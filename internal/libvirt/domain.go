@@ -19,16 +19,12 @@ import (
 // define path passes — create, a redefine on update or start, a restore, a
 // clone, a failover define, a cold migration's target — so none of them can
 // define a console that skipped it.
+//
+// The firmware move guard is asked first (OpDefine, spec §5.1).
 func (c *Client) DefineDomain(xmlConfig string) error {
-	xmlConfig, err := c.applyConsolePolicy(xmlConfig, true)
-	if err != nil {
-		return fmt.Errorf("define domain: %w", err)
-	}
-	_, err = c.virt.DomainDefineXML(xmlConfig)
-	if err != nil {
-		return fmt.Errorf("define domain: %w", err)
-	}
-	return nil
+	return defineDomain(c.virt, c.firmwareGuard(), xmlConfig, func(x string) (string, error) {
+		return c.applyConsolePolicy(x, true)
+	})
 }
 
 // StartDomain boots a defined domain.
@@ -73,28 +69,16 @@ func startDomainGuarded(v snapshotAPI, g StartGuard, name string) error {
 		func() { _ = v.DomainDestroy(dom) })
 }
 
-// ShutdownDomain sends an ACPI poweroff to a running domain.
+// ShutdownDomain sends an ACPI poweroff to a running domain. The firmware
+// move guard is asked first (OpStop).
 func (c *Client) ShutdownDomain(name string) error {
-	dom, err := c.virt.DomainLookupByName(name)
-	if err != nil {
-		return fmt.Errorf("lookup domain %s: %w", name, err)
-	}
-	if err := c.virt.DomainShutdown(dom); err != nil {
-		return fmt.Errorf("shutdown domain %s: %w", name, err)
-	}
-	return nil
+	return shutdownDomain(c.virt, c.firmwareGuard(), name)
 }
 
-// DestroyDomain force-stops a domain (like pulling the power cord).
+// DestroyDomain force-stops a domain (like pulling the power cord). The
+// firmware move guard is asked first (OpStop).
 func (c *Client) DestroyDomain(name string) error {
-	dom, err := c.virt.DomainLookupByName(name)
-	if err != nil {
-		return fmt.Errorf("lookup domain %s: %w", name, err)
-	}
-	if err := c.virt.DomainDestroy(dom); err != nil {
-		return fmt.Errorf("destroy domain %s: %w", name, err)
-	}
-	return nil
+	return destroyDomain(c.virt, c.firmwareGuard(), name)
 }
 
 // SuspendDomain pauses a running domain's vCPUs (virDomainSuspend). RAM stays
@@ -111,37 +95,17 @@ func (c *Client) SuspendDomain(name string) error {
 	return nil
 }
 
-// ResumeDomain resumes a domain SuspendDomain paused (virDomainResume).
+// ResumeDomain resumes a domain SuspendDomain paused (virDomainResume). The
+// firmware move guard is asked first (OpResume).
 func (c *Client) ResumeDomain(name string) error {
-	dom, err := c.virt.DomainLookupByName(name)
-	if err != nil {
-		return fmt.Errorf("lookup domain %s: %w", name, err)
-	}
-	if err := c.virt.DomainResume(dom); err != nil {
-		return fmt.Errorf("resume domain %s: %w", name, err)
-	}
-	return nil
+	return resumeDomain(c.virt, c.firmwareGuard(), FirmwareCall{Op: OpResume, Name: name})
 }
 
 // UndefineDomain removes a domain definition. If removeStorage is true,
-// also removes associated storage.
+// also removes associated storage. The firmware move guard is asked first
+// (OpUndefine).
 func (c *Client) UndefineDomain(name string, removeStorage bool) error {
-	dom, err := c.virt.DomainLookupByName(name)
-	if err != nil {
-		return fmt.Errorf("lookup domain %s: %w", name, err)
-	}
-
-	// Always include NVRAM flag — UEFI domains cannot be undefined without it.
-	flags := golibvirt.DomainUndefineNvram
-	if removeStorage {
-		flags |= golibvirt.DomainUndefineManagedSave |
-			golibvirt.DomainUndefineSnapshotsMetadata |
-			golibvirt.DomainUndefineCheckpointsMetadata
-	}
-	if err := c.virt.DomainUndefineFlags(dom, golibvirt.DomainUndefineFlagsValues(flags)); err != nil {
-		return fmt.Errorf("undefine domain %s: %w", name, err)
-	}
-	return nil
+	return undefineDomain(c.virt, c.firmwareGuard(), name, removeStorage)
 }
 
 // DomainIsActive asks libvirt whether a domain is ACTIVE, which is not the same
@@ -173,17 +137,10 @@ func domainIsActive(virt *golibvirt.Libvirt, name string) (bool, error) {
 // would delete the per-VM UEFI vars and break a Secure-Boot/vTPM guest on the
 // next start. (libvirt requires either Nvram or KeepNvram to undefine a UEFI
 // domain; KeepTpm is belt-and-suspenders — swtpm state is never touched unless
-// DomainUndefineTpm is set.)
+// DomainUndefineTpm is set.) The firmware move guard is asked first
+// (OpUndefine).
 func (c *Client) UndefineDomainPreservingState(name string) error {
-	dom, err := c.virt.DomainLookupByName(name)
-	if err != nil {
-		return fmt.Errorf("lookup domain %s: %w", name, err)
-	}
-	flags := golibvirt.DomainUndefineKeepNvram | golibvirt.DomainUndefineKeepTpm
-	if err := c.virt.DomainUndefineFlags(dom, golibvirt.DomainUndefineFlagsValues(flags)); err != nil {
-		return fmt.Errorf("undefine (keep state) domain %s: %w", name, err)
-	}
-	return nil
+	return undefineDomainPreservingState(c.virt, c.firmwareGuard(), name)
 }
 
 // DomainState returns the current coarse lifecycle state of a domain
@@ -637,7 +594,12 @@ func (c *Client) ExecInGuest(name, command string, args []string) (string, error
 // SetBootOrder changes the boot device order for a domain by fetching its XML,
 // patching the <boot dev='...'> element in the <os> section, and redefining it.
 // bootOrder is one of: disk, cdrom, network.
+//
+// It redefines the domain, so the firmware move guard is asked first (OpDefine).
 func (c *Client) SetBootOrder(domainName, bootOrder string) error {
+	if err := c.firmwareGuard().check(FirmwareCall{Op: OpDefine, Name: domainName}); err != nil {
+		return fmt.Errorf("redefine domain %s: %w", domainName, err)
+	}
 	dom, err := c.virt.DomainLookupByName(domainName)
 	if err != nil {
 		return fmt.Errorf("lookup domain %s: %w", domainName, err)

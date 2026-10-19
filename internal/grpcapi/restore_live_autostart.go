@@ -187,6 +187,11 @@ func (s *Server) autoDefineRestoredVM(
 		return "", "", status.Errorf(codes.AlreadyExists,
 			"domain %q already defined; pass --name to restore alongside it", targetName)
 	}
+	// The restore writes the target name's firmware state and defines its
+	// domain: not a name a live firmware move's record holds (spec §6.9).
+	if err := s.firmwareMoveNameRefusal("restore", targetName); err != nil {
+		return "", "", err
+	}
 
 	// Capacity + quota admission. A live-restore reconstructs a full-sized VM from
 	// a manifest and BOOTS it, so it consumes exactly what CreateVM of the same
@@ -288,7 +293,7 @@ func (s *Server) autoDefineRestoredVM(
 			// cleanly (and lifecycle never sees orphaned state).
 			s.virt.DestroyDomain(targetName)
 			_ = s.virt.UndefineDomain(targetName, false)
-			lv.WipeFirmwareState(s.dataDir, targetName, spec.Uuid)
+			s.fw().WipeFirmwareState(targetName, spec.Uuid)
 		}()
 	}
 

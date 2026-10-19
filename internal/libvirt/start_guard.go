@@ -78,7 +78,15 @@ func (c *Client) RequireStartGuard(wait time.Duration, needs func(name string) b
 
 // guard returns the start guard for a start of name, waiting for a required
 // one when name needs it.
+//
+// The firmware move guard is asked first (OpStart, spec §5.1), and
+// independently of the start guard's readiness: a domain RequireStartGuard
+// would let start unguarded (no NIC guard) is still refused while a firmware
+// move record names it.
 func (c *Client) guard(name string) (StartGuard, error) {
+	if err := c.firmwareGuard().check(FirmwareCall{Op: OpStart, Name: name}); err != nil {
+		return StartGuard{}, err
+	}
 	c.mu.RLock()
 	ready, wait, needs := c.guardReady, c.guardWait, c.guardNeeds
 	c.mu.RUnlock()

@@ -3,6 +3,8 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"github.com/litevirt/litevirt/internal/apimeta"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"net"
 	"path/filepath"
 	"slices"
@@ -137,6 +139,17 @@ func TestRemoveHost_RefusesACurrentVoter(t *testing.T) {
 	_, err := s.RemoveHost(adminCtx(), &pb.RemoveHostRequest{Name: "a"})
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "lv cluster voter rm a") {
 		t.Fatalf("removing a current voter was not refused with the way forward: %v", err)
+	}
+	// D2 re-review of d7bc5c868, N-4: the refusal carries its structured
+	// reason, which `lv host rm --dead` reads first.
+	hasReason := false
+	for _, d := range status.Convert(err).Details() {
+		if ei, ok := d.(*errdetails.ErrorInfo); ok && ei.GetReason() == apimeta.VoterMemberReason && ei.GetDomain() == apimeta.ErrorDomain {
+			hasReason = true
+		}
+	}
+	if !hasReason {
+		t.Errorf("the voter refusal carries no %s error detail: %v", apimeta.VoterMemberReason, status.Convert(err).Details())
 	}
 	if h, _ := corrosion.GetHost(ctx, s.db, "a"); h == nil {
 		t.Fatal("the voter's host row was deleted")

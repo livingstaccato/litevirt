@@ -845,6 +845,14 @@ func (s *Server) failbackOne(ctx context.Context, host string, o corrosion.Drain
 				"`lv migrate %s %s --cold`, or `--with-storage`", d.DiskName, vm.Name, host))
 		}
 	}
+	// A Secure Boot / vTPM VM returns as drain moves it (D-4): live, by the
+	// live firmware move, only where drain would try it.
+	if usesFirmwareState(vm.Spec) {
+		if why := s.firmwareLiveMoveIneligible(ctx, vm, o.To, host); why != "" {
+			return skip(fmt.Sprintf("Secure Boot / vTPM VM not moved live: %s; `lv stop %s`, then `lv migrate %s %s --cold`",
+				why, vm.Name, vm.Name, host))
+		}
+	}
 	if err := placement.ValidatePinned(ctx, s.db, buildDrainPlacementRequest(*vm, "", s.capacity), host); err != nil {
 		return skip("the host is not a valid placement for it now: " + err.Error())
 	}

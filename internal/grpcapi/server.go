@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -580,6 +581,19 @@ type Server struct {
 	// label was derived from.
 	firmware lv.FirmwarePaths
 
+	// fwStore is this host's firmware state (NVRAM and swtpm trees). The
+	// daemon injects the one it shares with the reconciler; NewServer and
+	// NewServerForTests start from the production layout under dataDir, and a
+	// struct-literal Server gets that layout through fw(). Read it through
+	// fw().
+	fwStore *lv.FirmwareStore
+	// fwWipesRefused are the firmware state wipes an unreadable firmware move
+	// record refused, named by firmware_migration_record_unreadable until it
+	// resolves (firmware_records_health.go). Guarded by fwRecordsMu.
+	fwRecordsMu         sync.Mutex
+	fwWipesRefused      []lv.RefusedWipe
+	fwWipesRefusedTotal int
+
 	// lbApplyOverride is a test seam for LB provisioning: when non-nil it
 	// replaces the real haproxy/keepalived Apply (unit tests have no root / no
 	// haproxy). Production leaves it nil so apply failures surface + roll back.
@@ -964,6 +978,12 @@ type Server struct {
 	// RollbackFirmwareState removes (migrate_firmware_rollback.go). Zero value
 	// ready.
 	firmwareTargets firmwareTargetLedger
+	// fwTarget is this host's side of a live firmware move, as its source
+	// (stage A) and as its target (Prepare): the one host check both read
+	// (SetLiveFirmwareHost).
+	fwTarget fwTargetState
+	// fwLive is the source half's test seams (migrate_firmware_live.go).
+	fwLive fwLiveSourceState
 
 	// vmLocks provides per-VM mutual exclusion for operations that must not
 	// run concurrently (e.g. snapshot + migration, backup + delete).
@@ -2612,6 +2632,7 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 		startedAt:      time.Now(),
 		hostName:       hostName,
 		dataDir:        dataDir,
+		fwStore:        lv.NewFirmwareStore(dataDir),
 		pkiDir:         pkiDir,
 		db:             db,
 		virt:           virt,
@@ -2733,6 +2754,34 @@ func (s *Server) reconcileFirewallRequired(ctx context.Context) error {
 // SetFirmwarePaths injects the host's resolved OVMF firmware paths (G1).
 func (s *Server) SetFirmwarePaths(fp lv.FirmwarePaths) { s.firmware = fp }
 
+// SetFirmwareStore injects this host's firmware store, the one the daemon
+// shares with its reconciler (and the fleet harness gives each node). nil is
+// ignored. A store whose DataDir is not the server's panics: the domain XML
+// names the NVRAM under the server's data dir, so the store must be the one
+// that holds it.
+func (s *Server) SetFirmwareStore(fw *lv.FirmwareStore) {
+	if fw == nil {
+		return
+	}
+	if filepath.Clean(fw.DataDir) != filepath.Clean(s.dataDir) {
+		panic(fmt.Sprintf("grpcapi: firmware store data dir %q is not the server's %q", fw.DataDir, s.dataDir))
+	}
+	s.fwStore = fw
+}
+
+// FirmwareStore is this host's firmware store.
+func (s *Server) FirmwareStore() *lv.FirmwareStore { return s.fw() }
+
+// fw is this host's firmware store. A Server built as a struct literal (unit
+// tests) has none and gets the production layout under its dataDir, which is
+// what every such Server used before the store existed.
+func (s *Server) fw() *lv.FirmwareStore {
+	if s.fwStore != nil {
+		return s.fwStore
+	}
+	return lv.NewFirmwareStore(s.dataDir)
+}
+
 // SetTenancyEngine wires the admission + billing engine.
 // nil = unbounded admission, no billing. Daemon constructs the
 // engine with a webhook URL from config.yaml.billing_webhook_url.
@@ -2782,6 +2831,14 @@ func (s *Server) lockVM(vmName string) func() {
 
 // tryLockVM is lockVM without the wait: it returns the unlock function and
 // true when it took the lock, or nil and false when someone else holds it.
+// lockVMOrSkip is lockVM when wait is set, else tryLockVM.
+func (s *Server) lockVMOrSkip(vmName string, wait bool) (func(), bool) {
+	if wait {
+		return s.lockVM(vmName), true
+	}
+	return s.tryLockVM(vmName)
+}
+
 func (s *Server) tryLockVM(vmName string) (func(), bool) {
 	s.vmLocksMu.Lock()
 	if s.vmLocks == nil {

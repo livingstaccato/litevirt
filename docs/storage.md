@@ -917,7 +917,7 @@ VM was created:
   resolves to is refused, refuses the move. A target on an older release
   judges nothing and returns nothing; the source then hands it the path the
   VM was given (an Admin's link), which its qemu follows there, as before.
-  A stopped or cold move (`--cold`, every Secure Boot or vTPM VM, a drain of
+  A stopped or cold move (`--cold`, a stopped Secure Boot or vTPM VM, a drain of
   a VM with a host-local disk) always ships an Admin's host-path ISO as the
   path the VM was given: a target on this release resolves and judges it at
   its start, and one on an older release follows the link, as before.

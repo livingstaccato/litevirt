@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/apimeta"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/ssh"
 )
@@ -122,6 +123,13 @@ func listedHost(ctx context.Context, c pb.LiteVirtClient, hostName string) *pb.H
 // changing anything. There is no command that asserts a decision away: an
 // operator only removes the host the decision named.
 func HostRemoveDead(ctx context.Context, c pb.LiteVirtClient, hostName string, dryRun bool) error {
+	return HostRemoveDeadForce(ctx, c, hostName, dryRun, false)
+}
+
+// HostRemoveDeadForce is HostRemoveDead; force is `--dead --force`: the
+// host is removed even while a Secure Boot / vTPM VM recorded on it has a
+// live firmware move to it that is not settled.
+func HostRemoveDeadForce(ctx context.Context, c pb.LiteVirtClient, hostName string, dryRun, force bool) error {
 	plan, err := c.PlanDeadHostRemoval(ctx, &pb.PlanDeadHostRemovalRequest{Name: hostName})
 	if err != nil {
 		return fmt.Errorf("plan the removal of %s: %w", hostName, err)
@@ -131,12 +139,27 @@ func HostRemoveDead(ctx context.Context, c pb.LiteVirtClient, hostName string, d
 		return fmt.Errorf("%s is not fenced proof-grade (%s): power it off, then run `%s` — `lv host rm --dead` "+
 			"removes only a host proven off", hostName, orDash(plan.GetFenceDetail()), plan.GetFenceCommand())
 	}
-	if dryRun && plan.GetVoter() {
-		// The daemon refuses to remove a voter's host, so its preflight can
-		// only answer once the real run has removed the vote.
-		fmt.Println("  removal check: runs after the voter removal, so not in a dry run")
-		fmt.Println("Dry run: nothing was changed.")
-		return nil
+	if plan.GetVoter() {
+		// Every refusal that does not depend on the vote is asked before the
+		// vote is removed: a refused removal changes nothing (D2 re-review
+		// I-4). The daemon answers those first, then refuses a voter's host;
+		// that last refusal is the one this run's voter removal clears. A
+		// daemon from before this order answers the voter refusal first, and
+		// its other refusals still come after the vote's removal.
+		serial, err := hostCertSerial(ctx, c, hostName)
+		if err != nil {
+			return fmt.Errorf("read %s's certificate serial: %w", hostName, err)
+		}
+		pre := &pb.RemoveHostRequest{Name: hostName, Dead: true, Force: force, ExpectedCertSerial: serial}
+		if _, err := c.PreflightRemoveHost(ctx, pre); err != nil &&
+			status.Code(err) != codes.Unimplemented && !apimeta.IsVoterMemberRefusal(err) {
+			return fmt.Errorf("the removal of %s would be refused, so its vote is not removed either: %w", hostName, err)
+		}
+		if dryRun {
+			fmt.Println("  removal check: passed up to the voter removal, which the real run makes first")
+			fmt.Println("Dry run: nothing was changed.")
+			return nil
+		}
 	}
 	if dryRun {
 		// Ask the daemon whether it would make the removal, as the real run
@@ -145,7 +168,7 @@ func HostRemoveDead(ctx context.Context, c pb.LiteVirtClient, hostName string, d
 		if err != nil {
 			return fmt.Errorf("read %s's certificate serial: %w", hostName, err)
 		}
-		pre := &pb.RemoveHostRequest{Name: hostName, Dead: true, ExpectedCertSerial: serial}
+		pre := &pb.RemoveHostRequest{Name: hostName, Dead: true, Force: force, ExpectedCertSerial: serial}
 		if _, err := c.PreflightRemoveHost(ctx, pre); err != nil && status.Code(err) != codes.Unimplemented {
 			return fmt.Errorf("the removal of %s would be refused: %w", hostName, err)
 		}
@@ -163,12 +186,12 @@ func HostRemoveDead(ctx context.Context, c pb.LiteVirtClient, hostName string, d
 		}
 		fmt.Printf("  removed %s from the voter set (it was a member of generation %d)\n", hostName, plan.GetVoterGeneration())
 	}
-	serial, version, err := revokeAndPublish(ctx, c, &pb.RemoveHostRequest{Name: hostName, Dead: true})
+	serial, version, err := revokeAndPublish(ctx, c, &pb.RemoveHostRequest{Name: hostName, Dead: true, Force: force})
 	if err != nil {
 		return err
 	}
 	closeRemovedHostAuditContract(ctx, c, hostName)
-	removed, err := removeAfterRevoke(ctx, c, &pb.RemoveHostRequest{Name: hostName, Dead: true, ExpectedCertSerial: serial},
+	removed, err := removeAfterRevoke(ctx, c, &pb.RemoveHostRequest{Name: hostName, Dead: true, Force: force, ExpectedCertSerial: serial},
 		"lv host rm --dead "+hostName)
 	if err != nil {
 		return err

@@ -280,6 +280,25 @@ func isUUID(s string) bool { return uuidPattern.MatchString(s) }
 // errNotHeld: the guest is not one this host holds paused for its guards.
 var errNotHeld = errors.New("not held")
 
+// errFirmwareMoveHeld: a live firmware move holds the guest here until its
+// state verifies; only that move's release resumes it (spec §6.9, I5).
+var errFirmwareMoveHeld = errors.New("held for firmware verification")
+
+// firmwareMoveHeld is nil when no live firmware move holds vm on this host,
+// else an errFirmwareMoveHeld naming the attempt and its source. A hold that
+// cannot be read holds too.
+func (s *Server) firmwareMoveHeld(vm string) error {
+	h, ok, err := s.fwRecords().GetHold(vm)
+	switch {
+	case err != nil:
+		return fmt.Errorf("%w: its live firmware move hold on %s cannot be read, so it is not resumed: %v", errFirmwareMoveHeld, s.hostName, err)
+	case !ok:
+		return nil
+	}
+	return fmt.Errorf("%w of attempt %s from %s (hold %s); only that move's release resumes it",
+		errFirmwareMoveHeld, h.Attempt, h.Source, h.State)
+}
+
 // resumeHeld lets vm, held paused here for its guards, run: it puts its NIC
 // firewall in force (ArmNICsFor, which refuses while a guard is not), then
 // resumes the domain, then drops the record. A guest already running is
@@ -294,6 +313,9 @@ func (s *Server) resumeHeld(ctx context.Context, vm string) error {
 	}
 	if !ok {
 		return errNotHeld
+	}
+	if err := s.firmwareMoveHeld(vm); err != nil {
+		return err
 	}
 	if !s.domainOfIncarnation(vm, g) {
 		// Not the domain the move carried: never resumed by its record. Kept
@@ -345,24 +367,39 @@ func (s *Server) ResumeHeldGuestsOnce(ctx context.Context) {
 			"the records of guests held paused for their NIC guards cannot be read: "+err.Error())
 		return
 	}
-	var held []string
+	var held, fwHeld []string
 	for _, g := range gs {
-		if why := s.resumeHeldGuest(ctx, g); why != "" {
+		why, firmware := s.resumeHeldGuest(ctx, g)
+		switch {
+		case why == "":
+		case firmware:
+			fwHeld = append(fwHeld, why)
+		default:
 			held = append(held, why)
 		}
 	}
-	text := ""
+	var parts []string
 	if len(held) > 0 {
-		text = "guests held paused because their NIC guards are not in force here: " + strings.Join(held, "; ") +
-			". Each resumes by itself once its guards are in force here"
+		parts = append(parts, "guests held paused because their NIC guards are not in force here: "+strings.Join(held, "; ")+
+			". Each resumes by itself once its guards are in force here")
 	}
-	s.setFirewallCondition(ctx, CondFirewallHeld, len(held) > 0, corrosion.SeverityCritical, text)
+	if len(fwHeld) > 0 {
+		parts = append(parts, "guests a live firmware move holds paused here: "+strings.Join(fwHeld, "; ")+
+			". Each resumes only when its move releases it")
+	}
+	s.setFirewallCondition(ctx, CondFirewallHeld, len(parts) > 0, corrosion.SeverityCritical, strings.Join(parts, ". "))
 }
 
 // resumeHeldGuest handles one record, returning why its guest stays held
-// ("" when it does not). A record whose guest is paused here is reported for
-// as long as it is (re-review m4), whatever stops this host resuming it.
-func (s *Server) resumeHeldGuest(ctx context.Context, g heldGuest) string {
+// ("" when it does not), and whether a live firmware move is what holds it.
+// A record whose guest is paused here is reported for as long as it is
+// (re-review m4), whatever stops this host resuming it.
+func (s *Server) resumeHeldGuest(ctx context.Context, g heldGuest) (why string, firmware bool) {
+	why = s.resumeHeldGuestWhy(ctx, g, &firmware)
+	return why, firmware
+}
+
+func (s *Server) resumeHeldGuestWhy(ctx context.Context, g heldGuest, firmware *bool) string {
 	stale := func() bool {
 		t, err := time.Parse(time.RFC3339, g.Since)
 		return err != nil || time.Since(t) > heldStaleAfter
@@ -413,6 +450,13 @@ func (s *Server) resumeHeldGuest(ctx context.Context, g heldGuest) string {
 		if why == "" && !g.Uncommitted && vm.State == "migrating" && !stale() {
 			return "" // the move is still under way
 		}
+		if ferr := s.firmwareMoveHeld(g.VM); ferr != nil {
+			// A live firmware move holds it: its source decides from Verify
+			// whether it commits here. Writing its owner here first is
+			// never the way out.
+			*firmware = true
+			return fmt.Sprintf("%s (since %s: %v)", g.VM, g.Since, ferr)
+		}
 		if why == "" {
 			why = fmt.Sprintf("it arrived here paused, but its move's ownership commit is not recorded (the VM's row names %s), "+
 				"so this host does not resume it: `lv doctor repair-owner %s %s` records it here", vm.HostName, g.VM, s.hostName)
@@ -434,6 +478,12 @@ func (s *Server) resumeHeldGuest(ctx context.Context, g heldGuest) string {
 		return ""
 	}
 	if err := s.resumeHeld(ctx, g.VM); err != nil && !errors.Is(err, errNotHeld) {
+		if errors.Is(err, errFirmwareMoveHeld) {
+			// Its guards are not what holds it: the record stays for the
+			// move's release to drop.
+			*firmware = true
+			return fmt.Sprintf("%s (since %s: %v)", g.VM, g.Since, err)
+		}
 		return held(err.Error())
 	}
 	return ""
@@ -477,6 +527,10 @@ func (s *Server) ResumeHeldVM(ctx context.Context, req *pb.ResumeHeldVMRequest) 
 		}
 		defer conn.Close()
 		return client.ResumeHeldVM(ctx, req)
+	}
+	if err := s.firmwareMoveHeld(vm.Name); err != nil {
+		s.audit(ctx, "vm.resume-held", vm.Name, "error: "+err.Error(), "error")
+		return nil, status.Errorf(codes.FailedPrecondition, "%s stays paused: %v", vm.Name, err)
 	}
 	err = s.resumeHeld(ctx, vm.Name)
 	switch {

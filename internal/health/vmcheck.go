@@ -88,6 +88,10 @@ type VMChecker struct {
 	// RPC path (with post-migration steps: GARP, LB, FDB, DNS, network provisioning).
 	migrateVMFunc func(ctx context.Context, vmName, targetHost string) error
 
+	// fwSkips logs, once per record, a VM the checker leaves alone because a
+	// live firmware move's record names it here.
+	fwSkips firmwareMoveSkips
+
 	// gate is the split-brain safety gate (Phase 1). When set + enforced, a
 	// restart-policy start requires local quorum. nil disables (tests). onGateRefused
 	// feeds the refusal metric (nil-safe).
@@ -773,6 +777,12 @@ func (v *VMChecker) takeAction(ctx context.Context, vm corrosion.VMRecord, hspec
 		slog.Info("vmcheck: skipping action — VM state changed", "vm", vm.Name, "state", fresh.State)
 		return
 	}
+	// A VM a live firmware move's record names here: no action, no row
+	// write (spec §6.9). A destroy the guard refused would be followed by a
+	// refused start and an `error` row.
+	if v.fwSkips.skip(v.dataDir, vm.Name, specUUIDOf(fresh.Spec), "health-check action") {
+		return
+	}
 
 	// Split-brain gate (Phase 1): "restart" (destroy+start) and "migrate" are
 	// automated RUNTIME actions — once enforcement is latched they require local
@@ -896,6 +906,13 @@ func (v *VMChecker) migrateVM(ctx context.Context, vm corrosion.VMRecord) {
 	// Fallback: direct libvirt migration (no post-migration steps).
 	if v.virt == nil {
 		slog.Error("vmcheck: migrate action requires libvirt or migrate callback", "vm", vm.Name)
+		return
+	}
+	// It carries no firmware state: a Secure Boot / vTPM VM is moved by
+	// `lv migrate` only (spec §12). Refused before the row is touched.
+	if spec := (&pb.VMSpec{}); json.Unmarshal([]byte(vm.Spec), spec) == nil && (spec.SecureBoot || spec.Tpm) {
+		slog.Error("vmcheck: the health-check migrate fallback does not move a Secure Boot / vTPM VM; it stays here",
+			"vm", vm.Name, "target", target.Name)
 		return
 	}
 
@@ -1128,6 +1145,9 @@ func (v *VMChecker) maybeRestartVM(ctx context.Context, vm corrosion.VMRecord, n
 
 	// Everything below acts on the FRESH record.
 	vm = *fresh
+	if v.fwSkips.skip(v.dataDir, vm.Name, specUUIDOf(vm.Spec), "restart policy") {
+		return
+	}
 
 	// Perform restart.
 	slog.Info("vmcheck: restarting VM per restart policy", "vm", vm.Name,

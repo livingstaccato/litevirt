@@ -166,14 +166,43 @@ type Fake struct {
 	guardReady chan struct{}
 	guardWait  time.Duration
 	guardNeeds func(name string) bool
+	// fwGuard mirrors libvirt.Client.SetFirmwareMoveGuard: every start,
+	// resume, stop, define and undefine asks it first, as the client does.
+	fwGuard libvirt.FirmwareMoveGuard
+	// fwStore is the host's firmware store (SetFirmwareStore): the files
+	// the libvirt model in firmware_live.go acts on. nil: no firmware state.
+	fwStore *libvirt.FirmwareStore
+	// pendingNvram is, per migrated-in guest that has not resumed yet, the
+	// source's final NVRAM its QEMU writes to the file on resume (probe
+	// (d)). offReason is the shut-off reason the model gave a domain
+	// (migrated, or a ShutOffDomain reason); a start clears it.
+	pendingNvram map[string][]byte
+	offReason    map[string]string
+	// pendingPermall is, per migrated-in TPM guest that has not resumed
+	// yet, the uuid whose permall its swtpm writes back once it runs.
+	pendingPermall map[string]string
+	// Firmware move knobs (spec §15). CorruptLandedPermall makes
+	// LandFirmwareLive on this (target) fake write an altered permall.
+	// FailAfterTargetTree fails LandFirmwareLive once the target's swtpm
+	// tree exists, before any domain is defined here. ReportSourceReasonUnknown
+	// makes this (source) fake report reason unknown, not migrated, for the
+	// shut-off a FirmwareLive migrate leaves; it is called under the fake's
+	// lock and must not call the fake.
+	CorruptLandedPermall      func(name string) bool
+	FailAfterTargetTree       func(name string) error
+	ReportSourceReasonUnknown func(name string) bool
 	// OnRunning, when set, is called (outside the fake's lock) each time a
-	// domain starts running: a start, a resume. A scenario samples what is in
-	// force at the moment a guest runs.
+	// domain starts running: a start, a resume, a migration that lands it
+	// running (LandMigratedState), and SetState into running. A scenario
+	// samples what is in force at the moment a guest runs.
 	OnRunning func(name string)
 	// OnMigrateToTarget, when set, runs inside MigrateToTarget after it is
 	// recorded, with the parameters libvirt was given; a scenario uses it to
 	// land the domain on the target's fake.
 	OnMigrateToTarget func(name, dconnuri string, p libvirt.MigrateParams) error
+	// JobActive, when set, answers DomainJobActive (a migration job a test
+	// has running on the domain). Set it under no lock the test holds.
+	JobActive func(name string) (bool, error)
 	// IgnoreShutdown makes ShutdownDomain a guest that ignores the ACPI
 	// request when it returns true: the call succeeds, the domain keeps
 	// running, and WaitForShutdown times out.
@@ -426,11 +455,22 @@ func (f *Fake) EventLog() []Event {
 
 // SetState forces a domain into a particular state. Scenarios use
 // this to simulate "the VM is already running" without rolling
-// through DefineDomain + StartDomain.
+// through DefineDomain + StartDomain. A domain it takes into running from
+// any other state starts running, as far as OnRunning is concerned.
 func (f *Fake) SetState(name string, s State) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	if s != StatePaused {
+		delete(f.pendingNvram, name)
+	}
+	if s != StateShutdown {
+		delete(f.offReason, name)
+	}
+	started := s == StateRunning && f.domains[name] != StateRunning
 	f.domains[name] = s
+	f.mu.Unlock()
+	if started {
+		f.running(name)
+	}
 }
 
 // SetStats sets the GetDomainStats / GetAllDomainStats response for
@@ -449,6 +489,9 @@ func (f *Fake) record(op, domain, note string) {
 // ── grpcapi.LibvirtBackend implementation ───────────────────────────────
 
 func (f *Fake) DefineDomain(xmlConfig string) error {
+	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpDefine, Name: domainNameFromXML(xmlConfig), UUID: libvirt.UUIDFromXML(xmlConfig)}); err != nil {
+		return fmt.Errorf("define domain: %w", err)
+	}
 	if f.FailDefineDomain != nil {
 		if err := f.FailDefineDomain(xmlConfig); err != nil {
 			return err
@@ -565,6 +608,168 @@ func domainUUIDFromXML(xmlConfig string) string {
 	return strings.TrimSpace(rest[:j])
 }
 
+// SetFirmwareMoveGuard mirrors libvirt.Client.SetFirmwareMoveGuard.
+func (f *Fake) SetFirmwareMoveGuard(g libvirt.FirmwareMoveGuard) {
+	f.mu.Lock()
+	f.fwGuard = g
+	f.mu.Unlock()
+}
+
+// fwCheck asks the firmware move guard, outside the fake's lock (the guard
+// reads records, not the fake).
+func (f *Fake) fwCheck(c libvirt.FirmwareCall) error {
+	f.mu.Lock()
+	g := f.fwGuard
+	f.mu.Unlock()
+	if g.Check == nil {
+		return nil
+	}
+	return g.Check(c)
+}
+
+// boundDomain refuses a domain of name whose uuid is not uuid, as
+// libvirt.Client's exempt entry points do; ok is false when there is no
+// domain of the name.
+func (f *Fake) boundDomain(name, uuid string) (State, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.domains[name]
+	if !ok {
+		return "", false, nil
+	}
+	if got := domainUUIDFromXML(f.liveXMLLocked(name)); uuid == "" || !strings.EqualFold(got, uuid) {
+		return st, true, fmt.Errorf("libvirtfake: domain %s has uuid %q, not %q", name, got, uuid)
+	}
+	return st, true, nil
+}
+
+// fwExemptResume mirrors the client's exempt resumes.
+func (f *Fake) fwExemptResume(c libvirt.FirmwareCall) error {
+	if err := f.fwCheck(c); err != nil {
+		return fmt.Errorf("resume domain %s: %w", c.Name, err)
+	}
+	if c.UUID != "" {
+		if _, ok, err := f.boundDomain(c.Name, c.UUID); err != nil {
+			return err
+		} else if !ok {
+			return fmt.Errorf("libvirtfake: domain %q not defined", c.Name)
+		}
+	}
+	return f.resumeDomain(c.Name)
+}
+
+// ResumeFirmwareMoveSource mirrors libvirt.Client.ResumeFirmwareMoveSource.
+func (f *Fake) ResumeFirmwareMoveSource(name, uuid, attempt string) error {
+	return f.fwExemptResume(libvirt.FirmwareCall{Op: libvirt.OpResume, Name: name, UUID: uuid, Attempt: attempt, Via: libvirt.ViaResumeFirmwareMoveSource})
+}
+
+// ResumeFirmwareMoveSourceForOperator mirrors
+// libvirt.Client.ResumeFirmwareMoveSourceForOperator.
+func (f *Fake) ResumeFirmwareMoveSourceForOperator(name, uuid, attempt string) error {
+	return f.fwExemptResume(libvirt.FirmwareCall{Op: libvirt.OpResume, Name: name, UUID: uuid, Attempt: attempt, Via: libvirt.ViaResumeFirmwareMoveSourceOperator})
+}
+
+// ResumePartitionPaused mirrors libvirt.Client.ResumePartitionPaused.
+func (f *Fake) ResumePartitionPaused(name, uuid string) error {
+	return f.fwExemptResume(libvirt.FirmwareCall{Op: libvirt.OpResume, Name: name, UUID: uuid, Via: libvirt.ViaResumePartitionPaused})
+}
+
+// ResumeFirmwareMoveTarget mirrors libvirt.Client.ResumeFirmwareMoveTarget.
+func (f *Fake) ResumeFirmwareMoveTarget(name, uuid, attempt string) error {
+	return f.fwExemptResume(libvirt.FirmwareCall{Op: libvirt.OpResume, Name: name, UUID: uuid, Attempt: attempt, Via: libvirt.ViaResumeFirmwareMoveTarget})
+}
+
+// DiscardFirmwareMoveTarget mirrors libvirt.Client.DiscardFirmwareMoveTarget:
+// destroy a paused domain, then undefine keeping its state; a running one is
+// refused, an absent one is nothing to discard.
+func (f *Fake) DiscardFirmwareMoveTarget(name, uuid, attempt string) error {
+	c := libvirt.FirmwareCall{Name: name, UUID: uuid, Attempt: attempt, Via: libvirt.ViaDiscardFirmwareMoveTarget}
+	for _, op := range []libvirt.FirmwareOp{libvirt.OpStop, libvirt.OpUndefine} {
+		c.Op = op
+		if err := f.fwCheck(c); err != nil {
+			return fmt.Errorf("discard %s: %w", name, err)
+		}
+	}
+	st, ok, err := f.boundDomain(name, uuid)
+	if err != nil || !ok {
+		return err
+	}
+	switch st {
+	case StateShutdown:
+	case StatePaused:
+		if err := f.destroyDomain(name); err != nil {
+			return fmt.Errorf("discard %s: destroy: %w", name, err)
+		}
+	default:
+		return fmt.Errorf("%w: discard %s: the domain is %s, not paused or shut off", libvirt.ErrFirmwareMoveInFlight, name, st)
+	}
+	return f.undefinePreservingState(name)
+}
+
+// UndefineFirmwareMoveLeftover mirrors
+// libvirt.Client.UndefineFirmwareMoveLeftover: the domain must be shut off.
+func (f *Fake) UndefineFirmwareMoveLeftover(name, uuid, attempt string) error {
+	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpUndefine, Name: name, UUID: uuid, Attempt: attempt, Via: libvirt.ViaUndefineFirmwareMoveLeftover}); err != nil {
+		return fmt.Errorf("undefine leftover %s: %w", name, err)
+	}
+	st, ok, err := f.boundDomain(name, uuid)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("libvirtfake: domain %q not defined", name)
+	}
+	if st != StateShutdown {
+		return fmt.Errorf("undefine leftover %s: the domain is not shut off (%s)", name, st)
+	}
+	return f.undefinePreservingState(name)
+}
+
+// StopFirmwareMoveTargetForOperator mirrors
+// libvirt.Client.StopFirmwareMoveTargetForOperator.
+func (f *Fake) StopFirmwareMoveTargetForOperator(name, uuid, attempt string, force bool) error {
+	return f.stopForOperator(name, uuid, attempt, force, libvirt.ViaStopFirmwareMoveTargetForOperator)
+}
+
+// StopOwedFirmwareLeftover mirrors libvirt.Client.StopOwedFirmwareLeftover.
+func (f *Fake) StopOwedFirmwareLeftover(name, uuid, attempt string, force bool) error {
+	return f.stopForOperator(name, uuid, attempt, force, libvirt.ViaStopOwedFirmwareLeftover)
+}
+
+// UndefineOwedFirmwareLeftover mirrors
+// libvirt.Client.UndefineOwedFirmwareLeftover: the domain must be shut off.
+func (f *Fake) UndefineOwedFirmwareLeftover(name, uuid, attempt string) error {
+	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpUndefine, Name: name, UUID: uuid, Attempt: attempt, Via: libvirt.ViaUndefineOwedFirmwareLeftover}); err != nil {
+		return fmt.Errorf("undefine leftover %s: %w", name, err)
+	}
+	st, ok, err := f.boundDomain(name, uuid)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("libvirtfake: domain %q not defined", name)
+	}
+	if st != StateShutdown {
+		return fmt.Errorf("undefine leftover %s: the domain is not shut off (%s)", name, st)
+	}
+	return f.undefinePreservingState(name)
+}
+
+func (f *Fake) stopForOperator(name, uuid, attempt string, force bool, via libvirt.FirmwareExemption) error {
+	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpStop, Name: name, UUID: uuid, Attempt: attempt, Via: via}); err != nil {
+		return fmt.Errorf("stop %s: %w", name, err)
+	}
+	if _, ok, err := f.boundDomain(name, uuid); err != nil {
+		return err
+	} else if !ok {
+		return fmt.Errorf("libvirtfake: domain %q not defined", name)
+	}
+	if force {
+		return f.destroyDomain(name)
+	}
+	return f.shutdownDomain(name)
+}
+
 // SetStartGuard mirrors libvirt.Client.SetStartGuard.
 func (f *Fake) SetStartGuard(g libvirt.StartGuard) {
 	f.mu.Lock()
@@ -595,7 +800,13 @@ func (f *Fake) running(name string) {
 // StartDomain mirrors libvirt.Client.StartDomain, guard included: a start the
 // guard asks to pause runs AfterPaused while the domain is paused (its taps
 // already assigned), then resumes it.
+//
+// The firmware move guard is asked first, whatever the start guard's
+// readiness, as libvirt.Client's guard() does.
 func (f *Fake) StartDomain(name string) error {
+	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpStart, Name: name}); err != nil {
+		return fmt.Errorf("start domain %s: %w", name, err)
+	}
 	f.mu.Lock()
 	ready, wait, needs := f.guardReady, f.guardWait, f.guardNeeds
 	f.mu.Unlock()
@@ -652,7 +863,7 @@ func (f *Fake) StartDomain(name string) error {
 			return fmt.Errorf("start domain %s: %w", name, err)
 		}
 	}
-	if err := f.ResumeDomain(name); err != nil {
+	if err := f.resumeDomain(name); err != nil {
 		// As libvirt.Client does (re-review m5): a domain that cannot be
 		// resumed is stopped, not left paused.
 		f.mu.Lock()
@@ -692,6 +903,7 @@ func (f *Fake) startDomain(name string, paused bool) error {
 		f.record("shutoff-late", name, "")
 		return fmt.Errorf("libvirtfake: domain %q is already running", name)
 	}
+	f.leftStateLocked(name)
 	f.domains[name] = StateRunning
 	if paused {
 		f.domains[name] = StatePaused
@@ -728,8 +940,15 @@ func (f *Fake) SuspendDomain(name string) error {
 }
 
 // ResumeDomain resumes a PAUSED domain. Resuming a domain that is not paused
-// is an error, as in libvirt.
+// is an error, as in libvirt. The firmware move guard is asked first.
 func (f *Fake) ResumeDomain(name string) error {
+	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpResume, Name: name}); err != nil {
+		return fmt.Errorf("resume domain %s: %w", name, err)
+	}
+	return f.resumeDomain(name)
+}
+
+func (f *Fake) resumeDomain(name string) error {
 	if f.FailResumeDomain != nil {
 		if err := f.FailResumeDomain(name); err != nil {
 			return err
@@ -746,6 +965,7 @@ func (f *Fake) ResumeDomain(name string) error {
 	}
 	f.domains[name] = StateRunning
 	f.record("resume", name, "")
+	f.flushPendingNvramLocked(name)
 	defer func() { f.mu.Unlock(); f.running(name); f.mu.Lock() }()
 	return nil
 }
@@ -780,6 +1000,13 @@ func (f *Fake) BlockJobStatus(domain, disk string) (libvirt.BlockJobStatus, erro
 }
 
 func (f *Fake) ShutdownDomain(name string) error {
+	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpStop, Name: name}); err != nil {
+		return fmt.Errorf("shutdown domain %s: %w", name, err)
+	}
+	return f.shutdownDomain(name)
+}
+
+func (f *Fake) shutdownDomain(name string) error {
 	if f.FailShutdownDomain != nil {
 		if err := f.FailShutdownDomain(name); err != nil {
 			return err
@@ -787,8 +1014,12 @@ func (f *Fake) ShutdownDomain(name string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, ok := f.domains[name]; !ok {
+	st, ok := f.domains[name]
+	if !ok {
 		return fmt.Errorf("libvirtfake: domain %q not defined", name)
+	}
+	if st == StateShutdown {
+		return notRunning("shutdown", name)
 	}
 	f.record("shutdown", name, "")
 	if f.IgnoreShutdown != nil && f.IgnoreShutdown(name) {
@@ -801,12 +1032,20 @@ func (f *Fake) ShutdownDomain(name string) error {
 		f.lateWaits[name] = 0
 		return nil
 	}
+	f.leftStateLocked(name)
 	f.domains[name] = StateShutdown
 	delete(f.liveConsolePw, name)
 	return nil
 }
 
 func (f *Fake) DestroyDomain(name string) error {
+	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpStop, Name: name}); err != nil {
+		return fmt.Errorf("destroy domain %s: %w", name, err)
+	}
+	return f.destroyDomain(name)
+}
+
+func (f *Fake) destroyDomain(name string) error {
 	if f.FailDestroyDomain != nil {
 		if err := f.FailDestroyDomain(name); err != nil {
 			return err
@@ -814,23 +1053,70 @@ func (f *Fake) DestroyDomain(name string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, ok := f.domains[name]; !ok {
+	st, ok := f.domains[name]
+	if !ok {
 		return fmt.Errorf("libvirtfake: domain %q not defined", name)
 	}
+	if st == StateShutdown {
+		return notRunning("destroy", name)
+	}
+	f.leftStateLocked(name)
 	f.domains[name] = StateShutdown
 	delete(f.liveConsolePw, name)
 	f.record("destroy", name, "")
 	return nil
 }
 
+// noDomain is libvirt's VIR_ERR_NO_DOMAIN for a lookup of name, wrapped as
+// libvirt.Client wraps it.
+func noDomain(name string) error {
+	return fmt.Errorf("lookup domain %s: %w", name, golibvirt.Error{Code: uint32(golibvirt.ErrNoDomain),
+		Message: fmt.Sprintf("Domain not found: no domain with matching name '%s'", name)})
+}
+
+// notRunning is libvirt's refusal to stop a domain that is not active
+// (VIR_ERR_OPERATION_INVALID), wrapped as libvirt.Client wraps it.
+func notRunning(op, name string) error {
+	return fmt.Errorf("%s domain %s: %w", op, name, golibvirt.Error{Code: uint32(golibvirt.ErrOperationInvalid),
+		Message: "Requested operation is not valid: domain is not running"})
+}
+
 func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
+	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpUndefine, Name: name}); err != nil {
+		return fmt.Errorf("undefine domain %s: %w", name, err)
+	}
+	// As libvirt.Client: the lookup comes first, and an absent name is
+	// libvirt's no-domain error, with nothing deleted (review I-1).
+	if !f.DomainExists(name) {
+		return noDomain(name)
+	}
 	if f.FailUndefineDomain != nil {
 		if err := f.FailUndefineDomain(name, removeStorage); err != nil {
 			return err
 		}
 	}
+	// The state is read and acted on under one hold of the lock (re-review
+	// N-3): the hook above may have changed it.
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	st, ok := f.domains[name]
+	if !ok {
+		return noDomain(name)
+	}
+	if st == StateRunning || st == StatePaused {
+		// An active domain survives as a transient one (see
+		// undefinePreservingState). libvirt unlinks the NVRAM file for
+		// UNDEFINE_NVRAM before it looks at whether the domain is active
+		// (qemuDomainUndefineFlags; not probed): the running QEMU keeps its
+		// open descriptor, the file is gone.
+		if _, ok := f.activeXML[name]; !ok {
+			f.activeXML[name] = f.xml[name]
+		}
+		delete(f.xml, name)
+		f.record("undefine", name, fmt.Sprintf("remove_storage=%v transient=true", removeStorage))
+		f.deleteNvramLocked(name)
+		return nil
+	}
 	f.dropPITLocked(name, "")
 	delete(f.domains, name)
 	delete(f.xml, name)
@@ -844,7 +1130,10 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	delete(f.ownerEpochs, name)
 	delete(f.managed, name)
 	delete(f.managedInc, name)
+	f.leftStateLocked(name)
 	f.record("undefine", name, fmt.Sprintf("remove_storage=%v", removeStorage))
+	// Probe (g): the NVRAM goes with the definition, the swtpm tree stays.
+	f.deleteNvramLocked(name)
 	if hook := f.OnUndefined; hook != nil {
 		f.mu.Unlock()
 		hook(name)
@@ -853,9 +1142,16 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	return nil
 }
 
-// UndefineDomainPreservingState mirrors UndefineDomain for the fake but records
-// that NVRAM/vTPM state is kept (the fake has no real firmware state).
+// UndefineDomainPreservingState mirrors UndefineDomain but keeps the domain's
+// NVRAM and swtpm state (KEEP_NVRAM|KEEP_TPM, probe (b)).
 func (f *Fake) UndefineDomainPreservingState(name string) error {
+	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpUndefine, Name: name}); err != nil {
+		return fmt.Errorf("undefine (keep state) domain %s: %w", name, err)
+	}
+	return f.undefinePreservingState(name)
+}
+
+func (f *Fake) undefinePreservingState(name string) error {
 	if f.FailUndefinePreserv != nil {
 		if err := f.FailUndefinePreserv(name); err != nil {
 			return err
@@ -883,6 +1179,7 @@ func (f *Fake) UndefineDomainPreservingState(name string) error {
 	delete(f.stats, name)
 	delete(f.ownerEpochs, name)
 	delete(f.managed, name)
+	f.leftStateLocked(name)
 	f.record("undefine", name, "keep_state=true")
 	if hook := f.OnUndefined; hook != nil {
 		f.mu.Unlock()
@@ -1038,6 +1335,9 @@ func (f *Fake) domainStateReason(name string) (libvirt.DomainStatus, error) {
 		coarse = "stopped"
 	}
 	reason := f.reasons[name]
+	if reason == "" && s == StateShutdown {
+		reason = f.offReason[name]
+	}
 	if reason == "" {
 		switch s {
 		case StateRunning:
@@ -1343,13 +1643,30 @@ func (f *Fake) consolePassword(name, kind string) (string, error) {
 // define of ours runs, so no console password policy applies — and the guest
 // runs with the passwords it already had.
 func (f *Fake) LandMigrated(domXML string) {
+	f.LandMigratedState(domXML, false)
+}
+
+// LandMigratedState is LandMigrated for a guest that arrives paused when
+// paused is set (VIR_MIGRATE_PAUSED), running otherwise.
+func (f *Fake) LandMigratedState(domXML string, paused bool) {
 	name := domainNameFromXML(domXML)
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.leftStateLocked(name)
 	f.xml[name] = domXML
 	f.domains[name] = StateRunning
+	note := ""
+	if paused {
+		f.domains[name] = StatePaused
+		note = "paused=true"
+	}
 	f.captureConsolePasswordsLocked(name, domXML)
-	f.record("migrate-in", name, "")
+	f.record("migrate-in", name, note)
+	f.mu.Unlock()
+	// A guest that lands running starts running here (OnRunning), however
+	// it arrived.
+	if !paused {
+		f.running(name)
+	}
 }
 
 // captureConsolePasswordsLocked records the console passwords a guest runs
@@ -1987,6 +2304,9 @@ func (f *Fake) SetDiskIOTune(domainName, dev string, t libvirt.IOTune) error {
 }
 
 func (f *Fake) SetBootOrder(domainName, bootOrder string) error {
+	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpDefine, Name: domainName}); err != nil {
+		return fmt.Errorf("redefine domain %s: %w", domainName, err)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("boot-order", domainName, bootOrder)
@@ -1996,6 +2316,14 @@ func (f *Fake) SetBootOrder(domainName, bootOrder string) error {
 // Migration — record and pretend success.
 
 func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) error {
+	// The flags libvirt.Client would send: what it refuses never reaches
+	// libvirt, a guest it asks libvirt to pause arrives paused (D2-4 m-2),
+	// and a source it does not ask libvirt to undefine stays defined.
+	paused, undefineSource, err := libvirt.MigrationOutcome(p)
+	if err != nil {
+		return fmt.Errorf("domain %q: %w", name, err)
+	}
+	p.Paused = paused
 	if f.FailMigrateToTarget != nil {
 		if err := f.FailMigrateToTarget(name, dconnuri); err != nil {
 			return err
@@ -2027,6 +2355,9 @@ func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) e
 	}
 	if p.Paused {
 		note += " paused=true"
+	}
+	if p.FirmwareLive {
+		note += " firmware_live=true"
 	}
 	if len(p.RBDLocators) > 0 {
 		var names []string
@@ -2062,13 +2393,33 @@ func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) e
 		f.mu.Unlock()
 		err := cb(name, dconnuri, p)
 		f.mu.Lock()
-		return err
+		if err != nil {
+			return err
+		}
+	}
+	// Probe (b): without UNDEFINE_SOURCE the source stays defined, shut off,
+	// reason migrated. The source of an ordinary migrate is not modelled:
+	// the fake leaves it as it was.
+	if !undefineSource {
+		f.migratedOutLocked(name)
 	}
 	return nil
 }
 
 func (f *Fake) DomainJobProgress(name string) (memPct, diskPct float32) {
 	return 100, 100
+}
+
+// DomainJobActive answers JobActive when it is set, else no job: the fake's
+// MigrateToTarget returns before anything could ask.
+func (f *Fake) DomainJobActive(name string) (bool, error) {
+	f.mu.Lock()
+	job := f.JobActive
+	f.mu.Unlock()
+	if job != nil {
+		return job(name)
+	}
+	return false, nil
 }
 
 // Snapshots.
@@ -2085,6 +2436,9 @@ func (f *Fake) CreateSnapshot(domainName, snapshotName string) (int64, error) {
 	return time.Now().UnixNano(), nil
 }
 func (f *Fake) RevertToSnapshot(domainName, snapshotName string, restorePreDefine func() error) error {
+	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpStart, Name: domainName}); err != nil {
+		return fmt.Errorf("revert %s: %w", domainName, err)
+	}
 	f.mu.Lock()
 	if _, ok := f.snapshots[domainName][snapshotName]; !ok {
 		f.mu.Unlock()
@@ -2131,6 +2485,13 @@ func (f *Fake) FlattenSnapshot(domainName, snapshotName string) error {
 }
 
 func (f *Fake) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, captureSuspended func() error) (diskBytes, vmstateBytes int64, err error) {
+	// As libvirt.Client: the capture stops and restarts the guest, so both
+	// are asked before anything is done.
+	for _, op := range []libvirt.FirmwareOp{libvirt.OpStop, libvirt.OpStart} {
+		if err := f.fwCheck(libvirt.FirmwareCall{Op: op, Name: domainName}); err != nil {
+			return 0, 0, fmt.Errorf("memory snapshot of %q: %w", domainName, err)
+		}
+	}
 	f.mu.Lock()
 	if f.snapshots[domainName] == nil {
 		f.snapshots[domainName] = map[string]struct{}{}
@@ -2240,6 +2601,9 @@ func (f *Fake) SetSavedImageXML(vmstatePath, xml string) {
 }
 
 func (f *Fake) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string, restorePreDefine func() error, rewriteSaved func(savedXML string) (string, error)) error {
+	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpStart, Name: domainName}); err != nil {
+		return fmt.Errorf("revert %s: %w", domainName, err)
+	}
 	f.mu.Lock()
 	if _, ok := f.snapshots[domainName][snapshotName]; !ok {
 		f.mu.Unlock()

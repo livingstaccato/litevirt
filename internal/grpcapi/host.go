@@ -441,7 +441,9 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 		}
 	}
 	if len(toMigrate) == 0 {
-		return nil
+		// Nothing to move, but the host may still hold a VM in another state
+		// (a move in progress or parked by an earlier drain): it is not drained.
+		return s.drainOutcome(ctx, req.Name, nil, nil)
 	}
 	// Highest compose migrate.priority first, ties in name order: targets are
 	// chosen, and the moves handed to the workers, in this order, so a
@@ -456,6 +458,8 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 		target corrosion.HostRecord
 	}
 	var drainJobs []drainJob
+	// failed names each VM whose frame was failed or error, with its reason.
+	var failed []string
 	for _, vm := range toMigrate {
 		placementReq := buildDrainPlacementRequest(vm, req.Name, s.capacity)
 		// A guarded VM drains only onto a host that enforces NIC guards
@@ -476,6 +480,7 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 			}); err != nil {
 				return err
 			}
+			failed = append(failed, vm.Name+" (no eligible target)")
 			continue
 		}
 
@@ -487,7 +492,7 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	}
 
 	if len(drainJobs) == 0 {
-		return nil
+		return s.drainOutcome(ctx, req.Name, failed, nil)
 	}
 
 	// Worker pool for parallel migrations.
@@ -530,7 +535,6 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	// notStarted: VMs moved off the host that did not start on their target
 	// (a `done` frame carrying an Error). They left the host, but the drain
 	// did not do what it was asked for them, so it does not end clean.
-	var failures int
 	var notStarted []string
 	// Drain records (failback.go) are written off this loop, after each frame:
 	// the release gate can take seconds, and a drain never waits for it.
@@ -541,7 +545,7 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 		progress := res.progress
 		record := false
 		if progress.Status == "error" || progress.Status == "failed" {
-			failures++
+			failed = append(failed, fmt.Sprintf("%s (%s: %s)", progress.VmName, progress.Status, progress.Error))
 		} else if progress.Status == "done" && progress.Error != "" {
 			notStarted = append(notStarted, progress.VmName)
 		} else if progress.Status == "done" {
@@ -556,27 +560,55 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 		}
 	}
 	recordsQueued()
+	return s.drainOutcome(ctx, req.Name, failed, notStarted)
+}
 
-	// Check for VMs that were skipped (pinned, no placement target).
-	// If any VMs remain on the host, report a partial drain (#25).
-	remaining, _ := corrosion.ListVMs(ctx, s.db, "", req.Name)
-	var stillRunning int
-	for _, vm := range remaining {
-		if vm.State == "running" || vm.State == "stopped" {
-			stillRunning++
-		}
-	}
-	if stillRunning > 0 {
+// drainOutcome is a drain's terminal result. The host is drained only when no
+// VM row names it any more and every move the drain made ended clean. Every
+// row still on the host counts, whatever its state: a VM skipped or refused,
+// one whose move is still running in the background, parked, or left
+// `migrating`, each still has its guest, or may have, on this host, and
+// powering it off then could lose that guest (K-7). failed names the moves
+// that failed or ended in error; notStarted the VMs moved that did not start.
+func (s *Server) drainOutcome(ctx context.Context, host string, failed, notStarted []string) error {
+	remaining, err := corrosion.ListVMs(ctx, s.db, "", host)
+	if err != nil {
 		return status.Errorf(codes.FailedPrecondition,
-			"drain incomplete: %d VM(s) remain on host %q (pinned, no eligible target, or not movable; see each VM's result)",
-			stillRunning, req.Name)
+			"drain incomplete: cannot confirm that no VM remains on host %q: %v", host, err)
+	}
+	if len(remaining) > 0 {
+		here := make([]string, 0, len(remaining))
+		var untried []string
+		for _, vm := range remaining {
+			here = append(here, fmt.Sprintf("%s (%s)", vm.Name, vm.State))
+			if vm.State != "running" && vm.State != "stopped" {
+				untried = append(untried, vm.Name)
+			}
+		}
+		next := ""
+		if len(untried) > 0 {
+			// A drain moves only running and stopped VMs, so these have no
+			// result of their own to read.
+			next = fmt.Sprintf("; the drain did not try to move %s (neither running nor stopped): "+
+				"start each with `lv start <vm>` and drain again, or remove it with `lv rm <vm>`; "+
+				"a VM a live firmware move left `migrating` is resolved with `lv doctor firmware-move <vm>`",
+				strings.Join(untried, ", "))
+		}
+		return status.Errorf(codes.FailedPrecondition,
+			"drain incomplete: %d VM(s) remain on host %q (pinned, no eligible target, not movable, or a move still running or parked; "+
+				"see each VM's result and `lv events <vm>`): %s%s",
+			len(remaining), host, strings.Join(here, ", "), next)
 	}
 	if len(notStarted) > 0 {
 		return status.Errorf(codes.FailedPrecondition,
 			"drain incomplete: every VM left host %q, but %d did not start on its target (%s); start each with `lv start <vm>`",
-			req.Name, len(notStarted), strings.Join(notStarted, ", "))
+			host, len(notStarted), strings.Join(notStarted, ", "))
 	}
-
+	if len(failed) > 0 {
+		return status.Errorf(codes.FailedPrecondition,
+			"drain incomplete: every VM left host %q, but %d move(s) did not end clean: %s; see `lv events <vm>`",
+			host, len(failed), strings.Join(failed, "; "))
+	}
 	return nil
 }
 
@@ -618,6 +650,15 @@ func buildDrainPlacementRequest(vm corrosion.VMRecord, drainHost string, capacit
 	}
 	// A Secure-Boot/vTPM VM may only drain onto a capable host (G1).
 	addCapabilityLabels(&placementReq, spec)
+	// A running one moves live only onto a host labelled for the live
+	// firmware move (spec §13): such a host is preferred, not required, so a
+	// cluster without one keeps today's placement and the VM is skipped.
+	if vm.State == "running" && (spec.SecureBoot || spec.Tpm) {
+		if placementReq.PreferLabels == nil {
+			placementReq.PreferLabels = map[string]string{}
+		}
+		placementReq.PreferLabels[corrosion.LabelFwLiveMigrate] = "true"
+	}
 	return placementReq
 }
 
@@ -629,12 +670,13 @@ const notMoved = pb.MigrateStrategy_MIGRATE_NONE
 
 // drainOneVM migrates a single VM to the target host. Returns progress message.
 //
-// A running VM whose disks are all on shared storage is live-migrated. Every
-// other VM moves the way `lv migrate --cold` moves a stopped one, with its
-// host-local disks: a stopped VM as it is (drainStoppedVM), a running one shut
-// down first and started again on the target (drainRunningVMCold), which is
-// also where a failed live migration falls back to. No VM is moved by its row
-// alone.
+// A running VM whose disks are all on shared storage is live-migrated; a
+// running Secure Boot / vTPM VM only by the live firmware move, or not at all
+// (drainRunningFirmwareVM). Every other VM moves the way `lv migrate --cold`
+// moves a stopped one, with its host-local disks: a stopped VM as it is
+// (drainStoppedVM), a running one shut down first and started again on the
+// target (drainRunningVMCold), which is also where a failed live migration
+// falls back to. No VM is moved by its row alone.
 func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target corrosion.HostRecord) *pb.DrainProgress {
 	// Acquire per-VM lock to avoid migrating while a backup is in progress (#54).
 	// It is MigrateVM's lock discipline: a migration that outlives this step
@@ -673,18 +715,17 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			Error: fmt.Sprintf("VM is %s — not drainable", fresh.State)}
 	}
 
-	// A RUNNING VM is drained either by a raw libvirt live-migrate (shared storage)
-	// or shut down and cold-moved — NEITHER carries the host-local NVRAM + swtpm of a
-	// running Secure-Boot/vTPM VM (and a stale live carry would race the TPM). Refuse
-	// such a VM REGARDLESS of storage type (NVRAM is host-local even on shared disks)
-	// and point the operator at explicit migration, which captures firmware
-	// quiescently and transfers it (G1). A STOPPED one takes that explicit path
-	// below (drainStoppedVM), with its refusals.
-	if fresh.State == "running" && usesFirmwareState(fresh.Spec) {
-		return &pb.DrainProgress{
-			VmName: vm.Name, TargetHost: target.Name, Status: "skipped", Strategy: notMoved,
-			Error: "Secure Boot / vTPM VM can't be drained while running (its firmware state isn't transferred live) — stop it (`lv stop " + vm.Name + "`), " +
-				"then drain again, or migrate it with `lv migrate " + vm.Name + " <target-host> --cold`; either moves it stopped, with its disks and its firmware",
+	// A RUNNING Secure-Boot/vTPM VM's NVRAM and swtpm state are host-local even
+	// on shared disks: neither drain's raw live-migrate nor its cold move (which
+	// would shut it down) carries them. It moves only by the live firmware move
+	// (drainRunningFirmwareVM, below), and only when it may (spec §13); any
+	// other is skipped, left running, with the routes that move it stopped. A
+	// STOPPED one takes the cold path below (drainStoppedVM), with its refusals.
+	fwRunning := fresh.State == "running" && usesFirmwareState(fresh.Spec)
+	if fwRunning {
+		if why := s.firmwareLiveMoveIneligible(ctx, fresh, s.hostName, target.Name); why != "" {
+			return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped", Strategy: notMoved,
+				Error: firmwareDrainSkipText(vm.Name, why)}
 		}
 	}
 
@@ -708,6 +749,9 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// after the handoff commits.
 	if fresh.State == "stopped" {
 		return s.drainStoppedVM(ctx, fresh, target, unlock, &adopted)
+	}
+	if fwRunning {
+		return s.drainRunningFirmwareVM(ctx, fresh, target, unlock, &adopted)
 	}
 
 	// A running VM with a host-local disk (local or dir storage, or a legacy
@@ -1750,6 +1794,19 @@ func (s *Server) removeHostRefusal(ctx context.Context, req *pb.RemoveHostReques
 	if h == nil {
 		return nil, none, status.Errorf(codes.NotFound, "host %q not found", req.Name)
 	}
+	// `--dead`'s refusals that do not depend on the vote come first: `lv host
+	// rm --dead` asks this preflight before it removes a voter's vote, and a
+	// refused removal must change nothing (D2 re-review I-4).
+	if req.Dead {
+		if err := s.deadRemovalRefusal(ctx, h); err != nil {
+			return nil, none, err
+		}
+		if !req.Force {
+			if err := s.deadRemovalFirmwareRefusal(ctx, req.Name); err != nil {
+				return nil, none, err
+			}
+		}
+	}
 	// A current voter keeps its vote whatever its hosts row says, so deleting
 	// the row must not look like removing the voter (recovery-claims.md §4.3).
 	if err := s.voterRemovalRefusal(ctx, req.Name); err != nil {
@@ -1799,6 +1856,7 @@ func (s *Server) removeHostRefusal(ctx context.Context, req *pb.RemoveHostReques
 	// stranded ones, and their rows stay in place for the recovery claims to
 	// supersede once this removal and the CRL have replicated.
 	if req.Dead {
+		// Again on the row the peers confirmed.
 		if err := s.deadRemovalRefusal(ctx, h); err != nil {
 			return nil, none, err
 		}

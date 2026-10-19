@@ -61,6 +61,11 @@ func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupSched
 	// that sends this run's data to a peer.
 	ctx = withReplicationLimiter(ctx, s.scheduleLimiter(ctx, sched))
 	err = s.runVMReplication(ctx, sched, vm, runAt)
+	if errors.Is(err, errFirmwareMoveSkipped) {
+		// A VM in a live firmware move: this run is skipped, with a log
+		// line, and reported as neither a success nor a failure (spec §6.9).
+		return nil
+	}
 	s.replicationOutcome(ctx, sched, "vm", vm.Name, tenancy.NormalizeProject(vm.Project), sched.TargetHost, sched.TargetPool, "", err)
 	return err
 }
@@ -78,6 +83,9 @@ func (s *Server) runVMReplication(ctx context.Context, sched corrosion.BackupSch
 	vmUnlock := s.lockVM(sched.VMName)
 	unlock := func() { unlockOnce.Do(vmUnlock) }
 	defer unlock()
+	if err := s.firmwareMoveSkip("scheduled replication", vm); err != nil {
+		return err
+	}
 	// A volume move left unresolved: the rows name the file holding the
 	// guest's writes before one is copied (move_unresolved.go).
 	if err := s.resolveUnresolvedMovesFor(ctx, sched.VMName, health.MoveUseReadsRunning); err != nil {

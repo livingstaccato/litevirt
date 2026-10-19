@@ -178,6 +178,12 @@ func (e *RebalanceExecutor) validate(ctx context.Context, p approvedRow) string 
 	if vm.HostName != p.SrcHost {
 		return fmt.Sprintf("vm already moved off source (now on %s)", vm.HostName)
 	}
+	// The rebalancer never proposes one (scheduler/rebalancer.go); an
+	// approved proposal of a Secure Boot / vTPM VM is still not run, since
+	// its live move is `lv migrate`'s only (spec §12).
+	if why := firmwareMoverRefusal("the rebalancer", vm); why != "" {
+		return why
+	}
 	if spec := (&pb.VMSpec{}); vm.Spec != "" {
 		if json.Unmarshal([]byte(vm.Spec), spec) == nil {
 			if spec.Placement != nil && spec.Placement.NoMigrate {

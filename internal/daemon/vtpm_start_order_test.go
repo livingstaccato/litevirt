@@ -65,6 +65,8 @@ func TestRunAwaitsTheFirstVTPMPassBeforeAnyVMStart(t *testing.T) {
 		"resumeVMReplaceCleanups", "runOperationRecovery", "SetStartGuard",
 		"vmChecker.Start", "reconciler.Start", "StartOnbootVMs", "RunDrainColdMoveRecovery",
 		"RunHeldGuestResumer", "fc.Start", "Serve",
+		// D2: the live firmware move recovery can resume a guest.
+		"RecoverFirmwareMoves", "RunFirmwareMoveRecovery",
 	} {
 		pos, ok := first[starter]
 		if !ok {

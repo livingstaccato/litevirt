@@ -115,11 +115,11 @@ const fwRollbackSpec = `{"name":"fw","secure_boot":true,"firmware":"uefi","uuid"
 
 func newFWRollbackFixture(t *testing.T) *fwRollbackFixture {
 	t.Helper()
-	t.Cleanup(lv.SetSwtpmBaseForTest(filepath.Join(t.TempDir(), "swtpm")))
 	ctx := adminCtx()
 
 	src := testServerWithLocks(t)
 	src.hostName = "src-host"
+	src.SetFirmwareStore(&lv.FirmwareStore{DataDir: src.dataDir, SwtpmBase: filepath.Join(t.TempDir(), "swtpm")})
 	srcVirt := libvirtfake.New()
 	src.virt = srcVirt
 	if err := srcVirt.DefineDomain(`<domain type='kvm'><name>fw</name><uuid>` + fwRollbackUUID + `</uuid></domain>`); err != nil {
@@ -137,6 +137,7 @@ func newFWRollbackFixture(t *testing.T) *fwRollbackFixture {
 	dst := testServer(t)
 	dst.hostName = fwRollbackDst
 	dst.dataDir = t.TempDir()
+	dst.SetFirmwareStore(&lv.FirmwareStore{DataDir: dst.dataDir, SwtpmBase: filepath.Join(t.TempDir(), "swtpm")})
 	dstVirt := libvirtfake.New()
 	dst.virt = dstVirt
 	// The VM row is replicated to the target, still naming the source.
@@ -242,7 +243,7 @@ func TestColdMigrateFirmwareVM_CancelledBeforeCommitRemovesWhatItDefined(t *test
 			if got := f.owner(t); got != f.src.hostName {
 				t.Fatalf("owner = %q after a pre-commit failure, want the source %q", got, f.src.hostName)
 			}
-			if !f.srcVirt.DomainExists(fwRollbackVM) || !lv.HasNvram(f.src.dataDir, fwRollbackVM) {
+			if !f.srcVirt.DomainExists(fwRollbackVM) || !f.src.fw().HasNvram(fwRollbackVM) {
 				t.Fatal("the source lost its domain or firmware on a failed attempt")
 			}
 
@@ -327,7 +328,7 @@ func TestColdMigrateFirmwareVM_SuccessKeepsTheTargetDomain(t *testing.T) {
 	if got, ok := f.dstNvram(t); !ok || got != "source-vars" {
 		t.Errorf("target firmware = %q (present=%v), want the source's vars", got, ok)
 	}
-	if f.srcVirt.DomainExists(fwRollbackVM) || lv.HasNvram(f.src.dataDir, fwRollbackVM) {
+	if f.srcVirt.DomainExists(fwRollbackVM) || f.src.fw().HasNvram(fwRollbackVM) {
 		t.Error("the source still holds the domain or firmware after a committed migration")
 	}
 	f.peer.mu.Lock()

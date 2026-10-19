@@ -355,3 +355,81 @@ func TestFleet_MAC_AStaleRecoveryMarkerDoesNotCoverALaterDrainsStop(t *testing.T
 		t.Fatalf("os1's row changed: %+v", after)
 	}
 }
+
+// An earlier build's drain source names no operation in its marker (from and
+// epoch only). Its genuine handoff — os1 stopped on the target at the
+// transfer's epoch with the empty detail the handoff writes — must start
+// although the target's replica holds no drain journal yet and another VM
+// there took os1's MAC after the preflight: that source does not retry, and
+// would leave the guest stopped. A row stopped with another drain's intent
+// is still refused for such a marker.
+//
+// Mutation: an operation-less marker counts as absent (the 5721e646f rule) —
+// the genuine handoff is refused and os1 left stopped: red.
+func TestFleet_MAC_AnEarlierBuildsResumeNeedsNoJournal(t *testing.T) {
+	const dup = "52:54:00:7a:0a:01"
+	sc := newColdStoppedScenarioWith(t, Options{Nodes: 2, IndependentReplicas: true, FaultSeed: 107})
+	a, b := sc.src, sc.dst
+	ctx := context.Background()
+	if err := a.Virt.StartDomain("os1"); err != nil {
+		t.Fatalf("start os1's domain: %v", err)
+	}
+	if err := corrosion.UpdateVMState(ctx, a.DB, "os1", "running", ""); err != nil {
+		t.Fatalf("record os1 running: %v", err)
+	}
+	if err := corrosion.InsertInterface(ctx, a.DB, corrosion.InterfaceRecord{VMName: "os1", NetworkName: "lan", MAC: dup}); err != nil {
+		t.Fatal(err)
+	}
+	sc.c.WaitConverged(t, convergeTimeout)
+	b.Server.SetBridgeEnsure(func(string) error { return nil })
+
+	var gotOp []string
+	b.HookUnary("StartVM", func(hctx context.Context, req any, handler grpc.UnaryHandler) (any, error) {
+		// The earlier build's marker: from and epoch, no operation.
+		md, _ := metadata.FromIncomingContext(hctx)
+		md = md.Copy()
+		gotOp = md.Get(grpcapi.DrainResumeOpMDKey)
+		md.Delete(grpcapi.DrainResumeOpMDKey)
+		hctx = metadata.NewIncomingContext(hctx, md)
+		// The drain journal has not reached B (this replica only), and a
+		// holder of os1's MAC appears after the preflight.
+		hide := `UPDATE operations SET desired_ref = desired_ref || '#lag' WHERE operation_kind = ? AND resource_id = 'os1'`
+		show := `UPDATE operations SET desired_ref = replace(desired_ref, '#lag', '') WHERE operation_kind = ? AND resource_id = 'os1'`
+		if err := localExec(ctx, b.DB, hide, string(corrosion.OpDrainColdMove)); err != nil {
+			t.Error(err)
+		}
+		defer func() { _ = localExec(ctx, b.DB, show, string(corrosion.OpDrainColdMove)) }()
+		if err := localExec(ctx, b.DB, `INSERT INTO vms (name, host_name, state, spec, created_at, updated_at) VALUES ('late', ?, 'running', '{}', 't', 't')`, b.Name); err != nil {
+			t.Error(err)
+		}
+		if err := localExec(ctx, b.DB, `INSERT INTO vm_interfaces (vm_name, network_name, ordinal, mac, updated_at) VALUES ('late', 'lan', 0, ?, 't')`, dup); err != nil {
+			t.Error(err)
+		}
+		return handler(hctx, req)
+	})
+	progress, err := drainHost(t, sc.c, a)
+	if len(gotOp) != 1 {
+		t.Fatalf("premise: this build's marker names its operation (%v)", gotOp)
+	}
+	if err != nil || progress["os1"] == nil || progress["os1"].Status != "done" || progress["os1"].Error != "" {
+		t.Fatalf("drain with an earlier build's marker: %v (%+v)", err, progress["os1"])
+	}
+	if active, _ := b.Virt.DomainIsActive("os1"); !active {
+		t.Fatalf("os1, running before the drain, is left stopped on %s", b.Name)
+	}
+
+	// The same kind of marker on a row stopped with another drain's intent.
+	_ = b.Virt.DestroyDomain("os1")
+	if err := localExec(ctx, b.DB, `UPDATE vms SET state = 'stopped', state_detail = ? WHERE name = 'os1'`, health.DrainStopDetail("m-other")); err != nil {
+		t.Fatal(err)
+	}
+	vm, _ := corrosion.GetVM(ctx, b.DB, "os1")
+	old := metadata.AppendToOutgoingContext(ctx, grpcapi.DrainResumeFromMDKey, a.Name,
+		grpcapi.DrainResumeEpochMDKey, strconv.FormatInt(vm.OwnerEpoch, 10))
+	if _, err := sc.c.PeerClient(a, b).StartVM(old, &pb.StartVMRequest{Name: "os1"}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("an earlier build's marker on another drain's stop: got %v, want the shared-MAC refusal", err)
+	}
+	if active, _ := b.Virt.DomainIsActive("os1"); active {
+		t.Fatal("os1 was started on another drain's stop")
+	}
+}

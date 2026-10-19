@@ -377,9 +377,10 @@ func (s *Server) drainResumeFromPeer(ctx context.Context) (source string, epoch 
 		slog.Warn("start: ignoring a drain-resume marker with an unreadable epoch", "claimed_source", claimed, "epoch", e[0])
 		return "", 0, "", false
 	}
+	// An earlier build's source names no operation: op is "".
 	o := md.Get(DrainResumeOpMDKey)
-	if len(o) == 0 || o[0] == "" {
-		return "", 0, "", false
+	if len(o) == 0 {
+		return claimed, n, "", true
 	}
 	return claimed, n, o[0], true
 }
@@ -406,7 +407,7 @@ func (s *Server) refuseStartOnSharedMAC(ctx context.Context, name string) error 
 		// A marker decides alone: honoured for the VM as its move handed it
 		// over, and otherwise the start is checked as any start — a rejected
 		// marker is never rescued by the journal.
-		if src, epoch, op, ok := s.drainResumeFromPeer(ctx); ok {
+		if src, epoch, op, ok := s.drainResumeFromPeer(ctx); ok && op != "" {
 			vm, err := corrosion.GetVM(ctx, s.db, name)
 			if err != nil || vm == nil || (vm.OwnerEpoch == epoch && vm.State == "stopped" &&
 				(vm.StateDetail == "" || vm.StateDetail == health.DrainStopDetail(op))) {
@@ -420,6 +421,19 @@ func (s *Server) refuseStartOnSharedMAC(ctx context.Context, name string) error 
 				"vm", name, "source", src, "operation", op, "marker_epoch", epoch, "owner_epoch", vm.OwnerEpoch, "state_detail", vm.StateDetail)
 		}
 	} else {
+		// A marker from an earlier build's source names no operation, so it
+		// binds no stop intent: it exempts only the empty-detail handoff it
+		// can name by epoch — the shape every handoff's transfer writes —
+		// with or without a journal here, since that source does not retry
+		// a refused start. A non-empty stop needs a journal that binds it.
+		if src, epoch, op, ok := s.drainResumeFromPeer(ctx); ok && op == "" {
+			vm, err := corrosion.GetVM(ctx, s.db, name)
+			if err != nil || vm == nil || (vm.OwnerEpoch == epoch && vm.State == "stopped" && vm.StateDetail == "") {
+				return nil
+			}
+			slog.Warn("start: an earlier build's drain-resume marker for a VM not in the empty handoff shape; checked by the journal",
+				"vm", name, "source", src, "marker_epoch", epoch, "owner_epoch", vm.OwnerEpoch, "state_detail", vm.StateDetail)
+		}
 		// No marker (an earlier build's source): an open move in this
 		// replica exempts the start only for the VM exactly as that move
 		// handed it over — on this host at its journaled epoch + 1, in the
@@ -455,8 +469,9 @@ func (s *Server) refuseStartOnSharedMAC(ctx context.Context, name string) error 
 // marker at all, honoured or not.
 //
 // A marker that names no drain operation (an earlier build's source) binds
-// nothing to the row's stop intent: it counts as absent, and the start is
-// judged by the journal instead.
+// no stop intent: it is judged on the unbound path instead, where it
+// exempts only the empty-detail handoff at its epoch, and the journal decides
+// anything else.
 func hasDrainResumeMarker(ctx context.Context) bool {
 	md, ok := metadata.FromIncomingContext(ctx)
 	return ok && len(md.Get(DrainResumeFromMDKey)) > 0 && len(md.Get(DrainResumeOpMDKey)) > 0

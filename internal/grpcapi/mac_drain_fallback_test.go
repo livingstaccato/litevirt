@@ -139,12 +139,49 @@ func TestStartVM_ADrainMarkerIsBoundToItsOwnStopIntent(t *testing.T) {
 	if s, ctx := setup(t, ""); s.refuseStartOnSharedMAC(ctx, "moved") != nil {
 		t.Error("the empty handoff detail was not exempted by m0's marker")
 	}
-	// No operation named: absent, so judged by the (empty) journal: refused.
-	s, _ := setup(t, "")
+	// No operation named (an earlier build's source): it binds no stop
+	// intent, so a non-empty one is judged by the (empty) journal: refused.
+	s, _ := setup(t, health.DrainStopDetail("m0"))
 	vm, _ := corrosion.GetVM(context.Background(), s.db, "moved")
 	noOp := metadata.NewIncomingContext(peerCtxFor(t, s, "src-host2"), metadata.Pairs(DrainResumeFromMDKey, "src-host2",
 		DrainResumeEpochMDKey, strconv.FormatInt(vm.OwnerEpoch, 10)))
 	if status.Code(s.refuseStartOnSharedMAC(noOp, "moved")) != codes.FailedPrecondition {
-		t.Error("a marker with no operation exempted the start without a journal")
+		t.Error("a marker with no operation exempted a non-empty stop without a journal")
+	}
+}
+
+// An earlier build's marker (from and epoch, no operation) with no journal at
+// all: the empty-detail handoff at its epoch is exempted; a non-empty stop —
+// another drain's, an operator's — or another epoch is not.
+func TestStartVM_AnEarlierBuildsMarkerExemptsOnlyTheEmptyHandoff(t *testing.T) {
+	const dup = "52:54:00:00:4f:01"
+	try := func(t *testing.T, detail string, epochDelta int64) error {
+		t.Helper()
+		s := testServer(t)
+		ctx := context.Background()
+		if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "moved", HostName: s.hostName, State: "stopped", StateDetail: detail},
+			[]corrosion.InterfaceRecord{{VMName: "moved", NetworkName: "lan", MAC: dup}}, nil); err != nil {
+			t.Fatal(err)
+		}
+		seedNICOf(t, s, "theirs", dup)
+		vm, _ := corrosion.GetVM(ctx, s.db, "moved")
+		old := metadata.NewIncomingContext(peerCtxFor(t, s, "src-host"), metadata.Pairs(DrainResumeFromMDKey, "src-host",
+			DrainResumeEpochMDKey, strconv.FormatInt(vm.OwnerEpoch+epochDelta, 10)))
+		return s.refuseStartOnSharedMAC(old, "moved")
+	}
+	if err := try(t, "", 0); err != nil {
+		t.Errorf("the empty handoff: %v", err)
+	}
+	for name, c := range map[string]struct {
+		detail string
+		delta  int64
+	}{
+		"another drain's stop": {health.DrainStopDetail("m1"), 0},
+		"an operator's stop":   {"operator-stop", 0},
+		"another epoch":        {"", 2},
+	} {
+		if err := try(t, c.detail, c.delta); status.Code(err) != codes.FailedPrecondition {
+			t.Errorf("%s: got %v, want the shared-MAC refusal", name, err)
+		}
 	}
 }

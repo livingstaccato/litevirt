@@ -1248,6 +1248,25 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetCapacityPolicy(capacity)
 	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
 	svc.SetVMReplaceEnforce(d.cfg.Enforcement.VMReplace)                 // drives the latch + conditional advertisement; gates `lv cutover`
+	// The first pass over the swtpm tree (vtpm_state_sync), before anything
+	// on this host can start a VM: the cutover resume below, the startup
+	// recovery barrier, the runtime loops, onboot autostart and the API.
+	// It completes, or runs past vtpmPassWait and raises
+	// vtpm_state_not_durable; either way no vTPM guest writes state here
+	// before the attempt to make that state synchronous. The vTPM capability
+	// label (below) reuses the same probe.
+	vtpmMarker := filepath.Join(d.cfg.DataDir, "vtpm-state-sync")
+	vtpmSync := &vtpmStateSync{
+		on:   d.cfg.VTPMStateSyncEnabled(),
+		base: libvirt.SwtpmBase(),
+		wait: vtpmPassWait,
+		sync: func(on bool) libvirt.SwtpmSyncReport { return libvirt.SyncSwtpmState(on, vtpmMarker) },
+		report: func(open bool, evidence map[string]any) bool {
+			return d.syncVTPMCondition(ctx, open, evidence)
+		},
+	}
+	tpmCapable := tpmCapableProbe(exec.LookPath, vtpmSync.probe)
+	awaitFirstVTPMPass(tpmCapable)
 	// Finish any cutover cleanup a previous process left committed-but-unfinished.
 	// The replacement transition displaced the rows describing what the replaced VM
 	// owned, so its journaled manifest is the only surviving record of the volumes
@@ -1761,19 +1780,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	//   - Secure Boot: the secboot/MS OVMF pair (resolved above).
 	// Asserted now, before the container checker starts, and re-asserted every
 	// capabilityLabelInterval (keepCapabilityLabels says why).
-	vtpmMarker := filepath.Join(d.cfg.DataDir, "vtpm-state-sync")
-	vtpmSync := &vtpmStateSync{
-		on:   d.cfg.VTPMStateSyncEnabled(),
-		base: libvirt.SwtpmBase(),
-		wait: vtpmPassWait,
-		sync: func(on bool) libvirt.SwtpmSyncReport { return libvirt.SyncSwtpmState(on, vtpmMarker) },
-		report: func(open bool, evidence map[string]any) bool {
-			return d.syncVTPMCondition(ctx, open, evidence)
-		},
-	}
 	capabilityLabels := []capabilityLabel{
 		{key: corrosion.LabelLXCCapable, capable: lxc.Available},
-		{key: corrosion.LabelTPMCapable, capable: tpmCapableProbe(exec.LookPath, vtpmSync.probe)},
+		{key: corrosion.LabelTPMCapable, capable: tpmCapable},
 		{key: corrosion.LabelSecureBootCapable, capable: firmwarePaths.SecureBootAvailable},
 	}
 	asserted, err := assertCapabilityLabels(ctx, d.db, d.cfg.HostName, capabilityLabels)

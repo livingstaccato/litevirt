@@ -71,7 +71,9 @@ type AntiEntropy struct {
 	// drift rate-limits the drift-detected line for a drift that has not
 	// changed (antientropy_driftlog.go).
 	drift driftLog
-	conns aeConnPool
+	// onFinish, when set, is called after each peer's merge half. Tests only.
+	onFinish func(peer string)
+	conns    aeConnPool
 	// owned is set while Start's loop runs: the pool then persists across
 	// passes, and Start closes it when the loop ends. A pass no loop owns
 	// closes its connections when it ends.
@@ -336,8 +338,9 @@ func (ae *AntiEntropy) checkPeerSet(ctx context.Context, choose func([]PeerInfo)
 	// The digests are asked of every target concurrently, at most
 	// antiEntropyPeerConcurrency at a time (#261): with peers asked one at a
 	// time a pass cost the sum of their round trips. What a digest disagreement
-	// leads to — the pulls and merges — then runs one peer at a time in target
-	// order, exactly as before, so the merge engine never sees two peers at once.
+	// leads to — the pulls and merges — runs one peer at a time on this
+	// goroutine, in the order the digests arrive, so the merge engine never
+	// sees two peers at once and a slow digest holds back no other peer's merge.
 	//
 	// Each peer gets a deadline of its own, for each half. On the daemon's root
 	// context a peer that accepted the connection and then sat on
@@ -345,44 +348,50 @@ func (ae *AntiEntropy) checkPeerSet(ctx context.Context, choose func([]PeerInfo)
 	// it in the member list was never checked again, and whatever divergence
 	// anti-entropy exists to heal stayed unhealed. A dial timeout cannot catch
 	// that: the dial succeeded.
-	exchanges := make([]*peerExchange, len(targets))
-	sem := make(chan struct{}, max(antiEntropyPeerConcurrency, 1))
-	var wg sync.WaitGroup
-	for i, peer := range targets {
-		select {
-		case sem <- struct{}{}:
-		case <-ctx.Done():
+	opened := make(chan *peerExchange, len(targets))
+	go func() {
+		sem := make(chan struct{}, max(antiEntropyPeerConcurrency, 1))
+		var wg sync.WaitGroup
+		for _, peer := range targets {
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+			}
+			if ctx.Err() != nil {
+				break
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer func() { <-sem }()
+				pctx, cancel := context.WithTimeout(ctx, antiEntropyPeerTimeout)
+				defer cancel()
+				opened <- ae.openExchange(pctx, peer, sensitiveMap, full)
+			}()
 		}
-		if ctx.Err() != nil {
-			break
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-			pctx, cancel := context.WithTimeout(ctx, antiEntropyPeerTimeout)
-			defer cancel()
-			exchanges[i] = ae.openExchange(pctx, peer, sensitiveMap, full)
-		}()
-	}
-	wg.Wait()
-	for _, ex := range exchanges {
+		wg.Wait()
+		close(opened)
+	}()
+	var exchanges []*peerExchange
+	for ex := range opened {
 		if ex == nil {
 			continue
 		}
+		exchanges = append(exchanges, ex)
 		pctx, cancel := context.WithTimeout(ctx, antiEntropyPeerTimeout)
 		if ae.finishExchange(pctx, ex, localMap, full) {
 			ae.client.markReplicaCaughtUp(gen, ex.peer)
 		}
 		cancel()
+		if ae.onFinish != nil {
+			ae.onFinish(ex.peer)
+		}
 	}
 	// Outside Start's loop, or once the pool is closed, nothing would close
 	// these connections later.
 	if !ae.poolPersists() {
 		for _, ex := range exchanges {
-			if ex != nil {
-				ex.pc.close()
-			}
+			ex.pc.close()
 		}
 		ae.conns.closeAll()
 	}
@@ -457,8 +466,12 @@ func (ae *AntiEntropy) openExchange(ctx context.Context, peerName string, sensit
 	resp, err := ae.askDigest(ctx, pc, full)
 	if err != nil && !fresh && status.Code(err) == codes.Unavailable {
 		// A reused connection whose transport died under it — a peer that
-		// rebooted without closing it — is tried once more on a fresh dial,
-		// so the pass does not lose its exchange with that peer.
+		// rebooted and reset it — is tried once more on a fresh dial, so the
+		// pass does not lose its exchange with that peer. A half-open
+		// transport that never sees a reset instead waits out the digest
+		// budget as DeadlineExceeded and is not retried: the pass loses that
+		// one exchange, and the connection is dropped below, so the next pass
+		// dials afresh.
 		ae.conns.drop(peerName, pc)
 		if pc, _, err = ae.pooledPeerClient(ctx, peerName); err != nil {
 			slog.Debug("anti-entropy: cannot reach peer", "peer", peerName, "error", err)
@@ -504,6 +517,16 @@ func (ae *AntiEntropy) askDigest(ctx context.Context, pc *aePooledConn, full boo
 func (ae *AntiEntropy) finishExchange(ctx context.Context, ex *peerExchange, localMap map[string]TableDigest, full bool) bool {
 	peerName, client, resp := ex.peer, ex.client, ex.digest
 	if ae.mergeSourceRefused(ctx, peerName) {
+		ae.conns.drop(peerName, ex.pc)
+		return false
+	}
+	// The connection was checked against the peer's row and this node's PKI
+	// when the digest half took it. Merges from other peers since then may
+	// have re-admitted or removed this one, or installed a CRL that revokes
+	// it, so the key is checked again before anything is pulled over it.
+	if _, key, err := ae.peerKey(ctx, peerName); err != nil || key != ex.pc.key {
+		slog.Info("anti-entropy: not pulling over a connection whose peer row or local PKI changed since its digest; it is redialled next pass",
+			"peer", peerName, "error", err)
 		ae.conns.drop(peerName, ex.pc)
 		return false
 	}

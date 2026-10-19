@@ -185,16 +185,26 @@ func (ae *AntiEntropy) poolPersists() bool {
 // pool holds none that is still valid (see aeConnPool). fresh is true when it
 // was dialled now.
 func (ae *AntiEntropy) pooledPeerClient(ctx context.Context, peer string) (pc *aePooledConn, fresh bool, err error) {
-	target, host, err := resolvePeerEndpoint(ctx, ae.client, peer)
+	target, key, err := ae.peerKey(ctx, peer)
 	if err != nil {
 		return nil, false, err
 	}
-	key := target
+	return ae.conns.get(peer, key, func() (*grpc.ClientConn, error) { return ae.dialPeer(target) })
+}
+
+// peerKey is the dial target for peer and the key a connection to it is valid
+// under: the target, the peer row's certificate serial and incarnation, and
+// this node's PKI stamp.
+func (ae *AntiEntropy) peerKey(ctx context.Context, peer string) (target, key string, err error) {
+	target, host, err := resolvePeerEndpoint(ctx, ae.client, peer)
+	if err != nil {
+		return "", "", err
+	}
+	key = target
 	if host != nil {
 		key = fmt.Sprintf("%s|%s|%s", target, host.CertSerial, host.CreatedAt)
 	}
-	key += "|" + pkiStamp(ae.pkiDir)
-	return ae.conns.get(peer, key, func() (*grpc.ClientConn, error) { return ae.dialPeer(target) })
+	return target, key + "|" + pkiStamp(ae.pkiDir), nil
 }
 
 // pkiStamp identifies the state of this node's own PKI files: their inodes,

@@ -590,3 +590,80 @@ func TestAEConnPool_AClosedPoolTakesNoConnection(t *testing.T) {
 	}
 	_ = ln
 }
+
+// openAgreeingExchange opens an exchange with an agreeing peer-a, so that
+// finishExchange completes unless something refuses it.
+func openAgreeingExchange(t *testing.T) (*AntiEntropy, *Client, string, *peerExchange) {
+	t.Helper()
+	pkiDir := testPKI(t, "self")
+	c := newPruneTestClient(t)
+	port, _ := servePeer(t, pkiDir, &slowPeer{})
+	addPeerHost(t, c, "peer-a", port, "aa01")
+	c.SetMembersForTests(aeMembers("peer-a"))
+	ae := newTestAE(t, c, pkiDir)
+	ex := ae.openExchange(context.Background(), "peer-a", nil, false)
+	if ex == nil {
+		t.Fatal("precondition: no exchange opened with a reachable, unisolated peer")
+	}
+	return ae, c, pkiDir, ex
+}
+
+// A peer re-admitted with a new certificate while the pass merged from the
+// peers before it is not pulled from over the connection its digest used:
+// that transport was verified against the old row. The merge half checks
+// the connection's key again, as the digest half's dial did.
+func TestFinishExchange_RefusesAPeerWhoseCertificateChangedSinceItsDigest(t *testing.T) {
+	ae, c, _, ex := openAgreeingExchange(t)
+	if _, err := c.DB().Exec(`UPDATE hosts SET cert_serial = 'bb02' WHERE name = 'peer-a'`); err != nil {
+		t.Fatal(err)
+	}
+	if ae.finishExchange(context.Background(), ex, nil, false) {
+		t.Error("merged from a peer whose certificate serial changed since its digest, over the old connection")
+	}
+	if !ex.pc.isClosed() || ae.conns.lookup("peer-a") != nil {
+		t.Error("the stale connection was kept")
+	}
+}
+
+// Likewise a CRL installed mid-pass: the connection's handshake predates it.
+func TestFinishExchange_RefusesAfterTheLocalCRLChangedSinceTheDigest(t *testing.T) {
+	ae, _, pkiDir, ex := openAgreeingExchange(t)
+	if err := os.WriteFile(filepath.Join(pkiDir, "crl.pem"), []byte("newer"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ae.finishExchange(context.Background(), ex, nil, false) {
+		t.Error("merged over a connection whose handshake predates the local CRL")
+	}
+	if !ex.pc.isClosed() || ae.conns.lookup("peer-a") != nil {
+		t.Error("the stale connection was kept")
+	}
+}
+
+// A peer's pull and merge start as soon as its own digest is in, not after
+// the slowest peer's: one slow digest held every merge in the pass back.
+func TestCheckPeers_AMergeDoesNotWaitForASlowerDigest(t *testing.T) {
+	pkiDir := testPKI(t, "self")
+	c := newPruneTestClient(t)
+	f := &inflight{}
+	slow := &slowPeer{delay: 2 * time.Second, f: f}
+	fast := &slowPeer{}
+	ps, _ := servePeer(t, pkiDir, slow)
+	pf, _ := servePeer(t, pkiDir, fast)
+	addPeerHost(t, c, "peer-slow", ps, "")
+	addPeerHost(t, c, "peer-fast", pf, "")
+	c.SetMembersForTests(aeMembers("peer-slow", "peer-fast"))
+	ae := newTestAE(t, c, pkiDir)
+	var fastWhileSlowInFlight atomic.Bool
+	ae.onFinish = func(peer string) {
+		if peer == "peer-fast" && f.now.Load() > 0 {
+			fastWhileSlowInFlight.Store(true)
+		}
+	}
+	ae.checkPeers(context.Background())
+	if slow.calls.Load() != 1 {
+		t.Fatalf("precondition: slow peer asked %d times", slow.calls.Load())
+	}
+	if !fastWhileSlowInFlight.Load() {
+		t.Error("the fast peer's exchange finished only after the slow peer's digest: merges wait for the slowest digest")
+	}
+}

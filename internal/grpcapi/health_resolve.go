@@ -666,13 +666,22 @@ func (s *Server) planMoveHandResolve(ctx context.Context, vm, holder string, ev 
 			}
 			if why != "" {
 				if !force {
+					// Name only exits the next gate takes: keeping the source
+					// needs the domain stopped and the source readable here.
+					forced := fmt.Sprintf("to keep %s all the same, pass --accept %s --force with --reason saying why", keep, keep)
+					exit := fmt.Sprintf("keep %s with `--accept %s` here, or, %s", m.Src, m.Src, forced)
+					switch {
+					case active:
+						exit = fmt.Sprintf("to keep %s, stop the domain first (`lv stop %s`) and retry with --accept of it; or, %s",
+							m.Src, vm, forced)
+					case health.FilesReadable(m.Src) != nil:
+						exit = forced
+					}
 					return nil, nil, nil, status.Errorf(codes.FailedPrecondition,
 						"refusing to resolve %s on vm/%s keeping %s: %s, and the VM changed hands since %s, so it may "+
-							"have run on %s since, and keeping %s discards those writes. Check whether it did (%s); keep %s "+
-							"with `--accept %s` here, or, to keep %s all the same, pass --accept %s --force with --reason "+
-							"saying why",
+							"have run on %s since, and keeping %s discards those writes. Check whether it did (%s); %s",
 						health.MoveUnresolvedCode, vm, keep, why, moved, m.Src, keep,
-						health.MoveStartsText(ctx, s.db, m), m.Src, m.Src, keep, keep)
+						health.MoveStartsText(ctx, s.db, m), exit)
 				}
 				forks = append(forks, fmt.Sprintf("disk %s keeps %s, taken with --force although %s, and the VM changed "+
 					"hands since the move began (owner %s at generation %d then, %s at %d now): what was written to %s "+

@@ -235,8 +235,7 @@ func InstallMigrationTLS(ctx context.Context, pkiDir string, hosts []MigrationTL
 			continue
 		}
 		if other := migrationPairOwner(hosts, h.Name()); other != "" {
-			fail(h.Name(), fmt.Errorf("its migration pair %s-migration.crt would replace this machine's "+
-				"copy of host %s's pair", h.Name(), other))
+			fail(h.Name(), migrationPairCollision(pkiDir, h.Name(), other))
 			continue
 		}
 		// nil: every host was asked above, before anything was issued.

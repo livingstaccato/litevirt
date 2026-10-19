@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"google.golang.org/grpc"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/pki"
@@ -441,6 +444,13 @@ func TestInstallMigrationTLS_ContinuesPastARefusedHost(t *testing.T) {
 	if !bytes.Equal(mustRead(t, filepath.Join(dir, "web-migration.crt")), keep) {
 		t.Error("this machine's copy of host web-migration's pair was replaced")
 	}
+	// The refusal names the colliding files and how to resolve it.
+	for _, want := range []string{filepath.Join(dir, "web-migration.crt"), filepath.Join(dir, "web-migration.key"),
+		"host web-migration's own", "Rename one of the two hosts", "lv host rm web-migration"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("the refusal of web does not say %q:\n%s", want, out.String())
+		}
+	}
 	if _, err := os.Stat(filepath.Join(root, "cfg", "esc-migration.crt")); !os.IsNotExist(err) {
 		t.Errorf("../esc wrote outside the PKI directory: %v", err)
 	}
@@ -485,8 +495,14 @@ func TestHostAdd_RefusesANameWhoseMigrationPairIsAnotherHosts(t *testing.T) {
 	f.client.hosts = append(f.client.hosts, &pb.Host{Name: "web-migration", Address: "10.0.0.5",
 		State: pb.HostState_HOST_ACTIVE, CertSerial: "c1"})
 	err := HostAddOn(context.Background(), f.client, f.target, "web", "10.0.0.9")
-	if err == nil || !strings.Contains(err.Error(), "web-migration") {
-		t.Fatalf("HostAddOn(web) = %v, want a refusal naming web-migration", err)
+	if err == nil {
+		t.Fatal("HostAddOn(web) = nil, want a refusal naming web-migration")
+	}
+	for _, want := range []string{filepath.Join(f.opPKI, "web-migration.crt"), filepath.Join(f.opPKI, "web-migration.key"),
+		"host web-migration's own", "Rename one of the two hosts", "lv host rm web-migration"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("HostAddOn(web) = %v, want it to say %q", err, want)
+		}
 	}
 	if len(f.client.admitted) != 0 || len(f.target.Events) != 0 {
 		t.Errorf("the refused add went ahead: admitted=%v events=%v", f.client.admitted, f.target.Events)
@@ -563,5 +579,35 @@ func TestHostAddPublic_KeepsALiveLegacyName(t *testing.T) {
 		if err == nil || strings.Contains(err.Error(), "invalid host name") || !strings.Contains(err.Error(), "SSH connect") {
 			t.Errorf("HostAdd(%q) over its live row = %v, want it to reach the target", name, err)
 		}
+	}
+}
+
+// listErrClient is a cluster whose host list cannot be read.
+type listErrClient struct{ hostAddTestClient }
+
+func (c *listErrClient) ListHosts(context.Context, *pb.ListHostsRequest, ...grpc.CallOption) (*pb.ListHostsResponse, error) {
+	return nil, errors.New("list unreadable")
+}
+
+// A host list that cannot be read cannot tell a new name from an existing
+// one, so it refuses the add before anything is minted or dialled, for a
+// valid name too (the reviewer's test, hostname-rereview.md L2).
+//
+// Mutation: ignore the ListHosts error in HostAdd — node-2 mints the
+// migration CA, reads the peers over SSH and dials the target.
+func TestHostAddPublic_UnreadableListRefusesBeforeAnyEffect(t *testing.T) {
+	useConfig(t, "")
+	for _, name := range []string{"node-2", "node+1"} {
+		root, _ := operatorPKIUnder(t)
+		probes := publicAddProbes(t)
+		before := dirSnapshot(t, root)
+		err := HostAdd(context.Background(), &listErrClient{}, "root@127.0.0.1:1", name, []string{"10.0.0.1:7946"})
+		if err == nil || !strings.Contains(err.Error(), "list the cluster's hosts") {
+			t.Errorf("HostAdd(%q) = %v, want the unreadable list to refuse", name, err)
+		}
+		if *probes != 0 {
+			t.Errorf("%q: %d peer probe(s) before the refusal", name, *probes)
+		}
+		sameTree(t, name, root, before)
 	}
 }

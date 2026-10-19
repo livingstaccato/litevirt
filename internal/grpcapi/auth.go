@@ -475,24 +475,9 @@ func (s *Server) isTrustedHostCN(ctx context.Context, cn string) bool {
 }
 
 // callerCertIsClientOnly reports whether the presented certificate is a
-// CLIENT certificate: its extended key usage names ClientAuth and not
-// ServerAuth, which is what GenerateClientCert issues (the distributable
-// lv-cli certificate).
+// CLIENT certificate (pki.IsClientOnlyCert): the distributable lv-cli one.
 func callerCertIsClientOnly(ctx context.Context) bool {
-	cert := peerLeafCert(ctx)
-	if cert == nil {
-		return false
-	}
-	client := false
-	for _, u := range cert.ExtKeyUsage {
-		switch u {
-		case x509.ExtKeyUsageServerAuth:
-			return false
-		case x509.ExtKeyUsageClientAuth:
-			client = true
-		}
-	}
-	return client
+	return pki.IsClientOnlyCert(peerLeafCert(ctx))
 }
 
 // callerCertHasServerAuth reports whether the presented certificate is a HOST

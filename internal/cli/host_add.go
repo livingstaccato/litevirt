@@ -58,7 +58,7 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	if err != nil {
 		return fmt.Errorf("list the cluster's hosts before adding %s: %w", hostName, err)
 	}
-	if err := checkAddName(hostsResp.GetHosts(), hostName); err != nil {
+	if err := checkAddName(PKIDir(), hostsResp.GetHosts(), hostName); err != nil {
 		return err
 	}
 	pkiDir := PKIDir()
@@ -204,7 +204,7 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 		return fmt.Errorf("list the cluster's hosts before adding %s: %w", p.hostName, err)
 	}
 	hosts := hostsResp.GetHosts()
-	if err := checkAddName(hosts, p.hostName); err != nil {
+	if err := checkAddName(p.pkiDir, hosts, p.hostName); err != nil {
 		return err
 	}
 	installed, err := remoteSerial(r, hostCrt)
@@ -402,7 +402,7 @@ func remoteSerial(r addRemote, path string) (string, error) {
 // build admitted. A removed name is not listed, so re-adding it is a new name.
 // It also refuses a name whose migration pair, <name>-migration.crt|.key in
 // this machine's directory, is another live host's pair.
-func checkAddName(hosts []*pb.Host, name string) error {
+func checkAddName(pkiDir string, hosts []*pb.Host, name string) error {
 	if liveHost(hosts, name) == nil {
 		if err := pki.ValidateHostName(name); err != nil {
 			return err
@@ -410,11 +410,21 @@ func checkAddName(hosts []*pb.Host, name string) error {
 	}
 	for _, h := range hosts {
 		if strings.EqualFold(h.GetName(), name+"-migration") {
-			return fmt.Errorf("invalid host name %q: its migration pair %s-migration.crt would replace "+
-				"this machine's copy of host %s's pair", name, name, h.GetName())
+			return migrationPairCollision(pkiDir, name, h.GetName())
 		}
 	}
 	return nil
+}
+
+// migrationPairCollision is the refusal for host name whose migration pair,
+// <pkiDir>/<name>-migration.crt|.key, is the file host other's own pair is
+// kept in.
+func migrationPairCollision(pkiDir, name, other string) error {
+	crt := filepath.Join(pkiDir, name+"-migration.crt")
+	return fmt.Errorf("host %s's migration pair would be written to %s and %s, which hold host %s's own "+
+		"certificate and key: the two names collide in this machine's PKI directory. Rename one of the "+
+		"two hosts: remove it (`lv host rm %s`) and add it again under another name (`lv host add --name`)",
+		name, crt, strings.TrimSuffix(crt, ".crt")+".key", other, other)
 }
 
 func liveHost(hosts []*pb.Host, name string) *pb.Host {

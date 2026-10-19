@@ -1,6 +1,8 @@
 package pki
 
 import (
+	"crypto/x509"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -93,5 +95,44 @@ func TestOperatorPKIFileAt(t *testing.T) {
 		if f, ok := OperatorPKIFileAt(filepath.Join(dir, n)); ok {
 			t.Errorf("OperatorPKIFileAt(%s) = %q, want none", n, f)
 		}
+	}
+}
+
+// IsClientOnlyCert is the host-versus-client discriminator peer trust and the
+// claim verifiers share: ClientAuth without ServerAuth.
+//
+// Mutation: return false when ClientAuth is seen — the client certificate is
+// not recognised.
+func TestIsClientOnlyCert(t *testing.T) {
+	dir := t.TempDir()
+	ca, caKey := filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key")
+	if err := GenerateCA(ca, caKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := GenerateClientCert(ca, caKey, filepath.Join(dir, "c.crt"), filepath.Join(dir, "c.key"), "lv-cli"); err != nil {
+		t.Fatal(err)
+	}
+	if err := GenerateHostCert(ca, caKey, filepath.Join(dir, "h.crt"), filepath.Join(dir, "h.key"), "lv-cli", nil); err != nil {
+		t.Fatal(err)
+	}
+	load := func(n string) *x509.Certificate {
+		b, err := os.ReadFile(filepath.Join(dir, n))
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := ParseCertPEM(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	if !IsClientOnlyCert(load("c.crt")) {
+		t.Error("the client certificate is not client-only")
+	}
+	if IsClientOnlyCert(load("h.crt")) {
+		t.Error("a host certificate is client-only")
+	}
+	if IsClientOnlyCert(nil) || IsClientOnlyCert(&x509.Certificate{}) {
+		t.Error("a nil or EKU-less certificate is client-only")
 	}
 }

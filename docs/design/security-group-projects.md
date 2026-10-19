@@ -3,8 +3,8 @@
 | | |
 |---|---|
 | Status | **Implemented** |
-| Base | integration `9eb7951f`, schema v69 |
-| Schema | one additive column, `security_groups.project` (v70, renumbered at merge) |
+| Base | integration `9cde70f20`, schema v69 |
+| Schema | one additive column, `security_groups.project` (v70) |
 | Gate | release feature `sg_projects` of `release_2026_11_v1` |
 
 ## 1. Data

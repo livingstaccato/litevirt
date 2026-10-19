@@ -898,25 +898,27 @@ func DeleteHost(ctx context.Context, c *Client, name string) error {
 }
 
 // DeleteHostIf is DeleteHost only while name's live row is still the
-// admission a caller checked: the certificate serial (compared without case)
-// and the incarnation, read in the same transaction as the delete. A row that
-// changed since — removed, re-admitted under a new certificate or
-// incarnation, its certificate renewed — is not deleted, and applied is
+// admission a caller checked: its whole ordering key (incarnation and
+// admission stamp, host_incarnation.go) and its certificate serial (compared
+// without case), read in the same transaction as the delete. A row that
+// changed since — removed, re-admitted under a new certificate, incarnation
+// or stamp (a later duplicate admission at the same incarnation, even of the
+// same certificate), its certificate renewed — is not deleted, and applied is
 // false. The statements are DeleteHost's.
-func DeleteHostIf(ctx context.Context, c *Client, name, serial string, incarnation int64) (applied bool, err error) {
+func DeleteHostIf(ctx context.Context, c *Client, name, serial string, key HostIncarnation) (applied bool, err error) {
 	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
-		var curSerial string
+		var curSerial, curAt string
 		var curInc int64
 		err := tx.QueryRowContext(ctx,
-			`SELECT COALESCE(cert_serial, ''), COALESCE(incarnation, 0) FROM hosts WHERE name = ? AND deleted_at IS NULL`,
-			name).Scan(&curSerial, &curInc)
+			`SELECT COALESCE(cert_serial, ''), COALESCE(incarnation, 0), COALESCE(created_at, '') FROM hosts WHERE name = ? AND deleted_at IS NULL`,
+			name).Scan(&curSerial, &curInc, &curAt)
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
 		}
 		if err != nil {
 			return false, err
 		}
-		return strings.EqualFold(curSerial, serial) && curInc == incarnation, nil
+		return strings.EqualFold(curSerial, serial) && curInc == key.N && curAt == key.At, nil
 	}, deleteHostStatements(c, name))
 }
 

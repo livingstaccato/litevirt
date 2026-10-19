@@ -190,8 +190,10 @@ func renewHostCert(ctx context.Context, c pb.LiteVirtClient, r remotePKI, probe 
 	if recorded != prevSerial {
 		return fmt.Errorf("the cluster records certificate %q for %s, but the host holds %s. A successor "+
 			"of a certificate the cluster does not record would be refused by every peer until "+
-			"replication catches up. The daemon re-records its own serial within a minute of starting "+
-			"(or of adopting a renewal) — wait for `lv host inspect %s` to show %s, then retry",
+			"replication catches up. At incarnation 0, or for a renewal or the host's own admission, the "+
+			"daemon re-records its own serial within a minute of starting (or of adopting a renewal) — "+
+			"wait for `lv host inspect %s` to show %s, then retry. Otherwise `lv health` on the host shows "+
+			"own_row_held and how to recover",
 			recorded, hostName, prevSerial, hostName, prevSerial)
 	}
 	if err := sameBuildEverywhere(hosts.Hosts, hostName); err != nil && !opts.Force {

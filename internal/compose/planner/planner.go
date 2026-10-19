@@ -997,6 +997,22 @@ func buildPlacementRequest(spec *pb.VMSpec, capacity corrosion.CapacityPolicy) p
 	for _, dev := range spec.Devices {
 		req.Devices = append(req.Devices, placement.DeviceRequestFor(dev))
 	}
+	// A Secure Boot / vTPM VM goes only to a host that advertises it, as
+	// CreateVM's placement requires (grpcapi.addCapabilityLabels). The map
+	// is copied: it is the compose file's own.
+	if spec.SecureBoot || spec.Tpm {
+		rl := map[string]string{}
+		for k, v := range req.RequireLabels {
+			rl[k] = v
+		}
+		if spec.Tpm {
+			rl[corrosion.LabelTPMCapable] = "true"
+		}
+		if spec.SecureBoot {
+			rl[corrosion.LabelSecureBootCapable] = "true"
+		}
+		req.RequireLabels = rl
+	}
 	return req
 }
 

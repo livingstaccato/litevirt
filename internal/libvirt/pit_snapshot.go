@@ -406,11 +406,11 @@ func domainXMLReferences(domXML, path string) (bool, error) {
 	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
 		return false, err
 	}
-	want := fileIdentity(path)
+	want := chainPathIdentity(path)
 	for i := range d.Disks {
 		for c := &d.Disks[i]; c != nil; c = c.Backing {
 			for _, p := range []string{c.Source.File, c.Source.Dev} {
-				if p != "" && want.same(fileIdentity(p)) {
+				if p != "" && want.same(chainPathIdentity(p)) {
 					return true, nil
 				}
 			}
@@ -425,7 +425,7 @@ type identity struct {
 	fi              os.FileInfo
 }
 
-func fileIdentity(p string) identity {
+func chainPathIdentity(p string) identity {
 	id := identity{clean: filepath.Clean(p), resolved: filepath.Clean(p)}
 	if r, err := filepath.EvalSymlinks(p); err == nil {
 		id.resolved = r

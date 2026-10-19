@@ -2,17 +2,38 @@ package grpcapi
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/apimeta"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 func admit(s *Server, name string) (*pb.AdmitHostResponse, error) {
-	return s.AdmitHost(adminCtx(), &pb.AdmitHostRequest{Name: name, Address: "10.0.0.9", CertSerial: "0a0b0c"})
+	return admitFrom(s, name, true)
+}
+
+// admitFrom is admit from an lv that names the release it installs
+// (this release's), or, with current false, from a previous release's.
+func admitFrom(s *Server, name string, current bool) (*pb.AdmitHostResponse, error) {
+	ctx := adminCtx()
+	if current {
+		ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(apimeta.AdmitInstallsReleaseHeader, capabilities.ReleaseToken))
+	}
+	return s.AdmitHost(ctx, &pb.AdmitHostRequest{Name: name, Address: "10.0.0.9", CertSerial: "0a0b0c"})
+}
+
+// admitAt is admit at another address than admit's: AdmitHost refuses a
+// second name at an address a host already holds.
+func admitAt(s *Server, name, addr string) (*pb.AdmitHostResponse, error) {
+	ctx := metadata.NewIncomingContext(adminCtx(), metadata.Pairs(apimeta.AdmitInstallsReleaseHeader, capabilities.ReleaseToken))
+	return s.AdmitHost(ctx, &pb.AdmitHostRequest{Name: name, Address: addr, CertSerial: "0b0c0d"})
 }
 
 // TestAdmitHost_AHeldAdmitterRefuses is I-A: a node that is itself holding its
@@ -153,5 +174,63 @@ func TestGetStateDigest_ReportsSeededOnlyWhenNotHeld(t *testing.T) {
 	s.db.HoldAuditUntilCaughtUp(corrosion.AuditHoldConfig{Host: s.hostName, Target: 9, TargetHash: "ab"})
 	if resp, err := s.GetStateDigest(adminCtx(), nil); err != nil || resp.GetAuditSeeded() {
 		t.Fatalf("seeded but held: %v %v; want not reported seeded", resp.GetAuditSeeded(), err)
+	}
+}
+
+// fd re-review N-m4: two `lv host add` runs against one machine under two
+// names each passed the CLI's address check before either was admitted.
+// AdmitHost itself refuses an address (at the gRPC port it records) that
+// another live or joining host already holds; a removed host's, or another
+// port's, does not count.
+//
+// Mutation: drop the check — "live" and "joining" are admitted.
+func TestAdmitHost_RefusesAnAddressAnotherHostHolds(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name    string
+		other   corrosion.HostRecord
+		removed bool
+		refuse  bool
+	}{
+		{"live", corrosion.HostRecord{Name: "other", Address: "10.0.0.9", GRPCPort: 7443, State: "active"}, false, true},
+		{"joining", corrosion.HostRecord{Name: "other", Address: "10.0.0.9", GRPCPort: 7443, State: corrosion.HostStateJoining}, false, true},
+		{"removed", corrosion.HostRecord{Name: "other", Address: "10.0.0.9", GRPCPort: 7443, State: "active"}, true, false},
+		{"another port", corrosion.HostRecord{Name: "other", Address: "10.0.0.9", GRPCPort: 7500, State: "active"}, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := testServer(t)
+			if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: s.hostName, Address: "10.0.0.1", State: "active"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.db.MarkAuditSeeded(ctx, "genesis"); err != nil {
+				t.Fatal(err)
+			}
+			s.db.MarkReplicaCaughtUpForTests("peer")
+			tc.other.CertSerial = "ffee"
+			if err := corrosion.InsertHost(ctx, s.db, tc.other); err != nil {
+				t.Fatal(err)
+			}
+			if tc.removed {
+				if err := corrosion.DeleteHost(ctx, s.db, "other"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := admit(s, "node-1")
+			if tc.refuse {
+				// N2-n2: a machine rebuilt under a new name usually replaces a dead
+				// host, which `lv host rm --dead` removes.
+				if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "lv host rm other") ||
+					!strings.Contains(err.Error(), "lv host rm --dead other") {
+					t.Fatalf("admit at an address other holds = %v, want a refusal naming it", err)
+				}
+				if h, _ := corrosion.GetHost(ctx, s.db, "node-1"); h != nil {
+					t.Error("the refused host was admitted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("admit = %v, want it admitted", err)
+			}
+		})
 	}
 }

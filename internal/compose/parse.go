@@ -320,6 +320,12 @@ func mergeVMDef(base, child VMDef) VMDef {
 	if child.Onboot {
 		m.Onboot = child.Onboot
 	}
+	if child.SecureBoot {
+		m.SecureBoot = true
+	}
+	if child.TPM {
+		m.TPM = true
+	}
 	if child.StartupOrder != 0 {
 		m.StartupOrder = child.StartupOrder
 	}

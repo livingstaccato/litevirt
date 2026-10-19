@@ -364,6 +364,18 @@ func (f *recordingNetBox) CreateInterface(_ context.Context, i netbox.VMInterfac
 func (f *recordingNetBox) UpdateInterface(context.Context, int, netbox.VMInterface) error { return nil }
 func (f *recordingNetBox) DeleteInterface(context.Context, int) error                     { return nil }
 func (f *recordingNetBox) SetPrimaryIP4(context.Context, int, int) error                  { return nil }
+func (f *recordingNetBox) SetPrimaryIP6(context.Context, int, int) error                  { return nil }
+func (f *recordingNetBox) ClearPrimaryIPs(context.Context, int, bool, bool) error         { return nil }
+func (f *recordingNetBox) LookupByIdentity(context.Context, string, int, string) ([]netbox.IPAddress, error) {
+	return nil, nil
+}
+func (f *recordingNetBox) ClaimSpecificIP(context.Context, string, int, string) (netbox.IPAddress, error) {
+	return netbox.IPAddress{}, errors.New("recordingNetBox does not create addresses")
+}
+func (f *recordingNetBox) ReleaseIP(context.Context, int) error { return nil }
+func (f *recordingNetBox) LookupByAddress(context.Context, string, int) ([]netbox.IPAddress, error) {
+	return nil, nil
+}
 func (f *recordingNetBox) FindDeviceInCluster(context.Context, string, int) (int, error) {
 	return 0, nil
 }

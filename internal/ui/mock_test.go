@@ -562,13 +562,13 @@ func (m *mockGRPC) FenceHost(_ context.Context, in *pb.FenceHostRequest, _ ...gr
 	return &pb.FenceResult{Method: "ipmi", Result: "success"}, nil
 }
 
-func (m *mockGRPC) RemoveHost(_ context.Context, in *pb.RemoveHostRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+func (m *mockGRPC) RemoveHost(_ context.Context, in *pb.RemoveHostRequest, _ ...grpc.CallOption) (*pb.RemoveHostResponse, error) {
 	m.lastRemoveHostName = in.Name
 	m.removeHostCalled = true
 	if m.removeHostErr != nil {
 		return nil, m.removeHostErr
 	}
-	return &emptypb.Empty{}, nil
+	return &pb.RemoveHostResponse{}, nil
 }
 
 func (m *mockGRPC) SetHostLabels(_ context.Context, in *pb.SetHostLabelsRequest, _ ...grpc.CallOption) (*pb.Host, error) {

@@ -101,8 +101,9 @@ lv cluster claim-release <kind>/<name>       # Release one workload ha.claim.leg
                                    #   legacy proof stuck in flight on a live destination; the
                                    #   destination confirms nothing runs it, then abandons it (admin)
 lv health [--resolved]             # Cluster health: overall + conditions + coverage (exit 0/1/2)
-lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E]  # Resolve one open dual-run
-                                   #   condition by hand (admin, audited); re-raised next pass if it still holds
+lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept-stale-uefi-vars]
+                                   # Resolve one open dual-run condition by hand (admin, audited; re-raised next
+                                   #   pass if it still holds), or accept nvram_flush_failed's vars stores as stale
 ```
 
 ## Hosts
@@ -161,6 +162,7 @@ lv host upgrade --binary <path> [host...] # Rolling upgrade of litevirt
   [--yes]                                 # Skip confirmation prompt
   [--force]                               # Skip preflight blocks (warnings still printed)
   [--no-prestage]                         # Skip the cluster-wide schema pre-stage pass
+  [--skip-prestage <host>[,<host>]]       # Members that are down: leave them on their schema
 lv host preflight-upgrade <host>          # Report preflight findings without upgrading
 lv host label set <host> key=value ...    # Set labels on a host
 lv host label rm <host> <key> ...         # Remove labels from a host
@@ -461,6 +463,26 @@ than silently breaking BitLocker. The explicit refusals:
 | automatic failover (host died) | skipped — firmware is host-local and died with the host; recover via restore from a firmware-carrying backup |
 | replica promotion | refused — a disk replica carries no firmware |
 | `lv rm --keep-disks` then `lv run --name <same>` | refused — the retained NVRAM isn't inherited; restore the VM instead of recreating it |
+
+**UEFI variable writes and a host power cut.** qemu writes a guest's UEFI
+variables (any UEFI VM, not only Secure Boot) to its vars file without
+flushing it, and libvirt has no cache setting for that file. The daemon
+fsyncs every vars file that changed, in `<data_dir>/nvram/` and
+`/var/lib/libvirt/qemu/nvram/`, once a second, and once more as it stops. A
+host power cut can therefore lose a variable written in about the last second
+before it, or up to `vm.dirty_expire_centisecs` (30 s by default) while the
+daemon is not running. A failed fsync raises `nvram_flush_failed`, and a vars
+file that cannot be opened for a minute raises `nvram_flush_blocked`
+(docs/diagnostics.md).
+
+swtpm makes its own vTPM state durable: it renames each new state file into
+place and fsyncs the directory before the TPM command completes. It does not
+fsync the file's data first, so this relies on ext4's defaults
+(`data=ordered`, `auto_da_alloc`) to write that data before the rename
+commits. Two cases are not covered: the state file's first creation, when
+nothing is replaced, and `/var/lib/libvirt/swtpm` on XFS or btrfs, or on ext4
+mounted `noauto_da_alloc`. In either, a power cut can leave the state file
+empty or old.
 
 ## Containers (LXC / OCI)
 
@@ -1536,6 +1558,10 @@ lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E]
                                              #   audited, ha.condition.resolved event. Refused until a
                                              #   detector scan after its last sighting probed every host
                                              #   it names; raised again next pass if it still holds.
+lv health resolve nvram_flush_failed host/<host> --accept-stale-uefi-vars --reason R
+                                             # Accept that the UEFI vars stores nvram_flush_failed names
+                                             #   may be stale, for a VM kept as it is. Admin, audited
+                                             #   naming every file; a new failed flush raises it again.
 lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since <time>] [--until <time>]   # Audit log (default 50 entries)
 lv host stats <host>                         # Host resource statistics
 lv stats <vm>                                # VM resource statistics

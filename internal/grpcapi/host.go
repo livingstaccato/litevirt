@@ -905,6 +905,9 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// target puts the guest's NIC guards in force before it arrives.
 	armed, aerr := s.armMigrationTarget(ctx, &target, vm.Name)
 	if aerr != nil {
+		// The guest never left: take back what this attempt put on the
+		// target (its cloud-init ISO), and nothing that was there before.
+		s.cleanupFailedMigrationTarget(context.WithoutCancel(ctx), vm.Name, target.Name, nil)
 		if ctx.Err() != nil {
 			return abortedBeforeStart()
 		}

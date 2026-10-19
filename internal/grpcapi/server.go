@@ -382,6 +382,8 @@ type Server struct {
 	// interval and observe its syncs (tests).
 	coldDiskSyncEvery int64
 	coldDiskSyncHook  func(final bool)
+	// coldDiskPlacedHook runs after a receive places its disk (tests).
+	coldDiskPlacedHook func()
 	// drainMoves cancels each VM's drain move in flight (drainOneVM), for
 	// `lv operation abort <vm> --force` (AbortVMOperation). Guarded by
 	// drainMovesMu.

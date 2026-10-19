@@ -443,8 +443,9 @@ func TestFleet_OperationAbortOfALiveDrainMoveLibvirtDoesNotAnswerIsFinishedInThe
 // job is active"). It is sent again until libvirt takes it, so the move is
 // still aborted, within the grace, and the guest stays on the source.
 //
-// Mutation: send the abort once — the move is never aborted, the drain hands
-// it to the background at the grace, red.
+// Mutations: send the abort once — the move is never aborted, the drain
+// hands it to the background at the grace, red. Keep re-sending after the
+// move returned — the count grows, red.
 func TestFleet_OperationAbortThatLibvirtRefusesIsSentAgain(t *testing.T) {
 	sc := newStuckLiveDrainTimeout(t, false, 0)
 	sc.src.Server.SetDrainAbortGraceForTest(5 * time.Second)
@@ -465,6 +466,12 @@ func TestFleet_OperationAbortThatLibvirtRefusesIsSentAgain(t *testing.T) {
 	}
 	if n := sc.src.Virt.AbortedMigrations("slow"); n != 2 {
 		t.Fatalf("abort sent %d time(s), want 2 (refused, then taken)", n)
+	}
+	// Nothing is sent once the move has returned: past two re-send periods,
+	// still 2.
+	time.Sleep(2 * time.Second)
+	if n := sc.src.Virt.AbortedMigrations("slow"); n != 2 {
+		t.Fatalf("abort sent %d time(s) after the move returned, want still 2", n)
 	}
 	waitRow(t, sc.src, sc.src.Name, "running")
 }

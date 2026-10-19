@@ -932,3 +932,76 @@ func TestFleet_DrainColdMoveNamesTheWayOutOfAStrayTargetDisk(t *testing.T) {
 		t.Fatal("os1 is not running on the source")
 	}
 }
+
+// The source gives up on the copy while the target is placing the disk (its
+// directory sync stalls on storage that just wedged). No answer was sent, so
+// the source rolled the move back and keeps the VM's disk: the target takes
+// back the file it just placed, and only that file — one that took its place
+// at the path in the meantime is left as it is.
+//
+// Mutation: no re-check after the directory sync — the placed copy stays on
+// the target, red. Remove whatever is at the path — the other file is gone,
+// red.
+func TestFleet_ColdDiskPlacedAfterTheSourceGaveUpIsTakenBack(t *testing.T) {
+	for _, replaced := range []bool{false, true} {
+		name := "placed copy taken back"
+		if replaced {
+			name = "a file that took its place is left"
+		}
+		t.Run(name, func(t *testing.T) {
+			sc := newColdStoppedScenario(t)
+			sc.makeRunning(t)
+			sc.src.Server.SetColdDiskStallForTest(300 * time.Millisecond)
+			dst := sc.file(sc.dst, sc.disk)
+			release := make(chan struct{})
+			var once sync.Once
+			releaseNow := func() { once.Do(func() { close(release) }) }
+			t.Cleanup(releaseNow)
+			sc.dst.Server.SetColdDiskPlacedHookForTest(func() {
+				if replaced {
+					if err := os.Rename(dst, dst+".aside"); err != nil {
+						t.Errorf("move the placed copy aside: %v", err)
+					}
+					if err := os.WriteFile(dst, []byte("another file"), 0o600); err != nil {
+						t.Errorf("write another file at the path: %v", err)
+					}
+				}
+				<-release
+			})
+			// The move's check of the disk, then the copy: the copy's handler
+			// signals when it has returned.
+			handled := make(chan struct{})
+			sc.dst.HookStream("ReceiveMigrationDisk", func(srv any, ss grpc.ServerStream, h grpc.StreamHandler) error {
+				return h(srv, ss)
+			})
+			sc.dst.HookStream("ReceiveMigrationDisk", func(srv any, ss grpc.ServerStream, h grpc.StreamHandler) error {
+				defer close(handled)
+				return h(srv, ss)
+			})
+			progress, err := drainWithin(t, sc, 30*time.Second)
+			assertIncomplete(t, err)
+			if p := progress["os1"]; p == nil || p.Status != "failed" || !strings.Contains(p.Error, "no progress") {
+				t.Fatalf("drain progress for os1 = %+v, want failed, the copy aborted", p)
+			}
+			releaseNow()
+			select {
+			case <-handled:
+			case <-time.After(15 * time.Second):
+				t.Fatal("the target's receive never returned")
+			}
+			if replaced {
+				if got, err := os.ReadFile(dst); err != nil || string(got) != "another file" {
+					t.Fatalf("the file that took the placed copy's place was touched (err %v, %q)", err, got)
+				}
+			} else if _, err := os.Lstat(dst); !os.IsNotExist(err) {
+				t.Fatalf("the target kept the disk it placed after the source gave up (stat: %v)", err)
+			}
+			if active, _ := sc.src.Virt.DomainIsActive("os1"); !active {
+				t.Fatal("os1 is not running on the source")
+			}
+			if vm := sc.vm(t); vm.HostName != sc.src.Name || vm.State != "running" {
+				t.Fatalf("os1 row = host %s state %s, want running on %s", vm.HostName, vm.State, sc.src.Name)
+			}
+		})
+	}
+}

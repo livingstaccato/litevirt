@@ -292,6 +292,10 @@ const defaultColdDiskSyncEvery = 64 << 20
 // SetColdDiskSyncEveryForTest shortens the interval between a receive's syncs.
 func (s *Server) SetColdDiskSyncEveryForTest(n int64) { s.coldDiskSyncEvery = n }
 
+// SetColdDiskPlacedHookForTest runs fn after a received disk is placed,
+// before its directory is synced. Tests only.
+func (s *Server) SetColdDiskPlacedHookForTest(fn func()) { s.coldDiskPlacedHook = fn }
+
 // SetColdDiskSyncHookForTest runs fn before each sync of a received disk
 // (final: the one before it is placed). Tests only.
 func (s *Server) SetColdDiskSyncHookForTest(fn func(final bool)) { s.coldDiskSyncHook = fn }
@@ -648,6 +652,12 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 			return status.Errorf(codes.Internal, "replace this host's stub %s: %v", hdr.Path, err)
 		}
 	}
+	// The file this receive places: what a re-check below may take back, and
+	// nothing else.
+	ours, err := os.Lstat(tmp.Name())
+	if err != nil {
+		return status.Errorf(codes.Internal, "stat %s: %v", tmp.Name(), err)
+	}
 	if err := placeColdDisk(tmp.Name(), dst); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return status.Errorf(codes.FailedPrecondition,
@@ -657,9 +667,30 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 		return status.Errorf(codes.Internal, "place %s: %v", hdr.Path, err)
 	}
 	placed = true
-	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
-		d.Close()
+	if s.coldDiskPlacedHook != nil {
+		s.coldDiskPlacedHook()
+	}
+	syncDir := func() {
+		if d, err := os.Open(dir); err == nil {
+			_ = d.Sync()
+			d.Close()
+		}
+	}
+	syncDir()
+	// A source that gave up while the disk was placed (the directory sync can
+	// stall on storage that just wedged) has had no answer, so it rolled the
+	// move back and keeps the VM's disk: the file this receive just placed is
+	// taken back, and only that file (the same inode at the same path).
+	if err := stream.Context().Err(); err != nil {
+		if fi, lerr := os.Lstat(dst); lerr == nil && os.SameFile(fi, ours) {
+			if rerr := os.Remove(dst); rerr != nil {
+				slog.Warn("cold migration: could not take back a disk placed after the source gave up",
+					"vm", vm.Name, "path", hdr.Path, "error", rerr)
+			} else {
+				syncDir()
+			}
+		}
+		return status.Errorf(codes.Canceled, "the source gave up on the copy of %s as it was placed: %v", hdr.Path, err)
 	}
 	s.migrationStubs.add(vm.Name, hdr.Path)
 	slog.Info("cold migration: disk received", "vm", vm.Name, "path", hdr.Path, "bytes", hdr.SizeBytes)

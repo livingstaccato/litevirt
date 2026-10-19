@@ -275,7 +275,7 @@ func newDownCmd() *cobra.Command {
 				}
 
 				if len(resp.Vms) == 0 {
-					fmt.Printf("Stack %q has no VMs listed here.\n", name)
+					fmt.Printf("Stack %q has no VMs listed here; its containers and the stack record will be removed.\n", name)
 				} else {
 					fmt.Printf("Will delete %d VM(s) in stack %q:\n", len(resp.Vms), name)
 				}

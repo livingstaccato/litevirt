@@ -660,6 +660,13 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 	if delErr != nil {
 		slog.Warn("deploy update delete failed", "workload", action.VMName, "error", delErr)
 		gate.markUnmet(action.VMName, fmt.Errorf("delete before recreate failed: %w", delErr))
+		if action.IsContainer {
+			// The delete did not complete, so nothing was recreated. The
+			// member is still there unless the delete reached its host.
+			return fmt.Errorf("delete before recreate: %w; container %q was not recreated and is kept unless the delete reached its host: "+
+				"check with lv ct inspect %s, then run lv compose up again (or remove it with lv ct rm %s)",
+				delErr, action.VMName, action.VMName, action.VMName)
+		}
 		return fmt.Errorf("delete before recreate: %w", delErr)
 	}
 	if tornDown {

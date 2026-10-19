@@ -28,11 +28,12 @@ func TestComposeRecreate_KeepsTheMembersSecurity(t *testing.T) {
 		"web": {Kind: compose.WorkloadKindLXC, Image: "alpine:3.21", CPU: 2},
 		"new": {Kind: compose.WorkloadKindLXC, Image: "alpine:3.21"},
 	}}
-	// web was deployed by main: no security recorded.
-	seedSecCT(t, s, rt, "web", "running", corrosion.ContainerCreateSpec{Template: "download", Distro: "alpine"})
+	// web was deployed by main: no security recorded. The recreate is a
+	// cpu change: the image is the one web runs.
+	seedSecCT(t, s, rt, "web", "running", corrosion.ContainerCreateSpec{Template: "download", Distro: "alpine", Release: "3.21"})
 	if err := corrosion.UpsertContainer(context.Background(), s.db, corrosion.ContainerRecord{
-		HostName: "host-a", Name: "web", State: "running", Labels: map[string]string{corrosion.LabelStack: "st"},
-		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download", Distro: "alpine"}),
+		HostName: "host-a", Name: "web", State: "running", Image: "alpine:3.21", Labels: map[string]string{corrosion.LabelStack: "st"},
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download", Distro: "alpine", Release: "3.21"}),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -159,21 +160,22 @@ func TestComposeRecreate_SameImageKeepsAPrivilegedMemberForADeployer(t *testing.
 
 // A recreate that CHANGES the image of a privileged or legacy-confined member
 // hands the deployer a rootfs of their choosing running as host root, so it
-// needs the Admin role or ct.exec on that member (root inside it already).
+// needs what exec in that member needs: the Admin role or the ContainerRoot
+// role on it. ct.exec, which Operator holds through ct.*, is not enough.
 // Anyone else is refused BEFORE the delete half runs: the member is never
 // deleted by a refused recreate.
-func TestComposeRecreate_AChangedImageOfAPrivilegedMemberNeedsExecOrAdmin(t *testing.T) {
+func TestComposeRecreate_AChangedImageOfAPrivilegedMemberNeedsContainerRootOrAdmin(t *testing.T) {
 	changed := &compose.File{Name: "st", VMs: map[string]compose.VMDef{"web": {Kind: compose.WorkloadKindLXC, Image: "alpine:3.23"}}}
 	upd := planner.VMAction{Kind: planner.OpUpdate, VMName: "web", TargetHost: "host-a", IsContainer: true}
 
-	t.Run("a deployer without ct.exec is refused, the member kept", func(t *testing.T) {
+	t.Run("a deployer without ContainerRoot is refused, the member kept", func(t *testing.T) {
 		s, rt := secServer(t)
 		carl := carlCtx(t, s)
 		seedMember(t, s, rt, "3.22")
 		err := recreateMember(carl, s, upd, changed)
 		if status.Code(err) != codes.PermissionDenied || !strings.Contains(err.Error(), "privileged") ||
-			!strings.Contains(err.Error(), "ct.exec") || !strings.Contains(err.Error(), "alpine:3.23") {
-			t.Fatalf("changed-image recreate by a deployer without ct.exec: %v", err)
+			!strings.Contains(err.Error(), "ContainerRoot") || !strings.Contains(err.Error(), "alpine:3.23") {
+			t.Fatalf("changed-image recreate by a deployer without ContainerRoot: %v", err)
 		}
 		memberExists(t, s, rt)
 		if len(rt.createCalls) != 0 {
@@ -183,16 +185,16 @@ func TestComposeRecreate_AChangedImageOfAPrivilegedMemberNeedsExecOrAdmin(t *tes
 			t.Errorf("audit row %+v, want a denied ct.recreate-security", row)
 		}
 	})
-	t.Run("ct.exec on the member", func(t *testing.T) {
-		s, rt := secServer(t)
-		carl := carlCtx(t, s)
-		seedMember(t, s, rt, "3.22")
+	bind := func(t *testing.T, s *Server, role string, verbs []string) {
+		t.Helper()
 		ctx := context.Background()
-		if err := corrosion.InsertRole(ctx, s.db, corrosion.RoleRecord{Name: "Shell", Verbs: []string{"ct.exec"}}); err != nil {
-			t.Fatal(err)
+		if verbs != nil {
+			if err := corrosion.InsertRole(ctx, s.db, corrosion.RoleRecord{Name: role, Verbs: verbs}); err != nil {
+				t.Fatal(err)
+			}
 		}
 		if err := corrosion.InsertRoleBinding(ctx, s.db, corrosion.RoleBindingRecord{
-			ID: "carl-shell", Path: "/projects/acme/containers/web", Role: "Shell", Principal: "user:carl@local", Propagate: true}); err != nil {
+			ID: "carl-" + role, Path: "/projects/acme/containers/web", Role: role, Principal: "user:carl@local", Propagate: true}); err != nil {
 			t.Fatal(err)
 		}
 		engine := auth.NewEngine(s.db)
@@ -200,8 +202,24 @@ func TestComposeRecreate_AChangedImageOfAPrivilegedMemberNeedsExecOrAdmin(t *tes
 			t.Fatal(err)
 		}
 		s.SetAuthEngine(engine)
+	}
+	t.Run("ct.exec on the member is not enough", func(t *testing.T) {
+		s, rt := secServer(t)
+		carl := carlCtx(t, s)
+		seedMember(t, s, rt, "3.22")
+		bind(t, s, "Shell", []string{"ct.exec"})
+		if err := recreateMember(carl, s, upd, changed); status.Code(err) != codes.PermissionDenied {
+			t.Fatalf("changed-image recreate with only ct.exec on the member: %v, want PermissionDenied", err)
+		}
+		memberExists(t, s, rt)
+	})
+	t.Run("ContainerRoot on the member", func(t *testing.T) {
+		s, rt := secServer(t)
+		carl := carlCtx(t, s)
+		seedMember(t, s, rt, "3.22")
+		bind(t, s, "ContainerRoot", nil)
 		if err := recreateMember(carl, s, upd, changed); err != nil {
-			t.Fatalf("changed-image recreate with ct.exec on the member: %v", err)
+			t.Fatalf("changed-image recreate with ContainerRoot on the member: %v", err)
 		}
 		if last := rt.createCalls[len(rt.createCalls)-1]; last.IDMapBase != 0 {
 			t.Fatalf("recreated as %+v, want privileged", last)

@@ -3,15 +3,19 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
+	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/storage"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
@@ -67,33 +71,137 @@ func (s *Server) checkContainerTemplate(template, name string) error {
 	return nil
 }
 
-// localOCISource returns the directory a local "oci:<dir>[:tag]" image
-// reference reads, or "" for a registry reference.
-func localOCISource(image string) string {
-	rest, ok := strings.CutPrefix(image, "oci:")
-	if !ok {
-		return ""
+// checkPullSource judges a local pull source at path, one rule per kind
+// wherever the path is: a directory for oci: and dir: (CheckReadDir), a
+// regular file for the archives, and never a protected place or a link
+// into a dot-directory (CheckRefusedReadPath). The runtime runs it again on
+// the object it opened (lxc.PullOCIOptions.CheckSource).
+func (s *Server) checkPullSource(transport, path string) error {
+	var err error
+	switch transport {
+	case "oci", "dir":
+		err = storage.CheckReadDir(path, s.dataDir, s.pkiDir)
+	default:
+		err = storage.CheckReadPathLexical(path, s.dataDir, s.pkiDir)
+		if err == nil {
+			err = storage.CheckRefusedReadPath(path, s.dataDir, s.pkiDir)
+		}
+		if err == nil {
+			fi, serr := os.Stat(path)
+			switch {
+			case errors.Is(serr, fs.ErrNotExist):
+				err = fmt.Errorf("%q does not exist on this host", path)
+			case serr != nil:
+				err = fmt.Errorf("%q: %w", path, serr)
+			case !fi.Mode().IsRegular():
+				err = fmt.Errorf("%q is not a regular file", path)
+			case storage.DataDirDisksFile(path, s.dataDir):
+				err = fmt.Errorf("%q is VM disk storage (the daemon's disks directory), not an image archive", path)
+			default:
+				err = s.refuseInDiskPool(path)
+			}
+		}
 	}
-	if i := strings.LastIndex(rest, ":"); i >= 0 && !strings.Contains(rest[i:], "/") {
-		rest = rest[:i]
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "%s source: %v", transport, err)
 	}
-	return rest
+	return nil
+}
+
+// refuseInDiskPool refuses VM disk storage as an archive source: any VM's
+// disk (every host's rows), and anything inside a storage pool on this host,
+// at the directory the daemon uses for it (its Target; a target-less local
+// pool's own directory and the shared disks directory; a target-less NFS
+// pool's mount under <data_dir>/mounts; a btrfs pool's source). A lookup
+// that fails refuses too.
+func (s *Server) refuseInDiskPool(path string) error {
+	if s.db == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	forms := func(p string) []string {
+		out := []string{filepath.Clean(p)}
+		if r, err := filepath.EvalSymlinks(p); err == nil && r != out[0] {
+			out = append(out, r)
+		}
+		return out
+	}
+	disks, err := corrosion.VMDiskPaths(ctx, s.db)
+	if err != nil {
+		return fmt.Errorf("cannot tell whether %q is a VM's disk: %v", path, err)
+	}
+	for d, vm := range disks {
+		for _, dd := range forms(d) {
+			for _, c := range forms(path) {
+				if c == dd {
+					return fmt.Errorf("%q is VM %s's disk, not an image archive", path, vm)
+				}
+			}
+		}
+	}
+	pools, err := corrosion.ListStoragePoolsForHost(ctx, s.db, s.hostName)
+	if err != nil {
+		return fmt.Errorf("cannot tell whether %q is VM disk storage: %v", path, err)
+	}
+	for _, pool := range pools {
+		for _, dir := range s.poolDiskDirs(pool) {
+			if dir == "" || !filepath.IsAbs(dir) {
+				continue
+			}
+			for _, t := range forms(dir) {
+				for _, c := range forms(path) {
+					if c == t || strings.HasPrefix(c, t+string(filepath.Separator)) {
+						return fmt.Errorf("%q is in storage pool %q, VM disk storage, not an image archive", path, pool.Name)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// poolDiskDirs are the directories a pool on this host keeps disks in.
+func (s *Server) poolDiskDirs(p corrosion.StoragePoolRecord) []string {
+	if p.Target != "" {
+		return []string{p.Target}
+	}
+	switch strings.ToLower(p.Driver) {
+	case "", "local":
+		return []string{localPoolDir(s.dataDir, p.Name), filepath.Join(s.dataDir, "disks")}
+	case "nfs":
+		return []string{filepath.Join(s.dataDir, "mounts", storage.NFSMountName(p.Source))}
+	case "btrfs":
+		return []string{p.Source}
+	}
+	return nil
 }
 
 // checkOCIPullPaths is the backstop for a pull's host paths, run on the host
 // that unpacks: an absolute dest is a directory root writes an untrusted
 // image into (the OCI library itself is the daemon's own), and a local source
-// is a directory it reads.
+// is a path it reads: a directory (oci:, dir:) or a regular file (the
+// archives), at the path skopeo will read (lxc.ParseOCISource).
 func (s *Server) checkOCIPullPaths(image, dest string) error {
-	if src := localOCISource(image); src != "" {
-		if err := storage.CheckReadDir(filepath.Clean(src), s.dataDir, s.pkiDir); err != nil {
-			return status.Errorf(codes.InvalidArgument, "oci source: %v", err)
+	src, err := lxc.ParseOCISource(image)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if src.Local {
+		if err := s.checkPullSource(src.Transport, src.Path); err != nil {
+			return err
 		}
 	}
 	if filepath.IsAbs(dest) {
 		lib := filepath.Join(s.dataDir, storage.OCILibraryDir)
 		inLib := s.dataDir != "" && filepath.Dir(filepath.Clean(dest)) == lib
-		if !inLib {
+		if inLib {
+			// An item in the library is named like any other item, however
+			// the path names it: no "+" (the staging directory's own).
+			if err := safename.ValidateName(filepath.Base(dest)); err != nil {
+				return status.Errorf(codes.InvalidArgument, "oci dest: %v", err)
+			}
+		} else {
 			if err := storage.CheckWriteRoot(dest, s.dataDir, s.pkiDir); err != nil {
 				return status.Errorf(codes.InvalidArgument, "oci dest: %v", err)
 			}

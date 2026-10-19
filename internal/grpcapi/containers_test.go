@@ -118,6 +118,17 @@ type fakeCTRuntime struct {
 	createHook func()
 	importHook func()
 	stopHook   func()
+
+	// fetchCalls records FetchContainerImage calls; fetchErr fails them.
+	fetchCalls []CreateContainerOpts
+	fetchErr   error
+
+	// pullReplace records each PullOCIImage call's replace; rootfsRefs is
+	// what RootfsReferences reports, by directory.
+	pullReplace []bool
+	rootfsRefs  map[string][]string
+	pullCheck   func(transport, path string) error
+	pullErr     error
 }
 
 func (f *fakeCTRuntime) CreateContainer(_ context.Context, opts CreateContainerOpts) (*ContainerInfo, error) {
@@ -135,6 +146,14 @@ func (f *fakeCTRuntime) CreateContainer(_ context.Context, opts CreateContainerO
 		return f.createOut, nil
 	}
 	return &ContainerInfo{Name: opts.Name, State: "stopped"}, nil
+}
+
+// FetchContainerImage records the fetch and fails with fetchErr.
+func (f *fakeCTRuntime) FetchContainerImage(_ context.Context, opts CreateContainerOpts) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fetchCalls = append(f.fetchCalls, opts)
+	return f.fetchErr
 }
 func (f *fakeCTRuntime) StartContainer(_ context.Context, name string) error {
 	f.mu.Lock()
@@ -403,11 +422,20 @@ func (f *fakeCTRuntime) ReadOwner(name string) (*lxc.ContainerOwner, error) {
 	}
 	return nil, nil
 }
-func (f *fakeCTRuntime) PullOCIImage(_ context.Context, image, dest, tag, username, password string) error {
+func (f *fakeCTRuntime) PullOCIImage(_ context.Context, image, dest, tag, username, password string, replace bool, check func(transport, path string) error) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.pullCheck = check
 	f.pullCalls = append(f.pullCalls, struct{ Image, Dest, Tag, Username, Password string }{image, dest, tag, username, password})
-	return nil
+	f.pullReplace = append(f.pullReplace, replace)
+	return f.pullErr
+}
+
+// RootfsReferences reports rootfsRefs[dir].
+func (f *fakeCTRuntime) RootfsReferences(_ context.Context, dir string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rootfsRefs[dir], nil
 }
 
 // TestCreateContainer_LocalHost_PersistsRow verifies the happy path:

@@ -36,6 +36,20 @@ func (b *peerBridge) DeleteContainer(ctx context.Context, in *pb.DeleteContainer
 	return b.to.DeleteContainer(b.in(ctx), in)
 }
 
+// InspectContainer carries a recreate probe as the transport would: the
+// target answers it, and its probe response header reaches the caller.
+func (b *peerBridge) InspectContainer(ctx context.Context, in *pb.InspectContainerRequest, opts ...grpc.CallOption) (*pb.ContainerDetail, error) {
+	md, _ := metadata.FromOutgoingContext(ctx)
+	if len(md.Get(recreateProbeMDKey)) > 0 {
+		for _, o := range opts {
+			if h, ok := o.(grpc.HeaderCallOption); ok {
+				*h.HeaderAddr = metadata.Pairs(recreateProbeMDKey, "1")
+			}
+		}
+	}
+	return b.to.InspectContainer(b.in(ctx), in)
+}
+
 func (b *peerBridge) CreateContainer(ctx context.Context, in *pb.CreateContainerRequest, _ ...grpc.CallOption) (*pb.Container, error) {
 	return b.to.CreateContainer(b.in(ctx), in)
 }

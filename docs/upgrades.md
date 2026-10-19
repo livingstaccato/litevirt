@@ -2156,3 +2156,40 @@ this release. Two effects while the fleet is mixed:
   email target without a password is allowed at any time. The first such create
   after the latch marks the feature used, after which a rollback below this
   release quarantines the host.
+
+### Container exec, recreate and OCI pulls during the roll
+
+Until every host runs this release:
+
+- `lv ct exec` entered on a host still on the previous release reaches a
+  privileged or legacy-confined container with Operator rights, as before.
+  Run exec through an upgraded host.
+- A compose recreate entered on a previous-release host deletes a container
+  member before its new image is fetched, and does not hold a privileged
+  member to the image it was built from. Run `lv compose up` through an
+  upgraded host, and only once the member's own host is upgraded.
+- An `lv ct pull` entered on a previous-release host may still let an
+  Operator pull from a local source (`dir:`, `oci-archive:`,
+  `docker-archive:`). Do not rely on local sources being the Admin's until
+  every host is upgraded.
+- An `lv ct pull --local` of the previous release that is still running does
+  not re-check its item's lock file, which this release removes once the item
+  is gone. Let such pulls finish before upgrading the host.
+- A pull over an existing OCI library item is refused on a previous-release
+  host. An Admin's claim (`lv ct pull --project`) replaces an item only on an
+  upgraded host, entered through an upgraded host.
+- A delegated `PermissionAdmin` on a previous-release host may grant the
+  `ContainerRoot` role through a custom `*.exec` role.
+- A container whose name is not valid today (anything but letters, digits,
+  `_`, `.` and `-`, or exactly `.` or `..`) cannot be started, stopped,
+  deleted, cloned or recreated by this release. Before the roll, on the
+  previous release, clone it under a valid name (`lv ct clone <source>
+  <new-name>`) and remove the original.
+
+Once every host is upgraded, review the `ContainerRoot` bindings and revoke
+any that were not intended:
+
+```bash
+lv role ls --role ContainerRoot
+lv role revoke <binding-id>
+```

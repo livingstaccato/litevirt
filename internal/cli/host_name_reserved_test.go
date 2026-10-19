@@ -492,3 +492,76 @@ func TestHostAdd_RefusesANameWhoseMigrationPairIsAnotherHosts(t *testing.T) {
 		t.Errorf("the refused add went ahead: admitted=%v events=%v", f.client.admitted, f.target.Events)
 	}
 }
+
+// publicAddProbes stubs the two SSH reads `lv host add` makes of the join
+// peers before it reaches the target (their config, and whether they hold
+// migration credentials), and counts them.
+func publicAddProbes(t *testing.T) *int {
+	t.Helper()
+	n := 0
+	oldCfg, oldMig := readPeerConfig, peerHoldsMigrationCredentials
+	t.Cleanup(func() { readPeerConfig, peerHoldsMigrationCredentials = oldCfg, oldMig })
+	readPeerConfig = func(string) (string, bool, error) {
+		n++
+		return "enforcement:\n  operation_protocol: true\n", true, nil
+	}
+	peerHoldsMigrationCredentials = func(string) (bool, error) {
+		n++
+		return false, nil
+	}
+	return &n
+}
+
+// The public `lv host add` decided whether a name was NEW only after it had
+// minted the migration CA and the client pair here and dialled the target, so
+// a refused new name ("node+1", ".hidden", "web-migration") still changed this
+// machine's PKI directory. The name is decided from the cluster's hosts first.
+// Port 1 on loopback refuses at once: reaching the target is an error that is
+// not the name's.
+//
+// Mutation: drop the ListHosts/checkAddName preflight in HostAdd — the
+// migration CA and client pair are minted and the target is dialled.
+func TestHostAddPublic_RefusesANewNameBeforeAnyEffect(t *testing.T) {
+	useConfig(t, "")
+	for _, name := range []string{"node+1", ".hidden", "web-migration"} {
+		root, dir := operatorPKIUnder(t)
+		for _, n := range []string{"client.crt", "client.key"} {
+			if err := os.Remove(filepath.Join(dir, n)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		probes := publicAddProbes(t)
+		c := &hostAddTestClient{hosts: []*pb.Host{{Name: "node-1", Address: "10.0.0.1", State: pb.HostState_HOST_ACTIVE, CertSerial: "a1"}}}
+		before := dirSnapshot(t, root)
+		err := HostAdd(context.Background(), c, "root@127.0.0.1:1", name, []string{"10.0.0.1:7946"})
+		if err == nil || !strings.Contains(err.Error(), "invalid host name") {
+			t.Errorf("HostAdd(%q) = %v, want the name refused", name, err)
+		}
+		if *probes != 0 {
+			t.Errorf("%q: %d SSH read(s) of the join peers before the refusal", name, *probes)
+		}
+		sameTree(t, name, root, before)
+	}
+}
+
+// The same entry still takes a name a live row holds (an add an older lv
+// started): the preflight lets it through to the target, which here refuses
+// the connection.
+//
+// Mutation: apply the new-name rule regardless of a live row — "node+1" is
+// refused by name.
+func TestHostAddPublic_KeepsALiveLegacyName(t *testing.T) {
+	useConfig(t, "")
+	for _, name := range []string{"node+1", "web-migration"} {
+		operatorPKIUnder(t)
+		publicAddProbes(t)
+		c := &hostAddTestClient{hosts: []*pb.Host{
+			{Name: "node-1", Address: "10.0.0.1", State: pb.HostState_HOST_ACTIVE, CertSerial: "a1"},
+			{Name: name, Address: "127.0.0.1", State: pb.HostState_HOST_JOINING, CertSerial: "b2"},
+		}}
+		err := HostAdd(context.Background(), c, "root@127.0.0.1:1", name, []string{"10.0.0.1:7946"})
+		if err == nil || strings.Contains(err.Error(), "invalid host name") || !strings.Contains(err.Error(), "SSH connect") {
+			t.Errorf("HostAdd(%q) over its live row = %v, want it to reach the target", name, err)
+		}
+	}
+}

@@ -34,7 +34,9 @@ import (
 // HostAdd adds a new host to an existing cluster.
 func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostName string, joinPeers []string) error {
 	// The name becomes <pkiDir>/<name>.crt|.key beside the CA: checked first.
-	// Whether it is new (the full rule) is decided once the hosts are listed.
+	// Whether it is new (the full rule) is decided from the cluster's hosts
+	// below, before anything is minted here or any machine is dialled; a list
+	// that cannot be read refuses the add.
 	if err := pki.ValidateExistingHostName(hostName); err != nil {
 		return err
 	}
@@ -51,6 +53,13 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 			"hosts, so %s would be provisioned with an empty join_peers and never reach the "+
 			"cluster. Check that a daemon is reachable from here (lv host ls), or that this "+
 			"is not the first host — the first one is `lv host init`", hostName)
+	}
+	hostsResp, err := c.ListHosts(ctx, &pb.ListHostsRequest{})
+	if err != nil {
+		return fmt.Errorf("list the cluster's hosts before adding %s: %w", hostName, err)
+	}
+	if err := checkAddName(hostsResp.GetHosts(), hostName); err != nil {
+		return err
 	}
 	pkiDir := PKIDir()
 

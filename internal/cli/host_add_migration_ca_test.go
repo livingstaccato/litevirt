@@ -54,7 +54,7 @@ func TestHostAdd_RefusesASecondMigrationCAWhenPeersHoldCredentials(t *testing.T)
 	})
 	asked := stubMigrationProbe(t, func(string) (bool, error) { return true, nil })
 
-	err := HostAdd(context.Background(), nil, "root@10.0.0.9", "node-9", []string{"10.0.0.1:7946"})
+	err := HostAdd(context.Background(), &hostAddTestClient{}, "root@10.0.0.9", "node-9", []string{"10.0.0.1:7946"})
 	if err == nil || !strings.Contains(err.Error(), pki.MigrationCACertName) {
 		t.Fatalf("err = %v; want a refusal telling the operator to bring the cluster's %s here",
 			err, pki.MigrationCACertName)

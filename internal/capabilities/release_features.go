@@ -136,7 +136,7 @@ var releaseFeatures = map[Feature]FeatureInfo{
 		Writers: []string{"internal/corrosion.AdmitHostV2", "internal/corrosion.WriteOwnEndpoint"}},
 
 	FeatureAutomationStream: {Token: Release202611V1, Description: "Certified automation history, retained recovery provenance, and managed-resource state"},
-	FeatureSGProjects:       {Token: Release202611V1, Description: "Security groups owned by a project (used when a group is created with a project)"},
+	FeatureSGProjects:       {Token: Release202611V1, Description: "Security groups owned by a project (used when a group is created with a project)", Writers: []string{"internal/corrosion.InsertProjectSecurityGroup"}},
 }
 
 // firewallRuleWriters write the three rule tables. Each takes one grant per

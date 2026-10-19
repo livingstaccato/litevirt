@@ -25152,6 +25152,7 @@ type CreateSecurityGroupRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	StackName     string                 `protobuf:"bytes,2,opt,name=stack_name,json=stackName,proto3" json:"stack_name,omitempty"`
+	Project       string                 `protobuf:"bytes,3,opt,name=project,proto3" json:"project,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -25196,6 +25197,13 @@ func (x *CreateSecurityGroupRequest) GetName() string {
 func (x *CreateSecurityGroupRequest) GetStackName() string {
 	if x != nil {
 		return x.StackName
+	}
+	return ""
+}
+
+func (x *CreateSecurityGroupRequest) GetProject() string {
+	if x != nil {
+		return x.Project
 	}
 	return ""
 }
@@ -25340,6 +25348,7 @@ type ListSecurityGroupsRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	StackName     string                 `protobuf:"bytes,1,opt,name=stack_name,json=stackName,proto3" json:"stack_name,omitempty"`           // empty = every group
 	IncludeRules  bool                   `protobuf:"varint,2,opt,name=include_rules,json=includeRules,proto3" json:"include_rules,omitempty"` // also return every rule of the listed groups
+	Project       string                 `protobuf:"bytes,3,opt,name=project,proto3" json:"project,omitempty"`                                // that project's groups plus the global ones; empty = every group the caller may read
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -25386,6 +25395,13 @@ func (x *ListSecurityGroupsRequest) GetIncludeRules() bool {
 		return x.IncludeRules
 	}
 	return false
+}
+
+func (x *ListSecurityGroupsRequest) GetProject() string {
+	if x != nil {
+		return x.Project
+	}
+	return ""
 }
 
 type ListSecurityGroupsResponse struct {
@@ -45506,21 +45522,23 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x06remove\x18\x05 \x03(\tR\x06remove\x1a6\n" +
 	"\bSetEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"O\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"i\n" +
 	"\x1aCreateSecurityGroupRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
-	"stack_name\x18\x02 \x01(\tR\tstackName\",\n" +
+	"stack_name\x18\x02 \x01(\tR\tstackName\x12\x18\n" +
+	"\aproject\x18\x03 \x01(\tR\aproject\",\n" +
 	"\x1aDeleteSecurityGroupRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\"Q\n" +
 	"\x1bAddSecurityGroupRuleRequest\x122\n" +
 	"\x04rule\x18\x01 \x01(\v2\x1e.litevirt.v1.SecurityGroupRuleR\x04rule\"0\n" +
 	"\x1eRemoveSecurityGroupRuleRequest\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id\"_\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"y\n" +
 	"\x19ListSecurityGroupsRequest\x12\x1d\n" +
 	"\n" +
 	"stack_name\x18\x01 \x01(\tR\tstackName\x12#\n" +
-	"\rinclude_rules\x18\x02 \x01(\bR\fincludeRules\"\x86\x01\n" +
+	"\rinclude_rules\x18\x02 \x01(\bR\fincludeRules\x12\x18\n" +
+	"\aproject\x18\x03 \x01(\tR\aproject\"\x86\x01\n" +
 	"\x1aListSecurityGroupsResponse\x122\n" +
 	"\x06groups\x18\x01 \x03(\v2\x1a.litevirt.v1.SecurityGroupR\x06groups\x124\n" +
 	"\x05rules\x18\x02 \x03(\v2\x1e.litevirt.v1.SecurityGroupRuleR\x05rules\"\x19\n" +

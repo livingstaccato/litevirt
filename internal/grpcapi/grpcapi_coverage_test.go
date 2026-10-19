@@ -197,7 +197,9 @@ func TestDeleteStack_Unauthorized(t *testing.T) {
 
 func TestDeleteStack_EmptyStack(t *testing.T) {
 	s := testServerCov(t)
-	ctx := context.WithValue(context.Background(), ctxKeyRole, "operator")
+	// A named operator: a teardown's firewall check needs a principal, as
+	// every real caller has.
+	ctx := userCtx("op", "operator")
 	stream := &mockDeleteStream{ctx: ctx}
 
 	// No VMs for this stack, just calls through.
@@ -2218,7 +2220,9 @@ vms:
 
 func TestDeleteStack_WithVMs_OtherHost(t *testing.T) {
 	s := testServerCov(t)
-	ctx := context.WithValue(context.Background(), ctxKeyRole, "operator")
+	// A named operator: a teardown's firewall check needs a principal, as
+	// every real caller has.
+	ctx := userCtx("op", "operator")
 	stream := &mockDeleteStream{ctx: ctx}
 
 	// Insert VMs belonging to a stack on a different host.

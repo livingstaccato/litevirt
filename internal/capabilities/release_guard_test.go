@@ -231,7 +231,6 @@ func f() {
 // change, after which the feature must list them.
 var writersPending = map[Feature]bool{
 	FeatureAutomationStream: true,
-	FeatureSGProjects:       true,
 }
 
 // TestReleaseFeatureWriters_TakeAGrant: a writer listed under several

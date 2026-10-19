@@ -137,6 +137,9 @@ func (s *Server) attachNICEntry(ctx context.Context, req *pb.AttachDeviceRequest
 		if err := s.admitManagedNetwork(ctx, vmRec.Project, spec.Name); err != nil {
 			return nil, err
 		}
+		if err := s.admitSecurityGroupRefs(ctx, vmRec.Project, spec.GetSecurityGroups()); err != nil {
+			return nil, err
+		}
 		// The entry node checked the caller's authority over the guard; the
 		// owner re-checks only what needs none.
 		if _, err := s.admitNICGuards(ctx, vmRec.Name, []*pb.NetworkAttachment{spec}, admitPeerOwner); err != nil {
@@ -187,6 +190,9 @@ func (s *Server) attachNICEntry(ctx context.Context, req *pb.AttachDeviceRequest
 	// so a completed attach replays its stored response; before the remote
 	// provisioning push and any operation row, so a refusal leaves nothing.
 	if err := s.admitNetworkAttach(ctx, vmRec.Project, spec.Name); err != nil {
+		return nil, err
+	}
+	if err := s.admitSecurityGroupRefs(ctx, vmRec.Project, spec.GetSecurityGroups()); err != nil {
 		return nil, err
 	}
 

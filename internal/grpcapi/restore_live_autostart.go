@@ -161,6 +161,9 @@ func (s *Server) autoDefineRestoredVM(
 			}
 		}
 	}
+	if err := s.admitSecurityGroupRefs(ctx, project, nicSecurityGroupNames(spec.Network)); err != nil {
+		return "", "", status.Errorf(status.Code(err), "restore: %s", status.Convert(err).Message())
+	}
 	// This path creates a RUNNING managed VM, so beyond backup.restore the caller
 	// must hold vm.create on the target name in the (authorized) restore project.
 	if err := s.RequirePerm(ctx, vmRBACPathFor(project, targetName), "vm.create", "operator"); err != nil {

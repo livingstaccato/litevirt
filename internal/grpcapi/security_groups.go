@@ -9,9 +9,11 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 	"github.com/litevirt/litevirt/internal/randid"
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 // Security-group CRUD, the per-NIC firewall tier (colonelpanik/litevirt#182).
@@ -29,6 +31,11 @@ import (
 // sg.write is held by Admin (`*`) and NetworkAdmin (`sg.*`); Operator holds
 // sg.read only. A cluster with no role bindings falls back to the legacy
 // operator role.
+//
+// A group owned by a project (docs/design/security-group-projects.md) is
+// authorized on its own path under that project instead (sgRBACPath), so a
+// project-scoped NetworkAdmin manages its project's groups and no others; a
+// global group stays at the root.
 
 const (
 	sgWriteVerb = "sg.write"
@@ -39,8 +46,27 @@ func (s *Server) requireSGWrite(ctx context.Context) error {
 	return s.RequirePerm(ctx, "/", sgWriteVerb, "operator")
 }
 
+// sgRBACPath is a security group's RBAC path: the cluster root for a global
+// group, /projects/<project>/security_groups/<name> for a project's.
+func sgRBACPath(project, name string) string {
+	if project == "" {
+		return "/"
+	}
+	return projectRBACBase(project) + "/security_groups/" + safeRBACSegment(name)
+}
+
+// requireSGWriteOn checks sg.write on g's own path.
+func (s *Server) requireSGWriteOn(ctx context.Context, g *corrosion.SecurityGroup) error {
+	return s.RequirePerm(ctx, sgRBACPath(g.Project, g.Name), sgWriteVerb, "operator")
+}
+
+// sgReadable reports whether the caller may read g: sg.read on its path.
+func (s *Server) sgReadable(ctx context.Context, g *corrosion.SecurityGroup) bool {
+	return s.RequirePerm(ctx, sgRBACPath(g.Project, g.Name), sgReadVerb, "viewer") == nil
+}
+
 func toPbSecurityGroup(g corrosion.SecurityGroup) *pb.SecurityGroup {
-	return &pb.SecurityGroup{Id: g.ID, Name: g.Name, StackName: g.StackName, CreatedAt: g.CreatedAt}
+	return &pb.SecurityGroup{Id: g.ID, Name: g.Name, StackName: g.StackName, CreatedAt: g.CreatedAt, Project: g.Project}
 }
 
 func toPbSGRule(r corrosion.SGRule) *pb.SecurityGroupRule {
@@ -50,13 +76,39 @@ func toPbSGRule(r corrosion.SGRule) *pb.SecurityGroupRule {
 	}
 }
 
-// CreateSecurityGroup creates an empty security group. `lv sg create`.
+// CreateSecurityGroup creates an empty security group, global or owned by
+// req.Project. `lv sg create [--project]`.
 func (s *Server) CreateSecurityGroup(ctx context.Context, req *pb.CreateSecurityGroupRequest) (*pb.SecurityGroup, error) {
-	if err := s.requireSGWrite(ctx); err != nil {
-		return nil, err
-	}
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
+	}
+	project := req.GetProject()
+	if project != "" {
+		if _, err := safename.CanonicalProjectName(project); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid project %q: %v", project, err)
+		}
+	}
+	if project != "" && req.StackName != "" {
+		// A stack's groups are global and go with the stack; a project's
+		// group must not be removed by another stack's teardown.
+		return nil, status.Error(codes.InvalidArgument, "a project's security group cannot belong to a stack; give one or the other")
+	}
+	if err := s.RequirePerm(ctx, sgRBACPath(project, req.Name), sgWriteVerb, "operator"); err != nil {
+		return nil, err
+	}
+	if project != "" {
+		// The group is stored under the project's own name, the one its
+		// workloads carry, so it must name a project that exists: a spelling
+		// such as "acme/" would bind no workload, and a group of a deleted
+		// project would pass to a later project of that name.
+		p, perr := corrosion.GetProject(ctx, s.db, project)
+		if perr != nil {
+			return nil, status.Errorf(codes.Unavailable, "look up project %q: %v", project, perr)
+		}
+		if p == nil {
+			return nil, status.Errorf(codes.NotFound, "project %q not found (lv project ls shows them)", project)
+		}
+		project = p.Name
 	}
 	// One live group per name. The firewall cannot tell which of two same-name
 	// groups a NIC meant, so it holds every NIC bound to such a name at drop;
@@ -66,12 +118,32 @@ func (s *Server) CreateSecurityGroup(ctx context.Context, req *pb.CreateSecurity
 	if held, err := liveSGNamed(ctx, s.db, req.Name, ""); err != nil {
 		return nil, status.Errorf(codes.Unavailable, "check for a security group named %q: %v", req.Name, err)
 	} else if held != nil {
+		if !s.sgReadable(ctx, held) {
+			// Names are unique across projects, so the refusal itself says
+			// the name is taken; the id of a group the caller may not read
+			// is not its to know.
+			return nil, status.Errorf(codes.AlreadyExists,
+				"security group %q already exists; names must be unique across projects, because a NIC bound to a name two groups hold is held at drop",
+				req.Name)
+		}
 		return nil, status.Errorf(codes.AlreadyExists,
 			"security group %q already exists (id %s); names must be unique, because a NIC bound to a name two groups hold is held at drop",
 			req.Name, held.ID)
 	}
-	row := corrosion.SecurityGroup{ID: randid.New(), Name: req.Name, StackName: req.StackName}
-	if err := corrosion.InsertSecurityGroup(ctx, s.db, row); err != nil {
+	row := corrosion.SecurityGroup{ID: randid.New(), Name: req.Name, StackName: req.StackName, Project: project}
+	if project == "" {
+		if err := corrosion.InsertSecurityGroup(ctx, s.db, row); err != nil {
+			return nil, status.Errorf(codes.Internal, "create security group: %v", err)
+		}
+	} else if err := s.WithReleaseFeature(ctx, capabilities.FeatureSGProjects, func(ctx context.Context, g capabilities.FeatureGrant) error {
+		// The project column is a shape a previous-release peer cannot
+		// decode: the release feature waits for the release token and
+		// records the use first (docs/design/security-group-projects.md).
+		return corrosion.InsertProjectSecurityGroup(ctx, s.db, g, row)
+	}); err != nil {
+		if _, ok := status.FromError(err); ok && status.Code(err) != codes.Unknown {
+			return nil, err
+		}
 		return nil, status.Errorf(codes.Internal, "create security group: %v", err)
 	}
 	// The same after-state the UI records for a new group: it has no rules yet.
@@ -138,11 +210,24 @@ func sgNameCounts(sgs []corrosion.SecurityGroup) map[string]int {
 // DeleteSecurityGroup tombstones a security group and every rule in it.
 // `lv sg rm`.
 func (s *Server) DeleteSecurityGroup(ctx context.Context, req *pb.DeleteSecurityGroupRequest) (*emptypb.Empty, error) {
-	if err := s.requireSGWrite(ctx); err != nil {
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
 	if req.Id == "" {
 		return nil, status.Error(codes.InvalidArgument, "id required")
+	}
+	// Authorized on the group's own project. An id no live group has needs
+	// the root, as every delete did before groups had projects.
+	owner, oerr := corrosion.GetSecurityGroup(ctx, s.db, req.Id)
+	if oerr != nil {
+		return nil, status.Errorf(codes.Unavailable, "look up security group %q: %v", req.Id, oerr)
+	}
+	if owner != nil {
+		if err := s.requireSGWriteOn(ctx, owner); err != nil {
+			return nil, err
+		}
+	} else if err := s.requireSGWrite(ctx); err != nil {
+		return nil, err
 	}
 	// Read what is about to go, rules included: after this the audit row is
 	// the only record of which traffic they allowed or refused.
@@ -179,7 +264,7 @@ func (s *Server) DeleteSecurityGroup(ctx context.Context, req *pb.DeleteSecurity
 
 // AddSecurityGroupRule appends a rule to a security group. `lv sg rule-add`.
 func (s *Server) AddSecurityGroupRule(ctx context.Context, req *pb.AddSecurityGroupRuleRequest) (*pb.SecurityGroupRule, error) {
-	if err := s.requireSGWrite(ctx); err != nil {
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
 	r := req.GetRule()
@@ -193,12 +278,26 @@ func (s *Server) AddSecurityGroupRule(ctx context.Context, req *pb.AddSecurityGr
 	if rerr != nil {
 		return nil, rerr
 	}
+	if err := s.requireSGWriteOn(ctx, sg); err != nil {
+		return nil, err
+	}
 	row := corrosion.SGRule{
 		ID: randid.New(), SGID: sg.ID, Direction: r.Direction, Proto: r.Proto,
 		PortRange: r.Port, CIDR: r.Cidr, Action: r.Action, Priority: int(r.Priority),
 	}
 	row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
 	need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, "")
+	if sg.Project != "" && len(need) > 0 {
+		// A rule that needs a release feature (an IPv6, logged or tag-group
+		// rule) records that feature's cluster-wide used bit, and a logged
+		// rule writes host logs: both reach beyond the project, so they stay
+		// with sg.write at the cluster root.
+		if err := s.requireSGWrite(ctx); err != nil {
+			return nil, status.Errorf(codes.PermissionDenied,
+				"a rule that needs %v on a project's security group needs sg.write at the cluster root: %s",
+				need, status.Convert(err).Message())
+		}
+	}
 	if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
 		if err := s.refuseUnknownTagGroup(ctx, row.CIDR); err != nil {
 			return err
@@ -221,13 +320,17 @@ func (s *Server) AddSecurityGroupRule(ctx context.Context, req *pb.AddSecurityGr
 
 // RemoveSecurityGroupRule tombstones one rule, by the RULE id. `lv sg rule-rm`.
 func (s *Server) RemoveSecurityGroupRule(ctx context.Context, req *pb.RemoveSecurityGroupRuleRequest) (*emptypb.Empty, error) {
-	if err := s.requireSGWrite(ctx); err != nil {
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
 	if req.Id == "" {
 		return nil, status.Error(codes.InvalidArgument, "id required")
 	}
-	before := corrosion.SGRuleAuditState(corrosion.GetSGRule(ctx, s.db, req.Id))
+	rule, rerr := corrosion.GetSGRule(ctx, s.db, req.Id)
+	if err := s.requireSGRuleWrite(ctx, rule, rerr); err != nil {
+		return nil, err
+	}
+	before := corrosion.SGRuleAuditState(rule, rerr)
 	if before == corrosion.AuditStateNone {
 		return nil, status.Errorf(codes.NotFound, "no security group rule with id %q (lv sg rule-ls shows ids)", req.Id)
 	}
@@ -239,20 +342,82 @@ func (s *Server) RemoveSecurityGroupRule(ctx context.Context, req *pb.RemoveSecu
 	return &emptypb.Empty{}, nil
 }
 
-// ListSecurityGroups lists security groups and, with include_rules, every rule
-// of the groups it lists. It checks sg.read at the cluster root, the path the
-// writes check sg.write at: every built-in role holding *.read or sg.read
-// passes, and a token scoped below "/" does not, since a group is
-// cluster-global and its rules name addresses and ports anywhere in the
-// cluster. The web UI's security-group page and Add-NIC modal read through
-// this with the session's bearer.
+// requireSGRuleWrite checks sg.write for a rule on the path of the group that
+// owns it. A rule no live group owns by id — one an older client stored under
+// a group's name, or an orphan — is judged on the group of that name, else at
+// the root.
+func (s *Server) requireSGRuleWrite(ctx context.Context, rule *corrosion.SGRule, rerr error) error {
+	if rerr != nil || rule == nil {
+		return s.requireSGWrite(ctx)
+	}
+	g, err := corrosion.GetSecurityGroup(ctx, s.db, rule.SGID)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "look up the group of rule %q: %v", rule.ID, err)
+	}
+	if g == nil {
+		if held, herr := liveSGNamed(ctx, s.db, rule.SGID, ""); herr == nil && held != nil {
+			g = held
+		}
+	}
+	if g == nil {
+		return s.requireSGWrite(ctx)
+	}
+	return s.requireSGWriteOn(ctx, g)
+}
+
+// ListSecurityGroups lists security groups and, with include_rules, the rules
+// of the groups it lists. sg.read at the cluster root sees every group and
+// rule. Below the root each project group is listed when the caller holds
+// sg.read on its path; with req.Project named (and sg.read on that project)
+// the global groups are listed too, without their rules, because that
+// project's workloads may bind them while their rules — addresses and ports
+// anywhere in the cluster — stay readable at the root only. req.Project
+// narrows any listing to that project's groups plus the global ones. The web
+// UI's security-group page and Add-NIC modal read through this with the
+// session's bearer.
 func (s *Server) ListSecurityGroups(ctx context.Context, req *pb.ListSecurityGroupsRequest) (*pb.ListSecurityGroupsResponse, error) {
-	if err := s.RequirePerm(ctx, "/", sgReadVerb, "viewer"); err != nil {
+	if err := s.requirePermPrecheck(ctx, "viewer"); err != nil {
 		return nil, err
 	}
-	groups, err := corrosion.ListSecurityGroups(ctx, s.db, req.GetStackName())
+	project := req.GetProject()
+	// Validated before any authorization, for every caller: the CLI probes
+	// with a malformed project, and only a build that reads the field gives
+	// this answer (cmd/litevirt sgProjectsProbe).
+	if project != "" {
+		if _, err := safename.CanonicalProjectName(project); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid project %q: %v", project, err)
+		}
+	}
+	root := s.RequirePerm(ctx, "/", sgReadVerb, "viewer") == nil
+	if project != "" && !root {
+		if err := s.RequirePerm(ctx, projectRBACBase(project)+"/security_groups", sgReadVerb, "viewer"); err != nil {
+			return nil, err
+		}
+	}
+	listed, err := corrosion.ListSecurityGroups(ctx, s.db, req.GetStackName())
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list security groups: %v", err)
+	}
+	// rulesOf says whose rules the caller may read: every listed group's at
+	// the root, a project group's once it is listed.
+	rulesOf := map[string]bool{}
+	var groups []corrosion.SecurityGroup
+	for _, g := range listed {
+		switch {
+		case project != "" && g.Project != "" && g.Project != project:
+			continue
+		case root:
+			rulesOf[g.ID] = true
+		case g.Project == "":
+			if project == "" {
+				continue
+			}
+		case !s.sgReadable(ctx, &g):
+			continue
+		default:
+			rulesOf[g.ID] = true
+		}
+		groups = append(groups, g)
 	}
 	all, err := corrosion.ListSecurityGroups(ctx, s.db, "")
 	if err != nil {
@@ -262,7 +427,7 @@ func (s *Server) ListSecurityGroups(ctx context.Context, req *pb.ListSecurityGro
 	resp := &pb.ListSecurityGroupsResponse{Groups: make([]*pb.SecurityGroup, 0, len(groups))}
 	for _, g := range groups {
 		resp.Groups = append(resp.Groups, toPbSecurityGroup(g))
-		if !req.GetIncludeRules() {
+		if !req.GetIncludeRules() || !rulesOf[g.ID] {
 			continue
 		}
 		rules, err := corrosion.ListSGRulesFor(ctx, s.db, g, counts[g.Name] == 1)
@@ -277,8 +442,9 @@ func (s *Server) ListSecurityGroups(ctx context.Context, req *pb.ListSecurityGro
 	}
 	// Legacy rules stored under a name two live groups share belong to neither,
 	// and are not applied. Report them with sg_id left as the bare name (it
-	// matches no group id) so `lv sg` can say so.
-	if req.GetIncludeRules() {
+	// matches no group id) so `lv sg` can say so. Root only: such a name may
+	// be any project's.
+	if req.GetIncludeRules() && root {
 		var shared []string
 		for name, n := range counts {
 			if n > 1 {

@@ -17,6 +17,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/nictap"
+	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
 // PlanLoader builds the desired Plan for *this host* from cluster
@@ -562,6 +563,42 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		for _, sg := range plan.SecurityGroups {
 			valid[sg.Name] = true
 		}
+		// A project's group applies only to its own project's NICs
+		// (docs/design/security-group-projects.md): for any other NIC it is
+		// skipped like an unknown name. A NIC whose workload row has not
+		// landed (a create still pending here) passed that check where it
+		// was created.
+		sgProject := map[string]string{}
+		for _, sg := range sgs {
+			if sg.Project != "" {
+				sgProject[sg.Name] = sg.Project
+			}
+		}
+		var vmProjects, ctProjects map[string]string
+		if len(sgProject) > 0 {
+			if vmProjects, ctProjects, err = corrosion.WorkloadProjects(ctx, db, hostName); err != nil {
+				return plan, err
+			}
+		}
+		foreign := func(kind, owner, name string) bool {
+			gp, owned := sgProject[name]
+			if !owned {
+				return false
+			}
+			projects := vmProjects
+			if kind == corrosion.TagMemberCT {
+				projects = ctProjects
+			}
+			wp, known := projects[owner]
+			if !known || tenancy.AdmitAttach(wp, gp) {
+				return false
+			}
+			if _, seen := warnedForeignSG.LoadOrStore(kind+"/"+owner+"/"+name, true); !seen {
+				slog.Warn("firewall: a NIC binds another project's security group; not applying it",
+					"workload", owner, "project", tenancy.NormalizeProject(wp), "group", name, "group_project", gp)
+			}
+			return true
+		}
 		ambiguous := map[string]int{} // duplicate name → this host's NICs held at drop for it
 		// bind resolves one NIC's bound names — its own and those its tag
 		// groups bind on its network, merged first so the ambiguity check
@@ -594,7 +631,7 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			}
 			nb.SecurityGroups = make([]string, 0, len(names))
 			for _, name := range names {
-				if valid[name] {
+				if valid[name] && !foreign(kind, owner, name) {
 					nb.SecurityGroups = append(nb.SecurityGroups, name)
 				}
 			}

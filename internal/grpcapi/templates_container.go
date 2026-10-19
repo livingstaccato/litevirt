@@ -194,6 +194,14 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 		s.audit(ctx, "ct.clone", req.Target, "project="+project, "denied")
 		return nil, err
 	}
+	var cloneSGs []string
+	for _, n := range corrosion.DecodeCreateSpec(src.CreateSpec).Networks {
+		cloneSGs = append(cloneSGs, n.SecurityGroups...)
+	}
+	if err := s.admitSecurityGroupRefs(ctx, project, cloneSGs); err != nil {
+		s.audit(ctx, "ct.clone", req.Target, "project="+project, "denied")
+		return nil, status.Errorf(status.Code(err), "clone: %s", status.Convert(err).Message())
+	}
 
 	unlock := s.lockVM("ct/" + req.Target)
 	defer unlock()

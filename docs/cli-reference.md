@@ -1436,8 +1436,8 @@ all six quota dimensions. See `docs/tenancy.md`.
 ## Security groups and firewall
 
 ```bash
-lv sg create <name>
-lv sg ls
+lv sg create <name> [--project <p>]   # --project: owned by p; only p's workloads may bind it
+lv sg ls [--project <p>]              # --project: p's groups and the global ones
 lv sg rm <id>
 lv sg rule-add <sg-id-or-name> --direction ingress|egress --proto tcp \
     --port <p> --cidr <c> [--action accept|drop|reject] [--priority N]

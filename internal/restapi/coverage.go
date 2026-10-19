@@ -216,6 +216,12 @@ func (s *Server) handleStackDelete(w http.ResponseWriter, r *http.Request) {
 		// Not only VMs: containers, a network that could not be deprovisioned
 		// or a failed container listing arrive named for themselves, and an
 		// unnamed error still counts.
+		if p.Status == "local-only" {
+			// No record on the daemon: it removed only the workloads it
+			// lists, and nothing retries a failure.
+			res.LocalOnly, res.Notice = true, p.Error
+			continue
+		}
 		item := p.VmName
 		if item == "" && p.Status == "error" {
 			item = "stack resource"
@@ -240,9 +246,18 @@ func (s *Server) handleStackDelete(w http.ResponseWriter, r *http.Request) {
 		}
 		res.Error = fmt.Sprintf("stack %q: %d of %d deletions failed (%s); the stack is left in state \"deleting\" and the daemon retries the teardown",
 			req.Name, len(res.Failures), len(seen), strings.Join(names, ", "))
+		if res.LocalOnly {
+			res.Error = fmt.Sprintf("stack %q: local-only teardown: %d of %d deletions failed (%s); nothing will retry them",
+				req.Name, len(res.Failures), len(seen), strings.Join(names, ", "))
+		}
 		// The stack still exists, in state "deleting", and the daemon retries
-		// the teardown: a conflict with the request, not a server fault.
-		w.WriteHeader(http.StatusConflict)
+		// the teardown: a conflict with the request, not a server fault. A
+		// local-only teardown marked nothing deleting, and nothing retries it.
+		if res.LocalOnly {
+			w.WriteHeader(http.StatusInternalServerError)
+		} else {
+			w.WriteHeader(http.StatusConflict)
+		}
 	}
 	jsonWrite(w, res)
 }
@@ -253,6 +268,10 @@ type stackDeleteResult struct {
 	Deleted  []string             `json:"deleted"`
 	Failures []stackDeleteFailure `json:"failures"`
 	Error    string               `json:"error,omitempty"`
+	// LocalOnly: the daemon held no record of the stack and removed only the
+	// workloads it lists; Notice says what is left and who can remove it.
+	LocalOnly bool   `json:"local_only,omitempty"`
+	Notice    string `json:"notice,omitempty"`
 }
 
 type stackDeleteFailure struct {

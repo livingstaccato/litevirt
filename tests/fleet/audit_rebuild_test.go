@@ -121,6 +121,7 @@ func TestFleet_AuditChainSurvivesThreeRebuildsUnderTheSameNames(t *testing.T) {
 		if err != nil {
 			t.Fatalf("admit %s again: %v", n.Name, err)
 		}
+		fleetAdmittedPort(t, n, serial, survivors...)
 		if admitted.GetAuditTailSeq() != 4 {
 			t.Fatalf("%s admitted with audit tail %d, want 4", n.Name, admitted.GetAuditTailSeq())
 		}

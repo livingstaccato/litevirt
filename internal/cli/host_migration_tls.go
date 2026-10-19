@@ -136,12 +136,17 @@ type migrationFile struct {
 // certificate for ip. It returns the three files to put in the host's
 // migration directory: the CA, the certificate, and the key (0600).
 func issueMigrationCredentials(pkiDir, hostName string, ip net.IP, existing migrationCredentialHolder) ([]migrationFile, error) {
+	return issueMigrationCredentialsAt(pkiDir, filepath.Join(pkiDir, hostName+"-migration.crt"),
+		filepath.Join(pkiDir, hostName+"-migration.key"), hostName, ip, existing)
+}
+
+// issueMigrationCredentialsAt is issueMigrationCredentials writing the
+// host's certificate and key to cert and key.
+func issueMigrationCredentialsAt(pkiDir, cert, key, hostName string, ip net.IP, existing migrationCredentialHolder) ([]migrationFile, error) {
 	caCert, caKey, _, err := ensureLocalMigrationCA(pkiDir, existing)
 	if err != nil {
 		return nil, err
 	}
-	cert := filepath.Join(pkiDir, hostName+"-migration.crt")
-	key := filepath.Join(pkiDir, hostName+"-migration.key")
 	if err := pki.GenerateHostCert(caCert, caKey, cert, key, hostName, ip); err != nil {
 		return nil, fmt.Errorf("issue %s's migration certificate: %w", hostName, err)
 	}

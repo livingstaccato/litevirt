@@ -2101,8 +2101,13 @@ At incarnation 1 or higher, a certificate swapped in while the daemon runs that
 is not a renewal of the recorded one is not recorded until the daemon restarts,
 and peers refuse it until then. The host raises `certificate/cert_swapped_at_runtime`
 about itself (**warning**; evidence `recorded_serial`, `serving_serial` and
-`remedy`). Restart the daemon on that host (`systemctl restart litevirt`); the
-condition clears once the serial is recorded.
+`remedy`). Peers refuse that host's writes until then, so the condition is
+only on that host's own replica: run `lv health` against that host
+(`LV_HOST=<its address> lv health`). Restart the daemon on that host
+(`systemctl restart litevirt`); the condition clears once the serial is
+recorded. The restart records it only when the host remembers its admission;
+if the condition is still open after the restart, the restart was held, and
+`own_row_held` below says why.
 
 A hold raised at start over a row at incarnation 0 reports `timed_out` after
 ten minutes, and the daemon then makes the writes the previous release makes.

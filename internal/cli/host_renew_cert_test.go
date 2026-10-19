@@ -430,18 +430,23 @@ func TestHostRevokeCert_Guards(t *testing.T) {
 	}
 }
 
-// The CA machine's copy of the replaced pair (left by `lv host init`) is
-// removed by the renewal — key AND certificate, so no half pair is left; a
-// file there that is not that pair is left alone.
+// The CA machine's copy of the replaced pair (left by `lv host init`, or by
+// `lv host add` under hosts/<host>/) is removed by the renewal — key AND
+// certificate, so no half pair is left; a file there that is not that pair is
+// left alone.
 //
 // Mutations: skip removeCAMachineCopy — the copy outlives the renewal; skip
 // the certificate's removal (the re-review's N-c) — <host>.crt is left beside
-// a missing key.
+// a missing key; skip the hosts/<host>/ copy — the add's copy outlives it.
 func TestRenewHostCert_RemovesTheCAMachinesCopyOfTheReplacedKey(t *testing.T) {
 	f := newRenewFixture(t)
 	key, _ := os.ReadFile(filepath.Join(f.host, "host.key"))
 	crt, _ := os.ReadFile(filepath.Join(f.host, "host.crt"))
-	for name, b := range map[string][]byte{"node-r.key": key, "node-r.crt": crt, "node-o.key": key, "node-o.crt": crt} {
+	if err := os.MkdirAll(filepath.Join(f.op, "hosts", "node-r"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, b := range map[string][]byte{"node-r.key": key, "node-r.crt": crt, "node-o.key": key, "node-o.crt": crt,
+		"hosts/node-r/host.key": key, "hosts/node-r/host.crt": crt} {
 		if err := os.WriteFile(filepath.Join(f.op, name), b, 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -454,6 +459,11 @@ func TestRenewHostCert_RemovesTheCAMachinesCopyOfTheReplacedKey(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(f.op, "node-r.crt")); !os.IsNotExist(err) {
 		t.Fatal("the CA machine kept the replaced certificate beside the removed key (a half pair)")
+	}
+	for _, name := range []string{"hosts/node-r/host.key", "hosts/node-r/host.crt"} {
+		if _, err := os.Stat(filepath.Join(f.op, name)); !os.IsNotExist(err) {
+			t.Errorf("the copy `lv host add` kept, %s, outlived the renewal", name)
+		}
 	}
 	for _, name := range []string{"node-o.key", "node-o.crt"} {
 		if _, err := os.Stat(filepath.Join(f.op, name)); err != nil {

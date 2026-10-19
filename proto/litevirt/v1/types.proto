@@ -515,6 +515,7 @@ message SecurityGroup {
     string name       = 2;
     string stack_name = 3;  // empty = cluster-wide
     string created_at = 4;
+    string project    = 5;  // owning project; empty = global (docs/design/security-group-projects.md)
 }
 
 // SecurityGroupRule is one rule of a security group.
@@ -532,13 +533,27 @@ message SecurityGroupRule {
 
 // FirewallSynfloodPolicy is the SYN-flood protection policy of one scope.
 message FirewallSynfloodPolicy {
-    string scope      = 1;  // "cluster" | <host name>
+    string scope      = 1;  // "cluster" | "host/<name>"
     string mode       = 2;  // on | off
     uint32 rate       = 3;  // new SYNs per second per (guest NIC, source address)
     uint32 burst      = 4;  // packets
     string set_by     = 5;
     string updated_at = 6;
     bool   inherited  = 7;  // a host with no row of its own: the cluster policy applies
+    // A host's entry only: its SYN-flood drops per family since its last
+    // reload (the lv-sf 4 and lv-sf 6 counters), asked of the host itself.
+    // error says why they could not be read; then the counts mean nothing.
+    uint64 drops_v4   = 8;
+    uint64 drops_v6   = 9;
+    string error      = 10;
+    // A host's entry only: what that host has in force, from its last
+    // firewall pass: on | ipv4-only | ipv6-only (the kernel refused the
+    // other family's rules) | observe (counted, not dropped) | guards-only (no
+    // bridge conntrack: nothing rendered) | no-guest-nics (no per-NIC table
+    // yet) | unavailable (the kernel refused the SYN-flood rules, or the
+    // first per-NIC table) | off. A refused per-NIC table keeps the previous
+    // pass's value. Empty from a daemon that predates it.
+    string in_force   = 11;
 }
 
 // FirewallLogPolicy is the firewall log policy of one scope.

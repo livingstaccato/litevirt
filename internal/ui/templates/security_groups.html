@@ -5,14 +5,14 @@
       <h2>Security Groups</h2>
       <p class="muted">Distributed firewall. Changes propagate cluster-wide; each host reloads within ~30s.</p>
     </div>
-    <button class="btn btn-primary" hx-get="/ui/security-groups/create-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} Create group</button>
+    <button class="btn btn-primary" hx-get="/ui/security-groups/create-modal{{if $.Project}}?project={{$.Project}}{{end}}" hx-target="body" hx-swap="beforeend">{{icon "add"}} Create group</button>
   </div>
   {{template "alert_error" .Error}}
   {{if not .Groups}}
     <div class="empty-state">
       <h3>No security groups defined</h3>
       <p>Create a group, then add ingress/egress rules and bind it to VM NICs.</p>
-      <button class="btn btn-primary" hx-get="/ui/security-groups/create-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} Create group</button>
+      <button class="btn btn-primary" hx-get="/ui/security-groups/create-modal{{if $.Project}}?project={{$.Project}}{{end}}" hx-target="body" hx-swap="beforeend">{{icon "add"}} Create group</button>
     </div>
   {{else}}
   <div class="grid-2">
@@ -21,7 +21,7 @@
       <div class="section-header">
         <div>
           <h2 style="text-transform:none;color:var(--text);font-size:14px">{{.Name}}</h2>
-          <span class="muted mono" style="font-size:11px">{{.ID}}{{if .Stack}} · stack {{.Stack}}{{end}}</span>
+          <span class="muted mono" style="font-size:11px">{{.ID}}{{if .Project}} · project {{.Project}}{{else}} · global{{end}}{{if .Stack}} · stack {{.Stack}}{{end}}</span>
         </div>
         <div class="actions">
           <button class="btn btn-sm" hx-get="/ui/security-groups/{{.ID}}/rule-modal" hx-target="body" hx-swap="beforeend">{{icon "add"}} Rule</button>

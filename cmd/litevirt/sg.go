@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -84,16 +86,25 @@ var openClusterDB = func() (*corrosion.Client, error) {
 }
 
 func newSGCreateCmd() *cobra.Command {
-	var stack string
+	var stack, project string
 	cmd := &cobra.Command{
 		Use:   "create <name>",
 		Short: "Create a security group",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				sg, err := c.CreateSecurityGroup(ctx, &pb.CreateSecurityGroupRequest{Name: args[0], StackName: stack})
+				if project != "" {
+					if err := requireSGProjects(ctx, c, "create"); err != nil {
+						return err
+					}
+				}
+				sg, err := c.CreateSecurityGroup(ctx, &pb.CreateSecurityGroupRequest{Name: args[0], StackName: stack, Project: project})
 				if err != nil {
 					return sgRPCError("create", err)
+				}
+				if sg.GetProject() != project {
+					return fmt.Errorf("lv sg create: asked for a group of project %q, and the daemon created %q (id %s) in project %q; "+
+						"remove it with `lv sg rm %s` and upgrade litevirtd on the host you are connected to", project, args[0], sg.GetId(), sg.GetProject(), sg.GetId())
 				}
 				fmt.Printf("Created security group %q (id=%s)\n", args[0], sg.Id)
 				return nil
@@ -101,7 +112,49 @@ func newSGCreateCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&stack, "stack", "", "Limit the SG to one stack (default: cluster-wide)")
+	cmd.Flags().StringVar(&project, "project", "", "Project that owns the SG; only its workloads may bind it (default: global)")
 	return cmd
+}
+
+// errSGProjectsUnsupported is the refusal of --project against a daemon that
+// does not implement project security groups.
+type errSGProjectsUnsupported struct{ sub, why string }
+
+func (e errSGProjectsUnsupported) Error() string {
+	return fmt.Sprintf("lv sg %s --project: the daemon predates project security groups (%s); upgrade litevirtd on the host you are connected to", e.sub, e.why)
+}
+
+// sgProjectsProbe is a malformed project name. A daemon that implements
+// project security groups validates ListSecurityGroups' project before any
+// authorization and answers it InvalidArgument; one that does not knows no
+// such field and answers as for any listing (every group, or its refusal of
+// the caller). A declared release feature proves nothing: a build can declare
+// sg_projects before it implements it.
+const sgProjectsProbe = ".."
+
+// requireSGProjects refuses --project against a daemon that does not
+// implement project security groups, before anything is created or listed.
+// Such a daemon drops the field it does not read: a create would make a
+// GLOBAL group every project may bind, and a listing would not be filtered.
+// The probe needs no more than any listing does, so a token scoped to a
+// project can make it. A daemon that cannot be reached is returned as it is.
+func requireSGProjects(ctx context.Context, c pb.LiteVirtClient, sub string) error {
+	_, err := c.ListSecurityGroups(ctx, &pb.ListSecurityGroupsRequest{Project: sgProjectsProbe})
+	switch {
+	case status.Code(err) == codes.InvalidArgument && strings.Contains(status.Convert(err).Message(), "invalid project"):
+		return nil
+	case err == nil:
+		return errSGProjectsUnsupported{sub, "it ignored the project of a listing"}
+	case status.Code(err) == codes.PermissionDenied:
+		// A previous build checks sg.read at the root before anything else;
+		// this one reads the project first.
+		return errSGProjectsUnsupported{sub, "it refused the listing before reading its project: " + status.Convert(err).Message()}
+	case status.Code(err) == codes.Unimplemented:
+		return errSGProjectsUnsupported{sub, "it has no security-group listing"}
+	}
+	// Anything else is the daemon failing for reasons of its own: say so,
+	// and still do nothing.
+	return fmt.Errorf("lv sg %s --project: could not ask the daemon whether it supports project security groups: %w", sub, err)
 }
 
 // sgRPCError explains an Unimplemented reply. A daemon older than the
@@ -117,25 +170,26 @@ func sgRPCError(sub string, err error) error {
 }
 
 func newSGListCmd() *cobra.Command {
-	var stack string
+	var stack, project string
 	cmd := &cobra.Command{
 		Use:   "ls",
 		Short: "List security groups",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			resp, err := listSecurityGroups(cmd, &pb.ListSecurityGroupsRequest{StackName: stack, IncludeRules: true})
+			resp, err := listSecurityGroups(cmd, &pb.ListSecurityGroupsRequest{StackName: stack, Project: project, IncludeRules: true})
 			if err != nil {
 				return err
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "ID\tNAME\tSTACK\tCREATED")
+			fmt.Fprintln(w, "ID\tNAME\tPROJECT\tSTACK\tCREATED")
 			for _, sg := range resp.GetGroups() {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", sg.GetId(), sg.GetName(), sg.GetStackName(), sg.GetCreatedAt())
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", sg.GetId(), sg.GetName(), sg.GetProject(), sg.GetStackName(), sg.GetCreatedAt())
 			}
 			warnUnattributedRules(cmd, resp)
 			return w.Flush()
 		},
 	}
 	cmd.Flags().StringVar(&stack, "stack", "", "Filter to one stack")
+	cmd.Flags().StringVar(&project, "project", "", "List one project's SGs and the global ones")
 	return cmd
 }
 
@@ -152,12 +206,26 @@ func newSGListCmd() *cobra.Command {
 func listSecurityGroups(cmd *cobra.Command, req *pb.ListSecurityGroupsRequest) (*pb.ListSecurityGroupsResponse, error) {
 	var resp *pb.ListSecurityGroupsResponse
 	asked := false
+	var unsupported error
 	err := withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+		if req.GetProject() != "" {
+			// A daemon that cannot be asked is handled below like any other.
+			if perr := requireSGProjects(ctx, c, "ls"); perr != nil {
+				var old errSGProjectsUnsupported
+				if errors.As(perr, &old) {
+					unsupported = perr
+					return perr
+				}
+			}
+		}
 		asked = true
 		var err error
 		resp, err = c.ListSecurityGroups(ctx, req)
 		return err
 	})
+	if unsupported != nil {
+		return nil, unsupported
+	}
 	var why string
 	switch {
 	case err == nil:
@@ -204,9 +272,10 @@ func listSecurityGroupsLocal(ctx context.Context, req *pb.ListSecurityGroupsRequ
 	resp := &pb.ListSecurityGroupsResponse{}
 	var unattributed []corrosion.SGRule
 	toPb := func(r corrosion.SGRule) *pb.SecurityGroupRule {
+		action, logged := corrosion.SplitLoggedAction(r.Action)
 		return &pb.SecurityGroupRule{
 			Id: r.ID, SgId: r.SGID, Direction: r.Direction, Proto: r.Proto,
-			Port: r.PortRange, Cidr: r.CIDR, Action: r.Action, Priority: int32(r.Priority),
+			Port: r.PortRange, Cidr: r.CIDR, Action: action, Priority: int32(r.Priority), Log: logged,
 		}
 	}
 	if req.GetIncludeRules() {
@@ -228,7 +297,10 @@ func listSecurityGroupsLocal(ctx context.Context, req *pb.ListSecurityGroupsRequ
 		}
 	}
 	for _, g := range groups {
-		resp.Groups = append(resp.Groups, &pb.SecurityGroup{Id: g.ID, Name: g.Name, StackName: g.StackName, CreatedAt: g.CreatedAt})
+		if p := req.GetProject(); p != "" && g.Project != "" && g.Project != p {
+			continue
+		}
+		resp.Groups = append(resp.Groups, &pb.SecurityGroup{Id: g.ID, Name: g.Name, StackName: g.StackName, CreatedAt: g.CreatedAt, Project: g.Project})
 		if !req.GetIncludeRules() {
 			continue
 		}
@@ -239,10 +311,7 @@ func listSecurityGroupsLocal(ctx context.Context, req *pb.ListSecurityGroupsRequ
 			return nil, err
 		}
 		for _, r := range rules {
-			resp.Rules = append(resp.Rules, &pb.SecurityGroupRule{
-				Id: r.ID, SgId: r.SGID, Direction: r.Direction, Proto: r.Proto,
-				Port: r.PortRange, Cidr: r.CIDR, Action: r.Action, Priority: int32(r.Priority),
-			})
+			resp.Rules = append(resp.Rules, toPb(r))
 		}
 	}
 	for _, r := range unattributed {
@@ -287,16 +356,20 @@ func newSGDeleteCmd() *cobra.Command {
 func newSGRuleAddCmd() *cobra.Command {
 	var direction, proto, port, cidr, action, macro string
 	var priority int
+	var logged bool
 	cmd := &cobra.Command{
 		Use:   "rule-add <sg-id-or-name>",
 		Short: "Add a rule to a security group (by id or name)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := refuseClientLogAction(action); err != nil {
+				return err
+			}
 			if macro != "" {
 				return runMacroAdd(cmd, macro, direction, cidr, action, func(ctx context.Context, c pb.LiteVirtClient, _ string, row firewall.ExpandedRule) (string, error) {
 					rule, err := c.AddSecurityGroupRule(ctx, &pb.AddSecurityGroupRuleRequest{Rule: &pb.SecurityGroupRule{
 						SgId: args[0], Direction: row.Direction, Proto: row.Proto, Port: row.Port,
-						Cidr: row.CIDR, Action: row.Action, Priority: int32(priority),
+						Cidr: row.CIDR, Action: row.Action, Priority: int32(priority), Log: logged,
 					}})
 					if err != nil {
 						return "", sgRPCError("rule-add", err)
@@ -311,9 +384,12 @@ func newSGRuleAddCmd() *cobra.Command {
 				if err := requireTagGroupSupport(ctx, c, cidr); err != nil {
 					return err
 				}
+				if err := requireLogSupport(ctx, c, logged); err != nil {
+					return err
+				}
 				rule, err := c.AddSecurityGroupRule(ctx, &pb.AddSecurityGroupRuleRequest{Rule: &pb.SecurityGroupRule{
 					SgId: args[0], Direction: direction, Proto: proto, Port: port,
-					Cidr: cidr, Action: action, Priority: int32(priority),
+					Cidr: cidr, Action: action, Priority: int32(priority), Log: logged,
 				}})
 				if err != nil {
 					return sgRPCError("rule-add", err)
@@ -330,6 +406,7 @@ func newSGRuleAddCmd() *cobra.Command {
 	cmd.Flags().StringVar(&action, "action", "accept", "accept | drop | reject")
 	cmd.Flags().IntVar(&priority, "priority", 100, "lower runs first")
 	cmd.Flags().StringVar(&macro, "macro", "", "add the rules of a named macro instead of --proto/--port (see 'lv firewall macros')")
+	cmd.Flags().BoolVar(&logged, "log", false, logFlagUsage)
 	return cmd
 }
 
@@ -377,7 +454,7 @@ func newSGRuleListCmd() *cobra.Command {
 						fmt.Fprintf(w, "%s\t", gid)
 					}
 					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-						r.GetId(), r.GetDirection(), r.GetProto(), r.GetPort(), r.GetCidr(), r.GetAction(),
+						r.GetId(), r.GetDirection(), r.GetProto(), r.GetPort(), r.GetCidr(), ruleAction(r.GetAction(), r.GetLog()),
 						strconv.Itoa(int(r.GetPriority())))
 				}
 			}

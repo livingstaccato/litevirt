@@ -127,8 +127,9 @@ var releaseFeatures = map[Feature]FeatureInfo{
 
 	// The firewall extras.
 	FeatureFirewallSynflood: {Token: Release202611V1, Description: "SYN-flood protection on guest NICs: the cluster and per-host policy (recorded on for a cluster founded by this release)",
-		Writers: []string{"internal/corrosion.SetFirewallSynflood"}},
-	FeatureFirewallLog:       {Token: Release202611V1, Description: "Firewall logging: logged rules and the cluster and per-host log policy", Writers: firewallRuleWriters},
+		Writers: []string{"internal/corrosion.SetFirewallSynflood", "internal/corrosion.SeedFirewallSynflood"}},
+	FeatureFirewallLog: {Token: Release202611V1, Description: "Firewall logging: logged rules and the cluster and per-host log policy",
+		Writers: append(slices.Clone(firewallRuleWriters), "internal/corrosion.SetFirewallLogPolicy")},
 	FeatureFirewallTagGroups: {Token: Release202611V1, Description: "Firewall tag groups, per-workload firewall tags, and rules matching a tag group's addresses", Writers: firewallTagGroupWriters},
 
 	// Used only when a removed host is added again.
@@ -136,7 +137,7 @@ var releaseFeatures = map[Feature]FeatureInfo{
 		Writers: []string{"internal/corrosion.AdmitHostV2", "internal/corrosion.WriteOwnEndpoint"}},
 
 	FeatureAutomationStream: {Token: Release202611V1, Description: "Certified automation history, retained recovery provenance, and managed-resource state"},
-	FeatureSGProjects:       {Token: Release202611V1, Description: "Security groups owned by a project (used when a group is created with a project)"},
+	FeatureSGProjects:       {Token: Release202611V1, Description: "Security groups owned by a project (used when a group is created with a project)", Writers: []string{"internal/corrosion.InsertProjectSecurityGroup"}},
 }
 
 // firewallRuleWriters write the three rule tables. Each takes one grant per

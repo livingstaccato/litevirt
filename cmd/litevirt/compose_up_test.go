@@ -38,6 +38,7 @@ type deployClient struct {
 	teardown []*pb.DeleteProgress
 	applied  bool // a non-dry-run DeployStack was issued
 	deleted  bool // DeleteStack was issued
+	noVMs    bool // ListVMs lists none for the stack
 }
 
 func (d *deployClient) DeployStack(_ context.Context, in *pb.DeployStackRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.DeployProgress], error) {
@@ -49,6 +50,9 @@ func (d *deployClient) DeployStack(_ context.Context, in *pb.DeployStackRequest,
 }
 
 func (d *deployClient) ListVMs(_ context.Context, _ *pb.ListVMsRequest, _ ...grpc.CallOption) (*pb.ListVMsResponse, error) {
+	if d.noVMs {
+		return &pb.ListVMsResponse{}, nil
+	}
 	return &pb.ListVMsResponse{Vms: []*pb.VM{{Name: "ha1", State: pb.VMState_VM_RUNNING}}}, nil
 }
 

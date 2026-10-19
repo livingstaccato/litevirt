@@ -20,7 +20,7 @@ func staleVarsServer(t *testing.T) *Server {
 		Evaluator: libvirt.NvramFlushEvaluator, Code: libvirt.CondNvramFlushFailed,
 		SubjectKind: "host", SubjectID: "h1", Lifecycle: corrosion.ConditionConfirmed,
 		Severity: corrosion.SeverityCritical, Reporter: "h1", LastSeen: backdated,
-		Evidence: `{"files":[{"path":"/var/lib/libvirt/qemu/nvram/web-1_VARS.fd","vm":"web-1"}]}`,
+		Evidence: `{"files":[{"path":"/var/lib/libvirt/qemu/nvram/web-1_VARS.fd","vm":"web-1","ino":4242,"episode":"9f3a1c"}]}`,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -67,8 +67,9 @@ func TestResolveHealthCondition_StaleUEFIVarsAcknowledged(t *testing.T) {
 	}
 	audits := healthResolveAudits(t, s)
 	if len(audits) != 1 || !strings.Contains(audits[0][1], "may be stale") ||
-		!strings.Contains(audits[0][1], "web-1_VARS.fd") || !strings.Contains(audits[0][1], req.Reason) {
-		t.Fatalf("audit = %v; want one row acknowledging the stale store, naming the file and the reason", audits)
+		!strings.Contains(audits[0][1], "web-1_VARS.fd") || !strings.Contains(audits[0][1], req.Reason) ||
+		!strings.Contains(audits[0][1], "inode 4242") || !strings.Contains(audits[0][1], "episode 9f3a1c") {
+		t.Fatalf("audit = %v; want one row acknowledging the stale store, naming the file, its inode and episode, and the reason", audits)
 	}
 }
 

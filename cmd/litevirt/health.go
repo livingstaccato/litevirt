@@ -128,7 +128,8 @@ files' sizes and times.
 One more condition can be resolved: nvram_flush_failed. Resolving it, with
 --accept-stale-uefi-vars and a --reason, accepts that the UEFI vars stores it
 names may be stale (writes a failed fsync lost are not on disk), for a VM
-kept as it is; the host's daemon then stops reporting those files:
+kept as it is; the host's daemon then stops reporting the failures it named
+(a later failed flush of the same file is raised again):
 
   lv health resolve nvram_flush_failed host/node-1 --accept-stale-uefi-vars --reason "disk replaced"
 

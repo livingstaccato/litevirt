@@ -910,8 +910,10 @@ func (s *Server) acknowledgeStaleUEFIVars(ctx context.Context, row corrosion.Hea
 	}
 	var ev struct {
 		Files []struct {
-			Path string `json:"path"`
-			VM   string `json:"vm"`
+			Path    string `json:"path"`
+			VM      string `json:"vm"`
+			Ino     uint64 `json:"ino"`
+			Episode string `json:"episode"`
 		} `json:"files"`
 	}
 	files := make([]string, 0)
@@ -919,7 +921,7 @@ func (s *Server) acknowledgeStaleUEFIVars(ctx context.Context, row corrosion.Hea
 		files = append(files, "evidence unreadable ("+err.Error()+"): the files are not known")
 	}
 	for _, f := range ev.Files {
-		files = append(files, f.Path+" (vm "+f.VM+")")
+		files = append(files, fmt.Sprintf("%s (vm %s, inode %d, episode %s)", f.Path, f.VM, f.Ino, f.Episode))
 	}
 	prior := row.Lifecycle
 	now := time.Now().UTC().Format(time.RFC3339)

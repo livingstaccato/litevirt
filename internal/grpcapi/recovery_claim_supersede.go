@@ -543,11 +543,14 @@ func (s *Server) uncertifiedClaims(ctx context.Context) (map[string]string, erro
 // RecoveryClaimHealthTick is the lease holder's pass over the recovery-claim
 // health conditions, run each tick it holds the failover lease (like
 // VoterGenesisTick): ha.claim.stranded names every workload decided for a
-// destination that cannot run it, with the command that unblocks it.
+// destination that cannot run it, with the command that unblocks it. It
+// also evaluates host.address_shared, which is the lease holder's to write
+// too.
 func (s *Server) RecoveryClaimHealthTick(ctx context.Context) {
 	if s.db == nil {
 		return
 	}
+	s.applyHostAddressShared(ctx)
 	s.applyVoterConditions(ctx)
 	s.applyVoterUnavailable(ctx)
 	if !s.RecoveryClaimEnforced(ctx) {

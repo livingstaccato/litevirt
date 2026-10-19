@@ -247,9 +247,7 @@ func (s *Server) listSetAsideOverlaysHere(ctx context.Context, only *corrosion.V
 		for i := range disks {
 			d := &disks[i]
 			disk := s.hostDiskFile(d.Path)
-			orphans, err := storage.Bounded("look for set-aside point-in-time overlays of", disk, func() ([]string, error) {
-				return pitoverlay.Orphans(disk)
-			})
+			orphans, err := pitoverlay.OrphansBounded(disk)
 			if err != nil {
 				return nil, status.Errorf(codes.Unavailable, "look for set-aside overlays of %s disk %s: %v", vm.Name, d.DiskName, err)
 			}

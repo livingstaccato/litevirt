@@ -235,6 +235,15 @@ func setAsideEvidenceWith(glob func(string) ([]string, error), disk, vmUUID stri
 // paths, without their bindings.
 func Orphans(disk string) ([]string, error) { return orphansWith(glob, disk) }
 
+// OrphansBounded is Orphans under storage.Bounded: a disk whose storage does
+// not answer gets the *storage.FSNoAnswerError.
+func OrphansBounded(disk string) ([]string, error) {
+	g := glob // read here: the call below may outlive its caller
+	return storage.Bounded("look for set-aside point-in-time overlays of", disk, func() ([]string, error) {
+		return orphansWith(g, disk)
+	})
+}
+
 func orphansWith(glob func(string) ([]string, error), disk string) ([]string, error) {
 	m, err := glob(Path(disk) + ".orphan-*")
 	if err != nil {

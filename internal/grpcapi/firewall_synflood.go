@@ -41,7 +41,7 @@ func (s *Server) SetFirewallSynflood(ctx context.Context, req *pb.SetFirewallSyn
 		}
 		if h == nil {
 			return nil, status.Errorf(codes.NotFound,
-				"no host named %q: --scope takes a host (lv host ls); leave it out for the cluster-wide policy", host)
+				"no host named %q has joined, as this node sees it: --scope takes a host (lv host ls); leave it out for the cluster-wide policy", host)
 		}
 	}
 	var p corrosion.FirewallSynflood

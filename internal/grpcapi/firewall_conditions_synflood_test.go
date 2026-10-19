@@ -45,6 +45,12 @@ func TestRecordFirewallState_SynFloodConditions(t *testing.T) {
 	if row, on := cond(CondFirewallSynfloodUnavailable); !on || !strings.Contains(row.Evidence, ": IPv6 SYNs") {
 		t.Errorf("IPv6 refused: %q (active %v), want it to name IPv6 alone", row.Evidence, on)
 	}
+	// Only IPv4 refused: the condition names IPv4 alone (round-2 re-review R2-m2).
+	s.RecordFirewallState(ctx, firewall.AppliedState{Mode: firewall.NICModeEnforce,
+		SynFlood: firewall.SynFlood{On: true, Rate: 200, Burst: 1000, NoV4: true}, SynFloodUnavailable: "IPv4: no nft_limit"})
+	if row, on := cond(CondFirewallSynfloodUnavailable); !on || !strings.Contains(row.Evidence, ": IPv4 SYNs") {
+		t.Errorf("IPv4 refused: %q (active %v), want it to name IPv4 alone", row.Evidence, on)
+	}
 	s.RecordFirewallState(ctx, firewall.AppliedState{Mode: firewall.NICModeEnforce})
 	if _, on := cond(CondFirewallSynfloodUnavailable); on {
 		t.Errorf("%s still active after a clean pass", CondFirewallSynfloodUnavailable)

@@ -134,6 +134,23 @@ func synfloodPolicyText(p *pb.FirewallSynfloodPolicy) string {
 	return fmt.Sprintf("on, %d/second burst %d", p.GetRate(), p.GetBurst())
 }
 
+// synfloodDropsText is a host's drops per family: "-" where they could not
+// be read (its error says why) or where that family is not limited at all
+// (in force ipv4-only or ipv6-only), never a 0.
+func synfloodDropsText(p *pb.FirewallSynfloodPolicy) (v4, v6 string) {
+	if p.GetError() != "" {
+		return "-", "-"
+	}
+	v4, v6 = fmt.Sprint(p.GetDropsV4()), fmt.Sprint(p.GetDropsV6())
+	switch p.GetInForce() {
+	case "ipv4-only":
+		v6 = "-"
+	case "ipv6-only":
+		v4 = "-"
+	}
+	return v4, v6
+}
+
 // synfloodInForceText is what a host has in force, as the host reported it:
 // "-" when it could not be asked (its error says why), "predates" when its
 // daemon is older than the report.
@@ -148,9 +165,10 @@ func synfloodInForceText(p *pb.FirewallSynfloodPolicy) string {
 }
 
 // printSynflood prints the cluster's policy (the reply's first entry) and
-// each host's: its policy, what the host itself has in force (on, observe,
-// guards-only, unavailable or off; synfloodInForceText) and its SYN-flood
-// drops per family since its last reload.
+// each host's: its policy, what the host itself has in force (on,
+// ipv4-only, ipv6-only, observe, guards-only, no-guest-nics, unavailable or
+// off; synfloodInForceText) and its SYN-flood drops per family since its last
+// reload (synfloodDropsText).
 func printSynflood(out io.Writer, r *pb.GetFirewallSynfloodResponse) error {
 	ps := r.GetPolicies()
 	if len(ps) == 0 {
@@ -180,10 +198,7 @@ func printSynflood(out io.Writer, r *pb.GetFirewallSynfloodResponse) error {
 		host := strings.TrimPrefix(p.GetScope(), "host/")
 		inForce := synfloodInForceText(p)
 		// A count that could not be read is "-", with why, never a 0.
-		d4, d6 := "-", "-"
-		if p.GetError() == "" {
-			d4, d6 = fmt.Sprint(p.GetDropsV4()), fmt.Sprint(p.GetDropsV6())
-		}
+		d4, d6 := synfloodDropsText(p)
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", host, p.GetMode(), inForce, rate, burst, from, d4, d6, setBy, p.GetError())
 	}
 	return w.Flush()

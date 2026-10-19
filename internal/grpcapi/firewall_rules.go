@@ -463,7 +463,7 @@ func (s *Server) defaultDenyScope(ctx context.Context, scope string) (string, er
 		return "cluster", nil
 	case h == nil:
 		return "", status.Errorf(codes.NotFound,
-			"no host named %q: --scope takes a host (lv host ls); leave it out for the cluster-wide policy", scope)
+			"no host named %q has joined, as this node sees it: --scope takes a host (lv host ls); leave it out for the cluster-wide policy", scope)
 	}
 	return scope, nil
 }

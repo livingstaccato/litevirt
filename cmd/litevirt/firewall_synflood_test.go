@@ -93,7 +93,8 @@ func TestSynfloodCLI_Writes(t *testing.T) {
 // asked shows "-" and why, never a 0 or an "on" (Track B review I-2).
 //
 // Mutations: show the policy as IN FORCE — h1 and h2 show on: red; show an
-// empty in_force as on — h3: red; print an unreadable count as 0 — h4: red.
+// empty in_force as on — h3: red; print an unreadable count as 0 — h4: red;
+// print the refused family's count as 0 — h6: red (round-2 re-review R2-m1).
 func TestSynfloodCLI_Status(t *testing.T) {
 	spy := &synfloodSpy{
 		get: &pb.GetFirewallSynfloodResponse{Policies: []*pb.FirewallSynfloodPolicy{
@@ -103,6 +104,7 @@ func TestSynfloodCLI_Status(t *testing.T) {
 			{Scope: "host/h3", Mode: "on", Rate: 200, Burst: 1000, Inherited: true},
 			{Scope: "host/h4", Mode: "on", Rate: 200, Burst: 1000, Inherited: true, Error: "unreachable"},
 			{Scope: "host/h5", Mode: "off", SetBy: "olga", UpdatedAt: "t2", InForce: "off", DropsV4: 17, DropsV6: 3},
+			{Scope: "host/h6", Mode: "on", Rate: 200, Burst: 1000, Inherited: true, InForce: "ipv4-only", DropsV4: 5},
 		}},
 	}
 	out, err := runSynfloodCLI(t, spy, "status")
@@ -110,7 +112,7 @@ func TestSynfloodCLI_Status(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 7 || lines[0] != "cluster: on, 200/second burst 1000 (set by olga at t1)" {
+	if len(lines) != 8 || lines[0] != "cluster: on, 200/second burst 1000 (set by olga at t1)" {
 		t.Fatalf("status output:\n%s", out)
 	}
 	for i, want := range []string{
@@ -119,6 +121,7 @@ func TestSynfloodCLI_Status(t *testing.T) {
 		"h3 on predates 200 1000 cluster 0 0 -",
 		"h4 on - 200 1000 cluster - - - unreachable",
 		"h5 off off - - host 17 3 olga t2",
+		"h6 on ipv4-only 200 1000 cluster 5 - -",
 	} {
 		if got := strings.Join(strings.Fields(lines[i+2]), " "); got != want {
 			t.Errorf("row %d = %q, want %q", i+1, got, want)

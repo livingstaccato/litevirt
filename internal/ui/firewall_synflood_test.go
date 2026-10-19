@@ -71,6 +71,7 @@ func TestUIFirewall_SynfloodPanelShowsWhatIsInForce(t *testing.T) {
 		{Scope: "host/h1", Mode: "on", Rate: 200, Burst: 1000, Inherited: true, InForce: "observe", DropsV4: 5},
 		{Scope: "host/h3", Mode: "on", Rate: 200, Burst: 1000, Inherited: true},
 		{Scope: "host/h4", Mode: "on", Rate: 200, Burst: 1000, Inherited: true, Error: "unreachable: connection refused"},
+		{Scope: "host/h6", Mode: "on", Rate: 200, Burst: 1000, Inherited: true, InForce: "ipv6-only", DropsV6: 2},
 	}}}
 	s := synfloodUIServer(t, m)
 
@@ -87,10 +88,13 @@ func TestUIFirewall_SynfloodPanelShowsWhatIsInForce(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 	body := w.Body.String()
 	mustContain(t, body, "on, 200/second burst 1000")
+	// Asking again needs no page reload (round-2 re-review n-b).
+	mustContain(t, body, `hx-get="/ui/firewall/synflood"`)
 	for host, want := range map[string]string{
 		"h1": "h1 on observe 200 1000 cluster 5 0",
 		"h3": "h3 on predates 200 1000 cluster 0 0",
 		"h4": "h4 on - 200 1000 cluster - - unreachable: connection refused",
+		"h6": "h6 on ipv6-only 200 1000 cluster - 2",
 	} {
 		if got := rowText(body, host); got != want {
 			t.Errorf("row %s = %q, want %q", host, got, want)

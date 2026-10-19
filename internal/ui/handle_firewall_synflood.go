@@ -20,8 +20,9 @@ type synfloodRow struct {
 
 // handleFWSynflood renders the SYN-flood panel: the cluster's policy, then
 // per host its policy and what the host itself has in force (as `lv firewall
-// synflood status` shows them). It is loaded after the page, since the daemon
-// asks every host.
+// synflood status` shows them). It is loaded on request (a button), not
+// with the page, since the daemon asks every host; the fragment carries a
+// button to ask again.
 func (s *Server) handleFWSynflood(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(s.uiBearerCtx(r), 30*time.Second)
 	defer cancel()
@@ -47,9 +48,16 @@ func (s *Server) handleFWSynflood(w http.ResponseWriter, r *http.Request) {
 			if p.GetMode() == "on" {
 				row.Rate, row.Burst = fmt.Sprint(p.GetRate()), fmt.Sprint(p.GetBurst())
 			}
-			// A count that could not be read is "-", never a 0.
+			// A count that could not be read, or of a family that is not
+			// limited (ipv4-only, ipv6-only), is "-", never a 0.
 			if p.GetError() == "" {
 				row.DropsV4, row.DropsV6 = fmt.Sprint(p.GetDropsV4()), fmt.Sprint(p.GetDropsV6())
+				switch p.GetInForce() {
+				case "ipv4-only":
+					row.DropsV6 = "-"
+				case "ipv6-only":
+					row.DropsV4 = "-"
+				}
 			}
 			switch {
 			case p.GetInForce() != "":

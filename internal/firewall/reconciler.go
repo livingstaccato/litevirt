@@ -205,8 +205,10 @@ type AppliedState struct {
 	SynFlood            SynFlood
 	SynFloodUnavailable string
 	// SynFloodInForce is what the pass put in force of SYN-flood
-	// protection: SynFloodInForceOn, ...Observe, ...GuardsOnly,
-	// ...Unavailable or ...Off; "" before the first pass.
+	// protection: SynFloodInForceOn, ...IPv4Only or ...IPv6Only (one family
+	// refused at start), ...Observe, ...GuardsOnly, ...NoGuestNICs,
+	// ...Unavailable or ...Off; "" before the first pass. A refused per-NIC
+	// table keeps the previous pass's value (unavailable with none).
 	SynFloodInForce string
 }
 

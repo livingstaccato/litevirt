@@ -15,7 +15,8 @@ import (
 // there: it says so rather than on (Track B round-1 re-review n-1).
 //
 // Mutations: report on in observe mode — red; report on in guards-only — red;
-// report off for a refused probe — red; report on with no guest NIC — red.
+// report off for a refused probe — red; report on with no guest NIC — red;
+// report on with one family refused — red (round-2 re-review R2-m1).
 func TestRecordState_SynFloodInForce(t *testing.T) {
 	on := SynFlood{On: true, Rate: 200, Burst: 1000}
 	nics := []NICBinding{{NICDev: "tap0", VMName: "vm1"}}
@@ -32,6 +33,10 @@ func TestRecordState_SynFloodInForce(t *testing.T) {
 		{"guards-only", Plan{NICMode: NICModeGuardsOnly, SynFlood: on, NICs: nics}, SynFloodInForceGuardsOnly},
 		{"refused probe", Plan{NICMode: NICModeEnforce, SynFloodUnavailable: "no nft_limit", NICs: nics}, SynFloodInForceUnavailable},
 		{"policy off", Plan{NICMode: NICModeEnforce, NICs: nics}, SynFloodInForceOff},
+		{"IPv6 refused", Plan{NICMode: NICModeEnforce, NICs: nics, SynFloodUnavailable: "IPv6: x",
+			SynFlood: SynFlood{On: true, Rate: 200, Burst: 1000, NoV6: true}}, SynFloodInForceIPv4Only},
+		{"IPv4 refused", Plan{NICMode: NICModeEnforce, NICs: nics, SynFloodUnavailable: "IPv4: x",
+			SynFlood: SynFlood{On: true, Rate: 200, Burst: 1000, NoV4: true}}, SynFloodInForceIPv6Only},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := &Reconciler{}

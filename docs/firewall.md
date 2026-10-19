@@ -1072,7 +1072,8 @@ lv firewall synflood inherit --scope <host>                       # clear a host
 - A host's own policy (`--scope <host>`) wins over the cluster's; with
   neither, protection is off. `status` shows, per host, the policy, where it
   comes from (`host` or `cluster`), what the host itself has in force
-  (IN FORCE: `on`; `observe`, counted and not dropped; `guards-only`, no
+  (IN FORCE: `on`; `ipv4-only` or `ipv6-only`, the kernel refused the other
+  family's rules, whose drops then show `-`; `observe`, counted and not dropped; `guards-only`, no
   bridge conntrack, nothing rendered; `no-guest-nics`, no per-NIC table yet;
   `unavailable`, the kernel refused the rules, or the host's first per-NIC
   table; `off`; `predates`, the host's litevirtd does not report it), and its

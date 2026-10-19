@@ -3444,7 +3444,8 @@ type FirewallSynfloodPolicy struct {
 	DropsV6 uint64 `protobuf:"varint,9,opt,name=drops_v6,json=dropsV6,proto3" json:"drops_v6,omitempty"`
 	Error   string `protobuf:"bytes,10,opt,name=error,proto3" json:"error,omitempty"`
 	// A host's entry only: what that host has in force, from its last
-	// firewall pass: on | observe (counted, not dropped) | guards-only (no
+	// firewall pass: on | ipv4-only | ipv6-only (the kernel refused the
+	// other family's rules) | observe (counted, not dropped) | guards-only (no
 	// bridge conntrack: nothing rendered) | no-guest-nics (no per-NIC table
 	// yet) | unavailable (the kernel refused the SYN-flood rules, or the
 	// first per-NIC table) | off. A refused per-NIC table keeps the previous

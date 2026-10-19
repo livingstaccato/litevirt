@@ -260,6 +260,8 @@ const (
 	SynFloodInForceUnavailable = "unavailable"
 	SynFloodInForceOff         = "off"
 	SynFloodInForceNoGuestNICs = "no-guest-nics"
+	SynFloodInForceIPv4Only    = "ipv4-only"
+	SynFloodInForceIPv6Only    = "ipv6-only"
 )
 
 // synFloodInForce is what a plan puts in force of SYN-flood protection: the
@@ -278,6 +280,10 @@ func synFloodInForce(p Plan) string {
 		return SynFloodInForceGuardsOnly
 	case p.nicMode() == NICModeObserve:
 		return SynFloodInForceObserve
+	case p.SynFlood.NoV6:
+		return SynFloodInForceIPv4Only
+	case p.SynFlood.NoV4:
+		return SynFloodInForceIPv6Only
 	}
 	return SynFloodInForceOn
 }

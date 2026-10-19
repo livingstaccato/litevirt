@@ -546,7 +546,8 @@ message FirewallSynfloodPolicy {
     uint64 drops_v6   = 9;
     string error      = 10;
     // A host's entry only: what that host has in force, from its last
-    // firewall pass: on | observe (counted, not dropped) | guards-only (no
+    // firewall pass: on | ipv4-only | ipv6-only (the kernel refused the
+    // other family's rules) | observe (counted, not dropped) | guards-only (no
     // bridge conntrack: nothing rendered) | no-guest-nics (no per-NIC table
     // yet) | unavailable (the kernel refused the SYN-flood rules, or the
     // first per-NIC table) | off. A refused per-NIC table keeps the previous

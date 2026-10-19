@@ -255,9 +255,10 @@ func TestLoader_SynFloodOneFamilyRefused(t *testing.T) {
 		res           SynFloodProbeResult
 		has, lacks    string
 		unavailableIs string
+		inForce       string
 	}{
-		{"IPv6 refused", SynFloodProbeResult{V6: errors.New("unexpected &")}, setSyn4, setSyn6, "IPv6"},
-		{"IPv4 refused", SynFloodProbeResult{V4: errors.New("no nft_limit")}, setSyn6, setSyn4, "IPv4"},
+		{"IPv6 refused", SynFloodProbeResult{V6: errors.New("unexpected &")}, setSyn4, setSyn6, "IPv6", SynFloodInForceIPv4Only},
+		{"IPv4 refused", SynFloodProbeResult{V4: errors.New("no nft_limit")}, setSyn6, setSyn4, "IPv4", SynFloodInForceIPv6Only},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			plan := loadSynFloodPlan(t, db, "host-a", func() SynFloodProbeResult { return tc.res })
@@ -275,8 +276,8 @@ func TestLoader_SynFloodOneFamilyRefused(t *testing.T) {
 			if !strings.Contains(out, tc.has) || strings.Contains(out, tc.lacks) {
 				t.Errorf("ruleset: want %s and not %s", tc.has, tc.lacks)
 			}
-			if got := synFloodInForce(plan); got != SynFloodInForceOn {
-				t.Errorf("in force = %q, want on (the accepted family is limited)", got)
+			if got := synFloodInForce(plan); got != tc.inForce {
+				t.Errorf("in force = %q, want %q (only the accepted family is limited)", got, tc.inForce)
 			}
 		})
 	}

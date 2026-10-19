@@ -2,7 +2,10 @@ package corrosion
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 )
 
 // StackRecord represents a deployed compose stack.
@@ -15,18 +18,21 @@ type StackRecord struct {
 	UpdatedAt   string
 }
 
-// UpsertStack creates or updates a stack record.
-func UpsertStack(ctx context.Context, c *Client, s StackRecord) error {
-	now := c.NowTS()
-	return c.Execute(ctx,
-		`INSERT INTO stacks (name, compose_hash, compose_yaml, state, created_at, updated_at)
+// stackUpsertSQL writes a stack's whole row: every column but created_at,
+// which only an insert sets.
+const stackUpsertSQL = `INSERT INTO stacks (name, compose_hash, compose_yaml, state, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(name) DO UPDATE SET
 		   compose_hash = excluded.compose_hash,
 		   compose_yaml = excluded.compose_yaml,
 		   state        = excluded.state,
 		   updated_at   = excluded.updated_at,
-		   deleted_at   = NULL`,
+		   deleted_at   = NULL`
+
+// UpsertStack creates or updates a stack record.
+func UpsertStack(ctx context.Context, c *Client, s StackRecord) error {
+	now := c.NowTS()
+	return c.Execute(ctx, stackUpsertSQL,
 		s.Name, s.ComposeHash, s.ComposeYAML, s.State, nowRFC3339(), now,
 	)
 }
@@ -75,13 +81,98 @@ func ListStacks(ctx context.Context, c *Client) ([]StackRecord, error) {
 	return stacks, nil
 }
 
-// stackSetStateSQL sets a live stack's state and stamps its LWW key.
+// stackSetStateSQL sets a live stack's state and stamps its LWW key. It is
+// written only for a stack this node holds no live row of: over a row, it
+// would leave the row's other columns as this node last saw them
+// (stackRowRead).
 const stackSetStateSQL = `UPDATE stacks SET state = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`
 
-// SetStackState updates the state column of a stack (e.g. "active" → "deleting").
+// stackTombstoneSQL tombstones a stack.
+const stackTombstoneSQL = `UPDATE stacks SET deleted_at = ?, updated_at = ?, state = 'deleted' WHERE name = ?`
+
+// stackRowRead is a stack's row as a state write read it, to write it back
+// WHOLE. A write of state and updated_at alone that is newer than a redeploy
+// this node has not seen yet wins last-write-wins on every peer, which takes
+// its state and keeps the redeploy's compose_yaml and compose_hash, while
+// this node skips the redeploy as older and keeps its own: the replicas hold
+// different rows under one updated_at for good. Written whole, the newer
+// write is the same row everywhere. The write is guarded on the row still
+// reading as it did (stillReads) and retried when it does not
+// (retryStackRowWrite).
+type stackRowRead struct {
+	row   StackRecord
+	found bool
+	gone  bool // tombstoned
+}
+
+const stackRowReadSQL = `SELECT compose_hash, compose_yaml, state, created_at, updated_at, deleted_at IS NOT NULL AS gone
+	FROM stacks WHERE name = ?`
+
+func readStackRowForWrite(ctx context.Context, c *Client, name string) (stackRowRead, error) {
+	rows, err := c.Query(ctx, stackRowReadSQL, name)
+	if err != nil || len(rows) == 0 {
+		return stackRowRead{}, err
+	}
+	r := rows[0]
+	return stackRowRead{found: true, gone: r.Int("gone") != 0, row: StackRecord{
+		Name: name, ComposeHash: r.String("compose_hash"), ComposeYAML: r.String("compose_yaml"),
+		State: r.String("state"), CreatedAt: r.String("created_at"), UpdatedAt: r.String("updated_at")}}, nil
+}
+
+// live reports whether the read found a live row.
+func (rd stackRowRead) live() bool { return rd.found && !rd.gone }
+
+// stillReads is the write's guard: the stack's row, inside the write's
+// transaction, is still the one read, or still absent.
+func (rd stackRowRead) stillReads(ctx context.Context, name string) func(tx *sql.Tx) (bool, error) {
+	return func(tx *sql.Tx) (bool, error) {
+		var got stackRowRead
+		got.row.Name = name
+		err := tx.QueryRowContext(ctx, stackRowReadSQL, name).Scan(&got.row.ComposeHash, &got.row.ComposeYAML,
+			&got.row.State, &got.row.CreatedAt, &got.row.UpdatedAt, &got.gone)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return !rd.found, nil
+		case err != nil:
+			return false, err
+		}
+		got.found = true
+		return got == rd, nil
+	}
+}
+
+// stackRowSQL writes the row rd read whole, as state at updatedAt.
+func stackRowSQL(rd stackRowRead, state, updatedAt string) Statement {
+	r := rd.row
+	return Statement{SQL: stackUpsertSQL, Params: []interface{}{
+		r.Name, r.ComposeHash, r.ComposeYAML, state, r.CreatedAt, updatedAt}}
+}
+
+// retryStackRowWrite runs write, a guarded stack row write, until it applies.
+func retryStackRowWrite(name string, write func() (bool, error)) error {
+	for attempt := 0; attempt < 5; attempt++ {
+		if applied, err := write(); err != nil || applied {
+			return err
+		}
+	}
+	return fmt.Errorf("stack %q: its row kept changing while it was written", name)
+}
+
+// SetStackState sets a live stack's state (e.g. "active" → "deleting"),
+// with its whole row (stackRowRead).
 func SetStackState(ctx context.Context, c *Client, name, state string) error {
-	now := c.NowTS()
-	return c.Execute(ctx, stackSetStateSQL, state, now, name)
+	return retryStackRowWrite(name, func() (bool, error) {
+		rd, err := readStackRowForWrite(ctx, c, name)
+		if err != nil {
+			return false, err
+		}
+		now := c.NowTS()
+		stmts := []Statement{{SQL: stackSetStateSQL, Params: []interface{}{state, now, name}}}
+		if rd.live() {
+			stmts = []Statement{stackRowSQL(rd, state, now)}
+		}
+		return c.ExecuteBatchGuarded(ctx, rd.stillReads(ctx, name), stmts)
+	})
 }
 
 // stackTeardownKeyPrefix keys, in cluster_policies, what a stack's teardown
@@ -104,18 +195,29 @@ type stackTeardownRecord struct {
 // cluster_policies may not be written yet (failover_scope_v1 not durably
 // latched), only the state is written, and a reconciler keeps the disks
 // (StackTeardownDeletesDisks).
+//
+// The state is written with the stack's whole row (stackRowRead).
 func MarkStackDeleting(ctx context.Context, c *Client, name string, keepDisks bool, setBy string) error {
-	now := c.NowTS()
-	stmts := []Statement{{SQL: stackSetStateSQL, Params: []interface{}{"deleting", now, name}}}
-	if c.MayWriteClusterPolicy() {
-		v, err := json.Marshal(stackTeardownRecord{Teardown: now, KeepDisks: keepDisks})
+	return retryStackRowWrite(name, func() (bool, error) {
+		rd, err := readStackRowForWrite(ctx, c, name)
 		if err != nil {
-			return err
+			return false, err
 		}
-		stmts = append(stmts, Statement{SQL: clusterPolicyUpsertSQL,
-			Params: []interface{}{stackTeardownKeyPrefix + name, string(v), setBy, now}})
-	}
-	return c.ExecuteBatch(ctx, stmts)
+		now := c.NowTS()
+		stmts := []Statement{{SQL: stackSetStateSQL, Params: []interface{}{"deleting", now, name}}}
+		if rd.live() {
+			stmts = []Statement{stackRowSQL(rd, "deleting", now)}
+		}
+		if c.MayWriteClusterPolicy() {
+			v, err := json.Marshal(stackTeardownRecord{Teardown: now, KeepDisks: keepDisks})
+			if err != nil {
+				return false, err
+			}
+			stmts = append(stmts, Statement{SQL: clusterPolicyUpsertSQL,
+				Params: []interface{}{stackTeardownKeyPrefix + name, string(v), setBy, now}})
+		}
+		return c.ExecuteBatchGuarded(ctx, rd.stillReads(ctx, name), stmts)
+	})
 }
 
 // StackTeardownDeletesDisks reports whether the teardown of st (a stack in
@@ -170,11 +272,20 @@ func ListDeletingStacks(ctx context.Context, c *Client) ([]StackRecord, error) {
 	return stacks, nil
 }
 
-// DeleteStackRecord tombstones a stack.
+// DeleteStackRecord tombstones a stack. Where this node holds its row, the
+// row is first written whole, at an earlier stamp of the same write, so the
+// tombstone is the same row everywhere (stackRowRead).
 func DeleteStackRecord(ctx context.Context, c *Client, name string) error {
-	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE stacks SET deleted_at = ?, updated_at = ?, state = 'deleted' WHERE name = ?`,
-		nowRFC3339(), now, name,
-	)
+	return retryStackRowWrite(name, func() (bool, error) {
+		rd, err := readStackRowForWrite(ctx, c, name)
+		if err != nil {
+			return false, err
+		}
+		var stmts []Statement
+		if rd.found {
+			stmts = append(stmts, stackRowSQL(rd, "deleted", c.NowTS()))
+		}
+		stmts = append(stmts, Statement{SQL: stackTombstoneSQL, Params: []interface{}{nowRFC3339(), c.NowTS(), name}})
+		return c.ExecuteBatchGuarded(ctx, rd.stillReads(ctx, name), stmts)
+	})
 }

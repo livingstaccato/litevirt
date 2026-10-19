@@ -8,10 +8,9 @@
 // disks since it learned to move a stopped VM (Task 8); the refusal predates
 // that and was all that stood between a firmware VM and it.
 //
-// The vTPM half of the firmware travels in the same bundle; the fleet's nodes
-// share one swtpm root (a process-wide path), so it is pinned in
-// internal/grpcapi (TestColdMigrateStoppedVM_CarriesFirmwareWithAHostLocalDisk)
-// with a root per host.
+// The vTPM half of the firmware travels in the same bundle. Every node has a
+// firmware store of its own (Node.FW), so the swtpm tree can be seen to leave
+// one node and arrive at the other.
 
 package fleet
 
@@ -25,7 +24,6 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
 // fwUUID is the scenario domain's uuid (newColdStoppedScenario).
@@ -37,8 +35,16 @@ const fwUUID = "11111111-2222-4333-8444-555555555555"
 // returns the vars file's content.
 func (sc *coldStoppedScenario) makeSecureBoot(t *testing.T) []byte {
 	t.Helper()
+	return sc.makeFirmware(t, false)
+}
+
+// makeFirmware is makeSecureBoot, and with tpm also a vTPM: the target is
+// labelled vTPM-capable and os1's swtpm tree is seeded into the source's
+// store (sc.tpmState).
+func (sc *coldStoppedScenario) makeFirmware(t *testing.T, tpm bool) []byte {
+	t.Helper()
 	ctx := context.Background()
-	spec, err := json.Marshal(&pb.VMSpec{Name: "os1", Cpu: 1, MemoryMib: 256, SecureBoot: true, Firmware: "uefi", Uuid: fwUUID})
+	spec, err := json.Marshal(&pb.VMSpec{Name: "os1", Cpu: 1, MemoryMib: 256, SecureBoot: true, Tpm: tpm, Firmware: "uefi", Uuid: fwUUID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,6 +53,18 @@ func (sc *coldStoppedScenario) makeSecureBoot(t *testing.T) []byte {
 	}
 	if err := corrosion.SetHostLabel(ctx, sc.src.DB, sc.dst.Name, corrosion.LabelSecureBootCapable, "true"); err != nil {
 		t.Fatalf("label %s Secure-Boot-capable: %v", sc.dst.Name, err)
+	}
+	if tpm {
+		if err := corrosion.SetHostLabel(ctx, sc.src.DB, sc.dst.Name, corrosion.LabelTPMCapable, "true"); err != nil {
+			t.Fatalf("label %s vTPM-capable: %v", sc.dst.Name, err)
+		}
+		p := sc.permall(sc.src)
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, tpmState, 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	layout := filepath.Join(sc.c.tmpRoot, "layout")
 	for _, n := range []*Node{sc.src, sc.dst} {
@@ -65,7 +83,15 @@ func (sc *coldStoppedScenario) makeSecureBoot(t *testing.T) []byte {
 
 // nvram is where node n keeps os1's UEFI vars file.
 func (sc *coldStoppedScenario) nvram(n *Node) string {
-	return lv.NvramPath(filepath.Join(sc.c.tmpRoot, n.Name, "data"), "os1")
+	return n.FW.NvramPath("os1")
+}
+
+// tpmState is os1's swtpm state as makeFirmware seeds it.
+var tpmState = []byte("os1's TPM state, sealing its BitLocker key")
+
+// permall is os1's swtpm state file in node n's store.
+func (sc *coldStoppedScenario) permall(n *Node) string {
+	return filepath.Join(n.FW.SwtpmDir(fwUUID), "tpm2", "tpm2-00.permall")
 }
 
 // assertFirmwareVMMoved: os1 is on the target, stopped, with its disk and its
@@ -134,6 +160,29 @@ func TestFleet_ColdMigrationMovesAStoppedFirmwareVMWithItsLocalDisk(t *testing.T
 		t.Fatalf("lv migrate --cold of a stopped Secure Boot VM with a host-local disk: %v", err)
 	}
 	sc.assertFirmwareVMMoved(t, vars)
+}
+
+// `lv migrate os1 <target> --cold` of a stopped Secure Boot + vTPM VM moves its
+// swtpm tree from the source's store to the target's, byte for byte, and
+// leaves none of it on the source.
+//
+// Mutations: give every node the same swtpm root (cluster.go) — the source's
+// post-move wipe removes the only copy and the target's check goes red; drop
+// the target's ReadFirmwareBundle of the bundle — the target has no state.
+func TestFleet_ColdMigrationMovesAVTPMStateBetweenNodeStores(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	vars := sc.makeFirmware(t, true)
+
+	if err := sc.migrateCold(t); err != nil {
+		t.Fatalf("lv migrate --cold of a stopped Secure Boot + vTPM VM: %v", err)
+	}
+	sc.assertFirmwareVMMoved(t, vars)
+	if got, err := os.ReadFile(sc.permall(sc.dst)); err != nil || string(got) != string(tpmState) {
+		t.Errorf("os1's swtpm state did not arrive intact on %s: %q (err %v)", sc.dst.Name, got, err)
+	}
+	if _, err := os.Stat(sc.src.FW.SwtpmDir(fwUUID)); !os.IsNotExist(err) {
+		t.Errorf("os1's swtpm state is still on %s (stat: %v)", sc.src.Name, err)
+	}
 }
 
 // A RUNNING Secure Boot VM is still not drained, and the drain says what to

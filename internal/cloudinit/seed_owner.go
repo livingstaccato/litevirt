@@ -165,13 +165,66 @@ func RemoveSeed(iso string) error {
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	for _, p := range []string{SeedOwnerPath(iso), SeedStalePath(iso)} {
+	for _, p := range []string{SeedOwnerPath(iso), SeedStalePath(iso), removedSeedPath(iso)} {
 		if serr := os.Remove(p); serr != nil && !os.IsNotExist(serr) {
 			return serr
 		}
 	}
 	return nil
 }
+
+// removedSeedPath is where a seed's instance-id is kept once the seed was
+// removed because its VM moved away (RecordRemovedSeed).
+func removedSeedPath(iso string) string { return iso + ".removed" }
+
+// RecordRemovedSeed keeps, beside the path of a seed just removed because its
+// VM moved away, the instance-id the guest booted with and the VM it was
+// stamped for, so a seed written again there for the VM keeps that
+// instance-id and cloud-init does not run its first-boot modules again (a VM
+// a cutover renamed was created as <name>-next). Durable, 0600.
+func RecordRemovedSeed(iso, owner, instanceID string) error {
+	if owner == "" || instanceID == "" {
+		return nil
+	}
+	b, err := json.Marshal(struct {
+		Owner      string `json:"owner"`
+		InstanceID string `json:"instance_id"`
+	}{owner, instanceID})
+	if err != nil {
+		return err
+	}
+	tmp := filepath.Join(filepath.Dir(iso), "."+filepath.Base(iso)+"."+randid.New()+".tmp")
+	if err := writeSynced(tmp, b); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, removedSeedPath(iso)); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return syncDir(filepath.Dir(iso))
+}
+
+// RemovedSeedInstanceID is the instance-id RecordRemovedSeed kept for the
+// seed at iso, when it was kept for the VM whose spec uuid is owner; "" when
+// there is none, it is another VM's, or it cannot be read.
+func RemovedSeedInstanceID(iso, owner string) string {
+	b, err := os.ReadFile(removedSeedPath(iso))
+	if err != nil || owner == "" {
+		return ""
+	}
+	var r struct {
+		Owner      string `json:"owner"`
+		InstanceID string `json:"instance_id"`
+	}
+	if json.Unmarshal(b, &r) != nil || r.Owner != owner {
+		return ""
+	}
+	return r.InstanceID
+}
+
+// ForgetRemovedSeed drops what RecordRemovedSeed kept for the seed at iso.
+func ForgetRemovedSeed(iso string) { _ = os.Remove(removedSeedPath(iso)) }
 
 // seedStaleSuffix names the stale mark beside a seed.
 const seedStaleSuffix = ".stale"

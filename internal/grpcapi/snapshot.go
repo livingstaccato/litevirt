@@ -23,6 +23,7 @@ import (
 	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // snapshotDepthWarning is the number of snapshots at which we warn about deep chains.
@@ -64,6 +65,9 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		}
 		defer conn.Close()
 		return client.CreateSnapshot(ctx, req)
+	}
+	if err := s.firmwareMoveRefusal("snapshot", vm); err != nil {
+		return nil, err
 	}
 
 	// A libvirt snapshot of a VM is an external qcow2 overlay per disk, which a
@@ -134,7 +138,7 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		// Preflight: the firmware state must be present locally to capture it —
 		// fail BEFORE touching libvirt so we never create an overlay we can't back.
 		// NVRAM only exists for UEFI (a BIOS+vTPM VM has swtpm but no NVRAM).
-		if (fwSpec.hasNvram() && !lv.HasNvram(s.dataDir, req.VmName)) || (fwSpec.Tpm && !lv.HasTPMState(fwUUID)) {
+		if (fwSpec.hasNvram() && !s.fw().HasNvram(req.VmName)) || (fwSpec.Tpm && !s.fw().HasTPMState(fwUUID)) {
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"firmware state for %q is not present on this host; cannot snapshot it consistently", req.VmName)
 		}
@@ -157,7 +161,7 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 			return err
 		}
 		diskmode.Restrict(f, diskmode.File) // best effort
-		has, werr := lv.WriteFirmwareBundle(s.dataDir, req.VmName, fwUUID, f)
+		has, werr := s.fw().WriteFirmwareBundle(req.VmName, fwUUID, f)
 		f.Close()
 		if werr != nil {
 			return werr
@@ -360,6 +364,12 @@ func (s *Server) restoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 		return vm, err
 	}
 
+	// A revert redefines and starts the domain and overwrites its firmware
+	// state from the snapshot's (restoreFW): not while a live firmware move's
+	// record names it (spec §6.9).
+	if err := s.firmwareMoveRefusal("snapshot restore", vm); err != nil {
+		return nil, err
+	}
 	// A revert can bring the domain back running with its installer ISO; it
 	// is judged here, on the owner, after the caller's authority.
 	if err := s.verifyVMISOForStart(vm); err != nil {
@@ -455,7 +465,7 @@ func (s *Server) restoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 			return err
 		}
 		defer f.Close()
-		return lv.ReadFirmwareBundle(f, s.dataDir, req.VmName, fwUUID)
+		return s.fw().ReadFirmwareBundle(f, req.VmName, fwUUID)
 	}
 
 	if snap != nil && snap.Type == "memory" && snap.VMStatePath != "" {
@@ -638,7 +648,12 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", vm.HostName, err)
 		}
 		defer conn.Close()
-		return client.DeleteSnapshot(ctx, req)
+		var hdr metadata.MD
+		out, err := client.DeleteSnapshot(ctx, req, grpc.Header(&hdr))
+		if w := hdr.Get(SnapshotFilesKeptHeader); len(w) > 0 {
+			_ = grpc.SetHeader(ctx, metadata.Pairs(SnapshotFilesKeptHeader, w[0]))
+		}
+		return out, err
 	}
 
 	// Fetch the record first so we know whether to clean up a vmstate file.
@@ -693,6 +708,12 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	} else {
 		delErr = s.virt.DeleteSnapshot(req.VmName, req.SnapshotName)
 	}
+	// A delete libvirt cannot merge safely removed only the metadata: done,
+	// with every file kept. Reported once the record is gone (below).
+	var kept *lv.SnapshotFilesKeptError
+	if errors.As(delErr, &kept) {
+		delErr = nil
+	}
 	// A revert consumes the libvirt snapshot metadata, so it may already be gone
 	// here — that must NOT block cleanup of the corrosion record + vmstate file
 	// (otherwise they leak). Treat a missing libvirt snapshot as already-deleted.
@@ -727,7 +748,63 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 
 	slog.Info("snapshot deleted", "vm", req.VmName, "snapshot", req.SnapshotName)
 	s.recordVMEvent(ctx, req.VmName, "snapshot.deleted", "ok", req.SnapshotName)
+	if kept != nil {
+		s.snapshotFilesKept(ctx, req.VmName, kept)
+	}
 	return &emptypb.Empty{}, nil
+}
+
+// SnapshotFilesKeptHeader is the response header DeleteSnapshot says, on a
+// delete that removed only the snapshot's metadata, which files it kept and
+// their size (lv snapshot rm prints it).
+const SnapshotFilesKeptHeader = "x-litevirt-snapshot-files-kept"
+
+// snapshotFilesKept reports a metadata-only delete: the files a merge would
+// have removed stay in the VM's disk chain, and their space is not
+// reclaimed. Said to the caller (SnapshotFilesKeptHeader), recorded as the
+// VM's event snapshot.files-kept, and logged. Each size is read bounded: a
+// file that does not answer is named with its size unknown.
+func (s *Server) snapshotFilesKept(ctx context.Context, vmName string, kept *lv.SnapshotFilesKeptError) {
+	var total int64
+	parts := make([]string, 0, len(kept.Files))
+	for _, f := range kept.Files {
+		size, err := storage.Bounded("read the size of", f, func() (int64, error) {
+			fi, err := os.Stat(f)
+			if err != nil {
+				return 0, err
+			}
+			return fi.Size(), nil
+		})
+		if err != nil {
+			parts = append(parts, f+" (size unknown)")
+			continue
+		}
+		total += size
+		parts = append(parts, fmt.Sprintf("%s (%s)", f, keptSize(size)))
+	}
+	files := "none named"
+	if len(parts) > 0 {
+		files = strings.Join(parts, ", ")
+	}
+	msg := fmt.Sprintf("snapshot %q was deleted as metadata only (%s); its files stay in the VM's disk chain and their space, %s, is not reclaimed: %s",
+		kept.Snapshot, kept.Reason, keptSize(total), files)
+	slog.Warn("snapshot delete: files kept", "vm", vmName, "snapshot", kept.Snapshot, "reason", kept.Reason, "files", kept.Files, "bytes", total)
+	s.recordVMEvent(ctx, vmName, "snapshot.files-kept", "warning", msg)
+	_ = grpc.SetHeader(ctx, metadata.Pairs(SnapshotFilesKeptHeader, msg))
+}
+
+// keptSize is a byte count in binary units, one decimal.
+func keptSize(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit && exp < 4; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTP"[exp])
 }
 
 // removeVMSnapshotRAMImages removes, for a VM being deleted with its disks,

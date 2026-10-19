@@ -206,7 +206,7 @@ func TestRender_OwnServicesAllowedExplicitly(t *testing.T) {
 	// haproxy on another host reaches a backend here through the forward
 	// hook, from that host's address (re-review m-d).
 	mustContainAll(t, chainBody(t, nic, "forward"),
-		"iifname != @lv_nic_devs ip saddr @lv_lb_src4 ip daddr . tcp dport @lv_lb4 accept")
+		"iifname != @lv_nic_devs meta protocol ip ip saddr @lv_lb_src4 ip daddr . tcp dport @lv_lb4 accept")
 	mustContainAll(t, nic, "elements = { 10.0.0.20 . 8080, 10.0.0.21 . 8080 }",
 		"elements = { 10.0.0.1, 192.0.2.10 }", "elements = { fd00::1 }")
 }

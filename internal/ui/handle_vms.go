@@ -1197,8 +1197,17 @@ func (s *Server) handleAddNICModal(w http.ResponseWriter, r *http.Request) {
 	// Through the RPC with the session's bearer, so a session that may not
 	// read security groups (a token scoped below the cluster root) is not
 	// shown their names here either.
+	// Listed for the VM's project: its own groups and the global ones, the
+	// only ones the attach admits.
 	var sgs []string
-	if groups, err := s.grpc.ListSecurityGroups(ctx, &pb.ListSecurityGroupsRequest{}); err == nil {
+	project := ""
+	if vm, verr := s.grpc.InspectVM(ctx, &pb.InspectVMRequest{Name: name}); verr == nil {
+		project = vm.GetSpec().GetProject()
+		if project == "" {
+			project = "_default" // a VM with no project is in the default one
+		}
+	}
+	if groups, err := s.grpc.ListSecurityGroups(ctx, &pb.ListSecurityGroupsRequest{Project: project}); err == nil {
 		for _, g := range groups.GetGroups() {
 			sgs = append(sgs, g.GetName())
 		}

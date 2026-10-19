@@ -48,6 +48,15 @@ func (s *Server) BindSecurityGroups(ctx context.Context, req *pb.BindSecurityGro
 		"network.update", "operator", "vm "+strconv.Quote(req.VmName)); err != nil {
 		return nil, err
 	}
+	// A NIC may bind only global groups and its own project's. Without the
+	// row the project is unknown, so only global groups pass.
+	wlProject := unresolvedProject
+	if vm != nil {
+		wlProject = vm.Project
+	}
+	if err := s.admitSecurityGroupRefs(ctx, wlProject, req.SecurityGroups); err != nil {
+		return nil, err
+	}
 	// The binding this replaces is read first. This RPC is how an operator pulls
 	// a compromised VM into an isolation group — or takes it out of one — so the
 	// audit row has to be able to say which groups the NIC left

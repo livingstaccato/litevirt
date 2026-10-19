@@ -124,3 +124,25 @@ func OperatorPKIFileAt(path string) (string, bool) {
 	}
 	return "", false
 }
+
+// OperatorPKIFileIn reports which of pkiDir's own files path is, wherever path
+// is: OperatorPKIFileAt when path is directly in pkiDir, and otherwise (a
+// kept copy under pkiDir/hosts/<name>/, say) the same file as one of them,
+// through a hard or symbolic link.
+func OperatorPKIFileIn(pkiDir, path string) (string, bool) {
+	if filepath.Clean(filepath.Dir(path)) == filepath.Clean(pkiDir) {
+		if f, ok := OperatorPKIFileAt(path); ok {
+			return f, true
+		}
+	}
+	pi, err := os.Stat(path)
+	if err != nil {
+		return "", false
+	}
+	for _, f := range operatorPKIFiles {
+		if fi, err := os.Stat(filepath.Join(pkiDir, f)); err == nil && os.SameFile(pi, fi) {
+			return f, true
+		}
+	}
+	return "", false
+}

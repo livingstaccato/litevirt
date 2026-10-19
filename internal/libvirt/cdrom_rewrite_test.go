@@ -85,14 +85,14 @@ func TestMigrationCDROMXML(t *testing.T) {
 	if _, _, err := MigrationCDROMXML(strings.ReplaceAll(cdromDomain, "/srv/drivers.iso", "/srv/other.iso"), cdromDomain, remap); err == nil {
 		t.Fatal("a running domain without the judged CD-ROM was migrated")
 	}
-	_, params := migrationFlagsAndParams(MigrateParams{Live: true, DestXML: dest, PersistXML: persist})
+	_, params, _ := migrationFlagsAndParams(MigrateParams{Live: true, DestXML: dest, PersistXML: persist})
 	if v, n := stringParam(params, golibvirt.MigrateParamDestXML); n != 1 || v != dest {
 		t.Errorf("destination_xml (x%d) is not the rewritten definition", n)
 	}
 	if v, n := stringParam(params, golibvirt.MigrateParamPersistXML); n != 1 || v != persist {
 		t.Errorf("persistent_xml (x%d) is not the rewritten definition", n)
 	}
-	if _, params := migrationFlagsAndParams(MigrateParams{Live: true}); len(params) != 0 {
+	if _, params, _ := migrationFlagsAndParams(MigrateParams{Live: true}); len(params) != 0 {
 		t.Errorf("a migration with no CD-ROM sources carries parameters %v", params)
 	}
 }

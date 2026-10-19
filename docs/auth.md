@@ -504,6 +504,11 @@ binding can:
   cluster-global, bound to NICs by name, and checked at `/`. Admin and
   NetworkAdmin hold `sg.write`; Operator holds only `sg.read`. Binding groups to
   a NIC (`lv sg bind`) is `network.update` on the VM's own path.
+- **The firewall log** (`firewall.log.view`: `lv firewall log`) is checked at
+  `/`. A record names any tenant's addresses and ports, so no built-in role but
+  Admin holds the verb: `*.read` does not match it (Viewer, Auditor), nor does
+  `sg.*` (NetworkAdmin). Grant it through a custom role holding
+  `firewall.log.view`. With no role bindings the legacy fallback is admin.
 - **Backup repository maintenance** (`backup.verify`, `backup.gc`,
   `backup.prune`, `backup.sync`, `backup.compression`) is checked at `/`. These are the
   `VerifyBackupRepo`, `GarbageCollectBackupRepo`, `PruneBackupRepo` and

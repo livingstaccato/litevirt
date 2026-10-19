@@ -29,6 +29,11 @@ type tagProbeSpy struct {
 	setReq   *pb.SetFirewallTagGroupRequest
 }
 
+// GetFirewallLogPolicy answers: this daemon knows firewall logging.
+func (s *tagProbeSpy) GetFirewallLogPolicy(context.Context, *pb.GetFirewallLogPolicyRequest, ...grpc.CallOption) (*pb.GetFirewallLogPolicyResponse, error) {
+	return &pb.GetFirewallLogPolicyResponse{}, nil
+}
+
 func (s *tagProbeSpy) SetFirewallTagGroup(_ context.Context, in *pb.SetFirewallTagGroupRequest, _ ...grpc.CallOption) (*pb.FirewallTagGroup, error) {
 	s.setReq = in
 	return in.GetGroup(), nil

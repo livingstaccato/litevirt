@@ -194,6 +194,14 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 		s.audit(ctx, "ct.clone", req.Target, "project="+project, "denied")
 		return nil, err
 	}
+	var cloneSGs []string
+	for _, n := range corrosion.DecodeCreateSpec(src.CreateSpec).Networks {
+		cloneSGs = append(cloneSGs, n.SecurityGroups...)
+	}
+	if err := s.admitSecurityGroupRefs(ctx, project, cloneSGs); err != nil {
+		s.audit(ctx, "ct.clone", req.Target, "project="+project, "denied")
+		return nil, status.Errorf(status.Code(err), "clone: %s", status.Convert(err).Message())
+	}
 
 	unlock := s.lockVM("ct/" + req.Target)
 	defer unlock()
@@ -257,7 +265,13 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	// (cloneFreshIdentity) stamps the SAME deterministic MAC/veth on-disk and drops
 	// the source's static IP, so the clone's DB state and on-disk config agree.
 	cloneSpec := corrosion.DecodeCreateSpec(src.CreateSpec)
-	ifaces, specNets := s.cloneContainerNICs(req.Target, cloneSpec)
+	ifaces, specNets, redrawnMACs, merr := s.cloneContainerNICs(ctx, req.Target, cloneSpec)
+	if merr != nil {
+		if delErr := s.containerRuntime.DeleteContainer(ctx, req.Target); delErr != nil {
+			slog.Warn("container clone: cleanup after the MAC draw failed also failed", "name", req.Target, "error", delErr)
+		}
+		return nil, merr
+	}
 	cloneSpec.Networks = specNets
 	// A clone is a new lineage, with its own owner record (the copied
 	// directory carried the source's).
@@ -274,6 +288,14 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	if err := s.rebuildContainerConfig(ctx, req.Target, cloneSpec); err != nil {
 		if delErr := s.containerRuntime.DeleteContainer(ctx, req.Target); delErr != nil {
 			slog.Warn("container clone: cleanup after the config rebuild failed also failed", "name", req.Target, "error", delErr)
+		}
+		return nil, err
+	}
+	// A derived MAC another NIC holds was drawn afresh: the clone's config
+	// takes the drawn one, never the duplicate the runtime clone wrote.
+	if err := s.setContainerNICMACs(ctx, req.Target, redrawnMACs); err != nil {
+		if delErr := s.containerRuntime.DeleteContainer(ctx, req.Target); delErr != nil {
+			slog.Warn("container clone: cleanup after the MAC rewrite failed also failed", "name", req.Target, "error", delErr)
 		}
 		return nil, err
 	}

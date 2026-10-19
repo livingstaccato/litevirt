@@ -41,8 +41,9 @@ type libvirt10 struct {
 	dom     *modelDomain
 	snaps   map[string]*modelSnap
 	current string
-	saved   map[string]string // vmstate path → domain XML it restores
-	unlinks []string          // files the model's libvirt unlinked
+	saved   map[string]string         // vmstate path → domain XML it restores
+	unlinks []string                  // files the model's libvirt unlinked
+	kept    []*SnapshotFilesKeptError // what rm's metadata-only deletes reported
 	// touched is every file a delete wrote into or removed: the overlay a
 	// merge committed and removed, the base it committed into, the disk an
 	// unmerged delete unlinked.

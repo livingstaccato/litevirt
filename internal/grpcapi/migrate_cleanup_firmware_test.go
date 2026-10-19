@@ -18,21 +18,21 @@ const (
 	cleanupUUIDB = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
 )
 
-// fwCleanupFixture redirects the swtpm base into a temp dir and seeds the
+// fwCleanupFixture gives s a firmware store in temp dirs and seeds the
 // firmware state of two VMs: A (being cleaned up) and B (a bystander). It
 // returns the swtpm base. A's row names hostA; B lives on src-host.
 func fwCleanupFixture(t *testing.T, s *Server, hostA string) string {
 	t.Helper()
 	s.dataDir = t.TempDir()
 	base := filepath.Join(t.TempDir(), "libvirt", "swtpm")
-	t.Cleanup(lv.SetSwtpmBaseForTest(base))
+	s.SetFirmwareStore(&lv.FirmwareStore{DataDir: s.dataDir, SwtpmBase: base})
 	ctx := adminCtx()
 	insertTestVMWithSpec(t, ctx, s.db, "vma", hostA, "stopped",
 		`{"name":"vma","tpm":true,"firmware":"uefi","uuid":"`+cleanupUUIDA+`"}`)
 	insertTestVMWithSpec(t, ctx, s.db, "vmb", "src-host", "running",
 		`{"name":"vmb","tpm":true,"firmware":"uefi","uuid":"`+cleanupUUIDB+`"}`)
 	for _, u := range []string{cleanupUUIDA, cleanupUUIDB} {
-		d := filepath.Join(lv.LibvirtSwtpmDir(u), "tpm2")
+		d := filepath.Join(s.fw().SwtpmDir(u), "tpm2")
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -87,8 +87,8 @@ func TestCleanupMigrationArtifacts_FirmwareUUIDTraversalRefused(t *testing.T) {
 			assertExists(t, libvirtDir, "the swtpm base's parent")
 			assertExists(t, sibling, "a sibling of the swtpm base")
 			assertExists(t, base, "the swtpm base")
-			assertExists(t, lv.LibvirtSwtpmDir(cleanupUUIDA), "A's swtpm state")
-			assertExists(t, lv.LibvirtSwtpmDir(cleanupUUIDB), "B's swtpm state")
+			assertExists(t, s.fw().SwtpmDir(cleanupUUIDA), "A's swtpm state")
+			assertExists(t, s.fw().SwtpmDir(cleanupUUIDB), "B's swtpm state")
 			assertExists(t, lv.NvramPath(s.dataDir, "vma"), "A's NVRAM")
 		})
 	}
@@ -104,8 +104,8 @@ func TestCleanupMigrationArtifacts_OtherVMsFirmwareUUIDRefused(t *testing.T) {
 	if status.Code(err) != codes.InvalidArgument {
 		t.Errorf("got %v, want InvalidArgument for a UUID that is not vma's", err)
 	}
-	assertExists(t, lv.LibvirtSwtpmDir(cleanupUUIDB), "B's swtpm state")
-	assertExists(t, lv.LibvirtSwtpmDir(cleanupUUIDA), "A's swtpm state")
+	assertExists(t, s.fw().SwtpmDir(cleanupUUIDB), "B's swtpm state")
+	assertExists(t, s.fw().SwtpmDir(cleanupUUIDA), "A's swtpm state")
 	assertExists(t, lv.NvramPath(s.dataDir, "vma"), "A's NVRAM")
 }
 
@@ -120,9 +120,9 @@ func TestCleanupMigrationArtifacts_OwnFirmwareUUIDWipes(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("CleanupMigrationArtifacts: %v", err)
 	}
-	assertGone(t, lv.LibvirtSwtpmDir(cleanupUUIDA), "A's swtpm state")
+	assertGone(t, s.fw().SwtpmDir(cleanupUUIDA), "A's swtpm state")
 	assertGone(t, lv.NvramPath(s.dataDir, "vma"), "A's NVRAM")
-	assertExists(t, lv.LibvirtSwtpmDir(cleanupUUIDB), "B's swtpm state")
+	assertExists(t, s.fw().SwtpmDir(cleanupUUIDB), "B's swtpm state")
 }
 
 // The same after this host pre-defined A's domain for the failed migration:
@@ -143,7 +143,7 @@ func TestCleanupMigrationArtifacts_OwnFirmwareUUIDWipesAfterUndefine(t *testing.
 	if fake.DomainExists("vma") {
 		t.Fatal("pre-defined domain should have been undefined")
 	}
-	assertGone(t, lv.LibvirtSwtpmDir(cleanupUUIDA), "A's swtpm state")
+	assertGone(t, s.fw().SwtpmDir(cleanupUUIDA), "A's swtpm state")
 }
 
 // A VM that lives here keeps its firmware: its row names this host.
@@ -163,7 +163,7 @@ func TestCleanupMigrationArtifacts_LiveVMFirmwareKept_RowHere(t *testing.T) {
 	if !fake.DomainExists("vma") {
 		t.Fatal("the domain of a VM that lives here was undefined")
 	}
-	assertExists(t, lv.LibvirtSwtpmDir(cleanupUUIDA), "A's swtpm state")
+	assertExists(t, s.fw().SwtpmDir(cleanupUUIDA), "A's swtpm state")
 	assertExists(t, lv.NvramPath(s.dataDir, "vma"), "A's NVRAM")
 }
 
@@ -181,7 +181,7 @@ func TestCleanupMigrationArtifacts_LiveVMFirmwareKept_DomainDefined(t *testing.T
 	}); err != nil {
 		t.Fatalf("CleanupMigrationArtifacts: %v", err)
 	}
-	assertExists(t, lv.LibvirtSwtpmDir(cleanupUUIDA), "A's swtpm state")
+	assertExists(t, s.fw().SwtpmDir(cleanupUUIDA), "A's swtpm state")
 	assertExists(t, lv.NvramPath(s.dataDir, "vma"), "A's NVRAM")
 }
 
@@ -199,5 +199,5 @@ func TestEnsureFirmwareState_OtherVMsUUIDRefused(t *testing.T) {
 	if status.Code(err) != codes.InvalidArgument {
 		t.Errorf("got %v, want InvalidArgument for a UUID that is not vma's", err)
 	}
-	assertExists(t, filepath.Join(lv.LibvirtSwtpmDir(cleanupUUIDB), "tpm2", "tpm2-00.permall"), "B's swtpm state")
+	assertExists(t, filepath.Join(s.fw().SwtpmDir(cleanupUUIDB), "tpm2", "tpm2-00.permall"), "B's swtpm state")
 }

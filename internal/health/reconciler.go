@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,6 +24,7 @@ import (
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fwmig"
 	"github.com/litevirt/litevirt/internal/image"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
@@ -97,6 +100,9 @@ type Reconciler struct {
 	rekeyMu      sync.Mutex
 	rekeyDefined map[string]string
 	rekeyLogged  map[string]string
+	// fwSkips logs, once per record, a VM this reconciler leaves alone
+	// because a live firmware move's record names it here.
+	fwSkips firmwareMoveSkips
 	// startDomainHook runs immediately before StartDomain, with the context
 	// the start is running under. Test-only seam: it makes a walk budget that
 	// expires between the start and the commit reproducible instead of a
@@ -156,6 +162,7 @@ type Reconciler struct {
 	autoPullImage    func(ctx context.Context, imageName string) error // optional: auto-pull image from peer
 	backupInProgress func(vmName string) bool                          // optional: is a backup actively running locally?
 	firmware         lv.FirmwarePaths                                  // resolved OVMF paths (G1); set via SetFirmwarePaths
+	fwStore          *lv.FirmwareStore                                 // this host's NVRAM and swtpm state; set via SetFirmwareStore
 
 	// recreateOverlay rebuilds a missing disk as an overlay of its image
 	// (SetRecreateOverlay); nil builds it in a store of its own, unheld.
@@ -415,6 +422,26 @@ func (r *Reconciler) noteGateRefused(action, reason string) {
 // reconciler renders the same firmware as CreateVM when it rebuilds a domain.
 func (r *Reconciler) SetFirmwarePaths(fp lv.FirmwarePaths) { r.firmware = fp }
 
+// SetFirmwareStore injects this host's firmware store, the one the daemon
+// shares with its gRPC server. NewReconciler starts from the production
+// layout under dataDir.
+//
+// nil is ignored, as the server does. A store whose DataDir is not the
+// reconciler's panics: the domain XML names the NVRAM under the reconciler's
+// data dir, so the store must be the one that holds it.
+func (r *Reconciler) SetFirmwareStore(fw *lv.FirmwareStore) {
+	if fw == nil {
+		return
+	}
+	if filepath.Clean(fw.DataDir) != filepath.Clean(r.dataDir) {
+		panic(fmt.Sprintf("health: firmware store data dir %q is not the reconciler's %q", fw.DataDir, r.dataDir))
+	}
+	r.fwStore = fw
+}
+
+// FirmwareStore is this host's firmware store.
+func (r *Reconciler) FirmwareStore() *lv.FirmwareStore { return r.fwStore }
+
 // SetSparePCIeRootPorts sets `pci.spare_pcie_root_ports` — see
 // daemon.PCIConfig.SparePCIeRootPorts.
 func (r *Reconciler) SetSparePCIeRootPorts(n int) { r.sparePCIeRootPortsCfg = n }
@@ -457,6 +484,7 @@ func NewReconciler(hostName, dataDir string, db *corrosion.Client, virt LibvirtB
 	return &Reconciler{
 		hostName: hostName,
 		dataDir:  dataDir,
+		fwStore:  lv.NewFirmwareStore(dataDir),
 		db:       db,
 		virt:     virt,
 	}
@@ -530,6 +558,7 @@ func (r *Reconciler) reconcilePass(ctx context.Context) {
 	cancel()
 
 	r.selfFence(ctx)
+	r.finishOrphanedStages()
 	r.assertRuntimeOwnership(ctx)
 	// Both sweeps above skip a domain with no live row. Stamp every domain that
 	// has one here, so it stays recognisable once its row is gone; then report
@@ -1291,6 +1320,14 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 
 		// If corrosion says this VM belongs to a different host, we no longer own it.
 		if vm.HostName != r.hostName {
+			// A live firmware move's record names it here: a moved VM's
+			// source leftover (reason migrated, or unknown after a reboot)
+			// or a held target guest. Its definition and both copies of
+			// its state stay until the move resolves it (spec §6.9, R-I5).
+			if r.firmwareMoveSkip(domName, specUUIDOf(vm.Spec), "leftover cleanup") {
+				keep[domName] = true
+				continue
+			}
 			// Non-destruction guard (LWW-repair Phase 1): NEVER destroy a domain
 			// that holds live or resumable state locally, whatever the DB host_name
 			// says. A converged-wrong host_name — the equal-`updated_at` LWW tie this
@@ -1342,6 +1379,13 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 			// domain to start between that check and now, undefining leaves
 			// the running copy alone, where a destroy would kill it.
 			//
+			// A leftover that holds firmware state here (NVRAM, swtpm tree)
+			// is never wiped: an owed DISCARD of a live firmware move may name
+			// it before its record reaches this host. Its state is quarantined
+			// and the domain undefined keeping state.
+			if r.quarantineLeftoverFirmware(domName, vm) {
+				continue
+			}
 			// wipe by design: a stopped/defined leftover whose VM now lives on
 			// another host (the authoritative firmware state travels with it).
 			if err := r.virt.UndefineDomain(domName, false); err != nil {
@@ -1349,6 +1393,216 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// quarantineLeftoverFirmware takes a clearly-dead leftover that holds
+// firmware state here: the NVRAM and the swtpm tree of its domain's uuid go
+// into <data_dir>/fwmig-quarantine/<vm>-reconciled-<unix>/ with a reason.txt,
+// as a firmware move's quarantine, and the domain is undefined keeping state.
+// The state is gathered in <vm>-reconciling-<uuid> first and renamed into
+// place whole, reason.txt included (FirmwareStore.QuarantineLeftoverFirmwareState),
+// so a pass that stops part way is finished by the next one rather than split
+// across two directories. A definition with no canonical uuid has its NVRAM
+// quarantined alone. These directories are kept while the VM exists and
+// removed by the hourly sweep after superseded_disk_retention_days once it is
+// gone (reconciled_quarantine.go); `lv host superseded-disks` lists them.
+// true when the domain was taken here (done, or left for a later pass on an
+// error); false when it holds no firmware state, so the ordinary cleanup runs.
+func (r *Reconciler) quarantineLeftoverFirmware(domName string, vm *corrosion.VMRecord) bool {
+	if r.fwStore == nil {
+		return false
+	}
+	xml, err := r.virt.DumpXMLInactive(domName)
+	if err != nil {
+		slog.Warn("reconciler: leftover kept: its definition cannot be read to find its firmware state", "vm", domName, "error", err)
+		return true
+	}
+	uuid := lv.UUIDFromXML(xml)
+	if !lv.ValidFirmwareUUID(uuid) {
+		uuid = ""
+	}
+	has := func(p string) bool { _, err := os.Lstat(p); return err == nil }
+	qdir := filepath.Join(r.fwStore.DataDir, fwmig.QuarantineDir)
+	stage := filepath.Join(qdir, reconcilingName(domName, uuid))
+	if !has(r.fwStore.NvramPath(domName)) && (uuid == "" || !has(r.fwStore.SwtpmDir(uuid))) && !has(stage) {
+		return false
+	}
+	now := time.Now()
+	final := filepath.Join(qdir, fmt.Sprintf("%s%s%d", domName, reconciledInfix, now.Unix()))
+	uuidLine := uuid
+	if uuid == "" {
+		uuidLine = fmt.Sprintf("(none: the definition gives no canonical uuid; only the NVRAM is here, and a swtpm tree, if any, stays under %s)", r.fwStore.SwtpmBase)
+	}
+	reason := fmt.Sprintf("vm: %s\nuuid: %s\nhost: %s\nrow_host: %s\nquarantined_at: %s\n"+
+		"reason: the reconciler cleaned a shut-off leftover whose row names another host; its firmware state is kept here\n"+
+		"retention: kept while VM %s exists; once it is gone, removed after superseded_disk_retention_days (lv host superseded-disks lists it)\n",
+		domName, uuidLine, r.hostName, vm.HostName, now.UTC().Format(time.RFC3339), domName)
+	// Stage, undefine, then finish (D2-18 verify, m-A): while the stage
+	// exists the guard refuses the VM's start, so a failed or interrupted
+	// undefine leaves a defined domain whose start is refused, never one that
+	// boots on blank firmware state. The next pass retries the undefine; a
+	// crash after it leaves an orphaned stage, which finishOrphanedStages
+	// finishes.
+	if err := r.fwStore.StageLeftoverFirmwareState(domName, uuid, stage, []byte(reason)); err != nil {
+		slog.Warn("reconciler: leftover kept: its firmware state cannot be quarantined", "vm", domName, "dir", stage, "error", err)
+		return true
+	}
+	if err := r.virt.UndefineDomainPreservingState(domName); err != nil {
+		slog.Warn("reconciler: undefine the quarantined leftover keeping its state; its state stays staged", "vm", domName, "stage", stage, "error", err)
+		return true
+	}
+	if err := r.fwStore.FinishStage(stage, final); err != nil {
+		slog.Warn("reconciler: finish the leftover's quarantine; a later pass finishes it as an orphaned stage", "vm", domName, "stage", stage, "error", err)
+		return true
+	}
+	slog.Warn("reconciler: a leftover's firmware state was quarantined, not wiped", "vm", domName, "row_host", vm.HostName, "dir", final)
+	// The leftover's seed, stamped for its uuid, goes with it: the VM lives
+	// on vm.HostName (lab-2 D2: seeds left on a lost target).
+	if uuid != "" {
+		if iso, err := lv.SafeCloudInitISOPath(r.fwStore.DataDir, domName); err == nil && cloudinit.SeedIsFor(iso, uuid) {
+			if err := cloudinit.RemoveSeed(iso); err != nil {
+				slog.Warn("reconciler: the quarantined leftover's seed was not removed", "vm", domName, "seed", iso, "error", err)
+			}
+		}
+	}
+	return true
+}
+
+// finishOrphanedStages finishes every reconciler stage
+// (<vm>-reconciling-<uuid>) whose leftover domain is gone: no domain of the
+// name is defined here, or the one defined has another uuid. It writes the
+// stage's reason.txt ("orphaned stage") and renames it to
+// <vm>-reconciled-<unix>, so it takes the retention rule and --remove like
+// any other (D2-18 re-review 4, m-2). A stage whose domain is still defined
+// with its uuid is left: as a leftover the cleanup finishes it, and as the
+// VM's own domain the guard refuses its start until --restore puts the state
+// back. An interrupted restore (<vm>-restoring-<uuid>) is never touched.
+func (r *Reconciler) finishOrphanedStages() {
+	if r.fwStore == nil {
+		return
+	}
+	qdir := filepath.Join(r.fwStore.DataDir, fwmig.QuarantineDir)
+	ents, err := os.ReadDir(qdir)
+	if err != nil {
+		return
+	}
+	var defined map[string]bool
+	for _, e := range ents {
+		vm, kind, uuid, ok := fwmig.ParseStageName(e.Name())
+		if !e.IsDir() || !ok || kind != fwmig.StageReconciling {
+			continue
+		}
+		stage := filepath.Join(qdir, e.Name())
+		if defined == nil {
+			// A listing error is never read as "no domain": the stage stays.
+			names, err := r.virt.ListDomains()
+			if err != nil {
+				return
+			}
+			defined = map[string]bool{}
+			for _, n := range names {
+				defined[n] = true
+			}
+		}
+		why := ""
+		if !defined[vm] {
+			why = "no domain of the VM is defined on this host any more"
+		} else if uuid != "" {
+			xml, err := r.virt.DumpXMLInactive(vm)
+			if err != nil {
+				continue // unreadable: not known to be another domain
+			}
+			if du := lv.UUIDFromXML(xml); du != "" && !strings.EqualFold(du, uuid) {
+				why = fmt.Sprintf("the domain of the VM defined on this host has uuid %s, not this stage's", du)
+			}
+		}
+		if why == "" {
+			continue
+		}
+		now := time.Now()
+		final := filepath.Join(qdir, fmt.Sprintf("%s%s%d", vm, reconciledInfix, now.Unix()))
+		reason := fmt.Sprintf("vm: %s\nuuid: %s\nhost: %s\nquarantined_at: %s\n"+
+			"reason: orphaned stage: the reconciler had gathered this leftover's firmware state when %s; it is finished here as is\n"+
+			"retention: kept while VM %s exists; once it is gone, removed after superseded_disk_retention_days (lv host superseded-disks lists it)\n",
+			vm, uuidOrNone(uuid), r.hostName, now.UTC().Format(time.RFC3339), why, vm)
+		staged := time.Time{}
+		if fi, err := os.Lstat(stage); err == nil {
+			staged = fi.ModTime()
+		}
+		if err := r.fwStore.FinishOrphanedStage(stage, final, []byte(reason)); err != nil {
+			slog.Warn("reconciler: an orphaned firmware quarantine stage cannot be finished", "stage", stage, "error", err)
+			continue
+		}
+		slog.Warn("reconciler: finished an orphaned firmware quarantine stage", "vm", vm, "dir", final, "why", why)
+		if !defined[vm] {
+			r.removeOrphanedStageSeed(vm, uuid, staged)
+		}
+	}
+}
+
+// removeOrphanedStageSeed removes the seed of the leftover whose orphaned
+// stage was just finished, as quarantineLeftoverFirmware does after its own
+// finish (re-review 3, m-3): only a seed stamped for the stage's uuid and
+// written no later than the stage was (a seed written since is another copy
+// of the VM arriving), never while a hold or a domain of the VM is here, and
+// never while the VM's row names this host or cannot be read.
+func (r *Reconciler) removeOrphanedStageSeed(vm, uuid string, staged time.Time) {
+	if uuid == "" || staged.IsZero() || r.db == nil {
+		return
+	}
+	row, err := corrosion.GetVM(context.Background(), r.db, vm)
+	if err != nil || (row != nil && row.HostName == r.hostName) {
+		return
+	}
+	iso, err := lv.SafeCloudInitISOPath(r.fwStore.DataDir, vm)
+	if err != nil || !cloudinit.SeedIsFor(iso, uuid) {
+		return
+	}
+	if fi, err := os.Stat(iso); err != nil || fi.ModTime().After(staged) {
+		return
+	}
+	// An incoming copy of the VM may reuse the seed without rewriting it:
+	// kept while a hold or a domain of the VM is here now (round-4 re-review
+	// m-1). Anything unreadable keeps it.
+	if _, held, err := fwmig.New(r.fwStore.DataDir).GetHold(vm); err != nil || held {
+		return
+	}
+	names, err := r.virt.ListDomains()
+	if err != nil || slices.Contains(names, vm) {
+		return
+	}
+	if err := cloudinit.RemoveSeed(iso); err != nil {
+		slog.Warn("reconciler: the orphaned stage's seed was not removed", "vm", vm, "seed", iso, "error", err)
+		return
+	}
+	slog.Info("reconciler: removed the seed of an orphaned stage's leftover", "vm", vm, "seed", iso)
+}
+
+// stagedOwnFirmware reports whether a stage of vm's firmware state is on
+// this host (by name or by the spec's uuid), logging it. A quarantine
+// directory that cannot be read counts as one.
+func (r *Reconciler) stagedOwnFirmware(vm corrosion.VMRecord) bool {
+	if r.fwStore == nil {
+		return false
+	}
+	staged, err := fwmig.New(r.fwStore.DataDir).Staged(vm.Name, specUUIDOf(vm.Spec))
+	if err != nil {
+		slog.Warn("reconciler: not starting the VM: its firmware quarantine directory cannot be read", "vm", vm.Name, "error", err)
+		return true
+	}
+	if len(staged) == 0 {
+		return false
+	}
+	slog.Warn("reconciler: not starting the VM: its firmware state is in a stage, not in place; `lv host superseded-disks <host> --restore <dir>` puts it back",
+		"vm", vm.Name, "dir", staged[0].Path)
+	return true
+}
+
+func uuidOrNone(u string) string {
+	if u == "" {
+		return "(none)"
+	}
+	return u
 }
 
 // cleanableLeftover reports whether a local domain is a CLEARLY-DEAD leftover —
@@ -1474,6 +1728,18 @@ func (r *Reconciler) startedDetail(ctx context.Context, vm corrosion.VMRecord) s
 }
 
 func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) {
+	// A VM a live firmware move's record names here is not started (and its
+	// domain not redefined) by the reconciler (spec §6.9).
+	if r.firmwareMoveSkip(vm.Name, specUUIDOf(vm.Spec), "start") {
+		return
+	}
+	// The VM's own firmware state sits in a stage (an unfinished quarantine,
+	// an interrupted restore): its domain is neither started, destroyed nor
+	// undefined here, so the stage is never finished away as orphaned and the
+	// VM never boots on blank state (D2-18 verify, m-B). --restore ends it.
+	if r.stagedOwnFirmware(vm) {
+		return
+	}
 	// A start that would be deferred for want of time is left as it is
 	// before anything is done for it — no lease, no proof claimed, no
 	// define — and goes first on the next pass (start_deferral.go).
@@ -1748,11 +2014,43 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 
 	slog.Info("reconciler: starting pending VM", "vm", vm.Name)
 
+	// A volume move this host left unresolved points the disk row at the file
+	// the persistent config names — read before the domain is undefined and
+	// rebuilt from the rows below — or the start is refused
+	// (move_unresolved.go). A domain already running is left to the branch
+	// below.
+	if r.virt == nil || !r.virt.DomainExists(vm.Name) || !domainRunningNow(r.virt, vm.Name) {
+		dom := MoveDomain{InactiveXML: func() (string, error) { return "", errors.New("no libvirt backend") }}
+		if r.virt != nil {
+			dom = MoveDomain{
+				InactiveXML: func() (string, error) { return r.virt.DumpXMLInactive(vm.Name) },
+				State:       func() (string, error) { return r.virt.DomainState(vm.Name) },
+			}
+		}
+		if merr := ResolveUnresolvedMoves(ctx, r.db, r.dataDir, r.hostName, vm.Name, dom); merr != nil {
+			slog.Warn("reconciler: start refused — an unresolved volume move", "vm", vm.Name, "error", merr)
+			if MoveUnresolvedRetryable(merr) {
+				// Transient (a move in flight, a read that failed): the row is
+				// left as it is and a later pass starts it again.
+				if proofID != "" {
+					r.failPendingStart(ctx, vm.Name, proofID, true, merr.Error())
+				}
+				return
+			}
+			r.failPendingStart(ctx, vm.Name, proofID, false, merr.Error())
+			return
+		}
+	}
 	// Check if a domain already exists locally from a partial migration (#14).
 	if r.virt != nil && r.virt.DomainExists(vm.Name) {
 		state, err := r.virt.DomainState(vm.Name)
 		if err == nil && state == "running" {
 			slog.Warn("reconciler: domain already running locally, updating state", "vm", vm.Name)
+			// Not a start, but the guest ran here: the evidence an operator
+			// judges a forked move history by (MoveStartsText).
+			if eerr := NoteAdoptedRunning(ctx, r.db, r.hostName, vm.Name); eerr != nil {
+				slog.Warn("reconciler: recording the running domain's adoption failed", "vm", vm.Name, "error", eerr)
+			}
 			// Idempotent retry: the domain is already up. Complete the proof
 			// (single-use) + clear pending_action_id in one guarded mutation. Do NOT
 			// downgrade to a plain running update on guard failure — that would bypass
@@ -1790,6 +2088,8 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		r.virt.DestroyDomain(vm.Name)
 		r.virt.UndefineDomainPreservingState(vm.Name)
 	}
+	// A start this pass makes (a domain found running is not one).
+	noteStartingHere(ctx, r.db, r.dataDir, vm.Name)
 
 	// wroteStarting: this pass's own "starting" write landed, so a stop the
 	// row says from here on was made while the start was under way (the
@@ -2052,7 +2352,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// Whether this VM's UEFI vars were here before this pass defined its
 	// domain: vars a boot creates for a since-deleted record are this pass's
 	// own to remove (start_row_gone.go).
-	nvramBefore := nvramExists(r.dataDir, vm.Name)
+	nvramBefore := nvramExists(r.fwStore, vm.Name)
 
 	// A start the operator cancelled meanwhile (`lv stop --force`) is not
 	// made: the start lease can run out under a slow start (vmLockTTL),
@@ -2636,7 +2936,7 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 	// rebuilt faithfully — fail clearly (state=error) rather than booting with a
 	// fresh TPM and silently breaking BitLocker.
 	r.firmware.ApplyTo(&vmCfg, r.dataDir, vm.Name, spec.SecureBoot, spec.Tpm)
-	if spec.Tpm && !lv.HasTPMState(spec.Uuid) {
+	if spec.Tpm && !r.fwStore.HasTPMState(spec.Uuid) {
 		slog.Error("reconciler: vTPM VM has no local TPM state; refusing to start with a fresh TPM", "vm", vm.Name)
 		return "", false, "vTPM state missing on this host (would break BitLocker)" // non-retryable
 	}
@@ -2644,7 +2944,7 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 	// whose vars aren't present here can't be rebuilt faithfully — refuse rather
 	// than redefine with fresh vars from the template (would lose enrolled keys).
 	uefiFW := spec.Firmware == "uefi" || spec.Firmware == ""
-	if (spec.SecureBoot || spec.Tpm) && uefiFW && !lv.HasNvram(r.dataDir, vm.Name) {
+	if (spec.SecureBoot || spec.Tpm) && uefiFW && !r.fwStore.HasNvram(vm.Name) {
 		slog.Error("reconciler: firmware VM has no local UEFI NVRAM; refusing to start with fresh vars", "vm", vm.Name)
 		return "", false, "UEFI NVRAM missing on this host (would lose Secure Boot keys)" // non-retryable
 	}
@@ -3134,4 +3434,79 @@ func (r *Reconciler) runtimeSuperseded(ctx context.Context, name string) bool {
 		return false
 	}
 	return row.OwnerEpoch > marker
+}
+
+// ── Live firmware moves (spec §6.9) ──
+//
+// While a live firmware move's record — a source marker or a target hold —
+// names a VM on this host, the health paths that would undefine, define,
+// start, stop or restart it leave it alone: the move, its recovery or an
+// operator's D-5 action resolves it. The firmware move guard refuses the
+// libvirt calls beneath them too; skipping first keeps a refused call from
+// being followed by another (a refused destroy by a start) or by a row
+// write, and keeps the leftover's state and definition as they are.
+
+// firmwareMoveSkips logs each skip once per VM and record.
+type firmwareMoveSkips struct {
+	mu     sync.Mutex
+	logged map[string]map[string]string // VM → what was skipped → why
+}
+
+// specUUIDOf is the uuid a stored VM spec carries, or "".
+func specUUIDOf(spec string) string {
+	var sp struct {
+		UUID string `json:"uuid"`
+	}
+	_ = json.Unmarshal([]byte(spec), &sp)
+	return sp.UUID
+}
+
+// skip reports whether a live firmware move's record names the VM on this
+// host (by name, or by uuid when known), logging it once. A record that
+// cannot be read counts as one: the guard refuses on it too. dataDir "" is a
+// host with no records.
+func (k *firmwareMoveSkips) skip(dataDir, name, uuid, what string) bool {
+	if dataDir == "" {
+		return false
+	}
+	recs, err := fwmig.New(dataDir).Lookup(name, uuid)
+	var why string
+	switch {
+	case err != nil:
+		why = "a firmware move record cannot be read: " + err.Error()
+	case len(recs) == 0:
+		k.mu.Lock()
+		delete(k.logged, name)
+		k.mu.Unlock()
+		return false
+	default:
+		r := recs[0]
+		dir := "to"
+		if r.Kind == lv.FirmwareHold {
+			dir = "from"
+		}
+		why = fmt.Sprintf("live firmware migration %s %s %s in %s %s", r.Attempt, dir, r.Peer, r.Kind, r.State)
+	}
+	k.mu.Lock()
+	if k.logged == nil {
+		k.logged = map[string]map[string]string{}
+	}
+	if k.logged[name] == nil {
+		k.logged[name] = map[string]string{}
+	}
+	first := k.logged[name][what] != why
+	k.logged[name][what] = why
+	k.mu.Unlock()
+	if first {
+		slog.Info("health: leaving a VM in a live firmware move alone", "vm", name, "skipped", what, "reason", why)
+	}
+	return true
+}
+
+// firmwareMoveSkip is skip over this reconciler's firmware store.
+func (r *Reconciler) firmwareMoveSkip(name, uuid, what string) bool {
+	if r.fwStore == nil {
+		return false
+	}
+	return r.fwSkips.skip(r.fwStore.DataDir, name, uuid, what)
 }

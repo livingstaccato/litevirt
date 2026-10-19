@@ -403,24 +403,35 @@ func rotateAuditKeyHint(hostName, sshTarget string) string {
 }
 
 // removeCAMachineCopy deletes the copy of the replaced host pair that `lv host
-// init` / `lv host add` left in this machine's pki directory (<host>.key and
-// <host>.crt), when it is that pair: a renewal retires the key, and a copy here
-// would outlive it. The key goes only when it matches the replaced certificate;
-// the certificate goes with it, never alone, and only when it IS the replaced
-// certificate — so no half pair is left behind for a later `lv host add` or a
-// human to trip on.
+// init` (<host>.key and <host>.crt) or `lv host add` (hosts/<host>/host.key
+// and host.crt) left in this machine's pki directory, when it is that pair: a
+// renewal retires the key, and a copy here would outlive it. The key goes only
+// when it matches the replaced certificate; the certificate goes with it,
+// never alone, and only when it IS the replaced certificate — so no half pair
+// is left behind for a later `lv host add` or a human to trip on.
 //
-// It refuses, and returns why, when the copy's path is not this host's to
-// remove: a name that leaves the directory, or a path that is one of the
-// directory's own files (a host an older build admitted as "ca" or "ui").
-// The renewal itself is complete either way.
+// It refuses, and returns why, when a copy's path is not this host's to
+// remove: a name that leaves the directory (checked before either place is
+// looked at), or a path that is one of the directory's own files (a host an
+// older build admitted as "ca"), in either place. Both places are tried; the
+// first refusal is returned. The renewal itself is complete either way.
 func removeCAMachineCopy(pkiDir, hostName string, prev *x509.Certificate) error {
 	if err := pki.ValidateHostPathName(hostName); err != nil {
 		fmt.Printf("  NOTE: this machine's copy of %s's replaced pair was not looked for: %v\n", hostName, err)
 		return fmt.Errorf("the renewal is complete, but this machine's copy of the replaced pair was not removed: %w", err)
 	}
-	keyPath := filepath.Join(pkiDir, hostName+".key")
-	crtPath := filepath.Join(pkiDir, hostName+".crt")
+	first := removeCAMachineCopyAt(pkiDir, hostName, filepath.Join(pkiDir, hostName+".key"), filepath.Join(pkiDir, hostName+".crt"), prev)
+	if dir := keptHostDir(pkiDir, hostName); dir != "" {
+		if err := removeCAMachineCopyAt(pkiDir, hostName, filepath.Join(dir, "host.key"), filepath.Join(dir, "host.crt"), prev); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+// removeCAMachineCopyAt is removeCAMachineCopy for one place: keyPath and
+// crtPath, under pkiDir.
+func removeCAMachineCopyAt(pkiDir, hostName, keyPath, crtPath string, prev *x509.Certificate) error {
 	b, err := os.ReadFile(keyPath)
 	if err != nil {
 		return nil
@@ -431,7 +442,7 @@ func removeCAMachineCopy(pkiDir, hostName string, prev *x509.Certificate) error 
 	// The replaced key under one of the directory's own names: an older lv
 	// minted the host's pair over it. Left, and said.
 	for _, p := range []string{keyPath, crtPath} {
-		if fixed, ok := pki.OperatorPKIFileAt(p); ok {
+		if fixed, ok := pki.OperatorPKIFileIn(pkiDir, p); ok {
 			fmt.Printf("  NOTE: left %s: it holds %s's replaced pair, but it is this directory's %s\n", p, hostName, fixed)
 			return fmt.Errorf("the renewal is complete, but %s was left: it holds %s's replaced pair under "+
 				"this directory's own %s, overwritten by an older release; restore %s from a backup", p, hostName, fixed, fixed)

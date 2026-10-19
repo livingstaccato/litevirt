@@ -515,7 +515,8 @@ func deleteSnapshot(v snapshotAPI, domainName, snapshotName string) error {
 			"so libvirt would unlink the disk it was taken of, under the VM's live layer; "+
 			"deleting its metadata only and keeping its files",
 			"vm", domainName, "snapshot", snapshotName)
-		return v.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly)
+		return metadataOnlyDelete(v, snap, snapshotName,
+			"libvirt does not hold it as its current snapshot and it has no children, so libvirt would unlink the disk it was taken of")
 	}
 	// The other case libvirt cannot handle: a snapshot it would merge, whose
 	// overlay is not in the VM's live chain over the disk it was taken of.
@@ -530,9 +531,42 @@ func deleteSnapshot(v snapshotAPI, domainName, snapshotName string) error {
 		slog.Warn("snapshot delete: libvirt cannot merge this snapshot ("+why+"); "+
 			"deleting its metadata only and keeping its files",
 			"vm", domainName, "snapshot", snapshotName)
-		return v.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly)
+		return metadataOnlyDelete(v, snap, snapshotName, "libvirt cannot merge it: "+why)
 	}
 	return v.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteFlags(0))
+}
+
+// SnapshotFilesKeptError is what a snapshot delete that removed only the
+// snapshot's metadata returns once that delete succeeded: the delete is done,
+// and Files, the snapshot's overlays a merge would have removed, are all kept
+// (with the disks they were taken of), so their space is not reclaimed. No
+// data is lost. The caller reports it; it is not a failure.
+type SnapshotFilesKeptError struct {
+	Snapshot string
+	Reason   string
+	Files    []string
+}
+
+func (e *SnapshotFilesKeptError) Error() string {
+	return fmt.Sprintf("snapshot %q was deleted as metadata only (%s); its files are kept: %s",
+		e.Snapshot, e.Reason, strings.Join(e.Files, ", "))
+}
+
+// metadataOnlyDelete deletes snap's metadata only and, once that succeeds,
+// returns the SnapshotFilesKeptError naming its overlays (read before the
+// delete; none when its XML cannot be read).
+func metadataOnlyDelete(v snapshotAPI, snap golibvirt.DomainSnapshot, name, reason string) error {
+	var files []string
+	if x, err := v.DomainSnapshotGetXMLDesc(snap, 0); err == nil {
+		for _, f := range parseSnapshotOverlays(x) {
+			files = append(files, f)
+		}
+		sort.Strings(files)
+	}
+	if err := v.DomainSnapshotDelete(snap, golibvirt.DomainSnapshotDeleteMetadataOnly); err != nil {
+		return err
+	}
+	return &SnapshotFilesKeptError{Snapshot: name, Reason: reason, Files: files}
 }
 
 // notInLiveChain says why libvirt cannot merge the snapshot — an external
@@ -643,7 +677,17 @@ func leafNotCurrent(v snapshotAPI, dom golibvirt.Domain, snap golibvirt.DomainSn
 // captureSuspended, when non-nil, is invoked while the guest is frozen (disks
 // snapshotted, guest paused) so firmware state (NVRAM + swtpm) is captured at the
 // SAME instant as the disk+RAM snapshot — see CreateLiveSnapshot (G1).
+//
+// The capture stops the guest (the RAM save) and starts it again (the
+// restore), so the firmware move guard is asked for both, OpStop and OpStart,
+// before the guest is suspended: a refusal after the save would leave it
+// stopped.
 func (c *Client) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, captureSuspended func() error) (diskBytes, vmstateBytes int64, err error) {
+	for _, op := range []FirmwareOp{OpStop, OpStart} {
+		if err := c.firmwareGuard().check(FirmwareCall{Op: op, Name: domainName}); err != nil {
+			return 0, 0, fmt.Errorf("memory snapshot of %q: %w", domainName, err)
+		}
+	}
 	dom, err := c.virt.DomainLookupByName(domainName)
 	if err != nil {
 		return 0, 0, fmt.Errorf("lookup domain %q: %w", domainName, err)
@@ -733,10 +777,10 @@ func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath stri
 	if err != nil {
 		return fmt.Errorf("revert %s: %w", domainName, err)
 	}
-	return revertToLiveSnapshot(keepConsoleSnapshotAPI{c.virt, c}, domainName, snapshotName, vmstatePath, restorePreDefine, rewriteSaved, g)
+	return revertToLiveSnapshot(keepConsoleSnapshotAPI{c.virt, c}, domainName, snapshotName, vmstatePath, restorePreDefine, rewriteSaved, g, c.firmwareGuard())
 }
 
-func revertToLiveSnapshot(v snapshotAPI, domainName, snapshotName, vmstatePath string, restorePreDefine func() error, rewriteSaved func(savedXML string) (string, error), g StartGuard) error {
+func revertToLiveSnapshot(v snapshotAPI, domainName, snapshotName, vmstatePath string, restorePreDefine func() error, rewriteSaved func(savedXML string) (string, error), g StartGuard, fg FirmwareMoveGuard) error {
 	// Pre-flight: never start tearing the VM down if the RAM image is gone.
 	if _, err := os.Stat(vmstatePath); err != nil {
 		return fmt.Errorf("vmstate image %q missing — cannot restore memory snapshot: %w", vmstatePath, err)
@@ -899,7 +943,7 @@ func revertToLiveSnapshot(v snapshotAPI, domainName, snapshotName, vmstatePath s
 	// needed for them; the chain is overlay→base→image with no file opened
 	// twice. Its CD-ROMs are the files judged here (rewriteSaved), when they
 	// differ.
-	if err := restoreWithRetry(v, g, domainName, vmstatePath, restoreXML); err != nil {
+	if err := restoreWithRetry(v, g, fg, domainName, vmstatePath, restoreXML); err != nil {
 		return fmt.Errorf("restore guest memory: %w", err)
 	}
 	if _, err := v.DomainDefineXML(savedXML); err != nil {
@@ -1399,13 +1443,13 @@ func (c *Client) restoreWithRetry(domainName, vmstatePath, dxml string) error {
 	if err != nil {
 		return fmt.Errorf("restore %s: %w", domainName, err)
 	}
-	return restoreWithRetry(c.virt, g, domainName, vmstatePath, dxml)
+	return restoreWithRetry(c.virt, g, c.firmwareGuard(), domainName, vmstatePath, dxml)
 }
 
 // restoreWithRetry restores the saved image paused; the guard (StartGuard)
 // puts the domain's NIC firewall in force under the taps it now has, and only
 // then is it resumed (re-review m5). A refusal destroys the restored domain.
-func restoreWithRetry(v snapshotAPI, g StartGuard, domainName, vmstatePath, dxml string) error {
+func restoreWithRetry(v snapshotAPI, g StartGuard, fg FirmwareMoveGuard, domainName, vmstatePath, dxml string) error {
 	var dxmlOpt golibvirt.OptString
 	if dxml != "" {
 		dxmlOpt = golibvirt.OptString{dxml}
@@ -1425,7 +1469,7 @@ func restoreWithRetry(v snapshotAPI, g StartGuard, domainName, vmstatePath, dxml
 		if !strings.Contains(msg, "lock") && !strings.Contains(msg, "already") {
 			return err
 		}
-		forceRemoveDomain(v, domainName) // clear any partial domain holding the lock
+		forceRemoveDomain(v, fg, domainName) // clear any partial domain holding the lock
 		time.Sleep(3 * time.Second)
 	}
 	if err != nil {
@@ -1465,7 +1509,15 @@ func restoreWithRetry(v snapshotAPI, g StartGuard, domainName, vmstatePath, dxml
 
 // forceRemoveDomain destroys (if up) and undefines (if defined) a domain so a
 // subsequent restore starts from a clean slate and the disk lease is released.
-func forceRemoveDomain(v snapshotAPI, domainName string) {
+// It is best effort: a firmware move guard refusal (OpStop, OpUndefine) leaves
+// the domain as it is.
+func forceRemoveDomain(v snapshotAPI, fg FirmwareMoveGuard, domainName string) {
+	for _, op := range []FirmwareOp{OpStop, OpUndefine} {
+		if err := fg.check(FirmwareCall{Op: op, Name: domainName}); err != nil {
+			slog.Warn("libvirt: force remove refused", "domain", domainName, "error", err)
+			return
+		}
+	}
 	d, e := v.DomainLookupByName(domainName)
 	if e != nil {
 		return

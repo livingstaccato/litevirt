@@ -3,6 +3,9 @@ package firewall
 import (
 	"context"
 	"errors"
+	"runtime"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -121,6 +124,10 @@ func TestCorrosionPlanLoader_SettleIgnoresAJoinedOlderTapCall(t *testing.T) {
 	insert("mover", "host-b", "52:54:00:00:00:22")
 	arm := NewArming()
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	doRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	// Every exit path, a Fatal included, unblocks the stalled tap call.
+	defer doRelease()
 	entered := make(chan struct{}, 1)
 	var calls int32
 	load := CorrosionPlanLoader(db, "host-a", Plan{}, LoaderOptions{
@@ -145,8 +152,10 @@ func TestCorrosionPlanLoader_SettleIgnoresAJoinedOlderTapCall(t *testing.T) {
 	// The pass under test joins that call, which started before its generations.
 	second := make(chan error, 1)
 	go func() { _, err := load(ctx); second <- err }()
-	time.Sleep(200 * time.Millisecond)
-	close(release)
+	// Release only once both passes are parked in the join's select: a
+	// goroutine scheduled after the release would start a fresh, valid lookup.
+	waitParkedInFetch(t, 2)
+	doRelease()
 	if err := <-first; err != nil {
 		t.Fatal(err)
 	}
@@ -160,4 +169,27 @@ func TestCorrosionPlanLoader_SettleIgnoresAJoinedOlderTapCall(t *testing.T) {
 	if !found {
 		t.Fatal("a pass disarmed on a tap answer older than its generations")
 	}
+}
+
+// waitParkedInFetch blocks until n goroutines are parked in the select of
+// tapFetcher.fetchStamped, which a pass reaches only after it has started or
+// joined a call. It reads goroutine stacks, so it needs no production hook.
+func waitParkedInFetch(t *testing.T, n int) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	buf := make([]byte, 1<<20)
+	for time.Now().Before(deadline) {
+		stacks := string(buf[:runtime.Stack(buf, true)])
+		got := 0
+		for _, g := range strings.Split(stacks, "\n\n") {
+			if strings.Contains(g, "tapFetcher).fetchStamped") && strings.Contains(strings.SplitN(g, "\n", 2)[0], "[select") {
+				got++
+			}
+		}
+		if got >= n {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("fewer than %d passes parked in the tap fetch", n)
 }

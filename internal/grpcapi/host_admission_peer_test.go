@@ -26,6 +26,7 @@ type fakeDestPeer struct {
 	reserveCalls []*pb.ReserveHostCapacityRequest
 	releaseCalls []string
 	reserveErr   error
+	releaseErr   error // fails ReleaseHostCapacity, as an unreachable destination does
 	leaseID      string
 }
 
@@ -43,6 +44,9 @@ func (f *fakeDestPeer) ReleaseHostCapacity(_ context.Context, req *pb.ReleaseHos
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.releaseCalls = append(f.releaseCalls, req.LeaseId)
+	if f.releaseErr != nil {
+		return nil, f.releaseErr
+	}
 	return &emptypb.Empty{}, nil
 }
 

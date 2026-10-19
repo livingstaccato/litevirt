@@ -19,7 +19,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 )
@@ -71,9 +71,19 @@ func (s *Server) BackupSnapshot(req *pb.BackupSnapshotRequest, stream grpc.Serve
 
 	unlock := s.lockVM(req.VmName)
 	defer unlock()
+	// The backup reads the VM's disks and firmware state, which a live
+	// firmware move holds (spec §6.9): refused while its record names the VM.
+	if err := s.firmwareMoveRefusal("backup", vm); err != nil {
+		return err
+	}
 	// A point-in-time overlay an earlier copy left holds writes the disk's
 	// file lacks: settle it before anything reads or starts the disk.
 	if err := s.settlePITOverlays(ctx, vm); err != nil {
+		return err
+	}
+	// A volume move left unresolved here: the row names the file the
+	// persistent config names before it is read (move_unresolved.go).
+	if err := s.resolveUnresolvedMovesFor(ctx, req.VmName, health.MoveUseReadsRunning); err != nil {
 		return err
 	}
 
@@ -519,16 +529,16 @@ func (s *Server) captureFirmwareBundle(repo *pbsstore.Repo, vmName, specJSON str
 	// Per-component preflight: WriteFirmwareBundle reports success for a PARTIAL
 	// bundle (NVRAM-only or swtpm-only), which would restore a VM with a fresh
 	// TPM and brick BitLocker. Require every component the spec declares.
-	if fs.hasNvram() && !lv.HasNvram(s.dataDir, vmName) {
+	if fs.hasNvram() && !s.fw().HasNvram(vmName) {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"Secure Boot / vTPM VM %q has no UEFI NVRAM on this host; cannot back it up consistently", vmName)
 	}
-	if fs.Tpm && !lv.HasTPMState(fs.UUID) {
+	if fs.Tpm && !s.fw().HasTPMState(fs.UUID) {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"vTPM VM %q has no swtpm state on this host; cannot back it up consistently", vmName)
 	}
 	var buf bytes.Buffer
-	has, err := lv.WriteFirmwareBundle(s.dataDir, vmName, fs.UUID, &buf)
+	has, err := s.fw().WriteFirmwareBundle(vmName, fs.UUID, &buf)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "capture firmware state for %q: %v", vmName, err)
 	}
@@ -553,7 +563,7 @@ func (s *Server) materializeFirmwareBundle(repo *pbsstore.Repo, manifest *pbssto
 	if err := repo.ReadBytesTo(manifest.FirmwareChunks, &buf); err != nil {
 		return status.Errorf(codes.Internal, "read firmware bundle for %q: %v", vmName, err)
 	}
-	if err := lv.ReadFirmwareBundle(&buf, s.dataDir, vmName, uuid); err != nil {
+	if err := s.fw().ReadFirmwareBundle(&buf, vmName, uuid); err != nil {
 		return status.Errorf(codes.Internal, "materialize firmware state for %q: %v", vmName, err)
 	}
 	return nil
@@ -672,6 +682,15 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 	switch {
 	case req.InPlace || ownDisk:
 		if err := inPlaceContentAccepted(manifest); err != nil {
+			return err
+		}
+		// An in-place restore overwrites the VM's own disk: not while a live
+		// firmware move's record names it here (spec §6.9).
+		if vm, _ := corrosion.GetVM(ctx, s.db, req.VmName); vm != nil {
+			if err := s.firmwareMoveRefusal("backup restore", vm); err != nil {
+				return err
+			}
+		} else if err := s.firmwareMoveNameRefusal("backup restore", req.VmName); err != nil {
 			return err
 		}
 		if dest, err = s.inPlaceRestoreTarget(ctx, req.VmName, req.DiskName, authProject); err != nil {

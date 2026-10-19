@@ -111,15 +111,18 @@ type SwtpmSyncReport struct {
 	Err error
 }
 
-// SyncSwtpmState sets the sync attribute on libvirt's swtpm tree (on), or
+// SyncSwtpmState sets the sync attribute on the store's swtpm tree (on), or
 // clears it (off). On creates the base (0711, as libvirt does) when it is
 // missing, so the first vTPM VM's state directory inherits the attribute, and
 // writes marker before it first sets anything. Off clears the tree only while
 // marker says litevirt set it, then removes marker, so an attribute set by
 // hand on a host litevirt never protected stays. Idempotent; it touches only
 // entries whose attribute differs.
-func SyncSwtpmState(on bool, marker string) SwtpmSyncReport {
-	return syncSwtpmTree(libvirtSwtpmBase, on, marker, osSwtpmFDOps)
+//
+// It works on this store's swtpm tree (SwtpmBase): a daemon syncs its own
+// host's, and the fleet harness, with several hosts in one process, each one's.
+func (f *FirmwareStore) SyncSwtpmState(on bool, marker string) SwtpmSyncReport {
+	return syncSwtpmTree(f.SwtpmBase, on, marker, osSwtpmFDOps)
 }
 
 // swtpmFDOps is what the walk does to an fd it opened: read and write its
@@ -153,12 +156,12 @@ func flagUnsupported(err error) bool {
 var errFlagsUnavailable = errors.New("inode flags are not available on this platform")
 
 // writeSwtpmMarker records that litevirt set the attribute, durably.
-func writeSwtpmMarker(path string) error {
+func writeSwtpmMarker(path, base string) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
-	_, err = f.WriteString("litevirt set the sync attribute on " + libvirtSwtpmBase + " (vtpm_state_sync)\n")
+	_, err = f.WriteString("litevirt set the sync attribute on " + base + " (vtpm_state_sync)\n")
 	if err == nil {
 		err = f.Sync()
 	}

@@ -48,15 +48,37 @@ func (r *LxcRunner) SetNetLink(name string, n int, bridge string) error {
 }
 
 func setNetLink(cfg string, n int, bridge string) (string, bool) {
+	return setNetKey(cfg, n, "link", bridge)
+}
+
+// setNetKey sets lxc.net.<n>.<key> to value on every line that has it.
+func setNetKey(cfg string, n int, field, value string) (string, bool) {
 	lines := strings.Split(cfg, "\n")
-	key := fmt.Sprintf("lxc.net.%d.link", n)
+	key := fmt.Sprintf("lxc.net.%d.%s", n, field)
 	found := false
 	for i, line := range lines {
 		k, _, ok := strings.Cut(strings.TrimSpace(line), "=")
 		if ok && strings.TrimSpace(k) == key {
-			lines[i] = key + " = " + bridge
+			lines[i] = key + " = " + value
 			found = true
 		}
 	}
 	return strings.Join(lines, "\n"), found
+}
+
+// SetNetHWAddr sets the MAC of NIC n in container name's config.
+func (r *LxcRunner) SetNetHWAddr(name string, n int, mac string) error {
+	cfg := filepath.Join(r.lxcpath(), name, "config")
+	data, err := os.ReadFile(cfg)
+	if err != nil {
+		return err
+	}
+	out, ok := setNetKey(string(data), n, "hwaddr", mac)
+	if !ok {
+		if _, has := parseNetLinks(string(data))[n]; !has {
+			return fmt.Errorf("container %s has no NIC %d", name, n)
+		}
+		out = strings.TrimRight(out, "\n") + fmt.Sprintf("\nlxc.net.%d.hwaddr = %s\n", n, mac)
+	}
+	return os.WriteFile(cfg, []byte(out), 0o644)
 }

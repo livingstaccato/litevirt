@@ -49,6 +49,8 @@ type CTFake struct {
 	// links is the bridge each container NIC is linked to, by ordinal: what
 	// a real create writes as lxc.net.<N>.link.
 	links map[string]map[int]string
+	// nicMACs records SetContainerNICMAC: the MAC written into a NIC's config.
+	nicMACs map[string]map[int]string
 
 	// Call counters/records. Read them with the accessors, never directly —
 	// the handlers write these from other goroutines.
@@ -356,6 +358,30 @@ func (f *CTFake) SetContainerNICLink(_ context.Context, name string, ordinal int
 	}
 	f.links[name][ordinal] = bridge
 	return nil
+}
+
+// SetContainerNICMAC records mac as NIC ordinal's MAC in name's config.
+func (f *CTFake) SetContainerNICMAC(_ context.Context, name string, ordinal int, mac string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.state[name]; !ok {
+		return lxc.ErrContainerNotFound
+	}
+	if f.nicMACs == nil {
+		f.nicMACs = map[string]map[int]string{}
+	}
+	if f.nicMACs[name] == nil {
+		f.nicMACs[name] = map[int]string{}
+	}
+	f.nicMACs[name][ordinal] = mac
+	return nil
+}
+
+// NICMACSet is the MAC SetContainerNICMAC wrote for NIC ordinal of name, or "".
+func (f *CTFake) NICMACSet(name string, ordinal int) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nicMACs[name][ordinal]
 }
 
 // ContainerLimits reports the limits recorded at create; a container seeded

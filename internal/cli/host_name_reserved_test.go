@@ -168,14 +168,17 @@ func TestHostAddRemote_RefusesAnUnsafeNameBeforeConnecting(t *testing.T) {
 
 // mintStaged is where an add's pair is written; it refuses on its own.
 //
-// Mutation: drop the check in mintStaged — ".ca.crt.add" is written, and
-// "/../esc" mints beside the PKI directory.
+// Mutation: drop the check in mintStaged — the pair is minted into the
+// attempt's directory under the refused name.
 func TestMintStaged_RefusesAnUnsafeName(t *testing.T) {
 	for _, name := range pairUnsafeHostNames {
 		root, dir := operatorPKIUnder(t)
+		minted, err := os.MkdirTemp(dir, ".add-")
+		if err != nil {
+			t.Fatal(err)
+		}
 		before := dirSnapshot(t, root)
-		var local []string
-		if _, _, err := mintStaged(dir, name, net.IPv4(10, 0, 0, 9), &local); err == nil {
+		if _, _, err := mintStaged(dir, minted, name, net.IPv4(10, 0, 0, 9)); err == nil {
 			t.Errorf("mintStaged(%q) = nil, want a refusal", name)
 		}
 		sameTree(t, name, root, before)
@@ -294,7 +297,7 @@ func TestHostNames_AnOldLayoutDirectoryStillWorks(t *testing.T) {
 	if err := f.add(t); err != nil {
 		t.Fatalf("add beside an old-layout directory: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(f.opPKI, "node-9.crt")); err != nil {
+	if _, err := os.Stat(filepath.Join(f.opPKI, keptHostsDir, "node-9", "host.crt")); err != nil {
 		t.Errorf("the added host's pair was not kept: %v", err)
 	}
 	if !bytes.Equal(mustRead(t, filepath.Join(f.opPKI, "ca.crt")), ca) {
@@ -486,26 +489,26 @@ func TestHostAdd_ResumesALegacyName(t *testing.T) {
 	}
 }
 
-// A new host "web" beside a live host an older build admitted as
-// "web-migration" would keep its migration pair over that host's pair.
+// An add keeps this machine's copies under hosts/<name>/, so a new host "web"
+// beside a live host an older build admitted as "web-migration" collides with
+// nothing: web-migration's copy in the old layout is left as it was.
 //
-// Mutation: drop the loop in checkAddName — the add proceeds.
-func TestHostAdd_RefusesANameWhoseMigrationPairIsAnotherHosts(t *testing.T) {
+// Mutation: refuse a name whose <name>-migration is a live host in
+// checkAddName — the add is refused.
+func TestHostAdd_AddsANameBesideALegacyMigrationNamedHost(t *testing.T) {
 	f := newAddFixture(t)
+	writeLegacyPair(t, f.opPKI, "web-migration")
+	keep := mustRead(t, filepath.Join(f.opPKI, "web-migration.crt"))
 	f.client.hosts = append(f.client.hosts, &pb.Host{Name: "web-migration", Address: "10.0.0.5",
 		State: pb.HostState_HOST_ACTIVE, CertSerial: "c1"})
-	err := HostAddOn(context.Background(), f.client, f.target, "web", "10.0.0.9")
-	if err == nil {
-		t.Fatal("HostAddOn(web) = nil, want a refusal naming web-migration")
+	if err := HostAddOn(context.Background(), f.client, f.target, "web", "10.0.0.9"); err != nil {
+		t.Fatalf("HostAddOn(web) = %v", err)
 	}
-	for _, want := range []string{filepath.Join(f.opPKI, "web-migration.crt"), filepath.Join(f.opPKI, "web-migration.key"),
-		"host web-migration's own", "Rename one of the two hosts", "lv host rm web-migration"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("HostAddOn(web) = %v, want it to say %q", err, want)
-		}
+	if !bytes.Equal(mustRead(t, filepath.Join(f.opPKI, "web-migration.crt")), keep) {
+		t.Error("host web-migration's copy was replaced")
 	}
-	if len(f.client.admitted) != 0 || len(f.target.Events) != 0 {
-		t.Errorf("the refused add went ahead: admitted=%v events=%v", f.client.admitted, f.target.Events)
+	if _, err := os.Stat(filepath.Join(f.opPKI, keptHostsDir, "web", "migration.crt")); err != nil {
+		t.Errorf("web's migration pair was not kept under hosts/web: %v", err)
 	}
 }
 
@@ -610,4 +613,96 @@ func TestHostAddPublic_UnreadableListRefusesBeforeAnyEffect(t *testing.T) {
 		}
 		sameTree(t, name, root, before)
 	}
+}
+
+// keptHostDir is the path rule for every name, legacy ones included: "" for a
+// name that is not one plain path element, the directory otherwise.
+//
+// Mutation: drop the leading '-' case from the path rule — "-rf" gets a
+// directory.
+func TestKeptHostDir_PathRule(t *testing.T) {
+	for _, name := range traversalHostNames {
+		if d := keptHostDir("/pki", name); d != "" {
+			t.Errorf("keptHostDir(%q) = %q, want none", name, d)
+		}
+	}
+	for _, name := range append([]string{"node-1"}, legacyHostNames...) {
+		if d := keptHostDir("/pki", name); d != filepath.Join("/pki", keptHostsDir, name) {
+			t.Errorf("keptHostDir(%q) = %q", name, d)
+		}
+	}
+}
+
+// A renewal removes the kept copy under hosts/<name>/ too, with the same
+// checks as the old-layout copy: a legacy name's kept pair goes; a traversal
+// name is refused before either place is looked at; and a kept file that is
+// one of the directory's own files (linked to ca.key in a directory a pre-fix
+// lv host init --name ca overwrote) is left, and said.
+//
+// Mutations: drop the operator-file check in removeCAMachineCopyAt — the
+// kept link and ca.key's other name are removed; drop the name check —
+// "../esc" removes the pair beside the PKI directory.
+func TestRemoveCAMachineCopy_KeptHostDir(t *testing.T) {
+	t.Run("legacy name", func(t *testing.T) {
+		for _, name := range legacyHostNames {
+			_, dir := operatorPKIUnder(t)
+			kept := filepath.Join(dir, keptHostsDir, name)
+			if err := os.MkdirAll(kept, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			prev := writeLegacyPairAt(t, dir, kept, "host")
+			if err := removeCAMachineCopy(dir, name, prev); err != nil {
+				t.Errorf("removeCAMachineCopy(%q) = %v", name, err)
+			}
+			for _, n := range []string{"host.crt", "host.key"} {
+				if _, err := os.Stat(filepath.Join(kept, n)); !os.IsNotExist(err) {
+					t.Errorf("%q: kept %s was not removed: %v", name, n, err)
+				}
+			}
+		}
+	})
+	t.Run("traversal", func(t *testing.T) {
+		root, dir := operatorPKIUnder(t)
+		// What hosts/../esc and pki/../esc would reach.
+		writeLegacyPairAt(t, dir, dir, "esc")
+		prev := writeLegacyPairAt(t, dir, filepath.Dir(dir), "esc")
+		if err := os.MkdirAll(filepath.Join(dir, "esc"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		before := dirSnapshot(t, root)
+		for _, name := range []string{"../esc", "/../esc"} {
+			if err := removeCAMachineCopy(dir, name, prev); err == nil || !strings.Contains(err.Error(), "invalid host name") {
+				t.Errorf("removeCAMachineCopy(%q) = %v, want the name refused", name, err)
+			}
+		}
+		sameTree(t, "../esc", root, before)
+	})
+	t.Run("operator file", func(t *testing.T) {
+		root, dir := operatorPKIUnder(t)
+		ca2 := filepath.Join(root, "ca2")
+		if err := os.MkdirAll(ca2, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		mustCA(t, ca2)
+		if err := pki.GenerateHostCert(filepath.Join(ca2, "ca.crt"), filepath.Join(ca2, "ca.key"),
+			filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"), "lab", net.IPv4(10, 0, 0, 9)); err != nil {
+			t.Fatal(err)
+		}
+		kept := filepath.Join(dir, keptHostsDir, "lab")
+		if err := os.MkdirAll(kept, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for _, n := range []string{"crt", "key"} {
+			if err := os.Link(filepath.Join(dir, "ca."+n), filepath.Join(kept, "host."+n)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		prev := mustParseCert(t, filepath.Join(dir, "ca.crt"))
+		before := dirSnapshot(t, root)
+		err := removeCAMachineCopy(dir, "lab", prev)
+		if err == nil || !strings.Contains(err.Error(), "was left") || !strings.Contains(err.Error(), "ca.key") {
+			t.Errorf("removeCAMachineCopy(lab) = %v, want the kept link to ca.key left and said", err)
+		}
+		sameTree(t, "lab", root, before)
+	})
 }

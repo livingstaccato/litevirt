@@ -183,16 +183,16 @@ func TestCreateVM_AFailedCreateKeepsFirmwareStateItDidNotMake(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if err := lv.WriteRetainedFirmwareMarker(s.dataDir, name, "kept-uuid"); err != nil {
+		if err := s.fw().WriteRetainedFirmwareMarker(name, "kept-uuid"); err != nil {
 			t.Fatal(err)
 		}
 	}
 	survives := func(t *testing.T, s *Server, name string, vars bool) {
 		t.Helper()
-		if vars && !lv.HasNvram(s.dataDir, name) {
+		if vars && !s.fw().HasNvram(name) {
 			t.Error("the kept UEFI vars were removed")
 		}
-		if u, ok := lv.ReadRetainedFirmwareMarker(s.dataDir, name); !ok || u != "kept-uuid" {
+		if u, ok := s.fw().ReadRetainedFirmwareMarker(name); !ok || u != "kept-uuid" {
 			t.Errorf("the retained-firmware marker = %q, %v; want it kept", u, ok)
 		}
 	}
@@ -240,7 +240,7 @@ func TestCreateVM_AFailedCreateKeepsFirmwareStateItDidNotMake(t *testing.T) {
 			t.Fatal("the create succeeded with the failure injected")
 		}
 		survives(t, s, "win", false)
-		if lv.HasNvram(s.dataDir, "win") {
+		if s.fw().HasNvram("win") {
 			t.Error("the vars this failed create made were left behind")
 		}
 	})

@@ -37,6 +37,22 @@ failed restart may need it, so not even --remove takes it. Once the VM is gone
 the host removes its copies when they are older than
 superseded_disk_retention_days (default 7; 0 keeps every copy).
 
+The firmware state (NVRAM, vTPM) the reconciler moved aside from a leftover
+domain whose VM now runs elsewhere is listed here too, as
+<data_dir>/fwmig-quarantine/<vm>-reconciled-<time> ("firmware state of VM
+<vm>"). It follows the same rule, and is also held while a live firmware move
+record or an open owed DISCARD names the VM. --remove takes it by its path.
+--restore <dir> puts its NVRAM and vTPM state back as the VM's own on this
+host; the VM must be stopped here, and the state it replaces is set aside as
+another such directory.
+
+A directory the reconciler has not finished (<vm>-reconciling-<uuid>), or a
+restore that was interrupted (<vm>-restoring-<uuid>), is held, and the VM's
+start on this host is refused while it exists. The reconciler finishes the
+first once its leftover domain is gone (it then becomes removable); while the
+VM's own domain is defined here, --restore <dir> puts the state back. Rerun
+--restore on an interrupted restore.
+
 --purge removes every copy that is neither retained nor held, whatever its
 age. Narrow it with --older-than.
 
@@ -93,7 +109,7 @@ operator removes it, by hand.`,
 					}
 					fmt.Fprintf(cmd.OutOrStdout(), "Restored %s as %s on %s.\n", resp.Restored, resp.RestoredTo, resp.Host)
 					if resp.SetAside != "" {
-						fmt.Fprintf(cmd.OutOrStdout(), "The disk it replaced is kept as %s.\n", resp.SetAside)
+						fmt.Fprintf(cmd.OutOrStdout(), "What it replaced is kept as %s.\n", resp.SetAside)
 					}
 					return nil
 				}

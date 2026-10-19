@@ -50,6 +50,7 @@
           <span class="mono muted">{{if .Cidr}}{{.Cidr}}{{else}}any{{end}}</span>
           <span>→</span>
           <span class="badge {{if eq .Action "accept"}}badge-green{{else}}badge-red{{end}}">{{.Action}}</span>
+          {{if .Log}}<span class="badge badge-gray" title="logs each packet it matches">log</span>{{end}}
           {{if .Comment}}<span class="muted" style="font-size:11px">{{.Comment}}</span>{{end}}
           {{if .StackName}}<span class="badge badge-gray" title="from compose stack">stack {{.StackName}}</span>{{end}}
           <button class="btn btn-sm btn-ghost" style="margin-left:auto" title="Remove rule"
@@ -78,11 +79,24 @@
           <span class="mono muted">{{if .Cidr}}{{.Cidr}}{{else}}any{{end}}</span>
           <span>→</span>
           <span class="badge {{if eq .Action "accept"}}badge-green{{else}}badge-red{{end}}">{{.Action}}</span>
+          {{if .Log}}<span class="badge badge-gray" title="logs each packet it matches">log</span>{{end}}
           {{if .Comment}}<span class="muted" style="font-size:11px">{{.Comment}}</span>{{end}}
           <button class="btn btn-sm btn-ghost" style="margin-left:auto" title="Remove rule"
                   hx-delete="/ui/firewall/host-rules/{{.Id}}" hx-confirm="Remove this host rule?">{{icon "delete"}}</button>
         </div>
       {{end}}
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header">
+      <div>
+        <h2 style="text-transform:none;color:var(--text);font-size:14px">SYN-flood protection</h2>
+        <span class="muted" style="font-size:11px">New TCP connections toward guest NICs, limited per NIC and source. "In force" is what each host's firewall applies; change it with <span class="mono">lv firewall synflood</span>.</span>
+      </div>
+    </div>
+    <div style="padding:8px 16px" id="fw-synflood-slot">
+      <button class="btn btn-sm" hx-get="/ui/firewall/synflood" hx-trigger="click" hx-target="#fw-synflood-slot" hx-swap="innerHTML">Ask every host</button>
     </div>
   </div>
 

@@ -171,3 +171,27 @@ func TestTagGroupName(t *testing.T) {
 		}
 	}
 }
+
+// C2: this build's own extensions take the server's log form at the writers'
+// grammar (StoredRule) when it names a verdict, and never at the client's
+// (Rule). A bare "+log" names no verdict and is refused, as is any suffix but
+// "+log".
+//
+// Mutations: leave LogAction nil — drop+log is refused, red; take a bare
+// "+log" — it passes, red.
+func TestRuleExtensions_ThisBuildTakesTheLogForm(t *testing.T) {
+	stored := func(action string) error { return StoredRule("ingress", "tcp", "22", "10.0.0.0/8", action, "") }
+	for _, a := range []string{"drop+log", "accept+log", "reject+log", "DROP+LOG"} {
+		if err := stored(a); err != nil {
+			t.Errorf("stored %q: %v", a, err)
+		}
+	}
+	for _, a := range []string{"+log", " +log", "drop+foo", "bogus+log", "drop+log+log", "drop +log"} {
+		if err := stored(a); err == nil {
+			t.Errorf("stored %q accepted", a)
+		}
+	}
+	if err := Rule("ingress", "tcp", "22", "10.0.0.0/8", "drop+log", ""); err == nil {
+		t.Error("a client drop+log passed the client grammar")
+	}
+}

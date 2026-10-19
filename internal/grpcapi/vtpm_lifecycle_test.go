@@ -422,7 +422,7 @@ func TestRestore_FirmwareMaterializeRollbackOnDefineFailure(t *testing.T) {
 		t.Fatalf("write src nvram: %v", err)
 	}
 	var buf bytes.Buffer
-	has, err := lv.WriteFirmwareBundle(s.dataDir, "src", "", &buf)
+	has, err := lv.NewFirmwareStore(s.dataDir).WriteFirmwareBundle("src", "", &buf)
 	if err != nil || !has {
 		t.Fatalf("WriteFirmwareBundle: has=%v err=%v", has, err)
 	}
@@ -441,7 +441,7 @@ func TestRestore_FirmwareMaterializeRollbackOnDefineFailure(t *testing.T) {
 	if status.Code(err) != codes.Internal {
 		t.Fatalf("expected Internal (define failed), got %v", err)
 	}
-	if lv.HasNvram(s.dataDir, "win") {
+	if s.fw().HasNvram("win") {
 		t.Error("materialized NVRAM must be wiped after a failed firmware restore")
 	}
 }

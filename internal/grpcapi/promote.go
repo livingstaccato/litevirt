@@ -832,6 +832,12 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	if s.virt == nil {
 		return status.Error(codes.FailedPrecondition, "no libvirt backend on this host")
 	}
+	// The promote defines (and may first destroy and undefine) a domain of
+	// the VM's name here: not one a live firmware move's record names
+	// (spec §6.9). Refused before any proof is claimed.
+	if err := s.firmwareMoveRefusal("promote", vm); err != nil {
+		return err
+	}
 	// Split-brain gate (Phase 1), EXECUTE side: the replica host must itself have
 	// local quorum to promote (a runtime-ownership action). A carried proof MARKER
 	// forces the gate even if THIS host hasn't latched enforcement — an asymmetric
@@ -1635,10 +1641,17 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	if renamed {
 		renamedNICs = spec.Network
 	}
+	macs := s.newMACAllocator()
 	for i, n := range renamedNICs {
-		mac := lv.GenerateMAC()
+		var mac string
 		if adoptedMACs != nil {
 			mac = adoptedMACs[i] // the running guest's NIC
+		} else {
+			var merr error
+			if mac, merr = macs.next(ctx); merr != nil {
+				removeLive()
+				return merr
+			}
 		}
 		// The spec records the NIC's real MAC (as a clone does), so its queues
 		// are matched at every later redefine, not lost to the source's MAC.
@@ -1763,6 +1776,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				Phase: pb.PromoteReplicaProgress_DEFINING, VmName: targetName, Host: s.hostName,
 				Replica: replica, DiskPath: livePath, Status: "defining domain" + multiDiskNote,
 			})
+			s.forgetMoveRecords(ctx, targetName) // the promoted domain takes the name
 			setFlightUUID(spec.Uuid)
 			if err := s.virt.DefineDomain(domXML); err != nil {
 				return "define domain", err
@@ -1803,6 +1817,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 					s.unfenceOperatorStart(opClaim)
 				}
 				return "shared disk released", status.Error(codes.FailedPrecondition, gerr.Error())
+			}
+			if eerr := health.NoteStartEvent(ctx, s.db, s.hostName, targetName); eerr != nil {
+				slog.Warn("promote: recording the start event failed", "vm", targetName, "error", eerr)
 			}
 			startErr := s.virt.StartDomain(targetName)
 			releaseGuard()

@@ -101,9 +101,15 @@ lv cluster claim-release <kind>/<name>       # Release one workload ha.claim.leg
                                    #   legacy proof stuck in flight on a live destination; the
                                    #   destination confirms nothing runs it, then abandons it (admin)
 lv health [--resolved]             # Cluster health: overall + conditions + coverage (exit 0/1/2)
-lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept-stale-uefi-vars]
-                                   # Resolve one open dual-run condition by hand (admin, audited; re-raised next
-                                   #   pass if it still holds), or accept nvram_flush_failed's vars stores as stale
+lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH] [--force] [--accept-stale-uefi-vars]
+                                   # Resolve one open dual-run condition by hand (admin, audited); re-raised next
+                                   #   pass if it still holds; or a vm.move_unresolved (--reason required) on its
+                                   #   holding host, or once that host is proven powered off; --accept picks the
+                                   #   file to keep of one disk (repeat per disk; required for a move with no pivot
+                                   #   recorded, unless the holder owns the VM and its config and record name
+                                   #   the source); --force keeps a forked history's file although the other
+                                   #   was modified after it; or accept nvram_flush_failed's vars stores as stale
+                                   #   (--accept-stale-uefi-vars)
 ```
 
 ## Hosts
@@ -131,10 +137,12 @@ lv host shutdown-workloads <host>         # Stop VMs in reverse startup-order (h
 lv host undrain <host> [--failback]       # Return a draining, maintenance, fenced or offline host to scheduling (--failback: wait for the failback it started and print results)
 lv host failback <host> [--all] [--dry-run] [--follow]   # Live-migrate VMs a drain moved away back to the host
 lv host rm <host> [--force]               # Remove host (--force with running VMs); revokes its cert
-lv host rm --dead <host> [--dry-run]      # Remove a host fenced proof-grade and gone for good: checks the
+lv host rm --dead <host> [--dry-run] [--force]  # Remove a host fenced proof-grade and gone for good: checks the
                                           #   fence, `voter rm` if it votes, revokes + publishes the CRL,
                                           #   removes it, and reports the stranded recoveries that now retry
-                                          #   at the next claim attempt. --dry-run changes nothing
+                                          #   at the next claim attempt. --dry-run changes nothing. Refused
+                                          #   while a firmware VM's live move to the host is not settled
+                                          #   (`lv doctor firmware-move <vm>`); --force removes it anyway
 lv host publish-crl                       # Re-publish this machine's crl.pem if `host rm` could not
 lv host renew-cert <host>                 # Renew a host's cluster certificate in place: key made on
   [--ssh root@<addr>] [--keep-old]        #   the host, one atomic switch, served without a restart,
@@ -463,7 +471,7 @@ than silently breaking BitLocker. The explicit refusals:
 | revert with no captured firmware | refused (a pre-firmware/older snapshot can't be reverted safely) |
 | backup | snapshot backup only; the legacy raw stream backup is refused. Running VMs are refused — **stop the VM** to back up its firmware consistently. Multi-disk firmware VMs are not supported yet |
 | clone | gets a **fresh** vTPM + fresh NVRAM (the secret is never copied) — a cloned BitLocker guest needs its recovery key |
-| live migration | refused — use cold migration |
+| live migration | supported for a **running** VM between hosts with equal firmware code; its NVRAM and vTPM state move with it and are verified on the target (see [migration-failover.md](migration-failover.md#secure-boot--vtpm-vms)) |
 | cold migration | supported for a **stopped** VM; its host-local disks are copied as for any stopped VM, and its firmware is captured quiescent and carried to the target. PCI-passthrough firmware VMs are not supported yet |
 | host drain | a stopped VM is moved as cold migration moves it, host-local disks included; a running one is refused — stop it (`lv stop <vm>`), then drain again or `lv migrate <vm> <target-host> --cold` |
 | automatic failover (host died) | skipped — firmware is host-local and died with the host; recover via restore from a firmware-carrying backup |
@@ -738,6 +746,9 @@ lv resolve-pit-overlay <vm> <disk>                       # Admin: the verdict on
 lv resolve-pit-overlay <vm> <disk> --commit --confirm    # Commit it; refused unless the verdict says it is safe (--force-commit overrides, experts only)
 lv resolve-pit-overlay <vm> <disk> --commit --force-commit --overwrite-newer-writes --confirm  # Expert only: commit an overlay already in the disk, over the guest's newer writes
 lv resolve-pit-overlay <vm> <disk> --discard --confirm   # Discard it; of a half-written disk only with --accept-torn-disk
+lv pit-overlays ls [--host <h>] [--vm <vm>]              # Set-aside overlays (.<disk file>.lv-pit.orphan-<time>) of a host's VMs, on their host; IN USE says why one is kept
+lv pit-overlays rm <vm> <disk> <name> [--yes]            # Admin, audited, asks first: remove one and its binding; refused while in use (see backups.md)
+lv pit-overlays rm --host <h> --path <path> [--yes]      # Admin, audited, asks first: remove a DETACHED one (no live disk where it was set aside)
 
 # Migrate every VM's volumes in a stack to a different pool (rolling, online):
 lv stack migrate-volumes <stack> --to <pool>
@@ -1030,12 +1041,15 @@ rather than unlink. Two cases keep every file:
 - the delete is **refused**, naming the VMs, while another VM (a linked clone)
   backs on the snapshot's overlay or on the disk it was taken of;
 - a snapshot libvirt does not hold as current and that has no children — as
-  a restore by an earlier build left one — is deleted as metadata only, with a
-  warning in the log: the VM keeps its backing chain, and the space is not
-  reclaimed;
+  a restore by an earlier build left one — is deleted as metadata only: the VM
+  keeps its backing chain, and the space is not reclaimed;
 - so is a snapshot libvirt cannot merge because its overlay is no longer in
   the VM's live chain. Restoring an older snapshot while a later one exists
   leaves the restored one so: its overlay file stays on disk, unused.
+
+A metadata-only delete says so: `lv snapshot rm` prints a warning naming the
+files it kept and their size, and the VM gets the event `snapshot.files-kept`
+(`lv events <vm>`). Nothing is lost, and no `lv` command reclaims that space.
 
 Restoring an older snapshot while a later one exists puts the VM on a new
 overlay (`<disk>.<snapshot>-r<time>`) directly on the disk that snapshot was
@@ -1227,6 +1241,10 @@ lv replication replicas <container> --target-pool <repo> [--host <h>] [--project
   [--restore <timestamp>]  # lay that replica down as the container, stopped (never a second copy)
   [--remove <timestamp>]   # a SET-ASIDE or ORPHANED replica to remove (repeatable; asks first)
   [--yes]                  # remove without asking
+
+# Incremental-replication checkpoint rows (the anchor of each VM's chain into a pool).
+lv replication checkpoints ls [--vm <vm>]                # IN USE: a live schedule uses it; VM DELETED: the VM has no live row
+lv replication checkpoints rm <vm> --target-pool <pool>  # Admin, audited: refused while a live schedule uses it; run on the VM's host, which drops its bitmap (printed); the next run is a full copy
 
 # Disaster recovery: bring a VM up from its replica.
 lv replication promote <vm>
@@ -1442,13 +1460,13 @@ all six quota dimensions. See `docs/tenancy.md`.
 ## Security groups and firewall
 
 ```bash
-lv sg create <name>
-lv sg ls
+lv sg create <name> [--project <p>]   # --project: owned by p; only p's workloads may bind it
+lv sg ls [--project <p>]              # --project: p's groups and the global ones
 lv sg rm <id>
 lv sg rule-add <sg-id-or-name> --direction ingress|egress --proto tcp \
-    --port <p> --cidr <c> [--action accept|drop|reject] [--priority N]
+    --port <p> --cidr <c> [--action accept|drop|reject] [--priority N] [--log]
 lv sg rule-add <sg-id-or-name> --macro <name> [--cidr <c>] [--direction ingress|egress] \
-    [--action accept|drop|reject] [--priority N]    # one rule per macro row; prints every id
+    [--action accept|drop|reject] [--priority N] [--log]    # one rule per macro row; prints every id
 lv sg rule-ls <sg-id-or-name>
 lv sg rule-rm <rule-id>       # Takes the RULE id from rule-ls, not the group id
 lv sg bind <vm> --network <name> --sg <name> [--sg <name>...]   # Bind SGs to a VM NIC
@@ -1471,15 +1489,15 @@ lv firewall reload            # Force the reconciler to re-read state and apply 
 
 # Cluster-tier rules (apply to every NIC on every host):
 lv firewall cluster-rule add --direction ingress|egress --proto tcp \
-    --port <p> --cidr <c> [--action accept|drop|reject] [--comment <s>] [--priority N]
-lv firewall cluster-rule add --macro <name> [--direction ...] [--cidr <c>] [--action ...] [--comment <s>]
+    --port <p> --cidr <c> [--action accept|drop|reject] [--comment <s>] [--priority N] [--log]
+lv firewall cluster-rule add --macro <name> [--direction ...] [--cidr <c>] [--action ...] [--comment <s>] [--log]
 lv firewall cluster-rule ls
 lv firewall cluster-rule rm <id>
 
 # Host-tier rules (apply to every NIC on one host):
 lv firewall host-rule add --host <name> --direction ingress|egress --proto tcp \
-    --port <p> --cidr <c> [--action accept|drop|reject] [--comment <s>] [--priority N]
-lv firewall host-rule add --host <name> --macro <name> [--direction ...] [--cidr <c>] [--action ...] [--comment <s>]
+    --port <p> --cidr <c> [--action accept|drop|reject] [--comment <s>] [--priority N] [--log]
+lv firewall host-rule add --host <name> --macro <name> [--direction ...] [--cidr <c>] [--action ...] [--comment <s>] [--log]
 lv firewall host-rule ls [--host <name>]
 lv firewall host-rule rm <id>
 
@@ -1490,6 +1508,8 @@ lv firewall ipset rm <id>
 
 # Default forward policy (deny = drop anything not explicitly accepted):
 lv firewall default-deny <on|off> [--scope <host>]   # no --scope = cluster-wide
+  # --scope names a host lv host ls shows (an unknown name is refused). A host named
+  # cluster cannot have its own default-deny: --scope cluster is then refused.
 
 # NIC guards (anti-spoofing). New NICs are guarded by default; relaxing one
 # needs network.update on its network. --allow replaces the list (repeatable).
@@ -1503,6 +1523,24 @@ lv firewall nic-guard resume <vm> # let a VM held paused for its guards run, gua
 lv firewall enforce status          # mode per host + would-drop totals per workload, NIC and rule, since <time>
 lv firewall enforce on              # enforce (admin, audited); off = observe
 lv firewall enforce reset-counters  # restart every host's would-drop totals from now (admin, audited)
+
+# Logging (docs/firewall.md, "Logging"). --log on a rule-add logs each packet the rule
+# matches; rule ls shows such a rule's action as "<verdict> log". lv asks the daemon first
+# and refuses --log against one that predates logging; an --action holding "+" is refused.
+lv firewall log-policy status                                          # the cluster's policy, then each host's
+lv firewall log-policy on  [--scope <host>] [--rate N] [--burst N]     # log each NIC's default verdict
+lv firewall log-policy off [--scope <host>] [--rate N] [--burst N]     # logged rules still log
+lv firewall log-policy inherit --scope <host>                           # clear a host's own policy
+lv firewall log [--host <h>] [--workload <name>] [--since 15m] [--limit 200] [--follow]
+  # TIME HOST WORKLOAD DEVICE SIDE RULE VERDICT PROTO SRC DST LEN, merged by time across every
+  # active host (a host that does not answer is named on stderr); --follow polls from each
+  # host's newest sequence. Needs firewall.log.view at / (Admin; docs/auth.md).
+  # --rate is log records per second per guest NIC side (1-10000, default 5); --burst is
+  # packets (1-10000, default 10). Every logged line of one NIC side shares that budget.
+  # Role operator; audited as firewall.log_policy; refused until the cluster upgrade has finished.
+  # --scope names a host, a host named "cluster" included; leave it out for the cluster-wide
+  # policy. status shows a row the daemon cannot read, or a host inheriting one, as
+  # "unreadable (read as off at 5/10)"; the API returns such a row with rate 0 and burst 0.
 
 # Firewall tags: per-workload key/value pairs, kept apart from labels (sg.write to change; audited).
 lv firewall tag set <vm> <key>=<value>...                          # adds or replaces keys
@@ -1524,6 +1562,15 @@ lv firewall tag-group rm <name> [--force]
   # before sending a tag: cidr (a rule, a compose file, or a gitops file that may hold one) and
   # refuses unless the daemon shows it knows tag groups.
   # A member leaving a group does not cut its open connections (docs/firewall.md, "Tag groups").
+
+# SYN-flood protection on guest NICs (docs/firewall.md, "SYN-flood protection")
+lv firewall synflood status                     # cluster policy, then per host: policy, in force (on/ipv4-only/ipv6-only/observe/guards-only/no-guest-nics/unavailable/off/predates), rate, burst, drops v4/v6 since its last reload
+lv firewall synflood on [--rate 200] [--burst 1000] [--scope <host>]   # no --scope = cluster-wide
+lv firewall synflood off [--scope <host>]
+lv firewall synflood inherit --scope <host>     # clear a host's own policy; the cluster's applies
+  # on, off and inherit need the operator role, are audited (firewall.synflood) and are refused
+  # until the cluster upgrade has finished. --rate is new SYNs per second per guest NIC and source
+  # address, --burst packets; each 1-100000.
 ```
 
 See `docs/firewall.md` for the three-tier model, where each tier is enforced
@@ -1549,12 +1596,28 @@ lv health [--resolved]                       # Cluster health: overall state, ac
                                              #   evaluator coverage, connectivity, capacity.
                                              #   --resolved includes the 30-day resolved history.
                                              #   Exit code: 0 healthy · 1 degraded/unknown · 2 critical.
-lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E]
+lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH] [--force]
                                              # Resolve one open dual-run condition by hand, named as
                                              #   `lv health` prints it. Admin (cluster.health.resolve),
                                              #   audited, ha.condition.resolved event. Refused until a
                                              #   detector scan after its last sighting probed every host
                                              #   it names; raised again next pass if it still holds.
+                                             #   Also vm.move_unresolved (an unresolved volume move),
+                                             #   with --reason: on the host holding its record, or once
+                                             #   that host is proven powered off. --accept PATH points
+                                             #   a disk record at one of its move's two files first, on
+                                             #   the VM's owner; once per disk, and required for a
+                                             #   move with no pivot recorded unless the holder owns
+                                             #   the VM and its config and record name the source.
+                                             #   On the owner the domain's config must name each file
+                                             #   kept, and a running domain's record is not changed.
+                                             #   After a pivot only the copy is accepted, unless the VM
+                                             #   changed hands since the move began (a forked
+                                             #   history, on the owner): a record, and a shut-off
+                                             #   domain's config, on the copy are pointed at the
+                                             #   source; refused while the file not kept was
+                                             #   modified later, unless --force.
+                                             #   `lv health` lists the moves first (docs/diagnostics.md).
 lv health resolve nvram_flush_failed host/<host> --accept-stale-uefi-vars --reason R
                                              # Accept that the UEFI vars stores nvram_flush_failed names
                                              #   may be stale, for a VM kept as it is. Admin, audited
@@ -1571,6 +1634,14 @@ lv doctor divergence [--json] [--table <name>]... [--include-sensitive]   # Repo
 lv doctor repair-owner <vm> <host>           # Re-assert a VM's owner on the host that actually runs it (audited)
 lv doctor fence                              # Report whether a shared-disk VM's cross-host transfer would be fenced and whether every host enforces recovery claims (read-only)
 lv doctor privileged-containers              # Report privileged or legacy-confined containers (read-only)
+lv doctor firmware-move <vm> [--json]        # Show a live firmware migration's records on every host, with every hash and path (read-only)
+lv doctor firmware-move <vm> --accept-target | --reverify | --adopt-target-copy | --discard-target [--stop-target]
+lv doctor firmware-move <vm> --adopt-target-copy --acknowledge-rollback   # keep a leftover as the VM's own (older state)
+lv doctor firmware-move <vm> --accept-source [--acknowledge-rollback] [--stop-target]
+lv doctor firmware-move <vm> --confirm-target-nvram --accept-nvram-hash=<sha256>
+lv doctor firmware-move <vm> --push-source-nvram [--acknowledge-rollback] [--stop-target]
+lv doctor firmware-move <vm> --resolve unverified|quarantine
+                                             # Resolve a parked live firmware move (admin, vm.firmware-move; audited)
 ```
 
 `divergence` is read-only, and lists a lease-term tie that every host has
@@ -1579,6 +1650,13 @@ audited, admin-gated repair for an equal-timestamp ownership split a stationary 
 splits are reclaimed automatically by the runtime-repair reconcilers — see
 `docs/diagnostics.md` for the full model (categories, metrics, alerts, and the
 operational repair flow).
+
+`firmware-move` resolves a live Secure Boot / vTPM migration that parked, on
+the host whose record it acts on, by the move's state: see
+[Live firmware migration](diagnostics.md#live-firmware-migration-firmware_migration_)
+for which action takes which state. It refuses an action the state has no row
+for. `--acknowledge-rollback` is required where the source's copy may be older
+than the target's.
 
 ## Ansible integration
 

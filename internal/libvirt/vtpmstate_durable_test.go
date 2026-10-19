@@ -29,10 +29,10 @@ func recordDirSyncs(t *testing.T, fail func(string) error) *[]string {
 
 func bundleOf(t *testing.T, nvram, tpm bool) *bytes.Buffer {
 	t.Helper()
-	src := t.TempDir()
+	src := storeAt(t.TempDir(), t.TempDir())
 	seedFirmware(t, src, "src", "uuid-s", nvram, tpm)
 	var buf bytes.Buffer
-	if _, err := WriteFirmwareBundle(src, "src", "uuid-s", &buf); err != nil {
+	if _, err := src.WriteFirmwareBundle("src", "uuid-s", &buf); err != nil {
 		t.Fatal(err)
 	}
 	return &buf
@@ -42,14 +42,15 @@ func bundleOf(t *testing.T, nvram, tpm bool) *bytes.Buffer {
 // before it is renamed into place, the directory a new nvram dir was made in,
 // and both directories the renames changed.
 func TestReadFirmwareBundle_FsyncsEveryDirectoryItChanges(t *testing.T) {
-	base := redirectSwtpmBase(t)
+	base := t.TempDir()
 	buf := bundleOf(t, true, true)
 	calls := recordDirSyncs(t, nil)
 	dst := t.TempDir()
-	if err := ReadFirmwareBundle(buf, dst, "dst", "uuid-d"); err != nil {
+	st := storeAt(base, dst)
+	if err := st.ReadFirmwareBundle(buf, "dst", "uuid-d"); err != nil {
 		t.Fatal(err)
 	}
-	nvramDir := filepath.Dir(NvramPath(dst, "dst"))
+	nvramDir := filepath.Dir(st.NvramPath("dst"))
 	for _, want := range []string{dst, nvramDir, base} {
 		if !slices.Contains(*calls, want) {
 			t.Errorf("no fsync of %s; calls %v", want, *calls)
@@ -71,11 +72,11 @@ func TestReadFirmwareBundle_FsyncsEveryDirectoryItChanges(t *testing.T) {
 // the swtpm directory, after the nvram directory's succeeded, must not leave
 // the new NVRAM on disk beside the old swtpm state.
 func TestReadFirmwareBundle_RollbackIsFsynced(t *testing.T) {
-	base := redirectSwtpmBase(t)
+	base := t.TempDir()
 	buf := bundleOf(t, true, true)
-	dst := t.TempDir()
-	seedFirmware(t, dst, "dst", "uuid-d", true, true)
-	if err := os.WriteFile(NvramPath(dst, "dst"), []byte("OLD-NVRAM"), 0o600); err != nil {
+	st := storeAt(base, t.TempDir())
+	seedFirmware(t, st, "dst", "uuid-d", true, true)
+	if err := os.WriteFile(st.NvramPath("dst"), []byte("OLD-NVRAM"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	failed := false
@@ -86,13 +87,13 @@ func TestReadFirmwareBundle_RollbackIsFsynced(t *testing.T) {
 		}
 		return nil
 	})
-	if err := ReadFirmwareBundle(buf, dst, "dst", "uuid-d"); err == nil {
+	if err := st.ReadFirmwareBundle(buf, "dst", "uuid-d"); err == nil {
 		t.Fatal("restore succeeded although the swtpm directory fsync failed")
 	}
-	if got, _ := os.ReadFile(NvramPath(dst, "dst")); string(got) != "OLD-NVRAM" {
+	if got, _ := os.ReadFile(st.NvramPath("dst")); string(got) != "OLD-NVRAM" {
 		t.Fatalf("nvram after the rollback = %q, want OLD-NVRAM", got)
 	}
-	nvramDir := filepath.Dir(NvramPath(dst, "dst"))
+	nvramDir := filepath.Dir(st.NvramPath("dst"))
 	at := slices.Index(*calls, base)
 	if at < 0 || !slices.Contains((*calls)[at+1:], nvramDir) || !slices.Contains((*calls)[at+1:], base) {
 		t.Fatalf("the rollback's renames were not fsynced: %v", *calls)
@@ -102,23 +103,22 @@ func TestReadFirmwareBundle_RollbackIsFsynced(t *testing.T) {
 // A backup left by an interrupted earlier restore holds the state from before
 // it, and is the only copy of that state: a retry keeps it.
 func TestReadFirmwareBundle_KeepsABackupLeftByAnEarlierAttempt(t *testing.T) {
-	redirectSwtpmBase(t)
 	buf := bundleOf(t, true, true)
 	recordDirSyncs(t, nil)
-	dst := t.TempDir()
-	seedFirmware(t, dst, "dst", "uuid-d", true, true)
-	nvBak := NvramPath(dst, "dst") + ".bak"
+	st := storeAt(t.TempDir(), t.TempDir())
+	seedFirmware(t, st, "dst", "uuid-d", true, true)
+	nvBak := st.NvramPath("dst") + ".bak"
 	if err := os.WriteFile(nvBak, []byte("ORIGINAL-NVRAM"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	tpmBak := LibvirtSwtpmDir("uuid-d") + ".bak"
+	tpmBak := st.SwtpmDir("uuid-d") + ".bak"
 	if err := os.MkdirAll(tpmBak, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(tpmBak, "marker"), []byte("ORIGINAL-TPM"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := ReadFirmwareBundle(buf, dst, "dst", "uuid-d"); err != nil {
+	if err := st.ReadFirmwareBundle(buf, "dst", "uuid-d"); err != nil {
 		t.Fatal(err)
 	}
 	found := func(glob, want string) bool {
@@ -141,12 +141,11 @@ func TestReadFirmwareBundle_KeepsABackupLeftByAnEarlierAttempt(t *testing.T) {
 // A swtpm base directory the restore had to make is fsynced into its parent,
 // as the new nvram directory is.
 func TestReadFirmwareBundle_FsyncsANewSwtpmBase(t *testing.T) {
-	redirectSwtpmBase(t)
 	buf := bundleOf(t, true, true) // made under another base, so this one is new
 	parent := t.TempDir()
-	libvirtSwtpmBase = filepath.Join(parent, "swtpm")
+	st := storeAt(filepath.Join(parent, "swtpm"), t.TempDir())
 	calls := recordDirSyncs(t, nil)
-	if err := ReadFirmwareBundle(buf, t.TempDir(), "dst", "uuid-d"); err != nil {
+	if err := st.ReadFirmwareBundle(buf, "dst", "uuid-d"); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Contains(*calls, parent) {
@@ -157,17 +156,16 @@ func TestReadFirmwareBundle_FsyncsANewSwtpmBase(t *testing.T) {
 // Moving an earlier attempt's backup aside is fsynced at once, before
 // anything else in the restore can fail.
 func TestReadFirmwareBundle_KeptBackupRenameIsFsynced(t *testing.T) {
-	redirectSwtpmBase(t)
 	buf := bundleOf(t, true, false)
-	dst := t.TempDir()
-	seedFirmware(t, dst, "dst", "uuid-d", true, false)
-	nvBak := NvramPath(dst, "dst") + ".bak"
+	st := storeAt(t.TempDir(), t.TempDir())
+	seedFirmware(t, st, "dst", "uuid-d", true, false)
+	nvBak := st.NvramPath("dst") + ".bak"
 	if err := os.WriteFile(nvBak, []byte("ORIGINAL-NVRAM"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	nvramDir := filepath.Dir(NvramPath(dst, "dst"))
+	nvramDir := filepath.Dir(st.NvramPath("dst"))
 	calls := recordDirSyncs(t, nil)
-	if err := ReadFirmwareBundle(buf, dst, "dst", "uuid-d"); err != nil {
+	if err := st.ReadFirmwareBundle(buf, "dst", "uuid-d"); err != nil {
 		t.Fatal(err)
 	}
 	n := 0

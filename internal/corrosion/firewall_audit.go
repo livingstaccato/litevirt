@@ -102,6 +102,11 @@ func ruleCore(direction, proto, port, cidr, action string, priority int) string 
 	if cidr == "" {
 		cidr = "any"
 	}
+	// A logged rule shows its plain verdict and "log", never the stored
+	// suffix (spec m-13).
+	if verdict, logged := SplitLoggedAction(action); logged {
+		action = verdict + " log"
+	}
 	return fmt.Sprintf("%s %s port=%s cidr=%s %s priority=%d", direction, proto, port, cidr, action, priority)
 }
 
@@ -212,7 +217,8 @@ func SecurityGroupAuditState(ctx context.Context, c *Client, id string) string {
 	}
 	// Rules stored under the group's name go with it on delete (see
 	// DeleteSecurityGroupWithLegacyRules), so the record of what it allowed includes them.
-	if sg.Name != "" && sg.Name != id {
+	// A project's group adopts none, and its delete leaves them.
+	if sg.Name != "" && sg.Name != id && sg.Project == "" {
 		legacy, lerr := ListSGRules(ctx, c, sg.Name)
 		if lerr != nil {
 			return AuditUnknown(lerr)

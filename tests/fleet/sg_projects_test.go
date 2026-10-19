@@ -327,3 +327,68 @@ func TestFleet_SGProjects_AContainerRestoreRefusesAnotherProjectsGroup(t *testin
 		t.Fatalf("a refused restore landed a row on %s: %+v", dst.Name, row)
 	}
 }
+
+// TestFleet_StackFirewall_ALaggingEntryNodeCannotTearItDown: an Operator
+// without sg.write runs `lv compose down` of a stack with a firewall against
+// a node the stack has not reached yet. That node's own view holds no
+// firewall rows, and a teardown it authorized would be replicated by name to
+// every node that holds them, whose sweep would then remove them. The node
+// fails closed: the down is refused, and once the node catches up the stack
+// and its firewall are whole everywhere.
+func TestFleet_StackFirewall_ALaggingEntryNodeCannotTearItDown(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 7203})
+	a, lag := c.Nodes[0], c.Nodes[2]
+	for _, n := range c.Nodes {
+		openNICGuards(t, n)
+	}
+	tok := scopedOperatorToken(t, c, a, "opal", "acme")
+	c.WaitConverged(t, convergeTimeout)
+	// Every node's engine sees opal's binding, so none falls back to the
+	// cluster-wide legacy role for her.
+	for _, n := range c.Nodes {
+		e := auth.NewEngine(n.DB)
+		if err := e.Reload(ctx); err != nil {
+			t.Fatal(err)
+		}
+		n.Server.SetAuthEngine(e)
+	}
+
+	c.Isolate(lag)
+	deployAndDrain(t, ctx, c.SelfClient(a), &pb.DeployStackRequest{ComposeYaml: `name: edge
+security-groups:
+  web:
+    rules:
+      - {direction: ingress, proto: tcp, port: "80", action: accept}
+firewall:
+  default-deny: true
+`})
+	if g, _ := corrosion.ListSecurityGroups(ctx, a.DB, "edge"); len(g) != 1 {
+		t.Fatalf("fixture: the stack's group is not on %s: %+v", a.Name, g)
+	}
+	if st, _ := corrosion.GetStack(ctx, lag.DB, "edge"); st != nil {
+		t.Fatalf("fixture: %s is not lagging, it holds the stack", lag.Name)
+	}
+
+	st, err := c.bearerClient(lag, tok).DeleteStack(ctx, &pb.DeleteStackRequest{Name: "edge"})
+	if err == nil {
+		_, err = st.Recv()
+	}
+	if status.Code(err) != codes.PermissionDenied || !strings.Contains(err.Error(), "lv role grant NetworkAdmin") {
+		t.Fatalf("an Operator's compose down on the lagging %s: %v, want PermissionDenied naming the grant", lag.Name, err)
+	}
+
+	c.ClearLinkFaults()
+	c.WaitConverged(t, convergeTimeout)
+	for _, n := range c.Nodes {
+		if st, _ := corrosion.GetStack(ctx, n.DB, "edge"); st == nil || st.State == "deleting" {
+			t.Errorf("%s: the stack is %+v after the refused down", n.Name, st)
+		}
+		if g, _ := corrosion.ListSecurityGroups(ctx, n.DB, "edge"); len(g) != 1 {
+			t.Errorf("%s: the stack's groups are %+v after the refused down", n.Name, g)
+		}
+		if d, _ := corrosion.GetFirewallDefault(ctx, n.DB, "cluster"); d == nil || !d.DefaultDeny {
+			t.Errorf("%s: the cluster default is %+v after the refused down", n.Name, d)
+		}
+	}
+}

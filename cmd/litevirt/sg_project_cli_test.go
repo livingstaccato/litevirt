@@ -172,3 +172,34 @@ func TestSGCLI_ProjectProbePassesAgainstThisBuildForAScopedToken(t *testing.T) {
 		t.Fatalf("lv sg ls --project teamA with a token scoped to teamA: %v", err)
 	}
 }
+
+// failingProbeDaemon answers the probe with an error a current daemon can
+// give for reasons of its own.
+type failingProbeDaemon struct {
+	pb.UnimplementedLiteVirtServer
+	created int
+}
+
+func (d *failingProbeDaemon) ListSecurityGroups(context.Context, *pb.ListSecurityGroupsRequest) (*pb.ListSecurityGroupsResponse, error) {
+	return nil, status.Error(codes.Internal, "database is locked")
+}
+
+func (d *failingProbeDaemon) CreateSecurityGroup(context.Context, *pb.CreateSecurityGroupRequest) (*pb.SecurityGroup, error) {
+	d.created++
+	return &pb.SecurityGroup{Id: "sg-1"}, nil
+}
+
+// An error the probe does not expect is reported as what it is, not as an old
+// daemon, and --project still stops before anything is created.
+func TestSGCLI_AnUnexpectedProbeErrorIsReportedAsItIs(t *testing.T) {
+	d := &failingProbeDaemon{}
+	sgCLIDaemon(t, d, nil, "")
+	noLocalDB(t)
+	_, err := runSGCLI(t, "create", "a-web", "--project", "acme")
+	if err == nil || strings.Contains(err.Error(), "predates") || !strings.Contains(err.Error(), "database is locked") {
+		t.Fatalf("lv sg create --project with a failing probe: %v, want the daemon's own error and no 'predates'", err)
+	}
+	if d.created != 0 {
+		t.Fatalf("created %d groups after a failed probe", d.created)
+	}
+}

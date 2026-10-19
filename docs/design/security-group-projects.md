@@ -36,6 +36,17 @@ A group's path is `/` for a global group and
 | `AddSecurityGroupRule` of an IPv6, logged or tag-group rule on a project group | also `sg.write` at `/`: it records a cluster-wide release-feature use, and a logged rule writes host logs |
 | `DeployStack` with a firewall block, or of a stack that owns firewall rows (a redeploy replaces or drops them) | `sg.write` at `/`: stack groups, ip sets and the default policy are global. Checked before anything changes; a dry run is not refused and reports that the real run would be |
 | `DeleteStack` (`lv compose down`) of a stack that owns firewall rows | `sg.write` at `/`, checked before anything is torn down, so a refused down leaves the stack whole |
+
+A stack "has a firewall" when it owns a firewall row on the entry node or its
+stored file declares a firewall block (a default-deny it only asks for while
+another stack owns the row decides whether that deny is handed on). The entry
+node's replica may lag, and a teardown it authorizes is replicated by name, so
+it fails closed: a stored file it cannot read counts as a firewall, and a
+teardown of a stack it holds no record of needs `sg.write` at `/` too. The
+orphan sweep (`SweepOrphanStackRows`) is unchanged: it cannot tell a checked
+teardown from an unchecked one without a new column, and with these checks a
+non-root teardown is authorized only where the entry node holds the stack and
+neither its file nor its rows show a firewall.
 | `ListSecurityGroups` | per row, below |
 
 `ListSecurityGroups`:

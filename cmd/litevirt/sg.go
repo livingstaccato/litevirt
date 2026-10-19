@@ -145,10 +145,16 @@ func requireSGProjects(ctx context.Context, c pb.LiteVirtClient, sub string) err
 		return nil
 	case err == nil:
 		return errSGProjectsUnsupported{sub, "it ignored the project of a listing"}
-	case status.Code(err) == codes.Unavailable || status.Code(err) == codes.Unauthenticated:
-		return fmt.Errorf("lv sg %s --project: could not ask the daemon whether it supports project security groups: %w", sub, err)
+	case status.Code(err) == codes.PermissionDenied:
+		// A previous build checks sg.read at the root before anything else;
+		// this one reads the project first.
+		return errSGProjectsUnsupported{sub, "it refused the listing before reading its project: " + status.Convert(err).Message()}
+	case status.Code(err) == codes.Unimplemented:
+		return errSGProjectsUnsupported{sub, "it has no security-group listing"}
 	}
-	return errSGProjectsUnsupported{sub, "it did not read the project of a listing: " + status.Convert(err).Message()}
+	// Anything else is the daemon failing for reasons of its own: say so,
+	// and still do nothing.
+	return fmt.Errorf("lv sg %s --project: could not ask the daemon whether it supports project security groups: %w", sub, err)
 }
 
 // sgRPCError explains an Unimplemented reply. A daemon older than the

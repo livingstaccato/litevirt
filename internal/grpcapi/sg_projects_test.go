@@ -517,3 +517,87 @@ func TestSGProjects_ListRefusesAMalformedProjectFirst(t *testing.T) {
 		}
 	}
 }
+
+const denyOnlyYAML = `name: denyonly
+firewall:
+  default-deny: true
+`
+
+// A stack whose only firewall is the cluster default-deny: an Operator's
+// redeploy without it, or its teardown, would turn the cluster default to
+// allow, so both need sg.write at the root.
+func TestStackFirewall_ADefaultDenyOnlyStackNeedsSGWriteAtTheRoot(t *testing.T) {
+	s, opal, ada := stackFirewallFixture(t)
+	if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: denyOnlyYAML}, &mockDeployStreamR2{ctx: ada}); err != nil {
+		t.Fatalf("Admin deploys the deny-only stack: %v", err)
+	}
+	// fwonly set the deny first and owns the row; take it down so denyonly
+	// owns it alone.
+	if err := s.DeleteStack(&pb.DeleteStackRequest{Name: "fwonly"}, &mockDeleteStream{ctx: ada}); err != nil {
+		t.Fatalf("Admin tears fwonly down: %v", err)
+	}
+	if d, _ := corrosion.GetFirewallDefault(context.Background(), s.db, "cluster"); d == nil || !d.DefaultDeny || d.StackName != "denyonly" {
+		t.Fatalf("the cluster default is %+v, want deny owned by denyonly", d)
+	}
+	err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: "name: denyonly\n"}, &mockDeployStreamR2{ctx: opal})
+	wantGrantHint(t, "an Operator drops a deny-only stack's firewall", err)
+	err = s.DeleteStack(&pb.DeleteStackRequest{Name: "denyonly"}, &mockDeleteStream{ctx: opal})
+	wantGrantHint(t, "an Operator tears a deny-only stack down", err)
+	if d, _ := corrosion.GetFirewallDefault(context.Background(), s.db, "cluster"); d == nil || !d.DefaultDeny {
+		t.Fatalf("a refused change turned the cluster default to %+v", d)
+	}
+	// The row alone counts: a stack that owns the deny row is held to it
+	// even when the file this node stores no longer asks for it (a newer
+	// file whose block was dropped by an Admin's deploy that has not
+	// finished here, say).
+	if err := corrosion.UpsertStack(context.Background(), s.db, corrosion.StackRecord{Name: "denyonly", ComposeYAML: "name: denyonly\n", State: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	err = s.DeployStack(&pb.DeployStackRequest{ComposeYaml: "name: denyonly\n"}, &mockDeployStreamR2{ctx: opal})
+	wantGrantHint(t, "an Operator redeploys a stack that owns the deny row but whose file does not ask", err)
+}
+
+// A stack whose file asks for default-deny while another stack owns the row
+// owns no firewall row, but withdrawing its ask decides whether the deny is
+// handed on: its file's firewall block counts.
+func TestStackFirewall_AStacksStoredBlockCountsWithoutRows(t *testing.T) {
+	s, opal, ada := stackFirewallFixture(t)
+	if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: denyOnlyYAML}, &mockDeployStreamR2{ctx: ada}); err != nil {
+		t.Fatalf("Admin deploys the second deny stack: %v", err)
+	}
+	if owns, _ := corrosion.StackOwnsFirewall(context.Background(), s.db, "denyonly"); owns {
+		t.Fatal("fixture: denyonly owns a firewall row; the test needs one that only asks")
+	}
+	err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: "name: denyonly\n"}, &mockDeployStreamR2{ctx: opal})
+	wantGrantHint(t, "an Operator withdraws a stack's deny ask", err)
+	err = s.DeleteStack(&pb.DeleteStackRequest{Name: "denyonly"}, &mockDeleteStream{ctx: opal})
+	wantGrantHint(t, "an Operator tears down a stack that asks for deny", err)
+}
+
+// A node whose replica lags: it holds the stack's record but none of its
+// firewall rows, or not even the record. Its own view must not authorize a
+// teardown that the tombstone then carries to every node holding the rows.
+func TestDeleteStack_ALaggingEntryNodeFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	s, opal, _ := stackFirewallFixture(t)
+	// Record and file present, rows not yet here.
+	if err := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{Name: "lagging", ComposeYAML: fwStackYAML, State: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	err := s.DeleteStack(&pb.DeleteStackRequest{Name: "lagging"}, &mockDeleteStream{ctx: opal})
+	wantGrantHint(t, "an Operator tears down a stack whose rows have not arrived", err)
+	// A file this node cannot read.
+	if err := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{Name: "garbled", ComposeYAML: "{{{not yaml", State: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	err = s.DeleteStack(&pb.DeleteStackRequest{Name: "garbled"}, &mockDeleteStream{ctx: opal})
+	wantGrantHint(t, "an Operator tears down a stack whose file cannot be read", err)
+	// No record at all here.
+	err = s.DeleteStack(&pb.DeleteStackRequest{Name: "elsewhere"}, &mockDeleteStream{ctx: opal})
+	wantGrantHint(t, "an Operator tears down a stack this node holds no record of", err)
+	for _, name := range []string{"lagging", "garbled"} {
+		if st, _ := corrosion.GetStack(ctx, s.db, name); st == nil || st.State == stackStateDeleting {
+			t.Fatalf("the refused down changed stack %s: %+v", name, st)
+		}
+	}
+}

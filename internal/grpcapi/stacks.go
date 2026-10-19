@@ -70,7 +70,7 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// create checks the same). Refused before anything is deployed; a dry run
 	// is not refused, and says the real run would be.
 	fwRefusal, fwErr := s.stackFirewallRefusal(ctx, f.Name,
-		len(f.SecurityGroups) > 0 || len(f.IPSets) > 0 || f.FirewallDefaults != nil, "deploying")
+		len(f.SecurityGroups) > 0 || len(f.IPSets) > 0 || f.FirewallDefaults != nil, "deploying", false)
 	if fwErr != nil {
 		return fwErr
 	}
@@ -1212,7 +1212,7 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	// sg.write at the cluster root: refused before anything is torn down, so
 	// the stack stays whole rather than losing its VMs and keeping orphaned
 	// firewall rows.
-	if refusal, err := s.stackFirewallRefusal(ctx, req.Name, false, "removing"); err != nil {
+	if refusal, err := s.stackFirewallRefusal(ctx, req.Name, false, "removing", true); err != nil {
 		return err
 	} else if refusal != nil {
 		return refusal
@@ -2826,24 +2826,59 @@ func (s *Server) provisionComposeNetworks(ctx context.Context, f *compose.File) 
 // stackFirewallRefusal is the refusal of a stack change that writes global
 // firewall state without sg.write at the cluster root, or nil when it may
 // proceed. The change writes that state when the new file declares a firewall
-// (declares) or the stack already owns firewall rows, which a redeploy
-// replaces or drops and a teardown removes. The refusal names the grant that
-// fixes it. A failure to read the stack's rows is returned as err.
-func (s *Server) stackFirewallRefusal(ctx context.Context, stack string, declares bool, verb string) (refusal, err error) {
-	owns, oerr := corrosion.StackOwnsFirewall(ctx, s.db, stack)
-	if oerr != nil {
-		return nil, status.Errorf(codes.Unavailable, "read the firewall rows of stack %q: %v", stack, oerr)
+// (declares), or when the stack has one: it owns firewall rows here, or its
+// stored file declares a firewall block (a default-deny it only asks for
+// while another stack owns the row decides whether that deny is handed on).
+// A redeploy replaces or drops those and a teardown removes them.
+//
+// This node's replica may lag, and a teardown it authorized is replicated by
+// name to every node holding the rows, whose sweep then removes them. So it
+// fails closed: a stored file this node cannot read counts as a firewall, and
+// a teardown (needRecord) of a stack this node holds no record of is refused
+// too. The refusal names the grant that fixes it. A failure to read the
+// stack's rows is returned as err.
+func (s *Server) stackFirewallRefusal(ctx context.Context, stack string, declares bool, verb string, needRecord bool) (refusal, err error) {
+	if s.requireSGWrite(ctx) == nil {
+		return nil, nil
 	}
-	if !declares && !owns {
+	why := ""
+	switch {
+	case declares:
+		why = "its file declares a firewall"
+	default:
+		owns, oerr := corrosion.StackOwnsFirewall(ctx, s.db, stack)
+		if oerr != nil {
+			return nil, status.Errorf(codes.Unavailable, "read the firewall rows of stack %q: %v", stack, oerr)
+		}
+		if owns {
+			why = "it owns firewall rows"
+			break
+		}
+		st, gerr := corrosion.GetStack(ctx, s.db, stack)
+		if gerr != nil {
+			return nil, status.Errorf(codes.Unavailable, "read stack %q: %v", stack, gerr)
+		}
+		if st == nil {
+			if needRecord {
+				why = "this node holds no record of it yet, so whether it owns firewall rows elsewhere is unknown (retry once it has replicated here)"
+			}
+			break
+		}
+		stored, serr := s.storedStackFile(ctx, stack)
+		switch {
+		case serr != nil:
+			why = "its stored file cannot be read, so whether it declares a firewall is unknown"
+		case stored != nil && (len(stored.SecurityGroups) > 0 || len(stored.IPSets) > 0 || stored.FirewallDefaults != nil):
+			why = "its stored file declares a firewall"
+		}
+	}
+	if why == "" {
 		return nil, nil
 	}
 	perr := s.requireSGWrite(ctx)
-	if perr == nil {
-		return nil, nil
-	}
 	return status.Errorf(codes.PermissionDenied,
 		"%s stack %q writes its firewall (security groups, ip sets, cluster and host rules, the cluster default policy), "+
-			"which needs sg.write at the cluster root: %s. An administrator can grant it with "+
+			"which needs sg.write at the cluster root (%s): %s. An administrator can grant it with "+
 			"`lv role grant NetworkAdmin %s --path / --propagate`, or run this as an Admin",
-		verb, stack, status.Convert(perr).Message(), "user:"+callerPrincipal(ctx)), nil
+		verb, stack, why, status.Convert(perr).Message(), "user:"+callerPrincipal(ctx)), nil
 }

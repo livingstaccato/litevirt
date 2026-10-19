@@ -3,6 +3,7 @@ package firewall
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"net/netip"
 	"strings"
@@ -338,5 +339,62 @@ func TestLogListener_ReportsLossBeforeClosing(t *testing.T) {
 	}
 	if !c.sawLost {
 		t.Error("the socket was closed before the loss was reported")
+	}
+}
+
+// Anomaly 5 (lab1-fwbc2): the group is configured to send its records within
+// 10 ms (NFULA_CFG_TIMEOUT 1) or at 16 held (NFULA_CFG_QTHRESH), not at the
+// kernel's 1 s. go-nflog sends neither attribute while it is 0, so each must
+// be set and non-zero.
+//
+// Mutations: drop Timeout (the kernel's 1 s again) — red; QThresh 1 (a send
+// per record) — red.
+func TestNflogConfig_FlushesPromptlyInBatches(t *testing.T) {
+	c := nflogConfig(31)
+	if c.Group != 31 || c.Copymode != nflog.CopyPacket || c.Bufsize != logSnaplen || c.Flags != nflog.FlagSeq {
+		t.Errorf("config = %+v, want group 31, the packet's %d bytes, sequence numbers", c, logSnaplen)
+	}
+	if c.Timeout != 1 {
+		t.Errorf("flush timeout = %d/100 s, want 1 (10 ms; 0 leaves the kernel's 1 s)", c.Timeout)
+	}
+	if c.QThresh != 16 {
+		t.Errorf("queue threshold = %d, want 16 (below the ~21 a buffer holds, above a send per record)", c.QThresh)
+	}
+}
+
+// Anomaly 5: a record keeps the packet's kernel timestamp and says so; with
+// none (a packet the host sends) or one on another clock it carries the time
+// the store received it, and says that.
+//
+// Mutations: ignore Timestamp — the first record's time is the clock's, red;
+// drop the skew check — the 1970 timestamp is kept, red; never set
+// TimeSource — red.
+func TestLogListener_PacketTimeOrReceiveTime(t *testing.T) {
+	clock := &fakeClock{t: time.Date(2026, 10, 19, 8, 20, 6, 0, time.UTC)}
+	store := openStore(t, LogStoreOptions{MaxRate: 1 << 30, Now: clock.now})
+	l := &LogListener{Group: 27, Store: store}
+	pkt := ipv4TCP("10.0.0.9", "10.0.0.1", 40000, 22, 0x02, 60)
+	sent := clock.t.Add(-4 * time.Millisecond)
+	l.handle(nflog.Attribute{Prefix: ptr("lv-log lvt0 in r1 drop"), Payload: &pkt, Timestamp: &sent})
+	l.handle(nflog.Attribute{Prefix: ptr("lv-log - - r1 drop"), Payload: &pkt})
+	boot := time.Unix(3600, 0) // a monotonic time an hour after boot
+	l.handle(nflog.Attribute{Prefix: ptr("lv-log - - r1 drop"), Payload: &pkt, Timestamp: &boot})
+	late := clock.t.Add(-2 * logTimeSkew)
+	l.handle(nflog.Attribute{Prefix: ptr("lv-log - - r1 drop"), Payload: &pkt, Timestamp: &late})
+	got := store.List(LogFilter{})
+	if len(got) != 4 {
+		t.Fatalf("records = %+v, want four", got)
+	}
+	want := []struct {
+		at  time.Time
+		src string
+	}{{sent, LogTimePacket}, {clock.t, LogTimeReceived}, {clock.t, LogTimeReceived}, {clock.t, LogTimeReceived}}
+	for i, w := range want {
+		if !got[i].Time.Equal(w.at) || got[i].TimeSource != w.src {
+			t.Errorf("record %d: time %v (%q), want %v (%q)", i, got[i].Time, got[i].TimeSource, w.at, w.src)
+		}
+	}
+	if b, _ := json.Marshal(got[1]); !strings.Contains(string(b), `"time_source":"received"`) {
+		t.Errorf("the file record %s does not say its time is the receive time", b)
 	}
 }

@@ -1088,7 +1088,9 @@ replicated database, and that read has partial answers a converged cluster is
 indistinguishable from. Two things can be taken away — a `delete`, which retires
 a `virtual_machine` or a `vminterface`, and a `clear`, which unassigns an
 `ip_address` from an interface — and neither runs without positive local
-evidence. Creates, updates and assignments are unaffected: they are additive, so
+evidence. Nulling a VM's `primary_ip4` or `primary_ip6` while it names a
+litevirt-owned address removes that address as a clear does, and needs the same
+evidence about that address. Creates, updates and assignments are unaffected: they are additive, so
 the worst a partial read costs there is an object a later sweep reconciles. One
 destructive call sits outside this gate: adopting an identity that NetBox holds
 *twice* keeps the lowest object id and deletes the duplicates, from the

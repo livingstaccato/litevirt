@@ -2434,6 +2434,11 @@ func legacyAtomicRelocationEntry(stmts []Statement) ([]Statement, bool) {
 
 func validateGuardedMutationEntry(stmts []Statement) error {
 	for _, s := range stmts {
+		if s.Guard != nil && s.Guard.Protocol == userIncarnationGuardV1 {
+			return validateUserIncarnationEntry(stmts)
+		}
+	}
+	for _, s := range stmts {
 		if s.Guard != nil && s.Guard.Protocol == workloadRekeyGuardV1 {
 			return validateGuardedContainerRekeyEntry(stmts)
 		}
@@ -3036,6 +3041,10 @@ func validateGuardedStatementBinding(s Statement, sh StmtShape) error {
 	// than bent into the per-table branches below.
 	if g.Protocol == workloadReplaceGuardV1 {
 		return validateReplaceStatementBinding(s, sh, g)
+	}
+	if g.Protocol == userIncarnationGuardV1 {
+		// Bound per entry (validateUserIncarnationEntry).
+		return nil
 	}
 	switch sh.Table {
 	case "operations":

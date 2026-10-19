@@ -398,7 +398,7 @@ func SetUserLifecycle(ctx context.Context, c *Client, g capabilities.FeatureGran
 		Params: []interface{}{username, UserAttrSessionsNotBefore, laterCutoff(cur.SessionsNotBefore, nowRFC3339()), setBy, now}})
 	if disabled != nil && *disabled {
 		// A disable also voids an outstanding first-enrollment code (N3).
-		stmts = append(stmts, invalidateEnrollmentCodeStatement(username, now))
+		stmts = append(stmts, invalidateEnrollmentCodeStatement(username, now, nil))
 	}
 	if disabled != nil {
 		v := "false"
@@ -483,7 +483,7 @@ func ResetUserLifecycle(ctx context.Context, c *Client, g capabilities.FeatureGr
 	if len(prior) > 0 {
 		tokenCut = nowRFC3339()
 	}
-	stmts = append(stmts, invalidateEnrollmentCodeStatement(username, now))
+	stmts = append(stmts, invalidateEnrollmentCodeStatement(username, now, nil))
 	stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
 		Params: []interface{}{username, UserAttrTokensNotBefore, laterCutoff(cur.TokensNotBefore, tokenCut), setBy, now}})
 	return c.ExecuteBatch(ctx, stmts)

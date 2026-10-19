@@ -278,6 +278,31 @@ type refusedRemints struct {
 type remintScope struct {
 	mu      sync.Mutex
 	unknown map[string]bool
+	// older names the accounts the sender holds an older incarnation of
+	// (user_incarnation.go): its rows keyed by that username are refused on
+	// this exchange's sensitive pull.
+	older map[string]bool
+}
+
+func (s *remintScope) noteOlderIncarnation(username string) {
+	if s == nil || username == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.older == nil {
+		s.older = map[string]bool{}
+	}
+	s.older[username] = true
+}
+
+func (s *remintScope) olderIncarnation(username string) bool {
+	if s == nil || username == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.older[username]
 }
 
 func (s *remintScope) noteUnknown(username string) {

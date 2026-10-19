@@ -1513,10 +1513,13 @@ A password change made on a host that has not yet seen an account's
 password. Once the `user_incarnation_v1` capability token has latched, a
 delete names the account it ends, and no later write to that account from a
 lagging host revives it. `lv user create` of a deleted name makes a new
-account, which replaces the deleted one everywhere. The token latches on its
-own once every host the cluster replicates to, including one parked in
-`maintenance`, runs this release. Until then hosts write and merge users rows
-as the previous release does.
+account, which replaces the deleted one everywhere. Nor does a lagging
+host's password change, or its delete of the deleted account, reach the new
+account: its password, second factors, recovery codes, role bindings,
+enrollment code, directory bindings and session cut-offs stay its own. The
+token latches on its own once every host the cluster replicates to, including
+one parked in `maintenance`, runs this release. Until then hosts write and
+merge users rows as the previous release does.
 
 `user_incarnation_v1` is mandatory and replication-gated, with no flag and no
 stand-down. A binary rolled back below the latched token enters WAL

@@ -85,7 +85,8 @@ func TestFleet_VMSpecNetworkRescopeConverges(t *testing.T) {
 	}
 }
 
-// antiEntropyRound merges every node's full state into every other node.
+// antiEntropyRound merges every node's full state, the peer-only sensitive
+// lane included, into every other node.
 func antiEntropyRound(t *testing.T, c *Cluster) {
 	t.Helper()
 	for _, a := range c.Nodes {
@@ -93,6 +94,9 @@ func antiEntropyRound(t *testing.T, c *Cluster) {
 			if a != b {
 				if err := b.DB.MergeStateBytesLWW(pullDump(t, c, a)); err != nil {
 					t.Fatalf("merge %s into %s: %v", a.Name, b.Name, err)
+				}
+				if err := b.DB.MergeSensitiveStateBytesLWW(a.DB.DumpSensitiveStateBytes()); err != nil {
+					t.Fatalf("merge %s's sensitive state into %s: %v", a.Name, b.Name, err)
 				}
 			}
 		}

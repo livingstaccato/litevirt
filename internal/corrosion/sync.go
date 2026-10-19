@@ -1201,6 +1201,12 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				continue
 			}
 		}
+		// ...and a second factor or recovery code an older account of the
+		// name left on the sender (user_incarnation.go).
+		if sensitiveUserKeyedTables[table.Name] && table.remints.olderIncarnation(cellStr(row, columnIndexMap(table.Columns), "username")) {
+			skipped++
+			continue
+		}
 		// ...and the credential that belongs to a refused re-mint, which this
 		// lane carries apart from its users row (users_admin_guard.go).
 		if table.Name == "user_credentials" {

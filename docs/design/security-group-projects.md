@@ -49,11 +49,16 @@ writes are applied by name on every peer, whose `StackReconciler`
 (`reconcileStack` → `DeleteStackFirewall`) then removes the stack's firewall
 rows. So `DeleteStack` on a node that holds no record of the stack, by a
 caller without `sg.write` at `/`, is local-only: it removes the workloads that
-node lists by the stack's name (a first `lv compose up` that failed in the
-workload phase leaves exactly these, and no record anywhere) and writes no
-stack state, record, load balancer, network or firewall row. Its progress says
-so and names the exits: `lv compose down --name <stack>` on a node that holds
-the stack, or an Admin.
+node lists by the stack's name and writes no stack state, record, load
+balancer, network, backup-repo or firewall row, and nothing retries a workload
+it cannot delete. A first `lv compose up` that failed in the workload phase
+leaves such workloads and no record anywhere, and also its networks and
+backup-repo registrations (registered before the workloads), which stay for an
+Admin. The teardown sends a `local-only` progress status whose text says what
+is left and how an Admin removes it (`lv compose down --name <stack>` on a node
+that holds the stack, or, where none does, `lv compose up` of the same file and
+then `lv compose down`); the CLI, the UI and the REST API (`local_only`,
+`notice`) report it as a local-only teardown, never as a complete one.
 
 Residual: a node that holds an older stack file without a firewall, and
 neither the newer file nor the rows, authorizes a non-root teardown or a

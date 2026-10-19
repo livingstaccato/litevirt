@@ -1217,10 +1217,13 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	// may simply lag: the stack's state and record writes are applied by name
 	// on every peer, whose reconciler then removes the stack's firewall rows.
 	// So without sg.write at the root it does a LOCAL-ONLY teardown: it
-	// removes the workloads it lists by the stack's name — a first `compose
-	// up` that failed in the workload phase leaves exactly these and no record
-	// anywhere — and writes no stack state, record, load balancer, network or
-	// firewall row.
+	// removes the workloads it lists by the stack's name and writes no stack
+	// state, record, load balancer, network, backup-repo or firewall row. A
+	// first `compose up` that failed in the workload phase leaves such
+	// workloads and no record anywhere, and also its networks and backup-repo
+	// registrations (registered before the workloads), which stay for an
+	// Admin. The progress line (Status "local-only") says what is left, and
+	// nothing retries a workload delete that fails here.
 	localOnly := false
 	if st, gerr := corrosion.GetStack(ctx, s.db, req.Name); gerr != nil {
 		return status.Errorf(codes.Unavailable, "read stack %q: %v", req.Name, gerr)
@@ -1310,10 +1313,7 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	lbName := req.Name + "-lb"
 	if localOnly {
 		if sendErr := stream.Send(&pb.DeleteProgress{VmName: "stack", Status: "local-only",
-			Error: fmt.Sprintf("this node holds no record of stack %q: removing only the workloads it lists here; its record, "+
-				"load balancer, networks and firewall are left. Run `lv compose down --name %s` again on a node that holds the stack, "+
-				"or as an Admin (`lv role grant NetworkAdmin %s --path / --propagate` grants what it needs)",
-				req.Name, req.Name, "user:"+callerPrincipal(ctx))}); sendErr != nil {
+			Error: localOnlyNotice(req.Name, "user:"+callerPrincipal(ctx))}); sendErr != nil {
 			return sendErr
 		}
 	} else {
@@ -2914,4 +2914,16 @@ func (s *Server) stackFirewallRefusal(ctx context.Context, stack string, declare
 			"which needs sg.write at the cluster root (%s): %s. An administrator can grant it with "+
 			"`lv role grant NetworkAdmin %s --path / --propagate`, or an Admin can run the same `lv compose` command",
 		verb, stack, why, status.Convert(perr).Message(), "user:"+callerPrincipal(ctx)), nil
+}
+
+// localOnlyNotice is the progress text of a local-only teardown: what it
+// does, what it leaves, and who can remove the rest.
+func localOnlyNotice(stack, principal string) string {
+	return fmt.Sprintf("this node holds no record of stack %q, so this is a local-only teardown: it removes only the workloads "+
+		"this node lists, and nothing retries one it cannot delete. Left for an Admin: whatever of the stack's record, load balancer, "+
+		"networks, backup-repo registrations and firewall exists anywhere (a first `lv compose up` that failed leaves its networks "+
+		"and backup-repo registrations). An Admin removes them with `lv compose down --name %s` on a node that holds the stack; "+
+		"where no node does, by deploying the same file again (`lv compose up`) and then `lv compose down --name %s`. "+
+		"`lv role grant NetworkAdmin %s --path / --propagate` lets you do it yourself",
+		stack, stack, stack, principal)
 }

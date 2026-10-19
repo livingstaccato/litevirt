@@ -1206,11 +1206,15 @@ be read. Both are refused before anything changes, and the refusal names the
 exits: `lv role grant NetworkAdmin <principal> --path / --propagate`, or an
 Admin runs the command. The plan `lv compose up` shows before it applies lists
 the refusal as a warning. `lv compose down` on a node that holds no record of
-the stack (a first `lv compose up` that failed leaves its workloads and no
-record) removes only the workloads that node lists, and leaves the stack's
-record, load balancer, networks and firewall; it says so, and
-`lv compose down --name <stack>` on a node that holds the stack, or as an
-Admin, removes the rest. Against a daemon
+the stack, by a caller without `sg.write` at `/`, removes only the workloads
+that node lists, and nothing retries one it cannot delete. It leaves whatever
+of the stack's record, load balancer, networks, backup-repo registrations and
+firewall exists anywhere: a first `lv compose up` that failed leaves its
+workloads, its networks and its backup-repo registrations, and no record. The
+CLI, the UI and the REST API (`local_only`, `notice`) all say so. An Admin
+removes the rest with `lv compose down --name <stack>` on a node that holds the
+stack, or, where no node does, by deploying the same file again with
+`lv compose up` and then running `lv compose down --name <stack>`. Against a daemon
 older than these RPCs the four commands fail with an error saying to upgrade
 litevirtd; they do not fall back to writing the database.
 

@@ -154,3 +154,45 @@ func TestHandler_DestroyStack_AKeptNetworkIsNotCountedAsAVM(t *testing.T) {
 		t.Errorf("toast %s counts the kept network as a VM", trig)
 	}
 }
+
+const uiLocalOnlyNotice = "this node holds no record of stack \"hb\": removing only the workloads it lists here; left for an Admin: ..."
+
+// A local-only teardown is a warning naming what is left, not "destroyed".
+func TestHandler_DestroyStack_ALocalOnlyTeardownIsAWarning(t *testing.T) {
+	mock := newDefaultMock()
+	mock.deleteStackFrames = []*pb.DeleteProgress{
+		{VmName: "stack", Status: "local-only", Error: uiLocalOnlyNotice},
+		{VmName: "ha1", Status: "deleting"},
+		{VmName: "ha1", Status: "deleted"},
+	}
+	resp := destroyStack(t, mock)
+	trig := resp.Header.Get("HX-Trigger")
+	if strings.Contains(trig, "destroyed") || strings.Contains(trig, `"success"`) {
+		t.Errorf("a local-only teardown was toasted as destroyed: %s", trig)
+	}
+	for _, want := range []string{`"warning"`, "left for an Admin"} {
+		if !strings.Contains(trig, want) {
+			t.Errorf("toast %s does not carry %q", trig, want)
+		}
+	}
+}
+
+// A failure under a local-only teardown promises no retry.
+func TestHandler_DestroyStack_ALocalOnlyFailurePromisesNoRetry(t *testing.T) {
+	mock := newDefaultMock()
+	mock.deleteStackFrames = []*pb.DeleteProgress{
+		{VmName: "stack", Status: "local-only", Error: uiLocalOnlyNotice},
+		{VmName: "ha1", Status: "deleting"},
+		{VmName: "ha1", Status: "error", Error: "undefine refused"},
+	}
+	resp := destroyStack(t, mock)
+	trig := resp.Header.Get("HX-Trigger")
+	if strings.Contains(trig, "retries") || strings.Contains(trig, "left deleting") {
+		t.Errorf("a failed local-only teardown promises a retry: %s", trig)
+	}
+	for _, want := range []string{`"error"`, "local-only", "1 of 1", "nothing will retry"} {
+		if !strings.Contains(trig, want) {
+			t.Errorf("toast %s does not carry %q", trig, want)
+		}
+	}
+}

@@ -368,6 +368,12 @@ returns the mapped status of its error (`500` by default) with the same body and
 the failure in `error`; one refused before any progress returns the usual
 `{"error": ...}`.
 
+A teardown the daemon could only do locally (it holds no record of the stack;
+see [firewall.md](firewall.md)) sets `"local_only": true` and puts what is left,
+and who can remove it, in `notice`. It is `200` when this node's workloads were
+all removed; a failure returns `500` and its `error` says nothing will retry
+it, because nothing marked the stack `deleting`.
+
 Both waits outlast the gateway's 120-second write timeout: a non-SSE deploy or
 delete answers when the operation is over, however long that takes, so give the
 client a timeout to match (a large stack can take many minutes). The operation

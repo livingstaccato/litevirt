@@ -11,6 +11,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
 // sgProjectsFixture is a server with the sg_projects feature open, a global group
@@ -656,4 +657,42 @@ func stackStatements(t *testing.T, s *Server) int {
 		}
 	}
 	return n
+}
+
+// The success path of a local-only down: the workload this node holds is
+// deleted, and still nothing stack-wide is written and no firewall row
+// removed — the record and firewall cleanup that a complete teardown ends
+// with are not reached.
+func TestDeleteStack_ALocalOnlyDownThatSucceedsWritesNothingStackWide(t *testing.T) {
+	ctx := context.Background()
+	s, opal, _ := stackFirewallFixture(t)
+	s.virt = libvirtfake.New()
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "ghost-web-1", StackName: "ghost",
+		HostName: s.hostName, State: "stopped", Spec: "{}"}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertSecurityGroup(ctx, s.db, corrosion.SecurityGroup{ID: "sg-ghost", Name: "ghost-web", StackName: "ghost"}); err != nil {
+		t.Fatal(err)
+	}
+	before := stackStatements(t, s)
+	st := &mockDeleteStream{ctx: opal}
+	if err := s.DeleteStack(&pb.DeleteStackRequest{Name: "ghost"}, st); err != nil {
+		t.Fatalf("an Operator's local-only down: %v", err)
+	}
+	deleted := false
+	for _, p := range st.sent {
+		deleted = deleted || (p.GetVmName() == "ghost-web-1" && p.GetStatus() == "deleted")
+		if p.GetStatus() == "error" {
+			t.Fatalf("the local-only down failed: %+v", st.sent)
+		}
+	}
+	if !deleted {
+		t.Fatalf("the workload was not deleted: %+v", st.sent)
+	}
+	if after := stackStatements(t, s); after != before {
+		t.Fatalf("a successful local-only down wrote %d stack-wide statement(s)", after-before)
+	}
+	if g, _ := corrosion.GetSecurityGroup(ctx, s.db, "sg-ghost"); g == nil {
+		t.Fatal("a successful local-only down removed a firewall row")
+	}
 }

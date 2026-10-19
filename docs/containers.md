@@ -61,7 +61,10 @@ host path as root. `lv ct pull` accepts a registry image (`name[:tag]`, which
 includes `docker:dind`, or `docker://registry/name[:tag]`) or one of those
 local forms, and refuses any other transport. A local source must be a
 directory (`oci:`, `dir:`) or a regular file (the archives), not a symbolic
-link, and is read through the descriptor the daemon opened and judged. Container inputs follow the same rules as a VM's host
+link, and an archive may not be VM disk storage (the data directory's
+`disks/`, or a storage pool). The daemon opens and judges the source once: a
+directory is then read through that descriptor, and an archive is copied
+from it into the pull's private staging directory and read from the copy. Container inputs follow the same rules as a VM's host
 paths:
 
 - Anyone with `ct.create` may name an **OCI library item**: exactly

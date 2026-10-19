@@ -121,6 +121,7 @@ mkdir -p "$layout" && echo "$tag" > "$layout/tag-$tag"
 for a in "$@"; do
   case "$a" in
     *:/proc/self/fd/*) p="${a#*:}"; p="${p%%:*}"; if [ -d "$p" ]; then ls "$p" > ` + log + `.read; else cat "$p" > ` + log + `.read; fi ;;
+    oci-archive:*|docker-archive:*) p="${a#*:}"; p="${p%%:*}"; cat "$p" > ` + log + `.read ;;
   esac
 done
 `
@@ -132,9 +133,10 @@ done
 }
 
 // A local source is opened once by the daemon, without following a link at
-// its own name, judged as the object opened (CheckSource gets the path it
-// really is), and handed to skopeo as that open descriptor: skopeo reads the
-// object that was judged, whatever happens to the path afterwards.
+// its own name, and judged as the object opened (CheckSource gets the path
+// it really is). skopeo reads that object, whatever happens to the path
+// afterwards: a directory through the descriptor, an archive as a copy the
+// daemon made from the descriptor into the pull's staging directory.
 func TestPullOCI_ALocalSourceIsOpenedJudgedAndPinned(t *testing.T) {
 	fakeOCITools(t, false)
 	log := fdSkopeo(t)
@@ -147,9 +149,9 @@ func TestPullOCI_ALocalSourceIsOpenedJudgedAndPinned(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "blobs"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, tc := range []struct{ ref, judged, read string }{
-		{"oci-archive:" + archive + ":v1", archive, "the archive"},
-		{"dir:" + filepath.Join(real, "x", "..", "layout"), dir, "blobs"}, // cleaned before it is opened
+	for _, tc := range []struct{ ref, judged, read, given string }{
+		{"oci-archive:" + archive + ":v1", archive, "the archive", "/" + unpackDirName + "/"},
+		{"dir:" + filepath.Join(real, "x", "..", "layout"), dir, "blobs", ":/proc/self/fd/3"}, // cleaned before it is opened
 	} {
 		var got []string
 		err := PullOCI(context.Background(), PullOCIOptions{Image: tc.ref, Dest: filepath.Join(t.TempDir(), "web"),
@@ -161,8 +163,8 @@ func TestPullOCI_ALocalSourceIsOpenedJudgedAndPinned(t *testing.T) {
 			t.Errorf("%s: judged %v, want %s", tc.ref, got, tc.judged)
 		}
 		args, _ := os.ReadFile(log)
-		if !strings.Contains(string(args), ":/proc/self/fd/3") || strings.Contains(string(args), real) {
-			t.Errorf("%s: skopeo args %q, want the open descriptor, never the path", tc.ref, args)
+		if !strings.Contains(string(args), tc.given) || strings.Contains(string(args), real) {
+			t.Errorf("%s: skopeo args %q, want %s, never the source path", tc.ref, args, tc.given)
 		}
 		if b, _ := os.ReadFile(log + ".read"); strings.TrimSpace(string(b)) != tc.read {
 			t.Errorf("%s: skopeo read %q through the descriptor, want %q", tc.ref, b, tc.read)
@@ -241,5 +243,74 @@ func TestParseOCISource_TheDockerImageByShortName(t *testing.T) {
 		if err != nil || src.Transport != "docker" || src.Local || src.Ref != "docker://"+ref {
 			t.Errorf("ParseOCISource(%q) = %+v, %v; want the registry image docker://%s", ref, src, err, ref)
 		}
+	}
+}
+
+// containers/image names an archive (oci-archive resolves the path it is
+// given with EvalSymlinks and opens that name), so a descriptor path alone
+// does not pin it. The daemon copies the archive from the descriptor it
+// judged into the pull's own 0700 staging directory and hands skopeo the
+// copy: whatever replaces the source after the check, the content pulled is
+// the content judged.
+func TestPullOCI_AnArchiveSwappedAfterTheCheckIsNotRead(t *testing.T) {
+	fakeOCITools(t, false)
+	bin := t.TempDir()
+	log := filepath.Join(t.TempDir(), "skopeo-args")
+	// A skopeo that, like containers/image, resolves an archive path to a
+	// name and opens that name.
+	skopeo := `#!/bin/sh
+echo "$@" >> ` + log + `
+for a in "$@"; do last="$a"; done
+rest="${last#oci:}"; layout="${rest%:*}"; tag="${rest##*:}"
+mkdir -p "$layout" && echo "$tag" > "$layout/tag-$tag"
+for a in "$@"; do
+  case "$a" in
+    oci-archive:*|docker-archive:*) p="${a#*:}"; p="${p%%:*}"; real=$(readlink -f "$p"); cat "$real" > ` + log + `.read ;;
+  esac
+done
+`
+	if err := os.WriteFile(filepath.Join(bin, "skopeo"), []byte(skopeo), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	for _, transport := range []string{"oci-archive", "docker-archive"} {
+		base := t.TempDir()
+		archive := filepath.Join(base, "img.tar")
+		if err := os.WriteFile(archive, []byte("judged"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		swapped := filepath.Join(base, "swapped.tar")
+		if err := os.WriteFile(swapped, []byte("swapped"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_ = os.Remove(log + ".read")
+		err := PullOCI(context.Background(), PullOCIOptions{Image: transport + ":" + archive, Dest: filepath.Join(t.TempDir(), "web"),
+			CheckSource: func(string, string) error {
+				// After the check: the judged file goes, and the name its
+				// descriptor now reads back as leads somewhere else.
+				if err := os.Remove(archive); err != nil {
+					return err
+				}
+				return os.Symlink(swapped, archive+" (deleted)")
+			}})
+		if err != nil {
+			t.Fatalf("%s: %v", transport, err)
+		}
+		if b, _ := os.ReadFile(log + ".read"); string(b) != "judged" {
+			t.Errorf("%s: skopeo read %q, want the content that was judged", transport, b)
+		}
+	}
+}
+
+// The object opened is judged at the path /proc/self/fd says it is, or not
+// at all: when that cannot be read, the source is refused.
+func TestOpenedFilePathFailsClosed(t *testing.T) {
+	f, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	if p, err := openedFilePath(f); err == nil {
+		t.Fatalf("openedFilePath of a closed file = %q, want an error", p)
 	}
 }

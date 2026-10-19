@@ -353,3 +353,38 @@ func TestPullOCI_TheSourceRulesAreOnePerKind(t *testing.T) {
 		t.Error("the check accepts a file as a dir: source")
 	}
 }
+
+// VM disk storage is not an archive source: a file directly in
+// <data_dir>/disks, or inside a storage pool on this host.
+func TestPullOCI_VMDiskStorageIsNoArchiveSource(t *testing.T) {
+	s, rt := ctPathServer(t)
+	disks := filepath.Join(s.dataDir, "disks")
+	if err := os.MkdirAll(disks, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inDisks := filepath.Join(disks, "web-root.qcow2")
+	pool := filepath.Join(t.TempDir(), "pool1")
+	if err := os.MkdirAll(pool, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inPool := filepath.Join(pool, "db-data.raw")
+	for _, f := range []string{inDisks, inPool} {
+		if err := os.WriteFile(f, []byte("disk"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := corrosion.UpsertStoragePool(context.Background(), s.db, corrosion.StoragePoolRecord{
+		HostName: s.hostName, Name: "pool1", Driver: "dir", Target: pool}); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{inDisks, inPool} {
+		for _, tr := range []string{"oci-archive", "docker-archive"} {
+			if _, err := s.PullOCIImage(adminCtx(), &pb.PullOCIImageRequest{Image: tr + ":" + f, Dest: "d"}); status.Code(err) != codes.InvalidArgument {
+				t.Errorf("%s:%s: %v, want InvalidArgument", tr, f, err)
+			}
+		}
+	}
+	if len(rt.pullCalls) != 0 {
+		t.Fatalf("a refused source reached the runtime: %+v", rt.pullCalls)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -157,11 +158,29 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	// prefix tells skopeo to fetch from a registry; "oci:" works for
 	// local OCI dirs.
 	srcRef, remote := src.Ref, !src.Local
-	if src.Local {
-		srcRef = src.Transport + ":/proc/self/fd/3"
-		if src.Reference != "" {
-			srcRef += ":" + src.Reference
+	var passFD *os.File
+	switch {
+	case src.Transport == "oci" || src.Transport == "dir":
+		// A directory is read through the descriptor (fd 3 in skopeo).
+		srcRef, passFD = src.Transport+":/proc/self/fd/3", srcFile
+	case src.Local:
+		// containers/image resolves an archive's path to a name and opens
+		// that name, so a descriptor path does not pin it: skopeo reads a
+		// copy, made from the descriptor that was judged into this pull's
+		// own staging directory (0700, root's).
+		archStage, err := stageUnpack(opts.Dest)
+		if err != nil {
+			return err
 		}
+		defer func() { _ = os.RemoveAll(archStage) }()
+		copyPath := filepath.Join(archStage, "source.tar")
+		if err := copyFromFile(ctx, srcFile, copyPath); err != nil {
+			return fmt.Errorf("oci: copy the %s source: %w", src.Transport, err)
+		}
+		srcRef = src.Transport + ":" + copyPath
+	}
+	if src.Local && src.Reference != "" {
+		srcRef += ":" + src.Reference
 	}
 	dstRef := fmt.Sprintf("oci:%s:%s", tmpLayout, tag)
 	args := []string{"copy"}
@@ -174,8 +193,8 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	// "--" ends the options: no reference is ever read as a flag.
 	args = append(args, "--", srcRef, dstRef)
 	copyCmd := dieWithDaemon(exec.CommandContext(ctx, "skopeo", args...))
-	if srcFile != nil {
-		copyCmd.ExtraFiles = []*os.File{srcFile} // fd 3 in skopeo
+	if passFD != nil {
+		copyCmd.ExtraFiles = []*os.File{passFD} // fd 3 in skopeo
 	}
 	if out, err := combinedOutputPinned(copyCmd); err != nil {
 		return fmt.Errorf("skopeo copy: %w: %s", err, out)
@@ -402,17 +421,15 @@ func ParseOCISource(ref string) (OCISource, error) {
 	}
 }
 
-// openLocalSource opens a local source's path without following a link at
-// its own name (a FIFO does not block the open), and refuses anything but a
-// directory (oci:, dir:) or a regular file (the archives). check, when set,
-// judges the object opened, at the path it really is.
+// openLocalSource opens a local source's path as a reference only, without
+// following a link at its own name (openNoFollow: no device driver's open
+// runs, and a FIFO cannot block), refuses anything but a directory (oci:,
+// dir:) or a regular file (the archives), judges the object at the path it
+// really is (check, when set; a path that cannot be read back is refused),
+// and only then opens that same object for reading.
 func openLocalSource(src OCISource, check func(transport, path string) error) (*os.File, error) {
 	wantDir := src.Transport == "oci" || src.Transport == "dir"
-	flags := syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_CLOEXEC | syscall.O_NONBLOCK
-	if wantDir {
-		flags |= syscall.O_DIRECTORY
-	}
-	f, err := os.OpenFile(src.Path, flags, 0)
+	ref, err := openNoFollow(src.Path, wantDir)
 	if err != nil {
 		switch {
 		case errors.Is(err, syscall.ELOOP):
@@ -422,24 +439,62 @@ func openLocalSource(src OCISource, check func(transport, path string) error) (*
 		}
 		return nil, fmt.Errorf("oci: %s source: %w", src.Transport, err)
 	}
-	fi, err := f.Stat()
+	defer ref.Close()
+	fi, err := ref.Stat()
 	if err != nil {
-		_ = f.Close()
 		return nil, fmt.Errorf("oci: %s source: %w", src.Transport, err)
 	}
 	switch {
+	case fi.Mode()&os.ModeSymlink != 0:
+		return nil, fmt.Errorf("oci: %s source %q is a symbolic link; name what it points to", src.Transport, src.Path)
 	case wantDir && !fi.IsDir():
-		_ = f.Close()
 		return nil, fmt.Errorf("oci: %s source %q is not a directory", src.Transport, src.Path)
 	case !wantDir && !fi.Mode().IsRegular():
-		_ = f.Close()
 		return nil, fmt.Errorf("oci: %s source %q is not a regular file", src.Transport, src.Path)
 	}
+	judged, err := openedFilePath(ref)
+	if err != nil {
+		return nil, fmt.Errorf("oci: %s source: %w", src.Transport, err)
+	}
 	if check != nil {
-		if err := check(src.Transport, openedFilePath(f)); err != nil {
-			_ = f.Close()
+		if err := check(src.Transport, judged); err != nil {
 			return nil, err
 		}
 	}
+	f, err := reopenRead(ref, wantDir)
+	if err != nil {
+		return nil, fmt.Errorf("oci: %s source: %w", src.Transport, err)
+	}
 	return f, nil
+}
+
+// copyFromFile copies what src reads into a new file at dst (0600), honouring
+// ctx between chunks.
+func copyFromFile(ctx context.Context, src *os.File, dst string) error {
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	buf := make([]byte, 1<<20)
+	for {
+		if err := ctx.Err(); err != nil {
+			_ = out.Close()
+			return err
+		}
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			if _, werr := out.Write(buf[:n]); werr != nil {
+				_ = out.Close()
+				return werr
+			}
+		}
+		if errors.Is(rerr, io.EOF) {
+			break
+		}
+		if rerr != nil {
+			_ = out.Close()
+			return rerr
+		}
+	}
+	return out.Close()
 }

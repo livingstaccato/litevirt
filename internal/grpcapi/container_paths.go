@@ -8,10 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/storage"
@@ -93,11 +95,49 @@ func (s *Server) checkPullSource(transport, path string) error {
 				err = fmt.Errorf("%q: %w", path, serr)
 			case !fi.Mode().IsRegular():
 				err = fmt.Errorf("%q is not a regular file", path)
+			case storage.DataDirDisksFile(path, s.dataDir):
+				err = fmt.Errorf("%q is VM disk storage (the daemon's disks directory), not an image archive", path)
+			default:
+				err = s.refuseInDiskPool(path)
 			}
 		}
 	}
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "%s source: %v", transport, err)
+	}
+	return nil
+}
+
+// refuseInDiskPool refuses a path inside a storage pool on this host (VM
+// disk storage). Pools that cannot be listed refuse too.
+func (s *Server) refuseInDiskPool(path string) error {
+	if s.db == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pools, err := corrosion.ListStoragePoolsForHost(ctx, s.db, s.hostName)
+	if err != nil {
+		return fmt.Errorf("cannot tell whether %q is VM disk storage: %v", path, err)
+	}
+	forms := func(p string) []string {
+		out := []string{filepath.Clean(p)}
+		if r, err := filepath.EvalSymlinks(p); err == nil && r != out[0] {
+			out = append(out, r)
+		}
+		return out
+	}
+	for _, pool := range pools {
+		if pool.Target == "" || !filepath.IsAbs(pool.Target) {
+			continue
+		}
+		for _, t := range forms(pool.Target) {
+			for _, c := range forms(path) {
+				if c == t || strings.HasPrefix(c, t+string(filepath.Separator)) {
+					return fmt.Errorf("%q is in storage pool %q, VM disk storage, not an image archive", path, pool.Name)
+				}
+			}
+		}
 	}
 	return nil
 }

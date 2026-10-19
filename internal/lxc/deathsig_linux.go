@@ -3,6 +3,7 @@
 package lxc
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -168,9 +169,38 @@ func flockTry(f *os.File) (bool, error) {
 
 // openedFilePath is the path the open file f really is, symlinks resolved
 // (/proc/self/fd), or its name when that cannot be read.
-func openedFilePath(f *os.File) string {
-	if p, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(int(f.Fd()))); err == nil {
-		return p
+func openedFilePath(f *os.File) (string, error) {
+	p, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(int(f.Fd())))
+	if err != nil {
+		return "", fmt.Errorf("cannot tell what %s is: %w", f.Name(), err)
 	}
-	return f.Name()
+	if strings.HasSuffix(p, " (deleted)") {
+		return "", fmt.Errorf("%s was removed while it was opened", f.Name())
+	}
+	return p, nil
+}
+
+// openNoFollow opens path as a reference only (O_PATH): no driver's open
+// runs and a FIFO cannot block, and a link at its own name is the link
+// itself. The caller judges it (fstat, the path check) before reopenRead.
+func openNoFollow(path string, dir bool) (*os.File, error) {
+	flags := unix.O_PATH | unix.O_NOFOLLOW | unix.O_CLOEXEC
+	if dir {
+		flags |= unix.O_DIRECTORY
+	}
+	fd, err := unix.Open(path, flags, 0)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	return os.NewFile(uintptr(fd), path), nil
+}
+
+// reopenRead opens for reading the object ref (from openNoFollow) refers to,
+// through /proc/self/fd: the same object, never the path again.
+func reopenRead(ref *os.File, dir bool) (*os.File, error) {
+	flags := os.O_RDONLY | unix.O_CLOEXEC | unix.O_NONBLOCK
+	if dir {
+		flags |= unix.O_DIRECTORY
+	}
+	return os.OpenFile("/proc/self/fd/"+strconv.Itoa(int(ref.Fd())), flags, 0)
 }

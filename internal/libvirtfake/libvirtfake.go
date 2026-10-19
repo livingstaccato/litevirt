@@ -329,8 +329,12 @@ type Fake struct {
 	unplugRequests map[string]int
 
 	// OnAbortMigration runs on every AbortMigration, after it is recorded.
-	OnAbortMigration  func(name string)
-	abortedMigrations map[string]int
+	OnAbortMigration func(name string)
+	// FailAbortMigration, when it returns an error, fails that AbortMigration
+	// (recorded, OnAbortMigration not run), as libvirt fails an abort that
+	// finds no job yet.
+	FailAbortMigration func(name string) error
+	abortedMigrations  map[string]int
 }
 
 // New returns a Fake ready to use. Safe for concurrent use.
@@ -2850,8 +2854,13 @@ func (f *Fake) AbortMigration(name string) error {
 		f.abortedMigrations = map[string]int{}
 	}
 	f.abortedMigrations[name]++
-	hook := f.OnAbortMigration
+	hook, fail := f.OnAbortMigration, f.FailAbortMigration
 	f.mu.Unlock()
+	if fail != nil {
+		if err := fail(name); err != nil {
+			return err
+		}
+	}
 	if hook != nil {
 		hook(name)
 	}

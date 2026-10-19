@@ -1420,11 +1420,11 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 			if !s.migrationStubs.owns(req.VmName, stub.Path) {
 				return nil, status.Errorf(codes.FailedPrecondition,
 					"disk %s of VM %q already exists on %s, and this migration did not create it. "+
-						"It may be the VM's disk from an earlier stay on %s (a copy partition settle kept, say), "+
-						"and copying the disk there would overwrite it. It may be the only copy of the VM's data from "+
-						"before a failover: do not delete it. Move it aside on %s (rename it to <path>.superseded-<time>, "+
-						"which `lv host superseded-disks` then lists and keeps), then migrate again",
-					stub.Path, req.VmName, s.hostName, s.hostName, s.hostName)
+						"It may be the VM's disk from an earlier stay on %s (a copy partition settle kept, or one a "+
+						"rolled-back move placed after it gave up, say), and copying the disk there would overwrite it. "+
+						"It may be the only copy of the VM's data from before a failover: do not delete it. %s, "+
+						"then migrate again",
+					stub.Path, req.VmName, s.hostName, s.hostName, moveAsideAdvice(s.hostName, stub.Path))
 			}
 		} else if !os.IsNotExist(err) {
 			return nil, status.Errorf(codes.Internal, "stat disk stub %s: %v", stub.Path, err)

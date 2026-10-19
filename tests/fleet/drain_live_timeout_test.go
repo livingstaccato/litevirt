@@ -17,9 +17,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -290,16 +292,18 @@ func abortStuckLiveDrain(t *testing.T, sc *stuckLiveDrain) (*pb.DrainProgress, e
 // keeps running on the source, never shut down for a cold move, and the drain
 // ends incomplete.
 //
-// Mutation: do not abort the libvirt job when the move is cancelled — the
-// move holds until the fake's 20s, then falls back, red.
+// Mutations: do not abort the libvirt job when the move is cancelled — the
+// move holds until the fake's 20s, then falls back, red. Leave cancelled moves
+// out of the drain's summary — red.
 func TestFleet_OperationAbortEndsAStuckLiveDrainMove(t *testing.T) {
 	sc := newStuckLiveDrainTimeout(t, false, 0)
 	p, err, elapsed := abortStuckLiveDrain(t, sc)
 	if elapsed > 15*time.Second {
 		t.Fatalf("the drain took %v; the abort did not end its live move", elapsed)
 	}
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "drain incomplete") {
-		t.Fatalf("drain = %v; want FailedPrecondition, incomplete", err)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "drain incomplete") ||
+		!strings.Contains(err.Error(), "slow was cancelled by `lv operation abort`") {
+		t.Fatalf("drain = %v; want FailedPrecondition, incomplete, naming slow's cancelled move", err)
 	}
 	if p == nil || p.Status != "failed" || p.Strategy != pb.MigrateStrategy_MIGRATE_LIVE ||
 		!strings.Contains(p.Error, "lv operation abort") || !strings.Contains(p.Error, sc.src.Name) {
@@ -349,5 +353,172 @@ func TestFleet_OperationAbortOfALiveDrainMoveThatCompletesIsRecordedOnTheTarget(
 	}
 	if n := sc.src.Virt.AbortedMigrations("slow"); n != 1 {
 		t.Fatalf("libvirt migration job aborted %d time(s), want 1", n)
+	}
+}
+
+// An operator abort of a live drain move (no policy timeout) that libvirt
+// does not answer within the grace is handed to the background owner, as a
+// timed-out one is: the row stays migrating on the source in the window, the
+// drain names the move as finishing in the background, and the owner records
+// where the guest ends — the target when the move completed, the source when
+// it failed. Never the target while libvirt may still fail it.
+//
+// Mutation: let an aborted move skip the hand-off (pending && !aborted) — the
+// frame is done and the row is committed to the target while libvirt is still
+// moving the guest, red.
+func TestFleet_OperationAbortOfALiveDrainMoveLibvirtDoesNotAnswerIsFinishedInTheBackground(t *testing.T) {
+	for _, complete := range []bool{true, false} {
+		name := "fails"
+		if complete {
+			name = "completes"
+		}
+		t.Run(name, func(t *testing.T) {
+			sc := newStuckLiveDrainTimeout(t, false, 0)
+			ctx := context.Background()
+			release := releaseOnCleanup(t)
+			sc.src.Server.SetDrainAbortGraceForTest(300 * time.Millisecond)
+			entered := make(chan struct{})
+			var once sync.Once
+			sc.src.Virt.FailMigrateToTarget = func(n, _ string) error {
+				if n != "slow" {
+					return nil
+				}
+				once.Do(func() { close(entered) })
+				<-release
+				if !complete {
+					return errors.New("operation failed: migration out job: unexpectedly failed")
+				}
+				cutOver(t, sc)
+				return nil
+			}
+			type res struct {
+				p   *pb.DrainProgress
+				err error
+			}
+			out := make(chan res, 1)
+			go func() { p, err := sc.drain(t); out <- res{p, err} }()
+			select {
+			case <-entered:
+			case <-time.After(15 * time.Second):
+				t.Fatal("the live move never reached libvirt")
+			}
+			resp, err := sc.c.SelfClient(sc.dst).AbortVMOperation(ctx, &pb.AbortVMOperationRequest{VmName: "slow", Force: true})
+			if err != nil || !resp.GetAborted() {
+				t.Fatalf("abort = %+v, %v", resp, err)
+			}
+			var r res
+			select {
+			case r = <-out:
+			case <-time.After(15 * time.Second):
+				t.Fatal("the drain still waits on the unanswered abort")
+			}
+			if r.p == nil || r.p.Status != "failed" || !strings.Contains(r.p.Error, "background") ||
+				!strings.Contains(r.p.Error, "lv operation abort") {
+				t.Fatalf("frame = %+v (err %v); want failed, aborted, left to the background", r.p, r.err)
+			}
+			if r.err == nil || !strings.Contains(r.err.Error(), "the cancelled move of slow is finishing in the background") {
+				t.Fatalf("drain = %v; want it to name slow's cancelled move finishing in the background", r.err)
+			}
+			row, _ := corrosion.GetVM(ctx, sc.src.DB, "slow")
+			if row == nil || row.HostName != sc.src.Name || row.State != "migrating" {
+				t.Fatalf("row in the window = %+v; want migrating on %s", row, sc.src.Name)
+			}
+			close(release)
+			want := sc.src.Name
+			if complete {
+				want = sc.dst.Name
+			}
+			waitRow(t, sc.src, want, "running")
+			if n := sc.srcOps("shutdown"); n != 0 {
+				t.Fatalf("shut down %d time(s)", n)
+			}
+			if got := sc.src.Virt.DomainExists("slow"); got == complete {
+				t.Fatalf("source domain exists = %v with complete=%v", got, complete)
+			}
+		})
+	}
+}
+
+// An abort that reaches libvirt before the migration job exists fails ("no
+// job is active"). It is sent again until libvirt takes it, so the move is
+// still aborted, within the grace, and the guest stays on the source.
+//
+// Mutation: send the abort once — the move is never aborted, the drain hands
+// it to the background at the grace, red.
+func TestFleet_OperationAbortThatLibvirtRefusesIsSentAgain(t *testing.T) {
+	sc := newStuckLiveDrainTimeout(t, false, 0)
+	sc.src.Server.SetDrainAbortGraceForTest(5 * time.Second)
+	var refused atomic.Bool
+	sc.src.Virt.FailAbortMigration = func(name string) error {
+		if name == "slow" && refused.CompareAndSwap(false, true) {
+			return errors.New("Requested operation is not valid: no job is active on the domain")
+		}
+		return nil
+	}
+	p, err, elapsed := abortStuckLiveDrain(t, sc)
+	if elapsed > 4*time.Second {
+		t.Fatalf("the drain took %v; the refused abort was not sent again", elapsed)
+	}
+	if p == nil || p.Status != "failed" || strings.Contains(p.Error, "background") ||
+		!strings.Contains(p.Error, "lv operation abort") {
+		t.Fatalf("drain progress for slow = %+v (err %v); want the move aborted, not left to the background", p, err)
+	}
+	if n := sc.src.Virt.AbortedMigrations("slow"); n != 2 {
+		t.Fatalf("abort sent %d time(s), want 2 (refused, then taken)", n)
+	}
+	waitRow(t, sc.src, sc.src.Name, "running")
+}
+
+// An abort that lands before libvirt is asked (here, while the target admits
+// the VM) is reported as the abort it is, not as the target refusing the
+// move, and libvirt is never asked to migrate.
+//
+// Mutation: report the interrupted step's error — "target admission refused:
+// ... context canceled", red.
+func TestFleet_OperationAbortBeforeTheLiveMoveStartsIsReportedAsAnAbort(t *testing.T) {
+	sc := newStuckLiveDrainTimeout(t, false, 0)
+	entered := make(chan struct{})
+	var once sync.Once
+	sc.dst.HookUnary("ReserveHostCapacity", func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
+		once.Do(func() { close(entered) })
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(15 * time.Second):
+			return h(ctx, req)
+		}
+	})
+	type res struct {
+		p   *pb.DrainProgress
+		err error
+	}
+	out := make(chan res, 1)
+	go func() { p, err := sc.drain(t); out <- res{p, err} }()
+	select {
+	case <-entered:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the live move never reached the target's admission")
+	}
+	resp, err := sc.c.SelfClient(sc.src).AbortVMOperation(context.Background(),
+		&pb.AbortVMOperationRequest{VmName: "slow", Force: true})
+	if err != nil || !resp.GetAborted() {
+		t.Fatalf("operation abort = %+v, %v; want the drain's move of slow aborted", resp, err)
+	}
+	var r res
+	select {
+	case r = <-out:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the drain did not end after its move was aborted")
+	}
+	if r.p == nil || r.p.Status != "failed" ||
+		!strings.HasPrefix(r.p.Error, "live move was cancelled by `lv operation abort slow --force` before libvirt started it") {
+		t.Fatalf("drain progress for slow = %+v; want the abort reported as such", r.p)
+	}
+	if n := sc.srcOps("migrate"); n != 0 {
+		t.Fatalf("libvirt was asked to migrate %d time(s)", n)
+	}
+	row, rerr := corrosion.GetVM(context.Background(), sc.src.DB, "slow")
+	if rerr != nil || row == nil || row.HostName != sc.src.Name || row.State != "running" {
+		t.Fatalf("VM row = %+v (err %v); want running on %s", row, rerr, sc.src.Name)
 	}
 }

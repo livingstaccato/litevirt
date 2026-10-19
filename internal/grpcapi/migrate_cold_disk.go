@@ -35,6 +35,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/diskmode"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/storage"
 )
@@ -522,11 +523,11 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 		if !s.migrationStubs.owns(vm.Name, hdr.Path) {
 			return status.Errorf(codes.FailedPrecondition,
 				"disk %s of VM %q already exists on %s, and this migration did not create it. "+
-					"It may be the VM's disk from an earlier stay on %s, and the copy would overwrite it. "+
-					"It may be the only copy of the VM's data from before a failover: do not delete it. Move it aside on %s "+
-					"(rename it to <path>.superseded-<time>, which `lv host superseded-disks` then lists and keeps), "+
+					"It may be the VM's disk from an earlier stay on %s, or a copy a move that was rolled back placed "+
+					"after it gave up, and the copy would overwrite it. "+
+					"It may be the only copy of the VM's data from before a failover: do not delete it. %s, "+
 					"then migrate again",
-				hdr.Path, vm.Name, s.hostName, s.hostName, s.hostName)
+				hdr.Path, vm.Name, s.hostName, s.hostName, moveAsideAdvice(s.hostName, dst))
 		}
 	} else if !os.IsNotExist(err) {
 		return status.Errorf(codes.Internal, "stat %s: %v", hdr.Path, err)
@@ -634,6 +635,11 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	if err := tmp.Close(); err != nil {
 		return status.Errorf(codes.Internal, "close %s: %v", hdr.Path, err)
 	}
+	// A source that gave up on the copy (its stall bound, an abort) has
+	// rolled the move back: the copy is not placed, and the scratch file goes.
+	if err := stream.Context().Err(); err != nil {
+		return status.Errorf(codes.Canceled, "the source gave up on the copy of %s before it was placed: %v", hdr.Path, err)
+	}
 	// A stub this host made for the VM's migration is the one file the copy may
 	// take the place of (checked above); anything else at the path — even one
 	// that appeared since the check — makes the placement fail.
@@ -682,6 +688,14 @@ func (s *Server) removeColdMigratedSourceDisks(ctx context.Context, vmName strin
 		}
 		slog.Info("cold migration: removed the source copy of a migrated disk", "vm", vmName, "path", d.Path)
 	}
+}
+
+// moveAsideAdvice is the way out of a disk file at path on host that a copy
+// would overwrite: the exact rename that sets it aside where
+// `lv host superseded-disks` lists and keeps it. Nothing deletes it.
+func moveAsideAdvice(host, path string) string {
+	return fmt.Sprintf("Move it aside on %s with `mv %s %s` (`lv host superseded-disks %s` then lists and keeps it)",
+		host, path, health.SupersededName(path, time.Now()), host)
 }
 
 // Scratch-file markers. A cold copy's scratch files are hidden (a leading dot)

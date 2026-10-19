@@ -68,6 +68,10 @@ func supersededName(path string, at time.Time) string {
 	return path + supersededInfix + at.UTC().Format(supersededTimeLayout)
 }
 
+// SupersededName is where an operator moves the file at path aside, now, so
+// that `lv host superseded-disks` lists and keeps it.
+func SupersededName(path string, now time.Time) string { return supersededName(path, now) }
+
 // parseSupersededName splits a set-aside copy's name into the disk path it
 // came from and when; ok=false for any other name.
 func parseSupersededName(name string) (diskPath string, at time.Time, ok bool) {

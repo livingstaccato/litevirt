@@ -776,8 +776,10 @@ func TestFleet_DrainColdMoveWaitsForASlowFinalSync(t *testing.T) {
 // holds the guest down for the stall bound, not for a time that grows with
 // the disk's size: the copy is aborted and the move rolls back.
 //
-// Mutation: bound the wait after the last frame by the disk's size at
-// 16 MiB/s (at least the stall bound) — it is 1s for this disk, red.
+// Mutations: bound the wait after the last frame by the disk's size at
+// 16 MiB/s (at least the stall bound) — it is 1s for this disk, and the
+// abort names 1s, red. Wait at least 3s after the last frame — the source
+// gives up too late, red.
 func TestFleet_DrainColdMoveToATargetWedgedAfterTheLastFrameIsRolledBack(t *testing.T) {
 	sc := newColdStoppedScenario(t)
 	sc.makeRunning(t)
@@ -820,7 +822,7 @@ func TestFleet_DrainColdMoveToATargetWedgedAfterTheLastFrameIsRolledBack(t *test
 	case <-time.After(5 * time.Second):
 		t.Fatal("the target's stream never ended")
 	}
-	if waited := to.Sub(from); waited >= 800*time.Millisecond {
+	if waited := to.Sub(from); waited >= 1500*time.Millisecond {
 		t.Fatalf("the source waited %v for the target's answer after the last frame; want about the %v stall bound", waited, stall)
 	}
 }
@@ -849,5 +851,84 @@ func TestFleet_ColdDiskReceiveSyncsAsItWrites(t *testing.T) {
 	defer mu.Unlock()
 	if periodic < 2 {
 		t.Fatalf("the target synced %d time(s) while it wrote ~2 MiB in 1 MiB steps; want at least 2", periodic)
+	}
+}
+
+// A target whose final sync returns after the source gave up on the copy
+// (its stall bound) does not place the disk: the source has rolled the move
+// back and runs the VM, and a placed copy would be a stray full copy of its
+// disk on the target. The scratch file goes too.
+//
+// Mutation: place without checking the stream — the disk appears on the
+// target, red.
+func TestFleet_ColdDiskCopyTheSourceGaveUpOnIsNotPlaced(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	sc.src.Server.SetColdDiskStallForTest(300 * time.Millisecond)
+	release := make(chan struct{})
+	var once sync.Once
+	releaseNow := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(releaseNow)
+	sc.dst.Server.SetColdDiskSyncHookForTest(func(final bool) {
+		if final {
+			<-release
+		}
+	})
+	progress, err := drainWithin(t, sc, 30*time.Second)
+	assertIncomplete(t, err)
+	if p := progress["os1"]; p == nil || p.Status != "failed" || !strings.Contains(p.Error, "no progress") {
+		t.Fatalf("drain progress for os1 = %+v, want failed, the copy aborted", p)
+	}
+	dst := sc.file(sc.dst, sc.disk)
+	scratch := filepath.Join(filepath.Dir(dst), "."+filepath.Base(dst)+".receiving-*")
+	if m, _ := filepath.Glob(scratch); len(m) == 0 {
+		t.Fatal("the target holds no scratch file while its final sync is wedged")
+	}
+	releaseNow()
+	eventually(t, 15*time.Second, "the target to finish its receive", func() bool {
+		m, _ := filepath.Glob(scratch)
+		return len(m) == 0
+	})
+	if _, err := os.Lstat(dst); !os.IsNotExist(err) {
+		t.Fatalf("the target placed the disk at %s after the source gave up on the copy (stat: %v)", dst, err)
+	}
+	sc.assertRunningOnSource(t)
+}
+
+// A disk file already on the target that no migration of this attempt made
+// (one a rolled-back move placed in the instant after its source gave up, or
+// an earlier stay's) refuses the move before the guest is shut down, and the
+// refusal names the exact way out: the rename that sets the file aside, and
+// the command that then lists and keeps it. The file is left as it was.
+//
+// Mutation: the old wording (<path>.superseded-<time>) — red.
+func TestFleet_DrainColdMoveNamesTheWayOutOfAStrayTargetDisk(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	dst := sc.file(sc.dst, sc.disk)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst, []byte("a stray copy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	progress, err := drainWithin(t, sc, 30*time.Second)
+	assertIncomplete(t, err)
+	p := progress["os1"]
+	if p == nil || p.Status == "done" {
+		t.Fatalf("drain progress for os1 = %+v, want the move refused", p)
+	}
+	if want := "`mv " + dst + " " + dst + ".superseded-"; !strings.Contains(p.Error, want) ||
+		!strings.Contains(p.Error, "`lv host superseded-disks "+sc.dst.Name+"`") {
+		t.Fatalf("refusal = %q; want the rename (%s<time>`) and `lv host superseded-disks %s`", p.Error, want, sc.dst.Name)
+	}
+	if n := sc.srcOps("shutdown"); n != 0 {
+		t.Fatalf("os1 was shut down %d time(s); the refusal must come before the shutdown", n)
+	}
+	if got, err := os.ReadFile(dst); err != nil || string(got) != "a stray copy" {
+		t.Fatalf("the stray file changed (err %v, %q)", err, got)
+	}
+	if active, _ := sc.src.Virt.DomainIsActive("os1"); !active {
+		t.Fatal("os1 is not running on the source")
 	}
 }

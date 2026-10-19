@@ -10,6 +10,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
 
 	"google.golang.org/grpc"
@@ -1931,8 +1932,14 @@ func (s *Server) SetMigrationCAFingerprint(fn func() (string, error)) { s.migrat
 func (s *Server) SetDrainAbortGraceForTest(d time.Duration) { s.drainAbortGrace = d }
 
 // SetDrainCommitFaultForTest makes the ownership commit a drain writes after
-// a completed live move fail with fn's error (nil fn: no fault). Tests only.
-func (s *Server) SetDrainCommitFaultForTest(fn func(vm string) error) { s.drainCommitFault = fn }
+// a completed live move fail with fn's error (nil fn: no fault). Outside a
+// test binary it panics, and the drain never consults the fault there.
+func (s *Server) SetDrainCommitFaultForTest(fn func(vm string) error) {
+	if !testing.Testing() {
+		panic("grpcapi.SetDrainCommitFaultForTest called outside a test")
+	}
+	s.drainCommitFault = fn
+}
 
 // localMigrationCA is this host's migration CA fingerprint, "" when it has
 // none (or no hook is set). An error is a CA file that cannot be read: the

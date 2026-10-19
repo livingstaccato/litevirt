@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"testing"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -693,6 +694,13 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		return skip
 	}
 	unlock := releaseOnce(lockUnlock)
+	if ctx.Err() != nil {
+		// The drain was cancelled (its client went away) before this job ran:
+		// start nothing, and say so rather than "VM no longer exists".
+		unlock()
+		return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped", Strategy: notMoved,
+			Error: "the drain was cancelled before this VM's move started; it keeps running here"}
+	}
 	adopted := false
 	defer func() {
 		if !adopted {
@@ -897,7 +905,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		// must not leave the row migrating on the source, which nothing heals.
 		dctx := context.WithoutCancel(ctx)
 		var err error
-		if s.drainCommitFault != nil {
+		if s.drainCommitFault != nil && testing.Testing() {
 			err = s.drainCommitFault(vm.Name)
 		}
 		if err == nil {
@@ -1008,14 +1016,23 @@ const drainTimedOutPrefix = "live move did not finish within "
 // ordinary operation. A var so tests can shorten it.
 var drainLockWait = 10 * time.Minute
 
+// drainLockPoll is how often a drain waiting on a VM's lock tries it again
+// (and reads the VM's row to see whether a move of it went in flight).
+const drainLockPoll = 250 * time.Millisecond
+
 // drainLockVM takes vm's lock for a drain. A VM whose move is in flight (its
 // row migrating: a move finishing in the background holds the lock until
 // libvirt ends it) is skipped at once. Any other holder — a scheduled
 // snapshot, a replication run, a hotplug, a backup — is waited for, up to
 // drainLockWait, after which the VM is skipped. skip is the frame then.
 func (s *Server) drainLockVM(ctx context.Context, vm, target string) (unlock func(), skip *pb.DrainProgress) {
+	cancelled := func() *pb.DrainProgress {
+		return &pb.DrainProgress{VmName: vm, TargetHost: target, Status: "skipped", Strategy: notMoved,
+			Error: "the drain was cancelled before this VM's move started; it keeps running here"}
+	}
 	inFlight := func() *pb.DrainProgress {
-		if row, err := corrosion.GetVM(ctx, s.db, vm); err == nil && row != nil && row.State == "migrating" {
+		// Read detached: a cancelled drain must still tell a move in flight.
+		if row, err := corrosion.GetVM(context.WithoutCancel(ctx), s.db, vm); err == nil && row != nil && row.State == "migrating" {
 			return &pb.DrainProgress{VmName: vm, TargetHost: target, Status: "skipped", Strategy: notMoved,
 				Error: "a move of this VM is in flight (an earlier drain's finishing in the background, or a migration); " +
 					"re-run drain once it ends (`lv events " + vm + "`)"}
@@ -1028,9 +1045,20 @@ func (s *Server) drainLockVM(ctx context.Context, vm, target string) (unlock fun
 	if p := inFlight(); p != nil {
 		return nil, p
 	}
-	deadline := time.Now().Add(drainLockWait)
-	for time.Now().Before(deadline) {
-		time.Sleep(100 * time.Millisecond)
+	deadline := time.NewTimer(drainLockWait)
+	defer deadline.Stop()
+	tick := time.NewTicker(drainLockPoll)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, cancelled()
+		case <-deadline.C:
+			return nil, &pb.DrainProgress{VmName: vm, TargetHost: target, Status: "skipped", Strategy: notMoved,
+				Error: fmt.Sprintf("another operation still holds this VM after %s (a scheduled snapshot, a replication run, "+
+					"a hotplug or resize, or a backup); re-run drain once it ends", drainLockWait)}
+		case <-tick.C:
+		}
 		if u, ok := s.tryLockVM(vm); ok {
 			return u, nil
 		}
@@ -1038,9 +1066,6 @@ func (s *Server) drainLockVM(ctx context.Context, vm, target string) (unlock fun
 			return nil, p
 		}
 	}
-	return nil, &pb.DrainProgress{VmName: vm, TargetHost: target, Status: "skipped", Strategy: notMoved,
-		Error: fmt.Sprintf("another operation still holds this VM after %s (a scheduled snapshot, a replication run, "+
-			"a hotplug or resize, or a backup); re-run drain once it ends", drainLockWait)}
 }
 
 // undrainJudge is undrain's judgement of host's drain_move_timed_out. On the
@@ -1209,7 +1234,11 @@ func (s *Server) forgetDrainTimeout(ctx context.Context, host, vm string) {
 		return
 	}
 	// A host no longer draining (undrained meanwhile) owes no aborted move:
-	// only VMs still in flight there stay named.
+	// only VMs still in flight there stay named. Read from this replica: one
+	// that has not yet seen the undrain keeps the aborted names, and an
+	// undrain served elsewhere that still sees a stale migrating row writes
+	// nothing, so under replication lag they can stay named until the next
+	// drain or undrain of the host. Cosmetic: no VM is moved by the condition.
 	draining := true
 	if h, err := corrosion.GetHost(ctx, s.db, host); err == nil && h != nil && h.State != "draining" {
 		draining = false

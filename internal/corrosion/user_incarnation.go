@@ -346,27 +346,49 @@ func validateUserIncarnationEntry(stmts []Statement) error {
 	return nil
 }
 
-// retireOlderIncarnationRows drops, on this node only, every row keyed by
-// username that an older incarnation of the name left here
-// (applyUserIncarnation). Each statement is on one line for the hard-delete
-// tripwire (hard_delete_guard_test.go).
+// retireOlderIncarnationRows drops, on this node only, the rows under the
+// name an older incarnation left here that could keep the new account's own
+// writes from landing (applyUserIncarnation). It never drops a row whose loss
+// could GRANT access: a row the new account's writes put here first, from
+// another origin ahead of the re-create, is indistinguishable from an older
+// incarnation's, so only the side whose loss is fail-closed goes:
+//
+//   - a row that grants (a credential, a recovery code or its active set, an
+//     enrollment code, a directory binding, a role binding — bindings are
+//     union-only, so losing one never widens access) goes only while LIVE.
+//     Its tombstone stays: dropped, an older live row of the same key could
+//     land under it and grant again (a consumed code, an unbound identity);
+//   - a row that restricts (a second factor or its active set, a lifecycle
+//     attribute: disabled, expiry, session and token cut-offs) goes only as a
+//     TOMBSTONE. A live one stays: dropped, a disabled account would read as
+//     enabled, or a factor would stop being asked for, until anti-entropy
+//     brought it back.
+//
+// What this costs is fail-closed: an older incarnation's live restriction (a
+// lagging delete's cut-off) or tombstoned grant of the same key (its cleared
+// directory binding, its consumed enrollment code) can still reach the new
+// account, which then logs in again, binds again or is issued a new code.
+// Each statement is on one line for the hard-delete tripwire
+// (hard_delete_guard_test.go).
 func retireOlderIncarnationRows(ctx context.Context, tx *sql.Tx, username string) error {
 	for _, q := range []string{
-		`DELETE FROM user_credentials WHERE username = ? -- full-state-delete-ok: an older incarnation's, replaced by a re-create`,
-		`DELETE FROM user_2fa WHERE username = ? -- full-state-delete-ok: an older incarnation's, replaced by a re-create`,
-		`DELETE FROM user_2fa_sets WHERE username = ? -- full-state-delete-ok: an older incarnation's, replaced by a re-create`,
-		`DELETE FROM recovery_codes WHERE username = ? -- full-state-delete-ok: an older incarnation's, replaced by a re-create`,
-		`DELETE FROM recovery_code_sets WHERE username = ? -- full-state-delete-ok: an older incarnation's, replaced by a re-create`,
-		`DELETE FROM user_enrollment_codes WHERE username = ? -- full-state-delete-ok: an older incarnation's, replaced by a re-create`,
-		`DELETE FROM user_identity_bindings WHERE username = ? -- full-state-delete-ok: an older incarnation's, replaced by a re-create`,
-		`DELETE FROM user_lifecycle WHERE username = ? -- full-state-delete-ok: an older incarnation's, replaced by a re-create`,
+		// Grants: live rows only.
+		`DELETE FROM user_credentials WHERE username = ? AND deleted_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
+		`DELETE FROM recovery_codes WHERE username = ? AND deleted_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
+		`DELETE FROM recovery_code_sets WHERE username = ? AND deleted_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
+		`DELETE FROM user_enrollment_codes WHERE username = ? AND deleted_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
+		`DELETE FROM user_identity_bindings WHERE username = ? AND deleted_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
+		// Restrictions: tombstones only.
+		`DELETE FROM user_2fa WHERE username = ? AND deleted_at IS NOT NULL -- full-state-delete-ok: an older incarnation's lifted restriction, replaced by a re-create`,
+		`DELETE FROM user_2fa_sets WHERE username = ? AND deleted_at IS NOT NULL -- full-state-delete-ok: an older incarnation's lifted restriction, replaced by a re-create`,
+		`DELETE FROM user_lifecycle WHERE username = ? AND deleted_at IS NOT NULL -- full-state-delete-ok: an older incarnation's lifted restriction, replaced by a re-create`,
 	} {
 		if _, err := tx.ExecContext(ctx, q, username); err != nil {
 			return err
 		}
 	}
 	_, err := tx.ExecContext(ctx,
-		`DELETE FROM role_bindings WHERE principal IN (?, ?) -- full-state-delete-ok: an older incarnation's, replaced by a re-create`,
+		`DELETE FROM role_bindings WHERE principal IN (?, ?) AND deleted_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
 		"user:"+username, "user:"+username+"@local")
 	return err
 }

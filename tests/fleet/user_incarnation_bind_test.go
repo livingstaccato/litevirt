@@ -149,6 +149,13 @@ func TestFleet_ALaggingDeleteLeavesARecreatedUsersRows(t *testing.T) {
 		before func(t *testing.T, n *Node)
 		make   func(t *testing.T, n *Node)
 		holds  func(t *testing.T, n *Node) bool
+		// residue: the lagging node's own row of the same key (a cleared
+		// binding, a cut-off) is one the re-create's retirement must keep,
+		// because it cannot tell it from the new account's and losing it
+		// could grant access. It reaches the new account fail-closed, from
+		// node-2 and then by anti-entropy; only node-0, where the re-create
+		// was made, is checked, over the WAL.
+		residue bool
 	}{
 		{"role binding", nil, func(t *testing.T, n *Node) {
 			if err := corrosion.InsertRoleBinding(ctx, n.DB, corrosion.RoleBindingRecord{
@@ -166,7 +173,7 @@ func TestFleet_ALaggingDeleteLeavesARecreatedUsersRows(t *testing.T) {
 				}
 			}
 			return false
-		}},
+		}, false},
 		{"second factor", nil, func(t *testing.T, n *Node) {
 			if err := corrosion.InsertUser2FA(ctx, n.DB, corrosion.User2FARecord{
 				Username: "carol", Method: "totp", Secret: "s-new", Label: "phone"}); err != nil {
@@ -178,7 +185,7 @@ func TestFleet_ALaggingDeleteLeavesARecreatedUsersRows(t *testing.T) {
 				t.Fatal(err)
 			}
 			return len(fs) == 1 && fs[0].Secret == "s-new"
-		}},
+		}, false},
 		{"recovery codes", nil, func(t *testing.T, n *Node) {
 			if err := corrosion.InsertRecoveryCodes(ctx, n.DB, "carol", []string{"code-new"}); err != nil {
 				t.Fatal(err)
@@ -190,7 +197,7 @@ func TestFleet_ALaggingDeleteLeavesARecreatedUsersRows(t *testing.T) {
 				t.Fatal(err)
 			}
 			return len(rows) == 1
-		}},
+		}, false},
 		{"enrollment code", nil, func(t *testing.T, n *Node) {
 			g := capabilities.GrantForTest(t, capabilities.FeatureLoginPolicy)
 			if _, _, err := corrosion.IssueEnrollmentCode(ctx, n.DB, g, "carol", time.Hour, "admin", n.Name); err != nil {
@@ -202,7 +209,7 @@ func TestFleet_ALaggingDeleteLeavesARecreatedUsersRows(t *testing.T) {
 				t.Fatal(err)
 			}
 			return live
-		}},
+		}, false},
 		// The old carol was bound to the same directory identity, so the
 		// lagging delete clears the very row the new carol's binding is.
 		{"directory binding", func(t *testing.T, n *Node) {
@@ -221,14 +228,14 @@ func TestFleet_ALaggingDeleteLeavesARecreatedUsersRows(t *testing.T) {
 				t.Fatal(err)
 			}
 			return id == "ext-1"
-		}},
+		}, true},
 		{"session cut-off", nil, nil, func(t *testing.T, n *Node) bool {
 			lc, err := corrosion.GetUserLifecycle(ctx, n.DB, "carol")
 			if err != nil {
 				t.Fatal(err)
 			}
 			return lc.SessionsNotBefore == "" && lc.TokensNotBefore == ""
-		}},
+		}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := recreatedWhileLagging(t, 5532, "hash-new", func(n *Node) {
@@ -247,9 +254,15 @@ func TestFleet_ALaggingDeleteLeavesARecreatedUsersRows(t *testing.T) {
 			})
 			for _, when := range []string{"over the WAL", "after anti-entropy"} {
 				if when == "after anti-entropy" {
+					if tc.residue {
+						break
+					}
 					antiEntropyRound(t, c)
 				}
 				for _, n := range c.Nodes {
+					if tc.residue && n != c.Nodes[0] {
+						continue
+					}
 					if !tc.holds(t, n) {
 						t.Errorf("%s, %s: the lagging delete of the old carol reached the new carol's %s", when, n.Name, tc.name)
 					}

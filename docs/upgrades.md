@@ -1516,7 +1516,11 @@ lagging host revives it. `lv user create` of a deleted name makes a new
 account, which replaces the deleted one everywhere. Nor does a lagging
 host's password change, or its delete of the deleted account, reach the new
 account: its password, second factors, recovery codes, role bindings,
-enrollment code, directory bindings and session cut-offs stay its own. The
+enrollment code, directory bindings and session cut-offs stay its own. Two
+things of the deleted account can still reach the new one from the lagging
+host itself, and both only take access away: its session cut-offs, which log
+the new account out once, and its clearing of a directory identity the new
+account is bound to as well, which the new account binds again. The
 token latches on its own once every host the cluster replicates to, including
 one parked in `maintenance`, runs this release. Until then hosts write and
 merge users rows as the previous release does.

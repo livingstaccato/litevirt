@@ -274,13 +274,15 @@ func TestCheckPeers_RedialsWhenThePeerRowChanges(t *testing.T) {
 		t.Errorf("after the peer moved: its new address got %d connections, want 1", n)
 	}
 
-	// A new incarnation of the row (re-admission restamps created_at).
+	// The row's insert stamp converging between replicas (the hosts tie
+	// chain) is not a new incarnation: a re-admission always carries a new
+	// certificate serial, which AdmitHost requires. The connection stands.
 	if _, err := c.DB().Exec(`UPDATE hosts SET created_at = '2099-01-01T00:00:00.000000000Z' WHERE name = 'peer-a'`); err != nil {
 		t.Fatal(err)
 	}
 	ae.checkPeers(ctx)
-	if n := newLn.accepts.Load(); n != 2 {
-		t.Errorf("after the peer's incarnation changed: %d connections, want 2 (redialled)", n)
+	if n := newLn.accepts.Load(); n != 1 {
+		t.Errorf("after only the row's created_at changed: %d connections, want 1 (reused)", n)
 	}
 }
 
@@ -665,5 +667,31 @@ func TestCheckPeers_AMergeDoesNotWaitForASlowerDigest(t *testing.T) {
 	}
 	if !fastWhileSlowInFlight.Load() {
 		t.Error("the fast peer's exchange finished only after the slow peer's digest: merges wait for the slowest digest")
+	}
+}
+
+// A peer removed while the pass merged from the peers before it is not pulled
+// from over its old connection.
+func TestFinishExchange_RefusesAPeerRemovedSinceItsDigest(t *testing.T) {
+	ae, c, _, ex := openAgreeingExchange(t)
+	if _, err := c.DB().Exec(`UPDATE hosts SET deleted_at = '2099-01-01T00:00:00Z' WHERE name = 'peer-a'`); err != nil {
+		t.Fatal(err)
+	}
+	if ae.finishExchange(context.Background(), ex, nil, false) {
+		t.Error("merged from a peer removed since its digest, over the old connection")
+	}
+}
+
+// Replicas converging on one insert stamp for a peer's row move its
+// created_at mid-pass on every node that held another (the hosts tie chain).
+// That is not a new incarnation, and refusing it held every such exchange
+// back for a pass.
+func TestFinishExchange_AConvergedInsertStampDoesNotRefuse(t *testing.T) {
+	ae, c, _, ex := openAgreeingExchange(t)
+	if _, err := c.DB().Exec(`UPDATE hosts SET created_at = '2099-01-01T00:00:00.000000000Z' WHERE name = 'peer-a'`); err != nil {
+		t.Fatal(err)
+	}
+	if !ae.finishExchange(context.Background(), ex, nil, false) {
+		t.Error("refused an exchange because the peer row's created_at converged")
 	}
 }

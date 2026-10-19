@@ -29,9 +29,10 @@ var antiEntropyConnMaxAge = 10 * time.Minute
 // afterwards, so every pass paid a TCP and a TLS handshake per peer.
 //
 // A pooled connection is reused only while everything it was dialled against
-// is unchanged: the peer's address, its recorded certificate serial and its
-// row's incarnation (created_at, restamped by a re-admission), this node's own
-// PKI files (ca.crt, host.crt, host.key, crl.pem — a revocation is enforced at
+// is unchanged: the peer's address and its recorded certificate serial (which
+// also marks a new incarnation: AdmitHost requires a re-admission to carry a
+// new one; created_at is not used, because replicas converging on one insert
+// stamp move it with no new incarnation), this node's own PKI files (ca.crt, host.crt, host.key, crl.pem — a revocation is enforced at
 // the handshake, so a new CRL must force one), and antiEntropyConnMaxAge.
 // A pass also drops the connection of every peer no longer a member, and of a
 // peer whose digest failed, so the next pass dials afresh instead of waiting
@@ -193,8 +194,9 @@ func (ae *AntiEntropy) pooledPeerClient(ctx context.Context, peer string) (pc *a
 }
 
 // peerKey is the dial target for peer and the key a connection to it is valid
-// under: the target, the peer row's certificate serial and incarnation, and
-// this node's PKI stamp.
+// under: the target, the peer row's certificate serial, and this node's PKI
+// stamp. A removed peer has no row, and resolves to its gossip address or not
+// at all.
 func (ae *AntiEntropy) peerKey(ctx context.Context, peer string) (target, key string, err error) {
 	target, host, err := resolvePeerEndpoint(ctx, ae.client, peer)
 	if err != nil {
@@ -202,7 +204,7 @@ func (ae *AntiEntropy) peerKey(ctx context.Context, peer string) (target, key st
 	}
 	key = target
 	if host != nil {
-		key = fmt.Sprintf("%s|%s|%s", target, host.CertSerial, host.CreatedAt)
+		key = fmt.Sprintf("%s|%s", target, host.CertSerial)
 	}
 	return target, key + "|" + pkiStamp(ae.pkiDir), nil
 }

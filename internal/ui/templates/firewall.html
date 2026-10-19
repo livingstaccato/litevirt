@@ -93,8 +93,8 @@
         <span class="muted" style="font-size:11px">New TCP connections toward guest NICs, limited per NIC and source. "In force" is what each host's firewall applies; change it with <span class="mono">lv firewall synflood</span>.</span>
       </div>
     </div>
-    <div style="padding:8px 16px" hx-get="/ui/firewall/synflood" hx-trigger="load" hx-swap="innerHTML">
-      <span class="muted">Asking every host…</span>
+    <div style="padding:8px 16px" id="fw-synflood-slot">
+      <button class="btn btn-sm" hx-get="/ui/firewall/synflood" hx-trigger="click" hx-target="#fw-synflood-slot" hx-swap="innerHTML">Ask every host</button>
     </div>
   </div>
 

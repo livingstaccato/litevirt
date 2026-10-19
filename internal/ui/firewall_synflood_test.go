@@ -64,7 +64,7 @@ func rowText(body, host string) string {
 // daemon that predates SYN-flood status the panel says so.
 //
 // Mutations: show the policy as in force — h1 shows on: red; show an empty
-// in_force as on — h3: red.
+// in_force as on — h3: red; load the panel with the page — red.
 func TestUIFirewall_SynfloodPanelShowsWhatIsInForce(t *testing.T) {
 	m := &synfloodUIMock{mockGRPC: newDefaultMock(), resp: &pb.GetFirewallSynfloodResponse{Policies: []*pb.FirewallSynfloodPolicy{
 		{Scope: "cluster", Mode: "on", Rate: 200, Burst: 1000, SetBy: "olga"},
@@ -76,7 +76,12 @@ func TestUIFirewall_SynfloodPanelShowsWhatIsInForce(t *testing.T) {
 
 	page := serveRequest(s, authReq(t, "GET", "/firewall", nil))
 	assertStatus(t, page, http.StatusOK)
-	mustContain(t, page.Body.String(), `hx-get="/ui/firewall/synflood"`)
+	// The panel asks every host only when asked, not on each page view
+	// (round-1 re-review n-2).
+	mustContain(t, page.Body.String(), `hx-get="/ui/firewall/synflood"`, `hx-trigger="click"`)
+	if strings.Contains(page.Body.String(), `hx-trigger="load"`) {
+		t.Error("the firewall page asks every host for SYN-flood status on each view")
+	}
 
 	w := serveRequest(s, authReq(t, "GET", "/ui/firewall/synflood", nil))
 	assertStatus(t, w, http.StatusOK)

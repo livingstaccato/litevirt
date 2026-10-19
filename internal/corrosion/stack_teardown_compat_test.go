@@ -89,7 +89,7 @@ func TestStackTeardownRecord_CrossesARollingUpgrade(t *testing.T) {
 func TestStackFirewallIntent_KeepsADefaultDenyAsk(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct{ name, value string }{
-		{"recorded", `{"firewall":true,"default_deny":true}`},
+		{"recorded", ""},
 		{"unreadable", `not json`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -106,7 +106,12 @@ func TestStackFirewallIntent_KeepsADefaultDenyAsk(t *testing.T) {
 			if err := SetFirewallDefault(ctx, c, "cluster", true, "base"); err != nil {
 				t.Fatal(err)
 			}
-			if err := c.Execute(ctx, clusterPolicyUpsertSQL, stackFirewallKeyPrefix+"edge", tc.value, "node-0", c.NowTS()); err != nil {
+			if tc.value == "" {
+				edge, _ := GetStack(ctx, c, "edge")
+				if err := SetStackFirewallIntent(ctx, c, edge, true, true, "node-0"); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := c.Execute(ctx, clusterPolicyUpsertSQL, stackFirewallKeyPrefix+"edge", tc.value, "node-0", c.NowTS()); err != nil {
 				t.Fatal(err)
 			}
 			read := func(y string) (bool, map[string]bool, error) { return y == "deny", nil, nil }
@@ -117,5 +122,37 @@ func TestStackFirewallIntent_KeepsADefaultDenyAsk(t *testing.T) {
 				t.Fatalf("the cluster default after base went = %+v, want deny handed to edge", d)
 			}
 		})
+	}
+}
+
+// A firewall intent speaks for the deployment it was written under: the
+// stack's record (created_at) since its last teardown began. It applies to
+// that deployment, including while it is being torn down, and not to one
+// recorded later, or after a teardown the stack was deployed again from.
+// One this build cannot read applies to every deployment.
+//
+// Mutations: ignore created_at — "another record", red. Ignore the teardown
+// stamp — "deployed again after a teardown", red. Drop the "deleting"
+// exception — "being torn down", red.
+func TestStackFirewallIntent_SpeaksForOneDeployment(t *testing.T) {
+	st := StackRecord{Name: "s", CreatedAt: "2026-10-19T10:00:00Z", State: "active"}
+	bound := StackFirewallIntent{Firewall: true, Created: st.CreatedAt, Teardown: "t1"}
+	for _, tc := range []struct {
+		name     string
+		in       StackFirewallIntent
+		st       StackRecord
+		teardown string
+		applies  bool
+	}{
+		{"its deployment", bound, st, "t1", true},
+		{"another record", bound, StackRecord{Name: "s", CreatedAt: "2026-10-19T11:00:00Z", State: "active"}, "t1", false},
+		{"written before a record existed", StackFirewallIntent{Firewall: true}, st, "", false},
+		{"deployed again after a teardown", bound, st, "t2", false},
+		{"being torn down", bound, StackRecord{Name: "s", CreatedAt: st.CreatedAt, State: "deleting"}, "t2", true},
+		{"unreadable", decodeStackFirewallIntent("not json"), st, "t9", true},
+	} {
+		if got := stackFirewallIntentApplies(tc.in, tc.st, tc.teardown); got != tc.applies {
+			t.Errorf("%s: applies = %v, want %v", tc.name, got, tc.applies)
+		}
 	}
 }

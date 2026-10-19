@@ -234,9 +234,13 @@ func TestStackReconciler_ReportsTheFirewallATornDownStackLeft(t *testing.T) {
 // file declares it again; a teardown without sg.write holds a firewall the
 // intent alone declares, and one with it clears the intent.
 //
+// A later deployment of the name does not inherit it, and a stored file this
+// build cannot read keeps the condition open.
+//
 // Mutations: never report a withdrawn firewall — red. Drop the intent from
-// stackFirewallHold — "held by the intent alone", red. Do not clear the
-// intent on an authorized teardown — red.
+// stackFirewallHold — "held by the intent alone", red. Drop the deployment
+// binding (stackFirewallIntentApplies true) — "a later deployment", red.
+// Skip an unreadable file — "an unreadable file", red.
 func TestStackReconciler_TheFirewallIntentOutlivesAStaleFile(t *testing.T) {
 	ctx := context.Background()
 	newDB := func() *corrosion.Client {
@@ -256,12 +260,10 @@ func TestStackReconciler_TheFirewallIntentOutlivesAStaleFile(t *testing.T) {
 	}
 	t.Run("withdrawn", func(t *testing.T) {
 		db := newDB()
-		if err := corrosion.SetStackFirewallIntent(ctx, db, "edge", corrosion.StackFirewallIntent{Firewall: true, DefaultDeny: true}, "node-0"); err != nil {
-			t.Fatal(err)
-		}
 		if err := corrosion.UpsertStack(ctx, db, corrosion.StackRecord{Name: "edge", ComposeYAML: "name: edge\n", State: "active"}); err != nil {
 			t.Fatal(err)
 		}
+		setIntent(t, db, "edge", true, true)
 		r := NewStackReconciler("node-0", db)
 		r.SetCleaner(&failingStackCleaner{})
 		r.ReconcileOnce(ctx)
@@ -279,9 +281,7 @@ func TestStackReconciler_TheFirewallIntentOutlivesAStaleFile(t *testing.T) {
 	t.Run("held by the intent alone", func(t *testing.T) {
 		db := seedDeletingStack(t, false, false)
 		db.SetClusterPolicyGate(func() bool { return true })
-		if err := corrosion.SetStackFirewallIntent(ctx, db, "app", corrosion.StackFirewallIntent{DefaultDeny: true}, "node-0"); err != nil {
-			t.Fatal(err)
-		}
+		setIntent(t, db, "app", false, true)
 		markTeardown(true, false)(t, db)
 		r := NewStackReconciler("node-0", db)
 		r.SetCleaner(&failingStackCleaner{})
@@ -294,12 +294,10 @@ func TestStackReconciler_TheFirewallIntentOutlivesAStaleFile(t *testing.T) {
 			t.Fatal("no condition for a teardown the intent holds")
 		}
 	})
-	t.Run("an authorized teardown clears it", func(t *testing.T) {
+	t.Run("a later deployment does not inherit it", func(t *testing.T) {
 		db := seedDeletingStack(t, false, false)
 		db.SetClusterPolicyGate(func() bool { return true })
-		if err := corrosion.SetStackFirewallIntent(ctx, db, "app", corrosion.StackFirewallIntent{Firewall: true}, "node-0"); err != nil {
-			t.Fatal(err)
-		}
+		setIntent(t, db, "app", true, false)
 		markTeardown(true, true)(t, db)
 		r := NewStackReconciler("node-0", db)
 		r.SetCleaner(&failingStackCleaner{})
@@ -308,8 +306,51 @@ func TestStackReconciler_TheFirewallIntentOutlivesAStaleFile(t *testing.T) {
 		if st, _ := corrosion.GetStack(ctx, db, "app"); st != nil {
 			t.Fatalf("the authorized teardown did not finish: %+v", st)
 		}
-		if in, found, _ := corrosion.GetStackFirewallIntent(ctx, db, "app"); !found || in.Firewall || in.DefaultDeny {
-			t.Errorf("intent after an authorized teardown = %+v (found %v), want cleared", in, found)
+		// The name is deployed again: another deployment.
+		if err := corrosion.UpsertStack(ctx, db, corrosion.StackRecord{Name: "app", ComposeYAML: "name: app\n", State: "active"}); err != nil {
+			t.Fatal(err)
+		}
+		st, _ := corrosion.GetStack(ctx, db, "app")
+		if in, applies, err := corrosion.StackFirewallIntentOf(ctx, db, *st); err != nil || applies {
+			t.Errorf("the torn-down deployment's intent %+v applies to the next one (err %v)", in, err)
+		}
+		r.ReconcileOnce(ctx)
+		if ok, ev := open(db, "app"); ok {
+			t.Errorf("the next deployment is reported for the last one's intent: %s", ev)
 		}
 	})
+	t.Run("an unreadable file keeps the condition open", func(t *testing.T) {
+		db := newDB()
+		if err := corrosion.UpsertStack(ctx, db, corrosion.StackRecord{Name: "edge", ComposeYAML: "name: edge\n", State: "active"}); err != nil {
+			t.Fatal(err)
+		}
+		setIntent(t, db, "edge", true, true)
+		r := NewStackReconciler("node-0", db)
+		r.SetCleaner(&failingStackCleaner{})
+		r.ReconcileOnce(ctx)
+		if ok, _ := open(db, "edge"); !ok {
+			t.Fatal("setup: no condition for the withdrawn intent")
+		}
+		if _, err := db.DB().ExecContext(ctx, `UPDATE stacks SET compose_yaml = ? WHERE name = 'edge'`, "vms: [a, b]\n"); err != nil {
+			t.Fatal(err)
+		}
+		r.ReconcileOnce(ctx)
+		if ok, ev := open(db, "edge"); !ok || !strings.Contains(ev, "cannot be read") {
+			t.Errorf("an unreadable file resolved the condition, or it does not say why: open %v, %s", ok, ev)
+		}
+	})
+}
+
+// setIntent records the firewall intent of stack's current deployment, as an
+// Admin's deploy does.
+func setIntent(t *testing.T, db *corrosion.Client, stack string, firewall, deny bool) {
+	t.Helper()
+	db.SetClusterPolicyGate(func() bool { return true })
+	st, err := corrosion.GetStack(context.Background(), db, stack)
+	if err != nil || st == nil {
+		t.Fatalf("stack %s: %+v %v", stack, st, err)
+	}
+	if err := corrosion.SetStackFirewallIntent(context.Background(), db, st, firewall, deny, "node-0"); err != nil {
+		t.Fatal(err)
+	}
 }

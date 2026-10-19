@@ -206,19 +206,20 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// workload action has been issued the rows stay, for `compose down`,
 	// which finds the stack's workloads by their stack_name.
 	//
+	//
 	// A caller with sg.write at the root records what this file declares of
-	// the firewall (corrosion.StackFirewallIntent) before any row changes. A
-	// deploy without it records nothing: one from a node whose replica holds
-	// an older file replaces the file on every peer, and must not withdraw
-	// the firewall a newer deploy declared.
-	if s.requireSGWrite(ctx) == nil {
-		if err := corrosion.SetStackFirewallIntent(ctx, s.db, f.Name, corrosion.StackFirewallIntent{
-			Firewall: f.DeclaresFirewall(), DefaultDeny: f.FirewallDefaults != nil && f.FirewallDefaults.DefaultDeny,
-		}, s.hostName); err != nil {
+	// the firewall (corrosion.StackFirewallIntent) for the stack's deployment
+	// before any row changes, and again once the record is written
+	// (recordStackDeploy; a first deploy has no deployment before). A deploy
+	// without it records nothing: one from a node whose replica holds an older
+	// file replaces the file on every peer, and must not withdraw the
+	// firewall a newer deploy declared.
+	prior, priorErr := corrosion.GetStack(ctx, s.db, f.Name)
+	if priorErr == nil && s.requireSGWrite(ctx) == nil {
+		if err := corrosion.SetStackFirewallIntent(ctx, s.db, prior, f.DeclaresFirewall(), fileAsksDefaultDeny(f), s.hostName); err != nil {
 			return status.Errorf(codes.Unavailable, "record the firewall stack %q declares: %v", f.Name, err)
 		}
 	}
-	prior, priorErr := corrosion.GetStack(ctx, s.db, f.Name)
 	written := &stackFirewallWrites{}
 	workloadPhase := false
 	if priorErr == nil && prior == nil {
@@ -404,11 +405,25 @@ func (s *Server) recordStackDeploy(ctx context.Context, f *compose.File, compose
 	}); dbErr != nil {
 		slog.Warn("upsert stack record failed", "stack", f.Name, "error", dbErr)
 	}
+	if s.requireSGWrite(ctx) == nil {
+		st, gErr := corrosion.GetStack(ctx, s.db, f.Name)
+		if gErr == nil {
+			gErr = corrosion.SetStackFirewallIntent(ctx, s.db, st, f.DeclaresFirewall(), fileAsksDefaultDeny(f), s.hostName)
+		}
+		if gErr != nil {
+			slog.Warn("record the firewall the stack declares failed", "stack", f.Name, "error", gErr)
+		}
+	}
 	if fd := f.FirewallDefaults; fd != nil && fd.DefaultDeny {
 		if dbErr := corrosion.EnsureClusterDefaultDeny(ctx, s.db, f.Name); dbErr != nil {
 			slog.Warn("re-assert the stack's cluster default-deny failed; the stack reconciler retries", "stack", f.Name, "error", dbErr)
 		}
 	}
+}
+
+// fileAsksDefaultDeny reports whether f asks for the cluster default-deny.
+func fileAsksDefaultDeny(f *compose.File) bool {
+	return f.FirewallDefaults != nil && f.FirewallDefaults.DefaultDeny
 }
 
 // stackFirewallWrites records the firewall rows one persistStackFirewall
@@ -1623,13 +1638,11 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 						return errors.New(status.Convert(refusal).Message())
 					}
 				}
-				if err := corrosion.DeleteStackFirewall(ctx, s.db, req.Name, compose.StoredStackWants); err != nil {
-					return err
-				}
-				if !removesFirewall {
-					return nil
-				}
-				return corrosion.SetStackFirewallIntent(ctx, s.db, req.Name, corrosion.StackFirewallIntent{}, s.hostName)
+				// The firewall intent is not cleared: it speaks for this
+				// deployment only, and a later one of the name is another
+				// (corrosion.StackFirewallIntent). A teardown writes none,
+				// with or without sg.write.
+				return corrosion.DeleteStackFirewall(ctx, s.db, req.Name, compose.StoredStackWants)
 			}},
 			{"backup repos", func() error {
 				return corrosion.DeleteStackBackupRepos(ctx, s.db, req.Name, compose.StoredStackWants)
@@ -2951,7 +2964,7 @@ func (s *Server) stackFirewallRefusal(ctx context.Context, stack string, declare
 		case stored.DeclaresFirewall():
 			why = "its stored file declares a firewall"
 		default:
-			in, found, ierr := corrosion.GetStackFirewallIntent(ctx, s.db, stack)
+			in, found, ierr := corrosion.StackFirewallIntentOf(ctx, s.db, *st)
 			if ierr != nil {
 				return nil, status.Errorf(codes.Unavailable, "read the firewall of stack %q: %v", stack, ierr)
 			}

@@ -38,33 +38,50 @@ const stackFirewallKeyPrefix = "stack_firewall/"
 // cannot withdraw what a newer one declared: the stack's file is replaced on
 // every peer, and this record still says what the stack asks for.
 //
+// It speaks for one deployment of the stack: the record it was written
+// under (Created, the record's created_at) since its last teardown began
+// (Teardown, that teardown's stamp in stack_teardown/<name>, "" for none).
+// A deploy that fails before it records the stack, a teardown that removes
+// the stack, and a later deploy of the name are each another deployment, so
+// a record left by an earlier one does not apply (stackFirewallIntentApplies).
+//
 // It is written only where cluster_policies may be written
 // (failover_scope_v1), and a previous release neither writes nor reads it:
 // with no record, the stack's file alone says (as before).
 type StackFirewallIntent struct {
-	Firewall    bool `json:"firewall"`
-	DefaultDeny bool `json:"default_deny"`
+	Firewall    bool   `json:"firewall"`
+	DefaultDeny bool   `json:"default_deny"`
+	Created     string `json:"created,omitempty"`
+	Teardown    string `json:"teardown,omitempty"`
+
+	// unreadable: a value this build cannot decode, which applies to every
+	// deployment, declaring a firewall and asking for the default-deny.
+	unreadable bool
 }
 
-// SetStackFirewallIntent records the firewall intent of stack. Callers write
-// it only for a caller holding sg.write at the cluster root: a deploy, with
-// what its file declares, and a teardown that removes the stack's firewall,
-// with none. A no-op where cluster_policies may not be written yet.
-func SetStackFirewallIntent(ctx context.Context, c *Client, stack string, in StackFirewallIntent, setBy string) error {
-	if stack == "" || !c.MayWriteClusterPolicy() {
+// SetStackFirewallIntent records the firewall intent of st, the stack's
+// record as the deploy holds it, bound to that deployment. Callers write it
+// only for a caller holding sg.write at the cluster root, with what the
+// deploy's file declares. A no-op where cluster_policies may not be written
+// yet, or for a stack with no record (a first deploy records it once its
+// record is written).
+func SetStackFirewallIntent(ctx context.Context, c *Client, st *StackRecord, firewall, defaultDeny bool, setBy string) error {
+	if st == nil || st.Name == "" || st.CreatedAt == "" || !c.MayWriteClusterPolicy() {
 		return nil
 	}
-	v, err := json.Marshal(in)
+	td, err := stackTeardownStamp(ctx, c, st.Name)
 	if err != nil {
 		return err
 	}
-	return c.Execute(ctx, clusterPolicyUpsertSQL, stackFirewallKeyPrefix+stack, string(v), setBy, c.NowTS())
+	v, err := json.Marshal(StackFirewallIntent{Firewall: firewall, DefaultDeny: defaultDeny, Created: st.CreatedAt, Teardown: td})
+	if err != nil {
+		return err
+	}
+	return c.Execute(ctx, clusterPolicyUpsertSQL, stackFirewallKeyPrefix+st.Name, string(v), setBy, c.NowTS())
 }
 
-// GetStackFirewallIntent reads the firewall intent of stack: found is false
-// when there is none. One this build cannot read declares a firewall and
-// asks for the default-deny (fail closed: a deny is never withdrawn, and a
-// firewall never removed, on a guess).
+// GetStackFirewallIntent reads the firewall intent recorded for stack,
+// whichever deployment it speaks for: found is false when there is none.
 func GetStackFirewallIntent(ctx context.Context, c *Client, stack string) (in StackFirewallIntent, found bool, err error) {
 	rows, err := c.Query(ctx,
 		`SELECT value FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`, stackFirewallKeyPrefix+stack)
@@ -74,24 +91,94 @@ func GetStackFirewallIntent(ctx context.Context, c *Client, stack string) (in St
 	return decodeStackFirewallIntent(rows[0].String("value")), true, nil
 }
 
-// StackFirewallIntents reads every stack's firewall intent, by stack name.
+// StackFirewallIntentOf reads the firewall intent of st's deployment:
+// applies is false when none is recorded for it.
+func StackFirewallIntentOf(ctx context.Context, c *Client, st StackRecord) (in StackFirewallIntent, applies bool, err error) {
+	in, found, err := GetStackFirewallIntent(ctx, c, st.Name)
+	if err != nil || !found {
+		return StackFirewallIntent{}, false, err
+	}
+	td, err := stackTeardownStamp(ctx, c, st.Name)
+	if err != nil {
+		return StackFirewallIntent{}, false, err
+	}
+	if !stackFirewallIntentApplies(in, st, td) {
+		return StackFirewallIntent{}, false, nil
+	}
+	return in, true, nil
+}
+
+// StackFirewallIntents reads the firewall intent of each live stack's
+// deployment, by stack name; a stack with none recorded is absent.
 func StackFirewallIntents(ctx context.Context, c *Client) (map[string]StackFirewallIntent, error) {
 	rows, err := c.Query(ctx,
 		`SELECT key, value FROM cluster_policies WHERE key LIKE 'stack\_firewall/%' ESCAPE '\' AND deleted_at IS NULL`)
+	if err != nil || len(rows) == 0 {
+		return nil, err
+	}
+	stacks, err := ListStacks(ctx, c)
 	if err != nil {
 		return nil, err
 	}
+	byName := make(map[string]StackRecord, len(stacks))
+	for _, st := range stacks {
+		byName[st.Name] = st
+	}
 	out := make(map[string]StackFirewallIntent, len(rows))
 	for _, r := range rows {
-		out[strings.TrimPrefix(r.String("key"), stackFirewallKeyPrefix)] = decodeStackFirewallIntent(r.String("value"))
+		name := strings.TrimPrefix(r.String("key"), stackFirewallKeyPrefix)
+		st, ok := byName[name]
+		if !ok {
+			continue
+		}
+		td, err := stackTeardownStamp(ctx, c, name)
+		if err != nil {
+			return nil, err
+		}
+		if in := decodeStackFirewallIntent(r.String("value")); stackFirewallIntentApplies(in, st, td) {
+			out[name] = in
+		}
 	}
 	return out, nil
+}
+
+// stackFirewallIntentApplies reports whether in speaks for st's deployment,
+// whose last teardown's stamp is teardown: it was written under st's record
+// (created_at) and since that teardown began. While st is "deleting", the
+// teardown under way began after the intent was written, and the intent
+// still speaks for what is being torn down. One this build cannot read
+// applies to every deployment.
+func stackFirewallIntentApplies(in StackFirewallIntent, st StackRecord, teardown string) bool {
+	if in.unreadable {
+		return true
+	}
+	if in.Created == "" || in.Created != st.CreatedAt {
+		return false
+	}
+	return in.Teardown == teardown || st.State == "deleting"
+}
+
+// stackTeardownStamp is the stamp of stack's last teardown, from its
+// teardown record (stackTeardownRecord), or "" when there is none. A record
+// this build cannot read is its own stamp: it is still another teardown's.
+func stackTeardownStamp(ctx context.Context, c *Client, stack string) (string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT value FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`, stackTeardownKeyPrefix+stack)
+	if err != nil || len(rows) == 0 {
+		return "", err
+	}
+	v := rows[0].String("value")
+	var rec stackTeardownRecord
+	if json.Unmarshal([]byte(v), &rec) != nil || rec.Teardown == "" {
+		return v, nil
+	}
+	return rec.Teardown, nil
 }
 
 func decodeStackFirewallIntent(v string) StackFirewallIntent {
 	var in StackFirewallIntent
 	if err := json.Unmarshal([]byte(v), &in); err != nil {
-		return StackFirewallIntent{Firewall: true, DefaultDeny: true}
+		return StackFirewallIntent{Firewall: true, DefaultDeny: true, unreadable: true}
 	}
 	return in
 }

@@ -63,7 +63,7 @@ func stackFirewallHold(ctx context.Context, db *corrosion.Client, stack corrosio
 		}
 	}
 	if held == "" {
-		in, found, ierr := corrosion.GetStackFirewallIntent(ctx, db, stack.Name)
+		in, found, ierr := corrosion.StackFirewallIntentOf(ctx, db, stack)
 		if ierr != nil {
 			return "", ierr
 		}
@@ -101,6 +101,11 @@ func (r *StackReconciler) reportTornDownFirewalls(ctx context.Context, held map[
 const withdrawnWhy = "its stored file no longer declares the firewall its last deploy by a caller with sg.write at the " +
 	"cluster root declared, so it was replaced by a deploy without sg.write; what that deploy declared still stands"
 
+// unreadableWhy is the why of a live stack with a firewall intent whose
+// stored file this build cannot read.
+const unreadableWhy = "its stored file cannot be read, so whether it still declares the firewall its last deploy by a " +
+	"caller with sg.write at the cluster root declared is unknown; what that deploy declared still stands"
+
 // reportWithdrawnFirewalls raises the condition for each live stack, not
 // being deleted, whose file no longer declares what its firewall intent does
 // (security groups, ip sets or a firewall block, or the default-deny), and
@@ -126,7 +131,11 @@ func (r *StackReconciler) reportWithdrawnFirewalls(ctx context.Context, held map
 		}
 		f, perr := compose.ParseStored([]byte(st.ComposeYAML))
 		if perr != nil {
-			continue // unreadable: every check already treats it as a firewall
+			// Every check treats it as a firewall; the condition says
+			// whether the file still declares the intent is unknown.
+			held[st.Name] = true
+			r.raiseFirewallHold(ctx, st.Name, unreadableWhy)
+			continue
 		}
 		deny := f.FirewallDefaults != nil && f.FirewallDefaults.DefaultDeny
 		if (in.Firewall && !f.DeclaresFirewall()) || (in.DefaultDeny && !deny) {
@@ -161,8 +170,8 @@ func (r *StackReconciler) raiseFirewallHold(ctx context.Context, stack, why stri
 		}
 	}
 	var detail string
-	if why == withdrawnWhy {
-		detail = fmt.Sprintf("stack %q keeps the firewall its file no longer declares: %s. Withdrawing it needs sg.write at "+
+	if why == withdrawnWhy || why == unreadableWhy {
+		detail = fmt.Sprintf("stack %q keeps the firewall its last deploy with sg.write declared: %s. Withdrawing it needs sg.write at "+
 			"the cluster root. An Admin deploys the file the stack should have with `lv compose up`, or tears the stack "+
 			"down with `lv compose down --name %s`; `lv role grant NetworkAdmin <principal> --path / --propagate` lets "+
 			"another caller do it", stack, why, stack)

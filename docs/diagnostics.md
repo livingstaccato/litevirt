@@ -1835,7 +1835,8 @@ with `sg.write` recorded) in three cases:
   default-deny, its last deploy with `sg.write` declared: a deploy without
   `sg.write` replaced it. What that deploy declared still stands: the stack
   still asks for the default-deny, and a deploy without `sg.write` is still
-  refused.
+  refused. A stored file this build cannot read keeps the condition open,
+  saying whether it still declares that is unknown.
 
 An Admin finishes a teardown with `lv compose down --name <stack>`, from any
 node, record or not, and settles a live stack's firewall with `lv compose up`

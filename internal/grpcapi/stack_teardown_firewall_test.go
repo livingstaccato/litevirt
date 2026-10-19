@@ -123,12 +123,12 @@ func TestDeployStack_ARefusalOverAHeldTeardownNamesTheAdminExit(t *testing.T) {
 // at the root declared it, is recorded by that deploy only; a deploy without
 // it is refused when the record declares a firewall, even where neither the
 // stack's rows nor its file here do (a node whose replica holds an older
-// file). An Admin's teardown clears it.
+// file). It does not outlive the deployment it was written for.
 //
 // Mutations: record the intent for any caller — the Operator's deploy
 // records it, red. Drop the intent from stackFirewallRefusal — the
-// Operator's redeploy is allowed, red. Keep the intent on an Admin's
-// teardown — red.
+// Operator's redeploy is allowed, red. Drop the deployment binding — the
+// Operator's deploys after the Admin's teardown are refused, red.
 func TestDeployStack_TheFirewallIntentIsTheAdminsToChange(t *testing.T) {
 	ctx := context.Background()
 	s, opal, ada := stackFirewallFixture(t)
@@ -160,10 +160,111 @@ func TestDeployStack_TheFirewallIntentIsTheAdminsToChange(t *testing.T) {
 		t.Errorf("the refusal does not say why: %v", err)
 	}
 
+	// Once an Admin tears fw down, the name is the Operator's to deploy
+	// again: the intent spoke for the deployment that went.
 	if err := s.DeleteStack(&pb.DeleteStackRequest{Name: "fw"}, &mockDeleteStream{ctx: ada}); err != nil {
 		t.Fatalf("the Admin tears fw down: %v", err)
 	}
-	if in, found, _ := corrosion.GetStackFirewallIntent(ctx, s.db, "fw"); !found || in.Firewall || in.DefaultDeny {
-		t.Fatalf("the Admin's teardown left intent %+v (found %v), want it cleared", in, found)
+	for i := 0; i < 2; i++ {
+		if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: "name: fw\n"}, &mockDeployStreamR2{ctx: opal}); err != nil {
+			t.Fatalf("the Operator's deploy %d of fw after the Admin's teardown: %v", i+1, err)
+		}
+	}
+}
+
+// A recorded intent speaks for one deployment of the stack. One left by
+// another — a first Admin deploy that failed before it recorded the stack,
+// or a deployment torn down on a host that does not clear or bind it —
+// does not block a later Operator stack of the same name; the deployment
+// it was written for still holds it.
+//
+// Mutations: write the intent before a first deploy's record exists — the
+// failed deploy leaves one, red. Drop the deployment binding — the Operator's
+// redeploy is refused, red.
+func TestDeployStack_AnIntentLeftByAnotherDeploymentDoesNotApply(t *testing.T) {
+	ctx := context.Background()
+	s, opal, ada := stackFirewallFixture(t)
+	s.db.SetClusterPolicyGate(func() bool { return true })
+
+	t.Run("a failed first deploy", func(t *testing.T) {
+		if err := corrosion.InsertSecurityGroup(ctx, s.db, corrosion.SecurityGroup{ID: "sg-taken", Name: "taken"}); err != nil {
+			t.Fatal(err)
+		}
+		yaml := "name: clash\nsecurity-groups:\n  taken:\n    rules:\n      - {direction: ingress, proto: tcp, port: \"80\", action: accept}\n"
+		if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: yaml}, &mockDeployStreamR2{ctx: ada}); err == nil {
+			t.Fatal("setup: the Admin's deploy of a taken group name succeeded")
+		}
+		if st, _ := corrosion.GetStack(ctx, s.db, "clash"); st != nil {
+			t.Fatalf("setup: the failed first deploy recorded the stack: %+v", st)
+		}
+		if in, found, _ := corrosion.GetStackFirewallIntent(ctx, s.db, "clash"); found {
+			t.Errorf("a first deploy that failed before it recorded the stack left intent %+v", in)
+		}
+		for i := 0; i < 2; i++ {
+			if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: "name: clash\n"}, &mockDeployStreamR2{ctx: opal}); err != nil {
+				t.Fatalf("the Operator's deploy %d of clash: %v", i+1, err)
+			}
+		}
+	})
+	t.Run("a deployment torn down elsewhere", func(t *testing.T) {
+		if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: "name: gone\nfirewall:\n  default-deny: true\n"}, &mockDeployStreamR2{ctx: ada}); err != nil {
+			t.Fatal(err)
+		}
+		// Torn down as a previous release does it: the teardown record and
+		// the tombstone, and the firewall rows removed; the intent is left.
+		if err := corrosion.MarkStackDeleting(ctx, s.db, "gone", false, true, "old-host"); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.DeleteStackFirewall(ctx, s.db, "gone", nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.DeleteStackRecord(ctx, s.db, "gone"); err != nil {
+			t.Fatal(err)
+		}
+		if _, found, _ := corrosion.GetStackFirewallIntent(ctx, s.db, "gone"); !found {
+			t.Fatal("setup: no intent left behind")
+		}
+		for i := 0; i < 2; i++ {
+			if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: "name: gone\n"}, &mockDeployStreamR2{ctx: opal}); err != nil {
+				t.Fatalf("the Operator's deploy %d of gone after its teardown: %v", i+1, err)
+			}
+		}
+	})
+}
+
+// No teardown writes the firewall intent, with sg.write or without. One
+// without it, begun on a node the intent has not reached, would otherwise
+// overwrite the Admin's intent everywhere (newer stamp); one with it could
+// overwrite the intent of an Admin redeploy a peer ran in the meantime.
+//
+// Mutation: write an empty intent at the firewall-rows step of a teardown,
+// for every caller or for an Operator only — red.
+func TestDeleteStack_ATeardownWritesNoFirewallIntent(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		admin bool
+	}{{"operator", false}, {"admin", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			s, opal, ada := stackFirewallFixture(t)
+			s.db.SetClusterPolicyGate(func() bool { return true })
+			if err := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{Name: "plain", ComposeYAML: "name: plain\n", State: "active"}); err != nil {
+				t.Fatal(err)
+			}
+			caller := opal
+			if tc.admin {
+				caller = ada
+			}
+			stream := &mockDeleteStream{ctx: caller}
+			if err := s.DeleteStack(&pb.DeleteStackRequest{Name: "plain"}, stream); err != nil {
+				t.Fatalf("compose down: %v", err)
+			}
+			if st, _ := corrosion.GetStack(ctx, s.db, "plain"); st != nil {
+				t.Fatalf("setup: the down did not reach the firewall-rows step and finish: %+v, %+v", st, stream.sent)
+			}
+			if in, found, _ := corrosion.GetStackFirewallIntent(ctx, s.db, "plain"); found {
+				t.Errorf("the teardown wrote firewall intent %+v", in)
+			}
+		})
 	}
 }

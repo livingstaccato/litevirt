@@ -307,14 +307,6 @@ func (r *StackReconciler) reconcileStack(ctx context.Context, stack corrosion.St
 		slog.Warn("stack-reconciler: tombstone the stack's firewall failed, will retry", "stack", stack.Name, "error", err)
 		return
 	}
-	// A teardown with sg.write removed the firewall: nothing of it is left
-	// for a later deploy of the name to inherit.
-	if removes, _ := corrosion.StackTeardownRemovesFirewall(ctx, r.db, stack); removes {
-		if err := corrosion.SetStackFirewallIntent(ctx, r.db, stack.Name, corrosion.StackFirewallIntent{}, r.hostName); err != nil {
-			slog.Warn("stack-reconciler: clear the stack's firewall intent failed, will retry", "stack", stack.Name, "error", err)
-			return
-		}
-	}
 	if err := corrosion.DeleteStackBackupRepos(ctx, r.db, stack.Name, compose.StoredStackWants); err != nil {
 		slog.Warn("stack-reconciler: unregister the stack's backup repos failed, will retry", "stack", stack.Name, "error", err)
 		return

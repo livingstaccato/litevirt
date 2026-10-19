@@ -378,10 +378,8 @@ type Server struct {
 	drainCommitFault func(vm string) error
 	// coldDiskStall overrides the cold disk copy's stall bound (tests).
 	coldDiskStall time.Duration
-	// coldDiskFinalRate, coldDiskSyncEvery and coldDiskSyncHook override the
-	// cold disk copy's final-answer rate, the receive's sync interval, and
-	// observe its syncs (tests).
-	coldDiskFinalRate int64
+	// coldDiskSyncEvery and coldDiskSyncHook override the receive's sync
+	// interval and observe its syncs (tests).
 	coldDiskSyncEvery int64
 	coldDiskSyncHook  func(final bool)
 	// drainMoves cancels each VM's drain move in flight (drainOneVM), for

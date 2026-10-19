@@ -2004,7 +2004,10 @@ The migration CA a host reports is a fingerprint of its CA file's
 certificates as a set. For a single CA it is the value every build computes.
 For a rotation bundle (two CAs) a host of this build and one of an older build
 compute different values, so a storage copy between them is refused as
-holding different migration CAs until both run this build.
+holding different migration CAs until both run this build. A memory-only move
+between them is not refused: it stays in libvirt's tunnel instead of using
+QEMU's TLS stream, and so does not use the migration network. Finishing the
+upgrade restores both.
 
 Peer connections of this build send gRPC keepalive pings while a call is
 open, every 6 minutes. That is longer than any daemon permits by default (5

@@ -905,7 +905,17 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// The target's NIC guards are armed for the guest (armMigrationTarget).
 	armed.apply(&mp)
 	logVNCPasswordStrip(vm.Name, target.Name, mp.StripVNCPassword)
-	lerr, timedOut, pending := s.drainLiveMigrate(vm.Name, dconnuri, mp, tuning.policy.GetTimeoutSec())
+	lerr, stopped, pending := s.drainLiveMigrate(ctx, vm.Name, dconnuri, mp, tuning.policy.GetTimeoutSec())
+	if stopped == liveAborted {
+		// The move's context is cancelled: what follows (the record of where
+		// the guest ended, the target's cleanup) must still run.
+		ctx = context.WithoutCancel(ctx)
+	}
+	// Why the move was stopped, in its frame's words.
+	why := fmt.Sprintf("%s%ds, the VM's migration policy timeout_sec", drainTimedOutPrefix, tuning.policy.GetTimeoutSec())
+	if stopped == liveAborted {
+		why = drainLiveAbortedPrefix + " by `lv operation abort " + vm.Name + " --force`"
+	}
 	if pending != nil {
 		// libvirt has not answered the abort: the live job may still cut
 		// over. Its outcome goes to a background owner, which takes the VM's
@@ -916,9 +926,9 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		adopted, leaseHeld = true, false
 		s.adoptAbandonedMigration(context.WithoutCancel(ctx), fresh, target.Name, false, disks, pending, unlock,
 			migrationFinish{target: &target, pbVM: pbVM, hspec: hspec, armed: armed, lease: migLease, drainFrom: s.hostName})
-		detail := fmt.Sprintf("%s%ds, the VM's migration policy timeout_sec, and libvirt did not answer its abort within %s; "+
+		detail := fmt.Sprintf("%s, and libvirt did not answer its abort within %s; "+
 			"the move is left to %s, and %s ends running on %s or on %s, never on both (watch `lv events %s`)",
-			drainTimedOutPrefix, tuning.policy.GetTimeoutSec(), s.drainAbortGraceOrDefault(), drainBackgroundMarker,
+			why, s.drainAbortGraceOrDefault(), drainBackgroundMarker,
 			vm.Name, s.hostName, target.Name, vm.Name)
 		s.recordVMEvent(context.WithoutCancel(ctx), vm.Name, "vm.migrated", "error", "drain: "+detail)
 		return &pb.DrainProgress{
@@ -993,12 +1003,13 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// One lease per move: the cold move takes the destination's lease itself.
 	migLease.release(ctx)
 
-	// A live move aborted at its migration policy's timeout is not followed by
-	// a cold move: the policy bounds how long the move may take, and a cold
-	// move shuts the guest down. The guest keeps running here.
-	if timedOut {
-		detail := fmt.Sprintf("%s%ds, the VM's migration policy timeout_sec; the move was aborted and %s keeps running on %s (%v)",
-			drainTimedOutPrefix, tuning.policy.GetTimeoutSec(), vm.Name, s.hostName, lerr)
+	// A live move aborted at its migration policy's timeout, or by an
+	// operator, is not followed by a cold move: the policy bounds how long the
+	// move may take, an abort ends it, and a cold move shuts the guest down.
+	// The guest keeps running here.
+	if stopped != liveNotStopped {
+		detail := fmt.Sprintf("%s; the move was aborted and %s keeps running on %s (%v)",
+			why, vm.Name, s.hostName, lerr)
 		s.recordVMEvent(context.WithoutCancel(ctx), vm.Name, "vm.migrated", "error", "drain: "+detail)
 		s.runDrainPostMigrate(ctx, pbVM, hspec, s.hostName, s.drainVMStateHere(ctx, vm.Name))
 		return &pb.DrainProgress{
@@ -1038,6 +1049,10 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 // drainTimedOutPrefix begins the Error of a drain frame for a live move
 // aborted at its migration policy's timeout (drainLiveMigrate).
 const drainTimedOutPrefix = "live move did not finish within "
+
+// drainLiveAbortedPrefix begins the Error of a drain frame for a live move an
+// operator aborted (drainLiveMigrate).
+const drainLiveAbortedPrefix = "live move was cancelled"
 
 // drainLockWait bounds how long a drain waits for a VM's lock held by an
 // ordinary operation. A var so tests can shorten it.
@@ -1204,36 +1219,55 @@ func (s *Server) drainAbortGraceOrDefault() time.Duration {
 	return defaultDrainAbortGrace
 }
 
+// liveStop is why a drain's live move was told to stop (drainLiveMigrate).
+type liveStop int
+
+const (
+	liveNotStopped liveStop = iota // libvirt ended the move on its own
+	liveTimedOut                   // it reached the VM's migration policy timeout
+	liveAborted                    // `lv operation abort <vm> --force` cancelled it
+)
+
 // drainLiveMigrate runs a drain's live move under the VM's migration policy
-// timeout (timeoutSec, none when 0), as `lv migrate` does. MigrateToTarget
-// takes no context, so a move past its timeout is aborted in libvirt
-// (AbortMigration) and its outcome is waited for, for up to the abort grace:
-// libvirt returns an error once the abort has taken, and the guest is still on
-// this host; it returns nil when the cut-over completed before the abort
-// could, and the guest runs on the target only. Either way the drain acts on
-// what libvirt did, never on the timeout alone. timedOut reports that the
-// abort was sent and the guest stayed.
+// timeout (timeoutSec, none when 0), as `lv migrate` does, and under ctx,
+// which `lv operation abort <vm> --force` cancels (cancelDrainMove).
+// MigrateToTarget takes no context, so a move past its timeout, or whose ctx
+// ends, is aborted in libvirt (AbortMigration) and its outcome is waited for,
+// for up to the abort grace: libvirt returns an error once the abort has
+// taken, and the guest is still on this host; it returns nil when the
+// cut-over completed before the abort could, and the guest runs on the target
+// only. Either way the drain acts on what libvirt did, never on the timeout
+// or the abort alone. stopped reports why the abort was sent when the guest
+// stayed (or may still move, with pending); liveNotStopped otherwise.
 //
 // When libvirt does not answer within the grace, pending is the channel its
 // outcome will arrive on, and the caller hands it to a background owner: the
 // move may still complete, so nothing else may act on it.
-func (s *Server) drainLiveMigrate(name, dconnuri string, mp libvirt.MigrateParams, timeoutSec int32) (err error, timedOut bool, pending <-chan error) {
-	if timeoutSec <= 0 {
-		return s.virt.MigrateToTarget(name, dconnuri, mp), false, nil
+func (s *Server) drainLiveMigrate(ctx context.Context, name, dconnuri string, mp libvirt.MigrateParams, timeoutSec int32) (err error, stopped liveStop, pending <-chan error) {
+	if cerr := ctx.Err(); cerr != nil {
+		return fmt.Errorf("the move was aborted before libvirt started it: %w", cerr), liveAborted, nil
 	}
 	done := make(chan error, 1)
 	go func() { done <- s.virt.MigrateToTarget(name, dconnuri, mp) }()
-	timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
-	defer timer.Stop()
+	var timeout <-chan time.Time
+	if timeoutSec > 0 {
+		timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
+		defer timer.Stop()
+		timeout = timer.C
+	}
 	select {
 	case err := <-done:
-		return err, false, nil
-	case <-timer.C:
+		return err, liveNotStopped, nil
+	case <-timeout:
+		stopped = liveTimedOut
+		slog.Warn("drain: live move reached its migration policy timeout; aborting the libvirt migration job",
+			"vm", name, "timeout_sec", timeoutSec)
+	case <-ctx.Done():
+		stopped = liveAborted
+		slog.Warn("drain: live move cancelled by admin; aborting the libvirt migration job", "vm", name)
 	}
-	slog.Warn("drain: live move reached its migration policy timeout; aborting the libvirt migration job",
-		"vm", name, "timeout_sec", timeoutSec)
 	if aerr := s.virt.AbortMigration(name); aerr != nil {
-		slog.Error("drain: could not abort the timed-out live move; waiting for libvirt to end it",
+		slog.Error("drain: could not abort the live move; waiting for libvirt to end it",
 			"vm", name, "error", aerr)
 	}
 	grace := time.NewTimer(s.drainAbortGraceOrDefault())
@@ -1241,15 +1275,15 @@ func (s *Server) drainLiveMigrate(name, dconnuri string, mp libvirt.MigrateParam
 	select {
 	case err = <-done:
 	case <-grace.C:
-		slog.Warn("drain: libvirt did not answer the abort of a timed-out live move; finishing it in the background",
+		slog.Warn("drain: libvirt did not answer the abort of a live move; finishing it in the background",
 			"vm", name, "grace", s.drainAbortGraceOrDefault())
-		return nil, true, done
+		return nil, stopped, done
 	}
 	if err == nil {
-		slog.Warn("drain: the timed-out live move completed before its abort took", "vm", name)
-		return nil, false, nil
+		slog.Warn("drain: the live move completed before its abort took", "vm", name)
+		return nil, liveNotStopped, nil
 	}
-	return err, true, nil
+	return err, stopped, nil
 }
 
 // condDrainMoveTimedOut names the VMs whose live move this host's last drain

@@ -112,7 +112,8 @@ func (s *Server) AbortVMOperation(ctx context.Context, req *pb.AbortVMOperationR
 	if !found {
 		if drainCancelled {
 			return &pb.AbortVMOperationResponse{Aborted: true,
-				Detail: "cancelled the drain's move of the VM; it rolls back (started again where it was, if it had been shut down)"}, nil
+				Detail: "cancelled the drain's move of the VM: a live move's migration job is aborted and the VM keeps running where it was, " +
+					"unless libvirt had already cut it over; a cold move rolls back (started again where it was, if it had been shut down)"}, nil
 		}
 		return &pb.AbortVMOperationResponse{Aborted: false, Detail: "no active operation"}, nil
 	}

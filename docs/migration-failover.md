@@ -117,8 +117,14 @@ migration-TLS credentials:
   the CA file is read (an old and a new CA during a rotation), and an expired
   or not-yet-valid certificate counts as unusable. The source and the target
   compare their CA files as sets: a rotation bundle listed in another order on
-  another host compares equal; hosts with different sets of CAs are refused as
-  holding different migration CAs.
+  another host compares equal, and a CA listed twice counts once; hosts with
+  different sets of CAs are refused as holding different migration CAs.
+  During a rotation, a host that holds the old and the new CA and one that
+  still holds only the old hold different sets: storage copies between them
+  are refused, and memory-only moves stay in libvirt's tunnel. Storage copies
+  work again once every host holds the same CA file: the same bundle on every
+  host, or credentials reissued on every host from one CA with
+  `lv host install-migration-tls --reissue`.
 - Each daemon installs its host's credentials into `/etc/pki/qemu`, with the key
   readable only by the QEMU user, at start and again before each storage
   migration, so no restart is needed. It refuses to touch `/etc/pki/qemu` if
@@ -367,19 +373,23 @@ for, up to 10 minutes, then skipped, naming the operation that holds it.
 
 Parts of a started move are bounded. A cold move's disk copy that the target
 stops taking (alive but wedged) for 5 minutes is aborted, and so is its check
-of the target that goes unanswered as long. Once the last of a disk has been
-sent, the target's verification and sync of it may take as long as the disk's
-size at 16 MiB/s (at least 5 minutes); the target syncs as it writes, so that
-final sync is small. An aborted copy rolls the move back: the VM is started
+of the target that goes unanswered as long, and so is a copy whose target does
+not answer within 5 minutes of the last of the disk. The target syncs the disk
+every 64 MiB as it writes, so its sync after the last frame is no larger than
+one during the copy. An aborted copy rolls the move back: the VM is started
 again on the drained host, where its record still names it. Peers also detect
 a host that stops answering during a call within about 6 minutes (gRPC
 keepalive). The move's other calls to the target (its firmware state, the
 hand-over) are not bounded by a timeout. To end any drain move without
 restarting the daemon, run `lv operation abort <vm> --force` (on any host; it
-is forwarded to the VM's host): it cancels the move, which rolls back the same
-way. A move the daemon recovers after a restart only rolls back (starts the
-VM again here) and copies nothing, so it is not in that registry and needs no
-abort.
+is forwarded to the VM's host): it cancels the move. A cold move rolls back
+the same way. A live move's libvirt migration job is aborted, with or without
+a migration policy timeout, and the VM keeps running on the drained host,
+never followed by a cold move; if libvirt had already cut the VM over, it runs
+on the target only and is recorded there. A move the daemon recovers after a
+restart copies nothing: it starts the VM on the target when the hand-over had
+committed, and otherwise leaves it running, or starts it again, here. So it is
+not in that registry and needs no abort.
 
 After the cut-over the source's cloud-init ISO is removed and DNS,
 load-balancer backends and VXLAN forwarding entries follow the VM, as for a

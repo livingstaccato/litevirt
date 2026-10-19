@@ -376,3 +376,42 @@ func TestMigrationCAFingerprint_IsOfTheBundleAsASet(t *testing.T) {
 		t.Fatal("a two-CA bundle fingerprints like one of its CAs alone")
 	}
 }
+
+// A CA listed twice is one CA: [A,A] fingerprints as A alone (what an older
+// build, which reads the first certificate, computes too), and [A,B,A] as
+// [A,B].
+//
+// Mutation: do not deduplicate — [A,A] differs from [A], red.
+func TestMigrationCAFingerprint_CountsARepeatedCAOnce(t *testing.T) {
+	a, b := t.TempDir(), t.TempDir()
+	provisionMigration(t, a)
+	provisionMigration(t, b)
+	caA, _ := os.ReadFile(filepath.Join(MigrationDir(a), MigrationCAName))
+	caB, _ := os.ReadFile(filepath.Join(MigrationDir(b), MigrationCAName))
+	fp := func(data []byte) string {
+		t.Helper()
+		dir := t.TempDir()
+		provisionMigration(t, dir)
+		if err := os.WriteFile(filepath.Join(MigrationDir(dir), MigrationCAName), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		f, err := MigrationCAFingerprint(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	cat := func(parts ...[]byte) []byte {
+		var out []byte
+		for _, p := range parts {
+			out = append(out, p...)
+		}
+		return out
+	}
+	if one, twice := fp(caA), fp(cat(caA, caA)); one != twice {
+		t.Fatalf("a CA listed twice fingerprints %s, want %s (the CA alone)", twice, one)
+	}
+	if pair, repeated := fp(cat(caA, caB)), fp(cat(caA, caB, caA)); pair != repeated {
+		t.Fatalf("[A,B,A] fingerprints %s, want %s ([A,B])", repeated, pair)
+	}
+}

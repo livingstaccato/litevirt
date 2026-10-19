@@ -15,6 +15,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -102,10 +103,11 @@ func GenerateMigrationCA(certPath, keyPath string) error {
 	return writePEM(keyPath, "EC PRIVATE KEY", keyDER)
 }
 
-// MigrationCAFingerprint is the SHA-256 fingerprint (hex, of the DER) of the
-// migration CA in this host's credential set under pkiDir: the CA its QEMU
-// trusts and its migration certificate was issued from. "" with no error
-// when the host has no migration credentials.
+// MigrationCAFingerprint is the SHA-256 fingerprint (hex) of the migration
+// CA file in this host's credential set under pkiDir: the CAs its QEMU trusts,
+// one of which issued its migration certificate. One distinct CA gives its
+// DER's SHA-256; a bundle gives one value for the set of its CAs (see below).
+// "" with no error when the host has no migration credentials.
 func MigrationCAFingerprint(pkiDir string) (string, error) {
 	path := filepath.Join(MigrationDir(pkiDir), MigrationCAName)
 	data, err := os.ReadFile(path)
@@ -124,17 +126,19 @@ func MigrationCAFingerprint(pkiDir string) (string, error) {
 		return "", fmt.Errorf("%s: %v", path, err)
 	}
 	// One CA: its DER's SHA-256, as every build computes it. A bundle (an old
-	// and a new CA during a rotation): the SHA-256 of its CAs' sorted
-	// fingerprints, so the same CAs compare equal in any order.
+	// and a new CA during a rotation): the SHA-256 of its distinct CAs' sorted
+	// fingerprints, so the same CAs compare equal in any order and however
+	// often one is listed.
 	sums := make([]string, 0, len(certs))
 	for _, c := range certs {
 		sum := sha256.Sum256(c.Raw)
 		sums = append(sums, hex.EncodeToString(sum[:]))
 	}
+	sort.Strings(sums)
+	sums = slices.Compact(sums)
 	if len(sums) == 1 {
 		return sums[0], nil
 	}
-	sort.Strings(sums)
 	sum := sha256.Sum256([]byte(strings.Join(sums, "\n")))
 	return hex.EncodeToString(sum[:]), nil
 }

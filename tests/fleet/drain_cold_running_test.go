@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -701,15 +702,21 @@ func TestFleet_OperationAbortSentToAnotherHostCancelsTheDrainMove(t *testing.T) 
 // The VM's host cannot be reached: the abort is answered where it was sent,
 // as before (the recorded operation is aborted there), not failed.
 //
-// Mutation: return the forward's Unavailable — red.
+// Mutations: return the forward's Unavailable — red. Do not forward at all —
+// the VM's host is never tried, red.
 func TestFleet_OperationAbortFallsBackWhenTheVMsHostIsUnreachable(t *testing.T) {
 	sc := newColdStoppedScenario(t)
 	sc.makeRunning(t)
+	var tried atomic.Bool
 	sc.src.HookUnary("AbortVMOperation", func(context.Context, any, grpc.UnaryHandler) (any, error) {
+		tried.Store(true)
 		return nil, status.Error(codes.Unavailable, "test: the VM's host cannot be reached")
 	})
 	resp, err := sc.c.SelfClient(sc.dst).AbortVMOperation(context.Background(),
 		&pb.AbortVMOperationRequest{VmName: "os1", Force: true})
+	if !tried.Load() {
+		t.Fatal("the abort was not forwarded to the VM's host before falling back")
+	}
 	if err != nil {
 		t.Fatalf("operation abort with the VM's host unreachable = %v; want it answered locally", err)
 	}
@@ -726,14 +733,14 @@ func TestFleet_OperationAbortFallsBackWhenTheVMsHostIsUnreachable(t *testing.T) 
 func TestFleet_ScopedOperationAbortIsNotForwarded(t *testing.T) {
 	sc := newColdStoppedScenario(t)
 	sc.makeRunning(t)
-	var called bool
+	var called atomic.Bool
 	sc.src.HookUnary("AbortVMOperation", func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
-		called = true
+		called.Store(true)
 		return h(ctx, req)
 	})
 	_, err := sc.c.SelfClient(sc.dst).AbortVMOperation(context.Background(),
 		&pb.AbortVMOperationRequest{VmName: "os1", Force: true, OperationId: "op-x"})
-	if called {
+	if called.Load() {
 		t.Fatal("a scoped abort was forwarded to the VM's host")
 	}
 	if status.Code(err) != codes.FailedPrecondition {
@@ -741,18 +748,16 @@ func TestFleet_ScopedOperationAbortIsNotForwarded(t *testing.T) {
 	}
 }
 
-// The target's final sync of a large disk on slow storage takes longer than
-// the stall bound: the copy is not aborted for it. The wait for the target's
-// answer after the last frame is bounded by the disk's size at a minimum
-// rate, not by the stall bound.
+// The target's final sync is slow but inside the stall bound: the copy is not
+// aborted for it. After the last frame the wait for the target's answer is
+// the stall bound, as for any frame.
 //
-// Mutation: bound the final answer by the stall bound — the copy is aborted
-// after it fully arrived, red.
+// Mutation: cap the wait after the last frame below the sync's time — the
+// copy is aborted after it fully arrived, red.
 func TestFleet_DrainColdMoveWaitsForASlowFinalSync(t *testing.T) {
 	sc := newColdStoppedScenario(t)
 	sc.makeRunning(t)
-	sc.src.Server.SetColdDiskStallForTest(500 * time.Millisecond)
-	sc.src.Server.SetColdDiskFinalRateForTest(1 << 20) // ~3 MiB disk: a ~3s bound for the answer
+	sc.src.Server.SetColdDiskStallForTest(3 * time.Second)
 	sc.dst.Server.SetColdDiskSyncHookForTest(func(final bool) {
 		if final {
 			time.Sleep(1500 * time.Millisecond)
@@ -764,6 +769,59 @@ func TestFleet_DrainColdMoveWaitsForASlowFinalSync(t *testing.T) {
 	}
 	if p := progress["os1"]; p == nil || p.Status != "done" || p.Error != "" {
 		t.Fatalf("drain progress for os1 = %+v, want done", p)
+	}
+}
+
+// A target that wedges after the last frame (its final sync never returns)
+// holds the guest down for the stall bound, not for a time that grows with
+// the disk's size: the copy is aborted and the move rolls back.
+//
+// Mutation: bound the wait after the last frame by the disk's size at
+// 16 MiB/s (at least the stall bound) — it is 1s for this disk, red.
+func TestFleet_DrainColdMoveToATargetWedgedAfterTheLastFrameIsRolledBack(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	const stall = 300 * time.Millisecond
+	sc.src.Server.SetColdDiskStallForTest(stall)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	finalAt := make(chan time.Time, 1)
+	sc.dst.Server.SetColdDiskSyncHookForTest(func(final bool) {
+		if final {
+			finalAt <- time.Now()
+			<-release
+		}
+	})
+	// The move's check of the disk, then the copy: when the source gave up on
+	// the copy is when the target's stream ends.
+	abandonedAt := make(chan time.Time, 1)
+	sc.dst.HookStream("ReceiveMigrationDisk", func(srv any, ss grpc.ServerStream, h grpc.StreamHandler) error {
+		return h(srv, ss)
+	})
+	sc.dst.HookStream("ReceiveMigrationDisk", func(srv any, ss grpc.ServerStream, h grpc.StreamHandler) error {
+		go func() { <-ss.Context().Done(); abandonedAt <- time.Now() }()
+		return h(srv, ss)
+	})
+	progress, err := drainWithin(t, sc, 30*time.Second)
+	assertIncomplete(t, err)
+	if p := progress["os1"]; p == nil || p.Status != "failed" || !strings.Contains(p.Error, "made no progress for 300ms") ||
+		!strings.Contains(p.Error, "started again") {
+		t.Fatalf("drain progress for os1 = %+v, want failed, the copy aborted after the 300ms stall bound, started again", p)
+	}
+	sc.assertRunningOnSource(t)
+	var from, to time.Time
+	select {
+	case from = <-finalAt:
+	default:
+		t.Fatal("the target never reached its final sync")
+	}
+	select {
+	case to = <-abandonedAt:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the target's stream never ended")
+	}
+	if waited := to.Sub(from); waited >= 800*time.Millisecond {
+		t.Fatalf("the source waited %v for the target's answer after the last frame; want about the %v stall bound", waited, stall)
 	}
 }
 

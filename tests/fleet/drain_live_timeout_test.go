@@ -55,6 +55,13 @@ func (sc *stuckLiveDrain) hooks(t *testing.T) []string {
 
 func newStuckLiveDrain(t *testing.T, completeAfterAbort bool) *stuckLiveDrain {
 	t.Helper()
+	return newStuckLiveDrainTimeout(t, completeAfterAbort, 1)
+}
+
+// newStuckLiveDrainTimeout is newStuckLiveDrain with the VM's migration
+// policy timeout timeoutSec (0: none).
+func newStuckLiveDrainTimeout(t *testing.T, completeAfterAbort bool, timeoutSec int32) *stuckLiveDrain {
+	t.Helper()
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
 	t.Cleanup(c.Stop)
@@ -66,7 +73,7 @@ func newStuckLiveDrain(t *testing.T, completeAfterAbort bool) *stuckLiveDrain {
 	hook := `echo "$LV_EVENT $LV_VM_HOST $LV_VM_STATE" >> ` + sc.hookLog
 	spec, err := json.Marshal(&pb.VMSpec{
 		Name: "slow", Cpu: 1, MemoryMib: 256,
-		Migrate: &pb.MigrationPolicy{TimeoutSec: 1},
+		Migrate: &pb.MigrationPolicy{TimeoutSec: timeoutSec},
 		Hooks:   &pb.HooksSpec{PreMigrate: hook, PostMigrate: hook},
 	})
 	if err != nil {
@@ -234,5 +241,113 @@ func TestFleet_DrainLiveMoveThatCompletesAsItIsAbortedIsRecordedOnTheTarget(t *t
 	}
 	if _, ok, _ := corrosion.GetHealthCondition(ctx, sc.src.DB, "drain", "drain_move_timed_out", "host", sc.src.Name); ok {
 		t.Fatal("drain_move_timed_out was raised for a move that completed")
+	}
+}
+
+// abortStuckLiveDrain starts sc's drain, waits until libvirt holds the live
+// move, and sends `lv operation abort slow --force` to the other host (it is
+// forwarded to the VM's). It returns the drain's last frame for slow, its
+// error, and how long it took.
+func abortStuckLiveDrain(t *testing.T, sc *stuckLiveDrain) (*pb.DrainProgress, error, time.Duration) {
+	t.Helper()
+	entered := make(chan struct{})
+	var once sync.Once
+	stuck := sc.src.Virt.FailMigrateToTarget
+	sc.src.Virt.FailMigrateToTarget = func(name, uri string) error {
+		if name == "slow" {
+			once.Do(func() { close(entered) })
+		}
+		return stuck(name, uri)
+	}
+	type res struct {
+		p   *pb.DrainProgress
+		err error
+	}
+	out := make(chan res, 1)
+	start := time.Now()
+	go func() { p, err := sc.drain(t); out <- res{p, err} }()
+	select {
+	case <-entered:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the drain's live move never reached libvirt")
+	}
+	resp, err := sc.c.SelfClient(sc.dst).AbortVMOperation(context.Background(),
+		&pb.AbortVMOperationRequest{VmName: "slow", Force: true})
+	if err != nil || !resp.GetAborted() {
+		t.Fatalf("operation abort = %+v, %v; want the drain's move of slow aborted", resp, err)
+	}
+	select {
+	case r := <-out:
+		return r.p, r.err, time.Since(start)
+	case <-time.After(30 * time.Second):
+		t.Fatal("the drain did not end after its live move was aborted")
+		return nil, nil, 0
+	}
+}
+
+// `lv operation abort <vm> --force` ends a drain's live move that has no
+// migration policy timeout: the libvirt migration job is aborted, the guest
+// keeps running on the source, never shut down for a cold move, and the drain
+// ends incomplete.
+//
+// Mutation: do not abort the libvirt job when the move is cancelled — the
+// move holds until the fake's 20s, then falls back, red.
+func TestFleet_OperationAbortEndsAStuckLiveDrainMove(t *testing.T) {
+	sc := newStuckLiveDrainTimeout(t, false, 0)
+	p, err, elapsed := abortStuckLiveDrain(t, sc)
+	if elapsed > 15*time.Second {
+		t.Fatalf("the drain took %v; the abort did not end its live move", elapsed)
+	}
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "drain incomplete") {
+		t.Fatalf("drain = %v; want FailedPrecondition, incomplete", err)
+	}
+	if p == nil || p.Status != "failed" || p.Strategy != pb.MigrateStrategy_MIGRATE_LIVE ||
+		!strings.Contains(p.Error, "lv operation abort") || !strings.Contains(p.Error, sc.src.Name) {
+		t.Fatalf("drain progress for slow = %+v; want a failed LIVE move naming the abort and the host it keeps running on", p)
+	}
+	if n := sc.src.Virt.AbortedMigrations("slow"); n != 1 {
+		t.Fatalf("libvirt migration job aborted %d time(s), want 1", n)
+	}
+	if n := sc.srcOps("shutdown"); n != 0 {
+		t.Fatalf("the VM was shut down %d time(s) on the source; an aborted live move must leave it running", n)
+	}
+	if st, _ := sc.src.Virt.DomainState("slow"); st != "running" {
+		t.Fatalf("source domain state = %q, want running", st)
+	}
+	row, rerr := corrosion.GetVM(context.Background(), sc.src.DB, "slow")
+	if rerr != nil || row == nil || row.HostName != sc.src.Name || row.State != "running" {
+		t.Fatalf("VM row = %+v (err %v); want running on %s", row, rerr, sc.src.Name)
+	}
+	if _, ok, _ := corrosion.GetHealthCondition(context.Background(), sc.src.DB, "drain", "drain_move_timed_out", "host", sc.src.Name); ok {
+		t.Fatal("drain_move_timed_out was raised for a move an operator aborted")
+	}
+}
+
+// The live move cut over as the abort reached libvirt: the guest runs on the
+// target only, and the drain records it there — one copy, owned where it runs.
+//
+// Mutation: treat every aborted move as failed — the row stays on the source
+// while the guest runs on the target, red.
+func TestFleet_OperationAbortOfALiveDrainMoveThatCompletesIsRecordedOnTheTarget(t *testing.T) {
+	sc := newStuckLiveDrainTimeout(t, true, 0)
+	p, err, elapsed := abortStuckLiveDrain(t, sc)
+	if elapsed > 15*time.Second {
+		t.Fatalf("the drain took %v; the abort did not reach its live move", elapsed)
+	}
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if p == nil || p.Status != "done" || p.Error != "" {
+		t.Fatalf("drain progress for slow = %+v; want done (libvirt cut over)", p)
+	}
+	if n := sc.srcOps("shutdown"); n != 0 {
+		t.Fatalf("the VM was shut down %d time(s); libvirt had already moved it live", n)
+	}
+	row, rerr := corrosion.GetVM(context.Background(), sc.src.DB, "slow")
+	if rerr != nil || row == nil || row.HostName != sc.dst.Name || row.State != "running" {
+		t.Fatalf("VM row = %+v (err %v); want it running, owned by %s", row, rerr, sc.dst.Name)
+	}
+	if n := sc.src.Virt.AbortedMigrations("slow"); n != 1 {
+		t.Fatalf("libvirt migration job aborted %d time(s), want 1", n)
 	}
 }

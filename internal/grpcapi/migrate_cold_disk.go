@@ -24,7 +24,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -172,14 +171,11 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 	// wedged (a hung write) takes no frame and never fails the stream. A copy
 	// with no accepted frame (or no answer after the last) for the stall
 	// bound is aborted, and the move rolls back as on any failed copy.
-	stall := s.coldDiskStallBound()
 	// After the last frame the target verifies, syncs and places the disk
-	// before it answers: that wait is bounded by the disk's size at a
-	// minimum rate, never less than the stall bound, so a large disk on slow
-	// storage is not aborted after it has fully arrived.
-	final := s.coldDiskFinalBound(size)
-	var bound atomic.Int64
-	bound.Store(int64(stall))
+	// before it answers. It syncs as it writes (defaultColdDiskSyncEvery), so
+	// that final sync is no larger than one it made mid-copy, and the same
+	// bound covers it.
+	stall := s.coldDiskStallBound()
 	sctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	progressed := make(chan struct{}, 1)
@@ -200,7 +196,7 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 				if !t.Stop() {
 					<-t.C
 				}
-				t.Reset(time.Duration(bound.Load()))
+				t.Reset(stall)
 			case <-t.C:
 				cancel(errColdCopyStalled)
 				return
@@ -210,7 +206,7 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 	stalled := func(err error) error {
 		if errors.Is(context.Cause(sctx), errColdCopyStalled) {
 			return status.Errorf(codes.DeadlineExceeded, "the copy of disk %s to the target made no progress for %s, so it was aborted: %v",
-				d.Path, time.Duration(bound.Load()), err)
+				d.Path, stall, err)
 		}
 		return err
 	}
@@ -257,7 +253,6 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 	if err := up.Send(&pb.ReceiveMigrationDiskRequest{Sha256: hex.EncodeToString(h.Sum(nil))}); err != nil {
 		return stalled(coldDiskSendErr(up, err))
 	}
-	bound.Store(int64(final))
 	tick()
 	resp, err := up.CloseAndRecv()
 	if err != nil {
@@ -287,31 +282,10 @@ func (s *Server) coldDiskStallBound() time.Duration {
 // SetColdDiskStallForTest shortens the cold disk copy's stall bound.
 func (s *Server) SetColdDiskStallForTest(d time.Duration) { s.coldDiskStall = d }
 
-// defaultColdDiskFinalRate is the slowest a target is expected to sync a
-// received disk (bytes per second): the wait for its answer after the last
-// frame is the disk's size at this rate, at least the stall bound.
-const defaultColdDiskFinalRate = 16 << 20
-
-// coldDiskFinalBound bounds the wait for the target's answer after the last
-// frame of a disk of size bytes.
-func (s *Server) coldDiskFinalBound(size int64) time.Duration {
-	rate := int64(defaultColdDiskFinalRate)
-	if s.coldDiskFinalRate > 0 {
-		rate = s.coldDiskFinalRate
-	}
-	d := time.Duration(size/rate+1) * time.Second
-	if stall := s.coldDiskStallBound(); d < stall {
-		d = stall
-	}
-	return d
-}
-
-// SetColdDiskFinalRateForTest lowers the rate the final-answer bound assumes.
-func (s *Server) SetColdDiskFinalRateForTest(bytesPerSec int64) { s.coldDiskFinalRate = bytesPerSec }
-
 // defaultColdDiskSyncEvery is how many bytes a receive writes between syncs
-// of the scratch file: the final sync then flushes at most this much, and
-// a slow target's storage shows in the sender's progress as it writes.
+// of the scratch file: the final sync then flushes at most this much, a slow
+// target's storage shows in the sender's progress as it writes, and the
+// stall bound that covers each sync mid-copy covers the final one too.
 const defaultColdDiskSyncEvery = 64 << 20
 
 // SetColdDiskSyncEveryForTest shortens the interval between a receive's syncs.
@@ -326,10 +300,7 @@ func (s *Server) syncReceivedDisk(f *os.File, final bool) error {
 	if s.coldDiskSyncHook != nil {
 		s.coldDiskSyncHook(final)
 	}
-	if final {
-		return f.Sync()
-	}
-	return syscall.Fdatasync(int(f.Fd()))
+	return f.Sync()
 }
 
 // flattenColdDisk writes a standalone copy of disk d's chain (its file src) to

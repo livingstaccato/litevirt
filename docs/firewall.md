@@ -1284,7 +1284,8 @@ lv firewall log [--host <h>] [--workload <name>] [--since 15m] [--limit 200] [--
   16 are waiting. A record's time is the kernel's timestamp of the packet. A
   packet the host itself sends has none, so its record carries the time the
   daemon read it, within about 10 ms of the packet. The JSON lines on disk say
-  which as `time_source`: `packet` or `received`.
+  which as `time_source`: `packet` or `received`. A record with no
+  `time_source` was written by an older build.
 
 **Kernel support.** At start the daemon checks, with `nft -c`, that the kernel
 loads a named limit and a log line to its group (`nft_log`,

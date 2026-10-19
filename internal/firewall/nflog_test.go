@@ -398,3 +398,40 @@ func TestLogListener_PacketTimeOrReceiveTime(t *testing.T) {
 		t.Errorf("the file record %s does not say its time is the receive time", b)
 	}
 }
+
+// Anomaly 5 (review): the plausibility window is one minute on both sides of
+// receipt. A packet time just inside it is kept as the packet's; one just
+// outside it, behind or ahead, is replaced by the receive time.
+//
+// Mutations: drop the future half of the check — the time a minute ahead is
+// kept, red; widen the window to 24 h — both times just outside are kept, red.
+func TestLogStore_PacketTimeWindow(t *testing.T) {
+	clock := &fakeClock{t: time.Date(2026, 10, 19, 8, 20, 6, 0, time.UTC)}
+	store := openStore(t, LogStoreOptions{MaxRate: 1 << 30, Now: clock.now})
+	const ms = time.Millisecond
+	for _, c := range []struct {
+		name string
+		off  time.Duration
+		src  string
+	}{
+		// Literal, not logTimeSkew: the window is one minute, so a wider
+		// constant must fail here.
+		{"just inside, behind", -time.Minute + ms, LogTimePacket},
+		{"just inside, ahead", time.Minute - ms, LogTimePacket},
+		{"just outside, behind", -time.Minute - ms, LogTimeReceived},
+		{"just outside, ahead", time.Minute + ms, LogTimeReceived},
+		{"far ahead", 2 * time.Minute, LogTimeReceived},
+	} {
+		r := testRecord(0)
+		r.Time, r.TimeSource = clock.t.Add(c.off), LogTimePacket
+		store.Add(r)
+		got := store.List(LogFilter{Limit: 1})[0]
+		want := clock.t.Add(c.off)
+		if c.src == LogTimeReceived {
+			want = clock.t
+		}
+		if !got.Time.Equal(want) || got.TimeSource != c.src {
+			t.Errorf("%s (%v from receipt): time %v (%q), want %v (%q)", c.name, c.off, got.Time, got.TimeSource, want, c.src)
+		}
+	}
+}

@@ -789,6 +789,22 @@ upgrade_health_deadline_sec: 120      # 0 → 120s; widen for very slow N-step s
 # relocate-restore is treated as in-flight before giving up and image-recreating.
 container_restore_timeout_sec: 600    # 0 → 600s (10m)
 
+# vTPM state durability. swtpm writes a vTPM's state without fsync, so a write
+# made shortly before a power cut can be lost. On a host with swtpm, the daemon
+# sets the sync attribute (chattr +S) on /var/lib/libvirt/swtpm and everything
+# under it, at start and every minute, and records that it did in
+# <data_dir>/vtpm-state-sync. Files swtpm creates there inherit it. On ext4,
+# and on xfs mounted with dirsync or wsync (a mount-time sync implies wsync; a
+# remount to sync does not), a vTPM command then returns only once its state
+# is on disk. Elsewhere (xfs without one of those,
+# btrfs, ZFS, NFS, tmpfs) the
+# host raises vtpm_state_not_durable (docs/diagnostics.md). The vTPM capability
+# label stays false until a pass has completed. false clears the attribute
+# where that record says litevirt set it (an attribute set by hand on a host
+# litevirt never protected stays): vTPM commands that write state return
+# sooner, and such a write can be lost.
+vtpm_state_sync: true
+
 # Container security and limit defaults (docs/containers.md, "Security").
 containers:
   # pids.max (cgroup v2) for a container whose config sets none: a new

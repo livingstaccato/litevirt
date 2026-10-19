@@ -30,6 +30,9 @@ const (
 	fwBundleSwtpm = "swtpm/" // tar entry prefix: the swtpm state tree
 )
 
+// SwtpmBase is libvirt's swtpm state root.
+func SwtpmBase() string { return libvirtSwtpmBase }
+
 // SetSwtpmBaseForTest redirects the swtpm state root (the real one is
 // root-owned) and returns a func restoring it. Tests only.
 func SetSwtpmBaseForTest(dir string) (restore func()) {

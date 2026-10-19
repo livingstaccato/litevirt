@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pquerna/otp"
+	"github.com/pquerna/otp/totp"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -19,6 +21,7 @@ import (
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/grpcapi"
 )
 
 func assertNoLifecycleRows(t *testing.T, n *Node) {
@@ -166,6 +169,57 @@ func TestFleet_TwoFactorPolicySetOnOneNodeEnforcedOnAnother(t *testing.T) {
 	if _, err := bob.Whoami(ctx, &emptypb.Empty{}); status.Code(err) != codes.Unauthenticated {
 		t.Fatalf("the enrollment-only session after enrolling: %v, want Unauthenticated", err)
 	}
+}
+
+// TestFleet_FactorPresentedOnOneNodeIsReadOnAnother: bob presents his TOTP
+// code on node-0 under a policy requiring a second factor. The factor is
+// recorded in the session's own batch, so node-2 reads it with the session
+// and serves the bearer as a full session, not an enrollment-only one.
+//
+// Mutation: drop the session_factors statement from
+// corrosion.InsertSessionWithLoginData — node-2 confines the session, red.
+func TestFleet_FactorPresentedOnOneNodeIsReadOnAnother(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 644})
+	latchLoginPolicy(t, c)
+	a, cc := c.Nodes[0], c.Nodes[2]
+	if _, err := c.SelfClient(a).CreateUser(ctx, &pb.CreateUserRequest{
+		Username: "bob", Password: "bobs-password-0123456789", Role: "operator",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	enr, err := auth.EnrollTOTP(ctx, a.DB, "bob", "phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.SelfClient(a).SetLoginPolicy(ctx, &pb.SetLoginPolicyRequest{Require_2Fa: "all"}); err != nil {
+		t.Fatalf("SetLoginPolicy: %v", err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+
+	code, err := totp.GenerateCodeCustom(enr.SecretBase32, time.Now().UTC(), totp.ValidateOpts{
+		Period: 30, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := c.SelfClient(a).Login(ctx, &pb.LoginRequest{
+		Username: "bob", Password: "bobs-password-0123456789", TotpCode: code,
+	})
+	if err != nil || login.GetToken() == "" || login.GetRequires_2FaEnrollment() {
+		t.Fatalf("a factor login on %s: %s enroll-only=%v %v, want a full session", a.Name,
+			credState(login), login.GetRequires_2FaEnrollment(), err)
+	}
+	sid := strings.TrimPrefix(login.GetToken(), grpcapi.SessionTokenPrefix)
+	bob := c.bearerClient(cc, login.GetToken())
+	eventually(t, convergeTimeout, "bob's factor session served in full on "+cc.Name, func() bool {
+		f, ferr := corrosion.SessionFactor(ctx, cc.DB, sid)
+		if ferr != nil || f != "totp" {
+			return false
+		}
+		_, err := bob.ListHosts(ctx, &pb.ListHostsRequest{})
+		return err == nil
+	})
 }
 
 // loginPolicyRefusal is the release-feature gate's refusal of a login rule

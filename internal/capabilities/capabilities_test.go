@@ -347,9 +347,11 @@ func TestGrantMinter_ClaimedOnce(t *testing.T) {
 // reviewed change to releaseFeatures and to this pin together.
 // (release_2026_11_v1 gained nic_guards and redfish_fence that way, and later
 // ha_disarm, nic_mtu and replication_rate, and then firewall_synflood, firewall_log
-// and firewall_tag_groups, and then host_incarnation, before it shipped.)
+// and firewall_tag_groups, and then host_incarnation, and then automation_stream
+// and sg_projects, before it shipped.)
 var frozenReleaseFeatures = map[string][]Feature{
 	Release202611V1: {
+		"automation_stream",
 		"backup_zstd",
 		"container_replication",
 		"drain_failback",
@@ -368,6 +370,7 @@ var frozenReleaseFeatures = map[string][]Feature{
 		"redfish_fence",
 		"replication_rate",
 		"returning_boot",
+		"sg_projects",
 		"usb_mounts_memory",
 		"vm_disk_nic_io",
 		"vm_limits",
@@ -399,5 +402,24 @@ func TestReleaseFeatureSetIsFrozen(t *testing.T) {
 		if _, ok := frozenReleaseFeatures[tok]; !ok {
 			t.Errorf("features are declared under %s, which has no pinned list", tok)
 		}
+	}
+}
+
+// TestNetBoxIPRepointV1Registered pins netbox_ip_repoint_v1: advertised,
+// known, mandatory (a fact about the binary — it decodes the lease re-point
+// statement) and replication-gated (that statement is a shape a
+// previous-release recipient has no ledger entry for).
+func TestNetBoxIPRepointV1Registered(t *testing.T) {
+	if NetBoxIPRepointV1 != "netbox_ip_repoint_v1" {
+		t.Fatalf("NetBoxIPRepointV1 = %q", NetBoxIPRepointV1)
+	}
+	if !slices.Contains(Supported(), NetBoxIPRepointV1) || !slices.Contains(All(), NetBoxIPRepointV1) {
+		t.Fatal("netbox_ip_repoint_v1 must be advertised and known")
+	}
+	if !Mandatory(NetBoxIPRepointV1) {
+		t.Fatal("netbox_ip_repoint_v1 must be mandatory: it states what this build decodes")
+	}
+	if !ReplicationGated(NetBoxIPRepointV1) {
+		t.Fatal("netbox_ip_repoint_v1 must be replication-gated: every recipient must decode the re-point")
 	}
 }

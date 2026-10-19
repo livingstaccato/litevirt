@@ -894,14 +894,43 @@ func UpdateHostRegion(ctx context.Context, c *Client, name, region string) error
 
 // DeleteHost soft-deletes a host and cleans up related records.
 func DeleteHost(ctx context.Context, c *Client, name string) error {
+	return c.ExecuteBatch(ctx, deleteHostStatements(c, name))
+}
+
+// DeleteHostIf is DeleteHost only while name's live row is still the
+// admission a caller checked: its whole ordering key (incarnation and
+// admission stamp, host_incarnation.go) and its certificate serial (compared
+// without case), read in the same transaction as the delete. A row that
+// changed since — removed, re-admitted under a new certificate, incarnation
+// or stamp (a later duplicate admission at the same incarnation, even of the
+// same certificate), its certificate renewed — is not deleted, and applied is
+// false. The statements are DeleteHost's.
+func DeleteHostIf(ctx context.Context, c *Client, name, serial string, key HostIncarnation) (applied bool, err error) {
+	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var curSerial, curAt string
+		var curInc int64
+		err := tx.QueryRowContext(ctx,
+			`SELECT COALESCE(cert_serial, ''), COALESCE(incarnation, 0), COALESCE(created_at, '') FROM hosts WHERE name = ? AND deleted_at IS NULL`,
+			name).Scan(&curSerial, &curInc, &curAt)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return strings.EqualFold(curSerial, serial) && curInc == key.N && curAt == key.At, nil
+	}, deleteHostStatements(c, name))
+}
+
+func deleteHostStatements(c *Client, name string) []Statement {
 	now := time.Now().UTC().Format(time.RFC3339) // deleted_at marker (bare)
-	return c.ExecuteBatch(ctx, []Statement{
+	return []Statement{
 		{SQL: deleteHostSQL, Params: []interface{}{now, c.NowTS(), name}},
 		{SQL: `UPDATE host_health SET deleted_at = ?, updated_at = ? WHERE observer = ? OR target = ?`,
 			Params: []interface{}{now, c.NowTS(), name, name}},
 		{SQL: `UPDATE network_vteps SET deleted_at = ?, updated_at = ? WHERE host_name = ?`,
 			Params: []interface{}{now, c.NowTS(), name}},
-	})
+	}
 }
 
 // deleteHostSQL tombstones a host row. Every node that applies it, the origin

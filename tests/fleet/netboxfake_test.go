@@ -216,3 +216,25 @@ func TestNetBoxFakeIDForAddressIsScopedToTheVRF(t *testing.T) {
 		t.Fatalf("IDForAddress in an unrelated VRF = %d, want 0", got)
 	}
 }
+
+// TestNetBoxFakeViewOnlyAddressRefusesChangeAndDelete: a token that may view
+// an address but not change it gets 404 on a PATCH and on a DELETE, while a GET
+// still returns the object — as a NetBox ObjectPermission scoped to view does.
+func TestNetBoxFakeViewOnlyAddressRefusesChangeAndDelete(t *testing.T) {
+	nb := NewNetBoxFake()
+	t.Cleanup(nb.Close)
+	c := netboxClientFor(t, nb)
+	ctx := context.Background()
+	id := nb.SeedIP("192.0.2.70/32", 3, "", time.Now())
+	nb.SetViewOnly(id)
+
+	if err := c.ClearIPAssignment(ctx, id); err == nil {
+		t.Fatal("PATCH of a view-only address succeeded")
+	}
+	if err := c.ReleaseIP(ctx, id); err == nil {
+		t.Fatal("DELETE of a view-only address succeeded")
+	}
+	if _, exists := nb.Address(id); !exists {
+		t.Fatal("the view-only address was deleted")
+	}
+}

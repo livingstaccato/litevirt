@@ -32,6 +32,11 @@ type hostRemoveTestClient struct {
 	// removeErrs are RemoveHost's answers, one per call, before it succeeds.
 	removeErrs []error
 	planVoter  bool
+	// goneAfterRemove lists no host once RemoveHost has been called.
+	goneAfterRemove bool
+	// hostState and hostAddr are node-9's listed state and address.
+	hostState pb.HostState
+	hostAddr  string
 }
 
 func (c *hostRemoveTestClient) PlanDeadHostRemoval(_ context.Context, req *pb.PlanDeadHostRemovalRequest, _ ...grpc.CallOption) (*pb.PlanDeadHostRemovalResponse, error) {
@@ -55,7 +60,10 @@ func (c *hostRemoveTestClient) GetVoterConfig(context.Context, *pb.GetVoterConfi
 }
 
 func (c *hostRemoveTestClient) ListHosts(context.Context, *pb.ListHostsRequest, ...grpc.CallOption) (*pb.ListHostsResponse, error) {
-	return &pb.ListHostsResponse{Hosts: []*pb.Host{{Name: "node-9", CertSerial: "a1b2c3"}}}, nil
+	if c.goneAfterRemove && countCalls(c.calls, "remove") > 0 {
+		return &pb.ListHostsResponse{}, nil
+	}
+	return &pb.ListHostsResponse{Hosts: []*pb.Host{{Name: "node-9", CertSerial: "a1b2c3", State: c.hostState, Address: c.hostAddr}}}, nil
 }
 
 func (c *hostRemoveTestClient) PublishCRL(context.Context, *pb.PublishCRLRequest, ...grpc.CallOption) (*pb.PublishCRLResponse, error) {
@@ -509,6 +517,55 @@ func TestHostRemove_RetriesTheRemovalAfterTheRevocation(t *testing.T) {
 	}
 }
 
+// eqts final check m-C: a retried RemoveHost whose earlier attempt removed
+// the host but lost its reply is answered NotFound. The removal completed, so
+// the command reports success; a NotFound on the first attempt is still an
+// error, since nothing this command did removed the host.
+//
+// Mutations: treat NotFound as a refusal on every attempt — "reply lost"
+// fails; on every attempt as success — "first attempt" passes a removal
+// this command never made; skip the ListHosts check — "still listed"
+// reports a live host removed.
+func TestHostRemove_ARetryAfterALostReplyIsTheRemoval(t *testing.T) {
+	old := removeRetryBackoff
+	removeRetryBackoff = []time.Duration{0, 0}
+	t.Cleanup(func() { removeRetryBackoff = old })
+	unavailable := status.Error(codes.Unavailable, "context deadline exceeded")
+	notFound := status.Error(codes.NotFound, `host "node-9" not found`)
+	for _, dead := range []bool{false, true} {
+		run := func(c *hostRemoveTestClient) error {
+			if dead {
+				return HostRemoveDead(context.Background(), c, "node-9", false)
+			}
+			return HostRemove(context.Background(), c, "node-9", false)
+		}
+		t.Run(fmt.Sprintf("reply lost dead=%v", dead), func(t *testing.T) {
+			rmTestPKI(t)
+			c := &hostRemoveTestClient{removeErrs: []error{unavailable, notFound}, goneAfterRemove: true}
+			if err := run(c); err != nil {
+				t.Errorf("a removal whose first reply was lost: %v", err)
+			}
+		})
+		// fd review I2: the daemon also answers NotFound when it could not
+		// read the row. A host still listed is not removed.
+		t.Run(fmt.Sprintf("still listed dead=%v", dead), func(t *testing.T) {
+			rmTestPKI(t)
+			c := &hostRemoveTestClient{removeErrs: []error{unavailable, notFound}}
+			err := run(c)
+			if err == nil || !strings.Contains(err.Error(), "the certificate is revoked; run") {
+				t.Errorf("a NotFound for a host still listed = %v, want the rerun", err)
+			}
+		})
+		t.Run(fmt.Sprintf("first attempt dead=%v", dead), func(t *testing.T) {
+			rmTestPKI(t)
+			c := &hostRemoveTestClient{removeErrs: []error{notFound}}
+			if err := run(c); err == nil {
+				t.Error("a NotFound on the first attempt reported success")
+			}
+		})
+	}
+}
+
 // Re-review n-3: `lv host rm --dead --dry-run` asks the daemon whether it
 // would make the removal, so the dry run does not report a plan the removal
 // would refuse; it still revokes, publishes and removes nothing.
@@ -540,5 +597,105 @@ func TestHostRemoveDead_TheDryRunRunsThePreflight(t *testing.T) {
 	voter := &hostRemoveTestClient{planVoter: true, preflightErr: status.Error(codes.FailedPrecondition, "node-9 is a member of voter generation 1")}
 	if err := HostRemoveDead(context.Background(), voter, "node-9", true); err != nil || voter.preflightReq != nil || len(voter.calls) != 0 {
 		t.Errorf("a voter's dry run: %v (preflight %v, calls %v), want no preflight and no change", err, voter.preflightReq, voter.calls)
+	}
+}
+
+// fd re-review N-m3: an add stranded after its admission leaves the admitted
+// pair staged on the host for a rerun. When the operator removes the joining
+// host instead, `lv host rm` removes that staged pair (only the one of the
+// serial it revoked), best-effort: a host it cannot reach does not fail the
+// removal. Nothing is attempted for a host that is not joining.
+//
+// Mutation: never call the cleanup — "joining" sees no call; call it for
+// every host — "active" sees one.
+func TestHostRemove_RemovesAStrandedAddsStagedPair(t *testing.T) {
+	type call struct{ addr, serial string }
+	for _, tc := range []struct {
+		name  string
+		state pb.HostState
+		fail  error
+		want  int
+	}{
+		{"joining", pb.HostState_HOST_JOINING, nil, 1},
+		{"joining unreachable", pb.HostState_HOST_JOINING, errors.New("no route to host"), 1},
+		{"active", pb.HostState_HOST_ACTIVE, nil, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rmTestPKI(t)
+			var calls []call
+			old := removeStagedAdmission
+			removeStagedAdmission = func(addr, serial string) error {
+				calls = append(calls, call{addr, serial})
+				return tc.fail
+			}
+			t.Cleanup(func() { removeStagedAdmission = old })
+			c := &hostRemoveTestClient{hostState: tc.state, hostAddr: "10.0.0.9"}
+			if err := HostRemove(context.Background(), c, "node-9", false); err != nil {
+				t.Fatalf("removal: %v", err)
+			}
+			if len(calls) != tc.want {
+				t.Fatalf("staged-pair cleanup called %d times, want %d", len(calls), tc.want)
+			}
+			if tc.want == 1 && (calls[0].addr != "10.0.0.9" || calls[0].serial != "a1b2c3") {
+				t.Errorf("cleanup asked for %+v, want 10.0.0.9 and the revoked serial", calls[0])
+			}
+		})
+	}
+}
+
+// fakeStagedHost is a host holding a staged certificate (or none).
+type fakeStagedHost struct {
+	staged []byte
+	ran    []string
+}
+
+func (h *fakeStagedHost) ReadFile(path string) ([]byte, bool, error) {
+	if path != "/etc/litevirt/pki/.host.crt.add" || h.staged == nil {
+		return nil, false, nil
+	}
+	return h.staged, true, nil
+}
+
+func (h *fakeStagedHost) Run(cmd string) error { h.ran = append(h.ran, cmd); return nil }
+
+// fd re-review 2 N2-m2: the cleanup deletes the staged pair only when the
+// staged certificate is the one this removal revoked, which is what makes a
+// dial to a reused address harmless.
+//
+// Mutation: delete whatever the serial — "another serial" removes files.
+func TestRemoveStagedPair_OnlyTheRevokedSerial(t *testing.T) {
+	dir := t.TempDir()
+	if err := pki.GenerateCA(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key")); err != nil {
+		t.Fatal(err)
+	}
+	crt := filepath.Join(dir, "h.crt")
+	if err := pki.GenerateHostCert(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"), crt,
+		filepath.Join(dir, "h.key"), "node-9", nil); err != nil {
+		t.Fatal(err)
+	}
+	pem, _ := os.ReadFile(crt)
+	serial, _ := pki.CertSerial(crt)
+	for _, tc := range []struct {
+		name   string
+		staged []byte
+		serial string
+		rm     bool
+	}{
+		{"the revoked serial", pem, strings.ToUpper(serial), true},
+		{"another serial", pem, "deadbeef", false},
+		{"nothing staged", nil, serial, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &fakeStagedHost{staged: tc.staged}
+			if err := removeStagedPair(h, tc.serial); err != nil {
+				t.Fatal(err)
+			}
+			if tc.rm != (len(h.ran) == 1) {
+				t.Fatalf("ran %v, want a removal: %v", h.ran, tc.rm)
+			}
+			if tc.rm && (!strings.Contains(h.ran[0], ".host.crt.add") || !strings.Contains(h.ran[0], ".host.key.add")) {
+				t.Errorf("removed %q, want the staged pair", h.ran[0])
+			}
+		})
 	}
 }

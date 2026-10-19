@@ -390,9 +390,10 @@ type LiteVirtClient interface {
 	SetHostLabels(ctx context.Context, in *SetHostLabelsRequest, opts ...grpc.CallOption) (*Host, error)
 	FenceHost(ctx context.Context, in *FenceHostRequest, opts ...grpc.CallOption) (*FenceResult, error)
 	GetClusterHealth(ctx context.Context, in *GetClusterHealthRequest, opts ...grpc.CallOption) (*ClusterHealth, error)
-	// ResolveHealthCondition marks one open dual-run condition resolved on an
-	// admin's word, audited. The detector re-derives its findings every pass,
-	// so a condition that still holds is raised again on the next one.
+	// ResolveHealthCondition marks one open condition resolved on an admin's
+	// word, audited: a dual-run condition, which the detector raises again on
+	// its next pass if it still holds, or nvram_flush_failed, accepted as a
+	// possibly stale UEFI vars store (accept_stale_uefi_vars).
 	ResolveHealthCondition(ctx context.Context, in *ResolveHealthConditionRequest, opts ...grpc.CallOption) (*ResolveHealthConditionResponse, error)
 	GetFenceReadiness(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*FenceReadiness, error)
 	RemoveHost(ctx context.Context, in *RemoveHostRequest, opts ...grpc.CallOption) (*RemoveHostResponse, error)
@@ -4968,9 +4969,10 @@ type LiteVirtServer interface {
 	SetHostLabels(context.Context, *SetHostLabelsRequest) (*Host, error)
 	FenceHost(context.Context, *FenceHostRequest) (*FenceResult, error)
 	GetClusterHealth(context.Context, *GetClusterHealthRequest) (*ClusterHealth, error)
-	// ResolveHealthCondition marks one open dual-run condition resolved on an
-	// admin's word, audited. The detector re-derives its findings every pass,
-	// so a condition that still holds is raised again on the next one.
+	// ResolveHealthCondition marks one open condition resolved on an admin's
+	// word, audited: a dual-run condition, which the detector raises again on
+	// its next pass if it still holds, or nvram_flush_failed, accepted as a
+	// possibly stale UEFI vars store (accept_stale_uefi_vars).
 	ResolveHealthCondition(context.Context, *ResolveHealthConditionRequest) (*ResolveHealthConditionResponse, error)
 	GetFenceReadiness(context.Context, *emptypb.Empty) (*FenceReadiness, error)
 	RemoveHost(context.Context, *RemoveHostRequest) (*RemoveHostResponse, error)

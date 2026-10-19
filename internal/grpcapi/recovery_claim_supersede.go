@@ -281,6 +281,12 @@ func (s *Server) strandedOn(ctx context.Context, host string) ([]*pb.StrandedRec
 				continue
 			}
 		}
+		// Failover never recovers a Secure Boot / vTPM VM: its firmware state
+		// was host-local and died with the host (failover.recoverWorkloads).
+		if corrosion.VMUsesFirmwareState(*full) {
+			out = append(out, &pb.StrandedRecovery{Kind: "vm", Name: full.Name, Detail: firmwareOnDeadHostDetail(full.Name, host)})
+			continue
+		}
 		out = append(out, s.strandedFor(ctx, "vm", full.Name, host, full.PendingActionID))
 	}
 	cts, err := corrosion.ListContainers(ctx, s.db, host)
@@ -326,6 +332,20 @@ func stoppedOnDeadHostDetail(kind, name, host string) string {
 		"onto a live host (`lv replication promote %s`). If the data is lost for good, remove it with `lv rm %s` "+
 		"and create it again",
 		name, host, host, host, name, name)
+}
+
+// firmwareOnDeadHostDetail is what `lv host rm --dead` says about a Secure
+// Boot / vTPM VM on the host it removes. It carries no next attempt.
+func firmwareOnDeadHostDetail(name, host string) string {
+	return fmt.Sprintf("vm/%s uses Secure Boot / vTPM: failover never recovers it, because its firmware state "+
+		"(UEFI NVRAM, TPM) was kept on %s and is lost with it, and this removal does not change that. Restore it, "+
+		"firmware included, from a backup that carried it: `lv backup restore-live --repo <repo> --vm %s --disk "+
+		"<disk> --timestamp <ts> --auto-start --blockpull --name <new>` (--blockpull localizes the disk: keep the "+
+		"command running until it prints [LOCALIZED], since stopping it earlier takes the disk's source away "+
+		"from the running guest; --name while this record still holds %s). If %s's "+
+		"disks survive, it returns with %s when the machine is added again under that name (`lv host add`). "+
+		"Otherwise remove it with `lv rm %s` and create it again",
+		name, host, name, name, host, host, name)
 }
 
 func (s *Server) strandedFor(ctx context.Context, kind, name, host, proofID string) *pb.StrandedRecovery {

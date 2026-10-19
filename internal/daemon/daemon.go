@@ -404,6 +404,11 @@ func boundedTelemetryShutdown(shutdown func(context.Context) error, timeout time
 }
 
 func (d *Daemon) Run(ctx context.Context) error {
+	// qemu writes UEFI vars files with no flush and libvirt has no cache mode
+	// for <nvram>: flush them from the first moment, so a host power cut
+	// loses at most about a second of a guest's UEFI variable writes.
+	nvramFlusher, stopNvramFlusher := d.startNvramFlusher(ctx)
+	defer stopNvramFlusher()
 	if err := d.checkMigrationNetwork(); err != nil {
 		return err
 	}
@@ -954,6 +959,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Hourly removal of the disk copies a failover start set aside here, once
 	// past superseded_disk_retention_days (health/superseded_retention.go).
 	go d.runSupersededDiskSweep(ctx)
+
+	// A UEFI vars file whose flush failed is a host condition
+	// (nvram_flush_failed); the flusher itself started with Run.
+	go d.runNvramFlushCondition(ctx, nvramFlusher)
 
 	// Sample this host's aggregate disk/net rates into host_runtime_usage for the
 	// placement engine's DiskIOPS/NetBW dimensions.
@@ -1744,16 +1753,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 	//   - vTPM (G1): both swtpm_setup and swtpm are needed to START a vTPM VM —
 	//     libvirt runs swtpm_setup to initialize state, then swtpm. (The first
 	//     G1 drill failed in swtpm_setup with swtpm alone present.)
+	//     The label is also held false until a pass over the swtpm tree
+	//     (vtpm_state_sync) has completed, so placement offers vTPM here only
+	//     after the attempt to make its state synchronous; a pass that cannot
+	//     raises vtpm_state_not_durable instead. The pass runs in its own
+	//     goroutine and the probe waits at most vtpmPassWait for it.
 	//   - Secure Boot: the secboot/MS OVMF pair (resolved above).
 	// Asserted now, before the container checker starts, and re-asserted every
 	// capabilityLabelInterval (keepCapabilityLabels says why).
+	vtpmMarker := filepath.Join(d.cfg.DataDir, "vtpm-state-sync")
+	vtpmSync := &vtpmStateSync{
+		on:   d.cfg.VTPMStateSyncEnabled(),
+		base: libvirt.SwtpmBase(),
+		wait: vtpmPassWait,
+		sync: func(on bool) libvirt.SwtpmSyncReport { return libvirt.SyncSwtpmState(on, vtpmMarker) },
+		report: func(open bool, evidence map[string]any) bool {
+			return d.syncVTPMCondition(ctx, open, evidence)
+		},
+	}
 	capabilityLabels := []capabilityLabel{
 		{key: corrosion.LabelLXCCapable, capable: lxc.Available},
-		{key: corrosion.LabelTPMCapable, capable: func() bool {
-			_, errSwtpm := exec.LookPath("swtpm")
-			_, errSetup := exec.LookPath("swtpm_setup")
-			return errSwtpm == nil && errSetup == nil
-		}},
+		{key: corrosion.LabelTPMCapable, capable: tpmCapableProbe(exec.LookPath, vtpmSync.probe)},
 		{key: corrosion.LabelSecureBootCapable, capable: firmwarePaths.SecureBootAvailable},
 	}
 	asserted, err := assertCapabilityLabels(ctx, d.db, d.cfg.HostName, capabilityLabels)
@@ -3792,6 +3812,18 @@ func (d *Daemon) wireCorrosionGates() {
 	d.wireVoterConfigGate()
 	d.wireRecoveryClaimGate()
 	d.wireSpecConflictGate()
+	d.wireNetBoxRepointGate()
+}
+
+// wireNetBoxRepointGate lets corrosion re-point a lease at a re-created NetBox
+// address only once netbox_ip_repoint_v1 has DURABLY latched: the re-point is a
+// shape a previous-release peer has no ledger entry for. Mandatory, no config
+// flag; unwired, the gate fails closed and the mirror skips a dead address and
+// reports the pass unconverged, as the previous release did.
+func (d *Daemon) wireNetBoxRepointGate() {
+	d.db.SetNetBoxRepointGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.NetBoxIPRepointV1)
+	})
 }
 
 // wireSpecConflictGate tells corrosion when spec_conflict_v1 has DURABLY

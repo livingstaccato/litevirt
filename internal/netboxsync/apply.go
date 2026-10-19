@@ -184,6 +184,11 @@ type Reconciler struct {
 	acquireLease func(context.Context) bool
 	holdsLease   func(context.Context) bool
 
+	// vmRows serialises the writes that PATCH one VM's primary fields: NetBox
+	// saves a PATCHed VM as the whole row it read, so two concurrent writes
+	// to one VM can each put back the field the other just changed.
+	vmRows keyedMutex
+
 	// repointLease re-points a lease at a re-created address; nil is
 	// corrosion.RepointNetBoxLease. A test substitutes it.
 	repointLease func(ctx context.Context, c *corrosion.Client, network, ip string, fromID, toID int) (bool, error)
@@ -333,10 +338,17 @@ func (r *Reconciler) applyOne(ctx context.Context, a Action, idx desiredIndex, f
 		// IPID is only ever a litevirt-owned address — BuildActual admits no
 		// other into the set Diff clears from — so this branch cannot detach an
 		// operator's address even by mistake.
+		//
+		// A clear nulls its VM's primaries first, and so does an interface
+		// delete (netbox.DeleteInterface): both are serialised per VM.
+		defer r.vmRows.lock(a.ParentNetBoxID)()
 		return r.clearAddress(ctx, a)
 	case a.Kind == kindVM && (a.Op == opPrimaryIP || a.Op == opPrimaryIP6):
 		return r.setPrimaryIP(ctx, a)
 	case a.Op == "delete":
+		if a.Kind == kindNIC {
+			defer r.vmRows.lock(a.ParentNetBoxID)()
+		}
 		return r.deleteObject(ctx, a)
 	default:
 		return fmt.Errorf("netboxsync: unhandled action %s/%s for %s", a.Kind, a.Op, a.Key)
@@ -1122,10 +1134,52 @@ func (r *Reconciler) setPrimaryIP(ctx context.Context, a Action) error {
 		// kept from failing.
 		return nil
 	}
+	// One VM's two family setters run in the same phase; NetBox's whole-row
+	// save would let one undo the other.
+	defer r.vmRows.lock(vmID)()
 	if a.Op == opPrimaryIP6 {
 		return r.nb.SetPrimaryIP6(ctx, vmID, ipID)
 	}
 	return r.nb.SetPrimaryIP4(ctx, vmID, ipID)
+}
+
+// keyedMutex is one mutex per key, held only while some caller uses it. The
+// zero value is ready; key 0 (an unresolved id) is not locked.
+type keyedMutex struct {
+	mu    sync.Mutex
+	locks map[int]*keyedLock
+}
+
+type keyedLock struct {
+	sync.Mutex
+	users int
+}
+
+// lock locks key and returns its unlock.
+func (k *keyedMutex) lock(key int) func() {
+	if key == 0 {
+		return func() {}
+	}
+	k.mu.Lock()
+	if k.locks == nil {
+		k.locks = map[int]*keyedLock{}
+	}
+	l := k.locks[key]
+	if l == nil {
+		l = &keyedLock{}
+		k.locks[key] = l
+	}
+	l.users++
+	k.mu.Unlock()
+	l.Lock()
+	return func() {
+		l.Unlock()
+		k.mu.Lock()
+		if l.users--; l.users == 0 {
+			delete(k.locks, key)
+		}
+		k.mu.Unlock()
+	}
 }
 
 // keepOldest resolves a search result to the one object to adopt.

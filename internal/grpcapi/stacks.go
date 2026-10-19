@@ -1224,10 +1224,20 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	// registrations (registered before the workloads), which stay for an
 	// Admin. The progress line (Status "local-only") says what is left, and
 	// nothing retries a workload delete that fails here.
+	//
+	// A node that holds an older record, without the firewall a newer one
+	// has, authorizes a teardown on what it sees. So the teardown records
+	// whether its caller held sg.write at the root (removesFirewall): a peer's
+	// reconciler that holds a firewall of the stack removes it only when it
+	// did, and otherwise leaves it and raises stack.firewall_teardown_held
+	// (corrosion.StackTeardownRemovesFirewall). Without it this node checks
+	// again before it removes the firewall rows itself, since they may have
+	// reached it during the teardown.
+	removesFirewall := s.requireSGWrite(ctx) == nil
 	localOnly := false
 	if st, gerr := corrosion.GetStack(ctx, s.db, req.Name); gerr != nil {
 		return status.Errorf(codes.Unavailable, "read stack %q: %v", req.Name, gerr)
-	} else if st == nil && s.requireSGWrite(ctx) != nil {
+	} else if st == nil && !removesFirewall {
 		localOnly = true
 	}
 	if !localOnly {
@@ -1317,7 +1327,7 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 			return sendErr
 		}
 	} else {
-		if err := corrosion.MarkStackDeleting(ctx, s.db, req.Name, req.KeepDisks, s.hostName); err != nil {
+		if err := corrosion.MarkStackDeleting(ctx, s.db, req.Name, req.KeepDisks, removesFirewall, s.hostName); err != nil {
 			return status.Errorf(codes.Internal, "set stack state: %v", err)
 		}
 
@@ -1584,6 +1594,13 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 			run  func() error
 		}{
 			{"firewall rows", func() error {
+				if !removesFirewall {
+					if refusal, err := s.stackFirewallRefusal(ctx, req.Name, false, "removing"); err != nil {
+						return err
+					} else if refusal != nil {
+						return errors.New(status.Convert(refusal).Message())
+					}
+				}
 				return corrosion.DeleteStackFirewall(ctx, s.db, req.Name, compose.StoredStackWants)
 			}},
 			{"backup repos", func() error {
@@ -2901,7 +2918,7 @@ func (s *Server) stackFirewallRefusal(ctx context.Context, stack string, declare
 		switch {
 		case serr != nil:
 			why = "its stored file cannot be read, so whether it declares a firewall is unknown"
-		case stored != nil && (len(stored.SecurityGroups) > 0 || len(stored.IPSets) > 0 || stored.FirewallDefaults != nil):
+		case stored.DeclaresFirewall():
 			why = "its stored file declares a firewall"
 		}
 	}

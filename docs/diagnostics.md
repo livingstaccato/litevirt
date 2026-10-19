@@ -1811,6 +1811,30 @@ created and torn down. `lv rm <vm>` removes the VM; deploying the stack again
 next pass after either. A VM created after the stack was torn down is a
 deploy of that stack name in progress, and is not reported.
 
+### A stack firewall a teardown may not remove (`stack.firewall_teardown_held`)
+
+Evaluator `stack_reconciler`, subject kind `stack`, subject the stack's
+name, severity warning. `lv compose down` by a caller without `sg.write` at
+`/` runs only where the entry node sees no firewall for the stack, and that
+node may hold an older record of it. Raised by the stack reconciler on a
+host that holds a firewall of the stack (a security group, ip set, cluster
+or host rule or firewall default it owns, or a stored file that declares a
+firewall or cannot be read) in two cases:
+
+- the stack is `deleting` and its teardown may not remove that firewall: its
+  caller did not hold `sg.write` at `/`, or its record does not say (begun by
+  an older build, before `cluster_policies` could be written, or re-stamped
+  since). The firewall stays in force and the stack stays `deleting`; its
+  workloads and networks are still removed.
+- the stack was torn down while this host holds a security group, ip set,
+  or cluster or host rule it owns, written before the teardown. They stay in
+  force. A cluster default-deny it owns is `firewall.default_deny_orphaned`.
+
+An Admin finishes the teardown with `lv compose down --name <stack>`, from
+any node, record or not; `lv role grant NetworkAdmin <principal> --path /
+--propagate` lets another caller do it. The condition resolves on the next
+pass after the stack is deployed again or no firewall of it is left.
+
 ### Tag-group conditions (`firewall.tag_group.*`)
 
 Raised per host by its firewall reconciler, and resolved on the next pass that

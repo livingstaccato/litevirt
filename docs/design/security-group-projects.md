@@ -60,15 +60,28 @@ node, record or not: an Admin's down is the full one, which finds networks and
 backup repos by their stack name); the CLI, the UI and the REST API (`local_only`,
 `notice`) report it as a local-only teardown, never as a complete one.
 
-Residual: a node that holds an older stack file without a firewall, and
-neither the newer file nor the rows, authorizes a non-root teardown or a
-redeploy that withdraws a deny ask. The window is replication lag right after
-an Admin deploy that adds the firewall (the deploy writes the rows before the
-record). Closing it would mean recording the stack's `compose_hash` the entry
-node authorized against in the teardown record `MarkStackDeleting` already
-writes to `cluster_policies` (`stack_teardown/<name>`, free-form JSON, no
-schema change), and having a peer's reconciler keep the firewall rows when its
-own record's hash differs. Not implemented.
+A node that holds an older stack file without a firewall, and neither the
+newer file nor the rows, still authorizes a teardown by a caller without
+`sg.write` at `/`: it sees no firewall. The teardown records whether its
+caller held `sg.write` at `/` in the record `MarkStackDeleting` writes to
+`cluster_policies` (`stack_teardown/<name>`, field `firewall`, omitted when
+false, so a previous release reads the record as before and its own record
+reads as a teardown without it). A reconciler removes a stack's firewall only
+for a teardown recorded with it. For any other teardown (a previous
+release's record, no record, or another teardown's record) a host that holds
+a firewall of the stack (a row it owns, or a stored file that declares one or
+cannot be read) keeps it, keeps the stack `deleting` and raises
+`stack.firewall_teardown_held` (diagnostics.md); its workloads and networks
+are still removed. The entry node checks again before it removes the firewall
+rows itself, since they may reach it during the teardown. A teardown that
+completes on the entry node tombstones the stack record; a host whose rows
+it never saw keeps them, and raises the same condition for the torn-down
+stack while it holds them. `lv compose down --name <stack>` by an Admin
+removes what is left, record or not.
+
+Residual: a previous release's reconciler still removes the firewall it
+holds of a stack whose teardown it receives, until that host is upgraded. A
+redeploy through the same older file can still withdraw a deny ask.
 
 `ListSecurityGroups`:
 

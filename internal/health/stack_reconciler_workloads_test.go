@@ -127,11 +127,18 @@ func TestStackReconciler_DeletesContainersAndKeepsNetworksWhileOneFails(t *testi
 // was refused, "security-group ... is already defined by stack" (lab 1 `web`,
 // lab 2 `noicmp`).
 //
+// The teardown is one whose caller held sg.write at the cluster root (one
+// without it is stack_firewall_hold_test.go).
+//
 // Mutation: drop the firewall tombstone from the reconciler's last step — the
 // security group outlives the stack.
 func TestStackReconciler_FinishedStackTakesItsFirewallAndRepos(t *testing.T) {
 	db := seedDeletingStack(t, false, false)
 	ctx := context.Background()
+	db.SetClusterPolicyGate(func() bool { return true })
+	if err := corrosion.MarkStackDeleting(ctx, db, "app", false, true, "node-0"); err != nil {
+		t.Fatal(err)
+	}
 	if err := corrosion.InsertSecurityGroup(ctx, db, corrosion.SecurityGroup{ID: "sg1", Name: "web", StackName: "app"}); err != nil {
 		t.Fatal(err)
 	}
@@ -143,6 +150,7 @@ func TestStackReconciler_FinishedStackTakesItsFirewallAndRepos(t *testing.T) {
 	}
 	r := NewStackReconciler("node-0", db)
 	r.SetCleaner(&failingStackCleaner{})
+	r.SetClock(func() time.Time { return time.Now().Add(2 * stackTeardownGrace) })
 	r.reconcile(ctx)
 	if st, _ := corrosion.GetStack(ctx, db, "app"); st != nil {
 		t.Fatalf("the stack was not finished: %+v", st)

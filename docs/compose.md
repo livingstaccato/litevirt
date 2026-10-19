@@ -180,7 +180,10 @@ containers is left, none of its networks is deprovisioned: a deleted network
 is torn down on every host, and would be pulled out from under that workload.
 The background retry deletes the remaining VMs and containers first, and
 removes the networks only once they are all gone; when it finishes, the stack's
-security groups, ip sets, cluster rules and backup repos go with it. A first
+security groups, ip sets, cluster rules and backup repos go with it. A host keeps
+the firewall it holds of the stack, and the stack `deleting`, when the teardown's
+caller did not hold `sg.write` at `/` (the `stack.firewall_teardown_held` health
+condition, see [diagnostics.md](diagnostics.md)). A first
 `compose up` of a stack that fails before it issues any workload action removes
 the security groups, ip sets and cluster rules it had just written; the
 cluster default-deny and backup repo registrations stay, and its error says

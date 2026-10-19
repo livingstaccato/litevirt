@@ -435,7 +435,7 @@ func TestPullOCI_RecoversTheItemsOwnLeftovers(t *testing.T) {
 	if got := imageIn(t, dest); got != "old" {
 		t.Fatalf("the item holds %q, want the old bundle put back", got)
 	}
-	if ents, _ := os.ReadDir(filepath.Join(parent, unpackDirName)); len(ents) != 0 {
+	if ents, _ := os.ReadDir(filepath.Join(parent, unpackDirName)); len(ents) != 1 || ents[0].Name() != "web"+lockSuffix {
 		t.Errorf("leftovers remain: %v", ents)
 	}
 	// Crash after the swap: the item is there, the old bundle was not removed.
@@ -455,5 +455,36 @@ func TestPullOCI_RecoversTheItemsOwnLeftovers(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(parent, unpackDirName, "webx+3+old")); err != nil {
 		t.Error("another item's leftover was touched")
+	}
+}
+
+// A skopeo killed mid-copy (the daemon died) can leave the item's .oci
+// layout unreadable; the next pull drops the layout and copies again
+// instead of failing until it is removed by hand.
+func TestPullOCI_ABrokenLayoutIsRefetched(t *testing.T) {
+	fakeOCITools(t, false)
+	bin := t.TempDir()
+	skopeo := `#!/bin/sh
+for a in "$@"; do last="$a"; done
+rest="${last#oci:}"; layout="${rest%:*}"; tag="${rest##*:}"
+if [ -f "$layout/index.json" ] && grep -q TRUNCATED "$layout/index.json"; then echo "invalid character in index.json" >&2; exit 1; fi
+mkdir -p "$layout" && echo '{}' > "$layout/index.json" && echo "$tag" > "$layout/tag-$tag"
+`
+	if err := os.WriteFile(filepath.Join(bin, "skopeo"), []byte(skopeo), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	dest := filepath.Join(t.TempDir(), "web")
+	if err := os.MkdirAll(dest+".oci", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dest+".oci", "index.json"), []byte("{TRUNCATED"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := PullOCI(context.Background(), PullOCIOptions{Image: "alpine:3.21", Dest: dest}); err != nil {
+		t.Fatalf("a pull over a broken layout: %v", err)
+	}
+	if got := imageIn(t, dest); got != "3.21" {
+		t.Fatalf("the item holds %q", got)
 	}
 }

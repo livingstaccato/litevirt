@@ -80,6 +80,30 @@ func BundleDir(abs string) string {
 
 var ociItemLocks sync.Map // bundle dir → *sync.Mutex
 
+// lockItemFile takes an exclusive flock on dest's lock file,
+// <parent>/.litevirt+unpack/<item>.lock, waiting for it: the lock another
+// process (lv ct pull --local beside the daemon) takes too, so only one
+// touches the item's staging entries at a time. It returns the release.
+func lockItemFile(dest string) (func(), error) {
+	dir := filepath.Join(filepath.Dir(dest), unpackDirName)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("lock %s: %w", dest, err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, filepath.Base(dest)+lockSuffix), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("lock %s: %w", dest, err)
+	}
+	if err := flockExclusive(f); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("lock %s: %w", dest, err)
+	}
+	return func() { _ = f.Close() }, nil
+}
+
+// lockSuffix names an item's lock file in the staging directory; recovery
+// leaves those alone.
+const lockSuffix = ".lock"
+
 // LockOCIItem serialises, in this daemon, everything that reads or replaces
 // the bundle at dir (a replacing pull, a create copying it, a fetch judging
 // it), so a create never copies a bundle half replaced. It returns the unlock.
@@ -162,6 +186,9 @@ func recoverStaged(dir, parent, item string) error {
 	var errs []error
 	for _, e := range ents {
 		n := e.Name()
+		if strings.HasSuffix(n, lockSuffix) {
+			continue // an item's lock (lockItemFile), not a leftover
+		}
 		it := stagedItem(n)
 		if item != "" && it != item {
 			continue

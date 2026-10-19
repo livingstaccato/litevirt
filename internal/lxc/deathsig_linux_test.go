@@ -159,3 +159,112 @@ func TestStartupSweepStopsAProcessStillInTheStage(t *testing.T) {
 		})
 	}
 }
+
+// The sweep reads /proc/<pid>/{cwd,root,fd}, which the kernel renders
+// relative to each process's own namespace root. A process in another mount
+// namespace (a container, a nested litevirt) whose own path is spelled like
+// the stage is not in the stage, and must survive the sweep.
+func TestStartupSweepSparesAnotherMountNamespace(t *testing.T) {
+	if err := exec.Command("unshare", "-Urm", "true").Run(); err != nil {
+		t.Skipf("user and mount namespaces unavailable: %v", err)
+	}
+	store := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(store, fetchDirName, "web"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ready := filepath.Join(t.TempDir(), "ready")
+	script := "mount -t tmpfs none " + store + " && mkdir -p " + store + "/" + fetchDirName + "/x && cd " + store + "/" + fetchDirName + "/x && touch " + ready + " && exec sleep 30"
+	c := exec.Command("unshare", "-Urm", "sh", "-c", script)
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { _ = c.Wait(); close(done) }()
+	t.Cleanup(func() { _ = c.Process.Kill(); <-done })
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the other-namespace process did not start")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	cwd, _ := os.Readlink("/proc/" + strconv.Itoa(c.Process.Pid) + "/cwd")
+	if !strings.HasPrefix(cwd, filepath.Join(store, fetchDirName)) {
+		t.Skipf("the kernel renders its cwd as %q here; nothing to tell apart", cwd)
+	}
+	if err := (&LxcRunner{Lxcpath: store}).SweepFetchDir(); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	select {
+	case <-done:
+		t.Fatal("a process in another mount namespace, not in the stage, was killed by the sweep")
+	case <-time.After(1 * time.Second):
+	}
+}
+
+// A pull holds a file lock on the item that another process (lv ct pull
+// --local) also takes, so the two never touch the item's staging entries
+// at once.
+func TestPullOCI_HoldsTheItemsFileLock(t *testing.T) {
+	fakeOCITools(t, false)
+	dest := filepath.Join(t.TempDir(), "web")
+	release, err := lockItemFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- PullOCI(context.Background(), PullOCIOptions{Image: "alpine:3.21", Dest: dest}) }()
+	select {
+	case err := <-done:
+		release()
+		t.Fatalf("the pull did not wait for the item's file lock (%v)", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	release()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A process in another mount namespace that is working in the stage itself
+// (the same directory, by device and inode) is stopped like any other.
+func TestStartupSweepStopsAnotherNamespaceInTheStage(t *testing.T) {
+	if err := exec.Command("unshare", "-Urm", "true").Run(); err != nil {
+		t.Skipf("user and mount namespaces unavailable: %v", err)
+	}
+	store := t.TempDir()
+	work := filepath.Join(store, fetchDirName, "web")
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ready := filepath.Join(t.TempDir(), "ready")
+	c := exec.Command("unshare", "-Urm", "sh", "-c", "cd "+work+" && touch "+ready+" && exec sleep 30")
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { _ = c.Wait(); close(done) }()
+	t.Cleanup(func() { _ = c.Process.Kill(); <-done })
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the other-namespace process did not start")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := (&LxcRunner{Lxcpath: store}).SweepFetchDir(); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a process working in the stage from another mount namespace was left running")
+	}
+}

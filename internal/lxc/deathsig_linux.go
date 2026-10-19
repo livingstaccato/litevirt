@@ -3,7 +3,6 @@
 package lxc
 
 import (
-	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +11,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // The daemon runs under KillMode=process, so a tool it spawned outlives it
@@ -40,61 +41,114 @@ func runPinned(fn func() error) error {
 	return fn()
 }
 
-// stopWorkersIn sends SIGKILL to every other process whose working
-// directory, root or open files lie under dir, and waits up to five seconds
-// for them to exit.
+// stopWorkersIn sends SIGKILL to every other process working inside dir,
+// and waits up to five seconds for them to exit. /proc/<pid>/{cwd,root,fd}
+// read as paths only within the reader's own mount namespace: a process in
+// another one (a container, a nested litevirt) renders its own paths, which
+// may be spelled like dir without being in it. So a process whose links
+// read as inside dir is stopped only when it shares this mount namespace,
+// or when the object a link leads to is dir or an entry under it (same
+// device and inode). Each is signalled through a pidfd opened before its
+// links are read again, so a reused PID is never hit.
 func stopWorkersIn(dir string) {
 	dir = canonPath(dir)
-	under := func(p string) bool { return p == dir || strings.HasPrefix(p, dir+"/") }
+	objs := stageObjects(dir)
+	selfNS, _ := os.Readlink("/proc/self/ns/mnt")
 	ents, err := os.ReadDir("/proc")
 	if err != nil {
 		return
 	}
 	self := os.Getpid()
-	var pids []int
+	var fds []int
 	for _, e := range ents {
 		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid == self {
+		if err != nil || pid == self || !worksIn(pid, dir, objs, selfNS) {
 			continue
 		}
-		base := filepath.Join("/proc", e.Name())
-		hit := false
-		for _, l := range []string{"cwd", "root"} {
-			if t, err := os.Readlink(filepath.Join(base, l)); err == nil && under(strings.TrimSuffix(t, " (deleted)")) {
-				hit = true
-			}
+		pfd, err := unix.PidfdOpen(pid, 0)
+		if err != nil {
+			continue
 		}
-		if !hit {
-			fds, _ := os.ReadDir(filepath.Join(base, "fd"))
-			for _, fd := range fds {
-				if t, err := os.Readlink(filepath.Join(base, "fd", fd.Name())); err == nil && under(strings.TrimSuffix(t, " (deleted)")) {
-					hit = true
-					break
-				}
-			}
+		// The pidfd pins this process: if the PID was reused before it was
+		// opened, the links read again now are the new process's.
+		if !worksIn(pid, dir, objs, selfNS) || unix.PidfdSendSignal(pfd, unix.SIGKILL, nil, 0) != nil {
+			_ = unix.Close(pfd)
+			continue
 		}
-		if hit {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
-			pids = append(pids, pid)
-		}
+		fds = append(fds, pfd)
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for _, pid := range pids {
-		for time.Now().Before(deadline) {
-			if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) || zombie(pid) {
-				break
-			}
-			time.Sleep(20 * time.Millisecond)
+	for _, pfd := range fds {
+		ms := int(time.Until(deadline) / time.Millisecond)
+		if ms > 0 {
+			_, _ = unix.Poll([]unix.PollFd{{Fd: int32(pfd), Events: unix.POLLIN}}, ms)
 		}
+		_ = unix.Close(pfd)
 	}
 }
 
-func zombie(pid int) bool {
-	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
-	if err != nil {
-		return true
+// worksIn reports whether process pid has its cwd, root or an open file
+// inside dir (see stopWorkersIn for what counts).
+func worksIn(pid int, dir string, objs map[devIno]bool, selfNS string) bool {
+	base := filepath.Join("/proc", strconv.Itoa(pid))
+	under := func(p string) bool { return p == dir || strings.HasPrefix(p, dir+"/") }
+	links := []string{filepath.Join(base, "cwd"), filepath.Join(base, "root")}
+	if fds, err := os.ReadDir(filepath.Join(base, "fd")); err == nil {
+		for _, fd := range fds {
+			links = append(links, filepath.Join(base, "fd", fd.Name()))
+		}
 	}
-	s := string(b)
-	i := strings.LastIndex(s, ")")
-	return i >= 0 && i+2 < len(s) && s[i+2] == 'Z'
+	var sameNS *bool
+	for _, l := range links {
+		t, err := os.Readlink(l)
+		if err != nil || !under(strings.TrimSuffix(t, " (deleted)")) {
+			continue
+		}
+		if sameNS == nil {
+			ns, _ := os.Readlink(filepath.Join(base, "ns", "mnt"))
+			v := ns != "" && ns == selfNS
+			sameNS = &v
+		}
+		if *sameNS {
+			return true
+		}
+		if st, err := os.Stat(l); err == nil && objs[devInoOf(st)] {
+			return true
+		}
+	}
+	return false
+}
+
+type devIno struct{ dev, ino uint64 }
+
+func devInoOf(fi os.FileInfo) devIno {
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return devIno{uint64(st.Dev), st.Ino}
+	}
+	return devIno{}
+}
+
+// stageObjects is the (device, inode) of dir and of every entry under it.
+func stageObjects(dir string) map[devIno]bool {
+	objs := map[devIno]bool{}
+	_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if fi, err := os.Lstat(p); err == nil {
+			objs[devInoOf(fi)] = true
+		}
+		return nil
+	})
+	return objs
+}
+
+// flockExclusive takes an exclusive flock on f, waiting for it.
+func flockExclusive(f *os.File) error {
+	for {
+		err := unix.Flock(int(f.Fd()), unix.LOCK_EX)
+		if err != unix.EINTR {
+			return err
+		}
+	}
 }

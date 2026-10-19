@@ -1999,6 +1999,11 @@ Until every host runs this release:
   upgraded host, entered through an upgraded host.
 - A delegated `PermissionAdmin` on a previous-release host may grant the
   `ContainerRoot` role through a custom `*.exec` role.
+- A container whose name is not valid today (anything but letters, digits,
+  `_`, `.` and `-`, or exactly `.` or `..`) cannot be started, stopped,
+  deleted, cloned or recreated by this release. Before the roll, on the
+  previous release, clone it under a valid name (`lv ct clone <source>
+  <new-name>`) and remove the original.
 
 Once every host is upgraded, review the `ContainerRoot` bindings and revoke
 any that were not intended:

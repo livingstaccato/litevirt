@@ -76,6 +76,11 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	}
 	unlock := LockOCIItem(opts.Dest)
 	defer unlock()
+	release, err := lockItemFile(opts.Dest)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if err := recoverItem(opts.Dest); err != nil {
 		return fmt.Errorf("oci: finish an interrupted pull of %s first: %w", opts.Dest, err)
 	}
@@ -127,7 +132,17 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	}
 	args = append(args, srcRef, dstRef)
 	if out, err := combinedOutputPinned(dieWithDaemon(exec.CommandContext(ctx, "skopeo", args...))); err != nil {
-		return fmt.Errorf("skopeo copy: %w: %s", err, out)
+		// A skopeo killed mid-copy (the daemon died) can leave the layout
+		// unreadable: drop it and copy once more from scratch.
+		if ctx.Err() != nil {
+			return fmt.Errorf("skopeo copy: %w: %s", err, out)
+		}
+		if rerr := os.RemoveAll(tmpLayout); rerr != nil {
+			return fmt.Errorf("skopeo copy: %w: %s", err, out)
+		}
+		if out2, err2 := combinedOutputPinned(dieWithDaemon(exec.CommandContext(ctx, "skopeo", args...))); err2 != nil {
+			return fmt.Errorf("skopeo copy: %w: %s", err2, out2)
+		}
 	}
 
 	// Stage 2: umoci unpack flattens the layers into a usable rootfs.

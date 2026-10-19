@@ -1,11 +1,9 @@
-package automation
+package custody
 
 import (
 	"bytes"
 	"encoding/hex"
 	"testing"
-
-	"filippo.io/age"
 )
 
 func equalityFixture(t *testing.T, epoch string, material byte) BootstrapEqualityKey {
@@ -126,38 +124,6 @@ func TestAutomationSecretEqualityHistoricalEpochAndUnavailable(t *testing.T) {
 	same, err = owned.CompareIntent("old", scope, raw, original)
 	if err != nil || !same {
 		t.Fatal("key aliases imported material")
-	}
-}
-
-func TestAutomationSecretWrappingDoesNotEnterRetryIdentity(t *testing.T) {
-	key := equalityFixture(t, "epoch", 3)
-	scope := IntentScope{"cluster", "namespace", "CreateVM"}
-	raw := RawBootstrapIntent{Present: true, UserData: []byte("raw")}
-	tag, err := key.IntentTag("epoch", scope, raw)
-	if err != nil {
-		t.Fatal("tag failed")
-	}
-	a, b := secretIdentity(t), secretIdentity(t)
-	binding := secretBindingFixture()
-	files := EffectiveBootstrap{UserData: []byte("effective"), Metadata: []byte("generated")}
-	first, err := EncryptBootstrap(binding, files, []*age.X25519Recipient{a.Recipient()})
-	if err != nil {
-		t.Fatal("encrypt failed")
-	}
-	second, err := EncryptBootstrap(binding, files, []*age.X25519Recipient{b.Recipient()})
-	if err != nil {
-		t.Fatal("rewrap failed")
-	}
-	c := Command{Kind: "admit_create", ClusterUID: "cluster", ProjectUID: "project", PrincipalID: "principal", OwnerID: "owner", ManagementKey: "key", RequestID: "request", ResourceUID: "resource", Body: []byte(`{"version":1}`), Ciphertext: first, SecretIntentTag: tag, SecretKeyEpoch: "epoch"}
-	original, err := CanonicalCommand(c)
-	if err != nil {
-		t.Fatal("canonical intent failed")
-	}
-	c.Ciphertext = second
-	c.Session++
-	changed, err := CanonicalCommand(c)
-	if err != nil || !bytes.Equal(original, changed) {
-		t.Fatal("wrapping or session changed immutable retry identity")
 	}
 }
 

@@ -1,4 +1,4 @@
-package automation
+package custody
 
 import (
 	"bytes"
@@ -8,8 +8,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"sync"
+	"time"
+	"unicode/utf8"
 
 	"filippo.io/age"
 )
@@ -19,6 +22,7 @@ import (
 type CustodyScope struct {
 	ClusterUID, HostID string
 	HostIncarnation    uint64
+	AdmittedAt         string
 }
 
 // CustodyKeyRef identifies the original key context. Current activation and
@@ -41,7 +45,7 @@ type LocalCustody struct {
 	closed       bool
 }
 
-// LocalVoterKey keeps the live private identity inside the automation package.
+// LocalVoterKey keeps the live private identity inside the custody package.
 // There is deliberately no private serialization or generic export method.
 type LocalVoterKey struct{ identity *age.X25519Identity }
 
@@ -69,13 +73,19 @@ type custodyRecord struct {
 }
 
 func (scope CustodyScope) valid() bool {
-	return secretStringValid(scope.ClusterUID) && secretStringValid(scope.HostID) && scope.HostIncarnation > 0
+	if !secretStringValid(scope.ClusterUID) || !secretStringValid(scope.HostID) || scope.HostIncarnation > math.MaxInt64 || !secretStringValid(scope.AdmittedAt) || !utf8.ValidString(scope.AdmittedAt) {
+		return false
+	}
+	// Parsing validates the supplied spelling; the original bytes remain the
+	// identity. Do not normalize it or compare its ordering to another lifetime.
+	_, err := time.Parse(time.RFC3339Nano, scope.AdmittedAt)
+	return err == nil
 }
 func (ref CustodyKeyRef) valid() bool {
 	return secretStringValid(ref.Epoch) && secretStringValid(ref.KeyID) && secretStringValid(ref.ConfigDigest) && ref.Generation > 0
 }
 func (s *LocalCustody) record(purpose string, ref CustodyKeyRef, material []byte) custodyRecord {
-	return custodyRecord{1, purpose, s.scope, ref, material}
+	return custodyRecord{2, purpose, s.scope, ref, material}
 }
 func custodyEncode(r custodyRecord) ([]byte, error) {
 	b, err := json.Marshal(r)
@@ -89,9 +99,16 @@ func custodyDecode(b []byte) (custodyRecord, error) {
 	if len(b) > custodyRecordMax {
 		return r, ErrCustodyCorrupt
 	}
+	var header struct{ Version uint32 }
+	if json.Unmarshal(b, &header) != nil {
+		return r, ErrCustodyCorrupt
+	}
+	if header.Version == 1 {
+		return r, refuseLegacyCustody(b)
+	}
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
-	if dec.Decode(&r) != nil || r.Version != 1 {
+	if dec.Decode(&r) != nil || r.Version != 2 || !r.Scope.valid() {
 		return custodyRecord{}, ErrCustodyCorrupt
 	}
 	canonical, err := custodyEncode(r)
@@ -107,8 +124,50 @@ func custodyName(record custodyRecord) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	digest := sha256.Sum256(append([]byte("litevirt/automation/local-custody-path/v1\x00"), encoded...))
+	digest := sha256.Sum256(append([]byte("litevirt/automation/local-custody-path/v2\x00"), encoded...))
 	return "key-" + hex.EncodeToString(digest[:]), nil
+}
+
+// This frozen original shape is decoded only to refuse old artifacts. It never
+// gains an AdmittedAt, returns private material or enters a current key lookup.
+func refuseLegacyCustody(body []byte) error {
+	var old struct {
+		Version uint32
+		Purpose string
+		Scope   struct {
+			ClusterUID, HostID string
+			HostIncarnation    uint64
+		}
+		Ref      CustodyKeyRef
+		Material []byte
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if dec.Decode(&old) != nil || old.Version != 1 || !secretStringValid(old.Scope.ClusterUID) || !secretStringValid(old.Scope.HostID) || old.Scope.HostIncarnation == 0 {
+		return ErrCustodyCorrupt
+	}
+	canonical, err := json.Marshal(old)
+	if err != nil || !bytes.Equal(canonical, body) {
+		return ErrCustodyCorrupt
+	}
+	switch old.Purpose {
+	case "scope":
+		if old.Ref != (CustodyKeyRef{}) || old.Material != nil {
+			return ErrCustodyCorrupt
+		}
+	case custodyEqualityPurpose:
+		if !old.Ref.valid() || len(old.Material) != 32 {
+			return ErrCustodyCorrupt
+		}
+	case custodyVoterPurpose:
+		identity, err := age.ParseX25519Identity(string(old.Material))
+		if !old.Ref.valid() || err != nil || identity.String() != string(old.Material) {
+			return ErrCustodyCorrupt
+		}
+	default:
+		return ErrCustodyCorrupt
+	}
+	return ErrCustodyRecoveryRequired
 }
 
 // CreateLocalCustody reserves a new root. An existing or incomplete root is

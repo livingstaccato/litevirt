@@ -1,4 +1,4 @@
-package automation
+package custody
 
 import (
 	"bytes"
@@ -16,7 +16,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func custodyScopeFixture() CustodyScope { return CustodyScope{"cluster", "host", 17} }
+func custodyScopeFixture() CustodyScope {
+	return CustodyScope{ClusterUID: "cluster", HostID: "host", HostIncarnation: 17, AdmittedAt: "2026-10-19T00:00:00Z"}
+}
 func custodyRefFixture(epoch string) CustodyKeyRef {
 	return CustodyKeyRef{Epoch: epoch, KeyID: "key", Generation: 8, ConfigDigest: "config"}
 }
@@ -79,7 +81,7 @@ func TestAutomationCustodyIdentityRestartAndBinding(t *testing.T) {
 	requireCustodyError(t, err, ErrCustodyConflict)
 	_, err = reopened.OpenVoterIdentity(ref, secretIdentity(t).Recipient().String())
 	requireCustodyError(t, err, ErrCustodyConflict)
-	_, err = OpenLocalCustody(path, CustodyScope{"other", "host", 17})
+	_, err = OpenLocalCustody(path, CustodyScope{ClusterUID: "other", HostID: "host", HostIncarnation: 17, AdmittedAt: "2026-10-19T00:00:00Z"})
 	requireCustodyError(t, err, ErrCustodyConflict)
 	for _, wrong := range []CustodyKeyRef{{Epoch: ref.Epoch, KeyID: ref.KeyID, Generation: 9, ConfigDigest: ref.ConfigDigest}, custodyRefFixture("missing")} {
 		_, err = reopened.OpenVoterIdentity(wrong, recipient)
@@ -512,6 +514,85 @@ func TestAutomationCustodyIncompleteKeyReservationRequiresRecovery(t *testing.T)
 			material, err := filepath.Glob(filepath.Join(path, "key-*", "material"))
 			if err != nil || len(material) != 0 {
 				t.Fatal("incomplete reservation regenerated material")
+			}
+		})
+	}
+}
+
+func TestAutomationCustodyAbruptReservationAndMaterialSync(t *testing.T) {
+	if path := os.Getenv("LITEVIRT_CUSTODY_ABRUPT_DIR"); path != "" {
+		store, err := OpenLocalCustody(path, custodyScopeFixture())
+		if err != nil {
+			t.Fatal("abrupt child root reopen failed")
+		}
+		defer store.Close()
+		switch os.Getenv("LITEVIRT_CUSTODY_ABRUPT_STAGE") {
+		case "reservation":
+			store.ops.syncDir = func(f *os.File) error {
+				if err := f.Sync(); err != nil {
+					return err
+				}
+				os.Exit(42)
+				return nil
+			}
+		case "material":
+			store.ops.syncFile = func(f *os.File) error {
+				if err := f.Sync(); err != nil {
+					return err
+				}
+				os.Exit(43)
+				return nil
+			}
+		default:
+			t.Fatal("unknown abrupt child stage")
+		}
+		store.ImportEqualityKey(custodyRefFixture("abrupt"), bytes.Repeat([]byte{23}, 32))
+		t.Fatal("abrupt child did not exit at durability seam")
+	}
+	for stage, exitCode := range map[string]int{"reservation": 42, "material": 43} {
+		t.Run(stage, func(t *testing.T) {
+			store, path := custodyStore(t)
+			if store.Close() != nil {
+				t.Fatal("abrupt parent close failed")
+			}
+			exe, err := os.Executable()
+			if err != nil {
+				t.Fatal("abrupt test executable unavailable")
+			}
+			cmd := exec.Command(exe, "-test.run=^TestAutomationCustodyAbruptReservationAndMaterialSync$", "-test.timeout=30s")
+			cmd.Env = append(os.Environ(), "LITEVIRT_CUSTODY_ABRUPT_DIR="+path, "LITEVIRT_CUSTODY_ABRUPT_STAGE="+stage)
+			var exited *exec.ExitError
+			if err := cmd.Run(); !errors.As(err, &exited) || exited.ExitCode() != exitCode {
+				t.Fatal("child did not reach the intended abrupt durability exit")
+			}
+			opened, err := OpenLocalCustody(path, custodyScopeFixture())
+			if err != nil {
+				t.Fatal("abrupt root reopen failed")
+			}
+			defer opened.Close()
+			ref := custodyRefFixture("abrupt")
+			if stage == "reservation" {
+				_, err := opened.OpenEqualityKey(ref)
+				requireCustodyError(t, err, ErrCustodyRecoveryRequired)
+				_, err = opened.GenerateEqualityKey(ref)
+				requireCustodyError(t, err, ErrCustodyRecoveryRequired)
+				if files, err := filepath.Glob(filepath.Join(path, "key-*", "material")); err != nil || len(files) != 0 {
+					t.Fatal("abrupt reservation regenerated missing material")
+				}
+			} else {
+				file := custodyKeyFile(t, path)
+				before, err := os.ReadFile(file)
+				if err != nil {
+					t.Fatal("abrupt material fixture unreadable")
+				}
+				key, err := opened.OpenEqualityKey(ref)
+				if err != nil || !bytes.Equal(key.material[:], bytes.Repeat([]byte{23}, 32)) {
+					t.Fatal("abrupt material sync lost original equality bytes")
+				}
+				after, err := os.ReadFile(file)
+				if err != nil || !bytes.Equal(before, after) {
+					t.Fatal("abrupt material reopen rewrote the original record")
+				}
 			}
 		})
 	}

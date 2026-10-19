@@ -398,3 +398,88 @@ func TestNvramFlushTick_SamePathOtherInodeIsNotAcknowledged(t *testing.T) {
 		t.Fatal("the unacknowledged failure was not raised again")
 	}
 }
+
+// Codex I3: a stale resolve (made from a read of the row naming [A], written
+// over the host's newer [A,B]) names A alone. The host restarts before its
+// next tick: B was never acknowledged and is raised again from the host's
+// own record; only A, which the resolve named, is dropped.
+//
+// Mutation: seed only from an open row (not from the host's state file) and
+// B is gone after the restart.
+func TestNvramFlushTick_AStaleResolveDoesNotEraseAnUnnamedFailureAcrossARestart(t *testing.T) {
+	ctx := context.Background()
+	d, db := nvramTestDaemon(t)
+	dir := t.TempDir()
+	state := filepath.Join(t.TempDir(), "nvram-flush-failures.json")
+	a, b := failedVars(t, dir, "web-1"), failedVars(t, dir, "web-2")
+	a.Episode, b.Episode = "ea", "eb"
+
+	f := libvirt.NewNvramFlusher(dir)
+	f.LoadState(state)
+	f.Seed([]libvirt.NvramFlushFailure{a})
+	var st nvramConditionState
+	d.nvramFlushTick(ctx, f, &st)
+	stale, open := nvramCondition(t, db, CondNvramFlushFailed)
+	if !open {
+		t.Fatal("setup: condition not raised")
+	}
+	f.Seed([]libvirt.NvramFlushFailure{b})
+	d.nvramFlushTick(ctx, f, &st)
+	if row, _ := nvramCondition(t, db, CondNvramFlushFailed); !strings.Contains(row.Evidence, "web-2_VARS.fd") {
+		t.Fatalf("setup: B not raised: %s", row.Evidence)
+	}
+	stale.Lifecycle, stale.ResolvedAt = corrosion.ConditionResolved, time.Now().UTC().Format(time.RFC3339)
+	if err := corrosion.UpsertHealthCondition(ctx, db, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	g := libvirt.NewNvramFlusher(dir)
+	g.LoadState(state)
+	var st2 nvramConditionState
+	d.nvramFlushTick(ctx, g, &st2)
+	if got := g.Failures(); len(got) != 1 || got[0].Path != b.Path {
+		t.Fatalf("after a stale resolve and a restart the flusher holds %+v; want B alone", got)
+	}
+	row, open := nvramCondition(t, db, CondNvramFlushFailed)
+	if !open || !strings.Contains(row.Evidence, "web-2_VARS.fd") || strings.Contains(row.Evidence, "web-1_VARS.fd") {
+		t.Fatalf("B not raised again alone after the restart: open=%v %s", open, row.Evidence)
+	}
+}
+
+// Codex I3: a resolve names the failure episode it saw. The same file
+// failing again since (a new episode, written after the resolver read the
+// row) is not acknowledged by it.
+//
+// Mutation: match acknowledged files on path and inode only and the new
+// episode is dropped.
+func TestNvramFlushTick_AnAcknowledgementOfAnEarlierEpisodeIsNotTaken(t *testing.T) {
+	ctx := context.Background()
+	d, db := nvramTestDaemon(t)
+	dir := t.TempDir()
+	a := failedVars(t, dir, "web-1")
+	a.Episode = "e2"
+	f := libvirt.NewNvramFlusher(dir)
+	f.Seed([]libvirt.NvramFlushFailure{a})
+	var st nvramConditionState
+	d.nvramFlushTick(ctx, f, &st)
+
+	row, open := nvramCondition(t, db, CondNvramFlushFailed)
+	if !open {
+		t.Fatal("setup: condition not raised")
+	}
+	earlier := a
+	earlier.Episode = "e1"
+	ev, _ := json.Marshal(nvramFlushEvidence{Files: []libvirt.NvramFlushFailure{earlier}})
+	row.Evidence = string(ev)
+	row.Lifecycle, row.ResolvedAt = corrosion.ConditionResolved, time.Now().UTC().Format(time.RFC3339)
+	if err := corrosion.UpsertHealthCondition(ctx, db, row); err != nil {
+		t.Fatal(err)
+	}
+	d.nvramFlushTick(ctx, f, &st)
+	if got := f.Failures(); len(got) != 1 || got[0].Episode != "e2" {
+		t.Fatalf("a resolve of episode e1 acknowledged %+v", got)
+	}
+	if _, open := nvramCondition(t, db, CondNvramFlushFailed); !open {
+		t.Fatal("the new episode was not raised again")
+	}
+}

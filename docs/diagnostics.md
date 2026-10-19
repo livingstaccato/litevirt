@@ -2269,16 +2269,23 @@ files that changed, in `<data_dir>/nvram/` and `/var/lib/libvirt/qemu/nvram/`,
 once a second. A node raises `nvram_flush_failed` (critical) about **itself**
 when one of those fsyncs fails, and logs `UEFI vars flush failed` with `path`,
 `vm` and `error`. The evidence carries `files` (each with `path`, `vm`,
-`error`, `at`, `dev`, `ino` and `mtime`) and `remedy`.
+`error`, `at`, `dev`, `ino`, `mtime` and `episode`) and `remedy`. Each failed
+fsync is a new `episode`, even of a file already listed.
 
 No later fsync clears it, whether or not the guest wrote the file again. The
 kernel reports a writeback error to one fsync and marks the lost pages clean,
 and qemu writes back only the sectors a later guest write changes, so the lost
-pages stay stale on disk. The condition survives a daemon restart.
+pages stay stale on disk. The failure belongs to the file, not its name: a
+file renamed within or between those directories (a replacement's cutover
+renames the new VM's vars file) is listed under its new name. A file that
+cannot be looked at stays listed. The node also records its failures in
+`<data_dir>/nvram-flush-failures.json`, so they survive a daemon restart
+whatever the condition row says. If that file cannot be read, the node lists
+it as a failure of its own, since the failures it held are not known.
 
 | Raised when | Clears when |
 |---|---|
-| An fsync of a vars file failed. | Every listed file is removed or replaced by another file, or an admin acknowledges that its store may be stale. |
+| An fsync of a vars file failed. | Every listed file is removed or replaced by another file, or an admin acknowledges each listed failure episode. |
 
 **What to do.** The listed file may be missing UEFI variable writes the guest
 made. Check the disk (`dmesg`, `smartctl`). Writing the variables again in the
@@ -2294,7 +2301,9 @@ again. The ways out:
   `lv health resolve nvram_flush_failed host/<host> --accept-stale-uefi-vars
   --reason <why>`, which prints the files accepted. It is audited, naming every
   file the condition named, and the host's daemon then stops reporting exactly
-  those files; any other failed file is raised again, and so is a new failure.
+  those failure episodes (path, inode and `episode`). Any other failed file is
+  raised again, and so is a new failure of a file it named, including one that
+  happened after the condition was read.
   A request without `--accept-stale-uefi-vars` (an older `lv`, or a script that
   sends only a reason) is refused.
 

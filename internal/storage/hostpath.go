@@ -191,6 +191,7 @@ var dataDirOwned = []string{
 	"onboot-boot-id",            // health/onboot_boot.go onbootBootFile (and its .tmp, dataDirOwnedPrefixes)
 	"pending-audit",             // corrosion/pending_audit.go PendingAuditDirName
 	"vtpm-state-sync",           // daemon.go: records that vtpm_state_sync set the swtpm tree's sync attribute
+	"nvram-flush-failures.json", // libvirt/nvramflush.go NvramFlushStateFile: this host's failed UEFI vars flushes (its temp is a dot-name)
 	"image-delete-skew.json",    // grpcapi/image_delete_skew.go imageSkewHistoryFile (its temp is a dot-name; an earlier build of it left a .tmp, dataDirOwnedPrefixes)
 	"audit-hold",                // corrosion/audit_hold.go AuditHoldDirName
 	"audit-seeded.json",         // corrosion/audit_seeded.go AuditSeededFileName

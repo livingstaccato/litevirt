@@ -29,3 +29,5 @@ func openNoFollow(path string, dir bool) (*os.File, error) {
 func reopenRead(ref *os.File, _ bool) (*os.File, error) {
 	return os.OpenFile(ref.Name(), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 }
+
+func stagingStatfs(string) (avail, total uint64, err error) { return 1 << 62, 1 << 62, nil }

@@ -173,6 +173,13 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 			return err
 		}
 		defer func() { _ = os.RemoveAll(archStage) }()
+		fi, err := srcFile.Stat()
+		if err != nil {
+			return fmt.Errorf("oci: %s source: %w", src.Transport, err)
+		}
+		if err := checkStagingSpace(archStage, uint64(fi.Size()), src.Transport); err != nil {
+			return err
+		}
 		copyPath := filepath.Join(archStage, "source.tar")
 		if err := copyFromFile(ctx, srcFile, copyPath); err != nil {
 			return fmt.Errorf("oci: copy the %s source: %w", src.Transport, err)
@@ -445,8 +452,6 @@ func openLocalSource(src OCISource, check func(transport, path string) error) (*
 		return nil, fmt.Errorf("oci: %s source: %w", src.Transport, err)
 	}
 	switch {
-	case fi.Mode()&os.ModeSymlink != 0:
-		return nil, fmt.Errorf("oci: %s source %q is a symbolic link; name what it points to", src.Transport, src.Path)
 	case wantDir && !fi.IsDir():
 		return nil, fmt.Errorf("oci: %s source %q is not a directory", src.Transport, src.Path)
 	case !wantDir && !fi.Mode().IsRegular():
@@ -497,4 +502,28 @@ func copyFromFile(ctx context.Context, src *os.File, dst string) error {
 		}
 	}
 	return out.Close()
+}
+
+// stagingSpace reports a directory's filesystem free space (for an
+// unprivileged writer, as root keeps its own reserve) and size; a test
+// replaces it.
+var stagingSpace = stagingStatfs
+
+// spareReserve is what a copy into the staging directory must leave free on
+// its filesystem, which the data directory, and state.db, share: a tenth of
+// it, at most 4 GiB.
+func spareReserve(total uint64) uint64 { return min(total/10, 4<<30) }
+
+// checkStagingSpace refuses a copy of size bytes into dir when it would leave
+// less than spareReserve free there.
+func checkStagingSpace(dir string, size uint64, what string) error {
+	avail, total, err := stagingSpace(dir)
+	if err != nil {
+		return fmt.Errorf("oci: cannot tell the free space for the %s copy in %s: %w", what, dir, err)
+	}
+	if reserve := spareReserve(total); size+reserve > avail {
+		return fmt.Errorf("oci: the %s source needs %d bytes copied into %s, and %d bytes are free there; "+
+			"%d must stay free for the daemon's state, so it was not pulled", what, size, dir, avail, reserve)
+	}
+	return nil
 }

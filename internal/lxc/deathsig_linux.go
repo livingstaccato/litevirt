@@ -204,3 +204,13 @@ func reopenRead(ref *os.File, dir bool) (*os.File, error) {
 	}
 	return os.OpenFile("/proc/self/fd/"+strconv.Itoa(int(ref.Fd())), flags, 0)
 }
+
+// stagingStatfs is a directory's filesystem free space for an unprivileged
+// writer and its size.
+func stagingStatfs(dir string) (avail, total uint64, err error) {
+	var st unix.Statfs_t
+	if err := unix.Statfs(dir, &st); err != nil {
+		return 0, 0, err
+	}
+	return st.Bavail * uint64(st.Bsize), st.Blocks * uint64(st.Bsize), nil
+}

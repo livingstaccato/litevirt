@@ -17,6 +17,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose/planner"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // mkBundle lays down an unpacked OCI bundle (config.json + rootfs) at
@@ -386,5 +387,39 @@ func TestPullOCI_VMDiskStorageIsNoArchiveSource(t *testing.T) {
 	}
 	if len(rt.pullCalls) != 0 {
 		t.Fatalf("a refused source reached the runtime: %+v", rt.pullCalls)
+	}
+}
+
+// Any VM's disk is no archive source, wherever it lives: on a target-less
+// NFS pool (mounted at <data_dir>/mounts/<name>), or outside every pool.
+func TestPullOCI_AnyVMDiskIsNoArchiveSource(t *testing.T) {
+	s, rt := ctPathServer(t)
+	ctx := context.Background()
+	src := "srv:/export"
+	mnt := filepath.Join(s.dataDir, "mounts", storage.NFSMountName(src))
+	if err := os.MkdirAll(mnt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	onNFS := filepath.Join(mnt, "vm1-root.raw")
+	loose := filepath.Join(t.TempDir(), "vm2-data.raw")
+	for _, f := range []string{onNFS, loose} {
+		if err := os.WriteFile(f, []byte("disk"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := corrosion.UpsertStoragePool(ctx, s.db, corrosion.StoragePoolRecord{
+		HostName: s.hostName, Name: "nfs1", Driver: "nfs", Source: src}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{VMName: "vm2", DiskName: "data", HostName: "other-host", Path: loose}); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{onNFS, loose} {
+		if _, err := s.PullOCIImage(adminCtx(), &pb.PullOCIImageRequest{Image: "docker-archive:" + f, Dest: "d"}); status.Code(err) != codes.InvalidArgument {
+			t.Errorf("a VM disk %s as an archive: %v, want InvalidArgument", f, err)
+		}
+	}
+	if len(rt.pullCalls) != 0 {
+		t.Fatalf("a VM disk reached the runtime: %+v", rt.pullCalls)
 	}
 }

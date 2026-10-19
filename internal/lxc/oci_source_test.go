@@ -150,7 +150,7 @@ func TestPullOCI_ALocalSourceIsOpenedJudgedAndPinned(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct{ ref, judged, read, given string }{
-		{"oci-archive:" + archive + ":v1", archive, "the archive", "/" + unpackDirName + "/"},
+		{"oci-archive:" + archive + ":v1", archive, "the archive", "/source.tar:v1 "},
 		{"dir:" + filepath.Join(real, "x", "..", "layout"), dir, "blobs", ":/proc/self/fd/3"}, // cleaned before it is opened
 	} {
 		var got []string
@@ -163,7 +163,7 @@ func TestPullOCI_ALocalSourceIsOpenedJudgedAndPinned(t *testing.T) {
 			t.Errorf("%s: judged %v, want %s", tc.ref, got, tc.judged)
 		}
 		args, _ := os.ReadFile(log)
-		if !strings.Contains(string(args), tc.given) || strings.Contains(string(args), real) {
+		if !strings.Contains(string(args), "-- "+strings.SplitN(tc.ref, ":", 2)[0]+":") || !strings.Contains(string(args), tc.given) || strings.Contains(string(args), real) {
 			t.Errorf("%s: skopeo args %q, want %s, never the source path", tc.ref, args, tc.given)
 		}
 		if b, _ := os.ReadFile(log + ".read"); strings.TrimSpace(string(b)) != tc.read {
@@ -312,5 +312,33 @@ func TestOpenedFilePathFailsClosed(t *testing.T) {
 	_ = f.Close()
 	if p, err := openedFilePath(f); err == nil {
 		t.Fatalf("openedFilePath of a closed file = %q, want an error", p)
+	}
+}
+
+// The archive copy lands beside the item, on the data directory's
+// filesystem: it is refused when the archive would leave less than the
+// reserve free, naming the size needed and the space free.
+func TestPullOCI_AnArchiveCopyNeedsTheSpace(t *testing.T) {
+	fakeOCITools(t, false)
+	log := fdSkopeo(t)
+	archive := filepath.Join(t.TempDir(), "img.tar")
+	if err := os.WriteFile(archive, make([]byte, 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prev := stagingSpace
+	t.Cleanup(func() { stagingSpace = prev })
+	// 100 GiB filesystem with 5000 bytes free: the reserve is not left.
+	stagingSpace = func(string) (avail, total uint64, err error) { return 5000, 100 << 30, nil }
+	err := PullOCI(context.Background(), PullOCIOptions{Image: "oci-archive:" + archive, Dest: filepath.Join(t.TempDir(), "web")})
+	if err == nil || !strings.Contains(err.Error(), "4096") || !strings.Contains(err.Error(), "5000") {
+		t.Fatalf("a pull that would fill the data filesystem: %v, want a refusal naming 4096 needed and 5000 free", err)
+	}
+	if b, _ := os.ReadFile(log); len(b) != 0 {
+		t.Fatalf("skopeo ran: %q", b)
+	}
+	// Plenty of room: the pull goes ahead.
+	stagingSpace = func(string) (avail, total uint64, err error) { return 50 << 30, 100 << 30, nil }
+	if err := PullOCI(context.Background(), PullOCIOptions{Image: "oci-archive:" + archive, Dest: filepath.Join(t.TempDir(), "web")}); err != nil {
+		t.Fatal(err)
 	}
 }

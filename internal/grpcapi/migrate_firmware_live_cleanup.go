@@ -105,6 +105,7 @@ func (s *Server) fwmigCleanupSourceAs(ctx context.Context, m fwmig.Marker, byOpe
 	default:
 		return fmt.Errorf("VM %q: the source cleanup of live firmware migration %s runs from released or cleaning, not %s", m.VM, m.Attempt, m.Phase)
 	}
+	movedOnTo := "" // the third host the VM's row names for the move's incarnation
 	if s.db != nil {
 		row, ours, err := s.moveRow(ctx, m)
 		if err != nil {
@@ -112,6 +113,9 @@ func (s *Server) fwmigCleanupSourceAs(ctx context.Context, m fwmig.Marker, byOpe
 		}
 		if ours && row.HostName == s.hostName {
 			return s.liveFirmwareCleanupStopped(ctx, m, "take the source's state", errFirmwareCleanupReturned)
+		}
+		if ours && row.HostName != "" && row.HostName != m.Target {
+			movedOnTo = row.HostName
 		}
 	}
 	if err := s.writeRetainedFirmwareBundle(m); err != nil {
@@ -124,6 +128,11 @@ func (s *Server) fwmigCleanupSourceAs(ctx context.Context, m fwmig.Marker, byOpe
 		h, off, err := s.fwTargetProvedOff(ctx, m.Target)
 		if err != nil {
 			return s.liveFirmwareCleanupStopped(ctx, m, "read whether the target is proved off", err)
+		}
+		if movedOnTo != "" {
+			// The VM moved on from the target (round-5 re-review m-1).
+			return s.liveFirmwareCleanupStopped(ctx, m, "undefine the leftover definition", &cleanupTargetHold{kind: holdMovedOn,
+				why: fmt.Sprintf("the VM has moved on to %s: its row names neither this host nor the target %s", movedOnTo, m.Target)})
 		}
 		if herr := s.cleanupTargetNotAlive(ctx, m, h, off); herr != nil {
 			return s.liveFirmwareCleanupStopped(ctx, m, "undefine the leftover definition", herr)
@@ -274,6 +283,7 @@ const (
 	holdTargetProvedOff                        // critical: both exits work now
 	holdTargetPlanned                          // warning: draining or maintenance
 	holdTargetRemoved                          // warning: no longer a member; --accept-target is the exit
+	holdMovedOn                                // warning: the row names a third host; --accept-target is the exit
 )
 
 func (e *cleanupTargetHold) Error() string        { return e.why }
@@ -282,7 +292,7 @@ func (e *cleanupTargetHold) Is(target error) bool { return target == errFirmware
 // severity is the cleanup_failed severity of the hold: a target in a
 // planned state or removed is the operator's own doing, and warns.
 func (e *cleanupTargetHold) severity() string {
-	if e.kind == holdTargetPlanned || e.kind == holdTargetRemoved {
+	if e.kind == holdTargetPlanned || e.kind == holdTargetRemoved || e.kind == holdMovedOn {
 		return corrosion.SeverityWarning
 	}
 	return corrosion.SeverityCritical
@@ -344,9 +354,12 @@ func cleanupTargetHoldAction(m fwmig.Marker, cause error) string {
 	case holdTargetProvedOff:
 		return head + "`lv doctor firmware-move <vm> --accept-source --acknowledge-rollback` returns the VM here; " + accept + ". " + resume
 	case holdTargetPlanned:
-		return head + "This is a planned state: " + resume + "; " + accept + " ends the hold now"
+		return head + "This is a planned state: " + strings.ToLower(resume[:1]) + resume[1:] + "; " + accept + " ends the hold now"
 	case holdTargetRemoved:
-		return head + "A removed target does not come back as itself, so " + accept + " is the exit. " + source
+		return head + "A removed target is not expected back, so " + accept + " is the exit. " + source
+	case holdMovedOn:
+		return h.why + ". The source's state here is a stale copy of the move; it is kept, defined and not wiped until an operator ends it: " +
+			"`lv doctor firmware-move <vm> --accept-target` quarantines it here and ends the move"
 	}
 	return head + accept + " and works now. " + source + resume
 }

@@ -168,3 +168,43 @@ func TestReconciler_OrphanedStageKeepsASeedUnderAHold(t *testing.T) {
 		t.Errorf("the seed an incoming copy holds was removed (%v)", err)
 	}
 }
+
+// Round-5 re-review m-1: the VM moved on to a third host (its row names
+// neither the source nor the target): the cleanup holds at warning, the
+// text names the host it moved to and --accept-target as the exit, and
+// never asks to power off or fence-confirm the healthy target. The exit
+// works.
+//
+// Mutation: no moved-on kind (the round-5 lost hold) — critical, with the
+// power-off text, red.
+func TestFwmigCleanup_MovedOnToAThirdHostHoldsAtWarning(t *testing.T) {
+	r := newFwdRig(t, fwlOpts{})
+	run := r.crashAt(fwmig.PhaseReleased)
+	cleaningMarker(t, r, run)
+	// B → C: the target's copy left with the VM.
+	r.dstFake.SetState(fwlVM, libvirtfake.StateShutdown)
+	if err := r.dstFake.UndefineDomainPreservingState(fwlVM); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpdateVMHost(context.Background(), r.src.db, fwlVM, "third-host", "running"); err != nil {
+		t.Fatal(err)
+	}
+	r.src.RetryLiveFirmwareCleanupsOnce(context.Background())
+	requireCleanupHeld(t, r, "after the cleanup retry")
+	sev, a := cleanupCondition(t, r)
+	if sev != corrosion.SeverityWarning {
+		t.Errorf("severity %s, want warning", sev)
+	}
+	for _, w := range []string{"third-host", "--accept-target"} {
+		if !strings.Contains(a, w) {
+			t.Errorf("action %q does not name %q", a, w)
+		}
+	}
+	for _, bad := range []string{"power", "fence-confirm", "--accept-source"} {
+		if strings.Contains(a, bad) {
+			t.Errorf("action %q names %q", a, bad)
+		}
+	}
+	_, err := r.doctor(actAcceptTarget)
+	r.resolved(err, "third-host", "running")
+}

@@ -136,6 +136,12 @@ type migrationFile struct {
 // certificate for ip. It returns the three files to put in the host's
 // migration directory: the CA, the certificate, and the key (0600).
 func issueMigrationCredentials(pkiDir, hostName string, ip net.IP, existing migrationCredentialHolder) ([]migrationFile, error) {
+	// hostName may come from the replicated hosts table, which a peer can
+	// write, and older builds admitted any name: only containment is asked.
+	// <name>-migration.* can never be one of the directory's own files.
+	if err := pki.ValidateHostPathName(hostName); err != nil {
+		return nil, err
+	}
 	return issueMigrationCredentialsAt(pkiDir, filepath.Join(pkiDir, hostName+"-migration.crt"),
 		filepath.Join(pkiDir, hostName+"-migration.key"), hostName, ip, existing)
 }
@@ -209,7 +215,14 @@ func InstallMigrationTLS(ctx context.Context, pkiDir string, hosts []MigrationTL
 		return err
 	}
 
+	// A host that cannot be provisioned is reported and skipped; the rest are
+	// still provisioned, and the command fails at the end naming each one.
 	done := 0
+	var failed []string
+	fail := func(name string, err error) {
+		fmt.Fprintf(out, "%s: NOT provisioned: %v\n", name, err)
+		failed = append(failed, name)
+	}
 	for _, h := range hosts {
 		if provisioned[h.Name()] && !reissue {
 			fmt.Fprintf(out, "%s: already has migration credentials (pass --reissue to replace them)\n", h.Name())
@@ -217,22 +230,43 @@ func InstallMigrationTLS(ctx context.Context, pkiDir string, hosts []MigrationTL
 		}
 		ip := net.ParseIP(h.Address())
 		if ip == nil || ip.To4() == nil {
-			return fmt.Errorf("%s's recorded address %q is not an IPv4 address; its migration "+
-				"certificate is issued for the address peers dial", h.Name(), h.Address())
+			fail(h.Name(), fmt.Errorf("its recorded address %q is not an IPv4 address; its migration "+
+				"certificate is issued for the address peers dial", h.Address()))
+			continue
+		}
+		if other := migrationPairOwner(hosts, h.Name()); other != "" {
+			fail(h.Name(), migrationPairCollision(pkiDir, h.Name(), other))
+			continue
 		}
 		// nil: every host was asked above, before anything was issued.
 		files, err := issueMigrationCredentials(pkiDir, h.Name(), ip, nil)
 		if err != nil {
-			return err
+			fail(h.Name(), err)
+			continue
 		}
 		if err := h.Push(ctx, files); err != nil {
-			return fmt.Errorf("%s: %w", h.Name(), err)
+			fail(h.Name(), err)
+			continue
 		}
 		fmt.Fprintf(out, "%s: migration credentials installed\n", h.Name())
 		done++
 	}
 	fmt.Fprintf(out, "%d host(s) provisioned. Storage migrations between provisioned hosts are now encrypted.\n", done)
+	if len(failed) > 0 {
+		return fmt.Errorf("%d host(s) not provisioned: %s", len(failed), strings.Join(failed, ", "))
+	}
 	return nil
+}
+
+// migrationPairOwner is the host among hosts whose own pair is name's
+// migration pair (a host an older build admitted as <name>-migration), or "".
+func migrationPairOwner(hosts []MigrationTLSHost, name string) string {
+	for _, h := range hosts {
+		if strings.EqualFold(h.Name(), name+"-migration") {
+			return h.Name()
+		}
+	}
+	return ""
 }
 
 // sshMigrationTLSHost is a MigrationTLSHost reached over SSH.

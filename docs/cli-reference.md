@@ -123,6 +123,12 @@ lv host init --local --name <name>        # Bootstrap on localhost (standalone)
                                           #   which also makes the node look like a
                                           #   founder — use `lv host add` instead
 lv host add <user@host> --name <name>     # Add host to cluster
+                                          # new <name> (init, add): letters, digits, '_', '.', '-';
+                                          #   not starting with '-' or '.', not ending in -migration,
+                                          #   and not ca, client, host, gossip, migration-ca, ui,
+                                          #   audit-signing or lv-cli (any case). A host an older
+                                          #   release admitted keeps its name; re-adding it after
+                                          #   `lv host rm` needs one that follows the rule
 lv host ls                                # List hosts (UPDATES column: pending OS package updates, see upgrades.md)
 lv host ls --names                        # Print only host names, one per line (for scripts)
 lv host inspect <host>                    # Host details, with the capacity reservations counted against it (see diagnostics.md)

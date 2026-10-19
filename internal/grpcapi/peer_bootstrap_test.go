@@ -240,3 +240,29 @@ func TestPeerTrust_RecoveryFlagUnblocksARotatedFleet(t *testing.T) {
 		t.Fatal("recovery mode re-admitted a decommissioned host")
 	}
 }
+
+// TestPeerTrust_ARowWithNoSerialTrustsOnlyAHostCert: a live row with no
+// recorded serial (from before serials were recorded, or written by a peer)
+// pins nothing. A row named lv-cli made the distributable client certificate,
+// CN lv-cli and ClientAuth only, a PEER; a host certificate stays one.
+//
+// Mutation: drop the client-only check for an empty recorded serial — the
+// client certificate is a peer.
+func TestPeerTrust_ARowWithNoSerialTrustsOnlyAHostCert(t *testing.T) {
+	ctx := context.Background()
+	s := trustFixture(t)
+	for _, name := range []string{"lv-cli", "node-5"} {
+		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+			Name: name, Address: "10.0.0.5", State: "active",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s.isTrustedHostCN(certSerialCtx("lv-cli", big.NewInt(7), x509.ExtKeyUsageClientAuth), "lv-cli") {
+		t.Fatal("a row named lv-cli with no serial made the client certificate a peer")
+	}
+	if !s.isTrustedHostCN(certSerialCtx("node-5", big.NewInt(8),
+		x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth), "node-5") {
+		t.Fatal("a host certificate for a row with no serial was refused")
+	}
+}

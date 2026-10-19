@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/pki"
 )
 
 // Forced reconfiguration (docs/design/recovery-claims.md §4.6): the
@@ -234,6 +236,10 @@ func (v *ClaimVerifier) verifySigned(certPEM, name string, payload, sig []byte) 
 	}
 	if c.Subject.CommonName != name {
 		return fmt.Errorf("signed with %q's certificate", c.Subject.CommonName)
+	}
+	// As in verifyAccept: a client certificate never speaks for a host.
+	if pki.IsClientOnlyCert(c) {
+		return fmt.Errorf("signed with a client certificate, not a host's")
 	}
 	if v.revoked(c) {
 		return fmt.Errorf("certificate %s is revoked", c.SerialNumber.Text(16))

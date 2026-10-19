@@ -884,6 +884,13 @@ func (v *ClaimVerifier) verifyAccept(cert ClaimCertificate, a ClaimAccept, elect
 	if c.Subject.CommonName != a.Voter {
 		return fmt.Errorf("signed with %q's certificate", c.Subject.CommonName)
 	}
+	// The Common Name alone does not make a host: a voter an older build
+	// admitted as "lv-cli" would otherwise take the distributable client
+	// certificate's signature as its own. Every host certificate names
+	// ServerAuth (pki.IsClientOnlyCert).
+	if pki.IsClientOnlyCert(c) {
+		return fmt.Errorf("signed with a client certificate, not a host's")
+	}
 	if v.revoked(c) {
 		return fmt.Errorf("certificate %s is revoked", c.SerialNumber.Text(16))
 	}

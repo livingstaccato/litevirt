@@ -101,7 +101,8 @@ func IsBundle(dir string) (bool, error) {
 }
 
 // replaceBundle puts the bundle unpacked at stage in dest's place, and
-// removes the bundle dest held. Both are in one directory, so each step is a
+// removes the bundle dest held. Both are on dest's filesystem (the staging
+// directory is in dest's parent), so each step is a
 // rename; if the second fails, the old bundle is put back. A crash between
 // the two leaves the old bundle at stage+oldPlus, which
 // RecoverOCILibrary puts back.
@@ -119,7 +120,6 @@ func replaceBundle(stage, dest string) error {
 	if err := os.RemoveAll(old); err != nil {
 		return fmt.Errorf("pulled into %s, but removing the old image at %s failed: %w", dest, old, err)
 	}
-	_ = os.Remove(filepath.Dir(stage)) // the staging directory, once empty
 	return nil
 }
 
@@ -141,7 +141,7 @@ func RecoverOCILibrary(lib string) error {
 	for _, e := range ents {
 		n := e.Name()
 		p := filepath.Join(dir, n)
-		item, _, _ := strings.Cut(n, "+")
+		item := stagedItem(n)
 		if strings.HasSuffix(n, oldPlus) && item != "" && safeItemName(item) {
 			if _, serr := os.Lstat(filepath.Join(lib, item)); errors.Is(serr, os.ErrNotExist) {
 				slog.Warn("oci library: a replacing pull was interrupted; putting the old image back", "item", item)
@@ -158,8 +158,22 @@ func RecoverOCILibrary(lib string) error {
 	return errors.Join(errs...)
 }
 
-// safeItemName reports whether item is a library item name (safename).
-func safeItemName(item string) bool { return safename.ValidateName(item) == nil }
+// stagedItem is the item a staging entry belongs to: its name with the
+// known suffixes ("+old", then "+<random>") stripped from the end.
+func stagedItem(n string) string {
+	n = strings.TrimSuffix(n, oldPlus)
+	if i := strings.LastIndex(n, "+"); i > 0 {
+		return n[:i]
+	}
+	return ""
+}
+
+// safeItemName reports whether item can be put back as a library item: a
+// safe name (safename), allowing the "+" an Admin's absolute --dest could
+// carry before pulls refused it.
+func safeItemName(item string) bool {
+	return item != unpackDirName && safename.ValidateName(strings.ReplaceAll(item, "+", "_")) == nil
+}
 
 // RootfsReferences names the containers in this runner's store whose config
 // points lxc.rootfs.path at dir or anything under it. A container created
@@ -167,7 +181,8 @@ func safeItemName(item string) bool { return safename.ValidateName(item) == nil 
 // so the item cannot be replaced while one exists. A config that cannot be
 // read is named too: it cannot be shown not to.
 func (r *LxcRunner) RootfsReferences(dir string) ([]string, error) {
-	dir = canonPath(dir)
+	lit, res := filepath.Clean(dir), canonPath(dir)
+	under := func(p, d string) bool { return p == d || strings.HasPrefix(p, d+string(filepath.Separator)) }
 	ents, err := os.ReadDir(r.lxcpath())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -189,7 +204,13 @@ func (r *LxcRunner) RootfsReferences(dir string) ([]string, error) {
 			out = append(out, e.Name())
 			continue
 		}
-		if ref = canonPath(ref); ref != "" && (ref == dir || strings.HasPrefix(ref, dir+string(filepath.Separator))) {
+		// Literal or resolved, either side: a path literally under the item
+		// that resolves out of it still runs from the item's tree.
+		if ref == "" {
+			continue
+		}
+		rref := canonPath(ref)
+		if under(ref, lit) || under(ref, res) || under(rref, lit) || under(rref, res) {
 			out = append(out, e.Name())
 		}
 	}

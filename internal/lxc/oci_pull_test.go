@@ -94,7 +94,7 @@ func TestPullOCI_ReplaceOverAnExistingItemReplacesIt(t *testing.T) {
 	}
 	ents, _ := os.ReadDir(lib)
 	for _, e := range ents {
-		if e.Name() != "web" && e.Name() != "web.oci" {
+		if e.Name() != "web" && e.Name() != "web.oci" && e.Name() != unpackDirName {
 			t.Errorf("the pull left %s behind in the library", e.Name())
 		}
 	}
@@ -119,7 +119,7 @@ func TestPullOCI_AFailedPullKeepsTheExistingItem(t *testing.T) {
 	}
 	ents, _ := os.ReadDir(lib)
 	for _, e := range ents {
-		if e.Name() != "web" && e.Name() != "web.oci" {
+		if e.Name() != "web" && e.Name() != "web.oci" && e.Name() != unpackDirName {
 			t.Errorf("the failed pull left %s behind in the library", e.Name())
 		}
 	}
@@ -349,4 +349,59 @@ func TestRootfsReferences_ThroughAnAlias(t *testing.T) {
 	}
 	unlock()
 	<-done
+}
+
+// An item name with "+" (only an Admin's absolute --dest could name one)
+// would make its staged leftovers ambiguous: the pull refuses it, and
+// recovery reads an item name only by stripping the known suffixes, so a
+// leftover of "foo+x" never touches "foo".
+func TestOCIItemNamesWithPlus(t *testing.T) {
+	fakeOCITools(t, false)
+	lib := t.TempDir()
+	for _, name := range []string{"foo+x", unpackDirName} {
+		if err := PullOCI(context.Background(), PullOCIOptions{Image: "alpine:3.21", Dest: filepath.Join(lib, name)}); err == nil {
+			t.Errorf("a pull into %q was accepted", name)
+		}
+	}
+	mk := func(rel, marker string) {
+		if err := os.MkdirAll(filepath.Join(lib, rel), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(lib, rel, "m"), []byte(marker), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("foo", "foo")
+	mk(filepath.Join(unpackDirName, "foo+x+123+old"), "foo+x old")
+	if err := RecoverOCILibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(lib, "foo", "m")); string(b) != "foo" {
+		t.Errorf("foo now holds %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(lib, "foo+x", "m")); string(b) != "foo+x old" {
+		t.Errorf("the old bundle of foo+x was not put back as foo+x: %q", b)
+	}
+}
+
+// A config naming a path literally under the item counts as a holder even
+// when resolving it leads out of the item (an in-image link).
+func TestRootfsReferences_ALiteralPathUnderTheItem(t *testing.T) {
+	store, item, outside := t.TempDir(), filepath.Join(t.TempDir(), "web"), t.TempDir()
+	if err := os.MkdirAll(filepath.Join(item, "rootfs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(item, "rootfs", "srv")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(store, "old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store, "old", "config"), []byte("lxc.rootfs.path = dir:"+filepath.Join(item, "rootfs", "srv")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := (&LxcRunner{Lxcpath: store}).RootfsReferences(item)
+	if err != nil || strings.Join(got, ",") != "old" {
+		t.Fatalf("RootfsReferences = %v (%v), want [old]", got, err)
+	}
 }

@@ -221,3 +221,18 @@ func TestRecreateProbe_RidesInspectNeverDelete(t *testing.T) {
 }
 
 var errFetchForTest = status.Error(codes.Unavailable, "no image alpine 3.99")
+
+// An Admin's absolute --dest in the library must be an item name like any
+// other: "+" (the staging directory's own name among them) is refused.
+func TestPullOCI_AnAbsoluteLibraryDestIsAnItemName(t *testing.T) {
+	s, rt := ctPathServer(t)
+	for _, name := range []string{"foo+x", ".litevirt+unpack"} {
+		dest := filepath.Join(s.dataDir, "oci", name)
+		if _, err := s.PullOCIImage(adminCtx(), &pb.PullOCIImageRequest{Image: "ghcr.io/x/y:2", Dest: dest}); status.Code(err) != codes.InvalidArgument {
+			t.Errorf("an absolute --dest %s: %v, want InvalidArgument", dest, err)
+		}
+	}
+	if len(rt.pullCalls) != 0 {
+		t.Fatalf("a refused pull reached the runtime: %+v", rt.pullCalls)
+	}
+}

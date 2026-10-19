@@ -416,6 +416,9 @@ const fetchStageTTL = time.Hour
 
 var fetchLocks sync.Map // container name → *sync.Mutex
 
+// adoptBeforeRename is a test seam run just before adoptFetched's rename.
+var adoptBeforeRename func(built string)
+
 func lockFetch(name string) func() {
 	m, _ := fetchLocks.LoadOrStore(name, &sync.Mutex{})
 	mu := m.(*sync.Mutex)
@@ -451,8 +454,10 @@ func (r *LxcRunner) fetchStage(name string) string {
 // instead of fetching again. A fetch of another image for the name replaces
 // it; SweepFetchDir clears what is left at daemon start.
 func (r *LxcRunner) FetchImage(ctx context.Context, opts CreateOpts) error {
-	if opts.Name == "" {
-		return errors.New("fetch image: container name required")
+	// The name becomes a path under the store: it must be a container
+	// name itself, whatever the caller checked.
+	if err := safename.ValidateContainerName(opts.Name); err != nil {
+		return fmt.Errorf("fetch image: %w", err)
 	}
 	if err := opts.Validate(); err != nil {
 		return err
@@ -505,6 +510,9 @@ func (r *LxcRunner) FetchImage(ctx context.Context, opts CreateOpts) error {
 // points its config at its new place. It reports whether it did; a staged
 // container of another image is left for the next fetch to replace.
 func (r *LxcRunner) adoptFetched(opts CreateOpts) (bool, error) {
+	if err := safename.ValidateContainerName(opts.Name); err != nil {
+		return false, err
+	}
 	unlock := lockFetch(opts.Name)
 	defer unlock()
 	stage := r.fetchStage(opts.Name)
@@ -516,16 +524,23 @@ func (r *LxcRunner) adoptFetched(opts CreateOpts) (bool, error) {
 	if _, err := os.Lstat(dst); err == nil {
 		return false, fmt.Errorf("container %q already exists at %s", opts.Name, dst)
 	}
-	if err := os.Rename(built, dst); err != nil {
-		return false, fmt.Errorf("move the fetched container into place as %q: %w", opts.Name, err)
-	}
-	_ = os.RemoveAll(stage)
+	// Its files name its final place before the one rename that puts it
+	// there: a crash leaves either a stage (swept at start) or a complete
+	// container, never one whose config names the stage.
 	for _, f := range []string{"config", "fstab"} {
-		if err := repointFetched(filepath.Join(dst, f), built, dst); err != nil {
-			_ = os.RemoveAll(dst)
+		if err := repointFetched(filepath.Join(built, f), built, dst); err != nil {
+			_ = os.RemoveAll(stage)
 			return false, err
 		}
 	}
+	if adoptBeforeRename != nil {
+		adoptBeforeRename(built)
+	}
+	if err := os.Rename(built, dst); err != nil {
+		_ = os.RemoveAll(stage)
+		return false, fmt.Errorf("move the fetched container into place as %q: %w", opts.Name, err)
+	}
+	_ = os.RemoveAll(stage)
 	return true, nil
 }
 
@@ -537,7 +552,9 @@ func (r *LxcRunner) freshFetch(stage string, opts CreateOpts) bool {
 	if err != nil || string(b) != fetchSignature(opts) {
 		return false
 	}
-	if fi, err := os.Stat(sig); err != nil || time.Since(fi.ModTime()) > fetchStageTTL {
+	// Fresh is fetched within fetchStageTTL; a fetch time in the future
+	// (the clock was set back) is not.
+	if fi, err := os.Stat(sig); err != nil || time.Since(fi.ModTime()) > fetchStageTTL || time.Until(fi.ModTime()) > time.Minute {
 		return false
 	}
 	_, err = os.Stat(filepath.Join(stage, opts.Name, "config"))

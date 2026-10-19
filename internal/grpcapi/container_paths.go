@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/lxc"
+	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/storage"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
@@ -93,7 +94,13 @@ func (s *Server) checkOCIPullPaths(image, dest string) error {
 	if filepath.IsAbs(dest) {
 		lib := filepath.Join(s.dataDir, storage.OCILibraryDir)
 		inLib := s.dataDir != "" && filepath.Dir(filepath.Clean(dest)) == lib
-		if !inLib {
+		if inLib {
+			// An item in the library is named like any other item, however
+			// the path names it: no "+" (the staging directory's own).
+			if err := safename.ValidateName(filepath.Base(dest)); err != nil {
+				return status.Errorf(codes.InvalidArgument, "oci dest: %v", err)
+			}
+		} else {
 			if err := storage.CheckWriteRoot(dest, s.dataDir, s.pkiDir); err != nil {
 				return status.Errorf(codes.InvalidArgument, "oci dest: %v", err)
 			}

@@ -69,6 +69,11 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	if err := requireBinary("umoci"); err != nil {
 		return err
 	}
+	// "+" is the separator of the staging names (unpackDirName): no item
+	// may carry one, whatever path names it.
+	if strings.Contains(filepath.Base(opts.Dest), "+") {
+		return fmt.Errorf("oci: dest %q: an item name may not contain '+'", opts.Dest)
+	}
 	unlock := LockOCIItem(opts.Dest)
 	defer unlock()
 	exists, err := IsBundle(opts.Dest)
@@ -90,10 +95,7 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 		if err != nil {
 			return err
 		}
-		defer func() {
-			_ = os.RemoveAll(stage)
-			_ = os.Remove(filepath.Dir(stage)) // the staging directory, once empty
-		}()
+		defer func() { _ = os.RemoveAll(stage) }()
 		bundle = stage
 	}
 	tmpLayout := opts.Dest + ".oci"

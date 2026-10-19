@@ -196,3 +196,69 @@ func TestFetchImage_AStaleStageIsNotAdopted(t *testing.T) {
 		t.Fatalf("lxc-create ran %d times (%q), want twice: the stale stage is not adopted", n, args)
 	}
 }
+
+// Adoption rewrites the staged container to its final place before the
+// one rename that moves it: a crash at any point leaves either a stage the
+// start-up sweep removes, or a complete container.
+func TestFetchImage_AdoptionRepointsBeforeTheRename(t *testing.T) {
+	store := t.TempDir()
+	fakeLxcCreate(t, 0)
+	r := &LxcRunner{Lxcpath: store}
+	opts := CreateOpts{Name: "web", Template: "download", Distro: "alpine", Release: "3.22", Arch: "amd64"}
+	if err := r.FetchImage(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	var seen string
+	adoptBeforeRename = func(built string) {
+		b, _ := os.ReadFile(filepath.Join(built, "config"))
+		seen = string(b)
+	}
+	t.Cleanup(func() { adoptBeforeRename = nil })
+	if _, err := r.Create(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(seen, "lxc.rootfs.path = dir:"+filepath.Join(store, "web", "rootfs")) || strings.Contains(seen, fetchDirName) {
+		t.Fatalf("at the rename the staged config was:\n%s\nwant it already naming %s", seen, filepath.Join(store, "web"))
+	}
+}
+
+// A stage whose fetch time lies in the future (the clock was set back) is
+// not taken as fresh.
+func TestFetchImage_AStageFromTheFutureIsNotFresh(t *testing.T) {
+	store := t.TempDir()
+	log := fakeLxcCreate(t, 0)
+	r := &LxcRunner{Lxcpath: store}
+	opts := CreateOpts{Name: "web", Template: "download", Distro: "alpine", Release: "3.22", Arch: "amd64"}
+	if err := r.FetchImage(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(24 * time.Hour)
+	if err := os.Chtimes(filepath.Join(store, fetchDirName, "web", fetchedImageFile), future, future); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Create(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(log); strings.Count(string(b), "-t download") != 2 {
+		t.Fatalf("a stage from the future was adopted: %q", b)
+	}
+}
+
+// FetchImage refuses a name that is not a container name itself, so a
+// caller's slip cannot make its staging path the store.
+func TestFetchImage_RefusesABadName(t *testing.T) {
+	store := t.TempDir()
+	fakeLxcCreate(t, 0)
+	if err := os.MkdirAll(filepath.Join(store, "web"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := &LxcRunner{Lxcpath: store}
+	for _, n := range []string{"..", "."} {
+		if err := r.FetchImage(context.Background(), CreateOpts{Name: n, Template: "download", Distro: "alpine", Release: "3.22"}); err == nil {
+			t.Errorf("FetchImage accepted name %q", n)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(store, "web")); err != nil {
+		t.Fatal("the store lost a container")
+	}
+}

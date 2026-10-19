@@ -1810,6 +1810,20 @@ in this host's view, 0 for a group this host cannot read. Hosts can differ for
 up to one replication lag plus the 30 second reconcile tick;
 `lv firewall tag-group ls --members` shows the members.
 
+### Firewall logging and policy conditions
+
+Raised per host; each resolves when its cause goes. docs/firewall.md,
+"Logging", has the detail.
+
+| Condition | Severity | Raised when |
+|---|---|---|
+| `firewall.log.unavailable` | warning | at start the kernel or nft refused the logging forms (`nft_log`, `nfnetlink_log`, `nft_limit`): no packet is logged on this host; the per-NIC rules are unaffected. Load the modules and restart the daemon |
+| `firewall.log.listener` | warning | the daemon cannot hold its NFLOG group (another program holds it): no log line is rendered on this host, so packets are not logged and nothing reaches that program (a listener that loses the group has its lines removed by the next pass, run at once). Set `firewall.log_group` to a free group and restart |
+| `firewall.policy.unreadable` | warning | a firewall policy row cannot be read here; the evidence names each row and the fallback it is read as (a log policy: logging off at the default budget). Set that policy again to replace the row |
+
+`litevirt_firewall_log_records_total{outcome}` counts log records `kept`,
+`rate_limited` (over `firewall.log_max_rate`) and lost to `overflow`.
+
 ### Deferred out-of-band stop sync after a restart or rejoin
 
 When a VM's domain is found shut off out of band (a crash, an external

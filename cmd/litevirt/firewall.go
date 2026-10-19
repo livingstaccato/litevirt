@@ -37,6 +37,8 @@ func newFirewallCmd() *cobra.Command {
 		newFirewallDefaultDenyCmd(),
 		newFirewallNICGuardCmd(),
 		newFirewallEnforceCmd(),
+		newFirewallLogPolicyCmd(),
+		newFirewallLogCmd(),
 		newFirewallTagCmd(),
 		newFirewallTagGroupCmd(),
 		newFirewallSynfloodCmd(),
@@ -98,6 +100,7 @@ command is for "I just changed a rule and want it live now".`,
 type ruleFlags struct {
 	direction, proto, port, cidr, action, comment, macro string
 	priority                                             int
+	log                                                  bool
 }
 
 func (rf *ruleFlags) register(cmd *cobra.Command) {
@@ -109,6 +112,7 @@ func (rf *ruleFlags) register(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&rf.comment, "comment", "", "human-readable note rendered on the rule")
 	cmd.Flags().IntVar(&rf.priority, "priority", 100, "lower runs first")
 	cmd.Flags().StringVar(&rf.macro, "macro", "", "add the rules of a named macro instead of --proto/--port (see 'lv firewall macros')")
+	cmd.Flags().BoolVar(&rf.log, "log", false, logFlagUsage)
 }
 
 // macroComment is the comment a macro's rows carry when none is given.
@@ -122,7 +126,7 @@ func (rf *ruleFlags) macroComment(name string) string {
 func (rf *ruleFlags) pb() *pb.FirewallRule {
 	return &pb.FirewallRule{
 		Direction: rf.direction, Proto: rf.proto, Port: rf.port, Cidr: rf.cidr,
-		Action: rf.action, Priority: int32(rf.priority), Comment: rf.comment,
+		Action: rf.action, Priority: int32(rf.priority), Comment: rf.comment, Log: rf.log,
 	}
 }
 
@@ -136,10 +140,10 @@ func printRules(rules []*pb.FirewallRule, withHost bool) error {
 	for _, r := range rules {
 		if withHost {
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-				r.Id, r.HostName, r.Direction, r.Proto, r.Port, r.Cidr, r.Action, strconv.Itoa(int(r.Priority)), r.StackName)
+				r.Id, r.HostName, r.Direction, r.Proto, r.Port, r.Cidr, ruleAction(r.Action, r.Log), strconv.Itoa(int(r.Priority)), r.StackName)
 		} else {
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-				r.Id, r.Direction, r.Proto, r.Port, r.Cidr, r.Action, strconv.Itoa(int(r.Priority)), r.StackName)
+				r.Id, r.Direction, r.Proto, r.Port, r.Cidr, ruleAction(r.Action, r.Log), strconv.Itoa(int(r.Priority)), r.StackName)
 		}
 	}
 	return w.Flush()
@@ -155,11 +159,14 @@ func newFirewallClusterRuleCmd() *cobra.Command {
 		Use:   "add",
 		Short: "Add a cluster-tier firewall rule",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := refuseClientLogAction(rf.action); err != nil {
+				return err
+			}
 			if rf.macro != "" {
 				return runMacroAdd(cmd, rf.macro, rf.direction, rf.cidr, rf.action, func(ctx context.Context, c pb.LiteVirtClient, m string, row firewall.ExpandedRule) (string, error) {
 					r, err := c.CreateClusterFirewallRule(ctx, &pb.CreateClusterFirewallRuleRequest{Rule: &pb.FirewallRule{
 						Direction: row.Direction, Proto: row.Proto, Port: row.Port, Cidr: row.CIDR,
-						Action: row.Action, Priority: int32(rf.priority), Comment: rf.macroComment(m),
+						Action: row.Action, Priority: int32(rf.priority), Comment: rf.macroComment(m), Log: rf.log,
 					}})
 					if err != nil {
 						return "", err
@@ -172,6 +179,9 @@ func newFirewallClusterRuleCmd() *cobra.Command {
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				if err := requireTagGroupSupport(ctx, c, rf.cidr); err != nil {
+					return err
+				}
+				if err := requireLogSupport(ctx, c, rf.log); err != nil {
 					return err
 				}
 				r, err := c.CreateClusterFirewallRule(ctx, &pb.CreateClusterFirewallRuleRequest{Rule: rf.pb()})
@@ -231,11 +241,14 @@ func newFirewallHostRuleCmd() *cobra.Command {
 			if host == "" {
 				return fmt.Errorf("--host is required")
 			}
+			if err := refuseClientLogAction(rf.action); err != nil {
+				return err
+			}
 			if rf.macro != "" {
 				return runMacroAdd(cmd, rf.macro, rf.direction, rf.cidr, rf.action, func(ctx context.Context, c pb.LiteVirtClient, m string, row firewall.ExpandedRule) (string, error) {
 					r, err := c.CreateHostFirewallRule(ctx, &pb.CreateHostFirewallRuleRequest{Rule: &pb.FirewallRule{
 						HostName: host, Direction: row.Direction, Proto: row.Proto, Port: row.Port, Cidr: row.CIDR,
-						Action: row.Action, Priority: int32(rf.priority), Comment: rf.macroComment(m),
+						Action: row.Action, Priority: int32(rf.priority), Comment: rf.macroComment(m), Log: rf.log,
 					}})
 					if err != nil {
 						return "", err
@@ -248,6 +261,9 @@ func newFirewallHostRuleCmd() *cobra.Command {
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				if err := requireTagGroupSupport(ctx, c, rf.cidr); err != nil {
+					return err
+				}
+				if err := requireLogSupport(ctx, c, rf.log); err != nil {
 					return err
 				}
 				rule := rf.pb()
@@ -464,6 +480,10 @@ func runMacroAdd(
 	}
 	return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 		if err := requireTagGroupSupport(ctx, c, cidr); err != nil {
+			return err
+		}
+		logged, _ := cmd.Flags().GetBool("log")
+		if err := requireLogSupport(ctx, c, logged); err != nil {
 			return err
 		}
 		var ids []string

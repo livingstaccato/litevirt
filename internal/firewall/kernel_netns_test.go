@@ -121,7 +121,7 @@ func TestKernel_NICGuard(t *testing.T) {
 	// missing (saying which); they must not fail or vanish. Under
 	// LITEVIRT_NFT_REQUIRE=1 they fail instead, so only a pass counts.
 	for _, child := range []string{"TestKernelChild_CompatCorpusLoads", "TestKernelChild_MainEraLvSetStillDrops",
-		"TestKernelChild_SynFloodLoads", "TestKernelChild_LogFormsLoad",
+		"TestKernelChild_SynFloodLoads", "TestKernelChild_LogFormsLoad", "TestKernelChild_LogBudget",
 		"TestKernelChild_SynFloodOnTheWire", "TestKernelChild_SynFloodProbeAccepted"} {
 		if !strings.Contains(string(out), "--- PASS: "+child) &&
 			(os.Getenv(nftRequire) == "1" || !strings.Contains(string(out), "--- SKIP: "+child)) {
@@ -186,6 +186,13 @@ type bridgeLab struct {
 func newBridgeLab(t *testing.T) *bridgeLab {
 	t.Helper()
 	sh(t, "ip", "link", "add", "lvbr0", "type", "bridge", "stp_state", "0", "forward_delay", "0")
+	// Every child runs in one namespace: the next child's lab needs these
+	// names free (deleting one veth end deletes its peer).
+	t.Cleanup(func() {
+		for _, dev := range []string{"lvg0", "lvg1", "lvbr0"} {
+			_ = exec.Command("ip", "link", "del", dev).Run()
+		}
+	})
 	for _, i := range []string{"0", "1"} {
 		sh(t, "ip", "link", "add", "lvg"+i, "type", "veth", "peer", "name", "lvh"+i)
 		sh(t, "ip", "link", "set", "lvh"+i, "master", "lvbr0")

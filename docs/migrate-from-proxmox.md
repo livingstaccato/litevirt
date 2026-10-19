@@ -184,6 +184,9 @@ rule maps to litevirt as follows:
 | Security group `web` with rules | `security-groups: { web: { rules: [...] } }` |
 | NIC binding `IPFILTER, "+vmgroup"` | `network[].security-groups: [vmgroup]` |
 | `host.fw` `[OPTIONS] protection_synflood: 1` (`protection_synflood_rate`, `protection_synflood_burst`) | `lv firewall synflood on --scope <host> --rate <rate> --burst <burst>`, or without `--scope` for every host (not in compose) |
+| `-log info` (any level) on a rule | `log: true` on the rule (`--log` on `lv sg rule-add`) |
+| `[OPTIONS] log_level_in: info` | `lv firewall log-policy on` (logs each NIC's default verdict) |
+| `log_ratelimit: rate=1/second,burst=5` | `lv firewall log-policy on --rate 1 --burst 5` (a budget per NIC side) |
 
 Example translation:
 

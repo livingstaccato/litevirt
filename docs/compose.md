@@ -1598,6 +1598,19 @@ which a compose file does not set (`lv firewall tag set`, docs/firewall.md,
 "Tag groups"). `lv compose up` asks the daemon first and refuses against one
 that does not know tag groups.
 
+A rule with `log: true` logs each packet it matches to the firewall log
+(`lv firewall log`; docs/firewall.md, "Logging"):
+
+```yaml
+- { direction: ingress, proto: tcp, port: "22", action: drop, log: true }
+```
+
+On a `macro:` rule every row the macro expands to logs. A stack deploy that
+holds one is refused until the cluster upgrade has finished, and is refused
+before the stack's old rows are touched. `lv compose up` (and `lv gitops`)
+asks the daemon first and refuses against one that predates logging. The
+action stays the plain verdict; `drop+log` is not an action.
+
 Per-NIC security groups can also be bound at runtime with
 `lv sg bind <vm> --network <name> --sg <name>`. See
 [`docs/firewall.md`](firewall.md) for the three-tier model and CLI surface.

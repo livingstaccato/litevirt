@@ -1483,6 +1483,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// that cannot load it renders the guards only and raises a health
 	// condition (firewall.nic.unavailable), never an empty firewall.
 	bridgeCT := firewall.BridgeConntrackAvailable(ctx, true)
+	// Firewall logging needs the kernel to load a named limit and a log line
+	// to an NFLOG group. Probed once here (nft -c, nothing committed); a host
+	// that refuses renders no log line and raises firewall.log.unavailable.
+	fwLogGroup := uint16(d.cfg.Firewall.LogGroup)
+	fwLogErr := firewall.ProbeLogging(ctx, fwLogGroup)
+	if fwLogErr != nil {
+		slog.Warn("firewall: logging is unavailable on this host; no packet is logged here", "error", fwLogErr)
+	}
+	svc.RecordFirewallLogAvailability(ctx, fwLogErr)
+	// Log lines are rendered only while this daemon's listener holds the
+	// group (firewallLogging); each bind change runs passes. The listener
+	// starts below, once d.fwReconciler exists.
+	fwLogging := newFirewallLogging(ctx, fwLogGroup, fwLogErr,
+		func(c context.Context) error { return d.fwReconciler.Reconcile(c) },
+		func(err error) { svc.RecordFirewallLogListener(ctx, err) })
 	// SYN-flood protection needs the kernel's per-source meters (nft_limit).
 	// Probed once here, check only; a host whose kernel refuses renders none
 	// and raises a health condition (firewall.synflood.unavailable).
@@ -1496,6 +1511,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			OnTagGroupMembers:    fwMetrics.SetTagGroupMembers,
 			OnDuplicateAddresses: firewall.NewDuplicateAddressReporter(d.db, d.cfg.HostName).Report,
 			BridgeConntrack:      func() bool { return bridgeCT }, Arming: fwArming,
+			Logging:       fwLogging.Logging,
 			SynFloodProbe: func() firewall.SynFloodProbeResult { return synFloodProbe }})
 	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
 	d.fwReconciler.SetArming(fwArming)
@@ -1505,6 +1521,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// started (re-review I-10).
 	d.virt.SetStartGuard(svc.NICStartGuard(ctx))
 	d.fwReconciler.SetStateHook(svc.RecordFirewallState)
+	// Firewall logging: the listener reads the NFLOG group every rendered log
+	// line sends to into a bounded store (docs/firewall.md, "Logging").
+	fwLogStore := openFirewallLogStore(d.cfg, fwMetrics)
+	svc.SetFirewallLogStore(fwLogStore)
+	if fwLogErr == nil {
+		go (&firewall.LogListener{Group: fwLogGroup, Store: fwLogStore,
+			Resolve: d.fwReconciler.ResolveLogDevice,
+			OnBind:  fwLogging.OnBind}).Run(ctx)
+	}
+	go pruneFirewallLog(ctx, fwLogStore)
 	// Whether this host enforces NIC guards, after every pass, the boot pass
 	// included (re-review m8, m2, m5): the label carries this build's
 	// version while the last pass put the per-NIC table in force, so a host
@@ -2172,6 +2198,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 			svc.FinishDrainRecords(grpcapi.DrainRecordStopWait)
 		})
 		if d.fwReconciler != nil {
+			// No log line outlives the listener: once this process exits,
+			// another program could take the group.
+			stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			fwLogging.Stop(stopCtx)
+			cancel()
 			d.fwReconciler.Stop()
 		}
 		if d.snapScheduler != nil {

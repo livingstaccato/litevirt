@@ -43,10 +43,13 @@ func toPbSecurityGroup(g corrosion.SecurityGroup) *pb.SecurityGroup {
 	return &pb.SecurityGroup{Id: g.ID, Name: g.Name, StackName: g.StackName, CreatedAt: g.CreatedAt}
 }
 
+// toPbSGRule is a stored rule as the API shows it: a logged rule's plain
+// verdict and log, never the stored suffix (spec m-13).
 func toPbSGRule(r corrosion.SGRule) *pb.SecurityGroupRule {
+	action, logged := corrosion.SplitLoggedAction(r.Action)
 	return &pb.SecurityGroupRule{
 		Id: r.ID, SgId: r.SGID, Direction: r.Direction, Proto: r.Proto,
-		Port: r.PortRange, Cidr: r.CIDR, Action: r.Action, Priority: int32(r.Priority),
+		Port: r.PortRange, Cidr: r.CIDR, Action: action, Priority: int32(r.Priority), Log: logged,
 	}
 }
 
@@ -199,6 +202,7 @@ func (s *Server) AddSecurityGroupRule(ctx context.Context, req *pb.AddSecurityGr
 	}
 	row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
 	need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, "")
+	row.Action, need = logRow(row.Action, r.Log, need, invalid)
 	if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
 		if err := s.refuseUnknownTagGroup(ctx, row.CIDR); err != nil {
 			return err

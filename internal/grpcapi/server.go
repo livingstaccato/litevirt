@@ -19,6 +19,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
+	"github.com/litevirt/litevirt/internal/firewall"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hostnet"
 	"github.com/litevirt/litevirt/internal/image"
@@ -1078,7 +1079,9 @@ type Server struct {
 	// ReloadFirewall calls Reconcile(ctx) on it synchronously to give
 	// `lv firewall reload` push semantics rather than a 30s wait.
 	fwReconciler FirewallReconciler
-	fwMu         sync.RWMutex
+	// fwLogStore is this host's firewall log store (SetFirewallLogStore).
+	fwLogStore atomic.Pointer[firewall.LogStore]
+	fwMu       sync.RWMutex
 
 	// DHCP reservations made for NICs whose rows are not written yet
 	// (nic_identity.go): network → address → reservation.

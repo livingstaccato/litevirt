@@ -212,6 +212,10 @@ func (s *Server) RecordFirewallState(ctx context.Context, st firewall.AppliedSta
 		s.blockedTrunksText(ctx, st.BlockedTrunks))
 	s.setFirewallCondition(ctx, CondFirewallInvalidRows, len(st.InvalidRows) > 0, corrosion.SeverityCritical,
 		invalidRowsText(st.InvalidRows))
+	// The one raiser of firewall.policy.unreadable: every policy block of the
+	// pass (the log policy, the SYN-flood policy) appends its row to the list.
+	s.setFirewallCondition(ctx, CondFirewallPolicyUnreadable, len(st.UnreadablePolicies) > 0, corrosion.SeverityWarning,
+		unreadablePoliciesText(st.UnreadablePolicies))
 	s.recordTagGroupState(ctx, st.TagGroups)
 	s.recordSynFloodState(ctx, st)
 }

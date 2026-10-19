@@ -110,6 +110,10 @@ type Config struct {
 	// forwarded-identity switches live under Auth for historical reasons.)
 	Enforcement EnforcementConfig `yaml:"enforcement"`
 
+	// Firewall is the `firewall:` block: this host's firewall log listener
+	// and store (docs/firewall.md, "Logging").
+	Firewall FirewallConfig `yaml:"firewall"`
+
 	// HostUpdates is the read-only check for pending OS package updates on this
 	// host (docs/upgrades.md, "Pending OS updates"). litevirt installs nothing.
 	HostUpdates HostUpdatesConfig `yaml:"host_updates"`
@@ -1009,6 +1013,8 @@ func LoadConfig() (*Config, error) {
 		// `spare_pcie_root_ports: 0` in config overrides this and is honored.
 		PCI: PCIConfig{SparePCIeRootPorts: 4},
 
+		Firewall: FirewallConfig{LogGroup: 27, LogMaxRate: 200, LogRetainMiB: 64, LogRetainDays: 7},
+
 		// The enforcement flags that default ON — see EnforcementConfig.
 		// AuditSignature, PartitionPause, RecoveryClaim, ConsolePassword, VRRPUnicast
 		// and DigestV2. An explicit false still wins
@@ -1104,6 +1110,9 @@ func LoadConfig() (*Config, error) {
 		return nil, err
 	}
 	if err := cfg.FileRestore.validate(cfg.Containers); err != nil {
+		return nil, err
+	}
+	if err := cfg.Firewall.validate(); err != nil {
 		return nil, err
 	}
 
@@ -1445,6 +1454,40 @@ func (c *Config) BackupBandwidthLimits() (map[string]int64, error) {
 		}
 	}
 	return out, nil
+}
+
+// FirewallConfig is the `firewall:` block: this host's firewall log store
+// (docs/firewall.md, "Logging"). Records hold tenant flow metadata, so the
+// store is bounded in rate, size and age.
+type FirewallConfig struct {
+	// LogGroup is the NFLOG group the daemon's log listener reads and every
+	// rendered log line sends to (default 27, 0-65535).
+	LogGroup int `yaml:"log_group"`
+	// LogMaxRate is the log records a second this host keeps (default 200);
+	// the rest are counted and discarded. 0 keeps none.
+	LogMaxRate int `yaml:"log_max_rate"`
+	// LogRetainMiB caps <data_dir>/firewall-log/ (default 64); 0 keeps
+	// records in memory only.
+	LogRetainMiB int `yaml:"log_retain_mib"`
+	// LogRetainDays removes log records older than this many days, on disk
+	// and in memory (default 7); 0 is no age bound.
+	LogRetainDays int `yaml:"log_retain_days"`
+}
+
+// maxFirewallLogRate bounds firewall.log_max_rate.
+const maxFirewallLogRate = 100000
+
+func (f FirewallConfig) validate() error {
+	if f.LogGroup < 0 || f.LogGroup > 65535 {
+		return fmt.Errorf("config firewall.log_group %d: want an NFLOG group 0-65535", f.LogGroup)
+	}
+	if f.LogMaxRate < 0 || f.LogMaxRate > maxFirewallLogRate {
+		return fmt.Errorf("config firewall.log_max_rate %d: want 0-%d", f.LogMaxRate, maxFirewallLogRate)
+	}
+	if f.LogRetainMiB < 0 || f.LogRetainDays < 0 {
+		return fmt.Errorf("config firewall: log_retain_mib and log_retain_days cannot be negative")
+	}
+	return nil
 }
 
 // FileRestoreConfig is the `file_restore:` block. Every field is optional;

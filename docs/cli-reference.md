@@ -1417,9 +1417,9 @@ lv sg create <name>
 lv sg ls
 lv sg rm <id>
 lv sg rule-add <sg-id-or-name> --direction ingress|egress --proto tcp \
-    --port <p> --cidr <c> [--action accept|drop|reject] [--priority N]
+    --port <p> --cidr <c> [--action accept|drop|reject] [--priority N] [--log]
 lv sg rule-add <sg-id-or-name> --macro <name> [--cidr <c>] [--direction ingress|egress] \
-    [--action accept|drop|reject] [--priority N]    # one rule per macro row; prints every id
+    [--action accept|drop|reject] [--priority N] [--log]    # one rule per macro row; prints every id
 lv sg rule-ls <sg-id-or-name>
 lv sg rule-rm <rule-id>       # Takes the RULE id from rule-ls, not the group id
 lv sg bind <vm> --network <name> --sg <name> [--sg <name>...]   # Bind SGs to a VM NIC
@@ -1442,15 +1442,15 @@ lv firewall reload            # Force the reconciler to re-read state and apply 
 
 # Cluster-tier rules (apply to every NIC on every host):
 lv firewall cluster-rule add --direction ingress|egress --proto tcp \
-    --port <p> --cidr <c> [--action accept|drop|reject] [--comment <s>] [--priority N]
-lv firewall cluster-rule add --macro <name> [--direction ...] [--cidr <c>] [--action ...] [--comment <s>]
+    --port <p> --cidr <c> [--action accept|drop|reject] [--comment <s>] [--priority N] [--log]
+lv firewall cluster-rule add --macro <name> [--direction ...] [--cidr <c>] [--action ...] [--comment <s>] [--log]
 lv firewall cluster-rule ls
 lv firewall cluster-rule rm <id>
 
 # Host-tier rules (apply to every NIC on one host):
 lv firewall host-rule add --host <name> --direction ingress|egress --proto tcp \
-    --port <p> --cidr <c> [--action accept|drop|reject] [--comment <s>] [--priority N]
-lv firewall host-rule add --host <name> --macro <name> [--direction ...] [--cidr <c>] [--action ...] [--comment <s>]
+    --port <p> --cidr <c> [--action accept|drop|reject] [--comment <s>] [--priority N] [--log]
+lv firewall host-rule add --host <name> --macro <name> [--direction ...] [--cidr <c>] [--action ...] [--comment <s>] [--log]
 lv firewall host-rule ls [--host <name>]
 lv firewall host-rule rm <id>
 
@@ -1476,6 +1476,24 @@ lv firewall nic-guard resume <vm> # let a VM held paused for its guards run, gua
 lv firewall enforce status          # mode per host + would-drop totals per workload, NIC and rule, since <time>
 lv firewall enforce on              # enforce (admin, audited); off = observe
 lv firewall enforce reset-counters  # restart every host's would-drop totals from now (admin, audited)
+
+# Logging (docs/firewall.md, "Logging"). --log on a rule-add logs each packet the rule
+# matches; rule ls shows such a rule's action as "<verdict> log". lv asks the daemon first
+# and refuses --log against one that predates logging; an --action holding "+" is refused.
+lv firewall log-policy status                                          # the cluster's policy, then each host's
+lv firewall log-policy on  [--scope <host>] [--rate N] [--burst N]     # log each NIC's default verdict
+lv firewall log-policy off [--scope <host>] [--rate N] [--burst N]     # logged rules still log
+lv firewall log-policy inherit --scope <host>                           # clear a host's own policy
+lv firewall log [--host <h>] [--workload <name>] [--since 15m] [--limit 200] [--follow]
+  # TIME HOST WORKLOAD DEVICE SIDE RULE VERDICT PROTO SRC DST LEN, merged by time across every
+  # active host (a host that does not answer is named on stderr); --follow polls from each
+  # host's newest sequence. Needs firewall.log.view at / (Admin; docs/auth.md).
+  # --rate is log records per second per guest NIC side (1-10000, default 5); --burst is
+  # packets (1-10000, default 10). Every logged line of one NIC side shares that budget.
+  # Role operator; audited as firewall.log_policy; refused until the cluster upgrade has finished.
+  # --scope names a host, a host named "cluster" included; leave it out for the cluster-wide
+  # policy. status shows a row the daemon cannot read, or a host inheriting one, as
+  # "unreadable (read as off at 5/10)"; the API returns such a row with rate 0 and burst 0.
 
 # Firewall tags: per-workload key/value pairs, kept apart from labels (sg.write to change; audited).
 lv firewall tag set <vm> <key>=<value>...                          # adds or replaces keys

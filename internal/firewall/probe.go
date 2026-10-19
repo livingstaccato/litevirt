@@ -41,3 +41,18 @@ func ProbeRuleset(ctx context.Context, body string) error {
 	}
 	return nil
 }
+
+// ProbeLogging reports whether the kernel and nft load the renderer's
+// logging forms (spec §3.4): a named limit, declared as the renderer declares
+// one, and a log line sending to NFLOG group, as the renderer writes it. A
+// host that refuses them renders no log line and raises
+// firewall.log.unavailable rather than lose its per-NIC table.
+func ProbeLogging(ctx context.Context, group uint16) error {
+	const limit = "lv_lg_probe"
+	var b strings.Builder
+	renderLogLimit(&b, limit, LogPolicy{})
+	b.WriteString("    chain probe {\n        type filter hook forward priority 0; policy accept;\n")
+	b.WriteString("        meta l4proto tcp " + logStmt(LogPolicy{Group: group}, limit, logPrefix("lvprobe", "in", "default", "drop")) + "\n")
+	b.WriteString("    }")
+	return ProbeRuleset(ctx, b.String())
+}

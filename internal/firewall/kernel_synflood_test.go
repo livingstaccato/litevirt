@@ -46,10 +46,10 @@ func fold(sum uint32) uint16 {
 	return ^uint16(sum)
 }
 
-// ipv4TCP is an IPv4 TCP segment with no payload and valid checksums (bridge
+// synIPv4TCP is an IPv4 TCP segment with no payload and valid checksums (bridge
 // conntrack checks them: a bad one is ct state invalid, dropped before the
 // SYN-flood line).
-func ipv4TCP(src, dst string, sport, dport uint16, seq, ack uint32, flags byte) []byte {
+func synIPv4TCP(src, dst string, sport, dport uint16, seq, ack uint32, flags byte) []byte {
 	s4, d4 := net.ParseIP(src).To4(), net.ParseIP(dst).To4()
 	tcp := make([]byte, 20)
 	binary.BigEndian.PutUint16(tcp[0:], sport)
@@ -179,7 +179,7 @@ func synFloodWire(t *testing.T, plan Plan, n int, v6 bool, vid int) synFloodWire
 		if flags&tcpACK != 0 {
 			sport, ack = uint16(30000+i), 1 // mid-flow
 		}
-		etype, seg := uint16(0x0800), ipv4TCP("10.30.0.9", "10.30.0."+p, sport, 80, uint32(sport)*7919, ack, flags)
+		etype, seg := uint16(0x0800), synIPv4TCP("10.30.0.9", "10.30.0."+p, sport, 80, uint32(sport)*7919, ack, flags)
 		if v6 {
 			etype = 0x86dd
 			seg = ipv6TCP(fmt.Sprintf("2001:db8:9::%x:%x", i>>16+1, i&0xffff), "2001:db8::"+p, sport, 80, uint32(sport)*7919, ack, flags)

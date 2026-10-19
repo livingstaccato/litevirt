@@ -146,8 +146,14 @@ func newQuarantine(sets []IPSet, degraded map[string]bool, prev map[string]Rule,
 func (q *quarantine) rule(table, id, direction, proto, port, cidr, action, comment string) (Rule, bool) {
 	r := FromCorrosionRule(direction, proto, port, cidr, action)
 	r.Comment = comment
+	r.ID = id
 	key := table + "/" + id
-	why := q.unreadable(r, action)
+	judged := action
+	if r.Log {
+		// The verdict the server's log form names; the suffix is storage.
+		judged = string(r.Action)
+	}
+	why := q.unreadable(r, judged)
 	if why == "" {
 		why = q.negatedMissing(r)
 	}

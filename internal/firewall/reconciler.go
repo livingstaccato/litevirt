@@ -184,6 +184,11 @@ type AppliedState struct {
 	NICTableError string
 	// NICs is the guest devices the per-NIC table covers.
 	NICs map[string]string // device → workload
+	// UnreadablePolicies are the firewall policy rows this build cannot read
+	// (Plan.UnreadablePolicies).
+	UnreadablePolicies []string
+	// MACs is each of those devices' MAC, where known.
+	MACs map[string]string // device → MAC
 	// Guarded is, per workload, the MACs whose guard the per-NIC table in
 	// force holds; empty when the table was refused.
 	Guarded map[string]map[string]bool
@@ -196,10 +201,9 @@ type AppliedState struct {
 	// (Plan.TagGroups).
 	TagGroups TagGroupReport
 	// SynFlood is the SYN-flood protection the pass rendered;
-	// SynFloodUnavailable and UnreadablePolicies are as in the Plan.
+	// SynFloodUnavailable is as in the Plan.
 	SynFlood            SynFlood
 	SynFloodUnavailable string
-	UnreadablePolicies  []string
 	// SynFloodInForce is what the pass put in force of SYN-flood
 	// protection: SynFloodInForceOn, ...Observe, ...GuardsOnly,
 	// ...Unavailable or ...Off; "" before the first pass.
@@ -240,8 +244,41 @@ func (r *Reconciler) AppliedState() AppliedState {
 	return r.state
 }
 
+// loadLogPolicy is the firewall logging block of a pass: the host's log
+// policy, rendered only where the kernel loads the forms and the daemon's
+// listener holds the group (opts.Logging, LogGate). An unreadable policy row
+// is appended to p.UnreadablePolicies (every policy block appends; the pass
+// resets the list once) naming its effect.
+func loadLogPolicy(ctx context.Context, db *corrosion.Client, hostName string, opts LoaderOptions, p *Plan) error {
+	p.LogPolicy = LogPolicy{}
+	if opts.Logging == nil {
+		return nil
+	}
+	lp, err := corrosion.ResolveFirewallLogPolicy(ctx, db, hostName)
+	if err != nil && !errors.Is(err, corrosion.ErrUnreadableFirewallPolicy) {
+		return err
+	}
+	if err != nil {
+		p.UnreadablePolicies = append(p.UnreadablePolicies,
+			fmt.Sprintf("%s: read as logging off at %d/%d", strings.TrimPrefix(err.Error(), corrosion.ErrUnreadableFirewallPolicy.Error()+": "), lp.Rate, lp.Burst))
+	}
+	if avail, group := opts.Logging(); avail {
+		p.LogPolicy = LogPolicy{Available: true, Group: group, Default: lp.On(), Rate: lp.Rate, Burst: lp.Burst}
+	}
+	return nil
+}
+
+// ResolveLogDevice names the workload and MAC of a guest device through the
+// plan in force; "" for a device it does not cover. The firewall log
+// listener resolves each record's device with it.
+func (r *Reconciler) ResolveLogDevice(dev string) (workload, mac string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.state.NICs[dev], r.state.MACs[dev]
+}
+
 func (r *Reconciler) recordState(ctx context.Context, p Plan, applyErr error) {
-	st := AppliedState{NICs: map[string]string{}, Guarded: map[string]map[string]bool{}, BlockedTrunks: p.BlockedTrunks,
+	st := AppliedState{NICs: map[string]string{}, MACs: map[string]string{}, Guarded: map[string]map[string]bool{}, BlockedTrunks: p.BlockedTrunks,
 		InvalidRows: p.InvalidRows, TagGroups: p.TagGroups,
 		SynFlood: p.SynFlood, SynFloodUnavailable: p.SynFloodUnavailable, UnreadablePolicies: p.UnreadablePolicies,
 		SynFloodInForce: synFloodInForce(p)}
@@ -261,6 +298,9 @@ func (r *Reconciler) recordState(ctx context.Context, p Plan, applyErr error) {
 	}
 	for _, n := range p.NICs {
 		st.NICs[n.NICDev] = n.VMName
+		if n.MAC != "" {
+			st.MACs[n.NICDev] = strings.ToLower(n.MAC)
+		}
 		if n.Guard != nil && applyErr == nil {
 			if st.Guarded[n.VMName] == nil {
 				st.Guarded[n.VMName] = map[string]bool{}
@@ -454,6 +494,11 @@ type LoaderOptions struct {
 	// Now is the loader's clock (time.Now when nil): how long a rule has
 	// referenced a missing set (emptySetGrace).
 	Now func() time.Time
+
+	// Logging reports whether this host renders log lines (its kernel loads
+	// the logging forms, ProbeLogging, and the daemon listens) and the NFLOG
+	// group they send to. nil renders none.
+	Logging func() (available bool, group uint16)
 }
 
 // CorrosionPlanLoader builds a Plan from the cluster's
@@ -503,7 +548,7 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		// reference to a set that does not exist matches nothing (see
 		// quarantine). Each is reported (Plan.InvalidRows).
 		plan.InvalidRows = plan.InvalidRows[:0:0]
-		// Each policy block of the pass appends the rows it cannot read.
+		// Every policy block of the pass appends here (once reset, here).
 		plan.UnreadablePolicies = plan.UnreadablePolicies[:0:0]
 		ipsets, err := corrosion.ListIPSets(ctx, db)
 		if err != nil {
@@ -870,6 +915,9 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		}
 		if opts.BridgeConntrack != nil && !opts.BridgeConntrack() {
 			plan.NICMode = NICModeGuardsOnly
+		}
+		if err := loadLogPolicy(ctx, db, hostName, opts, &plan); err != nil {
+			return plan, err
 		}
 		// The addresses of litevirt's own dnsmasq on the guest networks: only
 		// where litevirt is the network's router (re-review I-9).

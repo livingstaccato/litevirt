@@ -1073,10 +1073,13 @@ lv firewall synflood inherit --scope <host>                       # clear a host
   neither, protection is off. `status` shows, per host, the policy, where it
   comes from (`host` or `cluster`), what the host itself has in force
   (IN FORCE: `on`; `observe`, counted and not dropped; `guards-only`, no
-  bridge conntrack, nothing rendered; `unavailable`, the kernel refused the
-  rules; `off`; `predates`, the host's litevirtd does not report it), and its
+  bridge conntrack, nothing rendered; `no-guest-nics`, no per-NIC table yet;
+  `unavailable`, the kernel refused the rules, or the host's first per-NIC
+  table; `off`; `predates`, the host's litevirtd does not report it), and its
   drops per address family since its last reload, asked of every active host
-  at once. The firewall page of the web UI shows the same. A host
+  at once. A per-NIC table the kernel refuses leaves the previous one, and its
+  value, in force. The firewall page of the web UI shows the same under "Ask
+  every host". A host
   without counts shows `-` and why in ERROR, never a 0: `unreachable` (no
   answer within 10 seconds), `not asked` (not active), `predates` (its
   litevirtd is older) or `reported by the host` (it could not read them).
@@ -1112,11 +1115,13 @@ where such traffic runs.
 - Each host keeps at most 65536 sources per address family. A flood from more
   random sources than that (IPv4 addresses, or IPv6 /64s) passes the limiter
   once the meter is full; guests keep their own SYN cookies. Rotating
-  addresses within one IPv6 /64 does not escape it.
-- The kernel needs `nft_limit`. The daemon checks at start (`nft -c`, nothing
-  loaded); where the kernel refuses, nothing SYN-flood is rendered on that host
-  and it raises `firewall.synflood.unavailable` while the policy is on. Restart
-  the daemon once the module loads.
+  addresses within one IPv6 /64 does not escape it, but one IPv6 /48 holds
+  65536 /64s, enough to fill the meter, as one IPv4 /16 is.
+- The kernel needs `nft_limit`, and IPv6 an nft that keys a set by prefix. The
+  daemon checks each address family at start (`nft -c`, nothing loaded); a
+  family the kernel refuses is not rendered on that host, the other still is,
+  and the host raises `firewall.synflood.unavailable` naming the family while
+  the policy is on. Restart the daemon once it can.
 - A policy row this build cannot read (not JSON, an unknown mode, `{}`, or a
   rate or burst outside 1-100000) is enforced as on at 200/1000, and the host
   raises `firewall.policy.unreadable` naming the key until it is set again.
@@ -1150,7 +1155,7 @@ lv firewall ipset ls
 lv firewall ipset rm <id>
 
 # Default forward policy (no --scope = cluster-wide; --scope <host> overrides one host)
-lv firewall default-deny on [--scope node-1]
+lv firewall default-deny on [--scope node-1]   # --scope names a host that has joined
 
 # Per-NIC anti-spoofing (see "NIC guards")
 lv firewall nic-guard set <vm> --network <net> --mode on --allow 10.0.0.250

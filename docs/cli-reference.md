@@ -1499,7 +1499,7 @@ lv firewall tag-group rm <name> [--force]
   # A member leaving a group does not cut its open connections (docs/firewall.md, "Tag groups").
 
 # SYN-flood protection on guest NICs (docs/firewall.md, "SYN-flood protection")
-lv firewall synflood status                     # cluster policy, then per host: policy, in force (on/observe/guards-only/unavailable/off/predates), rate, burst, drops v4/v6 since its last reload
+lv firewall synflood status                     # cluster policy, then per host: policy, in force (on/observe/guards-only/no-guest-nics/unavailable/off/predates), rate, burst, drops v4/v6 since its last reload
 lv firewall synflood on [--rate 200] [--burst 1000] [--scope <host>]   # no --scope = cluster-wide
 lv firewall synflood off [--scope <host>]
 lv firewall synflood inherit --scope <host>     # clear a host's own policy; the cluster's applies

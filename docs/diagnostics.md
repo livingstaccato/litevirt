@@ -1787,7 +1787,7 @@ protection".
 
 | Condition | Raised when |
 |---|---|
-| `firewall.synflood.unavailable` | the SYN-flood policy is on for this host, but its kernel refused the SYN-flood rules at daemon start (`nft_limit` missing): its guest NICs are not protected. Restart the daemon once the module loads |
+| `firewall.synflood.unavailable` | the SYN-flood policy is on for this host, but its kernel refused the SYN-flood rules of one or both address families at daemon start (`nft_limit` missing, or an nft that cannot key a set by an IPv6 prefix): that family's SYNs to its guest NICs are not limited, and the evidence names it. Restart the daemon once it can |
 | `firewall.policy.unreadable` | a firewall policy row cannot be read here; the evidence names the key and what is enforced instead (SYN-flood: on at 200/1000). Set it again (`lv firewall synflood on`, `off` or `inherit`) |
 
 ### Tag-group conditions (`firewall.tag_group.*`)

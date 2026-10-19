@@ -1957,7 +1957,12 @@ subject `cluster/hosts`; the leader-lease holder writes it.
 |---|---|
 | Two live or joining hosts hold one address at one gRPC port (a port of 0 matches any). **Warning** severity. The evidence names each pair and the address. | No two live hosts share an address and port. |
 
-The machine serves the certificate of one of them. Remove the other with
+The one admitted first, or the lesser name when both were admitted at the same
+moment, keeps the address, and the evidence names it. The other is never
+recorded `active`: serving refuses it, so it stays `upgrading`
+(`upgrading_unconfirmed` names the host that holds the address), and the
+`lv host add` that admitted it was refused before it installed anything. The
+machine serves the certificate of one of them. Remove the other with
 `lv host rm <host>`, or `lv host rm --dead <host>` if it is fenced and gone for
 good.
 

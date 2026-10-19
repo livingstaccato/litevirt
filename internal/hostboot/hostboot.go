@@ -427,6 +427,9 @@ func ConfirmServing(ctx context.Context, db *corrosion.Client, host string) (boo
 	if h.State != "upgrading" {
 		return false, h.State, ErrNotUpgrading
 	}
+	if err := addressNotWon(ctx, db, host); err != nil {
+		return false, h.State, err
+	}
 	if beforeConfirmWrite != nil {
 		beforeConfirmWrite()
 	}
@@ -444,6 +447,25 @@ func ConfirmServing(ctx context.Context, db *corrosion.Client, host string) (boo
 		return false, now.State, ErrNotUpgrading
 	}
 	return true, "active", nil
+}
+
+// addressNotWon refuses to record host active while another live or joining
+// host holds its address and wins it (corrosion.AddressWinner): two
+// admissions made on two replicas before either reached the other both
+// stand, and only the first is activated. The caller retries, so the host
+// activates once the other is removed; until then it stays 'upgrading' and
+// says why (upgrading_unconfirmed).
+func addressNotWon(ctx context.Context, db *corrosion.Client, host string) error {
+	winner, err := corrosion.AddressWinner(ctx, db, host)
+	if err != nil {
+		return fmt.Errorf("read the hosts at this host's address: %w", err)
+	}
+	if winner == "" || winner == host {
+		return nil
+	}
+	return fmt.Errorf("%s holds this host's address, admitted before it: a machine is admitted under one name, "+
+		"and %s is not activated while %s holds it. Remove the one this machine does not serve: `lv host rm %s` "+
+		"or `lv host rm %s`", winner, host, winner, host, winner)
 }
 
 // ErrMovedOn is ConfirmServingReport's answer for a host recorded in another
@@ -493,6 +515,9 @@ func ConfirmServingReport(ctx context.Context, db *corrosion.Client, host, from 
 		from = "upgrading"
 	case h.State != from:
 		return false, h.State, reportKeepingState(ctx, db, host, h.State, r)
+	}
+	if err := addressNotWon(ctx, db, host); err != nil {
+		return false, h.State, err
 	}
 	if beforeConfirmWrite != nil {
 		beforeConfirmWrite()

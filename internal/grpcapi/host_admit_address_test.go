@@ -139,3 +139,127 @@ func TestAdmitHost_AnAddressArrivingInTheCurrencyPullIsRefused(t *testing.T) {
 		t.Error("the refused host was admitted")
 	}
 }
+
+// copyHostRow puts name's row as from holds it into to, as replication
+// delivers it: its address, port, state, serial and admission stamp.
+func copyHostRow(t *testing.T, from, to *Server, name string) {
+	t.Helper()
+	rows, err := from.db.Query(context.Background(), `SELECT address, grpc_port, state, cert_serial, created_at, updated_at
+		FROM hosts WHERE name = ?`, name)
+	if err != nil || len(rows) != 1 {
+		t.Errorf("read %s: %v (%d rows)", name, err, len(rows))
+		return
+	}
+	r := rows[0]
+	if _, err := to.db.DB().Exec(`INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial,
+		created_at, updated_at) VALUES (?, ?, 'root', 22, ?, ?, ?, ?, ?)`, name, r.String("address"), r.Int("grpc_port"),
+		r.String("state"), r.String("cert_serial"), r.String("created_at"), r.String("updated_at")); err != nil {
+		t.Error(err)
+	}
+}
+
+// replicaPuller is one replica's currency pulls. The first (before the
+// admission's write) finds nothing new. Each later one waits until every
+// replica has written, then delivers the other replica's admission: the two
+// admissions were made before either reached the other.
+type replicaPuller struct {
+	mu      sync.Mutex
+	calls   int
+	written *sync.WaitGroup
+	deliver func()
+}
+
+func (p *replicaPuller) RunOnce(context.Context) bool { return true }
+func (p *replicaPuller) PullTableNow(context.Context, string, string) (string, []string, error) {
+	p.mu.Lock()
+	p.calls++
+	n := p.calls
+	p.mu.Unlock()
+	if n == 2 {
+		p.written.Done()
+		done := make(chan struct{})
+		go func() { p.written.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+		}
+	}
+	if n >= 2 {
+		p.deliver()
+	}
+	return "peer-host", nil, nil
+}
+
+// Codex 612c78ba I1: two replicas, each admitting a name at one address
+// before the other's admission reached it, both admitted, and both CLIs went
+// on to install on the one machine. Each admission now pulls the hosts table
+// again after its write, and only the deterministic winner — the earlier
+// admission, the lesser name on a tie — is answered; the other is refused
+// with the command that removes it, so its CLI installs nothing.
+//
+// Mutation: drop the check after the write — both are admitted.
+func TestAdmitHost_TwoReplicasAdmittingOneAddressAnswerOne(t *testing.T) {
+	a, b := admissionServer(t), admissionServer(t)
+	var written sync.WaitGroup
+	written.Add(2)
+	a.antiEntropy = &replicaPuller{written: &written, deliver: func() { copyHostRow(t, b, a, "node-b") }}
+	b.antiEntropy = &replicaPuller{written: &written, deliver: func() { copyHostRow(t, a, b, "node-a") }}
+	var errA, errB error
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _, errA = admitAt(a, "node-a", "10.0.0.9") }()
+	go func() { defer wg.Done(); _, errB = admitAt(b, "node-b", "10.0.0.9") }()
+	wg.Wait()
+	stamp := func(s *Server, name string) string {
+		rows, err := s.db.Query(context.Background(), `SELECT created_at FROM hosts WHERE name = ?`, name)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return rows[0].String("created_at")
+	}
+	winner, loser, errWin, errLose := "node-a", "node-b", errA, errB
+	if at, bt := stamp(a, "node-a"), stamp(b, "node-b"); bt < at {
+		winner, loser, errWin, errLose = "node-b", "node-a", errB, errA
+	}
+	if errWin != nil {
+		t.Errorf("the earlier admission, %s: %v", winner, errWin)
+	}
+	if status.Code(errLose) != codes.FailedPrecondition || !strings.Contains(errLose.Error(), winner) ||
+		!strings.Contains(errLose.Error(), "lv host rm "+loser) {
+		t.Errorf("the later admission, %s = %v, want a refusal naming %s and lv host rm %s", loser, errLose, winner, loser)
+	}
+}
+
+// Codex 612c78ba I1: a rerun's admission of a joining name under the serial
+// it was admitted with returned success at once, never checking the address,
+// so a conflicting row the currency pull had just delivered did not stop its
+// install. It is checked like any admission now.
+//
+// Mutation: drop the check after the write — the rerun is answered.
+func TestAdmitHost_ARerunChecksAnAddressTheCurrencyPullDelivered(t *testing.T) {
+	ctx := context.Background()
+	s := admissionServer(t)
+	if _, err := admit(s, "node-1"); err != nil {
+		t.Fatal(err)
+	}
+	delivered := false
+	s.antiEntropy = &fakePuller{pull: func() {
+		if delivered {
+			return
+		}
+		delivered = true
+		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "other", Address: "10.0.0.9",
+			GRPCPort: admitGRPCPort, State: corrosion.HostStateJoining, CertSerial: "ffee"}); err != nil {
+			t.Error(err)
+		}
+		// Admitted before node-1 by the replica it came from.
+		if _, err := s.db.DB().Exec(`UPDATE hosts SET created_at = '2000-01-01T00:00:00.000000000Z' WHERE name = 'other'`); err != nil {
+			t.Error(err)
+		}
+	}}
+	_, err := admit(s, "node-1")
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "other") ||
+		!strings.Contains(err.Error(), "lv host rm node-1") {
+		t.Fatalf("the rerun of node-1 with other delivered = %v, want a refusal naming other", err)
+	}
+}

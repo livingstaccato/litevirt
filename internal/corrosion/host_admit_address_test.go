@@ -104,3 +104,45 @@ func TestAdmitHost_TheWriteTakesAnAddressNoLiveHostHoldsAtThePort(t *testing.T) 
 		})
 	}
 }
+
+// Codex 612c78ba I1: a retry of a standing admission (a live row under the
+// same serial) returned at once, before any address check, so a rerun's
+// admission was answered while another host held the address. It is decided
+// by AddressWinner now: refused when the other was admitted first, answered
+// when this one was.
+//
+// Mutation: return at once again — "admitted after the other" is answered.
+func TestAdmitHost_ARetryOfAStandingAdmissionChecksTheAddress(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, otherAt string
+		refused       bool
+	}{
+		{"admitted after the other", "2000-01-01T00:00:00.000000000Z", true},
+		{"admitted before the other", "2999-01-01T00:00:00.000000000Z", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newTestDB(t)
+			h := HostRecord{Name: "host-x", Address: "10.0.0.15", SSHUser: "root", SSHPort: 22, GRPCPort: 7443,
+				State: HostStateJoining, CertSerial: incSerialA}
+			if err := AdmitHost(ctx, c, h); err != nil {
+				t.Fatal(err)
+			}
+			// Admitted on another replica, delivered since.
+			if err := InsertHost(ctx, c, HostRecord{Name: "other", Address: "10.0.0.15", GRPCPort: 7443,
+				State: HostStateJoining, CertSerial: "ffee"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.DB().Exec(`UPDATE hosts SET created_at = ? WHERE name = 'other'`, tc.otherAt); err != nil {
+				t.Fatal(err)
+			}
+			err := AdmitHost(ctx, c, h)
+			if holder, ok := AsAddressHeld(err); ok != tc.refused || (ok && holder != "other") {
+				t.Fatalf("the retry = %v, want refused %v", err, tc.refused)
+			}
+			if !tc.refused && err != nil {
+				t.Fatalf("the retry of the winner = %v", err)
+			}
+		})
+	}
+}

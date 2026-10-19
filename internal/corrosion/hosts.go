@@ -214,6 +214,15 @@ func AdmitHost(ctx context.Context, c *Client, h HostRecord) error {
 	}
 	if rows[0].String("deleted_at") == "" {
 		if strings.EqualFold(rows[0].String("cert_serial"), h.CertSerial) {
+			// A retry of this admission writes nothing, so no guard runs:
+			// the address is checked here, by the rule activation follows.
+			winner, err := AddressWinner(ctx, c, h.Name)
+			if err != nil {
+				return err
+			}
+			if winner != "" && winner != h.Name {
+				return &AddressHeldError{Address: h.Address, Port: h.GRPCPort, Holder: winner}
+			}
 			return nil
 		}
 		return fmt.Errorf("host %q is already active", h.Name)
@@ -289,6 +298,44 @@ func HostAddressHolder(ctx context.Context, c *Client, address, name string, por
 		return "", err
 	}
 	return rows[0].String("name"), nil
+}
+
+// AddressWinner is the host that keeps name's address when more than one
+// live or joining host holds it at one gRPC port (a port of 0 matches any):
+// the one admitted first (created_at, the admission's stamp), the lesser name
+// on a tie. Every replica that holds the same rows picks the same host, so two
+// admissions made on two replicas before either reached the other resolve
+// the same way everywhere, and only the winner is activated (hostboot). It is
+// name when name holds its address alone, and "" when name has no live row.
+func AddressWinner(ctx context.Context, c *Client, name string) (string, error) {
+	rows, err := c.Query(ctx, `SELECT h.name AS name, COALESCE(h.created_at, '') AS created_at
+		FROM hosts h JOIN hosts me ON me.name = ?
+		WHERE me.deleted_at IS NULL AND h.deleted_at IS NULL AND h.address = me.address AND h.address <> ''
+		AND (COALESCE(h.grpc_port, 0) = 0 OR COALESCE(me.grpc_port, 0) = 0 OR h.grpc_port = me.grpc_port)`, name)
+	if err != nil {
+		return "", err
+	}
+	winner, at := "", ""
+	for _, r := range rows {
+		n, a := r.String("name"), r.String("created_at")
+		if winner == "" || admittedBefore(a, n, at, winner) {
+			winner, at = n, a
+		}
+	}
+	return winner, nil
+}
+
+// admittedBefore orders two admissions by stamp, then name.
+func admittedBefore(aAt, aName, bAt, bName string) bool {
+	ta, ea := time.Parse(time.RFC3339Nano, aAt)
+	tb, eb := time.Parse(time.RFC3339Nano, bAt)
+	switch {
+	case ea == nil && eb == nil && !ta.Equal(tb):
+		return ta.Before(tb)
+	case (ea != nil || eb != nil) && aAt != bAt:
+		return aAt < bAt
+	}
+	return aName < bName
 }
 
 // admissionGuard is the guard of every admission write of h

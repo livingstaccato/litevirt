@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // ── host.address_shared ─────────────────────────────────────────────────────
@@ -13,7 +15,8 @@ import (
 // by a check inside the admission's own write (corrosion.AdmitHost). That
 // check sees only this replica: two admissions on two replicas, each made
 // before the other's row arrived, both commit. The lease holder names every
-// such pair once it holds both rows.
+// such pair once it holds both rows, and which of them keeps the address
+// (corrosion.AddressWinner): only that one is activated.
 
 const (
 	hostAddressEvaluator  = "host_admission"
@@ -29,6 +32,14 @@ func (s *Server) sharedHostAddresses(ctx context.Context) (map[string]string, []
 		WHERE deleted_at IS NULL AND address <> '' ORDER BY address, name`)
 	if err != nil {
 		return nil, nil, err
+	}
+	winners := map[string]string{}
+	for _, r := range rows {
+		w, err := corrosion.AddressWinner(ctx, s.db, r.String("name"))
+		if err != nil {
+			return nil, nil, err
+		}
+		winners[r.String("name")] = w
 	}
 	type held struct {
 		name string
@@ -61,9 +72,14 @@ func (s *Server) sharedHostAddresses(ctx context.Context) (map[string]string, []
 				if port != 0 {
 					at = a + ":" + strconv.Itoa(port)
 				}
-				lines[a+" "+x.name+" "+y.name] = fmt.Sprintf("%s and %s are both admitted at %s; a machine "+
-					"serves one of them. Remove the one it does not serve (`lv host rm %s` or `lv host rm %s`; "+
-					"`lv host rm --dead` for one that is fenced and gone for good).", x.name, y.name, at, x.name, y.name)
+				won, lost := x.name, y.name
+				if winners[y.name] == y.name || winners[x.name] == y.name {
+					won, lost = y.name, x.name
+				}
+				lines[a+" "+x.name+" "+y.name] = fmt.Sprintf("%s and %s are both admitted at %s; %s, admitted "+
+					"first, keeps the address, and %s is not activated while it does. The machine serves one of "+
+					"them: remove the other (`lv host rm %s` or `lv host rm %s`; `lv host rm --dead` for one that is "+
+					"fenced and gone for good).", x.name, y.name, at, won, lost, lost, won)
 				hosts = append(hosts, x.name, y.name)
 			}
 		}

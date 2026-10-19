@@ -1816,6 +1816,17 @@ func (s *Server) removeHostRefusal(ctx context.Context, req *pb.RemoveHostReques
 // admitGRPCPort is the gRPC port AdmitHost records for an admitted host.
 const admitGRPCPort = 7443
 
+// addressLostRefusal refuses an admission of name that is written but loses
+// address to winner, admitted there first on another replica.
+func addressLostRefusal(address, name, winner string) error {
+	return status.Errorf(codes.FailedPrecondition,
+		"%s:%d is %s's address, admitted there before %s (on another replica, before the two admissions met): "+
+			"%s stays admitted (joining) but is never activated, and nothing was installed for it. Remove it "+
+			"(`lv host rm %s`), or remove %s (`lv host rm %s`, or `lv host rm --dead %s` if it is fenced and gone "+
+			"for good) and run the add again",
+		address, admitGRPCPort, winner, name, name, name, winner, winner, winner)
+}
+
 // addressHeldRefusal refuses to admit name at address, which other holds.
 func addressHeldRefusal(address, name, other string) error {
 	return status.Errorf(codes.FailedPrecondition,
@@ -1896,6 +1907,19 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.A
 	})
 	if err != nil {
 		return nil, err
+	}
+	// The write's guard sees only this replica. Pulled again now that it is
+	// written, the address is decided by the rule activation follows
+	// (corrosion.AddressWinner): an admission another replica made first at
+	// this address wins it, and this one is refused before anything is
+	// installed for it. Its row stays, and is never activated.
+	if err := s.pullHostsNow(ctx, "admit", req.Name); err != nil {
+		return nil, err
+	}
+	if winner, err := corrosion.AddressWinner(ctx, s.db, req.Name); err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read the hosts at %s: %v", req.Address, err)
+	} else if winner != "" && winner != req.Name {
+		return nil, addressLostRefusal(req.Address, req.Name, winner)
 	}
 	s.publish("host.admitted", req.Name, "cert_serial="+req.CertSerial)
 	return &pb.AdmitHostResponse{AuditTailSeq: tailSeq, AuditTailHash: tailHash, AuditPositionProven: true,
@@ -1991,6 +2015,10 @@ func (s *Server) admitHostRow(ctx context.Context, h corrosion.HostRecord) (notI
 	legacy := func() error {
 		if err := corrosion.AdmitHost(ctx, s.db, h); err != nil {
 			if other, ok := corrosion.AsAddressHeld(err); ok {
+				// A retry of a standing admission: its row is written.
+				if cur, _ := corrosion.GetHost(ctx, s.db, h.Name); cur != nil && strings.EqualFold(cur.CertSerial, h.CertSerial) {
+					return addressLostRefusal(h.Address, h.Name, other)
+				}
 				return addressHeldRefusal(h.Address, h.Name, other)
 			}
 			if errors.Is(err, corrosion.ErrReadmitNeedsCounter) {

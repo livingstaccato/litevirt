@@ -250,7 +250,11 @@ func (s *Server) drainRunningVMCold(ctx context.Context, vm *corrosion.VMRecord,
 			progress.Error = errDrainCrashed.Error()
 			return progress
 		}
-		if serr := s.startMovedVMOnTarget(ctx, vm.Name, target.Name); serr != nil {
+		opID := ""
+		if journal != nil {
+			opID = journal.OperationID
+		}
+		if serr := s.startMovedVMOnTarget(ctx, vm.Name, target.Name, opID); serr != nil {
 			finish("moved to " + target.Name + "; not started there: " + status.Convert(serr).Message())
 			progress.Status = "done"
 			progress.ProgressPct = 100
@@ -411,10 +415,10 @@ func (s *Server) restartAfterFailedColdMove(ctx context.Context, name string) er
 // It runs detached from the request, under its own bound: the move has
 // happened, and a client that goes away must not leave the VM stopped on the
 // target. A start that fails is recorded as a VM event.
-func (s *Server) startMovedVMOnTarget(ctx context.Context, name, target string) error {
+func (s *Server) startMovedVMOnTarget(ctx context.Context, name, target, opID string) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), drainOwnershipWait+drainStartTimeout)
 	defer cancel()
-	err := s.startOnOwner(ctx, name, target)
+	err := s.startOnOwner(ctx, name, target, opID)
 	if err != nil {
 		s.recordVMEvent(ctx, name, "vm.drain", "error",
 			"moved to "+target+" with its disks, but not started there: "+status.Convert(err).Message())
@@ -422,7 +426,9 @@ func (s *Server) startMovedVMOnTarget(ctx context.Context, name, target string) 
 	return err
 }
 
-func (s *Server) startOnOwner(ctx context.Context, name, target string) error {
+// opID is the drain operation the start ends: the marker names it, so the
+// target binds the row's stop intent to it. "" sends no marker.
+func (s *Server) startOnOwner(ctx context.Context, name, target, opID string) error {
 	client, closeConn, err := s.dialPeer(ctx, target)
 	if err != nil {
 		return status.Errorf(codes.Unavailable, "reach %s: %v", target, err)
@@ -441,10 +447,11 @@ func (s *Server) startOnOwner(ctx context.Context, name, target string) error {
 					// replica of the journal holds. Without the epoch no marker
 					// is sent: the gate then applies as to any start.
 					sctx := ctx
-					if cur, gerr := corrosion.GetVM(ctx, s.db, name); gerr == nil && cur != nil && cur.HostName == target {
+					if cur, gerr := corrosion.GetVM(ctx, s.db, name); gerr == nil && cur != nil && cur.HostName == target && opID != "" {
 						sctx = metadata.AppendToOutgoingContext(ctx,
 							DrainResumeFromMDKey, s.hostName,
-							DrainResumeEpochMDKey, strconv.FormatInt(cur.OwnerEpoch, 10))
+							DrainResumeEpochMDKey, strconv.FormatInt(cur.OwnerEpoch, 10),
+							DrainResumeOpMDKey, opID)
 					}
 					_, serr := client.StartVM(sctx, &pb.StartVMRequest{Name: name})
 					return serr
@@ -598,7 +605,7 @@ func (s *Server) resumeDrainColdMove(ctx context.Context, m corrosion.DrainColdM
 		// lock, which is never held across a peer call.
 		sctx, cancel := context.WithTimeout(ctx, drainOwnershipWait+drainStartTimeout)
 		defer cancel()
-		if err := s.startOnOwner(sctx, m.VM, vm.HostName); err != nil {
+		if err := s.startOnOwner(sctx, m.VM, vm.HostName, m.OperationID); err != nil {
 			return "", false, fmt.Errorf("start it on %s, its owner: %w", vm.HostName, err)
 		}
 		return "started on " + vm.HostName + ", where it was moved", false, nil

@@ -16,6 +16,7 @@ package libvirtfake
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -498,6 +499,14 @@ func (f *Fake) DefineDomain(xmlConfig string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// libvirt gives every domain a uuid: one whose XML names none gets a
+	// generated one, so a redefine of an existing name with no uuid is
+	// refused there (the generated one is not the domain's: the name check
+	// below), and so it is here. A test then sees the identity a real host
+	// would report.
+	if domainUUIDFromXML(xmlConfig) == "" {
+		xmlConfig = insertUUID(xmlConfig, name, randomUUID())
+	}
 	// libvirt refuses a definition whose UUID is already held by an ACTIVE domain
 	// under a different name. That is exactly what happens after undefining a
 	// RUNNING domain — it survives as a transient one, still holding its UUID — so
@@ -511,6 +520,13 @@ func (f *Fake) DefineDomain(xmlConfig string) error {
 			}
 			if domainUUIDFromXML(f.liveXMLLocked(other)) == uuid {
 				return fmt.Errorf("libvirtfake: domain %q is already active with uuid %s", other, uuid)
+			}
+		}
+		// An inactive domain of another name holds its uuid just as firmly:
+		// libvirt refuses it too ("already defined with uuid").
+		for other := range f.domains {
+			if other != name && domainUUIDFromXML(f.liveXMLLocked(other)) == uuid {
+				return fmt.Errorf("libvirtfake: domain %q is already defined with uuid %s", other, uuid)
 			}
 		}
 		// libvirt also refuses a definition that reuses an existing domain's NAME
@@ -1401,7 +1417,8 @@ func (f *Fake) synthesizeXMLLocked(name string) (string, error) {
 		return `<domain type='kvm'><name>` + name +
 			`</name><memory unit='MiB'>1024</memory><vcpu>1</vcpu><devices></devices></domain>`, nil
 	}
-	return "", fmt.Errorf("libvirtfake: domain %q not found", name)
+	// libvirt's own VIR_ERR_NO_DOMAIN, as DomainIsActive gives it.
+	return "", golibvirt.Error{Code: uint32(golibvirt.ErrNoDomain), Message: fmt.Sprintf("libvirtfake: domain %q not found", name)}
 }
 
 // DumpXMLInactive returns the domain's PERSISTENT (inactive) view — what a cold boot
@@ -3302,4 +3319,31 @@ func (f *Fake) DropSecrets() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.secrets = nil
+}
+
+// randomUUID is a version-4 uuid, as libvirt generates for a domain whose XML
+// names none.
+func randomUUID() string {
+	var b [16]byte
+	_, _ = cryptorand.Read(b[:])
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// insertUUID puts <uuid>u</uuid> right after the domain's <name>, or, where
+// that is not spelled so, right after the <domain> element's opening tag.
+func insertUUID(xmlConfig, name, u string) string {
+	tag := "<name>" + name + "</name>"
+	if i := strings.Index(xmlConfig, tag); i >= 0 {
+		j := i + len(tag)
+		return xmlConfig[:j] + "<uuid>" + u + "</uuid>" + xmlConfig[j:]
+	}
+	if i := strings.Index(xmlConfig, "<domain"); i >= 0 {
+		if j := strings.Index(xmlConfig[i:], ">"); j >= 0 {
+			k := i + j + 1
+			return xmlConfig[:k] + "<uuid>" + u + "</uuid>" + xmlConfig[k:]
+		}
+	}
+	return xmlConfig
 }

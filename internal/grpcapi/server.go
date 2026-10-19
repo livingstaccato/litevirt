@@ -403,6 +403,17 @@ type Server struct {
 	commitFenceHook func(op string)
 	// createCommittedHook is a test-only seam; see SetCreateCommittedHook.
 	createCommittedHook func(name string) error
+	// createBeforeFlightHook, when set, runs on the owner between a create's
+	// first existence check and its in-flight registration (beginCreate).
+	// Test seam only; nil in production.
+	createBeforeFlightHook func(name string)
+	// removeHostBeforeDeleteHook, when set, runs in RemoveHost between its
+	// checks and its delete. Test seam only; nil in production.
+	removeHostBeforeDeleteHook func(name string)
+	// removeHostBetweenReadsHook, when set, runs in removeHostRefusal between
+	// its read of the host's row and its read of the row's admission key.
+	// Test seam only; nil in production.
+	removeHostBetweenReadsHook func(name string)
 	// createReturnedHook is a test-only seam; see SetCreateReturnedHook.
 	createReturnedHook func(name string, err error)
 	// stackMemberDeleteHook is a test-only seam: DeleteStack calls it with
@@ -978,6 +989,11 @@ type Server struct {
 
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
+	// createFlights holds each create this host runs as the VM's owner until
+	// it returns: a second create of the name is refused while one is in
+	// flight (create_inflight.go).
+	createFlightsMu sync.Mutex
+	createFlights   map[*createFlight]struct{}
 	// vmLockQueues holds the callers waiting for a VM's lock through
 	// lockVMUnlessStartHeld (vm_start_bound.go).
 	vmLockQueuesMu sync.Mutex
@@ -1129,6 +1145,9 @@ type Server struct {
 	// it so `lv cluster converge` kicks an immediate (debounced) pass instead of waiting
 	// for the periodic tick. Same synchronous-push pattern as fwReconciler.
 	antiEntropy AntiEntropyTrigger
+	// hostWriteCurrency turns on the caught-up check for the operator's hosts
+	// writes (host_incarnation.go). The daemon turns it on.
+	hostWriteCurrency atomic.Bool
 
 	// tenancy gates CreateVM/stack admission against project quotas
 	// and emits metered billing events. Optional — nil means
@@ -1230,6 +1249,16 @@ type Server struct {
 	// releaseRollout: the HA monitor's cached rollout answers
 	// (releaseRolloutLagging). Guarded by releasePeerMu.
 	releaseRollout map[string]*rolloutAnswer
+	// schemaRefusedMu guards schemaRefused: each sender whose push this node
+	// refused because its schema is ahead (schema_refusal_health.go).
+	schemaRefusedMu sync.Mutex
+	schemaRefused   map[string]corrosion.SchemaRefusal
+	// schemaResolvedSeen is, per subject, the resolution of its
+	// replication_peer_schema_behind row this node last saw and when, on its
+	// own clock. Guarded by schemaRefusedMu.
+	schemaResolvedSeen map[string]schemaResolutionSeen
+	// schemaRefusalGraceOverride replaces schemaRefusalGrace in tests.
+	schemaRefusalGraceOverride atomic.Pointer[time.Duration]
 	// adoptedVoterGen is the voter generation AdoptVoterConfigs last found
 	// adopted, which Ping reports (PingResponse.voter_generation).
 	adoptedVoterGen atomic.Int64
@@ -1476,6 +1505,9 @@ func (s *Server) advertisedCapabilities() []string {
 	// relay_health_v1 is not withheld either: it says this binary reads the
 	// relay demotion rows when it elects relays, a fact about the build. The
 	// demotion rows are not written until the ReplicationGated latch forms.
+	// netbox_ip_repoint_v1 is not withheld either: it says this binary decodes
+	// the lease re-point statement, a fact about the build. No re-point is
+	// written until the ReplicationGated latch forms.
 	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
 	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
 	// operation_protocol_v1 is active (the crash-safe operation journal is a hard
@@ -2133,6 +2165,10 @@ func (s *Server) tokenEnabled(token string) bool {
 	case capabilities.SpecConflictV1:
 		// No kill switch: it says how this build resolves two edits of one
 		// spec at one generation, and every replica must resolve them alike.
+		return true
+	case capabilities.NetBoxIPRepointV1:
+		// No kill switch: it says this build decodes the lease re-point
+		// statement. The inventory mirror's own opt-in is its stand-down.
 		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm.Load()

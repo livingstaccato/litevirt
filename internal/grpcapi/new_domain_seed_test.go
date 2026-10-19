@@ -1,7 +1,6 @@
 package grpcapi
 
 import (
-	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -75,19 +74,22 @@ func TestNewDomainBuilders_AttachTheVMsStampedSeed(t *testing.T) {
 			specJSON, _ := json.Marshal(&pb.VMSpec{Name: "vm1", Uuid: uuid, Cpu: 1, MemoryMib: 512,
 				CloudInit: &pb.CloudInitSpec{Userdata: "#cloud-config\n"}})
 			if err := corrosion.InsertVM(ctx, s.db,
-				corrosion.VMRecord{Name: "vm1", HostName: "test-host", State: "running", Spec: string(specJSON)}, nil,
+				corrosion.VMRecord{Name: "vm1", HostName: "dead-host", State: "running", Spec: string(specJSON)}, nil,
 				[]corrosion.DiskRecord{{VMName: "vm1", DiskName: "root", HostName: "test-host", Path: "/nonexistent-source", SizeBytes: 1 << 20, StorageType: "local"}},
 			); err != nil {
 				t.Fatalf("InsertVM: %v", err)
 			}
 			seedReplica(t, poolDir, "", "vm1", "root", "20260101-000000", "raw", 1<<20)
-			iso := writeStampedSeed(t, s.dataDir, "vm1-p", tc.owner)
+			// A same-name takeover: the VM keeps its uuid. (A promotion to a
+			// new name is a new VM with a fresh uuid, which no seed already
+			// on the host is stamped for.)
+			iso := writeStampedSeed(t, s.dataDir, "vm1", tc.owner)
 
 			stream := &streamRecorder[pb.PromoteReplicaProgress]{ctx: ctx}
-			if err := s.PromoteReplica(&pb.PromoteReplicaRequest{VmName: "vm1", NewName: "vm1-p", TargetPool: "replica-pool", NoLocalize: true}, stream); err != nil {
+			if err := s.PromoteReplica(&pb.PromoteReplicaRequest{VmName: "vm1", TargetPool: "replica-pool", NoLocalize: true, Force: true}, stream); err != nil {
 				t.Fatalf("PromoteReplica: %v", err)
 			}
-			checkSeed(t, fake.DefinedXML("vm1-p"), iso, tc.want)
+			checkSeed(t, fake.DefinedXML("vm1"), iso, tc.want)
 		})
 
 		t.Run("restore/"+tc.name, func(t *testing.T) {
@@ -96,19 +98,17 @@ func TestNewDomainBuilders_AttachTheVMsStampedSeed(t *testing.T) {
 			fake := libvirtfake.New()
 			s.virt = fake
 			s.dataDir = t.TempDir()
+			// A restore to the VM's own name (its row gone): it keeps its
+			// uuid. (A restore beside it under a new name gets a fresh one.)
 			spec, _ := json.Marshal(&pb.VMSpec{Name: "vm1", Uuid: uuid, Cpu: 1, MemoryMib: 512,
 				CloudInit: &pb.CloudInitSpec{Userdata: "#cloud-config\n"}})
-			if err := corrosion.InsertVM(context.Background(), s.db,
-				corrosion.VMRecord{Name: "vm1", HostName: "host-a", State: "stopped", Spec: string(spec)}, nil, nil); err != nil {
-				t.Fatal(err)
-			}
-			iso := writeStampedSeed(t, s.dataDir, "vm2", tc.owner)
-			repoDir, ts := seedLiveRepo(t, make([]byte, pbsstore.ChunkSize), "")
+			iso := writeStampedSeed(t, s.dataDir, "vm1", tc.owner)
+			repoDir, ts := seedLiveRepo(t, make([]byte, pbsstore.ChunkSize), string(spec))
 			_, cancel, done := runRestoreLiveUntil(t, s, &pb.RestoreLiveRequest{
-				RepoPath: repoDir, VmName: "vm1", DiskName: "root", Timestamp: ts, FromExisting: true, NewName: "vm2",
+				RepoPath: repoDir, VmName: "vm1", DiskName: "root", Timestamp: ts,
 				TargetPath: filepath.Join(t.TempDir(), "live.qcow2"), AutoStart: true,
 			}, pb.RestoreLiveProgress_STARTED)
-			x := fake.DefinedXML("vm2")
+			x := fake.DefinedXML("vm1")
 			cancel()
 			<-done
 			checkSeed(t, x, iso, tc.want)

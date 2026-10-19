@@ -15,7 +15,7 @@ import (
 // after the commit (spec §17 D-5, the return writer).
 //
 // It reuses the commit's own statements with from and to swapped
-// (vmHostStateSQL, vmDiskHostMoveSQL, placementGenStmts), so it adds no
+// (vmHostStateSQL, diskPlacementMove, placementGenStmts), so it adds no
 // replicated statement shape. Its guard mirrors CommitMigrationOwnership's,
 // against the commit it undoes:
 //   - the VM row names fromHost, for the move's incarnation (the spec's uuid
@@ -47,10 +47,7 @@ func ReturnMigratedVM(ctx context.Context, c *Client, vmName, fromHost, toHost, 
 		if keep, _ := SharedRowKeepsOwner(ctx, c, d, fromHost, toHost); keep {
 			continue // its unproven owner keeps the row (review I1); the guard accepts it unchanged
 		}
-		stmts = append(stmts, Statement{
-			SQL:    vmDiskHostMoveSQL,
-			Params: []interface{}{toHost, now, vmName, d.DiskName},
-		})
+		stmts = append(stmts, diskPlacementMove(d, toHost, now))
 	}
 	stmts = append(stmts, placementGenStmts(ctx, c, vmName)...)
 	guard := func(tx *sql.Tx) (bool, error) {

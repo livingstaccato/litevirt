@@ -137,7 +137,12 @@ func TestCreateVM_AbortOfADomainThatVanishedOrIsUnreadable(t *testing.T) {
 				return err
 			}
 			own := domainUUIDFromXML(x)
-			if err := fake.DefineDomain(strings.Replace(x, "<uuid>"+own+"</uuid>", "", 1)); err != nil {
+			// The fake gives a definition with no uuid one, as libvirt does;
+			// a definition that reads back with none is what this models, so
+			// the uuid is taken out as it is stored.
+			fake.FillDefine = func(x string) string { return strings.Replace(x, "<uuid>"+own+"</uuid>", "", 1) }
+			defer func() { fake.FillDefine = nil }()
+			if err := fake.DefineDomain(x); err != nil {
 				return err
 			}
 			return errors.New("boom")

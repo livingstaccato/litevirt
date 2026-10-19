@@ -255,6 +255,9 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 			}
 		}
 		s.firmware.ApplyTo(&vmCfg, s.dataDir, spec.Name, spec.SecureBoot, spec.Tpm)
+		if err := ensureNvramDir(&vmCfg); err != nil {
+			return err
+		}
 		s.withNICMTU(&vmCfg)
 		generated, gerr := lv.GenerateDomainXML(vmCfg)
 		if gerr != nil {

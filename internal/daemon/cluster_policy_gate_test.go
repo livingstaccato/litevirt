@@ -35,7 +35,7 @@ func TestWireClusterPolicyGate_TracksTheDurableLatch(t *testing.T) {
 	})
 
 	d := &Daemon{db: db, checker: checker, cfg: &Config{DataDir: dataDir}}
-	d.wireClusterPolicyGate()
+	d.wireCorrosionGates() // the set the daemon wires, so a lost call fails here
 
 	if db.MayWriteClusterPolicy() {
 		t.Fatal("the cluster policy gate is open before failover_scope_v1 has durably latched")
@@ -76,7 +76,7 @@ func TestWireRelayHealthGate_TracksBothDurableLatches(t *testing.T) {
 	})
 
 	d := &Daemon{db: db, checker: checker, cfg: &Config{DataDir: dataDir}}
-	d.wireClusterPolicyGate()
+	d.wireCorrosionGates() // the set the daemon wires, so a lost call fails here
 
 	if !checker.Enforced(ctx, capabilities.FailoverScopeV1) || !checker.DurablyLatched(capabilities.FailoverScopeV1) {
 		t.Fatal("failover_scope_v1 did not latch durably; the rest is vacuous")

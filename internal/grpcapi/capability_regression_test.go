@@ -19,7 +19,7 @@ func TestCheckOneCapabilityHealth_DetectsPostLatchRegression(t *testing.T) {
 	//
 	// lease_term_ledger_v1, credentials_split_v1, credentials_clear_v1,
 	// host_membership_split_v1, host_membership_retire_v1, host_runtime_split_v1, host_runtime_retire_v1, failover_scope_v1, voter_config_v1,
-	// claim_incarnation_v1, lease_term_claim_v1, fence_state_v1, relay_health_v1, spec_conflict_v1 and release_2026_11_v1 are latched too, not because this
+	// claim_incarnation_v1, lease_term_claim_v1, fence_state_v1, relay_health_v1, spec_conflict_v1, netbox_ip_repoint_v1 and release_2026_11_v1 are latched too, not because this
 	// test is about them but because they
 	// have no kill switch: an unlatched one would consume the driver's
 	// one-per-cycle budget and the loop below would never reach the freshness
@@ -40,6 +40,7 @@ func TestCheckOneCapabilityHealth_DetectsPostLatchRegression(t *testing.T) {
 		capabilities.FenceStateV1:           true,
 		capabilities.RelayHealthV1:          true,
 		capabilities.SpecConflictV1:         true,
+		capabilities.NetBoxIPRepointV1:      true,
 		capabilities.Release202611V1:        true,
 		capabilities.LWWSkewGuardV1:         true,
 	}
@@ -59,6 +60,7 @@ func TestCheckOneCapabilityHealth_DetectsPostLatchRegression(t *testing.T) {
 		capabilities.FenceStateV1:           true,  // still active
 		capabilities.RelayHealthV1:          true,  // still active
 		capabilities.SpecConflictV1:         true,  // still active
+		capabilities.NetBoxIPRepointV1:      true,  // still active
 		capabilities.Release202611V1:        true,  // still active
 		capabilities.LWWSkewGuardV1:         false, // regressed: a peer stopped advertising
 	}

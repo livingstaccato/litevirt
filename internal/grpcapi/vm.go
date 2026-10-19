@@ -243,19 +243,8 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return nil, err
 	}
 
-	// Check if VM already exists. A rebuild or recreate whose replica here has
-	// not yet applied the tombstone of the VM it replaces sees that VM's row:
-	// exactly that incarnation is settled (settleReplacedVM), anything else
-	// still refuses.
-	if existing, _ := corrosion.GetVM(ctx, s.db, spec.Name); existing != nil {
-		replaced, serr := s.settleReplacedVM(ctx, existing)
-		if serr != nil {
-			return nil, status.Errorf(codes.Unavailable,
-				"VM %q: this host still holds the VM it re-creates and could not retire it: %v", spec.Name, serr)
-		}
-		if !replaced {
-			return nil, status.Errorf(codes.AlreadyExists, "VM %q already exists", spec.Name)
-		}
+	if err := s.refuseExistingVM(ctx, spec.Name); err != nil {
+		return nil, err
 	}
 
 	// Resource defaults BEFORE admission. Everything below — quota, placement,
@@ -367,32 +356,8 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		s.audit(ctx, "vm.create", spec.Name,
 			fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 				targetHost, spec.Cpu, spec.MemoryMib), "allow-overcommit")
-		// Bypassing the CHECK does not mean hiding the DRAW: an overcommit create
-		// that reserved nothing would be invisible to the very next admission, so a
-		// normal create could be admitted against memory this one is already using.
-		// Reserved on the OWNING node only, for the same double-count reason the
-		// checked path reserves there.
-		if targetHost == s.hostName {
-			lease, aerr := s.reserveWithoutCheck(ctx, "CreateVM", targetHost, project,
-				"vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib))
-			if aerr != nil {
-				return nil, aerr
-			}
-			defer lease.release(ctx)
-			// --allow-overcommit bypasses HOST capacity only. Project quota is a
-			// tenancy limit, not a physical judgment call, so it goes through the
-			// SERIALIZED admission like any other create — the earlier tenancy
-			// fail-fast cannot see in-flight reservations, so relying on it here
-			// let concurrent overcommit creates all observe the same headroom.
-			createQuota := vmSpecQuotaAmount(spec)
-			qLease, qerr := s.admitQuotaWithReservation(ctx, "CreateVM", targetHost, project,
-				corrosion.WorkloadVM, spec.Name, createQuota, createQuota, intentVMResident)
-			if qerr != nil {
-				return nil, qerr
-			}
-			defer qLease.release(ctx)
-			createLease = qLease
-		}
+		// The draw is reserved on the owning node only, once this create holds
+		// its flight (below, after beginCreate).
 	} else if err := s.checkResourceAdmission(ctx, targetHost, project, int(spec.Cpu), int(spec.MemoryMib)); err != nil {
 		// Advisory fail-fast on the ENTRY node: read-only, so it costs nothing and
 		// rejects the hopeless case before we forward. The authoritative
@@ -442,6 +407,50 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		return s.forwardCreateVM(ctx, req, targetHost)
 	}
+	// This host owns the create, and no other create of the name runs here
+	// until it returns (beginCreate): two would share the name's domain and
+	// paths, and each one's sweeps and cleanup would act on the other's.
+	// Taken before anything is reserved or made, so a refused create did
+	// nothing. The existence check above ran before the flight was taken: a
+	// create of the name that finished in between has a row by now.
+	if h := s.createBeforeFlightHook; h != nil {
+		h(spec.Name)
+	}
+	endFlight, setFlightUUID, err := s.beginCreate(spec.Name)
+	if err != nil {
+		return nil, err
+	}
+	defer endFlight()
+	if err := s.refuseExistingVM(ctx, spec.Name); err != nil {
+		return nil, err
+	}
+	if req.AllowOvercommit {
+		// Bypassing the CHECK does not mean hiding the DRAW: an overcommit create
+		// that reserved nothing would be invisible to the very next admission, so a
+		// normal create could be admitted against memory this one is already using.
+		// Reserved on the OWNING node only, for the same double-count reason the
+		// checked path reserves there, and under the flight, so a create refused
+		// for another in flight reserved nothing.
+		lease, aerr := s.reserveWithoutCheck(ctx, "CreateVM", targetHost, project,
+			"vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib))
+		if aerr != nil {
+			return nil, aerr
+		}
+		defer lease.release(ctx)
+		// --allow-overcommit bypasses HOST capacity only. Project quota is a
+		// tenancy limit, not a physical judgment call, so it goes through the
+		// SERIALIZED admission like any other create — the earlier tenancy
+		// fail-fast cannot see in-flight reservations, so relying on it here
+		// let concurrent overcommit creates all observe the same headroom.
+		createQuota := vmSpecQuotaAmount(spec)
+		qLease, qerr := s.admitQuotaWithReservation(ctx, "CreateVM", targetHost, project,
+			corrosion.WorkloadVM, spec.Name, createQuota, createQuota, intentVMResident)
+		if qerr != nil {
+			return nil, qerr
+		}
+		defer qLease.release(ctx)
+		createLease = qLease
+	}
 	// This host owns the create. A create that fails here is logged with its
 	// cause, and with what its cleanup did (undone, noted as each step runs),
 	// so the owner's log shows both and not only "creating VM" (lab 2, O5).
@@ -484,6 +493,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// keyed by it (never by the name, which a deleted namesake may have used),
 	// and removed again if the create fails.
 	spec.Uuid = uuid.NewString()
+	setFlightUUID(spec.Uuid)
 	// rowCommitted is set once the VM row has committed: from then on the VM
 	// exists and runs, and a later failure (reading it back, a step after it,
 	// a caller that stopped waiting) undoes nothing — no deferred cleanup
@@ -596,6 +606,17 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	var diskConfigs []lv.DiskConfig
 	var diskRecords []corrosion.DiskRecord
 	var createdDiskPaths []string
+	// createdDiskFile is the file each host-local disk this create made is
+	// (its identity, read right after it was made; madeFileID): a failed
+	// create removes a path only while that file is still there, never
+	// another create's or domain's file that took the path since.
+	createdDiskFile := map[string]madeFileID{}
+	recordDisk := func(p string) {
+		createdDiskPaths = append(createdDiskPaths, p)
+		if id, ok := madeFileIdentity(p); ok {
+			createdDiskFile[p] = id
+		}
+	}
 	// A disk that is not a file (an rbd image) is removed by the driver that
 	// created it: os.Remove of "rbd:pool/image" removes nothing, which is how a
 	// failed create left its ceph images behind.
@@ -636,7 +657,14 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	}
 	cleanupDisks := func() {
 		removeSeed()
+		// A domain of the name that is not this create's names paths a
+		// failed create must leave, whoever made the file there.
+		foreign := s.foreignDomainDiskPaths(spec.Name, spec.Uuid)
 		for _, p := range createdDiskPaths {
+			if foreign(p) {
+				noteUndo("disk " + p + " left: a domain of the name this create did not define names it")
+				continue
+			}
 			if drv := createdBy[p]; drv != nil {
 				// The request may be what failed (cancelled, timed out); the
 				// image this create made is removed regardless.
@@ -649,6 +677,14 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 					continue
 				}
 				noteUndo("removed disk " + p)
+				continue
+			}
+			made, ok := createdDiskFile[p]
+			if _, serr := os.Lstat(p); serr != nil && os.IsNotExist(serr) {
+				continue
+			}
+			if !ok || !made.stillAt(p) {
+				noteUndo("disk " + p + " left: it is no longer the file this create made")
 				continue
 			}
 			if rmErr := os.Remove(p); rmErr != nil && !os.IsNotExist(rmErr) {
@@ -664,16 +700,25 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return nil, status.Errorf(codes.Internal, "libvirt not connected on host %s", s.hostName)
 	}
 
-	// If a libvirt domain with this name exists but no active DB record does
-	// (we already checked above), it's an orphan from an incomplete delete.
-	// Only clean up if stopped — refuse if it's actually running.
+	// A libvirt domain of the name with no VM record (checked above, under
+	// this create's flight) is a leftover of an incomplete delete or a failed
+	// create, and is removed — only when it is stopped and no create in flight
+	// here defined it (refuseLiveDomainOfName).
 	if s.virt.DomainExists(spec.Name) {
+		if err := s.refuseLiveDomainOfName(spec.Name, spec.Uuid); err != nil {
+			return nil, err
+		}
 		state, _ := s.virt.DomainState(spec.Name)
 		slog.Warn("cleaning up orphaned libvirt domain", "vm", spec.Name, "state", state)
-		if state == "running" {
-			s.virt.DestroyDomain(spec.Name)
+		uerr := s.virt.UndefineDomain(spec.Name, true)
+		// Still there (the undefine failed, or someone started it in between
+		// and it is now transient): the debris sweep below must not run under
+		// it.
+		if s.virt.DomainExists(spec.Name) {
+			return nil, status.Errorf(codes.Unavailable,
+				"create %s refused on %s: a leftover domain of the name could not be removed (undefine: %v); "+
+					"nothing was created and the domain is left as it is", spec.Name, s.hostName, uerr)
 		}
-		s.virt.UndefineDomain(spec.Name, true)
 	}
 
 	// The refusals the create would meet later that do not depend on what it
@@ -855,7 +900,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			return nil, status.Errorf(codes.Internal, "create disk %s: %v", d.Name, err)
 		}
 		if !fixedDevice {
-			createdDiskPaths = append(createdDiskPaths, diskPath)
+			recordDisk(diskPath)
 		}
 
 		// An unset discard becomes the storage type's default now, in the spec
@@ -908,7 +953,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			cleanupDisks()
 			return nil, status.Errorf(codes.Internal, "create default disk: %v", err)
 		}
-		createdDiskPaths = append(createdDiskPaths, diskPath)
+		recordDisk(diskPath)
 		diskConfigs = append(diskConfigs, lv.DiskConfig{
 			Name: "root",
 			Path: diskPath,
@@ -1362,8 +1407,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// VM with a unique name and no prior/other owner — there is no ownership contest
 	// to arbitrate, so it can't double-run. Gating it would only block new workloads
 	// on a quorum-degraded node with zero safety benefit. The one cross-partition
-	// hazard (two operators creating the SAME name on both sides) is an operator error
-	// caught by the vms PK + owner-assert on heal, not something a quorum gate closes.
+	// hazard (two creates of the SAME name placed on different owners, on both sides of
+	// a partition or not) is not something a quorum gate closes, and nothing here
+	// resolves it: the per-host flight (beginCreate) serialises only creates on ONE
+	// owner. The vms PK keeps one row by LWW, and owner-assert DETECTS the second
+	// runtime on heal and alerts (SPLIT-BRAIN); it does not stop either copy. A
+	// replicated per-name create claim is the known follow-up.
 
 	// The ISO was judged before admission; an image pull can run in between,
 	// and qemu opens it at this boot, so it is judged again now.
@@ -1436,10 +1485,11 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// cannot be read or names no uuid, is left as it is with its disks,
 	// claims, LUNs and host-isolated addresses, and reported: removing them
 	// under a running guest is worse, and the next create of the name removes
-	// a leftover domain first. A domain gone by then is gone: its claims and
-	// swtpm tree are released, the disks are left (whatever removed the domain
-	// may have created at their paths since). Its seed is removed if it is
-	// still the file this create placed.
+	// a leftover domain first once it is stopped (refuseLiveDomainOfName). A
+	// domain gone by then is gone: its claims and swtpm tree are released, the
+	// disks are left (whatever removed the domain may have created at their
+	// paths since). Its seed is removed if it is still the file this create
+	// placed.
 	//
 	// The domain is undefined only after the disks, seed and vars at its
 	// name's paths are removed: while a domain of the name is defined, a
@@ -1472,7 +1522,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				"name", spec.Name, "host", s.hostName, "cause", cause, "error", xerr)
 			noteUndo(fmt.Sprintf("domain left as it is, with its disks: its definition could not be read (%v)", xerr))
 			return fmt.Errorf("%w; the definition of domain %s on %s could not be read (%v), so it is left as it is, "+
-				"with its disks and no VM record: the next create of %s removes it", cause, spec.Name, s.hostName, xerr, spec.Name)
+				"with its disks and no VM record: the next create of %s removes it if it is stopped, and is refused while it runs", cause, spec.Name, s.hostName, xerr, spec.Name)
 		}
 		if u != spec.Uuid {
 			return gone(fmt.Sprintf("domain %s on %s is no longer the one this create defined (uuid %s)", spec.Name, s.hostName, u))
@@ -1485,7 +1535,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 					"name", spec.Name, "host", s.hostName, "cause", cause, "error", derr)
 				noteUndo(fmt.Sprintf("domain left defined and running, with its disks: it could not be stopped (%v)", derr))
 				return fmt.Errorf("%w; its domain could not be stopped on %s (%v) and is left defined with its disks, "+
-					"with no VM record: the next create of %s removes it", cause, s.hostName, derr, spec.Name)
+					"with no VM record: the next create of %s is refused while it runs", cause, s.hostName, derr, spec.Name)
 			}
 		}
 		noteUndo("domain stopped")
@@ -4962,9 +5012,55 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	rctx, cancelCreate := detachReplace(rctx)
 	defer cancelCreate()
 
-	// Stop and undefine the current domain.
-	if vm.State == "running" {
-		s.virt.DestroyDomain(req.Name)
+	// Stop and undefine the current domain. Whether it runs is libvirt's to
+	// say, not the row's: a row still "creating" (not yet published) or
+	// lagging an out-of-band start names a running guest too, and undefining
+	// that one leaves a transient qemu on the disks deleted below, with no
+	// record, which the create would then refuse to replace. A domain that
+	// cannot be stopped refuses the rebuild with the VM as it is.
+	if s.virt.DomainExists(req.Name) {
+		// Only this VM's own domain is stopped and undefined: a domain of the
+		// name that is another guest (hand-made, or a runtime of another
+		// incarnation) is not this rebuild's to kill. Its own is the one with
+		// its uuid, or one that runs on the disks its row records here
+		// (domainIsVMsOwn). A VM with no recorded uuid (from before uuids were
+		// minted, or a non-firmware import, whose uuid libvirt chose) has
+		// nothing to compare, and is judged as before.
+		if spec.Uuid != "" {
+			own, du, why, ierr := s.domainIsVMsOwn(ctx, req.Name, spec.Uuid, req.Name)
+			switch {
+			case ierr != nil:
+				// libvirt cannot say what the domain is: stopping it would
+				// stop whatever has the name.
+				return nil, status.Errorf(codes.Unavailable,
+					"cannot rebuild %q: the domain of the name on %s cannot be identified (%v); nothing was changed",
+					req.Name, s.hostName, ierr)
+			case !own:
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"cannot rebuild %q: the domain of the name on %s is not this VM's (uuid %s, the VM's is %s, and %s); "+
+						"nothing was changed",
+					req.Name, s.hostName, du, spec.Uuid, why)
+			}
+		}
+		active, aerr := s.virt.DomainIsActive(req.Name)
+		if aerr != nil || active {
+			derr := s.virt.DestroyDomain(req.Name)
+			still, serr := s.virt.DomainIsActive(req.Name)
+			switch {
+			case derr == nil && serr != nil:
+				// The stop was sent and may have landed: say so, not
+				// "nothing was changed".
+				return nil, status.Errorf(codes.Unavailable,
+					"cannot rebuild %q: its domain on %s was sent a stop, but whether it still runs cannot be read (%v); "+
+						"the rebuild stopped there, and the VM's row, disks and definition are unchanged", req.Name, s.hostName, serr)
+			case derr != nil || serr != nil || still:
+				if derr == nil {
+					derr = errors.New("it is still running")
+				}
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"cannot rebuild %q: its domain on %s could not be stopped (%v); nothing was changed", req.Name, s.hostName, derr)
+			}
+		}
 	}
 	s.virt.UndefineDomain(req.Name, false)
 
@@ -5121,6 +5217,17 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	} else if err := s.firmwareMoveNameRefusal("cutover", req.VmName); err != nil {
 		return nil, err
 	}
+	// The refusals above come first: a cutover refused for a firmware move
+	// takes no create flight, so it is refused for the move, never reported
+	// as a create in progress.
+	// The cutover gives the -next VM the name: no create of the name runs on
+	// this host while it does (beginCreate), so none can land in the window
+	// between the original's tombstone and the rename.
+	endFlight, _, ferr := s.beginCreate(req.VmName)
+	if ferr != nil {
+		return nil, ferr
+	}
+	defer endFlight()
 
 	// Resource pre-check: during the cutover overlap window, both the old and
 	// new VM may be running simultaneously. Verify the host has enough resources
@@ -6597,6 +6704,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			}
 		}
 		s.firmware.ApplyTo(&vmCfg, s.dataDir, spec.Name, spec.SecureBoot, spec.Tpm)
+		if err := ensureNvramDir(&vmCfg); err != nil {
+			return nil, err
+		}
 
 		s.withNICMTU(&vmCfg)
 		var gerr error

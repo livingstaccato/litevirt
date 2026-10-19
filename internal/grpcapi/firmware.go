@@ -136,13 +136,23 @@ func (s *Server) applyFirmwareConfig(cfg *lv.VMConfig, spec *pb.VMSpec) error {
 	if !spec.SecureBoot && !spec.Tpm {
 		return nil
 	}
-	if cfg.NvramPath != "" {
-		// Searchable (0711) so the dropped-privilege qemu user can traverse to
-		// the vars file (the file itself is dynamic-owned by libvirt), listable
-		// by nobody else; matches the disks dir (internal/diskmode).
-		if err := diskmode.MkdirAll(filepath.Dir(cfg.NvramPath)); err != nil {
-			return status.Errorf(codes.Internal, "create nvram dir: %v", err)
-		}
+	return ensureNvramDir(cfg)
+}
+
+// ensureNvramDir makes the directory of cfg's name-keyed vars file, if cfg has
+// one. libvirt creates the vars FILE from its template at start, but not the
+// directory, so every path that defines a domain with firmware set by ApplyTo
+// calls this before the define: a create, and an update or redefine that
+// turns Secure Boot or vTPM on, on a host where no such VM was made before.
+// Searchable (0711) so the dropped-privilege qemu user can traverse to the
+// vars file (the file itself is dynamic-owned by libvirt), listable by nobody
+// else; matches the disks dir (internal/diskmode).
+func ensureNvramDir(cfg *lv.VMConfig) error {
+	if cfg.NvramPath == "" {
+		return nil
+	}
+	if err := diskmode.MkdirAll(filepath.Dir(cfg.NvramPath)); err != nil {
+		return status.Errorf(codes.Internal, "create nvram dir: %v", err)
 	}
 	return nil
 }

@@ -967,6 +967,15 @@ with the reason, the local identity and a remedy. See docs/diagnostics.md.
   certificate's key and the destination.
 - Drop the pause record.
 
+A host-local record of the settle (`<data_dir>/settle-pending/`, one file per
+settle) is written before the stop. Each pass (the reconciler for a VM, the
+pauser's resume pass for a container) retries the audit row and the condition
+until both are written, then removes it, so a failed write or a daemon crash
+after the stop does not lose them. The audit row keeps one ID across retries.
+A record whose stop is not known to have run completes only once the copy is
+positively shut off (or gone). The audit row then says how it was found. A
+record whose copy is still live is dropped, and settle decides again.
+
 The domain is now shut off with reason `destroyed`. On the next pass the
 existing leftover cleanup handles it exactly as it handles any shut-off domain
 whose row moved (`cleanableLeftover` → `UndefineDomain(name, false)`, which

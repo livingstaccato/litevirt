@@ -9,6 +9,7 @@ package netboxsync
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 
@@ -38,6 +39,14 @@ type DesiredNIC struct {
 	MAC        string
 	IP         string
 	NetBoxIPID int
+	// NetBoxIP is the address the NetBoxIPID object was leased for, read from
+	// the lease and not from the NIC row: the lease is what names the object,
+	// and its family is what decides which primary field may carry it.
+	NetBoxIP string
+	// LeaseNetwork and LeasePrefixID locate the lease that names NetBoxIPID and
+	// the binding it was claimed through. Read only to repair a dead address.
+	LeaseNetwork  string
+	LeasePrefixID int
 }
 
 // Action is one unit of work for the applier.
@@ -74,6 +83,12 @@ type Action struct {
 	// Record only — neither applier proof consults it — but it is what makes
 	// the log line and the refusals legible.
 	FreesName string
+
+	// ClearsPrimary4 and ClearsPrimary6 mark a "clear" of the address the
+	// owning VM's primary_ip4 / primary_ip6 currently names. NetBox refuses to
+	// detach a primary, so the applier nulls that primary first.
+	ClearsPrimary4 bool
+	ClearsPrimary6 bool
 }
 
 // ── vm/replace: the superseded incarnation of a reused name ─────────────────
@@ -174,6 +189,11 @@ const opPark = "park"
 // true during a create. Folding it into vmBody would put a field on every create
 // that the server must reject.
 const opPrimaryIP = "primary-ip"
+
+// opPrimaryIP6 is opPrimaryIP for primary_ip6. A separate op rather than a
+// family field on the action, because the two are separate NetBox fields that
+// converge independently: a dual-stack VM can need one, the other, or both.
+const opPrimaryIP6 = "primary-ip6"
 
 // parkedNamePrefix heads every temporary name the cycle-breaker writes.
 //
@@ -485,9 +505,15 @@ func Diff(desired []DesiredVM, actual Actual, fingerprint string) []Action {
 			// list, whatever order the API returned.
 			sort.Ints(stale)
 			for _, id := range stale {
+				// A stale address that is still the VM's primary cannot be
+				// detached until the primary is moved off it, and the primary
+				// phase runs after this one: the clear carries which primary
+				// names it, and the applier nulls that one first.
 				out = append(out, Action{
 					Kind: "nic", Op: "clear", Key: nicID,
 					NetBoxID: an.ID, ParentNetBoxID: a.ID, IPID: id,
+					ClearsPrimary4: a.PrimaryIP4ID == id,
+					ClearsPrimary6: a.PrimaryIP6ID == id,
 				})
 			}
 		}
@@ -509,9 +535,25 @@ func Diff(desired []DesiredVM, actual Actual, fingerprint string) []Action {
 		// ParentNetBoxID carries the id from ACTUAL state and is 0 for a VM
 		// created this sweep, exactly as the NIC actions do; the applier falls
 		// back to the mapping row the VM phase wrote. See parentVMID.
-		if want := desiredPrimaryIP(d); want != a.PrimaryIP4ID {
+		//
+		// ONE PER FAMILY. NetBox keeps primary_ip4 and primary_ip6 apart and
+		// refuses an address of the wrong family in either, so each is chosen
+		// from the addresses of its own family and converges on its own.
+		if want := desiredPrimaryIP(d, 4); want != a.PrimaryIP4ID {
 			out = append(out, Action{
 				Kind: "vm", Op: opPrimaryIP, Key: vmID,
+				ParentNetBoxID: a.ID, IPID: want,
+			})
+		}
+		// primary_ip6 is written while the VM holds a leased IPv6 address, and
+		// CLEARED only when it names an address this cluster owns on the VM's
+		// own interfaces — one the mirror put there, whose lease is gone.
+		// Before primary_ip6 was mirrored at all an operator could set it by
+		// hand; a value naming anything else is that, and is left alone.
+		if want := desiredPrimaryIP(d, 6); want != a.PrimaryIP6ID &&
+			(want != 0 || ownsAddressOn(actual, a.ID, a.PrimaryIP6ID)) {
+			out = append(out, Action{
+				Kind: "vm", Op: opPrimaryIP6, Key: vmID,
 				ParentNetBoxID: a.ID, IPID: want,
 			})
 		}
@@ -583,6 +625,33 @@ func Diff(desired []DesiredVM, actual Actual, fingerprint string) []Action {
 		})
 	}
 	return out
+}
+
+// unionPrimaryClears gives every primary-flagged clear of a VM the union of
+// that VM's flags. Applied by the sweep to the actions the evidence gates KEPT,
+// never in Diff: a clear withheld as unproven must not have its primary nulled
+// by a proven clear of another address. Its clears run concurrently, and NetBox saves a PATCHed VM
+// as the whole row it read: two requests that each null one field can write
+// the other back. Each clear nulling every flagged field makes any interleaving
+// leave all of them null.
+func unionPrimaryClears(actions []Action) []Action {
+	type flags struct{ p4, p6 bool }
+	byVM := map[int]flags{}
+	for _, a := range actions {
+		if a.Kind == "nic" && a.Op == "clear" && (a.ClearsPrimary4 || a.ClearsPrimary6) {
+			f := byVM[a.ParentNetBoxID]
+			f.p4 = f.p4 || a.ClearsPrimary4
+			f.p6 = f.p6 || a.ClearsPrimary6
+			byVM[a.ParentNetBoxID] = f
+		}
+	}
+	for i, a := range actions {
+		if a.Kind == "nic" && a.Op == "clear" && (a.ClearsPrimary4 || a.ClearsPrimary6) {
+			f := byVM[a.ParentNetBoxID]
+			actions[i].ClearsPrimary4, actions[i].ClearsPrimary6 = f.p4, f.p6
+		}
+	}
+	return actions
 }
 
 // freeReusedName appends the one removal that frees `name` for the VM about to
@@ -934,8 +1003,15 @@ func vmDiffers(d DesiredVM, a netbox.VirtualMachine) bool {
 		d.DeviceID != a.DeviceID
 }
 
-// desiredPrimaryIP is the address a mirrored VM should carry as its primary: the
-// first NIC that holds one, or 0 when none does.
+// desiredPrimaryIP is the address a mirrored VM should carry as its primary of
+// one address family (4 or 6): the first NIC holding an address of that family,
+// or 0 when none does.
+//
+// BY FAMILY, because NetBox refuses an IPv6 address as primary_ip4 and the
+// reverse. Taking the first NIC's address whatever its family made a VM whose
+// first NIC sat on an IPv6 network send that address as primary_ip4, and the
+// refusal failed every sweep. An address whose family cannot be read is never
+// chosen: a primary NetBox might refuse is worse than none.
 //
 // FIRST, over an order the caller already fixed — desiredNICs sorts by ordinal
 // then MAC — because "primary" has to be stable across sweeps. Picking by map or
@@ -944,13 +1020,46 @@ func vmDiffers(d DesiredVM, a netbox.VirtualMachine) bool {
 //
 // eth0 is what that ordering makes it in practice, which is also the one a guest
 // configures first and the one an operator means by "the VM's address".
-func desiredPrimaryIP(d DesiredVM) int {
+func desiredPrimaryIP(d DesiredVM, family int) int {
 	for _, n := range d.NICs {
-		if n.NetBoxIPID != 0 {
+		if n.NetBoxIPID != 0 && addressFamily(n.NetBoxIP) == family {
 			return n.NetBoxIPID
 		}
 	}
 	return 0
+}
+
+// ownsAddressOn reports whether ipID is a litevirt-owned address of this
+// cluster assigned to one of VM vmID's interfaces.
+func ownsAddressOn(actual Actual, vmID, ipID int) bool {
+	if vmID == 0 || ipID == 0 {
+		return false
+	}
+	for _, nic := range actual.NICs {
+		if nic.VMID != vmID {
+			continue
+		}
+		for _, ip := range actual.OwnedIPsByIface[nic.ID] {
+			if ip.ID == ipID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// addressFamily is 4 or 6 for a bare address, or 0 when it cannot be parsed.
+// An IPv4-mapped IPv6 address is family 6, as NetBox stores it.
+func addressFamily(ip string) int {
+	addr, err := netip.ParseAddr(ip)
+	switch {
+	case err != nil:
+		return 0
+	case addr.Is4():
+		return 4
+	default:
+		return 6
+	}
 }
 
 // nicDiffers compares the mirrored interface fields. The MAC comparison is
@@ -1013,7 +1122,7 @@ func Phase(a Action) int {
 		return PhaseNICUpsert
 	case a.Kind == "nic" && a.Op == "delete":
 		return PhaseNICDelete
-	case a.Kind == "vm" && a.Op == opPrimaryIP:
+	case a.Kind == "vm" && (a.Op == opPrimaryIP || a.Op == opPrimaryIP6):
 		return PhaseVMPrimaryIP
 	default:
 		// Everything left is a VM delete, and anything unrecognised lands here

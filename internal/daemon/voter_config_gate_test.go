@@ -38,7 +38,7 @@ func TestWireVoterConfigGate_TracksTheDurableLatch(t *testing.T) {
 	})
 
 	d := &Daemon{db: db, checker: checker, cfg: &Config{DataDir: dataDir}}
-	d.wireVoterConfigGate()
+	d.wireCorrosionGates() // the set the daemon wires, so a lost call fails here
 
 	if db.MayWriteVoterConfigs() {
 		t.Fatal("the voter_configs gate is open before voter_config_v1 has durably latched")

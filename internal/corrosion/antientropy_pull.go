@@ -2,8 +2,12 @@ package corrosion
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"slices"
+	"strings"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -119,4 +123,129 @@ func (c *Client) observePulledRows(rows map[string]int, pull []string, scope *pu
 		}
 		c.observePullRows(label, n)
 	}
+}
+
+// pullTableFrom pulls table from peer and merges it.
+func (ae *AntiEntropy) pullTableFrom(ctx context.Context, peer, table string) error {
+	client, conn, err := ae.peerClient(ctx, peer)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_, perr, merr := ae.pullAndMerge(ctx, client, []string{table}, nil, nil, nil)
+	return errors.Join(perr, merr)
+}
+
+// pullPeerFloor is the least share of PullTableNow's budget a candidate is
+// given while twice that is left. A var so tests can shorten it.
+var pullPeerFloor = 3 * time.Second
+
+// ErrNoPeerConfirmed is PullTableNow's answer when no peer completed the pull.
+var ErrNoPeerConfirmed = errors.New("no peer completed the pull")
+
+// PullTableNow pulls one replicated table from a member and merges it, ahead
+// of a decision read from that table: the currency pull `lv host rm` and `lv
+// host add` make before deciding a host's incarnation (host_incarnation.go).
+//
+// exclude (the host the decision is about) is never a candidate: its own
+// replica confirms nothing. Voters are tried first. A member is skipped when a
+// pass would skip it (isolated, or unable to keep a release feature in use).
+// When no candidate remains and no other voter was skipped — a cluster this
+// node is alone in, or one whose only other member is the excluded host — it
+// returns ("", skipped, nil): there is nobody to confirm with, and the
+// caller's voter-majority gate has already decided whether this node may act.
+// When a voter was skipped (isolated, or unable to keep a release feature in
+// use) it refuses, naming them. It is not debounced, and is
+// bounded by ctx, which it shares out among the voters, then the non-voters,
+// still left (pullPeerFloor).
+func (ae *AntiEntropy) PullTableNow(ctx context.Context, table, exclude string) (peer string, skipped []string, err error) {
+	if !replicatedTableSet[table] {
+		return "", nil, fmt.Errorf("%s is not a replicated table", table)
+	}
+	// This node in release probation takes no state from any peer: say so,
+	// rather than name every peer as the one that cannot keep a feature.
+	if err := ae.client.ReleaseProbationRefusal(); err != nil {
+		return "", nil, fmt.Errorf("%w: this node is in release probation: %v", ErrNoPeerConfirmed, err)
+	}
+	voters, verr := VoterSet(ctx, ae.client)
+	if verr != nil {
+		// Without the voter set a skipped voter cannot be told from a
+		// skipped non-voter: fail closed.
+		return "", nil, fmt.Errorf("%w: read the voter set: %v", ErrNoPeerConfirmed, verr)
+	}
+	var first, rest, skippedVoters []string
+	skip := func(name, why string) {
+		skipped = append(skipped, name+" ("+why+")")
+		if voters[name] {
+			skippedVoters = append(skippedVoters, name+" ("+why+")")
+		}
+	}
+	for _, m := range ae.client.Members() {
+		switch {
+		case m.Name == "" || m.Name == exclude:
+			continue
+		case func() bool { e, _, ierr := HostIsolation(ctx, ae.client, m.Name); return ierr == nil && e > 0 }():
+			skip(m.Name, "isolated")
+		case ae.client.ReplicationSourceAllowed(ctx, m.Name) != nil:
+			skip(m.Name, "cannot keep a release feature in use")
+		case voters[m.Name]:
+			first = append(first, m.Name)
+		default:
+			rest = append(rest, m.Name)
+		}
+	}
+	candidates := append(first, rest...)
+	if len(candidates) == 0 {
+		// Nobody to confirm with. That is a decision this node may make
+		// alone only when no other voter exists to confirm it: a voter that
+		// was skipped is one the operator should know about first.
+		if len(skippedVoters) > 0 {
+			return "", skipped, fmt.Errorf("%w: every other voter was skipped: %s", ErrNoPeerConfirmed,
+				strings.Join(skippedVoters, ", "))
+		}
+		return "", skipped, nil
+	}
+	pull := ae.tablePull
+	if pull == nil {
+		pull = ae.pullTableFrom
+	}
+	var errs []string
+	for i, name := range candidates {
+		if ctx.Err() != nil {
+			break
+		}
+		// Each candidate gets its share of what is left of ctx's budget, so
+		// one that does not answer cannot spend the time of those behind it.
+		// A voter's share is among the voters still left: a non-voter is
+		// asked only once every voter has failed, so it does not shrink it.
+		// No share falls below pullPeerFloor, or half of what is left when
+		// that is less, so one that does not answer still leaves the next
+		// at least as long.
+		budget := antiEntropyPeerTimeout
+		if dl, ok := ctx.Deadline(); ok {
+			left := len(candidates) - i
+			if i < len(first) {
+				left = len(first) - i
+			}
+			remaining := time.Until(dl)
+			share := remaining / time.Duration(left)
+			if floor := min(remaining/2, pullPeerFloor); share < floor {
+				share = floor
+			}
+			if share < budget {
+				budget = share
+			}
+		}
+		pctx, cancel := context.WithTimeout(ctx, budget)
+		err := pull(pctx, name, table)
+		cancel()
+		if err == nil {
+			return name, skipped, nil
+		}
+		errs = append(errs, name+": "+err.Error())
+	}
+	if len(errs) == 0 && ctx.Err() != nil {
+		errs = append(errs, ctx.Err().Error())
+	}
+	return "", skipped, fmt.Errorf("%w: %s", ErrNoPeerConfirmed, strings.Join(errs, "; "))
 }

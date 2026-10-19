@@ -15,6 +15,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/secretfile"
@@ -117,10 +119,23 @@ func MigrationCAFingerprint(pkiDir string) (string, error) {
 	if block == nil || block.Type != "CERTIFICATE" {
 		return "", fmt.Errorf("%s holds no PEM certificate", path)
 	}
-	if _, err := x509.ParseCertificate(block.Bytes); err != nil {
-		return "", fmt.Errorf("%s holds no valid certificate: %v", path, err)
+	certs, err := parsePEMCertificates(data)
+	if err != nil {
+		return "", fmt.Errorf("%s: %v", path, err)
 	}
-	sum := sha256.Sum256(block.Bytes)
+	// One CA: its DER's SHA-256, as every build computes it. A bundle (an old
+	// and a new CA during a rotation): the SHA-256 of its CAs' sorted
+	// fingerprints, so the same CAs compare equal in any order.
+	sums := make([]string, 0, len(certs))
+	for _, c := range certs {
+		sum := sha256.Sum256(c.Raw)
+		sums = append(sums, hex.EncodeToString(sum[:]))
+	}
+	if len(sums) == 1 {
+		return sums[0], nil
+	}
+	sort.Strings(sums)
+	sum := sha256.Sum256([]byte(strings.Join(sums, "\n")))
 	return hex.EncodeToString(sum[:]), nil
 }
 

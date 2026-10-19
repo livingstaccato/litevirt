@@ -115,7 +115,10 @@ migration-TLS credentials:
   a storage copy that asks for TLS outright, so a source on an older build
   fails closed rather than falling back to plaintext. Every certificate of
   the CA file is read (an old and a new CA during a rotation), and an expired
-  or not-yet-valid certificate counts as unusable.
+  or not-yet-valid certificate counts as unusable. The source and the target
+  compare their CA files as sets: a rotation bundle listed in another order on
+  another host compares equal; hosts with different sets of CAs are refused as
+  holding different migration CAs.
 - Each daemon installs its host's credentials into `/etc/pki/qemu`, with the key
   readable only by the QEMU user, at start and again before each storage
   migration, so no restart is needed. It refuses to touch `/etc/pki/qemu` if
@@ -362,14 +365,21 @@ outcome (`lv audit`), and each VM gets a `vm.drain` event. A VM whose lock
 another operation holds (a scheduled snapshot, a replication run) is waited
 for, up to 10 minutes, then skipped, naming the operation that holds it.
 
-A started move is still bounded. A cold move's disk copy that the target
+Parts of a started move are bounded. A cold move's disk copy that the target
 stops taking (alive but wedged) for 5 minutes is aborted, and so is its check
-of the target that goes unanswered as long; the VM is then started again on
-the drained host, where its record still names it. To end a drain move sooner,
-without restarting the daemon, run `lv operation abort <vm> --force`: it
-cancels the VM's drain move on the drained host, which rolls it back the same
-way. Peers also detect a host that stops answering during a call within about
-6 minutes (gRPC keepalive).
+of the target that goes unanswered as long. Once the last of a disk has been
+sent, the target's verification and sync of it may take as long as the disk's
+size at 16 MiB/s (at least 5 minutes); the target syncs as it writes, so that
+final sync is small. An aborted copy rolls the move back: the VM is started
+again on the drained host, where its record still names it. Peers also detect
+a host that stops answering during a call within about 6 minutes (gRPC
+keepalive). The move's other calls to the target (its firmware state, the
+hand-over) are not bounded by a timeout. To end any drain move without
+restarting the daemon, run `lv operation abort <vm> --force` (on any host; it
+is forwarded to the VM's host): it cancels the move, which rolls back the same
+way. A move the daemon recovers after a restart only rolls back (starts the
+VM again here) and copies nothing, so it is not in that registry and needs no
+abort.
 
 After the cut-over the source's cloud-init ISO is removed and DNS,
 load-balancer backends and VXLAN forwarding entries follow the VM, as for a

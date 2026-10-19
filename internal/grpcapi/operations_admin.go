@@ -70,8 +70,11 @@ func (s *Server) AbortVMOperation(ctx context.Context, req *pb.AbortVMOperationR
 		return nil, status.Error(codes.FailedPrecondition, "aborting an operation requires force")
 	}
 	// A drain's move of the VM runs on the VM's host, detached from the
-	// drain's client: an abort reaching another host goes there (once).
-	if md, _ := metadata.FromIncomingContext(ctx); len(md.Get(abortForwardedMD)) == 0 {
+	// drain's client: an unscoped abort reaching another host goes there
+	// (once). A scoped one (operation_id) never does: it cancels no drain
+	// move, its compare-and-swap works on any host, and a VM host on an older
+	// build drops operation_id and would abort whatever operation is active.
+	if md, _ := metadata.FromIncomingContext(ctx); req.OperationId == "" && len(md.Get(abortForwardedMD)) == 0 {
 		if vm, verr := corrosion.GetVM(ctx, s.db, req.VmName); verr == nil && vm != nil && vm.HostName != s.hostName {
 			if client, conn, perr := s.peerClient(ctx, vm.HostName); perr == nil {
 				resp, ferr := client.AbortVMOperation(metadata.AppendToOutgoingContext(ctx, abortForwardedMD, "1"), req)

@@ -329,3 +329,50 @@ func TestInstallQemuMigrationTLS_ChecksValidityAndReadsTheWholeBundle(t *testing
 		}
 	})
 }
+
+// The migration CA fingerprint is of the CA file's certificates as a set: a
+// rotation bundle listed in another order on another host compares equal, and
+// a single CA keeps the fingerprint an older build computes (its DER's
+// SHA-256), so the comparison holds across the roll.
+//
+// Mutation: fingerprint the first certificate only — the reordered bundles
+// differ, red.
+func TestMigrationCAFingerprint_IsOfTheBundleAsASet(t *testing.T) {
+	a, b := t.TempDir(), t.TempDir()
+	provisionMigration(t, a)
+	provisionMigration(t, b)
+	caA, _ := os.ReadFile(filepath.Join(MigrationDir(a), MigrationCAName))
+	caB, _ := os.ReadFile(filepath.Join(MigrationDir(b), MigrationCAName))
+
+	single, err := MigrationCAFingerprint(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := readCert(t, filepath.Join(MigrationDir(a), MigrationCAName))
+	sum := sha256.Sum256(cert.Raw)
+	if single != hex.EncodeToString(sum[:]) {
+		t.Fatalf("single-CA fingerprint = %s, want its DER's SHA-256 (what an older build computes)", single)
+	}
+
+	write := func(dir string, data []byte) {
+		if err := os.WriteFile(filepath.Join(MigrationDir(dir), MigrationCAName), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(a, append(append([]byte{}, caA...), caB...))
+	write(b, append(append([]byte{}, caB...), caA...))
+	fa, err := MigrationCAFingerprint(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fb, err := MigrationCAFingerprint(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fa != fb {
+		t.Fatalf("the same CAs in another order fingerprint differently: %s vs %s", fa, fb)
+	}
+	if fa == single {
+		t.Fatal("a two-CA bundle fingerprints like one of its CAs alone")
+	}
+}

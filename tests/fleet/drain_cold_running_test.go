@@ -663,3 +663,133 @@ type failingSendStream struct{ grpc.ServerStream }
 func (failingSendStream) SendMsg(any) error {
 	return status.Error(codes.Canceled, "test: the client went away")
 }
+
+// An abort sent to another host than the VM's reaches the VM's host, where
+// its drain move runs, and cancels it there.
+//
+// Mutation: do not forward — the other host has no move to cancel, the drain
+// waits on the stalled copy, red.
+func TestFleet_OperationAbortSentToAnotherHostCancelsTheDrainMove(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	sc.src.Server.SetColdDiskStallForTest(time.Hour)
+	entered, release := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	stallReceive(sc.dst, true, entered, release)
+
+	out := make(chan error, 1)
+	go func() { _, err := sc.drain(t); out <- err }()
+	select {
+	case <-entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the copy never reached the target")
+	}
+	resp, err := sc.c.SelfClient(sc.dst).AbortVMOperation(context.Background(),
+		&pb.AbortVMOperationRequest{VmName: "os1", Force: true})
+	if err != nil || !resp.GetAborted() {
+		t.Fatalf("operation abort via %s = %+v, %v; want the drain's move of os1 aborted on %s", sc.dst.Name, resp, err, sc.src.Name)
+	}
+	select {
+	case err := <-out:
+		assertIncomplete(t, err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("the drain did not end after its move was aborted from another host")
+	}
+	sc.assertRunningOnSource(t)
+}
+
+// The VM's host cannot be reached: the abort is answered where it was sent,
+// as before (the recorded operation is aborted there), not failed.
+//
+// Mutation: return the forward's Unavailable — red.
+func TestFleet_OperationAbortFallsBackWhenTheVMsHostIsUnreachable(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	sc.src.HookUnary("AbortVMOperation", func(context.Context, any, grpc.UnaryHandler) (any, error) {
+		return nil, status.Error(codes.Unavailable, "test: the VM's host cannot be reached")
+	})
+	resp, err := sc.c.SelfClient(sc.dst).AbortVMOperation(context.Background(),
+		&pb.AbortVMOperationRequest{VmName: "os1", Force: true})
+	if err != nil {
+		t.Fatalf("operation abort with the VM's host unreachable = %v; want it answered locally", err)
+	}
+	if resp.GetAborted() || resp.GetDetail() != "no active operation" {
+		t.Fatalf("operation abort = %+v; want the local answer (no active operation)", resp)
+	}
+}
+
+// A scoped abort (--operation) is never forwarded: it cancels no drain move,
+// its compare-and-swap works on any host, and a VM host on an older build
+// drops operation_id and would abort whatever operation is active.
+//
+// Mutation: forward scoped aborts too — the VM's host is called, red.
+func TestFleet_ScopedOperationAbortIsNotForwarded(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	var called bool
+	sc.src.HookUnary("AbortVMOperation", func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
+		called = true
+		return h(ctx, req)
+	})
+	_, err := sc.c.SelfClient(sc.dst).AbortVMOperation(context.Background(),
+		&pb.AbortVMOperationRequest{VmName: "os1", Force: true, OperationId: "op-x"})
+	if called {
+		t.Fatal("a scoped abort was forwarded to the VM's host")
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("scoped abort of an operation that is not active = %v; want FailedPrecondition", err)
+	}
+}
+
+// The target's final sync of a large disk on slow storage takes longer than
+// the stall bound: the copy is not aborted for it. The wait for the target's
+// answer after the last frame is bounded by the disk's size at a minimum
+// rate, not by the stall bound.
+//
+// Mutation: bound the final answer by the stall bound — the copy is aborted
+// after it fully arrived, red.
+func TestFleet_DrainColdMoveWaitsForASlowFinalSync(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	sc.src.Server.SetColdDiskStallForTest(500 * time.Millisecond)
+	sc.src.Server.SetColdDiskFinalRateForTest(1 << 20) // ~3 MiB disk: a ~3s bound for the answer
+	sc.dst.Server.SetColdDiskSyncHookForTest(func(final bool) {
+		if final {
+			time.Sleep(1500 * time.Millisecond)
+		}
+	})
+	progress, err := drainWithin(t, sc, 30*time.Second)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if p := progress["os1"]; p == nil || p.Status != "done" || p.Error != "" {
+		t.Fatalf("drain progress for os1 = %+v, want done", p)
+	}
+}
+
+// The target syncs a received disk as it writes, so its final sync is small
+// and the sender's progress reflects what the target's storage takes.
+//
+// Mutation: sync only at the end — no periodic sync, red.
+func TestFleet_ColdDiskReceiveSyncsAsItWrites(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	sc.dst.Server.SetColdDiskSyncEveryForTest(1 << 20)
+	var mu sync.Mutex
+	periodic := 0
+	sc.dst.Server.SetColdDiskSyncHookForTest(func(final bool) {
+		if !final {
+			mu.Lock()
+			periodic++
+			mu.Unlock()
+		}
+	})
+	if _, err := drainWithin(t, sc, 30*time.Second); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if periodic < 2 {
+		t.Fatalf("the target synced %d time(s) while it wrote ~2 MiB in 1 MiB steps; want at least 2", periodic)
+	}
+}

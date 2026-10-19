@@ -2214,15 +2214,23 @@ Evaluator `vtpm`, subject kind `host`, severity warning. A node with swtpm
 installed and `vtpm_state_sync` on (the default, docs/configuration.md) sets
 the sync attribute on `/var/lib/libvirt/swtpm` at start and every minute, so
 each vTPM state write is on disk before the TPM command returns. The node
-raises `vtpm_state_not_durable` about **itself** when it cannot: the
-filesystem refuses the attribute (tmpfs, NFS), a file created there does not
-inherit it (btrfs), or setting it failed. A vTPM write made shortly before a
-power cut on that host can be lost. The evidence carries `state`
-(`unsupported`, `not_inherited` or `failed`), `path`, `error` and `remedy`.
+raises `vtpm_state_not_durable` about **itself** when it cannot. The evidence
+carries `state`, `path`, `fs`, `error` and `remedy`:
+
+- `unsupported`: the filesystem refuses the attribute (tmpfs, NFS, ZFS);
+- `not_inherited`: a file created there does not get it (btrfs);
+- `rename_not_synchronous`: the filesystem does not commit swtpm's rename of
+  the state file synchronously (xfs mounted without `dirsync`, `wsync` or `sync`,
+  or a filesystem not known to);
+- `failed`: some entries could not be read or set (`error` names them);
+- `timed_out`: a pass has not finished within 10 seconds (a hung NFS server).
+  The vTPM capability label stays false until a pass completes.
+
+A vTPM write made shortly before a power cut on that host can be lost.
 
 | Raised when | Clears when |
 |---|---|
-| A pass finds the tree cannot be made synchronous. | A pass makes it synchronous (the path moved to ext4 or xfs), or `vtpm_state_sync: false` is set and the daemon restarted. |
+| A pass finds the tree cannot be made synchronous, or does not finish. | A pass makes it synchronous, `vtpm_state_sync: false` is set and the daemon restarted, or swtpm is removed from the host. A node rolled back to a build without this check leaves the row as it was until it runs a build that checks again. |
 
 ### Operation not reapable (`operation_unreapable`)
 

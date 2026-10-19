@@ -209,9 +209,10 @@ type Config struct {
 	ContainerRestoreTimeoutSec int `yaml:"container_restore_timeout_sec"`
 
 	// VTPMStateSync makes vTPM state writes synchronous: the sync attribute
-	// (chattr +S) on /var/lib/libvirt/swtpm, which its files inherit. swtpm does
-	// not fsync its state, so without it a vTPM write made shortly before a
-	// power cut can be lost. Nil = on; false clears the attribute.
+	// (chattr +S) on /var/lib/libvirt/swtpm, which its files inherit (ext4; xfs
+	// only with dirsync). swtpm does not fsync its state, so without it a vTPM
+	// write made shortly before a power cut can be lost. Nil = on; false clears
+	// the attribute where <data_dir>/vtpm-state-sync records litevirt set it.
 	VTPMStateSync *bool `yaml:"vtpm_state_sync,omitempty"`
 
 	// Containers holds the defaults new and restarted containers get.

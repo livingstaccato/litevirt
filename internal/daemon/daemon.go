@@ -1744,21 +1744,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 	//   - vTPM (G1): both swtpm_setup and swtpm are needed to START a vTPM VM —
 	//     libvirt runs swtpm_setup to initialize state, then swtpm. (The first
 	//     G1 drill failed in swtpm_setup with swtpm alone present.)
-	//     On such a host the probe first makes the swtpm tree synchronous
-	//     (vtpm_state_sync), so no vTPM VM is placed here before it is.
+	//     The label is also held false until a pass over the swtpm tree
+	//     (vtpm_state_sync) has completed, so placement offers vTPM here only
+	//     after the attempt to make its state synchronous; a pass that cannot
+	//     raises vtpm_state_not_durable instead. The pass runs in its own
+	//     goroutine and the probe waits at most vtpmPassWait for it.
 	//   - Secure Boot: the secboot/MS OVMF pair (resolved above).
 	// Asserted now, before the container checker starts, and re-asserted every
 	// capabilityLabelInterval (keepCapabilityLabels says why).
+	vtpmMarker := filepath.Join(d.cfg.DataDir, "vtpm-state-sync")
 	vtpmSync := &vtpmStateSync{
 		on:   d.cfg.VTPMStateSyncEnabled(),
-		sync: libvirt.SyncSwtpmState,
+		base: libvirt.SwtpmBase(),
+		wait: vtpmPassWait,
+		sync: func(on bool) libvirt.SwtpmSyncReport { return libvirt.SyncSwtpmState(on, vtpmMarker) },
 		report: func(open bool, evidence map[string]any) bool {
-			return d.writeSelfConditionAs(ctx, vtpmEvaluator, CondVTPMStateNotDurable, open, corrosion.SeverityWarning, evidence)
+			return d.syncVTPMCondition(ctx, open, evidence)
 		},
 	}
 	capabilityLabels := []capabilityLabel{
 		{key: corrosion.LabelLXCCapable, capable: lxc.Available},
-		{key: corrosion.LabelTPMCapable, capable: tpmCapableProbe(exec.LookPath, vtpmSync.ensure)},
+		{key: corrosion.LabelTPMCapable, capable: tpmCapableProbe(exec.LookPath, vtpmSync.probe)},
 		{key: corrosion.LabelSecureBootCapable, capable: firmwarePaths.SecureBootAvailable},
 	}
 	asserted, err := assertCapabilityLabels(ctx, d.db, d.cfg.HostName, capabilityLabels)

@@ -23,13 +23,19 @@ import (
 //
 // What it checks, on real swtpm and the host's own disk:
 //
-//  1. the VM's swtpm state directory and file carry the sync attribute;
+//  1. the VM's swtpm state directory and file carry the sync attribute. This
+//     is the deterministic half: a build without vtpm_state_sync fails it
+//     every time;
 //  2. periodic writeback is off on the host (vm.dirty_writeback_centisecs=0,
-//     after a sync), so only a synchronous write can put the TPM write on disk;
-//  3. a value written to a TPM NV index in the guest reaches the host's swtpm
-//     state file, and the host is powered off at once (within 1 s);
+//     after a sync). That stops the flusher, not the journal: litevirt's own
+//     fsyncs commit the ext4 journal about twice a second, and such a commit
+//     can carry the write, so a cut can keep it without the attribute;
+//  3. a value written to a TPM NV index in the guest, and the host powered
+//     off at once (within 1 s);
 //  4. once the host is back, the state file on disk still holds the value, and
-//     the guest, started again there, reads it back from its TPM.
+//     the guest, started again there, reads it back from its TPM. One pass of
+//     3-4 is evidence, not proof; the control run (E2E_VTPM_EXPECT_LOSS=1)
+//     shows the write is lost without the attribute.
 func TestDrill_VTPMStateSurvivesHostPowerCut(t *testing.T) {
 	l := newLab(t)
 	b := l.requireBaseline()
@@ -143,8 +149,7 @@ vms:
 		}
 	}
 
-	// 2. Only a synchronous write can persist it: periodic writeback off,
-	// after syncs that clean what came before.
+	// 2. Periodic writeback off, after syncs that clean what came before.
 	orig := strings.TrimSpace(l.mustSSH(victim, 20*time.Second, "cat /proc/sys/vm/dirty_writeback_centisecs"))
 	if _, err := strconv.Atoi(orig); err != nil {
 		t.Fatalf("vm.dirty_writeback_centisecs on %s: %q", victim, orig)

@@ -2,7 +2,12 @@
 
 package libvirt
 
-var osSwtpmFlagOps = swtpmFlagOps{
-	get: func(string) (uint32, error) { return 0, errFlagsUnavailable },
-	set: func(string, uint32) error { return errFlagsUnavailable },
+var osSwtpmFDOps = swtpmFDOps{}
+
+// syncSwtpmTree: no inode flags off Linux.
+func syncSwtpmTree(base string, on bool, marker string, ops swtpmFDOps) SwtpmSyncReport {
+	if !on {
+		return SwtpmSyncReport{State: SwtpmSyncOff, Base: base}
+	}
+	return SwtpmSyncReport{State: SwtpmSyncUnsupported, Base: base, Err: errFlagsUnavailable}
 }

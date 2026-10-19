@@ -181,6 +181,11 @@ func (s *Server) setAsideOverlayInUse(ctx context.Context, vm *corrosion.VMRecor
 	if why := s.domainNamesFile(vm.Name, orphan); why != "" {
 		return why
 	}
+	// Every other domain defined here too, a stray one with no VM row
+	// included, as for a detached overlay.
+	if why := s.anyDomainNamesFile(orphan); why != "" {
+		return why
+	}
 	if s.pitOverlayHeldOn(ctx, vm.Name, d.DiskName) {
 		return fmt.Sprintf("disk %s is held on its point-in-time overlay; resolve that first (lv resolve-pit-overlay %s %s)", d.DiskName, vm.Name, d.DiskName)
 	}

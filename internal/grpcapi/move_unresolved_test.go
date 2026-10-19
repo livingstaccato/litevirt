@@ -1345,68 +1345,188 @@ func TestCreateVM_ForgetsAnEarlierVMsMoveRecords(t *testing.T) {
 	}
 }
 
+// moveRecordKept fails unless vm's record is still here and its condition
+// still open.
+func moveRecordKept(t *testing.T, s *Server, vm, what string) {
+	t.Helper()
+	if ms := moveRecords(t, s, vm); len(ms) == 0 {
+		t.Errorf("%s: the record was dropped", what)
+	}
+	if !health.MoveConditionCovers(context.Background(), s.db, vm, "root") {
+		t.Errorf("%s: the condition was resolved", what)
+	}
+}
+
+// moveRecordGone fails unless vm's records here are gone and its condition
+// resolved.
+func moveRecordGone(t *testing.T, s *Server, vm, what string) {
+	t.Helper()
+	if ms := moveRecords(t, s, vm); len(ms) != 0 {
+		t.Errorf("%s: records kept: %+v", what, ms)
+	}
+	if health.MoveConditionCovers(context.Background(), s.db, vm, "root") {
+		t.Errorf("%s: condition left open", what)
+	}
+}
+
+// publishMoveAs records a move of vm's root disk here and opens its
+// condition as reporter.
+func publishMoveAs(t *testing.T, s *Server, vm, reporter string) {
+	t.Helper()
+	if err := health.RecordUnresolvedMove(s.dataDir, health.UnresolvedMove{VM: vm, Disk: "root", Src: "/a/x", Dst: "/b/x", Live: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := health.PublishUnresolvedMoves(context.Background(), s.db, s.dataDir, reporter, vm); err != nil {
+		t.Fatal(err)
+	}
+	if !health.MoveConditionCovers(context.Background(), s.db, vm, "root") {
+		t.Fatal("control: no open condition before the delete")
+	}
+}
+
+// failTombstoneOf makes every tombstone of vm's row fail until the returned
+// func is called.
+func failTombstoneOf(t *testing.T, s *Server, vm string) func() {
+	t.Helper()
+	if err := s.db.Execute(context.Background(), `CREATE TRIGGER fail_vm_tombstone BEFORE UPDATE OF deleted_at ON vms
+		WHEN OLD.name = '`+vm+`' AND NEW.deleted_at IS NOT NULL BEGIN SELECT RAISE(ABORT, 'injected tombstone failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		if err := s.db.Execute(context.Background(), `DROP TRIGGER fail_vm_tombstone`); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// removedHost records host as a cluster member that was removed.
+func removedHost(t *testing.T, s *Server, host string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: host, Address: "10.0.0.9", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Execute(ctx, `UPDATE hosts SET deleted_at = '2026-10-19T00:00:00Z' WHERE name = ?`, host); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := corrosion.HostRemoved(ctx, s.db, host); err != nil || !removed {
+		t.Fatalf("control: %s not removed (%v)", host, err)
+	}
+}
+
 // A deleted VM's unresolved volume-move records and condition go with it,
-// whichever path the delete takes: they describe nothing once it is gone.
+// whichever path the delete takes, and only once its row is tombstoned: a
+// delete that fails before that keeps the row, and with it the record and
+// condition that guard its next start. Each path is driven through DeleteVM.
 //
-// Mutation: drop deleteVM's forgetMoveRecords on the path with a domain here —
-// "domain here" is red; drop it from the path that cleans up a record whose
-// domain is gone everywhere — "no domain anywhere" is red; drop it from
-// deleteVMOnRemovedHost — "recorded on a removed host" is red.
+// Mutations, one at a time:
+//   - drop the forget on the path with a domain here: "domain here" is red;
+//     move it back above the tombstone: its failed delete is red;
+//   - the same for the path that cleans up a record whose domain is gone
+//     everywhere ("no domain anywhere");
+//   - the same for deleteVMOnRemovedHost ("recorded on a removed host"),
+//     including the forget moved above corrosion.DeleteVM.
 func TestDeleteVM_ForgetsTheVMsMoveRecords(t *testing.T) {
-	publish := func(t *testing.T, s *Server, reporter string) {
-		t.Helper()
-		if err := health.RecordUnresolvedMove(s.dataDir, health.UnresolvedMove{VM: "a", Disk: "root", Src: "/a/x", Dst: "/b/x", Live: true}); err != nil {
-			t.Fatal(err)
-		}
-		if err := health.PublishUnresolvedMoves(context.Background(), s.db, s.dataDir, reporter, "a"); err != nil {
-			t.Fatal(err)
-		}
-		if !health.MoveConditionCovers(context.Background(), s.db, "a", "root") {
-			t.Fatal("control: no open condition before the delete")
-		}
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T) *Server
+		raise string // the condition's reporter; "" is this host
+	}{
+		{"domain here", func(t *testing.T) *Server {
+			s, _ := deleteDiskServerWith(t, true)
+			return s
+		}, ""},
+		{"no domain anywhere", func(t *testing.T) *Server {
+			s, _, _ := runningNoDomainServer(t)
+			return s
+		}, ""},
+		{"recorded on a removed host", func(t *testing.T) *Server {
+			s := testServerWithLocks(t)
+			removedHost(t, s, "gone-host")
+			if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{Name: "a", HostName: "gone-host", Spec: "{}", State: "running"}, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			return s
+		}, "gone-host"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := tc.setup(t)
+			reporter := tc.raise
+			if reporter == "" {
+				reporter = s.hostName
+			}
+			publishMoveAs(t, s, "a", reporter)
+			restore := failTombstoneOf(t, s, "a")
+			if _, err := s.DeleteVM(adminCtx(), &pb.DeleteVMRequest{Name: "a"}); err == nil {
+				t.Fatal("the delete succeeded although its tombstone was made to fail")
+			}
+			if vm, _ := corrosion.GetVM(context.Background(), s.db, "a"); vm == nil {
+				t.Fatal("control: the failed delete tombstoned the row")
+			}
+			moveRecordKept(t, s, "a", "a delete that failed at its tombstone")
+			restore()
+			if _, err := s.DeleteVM(adminCtx(), &pb.DeleteVMRequest{Name: "a"}); err != nil {
+				t.Fatalf("DeleteVM: %v", err)
+			}
+			if vm, _ := corrosion.GetVM(context.Background(), s.db, "a"); vm != nil {
+				t.Fatalf("the VM row survived the delete: %+v", vm)
+			}
+			moveRecordGone(t, s, "a", "the delete")
+		})
 	}
-	gone := func(t *testing.T, s *Server) {
-		t.Helper()
-		if vm, _ := corrosion.GetVM(context.Background(), s.db, "a"); vm != nil {
-			t.Fatalf("the VM row survived the delete: %+v", vm)
-		}
-		if ms := moveRecords(t, s, "a"); len(ms) != 0 {
-			t.Fatalf("records kept: %+v", ms)
-		}
-		if health.MoveConditionCovers(context.Background(), s.db, "a", "root") {
-			t.Fatal("condition left open")
-		}
+}
+
+// A delete that tombstoned the VM and stopped before its forget (a crash
+// between the two) leaves the record and condition; a later lv rm of the
+// name, which finds only the tombstone, finishes the forget. A condition
+// another live host raised is left: it may be a newer VM's of the name whose
+// row this replica has not received.
+//
+// Mutations: drop the forget from deleteOfNoLiveRow — "this host raised it"
+// and "a removed host raised it" are red; resolve whichever host raised it —
+// "another live host raised it" is red.
+func TestDeleteVM_OfATombstonedVMFinishesItsForget(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		reporter string // "" is this host
+		removed  bool
+		wantGone bool
+	}{
+		{"this host raised it", "", false, true},
+		{"a removed host raised it", "gone-host", true, true},
+		{"another live host raised it", "node-b", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := testServerWithLocks(t)
+			ctx := context.Background()
+			reporter := tc.reporter
+			if reporter == "" {
+				reporter = s.hostName
+			}
+			if tc.removed {
+				removedHost(t, s, reporter)
+			}
+			if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "a", HostName: s.hostName, Spec: "{}", State: "stopped"}, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			publishMoveAs(t, s, "a", reporter)
+			if err := corrosion.DeleteVM(ctx, s.db, "a"); err != nil { // the tombstone, then the crash
+				t.Fatal(err)
+			}
+			_, err := s.DeleteVM(adminCtx(), &pb.DeleteVMRequest{Name: "a"})
+			if status.Code(err) != codes.NotFound {
+				t.Fatalf("lv rm of a deleted VM: %v, want NotFound", err)
+			}
+			if ms := moveRecords(t, s, "a"); len(ms) != 0 {
+				t.Errorf("records of a deleted VM kept: %+v", ms)
+			}
+			open := health.MoveConditionCovers(ctx, s.db, "a", "root")
+			if tc.wantGone && open {
+				t.Error("the deleted VM's condition is still open")
+			}
+			if !tc.wantGone && !open {
+				t.Error("a condition another live host raised was resolved")
+			}
+		})
 	}
-	t.Run("domain here", func(t *testing.T) {
-		s, _ := deleteDiskServerWith(t, true)
-		publish(t, s, s.hostName)
-		if _, err := s.DeleteVM(adminCtx(), &pb.DeleteVMRequest{Name: "a"}); err != nil {
-			t.Fatalf("DeleteVM: %v", err)
-		}
-		gone(t, s)
-	})
-	t.Run("no domain anywhere", func(t *testing.T) {
-		s, _, _ := runningNoDomainServer(t)
-		publish(t, s, s.hostName)
-		if _, err := s.DeleteVM(adminCtx(), &pb.DeleteVMRequest{Name: "a"}); err != nil {
-			t.Fatalf("DeleteVM: %v", err)
-		}
-		gone(t, s)
-	})
-	t.Run("recorded on a removed host", func(t *testing.T) {
-		s := testServer(t)
-		ctx := context.Background()
-		if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "a", HostName: "gone-host", Spec: "{}", State: "running"}, nil, nil); err != nil {
-			t.Fatal(err)
-		}
-		publish(t, s, "gone-host")
-		rec, err := corrosion.GetVM(ctx, s.db, "a")
-		if err != nil || rec == nil {
-			t.Fatalf("GetVM: %v %v", rec, err)
-		}
-		if _, err := s.deleteVMOnRemovedHost(ctx, rec); err != nil {
-			t.Fatalf("deleteVMOnRemovedHost: %v", err)
-		}
-		gone(t, s)
-	})
 }

@@ -585,6 +585,34 @@ func resolveMoveCondition(ctx context.Context, db *corrosion.Client, row corrosi
 	return corrosion.UpsertHealthCondition(ctx, db, row)
 }
 
+// ForgetMovesOfDeletedVM finishes the forget of a delete that tombstoned vm
+// and stopped before it forgot (a crash between the two), for a VM this
+// replica holds a tombstone and no live row of: it drops vm's records here,
+// and resolves its condition only when this host raised it or that host is
+// removed. A condition another live host raised may be a newer VM's of the
+// name whose row this replica has not received yet, so it is left to that
+// host or to `lv health resolve`. Nothing is done while a live row exists.
+func ForgetMovesOfDeletedVM(ctx context.Context, db *corrosion.Client, dataDir, host, vm string, hostRemoved func(string) bool) error {
+	if db == nil {
+		return nil
+	}
+	if live, err := corrosion.GetVM(ctx, db, vm); err != nil || live != nil {
+		return err
+	}
+	if err := ClearUnresolvedMovesOf(dataDir, vm); err != nil {
+		return err
+	}
+	forgetStartedHere(dataDir, vm)
+	row, ev, open, err := OpenMoveCondition(ctx, db, vm)
+	if err != nil || !open {
+		return err
+	}
+	if ev.Host != host && (hostRemoved == nil || !hostRemoved(ev.Host)) {
+		return nil
+	}
+	return resolveMoveCondition(ctx, db, row, host)
+}
+
 // ForgetUnresolvedMoves drops vm's records on this host and resolves its
 // condition whichever host raised it: the VM is deleted, a new VM takes its
 // name, or an admin resolved it by hand.

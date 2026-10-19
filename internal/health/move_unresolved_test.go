@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,10 +18,18 @@ import (
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
-// moveDomainXML is a stopped domain whose disk vda names path.
+// moveDomainXML is a stopped domain whose disk vda names path, under one
+// uuid for the name: a redefine keeps its identity, as libvirt requires.
 func moveDomainXML(name, path string) string {
-	return `<domain type="kvm"><name>` + name + `</name><devices><disk type="file" device="disk">` +
+	return `<domain type="kvm"><name>` + name + `</name><uuid>` + moveDomainUUID(name) + `</uuid>` +
+		`<devices><disk type="file" device="disk">` +
 		`<source file="` + path + `"/><target dev="vda" bus="virtio"/></disk></devices></domain>`
+}
+
+// moveDomainUUID is the uuid moveDomainXML gives name's domain.
+func moveDomainUUID(name string) string {
+	h := fmt.Sprintf("%012x", crc32.ChecksumIEEE([]byte(name)))
+	return "00000000-0000-4000-8000-" + h[len(h)-12:]
 }
 
 // seedMovedVM inserts VM mv on node-a whose disk row names src, with both

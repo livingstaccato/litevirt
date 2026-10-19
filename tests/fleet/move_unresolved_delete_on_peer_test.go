@@ -17,10 +17,14 @@ import (
 	"github.com/litevirt/litevirt/internal/health"
 )
 
-// TestFleet_MoveUnresolved_DeleteFoundOnAPeerForgetsTheRecord.
+// TestFleet_MoveUnresolved_DeleteFoundOnAPeerForgetsTheRecord. A first
+// delete, whose tombstone of the row on a fails after the peer deleted the
+// domain, keeps a's record and the condition: the row is still live there.
+// The retry finds no domain anywhere and completes the delete.
 //
-// Mutation: drop the forgetMoveRecords on DeleteVM's found-on-a-peer path —
-// a's record and the condition stay, red.
+// Mutations: drop the forgetMoveRecords on DeleteVM's found-on-a-peer path —
+// a's record and the condition stay, red; move it above the row's tombstone —
+// the failed delete drops them, red.
 func TestFleet_MoveUnresolved_DeleteFoundOnAPeerForgetsTheRecord(t *testing.T) {
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 2})
@@ -43,11 +47,33 @@ func TestFleet_MoveUnresolved_DeleteFoundOnAPeerForgetsTheRecord(t *testing.T) {
 		t.Fatal("control: no open condition before the delete")
 	}
 
-	if _, err := c.SelfClient(a).DeleteVM(ctx, &pb.DeleteVMRequest{Name: "pf", KeepDisks: true}); err != nil {
-		t.Fatalf("delete pf from %s: %v", a.Name, err)
+	// The first delete: b deletes the domain, a's tombstone of the row fails.
+	if err := localExec(ctx, a.DB, `CREATE TRIGGER fail_pf_tombstone BEFORE UPDATE OF deleted_at ON vms
+		WHEN OLD.name = 'pf' AND NEW.deleted_at IS NOT NULL BEGIN SELECT RAISE(ABORT, 'injected tombstone failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.SelfClient(a).DeleteVM(ctx, &pb.DeleteVMRequest{Name: "pf", KeepDisks: true}); err == nil {
+		t.Fatal("the delete succeeded although its tombstone on a was made to fail")
 	}
 	if b.Virt.DomainExists("pf") {
 		t.Fatalf("pf's domain is still on %s: the delete did not take the peer path", b.Name)
+	}
+	if vm, _ := corrosion.GetVM(ctx, a.DB, "pf"); vm == nil {
+		t.Fatal("control: the failed delete tombstoned pf's row on a")
+	}
+	if ms, err := health.UnresolvedMovesOf(aData, "pf"); err != nil || len(ms) == 0 {
+		t.Fatalf("the failed delete dropped %s's move record: %+v %v", a.Name, ms, err)
+	}
+	if !health.MoveConditionCovers(ctx, a.DB, "pf", "root") {
+		t.Fatal("the failed delete resolved pf's condition")
+	}
+	if err := localExec(ctx, a.DB, `DROP TRIGGER fail_pf_tombstone`); err != nil {
+		t.Fatal(err)
+	}
+
+	// The retry.
+	if _, err := c.SelfClient(a).DeleteVM(ctx, &pb.DeleteVMRequest{Name: "pf", KeepDisks: true}); err != nil {
+		t.Fatalf("delete pf from %s: %v", a.Name, err)
 	}
 	if vm, _ := corrosion.GetVM(ctx, a.DB, "pf"); vm != nil {
 		t.Fatalf("pf's row survived on %s: %+v", a.Name, vm)

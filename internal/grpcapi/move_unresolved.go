@@ -248,6 +248,19 @@ func (s *Server) resolveUnresolvedMovesFor(ctx context.Context, vmName string, u
 	return health.ResolveUnresolvedMoves(ctx, s.db, s.dataDir, s.hostName, vmName, dom)
 }
 
+// forgetMovesOfDeletedVM finishes the forget of an earlier delete of vm that
+// tombstoned it and stopped before it forgot (health.ForgetMovesOfDeletedVM).
+// The caller holds no live row of vm and a tombstone of it.
+func (s *Server) forgetMovesOfDeletedVM(ctx context.Context, vm string) {
+	removed := func(h string) bool {
+		ok, err := s.workloadHostRemoved(ctx, h)
+		return err == nil && ok
+	}
+	if err := health.ForgetMovesOfDeletedVM(context.WithoutCancel(ctx), s.db, s.dataDir, s.hostName, vm, removed); err != nil {
+		slog.Warn("removing a deleted VM's unresolved volume-move records failed", "vm", vm, "error", err)
+	}
+}
+
 // forgetMoveRecords drops vm's unresolved-move records here and resolves its
 // condition: the name now belongs to a new domain (create, import, restore,
 // promote) or to none (delete, rebuild).

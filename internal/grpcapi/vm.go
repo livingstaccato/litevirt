@@ -3292,9 +3292,14 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 // stored file names a member the caller holds no row of, and a tombstone of
 // an older incarnation says nothing of a newer one a peer may hold), and a
 // tombstone of another incarnation or of another stack's VM.
+//
+// A delete (not a peer-search probe) that finds a tombstone of the name,
+// from a caller who may delete that VM, also finishes a forget of its
+// unresolved-move records that an earlier delete did not reach
+// (forgetMovesOfDeletedVM), whatever it answers.
 func (s *Server) deleteOfNoLiveRow(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error) {
 	notFound := status.Errorf(codes.NotFound, "VM %q not found", req.Name)
-	if req.GetExpectedStack() == "" || req.GetExpectedCreatedAt() == "" || deleteLocalOnly(ctx) {
+	if deleteLocalOnly(ctx) {
 		return nil, notFound
 	}
 	rows, err := s.db.Query(ctx,
@@ -3302,6 +3307,12 @@ func (s *Server) deleteOfNoLiveRow(ctx context.Context, req *pb.DeleteVMRequest)
 		        COALESCE(project, '_default') AS project
 		 FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, req.Name)
 	if err != nil || len(rows) == 0 {
+		return nil, notFound
+	}
+	if s.RequirePerm(ctx, vmRBACPathFor(rows[0].String("project"), req.Name), "vm.delete", "operator") == nil {
+		s.forgetMovesOfDeletedVM(ctx, req.Name)
+	}
+	if req.GetExpectedStack() == "" || req.GetExpectedCreatedAt() == "" {
 		return nil, notFound
 	}
 	row := rows[0]
@@ -3834,8 +3845,6 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			"cannot delete VM %q: its libvirt domain could not be undefined, so its record and disks were kept (retry is safe): %v",
 			req.Name, undefErr)
 	}
-	// The domain is gone: a volume move it left unresolved describes nothing.
-	s.forgetMoveRecords(ctx, req.Name)
 	// The domain is gone: a failure from here records the stop whatever the
 	// row said, so no start path brings back a VM whose disks may be freed
 	// (a pending or starting row included).
@@ -4009,6 +4018,10 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// The row as this delete tombstoned it, for a re-create that follows
 	// (vm_recreate_replaces.go).
 	s.reportDeletedVM(ctx, deleted)
+	// The VM is gone: a volume move it left unresolved describes nothing.
+	// Only now: a delete that fails before its tombstone keeps the row, and
+	// with it the record and condition that guard its next start.
+	s.forgetMoveRecords(ctx, req.Name)
 	s.retireNICGuards(ctx, req.Name)
 	s.resyncDHCPHosts()
 

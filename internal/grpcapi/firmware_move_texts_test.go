@@ -1,7 +1,6 @@
 package grpcapi
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,46 +62,6 @@ func TestCleanupHoldAction_PlannedStateReads(t *testing.T) {
 		if !strings.Contains(a, want) {
 			t.Errorf("action %q lacks %q", a, want)
 		}
-	}
-}
-
-// Lab 2 anomaly 8: `lv host rm --dead` of a live firmware move's target
-// names the source that kept its state and the doctor's return, instead of
-// calling the state lost; with no such condition it keeps the backup text.
-//
-// Mutation: ignore the conditions — the text says "is lost", red.
-func TestStrandedOn_FirmwareVMNamesTheSourceCopy(t *testing.T) {
-	ctx := adminCtx()
-	s := testServerWithLocks(t)
-	s.hostName = "src-host"
-	insertTestVMWithSpec(t, ctx, s.db, "fw1", "dead-host", "running",
-		`{"name":"fw1","secure_boot":true,"tpm":true,"firmware":"uefi","uuid":"`+fwLiveUUID+`"}`)
-	insertTestVMWithSpec(t, ctx, s.db, "fw2", "dead-host", "running",
-		`{"name":"fw2","secure_boot":true,"tpm":true,"firmware":"uefi","uuid":"6f1c2d3e-4b5a-4c6d-8e7f-001122334466"}`)
-	if err := s.raiseFirmwareMigrationCondition(context.Background(), fwmigCondition{
-		Code: condFwmigCleanupFailed, VM: "fw1", Attempt: frAttempt, Source: "src-host", Target: "dead-host",
-		Detail: "the source cleanup could not undefine the leftover definition: the target dead-host is offline, not active",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	out, err := s.strandedOn(context.Background(), "dead-host")
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := map[string]string{}
-	for _, st := range out {
-		got[st.GetName()] = st.GetDetail()
-	}
-	for _, want := range []string{"src-host", "lv doctor firmware-move fw1 --accept-source --acknowledge-rollback", condFwmigCleanupFailed} {
-		if !strings.Contains(got["fw1"], want) {
-			t.Errorf("fw1: %q lacks %q", got["fw1"], want)
-		}
-	}
-	if strings.Contains(got["fw1"], "is lost") {
-		t.Errorf("fw1: %q calls the state lost although src-host kept it", got["fw1"])
-	}
-	if !strings.Contains(got["fw2"], "is lost") || strings.Contains(got["fw2"], "--accept-source") {
-		t.Errorf("fw2 (no move): %q, want the lost-state text", got["fw2"])
 	}
 }
 

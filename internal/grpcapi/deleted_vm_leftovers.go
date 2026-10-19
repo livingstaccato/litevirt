@@ -220,8 +220,8 @@ const LeftoverDomainMD = "x-litevirt-leftover-domain"
 type LeftoverDomain struct {
 	Host string `json:"host"`
 	// Pending: the host had not answered within deletedVMCleanupReportWait;
-	// the request to it carries on after the delete returns, and is not sent
-	// again if it fails.
+	// the request to it carries on after the delete returns, repeated only
+	// while that host's replica has not seen the delete.
 	Pending bool   `json:"pending,omitempty"`
 	Detail  string `json:"detail"`
 }
@@ -237,7 +237,7 @@ var deletedVMCleanupReportWait = 5 * time.Second
 // returns what the delete's caller is told: each host that declined within the
 // wait because a domain of the name is defined there, and each host the VM
 // left that had not answered (its request carries on after the delete
-// returns, once).
+// returns, repeated only while that host's replica lags the delete).
 // Without wait it returns at once. A peer call runs on a context detached
 // from the caller's (the receiving host authorises it as the system), and
 // never fails the delete: the VM is gone, and a host that is unreachable or
@@ -292,8 +292,9 @@ collect:
 
 // deletedVMLeftoverPendingDetail is what `lv rm` says of a host that had not
 // answered within deletedVMCleanupReportWait.
-const deletedVMLeftoverPendingDetail = "it has not answered yet; the delete's one request to remove the VM's leftovers there carries on " +
-	"after the delete returns, but it is not sent again if it fails, so what the VM left on that host may stay there"
+const deletedVMLeftoverPendingDetail = "it has not answered yet; the delete's request to remove the VM's leftovers there carries on " +
+	"after the delete returns. It is repeated only while that host's replica has not yet seen the delete, and is not sent " +
+	"again if it fails for any other reason, so what the VM left on that host may stay there"
 
 // leftoverSink carries a delete's plan out of deleteVM, which holds the
 // VM's lock and start lease, to DeleteVM, which waits for the hosts once

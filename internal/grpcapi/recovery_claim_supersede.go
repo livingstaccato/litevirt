@@ -15,6 +15,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fwmig"
 	"github.com/litevirt/litevirt/internal/health"
 )
 
@@ -286,8 +287,8 @@ func (s *Server) strandedOn(ctx context.Context, host string) ([]*pb.StrandedRec
 		// was host-local and died with the host (failover.recoverWorkloads).
 		if corrosion.VMUsesFirmwareState(*full) {
 			detail := firmwareOnDeadHostDetail(full.Name, host)
-			if src, code := s.firmwareMoveSourceCopy(ctx, full.Name, host); src != "" {
-				detail = firmwareSourceCopyDetail(full.Name, host, src, code)
+			if v := s.firmwareMoveSourceCopy(ctx, full.Name, host); v.kind != fwCopyNone {
+				detail = firmwareSourceCopyDetail(full.Name, host, v)
 			}
 			out = append(out, &pb.StrandedRecovery{Kind: "vm", Name: full.Name, Detail: detail})
 			continue
@@ -339,45 +340,137 @@ func stoppedOnDeadHostDetail(kind, name, host string) string {
 		name, host, host, host, name, name)
 }
 
-// fwmigSourceCopyCodes are the firmware_migration conditions a move's
-// source raises while it keeps its own firmware state of the move.
-var fwmigSourceCopyCodes = []string{condFwmigCleanupFailed, condFwmigTargetUnreachable, condFwmigTargetRan,
-	condFwmigSourcePaused, condFwmigNvramUnconfirmed}
+// fwSourceCopyKind sorts what `lv host rm --dead` can say about a Secure
+// Boot / vTPM VM whose live firmware move had the removed host as target.
+type fwSourceCopyKind int
 
-// firmwareMoveSourceCopy is the host that raised an open firmware_migration
-// condition of vm for a live move whose target is host, while it keeps its
-// own firmware state of the move, and that condition's code; "" when there
-// is none (or the conditions cannot be read).
-func (s *Server) firmwareMoveSourceCopy(ctx context.Context, vm, host string) (source, code string) {
-	for _, c := range fwmigSourceCopyCodes {
-		row, found, err := corrosion.GetHealthCondition(ctx, s.db, firmwareMigrationEvaluator, c, "vm", vm)
-		if err != nil || !found || row.Lifecycle == corrosion.ConditionResolved {
+const (
+	fwCopyNone       fwSourceCopyKind = iota // no open firmware_migration condition: the state was on the host
+	fwCopyUnchecked                          // a surviving copy could not be ruled out or confirmed
+	fwCopyReturnable                         // post-commit, the source kept its state: --accept-source returns it
+	fwCopyNvram                              // nvram_unconfirmed: the guest ran on the target; --accept-source refuses
+	fwCopyPaused                             // source_paused: its exit needs the target to answer
+)
+
+// fwSourceCopy is firmwareMoveSourceCopy's verdict.
+type fwSourceCopy struct {
+	kind         fwSourceCopyKind
+	source, code string
+	why          string // fwCopyUnchecked: what could not be checked
+}
+
+// firmwareMoveSourceCopy reads vm's firmware_migration conditions for a live
+// move whose target is host. A condition counts only while open, raised by
+// the move's source (evidence host == source), naming host as target, and
+// for the attempt the source's own marker still records (read from the
+// source). Anything that cannot be read or does not match is fwCopyUnchecked,
+// never fwCopyNone: only a clean read with no open condition says the state
+// went with the host.
+func (s *Server) firmwareMoveSourceCopy(ctx context.Context, vm, host string) fwSourceCopy {
+	codes := make([]string, 0, len(firmwareMigrationConditionSeverity))
+	for c := range firmwareMigrationConditionSeverity {
+		codes = append(codes, c)
+	}
+	sort.Strings(codes)
+	var other fwSourceCopy
+	for _, code := range codes {
+		row, found, err := corrosion.GetHealthCondition(ctx, s.db, firmwareMigrationEvaluator, code, "vm", vm)
+		if err != nil {
+			return fwSourceCopy{kind: fwCopyUnchecked, why: "its firmware_migration conditions cannot be read: " + err.Error()}
+		}
+		if !found || row.Lifecycle == corrosion.ConditionResolved {
 			continue
 		}
 		var ev struct {
-			Source string `json:"source"`
-			Target string `json:"target"`
-			Host   string `json:"host"`
+			Attempt string `json:"attempt"`
+			Source  string `json:"source"`
+			Target  string `json:"target"`
+			Host    string `json:"host"`
 		}
-		if json.Unmarshal([]byte(row.Evidence), &ev) != nil {
+		if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil {
+			return fwSourceCopy{kind: fwCopyUnchecked, code: code, why: fmt.Sprintf("its open %s cannot be read: %v", code, err)}
+		}
+		if ev.Target != host || ev.Source == "" || ev.Source == host || ev.Host != ev.Source {
+			if other.kind == fwCopyNone {
+				other = fwSourceCopy{kind: fwCopyUnchecked, code: code, why: fmt.Sprintf(
+					"an open %s (raised by %s, source %s, target %s) does not match a move from a live source to %s", code, orNone(ev.Host), orNone(ev.Source), orNone(ev.Target), host)}
+			}
 			continue
 		}
-		if ev.Target == host && ev.Source != "" && ev.Source != host && ev.Host == ev.Source {
-			return ev.Source, c
+		v := s.classifySourceCopy(ctx, vm, code, ev.Source, ev.Attempt)
+		if v.kind != fwCopyUnchecked {
+			return v
+		}
+		if other.kind == fwCopyNone {
+			other = v
 		}
 	}
-	return "", ""
+	return other
 }
 
-// firmwareSourceCopyDetail is firmwareOnDeadHostDetail for a VM whose live
-// firmware move to host left its source's firmware state on source.
-func firmwareSourceCopyDetail(name, host, source, code string) string {
-	return fmt.Sprintf("vm/%s uses Secure Boot / vTPM: failover never recovers it. Its live firmware move from %s to %s "+
-		"is still open (%s on %s), and %s kept its own firmware state of the move: once this removal is done, "+
-		"`lv doctor firmware-move %s --accept-source --acknowledge-rollback` returns the VM to %s, stopped, from that "+
-		"state (it refuses when that state changed since the cutover or the cleanup already undefined its domain); "+
-		"then `lv start %s`. `lv doctor firmware-move %s` shows both hosts' records first",
-		name, source, host, code, source, source, name, source, name, name)
+// classifySourceCopy asks source for vm's marker and sorts code by what the
+// doctor's --accept-source does with that marker (doctorAcceptSource).
+func (s *Server) classifySourceCopy(ctx context.Context, vm, code, source, attempt string) fwSourceCopy {
+	unchecked := func(why string) fwSourceCopy {
+		return fwSourceCopy{kind: fwCopyUnchecked, source: source, code: code, why: why}
+	}
+	rctx, cancel := context.WithTimeout(ctx, fwCleanupAliveReadTimeout)
+	defer cancel()
+	rec, err := s.inspectFirmwareMoveHost(rctx, source, vm)
+	if err != nil {
+		return unchecked(fmt.Sprintf("%s raised %s, and its records cannot be read: %v", source, code, err))
+	}
+	m := markerOf(rec)
+	if m == nil || attempt == "" || m.Attempt != attempt {
+		return unchecked(fmt.Sprintf("%s raised %s for attempt %s, and holds no marker of that attempt", source, code, orNone(attempt)))
+	}
+	v := fwSourceCopy{source: source, code: code}
+	switch {
+	case code == condFwmigCleanupFailed && (m.Phase == fwmig.PhaseCleaning || m.Phase == fwmig.PhaseReleased):
+		v.kind = fwCopyReturnable
+	case code == condFwmigTargetUnreachable && m.Phase == fwmig.PhaseTargetUnreachable && fwPostCommit(fwProgress(*m)),
+		code == condFwmigTargetRan && m.Phase == fwmig.PhaseTargetRan && fwPostCommit(fwProgress(*m)):
+		v.kind = fwCopyReturnable
+	case code == condFwmigNvramUnconfirmed && m.Phase == fwmig.PhaseNvramUnconfirmed:
+		v.kind = fwCopyNvram
+	case code == condFwmigSourcePaused && m.Phase == fwmig.PhaseSourcePaused:
+		v.kind = fwCopyPaused
+	default:
+		return unchecked(fmt.Sprintf("%s raised %s, and its marker is %s", source, code, fwDescribe(*m)))
+	}
+	return v
+}
+
+// firmwareSourceCopyDetail is what `lv host rm --dead` says about a Secure
+// Boot / vTPM VM whose live firmware move to host is still open (v).
+func firmwareSourceCopyDetail(name, host string, v fwSourceCopy) string {
+	head := fmt.Sprintf("vm/%s uses Secure Boot / vTPM: failover never recovers it. ", name)
+	switch v.kind {
+	case fwCopyReturnable:
+		return head + fmt.Sprintf("Its live firmware move from %s to %s is still open (%s on %s), and %s kept its own "+
+			"firmware state of the move: once this removal is done, `lv doctor firmware-move %s --accept-source "+
+			"--acknowledge-rollback` returns the VM to %s, stopped, from that state, and discards %s's copy, which may be "+
+			"newer (the guest ran there after the commit). The doctor refuses when that state changed since the cutover "+
+			"or the cleanup already undefined its domain; then `lv start %s`. To keep %s's copy instead, bring %s back "+
+			"(`lv host add`) before deleting anything: `lv doctor firmware-move %s` then names its exits",
+			v.source, host, v.code, v.source, v.source, name, v.source, host, name, host, host, name)
+	case fwCopyNvram:
+		return head + fmt.Sprintf("Its live firmware move from %s to %s is still open (%s on %s): the guest ran on %s "+
+			"after the move, so its newest firmware state was there, and `lv doctor firmware-move %s --accept-source` "+
+			"is refused for this move. %s keeps its older state of the move. Bring %s back (`lv host add`), then "+
+			"`lv doctor firmware-move %s --confirm-target-nvram`, or `--push-source-nvram` once its guest is powered "+
+			"off. Do not delete the VM while %s may come back",
+			v.source, host, v.code, v.source, host, name, v.source, host, name, host)
+	case fwCopyPaused:
+		return head + fmt.Sprintf("Its live firmware move from %s to %s is still open (%s on %s): the guest is paused "+
+			"on %s with its state, and `lv doctor firmware-move %s --accept-source` needs %s to answer, which a removed "+
+			"host cannot. Bring %s back (`lv host add`), then run it; until then %s keeps the paused guest and its state",
+			v.source, host, v.code, v.source, v.source, name, host, host, v.source)
+	}
+	return head + fmt.Sprintf("Whether another host still holds its firmware state could not be confirmed here (%s), "+
+		"so do not delete it: `lv doctor firmware-move %s` lists every host's records of a live firmware move and the "+
+		"exit each allows, and `lv health` shows the open firmware_migration conditions",
+		v.why, name)
 }
 
 // firmwareOnDeadHostDetail is what `lv host rm --dead` says about a Secure

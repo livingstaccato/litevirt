@@ -45,7 +45,7 @@ func staleVarsLifecycle(t *testing.T, s *Server) string {
 func TestResolveHealthCondition_StaleUEFIVarsAcknowledged(t *testing.T) {
 	s := staleVarsServer(t)
 	ctx := boundCtx(t, s, "alice", "admin", "Admin")
-	req := &pb.ResolveHealthConditionRequest{Code: libvirt.CondNvramFlushFailed, SubjectKind: "host", SubjectId: "h1"}
+	req := &pb.ResolveHealthConditionRequest{Code: libvirt.CondNvramFlushFailed, SubjectKind: "host", SubjectId: "h1", AcceptStaleUefiVars: true}
 
 	if _, err := s.ResolveHealthCondition(ctx, req); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("no reason: err = %v, want InvalidArgument", err)
@@ -58,6 +58,7 @@ func TestResolveHealthCondition_StaleUEFIVarsAcknowledged(t *testing.T) {
 	}
 
 	req.Reason = "disk replaced; guest re-enrolled its keys"
+	req.AcceptStaleUefiVars = true
 	if _, err := s.ResolveHealthCondition(ctx, req); err != nil {
 		t.Fatalf("acknowledge: %v", err)
 	}
@@ -76,11 +77,52 @@ func TestResolveHealthCondition_StaleUEFIVarsNeedsAdmin(t *testing.T) {
 	s := staleVarsServer(t)
 	ctx := boundCtx(t, s, "bob", "operator", "Operator")
 	_, err := s.ResolveHealthCondition(ctx, &pb.ResolveHealthConditionRequest{
-		Code: libvirt.CondNvramFlushFailed, SubjectKind: "host", SubjectId: "h1", Reason: "x"})
+		Code: libvirt.CondNvramFlushFailed, SubjectKind: "host", SubjectId: "h1", Reason: "x", AcceptStaleUefiVars: true})
 	if status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("operator: err = %v, want PermissionDenied", err)
 	}
 	if got := staleVarsLifecycle(t, s); got != corrosion.ConditionConfirmed {
 		t.Fatalf("operator call left the row %q", got)
+	}
+}
+
+// TestResolveHealthCondition_StaleUEFIVarsNeedsExplicitIntent: a request
+// with a reason but without accept_stale_uefi_vars (an older lv, a script
+// resolving open conditions, a direct gRPC call) is refused, naming the flag;
+// the row is untouched and nothing is audited.
+func TestResolveHealthCondition_StaleUEFIVarsNeedsExplicitIntent(t *testing.T) {
+	s := staleVarsServer(t)
+	ctx := boundCtx(t, s, "alice", "admin", "Admin")
+	_, err := s.ResolveHealthCondition(ctx, &pb.ResolveHealthConditionRequest{
+		Code: libvirt.CondNvramFlushFailed, SubjectKind: "host", SubjectId: "h1", Reason: "cleanup script"})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "--accept-stale-uefi-vars") {
+		t.Fatalf("reason without intent: err = %v, want FailedPrecondition naming --accept-stale-uefi-vars", err)
+	}
+	if got := staleVarsLifecycle(t, s); got != corrosion.ConditionConfirmed {
+		t.Fatalf("a refused acknowledgement left the row %q", got)
+	}
+	if len(healthResolveAudits(t, s)) != 0 {
+		t.Fatal("a refused acknowledgement was audited")
+	}
+}
+
+// Evidence that cannot be parsed is said so in the audit.
+func TestResolveHealthCondition_StaleUEFIVarsUnreadableEvidenceIsAudited(t *testing.T) {
+	s := dualRunTestServer(t, 2)
+	if err := corrosion.UpsertHealthCondition(context.Background(), s.db, corrosion.HealthCondition{
+		Evaluator: libvirt.NvramFlushEvaluator, Code: libvirt.CondNvramFlushFailed,
+		SubjectKind: "host", SubjectID: "h1", Lifecycle: corrosion.ConditionConfirmed,
+		Severity: corrosion.SeverityCritical, Reporter: "h1", LastSeen: backdated, Evidence: "not json",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := boundCtx(t, s, "alice", "admin", "Admin")
+	if _, err := s.ResolveHealthCondition(ctx, &pb.ResolveHealthConditionRequest{
+		Code: libvirt.CondNvramFlushFailed, SubjectKind: "host", SubjectId: "h1", Reason: "r", AcceptStaleUefiVars: true}); err != nil {
+		t.Fatal(err)
+	}
+	audits := healthResolveAudits(t, s)
+	if len(audits) != 1 || !strings.Contains(audits[0][1], "evidence unreadable") {
+		t.Fatalf("audit = %v; want it to say the evidence was unreadable", audits)
 	}
 }

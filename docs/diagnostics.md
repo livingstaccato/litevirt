@@ -2135,12 +2135,16 @@ again. The ways out:
   and the condition with it.
 - A VM kept as it is: an admin accepts that its vars store may be stale with
   `lv health resolve nvram_flush_failed host/<host> --accept-stale-uefi-vars
-  --reason <why>`. It is audited, naming every file, and the host's daemon then
-  stops reporting those files. A new failed flush raises it again.
+  --reason <why>`, which prints the files accepted. It is audited, naming every
+  file the condition named, and the host's daemon then stops reporting exactly
+  those files; any other failed file is raised again, and so is a new failure.
+  A request without `--accept-stale-uefi-vars` (an older `lv`, or a script that
+  sends only a reason) is refused.
 
-`lv backup restore-from` restores a disk, not firmware state. `lv backup
-restore-live` restores firmware state only into a new VM (`--name`); the old
-VM still needs `lv rm` to clear this.
+`lv backup restore-from` restores a disk, not firmware state, and is not a way
+out. Nor is `lv backup restore-live` for this VM: it restores firmware state
+only for a Secure Boot or vTPM VM, only with `--auto-start`, and only into a
+new VM (`--name`), and the old VM still needs `lv rm`.
 
 ### UEFI vars file not flushed (`nvram_flush_blocked`)
 

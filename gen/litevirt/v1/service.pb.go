@@ -2019,14 +2019,18 @@ func (x *HealthCondition) GetReporter() string {
 // `lv health` prints it: code and subject. evaluator is needed only when two
 // evaluators hold an open condition under the same code and subject.
 type ResolveHealthConditionRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Code          string                 `protobuf:"bytes,1,opt,name=code,proto3" json:"code,omitempty"`
-	SubjectKind   string                 `protobuf:"bytes,2,opt,name=subject_kind,json=subjectKind,proto3" json:"subject_kind,omitempty"`
-	SubjectId     string                 `protobuf:"bytes,3,opt,name=subject_id,json=subjectId,proto3" json:"subject_id,omitempty"`
-	Evaluator     string                 `protobuf:"bytes,4,opt,name=evaluator,proto3" json:"evaluator,omitempty"`
-	Reason        string                 `protobuf:"bytes,5,opt,name=reason,proto3" json:"reason,omitempty"` // the operator's note, recorded in the audit row
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Code        string                 `protobuf:"bytes,1,opt,name=code,proto3" json:"code,omitempty"`
+	SubjectKind string                 `protobuf:"bytes,2,opt,name=subject_kind,json=subjectKind,proto3" json:"subject_kind,omitempty"`
+	SubjectId   string                 `protobuf:"bytes,3,opt,name=subject_id,json=subjectId,proto3" json:"subject_id,omitempty"`
+	Evaluator   string                 `protobuf:"bytes,4,opt,name=evaluator,proto3" json:"evaluator,omitempty"`
+	Reason      string                 `protobuf:"bytes,5,opt,name=reason,proto3" json:"reason,omitempty"` // the operator's note, recorded in the audit row
+	// accept_stale_uefi_vars is the admin's explicit acceptance, for
+	// nvram_flush_failed, that the UEFI vars stores the condition names may
+	// be stale (`--accept-stale-uefi-vars`). That code is refused without it.
+	AcceptStaleUefiVars bool `protobuf:"varint,6,opt,name=accept_stale_uefi_vars,json=acceptStaleUefiVars,proto3" json:"accept_stale_uefi_vars,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *ResolveHealthConditionRequest) Reset() {
@@ -2092,6 +2096,13 @@ func (x *ResolveHealthConditionRequest) GetReason() string {
 		return x.Reason
 	}
 	return ""
+}
+
+func (x *ResolveHealthConditionRequest) GetAcceptStaleUefiVars() bool {
+	if x != nil {
+		return x.AcceptStaleUefiVars
+	}
+	return false
 }
 
 type ResolveHealthConditionResponse struct {
@@ -43501,14 +43512,15 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\fconfirmed_at\x18\r \x01(\tR\vconfirmedAt\x12\x1f\n" +
 	"\vresolved_at\x18\x0e \x01(\tR\n" +
 	"resolvedAt\x12\x1a\n" +
-	"\breporter\x18\x0f \x01(\tR\breporter\"\xab\x01\n" +
+	"\breporter\x18\x0f \x01(\tR\breporter\"\xe0\x01\n" +
 	"\x1dResolveHealthConditionRequest\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\tR\x04code\x12!\n" +
 	"\fsubject_kind\x18\x02 \x01(\tR\vsubjectKind\x12\x1d\n" +
 	"\n" +
 	"subject_id\x18\x03 \x01(\tR\tsubjectId\x12\x1c\n" +
 	"\tevaluator\x18\x04 \x01(\tR\tevaluator\x12\x16\n" +
-	"\x06reason\x18\x05 \x01(\tR\x06reason\"\\\n" +
+	"\x06reason\x18\x05 \x01(\tR\x06reason\x123\n" +
+	"\x16accept_stale_uefi_vars\x18\x06 \x01(\bR\x13acceptStaleUefiVars\"\\\n" +
 	"\x1eResolveHealthConditionResponse\x12:\n" +
 	"\tcondition\x18\x01 \x01(\v2\x1c.litevirt.v1.HealthConditionR\tcondition\"\xa2\x01\n" +
 	"\x15HealthEvaluatorStatus\x12\x1c\n" +

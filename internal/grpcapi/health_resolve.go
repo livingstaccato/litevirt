@@ -16,8 +16,9 @@ import (
 	"github.com/litevirt/litevirt/internal/notify"
 )
 
-// ResolveHealthCondition marks one open dual-run condition resolved on an
-// admin's word (`lv health resolve`).
+// ResolveHealthCondition marks one open condition resolved on an admin's
+// word (`lv health resolve`): a dual-run condition, or nvram_flush_failed
+// (acknowledgeStaleUEFIVars).
 //
 // The detector resolves its own conditions only on proof: two complete clean
 // scans under a valid gate. A condition that proof can never reach — one its
@@ -32,12 +33,14 @@ import (
 // admission while the detector still sees the condition, or onto a host it
 // cannot see at all, where nothing would raise it again.
 //
-// It is limited to the dual-run detector's conditions, and one other:
-// nvram_flush_failed, acknowledged (acknowledgeStaleUEFIVars). Those are the only ones
-// that gate admission, and the detector re-derives every finding from scratch
-// each pass, so a condition that still holds is raised again — observed, and
-// gating admission again — on its next pass. Other evaluators write on their
-// own transitions and could leave a still-true condition resolved.
+// Dual-run conditions are the ones that gate admission, and the detector
+// re-derives every finding from scratch each pass, so one that still holds is
+// raised again, observed and gating admission again, on its next pass. Other
+// evaluators write on their own transitions and could leave a still-true
+// condition resolved, so they are refused, with one exception:
+// nvram_flush_failed, which nothing can clear for a VM kept as it is, is
+// resolved as an explicit acknowledgement that its vars stores may be stale
+// (accept_stale_uefi_vars and a reason; acknowledgeStaleUEFIVars).
 //
 // Admin only (cluster.health.resolve), and never a peer: a peer certificate
 // authorizes as admin, and a node must not be able to clear evidence that
@@ -181,10 +184,19 @@ func (s *Server) dualRunScanCleared(ctx context.Context, row corrosion.HealthCon
 // acknowledgement that the vars stores it names may be stale. A failed fsync
 // of a vars file cannot be undone: no later fsync puts the lost pages back,
 // and a plain UEFI VM has no restore that replaces its vars file. This is the
-// way out for a VM kept as it is; it proves nothing, so it needs a reason, and
-// it is audited naming every file. The host's daemon then drops those
-// failures; a later failure raises the condition again.
+// way out for a VM kept as it is; it proves nothing, so it needs the
+// request's explicit accept_stale_uefi_vars (an older lv, or a script that
+// sends only a reason, is refused) and a reason, and it is audited naming
+// every file the row names. The host's daemon then drops exactly those
+// failures; any other is raised again.
 func (s *Server) acknowledgeStaleUEFIVars(ctx context.Context, row corrosion.HealthCondition, req *pb.ResolveHealthConditionRequest) (*pb.ResolveHealthConditionResponse, error) {
+	if !req.GetAcceptStaleUefiVars() {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"resolving %s on %s/%s accepts that the UEFI vars stores it names may be stale: "+
+				"say so with --accept-stale-uefi-vars (lv health resolve %s %s/%s --accept-stale-uefi-vars --reason <why>); "+
+				"a client without that flag cannot do it",
+			row.Code, row.SubjectKind, row.SubjectID, row.Code, row.SubjectKind, row.SubjectID)
+	}
 	reason := strings.TrimSpace(req.GetReason())
 	if reason == "" {
 		return nil, status.Errorf(codes.InvalidArgument,
@@ -197,8 +209,10 @@ func (s *Server) acknowledgeStaleUEFIVars(ctx context.Context, row corrosion.Hea
 			VM   string `json:"vm"`
 		} `json:"files"`
 	}
-	_ = json.Unmarshal([]byte(row.Evidence), &ev)
-	files := make([]string, 0, len(ev.Files))
+	files := make([]string, 0)
+	if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil {
+		files = append(files, "evidence unreadable ("+err.Error()+"): the files are not known")
+	}
 	for _, f := range ev.Files {
 		files = append(files, f.Path+" (vm "+f.VM+")")
 	}

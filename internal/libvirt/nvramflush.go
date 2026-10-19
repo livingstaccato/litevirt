@@ -99,6 +99,7 @@ type NvramFlusher struct {
 	failed   map[string]NvramFlushFailure
 	openFail map[string]nvramOpenFail // episodes, by file path or dirReadKey/dirFsyncKey
 	stall    *NvramFlushFailure       // the sweep stuck in an fsync, if one is
+	sweepGen uint64                   // changes at each watched sweep's start and end (beginSweep, endSweep)
 
 	done chan struct{}
 }
@@ -145,20 +146,13 @@ func (f *NvramFlusher) Run(ctx context.Context, interval time.Duration) {
 // watchedSweep is Sweep, reported if it takes longer than stallAfter.
 func (f *NvramFlusher) watchedSweep() {
 	start := time.Now()
+	gen := f.beginSweep()
 	timer := time.AfterFunc(f.stallAfter, func() {
 		p, _ := f.current.Load().(string)
-		elapsed := time.Since(start)
-		f.mu.Lock()
-		f.stall = &NvramFlushFailure{Path: p, VM: nvramVMName(p),
-			Error: fmt.Sprintf("fsync has not returned for %s; no vars file on this host is flushed until it does", elapsed.Round(time.Second)),
-			At:    time.Now().UTC().Format(time.RFC3339)}
-		f.mu.Unlock()
-		f.onStall(p, elapsed)
+		f.markStalled(gen, p, time.Since(start))
 	})
 	f.Sweep()
-	f.mu.Lock()
-	f.stall = nil
-	f.mu.Unlock()
+	f.endSweep()
 	if !timer.Stop() {
 		slog.Info("UEFI vars flush finished after a stall", "elapsed", time.Since(start))
 	}
@@ -247,6 +241,9 @@ func (f *NvramFlusher) Sweep() {
 			}
 		}
 		if !changed {
+			// Nothing pending: a directory-fsync episode for a change since
+			// undone is over.
+			f.episodeRecovered(dirFsyncKey(dir), "UEFI vars directory needs no fsync any more")
 			continue
 		}
 		f.current.Store(dir)
@@ -508,4 +505,36 @@ func (f *NvramFlusher) Acknowledge(failures []NvramFlushFailure) {
 				"path", v.Path, "vm", v.VM)
 		}
 	}
+}
+
+// beginSweep starts a watched sweep and returns its generation.
+func (f *NvramFlusher) beginSweep() uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sweepGen++
+	return f.sweepGen
+}
+
+// endSweep ends the watched sweep: its stall, if any, is over, and a stall
+// timer that fires from now on belongs to a finished sweep.
+func (f *NvramFlusher) endSweep() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sweepGen++
+	f.stall = nil
+}
+
+// markStalled records that sweep gen is stuck in an fsync of p, unless that
+// sweep has already returned.
+func (f *NvramFlusher) markStalled(gen uint64, p string, elapsed time.Duration) {
+	f.mu.Lock()
+	if gen != f.sweepGen {
+		f.mu.Unlock()
+		return
+	}
+	f.stall = &NvramFlushFailure{Path: p, VM: nvramVMName(p),
+		Error: fmt.Sprintf("fsync has not returned for %s; no vars file on this host is flushed until it does", elapsed.Round(time.Second)),
+		At:    time.Now().UTC().Format(time.RFC3339)}
+	f.mu.Unlock()
+	f.onStall(p, elapsed)
 }

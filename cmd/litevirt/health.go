@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -77,7 +78,7 @@ func newHealthResolveCmd() *cobra.Command {
 	var acceptStaleVars bool
 	cmd := &cobra.Command{
 		Use:   "resolve <code> <kind/subject>",
-		Short: "Resolve an open dual-run health condition by hand (admin, audited)",
+		Short: "Resolve an open dual-run condition, or acknowledge nvram_flush_failed, by hand (admin, audited)",
 		Long: `Mark one open condition resolved, named as 'lv health' prints it:
 its CODE and its SUBJECT (kind/id), for example
 
@@ -122,14 +123,28 @@ ha.condition.resolved event.`,
 				resp, err := c.ResolveHealthCondition(ctx, &pb.ResolveHealthConditionRequest{
 					Code: args[0], SubjectKind: kind, SubjectId: id,
 					Evaluator: evaluator, Reason: reason,
+					AcceptStaleUefiVars: acceptStaleVars,
 				})
 				if err != nil {
 					return fmt.Errorf("resolve %s on %s: %w", args[0], args[1], err)
 				}
 				h := resp.GetCondition()
 				if args[0] == "nvram_flush_failed" {
-					fmt.Printf("%s on %s/%s: %s. The vars stores it named are accepted as possibly stale; a new failed flush raises it again.\n",
+					fmt.Printf("%s on %s/%s: %s. These UEFI vars stores are accepted as possibly stale:\n",
 						h.GetCode(), h.GetSubjectKind(), h.GetSubjectId(), h.GetLifecycle())
+					var ev struct {
+						Files []struct {
+							Path string `json:"path"`
+							VM   string `json:"vm"`
+						} `json:"files"`
+					}
+					if err := json.Unmarshal([]byte(h.GetEvidence()), &ev); err != nil || len(ev.Files) == 0 {
+						fmt.Println("  (the condition named no readable file list)")
+					}
+					for _, f := range ev.Files {
+						fmt.Printf("  %s (vm %s)\n", f.Path, f.VM)
+					}
+					fmt.Println("Any other file of that host whose flush failed is raised again; so is a new failure.")
 					return nil
 				}
 				fmt.Printf("%s on %s/%s (%s): %s. If it still holds, the detector raises it again on its next pass.\n",

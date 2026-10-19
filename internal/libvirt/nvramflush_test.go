@@ -793,3 +793,46 @@ func TestNvramFlusher_StalledSweepIsBlocked(t *testing.T) {
 		t.Fatalf("still blocked after the sweep returned: %+v", got)
 	}
 }
+
+// A directory-fsync episode ends when nothing is pending any more: the
+// listing went back to the one last fsynced (a file added, then removed).
+func TestNvramFlusher_DirectoryFsyncEpisodeEndsWhenTheChangeIsUndone(t *testing.T) {
+	dir := t.TempDir()
+	f, _, now := recordingFlusher(t, dir)
+	a := filepath.Join(dir, "a_VARS.fd")
+	writeAt(t, a, "a", now.Add(-time.Hour))
+	f.Sweep() // fsyncs the listing [a]
+	failing := true
+	f.sync = func(p string, want os.FileInfo) error {
+		if want == nil && failing {
+			return syscall.EIO
+		}
+		return nil
+	}
+	b := filepath.Join(dir, "b_VARS.fd")
+	writeAt(t, b, "b", now.Add(-time.Hour))
+	f.Sweep()
+	*now = now.Add(nvramBlockedAfter + time.Second)
+	f.Sweep()
+	if len(f.Blocked()) != 1 {
+		t.Fatalf("setup: blocked = %+v", f.Blocked())
+	}
+	if err := os.Remove(b); err != nil {
+		t.Fatal(err)
+	}
+	f.Sweep()
+	if got := f.Blocked(); len(got) != 0 {
+		t.Fatalf("the directory-fsync episode outlived the change: %+v", got)
+	}
+}
+
+// A stall timer that fires after its sweep returned marks nothing.
+func TestNvramFlusher_LateStallTimerMarksNothing(t *testing.T) {
+	f := NewNvramFlusher(t.TempDir())
+	gen := f.beginSweep()
+	f.endSweep()
+	f.markStalled(gen, "/x/vm1_VARS.fd", time.Minute)
+	if got := f.Blocked(); len(got) != 0 {
+		t.Fatalf("a late stall timer left %+v", got)
+	}
+}

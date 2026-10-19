@@ -122,7 +122,16 @@ func (d *Daemon) nvramFlushTick(ctx context.Context, f *libvirt.NvramFlusher, st
 	if len(st.openFiles) > 0 {
 		row, found, err := readNvramFlushCondition(ctx, d.db, nvramFlushEvaluator, CondNvramFlushFailed, "host", d.cfg.HostName)
 		if err == nil && found && row.Lifecycle == corrosion.ConditionResolved {
-			f.Acknowledge(st.openFiles)
+			// An admin resolved it: drop only what the resolved row named
+			// (and the audit recorded), matched on path and inode. The rest
+			// is raised again below; so is everything if the row cannot be
+			// read.
+			var ev nvramFlushEvidence
+			if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil {
+				slog.Error("nvram_flush_failed was resolved but its evidence cannot be read; nothing is acknowledged and it is raised again", "error", err)
+			} else {
+				f.Acknowledge(acknowledgedFiles(st.openFiles, ev.Files))
+			}
 			st.openFiles, st.lastFailed = nil, ""
 		}
 	}
@@ -194,4 +203,19 @@ func stopAndWait(cancel func(), done <-chan struct{}, bound time.Duration) {
 	case <-time.After(bound):
 		slog.Warn("UEFI vars flusher's last sweep did not finish in time; exiting without it", "waited", bound)
 	}
+}
+
+// acknowledgedFiles is the failures this host wrote that the resolved row
+// also names, matched on path and inode.
+func acknowledgedFiles(wrote, named []libvirt.NvramFlushFailure) []libvirt.NvramFlushFailure {
+	var out []libvirt.NvramFlushFailure
+	for _, w := range wrote {
+		for _, n := range named {
+			if w.Path == n.Path && w.Ino == n.Ino {
+				out = append(out, w)
+				break
+			}
+		}
+	}
+	return out
 }

@@ -316,3 +316,51 @@ func TestNvramFlushTick_TakesAnOperatorAcknowledgement(t *testing.T) {
 		t.Fatalf("a new failure after an acknowledgement: open=%v evidence %s; want web-2 alone", open, row.Evidence)
 	}
 }
+
+// The daemon drops only what the resolved row named. A resolve made on a
+// node whose replica lagged the host names fewer files than the host wrote;
+// the others are raised again, never acknowledged unseen.
+func TestNvramFlushTick_AcknowledgesOnlyWhatTheResolvedRowNamed(t *testing.T) {
+	ctx := context.Background()
+	d, db := nvramTestDaemon(t)
+	dir := t.TempDir()
+	a, b := failedVars(t, dir, "web-1"), failedVars(t, dir, "web-2")
+	f := libvirt.NewNvramFlusher(dir)
+	f.Seed([]libvirt.NvramFlushFailure{a, b})
+	var st nvramConditionState
+	d.nvramFlushTick(ctx, f, &st)
+
+	row, open := nvramCondition(t, db, CondNvramFlushFailed)
+	if !open {
+		t.Fatal("setup: condition not raised")
+	}
+	// The lagging replica's row: open with [A] only, resolved there.
+	ev, _ := json.Marshal(nvramFlushEvidence{Files: []libvirt.NvramFlushFailure{a}})
+	row.Evidence = string(ev)
+	row.Lifecycle, row.ResolvedAt = corrosion.ConditionResolved, time.Now().UTC().Format(time.RFC3339)
+	if err := corrosion.UpsertHealthCondition(ctx, db, row); err != nil {
+		t.Fatal(err)
+	}
+	d.nvramFlushTick(ctx, f, &st)
+	if got := f.Failures(); len(got) != 1 || got[0].Path != b.Path {
+		t.Fatalf("after a resolve naming A, the flusher holds %+v; want B alone", got)
+	}
+	row, open = nvramCondition(t, db, CondNvramFlushFailed)
+	if !open || !strings.Contains(row.Evidence, "web-2_VARS.fd") || strings.Contains(row.Evidence, "web-1_VARS.fd") {
+		t.Fatalf("B not raised again alone: open=%v %s", open, row.Evidence)
+	}
+
+	// A resolved row whose evidence cannot be read acknowledges nothing.
+	row.Evidence = "not json"
+	row.Lifecycle, row.ResolvedAt = corrosion.ConditionResolved, time.Now().UTC().Format(time.RFC3339)
+	if err := corrosion.UpsertHealthCondition(ctx, db, row); err != nil {
+		t.Fatal(err)
+	}
+	d.nvramFlushTick(ctx, f, &st)
+	if got := f.Failures(); len(got) != 1 {
+		t.Fatalf("an unreadable resolved row acknowledged %+v", got)
+	}
+	if _, open := nvramCondition(t, db, CondNvramFlushFailed); !open {
+		t.Fatal("an unreadable resolved row was not raised again")
+	}
+}

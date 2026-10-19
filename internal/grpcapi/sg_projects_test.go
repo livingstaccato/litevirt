@@ -502,3 +502,18 @@ func TestSGProjects_AProjectGroupDoesNotAdoptNameKeyedRules(t *testing.T) {
 		t.Fatal("deleting acme's group removed a rule it never owned")
 	}
 }
+
+// A malformed project is refused before any authorization, for root and for
+// a project-scoped caller alike. The CLI relies on it to tell a daemon that
+// implements project groups from one that drops the field: only this answer
+// proves the field was read.
+func TestSGProjects_ListRefusesAMalformedProjectFirst(t *testing.T) {
+	f := newSGProjectsFixture(t)
+	for who, c := range map[string]context.Context{"root": f.root, "alice": f.alice} {
+		_, err := f.s.ListSecurityGroups(c, &pb.ListSecurityGroupsRequest{Project: ".."})
+		wantSGCode(t, who+" lists project ..", err, codes.InvalidArgument)
+		if !strings.Contains(err.Error(), "invalid project") {
+			t.Errorf("%s: %v, want the invalid project refusal", who, err)
+		}
+	}
+}

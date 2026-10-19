@@ -7,12 +7,12 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -94,11 +94,7 @@ func newSGCreateCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				if project != "" {
-					// A token scoped below the root cannot read the upgrade
-					// status. The create is then sent: a previous daemon checks
-					// sg.write at the root, which such a token cannot pass, and
-					// the project check below catches any other answer.
-					if err := requireSGProjects(ctx, c, "create"); err != nil && !errors.As(err, new(errSGProjectsDenied)) {
+					if err := requireSGProjects(ctx, c, "create"); err != nil {
 						return err
 					}
 				}
@@ -121,41 +117,38 @@ func newSGCreateCmd() *cobra.Command {
 }
 
 // errSGProjectsUnsupported is the refusal of --project against a daemon that
-// predates project security groups.
+// does not implement project security groups.
 type errSGProjectsUnsupported struct{ sub, why string }
 
 func (e errSGProjectsUnsupported) Error() string {
 	return fmt.Sprintf("lv sg %s --project: the daemon predates project security groups (%s); upgrade litevirtd on the host you are connected to", e.sub, e.why)
 }
 
-// errSGProjectsDenied is the daemon refusing the caller its upgrade status
-// (it needs the cluster root), so whether it knows project groups is not known.
-type errSGProjectsDenied struct{ err error }
+// sgProjectsProbe is a malformed project name. A daemon that implements
+// project security groups validates ListSecurityGroups' project before any
+// authorization and answers it InvalidArgument; one that does not knows no
+// such field and answers as for any listing (every group, or its refusal of
+// the caller). A declared release feature proves nothing: a build can declare
+// sg_projects before it implements it.
+const sgProjectsProbe = ".."
 
-func (e errSGProjectsDenied) Error() string { return e.err.Error() }
-
-// requireSGProjects refuses --project against a daemon that predates project
-// security groups. Such a daemon drops the field it does not know: a create
-// would make a GLOBAL group every project may bind, and a listing would not be
-// filtered. The daemon's own release-feature list says whether it knows them.
-// A failure to ask is returned as it is.
+// requireSGProjects refuses --project against a daemon that does not
+// implement project security groups, before anything is created or listed.
+// Such a daemon drops the field it does not read: a create would make a
+// GLOBAL group every project may bind, and a listing would not be filtered.
+// The probe needs no more than any listing does, so a token scoped to a
+// project can make it. A daemon that cannot be reached is returned as it is.
 func requireSGProjects(ctx context.Context, c pb.LiteVirtClient, sub string) error {
-	st, err := c.GetUpgradeStatus(ctx, &emptypb.Empty{})
-	if err != nil {
-		if status.Code(err) == codes.Unimplemented {
-			return errSGProjectsUnsupported{sub, "it has no upgrade status"}
-		}
-		if status.Code(err) == codes.PermissionDenied {
-			return errSGProjectsDenied{err}
-		}
+	_, err := c.ListSecurityGroups(ctx, &pb.ListSecurityGroupsRequest{Project: sgProjectsProbe})
+	switch {
+	case status.Code(err) == codes.InvalidArgument && strings.Contains(status.Convert(err).Message(), "invalid project"):
+		return nil
+	case err == nil:
+		return errSGProjectsUnsupported{sub, "it ignored the project of a listing"}
+	case status.Code(err) == codes.Unavailable || status.Code(err) == codes.Unauthenticated:
 		return fmt.Errorf("lv sg %s --project: could not ask the daemon whether it supports project security groups: %w", sub, err)
 	}
-	for _, f := range st.GetFeatures() {
-		if f.GetName() == string(corrosion.FeatureSGProjects) && f.GetDeclared() {
-			return nil
-		}
-	}
-	return errSGProjectsUnsupported{sub, "it does not declare the " + string(corrosion.FeatureSGProjects) + " feature"}
+	return errSGProjectsUnsupported{sub, "it did not read the project of a listing: " + status.Convert(err).Message()}
 }
 
 // sgRPCError explains an Unimplemented reply. A daemon older than the

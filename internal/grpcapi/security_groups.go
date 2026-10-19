@@ -380,6 +380,14 @@ func (s *Server) ListSecurityGroups(ctx context.Context, req *pb.ListSecurityGro
 		return nil, err
 	}
 	project := req.GetProject()
+	// Validated before any authorization, for every caller: the CLI probes
+	// with a malformed project, and only a build that reads the field gives
+	// this answer (cmd/litevirt sgProjectsProbe).
+	if project != "" {
+		if _, err := safename.CanonicalProjectName(project); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid project %q: %v", project, err)
+		}
+	}
 	root := s.RequirePerm(ctx, "/", sgReadVerb, "viewer") == nil
 	if project != "" && !root {
 		if err := s.RequirePerm(ctx, projectRBACBase(project)+"/security_groups", sgReadVerb, "viewer"); err != nil {

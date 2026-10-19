@@ -91,11 +91,13 @@ lv sg create <name> --project <P>   # owned by P; omit for a global group
 lv sg ls --project <P>              # P's groups and the global groups
 ```
 
-`lv sg ls` prints a PROJECT column (empty = global). Against a daemon that
-does not declare the `sg_projects` feature (`GetUpgradeStatus`), `--project` is
-refused rather than creating a global group or listing unfiltered. A token
-scoped below the root cannot read the upgrade status; its create is sent, a
-previous daemon refuses it (it checks `sg.write` at `/`), and the CLI checks
-the created group's project. The web UI
+`lv sg ls` prints a PROJECT column (empty = global). Before `--project` is
+used, the CLI probes the daemon with a listing of a malformed project: a build
+that implements project groups validates that field before any authorization
+and answers InvalidArgument; one that does not (including a build whose
+release catalog only declares `sg_projects`) ignores the field, so the CLI
+refuses rather than create a global group or list unfiltered. The probe needs
+no more than a listing, so a token scoped to a project can make it. The CLI
+also checks the created group's project. The web UI
 takes a project on its create form and `?project=` on `/security-groups`, and
 the Add-NIC dialog lists the VM's project's groups and the global ones.

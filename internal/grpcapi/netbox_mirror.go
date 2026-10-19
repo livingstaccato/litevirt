@@ -66,6 +66,12 @@ func (s *Server) netboxMirror(interval time.Duration) *netboxsync.Reconciler {
 		// The intra-node half of the exclusion the leader lease only covers
 		// across nodes. See netboxExclusivePass.
 		Exclusive: s.netboxExclusivePass,
+		// A removal withheld because the token may not change an address on
+		// it is a finding, not only a log line: it repeats on every pass until
+		// an operator fixes the token's permissions.
+		BlockedRemovals: func(ctx context.Context, blocked map[string]string) {
+			s.applyNetBoxConditions(ctx, condNetBoxAddressNotChangeable, "netbox_address", blocked)
+		},
 	})
 }
 

@@ -3792,6 +3792,18 @@ func (d *Daemon) wireCorrosionGates() {
 	d.wireVoterConfigGate()
 	d.wireRecoveryClaimGate()
 	d.wireSpecConflictGate()
+	d.wireNetBoxRepointGate()
+}
+
+// wireNetBoxRepointGate lets corrosion re-point a lease at a re-created NetBox
+// address only once netbox_ip_repoint_v1 has DURABLY latched: the re-point is a
+// shape a previous-release peer has no ledger entry for. Mandatory, no config
+// flag; unwired, the gate fails closed and the mirror skips a dead address and
+// reports the pass unconverged, as the previous release did.
+func (d *Daemon) wireNetBoxRepointGate() {
+	d.db.SetNetBoxRepointGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.NetBoxIPRepointV1)
+	})
 }
 
 // wireSpecConflictGate tells corrosion when spec_conflict_v1 has DURABLY

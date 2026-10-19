@@ -404,3 +404,22 @@ func TestReleaseFeatureSetIsFrozen(t *testing.T) {
 		}
 	}
 }
+
+// TestNetBoxIPRepointV1Registered pins netbox_ip_repoint_v1: advertised,
+// known, mandatory (a fact about the binary — it decodes the lease re-point
+// statement) and replication-gated (that statement is a shape a
+// previous-release recipient has no ledger entry for).
+func TestNetBoxIPRepointV1Registered(t *testing.T) {
+	if NetBoxIPRepointV1 != "netbox_ip_repoint_v1" {
+		t.Fatalf("NetBoxIPRepointV1 = %q", NetBoxIPRepointV1)
+	}
+	if !slices.Contains(Supported(), NetBoxIPRepointV1) || !slices.Contains(All(), NetBoxIPRepointV1) {
+		t.Fatal("netbox_ip_repoint_v1 must be advertised and known")
+	}
+	if !Mandatory(NetBoxIPRepointV1) {
+		t.Fatal("netbox_ip_repoint_v1 must be mandatory: it states what this build decodes")
+	}
+	if !ReplicationGated(NetBoxIPRepointV1) {
+		t.Fatal("netbox_ip_repoint_v1 must be replication-gated: every recipient must decode the re-point")
+	}
+}

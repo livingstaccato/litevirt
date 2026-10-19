@@ -15,6 +15,7 @@ package fleet
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestMirrorSetsPrimaryIPv4 is the regression: an address the mirror assigned
@@ -103,5 +104,34 @@ func TestFakeRefusesAForeignPrimaryIP(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not assigned to this VM") {
 		t.Fatalf("want NetBox's own refusal, got %v", err)
+	}
+}
+
+// TestFakeRefusesAPrimaryOfTheWrongFamily proves the HARNESS enforces NetBox's
+// family rule: primary_ip4 takes only an IPv4 address and primary_ip6 only an
+// IPv6 one. Without it a mirror sending an IPv6 address as primary_ip4 — which
+// NetBox refuses on every sweep — would pass every fleet scenario.
+func TestFakeRefusesAPrimaryOfTheWrongFamily(t *testing.T) {
+	nb, c := boundMirrorCluster(t, 1)
+	mustCreateVM(t, c.Nodes[0], "vm-1", "bound")
+	mustSyncAllNodes(t, c)
+
+	v4 := nb.InterfaceAddressID("vm-1", "eth0")
+	if v4 == 0 {
+		t.Fatal("precondition: vm-1 has no mirrored address")
+	}
+	v6 := nb.SeedIP("2001:db8::9/64", orphanVRF, "", time.Now())
+	nb.AssignDirect(v6, nb.InterfaceID("vm-1", "eth0"))
+
+	if err := nb.SetVMPrimaryIP4Direct("vm-1", v6); err == nil ||
+		!strings.Contains(err.Error(), "Must be an IPv4 address") {
+		t.Fatalf("primary_ip4 = an IPv6 address: want NetBox's family refusal, got %v", err)
+	}
+	if err := nb.SetVMPrimaryIP6Direct("vm-1", v4); err == nil ||
+		!strings.Contains(err.Error(), "Must be an IPv6 address") {
+		t.Fatalf("primary_ip6 = an IPv4 address: want NetBox's family refusal, got %v", err)
+	}
+	if err := nb.SetVMPrimaryIP6Direct("vm-1", v6); err != nil {
+		t.Fatalf("primary_ip6 = the VM's own IPv6 address must be accepted: %v", err)
 	}
 }

@@ -74,9 +74,9 @@ vms:
 //
 // Each process left running records its pid in <dir>/standins.pids, and the
 // cleanup kills those pids and nothing else. Its shell loops 'sleep 1; ... true'
-// while the test process lives, never 'sleep 600; :': branches without this cleanup still end each LB test
-// with `pkill -f "sleep 600; : .*<test name>"`, and the stand-ins' command
-// lines name their temp dir, which names the test. One such cleanup anywhere
+// while the test process lives, never 'sleep 600; :': branches without this
+// cleanup still end each LB test with `pkill -f "sleep 600; : .*<test name>"`,
+// and the stand-ins' command lines name their temp dir, which names the test. One such cleanup anywhere
 // on the host killed the stand-ins of every process running the test at that
 // moment, and each one's next apply started keepalived and conntrackd again
 // (TestLBStandIns_AnotherRunsCleanupLeavesThemAlone).

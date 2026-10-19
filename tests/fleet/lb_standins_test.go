@@ -103,8 +103,7 @@ func TestLBStandIns_AnotherRunsCleanupLeavesThemAlone(t *testing.T) {
 
 // TestLBStandIns_KilledTestLeavesNoneBehind: a test process killed before
 // t.Cleanup runs (a timeout, a SIGKILL, kbuild rebuilding the tree under a
-// running shard) must not leave its stand-ins running. On kvm003, 26
-// `sleep 600` stand-ins were orphaned this way on 2026-10-19.
+// running shard) must not leave its stand-ins running.
 //
 // Mutation (red): the stand-ins sleep for a fixed 600 seconds again instead
 // of polling their test process.
@@ -154,8 +153,8 @@ func TestLBStandIns_KilledTestLeavesNoneBehind(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			for pid := range alive {
-				syscall.Kill(pid, syscall.SIGKILL)                            //nolint:errcheck
 				exec.Command("pkill", "-KILL", "-P", strconv.Itoa(pid)).Run() //nolint:errcheck
+				syscall.Kill(pid, syscall.SIGKILL)                            //nolint:errcheck
 			}
 			t.Fatalf("stand-ins %v outlived their killed test", alive)
 		}

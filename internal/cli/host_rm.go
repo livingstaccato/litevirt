@@ -180,6 +180,7 @@ func HostRemoveDeadForce(ctx context.Context, c pb.LiteVirtClient, hostName stri
 	}
 	// voteGone, once the vote is removed, says so on every later refusal.
 	voteGone := func(err error) error { return err }
+	rerun := deadRemovalRerun(hostName, force)
 	if plan.GetVoter() {
 		resp, err := c.ChangeVoterConfig(ctx, &pb.ChangeVoterConfigRequest{Op: "rm", Host: hostName})
 		if err != nil {
@@ -193,8 +194,8 @@ func HostRemoveDeadForce(ctx context.Context, c pb.LiteVirtClient, hostName stri
 		fmt.Printf("  removed %s from the voter set (it was a member of generation %d)\n", hostName, plan.GetVoterGeneration())
 		voteGone = func(err error) error {
 			return fmt.Errorf("%w\n%s's vote was removed (voter generation %d) before this refusal, and a host that is off "+
-				"cannot be given it back; clear the cause, then run `lv host rm --dead %s` to finish the removal",
-				err, hostName, resp.GetGeneration(), hostName)
+				"cannot be given it back; clear the cause, then run `%s` to finish the removal",
+				err, hostName, resp.GetGeneration(), rerun)
 		}
 	}
 	serial, version, err := revokeAndPublishRetrying(ctx, c,
@@ -204,7 +205,7 @@ func HostRemoveDeadForce(ctx context.Context, c pb.LiteVirtClient, hostName stri
 	}
 	closeRemovedHostAuditContract(ctx, c, hostName)
 	removed, err := removeAfterRevoke(ctx, c, &pb.RemoveHostRequest{Name: hostName, Dead: true, Force: force, ExpectedCertSerial: serial},
-		"lv host rm --dead "+hostName)
+		rerun)
 	if err != nil {
 		return voteGone(err)
 	}
@@ -219,6 +220,15 @@ func HostRemoveDeadForce(ctx context.Context, c pb.LiteVirtClient, hostName stri
 	fmt.Printf("  %d stranded recover%s will now retry at the next claim attempt, once the removal and the CRL have replicated\n",
 		n, map[bool]string{true: "y", false: "ies"}[n == 1])
 	return nil
+}
+
+// deadRemovalRerun is the command that repeats this removal: the flags it was
+// given, --dead and --force when set, and nothing more.
+func deadRemovalRerun(hostName string, force bool) string {
+	if force {
+		return "lv host rm --dead --force " + hostName
+	}
+	return "lv host rm --dead " + hostName
 }
 
 func printDeadRemovalPlan(plan *pb.PlanDeadHostRemovalResponse) {

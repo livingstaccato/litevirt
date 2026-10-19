@@ -302,3 +302,44 @@ func TestHostRemoveDead_TheSerialIsPinnedAcrossTheVote(t *testing.T) {
 		t.Errorf("crl.pem revokes %v, want nothing", serials)
 	}
 }
+
+// The commands printed after the vote is gone repeat the original flags:
+// `--dead --force` is rerun as `--dead --force`, a plain `--dead` without
+// --force. Without it the rerun is refused by the firmware move --force
+// overrode.
+//
+// Mutation: either hint prints the plain `lv host rm --dead <host>` — red.
+func TestHostRemoveDead_TheRetryHintsKeepTheFlags(t *testing.T) {
+	rmTestPKI(t)
+	old := removeRetryBackoff
+	removeRetryBackoff = []time.Duration{0, 0}
+	t.Cleanup(func() { removeRetryBackoff = old })
+	unavailable := status.Error(codes.Unavailable, "no peer completed the pull")
+
+	for _, force := range []bool{true, false} {
+		want := "`lv host rm --dead node-9`"
+		if force {
+			want = "`lv host rm --dead --force node-9`"
+		}
+		// The check after the vote stays unavailable.
+		pre := &preflightSeqClient{hostRemoveTestClient: &hostRemoveTestClient{planVoter: true},
+			answers: []error{voterRefused, unavailable}}
+		err := HostRemoveDeadForce(context.Background(), pre, "node-9", false, force)
+		if err == nil || !strings.Contains(err.Error(), "vote was removed") || !strings.Contains(err.Error(), want) {
+			t.Errorf("force=%v, after-vote check: want hint %s: %v", force, want, err)
+		}
+		// The removal after the revocation stays unavailable.
+		rm := &hostRemoveTestClient{planVoter: true,
+			removeErrs: []error{unavailable, unavailable, unavailable}}
+		err = HostRemoveDeadForce(context.Background(), rm, "node-9", false, force)
+		if err == nil || !strings.Contains(err.Error(), "to finish the removal") {
+			t.Fatalf("force=%v, removal: %v", force, err)
+		}
+		if got := strings.Count(err.Error(), want); got != 2 {
+			t.Errorf("force=%v, removal: hint %s printed %d times, want 2: %v", force, want, got, err)
+		}
+		if !force && strings.Contains(err.Error(), "--force") {
+			t.Errorf("without --force the hint names it: %v", err)
+		}
+	}
+}

@@ -749,3 +749,72 @@ func TestRemoveStagedPair_OnlyTheRevokedSerial(t *testing.T) {
 		})
 	}
 }
+
+// Codex 6c258 I1: removal's cleanup read the install record of the revoked
+// serial and then removed the file by name, without the add lock: a re-add
+// that installed and wrote its own record in between lost it, and a second
+// add of the machine under another name could install over it. The record is
+// removed only under the lock, re-read there, and only those bytes.
+//
+// Mutations: remove by name after the first read — "a re-add wrote its record
+// meanwhile" loses it; remove without the lock — "an add holds the machine"
+// loses it.
+func TestRemoveInstalledMarker_OnlyTheRecordOfTheRevokedInstall(t *testing.T) {
+	const revoked = "0a0a"
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, r *LocalAddTarget) func()
+		left  string
+	}{
+		{"the revoked install", nil, ""},
+		{"another install", func(t *testing.T, r *LocalAddTarget) func() {
+			writeMarker(t, r, "node-9 0b0b 1 bb\n")
+			return func() {}
+		}, "node-9 0b0b 1 bb\n"},
+		{"a re-add wrote its record meanwhile", func(t *testing.T, r *LocalAddTarget) func() {
+			old := afterMarkerRead
+			afterMarkerRead = func() { writeMarker(t, r, "node-9 0b0b 2 bb\n") }
+			return func() { afterMarkerRead = old }
+		}, "node-9 0b0b 2 bb\n"},
+		{"an add holds the machine", func(t *testing.T, r *LocalAddTarget) func() {
+			release, err := lockMachine(r, "lock", "cc node-9 0b0b 3")
+			if err != nil {
+				t.Fatal(err)
+			}
+			return release
+		}, "node-9 0a0a 1 aa\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			r := &LocalAddTarget{Root: root, PKIDir: filepath.Join(root, "etc", "litevirt", "pki")}
+			writeMarker(t, r, "node-9 "+revoked+" 1 aa\n")
+			if tc.setup != nil {
+				defer tc.setup(t, r)()
+			}
+			err := removeInstalledMarker(r, revoked)
+			if tc.name == "an add holds the machine" && err == nil {
+				t.Error("removal while an add holds the machine reported success")
+			}
+			got, rerr := os.ReadFile(r.Path(addInstalledMarker))
+			if tc.left == "" {
+				if !os.IsNotExist(rerr) {
+					t.Errorf("the revoked install's record is left: %q", got)
+				}
+				return
+			}
+			if string(got) != tc.left {
+				t.Errorf("record = %q, want %q kept", got, tc.left)
+			}
+		})
+	}
+}
+
+func writeMarker(t *testing.T, r *LocalAddTarget, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(r.Path(addInstalledMarker)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(r.Path(addInstalledMarker), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}

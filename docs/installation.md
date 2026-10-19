@@ -173,14 +173,18 @@ activates it once the other is removed), and `lv health` shows
 `host.address_shared`.
 
 From just before it installs to the end of its setup or rollback, an add
-holds the machine (`/etc/litevirt/.lv-add.lock`): another add of the machine
-is refused meanwhile, and a lock older than an hour, left by an add that died,
-is broken. The add records what it installed in `/etc/litevirt/.lv-add-installed`.
+holds the machine: a shell on the machine holds an `flock` on
+`/etc/litevirt/.lv-add.lock` for it, which the kernel releases when that shell
+ends, so the lock goes when the add finishes or its connection drops. Another
+add of the machine is refused meanwhile. The add records what it installed in
+`/etc/litevirt/.lv-add-installed`, under that lock; `lv host rm` removes the
+record of the admission it revoked under the lock too.
 An add that finds the machine's certificate changed since it began, or another
 name installed there in the last hour whose certificate this machine's CRL
 does not revoke, installs nothing: of two adds of one machine, the second to
-install is refused, whatever its admission. A rollback moves back only files
-that are what that add installed.
+install is refused, whatever its admission. A rollback puts nothing back
+unless the machine still records that add's own install, and then moves back
+only files that are what that add installed.
 
 A machine that already has `/etc/litevirt/config.yaml` keeps it. The add
 edits in place only `host_name`, `advertise_address`, `join_peers`, `pki_dir`

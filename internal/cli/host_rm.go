@@ -482,14 +482,64 @@ func removeStagedPair(r addRemote, serial string) error {
 	if _, err := r.Shell("unstage", cmd.String()); err != nil {
 		return err
 	}
-	// The record of an install of the revoked admission no longer holds the
-	// machine for it.
-	if b, ok, err := r.ReadFile(addInstalledMarker); err == nil && ok {
-		if f := strings.Fields(string(b)); len(f) == 3 && strings.EqualFold(f[1], serial) {
-			if _, err := r.Shell("unstage", removeCmd(r, []string{addInstalledMarker})); err != nil {
-				return err
-			}
-		}
+	if err := removeInstalledMarker(r, serial); err != nil {
+		return err
 	}
 	return removeLegacyStagedPair(r, serial)
+}
+
+// afterMarkerRead is a test seam: it runs between removeInstalledMarker's
+// first read of the record and its lock.
+var afterMarkerRead func()
+
+// removeInstalledMarker removes the machine's record of an install of the
+// revoked admission (addInstalledMarker), which no longer holds the machine
+// for it. Only under the add lock, which every add writes the record under,
+// and only the record read there: renamed aside, checked to be those bytes,
+// then removed, so a record a later add wrote is never removed. While an add
+// holds the machine it is left, and the refusal says so.
+func removeInstalledMarker(r addRemote, serial string) error {
+	b, ok, err := r.ReadFile(addInstalledMarker)
+	if err != nil || !ok {
+		return err
+	}
+	if f := strings.Fields(string(b)); len(f) < 3 || !strings.EqualFold(f[1], serial) {
+		return nil
+	}
+	if afterMarkerRead != nil {
+		afterMarkerRead()
+	}
+	nonce, err := attemptNonce()
+	if err != nil {
+		return err
+	}
+	release, err := lockMachine(r, "lock", fmt.Sprintf("%s lv-host-rm %s %d", nonce, serial, time.Now().Unix()))
+	if err != nil {
+		return fmt.Errorf("leave the record %s of the removed admission's install: %w", addInstalledMarker, err)
+	}
+	defer release()
+	b, ok, err = r.ReadFile(addInstalledMarker)
+	if err != nil || !ok {
+		return err
+	}
+	f := strings.Fields(string(b))
+	if len(f) < 3 || !strings.EqualFold(f[1], serial) {
+		return nil
+	}
+	aside := addInstalledMarker + ".rm-" + nonce
+	if _, err := r.Shell("unstage", fmt.Sprintf("mv -T -- %s %s", ssh.ShellQuote(r.Path(addInstalledMarker)),
+		ssh.ShellQuote(r.Path(aside)))); err != nil {
+		return err
+	}
+	got, ok, err := r.ReadFile(aside)
+	if err != nil || !ok {
+		return err
+	}
+	if string(got) != string(b) {
+		_, err := r.Shell("unstage", fmt.Sprintf("mv -nT -- %s %s", ssh.ShellQuote(r.Path(aside)),
+			ssh.ShellQuote(r.Path(addInstalledMarker))))
+		return err
+	}
+	_, err = r.Shell("unstage", removeCmd(r, []string{aside}))
+	return err
 }

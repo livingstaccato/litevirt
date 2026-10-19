@@ -574,3 +574,64 @@ func TestHostAdd_ARefusalAskedAgainBeforeTheInstallInstallsNothing(t *testing.T)
 		}
 	}
 }
+
+// Codex 6c258 I2: the lock was a directory a later add could rename aside as
+// stale while its owner still ran, so two adds could hold the machine at
+// once. It is an flock(2) held by a shell on the host for the add's whole
+// install, setup and rollback, released by the kernel when that shell ends
+// (the add releases it, or its connection drops): nothing breaks it, and an
+// owner record that looks old lets nobody in while its add runs.
+//
+// Mutation: take the lock without flock — the second add takes it too.
+func TestLockMachine_OneAddAtATimeUntilItsShellEnds(t *testing.T) {
+	root := t.TempDir()
+	r := &LocalAddTarget{Root: root, PKIDir: filepath.Join(root, "etc", "litevirt", "pki")}
+	releaseA, err := lockMachine(r, "lock", "aaaa node-a 0a 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// However old its record says it is, a running add's lock holds.
+	if err := os.WriteFile(r.Path(addLockOwner), []byte("aaaa node-a 0a 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockMachine(r, "lock", "bbbb node-b 0b 2"); err == nil || !strings.Contains(err.Error(), "node-a") {
+		t.Fatalf("a second lock while the first is held = %v, want a refusal naming node-a", err)
+	}
+	releaseA()
+	releaseB, err := lockMachine(r, "lock", "bbbb node-b 0b 2")
+	if err != nil {
+		t.Fatalf("the lock after the first add ended: %v", err)
+	}
+	releaseB()
+}
+
+// Codex 6c258 I2: a failed setup's rollback must not undo another add's
+// install. The machine records which attempt installed last
+// (addInstalledMarker); a rollback that does not find its own record puts
+// nothing back.
+//
+// Mutation: drop the record check — the old identity is put back over the
+// install the record names.
+func TestHostAdd_ARollbackUndoesOnlyItsOwnRecordedInstall(t *testing.T) {
+	f := newAddFixture(t)
+	f.target.OnSetup = func() error {
+		// Another attempt's install is recorded since (as a lock that two
+		// adds held at once would allow).
+		b, err := os.ReadFile(f.target.Path(addInstalledMarker))
+		if err != nil {
+			t.Error(err)
+		}
+		fl := strings.Fields(string(b))
+		if err := os.WriteFile(f.target.Path(addInstalledMarker), []byte(fl[0]+" "+fl[1]+" "+fl[2]+" ffffffffffff\n"), 0o600); err != nil {
+			t.Error(err)
+		}
+		return errors.New("setup failed")
+	}
+	err := f.add(t)
+	if err == nil || !strings.Contains(err.Error(), "nothing was put back") {
+		t.Fatalf("add = %v, want a rollback that puts nothing back", err)
+	}
+	if got := installedSerial(mustRead(t, filepath.Join(f.targetPKI, "host.crt"))); got != f.client.admitted[0] {
+		t.Errorf("the machine serves %s: the rollback undid the install the machine records", got)
+	}
+}

@@ -410,6 +410,11 @@ func rotateAuditKeyHint(hostName, sshTarget string) string {
 // certificate — so no half pair is left behind for a later `lv host add` or a
 // human to trip on.
 func removeCAMachineCopy(pkiDir, hostName string, prev *x509.Certificate) {
+	// A name the rule refuses has no copy of its own here: <name>.key would be
+	// one of the cluster's files, or outside the directory.
+	if pki.ValidateHostName(hostName) != nil {
+		return
+	}
 	keyPath := filepath.Join(pkiDir, hostName+".key")
 	crtPath := filepath.Join(pkiDir, hostName+".crt")
 	b, err := os.ReadFile(keyPath)

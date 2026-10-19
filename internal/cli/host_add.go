@@ -33,6 +33,10 @@ import (
 
 // HostAdd adds a new host to an existing cluster.
 func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostName string, joinPeers []string) error {
+	// The name becomes <pkiDir>/<name>.crt|.key beside the CA: checked first.
+	if err := pki.ValidateHostName(hostName); err != nil {
+		return err
+	}
 	// Before anything is generated or pushed, because a failure here must leave the
 	// target untouched.
 	//
@@ -179,6 +183,9 @@ type addFile struct {
 // first, and only moved into place after AdmitHost. A refused add, or one
 // that fails before the admission, removes what it staged and leaves no row.
 func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddPlan) error {
+	if err := pki.ValidateHostName(p.hostName); err != nil {
+		return err
+	}
 	ip := net.ParseIP(p.hostAddr)
 	hostCrt, hostKey := filepath.Join(remotePKIDir, "host.crt"), filepath.Join(remotePKIDir, "host.key")
 
@@ -414,6 +421,9 @@ func refuseAnotherMember(hosts []*pb.Host, p hostAddPlan, installed string) erro
 // mintStaged mints hostName's pair beside this machine's copy and returns
 // its contents and serial. The paths are appended to local.
 func mintStaged(pkiDir, hostName string, ip net.IP, local *[]string) ([2][]byte, string, error) {
+	if err := pki.ValidateHostName(hostName); err != nil {
+		return [2][]byte{}, "", err
+	}
 	crt := filepath.Join(pkiDir, "."+hostName+".crt.add")
 	key := filepath.Join(pkiDir, "."+hostName+".key.add")
 	*local = append(*local, crt, key)

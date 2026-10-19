@@ -136,6 +136,10 @@ type migrationFile struct {
 // certificate for ip. It returns the three files to put in the host's
 // migration directory: the CA, the certificate, and the key (0600).
 func issueMigrationCredentials(pkiDir, hostName string, ip net.IP, existing migrationCredentialHolder) ([]migrationFile, error) {
+	// hostName may come from the replicated hosts table, which a peer can write.
+	if err := pki.ValidateHostName(hostName); err != nil {
+		return nil, err
+	}
 	return issueMigrationCredentialsAt(pkiDir, filepath.Join(pkiDir, hostName+"-migration.crt"),
 		filepath.Join(pkiDir, hostName+"-migration.key"), hostName, ip, existing)
 }

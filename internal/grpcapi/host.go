@@ -24,6 +24,7 @@ import (
 	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/hooks"
 	"github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/placement"
 	"github.com/litevirt/litevirt/internal/randid"
 )
@@ -1838,6 +1839,9 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.A
 	}
 	if req.Name == "" || req.Address == "" || req.CertSerial == "" {
 		return nil, status.Error(codes.InvalidArgument, "name, address, and certificate serial are required")
+	}
+	if err := pki.ValidateHostName(req.Name); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	// One machine, one name: an address another live or joining host is
 	// dialled at belongs to that host. Checked here, not only by `lv host

@@ -288,6 +288,11 @@ func coerceInt64OK(v interface{}) (int64, bool) {
 }
 
 func (c *Client) antiEntropyAuthorityDecision(tx *sql.Tx, table syncTable, row []interface{}) (mergeAuthorityDecision, error) {
+	if table.Name == "users" && c.UserIncarnationOn() {
+		// A live row never beats a tombstone of its own incarnation
+		// (user_incarnation.go).
+		return userIncarnationDecision(tx, table, row)
+	}
 	m := table.authority
 	if m == nil {
 		return mergeAuthorityNormal, nil

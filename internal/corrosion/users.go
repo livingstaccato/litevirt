@@ -79,17 +79,30 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 		if passwordHash == "" {
 			ts = shadowReactivationTS(rows[0].String("updated_at"), rows[0].String("cred_ts"), now)
 		}
+		// Once user_incarnation_v1 has latched the re-created account is a
+		// new incarnation, which replaces the tombstone on every node
+		// (user_incarnation.go).
+		created := rows[0].String("created_at")
+		oldColumn := passwordHash
+		if split {
+			oldColumn = c.oldColumnValue(passwordHash)
+		}
+		reactivate := Statement{SQL: usersReactivateSQL, Params: []interface{}{role, oldColumn, ts, username}}
+		if c.UserIncarnationOn() {
+			created = nextIncarnation(created)
+			reactivate = Statement{SQL: usersReactivateIncarnationSQL, Params: []interface{}{role, oldColumn, created, ts, username}}
+		}
 		if split {
 			return c.ExecuteBatch(ctx, []Statement{
-				{SQL: usersReactivateSQL, Params: []interface{}{role, c.oldColumnValue(passwordHash), ts, username}},
+				reactivate,
 				{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, ts}},
 			})
 		}
-		if err := c.Execute(ctx, usersReactivateSQL, role, passwordHash, ts, username); err != nil {
+		if err := c.ExecuteBatch(ctx, []Statement{reactivate}); err != nil {
 			return err
 		}
 		if passwordHash == "" {
-			c.noteExternalShadow(userIdentity{Username: username, CreatedAt: rows[0].String("created_at"), UpdatedAt: ts})
+			c.noteExternalShadow(userIdentity{Username: username, CreatedAt: created, UpdatedAt: ts})
 		}
 		return nil
 	}
@@ -360,10 +373,20 @@ func DeleteUserCounted(ctx context.Context, c *Client, g capabilities.FeatureGra
 	marker := nowRFC3339()
 	barePrincipal := "user:" + username
 	localPrincipal := barePrincipal + "@local"
-	stmts := []Statement{
-		{SQL: `UPDATE users SET deleted_at = ?, updated_at = ? WHERE username = ?`,
-			Params: []interface{}{marker, now, username}},
+	// Once user_incarnation_v1 has latched the delete names the incarnation
+	// it ends, so a later write to it from a node that had not seen the
+	// delete cannot bring the account back (user_incarnation.go).
+	tombstone := Statement{SQL: usersTombstoneSQL, Params: []interface{}{marker, now, username}}
+	if c.UserIncarnationOn() {
+		inc, err := c.Query(ctx, `SELECT created_at FROM users WHERE username = ?`, username)
+		if err != nil {
+			return 0, 0, err
+		}
+		if len(inc) > 0 {
+			tombstone = Statement{SQL: usersTombstoneIncarnationSQL, Params: []interface{}{marker, now, username, inc[0].String("created_at")}}
+		}
 	}
+	stmts := []Statement{tombstone}
 	stmts = append(stmts, clearSecondFactorStatements(username, marker, now)...)
 	stmts = append(stmts, Statement{
 		SQL:    `UPDATE role_bindings SET deleted_at = ?, updated_at = ? WHERE (principal = ? OR principal = ?) AND deleted_at IS NULL`,
@@ -729,7 +752,22 @@ func reinstateAdminStatements(ctx context.Context, c *Client, g capabilities.Fea
 	// The old column takes what every writer puts there (credentials-clear
 	// M3): "" once credentials_clear_v1 has latched, so the reinstatement
 	// does not put a value back into a cleared column for the next clear pass.
-	stmts := []Statement{{SQL: usersReactivateSQL, Params: []interface{}{"admin", c.oldColumnValue(hash), now, victim}}}
+	// Once user_incarnation_v1 has latched the reinstated account is a new
+	// incarnation, which replaces the tombstone on every node
+	// (user_incarnation.go).
+	reinstate := Statement{SQL: usersReactivateSQL, Params: []interface{}{"admin", c.oldColumnValue(hash), now, victim}}
+	if c.UserIncarnationOn() {
+		prev, err := c.Query(ctx, `SELECT created_at FROM users WHERE username = ?`, victim)
+		if err != nil {
+			return nil, err
+		}
+		created := ""
+		if len(prev) > 0 {
+			created = prev[0].String("created_at")
+		}
+		reinstate = Statement{SQL: usersReactivateIncarnationSQL, Params: []interface{}{"admin", c.oldColumnValue(hash), nextIncarnation(created), now, victim}}
+	}
+	stmts := []Statement{reinstate}
 	if c.MayWriteCredentialTables() {
 		stmts = append(stmts, Statement{SQL: userCredentialUpsertSQL, Params: []interface{}{victim, hash, now}})
 	}

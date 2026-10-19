@@ -122,6 +122,10 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// netbox_ip_repoint_v1: "this build decodes the lease re-point
 		// statement". Every replication recipient must decode it.
 		capabilities.NetBoxIPRepointV1: true,
+		// user_incarnation_v1: "this build decodes the incarnation-bearing
+		// users statements and keeps a tombstone over its own incarnation".
+		// Every replica must order a delete and a re-create alike.
+		capabilities.UserIncarnationV1: true,
 		// release_2026_11_v1, the release token: "this build decodes, keeps
 		// and honours every field and shape of its release". Nothing changes
 		// when it latches; a feature is opened only through WithFeature,

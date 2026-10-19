@@ -21,12 +21,13 @@ import (
 //
 // The invariant here is deliberately narrow, and it is keyed on created_at.
 //
-// users.created_at is written in exactly ONE place: the INSERT in InsertUser.
-// No update path touches it — UpdateUserPassword sets password_hash/updated_at,
-// InsertUser's reactivation branch sets role/password_hash/deleted_at/updated_at,
-// and DeleteUser sets deleted_at/updated_at. So for a given username created_at
-// is immutable in practice, and an incoming row that carries a DIFFERENT one is
-// not a new password for the existing account — it is a different account minted
+// users.created_at is written by the INSERT in InsertUser and, once
+// user_incarnation_v1 has latched, by the re-create of a DELETED name
+// (usersReactivateIncarnationSQL, user_incarnation.go). No write to a live
+// account touches it — UpdateUserPassword sets password_hash/updated_at, and
+// DeleteUser sets deleted_at/updated_at. So for a LIVE account created_at is
+// immutable, and an incoming row that carries a DIFFERENT one is not a new
+// password for the existing account — it is a different account minted
 // somewhere else wearing that account's name. That is exactly the #186 event,
 // and it is distinguishable from the legitimate operation (`lv user reset-admin`
 // preserves created_at and keeps replicating normally).

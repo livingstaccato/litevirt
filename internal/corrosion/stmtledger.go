@@ -84,6 +84,11 @@ const (
 	// another at its generation is resolved as anti-entropy resolves it
 	// instead of missing its compare-and-swap (spec_conflict_apply.go).
 	DispSpecGeneration Disposition = "spec_generation"
+	// DispUserIncarnation is a users delete or re-create that names its
+	// incarnation (created_at): the delete ends that incarnation whatever
+	// later write a receiver holds, and a re-create replaces the tombstone of
+	// an older one, each keeping the later clock (user_incarnation.go).
+	DispUserIncarnation Disposition = "user_incarnation"
 	// DispReject always back-pressures. Used as the BEFORE-activation disposition of a
 	// capability-gated shape (RequiresCapability + DispositionAfter): the shape is not authorized
 	// until its capability is active on this receiver, so a prematurely-emitted write fails closed.

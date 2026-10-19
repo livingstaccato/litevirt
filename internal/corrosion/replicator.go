@@ -1943,6 +1943,11 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		}
 		return nil
 
+	case DispUserIncarnation:
+		// A users delete or re-create naming its incarnation
+		// (user_incarnation.go).
+		return r.applyUserIncarnation(ctx, tx, s, sh, tableName, pkCols, incomingHLC)
+
 	case DispSpecGeneration:
 		// A VM desired-spec edit: DispLiveRowUpdate, but an edit that meets
 		// another at its generation is resolved, not dropped

@@ -1506,6 +1506,22 @@ stand-down is the inventory mirror's own: `netbox.mirror_inventory` off on
 every node stops the only writer. A binary rolled back below the latched token
 enters WAL quarantine, as below every latched token. Roll forward.
 
+### A deleted account stays deleted after the roll
+
+A password change made on a host that has not yet seen an account's
+`lv user delete` used to bring the account back on every host, with that
+password. Once the `user_incarnation_v1` capability token has latched, a
+delete names the account it ends, and no later write to that account from a
+lagging host revives it. `lv user create` of a deleted name makes a new
+account, which replaces the deleted one everywhere. The token latches on its
+own once every host the cluster replicates to, including one parked in
+`maintenance`, runs this release. Until then hosts write and merge users rows
+as the previous release does.
+
+`user_incarnation_v1` is mandatory and replication-gated, with no flag and no
+stand-down. A binary rolled back below the latched token enters WAL
+quarantine, as below every latched token. Roll forward.
+
 ### Console passwords start after the roll
 
 This release gives each VM's VNC and SPICE consoles a per-VM password

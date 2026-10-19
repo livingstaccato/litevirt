@@ -195,6 +195,10 @@ var explicitPolicyDefs = []explicitPolicyDef{
 	// The epoch-carrying out-of-band spec edit. Only emitted once
 	// spec_conflict_v1 has latched, and only this build knows it.
 	{SQL: vmSpecMutateAtEpochSQL, Disposition: DispSpecGeneration},
+	// The incarnation-bearing users delete and re-create. Only emitted once
+	// user_incarnation_v1 has latched, and only this build knows them.
+	{SQL: usersTombstoneIncarnationSQL, Disposition: DispUserIncarnation},
+	{SQL: usersReactivateIncarnationSQL, Disposition: DispUserIncarnation},
 	// Likewise the clear: once spec_conflict_v1 is active its guard, not the
 	// row's clock, orders it (spec_conflict_apply.go).
 	{SQL: vmOperationClearSQL, Disposition: DispLiveRowUpdate, RequiresCapability: capabilities.SpecConflictV1, DispositionAfter: DispSpecGeneration},

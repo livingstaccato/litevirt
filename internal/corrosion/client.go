@@ -474,6 +474,11 @@ type Client struct {
 	// Fails CLOSED when unset: the re-point is a shape a previous-release peer
 	// has no ledger entry for. See netbox_repoint.go.
 	netboxRepointGate atomic.Pointer[func() bool]
+	// userIncarnationGate, when set and returning true, says
+	// user_incarnation_v1 has durably latched: users rows are then deleted and
+	// re-created by incarnation (user_incarnation.go). Unset reads false, the
+	// previous release's statements and merge.
+	userIncarnationGate atomic.Pointer[func() bool]
 	// specDropsSeen is the spec-edit drops already noted (firstSpecDrop),
 	// with whether each one's event is recorded.
 	specDropsMu   sync.Mutex

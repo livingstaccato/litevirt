@@ -3901,6 +3901,20 @@ func (d *Daemon) wireCorrosionGates() {
 	d.wireRecoveryClaimGate()
 	d.wireSpecConflictGate()
 	d.wireNetBoxRepointGate()
+	d.wireUserIncarnationGate()
+}
+
+// wireUserIncarnationGate tells corrosion when user_incarnation_v1 has
+// DURABLY latched: users rows are then deleted and re-created by incarnation,
+// in two statements a previous-release peer has no ledger entry for, and
+// anti-entropy keeps a tombstone over its own incarnation. Durable, so a
+// restart does not return a node to the previous release's merge while its
+// peers keep the new one. Mandatory, no config flag; unwired, the gate reads
+// false and the node behaves as the previous release.
+func (d *Daemon) wireUserIncarnationGate() {
+	d.db.SetUserIncarnationGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.UserIncarnationV1)
+	})
 }
 
 // wireNetBoxRepointGate lets corrosion re-point a lease at a re-created NetBox

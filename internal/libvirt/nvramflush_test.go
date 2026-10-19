@@ -171,6 +171,7 @@ func TestNvramFlusher_FsyncErrorIsStickyUntilTheFileGoes(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Sweep()
+	f.Sweep() // confirmed gone by a second, fresh listing
 	if got := f.Failures(); len(got) != 0 {
 		t.Fatalf("removed file still listed as failed: %+v", got)
 	}
@@ -377,6 +378,7 @@ func TestNvramFlusher_FailureFollowsTheFileNotTheName(t *testing.T) {
 		NvramFlushFailure{Path: other, Error: "EIO", Dev: 1, Ino: 1}, // another file at the name now
 	))
 	g.Sweep()
+	g.Sweep()
 	if got := g.Failures(); len(got) != 1 || got[0].Path != vars {
 		t.Fatalf("after a restart, failures = %+v; want only %s", got, vars)
 	}
@@ -387,6 +389,7 @@ func TestNvramFlusher_FailureFollowsTheFileNotTheName(t *testing.T) {
 	if err := os.Rename(next, vars); err != nil {
 		t.Fatal(err)
 	}
+	g.Sweep()
 	g.Sweep()
 	if got := g.Failures(); len(got) != 0 {
 		t.Fatalf("a replaced file is still failed: %+v", got)

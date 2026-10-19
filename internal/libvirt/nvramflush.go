@@ -120,6 +120,7 @@ type NvramFlusher struct {
 	mu       sync.Mutex
 	failed   map[string]NvramFlushFailure // by failKey: the file's identity
 	dirty    bool                         // failed changed since the state file was last written
+	missing  map[string]int               // by failKey: consecutive sweeps that found the failed file nowhere
 	openFail map[string]nvramOpenFail     // episodes, by file path or dirReadKey/dirFsyncKey
 	stall    *NvramFlushFailure           // the sweep stuck in an fsync, if one is
 	sweepGen uint64                       // changes at each watched sweep's start and end (beginSweep, endSweep)
@@ -140,6 +141,7 @@ func NewNvramFlusher(dirs ...string) *NvramFlusher {
 		listed:     map[string]map[string]uint64{},
 		warned:     map[string]bool{},
 		failed:     map[string]NvramFlushFailure{},
+		missing:    map[string]int{},
 		openFail:   map[string]nvramOpenFail{},
 		done:       make(chan struct{}),
 	}
@@ -222,11 +224,14 @@ type nvramListing struct {
 	byPath  map[string]os.FileInfo
 	read    map[string]bool // the directories read
 	unknown bool            // some entry could not be looked at
+	// raced: directories an entry left between their listing and its lstat,
+	// so their listing may miss a name it moved to.
+	raced map[string]bool
 }
 
 // Sweep flushes, once, every file that changed since its last flush.
 func (f *NvramFlusher) Sweep() {
-	l := nvramListing{byPath: map[string]os.FileInfo{}, read: map[string]bool{}}
+	l := nvramListing{byPath: map[string]os.FileInfo{}, read: map[string]bool{}, raced: map[string]bool{}}
 	perDir := make([][]string, len(f.dirs))
 	for i, dir := range f.dirs {
 		entries, err := os.ReadDir(dir)
@@ -248,7 +253,10 @@ func (f *NvramFlusher) Sweep() {
 			info, err := f.entryInfo(e) // lstat
 			switch {
 			case errors.Is(err, fs.ErrNotExist):
-				continue // removed since the listing
+				// Removed or renamed since the listing, which may then miss
+				// its new name.
+				l.raced[dir] = true
+				continue
 			case err != nil:
 				// Still there as far as anyone knows, and not flushed: a
 				// failure it has stays, and it is reported if this lasts.
@@ -346,9 +354,10 @@ func (f *NvramFlusher) syncDirIfChanged(dir string, present map[string]uint64) {
 
 // reconcileFailures follows each failed file to where it is now. A failure
 // is its file's (inode's): renamed within or between the watched directories,
-// the file keeps it under its new name. It is dropped only once its inode is
-// in no watched directory, its own directory was read, and every listed entry
-// could be looked at; otherwise it is kept.
+// the file keeps it under its new name. It is dropped only once two sweeps in
+// a row found its inode in no watched directory, with its own directory read,
+// no entry of it renamed away mid-listing, and every listed entry looked at:
+// a rename racing one listing (a replacement's cutover) is seen by the next.
 func (f *NvramFlusher) reconcileFailures(l nvramListing) {
 	byIno := map[uint64][]string{}
 	for p, info := range l.byPath {
@@ -360,9 +369,15 @@ func (f *NvramFlusher) reconcileFailures(l nvramListing) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	next := make(map[string]NvramFlushFailure, len(f.failed))
-	for _, v := range f.failed {
+	missing := make(map[string]int, len(f.missing))
+	for k, v := range f.failed {
 		w, keep := locateFailed(v, l, byIno)
 		switch {
+		case !keep && l.raced[filepath.Dir(v.Path)]:
+			w = v // this listing may have missed its new name
+		case !keep && f.missing[k]+1 < 2:
+			missing[k] = f.missing[k] + 1
+			w = v // confirmed only by the next, fresh, listing
 		case !keep:
 			f.dirty = true
 			slog.Info("UEFI vars file whose flush failed was removed or replaced", "path", v.Path, "vm", v.VM)
@@ -380,7 +395,7 @@ func (f *NvramFlusher) reconcileFailures(l nvramListing) {
 		}
 		next[failKey(w)] = w
 	}
-	f.failed = next
+	f.failed, f.missing = next, missing
 }
 
 // locateFailed is failure v as of listing l, and whether it is kept.
@@ -435,7 +450,8 @@ func newNvramEpisode() string {
 	return hex.EncodeToString(b[:])
 }
 
-// fail records a failed fsync of p: a new episode of its file's failure.
+// fail records a failed fsync of p: a new episode of its file's failure,
+// written to the state file before it is visible (recordFailure).
 func (f *NvramFlusher) fail(p string, info os.FileInfo, err error) {
 	dev, ino := fileIdentity(info)
 	v := NvramFlushFailure{
@@ -444,12 +460,7 @@ func (f *NvramFlusher) fail(p string, info os.FileInfo, err error) {
 		Dev: dev, Ino: ino, Mtime: info.ModTime(),
 		Episode: newNvramEpisode(),
 	}
-	f.mu.Lock()
-	_, already := f.failed[failKey(v)]
-	f.failed[failKey(v)] = v
-	f.dirty = true
-	f.mu.Unlock()
-	if !already {
+	if already := f.recordFailure(v); !already {
 		slog.Error("UEFI vars flush failed: the guest's UEFI variable writes may not be on disk, "+
 			"and stopping the VM does not write them out again; see the nvram_flush_failed condition",
 			"path", p, "vm", nvramVMName(p), "error", err)
@@ -613,29 +624,75 @@ func (f *NvramFlusher) persist() {
 		f.mu.Unlock()
 		return
 	}
-	out := make([]NvramFlushFailure, 0, len(f.failed))
-	for _, v := range f.failed {
-		out = append(out, v)
-	}
+	out := f.snapshotLocked(nil)
 	f.dirty = false
 	f.mu.Unlock()
-	sortFailures(out)
-	if err := writeNvramState(f.statePath, out); err != nil {
+	if !f.writeStateLocked(out) {
 		f.mu.Lock()
 		f.dirty = true
 		f.mu.Unlock()
+	}
+}
+
+// recordFailure makes failure v visible (Failures, and through it the
+// condition and an acknowledgement) only once the state file holds it, so no
+// replicated write can be its only record: a tick could otherwise publish it,
+// a stale resolve overwrite that row, and a restart lose it. If the state
+// file cannot be written it is made visible anyway, and the write retried.
+// It reports whether the file already had a failure.
+func (f *NvramFlusher) recordFailure(v NvramFlushFailure) (already bool) {
+	f.stateMu.Lock()
+	defer f.stateMu.Unlock()
+	f.mu.Lock()
+	_, already = f.failed[failKey(v)]
+	var out []NvramFlushFailure
+	if f.statePath != "" {
+		out = f.snapshotLocked(&v)
+	}
+	f.mu.Unlock()
+	written := f.statePath == "" || f.writeStateLocked(out)
+	f.mu.Lock()
+	f.failed[failKey(v)] = v
+	if !written {
+		f.dirty = true
+	}
+	f.mu.Unlock()
+	return already
+}
+
+// snapshotLocked is the failures, with add among them if it is not nil. The
+// caller holds mu.
+func (f *NvramFlusher) snapshotLocked(add *NvramFlushFailure) []NvramFlushFailure {
+	out := make([]NvramFlushFailure, 0, len(f.failed)+1)
+	for k, v := range f.failed {
+		if add == nil || k != failKey(*add) {
+			out = append(out, v)
+		}
+	}
+	if add != nil {
+		out = append(out, *add)
+	}
+	sortFailures(out)
+	return out
+}
+
+// writeStateLocked writes out to the state file, logging a failure once.
+// The caller holds stateMu.
+func (f *NvramFlusher) writeStateLocked(out []NvramFlushFailure) bool {
+	if err := writeNvramState(f.statePath, out); err != nil {
 		if !f.stateWarned {
 			f.stateWarned = true
 			slog.Error("could not record this host's failed UEFI vars flushes; retried every sweep, "+
 				"and a restart until then keeps only those the nvram_flush_failed condition names",
 				"path", f.statePath, "error", err)
 		}
-		return
+		return false
 	}
 	if f.stateWarned {
 		f.stateWarned = false
 		slog.Info("this host's failed UEFI vars flushes are recorded again", "path", f.statePath)
 	}
+	return true
 }
 
 // writeNvramState replaces path with failures, durably: the data and the

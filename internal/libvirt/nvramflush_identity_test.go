@@ -62,11 +62,24 @@ func TestNvramFlusher_AnEntryThatCannotBeLookedAtKeepsItsFailure(t *testing.T) {
 		t.Fatalf("an entry that cannot be looked at for minutes: blocked = %+v; want %s", b, vars)
 	}
 
-	// No such file is absence: the failure goes.
+	// An lstat that says no such file leaves the listing in doubt (the file
+	// may have moved to a name it missed): the failure stays.
 	lookErr = syscall.ENOENT
+	for range 3 {
+		f.Sweep()
+	}
+	if got := f.Failures(); len(got) != 1 {
+		t.Fatalf("after an ENOENT lstat of a listed entry, failures = %+v; want it kept", got)
+	}
+	// Removed: two fresh listings without it, and the failure goes.
+	lookErr = nil
+	if err := os.Remove(vars); err != nil {
+		t.Fatal(err)
+	}
+	f.Sweep()
 	f.Sweep()
 	if got := f.Failures(); len(got) != 0 {
-		t.Fatalf("after ENOENT, failures = %+v; want none", got)
+		t.Fatalf("after the removal, failures = %+v; want none", got)
 	}
 }
 
@@ -113,6 +126,7 @@ func TestNvramFlusher_AFailedFileRenamedStaysFailed(t *testing.T) {
 	if err := os.Remove(moved); err != nil {
 		t.Fatal(err)
 	}
+	f.Sweep()
 	f.Sweep()
 	if got := f.Failures(); len(got) != 0 {
 		t.Fatalf("after the removal, failures = %+v; want none", got)
@@ -248,5 +262,96 @@ func TestNvramFlusher_ASamePathReplacementKeepingTheMtimeIsFlushed(t *testing.T)
 	f.Sweep()
 	if got := *synced; !slices.Equal(got, []string{vars}) {
 		t.Fatalf("after a truncation keeping the mtime synced %v, want [%s]", got, vars)
+	}
+}
+
+// Codex incoming-9 I1: the cutover renames OLD to NEW while a sweep is
+// between its listing and its lstat of OLD. The listing names OLD but not
+// NEW, and OLD's lstat says no such file. That listing proves nothing, so
+// the failure is kept, and the next sweep finds its inode under NEW. A
+// failure is dropped only once two sweeps in a row found its inode nowhere.
+//
+// Mutation: drop a failure the first time a listing does not hold its inode
+// and it is gone after the racing sweep.
+func TestNvramFlusher_ARenameDuringTheSweepKeepsTheFailure(t *testing.T) {
+	dir := t.TempDir()
+	oldp := filepath.Join(dir, "web-1-replace_VARS.fd")
+	newp := filepath.Join(dir, "web-1_VARS.fd")
+	f, now := failingFlusher(t, map[string]bool{oldp: true}, dir)
+	writeAt(t, oldp, "v1", now.Add(-time.Hour))
+	f.Sweep()
+	before := f.Failures()
+	if len(before) != 1 {
+		t.Fatal("setup: no failure")
+	}
+
+	f.entryInfo = func(e os.DirEntry) (os.FileInfo, error) {
+		if e.Name() == filepath.Base(oldp) {
+			if err := os.Rename(oldp, newp); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return e.Info()
+	}
+	f.Sweep()
+	f.entryInfo = os.DirEntry.Info
+	if got := f.Failures(); len(got) != 1 || got[0].Ino != before[0].Ino {
+		t.Fatalf("after a rename during the sweep, failures = %+v; want %+v kept", got, before[0])
+	}
+	f.Sweep()
+	if got := f.Failures(); len(got) != 1 || got[0].Path != newp || got[0].Episode != before[0].Episode {
+		t.Fatalf("the next sweep: failures = %+v; want the failure under %s", got, newp)
+	}
+
+	if err := os.Remove(newp); err != nil {
+		t.Fatal(err)
+	}
+	f.Sweep()
+	if got := f.Failures(); len(got) != 1 {
+		t.Fatalf("one sweep without the file dropped its failure: %+v", got)
+	}
+	f.Sweep()
+	if got := f.Failures(); len(got) != 0 {
+		t.Fatalf("two sweeps without the file: failures = %+v; want none", got)
+	}
+}
+
+// Codex incoming-9 I2: a failed fsync is in the state file before anyone
+// can see it (Failures, and so the condition row and an acknowledgement).
+// Otherwise a tick could publish it, a stale resolve overwrite that row, and
+// a restart before the sweep's end leave it in neither.
+//
+// Mutation: record the failure in memory first and persist it at the end of
+// the sweep, and the state file lacks it while the sweep is still running.
+func TestNvramFlusher_AFailureIsRecordedBeforeItIsVisible(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(t.TempDir(), NvramFlushStateFile)
+	a, b := filepath.Join(dir, "a_VARS.fd"), filepath.Join(dir, "b_VARS.fd")
+	f, _, now := recordingFlusher(t, dir)
+	f.LoadState(state)
+	writeAt(t, a, "a", now.Add(-time.Hour))
+	writeAt(t, b, "b", now.Add(-time.Hour))
+
+	var checked bool
+	f.sync = func(p string, _ os.FileInfo) error {
+		if p == a {
+			return &nvramSyncError{syscall.EIO}
+		}
+		if p == b {
+			// The sweep is still running (a later fsync, perhaps a slow
+			// one): whatever is visible now must already be on disk.
+			visible := f.Failures()
+			g, _, _ := recordingFlusher(t, dir)
+			g.LoadState(state)
+			if len(visible) != 1 || !slices.EqualFunc(g.Failures(), visible, sameEpisode) {
+				t.Errorf("mid-sweep: visible %+v, recorded %+v", visible, g.Failures())
+			}
+			checked = true
+		}
+		return nil
+	}
+	f.Sweep()
+	if !checked {
+		t.Fatal("the second file was never flushed")
 	}
 }

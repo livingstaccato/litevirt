@@ -102,6 +102,7 @@ func TestNvramFlushCondition_RaisedSurvivesRestartAndResolves(t *testing.T) {
 		t.Fatal(err)
 	}
 	g.Sweep()
+	g.Sweep()
 	d.nvramFlushTick(ctx, g, &st2)
 	if row, open := nvramCondition(t, db, CondNvramFlushFailed); open {
 		t.Fatalf("condition after the file was removed: %+v", row)

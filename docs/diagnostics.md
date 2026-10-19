@@ -2278,9 +2278,10 @@ and qemu writes back only the sectors a later guest write changes, so the lost
 pages stay stale on disk. The failure belongs to the file, not its name: a
 file renamed within or between those directories (a replacement's cutover
 renames the new VM's vars file) is listed under its new name. A file that
-cannot be looked at stays listed. The node also records its failures in
-`<data_dir>/nvram-flush-failures.json`, so they survive a daemon restart
-whatever the condition row says. If that file cannot be read, the node lists
+cannot be looked at stays listed, and a removed file is dropped only once two
+sweeps in a row found it nowhere. The node also records its failures in
+`<data_dir>/nvram-flush-failures.json`, each before the condition can name
+it, so they survive a daemon restart whatever the condition row says. If that file cannot be read, the node lists
 it as a failure of its own, since the failures it held are not known.
 
 | Raised when | Clears when |
@@ -2300,7 +2301,7 @@ again. The ways out:
 - A VM kept as it is: an admin accepts that its vars store may be stale with
   `lv health resolve nvram_flush_failed host/<host> --accept-stale-uefi-vars
   --reason <why>`, which prints the files accepted. It is audited, naming every
-  file the condition named, and the host's daemon then stops reporting exactly
+  file the condition named with its inode and `episode`, and the host's daemon then stops reporting exactly
   those failure episodes (path, inode and `episode`). Any other failed file is
   raised again, and so is a new failure of a file it named, including one that
   happened after the condition was read.

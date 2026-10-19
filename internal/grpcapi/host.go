@@ -1794,6 +1794,19 @@ func (s *Server) removeHostRefusal(ctx context.Context, req *pb.RemoveHostReques
 	if h == nil {
 		return nil, none, status.Errorf(codes.NotFound, "host %q not found", req.Name)
 	}
+	// `--dead`'s refusals that do not depend on the vote come first: `lv host
+	// rm --dead` asks this preflight before it removes a voter's vote, and a
+	// refused removal must change nothing (D2 re-review I-4).
+	if req.Dead {
+		if err := s.deadRemovalRefusal(ctx, h); err != nil {
+			return nil, none, err
+		}
+		if !req.Force {
+			if err := s.deadRemovalFirmwareRefusal(ctx, req.Name); err != nil {
+				return nil, none, err
+			}
+		}
+	}
 	// A current voter keeps its vote whatever its hosts row says, so deleting
 	// the row must not look like removing the voter (recovery-claims.md §4.3).
 	if err := s.voterRemovalRefusal(ctx, req.Name); err != nil {
@@ -1843,13 +1856,9 @@ func (s *Server) removeHostRefusal(ctx context.Context, req *pb.RemoveHostReques
 	// stranded ones, and their rows stay in place for the recovery claims to
 	// supersede once this removal and the CRL have replicated.
 	if req.Dead {
+		// Again on the row the peers confirmed.
 		if err := s.deadRemovalRefusal(ctx, h); err != nil {
 			return nil, none, err
-		}
-		if !req.Force {
-			if err := s.deadRemovalFirmwareRefusal(ctx, req.Name); err != nil {
-				return nil, none, err
-			}
 		}
 	} else {
 		// Check for VMs on this host.

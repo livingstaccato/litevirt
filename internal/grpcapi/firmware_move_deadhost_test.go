@@ -314,3 +314,91 @@ func TestDoctorAcceptSource_NvramUnconfirmedTargetProvedOff(t *testing.T) {
 }
 
 var errUnreachableForTest = status.Error(codes.Unavailable, "no route to host")
+
+// D2 re-review of d87df0f4c, M-7: the refusal covers every open live firmware
+// move whose target is the host, wherever the VM's row is. A source_paused
+// move (row on the source) needs the target to answer, so its removal is
+// refused with that advice; an in-flight move with no condition is found by
+// its marker; a pre-commit target_unreachable park resolves by fence once
+// the target is proved off, so it does not hold the removal.
+//
+// Mutation: list only the VMs whose row is on the host (d87df0f4c) — the
+// source_paused and in-flight cases are not refused, red.
+func TestDeadRemovalFirmwareRefusal_TargetWhereverTheRowIs(t *testing.T) {
+	t.Run("source_paused", func(t *testing.T) {
+		r := newFwdRig(t, fwlOpts{})
+		run := r.crashAt(fwmig.PhaseMigrating)
+		m := r.park(run, fwmig.PhaseSourcePaused, "both guests paused")
+		raiseOn(t, r, condFwmigSourcePaused, m.Attempt, "src-host", "dst-host")
+		// Found by its condition alone: the row no longer reads migrating.
+		if err := corrosion.UpdateVMState(context.Background(), r.src.db, fwlVM, "paused", ""); err != nil {
+			t.Fatal(err)
+		}
+		if row := r.row(); row.HostName != "src-host" {
+			t.Fatalf("fixture: row on %s", row.HostName)
+		}
+		err := r.src.deadRemovalFirmwareRefusal(context.Background(), "dst-host")
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("refusal = %v, want FailedPrecondition", err)
+		}
+		requireText(t, err.Error(), []string{"vm/os1, recorded on src-host", "needs dst-host to answer",
+			"bring dst-host back up rather than removing it", "lv host rm --dead --force dst-host"}, noReadd)
+	})
+	t.Run("in_flight_no_condition", func(t *testing.T) {
+		r := newFwdRig(t, fwlOpts{})
+		r.crashAt(fwmig.PhaseMigrating)
+		err := r.src.deadRemovalFirmwareRefusal(context.Background(), "dst-host")
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("refusal = %v, want FailedPrecondition", err)
+		}
+		requireText(t, err.Error(), []string{"vm/os1, recorded on src-host", "could not be confirmed"}, noReadd)
+	})
+	t.Run("pre_commit_unreachable_resolves_by_fence", func(t *testing.T) {
+		r := newFwdRig(t, fwlOpts{})
+		r.parkUnreachableAtVerify()
+		m, _ := r.marker()
+		raiseOn(t, r, condFwmigTargetUnreachable, m.Attempt, "src-host", "dst-host")
+		if err := r.src.deadRemovalFirmwareRefusal(context.Background(), "dst-host"); err != nil {
+			t.Fatalf("refusal = %v, want none: the fence resolution settles it", err)
+		}
+	})
+}
+
+// D2 re-review of d87df0f4c, M-8: the nvram_unconfirmed acknowledgement and
+// the removal text name the TPM state as well as the NVRAM for a vTPM VM.
+func TestNvramUnconfirmedTextsNameTheTPMState(t *testing.T) {
+	r := newFwdRig(t, fwlOpts{})
+	run := r.crashAt(fwmig.PhaseCommitted)
+	m := r.park(run, fwmig.PhaseNvramUnconfirmed, "NVRAM unconfirmed")
+	if a := fwAckReason(m); !strings.Contains(a, "NVRAM and TPM state") {
+		t.Errorf("acknowledgement %q does not name the TPM state", a)
+	}
+	raiseOn(t, r, condFwmigNvramUnconfirmed, m.Attempt, "src-host", "dst-host")
+	requireText(t, deadHostDetail(t, r), []string{"the newer NVRAM and TPM state on dst-host"}, nil)
+	sb := m
+	sb.TPM = false
+	if a := fwAckReason(sb); strings.Contains(a, "TPM") {
+		t.Errorf("acknowledgement %q names a TPM state the VM does not have", a)
+	}
+}
+
+// D2 re-review of d87df0f4c, M-9: when a host does not answer, the refusal
+// says that one silent host leaves every firmware VM unconfirmed, that each
+// waits for its own check, and that --force is the way out if it is gone.
+func TestDeadRemovalFirmwareRefusal_SilentHostNote(t *testing.T) {
+	r := newFwdRig(t, fwlOpts{})
+	run := r.crashAt(fwmig.PhaseReleased)
+	cleaningMarker(t, r, run)
+	if err := r.src.fwRecords().RemoveMarker(fwlVM); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertHost(context.Background(), r.src.db, corrosion.HostRecord{Name: "third-host", Address: "10.0.0.3", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	r.peerC.mu.Lock()
+	r.peerC.dialErr = func() error { return errUnreachableForTest }
+	r.peerC.mu.Unlock()
+	err := r.src.deadRemovalFirmwareRefusal(context.Background(), "dst-host")
+	requireText(t, errText(err), []string{"third-host did not answer", "every firmware VM", "up to 10s",
+		"lv host rm --dead --force dst-host"}, nil)
+}

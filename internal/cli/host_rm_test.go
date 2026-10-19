@@ -43,6 +43,11 @@ func (c *hostRemoveTestClient) PlanDeadHostRemoval(_ context.Context, req *pb.Pl
 	return &pb.PlanDeadHostRemovalResponse{Host: req.GetName(), Fenced: true, FenceDetail: "ipmi power off", Voter: c.planVoter}, nil
 }
 
+func (c *hostRemoveTestClient) ChangeVoterConfig(_ context.Context, req *pb.ChangeVoterConfigRequest, _ ...grpc.CallOption) (*pb.ChangeVoterConfigResponse, error) {
+	c.calls = append(c.calls, "voter-"+req.GetOp())
+	return &pb.ChangeVoterConfigResponse{}, nil
+}
+
 func (c *hostRemoveTestClient) PreflightRemoveHost(_ context.Context, req *pb.RemoveHostRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
 	c.preflightReq = req
 	if c.preflightErr != nil {
@@ -592,11 +597,34 @@ func TestHostRemoveDead_TheDryRunRunsThePreflight(t *testing.T) {
 	if err := HostRemoveDead(context.Background(), ok, "node-9", true); err != nil || ok.preflightReq == nil || len(ok.calls) != 0 {
 		t.Errorf("a dry run the removal would make: %v (preflight %v, calls %v)", err, ok.preflightReq, ok.calls)
 	}
-	// A voter: the daemon refuses to remove a voter's host until the real
-	// run has removed the vote, so the dry run does not ask.
+	// A voter: the daemon answers every other refusal before the voter
+	// refusal, which the real run's voter removal clears, so the dry run
+	// asks and passes on that refusal alone.
 	voter := &hostRemoveTestClient{planVoter: true, preflightErr: status.Error(codes.FailedPrecondition, "node-9 is a member of voter generation 1")}
-	if err := HostRemoveDead(context.Background(), voter, "node-9", true); err != nil || voter.preflightReq != nil || len(voter.calls) != 0 {
-		t.Errorf("a voter's dry run: %v (preflight %v, calls %v), want no preflight and no change", err, voter.preflightReq, voter.calls)
+	if err := HostRemoveDead(context.Background(), voter, "node-9", true); err != nil || voter.preflightReq == nil || len(voter.calls) != 0 {
+		t.Errorf("a voter's dry run: %v (preflight %v, calls %v), want the preflight and no change", err, voter.preflightReq, voter.calls)
+	}
+}
+
+// D2 re-review I-4: for a voter's host, a refusal other than the voter
+// refusal stops `lv host rm --dead` before it removes the vote, in a real
+// run and a dry run alike; the voter refusal alone lets the real run go on
+// to its voter removal.
+//
+// Mutation: ask the preflight only inside revokeAndPublish (after the
+// voter removal) — the vote is removed by a refused run, red.
+func TestHostRemoveDead_VoterRefusalStopsBeforeTheVote(t *testing.T) {
+	rmTestPKI(t)
+	refused := status.Error(codes.FailedPrecondition, "node-9 is the target of 1 live firmware move(s) that are not settled")
+	for _, dry := range []bool{false, true} {
+		c := &hostRemoveTestClient{planVoter: true, preflightErr: refused}
+		err := HostRemoveDead(context.Background(), c, "node-9", dry)
+		if err == nil || !strings.Contains(err.Error(), "not settled") {
+			t.Errorf("dry=%v: %v, want the refusal", dry, err)
+		}
+		if len(c.calls) != 0 {
+			t.Errorf("dry=%v: calls %v after a refused removal, want none (the vote kept)", dry, c.calls)
+		}
 	}
 }
 

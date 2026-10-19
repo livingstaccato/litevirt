@@ -14,10 +14,12 @@ import (
 // D2 re-review of 78580365c, I-3 (design a): `lv host rm --dead` of a host
 // that is the target of a Secure Boot / vTPM VM's live firmware move that is
 // not settled is refused before anything is revoked, naming the doctor and
-// --force; `--dead --force` removes it anyway, and the VM stays recorded.
+// --force, and its vote is not removed; `--dead --force` removes it anyway,
+// and the VM stays recorded.
 //
-// Mutation: drop the firmware refusal from removeHostRefusal — the plain
-// removal goes through, red.
+// Mutations: drop the firmware refusal from removeHostRefusal — the plain
+// removal goes through, red; ask the dead-removal refusals after the voter
+// refusal (d87df0f4c's order) — the refused run removes the vote, red.
 func TestFleet_DeadRemovalRefusesAnUnsettledFirmwareMoveTarget(t *testing.T) {
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 4, IndependentReplicas: true, FaultSeed: 2611})
@@ -48,7 +50,24 @@ func TestFleet_DeadRemovalRefusesAnUnsettledFirmwareMoveTarget(t *testing.T) {
 	}
 	withOperatorPKI(t, a)
 
+	voters := func() (bool, int64) {
+		t.Helper()
+		cfg, err := corrosion.AdoptedVoterConfig(ctx, a.DB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, member := cfg.Member(d.Name)
+		return member, int64(cfg.Generation)
+	}
+	memberBefore, genBefore := voters()
+	if !memberBefore {
+		t.Fatalf("fixture: %s is not a voter, so the vote-first order is not exercised", d.Name)
+	}
 	err := cli.HostRemoveDead(ctx, c.SelfClient(a), d.Name, false)
+	// D2 re-review I-4: a refused removal changes nothing, its vote included.
+	if member, gen := voters(); !member || gen != genBefore {
+		t.Errorf("after the refused removal %s is a voter=%v at generation %d, want a voter at %d", d.Name, member, gen, genBefore)
+	}
 	if err == nil || !strings.Contains(err.Error(), "lv doctor firmware-move fw-old") ||
 		!strings.Contains(err.Error(), "lv host rm --dead --force "+d.Name) {
 		t.Fatalf("lv host rm --dead %s = %v, want refused naming the doctor and --force", d.Name, err)

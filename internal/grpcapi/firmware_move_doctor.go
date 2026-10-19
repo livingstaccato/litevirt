@@ -1113,6 +1113,9 @@ func fwAckReason(m fwmig.Marker) string {
 	case fwmig.PhaseTargetRan:
 		return "the target's guest ran, so its copy is newer than the source's"
 	case fwmig.PhaseNvramUnconfirmed:
+		if m.TPM {
+			return "the guest ran on the target after the release, so its NVRAM and TPM state there are newer than the source's"
+		}
 		return "the guest ran on the target after the release, so its NVRAM there is newer than the source's"
 	case fwmig.PhaseSourceStateMissing:
 		return "the source's final state was never compared with the target's copy"

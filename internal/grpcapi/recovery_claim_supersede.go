@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -356,7 +358,10 @@ const (
 type fwSourceCopy struct {
 	kind         fwSourceCopyKind
 	source, code string
-	why          string // fwCopyUnchecked: what could not be checked
+	why          string   // fwCopyUnchecked: what could not be checked
+	silent       []string // hosts that did not answer the marker sweep
+	tpm          bool     // the move's VM keeps a vTPM state
+	settles      bool     // fwCopyNone found by a marker the fence resolution settles
 }
 
 // firmwareMoveSourceCopy finds an open live firmware move of vm whose target
@@ -376,6 +381,11 @@ func (s *Server) firmwareMoveSourceCopy(ctx context.Context, vm, host string) fw
 	sort.Strings(codeList)
 	var other fwSourceCopy
 	for _, code := range codeList {
+		if code == condFwmigDiscardOwed {
+			// The move ended with the VM on its source; the DISCARD owed
+			// the target is cleanup of the target's copy, not a live move.
+			continue
+		}
 		row, found, err := corrosion.GetHealthCondition(ctx, s.db, firmwareMigrationEvaluator, code, "vm", vm)
 		if err != nil {
 			return fwSourceCopy{kind: fwCopyUnchecked, why: "its firmware_migration conditions cannot be read: " + err.Error()}
@@ -443,7 +453,8 @@ func (s *Server) firmwareMoveMarkerSweep(ctx context.Context, vm, host string) f
 		}
 	}
 	if len(silent) > 0 {
-		return fwSourceCopy{kind: fwCopyUnchecked, why: "these hosts did not answer for their records of the VM: " + strings.Join(silent, ", ")}
+		return fwSourceCopy{kind: fwCopyUnchecked, silent: silent,
+			why: strings.Join(silent, ", ") + " did not answer for its records of the VM"}
 	}
 	return fwSourceCopy{}
 }
@@ -475,9 +486,14 @@ func (s *Server) classifySourceCopy(ctx context.Context, vm, code, source, attem
 // classifyFwMoveMarker sorts a source marker m (and the condition code it was
 // found by, "" for none) by what the doctor's --accept-source does with it.
 func classifyFwMoveMarker(m fwmig.Marker, code string) fwSourceCopy {
-	v := fwSourceCopy{code: code, kind: fwCopyUnchecked}
+	v := fwSourceCopy{code: code, kind: fwCopyUnchecked, tpm: m.TPM}
 	post := fwPostCommit(fwProgress(m))
 	switch {
+	case (code == "" || code == condFwmigTargetUnreachable) && m.Phase == fwmig.PhaseTargetUnreachable && !post:
+		// The commit never landed: the fence resolution returns the VM to
+		// its source once the target is proved off, removed or not
+		// (ResolveLiveFirmwareMoveByFence).
+		v.kind, v.settles = fwCopyNone, true
 	case (code == "" || code == condFwmigCleanupFailed) && post && !m.Phase.Parked():
 		v.kind = fwCopyReturnable
 	case (code == "" || code == condFwmigTargetUnreachable) && m.Phase == fwmig.PhaseTargetUnreachable && post,
@@ -494,7 +510,16 @@ func classifyFwMoveMarker(m fwmig.Marker, code string) fwSourceCopy {
 // firmwareSourceCopyDetail is what `lv host rm --dead` says about a Secure
 // Boot / vTPM VM whose live firmware move to host is still open (v).
 func firmwareSourceCopyDetail(name, host string, v fwSourceCopy) string {
+	return firmwareMoveDetail(name, host, host, v)
+}
+
+// firmwareMoveDetail is firmwareSourceCopyDetail for a VM whose row is on
+// rowHost.
+func firmwareMoveDetail(name, rowHost, host string, v fwSourceCopy) string {
 	head := fmt.Sprintf("vm/%s uses Secure Boot / vTPM: failover never recovers it. ", name)
+	if rowHost != host {
+		head = fmt.Sprintf("vm/%s, recorded on %s, has a live firmware move to %s. ", name, rowHost, host)
+	}
 	open := fmt.Sprintf("Its live firmware move from %s to %s is still open (its marker on %s", v.source, host, v.source)
 	if v.code != "" {
 		open += ", " + v.code
@@ -515,8 +540,8 @@ func firmwareSourceCopyDetail(name, host string, v fwSourceCopy) string {
 			"`lv doctor firmware-move %s --confirm-target-nvram --accept-nvram-hash=<sha256>`, or "+
 			"`lv doctor firmware-move %s --push-source-nvram --acknowledge-rollback` once its guest is powered off. "+
 			"If it cannot, settle it before removing %s: `lv doctor firmware-move %s --accept-source --acknowledge-rollback` "+
-			"returns the VM to %s, stopped, from %s's older state, and gives up the newer NVRAM on %s",
-			host, host, name, name, host, name, v.source, v.source, host)
+			"returns the VM to %s, stopped, from %s's older state, and gives up the newer %s on %s",
+			host, host, name, name, host, name, v.source, v.source, map[bool]string{true: "NVRAM and TPM state", false: "NVRAM"}[v.tpm], host)
 	case fwCopyPaused:
 		return head + open + fmt.Sprintf("The guest is paused on %s with its state. "+
 			"`lv doctor firmware-move %s --accept-source` needs %s to answer: bring %s back up rather than removing it, then run it. "+
@@ -537,31 +562,86 @@ func firmwareSourceCopyDetail(name, host string, v fwSourceCopy) string {
 // anyway: each such VM stays recorded on host, and a source's copy stays
 // for `lv doctor firmware-move`.
 func (s *Server) deadRemovalFirmwareRefusal(ctx context.Context, host string) error {
-	vms, err := corrosion.ListVMs(ctx, s.db, "", host)
+	cands, err := s.firmwareMoveCandidates(ctx, host)
 	if err != nil {
-		return status.Errorf(codes.Unavailable, "list %s's VMs: %v", host, err)
+		return status.Errorf(codes.Unavailable, "list the firmware VMs that may be moving to %s: %v", host, err)
 	}
 	var open []string
-	for _, vm := range vms {
-		full, err := corrosion.GetVM(ctx, s.db, vm.Name)
-		if err != nil {
-			return status.Errorf(codes.Unavailable, "read VM %q: %v", vm.Name, err)
-		}
-		if full == nil || !corrosion.VMUsesFirmwareState(*full) {
+	silent := map[string]bool{}
+	for _, vm := range cands {
+		v := s.firmwareMoveSourceCopy(ctx, vm.Name, host)
+		if v.kind == fwCopyNone {
 			continue
 		}
-		if v := s.firmwareMoveSourceCopy(ctx, full.Name, host); v.kind != fwCopyNone {
-			open = append(open, firmwareSourceCopyDetail(full.Name, host, v))
+		open = append(open, firmwareMoveDetail(vm.Name, vm.HostName, host, v))
+		for _, h := range v.silent {
+			silent[h] = true
 		}
 	}
 	if len(open) == 0 {
 		return nil
 	}
+	note := ""
+	if len(silent) > 0 {
+		hs := slices.Sorted(maps.Keys(silent))
+		note = fmt.Sprintf(" %s did not answer: one host that does not answer leaves every firmware VM checked through it "+
+			"unconfirmed, and each such VM waits up to %s for its own check. If %s is itself gone for good, --force is the way out.",
+			strings.Join(hs, ", "), fwCleanupAliveReadTimeout, strings.Join(hs, ", "))
+	}
 	return status.Errorf(codes.FailedPrecondition,
 		"%s is the target of %d live firmware move(s) that are not settled, and removing it would leave no way to bring it back for them:\n  %s\n"+
-			"Settle each first. Or run `lv host rm --dead --force %s` to remove it anyway: each such VM stays recorded on %s, "+
-			"and a source's copy stays for `lv doctor firmware-move <vm>`",
-		host, len(open), strings.Join(open, "\n  "), host, host)
+			"Settle each first. Or run `lv host rm --dead --force %s` to remove it anyway: each such VM stays where it is recorded, "+
+			"and a source's copy stays for `lv doctor firmware-move <vm>`.%s",
+		host, len(open), strings.Join(open, "\n  "), host, note)
+}
+
+// firmwareMoveCandidates are the Secure Boot / vTPM VMs that may have a live
+// firmware move to host, wherever their row is: those recorded on host,
+// those an open firmware_migration condition names with host as target, and
+// those migrating toward it (row state migrating, detail naming host).
+func (s *Server) firmwareMoveCandidates(ctx context.Context, host string) ([]corrosion.VMRecord, error) {
+	names := map[string]bool{}
+	vms, err := corrosion.ListVMs(ctx, s.db, "", host)
+	if err != nil {
+		return nil, err
+	}
+	for _, vm := range vms {
+		names[vm.Name] = true
+	}
+	for code := range firmwareMigrationConditionSeverity {
+		conds, err := corrosion.ListOpenHealthConditionsByCode(ctx, s.db, firmwareMigrationEvaluator, code)
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range conds {
+			var ev struct {
+				Target string `json:"target"`
+			}
+			if json.Unmarshal([]byte(c.Evidence), &ev) != nil || ev.Target == host {
+				names[c.SubjectID] = true
+			}
+		}
+	}
+	all, err := corrosion.ListVMs(ctx, s.db, "", "")
+	if err != nil {
+		return nil, err
+	}
+	for _, vm := range all {
+		if vm.State == "migrating" && strings.Contains(vm.StateDetail, host) {
+			names[vm.Name] = true
+		}
+	}
+	var out []corrosion.VMRecord
+	for _, n := range slices.Sorted(maps.Keys(names)) {
+		full, err := corrosion.GetVM(ctx, s.db, n)
+		if err != nil {
+			return nil, err
+		}
+		if full != nil && corrosion.VMUsesFirmwareState(*full) {
+			out = append(out, *full)
+		}
+	}
+	return out, nil
 }
 
 // firmwareOnDeadHostDetail is what `lv host rm --dead` says about a Secure

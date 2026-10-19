@@ -1944,6 +1944,23 @@ then keeps the fence: its daemon runs and serves, and the host stays `fenced` or
 Fix what the cause names, confirm the host should run workloads again, then
 run `lv host undrain <host>`.
 
+### Two hosts admitted at one address (`host.address_shared`)
+
+`lv host add` admits one name per machine: the admission write is refused, in
+its own transaction, while another live or joining host holds the address at
+gRPC port 7443. That check sees only the replica that admits. Two admissions
+made on two hosts at once, each before the other's row reached it, can both be
+written, and both names then point at one machine. Evaluator `host_admission`,
+subject `cluster/hosts`; the leader-lease holder writes it.
+
+| Raised when | Clears when |
+|---|---|
+| Two live or joining hosts hold one address at one gRPC port (a port of 0 matches any). **Warning** severity. The evidence names each pair and the address. | No two live hosts share an address and port. |
+
+The machine serves the certificate of one of them. Remove the other with
+`lv host rm <host>`, or `lv host rm --dead <host>` if it is fenced and gone for
+good.
+
 ### A host stuck `upgrading` while its daemon runs (`upgrading_unconfirmed`)
 
 After a restart the host stays `upgrading` until its daemon answers its own

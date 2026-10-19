@@ -108,6 +108,12 @@ func (h HostRecord) IsWitness() bool { return h.Role == "witness" }
 
 // InsertHost creates a new host record.
 func InsertHost(ctx context.Context, c *Client, h HostRecord) error {
+	return insertHost(ctx, c, h, false)
+}
+
+// insertHost is InsertHost; exclusive is an admission's, which applies only
+// while no other host holds h's address (admissionGuard).
+func insertHost(ctx context.Context, c *Client, h HostRecord, exclusive bool) error {
 	// created_at is the row's incarnation, in the same fixed-width form as a
 	// re-admission's stamp (host_readmit.go, THE INCARNATION): a machine
 	// re-added on an empty database inserts its row after its admission, and
@@ -128,6 +134,11 @@ func InsertHost(ctx context.Context, c *Client, h HostRecord) error {
 				now, uts,
 			}
 			if !live && !liveRuntime {
+				if exclusive {
+					var held string
+					applied, err := c.ExecuteBatchGuarded(ctx, admissionGuard(ctx, h, &held), []Statement{{SQL: insertHostSQL, Params: params}})
+					return admissionResult(h, held, applied, err)
+				}
 				return c.Execute(ctx, insertHostSQL, params...)
 			}
 			// After a split the new host's membership and runtime rows are
@@ -144,6 +155,11 @@ func InsertHost(ctx context.Context, c *Client, h HostRecord) error {
 					Version: h.Version, CPU: someInt(h.CPUTotal), Mem: someInt(h.MemTotal), Disk: someInt(h.DiskTotal),
 					PolicyHash: h.CapacityPolicyHash,
 				}, uts)})
+			}
+			if exclusive {
+				var held string
+				applied, err := c.ExecuteBatchGuarded(ctx, admissionGuard(ctx, h, &held), stmts)
+				return admissionResult(h, held, applied, err)
 			}
 			return c.ExecuteBatch(ctx, stmts)
 		})
@@ -194,7 +210,7 @@ func AdmitHost(ctx context.Context, c *Client, h HostRecord) error {
 		return err
 	}
 	if len(rows) == 0 {
-		return InsertHost(ctx, c, h)
+		return insertHost(ctx, c, h, true)
 	}
 	if rows[0].String("deleted_at") == "" {
 		if strings.EqualFold(rows[0].String("cert_serial"), h.CertSerial) {
@@ -217,8 +233,10 @@ func AdmitHost(ctx context.Context, c *Client, h HostRecord) error {
 		uts := c.NowTS()
 		params := []interface{}{h.Address, h.SSHUser, h.SSHPort, h.GRPCPort, h.State, h.CertSerial, uts,
 			h.Name, h.CertSerial}
+		var held string
 		if !live {
-			return c.Execute(ctx, readmitHostSQL, params...)
+			applied, err := c.ExecuteBatchGuarded(ctx, admissionGuard(ctx, h, &held), []Statement{{SQL: readmitHostSQL, Params: params}})
+			return admissionResult(h, held, applied, err)
 		}
 		// Re-admission rewrites the identity row whole, state included, and
 		// the membership state goes with it under the same updated_at. The
@@ -227,11 +245,84 @@ func AdmitHost(ctx context.Context, c *Client, h HostRecord) error {
 		if err != nil {
 			return err
 		}
-		return c.ExecuteBatch(ctx, []Statement{
+		applied, err := c.ExecuteBatchGuarded(ctx, admissionGuard(ctx, h, &held), []Statement{
 			{SQL: readmitHostSQL, Params: params},
 			{SQL: hostMembershipStateSQL, Params: []interface{}{h.Name, h.State, epoch, reason, uts}},
 		})
+		return admissionResult(h, held, applied, err)
 	})
+}
+
+// AddressHeldError refuses an admission at an address another live or
+// joining host holds at the admitted gRPC port: one machine is admitted under
+// one name.
+type AddressHeldError struct {
+	Address string
+	Port    int
+	Holder  string
+}
+
+func (e *AddressHeldError) Error() string {
+	return fmt.Sprintf("%s:%d is %s's address", e.Address, e.Port, e.Holder)
+}
+
+// AsAddressHeld is the host an AddressHeldError in err names.
+func AsAddressHeld(err error) (holder string, ok bool) {
+	var e *AddressHeldError
+	if errors.As(err, &e) {
+		return e.Holder, true
+	}
+	return "", false
+}
+
+// hostAddressHolderSQL is the live or joining host other than name at
+// address and port. A port of 0 (or NULL) is not known, so it matches any,
+// on either side.
+const hostAddressHolderSQL = `SELECT name FROM hosts WHERE address = ? AND name <> ? AND deleted_at IS NULL
+	AND (? = 0 OR grpc_port = ? OR grpc_port = 0 OR grpc_port IS NULL) ORDER BY name LIMIT 1`
+
+// HostAddressHolder is the live or joining host other than name that holds
+// address at port, "" when none does, as this replica holds the table.
+func HostAddressHolder(ctx context.Context, c *Client, address, name string, port int) (string, error) {
+	rows, err := c.Query(ctx, hostAddressHolderSQL, address, name, port, port)
+	if err != nil || len(rows) == 0 {
+		return "", err
+	}
+	return rows[0].String("name"), nil
+}
+
+// admissionGuard is the guard of every admission write of h
+// (ExecuteBatchGuarded): it applies only if, read in the same transaction,
+// no other live or joining host holds h's address, which it records in held.
+// Two admissions of one machine under two names on this replica cannot both
+// commit, whatever read either made before.
+//
+// It is one replica's guard. Two admissions on two replicas, each made before
+// the other's row arrived, can both commit; the lease holder names such a
+// pair (grpcapi host.address_shared).
+func admissionGuard(ctx context.Context, h HostRecord, held *string) func(*sql.Tx) (bool, error) {
+	return func(tx *sql.Tx) (bool, error) {
+		err := tx.QueryRowContext(ctx, hostAddressHolderSQL, h.Address, h.Name, h.GRPCPort, h.GRPCPort).Scan(held)
+		if errors.Is(err, sql.ErrNoRows) {
+			return true, nil
+		}
+		return false, err
+	}
+}
+
+// admissionResult is an admission write's outcome: an AddressHeldError when
+// admissionGuard refused it, and nothing of it was written or logged.
+func admissionResult(h HostRecord, held string, applied bool, err error) error {
+	if err != nil {
+		return err
+	}
+	if !applied {
+		if held == "" {
+			return fmt.Errorf("admission of %s was not applied", h.Name)
+		}
+		return &AddressHeldError{Address: h.Address, Port: h.GRPCPort, Holder: held}
+	}
+	return nil
 }
 
 // ErrReadmitNeedsCounter refuses a legacy re-admission over a tombstone of a
@@ -288,17 +379,20 @@ func AdmitHostV2(ctx context.Context, c *Client, h HostRecord, g capabilities.Fe
 		}
 		at = stamp
 		params := readmitV2Params(h, next, at, uts)
+		var held string
 		if !live {
-			return c.ExecuteBatch(ctx, []Statement{{SQL: readmitHostV2SQL, Params: params}})
+			applied, err := c.ExecuteBatchGuarded(ctx, admissionGuard(ctx, h, &held), []Statement{{SQL: readmitHostV2SQL, Params: params}})
+			return admissionResult(h, held, applied, err)
 		}
 		epoch, reason, err := currentIsolation(ctx, c, h.Name)
 		if err != nil {
 			return err
 		}
-		return c.ExecuteBatch(ctx, []Statement{
+		applied, err := c.ExecuteBatchGuarded(ctx, admissionGuard(ctx, h, &held), []Statement{
 			{SQL: readmitHostV2SQL, Params: params},
 			{SQL: hostMembershipStateSQL, Params: []interface{}{h.Name, h.State, epoch, reason, uts}},
 		})
+		return admissionResult(h, held, applied, err)
 	})
 	if err != nil {
 		return 0, "", err

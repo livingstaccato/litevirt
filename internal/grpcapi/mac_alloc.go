@@ -5,11 +5,13 @@ import (
 	"crypto/rand"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -121,6 +123,24 @@ func (m *macSet) heldBy(mac string, owners ...string) string {
 	for _, o := range m.leases[mac] {
 		if !mine(o) {
 			return o
+		}
+	}
+	return ""
+}
+
+// describeHeldBy describes, for an operator, a holder of mac other than
+// owners: the NIC's workload as describeMACHolder names it, or the address
+// lease and its owner; "" when none.
+func (m *macSet) describeHeldBy(mac string, owners ...string) string {
+	mac = strings.ToLower(mac)
+	for _, h := range m.holders[mac] {
+		if !slices.Contains(owners, h.Owner) {
+			return describeMACHolder(h)
+		}
+	}
+	for _, o := range m.leases[mac] {
+		if !slices.Contains(owners, o) {
+			return "the address lease of " + o
 		}
 	}
 	return ""
@@ -310,15 +330,57 @@ func describeMACHolder(h corrosion.MACHolder) string {
 	return fmt.Sprintf("%s %s (network %s, host %s)", kind, h.Name, h.Network, h.Host)
 }
 
+// DrainResumeFromMDKey marks a StartVM as the end of a drain's cold move:
+// the source host, which shut the guest down for the move, asks the target
+// to start it again. Honoured only over peer mTLS from that host
+// (drainResumeFromPeer); a client's is ignored.
+const DrainResumeFromMDKey = "x-litevirt-drain-resume-from"
+
+// drainResumeFromPeer returns the host a StartVM says it ends a drain move
+// for, when the caller is that host over peer mTLS; "" otherwise.
+func (s *Server) drainResumeFromPeer(ctx context.Context) string {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return ""
+	}
+	v := md.Get(DrainResumeFromMDKey)
+	if len(v) == 0 || v[0] == "" {
+		return ""
+	}
+	claimed := v[0]
+	if callerAuthMethod(ctx) != authMethodMTLS || callerMTLSCommonName(ctx) != claimed || !s.isTrustedHostCN(ctx, claimed) {
+		slog.Warn("start: ignoring a drain-resume marker not sent by the claimed host over peer mTLS", "claimed_source", claimed)
+		return ""
+	}
+	return claimed
+}
+
 // refuseStartOnSharedMAC refuses an operator start of the stopped VM name
 // while one of its NICs' MACs is held by another workload's NIC: the start
 // would put two NICs on one MAC (mac_duplicate names the pair). Nothing is
-// rewritten; the refusal names the way out. A start that resumes a guest a
-// drain's cold move shut down (an open move to this host) is not refused:
-// the drain refused the move before the shutdown when the MAC was shared,
-// and a guest that was running must not be left stopped by this check.
+// rewritten; the refusal names the way out.
+//
+// A start that ends a drain's cold move resumes a guest that was running,
+// and this check must never leave it stopped: the drain refused the move
+// before the shutdown when the MAC was shared. Such a start is recognised
+// first, before any MAC is read — from the source host's marker over peer
+// mTLS, or from an open move to this host in the replica — and a journal
+// that cannot be read lets the start through (it may be one). An operator
+// start whose MACs cannot be read is refused.
 func (s *Server) refuseStartOnSharedMAC(ctx context.Context, name string) error {
 	if s.db == nil {
+		return nil
+	}
+	if src := s.drainResumeFromPeer(ctx); src != "" {
+		return nil
+	}
+	resuming, rerr := corrosion.DrainColdMoveOpenTo(ctx, s.db, name, s.hostName)
+	if rerr != nil {
+		slog.Warn("start: the drain journal cannot be read; the start may end a drain move, so its MACs are not checked",
+			"vm", name, "error", rerr)
+		return nil
+	}
+	if resuming {
 		return nil
 	}
 	mac, holder, err := s.sharedNICMAC(ctx, name)
@@ -326,11 +388,6 @@ func (s *Server) refuseStartOnSharedMAC(ctx context.Context, name string) error 
 		return status.Errorf(codes.Unavailable, "start %q: %v", name, status.Convert(err).Message())
 	}
 	if mac == "" {
-		return nil
-	}
-	if resuming, rerr := corrosion.DrainColdMoveOpenTo(ctx, s.db, name, s.hostName); rerr == nil && resuming {
-		slog.Warn("start resumes a guest a drain moved here; its MAC is shared (mac_duplicate)",
-			"vm", name, "mac", mac, "holder", describeMACHolder(holder))
 		return nil
 	}
 	return status.Errorf(codes.FailedPrecondition,

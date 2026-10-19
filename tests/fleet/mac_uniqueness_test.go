@@ -26,7 +26,9 @@ import (
 	"sync"
 	"testing"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -299,7 +301,7 @@ func TestFleet_MAC_ContainerRestoreBesideItsOriginalGetsItsOwnMAC(t *testing.T) 
 		t.Fatalf("the copy's MAC = %q, the original's %s: want one of its own", got, orig)
 	}
 	// The caller and the audit are told: the old MAC, its holder, the new one.
-	want := "MAC " + orig + " is held by ct:" + a.Name + ":" + name + "; restored with " + got
+	want := "MAC " + orig + " is held by container " + name + " (network " + ctNetName + ", host " + a.Name + "); restored with " + got
 	told := false
 	for _, st := range statuses {
 		told = told || strings.Contains(st, want)
@@ -360,5 +362,87 @@ func TestFleet_MAC_DrainLeavesARunningVMOnASharedMACRunning(t *testing.T) {
 	}
 	if active, _ := sc.src.Virt.DomainIsActive("os1"); !active {
 		t.Errorf("os1's domain is not running on %s", sc.src.Name)
+	}
+}
+
+// The drain's source tells the target, over peer mTLS, that a start ends its
+// cold move: with no drain journal replicated to the target at all, that
+// start is not refused for a shared MAC, so the guest is not left stopped.
+// The same start without the marker is refused.
+func TestFleet_MAC_ADrainResumeStartNeedsNoReplicatedJournal(t *testing.T) {
+	const dup = "52:54:00:7a:04:01"
+	c := New(t, Options{Nodes: 2}) // independent databases; nothing replicates unless pumped
+	src, dst := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+	for _, n := range c.Nodes {
+		n.Server.SetBridgeEnsure(func(string) error { return nil })
+	}
+	if _, err := c.SelfClient(dst).CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "rv", Cpu: 1, MemoryMib: 128, Placement: &pb.PlacementSpec{Host: dst.Name},
+		Network: []*pb.NetworkAttachment{{Name: "lan", Mac: dup}},
+	}}); err != nil {
+		t.Fatalf("CreateVM rv: %v", err)
+	}
+	if _, err := c.SelfClient(dst).StopVM(ctx, &pb.StopVMRequest{Name: "rv", Force: true}); err != nil {
+		t.Fatalf("StopVM rv: %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, dst.DB, corrosion.VMRecord{Name: "holder", HostName: dst.Name, State: "running"},
+		[]corrosion.InterfaceRecord{{VMName: "holder", NetworkName: "lan", MAC: dup}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if open, err := corrosion.DrainColdMoveOpenTo(ctx, dst.DB, "rv", dst.Name); err != nil || open {
+		t.Fatalf("premise: %s holds an open drain move of rv (%v, %v)", dst.Name, open, err)
+	}
+
+	peer := c.PeerClient(src, dst)
+	if _, err := peer.StartVM(ctx, &pb.StartVMRequest{Name: "rv"}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("an unmarked start on a shared MAC: got %v, want FailedPrecondition", err)
+	}
+	mctx := metadata.AppendToOutgoingContext(ctx, grpcapi.DrainResumeFromMDKey, src.Name)
+	if _, err := peer.StartVM(mctx, &pb.StartVMRequest{Name: "rv"}); err != nil {
+		t.Fatalf("the drain source's resume start: %v", err)
+	}
+	if active, _ := dst.Virt.DomainIsActive("rv"); !active {
+		t.Fatalf("rv is not running on %s after the resume start", dst.Name)
+	}
+}
+
+// A drain's start on the target carries the source's drain-resume marker,
+// and a holder of the guest's MAC that appears after the preflight does not
+// leave the guest stopped: it runs on the target.
+func TestFleet_MAC_ADrainStartCarriesTheResumeMarker(t *testing.T) {
+	const dup = "52:54:00:7a:05:01"
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	ctx := context.Background()
+	if err := corrosion.InsertInterface(ctx, sc.src.DB, corrosion.InterfaceRecord{VMName: "os1", NetworkName: "lan", MAC: dup}); err != nil {
+		t.Fatal(err)
+	}
+	sc.dst.Server.SetBridgeEnsure(func(string) error { return nil })
+	var marker []string
+	sc.dst.HookUnary("StartVM", func(hctx context.Context, req any, handler grpc.UnaryHandler) (any, error) {
+		if md, ok := metadata.FromIncomingContext(hctx); ok {
+			marker = md.Get(grpcapi.DrainResumeFromMDKey)
+		}
+		// A holder of os1's MAC appears after the preflight passed.
+		if err := corrosion.InsertVM(ctx, sc.dst.DB, corrosion.VMRecord{Name: "late", HostName: sc.dst.Name, State: "running"},
+			[]corrosion.InterfaceRecord{{VMName: "late", NetworkName: "lan", MAC: dup}}, nil); err != nil {
+			t.Error(err)
+		}
+		return handler(hctx, req)
+	})
+
+	progress, err := sc.drain(t)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if p := progress["os1"]; p == nil || p.Status != "done" || p.Error != "" {
+		t.Fatalf("drain progress for os1 = %+v, want done with no error", p)
+	}
+	if len(marker) != 1 || marker[0] != sc.src.Name {
+		t.Fatalf("the target's StartVM got drain-resume marker %v, want [%s]", marker, sc.src.Name)
+	}
+	if active, _ := sc.dst.Virt.DomainIsActive("os1"); !active {
+		t.Fatalf("os1 is not running on %s", sc.dst.Name)
 	}
 }

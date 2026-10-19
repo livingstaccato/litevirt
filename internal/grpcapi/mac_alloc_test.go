@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -335,5 +336,89 @@ func TestStartVM_AStrayLeaseAloneDoesNotRefuse(t *testing.T) {
 	s.ReconcileMACCollisions(ctx)
 	if _, ok, _ := corrosion.GetHealthCondition(ctx, s.db, NICIdentityEvaluator, CondMACDuplicate, "host", s.hostName); ok {
 		t.Fatal("a stray lease raised mac_duplicate")
+	}
+}
+
+// m1 (round 3): a start that ends a drain move is recognised before any MAC
+// is read, so a failing MAC read never refuses it; a journal that cannot be
+// read lets the start through (it may end a drain move). An operator start
+// whose MACs cannot be read is refused.
+func TestStartVM_AReadErrorNeverRefusesADrainResume(t *testing.T) {
+	ctx := context.Background()
+	const dup = "52:54:00:00:0e:01"
+	setup := func(t *testing.T, open bool) *Server {
+		t.Helper()
+		s := testServer(t)
+		vm := corrosion.VMRecord{Name: "moved", HostName: s.hostName, State: "stopped"}
+		if err := corrosion.InsertVM(ctx, s.db, vm, []corrosion.InterfaceRecord{{VMName: "moved", NetworkName: "lan", MAC: dup}}, nil); err != nil {
+			t.Fatal(err)
+		}
+		seedNICOf(t, s, "theirs", dup)
+		if open {
+			if _, err := corrosion.BeginDrainColdMove(ctx, s.db, vm, "src-host", s.hostName, "attempt-1"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return s
+	}
+	t.Run("MAC read fails, open move", func(t *testing.T) {
+		s := setup(t, true)
+		if err := s.db.Execute(ctx, `DROP TABLE container_interfaces`); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.refuseStartOnSharedMAC(ctx, "moved"); err != nil {
+			t.Fatalf("a drain resume was refused on a MAC read error: %v", err)
+		}
+	})
+	t.Run("journal read fails", func(t *testing.T) {
+		s := setup(t, false)
+		if err := s.db.Execute(ctx, `DROP TABLE operation_steps`); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.db.Execute(ctx, `DROP TABLE operations`); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.refuseStartOnSharedMAC(ctx, "moved"); err != nil {
+			t.Fatalf("a start that may end a drain move was refused on a journal read error: %v", err)
+		}
+	})
+	t.Run("MAC read fails, operator start", func(t *testing.T) {
+		s := setup(t, false)
+		if err := s.db.Execute(ctx, `DROP TABLE container_interfaces`); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.refuseStartOnSharedMAC(ctx, "moved"); status.Code(err) != codes.Unavailable {
+			t.Fatalf("an operator start with unreadable MACs: got %v, want Unavailable", err)
+		}
+	})
+}
+
+// m2 (round 3): the source's drain-resume marker is honoured only from that
+// host over peer mTLS — with no journal in this replica at all — and never
+// from a client or from another host.
+func TestStartVM_ADrainResumeMarkerOnlyFromItsPeer(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	const dup = "52:54:00:00:0f:01"
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "moved", HostName: s.hostName, State: "stopped"},
+		[]corrosion.InterfaceRecord{{VMName: "moved", NetworkName: "lan", MAC: dup}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	seedNICOf(t, s, "theirs", dup)
+	marked := func(c context.Context, from string) context.Context {
+		return metadata.NewIncomingContext(c, metadata.Pairs(DrainResumeFromMDKey, from))
+	}
+	srcPeer := peerCtxFor(t, s, "src-host")
+	if err := s.refuseStartOnSharedMAC(marked(srcPeer, "src-host"), "moved"); err != nil {
+		t.Fatalf("the source's marker over peer mTLS: %v", err)
+	}
+	for name, c := range map[string]context.Context{
+		"a client":             marked(adminCtx(), "src-host"),
+		"another host":         marked(peerCtxFor(t, s, "other-host"), "src-host"),
+		"no marker, from peer": srcPeer,
+	} {
+		if err := s.refuseStartOnSharedMAC(c, "moved"); status.Code(err) != codes.FailedPrecondition {
+			t.Errorf("%s: got %v, want FailedPrecondition", name, err)
+		}
 	}
 }

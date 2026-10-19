@@ -438,7 +438,7 @@ func (s *Server) redrawHeldContainerMACs(ctx context.Context, name string, cs co
 		if n.MAC == "" {
 			continue
 		}
-		holder := set.heldBy(n.MAC, owner)
+		holder := set.describeHeldBy(n.MAC, owner)
 		if holder == "" {
 			continue
 		}

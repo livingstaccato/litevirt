@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -346,7 +347,11 @@ func (s *Server) startOnOwner(ctx context.Context, name, target string) error {
 		if lerr == nil {
 			for _, v := range resp.GetVms() {
 				if v.GetName() == name && v.GetHostName() == target {
-					_, serr := client.StartVM(ctx, &pb.StartVMRequest{Name: name})
+					// The target is told this start ends this host's drain move
+					// (over peer mTLS), so its shared-MAC gate never leaves the
+					// guest stopped, whatever its replica of the journal holds.
+					sctx := metadata.AppendToOutgoingContext(ctx, DrainResumeFromMDKey, s.hostName)
+					_, serr := client.StartVM(sctx, &pb.StartVMRequest{Name: name})
 					return serr
 				}
 			}

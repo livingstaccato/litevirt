@@ -118,7 +118,8 @@ func hostAntiEntropyRound(t *testing.T, c *Cluster) {
 // Mutations: the WAL removal left to the clock (hostRemovalEndsLocalAdmission
 // returns false) turns "the WAL first" red on node-1 and node-2; anti-entropy
 // deciding two rows at incarnation 0 by the clock (sameLegacyAdmission
-// returns false) turns "anti-entropy first" red on every node.
+// returns false) turns "anti-entropy first" red on every node; the hosts tie
+// chain without ruleRemovedAdmission leaves "the WAL first" apart on hosts.
 func TestFleet_ALaggingHostStateWriteDoesNotBringBackARemovedHost(t *testing.T) {
 	t.Run("the WAL first", func(t *testing.T) {
 		c := removalRace(t, false, nil)
@@ -197,8 +198,9 @@ func TestFleet_ARemovedHostReaddedAfterALaggingWriteConverges(t *testing.T) {
 //     row under the same created_at with the new certificate. Anti-entropy
 //     takes the re-add everywhere.
 //
-// Mutation: sameLegacyAdmission comparing created_at alone (no serial) turns
-// "an unstamped re-add is not undone" red on every node.
+// Mutations: sameLegacyAdmission comparing created_at alone (no serial) turns
+// "an unstamped re-add is not undone" red on every node; sameLegacyAdmission
+// returning false turns "its row stays removed" red on every node.
 func TestFleet_ARemovedHostOfAnOlderBuild(t *testing.T) {
 	const legacyCreated = "2026-01-01T00:00:00Z"
 	asOlderBuild := func(c *Cluster) {

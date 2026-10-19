@@ -3476,6 +3476,20 @@ func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement,
 		if refused {
 			return nil
 		}
+		// A removal of the admission this node holds live applies over a
+		// later write to it (host_removal_stands.go).
+		ends, eErr := hostRemovalEndsLocalAdmission(ctx, tx, s, time.Now())
+		if eErr != nil {
+			return eErr
+		}
+		if ends {
+			res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
+			if err == nil && rowsChanged(res) {
+				r.client.noteOwnRowApplied(tx, s, sh)
+				r.client.deferAfterCommit(tx, func() { r.client.clearUnresolvedFromShape(sh, s) })
+			}
+			return err
+		}
 	}
 	skip, err := r.shouldSkipLWW(ctx, tx, tableName, pkCols, s, sh, incomingHLC)
 	if err != nil {

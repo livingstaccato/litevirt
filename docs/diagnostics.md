@@ -1811,16 +1811,16 @@ created and torn down. `lv rm <vm>` removes the VM; deploying the stack again
 next pass after either. A VM created after the stack was torn down is a
 deploy of that stack name in progress, and is not reported.
 
-### SYN-flood and policy conditions (`firewall.synflood.unavailable`, `firewall.policy.unreadable`)
+### SYN-flood condition (`firewall.synflood.unavailable`)
 
 Raised per host by its firewall reconciler, severity warning, and resolved on
 the next pass that no longer finds the cause. docs/firewall.md, "SYN-flood
-protection".
+protection". An unreadable SYN-flood policy row raises
+`firewall.policy.unreadable` (see "Firewall logging and policy conditions").
 
 | Condition | Raised when |
 |---|---|
 | `firewall.synflood.unavailable` | the SYN-flood policy is on for this host, but its kernel refused the SYN-flood rules of one or both address families at daemon start (`nft_limit` missing, or an nft that cannot key a set by an IPv6 prefix): that family's SYNs to its guest NICs are not limited, and the evidence names it. Restart the daemon once it can |
-| `firewall.policy.unreadable` | a firewall policy row cannot be read here; the evidence names the key and what is enforced instead (SYN-flood: on at 200/1000). Set it again (`lv firewall synflood on`, `off` or `inherit`) |
 
 ### Tag-group conditions (`firewall.tag_group.*`)
 
@@ -1851,7 +1851,7 @@ Raised per host; each resolves when its cause goes. docs/firewall.md,
 |---|---|---|
 | `firewall.log.unavailable` | warning | at start the kernel or nft refused the logging forms (`nft_log`, `nfnetlink_log`, `nft_limit`): no packet is logged on this host; the per-NIC rules are unaffected. Load the modules and restart the daemon |
 | `firewall.log.listener` | warning | the daemon cannot hold its NFLOG group (another program holds it): no log line is rendered on this host, so packets are not logged and nothing reaches that program (a listener that loses the group has its lines removed by the next pass, run at once). Set `firewall.log_group` to a free group and restart |
-| `firewall.policy.unreadable` | warning | a firewall policy row cannot be read here; the evidence names each row and the fallback it is read as (a log policy: logging off at the default budget). Set that policy again to replace the row |
+| `firewall.policy.unreadable` | warning | a firewall policy row cannot be read here; the evidence names each row and the fallback it is read as: a SYN-flood policy (`firewall_synflood`, `firewall_synflood/<host>`) as on at 200/1000, a log policy (`firewall_log`, `firewall_log/<host>`) as logging off at the default budget. Set that policy again to replace the row: `lv firewall synflood on`, `off` or `inherit --scope <host>`, or `lv firewall log-policy on`, `off` or `inherit --scope <host>` |
 
 `litevirt_firewall_log_records_total{outcome}` counts log records `kept`,
 `rate_limited` (over `firewall.log_max_rate`) and lost to `overflow`.

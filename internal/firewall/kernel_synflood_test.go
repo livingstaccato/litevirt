@@ -378,3 +378,31 @@ func TestKernelChild_ProbeRefusedByTheKernel(t *testing.T) {
 		t.Errorf("a probe left its table behind: %s", out)
 	}
 }
+
+// TestKernelChild_SynFloodAndLogLoad: a plan with SYN-flood protection AND
+// firewall logging both on (a new cluster records SYN-flood on, and a log
+// policy is set on top) renders one ruleset a real nft accepts, in enforce
+// and observe mode. `nft -c` changes nothing. Each feature's own child proves
+// it alone; this proves them together (B+C merge review m-2).
+//
+// Mutation: render the SYN-flood counter's comment before its verdict — nft
+// refuses the combined ruleset: red.
+func TestKernelChild_SynFloodAndLogLoad(t *testing.T) {
+	inNetns(t)
+	mods := append(append([]string(nil), logFormsModules...), synFloodModules...)
+	skipUnlessModules(t, "the SYN-flood and log ruleset", mods...)
+	for _, mode := range []string{NICModeEnforce, NICModeObserve} {
+		p := goldenLogPlan(mode)
+		p.SynFlood = SynFlood{On: true, Rate: 200, Burst: 1000}
+		script, err := Render(p)
+		if err != nil {
+			t.Fatalf("%s: Render: %v", mode, err)
+		}
+		if !strings.Contains(script, "update @"+setSyn4) || !strings.Contains(script, "update @"+setSyn6) || !strings.Contains(script, " log group ") {
+			t.Fatalf("%s: the ruleset does not carry both SYN-flood lines and a log line", mode)
+		}
+		if err := nftCheck(t, script); err != nil {
+			t.Errorf("%s: nft -c refused the SYN-flood and log ruleset: %v", mode, err)
+		}
+	}
+}

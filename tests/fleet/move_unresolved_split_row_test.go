@@ -1,9 +1,11 @@
 // A pivoted move whose committed disk row reached only some replicas. The
 // holder committed the row onto the copy and pushed it to c, then died before
 // its push to b landed. The VM was rescheduled to b, whose row still named
-// the source: b started it there and wrote it. b was lost, and the VM was
-// rescheduled to c, whose row names the copy (the reschedule moves only the
-// host). c must not boot the copy, which would drop every write b made.
+// the source: b started it there and wrote it. b was lost before its history
+// reached c, and the VM was rescheduled to c, whose row names the copy. c must
+// not boot the copy, which would drop every write b made. (Once b's history
+// reaches c first, c's row names the source: a reschedule carries the disk
+// placement it read, TestFleet_RescheduleCarriesTheDiskRowItRead.)
 //
 // Multi-node by construction: the hosts' rows disagree because of the order
 // their histories were delivered in.
@@ -34,9 +36,8 @@ import (
 //     commits the row, pivots and writes the copy; its history reaches c only.
 //  2. a is proven powered off; split is rescheduled to b, whose row names
 //     the source. b starts it there and writes it.
-//  3. b's history reaches c: c's row now names b and the copy.
-//  4. b is lost and proven powered off; split is rescheduled to c, whose row
-//     names c and the copy.
+//  3. b is lost before its history reaches c, and is proven powered off.
+//  4. split is rescheduled to c, whose row names c and the copy.
 //  5. c's start is refused: the row stays on the copy, nothing is booted,
 //     both files keep their writes, the condition stays open.
 //  6. On c, `--accept <src>` points the row back at the source, keeping b's
@@ -134,8 +135,7 @@ func TestFleet_MoveUnresolved_SplitRowHoldsAfterTheSecondReschedule(t *testing.T
 	}
 	modTimes(t, dst, src)
 
-	// 3. b's history reaches c; 4. b is lost, and split is rescheduled to c.
-	pumpMutations(t, c, b, cn)
+	// 3. b is lost before its history reaches c; 4. split is rescheduled to c.
 	if err := corrosion.InsertFenceLog(ctx, cn.DB, corrosion.FenceLogRecord{ID: "confirm-" + b.Name, HostName: b.Name,
 		Method: "manual", Result: "manual-confirmed", Detail: "operator powered it off"}); err != nil {
 		t.Fatal(err)

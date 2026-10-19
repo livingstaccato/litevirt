@@ -487,7 +487,8 @@ func TestCleanupDeletedVMLeftovers_RetriesUntilTheTombstoneArrives(t *testing.T)
 	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
 		return abortingPeer{n: &n, abortFor: 2}, func() {}, nil
 	}
-	s.cleanupDeletedVMLeftovers(context.Background(), deletedVMLeftovers{vm: "os1", hosts: []string{"node-3"}})
+	s.cleanupDeletedVMLeftovers(context.Background(), deletedVMLeftovers{vm: "os1", hosts: []string{"node-3"},
+		left: map[string]bool{"node-3": true}}, true)
 	if n != 3 {
 		t.Fatalf("asked %d times, want 3 (two ABORTED, then OK)", n)
 	}

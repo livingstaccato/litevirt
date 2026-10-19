@@ -317,6 +317,18 @@ lv backup schedule rm --pool fast-ssd --repo main      # match the scope on remo
 Pool-mode is per-host, not leader-gated for the same reason per-VM
 mode isn't: each host fires for its own slice of the pool.
 
+A workload's own schedules end with it: `lv rm`, `lv ct rm` and
+`lv compose down` remove the deleted VM's per-VM schedules (backup or
+replication) and the deleted container's replication schedules. A rebuild, a
+compose re-create, a blue-green or snapshot-and-replace cutover and a failed
+clone keep them, and a schedule whose VM or container is gone for any other
+reason stays dormant until the name comes back. A schedule left behind by a
+delete the entry could not attribute (one entered on an older build, or made
+with a host certificate) for a workload of a stack that has since been torn
+down is removed by the failover lease holder's sweep 24 hours after the
+workload was deleted, or after the last run that finished after it, and does
+not keep that stack's backup repo registered.
+
 Repos referenced by schedules resolve through the cluster's repo map: a
 top-level compose `backup-repos:` block (see below) or daemon config
 `backup_repos:` (a flat `name: /path` map). When both define the same name,
@@ -889,8 +901,8 @@ incomplete the VM is marked **partial**:
 - the marker is durable: the health condition `vm.promoted_partial` (evaluator
   `replica_set`), shown by `lv inspect <vm>` as `promotedPartial` until a later
   promotion recovers the whole set or the VM is deleted (a VM re-created
-  under the name never inherits it). `lv health resolve` does not cover it:
-  it resolves only the dual-run detector's conditions.
+  under the name never inherits it). `lv health resolve` does not resolve
+  `vm.promoted_partial`.
 
 A disk not recovered is not attached; attach or restore it once its host is
 back. A file already where a disk's live disk would go (a crashed earlier

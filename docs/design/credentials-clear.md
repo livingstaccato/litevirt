@@ -18,8 +18,9 @@ dual-write step of a column move
 - the periodic split pass copies old column to credential table where the
   credential row is missing or older, and never clears;
 - readers take the credential row whenever one exists, and the old column only
-  when none does. A secret an unlatched node writes to the old column alone is
-  absorbed into the credential row where it is applied.
+  when none does. A retired row (its host removed or re-admitted) reads as no
+  secret, and no pass copies over it. A secret an unlatched node writes to the
+  old column alone is absorbed into the credential row where it is applied.
 
 So the old columns are always current. A host rolled back below
 `credentials_split_v1` still enters WAL quarantine (the capability-rollback

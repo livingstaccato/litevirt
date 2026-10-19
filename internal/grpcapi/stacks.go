@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -251,6 +252,17 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// From here on the deploy issues workload actions, on this host and on
 	// peers, and its firewall rows stay whatever happens (see above).
 	workloadPhase = true
+	// A deploy whose client went away after it tore a VM down to re-create
+	// it has replaced that VM with the new file's, whatever becomes of the
+	// client: the file is recorded, degraded, since the rest of the plan did
+	// not run. A deploy that tore nothing down, or that stopped for another
+	// reason (a rolling update's fail-fast), leaves the record as it was.
+	ctx, replaced := withReplaceMark(ctx)
+	defer func() {
+		if err != nil && replaced.Load() && ctx.Err() != nil {
+			s.recordStackDeploy(ctx, f, req.ComposeYaml, stackStateDegraded)
+		}
+	}()
 	if err := s.applyNICRetargets(ctx, resolved, stream, failures); err != nil {
 		return err
 	}
@@ -296,25 +308,7 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	if len(failures.names) > 0 {
 		stackState = stackStateDegraded
 	}
-	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(req.ComposeYaml)))
-	if dbErr := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{
-		Name:        f.Name,
-		ComposeHash: hash,
-		ComposeYAML: req.ComposeYaml,
-		State:       stackState,
-	}); dbErr != nil {
-		slog.Warn("upsert stack record failed", "stack", f.Name, "error", dbErr)
-	}
-	// The deny this file asks for is re-asserted now that its record is
-	// written: the persist above left a deny another stack owned as it was,
-	// and that owner may have gone down (or dropped it) since, seeing no
-	// record of this stack asking for it. The cluster must not end this
-	// deploy default-allow. A deny in force stays with its owner.
-	if fd := f.FirewallDefaults; fd != nil && fd.DefaultDeny {
-		if dbErr := corrosion.EnsureClusterDefaultDeny(ctx, s.db, f.Name); dbErr != nil {
-			slog.Warn("re-assert the stack's cluster default-deny failed; the stack reconciler retries", "stack", f.Name, "error", dbErr)
-		}
-	}
+	s.recordStackDeploy(ctx, f, req.ComposeYaml, stackState)
 
 	if len(failures.names) > 0 {
 		detail := fmt.Sprintf("%d of %d VM ops failed (%s)",
@@ -327,6 +321,52 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 		vmOps, len(resolved.Networks), len(resolved.LBs)))
 	s.audit(ctx, "stack.deploy", f.Name, fmt.Sprintf("%d VM ops", vmOps), "ok")
 	return nil
+}
+
+// replaceMarkKey carries a deploy's record that one of its re-creates tore
+// a VM down.
+type replaceMarkKey struct{}
+
+func withReplaceMark(ctx context.Context) (context.Context, *atomic.Bool) {
+	b := &atomic.Bool{}
+	return context.WithValue(ctx, replaceMarkKey{}, b), b
+}
+
+// markReplaced records in the deploy carrying ctx, if any, that a re-create
+// tore its VM down.
+func markReplaced(ctx context.Context) {
+	if b, ok := ctx.Value(replaceMarkKey{}).(*atomic.Bool); ok {
+		b.Store(true)
+	}
+}
+
+// stackRecordTimeout bounds recordStackDeploy.
+const stackRecordTimeout = 30 * time.Second
+
+// recordStackDeploy writes the stack record of a deploy that has acted, and
+// re-asserts the default-deny its file asks for: the persist left a deny
+// another stack owned as it was, and that owner may have gone down (or
+// dropped it) since, seeing no record of this stack asking for it. The
+// cluster must not end this deploy default-allow. A deny in force stays with
+// its owner. It runs whatever becomes of the deploy's client, on its own
+// bounded context.
+func (s *Server) recordStackDeploy(ctx context.Context, f *compose.File, composeYAML, state string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stackRecordTimeout)
+	defer cancel()
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(composeYAML)))
+	if dbErr := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{
+		Name:        f.Name,
+		ComposeHash: hash,
+		ComposeYAML: composeYAML,
+		State:       state,
+	}); dbErr != nil {
+		slog.Warn("upsert stack record failed", "stack", f.Name, "error", dbErr)
+	}
+	if fd := f.FirewallDefaults; fd != nil && fd.DefaultDeny {
+		if dbErr := corrosion.EnsureClusterDefaultDeny(ctx, s.db, f.Name); dbErr != nil {
+			slog.Warn("re-assert the stack's cluster default-deny failed; the stack reconciler retries", "stack", f.Name, "error", dbErr)
+		}
+	}
 }
 
 // stackFirewallWrites records the firewall rows one persistStackFirewall
@@ -1213,8 +1253,10 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	}
 
 	// Mark stack as "deleting" first — this is durable and survives crashes.
-	// The background StackReconciler will pick up stacks stuck in this state.
-	if err := corrosion.SetStackState(ctx, s.db, req.Name, "deleting"); err != nil {
+	// The background StackReconciler will pick up stacks stuck in this state,
+	// and keeps the disks when this teardown does (keep_disks): the choice
+	// is recorded with the state, in the same write.
+	if err := corrosion.MarkStackDeleting(ctx, s.db, req.Name, req.KeepDisks, s.hostName); err != nil {
 		return status.Errorf(codes.Internal, "set stack state: %v", err)
 	}
 
@@ -1563,6 +1605,9 @@ func (s *Server) deleteVMWithFanout(ctx context.Context, m stackMember, keepDisk
 			peerErr := s.fanoutDeleteVM(ctx, vmName, stackName, keepDisks)
 			switch {
 			case peerErr == nil:
+				// The peer that deleted the member was called by a peer, so
+				// it left the member's schedules; this teardown is their entry.
+				s.deleteVMSchedules(context.WithoutCancel(ctx), vmName)
 				return nil
 			case errors.Is(peerErr, errNotStackMember):
 				return peerErr
@@ -1584,6 +1629,7 @@ func (s *Server) deleteVMWithFanout(ctx context.Context, m stackMember, keepDisk
 		// locally won't fix that. Try fanout to other peers instead.
 		if code == codes.Unavailable {
 			if peerErr := s.fanoutDeleteVM(ctx, vmName, stackName, keepDisks); peerErr == nil {
+				s.deleteVMSchedules(context.WithoutCancel(ctx), vmName)
 				return nil
 			} else if errors.Is(peerErr, errNotStackMember) {
 				return peerErr
@@ -1829,6 +1875,35 @@ func (s *Server) DeleteVMForStackCleanup(ctx context.Context, req *pb.DeleteVMRe
 	authCtx := context.WithValue(ctx, ctxKeyRole, "admin")
 	authCtx = context.WithValue(authCtx, ctxKeyUsername, "system:stack-reconciler")
 	return s.DeleteVM(authCtx, req)
+}
+
+// NameStackTeardownKeptDisks names, by disk_leftover on this host, the disks
+// of vm, a stack member the stack reconciler deleted keeping its disks because
+// it could not prove the teardown let them go (why): no disk choice recorded,
+// another teardown's, or one it cannot read. Disks a delete keeps by their
+// own record (delete_with_vm=false) are not named here.
+func (s *Server) NameStackTeardownKeptDisks(ctx context.Context, stack string, vm corrosion.VMRecord, why string) {
+	disks, err := corrosion.VMIncarnationDisks(ctx, s.db, vm.Name, vm.CreatedAt)
+	if err != nil {
+		slog.Warn("stack-reconciler: the disks it kept could not be read, so they are not named",
+			"stack", stack, "vm", vm.Name, "reason", why, "error", err)
+		return
+	}
+	var kept []KeptDisk
+	for _, d := range disks {
+		if !d.DeleteWithVM || d.Path == "" {
+			continue
+		}
+		kept = append(kept, KeptDisk{Path: d.Path, Disk: d.DiskName, Host: d.HostName,
+			Reason: fmt.Sprintf("the stack reconciler finished stack %q's teardown and kept this disk, as it could not prove "+
+				"the teardown let it go: %s. Remove it by hand unless the stack delete asked to keep disks", stack, why)})
+	}
+	// As at every other record site: a disk on this host that is positively
+	// gone (the other deleter removed it) has nothing left to name.
+	kept = s.keptThere(kept)
+	authCtx := context.WithValue(ctx, ctxKeyRole, "admin")
+	authCtx = context.WithValue(authCtx, ctxKeyUsername, "system:stack-reconciler")
+	s.recordKeptDisks(authCtx, vm.Name, kept)
 }
 
 // DeleteContainerForStackCleanup is DeleteVMForStackCleanup for a stack's

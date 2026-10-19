@@ -242,19 +242,8 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return nil, err
 	}
 
-	// Check if VM already exists. A rebuild or recreate whose replica here has
-	// not yet applied the tombstone of the VM it replaces sees that VM's row:
-	// exactly that incarnation is settled (settleReplacedVM), anything else
-	// still refuses.
-	if existing, _ := corrosion.GetVM(ctx, s.db, spec.Name); existing != nil {
-		replaced, serr := s.settleReplacedVM(ctx, existing)
-		if serr != nil {
-			return nil, status.Errorf(codes.Unavailable,
-				"VM %q: this host still holds the VM it re-creates and could not retire it: %v", spec.Name, serr)
-		}
-		if !replaced {
-			return nil, status.Errorf(codes.AlreadyExists, "VM %q already exists", spec.Name)
-		}
+	if err := s.refuseExistingVM(ctx, spec.Name); err != nil {
+		return nil, err
 	}
 
 	// Resource defaults BEFORE admission. Everything below — quota, placement,
@@ -366,32 +355,8 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		s.audit(ctx, "vm.create", spec.Name,
 			fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 				targetHost, spec.Cpu, spec.MemoryMib), "allow-overcommit")
-		// Bypassing the CHECK does not mean hiding the DRAW: an overcommit create
-		// that reserved nothing would be invisible to the very next admission, so a
-		// normal create could be admitted against memory this one is already using.
-		// Reserved on the OWNING node only, for the same double-count reason the
-		// checked path reserves there.
-		if targetHost == s.hostName {
-			lease, aerr := s.reserveWithoutCheck(ctx, "CreateVM", targetHost, project,
-				"vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib))
-			if aerr != nil {
-				return nil, aerr
-			}
-			defer lease.release(ctx)
-			// --allow-overcommit bypasses HOST capacity only. Project quota is a
-			// tenancy limit, not a physical judgment call, so it goes through the
-			// SERIALIZED admission like any other create — the earlier tenancy
-			// fail-fast cannot see in-flight reservations, so relying on it here
-			// let concurrent overcommit creates all observe the same headroom.
-			createQuota := vmSpecQuotaAmount(spec)
-			qLease, qerr := s.admitQuotaWithReservation(ctx, "CreateVM", targetHost, project,
-				corrosion.WorkloadVM, spec.Name, createQuota, createQuota, intentVMResident)
-			if qerr != nil {
-				return nil, qerr
-			}
-			defer qLease.release(ctx)
-			createLease = qLease
-		}
+		// The draw is reserved on the owning node only, once this create holds
+		// its flight (below, after beginCreate).
 	} else if err := s.checkResourceAdmission(ctx, targetHost, project, int(spec.Cpu), int(spec.MemoryMib)); err != nil {
 		// Advisory fail-fast on the ENTRY node: read-only, so it costs nothing and
 		// rejects the hopeless case before we forward. The authoritative
@@ -441,6 +406,50 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		return s.forwardCreateVM(ctx, req, targetHost)
 	}
+	// This host owns the create, and no other create of the name runs here
+	// until it returns (beginCreate): two would share the name's domain and
+	// paths, and each one's sweeps and cleanup would act on the other's.
+	// Taken before anything is reserved or made, so a refused create did
+	// nothing. The existence check above ran before the flight was taken: a
+	// create of the name that finished in between has a row by now.
+	if h := s.createBeforeFlightHook; h != nil {
+		h(spec.Name)
+	}
+	endFlight, setFlightUUID, err := s.beginCreate(spec.Name)
+	if err != nil {
+		return nil, err
+	}
+	defer endFlight()
+	if err := s.refuseExistingVM(ctx, spec.Name); err != nil {
+		return nil, err
+	}
+	if req.AllowOvercommit {
+		// Bypassing the CHECK does not mean hiding the DRAW: an overcommit create
+		// that reserved nothing would be invisible to the very next admission, so a
+		// normal create could be admitted against memory this one is already using.
+		// Reserved on the OWNING node only, for the same double-count reason the
+		// checked path reserves there, and under the flight, so a create refused
+		// for another in flight reserved nothing.
+		lease, aerr := s.reserveWithoutCheck(ctx, "CreateVM", targetHost, project,
+			"vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib))
+		if aerr != nil {
+			return nil, aerr
+		}
+		defer lease.release(ctx)
+		// --allow-overcommit bypasses HOST capacity only. Project quota is a
+		// tenancy limit, not a physical judgment call, so it goes through the
+		// SERIALIZED admission like any other create — the earlier tenancy
+		// fail-fast cannot see in-flight reservations, so relying on it here
+		// let concurrent overcommit creates all observe the same headroom.
+		createQuota := vmSpecQuotaAmount(spec)
+		qLease, qerr := s.admitQuotaWithReservation(ctx, "CreateVM", targetHost, project,
+			corrosion.WorkloadVM, spec.Name, createQuota, createQuota, intentVMResident)
+		if qerr != nil {
+			return nil, qerr
+		}
+		defer qLease.release(ctx)
+		createLease = qLease
+	}
 	// This host owns the create. A create that fails here is logged with its
 	// cause, and with what its cleanup did (undone, noted as each step runs),
 	// so the owner's log shows both and not only "creating VM" (lab 2, O5).
@@ -476,6 +485,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// keyed by it (never by the name, which a deleted namesake may have used),
 	// and removed again if the create fails.
 	spec.Uuid = uuid.NewString()
+	setFlightUUID(spec.Uuid)
 	// rowCommitted is set once the VM row has committed: from then on the VM
 	// exists and runs, and a later failure (reading it back, a step after it,
 	// a caller that stopped waiting) undoes nothing — no deferred cleanup
@@ -588,6 +598,17 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	var diskConfigs []lv.DiskConfig
 	var diskRecords []corrosion.DiskRecord
 	var createdDiskPaths []string
+	// createdDiskFile is the file each host-local disk this create made is
+	// (its identity, read right after it was made; madeFileID): a failed
+	// create removes a path only while that file is still there, never
+	// another create's or domain's file that took the path since.
+	createdDiskFile := map[string]madeFileID{}
+	recordDisk := func(p string) {
+		createdDiskPaths = append(createdDiskPaths, p)
+		if id, ok := madeFileIdentity(p); ok {
+			createdDiskFile[p] = id
+		}
+	}
 	// A disk that is not a file (an rbd image) is removed by the driver that
 	// created it: os.Remove of "rbd:pool/image" removes nothing, which is how a
 	// failed create left its ceph images behind.
@@ -628,7 +649,14 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	}
 	cleanupDisks := func() {
 		removeSeed()
+		// A domain of the name that is not this create's names paths a
+		// failed create must leave, whoever made the file there.
+		foreign := s.foreignDomainDiskPaths(spec.Name, spec.Uuid)
 		for _, p := range createdDiskPaths {
+			if foreign(p) {
+				noteUndo("disk " + p + " left: a domain of the name this create did not define names it")
+				continue
+			}
 			if drv := createdBy[p]; drv != nil {
 				// The request may be what failed (cancelled, timed out); the
 				// image this create made is removed regardless.
@@ -641,6 +669,14 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 					continue
 				}
 				noteUndo("removed disk " + p)
+				continue
+			}
+			made, ok := createdDiskFile[p]
+			if _, serr := os.Lstat(p); serr != nil && os.IsNotExist(serr) {
+				continue
+			}
+			if !ok || !made.stillAt(p) {
+				noteUndo("disk " + p + " left: it is no longer the file this create made")
 				continue
 			}
 			if rmErr := os.Remove(p); rmErr != nil && !os.IsNotExist(rmErr) {
@@ -656,16 +692,25 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return nil, status.Errorf(codes.Internal, "libvirt not connected on host %s", s.hostName)
 	}
 
-	// If a libvirt domain with this name exists but no active DB record does
-	// (we already checked above), it's an orphan from an incomplete delete.
-	// Only clean up if stopped — refuse if it's actually running.
+	// A libvirt domain of the name with no VM record (checked above, under
+	// this create's flight) is a leftover of an incomplete delete or a failed
+	// create, and is removed — only when it is stopped and no create in flight
+	// here defined it (refuseLiveDomainOfName).
 	if s.virt.DomainExists(spec.Name) {
+		if err := s.refuseLiveDomainOfName(spec.Name, spec.Uuid); err != nil {
+			return nil, err
+		}
 		state, _ := s.virt.DomainState(spec.Name)
 		slog.Warn("cleaning up orphaned libvirt domain", "vm", spec.Name, "state", state)
-		if state == "running" {
-			s.virt.DestroyDomain(spec.Name)
+		uerr := s.virt.UndefineDomain(spec.Name, true)
+		// Still there (the undefine failed, or someone started it in between
+		// and it is now transient): the debris sweep below must not run under
+		// it.
+		if s.virt.DomainExists(spec.Name) {
+			return nil, status.Errorf(codes.Unavailable,
+				"create %s refused on %s: a leftover domain of the name could not be removed (undefine: %v); "+
+					"nothing was created and the domain is left as it is", spec.Name, s.hostName, uerr)
 		}
-		s.virt.UndefineDomain(spec.Name, true)
 	}
 
 	// The refusals the create would meet later that do not depend on what it
@@ -847,7 +892,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			return nil, status.Errorf(codes.Internal, "create disk %s: %v", d.Name, err)
 		}
 		if !fixedDevice {
-			createdDiskPaths = append(createdDiskPaths, diskPath)
+			recordDisk(diskPath)
 		}
 
 		// An unset discard becomes the storage type's default now, in the spec
@@ -900,7 +945,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			cleanupDisks()
 			return nil, status.Errorf(codes.Internal, "create default disk: %v", err)
 		}
-		createdDiskPaths = append(createdDiskPaths, diskPath)
+		recordDisk(diskPath)
 		diskConfigs = append(diskConfigs, lv.DiskConfig{
 			Name: "root",
 			Path: diskPath,
@@ -1354,8 +1399,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// VM with a unique name and no prior/other owner — there is no ownership contest
 	// to arbitrate, so it can't double-run. Gating it would only block new workloads
 	// on a quorum-degraded node with zero safety benefit. The one cross-partition
-	// hazard (two operators creating the SAME name on both sides) is an operator error
-	// caught by the vms PK + owner-assert on heal, not something a quorum gate closes.
+	// hazard (two creates of the SAME name placed on different owners, on both sides of
+	// a partition or not) is not something a quorum gate closes, and nothing here
+	// resolves it: the per-host flight (beginCreate) serialises only creates on ONE
+	// owner. The vms PK keeps one row by LWW, and owner-assert DETECTS the second
+	// runtime on heal and alerts (SPLIT-BRAIN); it does not stop either copy. A
+	// replicated per-name create claim is the known follow-up.
 
 	// The ISO was judged before admission; an image pull can run in between,
 	// and qemu opens it at this boot, so it is judged again now.
@@ -1431,10 +1480,11 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// cannot be read or names no uuid, is left as it is with its disks,
 	// claims, LUNs and host-isolated addresses, and reported: removing them
 	// under a running guest is worse, and the next create of the name removes
-	// a leftover domain first. A domain gone by then is gone: its claims and
-	// swtpm tree are released, the disks are left (whatever removed the domain
-	// may have created at their paths since). Its seed is removed if it is
-	// still the file this create placed.
+	// a leftover domain first once it is stopped (refuseLiveDomainOfName). A
+	// domain gone by then is gone: its claims and swtpm tree are released, the
+	// disks are left (whatever removed the domain may have created at their
+	// paths since). Its seed is removed if it is still the file this create
+	// placed.
 	//
 	// The domain is undefined only after the disks, seed and vars at its
 	// name's paths are removed: while a domain of the name is defined, a
@@ -1467,7 +1517,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				"name", spec.Name, "host", s.hostName, "cause", cause, "error", xerr)
 			noteUndo(fmt.Sprintf("domain left as it is, with its disks: its definition could not be read (%v)", xerr))
 			return fmt.Errorf("%w; the definition of domain %s on %s could not be read (%v), so it is left as it is, "+
-				"with its disks and no VM record: the next create of %s removes it", cause, spec.Name, s.hostName, xerr, spec.Name)
+				"with its disks and no VM record: the next create of %s removes it if it is stopped, and is refused while it runs", cause, spec.Name, s.hostName, xerr, spec.Name)
 		}
 		if u != spec.Uuid {
 			return gone(fmt.Sprintf("domain %s on %s is no longer the one this create defined (uuid %s)", spec.Name, s.hostName, u))
@@ -1480,7 +1530,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 					"name", spec.Name, "host", s.hostName, "cause", cause, "error", derr)
 				noteUndo(fmt.Sprintf("domain left defined and running, with its disks: it could not be stopped (%v)", derr))
 				return fmt.Errorf("%w; its domain could not be stopped on %s (%v) and is left defined with its disks, "+
-					"with no VM record: the next create of %s removes it", cause, s.hostName, derr, spec.Name)
+					"with no VM record: the next create of %s is refused while it runs", cause, s.hostName, derr, spec.Name)
 			}
 		}
 		noteUndo("domain stopped")
@@ -2997,12 +3047,83 @@ func (s *Server) checkNoRemotePCIOwner(ctx context.Context, vmName string) error
 // claiming a running guest, and no restart policy may bring back a VM that is
 // being deleted. The audit row carries why the delete stopped.
 func (s *Server) abortDeleteAfterStop(ctx context.Context, name string, destroyed bool, why string) {
+	// Its own budget: the delete's may be what ran out, and a stop left
+	// unrecorded is a running row with no domain, which the reconciler
+	// restarts.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deleteAbortRecordTimeout)
+	defer cancel()
 	if destroyed {
 		if werr := s.persistVMState(ctx, name, "stopped", "operator-stop", corrosion.OpVMState); werr != nil {
 			slog.Warn("DeleteVM: recording the stop of a VM whose delete failed also failed", "vm", name, "error", werr)
 		}
 	}
 	s.audit(ctx, "vm.delete", name, why, "error")
+}
+
+// deleteFinishTimeout bounds the rest of a VM delete once it has started
+// acting (detachDelete).
+const deleteFinishTimeout = 10 * time.Minute
+
+// deleteAbortRecordTimeout bounds abortDeleteAfterStop's writes.
+const deleteAbortRecordTimeout = 30 * time.Second
+
+// detachDelete is the context a delete runs on from its first destructive
+// step: the request's values (identity, trace, the response header) without
+// its cancellation, bounded by deleteFinishTimeout. A client that goes away
+// after the domain is stopped or undefined, or a peer's forward or stack
+// teardown cancelled with it, must not stop the delete between that step and
+// the tombstone (lab 2 F1): the row would stay running over an undefined
+// domain, and the reconciler would start the VM again on the disks the
+// delete had set out to remove. Before this point a cancellation still
+// refuses the delete with nothing done.
+func (s *Server) detachDelete(ctx context.Context) (context.Context, context.CancelFunc) {
+	bound := s.deleteFinish
+	if bound <= 0 {
+		bound = deleteFinishTimeout
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), bound)
+}
+
+// refuseIfCancelled refuses a delete or a replace whose caller has gone,
+// before it acts: nothing is done yet, so nothing is left half done.
+func refuseIfCancelled(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return status.FromContextError(err).Err()
+	}
+	return nil
+}
+
+// replaceFinishTimeout bounds a rebuild or re-create once its teardown has
+// started (detachReplace).
+const replaceFinishTimeout = 30 * time.Minute
+
+// detachReplace is detachDelete for a rebuild or re-create: from its
+// teardown on, the delete and the create that follows it run whatever
+// becomes of the caller, so a replace that has started never ends with no
+// copy of the VM because its client went away.
+func detachReplace(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), replaceFinishTimeout)
+}
+
+// deletePostStepsTimeout bounds the steps DeleteVM runs on the entry host
+// once the delete has succeeded.
+const deletePostStepsTimeout = 30 * time.Second
+
+// SetDeleteFinishTimeoutForTest sets how long a delete runs once it has
+// started acting.
+func (s *Server) SetDeleteFinishTimeoutForTest(d time.Duration) { s.deleteFinish = d }
+
+// SetDeleteStepHookForTest sets a hook run at named steps of a VM delete:
+// "acting" once the no-domain cleanup has detached, "nics" before the NIC
+// read, "tombstone" before the tombstone (on either path); and for a
+// container on a removed host, "removed-host" once its delete has detached.
+func (s *Server) SetDeleteStepHookForTest(fn func(vm, step string)) { s.deleteStep = fn }
+
+// deleteStepHook runs the deleteStep test seam.
+func (s *Server) deleteStepHook(vm, step string) {
+	if fn := s.deleteStep; fn != nil {
+		fn(vm, step)
+	}
 }
 
 // without returns ss with every occurrence of drop removed (order preserved).
@@ -3071,6 +3192,15 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			fwID = corrosion.FirewallIDOf(corrosion.TagMemberVM, vm.Spec)
 		}
 	}
+	// A plain delete ends the VM's own schedules too (deleteVMSchedules), on
+	// the same terms, and never on a host a peer called: an entry on an older
+	// build forwards a re-create's delete with no marker. A blue-green
+	// cutover's delete of the blue keeps them (withSchedulesKept).
+	dropSchedules := false
+	if !deleteLocalOnly(ctx) && !hasDeletedVMSink(ctx) && !schedulesKept(ctx) && !s.forwardedByEntry(ctx) && !s.isRemotePeer(ctx) {
+		vm, err := corrosion.GetVM(ctx, s.db, req.Name)
+		dropSchedules = err == nil && vm != nil
+	}
 	if !deleteLocalOnly(ctx) && !s.isRemotePeer(ctx) && !isRecreateDelete(ctx) {
 		if vm, err := corrosion.GetVM(ctx, s.db, req.Name); err == nil && vm != nil {
 			createdAt = vm.CreatedAt
@@ -3083,7 +3213,13 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			}
 		}
 	}
-	out, err := s.deleteVM(ctx, req)
+	sinkCtx, sink := withLeftoverSink(ctx)
+	out, err := s.deleteVM(sinkCtx, req)
+	if err == nil && sink != nil && sink.plan != nil {
+		// deleteVM has released the VM's lock and start lease: wait for the
+		// hosts the VM left here, bounded, holding neither.
+		setLeftoverDomainHeader(ctx, s.cleanupDeletedVMLeftovers(context.WithoutCancel(ctx), *sink.plan, true))
+	}
 	var noAnswer probeNoAnswer
 	if err != nil && deleteLocalOnly(ctx) && status.Code(err) != codes.NotFound && !errors.As(err, &noAnswer) {
 		// A probe that found the domain here and refused its delete: the
@@ -3092,9 +3228,17 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		_ = grpc.SetTrailer(ctx, metadata.Pairs(deleteProbeRefusedMD, "1"))
 	}
 	if err == nil {
+		// The delete has happened: what follows runs whatever becomes of
+		// the caller.
+		pctx, pcancel := context.WithTimeout(context.WithoutCancel(ctx), deletePostStepsTimeout)
+		defer pcancel()
+		ctx = pctx
 		// A deleted VM's partial-recovery marker goes with it (review N5).
 		s.clearPromotedPartial(ctx, req.Name)
 		s.clearDeletedFirewallTags(ctx, corrosion.TagMemberVM, "", req.Name, fwID)
+		if dropSchedules {
+			s.deleteVMSchedules(context.WithoutCancel(ctx), req.Name)
+		}
 	}
 	if err == nil && len(luns) > 0 && !s.lunPlainDeleteRecordable(ctx) &&
 		s.ReleaseFeatureAvailable(capabilities.FeatureISCSILUNClaim) {
@@ -3135,6 +3279,44 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	return out, err
 }
 
+// deleteOfNoLiveRow answers a delete that finds no live row of the name here.
+//
+// A delete bound to a stack member's incarnation (expected_stack and
+// expected_created_at: a stack teardown or the stack reconciler) that finds
+// that incarnation's tombstone here is done: the member was deleted, by
+// another deleter that got there first. Answered NotFound, the caller judged
+// it from its own replica, which can lag the tombstone written here: compose
+// down reported a member it had seen deleted as a failed deletion (lab 2
+// 2026-10-17, anomaly 2). Everything else is NotFound as before: an unbound
+// delete (lv rm), a peer-search probe, a delete bound to the stack only (the
+// stored file names a member the caller holds no row of, and a tombstone of
+// an older incarnation says nothing of a newer one a peer may hold), and a
+// tombstone of another incarnation or of another stack's VM.
+func (s *Server) deleteOfNoLiveRow(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error) {
+	notFound := status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+	if req.GetExpectedStack() == "" || req.GetExpectedCreatedAt() == "" || deleteLocalOnly(ctx) {
+		return nil, notFound
+	}
+	rows, err := s.db.Query(ctx,
+		`SELECT COALESCE(stack_name, '') AS stack_name, COALESCE(created_at, '') AS created_at,
+		        COALESCE(project, '_default') AS project
+		 FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, req.Name)
+	if err != nil || len(rows) == 0 {
+		return nil, notFound
+	}
+	row := rows[0]
+	if row.String("stack_name") != req.GetExpectedStack() || row.String("created_at") != req.GetExpectedCreatedAt() {
+		return nil, notFound
+	}
+	if err := s.RequirePerm(ctx, vmRBACPathFor(row.String("project"), req.Name), "vm.delete", "operator"); err != nil {
+		s.audit(ctx, "vm.delete", req.Name, "permission denied", "denied")
+		return nil, err
+	}
+	slog.Info("delete: the stack member was already deleted", "vm", req.Name,
+		"stack", req.GetExpectedStack(), "created_at", req.GetExpectedCreatedAt())
+	return &emptypb.Empty{}, nil
+}
+
 func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
@@ -3155,8 +3337,11 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	defer s.invalidateInventoryCache()
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.Name)
-	if err != nil || vm == nil {
+	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+	}
+	if vm == nil {
+		return s.deleteOfNoLiveRow(ctx, req)
 	}
 	if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.delete", "operator"); err != nil {
 		s.audit(ctx, "vm.delete", req.Name, "permission denied", "denied")
@@ -3236,11 +3421,17 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			return nil, lerr
 		}
 		defer releaseLease()
+		if h := s.deleteLeaseTakenHook; h != nil {
+			h(req.Name)
+		}
 		// A start that held the lease until a moment ago may have changed
 		// the row since it was read above: decide from the row as it is now.
 		vm, err = corrosion.GetVM(ctx, s.db, req.Name)
-		if err != nil || vm == nil {
+		if err != nil {
 			return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+		}
+		if vm == nil {
+			return s.deleteOfNoLiveRow(ctx, req)
 		}
 		if err := checkDeleteBinding(req, vm); err != nil {
 			return nil, err
@@ -3284,6 +3475,9 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			unknown = append(unknown, "the host list ("+herr.Error()+")")
 		}
 		for _, h := range hosts {
+			if ctx.Err() != nil {
+				break // refused below: the answers are lost with the caller
+			}
 			if h.Name == s.hostName || h.IsWitness() {
 				continue
 			}
@@ -3305,8 +3499,24 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			cancel()
 			conn.Close()
 			if peerErr == nil {
+				// The probe answers OK only from a delete that undefined
+				// its domain and tombstoned the row in its own replica; no
+				// domain, no live row and an unanswerable libvirt are each
+				// an error. This host's row names this host, so this host
+				// tombstones it too, as the incarnation read under the
+				// lease, before answering OK: a caller reading this
+				// replica must not see the VM live once its delete has
+				// answered (stack_vm_orphan.go).
 				forwardKeptImages(ctx, phdr)
 				slog.Info("DeleteVM: domain found and deleted on peer", "vm", req.Name, "peer", h.Name)
+				if terr := corrosion.DeleteVMIncarnation(ctx, s.db, req.Name, corrosion.SnapshotForDelete(*vm)); terr != nil {
+					if errors.Is(terr, corrosion.ErrVMIncarnationMismatch) {
+						return nil, status.Errorf(codes.Aborted,
+							"VM %q: host %s deleted its domain, but the row here changed mid-delete; retry", req.Name, h.Name)
+					}
+					return nil, status.Errorf(codes.Internal,
+						"VM %q: host %s deleted its domain, but its row here was not tombstoned; retry: %v", req.Name, h.Name, terr)
+				}
 				return &emptypb.Empty{}, nil
 			}
 			if len(ptrl.Get(deleteProbeRefusedMD)) > 0 || status.Code(peerErr) == codes.FailedPrecondition {
@@ -3333,7 +3543,42 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// ownership, and is a no-op when the host owns no devices for the VM. FAIL BEFORE the
 		// tombstone on its error (retryable; never leave a stale owner or an unowned-but-bound
 		// device).
+		// A caller gone during the probes took their answers with it — a
+		// peer that has the domain among them — so nothing is done.
+		if err := refuseIfCancelled(ctx); err != nil {
+			return nil, err
+		}
 		slog.Warn("DeleteVM: domain not found on any host — cleaning up stale record", "vm", req.Name)
+		// From here the delete acts: the stop record, devices, disks, then
+		// the tombstone. A cancellation must not stop it between them.
+		ctx, cancel := s.detachDelete(ctx)
+		defer cancel()
+		s.deleteStepHook(req.Name, "acting")
+		// A row being started (pending/starting: a failover's start, or
+		// one re-armed after a cancel) is one the reconciler starts, and
+		// a transfer start rebuilds a missing disk from its image; a
+		// running row with no domain is one the reconciler's self-heal
+		// starts again. A delete that removes some disks and then fails
+		// would leave it to boot the VM being deleted on missing or
+		// blank disks. So, before anything is done, the row is
+		// recorded stopped by its operator, as a delete that fails after
+		// its stop leaves it (abortDeleteAfterStop): no start path starts
+		// it, whatever this delete then manages. Nothing is done when
+		// that write fails, nor while libvirt does not confirm there is no
+		// domain here: stopped written over a live guest would not be
+		// synced back.
+		if (vm.State == "pending" || vm.State == "starting" || vm.State == "running") && vm.HostName == s.hostName {
+			if _, aerr := s.virt.DomainIsActive(req.Name); !lv.IsNoDomain(aerr) {
+				return nil, status.Errorf(codes.Unavailable,
+					"cannot delete VM %q: its row says %s, and libvirt does not confirm it has no domain on %s (%v); nothing was done (retry is safe)",
+					req.Name, vm.State, s.hostName, aerr)
+			}
+			if werr := s.persistVMState(ctx, req.Name, "stopped", "operator-stop", corrosion.OpVMState); werr != nil {
+				return nil, status.Errorf(codes.Internal,
+					"cannot delete VM %q: its row says %s, and recording its stop before cleaning up its record failed; nothing was done: %v",
+					req.Name, vm.State, werr)
+			}
+		}
 		if err := s.releaseDevices(ctx, req.Name); err != nil {
 			return nil, status.Errorf(codes.Internal,
 				"cannot clean up stale VM %q: its PCI device(s) could not be released (still bound to vfio-pci); resolve the device and retry: %v", req.Name, err)
@@ -3356,23 +3601,6 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// never removed on a guess. A disk whose removal fails fails the
 		// delete, and the record stays.
 		if !req.KeepDisks {
-			// A row being started (pending/starting: a failover's start, or
-			// one re-armed after a cancel) is one the reconciler starts, and
-			// a transfer start rebuilds a missing disk from its image. A
-			// delete that removes some disks and then fails would leave it
-			// to boot the VM being deleted on blank disks. So, before any
-			// disk is removed, the row is recorded stopped by its operator,
-			// as a delete that fails after its stop leaves it
-			// (abortDeleteAfterStop): no start path starts it, whatever
-			// this delete then manages. Nothing is removed when that write
-			// fails.
-			if (vm.State == "pending" || vm.State == "starting") && vm.HostName == s.hostName {
-				if werr := s.persistVMState(ctx, req.Name, "stopped", "operator-stop", corrosion.OpVMState); werr != nil {
-					return nil, status.Errorf(codes.Internal,
-						"cannot delete VM %q: it is being started (%s), and recording its stop before its disks are removed failed; nothing was removed: %v",
-						req.Name, vm.State, werr)
-				}
-			}
 			_, derr := s.virt.DomainIsActive(req.Name)
 			domainGone := lv.IsNoDomain(derr)
 			cephKept, keptDisks, leftovers := s.freeRecordedVMDisks(ctx, req.Name, func(d *corrosion.DiskRecord) (bool, string, string) {
@@ -3411,6 +3639,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// node keeps scheduling around. A failure is logged and every NIC named
 		// for the orphan sweep, never swallowed.
 		s.releaseNICLeasesBestEffort(ctx, vm, "delete-stale-record")
+		s.deleteStepHook(req.Name, "tombstone")
 		deleted, err := s.tombstoneDeletedVM(ctx, req.Name, req.KeepDisks)
 		if err != nil {
 			// A declined delete means the stale row is still live cluster-wide;
@@ -3464,6 +3693,16 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	if err := s.settleKeptPITOverlays(ctx, vm, req.KeepDisks); err != nil {
 		return nil, err
 	}
+
+	// Every check that refuses the delete with nothing done has passed. From
+	// the stop on, the delete runs to its tombstone or to a recorded abort
+	// whatever becomes of its caller (detachDelete). A caller already gone
+	// refuses it with nothing done.
+	if err := refuseIfCancelled(ctx); err != nil {
+		return nil, err
+	}
+	ctx, cancelFinish := s.detachDelete(ctx)
+	defer cancelFinish()
 
 	// Stop it. Ask libvirt, not only the row: an ACTIVE domain (running, or
 	// paused — which the row does not call "running") survives the undefine
@@ -3592,6 +3831,10 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	}
 	// The domain is gone: a volume move it left unresolved describes nothing.
 	s.forgetMoveRecords(ctx, req.Name)
+	// The domain is gone: a failure from here records the stop whatever the
+	// row said, so no start path brings back a VM whose disks may be freed
+	// (a pending or starting row included).
+	destroyed = destroyed || !s.virt.DomainExists(req.Name)
 
 	// Delete disks unless keep-disks. Free each disk at its RECORDED location
 	// (driver-dispatched, so non-default pools and block backends are released)
@@ -3676,11 +3919,13 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// Reading the lease by its (network, ip) key is also what carries the NetBox
 	// join id, and without it a release could never delete the remote object.
 	var releaseErrs []string
+	s.deleteStepHook(req.Name, "nics")
 	nics, nerr := corrosion.MergedVMNICs(ctx, s.db, req.Name)
 	if nerr != nil {
 		// Fail closed: an unreadable NIC list means we do not know which
 		// addresses this VM holds, and tombstoning the row over that is what
 		// strands them. Retryable — nothing destructive is skipped by returning.
+		s.abortDeleteAfterStop(ctx, req.Name, destroyed, "NIC read failed: "+nerr.Error())
 		return nil, status.Errorf(codes.Internal,
 			"delete %s: could not read NICs to release their addresses (retry is safe): %v", req.Name, nerr)
 	}
@@ -3712,6 +3957,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		}
 	}
 	if len(releaseErrs) > 0 {
+		s.abortDeleteAfterStop(ctx, req.Name, destroyed, "address release failed: "+strings.Join(releaseErrs, "; "))
 		return nil, status.Errorf(codes.Internal,
 			"delete %s: address release failed, so the VM was NOT deleted: %s. "+
 				"Retrying the delete is safe and completes it; whether it also frees the "+
@@ -3738,9 +3984,21 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// row every node keeps serving, scheduling around and failing over — the
 	// exact stale-live state the mandatory tombstone exists to kill. The domain
 	// teardown above is idempotent, so the caller can simply retry.
+	s.deleteStepHook(req.Name, "tombstone")
 	deleted, err := s.tombstoneDeletedVM(ctx, req.Name, req.KeepDisks)
 	if err != nil {
-		s.audit(ctx, "vm.delete", req.Name, "project="+tenancy.NormalizeProject(vm.Project), "error")
+		// The guarded tombstone declines when the row's authority moved
+		// under it: that row is no longer this delete's to record stopped.
+		why := "project=" + tenancy.NormalizeProject(vm.Project) + " tombstone failed: " + err.Error()
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), deleteAbortRecordTimeout)
+		defer rcancel()
+		cur, gerr := corrosion.GetVM(rctx, s.db, req.Name)
+		if gerr == nil && cur != nil &&
+			(cur.HostName != vm.HostName || cur.OwnerEpoch != vm.OwnerEpoch) {
+			s.audit(rctx, "vm.delete", req.Name, why+"; the row moved to "+cur.HostName+", its state is left as it is", "error")
+		} else {
+			s.abortDeleteAfterStop(ctx, req.Name, destroyed, why)
+		}
 		return nil, status.Errorf(codes.Internal, "delete: tombstone cluster row: %v", err)
 	}
 	// The row as this delete tombstoned it, for a re-create that follows
@@ -3766,7 +4024,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	go s.refreshLBForStack(context.Background(), vm.StackName)
 
 	if len(leftovers.hosts) > 0 {
-		go s.cleanupDeletedVMLeftovers(context.WithoutCancel(ctx), leftovers)
+		s.deferLeftoverCleanup(ctx, leftovers)
 	}
 
 	return &emptypb.Empty{}, nil
@@ -4704,9 +4962,66 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		defer s.holdImage(spec.Image)()
 	}
 
-	// Stop and undefine the current domain.
-	if vm.State == "running" {
-		s.virt.DestroyDomain(req.Name)
+	// From the teardown on, the rebuild runs to its create whatever becomes
+	// of its caller (detachReplace); a caller already gone refuses it with
+	// nothing done.
+	if err := refuseIfCancelled(ctx); err != nil {
+		return nil, err
+	}
+	ctx, cancelTeardown := detachReplace(ctx)
+	defer cancelTeardown()
+	rctx, cancelCreate := detachReplace(rctx)
+	defer cancelCreate()
+
+	// Stop and undefine the current domain. Whether it runs is libvirt's to
+	// say, not the row's: a row still "creating" (not yet published) or
+	// lagging an out-of-band start names a running guest too, and undefining
+	// that one leaves a transient qemu on the disks deleted below, with no
+	// record, which the create would then refuse to replace. A domain that
+	// cannot be stopped refuses the rebuild with the VM as it is.
+	if s.virt.DomainExists(req.Name) {
+		// Only this VM's own domain is stopped and undefined: a domain of the
+		// name that is another guest (hand-made, or a runtime of another
+		// incarnation) is not this rebuild's to kill. Its own is the one with
+		// its uuid, or one that runs on the disks its row records here
+		// (domainIsVMsOwn). A VM with no recorded uuid (from before uuids were
+		// minted, or a non-firmware import, whose uuid libvirt chose) has
+		// nothing to compare, and is judged as before.
+		if spec.Uuid != "" {
+			own, du, why, ierr := s.domainIsVMsOwn(ctx, req.Name, spec.Uuid, req.Name)
+			switch {
+			case ierr != nil:
+				// libvirt cannot say what the domain is: stopping it would
+				// stop whatever has the name.
+				return nil, status.Errorf(codes.Unavailable,
+					"cannot rebuild %q: the domain of the name on %s cannot be identified (%v); nothing was changed",
+					req.Name, s.hostName, ierr)
+			case !own:
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"cannot rebuild %q: the domain of the name on %s is not this VM's (uuid %s, the VM's is %s, and %s); "+
+						"nothing was changed",
+					req.Name, s.hostName, du, spec.Uuid, why)
+			}
+		}
+		active, aerr := s.virt.DomainIsActive(req.Name)
+		if aerr != nil || active {
+			derr := s.virt.DestroyDomain(req.Name)
+			still, serr := s.virt.DomainIsActive(req.Name)
+			switch {
+			case derr == nil && serr != nil:
+				// The stop was sent and may have landed: say so, not
+				// "nothing was changed".
+				return nil, status.Errorf(codes.Unavailable,
+					"cannot rebuild %q: its domain on %s was sent a stop, but whether it still runs cannot be read (%v); "+
+						"the rebuild stopped there, and the VM's row, disks and definition are unchanged", req.Name, s.hostName, serr)
+			case derr != nil || serr != nil || still:
+				if derr == nil {
+					derr = errors.New("it is still running")
+				}
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"cannot rebuild %q: its domain on %s could not be stopped (%v); nothing was changed", req.Name, s.hostName, derr)
+			}
+		}
 	}
 	s.virt.UndefineDomain(req.Name, false)
 	s.forgetMoveRecords(ctx, req.Name)
@@ -4851,6 +5166,15 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 		}
 		return out, err
 	}
+
+	// The cutover gives the -next VM the name: no create of the name runs on
+	// this host while it does (beginCreate), so none can land in the window
+	// between the original's tombstone and the rename.
+	endFlight, _, ferr := s.beginCreate(req.VmName)
+	if ferr != nil {
+		return nil, ferr
+	}
+	defer endFlight()
 
 	// Resource pre-check: during the cutover overlap window, both the old and
 	// new VM may be running simultaneously. Verify the host has enough resources
@@ -6321,6 +6645,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			}
 		}
 		s.firmware.ApplyTo(&vmCfg, s.dataDir, spec.Name, spec.SecureBoot, spec.Tpm)
+		if err := ensureNvramDir(&vmCfg); err != nil {
+			return nil, err
+		}
 
 		s.withNICMTU(&vmCfg)
 		var gerr error

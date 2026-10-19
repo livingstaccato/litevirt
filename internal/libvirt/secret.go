@@ -66,6 +66,11 @@ func SetCephMonitorResolver(f func(pool string) ([]string, bool)) (restore func(
 	}
 }
 
+// CephPoolMonitors returns a litevirt pool's current monitors on this host,
+// the ones an rbd disk's domain defined now is given; ok is false when the
+// host does not have the pool.
+func CephPoolMonitors(pool string) ([]string, bool) { return poolMonitors(pool) }
+
 func poolMonitors(pool string) ([]string, bool) {
 	cephMonitorMu.RLock()
 	f := cephMonitorResolver

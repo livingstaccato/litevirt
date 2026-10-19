@@ -66,7 +66,9 @@ func seedVM(t *testing.T, c *Cluster, on *Node, spec *pb.VMSpec) *corrosion.VMRe
 	}, nil, nil); err != nil {
 		t.Fatalf("seed %s on %s: %v", spec.Name, on.Name, err)
 	}
-	if err := on.Virt.DefineDomain(`<domain><name>` + spec.Name + `</name></domain>`); err != nil {
+	// The domain carries the VM's uuid, as a create defines it (a rebuild
+	// stops only the VM's own domain).
+	if err := on.Virt.DefineDomain(`<domain><name>` + spec.Name + `</name><uuid>` + spec.Uuid + `</uuid></domain>`); err != nil {
 		t.Fatal(err)
 	}
 	c.WaitConverged(t, 20*time.Second)

@@ -1,6 +1,9 @@
 package ssh
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -69,5 +72,83 @@ func TestWriteFileCmd_RefusesToMoveIntoADirectory(t *testing.T) {
 	}
 	if !strings.Contains(cmd, "--") {
 		t.Errorf("mv is not given --, so a destination starting with '-' parses as options:\n  %s", cmd)
+	}
+}
+
+// A3: `lv host add` pushes /usr/local/bin/litevirt while the machine's daemon
+// may be running from it. Writing into a running executable fails with
+// ETXTBSY ("Text file busy"), which stopped an add on the lab; the staged
+// write replaces it by rename, which the running process does not prevent.
+//
+// Mutation: write with `cat > path` — the push fails with ETXTBSY.
+func TestWriteFileCmd_ReplacesARunningExecutable(t *testing.T) {
+	src, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skip("no sleep binary")
+	}
+	exe := filepath.Join(t.TempDir(), "litevirt")
+	b, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe, b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	running := exec.Command(exe, "30")
+	if err := running.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = running.Process.Kill(); _ = running.Wait() })
+
+	push := exec.Command("sh", "-c", writeFileCmd(exe, 0o755))
+	push.Stdin = strings.NewReader("new build")
+	if out, err := push.CombinedOutput(); err != nil {
+		t.Fatalf("pushing over a running executable: %v\n%s", err, out)
+	}
+	if got, _ := os.ReadFile(exe); string(got) != "new build" {
+		t.Errorf("the running executable was not replaced (it holds %d bytes, not the pushed build)", len(got))
+	}
+}
+
+// fd review m3: without a sync before the rename, a power loss soon after a
+// push can leave the destination renamed over but empty (XFS has no
+// replace-by-rename flush). The staged file is synced before the move and the
+// directory after it.
+//
+// Mutation: drop either sync — the order check fails.
+func TestWriteFileCmd_SyncsAroundTheRename(t *testing.T) {
+	cmd := writeFileCmd("/etc/litevirt/pki/host.key", 0o600)
+	mv := strings.Index(cmd, "mv -fT")
+	before := strings.Index(cmd, "sync -- \"$t\"")
+	after := strings.Index(cmd, "sync -- \"$d\"")
+	if before < 0 || before > mv || after < mv {
+		t.Errorf("the staged file is not synced before the move and its directory after:\n  %s", cmd)
+	}
+}
+
+// fd re-review N-m1: a failed sync of the staged file (EIO) was swallowed by
+// a fallback to a global `sync`, which reports success whatever happened (and
+// blocks on a hung mount), and the rename then put a file whose writeback
+// failed over a good one. A sync failure now fails the write, and the
+// destination is left as it was.
+//
+// Mutation: restore the `|| sync` fallback — the write succeeds.
+func TestWriteFileCmd_AFailedSyncDoesNotRename(t *testing.T) {
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "sync"), []byte("#!/bin/sh\n# fails a file sync (EIO); a global sync succeeds\n[ $# -gt 0 ] && exit 1\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "host.key")
+	if err := os.WriteFile(dst, []byte("good"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	push := exec.Command("sh", "-c", writeFileCmd(dst, 0o600))
+	push.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+	push.Stdin = strings.NewReader("new")
+	if err := push.Run(); err == nil {
+		t.Error("a write whose sync failed reported success")
+	}
+	if got, _ := os.ReadFile(dst); string(got) != "good" {
+		t.Errorf("the destination was replaced after a failed sync: %q", got)
 	}
 }

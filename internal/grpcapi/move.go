@@ -779,7 +779,7 @@ func (s *Server) deleteRecordedVMDiskVolumeRecordsKept(
 // matter for ceph); otherwise we fall back to the recorded StorageType, and to
 // "local" when even that is blank (legacy rows).
 func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.DiskRecord) error {
-	drv, err := s.diskDriver(d)
+	drv, err := s.diskDriver(ctx, d)
 	if err != nil {
 		return err
 	}
@@ -803,20 +803,17 @@ func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.
 
 // diskDriver is the storage driver that serves a disk at its recorded
 // location (deleteDiskAtRecordedLocation).
-func (s *Server) diskDriver(d *corrosion.DiskRecord) (storage.Driver, error) {
+// An rbd disk's driver is rbdDiskConfig's: on the cluster its domain is
+// given, or none.
+func (s *Server) diskDriver(ctx context.Context, d *corrosion.DiskRecord) (storage.Driver, error) {
 	cfg := storage.Config{Driver: d.StorageType}
-	if pool, ok := s.lookupStoragePool(d.StorageVolume); ok {
-		cfg = storage.Config{Driver: pool.Driver, Source: pool.Source, Target: pool.Target, Options: pool.Options}
-	} else if strings.HasPrefix(d.Path, "rbd:") {
-		// A ceph disk whose pool is gone from this host (or not loaded yet)
-		// is removed as the identity its own locator names: with no --id and
-		// --keyring the rbd CLI would act as client.admin, which a node holding
-		// only a restricted key cannot.
-		pool := ""
-		if l, ok := storage.ParseCephLocator(d.Path); ok {
-			pool = l.Pool // pool[/namespace]
+	if strings.HasPrefix(d.Path, "rbd:") {
+		var err error
+		if cfg, err = s.rbdDiskConfig(ctx, d); err != nil {
+			return nil, err
 		}
-		cfg = storage.Config{Driver: "ceph", Source: pool, Options: rbdPathOptions(d.Path)}
+	} else if pool, ok := s.lookupStoragePool(d.StorageVolume); ok {
+		cfg = storage.Config{Driver: pool.Driver, Source: pool.Source, Target: pool.Target, Options: pool.Options}
 	}
 	if cfg.Driver == "" {
 		cfg.Driver = "local"
@@ -826,6 +823,61 @@ func (s *Server) diskDriver(d *corrosion.DiskRecord) (storage.Driver, error) {
 		return nil, fmt.Errorf("construct %s driver: %w", cfg.Driver, err)
 	}
 	return drv, nil
+}
+
+// rbdDiskConfig is the driver configuration an rbd disk's image is acted on
+// with: its locator's litevirt pool as this host has it now (cephPoolRef: a
+// host pool, read from the table when the loaded list does not hold it yet,
+// or a compose stack's volume), whose current monitors a domain defined now
+// is given. A locator that names no litevirt pool is acted on as its own
+// identity, as the renderer gives it a cluster by its own options; the row's
+// storage_volume is not consulted. Never on monitors the locator recorded
+// (mon_host) when its pool is not here: they may no longer be its cluster's,
+// and may be another's, with another image of the same name on it. Anything
+// that cannot be told so (the pool, the stack or the pool's monitors cannot
+// be read, a pool of the name that is not ceph, a locator conf that cannot be
+// read or names no monitor, or an option the renderer does not know) is an
+// error, and nothing is run against any cluster.
+func (s *Server) rbdDiskConfig(ctx context.Context, d *corrosion.DiskRecord) (storage.Config, error) {
+	l, ok := storage.ParseCephLocator(d.Path)
+	if !ok {
+		return storage.Config{}, fmt.Errorf("disk %s: %q is not an rbd image locator", d.DiskName, d.Path)
+	}
+	refuse := func(format string, a ...any) (storage.Config, error) {
+		return storage.Config{}, fmt.Errorf("rbd image %s (disk %s) is not acted on: "+format+
+			"; nothing was run against any Ceph cluster", append([]any{l.Spec, d.DiskName}, a...)...)
+	}
+	name := l.Opts["lvpool"]
+	if name != "" {
+		ref, found, err := s.cephPoolRef(ctx, name)
+		switch {
+		case err != nil:
+			return refuse("whether this host has its pool %s cannot be read (%v)", name, err)
+		case found && !strings.EqualFold(ref.Driver, "ceph"):
+			return refuse("its pool %s is a %s pool on this host, not a ceph one", name, ref.Driver)
+		case found:
+			if _, ok := cephRefMonitors(ref); !ok {
+				return refuse("the monitors of its pool %s on this host cannot be read", name)
+			}
+			return storage.Config{Driver: ref.Driver, Source: ref.Source, Target: ref.Target, Options: ref.Options}, nil
+		}
+	}
+	if _, known := rbdLocatorMonitors(l, s.CephMonitorsForPool); !known {
+		return refuse("the Ceph cluster its domain is given cannot be told (an option it does not know, or its conf %s cannot be read or names no monitor)", l.Opts["conf"])
+	}
+	if mh, ok := l.Opts["mon_host"]; ok {
+		which := "it names no litevirt pool"
+		if name != "" {
+			which = "its pool " + name + " is not on this host"
+		}
+		return refuse("%s, and the monitors its locator recorded (%s) may no longer be its cluster's. "+
+			"litevirt does not remove it: find the Ceph cluster that holds it and remove it there by hand "+
+			"(rbd -m <that cluster's monitors> rm %s)", which, mh, l.Spec)
+	}
+	// The identity its own locator names: with no --id and --keyring the rbd
+	// CLI would act as client.admin, which a node holding only a restricted
+	// key cannot.
+	return storage.Config{Driver: "ceph", Source: l.Pool, Options: rbdPathOptions(d.Path)}, nil
 }
 
 // diskPathReferencedByOtherVM reports whether a disk's path is still in use by a

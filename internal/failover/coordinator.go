@@ -3554,6 +3554,8 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 		IPMIPass:      h.IPMIPass,
 		Redfish:       h.Redfish,
 		WatchdogDev:   h.WatchdogDev,
+		// A retired credential is reported, never sent as an empty password.
+		IPMICredentialRetired: h.IPMIPassRetired,
 	})
 	// A best-effort fence that did not reach the host is recorded as
 	// self-pause when this coordinator relies on the host's partition pause

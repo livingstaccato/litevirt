@@ -101,14 +101,15 @@ lv cluster claim-release <kind>/<name>       # Release one workload ha.claim.leg
                                    #   legacy proof stuck in flight on a live destination; the
                                    #   destination confirms nothing runs it, then abandons it (admin)
 lv health [--resolved]             # Cluster health: overall + conditions + coverage (exit 0/1/2)
-lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH] [--force]  # Resolve one open
-                                   #   dual-run condition by hand (admin, audited); re-raised next pass if it
-                                   #   still holds; or a vm.move_unresolved (--reason required) on its holding
-                                   #   host, or once that host is proven powered off; --accept picks the file
-                                   #   to keep of one disk (repeat per disk; required for a move with no pivot
+lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH] [--force] [--accept-stale-uefi-vars]
+                                   # Resolve one open dual-run condition by hand (admin, audited); re-raised next
+                                   #   pass if it still holds; or a vm.move_unresolved (--reason required) on its
+                                   #   holding host, or once that host is proven powered off; --accept picks the
+                                   #   file to keep of one disk (repeat per disk; required for a move with no pivot
                                    #   recorded, unless the holder owns the VM and its config and record name
                                    #   the source); --force keeps a forked history's file although the other
-                                   #   was modified after it
+                                   #   was modified after it; or accept nvram_flush_failed's vars stores as stale
+                                   #   (--accept-stale-uefi-vars)
 ```
 
 ## Hosts
@@ -167,6 +168,7 @@ lv host upgrade --binary <path> [host...] # Rolling upgrade of litevirt
   [--yes]                                 # Skip confirmation prompt
   [--force]                               # Skip preflight blocks (warnings still printed)
   [--no-prestage]                         # Skip the cluster-wide schema pre-stage pass
+  [--skip-prestage <host>[,<host>]]       # Members that are down: leave them on their schema
 lv host preflight-upgrade <host>          # Report preflight findings without upgrading
 lv host label set <host> key=value ...    # Set labels on a host
 lv host label rm <host> <key> ...         # Remove labels from a host
@@ -278,6 +280,39 @@ behind. Until the delete is retried, or the lease expires after 10 minutes,
 nothing restarts the VM: the reconciler and the restart policy do not take a
 lease over. A retried `lv rm` runs on the same host and is the same holder, so
 it takes the lease back at once and completes the delete.
+
+**An interrupted delete still completes.** A delete interrupted before it acts
+— `lv rm` or `lv compose down` killed, or the entry host's forward cancelled,
+during its checks, its wait for the start lease, or while the VM's host asks
+its peers whether one of them has the domain — is refused with nothing
+touched. Once it acts (it stops the VM, or for a VM with no domain left, it
+begins removing the record), the host that carries it out finishes it whatever
+becomes of the client: the record is tombstoned, or the delete fails with the
+VM recorded `stopped` (`operator-stop`) as above, unless its record has moved
+to another host meanwhile. Its cluster writes from that point have 10 minutes;
+libvirt and storage calls are not cut short. `lv ct rm` behaves the same from
+the container's runtime delete on. A command interrupted by Ctrl-C or SIGTERM
+reports that the delete may still complete on its host, names `lv ls` (`lv ct
+ls` for a container, `lv compose ls` for a stack) to see the outcome, and then
+ends by the signal (the shell sees 130, or 143 for SIGTERM). A command waiting
+at a prompt ends at once. Any other command still running 2 seconds after the
+signal (one on an ssh step) ends then, except while it undoes what it already
+did (a firewall macro's rollback, up to 30 seconds), and a second Ctrl-C ends
+it at once, without the report. `lv daemon`, `lv gitops`, `lv top`, `lv spice`
+and `lv vnc` handle Ctrl-C themselves.
+
+`lv rebuild` and a `lv compose up` that re-creates a VM work the same way.
+Interrupted before the re-create sends its delete (a rebuild: before its
+teardown), nothing is deleted. From then on the replace runs to its create
+whatever becomes of the client, so an interrupted replace does not end with no
+VM; the command reports that it may still complete, and names `lv ls`. A VM
+being re-created is not listed until its create finishes, which can take
+minutes: wait until `lv ls` shows it before running the command again, or the
+second run may create it again. A create that replaces nothing (the delete found
+no VM) stays cancellable. A `lv compose up` interrupted after it has torn a VM
+down to re-create it still records the stack's new compose file, with the
+stack `degraded`: the rest of its plan did not run, and once `lv ls` shows the
+re-created VM, running `lv compose up` again finishes it.
 
 **CPU mode.** The default, `host-model`, gives the guest the host's modern
 instruction set — SSE4.2, AVX, AVX2, AVX-512 as the host has them — while keeping
@@ -434,6 +469,26 @@ than silently breaking BitLocker. The explicit refusals:
 | automatic failover (host died) | skipped — firmware is host-local and died with the host; recover via restore from a firmware-carrying backup |
 | replica promotion | refused — a disk replica carries no firmware |
 | `lv rm --keep-disks` then `lv run --name <same>` | refused — the retained NVRAM isn't inherited; restore the VM instead of recreating it |
+
+**UEFI variable writes and a host power cut.** qemu writes a guest's UEFI
+variables (any UEFI VM, not only Secure Boot) to its vars file without
+flushing it, and libvirt has no cache setting for that file. The daemon
+fsyncs every vars file that changed, in `<data_dir>/nvram/` and
+`/var/lib/libvirt/qemu/nvram/`, once a second, and once more as it stops. A
+host power cut can therefore lose a variable written in about the last second
+before it, or up to `vm.dirty_expire_centisecs` (30 s by default) while the
+daemon is not running. A failed fsync raises `nvram_flush_failed`, and a vars
+file that cannot be opened for a minute raises `nvram_flush_blocked`
+(docs/diagnostics.md).
+
+swtpm makes its own vTPM state durable: it renames each new state file into
+place and fsyncs the directory before the TPM command completes. It does not
+fsync the file's data first, so this relies on ext4's defaults
+(`data=ordered`, `auto_da_alloc`) to write that data before the rename
+commits. Two cases are not covered: the state file's first creation, when
+nothing is replaced, and `/var/lib/libvirt/swtpm` on XFS or btrfs, or on ext4
+mounted `noauto_da_alloc`. In either, a power cut can leave the state file
+empty or old.
 
 ## Containers (LXC / OCI)
 
@@ -1515,6 +1570,10 @@ lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH
                                              #   source; refused while the file not kept was
                                              #   modified later, unless --force.
                                              #   `lv health` lists the moves first (docs/diagnostics.md).
+lv health resolve nvram_flush_failed host/<host> --accept-stale-uefi-vars --reason R
+                                             # Accept that the UEFI vars stores nvram_flush_failed names
+                                             #   may be stale, for a VM kept as it is. Admin, audited
+                                             #   naming every file; a new failed flush raises it again.
 lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since <time>] [--until <time>]   # Audit log (default 50 entries)
 lv host stats <host>                         # Host resource statistics
 lv stats <vm>                                # VM resource statistics

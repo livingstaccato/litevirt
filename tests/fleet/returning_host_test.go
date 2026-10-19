@@ -125,12 +125,11 @@ func TestFleet_FencedHostReturningIsUpgradingUntilItServes(t *testing.T) {
 				}
 			}
 
-			f.down.Store(false)
+			served := f.answer()
 			hostboot.Served(dir)
 			if flipped, state, err := hostboot.ConfirmServing(ctx, f.d.DB, f.d.Name); err != nil || !flipped {
 				t.Fatalf("confirm serving: flipped=%v state=%q err=%v", flipped, state, err)
 			}
-			served := time.Now()
 			eventually(t, time.Minute, "every observer to see d answer, and d active", func() bool {
 				for _, n := range f.observers {
 					if got, at, ok := observedFailures(n, f.d.Name); !ok || got != 0 || !at.After(served) {
@@ -242,12 +241,11 @@ func TestFleet_OutOfServiceHostReturningIsUpgradingUntilItServes(t *testing.T) {
 				}
 			}
 
-			f.down.Store(false)
+			served := f.answer()
 			hostboot.Served(dir)
 			if flipped, state, err := hostboot.ConfirmServing(ctx, f.d.DB, f.d.Name); err != nil || !flipped {
 				t.Fatalf("confirm serving: flipped=%v state=%q err=%v", flipped, state, err)
 			}
-			served := time.Now()
 			eventually(t, time.Minute, "every observer to see d answer, and d active", func() bool {
 				for _, n := range f.observers {
 					if got, at, ok := observedFailures(n, f.d.Name); !ok || got != 0 || !at.After(served) {

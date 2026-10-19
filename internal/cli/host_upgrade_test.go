@@ -47,6 +47,12 @@ func (m *mockUpgradeClient) PreStageUpgrade(_ context.Context, _ ...grpc.CallOpt
 	return &mockUpgradeStream{response: &pb.UpgradeHostResponse{Status: "ok"}}, nil
 }
 
+// PreflightUpgrade is the pre-stage pass's probe of each member; every member
+// answers unless a test overrides it.
+func (m *mockUpgradeClient) PreflightUpgrade(_ context.Context, req *pb.PreflightUpgradeRequest, _ ...grpc.CallOption) (*pb.PreflightUpgradeResponse, error) {
+	return &pb.PreflightUpgradeResponse{Ok: true, Host: req.GetTargetHost()}, nil
+}
+
 func (m *mockUpgradeClient) Ping(_ context.Context, _ *pb.PingRequest, _ ...grpc.CallOption) (*pb.PingResponse, error) {
 	return &pb.PingResponse{HostName: "test-host", Version: "v1.0.0"}, nil
 }

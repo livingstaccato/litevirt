@@ -129,16 +129,22 @@ func TestShutdownHostWorkloads_WaitsStopDelay(t *testing.T) {
 func TestShutdownHostWorkloads_ContextCancelDuringDelay(t *testing.T) {
 	s := testServerR2(t)
 	base := adminContext(context.Background())
-	ctx, cancel := context.WithTimeout(base, 50*time.Millisecond)
+	ctx, cancel := context.WithCancel(base)
 	defer cancel()
 
-	insertTestHostR2(t, ctx, s.db, "cancel-host", "active")
-	insertTestVMR2WithSpec(t, ctx, s.db, "cancel-first", "cancel-host", "running", orderSpec(2, 10))
-	insertTestVMR2WithSpec(t, ctx, s.db, "cancel-second", "cancel-host", "running", orderSpec(1, 0))
+	insertTestHostR2(t, base, s.db, "cancel-host", "active")
+	insertTestVMR2WithSpec(t, base, s.db, "cancel-first", "cancel-host", "running", orderSpec(2, 10))
+	insertTestVMR2WithSpec(t, base, s.db, "cancel-second", "cancel-host", "running", orderSpec(1, 0))
 
+	// The context is cancelled as the first stop returns, so it is done
+	// inside the 10 s delay after it. A 50 ms timeout stood in for this,
+	// and on a loaded host it ran out before the first stop.
 	var stopped []string
 	s.stopVMOverride = func(_ context.Context, req *pb.StopVMRequest) (*pb.VM, error) {
 		stopped = append(stopped, req.Name)
+		if req.Name == "cancel-first" {
+			cancel()
+		}
 		return &pb.VM{Name: req.Name}, nil
 	}
 	stream := &mockShutdownStream{ctx: ctx}

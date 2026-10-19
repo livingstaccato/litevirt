@@ -278,6 +278,9 @@ func (s *Server) diskKeptRecords() ([]diskKeptRecord, string) {
 	return out, unreadable
 }
 
+// JudgeKeptDisksForTest runs one judgeKeptDisks pass.
+func (s *Server) JudgeKeptDisksForTest(ctx context.Context) { s.judgeKeptDisks(ctx) }
+
 // judgeKeptDisks forgets the kept disks on this host that are gone (a
 // bounded check: one that does not answer stays named), and raises
 // disk_leftover for this host while any kept disk no VM's disk names is

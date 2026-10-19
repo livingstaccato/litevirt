@@ -540,7 +540,35 @@ import (
 //	     SSH, so nothing writes it, or a 'redfish' fence strategy, without the
 //	     release feature redfish_fence (release_2026_11_v1, ReplicationGated).
 //	     One new table.
-const CurrentSchemaVersion = 67
+//	v68: host_fence_credentials.after_retirement (TEXT NOT NULL DEFAULT '')
+//	     — the retirement a live fence credential was set after
+//	     (credentials_revive_guard.go). A tombstone's own retirement is its
+//	     deleted_at. Rows are ordered by (retirement, updated_at), so a live
+//	     row that carries no retirement, written by a previous build or by a
+//	     stale copy, never beats a tombstone. Derived on each node from the
+//	     entry and never written by a replicated statement, so no statement
+//	     shape changes; a previous-release node refuses this table's
+//	     anti-entropy rows from this build (unknown column) and still applies
+//	     its WAL entries. Existing rows migrate with no retirement, so a
+//	     tombstone from before the upgrade still beats a password set after
+//	     it (docs/migration-failover.md). Additive.
+//	v69: hosts.incarnation (INTEGER NOT NULL DEFAULT 0) — the host
+//	     incarnation counter (host_incarnation.go). 0 on every row written
+//	     before the release feature host_incarnation is first used; a
+//	     re-admission over a tombstone at N writes N+1, and nothing else
+//	     raises it. Rows are ordered by (incarnation, created_at,
+//	     cert_serial) ahead of their clock. A previous-release node does not
+//	     write the column and cannot decode the re-admission that raises it,
+//	     which is written only through the feature (ReplicationGated).
+//	     Additive.
+const CurrentSchemaVersion = 69
+
+// schemaVersionCredentialRetirement is the version
+// host_fence_credentials.after_retirement was added in.
+const schemaVersionCredentialRetirement = 68
+
+// schemaVersionHostIncarnation is the version hosts.incarnation was added in.
+const schemaVersionHostIncarnation = 69
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -722,6 +750,10 @@ func (c *Client) migrateAcknowledgedTiesPK(ctx context.Context) error {
 //   - present  → record it (mark-only; the ALTER/CREATE already happened)
 //   - missing  → apply its SQL + record it in ONE local transaction (heal)
 //
+// A missing unit newer than the database's stamped schema_state.version is
+// the upgrade's own step and logs at INFO; one at or below it is a silent gap
+// and logs a WARN.
+//
 // A real apply error aborts LOUDLY (no benign swallowing). Mark-applied is
 // gated on the presence predicate, NEVER on the version number, so a silent
 // gap from the old swallow-benign loop is healed rather than falsely claimed.
@@ -784,8 +816,16 @@ func InitSchema(ctx context.Context, c *Client) error {
 		return fmt.Errorf("load applied_migrations: %w", err)
 	}
 
+	// The version the database was stamped at before this run. A missing unit
+	// newer than it is this upgrade's own step; one at or below it is a gap a
+	// prior daemon left. A fresh database has no stamp, so nothing is a gap.
+	stamped := 0
+	if rows, err := c.Query(ctx, `SELECT version FROM schema_state WHERE id = 1`); err == nil && len(rows) > 0 {
+		stamped = rows[0].Int("version")
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339)
-	healed := 0
+	healed, upgraded := 0, 0
 	for _, m := range schemaMigrationLedger {
 		sum := sha256hex(m.SQL)
 		if stored, ok := applied[m.ID]; ok {
@@ -832,8 +872,14 @@ func InitSchema(ctx context.Context, c *Client) error {
 		if err := c.execBatchLocal(ctx, stmts); err != nil {
 			return fmt.Errorf("schema migration %q: %w", m.ID, err)
 		}
+		if m.Version > stamped {
+			slog.Info("schema ledger: applied a migration of this upgrade",
+				"id", m.ID, "target", m.Target, "migration_version", m.Version, "db_version", stamped)
+			upgraded++
+			continue
+		}
 		slog.Warn("schema ledger: healed a missing migration (silent gap from a prior daemon)",
-			"id", m.ID, "target", m.Target)
+			"id", m.ID, "target", m.Target, "migration_version", m.Version, "db_version", stamped)
 		healed++
 	}
 
@@ -857,7 +903,7 @@ func InitSchema(ctx context.Context, c *Client) error {
 	// Seed the effective DB-applied schema cache (handshake source of truth).
 	eff := c.RefreshDBSchemaVersion(ctx)
 	slog.Info("schema initialized",
-		"schema_version", eff, "ledger", len(schemaMigrationLedger), "healed", healed)
+		"schema_version", eff, "ledger", len(schemaMigrationLedger), "upgraded", upgraded, "healed", healed)
 	return nil
 }
 
@@ -1219,7 +1265,8 @@ var schemaDDL = []string{
 		deleted_at   TEXT,
 		version      TEXT DEFAULT '',
 		region       TEXT NOT NULL DEFAULT 'default',
-		capacity_policy_hash TEXT NOT NULL DEFAULT ''
+		capacity_policy_hash TEXT NOT NULL DEFAULT '',
+		incarnation  INTEGER NOT NULL DEFAULT 0
 	)`,
 
 	`CREATE TABLE IF NOT EXISTS host_labels (
@@ -2789,7 +2836,8 @@ var schemaDDL = []string{
 		host_name  TEXT PRIMARY KEY,
 		ipmi_pass  TEXT NOT NULL DEFAULT '',
 		updated_at TEXT NOT NULL,
-		deleted_at TEXT
+		deleted_at TEXT,
+		after_retirement TEXT NOT NULL DEFAULT ''
 	)`,
 	`CREATE TABLE IF NOT EXISTS user_credentials (
 		username      TEXT PRIMARY KEY,
@@ -3470,6 +3518,11 @@ var schemaMigrations = []string{
 	// field: '' reads as "no certificate", which a destination enforcing
 	// recovery_claim_v1 refuses.
 	`ALTER TABLE runtime_action_proofs ADD COLUMN claim_certificate TEXT NOT NULL DEFAULT ''`,
+	// The retirement a live fence credential was set after (see History,
+	// schemaVersionCredentialRetirement).
+	`ALTER TABLE host_fence_credentials ADD COLUMN after_retirement TEXT NOT NULL DEFAULT ''`,
+	// The host incarnation counter (see History, schemaVersionHostIncarnation).
+	`ALTER TABLE hosts ADD COLUMN incarnation INTEGER NOT NULL DEFAULT 0`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -3558,10 +3611,12 @@ var alterVersions = []int{
 	45, 45, 45, // audit_log.key_id/signature/seq
 	49, 49, // hosts.isolation_epoch/isolation_reason
 	51, 51, // ip_allocations.netbox_ip_id/netbox_prefix_id
-	51, // netbox_bindings.netbox_cluster
-	53, // runtime_action_proofs.lease_term
-	54, // runtime_action_proofs.lease_key
-	60, // runtime_action_proofs.claim_certificate
+	51,                                // netbox_bindings.netbox_cluster
+	53,                                // runtime_action_proofs.lease_term
+	54,                                // runtime_action_proofs.lease_key
+	60,                                // runtime_action_proofs.claim_certificate
+	schemaVersionCredentialRetirement, // host_fence_credentials.after_retirement
+	schemaVersionHostIncarnation,      // hosts.incarnation
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

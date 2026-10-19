@@ -250,6 +250,7 @@ type inventoryFlight struct {
 	started time.Time
 	done    chan struct{}
 	res     inventoryVMs // set before done is closed
+	now     func() time.Time
 
 	mu       sync.Mutex
 	progress time.Time // when libvirt last answered a call of it
@@ -257,8 +258,18 @@ type inventoryFlight struct {
 
 func (f *inventoryFlight) answered() {
 	f.mu.Lock()
-	f.progress = time.Now()
+	f.progress = f.now()
 	f.mu.Unlock()
+}
+
+// invNow is the inventory's clock: the stall, the cap and progress are read on
+// it. invClock replaces it in tests, so a test drives "slow", "stalled" and
+// "past the cap" by the time it says passed, not by how fast this host runs.
+func (s *Server) invNow() time.Time {
+	if s.invClock != nil {
+		return s.invClock()
+	}
+	return time.Now()
 }
 
 type inventoryFlights struct {
@@ -284,12 +295,12 @@ func (e *inventoryNoAnswer) Is(target error) bool { return target == errLiveStat
 
 // inventoryVMsBounded is the libvirt half of an inventory (see above).
 func (s *Server) inventoryVMsBounded(ctx context.Context) (inventoryVMs, error) {
-	t0 := time.Now()
+	t0 := s.invNow()
 	fl := &s.invFlights
 	fl.mu.Lock()
 	f := fl.cur
 	if f == nil {
-		f = &inventoryFlight{started: t0, progress: t0, done: make(chan struct{})}
+		f = &inventoryFlight{started: t0, progress: t0, done: make(chan struct{}), now: s.invNow}
 		fl.cur = f
 		go func() {
 			res := s.inventoryVMs(f)
@@ -308,7 +319,7 @@ func (s *Server) inventoryVMsBounded(ctx context.Context) (inventoryVMs, error) 
 	tick := time.NewTicker(max(stall/10, time.Millisecond))
 	defer tick.Stop()
 	noAnswer := func(why string) (inventoryVMs, error) {
-		return inventoryVMs{}, &inventoryNoAnswer{why: why, waited: time.Since(t0)}
+		return inventoryVMs{}, &inventoryNoAnswer{why: why, waited: s.invNow().Sub(t0)}
 	}
 	for {
 		select {
@@ -317,13 +328,13 @@ func (s *Server) inventoryVMsBounded(ctx context.Context) (inventoryVMs, error) 
 		default:
 		}
 		f.mu.Lock()
-		stalled := time.Since(f.progress) >= stall
+		stalled := s.invNow().Sub(f.progress) >= stall
 		f.mu.Unlock()
 		switch {
 		case stalled:
 			return noAnswer(fmt.Sprintf("libvirt on %s has not answered the domain inventory for %s: a domain it hangs on holds it",
 				s.hostName, stall))
-		case time.Now().After(capAt):
+		case s.invNow().After(capAt):
 			return noAnswer(fmt.Sprintf("libvirt on %s is still answering the domain inventory past its cap of %s",
 				s.hostName, s.inventoryCap()))
 		}

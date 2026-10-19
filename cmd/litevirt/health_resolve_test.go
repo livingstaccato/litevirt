@@ -16,8 +16,9 @@ import (
 
 type captureResolveCondition struct {
 	pb.LiteVirtClient
-	req *pb.ResolveHealthConditionRequest
-	md  metadata.MD
+	req      *pb.ResolveHealthConditionRequest
+	md       metadata.MD
+	evidence string
 }
 
 func (c *captureResolveCondition) ResolveHealthCondition(ctx context.Context, in *pb.ResolveHealthConditionRequest, _ ...grpc.CallOption) (*pb.ResolveHealthConditionResponse, error) {
@@ -25,7 +26,7 @@ func (c *captureResolveCondition) ResolveHealthCondition(ctx context.Context, in
 	c.md, _ = metadata.FromOutgoingContext(ctx)
 	return &pb.ResolveHealthConditionResponse{Condition: &pb.HealthCondition{
 		Evaluator: "dual_run", Code: in.GetCode(), SubjectKind: in.GetSubjectKind(), SubjectId: in.GetSubjectId(),
-		Lifecycle: "resolved",
+		Lifecycle: "resolved", Evidence: c.evidence,
 	}}, nil
 }
 
@@ -118,6 +119,50 @@ func TestPrintClusterHealth_ShowsMoveEvidence(t *testing.T) {
 		"either file may hold", "error: pivot failed", "catch_up=true", "holds every write: /warm/d"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestHealthResolve_StaleUEFIVarsNeedsTheFlagAndAReason: resolving
+// nvram_flush_failed acknowledges that a vars store may be stale, so it needs
+// --accept-stale-uefi-vars and a --reason; without either nothing is sent.
+func TestHealthResolve_StaleUEFIVarsNeedsTheFlagAndAReason(t *testing.T) {
+	for _, args := range [][]string{
+		{"nvram_flush_failed", "host/node-1", "--reason", "disk replaced"},
+		{"nvram_flush_failed", "host/node-1", "--accept-stale-uefi-vars"},
+	} {
+		spy := &captureResolveCondition{}
+		if _, err := runHealthResolve(t, spy, args...); err == nil {
+			t.Fatalf("%v was accepted", args)
+		}
+		if spy.req != nil {
+			t.Fatalf("%v sent a request: %+v", args, spy.req)
+		}
+	}
+	spy := &captureResolveCondition{evidence: `{"files":[{"path":"/var/lib/libvirt/qemu/nvram/web-1_VARS.fd","vm":"web-1"}]}`}
+	out, err := runHealthResolve(t, spy, "nvram_flush_failed", "host/node-1", "--accept-stale-uefi-vars", "--reason", "disk replaced")
+	if err != nil {
+		t.Fatalf("with the flag and a reason: %v", err)
+	}
+	if spy.req == nil || spy.req.GetReason() != "disk replaced" || !spy.req.GetAcceptStaleUefiVars() {
+		t.Fatalf("request = %+v; want the reason and accept_stale_uefi_vars", spy.req)
+	}
+	if !strings.Contains(out, "/var/lib/libvirt/qemu/nvram/web-1_VARS.fd") || !strings.Contains(out, "web-1") {
+		t.Fatalf("output does not list the acknowledged files:\n%s", out)
+	}
+}
+
+// --accept and --force are vm.move_unresolved's: on nvram_flush_failed, even
+// with its own flag and a reason, each is refused before a request is sent.
+func TestHealthResolve_MoveFlagsRefusedOnStaleUEFIVars(t *testing.T) {
+	for _, extra := range [][]string{{"--accept", "/p"}, {"--force"}, {"--accept", "/p", "--force"}} {
+		spy := &captureResolveCondition{}
+		args := append([]string{"nvram_flush_failed", "host/node-1", "--accept-stale-uefi-vars", "--reason", "disk replaced"}, extra...)
+		if _, err := runHealthResolve(t, spy, args...); err == nil || !strings.Contains(err.Error(), "applies only to "+moveUnresolvedCode) {
+			t.Fatalf("%v: want the move flag refused, got %v", extra, err)
+		}
+		if spy.req != nil {
+			t.Fatalf("%v sent a request: %+v", extra, spy.req)
 		}
 	}
 }

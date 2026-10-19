@@ -74,14 +74,16 @@ Exit code: 0 healthy · 1 degraded or unknown · 2 critical.`,
 }
 
 // lv health resolve — mark one open dual-run or move-volume condition
-// resolved by hand.
+// resolved by hand, or acknowledge nvram_flush_failed
+// (--accept-stale-uefi-vars).
 func newHealthResolveCmd() *cobra.Command {
 	var evaluator, reason string
 	var accept []string
 	var force bool
+	var acceptStaleVars bool
 	cmd := &cobra.Command{
 		Use:   "resolve <code> <kind/subject>",
-		Short: "Resolve an open dual-run or move-volume health condition by hand (admin, audited)",
+		Short: "Resolve an open dual-run or move-volume health condition, or acknowledge nvram_flush_failed, by hand (admin, audited)",
 		Long: `Mark one open condition resolved, named as 'lv health' prints it:
 its CODE and its SUBJECT (kind/id), for example
 
@@ -123,6 +125,13 @@ copy was modified after the source, unless --force is given, as --accept of
 the copy is while the source was modified after it; the refusal prints both
 files' sizes and times.
 
+One more condition can be resolved: nvram_flush_failed. Resolving it, with
+--accept-stale-uefi-vars and a --reason, accepts that the UEFI vars stores it
+names may be stale (writes a failed fsync lost are not on disk), for a VM
+kept as it is; the host's daemon then stops reporting those files:
+
+  lv health resolve nvram_flush_failed host/node-1 --accept-stale-uefi-vars --reason "disk replaced"
+
 Requires the cluster.health.resolve verb (Admin). The resolution is written
 to the audit log with your principal and --reason, and published as an
 ha.condition.resolved event.`,
@@ -138,6 +147,15 @@ ha.condition.resolved event.`,
 			if force && (args[0] != moveUnresolvedCode || len(accept) == 0) {
 				return fmt.Errorf("--force applies only to %s with --accept", moveUnresolvedCode)
 			}
+			if args[0] == "nvram_flush_failed" {
+				if !acceptStaleVars {
+					return fmt.Errorf("resolving nvram_flush_failed accepts that the UEFI vars stores it names may be stale " +
+						"(the writes a failed fsync lost are not on disk); pass --accept-stale-uefi-vars to say so")
+				}
+				if strings.TrimSpace(reason) == "" {
+					return fmt.Errorf("resolving nvram_flush_failed needs a --reason, recorded in the audit log")
+				}
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				for _, a := range accept {
 					ctx = metadata.AppendToOutgoingContext(ctx, moveAcceptMDKey, a)
@@ -148,6 +166,7 @@ ha.condition.resolved event.`,
 				resp, err := c.ResolveHealthCondition(ctx, &pb.ResolveHealthConditionRequest{
 					Code: args[0], SubjectKind: kind, SubjectId: id,
 					Evaluator: evaluator, Reason: reason,
+					AcceptStaleUefiVars: acceptStaleVars,
 				})
 				if err != nil {
 					return fmt.Errorf("resolve %s on %s: %w", args[0], args[1], err)
@@ -156,6 +175,24 @@ ha.condition.resolved event.`,
 				if h.GetCode() == moveUnresolvedCode {
 					fmt.Printf("%s on %s/%s: %s.\n", h.GetCode(), h.GetSubjectKind(), h.GetSubjectId(), h.GetLifecycle())
 					printMoveEvidence(h.GetEvidence())
+					return nil
+				}
+				if args[0] == "nvram_flush_failed" {
+					fmt.Printf("%s on %s/%s: %s. These UEFI vars stores are accepted as possibly stale, each only while the host still holds that same file (path and inode):\n",
+						h.GetCode(), h.GetSubjectKind(), h.GetSubjectId(), h.GetLifecycle())
+					var ev struct {
+						Files []struct {
+							Path string `json:"path"`
+							VM   string `json:"vm"`
+						} `json:"files"`
+					}
+					if err := json.Unmarshal([]byte(h.GetEvidence()), &ev); err != nil || len(ev.Files) == 0 {
+						fmt.Println("  (the condition named no readable file list)")
+					}
+					for _, f := range ev.Files {
+						fmt.Printf("  %s (vm %s)\n", f.Path, f.VM)
+					}
+					fmt.Println("A listed file the host has since replaced stays raised, as does any other failed file and any new failure.")
 					return nil
 				}
 				fmt.Printf("%s on %s/%s (%s): %s. If it still holds, the detector raises it again on its next pass.\n",
@@ -168,6 +205,8 @@ ha.condition.resolved event.`,
 	cmd.Flags().StringVar(&reason, "reason", "", "why, recorded in the audit log")
 	cmd.Flags().StringArrayVar(&accept, "accept", nil, "vm.move_unresolved only: the file to keep of one disk's move; once per disk")
 	cmd.Flags().BoolVar(&force, "force", false, "vm.move_unresolved only: in a forked history, keep the file --accept names although the other file was modified after it (audited)")
+	cmd.Flags().BoolVar(&acceptStaleVars, "accept-stale-uefi-vars", false,
+		"for nvram_flush_failed: accept that the UEFI vars stores it names may be stale (needs --reason)")
 	return cmd
 }
 

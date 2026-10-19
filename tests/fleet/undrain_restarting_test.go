@@ -46,10 +46,13 @@ func (f *restartFleet) noFenceFor(t *testing.T, d time.Duration, what string) {
 	}
 }
 
-// serve brings d's daemon up: its probes and its Ping answer.
-func (f *restartFleet) serve(restorePing func()) {
+// serve brings d's daemon up: its probes and its Ping answer. It returns the
+// moment before they do, as answer does.
+func (f *restartFleet) serve(restorePing func()) time.Time {
+	at := time.Now() // before it answers (answer)
 	restorePing()
 	f.down.Store(false)
+	return at
 }
 
 // TestFleet_UndrainOfARestartingHostIsRefusedUntilItServes: d is stopped
@@ -117,8 +120,7 @@ func TestFleet_RestartingHostRecordedActiveByAnotherWriterKeepsItsAllowance(t *t
 	}
 	f.noFenceFor(t, 30*time.Second, "after it was recorded active mid-restart")
 
-	f.serve(restorePing)
-	served := time.Now()
+	served := f.serve(restorePing)
 	eventually(t, convergeTimeout, "every observer to see d answer", func() bool {
 		for _, n := range f.observers {
 			if got, at, ok := observedFailures(n, f.d.Name); !ok || got != 0 || !at.After(served) {

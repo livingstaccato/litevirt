@@ -54,8 +54,17 @@ type restartFleet struct {
 func newRestartFleet(t *testing.T, seed int64, tune ...func(*failover.Coordinator)) *restartFleet {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
 	c := New(t, Options{Nodes: 4, IndependentReplicas: true, FaultSeed: seed})
+	// The checkers and the coordinator loop below end before the cluster
+	// closes its databases: registered after New, this runs before its Stop.
+	// They used to be cancelled only after it, and went on querying closed
+	// databases, the coordinator's in-flight query keeping node-0's open into
+	// the next test (Cluster.dbName).
+	var loops sync.WaitGroup
+	t.Cleanup(func() {
+		cancel()
+		loops.Wait()
+	})
 	f := &restartFleet{c: c, a: c.Nodes[0], d: c.Nodes[3], observers: []*Node{c.Nodes[0], c.Nodes[1], c.Nodes[2]}}
 	c.WaitConverged(t, convergeTimeout)
 	// host_membership_split_v1 is mandatory and latched on any current
@@ -64,7 +73,7 @@ func newRestartFleet(t *testing.T, seed int64, tune ...func(*failover.Coordinato
 	for _, n := range c.Nodes {
 		splitMembership(t, n)
 	}
-	c.WaitConverged(t, convergeTimeout)
+	settleByAntiEntropy(t, c, true)
 	for _, n := range f.observers {
 		ch := health.NewChecker(n.Name, n.PKIDir, n.DB)
 		// The daemon's readiness prober, reduced to the one fact this
@@ -75,7 +84,11 @@ func newRestartFleet(t *testing.T, seed int64, tune ...func(*failover.Coordinato
 			}
 			return true, "", nil
 		})
-		go ch.Start(ctx)
+		loops.Add(1)
+		go func() {
+			defer loops.Done()
+			ch.Start(ctx)
+		}()
 	}
 	coord := failover.NewCoordinator(f.a.Name, f.a.DB)
 	for _, fn := range tune {
@@ -93,7 +106,9 @@ func newRestartFleet(t *testing.T, seed int64, tune ...func(*failover.Coordinato
 		}
 		return fence.Result{Method: "fleet-test", Success: true}
 	})
+	loops.Add(1)
 	go func() {
+		defer loops.Done()
 		tk := time.NewTicker(250 * time.Millisecond)
 		defer tk.Stop()
 		for {
@@ -112,6 +127,19 @@ func (f *restartFleet) fences() []time.Time {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]time.Time(nil), f.fencedAt...)
+}
+
+// answer has d's probes answered from now on, and returns the moment before
+// they were: an observer verdict published after it was made on a probe d
+// answered. Stamped BEFORE the flip, not after it. An observer publishes a
+// healthy verdict once, when its verdict changes, and never republishes it
+// unchanged, so a verdict made between the flip and a later stamp (under load,
+// an observer probes while the test is still confirming d serving) is older
+// than the stamp for good, and a wait for one newer never ends.
+func (f *restartFleet) answer() time.Time {
+	at := time.Now()
+	f.down.Store(false)
+	return at
 }
 
 // restart takes d down as a graceful stop does — its SIGTERM records it
@@ -177,8 +205,7 @@ func TestFleet_RestartedHostIsNotFencedBeforeItServes(t *testing.T) {
 	// lab 1 measured 3 s from the boot write to the gRPC listener on every
 	// one of the three re-fenced restarts.
 	time.Sleep(3 * time.Second)
-	f.down.Store(false)
-	served := time.Now()
+	served := f.answer()
 
 	eventually(t, convergeTimeout, "every observer to see d answer", func() bool {
 		for _, n := range f.observers {

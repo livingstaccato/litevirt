@@ -670,6 +670,35 @@ row and the old `hosts.ipmi_pass` column, so it is refused until
 predates the flag ignores it; the CLI reports an error when the host it gets
 back still has an IPMI address.
 
+`lv host rm` and a re-admission by `lv host add` retire the host's IPMI
+password, and it never falls back to a password from before the removal.
+Until it is set again with `lv host config <host> --ipmi-pass`, an `ipmi`
+fence of that host fails at once with `no IPMI password` and sends nothing to
+the BMC. A password that was never set is sent empty, for a BMC user with no
+password, and the fence result says so.
+
+A password set with `lv host config <host> --ipmi-pass` after the removal or
+re-admission reaches every node, by replication or by anti-entropy. A copy of
+the old password, from any node, never replaces the retired one. On a node
+that has not yet received the host's re-admission, `lv host config <host>
+--ipmi-pass` is refused with "this node's hosts row predates the host's
+current admission" and sets nothing: run it against a node that shows the
+re-admission in `lv host inspect <host>`, or retry once replication has
+caught up.
+
+A password only beats a retirement if this build recorded it as set after
+that retirement. The upgrade gives every existing password no such record,
+and a node still on the previous build records none with the passwords it
+writes. So any password set after a host's removal or re-admission before
+every node ran this build can lose to that retirement: a node that still
+holds the retirement (it was down when the password was set, or applies the
+removal late) retires the password on every node, and an `ipmi` fence of the
+host then fails with `no IPMI password`. If you removed or re-admitted a host
+and set its password again before or during the roll, set it again with
+`lv host config <host> --ipmi-pass` once the roll completes and every node
+is up. Passwords for hosts that were never removed or re-admitted replicate
+as before.
+
 ### Redfish
 
 A host whose BMC speaks Redfish (DMTF DSP0266) can be fenced through it
@@ -1562,7 +1591,11 @@ The restart is not silent, and the real disk is not lost:
   is not); when a disk stays at its path for one of the other reasons above;
   and for a seed from an earlier release. A seed that stays can hold
   user-data, and nothing removes it but an operator: while no VM of the name
-  exists, `lv host superseded-disks <host>` lists it as `kept`.
+  exists, `lv host superseded-disks <host>` lists it as `kept`. A shut-off domain of the VM still
+  defined on that host, from an owner epoch older than the deleted record's,
+  is undefined there (disks and TPM state kept, UEFI vars renamed to
+  `<vars>.superseded-<time>`) and its owner-epoch marker removed (orphaned runtimes in
+  [diagnostics](diagnostics.md)).
 - A VM of the same name created on that host before then clears
   `<data_dir>/disks/<vm>-<disk>.qcow2` files the earlier VM left. Of those, a
   disk that a failover left at its path is first renamed to

@@ -402,12 +402,26 @@ type Server struct {
 	commitFenceHook func(op string)
 	// createCommittedHook is a test-only seam; see SetCreateCommittedHook.
 	createCommittedHook func(name string) error
+	// createBeforeFlightHook, when set, runs on the owner between a create's
+	// first existence check and its in-flight registration (beginCreate).
+	// Test seam only; nil in production.
+	createBeforeFlightHook func(name string)
+	// removeHostBeforeDeleteHook, when set, runs in RemoveHost between its
+	// checks and its delete. Test seam only; nil in production.
+	removeHostBeforeDeleteHook func(name string)
+	// removeHostBetweenReadsHook, when set, runs in removeHostRefusal between
+	// its read of the host's row and its read of the row's admission key.
+	// Test seam only; nil in production.
+	removeHostBetweenReadsHook func(name string)
 	// createReturnedHook is a test-only seam; see SetCreateReturnedHook.
 	createReturnedHook func(name string, err error)
 	// stackMemberDeleteHook is a test-only seam: DeleteStack calls it with
 	// each member's name right before deleting it, where a test re-creates
 	// the VM as another incarnation.
 	stackMemberDeleteHook func(name string)
+	// deleteLeaseTakenHook is a test-only seam: deleteVM calls it with the
+	// VM's name once it holds the start lease, before it re-reads the row.
+	deleteLeaseTakenHook func(name string)
 	// restoreClaimedHook is a test-only seam; see SetRestoreClaimedHook.
 	restoreClaimedHook func(name string)
 	// restoreTargetResolvedHook is a test-only seam run after RestoreFromBackup
@@ -495,6 +509,10 @@ type Server struct {
 	// recreateTornDown is a test seam: it runs in a rebuild and a rolling
 	// recreate once the old VM is torn down, before it is created again.
 	recreateTornDown func(name string)
+	// recreateDeleted is a test seam: it runs in a rolling or inline
+	// recreate once its delete has returned, whether or not it removed
+	// anything, before the create.
+	recreateDeleted func(name string)
 	// testClearFirewallTags is a test seam: when set, a firewall-tags clear (a
 	// delete's, or a tag set's of a copied identity) calls it instead of
 	// corrosion.ClearFirewallTags.
@@ -918,6 +936,13 @@ type Server struct {
 	// lease another holder has (SetDeleteLeaseWaitForTest). Zero in
 	// production means deleteLeaseWaitDefault.
 	deleteLeaseWait time.Duration
+	// deleteFinish is a TEST SEAM for how long a delete runs once it has
+	// started acting (detachDelete). Zero, as in production, means
+	// deleteFinishTimeout.
+	deleteFinish time.Duration
+	// deleteStep is a TEST SEAM run at named steps of a VM delete
+	// (SetDeleteStepHookForTest). Nil in production.
+	deleteStep func(vm, step string)
 	// diskSpaceOverride is a TEST SEAM for the free-space checks of a cold
 	// migration's disk copy (diskSpace). Nil in production.
 	diskSpaceOverride func(dir string) (avail, total uint64, err error)
@@ -944,6 +969,11 @@ type Server struct {
 
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
+	// createFlights holds each create this host runs as the VM's owner until
+	// it returns: a second create of the name is refused while one is in
+	// flight (create_inflight.go).
+	createFlightsMu sync.Mutex
+	createFlights   map[*createFlight]struct{}
 	// vmLockQueues holds the callers waiting for a VM's lock through
 	// lockVMUnlessStartHeld (vm_start_bound.go).
 	vmLockQueuesMu sync.Mutex
@@ -957,6 +987,8 @@ type Server struct {
 	// invFlights is the runtime inventory's libvirt single flight
 	// (runtime_inventory.go).
 	invFlights inventoryFlights
+	// invClock, when set, is the inventory's clock (invNow). Test seam only.
+	invClock func() time.Time
 	// liveStateCalls holds each live-state read of a local domain libvirt
 	// has not answered yet (vm_live_state.go); liveStateWait is how long a
 	// read waits for one (zero: defaultLiveStateWait).
@@ -1093,6 +1125,9 @@ type Server struct {
 	// it so `lv cluster converge` kicks an immediate (debounced) pass instead of waiting
 	// for the periodic tick. Same synchronous-push pattern as fwReconciler.
 	antiEntropy AntiEntropyTrigger
+	// hostWriteCurrency turns on the caught-up check for the operator's hosts
+	// writes (host_incarnation.go). The daemon turns it on.
+	hostWriteCurrency atomic.Bool
 
 	// tenancy gates CreateVM/stack admission against project quotas
 	// and emits metered billing events. Optional — nil means
@@ -1125,6 +1160,9 @@ type Server struct {
 	// streamRecheckEvery is how often an open user-authenticated stream
 	// re-checks its credential (stream_watch.go); 0 = StreamRecheckInterval.
 	streamRecheckEvery time.Duration
+	// streamClock, when set, is the stream watcher's clock (streamNow).
+	// Test seam only.
+	streamClock func() time.Time
 	// streamKick wakes every open stream's watcher to re-check now; replaced
 	// (closed) on each kick. Guarded by streamKickMu.
 	streamKickMu sync.Mutex
@@ -1191,6 +1229,16 @@ type Server struct {
 	// releaseRollout: the HA monitor's cached rollout answers
 	// (releaseRolloutLagging). Guarded by releasePeerMu.
 	releaseRollout map[string]*rolloutAnswer
+	// schemaRefusedMu guards schemaRefused: each sender whose push this node
+	// refused because its schema is ahead (schema_refusal_health.go).
+	schemaRefusedMu sync.Mutex
+	schemaRefused   map[string]corrosion.SchemaRefusal
+	// schemaResolvedSeen is, per subject, the resolution of its
+	// replication_peer_schema_behind row this node last saw and when, on its
+	// own clock. Guarded by schemaRefusedMu.
+	schemaResolvedSeen map[string]schemaResolutionSeen
+	// schemaRefusalGraceOverride replaces schemaRefusalGrace in tests.
+	schemaRefusalGraceOverride atomic.Pointer[time.Duration]
 	// adoptedVoterGen is the voter generation AdoptVoterConfigs last found
 	// adopted, which Ping reports (PingResponse.voter_generation).
 	adoptedVoterGen atomic.Int64
@@ -1437,6 +1485,9 @@ func (s *Server) advertisedCapabilities() []string {
 	// relay_health_v1 is not withheld either: it says this binary reads the
 	// relay demotion rows when it elects relays, a fact about the build. The
 	// demotion rows are not written until the ReplicationGated latch forms.
+	// netbox_ip_repoint_v1 is not withheld either: it says this binary decodes
+	// the lease re-point statement, a fact about the build. No re-point is
+	// written until the ReplicationGated latch forms.
 	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
 	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
 	// operation_protocol_v1 is active (the crash-safe operation journal is a hard
@@ -2094,6 +2145,10 @@ func (s *Server) tokenEnabled(token string) bool {
 	case capabilities.SpecConflictV1:
 		// No kill switch: it says how this build resolves two edits of one
 		// spec at one generation, and every replica must resolve them alike.
+		return true
+	case capabilities.NetBoxIPRepointV1:
+		// No kill switch: it says this build decodes the lease re-point
+		// statement. The inventory mirror's own opt-in is its stand-down.
 		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm.Load()

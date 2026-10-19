@@ -200,6 +200,17 @@ func cloneTargetIgnored(req *pb.CloneVMRequest, vm *pb.VM, srcHost string) error
 // source's host it places the disks in req.TargetPool when one is named.
 func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, src *corrosion.VMRecord, project string, staging bool) (*pb.VM, error) {
 	var err error
+	// The clone makes a VM of the name here: no create of the name runs on
+	// this host while it does (beginCreate), and the name is checked again
+	// under the flight.
+	endFlight, setFlightUUID, err := s.beginCreate(req.Target)
+	if err != nil {
+		return nil, err
+	}
+	defer endFlight()
+	if existing, _ := corrosion.GetVM(ctx, s.db, req.Target); existing != nil {
+		return nil, status.Errorf(codes.AlreadyExists, "VM %q already exists", req.Target)
+	}
 	// The source's lock, held until the clone's row exists (review M-1): a
 	// linked clone backs on the source's current layer before anything
 	// records that. A snapshot delete or restore of the source holds this
@@ -346,6 +357,10 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	var diskRecords []corrosion.DiskRecord
 	var created []string
 	createdBy := map[string]storage.Driver{} // an rbd copy is removed by its driver
+	// createdFile is the file each copy this clone wrote is (its identity,
+	// right after it was written): a failed clone removes a path only while
+	// that file is still there, never another's that took the path since.
+	createdFile := map[string]madeFileID{}
 	cleanup := func() {
 		for _, p := range created {
 			if drv := createdBy[p]; drv != nil {
@@ -354,6 +369,10 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 					slog.Warn("clone cleanup: remove disk", "path", p, "error", e)
 				}
 				cancel()
+				continue
+			}
+			if id, ok := createdFile[p]; !ok || !id.stillAt(p) {
+				slog.Warn("clone cleanup: disk left, it is no longer the file this clone wrote", "path", p)
 				continue
 			}
 			if e := os.Remove(p); e != nil && !os.IsNotExist(e) {
@@ -454,6 +473,9 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 			}
 		}
 		created = append(created, hostFile)
+		if id, ok := madeFileIdentity(hostFile); ok {
+			createdFile[hostFile] = id
+		}
 		bus, controller := "virtio", ""
 		if ds := diskSpecByName[d.DiskName]; ds != nil {
 			if ds.Bus != "" {
@@ -489,6 +511,7 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics)
 	var guardRecords []corrosion.NICGuardRecord
 	cloneUUID := uuid.NewString() // the clone's incarnation; its guard records carry it
+	setFlightUUID(cloneUUID)
 	// The clone's seed network-config inputs, one per NIC (cloudinit.NIC),
 	// and its host-isolated picks, in flight until this returns.
 	var seedNICs []cloudinit.NIC

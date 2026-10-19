@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -201,6 +202,13 @@ type Options struct {
 	// wired on its own: with no other writer on the node there is nothing to
 	// exclude.
 	Exclusive func(ctx context.Context, pass func(context.Context) error) error
+
+	// BlockedRemovals receives, at the end of every pass that ran all its
+	// phases, the removals that pass withheld because an address on the
+	// object could not be detached: keyed by the NetBox address id, with what
+	// the operator has to do. An empty map is a pass that withheld none, which
+	// is what lets a finding clear. Nil discards them; the log line remains.
+	BlockedRemovals func(ctx context.Context, blocked map[string]string)
 }
 
 // New builds a Reconciler.
@@ -229,6 +237,7 @@ func New(o Options) *Reconciler {
 		holdsLease:   o.HoldsLease,
 		latched:      o.Latched,
 		exclusive:    o.Exclusive,
+		blockedSink:  o.BlockedRemovals,
 
 		inventorySnapshot: o.InventorySnapshot,
 	}
@@ -468,6 +477,7 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("cluster fingerprint: %w", err)
 	}
+	r.resetDeadAddresses()
 	// BEFORE the reads: actualState is scoped to this cluster id, and
 	// createVM/updateVM write it onto every object.
 	clusterID, err := r.ensureCluster(ctx)
@@ -548,6 +558,10 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 	// withheldReplacementCause.
 	planned := actions
 	var partialRead string
+	// Whether a gate took destructive actions away from this pass. A pass that
+	// did never attempted the removals a blocked-removal finding is about, so
+	// it may not report that finding's set — an empty one would read as clean.
+	withheldDestructive := false
 	if why := r.deleteBlocker(ctx, desired, skipped, actual); why != "" {
 		kept, withheld := withoutDestructive(actions)
 		slog.Warn("netbox mirror: withholding this sweep's deletes — the desired state is not whole",
@@ -555,6 +569,7 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 			"desired_vms", len(desired), "skipped_records", skipped,
 			"netbox_vms", len(actual.VMs), "netbox_interfaces", len(actual.NICs))
 		actions, converged, partialRead = kept, false, why
+		withheldDestructive = true
 	} else if kept, unprovenDeletes, unprovenClears := r.withoutUnprovenRemovals(ctx, actions, actual, proof); unprovenDeletes+unprovenClears > 0 {
 		// The whole-pass gate above answers "is this read whole?", which a
 		// PARTIALLY hydrated database passes: some of the cluster's rows are
@@ -581,6 +596,7 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 			kept, _ = withoutDestructive(kept)
 		}
 		actions, converged = kept, false
+		withheldDestructive = true
 		partialRead = fmt.Sprintf(
 			"this node holds no local record — tombstone included — for %d of the NetBox "+
 				"object(s) this sweep would have removed, so its view of the cluster is partial",
@@ -607,8 +623,34 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 			"desired_vms", len(desired), "netbox_vms", len(actual.VMs))
 	}
 
+	// THE PER-VM PRIMARY UNION, over what the gates kept. Taken in Diff it would
+	// let a proven clear null a primary naming an address whose own clear the
+	// evidence gate has just withheld. See unionPrimaryClears.
+	actions = unionPrimaryClears(actions)
+
 	if err := r.applyPhases(ctx, actions, indexDesired(desired, fp), fp); err != nil {
 		return false, withheldReplacementCause(err, withheldNames, partialRead)
+	}
+	// Reported from a pass that attempted every removal it planned, whether or
+	// not anything was withheld: an empty set from such a pass is what clears
+	// the finding. A pass whose gates withheld removals reports nothing, so the
+	// finding neither clears nor flaps while a block persists.
+	blocked := r.blockedRemovals()
+	if r.blockedSink != nil && !withheldDestructive {
+		r.blockedSink(ctx, blocked)
+	}
+	if len(blocked) > 0 {
+		converged = false
+	}
+	if ids, nics := r.deadAddresses(); len(ids) > 0 {
+		// Every other action ran; these NICs are left without their address in
+		// NetBox, and the pass is not converged while they are.
+		slog.Warn("netbox mirror: these NetBox address objects no longer exist, but a live "+
+			"lease still names each one, so its NIC could not be given its address. The rest "+
+			"of the pass ran; every pass reports itself unconverged until no live lease names "+
+			"a missing address object",
+			"netbox_address_ids", ids, "nics", nics)
+		return false, nil
 	}
 	return converged, nil
 }
@@ -829,6 +871,8 @@ func (r *Reconciler) withoutUnprovenRemovals(ctx context.Context, actions []Acti
 		switch {
 		case a.Op == "clear":
 			unprovenAddrs = append(unprovenAddrs, a.IPID)
+		case nullsOwnedPrimary(a):
+			unprovenAddrs = append(unprovenAddrs, a.UnsetsIPID)
 		case a.Kind == "vm":
 			unprovenVMs = append(unprovenVMs, actual.VMs[a.Key].Name)
 		default:
@@ -853,6 +897,8 @@ func (r *Reconciler) withoutUnprovenRemovals(ctx context.Context, actions []Acti
 	}
 	if len(unprovenAddrs) > 0 {
 		sort.Ints(unprovenAddrs)
+		// A clear and the primary null over one address name it twice.
+		unprovenAddrs = slices.Compact(unprovenAddrs)
 		slog.Warn("netbox mirror: withholding address detachments this node holds no lease "+
 			"record of, tombstone included — `ip_allocations` has not replicated them, or the "+
 			"address belongs to something this cluster has never leased; the next sweep "+
@@ -865,7 +911,8 @@ func (r *Reconciler) withoutUnprovenRemovals(ctx context.Context, actions []Acti
 }
 
 // destructive reports whether an action TAKES something away. Three ops do: the
-// delete, the clear, and the replace.
+// delete, the clear, and the replace — and a primary action that nulls a field
+// naming an owned address, which removes that address as a clear does.
 //
 // This is the ONLY spelling of that set: hasRemovals, withoutUnprovenRemovals
 // and withoutDestructive all call it rather than re-testing the ops, so the
@@ -884,7 +931,14 @@ func (r *Reconciler) withoutUnprovenRemovals(ctx context.Context, actions []Acti
 // for that one VM rather than removing an object on evidence just admitted to be
 // partial.
 func destructive(a Action) bool {
-	return a.Op == "delete" || a.Op == "clear" || a.Op == opReplace
+	return a.Op == "delete" || a.Op == "clear" || a.Op == opReplace || nullsOwnedPrimary(a)
+}
+
+// nullsOwnedPrimary reports whether a is a primary action that nulls a field
+// naming an owned address (Action.UnsetsIPID). It is the clear's removal by
+// another route, and proven the same way.
+func nullsOwnedPrimary(a Action) bool {
+	return a.Kind == "vm" && (a.Op == opPrimaryIP || a.Op == opPrimaryIP6) && a.IPID == 0 && a.UnsetsIPID != 0
 }
 
 // provenRemovable reports whether this node can CONCLUDE, from records it holds
@@ -919,6 +973,9 @@ func provenRemovable(a Action, actual Actual, nameByID map[int]string,
 	known corrosion.MirrorEvidence, corr *removalCorroboration) bool {
 	if a.Op == "clear" {
 		return known.KnowsAddress(a.IPID)
+	}
+	if nullsOwnedPrimary(a) {
+		return known.KnowsAddress(a.UnsetsIPID)
 	}
 	if a.Op == opReplace {
 		// Kind is checked, not assumed: Diff only ever builds a vm/replace, and
@@ -1463,7 +1520,7 @@ func (r *Reconciler) lookupDevice(ctx context.Context, host string) int {
 // desiredNICs maps litevirt NIC rows onto the mirror's NIC shape, resolving each
 // one's NetBox address object through the lease index. It also returns how many
 // NICs it skipped — see desiredState.
-func desiredNICs(nics []corrosion.NICRecord, byLease map[string]int) ([]DesiredNIC, int) {
+func desiredNICs(nics []corrosion.NICRecord, byLease map[string]leasedAddress) ([]DesiredNIC, int) {
 	// Ordered before naming, because the names are derived positionally on a
 	// collision and map/query order must not decide them.
 	sort.Slice(nics, func(i, j int) bool {
@@ -1489,11 +1546,15 @@ func desiredNICs(nics []corrosion.NICRecord, byLease map[string]int) ([]DesiredN
 			skipped++
 			continue
 		}
+		leased := byLease[leaseKey(n.NetworkName, strings.ToLower(n.MAC))]
 		out = append(out, DesiredNIC{
-			Name:       nicName(n, used),
-			MAC:        strings.ToLower(n.MAC),
-			IP:         n.IP,
-			NetBoxIPID: byLease[leaseKey(n.NetworkName, strings.ToLower(n.MAC))],
+			Name:          nicName(n, used),
+			MAC:           strings.ToLower(n.MAC),
+			IP:            n.IP,
+			NetBoxIPID:    leased.ID,
+			NetBoxIP:      leased.IP,
+			LeaseNetwork:  leased.Network,
+			LeasePrefixID: leased.PrefixID,
 		})
 	}
 	return out, skipped
@@ -1513,6 +1574,17 @@ func nicName(n corrosion.NICRecord, used map[string]bool) string {
 	}
 	used[name] = true
 	return name
+}
+
+// leasedAddress is the NetBox address object one lease names, and the address
+// it was leased for.
+type leasedAddress struct {
+	ID int
+	IP string
+	// Network and PrefixID locate the lease row and the binding it was claimed
+	// through, which a re-point of a dead address needs (see repairDeadAddress).
+	Network  string
+	PrefixID int
 }
 
 // indexLeases builds the (network, MAC) -> NetBox address id index the desired
@@ -1539,18 +1611,19 @@ func nicName(n corrosion.NICRecord, used map[string]bool) string {
 // and the count returned here withholds the destructive half of the pass (see
 // deleteBlocker), so the address the mirror could not resolve is not detached
 // either. The duplicate is left for an operator, named in the log.
-func indexLeases(leases []corrosion.LeaseRecord) (map[string]int, int) {
+func indexLeases(leases []corrosion.LeaseRecord) (map[string]leasedAddress, int) {
 	grouped := make(map[string][]corrosion.LeaseRecord, len(leases))
 	for _, l := range leases {
 		k := leaseKey(l.Network, l.MAC)
 		grouped[k] = append(grouped[k], l)
 	}
-	out := make(map[string]int, len(grouped))
+	out := make(map[string]leasedAddress, len(grouped))
 	var ambiguousKeys []string
 	dropped := 0
 	for k, group := range grouped {
 		if len(group) == 1 {
-			out[k] = group[0].NetBoxIPID
+			out[k] = leasedAddress{ID: group[0].NetBoxIPID, IP: group[0].IP,
+				Network: group[0].Network, PrefixID: group[0].NetBoxPrefix}
 			continue
 		}
 		ambiguousKeys = append(ambiguousKeys, k)

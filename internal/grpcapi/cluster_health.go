@@ -18,9 +18,10 @@ import (
 // set, evaluator coverage, the observer→target connectivity mesh, and per-host
 // capacity assessments into one response with one overall state — the single
 // surface the CLI, REST, MCP, UI, and dashboard all consume. There is no
-// per-signal health RPC. The rows say what the evaluators proved; the one
-// exception is an admin's audited ResolveHealthCondition on a dual-run row,
-// which the detector re-raises if it still holds.
+// per-signal health RPC. The rows say what the evaluators proved; the
+// exceptions are an admin's audited ResolveHealthCondition: on a dual-run row,
+// which the detector re-raises if it still holds, and on nvram_flush_failed,
+// an acknowledgement that a UEFI vars store may be stale.
 func (s *Server) GetClusterHealth(ctx context.Context, req *pb.GetClusterHealthRequest) (*pb.ClusterHealth, error) {
 	if err := RequireRole(ctx, "viewer"); err != nil {
 		return nil, err

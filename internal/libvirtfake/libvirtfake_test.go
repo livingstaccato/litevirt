@@ -173,3 +173,34 @@ func TestFake_TransientDomainStillHoldsItsName(t *testing.T) {
 		t.Errorf("a freed name must be reusable: %v", err)
 	}
 }
+
+// libvirt gives a definition with no <uuid> a random one, so a redefine of an
+// existing name without a uuid is refused there ("already exists with uuid"),
+// as is a uuid an INACTIVE domain of another name holds ("already defined
+// with uuid"). The fake refuses both, so a path that would fail on a real
+// host fails here too (dupcreate re-review 3, m-5).
+//
+// Mutation: keep the existing domain's uuid on a no-uuid redefine — red; skip
+// inactive domains in the uuid check — red.
+func TestFake_DefineRefusesWhatLibvirtRefuses(t *testing.T) {
+	f := New()
+	if err := f.DefineDomain(`<domain><name>vm1</name><uuid>uuid-one</uuid></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.DefineDomain(`<domain><name>vm1</name></domain>`); err == nil {
+		t.Error("a redefine of an existing name with no uuid was accepted")
+	}
+	if err := f.DefineDomain(`<domain><name>vm2</name><uuid>uuid-one</uuid></domain>`); err == nil {
+		t.Error("an inactive domain's uuid was accepted under another name")
+	}
+	// A new name with no uuid gets one, and the domain itself redefines.
+	if err := f.DefineDomain(`<domain type='kvm'><name>vm3</name></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.DefineDomain(`<domain><name>vm1</name><uuid>uuid-one</uuid></domain>`); err != nil {
+		t.Errorf("redefining a domain as itself: %v", err)
+	}
+	if x, _ := f.DumpXMLInactive("vm3"); domainUUIDFromXML(x) == "" {
+		t.Errorf("a definition with no uuid was stored with none: %s", x)
+	}
+}

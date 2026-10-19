@@ -48,7 +48,9 @@ type Replicator struct {
 	// not consuming our log, however recent its watermark row looks, so the
 	// prune stops counting it once the run outlasts UnreachablePeerGrace.
 	pushFailingSince map[string]time.Time
-	wg               sync.WaitGroup
+	// schemaPush is each peer's last schema answer to a push (schema_refusal.go).
+	schemaPush map[string]*schemaPushState
+	wg         sync.WaitGroup
 
 	// Fallback tracking for leaves: when was the last successful push to any relay?
 	lastRelayPush  atomic.Int64 // unix millis
@@ -401,6 +403,11 @@ func (r *Replicator) syncPeers() {
 			slog.Debug("replicator: started peer goroutine", "peer", name)
 		}
 	}
+	// A departed peer is pushed to no more, so its last schema answer would
+	// stand until the window ran out and re-raise a condition the gone-subject
+	// sweep resolved.
+	r.pruneSchemaPush(members)
+
 	// Stop goroutines for peers no longer in our target set.
 	for name, cancel := range r.peers {
 		if !targetSet[name] {
@@ -637,6 +644,7 @@ func (r *Replicator) replicateOnce(ctx context.Context, peerName string) (int, e
 	}
 	defer conn.Close()
 
+	schema := r.client.EffectiveDBSchema()
 	resp, err := client.PushMutations(pctx, &pb.ReplicateRequest{
 		Sender:        r.client.HostName(),
 		AfterSeq:      lastSeq,
@@ -646,7 +654,7 @@ func (r *Replicator) replicateOnce(ctx context.Context, peerName string) (int, e
 		// has), not the binary const — so during a multi-version rolling upgrade
 		// a node whose DB was pre-staged forward but whose binary hasn't swapped
 		// yet still reports the real (forward) schema and replication keeps flowing.
-		SenderSchemaVersion: int32(r.client.EffectiveDBSchema()),
+		SenderSchemaVersion: int32(schema),
 		// This node's belief that the PEER is a relay, carried so the peer can
 		// fan out even if its own copy of hosts.state disagrees with ours. The
 		// relay set is read under the lock because syncPeers replaces it.
@@ -656,8 +664,12 @@ func (r *Replicator) replicateOnce(ctx context.Context, peerName string) (int, e
 		SenderCapabilities: r.advertisedCapabilities(),
 	})
 	if err != nil {
+		if sender, peerSchema, ok := parseSchemaRefusal(err); ok {
+			r.noteSchemaRefusal(peerName, sender, peerSchema, time.Now())
+		}
 		return 0, fmt.Errorf("push mutations: %w", err)
 	}
+	r.noteSchemaAccepted(peerName, schema, time.Now())
 
 	// Update watermark: use the highest of peer's applied seq and our maxSeqSeen
 	// (to skip past filtered entries from the peer's origin).
@@ -1487,7 +1499,23 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 	// batch, which may carry the feature's data — is applied
 	// (release_features.go).
 	r.client.noteReleaseUseStatements(stmts)
-	for _, s := range stmts {
+	refusedIncarnation := map[int]bool{}
+	// The hosts writes this node refuses as another incarnation's, decided
+	// over the whole entry against the rows as they stand before it applies,
+	// so a credential upsert is skipped with one whichever comes first in the
+	// entry (the clear pass writes the upsert ahead of its hosts clear). No
+	// emitter puts a re-admission and a write of the same host in one entry,
+	// so the verdicts are the ones the loop reaches.
+	refusedHosts, err := r.refusedHostsInEntry(ctx, tx, stmts)
+	if err != nil {
+		return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+	}
+	// The credential upserts' hosts rows, before the entry (planCredentialUpsert).
+	credHosts, err := readEntryHostRows(ctx, tx, stmts)
+	if err != nil {
+		return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+	}
+	for i, s := range stmts {
 		if releaseUseApplyHook != nil {
 			releaseUseApplyHook(s)
 		}
@@ -1496,6 +1524,35 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 		}
 		if remintCredentialStatement(s, refusedRemints) {
 			r.client.deferAfterCommit(tx, func() { r.client.noteRemintCredentialRefused(pathWAL) })
+			continue
+		}
+		// A hosts write against another incarnation of the row is refused
+		// here, and its absorbs below skip it (host_incarnation.go).
+		if reason, rerr := r.hostsIncarnationRefusalOf(ctx, tx, s); rerr != nil {
+			return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, rerr)
+		} else if reason != "" {
+			refusedIncarnation[i] = true
+			if name := hostsStatementHost(s); name != "" {
+				refusedHosts[name] = true
+			}
+			r.client.noteIncarnationRefusal(tx, s, reason)
+			continue
+		}
+		// A fence credential carries the retirement it was set after
+		// (credentials_revive_guard.go). One that rides with a hosts write
+		// this node refuses as another incarnation's — before or after it in
+		// the entry — is that admission's credential, not this one's: it is
+		// skipped with it, and an entry whose password write was refused is
+		// not an operator write here. What this cannot reach: an upsert alone
+		// in its entry (the copy pass), which credrevive decides by the row
+		// this node holds — over no row, it applies.
+		if host := credentialUpsertHost(s); host != "" && refusedHosts[host] {
+			continue
+		}
+		credPlan, err := planCredentialUpsert(ctx, tx, s, withoutRefusedHosts(stmts, refusedHosts), credHosts)
+		if err != nil {
+			return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+		} else if credPlan.skip {
 			continue
 		}
 		if err := r.applyStatementLWW(ctx, tx, s, entry.Hlc); err != nil {
@@ -1523,6 +1580,9 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 				"sql", s.SQL, "origin", entry.Origin, "seq", entry.Seq, "error", err)
 			return wrapped
 		}
+		if err := credPlan.apply(ctx, tx); err != nil {
+			return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+		}
 		// A row this statement created may be one an earlier update
 		// is parked on. Replayed here, inside the batch, so the rest of
 		// the batch applies on top of it. See parked_updates.go.
@@ -1532,14 +1592,15 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 	// reaches this node in its old column only; absorb it into the
 	// credential row readers use (credentials_absorb.go). A users row the
 	// re-mint floor refused did not apply here, so it has nothing to absorb.
-	if err := absorbUnlatchedSecretWrite(ctx, tx, withoutRefusedRemints(stmts, refusedRemints), r.client.MayWriteCredentialTables()); err != nil {
+	applied := withoutIndexes(stmts, refusedIncarnation)
+	if err := absorbUnlatchedSecretWrite(ctx, tx, withoutRefusedRemints(applied, refusedRemints), r.client.MayWriteCredentialTables(), false, credHosts); err != nil {
 		slog.Error("replicator: absorbing an unlatched secret write failed — back-pressuring replication",
 			"origin", entry.Origin, "seq", entry.Seq, "error", err)
 		return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
 	}
 	// A host re-admitted over its tombstone takes no fence credential
 	// from the machine removed under its name (host_readmit.go).
-	if err := retireReadmittedCredentials(ctx, tx, stmts); err != nil {
+	if err := retireReadmittedCredentials(ctx, tx, applied); err != nil {
 		slog.Error("replicator: retiring a re-admitted host's credential failed — back-pressuring replication",
 			"origin", entry.Origin, "seq", entry.Seq, "error", err)
 		return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
@@ -1548,7 +1609,7 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 	// host_membership yet is absorbed into it here, locally
 	// (host_membership.go). Back-pressured on failure, like the secret
 	// absorb: swallowed, it would lose a fence on this node.
-	if err := absorbUnlatchedMembershipWrite(ctx, tx, stmts, r.client.MayWriteHostMembership(), r.client.hostsCopyFrozen()); err != nil {
+	if err := absorbUnlatchedMembershipWrite(ctx, tx, applied, r.client.MayWriteHostMembership(), r.client.hostsCopyFrozen()); err != nil {
 		slog.Error("replicator: absorbing an unlatched membership write failed — back-pressuring replication",
 			"origin", entry.Origin, "seq", entry.Seq, "error", err)
 		return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
@@ -1556,7 +1617,7 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 	// A runtime report written to hosts alone, by a node that was not
 	// writing host_runtime yet, is absorbed into it here, locally
 	// (host_runtime.go). Back-pressured on failure, like the other absorbs.
-	if err := absorbUnlatchedRuntimeWrite(ctx, tx, stmts); err != nil {
+	if err := absorbUnlatchedRuntimeWrite(ctx, tx, applied); err != nil {
 		slog.Error("replicator: absorbing an unlatched runtime write failed — back-pressuring replication",
 			"origin", entry.Origin, "seq", entry.Seq, "error", err)
 		return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
@@ -1889,6 +1950,29 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		return r.applySpecGeneration(ctx, tx, s, sh, tableName, pkCols, incomingHLC)
 
 	case DispHostReadmit:
+		// A counter-issuing re-admission carries its ordering in its WHERE
+		// (host_incarnation.go): applied verbatim through its reset form,
+		// never through the timestamp gate.
+		if isReadmitV2(s) {
+			if reason, iErr := hostsIncarnationRefusal(ctx, tx, s, sh); iErr != nil || reason != "" {
+				if reason != "" {
+					r.client.noteIncarnationRefusal(tx, s, reason)
+				}
+				return iErr
+			}
+			res, execErr := tx.ExecContext(ctx, appliedForm(s).SQL, s.Params...)
+			if execErr != nil {
+				return execErr
+			}
+			if rowsChanged(res) {
+				r.client.deferAfterCommit(tx, func() { r.client.clearUnresolvedFromShape(sh, s) })
+				r.client.noteOwnRowApplied(tx, s, sh)
+			}
+			if park := r.client.parkIfRowAbsent(ctx, tx, s, incomingHLC); park != nil {
+				r.client.deferAfterCommit(tx, park)
+			}
+			return nil
+		}
 		// Exactly DispFullPKUpdate, through the reset form: the re-admitted
 		// row starts with no per-host setting of the machine removed under
 		// its name, whichever release sent it (host_readmit.go). The
@@ -3371,6 +3455,17 @@ func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement,
 	// A write to a removed host's tombstone, other than its removal or its
 	// re-admission, changes nothing here (host_tombstone_guard.go).
 	if tableName == "hosts" {
+		// The incarnation rule (host_incarnation.go). applyEntry decides it
+		// before a statement gets here; a parked update replayed later meets
+		// it again here.
+		reason, iErr := hostsIncarnationRefusal(ctx, tx, s, sh)
+		if iErr != nil {
+			return iErr
+		}
+		if reason != "" {
+			r.client.noteIncarnationRefusal(tx, s, reason)
+			return nil
+		}
 		refused, rErr := hostsTombstoneRefuses(ctx, tx, s, sh)
 		if rErr != nil {
 			return rErr
@@ -3400,6 +3495,9 @@ func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement,
 		applied = replacedObservationApply(tableName, sh, rewritten)
 	}
 	res, err := tx.ExecContext(ctx, applied, s.Params...)
+	if err == nil && rowsChanged(res) && tableName == "hosts" {
+		r.client.noteOwnRowApplied(tx, s, sh)
+	}
 	if err == nil && rowsChanged(res) {
 		// A strictly-newer / resolver-chosen incoming write that actually CHANGED the row
 		// clears any stale unresolved-tie tracking — but only AFTER the batch commits, so a later
@@ -4313,6 +4411,91 @@ func (r *Replicator) Targets() []string {
 	out := make([]string, 0, len(r.peers))
 	for name := range r.peers {
 		out = append(out, name)
+	}
+	return out
+}
+
+// hostsIncarnationRefusalOf is hostsIncarnationRefusal for a statement not
+// yet parsed. A statement that does not parse is left to the apply, which
+// refuses it with its own error.
+func (r *Replicator) hostsIncarnationRefusalOf(ctx context.Context, tx *sql.Tx, s Statement) (string, error) {
+	if !strings.Contains(s.SQL, "hosts") {
+		return "", nil
+	}
+	sh, _, err := parseResolved(s.SQL)
+	if err != nil || sh.Table != "hosts" {
+		return "", nil
+	}
+	// A V2 re-admission is refused here only for an envelope that is not its
+	// parameters; its key is decided by its own WHERE, in the apply.
+	return hostsIncarnationRefusal(ctx, tx, s, sh)
+}
+
+// refusedHostsInEntry is the hosts whose hosts writes in the entry this node
+// refuses as another incarnation's, judged against the rows as they stand
+// before the entry applies.
+func (r *Replicator) refusedHostsInEntry(ctx context.Context, tx *sql.Tx, stmts []Statement) (map[string]bool, error) {
+	out := map[string]bool{}
+	for _, s := range stmts {
+		name := hostsStatementHost(s)
+		if name == "" {
+			continue
+		}
+		reason, err := r.hostsIncarnationRefusalOf(ctx, tx, s)
+		if err != nil {
+			return nil, err
+		}
+		if reason != "" {
+			out[name] = true
+		}
+	}
+	return out, nil
+}
+
+// withoutRefusedHosts is the entry without its hosts statements for the
+// refused hosts.
+func withoutRefusedHosts(stmts []Statement, refused map[string]bool) []Statement {
+	if len(refused) == 0 {
+		return stmts
+	}
+	out := make([]Statement, 0, len(stmts))
+	for _, s := range stmts {
+		if name := hostsStatementHost(s); name != "" && refused[name] {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// hostsStatementHost is the host a single-row hosts statement writes, "" for
+// any other statement.
+func hostsStatementHost(s Statement) string {
+	if !strings.Contains(s.SQL, "hosts") {
+		return ""
+	}
+	sh, _, err := parseResolved(s.SQL)
+	if err != nil || sh.Table != "hosts" {
+		return ""
+	}
+	pk, ok := pkValuesFromShape(sh, s)
+	if !ok || len(pk) != 1 {
+		return ""
+	}
+	name, _ := pk[0].(string)
+	return name
+}
+
+// withoutIndexes returns stmts without the ones at the given indexes.
+func withoutIndexes(stmts []Statement, drop map[int]bool) []Statement {
+	if len(drop) == 0 {
+		return stmts
+	}
+	out := make([]Statement, 0, len(stmts))
+	for i, s := range stmts {
+		if !drop[i] {
+			out = append(out, s)
+		}
 	}
 	return out
 }

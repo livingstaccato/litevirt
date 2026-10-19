@@ -188,7 +188,8 @@ func setKeptHeader(ctx context.Context, kept []KeptCephImage) {
 	_ = grpc.SetHeader(ctx, md)
 }
 
-// forwardKeptImages hands the kept images and kept disks (KeptDiskMD) a
+// forwardKeptImages hands the kept images, kept disks (KeptDiskMD) and
+// leftover domains on other hosts (LeftoverDomainMD) a
 // forwarded delete's owner named in hdr back to this delete's own caller.
 func forwardKeptImages(ctx context.Context, hdr metadata.MD) {
 	if vals := hdr.Get(KeptCephImageMD); len(vals) > 0 {
@@ -197,6 +198,9 @@ func forwardKeptImages(ctx context.Context, hdr metadata.MD) {
 	if vals := hdr.Get(KeptDiskMD); len(vals) > 0 {
 		_ = grpc.SetHeader(ctx, metadata.MD{KeptDiskMD: vals})
 	}
+	if vals := hdr.Get(LeftoverDomainMD); len(vals) > 0 {
+		_ = grpc.SetHeader(ctx, metadata.MD{LeftoverDomainMD: vals})
+	}
 }
 
 // recheckKeptCephImages forgets the kept images their pool, answering, no
@@ -204,7 +208,7 @@ func forwardKeptImages(ctx context.Context, hdr metadata.MD) {
 // answer stays named.
 func (s *Server) recheckKeptCephImages(ctx context.Context) {
 	for _, r := range s.keptRecords() {
-		drv, err := s.diskDriver(&corrosion.DiskRecord{Path: r.Path, StorageVolume: r.Volume, StorageType: "ceph"})
+		drv, err := s.diskDriver(ctx, &corrosion.DiskRecord{Path: r.Path, StorageVolume: r.Volume, StorageType: "ceph"})
 		if err != nil {
 			continue
 		}

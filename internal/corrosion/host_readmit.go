@@ -73,24 +73,28 @@ var readmitResetSQL = buildReadmitReset()
 // readmitFingerprint is the wire fingerprint applied through readmitResetSQL.
 var readmitFingerprint = mustStatementFingerprint(readmitHostSQL)
 
-func buildReadmitReset() string {
+func buildReadmitReset() string { return buildReadmitResetFor(readmitHostSQL) }
+
+// buildReadmitResetFor inserts the reset columns into a re-admission's wire
+// form (readmitHostSQL, readmitHostV2SQL). The reset form binds exactly the
+// wire form's parameters, in the same order: a receiver executes it with the
+// INCOMING params.
+func buildReadmitResetFor(wireSQL string) string {
 	const anchor = "deleted_at = NULL,"
-	if strings.Count(readmitHostSQL, anchor) != 1 {
-		panic("readmitHostSQL must clear deleted_at exactly once: " + readmitHostSQL)
+	if strings.Count(wireSQL, anchor) != 1 {
+		panic("a re-admission must clear deleted_at exactly once: " + wireSQL)
 	}
-	reset := strings.Replace(readmitHostSQL, anchor, readmitResetColumns+anchor, 1)
-	// The reset form binds exactly the wire form's parameters, in the same
-	// order: a receiver executes it with the INCOMING params.
-	wire, _, err := parseResolved(readmitHostSQL)
+	reset := strings.Replace(wireSQL, anchor, readmitResetColumns+anchor, 1)
+	wire, _, err := parseResolved(wireSQL)
 	if err != nil {
-		panic("readmitHostSQL does not resolve: " + err.Error())
+		panic("re-admission SQL does not resolve: " + err.Error())
 	}
 	r, _, err := parseResolved(reset)
 	if err != nil {
 		panic("readmit reset SQL does not resolve: " + reset + ": " + err.Error())
 	}
 	if wire.Kind != KindUpdate || !wire.HasFullPKIdentity || wire.UpdatedAtParamIdx < 0 {
-		panic("readmitHostSQL must be a full-PK UPDATE binding updated_at")
+		panic("a re-admission must be a full-PK UPDATE binding updated_at")
 	}
 	if r.ValidateParamArity(wire.ParamCount) != nil || r.UpdatedAtParamIdx != wire.UpdatedAtParamIdx {
 		panic("readmit reset form must bind the wire form's parameters")
@@ -159,6 +163,24 @@ func retireReadmittedCredentials(ctx context.Context, tx *sql.Tx, stmts []Statem
 		var host, ts string
 		var ok bool
 		switch {
+		case isReadmitV2(s):
+			if len(s.Params) == 13 {
+				ts, _ = s.Params[8].(string)
+				host, _ = s.Params[9].(string)
+				ok = host != "" && ts != ""
+			}
+			if ok {
+				if err := retireHostOwnedRows(ctx, tx, host, ts); err != nil {
+					return fmt.Errorf("reset %s's per-host rows on re-admission: %w", host, err)
+				}
+				// A counted re-admission retires the credential even where
+				// this node holds none, so a lagging node's live row from the
+				// earlier admission meets a retirement here on the sensitive
+				// merge, not an empty slot it would fill.
+				if err := ensureCredentialRow(ctx, tx, host, ts); err != nil {
+					return fmt.Errorf("retire %s's fence credential: %w", host, err)
+				}
+			}
 		case isReadmit(s):
 			host, ts, ok = readmitParams(s)
 			if ok {
@@ -188,25 +210,67 @@ func retireReadmittedCredentials(ctx context.Context, tx *sql.Tx, stmts []Statem
 // retireFenceCredential stamps the tombstone with updatedAt, the admission's
 // own updated_at (which its origin took from NowTS), never a clock of this
 // node's: every node must derive the same row from the same statement.
+//
+// It retires every row that comes before the tombstone in the credential
+// order (credentials_revive_guard.go): a row set after an EARLIER retirement,
+// or after none, is retired however new its clock — that is the stale copy
+// the order exists to stop. Only a row an operator set after this retirement
+// (or a later one) stands.
 func retireFenceCredential(ctx context.Context, tx *sql.Tx, host, updatedAt string) error {
-	var cur string
-	var deleted sql.NullString
-	err := tx.QueryRowContext(ctx,
-		`SELECT updated_at, deleted_at FROM host_fence_credentials WHERE host_name = ?`, host).Scan(&cur, &deleted)
-	switch {
-	case err == sql.ErrNoRows:
-		return nil
-	case err != nil:
+	local, err := readLocalCredential(ctx, tx, host)
+	if err != nil || !local.exists {
 		return err
-	case deleted.Valid && deleted.String != "":
-		return nil // already retired
-	case lwwOrder(cur, updatedAt) >= 0:
-		return nil // set after the admission: the new machine's
+	}
+	if local.order().cmp(credentialOrder{retirement: updatedAt, updatedAt: updatedAt}) >= 0 {
+		return nil // already retired at it, or set after it
 	}
 	_, err = tx.ExecContext(ctx,
-		`UPDATE host_fence_credentials SET ipmi_pass = '', deleted_at = ?, updated_at = ? WHERE host_name = ?`,
+		`UPDATE host_fence_credentials SET ipmi_pass = '', deleted_at = ?, updated_at = ?, after_retirement = ''
+		 WHERE host_name = ?`,
 		updatedAt, updatedAt, host)
 	return err
+}
+
+// ensureCredentialRow inserts host's credential tombstone at updatedAt when
+// this node holds no credential row for it; retireFenceCredential then finds
+// it already retired at that instant. Every node derives the same row from the
+// same statement.
+func ensureCredentialRow(ctx context.Context, tx *sql.Tx, host, updatedAt string) error {
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO host_fence_credentials (host_name, ipmi_pass, updated_at, deleted_at, after_retirement)
+		 VALUES (?, '', ?, ?, '') ON CONFLICT(host_name) DO NOTHING`,
+		host, updatedAt, updatedAt)
+	return err
+}
+
+// retireAdoptedAdmissionCredential is the credential half of a counted
+// re-admission for a node that adopts its hosts row by anti-entropy (a later
+// key than the local row's) rather than applying its entry: such a node runs
+// no retireReadmittedCredentials, and would otherwise hold no retirement for
+// the new admission, so a lagging node's live row from the earlier one would
+// fill the slot on the sensitive merge. It retires the credential at the
+// admission's created_at, the instant of the re-admission's own updated_at
+// (ReadmitStamp): not after a password written for the new admission, which
+// carries that updated_at as its retirement, and after the earlier
+// admission's retirement (the re-admission is stamped after it). A removal
+// adopted this way, and a row at incarnation 0, retire nothing here.
+func retireAdoptedAdmissionCredential(ctx context.Context, tx *sql.Tx, table syncTable, row []interface{}) error {
+	idx := columnIndexMap(table.Columns)
+	if _, ok := idx["incarnation"]; !ok {
+		return nil
+	}
+	in := rowHostKey(row, idx)
+	host := cellStr(row, idx, "name")
+	if in.n < 1 || in.deleted || in.at == "" || host == "" {
+		return nil
+	}
+	if err := ensureCredentialRow(ctx, tx, host, in.at); err != nil {
+		return fmt.Errorf("retire %s's fence credential: %w", host, err)
+	}
+	if err := retireFenceCredential(ctx, tx, host, in.at); err != nil {
+		return fmt.Errorf("retire %s's fence credential: %w", host, err)
+	}
+	return nil
 }
 
 // THE HOST'S OTHER ROWS. Four more tables are keyed by the host's name, and a

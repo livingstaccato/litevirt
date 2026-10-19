@@ -2,7 +2,9 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -75,7 +77,9 @@ func (s *Server) domainNamesFile(vmName, path string) string {
 	if s.pitSnapshotter == nil {
 		return "whether VM " + vmName + "'s domain names it cannot be told: no definition reader"
 	}
-	used, err := s.pitSnapshotter.DomainUsesFile(vmName, path)
+	used, err := storage.Bounded("read whether a domain names", path, func() (bool, error) {
+		return s.pitSnapshotter.DomainUsesFile(vmName, path)
+	})
 	if err != nil {
 		return "whether VM " + vmName + "'s domain names it cannot be told: " + err.Error()
 	}
@@ -108,7 +112,7 @@ func (s *Server) anyDomainNamesFile(path string) string {
 // forwardedHop reports whether ctx is a request an entry node already
 // forwarded here (forwardedHopMDKey, from a peer certificate only).
 func (s *Server) forwardedHop(ctx context.Context) bool {
-	if s.requirePeerCert(ctx) != nil {
+	if callerPrincipalKind(ctx) != principalKindPeer || s.requirePeerCert(ctx) != nil {
 		return false
 	}
 	md, ok := metadata.FromIncomingContext(ctx)
@@ -116,10 +120,15 @@ func (s *Server) forwardedHop(ctx context.Context) bool {
 }
 
 // refuseSecondHop is the answer of a host that received a forwarded request
-// for a VM its replica places on yet another host: never forwarded again, so
-// two replicas that disagree cannot pass it back and forth.
-func refuseSecondHop(vm, host string) error {
-	return status.Errorf(codes.Aborted, "this host's replica places vm %q on %s, not here: the forwarded request is not passed on again; retry once the cluster agrees", vm, host)
+// it would forward again: never, so two replicas that disagree cannot pass it
+// back and forth. why says where it would go, and why.
+func refuseSecondHop(why string) error {
+	return status.Errorf(codes.Aborted, "%s, not here: the forwarded request is not passed on again; retry once the cluster agrees", why)
+}
+
+// secondHopVM is refuseSecondHop for a VM this host's replica places on host.
+func secondHopVM(vm, host string) error {
+	return refuseSecondHop(fmt.Sprintf("this host's replica places vm %q on %s", vm, host))
 }
 
 // forwardOnce marks ctx as forwarded, carrying the operator who asked.
@@ -352,7 +361,10 @@ func (s *Server) ListSetAsideOverlays(ctx context.Context, req *pb.ListSetAsideO
 	var resp *pb.ListSetAsideOverlaysResponse
 	if target != "" && target != s.hostName {
 		if s.forwardedHop(ctx) {
-			return nil, refuseSecondHop(req.GetVmName(), target)
+			if req.GetVmName() != "" {
+				return nil, secondHopVM(req.GetVmName(), target)
+			}
+			return nil, refuseSecondHop(fmt.Sprintf("the forwarded listing names host %s", target))
 		}
 		client, conn, err := s.peerClient(ctx, target)
 		if err != nil {
@@ -392,9 +404,9 @@ func (s *Server) RemoveSetAsideOverlay(ctx context.Context, req *pb.RemoveSetAsi
 	// The operator who asked, carried to the host that removes, which writes
 	// the audit row (a forwarded call arrives as the peer).
 	actor := s.repairActor(ctx)
-	forward := func(what, host string) (*pb.RemoveSetAsideOverlayResponse, error) {
+	forward := func(hop error, host string) (*pb.RemoveSetAsideOverlayResponse, error) {
 		if s.forwardedHop(ctx) {
-			return nil, refuseSecondHop(what, host)
+			return nil, hop
 		}
 		client, conn, err := s.peerClient(ctx, host)
 		if err != nil {
@@ -408,7 +420,7 @@ func (s *Server) RemoveSetAsideOverlay(ctx context.Context, req *pb.RemoveSetAsi
 			return nil, status.Error(codes.InvalidArgument, "give a path (a detached overlay) or vm_name, disk_name and name, not both")
 		}
 		if h := req.GetHost(); h != "" && h != s.hostName {
-			return forward(req.GetPath(), h)
+			return forward(refuseSecondHop(fmt.Sprintf("the forwarded removal of %s names host %s", req.GetPath(), h)), h)
 		}
 		return s.removeDetachedOverlay(ctx, actor, req.GetPath())
 	}
@@ -420,7 +432,7 @@ func (s *Server) RemoveSetAsideOverlay(ctx context.Context, req *pb.RemoveSetAsi
 		return nil, status.Errorf(codes.NotFound, "vm %q not found", req.GetVmName())
 	}
 	if vm.HostName != s.hostName {
-		return forward(vm.Name, vm.HostName)
+		return forward(secondHopVM(vm.Name, vm.HostName), vm.HostName)
 	}
 	unlock := s.lockVM(vm.Name)
 	defer unlock()
@@ -442,6 +454,7 @@ func (s *Server) RemoveSetAsideOverlay(ctx context.Context, req *pb.RemoveSetAsi
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
+	defer s.lockVM(pitOrphanBaseLock(disk))()
 	target := vm.Name + "/" + d.DiskName + "/" + req.GetName()
 	fi, err := s.statOrphan(orphan, req.GetName(), "beside disk "+d.DiskName+" of vm "+vm.Name)
 	if err != nil {
@@ -511,12 +524,22 @@ func (s *Server) removeDetachedOverlay(ctx context.Context, actor, path string) 
 	}
 	// Held from the checks to the unlink: the VM lock of the disk's owner, as
 	// its binding records it (a re-create of that VM, or an attach or a
-	// set-aside on its disk, takes it), and of the disk file itself.
+	// set-aside on its disk, takes it), and the lock every removal of an
+	// overlay set aside beside base takes. A binding that exists but cannot
+	// be read keeps the overlay: whose it is cannot be told.
 	owner, oerr := storage.Bounded("read the binding of", path, func() (pitoverlay.Owner, error) { return pitoverlay.OrphanOwner(path) })
-	if oerr == nil && owner.VM != "" {
-		defer s.lockVM(owner.VM)()
+	switch {
+	case oerr == nil:
+		if owner.VM != "" {
+			defer s.lockVM(owner.VM)()
+		}
+	case errors.Is(oerr, fs.ErrNotExist):
+	default:
+		why := "its binding cannot be read: " + oerr.Error()
+		s.auditAs(ctx, actor, pitOverlayRemoveAction, path, "refused: "+why, "denied")
+		return nil, status.Errorf(codes.FailedPrecondition, "set-aside overlay %s is not removed: %s", path, why)
 	}
-	defer s.lockVM("pit-orphan-base:" + base)()
+	defer s.lockVM(pitOrphanBaseLock(base))()
 	fi, err := s.statOrphan(path, filepath.Base(path), "on host "+s.hostName)
 	if err != nil {
 		return nil, err
@@ -532,3 +555,7 @@ func (s *Server) removeDetachedOverlay(ctx context.Context, actor, path string) 
 // acts on. Honoured only from a peer certificate: such a request is answered
 // where it lands and never forwarded again.
 const forwardedHopMDKey = "x-litevirt-forwarded-hop"
+
+// pitOrphanBaseLock is the lock name of the disk path base an overlay was
+// set aside beside.
+func pitOrphanBaseLock(base string) string { return "pit-orphan-base:" + base }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -496,5 +497,108 @@ func TestDetachedPITOverlay_RemovalHoldsTheOwnersVMLock(t *testing.T) {
 	})
 	if hygieneFileThere(o) {
 		t.Fatal("not removed once the lock was free")
+	}
+}
+
+// R3 n-1. A detached overlay whose binding exists but cannot be read is
+// kept: whose it is cannot be told, so its owner's lock cannot be taken.
+//
+// Mutation "unreadable binding skips the owner lock" (only ENOENT refused
+// dropped: any error goes on unlocked): it is removed; red.
+func TestDetachedPITOverlay_AnUnreadableBindingKeepsIt(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads any file")
+	}
+	s, _, _ := setAsideServer(t)
+	dir := filepath.Join(s.dataDir, "disks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	o := pitoverlay.Path(filepath.Join(dir, "gone-root.qcow2")) + ".orphan-20261001-000000"
+	if err := os.WriteFile(o, []byte("o"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(o+".id", []byte(`{"vm":"gone"}`), 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(o+".id", 0o600) })
+	_, err := s.RemoveSetAsideOverlay(adminCtx(), &pb.RemoveSetAsideOverlayRequest{Path: o})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("remove with its binding unreadable = %v, want FailedPrecondition", err)
+	}
+	if !hygieneFileThere(o) {
+		t.Fatal("removed")
+	}
+}
+
+// R3 n-1. Both removal paths, by VM and by path, take the lock of the disk
+// path the overlay was set aside beside, so a removal of either kind never
+// runs beside another of the same file.
+//
+// Mutation "no base lock on the VM path": the VM-path removal completes
+// while that lock is held; red.
+func TestSetAsideOverlays_BothRemovalPathsTakeTheBaseLock(t *testing.T) {
+	s, _, older := setAsideServer(t)
+	disk, _ := pitoverlay.DiskOfOrphan(older)
+	assertSerializedByVMLock(t, s, pitOrphanBaseLock(disk), func() {
+		_, _ = s.RemoveSetAsideOverlay(adminCtx(), &pb.RemoveSetAsideOverlayRequest{VmName: "web", DiskName: "root", Name: filepath.Base(older)})
+	})
+	if hygieneFileThere(older) {
+		t.Fatal("not removed once the lock was free")
+	}
+	dir := filepath.Join(s.dataDir, "disks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Join(dir, "gone-root.qcow2")
+	o := pitoverlay.Path(base) + ".orphan-20261001-000000"
+	if err := os.WriteFile(o, []byte("o"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertSerializedByVMLock(t, s, pitOrphanBaseLock(base), func() {
+		_, _ = s.RemoveSetAsideOverlay(adminCtx(), &pb.RemoveSetAsideOverlayRequest{Path: o})
+	})
+}
+
+// R3 n-2. The forward-once marker is honoured only from a cluster peer: a
+// client (a bearer, an operator's own mTLS) that sends it has it ignored, so
+// its request is forwarded as any other (here: the third host cannot be
+// dialled, Unavailable), never refused as a second hop.
+//
+// Mutation "marker from any caller": Aborted; red.
+func TestForwardOnce_AClientsForgedMarkerIsIgnored(t *testing.T) {
+	s, _, _ := setAsideServer(t)
+	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{Name: "away", HostName: "third-host", State: "running", Spec: `{"name":"away"}`}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	ctx := metadata.NewIncomingContext(adminCtx(), metadata.Pairs(forwardedHopMDKey, "forged"))
+	_, err := s.RemoveSetAsideOverlay(ctx, &pb.RemoveSetAsideOverlayRequest{VmName: "away", DiskName: "root", Name: ".x.lv-pit.orphan-20261018-120000"})
+	if status.Code(err) == codes.Aborted {
+		t.Fatalf("a client's forged marker was honoured: %v", err)
+	}
+}
+
+// R3 n-2, the sending side. A forward carries the marker and the operator.
+//
+// Mutation "forwardOnce does not mark": red.
+func TestForwardOnce_MarksTheForward(t *testing.T) {
+	s := &Server{hostName: "node-a"}
+	md, ok := metadata.FromOutgoingContext(s.forwardOnce(context.Background(), "alice"))
+	if !ok || len(md.Get(forwardedHopMDKey)) != 1 || md.Get(forwardedHopMDKey)[0] != "node-a" || len(md.Get(repairActorMDKey)) != 1 {
+		t.Fatalf("outgoing metadata %v: want the forward-once marker naming node-a and the actor", md)
+	}
+}
+
+// R3 n-3. A host told to remove a detached overlay by path is never asked to
+// pass it on: the refusal names the path and the host it was sent to, not a
+// VM or a replica's placement.
+func TestForwardOnce_APathForwardIsRefusedByPath(t *testing.T) {
+	s, _, _ := setAsideServer(t)
+	ctx := peerCtxFor(t, s, "node-x")
+	ctx = context.WithValue(context.WithValue(ctx, ctxKeyUsername, "admin"), ctxKeyRole, "admin")
+	ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(forwardedHopMDKey, "node-x"))
+	_, err := s.RemoveSetAsideOverlay(ctx, &pb.RemoveSetAsideOverlayRequest{Host: "third-host", Path: "/srv/p/.x.lv-pit.orphan-20261018-120000"})
+	if status.Code(err) != codes.Aborted || strings.Contains(err.Error(), "vm \"") || !strings.Contains(err.Error(), "/srv/p/.x.lv-pit.orphan-20261018-120000") {
+		t.Fatalf("a forwarded path removal for another host = %v; want Aborted naming the path, not a vm", err)
 	}
 }

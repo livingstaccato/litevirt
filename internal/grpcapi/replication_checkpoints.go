@@ -65,7 +65,7 @@ func (s *Server) DeleteReplicationCheckpoint(ctx context.Context, req *pb.Delete
 	bitmapLeft := ""
 	if vm != nil && vm.HostName != s.hostName {
 		if s.forwardedHop(ctx) {
-			return nil, refuseSecondHop(vm.Name, vm.HostName)
+			return nil, secondHopVM(vm.Name, vm.HostName)
 		}
 		client, conn, derr := s.peerClient(ctx, vm.HostName)
 		if derr != nil {

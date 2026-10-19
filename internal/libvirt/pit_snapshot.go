@@ -3,6 +3,8 @@ package libvirt
 import (
 	"encoding/xml"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -358,7 +360,10 @@ func domainRunsOnFile(v pitAPI, domain, path string) (bool, error) {
 }
 
 // DomainUsesFile reports whether the domain's live or persistent definition
-// names path as a disk source.
+// names path as a disk source or anywhere in a disk's <backingStore> chain,
+// comparing by the path as given, the path with symlinks resolved, and the
+// file (device and inode) when both exist. A definition that cannot be read
+// or parsed is an error, never "not named".
 func (c *Client) DomainUsesFile(domain, path string) (bool, error) {
 	return domainUsesFile(c.virt, domain, path)
 }
@@ -373,9 +378,67 @@ func domainUsesFile(v pitAPI, domain, path string) (bool, error) {
 		if err != nil {
 			return false, fmt.Errorf("dump domain xml: %w", err)
 		}
-		if diskTargetForSource(x, path) != "" {
+		used, err := domainXMLReferences(x, path)
+		if err != nil {
+			return false, fmt.Errorf("parse domain %s xml: %w", domain, err)
+		}
+		if used {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// chainSource is a disk's, or a backing store's, source and what it backs on.
+type chainSource struct {
+	Source struct {
+		File string `xml:"file,attr"`
+		Dev  string `xml:"dev,attr"`
+	} `xml:"source"`
+	Backing *chainSource `xml:"backingStore"`
+}
+
+// domainXMLReferences reports whether domXML names path in any disk's chain.
+func domainXMLReferences(domXML, path string) (bool, error) {
+	var d struct {
+		Disks []chainSource `xml:"devices>disk"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
+		return false, err
+	}
+	want := fileIdentity(path)
+	for i := range d.Disks {
+		for c := &d.Disks[i]; c != nil; c = c.Backing {
+			for _, p := range []string{c.Source.File, c.Source.Dev} {
+				if p != "" && want.same(fileIdentity(p)) {
+					return true, nil
+				}
+			}
+		}
+	}
+	return false, nil
+}
+
+// identity is a path as given, with symlinks resolved, and the file it is.
+type identity struct {
+	clean, resolved string
+	fi              os.FileInfo
+}
+
+func fileIdentity(p string) identity {
+	id := identity{clean: filepath.Clean(p), resolved: filepath.Clean(p)}
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		id.resolved = r
+	}
+	if fi, err := os.Stat(p); err == nil {
+		id.fi = fi
+	}
+	return id
+}
+
+func (a identity) same(b identity) bool {
+	if a.clean == b.clean || a.resolved == b.resolved {
+		return true
+	}
+	return a.fi != nil && b.fi != nil && os.SameFile(a.fi, b.fi)
 }

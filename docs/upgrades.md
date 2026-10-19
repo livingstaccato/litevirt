@@ -2119,3 +2119,10 @@ this release. Two effects while the fleet is mixed:
   email target without a password is allowed at any time. The first such create
   after the latch marks the feature used, after which a rollback below this
   release quarantines the host.
+
+### Re-created project names during the roll
+
+During the roll, a host on the previous build can still retire a re-created
+project's admission authority, and anti-entropy spreads that to upgraded hosts.
+It recovers when the next admission claims a fresh authority epoch, and it
+heals once every host runs this release.

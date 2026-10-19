@@ -570,13 +570,14 @@ sender: the first use would not be refused, and every such host would
 acknowledge it and then quarantine itself. So a feature added after a release
 ships — in a patch release too — is declared under the next release token,
 never a shipped one, and a test pins every release token's list. All
-twenty-one features of `release_2026_11_v1` are declared in this release (`lv
+twenty-three features of `release_2026_11_v1` are declared in this release (`lv
 cluster upgrade-status` lists them): `vm_limits`, `vm_disk_nic_io`,
 `email_target_secret`, `login_policy`, `drain_failback`, `firewall_ipv6`,
 `nic_guards`, `usb_mounts_memory`, `backup_zstd`, `container_replication`,
 `iscsi_lun_claim`, `pit_overlay`, `redfish_fence`, `ha_disarm`, `nic_mtu`,
 `replication_rate`, `returning_boot`, `firewall_synflood`, `firewall_log`,
-`firewall_tag_groups` and `host_incarnation`. `host_incarnation` is used the
+`firewall_tag_groups`, `host_incarnation`, `automation_stream` and
+`sg_projects`. `host_incarnation` is used the
 first time a removed host is re-added with `lv host add` after the latch
 (below).
 

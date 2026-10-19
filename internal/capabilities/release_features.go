@@ -134,6 +134,9 @@ var releaseFeatures = map[Feature]FeatureInfo{
 	// Used only when a removed host is added again.
 	FeatureHostIncarnation: {Token: Release202611V1, Description: "Host incarnation counter: a removed host re-added under its name is a new incarnation that no copy of the removed machine's row overrides (used when a removed host is re-added)",
 		Writers: []string{"internal/corrosion.AdmitHostV2", "internal/corrosion.WriteOwnEndpoint"}},
+
+	FeatureAutomationStream: {Token: Release202611V1, Description: "Certified automation history, retained recovery provenance, and managed-resource state"},
+	FeatureSGProjects:       {Token: Release202611V1, Description: "Security groups owned by a project (used when a group is created with a project)"},
 }
 
 // firewallRuleWriters write the three rule tables. Each takes one grant per
@@ -209,6 +212,8 @@ const (
 	FeatureFirewallLog       Feature = "firewall_log"
 	FeatureFirewallTagGroups Feature = "firewall_tag_groups"
 	FeatureHostIncarnation   Feature = "host_incarnation"
+	FeatureAutomationStream  Feature = "automation_stream"
+	FeatureSGProjects        Feature = "sg_projects"
 )
 
 // LookupFeature returns a declared feature's token and description.

@@ -141,6 +141,12 @@ func OpenLogStore(opts LogStoreOptions) (*LogStore, error) {
 			}
 		}()
 	}
+	if opts.Dir != "" && opts.RetainBytes <= 0 {
+		// A zero cap keeps no file: the store's own files from an earlier
+		// run go now, or they would outlive both bounds. Nothing else in the
+		// directory is touched, and it is not created.
+		s.removeOwnedFiles()
+	}
 	if opts.Dir == "" || opts.RetainBytes <= 0 {
 		s.opts.Dir = ""
 		return s, nil
@@ -158,6 +164,20 @@ func OpenLogStore(opts LogStoreOptions) (*LogStore, error) {
 	}
 	s.pruneLocked(opts.Now())
 	return s, nil
+}
+
+// removeOwnedFiles removes the store's own log files (fwlog-*.jsonl) from
+// its directory, if it exists.
+func (s *LogStore) removeOwnedFiles() {
+	names, err := s.segments()
+	if err != nil {
+		return // no directory: nothing of ours is there
+	}
+	for _, n := range names {
+		if err := os.Remove(filepath.Join(s.opts.Dir, n)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("firewall log: cannot remove a log file the zero cap no longer allows", "dir", s.opts.Dir, "error", err)
+		}
+	}
 }
 
 // segments lists the directory's log files, oldest first.

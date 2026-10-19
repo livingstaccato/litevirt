@@ -1750,11 +1750,6 @@ func (s *Server) removeHostRefusal(ctx context.Context, req *pb.RemoveHostReques
 	if h == nil {
 		return nil, none, status.Errorf(codes.NotFound, "host %q not found", req.Name)
 	}
-	// A current voter keeps its vote whatever its hosts row says, so deleting
-	// the row must not look like removing the voter (recovery-claims.md §4.3).
-	if err := s.voterRemovalRefusal(ctx, req.Name); err != nil {
-		return nil, none, err
-	}
 	// A removal decides the row a later re-admission counts from, so it is
 	// made on a caught-up node, by the voter majority, on the row a peer
 	// confirms, and only of the certificate the operator revoked
@@ -1809,6 +1804,17 @@ func (s *Server) removeHostRefusal(ctx context.Context, req *pb.RemoveHostReques
 			return nil, none, status.Errorf(codes.FailedPrecondition,
 				"host %q has %d VMs — drain first or use --force", req.Name, len(vms))
 		}
+	}
+	// A current voter keeps its vote whatever its hosts row says, so deleting
+	// the row must not look like removing the voter (recovery-claims.md §4.3).
+	// Asked last: `lv host rm --dead` preflights a voter's host before it
+	// removes the vote and goes on only on this refusal, so every other
+	// refusal must come first, or a refused removal would have removed the
+	// vote. None of them depends on the vote: the majority above is counted
+	// without the host already, as the cluster counts it once the vote is
+	// gone, and the pull never asks the host itself.
+	if err := s.voterRemovalRefusal(ctx, req.Name); err != nil {
+		return nil, none, err
 	}
 	return h, key, nil
 }

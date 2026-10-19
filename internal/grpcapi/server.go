@@ -2000,6 +2000,12 @@ func (s *Server) SetCreateReturnedHook(h func(name string, err error)) { s.creat
 // that proof can land in. Production never calls this.
 func (s *Server) SetRestoreClaimedHook(h func(name string)) { s.restoreClaimedHook = h }
 
+// SetRemoveHostBetweenReadsHook is a test-only seam: removeHostRefusal calls
+// h with the host's name between its read of the host's row and its read of
+// the row's admission key, in RemoveHost and PreflightRemoveHost alike.
+// Production never calls this.
+func (s *Server) SetRemoveHostBetweenReadsHook(h func(name string)) { s.removeHostBetweenReadsHook = h }
+
 // fireCommitFenceHook runs the test hook, if any, naming the operation about to
 // evaluate its commit fence.
 func (s *Server) fireCommitFenceHook(op string) {

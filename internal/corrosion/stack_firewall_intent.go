@@ -76,11 +76,11 @@ func SetStackFirewallIntent(ctx context.Context, c *Client, st *StackRecord, fir
 	if st == nil || st.Name == "" || !c.MayWriteClusterPolicy() {
 		return nil
 	}
-	stmt, err := stackFirewallIntentStatement(st.Name, StackFirewallIntent{Firewall: firewall, DefaultDeny: defaultDeny}, setBy, c.NowTS())
+	v, err := json.Marshal(StackFirewallIntent{Firewall: firewall, DefaultDeny: defaultDeny})
 	if err != nil {
 		return err
 	}
-	return c.Execute(ctx, stmt.SQL, stmt.Params...)
+	return c.Execute(ctx, clusterPolicyUpsertSQL, stackFirewallKeyPrefix+st.Name, string(v), setBy, c.NowTS())
 }
 
 // GetStackFirewallIntent reads the firewall intent recorded for stack: found

@@ -69,6 +69,31 @@ func TestClaimVerifiers_RefuseAClientCertificateNamedAsAVoter(t *testing.T) {
 			}
 		}
 	})
+	// A generation a later one vouches for is judged by Historical(), which
+	// forgives revocation since, and nothing else.
+	//
+	// Mutation: skip the check when v.historical — the client key's accept is
+	// counted in history.
+	t.Run("historical accept", func(t *testing.T) {
+		hist := verifier.Historical()
+		for _, tc := range []struct {
+			s      *ClaimSigner
+			refuse bool
+		}{{client, true}, {host, false}} {
+			a, err := tc.s.Sign(key, 2, ballot, digest, inc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cert := ClaimCertificate{Key: key, ConfigGeneration: 2, Ballot: ballot, ValueDigest: digest}
+			err = hist.verifyAccept(cert, a, map[string]string{tc.s.Name(): inc})
+			if tc.refuse && (err == nil || !strings.Contains(err.Error(), "client certificate")) {
+				t.Errorf("historical: %s's accept with the client key = %v, want refused", tc.s.Name(), err)
+			}
+			if !tc.refuse && err != nil {
+				t.Errorf("historical: %s's accept with its host certificate = %v", tc.s.Name(), err)
+			}
+		}
+	})
 	t.Run("forced", func(t *testing.T) {
 		payload := sha256.Sum256([]byte("forced"))
 		for _, tc := range []struct {

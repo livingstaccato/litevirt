@@ -3517,6 +3517,8 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 					return nil, status.Errorf(codes.Internal,
 						"VM %q: host %s deleted its domain, but its row here was not tombstoned; retry: %v", req.Name, h.Name, terr)
 				}
+				// The peer dropped its own records; this host's go too.
+				s.forgetMoveRecords(ctx, req.Name)
 				return &emptypb.Empty{}, nil
 			}
 			if len(ptrl.Get(deleteProbeRefusedMD)) > 0 || status.Code(peerErr) == codes.FailedPrecondition {
@@ -3649,6 +3651,9 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		s.reportDeletedVM(ctx, deleted)
 		s.retireNICGuards(ctx, req.Name)
 		s.clearDeviceLease(req.Name)
+		// The domain is gone everywhere: a volume move it left unresolved
+		// describes nothing.
+		s.forgetMoveRecords(ctx, req.Name)
 		// This path returns without reaching the main cleanup below, so the
 		// marker has to be dropped here too. A ghost row whose domain is already
 		// gone still leaves <dataDir>/vms/<name>/owner_epoch behind, and the next

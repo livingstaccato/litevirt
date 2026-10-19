@@ -5042,7 +5042,6 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		}
 	}
 	s.virt.UndefineDomain(req.Name, false)
-	s.forgetMoveRecords(ctx, req.Name)
 
 	// Delete existing disks — at their recorded locations (driver-dispatched,
 	// so a rebuilt VM doesn't leak its old non-default-pool backing volume),
@@ -5074,6 +5073,10 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "rebuild: tombstone old records: %v", err)
 	}
+	// The old VM is gone: a volume move it left unresolved describes nothing.
+	// Only now: a rebuild that fails before its tombstone keeps the row, and
+	// with it the record and condition that guard its next start.
+	s.forgetMoveRecords(ctx, req.Name)
 	s.retireNICGuards(ctx, req.Name)
 	if hook := s.recreateTornDown; hook != nil {
 		hook(req.Name)

@@ -1530,3 +1530,69 @@ func TestDeleteVM_OfATombstonedVMFinishesItsForget(t *testing.T) {
 		})
 	}
 }
+
+// A rebuild forgets the old VM's unresolved-move records and condition only
+// once its row is tombstoned: one that fails before that keeps the row, and
+// with it the record and condition that guard its next start.
+//
+// Mutation: move RebuildVM's forget back to right after its undefine — the
+// failed rebuild drops the record, red.
+func TestRebuildVM_ForgetsTheMoveRecordsOnlyOnceTheRowIsTombstoned(t *testing.T) {
+	stageGenisoimage(t)
+	s, _, _ := isoServer(t)
+	const name = "rbm"
+	if _, err := s.CreateVM(adminCtx(), seedCreateRequest(t, s, name, "")); err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	publishMoveAs(t, s, name, s.hostName)
+	restore := failTombstoneOf(t, s, name)
+	if _, err := s.RebuildVM(adminCtx(), &pb.RebuildVMRequest{Name: name}); err == nil {
+		t.Fatal("the rebuild succeeded although its tombstone was made to fail")
+	}
+	if vm, _ := corrosion.GetVM(context.Background(), s.db, name); vm == nil {
+		t.Fatal("control: the failed rebuild tombstoned the row")
+	}
+	moveRecordKept(t, s, name, "a rebuild that failed at its tombstone")
+	restore()
+	if _, err := s.RebuildVM(adminCtx(), &pb.RebuildVMRequest{Name: name}); err != nil {
+		t.Fatalf("RebuildVM: %v", err)
+	}
+	moveRecordGone(t, s, name, "the rebuild")
+}
+
+// The forget a later lv rm finishes for a deleted VM is the deleter's to do:
+// a caller who may not delete that VM (an operator of another project)
+// leaves its record and condition as they are.
+//
+// Mutation: drop the vm.delete check before forgetMovesOfDeletedVM — the
+// other project's operator clears them, red.
+func TestDeleteVM_OfATombstonedVMForgetsOnlyForItsDeleter(t *testing.T) {
+	for _, tc := range []struct {
+		project  string
+		wantGone bool
+	}{
+		{"beta", false},
+		{"alpha", true},
+	} {
+		t.Run("operator of "+tc.project, func(t *testing.T) {
+			s := testServerWithLocks(t)
+			ctx := context.Background()
+			if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "a", HostName: s.hostName, Spec: "{}", State: "stopped", Project: "alpha"}, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			publishMoveAs(t, s, "a", s.hostName)
+			if err := corrosion.DeleteVM(ctx, s.db, "a"); err != nil {
+				t.Fatal(err)
+			}
+			caller := projectBoundCtx(t, s, "op-"+tc.project, tc.project)
+			if _, err := s.DeleteVM(caller, &pb.DeleteVMRequest{Name: "a"}); status.Code(err) != codes.NotFound {
+				t.Fatalf("lv rm of a deleted VM: %v, want NotFound", err)
+			}
+			if tc.wantGone {
+				moveRecordGone(t, s, "a", "lv rm by the VM's project operator")
+			} else {
+				moveRecordKept(t, s, "a", "lv rm by another project's operator")
+			}
+		})
+	}
+}

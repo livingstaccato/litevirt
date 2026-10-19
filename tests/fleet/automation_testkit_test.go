@@ -2,6 +2,8 @@ package fleet
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -13,10 +15,11 @@ import (
 // This evidence is intentionally constructed only in test source. It is not
 // daemon readiness, Task5 cutover evidence, key custody, or runtime eligibility.
 type AutomationFixture struct {
-	ctx          context.Context
-	cluster      *Cluster
-	engines      []*automation.Engine
-	ownerSession uint64
+	ctx               context.Context
+	cluster           *Cluster
+	engines           []*automation.Engine
+	ownerSession      uint64
+	historyDiagnostic *automationHistoryDiagnostic
 }
 
 func NewAutomationFixture(t *testing.T, nodes int) *AutomationFixture {
@@ -99,15 +102,103 @@ func (f *AutomationFixture) Converge(t *testing.T) {
 	// Catch-up calls production authenticated prefix RPCs. Barriers provide fresh
 	// quorum authority; fetched heads remain hints until re-certified.
 	for i := range f.engines {
+		if f.historyDiagnostic != nil {
+			f.historyDiagnostic.snapshot(fmt.Sprintf("recover-%d-start", i))
+		}
 		if err := f.Engine(i).Recover(f.ctx); err != nil {
+			if f.historyDiagnostic != nil {
+				f.historyDiagnostic.record(fmt.Sprintf("recover-%d-return error=%q", i, historyDiagnosticError(err)))
+				f.historyDiagnostic.snapshot("recover-error-before-fatal")
+				f.historyDiagnostic.dump(t)
+			}
 			t.Fatal(err)
 		}
+		if f.historyDiagnostic != nil {
+			f.historyDiagnostic.snapshot(fmt.Sprintf("recover-%d-return error=nil", i))
+		}
+	}
+	if f.historyDiagnostic != nil {
+		f.historyDiagnostic.snapshot("converge-comparison-start")
 	}
 	want := f.Head(t, 0)
 	for i := range f.engines {
 		if h := f.Head(t, i); h != want {
+			if f.historyDiagnostic != nil {
+				f.historyDiagnostic.snapshot("head-mismatch-before-original-fatal")
+				f.historyDiagnostic.dump(t)
+			}
 			t.Fatalf("node %d head %+v, want %+v", i, h, want)
 		}
+	}
+}
+
+// resetReplicaHistory injects complete active projection/history loss in one
+// existing FULL local transaction. Discover active semantic tables from the
+// compiled schema's stage column, matching automationSemanticTables and the
+// private reset owner; no production API or admission authority is added.
+func (f *AutomationFixture) resetReplicaHistory(t *testing.T, node int) {
+	t.Helper()
+	db := f.cluster.Nodes[node].DB
+	before, err := db.AutomationMembership(f.ctx)
+	if err != nil {
+		t.Fatal("reset fixture requires real adopted projection authority", err)
+	}
+	err = db.ExecuteLocal(f.ctx, func(tx *corrosion.LocalTx) error {
+		level, err := tx.Query(f.ctx, `PRAGMA synchronous`)
+		if err != nil || len(level) != 1 || level[0].Int64("synchronous") != corrosion.SynchronousFull {
+			return errors.New("reset fixture requires a FULL local transaction")
+		}
+		pending, err := tx.Query(f.ctx, `SELECT (SELECT count(*) FROM local_automation_recovery)+(SELECT count(*) FROM local_automation_staging) AS n`)
+		if err != nil || len(pending) != 1 || pending[0].Int64("n") != 0 {
+			return errors.New("reset fixture cannot discard an active recovery job")
+		}
+		tables, err := tx.Query(f.ctx, `SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'local_automation_%' ORDER BY name`)
+		if err != nil {
+			return err
+		}
+		var semantic []string
+		for _, table := range tables {
+			name := table.String("name")
+			columns, err := tx.Query(f.ctx, `SELECT name FROM pragma_table_info(?) WHERE name='stage'`, name)
+			if err != nil {
+				return err
+			}
+			if len(columns) == 1 {
+				semantic = append(semantic, name)
+			}
+		}
+		if len(semantic) != 11 {
+			return errors.New("reset fixture semantic schema differs from the compiled eleven-table descriptor")
+		}
+		for _, table := range semantic {
+			if _, err := tx.Exec(f.ctx, "DELETE FROM "+table+" WHERE stage=''"); err != nil {
+				return err
+			}
+			rows, err := tx.Query(f.ctx, "SELECT count(*) AS n FROM "+table+" WHERE stage=''")
+			if err != nil || len(rows) != 1 || rows[0].Int64("n") != 0 {
+				return errors.New("reset fixture left active semantic state")
+			}
+		}
+		for _, table := range []string{"local_automation_requests", "local_automation_prefix", "local_automation_history", "local_automation_anchors"} {
+			if _, err := tx.Exec(f.ctx, "DELETE FROM "+table); err != nil {
+				return err
+			}
+			rows, err := tx.Query(f.ctx, "SELECT count(*) AS n FROM "+table)
+			if err != nil || len(rows) != 1 || rows[0].Int64("n") != 0 {
+				return errors.New("reset fixture left certified history or receipts")
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := db.AutomationMembership(f.ctx)
+	if err != nil || after.Generation != before.Generation || corrosion.MembersHash(after.Members) != corrosion.MembersHash(before.Members) {
+		t.Fatal("reset fixture changed real adopted membership authority", err)
+	}
+	if head := f.Head(t, node); head != (corrosion.AutomationPrefix{}) {
+		t.Fatalf("reset fixture left a certified head: %+v", head)
 	}
 }
 

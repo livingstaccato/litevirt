@@ -87,17 +87,26 @@ func TestAutomationDecisionDifferentRequestContention(t *testing.T) {
 	f.Converge(t)
 }
 
-// A new method must not consume authority before its real semantic reducer exists.
+// An unknown method must be refused before it can consume a decision slot.
 func TestAutomationDecisionUnsupportedBeforeSlot(t *testing.T) {
 	f := NewAutomationFixture(t, 3)
 	before := f.Head(t, 0)
 	c := f.Barrier(0, "unsupported")
-	c.Kind = "admit_create"
+	c.Kind = "unknown_automation_method"
 	if _, err := f.Engine(0).Submit(f.Context(), c); automation.Code(err) != automation.CodeUnsupported {
 		t.Fatalf("unsupported = %v", err)
 	}
 	if after := f.Head(t, 0); before != after {
 		t.Fatal("unsupported command consumed a slot")
+	}
+	key, err := corrosion.AutomationClaimKey(before.Sequence + 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range f.cluster.Nodes {
+		if _, found, err := n.DB.ClaimState(f.Context(), key); err != nil || found {
+			t.Fatalf("unsupported command reached durable slot authority on %s: %v %v", n.Name, found, err)
+		}
 	}
 }
 
@@ -339,17 +348,30 @@ func TestAutomationReplayBoundedResume(t *testing.T) {
 // Failed prefix/auth transport is not a proof of an unused installation.
 func TestAutomationReplayTransportFailureNotEmptyGenesis(t *testing.T) {
 	f := NewAutomationFixture(t, 3)
-	f.Isolate(2)
 	n := f.cluster.Nodes[2]
-	for _, table := range []string{"local_automation_requests", "local_automation_prefix", "local_automation_history", "local_automation_anchors"} {
-		if err := localExec(f.Context(), n.DB, "DELETE FROM "+table); err != nil {
-			t.Fatal(err)
+	f.resetReplicaHistory(t, 2)
+	var mu sync.Mutex
+	fetches := 0
+	f.cluster.SetClaimScript(func(m ClaimMsg) ClaimFate {
+		if m.From == n.Name && m.Method == "GetAutomationDecision" {
+			mu.Lock()
+			fetches++
+			mu.Unlock()
+			return ClaimDropRequest
 		}
-	}
+		return ClaimDefault
+	})
+	t.Cleanup(func() { f.cluster.SetClaimScript(nil) })
 	if err := f.Engine(2).Recover(f.Context()); automation.Code(err) != automation.CodeUnavailable {
 		t.Fatalf("failed transport became empty genesis: %v", err)
 	}
-	f.Heal(2)
+	mu.Lock()
+	actualFetches := fetches
+	mu.Unlock()
+	if actualFetches != 2 || f.Head(t, 2).Sequence != 0 {
+		t.Fatalf("transport refusal did not reach both actual peer reads or minted a head: fetches=%d head=%+v", actualFetches, f.Head(t, 2))
+	}
+	f.cluster.SetClaimScript(nil)
 	f.Converge(t)
 }
 
@@ -438,17 +460,16 @@ func TestAutomationReplayRejectsWrongAnchoredPredecessor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, table := range []string{"local_automation_requests", "local_automation_prefix", "local_automation_history", "local_automation_anchors"} {
-		if err := localExec(f.Context(), n.DB, "DELETE FROM "+table); err != nil {
-			t.Fatal(err)
-		}
-	}
+	f.resetReplicaHistory(t, 2)
 	verifier, err := corrosion.LoadClaimVerifier(n.PKIDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := n.DB.AutomationBeginRecovery(f.Context(), head, verifier); err != nil {
 		t.Fatal(err)
+	}
+	if next, err := n.DB.AutomationRecoveryNext(f.Context()); err != nil || next != 2 {
+		t.Fatalf("fresh authenticated head did not establish the predecessor checkpoint: %d %v", next, err)
 	}
 	d, err := contract.DecodeDecision(middle.Value.Automation.Envelope)
 	if err != nil {
@@ -467,8 +488,17 @@ func TestAutomationReplayRejectsWrongAnchoredPredecessor(t *testing.T) {
 	if next, err := n.DB.AutomationRecoveryNext(f.Context()); err != nil || next != 2 {
 		t.Fatalf("invalid predecessor advanced checkpoint: %d %v", next, err)
 	}
+	if err := n.DB.AutomationStagePredecessor(f.Context(), middle); err != nil {
+		t.Fatalf("exact anchored predecessor was refused: %v", err)
+	}
+	if next, err := n.DB.AutomationRecoveryNext(f.Context()); err != nil || next != 1 {
+		t.Fatalf("exact predecessor did not advance the authenticated checkpoint: %d %v", next, err)
+	}
 	if err := f.Engine(2).Recover(f.Context()); err != nil {
 		t.Fatal(err)
+	}
+	if got, found, err := n.DB.AutomationRecord(f.Context(), 2); err != nil || !found || got.Value.MustDigest() != middle.Value.MustDigest() {
+		t.Fatalf("recovery did not retain the exact original predecessor: %+v %v %v", got, found, err)
 	}
 	f.Converge(t)
 }
@@ -541,9 +571,19 @@ func TestAutomationReplayPrefixLossKeepsReceipts(t *testing.T) {
 func TestAutomationReplayRejectsReceiptDrift(t *testing.T) {
 	f := NewAutomationFixture(t, 3)
 	n := f.cluster.Nodes[2]
+	certified := f.Head(t, 2)
+	beforeRows, err := n.DB.Query(f.Context(), `SELECT receipt_json FROM local_automation_history WHERE sequence=1`)
+	if err != nil || len(beforeRows) != 1 {
+		t.Fatalf("original certified receipt missing: %+v %v", beforeRows, err)
+	}
 	if err := localExec(f.Context(), n.DB, `UPDATE local_automation_history SET receipt_json=replace(receipt_json,'succeeded','rejected') WHERE sequence=1`); err != nil {
 		t.Fatal(err)
 	}
+	corruptRows, err := n.DB.Query(f.Context(), `SELECT receipt_json FROM local_automation_history WHERE sequence=1`)
+	if err != nil || len(corruptRows) != 1 || corruptRows[0].String("receipt_json") == beforeRows[0].String("receipt_json") {
+		t.Fatalf("receipt drift fixture did not change actual original evidence: %+v %v", corruptRows, err)
+	}
+	corruptReceipt := corruptRows[0].String("receipt_json")
 	for _, table := range []string{"local_automation_prefix", "local_automation_requests"} {
 		if err := localExec(f.Context(), n.DB, "DELETE FROM "+table); err != nil {
 			t.Fatal(err)
@@ -552,8 +592,37 @@ func TestAutomationReplayRejectsReceiptDrift(t *testing.T) {
 	if err := f.Engine(2).Recover(f.Context()); err == nil {
 		t.Fatal("replay silently rewrote immutable slot result")
 	}
-	if h := f.Head(t, 2); h.Sequence != 0 {
-		t.Fatalf("receipt drift granted prefix authority: %+v", h)
+	if h := f.Head(t, 2); h != certified {
+		t.Fatalf("receipt drift changed the retained certified frontier: %+v want %+v", h, certified)
+	}
+	semantic, err := n.DB.Query(f.Context(), `SELECT sequence FROM local_automation_semantic_heads WHERE stage=''`)
+	if err != nil || len(semantic) != 0 {
+		t.Fatalf("receipt drift left complete semantic authority: %+v %v", semantic, err)
+	}
+	if _, err := n.DB.AutomationMembership(f.Context()); err == nil {
+		t.Fatal("receipt drift granted fresh projection/admission authority")
+	}
+	cfg, err := corrosion.AdoptedVoterConfig(f.Context(), n.DB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := corrosion.AutomationClaimKey(certified.Sequence + 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	promise, err := n.DB.ClaimPrepare(f.Context(), key, corrosion.Ballot{Round: 100, Coordinator: n.Name, Nonce: []byte("receipt-drift")}, cfg.Generation)
+	if err != nil || promise.Promised || promise.Refusal != corrosion.RefusalAutomationUnavailable {
+		t.Fatalf("receipt drift granted a fresh durable promise: %+v %v", promise, err)
+	}
+	if _, found, err := n.DB.ClaimState(f.Context(), key); err != nil || found {
+		t.Fatalf("receipt drift refusal changed claim state: %v %v", found, err)
+	}
+	if _, err := f.Engine(2).Observe(f.Context(), "unseen-resource", 0); automation.Code(err) != automation.CodeUnavailable || automation.IsAbsent(err) {
+		t.Fatalf("receipt drift became an authoritative observation: %v", err)
+	}
+	rows, err := n.DB.Query(f.Context(), `SELECT receipt_json FROM local_automation_history WHERE sequence=1`)
+	if err != nil || len(rows) != 1 || rows[0].String("receipt_json") != corruptReceipt || f.Head(t, 2) != certified {
+		t.Fatalf("refused operations repaired corrupt evidence or changed the certified frontier: %+v %v", rows, err)
 	}
 }
 

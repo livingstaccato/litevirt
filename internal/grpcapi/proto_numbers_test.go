@@ -335,11 +335,15 @@ func TestProtoNumbers_StorageHygiene(t *testing.T) {
 		{&pb.SetAsideOverlay{}, 6, "set_aside_at"},
 		{&pb.SetAsideOverlay{}, 7, "size_bytes"},
 		{&pb.SetAsideOverlay{}, 8, "in_use"},
+		{&pb.SetAsideOverlay{}, 9, "detached"},
+		{&pb.SetAsideOverlay{}, 10, "owner_vm_uuid"},
 		{&pb.ListSetAsideOverlaysResponse{}, 1, "host"},
 		{&pb.ListSetAsideOverlaysResponse{}, 2, "overlays"},
 		{&pb.RemoveSetAsideOverlayRequest{}, 1, "vm_name"},
 		{&pb.RemoveSetAsideOverlayRequest{}, 2, "disk_name"},
 		{&pb.RemoveSetAsideOverlayRequest{}, 3, "name"},
+		{&pb.RemoveSetAsideOverlayRequest{}, 4, "host"},
+		{&pb.RemoveSetAsideOverlayRequest{}, 5, "path"},
 		{&pb.RemoveSetAsideOverlayResponse{}, 1, "host"},
 		{&pb.RemoveSetAsideOverlayResponse{}, 2, "path"},
 		{&pb.RemoveSetAsideOverlayResponse{}, 3, "size_bytes"},
@@ -354,6 +358,8 @@ func TestProtoNumbers_StorageHygiene(t *testing.T) {
 		{&pb.DeleteReplicationCheckpointRequest{}, 1, "vm_name"},
 		{&pb.DeleteReplicationCheckpointRequest{}, 2, "target_pool"},
 		{&pb.DeleteReplicationCheckpointResponse{}, 1, "checkpoint"},
+		{&pb.DeleteReplicationCheckpointResponse{}, 2, "bitmap"},
+		{&pb.DeleteReplicationCheckpointResponse{}, 3, "host"},
 	}
 	for _, f := range fields {
 		md := f.msg.ProtoReflect().Descriptor()
@@ -361,8 +367,25 @@ func TestProtoNumbers_StorageHygiene(t *testing.T) {
 		if fd == nil || fd.Name() != f.name {
 			t.Errorf("%s field %d is %v, want %s", md.FullName(), f.num, fd, f.name)
 		}
-		if n := md.Fields().Len(); f.num == 1 && n == 0 {
-			t.Errorf("%s has no fields", md.FullName())
+	}
+	kinds := []struct {
+		msg  protoreflect.ProtoMessage
+		name protoreflect.Name
+		kind protoreflect.Kind
+	}{
+		{&pb.SetAsideOverlay{}, "in_use", protoreflect.StringKind},
+		{&pb.SetAsideOverlay{}, "size_bytes", protoreflect.Int64Kind},
+		{&pb.SetAsideOverlay{}, "detached", protoreflect.BoolKind},
+		{&pb.ReplicationCheckpointRow{}, "in_use", protoreflect.BoolKind},
+		{&pb.ReplicationCheckpointRow{}, "vm_deleted", protoreflect.BoolKind},
+		{&pb.RemoveSetAsideOverlayResponse{}, "size_bytes", protoreflect.Int64Kind},
+		{&pb.ListSetAsideOverlaysResponse{}, "overlays", protoreflect.MessageKind},
+		{&pb.ListReplicationCheckpointsResponse{}, "checkpoints", protoreflect.MessageKind},
+	}
+	for _, k := range kinds {
+		fd := k.msg.ProtoReflect().Descriptor().Fields().ByName(k.name)
+		if fd == nil || fd.Kind() != k.kind {
+			t.Errorf("%s.%s is %v, want kind %v", k.msg.ProtoReflect().Descriptor().FullName(), k.name, fd, k.kind)
 		}
 	}
 	svc := pb.File_litevirt_v1_service_proto.Services().ByName("LiteVirt")

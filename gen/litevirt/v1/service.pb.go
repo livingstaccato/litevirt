@@ -31617,15 +31617,20 @@ func (x *ListSetAsideOverlaysRequest) GetVmName() string {
 }
 
 type SetAsideOverlay struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VmName        string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
-	DiskName      string                 `protobuf:"bytes,2,opt,name=disk_name,json=diskName,proto3" json:"disk_name,omitempty"`
-	Name          string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"` // the file's base name (what removal takes)
-	Path          string                 `protobuf:"bytes,4,opt,name=path,proto3" json:"path,omitempty"`
-	DiskPath      string                 `protobuf:"bytes,5,opt,name=disk_path,json=diskPath,proto3" json:"disk_path,omitempty"`         // the disk it was set aside beside
-	SetAsideAt    string                 `protobuf:"bytes,6,opt,name=set_aside_at,json=setAsideAt,proto3" json:"set_aside_at,omitempty"` // from the name, RFC3339; "" when it cannot be read
-	SizeBytes     int64                  `protobuf:"varint,7,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
-	InUse         string                 `protobuf:"bytes,8,opt,name=in_use,json=inUse,proto3" json:"in_use,omitempty"` // why it cannot be removed now; "" when it can
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	VmName     string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
+	DiskName   string                 `protobuf:"bytes,2,opt,name=disk_name,json=diskName,proto3" json:"disk_name,omitempty"`
+	Name       string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"` // the file's base name (what removal takes)
+	Path       string                 `protobuf:"bytes,4,opt,name=path,proto3" json:"path,omitempty"`
+	DiskPath   string                 `protobuf:"bytes,5,opt,name=disk_path,json=diskPath,proto3" json:"disk_path,omitempty"`         // the disk it was set aside beside
+	SetAsideAt string                 `protobuf:"bytes,6,opt,name=set_aside_at,json=setAsideAt,proto3" json:"set_aside_at,omitempty"` // from the name, RFC3339; "" when it cannot be read
+	SizeBytes  int64                  `protobuf:"varint,7,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
+	InUse      string                 `protobuf:"bytes,8,opt,name=in_use,json=inUse,proto3" json:"in_use,omitempty"` // why it cannot be removed now; "" when it can
+	// detached: no live disk is at disk_path any more (its VM was deleted,
+	// or the disk moved). vm_name, disk_name and owner_vm_uuid are then the
+	// owner its binding records, and removal goes by host and path.
+	Detached      bool   `protobuf:"varint,9,opt,name=detached,proto3" json:"detached,omitempty"`
+	OwnerVmUuid   string `protobuf:"bytes,10,opt,name=owner_vm_uuid,json=ownerVmUuid,proto3" json:"owner_vm_uuid,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -31716,6 +31721,20 @@ func (x *SetAsideOverlay) GetInUse() string {
 	return ""
 }
 
+func (x *SetAsideOverlay) GetDetached() bool {
+	if x != nil {
+		return x.Detached
+	}
+	return false
+}
+
+func (x *SetAsideOverlay) GetOwnerVmUuid() string {
+	if x != nil {
+		return x.OwnerVmUuid
+	}
+	return ""
+}
+
 type ListSetAsideOverlaysResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Host          string                 `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`
@@ -31769,10 +31788,14 @@ func (x *ListSetAsideOverlaysResponse) GetOverlays() []*SetAsideOverlay {
 }
 
 type RemoveSetAsideOverlayRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VmName        string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
-	DiskName      string                 `protobuf:"bytes,2,opt,name=disk_name,json=diskName,proto3" json:"disk_name,omitempty"`
-	Name          string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"` // SetAsideOverlay.name
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	VmName   string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
+	DiskName string                 `protobuf:"bytes,2,opt,name=disk_name,json=diskName,proto3" json:"disk_name,omitempty"`
+	Name     string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"` // SetAsideOverlay.name
+	// A detached overlay (SetAsideOverlay.detached) goes by its host and
+	// path instead, with vm_name, disk_name and name empty.
+	Host          string `protobuf:"bytes,4,opt,name=host,proto3" json:"host,omitempty"`
+	Path          string `protobuf:"bytes,5,opt,name=path,proto3" json:"path,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -31824,6 +31847,20 @@ func (x *RemoveSetAsideOverlayRequest) GetDiskName() string {
 func (x *RemoveSetAsideOverlayRequest) GetName() string {
 	if x != nil {
 		return x.Name
+	}
+	return ""
+}
+
+func (x *RemoveSetAsideOverlayRequest) GetHost() string {
+	if x != nil {
+		return x.Host
+	}
+	return ""
+}
+
+func (x *RemoveSetAsideOverlayRequest) GetPath() string {
+	if x != nil {
+		return x.Path
 	}
 	return ""
 }
@@ -32113,8 +32150,12 @@ func (x *DeleteReplicationCheckpointRequest) GetTargetPool() string {
 }
 
 type DeleteReplicationCheckpointResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Checkpoint    string                 `protobuf:"bytes,1,opt,name=checkpoint,proto3" json:"checkpoint,omitempty"` // the anchor retired
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Checkpoint string                 `protobuf:"bytes,1,opt,name=checkpoint,proto3" json:"checkpoint,omitempty"` // the anchor retired
+	// bitmap: what became of the anchor's libvirt bitmap on the VM's host:
+	// "dropped", "none" (no VM or no anchor), or why it is left there.
+	Bitmap        string `protobuf:"bytes,2,opt,name=bitmap,proto3" json:"bitmap,omitempty"`
+	Host          string `protobuf:"bytes,3,opt,name=host,proto3" json:"host,omitempty"` // the host that answered (the VM's, when it is live)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -32152,6 +32193,20 @@ func (*DeleteReplicationCheckpointResponse) Descriptor() ([]byte, []int) {
 func (x *DeleteReplicationCheckpointResponse) GetCheckpoint() string {
 	if x != nil {
 		return x.Checkpoint
+	}
+	return ""
+}
+
+func (x *DeleteReplicationCheckpointResponse) GetBitmap() string {
+	if x != nil {
+		return x.Bitmap
+	}
+	return ""
+}
+
+func (x *DeleteReplicationCheckpointResponse) GetHost() string {
+	if x != nil {
+		return x.Host
 	}
 	return ""
 }
@@ -46544,7 +46599,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x1cneeds_overwrite_newer_writes\x18\x0e \x01(\bR\x19needsOverwriteNewerWrites\"J\n" +
 	"\x1bListSetAsideOverlaysRequest\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x17\n" +
-	"\avm_name\x18\x02 \x01(\tR\x06vmName\"\xe4\x01\n" +
+	"\avm_name\x18\x02 \x01(\tR\x06vmName\"\xa4\x02\n" +
 	"\x0fSetAsideOverlay\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1b\n" +
 	"\tdisk_name\x18\x02 \x01(\tR\bdiskName\x12\x12\n" +
@@ -46555,14 +46610,19 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"setAsideAt\x12\x1d\n" +
 	"\n" +
 	"size_bytes\x18\a \x01(\x03R\tsizeBytes\x12\x15\n" +
-	"\x06in_use\x18\b \x01(\tR\x05inUse\"l\n" +
+	"\x06in_use\x18\b \x01(\tR\x05inUse\x12\x1a\n" +
+	"\bdetached\x18\t \x01(\bR\bdetached\x12\"\n" +
+	"\rowner_vm_uuid\x18\n" +
+	" \x01(\tR\vownerVmUuid\"l\n" +
 	"\x1cListSetAsideOverlaysResponse\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x128\n" +
-	"\boverlays\x18\x02 \x03(\v2\x1c.litevirt.v1.SetAsideOverlayR\boverlays\"h\n" +
+	"\boverlays\x18\x02 \x03(\v2\x1c.litevirt.v1.SetAsideOverlayR\boverlays\"\x90\x01\n" +
 	"\x1cRemoveSetAsideOverlayRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1b\n" +
 	"\tdisk_name\x18\x02 \x01(\tR\bdiskName\x12\x12\n" +
-	"\x04name\x18\x03 \x01(\tR\x04name\"f\n" +
+	"\x04name\x18\x03 \x01(\tR\x04name\x12\x12\n" +
+	"\x04host\x18\x04 \x01(\tR\x04host\x12\x12\n" +
+	"\x04path\x18\x05 \x01(\tR\x04path\"f\n" +
 	"\x1dRemoveSetAsideOverlayResponse\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x1d\n" +
@@ -46587,11 +46647,13 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\"DeleteReplicationCheckpointRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1f\n" +
 	"\vtarget_pool\x18\x02 \x01(\tR\n" +
-	"targetPool\"E\n" +
+	"targetPool\"q\n" +
 	"#DeleteReplicationCheckpointResponse\x12\x1e\n" +
 	"\n" +
 	"checkpoint\x18\x01 \x01(\tR\n" +
-	"checkpoint\"\xb5\x02\n" +
+	"checkpoint\x12\x16\n" +
+	"\x06bitmap\x18\x02 \x01(\tR\x06bitmap\x12\x12\n" +
+	"\x04host\x18\x03 \x01(\tR\x04host\"\xb5\x02\n" +
 	"\x16PromoteReplicaProgress\x12?\n" +
 	"\x05phase\x18\x01 \x01(\x0e2).litevirt.v1.PromoteReplicaProgress.PhaseR\x05phase\x12\x17\n" +
 	"\avm_name\x18\x02 \x01(\tR\x06vmName\x12\x12\n" +

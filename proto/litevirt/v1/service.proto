@@ -3483,6 +3483,11 @@ message SetAsideOverlay {
     string set_aside_at = 6; // from the name, RFC3339; "" when it cannot be read
     int64  size_bytes   = 7;
     string in_use       = 8; // why it cannot be removed now; "" when it can
+    // detached: no live disk is at disk_path any more (its VM was deleted,
+    // or the disk moved). vm_name, disk_name and owner_vm_uuid are then the
+    // owner its binding records, and removal goes by host and path.
+    bool   detached      = 9;
+    string owner_vm_uuid = 10;
 }
 message ListSetAsideOverlaysResponse {
     string                   host     = 1;
@@ -3492,6 +3497,10 @@ message RemoveSetAsideOverlayRequest {
     string vm_name   = 1;
     string disk_name = 2;
     string name      = 3; // SetAsideOverlay.name
+    // A detached overlay (SetAsideOverlay.detached) goes by its host and
+    // path instead, with vm_name, disk_name and name empty.
+    string host      = 4;
+    string path      = 5;
 }
 message RemoveSetAsideOverlayResponse {
     string host       = 1;
@@ -3518,6 +3527,10 @@ message DeleteReplicationCheckpointRequest {
 }
 message DeleteReplicationCheckpointResponse {
     string checkpoint = 1; // the anchor retired
+    // bitmap: what became of the anchor's libvirt bitmap on the VM's host:
+    // "dropped", "none" (no VM or no anchor), or why it is left there.
+    string bitmap     = 2;
+    string host       = 3; // the host that answered (the VM's, when it is live)
 }
 message PromoteReplicaProgress {
     enum Phase {

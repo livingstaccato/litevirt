@@ -43,10 +43,10 @@ func TestDiffMarksAClearOfTheVMsPrimary(t *testing.T) {
 		id     int
 		p4, p6 bool
 	}{
-		// 50 and 60 are its primaries, so each of their clears nulls both
-		// (see TestDiffFlagsEveryPrimaryClearOfAVMWithBothFields); 70 is not a
-		// primary and its clear touches neither.
-		{50, true, true}, {60, true, true}, {70, false, false},
+		// Each clear names only its own primary here; the per-VM union is the
+		// sweep's, over what the evidence gates keep (see
+		// TestUnionGivesEveryPrimaryClearOfAVMBothFields).
+		{50, true, false}, {60, false, true}, {70, false, false},
 	} {
 		a, ok := staleClear(got, c.id)
 		if !ok {
@@ -85,13 +85,13 @@ func TestApplyClearNullsThePrimaryFirst(t *testing.T) {
 // two concurrent PATCHes each nulling one field can write the other field back.
 // Every flagged clear of a VM therefore carries BOTH fields, and each one nulls
 // both in a single PATCH: any interleaving then leaves both null.
-func TestDiffFlagsEveryPrimaryClearOfAVMWithBothFields(t *testing.T) {
+func TestUnionGivesEveryPrimaryClearOfAVMBothFields(t *testing.T) {
 	const mac0, mac1 = "52:54:00:00:00:01", "52:54:00:00:00:02"
 	d := DesiredVM{Name: "vm-1", UUID: "u1", NICs: []DesiredNIC{
 		{Name: "eth0", MAC: mac0, NetBoxIPID: 9, NetBoxIP: "10.0.5.9"},
 		{Name: "eth1", MAC: mac1, NetBoxIPID: 10, NetBoxIP: "10.0.5.10"},
 	}}
-	got := Diff([]DesiredVM{d}, Actual{
+	got := unionPrimaryClears(Diff([]DesiredVM{d}, Actual{
 		VMs: map[string]netbox.VirtualMachine{
 			vmIdent("u1"): {ID: 11, Name: "vm-1", Identity: vmIdent("u1"), PrimaryIP4ID: 50, PrimaryIP6ID: 60},
 		},
@@ -103,7 +103,7 @@ func TestDiffFlagsEveryPrimaryClearOfAVMWithBothFields(t *testing.T) {
 			21: {{ID: 9, AssignedObjectID: 21}, {ID: 50, AssignedObjectID: 21}},
 			22: {{ID: 10, AssignedObjectID: 22}, {ID: 60, AssignedObjectID: 22}},
 		},
-	}, fp)
+	}, fp))
 	for _, id := range []int{50, 60} {
 		a, ok := staleClear(got, id)
 		if !ok || !a.ClearsPrimary4 || !a.ClearsPrimary6 {

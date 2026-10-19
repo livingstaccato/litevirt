@@ -557,6 +557,10 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 	// withheldReplacementCause.
 	planned := actions
 	var partialRead string
+	// Whether a gate took destructive actions away from this pass. A pass that
+	// did never attempted the removals a blocked-removal finding is about, so
+	// it may not report that finding's set — an empty one would read as clean.
+	withheldDestructive := false
 	if why := r.deleteBlocker(ctx, desired, skipped, actual); why != "" {
 		kept, withheld := withoutDestructive(actions)
 		slog.Warn("netbox mirror: withholding this sweep's deletes — the desired state is not whole",
@@ -564,6 +568,7 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 			"desired_vms", len(desired), "skipped_records", skipped,
 			"netbox_vms", len(actual.VMs), "netbox_interfaces", len(actual.NICs))
 		actions, converged, partialRead = kept, false, why
+		withheldDestructive = true
 	} else if kept, unprovenDeletes, unprovenClears := r.withoutUnprovenRemovals(ctx, actions, actual, proof); unprovenDeletes+unprovenClears > 0 {
 		// The whole-pass gate above answers "is this read whole?", which a
 		// PARTIALLY hydrated database passes: some of the cluster's rows are
@@ -590,6 +595,7 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 			kept, _ = withoutDestructive(kept)
 		}
 		actions, converged = kept, false
+		withheldDestructive = true
 		partialRead = fmt.Sprintf(
 			"this node holds no local record — tombstone included — for %d of the NetBox "+
 				"object(s) this sweep would have removed, so its view of the cluster is partial",
@@ -616,13 +622,20 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 			"desired_vms", len(desired), "netbox_vms", len(actual.VMs))
 	}
 
+	// THE PER-VM PRIMARY UNION, over what the gates kept. Taken in Diff it would
+	// let a proven clear null a primary naming an address whose own clear the
+	// evidence gate has just withheld. See unionPrimaryClears.
+	actions = unionPrimaryClears(actions)
+
 	if err := r.applyPhases(ctx, actions, indexDesired(desired, fp), fp); err != nil {
 		return false, withheldReplacementCause(err, withheldNames, partialRead)
 	}
-	// Reported whether or not anything was withheld: an empty set from a pass
-	// that ran every phase is what clears the finding.
+	// Reported from a pass that attempted every removal it planned, whether or
+	// not anything was withheld: an empty set from such a pass is what clears
+	// the finding. A pass whose gates withheld removals reports nothing, so the
+	// finding neither clears nor flaps while a block persists.
 	blocked := r.blockedRemovals()
-	if r.blockedSink != nil {
+	if r.blockedSink != nil && !withheldDestructive {
 		r.blockedSink(ctx, blocked)
 	}
 	if len(blocked) > 0 {

@@ -559,8 +559,6 @@ func Diff(desired []DesiredVM, actual Actual, fingerprint string) []Action {
 		}
 	}
 
-	out = unionPrimaryClears(out)
-
 	// Deletes are filtered by fingerprint DEFENSIVELY, even though BuildActual
 	// already scopes what it admits. Two litevirt clusters can share one NetBox,
 	// and a mis-scoped read reaching here must not become a delete of another
@@ -630,7 +628,9 @@ func Diff(desired []DesiredVM, actual Actual, fingerprint string) []Action {
 }
 
 // unionPrimaryClears gives every primary-flagged clear of a VM the union of
-// that VM's flags. Its clears run concurrently, and NetBox saves a PATCHed VM
+// that VM's flags. Applied by the sweep to the actions the evidence gates KEPT,
+// never in Diff: a clear withheld as unproven must not have its primary nulled
+// by a proven clear of another address. Its clears run concurrently, and NetBox saves a PATCHed VM
 // as the whole row it read: two requests that each null one field can write
 // the other back. Each clear nulling every flagged field makes any interleaving
 // leave all of them null.

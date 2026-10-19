@@ -35,6 +35,7 @@ import (
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/smart"
 	"github.com/litevirt/litevirt/internal/tenancy"
+	automationv1 "github.com/livingstaccato/litevirt/api/gen/litevirt/automation/v1"
 )
 
 // Server implements the LiteVirt gRPC service.
@@ -55,6 +56,7 @@ type Server struct {
 	// reseeding admits one local reseed at a time; see reseed_singleflight.go.
 	reseeding reseedInFlight
 	pb.UnimplementedLiteVirtServer
+	automationv1.UnimplementedAutomationServer
 
 	// consoleSessions groups a SPICE client's channels into one audited
 	// session (console_audit.go).

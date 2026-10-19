@@ -2179,7 +2179,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	grpcOpts = append(grpcOpts, obs.ServerOptions()...)
 	d.grpcSrv = grpc.NewServer(grpcOpts...)
 
-	pb.RegisterLiteVirtServer(d.grpcSrv, svc)
+	svc.RegisterServices(d.grpcSrv)
 
 	lis, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", d.cfg.GRPCPort))
 	if err != nil {

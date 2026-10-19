@@ -706,3 +706,50 @@ func TestRemoveCAMachineCopy_KeptHostDir(t *testing.T) {
 		sameTree(t, "lab", root, before)
 	})
 }
+
+// removeCAMachineCopy tries both places, the old-layout copy in pkiDir and the
+// kept copy under hosts/<name>/, even when the first refuses: a refusal at
+// pkiDir (here lab.key and lab.crt are links to ca.key and ca.crt, which hold
+// lab's replaced pair) is returned, and the kept copy still goes.
+//
+// Mutation: return after the pkiDir refusal — the kept copy stays.
+func TestRemoveCAMachineCopy_TriesTheKeptCopyAfterARefusal(t *testing.T) {
+	root, dir := operatorPKIUnder(t)
+	ca2 := filepath.Join(root, "ca2")
+	if err := os.MkdirAll(ca2, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mustCA(t, ca2)
+	if err := pki.GenerateHostCert(filepath.Join(ca2, "ca.crt"), filepath.Join(ca2, "ca.key"),
+		filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"), "lab", net.IPv4(10, 0, 0, 9)); err != nil {
+		t.Fatal(err)
+	}
+	kept := filepath.Join(dir, keptHostsDir, "lab")
+	if err := os.MkdirAll(kept, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"crt", "key"} {
+		if err := os.Link(filepath.Join(dir, "ca."+n), filepath.Join(dir, "lab."+n)); err != nil {
+			t.Fatal(err)
+		}
+		b := mustRead(t, filepath.Join(dir, "ca."+n))
+		if err := os.WriteFile(filepath.Join(kept, "host."+n), b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prev := mustParseCert(t, filepath.Join(dir, "ca.crt"))
+	err := removeCAMachineCopy(dir, "lab", prev)
+	if err == nil || !strings.Contains(err.Error(), "lab.key was left") {
+		t.Errorf("removeCAMachineCopy(lab) = %v, want the pkiDir copy refused", err)
+	}
+	for _, n := range []string{"ca.crt", "ca.key", "lab.crt", "lab.key"} {
+		if _, err := os.Stat(filepath.Join(dir, n)); err != nil {
+			t.Errorf("%s was removed: %v", n, err)
+		}
+	}
+	for _, n := range []string{"host.crt", "host.key"} {
+		if _, err := os.Stat(filepath.Join(kept, n)); !os.IsNotExist(err) {
+			t.Errorf("the kept %s was not removed after the pkiDir refusal: %v", n, err)
+		}
+	}
+}

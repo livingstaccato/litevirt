@@ -2269,16 +2269,25 @@ files that changed, in `<data_dir>/nvram/` and `/var/lib/libvirt/qemu/nvram/`,
 once a second. A node raises `nvram_flush_failed` (critical) about **itself**
 when one of those fsyncs fails, and logs `UEFI vars flush failed` with `path`,
 `vm` and `error`. The evidence carries `files` (each with `path`, `vm`,
-`error`, `at`, `dev`, `ino` and `mtime`) and `remedy`.
+`error`, `at`, `dev`, `ino`, `mtime` and `episode`) and `remedy`. Each failed
+fsync is a new `episode`, even of a file already listed.
 
 No later fsync clears it, whether or not the guest wrote the file again. The
 kernel reports a writeback error to one fsync and marks the lost pages clean,
 and qemu writes back only the sectors a later guest write changes, so the lost
-pages stay stale on disk. The condition survives a daemon restart.
+pages stay stale on disk. The failure belongs to the file, not its name: a
+file renamed within or between those directories (a replacement's cutover
+renames the new VM's vars file) is listed under its new name. A file that
+cannot be looked at stays listed, and a removed file is dropped only once two
+sweeps in a row found it nowhere. The node also records its failures in
+`<data_dir>/nvram-flush-failures.json`, so they survive a daemon restart
+whatever the condition row says. A failure that file does not hold yet (its
+write failed) is named here only once `nvram_flush_unrecorded` holds it. If that file cannot be read, the node lists
+it as a failure of its own, since the failures it held are not known.
 
 | Raised when | Clears when |
 |---|---|
-| An fsync of a vars file failed. | Every listed file is removed or replaced by another file, or an admin acknowledges that its store may be stale. |
+| An fsync of a vars file failed. | Every listed file is removed or replaced by another file, or an admin acknowledges each listed failure episode. |
 
 **What to do.** The listed file may be missing UEFI variable writes the guest
 made. Check the disk (`dmesg`, `smartctl`). Writing the variables again in the
@@ -2293,8 +2302,10 @@ again. The ways out:
 - A VM kept as it is: an admin accepts that its vars store may be stale with
   `lv health resolve nvram_flush_failed host/<host> --accept-stale-uefi-vars
   --reason <why>`, which prints the files accepted. It is audited, naming every
-  file the condition named, and the host's daemon then stops reporting exactly
-  those files; any other failed file is raised again, and so is a new failure.
+  file the condition named with its inode and `episode`, and the host's daemon then stops reporting exactly
+  those failure episodes (path, inode and `episode`). Any other failed file is
+  raised again, and so is a new failure of a file it named, including one that
+  happened after the condition was read.
   A request without `--accept-stale-uefi-vars` (an older `lv`, or a script that
   sends only a reason) is refused.
 
@@ -2302,6 +2313,23 @@ again. The ways out:
 out. Nor is `lv backup restore-live` for this VM: it restores firmware state
 only for a Secure Boot or vTPM VM, only with `--auto-start`, and only into a
 new VM (`--name`), and the old VM still needs `lv rm`.
+
+### UEFI vars flush failure not recorded (`nvram_flush_unrecorded`)
+
+Evaluator `uefi-vars`, subject kind `host`, severity critical. A node raises
+it about **itself** while a failed vars fsync is not in
+`<data_dir>/nvram-flush-failures.json` because that file could not be
+written. The evidence carries `files` (as `nvram_flush_failed`) and `remedy`.
+The node names such a failure in `nvram_flush_failed` only once this
+condition holds it, and carries it over a restart from here. It cannot be
+resolved by hand.
+
+| Raised when | Clears when |
+|---|---|
+| The state file could not be written with a failure in it. | A write of the state file succeeds (or the failure is gone). |
+
+**What to do.** Fix the filesystem holding `<data_dir>` (`dmesg`, `df`), then
+follow `nvram_flush_failed`.
 
 ### UEFI vars file not flushed (`nvram_flush_blocked`)
 

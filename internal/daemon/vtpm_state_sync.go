@@ -129,16 +129,16 @@ func (v *vtpmStateSync) finish(rep libvirt.SwtpmSyncReport, gen uint64) {
 	v.sync1(rep.State, open, evidence)
 }
 
-// overrun raises the condition once for a pass still running past wait.
+// overrun raises the condition for a pass still running past wait: logged
+// once, and written again by a later probe if the write failed (sync1).
 func (v *vtpmStateSync) overrun() {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if v.overran {
-		return
+	if !v.overran {
+		v.overran = true
+		slog.Warn("a pass over the vTPM state tree has not finished; vTPM is not offered on this host until one does",
+			"path", v.base, "waited", v.wait)
 	}
-	v.overran = true
-	slog.Warn("a pass over the vTPM state tree has not finished; vTPM is not offered on this host until one does",
-		"path", v.base, "waited", v.wait)
 	if !v.on {
 		return
 	}
@@ -207,4 +207,14 @@ func (d *Daemon) syncVTPMCondition(ctx context.Context, open bool, evidence map[
 		}
 	}
 	return d.writeSelfConditionAs(ctx, vtpmEvaluator, CondVTPMStateNotDurable, open, corrosion.SeverityWarning, evidence)
+}
+
+// awaitFirstVTPMPass runs the first pass over the swtpm tree (tpmCapable, the
+// vTPM capability probe) and waits until it completes or has run past
+// vtpmPassWait and raised vtpm_state_not_durable. Run calls it before
+// anything on this host can start a VM: the capability label orders
+// placement only, and an onboot or restart-policy start, a cutover, an
+// operation recovery or an API start on this host does not ask it.
+func awaitFirstVTPMPass(tpmCapable func() bool) {
+	tpmCapable()
 }

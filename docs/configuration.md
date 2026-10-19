@@ -792,7 +792,8 @@ container_restore_timeout_sec: 600    # 0 → 600s (10m)
 # vTPM state durability. swtpm writes a vTPM's state without fsync, so a write
 # made shortly before a power cut can be lost. On a host with swtpm, the daemon
 # sets the sync attribute (chattr +S) on /var/lib/libvirt/swtpm and everything
-# under it, at start and every minute, and records that it did in
+# under it, at start (before it starts any VM; it waits up to 10 seconds for
+# that pass) and every minute, and records that it did in
 # <data_dir>/vtpm-state-sync. Files swtpm creates there inherit it. On ext4,
 # and on xfs mounted with dirsync or wsync (a mount-time sync implies wsync; a
 # remount to sync does not), a vTPM command then returns only once its state

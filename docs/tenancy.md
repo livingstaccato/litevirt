@@ -32,6 +32,13 @@ lv project create acme/team-foo --parent acme
 `lv project rm <name>` soft-deletes; the VM rows continue to reference
 the project name but new creations against it are refused.
 
+A deleted project's name can be created again with `lv project create`. The
+new project starts with none of the old one's authority: its role bindings
+(`lv role grant`), quota and admission authority are retired at delete, and
+again at re-create. It keeps the old display name and parent, so a re-create
+with a different `--display` or `--parent` is refused; repeat the old display,
+or pass none.
+
 ## Quotas
 
 Each project can carry quota rows. Six dimensions are enforced today:

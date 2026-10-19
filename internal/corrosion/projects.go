@@ -2,10 +2,13 @@ package corrosion
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
+
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 // DefaultProject is the implicit bucket every VM lands in when no
@@ -50,11 +53,133 @@ func InsertProject(ctx context.Context, c *Client, p ProjectRecord) error {
 			return fmt.Errorf("parent project %q does not exist", p.ParentName)
 		}
 	}
-	now := c.NowTS()
-	return c.Execute(ctx,
-		`INSERT INTO projects (name, display, parent_name, created_at, updated_at)
+	// A tombstone under this name is a previous incarnation. It is revived in
+	// place with the statement shape DeleteProject already replicates, bound with
+	// a NULL deleted_at: no new shape, so no peer needs upgrading and nothing is
+	// gated. The HLC updated_at makes the revive beat the old tombstone on every
+	// replica, and a late copy of that tombstone (older clock) lose; a delete
+	// issued after seeing the revive carries a newer clock and wins.
+	old, err := c.Query(ctx, `SELECT display, parent_name FROM projects WHERE name = ? AND deleted_at IS NOT NULL`, p.Name)
+	if err != nil {
+		return fmt.Errorf("check previous incarnation: %w", err)
+	}
+	if len(old) == 0 {
+		live, lerr := c.Query(ctx, `SELECT 1 FROM projects WHERE name = ? AND deleted_at IS NULL`, p.Name)
+		if lerr != nil {
+			return fmt.Errorf("check existing project: %w", lerr)
+		}
+		if len(live) > 0 {
+			return fmt.Errorf("project %q already exists", p.Name)
+		}
+		now := c.NowTS()
+		return c.Execute(ctx,
+			`INSERT INTO projects (name, display, parent_name, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?)`,
-		p.Name, p.Display, p.ParentName, nowRFC3339(), now)
+			p.Name, p.Display, p.ParentName, nowRFC3339(), now)
+	}
+	// The revive can only clear the tombstone, not rewrite the row, so display
+	// and parent are those of the old incarnation. Never keep them silently.
+	oldDisplay, oldParent := old[0].String("display"), old[0].String("parent_name")
+	if p.Display != "" && p.Display != oldDisplay {
+		return fmt.Errorf("project %q was deleted with display %q and a re-created project keeps it; "+
+			"create it with --display %q, or with no --display", p.Name, oldDisplay, oldDisplay)
+	}
+	if p.ParentName != oldParent {
+		return fmt.Errorf("project %q was deleted under parent %q (%q now); a re-created project keeps its parent",
+			p.Name, oldParent, p.ParentName)
+	}
+	// Whatever the old incarnation was granted is retired FIRST, so a crash
+	// halfway leaves a tombstoned project with no authority, never a live one
+	// holding the old one's.
+	if err := retireProjectGrants(ctx, c, p.Name); err != nil {
+		return fmt.Errorf("retire previous incarnation's grants: %w", err)
+	}
+	guard := func(tx *sql.Tx) (bool, error) {
+		var live int
+		if qerr := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM projects WHERE name = ? AND deleted_at IS NULL`, p.Name).Scan(&live); qerr != nil {
+			return false, qerr
+		}
+		return live == 0, nil
+	}
+	applied, err := c.ExecuteBatchGuarded(ctx, guard, []Statement{{
+		SQL:    `UPDATE projects SET deleted_at = ?, updated_at = ? WHERE name = ?`,
+		Params: []interface{}{nil, c.NowTS(), p.Name},
+	}})
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return fmt.Errorf("project %q already exists", p.Name)
+	}
+	return nil
+}
+
+// projectRBACRoot is the RBAC path root of a project name, built like
+// safename.ProjectRBACPath(CanonicalProjectName(name)). ok=false for a name
+// that has no valid canonical form.
+func projectRBACRoot(name string) (string, bool) {
+	canon, err := safename.CanonicalProjectName(name)
+	if err != nil {
+		return "", false
+	}
+	return safename.ProjectRBACPath(canon), true
+}
+
+// retireProjectGrants removes everything that grants authority over a project
+// NAME, so a later project of the same name starts with none: its admission
+// authority, every role binding at or under its RBAC path, and its quota. All
+// three are keyed by the name, not by an incarnation, so without this a
+// re-created project would silently inherit the old one's operators, holder and
+// limits. Idempotent. Uses only existing statement shapes.
+func retireProjectGrants(ctx context.Context, c *Client, name string) error {
+	if err := RetireProjectAuthority(ctx, c, name); err != nil {
+		return err
+	}
+	// Two spellings of one project ("acme", "/acme") are two rows but one RBAC
+	// path: another LIVE spelling still owns these bindings, so leave them.
+	spelled, err := c.Query(ctx, `SELECT name FROM projects WHERE name <> ? AND deleted_at IS NULL`, name)
+	if err != nil {
+		return err
+	}
+	root, ok := projectRBACRoot(name)
+	for _, r := range spelled {
+		if other, oerr := projectRBACRoot(r.String("name")); oerr && other == root {
+			ok = false
+		}
+	}
+	if ok {
+		rows, err := c.Query(ctx,
+			`SELECT id, path FROM role_bindings WHERE deleted_at IS NULL`)
+		if err != nil {
+			return err
+		}
+		var stmts []Statement
+		for _, r := range rows {
+			path := r.String("path")
+			if path == root || strings.HasPrefix(path, root+"/") {
+				stmts = append(stmts, Statement{
+					SQL:    roleBindingDeleteSQL,
+					Params: []interface{}{nowRFC3339(), c.NowTS(), r.String("id")},
+				})
+			}
+		}
+		if len(stmts) > 0 {
+			if err := c.ExecuteBatch(ctx, stmts); err != nil {
+				return err
+			}
+		}
+	}
+	// project_quotas has no deleted_at, so a quota is reset to unbounded (the
+	// state of a new project) rather than tombstoned.
+	q, err := GetProjectQuota(ctx, c, name)
+	if err != nil {
+		return err
+	}
+	if q != nil {
+		return UpsertProjectQuota(ctx, c, ProjectQuotaRecord{ProjectName: name})
+	}
+	return nil
 }
 
 // GetProject returns the project by name (canonical path) or nil if
@@ -154,8 +279,8 @@ func DeleteProject(ctx context.Context, c *Client, name string) error {
 	// Retire the project's admission authority BEFORE tombstoning the project
 	// itself. Done in the other order, a delete that failed halfway would leave a
 	// gone project still holding live authority — the orphan state this prevents.
-	if err := RetireProjectAuthority(ctx, c, name); err != nil {
-		return fmt.Errorf("retire project authority: %w", err)
+	if err := retireProjectGrants(ctx, c, name); err != nil {
+		return fmt.Errorf("retire project grants: %w", err)
 	}
 	now := c.NowTS()
 	return c.Execute(ctx,

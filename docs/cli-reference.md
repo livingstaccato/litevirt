@@ -101,8 +101,9 @@ lv cluster claim-release <kind>/<name>       # Release one workload ha.claim.leg
                                    #   legacy proof stuck in flight on a live destination; the
                                    #   destination confirms nothing runs it, then abandons it (admin)
 lv health [--resolved]             # Cluster health: overall + conditions + coverage (exit 0/1/2)
-lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E]  # Resolve one open dual-run
-                                   #   condition by hand (admin, audited); re-raised next pass if it still holds
+lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept-stale-uefi-vars]
+                                   # Resolve one open dual-run condition by hand (admin, audited; re-raised next
+                                   #   pass if it still holds), or accept nvram_flush_failed's vars stores as stale
 ```
 
 ## Hosts
@@ -462,6 +463,27 @@ than silently breaking BitLocker. The explicit refusals:
 | automatic failover (host died) | skipped — firmware is host-local and died with the host; recover via restore from a firmware-carrying backup |
 | replica promotion | refused — a disk replica carries no firmware |
 | `lv rm --keep-disks` then `lv run --name <same>` | refused — the retained NVRAM isn't inherited; restore the VM instead of recreating it |
+
+**UEFI variable writes and a host power cut.** qemu writes a guest's UEFI
+variables (any UEFI VM, not only Secure Boot) to its vars file without
+flushing it, and libvirt has no cache setting for that file. The daemon
+fsyncs every vars file that changed, in `<data_dir>/nvram/` and
+`/var/lib/libvirt/qemu/nvram/`, once a second, and once more as it stops. A
+host power cut can therefore lose a variable written in about the last second
+before it, or up to `vm.dirty_expire_centisecs` (30 s by default) while the
+daemon is not running. A failed fsync raises `nvram_flush_failed`, and a vars
+file that cannot be opened for a minute raises `nvram_flush_blocked`
+(docs/diagnostics.md).
+
+swtpm writes a vTPM's state without fsync. With `vtpm_state_sync` on (the
+default, docs/configuration.md), the daemon sets the sync attribute on
+`/var/lib/libvirt/swtpm` and everything under it, at start before it starts
+any VM and every minute after. On ext4, and on xfs mounted `dirsync` or
+`wsync`, a vTPM command then returns only once its state is on disk. Elsewhere
+(xfs without either, btrfs, ZFS, NFS, tmpfs), or when a pass fails or does not
+finish within 10 seconds, the host raises `vtpm_state_not_durable`
+(docs/diagnostics.md), and a vTPM write made shortly before a power cut can be
+lost.
 
 ## Containers (LXC / OCI)
 
@@ -1414,8 +1436,8 @@ all six quota dimensions. See `docs/tenancy.md`.
 ## Security groups and firewall
 
 ```bash
-lv sg create <name>
-lv sg ls
+lv sg create <name> [--project <p>]   # --project: owned by p; only p's workloads may bind it
+lv sg ls [--project <p>]              # --project: p's groups and the global ones
 lv sg rm <id>
 lv sg rule-add <sg-id-or-name> --direction ingress|egress --proto tcp \
     --port <p> --cidr <c> [--action accept|drop|reject] [--priority N]
@@ -1527,6 +1549,10 @@ lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E]
                                              #   audited, ha.condition.resolved event. Refused until a
                                              #   detector scan after its last sighting probed every host
                                              #   it names; raised again next pass if it still holds.
+lv health resolve nvram_flush_failed host/<host> --accept-stale-uefi-vars --reason R
+                                             # Accept that the UEFI vars stores nvram_flush_failed names
+                                             #   may be stale, for a VM kept as it is. Admin, audited
+                                             #   naming every file; a new failed flush raises it again.
 lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since <time>] [--until <time>]   # Audit log (default 50 entries)
 lv host stats <host>                         # Host resource statistics
 lv stats <vm>                                # VM resource statistics

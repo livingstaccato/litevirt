@@ -1691,10 +1691,11 @@ const configureHostSQL = `UPDATE hosts SET ` +
 // RemoveHost removes a host from the cluster. If force is false and the host
 // has running VMs, the request is rejected. CRL revocation is handled here.
 func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*pb.RemoveHostResponse, error) {
-	h, incarnation, err := s.removeHostRefusal(ctx, req)
+	h, key, err := s.removeHostRefusal(ctx, req)
 	if err != nil {
 		return nil, err
 	}
+	incarnation := key.N
 
 	if hook := s.removeHostBeforeDeleteHook; hook != nil {
 		hook(req.Name)
@@ -1703,15 +1704,15 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*pb
 	// is still the admission the checks above passed: a removal and a
 	// re-admission of the name, or a certificate renewal, may have landed
 	// since, and the new machine is not this removal's to delete.
-	applied, err := corrosion.DeleteHostIf(ctx, s.db, req.Name, h.CertSerial, incarnation)
+	applied, err := corrosion.DeleteHostIf(ctx, s.db, req.Name, h.CertSerial, key)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "delete host: %v", err)
 	}
 	if !applied {
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"%s's row changed while it was being removed (it was serial %s at incarnation %d); nothing was removed. "+
+			"%s's row changed while it was being removed (it was serial %s at incarnation %d, admitted %s); nothing was removed. "+
 				"Check `lv host inspect %s`, and run `lv host rm` again if it is still to go",
-			req.Name, h.CertSerial, incarnation, req.Name)
+			req.Name, h.CertSerial, incarnation, key.At, req.Name)
 	}
 
 	slog.Warn("host removed from cluster", "host", req.Name, "cert_serial", h.CertSerial, "incarnation", incarnation)
@@ -1735,46 +1736,65 @@ func (s *Server) PreflightRemoveHost(ctx context.Context, req *pb.RemoveHostRequ
 	return &emptypb.Empty{}, nil
 }
 
-// removeHostRefusal is RemoveHost's checks: the host's row and incarnation
-// when it may be removed.
-func (s *Server) removeHostRefusal(ctx context.Context, req *pb.RemoveHostRequest) (*corrosion.HostRecord, int64, error) {
+// removeHostRefusal is RemoveHost's checks: the host's row and the key of the
+// admission they were made on (incarnation and admission stamp) when it may
+// be removed.
+func (s *Server) removeHostRefusal(ctx context.Context, req *pb.RemoveHostRequest) (*corrosion.HostRecord, corrosion.HostIncarnation, error) {
+	var none corrosion.HostIncarnation
 	if err := RequireRole(ctx, "admin"); err != nil {
-		return nil, 0, err
+		return nil, none, err
 	}
 	h, err := corrosion.GetHost(ctx, s.db, req.Name)
-	if err != nil || h == nil {
-		return nil, 0, status.Errorf(codes.NotFound, "host %q not found", req.Name)
+	if err != nil {
+		// Not NotFound: `lv host rm` reads that on a retry as its own removal.
+		return nil, none, status.Errorf(codes.Unavailable, "read host %q: %v", req.Name, err)
+	}
+	if h == nil {
+		return nil, none, status.Errorf(codes.NotFound, "host %q not found", req.Name)
 	}
 	// A current voter keeps its vote whatever its hosts row says, so deleting
 	// the row must not look like removing the voter (recovery-claims.md §4.3).
 	if err := s.voterRemovalRefusal(ctx, req.Name); err != nil {
-		return nil, 0, err
+		return nil, none, err
 	}
 	// A removal decides the row a later re-admission counts from, so it is
 	// made on a caught-up node, by the voter majority, on the row a peer
 	// confirms, and only of the certificate the operator revoked
 	// (host_incarnation.go).
 	if err := s.hostOperatorWriteAllowed(ctx, "remove", req.Name); err != nil {
-		return nil, 0, err
+		return nil, none, err
 	}
 	if err := s.requireVoterMajority(ctx, "remove", req.Name); err != nil {
-		return nil, 0, err
+		return nil, none, err
 	}
 	if err := s.pullHostsNow(ctx, "remove", req.Name); err != nil {
-		return nil, 0, err
+		return nil, none, err
 	}
-	if h, err = corrosion.GetHost(ctx, s.db, req.Name); err != nil || h == nil {
-		return nil, 0, status.Errorf(codes.NotFound, "host %q not found", req.Name)
+	if h, err = corrosion.GetHost(ctx, s.db, req.Name); err != nil {
+		return nil, none, status.Errorf(codes.Unavailable, "read host %q: %v", req.Name, err)
+	} else if h == nil {
+		return nil, none, status.Errorf(codes.NotFound, "host %q not found", req.Name)
 	}
 	if want := req.GetExpectedCertSerial(); want != "" && !strings.EqualFold(want, h.CertSerial) {
-		return nil, 0, status.Errorf(codes.FailedPrecondition,
+		return nil, none, status.Errorf(codes.FailedPrecondition,
 			"%s's row changed since its certificate was revoked (it now names %s, not %s); run `lv host rm` again",
 			req.Name, h.CertSerial, want)
 	}
-	incarnation, _, _, _, _, err := corrosion.HostIncarnationOf(ctx, s.db, req.Name)
-	if err != nil {
-		return nil, 0, status.Errorf(codes.Unavailable, "read %s's incarnation: %v", req.Name, err)
+	if hook := s.removeHostBetweenReadsHook; hook != nil {
+		hook(req.Name)
 	}
+	incarnation, at, keySerial, deleted, found, err := corrosion.HostIncarnationOf(ctx, s.db, req.Name)
+	if err != nil {
+		return nil, none, status.Errorf(codes.Unavailable, "read %s's incarnation: %v", req.Name, err)
+	}
+	// The key and the row checked are one admission: one that changed
+	// between the two reads (another certificate, or a later admission of
+	// the same one) is not the row checked.
+	if !found || deleted || !strings.EqualFold(keySerial, h.CertSerial) || at != h.CreatedAt {
+		return nil, none, status.Errorf(codes.FailedPrecondition,
+			"%s's row changed while its removal was checked; run `lv host rm` again", req.Name)
+	}
+	key := corrosion.HostIncarnation{N: incarnation, At: at}
 
 	// `lv host rm --dead` (recovery-claims.md §3.12): a host fenced proof-grade
 	// and gone for good. Its workloads are not drained first — they are the
@@ -1782,17 +1802,39 @@ func (s *Server) removeHostRefusal(ctx context.Context, req *pb.RemoveHostReques
 	// supersede once this removal and the CRL have replicated.
 	if req.Dead {
 		if err := s.deadRemovalRefusal(ctx, h); err != nil {
-			return nil, 0, err
+			return nil, none, err
 		}
 	} else {
 		// Check for VMs on this host.
 		vms, _ := corrosion.ListVMs(ctx, s.db, "", req.Name)
 		if len(vms) > 0 && !req.Force {
-			return nil, 0, status.Errorf(codes.FailedPrecondition,
+			return nil, none, status.Errorf(codes.FailedPrecondition,
 				"host %q has %d VMs — drain first or use --force", req.Name, len(vms))
 		}
 	}
-	return h, incarnation, nil
+	return h, key, nil
+}
+
+// admitGRPCPort is the gRPC port AdmitHost records for an admitted host.
+const admitGRPCPort = 7443
+
+// addressLostRefusal refuses an admission of name that is written but loses
+// address to winner, admitted there first on another replica.
+func addressLostRefusal(address, name, winner string) error {
+	return status.Errorf(codes.FailedPrecondition,
+		"%s:%d is %s's address (active there, or admitted there before %s on another replica): "+
+			"%s stays admitted (joining) but is never activated, and nothing was installed for it. Remove it "+
+			"(`lv host rm %s`), or remove %s (`lv host rm %s`, or `lv host rm --dead %s` if it is fenced and gone "+
+			"for good) and run the add again",
+		address, admitGRPCPort, winner, name, name, name, winner, winner, winner)
+}
+
+// addressHeldRefusal refuses to admit name at address, which other holds.
+func addressHeldRefusal(address, name, other string) error {
+	return status.Errorf(codes.FailedPrecondition,
+		"%s:%d is %s's address: a machine is admitted under one name. Remove %s first (`lv host rm %s`, or "+
+			"`lv host rm --dead %s` if it is fenced and gone for good) to add the machine as %s",
+		address, admitGRPCPort, other, other, other, other, name)
 }
 
 // AdmitHost records the CA-authorized identity produced by `lv host add`.
@@ -1817,6 +1859,18 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.A
 	}
 	if req.Name == "" || req.Address == "" || req.CertSerial == "" {
 		return nil, status.Error(codes.InvalidArgument, "name, address, and certificate serial are required")
+	}
+	// One machine, one name: an address another live or joining host is
+	// dialled at belongs to that host. Checked here, not only by `lv host
+	// add`, and again by the admission write itself, in its transaction
+	// (corrosion.AdmitHost), so two adds of one machine under two names on
+	// this replica cannot both pass. This read only refuses early.
+	other, err := corrosion.HostAddressHolder(ctx, s.db, req.Address, req.Name, admitGRPCPort)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read the hosts at %s: %v", req.Address, err)
+	}
+	if other != "" {
+		return nil, addressHeldRefusal(req.Address, req.Name, other)
 	}
 	// A name whose removed machine still has workloads recorded on it is not
 	// given to a new machine: those rows are the old machine's, recovered by
@@ -1849,12 +1903,27 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.A
 		Address:    req.Address,
 		SSHUser:    "root",
 		SSHPort:    22,
-		GRPCPort:   7443,
+		GRPCPort:   admitGRPCPort,
 		State:      corrosion.HostStateJoining,
 		CertSerial: req.CertSerial,
 	})
 	if err != nil {
 		return nil, err
+	}
+	// The write's guard sees only this replica. Pulled again now that it is
+	// written, the address is decided by the rule activation follows
+	// (corrosion.AddressLostTo): a host active at this address, or an
+	// admission another replica made there first, keeps it, and this one is
+	// refused before anything is installed for it. Its row stays, and is never
+	// activated. `lv host add` asks again, under its lock on the machine,
+	// right before it installs.
+	if err := s.pullHostsNow(ctx, "admit", req.Name); err != nil {
+		return nil, err
+	}
+	if lostTo, err := corrosion.AddressLostTo(ctx, s.db, req.Name); err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read the hosts at %s: %v", req.Address, err)
+	} else if lostTo != "" {
+		return nil, addressLostRefusal(req.Address, req.Name, lostTo)
 	}
 	s.publish("host.admitted", req.Name, "cert_serial="+req.CertSerial)
 	return &pb.AdmitHostResponse{AuditTailSeq: tailSeq, AuditTailHash: tailHash, AuditPositionProven: true,
@@ -1949,6 +2018,13 @@ func (s *Server) admitHostRow(ctx context.Context, h corrosion.HostRecord) (notI
 	}
 	legacy := func() error {
 		if err := corrosion.AdmitHost(ctx, s.db, h); err != nil {
+			if other, ok := corrosion.AsAddressHeld(err); ok {
+				// A retry of a standing admission: its row is written.
+				if cur, _ := corrosion.GetHost(ctx, s.db, h.Name); cur != nil && strings.EqualFold(cur.CertSerial, h.CertSerial) {
+					return addressLostRefusal(h.Address, h.Name, other)
+				}
+				return addressHeldRefusal(h.Address, h.Name, other)
+			}
 			if errors.Is(err, corrosion.ErrReadmitNeedsCounter) {
 				return status.Errorf(codes.FailedPrecondition, "admit host: %v", err)
 			}
@@ -1977,12 +2053,17 @@ func (s *Server) admitHostRow(ctx context.Context, h corrosion.HostRecord) (notI
 	if err := s.requireVoterMajority(ctx, "re-add", h.Name); err != nil {
 		return "", err
 	}
+	heldBy := ""
 	err = s.WithReleaseFeature(ctx, capabilities.FeatureHostIncarnation, func(ctx context.Context, g capabilities.FeatureGrant) error {
 		_, _, aerr := corrosion.AdmitHostV2(ctx, s.db, h, g)
+		heldBy, _ = corrosion.AsAddressHeld(aerr)
 		return aerr
 	})
 	if err == nil {
 		return "", nil
+	}
+	if heldBy != "" {
+		return "", addressHeldRefusal(h.Address, h.Name, heldBy)
 	}
 	st, isStatus := status.FromError(err)
 	gateRefusal := isStatus && (st.Code() == codes.Unavailable || st.Code() == codes.FailedPrecondition) &&

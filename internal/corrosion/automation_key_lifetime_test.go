@@ -13,7 +13,7 @@ import (
 // The existing historical fixture premise, with independent WAL/FULL files as
 // in aggregate_fixture. Hand-built membership is explicitly test history; this
 // helper never supplies a current custody provider or a fresh class issuer.
-func custodyLifetimeHistoricalVoters(t *testing.T, original80 bool) []*claimTestVoter {
+func custodyLifetimeHistoricalVoters(t *testing.T, baselineSchema int) []*claimTestVoter {
 	t.Helper()
 	ctx := context.Background()
 	ca := newClaimTestCA(t)
@@ -22,8 +22,12 @@ func custodyLifetimeHistoricalVoters(t *testing.T, original80 bool) []*claimTest
 		v := &claimTestVoter{name: name}
 		v.c = custodyLifetimeFileClient(t, t.TempDir(), name)
 		t.Cleanup(func() { _ = v.c.Close() })
-		if original80 {
-			custodyLifetimeBuildOriginal80(t, v.c)
+		if baselineSchema == 80 || baselineSchema == 81 {
+			if baselineSchema == 80 {
+				custodyLifetimeBuildOriginal80(t, v.c)
+			} else {
+				custodyLifetimeBuildComposed81(t, v.c)
+			}
 			if err := v.c.mintVoterIncarnation(ctx); err != nil {
 				t.Fatal(err)
 			}
@@ -49,7 +53,7 @@ func custodyLifetimeHistoricalVoters(t *testing.T, original80 bool) []*claimTest
 
 func TestAutomationKeyTransitionHostLifetimeReplay(t *testing.T) {
 	ctx := context.Background()
-	voters := custodyLifetimeHistoricalVoters(t, false)
+	voters := custodyLifetimeHistoricalVoters(t, 0)
 	a := voters[0]
 	genesis := sharedAutomationRecord(t, 1, "", "initialize", "initialize-operation", voters...)
 	if _, err := applySharedAutomation(t, a.c, genesis, contract.Reduce, automationFreshAnchor); err != nil {
@@ -72,7 +76,7 @@ func TestAutomationKeyTransitionHostLifetimeReplay(t *testing.T) {
 	record = keyCertifiedDecision(t, d, voters...)
 	receipt, err := applySharedAutomation(t, a.c, record, contract.Reduce, automationFreshAnchor)
 	if err != nil {
-		t.Fatalf("SETUP genuine schema81 N0 history persistence: %v", err)
+		t.Fatalf("SETUP genuine schema82 N0 history persistence: %v", err)
 	}
 	stored, err := a.c.Query(ctx, `SELECT host_incarnation,admitted_at,admission_serial FROM local_automation_key_recipients WHERE stage='' AND host='a'`)
 	if err != nil || len(stored) != 1 || stored[0].Int64("host_incarnation") != 0 || stored[0].String("admitted_at") != "2026-10-18T00:00:00Z" || stored[0].String("admission_serial") != "a0" {
@@ -86,7 +90,7 @@ func TestAutomationKeyTransitionHostLifetimeReplay(t *testing.T) {
 	a.c = custodyLifetimeFileClient(t, dir, a.name)
 	a.c.SetVoterConfigGate(func() bool { return true })
 	if err := InitSchema(ctx, a.c); err != nil {
-		t.Fatalf("SETUP schema81 reopen: %v", err)
+		t.Fatalf("SETUP schema82 reopen: %v", err)
 	}
 	err = a.c.ExecuteLocal(ctx, func(tx *LocalTx) error {
 		head, err := automationHeadTx(ctx, tx)
@@ -146,16 +150,138 @@ func TestAutomationKeyTransitionHostLifetimeReplay(t *testing.T) {
 	}
 }
 
-func TestAutomationCustodyLifetimeArchived80Migration(t *testing.T) {
+// This is a fresh clone of the frozen d226 original80 source fixture. Its
+// valid archive is created before storage-only rows are added. Later archive
+// reuse proves original byte preservation, not a new cut of uncertified rows.
+func TestAutomationCustodyLifetimeArchived80CloneUpgradePreservesOriginals(t *testing.T) {
 	ctx := context.Background()
-	a := custodyLifetimeHistoricalVoters(t, true)[0]
+	a := custodyLifetimeHistoricalVoters(t, 80)[0]
 	if storedVersion(t, a.c) != 80 {
-		t.Fatal("not a genuine original80 baseline")
+		t.Fatal("not a genuine original80 source fixture")
 	}
 	if corrected, err := automationCustodyRecipientShape(ctx, a.c); err != nil || corrected {
 		t.Fatal("original80 fixture already has corrected constraint", corrected, err)
 	}
-	if err := a.c.SealVoterGeneration(ctx, 1, "archive-before81"); err != nil {
+	if err := a.c.SealVoterGeneration(ctx, 1, "archive-original80-before-composition"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := a.c.FreezeAutomationCut(ctx, 1, nil)
+	if err != nil {
+		t.Fatal("freeze valid original80 source before storage-only rows", err)
+	}
+	before, records := cutFixtureRead(t, a.c, id)
+	if before.SourceSchema != 80 || len(before.Inventory) != 9 {
+		t.Fatal("original80 descriptor/inventory changed")
+	}
+	// Storage preservation fixtures only. These rows are intentionally added
+	// AFTER the valid historical cut; they confer no certified history or
+	// fresh authority, and no new live-state cut is claimed below.
+	for _, stage := range []string{"", "original80-audit-a", "original80-audit-b"} {
+		if err := custodyLifetimeInsertRecipient(t, a.c, stage, "original80-positive", 17); err != nil {
+			t.Fatal("original80 positive recipient row", err)
+		}
+	}
+	if exists, err := columnExists(ctx, a.c.db, "security_groups", "project"); err != nil || exists {
+		t.Fatal("original80 clone already has published SG70 column", exists, err)
+	}
+	if err := a.c.execLocal(ctx, `INSERT INTO security_groups(id,name,created_at,updated_at) VALUES('original80-global','original80-global','before70','before70')`); err != nil {
+		t.Fatal(err)
+	}
+	originalRows, err := a.c.Query(ctx, "SELECT "+custodyLifetimeRecipientColumns+" FROM local_automation_key_recipients ORDER BY stage,host")
+	if err != nil || len(originalRows) != 3 || len(originalRows[0].Columns) != 16 {
+		t.Fatal("original80 all-stage/16-column storage fixture", err)
+	}
+	originalLedger, err := a.c.Query(ctx, `SELECT id,applied_at,checksum FROM applied_migrations ORDER BY id`)
+	if err != nil || len(originalLedger) != 196 {
+		t.Fatal("original80 exact196 applied preimages missing", err)
+	}
+	oldIDs := map[string]bool{}
+	for _, row := range originalLedger {
+		oldIDs[row.String("id")] = true
+	}
+	const oldInventoryID = "a091_local_automation_receiver_current_established_inventory"
+	if !oldIDs[oldInventoryID] {
+		t.Fatal("original80 full inventory migration ID missing")
+	}
+	if err := InitSchema(ctx, a.c); err != nil {
+		t.Fatal("fresh original80 clone upgrade to82", err)
+	}
+	if storedVersion(t, a.c) != 82 || len(schemaMigrationLedger) != 198 {
+		t.Fatal("clone did not reach composed82/current198 known units")
+	}
+	afterRows, err := a.c.Query(ctx, "SELECT "+custodyLifetimeRecipientColumns+" FROM local_automation_key_recipients ORDER BY stage,host")
+	if err != nil || !reflect.DeepEqual(originalRows, afterRows) {
+		t.Fatal("clone upgrade changed recipient columns/bytes/stages", err)
+	}
+	if corrected, err := automationCustodyRecipientShape(ctx, a.c); err != nil || !corrected {
+		t.Fatal("clone upgrade omitted recipient constraint rebuild", corrected, err)
+	}
+	groups, err := a.c.Query(ctx, `SELECT project FROM security_groups WHERE id='original80-global'`)
+	if err != nil || len(groups) != 1 || groups[0].String("project") != "" {
+		t.Fatal("clone upgrade lost published SG70 global default", err)
+	}
+	upgradedLedger, err := a.c.Query(ctx, `SELECT id,applied_at,checksum FROM applied_migrations ORDER BY id`)
+	if err != nil || len(upgradedLedger) != 199 || len(upgradedLedger) != len(originalLedger)+3 {
+		t.Fatal("clone upgrade must retain196 old plus only3 new applied rows", err)
+	}
+	newIDs := map[string]bool{
+		"a091_security_groups_project":                                 false,
+		"a092_local_automation_receiver_current_established_inventory": false,
+		"r_automation_key_recipients_host_zero":                        false,
+	}
+	var preserved []Row
+	applied := map[string]Row{}
+	for _, row := range upgradedLedger {
+		name := row.String("id")
+		applied[name] = row
+		if oldIDs[name] {
+			preserved = append(preserved, row)
+		} else if _, ok := newIDs[name]; ok {
+			newIDs[name] = true
+		} else {
+			t.Fatal("clone upgrade recorded an unexpected new migration", name)
+		}
+	}
+	if !reflect.DeepEqual(originalLedger, preserved) {
+		t.Fatal("clone upgrade rewrote old IDs/checksums/timestamps")
+	}
+	for name, found := range newIDs {
+		if !found {
+			t.Fatal("clone upgrade omitted required new migration", name)
+		}
+	}
+	for _, unit := range schemaMigrationLedger {
+		row, ok := applied[unit.ID]
+		if !ok || row.String("checksum") != sha256hex(unit.SQL) {
+			t.Fatal("clone upgrade omitted or misrecorded known current unit", unit.ID)
+		}
+	}
+	again, err := a.c.FreezeAutomationCut(ctx, 1, nil)
+	if err != nil || again != id {
+		t.Fatal("clone upgrade did not reuse original80 archive", err)
+	}
+	after, later := cutFixtureRead(t, a.c, again)
+	if !reflect.DeepEqual(before, after) || !reflect.DeepEqual(records, later) {
+		t.Fatal("clone upgrade changed original80 cut metadata/records/root")
+	}
+	complete := custodyLifetimeSnapshot(t, a.c)
+	if err := InitSchema(ctx, a.c); err != nil || appliedCount(t, a.c) != 199 || !reflect.DeepEqual(complete, custodyLifetimeSnapshot(t, a.c)) {
+		t.Fatal("clone re-init changed retained old/current ledger or recipient rows", err)
+	}
+}
+
+// This distinct fresh composed fixture proves the SQL81->82 rebuild without
+// confusing a composed prerequisite with the separate original80 clone above.
+func TestAutomationCustodyLifetimeComposed81ArchiveSurvives82(t *testing.T) {
+	ctx := context.Background()
+	a := custodyLifetimeHistoricalVoters(t, 81)[0]
+	if storedVersion(t, a.c) != 81 {
+		t.Fatal("not a fresh composed81 prerequisite fixture")
+	}
+	if corrected, err := automationCustodyRecipientShape(ctx, a.c); err != nil || corrected {
+		t.Fatal("composed81 fixture already has corrected constraint", corrected, err)
+	}
+	if err := a.c.SealVoterGeneration(ctx, 1, "fresh-composed81-before82"); err != nil {
 		t.Fatal(err)
 	}
 	id, err := a.c.FreezeAutomationCut(ctx, 1, nil)
@@ -163,18 +289,18 @@ func TestAutomationCustodyLifetimeArchived80Migration(t *testing.T) {
 		t.Fatal(err)
 	}
 	before, records := cutFixtureRead(t, a.c, id)
-	if before.SourceSchema != 80 || len(before.Inventory) != 9 {
-		t.Fatal("original80 descriptor/inventory changed")
+	if before.SourceSchema != 81 || len(before.Inventory) != 9 {
+		t.Fatal("composed81 archive descriptor/inventory changed")
 	}
 	if err := InitSchema(ctx, a.c); err != nil {
 		t.Fatal(err)
 	}
 	again, err := a.c.FreezeAutomationCut(ctx, 1, nil)
-	if err != nil || again != id || storedVersion(t, a.c) != 81 {
-		t.Fatal("schema81 migration relabeled original80 cut", err)
+	if err != nil || again != id || storedVersion(t, a.c) != 82 {
+		t.Fatal("fresh composed82 rebuild relabeled archived81", err)
 	}
 	after, later := cutFixtureRead(t, a.c, again)
 	if !reflect.DeepEqual(before, after) || !reflect.DeepEqual(records, later) {
-		t.Fatal("schema81 migration changed original80 cut bytes/root")
+		t.Fatal("fresh composed82 rebuild changed archived81 bytes/root")
 	}
 }

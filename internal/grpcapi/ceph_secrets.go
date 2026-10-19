@@ -597,13 +597,54 @@ func (s *Server) ReconcileCephSecrets(ctx context.Context) {
 	}
 }
 
+// cephPoolRef is litevirt pool `name` as this host has it now: one of its
+// storage pools (the loaded list, then the table, which holds a pool the list
+// has not loaded yet, right after a restart), or, for "<stack>/<volume>" (no
+// host pool name has a "/"), that volume of the stored compose stack, as
+// resolveVolume gives it to a create and cephStartPlan to a start. found is
+// false when there is no such pool or volume here; err is set when whether
+// there is cannot be read.
+func (s *Server) cephPoolRef(ctx context.Context, name string) (StoragePoolRef, bool, error) {
+	if name == "" {
+		return StoragePoolRef{}, false, nil
+	}
+	if stack, vol, isVol := strings.Cut(name, "/"); isVol {
+		f, err := s.storedStackFile(ctx, stack)
+		if err != nil || f == nil {
+			return StoragePoolRef{}, false, err
+		}
+		v, ok := f.Volumes[vol]
+		if !ok {
+			return StoragePoolRef{}, false, nil
+		}
+		return StoragePoolRef{Driver: v.Driver, Source: v.Source, Target: v.Target, Options: v.Options}, true, nil
+	}
+	return s.resolvePoolErr(ctx, name)
+}
+
 // CephMonitorsForPool is the monitor list a domain's rbd disk on litevirt pool
 // `name` is given on this host now (lv.SetCephMonitorResolver): the pool's
-// mon_host option, else its conf's mon_host. ok is false when this host has no
-// such ceph pool, or its conf cannot be read.
+// mon_host option, else its conf's mon_host. The pool is cephPoolRef's — a
+// pool the loaded list does not hold yet, or a compose stack volume, is read
+// from the table: its locator's recorded monitors are never given in its
+// place. ok is false when this host has no such ceph pool, or it cannot be
+// read, or its conf cannot be.
 func (s *Server) CephMonitorsForPool(name string) ([]string, bool) {
 	ref, ok := s.lookupStoragePool(name)
-	if !ok || !strings.EqualFold(ref.Driver, "ceph") {
+	if !ok && name != "" && s.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), cephPoolTableReadTimeout)
+		ref, ok, _ = s.cephPoolRef(ctx, name)
+		cancel()
+	}
+	if !ok {
+		return nil, false
+	}
+	return cephRefMonitors(ref)
+}
+
+// cephRefMonitors is CephMonitorsForPool for a pool already in hand.
+func cephRefMonitors(ref StoragePoolRef) ([]string, bool) {
+	if !strings.EqualFold(ref.Driver, "ceph") {
 		return nil, false
 	}
 	if mh := strings.TrimSpace(ref.Options["mon_host"]); mh != "" {
@@ -622,6 +663,12 @@ func (s *Server) CephMonitorsForPool(name string) ([]string, bool) {
 	}
 	return mons, true
 }
+
+// cephPoolTableReadTimeout bounds CephMonitorsForPool's table read of a pool
+// the loaded list does not hold. It bounds the query, not the wait for the
+// database client's lock, which a running write batch holds: that wait is the
+// one every read on the start path makes, and a batch is not left holding it.
+const cephPoolTableReadTimeout = 5 * time.Second
 
 // refuseRBDDisk refuses an operation litevirt does not implement for ceph
 // (rbd) disks, with that reason, rather than letting it fail on a path that is

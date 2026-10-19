@@ -936,14 +936,22 @@ func (s *Server) sweepOrphanedBridges(ctx context.Context, st *netReconcileState
 	users, uerr := s.deviceUsersAll(ctx)
 	for _, b := range bridges {
 		key := "sweep:" + b
+		// A network naming b is checked before b's users, so a live
+		// network's bridge with a VM on it is not logged as one that no
+		// network names.
+		named, nerr := s.bridgeNamedBecause(ctx, b, pendingTeardown)
 		reason := ""
 		switch {
+		case nerr != nil:
+			reason = "unknown: " + nerr.Error()
+		case named != "":
+			reason = named
 		case uerr != nil:
 			reason = "unknown: " + uerr.Error()
 		case !users[b].none():
 			reason = users[b].String()
 		default:
-			r, err := s.bridgeKeptBecause(ctx, b, pendingTeardown)
+			r, err := s.bridgeKeptBecause(ctx, b)
 			if err != nil {
 				r = "unknown: " + err.Error()
 			}
@@ -971,9 +979,9 @@ func (s *Server) sweepOrphanedBridges(ctx context.Context, st *netReconcileState
 	}
 }
 
-// bridgeKeptBecause says why bridge b, which litevirt made here and no
-// workload's definition names, must stay, or "".
-func (s *Server) bridgeKeptBecause(ctx context.Context, b string, pendingTeardown map[string]bool) (string, error) {
+// bridgeNamedBecause says which network names bridge b, which litevirt made
+// here, as a reason that starts "named:", or "".
+func (s *Server) bridgeNamedBecause(ctx context.Context, b string, pendingTeardown map[string]bool) (string, error) {
 	if pendingTeardown[b] {
 		return "named: a deleted network's pending teardown", nil
 	}
@@ -985,6 +993,12 @@ func (s *Server) bridgeKeptBecause(ctx context.Context, b string, pendingTeardow
 	} else if user != "" {
 		return "named: network " + user, nil
 	}
+	return "", nil
+}
+
+// bridgeKeptBecause says why bridge b, which litevirt made here and no
+// network and no workload's definition names, must stay, or "".
+func (s *Server) bridgeKeptBecause(ctx context.Context, b string) (string, error) {
 	if who, err := network.BridgeNamedByWorkload(ctx, s.db, s.hostName, "", b); err != nil || who != "" {
 		return who, err
 	}

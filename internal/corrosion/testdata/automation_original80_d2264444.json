@@ -1,0 +1,1374 @@
+{
+  "source_commit": "d2264444ab949de12a5a87da2ed29c9f72a565f3",
+  "source_tree": "6edc84a7dc91ca1b5d9244f0735e0743bc7fc3d7",
+  "source_schema_blob": "266be870323216083d53c751a6cd198cc1487e53",
+  "source_schema_sha256": "823f75cff113e33f1aa783fe68d7213817aa0b6782be601ff2a0d517d5e9db9d",
+  "version": 80,
+  "ddl": [
+    "CREATE TABLE IF NOT EXISTS cluster (\n\t\tid           TEXT PRIMARY KEY DEFAULT 'default',\n\t\tname         TEXT NOT NULL,\n\t\tdomain       TEXT NOT NULL,\n\t\tca_cert      TEXT NOT NULL,\n\t\tcreated_at   TEXT NOT NULL,\n\t\tupdated_at   TEXT NOT NULL\n\t)",
+    "CREATE TABLE IF NOT EXISTS hosts (\n\t\tname         TEXT PRIMARY KEY,\n\t\taddress      TEXT NOT NULL,\n\t\tssh_user     TEXT NOT NULL,\n\t\tssh_port     INTEGER DEFAULT 22,\n\t\tgrpc_port    INTEGER DEFAULT 7443,\n\t\tstate        TEXT NOT NULL DEFAULT 'active',\n\t\tcert_serial  TEXT NOT NULL,\n\t\tcpu_total    INTEGER,\n\t\tmem_total    INTEGER,\n\t\tdisk_total   INTEGER,\n\t\tipmi_address TEXT,\n\t\tipmi_user    TEXT,\n\t\tipmi_pass    TEXT,\n\t\twatchdog_dev TEXT,\n\t\tfence_strategy TEXT DEFAULT 'best-effort',\n\t\tlabels       TEXT,\n\t\trole         TEXT NOT NULL DEFAULT 'worker',\n\t\tschema_version INTEGER NOT NULL DEFAULT 0,\n\t\tcpu_overcommit  REAL NOT NULL DEFAULT 0,\n\t\tmem_overcommit  REAL NOT NULL DEFAULT 0,\n\t\tcpu_reserve     INTEGER NOT NULL DEFAULT -1,\n\t\tmem_reserve_mib INTEGER NOT NULL DEFAULT -1,\n\t\tisolation_epoch INTEGER NOT NULL DEFAULT 0,\n\t\tisolation_reason TEXT NOT NULL DEFAULT '',\n\t\tcreated_at   TEXT NOT NULL,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT,\n\t\tversion      TEXT DEFAULT '',\n\t\tregion       TEXT NOT NULL DEFAULT 'default',\n\t\tcapacity_policy_hash TEXT NOT NULL DEFAULT '',\n\t\tincarnation  INTEGER NOT NULL DEFAULT 0\n\t)",
+    "CREATE TABLE IF NOT EXISTS host_labels (\n\t\thost_name    TEXT NOT NULL,\n\t\tkey          TEXT NOT NULL,\n\t\tvalue        TEXT NOT NULL,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT,\n\t\tPRIMARY KEY (host_name, key)\n\t)",
+    "CREATE TABLE IF NOT EXISTS host_health (\n\t\tobserver     TEXT NOT NULL,\n\t\ttarget       TEXT NOT NULL,\n\t\tstatus       TEXT NOT NULL,\n\t\tconsecutive_failures INTEGER DEFAULT 0,\n\t\tlast_seen    TEXT,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT,\n\t\tPRIMARY KEY (observer, target)\n\t)",
+    "CREATE TABLE IF NOT EXISTS clock_skew (\n\t\tobserver     TEXT NOT NULL,\n\t\ttarget       TEXT NOT NULL,\n\t\tskew_seconds REAL NOT NULL,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tPRIMARY KEY (observer, target)\n\t)",
+    "CREATE TABLE IF NOT EXISTS host_runtime_usage (\n\t\thost_name    TEXT PRIMARY KEY,\n\t\tdisk_iops    INTEGER NOT NULL DEFAULT 0,\n\t\tnet_mbps     INTEGER NOT NULL DEFAULT 0,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS crl_versions (\n\t\thost         TEXT PRIMARY KEY,\n\t\tversion      INTEGER NOT NULL,\n\t\tupdated_at   TEXT NOT NULL\n\t)",
+    "CREATE TABLE IF NOT EXISTS cluster_crl (\n\t\tid           TEXT NOT NULL,\n\t\tcrl_pem      TEXT NOT NULL,\n\t\tcreated_at   TEXT NOT NULL,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT,\n\t\tPRIMARY KEY (id, crl_pem)\n\t)",
+    "CREATE TABLE IF NOT EXISTS schema_state (\n\t\tid         INTEGER PRIMARY KEY,\n\t\tversion    INTEGER NOT NULL,\n\t\tupdated_at TEXT NOT NULL\n\t)",
+    "CREATE TABLE IF NOT EXISTS leader_election (\n\t\tkey        TEXT PRIMARY KEY,\n\t\tholder     TEXT NOT NULL,\n\t\texpires_at TEXT NOT NULL,\n\t\tupdated_at TEXT NOT NULL\n\t)",
+    "CREATE TABLE IF NOT EXISTS leader_lease_terms (\n\t\tkey         TEXT NOT NULL,\n\t\tterm        INTEGER NOT NULL DEFAULT 0,\n\t\tholder      TEXT NOT NULL DEFAULT '',\n\t\tacquired_at TEXT NOT NULL,\n\t\tcreated_at  TEXT NOT NULL,\n\t\tupdated_at  TEXT NOT NULL,\n\t\tdeleted_at  TEXT,\n\t\tPRIMARY KEY (key, term)\n\t)",
+    "CREATE TABLE IF NOT EXISTS vm_locks (\n\t\tvm_name    TEXT PRIMARY KEY,\n\t\tholder     TEXT NOT NULL,\n\t\texpires_at TEXT NOT NULL,\n\t\tupdated_at TEXT NOT NULL\n\t)",
+    "CREATE TABLE IF NOT EXISTS runtime_action_proofs (\n\t\tid                TEXT PRIMARY KEY,\n\t\taction            TEXT NOT NULL,           -- reschedule | promote | relocate | lb_apply | owner_assert\n\t\ttarget_kind       TEXT NOT NULL,           -- vm | container | lb\n\t\ttarget_name       TEXT NOT NULL,\n\t\tdest_host         TEXT NOT NULL,\n\t\tcoordinator       TEXT NOT NULL,\n\t\tlease_holder      TEXT NOT NULL DEFAULT '',\n\t\tlease_expires_at  TEXT NOT NULL DEFAULT '',\n\t\tquorum_live       INTEGER NOT NULL DEFAULT 0,\n\t\tquorum_needed     INTEGER NOT NULL DEFAULT 0,\n\t\towner_epoch       TEXT NOT NULL DEFAULT '', -- superseded owner epoch (Phase 4/5); '' pre-epoch\n\t\tfence_epoch       TEXT NOT NULL DEFAULT '', -- fence proof reference (Phase 5); '' pre-epoch\n\t\trelocation_token  TEXT NOT NULL DEFAULT '', -- container binding key; '' for VMs\n\t\tstatus            TEXT NOT NULL DEFAULT 'prepared', -- prepared | in_progress | completed | failed\n\t\tstep_state        TEXT NOT NULL DEFAULT '', -- forward-only step checkpoints for multi-step resume\n\t\tresult_code       TEXT NOT NULL DEFAULT '',\n\t\tresult_detail     TEXT NOT NULL DEFAULT '',\n\t\tstarted_at        TEXT NOT NULL DEFAULT '',\n\t\tcompleted_at      TEXT NOT NULL DEFAULT '',\n\t\texecutor_host     TEXT NOT NULL DEFAULT '',\n\t\tcreated_at        TEXT NOT NULL,\n\t\tupdated_at        TEXT NOT NULL,\n\t\tdeleted_at        TEXT,\n\t\t-- lease_term (v53) is LAST deliberately, after deleted_at, so this DDL\n\t\t-- produces the SAME physical column order as the ALTER in\n\t\t-- schemaMigrations. The v1 state digest hashes SELECT * positionally\n\t\t-- (sync.go digestTableRows \u2192 encodeRowCells) and anti-entropy only prefers\n\t\t-- the order-invariant v2 hash when BOTH peers emit one\n\t\t-- (antientropy.go:181). A mid-DDL column would therefore make a\n\t\t-- freshly-initialised v53 node and a v52\u2192v53 upgraded node disagree\n\t\t-- about this table's digest forever with identical rows, wherever\n\t\t-- digest_v2 is off. Put every future additive column here, not above.\n\t\tlease_term        INTEGER NOT NULL DEFAULT 0, -- lease incarnation term (v52); 0 = proof minted without one\n\t\tlease_key         TEXT NOT NULL DEFAULT '', -- WHICH lease's ledger lease_term belongs to (v54); '' = minted without one\n\t\tclaim_certificate TEXT NOT NULL DEFAULT '' -- recovery-claim certificate authorizing this proof (v60); '' = none\n\t)",
+    "CREATE TABLE IF NOT EXISTS operations (\n\t\tid               TEXT PRIMARY KEY,\n\t\tmethod           TEXT NOT NULL DEFAULT '',\n\t\tprincipal        TEXT NOT NULL DEFAULT '',\n\t\tproject          TEXT NOT NULL DEFAULT '',\n\t\tresource_kind    TEXT NOT NULL DEFAULT '',\n\t\tresource_id      TEXT NOT NULL DEFAULT '',\n\t\toperation_kind   TEXT NOT NULL DEFAULT '',\n\t\trequest_hash     TEXT NOT NULL DEFAULT '',\n\t\tidempotency_key  TEXT NOT NULL DEFAULT '',\n\t\treservation_json TEXT NOT NULL DEFAULT '',\n\t\tdesired_ref      TEXT NOT NULL DEFAULT '',\n\t\tvm_owner_epoch   INTEGER NOT NULL DEFAULT 0,\n\t\tcreated_at       TEXT NOT NULL,\n\t\tupdated_at       TEXT NOT NULL,\n\t\tdeleted_at       TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS operation_steps (\n\t\toperation_id   TEXT NOT NULL,\n\t\towner_epoch    INTEGER NOT NULL DEFAULT 0,\n\t\tstep_name      TEXT NOT NULL,\n\t\tfacts          TEXT NOT NULL DEFAULT '',\n\t\tcreated_at     TEXT NOT NULL,\n\t\tupdated_at     TEXT NOT NULL,\n\t\tdeleted_at     TEXT,\n\t\tPRIMARY KEY (operation_id, owner_epoch, step_name)\n\t)",
+    "CREATE TABLE IF NOT EXISTS project_authority_epochs (\n\t\tproject         TEXT NOT NULL,\n\t\tauthority_epoch INTEGER NOT NULL DEFAULT 0,\n\t\tholder          TEXT NOT NULL DEFAULT '',\n\t\ttransfer_kind   TEXT NOT NULL DEFAULT '',\n\t\tfence_proof_ref TEXT NOT NULL DEFAULT '',\n\t\tcreated_at      TEXT NOT NULL,\n\t\tupdated_at      TEXT NOT NULL,\n\t\tdeleted_at      TEXT,\n\t\tPRIMARY KEY (project, authority_epoch)\n\t)",
+    "CREATE TABLE IF NOT EXISTS quota_reservations (\n\t\tid          TEXT PRIMARY KEY,\n\t\tproject     TEXT NOT NULL,\n\t\tholder      TEXT NOT NULL,\n\t\tcpu         INTEGER NOT NULL DEFAULT 0,\n\t\tmem_mib     INTEGER NOT NULL DEFAULT 0,\n\t\tstate       TEXT NOT NULL DEFAULT 'pending',\n\t\tworkload    TEXT NOT NULL DEFAULT '',\n\t\tkind        TEXT NOT NULL DEFAULT '',\n\t\thost        TEXT NOT NULL DEFAULT '',\n\t\twant_cpu    INTEGER NOT NULL DEFAULT 0,\n\t\twant_mem    INTEGER NOT NULL DEFAULT 0,\n\t\texpires_at  TEXT NOT NULL,\n\t\tcreated_at  TEXT NOT NULL,\n\t\tupdated_at  TEXT NOT NULL,\n\t\tdeleted_at  TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS rebalance_proposals (\n\t\tid            TEXT PRIMARY KEY,\n\t\tvm_name       TEXT NOT NULL,\n\t\tsrc_host      TEXT NOT NULL,\n\t\tdst_host      TEXT NOT NULL,\n\t\tpolicy        TEXT NOT NULL,\n\t\texpected_gain REAL NOT NULL,\n\t\tstatus        TEXT NOT NULL,  -- pending | approved | applied | rejected | expired\n\t\tproposed_at   TEXT NOT NULL,\n\t\tapplied_at    TEXT,\n\t\texpires_at    TEXT NOT NULL,\n\t\tdetail        TEXT,\n\t\tupdated_at    TEXT NOT NULL\n\t)",
+    "CREATE TABLE IF NOT EXISTS host_pci_devices (\n\t\thost_name       TEXT NOT NULL,\n\t\taddress         TEXT NOT NULL,\n\t\tvendor_id       TEXT NOT NULL,\n\t\tdevice_id       TEXT NOT NULL,\n\t\tvendor_name     TEXT,\n\t\tdevice_name     TEXT,\n\t\ttype            TEXT NOT NULL,\n\t\tiommu_group     INTEGER,\n\t\tsriov_capable   BOOLEAN DEFAULT 0,\n\t\tsriov_vfs_total INTEGER DEFAULT 0,\n\t\tsriov_vfs_free  INTEGER DEFAULT 0,\n\t\tdriver          TEXT,\n\t\tvm_name         TEXT,\n\t\tnuma_node       INTEGER,\n\t\tpcie_root_port  TEXT,\n\t\tpcie_bridge     TEXT,\n\t\tlink_clique     TEXT,\n\t\tlink_peers      TEXT,\n\t\tupdated_at      TEXT NOT NULL,\n\t\tdeleted_at      TEXT,\n\t\tPRIMARY KEY (host_name, address)\n\t)",
+    "CREATE TABLE IF NOT EXISTS images (\n\t\tname         TEXT PRIMARY KEY,\n\t\tformat       TEXT NOT NULL,\n\t\tsource_url   TEXT,\n\t\tchecksum     TEXT,\n\t\tsize_bytes   INTEGER,\n\t\tcreated_at   TEXT NOT NULL,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS image_hosts (\n\t\timage_name   TEXT NOT NULL,\n\t\thost_name    TEXT NOT NULL,\n\t\tpath         TEXT NOT NULL,\n\t\tstatus       TEXT NOT NULL DEFAULT 'ready',\n\t\tpulled_at    TEXT,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT,\n\t\tPRIMARY KEY (image_name, host_name)\n\t)",
+    "CREATE TABLE IF NOT EXISTS networks (\n\t\tname         TEXT PRIMARY KEY,\n\t\tstack_name   TEXT,\n\t\ttype         TEXT NOT NULL,\n\t\tconfig       TEXT NOT NULL,\n\t\tcreated_at   TEXT NOT NULL,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS volumes (\n\t\tname         TEXT PRIMARY KEY,\n\t\tstack_name   TEXT,\n\t\ttype         TEXT NOT NULL,\n\t\tconfig       TEXT NOT NULL,\n\t\tcreated_at   TEXT NOT NULL,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS stacks (\n\t\tname         TEXT PRIMARY KEY,\n\t\tcompose_hash TEXT NOT NULL,\n\t\tcompose_yaml TEXT NOT NULL,\n\t\tstate        TEXT NOT NULL DEFAULT 'active',\n\t\tcreated_at   TEXT NOT NULL,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS vms (\n\t\tname              TEXT PRIMARY KEY,\n\t\tstack_name        TEXT,\n\t\thost_name         TEXT NOT NULL,\n\t\tspec              TEXT NOT NULL,\n\t\tstate             TEXT NOT NULL DEFAULT 'creating',\n\t\tstate_detail      TEXT,\n\t\tcpu_actual        INTEGER,\n\t\tmem_actual        INTEGER,\n\t\tcreated_at        TEXT NOT NULL,\n\t\tupdated_at        TEXT NOT NULL,\n\t\tdeleted_at        TEXT,\n\t\t-- v38 (split-brain hardening): control-plane pointer linking a state='pending'\n\t\t-- transition to the runtime_action_proofs row that authorizes the start. Set once\n\t\t-- with the pending transition, cleared in the same mutation that exits pending.\n\t\t-- '' = no in-flight proof-gated action. Carved out of LWW (ruleColUnresolved).\n\t\tpending_action_id TEXT NOT NULL DEFAULT '',\n\t\t-- v41 (F1 operation journal): per-VM monotonic ownership epoch (bumped on every\n\t\t-- ownership transfer) and spec generation (bumped on every desired-spec mutation)\n\t\t-- give ABA-proof recovery CAS; active_operation_id is the VM-wide mutation barrier\n\t\t-- pointing at the in-flight operations row ('' = none). Epochs resolve ruleNumericMax\n\t\t-- on an exact-ts tie; the pointer is carved out of LWW (ruleColUnresolved).\n\t\tvm_owner_epoch      INTEGER NOT NULL DEFAULT 0,\n\t\tspec_generation     INTEGER NOT NULL DEFAULT 0,\n\t\tactive_operation_id TEXT NOT NULL DEFAULT ''\n\t)",
+    "CREATE TABLE IF NOT EXISTS vm_interfaces (\n\t\tvm_name         TEXT NOT NULL,\n\t\tnetwork_name    TEXT NOT NULL,\n\t\tordinal         INTEGER NOT NULL,\n\t\tmac             TEXT NOT NULL,\n\t\tip              TEXT,\n\t\ttap_device      TEXT,\n\t\tsecurity_groups TEXT,                    -- : JSON []string of SG names; NULL = none\n\t\tupdated_at      TEXT NOT NULL,\n\t\tdeleted_at      TEXT,\n\t\tPRIMARY KEY (vm_name, network_name)\n\t)",
+    "CREATE TABLE IF NOT EXISTS container_interfaces (\n\t\thost_name       TEXT NOT NULL,\n\t\tct_name         TEXT NOT NULL,\n\t\tnetwork_name    TEXT NOT NULL,\n\t\tordinal         INTEGER NOT NULL,\n\t\tmac             TEXT NOT NULL,\n\t\tip              TEXT,\n\t\tveth_device     TEXT,\n\t\tsecurity_groups TEXT,                    -- JSON []string of SG names; NULL = none\n\t\tupdated_at      TEXT NOT NULL,\n\t\tdeleted_at      TEXT,\n\t\tPRIMARY KEY (host_name, ct_name, ordinal)\n\t)",
+    "CREATE TABLE IF NOT EXISTS vm_disks (\n\t\tvm_name      TEXT NOT NULL,\n\t\tdisk_name    TEXT NOT NULL,\n\t\thost_name    TEXT NOT NULL,\n\t\tpath         TEXT NOT NULL,\n\t\tsize_bytes   INTEGER,\n\t\tbacking_image TEXT,\n\t\tstorage_type TEXT NOT NULL DEFAULT 'local',\n\t\tstorage_volume TEXT,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT,\n\t\tPRIMARY KEY (vm_name, disk_name)\n\t)",
+    "CREATE TABLE IF NOT EXISTS vm_nics (\n\t\tvm_name TEXT NOT NULL, id TEXT NOT NULL, network_name TEXT NOT NULL,\n\t\tmodel TEXT NOT NULL DEFAULT 'virtio', mac TEXT NOT NULL, ordinal INTEGER NOT NULL,\n\t\tip TEXT, tap_device TEXT, security_groups TEXT,\n\t\tupdated_at TEXT NOT NULL, deleted_at TEXT,\n\t\tPRIMARY KEY (vm_name, id))",
+    "CREATE TABLE IF NOT EXISTS vm_pci_intent (\n\t\tvm_name TEXT NOT NULL, device_id TEXT NOT NULL, host_name TEXT NOT NULL,\n\t\tselector_kind TEXT NOT NULL, selector_payload TEXT NOT NULL, exclusive_key TEXT,\n\t\tupdated_at TEXT NOT NULL, deleted_at TEXT,\n\t\tPRIMARY KEY (vm_name, device_id))",
+    "CREATE TABLE IF NOT EXISTS vm_pci_realizations (\n\t\tvm_name TEXT NOT NULL, device_id TEXT NOT NULL, member_id TEXT NOT NULL,\n\t\thost_name TEXT NOT NULL, resolved_address TEXT, xml_alias TEXT, ordinal INTEGER NOT NULL,\n\t\tupdated_at TEXT NOT NULL, deleted_at TEXT,\n\t\tPRIMARY KEY (vm_name, device_id, member_id))",
+    "CREATE TABLE IF NOT EXISTS snapshots (\n\t\tid                 TEXT PRIMARY KEY,\n\t\tvm_name            TEXT NOT NULL,\n\t\thost_name          TEXT NOT NULL,\n\t\tname               TEXT NOT NULL,\n\t\tstate              TEXT NOT NULL,\n\t\tsize_bytes         INTEGER,\n\t\tparent_id          TEXT,\n\t\ttype               TEXT NOT NULL DEFAULT 'disk',\n\t\tvmstate_path       TEXT,\n\t\tvmstate_size_bytes INTEGER NOT NULL DEFAULT 0,\n\t\tcreated_at         TEXT NOT NULL,\n\t\tupdated_at         TEXT NOT NULL,\n\t\tdeleted_at         TEXT,\n\t\tUNIQUE(vm_name, name)\n\t)",
+    "CREATE TABLE IF NOT EXISTS resource_mappings (\n\t\tname        TEXT NOT NULL,\n\t\thost_name   TEXT NOT NULL,\n\t\taddress     TEXT NOT NULL,\n\t\tvendor      TEXT,\n\t\tdevice      TEXT,\n\t\tdescription TEXT,\n\t\tcreated_at  TEXT NOT NULL,\n\t\tupdated_at  TEXT NOT NULL,\n\t\tdeleted_at  TEXT,\n\t\tPRIMARY KEY (name, host_name, address)\n\t)",
+    "CREATE TABLE IF NOT EXISTS notification_targets (\n\t\tid         TEXT PRIMARY KEY,\n\t\tname       TEXT NOT NULL,\n\t\ttype       TEXT NOT NULL,            -- webhook | slack\n\t\tconfig     TEXT NOT NULL,            -- JSON (url, \u2026)\n\t\tenabled    INTEGER NOT NULL DEFAULT 1,\n\t\tcreated_at TEXT NOT NULL,\n\t\tupdated_at TEXT NOT NULL,\n\t\tdeleted_at TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS notification_routes (\n\t\tid            TEXT PRIMARY KEY,\n\t\tevent_pattern TEXT NOT NULL,         -- glob, e.g. \"backup.*\", \"*\"\n\t\ttarget_id     TEXT NOT NULL,\n\t\tmin_severity  TEXT NOT NULL DEFAULT 'info', -- info | warn | error\n\t\tenabled       INTEGER NOT NULL DEFAULT 1,\n\t\tcreated_at    TEXT NOT NULL,\n\t\tupdated_at    TEXT NOT NULL,\n\t\tdeleted_at    TEXT,\n\t\tsubject_pattern TEXT NOT NULL DEFAULT '*',\n\t\tproject       TEXT NOT NULL DEFAULT ''\n\t)",
+    "CREATE TABLE IF NOT EXISTS lb_configs (\n\t\tname         TEXT PRIMARY KEY,\n\t\tstack_name   TEXT,\n\t\tvip          TEXT NOT NULL,\n\t\talgorithm    TEXT NOT NULL DEFAULT 'roundrobin',\n\t\thosts        TEXT NOT NULL DEFAULT '',\n\t\tports        TEXT NOT NULL DEFAULT '[]',\n\t\tenabled      INTEGER NOT NULL DEFAULT 1,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT,\n\t\tgeneration   TEXT NOT NULL DEFAULT ''\n\t)",
+    "CREATE TABLE IF NOT EXISTS lb_backends (\n\t\tlb_name      TEXT NOT NULL,\n\t\tname         TEXT NOT NULL,\n\t\taddress      TEXT NOT NULL,\n\t\tis_vm        INTEGER NOT NULL DEFAULT 0,\n\t\tvm_name      TEXT,\n\t\tenabled      INTEGER NOT NULL DEFAULT 1,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT,\n\t\tgeneration   TEXT NOT NULL DEFAULT '',\n\t\tPRIMARY KEY (lb_name, name)\n\t)",
+    "CREATE TABLE IF NOT EXISTS users (\n\t\tusername      TEXT PRIMARY KEY,\n\t\trole          TEXT NOT NULL,\n\t\tpassword_hash TEXT NOT NULL,\n\t\trealm         TEXT NOT NULL DEFAULT 'local',\n\t\tdisplay_name  TEXT,\n\t\temail         TEXT,\n\t\tcreated_at    TEXT NOT NULL,\n\t\tupdated_at    TEXT NOT NULL,\n\t\tdeleted_at    TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS tokens (\n\t\tid           TEXT PRIMARY KEY,\n\t\tusername     TEXT NOT NULL,\n\t\tname         TEXT NOT NULL,\n\t\ttoken_hash   TEXT NOT NULL,\n\t\texpires_at   TEXT,\n\t\tlast_used_at TEXT,\n\t\tscope_paths  TEXT,                -- JSON []string of allowed path prefixes; empty/NULL = inherit user's full perms\n\t\tcreated_at   TEXT NOT NULL,\n\t\tupdated_at   TEXT NOT NULL DEFAULT '', -- bumped on create + revoke (not on last_used_at) so a revoke wins LWW\n\t\tdeleted_at   TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS roles (\n\t\tname         TEXT PRIMARY KEY,\n\t\tverbs        TEXT NOT NULL,        -- JSON array of verb strings, e.g. [\"vm.*\", \"lb.read\"]\n\t\tdescription  TEXT,\n\t\tbuilt_in     BOOLEAN NOT NULL DEFAULT 0,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS role_bindings (\n\t\tid           TEXT PRIMARY KEY,\n\t\tpath         TEXT NOT NULL,\n\t\trole         TEXT NOT NULL,\n\t\tprincipal    TEXT NOT NULL,\n\t\tpropagate    BOOLEAN NOT NULL DEFAULT 1,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS sessions (\n\t\tid            TEXT PRIMARY KEY,\n\t\tusername      TEXT NOT NULL,\n\t\trealm         TEXT NOT NULL,\n\t\tip            TEXT,\n\t\tuser_agent    TEXT,\n\t\tcreated_at    TEXT NOT NULL,\n\t\tlast_used_at  TEXT NOT NULL,\n\t\texpires_at    TEXT NOT NULL,\n\t\trevoked_at    TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS user_2fa (\n\t\tusername      TEXT NOT NULL,\n\t\tmethod        TEXT NOT NULL,        -- totp | webauthn\n\t\tsecret        TEXT NOT NULL,\n\t\tlabel         TEXT,                 -- user-supplied label (e.g. \"phone\"); normalized to '' on write, never NULL\n\t\tenrolled_at   TEXT NOT NULL,\n\t\tlast_used_at  TEXT,\n\t\tupdated_at    TEXT NOT NULL,\n\t\tlast_step     INTEGER NOT NULL DEFAULT 0, -- highest consumed TOTP time-step (replay guard)\n\t\tdeleted_at    TEXT,                 -- soft-delete tombstone (sensitive anti-entropy lane)\n\t\tepoch         TEXT NOT NULL DEFAULT '', -- active-factor-set this row belongs to; valid only if == user_2fa_sets.active_epoch\n\t\tPRIMARY KEY (username, method, label)\n\t)",
+    "CREATE TABLE IF NOT EXISTS user_2fa_sets (\n\t\tusername     TEXT PRIMARY KEY,\n\t\tactive_epoch TEXT NOT NULL,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS recovery_codes (\n\t\tusername   TEXT NOT NULL,\n\t\tcode_hash  TEXT NOT NULL,           -- bcrypt of code\n\t\tused_at    TEXT,\n\t\tcreated_at TEXT NOT NULL,\n\t\tset_id     TEXT NOT NULL DEFAULT '', -- enrollment set; valid only if == active_set_id\n\t\tupdated_at TEXT NOT NULL DEFAULT '', -- LWW key for the sensitive anti-entropy lane\n\t\tdeleted_at TEXT,                      -- soft-delete tombstone\n\t\tPRIMARY KEY (username, code_hash)\n\t)",
+    "CREATE TABLE IF NOT EXISTS recovery_code_sets (\n\t\tusername      TEXT PRIMARY KEY,\n\t\tactive_set_id TEXT NOT NULL,\n\t\tupdated_at    TEXT NOT NULL,\n\t\tdeleted_at    TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS dns_records (\n\t\tname         TEXT PRIMARY KEY,\n\t\ttype         TEXT NOT NULL DEFAULT 'A',\n\t\tvalue        TEXT NOT NULL,\n\t\tsource       TEXT NOT NULL DEFAULT 'auto',\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS fencing_log (\n\t\tid           TEXT PRIMARY KEY,\n\t\thost_name    TEXT NOT NULL,\n\t\tmethod       TEXT NOT NULL,\n\t\tresult       TEXT NOT NULL,\n\t\ttimestamp    TEXT NOT NULL,\n\t\tdetail       TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS local_term_bindings (\n\t\texecutor    TEXT NOT NULL,\n\t\tlease_key   TEXT NOT NULL,\n\t\tlease_term  INTEGER NOT NULL,\n\t\tcoordinator TEXT NOT NULL,\n\t\tbound_at    TEXT NOT NULL,\n\t\tPRIMARY KEY (executor, lease_key, lease_term)\n\t)",
+    "CREATE TABLE IF NOT EXISTS audit_log (\n\t\tid           TEXT PRIMARY KEY,\n\t\ttimestamp    TEXT NOT NULL,\n\t\tusername     TEXT,\n\t\thost_name    TEXT,\n\t\taction       TEXT NOT NULL,\n\t\ttarget       TEXT NOT NULL,\n\t\tdetail       TEXT,\n\t\tresult       TEXT NOT NULL,\n\t\t-- tamper-evidence: each row's content_hash =\n\t\t-- SHA-256(prev_hash || canonical(this row)). Operators\n\t\t-- detect tampering by replaying the chain via the\n\t\t-- VerifyAuditLog RPC. Both columns are nullable for\n\t\t-- pre-3.4 rows; the verifier treats absent values as a\n\t\t-- chain reset point.\n\t\tprev_hash    TEXT,\n\t\tcontent_hash TEXT,\n\t\t-- v45 tamper-evidence: content_hash alone is an UNKEYED digest, so\n\t\t-- anyone able to write the table can edit a row and recompute the\n\t\t-- chain. key_id/signature bind the row to the private key of the host\n\t\t-- that authored it; seq is that host's position counter, signed\n\t\t-- alongside, so rows cannot be renumbered or silently dropped.\n\t\t-- Nullable/zero for rows written before v45: those are chain-verified\n\t\t-- but NOT tamper-evident, and the verifier reports them as such.\n\t\tkey_id       TEXT,\n\t\tsignature    TEXT,\n\t\tseq          INTEGER NOT NULL DEFAULT 0\n\t)",
+    "CREATE TABLE IF NOT EXISTS audit_signing_keys (\n\t\tkey_id     TEXT PRIMARY KEY,\n\t\thost_name  TEXT NOT NULL,\n\t\tcert_pem   TEXT NOT NULL,\n\t\tcreated_at TEXT NOT NULL,\n\t\tupdated_at TEXT NOT NULL,\n\t\tdeleted_at TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS audit_chain_heads (\n\t\thost_name  TEXT NOT NULL,\n\t\tepoch      INTEGER NOT NULL DEFAULT 0,\n\t\tseq        INTEGER NOT NULL DEFAULT 0,\n\t\thead_hash  TEXT NOT NULL DEFAULT '',\n\t\tkey_id     TEXT NOT NULL DEFAULT '',\n\t\tsignature  TEXT NOT NULL DEFAULT '',\n\t\tcreated_at TEXT NOT NULL,\n\t\tupdated_at TEXT NOT NULL,\n\t\tdeleted_at TEXT,\n\t\tPRIMARY KEY (host_name, epoch, seq)\n\t)",
+    "CREATE TABLE IF NOT EXISTS audit_key_lifecycle (\n\t\thost_name  TEXT NOT NULL,\n\t\tkey_id     TEXT NOT NULL,\n\t\t-- 'adopted' or 'retired'. A key's signing contract runs between them.\n\t\t--\n\t\t-- Adoption is signed for the same reason retirement is, and it answers a\n\t\t-- question the certificate alone cannot: WHEN the host committed. Without\n\t\t-- it, publishing a certificate retroactively puts every row the host ever\n\t\t-- wrote under the contract, so the first verify after enabling signing\n\t\t-- reports a cluster's entire history as tampering.\n\t\tevent      TEXT NOT NULL,\n\t\t-- For 'adopted', the sequence the chain had reached when the key took\n\t\t-- effect: rows at or below it predate the commitment. For 'retired', the\n\t\t-- last sequence the key was entitled to sign; a row from it above this is\n\t\t-- a finding.\n\t\tat_seq     INTEGER NOT NULL DEFAULT 0,\n\t\t-- Who asserted it. The signature is checked against this key's published\n\t\t-- certificate, which must chain to the cluster CA and name the host.\n\t\tby_key_id  TEXT NOT NULL DEFAULT '',\n\t\tsignature  TEXT NOT NULL DEFAULT '',\n\t\tcreated_at TEXT NOT NULL,\n\t\tupdated_at TEXT NOT NULL,\n\t\tdeleted_at TEXT,\n\t\t-- by_key_id is IN the primary key, and that is what makes the slot\n\t\t-- unsquattable. With (host, key, event) alone the table was first-write-\n\t\t-- wins on data any peer can write: an attacker inserting an unverifiable\n\t\t-- 'adopted' row got it ignored by the reader AND blocked the host from\n\t\t-- ever recording its real one, so every pre-enforcement row that host\n\t\t-- wrote became evidence, permanently. Keying by the signer puts a forged\n\t\t-- row in a different slot from the genuine one; squatting would require\n\t\t-- forging under the host's own key.\n\t\t--\n\t\t-- Several VERIFIED records per (host, key, event) are expected and\n\t\t-- correct: a rotation and an operator retire-audit-key run both retire\n\t\t-- the same key with different signers. The reader keeps the strictest.\n\t\tPRIMARY KEY (host_name, key_id, event, by_key_id)\n\t)",
+    "CREATE TABLE IF NOT EXISTS vm_events (\n\t\tid         TEXT PRIMARY KEY,\n\t\tvm_name    TEXT NOT NULL,\n\t\thost_name  TEXT,\n\t\ttype       TEXT NOT NULL,                 -- e.g. \"backup.started\" / \"backup.failed\" / \"vm.started\"\n\t\tresult     TEXT NOT NULL DEFAULT 'ok',    -- \"ok\" | \"error\"\n\t\tseverity   TEXT NOT NULL DEFAULT 'info',  -- \"info\" | \"warn\" | \"error\"\n\t\tdetail     TEXT,\n\t\tusername   TEXT,\n\t\tts         TEXT NOT NULL                  -- RFC3339Nano UTC (stable ordering, like audit_log.timestamp)\n\t)",
+    "CREATE TABLE IF NOT EXISTS vm_backups (\n\t\tvm_name     TEXT NOT NULL,\n\t\tdisk_name   TEXT NOT NULL,\n\t\trepo        TEXT NOT NULL,\n\t\ttotal_bytes INTEGER NOT NULL DEFAULT 0,\n\t\tupdated_at  TEXT NOT NULL,\n\t\tPRIMARY KEY (vm_name, disk_name, repo)\n\t)",
+    "CREATE TABLE IF NOT EXISTS container_backups (\n\t\tct_name     TEXT NOT NULL,\n\t\trepo        TEXT NOT NULL,\n\t\ttotal_bytes INTEGER NOT NULL DEFAULT 0,\n\t\tupdated_at  TEXT NOT NULL,\n\t\tPRIMARY KEY (ct_name, repo)\n\t)",
+    "CREATE TABLE IF NOT EXISTS container_snapshots (\n\t\tid          TEXT PRIMARY KEY,\n\t\tct_name     TEXT NOT NULL,\n\t\thost_name   TEXT NOT NULL,\n\t\tname        TEXT NOT NULL,\n\t\tstate       TEXT NOT NULL,\n\t\tsize_bytes  INTEGER NOT NULL DEFAULT 0,\n\t\ttype        TEXT NOT NULL DEFAULT 'tar',\n\t\tpath        TEXT,\n\t\tcreated_at  TEXT NOT NULL,\n\t\tupdated_at  TEXT NOT NULL,\n\t\tdeleted_at  TEXT,\n\t\tUNIQUE(host_name, ct_name, name)\n\t)",
+    "CREATE TABLE IF NOT EXISTS network_vteps (\n\t\tnetwork_name  TEXT NOT NULL,\n\t\thost_name     TEXT NOT NULL,\n\t\tvtep_ip       TEXT NOT NULL,\n\t\tvni           INTEGER NOT NULL,\n\t\tupdated_at    TEXT NOT NULL,\n\t\tdeleted_at    TEXT,\n\t\tPRIMARY KEY (network_name, host_name)\n\t)",
+    "CREATE TABLE IF NOT EXISTS bgp_peers (\n\t\thost_name   TEXT PRIMARY KEY,\n\t\tasn         INTEGER NOT NULL,\n\t\tvtep_ip     TEXT NOT NULL,\n\t\trouter_id   TEXT NOT NULL,\n\t\tupdated_at  TEXT NOT NULL,\n\t\tdeleted_at  TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS ip_allocations (\n\t\tnetwork      TEXT NOT NULL,\n\t\tip           TEXT NOT NULL,\n\t\tmac          TEXT NOT NULL,\n\t\tvm_name      TEXT NOT NULL,        -- the owner NAME (legacy column name); see owner_kind\n\t\towner_kind   TEXT NOT NULL DEFAULT 'vm',  -- 'vm' | 'ct' (v36)\n\t\towner_host   TEXT NOT NULL DEFAULT '',    -- '' for VMs (cluster-global names); host for CTs (v36)\n\t\tallocated_at TEXT NOT NULL,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT,\n\t\t-- The two NetBox join keys stay LAST, where their ALTERs append them.\n\t\t-- The v1 state digest hashes SELECT * POSITIONALLY (digestTableRows ->\n\t\t-- encodeRowCells), so a fresh node that CREATEs them mid-table and an\n\t\t-- upgraded node that appends them after deleted_at produce different\n\t\t-- digests for identical rows \u2014 permanently. digestMismatches then\n\t\t-- reports ip_allocations as drifted on EVERY anti-entropy cycle, and\n\t\t-- each one pulls a full cluster-state dump, while genuine divergence on\n\t\t-- this table is masked because it is always already \"drifted\". Only\n\t\t-- enforcement.digest_v2 on BOTH peers avoids it, and it defaults false.\n\t\tnetbox_ip_id      INTEGER,  -- NetBox join key: the IP object this lease claimed (v51)\n\t\tnetbox_prefix_id  INTEGER,  -- NetBox join key: the prefix this lease's network is bound to (v51)\n\t\tPRIMARY KEY (network, ip)\n\t)",
+    "CREATE TABLE IF NOT EXISTS vm_restarts (\n\t\tvm_name       TEXT PRIMARY KEY,\n\t\tattempt_count INTEGER DEFAULT 0,\n\t\twindow_start  TEXT NOT NULL,\n\t\tlast_restart  TEXT,\n\t\tupdated_at    TEXT NOT NULL\n\t)",
+    "CREATE TABLE IF NOT EXISTS security_groups (\n\t\tid          TEXT PRIMARY KEY,\n\t\tname        TEXT NOT NULL,\n\t\tstack_name  TEXT,\n\t\tcreated_at  TEXT NOT NULL,\n\t\tupdated_at  TEXT NOT NULL,\n\t\tdeleted_at  TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS idempotency_keys (\n\t\tkey          TEXT PRIMARY KEY,\n\t\tclaim_id     TEXT NOT NULL DEFAULT '',\n\t\tmethod       TEXT NOT NULL,\n\t\trequest_hash TEXT NOT NULL,\n\t\tresponse     TEXT NOT NULL DEFAULT '',\n\t\tstatus       TEXT NOT NULL DEFAULT 'completed',\n\t\tcreated_at   TEXT NOT NULL,\n\t\tupdated_at   TEXT NOT NULL,\n\t\texpires_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS host_fw_intent (\n\t\thost_name       TEXT NOT NULL,\n\t\tscope_key       TEXT NOT NULL,\n\t\tbridge          TEXT NOT NULL,\n\t\tmasquerade_subnet TEXT NOT NULL DEFAULT '',\n\t\tisolate         INTEGER NOT NULL DEFAULT 0,\n\t\texceptions      TEXT NOT NULL DEFAULT '',\n\t\tsnat_subnet     TEXT NOT NULL DEFAULT '',\n\t\tsnat_vip        TEXT NOT NULL DEFAULT '',\n\t\tsnat_out_iface  TEXT NOT NULL DEFAULT '',\n\t\tupdated_at      TEXT NOT NULL,\n\t\tPRIMARY KEY (host_name, scope_key)\n\t)",
+    "CREATE TABLE IF NOT EXISTS host_networks (\n\t\thost_name    TEXT NOT NULL,\n\t\tname         TEXT NOT NULL,\n\t\tkind         TEXT NOT NULL,\n\t\tmembers      TEXT NOT NULL DEFAULT '',\n\t\tvlan_id      INTEGER NOT NULL DEFAULT 0,\n\t\tvlan_link    TEXT NOT NULL DEFAULT '',\n\t\taddressing   TEXT NOT NULL DEFAULT '',\n\t\tmtu          INTEGER NOT NULL DEFAULT 0,\n\t\tbond_mode    TEXT NOT NULL DEFAULT '',\n\t\tlacp_rate    TEXT NOT NULL DEFAULT '',\n\t\thash_policy  TEXT NOT NULL DEFAULT '',\n\t\tstate        TEXT NOT NULL DEFAULT 'desired',\n\t\tgeneration   INTEGER NOT NULL DEFAULT 0,\n\t\tlast_error   TEXT NOT NULL DEFAULT '',\n\t\tcreated_at   TEXT NOT NULL,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT,\n\t\tPRIMARY KEY (host_name, name)\n\t)",
+    "CREATE TABLE IF NOT EXISTS containers (\n\t\thost_name      TEXT NOT NULL,\n\t\tname           TEXT NOT NULL,\n\t\tstate          TEXT NOT NULL DEFAULT 'stopped',\n\t\timage          TEXT,\n\t\tcpu_limit      INTEGER NOT NULL DEFAULT 0,\n\t\tmemory_mib     INTEGER NOT NULL DEFAULT 0,\n\t\tlabels         TEXT,                  -- JSON {key:value}\n\t\trestart_policy TEXT,                  -- JSON {condition,delay,max_attempts,window}; '' = none (v24)\n\t\tstate_detail   TEXT,                  -- stop cause / intent, e.g. 'operator-stop' (v24)\n\t\tproject        TEXT NOT NULL DEFAULT '_default', -- tenancy bucket, mirrors vms.project (v25)\n\t\tis_template     INTEGER NOT NULL DEFAULT 0,       -- clone-source template, mirrors vms.is_template (v28)\n\t\ton_host_failure TEXT,                             -- host-loss policy: ''/'none' | 'image-recreate' (v28); v34 prefers restore-from-backup, then image-recreate\n\t\tcreate_spec     TEXT,                             -- JSON create-time intent (template/distro/release/arch/networks) for faithful relocation/restore (v34)\n\t\trelocate_token  TEXT,                             -- attempt token a restore-relocation stamps so the coordinator can prove a target row is ITS restore (v34)\n\t\tcreated_at     TEXT NOT NULL,\n\t\tupdated_at     TEXT NOT NULL,\n\t\tdeleted_at     TEXT,\n\t\towner_epoch        INTEGER NOT NULL DEFAULT 0,     -- ownership incarnation for ABA-proof recovery (v44)\n\t\tspec_generation    INTEGER NOT NULL DEFAULT 0,     -- monotonic desired-spec generation (v44)\n\t\tactive_operation_id TEXT NOT NULL DEFAULT '',      -- workload-wide mutation barrier (v44)\n\t\tPRIMARY KEY (host_name, name)\n\t)",
+    "CREATE TABLE IF NOT EXISTS container_restarts (\n\t\thost_name     TEXT NOT NULL,\n\t\tname          TEXT NOT NULL,\n\t\tattempt_count INTEGER DEFAULT 0,\n\t\twindow_start  TEXT NOT NULL,\n\t\tlast_restart  TEXT,\n\t\tupdated_at    TEXT NOT NULL,\n\t\tPRIMARY KEY (host_name, name)\n\t)",
+    "CREATE TABLE IF NOT EXISTS sg_rules (\n\t\tid          TEXT PRIMARY KEY,\n\t\tsg_id       TEXT NOT NULL,\n\t\tdirection   TEXT NOT NULL,\n\t\tproto       TEXT NOT NULL DEFAULT 'all',\n\t\tport_range  TEXT,\n\t\tcidr        TEXT,\n\t\taction      TEXT NOT NULL DEFAULT 'accept',\n\t\tpriority    INTEGER NOT NULL DEFAULT 100,\n\t\tcreated_at  TEXT NOT NULL,\n\t\tupdated_at  TEXT NOT NULL,\n\t\tdeleted_at  TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS ip_sets (\n\t\tid          TEXT PRIMARY KEY,\n\t\tname        TEXT NOT NULL,\n\t\tcidrs       TEXT NOT NULL DEFAULT '[]', -- JSON []string of CIDRs\n\t\tstack_name  TEXT,\n\t\tcreated_at  TEXT NOT NULL,\n\t\tupdated_at  TEXT NOT NULL,\n\t\tdeleted_at  TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS cluster_firewall_rules (\n\t\tid          TEXT PRIMARY KEY,\n\t\tdirection   TEXT NOT NULL,\n\t\tproto       TEXT NOT NULL DEFAULT 'all',\n\t\tport_range  TEXT,\n\t\tcidr        TEXT,\n\t\taction      TEXT NOT NULL DEFAULT 'accept',\n\t\tpriority    INTEGER NOT NULL DEFAULT 100,\n\t\tcomment     TEXT,\n\t\tstack_name  TEXT,\n\t\tcreated_at  TEXT NOT NULL,\n\t\tupdated_at  TEXT NOT NULL,\n\t\tdeleted_at  TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS host_firewall_rules (\n\t\tid          TEXT PRIMARY KEY,\n\t\thost_name   TEXT NOT NULL,\n\t\tdirection   TEXT NOT NULL,\n\t\tproto       TEXT NOT NULL DEFAULT 'all',\n\t\tport_range  TEXT,\n\t\tcidr        TEXT,\n\t\taction      TEXT NOT NULL DEFAULT 'accept',\n\t\tpriority    INTEGER NOT NULL DEFAULT 100,\n\t\tcomment     TEXT,\n\t\tstack_name  TEXT,\n\t\tcreated_at  TEXT NOT NULL,\n\t\tupdated_at  TEXT NOT NULL,\n\t\tdeleted_at  TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS firewall_defaults (\n\t\tscope        TEXT PRIMARY KEY,          -- 'cluster' | <host name>\n\t\tdefault_deny INTEGER NOT NULL DEFAULT 0,\n\t\tstack_name   TEXT,\n\t\tcreated_at   TEXT NOT NULL,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS storage_pools (\n\t\thost_name    TEXT NOT NULL,\n\t\tname         TEXT NOT NULL,\n\t\tdriver       TEXT NOT NULL DEFAULT 'local',\n\t\tsource       TEXT,\n\t\ttarget       TEXT,\n\t\ttotal_bytes  INTEGER DEFAULT 0,\n\t\tused_bytes   INTEGER DEFAULT 0,\n\t\tstate        TEXT NOT NULL DEFAULT 'active',\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT,\n\t\tPRIMARY KEY (host_name, name)\n\t)",
+    "CREATE TABLE IF NOT EXISTS backup_repos (\n\t\tname        TEXT PRIMARY KEY,\n\t\tpath        TEXT NOT NULL,\n\t\tstack_name  TEXT,\n\t\tcreated_at  TEXT NOT NULL,\n\t\tupdated_at  TEXT NOT NULL,\n\t\tdeleted_at  TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS replication_checkpoints (\n\t\tvm_name    TEXT NOT NULL,\n\t\trepo       TEXT NOT NULL,\n\t\tcheckpoint TEXT NOT NULL,\n\t\tupdated_at TEXT NOT NULL,\n\t\tdeleted_at TEXT,\n\t\tPRIMARY KEY (vm_name, repo)\n\t)",
+    "CREATE TABLE IF NOT EXISTS mutation_log (\n\t\tseq        INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\thlc        TEXT NOT NULL,\n\t\torigin     TEXT NOT NULL,\n\t\tstmts      TEXT NOT NULL,\n\t\tcreated_at TEXT NOT NULL\n\t)",
+    "CREATE TABLE IF NOT EXISTS replication_watermarks (\n\t\tpeer_name  TEXT PRIMARY KEY,\n\t\tlast_seq   INTEGER NOT NULL DEFAULT 0,\n\t\tupdated_at TEXT NOT NULL\n\t)",
+    "CREATE TABLE IF NOT EXISTS mutation_seen (\n\t\torigin TEXT NOT NULL,\n\t\thlc    TEXT NOT NULL,\n\t\tPRIMARY KEY (origin, hlc)\n\t) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS service_endpoints (\n\t\tservice_name TEXT NOT NULL,\n\t\tip           TEXT NOT NULL,\n\t\tregion       TEXT NOT NULL DEFAULT 'default',\n\t\tweight       INTEGER NOT NULL DEFAULT 1,\n\t\tcreated_at   TEXT NOT NULL,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT,\n\t\tPRIMARY KEY (service_name, ip)\n\t)",
+    "CREATE TABLE IF NOT EXISTS projects (\n\t\tname        TEXT PRIMARY KEY,        -- canonical path, e.g. \"/acme/team-foo\"\n\t\tdisplay     TEXT,                    -- human-readable label\n\t\tparent_name TEXT,                    -- parent project's name; NULL for root\n\t\tcreated_at  TEXT NOT NULL,\n\t\tupdated_at  TEXT NOT NULL,\n\t\tdeleted_at  TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS project_quotas (\n\t\tproject_name      TEXT PRIMARY KEY,\n\t\tvcpu_limit        INTEGER NOT NULL DEFAULT 0,\n\t\tmem_mib_limit     INTEGER NOT NULL DEFAULT 0,\n\t\tdisk_gib_limit    INTEGER NOT NULL DEFAULT 0,\n\t\tnic_limit         INTEGER NOT NULL DEFAULT 0,\n\t\tpublic_ip_limit   INTEGER NOT NULL DEFAULT 0,\n\t\tbackup_gib_limit  INTEGER NOT NULL DEFAULT 0,\n\t\tupdated_at        TEXT NOT NULL\n\t)",
+    "CREATE TABLE IF NOT EXISTS backup_schedules (\n\t\tvm_name      TEXT NOT NULL,\n\t\trepo         TEXT NOT NULL,                    -- logical repo name resolved via daemon config.backup_repos\n\t\tcron         TEXT NOT NULL,                    -- 5-field cron, e.g. \"0 2 * * *\"\n\t\tkeep_last    INTEGER NOT NULL DEFAULT 0,\n\t\tkeep_daily   INTEGER NOT NULL DEFAULT 0,\n\t\tkeep_weekly  INTEGER NOT NULL DEFAULT 0,\n\t\tkeep_monthly INTEGER NOT NULL DEFAULT 0,\n\t\tkeep_yearly  INTEGER NOT NULL DEFAULT 0,\n\t\tenabled      BOOLEAN NOT NULL DEFAULT 1,\n\t\tlast_run_at  TEXT,\n\t\tlast_run_err TEXT,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT,\n\t\tpool_name    TEXT,                            -- set when scope = \"pool\"\n\t\tscope        TEXT NOT NULL DEFAULT 'vm',      -- vm | pool | cluster | project\n\t\tproject_name TEXT,                            -- set when scope = \"project\"\n\t\tPRIMARY KEY (vm_name, repo)\n\t)",
+    "CREATE TABLE IF NOT EXISTS registry_credentials (\n\t\tid          TEXT PRIMARY KEY,\n\t\tscope       TEXT NOT NULL DEFAULT 'user',     -- 'user' | 'global'\n\t\towner       TEXT NOT NULL DEFAULT '',         -- username for scope='user'; '' for global\n\t\tregistry    TEXT NOT NULL,                    -- normalized host: docker.io | ghcr.io | registry:5000\n\t\tusername    TEXT NOT NULL,\n\t\tsecret      TEXT NOT NULL,                    -- registry password/token (plaintext \u2014 see v23 note)\n\t\tcreated_at  TEXT NOT NULL,\n\t\tupdated_at  TEXT NOT NULL,\n\t\tdeleted_at  TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS health_conditions (\n\t\tevaluator     TEXT NOT NULL,               -- producing evaluator: dual_run | connectivity | owner_epoch | capacity | \u2026\n\t\tcode          TEXT NOT NULL,               -- condition code, e.g. vm_dual_run, runtime_owner_mismatch\n\t\tsubject_kind  TEXT NOT NULL,               -- vm | container | vip | host | cluster\n\t\tsubject_id    TEXT NOT NULL,\n\t\tlifecycle     TEXT NOT NULL DEFAULT 'observed',  -- observed | confirmed | resolved\n\t\tseverity      TEXT NOT NULL DEFAULT 'warning',   -- info | warning | critical\n\t\thosts         TEXT NOT NULL DEFAULT '',    -- JSON array of involved host names\n\t\tevidence      TEXT NOT NULL DEFAULT '',    -- canonical structured evidence (JSON)\n\t\tobserve_count INTEGER NOT NULL DEFAULT 0,  -- consecutive positive scans\n\t\tclean_count   INTEGER NOT NULL DEFAULT 0,  -- consecutive complete clean scans\n\t\tfirst_seen    TEXT NOT NULL DEFAULT '',\n\t\tlast_seen     TEXT NOT NULL DEFAULT '',\n\t\tconfirmed_at  TEXT,\n\t\tresolved_at   TEXT,\n\t\treporter      TEXT NOT NULL DEFAULT '',    -- host that wrote the latest transition\n\t\tcreated_at    TEXT NOT NULL,\n\t\tupdated_at    TEXT NOT NULL,\n\t\tdeleted_at    TEXT,\n\t\tPRIMARY KEY (evaluator, code, subject_kind, subject_id)\n\t)",
+    "CREATE TABLE IF NOT EXISTS health_evaluator_status (\n\t\tevaluator     TEXT NOT NULL,\n\t\tlast_scan     TEXT NOT NULL DEFAULT '',    -- RFC3339 of the latest completed scan\n\t\tcoverage      TEXT NOT NULL DEFAULT '',    -- complete | partial | unreachable | unsupported\n\t\treporter      TEXT NOT NULL DEFAULT '',    -- host that ran the scan\n\t\tdetail        TEXT NOT NULL DEFAULT '',    -- human-readable coverage detail (which peers missed, why)\n\t\tcreated_at    TEXT NOT NULL,\n\t\tupdated_at    TEXT NOT NULL,\n\t\tdeleted_at    TEXT,\n\t\tPRIMARY KEY (evaluator)\n\t)",
+    "CREATE TABLE IF NOT EXISTS host_capacity_observations (\n\t\thost_name          TEXT NOT NULL,\n\t\tdb_cpu             INTEGER NOT NULL DEFAULT 0,  -- database-allocated vCPU\n\t\tdb_mem_mib         INTEGER NOT NULL DEFAULT 0,\n\t\textra_cpu          INTEGER NOT NULL DEFAULT 0,  -- runtime-only workloads' vCPU on top\n\t\textra_mem_mib      INTEGER NOT NULL DEFAULT 0,\n\t\teffective_cpu      INTEGER NOT NULL DEFAULT 0,  -- union accounting (see table doc)\n\t\teffective_mem_mib  INTEGER NOT NULL DEFAULT 0,\n\t\tcomplete           INTEGER NOT NULL DEFAULT 0,  -- 1 = every runtime workload accounted\n\t\tdetail             TEXT NOT NULL DEFAULT '',    -- why incomplete / notable contributors\n\t\tsampled_at         TEXT NOT NULL DEFAULT '',    -- RFC3339 of the local inventory scan\n\t\tcreated_at         TEXT NOT NULL,\n\t\tupdated_at         TEXT NOT NULL,\n\t\tdeleted_at         TEXT,\n\t\tPRIMARY KEY (host_name)\n\t)",
+    "CREATE TABLE IF NOT EXISTS netbox_bindings (\n\t\tprefix_id           INTEGER PRIMARY KEY,\n\t\tnetwork             TEXT NOT NULL,\n\t\tobserved_cidr       TEXT NOT NULL,\n\t\tvrf_id              INTEGER NOT NULL,\n\t\tcluster_fingerprint TEXT NOT NULL,\n\t\tsuspended           INTEGER NOT NULL DEFAULT 0,\n\t\tsuspend_reason      TEXT NOT NULL DEFAULT '',\n\t\tvalidated_at        TEXT NOT NULL,\n\t\tcreated_at          TEXT NOT NULL,\n\t\tupdated_at          TEXT NOT NULL,\n\t\tdeleted_at          TEXT,\n\t\t-- The NetBox virtualization.cluster name the FIRST bind resolved, pinned\n\t\t-- so a node whose netbox.cluster_name resolves to something else can\n\t\t-- discover the disagreement and refuse to mirror. It has to be uniform\n\t\t-- cluster-wide and, unlike an enforcement.* flag, has no latch to make it\n\t\t-- so: a capability token cannot express a string. Defaulted rather than\n\t\t-- NOT NULL-without-default so an older peer's writes still land.\n\t\t--\n\t\t-- LAST, where its heal ALTER appends it. That ALTER exists precisely to\n\t\t-- run on a real database \u2014 one created by an earlier v51 build, whose\n\t\t-- table already exists so CREATE TABLE IF NOT EXISTS is a no-op \u2014 and\n\t\t-- refusePrereleaseTrustDatabase does not refuse such a database, so it\n\t\t-- boots and gets the column appended after deleted_at. netbox_bindings is\n\t\t-- in sync.go's tableNames, so it is digested every anti-entropy tick, and\n\t\t-- the v1 digest hashes SELECT * positionally: declaring this column 6th\n\t\t-- while the ALTER appends it 12th made a freshly-created node and a healed\n\t\t-- one disagree forever on identical rows.\n\t\tnetbox_cluster      TEXT NOT NULL DEFAULT ''\n\t)",
+    "CREATE TABLE IF NOT EXISTS netbox_objects (\n\t\tlitevirt_kind TEXT NOT NULL,\n\t\tlitevirt_key  TEXT NOT NULL,\n\t\tnetbox_kind   TEXT NOT NULL,\n\t\tnetbox_id     INTEGER NOT NULL,\n\t\tsynced_at     TEXT NOT NULL,\n\t\tupdated_at    TEXT NOT NULL,\n\t\tdeleted_at    TEXT,\n\t\tPRIMARY KEY (litevirt_kind, litevirt_key)\n\t)",
+    "CREATE TABLE IF NOT EXISTS netbox_sync_queue (\n\t\tid         TEXT PRIMARY KEY,\n\t\tkind       TEXT NOT NULL,\n\t\tkey        TEXT NOT NULL,\n\t\top         TEXT NOT NULL,\n\t\tattempts   INTEGER NOT NULL DEFAULT 0,\n\t\tlast_error TEXT NOT NULL DEFAULT '',\n\t\tcreated_at TEXT NOT NULL,\n\t\tupdated_at TEXT NOT NULL,\n\t\tdeleted_at TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS netbox_host_config (\n\t\thost_name      TEXT PRIMARY KEY,\n\t\tnetbox_cluster TEXT NOT NULL DEFAULT '',\n\t\tcreated_at     TEXT NOT NULL,\n\t\tupdated_at     TEXT NOT NULL,\n\t\tdeleted_at     TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS host_fence_credentials (\n\t\thost_name  TEXT PRIMARY KEY,\n\t\tipmi_pass  TEXT NOT NULL DEFAULT '',\n\t\tupdated_at TEXT NOT NULL,\n\t\tdeleted_at TEXT,\n\t\tafter_retirement TEXT NOT NULL DEFAULT ''\n\t)",
+    "CREATE TABLE IF NOT EXISTS user_credentials (\n\t\tusername      TEXT PRIMARY KEY,\n\t\tpassword_hash TEXT NOT NULL DEFAULT '',\n\t\tupdated_at    TEXT NOT NULL,\n\t\tdeleted_at    TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS token_credentials (\n\t\ttoken_id   TEXT PRIMARY KEY,\n\t\ttoken_hash TEXT NOT NULL DEFAULT '',\n\t\tupdated_at TEXT NOT NULL,\n\t\tdeleted_at TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS host_membership (\n\t\thost_name        TEXT PRIMARY KEY,\n\t\tstate            TEXT NOT NULL DEFAULT 'active',\n\t\tisolation_epoch  INTEGER NOT NULL DEFAULT 0,\n\t\tisolation_reason TEXT NOT NULL DEFAULT '',\n\t\tupdated_at       TEXT NOT NULL,\n\t\tdeleted_at       TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS cluster_policies (\n\t\tkey        TEXT PRIMARY KEY,\n\t\tvalue      TEXT NOT NULL,\n\t\tset_by     TEXT NOT NULL DEFAULT '',\n\t\tupdated_at TEXT NOT NULL,\n\t\tdeleted_at TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS voter_configs (\n\t\tgeneration   INTEGER PRIMARY KEY,\n\t\tmembers_json TEXT NOT NULL,\n\t\tmembers_hash TEXT NOT NULL,\n\t\tchange       TEXT NOT NULL,\n\t\tcertificate  TEXT NOT NULL,\n\t\tcreated_by   TEXT NOT NULL,\n\t\tcreated_at   TEXT NOT NULL,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS local_automation_local_audits (\n id TEXT PRIMARY KEY, attempt TEXT NOT NULL, dependency TEXT NOT NULL,\n head BLOB NOT NULL, coverage TEXT NOT NULL, records INTEGER NOT NULL, origin BLOB NOT NULL\n )",
+    "CREATE TABLE IF NOT EXISTS local_automation_local_rows (\n local_id TEXT NOT NULL, section INTEGER NOT NULL, ordinal INTEGER NOT NULL,\n record BLOB NOT NULL, PRIMARY KEY(local_id,section,ordinal)\n )",
+    "CREATE TABLE IF NOT EXISTS local_automation_retained_deliveries (\n id TEXT PRIMARY KEY, attempt TEXT NOT NULL, envelope BLOB NOT NULL\n );",
+    "CREATE TABLE IF NOT EXISTS local_automation_retained_objects (\n delivery TEXT NOT NULL, ordinal INTEGER NOT NULL CHECK(ordinal > 0),\n namespace TEXT NOT NULL UNIQUE, descriptor BLOB NOT NULL,\n PRIMARY KEY(delivery,ordinal)\n );",
+    "CREATE TABLE IF NOT EXISTS local_automation_retained_completions (\n delivery TEXT PRIMARY KEY, evidence_digest TEXT NOT NULL,\n candidate_ref BLOB NOT NULL, coverage_digest TEXT NOT NULL\n );",
+    "CREATE TABLE IF NOT EXISTS local_automation_aggregates (\n id TEXT PRIMARY KEY, attempt TEXT NOT NULL, local_id TEXT NOT NULL,\n head BLOB NOT NULL, coverage TEXT NOT NULL, roster BLOB NOT NULL\n )",
+    "CREATE TABLE IF NOT EXISTS local_automation_aggregate_sources (\n bundle TEXT NOT NULL, source TEXT NOT NULL, incarnation TEXT NOT NULL,\n audit TEXT NOT NULL, publication TEXT NOT NULL, root TEXT NOT NULL, cut_id TEXT NOT NULL,\n PRIMARY KEY(bundle,source), UNIQUE(bundle,incarnation)\n )",
+    "CREATE TABLE IF NOT EXISTS local_automation_aggregate_copies (\n bundle TEXT NOT NULL, origin_kind TEXT NOT NULL, origin_id TEXT NOT NULL,\n component INTEGER NOT NULL, ordinal INTEGER NOT NULL, claim_key BLOB NOT NULL,\n promised_round INTEGER NOT NULL, promised_coord TEXT NOT NULL, promised_nonce BLOB NOT NULL,\n accepted_round INTEGER NOT NULL, accepted_coord TEXT NOT NULL, accepted_nonce BLOB NOT NULL,\n origin_ref BLOB NOT NULL, PRIMARY KEY(bundle,origin_kind,origin_id,component,ordinal)\n )",
+    "CREATE TABLE IF NOT EXISTS local_automation_aggregate_maxima (\n bundle TEXT NOT NULL, claim_key BLOB NOT NULL,\n promise_ref BLOB NOT NULL, accepted_ref BLOB NOT NULL, PRIMARY KEY(bundle,claim_key)\n )",
+    "CREATE TABLE IF NOT EXISTS local_automation_aggregate_conflicts (\n bundle TEXT NOT NULL, claim_key BLOB NOT NULL,\n round INTEGER NOT NULL, coord TEXT NOT NULL, nonce BLOB NOT NULL, first_ref BLOB NOT NULL,\n PRIMARY KEY(bundle,claim_key,round,coord,nonce)\n )",
+    "CREATE TABLE IF NOT EXISTS local_automation_receiver_audits (\n id TEXT PRIMARY KEY, attempt TEXT NOT NULL, source TEXT NOT NULL,\n publication TEXT NOT NULL, root TEXT NOT NULL, head BLOB NOT NULL,\n lineage TEXT NOT NULL, coverage TEXT NOT NULL, records INTEGER NOT NULL,\n payloads INTEGER NOT NULL, requests INTEGER NOT NULL, UNIQUE(attempt,source)\n )",
+    "CREATE TABLE IF NOT EXISTS local_automation_receiver_refs (\n audit TEXT NOT NULL, component INTEGER NOT NULL, ordinal INTEGER NOT NULL,\n sequence INTEGER NOT NULL, semantic_key BLOB NOT NULL,\n scope TEXT NOT NULL, request_id TEXT NOT NULL, operation_id TEXT NOT NULL,\n claim_key BLOB NOT NULL, generation INTEGER NOT NULL,\n accepted_round INTEGER NOT NULL, accepted_coord TEXT NOT NULL, accepted_nonce BLOB NOT NULL,\n PRIMARY KEY(audit,component,ordinal), UNIQUE(audit,component,semantic_key)\n )",
+    "CREATE UNIQUE INDEX IF NOT EXISTS automation_receiver_ref_sequence ON local_automation_receiver_refs(audit,component,sequence)\n WHERE component IN (5,6,8,9,10,11)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS automation_receiver_ref_request ON local_automation_receiver_refs(audit,scope,request_id) WHERE component=7",
+    "CREATE UNIQUE INDEX IF NOT EXISTS automation_receiver_ref_operation ON local_automation_receiver_refs(audit,operation_id) WHERE component=7 AND operation_id<>''",
+    "CREATE INDEX IF NOT EXISTS automation_receiver_ref_claim ON local_automation_receiver_refs(audit,claim_key,accepted_round,accepted_coord,accepted_nonce,component,ordinal)",
+    "CREATE TABLE IF NOT EXISTS local_automation_receiver_requests (\n audit TEXT NOT NULL, scope TEXT NOT NULL, request_id TEXT NOT NULL,\n identity BLOB NOT NULL, receipt BLOB NOT NULL, operation_id TEXT NOT NULL,\n origin INTEGER NOT NULL, PRIMARY KEY(audit,scope,request_id)\n )",
+    "CREATE UNIQUE INDEX IF NOT EXISTS automation_receiver_request_operation ON local_automation_receiver_requests(audit,operation_id) WHERE operation_id<>''",
+    "CREATE TABLE IF NOT EXISTS local_automation_receiver_jobs (\n id TEXT PRIMARY KEY, job TEXT NOT NULL, revision INTEGER NOT NULL,\n binding BLOB NOT NULL, evidence BLOB NOT NULL, UNIQUE(job,revision)\n )",
+    "CREATE TABLE IF NOT EXISTS local_automation_receiver_current (\n id INTEGER PRIMARY KEY CHECK(id=1), attempt TEXT NOT NULL,\n established_inventory BLOB NOT NULL DEFAULT x''\n )",
+    "CREATE TABLE IF NOT EXISTS local_automation_receiver_established (\n attempt TEXT NOT NULL, digest TEXT NOT NULL, artifact BLOB NOT NULL,\n PRIMARY KEY(attempt,digest)\n )",
+    "CREATE TABLE IF NOT EXISTS local_automation_receiver_validations (\n attempt TEXT NOT NULL, digest TEXT NOT NULL, evidence BLOB NOT NULL,\n PRIMARY KEY(attempt,digest)\n )",
+    "CREATE TABLE IF NOT EXISTS local_automation_receiver_sources (\n attempt TEXT NOT NULL, source TEXT NOT NULL, publication TEXT NOT NULL,\n authenticated INTEGER NOT NULL DEFAULT 0, metadata BLOB NOT NULL,\n PRIMARY KEY(attempt,source)\n )",
+    "CREATE TABLE IF NOT EXISTS local_automation_receiver_components (\n attempt TEXT NOT NULL, source TEXT NOT NULL, component INTEGER NOT NULL,\n state BLOB NOT NULL, cursor TEXT NOT NULL, terminal INTEGER NOT NULL,\n PRIMARY KEY(attempt,source,component)\n )",
+    "CREATE TABLE IF NOT EXISTS local_automation_receiver_records (\n attempt TEXT NOT NULL, source TEXT NOT NULL, component INTEGER NOT NULL,\n ordinal INTEGER NOT NULL, record BLOB NOT NULL,\n PRIMARY KEY(attempt,source,component,ordinal)\n )",
+    "CREATE TABLE IF NOT EXISTS local_automation_receiver_pages (\n attempt TEXT NOT NULL, source TEXT NOT NULL, component INTEGER NOT NULL,\n position INTEGER NOT NULL, request TEXT NOT NULL, digest TEXT NOT NULL, progress BLOB NOT NULL,\n PRIMARY KEY(attempt,source,component,position)\n )",
+    "CREATE TABLE IF NOT EXISTS local_automation_source_jobs (\n job TEXT NOT NULL, revision INTEGER NOT NULL, binding BLOB NOT NULL, publications INTEGER NOT NULL,\n PRIMARY KEY(job,revision)\n )",
+    "CREATE TABLE IF NOT EXISTS local_automation_publications (\n id TEXT PRIMARY KEY, job TEXT NOT NULL, revision INTEGER NOT NULL,\n artifact BLOB NOT NULL, evidence BLOB NOT NULL, membership BLOB NOT NULL, UNIQUE(job,revision,id)\n )",
+    "CREATE TABLE IF NOT EXISTS local_automation_cuts (\n\t\tid TEXT PRIMARY KEY, generation INTEGER NOT NULL, incarnation TEXT NOT NULL,\n\t\tmetadata BLOB NOT NULL, root TEXT NOT NULL, UNIQUE(generation,incarnation)\n\t)",
+    "CREATE TABLE IF NOT EXISTS local_automation_cut_records (\n\t\tcut_id TEXT NOT NULL, section INTEGER NOT NULL, ordinal INTEGER NOT NULL,\n\t\trecord BLOB NOT NULL, PRIMARY KEY(cut_id,section,ordinal)\n\t)",
+    "CREATE TABLE IF NOT EXISTS local_automation_credential_issuance (\n kind TEXT NOT NULL, credential_id TEXT NOT NULL, username TEXT NOT NULL,\n witness TEXT NOT NULL, principal_uid TEXT NOT NULL, cluster_uid TEXT NOT NULL,\n credential_digest TEXT NOT NULL, valid INTEGER NOT NULL DEFAULT 1 CHECK(valid IN (0,1)),\n PRIMARY KEY(kind,credential_id))",
+    "CREATE TRIGGER IF NOT EXISTS automation_issuance_tokens_insert\n AFTER INSERT ON tokens BEGIN\n UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='token' AND credential_id=NEW.id;\n END",
+    "CREATE TRIGGER IF NOT EXISTS automation_issuance_tokens_update\n AFTER UPDATE OF id,username,name,token_hash,expires_at,scope_paths,created_at,deleted_at ON tokens BEGIN\n UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='token' AND credential_id=OLD.id;\n END",
+    "CREATE TRIGGER IF NOT EXISTS automation_issuance_tokens_delete\n AFTER DELETE ON tokens BEGIN\n UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='token' AND credential_id=OLD.id;\n END",
+    "CREATE TRIGGER IF NOT EXISTS automation_issuance_token_credentials_insert\n AFTER INSERT ON token_credentials BEGIN\n UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='token' AND credential_id=NEW.token_id;\n END",
+    "CREATE TRIGGER IF NOT EXISTS automation_issuance_token_credentials_update\n AFTER UPDATE OF token_id,token_hash,deleted_at ON token_credentials BEGIN\n UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='token' AND credential_id=OLD.token_id;\n END",
+    "CREATE TRIGGER IF NOT EXISTS automation_issuance_token_credentials_delete\n AFTER DELETE ON token_credentials BEGIN\n UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='token' AND credential_id=OLD.token_id;\n END",
+    "CREATE TRIGGER IF NOT EXISTS automation_issuance_sessions_insert\n AFTER INSERT ON sessions BEGIN\n UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='session' AND credential_id=NEW.id;\n END",
+    "CREATE TRIGGER IF NOT EXISTS automation_issuance_sessions_update\n AFTER UPDATE OF id,username,realm,ip,user_agent,created_at,expires_at,revoked_at ON sessions BEGIN\n UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='session' AND credential_id=OLD.id;\n END",
+    "CREATE TRIGGER IF NOT EXISTS automation_issuance_sessions_delete\n AFTER DELETE ON sessions BEGIN\n UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='session' AND credential_id=OLD.id;\n END",
+    "CREATE TABLE IF NOT EXISTS local_automation_lifetimes (\n kind TEXT NOT NULL, name TEXT NOT NULL, witness TEXT NOT NULL,\n origin TEXT NOT NULL CHECK(origin IN ('birth','enrollment')),\n retired INTEGER NOT NULL DEFAULT 0 CHECK(retired IN (0,1)),\n valid INTEGER NOT NULL DEFAULT 1 CHECK(valid IN (0,1)),\n PRIMARY KEY(kind,name,witness))",
+    "CREATE UNIQUE INDEX IF NOT EXISTS automation_lifetime_current\n ON local_automation_lifetimes(kind,name) WHERE retired=0 AND valid=1",
+    "CREATE TRIGGER IF NOT EXISTS automation_lifetime_users_insert\n AFTER INSERT ON users BEGIN\n UPDATE local_automation_lifetimes SET valid=0 WHERE kind='principal' AND name=NEW.username;\n END",
+    "CREATE TRIGGER IF NOT EXISTS automation_lifetime_users_update\n AFTER UPDATE ON users BEGIN\n UPDATE local_automation_lifetimes SET valid=0 WHERE kind='principal' AND name=OLD.username;\n END",
+    "CREATE TRIGGER IF NOT EXISTS automation_lifetime_users_delete\n AFTER DELETE ON users BEGIN\n UPDATE local_automation_lifetimes SET valid=0 WHERE kind='principal' AND name=OLD.username;\n END",
+    "CREATE TRIGGER IF NOT EXISTS automation_lifetime_projects_insert\n AFTER INSERT ON projects BEGIN\n UPDATE local_automation_lifetimes SET valid=0 WHERE kind='project' AND name=NEW.name;\n END",
+    "CREATE TRIGGER IF NOT EXISTS automation_lifetime_projects_update\n AFTER UPDATE ON projects BEGIN\n UPDATE local_automation_lifetimes SET valid=0 WHERE kind='project' AND name=OLD.name;\n END",
+    "CREATE TRIGGER IF NOT EXISTS automation_lifetime_projects_delete\n AFTER DELETE ON projects BEGIN\n UPDATE local_automation_lifetimes SET valid=0 WHERE kind='project' AND name=OLD.name;\n END",
+    "CREATE TABLE IF NOT EXISTS local_automation_identities (\n        stage TEXT NOT NULL, uid TEXT NOT NULL, cluster_uid TEXT NOT NULL,\n        project_uid TEXT NOT NULL, kind TEXT NOT NULL, alias TEXT NOT NULL,\n        witness TEXT NOT NULL, generation INTEGER NOT NULL CHECK(generation>0),\n        retired INTEGER NOT NULL CHECK(retired IN (0,1)),\n        PRIMARY KEY(stage,uid))",
+    "CREATE TABLE IF NOT EXISTS local_automation_aliases (\n        stage TEXT NOT NULL, cluster_uid TEXT NOT NULL, project_scope TEXT NOT NULL,\n        kind TEXT NOT NULL, alias TEXT NOT NULL, uid TEXT NOT NULL,\n        generation INTEGER NOT NULL CHECK(generation>0),\n        PRIMARY KEY(stage,cluster_uid,project_scope,kind,alias))",
+    "CREATE TABLE IF NOT EXISTS local_automation_owners (\n        stage TEXT NOT NULL, cluster_uid TEXT NOT NULL, project_uid TEXT NOT NULL,\n        owner_id TEXT NOT NULL, founder_principal_uid TEXT NOT NULL,\n        session_id TEXT NOT NULL, session_principal_uid TEXT NOT NULL,\n        activation INTEGER NOT NULL CHECK(activation>=0),\n        PRIMARY KEY(stage,cluster_uid,project_uid,owner_id))",
+    "CREATE UNIQUE INDEX IF NOT EXISTS automation_owner_session ON local_automation_owners(stage,session_id) WHERE session_id<>''",
+    "CREATE TABLE IF NOT EXISTS local_automation_semantic_heads (\n        stage TEXT PRIMARY KEY, cluster_uid TEXT NOT NULL,\n        sequence INTEGER NOT NULL CHECK(sequence>=0), digest TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS local_automation_resources (\n  stage TEXT NOT NULL, uid TEXT NOT NULL, cluster_uid TEXT NOT NULL,\n  project_uid TEXT NOT NULL, name TEXT NOT NULL, domain_uuid TEXT NOT NULL,\n  incarnation TEXT NOT NULL, owner_id TEXT NOT NULL, management_key TEXT NOT NULL,\n  binding_generation INTEGER NOT NULL CHECK(binding_generation>=0),\n  revision TEXT NOT NULL CHECK(length(CAST(revision AS BLOB)) BETWEEN 1 AND 4096), retired INTEGER NOT NULL CHECK(retired IN (0,1)),\n  last_operation_id TEXT NOT NULL, original_operation_id TEXT NOT NULL,\n  applied_sequence INTEGER NOT NULL CHECK(applied_sequence>0), PRIMARY KEY(stage,uid))",
+    "CREATE UNIQUE INDEX IF NOT EXISTS automation_resource_live_name ON local_automation_resources(stage,cluster_uid,name) WHERE retired=0",
+    "CREATE TABLE IF NOT EXISTS local_automation_names (\n  stage TEXT NOT NULL, cluster_uid TEXT NOT NULL, name TEXT NOT NULL,\n  resource_uid TEXT NOT NULL, generation INTEGER NOT NULL CHECK(generation>0),\n  disposition TEXT NOT NULL CHECK(disposition IN ('reserved','live','reusable')),\n  retirement_operation_id TEXT NOT NULL, PRIMARY KEY(stage,cluster_uid,name))",
+    "CREATE TABLE IF NOT EXISTS local_automation_bindings (\n  stage TEXT NOT NULL, cluster_uid TEXT NOT NULL, project_uid TEXT NOT NULL,\n  owner_id TEXT NOT NULL, management_key TEXT NOT NULL,\n  creation_generation INTEGER NOT NULL CHECK(creation_generation>0),\n  resource_uid TEXT NOT NULL, operation_id TEXT NOT NULL,\n  revision TEXT NOT NULL CHECK(length(CAST(revision AS BLOB)) BETWEEN 1 AND 4096), retired INTEGER NOT NULL CHECK(retired IN (0,1)),\n  PRIMARY KEY(stage,cluster_uid,project_uid,owner_id,management_key,creation_generation))",
+    "CREATE UNIQUE INDEX IF NOT EXISTS automation_binding_active_uid ON local_automation_bindings(stage,resource_uid) WHERE retired=0",
+    "CREATE UNIQUE INDEX IF NOT EXISTS automation_binding_active_key ON local_automation_bindings(stage,cluster_uid,project_uid,owner_id,management_key) WHERE retired=0",
+    "CREATE TABLE IF NOT EXISTS local_automation_admissions (\n  stage TEXT NOT NULL, operation_id TEXT NOT NULL, cluster_uid TEXT NOT NULL,\n  project_uid TEXT NOT NULL, owner_id TEXT NOT NULL, management_key TEXT NOT NULL,\n  resource_uid TEXT NOT NULL, request_id TEXT NOT NULL, principal_uid TEXT NOT NULL,\n  method TEXT NOT NULL, payload_id TEXT NOT NULL,\n  binding_generation INTEGER NOT NULL CHECK(binding_generation>0),\n  admitted_generation INTEGER NOT NULL CHECK(admitted_generation>0),\n  sequence INTEGER NOT NULL CHECK(sequence>0), configuration_json TEXT NOT NULL,\n  PRIMARY KEY(stage,operation_id))",
+    "CREATE TABLE IF NOT EXISTS local_automation_key_epochs (\n stage TEXT NOT NULL, cluster_uid TEXT NOT NULL, recipient_epoch TEXT NOT NULL,\n membership_generation INTEGER NOT NULL CHECK(membership_generation>0), config_digest TEXT NOT NULL,\n equality_epoch TEXT NOT NULL, predecessor_activation_sequence INTEGER NOT NULL CHECK(predecessor_activation_sequence>=0),\n activation_sequence INTEGER NOT NULL CHECK(activation_sequence>predecessor_activation_sequence),\n PRIMARY KEY(stage,cluster_uid,recipient_epoch))",
+    "CREATE UNIQUE INDEX IF NOT EXISTS automation_key_activation ON local_automation_key_epochs(stage,cluster_uid,activation_sequence)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS automation_key_equality ON local_automation_key_epochs(stage,cluster_uid,equality_epoch)",
+    "CREATE TABLE IF NOT EXISTS local_automation_key_recipients (\n stage TEXT NOT NULL, cluster_uid TEXT NOT NULL, recipient_epoch TEXT NOT NULL,\n membership_generation INTEGER NOT NULL CHECK(membership_generation>0), config_digest TEXT NOT NULL,\n host TEXT NOT NULL, host_incarnation INTEGER NOT NULL CHECK(host_incarnation>0), admitted_at TEXT NOT NULL,\n admission_serial TEXT NOT NULL, voter_incarnation TEXT NOT NULL, key_id TEXT NOT NULL, recipient TEXT NOT NULL,\n enrollment_ref TEXT NOT NULL, recipient_ack_ref TEXT NOT NULL, equality_ack_ref TEXT NOT NULL,\n first_sequence INTEGER NOT NULL CHECK(first_sequence>0), PRIMARY KEY(stage,cluster_uid,recipient_epoch,host))",
+    "CREATE UNIQUE INDEX IF NOT EXISTS automation_key_id ON local_automation_key_recipients(stage,cluster_uid,key_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS automation_key_recipient ON local_automation_key_recipients(stage,cluster_uid,recipient)",
+    "CREATE TABLE IF NOT EXISTS local_automation_payload_wrappings (\n stage TEXT NOT NULL, cluster_uid TEXT NOT NULL, operation_id TEXT NOT NULL, payload_id TEXT NOT NULL,\n admission_sequence INTEGER NOT NULL CHECK(admission_sequence>0), wrapping_sequence INTEGER NOT NULL CHECK(wrapping_sequence>admission_sequence),\n wrapping_digest TEXT NOT NULL, recipient_epoch TEXT NOT NULL,\n membership_generation INTEGER NOT NULL CHECK(membership_generation>0), config_digest TEXT NOT NULL,\n PRIMARY KEY(stage,cluster_uid,operation_id,wrapping_sequence))",
+    "CREATE INDEX IF NOT EXISTS automation_wrapping_coverage ON local_automation_payload_wrappings(stage,cluster_uid,recipient_epoch,operation_id,wrapping_sequence)",
+    "CREATE INDEX IF NOT EXISTS automation_admission_inventory ON local_automation_admissions(stage,cluster_uid,sequence,operation_id)",
+    "CREATE TABLE IF NOT EXISTS local_automation_recovery (\n\t\tid INTEGER PRIMARY KEY CHECK(id=1),sequence INTEGER NOT NULL,digest TEXT NOT NULL,\n\t\tnext_sequence INTEGER NOT NULL,next_digest TEXT NOT NULL,\n\t\tbase_sequence INTEGER NOT NULL,base_digest TEXT NOT NULL,\n\t\tgeneration INTEGER NOT NULL,members_hash TEXT NOT NULL,certificate TEXT NOT NULL\n\t)",
+    "CREATE TABLE IF NOT EXISTS local_automation_staging (\n\t\tsequence INTEGER PRIMARY KEY,digest TEXT NOT NULL,value_json TEXT NOT NULL,certificate TEXT NOT NULL\n\t)",
+    "CREATE TABLE IF NOT EXISTS local_automation_authority (\n\t\tid INTEGER PRIMARY KEY CHECK(id=1), generation INTEGER NOT NULL,\n\t\tmembers_hash TEXT NOT NULL, incarnation TEXT NOT NULL,\n\t\tbootstrap_principal TEXT NOT NULL, bootstrap_request TEXT NOT NULL,\n\t\tprovenance TEXT NOT NULL\n\t)",
+    "CREATE TABLE IF NOT EXISTS local_automation_prefix (\n\t\tid INTEGER PRIMARY KEY CHECK(id=1), cluster_uid TEXT NOT NULL,\n\t\tsequence INTEGER NOT NULL, digest TEXT NOT NULL\n\t)",
+    "CREATE TABLE IF NOT EXISTS local_automation_anchors (\n\t\tsequence INTEGER PRIMARY KEY, digest TEXT NOT NULL,\n\t\tgeneration INTEGER NOT NULL, members_hash TEXT NOT NULL, certificate TEXT NOT NULL\n\t)",
+    "CREATE TABLE IF NOT EXISTS local_automation_history (\n\t\tsequence INTEGER PRIMARY KEY, digest TEXT NOT NULL,\n\t\tvalue_json TEXT NOT NULL, certificate TEXT NOT NULL,\n\t\treceipt_json TEXT NOT NULL, anchor_sequence INTEGER NOT NULL\n\t)",
+    "CREATE TABLE IF NOT EXISTS local_automation_requests (\n\t\tscope TEXT NOT NULL, request_id TEXT NOT NULL, identity BLOB NOT NULL,\n\t\treceipt_json TEXT NOT NULL, operation_id TEXT NOT NULL,\n\t\tPRIMARY KEY(scope,request_id)\n\t)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_local_automation_operation ON local_automation_requests(operation_id) WHERE operation_id<>''",
+    "CREATE TABLE IF NOT EXISTS local_recovery_claims (\n\t\ttarget_kind       TEXT    NOT NULL,\n\t\ttarget_name       TEXT    NOT NULL,\n\t\towner_epoch       INTEGER NOT NULL,\n\t\tattempt           INTEGER NOT NULL,\n\t\tpromised_round    INTEGER NOT NULL DEFAULT 0,\n\t\tpromised_coord    TEXT    NOT NULL DEFAULT '',\n\t\tpromised_nonce    BLOB    NOT NULL DEFAULT x'',\n\t\taccepted_round    INTEGER NOT NULL DEFAULT 0,\n\t\taccepted_coord    TEXT    NOT NULL DEFAULT '',\n\t\taccepted_nonce    BLOB    NOT NULL DEFAULT x'',\n\t\tvalue_json        TEXT    NOT NULL DEFAULT '',\n\t\tvalue_digest      TEXT    NOT NULL DEFAULT '',\n\t\taccept_json       TEXT    NOT NULL DEFAULT '',\n\t\tconfig_generation INTEGER NOT NULL,\n\t\tupdated_at        TEXT    NOT NULL,\n\t\tPRIMARY KEY (target_kind, target_name, owner_epoch, attempt)\n\t)",
+    "CREATE TABLE IF NOT EXISTS local_voter_incarnation (\n\t\tid          INTEGER PRIMARY KEY CHECK (id = 1),\n\t\tincarnation TEXT NOT NULL,\n\t\tcreated_at  TEXT NOT NULL\n\t)",
+    "CREATE TABLE IF NOT EXISTS local_voter_adoption (\n\t\tgeneration    INTEGER PRIMARY KEY,\n\t\timported_from TEXT NOT NULL DEFAULT '',\n\t\tadopted_at    TEXT NOT NULL\n\t)",
+    "CREATE TABLE IF NOT EXISTS local_abandoned_proofs (\n\t\tproof_id     TEXT    PRIMARY KEY,\n\t\ttarget_kind  TEXT    NOT NULL,\n\t\ttarget_name  TEXT    NOT NULL,\n\t\towner_epoch  INTEGER NOT NULL,\n\t\tattempt      INTEGER NOT NULL,\n\t\treason       TEXT    NOT NULL DEFAULT '',\n\t\tabandoned_at TEXT    NOT NULL\n\t)",
+    "CREATE TABLE IF NOT EXISTS local_voter_seals (\n\t\tgeneration INTEGER PRIMARY KEY,\n\t\treason     TEXT    NOT NULL DEFAULT '',\n\t\tsealed_at  TEXT    NOT NULL\n\t)",
+    "CREATE TABLE IF NOT EXISTS local_incarnation_claims (\n\t\ttarget_kind       TEXT    NOT NULL,\n\t\ttarget_name       TEXT    NOT NULL,\n\t\tincarnation       TEXT    NOT NULL,\n\t\towner_epoch       INTEGER NOT NULL,\n\t\tattempt           INTEGER NOT NULL,\n\t\tpromised_round    INTEGER NOT NULL DEFAULT 0,\n\t\tpromised_coord    TEXT    NOT NULL DEFAULT '',\n\t\tpromised_nonce    BLOB    NOT NULL DEFAULT x'',\n\t\taccepted_round    INTEGER NOT NULL DEFAULT 0,\n\t\taccepted_coord    TEXT    NOT NULL DEFAULT '',\n\t\taccepted_nonce    BLOB    NOT NULL DEFAULT x'',\n\t\tvalue_json        TEXT    NOT NULL DEFAULT '',\n\t\tvalue_digest      TEXT    NOT NULL DEFAULT '',\n\t\taccept_json       TEXT    NOT NULL DEFAULT '',\n\t\tconfig_generation INTEGER NOT NULL,\n\t\tupdated_at        TEXT    NOT NULL,\n\t\tPRIMARY KEY (target_kind, target_name, incarnation, owner_epoch, attempt)\n\t)",
+    "CREATE TABLE IF NOT EXISTS user_lifecycle (\n\t\tusername   TEXT NOT NULL,\n\t\tattribute  TEXT NOT NULL,\n\t\tvalue      TEXT NOT NULL DEFAULT '',\n\t\tset_by     TEXT NOT NULL DEFAULT '',\n\t\tupdated_at TEXT NOT NULL,\n\t\tdeleted_at TEXT,\n\t\tPRIMARY KEY (username, attribute)\n\t)",
+    "CREATE TABLE IF NOT EXISTS session_factors (\n\t\tsession_id   TEXT PRIMARY KEY,\n\t\tmethod       TEXT NOT NULL,\n\t\tpresented_at TEXT NOT NULL,\n\t\tupdated_at   TEXT NOT NULL,\n\t\tdeleted_at   TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS user_enrollment_codes (\n\t\tusername   TEXT PRIMARY KEY,\n\t\tcode_hash  TEXT NOT NULL,\n\t\texpires_at TEXT NOT NULL,\n\t\tissued_by  TEXT NOT NULL DEFAULT '',\n\t\tissued_on  TEXT NOT NULL DEFAULT '',\n\t\tused_at    TEXT NOT NULL DEFAULT '',\n\t\tupdated_at TEXT NOT NULL,\n\t\tdeleted_at TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS user_identity_bindings (\n\t\tusername    TEXT NOT NULL,\n\t\trealm       TEXT NOT NULL,\n\t\texternal_id TEXT NOT NULL,\n\t\tbound_at    TEXT NOT NULL,\n\t\tupdated_at  TEXT NOT NULL,\n\t\tdeleted_at  TEXT,\n\t\tPRIMARY KEY (username, realm, external_id)\n\t)",
+    "CREATE TABLE IF NOT EXISTS host_runtime (\n\t\thost_name            TEXT PRIMARY KEY,\n\t\tversion              TEXT NOT NULL DEFAULT '',\n\t\tschema_version       INTEGER NOT NULL DEFAULT 0,\n\t\tcpu_total            INTEGER,\n\t\tmem_total            INTEGER,\n\t\tdisk_total           INTEGER,\n\t\tcapacity_policy_hash TEXT NOT NULL DEFAULT '',\n\t\tupdated_at           TEXT NOT NULL,\n\t\tdeleted_at           TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS session_groups (\n\t\tsession_id  TEXT PRIMARY KEY,\n\t\trealm       TEXT NOT NULL,\n\t\tgroups_json TEXT NOT NULL DEFAULT '[]',\n\t\trecorded_at TEXT NOT NULL,\n\t\tupdated_at  TEXT NOT NULL,\n\t\tdeleted_at  TEXT\n\t)",
+    "CREATE TABLE IF NOT EXISTS host_fence_redfish (\n\t\thost_name  TEXT PRIMARY KEY,\n\t\tendpoint   TEXT NOT NULL DEFAULT '',\n\t\tusername   TEXT NOT NULL DEFAULT '',\n\t\tpassword   TEXT NOT NULL DEFAULT '',\n\t\tsystem_id  TEXT NOT NULL DEFAULT '',\n\t\tauth       TEXT NOT NULL DEFAULT '',\n\t\tca_pem     TEXT NOT NULL DEFAULT '',\n\t\tupdated_at TEXT NOT NULL,\n\t\tdeleted_at TEXT\n\t)"
+  ],
+  "applied_migrations_ddl": "CREATE TABLE IF NOT EXISTS applied_migrations (\n\tid         TEXT PRIMARY KEY,\n\tapplied_at TEXT NOT NULL,\n\tchecksum   TEXT NOT NULL\n)",
+  "ledger": [
+    {
+      "id": "a000_host_pci_devices_pcie_root_port",
+      "version": 1,
+      "sql": "ALTER TABLE host_pci_devices ADD COLUMN pcie_root_port TEXT",
+      "checksum": "40d8d6fc7cb0f34986db3d13b2819559feefb745e956c5aac4e22a94907adcd1"
+    },
+    {
+      "id": "a001_host_pci_devices_pcie_bridge",
+      "version": 1,
+      "sql": "ALTER TABLE host_pci_devices ADD COLUMN pcie_bridge TEXT",
+      "checksum": "d5e9c91cf4f9d16097edc278eb9bf318dd7a7597be706cf1b2a461f216997941"
+    },
+    {
+      "id": "a002_host_pci_devices_link_clique",
+      "version": 1,
+      "sql": "ALTER TABLE host_pci_devices ADD COLUMN link_clique TEXT",
+      "checksum": "fd4ee34755b59dab416d72714cb5aee512bce06f7ed8a741d5e0d1dc0339ef9e"
+    },
+    {
+      "id": "a003_host_pci_devices_link_peers",
+      "version": 1,
+      "sql": "ALTER TABLE host_pci_devices ADD COLUMN link_peers TEXT",
+      "checksum": "11eaf3d9a56fdf3367cb029e4d41036eb78a848579438c4f2dba4a1e78967b00"
+    },
+    {
+      "id": "a004_vm_disks_target_dev",
+      "version": 1,
+      "sql": "ALTER TABLE vm_disks ADD COLUMN target_dev TEXT",
+      "checksum": "3c4c04fa57620276c217ec42f2136a689f99048a51dcfa839fd8e4646382c32b"
+    },
+    {
+      "id": "a005_image_hosts_progress_pct",
+      "version": 1,
+      "sql": "ALTER TABLE image_hosts ADD COLUMN progress_pct REAL DEFAULT 0",
+      "checksum": "3ba66f7de09332a6f5609629959aad2ff5a5e89117fe30e917cf48901b9a5ee9"
+    },
+    {
+      "id": "a006_hosts_version",
+      "version": 1,
+      "sql": "ALTER TABLE hosts ADD COLUMN version TEXT DEFAULT ''",
+      "checksum": "d42ea503b5dabd8c94d8c95e7a65e47e6f9feb3234445e9752ff0b75660d16b5"
+    },
+    {
+      "id": "a007_lb_configs_ports",
+      "version": 1,
+      "sql": "ALTER TABLE lb_configs ADD COLUMN ports TEXT NOT NULL DEFAULT '[]'",
+      "checksum": "ed8bb62d1331777207833882ea4ba33abbdbcb1424d589b3215edb26f77276ea"
+    },
+    {
+      "id": "a008_lb_configs_stack_name",
+      "version": 1,
+      "sql": "ALTER TABLE lb_configs ADD COLUMN stack_name TEXT",
+      "checksum": "6626f7f7d23dc65c7d70ab2274162ad29d4e8a6182c227f5f5f603c52d208cfd"
+    },
+    {
+      "id": "a009_hosts_role",
+      "version": 1,
+      "sql": "ALTER TABLE hosts ADD COLUMN role TEXT NOT NULL DEFAULT 'worker'",
+      "checksum": "224878e68a8cd3570a893bf949714981bfdfc80ffae80e6e12f71a74722c987c"
+    },
+    {
+      "id": "a010_users_realm",
+      "version": 2,
+      "sql": "ALTER TABLE users ADD COLUMN realm TEXT NOT NULL DEFAULT 'local'",
+      "checksum": "1d4a34acae45da2e1afaf75da094c36832e0324e7b0dd0d74021d1014dfb6846"
+    },
+    {
+      "id": "a011_users_display_name",
+      "version": 2,
+      "sql": "ALTER TABLE users ADD COLUMN display_name TEXT",
+      "checksum": "f751e65dec40ce09f3ee29a014e8ae29dc5cb4d4965cb366d7873337d0cec7f9"
+    },
+    {
+      "id": "a012_users_email",
+      "version": 2,
+      "sql": "ALTER TABLE users ADD COLUMN email TEXT",
+      "checksum": "ca485cfee20fcd409b97429b69cf8223e32d9dad7e2793532dc343babb760c0e"
+    },
+    {
+      "id": "a013_tokens_scope_paths",
+      "version": 2,
+      "sql": "ALTER TABLE tokens ADD COLUMN scope_paths TEXT",
+      "checksum": "b834a8975130b8e6ab5c727681720cf1f4d086c12c96da50c15fb1cb07eb8237"
+    },
+    {
+      "id": "a014_vm_interfaces_security_groups",
+      "version": 4,
+      "sql": "ALTER TABLE vm_interfaces ADD COLUMN security_groups TEXT",
+      "checksum": "a831a0f97d14abf689ecba9cc113f2314996e9e3387242357dca7b7b85f8aab4"
+    },
+    {
+      "id": "a015_hosts_region",
+      "version": 6,
+      "sql": "ALTER TABLE hosts ADD COLUMN region TEXT NOT NULL DEFAULT 'default'",
+      "checksum": "538e04d21996afb58371a9d190cbc3e83568dd598464059c00bef55cd0f87759"
+    },
+    {
+      "id": "a016_audit_log_prev_hash",
+      "version": 8,
+      "sql": "ALTER TABLE audit_log ADD COLUMN prev_hash TEXT",
+      "checksum": "4f0cef2255eb85b1bab8bb2e03c5b0bfc10fc2e416e12146edc5b0fb7976d7fa"
+    },
+    {
+      "id": "a017_audit_log_content_hash",
+      "version": 8,
+      "sql": "ALTER TABLE audit_log ADD COLUMN content_hash TEXT",
+      "checksum": "eaf9581ba5a4c6f65c57a480defdcfa47e6eb0684c94cef2cc2306770483a3e7"
+    },
+    {
+      "id": "a018_vms_project",
+      "version": 9,
+      "sql": "ALTER TABLE vms ADD COLUMN project TEXT NOT NULL DEFAULT '_default'",
+      "checksum": "748865e56710e3312fdc63e920c2bf58b867321664dc2d258675822f3ec070c5"
+    },
+    {
+      "id": "a019_backup_schedules_pool_name",
+      "version": 10,
+      "sql": "ALTER TABLE backup_schedules ADD COLUMN pool_name TEXT",
+      "checksum": "f6f8ab76dc3298f92f3d688097fe09d9b9ddc51883f6fb72b2d3e7bf2b9b45e1"
+    },
+    {
+      "id": "a020_storage_pools_options",
+      "version": 11,
+      "sql": "ALTER TABLE storage_pools ADD COLUMN options TEXT",
+      "checksum": "70400db1df04a5240ad9e5e88bd72f7728b31d7a9f5ac91001715a26818f3ac3"
+    },
+    {
+      "id": "a021_backup_schedules_scope",
+      "version": 12,
+      "sql": "ALTER TABLE backup_schedules ADD COLUMN scope TEXT NOT NULL DEFAULT 'vm'",
+      "checksum": "62b95959c12d4ce63941503289accc2d144e737503b7347d1c25b06c85fc162f"
+    },
+    {
+      "id": "a022_backup_schedules_project_name",
+      "version": 12,
+      "sql": "ALTER TABLE backup_schedules ADD COLUMN project_name TEXT",
+      "checksum": "4b86ddf345ccfbd7d9eaa979391977613635b054a43fc59c59da747fb9e69fbc"
+    },
+    {
+      "id": "a023_user_2fa_last_step",
+      "version": 15,
+      "sql": "ALTER TABLE user_2fa ADD COLUMN last_step INTEGER NOT NULL DEFAULT 0",
+      "checksum": "985ff7d81d1d189bf15630a815c34c67927d7513dd8e8b58628a48937e5c0364"
+    },
+    {
+      "id": "a024_vms_is_template",
+      "version": 16,
+      "sql": "ALTER TABLE vms ADD COLUMN is_template INTEGER NOT NULL DEFAULT 0",
+      "checksum": "8baa50a146ad0546a9291e1a3c759805a34e43c72925fe4c949b4fb8e6e25c45"
+    },
+    {
+      "id": "a025_vm_disks_backing_disk",
+      "version": 16,
+      "sql": "ALTER TABLE vm_disks ADD COLUMN backing_disk TEXT",
+      "checksum": "aae86cacbfb78bf1d19d44ea4ed5b39d66159701a75426dcabd699c5a9120675"
+    },
+    {
+      "id": "a026_backup_schedules_type",
+      "version": 17,
+      "sql": "ALTER TABLE backup_schedules ADD COLUMN type TEXT NOT NULL DEFAULT 'backup'",
+      "checksum": "817c23ed91caa68e35bf3ee9001b485e9301e28f7b1e44dcce36baee5621175a"
+    },
+    {
+      "id": "a027_backup_schedules_target_pool",
+      "version": 17,
+      "sql": "ALTER TABLE backup_schedules ADD COLUMN target_pool TEXT",
+      "checksum": "f5b7693480294e7cd4e950429d320b811b5485d188d003203b11b2a343a555ee"
+    },
+    {
+      "id": "a028_backup_schedules_target_host",
+      "version": 17,
+      "sql": "ALTER TABLE backup_schedules ADD COLUMN target_host TEXT",
+      "checksum": "e99d96b7550a6704627ce69d113e9682ff280575460c36ddb6b6428e48951b82"
+    },
+    {
+      "id": "a029_backup_schedules_keep_replicas",
+      "version": 17,
+      "sql": "ALTER TABLE backup_schedules ADD COLUMN keep_replicas INTEGER NOT NULL DEFAULT 0",
+      "checksum": "02c80787ce9cca5da29dd705a91bc053f14bf3625ea50ebbdfb13932afefcc2c"
+    },
+    {
+      "id": "a030_backup_schedules_incremental",
+      "version": 18,
+      "sql": "ALTER TABLE backup_schedules ADD COLUMN incremental INTEGER NOT NULL DEFAULT 0",
+      "checksum": "6623e85e78d56a60c8c08805e4be1f99335b437b61a4aee568cb0870c7d6200f"
+    },
+    {
+      "id": "a031_backup_schedules_auto_promote",
+      "version": 18,
+      "sql": "ALTER TABLE backup_schedules ADD COLUMN auto_promote INTEGER NOT NULL DEFAULT 0",
+      "checksum": "1de005053d68fdb65ead828e7391eecad9f0848bf2332fffbd0b63c93b11e64e"
+    },
+    {
+      "id": "a032_backup_schedules_last_checkpoint",
+      "version": 18,
+      "sql": "ALTER TABLE backup_schedules ADD COLUMN last_checkpoint TEXT",
+      "checksum": "633d7a1c8aab5a4739084a8267c34d17813613ac0694dc3d44ed169c20db77b9"
+    },
+    {
+      "id": "a033_snapshots_type",
+      "version": 19,
+      "sql": "ALTER TABLE snapshots ADD COLUMN type TEXT NOT NULL DEFAULT 'disk'",
+      "checksum": "36fe8a4c0a0b590e827d39caea467f9c7b8c7f5b15693d02e828268827441d02"
+    },
+    {
+      "id": "a034_snapshots_vmstate_path",
+      "version": 19,
+      "sql": "ALTER TABLE snapshots ADD COLUMN vmstate_path TEXT",
+      "checksum": "d581d498e79ce211329fde28cec750d9f7ba70d169cc9f5f3d4abe1566857cf8"
+    },
+    {
+      "id": "a035_snapshots_vmstate_size_bytes",
+      "version": 19,
+      "sql": "ALTER TABLE snapshots ADD COLUMN vmstate_size_bytes INTEGER NOT NULL DEFAULT 0",
+      "checksum": "f5845ef7f1b329cf4a6d2c11de9b5cb0940394a82a2c0e114a160b62c6f054b3"
+    },
+    {
+      "id": "a036_containers_restart_policy",
+      "version": 24,
+      "sql": "ALTER TABLE containers ADD COLUMN restart_policy TEXT",
+      "checksum": "fd8584da7e98f5b6285a2d5109aad76dc1d46a35b38898d7657276c8158401f4"
+    },
+    {
+      "id": "a037_containers_state_detail",
+      "version": 24,
+      "sql": "ALTER TABLE containers ADD COLUMN state_detail TEXT",
+      "checksum": "dc8e4e8352b53073d6183a2d839dbe6befc1017fef2c23cde7471c04d0997ce7"
+    },
+    {
+      "id": "a038_containers_project",
+      "version": 25,
+      "sql": "ALTER TABLE containers ADD COLUMN project TEXT NOT NULL DEFAULT '_default'",
+      "checksum": "8a3196ab8f7107ff93e0cae80988d6b1c71bc02dc8ac4dd420d5d07a37694bad"
+    },
+    {
+      "id": "a039_containers_is_template",
+      "version": 28,
+      "sql": "ALTER TABLE containers ADD COLUMN is_template INTEGER NOT NULL DEFAULT 0",
+      "checksum": "715584b6c6991f7d047738bb2bfa7b2923b406f61a40a88ab313b30d1a60457f"
+    },
+    {
+      "id": "a040_containers_on_host_failure",
+      "version": 28,
+      "sql": "ALTER TABLE containers ADD COLUMN on_host_failure TEXT",
+      "checksum": "a17f7581339e32e00e949b3e8e5e02eb052f2d7820130fc9f172d272da5349d5"
+    },
+    {
+      "id": "a041_tokens_updated_at",
+      "version": 29,
+      "sql": "ALTER TABLE tokens ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
+      "checksum": "7c593ec7c5c27b48213b7e1d537fdddeb8cea2eeee90961d7c08e059e061f96d"
+    },
+    {
+      "id": "a042_lb_backends_deleted_at",
+      "version": 29,
+      "sql": "ALTER TABLE lb_backends ADD COLUMN deleted_at TEXT",
+      "checksum": "713cddf48ecd61e5a42c9d56a793c0822b743a9995dfcee3ccdadb4ce86738ae"
+    },
+    {
+      "id": "a043_hosts_schema_version",
+      "version": 30,
+      "sql": "ALTER TABLE hosts ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 0",
+      "checksum": "48b45f80bee82507b7acb16b87b8c49504b484f6859076adb103d13aeafb20b7"
+    },
+    {
+      "id": "a044_lb_configs_generation",
+      "version": 31,
+      "sql": "ALTER TABLE lb_configs ADD COLUMN generation TEXT NOT NULL DEFAULT ''",
+      "checksum": "83a1442485b59c20e57e8483fda5695dcc6dc7291c19047d3d54be9a2b07ae48"
+    },
+    {
+      "id": "a045_lb_backends_generation",
+      "version": 31,
+      "sql": "ALTER TABLE lb_backends ADD COLUMN generation TEXT NOT NULL DEFAULT ''",
+      "checksum": "7c5596c5f692f6bf5bc9cb913d990badaf4dd91f4a960ba7f0570f5aef242377"
+    },
+    {
+      "id": "a046_user_2fa_deleted_at",
+      "version": 32,
+      "sql": "ALTER TABLE user_2fa ADD COLUMN deleted_at TEXT",
+      "checksum": "937274a898b89c3e000518bc28ca8fa6b3cdfad0a2456fa15c0f1d5fb2b80dc0"
+    },
+    {
+      "id": "a047_user_2fa_epoch",
+      "version": 32,
+      "sql": "ALTER TABLE user_2fa ADD COLUMN epoch TEXT NOT NULL DEFAULT ''",
+      "checksum": "4fd41881e54895c33e7aa008b6cbeafd24ac1ab957141c891a400daf081d9524"
+    },
+    {
+      "id": "a048_recovery_codes_set_id",
+      "version": 32,
+      "sql": "ALTER TABLE recovery_codes ADD COLUMN set_id TEXT NOT NULL DEFAULT ''",
+      "checksum": "1ec0b8f41e05a2a2180b707cf92012274028e85a43fb5624c95f0617565a0a83"
+    },
+    {
+      "id": "a049_recovery_codes_updated_at",
+      "version": 32,
+      "sql": "ALTER TABLE recovery_codes ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
+      "checksum": "68c28373143b32d6f2d283cd898881d330b6767108f42fa025f498b1cb3e8537"
+    },
+    {
+      "id": "a050_recovery_codes_deleted_at",
+      "version": 32,
+      "sql": "ALTER TABLE recovery_codes ADD COLUMN deleted_at TEXT",
+      "checksum": "f0ba4f150990f505e4e6f2c12a90277f34e4d86849486ef50003c148f3f78ade"
+    },
+    {
+      "id": "a051_containers_create_spec",
+      "version": 34,
+      "sql": "ALTER TABLE containers ADD COLUMN create_spec TEXT",
+      "checksum": "82257e0b395ab5d4b619b8bfa278203327097e2b7df4d3aaad4703a83fa063ca"
+    },
+    {
+      "id": "a052_containers_relocate_token",
+      "version": 34,
+      "sql": "ALTER TABLE containers ADD COLUMN relocate_token TEXT",
+      "checksum": "0f34e54c33da071cf0145bd970a01cf15b49019d81dbddaa3763921ab4e43830"
+    },
+    {
+      "id": "a053_ip_allocations_owner_kind",
+      "version": 36,
+      "sql": "ALTER TABLE ip_allocations ADD COLUMN owner_kind TEXT NOT NULL DEFAULT 'vm'",
+      "checksum": "0bf51dcfea3eb668bc18646703be8d858724c452909ef013348c4e1e8c1266d6"
+    },
+    {
+      "id": "a054_ip_allocations_owner_host",
+      "version": 36,
+      "sql": "ALTER TABLE ip_allocations ADD COLUMN owner_host TEXT NOT NULL DEFAULT ''",
+      "checksum": "2e6f1a5f2cf565a642af8804aee6fba3349004615ed84ee3d6a5f944cbe62ce8"
+    },
+    {
+      "id": "a055_networks_project",
+      "version": 37,
+      "sql": "ALTER TABLE networks ADD COLUMN project TEXT NOT NULL DEFAULT ''",
+      "checksum": "9cacf8efb566cdb05842d92e3ab4ba1d8bcd7015f6240afa25e747614e1b91e4"
+    },
+    {
+      "id": "a056_storage_pools_project",
+      "version": 37,
+      "sql": "ALTER TABLE storage_pools ADD COLUMN project TEXT NOT NULL DEFAULT ''",
+      "checksum": "f03be8e52e021c41b305fc339fed34b0a43bbd1caad435ce7ba6cb73f5d33bcc"
+    },
+    {
+      "id": "a057_volumes_project",
+      "version": 37,
+      "sql": "ALTER TABLE volumes ADD COLUMN project TEXT NOT NULL DEFAULT ''",
+      "checksum": "6741e0803d739347d4e0e38f25ff723727ea08845f94a0f74081c83b6cec0dfa"
+    },
+    {
+      "id": "a058_vms_pending_action_id",
+      "version": 38,
+      "sql": "ALTER TABLE vms ADD COLUMN pending_action_id TEXT NOT NULL DEFAULT ''",
+      "checksum": "9e14421e5879ff1741fc2a88161dfebf73e2b26caad28b51a5da017caa35f4bd"
+    },
+    {
+      "id": "a059_vms_vm_owner_epoch",
+      "version": 41,
+      "sql": "ALTER TABLE vms ADD COLUMN vm_owner_epoch INTEGER NOT NULL DEFAULT 0",
+      "checksum": "3504675e87a445edbc3781dfc03c6c10f17184f70bd253ffcd8471c4060de9ef"
+    },
+    {
+      "id": "a060_vms_spec_generation",
+      "version": 41,
+      "sql": "ALTER TABLE vms ADD COLUMN spec_generation INTEGER NOT NULL DEFAULT 0",
+      "checksum": "b07ff15e79f47c730abe76030bfa9a1f7740a74a51476e3f9e395766f6f74a43"
+    },
+    {
+      "id": "a061_vms_active_operation_id",
+      "version": 41,
+      "sql": "ALTER TABLE vms ADD COLUMN active_operation_id TEXT NOT NULL DEFAULT ''",
+      "checksum": "c58eee943eb0b2189041ed6867d69b2beb49fb61070934247055f49b0dc2025a"
+    },
+    {
+      "id": "a062_vm_disks_bus",
+      "version": 42,
+      "sql": "ALTER TABLE vm_disks ADD COLUMN bus TEXT",
+      "checksum": "193a9ad625fac1a90f201c02c2ec974651fe9e6b39b734fd3dbe0cfcc6a44b09"
+    },
+    {
+      "id": "a063_vm_disks_device_kind",
+      "version": 42,
+      "sql": "ALTER TABLE vm_disks ADD COLUMN device_kind TEXT NOT NULL DEFAULT 'disk'",
+      "checksum": "4ba7fc51cbcbc7dafcbc5bc08315aff973a174962858d31aef43b7c2b990bb3a"
+    },
+    {
+      "id": "a064_vm_disks_delete_with_vm",
+      "version": 42,
+      "sql": "ALTER TABLE vm_disks ADD COLUMN delete_with_vm INTEGER NOT NULL DEFAULT 1",
+      "checksum": "ddf312f3f554e68b847626bbc81ccf8abda321f347e6d1dd7e582b04233b6696"
+    },
+    {
+      "id": "a065_vm_disks_controller_model",
+      "version": 42,
+      "sql": "ALTER TABLE vm_disks ADD COLUMN controller_model TEXT",
+      "checksum": "a15712cf9a6089961bf842ed0f689ee0cb777cf3d51e42660eb8ded27c908bd3"
+    },
+    {
+      "id": "a066_vms_hardware_adoption_state",
+      "version": 42,
+      "sql": "ALTER TABLE vms ADD COLUMN hardware_adoption_state TEXT NOT NULL DEFAULT 'pending'",
+      "checksum": "55b20840385e8253218a5fa04088c1cfefd6fd82da779f7a09f0f26a2331d8df"
+    },
+    {
+      "id": "a067_vms_hardware_adoption_error",
+      "version": 42,
+      "sql": "ALTER TABLE vms ADD COLUMN hardware_adoption_error TEXT",
+      "checksum": "08ec52e1ca50f05306b9b2dbf4ebb4f2e27de4e3db0ddb5f8ac0bb245ec5ca08"
+    },
+    {
+      "id": "a068_hosts_cpu_overcommit",
+      "version": 43,
+      "sql": "ALTER TABLE hosts ADD COLUMN cpu_overcommit REAL NOT NULL DEFAULT 0",
+      "checksum": "c34a9ddc12da23e7be8e037641ce253bfd384cfc9fa4fe3556fc18b564b3a747"
+    },
+    {
+      "id": "a069_hosts_mem_overcommit",
+      "version": 43,
+      "sql": "ALTER TABLE hosts ADD COLUMN mem_overcommit REAL NOT NULL DEFAULT 0",
+      "checksum": "0de69c8fb6ca73480abcea2135a72b47dc20c74f0d6477f78ff396a4231003e3"
+    },
+    {
+      "id": "a070_hosts_cpu_reserve",
+      "version": 43,
+      "sql": "ALTER TABLE hosts ADD COLUMN cpu_reserve INTEGER NOT NULL DEFAULT -1",
+      "checksum": "4d513cc0bfb1bb7a6f8a6a1d4a3a0cdb5ec8fe1aeba34bf557cbfb3f8ca71461"
+    },
+    {
+      "id": "a071_hosts_mem_reserve_mib",
+      "version": 43,
+      "sql": "ALTER TABLE hosts ADD COLUMN mem_reserve_mib INTEGER NOT NULL DEFAULT -1",
+      "checksum": "65d56a87ee78d5faf1e2c349977180f993e712cd7d1de41c13b52ba3cf4f7bc6"
+    },
+    {
+      "id": "a072_containers_owner_epoch",
+      "version": 44,
+      "sql": "ALTER TABLE containers ADD COLUMN owner_epoch INTEGER NOT NULL DEFAULT 0",
+      "checksum": "82a07a5bc4677c3d0699c93598acc7129d1f8e01bcb93d34ea3b310b9826ab34"
+    },
+    {
+      "id": "a073_containers_spec_generation",
+      "version": 44,
+      "sql": "ALTER TABLE containers ADD COLUMN spec_generation INTEGER NOT NULL DEFAULT 0",
+      "checksum": "8cdfe1226ae0018c98c98307e82f39bf4b18a200906a34986edad0c8a88cc0d5"
+    },
+    {
+      "id": "a074_containers_active_operation_id",
+      "version": 44,
+      "sql": "ALTER TABLE containers ADD COLUMN active_operation_id TEXT NOT NULL DEFAULT ''",
+      "checksum": "40542d17d0f25ad642dfd68068d1df32db20c043070218670404c155ec7a555e"
+    },
+    {
+      "id": "a075_hosts_capacity_policy_hash",
+      "version": 44,
+      "sql": "ALTER TABLE hosts ADD COLUMN capacity_policy_hash TEXT NOT NULL DEFAULT ''",
+      "checksum": "65cd75b7c3fa0a1b37f340ca421cd710958914f67b480e25439a18b4c16558a2"
+    },
+    {
+      "id": "a076_notification_routes_subject_pattern",
+      "version": 44,
+      "sql": "ALTER TABLE notification_routes ADD COLUMN subject_pattern TEXT NOT NULL DEFAULT '*'",
+      "checksum": "4b10b3b3aa21af22c681e8a2677f5741011143577eb96feaa04cc3949220c226"
+    },
+    {
+      "id": "a077_notification_routes_project",
+      "version": 44,
+      "sql": "ALTER TABLE notification_routes ADD COLUMN project TEXT NOT NULL DEFAULT ''",
+      "checksum": "fb059d979c701df6862c79814e6a78e271c1a8fa8d8b674fd6e84513e98f86e6"
+    },
+    {
+      "id": "a078_audit_log_key_id",
+      "version": 45,
+      "sql": "ALTER TABLE audit_log ADD COLUMN key_id TEXT",
+      "checksum": "c3d10fbe5dc738baeddcb1de1e18e627adcca99b8e21413518df5be9a1ae9c80"
+    },
+    {
+      "id": "a079_audit_log_signature",
+      "version": 45,
+      "sql": "ALTER TABLE audit_log ADD COLUMN signature TEXT",
+      "checksum": "8449564a3ce8d7653199f63b923b9189020ca97e6329b9c6c9741d03f081f5ef"
+    },
+    {
+      "id": "a080_audit_log_seq",
+      "version": 45,
+      "sql": "ALTER TABLE audit_log ADD COLUMN seq INTEGER NOT NULL DEFAULT 0",
+      "checksum": "e70fed41f2a70d34e5403b6b8d299ab2ba9583f39ce7bec380ca3e6a586f50e4"
+    },
+    {
+      "id": "a081_hosts_isolation_epoch",
+      "version": 49,
+      "sql": "ALTER TABLE hosts ADD COLUMN isolation_epoch INTEGER NOT NULL DEFAULT 0",
+      "checksum": "e0a3d1bb3e57680c086f4f240e79d71a1fe4a65b1d9a50b66cb0c3de4f8a23e8"
+    },
+    {
+      "id": "a082_hosts_isolation_reason",
+      "version": 49,
+      "sql": "ALTER TABLE hosts ADD COLUMN isolation_reason TEXT NOT NULL DEFAULT ''",
+      "checksum": "ecacd08f5257a622bb289fb410917fe725faf8455e8f9ef6cc7b0c671b6b678c"
+    },
+    {
+      "id": "a083_ip_allocations_netbox_ip_id",
+      "version": 51,
+      "sql": "ALTER TABLE ip_allocations ADD COLUMN netbox_ip_id INTEGER",
+      "checksum": "af139ce145ff63021dba56f370bea17a83af4ec9b7ddb096d72b6d2941b1469d"
+    },
+    {
+      "id": "a084_ip_allocations_netbox_prefix_id",
+      "version": 51,
+      "sql": "ALTER TABLE ip_allocations ADD COLUMN netbox_prefix_id INTEGER",
+      "checksum": "afe3456c2fa518a94db0230c16e8bd5e8fefcb6d63ec7d7efee43887a023e2f9"
+    },
+    {
+      "id": "a085_netbox_bindings_netbox_cluster",
+      "version": 51,
+      "sql": "ALTER TABLE netbox_bindings ADD COLUMN netbox_cluster TEXT NOT NULL DEFAULT ''",
+      "checksum": "99cf17a39e15a71153e7d854b72d42f4a23c723efe954daeb30860cba9567894"
+    },
+    {
+      "id": "a086_runtime_action_proofs_lease_term",
+      "version": 53,
+      "sql": "ALTER TABLE runtime_action_proofs ADD COLUMN lease_term INTEGER NOT NULL DEFAULT 0",
+      "checksum": "1f8e3c5e0a4fcf2e41df0b1cb44dd4c99cbf9094f1be889bd63b99d592e895ac"
+    },
+    {
+      "id": "a087_runtime_action_proofs_lease_key",
+      "version": 54,
+      "sql": "ALTER TABLE runtime_action_proofs ADD COLUMN lease_key TEXT NOT NULL DEFAULT ''",
+      "checksum": "7f6364d395afca272b1215f478b97b60c4d3e3d2895af0c14addfc85bffc0343"
+    },
+    {
+      "id": "a088_runtime_action_proofs_claim_certificate",
+      "version": 60,
+      "sql": "ALTER TABLE runtime_action_proofs ADD COLUMN claim_certificate TEXT NOT NULL DEFAULT ''",
+      "checksum": "4835b8bee95c6d66dc238d92a709bea4029d4d3ee5f29ea29e25859b713b59d7"
+    },
+    {
+      "id": "a089_host_fence_credentials_after_retirement",
+      "version": 68,
+      "sql": "ALTER TABLE host_fence_credentials ADD COLUMN after_retirement TEXT NOT NULL DEFAULT ''",
+      "checksum": "58be11db74edad8a7d70610d974e244f7d0d6c1cc07feb792c36cb031167f98f"
+    },
+    {
+      "id": "a090_hosts_incarnation",
+      "version": 69,
+      "sql": "ALTER TABLE hosts ADD COLUMN incarnation INTEGER NOT NULL DEFAULT 0",
+      "checksum": "9a059650032005d285e2f4b8e782bd70c529e708666296f92eea201ab8b6f100"
+    },
+    {
+      "id": "a091_local_automation_receiver_current_established_inventory",
+      "version": 79,
+      "sql": "ALTER TABLE local_automation_receiver_current ADD COLUMN established_inventory BLOB NOT NULL DEFAULT x''",
+      "checksum": "2e31eb0aaa1a641cb4fbf85ed9311e76677bd29f252741a25701616a315f113a"
+    },
+    {
+      "id": "t_security_groups",
+      "version": 3,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_containers",
+      "version": 5,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_backup_schedules",
+      "version": 7,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_vm_events",
+      "version": 13,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_vm_backups",
+      "version": 14,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_notification_targets",
+      "version": 20,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_ip_sets",
+      "version": 21,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_replication_checkpoints",
+      "version": 22,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_registry_credentials",
+      "version": 23,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_container_backups",
+      "version": 26,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_container_snapshots",
+      "version": 27,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_recovery_code_sets",
+      "version": 32,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_user_2fa_sets",
+      "version": 32,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_host_runtime_usage",
+      "version": 33,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_container_interfaces",
+      "version": 35,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_runtime_action_proofs",
+      "version": 38,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_idempotency_keys",
+      "version": 39,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_host_fw_intent",
+      "version": 40,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_operations",
+      "version": 41,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_operation_steps",
+      "version": 41,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_project_authority_epochs",
+      "version": 41,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_vm_nics",
+      "version": 42,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_vm_pci_intent",
+      "version": 42,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_vm_pci_realizations",
+      "version": 42,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_audit_signing_keys",
+      "version": 45,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_audit_chain_heads",
+      "version": 45,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_audit_key_lifecycle",
+      "version": 46,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_cluster_crl",
+      "version": 47,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_host_networks",
+      "version": 48,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_health_conditions",
+      "version": 50,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_health_evaluator_status",
+      "version": 50,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_host_capacity_observations",
+      "version": 50,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_quota_reservations",
+      "version": 50,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_netbox_bindings",
+      "version": 51,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_netbox_objects",
+      "version": 51,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_netbox_sync_queue",
+      "version": 51,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_netbox_host_config",
+      "version": 51,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_leader_lease_terms",
+      "version": 52,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_term_bindings",
+      "version": 55,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_host_fence_credentials",
+      "version": 56,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_user_credentials",
+      "version": 56,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_token_credentials",
+      "version": 56,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_host_membership",
+      "version": 57,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_cluster_policies",
+      "version": 58,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_voter_configs",
+      "version": 59,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_recovery_claims",
+      "version": 59,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_voter_incarnation",
+      "version": 59,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_voter_adoption",
+      "version": 59,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_abandoned_proofs",
+      "version": 61,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_voter_seals",
+      "version": 62,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_incarnation_claims",
+      "version": 63,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_user_lifecycle",
+      "version": 64,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_session_factors",
+      "version": 64,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_user_enrollment_codes",
+      "version": 64,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_user_identity_bindings",
+      "version": 64,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_host_runtime",
+      "version": 65,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_session_groups",
+      "version": 66,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_host_fence_redfish",
+      "version": 67,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_authority",
+      "version": 70,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_prefix",
+      "version": 70,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_anchors",
+      "version": 70,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_history",
+      "version": 70,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_requests",
+      "version": 70,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_recovery",
+      "version": 70,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_staging",
+      "version": 70,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_cuts",
+      "version": 71,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_cut_records",
+      "version": 71,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_source_jobs",
+      "version": 72,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_publications",
+      "version": 72,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_retained_deliveries",
+      "version": 80,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_retained_objects",
+      "version": 80,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_retained_completions",
+      "version": 80,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_receiver_established",
+      "version": 79,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_key_epochs",
+      "version": 78,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_key_recipients",
+      "version": 78,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_payload_wrappings",
+      "version": 78,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_local_audits",
+      "version": 77,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_local_rows",
+      "version": 77,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_aggregates",
+      "version": 77,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_aggregate_sources",
+      "version": 77,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_aggregate_copies",
+      "version": 77,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_aggregate_maxima",
+      "version": 77,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_aggregate_conflicts",
+      "version": 77,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_lifetimes",
+      "version": 76,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_credential_issuance",
+      "version": 76,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_identities",
+      "version": 75,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_aliases",
+      "version": 75,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_owners",
+      "version": 75,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_semantic_heads",
+      "version": 75,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_resources",
+      "version": 75,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_names",
+      "version": 75,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_bindings",
+      "version": 75,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_admissions",
+      "version": 75,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_receiver_audits",
+      "version": 74,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_receiver_refs",
+      "version": 74,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_receiver_requests",
+      "version": 74,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_receiver_jobs",
+      "version": 73,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_receiver_current",
+      "version": 73,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_receiver_validations",
+      "version": 73,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_receiver_sources",
+      "version": 73,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_receiver_components",
+      "version": 73,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_receiver_records",
+      "version": 73,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "t_local_automation_receiver_pages",
+      "version": 73,
+      "sql": "",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "r_cluster_crl_composite_pk",
+      "version": 47,
+      "sql": "DROP TABLE IF EXISTS cluster_crl;\nCREATE TABLE IF NOT EXISTS cluster_crl (\n\tid           TEXT NOT NULL,\n\tcrl_pem      TEXT NOT NULL,\n\tcreated_at   TEXT NOT NULL,\n\tupdated_at   TEXT NOT NULL,\n\tdeleted_at   TEXT,\n\tPRIMARY KEY (id, crl_pem)\n)",
+      "checksum": "7e8efdbeabe878be222dd90f91ca64f0459c0339d0c084ad0ae7addfeae121ac"
+    }
+  ]
+}

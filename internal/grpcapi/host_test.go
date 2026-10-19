@@ -538,3 +538,29 @@ func TestPreflightRemoveHost_RefusesAsRemoveHostAndRemovesNothing(t *testing.T) 
 		t.Error("a preflight removed the host")
 	}
 }
+
+// fd review I2: a row the daemon could not read is not a missing host. `lv
+// host rm` reads NotFound on a retry as its own earlier removal, so a read
+// error must say Unavailable.
+//
+// Mutation: map the read error to NotFound again — the code is NotFound.
+func TestRemoveHost_AReadErrorIsUnavailableNotNotFound(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	insertTestHost(t, ctx, s.db, "readerr-host", "active")
+	s.db.Close()
+	for name, call := range map[string]func() error{
+		"RemoveHost": func() error {
+			_, err := s.RemoveHost(ctx, &pb.RemoveHostRequest{Name: "readerr-host", Force: true})
+			return err
+		},
+		"PreflightRemoveHost": func() error {
+			_, err := s.PreflightRemoveHost(ctx, &pb.RemoveHostRequest{Name: "readerr-host", Force: true})
+			return err
+		},
+	} {
+		if c := status.Code(call()); c != codes.Unavailable {
+			t.Errorf("%s over an unreadable row: code %v, want Unavailable", name, c)
+		}
+	}
+}

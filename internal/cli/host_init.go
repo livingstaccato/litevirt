@@ -17,11 +17,7 @@ import (
 	"strings"
 	"syscall"
 
-	"google.golang.org/grpc/metadata"
-
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/apimeta"
-	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/netutil"
 	"gopkg.in/yaml.v3"
@@ -133,168 +129,6 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 
 	fmt.Printf("Host %s initialized successfully at %s\n", hostName, hostAddr)
 	fmt.Printf("  gRPC endpoint: %s:7443 (mTLS)\n", hostAddr)
-	return nil
-}
-
-// HostAdd adds a new host to an existing cluster.
-func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostName string, joinPeers []string) error {
-	// Before anything is generated or pushed, because a failure here must leave the
-	// target untouched.
-	//
-	// The peer list is gathered best-effort by the caller: it asks the local daemon
-	// for the current hosts and carries on if that fails. Carrying on means writing
-	// `join_peers: []` onto the new node — certificates, binary and a running daemon,
-	// and no way to find the cluster — and then reporting success. `add` always has
-	// at least one host to join by definition; if it did not, this would be `init`.
-	if len(joinPeers) == 0 {
-		return fmt.Errorf("no gossip peers to join: could not read the existing cluster's "+
-			"hosts, so %s would be provisioned with an empty join_peers and never reach the "+
-			"cluster. Check that a daemon is reachable from here (lv host ls), or that this "+
-			"is not the first host — the first one is `lv host init`", hostName)
-	}
-	pkiDir := PKIDir()
-
-	// Verify CA exists
-	caPath := filepath.Join(pkiDir, "ca.crt")
-	if _, err := os.Stat(caPath); os.IsNotExist(err) {
-		return fmt.Errorf("no cluster CA found — run 'lv host init' first")
-	}
-
-	parsedHost, sshUser, err := parseSSHTarget(sshTarget)
-	if err != nil {
-		return err
-	}
-	hostAddr, err := resolveHost(parsedHost)
-	if err != nil {
-		return err
-	}
-
-	// Format join_peers as YAML array, e.g. ["10.0.50.10:7946","10.0.50.11:7946"]
-	peersYAML := "["
-	for i, p := range joinPeers {
-		if i > 0 {
-			peersYAML += ","
-		}
-		peersYAML += fmt.Sprintf("%q", p)
-	}
-	peersYAML += "]"
-
-	// Decided before anything is minted or pushed, like the peer list: a refusal
-	// here must leave the target untouched.
-	enforcement, err := addSetupEnforcement(sshUser, joinPeers)
-	if err != nil {
-		return err
-	}
-	// The gossip key goes with ca.crt. A keyed cluster with no key here is a
-	// refusal now, before anything is minted or pushed.
-	gossipKeyPath, pushGossipKey, err := gossipKeyToPush(pkiDir, enforcement)
-	if err != nil {
-		return err
-	}
-	// The migration CA, likewise decided before anything is pushed: minted here
-	// only when no join peer already holds credentials from one elsewhere.
-	migHolder := peerMigrationHolder(sshUser, joinPeers)
-	if _, _, _, err := ensureLocalMigrationCA(pkiDir, migHolder); err != nil {
-		return err
-	}
-
-	// Generate CLI client certificate if it doesn't exist
-	caKeyPath := filepath.Join(pkiDir, "ca.key")
-	clientCertPath := filepath.Join(pkiDir, "client.crt")
-	clientKeyPath := filepath.Join(pkiDir, "client.key")
-	if _, err := os.Stat(clientCertPath); os.IsNotExist(err) {
-		slog.Info("generating CLI client certificate")
-		if err := pki.GenerateClientCert(caPath, caKeyPath, clientCertPath, clientKeyPath, "lv-cli"); err != nil {
-			return fmt.Errorf("generate client cert: %w", err)
-		}
-	}
-
-	// Generate host certificate
-	staged, err := stageHostEnrollmentIdentity(pkiDir, hostName, hostAddr)
-	if err != nil {
-		return err
-	}
-	defer staged.remove()
-	hostCertPath, hostKeyPath := staged.cert, staged.key
-	ip := net.ParseIP(hostAddr)
-
-	// Push to host
-	sc, err := connectEnrollmentRemote(sshTarget)
-	if err != nil {
-		return fmt.Errorf("SSH connect: %w", err)
-	}
-	defer sc.Close()
-
-	migFiles, err := issueMigrationCredentials(pkiDir, hostName, ip, migHolder)
-	if err != nil {
-		return err
-	}
-	gossipToStage := ""
-	if pushGossipKey {
-		gossipToStage = gossipKeyPath
-	}
-	request, err := loadEnrollmentRequest(hostName, caPath, hostCertPath, hostKeyPath, gossipToStage, migFiles)
-	if err != nil {
-		return err
-	}
-	request.SetupEnv = setupScriptEnvWith(hostName, hostAddr, peersYAML, enforcement)
-	serial, err := pki.CertSerial(hostCertPath)
-	if err != nil {
-		return fmt.Errorf("read generated host certificate serial: %w", err)
-	}
-	// The header is this command's claim that it installs its own build,
-	// which keeps a host incarnation; the daemon cannot check which binary
-	// findDaemonBinary pushed (docs/upgrades.md).
-	admitCtx := metadata.AppendToOutgoingContext(ctx, apimeta.AdmitInstallsReleaseHeader, capabilities.ReleaseToken)
-	admitted, err := c.AdmitHost(admitCtx, &pb.AdmitHostRequest{
-		Name: hostName, Address: hostAddr, CertSerial: serial,
-	})
-	if err != nil {
-		return fmt.Errorf("admit host identity to the cluster: %w", err)
-	}
-	if why := admitted.GetIncarnationNotIssued(); why != "" {
-		fmt.Printf("  re-admitted %s without a host incarnation: %s\n", hostName, why)
-	}
-	// The name's audit chain position, signed with the CA, so the new machine's
-	// daemon holds its own audit rows until that history has reached it instead
-	// of starting a second chain under an old name. Before setup, which starts
-	// the daemon. A name with no history gets no record — and loses any a
-	// previous machine under the name left behind.
-	rejoin, remove, err := AuditRejoinFile(pkiDir, hostName, serial, admitted)
-	if err != nil {
-		return fmt.Errorf("sign %s's audit admission record: %w", hostName, err)
-	}
-	request.Rejoin, request.RemoveRejoin = rejoin, remove
-	// Admission and its audit record are ready before the helper starts the daemon.
-	if err := runRemoteEnrollment(sc, request); err != nil {
-		return fmt.Errorf("enroll admitted host: %w", err)
-	}
-
-	// Back-fill the new host into THIS machine's gossip seed list. The daemon
-	// needs a restart to pick it up, and memberlist may discover the peer through
-	// existing members anyway — but the seed list is now load-bearing for more
-	// than gossip, so only one failure here is benign.
-	//
-	// Running `lv` from a workstation is supported, and a workstation has no
-	// daemon config to update. That is errNotALocalNode, and it is fine.
-	//
-	// Anything else means this machine IS a cluster node whose join_peers could
-	// not be updated, and a slog.Warn is not enough: an empty join_peers is what
-	// makes a node look like a FOUNDER, so leaving it wrong sets up a later
-	// state.db rebuild to mint a fresh admin credential over the cluster's.
-	if err := ensureLocalPeer(daemonConfigPath, hostAddr, 7946); err != nil {
-		if errors.Is(err, errNotALocalNode) {
-			slog.Info("this machine is not a cluster node, so it has no join_peers to back-fill",
-				"config", daemonConfigPath)
-		} else {
-			return fmt.Errorf("host %s WAS added to the cluster, but this machine's own "+
-				"join_peers in %s could not be updated (%w) — add %s to it by hand before "+
-				"restarting the daemon, or this node still looks like a founder",
-				hostName, daemonConfigPath, err, net.JoinHostPort(hostAddr, strconv.Itoa(7946)))
-		}
-	}
-
-	fmt.Printf("Host %s added to cluster at %s\n", hostName, hostAddr)
 	return nil
 }
 
@@ -879,9 +713,15 @@ func remoteInitSetupCommand(hostName, hostAddr, targetCfg string) string {
 // column, and sshd runs this line through the login shell, so every value MUST
 // go through shellEnvPrefix. It is a function of its own so a test can run the
 // exact line HostAdd sends through a real shell.
-func remoteAddSetupCommand(hostName, hostAddr, peersYAML, enforcement string) string {
-	return fmt.Sprintf("%s bash -s",
-		shellEnvPrefix(setupScriptEnvWith(hostName, hostAddr, peersYAML, enforcement)))
+//
+// configInstalled says the add has installed the host's own config.yaml with
+// its keys merged in, so setup must not write its template over it.
+func remoteAddSetupCommand(hostName, hostAddr, peersYAML, enforcement string, configInstalled bool) string {
+	env := setupScriptEnvWith(hostName, hostAddr, peersYAML, enforcement)
+	if configInstalled {
+		env = append(env, "CONFIG_INSTALLED=1")
+	}
+	return fmt.Sprintf("%s bash -s", shellEnvPrefix(env))
 }
 
 // readPeerConfig reads an existing cluster node's daemon config over SSH. It
@@ -1210,6 +1050,10 @@ fi
 # Write litevirtd config
 CONFIG=/etc/litevirt/config.yaml
 ` + uiTLSScript + `
+if [ "${CONFIG_INSTALLED:-}" = 1 ] && [ -f /etc/litevirt/config.yaml ]; then
+    # lv host add installed this host's own config with its keys merged in.
+    echo "kept the host's config.yaml"
+else
 cat > /etc/litevirt/config.yaml << CONF
 host_name: "${HOST_NAME}"
 ui_tls: ${UI_TLS}
@@ -1235,6 +1079,7 @@ CONF
 if [ -n "${ENFORCEMENT_B64:-}" ]; then
     echo "${ENFORCEMENT_B64}" | base64 -d >> /etc/litevirt/config.yaml
     echo "enforcement config propagated from the adding node"
+fi
 fi
 
 # pci.udev_hook is deprecated: real-time PCI events are covered by

@@ -17,6 +17,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/nictap"
+	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
 // PlanLoader builds the desired Plan for *this host* from cluster
@@ -562,6 +563,42 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		for _, sg := range plan.SecurityGroups {
 			valid[sg.Name] = true
 		}
+		// A project's group applies only to its own project's NICs
+		// (docs/design/security-group-projects.md): for any other NIC it is
+		// skipped like an unknown name. A NIC whose workload row has not
+		// landed (a create still pending here) passed that check where it
+		// was created.
+		sgProject := map[string]string{}
+		for _, sg := range sgs {
+			if sg.Project != "" {
+				sgProject[sg.Name] = sg.Project
+			}
+		}
+		var vmProjects, ctProjects map[string]string
+		if len(sgProject) > 0 {
+			if vmProjects, ctProjects, err = corrosion.WorkloadProjects(ctx, db, hostName); err != nil {
+				return plan, err
+			}
+		}
+		foreign := func(kind, owner, name string) bool {
+			gp, owned := sgProject[name]
+			if !owned {
+				return false
+			}
+			projects := vmProjects
+			if kind == corrosion.TagMemberCT {
+				projects = ctProjects
+			}
+			wp, known := projects[owner]
+			if !known || tenancy.AdmitAttach(wp, gp) {
+				return false
+			}
+			if _, seen := warnedForeignSG.LoadOrStore(kind+"/"+owner+"/"+name, true); !seen {
+				slog.Warn("firewall: a NIC binds another project's security group; not applying it",
+					"workload", owner, "project", tenancy.NormalizeProject(wp), "group", name, "group_project", gp)
+			}
+			return true
+		}
 		ambiguous := map[string]int{} // duplicate name → this host's NICs held at drop for it
 		// bind resolves one NIC's bound names — its own and those its tag
 		// groups bind on its network, merged first so the ambiguity check
@@ -594,13 +631,27 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			}
 			nb.SecurityGroups = make([]string, 0, len(names))
 			for _, name := range names {
-				if valid[name] {
+				if valid[name] && !foreign(kind, owner, name) {
 					nb.SecurityGroups = append(nb.SecurityGroups, name)
 				}
 			}
 			return nb
 		}
 		armed := opts.Arming.Armed()
+		if len(armed) > 0 && opts.RunningTaps != nil {
+			// A VM that came here and has gone (its row names another host,
+			// libvirt has none of it running here) is not drawn any more.
+			gens := opts.Arming.Generations() // before the snapshots below
+			gensAt := time.Now()
+			// Only an answer from a call that started after gens were read
+			// counts: one joined from before may predate an Arm they reflect.
+			if live, startedAt, terr := taps.fetchStamped(ctx, opts.RunningTaps, opts.TapTimeout); terr == nil && !startedAt.Before(gensAt) {
+				if hosts, herr := vmRowHosts(ctx, db, armed); herr == nil {
+					opts.Arming.Settle(hostName, gens, hosts, func(vm string) bool { return len(live[vm]) > 0 })
+					armed = opts.Arming.Armed()
+				}
+			}
+		}
 		ifaces, err := corrosion.ListHostVMNICs(ctx, db, hostName, armed...)
 		if err != nil {
 			return plan, err
@@ -1205,6 +1256,13 @@ type tapCall struct {
 var errTapFetchOutstanding = errors.New("an earlier libvirt tap lookup overran its deadline and has not returned")
 
 func (f *tapFetcher) fetch(ctx context.Context, src RunningTaps, timeout time.Duration) (map[string]map[string]string, error) {
+	taps, _, err := f.fetchStamped(ctx, src, timeout)
+	return taps, err
+}
+
+// fetchStamped is fetch, also saying when the libvirt call that answered
+// started: a pass that joined an older call gets an older answer.
+func (f *tapFetcher) fetchStamped(ctx context.Context, src RunningTaps, timeout time.Duration) (map[string]map[string]string, time.Time, error) {
 	if timeout <= 0 {
 		timeout = defaultTapTimeout
 	}
@@ -1212,7 +1270,7 @@ func (f *tapFetcher) fetch(ctx context.Context, src RunningTaps, timeout time.Du
 	call := f.inflight
 	if call != nil && time.Since(call.started) > timeout {
 		f.mu.Unlock()
-		return nil, errTapFetchOutstanding
+		return nil, time.Time{}, errTapFetchOutstanding
 	}
 	if call == nil {
 		call = &tapCall{started: time.Now(), done: make(chan struct{})}
@@ -1232,11 +1290,11 @@ func (f *tapFetcher) fetch(ctx context.Context, src RunningTaps, timeout time.Du
 	defer t.Stop()
 	select {
 	case <-call.done:
-		return call.taps, call.err
+		return call.taps, call.started, call.err
 	case <-t.C:
-		return nil, fmt.Errorf("libvirt did not answer within %s", timeout)
+		return nil, time.Time{}, fmt.Errorf("libvirt did not answer within %s", timeout)
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, time.Time{}, ctx.Err()
 	}
 }
 
@@ -1326,4 +1384,23 @@ func sysfsMaster(dev string) string {
 		}
 	}
 	return name
+}
+
+// vmRowHosts is the host each live VM of names has on its row; a name with no
+// live VM row (a container, a VM not created yet) is absent.
+func vmRowHosts(ctx context.Context, db *corrosion.Client, names []string) (map[string]string, error) {
+	args := make([]interface{}, len(names))
+	for i, n := range names {
+		args[i] = n
+	}
+	rows, err := db.Query(ctx, `SELECT name, COALESCE(host_name, '') AS host_name FROM vms
+		 WHERE deleted_at IS NULL AND name IN (?`+strings.Repeat(", ?", len(names)-1)+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(rows))
+	for _, r := range rows {
+		out[r.String("name")] = r.String("host_name")
+	}
+	return out, nil
 }

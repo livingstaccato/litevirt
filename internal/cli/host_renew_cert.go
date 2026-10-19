@@ -403,19 +403,24 @@ func rotateAuditKeyHint(hostName, sshTarget string) string {
 }
 
 // removeCAMachineCopy deletes the copy of the replaced host pair that `lv host
-// init` / `lv host add` left in this machine's pki directory (<host>.key and
-// <host>.crt), when it is that pair: a renewal retires the key, and a copy here
-// would outlive it. The key goes only when it matches the replaced certificate;
-// the certificate goes with it, never alone, and only when it IS the replaced
-// certificate — so no half pair is left behind for a later `lv host add` or a
-// human to trip on.
+// init` (<host>.key and <host>.crt) or `lv host add` (hosts/<host>/host.key
+// and host.crt) left in this machine's pki directory, when it is that pair: a
+// renewal retires the key, and a copy here would outlive it. The key goes only
+// when it matches the replaced certificate; the certificate goes with it,
+// never alone, and only when it IS the replaced certificate — so no half pair
+// is left behind for a later `lv host add` or a human to trip on.
 func removeCAMachineCopy(pkiDir, hostName string, prev *x509.Certificate) {
-	if !safeHostCacheCleanup(pkiDir, hostName) {
+	if safeHostCacheCleanup(pkiDir, hostName) {
+		removeCAMachineCopyAt(filepath.Join(pkiDir, hostName+".key"), filepath.Join(pkiDir, hostName+".crt"), prev)
+	} else {
 		fmt.Println("  NOTE: refusing host-cache cleanup of active or aliased PKI paths")
-		return
 	}
-	keyPath := filepath.Join(pkiDir, hostName+".key")
-	crtPath := filepath.Join(pkiDir, hostName+".crt")
+	if dir := keptHostDir(pkiDir, hostName); dir != "" {
+		removeCAMachineCopyAt(filepath.Join(dir, "host.key"), filepath.Join(dir, "host.crt"), prev)
+	}
+}
+
+func removeCAMachineCopyAt(keyPath, crtPath string, prev *x509.Certificate) {
 	b, err := os.ReadFile(keyPath)
 	if err != nil {
 		return

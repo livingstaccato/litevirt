@@ -149,7 +149,7 @@ func TestAutomationKeyTransitionStoredLifetimeAt(t *testing.T) {
 // keyActivationHistory; no current enrollment/class/custody authority is issued.
 func custodyLifetimeN0History(t *testing.T, at string) ([]*claimTestVoter, AutomationRecord) {
 	t.Helper()
-	voters := custodyLifetimeHistoricalVoters(t, false)
+	voters := custodyLifetimeHistoricalVoters(t, 0)
 	a := voters[0]
 	genesis := sharedAutomationRecord(t, 1, "", "initialize", "initialize-operation", voters...)
 	if _, err := applySharedAutomation(t, a.c, genesis, contract.Reduce, automationFreshAnchor); err != nil {

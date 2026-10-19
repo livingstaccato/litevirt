@@ -139,6 +139,66 @@ with `lv host rm` and added back under the same name starts with no failure
 history; every peer forgets the old machine's failed probes when it leaves the
 host table.
 
+`lv host add` uploads the binary and the host's credentials to staged paths
+on the machine, and moves them into place only once the cluster has admitted
+the host, so a refused add leaves the machine as it was. Each attempt's
+staged files are its own, named for the serial of the certificate it asks the
+cluster to admit and a nonce the attempt prints
+(`.host.crt.add-<serial>-<nonce>`), so two adds of one machine at once, or a
+rerun while the first add is still running, do not replace or remove each
+other's, and the install takes only the pair it was admitted with. It refuses a machine that serves another live member's
+certificate or has its address. While it
+installs, each file it replaces in `/etc/litevirt/pki` is kept beside it as
+`<file>.pre-add-<time>` (0600): the copies are put back if the add fails after
+the admission, and removed once it succeeds. A host admitted by an add that
+did not finish shows `HOST_JOINING`: run the same `lv host add` again, from
+any machine holding the cluster CA, to finish it, or `lv host rm <name>` to
+undo the admission. That removal also deletes the files every attempt left
+staged under the revoked serial on the machine (the config's beside the file
+`config.yaml` resolves to), when it can reach the machine over
+SSH as root within 10 seconds. A rerun refuses when the key staged or installed
+on the machine is not the admitted certificate's. The machine running
+`lv host add` keeps its copy of the admitted credentials in
+`hosts/<name>/` under its pki directory.
+
+One machine is admitted under one name: an add is refused at an address
+another live or joining host holds at port 7443. Two adds made through two
+hosts at once can each be admitted before either admission reaches the
+other. Of those, a host already `active` at the address keeps it, and
+otherwise the one admitted first (the lesser name on a tie); `lv host add`
+asks the cluster again right before it installs, and the other's is refused
+there, naming `lv host rm` for its admission. A host that does not keep its
+address is never activated: it stays `joining` (a restart of its daemon
+activates it once the other is removed), and `lv health` shows
+`host.address_shared`.
+
+From just before it installs to the end of its setup or rollback, an add
+holds the machine: it claims it in `/etc/litevirt/.lv-add-installed`, and every
+command it then runs there takes an `flock` on `/etc/litevirt/.lv-add.lock` in
+the shell that runs it and acts only while that record is still its claim. A
+command delayed past a lost connection therefore runs under the lock or does
+nothing, and never acts on a machine another add has claimed since. Without
+`flock` (util-linux) on the machine the add refuses. Another add of the machine
+is refused while the claim is younger than 10 minutes (setup holds the lock
+while it runs); an older claim is an add that died, and is taken over. An add
+that finds the machine's certificate changed since it began, or another name
+installed there in the last hour whose certificate this machine's CRL does not
+revoke, installs nothing: of two adds of one machine, the second to install is
+refused, whatever its admission. A rollback moves back only files that are
+what that add installed. `lv host rm` removes the record of the admission it
+revoked only while it is still that record, in one locked command.
+
+A machine that already has `/etc/litevirt/config.yaml` keeps it. The add
+edits in place only `host_name`, `advertise_address`, `join_peers`, `pki_dir`
+(set to `/etc/litevirt/pki`, where it installs the credentials) and
+`enforcement`, which becomes the cluster's block, or is removed when the
+cluster has none. Every other line (a `migration.network`, say) is kept as it
+was, as are the file's mode and a symlink to it. The file as it was is kept
+beside it as `config.yaml.pre-add-<time>` (0600). The add refuses a config it
+cannot parse, one with more than one document, one of 1 MiB or more, and a
+`grpc_port` other than 7443 or a `gossip_port` other than 7946, on which
+peers would not reach the host.
+
 Such a host is a new machine to the cluster and inherits nothing the old one
 was configured with: its fencing and IPMI settings, labels, role, region and
 capacity overrides return to their defaults, and its IPMI password is retired

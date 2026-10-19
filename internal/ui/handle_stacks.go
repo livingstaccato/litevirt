@@ -217,6 +217,9 @@ func (s *Server) handleDestroyStack(w http.ResponseWriter, r *http.Request) {
 	var failed, seen, kept, keptNets []string
 	seenItem := map[string]bool{}
 	var streamErr error
+	// localOnly is the daemon's notice that it held no record of the stack
+	// and removed only the workloads it lists; nothing retries a failure then.
+	localOnly := ""
 	for {
 		p, err := stream.Recv()
 		if err != nil {
@@ -229,6 +232,10 @@ func (s *Server) handleDestroyStack(w http.ResponseWriter, r *http.Request) {
 		// a deletion and not a failure. Said by name, with why.
 		// A network kept for a workload the stack did not create is named
 		// apart: it is not a VM.
+		if p.Status == "local-only" {
+			localOnly = p.Error
+			continue
+		}
 		if p.Status == "kept" && strings.HasPrefix(p.VmName, "network ") {
 			keptNets = append(keptNets, strings.TrimPrefix(p.VmName, "network ")+" ("+p.Error+")")
 			continue
@@ -275,6 +282,18 @@ func (s *Server) handleDestroyStack(w http.ResponseWriter, r *http.Request) {
 	if len(keptNets) > 0 {
 		slog.Warn("UI: destroy stack kept networks other workloads use", "stack", name, "kept", keptNets)
 		keptNote += fmt.Sprintf(" Kept network %s.", strings.Join(keptNets, "; network "))
+	}
+	if len(failed) > 0 && localOnly != "" {
+		slog.Warn("UI: local-only destroy stack incomplete", "stack", name, "failures", failed)
+		sendToast(w, fmt.Sprintf("Stack '%s': local-only teardown; %d of %d deletions failed (%s), and nothing will retry them: destroy it again, or remove each workload. %s%s",
+			name, len(failed), len(seen), strings.Join(failed, "; "), localOnly, keptNote), "error")
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	if localOnly != "" {
+		sendToast(w, "Stack '"+name+"': removed this node's workloads only. "+localOnly+keptNote, "warning")
+		w.WriteHeader(http.StatusOK)
+		return
 	}
 	if len(failed) > 0 {
 		slog.Warn("UI: destroy stack incomplete", "stack", name, "failures", failed)

@@ -137,6 +137,13 @@ type containerNICPlan struct {
 // container's leases (network.ReleaseContainerLeases) to undo partial allocation.
 func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName string, nics []*pb.ContainerNetwork) (*containerNICPlan, error) {
 	p := &containerNICPlan{}
+	var sgNames []string
+	for _, n := range nics {
+		sgNames = append(sgNames, n.GetSecurityGroups()...)
+	}
+	if err := s.admitSecurityGroupRefs(ctx, project, sgNames); err != nil {
+		return nil, err
+	}
 	haveGateway := false // one default route: the first managed NIC with a subnet
 	for i, n := range nics {
 		netName := n.NetworkName

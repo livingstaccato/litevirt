@@ -108,6 +108,12 @@ func (h HostRecord) IsWitness() bool { return h.Role == "witness" }
 
 // InsertHost creates a new host record.
 func InsertHost(ctx context.Context, c *Client, h HostRecord) error {
+	return insertHost(ctx, c, h, false)
+}
+
+// insertHost is InsertHost; exclusive is an admission's, which applies only
+// while no other host holds h's address (admissionGuard).
+func insertHost(ctx context.Context, c *Client, h HostRecord, exclusive bool) error {
 	// created_at is the row's incarnation, in the same fixed-width form as a
 	// re-admission's stamp (host_readmit.go, THE INCARNATION): a machine
 	// re-added on an empty database inserts its row after its admission, and
@@ -128,6 +134,11 @@ func InsertHost(ctx context.Context, c *Client, h HostRecord) error {
 				now, uts,
 			}
 			if !live && !liveRuntime {
+				if exclusive {
+					var held string
+					applied, err := c.ExecuteBatchGuarded(ctx, admissionGuard(ctx, h, &held), []Statement{{SQL: insertHostSQL, Params: params}})
+					return admissionResult(h, held, applied, err)
+				}
 				return c.Execute(ctx, insertHostSQL, params...)
 			}
 			// After a split the new host's membership and runtime rows are
@@ -144,6 +155,11 @@ func InsertHost(ctx context.Context, c *Client, h HostRecord) error {
 					Version: h.Version, CPU: someInt(h.CPUTotal), Mem: someInt(h.MemTotal), Disk: someInt(h.DiskTotal),
 					PolicyHash: h.CapacityPolicyHash,
 				}, uts)})
+			}
+			if exclusive {
+				var held string
+				applied, err := c.ExecuteBatchGuarded(ctx, admissionGuard(ctx, h, &held), stmts)
+				return admissionResult(h, held, applied, err)
 			}
 			return c.ExecuteBatch(ctx, stmts)
 		})
@@ -194,10 +210,19 @@ func AdmitHost(ctx context.Context, c *Client, h HostRecord) error {
 		return err
 	}
 	if len(rows) == 0 {
-		return InsertHost(ctx, c, h)
+		return insertHost(ctx, c, h, true)
 	}
 	if rows[0].String("deleted_at") == "" {
 		if strings.EqualFold(rows[0].String("cert_serial"), h.CertSerial) {
+			// A retry of this admission writes nothing, so no guard runs:
+			// the address is checked here, by the rule activation follows.
+			lostTo, err := AddressLostTo(ctx, c, h.Name)
+			if err != nil {
+				return err
+			}
+			if lostTo != "" {
+				return &AddressHeldError{Address: h.Address, Port: h.GRPCPort, Holder: lostTo}
+			}
 			return nil
 		}
 		return fmt.Errorf("host %q is already active", h.Name)
@@ -217,8 +242,10 @@ func AdmitHost(ctx context.Context, c *Client, h HostRecord) error {
 		uts := c.NowTS()
 		params := []interface{}{h.Address, h.SSHUser, h.SSHPort, h.GRPCPort, h.State, h.CertSerial, uts,
 			h.Name, h.CertSerial}
+		var held string
 		if !live {
-			return c.Execute(ctx, readmitHostSQL, params...)
+			applied, err := c.ExecuteBatchGuarded(ctx, admissionGuard(ctx, h, &held), []Statement{{SQL: readmitHostSQL, Params: params}})
+			return admissionResult(h, held, applied, err)
 		}
 		// Re-admission rewrites the identity row whole, state included, and
 		// the membership state goes with it under the same updated_at. The
@@ -227,11 +254,179 @@ func AdmitHost(ctx context.Context, c *Client, h HostRecord) error {
 		if err != nil {
 			return err
 		}
-		return c.ExecuteBatch(ctx, []Statement{
+		applied, err := c.ExecuteBatchGuarded(ctx, admissionGuard(ctx, h, &held), []Statement{
 			{SQL: readmitHostSQL, Params: params},
 			{SQL: hostMembershipStateSQL, Params: []interface{}{h.Name, h.State, epoch, reason, uts}},
 		})
+		return admissionResult(h, held, applied, err)
 	})
+}
+
+// AddressHeldError refuses an admission at an address another live or
+// joining host holds at the admitted gRPC port: one machine is admitted under
+// one name.
+type AddressHeldError struct {
+	Address string
+	Port    int
+	Holder  string
+}
+
+func (e *AddressHeldError) Error() string {
+	return fmt.Sprintf("%s:%d is %s's address", e.Address, e.Port, e.Holder)
+}
+
+// AsAddressHeld is the host an AddressHeldError in err names.
+func AsAddressHeld(err error) (holder string, ok bool) {
+	var e *AddressHeldError
+	if errors.As(err, &e) {
+		return e.Holder, true
+	}
+	return "", false
+}
+
+// hostAddressHolderSQL is the live or joining host other than name at
+// address and port. A port of 0 (or NULL) is not known, so it matches any,
+// on either side.
+const hostAddressHolderSQL = `SELECT name FROM hosts WHERE address = ? AND name <> ? AND deleted_at IS NULL
+	AND (? = 0 OR grpc_port = ? OR grpc_port = 0 OR grpc_port IS NULL) ORDER BY name LIMIT 1`
+
+// HostAddressHolder is the live or joining host other than name that holds
+// address at port, "" when none does, as this replica holds the table.
+func HostAddressHolder(ctx context.Context, c *Client, address, name string, port int) (string, error) {
+	rows, err := c.Query(ctx, hostAddressHolderSQL, address, name, port, port)
+	if err != nil || len(rows) == 0 {
+		return "", err
+	}
+	return rows[0].String("name"), nil
+}
+
+// addressContendersSQL reads the live or joining hosts that share name's
+// address at one gRPC port (a port of 0 matches any), name included: each
+// one's admission stamp and its resolved state.
+const addressContendersSQL = `SELECT h.name AS name, COALESCE(h.created_at, '') AS created_at,
+		COALESCE(h.state, '') AS h_state, COALESCE(m.host_name, '') AS m_host, COALESCE(m.state, '') AS m_state
+	FROM hosts h` + membershipJoins + ` JOIN hosts me ON me.name = ?
+	WHERE me.deleted_at IS NULL AND h.deleted_at IS NULL AND h.address = me.address AND h.address <> ''
+	AND (COALESCE(h.grpc_port, 0) = 0 OR COALESCE(me.grpc_port, 0) = 0 OR h.grpc_port = me.grpc_port)`
+
+type addressContender struct{ name, createdAt, state string }
+
+// addressLostTo decides an address held by more than one live host, the
+// same way on every replica that holds the same rows: a host recorded
+// 'active' keeps it, whatever its stamp, so a host is never activated
+// beside one that already is; otherwise the earliest admission (created_at)
+// keeps it, the lesser name on a tie. It is the host name loses to, "" when
+// name keeps the address.
+func addressLostTo(cs []addressContender, name string) string {
+	for _, c := range cs {
+		if c.name != name && c.state == "active" {
+			return c.name
+		}
+	}
+	winner, at := "", ""
+	for _, c := range cs {
+		if winner == "" || admittedBefore(c.createdAt, c.name, at, winner) {
+			winner, at = c.name, c.createdAt
+		}
+	}
+	if winner == name {
+		return ""
+	}
+	return winner
+}
+
+func contenderOf(name, createdAt, hState, mHost, mState string) addressContender {
+	st := hState
+	if mHost != "" {
+		st = mState // as membershipRow.resolve: the membership row when it exists
+	}
+	return addressContender{name, createdAt, st}
+}
+
+// AddressLostTo is the host that keeps name's address instead of name
+// (addressLostTo), "" when name keeps it or has no live row. Only the host
+// that keeps it is admitted by AdmitHost and activated (ActivateHostFrom).
+func AddressLostTo(ctx context.Context, c *Client, name string) (string, error) {
+	rows, err := c.Query(ctx, addressContendersSQL, name)
+	if err != nil {
+		return "", err
+	}
+	var cs []addressContender
+	for _, r := range rows {
+		cs = append(cs, contenderOf(r.String("name"), r.String("created_at"), r.String("h_state"),
+			r.String("m_host"), r.String("m_state")))
+	}
+	return addressLostTo(cs, name), nil
+}
+
+// addressKeptIn is AddressLostTo read inside a write's transaction: false,
+// with the holder in lostTo, when name does not keep its address.
+func addressKeptIn(ctx context.Context, tx *sql.Tx, name string, lostTo *string) (bool, error) {
+	rows, err := tx.QueryContext(ctx, addressContendersSQL, name)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	var cs []addressContender
+	for rows.Next() {
+		var n, at, hs, mh, ms string
+		if err := rows.Scan(&n, &at, &hs, &mh, &ms); err != nil {
+			return false, err
+		}
+		cs = append(cs, contenderOf(n, at, hs, mh, ms))
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	*lostTo = addressLostTo(cs, name)
+	return *lostTo == "", nil
+}
+
+// admittedBefore orders two admissions by stamp, then name.
+func admittedBefore(aAt, aName, bAt, bName string) bool {
+	ta, ea := time.Parse(time.RFC3339Nano, aAt)
+	tb, eb := time.Parse(time.RFC3339Nano, bAt)
+	switch {
+	case ea == nil && eb == nil && !ta.Equal(tb):
+		return ta.Before(tb)
+	case (ea != nil || eb != nil) && aAt != bAt:
+		return aAt < bAt
+	}
+	return aName < bName
+}
+
+// admissionGuard is the guard of every admission write of h
+// (ExecuteBatchGuarded): it applies only if, read in the same transaction,
+// no other live or joining host holds h's address, which it records in held.
+// Two admissions of one machine under two names on this replica cannot both
+// commit, whatever read either made before.
+//
+// It is one replica's guard. Two admissions on two replicas, each made before
+// the other's row arrived, can both commit; the lease holder names such a
+// pair (grpcapi host.address_shared).
+func admissionGuard(ctx context.Context, h HostRecord, held *string) func(*sql.Tx) (bool, error) {
+	return func(tx *sql.Tx) (bool, error) {
+		err := tx.QueryRowContext(ctx, hostAddressHolderSQL, h.Address, h.Name, h.GRPCPort, h.GRPCPort).Scan(held)
+		if errors.Is(err, sql.ErrNoRows) {
+			return true, nil
+		}
+		return false, err
+	}
+}
+
+// admissionResult is an admission write's outcome: an AddressHeldError when
+// admissionGuard refused it, and nothing of it was written or logged.
+func admissionResult(h HostRecord, held string, applied bool, err error) error {
+	if err != nil {
+		return err
+	}
+	if !applied {
+		if held == "" {
+			return fmt.Errorf("admission of %s was not applied", h.Name)
+		}
+		return &AddressHeldError{Address: h.Address, Port: h.GRPCPort, Holder: held}
+	}
+	return nil
 }
 
 // ErrReadmitNeedsCounter refuses a legacy re-admission over a tombstone of a
@@ -288,17 +483,20 @@ func AdmitHostV2(ctx context.Context, c *Client, h HostRecord, g capabilities.Fe
 		}
 		at = stamp
 		params := readmitV2Params(h, next, at, uts)
+		var held string
 		if !live {
-			return c.ExecuteBatch(ctx, []Statement{{SQL: readmitHostV2SQL, Params: params}})
+			applied, err := c.ExecuteBatchGuarded(ctx, admissionGuard(ctx, h, &held), []Statement{{SQL: readmitHostV2SQL, Params: params}})
+			return admissionResult(h, held, applied, err)
 		}
 		epoch, reason, err := currentIsolation(ctx, c, h.Name)
 		if err != nil {
 			return err
 		}
-		return c.ExecuteBatch(ctx, []Statement{
+		applied, err := c.ExecuteBatchGuarded(ctx, admissionGuard(ctx, h, &held), []Statement{
 			{SQL: readmitHostV2SQL, Params: params},
 			{SQL: hostMembershipStateSQL, Params: []interface{}{h.Name, h.State, epoch, reason, uts}},
 		})
+		return admissionResult(h, held, applied, err)
 	})
 	if err != nil {
 		return 0, "", err
@@ -807,6 +1005,54 @@ func UpdateHostStateFrom(ctx context.Context, c *Client, name, from, to string) 
 	return applied, err
 }
 
+// ActivateHostFrom is UpdateHostStateFrom(name, from, "active") made only
+// while, read in the same transaction, name keeps its address
+// (AddressLostTo): a host is never recorded active beside another host at
+// its address that already is, nor while an earlier admission there stands.
+// lostTo names the holder when that refused the write.
+func ActivateHostFrom(ctx context.Context, c *Client, name, from string) (applied bool, lostTo string, err error) {
+	err = c.withMembershipWrite(ctx, func(live bool) error {
+		stmts, err := hostStateStatements(ctx, c, name, "active", live)
+		if err != nil {
+			return err
+		}
+		applied, err = c.ExecuteBatchGuarded(ctx, activationGuard(ctx, c, name, from, &lostTo), stmts)
+		return err
+	})
+	return applied, lostTo, err
+}
+
+// ActivateHostStartupFrom is UpdateHostStartupFrom(..., "active", ...) under
+// ActivateHostFrom's address rule.
+func ActivateHostStartupFrom(ctx context.Context, c *Client, name, from, version string, cpu, mem, disk int, hasResources bool) (applied bool, lostTo string, err error) {
+	if err := c.ownRowWriteRefused(name); err != nil {
+		return false, "", err
+	}
+	err = c.withMembershipWrite(ctx, func(live bool) error {
+		return c.withRuntimeWrite(ctx, func(liveRuntime bool) error {
+			stmts, err := hostStartupStatements(ctx, c, name, "active", version, cpu, mem, disk, hasResources, live, liveRuntime)
+			if err != nil || len(stmts) == 0 {
+				return err
+			}
+			applied, err = c.ExecuteBatchGuarded(ctx, activationGuard(ctx, c, name, from, &lostTo), stmts)
+			return err
+		})
+	})
+	return applied, lostTo, err
+}
+
+// activationGuard is hostStateIs(name, from) and addressKeptIn, both read in
+// the write's transaction.
+func activationGuard(ctx context.Context, c *Client, name, from string, lostTo *string) func(tx *sql.Tx) (bool, error) {
+	stateIs := hostStateIs(ctx, c, name, from)
+	return func(tx *sql.Tx) (bool, error) {
+		if ok, err := stateIs(tx); err != nil || !ok {
+			return false, err
+		}
+		return addressKeptIn(ctx, tx, name, lostTo)
+	}
+}
+
 // hostStateIs is the guard of a write made only while host is recorded
 // `from`: it reads the state inside the write's transaction, as
 // membershipRow.resolve does. Build it inside withMembershipWrite.
@@ -898,25 +1144,27 @@ func DeleteHost(ctx context.Context, c *Client, name string) error {
 }
 
 // DeleteHostIf is DeleteHost only while name's live row is still the
-// admission a caller checked: the certificate serial (compared without case)
-// and the incarnation, read in the same transaction as the delete. A row that
-// changed since — removed, re-admitted under a new certificate or
-// incarnation, its certificate renewed — is not deleted, and applied is
+// admission a caller checked: its whole ordering key (incarnation and
+// admission stamp, host_incarnation.go) and its certificate serial (compared
+// without case), read in the same transaction as the delete. A row that
+// changed since — removed, re-admitted under a new certificate, incarnation
+// or stamp (a later duplicate admission at the same incarnation, even of the
+// same certificate), its certificate renewed — is not deleted, and applied is
 // false. The statements are DeleteHost's.
-func DeleteHostIf(ctx context.Context, c *Client, name, serial string, incarnation int64) (applied bool, err error) {
+func DeleteHostIf(ctx context.Context, c *Client, name, serial string, key HostIncarnation) (applied bool, err error) {
 	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
-		var curSerial string
+		var curSerial, curAt string
 		var curInc int64
 		err := tx.QueryRowContext(ctx,
-			`SELECT COALESCE(cert_serial, ''), COALESCE(incarnation, 0) FROM hosts WHERE name = ? AND deleted_at IS NULL`,
-			name).Scan(&curSerial, &curInc)
+			`SELECT COALESCE(cert_serial, ''), COALESCE(incarnation, 0), COALESCE(created_at, '') FROM hosts WHERE name = ? AND deleted_at IS NULL`,
+			name).Scan(&curSerial, &curInc, &curAt)
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
 		}
 		if err != nil {
 			return false, err
 		}
-		return strings.EqualFold(curSerial, serial) && curInc == incarnation, nil
+		return strings.EqualFold(curSerial, serial) && curInc == key.N && curAt == key.At, nil
 	}, deleteHostStatements(c, name))
 }
 

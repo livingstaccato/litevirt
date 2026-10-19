@@ -308,6 +308,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			return nil, err
 		}
 	}
+	if err := s.admitSecurityGroupRefs(ctx, project, nicSecurityGroupNames(spec.Network)); err != nil {
+		return nil, err
+	}
 
 	// Placement: determine which host should run this VM.
 	placementReq := s.createVMPlacementRequest(ctx, spec, req.AllowOvercommit)
@@ -6635,6 +6638,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			}
 		}
 		s.firmware.ApplyTo(&vmCfg, s.dataDir, spec.Name, spec.SecureBoot, spec.Tpm)
+		if err := ensureNvramDir(&vmCfg); err != nil {
+			return nil, err
+		}
 
 		s.withNICMTU(&vmCfg)
 		var gerr error

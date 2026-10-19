@@ -269,6 +269,11 @@ type VMDef struct {
 	Firmware string `yaml:"firmware"` // uefi | bios
 	Machine  string `yaml:"machine"`  // q35 | pc
 
+	// UEFI Secure Boot (uefi + q35) and a vTPM, as lv run --secure-boot
+	// --tpm. Toggling either on an existing VM is a restart-class update.
+	SecureBoot bool `yaml:"secure-boot"`
+	TPM        bool `yaml:"tpm"`
+
 	// Compute
 	CPU      int    `yaml:"cpu"`
 	MaxCPU   int    `yaml:"max-cpu"`   // vCPU hotplug ceiling (> cpu) for live CPU hot-add; requires live_resize

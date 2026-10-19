@@ -58,6 +58,15 @@ type NetBoxFake struct {
 
 	// released records every id deleted through the REST API, in order.
 	released []int
+	// cascaded records every address id deleted because the interface it was
+	// assigned to was deleted, in order.
+	cascaded []int
+	// lastIPID is the highest address id ever handed out; see nextID.
+	lastIPID int
+	// viewOnly is the address ids the API token may view but not change, as
+	// a NetBox ObjectPermission scoped to view would make them: a GET
+	// returns the object, and a PATCH or DELETE answers 404.
+	viewOnly map[int]bool
 
 	// addrRequests counts EVERY request to the ipam address surface — the
 	// collection, the id-scoped routes and the per-prefix available-ips band —
@@ -439,9 +448,19 @@ func (f *NetBoxFake) handle(w http.ResponseWriter, r *http.Request) {
 	// prefixes below, and its DELETE before any collection handler, or a
 	// release would fall through to the 404.
 	case strings.HasPrefix(r.URL.Path, "/api/ipam/ip-addresses/") && r.Method == http.MethodDelete:
+		if f.isViewOnly(r.URL.Path) {
+			writeErr(w, http.StatusNotFound, `{"detail":"No IPAddress matches the given query."}`)
+			return
+		}
 		f.release(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/ipam/ip-addresses/") && r.Method == http.MethodPatch:
+		if f.isViewOnly(r.URL.Path) {
+			writeErr(w, http.StatusNotFound, `{"detail":"No IPAddress matches the given query."}`)
+			return
+		}
 		f.patchIdentity(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/ipam/ip-addresses/") && r.Method == http.MethodGet:
+		f.getAddress(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/ipam/prefixes/"):
 		f.getPrefix(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/ipam/vrfs/"):
@@ -537,8 +556,10 @@ func (f *NetBoxFake) claimSpecific(w http.ResponseWriter, r *http.Request) {
 	}
 
 	f.mu.Lock()
+	// NetBox's uniqueness check: only in a VRF that enforces it, and on the
+	// HOST — 10.0.5.9/24 and 10.0.5.9/32 are one address.
 	for _, existing := range f.byID {
-		if existing.Address == body.Address && existing.VRFID == body.VRF {
+		if f.vrfs[body.VRF] && existing.VRFID == body.VRF && sameHostAddr(existing.Address, body.Address) {
 			f.mu.Unlock()
 			// The real duplicate refusal: a 400, which classifies as a DEFINITE
 			// answer even though our own earlier POST may be what created it.
@@ -562,6 +583,9 @@ var lookupParams = map[string]bool{
 	"cf_litevirt_identity":    true,
 	"cf_litevirt_identity__n": true,
 	"vminterface_id":          true,
+	"virtual_machine_id":      true,
+	"assigned_object_type":    true,
+	"assigned_object_id":      true,
 	"limit":                   true,
 	"offset":                  true,
 }
@@ -615,10 +639,17 @@ func (f *NetBoxFake) lookup(w http.ResponseWriter, r *http.Request) {
 		ids = append(ids, id)
 	}
 	sort.Ints(ids) // stable order so pagination is deterministic
+	// Which VM each interface belongs to: virtual_machine_id filters on it, and
+	// the nested assigned_object carries it, both resolved through the
+	// interface exactly as NetBox resolves them.
+	ifaceVM := make(map[int]int, len(f.ifaces))
+	for id, iface := range f.ifaces {
+		ifaceVM[id] = iface.VMID
+	}
 	var matched []*fakeIP
 	for _, id := range ids {
 		ip := f.byID[id]
-		if !matchIP(ip, q, parent) {
+		if !matchIP(ip, q, parent, ifaceVM) {
 			continue
 		}
 		copied := *ip
@@ -642,7 +673,12 @@ func (f *NetBoxFake) lookup(w http.ResponseWriter, r *http.Request) {
 		Results []ipView `json:"results"`
 	}{Count: total, Results: []ipView{}}
 	for _, ip := range page {
-		out.Results = append(out.Results, ipJSON(*ip))
+		v := ipJSON(*ip)
+		if ip.AssignedObjectID != 0 {
+			v.AssignedObject = &assignedRef{ID: ip.AssignedObjectID,
+				VirtualMachine: &objRef{ID: ifaceVM[ip.AssignedObjectID]}}
+		}
+		out.Results = append(out.Results, v)
 	}
 	if end < total {
 		out.Next = fmt.Sprintf("%s/api/ipam/ip-addresses/?limit=%d&offset=%d", f.srv.URL, limit, end)
@@ -652,7 +688,7 @@ func (f *NetBoxFake) lookup(w http.ResponseWriter, r *http.Request) {
 
 // matchIP applies every recognised filter. A filter that is present but matches
 // nothing yields an EMPTY result, never an unfiltered one.
-func matchIP(ip *fakeIP, q map[string][]string, parent *net.IPNet) bool {
+func matchIP(ip *fakeIP, q map[string][]string, parent *net.IPNet, ifaceVM map[int]int) bool {
 	get := func(k string) (string, bool) {
 		v, ok := q[k]
 		if !ok || len(v) == 0 {
@@ -660,8 +696,15 @@ func matchIP(ip *fakeIP, q map[string][]string, parent *net.IPNet) bool {
 		}
 		return v[0], true
 	}
-	if v, ok := get("address"); ok && ip.Address != v {
-		return false
+	// NetBox's address filter: a value with a prefix length matches that exact
+	// address, and a bare host matches the host under any mask.
+	if v, ok := get("address"); ok {
+		if strings.Contains(v, "/") && ip.Address != v {
+			return false
+		}
+		if !strings.Contains(v, "/") && !sameHostAddr(ip.Address, v) {
+			return false
+		}
 	}
 	if v, ok := get("vrf_id"); ok {
 		want, err := strconv.Atoi(v)
@@ -696,6 +739,26 @@ func matchIP(ip *fakeIP, q map[string][]string, parent *net.IPNet) bool {
 			return false
 		}
 	}
+	// Every address this fake holds is assigned to a VM interface or to
+	// nothing, so the content type matches only "virtualization.vminterface",
+	// and only on an assigned address.
+	if v, ok := get("assigned_object_type"); ok &&
+		(v != "virtualization.vminterface" || ip.AssignedObjectID == 0) {
+		return false
+	}
+	if v, ok := get("assigned_object_id"); ok {
+		want, err := strconv.Atoi(v)
+		if err != nil || ip.AssignedObjectID != want {
+			return false
+		}
+	}
+	if v, ok := get("virtual_machine_id"); ok {
+		want, err := strconv.Atoi(v)
+		vm, assigned := ifaceVM[ip.AssignedObjectID]
+		if err != nil || ip.AssignedObjectID == 0 || !assigned || vm != want {
+			return false
+		}
+	}
 	if parent != nil {
 		host, _, err := net.ParseCIDR(ip.Address)
 		if err != nil || !parent.Contains(host) {
@@ -703,6 +766,19 @@ func matchIP(ip *fakeIP, q map[string][]string, parent *net.IPNet) bool {
 		}
 	}
 	return true
+}
+
+// sameHostAddr reports whether two addresses, each with or without a prefix
+// length, name the same host.
+func sameHostAddr(a, b string) bool {
+	host := func(s string) net.IP {
+		if i := strings.IndexByte(s, '/'); i >= 0 {
+			s = s[:i]
+		}
+		return net.ParseIP(s)
+	}
+	ha, hb := host(a), host(b)
+	return ha != nil && hb != nil && ha.Equal(hb)
 }
 
 // getPrefix is GET /api/ipam/prefixes/{id}/.
@@ -783,7 +859,7 @@ func (f *NetBoxFake) release(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	_, known := f.byID[id]
 	if known {
-		delete(f.byID, id)
+		f.forgetAddressLocked(id)
 		f.released = append(f.released, id)
 	}
 	f.mu.Unlock()
@@ -794,6 +870,47 @@ func (f *NetBoxFake) release(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// SetViewOnly makes the API token able to view address id but not change it.
+func (f *NetBoxFake) SetViewOnly(id int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.viewOnly == nil {
+		f.viewOnly = map[int]bool{}
+	}
+	f.viewOnly[id] = true
+}
+
+func (f *NetBoxFake) isViewOnly(path string) bool {
+	id, ok := idFromPath(path, "/api/ipam/ip-addresses/")
+	if !ok {
+		return false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.viewOnly[id]
+}
+
+// getAddress is GET /api/ipam/ip-addresses/{id}/.
+func (f *NetBoxFake) getAddress(w http.ResponseWriter, r *http.Request) {
+	id, ok := idFromPath(r.URL.Path, "/api/ipam/ip-addresses/")
+	if !ok {
+		writeErr(w, http.StatusNotFound, "unparseable ip id in %s", r.URL.Path)
+		return
+	}
+	f.mu.Lock()
+	ip, known := f.byID[id]
+	var out ipView
+	if known {
+		out = ipJSON(*ip)
+	}
+	f.mu.Unlock()
+	if !known {
+		writeErr(w, http.StatusNotFound, "no ip-address %d", id)
+		return
+	}
+	writeJSON(w, out)
 }
 
 // patchIdentity is PATCH /api/ipam/ip-addresses/{id}/ — the identity rewrite a
@@ -902,8 +1019,12 @@ func (f *NetBoxFake) patchIPAssignment(w http.ResponseWriter, body map[string]js
 		target = *objID
 	}
 	_, ifaceKnown := f.ifaces[target]
+	// NetBox's IPAddress.clean(): an address that is its VM's primary_ip4 or
+	// primary_ip6 may not move to another parent — and "no parent" is
+	// another parent, so a detach is refused too.
+	primaryHeld := known && f.primaryReassignLocked(ip, target)
 	var updated fakeIP
-	if known && (target == 0 || ifaceKnown) {
+	if known && (target == 0 || ifaceKnown) && !primaryHeld {
 		ip.AssignedObjectID = target
 		updated = *ip
 	}
@@ -912,12 +1033,33 @@ func (f *NetBoxFake) patchIPAssignment(w http.ResponseWriter, body map[string]js
 		writeErr(w, http.StatusNotFound, "no ip-address %d", id)
 		return
 	}
+	if primaryHeld {
+		writeErr(w, http.StatusBadRequest,
+			`{"__all__":["Cannot reassign IP address while it is designated as the primary IP for the parent object"]}`)
+		return
+	}
 	if target != 0 && !ifaceKnown {
 		writeErr(w, http.StatusBadRequest,
 			`{"assigned_object_id":["Invalid pk %d - object does not exist."]}`, target)
 		return
 	}
 	writeJSON(w, ipJSON(updated))
+}
+
+// primaryReassignLocked reports whether moving ip to interface target (0 for
+// none) changes the parent of an address that is its current parent VM's
+// primary. Caller holds f.mu.
+func (f *NetBoxFake) primaryReassignLocked(ip *fakeIP, target int) bool {
+	cur, ok := f.ifaces[ip.AssignedObjectID]
+	if !ok {
+		return false
+	}
+	vm, ok := f.vms[cur.VMID]
+	if !ok || (vm.PrimaryIP4ID != ip.ID && vm.PrimaryIP6ID != ip.ID) {
+		return false
+	}
+	next, ok := f.ifaces[target]
+	return !ok || next.VMID != cur.VMID
 }
 
 // SetVRFEnforceUnique flips a VRF's enforce_unique flag. An operator can do this
@@ -1003,9 +1145,12 @@ func (f *NetBoxFake) Reassign(id int, identity string) {
 // nextID hands out object ids from a band that cannot collide with the address
 // host numbers, so a test misreading one for the other fails loudly.
 func (f *NetBoxFake) nextID() int {
-	id := 9000 + len(f.byID)
+	// Never an id handed out before, as NetBox's are monotonic: an address
+	// re-created after a delete must not come back under the dead id.
+	id := max(9000+len(f.byID), f.lastIPID+1)
 	for {
 		if _, taken := f.byID[id]; !taken {
+			f.lastIPID = id
 			return id
 		}
 		id++
@@ -1053,12 +1198,27 @@ func (f *NetBoxFake) nextAddressIn(cidr string) (string, error) {
 
 // ipView is the ip-address JSON shape the real API returns.
 type ipView struct {
-	ID               int               `json:"id"`
-	Address          string            `json:"address"`
-	VRF              *vrfRef           `json:"vrf"`
-	AssignedObjectID *int              `json:"assigned_object_id"`
-	CustomFields     map[string]string `json:"custom_fields"`
-	Created          string            `json:"created"`
+	ID               int     `json:"id"`
+	Address          string  `json:"address"`
+	VRF              *vrfRef `json:"vrf"`
+	AssignedObjectID *int    `json:"assigned_object_id"`
+	// AssignedObjectType and AssignedObject are what NetBox serves beside the
+	// id: the content type of the generic relation, and the nested interface
+	// with the VM it belongs to. AssignedObject is filled by the list handler,
+	// which can resolve the interface.
+	AssignedObjectType *string           `json:"assigned_object_type"`
+	AssignedObject     *assignedRef      `json:"assigned_object"`
+	CustomFields       map[string]string `json:"custom_fields"`
+	Created            string            `json:"created"`
+}
+
+type assignedRef struct {
+	ID             int     `json:"id"`
+	VirtualMachine *objRef `json:"virtual_machine"`
+}
+
+type objRef struct {
+	ID int `json:"id"`
 }
 
 type vrfRef struct {
@@ -1083,6 +1243,8 @@ func ipJSON(ip fakeIP) ipView {
 	if ip.AssignedObjectID != 0 {
 		id := ip.AssignedObjectID
 		out.AssignedObjectID = &id
+		typ := "virtualization.vminterface"
+		out.AssignedObjectType = &typ
 	}
 	return out
 }

@@ -39,7 +39,7 @@ func TestWireCredentialsSplitGate_TracksTheDurableLatch(t *testing.T) {
 	})
 
 	d := &Daemon{db: db, checker: checker, cfg: &Config{}}
-	d.wireCredentialsSplitGate()
+	d.wireCorrosionGates() // the set the daemon wires, so a lost call fails here
 	onDisk := CredentialsSplitLatchedOnDisk(dataDir)
 
 	if db.MayWriteCredentialTables() || onDisk() {

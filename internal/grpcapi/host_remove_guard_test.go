@@ -119,3 +119,119 @@ func TestRemoveHost_ADelayedRemovalRefusesAChangedAdmission(t *testing.T) {
 		}
 	})
 }
+
+// readmitSameKeySQL is corrosion's readmitHostV2SQL, verbatim: a test-side
+// copy so a duplicate admission can be written as a peer would write it.
+const readmitSameKeySQL = `UPDATE hosts SET address = ?, ssh_user = ?, ssh_port = ?, grpc_port = ?,
+			state = ?, cert_serial = ?, incarnation = ?, created_at = ?, deleted_at = NULL, updated_at = ?
+		 WHERE name = ? AND (incarnation < ? OR (incarnation = ? AND created_at < ?))`
+
+// The checked admission is its whole key, (incarnation, created_at), and its
+// serial. Two admissions of one staged certificate at one incarnation are a
+// supported input (host_incarnation.go: the later stamp replaces the row
+// whole): a removal that checked the first and was delayed while the second
+// committed — same serial, same incarnation, a later stamp — deletes nothing.
+// The later admission stays live with its related rows, and no removal of the
+// name is logged, under its stamp or any other.
+//
+// Mutation: leave created_at out of DeleteHostIf's guard — the later
+// admission is tombstoned under the removal that never checked it, red.
+func TestRemoveHost_ADelayedRemovalRefusesALaterAdmissionAtTheSameIncarnation(t *testing.T) {
+	ctx := context.Background()
+	s := incServer(t, 0)
+	s.SetReleaseFeatureGate(&scriptedFeatureGate{t: t})
+	if _, err := admit(s, "host-x"); err != nil {
+		t.Fatalf("admission A: %v", err)
+	}
+	n, atA, serial, deleted, _, err := corrosion.HostIncarnationOf(ctx, s.db, "host-x")
+	if err != nil || deleted || n != 1 || atA == "" {
+		t.Fatalf("admission A = (%d, %q, deleted %v), %v; want live at 1", n, atA, deleted, err)
+	}
+	removals := func() int {
+		var c int
+		if err := s.db.DB().QueryRow(`SELECT COUNT(*) FROM mutation_log WHERE stmts LIKE '%UPDATE hosts SET deleted_at%' AND stmts LIKE '%"host-x"%'`).Scan(&c); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	before := removals()
+	var atB string
+	s.removeHostBeforeDeleteHook = func(name string) {
+		uts := s.db.NowTS()
+		stamp, ok := corrosion.ReadmitStamp(uts)
+		if !ok || stamp <= atA {
+			t.Fatalf("admission B's stamp %q is not after A's %q", stamp, atA)
+		}
+		atB = stamp
+		if err := s.db.ExecuteBatch(ctx, []corrosion.Statement{{SQL: readmitSameKeySQL, Params: []interface{}{
+			"10.0.0.9", "root", 22, 9443, "joining", serial, int64(1), atB, uts, name, int64(1), int64(1), atB,
+		}}}); err != nil {
+			t.Fatalf("admission B: %v", err)
+		}
+		if _, err := s.db.DB().Exec(`INSERT INTO host_health (observer, target, status, updated_at) VALUES ('host-x', 'peer-host', 'ok', '2026-10-18T00:00:00Z')`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err = s.RemoveHost(adminCtx(), &pb.RemoveHostRequest{Name: "host-x", Force: true, ExpectedCertSerial: serial})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("the delayed removal = %v, want FailedPrecondition", err)
+	}
+	n, at, gotSerial, deleted, _, err := corrosion.HostIncarnationOf(ctx, s.db, "host-x")
+	if err != nil || deleted || n != 1 || at != atB || gotSerial != serial {
+		t.Errorf("admission B's row = (%d, %q, %q, deleted %v), %v; want live (1, %q, %q)", n, at, gotSerial, deleted, err, atB, serial)
+	}
+	var live int
+	if err := s.db.DB().QueryRow(`SELECT COUNT(*) FROM host_health WHERE observer = 'host-x' AND deleted_at IS NULL`).Scan(&live); err != nil {
+		t.Fatal(err)
+	}
+	if live != 1 {
+		t.Errorf("admission B's host_health rows live = %d, want 1", live)
+	}
+	if got := removals(); got != before {
+		t.Errorf("removals of host-x logged = %d, want %d (none by the delayed removal)", got, before)
+	}
+}
+
+// The checks themselves are made on one admission: a later admission of the
+// same certificate at the same incarnation that lands between the removal's
+// read of the row and its read of the row's key is not the row the checks
+// passed, and nothing is removed.
+//
+// Mutation: compare only the serial between the two reads (leave out
+// at != h.CreatedAt) — the key read is B's, DeleteHostIf passes, and B is
+// tombstoned, red.
+func TestRemoveHost_ALaterAdmissionBetweenTheChecksReadsIsRefused(t *testing.T) {
+	ctx := context.Background()
+	s := incServer(t, 0)
+	s.SetReleaseFeatureGate(&scriptedFeatureGate{t: t})
+	if _, err := admit(s, "host-x"); err != nil {
+		t.Fatalf("admission A: %v", err)
+	}
+	_, atA, serial, _, _, err := corrosion.HostIncarnationOf(ctx, s.db, "host-x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var atB string
+	s.removeHostBetweenReadsHook = func(name string) {
+		s.removeHostBetweenReadsHook = nil
+		uts := s.db.NowTS()
+		stamp, ok := corrosion.ReadmitStamp(uts)
+		if !ok || stamp <= atA {
+			t.Fatalf("admission B's stamp %q is not after A's %q", stamp, atA)
+		}
+		atB = stamp
+		if err := s.db.ExecuteBatch(ctx, []corrosion.Statement{{SQL: readmitSameKeySQL, Params: []interface{}{
+			"10.0.0.9", "root", 22, 9443, "joining", serial, int64(1), atB, uts, name, int64(1), int64(1), atB,
+		}}}); err != nil {
+			t.Fatalf("admission B: %v", err)
+		}
+	}
+	_, err = s.RemoveHost(adminCtx(), &pb.RemoveHostRequest{Name: "host-x", Force: true, ExpectedCertSerial: serial})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("the removal = %v, want FailedPrecondition", err)
+	}
+	n, at, _, deleted, _, err := corrosion.HostIncarnationOf(ctx, s.db, "host-x")
+	if err != nil || deleted || n != 1 || atB == "" || at != atB {
+		t.Errorf("admission B's row = (%d, %q, deleted %v), %v; want live (1, %q)", n, at, deleted, err, atB)
+	}
+}

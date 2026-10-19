@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -44,6 +46,9 @@ func (ae *AntiEntropy) pullAndMerge(ctx context.Context, client pb.LiteVirtClien
 		allowed = sensitiveTableSet
 	}
 	if !ae.legacyRepair {
+		if err := pullGuardFrom(ctx).check(ctx); err != nil {
+			return nil, err, nil
+		}
 		keep := map[string]bool{}
 		tracked := ae.client.UnresolvedTieTables()
 		for _, t := range tables {
@@ -89,6 +94,9 @@ func (ae *AntiEntropy) pullAndMerge(ctx context.Context, client pb.LiteVirtClien
 	}
 
 	// The blob dump: an older peer, or the stand-down.
+	if err := pullGuardFrom(ctx).check(ctx); err != nil {
+		return nil, err, nil
+	}
 	var data []byte
 	var err error
 	if sensitive {
@@ -248,4 +256,56 @@ func (ae *AntiEntropy) PullTableNow(ctx context.Context, table, exclude string) 
 		errs = append(errs, ctx.Err().Error())
 	}
 	return "", skipped, fmt.Errorf("%w: %s", ErrNoPeerConfirmed, strings.Join(errs, "; "))
+}
+
+// errPeerChangedMidExchange refuses a pull over a session whose peer changed
+// since the exchange began.
+var errPeerChangedMidExchange = errors.New("anti-entropy: the peer's row, isolation or source permission, or this node's PKI, changed during the exchange")
+
+// pullGuard re-checks, before each stream one exchange opens, what the
+// exchange was opened on: that this node may merge from the peer, and that
+// the connection's key (the peer's endpoint and certificate serial, and this
+// node's PKI files, CRL included) still holds. A merge earlier in the same
+// exchange can change any of them — the peer's newer row, its isolation, a
+// policy that refuses it — and so can a CRL installed meanwhile. Once tripped
+// it stays tripped: the rest of the exchange is refused and the connection is
+// dropped, so the next pass dials afresh under the new state.
+type pullGuard struct {
+	ae      *AntiEntropy
+	peer    string
+	pc      *aePooledConn
+	tripped atomic.Bool
+}
+
+// check returns errPeerChangedMidExchange when a pull may not be opened. A
+// nil guard (a pull outside an exchange) allows everything.
+func (g *pullGuard) check(ctx context.Context) error {
+	if g == nil {
+		return nil
+	}
+	if g.tripped.Load() {
+		return errPeerChangedMidExchange
+	}
+	if g.ae.mergeSourceRefused(ctx, g.peer) {
+		g.tripped.Store(true)
+		return errPeerChangedMidExchange
+	}
+	if _, key, err := g.ae.peerKey(ctx, g.peer); err != nil || key != g.pc.key {
+		slog.Info("anti-entropy: not pulling over a connection whose peer row or local PKI changed since it was checked; it is redialled next pass",
+			"peer", g.peer, "error", err)
+		g.tripped.Store(true)
+		return errPeerChangedMidExchange
+	}
+	return nil
+}
+
+type pullGuardKey struct{}
+
+func withPullGuard(ctx context.Context, g *pullGuard) context.Context {
+	return context.WithValue(ctx, pullGuardKey{}, g)
+}
+
+func pullGuardFrom(ctx context.Context) *pullGuard {
+	g, _ := ctx.Value(pullGuardKey{}).(*pullGuard)
+	return g
 }

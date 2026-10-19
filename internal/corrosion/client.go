@@ -482,6 +482,12 @@ type Client struct {
 	// at one generation is resolved (spec_conflict.go). Unset reads false,
 	// the previous release's behaviour.
 	specConflictGate atomic.Pointer[func() bool]
+	// netboxRepointGate, when set and returning true, permits re-pointing a
+	// live lease at a re-created NetBox address. Injected via
+	// SetNetBoxRepointGate, wired to the durable netbox_ip_repoint_v1 latch.
+	// Fails CLOSED when unset: the re-point is a shape a previous-release peer
+	// has no ledger entry for. See netbox_repoint.go.
+	netboxRepointGate atomic.Pointer[func() bool]
 	// specDropsSeen is the spec-edit drops already noted (firstSpecDrop),
 	// with whether each one's event is recorded.
 	specDropsMu   sync.Mutex

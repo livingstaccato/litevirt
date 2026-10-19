@@ -53,7 +53,7 @@ func TestWireLeaseTermLedgerGate_TheMintTracksTheDurableLatch(t *testing.T) {
 	})
 
 	d := &Daemon{db: db, checker: checker, cfg: &Config{}}
-	d.wireLeaseTermLedgerGate()
+	d.wireCorrosionGates() // the set the daemon wires, so a lost call fails here
 
 	// Before the latch: the pre-ledger behaviour. A term would be a statement
 	// shape a previous-release peer cannot resolve.
@@ -97,8 +97,20 @@ func TestWireLeaseMintClearance_WithholdsUntilTheServerIsPublished(t *testing.T)
 	}); err != nil {
 		t.Fatalf("register host: %v", err)
 	}
-	d := &Daemon{db: db, cfg: &Config{}}
-	d.wireLeaseMintClearance()
+	// A checker, as the daemon has one before it wires anything: the test goes
+	// through wireCorrosionGates, so removing the clearance from the set the
+	// daemon wires at start fails here. The ledger gate it also wires opens
+	// once lease_term_ledger_v1 latches, which a cluster of one does at once.
+	checker := health.NewChecker("host-a", "/etc/litevirt/pki", db)
+	checker.SetActivationMarker(filepath.Join(t.TempDir(), "split_brain_activated"))
+	checker.SetPeerPinger(func(context.Context, string) ([]string, time.Time, error) {
+		return capabilities.Supported(), time.Time{}, nil
+	})
+	d := &Daemon{db: db, checker: checker, cfg: &Config{}}
+	d.wireCorrosionGates()
+	if !checker.Enforced(ctx, capabilities.LeaseTermLedgerV1) || !checker.DurablyLatched(capabilities.LeaseTermLedgerV1) {
+		t.Fatal("precondition: lease_term_ledger_v1 did not latch with the only host advertising it")
+	}
 
 	now := time.Date(2026, 9, 29, 8, 34, 45, 0, time.UTC)
 	if held, term, err := corrosion.AcquireLeaseWithTerm(ctx, db, corrosion.LeaseKeyDualRun, "host-a", time.Minute, now); err != nil || held {

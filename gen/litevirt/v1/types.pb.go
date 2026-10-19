@@ -3256,6 +3256,7 @@ type SecurityGroup struct {
 	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
 	StackName     string                 `protobuf:"bytes,3,opt,name=stack_name,json=stackName,proto3" json:"stack_name,omitempty"` // empty = cluster-wide
 	CreatedAt     string                 `protobuf:"bytes,4,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	Project       string                 `protobuf:"bytes,5,opt,name=project,proto3" json:"project,omitempty"` // owning project; empty = global (docs/design/security-group-projects.md)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3314,6 +3315,13 @@ func (x *SecurityGroup) GetStackName() string {
 func (x *SecurityGroup) GetCreatedAt() string {
 	if x != nil {
 		return x.CreatedAt
+	}
+	return ""
+}
+
+func (x *SecurityGroup) GetProject() string {
+	if x != nil {
+		return x.Project
 	}
 	return ""
 }
@@ -7601,14 +7609,15 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x05scope\x18\x01 \x01(\tR\x05scope\x12!\n" +
 	"\fdefault_deny\x18\x02 \x01(\bR\vdefaultDeny\x12\x1d\n" +
 	"\n" +
-	"stack_name\x18\x03 \x01(\tR\tstackName\"q\n" +
+	"stack_name\x18\x03 \x01(\tR\tstackName\"\x8b\x01\n" +
 	"\rSecurityGroup\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
 	"stack_name\x18\x03 \x01(\tR\tstackName\x12\x1d\n" +
 	"\n" +
-	"created_at\x18\x04 \x01(\tR\tcreatedAt\"\xda\x01\n" +
+	"created_at\x18\x04 \x01(\tR\tcreatedAt\x12\x18\n" +
+	"\aproject\x18\x05 \x01(\tR\aproject\"\xda\x01\n" +
 	"\x11SecurityGroupRule\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x13\n" +
 	"\x05sg_id\x18\x02 \x01(\tR\x04sgId\x12\x1c\n" +

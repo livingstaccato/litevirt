@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"errors"
 	"net"
 	"slices"
 	"sort"
@@ -16,6 +17,9 @@ type SecurityGroup struct {
 	ID        string
 	Name      string
 	StackName string
+	// Project owns the group; "" is a global group
+	// (docs/design/security-group-projects.md).
+	Project   string
 	CreatedAt string
 	UpdatedAt string
 }
@@ -32,8 +36,13 @@ type SGRule struct {
 	Priority  int
 }
 
-// InsertSecurityGroup creates a new security group.
+// InsertSecurityGroup creates a new GLOBAL security group, in the previous
+// release's statement shape. A project's group is written by
+// InsertProjectSecurityGroup.
 func InsertSecurityGroup(ctx context.Context, c *Client, sg SecurityGroup) error {
+	if sg.Project != "" {
+		return errors.New("a project security group is written by InsertProjectSecurityGroup, through the release feature sg_projects")
+	}
 	now := c.NowTS()
 	if sg.CreatedAt == "" {
 		sg.CreatedAt = nowRFC3339() // created_at is wall/display, never the HLC key
@@ -45,10 +54,32 @@ func InsertSecurityGroup(ctx context.Context, c *Client, sg SecurityGroup) error
 	)
 }
 
+// InsertProjectSecurityGroup creates a security group owned by sg.Project
+// (docs/design/security-group-projects.md). Its insert names the project
+// column, which a previous-release peer cannot decode, so it is the release
+// feature sg_projects: g must be that feature's grant.
+func InsertProjectSecurityGroup(ctx context.Context, c *Client, g capabilities.FeatureGrant, sg SecurityGroup) error {
+	if err := g.Check(capabilities.FeatureSGProjects); err != nil {
+		return err
+	}
+	if sg.Project == "" {
+		return errors.New("a project security group needs a project")
+	}
+	now := c.NowTS()
+	if sg.CreatedAt == "" {
+		sg.CreatedAt = nowRFC3339() // created_at is wall/display, never the HLC key
+	}
+	return c.Execute(ctx,
+		`INSERT INTO security_groups (id, name, stack_name, project, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		sg.ID, sg.Name, sg.StackName, sg.Project, sg.CreatedAt, now,
+	)
+}
+
 // GetSecurityGroup returns a security group by ID.
 func GetSecurityGroup(ctx context.Context, c *Client, id string) (*SecurityGroup, error) {
 	rows, err := c.Query(ctx,
-		`SELECT id, name, stack_name, created_at, updated_at
+		`SELECT id, name, stack_name, project, created_at, updated_at
 		 FROM security_groups WHERE id = ? AND deleted_at IS NULL`, id)
 	if err != nil {
 		return nil, err
@@ -61,6 +92,7 @@ func GetSecurityGroup(ctx context.Context, c *Client, id string) (*SecurityGroup
 		ID:        r.String("id"),
 		Name:      r.String("name"),
 		StackName: r.String("stack_name"),
+		Project:   r.String("project"),
 		CreatedAt: r.String("created_at"),
 		UpdatedAt: r.String("updated_at"),
 	}, nil
@@ -68,7 +100,7 @@ func GetSecurityGroup(ctx context.Context, c *Client, id string) (*SecurityGroup
 
 // ListSecurityGroups returns all security groups, optionally filtered by stack.
 func ListSecurityGroups(ctx context.Context, c *Client, stackName string) ([]SecurityGroup, error) {
-	sql := `SELECT id, name, stack_name, created_at, updated_at
+	sql := `SELECT id, name, stack_name, project, created_at, updated_at
 		FROM security_groups WHERE deleted_at IS NULL`
 	var params []interface{}
 	if stackName != "" {
@@ -90,6 +122,7 @@ func ListSecurityGroups(ctx context.Context, c *Client, stackName string) ([]Sec
 			ID:        r.String("id"),
 			Name:      r.String("name"),
 			StackName: r.String("stack_name"),
+			Project:   r.String("project"),
 			CreatedAt: r.String("created_at"),
 			UpdatedAt: r.String("updated_at"),
 		}
@@ -243,7 +276,9 @@ func ListAllSGRules(ctx context.Context, c *Client) ([]SGRule, error) {
 // returned rule carries sg.ID in SGID, so callers filtering by group id see it.
 func ListSGRulesFor(ctx context.Context, c *Client, sg SecurityGroup, legacyByName bool) ([]SGRule, error) {
 	rules, err := ListSGRules(ctx, c, sg.ID)
-	if err != nil || !legacyByName || sg.Name == "" || sg.Name == sg.ID {
+	// A project's group never adopts them: it starts empty, and a rule stored
+	// under a name before the project took it is no project's.
+	if err != nil || !legacyByName || sg.Name == "" || sg.Name == sg.ID || sg.Project != "" {
 		return rules, err
 	}
 	legacy, err := ListSGRules(ctx, c, sg.Name)
@@ -279,7 +314,7 @@ func DeleteSecurityGroupWithLegacyRules(ctx context.Context, c *Client, sg Secur
 		SQL:    `UPDATE security_groups SET deleted_at = ?, updated_at = ? WHERE id = ?`,
 		Params: []interface{}{wall, now, sg.ID},
 	}}
-	if sg.Name != "" && sg.Name != sg.ID {
+	if sg.Name != "" && sg.Name != sg.ID && sg.Project == "" {
 		stmts = append(stmts, Statement{
 			SQL:    `UPDATE sg_rules SET deleted_at = ?, updated_at = ? WHERE sg_id = ?`,
 			Params: []interface{}{wall, now, sg.Name},
@@ -304,4 +339,48 @@ func DeleteSGRule(ctx context.Context, c *Client, ruleID string) error {
 		`UPDATE sg_rules SET deleted_at = ?, updated_at = ? WHERE id = ?`,
 		nowRFC3339(), now, ruleID,
 	)
+}
+
+// WorkloadProjects returns the project of every live VM, and of every live
+// container on hostName, keyed by name ("" is the default project). The
+// firewall reconciler reads it to keep a NIC off another project's security
+// group.
+func WorkloadProjects(ctx context.Context, c *Client, hostName string) (vms, cts map[string]string, err error) {
+	rows, err := c.Query(ctx, `SELECT name, COALESCE(project, '') AS project FROM vms WHERE deleted_at IS NULL`)
+	if err != nil {
+		return nil, nil, err
+	}
+	vms = make(map[string]string, len(rows))
+	for _, r := range rows {
+		vms[r.String("name")] = r.String("project")
+	}
+	rows, err = c.Query(ctx, `SELECT name, COALESCE(project, '') AS project FROM containers
+		WHERE host_name = ? AND deleted_at IS NULL`, hostName)
+	if err != nil {
+		return nil, nil, err
+	}
+	cts = make(map[string]string, len(rows))
+	for _, r := range rows {
+		cts[r.String("name")] = r.String("project")
+	}
+	return vms, cts, nil
+}
+
+// StackOwnsFirewall reports whether stack owns any live firewall row: a
+// security group, an ip set, a cluster or host rule, or a firewall default.
+// Removing or replacing them is a write to global firewall state.
+func StackOwnsFirewall(ctx context.Context, c *Client, stack string) (bool, error) {
+	if stack == "" {
+		return false, nil
+	}
+	for _, table := range []string{"security_groups", "ip_sets", "cluster_firewall_rules", "host_firewall_rules", "firewall_defaults"} {
+		rows, err := c.Query(ctx, `SELECT 1 FROM `+table+` WHERE stack_name = ? AND deleted_at IS NULL LIMIT 1`, stack)
+		if err != nil {
+			return false, err
+		}
+		if len(rows) > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
 }

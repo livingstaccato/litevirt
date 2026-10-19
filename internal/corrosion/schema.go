@@ -561,29 +561,40 @@ import (
 //	     write the column and cannot decode the re-admission that raises it,
 //	     which is written only through the feature (ReplicationGated).
 //	     Additive.
-//	v70: node-local automation authority, applied prefix, certified history,
+//	v70: security_groups.project (TEXT NOT NULL DEFAULT '') — the project that
+//	     owns a security group; '' is a global group, which every existing
+//	     group migrates as (docs/design/security-group-projects.md). Only a
+//	     project group's insert names the column, and it is written only
+//	     through the release feature sg_projects (release_2026_11_v1,
+//	     ReplicationGated), so a previous-release peer never sees that shape;
+//	     a global group keeps the previous insert. Appended LAST for the v53
+//	     digest reason. Additive.
+//	v71: node-local automation authority, applied prefix, certified history,
 //	     permanent request receipts, authenticated anchors and bounded on-disk
 //	     recovery staging. None participates in CRDT replication.
-//	v71: inert node-local audited automation content cuts and bounded immutable
+//	v72: inert node-local audited automation content cuts and bounded immutable
 //	     records. No transfer publication, adoption or capability authority.
-//	v72: completed node-local outgoing automation publications, immutable job
+//	v73: completed node-local outgoing automation publications, immutable job
 //	     pins and retained public trust evidence; excluded from source content.
 //
-// v73: inert receiver attempts, pending metadata and bounded transport inventory.
-// v74: inert per-source audit results, spool references and causal request indexes.
+// v74: inert receiver attempts, pending metadata and bounded transport inventory.
+// v75: inert per-source audit results, spool references and causal request indexes.
 // No active import, origin mode, replication or authority is introduced.
-// v75: typed node-local automation identity and owner projections, isolated
+// v76: typed node-local automation identity and owner projections, isolated
 // by reconstruction stage. No replication or admission authority is introduced.
-// v76: node-local originating account/project lifecycle evidence and exact
+// v77: node-local originating account/project lifecycle evidence and exact
 // credential issuance provenance, with atomic invalidate-only parent triggers.
 // These are source observations, never certified identities or class permits.
-// v77: immutable inert local snapshots and complete fixed-roster aggregates.
+// v78: immutable inert local snapshots and complete fixed-roster aggregates.
 // These rows confer no current proof, origin authority or active adoption.
-// v78: causal key epoch, recipient and payload wrapping projections.
-// v79: signed receiver-established floors and current-row complete inventory; never live proof.
-// v80: immutable retained-origin delivery/object/completion pins; no active authority.
-// v81: preserve all recipient stages while allowing the host-incarnation zero domain.
-const CurrentSchemaVersion = 81
+// v79: causal key epoch, recipient and payload wrapping projections.
+// v80: signed receiver-established floors and current-row complete inventory; never live proof.
+// v81: immutable retained-origin delivery/object/completion pins; no active authority.
+// v82: preserve all recipient stages while allowing the host-incarnation zero domain.
+const CurrentSchemaVersion = 82
+
+// schemaVersionSGProjects is the version security_groups.project was added in.
+const schemaVersionSGProjects = 70
 
 // schemaVersionCredentialRetirement is the version
 // host_fence_credentials.after_retirement was added in.
@@ -2339,7 +2350,9 @@ var schemaDDL = []string{
 		stack_name  TEXT,
 		created_at  TEXT NOT NULL,
 		updated_at  TEXT NOT NULL,
-		deleted_at  TEXT
+		deleted_at  TEXT,
+		-- project (v70) is LAST, for the v53 digest reason; '' = global.
+		project     TEXT NOT NULL DEFAULT ''
 	)`,
 
 	// idempotency_keys (v39): records a mutating RPC keyed by a client-supplied
@@ -2930,7 +2943,7 @@ var schemaDDL = []string{
 	// ExecuteLocal, one transaction per voter step, committed before the reply
 	// is built. Rows are never deleted or downgraded.
 	// Inert receiver evidence only: no adoption, voting, import or runtime authority.
-	// Schema76 inert audit storage; original source spool remains the evidence owner.
+	// Schema78 inert audit storage; original source spool remains the evidence owner.
 	`CREATE TABLE IF NOT EXISTS local_automation_local_audits (
  id TEXT PRIMARY KEY, attempt TEXT NOT NULL, dependency TEXT NOT NULL,
  head BLOB NOT NULL, coverage TEXT NOT NULL, records INTEGER NOT NULL, origin BLOB NOT NULL
@@ -3868,6 +3881,9 @@ var schemaMigrations = []string{
 	`ALTER TABLE host_fence_credentials ADD COLUMN after_retirement TEXT NOT NULL DEFAULT ''`,
 	// The host incarnation counter (see History, schemaVersionHostIncarnation).
 	`ALTER TABLE hosts ADD COLUMN incarnation INTEGER NOT NULL DEFAULT 0`,
+	// The project that owns a security group; '' = global (see History,
+	// schemaVersionSGProjects).
+	`ALTER TABLE security_groups ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE local_automation_receiver_current ADD COLUMN established_inventory BLOB NOT NULL DEFAULT x''`,
 }
 
@@ -3886,7 +3902,7 @@ const (
 	kindRebuildClusterCRL                // v47 final shape; presence = composite primary key
 )
 
-const kindRebuildAutomationCustody migKind = 3 // v81 exact recipient shape and nonnegative host counter
+const kindRebuildAutomationCustody migKind = 3 // v82 exact recipient shape and nonnegative host counter
 
 // migration is one ledgered schema unit.
 type migration struct {
@@ -3967,7 +3983,8 @@ var alterVersions = []int{
 	60,                                // runtime_action_proofs.claim_certificate
 	schemaVersionCredentialRetirement, // host_fence_credentials.after_retirement
 	schemaVersionHostIncarnation,      // hosts.incarnation
-	79,                                // local_automation_receiver_current.established_inventory
+	schemaVersionSGProjects,           // security_groups.project
+	80,                                // local_automation_receiver_current.established_inventory
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema
@@ -4014,35 +4031,35 @@ var createTableUnits = []struct {
 	{65, "host_runtime"},
 	{66, "session_groups"},
 	{67, "host_fence_redfish"},
-	{70, "local_automation_authority"}, {70, "local_automation_prefix"},
-	{70, "local_automation_anchors"}, {70, "local_automation_history"},
-	{70, "local_automation_requests"}, {70, "local_automation_recovery"}, {70, "local_automation_staging"},
-	{71, "local_automation_cuts"}, {71, "local_automation_cut_records"},
-	{72, "local_automation_source_jobs"}, {72, "local_automation_publications"},
-	{80, "local_automation_retained_deliveries"}, {80, "local_automation_retained_objects"}, {80, "local_automation_retained_completions"},
-	{79, "local_automation_receiver_established"},
-	{78, "local_automation_key_epochs"}, {78, "local_automation_key_recipients"}, {78, "local_automation_payload_wrappings"},
-	{77, "local_automation_local_audits"},
-	{77, "local_automation_local_rows"},
-	{77, "local_automation_aggregates"},
-	{77, "local_automation_aggregate_sources"},
-	{77, "local_automation_aggregate_copies"},
-	{77, "local_automation_aggregate_maxima"},
-	{77, "local_automation_aggregate_conflicts"},
-	{76, "local_automation_lifetimes"}, {76, "local_automation_credential_issuance"},
-	{75, "local_automation_identities"}, {75, "local_automation_aliases"},
-	{75, "local_automation_owners"}, {75, "local_automation_semantic_heads"},
-	{75, "local_automation_resources"}, {75, "local_automation_names"}, {75, "local_automation_bindings"}, {75, "local_automation_admissions"},
-	{74, "local_automation_receiver_audits"},
-	{74, "local_automation_receiver_refs"},
-	{74, "local_automation_receiver_requests"},
-	{73, "local_automation_receiver_jobs"},
-	{73, "local_automation_receiver_current"},
-	{73, "local_automation_receiver_validations"},
-	{73, "local_automation_receiver_sources"},
-	{73, "local_automation_receiver_components"},
-	{73, "local_automation_receiver_records"},
-	{73, "local_automation_receiver_pages"},
+	{71, "local_automation_authority"}, {71, "local_automation_prefix"},
+	{71, "local_automation_anchors"}, {71, "local_automation_history"},
+	{71, "local_automation_requests"}, {71, "local_automation_recovery"}, {71, "local_automation_staging"},
+	{72, "local_automation_cuts"}, {72, "local_automation_cut_records"},
+	{73, "local_automation_source_jobs"}, {73, "local_automation_publications"},
+	{81, "local_automation_retained_deliveries"}, {81, "local_automation_retained_objects"}, {81, "local_automation_retained_completions"},
+	{80, "local_automation_receiver_established"},
+	{79, "local_automation_key_epochs"}, {79, "local_automation_key_recipients"}, {79, "local_automation_payload_wrappings"},
+	{78, "local_automation_local_audits"},
+	{78, "local_automation_local_rows"},
+	{78, "local_automation_aggregates"},
+	{78, "local_automation_aggregate_sources"},
+	{78, "local_automation_aggregate_copies"},
+	{78, "local_automation_aggregate_maxima"},
+	{78, "local_automation_aggregate_conflicts"},
+	{77, "local_automation_lifetimes"}, {77, "local_automation_credential_issuance"},
+	{76, "local_automation_identities"}, {76, "local_automation_aliases"},
+	{76, "local_automation_owners"}, {76, "local_automation_semantic_heads"},
+	{76, "local_automation_resources"}, {76, "local_automation_names"}, {76, "local_automation_bindings"}, {76, "local_automation_admissions"},
+	{75, "local_automation_receiver_audits"},
+	{75, "local_automation_receiver_refs"},
+	{75, "local_automation_receiver_requests"},
+	{74, "local_automation_receiver_jobs"},
+	{74, "local_automation_receiver_current"},
+	{74, "local_automation_receiver_validations"},
+	{74, "local_automation_receiver_sources"},
+	{74, "local_automation_receiver_components"},
+	{74, "local_automation_receiver_records"},
+	{74, "local_automation_receiver_pages"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn
@@ -4085,7 +4102,7 @@ func init() {
 	})
 	schemaMigrationLedger = append(schemaMigrationLedger, migration{
 		ID:      automationCustodyMigrationID,
-		Version: 81,
+		Version: 82,
 		Kind:    kindRebuildAutomationCustody,
 		Target:  "local_automation_key_recipients",
 		SQL:     automationCustodyRebuildSQL,

@@ -431,10 +431,15 @@ func ConfirmServing(ctx context.Context, db *corrosion.Client, host string) (boo
 		beforeConfirmWrite()
 	}
 	// Only from 'upgrading', checked in the write's own transaction: a fence
-	// or drain recorded since the read above keeps its state.
-	applied, err := corrosion.UpdateHostStateFrom(ctx, db, host, "upgrading", "active")
+	// or drain recorded since the read above keeps its state. So is the
+	// address (corrosion.ActivateHostFrom): a host that does not keep it is
+	// refused, and retried.
+	applied, lostTo, err := corrosion.ActivateHostFrom(ctx, db, host, "upgrading")
 	if err != nil {
 		return false, h.State, err
+	}
+	if lostTo != "" {
+		return false, h.State, addressNotKept(host, lostTo)
 	}
 	if !applied {
 		if afterConfirmDeclined != nil {
@@ -450,6 +455,17 @@ func ConfirmServing(ctx context.Context, db *corrosion.Client, host string) (boo
 		return false, now.State, ErrNotUpgrading
 	}
 	return true, "active", nil
+}
+
+// addressNotKept is the refusal to record host active while lostTo keeps
+// its address (corrosion.AddressLostTo): a host already active there, or an
+// earlier admission. The caller retries, so the host activates once lostTo is
+// removed; until then it stays 'upgrading' and says why
+// (upgrading_unconfirmed).
+func addressNotKept(host, lostTo string) error {
+	return fmt.Errorf("%s keeps this host's address (it is active there, or was admitted there first): a machine is "+
+		"admitted under one name, and %s is not activated while %s holds it. Remove the one this machine does not "+
+		"serve: `lv host rm %s` or `lv host rm %s`", lostTo, host, lostTo, host, lostTo)
 }
 
 // ErrMovedOn means ConfirmServingReport kept a host's moved-on state. An
@@ -503,9 +519,12 @@ func ConfirmServingReport(ctx context.Context, db *corrosion.Client, host, from 
 	if beforeConfirmWrite != nil {
 		beforeConfirmWrite()
 	}
-	applied, err := corrosion.UpdateHostStartupFrom(ctx, db, host, from, "active", r.Version, r.CPUs, r.MemMiB, r.DiskGiB, r.HasResources)
+	applied, lostTo, err := corrosion.ActivateHostStartupFrom(ctx, db, host, from, r.Version, r.CPUs, r.MemMiB, r.DiskGiB, r.HasResources)
 	if err != nil {
 		return false, h.State, err
+	}
+	if lostTo != "" {
+		return false, h.State, addressNotKept(host, lostTo)
 	}
 	if !applied {
 		now, err := corrosion.GetHost(ctx, db, host)

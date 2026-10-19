@@ -7,15 +7,15 @@ import (
 )
 
 // Incoming69 is shipped and must keep its ALTER ID and default independently
-// of the ten relocated, still-private automation migrations.
+// of the relocated, still-private automation migrations.
 func TestAutomationIntegration69MigrationAndDescriptor(t *testing.T) {
 	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	if CurrentSchemaVersion != 81 || automationCutSourceSchema != 81 {
-		t.Fatalf("current SQL/source descriptor = %d/%d, want81/81", CurrentSchemaVersion, automationCutSourceSchema)
+	if CurrentSchemaVersion != 82 || automationCutSourceSchema != 82 {
+		t.Fatalf("current SQL/source descriptor = %d/%d, want82/82", CurrentSchemaVersion, automationCutSourceSchema)
 	}
 	units := 0
 	for _, m := range schemaMigrationLedger {
@@ -28,6 +28,18 @@ func TestAutomationIntegration69MigrationAndDescriptor(t *testing.T) {
 	}
 	if units != 1 {
 		t.Fatalf("schema69 units=%d", units)
+	}
+	sgUnits := 0
+	for _, m := range schemaMigrationLedger {
+		if m.Version == 70 {
+			sgUnits++
+			if m.ID != "a091_security_groups_project" || m.Target != "security_groups.project" || m.Kind != kindAddColumn || m.SQL != "ALTER TABLE security_groups ADD COLUMN project TEXT NOT NULL DEFAULT ''" {
+				t.Fatalf("published70 changed: %+v", m)
+			}
+		}
+	}
+	if sgUnits != 1 {
+		t.Fatalf("schema70 units=%d", sgUnits)
 	}
 }
 
@@ -66,12 +78,12 @@ func TestAutomationIntegration69Archived78Reopen(t *testing.T) {
 // Live local proof cannot reuse an older schema row. A retained original may
 // carry either accepted pre-metadata namespace without rewriting its frames.
 func TestAutomationIntegration80LocalSchemaProvenance(t *testing.T) {
-	for _, version := range []int64{77, 78, 79, 80, 81, 82} {
+	for _, version := range []int64{77, 78, 79, 80, 81, 82, 83} {
 		for _, retained := range []bool{false, true} {
 			observation := aggregateLocalObservation{retained: retained}
 			row := Row{Columns: []string{"id", "version"}, Values: []interface{}{int64(1), version}}
 			err := observation.observe(&aggregateLocalAudit{}, 15, 1, row)
-			want := version == 81 || (retained && (version == 78 || version == 79 || version == 80))
+			want := version == 82 || (retained && (version == 78 || version == 79 || version == 80 || version == 81))
 			if (err == nil) != want {
 				t.Fatalf("schema=%d retained=%t: %v", version, retained, err)
 			}

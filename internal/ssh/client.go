@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -26,7 +27,23 @@ type Client struct {
 
 // NewClient connects to a remote host via SSH.
 // target format: "user@host" or "user@host:port"
-func NewClient(target string) (*Client, error) {
+func NewClient(target string) (*Client, error) { return newClient(target, 0, false) }
+
+// NewClientTimeout is NewClient with the connect and the handshake bounded
+// by timeout together, for a best-effort connection to a host that may be
+// dead or silent.
+func NewClientTimeout(target string, timeout time.Duration) (*Client, error) {
+	return newClient(target, timeout, false)
+}
+
+// NewClientDeadline is NewClientTimeout with the bound left on the whole
+// session: the commands run over it fail once timeout has passed since the
+// dial began, for a short best-effort job on a host that may stall.
+func NewClientDeadline(target string, timeout time.Duration) (*Client, error) {
+	return newClient(target, timeout, true)
+}
+
+func newClient(target string, timeout time.Duration, keepDeadline bool) (*Client, error) {
 	sshUser, host, port := parseTarget(target)
 
 	auth, err := authMethods()
@@ -55,7 +72,12 @@ func NewClient(target string) (*Client, error) {
 	}
 
 	addr := net.JoinHostPort(host, port)
-	conn, err := ssh.Dial("tcp", addr, config)
+	var conn *ssh.Client
+	if timeout > 0 {
+		conn, err = dialTimeout(addr, config, timeout, keepDeadline)
+	} else {
+		conn, err = ssh.Dial("tcp", addr, config)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("SSH dial %s: %w", addr, err)
 	}
@@ -158,6 +180,11 @@ func ShellQuote(s string) string {
 // destination wholesale, mode included, and does so atomically.
 //
 // mktemp in the destination's own directory keeps the rename on one filesystem.
+// The staged file is synced before the move and the directory after it, so a
+// power loss cannot leave the destination renamed over but empty. A failed
+// sync fails the write before the move (coreutils 8.24 or later syncs one
+// file; there is no fallback to a global sync, which reports success
+// whatever happened and blocks on a hung mount).
 //
 // -T is load-bearing, not tidiness. Without it, `mv src dest` where dest is a
 // DIRECTORY moves src INSIDE it — so a local user who can see the destination
@@ -171,7 +198,8 @@ func writeFileCmd(remotePath string, mode os.FileMode) string {
 	return fmt.Sprintf(
 		"set -e; d=$(dirname %s); t=$(mktemp \"$d/.litevirt.XXXXXX\"); "+
 			"trap 'rm -f \"$t\"' EXIT; cat > \"$t\"; chmod %o \"$t\"; "+
-			"mv -fT -- \"$t\" %s; trap - EXIT",
+			"sync -- \"$t\"; "+
+			"mv -fT -- \"$t\" %s; trap - EXIT; sync -- \"$d\"",
 		q, mode.Perm(), q)
 }
 
@@ -416,4 +444,41 @@ func (r *bytesReaderWrapper) Read(p []byte) (n int, err error) {
 	n = copy(p, r.data[r.pos:])
 	r.pos += n
 	return
+}
+
+// dialTimeout is ssh.Dial with one bound on the TCP connect and the SSH
+// handshake together: ssh.Dial bounds neither the handshake nor, without
+// ClientConfig.Timeout, the connect.
+//
+// The deadline is fixed before the dial, so the connect and the handshake
+// share timeout rather than each getting its own. With keepDeadline it stays
+// on the connection, bounding the whole session to timeout.
+var dialTimeout = func(addr string, config *ssh.ClientConfig, timeout time.Duration, keepDeadline bool) (*ssh.Client, error) {
+	deadline := time.Now().Add(timeout)
+	conn, err := dialConn(addr, deadline)
+	if err != nil {
+		return nil, err
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	c, chans, reqs, err := ssh.NewClientConn(conn, addr, config)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if !keepDeadline {
+		if err := conn.SetDeadline(time.Time{}); err != nil {
+			c.Close()
+			return nil, err
+		}
+	}
+	return ssh.NewClient(c, chans, reqs), nil
+}
+
+// dialConn is the TCP connect of dialTimeout, given up at deadline.
+var dialConn = func(addr string, deadline time.Time) (net.Conn, error) {
+	d := net.Dialer{Deadline: deadline}
+	return d.Dial("tcp", addr)
 }

@@ -209,7 +209,8 @@ func (w *certWatch) reportSwap(ctx context.Context, serving string) bool {
 		return false
 	}
 	ev, _ := json.Marshal(certSwapEvidence{RecordedSerial: strings.ToLower(recorded), ServingSerial: serving,
-		Remedy: "restart the daemon on this host (systemctl restart litevirt); its serial is recorded at start"})
+		Remedy: "restart the daemon on this host (systemctl restart litevirt); its serial is recorded at start. " +
+			"If this stays open after a restart, the restart was held: see own_row_held on this host"})
 	if open && cur.Evidence == string(ev) {
 		return true
 	}

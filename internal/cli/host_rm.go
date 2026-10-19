@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +15,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/pki"
+	"github.com/litevirt/litevirt/internal/ssh"
 )
 
 // HostRemove takes a host out of the cluster and revokes the certificate it holds.
@@ -45,6 +48,7 @@ func HostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force
 	if err := refuseVoterRemoval(ctx, c, hostName); err != nil {
 		return err
 	}
+	listed := listedHost(ctx, c, hostName)
 	// Read and revoke BEFORE the tombstone. Once RemoveHost succeeds, ListHosts
 	// deliberately hides the row and there is no supported way to recover its
 	// certificate serial. A mint or publish failure must therefore leave the row
@@ -76,6 +80,29 @@ func HostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force
 	printRemoved(hostName, removed, "Host %s removed from cluster.\n")
 	fmt.Printf("  revoked certificate %s in CRL %d before removing the host\n", serial, version)
 	fmt.Println("  `lv health` warns for as long as any peer's CRL version is behind another's")
+	// A joining host is often an add stranded after its admission, which left
+	// the admitted (now revoked) pair staged on the machine for a rerun.
+	if listed != nil && listed.GetState() == pb.HostState_HOST_JOINING && listed.GetAddress() != "" {
+		if err := removeStagedAdmission(listed.GetAddress(), serial); err != nil {
+			fmt.Printf("  could not remove the credentials an unfinished `lv host add` may have staged on %s "+
+				"(%v); they are revoked. Remove %s/.host.crt.add-%s and .host.key.add-%s there by hand\n",
+				listed.GetAddress(), err, remotePKIDir, strings.ToLower(serial), strings.ToLower(serial))
+		}
+	}
+	return nil
+}
+
+// listedHost is hostName's ListHosts entry, or nil when it cannot be read.
+func listedHost(ctx context.Context, c pb.LiteVirtClient, hostName string) *pb.Host {
+	resp, err := c.ListHosts(ctx, &pb.ListHostsRequest{})
+	if err != nil {
+		return nil
+	}
+	for _, h := range resp.GetHosts() {
+		if h.GetName() == hostName {
+			return h
+		}
+	}
 	return nil
 }
 
@@ -197,12 +224,26 @@ func orDash(s string) string {
 // now is most likely a voter's link or the currency pull failing for a
 // moment: it is retried after each removeRetryBackoff wait, and one that is
 // still Unavailable names rerun, which finishes it (the revocation is already
-// in place). Any other refusal is returned at once.
+// in place). A NotFound on a retry, for a host no longer listed, is the
+// removal itself. Any other refusal is returned at once.
 func removeAfterRevoke(ctx context.Context, c pb.LiteVirtClient, req *pb.RemoveHostRequest, rerun string) (*pb.RemoveHostResponse, error) {
 	for attempt := 0; ; attempt++ {
 		removed, err := c.RemoveHost(ctx, req)
 		if err == nil {
 			return removed, nil
+		}
+		// The host was there when this command began, so a NotFound on a
+		// retry may be an earlier attempt's removal whose reply was lost. A
+		// daemon also answers NotFound when it could not read the row, so
+		// the host must be absent from a fresh list to count as removed.
+		if attempt > 0 && status.Code(err) == codes.NotFound {
+			if _, lerr := hostCertSerial(ctx, c, req.GetName()); errors.Is(lerr, errHostNotListed) {
+				fmt.Printf("  %s is no longer in the cluster: an earlier attempt whose reply was lost removed it, "+
+					"or another removal did\n", req.GetName())
+				return &pb.RemoveHostResponse{}, nil
+			}
+			return nil, fmt.Errorf("remove host after publishing its certificate revocation: %w\n"+
+				"the certificate is revoked; run `%s` to finish the removal", err, rerun)
 		}
 		if status.Code(err) != codes.Unavailable {
 			return nil, fmt.Errorf("remove host after publishing its certificate revocation: %w", err)
@@ -279,6 +320,10 @@ func publishClusterCRL(ctx context.Context, c pb.LiteVirtClient, pkiDir string) 
 	return resp.Version, nil
 }
 
+// errHostNotListed is hostCertSerial's answer for a host ListHosts does not
+// list (removed, or never there).
+var errHostNotListed = errors.New("host is not present")
+
 // hostCertSerial reads a host's certificate serial, best-effort: a removal must not
 // be blocked by a lookup, and a missing serial only costs the revocation.
 func hostCertSerial(ctx context.Context, c pb.LiteVirtClient, hostName string) (string, error) {
@@ -294,7 +339,7 @@ func hostCertSerial(ctx context.Context, c pb.LiteVirtClient, hostName string) (
 			return h.CertSerial, nil
 		}
 	}
-	return "", fmt.Errorf("host is not present")
+	return "", errHostNotListed
 }
 
 // closeRemovedHostAuditContract retires the removed host's live audit signing
@@ -371,4 +416,106 @@ func printRemoved(hostName string, removed *pb.RemoveHostResponse, plain string)
 	}
 	fmt.Printf("Host %s removed (incarnation %d, serial %s).\n", hostName,
 		removed.GetIncarnation(), removed.GetCertSerial())
+}
+
+// removeStagedAdmission removes, over SSH as root, what a stranded `lv host
+// add` admitted with certificate serial left staged on the host at addr. The host is often dead or half set up, so the
+// connection is bounded (stagedCleanupTimeout). A seam so the removal can be
+// tested without a host.
+var removeStagedAdmission = func(addr, serial string) error {
+	sc, err := ssh.NewClientDeadline("root@"+addr, stagedCleanupTimeout)
+	if err != nil {
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return fmt.Errorf("SSH connect: gave up after %s: %w", stagedCleanupTimeout, err)
+		}
+		return fmt.Errorf("SSH connect: %w", err)
+	}
+	defer sc.Close()
+	return removeStagedPair(&sshAddRemote{sshRemotePKI{sc: sc}}, serial)
+}
+
+// stagedCleanupTimeout bounds removeStagedAdmission's whole SSH session:
+// connect, handshake and the commands it runs.
+const stagedCleanupTimeout = 10 * time.Second
+
+// addStagedTargets are the files an add stages at fixed destinations (its
+// config, staged at the path config.yaml resolves to, is the default one's
+// here).
+func addStagedTargets() []string {
+	return []string{
+		filepath.Join(remotePKIDir, "host.crt"), filepath.Join(remotePKIDir, "host.key"),
+		filepath.Join(remotePKIDir, "ca.crt"), filepath.Join(remotePKIDir, pki.GossipKeyName),
+		filepath.Join(remoteMigrationDir, pki.MigrationCAName), filepath.Join(remoteMigrationDir, pki.MigrationHostCertName),
+		filepath.Join(remoteMigrationDir, pki.MigrationHostKeyName), remoteConfig, remoteBinary,
+	}
+}
+
+// removeStagedPair deletes on r what the adds admitted with serial, the one
+// this removal revoked, left staged: every attempt's files tagged with it
+// (<serial>-<nonce>), including the config staged beside the file
+// config.yaml resolves to, and only those, so another admission's on the
+// machine are not touched. A pair an earlier release's add staged untagged
+// goes only when its certificate is serial's (removeLegacyStagedPair).
+// Serials are unique to the CA, so another machine at a reused address never
+// matches, and nothing there is touched.
+func removeStagedPair(r addRemote, serial string) error {
+	serial = strings.ToLower(serial)
+	if !validAttemptTag(serial) {
+		return fmt.Errorf("serial %q is not one", serial)
+	}
+	targets := addStagedTargets()
+	q := ssh.ShellQuote(r.Path(remoteConfig))
+	if out, err := r.Shell("config", fmt.Sprintf("if [ -e %s ]; then readlink -f -- %s; fi", q, q)); err == nil {
+		if p := strings.TrimSpace(string(out)); p != "" && !strings.ContainsAny(p, "\n\x00") {
+			targets = append(targets, r.Unpath(p))
+		}
+	}
+	var cmd strings.Builder
+	cmd.WriteString("rc=0; ")
+	for _, t := range targets {
+		// The serial is hex (validAttemptTag), and the glob is all that is
+		// left unquoted.
+		fmt.Fprintf(&cmd, "rm -f -- %s* || rc=1; ", ssh.ShellQuote(r.Path(addStagedPath(t, serial+"-"))))
+	}
+	cmd.WriteString("exit $rc")
+	if _, err := r.Shell("unstage", cmd.String()); err != nil {
+		return err
+	}
+	if err := removeInstalledMarker(r, serial); err != nil {
+		return err
+	}
+	return removeLegacyStagedPair(r, serial)
+}
+
+// afterMarkerRead is a test seam: it runs between removeInstalledMarker's
+// read of the record and its removal.
+var afterMarkerRead func()
+
+// removeInstalledMarker removes the machine's record of an install of the
+// revoked admission (addInstalledMarker), which no longer holds the machine
+// for it. The check and the removal are one command, run under the add lock
+// by the shell that holds it, and remove the record only while it is
+// exactly the one read: a record a later add wrote, even after this command
+// was delayed past its connection, is never removed.
+func removeInstalledMarker(r addRemote, serial string) error {
+	b, ok, err := r.ReadFile(addInstalledMarker)
+	if err != nil || !ok {
+		return err
+	}
+	line := strings.TrimRight(string(b), "\n")
+	if f := strings.Fields(line); len(f) < 3 || !strings.EqualFold(f[1], serial) {
+		return nil
+	}
+	if afterMarkerRead != nil {
+		afterMarkerRead()
+	}
+	_, err = r.Shell("unstage", lockedCmd(r, markerIs(r, line), removeCmd(r, []string{addInstalledMarker})))
+	if exitStatus(err) == notOurMachine {
+		return nil // another add's record since: left
+	}
+	if err != nil {
+		return fmt.Errorf("remove the record %s of the removed admission's install: %w", addInstalledMarker, err)
+	}
+	return nil
 }

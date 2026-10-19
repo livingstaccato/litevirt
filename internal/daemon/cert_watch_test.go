@@ -233,7 +233,8 @@ func TestCertWatch_RetriesAKeyFileReportThatFailedToWrite(t *testing.T) {
 //
 // Mutations: drop the reportSwap call on ErrCertSwappedAtRuntime — no
 // condition is raised; drop the resolve on a recorded serial — the condition
-// stays open after the restart.
+// stays open after the restart; drop own_row_held from the remedy — the
+// remedy names no next step when a restart is held.
 func TestCertWatch_RaisesARuntimeSwapUntilRestart(t *testing.T) {
 	ctx := context.Background()
 	host := corrosion.NewTestClientT(t).HostName()
@@ -275,6 +276,12 @@ func TestCertWatch_RaisesARuntimeSwapUntilRestart(t *testing.T) {
 	c, open := cond()
 	if !open || !strings.Contains(c.Evidence, "systemctl restart litevirt") || !strings.Contains(c.Evidence, swapped) {
 		t.Fatalf("no condition names the runtime swap and the restart: %+v (open %v)", c, open)
+	}
+	// A restart records the serial only with a remembered admission; one
+	// that is held at start instead keeps the condition open, and
+	// own_row_held is what says why (eqts final check m-B).
+	if !strings.Contains(c.Evidence, "own_row_held") {
+		t.Errorf("the remedy does not point at own_row_held for a condition that outlives a restart: %s", c.Evidence)
 	}
 	if got := recordedSerial(t, db, host); got == swapped {
 		t.Fatal("the swapped serial was re-recorded at runtime")

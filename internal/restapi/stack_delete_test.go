@@ -128,3 +128,48 @@ func TestStackDelete_StreamRefusedMapsStatus(t *testing.T) {
 		t.Errorf("error = %q", body.Error)
 	}
 }
+
+const restLocalOnlyNotice = "this node holds no record of stack \"hb\": removing only the workloads it lists here; left for an Admin: ..."
+
+// A local-only teardown is marked in the response, with the notice, so a
+// caller does not take a 200 for a complete teardown.
+func TestStackDelete_ALocalOnlyTeardownIsMarked(t *testing.T) {
+	code, _, raw := postStackDelete(t, []*pb.DeleteProgress{
+		{VmName: "stack", Status: "local-only", Error: restLocalOnlyNotice},
+		{VmName: "hb-1", Status: "deleting"},
+		{VmName: "hb-1", Status: "deleted"},
+	}, nil)
+	if code != http.StatusOK {
+		t.Fatalf("local-only teardown → %d: %s", code, raw)
+	}
+	var body struct {
+		LocalOnly bool   `json:"local_only"`
+		Notice    string `json:"notice"`
+	}
+	if err := json.Unmarshal([]byte(raw), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.LocalOnly || body.Notice != restLocalOnlyNotice {
+		t.Errorf("response does not mark the local-only teardown: %s", raw)
+	}
+}
+
+// A failure under a local-only teardown promises no retry.
+func TestStackDelete_ALocalOnlyFailurePromisesNoRetry(t *testing.T) {
+	code, body, raw := postStackDelete(t, []*pb.DeleteProgress{
+		{VmName: "stack", Status: "local-only", Error: restLocalOnlyNotice},
+		{VmName: "hb-1", Status: "deleting"},
+		{VmName: "hb-1", Status: "error", Error: "undefine refused"},
+	}, nil)
+	if code != http.StatusInternalServerError {
+		t.Fatalf("a failed local-only teardown → %d, want 500 (nothing marked it deleting): %s", code, raw)
+	}
+	if strings.Contains(body.Error, "retries") || strings.Contains(body.Error, `"deleting"`) {
+		t.Errorf("the error promises a retry: %s", raw)
+	}
+	for _, want := range []string{"local-only", "1 of 1", "nothing will retry"} {
+		if !strings.Contains(body.Error, want) {
+			t.Errorf("error %q does not say %q", body.Error, want)
+		}
+	}
+}

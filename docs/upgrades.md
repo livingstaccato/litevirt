@@ -570,13 +570,14 @@ sender: the first use would not be refused, and every such host would
 acknowledge it and then quarantine itself. So a feature added after a release
 ships — in a patch release too — is declared under the next release token,
 never a shipped one, and a test pins every release token's list. All
-twenty-one features of `release_2026_11_v1` are declared in this release (`lv
+twenty-three features of `release_2026_11_v1` are declared in this release (`lv
 cluster upgrade-status` lists them): `vm_limits`, `vm_disk_nic_io`,
 `email_target_secret`, `login_policy`, `drain_failback`, `firewall_ipv6`,
 `nic_guards`, `usb_mounts_memory`, `backup_zstd`, `container_replication`,
 `iscsi_lun_claim`, `pit_overlay`, `redfish_fence`, `ha_disarm`, `nic_mtu`,
 `replication_rate`, `returning_boot`, `firewall_synflood`, `firewall_log`,
-`firewall_tag_groups` and `host_incarnation`. `host_incarnation` is used the
+`firewall_tag_groups`, `host_incarnation`, `automation_stream` and
+`sg_projects`. `host_incarnation` is used the
 first time a removed host is re-added with `lv host add` after the latch
 (below).
 
@@ -1475,6 +1476,35 @@ replicated exactly as before.
 host must resolve one conflict the same way. A binary rolled back below the
 latched token enters WAL quarantine, as below every latched token. Roll
 forward.
+
+### Project security groups wait for the roll
+
+`lv sg create <name> --project <p>` creates a group only `p`'s workloads may
+bind (docs/firewall.md). Its row carries a column a host on the previous
+release cannot decode, so it is the release feature `sg_projects`: refused
+with FailedPrecondition until `release_2026_11_v1` has latched, and its first
+use is recorded before the group is written. Global groups are created as
+before throughout, and every existing group stays global.
+
+### A hand-deleted NetBox address is re-created after the roll
+
+A lease names its NetBox address object by id. When that object is deleted in
+NetBox by hand, the inventory mirror can no longer give the NIC its address.
+It skips that one address, runs the rest of the pass, and reports the pass
+unconverged. Once the `netbox_ip_repoint_v1` capability token has latched, the
+mirror also repairs it. It re-creates the address in NetBox at the lease's
+address, under the NIC's identity and inside the bound prefix, then points the
+lease at the new object and assigns it. The token latches on its own once every
+host the cluster replicates to, including one parked in `maintenance`, runs
+this release. A host on the previous release cannot decode the statement that
+re-points the lease. The address is looked up first: if NetBox shows any object
+at it, nothing is created, and the mirror keeps reporting the pass unconverged
+until that object is removed in NetBox.
+
+`netbox_ip_repoint_v1` is mandatory and replication-gated, with no flag. Its
+stand-down is the inventory mirror's own: `netbox.mirror_inventory` off on
+every node stops the only writer. A binary rolled back below the latched token
+enters WAL quarantine, as below every latched token. Roll forward.
 
 ### Console passwords start after the roll
 

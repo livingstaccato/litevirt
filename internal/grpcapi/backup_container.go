@@ -935,6 +935,14 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 			s.audit(ctx, "ct.restore", req.Name, "project="+project, "denied")
 			return err
 		}
+		var ctSGs []string
+		for _, n := range corrosion.DecodeCreateSpec(spec.CreateSpec).Networks {
+			ctSGs = append(ctSGs, n.SecurityGroups...)
+		}
+		if err := s.admitSecurityGroupRefs(ctx, project, ctSGs); err != nil {
+			s.audit(ctx, "ct.restore", req.Name, "project="+project, "denied")
+			return status.Errorf(status.Code(err), "restore: %s", status.Convert(err).Message())
+		}
 	}
 
 	// Capacity + quota admission, the SAME two-scope split as CreateContainer.

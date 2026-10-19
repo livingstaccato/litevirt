@@ -86,8 +86,8 @@ func TestDrainOneVM_GivesUpOnALockHeldPastTheBound(t *testing.T) {
 	defer unlock()
 	select {
 	case p := <-drainOneVMAsync(s, corrosion.VMRecord{Name: "held-vm", HostName: "test-host", State: "running"}):
-		if p.Status != "skipped" || !strings.Contains(p.Error, "scheduled snapshot") || !strings.Contains(p.Error, "replication") {
-			t.Errorf("progress = %q %q, want skipped, naming scheduled snapshots and replication", p.Status, p.Error)
+		if p.Status != "skipped" || !strings.Contains(p.Error, "still holds this VM") {
+			t.Errorf("progress = %q %q, want skipped, the lock still held", p.Status, p.Error)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("drainOneVM waited past its bound on a held VM lock")
@@ -277,5 +277,25 @@ func TestDrainOneVM_ACancelledDrainSaysSo(t *testing.T) {
 	}
 	if got, _ := corrosion.GetVM(adminCtx(), s.db, "c-vm"); got == nil || got.State != "running" || got.HostName != "test-host" {
 		t.Errorf("row = %+v, want running on test-host", got)
+	}
+}
+
+// backupHoldsVMLock takes vm's lock as a long operation would.
+func backupHoldsVMLock(s *Server, vm string) func() { return s.lockVM(vm) }
+
+// A drain that gives up on a VM's lock names what holds it (the lock records
+// its holder), and since when.
+//
+// Mutation: record no holder — the message says the holder is not recorded,
+// red.
+func TestDrainOneVM_NamesTheLockHolder(t *testing.T) {
+	s := testServerR2(t)
+	setDrainLockWait(t, 300*time.Millisecond)
+	insertTestVMR2(t, adminCtx(), s.db, "named-vm", "test-host", "running")
+	unlock := backupHoldsVMLock(s, "named-vm")
+	defer unlock()
+	p := <-drainOneVMAsync(s, corrosion.VMRecord{Name: "named-vm", HostName: "test-host", State: "running"})
+	if p.Status != "skipped" || !strings.Contains(p.Error, "backupHoldsVMLock") || !strings.Contains(p.Error, "since") {
+		t.Errorf("progress = %q %q, want skipped, naming backupHoldsVMLock and since when", p.Status, p.Error)
 	}
 }

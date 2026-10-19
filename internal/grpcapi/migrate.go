@@ -27,6 +27,7 @@ import (
 	"github.com/litevirt/litevirt/internal/hooks"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/obs"
+	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/vfio"
@@ -401,7 +402,13 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// EnsureDisks.
 	srcTLS := false
 	if withStorage {
-		srcTLS = s.migrationTLSReady()
+		var tlsErr error
+		srcTLS, tlsErr = s.migrationTLSState()
+		if errors.Is(tlsErr, pki.ErrInvalidMigrationCredentials) {
+			// This host holds credentials it cannot use: a fault to fix, refused
+			// whatever the plaintext opt-in says.
+			return unusableMigrationCredentialsRefusal(req.VmName, s.hostName, tlsErr.Error())
+		}
 		if !srcTLS && !s.allowPlaintextStorageMigration {
 			return plaintextStorageRefusal(req.VmName, s.hostName, req.TargetHost, s.hostName)
 		}
@@ -617,6 +624,12 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			kind = routeCold
 		}
 		route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, kind, useTLS)
+		if !dstTLS && ens.tlsUnusable != "" {
+			// The target holds credentials it cannot use. Refused before the
+			// copy, whatever the plaintext opt-in says; the abort undoes the
+			// stubs.
+			return unusableMigrationCredentialsRefusal(req.VmName, req.TargetHost, ens.tlsUnusable)
+		}
 		if !useTLS && !s.allowPlaintextStorageMigration {
 			// This host could encrypt; the target cannot (no credentials, or an
 			// older build that never answers). The abort undoes the stubs.
@@ -1459,9 +1472,15 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 		// take the other end, and, in a response header, which migration CA
 		// its credentials chain to, so the source can refuse a mismatch
 		// before the copy rather than at QEMU's TLS handshake.
-		resp.MigrationTlsReady = s.migrationTLSReady()
+		ready, tlsErr := s.migrationTLSState()
+		resp.MigrationTlsReady = ready
 		if fp, _ := s.localMigrationCA(); resp.MigrationTlsReady && fp != "" {
 			_ = grpc.SetHeader(ctx, metadata.Pairs(MigrationCAMD, fp))
+		}
+		if errors.Is(tlsErr, pki.ErrInvalidMigrationCredentials) {
+			// Not ready because the credentials here are unusable: say why, so
+			// the source can refuse with the fix rather than "no credentials".
+			_ = grpc.SetHeader(ctx, metadata.Pairs(MigrationTLSUnusableMD, tlsErr.Error()))
 		}
 	}
 	s.answerMigrationNetwork(ctx, req, resp)
@@ -2307,6 +2326,21 @@ func (s *Server) ensureDisksOnTargetISO(ctx context.Context, targetHost, vmName 
 // its credentials chain to. An older target sends none.
 const MigrationCAMD = "x-litevirt-migration-ca-sha256"
 
+// MigrationTLSUnusableMD is the EnsureDisks response header in which a
+// target that is not ready for migration TLS because its credentials are
+// unusable (pki.ErrInvalidMigrationCredentials) says why. An older target, or
+// one that simply has none, sends none.
+const MigrationTLSUnusableMD = "x-litevirt-migration-tls-unusable"
+
+// unusableMigrationCredentialsRefusal refuses a storage copy because host's
+// migration-TLS credentials are unusable (why), with the fix.
+func unusableMigrationCredentialsRefusal(vmName, host, why string) error {
+	return status.Errorf(codes.FailedPrecondition,
+		"refusing to migrate VM %q with a storage copy: %s holds migration-TLS credentials it cannot use (%s), so the copy "+
+			"could not be encrypted. Reissue its credentials with `lv host install-migration-tls --reissue` (run where the "+
+			"cluster's migration CA lives)", vmName, host, why)
+}
+
 // migrationCAMismatch refuses a storage copy between hosts whose migration
 // credentials chain to different migration CAs: QEMU's TLS handshake would
 // fail mid-copy. Either fingerprint unknown (an older build, or none could be
@@ -2349,6 +2383,9 @@ type ensureOutcome struct {
 	// migrationCA is the fingerprint of the migration CA the target's
 	// credentials chain to (MigrationCAMD), "" when it did not say.
 	migrationCA string
+	// tlsUnusable is why the target's migration-TLS credentials are unusable
+	// (MigrationTLSUnusableMD), "" when it did not say.
+	tlsUnusable string
 	remap       map[string]string // installer CD-ROM source path -> the target's file
 	// migAddr is the target's address inside migration.network, "" when none
 	// was asked for or the target gave none (migration_network.go).
@@ -2457,11 +2494,14 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 			slog.Info("migration: the target opens the installer ISO at its own file", "vm", vmName, "target", targetHost, "here", from, "there", to)
 		}
 	}
-	var targetCA string
+	var targetCA, unusable string
 	if v := hdr.Get(MigrationCAMD); len(v) > 0 {
 		targetCA = v[0]
 	}
-	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), migrationCA: targetCA, remap: remap, migAddr: resp.GetMigrationAddress(), cgroupMode: resp.GetCgroupMode(), vncPasswordUnavailable: resp.GetVncPasswordUnavailable(), netDevices: resp.GetNetworkDevices()}, nil
+	if v := hdr.Get(MigrationTLSUnusableMD); len(v) > 0 {
+		unusable = v[0]
+	}
+	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), migrationCA: targetCA, tlsUnusable: unusable, remap: remap, migAddr: resp.GetMigrationAddress(), cgroupMode: resp.GetCgroupMode(), vncPasswordUnavailable: resp.GetVncPasswordUnavailable(), netDevices: resp.GetNetworkDevices()}, nil
 }
 
 // olderTargetISORemap points, for a move to an older target, the CD-ROM that

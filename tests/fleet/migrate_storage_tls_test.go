@@ -3,6 +3,7 @@ package fleet
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/pki"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -222,6 +224,67 @@ func TestFleet_StorageMigrationIsRefusedWhenTheSourceCannotReadItsMigrationCA(t 
 		!strings.Contains(err.Error(), "ca.crt holds no PEM certificate") ||
 		!strings.Contains(err.Error(), "lv host install-migration-tls --reissue") {
 		t.Fatalf("migration = %v; want FailedPrecondition naming %s, the CA error and `lv host install-migration-tls --reissue`", err, src.Name)
+	}
+	if n := migrateCalls(src); n != 0 {
+		t.Fatalf("the refused migration reached libvirt %d time(s)", n)
+	}
+}
+
+// migrationTLSInvalid makes n hold migration credentials it cannot use (a CA
+// that is not a certificate, a directory where a file should be).
+func migrationTLSInvalid(n *Node, why string) {
+	n.Server.SetMigrationTLS(func() (bool, error) {
+		return false, fmt.Errorf("%w: %s", pki.ErrInvalidMigrationCredentials, why)
+	})
+}
+
+// The target holds migration credentials it cannot use (its CA is not a
+// certificate). It used to report itself ready all the same, install the
+// garbage for QEMU, and the copy failed mid-way with a generic error. The
+// source now refuses before the copy, naming the target, why, and the fix.
+//
+// Mutation: read an unusable target as one with no credentials — the
+// refusal is the plain "no migration-TLS credentials" one, red.
+func TestFleet_StorageMigrationIsRefusedWhenTheTargetsMigrationCredentialsAreUnusable(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	defer c.Stop()
+	src, dst := c.Nodes[0], c.Nodes[1]
+	migrationTLSReady(src, true)
+	migrationTLSInvalid(dst, "ca.crt holds no PEM certificate")
+
+	path := filepath.Join(c.tmpRoot, dst.Name, "data", "disks", "pp1-root.qcow2")
+	storageMigrationVM(t, src, path, 1<<30)
+	err := runStorageMigration(t, c, src, dst.Name)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), dst.Name) ||
+		!strings.Contains(err.Error(), "ca.crt holds no PEM certificate") ||
+		!strings.Contains(err.Error(), "lv host install-migration-tls --reissue") {
+		t.Fatalf("migration = %v; want FailedPrecondition naming %s, why, and `lv host install-migration-tls --reissue`", err, dst.Name)
+	}
+	if n := migrateCalls(src); n != 0 {
+		t.Fatalf("the refused migration reached libvirt %d time(s)", n)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Errorf("the refused migration left its disk stub %s on the target (stat err %v)", path, statErr)
+	}
+}
+
+// The source's own credentials are unusable (its CA is a directory): it
+// refuses with the same guidance, not "no migration-TLS credentials".
+//
+// Mutation: read an unusable source as one with no credentials — red.
+func TestFleet_StorageMigrationIsRefusedWhenTheSourcesMigrationCredentialsAreUnusable(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	defer c.Stop()
+	src, dst := c.Nodes[0], c.Nodes[1]
+	migrationTLSInvalid(src, "read ca.crt: is a directory")
+	migrationTLSReady(dst, true)
+
+	storageMigrationVM(t, src, filepath.Join(c.tmpRoot, dst.Name, "data", "disks", "pp1-root.qcow2"), 1<<30)
+	err := runStorageMigration(t, c, src, dst.Name)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), src.Name) ||
+		!strings.Contains(err.Error(), "is a directory") ||
+		!strings.Contains(err.Error(), "lv host install-migration-tls --reissue") {
+		t.Fatalf("migration = %v; want FailedPrecondition naming %s, why, and `lv host install-migration-tls --reissue`", err, src.Name)
 	}
 	if n := migrateCalls(src); n != 0 {
 		t.Fatalf("the refused migration reached libvirt %d time(s)", n)

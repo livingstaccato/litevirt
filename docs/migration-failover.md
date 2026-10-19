@@ -106,6 +106,12 @@ migration-TLS credentials:
   `lv host install-migration-tls --reissue`. A target on an older build does
   not report its CA, and nothing is compared. A source that cannot read its
   own migration CA refuses the copy, naming the error and the same command.
+- A host whose credentials cannot be used (a CA that is not a certificate or
+  not a file, a host certificate the CA did not issue, a key that is not the
+  certificate's) is not ready for migration TLS, and its daemon installs
+  nothing for QEMU. A storage copy from or to it is refused before it starts,
+  naming the host, why, and `lv host install-migration-tls --reissue`, whatever
+  `migration.allow_unencrypted_storage` says.
 - Each daemon installs its host's credentials into `/etc/pki/qemu`, with the key
   readable only by the QEMU user, at start and again before each storage
   migration, so no restart is needed. It refuses to touch `/etc/pki/qemu` if
@@ -344,9 +350,13 @@ records the VM on whichever host it ended on and runs `post_migrate` naming
 it. No cold move is tried while the move can still complete, and a drain run
 meanwhile skips the VM. A move that completes in the background is recorded
 for failback like any other. Watch it with `lv events <vm>`. A drain whose
-client goes away still records a move that completes afterwards on its
-target. A VM whose lock another operation holds (a scheduled snapshot, a
-replication run) is waited for, up to 10 minutes, then skipped.
+client goes away (Ctrl-C) does not stop a move it has started: a live or cold
+move runs to its end, moved or rolled back, and one that completes afterwards
+is recorded on its target. VMs not yet started are left where they are. The
+drained host's audit log records the drain as `cancelled` with each VM's
+outcome (`lv audit`), and each VM gets a `vm.drain` event. A VM whose lock
+another operation holds (a scheduled snapshot, a replication run) is waited
+for, up to 10 minutes, then skipped, naming the operation that holds it.
 
 After the cut-over the source's cloud-init ISO is removed and DNS,
 load-balancer backends and VXLAN forwarding entries follow the VM, as for a

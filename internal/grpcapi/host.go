@@ -571,21 +571,35 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 		}
 		if serr != nil {
 			// The client went away; the moves already handed to the workers
-			// go on. Their outcomes are still judged, once all have ended.
+			// go on. Their outcomes are still judged, recorded and audited, once
+			// all have ended, so the drain does not end silently.
 			left := len(drainJobs) - i - 1
+			dctx := context.WithoutCancel(ctx)
+			slog.Warn("drain: the client went away; moves already started finish, queued ones are not started",
+				"host", req.Name, "error", serr, "unreported", left+1)
+			s.publish("host.drain.cancelled", req.Name, "the drain's client went away")
+			outcomes := []string{drainOutcome(progress)}
 			go func(seen []string) {
 				for ; left > 0; left-- {
 					r := <-results
+					outcomes = append(outcomes, drainOutcome(r.progress))
 					switch {
 					case isDrainTimedOut(r.progress):
 						seen = append(seen, r.progress.VmName)
 					case r.progress.Status == "done" && r.progress.Error == "":
 						// So that undrain can move it back, as a move the client saw.
-						s.recordDrainOriginBounded(context.WithoutCancel(ctx), r.record)
+						s.recordDrainOriginBounded(dctx, r.record)
 					}
+					s.recordVMEvent(dctx, r.progress.VmName, "vm.drain", drainEventResult(r.progress),
+						"after the drain's client left: "+drainOutcome(r.progress))
 				}
-				s.judgeDrainTimeouts(context.WithoutCancel(ctx), req.Name, seen, true)
+				s.judgeDrainTimeouts(dctx, req.Name, seen, true)
+				detail := "the drain's client went away; " + strings.Join(outcomes, "; ")
+				slog.Warn("drain: ended after its client went away", "host", req.Name, "outcomes", strings.Join(outcomes, "; "))
+				s.audit(dctx, "host.drain", req.Name, detail, "cancelled")
 			}(timedOut)
+			s.recordVMEvent(dctx, progress.VmName, "vm.drain", drainEventResult(progress),
+				"after the drain's client left: "+drainOutcome(progress))
 			return serr
 		}
 	}
@@ -701,6 +715,11 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped", Strategy: notMoved,
 			Error: "the drain was cancelled before this VM's move started; it keeps running here"}
 	}
+	// From here this VM's move has started: it runs to its end — moved, or
+	// rolled back as its own failure paths do — even if the drain's client
+	// goes away. A move on the request's context died with it: a cold move
+	// shut the guest down, failed its next read, and started it again here.
+	ctx = context.WithoutCancel(ctx)
 	adopted := false
 	defer func() {
 		if !adopted {
@@ -1054,9 +1073,13 @@ func (s *Server) drainLockVM(ctx context.Context, vm, target string) (unlock fun
 		case <-ctx.Done():
 			return nil, cancelled()
 		case <-deadline.C:
+			holder := "its holder is not recorded"
+			if h, ok := s.vmLockHolderOf(vm); ok && h.who != "" {
+				holder = fmt.Sprintf("held by %s since %s", h.who, h.since.UTC().Format(time.RFC3339))
+			}
 			return nil, &pb.DrainProgress{VmName: vm, TargetHost: target, Status: "skipped", Strategy: notMoved,
-				Error: fmt.Sprintf("another operation still holds this VM after %s (a scheduled snapshot, a replication run, "+
-					"a hotplug or resize, or a backup); re-run drain once it ends", drainLockWait)}
+				Error: fmt.Sprintf("another operation still holds this VM after %s (%s); re-run drain once it ends",
+					drainLockWait, holder)}
 		case <-tick.C:
 		}
 		if u, ok := s.tryLockVM(vm); ok {
@@ -1095,6 +1118,29 @@ func (s *Server) undrainJudge(ctx context.Context, host string) {
 // drainBackgroundMarker is in the Error of such a frame when libvirt did not
 // answer the abort and the move was handed to a background owner.
 const drainBackgroundMarker = "finish in the background"
+
+// drainOutcome is one VM's drain frame in words, for the record of a drain
+// whose client went away.
+func drainOutcome(p *pb.DrainProgress) string {
+	switch {
+	case p.Status == "done" && p.Error == "":
+		return p.VmName + " moved to " + p.TargetHost
+	case p.Status == "done":
+		return p.VmName + " moved to " + p.TargetHost + ", " + p.Error
+	case p.Error != "":
+		return p.VmName + " " + p.Status + ": " + p.Error
+	default:
+		return p.VmName + " " + p.Status
+	}
+}
+
+// drainEventResult is a drain frame's VM event result.
+func drainEventResult(p *pb.DrainProgress) string {
+	if p.Status == "done" && p.Error == "" {
+		return "ok"
+	}
+	return "error"
+}
 
 // isDrainTimedOut reports whether p is the frame of a live move aborted at
 // its migration policy's timeout.

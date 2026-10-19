@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -181,5 +182,59 @@ func TestMigrationCAFingerprint(t *testing.T) {
 	}
 	if _, err := MigrationCAFingerprint(a); err == nil {
 		t.Fatal("a CA file with no certificate gave a fingerprint")
+	}
+}
+
+// InstallQemuMigrationTLS validates a credential set before it writes any of
+// it: a CA that is not a certificate, a CA that is a directory, or a host
+// certificate another CA issued is refused as ErrInvalidMigrationCredentials,
+// and QEMU's directory is left as it was. Lab 1 found a target that installed
+// 30 bytes of garbage as ca-cert.pem and reported itself ready.
+//
+// Mutation: copy the CA unparsed — the garbage CA is installed, red.
+func TestInstallQemuMigrationTLS_RefusesUnusableCredentials(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		spoil func(t *testing.T, pkiDir string)
+	}{
+		{"CA not PEM", func(t *testing.T, pkiDir string) {
+			if err := os.WriteFile(filepath.Join(MigrationDir(pkiDir), MigrationCAName), []byte("this is not a certificate\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"CA a directory", func(t *testing.T, pkiDir string) {
+			p := filepath.Join(MigrationDir(pkiDir), MigrationCAName)
+			if err := os.Remove(p); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(p, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"host cert from another CA", func(t *testing.T, pkiDir string) {
+			other := t.TempDir()
+			provisionMigration(t, other)
+			data, err := os.ReadFile(filepath.Join(MigrationDir(other), MigrationCAName))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(MigrationDir(pkiDir), MigrationCAName), data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pkiDir := t.TempDir()
+			provisionMigration(t, pkiDir)
+			tc.spoil(t, pkiDir)
+			qemuDir := filepath.Join(t.TempDir(), "qemu")
+			ok, err := InstallQemuMigrationTLS(pkiDir, qemuDir, -1, -1)
+			if ok || !errors.Is(err, ErrInvalidMigrationCredentials) {
+				t.Fatalf("install = %v, %v; want refused as ErrInvalidMigrationCredentials", ok, err)
+			}
+			if _, statErr := os.Stat(filepath.Join(qemuDir, "ca-cert.pem")); !os.IsNotExist(statErr) {
+				t.Fatalf("an unusable credential set was installed for QEMU (stat err %v)", statErr)
+			}
+		})
 	}
 }

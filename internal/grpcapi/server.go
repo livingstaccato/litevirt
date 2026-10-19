@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/netip"
 	"os"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -974,6 +976,9 @@ type Server struct {
 
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
+	// vmLockHolders records who holds each held VM lock (vmLocksMu), so a
+	// drain that gives up on one can name it.
+	vmLockHolders map[string]vmLockHolder
 	// vmLockQueues holds the callers waiting for a VM's lock through
 	// lockVMUnlessStartHeld (vm_start_bound.go).
 	vmLockQueuesMu sync.Mutex
@@ -1965,16 +1970,24 @@ func (s *Server) AnswerEnsureDisksAsAnOlderTargetForTest(v bool) { s.isoResolved
 // returned, because the caller decides between refusing and the plaintext
 // fallback.
 func (s *Server) migrationTLSReady() bool {
+	ok, _ := s.migrationTLSState()
+	return ok
+}
+
+// migrationTLSState is migrationTLSReady with the reason it is not ready: nil
+// for a host with no credentials, pki.ErrInvalidMigrationCredentials for one
+// whose credentials are unusable (logged).
+func (s *Server) migrationTLSState() (bool, error) {
 	if s.migrationTLS == nil {
-		return false
+		return false, nil
 	}
 	ok, err := s.migrationTLS()
 	if err != nil {
 		slog.Warn("migration TLS is not available on this host; storage migrations "+
 			"from or to it cannot be encrypted", "error", err)
-		return false
+		return false, err
 	}
-	return ok
+	return ok, nil
 }
 
 // SetCanonicalIdentityEnforce sets this node's kill-switch for natural-key identity
@@ -2786,7 +2799,66 @@ func (s *Server) lockVM(vmName string) func() {
 	}
 	s.vmLocksMu.Unlock()
 	mu.Lock()
-	return mu.Unlock
+	return s.holdVMLock(vmName, mu)
+}
+
+// vmLockHolder is who holds a VM's lock, and since when.
+type vmLockHolder struct {
+	who   string
+	since time.Time
+}
+
+// holdVMLock records the caller that just took vmName's lock (mu) and returns
+// the unlock, which forgets it.
+func (s *Server) holdVMLock(vmName string, mu *sync.Mutex) func() {
+	h := vmLockHolder{who: vmLockCaller(), since: time.Now()}
+	s.vmLocksMu.Lock()
+	if s.vmLockHolders == nil {
+		s.vmLockHolders = map[string]vmLockHolder{}
+	}
+	s.vmLockHolders[vmName] = h
+	s.vmLocksMu.Unlock()
+	return func() {
+		s.vmLocksMu.Lock()
+		delete(s.vmLockHolders, vmName)
+		s.vmLocksMu.Unlock()
+		mu.Unlock()
+	}
+}
+
+// vmLockHolderOf is who holds vmName's lock, when it is recorded.
+func (s *Server) vmLockHolderOf(vmName string) (vmLockHolder, bool) {
+	s.vmLocksMu.Lock()
+	defer s.vmLocksMu.Unlock()
+	h, ok := s.vmLockHolders[vmName]
+	return h, ok
+}
+
+// vmLockCaller is the function that asked for a VM lock: the first caller
+// outside the lock helpers, as "Method" or "function".
+func vmLockCaller() string {
+	pcs := make([]uintptr, 12)
+	n := runtime.Callers(3, pcs)
+	frames := runtime.CallersFrames(pcs[:n])
+	for {
+		f, more := frames.Next()
+		name := f.Function
+		if i := strings.LastIndex(name, "/"); i >= 0 {
+			name = name[i+1:]
+		}
+		if i := strings.Index(name, "."); i >= 0 {
+			name = name[i+1:]
+		}
+		name = strings.TrimPrefix(name, "(*Server).")
+		lower := strings.ToLower(name)
+		if name != "" && !strings.Contains(lower, "lockvm") && !strings.Contains(lower, "lockcontainer") &&
+			!strings.HasPrefix(lower, "holdvmlock") {
+			return name
+		}
+		if !more {
+			return ""
+		}
+	}
 }
 
 // tryLockVM is lockVM without the wait: it returns the unlock function and
@@ -2805,7 +2877,7 @@ func (s *Server) tryLockVM(vmName string) (func(), bool) {
 	if !mu.TryLock() {
 		return nil, false
 	}
-	return mu.Unlock, true
+	return s.holdVMLock(vmName, mu), true
 }
 
 // markBackupActive / clearBackupActive bracket a backup operation so the

@@ -17,11 +17,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 )
@@ -425,4 +428,88 @@ func TestFleet_DrainCountsAVMThatDidNotStartOnItsTarget(t *testing.T) {
 	if !found {
 		t.Errorf("no vm.drain error event says os1 was not started on %s: %+v", sc.dst.Name, evs)
 	}
+}
+
+// auditEntries is the audit log's host.drain entries on n: "result detail".
+func auditEntries(t *testing.T, n *Node, action string) []string {
+	t.Helper()
+	rows, err := n.DB.Query(context.Background(), `SELECT result, detail FROM audit_log WHERE action = ?`, action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, r := range rows {
+		out = append(out, r.String("result")+" "+r.String("detail"))
+	}
+	return out
+}
+
+// The client of `lv host drain` goes away (Ctrl-C) while a running VM's cold
+// move is shutting it down. The move does not die with the request: it
+// completes, and the VM runs on the target only. The drain does not end
+// silently: the host's audit log records that its client left and how each
+// VM it had started ended.
+//
+// Mutations: run the cold move on the request's context — the move fails
+// (context canceled), the VM is started again on the source, and goes red.
+// Record nothing when the client leaves — the audit check goes red.
+func TestFleet_DrainColdMoveCompletesWhenTheClientLeaves(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	startsBefore := sc.srcOps("start")
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	sc.src.Virt.FailShutdownDomain = func(name string) error {
+		if name == "os1" {
+			once.Do(func() { close(started) })
+			<-release
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st, err := sc.c.SelfClient(sc.src).DrainHost(ctx, &pb.DrainHostRequest{Name: sc.src.Name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			if _, err := st.Recv(); err != nil {
+				return
+			}
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the cold move never reached the shutdown")
+	}
+	cancel()
+	time.Sleep(150 * time.Millisecond) // the server sees the stream end
+	close(release)
+
+	eventually(t, 15*time.Second, "os1 to run on the target only", func() bool {
+		vm, _ := corrosion.GetVM(context.Background(), sc.src.DB, "os1")
+		dstActive, _ := sc.dst.Virt.DomainIsActive("os1")
+		srcActive, _ := sc.src.Virt.DomainIsActive("os1")
+		return vm != nil && vm.HostName == sc.dst.Name && vm.State == "running" && dstActive && !srcActive
+	})
+	if n := sc.srcOps("start") - startsBefore; n != 0 {
+		t.Errorf("os1 was started again on the source %d time(s)", n)
+	}
+	eventually(t, 15*time.Second, "the drain's end after its client left to be audited", func() bool {
+		for _, e := range auditEntries(t, sc.src, "host.drain") {
+			if strings.HasPrefix(e, "cancelled ") && strings.Contains(e, "os1") && strings.Contains(e, "moved") {
+				return true
+			}
+		}
+		return false
+	})
 }

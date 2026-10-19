@@ -155,6 +155,9 @@ drive a local `lv`).
 | `E2E_LAB_PORT_BASE` | `2230` | node N's SSH is `127.0.0.1:(base+N)` |
 | `E2E_EVIDENCE_DIR` | (none) | per drill: `samples.log` (every sample), `timeline.txt`, extra evidence |
 | `E2E_DRILL_IMAGE` / `E2E_DRILL_MEMORY` | `cirros` / `128M` | the drills' own test VMs |
+| `E2E_UEFI_IMAGE` / `E2E_UEFI_MEMORY` | `ubuntu-ga` / `768` | the `TestDrill_UEFIVariableSurvivesHostPowerCut*` drills' VM: a UEFI-bootable cloud image with efivarfs and a `ubuntu` user with passwordless `sudo` |
+| `E2E_NVRAM_CUT_AFTER` | `3s` | how long after the guest's UEFI variable write the `TestDrill_UEFIVariableSurvivesHostPowerCut*` drills power the host off, from `2s` to `5s` |
+| `E2E_NVRAM_EXPECT_LOSS` | (none) | `1` inverts those drills for the control run on a build without the vars flusher: the write must then be lost. Run it once against that build before trusting a pass on the build with it |
 | `E2E_RELAY_NETEM` | (none) | overrides `TestRelayHealth_DegradedLinkBecomesALeafEverywhere`'s impairment with a uniform `tc netem <args>` on node-1's cluster interface. By default the test drops all of node-1's traffic to node-2 and node-3 with a per-peer `tc` filter: two of four observers fail every probe, below fence quorum. Uniform loss rarely fails every probe for 2 minutes (TCP retransmits) |
 | `E2E_GUEST_USER` / `E2E_GUEST_PASSWORD` | `cirros` / `gocubsgo` | login the firewall traffic case (`TestFirewall_TrafficBetweenVMs`) uses inside its guests, over SSH through the host node |
 | `E2E_MAILPIT` / `E2E_MAILPIT_SMTP` | `http://10.77.0.50:8025` / its host, port `1025` | the witness drills' mail sink, as the nodes reach it: Mailpit's HTTP API (checked with `curl` from a node) and its SMTP listener, which `lv notify target add --type email` points at. `TestDrillW1_WitnessBridgedStall` skips without it; `TestDrillW5_ClockSteps` then leaves the notification unchecked |

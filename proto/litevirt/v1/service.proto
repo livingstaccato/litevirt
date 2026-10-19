@@ -145,6 +145,10 @@ message ResolveHealthConditionRequest {
     string subject_id   = 3;
     string evaluator    = 4;
     string reason       = 5;   // the operator's note, recorded in the audit row
+    // accept_stale_uefi_vars is the admin's explicit acceptance, for
+    // nvram_flush_failed, that the UEFI vars stores the condition names may
+    // be stale (`--accept-stale-uefi-vars`). That code is refused without it.
+    bool   accept_stale_uefi_vars = 6;
 }
 message ResolveHealthConditionResponse {
     HealthCondition condition = 1;   // the row as resolved
@@ -4387,9 +4391,10 @@ service LiteVirt {
     rpc SetHostLabels(SetHostLabelsRequest)    returns (Host);
     rpc FenceHost(FenceHostRequest)            returns (FenceResult);
     rpc GetClusterHealth(GetClusterHealthRequest) returns (ClusterHealth);
-    // ResolveHealthCondition marks one open dual-run condition resolved on an
-    // admin's word, audited. The detector re-derives its findings every pass,
-    // so a condition that still holds is raised again on the next one.
+    // ResolveHealthCondition marks one open condition resolved on an admin's
+    // word, audited: a dual-run condition, which the detector raises again on
+    // its next pass if it still holds, or nvram_flush_failed, accepted as a
+    // possibly stale UEFI vars store (accept_stale_uefi_vars).
     rpc ResolveHealthCondition(ResolveHealthConditionRequest) returns (ResolveHealthConditionResponse);
     rpc GetFenceReadiness(google.protobuf.Empty)  returns (FenceReadiness);
     rpc RemoveHost(RemoveHostRequest)          returns (RemoveHostResponse);

@@ -589,6 +589,7 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 				if e := os.Rename(oldNvram, newNvram); e != nil {
 					return failed("nvram rename", e)
 				}
+				syncDir(filepath.Dir(newNvram))
 			}
 			if _, e := os.Stat(oldSeed); e == nil {
 				if e := os.Rename(oldSeed, newSeed); e != nil {

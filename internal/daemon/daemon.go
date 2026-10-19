@@ -404,6 +404,11 @@ func boundedTelemetryShutdown(shutdown func(context.Context) error, timeout time
 }
 
 func (d *Daemon) Run(ctx context.Context) error {
+	// qemu writes UEFI vars files with no flush and libvirt has no cache mode
+	// for <nvram>: flush them from the first moment, so a host power cut
+	// loses at most about a second of a guest's UEFI variable writes.
+	nvramFlusher, stopNvramFlusher := d.startNvramFlusher(ctx)
+	defer stopNvramFlusher()
 	if err := d.checkMigrationNetwork(); err != nil {
 		return err
 	}
@@ -954,6 +959,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Hourly removal of the disk copies a failover start set aside here, once
 	// past superseded_disk_retention_days (health/superseded_retention.go).
 	go d.runSupersededDiskSweep(ctx)
+
+	// A UEFI vars file whose flush failed is a host condition
+	// (nvram_flush_failed); the flusher itself started with Run.
+	go d.runNvramFlushCondition(ctx, nvramFlusher)
 
 	// Sample this host's aggregate disk/net rates into host_runtime_usage for the
 	// placement engine's DiskIOPS/NetBW dimensions.

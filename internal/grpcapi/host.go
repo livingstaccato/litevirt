@@ -1820,7 +1820,7 @@ const admitGRPCPort = 7443
 // address to winner, admitted there first on another replica.
 func addressLostRefusal(address, name, winner string) error {
 	return status.Errorf(codes.FailedPrecondition,
-		"%s:%d is %s's address, admitted there before %s (on another replica, before the two admissions met): "+
+		"%s:%d is %s's address (active there, or admitted there before %s on another replica): "+
 			"%s stays admitted (joining) but is never activated, and nothing was installed for it. Remove it "+
 			"(`lv host rm %s`), or remove %s (`lv host rm %s`, or `lv host rm --dead %s` if it is fenced and gone "+
 			"for good) and run the add again",
@@ -1910,16 +1910,18 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.A
 	}
 	// The write's guard sees only this replica. Pulled again now that it is
 	// written, the address is decided by the rule activation follows
-	// (corrosion.AddressWinner): an admission another replica made first at
-	// this address wins it, and this one is refused before anything is
-	// installed for it. Its row stays, and is never activated.
+	// (corrosion.AddressLostTo): a host active at this address, or an
+	// admission another replica made there first, keeps it, and this one is
+	// refused before anything is installed for it. Its row stays, and is never
+	// activated. `lv host add` asks again, under its lock on the machine,
+	// right before it installs.
 	if err := s.pullHostsNow(ctx, "admit", req.Name); err != nil {
 		return nil, err
 	}
-	if winner, err := corrosion.AddressWinner(ctx, s.db, req.Name); err != nil {
+	if lostTo, err := corrosion.AddressLostTo(ctx, s.db, req.Name); err != nil {
 		return nil, status.Errorf(codes.Unavailable, "read the hosts at %s: %v", req.Address, err)
-	} else if winner != "" && winner != req.Name {
-		return nil, addressLostRefusal(req.Address, req.Name, winner)
+	} else if lostTo != "" {
+		return nil, addressLostRefusal(req.Address, req.Name, lostTo)
 	}
 	s.publish("host.admitted", req.Name, "cert_serial="+req.CertSerial)
 	return &pb.AdmitHostResponse{AuditTailSeq: tailSeq, AuditTailHash: tailHash, AuditPositionProven: true,

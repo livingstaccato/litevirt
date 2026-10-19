@@ -427,17 +427,19 @@ func ConfirmServing(ctx context.Context, db *corrosion.Client, host string) (boo
 	if h.State != "upgrading" {
 		return false, h.State, ErrNotUpgrading
 	}
-	if err := addressNotWon(ctx, db, host); err != nil {
-		return false, h.State, err
-	}
 	if beforeConfirmWrite != nil {
 		beforeConfirmWrite()
 	}
 	// Only from 'upgrading', checked in the write's own transaction: a fence
-	// or drain recorded since the read above keeps its state.
-	applied, err := corrosion.UpdateHostStateFrom(ctx, db, host, "upgrading", "active")
+	// or drain recorded since the read above keeps its state. So is the
+	// address (corrosion.ActivateHostFrom): a host that does not keep it is
+	// refused, and retried.
+	applied, lostTo, err := corrosion.ActivateHostFrom(ctx, db, host, "upgrading")
 	if err != nil {
 		return false, h.State, err
+	}
+	if lostTo != "" {
+		return false, h.State, addressNotKept(host, lostTo)
 	}
 	if !applied {
 		now, err := corrosion.GetHost(ctx, db, host)
@@ -449,23 +451,15 @@ func ConfirmServing(ctx context.Context, db *corrosion.Client, host string) (boo
 	return true, "active", nil
 }
 
-// addressNotWon refuses to record host active while another live or joining
-// host holds its address and wins it (corrosion.AddressWinner): two
-// admissions made on two replicas before either reached the other both
-// stand, and only the first is activated. The caller retries, so the host
-// activates once the other is removed; until then it stays 'upgrading' and
-// says why (upgrading_unconfirmed).
-func addressNotWon(ctx context.Context, db *corrosion.Client, host string) error {
-	winner, err := corrosion.AddressWinner(ctx, db, host)
-	if err != nil {
-		return fmt.Errorf("read the hosts at this host's address: %w", err)
-	}
-	if winner == "" || winner == host {
-		return nil
-	}
-	return fmt.Errorf("%s holds this host's address, admitted before it: a machine is admitted under one name, "+
-		"and %s is not activated while %s holds it. Remove the one this machine does not serve: `lv host rm %s` "+
-		"or `lv host rm %s`", winner, host, winner, host, winner)
+// addressNotKept is the refusal to record host active while lostTo keeps
+// its address (corrosion.AddressLostTo): a host already active there, or an
+// earlier admission. The caller retries, so the host activates once lostTo is
+// removed; until then it stays 'upgrading' and says why
+// (upgrading_unconfirmed).
+func addressNotKept(host, lostTo string) error {
+	return fmt.Errorf("%s keeps this host's address (it is active there, or was admitted there first): a machine is "+
+		"admitted under one name, and %s is not activated while %s holds it. Remove the one this machine does not "+
+		"serve: `lv host rm %s` or `lv host rm %s`", lostTo, host, lostTo, host, lostTo)
 }
 
 // ErrMovedOn is ConfirmServingReport's answer for a host recorded in another
@@ -516,15 +510,15 @@ func ConfirmServingReport(ctx context.Context, db *corrosion.Client, host, from 
 	case h.State != from:
 		return false, h.State, reportKeepingState(ctx, db, host, h.State, r)
 	}
-	if err := addressNotWon(ctx, db, host); err != nil {
-		return false, h.State, err
-	}
 	if beforeConfirmWrite != nil {
 		beforeConfirmWrite()
 	}
-	applied, err := corrosion.UpdateHostStartupFrom(ctx, db, host, from, "active", r.Version, r.CPUs, r.MemMiB, r.DiskGiB, r.HasResources)
+	applied, lostTo, err := corrosion.ActivateHostStartupFrom(ctx, db, host, from, r.Version, r.CPUs, r.MemMiB, r.DiskGiB, r.HasResources)
 	if err != nil {
 		return false, h.State, err
+	}
+	if lostTo != "" {
+		return false, h.State, addressNotKept(host, lostTo)
 	}
 	if !applied {
 		now, err := corrosion.GetHost(ctx, db, host)

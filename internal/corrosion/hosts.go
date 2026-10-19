@@ -216,12 +216,12 @@ func AdmitHost(ctx context.Context, c *Client, h HostRecord) error {
 		if strings.EqualFold(rows[0].String("cert_serial"), h.CertSerial) {
 			// A retry of this admission writes nothing, so no guard runs:
 			// the address is checked here, by the rule activation follows.
-			winner, err := AddressWinner(ctx, c, h.Name)
+			lostTo, err := AddressLostTo(ctx, c, h.Name)
 			if err != nil {
 				return err
 			}
-			if winner != "" && winner != h.Name {
-				return &AddressHeldError{Address: h.Address, Port: h.GRPCPort, Holder: winner}
+			if lostTo != "" {
+				return &AddressHeldError{Address: h.Address, Port: h.GRPCPort, Holder: lostTo}
 			}
 			return nil
 		}
@@ -300,29 +300,86 @@ func HostAddressHolder(ctx context.Context, c *Client, address, name string, por
 	return rows[0].String("name"), nil
 }
 
-// AddressWinner is the host that keeps name's address when more than one
-// live or joining host holds it at one gRPC port (a port of 0 matches any):
-// the one admitted first (created_at, the admission's stamp), the lesser name
-// on a tie. Every replica that holds the same rows picks the same host, so two
-// admissions made on two replicas before either reached the other resolve
-// the same way everywhere, and only the winner is activated (hostboot). It is
-// name when name holds its address alone, and "" when name has no live row.
-func AddressWinner(ctx context.Context, c *Client, name string) (string, error) {
-	rows, err := c.Query(ctx, `SELECT h.name AS name, COALESCE(h.created_at, '') AS created_at
-		FROM hosts h JOIN hosts me ON me.name = ?
-		WHERE me.deleted_at IS NULL AND h.deleted_at IS NULL AND h.address = me.address AND h.address <> ''
-		AND (COALESCE(h.grpc_port, 0) = 0 OR COALESCE(me.grpc_port, 0) = 0 OR h.grpc_port = me.grpc_port)`, name)
+// addressContendersSQL reads the live or joining hosts that share name's
+// address at one gRPC port (a port of 0 matches any), name included: each
+// one's admission stamp and its resolved state.
+const addressContendersSQL = `SELECT h.name AS name, COALESCE(h.created_at, '') AS created_at,
+		COALESCE(h.state, '') AS h_state, COALESCE(m.host_name, '') AS m_host, COALESCE(m.state, '') AS m_state
+	FROM hosts h` + membershipJoins + ` JOIN hosts me ON me.name = ?
+	WHERE me.deleted_at IS NULL AND h.deleted_at IS NULL AND h.address = me.address AND h.address <> ''
+	AND (COALESCE(h.grpc_port, 0) = 0 OR COALESCE(me.grpc_port, 0) = 0 OR h.grpc_port = me.grpc_port)`
+
+type addressContender struct{ name, createdAt, state string }
+
+// addressLostTo decides an address held by more than one live host, the
+// same way on every replica that holds the same rows: a host recorded
+// 'active' keeps it, whatever its stamp, so a host is never activated
+// beside one that already is; otherwise the earliest admission (created_at)
+// keeps it, the lesser name on a tie. It is the host name loses to, "" when
+// name keeps the address.
+func addressLostTo(cs []addressContender, name string) string {
+	for _, c := range cs {
+		if c.name != name && c.state == "active" {
+			return c.name
+		}
+	}
+	winner, at := "", ""
+	for _, c := range cs {
+		if winner == "" || admittedBefore(c.createdAt, c.name, at, winner) {
+			winner, at = c.name, c.createdAt
+		}
+	}
+	if winner == name {
+		return ""
+	}
+	return winner
+}
+
+func contenderOf(name, createdAt, hState, mHost, mState string) addressContender {
+	st := hState
+	if mHost != "" {
+		st = mState // as membershipRow.resolve: the membership row when it exists
+	}
+	return addressContender{name, createdAt, st}
+}
+
+// AddressLostTo is the host that keeps name's address instead of name
+// (addressLostTo), "" when name keeps it or has no live row. Only the host
+// that keeps it is admitted by AdmitHost and activated (ActivateHostFrom).
+func AddressLostTo(ctx context.Context, c *Client, name string) (string, error) {
+	rows, err := c.Query(ctx, addressContendersSQL, name)
 	if err != nil {
 		return "", err
 	}
-	winner, at := "", ""
+	var cs []addressContender
 	for _, r := range rows {
-		n, a := r.String("name"), r.String("created_at")
-		if winner == "" || admittedBefore(a, n, at, winner) {
-			winner, at = n, a
-		}
+		cs = append(cs, contenderOf(r.String("name"), r.String("created_at"), r.String("h_state"),
+			r.String("m_host"), r.String("m_state")))
 	}
-	return winner, nil
+	return addressLostTo(cs, name), nil
+}
+
+// addressKeptIn is AddressLostTo read inside a write's transaction: false,
+// with the holder in lostTo, when name does not keep its address.
+func addressKeptIn(ctx context.Context, tx *sql.Tx, name string, lostTo *string) (bool, error) {
+	rows, err := tx.QueryContext(ctx, addressContendersSQL, name)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	var cs []addressContender
+	for rows.Next() {
+		var n, at, hs, mh, ms string
+		if err := rows.Scan(&n, &at, &hs, &mh, &ms); err != nil {
+			return false, err
+		}
+		cs = append(cs, contenderOf(n, at, hs, mh, ms))
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	*lostTo = addressLostTo(cs, name)
+	return *lostTo == "", nil
 }
 
 // admittedBefore orders two admissions by stamp, then name.
@@ -946,6 +1003,54 @@ func UpdateHostStateFrom(ctx context.Context, c *Client, name, from, to string) 
 		return err
 	})
 	return applied, err
+}
+
+// ActivateHostFrom is UpdateHostStateFrom(name, from, "active") made only
+// while, read in the same transaction, name keeps its address
+// (AddressLostTo): a host is never recorded active beside another host at
+// its address that already is, nor while an earlier admission there stands.
+// lostTo names the holder when that refused the write.
+func ActivateHostFrom(ctx context.Context, c *Client, name, from string) (applied bool, lostTo string, err error) {
+	err = c.withMembershipWrite(ctx, func(live bool) error {
+		stmts, err := hostStateStatements(ctx, c, name, "active", live)
+		if err != nil {
+			return err
+		}
+		applied, err = c.ExecuteBatchGuarded(ctx, activationGuard(ctx, c, name, from, &lostTo), stmts)
+		return err
+	})
+	return applied, lostTo, err
+}
+
+// ActivateHostStartupFrom is UpdateHostStartupFrom(..., "active", ...) under
+// ActivateHostFrom's address rule.
+func ActivateHostStartupFrom(ctx context.Context, c *Client, name, from, version string, cpu, mem, disk int, hasResources bool) (applied bool, lostTo string, err error) {
+	if err := c.ownRowWriteRefused(name); err != nil {
+		return false, "", err
+	}
+	err = c.withMembershipWrite(ctx, func(live bool) error {
+		return c.withRuntimeWrite(ctx, func(liveRuntime bool) error {
+			stmts, err := hostStartupStatements(ctx, c, name, "active", version, cpu, mem, disk, hasResources, live, liveRuntime)
+			if err != nil || len(stmts) == 0 {
+				return err
+			}
+			applied, err = c.ExecuteBatchGuarded(ctx, activationGuard(ctx, c, name, from, &lostTo), stmts)
+			return err
+		})
+	})
+	return applied, lostTo, err
+}
+
+// activationGuard is hostStateIs(name, from) and addressKeptIn, both read in
+// the write's transaction.
+func activationGuard(ctx context.Context, c *Client, name, from string, lostTo *string) func(tx *sql.Tx) (bool, error) {
+	stateIs := hostStateIs(ctx, c, name, from)
+	return func(tx *sql.Tx) (bool, error) {
+		if ok, err := stateIs(tx); err != nil || !ok {
+			return false, err
+		}
+		return addressKeptIn(ctx, tx, name, lostTo)
+	}
 }
 
 // hostStateIs is the guard of a write made only while host is recorded

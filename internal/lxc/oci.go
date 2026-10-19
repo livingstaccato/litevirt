@@ -36,8 +36,8 @@ type PullOCIOptions struct {
 // OCI layout) and umoci (to unpack it). The hosts ship both in their
 // container-runtime package set.
 //
-// Conversion runs in two stages so we can resume a failed unpack
-// without re-downloading the layers:
+// Conversion runs in two stages, through a layout of this pull's own in
+// the item's staging directory, removed when the pull ends:
 //
 //  1. skopeo copy &lt;image&gt; oci:&lt;staged layout&gt;:&lt;tag&gt;
 //  2. umoci unpack --image &lt;tmp&gt;:&lt;tag&gt; --rootless &lt;dest&gt;
@@ -66,6 +66,13 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	// One spelling of the item: "/x/web/" is "/x/web", whose lock and
 	// staging live beside it, never inside the bundle.
 	opts.Dest = filepath.Clean(opts.Dest)
+	// The source as skopeo will read it: a registry image, or a local one
+	// at the path the caller judged (ParseOCISource). Anything else is
+	// refused before anything is touched.
+	src, err := ParseOCISource(opts.Image)
+	if err != nil {
+		return err
+	}
 	if err := requireBinary("skopeo"); err != nil {
 		return err
 	}
@@ -120,24 +127,19 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	defer func() { _ = os.RemoveAll(tmpLayout) }()
 	tag := opts.Tag
 	if tag == "" {
-		tag = parseOCITag(opts.Image)
+		tag = "latest"
+		switch {
+		case src.Local && src.Reference != "":
+			tag = src.Reference
+		case !src.Local:
+			tag = parseOCITag(opts.Image)
+		}
 	}
 
 	// Stage 1: skopeo into a local OCI directory layout. The "docker://"
 	// prefix tells skopeo to fetch from a registry; "oci:" works for
 	// local OCI dirs.
-	// A local "oci:<dir>[:tag]" source is read from that directory as is
-	// (the caller has judged the directory); anything else without a
-	// transport is a registry reference.
-	srcRef := opts.Image
-	remote := false
-	switch {
-	case strings.HasPrefix(srcRef, "oci:"):
-	case strings.Contains(srcRef, "://"):
-		remote = strings.HasPrefix(srcRef, "docker://")
-	default:
-		srcRef, remote = "docker://"+srcRef, true
-	}
+	srcRef, remote := src.Ref, !src.Local
 	dstRef := fmt.Sprintf("oci:%s:%s", tmpLayout, tag)
 	args := []string{"copy"}
 	// Credentials only make sense for a remote registry source; a local
@@ -146,7 +148,8 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	if opts.Username != "" && remote {
 		args = append(args, "--src-creds", opts.Username+":"+opts.Password)
 	}
-	args = append(args, srcRef, dstRef)
+	// "--" ends the options: no reference is ever read as a flag.
+	args = append(args, "--", srcRef, dstRef)
 	if out, err := combinedOutputPinned(dieWithDaemon(exec.CommandContext(ctx, "skopeo", args...))); err != nil {
 		return fmt.Errorf("skopeo copy: %w: %s", err, out)
 	}
@@ -219,8 +222,9 @@ func parseOCITag(ref string) string {
 //	"localhost:5000/x"                → "localhost:5000"
 //	"oci:/var/lib/litevirt/oci/x:1"   → ""
 func RegistryHost(ref string) string {
-	// A local OCI layout reference ("oci:/path:tag") never authenticates.
-	if strings.HasPrefix(ref, "oci:") {
+	// A local source (any local transport) never authenticates, and a
+	// refused one has no registry.
+	if src, err := ParseOCISource(ref); err != nil || src.Local {
 		return ""
 	}
 	// Strip any scheme prefix (e.g. "docker://").
@@ -294,4 +298,79 @@ func RootfsPath(lxcpath, name string) string {
 		lxcpath = "/var/lib/lxc"
 	}
 	return filepath.Join(lxcpath, name, "rootfs")
+}
+
+// OCISource is a pull's source reference, read the way skopeo reads it
+// (ParseOCISource).
+type OCISource struct {
+	// Transport is "docker" (a registry), or one of the local transports
+	// "oci", "dir", "oci-archive" and "docker-archive".
+	Transport string
+	// Path is a local transport's directory (oci, dir) or archive file
+	// (oci-archive, docker-archive), absolute and cleaned; "" for docker.
+	Path string
+	// Reference is what follows the path of an oci or archive source
+	// (its tag or index), "" when none.
+	Reference string
+	// Local is true for every transport that reads this host.
+	Local bool
+	// Ref is the reference to hand skopeo: a registry image with docker://,
+	// a local one rebuilt from Transport, Path and Reference, so skopeo
+	// reads exactly the path that was judged.
+	Ref string
+}
+
+// localTransports are the transports a pull may read from this host;
+// refusedTransports the other skopeo transports, which it never uses.
+var (
+	localTransports   = map[string]bool{"oci": true, "dir": true, "oci-archive": true, "docker-archive": true}
+	refusedTransports = map[string]bool{"docker-daemon": true, "containers-storage": true, "ostree": true, "sif": true, "tarball": true, "atomic": true}
+)
+
+// errOCISourceForms names the sources a pull accepts.
+const errOCISourceForms = `a registry image ("name[:tag]" or "docker://registry/name[:tag]"), or a local ` +
+	`"oci:<dir>[:tag]", "dir:<dir>", "oci-archive:<file>[:tag]" or "docker-archive:<file>[:ref]"`
+
+// ParseOCISource reads ref as skopeo does: the transport is the name before
+// the first ":", when that is a transport's name, and a local transport's
+// path ends at the next ":" (dir: has no reference, so its whole remainder
+// is the path). A reference with no transport name is a registry image.
+// Transports other than docker and the local ones, a relative path, and a
+// reference starting with "-" are refused.
+func ParseOCISource(ref string) (OCISource, error) {
+	if ref == "" {
+		return OCISource{}, errors.New("oci: image required")
+	}
+	if strings.HasPrefix(ref, "-") {
+		return OCISource{}, fmt.Errorf("oci: image %q: want %s", ref, errOCISourceForms)
+	}
+	name, rest, ok := strings.Cut(ref, ":")
+	switch {
+	case !ok:
+		return OCISource{Transport: "docker", Ref: "docker://" + ref}, nil
+	case name == "docker":
+		if !strings.HasPrefix(rest, "//") || len(rest) == 2 {
+			return OCISource{}, fmt.Errorf("oci: image %q: want %s", ref, errOCISourceForms)
+		}
+		return OCISource{Transport: "docker", Ref: ref}, nil
+	case localTransports[name]:
+		p, reference := rest, ""
+		if name != "dir" {
+			p, reference, _ = strings.Cut(rest, ":")
+		}
+		if !strings.HasPrefix(p, "/") {
+			return OCISource{}, fmt.Errorf("oci: image %q: a local source needs an absolute path; want %s", ref, errOCISourceForms)
+		}
+		p = filepath.Clean(p)
+		out := name + ":" + p
+		if reference != "" {
+			out += ":" + reference
+		}
+		return OCISource{Transport: name, Path: p, Reference: reference, Local: true, Ref: out}, nil
+	case refusedTransports[name]:
+		return OCISource{}, fmt.Errorf("oci: image %q: transport %q is not one a pull reads; want %s", ref, name, errOCISourceForms)
+	default:
+		// "name:tag", "registry:5000/name": a registry image.
+		return OCISource{Transport: "docker", Ref: "docker://" + ref}, nil
+	}
 }

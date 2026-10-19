@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -255,5 +256,60 @@ func TestPullOCI_ALocalOCISourceIsTheAdmins(t *testing.T) {
 	}
 	if len(rt.pullCalls) != 1 || rt.pullCalls[0].Image != src {
 		t.Fatalf("pull calls %+v, want one with the source as spelled", rt.pullCalls)
+	}
+}
+
+// Every local transport reads a host path as root: it is the Admin's, and
+// the path is judged (a directory for oci: and dir:, a regular file for the
+// archives). A registry source stays open to the roles it was. Any other
+// transport is refused for everyone.
+func TestPullOCI_LocalTransportsAreTheAdminsAndJudged(t *testing.T) {
+	s, rt := ctPathServer(t)
+	dir := filepath.Join(t.TempDir(), "img")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(t.TempDir(), "img.tar")
+	if err := os.WriteFile(archive, []byte("tar"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	local := []string{
+		"oci:" + dir + ":v1",
+		"oci:" + dir + ":odd:tag", // the path ends at the first colon, as skopeo reads it
+		"dir:" + dir,
+		"dir://" + dir,
+		"oci-archive:" + archive,
+		"oci-archive://" + archive + ":v1",
+		"docker-archive:" + archive,
+		"docker-archive://" + archive,
+	}
+	for _, src := range local {
+		if _, err := s.PullOCIImage(ctOperatorCtx(), &pb.PullOCIImageRequest{Image: src, Dest: "img"}); status.Code(err) != codes.PermissionDenied {
+			t.Errorf("an Operator's %s: %v, want PermissionDenied", src, err)
+		}
+		if _, err := s.PullOCIImage(adminCtx(), &pb.PullOCIImageRequest{Image: src, Dest: "img-" + strconv.Itoa(len(rt.pullCalls))}); err != nil {
+			t.Errorf("an Admin's %s: %v", src, err)
+		}
+	}
+	for _, src := range []string{
+		"dir:///etc/ssl",              // a protected tree
+		"oci-archive:///etc/shadow",   // a protected file
+		"docker-archive:///dev/zero",  // not a regular file
+		"oci:/nonexistent/layout:v1",  // missing
+		"oci-archive://" + dir,        // a directory is not an archive
+		"docker-daemon:alpine:latest", // not an allowed transport
+		"containers-storage:alpine",
+		"-alpine",
+	} {
+		if _, err := s.PullOCIImage(adminCtx(), &pb.PullOCIImageRequest{Image: src, Dest: "bad"}); status.Code(err) != codes.InvalidArgument {
+			t.Errorf("an Admin's %s: %v, want InvalidArgument", src, err)
+		}
+	}
+	// A registry source is still the Operator's.
+	if _, err := s.PullOCIImage(ctOperatorCtx(), &pb.PullOCIImageRequest{Image: "docker://ghcr.io/acme/x:1", Dest: "reg"}); err != nil {
+		t.Errorf("an Operator's registry pull: %v", err)
+	}
+	if n := len(rt.pullCalls); n != len(local)+1 {
+		t.Fatalf("runtime pulls %d, want %d (each Admin local source and the registry pull)", n, len(local)+1)
 	}
 }

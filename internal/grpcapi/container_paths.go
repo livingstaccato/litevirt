@@ -68,27 +68,23 @@ func (s *Server) checkContainerTemplate(template, name string) error {
 	return nil
 }
 
-// localOCISource returns the directory a local "oci:<dir>[:tag]" image
-// reference reads, or "" for a registry reference.
-func localOCISource(image string) string {
-	rest, ok := strings.CutPrefix(image, "oci:")
-	if !ok {
-		return ""
-	}
-	if i := strings.LastIndex(rest, ":"); i >= 0 && !strings.Contains(rest[i:], "/") {
-		rest = rest[:i]
-	}
-	return rest
-}
-
 // checkOCIPullPaths is the backstop for a pull's host paths, run on the host
 // that unpacks: an absolute dest is a directory root writes an untrusted
 // image into (the OCI library itself is the daemon's own), and a local source
-// is a directory it reads.
+// is a path it reads: a directory (oci:, dir:) or a regular file (the
+// archives), at the path skopeo will read (lxc.ParseOCISource).
 func (s *Server) checkOCIPullPaths(image, dest string) error {
-	if src := localOCISource(image); src != "" {
-		if err := storage.CheckReadDir(filepath.Clean(src), s.dataDir, s.pkiDir); err != nil {
-			return status.Errorf(codes.InvalidArgument, "oci source: %v", err)
+	src, err := lxc.ParseOCISource(image)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if src.Local {
+		check := storage.CheckReadDir
+		if src.Transport == "oci-archive" || src.Transport == "docker-archive" {
+			check = storage.CheckReadFile
+		}
+		if err := check(src.Path, s.dataDir, s.pkiDir); err != nil {
+			return status.Errorf(codes.InvalidArgument, "%s source: %v", src.Transport, err)
 		}
 	}
 	if filepath.IsAbs(dest) {

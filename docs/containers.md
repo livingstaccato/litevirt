@@ -54,9 +54,12 @@ confirmation) delete a running container as before.
 
 ### Host paths a container is given
 
-A rootfs template is copied whole into the new container, and a local
-`oci:<dir>` source is unpacked by root, so naming either is reading a host
-directory as root. Container inputs follow the same rules as a VM's host
+A rootfs template is copied whole into the new container, and a local pull
+source (`oci:<dir>[:tag]`, `dir:<dir>`, `oci-archive:<file>[:tag]`,
+`docker-archive:<file>[:ref]`) is read by root, so naming either is reading a
+host path as root. `lv ct pull` accepts a registry image (`name[:tag]` or
+`docker://registry/name[:tag]`) or one of those local forms, and refuses any
+other transport. Container inputs follow the same rules as a VM's host
 paths:
 
 - Anyone with `ct.create` may name an **OCI library item**: exactly
@@ -85,7 +88,7 @@ paths:
   an item whose content was replaced since counts as changing its image on
   its next recreate (see compose.md).
 - Any other host path (`--template /srv/rootfs`, `rootfs:<path>`, a relative
-  path, an absolute `lv ct pull --dest`, a local `oci:` source) needs
+  path, an absolute `lv ct pull --dest`, a local pull source) needs
   `storage.hostpath` at the cluster root — the Admin role.
 - Whoever asks, a template or OCI source may not be under, or contain, a
   directory that holds host secrets or live state (`/etc`, `/boot`, `/dev`,

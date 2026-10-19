@@ -928,15 +928,22 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 		}
 	}
 	// Dest is where umoci unpacks the (untrusted) image rootfs as root, and a
-	// local oci: source is read as root — both are host-path primitives. A bare
-	// Dest name is contained under the daemon OCI staging dir; an absolute Dest
-	// or a local oci: source requires admin (remote docker:// registry pulls
-	// stay operator). The check binds the real caller on the entry node; a
-	// forwarded peer call runs as admin (daemon mTLS) so it isn't re-denied.
-	if lxc.RegistryHost(req.Image) == "" {
+	// local source (oci:, dir:, oci-archive:, docker-archive:) is read as
+	// root — both are host-path primitives. A bare Dest name is contained
+	// under the daemon OCI staging dir; an absolute Dest or a local source
+	// requires admin (registry pulls stay operator), and any other transport
+	// is refused (lxc.ParseOCISource reads the source as skopeo does). The
+	// check binds the real caller on the entry node; a forwarded peer call
+	// runs as admin (daemon mTLS) so it isn't re-denied, and the host that
+	// reads the source judges its path (checkOCIPullPaths).
+	src, err := lxc.ParseOCISource(req.Image)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if src.Local {
 		if err := RequireRole(ctx, "admin"); err != nil {
-			return nil, status.Error(codes.PermissionDenied,
-				"pulling from a local OCI source path requires the admin role")
+			return nil, status.Errorf(codes.PermissionDenied,
+				"pulling from a local %s: source reads this host as root, which requires the admin role", src.Transport)
 		}
 	}
 	if filepath.IsAbs(req.Dest) {

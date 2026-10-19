@@ -115,7 +115,7 @@ type synFloodWireResult struct {
 // ONE /64, 2001:db8:9::/64, as a host rotating addresses within its prefix
 // does. What passed is counted at the bridge's postrouting hook, after the
 // per-NIC table's verdict, so nothing is lost to a receive buffer.
-func synFloodWire(t *testing.T, plan Plan, n int, v6 bool) synFloodWireResult {
+func synFloodWire(t *testing.T, plan Plan, n int, v6 bool, vid int) synFloodWireResult {
 	t.Helper()
 	sh(t, "ip", "link", "add", "sfbr0", "type", "bridge", "stp_state", "0", "forward_delay", "0")
 	macs := map[string]net.HardwareAddr{}
@@ -141,10 +141,17 @@ func synFloodWire(t *testing.T, plan Plan, n int, v6 bool) synFloodWireResult {
 	})
 
 	plan.NICs = []NICBinding{{NICDev: "sfh1", VMName: "vm1", Bridge: "sfbr0"}, {NICDev: "sfh2", VMName: "vm2", Bridge: "sfbr0"}}
+	if vid > 0 {
+		// Both guest NICs are trunks carrying VLAN vid.
+		for i := range plan.NICs {
+			plan.NICs[i].TrunkVIDs = []int{vid}
+		}
+	}
 	applyPlan(t, plan)
-	src := "ip saddr 10.30.0.9"
+	// meta protocol first, so a tagged frame is counted too.
+	src := "meta protocol ip ip saddr 10.30.0.9 meta l4proto tcp"
 	if v6 {
-		src = "ip6 saddr 2001:db8:9::/64"
+		src = "meta protocol ip6 ip6 saddr 2001:db8:9::/64 meta l4proto tcp"
 	}
 	sh(t, "sh", "-c", `nft add table bridge sfcount && `+
 		`nft add chain bridge sfcount post '{ type filter hook postrouting priority 100; policy accept; }' && `+
@@ -177,7 +184,12 @@ func synFloodWire(t *testing.T, plan Plan, n int, v6 bool) synFloodWireResult {
 			etype = 0x86dd
 			seg = ipv6TCP(fmt.Sprintf("2001:db8:9::%x:%x", i>>16+1, i&0xffff), "2001:db8::"+p, sport, 80, uint32(sport)*7919, ack, flags)
 		}
-		if err := syscall.Sendto(tx, etherTo(macs[p], srcIfc.HardwareAddr, etype, seg), 0,
+		frame := etherTo(macs[p], srcIfc.HardwareAddr, etype, seg)
+		if vid > 0 {
+			frame = taggedType(srcIfc.HardwareAddr, 0x8100, etype, seg, uint16(vid))
+			copy(frame[0:6], macs[p])
+		}
+		if err := syscall.Sendto(tx, frame, 0,
 			&syscall.SockaddrLinklayer{Ifindex: srcIfc.Index, Halen: 6}); err != nil {
 			t.Fatalf("send: %v", err)
 		}
@@ -204,8 +216,8 @@ func synFloodWire(t *testing.T, plan Plan, n int, v6 bool) synFloodWireResult {
 		return v
 	}
 	r.syn1, r.syn2, r.ack1 = count("syn1"), count("syn2"), count("ack1")
-	t.Logf("v6=%v: sent %d SYNs to each NIC in %.3fs, then %d ACKs: passed SYNs NIC 1 %d, NIC 2 %d; ACKs %d",
-		v6, n, r.elapsed, n, r.syn1, r.syn2, r.ack1)
+	t.Logf("v6=%v vid=%d: sent %d SYNs to each NIC in %.3fs, then %d ACKs: passed SYNs NIC 1 %d, NIC 2 %d; ACKs %d",
+		v6, vid, n, r.elapsed, n, r.syn1, r.syn2, r.ack1)
 	return r
 }
 
@@ -219,9 +231,12 @@ func TestKernelChild_SynFloodWireHarness(t *testing.T) {
 	inNetns(t)
 	skipUnlessModules(t, "the SYN-flood wire harness", kernelTestModules...)
 	const n = 1500
-	for _, v6 := range []bool{false, true} {
-		t.Run(fmt.Sprintf("v6=%v", v6), func(t *testing.T) {
-			r := synFloodWire(t, Plan{NICMode: NICModeEnforce}, n, v6)
+	for _, c := range []struct {
+		v6  bool
+		vid int
+	}{{false, 0}, {true, 0}, {false, 100}} {
+		t.Run(fmt.Sprintf("v6=%v vid=%d", c.v6, c.vid), func(t *testing.T) {
+			r := synFloodWire(t, Plan{NICMode: NICModeEnforce}, n, c.v6, c.vid)
 			if r.syn1 != n || r.syn2 != n || r.ack1 != n {
 				t.Errorf("with no protection: %d and %d SYNs and %d ACKs passed, want %d each", r.syn1, r.syn2, r.ack1, n)
 			}
@@ -243,7 +258,9 @@ func TestKernelChild_SynFloodWireHarness(t *testing.T) {
 //     lv_lb4): every SYN to NIC 1 passes, accepted before the limiter; NIC 2's
 //     are limited;
 //   - IPv6 from a new address in one /64 for every SYN: limited as one source
-//     (review m-7).
+//     (review m-7);
+//   - 802.1Q-tagged SYNs into trunk NICs carrying the VLAN: limited, and a
+//     tagged LB flow passes (round-1 re-review N-m1).
 //
 // Mutations: key the sets on the source address only — NIC 2 shares NIC 1's
 // budget and gets well under B: red; drop the `tcp flags` match — the ACKs
@@ -267,15 +284,19 @@ func TestKernelChild_SynFloodOnTheWire(t *testing.T) {
 		plan  Plan
 		v6    bool
 		lbNIC bool // NIC 1 is an LB backend on port 80
+		vid   int  // tagged into trunk NICs carrying this VLAN
 	}{
-		{"one source", Plan{NICMode: NICModeEnforce, SynFlood: on}, false, false},
-		{"gateway source", Plan{NICMode: NICModeEnforce, SynFlood: on, LBSources: []string{"10.30.0.9"}}, false, false},
+		{"one source", Plan{NICMode: NICModeEnforce, SynFlood: on}, false, false, 0},
+		{"gateway source", Plan{NICMode: NICModeEnforce, SynFlood: on, LBSources: []string{"10.30.0.9"}}, false, false, 0},
 		{"lb flow", Plan{NICMode: NICModeEnforce, SynFlood: on, LBSources: []string{"10.30.0.9"},
-			LBBackends: []LBBackend{{Addr: "10.30.0.1", Port: 80}}}, false, true},
-		{"ipv6 one /64", Plan{NICMode: NICModeEnforce, SynFlood: on}, true, false},
+			LBBackends: []LBBackend{{Addr: "10.30.0.1", Port: 80}}}, false, true, 0},
+		{"ipv6 one /64", Plan{NICMode: NICModeEnforce, SynFlood: on}, true, false, 0},
+		{"one source, tagged", Plan{NICMode: NICModeEnforce, SynFlood: on}, false, false, 100},
+		{"lb flow, tagged", Plan{NICMode: NICModeEnforce, SynFlood: on, LBSources: []string{"10.30.0.9"},
+			LBBackends: []LBBackend{{Addr: "10.30.0.1", Port: 80}}}, false, true, 100},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := synFloodWire(t, tc.plan, n, tc.v6)
+			r := synFloodWire(t, tc.plan, n, tc.v6, tc.vid)
 			if tc.lbNIC {
 				if r.syn1 != n {
 					t.Errorf("LB flow: %d of %d SYNs to the backend passed, want all", r.syn1, n)

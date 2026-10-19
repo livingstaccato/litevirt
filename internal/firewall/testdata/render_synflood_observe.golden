@@ -99,7 +99,7 @@ table bridge litevirt-nic {
         iifname @lv_dhcp_srv udp sport 67 udp dport 68 accept
         iifname @lv_dhcp_srv ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept
         iifname != @lv_nic_devs ip6 hoplimit 255 icmpv6 type { nd-router-advert, nd-redirect } accept
-        iifname != @lv_nic_devs ip saddr @lv_lb_src4 ip daddr . tcp dport @lv_lb4 accept
+        iifname != @lv_nic_devs meta protocol ip ip saddr @lv_lb_src4 ip daddr . tcp dport @lv_lb4 accept
         ct state invalid counter comment "lv-wd - state invalid"
         iifname tap-a jump nic_out_tap_a
         iifname tap-b jump nic_out_tap_b
@@ -140,7 +140,7 @@ table bridge litevirt-nic {
         ip saddr @lv_gw4 udp sport 67 udp dport 68 accept
         ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept
         ip6 saddr fe80::/10 ip6 hoplimit 255 icmpv6 type nd-router-advert accept
-        ip saddr @lv_lb_src4 ip daddr . tcp dport @lv_lb4 accept
+        meta protocol ip ip saddr @lv_lb_src4 ip daddr . tcp dport @lv_lb4 accept
         ct state invalid counter comment "lv-wd - state invalid"
         oifname @lv_nic_devs meta protocol ip meta l4proto tcp tcp flags & (fin|syn|rst|ack) == syn update @lv_syn4 { oifname . ip saddr limit rate over 250/second burst 1500 packets } counter comment "lv-wd - in synflood"
         oifname @lv_nic_devs meta protocol ip6 meta l4proto tcp tcp flags & (fin|syn|rst|ack) == syn update @lv_syn6 { oifname . ip6 saddr & ffff:ffff:ffff:ffff:: limit rate over 250/second burst 1500 packets } counter comment "lv-wd - in synflood"

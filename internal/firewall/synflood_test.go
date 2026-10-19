@@ -240,3 +240,28 @@ func TestRender_SynFloodNoSourceExemption(t *testing.T) {
 		}
 	}
 }
+
+// The load balancer's accepts name `meta protocol ip` first, as the
+// SYN-flood line does, so an LB flow tagged toward a trunk NIC's VLAN is
+// accepted before the limit like an untagged one (Track B round-1 re-review
+// N-m1): without it the bridge family adds an implicit `ether type ip`,
+// which misses 802.1Q frames.
+//
+// Mutation: drop `meta protocol ip` from either accept — red.
+func TestRender_LBAcceptsMatchTaggedFrames(t *testing.T) {
+	nic := renderNICPart(t, synFloodPlan(NICModeEnforce))
+	for _, chain := range []string{"forward", "output"} {
+		n := 0
+		for _, l := range synChainLines(t, nic, chain) {
+			if strings.Contains(l, "ip saddr @lv_lb_src4 ip daddr . tcp dport @lv_lb4 accept") {
+				n++
+				if !strings.Contains(l, "meta protocol ip ip saddr @lv_lb_src4") {
+					t.Errorf("%s: the LB accept does not name meta protocol first: %s", chain, l)
+				}
+			}
+		}
+		if n != 1 {
+			t.Errorf("%s: %d LB accepts, want 1", chain, n)
+		}
+	}
+}

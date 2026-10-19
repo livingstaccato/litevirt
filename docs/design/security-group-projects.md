@@ -34,20 +34,36 @@ A group's path is `/` for a global group and
 | `CreateSecurityGroup` | `sg.write` on the new group's path |
 | `DeleteSecurityGroup`, `AddSecurityGroupRule`, `RemoveSecurityGroupRule` | `sg.write` on the path of the group (for a rule, the rule's group); a rule no live group owns needs `/` |
 | `AddSecurityGroupRule` of an IPv6, logged or tag-group rule on a project group | also `sg.write` at `/`: it records a cluster-wide release-feature use, and a logged rule writes host logs |
-| `DeployStack` with a firewall block, or of a stack that owns firewall rows (a redeploy replaces or drops them) | `sg.write` at `/`: stack groups, ip sets and the default policy are global. Checked before anything changes; a dry run is not refused and reports that the real run would be |
-| `DeleteStack` (`lv compose down`) of a stack that owns firewall rows | `sg.write` at `/`, checked before anything is torn down, so a refused down leaves the stack whole |
-
-A stack "has a firewall" when it owns a firewall row on the entry node or its
-stored file declares a firewall block (a default-deny it only asks for while
-another stack owns the row decides whether that deny is handed on). The entry
-node's replica may lag, and a teardown it authorizes is replicated by name, so
-it fails closed: a stored file it cannot read counts as a firewall, and a
-teardown of a stack it holds no record of needs `sg.write` at `/` too. The
-orphan sweep (`SweepOrphanStackRows`) is unchanged: it cannot tell a checked
-teardown from an unchecked one without a new column, and with these checks a
-non-root teardown is authorized only where the entry node holds the stack and
-neither its file nor its rows show a firewall.
+| `DeployStack` of a stack that has a firewall (below), or whose file declares one | `sg.write` at `/`: stack groups, ip sets and the default policy are global. Checked before anything changes; a dry run is not refused and reports that the real run would be |
+| `DeleteStack` (`lv compose down`) of a stack that has a firewall | `sg.write` at `/`, checked before anything is torn down, so a refused down leaves the stack whole |
+| `DeleteStack` of a stack the entry node holds no record of, without `sg.write` at `/` | not refused: a local-only teardown (below) |
 | `ListSecurityGroups` | per row, below |
+
+A stack "has a firewall" when it owns a firewall row on the entry node, or
+its stored file declares a firewall block (a default-deny it only asks for
+while another stack owns the row decides whether that deny is handed on), or
+its stored file cannot be read (fail closed).
+
+The entry node's replica may lag, and a teardown's stack state and record
+writes are applied by name on every peer, whose `StackReconciler`
+(`reconcileStack` → `DeleteStackFirewall`) then removes the stack's firewall
+rows. So `DeleteStack` on a node that holds no record of the stack, by a
+caller without `sg.write` at `/`, is local-only: it removes the workloads that
+node lists by the stack's name (a first `lv compose up` that failed in the
+workload phase leaves exactly these, and no record anywhere) and writes no
+stack state, record, load balancer, network or firewall row. Its progress says
+so and names the exits: `lv compose down --name <stack>` on a node that holds
+the stack, or an Admin.
+
+Residual: a node that holds an older stack file without a firewall, and
+neither the newer file nor the rows, authorizes a non-root teardown or a
+redeploy that withdraws a deny ask. The window is replication lag right after
+an Admin deploy that adds the firewall (the deploy writes the rows before the
+record). Closing it would mean recording the stack's `compose_hash` the entry
+node authorized against in the teardown record `MarkStackDeleting` already
+writes to `cluster_policies` (`stack_teardown/<name>`, free-form JSON, no
+schema change), and having a peer's reconciler keep the firewall rows when its
+own record's hash differs. Not implemented.
 
 `ListSecurityGroups`:
 

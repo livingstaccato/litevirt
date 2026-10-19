@@ -70,7 +70,7 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// create checks the same). Refused before anything is deployed; a dry run
 	// is not refused, and says the real run would be.
 	fwRefusal, fwErr := s.stackFirewallRefusal(ctx, f.Name,
-		len(f.SecurityGroups) > 0 || len(f.IPSets) > 0 || f.FirewallDefaults != nil, "deploying", false)
+		len(f.SecurityGroups) > 0 || len(f.IPSets) > 0 || f.FirewallDefaults != nil, "deploying")
 	if fwErr != nil {
 		return fwErr
 	}
@@ -1212,10 +1212,27 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	// sg.write at the cluster root: refused before anything is torn down, so
 	// the stack stays whole rather than losing its VMs and keeping orphaned
 	// firewall rows.
-	if refusal, err := s.stackFirewallRefusal(ctx, req.Name, false, "removing", true); err != nil {
-		return err
-	} else if refusal != nil {
-		return refusal
+	//
+	// A node that holds no record of the stack cannot see its firewall, and
+	// may simply lag: the stack's state and record writes are applied by name
+	// on every peer, whose reconciler then removes the stack's firewall rows.
+	// So without sg.write at the root it does a LOCAL-ONLY teardown: it
+	// removes the workloads it lists by the stack's name — a first `compose
+	// up` that failed in the workload phase leaves exactly these and no record
+	// anywhere — and writes no stack state, record, load balancer, network or
+	// firewall row.
+	localOnly := false
+	if st, gerr := corrosion.GetStack(ctx, s.db, req.Name); gerr != nil {
+		return status.Errorf(codes.Unavailable, "read stack %q: %v", req.Name, gerr)
+	} else if st == nil && s.requireSGWrite(ctx) != nil {
+		localOnly = true
+	}
+	if !localOnly {
+		if refusal, err := s.stackFirewallRefusal(ctx, req.Name, false, "removing"); err != nil {
+			return err
+		} else if refusal != nil {
+			return refusal
+		}
 	}
 
 	vms, err := corrosion.ListVMs(ctx, s.db, req.Name, "")
@@ -1290,15 +1307,25 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	// The background StackReconciler will pick up stacks stuck in this state,
 	// and keeps the disks when this teardown does (keep_disks): the choice
 	// is recorded with the state, in the same write.
-	if err := corrosion.MarkStackDeleting(ctx, s.db, req.Name, req.KeepDisks, s.hostName); err != nil {
-		return status.Errorf(codes.Internal, "set stack state: %v", err)
-	}
-
-	// Soft-delete the LB config so that VM deletion's refreshLBForStack
-	// goroutines see the record as gone and don't re-apply the LB mid-teardown.
 	lbName := req.Name + "-lb"
-	corrosion.SoftDeleteLBBackends(ctx, s.db, lbName)
-	_ = corrosion.SoftDeleteLBConfig(ctx, s.db, lbName)
+	if localOnly {
+		if sendErr := stream.Send(&pb.DeleteProgress{VmName: "stack", Status: "local-only",
+			Error: fmt.Sprintf("this node holds no record of stack %q: removing only the workloads it lists here; its record, "+
+				"load balancer, networks and firewall are left. Run `lv compose down --name %s` again on a node that holds the stack, "+
+				"or as an Admin (`lv role grant NetworkAdmin %s --path / --propagate` grants what it needs)",
+				req.Name, req.Name, "user:"+callerPrincipal(ctx))}); sendErr != nil {
+			return sendErr
+		}
+	} else {
+		if err := corrosion.MarkStackDeleting(ctx, s.db, req.Name, req.KeepDisks, s.hostName); err != nil {
+			return status.Errorf(codes.Internal, "set stack state: %v", err)
+		}
+
+		// Soft-delete the LB config so that VM deletion's refreshLBForStack
+		// goroutines see the record as gone and don't re-apply the LB mid-teardown.
+		corrosion.SoftDeleteLBBackends(ctx, s.db, lbName)
+		_ = corrosion.SoftDeleteLBConfig(ctx, s.db, lbName)
+	}
 
 	// hadFailures keeps the stack in "deleting"; notRemoved names what is left,
 	// for the audit row.
@@ -1437,6 +1464,15 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	// in "deleting", and the StackReconciler removes the networks once the
 	// workloads are gone. The workload failure is already on the stream.
 	workloadsLeft := hadFailures
+	if localOnly {
+		result := "ok"
+		if hadFailures {
+			result = "error"
+		}
+		s.audit(ctx, "stack.delete", req.Name, "local-only: no stack record on this node; workloads listed here removed, "+
+			"record, load balancer, networks and firewall left", result)
+		return nil
+	}
 	externalNets := externalNetworksOf(stored, req.Name)
 	nets, _ := corrosion.ListNetworks(ctx, s.db)
 	if workloadsLeft {
@@ -2832,12 +2868,12 @@ func (s *Server) provisionComposeNetworks(ctx context.Context, f *compose.File) 
 // A redeploy replaces or drops those and a teardown removes them.
 //
 // This node's replica may lag, and a teardown it authorized is replicated by
-// name to every node holding the rows, whose sweep then removes them. So it
-// fails closed: a stored file this node cannot read counts as a firewall, and
-// a teardown (needRecord) of a stack this node holds no record of is refused
-// too. The refusal names the grant that fixes it. A failure to read the
-// stack's rows is returned as err.
-func (s *Server) stackFirewallRefusal(ctx context.Context, stack string, declares bool, verb string, needRecord bool) (refusal, err error) {
+// name to every node holding the rows, whose reconciler then removes them. So
+// it fails closed: a stored file this node cannot read counts as a firewall.
+// (DeleteStack does a local-only teardown where this node holds no record.)
+// The refusal names the exits. A failure to read the stack's rows is
+// returned as err.
+func (s *Server) stackFirewallRefusal(ctx context.Context, stack string, declares bool, verb string) (refusal, err error) {
 	if s.requireSGWrite(ctx) == nil {
 		return nil, nil
 	}
@@ -2859,9 +2895,6 @@ func (s *Server) stackFirewallRefusal(ctx context.Context, stack string, declare
 			return nil, status.Errorf(codes.Unavailable, "read stack %q: %v", stack, gerr)
 		}
 		if st == nil {
-			if needRecord {
-				why = "this node holds no record of it yet, so whether it owns firewall rows elsewhere is unknown (retry once it has replicated here)"
-			}
 			break
 		}
 		stored, serr := s.storedStackFile(ctx, stack)
@@ -2879,6 +2912,6 @@ func (s *Server) stackFirewallRefusal(ctx context.Context, stack string, declare
 	return status.Errorf(codes.PermissionDenied,
 		"%s stack %q writes its firewall (security groups, ip sets, cluster and host rules, the cluster default policy), "+
 			"which needs sg.write at the cluster root (%s): %s. An administrator can grant it with "+
-			"`lv role grant NetworkAdmin %s --path / --propagate`, or run this as an Admin",
+			"`lv role grant NetworkAdmin %s --path / --propagate`, or an Admin can run the same `lv compose` command",
 		verb, stack, why, status.Convert(perr).Message(), "user:"+callerPrincipal(ctx)), nil
 }

@@ -575,8 +575,8 @@ func TestStackFirewall_AStacksStoredBlockCountsWithoutRows(t *testing.T) {
 }
 
 // A node whose replica lags: it holds the stack's record but none of its
-// firewall rows, or not even the record. Its own view must not authorize a
-// teardown that the tombstone then carries to every node holding the rows.
+// firewall rows, or its file cannot be read. Its own view must not authorize
+// a teardown that the tombstone then carries to every node holding the rows.
 func TestDeleteStack_ALaggingEntryNodeFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	s, opal, _ := stackFirewallFixture(t)
@@ -592,12 +592,68 @@ func TestDeleteStack_ALaggingEntryNodeFailsClosed(t *testing.T) {
 	}
 	err = s.DeleteStack(&pb.DeleteStackRequest{Name: "garbled"}, &mockDeleteStream{ctx: opal})
 	wantGrantHint(t, "an Operator tears down a stack whose file cannot be read", err)
-	// No record at all here.
-	err = s.DeleteStack(&pb.DeleteStackRequest{Name: "elsewhere"}, &mockDeleteStream{ctx: opal})
-	wantGrantHint(t, "an Operator tears down a stack this node holds no record of", err)
 	for _, name := range []string{"lagging", "garbled"} {
 		if st, _ := corrosion.GetStack(ctx, s.db, name); st == nil || st.State == stackStateDeleting {
 			t.Fatalf("the refused down changed stack %s: %+v", name, st)
 		}
 	}
+}
+
+// A first `lv compose up` that failed in the workload phase leaves workloads
+// that carry the stack's name and no stack record anywhere; `lv compose down`
+// is how an Operator removes them. With no record here, the down removes only
+// the workloads this node lists and writes nothing every peer applies by the
+// stack's name (its state, its record) and no firewall row: on a node that
+// merely lags, such a write would tear down a stack it cannot see.
+func TestDeleteStack_AnOperatorCanTakeDownAFailedFirstDeploy(t *testing.T) {
+	ctx := context.Background()
+	s, opal, _ := stackFirewallFixture(t)
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "ghost-web-1", StackName: "ghost",
+		HostName: "other-host", State: "stopped", Spec: "{}"}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	// A firewall row of the stack that reached this node ahead of its record.
+	if err := corrosion.InsertSecurityGroup(ctx, s.db, corrosion.SecurityGroup{ID: "sg-ghost", Name: "ghost-web", StackName: "ghost"}); err != nil {
+		t.Fatal(err)
+	}
+	before := stackStatements(t, s)
+	st := &mockDeleteStream{ctx: opal}
+	if err := s.DeleteStack(&pb.DeleteStackRequest{Name: "ghost"}, st); err != nil {
+		t.Fatalf("an Operator's compose down of a failed first deploy: %v", err)
+	}
+	tried, said := false, false
+	for _, p := range st.sent {
+		tried = tried || p.GetVmName() == "ghost-web-1"
+		said = said || strings.Contains(p.GetError(), "holds no record of stack")
+	}
+	if !tried {
+		t.Errorf("the down did not act on the stack's workload: %+v", st.sent)
+	}
+	if !said {
+		t.Errorf("the down did not say it acted on this node's workloads only: %+v", st.sent)
+	}
+	if after := stackStatements(t, s); after != before {
+		t.Fatalf("a record-less down wrote %d stack-wide statement(s) every peer applies", after-before)
+	}
+	if g, _ := corrosion.GetSecurityGroup(ctx, s.db, "sg-ghost"); g == nil {
+		t.Fatal("a record-less down removed a firewall row")
+	}
+}
+
+// stackStatements counts replicated statements that change a stack's state or
+// record, or record a stack teardown.
+func stackStatements(t *testing.T, s *Server) int {
+	t.Helper()
+	rows, err := s.db.Query(context.Background(), `SELECT stmts FROM mutation_log`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, r := range rows {
+		st := r.String("stmts")
+		if strings.Contains(st, "stacks") && (strings.Contains(st, "UPDATE stacks") || strings.Contains(st, "stack_teardown")) {
+			n++
+		}
+	}
+	return n
 }

@@ -5,6 +5,7 @@ package fleet
 
 import (
 	"context"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -330,10 +331,9 @@ func TestFleet_SGProjects_AContainerRestoreRefusesAnotherProjectsGroup(t *testin
 
 // TestFleet_StackFirewall_ALaggingEntryNodeCannotTearItDown: an Operator
 // without sg.write runs `lv compose down` of a stack with a firewall against
-// a node the stack has not reached yet. That node's own view holds no
-// firewall rows, and a teardown it authorized would be replicated by name to
-// every node that holds them, whose sweep would then remove them. The node
-// fails closed: the down is refused, and once the node catches up the stack
+// a node the stack has not reached yet. That node holds no record of the
+// stack, so it removes only the workloads it lists (none) and writes nothing
+// every peer applies by the stack's name: once the node catches up, the stack
 // and its firewall are whole everywhere.
 func TestFleet_StackFirewall_ALaggingEntryNodeCannotTearItDown(t *testing.T) {
 	ctx := context.Background()
@@ -371,24 +371,24 @@ firewall:
 	}
 
 	st, err := c.bearerClient(lag, tok).DeleteStack(ctx, &pb.DeleteStackRequest{Name: "edge"})
-	if err == nil {
+	for err == nil {
 		_, err = st.Recv()
 	}
-	if status.Code(err) != codes.PermissionDenied || !strings.Contains(err.Error(), "lv role grant NetworkAdmin") {
-		t.Fatalf("an Operator's compose down on the lagging %s: %v, want PermissionDenied naming the grant", lag.Name, err)
+	if err != io.EOF {
+		t.Fatalf("an Operator's compose down on the lagging %s: %v, want a local-only down", lag.Name, err)
 	}
 
 	c.ClearLinkFaults()
 	c.WaitConverged(t, convergeTimeout)
 	for _, n := range c.Nodes {
 		if st, _ := corrosion.GetStack(ctx, n.DB, "edge"); st == nil || st.State == "deleting" {
-			t.Errorf("%s: the stack is %+v after the refused down", n.Name, st)
+			t.Errorf("%s: the stack is %+v after the local-only down", n.Name, st)
 		}
 		if g, _ := corrosion.ListSecurityGroups(ctx, n.DB, "edge"); len(g) != 1 {
-			t.Errorf("%s: the stack's groups are %+v after the refused down", n.Name, g)
+			t.Errorf("%s: the stack's groups are %+v after the local-only down", n.Name, g)
 		}
 		if d, _ := corrosion.GetFirewallDefault(ctx, n.DB, "cluster"); d == nil || !d.DefaultDeny {
-			t.Errorf("%s: the cluster default is %+v after the refused down", n.Name, d)
+			t.Errorf("%s: the cluster default is %+v after the local-only down", n.Name, d)
 		}
 	}
 }

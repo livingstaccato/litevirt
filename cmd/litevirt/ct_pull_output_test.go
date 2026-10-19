@@ -61,7 +61,8 @@ func TestComposeDown_AStackWithoutVMsIsNotCalledEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compose down: %v\n%s", err, out)
 	}
-	if strings.Contains(out, "has no running VMs") {
+	if strings.Contains(out, "has no running VMs") || !strings.Contains(out, "has no VMs listed here") ||
+		!strings.Contains(out, "containers and the stack record will be removed") {
 		t.Fatalf("compose down of a stack without VMs printed:\n%s", out)
 	}
 }

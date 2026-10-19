@@ -514,16 +514,19 @@ var stagingSpace = stagingStatfs
 // it, at most 4 GiB.
 func spareReserve(total uint64) uint64 { return min(total/10, 4<<30) }
 
-// checkStagingSpace refuses a copy of size bytes into dir when it would leave
-// less than spareReserve free there.
+// checkStagingSpace refuses a copy of size bytes into dir, an item's
+// staging entry (<parent>/.litevirt+unpack/<entry>), when it would leave less
+// than spareReserve free on the filesystem holding the item's parent (the
+// data directory's, for a library pull).
 func checkStagingSpace(dir string, size uint64, what string) error {
+	holder := filepath.Dir(filepath.Dir(dir))
 	avail, total, err := stagingSpace(dir)
 	if err != nil {
 		return fmt.Errorf("oci: cannot tell the free space for the %s copy in %s: %w", what, dir, err)
 	}
 	if reserve := spareReserve(total); size+reserve > avail {
 		return fmt.Errorf("oci: the %s source needs %d bytes copied into %s, and %d bytes are free there; "+
-			"%d must stay free for the daemon's state, so it was not pulled", what, size, dir, avail, reserve)
+			"%d must stay free on the filesystem holding %s, so it was not pulled", what, size, dir, avail, reserve, holder)
 	}
 	return nil
 }

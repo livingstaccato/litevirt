@@ -342,3 +342,34 @@ func TestPullOCI_AnArchiveCopyNeedsTheSpace(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The space checked is the space the copy lands in: the item's own staging
+// directory, beside the item (on the data directory's filesystem for a
+// library pull), and the refusal names that filesystem.
+func TestPullOCI_TheSpaceCheckReadsTheStagingDirectory(t *testing.T) {
+	fakeOCITools(t, false)
+	fdSkopeo(t)
+	archive := filepath.Join(t.TempDir(), "img.tar")
+	if err := os.WriteFile(archive, make([]byte, 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parent := t.TempDir()
+	prev := stagingSpace
+	t.Cleanup(func() { stagingSpace = prev })
+	var asked []string
+	stagingSpace = func(dir string) (avail, total uint64, err error) {
+		asked = append(asked, dir)
+		return 5000, 100 << 30, nil
+	}
+	err := PullOCI(context.Background(), PullOCIOptions{Image: "docker-archive:" + archive, Dest: filepath.Join(parent, "web")})
+	if err == nil {
+		t.Fatal("a pull that would leave less than the reserve free went ahead")
+	}
+	stage := filepath.Join(parent, unpackDirName) + string(filepath.Separator)
+	if len(asked) != 1 || !strings.HasPrefix(asked[0], stage) {
+		t.Fatalf("the space check read %v, want the item's staging directory under %s", asked, stage)
+	}
+	if !strings.Contains(err.Error(), "filesystem holding "+parent) || strings.Contains(err.Error(), "daemon's state") {
+		t.Fatalf("the refusal %q does not name the filesystem holding %s", err, parent)
+	}
+}

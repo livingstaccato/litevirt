@@ -1,8 +1,10 @@
 package grpcapi
 
 import (
+	"bytes"
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -207,4 +209,16 @@ func TestFwmigCleanup_MovedOnToAThirdHostHoldsAtWarning(t *testing.T) {
 	}
 	_, err := r.doctor(actAcceptTarget)
 	r.resolved(err, "third-host", "running")
+	// Quarantined, not wiped: the source's state is kept whole in its
+	// quarantine.
+	q, _ := filepath.Glob(filepath.Join(r.src.dataDir, fwmig.QuarantineDir, fwlVM+"-*"))
+	if len(q) != 1 {
+		t.Fatalf("source quarantine %v, want one", q)
+	}
+	if b, _ := os.ReadFile(filepath.Join(q[0], "swtpm", "tpm2", "tpm2-00.permall")); !bytes.Equal(b, fwlPermall) {
+		t.Errorf("quarantined permall %q, want the source's", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(q[0], "nvram")); !bytes.Equal(b, fwlNvram) {
+		t.Errorf("quarantined NVRAM %q, want the source's", b)
+	}
 }

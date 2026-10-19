@@ -699,3 +699,33 @@ func TestCutoverVM_RefusesRecordOnNext(t *testing.T) {
 	f.requireEntryRefusal(err)
 	f.requireKept(libvirtfake.StateRunning)
 }
+
+// Merge of integration (beginCreate in CutoverVM) with D2: the firmware-move
+// refusals run before the cutover takes the name's create flight, so a
+// cutover of a VM in a move is refused for the move even while a create of
+// the name is in flight, and a refused cutover leaves no flight behind.
+//
+// Mutation: take the create flight before the refusals — the cutover answers
+// Aborted (a create in progress), red.
+func TestCutoverVM_FirmwareRefusalBeforeTheCreateFlight(t *testing.T) {
+	ctx := adminCtx()
+	f := newFRFixture(t, "running", libvirtfake.StateRunning)
+	enableVMReplace(f.s)
+	insertTestVMWithSpec(t, ctx, f.s.db, "os1-next", f.s.hostName, "running", `{"name":"os1-next"}`)
+	f.marker(fwmig.PhaseTargetRan)
+	end, _, err := f.s.beginCreate("os1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "os1"})
+	f.requireEntryRefusal(err)
+	end()
+	_, err = f.s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "os1"})
+	f.requireEntryRefusal(err)
+	end2, _, err := f.s.beginCreate("os1")
+	if err != nil {
+		t.Fatalf("a refused cutover left a create flight: %v", err)
+	}
+	end2()
+	f.requireKept(libvirtfake.StateRunning)
+}

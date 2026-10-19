@@ -286,13 +286,21 @@ func RecoverOCILibrary(lib string) error {
 			slog.Info("oci library: a pull of this item is running in another process; its staging is left to it", "item", item)
 			continue
 		}
+		quiet := true
 		for _, e := range ents {
 			if !strings.HasSuffix(e.Name(), lockSuffix) && stagedItem(e.Name()) == item {
-				stopWorkersIn(filepath.Join(dir, e.Name()))
+				if err := stopWorkersIn(filepath.Join(dir, e.Name())); err != nil {
+					// Not proven quiet: its entries are kept as they are.
+					slog.Warn("oci library: kept what an interrupted pull left; a process may still be working in it", "item", item, "error", err)
+					errs = append(errs, err)
+					quiet = false
+				}
 			}
 		}
-		if err := recoverStaged(dir, lib, item); err != nil {
-			errs = append(errs, err)
+		if quiet {
+			if err := recoverStaged(dir, lib, item); err != nil {
+				errs = append(errs, err)
+			}
 		}
 		release()
 	}

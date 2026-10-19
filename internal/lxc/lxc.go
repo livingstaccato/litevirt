@@ -594,7 +594,11 @@ func sweepStage(dir string) error {
 	if _, err := os.Lstat(dir); errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	stopWorkersIn(dir)
+	// A stage is removed only once nobody works in it any more.
+	if err := stopWorkersIn(dir); err != nil {
+		slog.Warn("container staging: kept a stage a process may still be working in", "path", dir, "error", err)
+		return err
+	}
 	var err error
 	for i := 0; i < 10; i++ {
 		if err = os.RemoveAll(dir); err == nil {

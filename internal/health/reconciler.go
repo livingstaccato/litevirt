@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1538,8 +1539,8 @@ func (r *Reconciler) finishOrphanedStages() {
 // stage was just finished, as quarantineLeftoverFirmware does after its own
 // finish (re-review 3, m-3): only a seed stamped for the stage's uuid and
 // written no later than the stage was (a seed written since is another copy
-// of the VM arriving), and never while the VM's row names this host or
-// cannot be read.
+// of the VM arriving), never while a hold or a domain of the VM is here, and
+// never while the VM's row names this host or cannot be read.
 func (r *Reconciler) removeOrphanedStageSeed(vm, uuid string, staged time.Time) {
 	if uuid == "" || staged.IsZero() || r.db == nil {
 		return
@@ -1553,6 +1554,16 @@ func (r *Reconciler) removeOrphanedStageSeed(vm, uuid string, staged time.Time) 
 		return
 	}
 	if fi, err := os.Stat(iso); err != nil || fi.ModTime().After(staged) {
+		return
+	}
+	// An incoming copy of the VM may reuse the seed without rewriting it:
+	// kept while a hold or a domain of the VM is here now (round-4 re-review
+	// m-1). Anything unreadable keeps it.
+	if _, held, err := fwmig.New(r.fwStore.DataDir).GetHold(vm); err != nil || held {
+		return
+	}
+	names, err := r.virt.ListDomains()
+	if err != nil || slices.Contains(names, vm) {
 		return
 	}
 	if err := cloudinit.RemoveSeed(iso); err != nil {

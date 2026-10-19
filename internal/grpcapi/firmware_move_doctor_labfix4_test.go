@@ -279,14 +279,7 @@ func TestReconciler_OrphanedStageRemovesItsSeed(t *testing.T) {
 			if err := os.Chtimes(iso, past, past); err != nil {
 				t.Fatal(err)
 			}
-			// The reconciler's stage, then its undefine, then the crash.
-			stage := filepath.Join(r.dst.dataDir, fwmig.QuarantineDir, fwmig.StageName(fwlVM, fwmig.StageReconciling, fwLiveUUID))
-			if err := r.dstStore.StageLeftoverFirmwareState(fwlVM, fwLiveUUID, stage, []byte("reason")); err != nil {
-				t.Fatal(err)
-			}
-			if err := r.dstFake.UndefineDomainPreservingState(fwlVM); err != nil {
-				t.Fatal(err)
-			}
+			stage := stageLeftoverAndCrash(t, r)
 			if late {
 				future := time.Now().Add(time.Hour)
 				if err := os.Chtimes(iso, future, future); err != nil {
@@ -305,4 +298,19 @@ func TestReconciler_OrphanedStageRemovesItsSeed(t *testing.T) {
 			}
 		})
 	}
+}
+
+// stageLeftoverAndCrash stages os1's leftover on the target as the
+// reconciler does, undefines it, and stops there, as a crash before the
+// finish leaves it: an orphaned stage.
+func stageLeftoverAndCrash(t *testing.T, r *fwlRig) string {
+	t.Helper()
+	stage := filepath.Join(r.dst.dataDir, fwmig.QuarantineDir, fwmig.StageName(fwlVM, fwmig.StageReconciling, fwLiveUUID))
+	if err := r.dstStore.StageLeftoverFirmwareState(fwlVM, fwLiveUUID, stage, []byte("reason")); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.dstFake.UndefineDomainPreservingState(fwlVM); err != nil {
+		t.Fatal(err)
+	}
+	return stage
 }

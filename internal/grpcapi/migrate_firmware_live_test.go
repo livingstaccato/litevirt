@@ -87,12 +87,14 @@ type fwlPeer struct {
 	verifyAnswer  func(call func() (*pb.VerifyLiveFirmwareTargetResponse, error)) (*pb.VerifyLiveFirmwareTargetResponse, error)
 	releaseAnswer func(call func() (*pb.ReleaseLiveFirmwareTargetResponse, error)) (*pb.ReleaseLiveFirmwareTargetResponse, error)
 	// dialErr, when set, fails the source's dial of the target.
-	dialErr   func() error
-	ensures   []*pb.EnsureDisksRequest
-	ensureTLS bool
-	cpuChecks int
-	cleanups  int
-	coldCalls int
+	dialErr func() error
+	// readAnswer, when set, rewrites the target's answer to a doctor read.
+	readAnswer func(*pb.FirmwareMoveDoctorResponse) *pb.FirmwareMoveDoctorResponse
+	ensures    []*pb.EnsureDisksRequest
+	ensureTLS  bool
+	cpuChecks  int
+	cleanups   int
+	coldCalls  int
 }
 
 func (p *fwlPeer) refuse(name string) error {

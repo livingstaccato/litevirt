@@ -198,15 +198,26 @@ func (s *Server) liveFirmwareCleanupStopped(ctx context.Context, m fwmig.Marker,
 	}
 	if cerr := s.raiseFirmwareMigrationCondition(ctx, fwmigCondition{
 		Code: condFwmigCleanupFailed, VM: m.VM, Attempt: m.Attempt, Source: s.hostName, Target: m.Target,
-		Hashes: map[string]string{"src_permall_sha256": m.SrcPermallSHA256, "src_nvram_sha256": m.SrcNvramSHA256},
-		Paths:  []string{retained, s.fw().SwtpmDir(m.UUID), s.fw().NvramPath(m.VM)},
-		Detail: detail,
-		Action: action,
+		Hashes:   map[string]string{"src_permall_sha256": m.SrcPermallSHA256, "src_nvram_sha256": m.SrcNvramSHA256},
+		Paths:    []string{retained, s.fw().SwtpmDir(m.UUID), s.fw().NvramPath(m.VM)},
+		Detail:   detail,
+		Action:   action,
+		Severity: holdSeverity(cause),
 	}); cerr != nil {
 		slog.Warn("live firmware move: raise the condition", "vm", m.VM, "code", condFwmigCleanupFailed, "error", cerr)
 	}
 	slog.Error("live firmware move: the source cleanup stopped; the source state is kept", "vm", m.VM, "attempt", m.Attempt, "step", step, "error", cause)
 	return err
+}
+
+// holdSeverity is a hold's severity, "" (the code's default) for any other
+// cause.
+func holdSeverity(cause error) string {
+	var h *cleanupTargetHold
+	if errors.As(cause, &h) {
+		return h.severity()
+	}
+	return ""
 }
 
 // cleanupConditionOpenWith reports whether vm's cleanup condition is open
@@ -251,47 +262,93 @@ var errFirmwareCleanupTargetOff = errors.New("the target is not positively alive
 
 // cleanupTargetHold is why an automatic cleanup holds before the undefine.
 type cleanupTargetHold struct {
-	provedOff bool // the doctor's --accept-source works now
-	why       string
+	kind cleanupHoldKind
+	why  string
 }
+
+// cleanupHoldKind sorts the holds by the exits and severity they take.
+type cleanupHoldKind int
+
+const (
+	holdTargetLost      cleanupHoldKind = iota // critical: --accept-source after a fence-confirm
+	holdTargetProvedOff                        // critical: both exits work now
+	holdTargetPlanned                          // warning: draining or maintenance
+	holdTargetRemoved                          // warning: no longer a member; --accept-target is the exit
+)
 
 func (e *cleanupTargetHold) Error() string        { return e.why }
 func (e *cleanupTargetHold) Is(target error) bool { return target == errFirmwareCleanupTargetOff }
 
-// cleanupTargetNotAlive is nil only when m's target is positively alive: its
-// state (h, as fwTargetProvedOff read it) is active and it answers a records
-// call for the VM now. Anything else, an unreadable answer included, is a
-// hold (re-review 3, I-1): a target lost but not yet fenced is offline, and
-// stays so until the fencer or an operator acts.
+// severity is the cleanup_failed severity of the hold: a target in a
+// planned state or removed is the operator's own doing, and warns.
+func (e *cleanupTargetHold) severity() string {
+	if e.kind == holdTargetPlanned || e.kind == holdTargetRemoved {
+		return corrosion.SeverityWarning
+	}
+	return corrosion.SeverityCritical
+}
+
+// fwCleanupAliveReadTimeout bounds the cleanup's read of the target, made
+// under the VM's lock: a target that does not answer in time holds the
+// cleanup, which the next minute's retry asks again.
+var fwCleanupAliveReadTimeout = 10 * time.Second
+
+// cleanupTargetNotAlive is nil only when m's target is positively alive and
+// holds the VM's copy: its state (h, as fwTargetProvedOff read it) is active,
+// and its records for the VM, read now, carry no error and a domain of the
+// VM's uuid. Anything else is a hold (re-review 3, I-1; round-4 re-review
+// n-1): a target lost but not yet fenced is offline until the fencer or an
+// operator acts, and a target without the copy leaves the source's as maybe
+// the only one.
 func (s *Server) cleanupTargetNotAlive(ctx context.Context, m fwmig.Marker, h *corrosion.HostRecord, provedOff bool) error {
 	switch {
 	case provedOff:
-		return &cleanupTargetHold{provedOff: true, why: fmt.Sprintf("the target %s is proved off", m.Target)}
+		return &cleanupTargetHold{kind: holdTargetProvedOff, why: fmt.Sprintf("the target %s is proved off", m.Target)}
 	case h == nil || h.State == "removed":
-		return &cleanupTargetHold{why: fmt.Sprintf("the target %s is no longer a member, and is not proved off", m.Target)}
+		return &cleanupTargetHold{kind: holdTargetRemoved, why: fmt.Sprintf("the target %s was removed from the cluster, and is not proved off", m.Target)}
+	case h.State == "draining" || h.State == "maintenance":
+		return &cleanupTargetHold{kind: holdTargetPlanned, why: fmt.Sprintf("the target %s is in %s, not active", m.Target, h.State)}
 	case h.State != "active":
 		return &cleanupTargetHold{why: fmt.Sprintf("the target %s is %s, not active", m.Target, h.State)}
 	}
-	if _, err := s.inspectFirmwareMoveHost(ctx, m.Target, m.VM); err != nil {
+	rctx, cancel := context.WithTimeout(ctx, fwCleanupAliveReadTimeout)
+	defer cancel()
+	rec, err := s.inspectFirmwareMoveHost(rctx, m.Target, m.VM)
+	switch {
+	case err != nil:
 		slog.Warn("live firmware move: the target does not answer; the source cleanup holds", "vm", m.VM, "attempt", m.Attempt, "target", m.Target, "error", err)
 		return &cleanupTargetHold{why: fmt.Sprintf("the target %s is active, but does not answer", m.Target)}
+	case rec.GetError() != "":
+		slog.Warn("live firmware move: the target cannot read its records of the VM; the source cleanup holds", "vm", m.VM, "attempt", m.Attempt, "target", m.Target, "error", rec.GetError())
+		return &cleanupTargetHold{why: fmt.Sprintf("the target %s answers, but cannot read its records of the VM", m.Target)}
+	case !rec.GetDomain().GetPresent() || !strings.EqualFold(rec.GetDomain().GetUuid(), m.UUID):
+		return &cleanupTargetHold{why: fmt.Sprintf("the target %s answers, but holds no domain of the VM's uuid", m.Target)}
 	}
 	return nil
 }
 
-// cleanupTargetHoldAction is the action text of a hold: --accept-target
-// always works; --accept-source only once the target is proved off.
+// cleanupTargetHoldAction is the action text of a hold: why it holds, then
+// the exits. --accept-target always works; --accept-source only once the
+// target is proved off.
 func cleanupTargetHoldAction(m fwmig.Marker, cause error) string {
-	head := "the source's copy may be the only one that can still run: it is kept, defined and not wiped. "
-	resume := "The cleanup goes on by itself at the next pass once the target is active and answers again"
 	var h *cleanupTargetHold
-	if errors.As(cause, &h) && h.provedOff {
-		return head + "`lv doctor firmware-move <vm> --accept-source --acknowledge-rollback` returns the VM here; " +
-			"`lv doctor firmware-move <vm> --accept-target` takes the target's copy (the source's state quarantined). " + resume
+	if !errors.As(cause, &h) {
+		h = &cleanupTargetHold{why: cause.Error()}
 	}
-	return head + "`lv doctor firmware-move <vm> --accept-target` takes the target's copy (the source's state quarantined) and works now. " +
-		fmt.Sprintf("To return the VM here instead, power the target off and run `lv host fence-confirm %s` first; ", m.Target) +
-		"then `lv doctor firmware-move <vm> --accept-source --acknowledge-rollback` returns it. " + resume
+	head := h.why + ", so the source's copy may be the only one that can still run: it is kept, defined and not wiped. "
+	resume := "The cleanup goes on by itself at the next pass once the target is active, answers and holds the VM's copy"
+	accept := "`lv doctor firmware-move <vm> --accept-target` takes the target's copy (the source's state quarantined)"
+	source := fmt.Sprintf("To return the VM here instead, power %s off and run `lv host fence-confirm %s` first; "+
+		"then `lv doctor firmware-move <vm> --accept-source --acknowledge-rollback` returns it. ", m.Target, m.Target)
+	switch h.kind {
+	case holdTargetProvedOff:
+		return head + "`lv doctor firmware-move <vm> --accept-source --acknowledge-rollback` returns the VM here; " + accept + ". " + resume
+	case holdTargetPlanned:
+		return head + "This is a planned state: " + resume + "; " + accept + " ends the hold now"
+	case holdTargetRemoved:
+		return head + "A removed target does not come back as itself, so " + accept + " is the exit. " + source
+	}
+	return head + accept + " and works now. " + source + resume
 }
 
 // writeRetainedFirmwareBundle is §6.7 step 2. A bundle of the attempt already

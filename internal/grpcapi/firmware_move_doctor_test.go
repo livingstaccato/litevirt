@@ -38,9 +38,16 @@ func (p *fwlPeer) FirmwareMoveDoctor(_ context.Context, req *pb.FirmwareMoveDoct
 	if aerr != nil && req.GetAction() != pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_UNSPECIFIED {
 		return nil, aerr
 	}
-	return withPeerTrailer(p.r.peer, opts, func(ctx context.Context) (*pb.FirmwareMoveDoctorResponse, error) {
+	p.mu.Lock()
+	ra := p.readAnswer
+	p.mu.Unlock()
+	resp, err := withPeerTrailer(p.r.peer, opts, func(ctx context.Context) (*pb.FirmwareMoveDoctorResponse, error) {
 		return p.r.dst.FirmwareMoveDoctor(ctx, req)
 	})
+	if ra != nil && err == nil && req.GetAction() == pb.FirmwareMoveDoctorAction_FIRMWARE_MOVE_DOCTOR_ACTION_UNSPECIFIED {
+		resp = ra(resp)
+	}
+	return resp, err
 }
 
 // fwTrailerStream records the trailer a handler sets, as a gRPC transport

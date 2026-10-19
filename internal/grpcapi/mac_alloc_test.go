@@ -13,6 +13,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 	"github.com/litevirt/litevirt/internal/vmimport"
@@ -372,14 +373,20 @@ func TestStartVM_AReadErrorNeverRefusesADrainResume(t *testing.T) {
 	})
 	t.Run("journal read fails", func(t *testing.T) {
 		s := setup(t, false)
+		peer := peerCtxFor(t, s, "src-host")
 		if err := s.db.Execute(ctx, `DROP TABLE operation_steps`); err != nil {
 			t.Fatal(err)
 		}
 		if err := s.db.Execute(ctx, `DROP TABLE operations`); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.refuseStartOnSharedMAC(ctx, "moved"); err != nil {
-			t.Fatalf("a start that may end a drain move was refused on a journal read error: %v", err)
+		// A peer's start may end a drain move: through.
+		if err := s.refuseStartOnSharedMAC(peer, "moved"); err != nil {
+			t.Fatalf("a peer's start that may end a drain move was refused on a journal read error: %v", err)
+		}
+		// An operator's is not one: refused, fail closed.
+		if err := s.refuseStartOnSharedMAC(adminCtx(), "moved"); status.Code(err) != codes.Unavailable {
+			t.Fatalf("an operator start on a journal read error: got %v, want Unavailable", err)
 		}
 	})
 	t.Run("MAC read fails, operator start", func(t *testing.T) {
@@ -400,7 +407,7 @@ func TestStartVM_ADrainResumeMarkerOnlyFromItsPeer(t *testing.T) {
 	s := testServer(t)
 	ctx := context.Background()
 	const dup = "52:54:00:00:0f:01"
-	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "moved", HostName: s.hostName, State: "stopped"},
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "moved", HostName: s.hostName, State: "stopped", StateDetail: health.DrainStopDetail("op-1")},
 		[]corrosion.InterfaceRecord{{VMName: "moved", NetworkName: "lan", MAC: dup}}, nil); err != nil {
 		t.Fatal(err)
 	}

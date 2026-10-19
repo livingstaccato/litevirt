@@ -34,6 +34,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/grpcapi"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // forcedMACs makes every node's MAC draw return seq in order, then repeat
@@ -388,6 +389,10 @@ func TestFleet_MAC_ADrainResumeStartNeedsNoReplicatedJournal(t *testing.T) {
 	}
 	if err := corrosion.InsertVM(ctx, dst.DB, corrosion.VMRecord{Name: "holder", HostName: dst.Name, State: "running"},
 		[]corrosion.InterfaceRecord{{VMName: "holder", NetworkName: "lan", MAC: dup}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// rv's row as a drain's move hands it over: stopped for the move.
+	if err := localExec(ctx, dst.DB, `UPDATE vms SET state_detail = ? WHERE name = 'rv'`, health.DrainStopDetail("op-rv")); err != nil {
 		t.Fatal(err)
 	}
 	if open, err := corrosion.DrainColdMoveOpenTo(ctx, dst.DB, "rv", dst.Name); err != nil || open {

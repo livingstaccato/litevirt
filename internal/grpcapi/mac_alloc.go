@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
@@ -332,12 +333,16 @@ func describeMACHolder(h corrosion.MACHolder) string {
 
 // DrainResumeFromMDKey marks a StartVM as the end of a drain's cold move:
 // the source host, which shut the guest down for the move, asks the target
-// to start it again. Honoured only over peer mTLS from that host
-// (drainResumeFromPeer); a client's is ignored.
+// to start it again. Honoured only from that host as a peer
+// (drainResumeFromPeer); a client's, or this host's own, is ignored.
 const DrainResumeFromMDKey = "x-litevirt-drain-resume-from"
 
 // drainResumeFromPeer returns the host a StartVM says it ends a drain move
-// for, when the caller is that host over peer mTLS; "" otherwise.
+// for, when the caller is that host: a peer principal (its transport a
+// cluster host certificate — kept when forwarded identity promotes the call
+// to the operator who drove the drain), whose certificate CN is the claimed
+// host, a trusted host that is not this one (a drain's source is never its
+// target). "" otherwise.
 func (s *Server) drainResumeFromPeer(ctx context.Context) string {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
@@ -348,8 +353,9 @@ func (s *Server) drainResumeFromPeer(ctx context.Context) string {
 		return ""
 	}
 	claimed := v[0]
-	if callerAuthMethod(ctx) != authMethodMTLS || callerMTLSCommonName(ctx) != claimed || !s.isTrustedHostCN(ctx, claimed) {
-		slog.Warn("start: ignoring a drain-resume marker not sent by the claimed host over peer mTLS", "claimed_source", claimed)
+	if callerPrincipalKind(ctx) != principalKindPeer || callerMTLSCommonName(ctx) != claimed ||
+		claimed == s.hostName || !s.isTrustedHostCN(ctx, claimed) {
+		slog.Warn("start: ignoring a drain-resume marker not sent by the claimed source host as a peer", "claimed_source", claimed)
 		return ""
 	}
 	return claimed
@@ -363,22 +369,35 @@ func (s *Server) drainResumeFromPeer(ctx context.Context) string {
 // A start that ends a drain's cold move resumes a guest that was running,
 // and this check must never leave it stopped: the drain refused the move
 // before the shutdown when the MAC was shared. Such a start is recognised
-// first, before any MAC is read — from the source host's marker over peer
-// mTLS, or from an open move to this host in the replica — and a journal
-// that cannot be read lets the start through (it may be one). An operator
-// start whose MACs cannot be read is refused.
+// first, before any MAC is read: from the source host's marker on a VM in
+// the shape a drain's move hands it over in, or from an open move to this host in
+// the replica. A peer's start whose journal cannot be read goes through (a
+// drain's resume arrives from a peer); an operator start whose journal or
+// MACs cannot be read is refused.
 func (s *Server) refuseStartOnSharedMAC(ctx context.Context, name string) error {
 	if s.db == nil {
 		return nil
 	}
 	if src := s.drainResumeFromPeer(ctx); src != "" {
-		return nil
+		vm, err := corrosion.GetVM(ctx, s.db, name)
+		if err != nil || vm == nil || (vm.State == "stopped" &&
+			(vm.StateDetail == "" || strings.HasPrefix(vm.StateDetail, health.DrainStopDetailPrefix))) {
+			// The shape a drain's move hands the VM over in: stopped, with
+			// no stop intent (or the drain's own). A row that cannot be
+			// read now may be one.
+			return nil
+		}
+		slog.Warn("start: a drain-resume marker for a VM no drain recorded stopped; checked as any start",
+			"vm", name, "source", src, "state_detail", vm.StateDetail)
 	}
 	resuming, rerr := corrosion.DrainColdMoveOpenTo(ctx, s.db, name, s.hostName)
 	if rerr != nil {
-		slog.Warn("start: the drain journal cannot be read; the start may end a drain move, so its MACs are not checked",
-			"vm", name, "error", rerr)
-		return nil
+		if callerPrincipalKind(ctx) == principalKindPeer {
+			slog.Warn("start: the drain journal cannot be read; a peer's start may end a drain move, so its MACs are not checked",
+				"vm", name, "error", rerr)
+			return nil
+		}
+		return status.Errorf(codes.Unavailable, "start %q: read the drain journal: %v", name, rerr)
 	}
 	if resuming {
 		return nil

@@ -1280,6 +1280,12 @@ lv firewall log [--host <h>] [--workload <name>] [--since 15m] [--limit 200] [--
   200) across the host. `litevirt_firewall_log_records_total{outcome}` counts
   records `kept`, `rate_limited` by that cap, and lost to `overflow` (the
   kernel dropped them before the daemon read them).
+- The kernel sends records to the daemon within about 10 ms, or at once when
+  16 are waiting. A record's time is the kernel's timestamp of the packet. A
+  packet the host itself sends has none, so its record carries the time the
+  daemon read it, within about 10 ms of the packet. The JSON lines on disk say
+  which as `time_source`: `packet` or `received`. A record with no
+  `time_source` was written by an older build.
 
 **Kernel support.** At start the daemon checks, with `nft -c`, that the kernel
 loads a named limit and a log line to its group (`nft_log`,

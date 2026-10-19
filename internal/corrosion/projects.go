@@ -2,7 +2,9 @@ package corrosion
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"strconv"
@@ -63,13 +65,29 @@ func InsertProject(ctx context.Context, c *Client, p ProjectRecord) error {
 	if err != nil {
 		return fmt.Errorf("check previous incarnation: %w", err)
 	}
+	// A live project is refused BEFORE anything is retired: a re-create that
+	// loses must not have revoked grants on its way to failing.
+	live, err := c.Query(ctx, `SELECT 1 FROM projects WHERE name = ? AND deleted_at IS NULL`, p.Name)
+	if err != nil {
+		return fmt.Errorf("check existing project: %w", err)
+	}
+	if len(live) > 0 {
+		return fmt.Errorf("project %q already exists", p.Name)
+	}
 	if len(old) == 0 {
-		live, lerr := c.Query(ctx, `SELECT 1 FROM projects WHERE name = ? AND deleted_at IS NULL`, p.Name)
-		if lerr != nil {
-			return fmt.Errorf("check existing project: %w", lerr)
+		// Another spelling of the name ("acme" for a deleted "/acme") shares its
+		// RBAC root, so a tombstone under it is a previous incarnation too.
+		prev, perr := tombstonedSpellings(ctx, c, p.Name)
+		if perr != nil {
+			return perr
 		}
-		if len(live) > 0 {
-			return fmt.Errorf("project %q already exists", p.Name)
+		if prev {
+			if err := refuseOwnedResources(ctx, c, p.Name); err != nil {
+				return err
+			}
+			if err := retireProjectGrants(ctx, c, p.Name); err != nil {
+				return fmt.Errorf("retire previous incarnation's grants: %w", err)
+			}
 		}
 		now := c.NowTS()
 		return c.Execute(ctx,
@@ -81,12 +99,21 @@ func InsertProject(ctx context.Context, c *Client, p ProjectRecord) error {
 	// and parent are those of the old incarnation. Never keep them silently.
 	oldDisplay, oldParent := old[0].String("display"), old[0].String("parent_name")
 	if p.Display != "" && p.Display != oldDisplay {
+		if oldDisplay == "" {
+			return fmt.Errorf("project %q was deleted with no display name and a re-created project keeps that; "+
+				"create it without --display", p.Name)
+		}
 		return fmt.Errorf("project %q was deleted with display %q and a re-created project keeps it; "+
 			"create it with --display %q, or with no --display", p.Name, oldDisplay, oldDisplay)
 	}
-	if p.ParentName != oldParent {
+	if !sameProjectPath(p.ParentName, oldParent) {
 		return fmt.Errorf("project %q was deleted under parent %q (%q now); a re-created project keeps its parent",
 			p.Name, oldParent, p.ParentName)
+	}
+	// Project-owned resources an older build let outlive the delete would be
+	// inherited by the new incarnation: refuse, as DeleteProject does.
+	if err := refuseOwnedResources(ctx, c, p.Name); err != nil {
+		return err
 	}
 	// Whatever the old incarnation was granted is retired FIRST, so a crash
 	// halfway leaves a tombstoned project with no authority, never a live one
@@ -126,12 +153,118 @@ func projectRBACRoot(name string) (string, bool) {
 	return safename.ProjectRBACPath(canon), true
 }
 
+// sameProjectPath reports whether two project names are one project: equal
+// after canonicalisation ("acme" and "/acme"), or equal as raw strings when
+// either has no canonical form. "" is only equal to "".
+func sameProjectPath(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if a == "" || b == "" {
+		return false
+	}
+	ca, ea := safename.CanonicalProjectName(a)
+	cb, eb := safename.CanonicalProjectName(b)
+	return ea == nil && eb == nil && ca == cb
+}
+
+// tombstonedSpellings reports whether a TOMBSTONED project of another spelling
+// of name exists with no LIVE sibling spelling left: the previous incarnation of
+// the same RBAC root.
+func tombstonedSpellings(ctx context.Context, c *Client, name string) (bool, error) {
+	rows, err := c.Query(ctx, `SELECT name, deleted_at FROM projects WHERE name <> ?`, name)
+	if err != nil {
+		return false, err
+	}
+	dead := false
+	for _, r := range rows {
+		if !sameProjectPath(r.String("name"), name) {
+			continue
+		}
+		if r.String("deleted_at") == "" {
+			return false, nil
+		}
+		dead = true
+	}
+	return dead, nil
+}
+
+// refuseOwnedResources refuses while a live resource still belongs to the
+// project, naming each with the command that removes it. These carry the
+// project name in a column and resolve under the project's RBAC root, so a
+// project of the same name created later would inherit them — and with them
+// whatever their owner chose (a network's config, a storage pool and its
+// content, a backup repo, a notification target).
+func refuseOwnedResources(ctx context.Context, c *Client, name string) error {
+	owned := func(p string) bool { return p != "" && sameProjectPath(p, name) }
+	var found []string
+
+	nets, err := c.Query(ctx, `SELECT name, COALESCE(project, '') AS project FROM networks WHERE deleted_at IS NULL`)
+	if err != nil {
+		return err
+	}
+	for _, r := range nets {
+		if owned(r.String("project")) {
+			found = append(found, fmt.Sprintf("network %q (lv network rm %s)", r.String("name"), r.String("name")))
+		}
+	}
+	pools, err := c.Query(ctx, `SELECT DISTINCT name, COALESCE(project, '') AS project FROM storage_pools WHERE deleted_at IS NULL`)
+	if err != nil {
+		return err
+	}
+	for _, r := range pools {
+		if owned(r.String("project")) {
+			found = append(found, fmt.Sprintf("storage pool %q (lv pool delete %s)", r.String("name"), r.String("name")))
+		}
+	}
+	scheds, err := c.Query(ctx, `SELECT vm_name, repo, scope, COALESCE(project_name, '') AS project_name
+		FROM backup_schedules WHERE deleted_at IS NULL AND scope IN ('project', 'container')`)
+	if err != nil {
+		return err
+	}
+	for _, r := range scheds {
+		rec := BackupScheduleRecord{VMName: r.String("vm_name"), Scope: r.String("scope"), ProjectName: r.String("project_name")}
+		proj := rec.ProjectName
+		if rec.Scope == "container" {
+			proj = ContainerScheduleProject(rec)
+		}
+		if owned(proj) {
+			found = append(found, fmt.Sprintf("%s backup schedule %q to repo %q (lv backup schedule ls; lv backup schedule rm)",
+				rec.Scope, rec.VMName, r.String("repo")))
+		}
+	}
+	routes, err := c.Query(ctx, `SELECT id, COALESCE(project, '') AS project FROM notification_routes WHERE deleted_at IS NULL`)
+	if err != nil {
+		return err
+	}
+	for _, r := range routes {
+		if owned(r.String("project")) {
+			found = append(found, fmt.Sprintf("notification route %q (lv notify route rm %s)", r.String("id"), r.String("id")))
+		}
+	}
+	if len(found) > 0 {
+		return fmt.Errorf("project %q still owns %s; delete them first", name, strings.Join(found, ", "))
+	}
+	return nil
+}
+
+// bindingSentinelPath is where the NoAccess binding retireProjectGrants leaves
+// for a principal sits: the root, which no project's RBAC root is under, so a
+// later re-create (which retires everything under ITS root) never removes it.
+const bindingSentinelPath = "/"
+
 // retireProjectGrants removes everything that grants authority over a project
 // NAME, so a later project of the same name starts with none: its admission
 // authority, every role binding at or under its RBAC path, and its quota. All
 // three are keyed by the name, not by an incarnation, so without this a
 // re-created project would silently inherit the old one's operators, holder and
 // limits. Idempotent. Uses only existing statement shapes.
+//
+// A principal left with NO live binding at all would fall back to its legacy
+// cluster-wide role (RequirePerm: no bindings means legacy role), so retiring
+// the last binding of a principal bound only here would WIDEN its access. Each
+// such principal is left a NoAccess sentinel — bound, with no verbs — exactly as
+// RevokeRoleBindingLeavingSentinel does for a revoke.
 func retireProjectGrants(ctx context.Context, c *Client, name string) error {
 	if err := RetireProjectAuthority(ctx, c, name); err != nil {
 		return err
@@ -150,19 +283,37 @@ func retireProjectGrants(ctx context.Context, c *Client, name string) error {
 	}
 	if ok {
 		rows, err := c.Query(ctx,
-			`SELECT id, path FROM role_bindings WHERE deleted_at IS NULL`)
+			`SELECT id, path, principal FROM role_bindings WHERE deleted_at IS NULL`)
 		if err != nil {
 			return err
 		}
 		var stmts []Statement
+		losing := map[string]bool{}  // principals with a binding being retired
+		keeping := map[string]bool{} // principals with a binding that stays
+		var order []string
 		for _, r := range rows {
-			path := r.String("path")
+			path, who := r.String("path"), r.String("principal")
 			if path == root || strings.HasPrefix(path, root+"/") {
 				stmts = append(stmts, Statement{
 					SQL:    roleBindingDeleteSQL,
 					Params: []interface{}{nowRFC3339(), c.NowTS(), r.String("id")},
 				})
+				if !losing[who] {
+					losing[who] = true
+					order = append(order, who)
+				}
+			} else {
+				keeping[who] = true
 			}
+		}
+		for _, who := range order {
+			if keeping[who] {
+				continue
+			}
+			stmts = append(stmts, Statement{
+				SQL:    roleBindingInsertSQL,
+				Params: []interface{}{newSentinelID(), bindingSentinelPath, SentinelRole, who, 0, c.NowTS()},
+			})
 		}
 		if len(stmts) > 0 {
 			if err := c.ExecuteBatch(ctx, stmts); err != nil {
@@ -180,6 +331,14 @@ func retireProjectGrants(ctx context.Context, c *Client, name string) error {
 		return UpsertProjectQuota(ctx, c, ProjectQuotaRecord{ProjectName: name})
 	}
 	return nil
+}
+
+func newSentinelID() string {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		panic("rand.Read: " + err.Error())
+	}
+	return hex.EncodeToString(buf)
 }
 
 // GetProject returns the project by name (canonical path) or nil if
@@ -237,6 +396,16 @@ func DeleteProject(ctx context.Context, c *Client, name string) error {
 	if name == DefaultProject {
 		return fmt.Errorf("cannot delete the default project")
 	}
+	// Deleting a name with no live project has no business revoking anything: it
+	// would retire pre-grants for a project not yet created and bump the clock of
+	// an already-deleted row.
+	liveRow, err := c.Query(ctx, `SELECT 1 FROM projects WHERE name = ? AND deleted_at IS NULL`, name)
+	if err != nil {
+		return err
+	}
+	if len(liveRow) == 0 {
+		return fmt.Errorf("project %q not found", name)
+	}
 	// Refuse if children exist.
 	children, err := c.Query(ctx,
 		`SELECT 1 FROM projects WHERE parent_name = ? AND deleted_at IS NULL LIMIT 1`, name)
@@ -275,6 +444,11 @@ func DeleteProject(ctx context.Context, c *Client, name string) error {
 	}
 	if len(sgRows) > 0 {
 		return fmt.Errorf("project %q still owns security groups; delete them first (lv sg ls --project %s)", name, name)
+	}
+	// Refuse if networks, storage pools, backup schedules or notification routes
+	// still belong to it: a later project of the same name would inherit them.
+	if err := refuseOwnedResources(ctx, c, name); err != nil {
+		return err
 	}
 	// Retire the project's admission authority BEFORE tombstoning the project
 	// itself. Done in the other order, a delete that failed halfway would leave a

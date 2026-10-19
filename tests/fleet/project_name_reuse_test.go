@@ -32,6 +32,9 @@ func TestFleet_ProjectNameReusedAcrossNodesConverges(t *testing.T) {
 	if err := corrosion.UpsertProjectQuota(ctx, a.DB, corrosion.ProjectQuotaRecord{ProjectName: "/reuse", VCPULimit: 900}); err != nil {
 		t.Fatal(err)
 	}
+	if ok, err := corrosion.ClaimInitialProjectAuthority(ctx, a.DB, "/reuse", a.Name); err != nil || !ok {
+		t.Fatalf("claim authority on A: ok=%v err=%v", ok, err)
+	}
 	for _, to := range []*Node{b, o} {
 		pumpMutations(t, c, a, to)
 	}
@@ -42,9 +45,28 @@ func TestFleet_ProjectNameReusedAcrossNodesConverges(t *testing.T) {
 	}
 	pumpMutations(t, c, a, b)
 
-	// B re-creates the name.
+	// Retirement happens at the delete, before any re-create: on A, no live
+	// authority, no live binding but the sentinel, and no quota.
+	if _, ok, _ := corrosion.CurrentProjectAuthority(ctx, a.DB, "/reuse"); ok {
+		t.Fatal("A: the deleted project still holds live authority")
+	}
+	abs, _ := corrosion.ListRoleBindings(ctx, a.DB)
+	for _, bd := range abs {
+		if bd.Role != corrosion.SentinelRole {
+			t.Fatalf("A: a binding survived the delete: %+v", bd)
+		}
+	}
+	if q, _ := corrosion.GetProjectQuota(ctx, a.DB, "/reuse"); q != nil && q.VCPULimit != 0 {
+		t.Fatalf("A: quota survived the delete: %+v", q)
+	}
+
+	// B re-creates the name and its coordinator mints the new incarnation's
+	// first authority epoch.
 	if _, err := c.SelfClient(b).CreateProject(ctx, &pb.CreateProjectRequest{Name: "/reuse"}); err != nil {
 		t.Fatalf("re-create on B: %v", err)
+	}
+	if ok, err := corrosion.ClaimInitialProjectAuthority(ctx, b.DB, "/reuse", b.Name); err != nil || !ok {
+		t.Fatalf("claim authority on B: ok=%v err=%v", ok, err)
 	}
 
 	// B's incarnation reaches O BEFORE A's tombstone does (late tombstone), then
@@ -70,6 +92,12 @@ func TestFleet_ProjectNameReusedAcrossNodesConverges(t *testing.T) {
 			if bd.ID == "old-grant" {
 				t.Fatalf("%s: the old incarnation's role binding is live on the re-created project", n.Name)
 			}
+		}
+		// The new incarnation's authority survives the old delete's retirement
+		// arriving late, on every replica, with the same holder.
+		auth, ok, err := corrosion.CurrentProjectAuthority(ctx, n.DB, "/reuse")
+		if err != nil || !ok || auth.Holder != b.Name || auth.Epoch != 2 {
+			t.Fatalf("%s: authority = %+v ok=%v err=%v, want epoch 2 held by %s", n.Name, auth, ok, err, b.Name)
 		}
 		if q, _ := corrosion.GetProjectQuota(ctx, n.DB, "/reuse"); q != nil && q.VCPULimit != 0 {
 			t.Fatalf("%s: re-created project inherited quota %+v", n.Name, q)

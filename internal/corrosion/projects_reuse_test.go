@@ -120,8 +120,10 @@ func TestProject_RecreateRetiresGrantsLeftByAnOlderDelete(t *testing.T) {
 	if err := InsertProject(ctx, c, ProjectRecord{Name: "/old"}); err != nil {
 		t.Fatal(err)
 	}
-	if bs, _ := ListRoleBindings(ctx, c); len(bs) != 0 {
-		t.Fatalf("inherited bindings: %+v", bs)
+	for _, b := range liveBindings(t, c) {
+		if b.Role != SentinelRole {
+			t.Fatalf("inherited binding: %+v", b)
+		}
 	}
 	if _, ok, _ := CurrentProjectAuthority(ctx, c, "/old"); ok {
 		t.Fatal("inherited admission authority")
@@ -173,5 +175,218 @@ func TestProject_RecreateRefusesADifferingDisplayOrParent(t *testing.T) {
 	}
 	if got, _ := GetProject(ctx, c, "/a/x"); got == nil || got.Display != "X" {
 		t.Fatalf("re-created = %+v, want old display X", got)
+	}
+}
+
+func liveBindings(t *testing.T, c *Client) []RoleBindingRecord {
+	t.Helper()
+	bs, err := ListRoleBindings(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bs
+}
+
+// Retirement happens AT DELETE, not only when the name is next created: between
+// the two, stale grants must not sit live under a path nobody owns.
+func TestDeleteProject_RetiresGrantsImmediately(t *testing.T) {
+	ctx := context.Background()
+	c := newProjectTestClient(t)
+	if err := InsertProject(ctx, c, ProjectRecord{Name: "/acme"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertRoleBinding(ctx, c, RoleBindingRecord{ID: "b1", Path: "/projects/acme/vms/web", Role: "Operator", Principal: "user:bob@local"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpsertProjectQuota(ctx, c, ProjectQuotaRecord{ProjectName: "/acme", VCPULimit: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteProject(ctx, c, "/acme"); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range liveBindings(t, c) {
+		if b.ID == "b1" {
+			t.Fatal("a deleted project's role binding is still live")
+		}
+	}
+	if q, _ := GetProjectQuota(ctx, c, "/acme"); q != nil && q.VCPULimit != 0 {
+		t.Fatalf("a deleted project's quota is still %+v", q)
+	}
+}
+
+// H1: a principal whose only bindings were in the project must not be left with
+// none, or RequirePerm falls back to its legacy role, cluster-wide.
+func TestDeleteProject_NeverLeavesAPrincipalUnbound(t *testing.T) {
+	ctx := context.Background()
+	c := newProjectTestClient(t)
+	if err := InsertProject(ctx, c, ProjectRecord{Name: "/acme"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range []RoleBindingRecord{
+		{ID: "only", Path: "/projects/acme", Role: "Operator", Principal: "user:bob@local", Propagate: true},
+		{ID: "two", Path: "/projects/acme/vms/x", Role: "Operator", Principal: "user:bob@local"},
+		{ID: "also", Path: "/projects/acme", Role: "Viewer", Principal: "user:eve@local", Propagate: true},
+		{ID: "elsewhere", Path: "/projects/beta", Role: "Viewer", Principal: "user:eve@local", Propagate: true},
+	} {
+		if err := InsertRoleBinding(ctx, c, b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := DeleteProject(ctx, c, "/acme"); err != nil {
+		t.Fatal(err)
+	}
+	perPrincipal := map[string][]RoleBindingRecord{}
+	for _, b := range liveBindings(t, c) {
+		perPrincipal[b.Principal] = append(perPrincipal[b.Principal], b)
+	}
+	bob := perPrincipal["user:bob@local"]
+	if len(bob) != 1 || bob[0].Role != SentinelRole || bob[0].Path != "/" {
+		t.Fatalf("bob (bound only in the deleted project) has %+v, want exactly one NoAccess sentinel at /", bob)
+	}
+	if eve := perPrincipal["user:eve@local"]; len(eve) != 1 || eve[0].ID != "elsewhere" {
+		t.Fatalf("eve (bound elsewhere too) has %+v, want only her /projects/beta binding", eve)
+	}
+	// A re-create must not remove the sentinel (it is outside the project's root).
+	if err := InsertProject(ctx, c, ProjectRecord{Name: "/acme"}); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, b := range liveBindings(t, c) {
+		if b.Principal == "user:bob@local" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("after re-create bob has %d live bindings, want his sentinel", n)
+	}
+}
+
+// H2: resources that carry the project name and resolve under its RBAC root
+// would be inherited by a project of the same name, so delete refuses.
+func TestDeleteProject_RefusesWhileProjectOwnedResourcesExist(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name  string
+		make  func(c *Client) error
+		wants string
+	}{
+		{"network", func(c *Client) error {
+			return UpsertNetwork(ctx, c, NetworkRecord{Name: "acme-net", Type: "bridge", Config: "{}", Project: "acme"})
+		}, "lv network rm acme-net"},
+		{"pool", func(c *Client) error {
+			return UpsertStoragePool(ctx, c, StoragePoolRecord{HostName: "h1", Name: "acme-pool", Driver: "dir", Project: "/acme", State: "active"})
+		}, "lv pool delete acme-pool"},
+		{"backup schedule", func(c *Client) error {
+			return UpsertBackupSchedule(ctx, c, BackupScheduleRecord{VMName: "@project:/acme", Repo: "r1", Scope: "project", ProjectName: "/acme", Cron: "0 2 * * *", Enabled: true})
+		}, "lv backup schedule"},
+		{"notification route", func(c *Client) error {
+			return InsertNotificationRoute(ctx, c, NotificationRoute{ID: "route1", EventPattern: "*", Project: "/acme", TargetID: "t", Enabled: true})
+		}, "lv notify route rm route1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newProjectTestClient(t)
+			if err := InsertProject(ctx, c, ProjectRecord{Name: "/acme"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.make(c); err != nil {
+				t.Fatal(err)
+			}
+			err := DeleteProject(ctx, c, "/acme")
+			if err == nil || !strings.Contains(err.Error(), tc.wants) {
+				t.Fatalf("DeleteProject = %v, want a refusal naming %q", err, tc.wants)
+			}
+			if got, _ := GetProject(ctx, c, "/acme"); got == nil {
+				t.Fatal("a refused delete tombstoned the project")
+			}
+		})
+	}
+}
+
+// The same resources, left by a delete from an older build, block the re-create.
+func TestProject_RecreateRefusedWhileAnOlderDeleteLeftOwnedResources(t *testing.T) {
+	ctx := context.Background()
+	c := newProjectTestClient(t)
+	if err := InsertProject(ctx, c, ProjectRecord{Name: "/acme"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpsertNetwork(ctx, c, NetworkRecord{Name: "acme-net", Type: "bridge", Config: "{}", Project: "/acme"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Execute(ctx, `UPDATE projects SET deleted_at = ?, updated_at = ? WHERE name = ?`, nowRFC3339(), c.NowTS(), "/acme"); err != nil {
+		t.Fatal(err)
+	}
+	err := InsertProject(ctx, c, ProjectRecord{Name: "/acme"})
+	if err == nil || !strings.Contains(err.Error(), "lv network rm acme-net") {
+		t.Fatalf("re-create = %v, want a refusal naming the network", err)
+	}
+	if got, _ := GetProject(ctx, c, "/acme"); got != nil {
+		t.Fatal("a refused re-create revived the project")
+	}
+}
+
+// L3: deleting a project that is not live changes nothing.
+func TestDeleteProject_OfAMissingProjectRevokesNothing(t *testing.T) {
+	ctx := context.Background()
+	c := newProjectTestClient(t)
+	if err := InsertRoleBinding(ctx, c, RoleBindingRecord{ID: "pre", Path: "/projects/future", Role: "Admin", Principal: "user:alice@local", Propagate: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteProject(ctx, c, "/future"); err == nil {
+		t.Fatal("deleting a project that does not exist succeeded")
+	}
+	if len(liveBindings(t, c)) != 1 {
+		t.Fatal("deleting a missing project retired a pre-grant")
+	}
+	if err := InsertProject(ctx, c, ProjectRecord{Name: "/gone"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteProject(ctx, c, "/gone"); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteProject(ctx, c, "/gone"); err == nil {
+		t.Fatal("deleting an already-deleted project succeeded")
+	}
+}
+
+// L2: a re-create of a LIVE project fails without having revoked anything.
+func TestProject_DuplicateCreateRevokesNothing(t *testing.T) {
+	ctx := context.Background()
+	c := newProjectTestClient(t)
+	if err := InsertProject(ctx, c, ProjectRecord{Name: "/acme"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertRoleBinding(ctx, c, RoleBindingRecord{ID: "b", Path: "/projects/acme", Role: "Admin", Principal: "user:alice@local", Propagate: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertProject(ctx, c, ProjectRecord{Name: "/acme"}); err == nil {
+		t.Fatal("duplicate create succeeded")
+	}
+	if len(liveBindings(t, c)) != 1 {
+		t.Fatal("a failed duplicate create retired a live project's binding")
+	}
+}
+
+// M2: another spelling of a deleted name shares its RBAC root.
+func TestProject_OtherSpellingOfADeletedNameInheritsNothing(t *testing.T) {
+	ctx := context.Background()
+	c := newProjectTestClient(t)
+	if err := InsertProject(ctx, c, ProjectRecord{Name: "/acme"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertRoleBinding(ctx, c, RoleBindingRecord{ID: "b", Path: "/projects/acme", Role: "Admin", Principal: "user:alice@local", Propagate: true}); err != nil {
+		t.Fatal(err)
+	}
+	// An older build's delete: tombstone only.
+	if err := c.Execute(ctx, `UPDATE projects SET deleted_at = ?, updated_at = ? WHERE name = ?`, nowRFC3339(), c.NowTS(), "/acme"); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertProject(ctx, c, ProjectRecord{Name: "acme"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range liveBindings(t, c) {
+		if b.ID == "b" {
+			t.Fatal("a project created under another spelling inherited the old binding")
+		}
 	}
 }

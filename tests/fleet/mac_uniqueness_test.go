@@ -276,11 +276,14 @@ func TestFleet_MAC_ContainerRestoreBesideItsOriginalGetsItsOwnMAC(t *testing.T) 
 	st, err := c.SelfClient(b).RestoreContainer(ctx, &pb.RestoreContainerRequest{
 		RepoPath: repo, Name: name, Timestamp: ts, HostName: b.Name,
 	})
+	var statuses []string
 	if err == nil {
 		for {
-			if _, err = st.Recv(); err != nil {
+			var p *pb.RestoreContainerProgress
+			if p, err = st.Recv(); err != nil {
 				break
 			}
+			statuses = append(statuses, p.GetStatus())
 		}
 	}
 	// The copy lands; it may not take the original's address.
@@ -295,11 +298,67 @@ func TestFleet_MAC_ContainerRestoreBesideItsOriginalGetsItsOwnMAC(t *testing.T) 
 	if got == orig || got == "" {
 		t.Fatalf("the copy's MAC = %q, the original's %s: want one of its own", got, orig)
 	}
+	// The caller and the audit are told: the old MAC, its holder, the new one.
+	want := "MAC " + orig + " is held by ct:" + a.Name + ":" + name + "; restored with " + got
+	told := false
+	for _, st := range statuses {
+		told = told || strings.Contains(st, want)
+	}
+	if !told {
+		t.Errorf("no progress message %q; got %q", want, statuses)
+	}
+	if rows, qerr := b.DB.Query(ctx, `SELECT detail FROM audit_log WHERE action = 'ct.restore' AND target = ?`, name); qerr != nil {
+		t.Fatal(qerr)
+	} else {
+		audited := false
+		for _, r := range rows {
+			audited = audited || strings.Contains(r.String("detail"), want)
+		}
+		if !audited {
+			t.Errorf("no ct.restore audit row says %q", want)
+		}
+	}
 	for _, n := range c.Nodes {
 		n.Server.ReconcileMACCollisions(ctx)
 		if row, ok, err := corrosion.GetHealthCondition(ctx, n.DB, grpcapi.NICIdentityEvaluator, grpcapi.CondMACDuplicate, "host", n.Name); err != nil ||
 			(ok && row.Lifecycle != corrosion.ConditionResolved) {
 			t.Errorf("%s raised mac_duplicate: %+v (err %v)", n.Name, row, err)
 		}
+	}
+}
+
+// A running VM whose NIC's MAC another VM holds is not cold-moved by a
+// drain: refused before its shutdown, it keeps running where it is, and the
+// refusal names both NICs and the way out. (A move that went ahead would end
+// in a start the shared MAC refuses, leaving the guest stopped.)
+func TestFleet_MAC_DrainLeavesARunningVMOnASharedMACRunning(t *testing.T) {
+	const dup = "52:54:00:7a:03:01"
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	ctx := context.Background()
+	if err := corrosion.InsertInterface(ctx, sc.src.DB, corrosion.InterfaceRecord{VMName: "os1", NetworkName: "lan", MAC: dup}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(ctx, sc.src.DB, corrosion.VMRecord{Name: "holder", HostName: sc.dst.Name, State: "running"},
+		[]corrosion.InterfaceRecord{{VMName: "holder", NetworkName: "lan", MAC: dup}}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	progress, err := sc.drain(t)
+	assertIncomplete(t, err)
+	p := progress["os1"]
+	if p == nil || p.Status != "failed" || !strings.Contains(p.Error, "left running on "+sc.src.Name) ||
+		!strings.Contains(p.Error, "VM holder") || !strings.Contains(p.Error, "lv detach-nic os1 "+dup) {
+		t.Fatalf("drain progress for os1 = %+v, want failed: left running, naming holder and lv detach-nic", p)
+	}
+	if n := sc.srcOps("shutdown"); n != 0 {
+		t.Errorf("os1 was shut down %d time(s) for a move its shared MAC refuses", n)
+	}
+	vm := sc.vm(t)
+	if vm.HostName != sc.src.Name || vm.State != "running" {
+		t.Errorf("os1 row = host %s state %s, want host %s state running", vm.HostName, vm.State, sc.src.Name)
+	}
+	if active, _ := sc.src.Virt.DomainIsActive("os1"); !active {
+		t.Errorf("os1's domain is not running on %s", sc.src.Name)
 	}
 }

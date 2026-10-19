@@ -1194,6 +1194,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// it errs only toward "used", which changes nothing for this release.
 	var hostAccessG capabilities.FeatureGrant
 	var withoutHostAccessAudit string
+	var macRedraws []string // "NIC <name>: MAC <old> is held by <holder>; restored with <new>"
 	{
 		authorized, stripped, g, herr := s.authorizeRestoredHostAccess(ctx, corrosion.DecodeCreateSpec(spec.CreateSpec), source, !operatorRestore, req.GetWithoutHostAccess())
 		if herr != nil {
@@ -1253,7 +1254,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 			// NIC holds now (its live original beside it, or a NIC that took
 			// it since) is drawn afresh. A move keeps the moving container's.
 			var merr error
-			if authorized, merr = s.redrawHeldContainerMACs(ctx, req.Name, authorized); merr != nil {
+			if authorized, macRedraws, merr = s.redrawHeldContainerMACs(ctx, req.Name, authorized); merr != nil {
 				if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
 					slog.Warn("container restore: cleanup after the MAC draw failed also failed", "name", req.Name, "error", delErr)
 				}
@@ -1351,6 +1352,13 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	s.removeRestoreMarker(req.Name)
 	if withoutHostAccessAudit != "" {
 		s.audit(ctx, "ct.restore", req.Name, withoutHostAccessAudit, "ok")
+	}
+	// A backed-up MAC another NIC holds was replaced: said in the audit and
+	// to the caller, since in-guest and external configuration keyed by the
+	// old MAC no longer matches.
+	for _, r := range macRedraws {
+		s.audit(ctx, "ct.restore", req.Name, "project="+project+" "+r, "ok")
+		_ = send(&pb.RestoreContainerProgress{Phase: pb.RestoreContainerProgress_IMPORT, Status: r})
 	}
 	s.recordContainerBases(project, req.Name, placement, spec)
 	s.recordForeignNetworks(ctx, "ct.restore", req.Name, foreignNets)

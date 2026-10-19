@@ -26,16 +26,19 @@ type MACHolder struct {
 // keyed by lower-cased MAC: the NICs of live VMs as the vm_nics /
 // vm_interfaces overlay (MergedVMNICs) has them, so the legacy row of a NIC
 // a latched cluster detached holds nothing, and the NICs of live containers.
-// One entry per workload Identity.
+// One entry per workload Identity and host: both rows of a container a
+// migrate is moving are kept, each naming its host, and count as one
+// workload (Identity).
 func LiveMACHolders(ctx context.Context, c *Client) (map[string][]MACHolder, error) {
 	out := map[string][]MACHolder{}
-	seen := map[string]bool{} // mac|identity
+	seen := map[string]bool{} // mac|identity|host
 	add := func(mac string, h MACHolder) {
 		mac = strings.ToLower(strings.TrimSpace(mac))
-		if mac == "" || seen[mac+"|"+h.Identity] {
+		key := mac + "|" + h.Identity + "|" + h.Host
+		if mac == "" || seen[key] {
 			return
 		}
-		seen[mac+"|"+h.Identity] = true
+		seen[key] = true
 		out[mac] = append(out[mac], h)
 	}
 
@@ -98,7 +101,7 @@ func LiveMACHolders(ctx context.Context, c *Client) (map[string][]MACHolder, err
 // MACCollision is a MAC that NICs of more than one workload record.
 type MACCollision struct {
 	MAC     string
-	Holders []MACHolder // one per workload, sorted by owner
+	Holders []MACHolder // one per workload and host, sorted by owner then host
 }
 
 // ListMACCollisions returns every MAC that the live NICs of two or more
@@ -111,11 +114,20 @@ func ListMACCollisions(ctx context.Context, c *Client) ([]MACCollision, error) {
 	}
 	var out []MACCollision
 	for mac, hs := range holders {
-		if len(hs) < 2 {
+		workloads := map[string]bool{}
+		for _, h := range hs {
+			workloads[h.Identity] = true
+		}
+		if len(workloads) < 2 {
 			continue
 		}
 		col := MACCollision{MAC: mac, Holders: append([]MACHolder(nil), hs...)}
-		sort.Slice(col.Holders, func(i, j int) bool { return col.Holders[i].Owner < col.Holders[j].Owner })
+		sort.Slice(col.Holders, func(i, j int) bool {
+			if col.Holders[i].Owner != col.Holders[j].Owner {
+				return col.Holders[i].Owner < col.Holders[j].Owner
+			}
+			return col.Holders[i].Host < col.Holders[j].Host
+		})
 		out = append(out, col)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].MAC < out[j].MAC })

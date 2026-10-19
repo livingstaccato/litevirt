@@ -2323,13 +2323,18 @@ the evidence names the MAC and each NIC (its VM or container, network and
 host). It resolves on the first look that finds none.
 
 Nothing is rewritten: a running guest keeps its MAC. A stopped VM whose NIC's
-MAC another workload holds is refused `lv start` until it has a new one. On
-one network the two NICs receive each other's traffic: the MAC-keyed
-forwarding entries of a vxlan network and the DHCP reservation keyed by the
-MAC send one guest's unicast and DHCP replies to the other. Give one a new
-MAC: for a VM, `lv detach-nic <vm> <mac>`, then `lv attach-nic <vm>
-<network>`; for a container, create it again (`lv ct rm`, then `lv ct
-create`).
+MAC another workload's NIC holds is refused `lv start` until it has a new one
+(an address lease alone holding the MAC raises nothing and refuses nothing);
+a start that resumes a guest a drain moved here is not refused. A drain does
+not cold-move a running VM whose NIC's MAC another NIC holds: it is refused
+before the shutdown and keeps running where it is. A container's start is not
+refused. On one network the two NICs receive each other's traffic: the
+MAC-keyed forwarding entries of a vxlan network and the DHCP reservation keyed
+by the MAC send one guest's unicast and DHCP replies to the other. Give one a
+new MAC: for a VM, `lv detach-nic <vm> <mac>`, then `lv attach-nic <vm>
+<network>`; for a container, clone it under a new name and remove the
+original (`lv ct clone <ct> <new-name>`, then `lv ct rm <ct>`), which keeps
+its data.
 
 During a rolling upgrade, only hosts on this build look: two colliding NICs
 whose hosts both still run an earlier build raise nothing until one of the

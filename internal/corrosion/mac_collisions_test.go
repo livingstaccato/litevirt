@@ -111,7 +111,13 @@ func TestListMACCollisions_AContainersTwoRowsAreOneWorkload(t *testing.T) {
 	}
 	put("h3", "web", "lineage-2")
 	cols, err := ListMACCollisions(ctx, c)
-	if err != nil || len(cols) != 1 || len(cols[0].Holders) != 2 {
-		t.Fatalf("a second lineage: %+v, %v; want one collision of two", cols, err)
+	if err != nil || len(cols) != 1 || len(cols[0].Holders) != 3 {
+		t.Fatalf("a second lineage: %+v, %v; want one collision naming all three rows", cols, err)
+	}
+	// Both rows of the migrating container are named, each with its host.
+	for i, want := range []string{"h1", "h2", "h3"} {
+		if cols[0].Holders[i].Host != want {
+			t.Fatalf("holders %+v: want hosts h1, h2, h3", cols[0].Holders)
+		}
 	}
 }

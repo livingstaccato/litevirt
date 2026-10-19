@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 
@@ -418,11 +419,13 @@ func (s *Server) setContainerNICMACs(ctx context.Context, name string, macs map[
 
 // redrawHeldContainerMACs gives each NIC of cs whose MAC another workload's
 // NIC or lease holds a fresh one (container scheme), returning the spec with
-// them. Container name on this host is the owner whose own rows do not count.
-func (s *Server) redrawHeldContainerMACs(ctx context.Context, name string, cs corrosion.ContainerCreateSpec) (corrosion.ContainerCreateSpec, error) {
+// them and one line per NIC changed, naming the old MAC, its holder and the
+// new MAC. Container name on this host is the owner whose own rows do not
+// count.
+func (s *Server) redrawHeldContainerMACs(ctx context.Context, name string, cs corrosion.ContainerCreateSpec) (corrosion.ContainerCreateSpec, []string, error) {
 	set, err := s.loadMACSet(ctx)
 	if err != nil {
-		return cs, err
+		return cs, nil, err
 	}
 	owner := corrosion.ContainerGuardOwner(s.hostName, name)
 	alloc := s.newMACAllocatorFrom(set)
@@ -430,8 +433,13 @@ func (s *Server) redrawHeldContainerMACs(ctx context.Context, name string, cs co
 		alloc.reserve(n.MAC)
 	}
 	var nets []corrosion.ContainerNetwork
+	var notes []string
 	for i, n := range cs.Networks {
-		if n.MAC == "" || set.heldBy(n.MAC, owner) == "" {
+		if n.MAC == "" {
+			continue
+		}
+		holder := set.heldBy(n.MAC, owner)
+		if holder == "" {
 			continue
 		}
 		if nets == nil {
@@ -439,12 +447,17 @@ func (s *Server) redrawHeldContainerMACs(ctx context.Context, name string, cs co
 		}
 		mac, derr := alloc.nextContainer(ctx)
 		if derr != nil {
-			return cs, derr
+			return cs, nil, derr
 		}
 		nets[i].MAC = mac
+		nic := n.Name
+		if nic == "" {
+			nic = fmt.Sprintf("%d", i)
+		}
+		notes = append(notes, fmt.Sprintf("NIC %s: MAC %s is held by %s; restored with %s", nic, strings.ToLower(n.MAC), holder, mac))
 	}
 	if nets != nil {
 		cs.Networks = nets
 	}
-	return cs, nil
+	return cs, notes, nil
 }

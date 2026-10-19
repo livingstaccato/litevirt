@@ -255,11 +255,7 @@ func (s *Server) ReconcileMACCollisions(ctx context.Context) {
 		var nics []string
 		for _, h := range c.Holders {
 			here = here || h.Host == s.hostName
-			kind := "VM"
-			if h.Kind == "ct" {
-				kind = "container"
-			}
-			nics = append(nics, fmt.Sprintf("%s %s (network %s, host %s)", kind, h.Name, h.Network, h.Host))
+			nics = append(nics, describeMACHolder(h))
 		}
 		if here {
 			parts = append(parts, fmt.Sprintf("MAC %s is on %s", c.MAC, strings.Join(nics, " and ")))
@@ -269,39 +265,94 @@ func (s *Server) ReconcileMACCollisions(ctx context.Context) {
 	if len(parts) > 0 {
 		detail = strings.Join(parts, "; ") + ". On one network the MAC-keyed forwarding entries (vxlan) and DHCP reservations deliver one's traffic and DHCP replies to the other; " +
 			"nothing was changed, and a stopped VM among them is refused `lv start`. Give one of them a new MAC: for a VM, `lv detach-nic <vm> <mac>`, then `lv attach-nic <vm> <network>`; " +
-			"for a container, create it again (`lv ct rm`, then `lv ct create`)"
+			"for a container, clone it under a new name and remove the original (`lv ct clone <ct> <new-name>`, then `lv ct rm <ct>`), which keeps its data"
 	}
 	s.setHostCondition(ctx, NICIdentityEvaluator, CondMACDuplicate, len(parts) > 0, corrosion.SeverityCritical, detail)
 }
 
+// sharedNICMAC returns the first MAC of VM name's NICs that a NIC of
+// another workload holds, with that holder — exactly what mac_duplicate
+// reports (corrosion.LiveMACHolders; an address lease alone is not a NIC and
+// raises nothing). mac is "" when none.
+func (s *Server) sharedNICMAC(ctx context.Context, name string) (mac string, holder corrosion.MACHolder, err error) {
+	if s.db == nil {
+		return "", holder, nil
+	}
+	nics, err := corrosion.MergedVMNICs(ctx, s.db, name)
+	if err != nil {
+		return "", holder, status.Errorf(codes.Unavailable, "read the NICs of %q: %v", name, err)
+	}
+	if len(nics) == 0 {
+		return "", holder, nil
+	}
+	holders, err := corrosion.LiveMACHolders(ctx, s.db)
+	if err != nil {
+		return "", holder, status.Errorf(codes.Unavailable, "read the cluster's NIC MACs: %v", err)
+	}
+	for _, n := range nics {
+		m := strings.ToLower(n.MAC)
+		for _, h := range holders[m] {
+			if h.Identity != name {
+				return m, h, nil
+			}
+		}
+	}
+	return "", holder, nil
+}
+
+// describeMACHolder names a holder for an operator: kind, name, network and
+// host.
+func describeMACHolder(h corrosion.MACHolder) string {
+	kind := "VM"
+	if h.Kind == "ct" {
+		kind = "container"
+	}
+	return fmt.Sprintf("%s %s (network %s, host %s)", kind, h.Name, h.Network, h.Host)
+}
+
 // refuseStartOnSharedMAC refuses an operator start of the stopped VM name
-// while one of its NICs' MACs is held by another workload's NIC or lease
-// (mac_duplicate): the start would put two NICs on one MAC. Nothing is
-// rewritten; the refusal names the way out.
+// while one of its NICs' MACs is held by another workload's NIC: the start
+// would put two NICs on one MAC (mac_duplicate names the pair). Nothing is
+// rewritten; the refusal names the way out. A start that resumes a guest a
+// drain's cold move shut down (an open move to this host) is not refused:
+// the drain refused the move before the shutdown when the MAC was shared,
+// and a guest that was running must not be left stopped by this check.
 func (s *Server) refuseStartOnSharedMAC(ctx context.Context, name string) error {
 	if s.db == nil {
 		return nil
 	}
-	nics, err := corrosion.MergedVMNICs(ctx, s.db, name)
+	mac, holder, err := s.sharedNICMAC(ctx, name)
 	if err != nil {
-		return status.Errorf(codes.Unavailable, "start %q: read its NICs: %v", name, err)
+		return status.Errorf(codes.Unavailable, "start %q: %v", name, status.Convert(err).Message())
 	}
-	if len(nics) == 0 {
+	if mac == "" {
 		return nil
 	}
-	macs := make([]string, 0, len(nics))
-	for _, n := range nics {
-		macs = append(macs, n.MAC)
+	if resuming, rerr := corrosion.DrainColdMoveOpenTo(ctx, s.db, name, s.hostName); rerr == nil && resuming {
+		slog.Warn("start resumes a guest a drain moved here; its MAC is shared (mac_duplicate)",
+			"vm", name, "mac", mac, "holder", describeMACHolder(holder))
+		return nil
 	}
-	mac, holder, err := s.macHolderOtherThan(ctx, macs, name)
+	return status.Errorf(codes.FailedPrecondition,
+		"start %q: its NIC's MAC %s is also used by %s (mac_duplicate); started, the two would share one MAC. "+
+			"Give this NIC a new MAC first: `lv detach-nic %s %s`, then `lv attach-nic %s <network>`",
+		name, mac, describeMACHolder(holder), name, mac, name)
+}
+
+// refuseColdMoveOnSharedMAC refuses, before the guest is shut down, a cold
+// move of running VM name whose NIC's MAC another workload's NIC holds: the
+// move would end in a start the shared MAC refuses. The VM keeps running
+// where it is.
+func (s *Server) refuseColdMoveOnSharedMAC(ctx context.Context, name string) error {
+	mac, holder, err := s.sharedNICMAC(ctx, name)
 	if err != nil {
 		return err
 	}
-	if holder != "" {
-		return status.Errorf(codes.FailedPrecondition,
-			"start %q: its NIC's MAC %s is also used by %s (mac_duplicate); started, the two would share one MAC. "+
-				"Give this NIC a new MAC first: `lv detach-nic %s %s`, then `lv attach-nic %s <network>`",
-			name, mac, holder, name, mac, name)
+	if mac == "" {
+		return nil
 	}
-	return nil
+	return status.Errorf(codes.FailedPrecondition,
+		"VM %q is not cold-moved, and keeps running on %s: its NIC's MAC %s is also used by %s (mac_duplicate). "+
+			"Give one of them a new MAC (for this VM: `lv detach-nic %s %s`, then `lv attach-nic %s <network>`), then drain again",
+		name, s.hostName, mac, describeMACHolder(holder), name, mac, name)
 }

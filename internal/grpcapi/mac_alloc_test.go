@@ -119,7 +119,7 @@ func TestReconcileMACCollisions_RaisesNamingBothAndResolves(t *testing.T) {
 	if err != nil || !ok || row.Lifecycle == corrosion.ConditionResolved {
 		t.Fatalf("condition after a collision: %+v ok=%v err=%v; want open", row, ok, err)
 	}
-	for _, want := range []string{dup, "VM mine", "VM theirs", "host peer"} {
+	for _, want := range []string{dup, "VM mine", "VM theirs", "host peer", "`lv ct clone <ct> <new-name>`, then `lv ct rm <ct>`"} {
 		if !strings.Contains(row.Evidence, want) {
 			t.Errorf("evidence %q does not name %q", row.Evidence, want)
 		}
@@ -282,5 +282,58 @@ func TestMACAllocator_ADetachedNICsMACIsFree(t *testing.T) {
 	}
 	if err := s.checkNICIdentities(ctx, "", []*pb.NetworkAttachment{{Name: "lan", Mac: mac}}, "new"); err != nil {
 		t.Fatalf("an explicit MAC a detach freed: %v", err)
+	}
+}
+
+// A start that resumes a guest a drain's cold move shut down is not refused
+// for a shared MAC: the guest was running, and the check must never leave it
+// stopped. Without the open move it is refused.
+func TestStartVM_ADrainResumeIsNotRefusedForASharedMAC(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	const dup = "52:54:00:00:0c:01"
+	vm := corrosion.VMRecord{Name: "moved", HostName: s.hostName, State: "stopped"}
+	if err := corrosion.InsertVM(ctx, s.db, vm, []corrosion.InterfaceRecord{{VMName: "moved", NetworkName: "lan", MAC: dup}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	seedNICOf(t, s, "theirs", dup)
+	if err := s.refuseStartOnSharedMAC(ctx, "moved"); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("no open move: got %v, want FailedPrecondition", err)
+	}
+	m, err := corrosion.BeginDrainColdMove(ctx, s.db, vm, "src-host", s.hostName, "attempt-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.refuseStartOnSharedMAC(ctx, "moved"); err != nil {
+		t.Fatalf("resuming a drained guest: %v", err)
+	}
+	if err := corrosion.FinishDrainColdMove(ctx, s.db, m, "moved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.refuseStartOnSharedMAC(ctx, "moved"); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("after the move finished: got %v, want FailedPrecondition", err)
+	}
+}
+
+// An address lease alone is not a NIC: it raises no mac_duplicate, so it
+// does not refuse a start in mac_duplicate's name.
+func TestStartVM_AStrayLeaseAloneDoesNotRefuse(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	const mac = "52:54:00:00:0d:01"
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "mine", HostName: s.hostName, State: "stopped"},
+		[]corrosion.InterfaceRecord{{VMName: "mine", NetworkName: "lan", MAC: mac}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Execute(ctx, `INSERT INTO ip_allocations (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
+		VALUES ('lan', '10.0.0.9', ?, 'gone', 'vm', '', 't', 't')`, mac); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.refuseStartOnSharedMAC(ctx, "mine"); err != nil {
+		t.Fatalf("a stray lease refused the start: %v", err)
+	}
+	s.ReconcileMACCollisions(ctx)
+	if _, ok, _ := corrosion.GetHealthCondition(ctx, s.db, NICIdentityEvaluator, CondMACDuplicate, "host", s.hostName); ok {
+		t.Fatal("a stray lease raised mac_duplicate")
 	}
 }

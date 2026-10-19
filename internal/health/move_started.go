@@ -56,11 +56,7 @@ func NoteStartingHere(ctx context.Context, db *corrosion.Client, dataDir, vm str
 	if err != nil || rec == nil {
 		return err
 	}
-	evErr := corrosion.InsertVMEvent(ctx, db, corrosion.VMEventRecord{VMName: vm, HostName: rec.HostName,
-		Type: StartingEventType, Detail: fmt.Sprintf("starting on %s at ownership generation %d", rec.HostName, rec.OwnerEpoch)})
-	if evErr != nil {
-		evErr = fmt.Errorf("record the start event: %w", evErr)
-	}
+	evErr := NoteStartEvent(ctx, db, rec.HostName, vm)
 	if prev, ok, err := startedHereAt(dataDir, vm); err == nil && ok && prev >= rec.OwnerEpoch {
 		return evErr
 	}
@@ -81,11 +77,31 @@ func NoteStartingHere(ctx context.Context, db *corrosion.Client, dataDir, vm str
 	return evErr
 }
 
+// NoteStartEvent appends the replicated StartingEventType event of a start of
+// vm on host, naming the VM's ownership generation when it has a row.
+func NoteStartEvent(ctx context.Context, db *corrosion.Client, host, vm string) error {
+	if db == nil {
+		return nil
+	}
+	detail := fmt.Sprintf("starting on %s", host)
+	if rec, err := corrosion.GetVM(ctx, db, vm); err == nil && rec != nil {
+		detail += fmt.Sprintf(" at ownership generation %d", rec.OwnerEpoch)
+	}
+	if err := corrosion.InsertVMEvent(ctx, db, corrosion.VMEventRecord{VMName: vm, HostName: host,
+		Type: StartingEventType, Detail: detail}); err != nil {
+		return fmt.Errorf("record the start event: %w", err)
+	}
+	return nil
+}
+
 // MoveStartsText lists the starts of m's VM recorded since m began (the
 // replicated StartingEventType events), for an operator choosing between a
 // move's two files. An empty list proves nothing, and says so.
 func MoveStartsText(ctx context.Context, db *corrosion.Client, m UnresolvedMove) string {
-	more := fmt.Sprintf("`lv events %s` lists them, and `lv audit ls --target %s` its failover reschedules", m.VM, m.VM)
+	more := fmt.Sprintf("the list may be incomplete: an event stamped by a host whose clock runs behind the move's, "+
+		"one pruned with the VM's old events or beyond the newest 1000, one that has not reached this host, and a "+
+		"start by a build that records none are not listed; `lv events %s` lists the events, and `lv audit ls "+
+		"--target %s` its failover reschedules", m.VM, m.VM)
 	evs, err := corrosion.ListVMEvents(ctx, db, m.VM, 1000, m.At)
 	if err != nil {
 		return fmt.Sprintf("the starts of the VM cannot be read here (%v); %s", err, more)
@@ -97,8 +113,7 @@ func MoveStartsText(ctx context.Context, db *corrosion.Client, m UnresolvedMove)
 		}
 	}
 	if len(out) == 0 {
-		return fmt.Sprintf("no start of the VM is recorded since the move began, but the absence proves nothing: a "+
-			"start whose event has not reached this host, or by a build that does not record one, is not listed; %s", more)
+		return fmt.Sprintf("no start of the VM is recorded since the move began, but the absence proves nothing: %s", more)
 	}
 	return fmt.Sprintf("the starts of the VM recorded since the move began: %s; %s", strings.Join(out, "; "), more)
 }

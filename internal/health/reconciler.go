@@ -1770,8 +1770,6 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			return
 		}
 	}
-	noteStartingHere(ctx, r.db, r.dataDir, vm.Name)
-
 	// Check if a domain already exists locally from a partial migration (#14).
 	if r.virt != nil && r.virt.DomainExists(vm.Name) {
 		state, err := r.virt.DomainState(vm.Name)
@@ -1814,6 +1812,8 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		r.virt.DestroyDomain(vm.Name)
 		r.virt.UndefineDomainPreservingState(vm.Name)
 	}
+	// A start this pass makes (a domain found running is not one).
+	noteStartingHere(ctx, r.db, r.dataDir, vm.Name)
 
 	// wroteStarting: this pass's own "starting" write landed, so a stop the
 	// row says from here on was made while the start was under way (the

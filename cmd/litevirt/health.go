@@ -119,8 +119,9 @@ hands after the move began: --accept of the source keeps the writes made on
 it since (a disk record, and a persistent config with its domain shut off,
 naming the copy are pointed at it), and the copy is kept on disk
 (docs/diagnostics.md, "A forked history"). That is refused while the
-copy was modified after the source, unless --force is given; the refusal
-prints both files' sizes and times.
+copy was modified after the source, unless --force is given, as --accept of
+the copy is while the source was modified after it; the refusal prints both
+files' sizes and times.
 
 Requires the cluster.health.resolve verb (Admin). The resolution is written
 to the audit log with your principal and --reason, and published as an
@@ -166,7 +167,7 @@ ha.condition.resolved event.`,
 	cmd.Flags().StringVar(&evaluator, "evaluator", "", "the evaluator, when two hold an open condition under the same code and subject")
 	cmd.Flags().StringVar(&reason, "reason", "", "why, recorded in the audit log")
 	cmd.Flags().StringArrayVar(&accept, "accept", nil, "vm.move_unresolved only: the file to keep of one disk's move; once per disk")
-	cmd.Flags().BoolVar(&force, "force", false, "vm.move_unresolved only: in a forked history, keep the source --accept names although the copy was modified after it (audited)")
+	cmd.Flags().BoolVar(&force, "force", false, "vm.move_unresolved only: in a forked history, keep the file --accept names although the other file was modified after it (audited)")
 	return cmd
 }
 

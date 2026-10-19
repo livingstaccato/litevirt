@@ -1665,6 +1665,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				}
 				return "shared disk released", status.Error(codes.FailedPrecondition, gerr.Error())
 			}
+			if eerr := health.NoteStartEvent(ctx, s.db, s.hostName, targetName); eerr != nil {
+				slog.Warn("promote: recording the start event failed", "vm", targetName, "error", eerr)
+			}
 			startErr := s.virt.StartDomain(targetName)
 			releaseGuard()
 			if err := startErr; err != nil {

@@ -107,7 +107,7 @@ lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH
                                    #   host, or once that host is proven powered off; --accept picks the file
                                    #   to keep of one disk (repeat per disk; required for a move with no pivot
                                    #   recorded, unless the holder owns the VM and its config and record name
-                                   #   the source); --force keeps a forked history's source although the copy
+                                   #   the source); --force keeps a forked history's file although the other
                                    #   was modified after it
 ```
 
@@ -1512,8 +1512,8 @@ lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E] [--accept PATH
                                              #   changed hands since the move began (a forked
                                              #   history, on the owner): a record, and a shut-off
                                              #   domain's config, on the copy are pointed at the
-                                             #   source; refused while the copy was modified
-                                             #   later, unless --force.
+                                             #   source; refused while the file not kept was
+                                             #   modified later, unless --force.
                                              #   `lv health` lists the moves first (docs/diagnostics.md).
 lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since <time>] [--until <time>]   # Audit log (default 50 entries)
 lv host stats <host>                         # Host resource statistics

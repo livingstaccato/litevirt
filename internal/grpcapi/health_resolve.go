@@ -574,6 +574,27 @@ func (s *Server) planMoveHandResolve(ctx context.Context, vm, holder string, ev 
 			keep = a
 		}
 		path, proven := health.MoveCompleteFile(m)
+		if active {
+			// The running guest writes the file it has open, whatever the
+			// persistent config and the row name: only that file is kept
+			// while it runs.
+			live, lerr := s.virt.DumpXML(vm)
+			lname := ""
+			if lerr == nil {
+				lname, lerr = health.MovedDiskNames(live, m)
+			}
+			if lerr != nil {
+				return nil, nil, nil, status.Errorf(codes.FailedPrecondition,
+					"refusing to resolve %s on vm/%s: its domain is active on %s, and the file its running disk %s has open "+
+						"cannot be read (%v). Stop it first (`lv stop %s`) and retry", health.MoveUnresolvedCode, vm, here, m.Disk, lerr, vm)
+			}
+			if lname != keep {
+				return nil, nil, nil, status.Errorf(codes.FailedPrecondition,
+					"refusing to resolve %s on vm/%s: its domain is active on %s and the running guest has %s open for disk "+
+						"%s, not %s, which this would keep. Stop it first (`lv stop %s`) and retry, or pass --accept %s",
+					health.MoveUnresolvedCode, vm, here, lname, m.Disk, keep, vm, lname)
+			}
+		}
 		rewrite := false
 		if proven && path != "" && keep != path {
 			f, rw, ferr := forkedHistory(ctx, s.db, here, owner, holder, rec, m, row.Path, keep, path, accepted, config, noDomain, active, force, xml)
@@ -607,6 +628,25 @@ func (s *Server) planMoveHandResolve(ctx context.Context, vm, holder string, ev 
 			if keep == row.Path {
 				continue
 			}
+		}
+		if proven && path == m.Dst && keep == m.Dst && health.OwnerChangedSince(rec, m) && health.ModifiedLater(m.Src, m.Dst) {
+			// A forked history the other way: the source was written after
+			// the holder's last write to the copy, so the VM ran on it since
+			// it changed hands, and keeping the copy discards those writes.
+			facts := health.MoveFileFacts(m.Src) + "; " + health.MoveFileFacts(m.Dst)
+			if !force {
+				return nil, nil, nil, status.Errorf(codes.FailedPrecondition,
+					"refusing to resolve %s on vm/%s keeping %s: %s was modified after it (%s), and the VM changed hands "+
+						"since %s pivoted the guest onto %s, so it may have run on %s since, and keeping %s discards those "+
+						"writes. Check whether it did (%s); keep %s with `--accept %s` on the VM's owner %s, or, to keep %s "+
+						"all the same, pass --accept %s --force with --reason saying why",
+					health.MoveUnresolvedCode, vm, keep, m.Src, facts, holder, m.Dst, m.Src, keep,
+					health.MoveStartsText(ctx, s.db, m), m.Src, m.Src, owner, keep, keep)
+			}
+			forks = append(forks, fmt.Sprintf("disk %s keeps %s, taken with --force although %s was modified after it "+
+				"and the VM changed hands since the move began (owner %s at generation %d then, %s at %d now): what was "+
+				"written to %s since is discarded, and the file is kept on disk (%s)", m.Disk, keep, m.Src, m.Owner,
+				m.OwnerEpoch, rec.HostName, rec.OwnerEpoch, m.Src, facts))
 		}
 		if active && keep != row.Path {
 			return nil, nil, nil, status.Errorf(codes.FailedPrecondition,

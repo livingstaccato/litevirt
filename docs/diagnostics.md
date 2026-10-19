@@ -1826,16 +1826,24 @@ it):
 - `--accept <copy>` keeps the holding host's writes and discards every write
   made on the source since the failover. With the owner's domain defined it
   needs the domain stopped (`lv stop`) and its persistent config pointed at
-  the copy, as any other `--accept` of the copy on the owner.
+  the copy, as any other `--accept` of the copy on the owner. Once the VM
+  changed hands it is refused while the source was modified after the copy,
+  unless `--force` is given, with the reason audited.
+
+With the domain running, only the file the running guest has open is kept,
+whatever its persistent config and the disk record name.
 
 The refusal prints both files' sizes and modification times (a source
 modified after the copy was written since the failover) and the starts of the
-VM recorded since the move began. Each start of a VM leaves a replicated
-`vm.starting` event naming the host and the ownership generation, which `lv
-events <vm>` lists; `lv audit ls --target <vm>` lists its failover
-reschedules (action `failover`). A start whose event has not reached the host,
-or by a build that records none, is not listed, so no start listed proves
-nothing. Each host also keeps a record of the ownership generation it last
+VM recorded since the move began. A start through `lv start`, an HA restart
+or failover, the reconciler, a health check's restart, a replacement's restart
+or a promotion leaves a replicated `vm.starting` event naming the host and the
+ownership generation, which `lv events <vm>` lists; `lv audit ls --target
+<vm>` lists its failover reschedules (action `failover`). The list may be
+incomplete either way: an event stamped by a host whose clock runs behind,
+one pruned with the VM's old events or beyond the newest 1000, one that has
+not reached the host, and a start by a build that records none are not
+listed. Each host also keeps a record of the ownership generation it last
 started a VM at, under `move-started` in its data directory, and the refusal
 names a start there since the move began.
 

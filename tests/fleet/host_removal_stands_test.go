@@ -253,3 +253,158 @@ func TestFleet_ARemovedHostOfAnOlderBuild(t *testing.T) {
 		}
 	})
 }
+
+// The race on a counted admission (incarnation 1): over the WAL alone, before
+// any anti-entropy, the removal stands on every node (review V1).
+//
+// Red on 8932d0b39 (node-1 and node-2 skip the removal as older); mutation:
+// hostRemovalEndsLocalAdmission always false turns it red.
+func TestFleet_ACountedAdmissionsRemovalStandsOverTheWAL(t *testing.T) {
+	ctx := context.Background()
+	counted := func(c *Cluster) {
+		n0 := c.Nodes[0]
+		if err := corrosion.DeleteHost(ctx, n0.DB, removedHost); err != nil {
+			t.Fatal(err)
+		}
+		c.WaitConverged(t, convergeTimeout)
+		if _, _, err := corrosion.AdmitHostV2(ctx, n0.DB, corrosion.HostRecord{Name: removedHost,
+			Address: "10.0.0.9", SSHUser: "root", CertSerial: "s1b", State: "active"},
+			capabilities.GrantForTest(t, capabilities.FeatureHostIncarnation)); err != nil {
+			t.Fatal(err)
+		}
+		c.WaitConverged(t, convergeTimeout)
+		for _, n := range c.Nodes {
+			if inc, _, _, del, found, err := corrosion.HostIncarnationOf(ctx, n.DB, removedHost); err != nil || !found || del || inc != 1 {
+				t.Fatalf("fixture: %s holds inc=%d del=%v found=%v err=%v", n.Name, inc, del, found, err)
+			}
+		}
+	}
+	c := removalRace(t, false, counted)
+	assertRemoved(t, c, "counted, over the WAL")
+	hostAntiEntropyRound(t, c)
+	assertRemoved(t, c, "counted, after anti-entropy")
+	c.WaitConverged(t, convergeTimeout)
+}
+
+// Rolling upgrade (review P1, I1): wl was admitted by THIS build (InsertHost writes a
+// fixed-width created_at), removed, and re-added by a v1.9.0 node, whose
+// AdmitHost keeps created_at and changes only the serial. node-2 (this build)
+// missed the re-add's WAL entry and holds the removal. Anti-entropy must take
+// the re-add, never the old removal.
+//
+// Red on 3c268d2c7, where sameLegacyAdmission took one fixed-width stamp for
+// one admission whatever the serial, so the old tombstone won on every node.
+// Mutation: sameLegacyAdmission accepting a stamped created_at without the
+// serial turns it red.
+func TestFleet_AV190ReaddOverAStampedRowIsNotUndone(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 5537})
+	for _, n := range c.Nodes {
+		splitMembership(t, n)
+	}
+	if err := corrosion.InsertHost(ctx, c.Nodes[0].DB, corrosion.HostRecord{
+		Name: removedHost, Address: "10.0.0.9", SSHUser: "root", CertSerial: "s1", State: "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	c.Isolate(c.Nodes[0])
+	c.Isolate(c.Nodes[1])
+	c.Isolate(c.Nodes[2])
+	const removedAt, readdedAt = "2026-02-01T00:00:00.000000000Z", "2026-02-02T00:00:00.000000000Z"
+	if _, err := c.Nodes[2].DB.DB().Exec(`UPDATE hosts SET deleted_at = ?, updated_at = ? WHERE name = ?`,
+		removedAt, removedAt, removedHost); err != nil {
+		t.Fatal(err)
+	}
+	// v1.9.0's re-admission: serial and clock change, created_at is kept.
+	for _, n := range c.Nodes[:2] {
+		if _, err := n.DB.DB().Exec(`UPDATE hosts SET cert_serial = 's2', deleted_at = NULL, updated_at = ? WHERE name = ?`,
+			readdedAt, removedHost); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hostAntiEntropyRound(t, c)
+	for _, n := range c.Nodes {
+		got, err := corrosion.GetHost(ctx, n.DB, removedHost)
+		if err != nil || got == nil || got.CertSerial != "s2" {
+			t.Errorf("%s: GetHost(%s) = %+v (err %v), want the re-added host with s2", n.Name, removedHost, got, err)
+		}
+	}
+}
+
+// wl's row carries an older build's whole-second created_at (any host v1.9.0
+// inserted and nobody re-admitted since). Once host_membership_split_v1 has
+// latched, the removal stands over the WAL too, before any anti-entropy: no
+// node lists wl, which is what checkAllPeers and recoverHosts read (review P2,
+// M1).
+//
+// Red on 8932d0b39 and on 3c268d2c7, which left whole-second rows to
+// anti-entropy; mutation: the WAL rule refusing a whole-second created_at
+// turns it red on node-1 and node-2.
+func TestFleet_AnOlderBuildsRowStaysRemovedOverTheWAL(t *testing.T) {
+	const legacyCreated = "2026-01-01T00:00:00Z"
+	c := removalRace(t, false, func(c *Cluster) {
+		for _, n := range c.Nodes {
+			if _, err := n.DB.DB().Exec(`UPDATE hosts SET created_at = ? WHERE name = ?`, legacyCreated, removedHost); err != nil {
+				t.Fatal(err)
+			}
+		}
+		c.WaitConverged(t, convergeTimeout)
+	})
+	assertRemoved(t, c, "older build's row, over the WAL")
+}
+
+// wl is removed twice, by node-2 while partitioned and then by
+// node-0, and node-0 re-adds it with the legacy AdmitHost (incarnation 0, a
+// new stamp). node-1 applies node-0's removal and re-add first, and node-2's
+// earlier removal only after. That removal predates the re-add's stamp and
+// must not end it, over the WAL or after anti-entropy (review V2, M2).
+//
+// A guard: green on 8932d0b39. Mutation: the WAL rule without its "removal
+// made after created_at" check turns it red on every node.
+func TestFleet_AnEarlierSecondRemovalDoesNotEndALegacyReadd(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 5538})
+	for _, n := range c.Nodes {
+		splitMembership(t, n)
+	}
+	n0, n1, n2 := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	if err := corrosion.InsertHost(ctx, n0.DB, corrosion.HostRecord{
+		Name: removedHost, Address: "10.0.0.9", SSHUser: "root", CertSerial: "s1", State: "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	c.Isolate(n2)
+	if err := corrosion.DeleteHost(ctx, n2.DB, removedHost); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := corrosion.DeleteHost(ctx, n0.DB, removedHost); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.AdmitHost(ctx, n0.DB, corrosion.HostRecord{Name: removedHost, Address: "10.0.0.9",
+		SSHUser: "root", CertSerial: "s2", State: corrosion.HostStateJoining}); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, convergeTimeout, n1.Name+" to apply the re-add", func() bool {
+		h, _ := corrosion.GetHost(ctx, n1.DB, removedHost)
+		return h != nil && h.CertSerial == "s2"
+	})
+	c.ClearLinkFaults()
+	eventually(t, convergeTimeout, "the WAL to drain", func() bool {
+		n, err := undelivered(c.Nodes)
+		return err == nil && n == 0
+	})
+	check := func(when string) {
+		for _, n := range c.Nodes {
+			got, err := corrosion.GetHost(ctx, n.DB, removedHost)
+			if err != nil || got == nil || got.CertSerial != "s2" {
+				t.Errorf("%s, %s: GetHost(%s) = %+v (err %v), want the re-added host with s2", when, n.Name, removedHost, got, err)
+			}
+		}
+	}
+	check("over the WAL")
+	hostAntiEntropyRound(t, c)
+	check("after anti-entropy")
+}

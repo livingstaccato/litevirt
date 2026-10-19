@@ -24,11 +24,14 @@ import (
 // re-reconciles immediately so `lv firewall …` changes are visible at once;
 // every other host picks them up on its own 30s reconcile tick.
 
+// toPbFirewallRule is a stored rule as the API shows it: a logged rule's
+// plain verdict and log, never the stored suffix (spec m-13).
 func toPbFirewallRule(r corrosion.FirewallRule) *pb.FirewallRule {
+	action, logged := corrosion.SplitLoggedAction(r.Action)
 	return &pb.FirewallRule{
 		Id: r.ID, HostName: r.HostName, Direction: r.Direction, Proto: r.Proto,
-		Port: r.PortRange, Cidr: r.CIDR, Action: r.Action, Priority: int32(r.Priority),
-		Comment: r.Comment, StackName: r.StackName,
+		Port: r.PortRange, Cidr: r.CIDR, Action: action, Priority: int32(r.Priority),
+		Comment: r.Comment, StackName: r.StackName, Log: logged,
 	}
 }
 
@@ -118,6 +121,18 @@ func ruleRowFeatures(direction, proto, port, cidr, action, comment string) ([]ca
 		return nil, err
 	}
 	return corrosion.FirewallRowFeatures(cidr, proto, action)
+}
+
+// logRow is a client rule's stored action and release features once its log
+// field is applied: a rule asked to log (log=true) is stored with the
+// server's suffix (corrosion.LoggedAction) and needs firewall_log. It is
+// applied only to a rule ruleRowFeatures took, which refused a client's own
+// "+" suffix.
+func logRow(action string, log bool, need []capabilities.Feature, invalid error) (string, []capabilities.Feature) {
+	if !log || invalid != nil {
+		return action, need
+	}
+	return corrosion.LoggedAction(action), append(slices.Clone(need), capabilities.FeatureFirewallLog)
 }
 
 // ipSetRowFeatures is ruleRowFeatures for an ip set: the grammar, then
@@ -247,6 +262,7 @@ func (s *Server) CreateClusterFirewallRule(ctx context.Context, req *pb.CreateCl
 	}
 	row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
 	need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, row.Comment)
+	row.Action, need = logRow(row.Action, r.Log, need, invalid)
 	if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
 		if err := s.refuseUnknownTagGroup(ctx, row.CIDR); err != nil {
 			return err
@@ -307,6 +323,7 @@ func (s *Server) CreateHostFirewallRule(ctx context.Context, req *pb.CreateHostF
 	}
 	row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
 	need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, row.Comment)
+	row.Action, need = logRow(row.Action, r.Log, need, invalid)
 	if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
 		if err := s.refuseUnknownTagGroup(ctx, row.CIDR); err != nil {
 			return err
@@ -411,9 +428,9 @@ func (s *Server) SetFirewallDefault(ctx context.Context, req *pb.SetFirewallDefa
 	if err := RequireRole(ctx, "operator"); err != nil {
 		return nil, err
 	}
-	scope := req.Scope
-	if scope == "" {
-		scope = "cluster"
+	scope, err := s.defaultDenyScope(ctx, req.GetScope())
+	if err != nil {
+		return nil, err
 	}
 	before := defaultState(corrosion.GetFirewallDefault(ctx, s.db, scope))
 	if err := corrosion.SetFirewallDefault(ctx, s.db, scope, req.DefaultDeny, ""); err != nil {
@@ -422,6 +439,33 @@ func (s *Server) SetFirewallDefault(ctx context.Context, req *pb.SetFirewallDefa
 	s.audit(ctx, "firewall.default-deny", scope, corrosion.AuditChange(before, verdictOf(req.DefaultDeny)), "ok")
 	s.reconcileLocal(ctx)
 	return &emptypb.Empty{}, nil
+}
+
+// defaultDenyScope is the firewall_defaults scope of a default-deny request:
+// "" is the cluster ("cluster"), and any other scope a host this replica
+// knows, as for `lv firewall synflood --scope`. "cluster" still means the
+// cluster (the web UI and older clients send it) until a host has that name: the
+// two then share one key, and the scope is refused rather than guessed.
+func (s *Server) defaultDenyScope(ctx context.Context, scope string) (string, error) {
+	if scope == "" {
+		return "cluster", nil
+	}
+	h, err := corrosion.GetHost(ctx, s.db, scope)
+	if err != nil {
+		return "", status.Errorf(codes.Unavailable, "look up host %s: %v", scope, err)
+	}
+	switch {
+	case scope == "cluster" && h != nil:
+		return "", status.Error(codes.FailedPrecondition,
+			"a host is named cluster, and default-deny cannot tell its policy from the cluster's: "+
+				"leave out --scope for the cluster-wide policy; host cluster cannot have its own")
+	case scope == "cluster":
+		return "cluster", nil
+	case h == nil:
+		return "", status.Errorf(codes.NotFound,
+			"no host named %q has joined, as this node sees it: --scope takes a host (lv host ls); leave it out for the cluster-wide policy", scope)
+	}
+	return scope, nil
 }
 
 func (s *Server) ListFirewallDefaults(ctx context.Context, _ *pb.ListFirewallDefaultsRequest) (*pb.ListFirewallDefaultsResponse, error) {

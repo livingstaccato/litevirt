@@ -1536,11 +1536,36 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// that cannot load it renders the guards only and raises a health
 	// condition (firewall.nic.unavailable), never an empty firewall.
 	bridgeCT := firewall.BridgeConntrackAvailable(ctx, true)
+	// Firewall logging needs the kernel to load a named limit and a log line
+	// to an NFLOG group. Probed once here (nft -c, nothing committed); a host
+	// that refuses renders no log line and raises firewall.log.unavailable.
+	fwLogGroup := uint16(d.cfg.Firewall.LogGroup)
+	fwLogErr := firewall.ProbeLogging(ctx, fwLogGroup)
+	if fwLogErr != nil {
+		slog.Warn("firewall: logging is unavailable on this host; no packet is logged here", "error", fwLogErr)
+	}
+	svc.RecordFirewallLogAvailability(ctx, fwLogErr)
+	// Log lines are rendered only while this daemon's listener holds the
+	// group (firewallLogging); each bind change runs passes. The listener
+	// starts below, once d.fwReconciler exists.
+	fwLogging := newFirewallLogging(ctx, fwLogGroup, fwLogErr,
+		func(c context.Context) error { return d.fwReconciler.Reconcile(c) },
+		func(err error) { svc.RecordFirewallLogListener(ctx, err) })
+	// SYN-flood protection needs the kernel's per-source meters (nft_limit).
+	// Probed once here, check only; a host whose kernel refuses renders none
+	// and raises a health condition (firewall.synflood.unavailable).
+	synFloodProbe := firewall.ProbeSynFlood(ctx)
+	if synFloodProbe.V4 != nil || synFloodProbe.V6 != nil {
+		slog.Warn("firewall: the kernel refused a SYN-flood probe; that family gets no SYN-flood protection on guest NICs here",
+			"ipv4", synFloodProbe.V4, "ipv6", synFloodProbe.V6)
+	}
 	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{},
 		firewall.LoaderOptions{RunningTaps: d.virt.RunningDomainTaps, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs,
 			OnTagGroupMembers:    fwMetrics.SetTagGroupMembers,
 			OnDuplicateAddresses: firewall.NewDuplicateAddressReporter(d.db, d.cfg.HostName).Report,
-			BridgeConntrack:      func() bool { return bridgeCT }, Arming: fwArming})
+			BridgeConntrack:      func() bool { return bridgeCT }, Arming: fwArming,
+			Logging:       fwLogging.Logging,
+			SynFloodProbe: func() firewall.SynFloodProbeResult { return synFloodProbe }})
 	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
 	d.fwReconciler.SetArming(fwArming)
 	// Every domain start — an API start, a restart policy, a failover
@@ -1549,6 +1574,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// started (re-review I-10).
 	d.virt.SetStartGuard(svc.NICStartGuard(ctx))
 	d.fwReconciler.SetStateHook(svc.RecordFirewallState)
+	// Firewall logging: the listener reads the NFLOG group every rendered log
+	// line sends to into a bounded store (docs/firewall.md, "Logging").
+	fwLogStore := openFirewallLogStore(d.cfg, fwMetrics)
+	svc.SetFirewallLogStore(fwLogStore)
+	if fwLogErr == nil {
+		go (&firewall.LogListener{Group: fwLogGroup, Store: fwLogStore,
+			Resolve: d.fwReconciler.ResolveLogDevice,
+			OnBind:  fwLogging.OnBind}).Run(ctx)
+	}
+	go pruneFirewallLog(ctx, fwLogStore)
 	// Whether this host enforces NIC guards, after every pass, the boot pass
 	// included (re-review m8, m2, m5): the label carries this build's
 	// version while the last pass put the per-NIC table in force, so a host
@@ -1735,6 +1770,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// dnsmasq's host reservations in step with the NICs guarded on its
 	// networks.
 	go svc.SeedFirewallEnforcementLoop(ctx, 0, filepath.Join(d.cfg.DataDir, firewallInitialModeName))
+	go svc.SeedFirewallSynfloodLoop(ctx, 0, filepath.Join(d.cfg.DataDir, firewallSynfloodDecisionName))
 	svc.StartDHCPReservations(ctx, 0)
 
 	// Converge this host's network devices on the replicated networks table
@@ -2217,6 +2253,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 			svc.FinishDrainRecords(grpcapi.DrainRecordStopWait)
 		})
 		if d.fwReconciler != nil {
+			// No log line outlives the listener: once this process exits,
+			// another program could take the group.
+			stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			fwLogging.Stop(stopCtx)
+			cancel()
 			d.fwReconciler.Stop()
 		}
 		if d.snapScheduler != nil {
@@ -3075,6 +3116,11 @@ const genesisMarkerName = "genesis-pending"
 // (grpcapi.SeedFirewallEnforcementLoop).
 const firewallInitialModeName = "firewall-initial-mode"
 
+// firewallSynfloodDecisionName is the founder's genesis decision to protect
+// guest NICs from SYN floods, in data_dir, consumed once recorded
+// (grpcapi.SeedFirewallSynfloodLoop).
+const firewallSynfloodDecisionName = "firewall-synflood-decision"
+
 // wireActivationMarker points the health checker at this node's durable
 // capability latches (health.ActivationMarkerBase), loading any already there.
 // They are written only after a daemon has run as a member and survive a
@@ -3210,6 +3256,13 @@ func (d *Daemon) seedAdminUser(ctx context.Context) error {
 	if err := os.WriteFile(filepath.Join(d.cfg.DataDir, firewallInitialModeName),
 		[]byte(corrosion.FirewallEnforce+"\n"), 0o600); err != nil {
 		slog.Warn("could not record the new cluster's initial firewall mode; it observes until `lv firewall enforce on`",
+			"error", err)
+	}
+	// And that it protects guest NICs from SYN floods (spec §1.4): its own
+	// decision, recorded by its own loop once the release latch forms.
+	if err := os.WriteFile(filepath.Join(d.cfg.DataDir, firewallSynfloodDecisionName),
+		[]byte(corrosion.SynfloodOn+"\n"), 0o600); err != nil {
+		slog.Warn("could not record the new cluster's SYN-flood protection; it stays off until `lv firewall synflood on`",
 			"error", err)
 	}
 

@@ -84,3 +84,34 @@ func TestFirewallMetrics_TagGroupMembersReplacesEachPass(t *testing.T) {
 		t.Fatalf("after db was removed: %v, want only web=2", got)
 	}
 }
+
+// C4a (L-5): log records are counted by outcome, and every outcome's series
+// exists from the start, so a rate alert has a zero to compare with.
+//
+// Mutation: count every outcome as kept — red.
+func TestFirewallMetrics_LogRecordsByOutcome(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := newFirewallMetrics(reg)
+	m.LogRecords("kept", 3)
+	m.LogRecords("rate_limited", 2)
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]float64{}
+	for _, mf := range mfs {
+		if mf.GetName() != "litevirt_firewall_log_records_total" {
+			continue
+		}
+		for _, s := range mf.GetMetric() {
+			for _, l := range s.GetLabel() {
+				if l.GetName() == "outcome" {
+					got[l.GetValue()] = s.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	if len(got) != 3 || got["kept"] != 3 || got["rate_limited"] != 2 || got["overflow"] != 0 {
+		t.Errorf("series = %v, want kept=3 rate_limited=2 overflow=0", got)
+	}
+}

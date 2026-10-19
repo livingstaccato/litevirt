@@ -332,6 +332,12 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 	if err := opts.Validate(); err != nil {
 		return nil, err
 	}
+	// The name becomes <lxcpath>/<name>, which a failed create removes: it
+	// must be a container name, whatever the caller (a relocation recreate
+	// from a legacy row among them) checked.
+	if err := safename.ValidateContainerName(opts.Name); err != nil {
+		return nil, err
+	}
 	if opts.PidsMax == 0 {
 		opts.PidsMax = r.DefaultPidsMax
 	}
@@ -667,6 +673,9 @@ func (r *LxcRunner) Stop(ctx context.Context, name string, timeoutSec int) error
 // running. Without -f, lxc-destroy refuses a running container ("<name> is
 // running"), so `lv ct rm` and `compose down` of a running container would fail.
 func (r *LxcRunner) Delete(ctx context.Context, name string) error {
+	if err := safename.ValidateContainerName(name); err != nil {
+		return err
+	}
 	if _, stderr, err := r.run(ctx, "lxc-destroy", "-f", "-n", name); err != nil {
 		// Only classify as not-found when the container is ACTUALLY gone on disk
 		// (its config is absent). A broad stderr match would mask a real failure —
@@ -1135,6 +1144,11 @@ func (r *LxcRunner) TakeDroppedAttrs(name string) ([]string, error) {
 // Container clones are always full copies (no qcow2 backing), so there's no
 // linked-clone dependency to track.
 func (r *LxcRunner) CloneContainer(ctx context.Context, src, dst string) error {
+	for _, n := range []string{src, dst} {
+		if err := safename.ValidateContainerName(n); err != nil {
+			return err
+		}
+	}
 	srcDir := filepath.Join(r.lxcpath(), src)
 	dstDir := filepath.Join(r.lxcpath(), dst)
 	if _, err := os.Stat(srcDir); err != nil {

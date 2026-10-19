@@ -405,3 +405,55 @@ func TestRootfsReferences_ALiteralPathUnderTheItem(t *testing.T) {
 		t.Fatalf("RootfsReferences = %v (%v), want [old]", got, err)
 	}
 }
+
+// A pull first finishes what a crash left of an earlier replacing pull of
+// the same item, wherever the item is (outside the library too, which the
+// start-up recovery does not read): an old bundle whose item is missing is
+// put back; one whose item is there is removed, with any staged unpack.
+func TestPullOCI_RecoversTheItemsOwnLeftovers(t *testing.T) {
+	fakeOCITools(t, false)
+	ctx := context.Background()
+	mk := func(dir, image string) {
+		if err := os.MkdirAll(filepath.Join(dir, "rootfs", "etc"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "rootfs", "etc", "image"), []byte(image), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte("{}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Crash between the renames: the item is missing.
+	parent := t.TempDir()
+	dest := filepath.Join(parent, "web")
+	mk(filepath.Join(parent, unpackDirName, "web+1+old"), "old")
+	mk(filepath.Join(parent, unpackDirName, "web+1"), "new-half")
+	if err := PullOCI(ctx, PullOCIOptions{Image: "alpine:3.22", Dest: dest}); !errors.Is(err, ErrOCIItemExists) {
+		t.Fatalf("a pull over the restored item without Replace: %v, want ErrOCIItemExists", err)
+	}
+	if got := imageIn(t, dest); got != "old" {
+		t.Fatalf("the item holds %q, want the old bundle put back", got)
+	}
+	if ents, _ := os.ReadDir(filepath.Join(parent, unpackDirName)); len(ents) != 0 {
+		t.Errorf("leftovers remain: %v", ents)
+	}
+	// Crash after the swap: the item is there, the old bundle was not removed.
+	parent = t.TempDir()
+	dest = filepath.Join(parent, "web")
+	mk(dest, "new")
+	mk(filepath.Join(parent, unpackDirName, "web+2+old"), "old")
+	mk(filepath.Join(parent, unpackDirName, "webx+3+old"), "another item's")
+	if err := PullOCI(ctx, PullOCIOptions{Image: "alpine:3.22", Dest: dest}); !errors.Is(err, ErrOCIItemExists) {
+		t.Fatalf("%v, want ErrOCIItemExists", err)
+	}
+	if got := imageIn(t, dest); got != "new" {
+		t.Fatalf("the item holds %q, want the swapped-in bundle kept", got)
+	}
+	if _, err := os.Stat(filepath.Join(parent, unpackDirName, "web+2+old")); err == nil {
+		t.Error("the finished swap's old bundle was not removed")
+	}
+	if _, err := os.Stat(filepath.Join(parent, unpackDirName, "webx+3+old")); err != nil {
+		t.Error("another item's leftover was touched")
+	}
+}

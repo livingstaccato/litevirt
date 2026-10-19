@@ -76,6 +76,9 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) error {
 	}
 	unlock := LockOCIItem(opts.Dest)
 	defer unlock()
+	if err := recoverItem(opts.Dest); err != nil {
+		return fmt.Errorf("oci: finish an interrupted pull of %s first: %w", opts.Dest, err)
+	}
 	exists, err := IsBundle(opts.Dest)
 	if err != nil {
 		return err

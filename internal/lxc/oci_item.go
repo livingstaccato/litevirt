@@ -27,9 +27,12 @@ const ImageGenFile = ".litevirt-image-gen"
 
 // unpackDirName is the directory in the item's parent where a replacing pull
 // stages: "<item>+<random>" for the new bundle, and that name plus oldPlus
-// for the old one while the two are swapped (replaceBundle). "+" is outside
-// every item name's charset (safename), so nothing in or named like this
-// directory is ever an item, and RecoverOCILibrary touches nothing else.
+// for the old one while the two are swapped (replaceBundle). A pull refuses
+// an item name with "+" (safename's charset has none, and PullOCI checks an
+// absolute dest too), so nothing in or named like this directory is a new
+// item; an item an earlier build let an Admin name with "+" is still
+// recovered by its name (stagedItem, safeItemName). RecoverOCILibrary and
+// recoverItem touch nothing else.
 const (
 	unpackDirName = ".litevirt+unpack"
 	oldPlus       = "+old"
@@ -124,12 +127,26 @@ func replaceBundle(stage, dest string) error {
 }
 
 // RecoverOCILibrary finishes, at daemon start, what a crash left of a
-// replacing pull in the OCI library lib (its unpackDirName): an old bundle
-// set aside whose item is missing goes back in its place (the swap never
-// finished), one whose item is there is removed (it finished), and an
-// unpack directory is removed. Nothing outside unpackDirName is touched.
+// replacing pull in the OCI library lib (its unpackDirName), item by item
+// (recoverStaged). Nothing outside unpackDirName is touched.
 func RecoverOCILibrary(lib string) error {
-	dir := filepath.Join(lib, unpackDirName)
+	return recoverStaged(filepath.Join(lib, unpackDirName), lib, "")
+}
+
+// recoverItem finishes, under dest's item lock, what a crash left of an
+// earlier replacing pull of dest: PullOCI runs it first, so an item outside
+// the library, which the start-up recovery does not read, is recovered too.
+func recoverItem(dest string) error {
+	return recoverStaged(filepath.Join(filepath.Dir(dest), unpackDirName), filepath.Dir(dest), filepath.Base(dest))
+}
+
+// recoverStaged recovers the entries of the staging directory dir whose
+// items live in parent, only item's when item is not "": an old bundle set
+// aside whose item is missing goes back in its place (the swap never
+// finished); one whose item is there is removed (it finished); a staged
+// unpack is removed. When several old bundles of one missing item remain,
+// the first in name order goes back and the rest are removed.
+func recoverStaged(dir, parent, item string) error {
 	ents, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -140,12 +157,15 @@ func RecoverOCILibrary(lib string) error {
 	var errs []error
 	for _, e := range ents {
 		n := e.Name()
+		it := stagedItem(n)
+		if item != "" && it != item {
+			continue
+		}
 		p := filepath.Join(dir, n)
-		item := stagedItem(n)
-		if strings.HasSuffix(n, oldPlus) && item != "" && safeItemName(item) {
-			if _, serr := os.Lstat(filepath.Join(lib, item)); errors.Is(serr, os.ErrNotExist) {
-				slog.Warn("oci library: a replacing pull was interrupted; putting the old image back", "item", item)
-				if rerr := os.Rename(p, filepath.Join(lib, item)); rerr != nil {
+		if strings.HasSuffix(n, oldPlus) && it != "" && safeItemName(it) {
+			if _, serr := os.Lstat(filepath.Join(parent, it)); errors.Is(serr, os.ErrNotExist) {
+				slog.Warn("oci library: a replacing pull was interrupted; putting the old image back", "item", it)
+				if rerr := os.Rename(p, filepath.Join(parent, it)); rerr != nil {
 					errs = append(errs, rerr)
 				}
 				continue
@@ -192,7 +212,9 @@ func (r *LxcRunner) RootfsReferences(dir string) ([]string, error) {
 	}
 	var out []string
 	for _, e := range ents {
-		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+		// Only the fetch stage is not a container: earlier releases allowed
+		// container names starting with ".", and one may use an item in place.
+		if !e.IsDir() || e.Name() == fetchDirName {
 			continue
 		}
 		cfg := filepath.Join(r.lxcpath(), e.Name(), "config")
@@ -209,12 +231,27 @@ func (r *LxcRunner) RootfsReferences(dir string) ([]string, error) {
 		if ref == "" {
 			continue
 		}
-		rref := canonPath(ref)
-		if under(ref, lit) || under(ref, res) || under(rref, lit) || under(rref, res) {
+		if refsItem(ref, lit, res, under) {
 			out = append(out, e.Name())
 		}
 	}
 	return out, nil
+}
+
+// refsItem reports whether ref runs from the item's tree: ref, or any of
+// its ancestors, literal or resolved, is under the literal or resolved item
+// path. The ancestors catch a path that reaches the item through an alias
+// and leaves it again through a link inside the image.
+func refsItem(ref, lit, res string, under func(p, d string) bool) bool {
+	for p := ref; ; p = filepath.Dir(p) {
+		rp := canonPath(p)
+		if under(p, lit) || under(p, res) || under(rp, lit) || under(rp, res) {
+			return true
+		}
+		if filepath.Dir(p) == p {
+			return false
+		}
+	}
 }
 
 // configRootfsPath is the directory a container config's lxc.rootfs.path

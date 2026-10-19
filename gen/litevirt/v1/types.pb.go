@@ -3445,8 +3445,10 @@ type FirewallSynfloodPolicy struct {
 	Error   string `protobuf:"bytes,10,opt,name=error,proto3" json:"error,omitempty"`
 	// A host's entry only: what that host has in force, from its last
 	// firewall pass: on | observe (counted, not dropped) | guards-only (no
-	// bridge conntrack: nothing rendered) | unavailable (the kernel refused
-	// the SYN-flood rules) | off. Empty from a daemon that predates it.
+	// bridge conntrack: nothing rendered) | no-guest-nics (no per-NIC table
+	// yet) | unavailable (the kernel refused the SYN-flood rules, or the
+	// first per-NIC table) | off. A refused per-NIC table keeps the previous
+	// pass's value. Empty from a daemon that predates it.
 	InForce       string `protobuf:"bytes,11,opt,name=in_force,json=inForce,proto3" json:"in_force,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

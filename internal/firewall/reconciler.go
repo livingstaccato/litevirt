@@ -245,6 +245,17 @@ func (r *Reconciler) recordState(ctx context.Context, p Plan, applyErr error) {
 		InvalidRows: p.InvalidRows, TagGroups: p.TagGroups,
 		SynFlood: p.SynFlood, SynFloodUnavailable: p.SynFloodUnavailable, UnreadablePolicies: p.UnreadablePolicies,
 		SynFloodInForce: synFloodInForce(p)}
+	if applyErr != nil {
+		// The kernel refused the per-NIC table and kept the previous one:
+		// what that one put in force still holds; with none (a fresh boot)
+		// nothing is.
+		r.mu.Lock()
+		st.SynFloodInForce = r.state.SynFloodInForce
+		r.mu.Unlock()
+		if st.SynFloodInForce == "" {
+			st.SynFloodInForce = SynFloodInForceUnavailable
+		}
+	}
 	if len(p.NICs) > 0 {
 		st.Mode = p.nicMode()
 	}

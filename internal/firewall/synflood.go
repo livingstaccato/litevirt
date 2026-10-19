@@ -219,17 +219,21 @@ const (
 	SynFloodInForceGuardsOnly  = "guards-only"
 	SynFloodInForceUnavailable = "unavailable"
 	SynFloodInForceOff         = "off"
+	SynFloodInForceNoGuestNICs = "no-guest-nics"
 )
 
 // synFloodInForce is what a plan puts in force of SYN-flood protection: the
-// lines drop only in enforce mode; observe mode counts them; guards-only mode
-// renders none.
+// lines drop only in enforce mode; observe mode counts them; guards-only mode,
+// and a host with no guest NIC (no per-NIC table), render none.
 func synFloodInForce(p Plan) string {
 	switch {
 	case p.SynFloodUnavailable != "":
 		return SynFloodInForceUnavailable
 	case !p.SynFlood.On:
 		return SynFloodInForceOff
+	case len(p.NICs) == 0:
+		// No per-NIC table is rendered: nothing to limit yet.
+		return SynFloodInForceNoGuestNICs
 	case p.nicMode() == NICModeGuardsOnly:
 		return SynFloodInForceGuardsOnly
 	case p.nicMode() == NICModeObserve:

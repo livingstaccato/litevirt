@@ -121,3 +121,42 @@ func TestSetAsideEvidenceBoundedFor_DifferentVMsAreNotMerged(t *testing.T) {
 	close(release)
 	<-done
 }
+
+// R5 nit. Two assessments of one disk at the same time with different
+// "running on the disk" flags each get their own verdict: the bound that
+// merges concurrent calls is keyed by the owner and the flag too, so a merged
+// call never turns one caller's "pivoted" into the other's "unknown".
+//
+// Mutation "owner and flag not in the op": the second joins the first and
+// reads its verdict; red.
+func TestAssessBounded_DifferentRunningFlagsAreNotMerged(t *testing.T) {
+	disk := filepath.Join(t.TempDir(), "d")
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	defer SetAssessForTest(func(_ string, _ Owner, live bool) Assessment {
+		if !live {
+			entered <- struct{}{}
+			<-release
+			return Assessment{Verdict: Unknown}
+		}
+		return Assessment{Verdict: Pivoted}
+	})()
+	owner := Owner{VM: "web", Disk: "root"}
+	firstDone := make(chan Assessment, 1)
+	go func() { a, _ := AssessBounded(disk, owner, false); firstDone <- a }()
+	<-entered
+	second := make(chan Assessment, 1)
+	go func() { a, _ := AssessBounded(disk, owner, true); second <- a }()
+	select {
+	case a := <-second:
+		if a.Verdict != Pivoted {
+			t.Errorf("the running-on-disk assessment = %s, want %s", a.Verdict, Pivoted)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("the running-on-disk assessment waited on the other: it joined its call")
+	}
+	close(release)
+	if a := <-firstDone; a.Verdict != Unknown {
+		t.Errorf("the first assessment = %s, want %s", a.Verdict, Unknown)
+	}
+}

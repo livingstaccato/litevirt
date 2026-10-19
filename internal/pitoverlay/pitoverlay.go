@@ -846,7 +846,10 @@ func AssessAt(g Gate, disk string, owner Owner, liveOnDisk bool) Assessment {
 // overlay's header, any of which only the server may answer.
 func AssessBounded(disk string, owner Owner, liveOnDisk bool) (Assessment, error) {
 	assess := assessFn // read here: the call below may outlive its caller
-	return storage.Bounded("assess the point-in-time overlay of", disk, func() (Assessment, error) {
+	// The owner and the flag are in the op: the bound merges concurrent calls
+	// on one op and path, and the verdict depends on both.
+	op := fmt.Sprintf("assess (for %s/%s uuid %s, running on the disk %t) the point-in-time overlay of", owner.VM, owner.Disk, owner.VMUUID, liveOnDisk)
+	return storage.Bounded(op, disk, func() (Assessment, error) {
 		return assess(disk, owner, liveOnDisk), nil
 	})
 }

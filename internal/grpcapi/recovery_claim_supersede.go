@@ -438,7 +438,8 @@ func (s *Server) firmwareMoveMarkerSweep(ctx context.Context, vm, host string) f
 			continue
 		}
 		if m := markerOf(rec); m != nil && m.VM == vm && m.Target == host {
-			v := classifyFwMoveMarker(*m, "")
+			row, _ := corrosion.GetVM(ctx, s.db, vm)
+			v := classifyFwMoveMarker(*m, "", row, rec.GetHost())
 			v.source = rec.GetHost()
 			if v.kind == fwCopyUnchecked && v.why == "" {
 				v.why = fmt.Sprintf("%s holds a marker of a move to %s that is %s", rec.GetHost(), host, fwDescribe(*m))
@@ -475,7 +476,8 @@ func (s *Server) classifySourceCopy(ctx context.Context, vm, code, source, attem
 	if m == nil || attempt == "" || m.Attempt != attempt {
 		return unchecked(fmt.Sprintf("%s raised %s for attempt %s, and holds no marker of that attempt", source, code, orNone(attempt)))
 	}
-	v := classifyFwMoveMarker(*m, code)
+	row, _ := corrosion.GetVM(ctx, s.db, vm)
+	v := classifyFwMoveMarker(*m, code, row, source)
 	v.source = source
 	if v.kind == fwCopyUnchecked {
 		v.why = fmt.Sprintf("%s raised %s, and its marker is %s", source, code, fwDescribe(*m))
@@ -483,16 +485,17 @@ func (s *Server) classifySourceCopy(ctx context.Context, vm, code, source, attem
 	return v
 }
 
-// classifyFwMoveMarker sorts a source marker m (and the condition code it was
-// found by, "" for none) by what the doctor's --accept-source does with it.
-func classifyFwMoveMarker(m fwmig.Marker, code string) fwSourceCopy {
+// classifyFwMoveMarker sorts a source marker m on source (and the condition
+// code it was found by, "" for none; row is the VM's row) by what the
+// doctor's --accept-source, or the fence resolution, does with it.
+func classifyFwMoveMarker(m fwmig.Marker, code string, row *corrosion.VMRecord, source string) fwSourceCopy {
 	v := fwSourceCopy{code: code, kind: fwCopyUnchecked, tpm: m.TPM}
 	post := fwPostCommit(fwProgress(m))
 	switch {
-	case (code == "" || code == condFwmigTargetUnreachable) && m.Phase == fwmig.PhaseTargetUnreachable && !post:
-		// The commit never landed: the fence resolution returns the VM to
-		// its source once the target is proved off, removed or not
-		// (ResolveLiveFirmwareMoveByFence).
+	case (code == "" || code == condFwmigTargetUnreachable) && fenceResolves(m, row, source):
+		// The fence resolution returns the VM to its source once the target
+		// is proved off, removed or not (ResolveLiveFirmwareMoveByFence),
+		// by the same predicate.
 		v.kind, v.settles = fwCopyNone, true
 	case (code == "" || code == condFwmigCleanupFailed) && post && !m.Phase.Parked():
 		v.kind = fwCopyReturnable
@@ -595,6 +598,16 @@ func (s *Server) deadRemovalFirmwareRefusal(ctx context.Context, host string) er
 		host, len(open), strings.Join(open, "\n  "), host, note)
 }
 
+// migratingToward is the target host a migrating row's detail names
+// (migratingDetail), "" when it names none.
+func migratingToward(detail string) string {
+	h, ok := strings.CutPrefix(detail, migratingDetailPrefix)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(h)
+}
+
 // firmwareMoveCandidates are the Secure Boot / vTPM VMs that may have a live
 // firmware move to host, wherever their row is: those recorded on host,
 // those an open firmware_migration condition names with host as target, and
@@ -627,7 +640,7 @@ func (s *Server) firmwareMoveCandidates(ctx context.Context, host string) ([]cor
 		return nil, err
 	}
 	for _, vm := range all {
-		if vm.State == "migrating" && strings.Contains(vm.StateDetail, host) {
+		if vm.State == "migrating" && migratingToward(vm.StateDetail) == host {
 			names[vm.Name] = true
 		}
 	}

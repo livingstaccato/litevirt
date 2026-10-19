@@ -816,7 +816,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// Mark as migrating in state store. Recorded first, so a write that errored
 	// after landing is still restored by the abort.
 	abort.stateWritten = true
-	if err := corrosion.UpdateVMState(ctx, s.db, vm.Name, "migrating", fmt.Sprintf("→ %s", req.TargetHost)); err != nil {
+	if err := corrosion.UpdateVMState(ctx, s.db, vm.Name, "migrating", migratingDetailPrefix+req.TargetHost); err != nil {
 		s.noteStateWriteFail(corrosion.OpVMState, err)
 	}
 	// §6.1 step 5: the marker migrating, last before libvirt has the guest.
@@ -2968,6 +2968,10 @@ type migrationFinish struct {
 	// run, in place of armed.finish (spec §6.1 step 10).
 	fwLive *liveFirmwareRun
 }
+
+// migratingDetailPrefix starts a migrating row's state detail, followed by
+// the target host's name (migratingToward reads it back).
+const migratingDetailPrefix = "→ "
 
 // adoptedMigrationCeiling bounds how long an adopted migration may run before
 // it is aborted. A var so tests can shorten it.

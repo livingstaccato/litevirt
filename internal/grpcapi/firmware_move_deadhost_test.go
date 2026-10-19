@@ -402,3 +402,65 @@ func TestDeadRemovalFirmwareRefusal_SilentHostNote(t *testing.T) {
 	requireText(t, errText(err), []string{"third-host did not answer", "every firmware VM", "up to 10s",
 		"lv host rm --dead --force dst-host"}, nil)
 }
+
+// D2 re-review of d7bc5c868, M-12: a row migrating toward another host whose
+// name merely contains the removed host's ("dst-host-2" for "dst-host") is
+// no candidate; one migrating toward the host is.
+//
+// Mutation: match the detail by substring — the dst-host-2 move is refused,
+// red.
+func TestFirmwareMoveCandidates_ExactHost(t *testing.T) {
+	r := newFwdRig(t, fwlOpts{})
+	ctx := context.Background()
+	if err := corrosion.UpdateVMState(ctx, r.src.db, fwlVM, "migrating", "→ dst-host-2"); err != nil {
+		t.Fatal(err)
+	}
+	cands, err := r.src.firmwareMoveCandidates(ctx, "dst-host")
+	if err != nil || len(cands) != 0 {
+		t.Fatalf("candidates for dst-host with a move to dst-host-2: %v %v, want none", cands, err)
+	}
+	if err := corrosion.UpdateVMState(ctx, r.src.db, fwlVM, "migrating", "→ dst-host"); err != nil {
+		t.Fatal(err)
+	}
+	cands, err = r.src.firmwareMoveCandidates(ctx, "dst-host")
+	if err != nil || len(cands) != 1 {
+		t.Fatalf("candidates for dst-host with a move to it: %v %v, want os1", cands, err)
+	}
+}
+
+// D2 re-review of d7bc5c868, M-11: a pre-commit target_unreachable park holds
+// no removal only where the fence resolution settles it: before cutover, or
+// after it with the source stopped as migrated. After cutover with another
+// stop reason the resolution leaves it for an operator, so the removal is
+// refused; and the resolution itself agrees on both sides.
+//
+// Mutation: skip every pre-commit target_unreachable (d7bc5c868) — the
+// other-reason case is not refused, red.
+func TestDeadRemovalFirmwareRefusal_SettlesOnlyWhatTheFenceResolves(t *testing.T) {
+	for _, migrated := range []bool{true, false} {
+		t.Run(map[bool]string{true: "stopped_migrated", false: "stopped_otherwise"}[migrated], func(t *testing.T) {
+			r := newFwdRig(t, fwlOpts{})
+			r.parkUnreachableAtVerify()
+			m, _ := r.marker()
+			if m.BeforeCutover() {
+				t.Fatal("fixture: the park is before cutover")
+			}
+			if !migrated {
+				m.SrcStopReason = "crashed"
+				if err := r.src.fwRecords().PutMarker(m); err != nil {
+					t.Fatal(err)
+				}
+			}
+			raiseOn(t, r, condFwmigTargetUnreachable, m.Attempt, "src-host", "dst-host")
+			r.fenceTarget()
+			err := r.src.deadRemovalFirmwareRefusal(context.Background(), "dst-host")
+			if refused := err != nil; refused == migrated {
+				t.Errorf("refused=%v (%v), want %v", refused, err, !migrated)
+			}
+			ok, rerr := r.src.ResolveLiveFirmwareMoveByFence(context.Background(), fwlVM)
+			if rerr != nil || ok != migrated {
+				t.Errorf("the fence resolution resolved=%v (%v), want %v", ok, rerr, migrated)
+			}
+		})
+	}
+}

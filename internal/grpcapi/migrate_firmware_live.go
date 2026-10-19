@@ -887,6 +887,23 @@ func (s *Server) releaseLiveFirmwareMove(ctx context.Context, r *liveFirmwareRun
 
 // ── Fence-based resolution and owed DISCARDs (§7) ──
 
+// fenceResolves reports whether, with m's target proved off, the fence
+// resolution takes m's move back to source (the host holding m): parked
+// target_unreachable or discard_pending; before cutover, or after it with
+// the source stopped as a completed migration; and the VM's row naming
+// source for the move's incarnation. `lv host rm --dead` reads the same
+// predicate (classifyFwMoveMarker).
+func fenceResolves(m fwmig.Marker, row *corrosion.VMRecord, source string) bool {
+	if m.Phase != fwmig.PhaseTargetUnreachable && m.Phase != fwmig.PhaseDiscardPending {
+		return false
+	}
+	if !m.BeforeCutover() && m.SrcStopReason != fwmig.StopReasonMigrated {
+		return false
+	}
+	return row != nil && row.HostName == source &&
+		m.Binding.SameIncarnation(fwmig.Binding{UUID: parseFirmwareSpec(row.Spec).UUID, CreatedAt: row.CreatedAt})
+}
+
 // ResolveLiveFirmwareMoveByFence is §7's fence-based resolution of vm's move
 // parked target_unreachable or discard_pending. It acts only when the
 // target is proved off (HostProvedOff: fenced with a proof-grade fence, or
@@ -933,8 +950,7 @@ func (s *Server) resolveLiveFirmwareMoveByFenceLocked(ctx context.Context, m fwm
 	if err != nil || row == nil {
 		return false, err
 	}
-	if row.HostName != s.hostName ||
-		!m.Binding.SameIncarnation(fwmig.Binding{UUID: parseFirmwareSpec(row.Spec).UUID, CreatedAt: row.CreatedAt}) {
+	if !fenceResolves(m, row, s.hostName) {
 		slog.Warn("live firmware move: the target is proved off, but the VM's row does not name this host for the move's incarnation; the park stays for an operator",
 			"vm", vm, "attempt", m.Attempt, "target", m.Target, "row_host", row.HostName)
 		return false, nil

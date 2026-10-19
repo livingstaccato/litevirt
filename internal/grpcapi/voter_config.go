@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"log/slog"
 	"sort"
 	"strings"
@@ -1114,10 +1115,15 @@ func (s *Server) voterRemovalRefusal(ctx context.Context, host string) error {
 		return status.Errorf(codes.Unavailable, "read the voter set: %v", err)
 	}
 	if _, ok := cfg.Member(host); ok {
-		return status.Errorf(codes.FailedPrecondition,
+		st := status.Newf(codes.FailedPrecondition,
 			"%s "+apimeta.VoterMemberRefusal+" %d; removing the host would not remove its vote. "+
 				"Run `lv cluster voter rm %s` first, then remove the host — or, if it is fenced and gone for "+
 				"good, `lv host rm --dead %s`, which does both", host, cfg.Generation, host, host)
+		if dst, err := st.WithDetails(&errdetails.ErrorInfo{Reason: apimeta.VoterMemberReason, Domain: apimeta.ErrorDomain,
+			Metadata: map[string]string{"host": host}}); err == nil {
+			st = dst
+		}
+		return st.Err()
 	}
 	return nil
 }

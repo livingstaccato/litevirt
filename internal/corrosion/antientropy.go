@@ -741,7 +741,14 @@ func (ae *AntiEntropy) sensitiveDigest(ctx context.Context, client pb.LiteVirtCl
 // back to the legacy unary GetStateDump when the peer is an older build that
 // doesn't implement the stream. This keeps anti-entropy working in a
 // mixed-version cluster in both directions.
+//
+// Every RPC a dump helper opens, its fallbacks included, is re-checked first
+// against the exchange it belongs to (pullGuard): an older peer's Unimplemented
+// can arrive after a change that refuses the peer.
 func fetchStateDump(ctx context.Context, client pb.LiteVirtClient) ([]byte, error) {
+	if err := pullGuardFrom(ctx).check(ctx); err != nil {
+		return nil, err
+	}
 	stream, err := client.StreamStateDump(ctx, &emptypb.Empty{})
 	if err == nil {
 		var buf []byte
@@ -765,6 +772,9 @@ func fetchStateDump(ctx context.Context, client pb.LiteVirtClient) ([]byte, erro
 	}
 
 	// Fallback: legacy unary full-state dump.
+	if err := pullGuardFrom(ctx).check(ctx); err != nil {
+		return nil, err
+	}
 	dump, derr := client.GetStateDump(ctx, &emptypb.Empty{})
 	if derr != nil {
 		return nil, derr
@@ -788,6 +798,9 @@ func fetchTableDumpScoped(ctx context.Context, client pb.LiteVirtClient, tables 
 	req := &pb.TableDumpRequest{Tables: tables}
 	if b := scope.wire(); b != nil {
 		req.Buckets, req.BucketScheme = b, BucketScheme
+	}
+	if err := pullGuardFrom(ctx).check(ctx); err != nil {
+		return nil, err
 	}
 	stream, err := client.StreamTableDump(ctx, req)
 	if err != nil {
@@ -813,6 +826,9 @@ func fetchTableDumpScoped(ctx context.Context, client pb.LiteVirtClient, tables 
 }
 
 func fetchSensitiveStateDump(ctx context.Context, client pb.LiteVirtClient, req *pb.SensitiveStateRequest) ([]byte, error) {
+	if err := pullGuardFrom(ctx).check(ctx); err != nil {
+		return nil, err
+	}
 	stream, err := client.StreamSensitiveStateDump(ctx, req)
 	if err != nil {
 		return nil, err

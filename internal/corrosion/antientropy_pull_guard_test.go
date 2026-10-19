@@ -9,6 +9,9 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 // streamingPeer serves the two row streams, each empty, counting the streams
@@ -183,5 +186,91 @@ func TestFinishExchange_AnUnchangedPeerGetsEveryPull(t *testing.T) {
 	}
 	if pub, sens := peer.counts(); pub != 2 || sens != 1 {
 		t.Errorf("streams: public=%d sensitive=%d, want public=2 (vms, then the sensitive lane's cluster_policies) sensitive=1", pub, sens)
+	}
+}
+
+// olderPeer is a peer on an older build: every narrower dump answers
+// Unimplemented, and the pull falls back to the next. change runs inside the
+// RPC named by changeIn, before its Unimplemented answer goes back.
+type olderPeer struct {
+	slowPeer
+	mu       sync.Mutex
+	opened   []string
+	changeIn string
+	change   func()
+}
+
+func (p *olderPeer) open(rpc string) {
+	p.mu.Lock()
+	p.opened = append(p.opened, rpc)
+	f := p.change
+	if rpc != p.changeIn {
+		f = nil
+	}
+	p.mu.Unlock()
+	if f != nil {
+		f()
+	}
+}
+
+func (p *olderPeer) calls() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.opened...)
+}
+
+func (p *olderPeer) StreamTableDump(_ *pb.TableDumpRequest, _ grpc.ServerStreamingServer[pb.StateDumpChunk]) error {
+	p.open("StreamTableDump")
+	return status.Error(codes.Unimplemented, "older build")
+}
+
+func (p *olderPeer) StreamStateDump(_ *emptypb.Empty, _ grpc.ServerStreamingServer[pb.StateDumpChunk]) error {
+	p.open("StreamStateDump")
+	return status.Error(codes.Unimplemented, "older build")
+}
+
+func (p *olderPeer) GetStateDump(context.Context, *emptypb.Empty) (*pb.StateDumpResponse, error) {
+	p.open("GetStateDump")
+	return &pb.StateDumpResponse{}, nil
+}
+
+// A change that lands while an older peer's Unimplemented answer is in flight
+// stops the fallback it would have opened next: each fallback is a new stream
+// (or a unary call) over the old session, and is re-checked like any other.
+func TestFinishExchange_RechecksThePeerBeforeEachLegacyFallback(t *testing.T) {
+	for _, in := range []struct{ rpc, wantLast string }{
+		{"StreamTableDump", "StreamTableDump"},
+		{"StreamStateDump", "StreamStateDump"},
+	} {
+		for _, tc := range midExchangeChanges {
+			t.Run(in.rpc+"/"+tc.name, func(t *testing.T) {
+				pkiDir := testPKI(t, "self")
+				c := newPruneTestClient(t)
+				peer := &olderPeer{changeIn: in.rpc}
+				port, _ := servePeer(t, pkiDir, peer)
+				addPeerHost(t, c, "peer-a", port, "aa01")
+				c.SetMembersForTests(aeMembers("peer-a"))
+				ae := newTestAE(t, c, pkiDir)
+				ae.legacyRepair = true
+				ex := ae.openExchange(context.Background(), "peer-a", nil, false)
+				if ex == nil {
+					t.Fatal("precondition: no exchange opened")
+				}
+				ex.digest = &pb.StateDigestResponse{Tables: []*pb.TableDigest{{Name: "vms", Count: 1, Hash: "peer"}}}
+				local := map[string]TableDigest{"vms": {Count: 1, Hash: "local"}}
+				peer.change = func() { tc.change(t, c, pkiDir) }
+
+				if ae.finishExchange(context.Background(), ex, local, false) {
+					t.Error("an exchange whose peer changed under a fallback completed")
+				}
+				calls := peer.calls()
+				if len(calls) == 0 || calls[len(calls)-1] != in.wantLast {
+					t.Errorf("RPCs opened: %v; nothing may follow the %s the change landed in", calls, in.wantLast)
+				}
+				if !ex.pc.isClosed() || ae.conns.lookup("peer-a") != nil {
+					t.Error("the obsolete connection was kept")
+				}
+			})
+		}
 	}
 }

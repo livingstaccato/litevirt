@@ -320,9 +320,11 @@ marker a `delete --keep-disks` left under the name are kept. The client gets
 the error. If the domain cannot be stopped, is gone, or is no longer the one
 the create defined, the disks are left as they are, and so is any such domain,
 and the error says so; the next create of the same name removes a leftover
-domain. The host that ran the create logs it at WARN (`vm create failed`, with
-the cause), and what the cleanup did (`vm create: cleanup after the failed
-create`).
+domain once it is stopped, and is refused while one runs. A create of a name
+whose create is still in flight on the owning host is refused (`a create of VM
+"<name>" is in progress`) and touches nothing. The host that ran the create
+logs it at WARN (`vm create failed`, with the cause), and what the cleanup did
+(`vm create: cleanup after the failed create`).
 Once the VM record is written the VM exists: a later failure, or a client that
 stops waiting, undoes nothing.
 
@@ -1044,7 +1046,8 @@ named after the local cluster or after `netbox.cluster_name`) and mirrors:
   case-insensitive, so that is not drift;
 - each address litevirt claimed from NetBox as an `ip_address` assigned to the
   interface that holds it;
-- the VM's **`primary_ip4`**, pointed at the address on its first NIC.
+- the VM's **`primary_ip4`** and **`primary_ip6`**, each pointed at the address
+  of that family on its first NIC holding one.
 
 That last one is a separate fact from the assignment above it, and it is the one
 most things downstream actually read: NetBox's own UI column, its DNS
@@ -1054,7 +1057,10 @@ address. NetBox will only accept a primary that is already assigned to an
 interface of that VM, so the mirror sets it after the interface phase rather than
 at create time, and clears it when the NIC that held it is detached. "First NIC"
 is by NIC ordinal then MAC — the same order the guest sees — so the choice is
-stable across sweeps rather than drifting with API ordering.
+stable across sweeps rather than drifting with API ordering. NetBox refuses an
+address of the wrong family in either field, so the family is the leased
+address's. `primary_ip6` is only written while the VM holds a leased IPv6
+address; on a VM without one, a value set by hand in NetBox is left alone.
 
 If a host is modelled as a DCIM device whose name matches the litevirt host **and
 that device belongs to the NetBox cluster litevirt mirrors into**, the VM links
@@ -1082,7 +1088,9 @@ replicated database, and that read has partial answers a converged cluster is
 indistinguishable from. Two things can be taken away — a `delete`, which retires
 a `virtual_machine` or a `vminterface`, and a `clear`, which unassigns an
 `ip_address` from an interface — and neither runs without positive local
-evidence. Creates, updates and assignments are unaffected: they are additive, so
+evidence. Nulling a VM's `primary_ip4` or `primary_ip6` while it names a
+litevirt-owned address removes that address as a clear does, and needs the same
+evidence about that address. Creates, updates and assignments are unaffected: they are additive, so
 the worst a partial read costs there is an object a later sweep reconciles. One
 destructive call sits outside this gate: adopting an identity that NetBox holds
 *twice* keeps the lowest object id and deletes the duplicates, from the

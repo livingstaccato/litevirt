@@ -480,7 +480,12 @@ var capabilityMap = map[string]tableResolver{
 	// whole, ahead of the control-plane carve-out — the earlier row is a
 	// machine's stale database, whose settings the operator's re-admission
 	// reset.
+	//
+	// Ahead of both, the incarnation counter (host_incarnation.go): two rows
+	// with different keys go to the later incarnation whole, a tombstone of an
+	// earlier one included.
 	"hosts": {category: "host-control-plane", chain: []tieRule{
+		ruleIncarnationCounter(),
 		ruleTombstone(),
 		ruleIncarnation(),
 		ruleAnyColUnresolved([]string{

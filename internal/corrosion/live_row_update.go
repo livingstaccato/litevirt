@@ -123,8 +123,11 @@ func appliedForm(s Statement) Statement {
 	g := ""
 	if fp, err := FingerprintSQL(s.SQL); err == nil {
 		g = liveRowGuardedByFP[fp]
-		if fp == readmitFingerprint {
+		switch fp {
+		case readmitFingerprint:
 			g = readmitResetSQL
+		case readmitV2Fingerprint:
+			g = readmitResetV2SQL
 		}
 	}
 	appliedFormCache.Store(s.SQL, g)

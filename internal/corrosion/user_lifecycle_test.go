@@ -205,10 +205,10 @@ func TestGC_PrunesExpiredSessionsWithTheirFactors(t *testing.T) {
 		if id == "live" {
 			created = now
 		}
-		if err := InsertSessionWithFactor(ctx, c, lpGrant(t), SessionRecord{
+		if err := InsertSessionWithLoginData(ctx, c, lpGrant(t), SessionRecord{
 			ID: id, Username: "bob", Realm: "local", CreatedAt: created.Format(time.RFC3339),
 			LastUsedAt: created.Format(time.RFC3339), ExpiresAt: exp.Format(time.RFC3339),
-		}, "totp"); err != nil {
+		}, "totp", nil); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -569,14 +569,17 @@ data, yet it advertises the token, counts toward its latch and is accepted as a
 sender: the first use would not be refused, and every such host would
 acknowledge it and then quarantine itself. So a feature added after a release
 ships — in a patch release too — is declared under the next release token,
-never a shipped one, and a test pins every release token's list. All twenty
-features of `release_2026_11_v1` are declared in this release (`lv cluster
-upgrade-status` lists them): `vm_limits`, `vm_disk_nic_io`,
+never a shipped one, and a test pins every release token's list. All
+twenty-three features of `release_2026_11_v1` are declared in this release (`lv
+cluster upgrade-status` lists them): `vm_limits`, `vm_disk_nic_io`,
 `email_target_secret`, `login_policy`, `drain_failback`, `firewall_ipv6`,
 `nic_guards`, `usb_mounts_memory`, `backup_zstd`, `container_replication`,
 `iscsi_lun_claim`, `pit_overlay`, `redfish_fence`, `ha_disarm`, `nic_mtu`,
-`replication_rate`, `returning_boot`, `firewall_synflood`, `firewall_log` and
-`firewall_tag_groups`.
+`replication_rate`, `returning_boot`, `firewall_synflood`, `firewall_log`,
+`firewall_tag_groups`, `host_incarnation`, `automation_stream` and
+`sg_projects`. `host_incarnation` is used the
+first time a removed host is re-added with `lv host add` after the latch
+(below).
 
 One feature is one used bit: the first write of any of its data marks it used,
 and a rollback below the release then quarantines. So a feature written by
@@ -1242,6 +1245,54 @@ The two `created_at` values come from two hosts' clocks. If the host's
 original `created_at` is later than the re-admission's — a clock skew larger
 than its whole first membership — the stale row wins whole, on every host.
 
+**The host incarnation counter (`host_incarnation`).** Once the release token
+has latched, `hosts.incarnation` numbers a host's admissions instead. A host is
+at incarnation 0 until a removed host is re-added; `lv host add` of a host
+whose tombstone is at N then records it at N+1. Every node orders two copies of
+a host's row by incarnation first, then by the re-admission's `created_at`,
+then by certificate serial, whatever their `updated_at`: a write made against an
+earlier incarnation is refused (`litevirt_merge_apply_rejected_total`, reason
+`older_incarnation`), and anti-entropy keeps the later incarnation's row. The
+five-minute rule above still decides between two rows that are both at
+incarnation 0. A re-admission that issues a number needs:
+
+- the release token latched on the node `lv host add` runs against;
+- a live voter majority on that node, counted without the host being re-added;
+- a peer it can pull the host's row from first;
+- an `lv` of this release or later, which installs its own build on the host.
+  A previous release's `lv host add` would install a build that cannot keep an
+  incarnation, and the host would stay joining, refused by every peer.
+  Removing the last previous-build host latches the release, so re-add such a
+  host with this release's `lv`; a host already admitted on an older build
+  joins after `lv host upgrade <host>`. The daemon takes `lv`'s word for the
+  build: `lv host add` pushes the `litevirt` beside its own executable, or
+  `/usr/local/bin/litevirt` when there is none, so an `lv` run without this
+  release's `litevirt` beside it can install an older build; that host also
+  stays joining until `lv host upgrade <host>`.
+
+Otherwise `lv host add` is refused with the reason. Over a tombstone at 1 or
+higher it is never written the way the previous release writes it. `lv host rm`
+takes the same majority and pull, and is refused when the row names another
+certificate than the one it revoked. This release's `lv host rm` asks the
+daemon before it revokes, and revokes nothing when the removal would be
+refused; once it has revoked, it retries a removal that fails `Unavailable`
+twice, over about 30 seconds, then prints the command that finishes it. A
+previous release's `lv host rm` does not ask: against this release's daemon it
+still revokes the certificate and publishes the CRL first, and a refusal then
+leaves the host revoked with its row live. Run `lv host rm` with this
+release's `lv`. On a node that has not caught up with the
+cluster since it started, `lv host rm`, `lv host config`, `lv host label`,
+`lv host drain`, `lv host undrain` and `lv host isolate` are refused; `lv host
+fence` is not, and its result names the incarnation, serial, strategy and BMC
+it fenced through. A daemon whose own row names another certificate than the
+one installed (and not its renewal), or whose own row is removed, makes no
+write to that row until the cluster's row for its certificate reaches it
+(`own_row_held`, [diagnostics.md](diagnostics.md#own-row-held-own_row_held)).
+An `lv host add` of a host removed at incarnation 0 that cannot use
+`host_incarnation` at that moment (not every host runs the release yet, or a
+host has not acknowledged its first use) re-admits the host as the previous
+release does, and prints why.
+
 The re-added host publishes a missing capability label again (`litevirt.lxc`,
 `litevirt.tpm`, `litevirt.secureboot`) within a minute of the re-admitted row
 reaching it; it does not need a restart. A label set to another value with
@@ -1425,6 +1476,26 @@ replicated exactly as before.
 host must resolve one conflict the same way. A binary rolled back below the
 latched token enters WAL quarantine, as below every latched token. Roll
 forward.
+
+### A hand-deleted NetBox address is re-created after the roll
+
+A lease names its NetBox address object by id. When that object is deleted in
+NetBox by hand, the inventory mirror can no longer give the NIC its address.
+It skips that one address, runs the rest of the pass, and reports the pass
+unconverged. Once the `netbox_ip_repoint_v1` capability token has latched, the
+mirror also repairs it. It re-creates the address in NetBox at the lease's
+address, under the NIC's identity and inside the bound prefix, then points the
+lease at the new object and assigns it. The token latches on its own once every
+host the cluster replicates to, including one parked in `maintenance`, runs
+this release. A host on the previous release cannot decode the statement that
+re-points the lease. The address is looked up first: if NetBox shows any object
+at it, nothing is created, and the mirror keeps reporting the pass unconverged
+until that object is removed in NetBox.
+
+`netbox_ip_repoint_v1` is mandatory and replication-gated, with no flag. Its
+stand-down is the inventory mirror's own: `netbox.mirror_inventory` off on
+every node stops the only writer. A binary rolled back below the latched token
+enters WAL quarantine, as below every latched token. Roll forward.
 
 ### Console passwords start after the roll
 
@@ -1827,10 +1898,67 @@ WAL + busy-timeout — safe while the old daemon is up). Only after every node's
 schema is forward-staged does it begin the rolling restart, so a freshly-
 upgraded node can never write a column a not-yet-upgraded peer is missing.
 If pre-staging fails on any host the upgrade aborts **before** any binary is
-swapped, so you can fix it and re-run. Daemons too old to support the
-pre-stage RPC report `Unimplemented` and are skipped (they migrate themselves
-on restart; a single-version skew self-heals) — so the very upgrade that
-introduces this feature still works as a plain rolling restart. Pass
+swapped, so you can fix it and re-run.
+
+An upgrade of some hosts (`lv host upgrade host-b`) pre-stages **every other
+member** too, and leaves their binaries alone: a member left on the old
+schema refuses every push from an upgraded host. A member is skipped only
+when it already runs the version `lv` probed from `--binary`, and that
+version names one build: a `dev` build or a `-dirty` tree never matches, and
+neither is treated as up to date by `lv host upgrade` with no host names.
+"The same build" means the identical version string (`git describe` at build
+time). Two builds that share one defeat it: a `VERSION=` override reused for
+different code, or a tree whose only change is an untracked file, which
+`--dirty` does not see. Build those with a distinct `VERSION`. When the
+binary cannot be probed (built for another architecture), every member is
+pre-staged, and `lv host upgrade` with no host names refuses before it
+changes anything, whatever versions the members run: check the path given
+to `--binary`, or name the hosts to upgrade.
+
+A pre-staged host advertises the new schema at once, so the upgrade first
+checks that every member answers (the read-only `lv host preflight-upgrade`
+call) and pre-stages nothing until all do. A member that does not answer
+(down, unreachable, or a daemon without the upgrade RPCs) refuses the
+upgrade, naming it, with nothing changed on any host. Then bring it back and
+re-run, upgrade it with the rest, remove it with `lv host rm <host>`, or name
+it with `--skip-prestage <host>[,<host>]`. `--skip-prestage` pre-stages a
+named member anyway if it answers, and otherwise leaves it on its old schema
+with a warning; the targets' preflight blocks still apply. A skipped member
+refuses replication from every upgraded host once it is back, until
+`lv host upgrade <host>` reaches it, and while it does so `lv health` reports
+[`replication_peer_schema_behind`](diagnostics.md#a-peer-refuses-replication-its-schema-is-behind-replication_peer_schema_behind)
+on every node running this release or later. `--force` only skips preflight
+blocks; it does not pass a member that cannot be pre-staged.
+
+Every member is probed in parallel, a few at a time, and a member that does
+not answer within 30 seconds counts as one that does not answer.
+
+If a pre-stage fails after every member answered (a full disk, or a binary
+built for another architecture), the hosts already pre-staged stay at the new
+schema (it cannot be undone), the rest are still pre-staged, and the refusal
+names them and the host that failed. That host refuses their pushes until it
+is pre-staged: fix it and re-run, re-run with a binary built for that host,
+or, for a member outside the upgrade, proceed without it with
+`--skip-prestage <host>` and pre-stage it later. While it refuses, `lv health`
+reports `replication_peer_schema_behind` only on nodes running this release
+or later: on the rollout into this release every node still runs the old one,
+so the refusal printed by `lv host upgrade` is the only sign.
+
+A member pre-staged without its binary keeps running, and restarts safely,
+on its old binary: that binary starts on the newer schema. Two things stay
+until its own upgrade:
+
+- The staged binary is left at `<daemon binary>.new` (for example
+  `/usr/local/bin/litevirt.new`). Nothing starts it; the member's own upgrade
+  overwrites it.
+- A previous-release daemon on the new schema cannot record a tie
+  acknowledgement: `lv cluster acknowledge-lease-term` on that host fails
+  with `persist acknowledgement`. Upgrade the host first, then acknowledge.
+
+A **target** whose daemon is too old to support the pre-stage RPC reports
+`Unimplemented` and is skipped (it migrates itself on restart; a
+single-version skew self-heals) — so the very upgrade that introduces this
+feature still works as a plain rolling restart. Pass
 `--no-prestage` to skip the pass (not recommended for multi-version jumps).
 
 You generally do **not** need to run `schema-migrate` by hand. It

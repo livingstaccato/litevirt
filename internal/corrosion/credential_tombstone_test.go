@@ -24,21 +24,33 @@ import (
 //     every survivor applied it over its own.
 
 const (
-	staleOldPass   = "Old-Machine-Pass"
-	staleAdmission = "2026-10-01T00:00:00.000001Z"
-	staleBoot      = "2026-10-02T00:00:00.000001Z"
+	staleOldPass        = "Old-Machine-Pass"
+	staleFirstAdmission = "2026-09-01T00:00:00Z"
+	staleAdmission      = "2026-10-01T00:00:00.000001Z"
+	staleBoot           = "2026-10-02T00:00:00.000001Z"
 )
 
 // staleDBAfterReadmission leaves c as d's own database once the re-admission
 // has reached it: the old machine's live hosts row (re-recorded serial,
 // newer than the admission) holding its IPMI password, and the credential row
 // retired by the admission.
+//
+// The row stays at incarnation 0 with its first created_at
+// (staleFirstAdmission), before the retirement, and only its updated_at
+// (staleBoot) is after it. So it pins
+// admissionAtOrAfter's incarnation-0 updated_at fallback: the tests that
+// expect an operator's write to carry the retirement here
+// (TestApply_AnOperatorPasswordWriteRevivesARetiredCredential,
+// TestApply_AnOperatorWriteCarriesTheRetirement) go red without it. Keep the
+// row at incarnation 0 with created_at before staleAdmission.
 func staleDBAfterReadmission(t *testing.T, c *Client) {
 	t.Helper()
 	configuredHost(t, c)
 	// d's daemon boots on its old database and re-records its new serial.
+	// Its first admission predates the re-admission (staleFirstAdmission).
 	if _, err := c.DB().Exec(`UPDATE hosts SET ipmi_address = '10.0.1.15', ipmi_user = 'probe',
-		ipmi_pass = ?, cert_serial = '02new', updated_at = ? WHERE name = 'host-x'`, staleOldPass, staleBoot); err != nil {
+		ipmi_pass = ?, cert_serial = '02new', created_at = ?, updated_at = ? WHERE name = 'host-x'`,
+		staleOldPass, staleFirstAdmission, staleBoot); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.DB().Exec(HostFenceCredentialUpsertSQL, "host-x", staleOldPass, credTS); err != nil {
@@ -308,6 +320,7 @@ func TestApply_AnUnpairedReviveOfARetiredCredentialIsRefused(t *testing.T) {
 // The operator's write revives it: its entry carries the hosts write of the
 // password. Applied from a peer, whatever the old column holds after
 // credentials_clear_v1 (empty), as long as the statement is not the clear.
+// Pins the incarnation-0 updated_at fallback (staleDBAfterReadmission).
 func TestApply_AnOperatorPasswordWriteRevivesARetiredCredential(t *testing.T) {
 	c := newTestDB(t)
 	staleDBAfterReadmission(t, c)
@@ -513,6 +526,7 @@ func TestCredentialMerge_TheOrderLeavesOrdinaryMergesAlone(t *testing.T) {
 // The operator's write, applied from a peer over a local tombstone, carries
 // that retirement; a peer that pulls it later orders it after the tombstone.
 // Mutation: an operator's write carries no evidence — red.
+// Pins the incarnation-0 updated_at fallback (staleDBAfterReadmission).
 func TestApply_AnOperatorWriteCarriesTheRetirement(t *testing.T) {
 	c := newTestDB(t)
 	staleDBAfterReadmission(t, c)

@@ -13,14 +13,15 @@ import (
 
 type captureResolveCondition struct {
 	pb.LiteVirtClient
-	req *pb.ResolveHealthConditionRequest
+	req      *pb.ResolveHealthConditionRequest
+	evidence string
 }
 
 func (c *captureResolveCondition) ResolveHealthCondition(_ context.Context, in *pb.ResolveHealthConditionRequest, _ ...grpc.CallOption) (*pb.ResolveHealthConditionResponse, error) {
 	c.req = in
 	return &pb.ResolveHealthConditionResponse{Condition: &pb.HealthCondition{
 		Evaluator: "dual_run", Code: in.GetCode(), SubjectKind: in.GetSubjectKind(), SubjectId: in.GetSubjectId(),
-		Lifecycle: "resolved",
+		Lifecycle: "resolved", Evidence: c.evidence,
 	}}, nil
 }
 
@@ -70,5 +71,34 @@ func TestHealthResolve_RejectsASubjectWithoutKind(t *testing.T) {
 	}
 	if spy.req != nil {
 		t.Fatalf("a request was sent: %+v", spy.req)
+	}
+}
+
+// TestHealthResolve_StaleUEFIVarsNeedsTheFlagAndAReason: resolving
+// nvram_flush_failed acknowledges that a vars store may be stale, so it needs
+// --accept-stale-uefi-vars and a --reason; without either nothing is sent.
+func TestHealthResolve_StaleUEFIVarsNeedsTheFlagAndAReason(t *testing.T) {
+	for _, args := range [][]string{
+		{"nvram_flush_failed", "host/node-1", "--reason", "disk replaced"},
+		{"nvram_flush_failed", "host/node-1", "--accept-stale-uefi-vars"},
+	} {
+		spy := &captureResolveCondition{}
+		if _, err := runHealthResolve(t, spy, args...); err == nil {
+			t.Fatalf("%v was accepted", args)
+		}
+		if spy.req != nil {
+			t.Fatalf("%v sent a request: %+v", args, spy.req)
+		}
+	}
+	spy := &captureResolveCondition{evidence: `{"files":[{"path":"/var/lib/libvirt/qemu/nvram/web-1_VARS.fd","vm":"web-1"}]}`}
+	out, err := runHealthResolve(t, spy, "nvram_flush_failed", "host/node-1", "--accept-stale-uefi-vars", "--reason", "disk replaced")
+	if err != nil {
+		t.Fatalf("with the flag and a reason: %v", err)
+	}
+	if spy.req == nil || spy.req.GetReason() != "disk replaced" || !spy.req.GetAcceptStaleUefiVars() {
+		t.Fatalf("request = %+v; want the reason and accept_stale_uefi_vars", spy.req)
+	}
+	if !strings.Contains(out, "/var/lib/libvirt/qemu/nvram/web-1_VARS.fd") || !strings.Contains(out, "web-1") {
+		t.Fatalf("output does not list the acknowledged files:\n%s", out)
 	}
 }

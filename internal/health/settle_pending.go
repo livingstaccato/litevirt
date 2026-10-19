@@ -430,7 +430,8 @@ func (w *settleRecorder) raise(ctx context.Context, rec settlePending) error {
 // record is dropped and the settle decides again; anything else waits. Once
 // proven, the record is saved in the stopped phase before anything is
 // written, so a later live copy of the name never drops a stop that happened;
-// a stop this run proved counts even when that save failed. A stopping-phase
+// a stop this run proved counts even when that save failed, and the save is
+// retried on every pass until it holds. A stopping-phase
 // record that already wrote part of its record was proven then.
 func (w *settleRecorder) retry(ctx context.Context, kind string, state func(name string) (settleCopyState, string)) {
 	store := w.store()
@@ -447,7 +448,12 @@ func (w *settleRecorder) retry(ctx context.Context, kind string, state func(name
 		}
 		proven := rec.Phase == settlePhaseStopped || rec.Audited || rec.Raised
 		if detail, ok := w.provenThisRun(*rec); ok && !proven {
+			// The stopped-phase save failed when this run proved the stop;
+			// retry it now, since the in-run proof dies with the daemon.
 			rec.Phase, rec.Detail, proven = settlePhaseStopped, detail, true
+			if err := w.putStopped(store, *rec); err != nil {
+				slog.Warn("partition-settle: could not mark the pending-settle record stopped", "kind", rec.Kind, "name", rec.Name, "error", err)
+			}
 		}
 		if !proven {
 			st, seen := state(rec.Name)

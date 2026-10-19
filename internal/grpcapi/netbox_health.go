@@ -110,6 +110,13 @@ const (
 	// Subject is the HOST, for the same reason as its two neighbours: the input
 	// is this node's own bridge state, which no peer can read.
 	condNetBoxDHCPWouldRace = "netbox_dhcp_would_race"
+	// condNetBoxAddressNotChangeable: the inventory mirror withheld a removal
+	// because an address on the object could not be detached — the API token
+	// may view it but not change it — and removing what holds it would destroy
+	// it. Subject is the NetBox address id. Written by the mirror pass, which
+	// runs under the `netbox` leader lease, so one writer at a time and a clean
+	// pass may clear every subject.
+	condNetBoxAddressNotChangeable = "netbox_address_not_changeable"
 )
 
 // netboxSweepSubject is the single subject of condNetBoxSweepBlocked. The

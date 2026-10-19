@@ -20,8 +20,10 @@ import (
 // fakeDomainXML builds a minimal (namespace-free) libvirt domain whose single disk
 // at target dev `dev` has <source file=srcPath>. The libvirtfake stores it by the
 // <name>, so DumpXMLInactive returns it for the cutover gate to rewrite.
+// The domain carries the VM's uuid, as every redefine of it does: libvirt
+// refuses a redefine of an existing name with none.
 func fakeDomainXML(name, dev, srcPath string) string {
-	return `<domain type="kvm"><name>` + name + `</name><devices>` +
+	return `<domain type="kvm"><name>` + name + `</name><uuid>` + libvirtfake.DomainUUIDFor(name) + `</uuid><devices>` +
 		`<disk type="file" device="disk"><source file="` + srcPath + `"/>` +
 		`<target dev="` + dev + `" bus="virtio"/></disk>` +
 		`</devices></domain>`

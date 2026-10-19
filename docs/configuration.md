@@ -604,14 +604,29 @@ auth:
   #
   # Peer trust binds a live host row to the certificate serial recorded in it. A
   # node re-records its own serial at startup, so an ordinary certificate rotation
-  # converges by replication and needs nothing here. But if those recorded serials
-  # have ALREADY gone stale fleet-wide, every daemon refuses every peer
-  # ("replication RPC requires peer mTLS") and the cluster cannot repair itself:
-  # the correction has to replicate, and replication is what is being refused.
+  # converges by replication and needs nothing here. That re-record is
+  # conditional (docs/diagnostics.md, own_row_held):
+  #   - a certificate that renewed the recorded one (lv host renew-cert) is
+  #     re-recorded at once;
+  #   - otherwise, over a row at incarnation 0, the node first holds its own-row
+  #     writes for ten minutes (reason at_start) and re-records when that hold
+  #     times out;
+  #   - otherwise, over a row at incarnation 1 or higher (a host re-added since
+  #     host_incarnation latched), it re-records only when the row is the
+  #     admission recorded in <pki_dir>/own-admission.json. A host without that
+  #     record, or with another admission's, is held and never re-records: it
+  #     needs `lv host rm` then `lv host add`;
+  #   - a certificate swapped while the daemon runs, not by a renewal, is held
+  #     until the daemon restarts, and then as above.
+  # But if those recorded serials have ALREADY gone stale fleet-wide, every
+  # daemon refuses every peer ("replication RPC requires peer mTLS") and the
+  # cluster cannot repair itself: the correction has to replicate, and
+  # replication is what is being refused.
   #
   # Set true on EVERY node to break that deadlock — a mismatch is then logged and
   # admitted for CA-issued HOST certificates instead of refused — wait for the
-  # fleet to replicate, then set it back to false. It never relaxes the removal
+  # fleet to replicate, then set it back to false — only once every host above
+  # has re-recorded or been re-added. It never relaxes the removal
   # tombstone (a decommissioned host stays out) and never lets a distributable
   # client certificate act as a peer. While it is on it ALSO turns off the
   # recovery-claim serial pin (accepts signed with a renewal's replaced key
@@ -773,6 +788,22 @@ upgrade_health_deadline_sec: 120      # 0 → 120s; widen for very slow N-step s
 # back to recreate-from-image. container_restore_timeout_sec bounds how long a
 # relocate-restore is treated as in-flight before giving up and image-recreating.
 container_restore_timeout_sec: 600    # 0 → 600s (10m)
+
+# vTPM state durability. swtpm writes a vTPM's state without fsync, so a write
+# made shortly before a power cut can be lost. On a host with swtpm, the daemon
+# sets the sync attribute (chattr +S) on /var/lib/libvirt/swtpm and everything
+# under it, at start and every minute, and records that it did in
+# <data_dir>/vtpm-state-sync. Files swtpm creates there inherit it. On ext4,
+# and on xfs mounted with dirsync or wsync (a mount-time sync implies wsync; a
+# remount to sync does not), a vTPM command then returns only once its state
+# is on disk. Elsewhere (xfs without one of those,
+# btrfs, ZFS, NFS, tmpfs) the
+# host raises vtpm_state_not_durable (docs/diagnostics.md). The vTPM capability
+# label stays false until a pass has completed. false clears the attribute
+# where that record says litevirt set it (an attribute set by hand on a host
+# litevirt never protected stays): vTPM commands that write state return
+# sooner, and such a write can be lost.
+vtpm_state_sync: true
 
 # Container security and limit defaults (docs/containers.md, "Security").
 containers:

@@ -59,12 +59,19 @@ func ResolvePeerTarget(ctx context.Context, c *Client, peerName string) (string,
 }
 
 func resolvePeerTarget(ctx context.Context, c *Client, peerName string) (string, error) {
+	target, _, err := resolvePeerEndpoint(ctx, c, peerName)
+	return target, err
+}
+
+// resolvePeerEndpoint is resolvePeerTarget that also returns the host row the
+// target came from, or nil when it came from gossip.
+func resolvePeerEndpoint(ctx context.Context, c *Client, peerName string) (string, *HostRecord, error) {
 	var addr string
 	var port int
 
 	host, err := GetHost(ctx, c, peerName)
 	if err != nil {
-		return "", fmt.Errorf("look up host %q: %w", peerName, err)
+		return "", nil, fmt.Errorf("look up host %q: %w", peerName, err)
 	}
 	if host != nil {
 		addr = host.Address
@@ -81,9 +88,9 @@ func resolvePeerTarget(ctx context.Context, c *Client, peerName string) (string,
 			}
 		}
 		if addr == "" {
-			return "", fmt.Errorf("look up host %q: not found in cluster state or gossip", peerName)
+			return "", nil, fmt.Errorf("look up host %q: not found in cluster state or gossip", peerName)
 		}
 		slog.Debug("resolvePeerTarget: using gossip address for peer", "peer", peerName, "addr", addr)
 	}
-	return PeerTarget(addr, port), nil
+	return PeerTarget(addr, port), host, nil
 }

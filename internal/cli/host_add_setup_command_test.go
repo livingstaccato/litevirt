@@ -24,7 +24,7 @@ func TestRemoteAddSetupCommand_NoInjectionFromJoinPeers(t *testing.T) {
 	// A peer address from hosts.address, rendered the way HostAdd renders it.
 	peersYAML := `["$(touch ` + canary + `):7946","10.0.0.2:7946"]`
 
-	line := remoteAddSetupCommand("node-9", "10.0.0.9", peersYAML, "enforcement:\n  audit_signature: true\n")
+	line := remoteAddSetupCommand("node-9", "10.0.0.9", peersYAML, "enforcement:\n  audit_signature: true\n", false)
 	if !strings.HasSuffix(line, " bash -s") {
 		t.Fatalf("the add setup line no longer runs `bash -s` off stdin: %q", line)
 	}

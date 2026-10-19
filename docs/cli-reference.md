@@ -475,14 +475,15 @@ daemon is not running. A failed fsync raises `nvram_flush_failed`, and a vars
 file that cannot be opened for a minute raises `nvram_flush_blocked`
 (docs/diagnostics.md).
 
-swtpm makes its own vTPM state durable: it renames each new state file into
-place and fsyncs the directory before the TPM command completes. It does not
-fsync the file's data first, so this relies on ext4's defaults
-(`data=ordered`, `auto_da_alloc`) to write that data before the rename
-commits. Two cases are not covered: the state file's first creation, when
-nothing is replaced, and `/var/lib/libvirt/swtpm` on XFS or btrfs, or on ext4
-mounted `noauto_da_alloc`. In either, a power cut can leave the state file
-empty or old.
+swtpm writes a vTPM's state without fsync. With `vtpm_state_sync` on (the
+default, docs/configuration.md), the daemon sets the sync attribute on
+`/var/lib/libvirt/swtpm` and everything under it, at start before it starts
+any VM and every minute after. On ext4, and on xfs mounted `dirsync` or
+`wsync`, a vTPM command then returns only once its state is on disk. Elsewhere
+(xfs without either, btrfs, ZFS, NFS, tmpfs), or when a pass fails or does not
+finish within 10 seconds, the host raises `vtpm_state_not_durable`
+(docs/diagnostics.md), and a vTPM write made shortly before a power cut can be
+lost.
 
 ## Containers (LXC / OCI)
 

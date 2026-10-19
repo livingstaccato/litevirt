@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -995,6 +996,17 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	if !validRestoreName(targetName) {
 		return status.Errorf(codes.InvalidArgument, "invalid promotion name %q", targetName)
 	}
+	// A promotion to a new name makes a VM of that name here: no create of
+	// the name runs on this host while it does (beginCreate).
+	setFlightUUID := func(string) {}
+	if renamed {
+		endFlight, set, ferr := s.beginCreate(targetName)
+		if ferr != nil {
+			return ferr
+		}
+		defer endFlight()
+		setFlightUUID = set
+	}
 
 	// Reconstruct the spec from the durable record BEFORE admission: the host
 	// lease must cover the spec's complete CPU and memory, and a record that
@@ -1007,6 +1019,13 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		return status.Errorf(codes.Internal, "parse vm spec: %v", err)
 	}
 	spec.Name = targetName
+	// A promotion to a new name is a second VM beside the original, so it
+	// gets its own identity, as a clone does: never the original's uuid,
+	// which NIC guards, the seed stamp and replicas key on, and which libvirt
+	// refuses for a second domain while the original's runs on this host.
+	if renamed {
+		spec.Uuid = uuid.NewString()
+	}
 	// The stored tuning is validated again (and dropped before the gate opens)
 	// so a record from before a rollback cannot define what the cluster refuses.
 	ioR, err := s.restrictRestoredTuning(ctx, &spec)
@@ -1096,15 +1115,69 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 	}
 	started := promoteDomainAlreadyStarted(stepDone("started"), stepDone("start_attempted"), s.promoteMarkerPresent(targetName), domExists, domRunning)
+	// A renamed promotion mints its uuid and MACs on every attempt, so a
+	// retry that adopts the domain an earlier attempt started takes that
+	// domain's uuid, and its MACs by position (the spec's NICs, in order, are
+	// the domain's), for the row, the NIC rows and the NIC guards: the row and
+	// the domain never name two identities. One whose uuid or NICs cannot be
+	// read is not adopted now; one with a NIC that names no MAC, NICs not the
+	// spec's in number, or a NIC not on its spec NIC's bridge is never
+	// adopted, and the refusal names the way out.
+	var adoptedMACs []string
+	if renamed && started {
+		x, xerr := s.virt.DumpXML(targetName)
+		du := domainUUIDFromXML(x)
+		nics, nerr := domainNICsFromXML(x)
+		if xerr != nil || du == "" {
+			return status.Errorf(codes.Unavailable,
+				"promote of %s to %s: the domain an earlier attempt started cannot be identified (%v); nothing was changed",
+				vm.Name, targetName, xerr)
+		}
+		if nerr != nil {
+			return status.Errorf(codes.Unavailable,
+				"promote of %s to %s: the NICs of the domain an earlier attempt started cannot be read (%v); nothing was changed",
+				vm.Name, targetName, nerr)
+		}
+		why := ""
+		if len(nics) != len(spec.Network) {
+			why = fmt.Sprintf("has %d NICs, the VM's spec %d", len(nics), len(spec.Network))
+		}
+		for i := 0; why == "" && i < len(nics); i++ {
+			want := network.FlatBridgeName(spec.Network[i].Name)
+			switch {
+			case nics[i].MAC == "":
+				why = fmt.Sprintf("names no MAC for NIC %d", i)
+			case nics[i].Bridge != want:
+				why = fmt.Sprintf("has NIC %d on bridge %q, the VM's spec on %q (network %s)", i, nics[i].Bridge, want, spec.Network[i].Name)
+			}
+		}
+		if why != "" {
+			return status.Errorf(codes.FailedPrecondition,
+				"promote of %s to %s: the domain an earlier attempt started %s, so it is not this promotion's to adopt; "+
+					"stop and remove it on %s (`virsh destroy %s`, then `virsh undefine %s`), or retry with another --new-name; nothing was changed",
+				vm.Name, targetName, why, s.hostName, targetName, targetName)
+		}
+		spec.Uuid = du
+		for _, n := range nics {
+			adoptedMACs = append(adoptedMACs, n.MAC)
+		}
+	}
 
 	// Split-brain guard. Taking over the original name while the original is
 	// still on a healthy host (and not force) would double-run the VM.
+	// A promotion to a new name never replaces another VM, --force or not:
+	// --force is for a same-name takeover of a VM still on a healthy host.
+	// With it, a rename onto a live VM's name stopped and undefined that VM's
+	// domain here and then failed on its row (dupcreate re-review). Checked
+	// under this promotion's create flight of the name (above).
+	if renamed {
+		if rec, _ := corrosion.GetVM(ctx, s.db, targetName); rec != nil {
+			return status.Errorf(codes.AlreadyExists,
+				"vm %q already exists; choose another --new-name (--force never replaces another VM); nothing was changed", targetName)
+		}
+	}
 	if !req.Force {
-		if renamed {
-			if rec, _ := corrosion.GetVM(ctx, s.db, targetName); rec != nil {
-				return status.Errorf(codes.AlreadyExists, "vm %q already exists; choose another --new-name", targetName)
-			}
-		} else if vm.HostName != "" && vm.HostName != s.hostName {
+		if !renamed && vm.HostName != "" && vm.HostName != s.hostName {
 			if h, _ := corrosion.GetHost(ctx, s.db, vm.HostName); h != nil && h.State == "active" {
 				return status.Errorf(codes.FailedPrecondition,
 					"vm %q still owned by healthy host %q; fence it or pass --force/--new-name to avoid split-brain", vm.Name, vm.HostName)
@@ -1186,9 +1259,54 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// (If this proof already reached "started", the existing domain is OUR OWN
 	// prior promotion — never destroy it on resume; fall through to persist.)
 	replaceDomain := false
+	replaceVerdict := func() (bool, error) {
+		own, du, _, ierr := s.domainIsVMsOwn(ctx, targetName, spec.Uuid, "")
+		if spec.Uuid == "" && ierr == nil && !renamed {
+			own = true // a VM from before uuids were minted: judged as before
+		}
+		if own {
+			return true, nil
+		}
+		active, aerr := s.virt.DomainIsActive(targetName)
+		if aerr == nil && !active {
+			return false, nil
+		}
+		why := "it is running"
+		if aerr != nil {
+			why = fmt.Sprintf("whether it runs cannot be read (%v)", aerr)
+		}
+		if ierr != nil {
+			du = fmt.Sprintf("unidentified: %v", ierr)
+		}
+		// The way out: stop the domain, then retry.
+		out := fmt.Sprintf("no VM of the name exists, so stop it with `virsh destroy %s` on %s", targetName, s.hostName)
+		switch {
+		case renamed:
+		case vm.HostName == s.hostName:
+			out = fmt.Sprintf("stop it with `lv stop %s`", targetName)
+		default:
+			out = fmt.Sprintf("%s owns the VM: if the domain is a superseded copy of this VM, this host's reconciler stops it "+
+				"once a recovery claim certifies the move there; otherwise stop it with `virsh destroy %s` on %s", vm.HostName, targetName, s.hostName)
+		}
+		return false, status.Errorf(codes.FailedPrecondition,
+			"domain %q on %s is not this VM's (uuid %s, the VM's is %s) and %s; --force replaces only the VM's own "+
+				"domain or a stopped one; %s, then retry; nothing was changed", targetName, s.hostName, du, spec.Uuid, why, out)
+	}
 	if s.virt.DomainExists(targetName) && !started {
 		if !req.Force {
 			return status.Errorf(codes.AlreadyExists, "domain %q already defined on %q; pass --force or --new-name", targetName, s.hostName)
+		}
+		// --force replaces the VM's own domain (its uuid: domainIsVMsOwn),
+		// running or not, and any other domain of the name only when it is
+		// positively stopped, keeping that one's NVRAM and vTPM state (its
+		// disks are not touched), as a create removes a stopped domain with
+		// no record. One that runs, or whose state cannot be read, is another
+		// guest, never this promotion's to stop. For a renamed promotion no
+		// row of the name exists (checked above) and the VM's identity is the
+		// fresh uuid minted for it, so only a stopped leftover is replaced.
+		// The verdict is taken again just before the replace (replaceVerdict).
+		if _, verr := replaceVerdict(); verr != nil {
+			return verr
 		}
 		replaceDomain = true
 	}
@@ -1519,6 +1637,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	}
 	for i, n := range renamedNICs {
 		mac := lv.GenerateMAC()
+		if adoptedMACs != nil {
+			mac = adoptedMACs[i] // the running guest's NIC
+		}
 		// The spec records the NIC's real MAC (as a clone does), so its queues
 		// are matched at every later redefine, not lost to the source's MAC.
 		n.Mac = mac
@@ -1599,14 +1720,32 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			// leaving the live domain to collide on UUID at DefineDomain. (In a
 			// real failover the VM ran on the fenced host, so the promotion
 			// host has no such domain and this is a no-op.)
-			_ = s.virt.DestroyDomain(targetName)
-			_ = s.virt.UndefineDomain(targetName, false)
+			// The verdict is taken again first: the build took time, and a
+			// stopped domain that is not the VM's may run by now. One that is
+			// not the VM's is never sent a stop, and keeps its NVRAM and vTPM
+			// state.
+			if s.virt.DomainExists(targetName) {
+				own, verr := replaceVerdict()
+				if verr != nil {
+					removeLive()
+					return verr
+				}
+				if own {
+					_ = s.virt.DestroyDomain(targetName)
+					_ = s.virt.UndefineDomain(targetName, false)
+				} else {
+					_ = s.virt.UndefineDomainPreservingState(targetName)
+				}
+			}
 		}
 		// attempt defines and starts the domain on disks; stage names the
 		// step that failed.
 		attempt := func(disks []lv.DiskConfig) (string, error) {
 			cfg := lv.VMConfig{
 				Name: targetName, CPU: int(spec.Cpu), CPUMode: spec.CpuMode, CPUModel: spec.CpuModel,
+				// The domain carries the VM's identity, as every definer does,
+				// so a later rebuild or --force retry knows it for the VM's own.
+				UUID:      spec.Uuid,
 				MemoryMiB: int(spec.MemoryMib), Machine: spec.Machine, Firmware: spec.Firmware,
 				GuestAgent: spec.GuestAgent, EnableVNC: !spec.DisableVnc, EnableSPICE: spec.EnableSpice,
 				Disks: disks, Networks: netCfg, Boot: spec.Boot,
@@ -1624,6 +1763,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				Phase: pb.PromoteReplicaProgress_DEFINING, VmName: targetName, Host: s.hostName,
 				Replica: replica, DiskPath: livePath, Status: "defining domain" + multiDiskNote,
 			})
+			setFlightUUID(spec.Uuid)
 			if err := s.virt.DefineDomain(domXML); err != nil {
 				return "define domain", err
 			}

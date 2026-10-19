@@ -139,6 +139,31 @@ with `lv host rm` and added back under the same name starts with no failure
 history; every peer forgets the old machine's failed probes when it leaves the
 host table.
 
+`lv host add` uploads the binary and the host's credentials to staged paths
+on the machine, and moves them into place only once the cluster has admitted
+the host, so a refused add leaves the machine as it was. It refuses a machine
+that serves another live member's certificate or has its address. While it
+installs, each file it replaces in `/etc/litevirt/pki` is kept beside it as
+`<file>.pre-add-<time>` (0600): the copies are put back if the add fails after
+the admission, and removed once it succeeds. A host admitted by an add that
+did not finish shows `HOST_JOINING`: run the same `lv host add` again, from
+any machine holding the cluster CA, to finish it, or `lv host rm <name>` to
+undo the admission. That removal also deletes the admitted credentials the add
+left staged on the machine, when it can reach the machine over SSH as root. A
+rerun refuses when the key staged or installed on the machine is not the
+admitted certificate's.
+
+A machine that already has `/etc/litevirt/config.yaml` keeps it. The add
+edits in place only `host_name`, `advertise_address`, `join_peers`, `pki_dir`
+(set to `/etc/litevirt/pki`, where it installs the credentials) and
+`enforcement`, which becomes the cluster's block, or is removed when the
+cluster has none. Every other line (a `migration.network`, say) is kept as it
+was, as are the file's mode and a symlink to it. The file as it was is kept
+beside it as `config.yaml.pre-add-<time>` (0600). The add refuses a config it
+cannot parse, one with more than one document, one of 1 MiB or more, and a
+`grpc_port` other than 7443 or a `gossip_port` other than 7946, on which
+peers would not reach the host.
+
 Such a host is a new machine to the cluster and inherits nothing the old one
 was configured with: its fencing and IPMI settings, labels, role, region and
 capacity overrides return to their defaults, and its IPMI password is retired

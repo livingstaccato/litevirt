@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -149,5 +150,18 @@ func TestRefusalLogLimiter(t *testing.T) {
 	}
 	if !l.allow("hosts/h1", t0.Add(refusalLogInterval)) {
 		t.Errorf("the same row was not logged again after %s", refusalLogInterval)
+	}
+}
+
+// A5 (lab eqts-test26): the warning named one cause, a host re-added while
+// its data directory still held its old database. On the lab the stale row
+// came from a peer of the previous release that had applied the legacy
+// re-admission without its created_at, and the re-added host's database was
+// not involved. The advice names both.
+func TestHostsIncarnationAdvice_NamesALaggingPeer(t *testing.T) {
+	for _, want := range []string{"previous release", "does not hold the re-admitted row", "data directory"} {
+		if !strings.Contains(hostsIncarnationAdvice, want) {
+			t.Errorf("the advice does not mention %q: %s", want, hostsIncarnationAdvice)
+		}
 	}
 }

@@ -770,6 +770,15 @@ type stubVirt struct {
 	// primaryIPs records every SetPrimaryIP4 call as {vmID, ipID}, so a test
 	// can assert the mirror set one and did not re-send it.
 	primaryIPs [][2]int
+	// primaryIP6s records every SetPrimaryIP6 call the same way.
+	primaryIP6s [][2]int
+	// The dead-address repair's address state; see LookupByIdentity.
+	byIdentityIPs map[string][]netbox.IPAddress
+	byAddressIPs  map[string][]netbox.IPAddress
+	claimed       [][2]string
+	claimErr      error
+	releasedIPs   []int
+	nextIP        int
 	// sites is the NetBox site name -> id table FindSiteByName resolves against.
 	sites map[string]int
 
@@ -806,7 +815,11 @@ type stubVirt struct {
 	deletedInterfaces []int
 	ipAssignments     []ipAssignment
 	cleared           []int
-	deviceLookups     []string
+	// primaryClears records every ClearPrimaryIPs as {vmID, ip4, ip6}.
+	primaryClears [][3]int
+	// order records the primary and clear writes in sequence.
+	order         []string
+	deviceLookups []string
 
 	nextID int
 }
@@ -986,6 +999,7 @@ func (s *stubVirt) ClearIPAssignment(_ context.Context, ipID int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cleared = append(s.cleared, ipID)
+	s.order = append(s.order, "clear")
 	return nil
 }
 
@@ -993,6 +1007,62 @@ func (s *stubVirt) SetPrimaryIP4(_ context.Context, vmID, ipID int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.primaryIPs = append(s.primaryIPs, [2]int{vmID, ipID})
+	s.order = append(s.order, "primary4")
+	return nil
+}
+
+// The dead-address repair's address surface. claimed records every
+// ClaimSpecificIP as {address, identity}; byIdentityIPs is what a lookup finds;
+// claimErr fails a create; released records every ReleaseIP.
+func (s *stubVirt) LookupByIdentity(_ context.Context, identity string, _ int, _ string) ([]netbox.IPAddress, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]netbox.IPAddress(nil), s.byIdentityIPs[identity]...), nil
+}
+
+func (s *stubVirt) LookupByAddress(_ context.Context, address string, _ int) ([]netbox.IPAddress, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]netbox.IPAddress(nil), s.byAddressIPs[address]...), nil
+}
+
+func (s *stubVirt) ClaimSpecificIP(_ context.Context, address string, vrfID int, identity string) (netbox.IPAddress, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.claimErr != nil {
+		return netbox.IPAddress{}, s.claimErr
+	}
+	s.claimed = append(s.claimed, [2]string{address, identity})
+	s.nextIP++
+	return netbox.IPAddress{ID: 9000 + s.nextIP, Address: address, Identity: identity, VRFID: vrfID}, nil
+}
+
+func (s *stubVirt) ReleaseIP(_ context.Context, id int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.releasedIPs = append(s.releasedIPs, id)
+	return nil
+}
+
+func (s *stubVirt) ClearPrimaryIPs(_ context.Context, vmID int, ip4, ip6 bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b := func(v bool) int {
+		if v {
+			return 1
+		}
+		return 0
+	}
+	s.primaryClears = append(s.primaryClears, [3]int{vmID, b(ip4), b(ip6)})
+	s.order = append(s.order, "primaries")
+	return nil
+}
+
+func (s *stubVirt) SetPrimaryIP6(_ context.Context, vmID, ipID int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.primaryIP6s = append(s.primaryIP6s, [2]int{vmID, ipID})
+	s.order = append(s.order, "primary6")
 	return nil
 }
 

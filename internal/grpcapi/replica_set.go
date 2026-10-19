@@ -245,19 +245,29 @@ var statShared = os.Stat
 // statWithin stats path, giving up after timeout (review N2). The stat left
 // running when it times out is abandoned; it ends when the mount answers.
 func statWithin(path string, timeout time.Duration) error {
-	done := make(chan error, 1)
+	_, err := statInfoWithin(path, timeout)
+	return err
+}
+
+// statInfoWithin is statWithin with what the stat found.
+func statInfoWithin(path string, timeout time.Duration) (os.FileInfo, error) {
+	type res struct {
+		fi  os.FileInfo
+		err error
+	}
+	done := make(chan res, 1)
 	stat := statShared // read here, not in the goroutine that may outlive the call
 	go func() {
-		_, err := stat(path)
-		done <- err
+		fi, err := stat(path)
+		done <- res{fi, err}
 	}()
 	t := time.NewTimer(timeout)
 	defer t.Stop()
 	select {
-	case err := <-done:
-		return err
+	case r := <-done:
+		return r.fi, r.err
 	case <-t.C:
-		return fmt.Errorf("not reachable (timed out after %s)", timeout)
+		return nil, fmt.Errorf("not reachable (timed out after %s)", timeout)
 	}
 }
 

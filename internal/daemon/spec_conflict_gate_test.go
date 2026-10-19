@@ -34,7 +34,7 @@ func TestWireSpecConflictGate_TracksTheDurableLatch(t *testing.T) {
 	})
 
 	d := &Daemon{db: db, checker: checker, cfg: &Config{DataDir: dataDir}}
-	d.wireSpecConflictGate()
+	d.wireCorrosionGates() // the set the daemon wires, so a lost call fails here
 
 	if db.SpecConflictOn() {
 		t.Fatal("spec conflict resolution is on before spec_conflict_v1 has durably latched")

@@ -229,7 +229,10 @@ func f() {
 // branches land, because its set is frozen). Each may list no writer, and must
 // not: the branch that adds its Writers deletes it from here in the same
 // change, after which the feature must list them.
-var writersPending = map[Feature]bool{}
+var writersPending = map[Feature]bool{
+	FeatureAutomationStream: true,
+	FeatureSGProjects:       true,
+}
 
 // TestReleaseFeatureWriters_TakeAGrant: a writer listed under several
 // features (review I-4) must Check each of them; one Check on any grant does
@@ -239,6 +242,11 @@ func TestReleaseFeatureWriters_TakeAGrant(t *testing.T) {
 	consts, err := featureConstants(filepath.Join(root, "internal", "capabilities"))
 	if err != nil {
 		t.Fatal(err)
+	}
+	for f := range writersPending {
+		if _, ok := LookupFeature(f); !ok {
+			t.Errorf("writersPending names %q, which is not a declared feature", f)
+		}
 	}
 	listedUnder := map[string][]Feature{}
 	for _, f := range Features() {

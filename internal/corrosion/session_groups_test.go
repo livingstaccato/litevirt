@@ -89,3 +89,36 @@ func TestNormalizeSessionGroups_DropsControlCharacters(t *testing.T) {
 		t.Fatalf("kept %q dropped %d", out, dropped)
 	}
 }
+
+// TestSessionFactor_RecordedWithTheSessionOnlyWithTheGrant: the factor a login
+// presented goes in the session's own batch, through the one session writer,
+// only with the login_policy grant. Without it, or with another feature's
+// grant, the session is written alone and reads as password-only, which the
+// second-factor policy confines (fail closed).
+//
+// Mutation: drop the session_factors statement from InsertSessionWithLoginData,
+// or its grant check — red.
+func TestSessionFactor_RecordedWithTheSessionOnlyWithTheGrant(t *testing.T) {
+	ctx := context.Background()
+	c := lifecycleDB(t)
+	now := time.Now().UTC()
+	for _, tc := range []struct {
+		id   string
+		g    capabilities.FeatureGrant
+		want string
+	}{
+		{"granted", lpGrant(t), "totp"},
+		{"no-grant", capabilities.FeatureGrant{}, ""},
+		{"other-grant", capabilities.GrantForTest(t, capabilities.FeatureVMLimits), ""},
+	} {
+		if err := InsertSessionWithLoginData(ctx, c, tc.g, groupSession(tc.id, "local", now, now.Add(time.Hour)), "totp", nil); err != nil {
+			t.Fatalf("%s: %v", tc.id, err)
+		}
+		if s, err := GetSession(ctx, c, tc.id); err != nil || s == nil {
+			t.Fatalf("%s: session row %v %v, want it written", tc.id, s, err)
+		}
+		if f, err := SessionFactor(ctx, c, tc.id); err != nil || f != tc.want {
+			t.Errorf("%s: factor %q %v, want %q", tc.id, f, err, tc.want)
+		}
+	}
+}

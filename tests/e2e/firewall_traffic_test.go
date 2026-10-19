@@ -52,6 +52,11 @@ func (c *stdioConn) SetWriteDeadline(time.Time) error { return nil }
 // returns the combined output and whether the command exited 0; err is a
 // failure to reach or log into the guest.
 func (l *lab) guestRun(host, ip, cmd string) (string, bool, error) {
+	return l.guestRunAs(host, ip, envOr("E2E_GUEST_USER", "cirros"), envOr("E2E_GUEST_PASSWORD", "gocubsgo"), cmd)
+}
+
+// guestRunAs is guestRun logging in as user with password.
+func (l *lab) guestRunAs(host, ip, user, password, cmd string) (string, bool, error) {
 	args := append(l.sshArgs(host)[:len(l.sshArgs(host))-1], "-W", ip+":22", "root@127.0.0.1")
 	c := exec.Command("ssh", args...)
 	in, err := c.StdinPipe()
@@ -67,8 +72,8 @@ func (l *lab) guestRun(host, ip, cmd string) (string, bool, error) {
 	}
 	conn := &stdioConn{Reader: out, WriteCloser: in, cmd: c}
 	cfg := &ssh.ClientConfig{
-		User:            envOr("E2E_GUEST_USER", "cirros"),
-		Auth:            []ssh.AuthMethod{ssh.Password(envOr("E2E_GUEST_PASSWORD", "gocubsgo"))},
+		User:            user,
+		Auth:            []ssh.AuthMethod{ssh.Password(password)},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // a throwaway test guest
 		Timeout:         20 * time.Second,
 	}

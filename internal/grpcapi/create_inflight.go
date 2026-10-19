@@ -343,7 +343,7 @@ func (s *Server) domainIsVMsOwn(ctx context.Context, name, specUUID, diskOwner s
 			return false
 		}
 		name := l.Opts["lvpool"]
-		ref, found, err := s.resolvePoolErr(ctx, name)
+		ref, found, err := s.cephPoolRef(ctx, name)
 		why := ""
 		switch {
 		case err != nil:
@@ -351,7 +351,7 @@ func (s *Server) domainIsVMsOwn(ctx context.Context, name, specUUID, diskOwner s
 		case found && !strings.EqualFold(ref.Driver, "ceph"):
 			why = fmt.Sprintf("pool %s on %s is a %s pool, not a ceph one", name, s.hostName, ref.Driver)
 		case found:
-			if _, ok := s.CephMonitorsForPool(name); !ok {
+			if _, ok := cephRefMonitors(ref); !ok {
 				why = fmt.Sprintf("the monitors of pool %s on %s cannot be read", name, s.hostName)
 			}
 		}

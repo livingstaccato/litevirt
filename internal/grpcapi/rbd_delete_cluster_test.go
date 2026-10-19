@@ -208,3 +208,117 @@ func TestRecheckKeptCephImages_AsksThePoolsCurrentCluster(t *testing.T) {
 	s.recheckKeptCephImages(context.Background())
 	r.requireOnlyClusterA(t)
 }
+
+// stackOnA stores stack stk, whose ceph volume rbd-fast is on cluster A.
+func stackOnA(t *testing.T, s *Server) {
+	t.Helper()
+	yaml := `name: stk
+volumes:
+  rbd-fast:
+    driver: ceph
+    source: lv
+    options:
+      id: litevirt
+      keyring: /k
+      mon_host: "10.0.0.1:6789"
+vms:
+  vm1:
+    cpu: 1
+`
+	if err := corrosion.UpsertStack(context.Background(), s.db, corrosion.StackRecord{Name: "stk", ComposeYAML: yaml, State: "running"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// staleStackB is a disk of compose volume rbd-fast of stack stk whose locator
+// still names cluster B's monitor.
+const staleStackB = `rbd:lv/vm1-data:id=litevirt:keyring=/k:lvpool=stk/rbd-fast:mon_host=10.0.9.1\:6789`
+
+// A compose stack's ceph volume is a litevirt pool too ("<stack>/<volume>"),
+// read from the stored stack: its image is removed on the volume's cluster,
+// never on the monitors its locator recorded, and never kept for want of a
+// host pool of that name (no host pool can be named with a "/").
+//
+// Mutation: look a "<stack>/<volume>" pool up among the host's pools only —
+// the image is kept (or, without the recorded-mon_host refusal, removed on
+// B), red.
+func TestDeleteRecordedVMDiskVolumes_RBDStackVolumeOnItsCluster(t *testing.T) {
+	s := testServerWithLocks(t)
+	r := installRBDCalls(t)
+	stackOnA(t, s)
+	insertRBDDisk(t, s, "rbd-fast", staleStackB)
+	if kept := s.deleteRecordedVMDiskVolumes(context.Background(), "vm1"); len(kept) != 0 {
+		t.Errorf("kept %v, want the image removed on the volume's cluster", kept)
+	}
+	r.requireOnlyClusterA(t)
+}
+
+// A stack volume the stored stack no longer has, or a stack that is gone,
+// is not a cluster that can be told: with a recorded mon_host the image is
+// kept and named, with nothing run against any cluster. The refusal names
+// the image and a manual removal, since a VM delete does not come back for it.
+//
+// Mutation: fall back to the locator's recorded mon_host — rbd runs on B,
+// red.
+func TestDeleteRecordedVMDiskVolumes_RBDStackVolumeGoneIsKept(t *testing.T) {
+	s := testServerWithLocks(t)
+	r := installRBDCalls(t)
+	insertRBDDisk(t, s, "rbd-fast", staleStackB)
+	kept := s.deleteRecordedVMDiskVolumes(context.Background(), "vm1")
+	if calls := r.all(); len(calls) != 0 {
+		t.Errorf("rbd ran %q", calls)
+	}
+	if len(kept) != 1 {
+		t.Fatalf("kept = %+v, want lv/vm1-data named", kept)
+	}
+	for _, want := range []string{"stk/rbd-fast", "rbd -m", "rm lv/vm1-data"} {
+		if !strings.Contains(kept[0].Reason, want) {
+			t.Errorf("reason %q does not name %q", kept[0].Reason, want)
+		}
+	}
+}
+
+// The refusal for a locator that names no litevirt pool says so, rather than
+// naming an empty pool.
+func TestDeleteRecordedVMDiskVolumes_RBDNoPoolNamedInTheRefusal(t *testing.T) {
+	s := testServerWithLocks(t)
+	installRBDCalls(t)
+	insertRBDDisk(t, s, "", `rbd:lv/vm1-data:id=litevirt:keyring=/k:mon_host=10.0.9.1\:6789`)
+	kept := s.deleteRecordedVMDiskVolumes(context.Background(), "vm1")
+	if len(kept) != 1 || strings.Contains(kept[0].Reason, "pool  ") || !strings.Contains(kept[0].Reason, "names no litevirt pool") {
+		t.Errorf("kept = %+v, want a reason saying it names no litevirt pool", kept)
+	}
+}
+
+// A locator that names no litevirt pool is acted on as the renderer gives it
+// a cluster — by its own options — whatever pool the row's storage_volume
+// names: a row's pool is not where its domain's monitors come from.
+//
+// Mutation: use the row's storage_volume pool for such a locator — rbd runs
+// on that pool's cluster B, red.
+func TestDeleteRecordedVMDiskVolumes_RBDLvpoolLessLocatorIgnoresTheRowsPool(t *testing.T) {
+	s := testServerWithLocks(t)
+	r := installRBDCalls(t)
+	s.addStoragePoolRef("ceph2", StoragePoolRef{Driver: "ceph", Source: "lv", Options: map[string]string{"id": "litevirt", "keyring": "/k", "mon_host": "10.0.9.1:6789"}})
+	insertRBDDisk(t, s, "ceph2", "rbd:lv/vm1-data:id=litevirt:keyring=/k")
+	if kept := s.deleteRecordedVMDiskVolumes(context.Background(), "vm1"); len(kept) != 0 {
+		t.Errorf("kept %v, want the image removed", kept)
+	}
+	for _, c := range r.all() {
+		if strings.Contains(c, "10.0.9.1") {
+			t.Errorf("rbd ran %q on the row's pool's cluster", c)
+		}
+	}
+}
+
+// The renderer's monitors for a compose stack volume are the stored stack's.
+//
+// Mutation: host pools only — no monitors, red.
+func TestCephMonitorsForPool_ReadsAStackVolume(t *testing.T) {
+	s := testServerWithLocks(t)
+	stackOnA(t, s)
+	mons, ok := s.CephMonitorsForPool("stk/rbd-fast")
+	if !ok || len(mons) != 1 || mons[0] != "10.0.0.1:6789" {
+		t.Errorf("CephMonitorsForPool = %v, %v; want [10.0.0.1:6789]", mons, ok)
+	}
+}

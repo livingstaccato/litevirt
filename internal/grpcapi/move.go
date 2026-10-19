@@ -766,17 +766,18 @@ func (s *Server) diskDriver(ctx context.Context, d *corrosion.DiskRecord) (stora
 }
 
 // rbdDiskConfig is the driver configuration an rbd disk's image is acted on
-// with. It is its litevirt pool's on this host (the locator's lvpool; the
-// row's storage_volume only for a locator that names none), loaded from this
-// host's table when the pool list has not caught up: a domain defined now is
-// given that pool's current monitors (rbdDomainSource). With no such pool here
-// it is the locator's own identity, on this host's default ceph.conf or the
-// conf the locator names — never on monitors the locator recorded (mon_host),
-// which may no longer be its cluster's and may be another's, with another
-// image of the same name on it. Anything that cannot be told so (the pool's
-// table or monitors cannot be read, a pool of the name that is not ceph, a
-// locator conf that cannot be read or names no monitor, or an option the
-// renderer does not know) is an error, and nothing is run against any cluster.
+// with: its locator's litevirt pool as this host has it now (cephPoolRef: a
+// host pool, read from the table when the loaded list does not hold it yet,
+// or a compose stack's volume), whose current monitors a domain defined now
+// is given. A locator that names no litevirt pool is acted on as its own
+// identity, as the renderer gives it a cluster by its own options; the row's
+// storage_volume is not consulted. Never on monitors the locator recorded
+// (mon_host) when its pool is not here: they may no longer be its cluster's,
+// and may be another's, with another image of the same name on it. Anything
+// that cannot be told so (the pool, the stack or the pool's monitors cannot
+// be read, a pool of the name that is not ceph, a locator conf that cannot be
+// read or names no monitor, or an option the renderer does not know) is an
+// error, and nothing is run against any cluster.
 func (s *Server) rbdDiskConfig(ctx context.Context, d *corrosion.DiskRecord) (storage.Config, error) {
 	l, ok := storage.ParseCephLocator(d.Path)
 	if !ok {
@@ -787,18 +788,15 @@ func (s *Server) rbdDiskConfig(ctx context.Context, d *corrosion.DiskRecord) (st
 			"; nothing was run against any Ceph cluster", append([]any{l.Spec, d.DiskName}, a...)...)
 	}
 	name := l.Opts["lvpool"]
-	if name == "" {
-		name = d.StorageVolume
-	}
 	if name != "" {
-		ref, found, err := s.resolvePoolErr(ctx, name)
+		ref, found, err := s.cephPoolRef(ctx, name)
 		switch {
 		case err != nil:
 			return refuse("whether this host has its pool %s cannot be read (%v)", name, err)
 		case found && !strings.EqualFold(ref.Driver, "ceph"):
 			return refuse("its pool %s is a %s pool on this host, not a ceph one", name, ref.Driver)
 		case found:
-			if _, ok := s.CephMonitorsForPool(name); !ok {
+			if _, ok := cephRefMonitors(ref); !ok {
 				return refuse("the monitors of its pool %s on this host cannot be read", name)
 			}
 			return storage.Config{Driver: ref.Driver, Source: ref.Source, Target: ref.Target, Options: ref.Options}, nil
@@ -808,8 +806,13 @@ func (s *Server) rbdDiskConfig(ctx context.Context, d *corrosion.DiskRecord) (st
 		return refuse("the Ceph cluster its domain is given cannot be told (an option it does not know, or its conf %s cannot be read or names no monitor)", l.Opts["conf"])
 	}
 	if mh, ok := l.Opts["mon_host"]; ok {
-		return refuse("its pool %s is not on this host, and the monitors its locator recorded (%s) may no longer be its cluster's; "+
-			"add the pool to this host with `lv pool create`, and delete again", name, mh)
+		which := "it names no litevirt pool"
+		if name != "" {
+			which = "its pool " + name + " is not on this host"
+		}
+		return refuse("%s, and the monitors its locator recorded (%s) may no longer be its cluster's. "+
+			"litevirt does not remove it: find the Ceph cluster that holds it and remove it there by hand "+
+			"(rbd -m <that cluster's monitors> rm %s)", which, mh, l.Spec)
 	}
 	// The identity its own locator names: with no --id and --keyring the rbd
 	// CLI would act as client.admin, which a node holding only a restricted

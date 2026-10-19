@@ -2775,12 +2775,18 @@ again, and is forgotten once its pool answers without it (checked every 5
 minutes).
 
 An image is also left, and named the same way, when its cluster cannot be
-told as its domain would be given it: its pool is on this host but its
-monitors cannot be read, the pool of its name here is not a ceph pool, its
-locator carries an option a domain cannot be given, or its pool is not on
-this host and its locator recorded monitors (`mon_host`). Those recorded
-monitors may no longer be its cluster's, so no rbd command is run on them.
-Add the pool to this host with `lv pool create`, then delete again.
+told as its domain would be given it. Its litevirt pool is the host pool, or
+for a compose stack's volume the stored stack's volume, its locator names
+(`lvpool`). The image is left when that pool, the stack or the pool's
+monitors cannot be read, when the pool of its name here is not a ceph pool,
+when its locator carries an option a domain cannot be given, or when its pool
+is not on this host (or the stack no longer has the volume) and its locator
+recorded monitors (`mon_host`). Those recorded monitors may no longer be its
+cluster's, so no rbd command is run on them. The VM's delete does not come
+back for the image: find the Ceph cluster that holds it and remove it there
+by hand (`rbd -m <that cluster's monitors> rm <pool>/<image>`). A journaled
+cutover cleanup that kept one retries by itself, and succeeds once the pool
+is on this host.
 
 ### A VM delete kept a disk file (`disk_leftover`)
 

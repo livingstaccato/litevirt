@@ -24349,6 +24349,7 @@ func (x *ListFirewallDefaultsResponse) GetDefaults() []*FirewallDefault {
 // An older daemon answers each of these RPCs Unimplemented.
 type GetFirewallSynfloodRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
+	LocalOnly     bool                   `protobuf:"varint,1,opt,name=local_only,json=localOnly,proto3" json:"local_only,omitempty"` // this host's entry only (a peer's fan-out leg)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -24381,6 +24382,13 @@ func (x *GetFirewallSynfloodRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use GetFirewallSynfloodRequest.ProtoReflect.Descriptor instead.
 func (*GetFirewallSynfloodRequest) Descriptor() ([]byte, []int) {
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{344}
+}
+
+func (x *GetFirewallSynfloodRequest) GetLocalOnly() bool {
+	if x != nil {
+		return x.LocalOnly
+	}
+	return false
 }
 
 type GetFirewallSynfloodResponse struct {
@@ -46017,8 +46025,10 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\fdefault_deny\x18\x02 \x01(\bR\vdefaultDeny\"\x1d\n" +
 	"\x1bListFirewallDefaultsRequest\"X\n" +
 	"\x1cListFirewallDefaultsResponse\x128\n" +
-	"\bdefaults\x18\x01 \x03(\v2\x1c.litevirt.v1.FirewallDefaultR\bdefaults\"\x1c\n" +
-	"\x1aGetFirewallSynfloodRequest\"^\n" +
+	"\bdefaults\x18\x01 \x03(\v2\x1c.litevirt.v1.FirewallDefaultR\bdefaults\";\n" +
+	"\x1aGetFirewallSynfloodRequest\x12\x1d\n" +
+	"\n" +
+	"local_only\x18\x01 \x01(\bR\tlocalOnly\"^\n" +
 	"\x1bGetFirewallSynfloodResponse\x12?\n" +
 	"\bpolicies\x18\x01 \x03(\v2#.litevirt.v1.FirewallSynfloodPolicyR\bpolicies\"p\n" +
 	"\x1aSetFirewallSynfloodRequest\x12\x14\n" +

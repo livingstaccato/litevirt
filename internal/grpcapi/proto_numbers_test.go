@@ -221,6 +221,11 @@ func TestProtoNumbers_FirewallExtras(t *testing.T) {
 		{&pb.FirewallSynfloodPolicy{}, 5, "set_by"},
 		{&pb.FirewallSynfloodPolicy{}, 6, "updated_at"},
 		{&pb.FirewallSynfloodPolicy{}, 7, "inherited"},
+		{&pb.FirewallSynfloodPolicy{}, 8, "drops_v4"},
+		{&pb.FirewallSynfloodPolicy{}, 9, "drops_v6"},
+		{&pb.FirewallSynfloodPolicy{}, 10, "error"},
+		{&pb.FirewallSynfloodPolicy{}, 11, "in_force"},
+		{&pb.GetFirewallSynfloodRequest{}, 1, "local_only"},
 
 		{&pb.FirewallLogPolicy{}, 1, "scope"},
 		{&pb.FirewallLogPolicy{}, 2, "default_policy"},

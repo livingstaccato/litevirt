@@ -190,7 +190,7 @@ func (s *Server) handleSetFWDefaultDeny(w http.ResponseWriter, r *http.Request) 
 	_ = r.ParseForm()
 	deny := r.FormValue("deny") == "on" || r.FormValue("deny") == "true"
 	if _, err := s.grpc.SetFirewallDefault(s.uiBearerCtx(r),
-		&pb.SetFirewallDefaultRequest{Scope: "cluster", DefaultDeny: deny}); err != nil {
+		&pb.SetFirewallDefaultRequest{DefaultDeny: deny}); err != nil {
 		sendToast(w, "Update failed: "+err.Error(), "error")
 		w.WriteHeader(httpStatusFor(err))
 		return

@@ -73,8 +73,8 @@ func tagRefsText(lead string, refs []firewall.TagGroupRef) string {
 			continue
 		}
 		row := firewall.InvalidRow{Table: r.Table, ID: r.ID}
-		parts = append(parts, fmt.Sprintf("%s %s (tag:%s, stored action %q): %s; remove it with `%s`",
-			r.Table, r.ID, r.Group, r.Action, r.Handling, removeRowCmd(row)))
+		parts = append(parts, fmt.Sprintf("%s %s (tag:%s, action %q): %s; remove it with `%s`",
+			r.Table, r.ID, r.Group, shownAction(r.Action), r.Handling, removeRowCmd(row)))
 	}
 	return lead + ": " + strings.Join(parts, "; ")
 }

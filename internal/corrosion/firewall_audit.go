@@ -102,6 +102,11 @@ func ruleCore(direction, proto, port, cidr, action string, priority int) string 
 	if cidr == "" {
 		cidr = "any"
 	}
+	// A logged rule shows its plain verdict and "log", never the stored
+	// suffix (spec m-13).
+	if verdict, logged := SplitLoggedAction(action); logged {
+		action = verdict + " log"
+	}
 	return fmt.Sprintf("%s %s port=%s cidr=%s %s priority=%d", direction, proto, port, cidr, action, priority)
 }
 

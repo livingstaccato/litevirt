@@ -2,7 +2,9 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -20,15 +22,29 @@ import (
 // runtime clone writes on-disk) and a DYNAMIC IP (blank: a clone must not reuse
 // the source's address), so no IPAM lease is taken here. Legacy raw NICs are
 // copied verbatim (no managed state).
-func (s *Server) cloneContainerNICs(ctName string, srcSpec corrosion.ContainerCreateSpec) ([]corrosion.ContainerInterfaceRecord, []corrosion.ContainerNetwork) {
-	var ifaces []corrosion.ContainerInterfaceRecord
-	var specNets []corrosion.ContainerNetwork
+//
+// The derived MAC is the one the runtime clone wrote; when another NIC holds
+// it (a container of the clone's name that migrated away from this host) a
+// fresh one is drawn, and redrawn reports which NICs, by ordinal, need the
+// clone's config rewritten to it.
+func (s *Server) cloneContainerNICs(ctx context.Context, ctName string, srcSpec corrosion.ContainerCreateSpec) (ifaces []corrosion.ContainerInterfaceRecord, specNets []corrosion.ContainerNetwork, redrawn map[int]string, err error) {
+	alloc := s.newMACAllocator()
+	owner := corrosion.ContainerGuardOwner(s.hostName, ctName)
 	for i, n := range srcSpec.Networks {
 		if n.NetworkName == "" {
 			specNets = append(specNets, n) // legacy/unmanaged → copy as-is
 			continue
 		}
-		mac := corrosion.ContainerMAC(s.hostName, ctName, i)
+		mac, ferr := s.freeContainerMAC(ctx, alloc, ctName, i, owner)
+		if ferr != nil {
+			return nil, nil, nil, ferr
+		}
+		if mac != corrosion.ContainerMAC(s.hostName, ctName, i) {
+			if redrawn == nil {
+				redrawn = map[int]string{}
+			}
+			redrawn[i] = mac
+		}
 		veth := corrosion.ContainerVethName(ctName, i)
 		ifaces = append(ifaces, corrosion.ContainerInterfaceRecord{
 			HostName: s.hostName, CtName: ctName, NetworkName: n.NetworkName, Ordinal: i,
@@ -38,7 +54,23 @@ func (s *Server) cloneContainerNICs(ctName string, srcSpec corrosion.ContainerCr
 			Name: n.Name, Bridge: n.Bridge, MAC: mac, NetworkName: n.NetworkName, SecurityGroups: n.SecurityGroups,
 		})
 	}
-	return ifaces, specNets
+	return ifaces, specNets, redrawn, nil
+}
+
+// freeContainerMAC is NIC ordinal's derived MAC (corrosion.ContainerMAC),
+// or a fresh random one in the same scheme when another NIC holds it or
+// this request already has it.
+func (s *Server) freeContainerMAC(ctx context.Context, alloc *macAllocator, ctName string, ordinal int, owner string) (string, error) {
+	mac := corrosion.ContainerMAC(s.hostName, ctName, ordinal)
+	ok, err := alloc.free(ctx, mac, owner)
+	if err != nil {
+		return "", err
+	}
+	if ok {
+		alloc.reserve(mac)
+		return mac, nil
+	}
+	return alloc.nextContainer(ctx)
 }
 
 // containerSpecNetworkNames lists the network each create-spec NIC attaches to:
@@ -145,6 +177,33 @@ func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName strin
 		return nil, err
 	}
 	haveGateway := false // one default route: the first managed NIC with a subnet
+	// A MAC the request names must be its NIC's own: one another live NIC
+	// records would put two NICs on one MAC, and the guard keyed by it would
+	// admit the other's traffic.
+	owner := corrosion.ContainerGuardOwner(s.hostName, ctName)
+	seenMAC := map[string]bool{}
+	var explicit []string
+	for _, n := range nics {
+		if m := strings.ToLower(n.GetMac()); m != "" {
+			if seenMAC[m] {
+				return nil, status.Errorf(codes.InvalidArgument, "MAC %s is given to two NICs of this request", m)
+			}
+			seenMAC[m] = true
+			explicit = append(explicit, m)
+		}
+	}
+	// The cluster's MACs, read once for the whole request.
+	macs, merr := s.loadMACSet(ctx)
+	if merr != nil {
+		return nil, merr
+	}
+	if mac, holder := macs.firstHeld(explicit, owner); holder != "" {
+		return nil, status.Errorf(codes.AlreadyExists, "MAC %s is already used by %s", mac, holder)
+	}
+	macAlloc := s.newMACAllocatorFrom(macs)
+	for _, m := range explicit {
+		macAlloc.reserve(m)
+	}
 	for i, n := range nics {
 		netName := n.NetworkName
 		var def *compose.NetworkDef
@@ -246,7 +305,13 @@ func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName strin
 			// clone/relocate paths use, so a rebuild reproduces it and two same-named
 			// CTs on different hosts (shared L2) don't collide. (GenerateMAC's 24-bit
 			// 52:54:00 space is VM-shared; CTs get the wider scheme.)
-			mac = corrosion.ContainerMAC(s.hostName, ctName, i)
+			// The derived MAC repeats for the same host, name and NIC: a
+			// container of this name that migrated away holds it. One another
+			// NIC holds is drawn afresh instead.
+			var ferr error
+			if mac, ferr = s.freeContainerMAC(ctx, macAlloc, ctName, i, owner); ferr != nil {
+				return nil, ferr
+			}
 		}
 		veth := containerVethName(ctName, i)
 		// Allocate the IP NOW (writing the lease) — tombstone- and race-safe. A
@@ -331,4 +396,75 @@ func (s *Server) releaseContainerNICs(ctx context.Context, ctName string) error 
 		firstErr = e
 	}
 	return firstErr
+}
+
+// containerNICMACSetter rewrites the MAC of NIC ordinal in a stopped
+// container's runtime config.
+type containerNICMACSetter interface {
+	SetContainerNICMAC(ctx context.Context, name string, ordinal int, mac string) error
+}
+
+// setContainerNICMACs writes macs (by NIC ordinal) into container name's
+// config. A runtime that cannot is a refusal: the config would keep a MAC
+// another NIC holds.
+func (s *Server) setContainerNICMACs(ctx context.Context, name string, macs map[int]string) error {
+	if len(macs) == 0 {
+		return nil
+	}
+	st, ok := s.containerRuntime.(containerNICMACSetter)
+	if !ok {
+		return status.Errorf(codes.Unavailable,
+			"container %q: a NIC's MAC is already used by another NIC, and this host's container runtime cannot write a new one into its config", name)
+	}
+	for ord, mac := range macs {
+		if err := st.SetContainerNICMAC(ctx, name, ord, mac); err != nil {
+			return status.Errorf(codes.Internal, "container %q: write NIC %d's MAC %s: %v", name, ord, mac, err)
+		}
+	}
+	return nil
+}
+
+// redrawHeldContainerMACs gives each NIC of cs whose MAC another workload's
+// NIC or lease holds a fresh one (container scheme), returning the spec with
+// them and one line per NIC changed, naming the old MAC, its holder and the
+// new MAC. Container name on this host is the owner whose own rows do not
+// count.
+func (s *Server) redrawHeldContainerMACs(ctx context.Context, name string, cs corrosion.ContainerCreateSpec) (corrosion.ContainerCreateSpec, []string, error) {
+	set, err := s.loadMACSet(ctx)
+	if err != nil {
+		return cs, nil, err
+	}
+	owner := corrosion.ContainerGuardOwner(s.hostName, name)
+	alloc := s.newMACAllocatorFrom(set)
+	for _, n := range cs.Networks {
+		alloc.reserve(n.MAC)
+	}
+	var nets []corrosion.ContainerNetwork
+	var notes []string
+	for i, n := range cs.Networks {
+		if n.MAC == "" {
+			continue
+		}
+		holder := set.describeHeldBy(n.MAC, owner)
+		if holder == "" {
+			continue
+		}
+		if nets == nil {
+			nets = append([]corrosion.ContainerNetwork(nil), cs.Networks...)
+		}
+		mac, derr := alloc.nextContainer(ctx)
+		if derr != nil {
+			return cs, nil, derr
+		}
+		nets[i].MAC = mac
+		nic := n.Name
+		if nic == "" {
+			nic = fmt.Sprintf("%d", i)
+		}
+		notes = append(notes, fmt.Sprintf("NIC %s: MAC %s is held by %s; restored with %s", nic, strings.ToLower(n.MAC), holder, mac))
+	}
+	if nets != nil {
+		cs.Networks = nets
+	}
+	return cs, notes, nil
 }

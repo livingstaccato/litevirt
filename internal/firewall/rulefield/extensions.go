@@ -24,10 +24,17 @@ type Extensions struct {
 	TagCIDR func(cidr string) (ok bool, err error)
 }
 
-// ruleExtensions are this build's: the tag-group cidr (D5). C2 fills the log
-// action here, in this file; nothing assigns them at run time
-// (SetExtensionsForTest is for tests).
-var ruleExtensions = Extensions{TagCIDR: tagCIDR}
+// ruleExtensions are this build's: the server's log action (C2) and the
+// tag-group cidr (D5). Nothing assigns them at run time (SetExtensionsForTest
+// is for tests).
+var ruleExtensions = Extensions{LogAction: logAction, TagCIDR: tagCIDR}
+
+// logAction takes the server's log form when it names a verdict: a bare
+// "+log" names none, so it is refused rather than read as an accept.
+func logAction(action string) (string, bool) {
+	verdict, ok := LogActionVerdict(action)
+	return verdict, ok && verdict != ""
+}
 
 // tagCIDR takes a cidr that starts "tag:" in any case, padded or not, and
 // refuses it unless it is exactly tag:<group name>: a client that means a tag

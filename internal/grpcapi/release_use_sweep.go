@@ -28,6 +28,7 @@ type releaseUseProbe struct {
 
 // releaseUseProbes are the features the sweep looks for, one data probe each.
 var releaseUseProbes = []releaseUseProbe{
+	{feature: capabilities.FeatureFirewallLog, present: corrosion.FirewallLogDataPresent},
 	{feature: capabilities.FeatureFirewallTagGroups, present: corrosion.FirewallTagGroupsDataPresent},
 }
 

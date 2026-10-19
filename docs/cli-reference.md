@@ -1440,9 +1440,9 @@ lv sg create <name> [--project <p>]   # --project: owned by p; only p's workload
 lv sg ls [--project <p>]              # --project: p's groups and the global ones
 lv sg rm <id>
 lv sg rule-add <sg-id-or-name> --direction ingress|egress --proto tcp \
-    --port <p> --cidr <c> [--action accept|drop|reject] [--priority N]
+    --port <p> --cidr <c> [--action accept|drop|reject] [--priority N] [--log]
 lv sg rule-add <sg-id-or-name> --macro <name> [--cidr <c>] [--direction ingress|egress] \
-    [--action accept|drop|reject] [--priority N]    # one rule per macro row; prints every id
+    [--action accept|drop|reject] [--priority N] [--log]    # one rule per macro row; prints every id
 lv sg rule-ls <sg-id-or-name>
 lv sg rule-rm <rule-id>       # Takes the RULE id from rule-ls, not the group id
 lv sg bind <vm> --network <name> --sg <name> [--sg <name>...]   # Bind SGs to a VM NIC
@@ -1465,15 +1465,15 @@ lv firewall reload            # Force the reconciler to re-read state and apply 
 
 # Cluster-tier rules (apply to every NIC on every host):
 lv firewall cluster-rule add --direction ingress|egress --proto tcp \
-    --port <p> --cidr <c> [--action accept|drop|reject] [--comment <s>] [--priority N]
-lv firewall cluster-rule add --macro <name> [--direction ...] [--cidr <c>] [--action ...] [--comment <s>]
+    --port <p> --cidr <c> [--action accept|drop|reject] [--comment <s>] [--priority N] [--log]
+lv firewall cluster-rule add --macro <name> [--direction ...] [--cidr <c>] [--action ...] [--comment <s>] [--log]
 lv firewall cluster-rule ls
 lv firewall cluster-rule rm <id>
 
 # Host-tier rules (apply to every NIC on one host):
 lv firewall host-rule add --host <name> --direction ingress|egress --proto tcp \
-    --port <p> --cidr <c> [--action accept|drop|reject] [--comment <s>] [--priority N]
-lv firewall host-rule add --host <name> --macro <name> [--direction ...] [--cidr <c>] [--action ...] [--comment <s>]
+    --port <p> --cidr <c> [--action accept|drop|reject] [--comment <s>] [--priority N] [--log]
+lv firewall host-rule add --host <name> --macro <name> [--direction ...] [--cidr <c>] [--action ...] [--comment <s>] [--log]
 lv firewall host-rule ls [--host <name>]
 lv firewall host-rule rm <id>
 
@@ -1484,6 +1484,8 @@ lv firewall ipset rm <id>
 
 # Default forward policy (deny = drop anything not explicitly accepted):
 lv firewall default-deny <on|off> [--scope <host>]   # no --scope = cluster-wide
+  # --scope names a host lv host ls shows (an unknown name is refused). A host named
+  # cluster cannot have its own default-deny: --scope cluster is then refused.
 
 # NIC guards (anti-spoofing). New NICs are guarded by default; relaxing one
 # needs network.update on its network. --allow replaces the list (repeatable).
@@ -1497,6 +1499,24 @@ lv firewall nic-guard resume <vm> # let a VM held paused for its guards run, gua
 lv firewall enforce status          # mode per host + would-drop totals per workload, NIC and rule, since <time>
 lv firewall enforce on              # enforce (admin, audited); off = observe
 lv firewall enforce reset-counters  # restart every host's would-drop totals from now (admin, audited)
+
+# Logging (docs/firewall.md, "Logging"). --log on a rule-add logs each packet the rule
+# matches; rule ls shows such a rule's action as "<verdict> log". lv asks the daemon first
+# and refuses --log against one that predates logging; an --action holding "+" is refused.
+lv firewall log-policy status                                          # the cluster's policy, then each host's
+lv firewall log-policy on  [--scope <host>] [--rate N] [--burst N]     # log each NIC's default verdict
+lv firewall log-policy off [--scope <host>] [--rate N] [--burst N]     # logged rules still log
+lv firewall log-policy inherit --scope <host>                           # clear a host's own policy
+lv firewall log [--host <h>] [--workload <name>] [--since 15m] [--limit 200] [--follow]
+  # TIME HOST WORKLOAD DEVICE SIDE RULE VERDICT PROTO SRC DST LEN, merged by time across every
+  # active host (a host that does not answer is named on stderr); --follow polls from each
+  # host's newest sequence. Needs firewall.log.view at / (Admin; docs/auth.md).
+  # --rate is log records per second per guest NIC side (1-10000, default 5); --burst is
+  # packets (1-10000, default 10). Every logged line of one NIC side shares that budget.
+  # Role operator; audited as firewall.log_policy; refused until the cluster upgrade has finished.
+  # --scope names a host, a host named "cluster" included; leave it out for the cluster-wide
+  # policy. status shows a row the daemon cannot read, or a host inheriting one, as
+  # "unreadable (read as off at 5/10)"; the API returns such a row with rate 0 and burst 0.
 
 # Firewall tags: per-workload key/value pairs, kept apart from labels (sg.write to change; audited).
 lv firewall tag set <vm> <key>=<value>...                          # adds or replaces keys
@@ -1518,6 +1538,15 @@ lv firewall tag-group rm <name> [--force]
   # before sending a tag: cidr (a rule, a compose file, or a gitops file that may hold one) and
   # refuses unless the daemon shows it knows tag groups.
   # A member leaving a group does not cut its open connections (docs/firewall.md, "Tag groups").
+
+# SYN-flood protection on guest NICs (docs/firewall.md, "SYN-flood protection")
+lv firewall synflood status                     # cluster policy, then per host: policy, in force (on/ipv4-only/ipv6-only/observe/guards-only/no-guest-nics/unavailable/off/predates), rate, burst, drops v4/v6 since its last reload
+lv firewall synflood on [--rate 200] [--burst 1000] [--scope <host>]   # no --scope = cluster-wide
+lv firewall synflood off [--scope <host>]
+lv firewall synflood inherit --scope <host>     # clear a host's own policy; the cluster's applies
+  # on, off and inherit need the operator role, are audited (firewall.synflood) and are refused
+  # until the cluster upgrade has finished. --rate is new SYNs per second per guest NIC and source
+  # address, --burst packets; each 1-100000.
 ```
 
 See `docs/firewall.md` for the three-tier model, where each tier is enforced

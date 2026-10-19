@@ -1811,6 +1811,17 @@ created and torn down. `lv rm <vm>` removes the VM; deploying the stack again
 next pass after either. A VM created after the stack was torn down is a
 deploy of that stack name in progress, and is not reported.
 
+### SYN-flood condition (`firewall.synflood.unavailable`)
+
+Raised per host by its firewall reconciler, severity warning, and resolved on
+the next pass that no longer finds the cause. docs/firewall.md, "SYN-flood
+protection". An unreadable SYN-flood policy row raises
+`firewall.policy.unreadable` (see "Firewall logging and policy conditions").
+
+| Condition | Raised when |
+|---|---|
+| `firewall.synflood.unavailable` | the SYN-flood policy is on for this host, but its kernel refused the SYN-flood rules of one or both address families at daemon start (`nft_limit` missing, or an nft that cannot key a set by an IPv6 prefix): that family's SYNs to its guest NICs are not limited, and the evidence names it. Restart the daemon once it can |
+
 ### Tag-group conditions (`firewall.tag_group.*`)
 
 Raised per host by its firewall reconciler, and resolved on the next pass that
@@ -1830,6 +1841,20 @@ no longer finds the cause. Each names the rules, groups or workloads involved
 in this host's view, 0 for a group this host cannot read. Hosts can differ for
 up to one replication lag plus the 30 second reconcile tick;
 `lv firewall tag-group ls --members` shows the members.
+
+### Firewall logging and policy conditions
+
+Raised per host; each resolves when its cause goes. docs/firewall.md,
+"Logging", has the detail.
+
+| Condition | Severity | Raised when |
+|---|---|---|
+| `firewall.log.unavailable` | warning | at start the kernel or nft refused the logging forms (`nft_log`, `nfnetlink_log`, `nft_limit`): no packet is logged on this host; the per-NIC rules are unaffected. Load the modules and restart the daemon |
+| `firewall.log.listener` | warning | the daemon cannot hold its NFLOG group (another program holds it): no log line is rendered on this host, so packets are not logged and nothing reaches that program (a listener that loses the group has its lines removed by the next pass, run at once). Set `firewall.log_group` to a free group and restart |
+| `firewall.policy.unreadable` | warning | a firewall policy row cannot be read here; the evidence names each row and the fallback it is read as: a SYN-flood policy (`firewall_synflood`, `firewall_synflood/<host>`) as on at 200/1000, a log policy (`firewall_log`, `firewall_log/<host>`) as logging off at the default budget. Set that policy again to replace the row: `lv firewall synflood on`, `off` or `inherit --scope <host>`, or `lv firewall log-policy on`, `off` or `inherit --scope <host>` |
+
+`litevirt_firewall_log_records_total{outcome}` counts log records `kept`,
+`rate_limited` (over `firewall.log_max_rate`) and lost to `overflow`.
 
 ### Deferred out-of-band stop sync after a restart or rejoin
 
@@ -2584,6 +2609,35 @@ The holds are checked every five seconds, and a condition is written only when
 it changes. `lv host lun-holds <host>` lists them. Discard one only after the
 check in [storage.md](storage.md#iscsi-one-lun-one-disk): a hold is what keeps
 a second VM off a LUN whose re-created VM's rows are still on their way.
+
+### Two NICs on one MAC (`mac_duplicate`)
+
+Each host looks, at start and every minute, for a MAC that the live NICs of
+two workloads record, one of them on this host: two hosts that drew one MAC
+at the same moment, each before seeing the other's NIC, or NICs an earlier
+build made. Both copies of a container a migrate is moving (or whose source
+it parked) are one workload, not two. While one is there the host raises
+`mac_duplicate` (evaluator `nic_identity`, subject `host/<host>`, critical);
+the evidence names the MAC and each NIC (its VM or container, network and
+host). It resolves on the first look that finds none.
+
+Nothing is rewritten: a running guest keeps its MAC. A stopped VM whose NIC's
+MAC another workload's NIC holds is refused `lv start` until it has a new one
+(an address lease alone holding the MAC raises nothing and refuses nothing);
+a start that resumes a guest a drain moved here is not refused. A drain does
+not cold-move a running VM whose NIC's MAC another NIC holds: it is refused
+before the shutdown and keeps running where it is. A container's start is not
+refused. On one network the two NICs receive each other's traffic: the
+MAC-keyed forwarding entries of a vxlan network and the DHCP reservation keyed
+by the MAC send one guest's unicast and DHCP replies to the other. Give one a
+new MAC: for a VM, `lv detach-nic <vm> <mac>`, then `lv attach-nic <vm>
+<network>`; for a container, clone it under a new name and remove the
+original (`lv ct clone <ct> <new-name>`, then `lv ct rm <ct>`), which keeps
+its data.
+
+During a rolling upgrade, only hosts on this build look: two colliding NICs
+whose hosts both still run an earlier build raise nothing until one of the
+hosts is upgraded.
 
 ### An iSCSI pool has no session (`iscsi_session_missing`)
 

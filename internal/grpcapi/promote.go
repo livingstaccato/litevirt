@@ -1635,10 +1635,17 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	if renamed {
 		renamedNICs = spec.Network
 	}
+	macs := s.newMACAllocator()
 	for i, n := range renamedNICs {
-		mac := lv.GenerateMAC()
+		var mac string
 		if adoptedMACs != nil {
 			mac = adoptedMACs[i] // the running guest's NIC
+		} else {
+			var merr error
+			if mac, merr = macs.next(ctx); merr != nil {
+				removeLive()
+				return merr
+			}
 		}
 		// The spec records the NIC's real MAC (as a clone does), so its queues
 		// are matched at every later redefine, not lost to the source's MAC.

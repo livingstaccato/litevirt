@@ -825,22 +825,8 @@ func (s *Server) ExecContainer(ctx context.Context, req *pb.ExecContainerRequest
 	// grant (requireContainerRoot), judged here from the resolved row, and
 	// again on the owner from its own row for a forward (execRootRefused):
 	// an entry whose replica lags may not know the container became one.
-	if mode := rootContainerMode(*rec); mode != "" {
-		if s.execRootRefused(ctx) {
-			s.audit(ctx, "ct.exec", req.Name, "permission denied on the owner ("+mode+"): "+strings.Join(req.Argv, " "), "denied")
-			return nil, status.Errorf(codes.PermissionDenied,
-				"container %q is %s on its host %s, so exec in it needs the Admin role or the ContainerRoot role on it "+
-					"(an Admin grants it with lv role grant ContainerRoot <principal> --path %s)",
-				req.Name, mode, s.hostName, ctRBACPathFor(rec.Project, req.Name))
-		}
-		if err := s.requireContainerRoot(ctx, *rec); err != nil {
-			s.audit(ctx, "ct.exec", req.Name, "permission denied ("+mode+"): "+strings.Join(req.Argv, " "), "denied")
-			return nil, status.Errorf(codes.PermissionDenied,
-				"container %q is %s, so exec in it needs the Admin role or the ContainerRoot role on it "+
-					"(an Admin grants it with lv role grant ContainerRoot <principal> --path %s); "+
-					"or move it over first with lv ct convert --unprivileged --confinement default %s",
-				req.Name, mode, ctRBACPathFor(rec.Project, req.Name), req.Name)
-		}
+	if err := s.judgeExecMode(ctx, *rec, rootContainerMode(*rec), req.Argv); err != nil {
+		return nil, err
 	}
 	if host != s.hostName {
 		c, conn, err := s.peerClient(ctx, host)
@@ -856,6 +842,22 @@ func (s *Server) ExecContainer(ctx context.Context, req *pb.ExecContainerRequest
 	}
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")
+	}
+	execAfterJudge()
+	// Judge again where the exec attaches, from the row read under the
+	// container's lock, which lv ct stop, start and convert hold: the row
+	// judged above may be stale by now.
+	unlock := s.LockContainer(req.Name)
+	defer unlock()
+	cur, err := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "exec: read container: %v", err)
+	}
+	if cur == nil {
+		return nil, status.Errorf(codes.NotFound, "container %q not found on %s", req.Name, s.hostName)
+	}
+	if err := s.judgeExecMode(ctx, *cur, rootContainerMode(*cur), req.Argv); err != nil {
+		return nil, err
 	}
 	res, err := s.containerRuntime.ExecContainer(ctx, req.Name, req.Argv)
 	if err != nil {

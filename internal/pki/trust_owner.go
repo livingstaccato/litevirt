@@ -20,22 +20,23 @@ const trustLockName = ".trust.lock"
 // read lease may precede that caller's DB transaction; writers never dial peers
 // or fetch keys while holding this barrier.
 type trustOwner struct {
-	successorFloor    map[[32]byte][]byte
-	dir               string
-	gate              chan struct{}
-	nonce             [32]byte
-	revision          uint64
-	root              []byte
-	digest            [32]byte
-	servedFingerprint [32]byte
-	revokedFloor      map[string]bool
-	capabilities      map[*HostCertificateValidation]bool
-	policy            bool
-	policyCell        *atomic.Bool
-	pendingPolicy     atomic.Pointer[atomic.Bool]
-	dirty             error
-	crlEstablished    bool
-	retired           bool
+	successorFloor          map[[32]byte][]byte
+	dir                     string
+	gate                    chan struct{}
+	nonce                   [32]byte
+	revision                uint64
+	root                    []byte
+	digest                  [32]byte
+	servedFingerprint       [32]byte
+	revokedFloor            map[string]bool
+	capabilities            map[*HostCertificateValidation]bool
+	policy                  bool
+	policyCell              *atomic.Bool
+	pendingPolicy           atomic.Pointer[atomic.Bool]
+	dirty                   error
+	crlEstablished          bool
+	retired                 bool
+	nativeReservationDigest [32]byte
 }
 
 var trustOwners sync.Map

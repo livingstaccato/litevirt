@@ -26,6 +26,8 @@ const nativeCARecordSize = 104
 // retained: neither retry nor normal existing-root return mints another record.
 type nativeOperatorCA struct {
 	record, cert, key []byte
+	original          []byte
+	assignment        *nativeAssignedOperation
 }
 
 func readNativeCAFile(path string, limit int) ([]byte, error) {
@@ -53,7 +55,7 @@ func readNativeCAFile(path string, limit int) ([]byte, error) {
 }
 
 func (o *trustOwner) readNativeOperatorCALocked() (*nativeOperatorCA, error) {
-	record, err := readNativeCAFile(filepath.Join(o.dir, nativeCARecordName), nativeCARecordSize)
+	record, err := readNativeCAFile(filepath.Join(o.dir, nativeCARecordName), nativeAssignmentLimit)
 	if errors.Is(err, os.ErrNotExist) {
 		if _, stageErr := os.Lstat(filepath.Join(o.dir, nativeCAStageName)); !errors.Is(stageErr, os.ErrNotExist) {
 			return nil, errors.New("uncommitted native CA staging requires repair")
@@ -63,7 +65,16 @@ func (o *trustOwner) readNativeOperatorCALocked() (*nativeOperatorCA, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(record) != nativeCARecordSize || string(record[:8]) != "LVNCA001" || bytes.Equal(record[8:40], make([]byte, 32)) {
+	original := record
+	var assignment *nativeAssignedOperation
+	if len(record) >= 8 && string(record[:8]) == "LVNCA002" {
+		assignment = new(nativeAssignedOperation)
+		if err := nativeCanonicalDER(record[8:], nativeAssignmentLimit-8, assignment); err != nil {
+			return nil, err
+		}
+		original = assignment.Original
+	}
+	if len(original) != nativeCARecordSize || string(original[:8]) != "LVNCA001" || bytes.Equal(original[8:40], make([]byte, 32)) {
 		return nil, errors.New("invalid native CA operation")
 	}
 	stage := filepath.Join(o.dir, nativeCAStageName)
@@ -83,7 +94,7 @@ func (o *trustOwner) readNativeOperatorCALocked() (*nativeOperatorCA, error) {
 		return nil, err
 	}
 	certHash, keyHash := sha256.Sum256(cert), sha256.Sum256(key)
-	if !bytes.Equal(record[40:72], certHash[:]) || !bytes.Equal(record[72:], keyHash[:]) {
+	if !bytes.Equal(original[40:72], certHash[:]) || !bytes.Equal(original[72:], keyHash[:]) {
 		return nil, errors.New("native CA staged binding mismatch")
 	}
 	pair, err := tls.X509KeyPair(cert, key)
@@ -100,7 +111,12 @@ func (o *trustOwner) readNativeOperatorCALocked() (*nativeOperatorCA, error) {
 	if !root.IsCA || root.CheckSignatureFrom(root) != nil {
 		return nil, errors.New("native CA is not self-signed")
 	}
-	return &nativeOperatorCA{record: record, cert: cert, key: key}, nil
+	if assignment != nil {
+		if err := validateNativeAssignment(assignment, cert, original); err != nil {
+			return nil, err
+		}
+	}
+	return &nativeOperatorCA{record: record, cert: cert, key: key, original: original, assignment: assignment}, nil
 }
 
 // Validate before the old existing-root early return. Missing active material
@@ -125,6 +141,9 @@ func (o *trustOwner) nativeOperatorCAPendingLocked(n *nativeOperatorCA) (bool, e
 			return false, err
 		}
 		return false, nil
+	}
+	if n.assignment != nil {
+		return false, errors.New("assigned native CA publication is missing; refusing re-publication")
 	}
 	if len(o.root) != 0 || o.servedFingerprint != [32]byte{} || o.retired {
 		return false, errors.New("established native CA is missing")
@@ -174,7 +193,7 @@ func (o *trustOwner) publishNativeOperatorCALocked(ctx context.Context) (err err
 				}
 			}
 		}()
-		if err := GenerateCA(filepath.Join(stage, "ca.crt"), filepath.Join(stage, "ca.key")); err != nil {
+		if err := generateCAAt(filepath.Join(stage, "ca.crt"), filepath.Join(stage, "ca.key"), nativeEnrollmentNow()); err != nil {
 			return err
 		}
 		if err := os.Chmod(filepath.Join(stage, "ca.crt"), 0600); err != nil {
@@ -213,7 +232,7 @@ func (o *trustOwner) publishNativeOperatorCALocked(ctx context.Context) (err err
 		if err := trustDurabilityPoint("native-ca:record-committed"); err != nil {
 			return err
 		}
-		n = &nativeOperatorCA{record: record, cert: cert, key: key}
+		n = &nativeOperatorCA{record: record, cert: cert, key: key, original: record}
 	}
 	if err := ctx.Err(); err != nil {
 		return err

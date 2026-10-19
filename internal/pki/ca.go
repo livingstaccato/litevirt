@@ -24,6 +24,12 @@ var auditSigningGenerationOID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 61117, 1
 
 // GenerateCA creates a self-signed ECDSA P-256 CA certificate and key.
 func GenerateCA(certPath, keyPath string) error {
+	return generateCAAt(certPath, keyPath, time.Now())
+}
+
+// Keep ordinary CA policy here; native creation supplies its private clock so
+// tests can exercise actual owner publication at a real certificate boundary.
+func generateCAAt(certPath, keyPath string, at time.Time) error {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return fmt.Errorf("generate CA key: %w", err)
@@ -40,8 +46,8 @@ func GenerateCA(certPath, keyPath string) error {
 			Organization: []string{"litevirt"},
 			CommonName:   "litevirt Cluster CA",
 		},
-		NotBefore:             time.Now().Add(-5 * time.Minute),
-		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour), // 10 years
+		NotBefore:             at.Add(-5 * time.Minute),
+		NotAfter:              at.Add(10 * 365 * 24 * time.Hour), // 10 years
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		BasicConstraintsValid: true,
 		IsCA:                  true,

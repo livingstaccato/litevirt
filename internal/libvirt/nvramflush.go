@@ -121,6 +121,7 @@ type NvramFlusher struct {
 	failed   map[string]NvramFlushFailure // by failKey: the file's identity
 	dirty    bool                         // failed changed since the state file was last written
 	missing  map[string]int               // by failKey: consecutive sweeps that found the failed file nowhere
+	recorded map[string]bool              // by recordKey: the episodes the state file held at its last write
 	openFail map[string]nvramOpenFail     // episodes, by file path or dirReadKey/dirFsyncKey
 	stall    *NvramFlushFailure           // the sweep stuck in an fsync, if one is
 	sweepGen uint64                       // changes at each watched sweep's start and end (beginSweep, endSweep)
@@ -627,18 +628,23 @@ func (f *NvramFlusher) persist() {
 	out := f.snapshotLocked(nil)
 	f.dirty = false
 	f.mu.Unlock()
-	if !f.writeStateLocked(out) {
-		f.mu.Lock()
+	ok := f.writeStateLocked(out)
+	f.mu.Lock()
+	if ok {
+		f.noteRecorded(out)
+	} else {
 		f.dirty = true
-		f.mu.Unlock()
 	}
+	f.mu.Unlock()
 }
 
 // recordFailure makes failure v visible (Failures, and through it the
 // condition and an acknowledgement) only once the state file holds it, so no
 // replicated write can be its only record: a tick could otherwise publish it,
 // a stale resolve overwrite that row, and a restart lose it. If the state
-// file cannot be written it is made visible anyway, and the write retried.
+// file cannot be written it is visible anyway, listed by Unrecorded until a
+// retried write succeeds; the daemon then keeps it out of what a resolve can
+// overwrite (nvram_flush_unrecorded).
 // It reports whether the file already had a failure.
 func (f *NvramFlusher) recordFailure(v NvramFlushFailure) (already bool) {
 	f.stateMu.Lock()
@@ -654,7 +660,9 @@ func (f *NvramFlusher) recordFailure(v NvramFlushFailure) (already bool) {
 	f.mu.Lock()
 	f.failed[failKey(v)] = v
 	if !written {
-		f.dirty = true
+		f.dirty = true // and Unrecorded lists it until a write succeeds
+	} else if f.statePath != "" {
+		f.noteRecorded(out)
 	}
 	f.mu.Unlock()
 	return already
@@ -869,4 +877,34 @@ func (f *NvramFlusher) markStalled(gen uint64, p string, elapsed time.Duration) 
 		At:    time.Now().UTC().Format(time.RFC3339)}
 	f.mu.Unlock()
 	f.onStall(p, elapsed)
+}
+
+// Unrecorded lists the failures the state file does not hold yet (its
+// writes failed since they were found), by path; none without a state file.
+func (f *NvramFlusher) Unrecorded() []NvramFlushFailure {
+	if f.statePath == "" {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []NvramFlushFailure
+	for _, v := range f.failed {
+		if !f.recorded[recordKey(v)] {
+			out = append(out, v)
+		}
+	}
+	sortFailures(out)
+	return out
+}
+
+// recordKey names a failure episode as the state file last held it.
+func recordKey(v NvramFlushFailure) string { return failKey(v) + "\x00" + v.Episode }
+
+// noteRecorded remembers that the state file now holds exactly out. The
+// caller holds mu.
+func (f *NvramFlusher) noteRecorded(out []NvramFlushFailure) {
+	f.recorded = make(map[string]bool, len(out))
+	for _, v := range out {
+		f.recorded[recordKey(v)] = true
+	}
 }

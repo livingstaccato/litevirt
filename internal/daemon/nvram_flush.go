@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -31,6 +32,11 @@ const CondNvramFlushFailed = libvirt.CondNvramFlushFailed
 // and resolved once every such file is flushed again (or gone).
 const CondNvramFlushBlocked = "nvram_flush_blocked"
 
+// CondNvramFlushUnrecorded is raised by a node about itself while a failed
+// vars fsync is not yet in its state file
+// (<data_dir>/nvram-flush-failures.json), which it cannot write.
+const CondNvramFlushUnrecorded = "nvram_flush_unrecorded"
+
 // nvramFlushConditionEvery is how often the condition follows the flusher.
 const nvramFlushConditionEvery = 10 * time.Second
 
@@ -41,6 +47,10 @@ const nvramFlushRemedy = "the listed vars files may be missing UEFI variable wri
 	"which replaces its vars file; for any VM, lv rm <vm> without --keep-disks, which removes it; " +
 	"or, for a VM kept as it is, an admin's acknowledgement that its vars store may be stale: " +
 	"lv health resolve nvram_flush_failed host/<host> --accept-stale-uefi-vars --reason <why>"
+
+const nvramFlushUnrecordedRemedy = "the listed failed vars flushes are not in <data_dir>/nvram-flush-failures.json, " +
+	"which this host could not write; they are kept here, and named in nvram_flush_failed, until it can. " +
+	"Fix the data directory's filesystem (dmesg, df); the condition clears once the file is written"
 
 const nvramFlushBlockedRemedy = "the listed vars files or directories could not be opened, read or fsynced, " +
 	"or an fsync has not returned, so the guests' UEFI variable writes are not being made durable; " +
@@ -92,6 +102,7 @@ type nvramConditionState struct {
 	// failure.
 	holdResolve             bool
 	lastFailed, lastBlocked string // what each condition was last written as
+	lastUnrecorded          string
 	// openFiles: the failures nvram_flush_failed was last written open with.
 	// If it is found resolved while they are, an admin acknowledged them.
 	openFiles []libvirt.NvramFlushFailure
@@ -144,6 +155,14 @@ func (d *Daemon) nvramFlushTick(ctx context.Context, f *libvirt.NvramFlusher, st
 	if len(failed) > 0 {
 		st.holdResolve = false
 	}
+	// A failure the state file lacks is named in nvram_flush_failed, which a
+	// resolve overwrites, only once nvram_flush_unrecorded (which no resolve
+	// touches) holds it; a restart carries it over from there.
+	unrec := f.Unrecorded()
+	d.syncNvramCondition(ctx, CondNvramFlushUnrecorded, corrosion.SeverityCritical, unrec, nvramFlushUnrecordedRemedy, &st.lastUnrecorded)
+	if b, _ := json.Marshal(unrec); string(b) != st.lastUnrecorded {
+		failed = withoutFailures(failed, unrec)
+	}
 	if !st.holdResolve {
 		d.syncNvramCondition(ctx, CondNvramFlushFailed, corrosion.SeverityCritical, failed, nvramFlushRemedy, &st.lastFailed)
 		if b, _ := json.Marshal(failed); string(b) == st.lastFailed {
@@ -161,6 +180,19 @@ func (d *Daemon) nvramFlushTick(ctx context.Context, f *libvirt.NvramFlusher, st
 // drops nothing it did not name, across a restart too. A read error is
 // returned, to be retried.
 func (d *Daemon) seedNvramFlushFailures(ctx context.Context, f *libvirt.NvramFlusher, st *nvramConditionState) error {
+	// Failures the state file never recorded: no resolve touches this row.
+	urow, ufound, err := readNvramFlushCondition(ctx, d.db, nvramFlushEvaluator, CondNvramFlushUnrecorded, "host", d.cfg.HostName)
+	if err != nil {
+		return err
+	}
+	if ufound && urow.Lifecycle != corrosion.ConditionResolved {
+		var ev nvramFlushEvidence
+		if err := json.Unmarshal([]byte(urow.Evidence), &ev); err != nil {
+			slog.Error("the nvram_flush_unrecorded evidence cannot be read; the failures it held are not known", "error", err)
+		} else {
+			f.Seed(ev.Files)
+		}
+	}
 	row, found, err := readNvramFlushCondition(ctx, d.db, nvramFlushEvaluator, CondNvramFlushFailed, "host", d.cfg.HostName)
 	if err != nil {
 		return err
@@ -221,6 +253,19 @@ func stopAndWait(cancel func(), done <-chan struct{}, bound time.Duration) {
 	case <-time.After(bound):
 		slog.Warn("UEFI vars flusher's last sweep did not finish in time; exiting without it", "waited", bound)
 	}
+}
+
+// withoutFailures is failed less the episodes in drop.
+func withoutFailures(failed, drop []libvirt.NvramFlushFailure) []libvirt.NvramFlushFailure {
+	out := make([]libvirt.NvramFlushFailure, 0, len(failed))
+	for _, v := range failed {
+		if !slices.ContainsFunc(drop, func(x libvirt.NvramFlushFailure) bool {
+			return x.Path == v.Path && x.Ino == v.Ino && x.Episode == v.Episode
+		}) {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // acknowledgedFiles is the failures this host wrote that the resolved row

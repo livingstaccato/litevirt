@@ -101,14 +101,17 @@ func lockItemFile(ctx context.Context, dest string) (func(), error) {
 			_ = f.Close()
 			return nil, fmt.Errorf("lock %s: %w", dest, err)
 		}
-		if ok && lockIsAtPath(f, path) {
+		if ok && lockAtPath(f, path) {
 			return func() { _ = f.Close() }, nil
 		}
 		if ok {
 			// The file was removed (an item's lock is cleaned up once the
 			// item is gone) while this waited on it: lock the file now at
-			// the path instead.
+			// the path instead, unless the caller has given up.
 			_ = f.Close()
+			if err := ctx.Err(); err != nil {
+				return nil, fmt.Errorf("lock %s: %w", dest, err)
+			}
 			if f, err = os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600); err != nil {
 				return nil, fmt.Errorf("lock %s: %w", dest, err)
 			}
@@ -130,12 +133,15 @@ func tryLockItem(dir, item string) (release func(), ok bool) {
 	if err != nil {
 		return nil, false
 	}
-	if got, err := flockTry(f); err != nil || !got || !lockIsAtPath(f, filepath.Join(dir, item+lockSuffix)) {
+	if got, err := flockTry(f); err != nil || !got || !lockAtPath(f, filepath.Join(dir, item+lockSuffix)) {
 		_ = f.Close()
 		return nil, false
 	}
 	return func() { _ = f.Close() }, true
 }
+
+// lockAtPath is lockIsAtPath; a test replaces it.
+var lockAtPath = lockIsAtPath
 
 // lockIsAtPath reports whether the locked file f is still the file at path:
 // a lock on a file removed from it locks nothing.

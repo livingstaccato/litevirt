@@ -115,9 +115,8 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) (err error) {
 		if err == nil {
 			return
 		}
-		if created {
-			_ = os.Remove(opts.Dest) // only an empty directory goes
-		}
+		// A first pull never put anything at Dest (it unpacks beside it);
+		// only its lock file is left to go.
 		if _, serr := os.Lstat(opts.Dest); errors.Is(serr, os.ErrNotExist) {
 			_ = os.Remove(filepath.Join(filepath.Dir(opts.Dest), unpackDirName, filepath.Base(opts.Dest)+lockSuffix))
 		}
@@ -132,17 +131,18 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) (err error) {
 	if exists && !opts.Replace {
 		return fmt.Errorf("%w: %s", ErrOCIItemExists, opts.Dest)
 	}
-	if _, serr := os.Lstat(opts.Dest); errors.Is(serr, os.ErrNotExist) {
-		created = true
-	}
-	if err := os.MkdirAll(opts.Dest, 0750); err != nil {
-		return fmt.Errorf("mkdir dest: %w", err)
-	}
-	// Where umoci unpacks: Dest itself when it holds no bundle yet (new, or
-	// an empty or foreign directory umoci unpacks into as before), else a
-	// fresh directory beside it that then replaces it.
+	// Where umoci unpacks: a fresh directory beside the item, which then
+	// takes its place (replaceBundle) or becomes it (a first pull, renamed
+	// in only when it succeeded, so a failure leaves no partial item). A
+	// directory already at Dest that holds no bundle (empty, or foreign) is
+	// unpacked into as before, and never removed.
+	_, serr := os.Lstat(opts.Dest)
+	created = errors.Is(serr, os.ErrNotExist)
 	bundle := opts.Dest
-	if exists {
+	if exists || created {
+		if err := os.MkdirAll(filepath.Dir(opts.Dest), 0750); err != nil {
+			return fmt.Errorf("mkdir dest parent: %w", err)
+		}
 		stage, err := stageUnpack(opts.Dest)
 		if err != nil {
 			return err
@@ -235,8 +235,16 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) (err error) {
 	if err := writeImageGen(bundle); err != nil {
 		return err
 	}
-	if exists {
+	switch {
+	case exists:
 		return replaceBundle(bundle, opts.Dest)
+	case created:
+		if err := os.Chmod(bundle, 0o750); err != nil {
+			return fmt.Errorf("oci: %w", err)
+		}
+		if err := os.Rename(bundle, opts.Dest); err != nil {
+			return fmt.Errorf("oci: put the pulled image in place at %s: %w", opts.Dest, err)
+		}
 	}
 	return nil
 }
@@ -454,20 +462,24 @@ func ParseOCISource(ref string) (OCISource, error) {
 // and only then opens that same object for reading.
 func openLocalSource(src OCISource, check func(transport, path string) error) (*os.File, error) {
 	wantDir := src.Transport == "oci" || src.Transport == "dir"
-	ref, err := openNoFollow(src.Path, wantDir)
+	ref, err := openSourceRef(src.Path, wantDir)
 	if err != nil {
 		switch {
 		case errors.Is(err, syscall.ELOOP):
 			return nil, refused("oci: %s source %q is a symbolic link; name what it points to", src.Transport, src.Path)
 		case errors.Is(err, syscall.ENOTDIR):
 			return nil, refused("oci: %s source %q is not a directory", src.Transport, src.Path)
+		case errors.Is(err, os.ErrNotExist), errors.Is(err, os.ErrPermission):
+			return nil, refused("oci: %s source: %w", src.Transport, err)
 		}
-		return nil, refused("oci: %s source: %w", src.Transport, err)
+		// The host could not open what was named (an I/O error, no
+		// memory): a failure, not a refusal of the request.
+		return nil, fmt.Errorf("oci: %s source: %w", src.Transport, err)
 	}
 	defer ref.Close()
 	fi, err := ref.Stat()
 	if err != nil {
-		return nil, refused("oci: %s source: %w", src.Transport, err)
+		return nil, fmt.Errorf("oci: %s source: %w", src.Transport, err)
 	}
 	switch {
 	case wantDir && !fi.IsDir():
@@ -486,7 +498,7 @@ func openLocalSource(src OCISource, check func(transport, path string) error) (*
 	}
 	f, err := reopenRead(ref, wantDir)
 	if err != nil {
-		return nil, refused("oci: %s source: %w", src.Transport, err)
+		return nil, fmt.Errorf("oci: %s source: %w", src.Transport, err)
 	}
 	return f, nil
 }
@@ -548,3 +560,6 @@ func checkStagingSpace(dir string, size uint64, what string) error {
 	}
 	return nil
 }
+
+// openSourceRef is openNoFollow; a test replaces it.
+var openSourceRef = openNoFollow

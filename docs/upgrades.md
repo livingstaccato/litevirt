@@ -2135,6 +2135,9 @@ Until every host runs this release:
   Operator pull from a local source (`dir:`, `oci-archive:`,
   `docker-archive:`). Do not rely on local sources being the Admin's until
   every host is upgraded.
+- An `lv ct pull --local` of the previous release that is still running does
+  not re-check its item's lock file, which this release removes once the item
+  is gone. Let such pulls finish before upgrading the host.
 - A pull over an existing OCI library item is refused on a previous-release
   host. An Admin's claim (`lv ct pull --project`) replaces an item only on an
   upgraded host, entered through an upgraded host.

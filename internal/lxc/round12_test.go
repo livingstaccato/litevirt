@@ -174,3 +174,83 @@ func TestSourceRefusalsAreTyped(t *testing.T) {
 		t.Errorf("space refusal %v, want an ErrStagingSpace", err)
 	}
 }
+
+// Retaking a lock file that keeps being replaced under the taker honours
+// the caller's cancel: the taker does not spin past it.
+func TestLockItemFile_TheRetakeHonoursCancel(t *testing.T) {
+	prev := lockAtPath
+	t.Cleanup(func() { lockAtPath = prev })
+	lockAtPath = func(*os.File, string) bool { return false } // replaced every time
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	got := make(chan error, 1)
+	go func() {
+		r, err := lockItemFile(ctx, filepath.Join(t.TempDir(), "web"))
+		if r != nil {
+			r()
+		}
+		got <- err
+	}()
+	select {
+	case err := <-got:
+		if err == nil {
+			t.Fatal("the taker reported a lock it never held")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a cancelled taker kept retaking")
+	}
+}
+
+// A source the host cannot read for reasons of its own (an I/O error) is a
+// failure, not a refusal of what the caller named; a missing one is.
+func TestSourceIOErrorsAreNotRefusals(t *testing.T) {
+	prev := openSourceRef
+	t.Cleanup(func() { openSourceRef = prev })
+	src := OCISource{Transport: "docker-archive", Path: "/x/img.tar", Local: true}
+	openSourceRef = func(string, bool) (*os.File, error) {
+		return nil, &os.PathError{Op: "open", Path: "/x/img.tar", Err: syscall.EIO}
+	}
+	if _, err := openLocalSource(src, nil); err == nil || errors.Is(err, ErrSourceRefused) {
+		t.Errorf("an I/O error: %v, want a plain failure", err)
+	}
+	openSourceRef = func(string, bool) (*os.File, error) {
+		return nil, &os.PathError{Op: "open", Path: "/x/img.tar", Err: syscall.ENOENT}
+	}
+	if _, err := openLocalSource(src, nil); !errors.Is(err, ErrSourceRefused) {
+		t.Errorf("a missing source: %v, want a refusal", err)
+	}
+}
+
+// A first pull whose unpack fails after writing leaves no item behind: it
+// unpacks beside the item and puts it in place only when it succeeds.
+func TestPullOCI_AFailedFirstPullLeavesNoPartialItem(t *testing.T) {
+	fakeOCITools(t, false)
+	bin := t.TempDir()
+	// An umoci that writes part of the bundle, then fails.
+	umoci := `#!/bin/sh
+for a in "$@"; do bundle="$a"; done
+mkdir -p "$bundle/rootfs/etc" && echo partial > "$bundle/rootfs/etc/image"
+echo "umoci: write failed" >&2; exit 1
+`
+	if err := os.WriteFile(filepath.Join(bin, "umoci"), []byte(umoci), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	parent := t.TempDir()
+	dest := filepath.Join(parent, "web")
+	if err := PullOCI(context.Background(), PullOCIOptions{Image: "alpine:3.21", Dest: dest}); err == nil {
+		t.Fatal("a failing unpack reported success")
+	}
+	if _, err := os.Stat(dest); err == nil {
+		t.Fatal("a failed first pull left a partial item")
+	}
+	// An item directory that existed before the pull is never removed.
+	mine := filepath.Join(parent, "mine")
+	if err := os.MkdirAll(mine, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = PullOCI(context.Background(), PullOCIOptions{Image: "alpine:3.21", Dest: mine})
+	if _, err := os.Stat(mine); err != nil {
+		t.Fatal("a failed pull removed a directory that existed before it")
+	}
+}

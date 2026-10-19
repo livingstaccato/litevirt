@@ -192,7 +192,7 @@ func printSupersededDisks(out io.Writer, resp *pb.SupersededDisksResponse, purge
 		}
 	}
 	if retained > 0 {
-		fmt.Fprintf(out, "Retained: %d copies, %d bytes on %s; never removed automatically (remove one with --remove <copy>).\n",
+		fmt.Fprintf(out, "Retained: %d copies, %d bytes on %s; kept while their VMs exist (remove one with --remove <copy>).\n",
 			retained, retainedBytes, resp.Host)
 	}
 	if purge {

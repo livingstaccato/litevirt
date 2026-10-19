@@ -96,8 +96,7 @@ type SupersededCopy struct {
 	VMState    string
 	Held       string // why it is kept even from a named removal; "" when it is not held
 	// Retained says why the sweep and a bare purge keep it whatever its age:
-	// its VM still exists, or it is in a directory only deleted VMs' disks
-	// used. "" when nothing retains it.
+	// its VM still exists. "" when nothing retains it.
 	Retained string
 	// DeletedVM is the deleted VM whose disk it was set aside from, when no
 	// VM has a disk at that path now; "" otherwise. Never a VM to restore to.
@@ -113,37 +112,24 @@ var supersededHoldStates = map[string]bool{"error": true, "pending": true, "star
 // disk path recorded anywhere (the same path names a file on every host), and
 // the image store's disk directory, which holds the disks of deleted VMs too.
 // A directory only a deleted VM's disks used (a pool directory, say) is
-// listed too, in orphaned: a copy there is listed and removable by name, but
-// no sweep or purge takes it (lab2-drain anomaly 7).
-func supersededDirs(ctx context.Context, db *corrosion.Client, dataDir string) (dirs []string, orphaned map[string]bool, err error) {
+// scanned too: a copy there is a deleted VM's like any other, listed and
+// swept by the same retention (lab2-drain anomaly 7).
+func supersededDirs(ctx context.Context, db *corrosion.Client, dataDir string) ([]string, error) {
 	seen := map[string]bool{filepath.Join(dataDir, "disks"): true}
-	rows, err := db.Query(ctx, `SELECT path, deleted_at IS NOT NULL AS gone FROM vm_disks
+	rows, err := db.Query(ctx, `SELECT DISTINCT path FROM vm_disks
 		WHERE path != '' AND storage_type IN ('', 'local', 'dir')`)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	deletedOnly := map[string]bool{}
 	for _, r := range rows {
-		d := filepath.Dir(r.String("path"))
-		if r.Int64("gone") != 0 {
-			deletedOnly[d] = true
-			continue
-		}
-		seen[d] = true
+		seen[filepath.Dir(r.String("path"))] = true
 	}
-	orphaned = map[string]bool{}
-	for d := range deletedOnly {
-		if !seen[d] {
-			orphaned[d] = true
-			seen[d] = true
-		}
-	}
-	dirs = make([]string, 0, len(seen))
+	dirs := make([]string, 0, len(seen))
 	for d := range seen {
 		dirs = append(dirs, d)
 	}
 	sort.Strings(dirs)
-	return dirs, orphaned, nil
+	return dirs, nil
 }
 
 // deletedVMOfPath is the VM a deleted disk row at path belonged to, "" when
@@ -177,7 +163,7 @@ func ListSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir stri
 // does not answer: it lists the copies it could see, and returns the first
 // no-answer separately.
 func listSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir string) (out []SupersededCopy, noAnswer, err error) {
-	dirs, orphaned, err := supersededDirs(ctx, db, dataDir)
+	dirs, err := supersededDirs(ctx, db, dataDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list disk directories: %w", err)
 	}
@@ -255,17 +241,13 @@ func listSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir stri
 			if c.VM != "" {
 				c.Retained = fmt.Sprintf("VM %s exists; only an operator removes this copy", c.VM)
 			} else {
-				// Its VM was deleted: shown as such. In a directory only
-				// deleted VMs' disks used, it is never swept: it was not
-				// listed before, and no retention was ever shown for it.
+				// Its VM was deleted: shown as such, and swept by the
+				// retention.
 				gone, err := deletedVMOfPath(ctx, db, diskPath)
 				if err != nil {
 					return nil, nil, fmt.Errorf("read the deleted disks at %s: %w", diskPath, err)
 				}
 				c.DeletedVM = gone
-				if orphaned[dir] {
-					c.Retained = "its VM was deleted, and only deleted VMs' disks used this directory; only an operator removes this copy"
-				}
 			}
 			out = append(out, c)
 		}
@@ -298,7 +280,7 @@ type KeptCopy struct {
 // first. Storage that does not answer fails the listing, as it fails
 // ListSupersededDisks.
 func ListKeptDisks(ctx context.Context, db *corrosion.Client, dataDir string) ([]KeptCopy, error) {
-	dirs, _, err := supersededDirs(ctx, db, dataDir)
+	dirs, err := supersededDirs(ctx, db, dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("list disk directories: %w", err)
 	}

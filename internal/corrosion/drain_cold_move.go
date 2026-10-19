@@ -149,3 +149,40 @@ func DrainColdMoveOpenTo(ctx context.Context, c *Client, vm, target string) (boo
 	}
 	return false, nil
 }
+
+// DrainColdMoveHandedOver reports whether vm, as this replica holds it, is
+// exactly the handoff of a drain cold move to target that is journaled and
+// not finished: on target, at that move's journaled owner epoch + 1 (the
+// handoff advances it once). The caller judges the row's state and stop
+// intent. A move whose terminal step is late does not cover a later
+// placement of the VM, whatever its epoch.
+func DrainColdMoveHandedOver(ctx context.Context, c *Client, vm VMRecord, target string) (bool, error) {
+	if vm.HostName != target {
+		return false, nil
+	}
+	rows, err := c.Query(ctx,
+		`SELECT `+operationCols+` FROM operations
+		 WHERE operation_kind = ? AND resource_id = ? AND desired_ref = ? AND deleted_at IS NULL`,
+		string(OpDrainColdMove), vm.Name, target)
+	if err != nil {
+		return false, err
+	}
+	for _, r := range rows {
+		op := scanOperation(r)
+		if op.VMOwnerEpoch+1 != vm.OwnerEpoch {
+			continue
+		}
+		steps, sErr := ListOperationSteps(ctx, c, op.ID, op.VMOwnerEpoch)
+		if sErr != nil {
+			return false, sErr
+		}
+		names := make([]string, 0, len(steps))
+		for _, st := range steps {
+			names = append(names, st.StepName)
+		}
+		if state, _ := ReduceOperationState(OpDrainColdMove, names); state != "" && !IsOperationTerminal(state) {
+			return true, nil
+		}
+	}
+	return false, nil
+}

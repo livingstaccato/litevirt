@@ -303,7 +303,7 @@ func TestStartVM_ADrainResumeIsNotRefusedForASharedMAC(t *testing.T) {
 	if err := s.refuseStartOnSharedMAC(ctx, "moved"); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("no open move: got %v, want FailedPrecondition", err)
 	}
-	m, err := corrosion.BeginDrainColdMove(ctx, s.db, vm, "src-host", s.hostName, "attempt-1")
+	m, err := corrosion.BeginDrainColdMove(ctx, s.db, journaledBefore(t, s, "moved"), "src-host", s.hostName, "attempt-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,7 +357,7 @@ func TestStartVM_AReadErrorNeverRefusesADrainResume(t *testing.T) {
 		}
 		seedNICOf(t, s, "theirs", dup)
 		if open {
-			if _, err := corrosion.BeginDrainColdMove(ctx, s.db, vm, "src-host", s.hostName, "attempt-1"); err != nil {
+			if _, err := corrosion.BeginDrainColdMove(ctx, s.db, journaledBefore(t, s, "moved"), "src-host", s.hostName, "attempt-1"); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -431,4 +431,18 @@ func TestStartVM_ADrainResumeMarkerOnlyFromItsPeer(t *testing.T) {
 			t.Errorf("%s: got %v, want FailedPrecondition", name, err)
 		}
 	}
+}
+
+// journaledBefore is VM name as a drain journaled it on its source: one owner
+// epoch before the row this replica holds, which the handoff advanced once.
+func journaledBefore(t *testing.T, s *Server, name string) corrosion.VMRecord {
+	t.Helper()
+	vm, err := corrosion.GetVM(context.Background(), s.db, name)
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM %s: %v", name, err)
+	}
+	j := *vm
+	j.HostName = "src-host"
+	j.OwnerEpoch--
+	return j
 }

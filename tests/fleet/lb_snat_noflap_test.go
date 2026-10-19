@@ -73,26 +73,32 @@ vms:
 // conntrackd's does.
 //
 // Each process left running records its pid in <dir>/standins.pids, and the
-// cleanup kills those pids and nothing else. Its shell runs 'sleep 600; true',
-// never 'sleep 600; :': branches without this cleanup still end each LB test
-// with `pkill -f "sleep 600; : .*<test name>"`, and the stand-ins' command
-// lines name their temp dir, which names the test. One such cleanup anywhere
-// on the host killed the stand-ins of every process running the test at that
-// moment, and each one's next apply started keepalived and conntrackd again
+// cleanup kills those pids and nothing else. Its shell loops 'sleep 1; ... true'
+// while the test process lives, never 'sleep 600; :': branches without this
+// cleanup still end each LB test with `pkill -f "sleep 600; : .*<test name>"`,
+// and the stand-ins' command lines name their temp dir, which names the test.
+// One such cleanup anywhere on the host killed the stand-ins of every process
+// running the test at that moment, and each one's next apply started
+// keepalived and conntrackd again
 // (TestLBStandIns_AnotherRunsCleanupLeavesThemAlone).
 func lbStandIns(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	pids := filepath.Join(dir, "standins.pids")
+	// A stand-in outlives nothing: it polls its test process and exits when
+	// that is gone, so a test killed before t.Cleanup runs (a timeout, a
+	// SIGKILL, a rebuilt tree) leaves no process behind. 600 iterations of
+	// one second bound it regardless.
+	alive := fmt.Sprintf("i=0; while [ $i -lt 600 ] && kill -0 %d 2>/dev/null; do sleep 1; i=$((i+1)); done; true", os.Getpid())
 	for name, body := range map[string]string{
 		"haproxy": "",
 		// keepalived daemonizes and writes its pidfile (-p); the apply
 		// restarts one that is not alive.
 		"keepalived": "while [ $# -gt 0 ]; do [ \"$1\" = -p ] && pidf=$2; shift; done\n" +
-			"nohup sh -c 'sleep 600; true' keepalived-standin " + dir + " >/dev/null 2>&1 &\n" +
+			"nohup sh -c '" + alive + "' keepalived-standin " + dir + " >/dev/null 2>&1 &\n" +
 			"echo $! > \"$pidf\"\necho $! >> " + pids + "\n",
 		"sysctl": "",
-		"conntrackd": "nohup sh -c 'sleep 600; true' conntrackd \"$@\" >/dev/null 2>&1 &\n" +
+		"conntrackd": "nohup sh -c '" + alive + "' conntrackd \"$@\" >/dev/null 2>&1 &\n" +
 			"echo $! >> " + pids + "\n",
 	} {
 		script := fmt.Sprintf("#!/bin/sh\necho \"$@\" >> %s\n%s", filepath.Join(dir, name+".calls"), body)

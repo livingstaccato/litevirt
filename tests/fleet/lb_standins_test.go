@@ -100,3 +100,65 @@ func TestLBStandIns_AnotherRunsCleanupLeavesThemAlone(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// TestLBStandIns_KilledTestLeavesNoneBehind: a test process killed before
+// t.Cleanup runs (a timeout, a SIGKILL, kbuild rebuilding the tree under a
+// running shard) must not leave its stand-ins running. On kvm003, 26
+// `sleep 600` stand-ins were orphaned this way on 2026-10-19.
+//
+// Mutation (red): the stand-ins sleep for a fixed 600 seconds again instead
+// of polling their test process.
+func TestLBStandIns_KilledTestLeavesNoneBehind(t *testing.T) {
+	if os.Getenv("LB_STANDIN_HELPER") == "1" {
+		dir := lbStandIns(t)
+		for _, c := range [][]string{
+			{"keepalived", "-f", filepath.Join(dir, "k.conf"), "-p", filepath.Join(dir, "k.pid")},
+			{"conntrackd", "-C", filepath.Join(dir, "c.conf"), "-d"},
+		} {
+			if out, err := exec.Command(c[0], c[1:]...).CombinedOutput(); err != nil {
+				t.Fatalf("%s: %v: %s", c[0], err, out)
+			}
+		}
+		os.WriteFile(os.Getenv("LB_STANDIN_DIRFILE"), []byte(dir), 0o644) //nolint:errcheck
+		time.Sleep(time.Minute)                                           // killed by the parent
+		return
+	}
+	dirFile := filepath.Join(t.TempDir(), "dir")
+	cmd := exec.Command(os.Args[0], "-test.run", "^TestLBStandIns_KilledTestLeavesNoneBehind$")
+	cmd.Env = append(os.Environ(), "LB_STANDIN_HELPER=1", "LB_STANDIN_DIRFILE="+dirFile)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Process.Kill() //nolint:errcheck
+	var dir string
+	deadline := time.Now().Add(20 * time.Second)
+	for dir == "" {
+		if b, err := os.ReadFile(dirFile); err == nil {
+			dir = string(b)
+		} else if time.Now().After(deadline) {
+			t.Fatal("helper never started its stand-ins")
+		} else {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	if n := len(standInProcs(t, dir)); n != 2 {
+		t.Fatalf("stand-ins running: %d, want 2", n)
+	}
+	cmd.Process.Kill() //nolint:errcheck // no t.Cleanup runs in the helper
+	cmd.Wait()         //nolint:errcheck
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		alive := standInProcs(t, dir)
+		if len(alive) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			for pid := range alive {
+				syscall.Kill(pid, syscall.SIGKILL)                            //nolint:errcheck
+				exec.Command("pkill", "-KILL", "-P", strconv.Itoa(pid)).Run() //nolint:errcheck
+			}
+			t.Fatalf("stand-ins %v outlived their killed test", alive)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}

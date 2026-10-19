@@ -651,6 +651,10 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 		if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
 			return status.Errorf(codes.Internal, "replace this host's stub %s: %v", hdr.Path, err)
 		}
+		// The stub is gone, and the copy placed at its path is not this
+		// host's stub until the source is known to be there (the add below):
+		// nothing may reuse a file the take-back below may still unlink.
+		s.migrationStubs.forget(hdr.Path)
 	}
 	// The file this receive places: what a re-check below may take back, and
 	// nothing else.

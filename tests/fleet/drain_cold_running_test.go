@@ -940,8 +940,8 @@ func TestFleet_DrainColdMoveNamesTheWayOutOfAStrayTargetDisk(t *testing.T) {
 // at the path in the meantime is left as it is.
 //
 // Mutation: no re-check after the directory sync — the placed copy stays on
-// the target, red. Remove whatever is at the path — the other file is gone,
-// red.
+// the target, red. Remove whatever is at the path, or whatever has the placed
+// copy's size — the other file is gone, red.
 func TestFleet_ColdDiskPlacedAfterTheSourceGaveUpIsTakenBack(t *testing.T) {
 	for _, replaced := range []bool{false, true} {
 		name := "placed copy taken back"
@@ -962,8 +962,15 @@ func TestFleet_ColdDiskPlacedAfterTheSourceGaveUpIsTakenBack(t *testing.T) {
 					if err := os.Rename(dst, dst+".aside"); err != nil {
 						t.Errorf("move the placed copy aside: %v", err)
 					}
+					// Another file, of exactly the placed copy's size: only
+					// the inode tells them apart.
 					if err := os.WriteFile(dst, []byte("another file"), 0o600); err != nil {
 						t.Errorf("write another file at the path: %v", err)
+					}
+					if aside, err := os.Stat(dst + ".aside"); err != nil {
+						t.Errorf("stat the placed copy: %v", err)
+					} else if err := os.Truncate(dst, aside.Size()); err != nil {
+						t.Errorf("size the other file: %v", err)
 					}
 				}
 				<-release
@@ -990,7 +997,7 @@ func TestFleet_ColdDiskPlacedAfterTheSourceGaveUpIsTakenBack(t *testing.T) {
 				t.Fatal("the target's receive never returned")
 			}
 			if replaced {
-				if got, err := os.ReadFile(dst); err != nil || string(got) != "another file" {
+				if got, err := os.ReadFile(dst); err != nil || !strings.HasPrefix(string(got), "another file") {
 					t.Fatalf("the file that took the placed copy's place was touched (err %v, %q)", err, got)
 				}
 			} else if _, err := os.Lstat(dst); !os.IsNotExist(err) {

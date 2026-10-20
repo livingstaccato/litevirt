@@ -22,6 +22,7 @@ var frozenLatchGatedShapes = map[string][]string{
 		"stmtshape/v1:7ed4a32cf5eac0729d6dd4133bbbcf74826005634126d1e32504b864aa15982e",
 		"stmtshape/v1:83f910f2e35a4b7ab7ac51f5dee634c2b37925838de6ac23c1543786c14de656", // hostOwnEndpointSQL (host_incarnation)
 		"stmtshape/v1:ab30a087c3d613badbf21d09a8699381fe9d6f5d73fe19ac96aad997eb32dfa4",
+		"stmtshape/v1:d91a17399ef8d0d2ea02dd132405a64a053f9aea5c6b7cfaac9cd18cf1665f66", // deleteHostAdmissionSQL (host_incarnation)
 		"stmtshape/v1:e3428cc6a7557a34588a878ed81a5f47e59c17c11b1be584384d4afb0b832c8e",
 	},
 }

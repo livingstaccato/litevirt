@@ -44,34 +44,33 @@ func sameLegacyAdmission(a, b hostKey) bool {
 	return a.serial != "" && strings.EqualFold(a.serial, b.serial)
 }
 
-// hostRemovalEndsLocalAdmission reports whether s, a replicated host removal
-// (deleteHostSQL), ends the admission this node holds live, so it applies
-// whatever the local row's clock (applyLWWGated). It runs after the
-// incarnation rule.
+// hostRemovalEndsLocalAdmission reports whether s, a replicated host removal,
+// ends the admission this node holds live, so it applies whatever the local
+// row's clock (applyLWWGated). It runs after the incarnation rule.
 //
-//   - at incarnation ≥ 1 the removal's envelope names the key it was written
-//     against, and the incarnation rule has already refused every other key,
-//     so the comparison below always holds where it is reached;
-//   - at 0 the removal names no admission. It is taken as the removal of the
-//     local one only when it was made after that admission's created_at (a
-//     removal made before a re-admission ended the admission before it), and
-//     only once host_membership_split_v1 has latched (membershipLatched). That
-//     token is replication-gated and postdates v1.9.0, so no v1.9.0 host is
-//     left to re-admit a host without a new created_at, which would make an
-//     earlier removal look made after the re-added admission. Before the
-//     latch the removal is left to the clock, and anti-entropy decides the row
-//     by its serial.
-//
-// A whole-second created_at (an older build's insert) says only the second of
-// the admission, so the removal must be at least a second after it.
+//   - A removal that names its admission's certificate serial
+//     (deleteHostAdmissionSQL) ends the local row only while that row holds
+//     the same serial, at the key the removal was written against. A removal
+//     of serial X never ends a row whose serial is Y: a re-admission refuses
+//     the removed certificate, so Y is another admission, even one a v1.9.0
+//     node re-admitted without a new created_at. The statement's own WHERE
+//     says the same, so the comparison here only saves running it twice:
+//     where this declines, the clock applies it to nothing.
+//   - A removal in the previous shape (deleteHostSQL) names no admission. At
+//     incarnation ≥ 1 its envelope names the key, and the incarnation rule has
+//     already refused every other key, so it ends the local admission. At 0 it
+//     is left to the clock, as before, and anti-entropy then decides the row
+//     by created_at and serial (sameLegacyAdmission). A previous-release node
+//     writes only this shape, and so does this build until the host_incarnation
+//     release feature is granted.
 //
 // A removal stamped implausibly far ahead is left to the clock and its skew
 // guard.
-func hostRemovalEndsLocalAdmission(ctx context.Context, tx *sql.Tx, s Statement, now time.Time, membershipLatched bool) (bool, error) {
+func hostRemovalEndsLocalAdmission(ctx context.Context, tx *sql.Tx, s Statement, now time.Time) (bool, error) {
 	if !isHostDelete(s) {
 		return false, nil
 	}
-	host, ts, ok := deleteParams(s)
+	host, ts, serial, ok := deleteParams(s)
 	if !ok || tsFutureSkewed(ts, now) {
 		return false, nil
 	}
@@ -80,24 +79,13 @@ func hostRemovalEndsLocalAdmission(ctx context.Context, tx *sql.Tx, s Statement,
 		return false, err
 	}
 	in := statementHostKey(s)
-	if local.n >= 1 {
-		return in.n == local.n && in.at == local.at, nil
-	}
-	if in.n != 0 || !membershipLatched {
+	if in.n != local.n || (local.n >= 1 && in.at != local.at) {
 		return false, nil
 	}
-	at, err := time.Parse(time.RFC3339, local.at)
-	if err != nil {
-		return false, nil
+	if serial != "" {
+		return strings.EqualFold(local.serial, serial), nil
 	}
-	removed, ok := tsInstant(ts)
-	if !ok {
-		return false, nil
-	}
-	if isReadmitStamp(local.at) {
-		return removed.After(at), nil
-	}
-	return !removed.Before(at.Add(time.Second)), nil
+	return local.n >= 1, nil
 }
 
 // ruleRemovedAdmission settles a tie between two tombstones of one admission

@@ -3478,7 +3478,7 @@ func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement,
 		}
 		// A removal of the admission this node holds live applies over a
 		// later write to it (host_removal_stands.go).
-		ends, eErr := hostRemovalEndsLocalAdmission(ctx, tx, s, time.Now(), r.client.MayWriteHostMembership())
+		ends, eErr := hostRemovalEndsLocalAdmission(ctx, tx, s, time.Now())
 		if eErr != nil {
 			return eErr
 		}

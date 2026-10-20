@@ -20,6 +20,7 @@ var latchGatedShapes = map[string][]string{
 		deleteNetworkVTEPsSQL,     // DeleteNetworkAndVTEPs
 		readmitHostV2SQL,          // AdmitHostV2 (host_incarnation)
 		hostOwnEndpointSQL,        // WriteOwnEndpoint (host_incarnation)
+		deleteHostAdmissionSQL,    // DeleteHostAdmissionIf (host_incarnation)
 	},
 }
 

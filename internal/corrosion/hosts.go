@@ -1152,7 +1152,30 @@ func DeleteHost(ctx context.Context, c *Client, name string) error {
 // same certificate), its certificate renewed — is not deleted, and applied is
 // false. The statements are DeleteHost's.
 func DeleteHostIf(ctx context.Context, c *Client, name, serial string, key HostIncarnation) (applied bool, err error) {
-	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+	return c.ExecuteBatchGuarded(ctx, admissionStillIs(ctx, name, serial, key), deleteHostStatements(c, name))
+}
+
+// DeleteHostAdmissionIf is DeleteHostIf whose removal names the certificate
+// serial of the admission it ends (deleteHostAdmissionSQL): a receiver ends
+// the row only while it holds that serial, and a row it holds under another
+// serial (a re-admission, even one that kept the created_at) is not this
+// removal's to end (host_removal_stands.go). A previous-release receiver does
+// not know the shape, so it is written only under the host_incarnation
+// release feature's grant.
+func DeleteHostAdmissionIf(ctx context.Context, c *Client, name, serial string, key HostIncarnation, g capabilities.FeatureGrant) (applied bool, err error) {
+	if err := g.Check(capabilities.FeatureHostIncarnation); err != nil {
+		return false, err
+	}
+	if serial == "" {
+		return false, fmt.Errorf("removal of %s names no certificate serial", name)
+	}
+	return c.ExecuteBatchGuarded(ctx, admissionStillIs(ctx, name, serial, key), deleteHostStatementsOf(c, name, serial))
+}
+
+// admissionStillIs is DeleteHostIf's guard: name's live row is still the
+// admission with this key and serial, read in the write's transaction.
+func admissionStillIs(ctx context.Context, name, serial string, key HostIncarnation) func(tx *sql.Tx) (bool, error) {
+	return func(tx *sql.Tx) (bool, error) {
 		var curSerial, curAt string
 		var curInc int64
 		err := tx.QueryRowContext(ctx,
@@ -1165,13 +1188,23 @@ func DeleteHostIf(ctx context.Context, c *Client, name, serial string, key HostI
 			return false, err
 		}
 		return strings.EqualFold(curSerial, serial) && curInc == key.N && curAt == key.At, nil
-	}, deleteHostStatements(c, name))
+	}
 }
 
 func deleteHostStatements(c *Client, name string) []Statement {
+	return deleteHostStatementsOf(c, name, "")
+}
+
+// deleteHostStatementsOf is DeleteHost's batch; with a serial, its removal
+// names the admission it ends (deleteHostAdmissionSQL).
+func deleteHostStatementsOf(c *Client, name, serial string) []Statement {
 	now := time.Now().UTC().Format(time.RFC3339) // deleted_at marker (bare)
+	removal := Statement{SQL: deleteHostSQL, Params: []interface{}{now, c.NowTS(), name}}
+	if serial != "" {
+		removal = Statement{SQL: deleteHostAdmissionSQL, Params: []interface{}{now, c.NowTS(), name, serial}}
+	}
 	return []Statement{
-		{SQL: deleteHostSQL, Params: []interface{}{now, c.NowTS(), name}},
+		removal,
 		{SQL: `UPDATE host_health SET deleted_at = ?, updated_at = ? WHERE observer = ? OR target = ?`,
 			Params: []interface{}{now, c.NowTS(), name, name}},
 		{SQL: `UPDATE network_vteps SET deleted_at = ?, updated_at = ? WHERE host_name = ?`,
@@ -1182,6 +1215,11 @@ func deleteHostStatements(c *Client, name string) []Statement {
 // deleteHostSQL tombstones a host row. Every node that applies it, the origin
 // included, also retires the host's fence credential row (host_readmit.go).
 const deleteHostSQL = `UPDATE hosts SET deleted_at = ?, updated_at = ? WHERE name = ?`
+
+// deleteHostAdmissionSQL is deleteHostSQL bound to the certificate serial of
+// the admission it ends (DeleteHostAdmissionIf). Params: deleted_at,
+// updated_at, name, cert_serial.
+const deleteHostAdmissionSQL = `UPDATE hosts SET deleted_at = ?, updated_at = ? WHERE name = ? AND lower(cert_serial) = lower(?)`
 
 // UpdateHostVersion updates a host's reported version: hosts.version, and
 // after the runtime split host_runtime.version too, in one batch under one

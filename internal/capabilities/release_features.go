@@ -134,7 +134,8 @@ var releaseFeatures = map[Feature]FeatureInfo{
 
 	// Used only when a removed host is added again.
 	FeatureHostIncarnation: {Token: Release202611V1, Description: "Host incarnation counter: a removed host re-added under its name is a new incarnation that no copy of the removed machine's row overrides (used when a removed host is re-added)",
-		Writers: []string{"internal/corrosion.AdmitHostV2", "internal/corrosion.WriteOwnEndpoint"}},
+		Writers: []string{"internal/corrosion.AdmitHostV2", "internal/corrosion.WriteOwnEndpoint",
+			"internal/corrosion.DeleteHostAdmissionIf"}},
 
 	FeatureAutomationStream: {Token: Release202611V1, Description: "Certified automation history, retained recovery provenance, and managed-resource state"},
 	FeatureSGProjects:       {Token: Release202611V1, Description: "Security groups owned by a project (used when a group is created with a project)", Writers: []string{"internal/corrosion.InsertProjectSecurityGroup"}},

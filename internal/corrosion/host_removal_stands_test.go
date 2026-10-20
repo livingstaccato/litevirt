@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 // A removal stands over a live copy of its own admission at incarnation 0,
@@ -100,37 +102,36 @@ func TestHostRemoval_StandsAgainstAPreviousBuildsDump(t *testing.T) {
 	}
 }
 
-// The WAL rule at incarnation 0 (hostRemovalEndsLocalAdmission): a removal
-// made after the local admission's created_at applies over a later write to
-// it, once host_membership_split_v1 has latched; before the latch, and for a
-// removal made before the admission (or within an older build's whole
-// second), the clock decides and the row stays live.
+// The WAL rule (hostRemovalEndsLocalAdmission) over a live row whose clock is
+// past the removal's: a removal that names the row's serial ends it; one that
+// names another serial, or none (the previous shape), is left to the clock.
+// And a removal that names another serial does nothing even where it is the
+// newer write.
 //
-// Mutations: dropping the latch condition turns "before the latch" red;
-// dropping the "after created_at" check turns "a removal made before the
-// admission" and "within the admission's second" red; the rule always false
-// turns both "after the latch" cases red.
-func TestHostRemoval_WALRuleAtIncarnationZero(t *testing.T) {
+// The statement's own WHERE names the serial, so the WAL rule's serial
+// comparison is a guard no test can tell from its absence. Mutations: the
+// rule taking a serial-less removal turns "no serial" red; the rule always
+// false turns both "the admission's serial" cases red; DeleteHostAdmissionIf
+// without its grant check turns "no grant" red; retiring the credential on a
+// removal whatever serial it names turns both "another serial" cases red.
+func TestHostRemoval_WALRuleNamesTheAdmission(t *testing.T) {
 	ctx := context.Background()
-	const later = "2999-01-01T00:00:00.000000000Z"
+	const later, earlier = "2999-01-01T00:00:00.000000000Z", "2026-01-01T00:00:00.000000000Z"
 	for _, tc := range []struct {
-		name     string
-		created  string        // "" keeps InsertHost's stamp
-		removeAt time.Duration // the removal's instant, after created_at
-		latched  bool
-		removed  bool
+		name    string
+		created string // "" keeps InsertHost's stamp
+		serial  string // the removal's; "" is the previous shape
+		rowTS   string
+		removed bool
 	}{
-		{"after the latch", "", time.Second, true, true},
-		{"before the latch", "", time.Second, false, false},
-		{"a removal made before the admission", "", -time.Second, true, false},
-		{"an older build's row, after the latch", "2026-01-01T00:00:00Z", 2 * time.Second, true, true},
-		{"within the admission's second", "2026-01-01T00:00:00Z", 500 * time.Millisecond, true, false},
+		{"the admission's serial", "", "01OLD", later, true},
+		{"the admission's serial, an older build's row", "2026-01-01T00:00:00Z", "01old", later, true},
+		{"another serial", "", "02new", later, false},
+		{"another serial, the newer write", "", "02new", earlier, false},
+		{"no serial", "", "", later, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := newTestDB(t)
-			if tc.latched {
-				c.SetHostMembershipGate(func() bool { return true })
-			}
 			if err := InsertHost(ctx, c, HostRecord{Name: "host-x", Address: "10.0.0.15", State: "active", CertSerial: "01old"}); err != nil {
 				t.Fatal(err)
 			}
@@ -139,20 +140,44 @@ func TestHostRemoval_WALRuleAtIncarnationZero(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			// A later write to the admission: the row's clock is past the removal's.
-			if _, err := c.DB().Exec(`UPDATE hosts SET state = 'offline', updated_at = ? WHERE name = 'host-x'`, later); err != nil {
+			if _, err := c.DB().Exec(`UPDATE hosts SET state = 'offline', updated_at = ? WHERE name = 'host-x'`, tc.rowTS); err != nil {
 				t.Fatal(err)
 			}
-			at, err := time.Parse(time.RFC3339, incKey(t, c).at)
-			if err != nil {
+			if _, err := c.DB().Exec(`INSERT INTO host_fence_credentials (host_name, ipmi_pass, updated_at, deleted_at, after_retirement)
+				VALUES ('host-x', 'pw', '2026-01-01T00:00:00.000000000Z', NULL, '')`); err != nil {
 				t.Fatal(err)
 			}
-			ts := at.Add(tc.removeAt).UTC().Format(nowTSLayout)
-			applyRemote(t, c, "2999000000000-0000-remover",
-				Statement{SQL: deleteHostSQL, Params: []interface{}{ts, ts, "host-x"}})
+			ts := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC).Format(nowTSLayout)
+			st := Statement{SQL: deleteHostSQL, Params: []interface{}{ts, ts, "host-x"}}
+			if tc.serial != "" {
+				st = Statement{SQL: deleteHostAdmissionSQL, Params: []interface{}{ts, ts, "host-x", tc.serial}}
+			}
+			applyRemote(t, c, "2999000000000-0000-remover", st)
 			if got := incKey(t, c).deleted; got != tc.removed {
 				t.Errorf("removed = %v, want %v", got, tc.removed)
 			}
+			if tc.serial != "" {
+				rows, err := c.Query(ctx, `SELECT COALESCE(deleted_at, '') AS d FROM host_fence_credentials WHERE host_name = 'host-x'`)
+				if err != nil || len(rows) != 1 {
+					t.Fatalf("read the credential: %v %d", err, len(rows))
+				}
+				if retired := rows[0].String("d") != ""; retired != tc.removed {
+					t.Errorf("credential retired = %v, want %v", retired, tc.removed)
+				}
+			}
 		})
 	}
+	t.Run("no grant", func(t *testing.T) {
+		c := newTestDB(t)
+		if err := InsertHost(ctx, c, HostRecord{Name: "host-x", Address: "10.0.0.15", State: "active", CertSerial: "01old"}); err != nil {
+			t.Fatal(err)
+		}
+		k := incKey(t, c)
+		if _, err := DeleteHostAdmissionIf(ctx, c, "host-x", "01old", HostIncarnation{N: k.n, At: k.at}, capabilities.FeatureGrant{}); err == nil {
+			t.Error("the removal that names a serial was written without the host_incarnation grant")
+		}
+		if incKey(t, c).deleted {
+			t.Error("a refused removal ended the row")
+		}
+	})
 }

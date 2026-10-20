@@ -195,6 +195,12 @@ type addFile struct {
 // rolls back, only files that carry its nonce. `lv host rm` removes every
 // attempt's of the serial it revoked.
 func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddPlan) error {
+	// The commands an add prints to undo its admission name the host: a name
+	// `lv host rm --serial` would refuse is refused here, before anything.
+	if !settleName(p.hostName) {
+		return fmt.Errorf("%s is not a host name: it must be printable, at most %d bytes, and not begin with '-'; "+
+			"nothing was changed", strconv.Quote(p.hostName), safename.MaxNameLen)
+	}
 	ip := net.ParseIP(p.hostAddr)
 	hostCrt, hostKey := filepath.Join(remotePKIDir, "host.crt"), filepath.Join(remotePKIDir, "host.key")
 

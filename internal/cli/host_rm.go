@@ -103,6 +103,14 @@ func hostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force
 	// it selects the admission by serial).
 	if listed != nil && listed.GetState() == pb.HostState_HOST_JOINING && listed.GetAddress() != "" {
 		if err := removeStagedAdmission(listed.GetAddress(), serial); err != nil {
+			if !settleName(hostName) {
+				// `lv host rm` with no row refuses this name: no command is
+				// printed that would only be refused.
+				return fmt.Errorf("%s is removed and its certificate %s revoked, but removing what its unfinished "+
+					"`lv host add` left on %s failed (%v). Its name is not one `lv host rm --serial` takes: check that "+
+					"machine for the files tagged .add-%s- and an install record %s of certificate %s", strconv.Quote(hostName),
+					canonOr(serial), listed.GetAddress(), err, canonOr(serial), addInstalledMarker, canonOr(serial))
+			}
 			return fmt.Errorf("%s is removed and its certificate %s revoked, but removing what its unfinished "+
 				"`lv host add` left on %s failed (%v). Run `%s` to finish it",
 				hostName, canonOr(serial), listed.GetAddress(), err, settleRmCmd(hostName, serial, listed.GetAddress()))

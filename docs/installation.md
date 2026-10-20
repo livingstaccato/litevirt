@@ -202,7 +202,9 @@ finishes it. `lv host rm <name>` of a
 joining host whose cleanup on the machine fails does the same. Install and
 attempt records quote a host name that holds a blank, and with no row the
 command takes such a name when it prints safely; the machine's trace must
-name it exactly before anything is revoked. A rerun refuses when the key staged or installed
+name it exactly before anything is revoked. `lv host add` refuses, before
+anything, a name that command would not take: one with a control character,
+one longer than a host name may be, or one that begins with `-`. A rerun refuses when the key staged or installed
 on the machine is not the admitted certificate's. The machine running
 `lv host add` keeps its copy of the admitted credentials in
 `hosts/<name>/` under its pki directory.

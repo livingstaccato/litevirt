@@ -12,6 +12,7 @@ import (
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/safename"
 	"google.golang.org/grpc"
 )
 
@@ -589,6 +590,49 @@ func TestHostAdd_AnEarlierBuildsStaleSettleClaimIsJudgedByTheRecordItReplaced(t 
 			}
 			(&settleMachine{f: f, serial: S}).recordIs(t, installed)
 		})
+	}
+}
+
+// Round-4 review m4: `lv host add` took a name `lv host rm --serial` refuses
+// with no row (a control or format character, longer than a host name, a
+// leading '-'), and then printed that command as the way out. It refuses
+// such a name before anything now.
+//
+// Mutation: drop the check — each is staged and admitted.
+func TestHostAdd_RefusesANameItsSettleCommandCannotTake(t *testing.T) {
+	for _, name := range []string{"a\x01b", "a‮b", "-rf", strings.Repeat("a", safename.MaxNameLen+1), ""} {
+		f := newAddFixture(t)
+		f.target.Events = nil
+		err := HostAddOn(context.Background(), f.client, f.target, name, "10.0.0.9")
+		if err == nil || len(f.client.admitted) != 0 || len(f.staged(t)) != 0 || len(f.target.Events) != 0 {
+			t.Errorf("add of %q = %v, admitted %v, staged %v, events %v: want refused before anything",
+				name, err, f.client.admitted, f.staged(t), f.target.Events)
+		}
+		f.identityUnchanged(t)
+	}
+}
+
+// The same for a joining row's removal whose cleanup fails: a row name the
+// no-row command refuses is not printed in a command.
+//
+// Mutation: print settleRmCmd for every name — "-x"'s command is printed.
+func TestHostRemove_ARowNameTheSettleRefusesGetsNoCommand(t *testing.T) {
+	rmTestPKI(t)
+	old := removeStagedAdmission
+	removeStagedAdmission = func(string, string) error { return errors.New("no route to host") }
+	t.Cleanup(func() { removeStagedAdmission = old })
+	for _, name := range []string{"-x", "a\x01b"} {
+		c := &serialRemoveClient{hostRemoveTestClient: &hostRemoveTestClient{},
+			hosts: []*pb.Host{{Name: name, CertSerial: "a1b2c3", State: pb.HostState_HOST_JOINING, Address: "10.0.0.9"}}}
+		err := HostRemove(context.Background(), c, name, false)
+		if err == nil || strings.Contains(err.Error(), "--address") || !strings.Contains(err.Error(), "check that machine") {
+			t.Errorf("removal of %q = %v: want the cleanup failure with no command", name, err)
+		}
+	}
+	c := &serialRemoveClient{hostRemoveTestClient: &hostRemoveTestClient{},
+		hosts: []*pb.Host{{Name: "a b", CertSerial: "a1b2c3", State: pb.HostState_HOST_JOINING, Address: "10.0.0.9"}}}
+	if err := HostRemove(context.Background(), c, "a b", false); err == nil || !strings.Contains(err.Error(), "lv host rm 'a b' --serial a1b2c3") {
+		t.Errorf("control: removal of %q = %v, want its command", "a b", err)
 	}
 }
 

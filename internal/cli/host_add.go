@@ -741,6 +741,20 @@ func canonSerial(serial string) string {
 	return c
 }
 
+// echoableName reports whether name, read from a machine, may be echoed in a
+// command the operator is told to run: one `lv host rm` takes (settleName),
+// and every byte printable ASCII (0x20-0x7E), so no control, bidi override,
+// zero-width or look-alike character makes the command shown differ from
+// the one that runs.
+func echoableName(name string) bool {
+	for i := 0; i < len(name); i++ {
+		if name[i] < 0x20 || name[i] > 0x7e {
+			return false
+		}
+	}
+	return settleName(name)
+}
+
 // validHostName reports whether name is a host name the CLI accepts in a command
 // it prints: letters, digits, '_', '.', '-', not leading '-'.
 func validHostName(name string) bool {
@@ -864,9 +878,10 @@ func refuseUnproven(r addRemote, p hostAddPlan, serial string, exp addExpect, no
 		if rec.before != "" {
 			found = "certificate " + rec.before
 		}
-		if !settleName(rec.name) {
-			// A name `lv host rm` would not take is not printed, nor a command
-			// with it. One it takes is printed quoted (shellWord).
+		if !echoableName(rec.name) {
+			// A name `lv host rm` would not take, or one a terminal may show
+			// as other than it is, is not printed, nor a command with it. One
+			// it takes is printed quoted (shellWord).
 			return settled(fmt.Sprintf("an earlier add of this machine (certificate %s, attempt %s) found %s here and "+
 				"was neither finished nor undone; the machine serves certificate %s now, which nothing proves is that "+
 				"add's, so this add changes nothing. Its record %s names a host the CLI cannot name in a command: check it "+

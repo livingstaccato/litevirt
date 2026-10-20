@@ -268,6 +268,7 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 			// the item is still the generation it was built from
 			// (recreateHostChecks), or this is an image change too.
 			pinGen, pinned = old.TemplateGen, true
+			dec.pinned, dec.pinGen = true, pinGen
 		}
 		dec.keep = true
 		dec.note = RequireRole(ctx, "admin") != nil
@@ -282,6 +283,12 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 		if old.Template != "" && old.Template == req.Template {
 			dec.template = req.Template
 		}
+		// A recreate from a rootfs path is built from a copy its member's
+		// host takes before the delete, so nothing that becomes of the item
+		// afterwards can leave the member deleted and not rebuilt.
+		if _, isPath, _ := lxc.TemplatePath(req.Template); isPath {
+			dec.bound = true
+		}
 		createCtx, _ = dec.apply(ctx, d, req)
 	}
 	if err := s.authorizeContainerCreate(createCtx, req); err != nil {
@@ -293,7 +300,7 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 	// otherwise that host runs them at the delete, from the preflight its
 	// forwarded delete carries (recreate_preflight.go).
 	pf := &recreatePreflight{template: req.Template, project: req.Project, distro: req.Distro, release: req.Release, arch: req.Arch,
-		pinned: pinned, pinGen: pinGen}
+		pinned: pinned, pinGen: pinGen, bound: dec != nil && dec.bound}
 	if a.TargetHost == "" || a.TargetHost == s.hostName {
 		if err := s.recreateHostChecks(createCtx, *pf, req.Name); err != nil {
 			if status.Code(err) != codes.FailedPrecondition {
@@ -400,6 +407,12 @@ type recreateDecision struct {
 	project           string
 	keep, note        bool
 	template          string
+	// pinned: the create must copy generation pinGen of the item under
+	// template (recreatePinnedImage); bound: it is built from the copy its
+	// fetch takes before the delete, whatever generation that is.
+	pinned bool
+	pinGen string
+	bound  bool
 }
 
 // recreateDecisionKey carries one recreate's decision from its judgment to
@@ -425,6 +438,9 @@ func recreateTemplateGranted(ctx context.Context, template string) bool {
 func (dec *recreateDecision) apply(ctx context.Context, d *compose.VMDef, req *pb.CreateContainerRequest) (context.Context, bool) {
 	if dec.template != "" {
 		ctx = context.WithValue(ctx, recreateTemplateKey{}, dec.template)
+	}
+	if dec.pinned || dec.bound {
+		ctx = withRecreatePin(ctx, req.Template, dec.pinGen, !dec.pinned)
 	}
 	if !dec.keep {
 		// Bound to this create, for its member's host when that is

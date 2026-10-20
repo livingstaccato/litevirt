@@ -37,6 +37,7 @@ func (a *LXCRuntimeAdapter) CreateContainer(ctx context.Context, opts CreateCont
 		Network: nics, Labels: opts.Labels,
 		Confinement: opts.Confinement, IDMap: idmap,
 		Mounts: lxcMounts(opts.Mounts), Devices: lxcDevices(opts.Devices),
+		CheckItem: opts.CheckItem, Pinned: opts.Pinned, PinnedGen: opts.PinnedGen, PinAnyGen: opts.PinAnyGen,
 	})
 	if err != nil {
 		return nil, err
@@ -93,7 +94,22 @@ func (a *LXCRuntimeAdapter) DeleteContainer(ctx context.Context, name string) er
 }
 
 func (a *LXCRuntimeAdapter) ExecContainer(ctx context.Context, name string, argv []string) (ContainerExecResult, error) {
-	r, err := a.Inner.Exec(ctx, name, argv)
+	return a.ExecContainerStarted(ctx, name, argv, nil)
+}
+
+// ExecContainerStarted is ExecContainer, calling started once the exec is
+// attached (lxc.LxcRunner.ExecStarted); a runtime that cannot tell never
+// calls it.
+func (a *LXCRuntimeAdapter) ExecContainerStarted(ctx context.Context, name string, argv []string, started func()) (ContainerExecResult, error) {
+	var r lxc.ExecResult
+	var err error
+	if es, ok := a.Inner.(interface {
+		ExecStarted(ctx context.Context, name string, argv []string, started func()) (lxc.ExecResult, error)
+	}); ok {
+		r, err = es.ExecStarted(ctx, name, argv, started)
+	} else {
+		r, err = a.Inner.Exec(ctx, name, argv)
+	}
 	if err != nil {
 		return ContainerExecResult{}, err
 	}
@@ -145,10 +161,10 @@ func (a *LXCRuntimeAdapter) ListContainers(ctx context.Context) ([]string, error
 	return a.Inner.List(ctx)
 }
 
-func (a *LXCRuntimeAdapter) PullOCIImage(ctx context.Context, image, dest, tag, username, password string, replace bool, check func(transport, path string) error) error {
+func (a *LXCRuntimeAdapter) PullOCIImage(ctx context.Context, image, dest, tag, username, password string, replace bool, check func(transport, path string) error, owner string, publish func() error) error {
 	return lxc.PullOCI(ctx, lxc.PullOCIOptions{
 		Image: image, Dest: dest, Tag: tag, Username: username, Password: password, Replace: replace,
-		CheckSource: check,
+		CheckSource: check, Owner: owner, Publish: publish,
 	})
 }
 
@@ -177,6 +193,7 @@ func (a *LXCRuntimeAdapter) FetchContainerImage(ctx context.Context, opts Create
 	}
 	return f.FetchImage(ctx, lxc.CreateOpts{
 		Name: opts.Name, Template: opts.Template, Distro: opts.Distro, Release: opts.Release, Arch: opts.Arch,
+		Pinned: opts.Pinned, PinnedGen: opts.PinnedGen, PinAnyGen: opts.PinAnyGen, CheckItem: opts.CheckItem,
 	})
 }
 

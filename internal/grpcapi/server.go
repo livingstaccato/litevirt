@@ -2554,8 +2554,11 @@ type ContainerRuntime interface {
 	// bundle already there (lxc.PullOCIOptions.Replace); without, such a pull
 	// fails with lxc.ErrOCIItemExists.
 	// check judges a local source as the object the runtime opened
-	// (lxc.PullOCIOptions.CheckSource).
-	PullOCIImage(ctx context.Context, image, dest, tag, username, password string, replace bool, check func(transport, path string) error) error
+	// (lxc.PullOCIOptions.CheckSource). owner, when not "", is recorded in
+	// the bundle with its content (lxc.PullOCIOptions.Owner). publish, when
+	// not nil, runs once the image is in place, under the item's locks
+	// (lxc.PullOCIOptions.Publish).
+	PullOCIImage(ctx context.Context, image, dest, tag, username, password string, replace bool, check func(transport, path string) error, owner string, publish func() error) error
 	// RootfsReferences names the containers on this host whose config uses
 	// dir, or anything under it, as their rootfs in place.
 	RootfsReferences(ctx context.Context, dir string) ([]string, error)
@@ -2587,6 +2590,15 @@ type CreateContainerOpts struct {
 	// only); the runtime judges them against this host's allowed prefixes.
 	Mounts  []ContainerMountOpt
 	Devices []ContainerDeviceOpt
+	// CheckItem judges a library item's rootfs path as the create copies
+	// it (lxc.CreateOpts.CheckItem).
+	CheckItem func(gen string) error
+	// Pinned, PinnedGen and PinAnyGen bind a rootfs path to one
+	// generation of its library item (lxc.CreateOpts.Pinned): a fetch
+	// copies it aside, a create is built from that copy.
+	Pinned    bool
+	PinnedGen string
+	PinAnyGen bool
 }
 
 // ContainerMountOpt mirrors lxc.Mount; ContainerDeviceOpt mirrors lxc.Device.

@@ -3,7 +3,10 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -129,11 +132,57 @@ type fakeCTRuntime struct {
 	rootfsRefs  map[string][]string
 	pullCheck   func(transport, path string) error
 	pullErr     error
+	// pullUnpack makes PullOCIImage lay the image down (fakeUnpack).
+	pullUnpack bool
+	// pullCrashBeforePublish models a daemon that dies once the pulled
+	// image is in place, before the pull's publish step runs.
+	pullCrashBeforePublish bool
+	// beforeCopy runs at the start of CreateContainer, before the item is
+	// judged and copied.
+	beforeCopy func()
+	// copied records, per created container, the rootfs/etc/image of the
+	// library item it was copied from.
+	copied map[string]string
+	// pinnedCopies is what a pinned fetch copied aside, by name: its
+	// template, generation and rootfs/etc/image.
+	pinnedCopies map[string][4]string
 }
 
 func (f *fakeCTRuntime) CreateContainer(_ context.Context, opts CreateContainerOpts) (*ContainerInfo, error) {
+	if f.beforeCopy != nil {
+		f.beforeCopy()
+	}
+	var image string
+	if p, isPath, _ := lxc.TemplatePath(opts.Template); isPath {
+		unlock := lxc.LockOCIItem(lxc.BundleDir(p))
+		f.mu.Lock()
+		c, ok := f.pinnedCopies[opts.Name]
+		delete(f.pinnedCopies, opts.Name)
+		f.mu.Unlock()
+		switch {
+		case opts.Pinned && ok && c[0] == opts.Template && (c[1] == pinWant(opts) || opts.PinAnyGen):
+			image = c[2] // the copy the pinned fetch took
+		case opts.Pinned && !opts.PinAnyGen && lxc.ReadImageGen(lxc.BundleDir(p)) != opts.PinnedGen:
+			unlock()
+			return nil, fmt.Errorf("fake: create %s: %w", opts.Name, lxc.ErrImageReplaced)
+		default:
+			if opts.CheckItem != nil {
+				if err := opts.CheckItem(lxc.ReadImageGen(lxc.BundleDir(p))); err != nil {
+					unlock()
+					return nil, err
+				}
+			}
+			b, _ := os.ReadFile(filepath.Join(lxc.BundleDir(p), "rootfs", "etc", "image"))
+			image = string(b)
+		}
+		unlock()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.copied == nil {
+		f.copied = map[string]string{}
+	}
+	f.copied[opts.Name] = image
 	f.createCalls = append(f.createCalls, opts)
 	f.setRunState(opts.Name, "stopped")
 	if f.createHook != nil {
@@ -148,12 +197,37 @@ func (f *fakeCTRuntime) CreateContainer(_ context.Context, opts CreateContainerO
 	return &ContainerInfo{Name: opts.Name, State: "stopped"}, nil
 }
 
-// FetchContainerImage records the fetch and fails with fetchErr.
+// FetchContainerImage records the fetch and fails with fetchErr. A pinned
+// fetch copies the judged generation's rootfs/etc/image aside, under the
+// item's lock, as lxc.LxcRunner.FetchImage does.
 func (f *fakeCTRuntime) FetchContainerImage(_ context.Context, opts CreateContainerOpts) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.fetchCalls = append(f.fetchCalls, opts)
-	return f.fetchErr
+	err := f.fetchErr
+	f.mu.Unlock()
+	p, isPath, _ := lxc.TemplatePath(opts.Template)
+	if err != nil || !opts.Pinned || !isPath {
+		return err
+	}
+	unlock := lxc.LockOCIItem(lxc.BundleDir(p))
+	defer unlock()
+	gen := lxc.ReadImageGen(lxc.BundleDir(p))
+	if !opts.PinAnyGen && gen != opts.PinnedGen {
+		return fmt.Errorf("fake: fetch %s: %w", opts.Template, lxc.ErrImageReplaced)
+	}
+	if opts.CheckItem != nil {
+		if err := opts.CheckItem(gen); err != nil {
+			return err
+		}
+	}
+	b, _ := os.ReadFile(filepath.Join(lxc.BundleDir(p), "rootfs", "etc", "image"))
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.pinnedCopies == nil {
+		f.pinnedCopies = map[string][4]string{}
+	}
+	f.pinnedCopies[opts.Name] = [4]string{opts.Template, pinWant(opts), string(b), gen}
+	return nil
 }
 func (f *fakeCTRuntime) StartContainer(_ context.Context, name string) error {
 	f.mu.Lock()
@@ -422,13 +496,63 @@ func (f *fakeCTRuntime) ReadOwner(name string) (*lxc.ContainerOwner, error) {
 	}
 	return nil, nil
 }
-func (f *fakeCTRuntime) PullOCIImage(_ context.Context, image, dest, tag, username, password string, replace bool, check func(transport, path string) error) error {
+func (f *fakeCTRuntime) PullOCIImage(_ context.Context, image, dest, tag, username, password string, replace bool, check func(transport, path string) error, owner string, publish func() error) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.pullCheck = check
 	f.pullCalls = append(f.pullCalls, struct{ Image, Dest, Tag, Username, Password string }{image, dest, tag, username, password})
 	f.pullReplace = append(f.pullReplace, replace)
-	return f.pullErr
+	err, unpack := f.pullErr, f.pullUnpack
+	if f.pullCrashBeforePublish {
+		publish = nil // the daemon died once the image was in place
+	}
+	f.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if !unpack {
+		if publish != nil {
+			return publish()
+		}
+		return nil
+	}
+	return fakeUnpack(image, dest, replace, owner, publish)
+}
+
+// fakeUnpack puts a bundle whose rootfs/etc/image names image at dest, with
+// a fresh generation, under the item's lock, as lxc.PullOCI does: an item
+// there already is replaced only with replace and while no recreate pins
+// it, and publish runs once it is in place.
+func fakeUnpack(image, dest string, replace bool, owner string, publish func() error) error {
+	unlock := lxc.LockOCIItem(dest)
+	defer unlock()
+	exists, err := lxc.IsBundle(dest)
+	if err != nil {
+		return err
+	}
+	if exists && !replace {
+		return fmt.Errorf("%w: %s", lxc.ErrOCIItemExists, dest)
+	}
+	if err := os.MkdirAll(filepath.Join(dest, "rootfs", "etc"), 0o755); err != nil {
+		return err
+	}
+	for p, b := range map[string]string{
+		filepath.Join(dest, "rootfs", "etc", "image"): image,
+		filepath.Join(dest, "config.json"):            "{}",
+		filepath.Join(dest, lxc.ImageGenFile):         image + "-gen",
+		filepath.Join(dest, lxc.OwnerFile):            owner,
+	} {
+		if b == "" && filepath.Base(p) == lxc.OwnerFile {
+			_ = os.Remove(p)
+			continue
+		}
+		if err := os.WriteFile(p, []byte(b), 0o644); err != nil {
+			return err
+		}
+	}
+	if publish != nil {
+		return publish()
+	}
+	return nil
 }
 
 // RootfsReferences reports rootfsRefs[dir].
@@ -625,4 +749,12 @@ func TestPullOCIImage_ForwardsToRuntime(t *testing.T) {
 	if rt.pullCalls[0].Image != "alpine:3.19" || rt.pullCalls[0].Dest != "/tmp/r" {
 		t.Errorf("pull args wrong: %+v", rt.pullCalls[0])
 	}
+}
+
+// pinWant is what a pinned copy is bound to: its generation, or any.
+func pinWant(opts CreateContainerOpts) string {
+	if opts.PinAnyGen {
+		return "*"
+	}
+	return "=" + opts.PinnedGen
 }

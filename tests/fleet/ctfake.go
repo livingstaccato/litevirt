@@ -427,7 +427,7 @@ func (f *CTFake) CreateContainer(_ context.Context, opts grpcapi.CreateContainer
 		c, ok := f.pinnedCopies[opts.Name]
 		delete(f.pinnedCopies, opts.Name)
 		f.mu.Unlock()
-		if opts.Pinned && ok && c[0] == opts.Template && c[1] == pinWant(opts) {
+		if opts.Pinned && ok && c[0] == opts.Template && (c[1] == pinWant(opts) || opts.PinAnyGen) {
 			fromCopy = &c
 		} else if opts.Pinned && !opts.PinAnyGen && lxc.ReadImageGen(lxc.BundleDir(p)) != opts.PinnedGen {
 			return nil, fmt.Errorf("ctfake: create %s: %w", opts.Name, lxc.ErrImageReplaced)

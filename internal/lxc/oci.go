@@ -240,6 +240,16 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) (err error) {
 	))); err != nil {
 		return fmt.Errorf("umoci unpack: %w: %s", err, out)
 	}
+	return placePulled(bundle, opts, exists, created)
+}
+
+// placePulled puts the bundle a pull unpacked in place at opts.Dest: it
+// records the bundle's generation and, with opts.Owner, its owner in the
+// bundle, so the one rename that publishes the content publishes them;
+// then the bundle replaces the item there (exists) or becomes it
+// (created); then opts.Publish runs. A failure before the rename leaves
+// the item as it was.
+func placePulled(bundle string, opts PullOCIOptions, exists, created bool) error {
 	if err := writeImageGen(bundle); err != nil {
 		return err
 	}

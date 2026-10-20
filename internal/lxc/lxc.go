@@ -509,6 +509,7 @@ func (r *LxcRunner) FetchImage(ctx context.Context, opts CreateOpts) error {
 	if err := opts.Validate(); err != nil {
 		return err
 	}
+	r.expirePinnedCopies()
 	if opts.Template != "download" {
 		if p, isPath, _ := TemplatePath(opts.Template); isPath {
 			unlock := LockOCIItem(BundleDir(p))
@@ -833,8 +834,8 @@ func (r *LxcRunner) Exec(ctx context.Context, name string, argv []string) (ExecR
 // committed to the container it found running: it has forked to enter it.
 // A container stopped after that ends what was attached; one started again
 // is not the one attached to. If lxc-attach exits first, started is not
-// called. On a kernel that cannot list a process's children, started is
-// called once lxc-attach has started.
+// called; nor is it on a kernel that cannot list a process's children
+// (no CONFIG_PROC_CHILDREN), where the attach cannot be seen.
 func (r *LxcRunner) ExecStarted(ctx context.Context, name string, argv []string, started func()) (ExecResult, error) {
 	args := append([]string{"-n", name, "--set-var", execPATH, "--"}, argv...)
 	cmd := exec.CommandContext(ctx, "lxc-attach", r.withLxcpath(args)...)
@@ -2065,9 +2066,21 @@ func (r *LxcRunner) stagePinnedCopy(ctx context.Context, opts CreateOpts, rootfs
 
 // pinnedCopy is the rootfs copy stagePinnedCopy took for opts, "" when
 // there is none. The caller holds lockFetch(opts.Name).
+//
+// Only a copy taken within pinnedCopyKeep is used. A create bound to any
+// generation (PinAnyGen) uses a copy of its template taken for either
+// binding: the copy is the generation the member's host found and judged.
 func (r *LxcRunner) pinnedCopy(opts CreateOpts) string {
 	stage := r.fetchStage(opts.Name)
-	if b, err := os.ReadFile(filepath.Join(stage, fetchedImageFile)); err != nil || string(b) != pinnedSignature(opts) {
+	if !isPinnedCopy(stage, pinnedCopyKeep) {
+		return ""
+	}
+	b, err := os.ReadFile(filepath.Join(stage, fetchedImageFile))
+	if err != nil {
+		return ""
+	}
+	if sig := string(b); sig != pinnedSignature(opts) &&
+		!(opts.PinAnyGen && strings.HasPrefix(sig, "pinned\x00"+opts.Template+"\x00")) {
 		return ""
 	}
 	p := filepath.Join(stage, "rootfs")
@@ -2086,6 +2099,58 @@ func (r *LxcRunner) dropPinnedCopy(name string) {
 	}
 }
 
+// expirePinnedCopies removes, during the daemon's life, the pinned copies
+// (stagePinnedCopy) older than pinnedCopyKeep that no recreate took: one a
+// cancelled deploy left. SweepFetchDir does the same at start.
+func (r *LxcRunner) expirePinnedCopies() {
+	dir := filepath.Join(r.lxcpath(), fetchDirName)
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		stage := filepath.Join(dir, e.Name())
+		if !isPinnedCopy(stage, 100*365*24*time.Hour) || isPinnedCopy(stage, pinnedCopyKeep) {
+			continue
+		}
+		unlock := lockFetch(e.Name())
+		if isPinnedCopy(stage, 100*365*24*time.Hour) && !isPinnedCopy(stage, pinnedCopyKeep) {
+			if err := clearStage(stage); err != nil {
+				slog.Warn("container staging: kept an expired image copy a process may still be working in", "path", stage, "error", err)
+			} else {
+				slog.Info("container staging: removed an image copy no recreate took", "path", stage)
+			}
+		}
+		unlock()
+	}
+}
+
+// PinnedCopies counts the image copies recreates have taken and not yet
+// used (stagePinnedCopy), and their size in bytes.
+func (r *LxcRunner) PinnedCopies() (n int, bytes int64) {
+	dir := filepath.Join(r.lxcpath(), fetchDirName)
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, 0
+	}
+	for _, e := range ents {
+		stage := filepath.Join(dir, e.Name())
+		if !isPinnedCopy(stage, 100*365*24*time.Hour) {
+			continue
+		}
+		n++
+		_ = filepath.WalkDir(stage, func(_ string, d fs.DirEntry, err error) error {
+			if err == nil && d.Type().IsRegular() {
+				if fi, ierr := d.Info(); ierr == nil {
+					bytes += fi.Size()
+				}
+			}
+			return nil
+		})
+	}
+	return n, bytes
+}
+
 // clearStage removes a stage for a new fetch, once no process works in it
 // (stopWorkersIn); one that cannot be shown quiet is kept, and the fetch
 // refused.
@@ -2099,6 +2164,9 @@ func clearStage(stage string) error {
 	return os.RemoveAll(stage)
 }
 
+// procChildren is the file listing pid's children; a test seam.
+var procChildren = func(pid int) string { return fmt.Sprintf("/proc/%d/task/%d/children", pid, pid) }
+
 // waitAttached calls started once process pid has a child (lxc-attach
 // forks to enter the container), then waits for done; if done comes first,
 // started is not called.
@@ -2106,7 +2174,7 @@ func waitAttached(pid int, done <-chan error, started func()) error {
 	if started == nil {
 		return <-done
 	}
-	children := fmt.Sprintf("/proc/%d/task/%d/children", pid, pid)
+	children := procChildren(pid)
 	tick := time.NewTicker(2 * time.Millisecond)
 	defer tick.Stop()
 	for {
@@ -2117,7 +2185,9 @@ func waitAttached(pid int, done <-chan error, started func()) error {
 			b, err := os.ReadFile(children)
 			if err != nil && errors.Is(err, os.ErrNotExist) {
 				if _, perr := os.Stat(fmt.Sprintf("/proc/%d", pid)); perr == nil {
-					started() // no children file on this kernel
+					// No children file on this kernel: the attach cannot be
+					// seen, so it is never reported (the caller keeps what
+					// it holds for the whole exec).
 					return <-done
 				}
 				continue

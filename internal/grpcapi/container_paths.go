@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -248,6 +249,35 @@ func (s *Server) readOCIOwner(name string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(b)), nil
+}
+
+// ociOwnerPending is what <data_dir>/oci-owners/<name> holds while a pull
+// with a project is under way (markOCIOwnerPending). It is no project's
+// name, so an owner-bound caller is refused the item.
+const ociOwnerPending = "!a-claim-of-this-image-was-interrupted"
+
+// markOCIOwnerPending sets the owner record of item to ociOwnerPending for
+// a pull with a project, and returns what puts it back as it was.
+func (s *Server) markOCIOwnerPending(item string) (restore func()) {
+	path := filepath.Join(s.dataDir, ociOwnersDir, item)
+	prev, err := os.ReadFile(path)
+	had := err == nil
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return func() {}
+	}
+	if err := s.writeOCIOwner(item, ociOwnerPending); err != nil {
+		slog.Warn("oci pull: could not mark the image's owner record for earlier builds as pending", "image", item, "error", err)
+		return func() {}
+	}
+	return func() {
+		if had {
+			if err := s.writeOCIOwner(item, strings.TrimSpace(string(prev))); err != nil {
+				slog.Warn("oci pull: could not put the image's owner record back", "image", item, "error", err)
+			}
+			return
+		}
+		_ = os.Remove(path)
+	}
 }
 
 // writeOCIOwner records project in <data_dir>/oci-owners/<name>, whole or

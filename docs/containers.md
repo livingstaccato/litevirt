@@ -552,6 +552,9 @@ Containers are first-class tenancy citizens, at parity with VMs:
   `cpu.stat`) and `litevirt_container_memory_bytes` (cgroup-v2 `memory.current`).
   Usage metrics require cgroup-v2 (the modern default); on a cgroup-v1-only host
   they are quietly omitted (limits/state are still reported).
+  `litevirt_container_image_copies` and `litevirt_container_image_copy_bytes`
+  count the image copies compose recreates took before their delete and have
+  not used yet (a cancelled deploy leaves one; it goes after 24 hours).
 
 ## Backup & restore
 

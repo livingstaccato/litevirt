@@ -2,12 +2,14 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -238,5 +240,39 @@ func TestComposeRecreate_AClaimForAnotherProjectAfterTheDeleteKeepsTheMember(t *
 	err := recreateMember(carl, s, upd, f)
 	if claimErr != nil || err != nil || rt.copied["web"] != "judged" {
 		t.Fatalf("claim=%v recreate=%v copied=%q: want the member rebuilt from the judged copy", claimErr, err, rt.copied["web"])
+	}
+}
+
+// Review r2 M2: an entry on an earlier build asks the member's delete for a
+// pinned copy, then forwards a create with its recreate decision but no
+// binding. The member's host builds that create from the copy its delete
+// check took, not from the item an Admin replaced in between.
+func TestCreateContainer_AnEarlierEntrysRecreateIsBuiltFromTheDeletesCopy(t *testing.T) {
+	s, rt := secServer(t)
+	rt.pullUnpack = true
+	item := mkBundle(t, s, "build", "g1")
+	if err := os.WriteFile(filepath.Join(item, "rootfs", "etc", "image"), []byte("judged"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tmpl := filepath.Join(item, "rootfs")
+	// The forwarded delete's check (recreatePinnedMDKey "1:g1") took the copy.
+	if err := rt.FetchContainerImage(context.Background(), CreateContainerOpts{Name: "web", Template: tmpl, Pinned: true, PinnedGen: "g1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PullOCIImage(adminCtx(), &pb.PullOCIImageRequest{Image: "replaced", Dest: "build", Project: "acme"}); err != nil {
+		t.Fatal(err)
+	}
+	ri, err := json.Marshal(map[string]any{"name": "web", "host": s.hostName, "image": tmpl, "template": tmpl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := context.WithValue(context.WithValue(peerCtxFor(t, s, "host-b"), ctxKeyUsername, "host-b"), ctxKeyRole, "admin")
+	ctx := metadata.NewIncomingContext(peer, metadata.Pairs(recreateInheritMDKey, string(ri)))
+	if _, err := s.CreateContainer(ctx, &pb.CreateContainerRequest{
+		Name: "web", HostName: s.hostName, Image: tmpl, Template: tmpl, Project: "acme", Arch: "amd64"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if got := rt.copied["web"]; got != "judged" {
+		t.Fatalf("the member was rebuilt from %q, want the copy its delete check took", got)
 	}
 }

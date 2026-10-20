@@ -1047,11 +1047,21 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 	// the content (lxc.OwnerFile), so the one rename that publishes the
 	// content publishes its owner; then, under the item's locks, in
 	// <data_dir>/oci-owners too, which an earlier build reads.
+	//
+	// Until the image is in place, that copy holds ociOwnerPending, which
+	// matches no project: an earlier build, rolled back to after a claim was
+	// cut short, refuses the item to every project rather than give the new
+	// image to the old owner. A pull that fails before then puts the copy
+	// back as it was.
 	var owner string
 	var publish func() error
+	restore := func() {}
+	published := false
 	if item != "" && s.dataDir != "" && req.Project != "" {
 		owner = tenancy.NormalizeProject(req.Project)
+		restore = s.markOCIOwnerPending(item)
 		publish = func() error {
+			published = true
 			ociOwnerWriteHook(item, owner)
 			if err := s.writeOCIOwner(item, owner); err != nil {
 				slog.Warn("oci pull: the image's owner is recorded with it, but its copy for earlier builds could not be written", "image", item, "project", owner, "error", err)
@@ -1060,6 +1070,9 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 		}
 	}
 	if err := s.containerRuntime.PullOCIImage(ctx, req.Image, req.Dest, req.Tag, req.Username, req.Password, replace, s.checkPullSource, owner, publish); err != nil {
+		if !published {
+			restore()
+		}
 		switch {
 		case errors.Is(err, lxc.ErrOCIItemExists):
 			return nil, ociItemExistsErr(req.Dest, s.hostName)

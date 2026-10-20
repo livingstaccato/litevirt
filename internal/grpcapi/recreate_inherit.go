@@ -125,6 +125,11 @@ func (s *Server) acceptRecreateInherit(ctx context.Context, req *pb.CreateContai
 	}
 	if ri.Pinned || ri.Bound {
 		ctx = withRecreatePin(ctx, req.Template, ri.PinGen, !ri.Pinned)
+	} else if _, isPath, _ := lxc.TemplatePath(req.Template); isPath {
+		// From an entry on an earlier build, which may have asked the delete
+		// for a pinned copy without binding the create to it: the create is
+		// built from a copy its delete check took, when there is one.
+		ctx = withRecreatePin(ctx, req.Template, "", true)
 	}
 	return ctx
 }

@@ -54,3 +54,19 @@ func TestExecStarted_NoAttachNoReport(t *testing.T) {
 		t.Fatal("an exec that never attached was reported attached")
 	}
 }
+
+// On a kernel that cannot list a process's children, the attach cannot be
+// seen, so it is never reported: the caller keeps its lock for the exec.
+func TestExecStarted_NoChildrenFileNoReport(t *testing.T) {
+	fakeLxcAttach(t)
+	prev := procChildren
+	t.Cleanup(func() { procChildren = prev })
+	procChildren = func(int) string { return filepath.Join(t.TempDir(), "no-such-file") }
+	called := false
+	if _, err := (&LxcRunner{Lxcpath: t.TempDir()}).ExecStarted(context.Background(), "web", []string{"sleep", "0.3"}, func() { called = true }); err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Fatal("an attach that could not be seen was reported")
+	}
+}

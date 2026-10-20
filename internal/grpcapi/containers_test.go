@@ -160,7 +160,7 @@ func (f *fakeCTRuntime) CreateContainer(_ context.Context, opts CreateContainerO
 		delete(f.pinnedCopies, opts.Name)
 		f.mu.Unlock()
 		switch {
-		case opts.Pinned && ok && c[0] == opts.Template && c[1] == pinWant(opts):
+		case opts.Pinned && ok && c[0] == opts.Template && (c[1] == pinWant(opts) || opts.PinAnyGen):
 			image = c[2] // the copy the pinned fetch took
 		case opts.Pinned && !opts.PinAnyGen && lxc.ReadImageGen(lxc.BundleDir(p)) != opts.PinnedGen:
 			unlock()

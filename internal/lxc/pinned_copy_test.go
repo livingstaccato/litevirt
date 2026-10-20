@@ -216,3 +216,56 @@ func TestFetchImage_APinnedCopyIsJudgedUnderTheItemLock(t *testing.T) {
 		t.Errorf("something was staged: %v", err)
 	}
 }
+
+// A create bound to any generation builds from a copy of its template the
+// member's host took for a pinned recreate (an entry on an earlier build
+// asked the delete for the pin, but not the create).
+func TestCreate_ABoundCreateUsesAPinnedCopyOfItsTemplate(t *testing.T) {
+	tmp := t.TempDir()
+	r := &LxcRunner{Lxcpath: filepath.Join(tmp, "lxc")}
+	bundle := filepath.Join(tmp, "oci", "build")
+	tmpl := pinnedItem(t, bundle, "g1", "judged")
+	if err := r.FetchImage(context.Background(), CreateOpts{Name: "web", Template: tmpl, Pinned: true, PinnedGen: "g1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(bundle); err != nil {
+		t.Fatal(err)
+	}
+	pinnedItem(t, bundle, "g2", "replaced")
+	if _, err := r.Create(context.Background(), CreateOpts{Name: "web", Template: tmpl, Pinned: true, PinAnyGen: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got := ctImage(t, r.Lxcpath, "web"); got != "judged" {
+		t.Fatalf("built from %q, want the pinned copy", got)
+	}
+}
+
+// A copy older than the keep period is not used, and the next fetch of any
+// name removes it (a cancelled deploy's copy does not wait for a restart).
+func TestPinnedCopy_AnExpiredCopyIsNotUsedAndGoes(t *testing.T) {
+	tmp := t.TempDir()
+	r := &LxcRunner{Lxcpath: filepath.Join(tmp, "lxc")}
+	bundle := filepath.Join(tmp, "oci", "build")
+	tmpl := pinnedItem(t, bundle, "g1", "judged")
+	opts := CreateOpts{Name: "web", Template: tmpl, Pinned: true, PinnedGen: "g1"}
+	if err := r.FetchImage(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-2 * pinnedCopyKeep)
+	if err := os.Chtimes(filepath.Join(r.fetchStage("web"), fetchedImageFile), past, past); err != nil {
+		t.Fatal(err)
+	}
+	if n, b := r.PinnedCopies(); n != 1 || b == 0 {
+		t.Fatalf("PinnedCopies = %d, %d; want the one copy counted", n, b)
+	}
+	if r.pinnedCopy(opts) != "" {
+		t.Fatal("an expired copy would be used")
+	}
+	other := pinnedItem(t, filepath.Join(tmp, "oci", "other"), "o1", "o")
+	if err := r.FetchImage(context.Background(), CreateOpts{Name: "db", Template: other}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(r.fetchStage("web")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the expired copy is still there: %v", err)
+	}
+}

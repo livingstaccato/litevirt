@@ -482,10 +482,14 @@ func projectQuotaIncarnation(ctx context.Context, c *Client, name string) (strin
 // (projectFormsFor), it is keyed by the incarnation of the live project
 // (projectQuotaKey), in a transaction that requires the project still to
 // hold it (ErrProjectChanged); a project with no live row is refused
-// (ErrNoLiveProject). Before, the bare name is the key, as before the latch.
+// (ErrNoLiveProject). Before, and for the default project (which has no row),
+// the bare name is the key, as before the latch.
 func upsertProjectQuota(ctx context.Context, c *Client, q ProjectQuotaRecord, now string) error {
 	canon, err := safename.CanonicalProjectName(q.ProjectName)
-	if err != nil || canon == "/" {
+	// The default project has no projects row and no incarnation, by design:
+	// its quota keeps the bare key and the previous form, as
+	// projectQuotaIncarnation reads it.
+	if err != nil || canon == "/" || canon == "/"+DefaultProject {
 		return c.Execute(ctx, projectQuotaUpsertSQL, q.ProjectName, q.VCPULimit, q.MemMiBLimit, q.DiskGiBLimit,
 			q.NICLimit, q.PublicIPLimit, q.BackupGiBLimit, now)
 	}

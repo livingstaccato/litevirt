@@ -189,12 +189,20 @@ func IsCredentialsInvalidText(installErr string) bool {
 // qemuDir that holds files litevirt did not put there: that directory is
 // libvirt's default and an operator may already use it.
 func InstallQemuMigrationTLS(pkiDir, qemuDir string, keyUID, keyGID int) (bool, error) {
+	ok, _, err := InstallQemuMigrationTLSReport(pkiDir, qemuDir, keyUID, keyGID)
+	return ok, err
+}
+
+// InstallQemuMigrationTLSReport is InstallQemuMigrationTLS that also says
+// whether it wrote anything (a credential file, the marker, the directory).
+func InstallQemuMigrationTLSReport(pkiDir, qemuDir string, keyUID, keyGID int) (ok, wrote bool, err error) {
 	ca, cert, key, err := readValidMigrationSet(pkiDir)
 	if err != nil || ca == nil {
-		return false, err
+		return false, false, err
 	}
-	if err := claimQemuTLSDir(qemuDir); err != nil {
-		return false, err
+	wrote, err = claimQemuTLSDir(qemuDir)
+	if err != nil {
+		return false, wrote, err
 	}
 	files := []struct {
 		name  string
@@ -220,10 +228,11 @@ func InstallQemuMigrationTLS(pkiDir, qemuDir string, keyUID, keyGID int) (bool, 
 			continue
 		}
 		if err := secretfile.WriteOwned(path, f.data, f.mode, uid, gid); err != nil {
-			return false, fmt.Errorf("install %s: %w", path, err)
+			return false, wrote, fmt.Errorf("install %s: %w", path, err)
 		}
+		wrote = true
 	}
-	return true, nil
+	return true, wrote, nil
 }
 
 // readValidMigrationSet reads this host's migration-credential set from
@@ -432,22 +441,23 @@ var qemuTLSMarkerNote = []byte("Managed by litevirt: migration TLS credentials, 
 // claimQemuTLSDir makes qemuDir litevirt's: creates it if absent, accepts it if
 // it is empty or already carries the marker, and refuses anything else. The
 // marker is written only when it is missing or differs.
-func claimQemuTLSDir(qemuDir string) error {
+func claimQemuTLSDir(qemuDir string) (wrote bool, err error) {
 	exists, err := checkQemuTLSDir(qemuDir)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !exists {
 		if err := os.MkdirAll(qemuDir, 0o755); err != nil {
-			return fmt.Errorf("create %s: %w", qemuDir, err)
+			return false, fmt.Errorf("create %s: %w", qemuDir, err)
 		}
+		wrote = true
 	}
 	marker := filepath.Join(qemuDir, qemuTLSManagedMarker)
 	if upToDate(marker, qemuTLSMarkerNote, 0o444, -1, -1) {
-		return nil
+		return wrote, nil
 	}
 	if err := secretfile.Write(marker, qemuTLSMarkerNote, 0o444); err != nil {
-		return fmt.Errorf("mark %s as managed: %w", qemuDir, err)
+		return wrote, fmt.Errorf("mark %s as managed: %w", qemuDir, err)
 	}
-	return nil
+	return true, nil
 }

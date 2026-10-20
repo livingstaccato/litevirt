@@ -183,11 +183,12 @@ fixes `--reissue` whether or not rotation lands.
 host:
 
 - `host`, and `error` when the host could not answer;
-- `valid` and `validation_error` — whether the set passes the installer's
-  validation above;
-- `trusted_ca_fingerprints` — SHA-256 of each CA in `ca.crt`;
+- `provisioned` — the host holds at least one of the three files;
+- `validation_error` — why the set fails the installer's validation above,
+  empty when it passes;
+- `trusted_cas` — SHA-256 fingerprint and `not_after` of each CA in `ca.crt`;
 - `cert_issuer_fingerprint` — the CA that issued the host certificate;
-- `cert_not_after` and each CA's `not_after`;
+- `cert_not_after` — when the host certificate expires;
 - `allow_unencrypted_storage` — this host would fall back to plaintext;
 - `install_error` — why the daemon's installer would refuse the set (a refused
   `/etc/pki/qemu`, an unresolvable QEMU user, a failed validation), from a

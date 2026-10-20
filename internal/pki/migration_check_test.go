@@ -219,3 +219,21 @@ func TestInstallQemuMigrationTLS_RewritesAKeyWhoseGroupChanged(t *testing.T) {
 		t.Fatalf("server-key.pem group %d; want %d", gid, gids[1])
 	}
 }
+
+// InstallQemuMigrationTLSReport says whether it wrote anything, so the
+// daemon logs "installed" only when it did.
+//
+// Mutation: report wrote=true whenever the set is in place — the second
+// install reports a write.
+func TestInstallQemuMigrationTLSReport_SaysWhetherItWrote(t *testing.T) {
+	pkiDir, qemu := t.TempDir(), filepath.Join(t.TempDir(), "qemu")
+	provisionMigration(t, pkiDir)
+	ok, wrote, err := InstallQemuMigrationTLSReport(pkiDir, qemu, -1, -1)
+	if err != nil || !ok || !wrote {
+		t.Fatalf("first install = (%v, %v, %v); want installed and written", ok, wrote, err)
+	}
+	ok, wrote, err = InstallQemuMigrationTLSReport(pkiDir, qemu, -1, -1)
+	if err != nil || !ok || wrote {
+		t.Fatalf("unchanged install = (%v, %v, %v); want installed, nothing written", ok, wrote, err)
+	}
+}

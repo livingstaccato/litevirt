@@ -81,14 +81,21 @@ func qemuOwner(confPath string, lookup func(string) (*user.User, error)) (int, i
 // serialized on d.migrationTLSMu.
 func (d *Daemon) migrationTLSInstaller() func() (bool, error) {
 	return func() (bool, error) {
-		d.migrationTLSMu.Lock()
-		defer d.migrationTLSMu.Unlock()
-		uid, gid, err := qemuOwner(qemuConfPath, user.Lookup)
-		if err != nil {
-			return false, err
-		}
-		return pki.InstallQemuMigrationTLS(d.cfg.PKIDir, pki.QemuTLSDir, uid, gid)
+		ok, _, err := d.installMigrationTLS()
+		return ok, err
 	}
+}
+
+// installMigrationTLS is the install, serialized on d.migrationTLSMu, that
+// also says whether it wrote anything.
+func (d *Daemon) installMigrationTLS() (ok, wrote bool, err error) {
+	d.migrationTLSMu.Lock()
+	defer d.migrationTLSMu.Unlock()
+	uid, gid, err := qemuOwner(qemuConfPath, user.Lookup)
+	if err != nil {
+		return false, false, err
+	}
+	return pki.InstallQemuMigrationTLSReport(d.cfg.PKIDir, pki.QemuTLSDir, uid, gid)
 }
 
 // migrationTLSChecker is the read-only twin of migrationTLSInstaller, for

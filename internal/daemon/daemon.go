@@ -1273,11 +1273,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go runMigrationExpiryWatch(ctx, d.cfg.PKIDir)
 	// Install once at start so the operator sees the state in the log; it runs
 	// again before each storage migration.
-	if ok, err := migrationTLS(); err != nil {
+	if ok, wrote, err := d.installMigrationTLS(); err != nil {
 		slog.Warn("migration TLS: not installed; storage migrations from or to this host "+
 			"cannot be encrypted", "error", err)
-	} else if ok {
+	} else if ok && wrote {
 		slog.Info("migration TLS: credentials installed for QEMU", "dir", pki.QemuTLSDir)
+	} else if ok {
+		slog.Info("migration TLS: credentials for QEMU already up to date", "dir", pki.QemuTLSDir)
 	} else {
 		slog.Info("migration TLS: this host has no migration credentials; provision them with " +
 			"`lv host install-migration-tls`")

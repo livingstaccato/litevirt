@@ -74,7 +74,6 @@ func (f *Fake) deleteNvramLocked(name string) {
 // FailAfterTargetTree fails the migrate once the tree exists, with no domain
 // defined here.
 func (f *Fake) LandFirmwareLive(src *Fake, name string, p libvirt.MigrateParams) error {
-	f.daemon()
 	src.mu.Lock()
 	live, persist, srcStore := p.DestXML, p.PersistXML, src.fwStore
 	if live == "" {

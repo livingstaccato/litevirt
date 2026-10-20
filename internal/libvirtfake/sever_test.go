@@ -146,3 +146,46 @@ func TestSeverDaemon_CallbackEndingItsGoroutineLeavesTheLockFree(t *testing.T) {
 		t.Fatal("the Fake's lock was left held by the ended goroutine")
 	}
 }
+
+// The fingerprint covers all of libvirtd's state, not only domains and
+// operations: a snapshot, a bridge's MTU or a secret changes it.
+//
+// Mutation: Fingerprint hashes only the domains and the events — the bridge
+// MTU change goes unseen, red.
+func TestFingerprint_CoversTheWholeState(t *testing.T) {
+	f := New()
+	f.SetState("vm1", StateRunning)
+	for _, change := range []struct {
+		what string
+		do   func()
+	}{
+		{"a bridge MTU", func() { f.SetBridgeMTU("br0", 9000) }},
+		{"a secret", func() { _ = f.DefineCephSecret("8a1b2c3d-0000-4000-8000-000000000001", "client.x", []byte("k")) }},
+		{"a domain's owner epoch", func() { _ = f.SetDomainOwnerEpoch("vm1", 7, true) }},
+	} {
+		before := f.Fingerprint()
+		change.do()
+		if f.Fingerprint() == before {
+			t.Errorf("%s changed and the fingerprint did not", change.what)
+		}
+	}
+	if a, b := f.Fingerprint(), f.Fingerprint(); a != b {
+		t.Error("the fingerprint of an unchanged Fake differs between two reads")
+	}
+}
+
+// A migration landing on a Fake whose daemon is dead is libvirtd's own
+// doing: the source's goroutine that lands it is not ended.
+func TestSeverDaemon_MigrationLandingIsNotTheDaemons(t *testing.T) {
+	f := New()
+	restore := f.SeverDaemon()
+	defer restore()
+	if !severedCall(t, func() {
+		f.LandMigratedState("<domain><name>vm9</name><uuid>8a1b2c3d-0000-4000-8000-000000000009</uuid></domain>", true)
+	}) {
+		t.Fatal("landing a migration on a severed Fake ended the caller")
+	}
+	if st, ok := f.RawState("vm9"); !ok || st != StatePaused {
+		t.Errorf("vm9 is %v (present %v), want landed paused", st, ok)
+	}
+}

@@ -1691,14 +1691,12 @@ func (f *Fake) consolePassword(name, kind string) (string, error) {
 // define of ours runs, so no console password policy applies — and the guest
 // runs with the passwords it already had.
 func (f *Fake) LandMigrated(domXML string) {
-	f.daemon()
 	f.LandMigratedState(domXML, false)
 }
 
 // LandMigratedState is LandMigrated for a guest that arrives paused when
 // paused is set (VIR_MIGRATE_PAUSED), running otherwise.
 func (f *Fake) LandMigratedState(domXML string, paused bool) {
-	f.daemon()
 	name := domainNameFromXML(domXML)
 	f.mu.Lock()
 	f.leftStateLocked(name)

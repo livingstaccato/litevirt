@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,11 @@ import (
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 )
+
+// userWriteInterleaveHook is a test seam: it runs between an account write's
+// read and its guarded batch (InsertUser's re-create, the admin floor), where
+// a peer's write can replicate in. Nil in production.
+var userWriteInterleaveHook func(username string)
 
 // UserRecord represents a litevirt user.
 type UserRecord struct {
@@ -79,21 +85,67 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 		if passwordHash == "" {
 			ts = shadowReactivationTS(rows[0].String("updated_at"), rows[0].String("cred_ts"), now)
 		}
+		// Once user_incarnation_v1 has latched the re-created account is a
+		// new incarnation, which replaces the tombstone on every node
+		// (user_incarnation.go).
+		created := rows[0].String("created_at")
+		prev := created
+		oldColumn := passwordHash
 		if split {
-			return c.ExecuteBatch(ctx, []Statement{
-				{SQL: usersReactivateSQL, Params: []interface{}{role, c.oldColumnValue(passwordHash), ts, username}},
+			oldColumn = c.oldColumnValue(passwordHash)
+		}
+		reactivate := Statement{SQL: usersReactivateSQL, Params: []interface{}{role, oldColumn, ts, username}}
+		if c.UserIncarnationOn() {
+			created = c.newIncarnation(created)
+			reactivate = Statement{SQL: usersReactivateIncarnationSQL, Params: []interface{}{role, oldColumn, created, ts, username}}
+		}
+		// The re-create replaces the tombstone this node read, and nothing a
+		// peer wrote under the name since: another account of the name that
+		// replicated in between is left as it is, and the caller told to
+		// retry. The credential is bound to the NEW incarnation once
+		// user_incarnation_v1 has latched (stampUserIncarnation), so a
+		// receiver that keeps this re-create off — it still holds the old
+		// account live — takes none of it.
+		still := func(tx *sql.Tx) (bool, error) {
+			var cur string
+			err := tx.QueryRowContext(ctx, `SELECT created_at FROM users WHERE username = ? AND deleted_at IS NOT NULL`, username).Scan(&cur)
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			}
+			return err == nil && cur == prev, err
+		}
+		if userWriteInterleaveHook != nil {
+			userWriteInterleaveHook(username)
+		}
+		var applied bool
+		if split {
+			applied, err = c.ExecuteBatchGuarded(ctx, still, []Statement{
+				reactivate,
 				{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, ts}},
 			})
+		} else {
+			applied, err = c.ExecuteBatchGuarded(ctx, still, []Statement{reactivate})
 		}
-		if err := c.Execute(ctx, usersReactivateSQL, role, passwordHash, ts, username); err != nil {
+		if err != nil {
 			return err
 		}
+		if !applied {
+			return ErrUserAccountChanged
+		}
+		if split {
+			return nil
+		}
 		if passwordHash == "" {
-			c.noteExternalShadow(userIdentity{Username: username, CreatedAt: rows[0].String("created_at"), UpdatedAt: ts})
+			c.noteExternalShadow(userIdentity{Username: username, CreatedAt: created, UpdatedAt: ts})
 		}
 		return nil
 	}
 	created := nowRFC3339()
+	if c.UserIncarnationOn() {
+		// An incarnation at nanosecond precision, so two creates of one name
+		// on partitioned nodes in the same second are two incarnations.
+		created = c.newIncarnation("")
+	}
 	if passwordHash != "" {
 		// A local account under this name: any record that this node made
 		// an external shadow of it is about an earlier incarnation.
@@ -318,15 +370,31 @@ func updateUserPasswordStatements(ctx context.Context, c *Client, username, pass
 		if len(live) == 0 {
 			return nil, nil
 		}
+		// Once user_incarnation_v1 has latched both statements carry the
+		// account's incarnation, so a lagging change to an account since
+		// deleted cannot land on a re-created account of the name
+		// (user_incarnation.go).
+		g, err := userIncarnationGuard(ctx, c, username, true)
+		if err != nil {
+			return nil, err
+		}
 		return []Statement{
-			{SQL: usersUpdatePasswordSQL, Params: []interface{}{c.oldColumnValue(passwordHash), now, username}},
-			{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, now}},
+			{SQL: usersUpdatePasswordSQL, Params: []interface{}{c.oldColumnValue(passwordHash), now, username}, Guard: g},
+			{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, now}, Guard: g},
 		}, nil
 	}
-	return []Statement{{SQL: usersUpdatePasswordSQL, Params: []interface{}{passwordHash, now, username}}}, nil
+	g, err := userIncarnationGuard(ctx, c, username, true)
+	if err != nil {
+		return nil, err
+	}
+	return []Statement{{SQL: usersUpdatePasswordSQL, Params: []interface{}{passwordHash, now, username}, Guard: g}}, nil
 }
 
 const usersUpdatePasswordSQL = `UPDATE users SET password_hash = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`
+
+// userRoleBindingsRevokeSQL is a delete's revocation of the account's role
+// bindings, under both spellings of its principal.
+const userRoleBindingsRevokeSQL = `UPDATE role_bindings SET deleted_at = ?, updated_at = ? WHERE (principal = ? OR principal = ?) AND deleted_at IS NULL`
 
 // DeleteUser tombstones a user and CASCADES the tombstone to its 2FA factors,
 // recovery codes, both active-set pointers, AND its role bindings — all in one
@@ -360,14 +428,28 @@ func DeleteUserCounted(ctx context.Context, c *Client, g capabilities.FeatureGra
 	marker := nowRFC3339()
 	barePrincipal := "user:" + username
 	localPrincipal := barePrincipal + "@local"
-	stmts := []Statement{
-		{SQL: `UPDATE users SET deleted_at = ?, updated_at = ? WHERE username = ?`,
-			Params: []interface{}{marker, now, username}},
+	// Once user_incarnation_v1 has latched the delete names the incarnation
+	// it ends, so a later write to it from a node that had not seen the
+	// delete cannot bring the account back (user_incarnation.go).
+	//
+	// Every statement that names the account by username alone carries the
+	// incarnation too (a user_incarnation_v1 guard), so a lagging delete of
+	// it cannot strip the factors, codes and bindings of a re-created
+	// account of the name. Revocations by session and token id are not
+	// bound: each names one credential of this account.
+	tombstone := Statement{SQL: usersTombstoneSQL, Params: []interface{}{marker, now, username}}
+	ug, err := userIncarnationGuard(ctx, c, username, false)
+	if err != nil {
+		return 0, 0, err
 	}
-	stmts = append(stmts, clearSecondFactorStatements(username, marker, now)...)
+	if ug != nil {
+		tombstone = Statement{SQL: usersTombstoneIncarnationSQL, Params: []interface{}{marker, now, username, ug.Incarnation}, Guard: ug}
+	}
+	stmts := []Statement{tombstone}
+	stmts = append(stmts, clearSecondFactorStatements(username, marker, now, ug)...)
 	stmts = append(stmts, Statement{
-		SQL:    `UPDATE role_bindings SET deleted_at = ?, updated_at = ? WHERE (principal = ? OR principal = ?) AND deleted_at IS NULL`,
-		Params: []interface{}{marker, now, barePrincipal, localPrincipal}})
+		SQL:    userRoleBindingsRevokeSQL,
+		Params: []interface{}{marker, now, barePrincipal, localPrincipal}, Guard: ug})
 	// The account's credentials end IN THIS BATCH (rereview-2 N6, m-4): every
 	// session and API token this node holds for it is revoked with the
 	// existing per-row statements, so the delete cannot land without them.
@@ -388,8 +470,8 @@ func DeleteUserCounted(ctx context.Context, c *Client, g capabilities.FeatureGra
 	if g.Check(capabilities.FeatureLoginPolicy) == nil {
 		// A deleted account's first-enrollment code goes with it (N3); its
 		// directory binding too, so a re-created name binds afresh (N5).
-		stmts = append(stmts, invalidateEnrollmentCodeStatement(username, now))
-		clear, err := clearIdentityBindingsStatements(ctx, c, username, marker, now)
+		stmts = append(stmts, invalidateEnrollmentCodeStatement(username, now, ug))
+		clear, err := clearIdentityBindingsStatements(ctx, c, username, marker, now, ug)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -398,8 +480,8 @@ func DeleteUserCounted(ctx context.Context, c *Client, g capabilities.FeatureGra
 		// held (sessions are not anti-entropy repaired) is refused anyway
 		// once these replicate, whatever comes back under the name.
 		stmts = append(stmts,
-			Statement{SQL: userLifecycleUpsertSQL, Params: []interface{}{username, UserAttrSessionsNotBefore, marker, "user.delete", now}},
-			Statement{SQL: userLifecycleUpsertSQL, Params: []interface{}{username, UserAttrTokensNotBefore, marker, "user.delete", now}},
+			Statement{SQL: userLifecycleUpsertSQL, Params: []interface{}{username, UserAttrSessionsNotBefore, marker, "user.delete", now}, Guard: ug},
+			Statement{SQL: userLifecycleUpsertSQL, Params: []interface{}{username, UserAttrTokensNotBefore, marker, "user.delete", now}, Guard: ug},
 		)
 	}
 	// The account's lifecycle (user_lifecycle) is deliberately LEFT as it is
@@ -417,16 +499,19 @@ func DeleteUserCounted(ctx context.Context, c *Client, g capabilities.FeatureGra
 // both active-set pointers of username: DeleteUser's cascade, and
 // `lv user reset-admin --clear-2fa`. The SQL text is DeleteUser's, so it adds
 // no statement shape.
-func clearSecondFactorStatements(username, marker, now string) []Statement {
+//
+// g, when set, binds each statement to the account's incarnation
+// (user_incarnation.go); nil is the previous release's wire form.
+func clearSecondFactorStatements(username, marker, now string, g *MutationGuard) []Statement {
 	return []Statement{
 		{SQL: `UPDATE user_2fa SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`,
-			Params: []interface{}{marker, now, username}},
+			Params: []interface{}{marker, now, username}, Guard: g},
 		{SQL: `UPDATE user_2fa_sets SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`,
-			Params: []interface{}{marker, now, username}},
+			Params: []interface{}{marker, now, username}, Guard: g},
 		{SQL: `UPDATE recovery_codes SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`,
-			Params: []interface{}{marker, now, username}},
+			Params: []interface{}{marker, now, username}, Guard: g},
 		{SQL: `UPDATE recovery_code_sets SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`,
-			Params: []interface{}{marker, now, username}},
+			Params: []interface{}{marker, now, username}, Guard: g},
 	}
 }
 
@@ -653,7 +738,23 @@ func ReinstateAdminIfNoneRemain(ctx context.Context, c *Client, run FeatureRun) 
 		if err != nil {
 			return err
 		}
-		return c.ExecuteBatch(ctx, stmts)
+		// Over the tombstone read above only: an account of the name that
+		// replicated in since is not overwritten (user_incarnation.go).
+		if userWriteInterleaveHook != nil {
+			userWriteInterleaveHook(victim)
+		}
+		applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+			var del sql.NullString
+			err := tx.QueryRowContext(ctx, `SELECT deleted_at FROM users WHERE username = ?`, victim).Scan(&del)
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			}
+			return err == nil && del.Valid && del.String == deletedAt, err
+		}, stmts)
+		if err == nil && !applied {
+			err = ErrUserAccountChanged
+		}
+		return err
 	}); err != nil {
 		return "", err
 	}
@@ -729,7 +830,22 @@ func reinstateAdminStatements(ctx context.Context, c *Client, g capabilities.Fea
 	// The old column takes what every writer puts there (credentials-clear
 	// M3): "" once credentials_clear_v1 has latched, so the reinstatement
 	// does not put a value back into a cleared column for the next clear pass.
-	stmts := []Statement{{SQL: usersReactivateSQL, Params: []interface{}{"admin", c.oldColumnValue(hash), now, victim}}}
+	// Once user_incarnation_v1 has latched the reinstated account is a new
+	// incarnation, which replaces the tombstone on every node
+	// (user_incarnation.go).
+	reinstate := Statement{SQL: usersReactivateSQL, Params: []interface{}{"admin", c.oldColumnValue(hash), now, victim}}
+	if c.UserIncarnationOn() {
+		prev, err := c.Query(ctx, `SELECT created_at FROM users WHERE username = ?`, victim)
+		if err != nil {
+			return nil, err
+		}
+		created := ""
+		if len(prev) > 0 {
+			created = prev[0].String("created_at")
+		}
+		reinstate = Statement{SQL: usersReactivateIncarnationSQL, Params: []interface{}{"admin", c.oldColumnValue(hash), c.newIncarnation(created), now, victim}}
+	}
+	stmts := []Statement{reinstate}
 	if c.MayWriteCredentialTables() {
 		stmts = append(stmts, Statement{SQL: userCredentialUpsertSQL, Params: []interface{}{victim, hash, now}})
 	}
@@ -754,7 +870,7 @@ func reinstateAdminStatements(ctx context.Context, c *Client, g capabilities.Fea
 	for _, r := range tokRows {
 		stmts = append(stmts, Statement{SQL: tokenRevokeSQL, Params: []interface{}{marker, now, r.String("id")}})
 	}
-	stmts = append(stmts, clearSecondFactorStatements(victim, marker, now)...)
+	stmts = append(stmts, clearSecondFactorStatements(victim, marker, now, nil)...)
 	if loginRules {
 		life, err := GetUserLifecycle(ctx, c, victim)
 		if err != nil {
@@ -768,7 +884,7 @@ func reinstateAdminStatements(ctx context.Context, c *Client, g capabilities.Fea
 				laterCutoff(life.SessionsNotBefore, cut), "admin-floor", now}},
 			Statement{SQL: userLifecycleUpsertSQL, Params: []interface{}{victim, UserAttrTokensNotBefore,
 				laterCutoff(life.TokensNotBefore, marker), "admin-floor", now}},
-			invalidateEnrollmentCodeStatement(victim, now),
+			invalidateEnrollmentCodeStatement(victim, now, nil),
 		)
 	}
 	return stmts, nil
@@ -836,6 +952,9 @@ func UserVariants(ctx context.Context, c *Client, username string) ([]UserVarian
 		}
 		if f, err := ListUser2FA(ctx, c, v.Username); err == nil {
 			v.Factors = len(f)
+		}
+		if f, err := ListHeldUser2FA(ctx, c, v.Username); err == nil {
+			v.Factors += len(f)
 		}
 		if tk, err := c.Query(ctx, `SELECT COUNT(*) AS n FROM tokens WHERE username = ? AND deleted_at IS NULL`, v.Username); err == nil && len(tk) > 0 {
 			v.Tokens = int(tk[0].Int("n"))

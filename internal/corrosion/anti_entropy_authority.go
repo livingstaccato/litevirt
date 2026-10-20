@@ -17,6 +17,9 @@ type mergeAuthorityManifest struct {
 	vms        map[string]workloadMergeAuthority
 	containers map[string]workloadMergeAuthority
 	operations map[string]operationMergeAuthority
+	// users is the sender's users incarnation (created_at) per name, for the
+	// rows it sends keyed by username (user_incarnation.go).
+	users map[string]string
 }
 
 type workloadMergeAuthority struct {
@@ -51,6 +54,10 @@ const (
 	mergeAuthorityKeepLocal
 	mergeAuthorityApplyIncoming
 	mergeAuthorityApplyIncomingAndSweep
+	// mergeAuthorityApplyIncomingAndRetire applies a users row of a newer
+	// incarnation and then retires the older one's rows under the name
+	// (user_incarnation.go).
+	mergeAuthorityApplyIncomingAndRetire
 )
 
 var vmAuthorityChildTables = map[string]bool{
@@ -80,7 +87,7 @@ func mergeDependencyRank(table string) int {
 	switch table {
 	case "vms", "containers":
 		return 0
-	case "operations":
+	case "operations", "users":
 		return 1
 	case "vm_interfaces", "vm_disks", "vm_nics", "vm_pci_intent",
 		"vm_pci_realizations", "container_interfaces", "operation_steps":
@@ -95,6 +102,7 @@ func buildMergeAuthorityManifest(payload *syncPayload) *mergeAuthorityManifest {
 		vms:        make(map[string]workloadMergeAuthority),
 		containers: make(map[string]workloadMergeAuthority),
 		operations: make(map[string]operationMergeAuthority),
+		users:      make(map[string]string),
 	}
 	finished := finishedOperationsInPayload(payload)
 	defer func() {
@@ -109,6 +117,13 @@ func buildMergeAuthorityManifest(payload *syncPayload) *mergeAuthorityManifest {
 				continue
 			}
 			switch table.Name {
+			case "users":
+				idx := columnIndexMap(table.Columns)
+				if ni, ok := idx["username"]; ok {
+					if ci, ok := idx["created_at"]; ok {
+						m.users[coerceString(row[ni])] = coerceString(row[ci])
+					}
+				}
 			case "vms":
 				a, ok := vmAuthorityFromDump(table.Columns, row)
 				if ok {
@@ -288,6 +303,16 @@ func coerceInt64OK(v interface{}) (int64, bool) {
 }
 
 func (c *Client) antiEntropyAuthorityDecision(tx *sql.Tx, table syncTable, row []interface{}) (mergeAuthorityDecision, error) {
+	if table.Name == "users" && c.UserIncarnationOn() {
+		// A live row never beats a tombstone of its own incarnation
+		// (user_incarnation.go).
+		return c.userIncarnationDecision(tx, table, row)
+	}
+	if userKeyedTables[table.Name] && c.UserIncarnationOn() {
+		// A row an older account of the name left on the sender is not this
+		// node's account's (user_incarnation.go).
+		return c.userKeyedRowDecision(tx, table, row)
+	}
 	m := table.authority
 	if m == nil {
 		return mergeAuthorityNormal, nil

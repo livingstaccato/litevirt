@@ -937,6 +937,29 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		}
 	}
 
+	// The incarnation each users row of the chunk holds before the merge:
+	// only a change retires what an older one left (user_holds.go).
+	var usersBefore map[string]string
+	if table.Name == "users" && c.UserIncarnationOn() {
+		usersBefore = map[string]string{}
+		idx := columnIndexMap(table.Columns)
+		for _, row := range rows {
+			if len(row) != len(table.Columns) {
+				continue
+			}
+			name := cellStr(row, idx, "username")
+			if _, seen := usersBefore[name]; seen || name == "" {
+				continue
+			}
+			inc, ierr := userIncarnationHeld(context.Background(), tx, name)
+			if ierr != nil {
+				_ = tx.Rollback()
+				return 0, len(rows), fmt.Errorf("read user incarnation: %w", ierr)
+			}
+			usersBefore[name] = inc
+		}
+	}
+
 	for _, row := range rows {
 		// A peer dump whose row doesn't match the declared column count is
 		// malformed/corrupt: skip it rather than index out of range below or
@@ -991,7 +1014,8 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 			continue
 		}
 		if authorityDecision == mergeAuthorityApplyIncoming ||
-			authorityDecision == mergeAuthorityApplyIncomingAndSweep {
+			authorityDecision == mergeAuthorityApplyIncomingAndSweep ||
+			authorityDecision == mergeAuthorityApplyIncomingAndRetire {
 			// Workload owner/generation is the semantic ABA order. A higher
 			// authority applies even when an unrelated local wall/HLC clock is
 			// larger; children later in the payload are fenced against the
@@ -1005,6 +1029,16 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				skipped++
 			} else {
 				merged++
+				if authorityDecision == mergeAuthorityApplyIncomingAndRetire {
+					// The newer incarnation has landed: the older one's rows
+					// under the name go, here only (user_incarnation.go).
+					idx := columnIndexMap(table.Columns)
+					if retErr := retireOlderIncarnationRows(context.Background(), tx,
+						cellStr(row, idx, "username"), cellStr(row, idx, "created_at")); retErr != nil {
+						_ = tx.Rollback()
+						return merged, skipped, retErr
+					}
+				}
 				if authorityDecision == mergeAuthorityApplyIncomingAndSweep {
 					deletedIdx, updatedIdx := indexOf(table.Columns, "deleted_at"), indexOf(table.Columns, "updated_at")
 					if deletedIdx < 0 || updatedIdx < 0 {
@@ -1200,6 +1234,12 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				})
 				continue
 			}
+		}
+		// ...and a second factor or recovery code an older account of the
+		// name left on the sender (user_incarnation.go).
+		if sensitiveUserKeyedTables[table.Name] && table.remints.olderIncarnation(cellStr(row, columnIndexMap(table.Columns), "username")) {
+			skipped++
+			continue
 		}
 		// ...and the credential that belongs to a refused re-mint, which this
 		// lane carries apart from its users row (users_admin_guard.go).
@@ -1400,6 +1440,23 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		if c.anyUnresolved() {
 			pk := pkKeyAt(row, pkIdx)
 			c.deferAfterCommit(tx, func() { c.clearUnresolved(table.Name, pk) })
+		}
+	}
+
+	// A users row that moved settles what is held or recorded for its name
+	// (user_holds.go).
+	if table.Name == "users" && merged > 0 && usersBefore != nil {
+		idx := columnIndexMap(table.Columns)
+		for _, row := range rows {
+			if len(row) != len(table.Columns) {
+				continue
+			}
+			name := cellStr(row, idx, "username")
+			if err := c.settleUserName(context.Background(), tx, name, usersBefore[name],
+				func(fn func()) { c.deferAfterCommit(tx, fn) }); err != nil {
+				_ = tx.Rollback()
+				return 0, len(rows), fmt.Errorf("settle held user writes: %w", err)
+			}
 		}
 	}
 

@@ -83,16 +83,6 @@ func SetStackFirewallIntent(ctx context.Context, c *Client, st *StackRecord, fir
 	return c.Execute(ctx, clusterPolicyUpsertSQL, stackFirewallKeyPrefix+st.Name, string(v), setBy, c.NowTS())
 }
 
-// stackUpsertSQL is UpsertStack's statement, for a batch.
-const stackUpsertSQL = `INSERT INTO stacks (name, compose_hash, compose_yaml, state, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(name) DO UPDATE SET
-		   compose_hash = excluded.compose_hash,
-		   compose_yaml = excluded.compose_yaml,
-		   state        = excluded.state,
-		   updated_at   = excluded.updated_at,
-		   deleted_at   = NULL`
-
 // UpsertStackWithFirewallIntent writes a stack's record, as UpsertStack
 // does, and the firewall intent of its file in the same replicated write, for
 // a deploy by a caller holding sg.write at the cluster root, the intent

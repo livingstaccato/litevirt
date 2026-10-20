@@ -96,6 +96,18 @@ func (r *LocalRealm) Authenticate(ctx context.Context, creds Credentials) (*Prin
 	if len(factors) > 0 {
 		p.Requires2FA = true
 	}
+	// Held factors (an account re-created under the name of one a lagging
+	// node gave a factor) are never accepted, and their account never logs
+	// in on its password alone: with no other factor, the login is refused
+	// until an admin removes them.
+	held, err := corrosion.ListHeldUser2FA(ctx, r.db, user.Username)
+	if err != nil {
+		return nil, fmt.Errorf("check held 2FA factors for %q: %w", user.Username, err)
+	}
+	if len(held) > 0 && len(factors) == 0 {
+		return nil, fmt.Errorf("%w: the second factors of %q are held: they may be a deleted account's of the same name, "+
+			"and none is accepted. An admin runs %s", ErrSecondFactorHeld, user.Username, corrosion.HeldSecondFactorRecovery(user.Username, held))
+	}
 
 	return p, nil
 }

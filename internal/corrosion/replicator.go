@@ -111,6 +111,9 @@ func NewReplicator(client *Client, pkiDir string, cfg RelayConfig) *Replicator {
 		stopCh:         make(chan struct{}),
 	}
 	r.lastRelayPush.Store(time.Now().UnixMilli())
+	// A user write held for an incarnation this node had not reached is
+	// applied through the WAL lane's own path once it is (user_holds.go).
+	client.setUserHoldReplay(r.applyStatementLWW)
 	return r
 }
 
@@ -1538,6 +1541,58 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 			r.client.noteIncarnationRefusal(tx, s, reason)
 			continue
 		}
+		// A statement bound to an account's incarnation that this node's
+		// users row is not, and a re-create of an older incarnation than the
+		// one it holds, are skipped here and kept out of the absorbs below
+		// with them: a guard-skipped password change from a node that wrote
+		// the old column alone must not be absorbed into the credential row of
+		// whatever account holds the name now (user_incarnation.go).
+		//
+		// A grant or lift whose incarnation this node has not reached yet is
+		// held, with its token's credential, and replayed once it is; a
+		// tightening applies at once (user_holds.go). A token's credential
+		// goes with its token either way, so a skipped token leaves no orphan.
+		if refusedIncarnation[i] {
+			continue
+		}
+		if s.Guard != nil && s.Guard.Protocol == userIncarnationGuardV1 {
+			v, gerr := r.client.userGuardVerdictOf(ctx, tx, s.Guard)
+			if gerr != nil {
+				return fmt.Errorf("apply mutation (origin=%s seq=%d): mutation guard: %w", entry.Origin, entry.Seq, gerr)
+			}
+			// The writer judged a tightening against its own value; one that
+			// would loosen what this node holds (an expiry later than the one
+			// here) waits for its incarnation like a lift.
+			waits := v == userVerdictAhead && s.Guard.ResourceKind != userGuardTighten
+			if v == userVerdictAhead && s.Guard.ResourceKind == userGuardTighten {
+				loosens, lerr := loosensHere(ctx, tx, s)
+				if lerr != nil {
+					return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, lerr)
+				}
+				waits = loosens
+			}
+			if v == userVerdictSkip || waits {
+				refusedIncarnation[i] = true
+				held := []Statement{s}
+				if j, ok := tokenCredentialOf(stmts, i); ok {
+					refusedIncarnation[j] = true
+					held = append(held, stmts[j])
+				}
+				if v == userVerdictAhead {
+					w := userHeldWrite{guard: *s.Guard, stmts: held, hlc: entry.Hlc}
+					name := s.Guard.ResourceID
+					r.client.deferAfterCommit(tx, func() { r.client.userHolds.hold(name, w) })
+				}
+				continue
+			}
+		}
+		if kept, kerr := userRecreateRefused(ctx, tx, s); kerr != nil {
+			return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, kerr)
+		} else if kept {
+			r.client.observeMergeRejected("users", "wal", "older_incarnation")
+			refusedIncarnation[i] = true
+			continue
+		}
 		// A fence credential carries the retirement it was set after
 		// (credentials_revive_guard.go). One that rides with a hosts write
 		// this node refuses as another incarnation's — before or after it in
@@ -1554,6 +1609,14 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 			return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
 		} else if credPlan.skip {
 			continue
+		}
+		// The incarnation the users row holds before this statement moves
+		// it: only a change retires what an older one left (user_holds.go).
+		userName, userBefore := usersStatementName(s), ""
+		if userName != "" {
+			if userBefore, err = userIncarnationHeld(ctx, tx, userName); err != nil {
+				return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+			}
 		}
 		if err := r.applyStatementLWW(ctx, tx, s, entry.Hlc); err != nil {
 			// A held entry's periodic retry is not a new refusal: counting it
@@ -1587,6 +1650,14 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 		// is parked on. Replayed here, inside the batch, so the rest of
 		// the batch applies on top of it. See parked_updates.go.
 		r.replayParked(ctx, tx, s)
+		// A restriction row written for an incarnation is recorded with it,
+		// and a users row that moved settles its name (user_holds.go).
+		r.client.recordUserWrite(ctx, tx, s, s.Guard, func(fn func()) { r.client.deferAfterCommit(tx, fn) })
+		if userName != "" {
+			if err := r.client.settleUserName(ctx, tx, userName, userBefore, func(fn func()) { r.client.deferAfterCommit(tx, fn) }); err != nil {
+				return fmt.Errorf("apply mutation (origin=%s seq=%d): settle held user writes: %w", entry.Origin, entry.Seq, err)
+			}
+		}
 	}
 	// A secret written by a node that had not latched credentials_split_v1
 	// reaches this node in its old column only; absorb it into the
@@ -1947,6 +2018,11 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 			r.client.deferAfterCommit(tx, park)
 		}
 		return nil
+
+	case DispUserIncarnation:
+		// A users delete or re-create naming its incarnation
+		// (user_incarnation.go).
+		return r.applyUserIncarnation(ctx, tx, s, sh, tableName, pkCols, incomingHLC)
 
 	case DispSpecGeneration:
 		// A VM desired-spec edit: DispLiveRowUpdate, but an edit that meets
@@ -2433,6 +2509,11 @@ func legacyAtomicRelocationEntry(stmts []Statement) ([]Statement, bool) {
 }
 
 func validateGuardedMutationEntry(stmts []Statement) error {
+	for _, s := range stmts {
+		if s.Guard != nil && s.Guard.Protocol == userIncarnationGuardV1 {
+			return validateUserIncarnationEntry(stmts)
+		}
+	}
 	for _, s := range stmts {
 		if s.Guard != nil && s.Guard.Protocol == workloadRekeyGuardV1 {
 			return validateGuardedContainerRekeyEntry(stmts)
@@ -3036,6 +3117,10 @@ func validateGuardedStatementBinding(s Statement, sh StmtShape) error {
 	// than bent into the per-table branches below.
 	if g.Protocol == workloadReplaceGuardV1 {
 		return validateReplaceStatementBinding(s, sh, g)
+	}
+	if g.Protocol == userIncarnationGuardV1 {
+		// Bound per entry (validateUserIncarnationEntry).
+		return nil
 	}
 	switch sh.Table {
 	case "operations":

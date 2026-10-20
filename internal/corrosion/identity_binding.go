@@ -292,14 +292,15 @@ func ClearIdentityBindingRows(ctx context.Context, c *Client, g capabilities.Fea
 // binds afresh. marker is the delete's own deleted_at, so the admin floor can
 // find exactly the bindings a delete cleared when it reinstates an external
 // admin (restoreDeletedBindingsStatements).
-func clearIdentityBindingsStatements(ctx context.Context, c *Client, username, marker, now string) ([]Statement, error) {
+// g, when set, binds each to the account's incarnation (user_incarnation.go).
+func clearIdentityBindingsStatements(ctx context.Context, c *Client, username, marker, now string, g *MutationGuard) ([]Statement, error) {
 	bs, err := queryBindings(ctx, c, `username = ?`, username)
 	if err != nil {
 		return nil, err
 	}
 	stmts := make([]Statement, 0, len(bs))
 	for _, b := range bs {
-		stmts = append(stmts, Statement{SQL: identityBindingClearSQL, Params: []interface{}{marker, now, b.Username, b.Realm, b.ExternalID}})
+		stmts = append(stmts, Statement{SQL: identityBindingClearSQL, Params: []interface{}{marker, now, b.Username, b.Realm, b.ExternalID}, Guard: g})
 	}
 	return stmts, nil
 }

@@ -1593,6 +1593,47 @@ stand-down is the inventory mirror's own: `netbox.mirror_inventory` off on
 every node stops the only writer. A binary rolled back below the latched token
 enters WAL quarantine, as below every latched token. Roll forward.
 
+### A deleted account stays deleted after the roll
+
+A password change made on a host that has not yet seen an account's
+`lv user delete` used to bring the account back on every host, with that
+password. Once the `user_incarnation_v1` capability token has latched, a
+delete names the account it ends, and no later write to that account from a
+lagging host revives it. `lv user create` of a deleted name makes a new
+account, which replaces the deleted one everywhere. Nor does a lagging
+host's password change, or its delete of the deleted account, reach the new
+account: its password, second factors, recovery codes, role bindings,
+enrollment code, directory bindings and session cut-offs stay its own. The
+same holds for anything else a lagging host gives the deleted account: an API
+token or login session minted there, a role binding, a directory binding, an
+enrollment code, recovery codes, a second-factor change, or an enable or
+expiry change. A host that learns of the re-create drops the deleted
+account's tokens and sessions it holds. A write to an account that is deleted
+or re-created while the write is being made fails and changes nothing; run it
+again. A second factor, a disable or an earlier expiry that reaches a host
+before the account it belongs to does is applied there at once, and taken
+away again only if the host then learns of a newer account of the name. Two
+things of the deleted account can still reach the new one from the lagging
+host itself, and both only take access away: its session cut-offs, which log
+the new account out once, and its clearing of a directory identity the new
+account is bound to as well, which the new account binds again. A second
+factor enrolled on a host that had not latched the token yet names no
+account. A host that then learns of the re-create holds it: the factor is
+kept, but never accepted, and the account cannot log in, even with its
+password, until an admin removes it with
+`lv 2fa disable --user <name> --method <method> --label <label>` (the
+factor's own method, `totp` or `webauthn`) and then issues an enrollment
+code with `lv 2fa enroll-code <name>`. `lv 2fa ls --user <name>` lists a
+held factor with `(held)` after its label, and the `held_second_factor`
+health condition names the account and the commands for each held factor. The
+token latches on its own once every host the cluster replicates to, including
+one parked in `maintenance`, runs this release. Until then hosts write and
+merge users rows as the previous release does.
+
+`user_incarnation_v1` is mandatory and replication-gated, with no flag and no
+stand-down. A binary rolled back below the latched token enters WAL
+quarantine, as below every latched token. Roll forward.
+
 ### Console passwords start after the roll
 
 This release gives each VM's VNC and SPICE consoles a per-VM password

@@ -82,7 +82,7 @@ func (s *Server) ResetAdminPassword(ctx context.Context, req *pb.ResetAdminPassw
 			return nil, status.Error(codes.FailedPrecondition, st.Message())
 		}
 		s.auditAs(ctx, actor, "user.reset-admin", target, detail, "error")
-		return nil, status.Errorf(codes.Internal, "reset admin password: %v", err)
+		return nil, userWriteStatus(err, "reset admin password")
 	}
 	if u, err := corrosion.GetUser(ctx, s.db, target); err == nil && u != nil {
 		target = u.Username

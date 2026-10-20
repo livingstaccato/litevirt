@@ -300,3 +300,24 @@ func TestHistoricalLedger_HostOnlyDiskMoveHorizonIsItsNewestEmitter(t *testing.T
 		}
 	}
 }
+
+// The legacy network pass's bare VM spec rewrite is emitted by every release
+// through v1.9.0: its historical entry may be removed only once v1.9.0 is
+// unsupported.
+//
+// Mutation: register it with add() (v1.3.0's horizon) — red.
+func TestHistoricalLedger_VMSpecRescopeHorizonIsItsNewestEmitter(t *testing.T) {
+	fp := mustStatementFingerprint("UPDATE vms SET spec = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL")
+	e, ok := historicalLedger[fp]
+	if !ok {
+		t.Fatalf("%s is not in the historical ledger", fp)
+	}
+	if !strings.Contains(e.RemovalHorizon, "v1.9.0") {
+		t.Fatalf("RemovalHorizon = %q, want it to name v1.9.0, the newest release that emits it", e.RemovalHorizon)
+	}
+	for _, hs := range HistoricalShapes() {
+		if hs.Family == "vm_spec_rescope_v130" && !strings.Contains(hs.LastEmitter, "v1.9.0") {
+			t.Fatalf("LastEmitter = %q, want v1.9.0", hs.LastEmitter)
+		}
+	}
+}

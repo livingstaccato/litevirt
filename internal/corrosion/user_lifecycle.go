@@ -398,7 +398,7 @@ func SetUserLifecycle(ctx context.Context, c *Client, g capabilities.FeatureGran
 		Params: []interface{}{username, UserAttrSessionsNotBefore, laterCutoff(cur.SessionsNotBefore, nowRFC3339()), setBy, now}})
 	if disabled != nil && *disabled {
 		// A disable also voids an outstanding first-enrollment code (N3).
-		stmts = append(stmts, invalidateEnrollmentCodeStatement(username, now))
+		stmts = append(stmts, invalidateEnrollmentCodeStatement(username, now, nil))
 	}
 	if disabled != nil {
 		v := "false"
@@ -483,7 +483,7 @@ func ResetUserLifecycle(ctx context.Context, c *Client, g capabilities.FeatureGr
 	if len(prior) > 0 {
 		tokenCut = nowRFC3339()
 	}
-	stmts = append(stmts, invalidateEnrollmentCodeStatement(username, now))
+	stmts = append(stmts, invalidateEnrollmentCodeStatement(username, now, nil))
 	stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
 		Params: []interface{}{username, UserAttrTokensNotBefore, laterCutoff(cur.TokensNotBefore, tokenCut), setBy, now}})
 	return c.ExecuteBatch(ctx, stmts)
@@ -666,6 +666,10 @@ type AdminLoginReport struct {
 	// without their old password: none logs in until root runs
 	// `lv user reset-admin --user <name>`.
 	AwaitingCredential []string
+	// HeldSecondFactor lists usable admins whose only second factors are
+	// held (holdUntaggedFactorSet): none logs in until another admin, or root
+	// on a node, removes them (HeldSecondFactorRecovery).
+	HeldSecondFactor []string
 }
 
 // AdminLoginState reports whether some admin can actually log in now, and,
@@ -706,10 +710,29 @@ func AdminLoginState(ctx context.Context, c *Client) (AdminLoginReport, error) {
 		case hash == ReinstatedAdminPasswordHash:
 			rep.AwaitingCredential = append(rep.AwaitingCredential, name)
 		default:
+			held, err := onlyHeldSecondFactors(ctx, c, name)
+			if err != nil {
+				return rep, err
+			}
+			if held {
+				rep.HeldSecondFactor = append(rep.HeldSecondFactor, name)
+				continue
+			}
 			rep.Loggable = true
 		}
 	}
 	return rep, nil
+}
+
+// onlyHeldSecondFactors reports whether name's second factors are all held:
+// its login asks for a factor that nothing accepts.
+func onlyHeldSecondFactors(ctx context.Context, c *Client, name string) (bool, error) {
+	held, err := ListHeldUser2FA(ctx, c, name)
+	if err != nil || len(held) == 0 {
+		return false, err
+	}
+	active, err := ListUser2FA(ctx, c, name)
+	return len(active) == 0, err
 }
 
 // ambiguousNames is the set of normalized names two or more live accounts

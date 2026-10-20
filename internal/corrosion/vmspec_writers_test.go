@@ -19,15 +19,14 @@ import (
 // mutation barrier or the generation counter. If you add a legitimate new writer,
 // add it here WITH a comment justifying why it can't use the sanctioned APIs.
 var sanctionedSpecWriters = map[string]string{
-	"InsertVMWithHardware":      "creates the row (InsertVM delegates here with nics/pciIntents nil)",
-	"BeginVMCreateOperation":    "creates the provisional row with its operation barrier in the same transaction",
-	"CommitVMCreateOperation":   "commits the provisional row's desired/observed fields under operation+owner+generation fencing",
-	"execVMRekey":               "structural rename — changes the primary key, can't use a name-keyed CAS",
-	"BeginVMOperation":          "F1 op-start: sets desired spec + bumps generation + claims the barrier atomically",
-	"mutateDesiredSpec":         "THE sanctioned desired-spec writer (MutateDesiredSpec, MintFirewallID)",
-	"UpdateObservedActuals":     "THE sanctioned cpu_actual/mem_actual writer",
-	"migrateVMSpecNetworkNames": "one-time schema migration, runs before serving (no barrier to honor)",
-	"isGuardedTransitionSQL":    "fingerprints audited transition constants; it does not execute a write",
+	"InsertVMWithHardware":    "creates the row (InsertVM delegates here with nics/pciIntents nil)",
+	"BeginVMCreateOperation":  "creates the provisional row with its operation barrier in the same transaction",
+	"CommitVMCreateOperation": "commits the provisional row's desired/observed fields under operation+owner+generation fencing",
+	"execVMRekey":             "structural rename — changes the primary key, can't use a name-keyed CAS",
+	"BeginVMOperation":        "F1 op-start: sets desired spec + bumps generation + claims the barrier atomically",
+	"mutateDesiredSpec":       "THE sanctioned desired-spec writer (MutateDesiredSpec, MintFirewallID)",
+	"UpdateObservedActuals":   "THE sanctioned cpu_actual/mem_actual writer",
+	"isGuardedTransitionSQL":  "fingerprints audited transition constants; it does not execute a write",
 	"validateGuardedTransitionStatement": "validates replicated transition params against their guard; " +
 		"it does not execute a write",
 	"validateGuardedMutationEntry": "fingerprints the final guarded transition to validate batch protocol completeness; " +

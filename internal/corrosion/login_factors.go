@@ -74,8 +74,9 @@ const enrollmentCodeTombstoneSQL = `UPDATE user_enrollment_codes SET deleted_at 
 	 WHERE username = ? AND deleted_at IS NULL`
 
 // invalidateEnrollmentCodeStatement is the statement other batches append.
-func invalidateEnrollmentCodeStatement(username, now string) Statement {
-	return Statement{SQL: enrollmentCodeTombstoneSQL, Params: []interface{}{nowRFC3339(), now, username}}
+// g, when set, binds it to the account's incarnation (user_incarnation.go).
+func invalidateEnrollmentCodeStatement(username, now string, g *MutationGuard) Statement {
+	return Statement{SQL: enrollmentCodeTombstoneSQL, Params: []interface{}{nowRFC3339(), now, username}, Guard: g}
 }
 
 // InvalidateEnrollmentCode tombstones username's outstanding code. A no-op
@@ -86,7 +87,7 @@ func InvalidateEnrollmentCode(ctx context.Context, c *Client, g capabilities.Fea
 	if g.Check(capabilities.FeatureLoginPolicy) != nil {
 		return nil
 	}
-	st := invalidateEnrollmentCodeStatement(username, c.NowTS())
+	st := invalidateEnrollmentCodeStatement(username, c.NowTS(), nil)
 	return c.ExecuteBatch(ctx, []Statement{st})
 }
 

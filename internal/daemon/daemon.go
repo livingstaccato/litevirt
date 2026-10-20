@@ -527,11 +527,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// it is derived rather than minted, and why it never rewrites a row.
 	d.ensureClusterRecord(ctx)
 
-	// Migrate legacy unscoped network names to stack-scoped names.
-	if err := corrosion.MigrateLegacyNetworkNames(ctx, d.db); err != nil {
-		slog.Warn("failed to migrate legacy network names", "error", err)
-	}
-
 	// Hold this host's audit rows while its own chain is still arriving, before
 	// anything can write one. Only a host re-added under an old name, whose
 	// CA-signed admission record (pki_dir/audit-rejoin.json, written by
@@ -795,6 +790,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	})
 
 	d.wireCorrosionGates()
+
+	// Migrate legacy unscoped network names to stack-scoped names. After the
+	// gates: its VM spec rewrites are desired-spec edits, which carry their
+	// owner epoch once spec_conflict_v1 has latched, so receivers order them
+	// by generation rather than by the row clock.
+	if err := corrosion.MigrateLegacyNetworkNames(ctx, d.db); err != nil {
+		slog.Warn("failed to migrate legacy network names", "error", err)
+	}
 
 	// Apply a replicated guarded VM-name replacement once vm_replace_v1 is DURABLY
 	// LATCHED. Durable, not Latched or the config flag: a replace batch already on
@@ -3970,6 +3973,20 @@ func (d *Daemon) wireCorrosionGates() {
 	d.wireRecoveryClaimGate()
 	d.wireSpecConflictGate()
 	d.wireNetBoxRepointGate()
+	d.wireUserIncarnationGate()
+}
+
+// wireUserIncarnationGate tells corrosion when user_incarnation_v1 has
+// DURABLY latched: users rows are then deleted and re-created by incarnation,
+// in two statements a previous-release peer has no ledger entry for, and
+// anti-entropy keeps a tombstone over its own incarnation. Durable, so a
+// restart does not return a node to the previous release's merge while its
+// peers keep the new one. Mandatory, no config flag; unwired, the gate reads
+// false and the node behaves as the previous release.
+func (d *Daemon) wireUserIncarnationGate() {
+	d.db.SetUserIncarnationGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.UserIncarnationV1)
+	})
 }
 
 // wireNetBoxRepointGate lets corrosion re-point a lease at a re-created NetBox

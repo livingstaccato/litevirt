@@ -105,12 +105,12 @@ func TestAdminFloor_AHeldOnlyAdminIsRecoverable(t *testing.T) {
 				t.Errorf("the floor changed the accounts beside a held-only admin: %+v", users)
 			}
 			open, ev := condition(t, d, CondNoUnrestrictedAdmin)
-			for _, want := range []string{"lv user reset-admin --user boss --clear-2fa", "lv 2fa disable --user boss --method totp", "lv 2fa enroll-code boss"} {
+			for _, want := range []string{"lv user reset-admin --user boss --clear-2fa", "lv 2fa disable --user boss --method totp --label old-phone", "lv 2fa enroll-code boss"} {
 				if !open || !strings.Contains(ev, want) {
 					t.Errorf("no_unrestricted_admin open=%v evidence=%s; want it open, naming %q", open, ev, want)
 				}
 			}
-			if open, ev := condition(t, d, CondHeldSecondFactor); !open || !strings.Contains(ev, "boss") || !strings.Contains(ev, "lv 2fa enroll-code boss") {
+			if open, ev := condition(t, d, CondHeldSecondFactor); !open || !strings.Contains(ev, "lv 2fa disable --user boss --method totp --label old-phone") || !strings.Contains(ev, "lv 2fa enroll-code boss") {
 				t.Errorf("held_second_factor open=%v evidence=%s; want it open, naming boss and the recovery", open, ev)
 			}
 			tc.recover(t, db)

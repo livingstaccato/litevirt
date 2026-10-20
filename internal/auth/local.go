@@ -106,7 +106,7 @@ func (r *LocalRealm) Authenticate(ctx context.Context, creds Credentials) (*Prin
 	}
 	if len(held) > 0 && len(factors) == 0 {
 		return nil, fmt.Errorf("%w: the second factors of %q are held: they may be a deleted account's of the same name, "+
-			"and none is accepted. An admin runs %s", ErrSecondFactorHeld, user.Username, corrosion.HeldSecondFactorRecovery(user.Username))
+			"and none is accepted. An admin runs %s", ErrSecondFactorHeld, user.Username, corrosion.HeldSecondFactorRecovery(user.Username, held))
 	}
 
 	return p, nil

@@ -1014,10 +1014,11 @@ with no credential one (`lv user reset-admin --user <name>`, as root).
 release enrolled for an account deleted and re-created during the upgrade is
 held (docs/upgrades.md): kept, never accepted, and the account's login is
 refused, even with the right password, until an admin removes it with
-`lv 2fa disable --user <name> --method totp --label <label>` and issues an
-enrollment code with `lv 2fa enroll-code <name>`. `lv 2fa ls --user <name>`
-marks it `(held)`, and every node raises the `held_second_factor` health
-condition (warning) naming the account. An admin whose only factors are
+`lv 2fa disable --user <name> --method <method> --label <label>` (`totp`
+or `webauthn`, the factor's own) and issues an enrollment code with
+`lv 2fa enroll-code <name>`. `lv 2fa ls --user <name>` marks it `(held)`,
+and every node raises the `held_second_factor` health condition (warning)
+naming the account and the commands for each held factor. An admin whose only factors are
 held cannot log in, so it does not count for `no_unrestricted_admin`, whose
 recovery then names those two commands, run by another admin, or
 `lv user reset-admin --user <name> --clear-2fa` as root on a node.

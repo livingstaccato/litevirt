@@ -102,7 +102,8 @@ func (d *Daemon) reportUsableAdmin(ctx context.Context) {
 			"(the admin floor reinstated %s without its old password)", name, name))
 	}
 	for _, name := range rep.HeldSecondFactor {
-		recovery = append(recovery, "as another admin: "+corrosion.HeldSecondFactorRecovery(name)+
+		held, _ := corrosion.ListHeldUser2FA(ctx, d.db, name) // none: the text names the form
+		recovery = append(recovery, "as another admin: "+corrosion.HeldSecondFactorRecovery(name, held)+
 			"; or as root on a node: lv user reset-admin --user "+name+" --clear-2fa")
 	}
 	for _, norm := range rep.Ambiguous {
@@ -130,7 +131,11 @@ func (d *Daemon) reportHeldSecondFactors(ctx context.Context) {
 	}
 	recovery := make([]string, 0, len(names))
 	for _, name := range names {
-		recovery = append(recovery, corrosion.HeldSecondFactorRecovery(name))
+		held, err := corrosion.ListHeldUser2FA(ctx, d.db, name)
+		if err != nil {
+			slog.Warn("could not list held second factors", "user", name, "error", err)
+		}
+		recovery = append(recovery, corrosion.HeldSecondFactorRecovery(name, held))
 	}
 	d.writeSelfConditionAs(ctx, adminFloorEvaluator, CondHeldSecondFactor, len(names) > 0, corrosion.SeverityWarning,
 		map[string]any{"accounts": names, "recovery": strings.Join(recovery, "; ")})

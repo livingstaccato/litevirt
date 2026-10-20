@@ -931,17 +931,41 @@ func holdUntaggedFactorSet(ctx context.Context, tx *sql.Tx, username string) err
 		epoch+userEpochHeldSuffix, at, username, epoch); err != nil {
 		return err
 	}
+	var held []User2FARecord
+	rows, err := tx.QueryContext(ctx, `SELECT method, COALESCE(label, '') FROM user_2fa WHERE username = ? AND deleted_at IS NULL AND epoch = ?`, username, epoch)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var f User2FARecord
+		if err := rows.Scan(&f.Method, &f.Label); err != nil {
+			return err
+		}
+		held = append(held, f)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	slog.Warn("held the second factors of an account re-created under the same name: they may be the deleted account's, "+
 		"and none is accepted until an admin removes them",
-		"user", username, "recovery", HeldSecondFactorRecovery(username))
+		"user", username, "recovery", HeldSecondFactorRecovery(username, held))
 	return nil
 }
 
 // HeldSecondFactorRecovery is what an admin runs for an account whose second
-// factors are held.
-func HeldSecondFactorRecovery(username string) string {
-	return fmt.Sprintf("lv 2fa disable --user %s --method totp --label <label> for each held factor "+
-		"(lv 2fa ls --user %s lists them), then lv 2fa enroll-code %s", username, username, username)
+// factors are held: a disable of each, by its own method and label, then an
+// enrollment code. With none given it names the form.
+func HeldSecondFactorRecovery(username string, held []User2FARecord) string {
+	if len(held) == 0 {
+		return fmt.Sprintf("lv 2fa disable --user %s --method <method> --label <label> for each held factor "+
+			"(lv 2fa ls --user %s lists them), then lv 2fa enroll-code %s", username, username, username)
+	}
+	disables := make([]string, 0, len(held))
+	for _, f := range held {
+		disables = append(disables, fmt.Sprintf("lv 2fa disable --user %s --method %s --label %s", username, f.Method, f.Label))
+	}
+	return strings.Join(disables, ", ") + ", then lv 2fa enroll-code " + username
 }
 
 // justAfterTS is the LWW key that orders immediately after ts: one logical

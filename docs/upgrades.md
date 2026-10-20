@@ -1534,10 +1534,11 @@ factor enrolled on a host that had not latched the token yet names no
 account. A host that then learns of the re-create holds it: the factor is
 kept, but never accepted, and the account cannot log in, even with its
 password, until an admin removes it with
-`lv 2fa disable --user <name> --method totp --label <label>` and then
-issues an enrollment code with `lv 2fa enroll-code <name>`. `lv 2fa ls
---user <name>` lists a held factor with `(held)` after its label, and the
-`held_second_factor` health condition names the account. The
+`lv 2fa disable --user <name> --method <method> --label <label>` (the
+factor's own method, `totp` or `webauthn`) and then issues an enrollment
+code with `lv 2fa enroll-code <name>`. `lv 2fa ls --user <name>` lists a
+held factor with `(held)` after its label, and the `held_second_factor`
+health condition names the account and the commands for each held factor. The
 token latches on its own once every host the cluster replicates to, including
 one parked in `maintenance`, runs this release. Until then hosts write and
 merge users rows as the previous release does.

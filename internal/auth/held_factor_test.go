@@ -24,6 +24,12 @@ const heldOld, heldNew = "JBSWY3DPEHPK3PXP", "KRSXG5CTMVRXEZLU"
 // the latched node that took the held factor from u.
 func heldCarol(t *testing.T) *corrosion.Client {
 	t.Helper()
+	return heldCarolWith(t, corrosion.User2FARecord{Username: "carol", Method: "totp", Secret: heldOld, Label: "old-phone"})
+}
+
+// heldCarolWith is heldCarol with the factor u enrols for the deleted carol.
+func heldCarolWith(t *testing.T, f corrosion.User2FARecord) *corrosion.Client {
+	t.Helper()
 	ctx := context.Background()
 	a, u := corrosion.NewTestClientT(t), corrosion.NewTestClientT(t)
 	uOn := false
@@ -58,7 +64,7 @@ func heldCarol(t *testing.T) *corrosion.Client {
 	if err := corrosion.InsertUser(ctx, a, "carol", "operator", string(pw)); err != nil {
 		t.Fatal(err)
 	}
-	if err := corrosion.InsertUser2FA(ctx, u, corrosion.User2FARecord{Username: "carol", Method: "totp", Secret: heldOld, Label: "old-phone"}); err != nil {
+	if err := corrosion.InsertUser2FA(ctx, u, f); err != nil {
 		t.Fatal(err)
 	}
 	uOn = true
@@ -120,5 +126,28 @@ func TestHeldFactor_OnlyHeldFactorsRefuseTheLogin(t *testing.T) {
 	}
 	if _, err := NewLocalRealm(a).Authenticate(ctx, Credentials{Username: "carol", Password: "wrong"}); !errors.Is(err, ErrInvalidCredentials) {
 		t.Errorf("a wrong password: err %v, want ErrInvalidCredentials (the hold is told only to the password's holder)", err)
+	}
+}
+
+// Re-review 6, L5: the refusal names each held factor by its own method: a
+// held WebAuthn factor is removed with --method webauthn, not totp.
+//
+// Red on 16d1c2760 (the text always said --method totp). Mutation: the
+// method hard-coded again — red.
+func TestHeldFactor_AHeldWebAuthnFactorIsNamedByItsMethod(t *testing.T) {
+	ctx := context.Background()
+	a := heldCarolWith(t, corrosion.User2FARecord{Username: "carol", Method: "webauthn", Secret: "opaque-credential", Label: "old-key"})
+	if held, _ := corrosion.ListHeldUser2FA(ctx, a, "carol"); len(held) != 1 || held[0].Method != "webauthn" {
+		t.Fatalf("fixture: held = %+v", held)
+	}
+	_, err := NewLocalRealm(a).Authenticate(ctx, Credentials{Username: "carol", Password: "new-carol-pw"})
+	if !errors.Is(err, ErrSecondFactorHeld) {
+		t.Fatalf("login err %v; want ErrSecondFactorHeld", err)
+	}
+	if want := "lv 2fa disable --user carol --method webauthn --label old-key"; !strings.Contains(err.Error(), want) {
+		t.Errorf("refusal %q does not name %q", err, want)
+	}
+	if strings.Contains(err.Error(), "--method totp") {
+		t.Errorf("refusal %q names --method totp for a WebAuthn factor", err)
 	}
 }

@@ -83,7 +83,7 @@ current phase's unfinished hosts.
 
 1. **trust-both.** Each host's `migration/ca.crt` becomes a two-certificate PEM:
    old CA, then new CA. QEMU's GnuTLS loads every certificate in
-   `ca-cert.pem` (to be proven on the lab first; see Testing). Host
+   `ca-cert.pem` (proven with real QEMU; see Testing). Host
    certificates are unchanged.
 2. **reissue.** Each host gets a new `host.crt` / `host.key` issued by the new
    CA, for its recorded IPv4 address, exactly as `issueMigrationCredentials`
@@ -229,10 +229,15 @@ At startup and every 24 hours, a daemon with migration credentials logs a
 
 ## Testing
 
-**First, prove the assumption.** On the kvm003 lab, before any rotation code:
-a storage migration between a host whose `ca-cert.pem` holds two CAs and a host
-holding only one of them, in both directions. If GnuTLS does not accept the
-bundle, the overlap phase needs a different shape and this design is revisited.
+**The assumption, proven.** `TestQemuMigrationTLS_RotationPairings`
+(`internal/pki`, run with `LITEVIRT_QEMU_TLS=1`) migrates a paused guest between
+two real QEMU processes over QEMU's own TLS, with directories laid out as the
+installer lays them out, for every pairing a rotation produces: across a
+trust-both host and one not yet updated, both ways; across the mid-reissue
+pair (certificates from either CA, one two-CA bundle), both ways; and after
+drop-old. All complete. Its controls, two hosts with no CA in common, fail at
+the handshake ("The certificate hasn't got a known issuer"). Proven on QEMU
+10.2.1; the lab run below is still owed before release.
 
 **Unit.**
 

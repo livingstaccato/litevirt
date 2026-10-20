@@ -346,6 +346,13 @@ func TestFleet_FwLiveCrash_AnOwnerHeldPastTheBoundKeepsEveryFence(t *testing.T) 
 	probe := filepath.Join(src.FW.DataDir, "fwlive-held-probe")
 	db, virt := src.DB, src.Virt
 	in, hold, ended := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var letGo sync.Once
+	t.Cleanup(func() { letGo.Do(func() { close(hold) }) })
+	// The daemon's connection to the peer, made while it lives.
+	peer := c.PeerClient(src, dst)
+	if _, err := peer.Ping(ctx, &pb.PingRequest{}); err != nil {
+		t.Fatalf("fixture: the peer's Ping: %v", err)
+	}
 	src.HookUnary("Ping", func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
 		defer close(ended)
 		close(in)
@@ -370,11 +377,11 @@ func TestFleet_FwLiveCrash_AnOwnerHeldPastTheBoundKeepsEveryFence(t *testing.T) 
 	if err := os.WriteFile(filepath.Join(src.FW.DataDir, "fwlive-held-after"), nil, 0o600); err == nil && os.Geteuid() != 0 {
 		t.Error("the dead daemon's files take a write after a failed kill")
 	}
-	if _, err := c.PeerClient(src, dst).Ping(ctx, &pb.PingRequest{}); err == nil {
+	if _, err := peer.Ping(ctx, &pb.PingRequest{}); err == nil {
 		t.Error("the dead daemon reaches a peer after a failed kill")
 	}
 
-	close(hold)
+	letGo.Do(func() { close(hold) })
 	select {
 	case <-ended:
 	case <-time.After(time.Minute):

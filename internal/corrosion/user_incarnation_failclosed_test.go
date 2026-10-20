@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"encoding/json"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,7 +26,14 @@ import (
 func TestUserRecreate_RetirementFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	c := newTestDB(t)
-	c.SetUserIncarnationGate(func() bool { return true })
+	// The rows below reach this node with nothing recording which
+	// incarnation they were for — written before the latch, or recorded and
+	// forgotten across a restart (user_holds.go) — so the retirement cannot
+	// tell them from the new account's own. A row recorded for the older
+	// incarnation is taken away instead (TestFleet_ALaggingGrantDoesNotReach-
+	// ARecreatedUser, "a second factor re-enrolled").
+	var gate atomic.Bool
+	c.SetUserIncarnationGate(gate.Load)
 	c.SetCredentialsSplitGate(func() bool { return true })
 	g := capabilities.GrantForTest(t, capabilities.FeatureLoginPolicy)
 	if err := InsertUser(ctx, c, "carol", "operator", "hash-old"); err != nil {
@@ -101,6 +109,7 @@ func TestUserRecreate_RetirementFailsClosed(t *testing.T) {
 		return out
 	}
 	before := counts()
+	gate.Store(true)
 
 	// The re-create of a newer carol arrives.
 	stmts, _ := json.Marshal([]Statement{

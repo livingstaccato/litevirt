@@ -75,7 +75,22 @@ func (c *Client) UserIncarnationOn() bool {
 // whatever the two clocks say, so every node orders the re-create after the
 // incarnation it replaces.
 func nextIncarnation(prev string) string {
+	return incarnationAfterAll(time.Now().UTC(), prev)
+}
+
+// newIncarnation is nextIncarnation floored at this node's hybrid clock too,
+// which has seen every write that reached it: a create on a node whose wall
+// clock runs behind a peer's still orders after any incarnation of the name
+// this node could have heard of. prev is "" for a first create.
+func (c *Client) newIncarnation(prev string) string {
 	now := time.Now().UTC()
+	if t, ok := tsInstant(c.NowTS()); ok && t.After(now) {
+		now = t.UTC()
+	}
+	return incarnationAfterAll(now, prev)
+}
+
+func incarnationAfterAll(now time.Time, prev string) string {
 	if p, err := time.Parse(time.RFC3339Nano, prev); err == nil && !now.After(p) {
 		now = p.Add(time.Nanosecond)
 	}
@@ -293,6 +308,12 @@ const (
 	userGuardLive          = "user_live"
 	userGuardDeleted       = "user_deleted"
 	userGuardAny           = "user"
+	// userGuardTighten binds a write that TIGHTENS the account (a second
+	// factor or its active set, a disable, an earlier expiry, a later
+	// cut-off). It applies wherever the name does not hold a newer
+	// incarnation, ahead of its own included, and is never dropped for the
+	// one it names (user_holds.go).
+	userGuardTighten = "user_tighten"
 )
 
 // ErrUserAccountChanged is a local write's refusal when the account it names
@@ -320,36 +341,19 @@ func userIncarnationGuard(ctx context.Context, c *Client, username string, live 
 }
 
 func validUserGuardKind(k string) bool {
-	return k == userGuardLive || k == userGuardDeleted || k == userGuardAny
+	return k == userGuardLive || k == userGuardDeleted || k == userGuardAny || k == userGuardTighten
 }
 
-// userIncarnationGuardMatches: the receiver's users row for the name is the
-// guard's incarnation (and live, or deleted, as the kind requires).
-func userIncarnationGuardMatches(ctx context.Context, tx *sql.Tx, g *MutationGuard) (bool, error) {
-	if g.ResourceID == "" || g.Incarnation == "" || !validUserGuardKind(g.ResourceKind) {
-		return false, invalidf("invalid user incarnation guard")
-	}
-	var created string
-	var deleted sql.NullString
-	err := tx.QueryRowContext(ctx, `SELECT created_at, deleted_at FROM users WHERE username = ?`, g.ResourceID).
-		Scan(&created, &deleted)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
+// userIncarnationGuardMatches: the receiver applies the guarded statement
+// now — its users row is the guard's incarnation (live, or deleted, as the
+// kind requires), or the statement tightens and the guard is not behind it
+// (userGuardVerdictOf, user_holds.go).
+func (c *Client) userIncarnationGuardMatches(ctx context.Context, tx *sql.Tx, g *MutationGuard) (bool, error) {
+	v, err := c.userGuardVerdictOf(ctx, tx, g)
 	if err != nil {
 		return false, err
 	}
-	if created != g.Incarnation {
-		return false, nil
-	}
-	isDeleted := deleted.Valid && deleted.String != ""
-	switch g.ResourceKind {
-	case userGuardLive:
-		return !isDeleted, nil
-	case userGuardDeleted:
-		return isDeleted, nil
-	}
-	return true, nil
+	return v == userVerdictApply || v == userVerdictAhead && g.ResourceKind == userGuardTighten, nil
 }
 
 // userGuardedShapes is every statement a user_incarnation_v1 guard may bind,
@@ -446,25 +450,44 @@ var userStampedShapes = map[string]bool{
 	mustFingerprint(recoveryCodeSetUpsertSQL):  true,
 	mustFingerprint(recoveryCodesSupersedeSQL): true,
 	mustFingerprint(recoveryCodeUpsertSQL):     true,
-	mustFingerprint(userLifecycleUpsertSQL):    true, // a lift only (lifecycleLift)
+	mustFingerprint(userLifecycleUpsertSQL):    true,
+}
+
+// userTighteningShapes are the userStampedShapes that only ever tighten:
+// enrolling a second factor, and the active set it is enrolled under. A
+// user_lifecycle write is judged by its value (lifecycleTightens).
+var userTighteningShapes = map[string]bool{
+	mustFingerprint(user2FASetUpsertSQL): true,
+	mustFingerprint(user2FAUpsertSQL):    true,
 }
 
 var fpUserLifecycleUpsert = mustFingerprint(userLifecycleUpsertSQL)
 
-// lifecycleLift reports whether a user_lifecycle upsert lifts a restriction:
-// an enable, or any expiry change (an extension, or none). A disable and a
-// session or token cut-off restrict.
-func lifecycleLift(p []interface{}) bool {
+// lifecycleTightens reports whether a user_lifecycle upsert tightens the
+// account against the value this node holds (cur, "" for none): a disable, an
+// expiry set or brought earlier, a cut-off moved later (an unchanged value
+// loosens nothing, and counts as tightening). An enable, an expiry cleared or
+// extended and a cut-off set back loosen it.
+func lifecycleTightens(p []interface{}, cur string) bool {
 	if len(p) < 3 {
 		return false
 	}
+	val := coerceString(p[2])
 	switch coerceString(p[1]) {
 	case UserAttrDisabled:
-		return coerceString(p[2]) != "true"
+		return val == "true"
 	case UserAttrExpiresAt:
-		return true
+		if val == "" {
+			return false
+		}
+		if cur == "" {
+			return true
+		}
+		return lwwOrder(cur, val) >= 0
+	case UserAttrSessionsNotBefore, UserAttrTokensNotBefore:
+		return cur == "" || lwwOrder(cur, val) <= 0
 	}
-	return false
+	return true
 }
 
 // userStatementAccount is the account s names when a local write stamps it
@@ -479,7 +502,7 @@ func userStatementAccount(s Statement) string {
 		return ""
 	}
 	fp := stmtFingerprint(sh)
-	if !userStampedShapes[fp] || fp == fpUserLifecycleUpsert && !lifecycleLift(s.Params) {
+	if !userStampedShapes[fp] {
 		return ""
 	}
 	return userGuardedShapes[fp](s.Params)
@@ -488,33 +511,72 @@ func userStatementAccount(s Statement) string {
 // userStampPlan decides whether a local write's unguarded user-keyed
 // statements are stamped (stampUserIncarnation): only once the gate is on,
 // and only when every user-keyed statement of the entry names ONE account and
-// nothing in it carries another protocol's guard — a receiver refuses an entry
-// that mixes them (validateUserIncarnationEntry), and a write that names two
-// accounts (clearing several accounts' directory bindings) keeps the previous
-// release's form.
-func (c *Client) userStampPlan(stmts []Statement) bool {
+// nothing in it carries another protocol's guard, because a receiver refuses
+// an entry that mixes them (validateUserIncarnationEntry). A write that names
+// two accounts stays unstamped only if all it does is tighten (clearing
+// several accounts' directory bindings, with their cut-offs): a grant or lift
+// left unguarded would reach a re-created account, so such a write is
+// refused (ErrUserMultiAccountGrant) rather than sent.
+func (c *Client) userStampPlan(stmts []Statement) (bool, error) {
 	if !c.UserIncarnationOn() {
-		return false
+		return false, nil
 	}
-	account, unguarded := "", false
+	account, unguarded, mixed, loosens := "", false, false, false
 	for _, s := range stmts {
 		u := ""
 		if s.Guard != nil {
 			if s.Guard.Protocol != userIncarnationGuardV1 {
-				return false
+				return false, nil
 			}
 			u = s.Guard.ResourceID
 		} else if u = userStatementAccount(s); u == "" {
 			continue
 		} else {
 			unguarded = true
+			if !statementOnlyTightens(s) {
+				loosens = true
+			}
 		}
 		if account != "" && u != account {
-			return false
+			mixed = true
 		}
 		account = u
 	}
-	return unguarded
+	if mixed {
+		if loosens {
+			return false, ErrUserMultiAccountGrant
+		}
+		return false, nil
+	}
+	return unguarded, nil
+}
+
+// ErrUserMultiAccountGrant refuses a local write that grants, or lifts a
+// restriction on, more than one account in one entry: its statements could
+// not each be bound to their account's incarnation.
+var ErrUserMultiAccountGrant = errors.New("a write that grants or loosens more than one account in one entry cannot be bound to their incarnations")
+
+// statementOnlyTightens reports, without reading any row, whether s can only
+// tighten: a factor enrolment, or a lifecycle write that is a disable or a
+// cut-off (judged against no current value; an expiry change may loosen).
+func statementOnlyTightens(s Statement) bool {
+	sh, _, err := parseResolved(s.SQL)
+	if err != nil {
+		return false
+	}
+	fp := stmtFingerprint(sh)
+	if userTighteningShapes[fp] {
+		return true
+	}
+	if fp == fpUserLifecycleUpsert && len(s.Params) >= 3 {
+		switch coerceString(s.Params[1]) {
+		case UserAttrDisabled:
+			return coerceString(s.Params[2]) == "true"
+		case UserAttrSessionsNotBefore, UserAttrTokensNotBefore:
+			return true
+		}
+	}
+	return false
 }
 
 // stampUserIncarnation sets, on an unguarded user-keyed statement of a write
@@ -542,8 +604,38 @@ func stampUserIncarnation(ctx context.Context, tx *sql.Tx, s *Statement) error {
 	if deleted.Valid && deleted.String != "" {
 		kind = userGuardDeleted
 	}
+	tightens, err := statementTightensHere(ctx, tx, *s)
+	if err != nil {
+		return err
+	}
+	if tightens {
+		kind = userGuardTighten
+	}
 	s.Guard = &MutationGuard{Protocol: userIncarnationGuardV1, ResourceKind: kind, ResourceID: user, Incarnation: created}
 	return nil
+}
+
+// statementTightensHere reports whether s tightens its account against the
+// row this node holds (userGuardTighten).
+func statementTightensHere(ctx context.Context, tx *sql.Tx, s Statement) (bool, error) {
+	sh, _, err := parseResolved(s.SQL)
+	if err != nil {
+		return false, nil
+	}
+	fp := stmtFingerprint(sh)
+	if userTighteningShapes[fp] {
+		return true, nil
+	}
+	if fp != fpUserLifecycleUpsert || len(s.Params) < 3 {
+		return false, nil
+	}
+	var cur string
+	err = tx.QueryRowContext(ctx, `SELECT value FROM user_lifecycle WHERE username = ? AND attribute = ? AND deleted_at IS NULL`,
+		coerceString(s.Params[0]), coerceString(s.Params[1])).Scan(&cur)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	return lifecycleTightens(s.Params, cur), nil
 }
 
 // checkOwnUserGuard is the local write path's check of a statement's
@@ -551,15 +643,21 @@ func stampUserIncarnation(ctx context.Context, tx *sql.Tx, s *Statement) error {
 // transaction: a guard that no longer matches here is ErrUserAccountChanged.
 // Receivers skip such a statement, but this node would apply it, and its
 // newer clock would then carry it to every node by anti-entropy.
-func checkOwnUserGuard(ctx context.Context, tx *sql.Tx, s Statement) error {
+//
+// The writer holds the account it writes, so anything but "apply" means the
+// name moved: deleted or re-created here, or — known from a write for a newer
+// incarnation that reached this node first — re-created elsewhere. A write
+// to an account that is gone is refused rather than overwrite what the new
+// account's write put here first.
+func (c *Client) checkOwnUserGuard(ctx context.Context, tx *sql.Tx, s Statement) error {
 	if s.Guard == nil || s.Guard.Protocol != userIncarnationGuardV1 {
 		return nil
 	}
-	ok, err := userIncarnationGuardMatches(ctx, tx, s.Guard)
+	v, err := c.userGuardVerdictOf(ctx, tx, s.Guard)
 	if err != nil {
 		return err
 	}
-	if !ok {
+	if v != userVerdictApply || c.userHolds.newerKnown(s.Guard.ResourceID, s.Guard.Incarnation) {
 		return ErrUserAccountChanged
 	}
 	return nil
@@ -581,7 +679,8 @@ func validateUserIncarnationEntry(stmts []Statement) error {
 		}
 		if base == nil {
 			base = g
-		} else if *g != *base {
+		} else if g.ResourceID != base.ResourceID || g.Incarnation != base.Incarnation {
+			// One account, one incarnation; each statement's kind is its own.
 			return invalidf("user incarnation entry mixes guard identities")
 		}
 		if g.ResourceID == "" || g.Incarnation == "" || !validUserGuardKind(g.ResourceKind) {
@@ -636,6 +735,7 @@ func retireOlderIncarnationRows(ctx context.Context, tx *sql.Tx, username, incar
 		`DELETE FROM recovery_code_sets WHERE username = ? AND deleted_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
 		`DELETE FROM user_enrollment_codes WHERE username = ? AND deleted_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
 		`DELETE FROM user_identity_bindings WHERE username = ? AND deleted_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
+		`DELETE FROM token_credentials WHERE token_id IN (SELECT id FROM tokens WHERE username = ? AND deleted_at IS NULL) -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
 		`DELETE FROM tokens WHERE username = ? AND deleted_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
 		`DELETE FROM sessions WHERE username = ? AND revoked_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
 		// Restrictions: tombstones only.
@@ -655,15 +755,16 @@ func retireOlderIncarnationRows(ctx context.Context, tx *sql.Tx, username, incar
 	return retireLaggingLifts(ctx, tx, username, incarnation)
 }
 
-// retireLaggingLifts drops the live rows under the name that LIFT a
-// restriction (an enable, an expiry change, a second factor or its active
-// set) and were written after the new incarnation was made. The new
-// account's own such writes are bound to it (userStampedShapes), so none can
-// be here before its re-create: a row like that is a lagging node's write to
-// the deleted account, whose later clock would otherwise beat the new
-// account's own restriction (a disable, an earlier expiry, its factor) here,
-// and then on every node by anti-entropy. One written before the re-create
-// stays: the new account's own writes come after it and win by clock.
+// retireLaggingLifts drops the live lifecycle rows under the name that read
+// as no restriction at all — an enable, no expiry — and were written after
+// the new incarnation was made. Dropping one changes nothing this node reads
+// (no row is enabled and unexpiring), but its later clock would otherwise beat
+// the new account's own disable or expiry here, and then on every node by
+// anti-entropy. It is the fallback for a lagging write this node no longer
+// has a record of (a restart): the records (settleUserName, user_holds.go)
+// take away the lagging writes it does know of, an extension or a factor
+// included. A row that restricts is never dropped here: a new account's own
+// restriction can reach this node ahead of its re-create.
 func retireLaggingLifts(ctx context.Context, tx *sql.Tx, username, incarnation string) error {
 	if incarnation == "" {
 		return nil
@@ -671,9 +772,7 @@ func retireLaggingLifts(ctx context.Context, tx *sql.Tx, username, incarnation s
 	type lift struct{ table, key, ts string }
 	var lifts []lift
 	for _, q := range []struct{ table, sql string }{
-		{"user_lifecycle", `SELECT attribute, updated_at FROM user_lifecycle WHERE username = ? AND deleted_at IS NULL AND (attribute = 'disabled' AND value <> 'true' OR attribute = 'expires_at')`},
-		{"user_2fa", `SELECT method || char(31) || COALESCE(label, ''), updated_at FROM user_2fa WHERE username = ? AND deleted_at IS NULL`},
-		{"user_2fa_sets", `SELECT '', updated_at FROM user_2fa_sets WHERE username = ? AND deleted_at IS NULL`},
+		{"user_lifecycle", `SELECT attribute, updated_at FROM user_lifecycle WHERE username = ? AND deleted_at IS NULL AND (attribute = 'disabled' AND value <> 'true' OR attribute = 'expires_at' AND value = '')`},
 	} {
 		rows, err := tx.QueryContext(ctx, q.sql, username)
 		if err != nil {
@@ -698,10 +797,6 @@ func retireLaggingLifts(ctx context.Context, tx *sql.Tx, username, incarnation s
 		switch l.table {
 		case "user_lifecycle":
 			_, err = tx.ExecContext(ctx, `DELETE FROM user_lifecycle WHERE username = ? AND attribute = ? AND updated_at = ? -- full-state-delete-ok: a deleted account's lagging lift, replaced by a re-create`, username, l.key, l.ts)
-		case "user_2fa":
-			_, err = tx.ExecContext(ctx, `DELETE FROM user_2fa WHERE username = ? AND method || char(31) || COALESCE(label, '') = ? AND updated_at = ? -- full-state-delete-ok: a deleted account's lagging lift, replaced by a re-create`, username, l.key, l.ts)
-		case "user_2fa_sets":
-			_, err = tx.ExecContext(ctx, `DELETE FROM user_2fa_sets WHERE username = ? AND updated_at = ? -- full-state-delete-ok: a deleted account's lagging lift, replaced by a re-create`, username, l.ts)
 		}
 		if err != nil {
 			return err

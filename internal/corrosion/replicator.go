@@ -111,6 +111,9 @@ func NewReplicator(client *Client, pkiDir string, cfg RelayConfig) *Replicator {
 		stopCh:         make(chan struct{}),
 	}
 	r.lastRelayPush.Store(time.Now().UnixMilli())
+	// A user write held for an incarnation this node had not reached is
+	// applied through the WAL lane's own path once it is (user_holds.go).
+	client.setUserHoldReplay(r.applyStatementLWW)
 	return r
 }
 
@@ -1544,13 +1547,31 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 		// with them: a guard-skipped password change from a node that wrote
 		// the old column alone must not be absorbed into the credential row of
 		// whatever account holds the name now (user_incarnation.go).
+		//
+		// A grant or lift whose incarnation this node has not reached yet is
+		// held, with its token's credential, and replayed once it is; a
+		// tightening applies at once (user_holds.go). A token's credential
+		// goes with its token either way, so a skipped token leaves no orphan.
+		if refusedIncarnation[i] {
+			continue
+		}
 		if s.Guard != nil && s.Guard.Protocol == userIncarnationGuardV1 {
-			matches, gerr := userIncarnationGuardMatches(ctx, tx, s.Guard)
+			v, gerr := r.client.userGuardVerdictOf(ctx, tx, s.Guard)
 			if gerr != nil {
 				return fmt.Errorf("apply mutation (origin=%s seq=%d): mutation guard: %w", entry.Origin, entry.Seq, gerr)
 			}
-			if !matches {
+			if v == userVerdictSkip || v == userVerdictAhead && s.Guard.ResourceKind != userGuardTighten {
 				refusedIncarnation[i] = true
+				held := []Statement{s}
+				if j, ok := tokenCredentialOf(stmts, i); ok {
+					refusedIncarnation[j] = true
+					held = append(held, stmts[j])
+				}
+				if v == userVerdictAhead {
+					w := userHeldWrite{guard: *s.Guard, stmts: held, hlc: entry.Hlc}
+					name := s.Guard.ResourceID
+					r.client.deferAfterCommit(tx, func() { r.client.userHolds.hold(name, w) })
+				}
 				continue
 			}
 		}
@@ -1610,6 +1631,14 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 		// is parked on. Replayed here, inside the batch, so the rest of
 		// the batch applies on top of it. See parked_updates.go.
 		r.replayParked(ctx, tx, s)
+		// A restriction row written for an incarnation is recorded with it,
+		// and a users row that moved settles its name (user_holds.go).
+		r.client.recordUserWrite(ctx, tx, s, s.Guard, func(fn func()) { r.client.deferAfterCommit(tx, fn) })
+		if name := usersStatementName(s); name != "" {
+			if err := r.client.settleUserName(ctx, tx, name, func(fn func()) { r.client.deferAfterCommit(tx, fn) }); err != nil {
+				return fmt.Errorf("apply mutation (origin=%s seq=%d): settle held user writes: %w", entry.Origin, entry.Seq, err)
+			}
+		}
 	}
 	// A secret written by a node that had not latched credentials_split_v1
 	// reaches this node in its old column only; absorb it into the

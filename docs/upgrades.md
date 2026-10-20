@@ -1523,7 +1523,9 @@ enrollment code, recovery codes, a second-factor change, or an enable or
 expiry change. A host that learns of the re-create drops the deleted
 account's tokens and sessions it holds. A write to an account that is deleted
 or re-created while the write is being made fails and changes nothing; run it
-again. Two
+again. A second factor, a disable or an earlier expiry that reaches a host
+before the account it belongs to does is applied there at once, and taken
+away again only if the host then learns of a newer account of the name. Two
 things of the deleted account can still reach the new one from the lagging
 host itself, and both only take access away: its session cut-offs, which log
 the new account out once, and its clearing of a directory identity the new

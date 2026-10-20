@@ -178,7 +178,7 @@ func (c *Client) mutationGuardMatches(ctx context.Context, tx *sql.Tx, guard *Mu
 		return workloadDeleteGuardMatches(ctx, tx, guard)
 	}
 	if guard.Protocol == userIncarnationGuardV1 {
-		return userIncarnationGuardMatches(ctx, tx, guard)
+		return c.userIncarnationGuardMatches(ctx, tx, guard)
 	}
 	if guard.Protocol == workloadRekeyGuardV1 {
 		return workloadRekeyGuardMatches(ctx, tx, guard)

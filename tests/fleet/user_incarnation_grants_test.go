@@ -18,8 +18,10 @@ import (
 // Red on eb047a3ac for every kind: the write lands on the new carol
 // everywhere. Mutations: the grants left unstamped (userStampedShapes) — red
 // for every kind; the lagging lifts kept by the retirement
-// (retireLaggingLifts) — "an enable" and "an expiry extension" red on node-2,
-// and on every node after anti-entropy.
+// (retireLaggingLifts) and unrecorded (settleUserName) — "an enable" and "an
+// expiry extension" red on node-2, and on every node after anti-entropy;
+// settleUserName not taking recorded rows away — "a second factor
+// re-enrolled" red.
 func TestFleet_ALaggingGrantDoesNotReachARecreatedUser(t *testing.T) {
 	ctx := context.Background()
 	g := capabilities.GrantForTest(t, capabilities.FeatureLoginPolicy)
@@ -150,6 +152,31 @@ func TestFleet_ALaggingGrantDoesNotReachARecreatedUser(t *testing.T) {
 			check: func(t *testing.T, n *Node) string {
 				if fs, err := corrosion.ListUser2FA(ctx, n.DB, "carol"); err != nil || len(fs) != 1 || fs[0].Secret != "s-new" {
 					return "the new carol's factor is gone"
+				}
+				return ""
+			},
+		},
+		{
+			// A lagging RE-ENROLMENT of the deleted account, under the same
+			// key as the new account's factor and with a later clock: node-2
+			// takes it away when the re-create reaches it (its record,
+			// user_holds.go), and no other node takes it (re-review 2, MU9).
+			name: "a second factor re-enrolled", seed: 5609,
+			after: func(t *testing.T, n *Node) {
+				if err := corrosion.InsertUser2FA(ctx, n.DB, corrosion.User2FARecord{
+					Username: "carol", Method: "totp", Secret: "s-new", Label: "phone"}); err != nil {
+					t.Fatal(err)
+				}
+			},
+			lagging: func(t *testing.T, n *Node) {
+				if err := corrosion.InsertUser2FA(ctx, n.DB, corrosion.User2FARecord{
+					Username: "carol", Method: "totp", Secret: "s-lag", Label: "phone"}); err != nil {
+					t.Fatal(err)
+				}
+			},
+			check: func(t *testing.T, n *Node) string {
+				if fs, err := corrosion.ListUser2FA(ctx, n.DB, "carol"); err != nil || len(fs) != 1 || fs[0].Secret != "s-new" {
+					return "the new carol's factors are not her own"
 				}
 				return ""
 			},
@@ -313,5 +340,48 @@ func TestFleet_ARecreatesLifecycleResetDoesNotEnableTheOldAccount(t *testing.T) 
 	}
 	if l, err := corrosion.GetUserLifecycle(ctx, old.DB, "carol"); err != nil || !l.Disabled {
 		t.Errorf("node-2: the live old carol was re-enabled by a reset of the deleted name (err %v)", err)
+	}
+}
+
+// TestFleet_AnOldAccountsTokenIsRefusedByAntiEntropy: node-2, cut off, mints
+// a token for the carol it knows after node-0 deleted her and created a new
+// carol. Before node-2 learns of it, node-0 pulls node-2's state by
+// anti-entropy: node-2's users row is the older incarnation, so the token,
+// the deleted account's, is refused (userKeyedTables) — node-2's own
+// retirement has not run to take it away (re-review 2, MU4).
+//
+// Mutation: tokens out of userKeyedTables — red.
+func TestFleet_AnOldAccountsTokenIsRefusedByAntiEntropy(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 5613})
+	latchUserIncarnation(t, c, nil, nil)
+	for _, n := range c.Nodes {
+		n.DB.SetCredentialsSplitGate(func() bool { return true })
+	}
+	admin, lag := c.Nodes[0], c.Nodes[2]
+	if err := corrosion.InsertUser(ctx, admin.DB, "carol", "operator", "hash-old"); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	c.Isolate(lag)
+	if err := corrosion.DeleteUser(ctx, admin.DB, "carol"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertUser(ctx, admin.DB, "carol", "operator", "hash-new"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertToken(ctx, lag.DB, corrosion.TokenRecord{
+		ID: "tok-lag", Username: "carol", Name: "mine", TokenHash: "th-lag"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := admin.DB.MergeStateBytesLWW(pullDump(t, c, lag)); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := admin.DB.Query(ctx, `SELECT id FROM tokens WHERE id = 'tok-lag'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("node-0 took the deleted carol's token from node-2 by anti-entropy")
 	}
 }

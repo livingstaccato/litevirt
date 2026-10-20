@@ -17,6 +17,11 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
+// userWriteInterleaveHook is a test seam: it runs between an account write's
+// read and its guarded batch (InsertUser's re-create, the admin floor), where
+// a peer's write can replicate in. Nil in production.
+var userWriteInterleaveHook func(username string)
+
 // UserRecord represents a litevirt user.
 type UserRecord struct {
 	Username     string
@@ -91,7 +96,7 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 		}
 		reactivate := Statement{SQL: usersReactivateSQL, Params: []interface{}{role, oldColumn, ts, username}}
 		if c.UserIncarnationOn() {
-			created = nextIncarnation(created)
+			created = c.newIncarnation(created)
 			reactivate = Statement{SQL: usersReactivateIncarnationSQL, Params: []interface{}{role, oldColumn, created, ts, username}}
 		}
 		// The re-create replaces the tombstone this node read, and nothing a
@@ -108,6 +113,9 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 				return false, nil
 			}
 			return err == nil && cur == prev, err
+		}
+		if userWriteInterleaveHook != nil {
+			userWriteInterleaveHook(username)
 		}
 		var applied bool
 		if split {
@@ -136,7 +144,7 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 	if c.UserIncarnationOn() {
 		// An incarnation at nanosecond precision, so two creates of one name
 		// on partitioned nodes in the same second are two incarnations.
-		created = time.Now().UTC().Format(time.RFC3339Nano)
+		created = c.newIncarnation("")
 	}
 	if passwordHash != "" {
 		// A local account under this name: any record that this node made
@@ -732,6 +740,9 @@ func ReinstateAdminIfNoneRemain(ctx context.Context, c *Client, run FeatureRun) 
 		}
 		// Over the tombstone read above only: an account of the name that
 		// replicated in since is not overwritten (user_incarnation.go).
+		if userWriteInterleaveHook != nil {
+			userWriteInterleaveHook(victim)
+		}
 		applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 			var del sql.NullString
 			err := tx.QueryRowContext(ctx, `SELECT deleted_at FROM users WHERE username = ?`, victim).Scan(&del)
@@ -832,7 +843,7 @@ func reinstateAdminStatements(ctx context.Context, c *Client, g capabilities.Fea
 		if len(prev) > 0 {
 			created = prev[0].String("created_at")
 		}
-		reinstate = Statement{SQL: usersReactivateIncarnationSQL, Params: []interface{}{"admin", c.oldColumnValue(hash), nextIncarnation(created), now, victim}}
+		reinstate = Statement{SQL: usersReactivateIncarnationSQL, Params: []interface{}{"admin", c.oldColumnValue(hash), c.newIncarnation(created), now, victim}}
 	}
 	stmts := []Statement{reinstate}
 	if c.MayWriteCredentialTables() {

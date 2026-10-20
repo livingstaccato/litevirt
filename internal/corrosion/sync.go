@@ -1420,6 +1420,22 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		}
 	}
 
+	// A users row that moved settles what is held or recorded for its name
+	// (user_holds.go).
+	if table.Name == "users" && merged > 0 && c.UserIncarnationOn() && !c.userHolds.empty() {
+		idx := columnIndexMap(table.Columns)
+		for _, row := range rows {
+			if len(row) != len(table.Columns) {
+				continue
+			}
+			if err := c.settleUserName(context.Background(), tx, cellStr(row, idx, "username"),
+				func(fn func()) { c.deferAfterCommit(tx, fn) }); err != nil {
+				_ = tx.Rollback()
+				return 0, len(rows), fmt.Errorf("settle held user writes: %w", err)
+			}
+		}
+	}
+
 	// A fence credential tombstone carries no retirement evidence, whichever
 	// build's dump it came from (credentials_revive_guard.go).
 	if table.Name == "host_fence_credentials" && merged > 0 {

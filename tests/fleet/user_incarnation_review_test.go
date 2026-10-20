@@ -194,6 +194,14 @@ func TestFleet_ALaggingTokenDoesNotOpenARecreatedUser(t *testing.T) {
 			t.Errorf("%s: the old holder's token (created %s, cut-off %q) authenticates as the new carol (created %s)",
 				n.Name, rows[0].String("created_at"), life.TokensNotBefore, u.CreatedAt)
 		}
+		// Nor is its credential left behind anywhere (re-review 2, L4).
+		creds, err := n.DB.Query(ctx, `SELECT token_id FROM token_credentials WHERE token_id = 'tok-old-holder'`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(creds) != 0 {
+			t.Errorf("%s: the old holder's token credential is left behind", n.Name)
+		}
 	}
 }
 

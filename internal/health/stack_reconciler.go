@@ -126,9 +126,11 @@ func (r *StackReconciler) reconcile(ctx context.Context) {
 			held[stack.Name] = true
 		}
 	}
-	r.reportTornDownFirewalls(ctx, held)
-	r.reportWithdrawnFirewalls(ctx, held)
-	r.resolveFirewallHolds(ctx, held)
+	tornDownRead := r.reportTornDownFirewalls(ctx, held)
+	withdrawnRead := r.reportWithdrawnFirewalls(ctx, held)
+	if tornDownRead && withdrawnRead {
+		r.resolveFirewallHolds(ctx, held)
+	}
 	for name := range r.deletingSeen {
 		if !listed[name] {
 			delete(r.deletingSeen, name)

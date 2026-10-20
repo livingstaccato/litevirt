@@ -83,12 +83,14 @@ const tornDownWhy = "the stack was torn down, and this host still holds security
 	"rules it owns, written before the teardown"
 
 // reportTornDownFirewalls raises the condition for each torn-down stack whose
-// firewall rows this host still holds, and adds it to held.
-func (r *StackReconciler) reportTornDownFirewalls(ctx context.Context, held map[string]bool) {
+// firewall rows this host still holds, and adds it to held. It reports
+// whether it read everything it judges by: a pass that could not leaves
+// open conditions as they are (resolveFirewallHolds).
+func (r *StackReconciler) reportTornDownFirewalls(ctx context.Context, held map[string]bool) (complete bool) {
 	stacks, err := corrosion.TornDownStacksOwningFirewall(ctx, r.db)
 	if err != nil {
 		slog.Warn("stack-reconciler: list the torn-down stacks that own firewall rows", "error", err)
-		return
+		return false
 	}
 	for _, stack := range stacks {
 		held[stack] = true
@@ -100,31 +102,38 @@ func (r *StackReconciler) reportTornDownFirewalls(ctx context.Context, held map[
 	intents, err := corrosion.StackFirewallIntents(ctx, r.db)
 	if err != nil {
 		slog.Warn("stack-reconciler: read the stacks' firewall intents", "error", err)
-		return
+		return false
 	}
+	complete = true
 	for name := range intents {
 		if held[name] {
 			continue
 		}
 		rec, err := r.db.Query(ctx, `SELECT deleted_at FROM stacks WHERE name = ?`, name)
-		if err != nil || len(rec) == 0 || rec[0].String("deleted_at") == "" {
+		if err != nil {
+			slog.Warn("stack-reconciler: read the stack of a firewall intent", "stack", name, "error", err)
+			complete = false
+			continue
+		}
+		if len(rec) == 0 || rec[0].String("deleted_at") == "" {
 			continue
 		}
 		held[name] = true
 		r.raiseFirewallHold(ctx, name, tornDownIntentWhy)
 	}
+	return complete
 }
 
 // tornDownIntentWhy is the why of a torn-down stack whose firewall intent
 // still stands.
-const tornDownIntentWhy = "the stack was torn down by a teardown without sg.write at the cluster root, which ends " +
-	"nothing its last deploy by a caller with sg.write declared: the firewall (and a default-deny it asked for) still " +
-	"counts for its name"
+const tornDownIntentWhy = "the stack was torn down, and the firewall intent its last deploy by a caller with sg.write " +
+	"at the cluster root recorded still stands: the firewall (and a default-deny it asked for) still counts for its name"
 
 // withdrawnWhy is the why of a live stack whose file no longer declares the
 // firewall its last deploy with sg.write declared.
 const withdrawnWhy = "its stored file no longer declares the firewall its last deploy by a caller with sg.write at the " +
-	"cluster root declared, so it was replaced by a deploy without sg.write; what that deploy declared still stands"
+	"cluster root recorded: a later deploy that recorded none replaced it (one without sg.write, or one on a host " +
+	"still on the previous release); what the recorded deploy declared still stands"
 
 // unreadableWhy is the why of a live stack with a firewall intent whose
 // stored file this build cannot read.
@@ -135,19 +144,21 @@ const unreadableWhy = "its stored file cannot be read, so whether it still decla
 // being deleted, whose file no longer declares what its firewall intent does
 // (security groups, ip sets or a firewall block, or the default-deny), and
 // adds it to held. Such a file was written by a deploy without sg.write at
-// the root from a node holding an older one, or by a previous release.
-func (r *StackReconciler) reportWithdrawnFirewalls(ctx context.Context, held map[string]bool) {
+// the root from a node holding an older one, or by a previous release. It
+// reports whether it read everything it judges by.
+func (r *StackReconciler) reportWithdrawnFirewalls(ctx context.Context, held map[string]bool) (complete bool) {
 	intents, err := corrosion.StackFirewallIntents(ctx, r.db)
-	if err != nil || len(intents) == 0 {
-		if err != nil {
-			slog.Warn("stack-reconciler: read the stacks' firewall intents", "error", err)
-		}
-		return
+	if err != nil {
+		slog.Warn("stack-reconciler: read the stacks' firewall intents", "error", err)
+		return false
+	}
+	if len(intents) == 0 {
+		return true
 	}
 	stacks, err := corrosion.ListStacks(ctx, r.db)
 	if err != nil {
 		slog.Warn("stack-reconciler: list stacks", "error", err)
-		return
+		return false
 	}
 	for _, st := range stacks {
 		in, ok := intents[st.Name]
@@ -168,6 +179,7 @@ func (r *StackReconciler) reportWithdrawnFirewalls(ctx context.Context, held map
 			r.raiseFirewallHold(ctx, st.Name, withdrawnWhy)
 		}
 	}
+	return true
 }
 
 // raiseFirewallHold raises the condition for stack, or leaves an open one that
@@ -203,16 +215,17 @@ func (r *StackReconciler) raiseFirewallHold(ctx context.Context, stack, why stri
 	} else {
 		state := "the teardown of stack %q leaves its firewall (security groups, ip sets, cluster and host rules, " +
 			"the cluster default policy) in place, and the stack stays \"deleting\": %s"
+		saw := ", and the node that began the teardown saw no firewall for the stack"
 		switch why {
 		case tornDownWhy:
 			state = "stack %q is gone and its firewall rows stay in force: %s"
 		case tornDownIntentWhy:
 			state = "stack %q is gone and what it declared of the firewall stands: %s"
+			saw = ""
 		}
-		detail = fmt.Sprintf(state+". Removing it needs sg.write at the cluster root, and the node that began the "+
-			"teardown saw no firewall for the stack. An Admin finishes the teardown with `lv compose down --name %s`, "+
-			"record or not; `lv role grant NetworkAdmin <principal> --path / --propagate` lets another caller do it",
-			stack, why, stack)
+		detail = fmt.Sprintf(state+". Removing it needs sg.write at the cluster root"+saw+". An Admin finishes the "+
+			"teardown with `lv compose down --name %s`, record or not; `lv role grant NetworkAdmin <principal> --path / "+
+			"--propagate` lets another caller do it", stack, why, stack)
 	}
 	slog.Warn("stack-reconciler: a caller without sg.write could not remove or withdraw a stack's firewall; kept",
 		"stack", stack, "why", why)
@@ -238,7 +251,8 @@ func (r *StackReconciler) raiseFirewallHold(ctx context.Context, stack, why stri
 // (reportTornDownFirewalls; a default-deny it still owns is
 // firewall.default_deny_orphaned's). One still "deleting" is left to the
 // pass that takes it up (this one may have left it to a compose down in
-// flight).
+// flight). The caller skips it on a pass whose reports could not read what
+// they judge by: a stack such a pass did not hold may still be held.
 func (r *StackReconciler) resolveFirewallHolds(ctx context.Context, held map[string]bool) {
 	open, err := corrosion.ListOpenHealthConditionsByCode(ctx, r.db, firewallHoldEvaluator, firewallHoldCode)
 	if err != nil {

@@ -1503,10 +1503,15 @@ and its file alone says what it asks for. Finish the roll before relying on
 the check; an Admin's `lv compose up` from an upgraded host records the
 intent of a stack deployed before it. During the roll, a stack torn down on a
 host still on the previous release leaves the intent its last deploy with
-`sg.write` recorded in force for the stack's name: a later deploy of that
-name without `sg.write` is refused once it has a record, and raises
+`sg.write` recorded in force for the stack's name: the upgraded hosts turn
+a default-deny it asked for back on, owned by the name, a later deploy of
+that name without `sg.write` is refused, and the name raises
 `stack.firewall_teardown_held`. An Admin's `lv compose down --name <stack>`
-from an upgraded host clears it.
+from an upgraded host clears it. Likewise, an Admin's `lv compose up` on a
+host still on the previous release records no intent: when it drops the
+stack's firewall or default-deny, the upgraded hosts keep the default-deny
+the recorded intent asks for and raise the condition. Run it again from an
+upgraded host.
 
 ### A hand-deleted NetBox address is re-created after the roll
 

@@ -1965,23 +1965,29 @@ with `sg.write` recorded) in four cases:
 - the stack was torn down while this host holds a security group, ip set,
   or cluster or host rule it owns, written before the teardown. They stay in
   force. A cluster default-deny it owns is `firewall.default_deny_orphaned`.
-- the stack was torn down by a teardown without `sg.write` at `/`, and the
-  intent its last deploy with `sg.write` recorded declares a firewall. It
+- the stack was torn down, and the intent its last deploy with `sg.write`
+  recorded still stands and declares a firewall: the teardown's caller did
+  not hold `sg.write` at `/`, it ran on a host still on the previous
+  release, or a deploy with `sg.write` recorded the intent after it. It
   still counts for the name: a default-deny it asked for passes to it when
-  the stack that owns the deny goes, and stays with it.
+  the stack that owns the deny goes, and stays with it, and `lv compose up`
+  of the name without `sg.write` is refused.
 - the stack is live and its file no longer declares the firewall, or the
-  default-deny, its last deploy with `sg.write` declared: a deploy without
-  `sg.write` replaced it. What that deploy declared still stands: the stack
-  still asks for the default-deny, and a deploy without `sg.write` is still
-  refused. A stored file this build cannot read keeps the condition open,
+  default-deny, its last deploy with `sg.write` declared: a deploy that
+  recorded no intent replaced it (one without `sg.write`, or one on a host
+  still on the previous release). What the recorded deploy declared still
+  stands: the stack still asks for the default-deny, and a deploy without
+  `sg.write` is still refused. A stored file this build cannot read keeps the condition open,
   saying whether it still declares that is unknown.
 
 An Admin finishes a teardown with `lv compose down --name <stack>`, from any
 node, record or not, and settles a live stack's firewall with `lv compose up`
 of the file it should have; `lv role grant NetworkAdmin <principal> --path /
 --propagate` lets another caller do either. The condition resolves on the
-next pass after that: a torn-down stack's rows are gone, or a live stack's
-file declares what its last deploy with `sg.write` did.
+next pass after that: a torn-down stack's rows are gone and an Admin's
+`lv compose down --name <stack>` has cleared its intent, or a live stack's
+file declares what its last deploy with `sg.write` did. A pass that cannot
+read the stacks or their intents leaves the condition as it is.
 
 ### SYN-flood condition (`firewall.synflood.unavailable`)
 

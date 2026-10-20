@@ -362,3 +362,72 @@ func setIntent(t *testing.T, db *corrosion.Client, stack string, firewall, deny 
 		t.Fatal(err)
 	}
 }
+
+// A pass that cannot read the stacks' firewall intents leaves an open
+// condition as it is: it does not know the stack is no longer held, and a
+// resolve on one failed read would raise the condition again on the next
+// pass with a new FirstSeen.
+//
+// Mutation: resolve whatever the reports could read — both cases, red.
+func TestStackReconciler_AFailedReadLeavesTheConditionOpen(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, db *corrosion.Client)
+	}{
+		{"withdrawn", func(t *testing.T, db *corrosion.Client) {
+			if err := corrosion.UpsertStack(ctx, db, corrosion.StackRecord{Name: "edge", ComposeYAML: "name: edge\n", State: "active"}); err != nil {
+				t.Fatal(err)
+			}
+			setIntent(t, db, "edge", true, true)
+		}},
+		{"torn down", func(t *testing.T, db *corrosion.Client) {
+			if err := corrosion.UpsertStack(ctx, db, corrosion.StackRecord{Name: "edge", ComposeYAML: "name: edge\n", State: "active"}); err != nil {
+				t.Fatal(err)
+			}
+			setIntent(t, db, "edge", true, true)
+			if err := corrosion.DeleteStackRecord(ctx, db, "edge"); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := corrosion.NewTestClientT(t)
+			if err := corrosion.InitSchema(ctx, db); err != nil {
+				t.Fatal(err)
+			}
+			db.SetClusterPolicyGate(func() bool { return true })
+			tc.setup(t, db)
+			r := NewStackReconciler("node-0", db)
+			r.SetCleaner(&failingStackCleaner{})
+			r.ReconcileOnce(ctx)
+			row, found, err := corrosion.GetHealthCondition(ctx, db, firewallHoldEvaluator, firewallHoldCode, firewallHoldKind, "edge")
+			if err != nil || !found || row.Lifecycle == corrosion.ConditionResolved {
+				t.Fatalf("setup: condition = %+v (found %v, err %v), want open", row, found, err)
+			}
+			// The intent may stand after a teardown with sg.write too (a
+			// previous release's, or one an Admin redeploy's intent won):
+			// the condition does not say who tore it down.
+			if strings.Contains(row.Evidence, "teardown without sg.write") {
+				t.Errorf("the condition blames a teardown without sg.write: %s", row.Evidence)
+			}
+			first := row.FirstSeen
+			if _, err := db.DB().ExecContext(ctx, `ALTER TABLE cluster_policies RENAME TO cluster_policies_away`); err != nil {
+				t.Fatal(err)
+			}
+			r.ReconcileOnce(ctx)
+			if _, err := db.DB().ExecContext(ctx, `ALTER TABLE cluster_policies_away RENAME TO cluster_policies`); err != nil {
+				t.Fatal(err)
+			}
+			row, found, err = corrosion.GetHealthCondition(ctx, db, firewallHoldEvaluator, firewallHoldCode, firewallHoldKind, "edge")
+			if err != nil || !found || row.Lifecycle == corrosion.ConditionResolved {
+				t.Errorf("a pass that could not read the intents resolved the condition: %+v (found %v, err %v)", row, found, err)
+			}
+			r.ReconcileOnce(ctx)
+			row, _, _ = corrosion.GetHealthCondition(ctx, db, firewallHoldEvaluator, firewallHoldCode, firewallHoldKind, "edge")
+			if row.FirstSeen != first {
+				t.Errorf("FirstSeen = %q after the failed read, want %q", row.FirstSeen, first)
+			}
+		})
+	}
+}

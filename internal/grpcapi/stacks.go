@@ -206,21 +206,25 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// workload action has been issued the rows stay, for `compose down`,
 	// which finds the stack's workloads by their stack_name.
 	//
-	//
 	// A caller with sg.write at the root records what this file declares of
-	// the firewall (corrosion.StackFirewallIntent) for the stack's deployment
-	// before any row changes, and again once the record is written
-	// (recordStackDeploy; a first deploy has no deployment before). A deploy
-	// without it records nothing: one from a node whose replica holds an older
-	// file replaces the file on every peer, and must not withdraw the
-	// firewall a newer deploy declared.
+	// the firewall (corrosion.StackFirewallIntent) for a stack that has a
+	// record once the persist has validated the file and taken its release
+	// features, before its first row changes (stackFirewallWrites.changing),
+	// and again once the record is written (recordStackDeploy; a first
+	// deploy has no record before). A deploy the persist refuses records
+	// nothing. A deploy without sg.write records nothing either: one from a
+	// node whose replica holds an older file replaces the file on every peer,
+	// and must not withdraw the firewall a newer deploy declared.
 	prior, priorErr := corrosion.GetStack(ctx, s.db, f.Name)
-	if priorErr == nil && s.requireSGWrite(ctx) == nil {
-		if err := corrosion.SetStackFirewallIntent(ctx, s.db, prior, f.DeclaresFirewall(), fileAsksDefaultDeny(f), s.hostName); err != nil {
-			return status.Errorf(codes.Unavailable, "record the firewall stack %q declares: %v", f.Name, err)
+	written := &stackFirewallWrites{}
+	if priorErr == nil && prior != nil && s.requireSGWrite(ctx) == nil {
+		written.changing = func(ctx context.Context) error {
+			if err := corrosion.SetStackFirewallIntent(ctx, s.db, prior, f.DeclaresFirewall(), fileAsksDefaultDeny(f), s.hostName); err != nil {
+				return status.Errorf(codes.Unavailable, "record the firewall stack %q declares: %v", f.Name, err)
+			}
+			return nil
 		}
 	}
-	written := &stackFirewallWrites{}
 	workloadPhase := false
 	if priorErr == nil && prior == nil {
 		defer func() {
@@ -430,6 +434,20 @@ func fileAsksDefaultDeny(f *compose.File) bool {
 // call inserted, by id.
 type stackFirewallWrites struct {
 	sgIDs, ipSetIDs, clusterRuleIDs []string
+	// changing, when set, runs once, before the persist changes its first
+	// row and after everything that can refuse the file: an error from it
+	// refuses the persist with nothing changed.
+	changing func(context.Context) error
+}
+
+// change runs w.changing, once.
+func (w *stackFirewallWrites) change(ctx context.Context) error {
+	fn := w.changing
+	w.changing = nil
+	if fn == nil {
+		return nil
+	}
+	return fn(ctx)
 }
 
 // undoFailedFirstDeploy tombstones the security groups (and their rules), ip
@@ -536,6 +554,9 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 	if !hasFirewall {
 		// Still clear any rows a previous deploy of this stack left behind, in
 		// case the firewall block was removed from the compose file.
+		if err := w.change(ctx); err != nil {
+			return err
+		}
 		return corrosion.DeleteStackFirewall(ctx, s.db, f.Name, compose.StoredStackWants)
 	}
 	// A name another stack or `lv sg create` already holds is refused before
@@ -644,6 +665,9 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 	// goes only once the new config's rows are written, and only when the new
 	// config drops default-deny. A redeploy that fails part way leaves the
 	// cluster denying, with fewer accepts: fail closed.
+	if err := w.change(ctx); err != nil {
+		return err
+	}
 	wantDeny := f.FirewallDefaults != nil && f.FirewallDefaults.DefaultDeny
 	if wantDeny {
 		// Compose sets the cluster-wide default; per-host overrides live in
@@ -1642,10 +1666,10 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 						return errors.New(status.Convert(refusal).Message())
 					}
 				}
-				// The firewall intent is not cleared: it speaks for this
-				// deployment only, and a later one of the name is another
-				// (corrosion.StackFirewallIntent). A teardown writes none,
-				// with or without sg.write.
+				// The firewall intent is not written here: a teardown with
+				// sg.write cleared it in MarkStackDeleting's batch, at the
+				// teardown's own stamp, and one without leaves it as it is
+				// (corrosion.StackFirewallIntent).
 				return corrosion.DeleteStackFirewall(ctx, s.db, req.Name, compose.StoredStackWants)
 			}},
 			{"backup repos", func() error {
@@ -2928,8 +2952,9 @@ func (s *Server) provisionComposeNetworks(ctx context.Context, f *compose.File) 
 // stored file declares a firewall block (a default-deny it only asks for
 // while another stack owns the row decides whether that deny is handed on),
 // or its last deploy by a caller with sg.write at the root declared one
-// (corrosion.StackFirewallIntent). A redeploy replaces or drops those and a
-// teardown removes them.
+// (corrosion.StackFirewallIntent), whether or not this node holds a record
+// of the stack. A redeploy replaces or drops those and a teardown removes
+// them.
 //
 // This node's replica may lag, and a teardown it authorized is replicated by
 // name to every node holding the rows, whose reconciler then removes them. So
@@ -2958,22 +2983,30 @@ func (s *Server) stackFirewallRefusal(ctx context.Context, stack string, declare
 		if gerr != nil {
 			return nil, status.Errorf(codes.Unavailable, "read stack %q: %v", stack, gerr)
 		}
-		if st == nil {
-			break
-		}
-		stored, serr := s.storedStackFile(ctx, stack)
-		switch {
-		case serr != nil:
-			why = "its stored file cannot be read, so whether it declares a firewall is unknown"
-		case stored.DeclaresFirewall():
-			why = "its stored file declares a firewall"
-		default:
-			in, found, ierr := corrosion.StackFirewallIntentOf(ctx, s.db, *st)
-			if ierr != nil {
-				return nil, status.Errorf(codes.Unavailable, "read the firewall of stack %q: %v", stack, ierr)
+		if st != nil {
+			stored, serr := s.storedStackFile(ctx, stack)
+			switch {
+			case serr != nil:
+				why = "its stored file cannot be read, so whether it declares a firewall is unknown"
+			case stored.DeclaresFirewall():
+				why = "its stored file declares a firewall"
 			}
-			if found && (in.Firewall || in.DefaultDeny) {
-				why = "its last deploy by a caller with sg.write at the cluster root declared a firewall"
+			if why != "" {
+				break
+			}
+		}
+		// The intent stands for the name with or without a record here: a
+		// teardown without sg.write, or one by a previous release, leaves
+		// it, and the record of a deploy elsewhere may not have reached
+		// this node yet.
+		in, found, ierr := corrosion.GetStackFirewallIntent(ctx, s.db, stack)
+		if ierr != nil {
+			return nil, status.Errorf(codes.Unavailable, "read the firewall of stack %q: %v", stack, ierr)
+		}
+		if found && in.Declares() {
+			why = "its last deploy by a caller with sg.write at the cluster root declared a firewall"
+			if st == nil {
+				why += ", and no teardown by such a caller has ended it since (an Admin's `lv compose down --name " + stack + "` does)"
 			}
 		}
 	}

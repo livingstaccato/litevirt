@@ -1,6 +1,14 @@
 package pki
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"errors"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -180,5 +188,47 @@ func TestInstallQemuMigrationTLS_RewritesAReissuedKey(t *testing.T) {
 	want := mustRead(t, filepath.Join(MigrationDir(pkiDir), MigrationHostKeyName))
 	if got := mustRead(t, filepath.Join(qemu, "server-key.pem")); string(got) != string(want) {
 		t.Fatal("QEMU still has the old key after a reissue")
+	}
+}
+
+// QEMU presents the host certificate as both the server and the client of the
+// migration stream, so one limited to either is refused before it is
+// installed, like any other unusable set.
+//
+// Mutation: drop the extended-key-usage check — the server-only certificate
+// validates.
+func TestValidateMigrationCredentials_RefusesACertificateNotUsableAsClientAndServer(t *testing.T) {
+	caC, caK := testMigrationCA(t)
+	ca, key, err := loadCA(caC, caK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, eku := range map[string][]x509.ExtKeyUsage{
+		"server only": {x509.ExtKeyUsageServerAuth},
+		"client only": {x509.ExtKeyUsageClientAuth},
+	} {
+		leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tmpl := &x509.Certificate{
+			SerialNumber: big.NewInt(time.Now().UnixNano()), Subject: pkix.Name{CommonName: "node-1"},
+			NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+			KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: eku,
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &leafKey.PublicKey, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		kb, err := x509.MarshalECPrivateKey(leafKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+		keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb})
+		_, _, err = ValidateMigrationCredentials(mustRead(t, caC), certPEM, keyPEM, time.Now())
+		if !errors.Is(err, ErrInvalidMigrationCredentials) || !strings.Contains(err.Error(), "server and client") {
+			t.Errorf("%s: err = %v; want refused as not usable for both", name, err)
+		}
 	}
 }

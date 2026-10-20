@@ -1022,10 +1022,20 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			// "operator-stop", which a clean shutdown's "guest-shutdown" must
 			// not replace — failover recovers a stop nobody asked for
 			// (corrosion.SyncVMStopIfRunning).
+			// With enforcement on, a row whose epoch cannot be read is not
+			// synced this pass: the plain statement would publish the stop
+			// unfenced. The next pass reads it again.
 			var epoch int64
-			if fresh, gerr := corrosion.GetVM(ctx, r.db, vm.Name); r.ownerEpochEnforced(ctx) &&
-				gerr == nil && fresh != nil && fresh.OwnerEpoch > 0 {
-				epoch = fresh.OwnerEpoch
+			if r.ownerEpochEnforced(ctx) {
+				fresh, gerr := corrosion.GetVM(ctx, r.db, vm.Name)
+				if gerr != nil {
+					slog.Warn("reconciler: VM's owner epoch cannot be read; not syncing its out-of-band stop this pass",
+						"vm", vm.Name, "error", gerr)
+					break
+				}
+				if fresh != nil && fresh.OwnerEpoch > 0 {
+					epoch = fresh.OwnerEpoch
+				}
 			}
 			if r.stopSyncHook != nil {
 				r.stopSyncHook(ctx, vm.Name)

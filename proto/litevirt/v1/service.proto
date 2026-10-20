@@ -4106,4 +4106,8 @@ message MigrationTLSHostStatus {
   google.protobuf.Timestamp cert_not_after = 7;
   // allow_unencrypted_storage: this host falls back to plaintext.
   bool allow_unencrypted_storage = 8;
+  // install_error is why this host's daemon could not install its set into
+  // QEMU's TLS directory when asked (a refused /etc/pki/qemu, an unresolvable
+  // QEMU user, a failed validation), or empty.
+  string install_error = 9;
 }

@@ -31787,8 +31787,12 @@ type MigrationTLSHostStatus struct {
 	CertNotAfter          *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=cert_not_after,json=certNotAfter,proto3" json:"cert_not_after,omitempty"`
 	// allow_unencrypted_storage: this host falls back to plaintext.
 	AllowUnencryptedStorage bool `protobuf:"varint,8,opt,name=allow_unencrypted_storage,json=allowUnencryptedStorage,proto3" json:"allow_unencrypted_storage,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	// install_error is why this host's daemon could not install its set into
+	// QEMU's TLS directory when asked (a refused /etc/pki/qemu, an unresolvable
+	// QEMU user, a failed validation), or empty.
+	InstallError  string `protobuf:"bytes,9,opt,name=install_error,json=installError,proto3" json:"install_error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *MigrationTLSHostStatus) Reset() {
@@ -31875,6 +31879,13 @@ func (x *MigrationTLSHostStatus) GetAllowUnencryptedStorage() bool {
 		return x.AllowUnencryptedStorage
 	}
 	return false
+}
+
+func (x *MigrationTLSHostStatus) GetInstallError() string {
+	if x != nil {
+		return x.InstallError
+	}
+	return ""
 }
 
 var File_litevirt_v1_service_proto protoreflect.FileDescriptor
@@ -34382,7 +34393,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x05hosts\x18\x01 \x03(\v2#.litevirt.v1.MigrationTLSHostStatusR\x05hosts\"k\n" +
 	"\x0eMigrationTLSCA\x12 \n" +
 	"\vfingerprint\x18\x01 \x01(\tR\vfingerprint\x127\n" +
-	"\tnot_after\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\bnotAfter\"\x83\x03\n" +
+	"\tnot_after\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\bnotAfter\"\xa8\x03\n" +
 	"\x16MigrationTLSHostStatus\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12 \n" +
@@ -34392,7 +34403,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"trustedCas\x126\n" +
 	"\x17cert_issuer_fingerprint\x18\x06 \x01(\tR\x15certIssuerFingerprint\x12@\n" +
 	"\x0ecert_not_after\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\fcertNotAfter\x12:\n" +
-	"\x19allow_unencrypted_storage\x18\b \x01(\bR\x17allowUnencryptedStorage*V\n" +
+	"\x19allow_unencrypted_storage\x18\b \x01(\bR\x17allowUnencryptedStorage\x12#\n" +
+	"\rinstall_error\x18\t \x01(\tR\finstallError*V\n" +
 	"\x0eRelayVIPResult\x12\x15\n" +
 	"\x11RELAY_VIP_UNKNOWN\x10\x00\x12\x14\n" +
 	"\x10RELAY_VIP_CLAIMS\x10\x01\x12\x17\n" +

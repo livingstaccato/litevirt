@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -174,6 +175,21 @@ func upToDate(path string, data []byte, mode os.FileMode, uid, gid int) bool {
 	return err == nil && bytes.Equal(have, data)
 }
 
+// ErrCredentialsInvalid wraps InstallQemuMigrationTLS's refusal of a set that
+// fails ValidateMigrationCredentials, as opposed to a refusal of the install
+// itself (a foreign qemuDir, a failed write).
+var ErrCredentialsInvalid = errors.New("not installing migration credentials")
+
+// IsCredentialsInvalidText reports whether an install error's text, as it
+// arrives over gRPC in MigrationTLSHostStatus.install_error, is
+// ErrCredentialsInvalid: the set failed validation. errors.Is cannot be used
+// once the error is a string, and the text after the prefix cannot be compared
+// with validation_error either — both come from separate validations whose
+// expiry messages embed the second each one ran.
+func IsCredentialsInvalidText(installErr string) bool {
+	return strings.HasPrefix(installErr, ErrCredentialsInvalid.Error()+": ")
+}
+
 // InstallQemuMigrationTLS copies this host's migration credentials from
 // pkiDir/migration into qemuDir under the names libvirt reads for migration TLS.
 // The keys are written 0400 and, when keyUID >= 0, owned by keyUID:keyGID (the
@@ -201,7 +217,7 @@ func InstallQemuMigrationTLS(pkiDir, qemuDir string, keyUID, keyGID int) (bool, 
 	}
 
 	if _, _, err := ValidateMigrationCredentials(ca, cert, key, time.Now()); err != nil {
-		return false, fmt.Errorf("not installing migration credentials: %w", err)
+		return false, fmt.Errorf("%w: %w", ErrCredentialsInvalid, err)
 	}
 
 	if err := claimQemuTLSDir(qemuDir); err != nil {

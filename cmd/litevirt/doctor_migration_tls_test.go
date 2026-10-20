@@ -53,6 +53,52 @@ func TestMigrationTLSProblems_FlagsEachCondition(t *testing.T) {
 	}
 }
 
+// A host whose daemon cannot install a valid set is a problem, and its STATUS
+// reads invalid.
+//
+// Mutation: drop the install_error check — no line names the refusal.
+func TestMigrationTLSProblems_FlagsAnInstallRefusal(t *testing.T) {
+	now := time.Now()
+	far := now.Add(365 * 24 * time.Hour)
+	refused := row("b", "x", far, "x")
+	refused.InstallError = "cannot tell which user QEMU runs as"
+	rows := []*pb.MigrationTLSHostStatus{row("a", "x", far, "x"), refused}
+	got := strings.Join(migrationTLSProblems(rows, false, now), "\n")
+	if !strings.Contains(got, "b: its daemon cannot install migration credentials: cannot tell which user QEMU runs as") {
+		t.Errorf("problems do not name the install refusal:\n%s", got)
+	}
+}
+
+// A CA that has expired names `--no-overlap`, since the overlapping rotation
+// refuses one; a CA that is only expiring names the plain rotation.
+//
+// Mutation: always name the plain `lv host rotate-migration-ca` — the expired
+// line misses --no-overlap.
+func TestMigrationTLSProblems_ExpiredCANamesNoOverlap(t *testing.T) {
+	now := time.Now()
+	far := now.Add(365 * 24 * time.Hour)
+	expired := row("a", "x", far, "x")
+	expired.TrustedCas[0].NotAfter = timestamppb.New(now.Add(-24 * time.Hour))
+	expiring := row("b", "y", far, "y")
+	expiring.TrustedCas[0].NotAfter = timestamppb.New(now.Add(30 * 24 * time.Hour))
+	for _, p := range migrationTLSProblems([]*pb.MigrationTLSHostStatus{expired, expiring}, true, now) {
+		switch {
+		case strings.HasPrefix(p, "a: CA"):
+			if !strings.Contains(p, "expired") || !strings.Contains(p, "`lv host rotate-migration-ca --no-overlap`") {
+				t.Errorf("expired CA: %q; want it to say expired and name --no-overlap", p)
+			}
+		case strings.HasPrefix(p, "b: CA"):
+			if !strings.Contains(p, "`lv host rotate-migration-ca`") || strings.Contains(p, "--no-overlap") {
+				t.Errorf("expiring CA: %q; want the plain rotation, without --no-overlap", p)
+			}
+		}
+	}
+	got := strings.Join(migrationTLSProblems([]*pb.MigrationTLSHostStatus{expired, expiring}, true, now), "\n")
+	if !strings.Contains(got, "a: CA") || !strings.Contains(got, "b: CA") {
+		t.Fatalf("problems = %q; want a CA line for each host", got)
+	}
+}
+
 // Review focus 5: run away from the operator machine mid-rotation, a CA-set
 // mismatch is reported, with the hint that a rotation may be running.
 // Mid-rotation on the operator machine (rotating=true), it is not a problem.

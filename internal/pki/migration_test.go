@@ -3,6 +3,7 @@ package pki
 import (
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -140,6 +141,11 @@ func TestInstallQemuMigrationTLS_RefusesADirectoryItDoesNotOwn(t *testing.T) {
 	ok, err := InstallQemuMigrationTLS(pkiDir, qemu, -1, -1)
 	if err == nil || ok {
 		t.Fatalf("install over a foreign %s = (%v, %v), want a refusal", qemu, ok, err)
+	}
+	// Not a validation failure: a new credential set would not cure it.
+	// Mutation: make IsCredentialsInvalidText return true.
+	if errors.Is(err, ErrCredentialsInvalid) || IsCredentialsInvalidText(err.Error()) {
+		t.Errorf("refusal %q reads as a validation failure", err)
 	}
 	if data, _ := os.ReadFile(foreign); string(data) != "the operator's own CA\n" {
 		t.Error("the refusal still overwrote the operator's ca-cert.pem")

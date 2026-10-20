@@ -3058,6 +3058,15 @@ func (s *Server) tryLockVM(vmName string) (func(), bool) {
 	return s.tryLockVMAs(vmName, defaultVMLockOwner)
 }
 
+// TryLockVMForHealth takes name's lock for a health restart without waiting
+// (the daemon wires it as the health checker's VM locker): the lock every
+// operation on the VM through this server holds — a move, a start, a stop —
+// so the restart interleaves with none of them. A lock another operation
+// holds is reported, not waited for.
+func (s *Server) TryLockVMForHealth(name string) (release func(), ok bool) {
+	return s.tryLockVMAs(name, "a health restart")
+}
+
 // tryLockVMAs is tryLockVM for an operation that names itself (lockVMAs).
 func (s *Server) tryLockVMAs(vmName, owner string) (func(), bool) {
 	s.vmLocksMu.Lock()

@@ -165,5 +165,6 @@ func (s *Server) RepairVMOwner(ctx context.Context, req *pb.RepairVMOwnerRequest
 	s.auditAs(ctx, actor, "vm.repair-owner", req.GetName(),
 		fmt.Sprintf("owner %s -> %s (running; state_detail cleared, fresh ts)", prev, s.hostName), "ok")
 	s.reverseReplicationAfterMove(ctx, "vm", req.GetName(), "", prev, s.hostName)
+	s.resolveMigrationUnresolved(context.WithoutCancel(ctx), req.GetName())
 	return &pb.RepairVMOwnerResponse{Host: s.hostName, PreviousHost: prev}, nil
 }

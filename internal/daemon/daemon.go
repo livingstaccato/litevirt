@@ -1469,6 +1469,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// adoption-gate + PCI-start-preflight. A strict no-op until hardware_v2 latches, so
 	// this changes nothing on a fleet where the feature is off.
 	vmChecker.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
+	// A health restart runs under the VM's API lock, the one a move, a start
+	// or a stop of the VM holds, so none interleaves with it.
+	vmChecker.SetVMLocker(svc.TryLockVMForHealth)
 	// A health restart moves a stopped VM's NICs onto the devices their
 	// networks are on now, as a start through the Server does.
 	vmChecker.SetNetworkFollower(svc.FollowNetworkDevices)
@@ -1556,6 +1559,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	}()
 	dbWorkers.recoverFirmwareMoves(ctx)
+	// A VM recorded migrating here with no move of it running (this daemon
+	// stopped mid-move) is named by vm.migration_unresolved.
+	svc.RaiseLeftMigrating(ctx)
 
 	// F1 resource-update recovery: resume any locally-owned VM wedged on a nonterminal
 	// resource_update_running operation (a live resize that crashed after committing its

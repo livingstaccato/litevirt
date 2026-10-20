@@ -1207,6 +1207,35 @@ func UpdateVMStateStrict(ctx context.Context, c *Client, name, state, detail str
 	return nil
 }
 
+// UpdateVMStateFrom is UpdateVMState only while the VM's row is still host's
+// and recorded `from`, checked inside the write's transaction
+// (ExecuteBatchGuarded): a state another writer recorded between a caller's
+// read and this write — a move recording migrating under a health restart,
+// a cold move handing the VM to another host — is not overwritten. The
+// statement is UpdateVMState's; the guard is local only. applied=false, with
+// no error, when the row is recorded otherwise (or absent).
+func UpdateVMStateFrom(ctx context.Context, c *Client, name, host, from, to, detail string) (bool, error) {
+	now := c.NowTS()
+	return c.ExecuteBatchGuarded(ctx, vmRowIs(ctx, name, host, from),
+		[]Statement{{SQL: vmStateUpdateSQL, Params: []interface{}{to, detail, now, name}}})
+}
+
+// vmRowIs is the guard of UpdateVMStateFrom: the VM's live row names host
+// and is in state from.
+func vmRowIs(ctx context.Context, name, host, from string) func(tx *sql.Tx) (bool, error) {
+	return func(tx *sql.Tx) (bool, error) {
+		var curHost, curState string
+		err := tx.QueryRowContext(ctx, `SELECT host_name, state FROM vms WHERE name = ? AND deleted_at IS NULL`, name).Scan(&curHost, &curState)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return curHost == host && curState == from, nil
+	}
+}
+
 // UpdateVMHost moves a VM's host assignment and state after migration.
 // The placement generation advances in the same batch as the host change,
 // as for every writer of host_name (VMPlacementMark).

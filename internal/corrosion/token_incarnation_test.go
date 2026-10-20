@@ -502,3 +502,54 @@ func TestTokenIncarnation_AnUnlatchedReinstatementIsANewIncarnationOnceAnyNodeLa
 		t.Errorf("the reinstatement kept the incarnation (%q -> %q)", old, cur)
 	}
 }
+
+// Fix round 2: a re-create that arrives by the WAL retires only the tokens
+// whose stamp is not the new incarnation. The new account's own token, heard
+// before the re-create or in its entry, survives with no anti-entropy; the
+// old account's token and an unstamped one are retired.
+func TestTokenIncarnation_AReplicatedRecreateKeepsTheNewAccountsEarlyToken(t *testing.T) {
+	for _, order := range []string{"token entry before the re-create", "token in the re-create's entry, ahead of it"} {
+		t.Run(order, func(t *testing.T) {
+			ctx := context.Background()
+			c := newTestDB(t)
+			c.SetUserIncarnationGate(func() bool { return true })
+			if err := InsertUser(ctx, c, "carol", "operator", "h"); err != nil {
+				t.Fatal(err)
+			}
+			old := userCreatedAt(t, c, "carol")
+			if err := InsertToken(ctx, c, TokenRecord{ID: "t-old", Username: "carol", Name: "n", TokenHash: mustBcrypt(t, tokRawA)}); err != nil {
+				t.Fatal(err)
+			}
+			const now = "2026-12-31T00:00:00Z"
+			if _, err := c.db.Exec(`INSERT INTO tokens (id, username, name, token_hash, created_at, updated_at) VALUES ('t-unstamped', 'carol', 'n', 'x', ?, ?)`, now, now); err != nil {
+				t.Fatal(err)
+			}
+			const inc = "2999-01-01T00:00:00.5Z"
+			early := []Statement{
+				{SQL: tokensInsertIncarnationSQL, Params: []interface{}{"t-new", "carol", "n", mustBcrypt(t, tokRawB), nil, "", now, "2999-01-01T00:00:01.000000001Z", inc}},
+				{SQL: tokenCredentialUpsertSQL, Params: []interface{}{"t-new", mustBcrypt(t, tokRawB), "2999-01-01T00:00:01.000000001Z"}},
+			}
+			del := Statement{SQL: usersTombstoneIncarnationSQL, Params: []interface{}{"2999-01-01T00:00:00Z", "2999-01-01T00:00:00.1Z", "carol", old}}
+			recreate := Statement{SQL: usersReactivateIncarnationSQL, Params: []interface{}{"operator", "h2", inc, "2999-01-01T00:00:00.6Z", "carol"}}
+			if order == "token entry before the re-create" {
+				applyRemote(t, c, "2999000000001-0000-peer", early...)
+				applyRemote(t, c, "2999000000002-0000-peer", del)
+				applyRemote(t, c, "2999000000003-0000-peer", recreate)
+			} else {
+				applyRemote(t, c, "2999000000001-0000-peer", del)
+				applyRemote(t, c, "2999000000002-0000-peer", append(append([]Statement{}, early...), recreate)...)
+			}
+			if got := userCreatedAt(t, c, "carol"); got != inc {
+				t.Fatalf("carol is %q after the re-create, want %q", got, inc)
+			}
+			if u, err := ValidateToken(ctx, c, tokRawB); err != nil || u == nil || u.TokenID != "t-new" {
+				t.Errorf("the new carol's early token was dropped: %+v, %v", u, err)
+			}
+			for _, id := range []string{"t-old", "t-unstamped"} {
+				if rows, _ := c.Query(ctx, `SELECT id FROM tokens WHERE id = ? AND deleted_at IS NULL`, id); len(rows) != 0 {
+					t.Errorf("%s is still live after the re-create", id)
+				}
+			}
+		})
+	}
+}

@@ -728,7 +728,8 @@ func validateUserIncarnationEntry(stmts []Statement) error {
 //   - a row that grants (a credential, a recovery code or its active set, an
 //     enrollment code, a directory binding, a role binding — bindings are
 //     union-only, so losing one never widens access — an API token, a
-//     session) goes only while LIVE.
+//     session) goes only while LIVE. An API token stamped with the new
+//     incarnation is the new account's own, and stays.
 //     Its tombstone stays: dropped, an older live row of the same key could
 //     land under it and grant again (a consumed code, an unbound identity);
 //   - a row that restricts (a second factor or its active set, a lifecycle
@@ -755,8 +756,6 @@ func retireOlderIncarnationRows(ctx context.Context, tx *sql.Tx, username, incar
 		`DELETE FROM recovery_code_sets WHERE username = ? AND deleted_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
 		`DELETE FROM user_enrollment_codes WHERE username = ? AND deleted_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
 		`DELETE FROM user_identity_bindings WHERE username = ? AND deleted_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
-		`DELETE FROM token_credentials WHERE token_id IN (SELECT id FROM tokens WHERE username = ? AND deleted_at IS NULL) -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
-		`DELETE FROM tokens WHERE username = ? AND deleted_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
 		`DELETE FROM sessions WHERE username = ? AND revoked_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
 		// Restrictions: tombstones only.
 		`DELETE FROM user_2fa WHERE username = ? AND deleted_at IS NOT NULL -- full-state-delete-ok: an older incarnation's lifted restriction, replaced by a re-create`,
@@ -764,6 +763,18 @@ func retireOlderIncarnationRows(ctx context.Context, tx *sql.Tx, username, incar
 		`DELETE FROM user_lifecycle WHERE username = ? AND deleted_at IS NOT NULL -- full-state-delete-ok: an older incarnation's lifted restriction, replaced by a re-create`,
 	} {
 		if _, err := tx.ExecContext(ctx, q, username); err != nil {
+			return err
+		}
+	}
+	// A token says which incarnation it was issued to (token_incarnation.go):
+	// one stamped with the new incarnation is the new account's own, heard
+	// before its re-create, and stays. An unstamped one goes, as every token
+	// did before.
+	for _, q := range []string{
+		`DELETE FROM token_credentials WHERE token_id IN (SELECT id FROM tokens WHERE username = ? AND deleted_at IS NULL AND user_created_at <> ?) -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
+		`DELETE FROM tokens WHERE username = ? AND deleted_at IS NULL AND user_created_at <> ? -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, username, incarnation); err != nil {
 			return err
 		}
 	}

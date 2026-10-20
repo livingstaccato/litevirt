@@ -792,7 +792,7 @@ func TestRemoveInstalledMarker_OnlyTheRecordOfTheRevokedInstall(t *testing.T) {
 			if tc.setup != nil {
 				defer tc.setup(t, r)()
 			}
-			err := removeInstalledMarker(r, revoked)
+			err := releaseInstallRecord(r, revoked, releaseRemoved)
 			if tc.name == "an add holds the machine" && err == nil {
 				t.Error("removal while an add holds the machine reported success")
 			}
@@ -834,7 +834,7 @@ func TestRemoveInstalledMarker_ALateRemovalLeavesAReaddsRecord(t *testing.T) {
 	local := &LocalAddTarget{Root: root, PKIDir: filepath.Join(root, "etc", "litevirt", "pki")}
 	r := &deferringTarget{LocalAddTarget: local, kind: "unstage"}
 	writeMarker(t, local, "node-9 0a0a 1 aa\n")
-	_ = removeInstalledMarker(r, "0a0a")
+	_ = releaseInstallRecord(r, "0a0a", releaseRemoved)
 	if len(r.deferred) == 0 {
 		t.Fatal("the removal issued no command")
 	}

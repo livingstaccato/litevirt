@@ -185,12 +185,17 @@ staged file, record or install record for `<name>`, and no add may hold the
 machine; a machine that serves the serial may be a completed add, so only the
 serial's staged files are removed and nothing is revoked. The command then
 claims the machine (`/etc/litevirt/.lv-add-installed`, compared with what it
-checked), revokes the serial, publishes the CRL, and removes that serial's
-staged files, records and install record, never the installed identity. A
+checked, the record it replaces kept beside it), revokes the serial,
+publishes the CRL, removes that serial's staged files and records, and puts
+the install record back as it was: another admission's install keeps its
+name and time, and so the hour in which it keeps a fresh add out. Only the
+serial's own add's claim is removed, and never the installed identity. A
 step that fails after the revocation, the publication or the cleanup, says so
 and names the same command, which finishes it. `lv host rm <name>` of a
 joining host whose cleanup on the machine fails does the same. Install and
-attempt records quote a host name that holds a blank. A rerun refuses when the key staged or installed
+attempt records quote a host name that holds a blank, and with no row the
+command takes such a name when it prints safely; the machine's trace must
+name it exactly before anything is revoked. A rerun refuses when the key staged or installed
 on the machine is not the admitted certificate's. The machine running
 `lv host add` keeps its copy of the admitted credentials in
 `hosts/<name>/` under its pki directory.

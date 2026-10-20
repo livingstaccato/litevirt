@@ -497,6 +497,12 @@ func addStagedTargets() []string {
 // Serials are unique to the CA, so another machine at a reused address never
 // matches, and nothing there is touched.
 func removeStagedPair(r addRemote, serial string) error {
+	return removeStaged(r, serial, releaseRemoved)
+}
+
+// removeStaged is removeStagedPair, its install record released as how says
+// (releaseInstallRecord).
+func removeStaged(r addRemote, serial string, how releaseMode) error {
 	serial = canonSerial(serial)
 	if serial == "" {
 		return fmt.Errorf("not a certificate serial")
@@ -504,7 +510,7 @@ func removeStagedPair(r addRemote, serial string) error {
 	if err := removeStagedFiles(r, serial); err != nil {
 		return err
 	}
-	if err := removeInstalledMarker(r, serial); err != nil {
+	if err := releaseInstallRecord(r, serial, how); err != nil {
 		return err
 	}
 	return removeLegacyStagedPair(r, serial)
@@ -532,36 +538,138 @@ func removeStagedFiles(r addRemote, serial string) error {
 	return err
 }
 
-// afterMarkerRead is a test seam: it runs between removeInstalledMarker's
-// read of the record and its removal.
+// afterMarkerRead is a test seam: it runs between releaseInstallRecord's
+// read of the record and its change.
 var afterMarkerRead func()
 
-// removeInstalledMarker removes the machine's record of an install of the
-// revoked admission (addInstalledMarker), which no longer holds the machine
-// for it. The check and the removal are one command, run under the add lock
-// by the shell that holds it, and remove the record only while it is
-// exactly the one read: a record a later add wrote, even after this command
-// was delayed past its connection, is never removed.
-func removeInstalledMarker(r addRemote, serial string) error {
+// settlePriorPath is where settleAbsentAdmission's claim of the machine keeps
+// the install record it replaced ("" when there was none), so that the record
+// is put back as it was, its admission and time with it: an install younger
+// than freshInstall keeps a fresh add out by that record.
+func settlePriorPath(serial string) string {
+	return addInstalledMarker + ".settle-" + serial
+}
+
+// namesSerial reports whether the install record line is of serial, in any
+// spelling.
+func namesSerial(line, serial string) bool {
+	f := markerFields(line)
+	return len(f) >= 3 && canonSerial(f[1]) != "" && canonSerial(f[1]) == canonSerial(serial)
+}
+
+// isClaimOf reports whether the install record line is a claim of serial's
+// add, not an install.
+func isClaimOf(line, serial string) bool {
+	f := markerFields(line)
+	return namesSerial(line, serial) && len(f) >= 5 && f[4] == "installing"
+}
+
+// releaseMode is what releaseInstallRecord leaves of a record of the serial.
+type releaseMode int
+
+const (
+	// releaseRemoved: the serial's admission is revoked and its row removed;
+	// a record of it goes.
+	releaseRemoved releaseMode = iota
+	// releaseSettled: the serial is revoked with no row (a settle); only its
+	// add's claim goes, and an install record of it stays.
+	releaseSettled
+	// releaseUndo: the settle revoked nothing; the record its claim replaced
+	// is put back exactly.
+	releaseUndo
+)
+
+// fileIs is the shell test that the file at path holds content (without
+// its trailing newline; "" also for no file).
+func fileIs(r addRemote, path, content string) string {
+	return fmt.Sprintf("[ \"$(cat -- %s 2>/dev/null)\" = %s ]", ssh.ShellQuote(r.Path(path)), ssh.ShellQuote(content))
+}
+
+// writeSyncedCmd writes content to path as setMarkerCmd writes the record:
+// synced, renamed into place, its directory synced.
+func writeSyncedCmd(r addRemote, path, content, nonce string) string {
+	p := ssh.ShellQuote(r.Path(path))
+	tmp := ssh.ShellQuote(r.Path(path) + ".new-" + nonce)
+	return fmt.Sprintf("umask 077; printf '%%s' %s > %s && sync -- %s && mv -fT -- %s %s && sync -- %s",
+		ssh.ShellQuote(content), tmp, tmp, tmp, p, ssh.ShellQuote(filepath.Dir(r.Path(path))))
+}
+
+// releaseInstallRecord takes the admission serial, which this removal
+// revoked (or, with releaseUndo, did not), off the machine's install record
+// (addInstalledMarker), under the add lock and only while the record, and
+// what a settle's claim kept of the one it replaced (settlePriorPath), are
+// exactly as read: a record a later add wrote is never changed.
+//
+// Where a settle's claim replaced a record, that record is put back as it
+// was, another admission's install with its time, unless it was the serial's
+// own add's claim (releaseUndo puts back even that). Otherwise a record of
+// the serial goes as how says.
+func releaseInstallRecord(r addRemote, serial string, how releaseMode) error {
 	b, ok, err := r.ReadFile(addInstalledMarker)
-	if err != nil || !ok {
+	if err != nil {
 		return err
 	}
 	line := strings.TrimRight(string(b), "\n")
-	if f := markerFields(line); len(f) < 3 || canonSerial(f[1]) != canonSerial(serial) {
+	kb, kept, err := r.ReadFile(settlePriorPath(serial))
+	if err != nil {
+		return err
+	}
+	prior := strings.TrimRight(string(kb), "\n")
+	cond := markerAbsent(r)
+	if ok {
+		cond = markerIs(r, line)
+	}
+	side := ssh.ShellQuote(r.Path(settlePriorPath(serial)))
+	dropSide := fmt.Sprintf("rm -f -- %s && sync -- %s", side, ssh.ShellQuote(filepath.Dir(r.Path(addInstalledMarker))))
+	if ok && !namesSerial(line, serial) {
+		// Another add's record since: left, and what the claim kept is stale.
+		if kept {
+			if _, err := r.Shell("unstage", lockedCmd(r, cond, dropSide)); err != nil && exitStatus(err) != notOurMachine {
+				return fmt.Errorf("remove %s: %w", settlePriorPath(serial), err)
+			}
+		}
 		return nil
+	}
+	if !ok && !kept {
+		return nil
+	}
+	var put string
+	switch {
+	case kept && how == releaseUndo:
+		put = prior
+	case kept && !isClaimOf(prior, serial):
+		put = prior
+	case kept:
+	case how == releaseRemoved, how == releaseSettled && isClaimOf(line, serial):
+	default:
+		return nil // an install record of a settled serial: it stays
+	}
+	body := "{ " + setMarkerCmd(r, put, nonceOr(serial)) + "; }"
+	if kept {
+		cond += " && " + fileIs(r, settlePriorPath(serial), prior)
+		body += " && " + dropSide
 	}
 	if afterMarkerRead != nil {
 		afterMarkerRead()
 	}
-	_, err = r.Shell("unstage", lockedCmd(r, markerIs(r, line), removeCmd(r, []string{addInstalledMarker})))
+	_, err = r.Shell("unstage", lockedCmd(r, cond, body))
 	if exitStatus(err) == notOurMachine {
 		return nil // another add's record since: left
 	}
 	if err != nil {
-		return fmt.Errorf("remove the record %s of the removed admission's install: %w", addInstalledMarker, err)
+		return fmt.Errorf("put back the record %s of the machine's install in place of the removed admission's: %w",
+			addInstalledMarker, err)
 	}
 	return nil
+}
+
+// nonceOr is a fresh attempt nonce, or serial when none can be made (it only
+// names a temporary file).
+func nonceOr(serial string) string {
+	if n, err := attemptNonce(); err == nil {
+		return n
+	}
+	return serial
 }
 
 // HostRemoveAdmission is `lv host rm <host> --serial <serial> [--address <ip>]`:
@@ -604,9 +712,12 @@ func HostRemoveAdmission(ctx context.Context, c pb.LiteVirtClient, hostName, ser
 		}
 		return hostRemove(ctx, c, hostName, force, holder.GetCertSerial())
 	}
-	// With no row to check the name against, only a name the CLI takes.
-	if !validHostName(hostName) {
-		return fmt.Errorf("%q is not a host name (letters, digits, '_', '.', '-'); nothing was revoked", hostName)
+	// With no row to check the name against: a name that prints safely, which
+	// the machine's trace must name exactly (settleTrace) before anything is
+	// revoked. One the CLI would not take otherwise (a blank, say) is an
+	// existing host's that an add recorded, and printed commands quote it.
+	if !settleName(hostName) {
+		return fmt.Errorf("%q is not a host name an add could have recorded; nothing was revoked", hostName)
 	}
 	if address == "" {
 		return fmt.Errorf("no host row holds certificate %s; pass --address with the machine its add was run "+
@@ -657,6 +768,11 @@ func settleAbsentAdmission(ctx context.Context, c pb.LiteVirtClient, hostName, s
 			return err
 		}
 		if err := revokeHostCert(PKIDir(), hostName, serial); err != nil {
+			// Nothing was revoked: the record the claim replaced goes back.
+			if uerr := releaseInstallRecord(r, serial, releaseUndo); uerr != nil {
+				return fmt.Errorf("%w; putting back the machine's install record failed too (%v), and %s keeps it. "+
+					"Run `%s` once the revocation can be made", err, uerr, settlePriorPath(serial), again)
+			}
 			return err
 		}
 	}
@@ -666,12 +782,13 @@ func settleAbsentAdmission(ctx context.Context, c pb.LiteVirtClient, hostName, s
 			"claimed against adds for %s. Run `%s` to publish it and finish", serial,
 			filepath.Join(PKIDir(), "crl.pem"), err, address, staleClaim, again)
 	}
-	if err := removeStagedPair(r, serial); err != nil {
+	if err := removeStaged(r, serial, releaseSettled); err != nil {
 		return fmt.Errorf("certificate %s is revoked and CRL %d published, but removing what its adds left on %s "+
 			"failed (%v). Run `%s` to finish it", serial, version, address, err, again)
 	}
 	fmt.Printf("Revoked certificate %s in CRL %d; no host row holds it, and none was removed.\n", serial, version)
-	fmt.Printf("  removed its adds' staged files and records on %s; the machine's installed identity is as it was\n", address)
+	fmt.Printf("  removed its adds' staged files and records on %s; the machine's installed identity and its "+
+		"install record are as they were\n", address)
 	return nil
 }
 
@@ -740,10 +857,14 @@ func claimForSettle(r addRemote, hostName, serial, address string) error {
 	if ok {
 		prior = strings.TrimRight(string(b), "\n")
 	}
+	sb, kept, err := r.ReadFile(settlePriorPath(serial))
+	if err != nil {
+		return err
+	}
 	f := markerFields(prior)
 	if len(f) >= 5 && f[4] == "installing" {
 		at, _ := strconv.ParseInt(f[2], 10, 64)
-		if time.Since(time.Unix(at, 0)) < staleClaim {
+		if addNow().Sub(time.Unix(at, 0)) < staleClaim {
 			return fmt.Errorf("an `lv host add` holds the machine at %s (claimed less than %s ago); nothing was revoked. "+
 				"Run this again once it has finished", address, staleClaim)
 		}
@@ -774,8 +895,20 @@ func claimForSettle(r addRemote, hostName, serial, address string) error {
 		sum := sha256.Sum256(pemB)
 		cond += fmt.Sprintf(" && [ \"$(sha256sum < %s | cut -d' ' -f1)\" = %s ]", q, hex.EncodeToString(sum[:]))
 	}
-	mine := markerLine(hostName, serial, time.Now().Unix(), nonce, "installing")
-	_, err = r.Shell("claim", lockedCmd(r, cond, setMarkerCmd(r, mine, nonce)))
+	// The record the claim replaces is kept (settlePriorPath) and put back
+	// once the serial is settled. One an earlier claim of this serial
+	// replaced is kept already: the record now is that claim, or none.
+	body := "{ " + setMarkerCmd(r, settleClaimLine(hostName, serial, nonce), nonce) + "; }"
+	if kept && (!ok || namesSerial(prior, serial)) {
+		cond += " && " + fileIs(r, settlePriorPath(serial), strings.TrimRight(string(sb), "\n"))
+	} else {
+		keep := ""
+		if prior != "" {
+			keep = prior + "\n"
+		}
+		body = "{ " + writeSyncedCmd(r, settlePriorPath(serial), keep, nonce) + "; } && " + body
+	}
+	_, err = r.Shell("claim", lockedCmd(r, cond, body))
 	if exitStatus(err) == notOurMachine {
 		return fmt.Errorf("the machine at %s changed while it was checked; nothing was revoked. Run `%s` again",
 			address, settleRmCmd(hostName, serial, address))
@@ -784,6 +917,17 @@ func claimForSettle(r addRemote, hostName, serial, address string) error {
 		return fmt.Errorf("claim the machine at %s before revoking: %w; nothing was revoked", address, err)
 	}
 	return nil
+}
+
+// settleClaimLine is a settle's claim of the machine for serial.
+func settleClaimLine(hostName, serial, nonce string) string {
+	return markerLine(hostName, serial, addNow().Unix(), nonce, "installing")
+}
+
+// settleName reports whether hostName may be settled with no row to check it
+// against: printable (printableName) and not taken for a flag.
+func settleName(hostName string) bool {
+	return printableName(hostName) && !strings.HasPrefix(hostName, "-")
 }
 
 // settleTrace reports whether the machine holds a trace of serial's add for

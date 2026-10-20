@@ -485,8 +485,9 @@ removal's checks and a pull and confirms no live row holds the serial; the
 machine at --address must hold a trace of it for <host>, no add may hold the
 machine, and a machine serving it may be a completed add (only its staged
 files go, nothing is revoked). Under the machine's add lock it is claimed,
-then the serial is revoked, the CRL published, and its adds' staged files and
-records removed, never the installed identity. A step that fails names this
+then the serial is revoked, the CRL published, its adds' staged files and
+records removed, and the install record the claim replaced put back as it
+was, never the installed identity. A step that fails names this
 same command, which finishes it. 'lv host add' names this command when it
 refuses a machine it cannot prove is its own to install on.
 

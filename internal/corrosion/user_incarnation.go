@@ -755,53 +755,164 @@ func retireOlderIncarnationRows(ctx context.Context, tx *sql.Tx, username, incar
 	return retireLaggingLifts(ctx, tx, username, incarnation)
 }
 
-// retireLaggingLifts drops the live lifecycle rows under the name that read
-// as no restriction at all — an enable, no expiry — and were written after
-// the new incarnation was made. Dropping one changes nothing this node reads
-// (no row is enabled and unexpiring), but its later clock would otherwise beat
-// the new account's own disable or expiry here, and then on every node by
-// anti-entropy. It is the fallback for a lagging write this node no longer
-// has a record of (a restart): the records (settleUserName, user_holds.go)
-// take away the lagging writes it does know of, an extension or a factor
-// included. A row that restricts is never dropped here: a new account's own
-// restriction can reach this node ahead of its re-create.
-func retireLaggingLifts(ctx context.Context, tx *sql.Tx, username, incarnation string) error {
-	if incarnation == "" {
+// retireLaggingLifts drops, durably, what a deleted account's lagging writes
+// left under the name once this node holds the newer incarnation inc. It
+// reads only the rows themselves, so a restart or a long partition does not
+// change its answer:
+//
+//   - a second factor or its active set whose epoch is tagged with an older
+//     incarnation (userEpochTag): a lagging re-enrolment of the deleted
+//     account. The new account's own factor carries its own incarnation, so
+//     one that reached this node first — over the WAL or the sensitive lane —
+//     is kept. An untagged epoch predates the latch; a live row of one
+//     written after inc can only be a lagging write, and goes by clock;
+//   - an enable or an expiry change tagged as written to an older incarnation
+//     while it was live, after inc was made (userLifecycleTag): a lagging
+//     lift, whose later clock would beat the new account's own disable or
+//     expiry. One written before inc stays: it is the state a deleted account
+//     hands on (DeleteUser keeps the lifecycle; t1-auth-review m3), and the
+//     new account's own writes come after it. A row written to the deleted
+//     name (a re-create's reset) is the successor's, and stays;
+//   - an untagged enable or no-expiry written after inc, which reads as no
+//     restriction at all (the fallback for a row from before the latch).
+//
+// A restriction — a disable, a cut-off — is never dropped here: whoever it
+// was written for, losing it would loosen the account.
+func retireLaggingLifts(ctx context.Context, tx *sql.Tx, username, inc string) error {
+	if inc == "" {
 		return nil
 	}
-	type lift struct{ table, key, ts string }
-	var lifts []lift
-	for _, q := range []struct{ table, sql string }{
-		{"user_lifecycle", `SELECT attribute, updated_at FROM user_lifecycle WHERE username = ? AND deleted_at IS NULL AND (attribute = 'disabled' AND value <> 'true' OR attribute = 'expires_at' AND value = '')`},
-	} {
-		rows, err := tx.QueryContext(ctx, q.sql, username)
+	after := func(ts string) bool { return lwwOrder(inc, ts) < 0 }
+	older := func(tag string) bool { return tag != inc && !incarnationAfter(tag, inc) }
+	type row struct{ a, b, c, ts string }
+	collect := func(q string, keep func(r row) bool) ([]row, error) {
+		rows, err := tx.QueryContext(ctx, q, username)
 		if err != nil {
-			return err
+			return nil, err
 		}
+		defer rows.Close()
+		var out []row
 		for rows.Next() {
-			var key, ts string
-			if err := rows.Scan(&key, &ts); err != nil {
-				rows.Close()
-				return err
+			var r row
+			if err := rows.Scan(&r.a, &r.b, &r.c, &r.ts); err != nil {
+				return nil, err
 			}
-			if lwwOrder(incarnation, ts) < 0 {
-				lifts = append(lifts, lift{q.table, key, ts})
+			if !keep(r) {
+				out = append(out, r)
 			}
 		}
-		if err := rows.Close(); err != nil {
+		return out, rows.Err()
+	}
+	epochKeeps := func(epoch, ts string) bool {
+		if tag, ok := userEpochTag(epoch); ok {
+			return !older(tag)
+		}
+		return !after(ts)
+	}
+	factors, err := collect(`SELECT method, COALESCE(label, ''), epoch, updated_at FROM user_2fa WHERE username = ? AND deleted_at IS NULL`,
+		func(r row) bool { return epochKeeps(r.c, r.ts) })
+	if err != nil {
+		return err
+	}
+	sets, err := collect(`SELECT '', '', active_epoch, updated_at FROM user_2fa_sets WHERE username = ? AND deleted_at IS NULL`,
+		func(r row) bool { return epochKeeps(r.c, r.ts) })
+	if err != nil {
+		return err
+	}
+	lifts, err := collect(`SELECT attribute, value, set_by, updated_at FROM user_lifecycle WHERE username = ? AND deleted_at IS NULL AND (attribute = 'disabled' AND value <> 'true' OR attribute = 'expires_at')`,
+		func(r row) bool {
+			if !after(r.ts) {
+				return true
+			}
+			if kind, tag, ok := userLifecycleTag(r.c); ok {
+				return kind != userTagLive || !older(tag)
+			}
+			// Untagged: only a lift that reads as no restriction at all.
+			return !(r.a == UserAttrDisabled || r.b == "")
+		})
+	if err != nil {
+		return err
+	}
+	for _, r := range factors {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM user_2fa WHERE username = ? AND method = ? AND COALESCE(label, '') = ? AND updated_at = ? -- full-state-delete-ok: a deleted account's lagging factor, replaced by a re-create`, username, r.a, r.b, r.ts); err != nil {
 			return err
 		}
 	}
-	for _, l := range lifts {
-		var err error
-		switch l.table {
-		case "user_lifecycle":
-			_, err = tx.ExecContext(ctx, `DELETE FROM user_lifecycle WHERE username = ? AND attribute = ? AND updated_at = ? -- full-state-delete-ok: a deleted account's lagging lift, replaced by a re-create`, username, l.key, l.ts)
-		}
-		if err != nil {
+	for _, r := range sets {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM user_2fa_sets WHERE username = ? AND updated_at = ? -- full-state-delete-ok: a deleted account's lagging factor set, replaced by a re-create`, username, r.ts); err != nil {
 			return err
 		}
 	}
+	for _, r := range lifts {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM user_lifecycle WHERE username = ? AND attribute = ? AND updated_at = ? -- full-state-delete-ok: a deleted account's lagging lift, replaced by a re-create`, username, r.a, r.ts); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// A second factor's epoch, and a lifecycle row's set_by, carry the
+// incarnation they were written for once user_incarnation_v1 has latched. It
+// rides in values every build already stores and only ever compares for
+// equality (the epoch) or never reads (set_by), so it needs no new column and
+// no new statement shape, and survives a restart and anti-entropy with the
+// row (retireLaggingLifts).
+const (
+	userEpochTagSep     = "~"
+	userLifecycleTagSep = "\x1f"
+	userTagLive         = "inc"
+	userTagDeleted      = "after"
+)
+
+// userEpochTag is the incarnation an epoch was minted for, if it carries one.
+func userEpochTag(epoch string) (string, bool) {
+	_, tag, ok := strings.Cut(epoch, userEpochTagSep)
+	return tag, ok && tag != ""
+}
+
+// userLifecycleTag is how a lifecycle row was written: to the incarnation
+// while it was live (userTagLive), or to it deleted (userTagDeleted, as a
+// re-create's reset is), if its set_by carries one.
+func userLifecycleTag(setBy string) (kind, inc string, ok bool) {
+	i := strings.LastIndex(setBy, userLifecycleTagSep)
+	if i < 0 {
+		return "", "", false
+	}
+	kind, inc, ok = strings.Cut(setBy[i+len(userLifecycleTagSep):], ":")
+	return kind, inc, ok && inc != "" && (kind == userTagLive || kind == userTagDeleted)
+}
+
+// tagUserLifecycle tags, on the local write path, a lifecycle upsert's
+// set_by with the account's incarnation as its users row stands just before
+// the statement runs (userLifecycleTag). A name with no row is left as it is.
+func tagUserLifecycle(ctx context.Context, tx *sql.Tx, s *Statement) error {
+	if len(s.Params) < 5 || !strings.Contains(s.SQL, "user_lifecycle") {
+		return nil
+	}
+	sh, _, err := parseResolved(s.SQL)
+	if err != nil || stmtFingerprint(sh) != fpUserLifecycleUpsert {
+		return nil
+	}
+	setBy := coerceString(s.Params[3])
+	if _, _, ok := userLifecycleTag(setBy); ok {
+		return nil
+	}
+	var created string
+	var deleted sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT created_at, deleted_at FROM users WHERE username = ?`, coerceString(s.Params[0])).Scan(&created, &deleted)
+	if errors.Is(err, sql.ErrNoRows) || err == nil && created == "" {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	kind := userTagLive
+	if deleted.Valid && deleted.String != "" {
+		kind = userTagDeleted
+	}
+	params := append([]interface{}(nil), s.Params...)
+	params[3] = setBy + userLifecycleTagSep + kind + ":" + created
+	s.Params = params
 	return nil
 }
 

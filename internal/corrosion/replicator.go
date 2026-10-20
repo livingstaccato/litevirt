@@ -1560,7 +1560,18 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 			if gerr != nil {
 				return fmt.Errorf("apply mutation (origin=%s seq=%d): mutation guard: %w", entry.Origin, entry.Seq, gerr)
 			}
-			if v == userVerdictSkip || v == userVerdictAhead && s.Guard.ResourceKind != userGuardTighten {
+			// The writer judged a tightening against its own value; one that
+			// would loosen what this node holds (an expiry later than the one
+			// here) waits for its incarnation like a lift.
+			waits := v == userVerdictAhead && s.Guard.ResourceKind != userGuardTighten
+			if v == userVerdictAhead && s.Guard.ResourceKind == userGuardTighten {
+				loosens, lerr := loosensHere(ctx, tx, s)
+				if lerr != nil {
+					return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, lerr)
+				}
+				waits = loosens
+			}
+			if v == userVerdictSkip || waits {
 				refusedIncarnation[i] = true
 				held := []Statement{s}
 				if j, ok := tokenCredentialOf(stmts, i); ok {

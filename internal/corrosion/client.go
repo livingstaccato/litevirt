@@ -1553,6 +1553,13 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 					return false, fmt.Errorf("stamp user incarnation: %w", err)
 				}
 			}
+			if c.UserIncarnationOn() {
+				if err := tagUserLifecycle(ctx, tx, &s); err != nil {
+					tx.Rollback()
+					c.mu.Unlock()
+					return false, fmt.Errorf("tag user lifecycle: %w", err)
+				}
+			}
 			if s.Guard != nil {
 				matches, err := c.mutationGuardMatches(ctx, tx, s.Guard)
 				if err != nil {
@@ -1823,6 +1830,13 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 				tx.Rollback()
 				c.mu.Unlock()
 				return 0, fmt.Errorf("stamp user incarnation: %w", err)
+			}
+		}
+		if c.UserIncarnationOn() {
+			if err := tagUserLifecycle(ctx, tx, &s); err != nil {
+				tx.Rollback()
+				c.mu.Unlock()
+				return 0, fmt.Errorf("tag user lifecycle: %w", err)
 			}
 		}
 		if err := c.checkOwnUserGuard(ctx, tx, s); err != nil {

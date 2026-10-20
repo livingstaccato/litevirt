@@ -1422,7 +1422,7 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 
 	// A users row that moved settles what is held or recorded for its name
 	// (user_holds.go).
-	if table.Name == "users" && merged > 0 && c.UserIncarnationOn() && !c.userHolds.empty() {
+	if table.Name == "users" && merged > 0 && c.UserIncarnationOn() {
 		idx := columnIndexMap(table.Columns)
 		for _, row := range rows {
 			if len(row) != len(table.Columns) {

@@ -25,18 +25,19 @@ import (
 //     create does:
 //   - a write that tightens (userGuardTighten: a second factor, its active
 //     set, a disable, an earlier expiry, a later cut-off) applies at once,
-//     so the account never reads as less restricted than it is. It is
-//     recorded with the incarnation it was for (userTightenRecord), and if
-//     the name then reaches a newer incarnation than that here, the row is
-//     taken away again: it never attaches to a later re-created account;
+//     so the account never reads as less restricted than it is. A factor's
+//     epoch and a lifecycle row's set_by name the incarnation it was for, so
+//     if the name then reaches a newer one here, a factor or a lift is taken
+//     away again (retireLaggingLifts): it never attaches to a later
+//     re-created account;
 //   - any other write (a grant, a lift) is held in memory and replayed when
 //     the name reaches its incarnation here, or dropped when it reaches a
 //     newer one (userHeldWrite).
 //
-// The same records also hold the restriction-table writes this node applies
-// for the incarnation it holds (its own included), so a lagging node's write
-// to an account deleted elsewhere is taken away when the re-create reaches it
-// (settleUserName) — whatever its clock, and whether it tightens or lifts.
+// A lagging node's own writes to an account deleted elsewhere are taken away
+// when the re-create reaches it by retireLaggingLifts, which judges from the
+// rows alone (their incarnation tags), so a restart does not change it. The
+// records only tell newerKnown that a newer incarnation has been heard of.
 //
 // Both are memory only, bounded and aged out. Losing them (a restart, an
 // overflow) is fail-closed: a held grant is missing until anti-entropy
@@ -98,6 +99,8 @@ func (h *userHolds) expireLocked() {
 		for _, w := range list {
 			if now.Sub(w.at) < userHeldTTL {
 				kept = append(kept, w)
+			} else {
+				warnHeldDropped(name, w, "its account's create or re-create did not reach this node in time")
 			}
 		}
 		h.count -= len(list) - len(kept)
@@ -156,6 +159,11 @@ func (h *userHolds) evictOldestLocked() {
 		return
 	}
 	if held {
+		for _, w := range h.held[name] {
+			if w.seq == seq {
+				warnHeldDropped(name, w, "the hold is full")
+			}
+		}
 		h.removeHeldLocked(name, map[uint64]bool{seq: true})
 	} else {
 		h.removeRecordsLocked(name, map[uint64]bool{seq: true})
@@ -375,32 +383,12 @@ func userRowUpdatedAt(ctx context.Context, tx *sql.Tx, table string, pk []interf
 	return ts, true
 }
 
-// dropRecordedRow deletes a recorded row, only while it is still the write
-// that was recorded.
-func dropRecordedRow(ctx context.Context, tx *sql.Tx, r userTightenRecord) error {
-	args := append(append([]interface{}(nil), r.pk...), r.updatedAt)
-	var err error
-	switch {
-	case r.table == "user_2fa" && len(r.pk) == 3:
-		_, err = tx.ExecContext(ctx, `DELETE FROM user_2fa WHERE username = ? AND method = ? AND label = ? AND updated_at = ? -- full-state-delete-ok: written for an incarnation of the name that this node has since replaced`, args...)
-	case r.table == "user_2fa_sets" && len(r.pk) == 1:
-		_, err = tx.ExecContext(ctx, `DELETE FROM user_2fa_sets WHERE username = ? AND updated_at = ? -- full-state-delete-ok: written for an incarnation of the name that this node has since replaced`, args...)
-	case r.table == "user_lifecycle" && len(r.pk) == 2:
-		_, err = tx.ExecContext(ctx, `DELETE FROM user_lifecycle WHERE username = ? AND attribute = ? AND updated_at = ? -- full-state-delete-ok: written for an incarnation of the name that this node has since replaced`, args...)
-	}
-	return err
-}
-
 // settleUserName runs, inside tx, once the users row of name may have moved:
 // held writes for the incarnation it now holds are replayed, those for an
 // older one dropped; restriction rows recorded for an older incarnation are
 // taken away. onCommit runs its argument once tx commits.
 func (c *Client) settleUserName(ctx context.Context, tx *sql.Tx, name string, onCommit func(func())) error {
-	if name == "" || c.userHolds.empty() {
-		return nil
-	}
-	held, records := c.userHolds.snapshot(name)
-	if len(held) == 0 && len(records) == 0 {
+	if name == "" || !c.UserIncarnationOn() {
 		return nil
 	}
 	var local string
@@ -411,12 +399,20 @@ func (c *Client) settleUserName(ctx context.Context, tx *sql.Tx, name string, on
 	if err != nil {
 		return err
 	}
+	// What a deleted account's lagging writes left here goes, judged by the
+	// rows alone, so the answer survives a restart (retireLaggingLifts).
+	if err := retireLaggingLifts(ctx, tx, name, local); err != nil {
+		return err
+	}
+	held, records := c.userHolds.snapshot(name)
+	if len(held) == 0 && len(records) == 0 {
+		return nil
+	}
+	// A record only says a newer incarnation has been heard of (newerKnown);
+	// one this node has reached is done with.
 	doneRecords := map[uint64]bool{}
 	for _, r := range records {
-		if incarnationAfter(local, r.inc) {
-			if err := dropRecordedRow(ctx, tx, r); err != nil {
-				return err
-			}
+		if !incarnationAfter(r.inc, local) {
 			doneRecords[r.seq] = true
 		}
 	}
@@ -506,3 +502,32 @@ var (
 	fpTokensInsert          = mustFingerprint(tokensInsertSQL)
 	fpTokenCredentialUpsert = mustFingerprint(tokenCredentialUpsertSQL)
 )
+
+// loosensHere reports whether a lifecycle tightening, judged by its writer
+// against the writer's value, would loosen the value this node holds.
+func loosensHere(ctx context.Context, tx *sql.Tx, s Statement) (bool, error) {
+	if len(s.Params) < 3 || !strings.Contains(s.SQL, "user_lifecycle") {
+		return false, nil
+	}
+	sh, _, err := parseResolved(s.SQL)
+	if err != nil || stmtFingerprint(sh) != fpUserLifecycleUpsert {
+		return false, nil
+	}
+	tightens, err := statementTightensHere(ctx, tx, s)
+	return !tightens, err
+}
+
+// warnHeldDropped says that a held grant or lift is given up: until
+// anti-entropy brings it (a login session never: it is WAL-only), the account
+// lacks it on this node.
+func warnHeldDropped(name string, w userHeldWrite, why string) {
+	table := ""
+	if len(w.stmts) > 0 {
+		if sh, _, err := parseResolved(w.stmts[0].SQL); err == nil {
+			table = sh.Table
+		}
+	}
+	slog.Warn("corrosion: gave up a user write held for an account this node has not reached; "+
+		"anti-entropy repairs it, except a login session, which needs a new login",
+		"user", name, "table", table, "incarnation", w.guard.Incarnation, "reason", why)
+}

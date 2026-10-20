@@ -422,6 +422,18 @@ func InsertUser2FA(ctx context.Context, c *Client, r User2FARecord) error {
 		if err != nil {
 			return err
 		}
+		// Once user_incarnation_v1 has latched the epoch names the account's
+		// incarnation, so a factor enrolled for an account since deleted is
+		// told apart from the new account's own (retireLaggingLifts).
+		if c.UserIncarnationOn() {
+			rows, err := c.Query(ctx, `SELECT created_at FROM users WHERE username = ?`, r.Username)
+			if err != nil {
+				return err
+			}
+			if len(rows) > 0 && rows[0].String("created_at") != "" {
+				epoch += userEpochTagSep + rows[0].String("created_at")
+			}
+		}
 		stmts = append(stmts, Statement{SQL: user2FASetUpsertSQL, Params: []interface{}{r.Username, epoch, now}})
 	}
 	stmts = append(stmts, Statement{SQL: user2FAUpsertSQL,

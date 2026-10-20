@@ -12,13 +12,18 @@ import (
 )
 
 // An account write the account moved under is Aborted, which a caller may
-// retry; any other failure stays Internal (re-review 2, M3).
+// retry; a write granting several accounts at once is FailedPrecondition; any
+// other failure stays Internal (re-review 2, M3; re-review 3, M1).
 //
-// Mutation: userWriteStatus always Internal — red.
+// Mutations: userWriteStatus always Internal — red; ErrUserMultiAccountGrant
+// unmapped — red.
 func TestUserWriteStatus_AccountChangedIsAborted(t *testing.T) {
 	moved := fmt.Errorf("exec batch: %w", corrosion.ErrUserAccountChanged)
 	if got := status.Code(userWriteStatus(moved, "create user")); got != codes.Aborted {
 		t.Errorf("account changed: code %v, want Aborted", got)
+	}
+	if got := status.Code(userWriteStatus(corrosion.ErrUserMultiAccountGrant, "insert binding")); got != codes.FailedPrecondition {
+		t.Errorf("multi-account grant: code %v, want FailedPrecondition", got)
 	}
 	if got := status.Code(userWriteStatus(errors.New("disk full"), "create user")); got != codes.Internal {
 		t.Errorf("other failure: code %v, want Internal", got)

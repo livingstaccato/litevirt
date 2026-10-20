@@ -11,6 +11,7 @@ import (
 // implemented control handlers. New semantic handlers add their own typed
 // schema here and extend the one reducer; they never inherit generic success.
 type Assignment struct {
+	Execution     *ExecutionAssignment     `json:"execution,omitempty"`
 	KeyTransition *KeyTransitionAssignment `json:"key_transition,omitempty"`
 	Ownership     *OwnershipAssignment     `json:"ownership,omitempty"`
 	Binding       *BindingAssignment       `json:"binding,omitempty"`
@@ -57,6 +58,13 @@ func decodeFieldsObject(b []byte, out any, fields ...string) error {
 // ValidateSupportedCommand is shared by pre-slot admission and the direct
 // acceptor gate. It is structural capability validation, not a second reducer.
 func ValidateSupportedCommand(c Command) error {
+	if executionKind(c.Kind) {
+		if _, err := DecodeExecutionBody(c); err != nil {
+			return err
+		}
+		_, err := CanonicalCommand(c)
+		return err
+	}
 	if c.Kind == "adopt_resource" || c.Kind == "transfer_owner" {
 		if _, err := DecodeOwnershipBody(c); err != nil {
 			return err
@@ -101,6 +109,9 @@ func ValidateSupportedCommand(c Command) error {
 func DecodeAssignment(d Decision) (Assignment, error) {
 	var a Assignment
 	fields := []string{"version", "cluster_uid", "operation_id", "recorded_at"}
+	if d.Command.Kind == "claim_executor" {
+		fields = append(fields, "execution")
+	}
 	if keyTransitionKind(d.Command.Kind) {
 		fields = append(fields, "key_transition")
 	}
@@ -136,6 +147,9 @@ func ValidateSupportedDecision(d Decision) error {
 	a, err := DecodeAssignment(d)
 	if err != nil {
 		return err
+	}
+	if executionKind(d.Command.Kind) {
+		return validateExecutionAssignment(d, a)
 	}
 	if keyTransitionKind(d.Command.Kind) {
 		return validateKeyTransition(d, a)

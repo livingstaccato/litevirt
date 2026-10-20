@@ -374,8 +374,10 @@ func TestFleet_StorageMigrationRefusalNamesTheRealCAFingerprints(t *testing.T) {
 	src, dst := c.Nodes[0], c.Nodes[1]
 	migrationTLSReady(src, true)
 	migrationTLSReady(dst, true)
-	migrationCAs(src, "digest-of-two", "6cee35be", "5eda7fef")
-	migrationCAs(dst, "digest-of-one", "6cee35be")
+	// Real-shaped fingerprints: the source drops anything else the target sends.
+	fpA, fpB := strings.Repeat("6c", 32), strings.Repeat("5e", 32)
+	migrationCAs(src, "digest-of-two", fpA, fpB)
+	migrationCAs(dst, "digest-of-one", fpA)
 
 	path := filepath.Join(c.tmpRoot, dst.Name, "data", "disks", "pp1-root.qcow2")
 	storageMigrationVM(t, src, path, 1<<30)
@@ -384,7 +386,7 @@ func TestFleet_StorageMigrationRefusalNamesTheRealCAFingerprints(t *testing.T) {
 		t.Fatalf("migration = %v; want refused", err)
 	}
 	msg := err.Error()
-	for _, want := range []string{src.Name + ": 6cee35be, 5eda7fef", dst.Name + ": 6cee35be"} {
+	for _, want := range []string{src.Name + ": " + fpA + ", " + fpB, dst.Name + ": " + fpA} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("refusal %q does not list %q", msg, want)
 		}

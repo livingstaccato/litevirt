@@ -1050,6 +1050,28 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			Error: detail,
 		}
 	}
+	if stopped == liveUnanswered {
+		// Where the guest runs is not known. The lease stays until the guest
+		// is seen running here, so a daemon that dies asking keeps it, as a
+		// killed process would.
+		leaseHeld = false
+		if st, serr := s.sourceDomainState(vm.Name); serr != nil || st != "running" {
+			// It may run on the target: the row stays migrating on this host,
+			// the lease and the target's copy with it, and nothing here
+			// starts or moves it.
+			detail := fmt.Sprintf("%s, and %s is not running on %s (%v): it may run on %s, "+
+				"so its record is left migrating and nothing is started or moved (watch `lv events %s`)",
+				why, vm.Name, s.hostName, lerr, target.Name, vm.Name)
+			slog.Warn("drain: the live move ended without libvirt's answer and the guest is not running here; its record is left migrating",
+				"vm", vm.Name, "target", target.Name, "state", st, "state_error", serr)
+			s.recordVMEvent(context.WithoutCancel(ctx), vm.Name, "vm.migrated", "error", "drain: "+detail)
+			return &pb.DrainProgress{
+				VmName: vm.Name, TargetHost: target.Name, Status: "failed", Strategy: pb.MigrateStrategy_MIGRATE_LIVE,
+				Error: detail,
+			}
+		}
+		leaseHeld = true
+	}
 	if lerr == nil {
 		// libvirt cut over: the only copy runs on the target. What follows runs
 		// detached from the drain's request — a client that went away (Ctrl-C)

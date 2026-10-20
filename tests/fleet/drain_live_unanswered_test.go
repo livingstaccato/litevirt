@@ -19,6 +19,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
 // unansweredMove is the text of grpcapi's errLibvirtCallUnanswered.
@@ -66,6 +67,36 @@ func liveDrainWithin(t *testing.T, sc *stuckLiveDrain, d time.Duration) (*pb.Dra
 		os.Exit(3)
 		return nil, nil
 	}
+}
+
+// landThenEnd makes src's libvirt land slow on dst, as a completed move
+// leaves it (gone from src, running on dst), and then end the migration
+// call's goroutine without returning; with kill, src's daemon dies first.
+// ended is closed as the goroutine ends.
+func landThenEnd(t *testing.T, sc *stuckLiveDrain, kill bool) (ended <-chan struct{}) {
+	end := make(chan struct{})
+	sc.src.Virt.FailMigrateToTarget = nil
+	sc.src.Virt.OnMigrateToTarget = func(name, _ string, p lv.MigrateParams) error {
+		if name != "slow" {
+			return nil
+		}
+		x := p.DestXML
+		if x == "" {
+			var err error
+			if x, err = sc.src.Virt.DumpXML(name); err != nil {
+				return err
+			}
+		}
+		sc.dst.Virt.LandMigratedState(x, p.Paused)
+		cutOver(t, sc)
+		if kill {
+			sc.src.Virt.KillDaemon()
+		}
+		close(end)
+		runtime.Goexit()
+		return nil
+	}
+	return end
 }
 
 // The drain's live move ends without libvirt's answer: the drain is told so,
@@ -145,6 +176,85 @@ func TestFleet_BackgroundDrainMoveWhoseCallEndsUnansweredSettlesOnTheSource(t *t
 	if sc.dst.Virt.DomainExists("slow") {
 		t.Fatal("slow is defined on the target")
 	}
+}
+
+// libvirt lands the guest on the target, and the drain's call then ends
+// without an answer. The guest is not running on the source, so where it
+// runs is not known to the drain: the row stays migrating on the source and
+// the target keeps its reservation. A row written error on the source would
+// let a later start make a second copy there.
+//
+// Mutation: an unanswered move taken as one that stayed — the row is written
+// error on the source, red.
+func TestFleet_DrainLiveMoveWhoseCallEndsUnansweredAfterLandingStaysMigrating(t *testing.T) {
+	if !inUnansweredChild(t, "TestFleet_DrainLiveMoveWhoseCallEndsUnansweredAfterLandingStaysMigrating") {
+		return
+	}
+	sc := newStuckLiveDrainTimeout(t, false, 0)
+	ctx := context.Background()
+	landThenEnd(t, sc, false)
+	p, err := liveDrainWithin(t, sc, 15*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "slow") {
+		t.Fatalf("drain = %v; want it incomplete, naming slow", err)
+	}
+	if p == nil || p.Status != "failed" || !strings.Contains(p.Error, unansweredMove) ||
+		!strings.Contains(p.Error, "migrating") {
+		t.Fatalf("frame for slow = %+v; want failed, naming the unanswered call and the row left migrating", p)
+	}
+	row, err := corrosion.GetVM(ctx, sc.src.DB, "slow")
+	if err != nil || row == nil || row.HostName != sc.src.Name || row.State != "migrating" {
+		t.Fatalf("VM row = %+v (err %v); want migrating on %s", row, err, sc.src.Name)
+	}
+	if cpu, _, err := corrosion.HostReserved(ctx, sc.dst.DB, sc.dst.Name); err != nil || cpu < 1 {
+		t.Fatalf("the target reserves %d vCPU (err %v) while it may run slow; want the move's 1", cpu, err)
+	}
+	if _, err := sc.c.SelfClient(sc.src).StartVM(ctx, &pb.StartVMRequest{Name: "slow"}); err == nil {
+		t.Fatal("a start of slow on the source was accepted while it may run on the target")
+	}
+	if sc.src.Virt.DomainExists("slow") {
+		t.Fatal("slow is defined on the source again: a second copy")
+	}
+	if st, _ := sc.dst.Virt.DomainState("slow"); st != "running" {
+		t.Fatalf("target domain state = %q, want running", st)
+	}
+}
+
+// As above, with the source's daemon killed before its call ends: the
+// drain's goroutine ends at its next libvirt call, as a killed process
+// would, and like one it does not release the target's reservation.
+//
+// Mutation: the lease's release left armed while the source is asked — the
+// dead daemon's drain releases it, red.
+func TestFleet_ADeadDaemonsUnansweredDrainMoveKeepsTheTargetReservation(t *testing.T) {
+	if !inUnansweredChild(t, "TestFleet_ADeadDaemonsUnansweredDrainMoveKeepsTheTargetReservation") {
+		return
+	}
+	sc := newStuckLiveDrainTimeout(t, false, 0)
+	ctx := context.Background()
+	ended := landThenEnd(t, sc, true)
+	go func() { _, _ = sc.drain(t) }() // never ends: its daemon died
+	select {
+	case <-ended:
+	case <-time.After(15 * time.Second):
+		fmt.Fprintln(os.Stderr, "the live move never reached libvirt")
+		os.Exit(4)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cpu, _, err := corrosion.HostReserved(ctx, sc.dst.DB, sc.dst.Name); err != nil || cpu < 1 {
+			fmt.Fprintf(os.Stderr, "RELEASED: the target reserves %d vCPU (err %v) after the source's daemon died; want the move's 1\n", cpu, err)
+			os.Exit(4)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if sc.src.Virt.DaemonGate() != "dead" {
+		fmt.Fprintln(os.Stderr, "the source's daemon is not dead")
+		os.Exit(4)
+	}
+	// The drain's goroutine is gone, and the cluster's teardown would wait
+	// on its request: the child ends here.
+	fmt.Fprintln(os.Stderr, "RESERVATION-KEPT")
+	os.Exit(0)
 }
 
 // A panic in the drain's libvirt call answers nothing: it crashes the

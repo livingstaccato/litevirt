@@ -678,3 +678,39 @@ func TestHostRemoveSerial_AnUnfinishedSettleKeepsNoStaleInstallFromBeingReplaced
 		t.Error("want S revoked and node-x not")
 	}
 }
+
+// Round-4 review m2, an earlier build's claim of the settle's own serial:
+// within staleClaim of it, that settle's own command refused it as "an
+// `lv host add` holds the machine". It is no add's (its copy is beside it):
+// the command takes it, revokes, and puts node-x's record back.
+//
+// Mutation: read every fresh claim as an add's — the command refuses.
+func TestHostRemoveSerial_AnEarlierBuildsFreshSettleClaimIsNoAdds(t *testing.T) {
+	t0 := time.Unix(1_800_000_000, 0)
+	fixAddClock(t, t0)
+	f, serials, x, rec := strandedMachine(t, []string{"node-9"}, t0.Add(-5*time.Minute))
+	S := serials[0]
+	writeMarker(t, f.target, markerLine("node-9", S, t0.Add(-time.Minute).Unix(), "aaaaaaaaaaaa", "installing")+"\n")
+	if err := os.WriteFile(f.target.Path(settlePriorPath(S)), []byte(rec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var r addRemote = f.target
+	down := false
+	dialTo(t, &r, &down)
+	c := &serialRemoveClient{hostRemoveTestClient: &hostRemoveTestClient{}}
+	if err := HostRemoveAdmission(context.Background(), c, "node-9", S, "10.0.0.9", false); err != nil {
+		t.Fatalf("the settle's command under its earlier build's claim: %v", err)
+	}
+	(&settleMachine{f: f, serial: S}).recordIs(t, rec)
+	if !serialInCRL(t, f.opPKI, S) || serialInCRL(t, f.opPKI, x) {
+		t.Error("want S revoked and node-x not")
+	}
+	// A fresh claim of an add is still refused.
+	f2, s2, _, _ := strandedMachine(t, []string{"node-9"}, t0.Add(-5*time.Minute))
+	writeMarker(t, f2.target, markerLine("node-9", s2[0], t0.Add(-time.Minute).Unix(), "aaaaaaaaaaaa", "installing")+"\n")
+	r = f2.target
+	if err := HostRemoveAdmission(context.Background(), c, "node-9", s2[0], "10.0.0.9", false); err == nil ||
+		!strings.Contains(err.Error(), "holds the machine") {
+		t.Errorf("settle under an add's fresh claim = %v, want refused", err)
+	}
+}

@@ -181,6 +181,8 @@ func releaseGenerations(dsn string) {
 type hookedConnector struct {
 	driver.Connector
 	gens *tableGenerations
+	// sever, when set (a test client's), refuses each commit while it is on.
+	sever *writeSever
 }
 
 func (h hookedConnector) Connect(ctx context.Context) (driver.Conn, error) {
@@ -194,21 +196,39 @@ func (h hookedConnector) Connect(ctx context.Context) (driver.Conn, error) {
 		return conn, nil
 	}
 	gens := h.gens
+	if h.sever == nil {
+		hr.RegisterPreUpdateHook(func(d sqlite.SQLitePreUpdateData) {
+			gens.bump(d.TableName)
+		})
+		return conn, nil
+	}
+	// A test client's connection: its sever also sees each row it changes
+	// and decides each commit (write_sever.go).
+	sc := h.sever.conn()
 	hr.RegisterPreUpdateHook(func(d sqlite.SQLitePreUpdateData) {
 		gens.bump(d.TableName)
+		sc.staged()
 	})
+	hr.RegisterCommitHook(sc.commit)
+	hr.RegisterRollbackHook(sc.rollback)
 	return conn, nil
 }
 
 // openHookedDB opens dsn with every pooled connection reporting its row
 // changes to the database's generations.
 func openHookedDB(dsn string) (*sql.DB, *tableGenerations, error) {
+	return openHookedDBSevered(dsn, nil)
+}
+
+// openHookedDBSevered is openHookedDB whose connections also ask sever
+// before each commit (nil: they do not).
+func openHookedDBSevered(dsn string, sever *writeSever) (*sql.DB, *tableGenerations, error) {
 	base, err := sqlite.NewConnector(dsn)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	gens := acquireGenerations(dsn)
-	db := sql.OpenDB(hookedConnector{Connector: base, gens: gens})
+	db := sql.OpenDB(hookedConnector{Connector: base, gens: gens, sever: sever})
 	sizeConnPool(db)
 	return db, gens, nil
 }

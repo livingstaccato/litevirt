@@ -115,6 +115,7 @@ type LinkStats struct {
 	Blocked    int // replication RPCs of any kind refused by Block
 	HeldFailed int // held batches whose late delivery the handler refused
 	Pings      int // Ping calls that reached the injector (an owner probe is one)
+	Passed     int // RPCs of any kind a fault on the link let past BlockAll
 }
 
 // heldPush is a batch the Reorder fault is sitting on.
@@ -202,6 +203,16 @@ func (c *Cluster) ClearLinkFaults() {
 	}
 }
 
+// LinkFaultOf is the fault set on from→to (the zero value when none is).
+func (c *Cluster) LinkFaultOf(from, to *Node) LinkFault {
+	to.faults.mu.Lock()
+	defer to.faults.mu.Unlock()
+	if ls := to.faults.links[from.Name]; ls != nil {
+		return ls.fault
+	}
+	return LinkFault{}
+}
+
 // LinkStats reports what the injector has done on from→to so far.
 func (c *Cluster) LinkStats(from, to *Node) LinkStats {
 	to.faults.mu.Lock()
@@ -260,7 +271,11 @@ func (n *Node) allBlocked(caller string) bool {
 	n.faults.mu.Lock()
 	defer n.faults.mu.Unlock()
 	ls := n.faults.links[caller]
-	if ls == nil || !ls.fault.BlockAll {
+	if ls == nil {
+		return false
+	}
+	if !ls.fault.BlockAll {
+		ls.stats.Passed++
 		return false
 	}
 	ls.stats.Blocked++

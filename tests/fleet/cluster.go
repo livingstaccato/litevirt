@@ -954,6 +954,9 @@ func (c *Cluster) crossRegisterHosts() {
 }
 
 func (c *Cluster) buildServer(n *Node) {
+	// Every goroutine this server's daemon starts carries its generation
+	// (server_labels.go).
+	defer n.labelServerGoroutines()()
 	dataDir := filepath.Join(c.tmpRoot, n.Name, "data")
 	if c.opts.SharedDataDir {
 		dataDir = filepath.Join(c.tmpRoot, "shared-data")
@@ -1215,13 +1218,23 @@ func (n *Node) blocked(fullMethod string, ctx context.Context) bool {
 }
 
 func (n *Node) partitionUnaryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	done, err := n.lifeAdmit(peerCertCN(ctx))
+	if err != nil {
+		return nil, err
+	}
+	defer done()
 	if n.blocked(info.FullMethod, ctx) {
 		return nil, status.Errorf(codes.Unavailable, "fleet partition: %s refused by %s", methodName(info.FullMethod), n.Name)
 	}
 	if n.answersUnimplemented(info.FullMethod) {
 		return nil, unknownMethod(info.FullMethod)
 	}
-	return handler(ctx, req)
+	resp, err := handler(ctx, req)
+	// A daemon that died while it served the call answers nothing.
+	if aerr := n.lifeAnswer(); aerr != nil {
+		return nil, aerr
+	}
+	return resp, err
 }
 
 // unknownMethod is what grpc's server answers for a method it does not have
@@ -1306,6 +1319,11 @@ func (n *Node) Reconciler() *health.Reconciler {
 }
 
 func (n *Node) partitionStreamInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	done, lerr := n.lifeAdmit(peerCertCN(ss.Context()))
+	if lerr != nil {
+		return lerr
+	}
+	defer done()
 	if n.blocked(info.FullMethod, ss.Context()) {
 		return status.Errorf(codes.Unavailable, "fleet partition: %s refused by %s", methodName(info.FullMethod), n.Name)
 	}
@@ -1316,7 +1334,10 @@ func (n *Node) partitionStreamInterceptor(srv any, ss grpc.ServerStream, info *g
 	for _, w := range watches {
 		w.Started <- ss.Context()
 	}
-	err := handler(srv, ss)
+	err := handler(srv, lifeStream{ServerStream: ss, n: n})
+	if aerr := n.lifeAnswer(); aerr != nil {
+		err = aerr
+	}
 	for _, w := range watches {
 		w.Returned <- err
 	}

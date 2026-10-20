@@ -12,12 +12,14 @@ package fleet
 // nothing of the old one's memory.
 //
 // A daemon that dies mid-move is modelled by stopping its move inside a
-// libvirt call that never returns (fwliveRestartFreeze): the old process's
-// goroutine is frozen there for good, as a killed process is, and writes
-// nothing after; its gRPC server is then replaced. Where a crash point has no
-// libvirt call to stop in, the scenario stops the move one call later and
-// writes back the marker the source wrote at that point (fwliveRestartAt):
-// the durable record a crash there leaves, with nothing else changed.
+// libvirt call (fwliveRestartFreeze) and killing the daemon there
+// (fwliveCrash, fwlive_crash_test.go): everything it could reach is severed,
+// its goroutine ends inside the call, which never returns, and nothing it
+// does after reaches libvirt, the database, its files or a peer; its gRPC
+// server is then replaced. Where a crash point has no libvirt call to stop
+// in, the scenario stops the move one call later and writes back the marker
+// the source wrote at that point (fwliveRestartAt): the durable record a
+// crash there leaves, with nothing else changed.
 //
 // The scene's one-copy watcher (fwliveOneCopy, fwlive_scene_test.go) checks
 // the invariant every scenario keeps: at no moment do both hosts run the
@@ -83,28 +85,22 @@ func fwliveRestartRecovered(n *Node) {
 	n.Server.FirmwareMoveRecoveryOnce(context.Background())
 }
 
-// fwliveRestartNever is never closed: a killed daemon's goroutine waits on it
-// for good, as a killed process never resumes, so it writes nothing after its
-// death. Its server is replaced (or, on a failed test, stopped outright by
-// fwliveSetup's cleanup before the cluster stops), so nothing waits on it.
-var fwliveRestartNever = make(chan struct{})
-
-// fwliveRestartFreeze makes src's next migration of fwlive1 stop inside
-// libvirt for good, as the source daemon dying there leaves it: crash runs
-// first (what libvirt had done by then; it may land the guest on dst), the
-// returned channel is closed, and the call never returns. The frozen
-// goroutine belongs to the old daemon, which the scenario then replaces.
-func fwliveRestartFreeze(t *testing.T, src, dst *Node, crash func(name string, p lv.MigrateParams)) <-chan struct{} {
-	reached := make(chan struct{})
+// fwliveRestartFreeze makes src's next migration of fwlive1 the source
+// daemon's death inside libvirt: crash runs first (what libvirt had done by
+// then; it may land the guest on dst), then the call stops at the returned
+// crash point, which the scenario kills (die); the call never returns. The
+// move's handler is tracked, so die waits for it too.
+func fwliveRestartFreeze(t *testing.T, c *Cluster, src *Node, crash func(name string, p lv.MigrateParams)) *fwliveCrash {
+	k := fwliveNewCrash(t, c, src)
+	k.trackMove()
 	src.Virt.OnMigrateToTarget = func(name, _ string, p lv.MigrateParams) error {
 		if crash != nil {
 			crash(name, p)
 		}
-		close(reached)
-		<-fwliveRestartNever // the daemon died here: nothing after this runs
-		return errors.New("the daemon died in this call")
+		k.freeze() // the daemon dies here: nothing after this runs
+		return errors.New("unreachable: the daemon died in this call")
 	}
-	return reached
+	return k
 }
 
 // fwliveRestartLand lands the migration on dst and leaves the source shut off
@@ -170,22 +166,22 @@ var fwliveRestartStoppedHere = status.Error(codes.Unavailable, "the daemon was r
 func fwliveRestartCleanupCrash(t *testing.T, c *Cluster, src, dst *Node, beforeDeath func()) fwmig.Marker {
 	t.Helper()
 	src.LandMigrationsOn(dst)
-	reached := make(chan struct{})
+	k := fwliveNewCrash(t, c, src)
+	k.trackMove()
 	var once atomic.Bool
 	src.Virt.FailUndefinePreserv = func(name string) error {
 		if name == fwwVM && once.CompareAndSwap(false, true) {
-			close(reached)
-			<-fwliveRestartNever // the daemon died here
-			return errors.New("the daemon died in this call")
+			k.freeze() // the daemon dies here
+			return errors.New("unreachable: the daemon died in this call")
 		}
 		return nil
 	}
 	done := fwliveMigrate(t, c, src, dst)
-	fwliveRestartReach(t, reached, done, "the source cleanup's undefine")
+	fwliveRestartReach(t, k.reached, done, "the source cleanup's undefine")
 	if beforeDeath != nil {
 		beforeDeath()
 	}
-	fwliveRestartDown(src)
+	k.die(true)
 	m, ok := fwliveMarker(t, src)
 	if !ok || m.Phase != fwmig.PhaseCleaning {
 		t.Fatalf("marker %+v (present %v), want cleaning", m, ok)
@@ -211,11 +207,11 @@ func fwliveRestartCrashMigrating(t *testing.T, c *Cluster, src, dst *Node, crash
 
 func fwliveRestartCrashMigratingReq(t *testing.T, c *Cluster, src, dst *Node, crash func(string, lv.MigrateParams), req *pb.MigrateVMRequest) fwmig.Marker {
 	t.Helper()
-	reached := fwliveRestartFreeze(t, src, dst, crash)
+	k := fwliveRestartFreeze(t, c, src, crash)
 	done := fwliveMigrateReq(t, c, src, req)
-	fwliveRestartReach(t, reached, done, "the migration call")
+	fwliveRestartReach(t, k.reached, done, "the migration call")
 	src.LandMigrationsOn(dst)
-	fwliveRestartDown(src)
+	k.die(true)
 	m, ok := fwliveMarker(t, src)
 	if !ok || m.Phase != fwmig.PhaseMigrating {
 		t.Fatalf("the source died in the migration call with marker %+v (present %v), want migrating", m, ok)
@@ -741,13 +737,13 @@ func TestFleet_FwLiveRestart_F6b_HeldTargetShutOffAfterVerify(t *testing.T) {
 	}
 }
 
-// fwliveRestartKillAfterResume freezes dst's daemon the moment its Release
-// has resumed the held guest, before the hold is updated (§6.6 step 5 then
-// 6), as a daemon killed there leaves it. killed is closed then; the
-// caller restarts the daemon. crash runs first, in the old daemon's last
-// moment (a host crash).
-func fwliveRestartKillAfterResume(t *testing.T, w *fwliveOneCopy, dst *Node, crash func()) <-chan struct{} {
-	killed := make(chan struct{})
+// fwliveRestartKillAfterResume stops dst's daemon the moment its Release has
+// resumed the held guest, before the hold is updated (§6.6 step 5 then 6),
+// at the returned crash point: the caller kills the daemon there (die) and
+// starts it again. crash runs first, in the old daemon's last moment (a host
+// crash).
+func fwliveRestartKillAfterResume(t *testing.T, c *Cluster, w *fwliveOneCopy, dst *Node, crash func()) *fwliveCrash {
+	k := fwliveNewCrash(t, c, dst)
 	var once atomic.Bool
 	w.onRunning(dst, func(name string) {
 		if name != fwwVM || !once.CompareAndSwap(false, true) {
@@ -756,10 +752,9 @@ func fwliveRestartKillAfterResume(t *testing.T, w *fwliveOneCopy, dst *Node, cra
 		if crash != nil {
 			crash()
 		}
-		close(killed)
-		<-fwliveRestartNever // the daemon died here
+		k.freeze() // the daemon dies here
 	})
-	return killed
+	return k
 }
 
 // F-6c. The target daemon is killed right after Release resumed the held
@@ -774,13 +769,14 @@ func fwliveRestartKillAfterResume(t *testing.T, w *fwliveOneCopy, dst *Node, cra
 func TestFleet_FwLiveRestart_F6c_TargetKilledAfterResume(t *testing.T) {
 	c, src, dst, w := fwliveCluster(t)
 	src.LandMigrationsOn(dst)
-	killed := fwliveRestartKillAfterResume(t, w, dst, nil)
+	k := fwliveRestartKillAfterResume(t, c, w, dst, nil)
 	done := fwliveMigrate(t, c, src, dst)
-	fwliveRestartReach(t, killed, done, "the target's resume")
+	fwliveRestartReach(t, k.reached, done, "the target's resume")
 	if h, ok := fwliveHold(t, dst); !ok || h.State != fwmig.HoldResuming {
 		t.Errorf("%s's hold %+v (present %v) when its daemon died, want resuming", dst.Name, h.State, ok)
 	}
-	fwliveRestartDaemon(t, c, dst)
+	k.die(true)
+	fwliveRestartUp(t, c, dst)
 	if err := fwliveWait(t, done); err != nil {
 		t.Fatalf("the move after the target's restart: %v", err)
 	}
@@ -833,9 +829,9 @@ func TestFleet_FwLiveRestart_F6d_ResumeFailsThenTargetCrashes(t *testing.T) {
 	t.Run("target_crash_after_resume", func(t *testing.T) {
 		c, src, dst, w := fwliveCluster(t)
 		final := fwliveRestartFinalNvram(src, dst)
-		killed := fwliveRestartKillAfterResume(t, w, dst, func() { dst.Virt.ShutOffDomain(fwwVM, "crashed") })
+		k := fwliveRestartKillAfterResume(t, c, w, dst, func() { dst.Virt.ShutOffDomain(fwwVM, "crashed") })
 		done := fwliveMigrate(t, c, src, dst)
-		fwliveRestartReach(t, killed, done, "the target's resume")
+		fwliveRestartReach(t, k.reached, done, "the target's resume")
 		// The guest ran: its NVRAM is T1 (the source's final, written on
 		// resume), not the T0 Prepare materialised.
 		ran, _ := fwliveFile(dst.FW.NvramPath(fwwVM))
@@ -844,7 +840,8 @@ func TestFleet_FwLiveRestart_F6d_ResumeFailsThenTargetCrashes(t *testing.T) {
 		}
 		permall, _ := fwliveFile(fwlivePermall(dst))
 		rowBefore := fwliveRow(t, src)
-		fwliveRestartDaemon(t, c, dst)
+		k.die(true)
+		fwliveRestartUp(t, c, dst)
 		err := fwliveWait(t, done)
 		if err == nil {
 			t.Fatal("the move succeeded over a guest that ran before the crash")

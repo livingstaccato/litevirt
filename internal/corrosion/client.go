@@ -138,6 +138,11 @@ type Client struct {
 	incarnationRefusals refusalLogLimiter
 	// ownHold is the own-row hold (own_row_hold.go).
 	ownHold ownRowHold
+
+	// writeSever refuses a test client's commits while a scenario has its
+	// process dead (FenceWritesForTests). Nil outside tests.
+	writeSever *writeSever
+
 	// dsn is what db was opened with; tableGens counts the row changes every
 	// connection of that database reports (digest_cache.go), and digests is
 	// the anti-entropy digest cache they invalidate. tableGens is nil for a

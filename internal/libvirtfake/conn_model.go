@@ -98,6 +98,7 @@ func (f *Fake) mainConn() *fakeConn {
 // SetConnRequests sets libvirtd's per-connection cap on requests in flight
 // (max_client_requests) for the state calls; 0 removes it.
 func (f *Fake) SetConnRequests(n int) {
+	defer f.daemon()()
 	f.conns.mu.Lock()
 	f.conns.requests = n
 	all := append([]*fakeConn(nil), f.conns.all...)
@@ -113,6 +114,7 @@ func (f *Fake) SetConnRequests(n int) {
 // SetStateDial sets a hook each StateReader dial runs first: an error fails
 // the dial, and the hook may block. nil removes it.
 func (f *Fake) SetStateDial(hook func() error) {
+	defer f.daemon()()
 	f.conns.mu.Lock()
 	f.conns.dialHook = hook
 	f.conns.mu.Unlock()
@@ -121,6 +123,7 @@ func (f *Fake) SetStateDial(hook func() error) {
 // MainConnCallsFor is how many modelled calls naming the domain name were
 // made on the Fake's own connection ("" counts the domain lists).
 func (f *Fake) MainConnCallsFor(name string) int {
+	defer f.daemon()()
 	f.conns.mu.Lock()
 	defer f.conns.mu.Unlock()
 	return f.conns.mainFor[name]
@@ -129,6 +132,7 @@ func (f *Fake) MainConnCallsFor(name string) int {
 // MainConnCalls is how many state calls were made on the Fake's own
 // connection.
 func (f *Fake) MainConnCalls() int {
+	defer f.daemon()()
 	f.conns.mu.Lock()
 	defer f.conns.mu.Unlock()
 	return f.conns.mainN
@@ -144,6 +148,7 @@ func (f *Fake) connRequests() int {
 // domain whose start waits on storage does, until release is called. A call
 // that waits holds its connection's slot (see SetConnRequests).
 func (f *Fake) HangDomain(name string) (release func()) {
+	defer f.daemon()()
 	ch := make(chan struct{})
 	f.conns.mu.Lock()
 	if f.conns.hung == nil {
@@ -176,6 +181,7 @@ func (f *Fake) waitHung(name string) {
 // HangCall is HangDomain for the calls of one kind only, naming name:
 // CallVNCPort or CallConsolePassword. The domain's other calls answer.
 func (f *Fake) HangCall(kind, name string) (release func()) {
+	defer f.daemon()()
 	key := kind + "\x00" + name
 	ch := make(chan struct{})
 	f.conns.mu.Lock()
@@ -235,6 +241,7 @@ func (f *Fake) waitAllHung() {
 // ConnInFlight is how many state calls are in flight on the Fake's own
 // connection.
 func (f *Fake) ConnInFlight() int {
+	defer f.daemon()()
 	c := f.mainConn()
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -252,6 +259,7 @@ func (c *fakeConn) call(name string, fn func()) error {
 // those), and kind names the call for HangCall ("" for none). A name of ""
 // waits on every hung domain (the domain list).
 func (c *fakeConn) callAs(state bool, kind, name string, fn func()) error {
+	defer c.f.daemon()()
 	if c == c.f.mainConn() {
 		c.f.conns.mu.Lock()
 		if state {
@@ -309,6 +317,7 @@ func (c *fakeConn) freeSlot() {
 // StateReader is the Fake's libvirt.StateReader (the real one), whose
 // connections are fake connections of their own (see above).
 func (f *Fake) StateReader() *libvirt.StateReader {
+	defer f.daemon()()
 	f.conns.mu.Lock()
 	defer f.conns.mu.Unlock()
 	if f.conns.reader == nil {
@@ -320,6 +329,7 @@ func (f *Fake) StateReader() *libvirt.StateReader {
 // NewStateReader is a libvirt.StateReader on fresh fake connections, with
 // its own stallAfter, for a test of the reader itself.
 func (f *Fake) NewStateReader(stallAfter time.Duration) *libvirt.StateReader {
+	defer f.daemon()()
 	f.conns.mu.Lock()
 	defer f.conns.mu.Unlock()
 	return f.newStateReaderLocked(stallAfter)
@@ -328,6 +338,7 @@ func (f *Fake) NewStateReader(stallAfter time.Duration) *libvirt.StateReader {
 // SecureStateReader is the Fake's libvirt.SecureStateReader: the real
 // StateReader on read-write fake connections of its own.
 func (f *Fake) SecureStateReader() *libvirt.StateReader {
+	defer f.daemon()()
 	f.conns.mu.Lock()
 	defer f.conns.mu.Unlock()
 	if f.conns.secure == nil {

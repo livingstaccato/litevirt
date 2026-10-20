@@ -438,38 +438,66 @@ func EnsureClusterDefaultDeny(ctx context.Context, c *Client, stack string) erro
 }
 
 // ReassertStackDefaultDeny sets the cluster default-deny, owned by the first
-// live stack (by name) whose deployed file asks for it, when the cluster has
-// no default row at all: a stack's deploy can miss a handoff from an owner
-// that went down while it was in flight. A row an operator set either way is
-// left as it is.
+// stack (by name) that asks for it (otherStackWants), when the cluster has no
+// live default row: a stack's deploy can miss a handoff from an owner that
+// went down while it was in flight, and a removal written on a replica that
+// had not yet seen the ask (a teardown's handoff, a redeploy's drop) can
+// outrank it. A live row is left as it is: a deny is its owner's, and an
+// allow is an operator's decision (`lv firewall default-deny off`).
 //
-// When the row was removed, only a stack whose record was written after the
-// removal counts: a stack's own redeploy dropping default-deny removes the
-// row before it records its new file, and the old file still in its record
-// must not bring the deny back.
+// A stack that asks gets the deny back whatever removed it and whenever: a
+// removal never outranks an ask. Its recorded intent outranks its file when
+// an Admin's redeploy drops the deny, so its old file does not ask in the
+// meantime. A stack with no recorded intent (deployed before
+// cluster_policies could be written, or by a previous release) is judged by
+// its file alone: its own redeploy dropping the deny can then get it back
+// from the old file still in its record, and once the new file is recorded
+// the deny is one nothing asks for, kept and reported (fail closed).
+//
+// No pass removes or withdraws a deny. One that nothing asks for any more
+// stays, fail closed, and is reported (UnaskedStackDeny).
 func ReassertStackDefaultDeny(ctx context.Context, c *Client, read StackFileWants) error {
-	rows, err := c.Query(ctx,
-		`SELECT updated_at, deleted_at FROM firewall_defaults WHERE scope = 'cluster'`)
-	if err != nil {
-		return err
-	}
-	removedAt := ""
-	if len(rows) > 0 {
-		if rows[0].String("deleted_at") == "" {
-			return nil // a live row, deny or allow: its owner's decision
-		}
-		removedAt = rows[0].String("updated_at")
+	cur, err := GetFirewallDefault(ctx, c, "cluster")
+	if err != nil || cur != nil {
+		return err // a live row, deny or allow: its owner's decision
 	}
 	wants, _, err := otherStackWants(ctx, c, "", read)
 	if err != nil {
 		return err
 	}
 	for _, w := range wants {
-		if w.defaultDeny && (removedAt == "" || lwwOrder(removedAt, w.updatedAt) < 0) {
+		if w.defaultDeny {
 			return SetFirewallDefault(ctx, c, "cluster", true, w.name)
 		}
 	}
 	return nil
+}
+
+// UnaskedStackDeny returns the live stack that owns the cluster default-deny
+// when nothing asks for it any more: neither that stack (its file, and the
+// intent its last deploy with sg.write recorded) nor any other stack, and
+// every stack's file can be read. "" otherwise. The deny stays; the caller
+// reports it, and an Admin turns it off (`lv firewall default-deny off`) or
+// keeps it as an operator's (`lv firewall default-deny on`).
+func UnaskedStackDeny(ctx context.Context, c *Client, read StackFileWants) (string, error) {
+	cur, err := GetFirewallDefault(ctx, c, "cluster")
+	if err != nil || cur == nil || !cur.DefaultDeny || cur.StackName == "" {
+		return "", err
+	}
+	st, err := GetStack(ctx, c, cur.StackName)
+	if err != nil || st == nil || st.State == "deleting" {
+		return "", err
+	}
+	wants, unreadable, err := otherStackWants(ctx, c, "", read)
+	if err != nil || len(unreadable) > 0 {
+		return "", err
+	}
+	for _, w := range wants {
+		if w.defaultDeny {
+			return "", nil
+		}
+	}
+	return cur.StackName, nil
 }
 
 // ── Stack teardown ───────────────────────────────────────────────────────────
@@ -517,7 +545,7 @@ func DeleteStackFirewallDefaults(ctx context.Context, c *Client, stack string, r
 		}
 		handed, err := handOff(ctx, c, stack, heirs, func(owner string) error {
 			return SetFirewallDefault(ctx, c, "cluster", true, owner)
-		})
+		}, standingDenyAsk)
 		if err != nil {
 			return err
 		}

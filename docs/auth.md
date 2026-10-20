@@ -518,7 +518,10 @@ binding can:
 - **Security groups** (`sg.write`: `lv sg create/rm/rule-add/rule-rm`) are
   cluster-global, bound to NICs by name, and checked at `/`. Admin and
   NetworkAdmin hold `sg.write`; Operator holds only `sg.read`. Binding groups to
-  a NIC (`lv sg bind`) is `network.update` on the VM's own path.
+  a NIC (`lv sg bind`) is `network.update` on the VM's own path. Cluster and
+  host rules, ip sets and default policies (`lv firewall cluster-rule`,
+  `host-rule`, `ipset` and `default-deny`) are global too, and their writes
+  need `sg.write` at `/` as well.
 - **The firewall log** (`firewall.log.view`: `lv firewall log`) is checked at
   `/`. A record names any tenant's addresses and ports, so no built-in role but
   Admin holds the verb: `*.read` does not match it (Viewer, Auditor), nor does

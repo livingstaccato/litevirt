@@ -1523,6 +1523,56 @@ with FailedPrecondition until `release_2026_11_v1` has latched, and its first
 use is recorded before the group is written. Global groups are created as
 before throughout, and every existing group stays global.
 
+### Stack firewall changes need sg.write only after the roll
+
+On this release, `lv compose down` and `lv compose up` of a stack need
+`sg.write` at `/` to remove or withdraw the stack's firewall, wherever it is:
+a host keeps a stack's security groups, ip sets, rules and default-deny when
+the teardown's caller did not hold it, and a deploy without it cannot
+withdraw what the stack's last deploy with it declared
+(`stack.firewall_teardown_held`, docs/diagnostics.md). That holds only once
+every host runs this release. A host on the previous release checks neither:
+an Operator's `lv compose down` or `lv compose up` on it changes the stack's
+firewall as before, and its stack reconciler removes the firewall it holds
+of any stack being torn down, whoever began the teardown. A stack whose last
+deploy with `sg.write` ran on the previous release has no recorded intent,
+and its file alone says what it asks for. Finish the roll before relying on
+the check; an Admin's `lv compose up` from an upgraded host records the
+intent of a stack deployed before it. During the roll, a stack torn down on a
+host still on the previous release leaves the intent its last deploy with
+`sg.write` recorded in force for the stack's name: the upgraded hosts turn
+a default-deny it asked for back on, owned by the name, a later deploy of
+that name without `sg.write` is refused, and the name raises
+`stack.firewall_teardown_held`. An Admin's `lv compose down --name <stack>`
+from an upgraded host clears it. Likewise, an Admin's `lv compose up` on a
+host still on the previous release records no intent: when it drops the
+stack's firewall or default-deny, the upgraded hosts keep the default-deny
+the recorded intent asks for and raise the condition. Run it again from an
+upgraded host.
+
+### A stack's default-deny is never removed by the reconciler
+
+On this release the stack reconciler gives the cluster default-deny back to
+a stack that asks for it whenever no default is in force, however new the
+removal, and never removes a deny on its own. Until `failover_scope_v1` has
+latched no firewall intent is recorded, and a stack's file alone says whether
+it asks: an `lv compose up` that drops `default-deny` can leave the deny on,
+owned by the stack, when a reconciler pass runs while it is recorded. The
+stack reconciler raises `stack.firewall_deny_unasked` naming the stack, and
+`lv firewall default-deny off` turns the deny off (docs/diagnostics.md).
+
+### Firewall rules, ip sets and default policies need sg.write
+
+On this release, `lv firewall cluster-rule add/rm`,
+`lv firewall host-rule add/rm`, `lv firewall ipset add/rm` and
+`lv firewall default-deny`, and the same actions in the web UI, need `sg.write` at `/` (Admin or NetworkAdmin)
+where they needed the operator role. An Operator is refused on an upgraded
+host, with the grant that lets it:
+`lv role grant NetworkAdmin <principal> --path / --propagate`. A host still on
+the previous release checks the operator role only until it is upgraded. A
+caller with no role binding of its own is unchanged: its legacy operator role
+still passes.
+
 ### A hand-deleted NetBox address is re-created after the roll
 
 A lease names its NetBox address object by id. When that object is deleted in

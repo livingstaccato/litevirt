@@ -108,7 +108,7 @@ func DeleteStackBackupRepos(ctx context.Context, c *Client, stack string, read S
 		}
 		handed, err := handOff(ctx, c, stack, heirs, func(owner string) error {
 			return UpsertBackupRepo(ctx, c, BackupRepo{Name: r.Name, Path: r.Path, StackName: owner})
-		})
+		}, nil)
 		if err != nil {
 			return err
 		}

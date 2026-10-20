@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"log/slog"
+	"sort"
 	"sync"
 )
 
@@ -22,10 +23,33 @@ type stackWants struct {
 
 // otherStackWants returns what every live stack other than stack asks for,
 // in name order, for handing a row stack owns to another stack whose file
-// asks for it too. A stack being deleted asks for nothing. unreadable names
-// the stacks whose stored file cannot be read, which may ask for anything.
+// asks for it too. A stack being deleted asks for nothing by its file.
+// unreadable names the stacks whose stored file cannot be read, which may
+// ask for anything.
+//
+// A live stack's file asks unless an intent recorded after its record says
+// otherwise.
+//
+// A stack whose standing firewall intent asks for the default-deny
+// (StackFirewallIntent) asks for it whatever its state: live, being torn
+// down, or torn down by a teardown without sg.write at the root, which a
+// node whose replica held an older file (or none of the intent) may have
+// begun. Those not live are listed after the live ones, by name, with
+// nothing else asked for.
 func otherStackWants(ctx context.Context, c *Client, stack string, read StackFileWants) (out []stackWants, unreadable []string, err error) {
 	stacks, err := ListStacks(ctx, c)
+	if err != nil {
+		return nil, nil, err
+	}
+	// A stack asks for the default-deny when its file does, or when its last
+	// deploy by a caller with sg.write at the root did (StackFirewallIntent):
+	// a deploy without it, from a node holding an older file, does not
+	// withdraw the ask.
+	intents, err := StackFirewallIntents(ctx, c)
+	if err != nil {
+		return nil, nil, err
+	}
+	stamped, err := stackFirewallIntentStamps(ctx, c)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -42,7 +66,41 @@ func otherStackWants(ctx context.Context, c *Client, stack string, read StackFil
 			unreadable = append(unreadable, st.Name)
 			continue
 		}
+		// An intent recorded after the stack's record is an Admin's later
+		// word than its file: a redeploy dropping the deny records it before
+		// it removes the row, and its old file, still in the record until
+		// the deploy ends, does not ask for the deny back. Otherwise the
+		// file asks too.
+		if in, ok := stamped[st.Name]; ok && lwwOrder(st.UpdatedAt, in.at) < 0 {
+			deny = false
+		}
+		deny = deny || intents[st.Name].DefaultDeny
 		out = append(out, stackWants{name: st.Name, updatedAt: st.UpdatedAt, defaultDeny: deny, repos: repos})
+	}
+	listed := make(map[string]bool, len(out)+len(unreadable))
+	for _, w := range out {
+		listed[w.name] = true
+	}
+	for _, n := range unreadable {
+		listed[n] = true
+	}
+	var standing []string
+	for name, in := range intents {
+		if in.DefaultDeny && name != stack && !listed[name] {
+			standing = append(standing, name)
+		}
+	}
+	sort.Strings(standing)
+	for _, name := range standing {
+		rec, err := c.Query(ctx, `SELECT updated_at FROM stacks WHERE name = ?`, name)
+		if err != nil {
+			return nil, nil, err
+		}
+		at := ""
+		if len(rec) > 0 {
+			at = rec[0].String("updated_at")
+		}
+		out = append(out, stackWants{name: name, updatedAt: at, defaultDeny: true})
 	}
 	return out, unreadable, nil
 }
@@ -53,8 +111,10 @@ func otherStackWants(ctx context.Context, c *Client, stack string, read StackFil
 // may have gone down since; it is passed over. When no heir holds it, a row
 // that was moved is set back to stack, so stack's own tombstone removes it
 // rather than leaving it with a gone owner. It reports whether an heir took
-// the row.
-func handOff(ctx context.Context, c *Client, stack string, heirs []string, set func(owner string) error) (bool, error) {
+// the row. standing, when not nil, also accepts an heir that is not live
+// (standingDenyAsk).
+func handOff(ctx context.Context, c *Client, stack string, heirs []string, set func(owner string) error,
+	standing func(context.Context, *Client, string) (bool, error)) (bool, error) {
 	moved := false
 	for _, name := range heirs {
 		if err := set(name); err != nil {
@@ -67,6 +127,13 @@ func handOff(ctx context.Context, c *Client, stack string, heirs []string, set f
 		}
 		if st != nil && st.State != "deleting" {
 			return true, nil
+		}
+		if standing != nil {
+			if ok, err := standing(ctx, c, name); err != nil {
+				return false, err
+			} else if ok {
+				return true, nil
+			}
 		}
 	}
 	if moved {
@@ -117,7 +184,16 @@ func SweepOrphanStackRows(ctx context.Context, c *Client, read StackFileWants) (
 		if err != nil {
 			return "", err
 		}
+		// A torn-down owner whose standing intent asks for the deny keeps it
+		// (stack.firewall_teardown_held names it): handing it to another
+		// such stack would hand it back on that one's pass.
+		standing := false
 		if gone {
+			if standing, err = standingDenyAsk(ctx, c, cur.StackName); err != nil {
+				return "", err
+			}
+		}
+		if gone && !standing {
 			others, _, err := otherStackWants(ctx, c, cur.StackName, read)
 			if err != nil {
 				return "", err
@@ -130,7 +206,7 @@ func SweepOrphanStackRows(ctx context.Context, c *Client, read StackFileWants) (
 			}
 			handed, err := handOff(ctx, c, cur.StackName, heirs, func(owner string) error {
 				return SetFirewallDefault(ctx, c, "cluster", true, owner)
-			})
+			}, standingDenyAsk)
 			if err != nil {
 				return "", err
 			}

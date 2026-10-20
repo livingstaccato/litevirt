@@ -60,15 +60,50 @@ node, record or not: an Admin's down is the full one, which finds networks and
 backup repos by their stack name); the CLI, the UI and the REST API (`local_only`,
 `notice`) report it as a local-only teardown, never as a complete one.
 
-Residual: a node that holds an older stack file without a firewall, and
-neither the newer file nor the rows, authorizes a non-root teardown or a
-redeploy that withdraws a deny ask. The window is replication lag right after
-an Admin deploy that adds the firewall (the deploy writes the rows before the
-record). Closing it would mean recording the stack's `compose_hash` the entry
-node authorized against in the teardown record `MarkStackDeleting` already
-writes to `cluster_policies` (`stack_teardown/<name>`, free-form JSON, no
-schema change), and having a peer's reconciler keep the firewall rows when its
-own record's hash differs. Not implemented.
+A node that holds an older stack file without a firewall, and neither the
+newer file nor the rows, still authorizes a teardown by a caller without
+`sg.write` at `/`: it sees no firewall. The teardown records whether its
+caller held `sg.write` at `/` in the record `MarkStackDeleting` writes to
+`cluster_policies` (`stack_teardown/<name>`, field `firewall`, omitted when
+false, so a previous release reads the record as before and its own record
+reads as a teardown without it). A reconciler removes a stack's firewall only
+for a teardown recorded with it. For any other teardown (a previous
+release's record, no record, or another teardown's record) a host that holds
+a firewall of the stack (a row it owns, or a stored file that declares one or
+cannot be read) keeps it, keeps the stack `deleting` and raises
+`stack.firewall_teardown_held` (diagnostics.md); its workloads and networks
+are still removed. The entry node checks again before it removes the firewall
+rows itself, since they may reach it during the teardown. A teardown that
+completes on the entry node tombstones the stack record; a host whose rows
+it never saw keeps them, and raises the same condition for the torn-down
+stack while it holds them. `lv compose down --name <stack>` by an Admin
+removes what is left, record or not.
+
+A redeploy through the same older file replaces the stack's file on every
+peer, so what a stack declares of its firewall is also recorded apart from
+the file: a deploy by a caller with `sg.write` at `/` writes
+`stack_firewall/<name>` in `cluster_policies` (whether the file declares a
+firewall, and whether it asks for the default-deny) before any row changes
+and again once the stack's record is written. A deploy or teardown without
+`sg.write` never writes it; a teardown with `sg.write` clears it, in the same
+write that marks the stack `deleting` and at that write's stamp, so an Admin
+redeploy of the name that began after the teardown is newer and stands. So
+what a stack declared stands for its name until an Admin deploys or tears it
+down: while it is being torn down, after a teardown without `sg.write`
+tombstoned it, and after a deploy without `sg.write` replaced its file. A
+first deploy writes it only once it has recorded the stack, so one that
+failed leaves none. A previous release's teardown leaves it too
+(docs/upgrades.md). A stack asks for the default-deny when its file or this
+record does, whatever the stack's state (the hand-off on teardown, the sweep
+of a torn-down owner's deny and the re-assert all read it); a deploy or
+teardown without `sg.write` counts a firewall the record declares; and a
+live stack whose file no longer declares what the record does, or a
+torn-down stack whose record declares a firewall, raises
+`stack.firewall_teardown_held`.
+
+Residual: a previous release neither checks nor records any of this, so it
+holds only once every host runs this release (docs/upgrades.md, "Stack
+firewall changes need sg.write only after the roll").
 
 `ListSecurityGroups`:
 

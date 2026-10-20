@@ -1930,6 +1930,33 @@ on` keeps it as the operator's; a stack deployed later that asks for
 default-deny takes it over. The condition resolves on the next pass after
 either.
 
+### A cluster default-deny nothing asks for (`stack.firewall_deny_unasked`)
+
+Evaluator `stack_reconciler`, subject kind `cluster`, subject `cluster`,
+severity warning. Raised by the stack reconciler when the cluster default-deny
+is owned by a live compose stack, and neither that stack's file nor the
+intent its last deploy with `sg.write` at `/` recorded asks for it, nor does
+any other stack (every stack's file can be read). For example, a reconciler
+pass gave the deny back to a stack while a deploy without it was being
+recorded, or the stack was deployed before `cluster_policies` could be
+written. No reconciler pass removes a deny on its own: one replica's view may
+miss a newer deploy that asks for it. The deny stays in force.
+`lv firewall default-deny off` turns it off and `lv firewall default-deny on`
+keeps it as the operator's; both need `sg.write` at `/`. A stack that asks
+for default-deny takes it over. The condition resolves on the next pass after
+any of them.
+
+When the cluster has no default-deny row in force and a stack asks for one
+(its file, or the intent its last deploy with `sg.write` recorded, or a torn-down
+stack's standing intent), the stack reconciler sets it again, owned by that
+stack, whatever removed it. An intent recorded after a stack's file outranks
+the file's ask: an Admin's `lv compose up` that drops the deny is not undone
+while its file is still being recorded. A stack with no recorded intent
+(deployed before `cluster_policies` could be written, or by a previous
+release) is judged by its file alone: a redeploy of it that drops the deny
+can get the deny back from the old file while it runs, and once the new file
+is recorded the deny raises this condition.
+
 ### A VM that outlived its stack's teardown (`stack.vm_outlived_stack`)
 
 Evaluator `stack_reconciler`, subject kind `vm`, subject the VM's name,
@@ -1944,6 +1971,51 @@ created and torn down. `lv rm <vm>` removes the VM; deploying the stack again
 (`lv compose up`) makes it the stack's again. The condition resolves on the
 next pass after either. A VM created after the stack was torn down is a
 deploy of that stack name in progress, and is not reported.
+
+### A stack firewall a caller could not remove (`stack.firewall_teardown_held`)
+
+Evaluator `stack_reconciler`, subject kind `stack`, subject the stack's
+name, severity warning. `lv compose down` and `lv compose up` by a caller
+without `sg.write` at `/` run only where the entry node sees no firewall for
+the stack, and that node may hold an older record of it. Raised by the stack
+reconciler on a host that holds a firewall of the stack (a security group,
+ip set, cluster or host rule or firewall default it owns, a stored file that
+declares a firewall or cannot be read, or the intent the stack's last deploy
+with `sg.write` recorded) in four cases:
+
+- the stack is `deleting` and its teardown may not remove that firewall: its
+  caller did not hold `sg.write` at `/`, or its record does not say (begun by
+  an older build, before `cluster_policies` could be written, or re-stamped
+  since). The firewall stays in force and the stack stays `deleting`; its
+  workloads and networks are still removed, and `lv compose up` of the name
+  is refused naming this condition.
+- the stack was torn down while this host holds a security group, ip set,
+  or cluster or host rule it owns, written before the teardown. They stay in
+  force. A cluster default-deny it owns is `firewall.default_deny_orphaned`.
+- the stack was torn down, and the intent its last deploy with `sg.write`
+  recorded still stands and declares a firewall: the teardown's caller did
+  not hold `sg.write` at `/`, it ran on a host still on the previous
+  release, or a deploy with `sg.write` recorded the intent after it. It
+  still counts for the name: a default-deny it asked for passes to it when
+  the stack that owns the deny goes, and stays with it, and `lv compose up`
+  of the name without `sg.write` is refused.
+- the stack is live and its file no longer declares the firewall, or the
+  default-deny, its last deploy with `sg.write` declared: a deploy that
+  recorded no intent replaced it (one without `sg.write`, or one on a host
+  still on the previous release), or that deploy failed after writing its
+  firewall and before recording its file. What the recorded deploy declared still
+  stands: the stack still asks for the default-deny, and a deploy without
+  `sg.write` is still refused. A stored file this build cannot read keeps the condition open,
+  saying whether it still declares that is unknown.
+
+An Admin finishes a teardown with `lv compose down --name <stack>`, from any
+node, record or not, and settles a live stack's firewall with `lv compose up`
+of the file it should have; `lv role grant NetworkAdmin <principal> --path /
+--propagate` lets another caller do either. The condition resolves on the
+next pass after that: a torn-down stack's rows are gone and an Admin's
+`lv compose down --name <stack>` has cleared its intent, or a live stack's
+file declares what its last deploy with `sg.write` did. A pass that cannot
+read the stacks or their intents leaves the condition as it is.
 
 ### SYN-flood condition (`firewall.synflood.unavailable`)
 

@@ -410,7 +410,7 @@ func (s *Server) SetUserAccount(ctx context.Context, req *pb.SetUserAccountReque
 			if errors.Is(err, corrosion.ErrLoginPolicyGateClosed) {
 				return status.Error(codes.FailedPrecondition, err.Error())
 			}
-			return status.Errorf(codes.Internal, "set account state: %v", err)
+			return userWriteStatus(err, "set account state")
 		}
 		return nil
 	}); err != nil {
@@ -654,7 +654,7 @@ func (s *Server) IssueEnrollmentCode(ctx context.Context, req *pb.IssueEnrollmen
 			if errors.Is(ierr, corrosion.ErrLoginPolicyGateClosed) {
 				return status.Error(codes.FailedPrecondition, ierr.Error())
 			}
-			return status.Errorf(codes.Internal, "issue enrollment code: %v", ierr)
+			return userWriteStatus(ierr, "issue enrollment code")
 		}
 		return nil
 	}); err != nil {

@@ -123,7 +123,7 @@ func (s *Server) DisableTwoFactor(ctx context.Context, req *pb.DisableTwoFactorR
 		target = u.Username
 	}
 	if err := corrosion.DeleteUser2FA(ctx, s.db, target, req.Method, req.Label); err != nil {
-		return nil, status.Errorf(codes.Internal, "delete 2fa: %v", err)
+		return nil, userWriteStatus(err, "delete 2fa")
 	}
 	slog.Info("2fa disabled", "username", target, "method", req.Method, "label", req.Label, "by", caller)
 	s.audit(ctx, "2fa.disable", target, "method="+req.Method+" label="+req.Label, "ok")

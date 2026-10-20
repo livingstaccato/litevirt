@@ -78,7 +78,7 @@ func (s *Server) ChangePassword(ctx context.Context, req *pb.ChangePasswordReque
 		return nil, status.Errorf(codes.Internal, "hash password: %v", err)
 	}
 	if err := corrosion.UpdateUserPassword(ctx, s.db, target, string(hash)); err != nil {
-		return nil, status.Errorf(codes.Internal, "update password: %v", err)
+		return nil, userWriteStatus(err, "update password")
 	}
 	detail := "by=" + caller
 	if !selfChange {

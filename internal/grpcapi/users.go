@@ -916,7 +916,7 @@ func (s *Server) CreateUser(ctx context.Context, req *pb.CreateUserRequest) (*pb
 					"the login_policy feature of %s opens here; retry shortly or create it on another node",
 				username, capabilities.ReleaseToken)
 		}
-		return nil, status.Errorf(codes.Internal, "reset account state of %q: %v", username, err)
+		return nil, userWriteStatus(err, "reset account state of %q", username)
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), auth.BcryptCost)
@@ -925,7 +925,7 @@ func (s *Server) CreateUser(ctx context.Context, req *pb.CreateUserRequest) (*pb
 	}
 
 	if err := corrosion.InsertUser(ctx, s.db, username, role, string(hash)); err != nil {
-		return nil, status.Errorf(codes.Internal, "create user: %v", err)
+		return nil, userWriteStatus(err, "create user")
 	}
 
 	slog.Info("user created", "username", username, "role", role)
@@ -1113,7 +1113,7 @@ func (s *Server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*em
 		return derr
 	})
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "delete user: %v", err)
+		return nil, userWriteStatus(err, "delete user")
 	}
 	s.kickStreams()
 	// The OtherLiveAdminExists check above and this delete are two independent
@@ -1231,7 +1231,7 @@ func (s *Server) CreateToken(ctx context.Context, req *pb.CreateTokenRequest) (*
 		ExpiresAt:  expiresAt,
 		ScopePaths: req.ScopePaths,
 	}); err != nil {
-		return nil, status.Errorf(codes.Internal, "store token: %v", err)
+		return nil, userWriteStatus(err, "store token")
 	}
 
 	slog.Info("token created", "username", req.Username, "name", req.Name, "id", id, "scopes", req.ScopePaths)

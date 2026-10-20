@@ -581,16 +581,27 @@ func (c *Client) dumpTable(table string) (syncTable, bool) {
 	return withoutUnsetIncarnation(st), true
 }
 
-// withoutUnsetIncarnation leaves projects.incarnation out of a dump while
-// every row's value is empty (schema v71): a previous-release node, which
-// does not know the column, then still takes the table's rows by
-// anti-entropy during the roll. A receiver of this build keeps its own row
-// over such a row when its own carries an incarnation (projectsDumpDecision).
+// unsetIncarnationColumns are the incarnation columns withoutUnsetIncarnation
+// leaves out of a dump while they are unset.
+var unsetIncarnationColumns = map[string]string{
+	"projects": "incarnation",
+	"tokens":   "user_created_at",
+}
+
+// withoutUnsetIncarnation leaves an incarnation column out of a dump while
+// every row's value is empty: projects.incarnation (schema v71) and
+// tokens.user_created_at (schemaVersionTokenUserIncarnation). A
+// previous-release node, which does not know the column, then still takes the
+// table's rows by anti-entropy during the roll. A receiver of this build
+// keeps its own row over such a projects row when its own carries an
+// incarnation (projectsDumpDecision), and judges such a tokens row as
+// unstamped (tokenRowDecision).
 func withoutUnsetIncarnation(st syncTable) syncTable {
-	if st.Name != "projects" {
+	col, ok := unsetIncarnationColumns[st.Name]
+	if !ok {
 		return st
 	}
-	at := indexOf(st.Columns, "incarnation")
+	at := indexOf(st.Columns, col)
 	if at < 0 {
 		return st
 	}
@@ -967,7 +978,7 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 	// The incarnation each users row of the chunk holds before the merge:
 	// only a change retires what an older one left (user_holds.go).
 	var usersBefore map[string]string
-	if table.Name == "users" && c.UserIncarnationOn() {
+	if table.Name == "users" {
 		usersBefore = map[string]string{}
 		idx := columnIndexMap(table.Columns)
 		for _, row := range rows {

@@ -422,6 +422,23 @@ func TestUserIncarnationV1Registered(t *testing.T) {
 	}
 }
 
+// TestProjectIncarnationV1Registered pins project_incarnation_v1: advertised,
+// known, mandatory and replication-gated.
+func TestProjectIncarnationV1Registered(t *testing.T) {
+	if ProjectIncarnationV1 != "project_incarnation_v1" {
+		t.Fatalf("ProjectIncarnationV1 = %q", ProjectIncarnationV1)
+	}
+	if !slices.Contains(Supported(), ProjectIncarnationV1) || !slices.Contains(All(), ProjectIncarnationV1) {
+		t.Fatal("project_incarnation_v1 must be advertised and known")
+	}
+	if !Mandatory(ProjectIncarnationV1) {
+		t.Fatal("project_incarnation_v1 must be mandatory: it states which bindings this build lets grant on a re-created project")
+	}
+	if !ReplicationGated(ProjectIncarnationV1) {
+		t.Fatal("project_incarnation_v1 must be replication-gated: every recipient must decode its statements and guard")
+	}
+}
+
 // TestNetBoxIPRepointV1Registered pins netbox_ip_repoint_v1: advertised,
 // known, mandatory (a fact about the binary — it decodes the lease re-point
 // statement) and replication-gated (that statement is a shape a

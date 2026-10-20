@@ -10,6 +10,8 @@ import (
 	"hash/fnv"
 	"sort"
 	"strings"
+
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 // D1 — project-admission authority. Project quota is a HARD admission guarantee, so
@@ -243,7 +245,7 @@ func applyReplicatedAuthorityRetire(ctx context.Context, tx *sql.Tx, params []in
 // tombstoned project — so the hourly GC that calls it does no work once clean.
 func ReconcileOrphanedProjectAuthority(ctx context.Context, c *Client) (int, error) {
 	rows, err := c.Query(ctx,
-		`SELECT DISTINCT a.project AS project, p.updated_at AS tomb_at
+		`SELECT DISTINCT a.project AS project, p.updated_at AS tomb_at, p.incarnation AS tomb_inc
 		 FROM project_authority_epochs a
 		 JOIN projects p ON p.name = a.project
 		 WHERE a.deleted_at IS NULL AND p.deleted_at IS NOT NULL AND a.project <> ?`,
@@ -263,9 +265,19 @@ func ReconcileOrphanedProjectAuthority(ctx context.Context, c *Client) (int, err
 		// Retired only while the project is STILL the tombstone this scan saw. A
 		// re-create that landed since has revived the row and may have minted a new
 		// epoch; a name-wide retirement here would retire that one.
+		// Every receiver retires only while it holds the same tombstone: a node
+		// that took a re-create of the name keeps the new project's authority,
+		// however late this node's clock stamps the retirement
+		// (project_incarnation.go).
+		var guard *MutationGuard
+		if canon, cerr := safename.CanonicalProjectName(project); cerr == nil && canon != "/" && c.ProjectIncarnationOn() {
+			guard = &MutationGuard{Protocol: projectIncarnationGuardV1, ResourceKind: projectGuardDeleted,
+				ResourceID: canon, Incarnation: r.String("tomb_inc")}
+		}
 		applied, rerr := c.ExecuteBatchGuarded(ctx, projectRowGuard(ctx, project, true, tombAt), []Statement{{
 			SQL:    retireProjectAuthoritySQL,
 			Params: []interface{}{nowRFC3339(), c.NowTS(), projectOrDefault(project)},
+			Guard:  guard,
 		}})
 		if rerr != nil {
 			return retired, fmt.Errorf("retire authority for deleted project %q: %w", project, rerr)

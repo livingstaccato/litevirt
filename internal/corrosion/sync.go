@@ -960,6 +960,28 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		}
 	}
 
+	// Likewise each projects row's incarnation (project_incarnation.go).
+	var projectsBefore map[string]string
+	if table.Name == "projects" {
+		projectsBefore = map[string]string{}
+		idx := columnIndexMap(table.Columns)
+		for _, row := range rows {
+			if len(row) != len(table.Columns) {
+				continue
+			}
+			name := cellStr(row, idx, "name")
+			if _, seen := projectsBefore[name]; seen || name == "" {
+				continue
+			}
+			inc, ierr := projectIncarnationHeld(context.Background(), tx, name)
+			if ierr != nil {
+				_ = tx.Rollback()
+				return 0, len(rows), fmt.Errorf("read project incarnation: %w", ierr)
+			}
+			projectsBefore[name] = inc
+		}
+	}
+
 	for _, row := range rows {
 		// A peer dump whose row doesn't match the declared column count is
 		// malformed/corrupt: skip it rather than index out of range below or
@@ -1456,6 +1478,17 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				func(fn func()) { c.deferAfterCommit(tx, fn) }); err != nil {
 				_ = tx.Rollback()
 				return 0, len(rows), fmt.Errorf("settle held user writes: %w", err)
+			}
+		}
+	}
+
+	// A projects row that took another incarnation retires the grants tagged
+	// with an older one (project_incarnation.go).
+	if merged > 0 && projectsBefore != nil {
+		for name, before := range projectsBefore {
+			if err := settleProjectName(context.Background(), tx, name, before); err != nil {
+				_ = tx.Rollback()
+				return 0, len(rows), fmt.Errorf("retire an older project's grants: %w", err)
 			}
 		}
 	}

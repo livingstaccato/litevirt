@@ -111,7 +111,7 @@ func (s *Server) SetProjectQuota(ctx context.Context, req *pb.SetProjectQuotaReq
 		BackupGiBLimit: int(req.Quota.BackupGibLimit),
 	}
 	if err := corrosion.UpsertProjectQuota(ctx, s.db, q); err != nil {
-		return nil, status.Errorf(codes.Internal, "upsert quota: %v", err)
+		return nil, userWriteStatus(err, "upsert quota")
 	}
 	s.audit(ctx, "project.quota.set", q.ProjectName, "", "ok")
 	return quotaToPB(&q), nil

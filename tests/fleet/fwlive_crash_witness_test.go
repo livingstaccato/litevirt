@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -314,11 +315,13 @@ func TestFleet_FwLiveCrash_ADrainThatRunsOutLeavesNoFenceOut(t *testing.T) {
 
 // fix1 I3. A database write of the daemon's is in its transaction when the
 // fence goes up; its goroutine writes a file once the write returns. The
-// write commits as it would have (the database fence tells it nothing), and
-// the file write after it finds the files fenced.
+// write commits as it would have (the database fence tells it nothing). The
+// files are fenced only once the database fence holds, after that write:
+// the file write is the living daemon's, landing before the death or
+// refused, and either way nothing changes after the death (die's check).
 //
 // On the first fix: the database fence refuses the commit at once, before
-// the files are fenced, and the goroutine's file write lands, red.
+// the files are fenced, red.
 func TestFleet_FwLiveCrash_AnAdmittedDatabaseWriteLearnsNothing(t *testing.T) {
 	ctx := context.Background()
 	c, src, dst, _ := fwliveCluster(t)
@@ -349,9 +352,6 @@ func TestFleet_FwLiveCrash_AnAdmittedDatabaseWriteLearnsNothing(t *testing.T) {
 	k.die(true)
 	if err := <-committed; err != nil {
 		t.Errorf("the admitted write learned of the fence: %v", err)
-	}
-	if _, err := os.Stat(probe); err == nil {
-		t.Error("the goroutine's file write after its database write landed")
 	}
 	fwliveRestartUp(t, c, src)
 }
@@ -479,4 +479,103 @@ func TestFleet_FwLiveCrash_ANestedLibvirtCallDoesNotStopTheDeath(t *testing.T) {
 
 	k.die(true)
 	fwliveRestartUp(t, c, src)
+}
+
+// The probes of our review of the second fix (fwlivefix-r2-review.md, I-1
+// and I-2). Each schedule races the fence it probes, so it runs several
+// times: one run in which the effect lands is a failure.
+const fwliveWitnessRuns = 8
+
+// r2 I-1. A goroutine of the daemon is in a database transaction when the
+// fence goes up; once its write returns it writes a file and, refused,
+// records its failure in the database instead. That record must not land:
+// the database is fenced before the files are, so the reaction waits at the
+// client's lock and is refused at the death.
+//
+// On the second fix: the files are fenced while the database fence's own
+// take of the lock may still be pending, and the reaction sometimes commits
+// into the state taken at the death, red.
+func TestFleet_FwLiveCrash_AReactionToTheFileFenceDoesNotReachTheDatabase(t *testing.T) {
+	for i := 0; i < fwliveWitnessRuns; i++ {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			ctx := context.Background()
+			c, src, dst, _ := fwliveCluster(t)
+			if _, err := src.DB.DB().ExecContext(ctx, `CREATE TABLE fwlive_reaction_probe (k TEXT PRIMARY KEY)`); err != nil {
+				t.Fatal(err)
+			}
+			k := fwliveRestartFreeze(t, c, src, nil)
+			done := fwliveMigrate(t, c, src, dst)
+			fwliveRestartReach(t, k.reached, done, "the migration call")
+
+			db, virt := src.DB, src.Virt
+			probe := filepath.Join(src.FW.DataDir, "fwlive-reaction-probe")
+			inTx := make(chan struct{})
+			fwliveWitnessPings(t, c, src, func() {
+				_, _ = db.ExecuteBatchGuarded(context.Background(), func(*sql.Tx) (bool, error) {
+					close(inTx)
+					fwliveWitnessUntilGate(src, "fenced")
+					time.Sleep(200 * time.Millisecond)
+					return true, nil
+				}, []corrosion.Statement{{SQL: `INSERT INTO fwlive_reaction_probe (k) VALUES ('admitted')`}})
+				if err := os.WriteFile(probe, []byte("x"), 0o600); err != nil {
+					_ = db.Execute(context.Background(), `INSERT INTO fwlive_reaction_probe (k) VALUES ('reaction')`)
+				}
+				_ = virt.DomainExists(fwwVM)
+			})
+			<-inTx
+
+			k.die(true)
+			var rows int
+			if err := src.DB.DB().QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM fwlive_reaction_probe WHERE k = 'reaction'`).Scan(&rows); err != nil || rows != 0 {
+				t.Errorf("the reaction to the file fence reached the database: %d rows (%v)", rows, err)
+			}
+			fwliveRestartUp(t, c, src)
+		})
+	}
+}
+
+// r2 I-2. A peer's call the daemon admitted while it lived is answered by
+// its handler after the death. The peer must get no answer from the dead
+// daemon: Unavailable, as from a dead process.
+//
+// On the second fix: only admission is gated, and the peer sometimes gets the
+// dead daemon's successful answer, red.
+func TestFleet_FwLiveCrash_APeerGetsNoAnswerAfterTheDeath(t *testing.T) {
+	for i := 0; i < fwliveWitnessRuns; i++ {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			c, src, dst, _ := fwliveCluster(t)
+			k := fwliveRestartFreeze(t, c, src, nil)
+			done := fwliveMigrate(t, c, src, dst)
+			fwliveRestartReach(t, k.reached, done, "the migration call")
+
+			peer := c.PeerClient(dst, src)
+			if _, err := peer.Ping(context.Background(), &pb.PingRequest{}); err != nil {
+				t.Fatalf("fixture: dst's Ping of src: %v", err)
+			}
+			in := make(chan struct{})
+			src.HookUnary("Ping", func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
+				close(in)
+				fwliveWitnessUntilGate(src, "dead")
+				return h(ctx, req)
+			})
+			answered := make(chan error, 1)
+			go func() {
+				_, err := peer.Ping(context.Background(), &pb.PingRequest{})
+				answered <- err
+			}()
+			<-in
+
+			k.die(true)
+			select {
+			case err := <-answered:
+				if err == nil {
+					t.Error("the peer got the dead daemon's answer")
+				}
+			case <-time.After(time.Minute):
+				t.Fatal("the peer's call did not end")
+			}
+			fwliveRestartUp(t, c, src)
+		})
+	}
 }

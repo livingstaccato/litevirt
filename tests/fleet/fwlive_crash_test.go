@@ -47,8 +47,15 @@ package fleet
 // Limits: the libvirt gate is per Fake, so a scenario must not kill a node
 // whose Fake a live daemon's goroutine still calls (the landing of a migration
 // is libvirtd's own, LandFirmwareLive and LandMigrated*, and is not gated).
-// A goroutine a scenario starts by calling into the server on its own
-// goroutine is the scenario's, not the daemon's, and carries no generation.
+// Goroutines that carry no generation are not waited for: one a scenario
+// starts by calling into the server on its own goroutine; one a timer or a
+// context callback of the daemon starts (time.AfterFunc, context.AfterFunc),
+// which carries the labels of whatever fires it; and the replicator's loops,
+// started by the scenario, which downNode's replicator stop joins. No fwlive
+// scenario has the first two in flight at a death.
+// A descriptor is revoked by number after checking it is still the file its
+// path names; one closed and reused for the same file in that instant would
+// be revoked with it.
 // File modes do not refuse root, so the kill refuses to run as root. A
 // cluster with SharedDataDir cannot be killed this way.
 
@@ -178,10 +185,19 @@ func (k *fwliveCrash) killWithin(d time.Duration) error {
 	k.root = filepath.Join(c.tmpRoot, n.Name)
 	k.gen = n.serverGeneration()
 
-	// 1. Fence every channel: the silent ones, then the files.
+	// 1. Fence every channel: the silent ones, then the files. The database
+	// fence holds only once it has the client's lock, which waits for the
+	// client's calls admitted before it: the files are fenced after that, so
+	// a goroutine refused a file write cannot reach the database instead.
+	var failed []error
 	n.fenceLife()
 	n.Virt.FenceDaemon()
 	k.db = n.DB.FenceWritesForTests()
+	select {
+	case <-k.db.Held():
+	case <-time.After(d):
+		failed = append(failed, fmt.Errorf("%s's daemon: database calls admitted before the fence did not end within %v", n.Name, d))
+	}
 	k.filesUnlock = fwliveReadOnly(t, k.root)
 	revoked, err := fwliveRevokeWriters(k.root)
 	if err != nil {
@@ -194,15 +210,9 @@ func (k *fwliveCrash) killWithin(d time.Duration) error {
 	k.died = true
 
 	// 2. What was admitted before the fence runs to its end.
-	var failed []error
 	if !fwliveUntil(d, func() bool { return n.Virt.DaemonInFlight() <= int(k.frozen.Load()) }) {
 		failed = append(failed, fmt.Errorf("%s's daemon: %d libvirt calls admitted before the fence did not end within %v",
 			n.Name, n.Virt.DaemonInFlight()-int(k.frozen.Load()), d))
-	}
-	select {
-	case <-k.db.Held():
-	case <-time.After(d):
-		failed = append(failed, fmt.Errorf("%s's daemon: database calls admitted before the fence did not end within %v", n.Name, d))
 	}
 	if !fwliveUntil(d, func() bool { return n.inFlightFrom() == 0 }) {
 		failed = append(failed, fmt.Errorf("%s's daemon: %d calls a peer serves it did not end within %v", n.Name, n.inFlightFrom(), d))
@@ -554,6 +564,13 @@ func fwliveRevokeWriters(root string) ([]string, error) {
 		}
 		flags, ok := fwliveFDFlags(string(info))
 		if !ok || flags&syscall.O_ACCMODE == syscall.O_RDONLY {
+			continue
+		}
+		// The number is still the descriptor of that file: the same file
+		// as the path names, just before it is replaced.
+		var byFD, byPath syscall.Stat_t
+		if syscall.Fstat(fd, &byFD) != nil || syscall.Stat(path, &byPath) != nil ||
+			byFD.Dev != byPath.Dev || byFD.Ino != byPath.Ino {
 			continue
 		}
 		if err := syscall.Dup3(int(null.Fd()), fd, syscall.O_CLOEXEC); err != nil {

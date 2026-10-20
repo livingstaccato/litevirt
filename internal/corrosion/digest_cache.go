@@ -196,12 +196,21 @@ func (h hookedConnector) Connect(ctx context.Context) (driver.Conn, error) {
 		return conn, nil
 	}
 	gens := h.gens
+	if h.sever == nil {
+		hr.RegisterPreUpdateHook(func(d sqlite.SQLitePreUpdateData) {
+			gens.bump(d.TableName)
+		})
+		return conn, nil
+	}
+	// A test client's connection: its sever also sees each row it changes
+	// and decides each commit (write_sever.go).
+	sc := h.sever.conn()
 	hr.RegisterPreUpdateHook(func(d sqlite.SQLitePreUpdateData) {
 		gens.bump(d.TableName)
+		sc.staged()
 	})
-	if s := h.sever; s != nil {
-		hr.RegisterCommitHook(s.commit)
-	}
+	hr.RegisterCommitHook(sc.commit)
+	hr.RegisterRollbackHook(sc.rollback)
 	return conn, nil
 }
 

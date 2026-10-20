@@ -11,8 +11,8 @@ import (
 // database (another node's) writes as before; once restored it writes
 // again.
 //
-// Mutation: the commit hook returns 0 while on — the severed write lands,
-// red.
+// Mutation: refuse returns 0 — the severed writes land, and the landed
+// count reports their rows, red.
 func TestSeverWritesForTests_RefusesOnlyTheSeveredClient(t *testing.T) {
 	ctx := context.Background()
 	suffix := strings.ReplaceAll(t.Name(), "/", "_")
@@ -66,8 +66,12 @@ func TestSeverWritesForTests_RefusesOnlyTheSeveredClient(t *testing.T) {
 	if _, err := b.DB().ExecContext(ctx, `INSERT INTO sever_probe (k) VALUES ('other')`); err != nil {
 		t.Errorf("another client's write while a is severed: %v", err)
 	}
-	if refused := restore(); refused < 2 {
+	refused, landed := restore()
+	if refused < 2 {
 		t.Errorf("the sever refused %d commits, want at least 2", refused)
+	}
+	if landed != 0 {
+		t.Errorf("%d rows reached the database through the severed client", landed)
 	}
 	if _, err := a.DB().ExecContext(ctx, `INSERT INTO sever_probe (k) VALUES ('after')`); err != nil {
 		t.Errorf("a write after restore: %v", err)

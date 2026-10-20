@@ -3891,6 +3891,162 @@ message RollbackFirmwareStateResponse {
     bool removed = 1;
 }
 
+// The live firmware migration RPCs move a running vTPM / Secure Boot VM. All
+// four are peer only, from the source to the target, and every response
+// carries the target's domain. An older target answers Unimplemented.
+
+// PrepareLiveFirmwareTargetRequest asks the target to hold a live firmware
+// move of attempt_id: it checks its own runtime and the VM's applicability
+// against the source's, records the hold and materialises the NVRAM.
+message PrepareLiveFirmwareTargetRequest {
+    string                vm_name              = 1;
+    string                uuid                 = 2;  // the VM's domain uuid
+    string                created_at           = 3;  // the row's incarnation
+    string                attempt_id           = 4;
+    uint32                protocol_version     = 5;  // 1
+    FirmwareRuntime       src_runtime          = 6;
+    FirmwareApplicability src_applicability    = 7;
+    bool                  source_domain_active = 8;  // the source checked its domain is active
+    bytes                 nvram                = 9;  // the source NVRAM; UEFI only
+}
+message PrepareLiveFirmwareTargetResponse {
+    FirmwareRuntime       dst_runtime       = 1;
+    FirmwareApplicability dst_applicability = 2;
+    bool                  swtpm_absent      = 3;  // no swtpm state for the uuid was here at prepare
+    TargetDomain          target_domain     = 4;
+}
+
+// VerifyLiveFirmwareTargetRequest asks the target, after cutover, whether the
+// paused guest's TPM state equals the source's final state. Reads only.
+message VerifyLiveFirmwareTargetRequest {
+    string vm_name            = 1;
+    string uuid               = 2;
+    string attempt_id         = 3;
+    string src_permall_sha256 = 4;  // empty when the VM has no vTPM
+}
+message VerifyLiveFirmwareTargetResponse {
+    FirmwareVerdict verdict            = 1;
+    string          dst_permall_sha256 = 2;
+    TargetDomain    target_domain      = 3;
+    string          detail             = 4;
+}
+
+// ReleaseLiveFirmwareTargetRequest hands the verified guest over: the target
+// puts its NIC firewall in force, resumes it and confirms its NVRAM.
+message ReleaseLiveFirmwareTargetRequest {
+    string vm_name          = 1;
+    string uuid             = 2;
+    string attempt_id       = 3;
+    string src_nvram_sha256 = 4;  // the source's final NVRAM hash; UEFI only
+    bytes  nvram_final      = 5;  // the source's final NVRAM; UEFI only
+    string created_at       = 6;  // the row's incarnation (an idempotent retry with no hold)
+}
+message ReleaseLiveFirmwareTargetResponse {
+    string          nvram_sha256    = 1;
+    bool            nvram_confirmed = 2;  // the target's NVRAM equalled src_nvram_sha256
+    TargetDomain    target_domain   = 3;
+    FirmwareVerdict verdict         = 4;  // BAD_REQUEST or TARGET_RAN when the release refused
+    string          detail          = 5;
+}
+
+// AbortLiveFirmwareTargetRequest drops the target's hold of attempt_id. It
+// binds to the hold: uuid, created_at and attempt_id must equal the hold's.
+// With no hold for the attempt it answers OK and touches nothing.
+message AbortLiveFirmwareTargetRequest {
+    string            vm_name              = 1;
+    string            uuid                 = 2;
+    string            created_at           = 3;
+    string            attempt_id           = 4;
+    FirmwareAbortMode mode                 = 5;
+    bool              source_domain_active = 6;
+    repeated string   created_stubs        = 7;  // stub disks the move created on the target
+}
+message AbortLiveFirmwareTargetResponse {
+    TargetDomain target_domain = 1;
+    string       hold_state    = 2;  // the hold's state when the abort refused; empty with no hold
+    bool         refused       = 3;  // the hold was kept
+    string       detail        = 4;
+}
+
+// FirmwareMoveDoctorAction is the operator's resolution of a parked live
+// firmware move (`lv doctor firmware-move`, spec §17 D-5).
+enum FirmwareMoveDoctorAction {
+    FIRMWARE_MOVE_DOCTOR_ACTION_UNSPECIFIED          = 0;  // show both records, every hash and path
+    FIRMWARE_MOVE_DOCTOR_ACTION_ACCEPT_TARGET        = 1;
+    FIRMWARE_MOVE_DOCTOR_ACTION_ACCEPT_SOURCE        = 2;
+    FIRMWARE_MOVE_DOCTOR_ACTION_ADOPT_TARGET_COPY    = 3;
+    FIRMWARE_MOVE_DOCTOR_ACTION_DISCARD_TARGET       = 4;
+    FIRMWARE_MOVE_DOCTOR_ACTION_CONFIRM_TARGET_NVRAM = 5;
+    FIRMWARE_MOVE_DOCTOR_ACTION_PUSH_SOURCE_NVRAM    = 6;
+    FIRMWARE_MOVE_DOCTOR_ACTION_REVERIFY             = 7;
+    FIRMWARE_MOVE_DOCTOR_ACTION_RESOLVE_CONDITION    = 8;
+}
+
+// FirmwareMoveDoctorRequest shows, or resolves, the live firmware move of a
+// VM. Admin only, audited. The node that takes it reads every host's
+// records and hands the action to the host whose record it acts on.
+message FirmwareMoveDoctorRequest {
+    string                   vm_name              = 1;
+    FirmwareMoveDoctorAction action               = 2;
+    bool                     acknowledge_rollback = 3;  // --acknowledge-rollback
+    bool                     stop_target          = 4;  // --stop-target
+    string                   accept_nvram_hash    = 5;  // --accept-nvram-hash
+    string                   resolve_condition    = 6;  // --resolve: unverified or quarantine
+    string                   host                 = 7;  // the host to read or act on; empty: the node that takes it decides
+}
+message FirmwareMoveDoctorResponse {
+    repeated FirmwareMoveHostRecords hosts       = 1;
+    string                           outcome     = 2;  // what the action did
+    repeated string                  unreachable = 3;  // hosts whose records could not be read
+}
+
+// FirmwareMoveHostRecords is one host's records of a VM's live firmware move,
+// as on its disk, with the VM's domain there and its state's hashes now.
+message FirmwareMoveHostRecords {
+    string              host          = 1;
+    string              marker_json   = 2;  // the source marker; empty with none
+    string              hold_json     = 3;  // the target hold; empty with none
+    repeated string     owed_discards = 4;  // owed-discard records, JSON
+    repeated string     quarantines   = 5;  // quarantine directories of the VM
+    repeated string     retained      = 6;  // retained bundles of the VM
+    TargetDomain        domain        = 7;
+    map<string, string> hashes        = 8;  // permall_now, nvram_now
+    map<string, string> paths         = 9;
+    string              error         = 10; // a record or the domain that cannot be read
+    string              leftover_json = 11; // the target's leftover record of an owed DISCARD; empty with none
+}
+
+// FirmwareMoveDoctorTargetOp is a target's part of an operator's resolution,
+// asked by the move's source (the hold's source only).
+enum FirmwareMoveDoctorTargetOp {
+    FIRMWARE_MOVE_DOCTOR_TARGET_OP_UNSPECIFIED   = 0;
+    FIRMWARE_MOVE_DOCTOR_TARGET_OP_STOP          = 1;  // stop the held guest (--stop-target)
+    FIRMWARE_MOVE_DOCTOR_TARGET_OP_ADOPT         = 2;  // the hold to verified (paused) or resuming (running)
+    FIRMWARE_MOVE_DOCTOR_TARGET_OP_CONFIRM_NVRAM = 3;  // accept the target's NVRAM by its hash
+    FIRMWARE_MOVE_DOCTOR_TARGET_OP_PUSH_NVRAM    = 4;  // write the source's final NVRAM
+}
+message FirmwareMoveDoctorTargetRequest {
+    string                     vm_name              = 1;
+    string                     uuid                 = 2;
+    string                     created_at           = 3;
+    string                     attempt_id           = 4;
+    FirmwareMoveDoctorTargetOp op                   = 5;
+    string                     operator             = 6;  // who asked, for the hold and the audit
+    string                     reason               = 7;
+    string                     accept_nvram_hash    = 8;
+    bytes                      nvram                = 9;  // the source's final NVRAM (PUSH_NVRAM)
+    string                     src_nvram_sha256     = 10;
+    bool                       acknowledge_rollback = 11;
+}
+message FirmwareMoveDoctorTargetResponse {
+    TargetDomain target_domain   = 1;
+    string       hold_state      = 2;  // after the op; empty when the hold is gone
+    string       detail          = 3;
+    string       permall_sha256  = 4;  // the target's now
+    string       nvram_sha256    = 5;  // the target's now
+    string       nvram_t0_sha256 = 6;
+}
+
 // ReceiveMigrationDiskRequest is one frame of a cold migration's disk copy: a
 // STOPPED VM's host-local disk file, streamed by the source to the target over
 // the peer connection. The first frame is a header (vm_name, path, size_bytes)
@@ -4526,6 +4682,9 @@ service LiteVirt {
     rpc RestartVM(RestartVMRequest)   returns (VM);
     rpc DeleteVM(DeleteVMRequest)        returns (google.protobuf.Empty);
     rpc RepairVMOwner(RepairVMOwnerRequest) returns (RepairVMOwnerResponse);
+    // FirmwareMoveDoctor shows or resolves a VM's parked live firmware move
+    // (`lv doctor firmware-move`). See FirmwareMoveDoctorRequest.
+    rpc FirmwareMoveDoctor(FirmwareMoveDoctorRequest) returns (FirmwareMoveDoctorResponse);
     rpc GetRuntimeInventory(GetRuntimeInventoryRequest) returns (RuntimeInventory);
     // CollectOrphanProof answers, for THIS host, "does anything here still claim
     // this address" — every defined domain in every state plus this host's local
@@ -4911,6 +5070,15 @@ service LiteVirt {
     rpc EnsureFirmwareState(EnsureFirmwareStateRequest) returns (EnsureFirmwareStateResponse);
     rpc RollbackFirmwareState(RollbackFirmwareStateRequest) returns (RollbackFirmwareStateResponse);
     rpc CleanupMigrationArtifacts(CleanupMigrationArtifactsRequest) returns (google.protobuf.Empty);
+    // Live firmware migration (peer only): see PrepareLiveFirmwareTargetRequest
+    // and the three after it.
+    rpc PrepareLiveFirmwareTarget(PrepareLiveFirmwareTargetRequest) returns (PrepareLiveFirmwareTargetResponse);
+    rpc VerifyLiveFirmwareTarget(VerifyLiveFirmwareTargetRequest)   returns (VerifyLiveFirmwareTargetResponse);
+    rpc ReleaseLiveFirmwareTarget(ReleaseLiveFirmwareTargetRequest) returns (ReleaseLiveFirmwareTargetResponse);
+    rpc AbortLiveFirmwareTarget(AbortLiveFirmwareTargetRequest)     returns (AbortLiveFirmwareTargetResponse);
+    // FirmwareMoveDoctorTarget is a target's part of `lv doctor firmware-move`,
+    // asked by the move's source (peer only).
+    rpc FirmwareMoveDoctorTarget(FirmwareMoveDoctorTargetRequest)   returns (FirmwareMoveDoctorTargetResponse);
     // ReceiveMigrationDisk takes one host-local disk file of a STOPPED VM that is
     // being cold-migrated here, as a client stream. See ReceiveMigrationDiskRequest.
     rpc ReceiveMigrationDisk(stream ReceiveMigrationDiskRequest) returns (ReceiveMigrationDiskResponse);

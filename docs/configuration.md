@@ -772,7 +772,11 @@ vm_event_prune_hours: 24
 # from exists, whatever its state: only `lv host superseded-disks <host>
 # --remove <copy>` removes one then. Once the VM is gone, its copies are
 # removed by their host when older than this. 0 keeps every copy until removed
-# with `lv host superseded-disks --purge` or `--remove`.
+# with `lv host superseded-disks --purge` or `--remove`. The firmware state
+# (NVRAM, vTPM) the reconciler moves aside from a leftover domain
+# (<data_dir>/fwmig-quarantine/<vm>-reconciled-<unix>/) follows the same rule,
+# and is also kept while a firmware move record or an open owed DISCARD names
+# the VM.
 superseded_disk_retention_days: 7
 
 # Pending OS package updates (docs/upgrades.md, "Pending OS updates"). A
@@ -1053,6 +1057,7 @@ migration:
   network: 10.20.0.0/24              # default empty: the cluster address
   address: 10.20.0.7                 # optional: this host's own address in that network
   allow_any_network: false           # default false: refuse a non-private network, or one holding the cluster address
+  live_firmware: true                # default true
 ```
 
 `allow_unencrypted_storage` decides whether this node may **send** a migration
@@ -1088,6 +1093,19 @@ target's address in the network over TLS. When either host has none, it stays
 in libvirt's TLS tunnel on the cluster address. A migration that cannot use the
 network (this host or the target has no address in it) also stays on the
 cluster address, with a `vm.migrate.network_fallback` event on the VM.
+
+`live_firmware` lets this node take part in live moves of vTPM and Secure Boot
+VMs. The daemon publishes the host label `litevirt.fw_live_migrate=true` only
+when it is on, the host has vTPM and Secure Boot support (`litevirt.tpm` and
+`litevirt.secureboot` are `true`), the installed libvirt is at least 10.0.0,
+QEMU 8.2.2, swtpm 0.7.3 and libtpms 0.9.3, and `libvirt-guests` does not save or
+restore guests (the unit enabled or active with `ON_SHUTDOWN=suspend` or
+`ON_BOOT=start`; read from `/etc/default/libvirt-guests`, else `/etc/sysconfig/libvirt-guests`; keys the file does not set, and values that cannot be read as a plain shell assignment, count as unsafe). A version
+that cannot be read counts as below the floor. The label is advisory: each
+condition is checked again when a move starts. A live move of a vTPM or Secure
+Boot VM does not use `network`: its data goes to the target's cluster address
+(its memory in libvirt's tunnel), with a `vm.migrate.network_fallback` event
+on the VM when `network` is set.
 
 ## Capacity and overcommit
 

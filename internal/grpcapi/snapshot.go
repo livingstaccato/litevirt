@@ -66,6 +66,9 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		defer conn.Close()
 		return client.CreateSnapshot(ctx, req)
 	}
+	if err := s.firmwareMoveRefusal("snapshot", vm); err != nil {
+		return nil, err
+	}
 
 	// A libvirt snapshot of a VM is an external qcow2 overlay per disk, which a
 	// network (rbd) disk cannot have.
@@ -135,7 +138,7 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		// Preflight: the firmware state must be present locally to capture it —
 		// fail BEFORE touching libvirt so we never create an overlay we can't back.
 		// NVRAM only exists for UEFI (a BIOS+vTPM VM has swtpm but no NVRAM).
-		if (fwSpec.hasNvram() && !lv.HasNvram(s.dataDir, req.VmName)) || (fwSpec.Tpm && !lv.HasTPMState(fwUUID)) {
+		if (fwSpec.hasNvram() && !s.fw().HasNvram(req.VmName)) || (fwSpec.Tpm && !s.fw().HasTPMState(fwUUID)) {
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"firmware state for %q is not present on this host; cannot snapshot it consistently", req.VmName)
 		}
@@ -158,7 +161,7 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 			return err
 		}
 		diskmode.Restrict(f, diskmode.File) // best effort
-		has, werr := lv.WriteFirmwareBundle(s.dataDir, req.VmName, fwUUID, f)
+		has, werr := s.fw().WriteFirmwareBundle(req.VmName, fwUUID, f)
 		f.Close()
 		if werr != nil {
 			return werr
@@ -361,6 +364,12 @@ func (s *Server) restoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 		return vm, err
 	}
 
+	// A revert redefines and starts the domain and overwrites its firmware
+	// state from the snapshot's (restoreFW): not while a live firmware move's
+	// record names it (spec §6.9).
+	if err := s.firmwareMoveRefusal("snapshot restore", vm); err != nil {
+		return nil, err
+	}
 	// A revert can bring the domain back running with its installer ISO; it
 	// is judged here, on the owner, after the caller's authority.
 	if err := s.verifyVMISOForStart(vm); err != nil {
@@ -456,7 +465,7 @@ func (s *Server) restoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 			return err
 		}
 		defer f.Close()
-		return lv.ReadFirmwareBundle(f, s.dataDir, req.VmName, fwUUID)
+		return s.fw().ReadFirmwareBundle(f, req.VmName, fwUUID)
 	}
 
 	if snap != nil && snap.Type == "memory" && snap.VMStatePath != "" {

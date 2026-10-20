@@ -150,7 +150,13 @@ func pitSnapshotXML(domXML, diskPath, overlay string) (string, error) {
 // it records, durably, that a pivot is about to happen, so a daemon that dies
 // right after the pivot is known to have pivoted. If it fails, nothing is
 // pivoted: the job is aborted and the domain stays on the overlay.
+//
+// It ends by redefining the domain's persistent disk, so the firmware move
+// guard is asked for that define (OpDefine) before anything is committed.
 func (c *Client) CommitDiskOverlay(domain, diskPath, overlay, diskFormat string, beforePivot func() error) error {
+	if err := c.firmwareGuard().check(FirmwareCall{Op: OpDefine, Name: domain}); err != nil {
+		return fmt.Errorf("commit %s into %s: %w", overlay, diskPath, err)
+	}
 	return commitDiskOverlay(keepConsolePITAPI{c.virt, c}, domain, diskPath, overlay, diskFormat, beforePivot)
 }
 

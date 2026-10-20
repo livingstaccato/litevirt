@@ -79,7 +79,8 @@ func TestFleet_ConsolePassword_AStripMigrationIsLoggedOnTheSource(t *testing.T) 
 	dst.Virt.SetVNCPasswordUnavailable("fips")
 	src.Virt.OnMigrateToTarget = func(name, _ string, p lv.MigrateParams) error {
 		dst.Virt.LandMigrated(p.DestXML)
-		return src.Virt.UndefineDomain(name, false)
+		src.Virt.VanishDomain(name)
+		return nil
 	}
 	if err := migrateAt(t, c, src, "desk", dst.Name); err != nil {
 		t.Fatalf("migrate: %v", err)

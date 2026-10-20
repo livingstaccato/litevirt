@@ -436,6 +436,13 @@ func (s *Server) isTrustedHostCN(ctx context.Context, cn string) bool {
 		// a mismatch falls back to the host-vs-client discriminator and is logged
 		// — it never relaxes the tombstone above, so a removed host stays removed.
 		recorded := rows[0].String("cert_serial")
+		// No recorded serial (a row from before serials were recorded, or one
+		// a peer wrote): nothing to pin. The distributable lv-cli certificate
+		// (ClientAuth alone) is still never a peer, so a row named lv-cli
+		// cannot make it one.
+		if recorded == "" && callerCertIsClientOnly(ctx) {
+			return false
+		}
 		if cert := peerLeafCert(ctx); cert != nil && cert.SerialNumber != nil && recorded != "" {
 			presented := cert.SerialNumber.Text(16)
 			if strings.EqualFold(recorded, presented) {
@@ -465,6 +472,12 @@ func (s *Server) isTrustedHostCN(ctx context.Context, cn string) bool {
 		return true
 	}
 	return callerCertHasServerAuth(ctx)
+}
+
+// callerCertIsClientOnly reports whether the presented certificate is a
+// CLIENT certificate (pki.IsClientOnlyCert): the distributable lv-cli one.
+func callerCertIsClientOnly(ctx context.Context) bool {
+	return pki.IsClientOnlyCert(peerLeafCert(ctx))
 }
 
 // callerCertHasServerAuth reports whether the presented certificate is a HOST

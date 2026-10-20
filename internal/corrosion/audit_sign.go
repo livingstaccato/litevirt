@@ -541,6 +541,15 @@ func (k *AuditKeyring) certFor(ctx context.Context, c *Client, keyID string) (*x
 	if _, err := cert.Verify(x509.VerifyOptions{Roots: k.roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err != nil {
 		return nil, fmt.Errorf("certificate for key %s does not chain to the cluster CA: %w", keyID, err)
 	}
+	// The Common Name is what binds a key to a host (verifySig,
+	// KeyBelongsToHost), and a CN alone does not make a host: on a cluster
+	// where an older build admitted a host named "lv-cli", the distributable
+	// client key would otherwise sign as it. Audit signing certificates name
+	// no extended key usage and host certificates name ServerAuth, so neither
+	// is client-only (pki.IsClientOnlyCert).
+	if pki.IsClientOnlyCert(cert) {
+		return nil, fmt.Errorf("certificate for key %s is a client certificate, not a host's", keyID)
+	}
 	// A published certificate must match the id it was filed under, or one
 	// certificate could answer for another key's signatures.
 	if got, err := AuditKeyID(cert); err != nil || got != keyID {
@@ -594,6 +603,10 @@ func (k *AuditKeyring) trustSubmittedCert(cert *x509.Certificate, keyID string) 
 		Roots: k.roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
 	}); err != nil {
 		return fmt.Errorf("does not chain to the cluster CA: %w", err)
+	}
+	// As in certFor: a client certificate never speaks for a host.
+	if pki.IsClientOnlyCert(cert) {
+		return fmt.Errorf("is a client certificate, not a host's")
 	}
 	got, err := AuditKeyID(cert)
 	if err != nil {

@@ -160,10 +160,70 @@ func maxProjectAuthorityEpoch(ctx context.Context, c *Client, project string) (i
 // disagreed about. The rows themselves are kept, both because the table is
 // append-only and because ClaimInitialProjectAuthority mints above them.
 func RetireProjectAuthority(ctx context.Context, c *Client, project string) error {
-	return c.Execute(ctx,
-		`UPDATE project_authority_epochs SET deleted_at = ?, updated_at = ?
-		 WHERE project = ? AND deleted_at IS NULL`,
+	return c.Execute(ctx, retireProjectAuthoritySQL,
 		nowRFC3339(), c.NowTS(), projectOrDefault(project))
+}
+
+// retireProjectAuthoritySQL is the retirement statement. Its params are
+// (deleted_at, updated_at, project); updated_at is the retirement's own HLC.
+const retireProjectAuthoritySQL = `UPDATE project_authority_epochs SET deleted_at = ?, updated_at = ?
+		 WHERE project = ? AND deleted_at IS NULL`
+
+var retireProjectAuthorityNorm = strings.Join(strings.Fields(retireProjectAuthoritySQL), " ")
+
+func isRetireProjectAuthority(stmt string) bool {
+	return strings.Join(strings.Fields(stmt), " ") == retireProjectAuthorityNorm
+}
+
+// applyReplicatedAuthorityRetire applies a replicated retirement to the epochs
+// that existed when it was written, and only those. The statement names the
+// project, not an incarnation of it, so applied verbatim a LATE retirement (the
+// old incarnation's, arriving after the new incarnation minted its epoch) would
+// retire the new epoch and regress its clock, and the replicas would disagree on
+// who holds authority. A row stamped later than the retirement was minted after
+// it was written, so it is not the retirement's to retire. Same statement shape,
+// so previous-release peers are unaffected; they keep the verbatim apply.
+func applyReplicatedAuthorityRetire(ctx context.Context, tx *sql.Tx, params []interface{}) error {
+	if len(params) != 3 {
+		return fmt.Errorf("project authority retirement: %d params, want 3", len(params))
+	}
+	at := coerceString(params[1])
+	rows, err := tx.QueryContext(ctx,
+		`SELECT authority_epoch, updated_at FROM project_authority_epochs WHERE project = ? AND deleted_at IS NULL`,
+		params[2])
+	if err != nil {
+		return err
+	}
+	type row struct {
+		epoch int64
+		upd   string
+	}
+	var cands []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.epoch, &r.upd); err != nil {
+			rows.Close()
+			return err
+		}
+		cands = append(cands, r)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, r := range cands {
+		if LWWNewer(r.upd, at) {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE project_authority_epochs SET deleted_at = ?, updated_at = ?
+			 WHERE project = ? AND authority_epoch = ? AND deleted_at IS NULL`,
+			params[0], params[1], params[2], r.epoch); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ReconcileOrphanedProjectAuthority retires authority still held by projects that

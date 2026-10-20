@@ -92,13 +92,6 @@ func (fp FirmwarePaths) ApplyTo(cfg *VMConfig, dataDir, vmName string, secureBoo
 	}
 	// Deliberately NO TPMStateDir/<source>: libvirt manages swtpm state at the
 	// AppArmor-permitted /var/lib/libvirt/swtpm/<uuid>/, made deterministic by the
-	// stable cfg.UUID. State-travel addresses it via LibvirtSwtpmDir(uuid)
+	// stable cfg.UUID. State-travel addresses it via the host's FirmwareStore
 	// (vtpmstate.go).
-}
-
-// HasNvram reports whether the per-VM (name-keyed) UEFI vars file exists.
-// (LibvirtSwtpmDir/HasTPMState live in vtpmstate.go alongside the bundle ops.)
-func HasNvram(dataDir, vmName string) bool {
-	fi, err := os.Stat(NvramPath(dataDir, vmName))
-	return err == nil && fi.Size() > 0
 }

@@ -58,6 +58,7 @@ var guarded = map[string]bool{
 	"MarkContainerRelocateRestore":  true,
 	"RekeyStoppedVM":                true,
 	"RekeyStoppedVMClaimed":         true,
+	"ReturnMigratedVM":              true,
 	"SyncVMStopIfRunning":           true,
 }
 

@@ -82,9 +82,7 @@ func TestFleet_DeleteRemovesWhatTheVMLeftOnAHostItMigratedFrom(t *testing.T) {
 			}
 			// libvirt undefines the source and the guest runs on the target;
 			// the fakes do not model the move.
-			if err := src.Virt.UndefineDomain("os1", false); err != nil {
-				t.Fatal(err)
-			}
+			src.Virt.VanishDomain("os1")
 			dst.Virt.SetState("os1", "running")
 
 			// The migration leaves both on src, deliberately.

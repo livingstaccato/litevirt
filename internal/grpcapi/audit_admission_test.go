@@ -234,3 +234,86 @@ func TestAdmitHost_RefusesAnAddressAnotherHostHolds(t *testing.T) {
 		})
 	}
 }
+
+// TestAdmitHost_RefusesAnUnsafeName: a host named after a fixed file of the
+// operator's PKI directory ("ca") or one that leaves it is refused by the
+// daemon too, so an lv that does not check cannot record one; "lv-cli" is the
+// distributable client certificate's Common Name.
+//
+// Mutation: drop the ValidateHostName check in AdmitHost — "ca" is admitted.
+func TestAdmitHost_RefusesAnUnsafeName(t *testing.T) {
+	ctx := context.Background()
+	for _, name := range []string{"ca", "client", "lv-cli", "node-1-migration", "../esc", "-rf", ".hidden"} {
+		s := testServer(t)
+		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: s.hostName, Address: "10.0.0.1", State: "active"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.db.MarkAuditSeeded(ctx, "genesis"); err != nil {
+			t.Fatal(err)
+		}
+		s.db.MarkReplicaStale("no peer has ever been reachable")
+		if _, err := admit(s, name); status.Code(err) != codes.InvalidArgument {
+			t.Errorf("AdmitHost(%q) = %v, want InvalidArgument", name, err)
+		}
+		if h, _ := corrosion.GetHost(ctx, s.db, name); h != nil {
+			t.Errorf("%q was admitted", name)
+		}
+	}
+	// The same server admits an ordinary name.
+	s := testServer(t)
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: s.hostName, Address: "10.0.0.1", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.MarkAuditSeeded(ctx, "genesis"); err != nil {
+		t.Fatal(err)
+	}
+	s.db.MarkReplicaStale("no peer has ever been reachable")
+	if _, err := admit(s, "node-1"); err != nil {
+		t.Fatalf("AdmitHost(node-1) = %v", err)
+	}
+}
+
+// TestAdmitHost_KeepsALiveLegacyName: a live row an older build admitted under
+// a name the new-name rule refuses ("node+1", "web-migration") is not a new
+// name, so its add can still be resumed; one whose pair would be a fixed file
+// ("ca", "Host") or that leaves the directory is refused even then, and a
+// REMOVED legacy name is new again.
+//
+// Mutation: apply pki.ValidateHostName whatever the row — "node+1" and
+// "web-migration" are InvalidArgument.
+func TestAdmitHost_KeepsALiveLegacyName(t *testing.T) {
+	ctx := context.Background()
+	setup := func(t *testing.T, name string, removed bool) *Server {
+		s := testServer(t)
+		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: s.hostName, Address: "10.0.0.1", State: "active"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: name, Address: "10.0.0.9", GRPCPort: 7443,
+			State: corrosion.HostStateJoining, CertSerial: "0a0b0c"}); err != nil {
+			t.Fatal(err)
+		}
+		if removed {
+			if err := corrosion.DeleteHost(ctx, s.db, name); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := s.db.MarkAuditSeeded(ctx, "genesis"); err != nil {
+			t.Fatal(err)
+		}
+		s.db.MarkReplicaStale("no peer has ever been reachable")
+		return s
+	}
+	for _, name := range []string{"node+1", "web-migration"} {
+		if _, err := admit(setup(t, name, false), name); status.Code(err) == codes.InvalidArgument {
+			t.Errorf("AdmitHost(%q) over its live row = %v, want the name kept", name, err)
+		}
+		if _, err := admit(setup(t, name, true), name); status.Code(err) != codes.InvalidArgument {
+			t.Errorf("AdmitHost(%q) after its removal = %v, want InvalidArgument", name, err)
+		}
+	}
+	for _, name := range []string{"ca", "Host", "lv-cli"} {
+		if _, err := admit(setup(t, name, false), name); status.Code(err) != codes.InvalidArgument {
+			t.Errorf("AdmitHost(%q) over its live row = %v, want InvalidArgument", name, err)
+		}
+	}
+}

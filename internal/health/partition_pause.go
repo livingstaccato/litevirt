@@ -108,7 +108,13 @@ type PauseVMBackend interface {
 	// record is trusted only for the very domain it paused.
 	DumpXMLInactive(name string) (string, error)
 	SuspendDomain(name string) error
-	ResumeDomain(name string) error
+	// ResumePartitionPaused resumes a guest this pauser paused, bound to
+	// the domain uuid the pause recorded ("" when it recorded none). The
+	// firmware move guard lets it through under a live firmware move's
+	// marker only while that move is in progress before cutover; under any
+	// parked marker, or from cutover on, it refuses, and the guest stays
+	// paused until the move's own steps resume it (spec §5.1, §10).
+	ResumePartitionPaused(name, uuid string) error
 }
 
 // Read kinds the pauser's abandoned-call guard tracks (callGuard).
@@ -1027,7 +1033,7 @@ func (p *PartitionPauser) resume(ctx context.Context, rec PauseRecord, why strin
 		}
 		st, err := p.vms.DomainStateReason(rec.Name)
 		if err == nil && st.Reason == "paused" {
-			if err := p.vms.ResumeDomain(rec.Name); err != nil {
+			if err := p.vms.ResumePartitionPaused(rec.Name, rec.DomainUUID); err != nil {
 				p.hold(rec, "resume failed: "+err.Error())
 				return
 			}

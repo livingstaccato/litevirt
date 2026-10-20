@@ -62,6 +62,7 @@ const (
 	LiteVirt_RestartVM_FullMethodName                   = "/litevirt.v1.LiteVirt/RestartVM"
 	LiteVirt_DeleteVM_FullMethodName                    = "/litevirt.v1.LiteVirt/DeleteVM"
 	LiteVirt_RepairVMOwner_FullMethodName               = "/litevirt.v1.LiteVirt/RepairVMOwner"
+	LiteVirt_FirmwareMoveDoctor_FullMethodName          = "/litevirt.v1.LiteVirt/FirmwareMoveDoctor"
 	LiteVirt_GetRuntimeInventory_FullMethodName         = "/litevirt.v1.LiteVirt/GetRuntimeInventory"
 	LiteVirt_CollectOrphanProof_FullMethodName          = "/litevirt.v1.LiteVirt/CollectOrphanProof"
 	LiteVirt_GetMembershipView_FullMethodName           = "/litevirt.v1.LiteVirt/GetMembershipView"
@@ -285,6 +286,11 @@ const (
 	LiteVirt_EnsureFirmwareState_FullMethodName         = "/litevirt.v1.LiteVirt/EnsureFirmwareState"
 	LiteVirt_RollbackFirmwareState_FullMethodName       = "/litevirt.v1.LiteVirt/RollbackFirmwareState"
 	LiteVirt_CleanupMigrationArtifacts_FullMethodName   = "/litevirt.v1.LiteVirt/CleanupMigrationArtifacts"
+	LiteVirt_PrepareLiveFirmwareTarget_FullMethodName   = "/litevirt.v1.LiteVirt/PrepareLiveFirmwareTarget"
+	LiteVirt_VerifyLiveFirmwareTarget_FullMethodName    = "/litevirt.v1.LiteVirt/VerifyLiveFirmwareTarget"
+	LiteVirt_ReleaseLiveFirmwareTarget_FullMethodName   = "/litevirt.v1.LiteVirt/ReleaseLiveFirmwareTarget"
+	LiteVirt_AbortLiveFirmwareTarget_FullMethodName     = "/litevirt.v1.LiteVirt/AbortLiveFirmwareTarget"
+	LiteVirt_FirmwareMoveDoctorTarget_FullMethodName    = "/litevirt.v1.LiteVirt/FirmwareMoveDoctorTarget"
 	LiteVirt_ReceiveMigrationDisk_FullMethodName        = "/litevirt.v1.LiteVirt/ReceiveMigrationDisk"
 	LiteVirt_CheckCPUCompatibility_FullMethodName       = "/litevirt.v1.LiteVirt/CheckCPUCompatibility"
 	LiteVirt_AnnounceMigratedGuest_FullMethodName       = "/litevirt.v1.LiteVirt/AnnounceMigratedGuest"
@@ -463,6 +469,9 @@ type LiteVirtClient interface {
 	RestartVM(ctx context.Context, in *RestartVMRequest, opts ...grpc.CallOption) (*VM, error)
 	DeleteVM(ctx context.Context, in *DeleteVMRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	RepairVMOwner(ctx context.Context, in *RepairVMOwnerRequest, opts ...grpc.CallOption) (*RepairVMOwnerResponse, error)
+	// FirmwareMoveDoctor shows or resolves a VM's parked live firmware move
+	// (`lv doctor firmware-move`). See FirmwareMoveDoctorRequest.
+	FirmwareMoveDoctor(ctx context.Context, in *FirmwareMoveDoctorRequest, opts ...grpc.CallOption) (*FirmwareMoveDoctorResponse, error)
 	GetRuntimeInventory(ctx context.Context, in *GetRuntimeInventoryRequest, opts ...grpc.CallOption) (*RuntimeInventory, error)
 	// CollectOrphanProof answers, for THIS host, "does anything here still claim
 	// this address" — every defined domain in every state plus this host's local
@@ -821,6 +830,15 @@ type LiteVirtClient interface {
 	EnsureFirmwareState(ctx context.Context, in *EnsureFirmwareStateRequest, opts ...grpc.CallOption) (*EnsureFirmwareStateResponse, error)
 	RollbackFirmwareState(ctx context.Context, in *RollbackFirmwareStateRequest, opts ...grpc.CallOption) (*RollbackFirmwareStateResponse, error)
 	CleanupMigrationArtifacts(ctx context.Context, in *CleanupMigrationArtifactsRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Live firmware migration (peer only): see PrepareLiveFirmwareTargetRequest
+	// and the three after it.
+	PrepareLiveFirmwareTarget(ctx context.Context, in *PrepareLiveFirmwareTargetRequest, opts ...grpc.CallOption) (*PrepareLiveFirmwareTargetResponse, error)
+	VerifyLiveFirmwareTarget(ctx context.Context, in *VerifyLiveFirmwareTargetRequest, opts ...grpc.CallOption) (*VerifyLiveFirmwareTargetResponse, error)
+	ReleaseLiveFirmwareTarget(ctx context.Context, in *ReleaseLiveFirmwareTargetRequest, opts ...grpc.CallOption) (*ReleaseLiveFirmwareTargetResponse, error)
+	AbortLiveFirmwareTarget(ctx context.Context, in *AbortLiveFirmwareTargetRequest, opts ...grpc.CallOption) (*AbortLiveFirmwareTargetResponse, error)
+	// FirmwareMoveDoctorTarget is a target's part of `lv doctor firmware-move`,
+	// asked by the move's source (peer only).
+	FirmwareMoveDoctorTarget(ctx context.Context, in *FirmwareMoveDoctorTargetRequest, opts ...grpc.CallOption) (*FirmwareMoveDoctorTargetResponse, error)
 	// ReceiveMigrationDisk takes one host-local disk file of a STOPPED VM that is
 	// being cold-migrated here, as a client stream. See ReceiveMigrationDiskRequest.
 	ReceiveMigrationDisk(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse], error)
@@ -1616,6 +1634,16 @@ func (c *liteVirtClient) RepairVMOwner(ctx context.Context, in *RepairVMOwnerReq
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RepairVMOwnerResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_RepairVMOwner_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) FirmwareMoveDoctor(ctx context.Context, in *FirmwareMoveDoctorRequest, opts ...grpc.CallOption) (*FirmwareMoveDoctorResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FirmwareMoveDoctorResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_FirmwareMoveDoctor_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4050,6 +4078,56 @@ func (c *liteVirtClient) CleanupMigrationArtifacts(ctx context.Context, in *Clea
 	return out, nil
 }
 
+func (c *liteVirtClient) PrepareLiveFirmwareTarget(ctx context.Context, in *PrepareLiveFirmwareTargetRequest, opts ...grpc.CallOption) (*PrepareLiveFirmwareTargetResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PrepareLiveFirmwareTargetResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_PrepareLiveFirmwareTarget_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) VerifyLiveFirmwareTarget(ctx context.Context, in *VerifyLiveFirmwareTargetRequest, opts ...grpc.CallOption) (*VerifyLiveFirmwareTargetResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VerifyLiveFirmwareTargetResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_VerifyLiveFirmwareTarget_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ReleaseLiveFirmwareTarget(ctx context.Context, in *ReleaseLiveFirmwareTargetRequest, opts ...grpc.CallOption) (*ReleaseLiveFirmwareTargetResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseLiveFirmwareTargetResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ReleaseLiveFirmwareTarget_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) AbortLiveFirmwareTarget(ctx context.Context, in *AbortLiveFirmwareTargetRequest, opts ...grpc.CallOption) (*AbortLiveFirmwareTargetResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AbortLiveFirmwareTargetResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_AbortLiveFirmwareTarget_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) FirmwareMoveDoctorTarget(ctx context.Context, in *FirmwareMoveDoctorTargetRequest, opts ...grpc.CallOption) (*FirmwareMoveDoctorTargetResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FirmwareMoveDoctorTargetResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_FirmwareMoveDoctorTarget_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) ReceiveMigrationDisk(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[34], LiteVirt_ReceiveMigrationDisk_FullMethodName, cOpts...)
@@ -5096,6 +5174,9 @@ type LiteVirtServer interface {
 	RestartVM(context.Context, *RestartVMRequest) (*VM, error)
 	DeleteVM(context.Context, *DeleteVMRequest) (*emptypb.Empty, error)
 	RepairVMOwner(context.Context, *RepairVMOwnerRequest) (*RepairVMOwnerResponse, error)
+	// FirmwareMoveDoctor shows or resolves a VM's parked live firmware move
+	// (`lv doctor firmware-move`). See FirmwareMoveDoctorRequest.
+	FirmwareMoveDoctor(context.Context, *FirmwareMoveDoctorRequest) (*FirmwareMoveDoctorResponse, error)
 	GetRuntimeInventory(context.Context, *GetRuntimeInventoryRequest) (*RuntimeInventory, error)
 	// CollectOrphanProof answers, for THIS host, "does anything here still claim
 	// this address" — every defined domain in every state plus this host's local
@@ -5454,6 +5535,15 @@ type LiteVirtServer interface {
 	EnsureFirmwareState(context.Context, *EnsureFirmwareStateRequest) (*EnsureFirmwareStateResponse, error)
 	RollbackFirmwareState(context.Context, *RollbackFirmwareStateRequest) (*RollbackFirmwareStateResponse, error)
 	CleanupMigrationArtifacts(context.Context, *CleanupMigrationArtifactsRequest) (*emptypb.Empty, error)
+	// Live firmware migration (peer only): see PrepareLiveFirmwareTargetRequest
+	// and the three after it.
+	PrepareLiveFirmwareTarget(context.Context, *PrepareLiveFirmwareTargetRequest) (*PrepareLiveFirmwareTargetResponse, error)
+	VerifyLiveFirmwareTarget(context.Context, *VerifyLiveFirmwareTargetRequest) (*VerifyLiveFirmwareTargetResponse, error)
+	ReleaseLiveFirmwareTarget(context.Context, *ReleaseLiveFirmwareTargetRequest) (*ReleaseLiveFirmwareTargetResponse, error)
+	AbortLiveFirmwareTarget(context.Context, *AbortLiveFirmwareTargetRequest) (*AbortLiveFirmwareTargetResponse, error)
+	// FirmwareMoveDoctorTarget is a target's part of `lv doctor firmware-move`,
+	// asked by the move's source (peer only).
+	FirmwareMoveDoctorTarget(context.Context, *FirmwareMoveDoctorTargetRequest) (*FirmwareMoveDoctorTargetResponse, error)
 	// ReceiveMigrationDisk takes one host-local disk file of a STOPPED VM that is
 	// being cold-migrated here, as a client stream. See ReceiveMigrationDiskRequest.
 	ReceiveMigrationDisk(grpc.ClientStreamingServer[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse]) error
@@ -5918,6 +6008,9 @@ func (UnimplementedLiteVirtServer) DeleteVM(context.Context, *DeleteVMRequest) (
 }
 func (UnimplementedLiteVirtServer) RepairVMOwner(context.Context, *RepairVMOwnerRequest) (*RepairVMOwnerResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RepairVMOwner not implemented")
+}
+func (UnimplementedLiteVirtServer) FirmwareMoveDoctor(context.Context, *FirmwareMoveDoctorRequest) (*FirmwareMoveDoctorResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method FirmwareMoveDoctor not implemented")
 }
 func (UnimplementedLiteVirtServer) GetRuntimeInventory(context.Context, *GetRuntimeInventoryRequest) (*RuntimeInventory, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetRuntimeInventory not implemented")
@@ -6587,6 +6680,21 @@ func (UnimplementedLiteVirtServer) RollbackFirmwareState(context.Context, *Rollb
 }
 func (UnimplementedLiteVirtServer) CleanupMigrationArtifacts(context.Context, *CleanupMigrationArtifactsRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method CleanupMigrationArtifacts not implemented")
+}
+func (UnimplementedLiteVirtServer) PrepareLiveFirmwareTarget(context.Context, *PrepareLiveFirmwareTargetRequest) (*PrepareLiveFirmwareTargetResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PrepareLiveFirmwareTarget not implemented")
+}
+func (UnimplementedLiteVirtServer) VerifyLiveFirmwareTarget(context.Context, *VerifyLiveFirmwareTargetRequest) (*VerifyLiveFirmwareTargetResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method VerifyLiveFirmwareTarget not implemented")
+}
+func (UnimplementedLiteVirtServer) ReleaseLiveFirmwareTarget(context.Context, *ReleaseLiveFirmwareTargetRequest) (*ReleaseLiveFirmwareTargetResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseLiveFirmwareTarget not implemented")
+}
+func (UnimplementedLiteVirtServer) AbortLiveFirmwareTarget(context.Context, *AbortLiveFirmwareTargetRequest) (*AbortLiveFirmwareTargetResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AbortLiveFirmwareTarget not implemented")
+}
+func (UnimplementedLiteVirtServer) FirmwareMoveDoctorTarget(context.Context, *FirmwareMoveDoctorTargetRequest) (*FirmwareMoveDoctorTargetResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method FirmwareMoveDoctorTarget not implemented")
 }
 func (UnimplementedLiteVirtServer) ReceiveMigrationDisk(grpc.ClientStreamingServer[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse]) error {
 	return status.Error(codes.Unimplemented, "method ReceiveMigrationDisk not implemented")
@@ -7575,6 +7683,24 @@ func _LiteVirt_RepairVMOwner_Handler(srv interface{}, ctx context.Context, dec f
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).RepairVMOwner(ctx, req.(*RepairVMOwnerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_FirmwareMoveDoctor_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FirmwareMoveDoctorRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).FirmwareMoveDoctor(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_FirmwareMoveDoctor_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).FirmwareMoveDoctor(ctx, req.(*FirmwareMoveDoctorRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -11361,6 +11487,96 @@ func _LiteVirt_CleanupMigrationArtifacts_Handler(srv interface{}, ctx context.Co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_PrepareLiveFirmwareTarget_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PrepareLiveFirmwareTargetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PrepareLiveFirmwareTarget(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PrepareLiveFirmwareTarget_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PrepareLiveFirmwareTarget(ctx, req.(*PrepareLiveFirmwareTargetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_VerifyLiveFirmwareTarget_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(VerifyLiveFirmwareTargetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).VerifyLiveFirmwareTarget(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_VerifyLiveFirmwareTarget_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).VerifyLiveFirmwareTarget(ctx, req.(*VerifyLiveFirmwareTargetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ReleaseLiveFirmwareTarget_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseLiveFirmwareTargetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ReleaseLiveFirmwareTarget(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ReleaseLiveFirmwareTarget_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ReleaseLiveFirmwareTarget(ctx, req.(*ReleaseLiveFirmwareTargetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_AbortLiveFirmwareTarget_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AbortLiveFirmwareTargetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).AbortLiveFirmwareTarget(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_AbortLiveFirmwareTarget_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).AbortLiveFirmwareTarget(ctx, req.(*AbortLiveFirmwareTargetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_FirmwareMoveDoctorTarget_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FirmwareMoveDoctorTargetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).FirmwareMoveDoctorTarget(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_FirmwareMoveDoctorTarget_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).FirmwareMoveDoctorTarget(ctx, req.(*FirmwareMoveDoctorTargetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_ReceiveMigrationDisk_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(LiteVirtServer).ReceiveMigrationDisk(&grpc.GenericServerStream[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse]{ServerStream: stream})
 }
@@ -13019,6 +13235,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LiteVirt_RepairVMOwner_Handler,
 		},
 		{
+			MethodName: "FirmwareMoveDoctor",
+			Handler:    _LiteVirt_FirmwareMoveDoctor_Handler,
+		},
+		{
 			MethodName: "GetRuntimeInventory",
 			Handler:    _LiteVirt_GetRuntimeInventory_Handler,
 		},
@@ -13797,6 +14017,26 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CleanupMigrationArtifacts",
 			Handler:    _LiteVirt_CleanupMigrationArtifacts_Handler,
+		},
+		{
+			MethodName: "PrepareLiveFirmwareTarget",
+			Handler:    _LiteVirt_PrepareLiveFirmwareTarget_Handler,
+		},
+		{
+			MethodName: "VerifyLiveFirmwareTarget",
+			Handler:    _LiteVirt_VerifyLiveFirmwareTarget_Handler,
+		},
+		{
+			MethodName: "ReleaseLiveFirmwareTarget",
+			Handler:    _LiteVirt_ReleaseLiveFirmwareTarget_Handler,
+		},
+		{
+			MethodName: "AbortLiveFirmwareTarget",
+			Handler:    _LiteVirt_AbortLiveFirmwareTarget_Handler,
+		},
+		{
+			MethodName: "FirmwareMoveDoctorTarget",
+			Handler:    _LiteVirt_FirmwareMoveDoctorTarget_Handler,
 		},
 		{
 			MethodName: "CheckCPUCompatibility",

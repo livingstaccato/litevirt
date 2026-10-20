@@ -123,6 +123,12 @@ lv host init --local --name <name>        # Bootstrap on localhost (standalone)
                                           #   which also makes the node look like a
                                           #   founder — use `lv host add` instead
 lv host add <user@host> --name <name>     # Add host to cluster
+                                          # new <name> (init, add): letters, digits, '_', '.', '-';
+                                          #   not starting with '-' or '.', not ending in -migration,
+                                          #   and not ca, client, host, gossip, migration-ca, ui,
+                                          #   audit-signing or lv-cli (any case). A host an older
+                                          #   release admitted keeps its name; re-adding it after
+                                          #   `lv host rm` needs one that follows the rule
 lv host ls                                # List hosts (UPDATES column: pending OS package updates, see upgrades.md)
 lv host ls --names                        # Print only host names, one per line (for scripts)
 lv host inspect <host>                    # Host details, with the capacity reservations counted against it (see diagnostics.md)
@@ -131,10 +137,12 @@ lv host shutdown-workloads <host>         # Stop VMs in reverse startup-order (h
 lv host undrain <host> [--failback]       # Return a draining, maintenance, fenced or offline host to scheduling (--failback: wait for the failback it started and print results)
 lv host failback <host> [--all] [--dry-run] [--follow]   # Live-migrate VMs a drain moved away back to the host
 lv host rm <host> [--force]               # Remove host (--force with running VMs); revokes its cert
-lv host rm --dead <host> [--dry-run]      # Remove a host fenced proof-grade and gone for good: checks the
+lv host rm --dead <host> [--dry-run] [--force]  # Remove a host fenced proof-grade and gone for good: checks the
                                           #   fence, `voter rm` if it votes, revokes + publishes the CRL,
                                           #   removes it, and reports the stranded recoveries that now retry
-                                          #   at the next claim attempt. --dry-run changes nothing
+                                          #   at the next claim attempt. --dry-run changes nothing. Refused
+                                          #   while a firmware VM's live move to the host is not settled
+                                          #   (`lv doctor firmware-move <vm>`); --force removes it anyway
 lv host rm <host> --serial <serial>       # Remove one admission by its certificate: the row of <host> if it
   [--address <ip>]                        #   holds it, otherwise no row: once the daemon confirms no row
                                           #   holds it and the machine at --address has its trace and does
@@ -468,7 +476,7 @@ than silently breaking BitLocker. The explicit refusals:
 | revert with no captured firmware | refused (a pre-firmware/older snapshot can't be reverted safely) |
 | backup | snapshot backup only; the legacy raw stream backup is refused. Running VMs are refused — **stop the VM** to back up its firmware consistently. Multi-disk firmware VMs are not supported yet |
 | clone | gets a **fresh** vTPM + fresh NVRAM (the secret is never copied) — a cloned BitLocker guest needs its recovery key |
-| live migration | refused — use cold migration |
+| live migration | supported for a **running** VM between hosts with equal firmware code; its NVRAM and vTPM state move with it and are verified on the target (see [migration-failover.md](migration-failover.md#secure-boot--vtpm-vms)) |
 | cold migration | supported for a **stopped** VM; its host-local disks are copied as for any stopped VM, and its firmware is captured quiescent and carried to the target. PCI-passthrough firmware VMs are not supported yet |
 | host drain | a stopped VM is moved as cold migration moves it, host-local disks included; a running one is refused — stop it (`lv stop <vm>`), then drain again or `lv migrate <vm> <target-host> --cold` |
 | automatic failover (host died) | skipped — firmware is host-local and died with the host; recover via restore from a firmware-carrying backup |
@@ -1631,6 +1639,14 @@ lv doctor divergence [--json] [--table <name>]... [--include-sensitive]   # Repo
 lv doctor repair-owner <vm> <host>           # Re-assert a VM's owner on the host that actually runs it (audited)
 lv doctor fence                              # Report whether a shared-disk VM's cross-host transfer would be fenced and whether every host enforces recovery claims (read-only)
 lv doctor privileged-containers              # Report privileged or legacy-confined containers (read-only)
+lv doctor firmware-move <vm> [--json]        # Show a live firmware migration's records on every host, with every hash and path (read-only)
+lv doctor firmware-move <vm> --accept-target | --reverify | --adopt-target-copy | --discard-target [--stop-target]
+lv doctor firmware-move <vm> --adopt-target-copy --acknowledge-rollback   # keep a leftover as the VM's own (older state)
+lv doctor firmware-move <vm> --accept-source [--acknowledge-rollback] [--stop-target]
+lv doctor firmware-move <vm> --confirm-target-nvram --accept-nvram-hash=<sha256>
+lv doctor firmware-move <vm> --push-source-nvram [--acknowledge-rollback] [--stop-target]
+lv doctor firmware-move <vm> --resolve unverified|quarantine
+                                             # Resolve a parked live firmware move (admin, vm.firmware-move; audited)
 ```
 
 `divergence` is read-only, and lists a lease-term tie that every host has
@@ -1639,6 +1655,13 @@ audited, admin-gated repair for an equal-timestamp ownership split a stationary 
 splits are reclaimed automatically by the runtime-repair reconcilers — see
 `docs/diagnostics.md` for the full model (categories, metrics, alerts, and the
 operational repair flow).
+
+`firmware-move` resolves a live Secure Boot / vTPM migration that parked, on
+the host whose record it acts on, by the move's state: see
+[Live firmware migration](diagnostics.md#live-firmware-migration-firmware_migration_)
+for which action takes which state. It refuses an action the state has no row
+for. `--acknowledge-rollback` is required where the source's copy may be older
+than the target's.
 
 ## Ansible integration
 

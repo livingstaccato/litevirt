@@ -359,7 +359,8 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// restore can rebuild this container faithfully, not as a bare image recreate.
 	createSpec := corrosion.ContainerCreateSpec{
 		Template: req.Template, Distro: req.Distro, Release: req.Release, Arch: req.Arch,
-		Networks: plan.specNets,
+		TemplateGen: info.ImageGen,
+		Networks:    plan.specNets,
 		// A new lineage: the owner record its files are matched by.
 		OwnerID:     randid.New(),
 		IDMapBase:   idmapBase,
@@ -683,6 +684,14 @@ func (s *Server) deleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")
 	}
+	// A compose recreate's delete forwarded from another entry host: the
+	// create that follows it is judged on this host first, its image
+	// fetched included, so a recreate refused there keeps its member
+	// (recreate_preflight.go). Before the container's lock: a fetch can take
+	// minutes, and judges nothing about the container itself.
+	if err := s.recreateDeleteCheck(ctx, req.Name); err != nil {
+		return nil, err
+	}
 	// Serialize with the other operations on this container and with the
 	// container checker's sweep (LockContainer), so a sweep never reconciles a
 	// container that is half deleted.
@@ -694,12 +703,6 @@ func (s *Server) deleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	// (lab 2 run c2, P-3). Dropping the cache only makes the next admission
 	// read the runtime afresh; it never admits anything unread.
 	defer s.invalidateInventoryCache()
-	// A compose recreate's delete forwarded from another entry host: the
-	// create that follows it is judged on this host's disk first, so a
-	// recreate refused there keeps its member (recreate_preflight.go).
-	if err := s.recreateDeleteCheck(ctx, req.Name); err != nil {
-		return nil, err
-	}
 	// The runtime delete is lxc-destroy -f, which stops a running container
 	// first, so without force a running one is refused. A remote peer's call is
 	// exempt: a current entry node judged it before forwarding, and an older
@@ -818,6 +821,27 @@ func (s *Server) ExecContainer(ctx context.Context, req *pb.ExecContainerRequest
 		s.audit(ctx, "ct.exec", req.Name, "permission denied: "+strings.Join(req.Argv, " "), "denied")
 		return nil, err
 	}
+	// In a privileged or legacy-confined container, exec is a host-level
+	// grant (requireContainerRoot), judged here from the resolved row, and
+	// again on the owner from its own row for a forward (execRootRefused):
+	// an entry whose replica lags may not know the container became one.
+	if mode := rootContainerMode(*rec); mode != "" {
+		if s.execRootRefused(ctx) {
+			s.audit(ctx, "ct.exec", req.Name, "permission denied on the owner ("+mode+"): "+strings.Join(req.Argv, " "), "denied")
+			return nil, status.Errorf(codes.PermissionDenied,
+				"container %q is %s on its host %s, so exec in it needs the Admin role or the ContainerRoot role on it "+
+					"(an Admin grants it with lv role grant ContainerRoot <principal> --path %s)",
+				req.Name, mode, s.hostName, ctRBACPathFor(rec.Project, req.Name))
+		}
+		if err := s.requireContainerRoot(ctx, *rec); err != nil {
+			s.audit(ctx, "ct.exec", req.Name, "permission denied ("+mode+"): "+strings.Join(req.Argv, " "), "denied")
+			return nil, status.Errorf(codes.PermissionDenied,
+				"container %q is %s, so exec in it needs the Admin role or the ContainerRoot role on it "+
+					"(an Admin grants it with lv role grant ContainerRoot <principal> --path %s); "+
+					"or move it over first with lv ct convert --unprivileged --confinement default %s",
+				req.Name, mode, ctRBACPathFor(rec.Project, req.Name), req.Name)
+		}
+	}
 	if host != s.hostName {
 		c, conn, err := s.peerClient(ctx, host)
 		if err != nil {
@@ -826,7 +850,7 @@ func (s *Server) ExecContainer(ctx context.Context, req *pb.ExecContainerRequest
 		defer conn.Close()
 		// Pin the resolved host on the forwarded request so the peer does not
 		// re-run the cluster-wide name resolution (same as StartContainer).
-		return c.ExecContainer(ctx, &pb.ExecContainerRequest{
+		return c.ExecContainer(s.execRootOutgoing(ctx, *rec), &pb.ExecContainerRequest{
 			Name: req.Name, HostName: host, Argv: req.Argv,
 		})
 	}
@@ -904,15 +928,22 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 		}
 	}
 	// Dest is where umoci unpacks the (untrusted) image rootfs as root, and a
-	// local oci: source is read as root — both are host-path primitives. A bare
-	// Dest name is contained under the daemon OCI staging dir; an absolute Dest
-	// or a local oci: source requires admin (remote docker:// registry pulls
-	// stay operator). The check binds the real caller on the entry node; a
-	// forwarded peer call runs as admin (daemon mTLS) so it isn't re-denied.
-	if lxc.RegistryHost(req.Image) == "" {
+	// local source (oci:, dir:, oci-archive:, docker-archive:) is read as
+	// root — both are host-path primitives. A bare Dest name is contained
+	// under the daemon OCI staging dir; an absolute Dest or a local source
+	// requires admin (registry pulls stay operator), and any other transport
+	// is refused (lxc.ParseOCISource reads the source as skopeo does). The
+	// check binds the real caller on the entry node; a forwarded peer call
+	// runs as admin (daemon mTLS) so it isn't re-denied, and the host that
+	// reads the source judges its path (checkOCIPullPaths).
+	src, err := lxc.ParseOCISource(req.Image)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if src.Local {
 		if err := RequireRole(ctx, "admin"); err != nil {
-			return nil, status.Error(codes.PermissionDenied,
-				"pulling from a local OCI source path requires the admin role")
+			return nil, status.Errorf(codes.PermissionDenied,
+				"pulling from a local %s: source reads this host as root, which requires the admin role", src.Transport)
 		}
 	}
 	if filepath.IsAbs(req.Dest) {
@@ -947,7 +978,7 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 	// Forward AFTER resolution so req carries the resolved secret to the host
 	// that actually runs skopeo (it cannot resolve per-user creds itself).
 	if forwarded, err := s.forwardSimpleCT(ctx, req.HostName, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
-		return c.PullOCIImage(s.ownerStrictOutgoing(ctx), req)
+		return c.PullOCIImage(s.ociReplaceOutgoing(ctx, req), req)
 	}); err != nil || forwarded != nil {
 		return forwarded, err
 	}
@@ -976,7 +1007,24 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 	if err := s.refuseClaimingOwnerlessItem(ctx, item, req.Dest, req.Project); err != nil {
 		return nil, err
 	}
-	if err := s.containerRuntime.PullOCIImage(ctx, req.Image, req.Dest, req.Tag, req.Username, req.Password); err != nil {
+	replace, err := s.judgeOCIReplace(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.containerRuntime.PullOCIImage(ctx, req.Image, req.Dest, req.Tag, req.Username, req.Password, replace, s.checkPullSource); err != nil {
+		switch {
+		case errors.Is(err, lxc.ErrOCIItemExists):
+			return nil, ociItemExistsErr(req.Dest, s.hostName)
+		case errors.Is(err, lxc.ErrSourceRefused):
+			return nil, status.Errorf(codes.InvalidArgument, "pull oci: %v", err)
+		case errors.Is(err, lxc.ErrStagingSpace):
+			return nil, status.Errorf(codes.ResourceExhausted, "pull oci: %v", err)
+		}
+		// The source check, run by the runtime on the object it opened,
+		// answers with its own code.
+		if st, ok := status.FromError(err); ok && st.Code() != codes.Unknown && st.Code() != codes.OK {
+			return nil, st.Err()
+		}
 		return nil, status.Errorf(codes.Internal, "pull oci: %v", err)
 	}
 	// Only an explicit --project makes the image a project's; without one it

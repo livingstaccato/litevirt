@@ -49,8 +49,7 @@ func heldCluster(t *testing.T) (*Cluster, *Node, *Node, map[string]*recordingNft
 		if p.Paused {
 			dst.Virt.SetState(name, libvirtfake.StatePaused)
 		} else {
-			dst.Virt.SetState(name, libvirtfake.StateRunning)
-			dst.Virt.OnRunning(name)
+			dst.Virt.SetState(name, libvirtfake.StateRunning) // fires OnRunning
 		}
 		return nil
 	}

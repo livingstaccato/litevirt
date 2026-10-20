@@ -267,6 +267,7 @@ func loadLogPolicy(ctx context.Context, db *corrosion.Client, hostName string, o
 	}
 	if avail, group := opts.Logging(); avail {
 		p.LogPolicy = LogPolicy{Available: true, Group: group, Default: lp.On(), Rate: lp.Rate, Burst: lp.Burst}
+		p.logRecheck = opts.Logging
 	}
 	return nil
 }

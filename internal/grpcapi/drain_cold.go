@@ -31,17 +31,103 @@ import (
 // names, so asking earlier would bounce the start back here.
 var drainOwnershipWait = time.Minute
 
-// drainColdMove runs one drain cold move through migrateOwnedVM, under the
-// per-VM "vm.migrate" span MigrateVM opens for an explicit migration. vm's
-// State must be "stopped": the move keeps it, and the handoff records it.
+// drainColdMove runs one drain cold move through drainMove. vm's State must
+// be "stopped": the move keeps it, and the handoff records it.
 func (s *Server) drainColdMove(ctx context.Context, vm *corrosion.VMRecord, target string, unlock func(), adopted *bool, opts ownedMigrateOpts) error {
+	return s.drainMove(ctx, vm, target, pb.MigrateStrategy_MIGRATE_COLD, unlock, adopted, opts)
+}
+
+// drainMove runs one drain move through migrateOwnedVM, under the per-VM
+// "vm.migrate" span MigrateVM opens for an explicit migration: a cold move
+// (drainColdMove), or a running Secure Boot / vTPM VM's live firmware move
+// (drainRunningFirmwareVM).
+func (s *Server) drainMove(ctx context.Context, vm *corrosion.VMRecord, target string, strategy pb.MigrateStrategy, unlock func(), adopted *bool, opts ownedMigrateOpts) error {
 	ctx, span := obs.Span(ctx, "vm.migrate")
 	span.SetAttribute("vm.name", vm.Name)
 	span.SetAttribute("vm.target_host", target)
 	defer span.End()
-	req := &pb.MigrateVMRequest{VmName: vm.Name, TargetHost: target, Strategy: pb.MigrateStrategy_MIGRATE_COLD}
+	req := &pb.MigrateVMRequest{VmName: vm.Name, TargetHost: target, Strategy: strategy}
 	discard := func(pb.MigratePhase, float32, float32) error { return nil }
 	return s.migrateOwnedVM(ctx, req, vm, discard, unlock, adopted, opts)
+}
+
+// firmwareLiveMoveIneligible is why a drain (or a failback, which follows
+// drain) does not try to move running Secure Boot / vTPM VM vm from host
+// from to host to live, or "" when it tries (spec §13): every disk on shared
+// storage (drain asks for no storage copy), no USB device, and both hosts
+// labelled for the live firmware move. The move itself checks everything
+// again, and refuses what this cannot see.
+func (s *Server) firmwareLiveMoveIneligible(ctx context.Context, vm *corrosion.VMRecord, from, to string) string {
+	disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
+	if err != nil {
+		return "its disks cannot be read: " + err.Error()
+	}
+	for _, d := range disks {
+		if isHostLocalDisk(d) {
+			return fmt.Sprintf("disk %s is on host-local storage, which a drain's live move does not copy", d.DiskName)
+		}
+	}
+	if len(parseSpecOrNil(vm.Spec).GetUsbDevices()) > 0 {
+		return "it has USB passthrough, which is never moved live"
+	}
+	for _, name := range []string{from, to} {
+		h, err := corrosion.GetHost(ctx, s.db, name)
+		if err != nil || h == nil {
+			return fmt.Sprintf("host %s cannot be read", name)
+		}
+		if h.Labels[corrosion.LabelFwLiveMigrate] != "true" {
+			return fmt.Sprintf("host %s does not advertise %s=true", name, corrosion.LabelFwLiveMigrate)
+		}
+	}
+	return ""
+}
+
+// firmwareDrainSkipText is a drain frame's text for a running Secure Boot /
+// vTPM VM it leaves running: the reason, and the routes that move it stopped.
+func firmwareDrainSkipText(vm, why string) string {
+	return "Secure Boot / vTPM VM can't be drained while running (" + why + ") — stop it (`lv stop " + vm + "`), " +
+		"then drain again, or migrate it with `lv migrate " + vm + " <target-host> --cold`; either moves it stopped, with its disks and its firmware"
+}
+
+// drainRunningFirmwareVM drains a running Secure Boot / vTPM VM that
+// firmwareLiveMoveIneligible passed through the live firmware move, as `lv
+// migrate <vm> <target>` moves it, under the caller's lock (spec §13). It
+// never falls back to a cold move. The frame says where the move ended:
+//   - done: the VM runs on the target;
+//   - skipped: the move was refused before the guest left (an older target
+//     without the live firmware RPCs among them): it runs here, untouched,
+//     and the frame gives today's text and the refusal;
+//   - error: the move failed or parked (its marker kept), or the VM moved
+//     but its finish did not complete; the refusal or failure is the text.
+func (s *Server) drainRunningFirmwareVM(ctx context.Context, vm *corrosion.VMRecord, target corrosion.HostRecord, unlock func(), adopted *bool) *pb.DrainProgress {
+	progress := &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Strategy: pb.MigrateStrategy_MIGRATE_LIVE}
+	err := s.drainMove(ctx, vm, target.Name, pb.MigrateStrategy_MIGRATE_LIVE, unlock, adopted, ownedMigrateOpts{})
+	if err == nil {
+		progress.Status = "done"
+		progress.ProgressPct = 100
+		return progress
+	}
+	msg := status.Convert(err).Message()
+	slog.Warn("drain: live firmware move did not complete", "vm", vm.Name, "target", target.Name, "error", err)
+	progress.Status = "error"
+	if cur, gerr := corrosion.GetVM(context.WithoutCancel(ctx), s.db, vm.Name); gerr == nil && cur != nil && cur.HostName != s.hostName {
+		progress.Error = "migrated; " + msg
+		return progress
+	}
+	if _, ok, merr := s.fwRecords().GetMarker(vm.Name); ok || merr != nil || *adopted {
+		// Parked (both copies of its firmware state kept), or still moving
+		// in the background.
+		progress.Error = msg
+		return progress
+	}
+	if status.Code(err) == codes.FailedPrecondition {
+		progress.Status = "skipped"
+		progress.Strategy = notMoved
+		progress.Error = firmwareDrainSkipText(vm.Name, "its live move was refused: "+msg)
+		return progress
+	}
+	progress.Error = "not moved, still on " + s.hostName + ": " + msg
+	return progress
 }
 
 // drainStoppedVM drains a STOPPED VM through the same path as `lv migrate
@@ -164,7 +250,11 @@ func (s *Server) drainRunningVMCold(ctx context.Context, vm *corrosion.VMRecord,
 			progress.Error = errDrainCrashed.Error()
 			return progress
 		}
-		if serr := s.startMovedVMOnTarget(ctx, vm.Name, target.Name); serr != nil {
+		opID := ""
+		if journal != nil {
+			opID = journal.OperationID
+		}
+		if serr := s.startMovedVMOnTarget(ctx, vm.Name, target.Name, opID); serr != nil {
 			finish("moved to " + target.Name + "; not started there: " + status.Convert(serr).Message())
 			progress.Status = "done"
 			progress.ProgressPct = 100
@@ -325,10 +415,10 @@ func (s *Server) restartAfterFailedColdMove(ctx context.Context, name string) er
 // It runs detached from the request, under its own bound: the move has
 // happened, and a client that goes away must not leave the VM stopped on the
 // target. A start that fails is recorded as a VM event.
-func (s *Server) startMovedVMOnTarget(ctx context.Context, name, target string) error {
+func (s *Server) startMovedVMOnTarget(ctx context.Context, name, target, opID string) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), drainOwnershipWait+drainStartTimeout)
 	defer cancel()
-	err := s.startOnOwner(ctx, name, target)
+	err := s.startOnOwner(ctx, name, target, opID)
 	if err != nil {
 		s.recordVMEvent(ctx, name, "vm.drain", "error",
 			"moved to "+target+" with its disks, but not started there: "+status.Convert(err).Message())
@@ -336,7 +426,9 @@ func (s *Server) startMovedVMOnTarget(ctx context.Context, name, target string) 
 	return err
 }
 
-func (s *Server) startOnOwner(ctx context.Context, name, target string) error {
+// opID is the drain operation the start ends: the marker names it, so the
+// target binds the row's stop intent to it. "" sends no marker.
+func (s *Server) startOnOwner(ctx context.Context, name, target, opID string) error {
 	client, closeConn, err := s.dialPeer(ctx, target)
 	if err != nil {
 		return status.Errorf(codes.Unavailable, "reach %s: %v", target, err)
@@ -355,10 +447,11 @@ func (s *Server) startOnOwner(ctx context.Context, name, target string) error {
 					// replica of the journal holds. Without the epoch no marker
 					// is sent: the gate then applies as to any start.
 					sctx := ctx
-					if cur, gerr := corrosion.GetVM(ctx, s.db, name); gerr == nil && cur != nil && cur.HostName == target {
+					if cur, gerr := corrosion.GetVM(ctx, s.db, name); gerr == nil && cur != nil && cur.HostName == target && opID != "" {
 						sctx = metadata.AppendToOutgoingContext(ctx,
 							DrainResumeFromMDKey, s.hostName,
-							DrainResumeEpochMDKey, strconv.FormatInt(cur.OwnerEpoch, 10))
+							DrainResumeEpochMDKey, strconv.FormatInt(cur.OwnerEpoch, 10),
+							DrainResumeOpMDKey, opID)
 					}
 					_, serr := client.StartVM(sctx, &pb.StartVMRequest{Name: name})
 					return serr
@@ -512,7 +605,7 @@ func (s *Server) resumeDrainColdMove(ctx context.Context, m corrosion.DrainColdM
 		// lock, which is never held across a peer call.
 		sctx, cancel := context.WithTimeout(ctx, drainOwnershipWait+drainStartTimeout)
 		defer cancel()
-		if err := s.startOnOwner(sctx, m.VM, vm.HostName); err != nil {
+		if err := s.startOnOwner(sctx, m.VM, vm.HostName, m.OperationID); err != nil {
 			return "", false, fmt.Errorf("start it on %s, its owner: %w", vm.HostName, err)
 		}
 		return "started on " + vm.HostName + ", where it was moved", false, nil

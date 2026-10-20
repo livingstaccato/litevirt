@@ -229,9 +229,14 @@ func (l *reservationLease) releaseQuota(ctx context.Context) {
 
 // release marks the reservation's operation terminal, freeing the capacity.
 // Idempotent, and safe on the empty lease returned for a no-op admission.
-func (l *reservationLease) release(ctx context.Context) {
+func (l *reservationLease) release(ctx context.Context) { l.released(ctx) }
+
+// released is release, reporting whether the host reservation it held, if
+// any, is released now (false: one whose release failed, and which the
+// stale-lease sweep collects).
+func (l *reservationLease) released(ctx context.Context) bool {
 	if l == nil || l.s == nil {
-		return
+		return true
 	}
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
 	defer cancel()
@@ -241,7 +246,7 @@ func (l *reservationLease) release(ctx context.Context) {
 		l.s.releaseProjectQuota(rctx, l.quotaHolder, l.quotaProject, id)
 	}
 	if l.id == "" {
-		return
+		return true
 	}
 	id := l.id
 	l.id = ""
@@ -251,8 +256,9 @@ func (l *reservationLease) release(ctx context.Context) {
 				"holds it until the stale-lease sweep collects it",
 				"operation", id, "destination", l.hostHolder, "error", err)
 			l.s.noteStateWriteFail(string(corrosion.OpResourceUpdateRunning), err)
+			return false
 		}
-		return
+		return true
 	}
 	if err := corrosion.AppendOperationStep(rctx, l.s.db, corrosion.OperationStepRecord{
 		OperationID: id, OwnerEpoch: l.ownerEpoch, StepName: corrosion.OpStepCompleted,
@@ -265,7 +271,9 @@ func (l *reservationLease) release(ctx context.Context) {
 		slog.Error("capacity reservation was not released; the host will hold it until the "+
 			"stale-lease sweep collects it", "operation", id, "error", err)
 		l.s.noteStateWriteFail(string(corrosion.OpResourceUpdateRunning), err)
+		return false
 	}
+	return true
 }
 
 // admitWithReservation reserves cpuDelta/memDelta against host and project, verifies

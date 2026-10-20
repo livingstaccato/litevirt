@@ -360,6 +360,54 @@ func (s *Server) chooseMigrationRoute(ctx context.Context, vmName string, target
 	return migrationRoute{addr: migAddr, direct: true, onNetwork: true}
 }
 
+// liveFirmwareMignetRoute is the D-3 entry of the live firmware route table
+// (spec §3.3): a memory-only firmware move over migration.network (Direct,
+// TLS). Off until lab e2e E-9 captures the stream on that network; while off,
+// firmwareRouteOverride sends such a move through libvirt's tunnel.
+var liveFirmwareMignetRoute = false
+
+// firmwareRouteOverride replaces chooseMigrationRoute's answer for a live
+// firmware move (spec §6.0), so stage C never refuses a route this would have
+// avoided: a storage copy always goes to the cluster address (a storage copy
+// over the migration network is not probed); a memory-only move keeps the
+// migration network's Direct+TLS route only while liveFirmwareMignetRoute is
+// on, and otherwise rides the tunnel on the cluster address. A cold move is
+// not a live firmware move and is returned unchanged.
+func firmwareRouteOverride(r migrationRoute, kind routeKind, target corrosion.HostRecord) migrationRoute {
+	cluster := migrationRoute{addr: target.Address}
+	switch kind {
+	case routeStorage:
+		return cluster
+	case routeMemory:
+		if liveFirmwareMignetRoute && r.direct && r.onNetwork {
+			return r
+		}
+		return cluster
+	}
+	return r
+}
+
+// chooseLiveFirmwareRoute is chooseMigrationRoute for a live firmware move:
+// its answer with firmwareRouteOverride applied. When the override moves the
+// data off the migration network it says so, in the log and on the VM's
+// events, as every other fallback does.
+func (s *Server) chooseLiveFirmwareRoute(ctx context.Context, vmName string, target corrosion.HostRecord, migAddr string, kind routeKind, bothTLS bool) migrationRoute {
+	r := s.chooseMigrationRoute(ctx, vmName, target, migAddr, kind, bothTLS)
+	o := firmwareRouteOverride(r, kind, target)
+	if o != r {
+		why := "a live firmware move does not copy storage over it (not probed)"
+		if kind == routeMemory {
+			why = "a live firmware move does not use it until its stream is verified to stay on that network; until then it rides libvirt's tunnel"
+		}
+		msg := fmt.Sprintf("migration.network %s is not used for the live firmware move of %s to %s: %s; "+
+			"its data goes to %s, the address the host is dialed on",
+			s.migrationNetwork, vmName, target.Name, why, target.Address)
+		slog.Warn("migration: " + msg)
+		s.recordVMEvent(ctx, vmName, "vm.migrate.network_fallback", "warn", msg)
+	}
+	return o
+}
+
 // answerMigrationNetwork is the target's half, run in EnsureDisks.
 func (s *Server) answerMigrationNetwork(ctx context.Context, req *pb.EnsureDisksRequest, resp *pb.EnsureDisksResponse) {
 	if req.GetMigrationNetwork() == "" {

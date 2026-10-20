@@ -735,6 +735,11 @@ func RecordSignedRetirement(ctx context.Context, c *Client, pkiDir, hostName, re
 		return fmt.Errorf("retirement certificate names %q, not %q",
 			cert.Subject.CommonName, hostName)
 	}
+	// The CN alone does not make a host: refuse the distributable client
+	// certificate here, before anything is checked or stored, as certFor does.
+	if pki.IsClientOnlyCert(cert) {
+		return fmt.Errorf("retirement certificate for %q is a client certificate, not one the CA minted for the host", hostName)
+	}
 	byKeyID, err := AuditKeyID(cert)
 	if err != nil {
 		return err

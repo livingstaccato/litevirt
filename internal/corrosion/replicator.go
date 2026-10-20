@@ -1758,6 +1758,9 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		// periodic anti-entropy full-row compare raises the safety-fault signal. Mixed-version
 		// safety is enforced on the SEND side (proof-bearing entries are dropped to peers that
 		// don't advertise split_brain_gate_v1), so this receive side just stays monotone.
+		if tableName == "project_authority_epochs" && sh.Kind == KindUpdate && isRetireProjectAuthority(s.SQL) {
+			return applyReplicatedAuthorityRetire(ctx, tx, s.Params)
+		}
 		sqlStmt := s.SQL
 		if sh.Kind == KindInsert {
 			sqlStmt = setInsertOrIgnore(sqlStmt, sh)

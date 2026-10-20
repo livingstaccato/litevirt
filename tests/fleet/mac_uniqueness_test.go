@@ -409,7 +409,7 @@ func TestFleet_MAC_ADrainResumeStartNeedsNoReplicatedJournal(t *testing.T) {
 		t.Fatalf("rv on %s: %v", dst.Name, err)
 	}
 	mctx := metadata.AppendToOutgoingContext(ctx, grpcapi.DrainResumeFromMDKey, src.Name,
-		grpcapi.DrainResumeEpochMDKey, strconv.FormatInt(rv.OwnerEpoch, 10))
+		grpcapi.DrainResumeEpochMDKey, strconv.FormatInt(rv.OwnerEpoch, 10), grpcapi.DrainResumeOpMDKey, "op-rv")
 	if _, err := peer.StartVM(mctx, &pb.StartVMRequest{Name: "rv"}); err != nil {
 		t.Fatalf("the drain source's resume start: %v", err)
 	}

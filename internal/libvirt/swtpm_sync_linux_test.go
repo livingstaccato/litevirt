@@ -631,7 +631,7 @@ func TestSwtpmSync_AHardLinkIsNotTouched(t *testing.T) {
 		ff := newFakeFlags(t)
 		marker := markerIn(t)
 		if !on {
-			if err := writeSwtpmMarker(marker); err != nil {
+			if err := writeSwtpmMarker(marker, base); err != nil {
 				t.Fatal(err)
 			}
 			ff.flags[pathIno(t, outside)] = fsSyncFlag

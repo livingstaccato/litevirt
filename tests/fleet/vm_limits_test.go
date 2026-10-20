@@ -865,7 +865,7 @@ func TestFleet_DoomedRedefineWithRestartIsRefusedBeforeTheGuestIsTouched(t *test
 		{
 			name: "secure_boot over existing NVRAM",
 			setup: func(t *testing.T, node *Node, _ *pb.VMSpec) {
-				p := lv.NvramPath(node.Server.DataDir(), "db")
+				p := node.FW.NvramPath("db")
 				if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 					t.Fatal(err)
 				}
@@ -878,12 +878,11 @@ func TestFleet_DoomedRedefineWithRestartIsRefusedBeforeTheGuestIsTouched(t *test
 		},
 		{
 			name: "tpm over existing TPM state",
-			setup: func(t *testing.T, _ *Node, spec *pb.VMSpec) {
-				t.Cleanup(lv.SetSwtpmBaseForTest(t.TempDir()))
+			setup: func(t *testing.T, node *Node, spec *pb.VMSpec) {
 				if spec.Uuid == "" {
 					t.Fatal("setup: db has no uuid in its spec")
 				}
-				dir := lv.LibvirtSwtpmDir(spec.Uuid)
+				dir := node.FW.SwtpmDir(spec.Uuid)
 				if err := os.MkdirAll(dir, 0o755); err != nil {
 					t.Fatal(err)
 				}

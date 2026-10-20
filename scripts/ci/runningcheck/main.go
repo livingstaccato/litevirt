@@ -108,6 +108,10 @@ var nonMinting = map[string]int{
 	// SyncVMStopIfRunning(ctx, c, name, state, detail, epoch): the
 	// out-of-band stop sync, conditional on the row still running.
 	"SyncVMStopIfRunning": 3,
+	// UpdateVMStateFrom(ctx, c, name, host, from, to, detail): UpdateVMState
+	// made only while the row is still host's and recorded `from` (a health
+	// restart's writes, over the row it acted on).
+	"UpdateVMStateFrom": 5,
 	// UpdateVMHost(ctx, c, name, hostName, state) — a plain state argument that
 	// goes straight into `UPDATE vms SET host_name = ?, state = ?`. It was
 	// registered -1 here under a comment claiming the state travelled inside a
@@ -587,8 +591,8 @@ type stateStatement struct {
 var stateWritingStatements = []stateStatement{
 	{
 		sql:     `UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ?`,
-		writers: []string{"UpdateVMState", "UpdateVMStateStrict", "SyncVMStopIfRunning", "RekeyStoppedVM"},
-		note:    "nonMinting, state at arg 3; they differ only in their Go-side row-count check",
+		writers: []string{"UpdateVMState", "UpdateVMStateStrict", "SyncVMStopIfRunning", "RekeyStoppedVM", "UpdateVMStateFrom"},
+		note:    "nonMinting, state at arg 3 (UpdateVMStateFrom: arg 5); they differ only in their Go-side row-count check or guard",
 	},
 	{
 		sql:     `UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ? AND vm_owner_epoch = ?`,

@@ -87,6 +87,27 @@ func (s *Server) withinDiskArtifactRoot(p string) bool {
 // ended without one: what waits on the call's result is never left waiting.
 var errLibvirtCallUnanswered = errors.New("the libvirt call ended without an answer")
 
+// answerLibvirtCall runs call in a goroutine of its own and returns the
+// channel its answer arrives on. The answer is sent however the goroutine
+// ends but by a panic, so what waits on it always gets one: what call
+// returned, or errLibvirtCallUnanswered when it ended without returning
+// (runtime.Goexit below it). A panic answers nothing: it goes on, and the
+// process with it.
+func answerLibvirtCall(call func() error) <-chan error {
+	answered := make(chan error, 1)
+	go func() {
+		err := errLibvirtCallUnanswered
+		defer func() {
+			if p := recover(); p != nil {
+				panic(p)
+			}
+			answered <- err
+		}()
+		err = call()
+	}()
+	return answered
+}
+
 // MigrateVM performs a live migration of a VM to a target host.
 // It streams MigrateProgress messages back to the caller.
 func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreamingServer[pb.MigrateProgress]) error {
@@ -888,18 +909,9 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// Run migration in background; poll progress. From here the failure branch
 	// below and the adopter own the outcome, so the abort stands down.
 	abort.armed = false
-	done := make(chan error, 1)
-	go func() {
-		// The answer is sent however this goroutine ends but by a panic, so
-		// the request or the adopter waiting on done always gets one. A panic
-		// answers nothing: it goes on, and the process with it.
-		migrateErr := errLibvirtCallUnanswered
-		defer func() {
-			if p := recover(); p != nil {
-				panic(p)
-			}
-			done <- migrateErr
-		}()
+	// The request or the adopter waiting on done always gets an answer
+	// (answerLibvirtCall).
+	done := answerLibvirtCall(func() error {
 		params := lv.MigrateParams{
 			Live:          live,
 			WithStorage:   withStorage,
@@ -934,8 +946,8 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		}
 		armed.apply(&params)
 		logVNCPasswordStrip(vm.Name, req.TargetHost, params.StripVNCPassword)
-		migrateErr = s.virt.MigrateToTarget(vm.Name, dconnuri, params)
-	}()
+		return s.virt.MigrateToTarget(vm.Name, dconnuri, params)
+	})
 
 	// failedOnSource ends a migration that left the guest on this host.
 	failedOnSource := func(migrateErr error) error {

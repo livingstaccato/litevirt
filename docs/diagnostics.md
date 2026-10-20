@@ -3257,6 +3257,34 @@ by a drain of the host that has no such move, and by `lv host undrain <host>`;
 a VM whose move is still finishing in the background stays named until it
 ends.
 
+### A VM left recorded `migrating` (`vm.migration_unresolved`)
+
+`vm.migration_unresolved` (evaluator `drain`, subject `vm/<vm>`, critical)
+names a VM recorded `migrating` with no move of it running: a drain's live
+move that ended without libvirt's answer while the guest was not running on
+the drained host (or its state there could not be read), or a daemon that
+stopped mid-move, raised when it starts again. The guest may run on the move's
+target, so the record stays `migrating`, a drain's target keeps its capacity
+reservation, and nothing starts or moves the VM: `lv start`, `lv restart` and
+`lv update --restart-if-needed` of it are refused, and a drain skips it,
+pointing here. No start path starts a VM recorded `migrating`, on any host:
+only the move itself brings its guest up, on the target. The evidence names the
+VM's host (`source`), the target (`target`) and what happened (`detail`).
+Find where the guest runs (`virsh list` on both hosts). If it runs on a host,
+`lv doctor repair-owner <vm> <host>` records it there; if it runs on none,
+`lv stop <vm>` settles the record. Either resolves the condition, and so does
+`lv rm <vm>`; each releases the target's reservation.
+
+`lv stop` and `lv rm` of a VM recorded `migrating` whose guest is not running
+on its host first ask the move's target whether it holds a domain of the VM.
+They are refused when it does (pointing at `lv doctor repair-owner`), and when
+the target cannot be asked, unless the target is proven powered off: fenced,
+or removed, over a verified IPMI or Redfish power-off or an operator's
+`lv host fence-confirm <target>`. A target that is gone for good is made so
+with `lv host fence-confirm <target>` once it is powered off (and then
+`lv host rm <target> --dead`). A guest still running on its host is stopped
+there, after any migration job libvirtd still runs for it is aborted.
+
 ### A firmware move record cannot be read (`firmware_migration_record_unreadable`)
 
 A live firmware migration keeps its records under `<data_dir>/fwmig-inflight/`

@@ -430,12 +430,12 @@ func TestFleet_AnEarlierSecondRemovalDoesNotEndALegacyReadd(t *testing.T) {
 
 // The removal that waited out a rolling upgrade (fix round 2). Mid-roll the
 // release token has not latched, so node-0's removal of wl is the previous
-// shape, naming no serial. node-2 does not hear it. A v1.9.0
-// node then re-adds wl, keeping its created_at and changing only the serial
-// (emulated on nodes 0 and 1), and node-2 takes that re-add by anti-entropy.
-// host_membership_split_v1 latches on node-2, and only then does the removal
-// reach it. The re-add stands on every node, over the WAL and after
-// anti-entropy.
+// shape, naming no serial. node-2 does not hear it. A v1.9.0 node then
+// re-adds wl, keeping its created_at and changing only the serial (emulated
+// on nodes 0 and 1), and node-2 takes that re-add by anti-entropy.
+// host_membership_split_v1 then latches on node-2 (109a8a2b4's WAL rule read
+// that latch; head's does not), and only then does the removal reach it. The
+// re-add stands on every node, over the WAL and after anti-entropy.
 //
 // Red on 109a8a2b4, whose WAL rule took a serial-less removal at incarnation 0
 // once the latch had formed: the tombstone carried the re-add's serial, and
@@ -602,6 +602,49 @@ func TestFleet_RemoveHostNamesTheAdmissionsSerial(t *testing.T) {
 		}
 		if j := incMutationLog(t, a); !strings.Contains(j, shape) {
 			t.Errorf("%s removed the down %s without naming its serial", a.Name, d.Name)
+		}
+	})
+}
+
+// Before the release token latches, RemoveHost writes the previous shape,
+// which every receiver knows; and after it, a row that records no serial is
+// still removable, in the previous shape (fix round 3, review m1 and m3).
+//
+// Mutations: RemoveHost writing the new shape whenever the host has a serial
+// (latched or not) turns "before the latch" red; dropping the empty-serial
+// fallback turns "no serial, after the latch" red.
+func TestFleet_RemoveHostShapeBeforeTheLatchAndWithoutASerial(t *testing.T) {
+	const newShape = "lower(cert_serial) = lower(?)"
+	const oldShape = "UPDATE hosts SET deleted_at = ?, updated_at = ? WHERE name = ?"
+	t.Run("before the latch", func(t *testing.T) {
+		c, gates := latchedFleet(t, 3, 5544)
+		seedIncPeers(c, gates)
+		useRawGossip(c)
+		a, d := c.Nodes[0], c.Nodes[2]
+		if _, err := c.SelfClient(a).RemoveHost(context.Background(), &pb.RemoveHostRequest{Name: d.Name, Force: true}); err != nil {
+			t.Fatalf("remove %s: %v", d.Name, err)
+		}
+		j := incMutationLog(t, a)
+		if strings.Contains(j, newShape) || !strings.Contains(j, oldShape) {
+			t.Errorf("%s removed %s before the release latch in a shape a previous release cannot read:\n%s", a.Name, d.Name, j)
+		}
+	})
+	t.Run("no serial, after the latch", func(t *testing.T) {
+		c, _ := incFleet(t, 5545)
+		a, d := c.Nodes[0], c.Nodes[2]
+		for _, n := range c.Nodes {
+			if _, err := n.DB.DB().Exec(`UPDATE hosts SET cert_serial = '' WHERE name = ?`, d.Name); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := c.SelfClient(a).RemoveHost(context.Background(), &pb.RemoveHostRequest{Name: d.Name, Force: true}); err != nil {
+			t.Fatalf("remove %s, which records no serial: %v", d.Name, err)
+		}
+		if h, _ := corrosion.GetHost(context.Background(), a.DB, d.Name); h != nil {
+			t.Errorf("%s still lists %s", a.Name, d.Name)
+		}
+		if j := incMutationLog(t, a); !strings.Contains(j, oldShape) {
+			t.Errorf("%s did not remove %s in the previous shape", a.Name, d.Name)
 		}
 	})
 }

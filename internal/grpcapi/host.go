@@ -1751,9 +1751,11 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*pb
 	// knows the removal that names the certificate serial it ends, so a
 	// receiver that holds a later admission of the name never ends it
 	// (corrosion.DeleteHostAdmissionIf). Before, the previous shape, which
-	// every receiver applies as it always has.
+	// every receiver applies as it always has. A row that records no serial
+	// (the schema allows '') has none to name, and is removed in the previous
+	// shape too.
 	var applied bool
-	if s.ReleaseTokenLatched() {
+	if s.ReleaseTokenLatched() && h.CertSerial != "" {
 		applied, err = corrosion.DeleteHostAdmissionIf(ctx, s.db, req.Name, h.CertSerial, key)
 	} else {
 		applied, err = corrosion.DeleteHostIf(ctx, s.db, req.Name, h.CertSerial, key)

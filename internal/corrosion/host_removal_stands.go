@@ -62,7 +62,10 @@ func sameLegacyAdmission(a, b hostKey) bool {
 //     is left to the clock, as before, and anti-entropy then decides the row
 //     by created_at and serial (sameLegacyAdmission). A previous-release node
 //     writes only this shape, and so does this build until the release token
-//     has latched.
+//     has latched (and for a row that records no serial). Until anti-entropy
+//     runs, a node that applied a lagging write to the host first keeps the
+//     row live in whatever state that write set, `active` and schedulable
+//     included.
 //
 // A removal stamped implausibly far ahead is left to the clock and its skew
 // guard.

@@ -113,7 +113,7 @@ type Daemon struct {
 	mintClearance atomic.Pointer[grpcapi.Server]
 
 	// migrationTLSMu serializes the migration-TLS install hook. Storage
-	// migrations, the start-up install and MigrationTLSStatus all run it, and
+	// migrations and the start-up install both run it, and
 	// two installs interleaving their per-file skip/write could leave QEMU a
 	// certificate from one set and a key from the other.
 	migrationTLSMu sync.Mutex
@@ -1265,6 +1265,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	migrationTLS := d.migrationTLSInstaller()
 	svc.SetMigrationTLS(migrationTLS)
 	svc.SetMigrationCAFingerprint(func() (string, error) { return pki.MigrationCAFingerprint(d.cfg.PKIDir) })
+	svc.SetMigrationTLSCheck(d.migrationTLSChecker())
 	svc.SetMigrationTLSStatus(func() *pb.MigrationTLSHostStatus {
 		return migrationTLSStatusRow(pki.InspectMigrationTLS(d.cfg.PKIDir, time.Now()))
 	})

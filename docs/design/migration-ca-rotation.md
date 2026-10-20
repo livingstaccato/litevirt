@@ -156,14 +156,16 @@ fixes `--reissue` whether or not rotation lands.
 
 1. **Validate before installing.** The key must match the certificate
    (`tls.X509KeyPair`), and the certificate must verify against the `ca.crt`
-   bundle. A set that fails is not installed; the error makes that migration
-   not TLS-ready, so it is refused (or plaintext where allowed). A torn push
+   bundle. A set that fails, or one missing some of its three files, is not
+   installed; the error makes that migration not TLS-ready, so it is refused
+   whatever `migration.allow_unencrypted_storage` says. A torn push
    resolves itself once the copy finishes, so a retry a few seconds later
    succeeds.
 2. **Skip unchanged files.** Today every storage migration rewrites all five
    files, so two concurrent migrations can tear each other's server pair. Only
-   files whose bytes differ are rewritten, so writes happen only when a push
-   actually changed something.
+   files whose bytes, mode or owner differ are rewritten, and the marker only
+   when it is missing or differs, so an install that changes nothing writes
+   nothing.
 
 ## `MigrationTLSStatus` and `lv doctor migration-tls`
 
@@ -179,17 +181,18 @@ host:
 - `cert_issuer_fingerprint` — the CA that issued the host certificate;
 - `cert_not_after` and each CA's `not_after`;
 - `allow_unencrypted_storage` — this host would fall back to plaintext;
-- `install_error` — why the daemon's install hook, run for the answer, refused
-  the set (a refused `/etc/pki/qemu`, an unresolvable QEMU user). Every gate
-  requires it empty.
+- `install_error` — why the daemon's installer would refuse the set (a refused
+  `/etc/pki/qemu`, an unresolvable QEMU user, a failed validation), from a
+  read-only check (`pki.CheckQemuMigrationTLS`) that installs nothing. Every
+  gate requires it empty.
 
 The daemon the CLI calls answers for itself and fans out to every host in the
 `hosts` table through `s.peerClient`, with `local_only=true` so the fan-out does
 not recurse. An unreachable host, or one returning `Unimplemented` (an older
-build), becomes a row with `error` set, not a failed call. The RPC changes
-nothing an operator owns (the install it runs is the same change-only,
-serialized install a storage migration runs) and returns nothing secret, so it
-takes the role the other read-only doctor RPCs take.
+build), becomes a row with `error` set, not a failed call. At most 8 peers
+are asked at once. The RPC writes nothing on any host and returns nothing
+secret, so a peer or a viewer may call it (`requirePeerOrRole`); a scoped
+token is refused. A peer's answer counts only as one row for that peer.
 
 ### Command
 

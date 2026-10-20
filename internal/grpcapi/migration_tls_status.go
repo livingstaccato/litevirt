@@ -17,23 +17,31 @@ import (
 // cannot hold the whole report.
 const peerMigrationTLSStatusTimeout = 10 * time.Second
 
+// peerMigrationTLSStatusConcurrency bounds the peers one report asks at once.
+const peerMigrationTLSStatusConcurrency = 8
+
 // SetMigrationTLSStatus sets the hook that reports this host's migration
 // credentials (the daemon reads them with pki.InspectMigrationTLS).
 func (s *Server) SetMigrationTLSStatus(fn func() *pb.MigrationTLSHostStatus) {
 	s.migrationTLSStatus = fn
 }
 
+// SetMigrationTLSCheck sets the read-only hook that says why this host's
+// daemon could not install its migration credentials, without installing
+// them (the daemon runs pki.CheckQemuMigrationTLS). nil reports nothing.
+func (s *Server) SetMigrationTLSCheck(fn func() error) { s.migrationTLSCheck = fn }
+
 func (s *Server) localMigrationTLSStatus() *pb.MigrationTLSHostStatus {
 	row := &pb.MigrationTLSHostStatus{Error: "this host cannot report its migration credentials"}
 	if s.migrationTLSStatus != nil {
 		row = s.migrationTLSStatus()
 	}
-	// Run the install hook too, so the row says what this daemon would
-	// install, not only what its files hold: a refused /etc/pki/qemu or an
-	// unresolvable QEMU user must hold a rotation's gate. The hook is
-	// change-only and serialized, so a healthy host rewrites nothing.
-	if row.GetError() == "" && s.migrationTLS != nil {
-		if _, err := s.migrationTLS(); err != nil {
+	// Say what this daemon would install, not only what its files hold: a
+	// refused /etc/pki/qemu or an unresolvable QEMU user must hold a
+	// rotation's gate. The check writes nothing; installing stays on the
+	// storage-migration and start-up paths.
+	if row.GetError() == "" && s.migrationTLSCheck != nil {
+		if err := s.migrationTLSCheck(); err != nil {
 			row.InstallError = err.Error()
 		}
 	}
@@ -44,12 +52,10 @@ func (s *Server) localMigrationTLSStatus() *pb.MigrationTLSHostStatus {
 
 // MigrationTLSStatus reports every host's migration credentials: this one
 // directly, every other host by asking it with local_only set. A host that
-// cannot answer is a row with an error, never a failed call.
+// cannot answer is a row with an error, never a failed call. It is read-only
+// on every host, so a peer or a viewer may ask.
 func (s *Server) MigrationTLSStatus(ctx context.Context, req *pb.MigrationTLSStatusRequest) (*pb.MigrationTLSStatusResponse, error) {
-	if req.GetLocalOnly() && s.requirePeerCert(ctx) == nil {
-		return &pb.MigrationTLSStatusResponse{Hosts: []*pb.MigrationTLSHostStatus{s.localMigrationTLSStatus()}}, nil
-	}
-	if err := RequireRole(ctx, "viewer"); err != nil {
+	if err := s.requirePeerOrRole(ctx, "viewer"); err != nil {
 		return nil, err
 	}
 	if req.GetLocalOnly() {
@@ -60,6 +66,7 @@ func (s *Server) MigrationTLSStatus(ctx context.Context, req *pb.MigrationTLSSta
 		return nil, status.Errorf(codes.Internal, "list hosts: %v", err)
 	}
 	rows := make([]*pb.MigrationTLSHostStatus, len(hosts))
+	sem := make(chan struct{}, peerMigrationTLSStatusConcurrency)
 	var wg sync.WaitGroup
 	for i, h := range hosts {
 		if h.Name == s.hostName {
@@ -67,8 +74,10 @@ func (s *Server) MigrationTLSStatus(ctx context.Context, req *pb.MigrationTLSSta
 			continue
 		}
 		wg.Add(1)
+		sem <- struct{}{}
 		go func(i int, name string) {
 			defer wg.Done()
+			defer func() { <-sem }()
 			rows[i] = s.peerMigrationTLSStatus(ctx, name)
 		}(i, h.Name)
 	}
@@ -79,15 +88,21 @@ func (s *Server) MigrationTLSStatus(ctx context.Context, req *pb.MigrationTLSSta
 func (s *Server) peerMigrationTLSStatus(ctx context.Context, name string) *pb.MigrationTLSHostStatus {
 	ctx, cancel := context.WithTimeout(ctx, peerMigrationTLSStatusTimeout)
 	defer cancel()
-	failed := func(format string, a ...any) *pb.MigrationTLSHostStatus {
-		return &pb.MigrationTLSHostStatus{Host: name, Error: fmt.Sprintf(format, a...)}
-	}
 	client, conn, err := s.peerClient(ctx, name)
 	if err != nil {
-		return failed("unreachable: %v", err)
+		return peerStatusRow(name, nil, err)
 	}
 	defer conn.Close()
 	resp, err := client.MigrationTLSStatus(ctx, &pb.MigrationTLSStatusRequest{LocalOnly: true})
+	return peerStatusRow(name, resp, err)
+}
+
+// peerStatusRow is name's row from its answer: the one row it gave for itself,
+// or an error row naming why not. A peer never speaks for another host.
+func peerStatusRow(name string, resp *pb.MigrationTLSStatusResponse, err error) *pb.MigrationTLSHostStatus {
+	failed := func(format string, a ...any) *pb.MigrationTLSHostStatus {
+		return &pb.MigrationTLSHostStatus{Host: name, Error: fmt.Sprintf(format, a...)}
+	}
 	if status.Code(err) == codes.Unimplemented {
 		return failed("its build cannot report migration TLS; upgrade it")
 	}

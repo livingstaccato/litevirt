@@ -38135,9 +38135,10 @@ type MigrationTLSHostStatus struct {
 	CertNotAfter          *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=cert_not_after,json=certNotAfter,proto3" json:"cert_not_after,omitempty"`
 	// allow_unencrypted_storage: this host falls back to plaintext.
 	AllowUnencryptedStorage bool `protobuf:"varint,8,opt,name=allow_unencrypted_storage,json=allowUnencryptedStorage,proto3" json:"allow_unencrypted_storage,omitempty"`
-	// install_error is why this host's daemon could not install its set into
-	// QEMU's TLS directory when asked (a refused /etc/pki/qemu, an unresolvable
-	// QEMU user, a failed validation), or empty.
+	// install_error is why this host's daemon would refuse to install its set
+	// into QEMU's TLS directory (a refused /etc/pki/qemu, an unresolvable QEMU
+	// user, a failed validation), or empty. A read-only check: answering
+	// installs nothing.
 	InstallError  string `protobuf:"bytes,9,opt,name=install_error,json=installError,proto3" json:"install_error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

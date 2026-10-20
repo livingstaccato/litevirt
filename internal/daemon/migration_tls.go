@@ -76,9 +76,9 @@ func qemuOwner(confPath string, lookup func(string) (*user.User, error)) (int, i
 // host's migration credentials into QEMU's TLS directory, owned by the QEMU
 // user, and reports whether they are in place. It runs at daemon start and
 // before each storage migration, so credentials pushed by
-// `lv host install-migration-tls` take effect without a restart. MigrationTLSStatus
-// runs it too, to report what it would install. Calls are serialized on
-// d.migrationTLSMu.
+// `lv host install-migration-tls` take effect without a restart.
+// MigrationTLSStatus does not run it (see migrationTLSChecker). Calls are
+// serialized on d.migrationTLSMu.
 func (d *Daemon) migrationTLSInstaller() func() (bool, error) {
 	return func() (bool, error) {
 		d.migrationTLSMu.Lock()
@@ -88,6 +88,19 @@ func (d *Daemon) migrationTLSInstaller() func() (bool, error) {
 			return false, err
 		}
 		return pki.InstallQemuMigrationTLS(d.cfg.PKIDir, pki.QemuTLSDir, uid, gid)
+	}
+}
+
+// migrationTLSChecker is the read-only twin of migrationTLSInstaller, for
+// MigrationTLSStatus: it says why the installer would refuse (QEMU's user
+// cannot be resolved, the set does not validate, /etc/pki/qemu is someone
+// else's) and writes nothing.
+func (d *Daemon) migrationTLSChecker() func() error {
+	return func() error {
+		if _, _, err := qemuOwner(qemuConfPath, user.Lookup); err != nil {
+			return err
+		}
+		return pki.CheckQemuMigrationTLS(d.cfg.PKIDir, pki.QemuTLSDir)
 	}
 }
 

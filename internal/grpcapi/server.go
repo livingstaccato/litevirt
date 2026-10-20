@@ -414,6 +414,9 @@ type Server struct {
 	// migrationTLSStatus reports this host's migration credentials for
 	// MigrationTLSStatus. nil: this host cannot report them.
 	migrationTLSStatus func() *pb.MigrationTLSHostStatus
+	// migrationTLSCheck says, without writing anything, why this host's
+	// daemon could not install its migration credentials. nil: no check.
+	migrationTLSCheck func() error
 	// enfCanonicalIdentity is this node's kill-switch for natural-key identity
 	// resolution (snapshots/container_snapshots); gated by this flag AND the
 	// CanonicalIdentityV1 latch. Advertised CONDITIONALLY on this flag (like

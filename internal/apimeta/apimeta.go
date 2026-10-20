@@ -12,3 +12,14 @@ const InspectStaleHeader = "x-litevirt-inspect-stale"
 // own. A previous release's `lv` sets none, and the build it installs cannot
 // keep a host incarnation, so AdmitHost refuses to issue one for it.
 const AdmitInstallsReleaseHeader = "x-litevirt-admit-installs-release"
+
+// AdmissionAbsentReason and AdmissionAbsentDomain mark PreflightRemoveHost's
+// NotFound for a removal that names an expected certificate serial: the
+// daemon ran a removal's gates (admin, caught up, voter majority, a pull of
+// the hosts table) and then found no row of the name and no live row holding
+// that serial. An earlier daemon's NotFound carries neither, and
+// `lv host rm --serial` does not act on it.
+const (
+	AdmissionAbsentReason = "ADMISSION_ABSENT_AFTER_PULL"
+	AdmissionAbsentDomain = "litevirt.host"
+)

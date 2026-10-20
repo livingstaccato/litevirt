@@ -129,7 +129,7 @@ func installedLive(events []string) []string {
 	for _, e := range events {
 		switch {
 		case isStagedWrite(e):
-		case strings.HasPrefix(e, "run mkdir -p"), e == "sh unstage", e == "sh config":
+		case strings.HasPrefix(e, "run mkdir -p"), e == "sh unstage", e == "sh config", e == "sh records":
 		default:
 			live = append(live, e)
 		}
@@ -624,8 +624,8 @@ func TestHostAdd_KeepsTheMachinesConfig(t *testing.T) {
 			if tc.name == "quoted key" && strings.Contains(err.Error(), "alias") {
 				t.Errorf("a refusal not caused by an alias blames one: %v", err)
 			}
-			// Only the read of the config reached the host.
-			if len(f.client.admitted) != 0 || len(f.target.Events) != 1 || f.target.Events[0] != "sh config" {
+			// Only the reads of the add records and the config reached the host.
+			if len(f.client.admitted) != 0 || strings.Join(f.target.Events, ",") != "sh records,sh config" {
 				t.Errorf("the add went ahead: admitted %v, events %v", f.client.admitted, f.target.Events)
 			}
 		})

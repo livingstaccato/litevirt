@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -1785,11 +1786,93 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*pb
 // PreflightRemoveHost runs every refusal RemoveHost would give req and
 // removes nothing. `lv host rm` asks it before it revokes the host's
 // certificate: the revocation is not undone by a refusal that follows it.
+//
+// For a request naming an expected certificate serial that the row of the
+// name does not hold here (no row, or another admission's), it runs a
+// removal's gates anyway (admin, caught up, voter majority, a pull of the
+// hosts table) and answers on the pulled table: the ordinary refusals when
+// the row now holds the serial, and otherwise, when no live row holds it, a
+// refusal marked apimeta.AdmissionAbsentReason (NotFound with no row of the
+// name, FailedPrecondition with another admission's). That mark is what
+// `lv host rm <host> --serial <serial>` needs before it revokes a serial no
+// row holds.
 func (s *Server) PreflightRemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*emptypb.Empty, error) {
+	if want := req.GetExpectedCertSerial(); want != "" {
+		if err := RequireRole(ctx, "admin"); err != nil {
+			return nil, err
+		}
+		h, err := corrosion.GetHost(ctx, s.db, req.Name)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "read host %q: %v", req.Name, err)
+		}
+		if h == nil || !sameSerial(h.CertSerial, want) {
+			if err := s.absentAdmissionRefusal(ctx, req); err != nil {
+				return nil, err
+			}
+			return &emptypb.Empty{}, nil
+		}
+	}
 	if _, _, err := s.removeHostRefusal(ctx, req); err != nil {
 		return nil, err
 	}
 	return &emptypb.Empty{}, nil
+}
+
+// sameSerial reports whether a and b spell one certificate serial.
+func sameSerial(a, b string) bool {
+	ca, err := pki.CanonicalSerial(a)
+	if err != nil {
+		return false
+	}
+	cb, err := pki.CanonicalSerial(b)
+	return err == nil && ca == cb
+}
+
+// absentAdmissionRefusal is PreflightRemoveHost for an expected serial the
+// row of the name does not hold here.
+func (s *Server) absentAdmissionRefusal(ctx context.Context, req *pb.RemoveHostRequest) error {
+	want, err := pki.CanonicalSerial(req.GetExpectedCertSerial())
+	if err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	if err := s.hostOperatorWriteAllowed(ctx, "remove", req.Name); err != nil {
+		return err
+	}
+	if err := s.requireVoterMajority(ctx, "remove", req.Name); err != nil {
+		return err
+	}
+	if err := s.pullHostsNow(ctx, "remove", req.Name); err != nil {
+		return err
+	}
+	h, err := corrosion.GetHost(ctx, s.db, req.Name)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "read host %q: %v", req.Name, err)
+	}
+	if h != nil && sameSerial(h.CertSerial, want) {
+		// Its row has arrived: the ordinary removal's checks decide.
+		_, _, err := s.removeHostRefusal(ctx, req)
+		return err
+	}
+	hosts, err := corrosion.ListHosts(ctx, s.db)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "list hosts: %v", err)
+	}
+	for _, o := range hosts {
+		if sameSerial(o.CertSerial, want) {
+			return status.Errorf(codes.FailedPrecondition, "certificate %s is %s's, not %s's", want, o.Name, req.Name)
+		}
+	}
+	code, msg := codes.NotFound, fmt.Sprintf("no row of %s and no live row holding certificate %s, after a pull of the hosts table", req.Name, want)
+	if h != nil {
+		code = codes.FailedPrecondition
+		msg = fmt.Sprintf("%s's row holds certificate %s, not %s, and no live row holds %s, after a pull of the hosts table",
+			req.Name, h.CertSerial, want, want)
+	}
+	st := status.New(code, msg)
+	if d, derr := st.WithDetails(&errdetails.ErrorInfo{Reason: apimeta.AdmissionAbsentReason, Domain: apimeta.AdmissionAbsentDomain}); derr == nil {
+		st = d
+	}
+	return st.Err()
 }
 
 // removeHostRefusal is RemoveHost's checks: the host's row and the key of the

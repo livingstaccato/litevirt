@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -200,10 +202,12 @@ func projectRBACRoot(name string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	// "/" is the whole project namespace and "/_default" the implicit default
-	// project: grants under either belong to more than the row of that name, so no
-	// prefix retirement is derived from them (safename refuses to create them).
-	if canon == "/" || canon == "/_default" {
+	// A name the validator refuses to create ("/", "/_default", a segment named
+	// like a resource namespace such as "/acme/vms") has a canonical root that is
+	// not the row's own: "/projects", the default project's, or a live parent
+	// project's resource namespace. A row that already carries one (an older
+	// build made it) derives no prefix retirement. One predicate, the creator's.
+	if safename.ValidateNewProjectName(name) != nil {
 		return "", false
 	}
 	return safename.ProjectRBACPath(canon), true
@@ -346,10 +350,14 @@ func commitProjectLifecycle(ctx context.Context, c *Client, kind projectLifecycl
 		return false, err
 	}
 	root, ok := projectRBACRoot(name)
+	liveSpellings := liveSpellingsOf(name, spelled)
 	for _, r := range spelled {
 		if other, oerr := projectRBACRoot(r.String("name")); oerr && other == root {
 			ok = false
 		}
+	}
+	if h := projectSpellingsReadHook; h != nil {
+		h()
 	}
 	if ok {
 		rows, err := c.Query(ctx,
@@ -357,10 +365,16 @@ func commitProjectLifecycle(ctx context.Context, c *Client, kind projectLifecycl
 		if err != nil {
 			return false, err
 		}
-		hasSentinel := map[string]bool{}
+		// A binding outside /projects/ cannot be retired by any project delete (the
+		// sentinel itself, at "/", is one, so a principal gets at most one), so
+		// a principal that holds one keeps its authority whatever the deletes do:
+		// root-scope and group-held grants (group:admin@local at "/") need no
+		// sentinel, and giving one would turn a later revoke of that grant into a
+		// lockout instead of a fall-back to the legacy role.
+		stable := map[string]bool{}
 		for _, r := range rows {
-			if r.String("role") == SentinelRole && r.String("path") == bindingSentinelPath {
-				hasSentinel[r.String("principal")] = true
+			if pth := r.String("path"); pth != "/projects" && !strings.HasPrefix(pth, "/projects/") {
+				stable[r.String("principal")] = true
 			}
 		}
 		losing := map[string]bool{}
@@ -379,7 +393,7 @@ func commitProjectLifecycle(ctx context.Context, c *Client, kind projectLifecycl
 			}
 		}
 		for _, who := range order {
-			if hasSentinel[who] {
+			if stable[who] {
 				continue
 			}
 			stmts = append(stmts, Statement{
@@ -418,8 +432,55 @@ func commitProjectLifecycle(ctx context.Context, c *Client, kind projectLifecycl
 			Params: []interface{}{nowRFC3339(), c.NowTS(), p.Name},
 		})
 	}
-	return c.ExecuteBatchGuarded(ctx, guard, stmts)
+	// The retirement was decided with these live spellings of the name; the
+	// transaction must still see exactly them, or a sibling revived since would
+	// have its fresh grants retired by a statement list that predates it.
+	pinned := func(tx *sql.Tx) (bool, error) {
+		ok, err := guard(tx)
+		if err != nil || !ok {
+			return ok, err
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT name FROM projects WHERE name <> ? AND deleted_at IS NULL`, name)
+		if err != nil {
+			return false, err
+		}
+		defer rows.Close()
+		var now []string
+		for rows.Next() {
+			var n string
+			if err := rows.Scan(&n); err != nil {
+				return false, err
+			}
+			if sameProjectPath(n, name) {
+				now = append(now, n)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return false, err
+		}
+		sort.Strings(now)
+		return slices.Equal(now, liveSpellings), nil
+	}
+	return c.ExecuteBatchGuarded(ctx, pinned, stmts)
 }
+
+// liveSpellingsOf returns the sorted names, among the live rows read, that are
+// another spelling of name.
+func liveSpellingsOf(name string, rows []Row) []string {
+	var out []string
+	for _, r := range rows {
+		if n := r.String("name"); sameProjectPath(n, name) {
+			out = append(out, n)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// projectSpellingsReadHook, when set (tests only), runs after a lifecycle has
+// read which other spellings of the name are live and before it reads the
+// bindings it will retire.
+var projectSpellingsReadHook func()
 
 func newSentinelID() string {
 	buf := make([]byte, 16)

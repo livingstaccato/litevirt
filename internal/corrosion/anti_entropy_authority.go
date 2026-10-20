@@ -316,7 +316,9 @@ func (c *Client) antiEntropyAuthorityDecision(tx *sql.Tx, table syncTable, row [
 	if table.Name == "tokens" {
 		// A token names the incarnation it was issued to, so this needs no
 		// latch here (token_incarnation.go).
-		if d, err := tokenRowDecision(tx, table, row); err != nil || d != mergeAuthorityNormal {
+		// A revoke is merged by its clock alone, past the per-sender rule
+		// below (final).
+		if d, final, err := tokenRowDecision(tx, table, row); err != nil || final || d != mergeAuthorityNormal {
 			return d, err
 		}
 	}

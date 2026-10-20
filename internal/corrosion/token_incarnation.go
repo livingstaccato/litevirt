@@ -25,7 +25,8 @@ import (
 //     account holds that incarnation (tokenIncarnationHolds);
 //   - the WAL skips, with its credential, a token insert for an incarnation
 //     the name has left (staleTokenInsert), anti-entropy does not take such
-//     a row (tokenRowDecision), and a node whose users row takes a new
+//     a live row though it always takes a revoke (tokenRowDecision), and a
+//     node whose users row takes a new
 //     incarnation drops the live tokens that do not hold for it
 //     (retireStaleTokens).
 //
@@ -39,11 +40,8 @@ import (
 //
 // No capability token of its own: the guarantee is enforced where a token is
 // USED, on the serving node, from the row alone. The writer emits the
-// stamped insert only where every receiver decodes it: once it has latched
-// user_incarnation_v1 (mandatory, ReplicationGated, so every host it
-// replicates to advertises it, which only builds with this column do), or for
-// an account whose incarnation a latched writer made, which proves the same
-// of the cluster.
+// stamped insert only where every receiver decodes it
+// (incarnationFormsDecodable).
 
 // tokensInsertIncarnationSQL is InsertToken's insert with the incarnation;
 // tokensInsertSQL is the previous release's.
@@ -86,6 +84,25 @@ func tokenIncarnationStale(stamp, current string) bool {
 	return stamp != current && incarnationAfter(current, stamp)
 }
 
+// incarnationFormsDecodable reports whether every host this node replicates
+// to decodes the incarnation forms (a re-create that names a new created_at,
+// a token stamped with its account's): this node has latched
+// user_incarnation_v1, or it holds an account a latched writer made — prev,
+// the account being written, or any other. Only a latched writer makes one,
+// and the latch is mandatory and ReplicationGated, so every host runs a build
+// with these forms. A node that has not latched itself yet therefore still
+// writes them once any node has, which leaves only the window before the
+// first latch (docs/upgrades.md).
+func (c *Client) incarnationFormsDecodable(ctx context.Context, prev string) (bool, error) {
+	if c.UserIncarnationOn() || latchedIncarnation(prev) {
+		return true, nil
+	}
+	// A latched incarnation always carries a fractional second, and no
+	// other created_at has a '.' (latchedIncarnation).
+	rows, err := c.Query(ctx, `SELECT 1 AS x FROM users WHERE instr(created_at, '.') > 0 LIMIT 1`)
+	return err == nil && len(rows) > 0, err
+}
+
 // tokenStampFor is the incarnation a new token of username is stamped with,
 // or "" for the previous release's insert (see the file comment).
 func (c *Client) tokenStampFor(ctx context.Context, username string) (string, error) {
@@ -94,10 +111,13 @@ func (c *Client) tokenStampFor(ctx context.Context, username string) (string, er
 		return "", err
 	}
 	created := rows[0].String("created_at")
-	if created != "" && (c.UserIncarnationOn() || latchedIncarnation(created)) {
-		return created, nil
+	if created == "" {
+		return "", nil
 	}
-	return "", nil
+	if ok, err := c.incarnationFormsDecodable(ctx, created); err != nil || !ok {
+		return "", err
+	}
+	return created, nil
 }
 
 // staleTokenInsert reports whether s is a replicated token insert for an
@@ -132,23 +152,28 @@ func staleTokenInsert(ctx context.Context, tx *sql.Tx, s Statement) (bool, error
 	return tokenIncarnationStale(stamp, current), nil
 }
 
-// tokenRowDecision is anti-entropy's rule for a tokens row: a token for an
-// incarnation the name has left here is not taken (this node never holds
-// one live: retireStaleTokens).
-func tokenRowDecision(tx *sql.Tx, table syncTable, row []interface{}) (mergeAuthorityDecision, error) {
+// tokenRowDecision is anti-entropy's rule for a tokens row: a live token for
+// an incarnation the name has left here is not taken. A revoke always is,
+// merged by its clock alone (final): it only takes access away, so no
+// sender's account, older or not, makes it unsafe, and a revoked token must
+// not stay live here.
+func tokenRowDecision(tx *sql.Tx, table syncTable, row []interface{}) (d mergeAuthorityDecision, final bool, err error) {
+	if mergeRowIsDeleted(table, row) {
+		return mergeAuthorityNormal, true, nil
+	}
 	idx := columnIndexMap(table.Columns)
 	var current string
-	err := tx.QueryRow(`SELECT created_at FROM users WHERE username = ?`, cellStr(row, idx, "username")).Scan(&current)
+	err = tx.QueryRow(`SELECT created_at FROM users WHERE username = ?`, cellStr(row, idx, "username")).Scan(&current)
 	if errors.Is(err, sql.ErrNoRows) {
-		return mergeAuthorityNormal, nil
+		return mergeAuthorityNormal, false, nil
 	}
 	if err != nil {
-		return mergeAuthorityKeepLocal, err
+		return mergeAuthorityKeepLocal, false, err
 	}
 	if tokenIncarnationStale(cellStr(row, idx, "user_created_at"), current) {
-		return mergeAuthorityKeepLocal, nil
+		return mergeAuthorityKeepLocal, false, nil
 	}
-	return mergeAuthorityNormal, nil
+	return mergeAuthorityNormal, false, nil
 }
 
 // retireStaleTokens drops, on this node only, the live tokens of name (and

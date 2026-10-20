@@ -3,6 +3,7 @@
 package lxc
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -82,5 +83,48 @@ func TestSweepKeepsTheStageWhenItCannotStopAWorker(t *testing.T) {
 	}
 	if _, err := os.Stat(stage); err != nil {
 		t.Fatal("the stage was removed under a live worker")
+	}
+}
+
+// A stage the start-up sweep kept (a worker it could not stop) stays kept:
+// the name's next fetch refuses rather than rebuild it under that worker.
+func TestFetchImage_KeepsAStageAWorkerMayStillWorkIn(t *testing.T) {
+	store := t.TempDir()
+	fakeLxcCreate(t, 0)
+	stage := filepath.Join(store, fetchDirName, "web", "web", "rootfs")
+	if err := os.MkdirAll(stage, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	startIn(t, stage)
+	prev := pidfdOpen
+	t.Cleanup(func() { pidfdOpen = prev })
+	pidfdOpen = func(int, int) (int, error) { return -1, errors.New("pidfd unsupported") }
+	err := (&LxcRunner{Lxcpath: store}).FetchImage(context.Background(),
+		CreateOpts{Name: "web", Template: "download", Distro: "alpine", Release: "3.22", Arch: "amd64"})
+	if err == nil {
+		t.Fatal("the fetch rebuilt a stage a worker may still work in")
+	}
+	if _, err := os.Stat(stage); err != nil {
+		t.Fatal("the stage was removed under a live worker")
+	}
+}
+
+// So does what an interrupted pull left of an item: its next pull refuses
+// rather than recover the entries under that worker.
+func TestRecoverItem_KeepsEntriesAWorkerMayStillWorkIn(t *testing.T) {
+	lib := t.TempDir()
+	entry := filepath.Join(lib, unpackDirName, "web+abc", "rootfs")
+	if err := os.MkdirAll(entry, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	startIn(t, entry)
+	prev := pidfdOpen
+	t.Cleanup(func() { pidfdOpen = prev })
+	pidfdOpen = func(int, int) (int, error) { return -1, errors.New("pidfd unsupported") }
+	if err := recoverItem(filepath.Join(lib, "web")); err == nil {
+		t.Fatal("recovery went ahead with a worker it could not stop")
+	}
+	if _, err := os.Stat(entry); err != nil {
+		t.Fatal("the entry was removed under a live worker")
 	}
 }

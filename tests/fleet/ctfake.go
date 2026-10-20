@@ -36,6 +36,10 @@ type CTFake struct {
 	mu   sync.Mutex
 	root string
 
+	// pinnedCopies is what a pinned fetch copied aside, by name: its
+	// template, generation and rootfs/etc/image.
+	pinnedCopies map[string][4]string
+
 	// state tracks the runtime state of each existing container
 	// ("running"/"stopped"). Absence means the container does not exist,
 	// which is kept in sync with the on-disk dir.
@@ -322,8 +326,36 @@ func (f *CTFake) FetchContainerImage(ctx context.Context, opts grpcapi.CreateCon
 		}
 	}
 	f.mu.Lock()
+	err := f.fetchErrLocked(opts)
+	f.mu.Unlock()
+	if err != nil || !opts.Pinned {
+		return err
+	}
+	// A pinned fetch copies the judged generation aside, under the item's
+	// lock, as lxc.LxcRunner.FetchImage does.
+	p, isPath, _ := lxc.TemplatePath(opts.Template)
+	if !isPath {
+		return nil
+	}
+	unlock := lxc.LockOCIItem(lxc.BundleDir(p))
+	defer unlock()
+	gen := lxc.ReadImageGen(lxc.BundleDir(p))
+	if !opts.PinAnyGen && gen != opts.PinnedGen {
+		return fmt.Errorf("ctfake: fetch %s: %w", opts.Template, lxc.ErrImageReplaced)
+	}
+	if opts.CheckItem != nil {
+		if err := opts.CheckItem(gen); err != nil {
+			return err
+		}
+	}
+	b, _ := os.ReadFile(filepath.Join(lxc.BundleDir(p), "rootfs", "etc", "image"))
+	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.fetchErrLocked(opts)
+	if f.pinnedCopies == nil {
+		f.pinnedCopies = map[string][4]string{}
+	}
+	f.pinnedCopies[opts.Name] = [4]string{opts.Template, pinWant(opts), string(b), gen}
+	return nil
 }
 
 // OnFetch registers fn to run inside every FetchContainerImage call: a slow
@@ -385,11 +417,22 @@ func (f *CTFake) snapshot(get func() []string) []string {
 
 func (f *CTFake) CreateContainer(_ context.Context, opts grpcapi.CreateContainerOpts) (*grpcapi.ContainerInfo, error) {
 	// A rootfs path is judged and copied under its item's lock, as the
-	// real create does.
+	// real create does: a pinned create from its copy, or from the item
+	// while it is still the pinned generation.
+	var fromCopy *[4]string
 	if p, isPath, _ := lxc.TemplatePath(opts.Template); isPath {
 		unlock := lxc.LockOCIItem(lxc.BundleDir(p))
 		defer unlock()
-		if opts.CheckItem != nil {
+		f.mu.Lock()
+		c, ok := f.pinnedCopies[opts.Name]
+		delete(f.pinnedCopies, opts.Name)
+		f.mu.Unlock()
+		if opts.Pinned && ok && c[0] == opts.Template && c[1] == pinWant(opts) {
+			fromCopy = &c
+		} else if opts.Pinned && !opts.PinAnyGen && lxc.ReadImageGen(lxc.BundleDir(p)) != opts.PinnedGen {
+			return nil, fmt.Errorf("ctfake: create %s: %w", opts.Name, lxc.ErrImageReplaced)
+		}
+		if fromCopy == nil && opts.CheckItem != nil {
 			if err := opts.CheckItem(lxc.ReadImageGen(lxc.BundleDir(p))); err != nil {
 				return nil, err
 			}
@@ -405,7 +448,10 @@ func (f *CTFake) CreateContainer(_ context.Context, opts grpcapi.CreateContainer
 	// A rootfs path's image is copied, as the real create copies it, so a
 	// later replace of the item does not reach this container.
 	var gen string
-	if p, isPath, _ := lxc.TemplatePath(opts.Template); isPath {
+	if fromCopy != nil {
+		_ = os.WriteFile(filepath.Join(f.dir(opts.Name), "rootfs", "payload"), []byte("image "+fromCopy[2]), 0o644)
+		gen = fromCopy[3]
+	} else if p, isPath, _ := lxc.TemplatePath(opts.Template); isPath {
 		if b, err := os.ReadFile(filepath.Join(lxc.BundleDir(p), "rootfs", "etc", "image")); err == nil {
 			_ = os.WriteFile(filepath.Join(f.dir(opts.Name), "rootfs", "payload"), append([]byte("image "), b...), 0o644)
 		}
@@ -556,6 +602,14 @@ func (f *CTFake) DeleteContainer(_ context.Context, name string) error {
 		hook(name)
 	}
 	return err
+}
+
+// ExecContainerStarted is ExecContainer, reporting the attach first.
+func (f *CTFake) ExecContainerStarted(ctx context.Context, name string, argv []string, started func()) (grpcapi.ContainerExecResult, error) {
+	if started != nil {
+		started()
+	}
+	return f.ExecContainer(ctx, name, argv)
 }
 
 func (f *CTFake) ExecContainer(_ context.Context, name string, argv []string) (grpcapi.ContainerExecResult, error) {
@@ -749,7 +803,7 @@ func (f *CTFake) CloneContainer(_ context.Context, src, dst string) error {
 // PullOCIImage unpacks a bundle at dest as umoci does — config.json, a
 // rootfs whose etc/image names image, and a fresh generation — refusing a
 // dest that already holds one unless replace, as lxc.PullOCI does.
-func (f *CTFake) PullOCIImage(_ context.Context, image, dest, _, _, _ string, replace bool, _ func(transport, path string) error, publish func() error) error {
+func (f *CTFake) PullOCIImage(_ context.Context, image, dest, _, _, _ string, replace bool, _ func(transport, path string) error, owner string, publish func() error) error {
 	if dest == "" {
 		return fmt.Errorf("ctfake: empty OCI destination")
 	}
@@ -762,11 +816,6 @@ func (f *CTFake) PullOCIImage(_ context.Context, image, dest, _, _, _ string, re
 	if exists && !replace {
 		return fmt.Errorf("%w: %s", lxc.ErrOCIItemExists, dest)
 	}
-	if exists {
-		if h := lxc.OCIItemPinnedBy(dest); h != "" {
-			return fmt.Errorf("%w: %s (into container %s)", lxc.ErrOCIItemPinned, dest, h)
-		}
-	}
 	stage := dest + ".ctfake-unpack"
 	_ = os.RemoveAll(stage)
 	if err := os.MkdirAll(filepath.Join(stage, "rootfs", "etc"), 0o755); err != nil {
@@ -776,7 +825,11 @@ func (f *CTFake) PullOCIImage(_ context.Context, image, dest, _, _, _ string, re
 		filepath.Join(stage, "rootfs", "etc", "image"): image,
 		filepath.Join(stage, "config.json"):            "{}",
 		filepath.Join(stage, lxc.ImageGenFile):         randid.New(),
+		filepath.Join(stage, lxc.OwnerFile):            owner,
 	} {
+		if b == "" && filepath.Base(p) == lxc.OwnerFile {
+			continue
+		}
 		if err := os.WriteFile(p, []byte(b), 0o644); err != nil {
 			return err
 		}
@@ -1010,4 +1063,12 @@ func (f *CTFake) CreateCalls() []grpcapi.CreateContainerOpts {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]grpcapi.CreateContainerOpts(nil), f.createCalls...)
+}
+
+// pinWant is what a pinned copy is bound to: its generation, or any.
+func pinWant(opts grpcapi.CreateContainerOpts) string {
+	if opts.PinAnyGen {
+		return "*"
+	}
+	return "=" + opts.PinnedGen
 }

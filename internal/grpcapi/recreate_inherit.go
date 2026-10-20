@@ -45,6 +45,9 @@ type recreateInherit struct {
 	// Template, or nothing (createItemCheck).
 	Pinned bool   `json:"pinned,omitempty"`
 	PinGen string `json:"pin_gen,omitempty"`
+	// Bound: the create is built from the copy the member's host took
+	// before the delete, whatever generation (createItemCheck).
+	Bound bool `json:"bound,omitempty"`
 }
 
 type recreateInheritKey struct{}
@@ -56,7 +59,7 @@ func withRecreateInherit(ctx context.Context, dec *recreateDecision, req *pb.Cre
 		Name: dec.name, Host: dec.host, Image: req.Image, Template: req.Template,
 		Privileged: req.Privileged, Confinement: req.Confinement,
 		Inherited: inherited, GrantTemplate: dec.template,
-		Pinned: dec.pinned, PinGen: dec.pinGen,
+		Pinned: dec.pinned, PinGen: dec.pinGen, Bound: dec.bound,
 	})
 }
 
@@ -120,8 +123,8 @@ func (s *Server) acceptRecreateInherit(ctx context.Context, req *pb.CreateContai
 	if ri.Inherited {
 		ctx = withInheritedSecurity(ctx)
 	}
-	if ri.Pinned {
-		ctx = withRecreatePin(ctx, req.Template, ri.PinGen)
+	if ri.Pinned || ri.Bound {
+		ctx = withRecreatePin(ctx, req.Template, ri.PinGen, !ri.Pinned)
 	}
 	return ctx
 }

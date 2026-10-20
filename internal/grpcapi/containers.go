@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -164,7 +165,11 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// A library item another project pulled is that project's image, for
 	// every create (a compose recreate's judgment runs this same check before
 	// its delete when the member is on this host).
-	if p, isPath, _ := lxc.TemplatePath(req.Template); isPath {
+	// A recreate built from the copy its member's host took before the
+	// delete was judged where the copy was taken (recreateFetchImage); the
+	// item's owner now is not that copy's, and the runtime judges the item
+	// again (createItemCheck) if it copies the item instead.
+	if p, isPath, _ := lxc.TemplatePath(req.Template); isPath && !recreateBound(ctx, req.Template) {
 		if err := s.refuseForeignOCIItem(ctx, ociLibraryName(p, s.dataDir), req.Project, "be created from"); err != nil {
 			s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
 			return nil, err
@@ -340,8 +345,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	}
 	specMounts, specDevices := hostAccessSpec(req.Mounts, req.Devices)
 	optMounts, optDevices := hostAccessOpts(corrosion.ContainerCreateSpec{Mounts: specMounts, Devices: specDevices})
-	checkItem, unpin := s.createItemCheck(ctx, req)
-	defer unpin()
+	checkItem, pinned, pinnedGen, anyGen := s.createItemCheck(ctx, req)
 	info, err := s.containerRuntime.CreateContainer(ctx, CreateContainerOpts{
 		Name: req.Name, Template: req.Template,
 		Distro: req.Distro, Release: req.Release, Arch: req.Arch,
@@ -349,7 +353,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		Networks: plan.lxcNics, Labels: req.Labels,
 		Confinement: confinement, IDMapBase: idmapBase,
 		Mounts: optMounts, Devices: optDevices,
-		CheckItem: checkItem,
+		CheckItem: checkItem, Pinned: pinned, PinnedGen: pinnedGen, PinAnyGen: anyGen,
 	})
 	if err != nil {
 		_ = s.releaseContainerNICs(ctx, req.Name)
@@ -357,6 +361,13 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		s.audit(ctx, "ct.create", req.Name, "image="+req.Image, "error")
 		if st, ok := status.FromError(err); ok && st.Code() == codes.PermissionDenied {
 			return nil, st.Err()
+		}
+		if errors.Is(err, lxc.ErrImageReplaced) {
+			return nil, status.Errorf(codes.PermissionDenied,
+				"recreating container %q: it is privileged or legacy-confined, and the image under %q was replaced after the recreate was judged, "+
+					"with no copy of the judged image kept for it, so the create would run another image as root on the host; "+
+					"that needs the Admin role or the ContainerRoot role on it (lv role grant ContainerRoot <principal> --path %s)",
+				req.Name, req.Template, ctRBACPathFor(req.Project, req.Name))
 		}
 		return nil, status.Errorf(codes.Internal, "create: %v", err)
 	}
@@ -853,7 +864,14 @@ func (s *Server) ExecContainer(ctx context.Context, req *pb.ExecContainerRequest
 	// Judge again where the exec attaches, from the row read under the
 	// container's lock, which lv ct stop, start and convert hold: the row
 	// judged above may be stale by now.
-	unlock := s.LockContainer(req.Name)
+	//
+	// The lock is held until the exec is attached, not for the session: a
+	// mode change needs the container stopped (lv ct convert), and the stop
+	// ends what is attached. A runtime that cannot tell when it is attached
+	// keeps the lock for the whole exec.
+	var once sync.Once
+	unlockContainer := s.LockContainer(req.Name)
+	unlock := func() { once.Do(unlockContainer) }
 	defer unlock()
 	cur, err := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name)
 	if err != nil {
@@ -865,7 +883,12 @@ func (s *Server) ExecContainer(ctx context.Context, req *pb.ExecContainerRequest
 	if err := s.judgeExecMode(ctx, *cur, rootContainerMode(*cur), req.Argv); err != nil {
 		return nil, err
 	}
-	res, err := s.containerRuntime.ExecContainer(ctx, req.Name, req.Argv)
+	var res ContainerExecResult
+	if es, ok := s.containerRuntime.(containerExecStarter); ok {
+		res, err = es.ExecContainerStarted(ctx, req.Name, req.Argv, unlock)
+	} else {
+		res, err = s.containerRuntime.ExecContainer(ctx, req.Name, req.Argv)
+	}
 	if err != nil {
 		s.audit(ctx, "ct.exec", req.Name, strings.Join(req.Argv, " "), "error")
 		return nil, status.Errorf(codes.Internal, "exec: %v", err)
@@ -1020,27 +1043,26 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 		return nil, err
 	}
 	// Only an explicit --project makes the image a project's; without one it
-	// is everyone's, as on main. The owner is recorded with the content,
-	// under the item's locks: a create judges the pair there
-	// (createItemCheck), and a concurrent claim cannot interleave its
-	// content with this claim's owner.
+	// is everyone's, as on main. The owner is recorded in the bundle with
+	// the content (lxc.OwnerFile), so the one rename that publishes the
+	// content publishes its owner; then, under the item's locks, in
+	// <data_dir>/oci-owners too, which an earlier build reads.
+	var owner string
 	var publish func() error
 	if item != "" && s.dataDir != "" && req.Project != "" {
-		owner := tenancy.NormalizeProject(req.Project)
+		owner = tenancy.NormalizeProject(req.Project)
 		publish = func() error {
 			ociOwnerWriteHook(item, owner)
 			if err := s.writeOCIOwner(item, owner); err != nil {
-				return fmt.Errorf("recording its owner (project %s) failed: %w; until it is recorded, the project that owned it before may still use the new image, so run the same lv ct pull --project again", owner, err)
+				slog.Warn("oci pull: the image's owner is recorded with it, but its copy for earlier builds could not be written", "image", item, "project", owner, "error", err)
 			}
 			return nil
 		}
 	}
-	if err := s.containerRuntime.PullOCIImage(ctx, req.Image, req.Dest, req.Tag, req.Username, req.Password, replace, s.checkPullSource, publish); err != nil {
+	if err := s.containerRuntime.PullOCIImage(ctx, req.Image, req.Dest, req.Tag, req.Username, req.Password, replace, s.checkPullSource, owner, publish); err != nil {
 		switch {
 		case errors.Is(err, lxc.ErrOCIItemExists):
 			return nil, ociItemExistsErr(req.Dest, s.hostName)
-		case errors.Is(err, lxc.ErrOCIItemPinned):
-			return nil, status.Errorf(codes.FailedPrecondition, "pull oci: %v", err)
 		case errors.Is(err, lxc.ErrSourceRefused):
 			return nil, status.Errorf(codes.InvalidArgument, "pull oci: %v", err)
 		case errors.Is(err, lxc.ErrStagingSpace):

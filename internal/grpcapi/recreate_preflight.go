@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"google.golang.org/grpc"
@@ -39,7 +40,8 @@ const (
 	recreateArchMDKey     = "x-litevirt-recreate-arch-bin"
 	// recreatePinnedMDKey carries the item generation a privileged or
 	// legacy member was built from, for a deployer who may not change its
-	// image: "1:<gen>" (gen may be empty).
+	// image: "1:<gen>" (gen may be empty); "2:" binds any other recreate
+	// from a rootfs path to the generation the fetch finds (bound).
 	recreatePinnedMDKey = "x-litevirt-recreate-pinned-gen-bin"
 )
 
@@ -54,6 +56,9 @@ type recreatePreflight struct {
 	// the rootfs path's content must still be generation pinGen.
 	pinned bool
 	pinGen string
+	// bound: the rootfs path's content is copied aside by the fetch before
+	// the delete, and the create built from that copy (pinned implies it).
+	bound bool
 }
 
 type recreatePreflightKey struct{}
@@ -80,6 +85,8 @@ func (s *Server) recreatePreflightOutgoing(ctx context.Context) context.Context 
 		recreateDistroMDKey, pf.distro, recreateReleaseMDKey, pf.release, recreateArchMDKey, pf.arch)
 	if pf.pinned {
 		ctx = metadata.AppendToOutgoingContext(ctx, recreatePinnedMDKey, "1:"+pf.pinGen)
+	} else if pf.bound {
+		ctx = metadata.AppendToOutgoingContext(ctx, recreatePinnedMDKey, "2:")
 	}
 	return ctx
 }
@@ -109,7 +116,9 @@ func (s *Server) recreatePreflightIncoming(ctx context.Context) *recreatePreflig
 		distro: first(recreateDistroMDKey), release: first(recreateReleaseMDKey), arch: first(recreateArchMDKey),
 	}
 	if g, ok := strings.CutPrefix(first(recreatePinnedMDKey), "1:"); ok {
-		pf.pinned, pf.pinGen = true, g
+		pf.pinned, pf.pinGen, pf.bound = true, g, true
+	} else if first(recreatePinnedMDKey) == "2:" {
+		pf.bound = true
 	}
 	return pf
 }
@@ -160,18 +169,25 @@ func (s *Server) recreatePinnedImage(ctx context.Context, pf recreatePreflight, 
 	if !isPath {
 		return nil
 	}
-	// Pinned at the generation it was judged at: no replacing pull runs
-	// until the recreate's create has copied it (createItemCheck).
-	if !lxc.PinOCIItem(lxc.BundleDir(p), name, pf.pinGen) {
-		s.audit(ctx, "ct.recreate-security", name, "image under "+pf.template+" replaced since the member was built", "denied")
-		return status.Errorf(codes.PermissionDenied,
-			"recreating container %q: it is privileged or legacy-confined, and the image under %q on %s is not the pull it was built from "+
-				"(the item was replaced since by a pull over it, or the member was built on another host, whose items are its own), "+
-				"so this recreate would run another image as root on the host; that needs the Admin role "+
-				"or the ContainerRoot role on it (lv role grant ContainerRoot <principal> --path %s). The member was left as it is",
-			name, pf.template, s.hostName, ctRBACPathFor(pf.project, name))
+	// A fast refusal; the fetch (recreateFetchImage) copies the judged
+	// generation aside under the item's lock, and the create is built from
+	// that copy, so a pull over the item after this cannot reach it.
+	if lxc.ReadImageGen(lxc.BundleDir(p)) != pf.pinGen {
+		return s.pinnedImageReplaced(ctx, pf, name)
 	}
 	return nil
+}
+
+// pinnedImageReplaced is the refusal of a pinned recreate whose item is no
+// longer the generation the member was built from.
+func (s *Server) pinnedImageReplaced(ctx context.Context, pf recreatePreflight, name string) error {
+	s.audit(ctx, "ct.recreate-security", name, "image under "+pf.template+" replaced since the member was built", "denied")
+	return status.Errorf(codes.PermissionDenied,
+		"recreating container %q: it is privileged or legacy-confined, and the image under %q on %s is not the pull it was built from "+
+			"(the item was replaced since by a pull over it, or the member was built on another host, whose items are its own), "+
+			"so this recreate would run another image as root on the host; that needs the Admin role "+
+			"or the ContainerRoot role on it (lv role grant ContainerRoot <principal> --path %s). The member was left as it is",
+		name, pf.template, s.hostName, ctRBACPathFor(pf.project, name))
 }
 
 // recreateFetchImage fetches and verifies, on the member's host and before
@@ -190,7 +206,20 @@ func (s *Server) recreateFetchImage(ctx context.Context, pf recreatePreflight, n
 			"recreating container %q: no container runtime on %s to fetch its image; the member was left as it is", name, s.hostName)
 	}
 	opts := CreateContainerOpts{Name: name, Template: pf.template, Distro: pf.distro, Release: pf.release, Arch: pf.arch}
+	if p, isPath, _ := lxc.TemplatePath(pf.template); isPath && (pf.pinned || pf.bound) {
+		// The copy the create is built from is taken now, before the delete,
+		// and judged where it is taken: its owner, under the item's lock.
+		item := ociLibraryName(p, s.dataDir)
+		opts.Pinned, opts.PinnedGen, opts.PinAnyGen = true, pf.pinGen, !pf.pinned
+		opts.CheckItem = func(string) error { return s.refuseForeignOCIItem(ctx, item, pf.project, "be created from") }
+	}
 	if err := s.containerRuntime.FetchContainerImage(ctx, opts); err != nil {
+		if errors.Is(err, lxc.ErrImageReplaced) {
+			return s.pinnedImageReplaced(ctx, pf, name)
+		}
+		if status.Code(err) == codes.PermissionDenied {
+			return status.Errorf(codes.PermissionDenied, "recreating container %q: %s; the member was left as it is", name, status.Convert(err).Message())
+		}
 		image := pf.template
 		if pf.template == "download" {
 			image = pf.distro + ":" + pf.release

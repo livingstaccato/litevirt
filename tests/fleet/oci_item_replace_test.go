@@ -121,10 +121,10 @@ func TestFleet_AnOperatorCannotRecreateAPrivilegedMemberFromAReplacedItem(t *tes
 }
 
 // An Admin's claim of the item between the member host's last judgment of
-// an Operator's recreate (its generation check) and the create's copy does
-// not reach the member: the item is pinned at the judged generation until
-// the copy, so the claim is refused, and the member is rebuilt from the
-// image it was judged on. Then the item is the Admin's to claim again.
+// an Operator's recreate (its generation check) and the create does not
+// reach the member: the member's host copied the judged generation aside
+// before the delete, the claim goes ahead, and the member is rebuilt from
+// the image it was judged on.
 func TestFleet_AClaimDuringAnOperatorsRecreateDoesNotReachTheMember(t *testing.T) {
 	for _, entry := range []int{0, 1} {
 		t.Run([]string{"entered on the owner", "entered on a peer"}[entry], func(t *testing.T) {
@@ -151,14 +151,11 @@ func TestFleet_AClaimDuringAnOperatorsRecreateDoesNotReachTheMember(t *testing.T
 			if !claimed {
 				t.Fatal("the member was not recreated")
 			}
-			if status.Code(claimErr) != codes.FailedPrecondition || !strings.Contains(claimErr.Error(), "build") {
-				t.Fatalf("the Admin's claim during the recreate: %v, want FailedPrecondition naming the member", claimErr)
+			if claimErr != nil {
+				t.Fatalf("the Admin's claim during the recreate: %v", claimErr)
 			}
 			if got := buildImage(t, owner); got != "image ghcr.io/acme/build:1" {
 				t.Fatalf("the member runs %q, want the image it was judged on", got)
-			}
-			if err := claim(); err != nil {
-				t.Fatalf("the Admin's claim after the recreate: %v", err)
 			}
 		})
 	}

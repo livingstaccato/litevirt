@@ -35,10 +35,11 @@ type PullOCIOptions struct {
 	// path of the object PullOCI opened (symlinks resolved), before
 	// anything reads it. nil judges nothing (lv ct pull --local, as root).
 	CheckSource func(transport, path string) error
+	// Owner, when not "", is recorded in the pulled bundle (OwnerFile)
+	// before it goes in place at Dest, with the content.
+	Owner string
 	// Publish runs once the pulled image is in place at Dest, under the
-	// item's locks, so what it records about the item (its owner) is
-	// recorded with the content it describes: nothing that takes the lock
-	// sees one without the other. Its error is the pull's.
+	// item's locks. Its error is the pull's.
 	Publish func() error
 }
 
@@ -135,11 +136,6 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) (err error) {
 	}
 	if exists && !opts.Replace {
 		return fmt.Errorf("%w: %s", ErrOCIItemExists, opts.Dest)
-	}
-	if exists {
-		if h := OCIItemPinnedBy(opts.Dest); h != "" {
-			return fmt.Errorf("%w: %s (into container %s); retry once it is done", ErrOCIItemPinned, opts.Dest, h)
-		}
 	}
 	// Where umoci unpacks: a fresh directory beside the item, which then
 	// takes its place (replaceBundle) or becomes it (a first pull, renamed
@@ -246,6 +242,11 @@ func PullOCI(ctx context.Context, opts PullOCIOptions) (err error) {
 	}
 	if err := writeImageGen(bundle); err != nil {
 		return err
+	}
+	if opts.Owner != "" {
+		if err := writeOwner(bundle, opts.Owner); err != nil {
+			return err
+		}
 	}
 	switch {
 	case exists:

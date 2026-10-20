@@ -105,3 +105,10 @@ func (s *Server) judgeExecMode(ctx context.Context, rec corrosion.ContainerRecor
 // execAfterJudge is a test seam: it runs after ExecContainer's first
 // judgment of the container's mode, before the judgment under its lock.
 var execAfterJudge = func() {}
+
+// containerExecStarter is a runtime that reports when an exec is attached
+// (LXCRuntimeAdapter.ExecContainerStarted), so ExecContainer holds the
+// container's lock only until then.
+type containerExecStarter interface {
+	ExecContainerStarted(ctx context.Context, name string, argv []string, started func()) (ContainerExecResult, error)
+}

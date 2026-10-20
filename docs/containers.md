@@ -87,13 +87,10 @@ paths:
   use any image. A pull over an existing item is refused, except an Admin's
   claim (`lv ct pull --project`), which replaces it with the image pulled
   (unpacked beside the item first; a pull that fails leaves the item as it
-  was). The owner record is written with the new image, so a create judges
-  the two together; a claim whose record cannot be written after the image
-  is in place fails saying so, and is run again. Containers created from it
-  keep their own copy. A claim is refused while a container created by an
-  earlier release uses the item's rootfs in place, naming it, and while a
-  compose recreate of a privileged or legacy-confined member built from the
-  item is under way (at most ten minutes): retry it once the deploy is done. A privileged or legacy-confined stack member built from
+  was). The owner is recorded inside the item, so it goes in place with the
+  image it owns, and a create judges the two together. Containers created
+  from it keep their own copy. A claim is refused while a container created
+  by an earlier release uses the item's rootfs in place, naming it. A privileged or legacy-confined stack member built from
   an item whose content was replaced since counts as changing its image on
   its next recreate (see compose.md).
 - Any other host path (`--template /srv/rootfs`, `rootfs:<path>`, a relative

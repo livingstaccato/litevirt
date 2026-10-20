@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"database/sql"
 	"strings"
 	"testing"
 	"time"
@@ -119,4 +120,55 @@ func TestFenceWritesForTests_HoldsLaterCallsUntilTheKill(t *testing.T) {
 	if _, landed := fence.Lift(); landed != 0 {
 		t.Errorf("%d rows landed", landed)
 	}
+}
+
+// A write admitted before the fence, mid-transaction when the fence goes up,
+// commits as it would have: the fence tells it nothing (Codex fix1 review
+// I3). The fence holds once it returned; a raw write after that is counted
+// as having got past the client's lock.
+//
+// Mutation: the fence refuses commits from the moment it is put up — the
+// admitted write is refused, red.
+func TestFenceWritesForTests_AnAdmittedWriteCommitsUntouched(t *testing.T) {
+	ctx := context.Background()
+	c := NewTestClientT(t)
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.DB().ExecContext(ctx, `CREATE TABLE fence_probe (k TEXT PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	inTx, release := make(chan struct{}), make(chan struct{})
+	committed := make(chan error, 1)
+	go func() {
+		_, err := c.ExecuteBatchGuarded(ctx, func(*sql.Tx) (bool, error) {
+			close(inTx)
+			<-release
+			return true, nil
+		}, []Statement{{SQL: `INSERT INTO fence_probe (k) VALUES ('admitted')`}})
+		committed <- err
+	}()
+	<-inTx
+	fence := c.FenceWritesForTests()
+	select {
+	case <-fence.Held():
+		t.Fatal("the fence held the lock while an admitted write was in its transaction")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if err := <-committed; err != nil {
+		t.Errorf("the admitted write was refused: %v", err)
+	}
+	<-fence.Held()
+	if _, err := c.DB().ExecContext(ctx, `INSERT INTO fence_probe (k) VALUES ('raw')`); err != nil {
+		t.Fatalf("a raw write while held: %v", err)
+	}
+	if n := fence.PastTheLock(); n != 1 {
+		t.Errorf("%d commits counted past the lock, want the raw one", n)
+	}
+	fence.Kill()
+	if _, err := c.DB().ExecContext(ctx, `INSERT INTO fence_probe (k) VALUES ('dead')`); err == nil {
+		t.Error("a write after the kill was not refused")
+	}
+	fence.Lift()
 }

@@ -1,18 +1,30 @@
 package corrosion
 
-import "sync/atomic"
+import (
+	"sync"
+	"sync/atomic"
+)
 
-// writeSever is a test client's write switch: while on, SQLite rolls back
-// every transaction one of the client's connections commits (its commit
-// hook), so nothing the client writes reaches the database, however it
-// writes (Execute, a raw DB() statement, a guarded batch, a local-only
-// table). It also counts, apart from that decision, the rows each commit
-// carried into the database while on: zero unless the refusal is broken.
+// writeSever is a test client's write switch (FenceWritesForTests). Fenced,
+// the client's own calls wait at its lock and nothing is refused; once the
+// fence holds the lock, a commit that still reaches the database got past
+// the lock (a raw DB() write) and is counted. Dead, SQLite rolls back every
+// commit of the client's connections (their commit hook), however it was
+// written. It also counts, apart from that decision, the rows each commit
+// carried into the database while dead: zero unless the refusal is broken.
 type writeSever struct {
-	on      atomic.Bool
-	refused atomic.Int64
-	landed  atomic.Int64
+	state       atomic.Int32 // severOff, severFenced, severHeld or severDead
+	refused     atomic.Int64
+	landed      atomic.Int64
+	pastTheLock atomic.Int64
 }
+
+const (
+	severOff int32 = iota
+	severFenced
+	severHeld
+	severDead
+)
 
 // severConn is one connection's view of its client's sever: the rows its
 // open transaction has changed so far (pre-update hook).
@@ -30,13 +42,16 @@ func (c *severConn) staged() { c.rows.Add(1) }
 // rollback.
 func (c *severConn) commit() int32 {
 	rows := c.rows.Swap(0)
-	if !c.s.on.Load() {
+	switch c.s.state.Load() {
+	case severHeld:
+		c.s.pastTheLock.Add(1)
 		return 0
+	case severDead:
+		if refuse := c.s.refuse(); refuse != 0 {
+			return refuse
+		}
+		c.s.landed.Add(rows)
 	}
-	if refuse := c.s.refuse(); refuse != 0 {
-		return refuse
-	}
-	c.s.landed.Add(rows)
 	return 0
 }
 
@@ -44,28 +59,27 @@ func (c *severConn) commit() int32 {
 // are gone.
 func (c *severConn) rollback() { c.rows.Store(0) }
 
-// refuse is the sever's decision on a commit while on.
+// refuse is the sever's decision on a commit of a dead client.
 func (s *writeSever) refuse() int32 {
 	s.refused.Add(1)
 	return 1
 }
 
-// WriteFence is a test client's database cut off from a scenario's killed
-// process: the commits of the client's connections are refused, and the
-// client's own calls are held at its lock.
+// WriteFence is a test client cut off from the database for a scenario's
+// killed process.
 type WriteFence struct {
-	c      *Client
-	held   chan struct{} // closed once the fence holds the client's lock
-	killed atomic.Bool
+	c    *Client
+	held chan struct{} // closed once the fence holds the client's lock
+	once sync.Once
 }
 
-// FenceWritesForTests fences this client: from now on every commit of its
-// connections is refused (the caller gets an error, no row changes), and the
-// fence takes the client's lock, so that a call of the client's admitted
-// before the fence runs to its end while a later one waits at the lock,
-// asking the database nothing. Held reports when the lock is taken. It
-// fences this client only; another client of the same shared test database
-// (another node's) is untouched. A raw read through DB() still answers.
+// FenceWritesForTests fences this client: the fence takes the client's
+// lock, so a call of the client's admitted before the fence runs to its end,
+// commits included, and a later one waits at the lock, asking the database
+// nothing and learning nothing. Nothing is refused until Kill. Held reports
+// when the lock is taken. It fences this client only; another client of the
+// same shared test database (another node's) is untouched. A raw read
+// through DB() still answers; a raw write is counted (PastTheLock).
 //
 // Test clients only (NewTestClient, NewSharedTestClient); it panics on any
 // other.
@@ -76,10 +90,12 @@ func (c *Client) FenceWritesForTests() *WriteFence {
 	}
 	s.refused.Store(0)
 	s.landed.Store(0)
-	s.on.Store(true)
+	s.pastTheLock.Store(0)
+	s.state.Store(severFenced)
 	w := &WriteFence{c: c, held: make(chan struct{})}
 	go func() {
 		c.mu.Lock()
+		s.state.CompareAndSwap(severFenced, severHeld)
 		close(w.held)
 	}()
 	return w
@@ -89,22 +105,37 @@ func (c *Client) FenceWritesForTests() *WriteFence {
 // the fence has returned.
 func (w *WriteFence) Held() <-chan struct{} { return w.held }
 
-// Kill lets the held calls, and every later one, go on to a database that
-// refuses all they commit. Only once Held.
+// PastTheLock is how many commits reached the database through this client's
+// connections while the fence held its lock: writes that bypassed the
+// client (raw DB() statements).
+func (w *WriteFence) PastTheLock() int64 { return w.c.writeSever.pastTheLock.Load() }
+
+// Kill refuses every commit of the client's connections from now on, and
+// lets the held calls, and every later one, go on to that refusal once the
+// fence holds the lock (at once when it does).
 func (w *WriteFence) Kill() {
-	<-w.held
-	if w.killed.CompareAndSwap(false, true) {
-		w.c.mu.Unlock()
+	w.c.writeSever.state.Store(severDead)
+	select {
+	case <-w.held:
+		w.release()
+	default:
+		go w.release()
 	}
+}
+
+// release gives the client's lock back once the fence holds it.
+func (w *WriteFence) release() {
+	<-w.held
+	w.once.Do(func() { w.c.mu.Unlock() })
 }
 
 // Lift ends the refusal, for the client of the process that replaces the
 // dead one, once nothing of the dead one is left: it reports how many
 // commits were refused, and how many rows nonetheless reached the database
-// while fenced.
+// while dead.
 func (w *WriteFence) Lift() (refused, landed int64) {
-	w.Kill()
+	w.release()
 	s := w.c.writeSever
-	s.on.Store(false)
+	s.state.Store(severOff)
 	return s.refused.Load(), s.landed.Load()
 }

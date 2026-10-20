@@ -19,12 +19,14 @@ import (
 // SetPITFailures makes every later snapshot or commit fail with the error
 // given (nil: succeed).
 func (f *Fake) SetPITFailures(snapshot, commit error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pitSnapErr, f.pitCommitErr = snapshot, commit
 }
 
 func (f *Fake) SnapshotDiskExternal(domain, diskPath, overlay string) (bool, error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.pitSnapErr != nil {
@@ -47,6 +49,7 @@ func (f *Fake) SnapshotDiskExternal(domain, diskPath, overlay string) (bool, err
 }
 
 func (f *Fake) CommitDiskOverlay(domain, diskPath, overlay, diskFormat string, beforePivot func() error) error {
+	f.daemon()
 	// As libvirt.Client: the commit ends in a redefine.
 	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpDefine, Name: domain}); err != nil {
 		return fmt.Errorf("commit %s into %s: %w", overlay, diskPath, err)
@@ -71,10 +74,12 @@ func (f *Fake) CommitDiskOverlay(domain, diskPath, overlay, diskFormat string, b
 
 // DomainRunsOnFile is DomainUsesFile: the model keeps one definition.
 func (f *Fake) DomainRunsOnFile(domain, path string) (bool, error) {
+	f.daemon()
 	return f.DomainUsesFile(domain, path)
 }
 
 func (f *Fake) DomainUsesFile(domain, path string) (bool, error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.pitOn[path] == domain, nil

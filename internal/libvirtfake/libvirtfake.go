@@ -65,6 +65,7 @@ type Fake struct {
 	execStdout, execStderr string
 	execExitCode           int32
 	mu                     sync.Mutex
+	sever                  severState // the daemon's connection severed (sever.go)
 	domains                map[string]State
 	xml                    map[string]string
 	activeXML              map[string]string              // domain → live-view override (see DumpXML)
@@ -411,6 +412,7 @@ func (f *Fake) applyLiveUnplug(domain string, remove func()) {
 // UnplugRequests reports how many detach requests domain has received — the
 // assertion that a verifier really did RE-REQUEST rather than only poll.
 func (f *Fake) UnplugRequests(domain string) int {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.unplugRequests[domain]
@@ -420,6 +422,7 @@ func (f *Fake) UnplugRequests(domain string) int {
 // it applies the parked live-view removals in request order and returns how many.
 // A no-op when nothing is pending, so a test can call it unconditionally.
 func (f *Fake) AckLiveUnplug(domain string) int {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	pending := f.pendingUnplug[domain]
@@ -438,6 +441,7 @@ func (f *Fake) AckLiveUnplug(domain string) int {
 // is carrying — the assertion that a detach really did leave the device in the live
 // view rather than removing it synchronously.
 func (f *Fake) PendingUnplugs(domain string) int {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.pendingUnplug[domain])
@@ -458,6 +462,7 @@ func (f *Fake) EventLog() []Event {
 // through DefineDomain + StartDomain. A domain it takes into running from
 // any other state starts running, as far as OnRunning is concerned.
 func (f *Fake) SetState(name string, s State) {
+	f.daemon()
 	f.mu.Lock()
 	if s != StatePaused {
 		delete(f.pendingNvram, name)
@@ -477,6 +482,7 @@ func (f *Fake) SetState(name string, s State) {
 // a domain. Scenarios use this to feed deterministic stats into
 // metrics + monitoring paths.
 func (f *Fake) SetStats(name string, s *libvirt.DomainStats) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.stats[name] = s
@@ -489,6 +495,7 @@ func (f *Fake) record(op, domain, note string) {
 // ── grpcapi.LibvirtBackend implementation ───────────────────────────────
 
 func (f *Fake) DefineDomain(xmlConfig string) error {
+	f.daemon()
 	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpDefine, Name: domainNameFromXML(xmlConfig), UUID: libvirt.UUIDFromXML(xmlConfig)}); err != nil {
 		return fmt.Errorf("define domain: %w", err)
 	}
@@ -610,6 +617,7 @@ func domainUUIDFromXML(xmlConfig string) string {
 
 // SetFirmwareMoveGuard mirrors libvirt.Client.SetFirmwareMoveGuard.
 func (f *Fake) SetFirmwareMoveGuard(g libvirt.FirmwareMoveGuard) {
+	f.daemon()
 	f.mu.Lock()
 	f.fwGuard = g
 	f.mu.Unlock()
@@ -660,22 +668,26 @@ func (f *Fake) fwExemptResume(c libvirt.FirmwareCall) error {
 
 // ResumeFirmwareMoveSource mirrors libvirt.Client.ResumeFirmwareMoveSource.
 func (f *Fake) ResumeFirmwareMoveSource(name, uuid, attempt string) error {
+	f.daemon()
 	return f.fwExemptResume(libvirt.FirmwareCall{Op: libvirt.OpResume, Name: name, UUID: uuid, Attempt: attempt, Via: libvirt.ViaResumeFirmwareMoveSource})
 }
 
 // ResumeFirmwareMoveSourceForOperator mirrors
 // libvirt.Client.ResumeFirmwareMoveSourceForOperator.
 func (f *Fake) ResumeFirmwareMoveSourceForOperator(name, uuid, attempt string) error {
+	f.daemon()
 	return f.fwExemptResume(libvirt.FirmwareCall{Op: libvirt.OpResume, Name: name, UUID: uuid, Attempt: attempt, Via: libvirt.ViaResumeFirmwareMoveSourceOperator})
 }
 
 // ResumePartitionPaused mirrors libvirt.Client.ResumePartitionPaused.
 func (f *Fake) ResumePartitionPaused(name, uuid string) error {
+	f.daemon()
 	return f.fwExemptResume(libvirt.FirmwareCall{Op: libvirt.OpResume, Name: name, UUID: uuid, Via: libvirt.ViaResumePartitionPaused})
 }
 
 // ResumeFirmwareMoveTarget mirrors libvirt.Client.ResumeFirmwareMoveTarget.
 func (f *Fake) ResumeFirmwareMoveTarget(name, uuid, attempt string) error {
+	f.daemon()
 	return f.fwExemptResume(libvirt.FirmwareCall{Op: libvirt.OpResume, Name: name, UUID: uuid, Attempt: attempt, Via: libvirt.ViaResumeFirmwareMoveTarget})
 }
 
@@ -683,6 +695,7 @@ func (f *Fake) ResumeFirmwareMoveTarget(name, uuid, attempt string) error {
 // destroy a paused domain, then undefine keeping its state; a running one is
 // refused, an absent one is nothing to discard.
 func (f *Fake) DiscardFirmwareMoveTarget(name, uuid, attempt string) error {
+	f.daemon()
 	c := libvirt.FirmwareCall{Name: name, UUID: uuid, Attempt: attempt, Via: libvirt.ViaDiscardFirmwareMoveTarget}
 	for _, op := range []libvirt.FirmwareOp{libvirt.OpStop, libvirt.OpUndefine} {
 		c.Op = op
@@ -709,6 +722,7 @@ func (f *Fake) DiscardFirmwareMoveTarget(name, uuid, attempt string) error {
 // UndefineFirmwareMoveLeftover mirrors
 // libvirt.Client.UndefineFirmwareMoveLeftover: the domain must be shut off.
 func (f *Fake) UndefineFirmwareMoveLeftover(name, uuid, attempt string) error {
+	f.daemon()
 	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpUndefine, Name: name, UUID: uuid, Attempt: attempt, Via: libvirt.ViaUndefineFirmwareMoveLeftover}); err != nil {
 		return fmt.Errorf("undefine leftover %s: %w", name, err)
 	}
@@ -728,17 +742,20 @@ func (f *Fake) UndefineFirmwareMoveLeftover(name, uuid, attempt string) error {
 // StopFirmwareMoveTargetForOperator mirrors
 // libvirt.Client.StopFirmwareMoveTargetForOperator.
 func (f *Fake) StopFirmwareMoveTargetForOperator(name, uuid, attempt string, force bool) error {
+	f.daemon()
 	return f.stopForOperator(name, uuid, attempt, force, libvirt.ViaStopFirmwareMoveTargetForOperator)
 }
 
 // StopOwedFirmwareLeftover mirrors libvirt.Client.StopOwedFirmwareLeftover.
 func (f *Fake) StopOwedFirmwareLeftover(name, uuid, attempt string, force bool) error {
+	f.daemon()
 	return f.stopForOperator(name, uuid, attempt, force, libvirt.ViaStopOwedFirmwareLeftover)
 }
 
 // UndefineOwedFirmwareLeftover mirrors
 // libvirt.Client.UndefineOwedFirmwareLeftover: the domain must be shut off.
 func (f *Fake) UndefineOwedFirmwareLeftover(name, uuid, attempt string) error {
+	f.daemon()
 	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpUndefine, Name: name, UUID: uuid, Attempt: attempt, Via: libvirt.ViaUndefineOwedFirmwareLeftover}); err != nil {
 		return fmt.Errorf("undefine leftover %s: %w", name, err)
 	}
@@ -772,6 +789,7 @@ func (f *Fake) stopForOperator(name, uuid, attempt string, force bool, via libvi
 
 // SetStartGuard mirrors libvirt.Client.SetStartGuard.
 func (f *Fake) SetStartGuard(g libvirt.StartGuard) {
+	f.daemon()
 	f.mu.Lock()
 	f.startGuard, f.guardSet = g, true
 	ready := f.guardReady
@@ -786,6 +804,7 @@ func (f *Fake) SetStartGuard(g libvirt.StartGuard) {
 // domain needs reports true for (nil: every start) wait for the next
 // SetStartGuard, up to wait.
 func (f *Fake) RequireStartGuard(wait time.Duration, needs func(name string) bool) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.guardReady, f.guardWait, f.guardNeeds = make(chan struct{}), wait, needs
@@ -804,6 +823,7 @@ func (f *Fake) running(name string) {
 // The firmware move guard is asked first, whatever the start guard's
 // readiness, as libvirt.Client's guard() does.
 func (f *Fake) StartDomain(name string) error {
+	f.daemon()
 	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpStart, Name: name}); err != nil {
 		return fmt.Errorf("start domain %s: %w", name, err)
 	}
@@ -920,6 +940,7 @@ func (f *Fake) startDomain(name string, paused bool) error {
 // DomainStateReason reports reason "paused", as libvirt does. Suspending a
 // domain that is not running is an error, as in libvirt.
 func (f *Fake) SuspendDomain(name string) error {
+	f.daemon()
 	if f.FailSuspendDomain != nil {
 		if err := f.FailSuspendDomain(name); err != nil {
 			return err
@@ -942,6 +963,7 @@ func (f *Fake) SuspendDomain(name string) error {
 // ResumeDomain resumes a PAUSED domain. Resuming a domain that is not paused
 // is an error, as in libvirt. The firmware move guard is asked first.
 func (f *Fake) ResumeDomain(name string) error {
+	f.daemon()
 	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpResume, Name: name}); err != nil {
 		return fmt.Errorf("resume domain %s: %w", name, err)
 	}
@@ -966,7 +988,7 @@ func (f *Fake) resumeDomain(name string) error {
 	f.domains[name] = StateRunning
 	f.record("resume", name, "")
 	f.flushPendingNvramLocked(name)
-	defer func() { f.mu.Unlock(); f.running(name); f.mu.Lock() }()
+	defer f.outsideLock(func() { f.running(name) })
 	return nil
 }
 
@@ -981,6 +1003,7 @@ func (f *Fake) RawState(name string) (State, bool) {
 }
 
 func (f *Fake) BlockPull(domain, disk string) error {
+	f.daemon()
 	if f.FailBlockPull != nil {
 		if err := f.FailBlockPull(domain, disk); err != nil {
 			return err
@@ -993,6 +1016,7 @@ func (f *Fake) BlockPull(domain, disk string) error {
 }
 
 func (f *Fake) BlockJobStatus(domain, disk string) (libvirt.BlockJobStatus, error) {
+	f.daemon()
 	if f.BlockJobStatusFn != nil {
 		return f.BlockJobStatusFn(domain, disk)
 	}
@@ -1000,6 +1024,7 @@ func (f *Fake) BlockJobStatus(domain, disk string) (libvirt.BlockJobStatus, erro
 }
 
 func (f *Fake) ShutdownDomain(name string) error {
+	f.daemon()
 	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpStop, Name: name}); err != nil {
 		return fmt.Errorf("shutdown domain %s: %w", name, err)
 	}
@@ -1039,6 +1064,7 @@ func (f *Fake) shutdownDomain(name string) error {
 }
 
 func (f *Fake) DestroyDomain(name string) error {
+	f.daemon()
 	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpStop, Name: name}); err != nil {
 		return fmt.Errorf("destroy domain %s: %w", name, err)
 	}
@@ -1082,6 +1108,7 @@ func notRunning(op, name string) error {
 }
 
 func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
+	f.daemon()
 	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpUndefine, Name: name}); err != nil {
 		return fmt.Errorf("undefine domain %s: %w", name, err)
 	}
@@ -1135,9 +1162,7 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	// Probe (g): the NVRAM goes with the definition, the swtpm tree stays.
 	f.deleteNvramLocked(name)
 	if hook := f.OnUndefined; hook != nil {
-		f.mu.Unlock()
-		hook(name)
-		f.mu.Lock()
+		f.outsideLock(func() { hook(name) })
 	}
 	return nil
 }
@@ -1145,6 +1170,7 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 // UndefineDomainPreservingState mirrors UndefineDomain but keeps the domain's
 // NVRAM and swtpm state (KEEP_NVRAM|KEEP_TPM, probe (b)).
 func (f *Fake) UndefineDomainPreservingState(name string) error {
+	f.daemon()
 	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpUndefine, Name: name}); err != nil {
 		return fmt.Errorf("undefine (keep state) domain %s: %w", name, err)
 	}
@@ -1182,9 +1208,7 @@ func (f *Fake) undefinePreservingState(name string) error {
 	f.leftStateLocked(name)
 	f.record("undefine", name, "keep_state=true")
 	if hook := f.OnUndefined; hook != nil {
-		f.mu.Unlock()
-		hook(name)
-		f.mu.Lock()
+		f.outsideLock(func() { hook(name) })
 	}
 	return nil
 }
@@ -1192,6 +1216,7 @@ func (f *Fake) undefinePreservingState(name string) error {
 // DomainIsActive mirrors libvirt's activity question. StateRunning and
 // StatePaused are both ACTIVE; only an undefined or shut-off domain is not.
 func (f *Fake) DomainIsActive(name string) (bool, error) {
+	f.daemon()
 	var active bool
 	var err error
 	_ = f.mainConn().callAs(false, "", name, func() { active, err = f.domainIsActive(name) })
@@ -1217,6 +1242,7 @@ func (f *Fake) domainIsActive(name string) (bool, error) {
 
 // DomainState is a call on the Fake's own connection (conn_model.go).
 func (f *Fake) DomainState(name string) (string, error) {
+	f.daemon()
 	var st string
 	var err error
 	if cerr := f.mainConn().call(name, func() { st, err = f.domainState(name) }); cerr != nil {
@@ -1251,12 +1277,14 @@ func (f *Fake) domainState(name string) (string, error) {
 // SetPaused puts a domain into the ACTIVE-but-not-running state, which
 // DomainState cannot distinguish from shut off. Scenario helper.
 func (f *Fake) SetPaused(name string) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.domains[name] = StatePaused
 }
 
 func (f *Fake) DomainExists(name string) bool {
+	f.daemon()
 	var ok bool
 	_ = f.mainConn().callAs(false, "", name, func() {
 		f.mu.Lock()
@@ -1269,6 +1297,7 @@ func (f *Fake) DomainExists(name string) bool {
 // SetStateReason injects the Reason returned by DomainStateReason for a domain
 // (e.g. "crashed" to drive an on-failure restart decision). Scenario helper.
 func (f *Fake) SetStateReason(name, reason string) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.reasons[name] = reason
@@ -1277,6 +1306,7 @@ func (f *Fake) SetStateReason(name, reason string) {
 // SetManagedSaveImage injects whether a domain carries a managed-save
 // (suspend-to-disk) image, as reported by HasManagedSaveImage.
 func (f *Fake) SetManagedSaveImage(name string, has bool) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.managedSave[name] = has
@@ -1286,6 +1316,7 @@ func (f *Fake) SetManagedSaveImage(name string, has bool) {
 // satisfying health.LibvirtBackend. Like the real client, an undefined domain
 // is a lookup error, never a confident "no image".
 func (f *Fake) HasManagedSaveImage(name string) (bool, error) {
+	f.daemon()
 	if f.FailHasManagedSaveImage != nil {
 		if err := f.FailHasManagedSaveImage(name); err != nil {
 			return false, err
@@ -1307,6 +1338,7 @@ func (f *Fake) HasManagedSaveImage(name string) (bool, error) {
 //
 // It is a call on the Fake's own connection (conn_model.go).
 func (f *Fake) DomainStateReason(name string) (libvirt.DomainStatus, error) {
+	f.daemon()
 	var st libvirt.DomainStatus
 	var err error
 	if cerr := f.mainConn().call(name, func() { st, err = f.domainStateReason(name) }); cerr != nil {
@@ -1352,6 +1384,7 @@ func (f *Fake) domainStateReason(name string) (libvirt.DomainStatus, error) {
 }
 
 func (f *Fake) ListDomains() ([]string, error) {
+	f.daemon()
 	var names []string
 	var err error
 	_ = f.mainConn().callAs(false, "", "", func() { names, err = f.listDomains() })
@@ -1380,6 +1413,7 @@ func (f *Fake) listDomains() ([]string, error) {
 // diverges them). Disk hotplug's live view is tracked separately (diskSources) and
 // never touches activeXML, so this default is unaffected by disk attach/detach.
 func (f *Fake) DumpXML(name string) (string, error) {
+	f.daemon()
 	var x string
 	var err error
 	_ = f.mainConn().callAs(false, "", name, func() { x, err = f.dumpXML(name) })
@@ -1430,6 +1464,7 @@ func (f *Fake) synthesizeXMLLocked(name string) (string, error) {
 // explicitly via SetInactiveXML/SetActiveXML. A domain with no configured XML is a
 // valid empty domain, not an error: it synthesizes exactly as DumpXML does.
 func (f *Fake) DumpXMLInactive(name string) (string, error) {
+	f.daemon()
 	if f.FailDumpXMLInactive != nil {
 		if err := f.FailDumpXMLInactive(name); err != nil {
 			return "", err
@@ -1457,6 +1492,7 @@ func (f *Fake) activeBaseline(domain string) string {
 // SetInactiveXML. A real running domain's live view always exists; this lets a
 // scenario seed it explicitly before exercising a live/persistent divergence.
 func (f *Fake) SetActiveXML(name, xml string) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.activeXML[name] = xml
@@ -1466,6 +1502,7 @@ func (f *Fake) SetActiveXML(name, xml string) {
 // domain was never defined. A test accessor (no error) so assertions can inspect
 // the domain a reconcile/redefine produced without the DumpXML not-found error.
 func (f *Fake) DefinedXML(name string) string {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.xml[name]
@@ -1476,12 +1513,14 @@ func (f *Fake) DefinedXML(name string) string {
 // persistent definition (which a real running domain always does) so a live-vs-config
 // divergence can be exercised. Mirrors SetDiskSource/SetState.
 func (f *Fake) SetInactiveXML(name, xml string) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.xml[name] = xml
 }
 
 func (f *Fake) WaitForShutdown(name string, timeout time.Duration) bool {
+	f.daemon()
 	// The fake transitions synchronously; the wait succeeds unless the guest
 	// ignored the shutdown (IgnoreShutdown) and still runs.
 	f.mu.Lock()
@@ -1504,6 +1543,7 @@ func (f *Fake) WaitForShutdown(name string, timeout time.Duration) bool {
 // VNC / SPICE / console — return deterministic placeholders.
 
 func (f *Fake) GetVMVNCPort(name string) (int, error) {
+	f.daemon()
 	port := -1
 	var err error
 	_ = f.mainConn().callAs(false, CallVNCPort, name, func() { port, err = f.vncPort(name) })
@@ -1522,6 +1562,7 @@ func (f *Fake) vncPort(name string) (int, error) {
 // SetVNCPort points a domain's VNC console at port, so a scenario can stand a
 // real listener behind ProxyVNC.
 func (f *Fake) SetVNCPort(name string, port int) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.vncPorts == nil {
@@ -1532,6 +1573,7 @@ func (f *Fake) SetVNCPort(name string, port int) {
 
 // SetConsolePasswordPolicy mirrors libvirt.Client.SetConsolePasswordPolicy.
 func (f *Fake) SetConsolePasswordPolicy(fn func() libvirt.ConsolePolicy) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.consolePolicy = fn
@@ -1540,6 +1582,7 @@ func (f *Fake) SetConsolePasswordPolicy(fn func() libvirt.ConsolePolicy) {
 // SetVNCPasswordUnavailable mirrors libvirt.Client.SetVNCPasswordUnavailable:
 // a scenario models a host whose QEMU cannot do VNC passwords (FIPS).
 func (f *Fake) SetVNCPasswordUnavailable(reason string) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.vncUnavailable = reason
@@ -1548,6 +1591,7 @@ func (f *Fake) SetVNCPasswordUnavailable(reason string) {
 // SetSpiceUnusable models a host where SPICE cannot connect (a FIPS-mode
 // kernel), as libvirt.Client.SpiceUnusable reports it.
 func (f *Fake) SetSpiceUnusable(reason string) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.spiceUnusable = reason
@@ -1555,6 +1599,7 @@ func (f *Fake) SetSpiceUnusable(reason string) {
 
 // SpiceUnusable mirrors libvirt.Client.SpiceUnusable.
 func (f *Fake) SpiceUnusable() string {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.spiceUnusable
@@ -1562,6 +1607,7 @@ func (f *Fake) SpiceUnusable() string {
 
 // VNCPasswordUnavailable mirrors libvirt.Client.VNCPasswordUnavailable.
 func (f *Fake) VNCPasswordUnavailable() string {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.vncUnavailable
@@ -1572,6 +1618,7 @@ func (f *Fake) VNCPasswordUnavailable() string {
 // migration hands the destination) carries them. DumpXML and DumpXMLInactive
 // leave them out, as libvirt's ordinary dumps do.
 func (f *Fake) DumpXMLSecure(name string) (string, error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if x, ok := f.activeXML[name]; ok {
@@ -1619,6 +1666,7 @@ func (f *Fake) stripConsoleForBackstop(name string, cause error) bool {
 // running guest started with, else its definition's. A domain the fake has
 // never heard of has none (its console placeholders answer for any name).
 func (f *Fake) ConsolePassword(name, kind string) (string, error) {
+	f.daemon()
 	var pw string
 	var err error
 	_ = f.mainConn().callAs(false, CallConsolePassword, name, func() { pw, err = f.consolePassword(name, kind) })
@@ -1643,12 +1691,14 @@ func (f *Fake) consolePassword(name, kind string) (string, error) {
 // define of ours runs, so no console password policy applies — and the guest
 // runs with the passwords it already had.
 func (f *Fake) LandMigrated(domXML string) {
+	f.daemon()
 	f.LandMigratedState(domXML, false)
 }
 
 // LandMigratedState is LandMigrated for a guest that arrives paused when
 // paused is set (VIR_MIGRATE_PAUSED), running otherwise.
 func (f *Fake) LandMigratedState(domXML string, paused bool) {
+	f.daemon()
 	name := domainNameFromXML(domXML)
 	f.mu.Lock()
 	f.leftStateLocked(name)
@@ -1684,6 +1734,7 @@ func (f *Fake) captureConsolePasswordsLocked(name, domXML string) {
 	f.liveConsolePw[name] = pw
 }
 func (f *Fake) GetVMSpicePort(name string) (int, error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if p, ok := f.spicePorts[name]; ok {
@@ -1695,6 +1746,7 @@ func (f *Fake) GetVMSpicePort(name string) (int, error) {
 // SetSpicePort points a domain's SPICE console at port, so a scenario can
 // stand a real listener behind ProxySpice.
 func (f *Fake) SetSpicePort(name string, port int) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.spicePorts == nil {
@@ -1706,6 +1758,7 @@ func (f *Fake) SetSpicePort(name string, port int) {
 // SetConsolePTYPath points a domain's serial console at path (a FIFO, say),
 // so a scenario can carry a real serial console through ConsoleVM.
 func (f *Fake) SetConsolePTYPath(name, path string) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.consolePTYs == nil {
@@ -1715,6 +1768,7 @@ func (f *Fake) SetConsolePTYPath(name, path string) {
 }
 
 func (f *Fake) ConsolePTYPath(name string) (string, error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if p, ok := f.consolePTYs[name]; ok {
@@ -1726,6 +1780,7 @@ func (f *Fake) ConsolePTYPath(name string) (string, error) {
 // Hot-plug — record and succeed.
 
 func (f *Fake) AttachDisk(domainName, path, targetDev, bus string) error {
+	f.daemon()
 	if f.FailAttachDisk != nil {
 		if err := f.FailAttachDisk(domainName, path, targetDev, bus); err != nil {
 			return err
@@ -1750,6 +1805,7 @@ func (f *Fake) AttachDisk(domainName, path, targetDev, bus string) error {
 	return nil
 }
 func (f *Fake) DetachDisk(domainName, targetDev string) error {
+	f.daemon()
 	if f.FailDetachDisk != nil {
 		if err := f.FailDetachDisk(domainName, targetDev); err != nil {
 			return err
@@ -1904,11 +1960,13 @@ func removeDiskFromDomainXML(domainXML, targetDev string) string {
 // AttachDiskCount / DetachDiskCount return how many times the disk hot-plug
 // primitives have been invoked — test accessors for at-most-once assertions.
 func (f *Fake) AttachDiskCount() int {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.attachDiskN
 }
 func (f *Fake) DetachDiskCount() int {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.detachDiskN
@@ -1920,6 +1978,7 @@ func (f *Fake) DetachDiskCount() int {
 // applied divergence, the persistent view (xml) too — the real AttachNIC applies
 // DomainDeviceModifyLive|Config.
 func (f *Fake) AttachNIC(domainName, bridge, model, mac string) error {
+	f.daemon()
 	if f.FailAttachNIC != nil {
 		if err := f.FailAttachNIC(domainName, bridge, model, mac); err != nil {
 			return err
@@ -1939,6 +1998,7 @@ func (f *Fake) AttachNIC(domainName, bridge, model, mac string) error {
 // DetachNIC hot-detaches a NIC from domainName by MAC, mirroring AttachNIC's
 // live/persistent tracking split.
 func (f *Fake) DetachNIC(domainName, mac string) error {
+	f.daemon()
 	if f.FailDetachNIC != nil {
 		if err := f.FailDetachNIC(domainName, mac); err != nil {
 			return err
@@ -1962,6 +2022,7 @@ func (f *Fake) DetachNIC(domainName, mac string) error {
 // persistent and the live view, as the real update-device does. It records a
 // "set-nic-bridge" event and never a define.
 func (f *Fake) SetNICBridge(domainName, mac, bridge string) error {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	x, ok := libvirt.RetargetDomainXML(f.xml[domainName], mac, bridge)
@@ -1980,6 +2041,7 @@ func (f *Fake) SetNICBridge(domainName, mac, bridge string) error {
 
 // SetNICBridgeConfig retargets the NIC in the persistent definition only.
 func (f *Fake) SetNICBridgeConfig(domainName, mac, bridge string) error {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	x, ok := libvirt.RetargetDomainXML(f.xml[domainName], mac, bridge)
@@ -1995,6 +2057,7 @@ func (f *Fake) SetNICBridgeConfig(domainName, mac, bridge string) error {
 // source is path ("reload-cdrom", note "path=<path>"). Like libvirt, it
 // refuses a domain that is not active (running or paused).
 func (f *Fake) ReloadCDROMMedia(domainName, path string) error {
+	f.daemon()
 	if f.FailReloadCDROM != nil {
 		if err := f.FailReloadCDROM(domainName, path); err != nil {
 			return err
@@ -2079,11 +2142,13 @@ func removeNICFromDomainXML(domainXML, mac string) string {
 // AttachNICCount / DetachNICCount return how many times the NIC hot-plug primitives
 // have been invoked — test accessors for at-most-once assertions.
 func (f *Fake) AttachNICCount() int {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.attachNICN
 }
 func (f *Fake) DetachNICCount() int {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.detachNICN
@@ -2094,6 +2159,7 @@ func (f *Fake) DetachNICCount() int {
 // (keyed on the pci address for later detach) exactly like AttachHostdevWithAlias
 // with an empty alias.
 func (f *Fake) AttachHostdev(domainName, pciAddress string) error {
+	f.daemon()
 	return f.AttachHostdevWithAlias(domainName, pciAddress, "")
 }
 
@@ -2104,6 +2170,7 @@ func (f *Fake) AttachHostdev(domainName, pciAddress string) error {
 // divergence, the persistent view (xml) too — the real attach applies
 // DomainDeviceModifyLive|Config.
 func (f *Fake) AttachHostdevWithAlias(domainName, pciAddress, alias string) error {
+	f.daemon()
 	if f.FailAttachHostdev != nil {
 		if err := f.FailAttachHostdev(domainName, pciAddress, alias); err != nil {
 			return err
@@ -2123,6 +2190,7 @@ func (f *Fake) AttachHostdevWithAlias(domainName, pciAddress, alias string) erro
 // DetachHostdev hot-detaches a PCI passthrough device by its pci address,
 // mirroring AttachHostdevWithAlias's live/persistent tracking split.
 func (f *Fake) DetachHostdev(domainName, pciAddress string) error {
+	f.daemon()
 	if f.FailDetachHostdev != nil {
 		if err := f.FailDetachHostdev(domainName, pciAddress); err != nil {
 			return err
@@ -2156,6 +2224,7 @@ func hostdevPCIInDomainXML(domainXML, pciAddress string) bool {
 // separately (detachHostdevConfigN) so a test can assert the config path (not the live
 // one) was used on a shut-off domain.
 func (f *Fake) DetachHostdevConfig(domainName, pciAddress string) error {
+	f.daemon()
 	if f.FailDetachHostdevConfig != nil {
 		if err := f.FailDetachHostdevConfig(domainName, pciAddress); err != nil {
 			return err
@@ -2173,11 +2242,13 @@ func (f *Fake) DetachHostdevConfig(domainName, pciAddress string) error {
 // hot-plug primitives have been invoked — test accessors for at-most-once
 // assertions.
 func (f *Fake) AttachHostdevCount() int {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.attachHostdevN
 }
 func (f *Fake) DetachHostdevCount() int {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.detachHostdevN
@@ -2186,6 +2257,7 @@ func (f *Fake) DetachHostdevCount() int {
 // DetachHostdevConfigCount returns how many times the CONFIG-only hostdev detach has been
 // invoked — the shut-off reclaim path's at-most-once / config-vs-live test accessor.
 func (f *Fake) DetachHostdevConfigCount() int {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.detachHostdevConfigN
@@ -2259,6 +2331,7 @@ func removeHostdevFromDomainXML(domainXML, pciAddress string) string {
 	}
 }
 func (f *Fake) BlockResize(domainName, path string, sizeBytes int64) error {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("block-resize", domainName, fmt.Sprintf("path=%s size=%d", path, sizeBytes))
@@ -2270,6 +2343,7 @@ func (f *Fake) BlockResize(domainName, path string, sizeBytes int64) error {
 // either back with DumpXML / DumpXMLInactive. Like libvirt it refuses a disk
 // the definition does not carry and a throttle libvirt would refuse.
 func (f *Fake) SetDiskIOTune(domainName, dev string, t libvirt.IOTune) error {
+	f.daemon()
 	if f.FailSetDiskIOTune != nil {
 		if err := f.FailSetDiskIOTune(domainName, dev); err != nil {
 			return err
@@ -2304,6 +2378,7 @@ func (f *Fake) SetDiskIOTune(domainName, dev string, t libvirt.IOTune) error {
 }
 
 func (f *Fake) SetBootOrder(domainName, bootOrder string) error {
+	f.daemon()
 	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpDefine, Name: domainName}); err != nil {
 		return fmt.Errorf("redefine domain %s: %w", domainName, err)
 	}
@@ -2316,6 +2391,7 @@ func (f *Fake) SetBootOrder(domainName, bootOrder string) error {
 // Migration — record and pretend success.
 
 func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) error {
+	f.daemon()
 	// The flags libvirt.Client would send: what it refuses never reaches
 	// libvirt, a guest it asks libvirt to pause arrives paused (D2-4 m-2),
 	// and a source it does not ask libvirt to undefine stays defined.
@@ -2390,9 +2466,8 @@ func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) e
 		p.DestXML, p.PersistXML = dest, persist
 	}
 	if cb := f.OnMigrateToTarget; cb != nil {
-		f.mu.Unlock()
-		err := cb(name, dconnuri, p)
-		f.mu.Lock()
+		var err error
+		f.outsideLock(func() { err = cb(name, dconnuri, p) })
 		if err != nil {
 			return err
 		}
@@ -2407,12 +2482,14 @@ func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) e
 }
 
 func (f *Fake) DomainJobProgress(name string) (memPct, diskPct float32) {
+	f.daemon()
 	return 100, 100
 }
 
 // DomainJobActive answers JobActive when it is set, else no job: the fake's
 // MigrateToTarget returns before anything could ask.
 func (f *Fake) DomainJobActive(name string) (bool, error) {
+	f.daemon()
 	f.mu.Lock()
 	job := f.JobActive
 	f.mu.Unlock()
@@ -2425,6 +2502,7 @@ func (f *Fake) DomainJobActive(name string) (bool, error) {
 // Snapshots.
 
 func (f *Fake) CreateSnapshot(domainName, snapshotName string) (int64, error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.snapshots[domainName] == nil {
@@ -2436,6 +2514,7 @@ func (f *Fake) CreateSnapshot(domainName, snapshotName string) (int64, error) {
 	return time.Now().UnixNano(), nil
 }
 func (f *Fake) RevertToSnapshot(domainName, snapshotName string, restorePreDefine func() error) error {
+	f.daemon()
 	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpStart, Name: domainName}); err != nil {
 		return fmt.Errorf("revert %s: %w", domainName, err)
 	}
@@ -2461,6 +2540,7 @@ func (f *Fake) RevertToSnapshot(domainName, snapshotName string, restorePreDefin
 	return nil
 }
 func (f *Fake) DeleteSnapshot(domainName, snapshotName string) error {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.snapshots[domainName], snapshotName)
@@ -2473,6 +2553,7 @@ func (f *Fake) DeleteSnapshot(domainName, snapshotName string) error {
 	return nil
 }
 func (f *Fake) FlattenSnapshot(domainName, snapshotName string) error {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.snapshots[domainName][snapshotName]; !ok {
@@ -2485,6 +2566,7 @@ func (f *Fake) FlattenSnapshot(domainName, snapshotName string) error {
 }
 
 func (f *Fake) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, captureSuspended func() error) (diskBytes, vmstateBytes int64, err error) {
+	f.daemon()
 	// As libvirt.Client: the capture stops and restarts the guest, so both
 	// are asked before anything is done.
 	for _, op := range []libvirt.FirmwareOp{libvirt.OpStop, libvirt.OpStart} {
@@ -2515,6 +2597,7 @@ func (f *Fake) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, 
 
 // SetDiskSource sets a domain's disk source (test helper).
 func (f *Fake) SetDiskSource(domain, dev, src string) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.diskSources[domain] == nil {
@@ -2526,6 +2609,7 @@ func (f *Fake) SetDiskSource(domain, dev, src string) {
 // DomainDiskSources returns target-dev → live source. Defaults to a single
 // vda disk if nothing was configured for the domain.
 func (f *Fake) DomainDiskSources(domain string) (map[string]string, error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if fail := f.FailDomainDiskSources; fail != nil {
@@ -2561,6 +2645,7 @@ func (f *Fake) cutoverDisks(domain, snapname string) {
 // SetFailDomainDiskSources sets FailDomainDiskSources under the fake's lock,
 // for a test that changes it while the server may be reading it.
 func (f *Fake) SetFailDomainDiskSources(fn func(domain string) error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.FailDomainDiskSources = fn
@@ -2569,6 +2654,7 @@ func (f *Fake) SetFailDomainDiskSources(fn func(domain string) error) {
 // DomainDiskFormats returns the disks of the domain's definition as source
 // file → driver type; a domain the fake has no definition of is not found.
 func (f *Fake) DomainDiskFormats(domainName string) (map[string]string, error) {
+	f.daemon()
 	f.mu.Lock()
 	x := f.liveXMLLocked(domainName)
 	f.mu.Unlock()
@@ -2581,6 +2667,7 @@ func (f *Fake) DomainDiskFormats(domainName string) (map[string]string, error) {
 // SnapshotDiskFiles returns the overlay and base of each disk the snapshot
 // cut over, as recorded at its creation.
 func (f *Fake) SnapshotDiskFiles(domainName, snapshotName string) ([]string, error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.snapshots[domainName][snapshotName]; !ok {
@@ -2592,6 +2679,7 @@ func (f *Fake) SnapshotDiskFiles(domainName, snapshotName string) ([]string, err
 // SetSavedImageXML sets the definition a memory snapshot's saved image at
 // vmstatePath carries (default: the domain's definition when reverted).
 func (f *Fake) SetSavedImageXML(vmstatePath, xml string) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.savedImageXML == nil {
@@ -2601,6 +2689,7 @@ func (f *Fake) SetSavedImageXML(vmstatePath, xml string) {
 }
 
 func (f *Fake) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string, restorePreDefine func() error, rewriteSaved func(savedXML string) (string, error)) error {
+	f.daemon()
 	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpStart, Name: domainName}); err != nil {
 		return fmt.Errorf("revert %s: %w", domainName, err)
 	}
@@ -2646,6 +2735,7 @@ func (f *Fake) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string
 }
 
 func (f *Fake) FreezeGuest(domainName string) error {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("fs-freeze", domainName, "")
@@ -2653,6 +2743,7 @@ func (f *Fake) FreezeGuest(domainName string) error {
 }
 
 func (f *Fake) ThawGuest(domainName string) error {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("fs-thaw", domainName, "")
@@ -2660,6 +2751,7 @@ func (f *Fake) ThawGuest(domainName string) error {
 }
 
 func (f *Fake) SetMemory(domainName string, memMiB int) error {
+	f.daemon()
 	if f.FailSetMemory != nil {
 		if err := f.FailSetMemory(domainName, memMiB); err != nil {
 			return err
@@ -2676,6 +2768,7 @@ func (f *Fake) SetMemory(domainName string, memMiB int) error {
 // and, when one is tracked, the live view — so DumpXML shows what libvirt
 // would. A domain with no virtio-mem device errors, as libvirt does.
 func (f *Fake) SetVirtioMemRequested(domainName string, requestedMiB int) error {
+	f.daemon()
 	if f.FailSetVirtioMem != nil {
 		if err := f.FailSetVirtioMem(domainName, requestedMiB); err != nil {
 			return err
@@ -2713,6 +2806,7 @@ func (f *Fake) SetVirtioMemRequested(domainName string, requestedMiB int) error 
 var virtioMemElemRe = regexp.MustCompile(`(?s)<memory\b[^>]*\bmodel=['"]virtio-mem['"][^>]*>.*?</memory>`)
 
 func (f *Fake) SetVCPUs(name string, count int) error {
+	f.daemon()
 	if f.FailSetVCPUs != nil {
 		if err := f.FailSetVCPUs(name, count); err != nil {
 			return err
@@ -2728,6 +2822,7 @@ func (f *Fake) SetVCPUs(name string, count int) error {
 // persistent XML and, for a running domain with a live override, the live XML,
 // exactly as the real primitive's config-then-live apply does.
 func (f *Fake) SetCPUTune(name string, limit float64, shares int) error {
+	f.daemon()
 	// Refuse what the real primitive refuses, so a caller cannot pass a value the
 	// fake accepts and libvirt would not.
 	if err := libvirt.ValidateCPUShares(shares); err != nil {
@@ -2765,6 +2860,7 @@ func (f *Fake) SetCPUTune(name string, limit float64, shares int) error {
 
 // SetNICRate models the libvirt interface-parameter write (see SetCPUTune).
 func (f *Fake) SetNICRate(name, mac string, rateMBps float64) error {
+	f.daemon()
 	if err := libvirt.ValidateNICRate(rateMBps); err != nil {
 		return err
 	}
@@ -2799,6 +2895,7 @@ func (f *Fake) SetNICRate(name, mac string, rateMBps float64) error {
 // Stats / introspection.
 
 func (f *Fake) NodeInfo() (cpus int, memMiB int, err error) {
+	f.daemon()
 	return 8, 32 * 1024, nil
 }
 
@@ -2807,6 +2904,7 @@ func (f *Fake) NodeInfo() (cpus int, memMiB int, err error) {
 // CPUCompareResult (or FailCompareCPU) to model a destination whose CPU is
 // poorer than the guest needs.
 func (f *Fake) CompareCPU(cpuXML, machine string) (libvirt.CPUCompare, error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.comparedCPUXML = append(f.comparedCPUXML, cpuXML)
@@ -2838,6 +2936,7 @@ func (f *Fake) CompareCPU(cpuXML, machine string) (libvirt.CPUCompare, error) {
 // host-model list. Without one set it errors, as a host whose host-model
 // cannot be read would, so the source keeps the guest's requirement verbatim.
 func (f *Fake) HostModelCPUFeatures(machine string) (map[string]bool, error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.HostModelFeatures == nil {
@@ -2852,6 +2951,7 @@ func (f *Fake) HostModelCPUFeatures(machine string) (map[string]bool, error) {
 
 // ComparedMachines returns, in order, the machine type of every CompareCPU.
 func (f *Fake) ComparedMachines() []string {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.comparedMachines...)
@@ -2882,6 +2982,7 @@ func requiredCPUFeatures(cpuXML string) []string {
 // "fake-host-cpu") names the model, so two fakes in one fleet test can be given
 // deliberately different host CPUs.
 func (f *Fake) HostCPUXML() (string, error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.FailHostCPUXML != nil {
@@ -2900,11 +3001,13 @@ func (f *Fake) HostCPUXML() (string, error) {
 // so a test can prove the preflight asked the DESTINATION, and asked it about
 // the right CPU, rather than passing because nothing was checked.
 func (f *Fake) ComparedCPUXML() []string {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.comparedCPUXML...)
 }
 func (f *Fake) GetDomainStats(name string) (*libvirt.DomainStats, error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if s, ok := f.stats[name]; ok {
@@ -2913,6 +3016,7 @@ func (f *Fake) GetDomainStats(name string) (*libvirt.DomainStats, error) {
 	return &libvirt.DomainStats{Name: name}, nil
 }
 func (f *Fake) GetAllDomainStats() ([]*libvirt.DomainStats, error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]*libvirt.DomainStats, 0, len(f.domains))
@@ -2930,12 +3034,14 @@ func (f *Fake) GetAllDomainStats() ([]*libvirt.DomainStats, error) {
 // non-zero code is a command that RAN and failed, not a failure to run it —
 // the distinction `lv exec` depends on.
 func (f *Fake) SetExecResult(stdout, stderr string, exitCode int32) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.execStdout, f.execStderr, f.execExitCode = stdout, stderr, exitCode
 }
 
 func (f *Fake) ExecInGuestDetailed(name, command string, args []string) ([]byte, []byte, int32, error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("exec-in-guest", name, command)
@@ -2943,6 +3049,7 @@ func (f *Fake) ExecInGuestDetailed(name, command string, args []string) ([]byte,
 }
 
 func (f *Fake) ExecInGuest(name, command string, args []string) (string, error) {
+	f.daemon()
 	out, errOut, code, err := f.ExecInGuestDetailed(name, command, args)
 	combined := string(out) + string(errOut)
 	if err != nil {
@@ -2955,6 +3062,7 @@ func (f *Fake) ExecInGuest(name, command string, args []string) (string, error) 
 }
 
 func (f *Fake) EnsureStoragePool(name, driver, source, target string, opts map[string]string) error {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("ensure-pool", name, driver)
@@ -2966,6 +3074,7 @@ func (f *Fake) EnsureStoragePool(name, driver, source, target string, opts map[s
 // here it always records so a test can assert the delete path reached it. A
 // FailPoolDestroy hook lets a scenario model an undefine failure.
 func (f *Fake) PoolDestroyIfDefined(name string) error {
+	f.daemon()
 	if f.FailPoolDestroy != nil {
 		if err := f.FailPoolDestroy(name); err != nil {
 			return err
@@ -2978,12 +3087,14 @@ func (f *Fake) PoolDestroyIfDefined(name string) error {
 }
 
 func (f *Fake) ConfigureVLANTap(domainName, bridge, mac string, vlanID int) error {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("vlan-tap", domainName, fmt.Sprintf("bridge=%s mac=%s vlan=%d", bridge, mac, vlanID))
 	return nil
 }
 func (f *Fake) ConfigureTrunkTap(domainName, bridge, mac string, vlanIDs []int) error {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("trunk-tap", domainName, fmt.Sprintf("bridge=%s mac=%s vlans=%v", bridge, mac, vlanIDs))
@@ -2998,6 +3109,7 @@ var fakeMACAttr = regexp.MustCompile(`<mac\s+address=["']([^"']+)["']`)
 // active domain, every MAC in its live XML, each with the tap TapDevice
 // would report.
 func (f *Fake) RunningDomainTaps() (map[string]map[string]string, error) {
+	f.daemon()
 	if f.FailRunningDomainTaps != nil {
 		if err := f.FailRunningDomainTaps(); err != nil {
 			return nil, err
@@ -3034,6 +3146,7 @@ type tapKey struct {
 // recorded name goes stale on a stop and start; returning the same name for
 // ever would hide exactly that.
 func (f *Fake) TapDevice(domainName, mac string) (string, error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	st, ok := f.domains[domainName]
@@ -3093,7 +3206,7 @@ func targetDevForMAC(domainXML, mac string) string {
 // is no connection to lose); domain events are recorded so a scenario can drive
 // them via FireEvent.
 
-func (f *Fake) StartReconnectLoop(ctx context.Context) {}
+func (f *Fake) StartReconnectLoop(ctx context.Context) { f.daemon() }
 
 // RegisterDomainEventCallback stores the callback the daemon would install on a
 // real libvirt client. Storing it has no effect on its own — the fake dispatches
@@ -3101,6 +3214,7 @@ func (f *Fake) StartReconnectLoop(ctx context.Context) {}
 // that never drive events. A second registration replaces the first, matching
 // libvirt.Client.
 func (f *Fake) RegisterDomainEventCallback(cb libvirt.DomainEventCallback) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.eventCB = cb
@@ -3119,6 +3233,7 @@ func (f *Fake) RegisterDomainEventCallback(cb libvirt.DomainEventCallback) {
 // fake's domain state to agree with the event calls SetState itself, keeping
 // event injection and state orthogonal (same split as SetStateReason).
 func (f *Fake) FireEvent(domainName string, event libvirt.DomainEventType, detail int) {
+	f.daemon()
 	f.mu.Lock()
 	f.record("fire-event", domainName, fmt.Sprintf("event=%d detail=%d", int(event), detail))
 	cb := f.eventCB
@@ -3131,6 +3246,7 @@ func (f *Fake) FireEvent(domainName string, event libvirt.DomainEventType, detai
 
 // Close marks the Fake closed (Closing); its calls go on answering.
 func (f *Fake) Close() error {
+	f.daemon()
 	f.conns.mu.Lock()
 	f.conns.closing = true
 	f.conns.mu.Unlock()
@@ -3139,6 +3255,7 @@ func (f *Fake) Close() error {
 
 // Closing mirrors libvirt.Client.Closing: whether Close has been called.
 func (f *Fake) Closing() bool {
+	f.daemon()
 	f.conns.mu.Lock()
 	defer f.conns.mu.Unlock()
 	return f.conns.closing
@@ -3148,6 +3265,7 @@ func (f *Fake) Closing() bool {
 // stored in domain metadata. The fake records them per domain so fleet and
 // unit tests can assert write-through and convergence without libvirt.
 func (f *Fake) SetDomainOwnerEpoch(name string, epoch int64, running bool) error {
+	f.daemon()
 	// The real client refuses a pre-epoch value (a generation starts at 1); the
 	// fake must too, or a test could pass against a marker state production
 	// cannot produce.
@@ -3167,6 +3285,7 @@ func (f *Fake) SetDomainOwnerEpoch(name string, epoch int64, running bool) error
 }
 
 func (f *Fake) GetDomainOwnerEpoch(name string) (int64, bool, error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.domains[name]; !ok {
@@ -3180,6 +3299,7 @@ func (f *Fake) GetDomainOwnerEpoch(name string) (int64, bool, error) {
 // element (internal/libvirt/managed_stamp.go). It dies with the domain on
 // undefine, as the real metadata does.
 func (f *Fake) SetDomainManaged(name string, running bool) error {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.domains[name]; !ok {
@@ -3195,6 +3315,7 @@ func (f *Fake) SetDomainManaged(name string, running bool) error {
 // SetDomainManagedIncarnation writes the managed stamp with its incarnation
 // attribute; GetDomainManagedIncarnation reads it back.
 func (f *Fake) SetDomainManagedIncarnation(name, incarnation string, running bool) error {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.domains[name]; !ok {
@@ -3212,6 +3333,7 @@ func (f *Fake) SetDomainManagedIncarnation(name, incarnation string, running boo
 }
 
 func (f *Fake) GetDomainManagedIncarnation(name string) (string, bool, error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.domains[name]; !ok {
@@ -3222,6 +3344,7 @@ func (f *Fake) GetDomainManagedIncarnation(name string) (string, bool, error) {
 }
 
 func (f *Fake) GetDomainManaged(name string) (bool, error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.domains[name]; !ok {
@@ -3234,6 +3357,7 @@ func (f *Fake) GetDomainManaged(name string) (bool, error) {
 // OnAbortMigration, which a scenario uses to make its blocked MigrateToTarget
 // return the way a real abort makes it return.
 func (f *Fake) AbortMigration(name string) error {
+	f.daemon()
 	f.mu.Lock()
 	if f.abortedMigrations == nil {
 		f.abortedMigrations = map[string]int{}
@@ -3249,6 +3373,7 @@ func (f *Fake) AbortMigration(name string) error {
 
 // AbortedMigrations is how many times AbortMigration was called for name.
 func (f *Fake) AbortedMigrations(name string) int {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.abortedMigrations[name]
@@ -3263,6 +3388,7 @@ type fakeSecret struct {
 // DefineCephSecret defines or redefines a ceph secret and sets its value. The
 // event recorded carries the client, never the value.
 func (f *Fake) DefineCephSecret(secretUUID, clientID string, value []byte) error {
+	f.daemon()
 	if f.FailDefineSecret != nil {
 		if err := f.FailDefineSecret(secretUUID); err != nil {
 			return err
@@ -3283,6 +3409,7 @@ func (f *Fake) DefineCephSecret(secretUUID, clientID string, value []byte) error
 
 // HasSecret reports whether the secret is defined.
 func (f *Fake) HasSecret(secretUUID string) (bool, error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	_, ok := f.secrets[secretUUID]
@@ -3292,6 +3419,7 @@ func (f *Fake) HasSecret(secretUUID string) (bool, error) {
 // ListCephSecrets returns every defined secret's UUID (the fake holds only
 // litevirt's).
 func (f *Fake) ListCephSecrets() ([]string, error) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]string, 0, len(f.secrets))
@@ -3304,6 +3432,7 @@ func (f *Fake) ListCephSecrets() ([]string, error) {
 
 // UndefineSecret removes a secret; one not defined is not an error.
 func (f *Fake) UndefineSecret(secretUUID string) error {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.secrets[secretUUID]; ok {
@@ -3315,6 +3444,7 @@ func (f *Fake) UndefineSecret(secretUUID string) error {
 
 // CephSecret returns a defined secret's client and value (test accessor).
 func (f *Fake) CephSecret(secretUUID string) (clientID string, value []byte, ok bool) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	s, ok := f.secrets[secretUUID]
@@ -3324,6 +3454,7 @@ func (f *Fake) CephSecret(secretUUID string) (clientID string, value []byte, ok 
 // DropSecrets forgets every secret, as a libvirtd restart does to ephemeral
 // ones.
 func (f *Fake) DropSecrets() {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.secrets = nil

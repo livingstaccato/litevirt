@@ -17,6 +17,7 @@ import (
 // Seeding is direct (like SetState), not a DefineDomain call, so it cannot fail
 // and does not trip a scenario's FailDefineDomain injection.
 func (f *Fake) DefineStoppedDomain(name, mac string) {
+	f.daemon()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.domains[name] = StateShutdown

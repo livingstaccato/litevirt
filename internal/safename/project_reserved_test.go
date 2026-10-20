@@ -14,3 +14,16 @@ func TestValidateNewProjectName_ReservedSegments(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateNewProjectName_RootAndDefaultRefused(t *testing.T) {
+	for _, bad := range []string{"/", "//", "///", "/_default", "_default", "_default/"} {
+		if err := ValidateNewProjectName(bad); err == nil {
+			t.Errorf("%q accepted, want refused", bad)
+		}
+	}
+	for _, ok := range []string{"/_default/x", "_defaults", "/acme"} {
+		if err := ValidateNewProjectName(ok); err != nil {
+			t.Errorf("%q refused: %v", ok, err)
+		}
+	}
+}

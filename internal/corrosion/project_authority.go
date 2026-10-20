@@ -243,7 +243,7 @@ func applyReplicatedAuthorityRetire(ctx context.Context, tx *sql.Tx, params []in
 // tombstoned project — so the hourly GC that calls it does no work once clean.
 func ReconcileOrphanedProjectAuthority(ctx context.Context, c *Client) (int, error) {
 	rows, err := c.Query(ctx,
-		`SELECT DISTINCT a.project AS project
+		`SELECT DISTINCT a.project AS project, p.updated_at AS tomb_at
 		 FROM project_authority_epochs a
 		 JOIN projects p ON p.name = a.project
 		 WHERE a.deleted_at IS NULL AND p.deleted_at IS NOT NULL AND a.project <> ?`,
@@ -253,14 +253,26 @@ func ReconcileOrphanedProjectAuthority(ctx context.Context, c *Client) (int, err
 	}
 	retired := 0
 	for _, r := range rows {
-		project := r.String("project")
+		project, tombAt := r.String("project"), r.String("tomb_at")
 		if project == "" {
 			continue
 		}
-		if rerr := RetireProjectAuthority(ctx, c, project); rerr != nil {
+		if h := projectLifecycleInterleaveHook; h != nil {
+			h()
+		}
+		// Retired only while the project is STILL the tombstone this scan saw. A
+		// re-create that landed since has revived the row and may have minted a new
+		// epoch; a name-wide retirement here would retire that one.
+		applied, rerr := c.ExecuteBatchGuarded(ctx, projectRowGuard(ctx, project, true, tombAt), []Statement{{
+			SQL:    retireProjectAuthoritySQL,
+			Params: []interface{}{nowRFC3339(), c.NowTS(), projectOrDefault(project)},
+		}})
+		if rerr != nil {
 			return retired, fmt.Errorf("retire authority for deleted project %q: %w", project, rerr)
 		}
-		retired++
+		if applied {
+			retired++
+		}
 	}
 	return retired, nil
 }

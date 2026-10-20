@@ -7,6 +7,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -39,5 +40,20 @@ func TestDeleteProject_ConfinedUserGainsNothingClusterWide(t *testing.T) {
 			t.Fatalf("after the project was deleted, RequirePerm(%s) = %v, want PermissionDenied: "+
 				"the user fell back to their legacy role cluster-wide", path, err)
 		}
+	}
+}
+
+// I4: the project root and the default project cannot be created, by any
+// spelling, through the RPC.
+func TestCreateProject_RefusesRootAndDefaultSpellings(t *testing.T) {
+	s := testServer(t)
+	for _, name := range []string{"/", "//", "/_default", "_default"} {
+		_, err := s.CreateProject(adminCtx(), &pb.CreateProjectRequest{Name: name})
+		if status.Code(err) != codes.InvalidArgument {
+			t.Errorf("CreateProject(%q) = %v, want InvalidArgument", name, err)
+		}
+	}
+	if rows, _ := s.db.Query(context.Background(), `SELECT 1 FROM projects`); len(rows) != 0 {
+		t.Fatal("a refused create left a project row")
 	}
 }

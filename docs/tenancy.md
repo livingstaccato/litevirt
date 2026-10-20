@@ -42,13 +42,17 @@ nothing.
 A deleted project's name can be created again with `lv project create`. The
 new project starts with none of the old one's authority: its role bindings
 (`lv role grant`), quota and admission authority are retired at delete, and
-again at re-create. A user whose only bindings were in the deleted project is
-left a NoAccess binding at `/` (visible in `lv role ls`), so they stay bound
-and do not fall back to their cluster-wide legacy role. The re-created project
+again at re-create. Every principal that loses a binding to the delete and holds
+no binding outside `/projects/` is left one NoAccess binding at `/` (visible in
+`lv role ls`), so it stays bound and does not fall back to its cluster-wide
+legacy role. A principal with a binding outside `/projects/` (a grant at `/`, a
+group-held grant) gets none. To return a principal to its legacy role, revoke
+its NoAccess binding with `lv role revoke`. The re-created project
 keeps the old display name and parent, so a re-create with a different
 `--display` or `--parent` is refused; repeat the old display, or pass none.
 Project path segments named `vms`, `containers`, `networks`, `storage_pools`,
 `security_groups` or `stacks` are reserved below the first segment.
+The names `/` and `_default` (in any spelling, such as `//`) are refused: the first is the whole project namespace and the second the implicit default project.
 
 ## Quotas
 

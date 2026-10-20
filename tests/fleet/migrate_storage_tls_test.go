@@ -2,6 +2,8 @@ package fleet
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -135,7 +137,18 @@ func TestFleet_StorageMigrationFallsBackToPlaintextOnlyWhenAllowed(t *testing.T)
 
 // migrationCA makes n report fp as the fingerprint of the migration CA its
 // QEMU credentials chain to ("" for none known, as an older build reports).
+// caFP makes a test's CA name a real-shaped SHA-256 fingerprint, which is all
+// a source accepts from a target ("" stays "": the target does not say).
+func caFP(name string) string {
+	if name == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(name))
+	return hex.EncodeToString(sum[:])
+}
+
 func migrationCA(n *Node, fp string) {
+	fp = caFP(fp)
 	n.Server.SetMigrationCAFingerprint(func() (string, error) { return fp, nil })
 }
 
@@ -167,7 +180,7 @@ func TestFleet_StorageMigrationIsRefusedWhenTheHostsHaveDifferentMigrationCAs(t 
 	}
 	msg := err.Error()
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(msg, src.Name) || !strings.Contains(msg, dst.Name) ||
-		!strings.Contains(msg, "aaaa1111") || !strings.Contains(msg, "bbbb2222") ||
+		!strings.Contains(msg, caFP("aaaa1111")) || !strings.Contains(msg, caFP("bbbb2222")) ||
 		!strings.Contains(msg, "lv host install-migration-tls --reissue") {
 		t.Fatalf("refusal = %v; want FailedPrecondition naming %s and %s, both fingerprints, and `lv host install-migration-tls --reissue`",
 			err, src.Name, dst.Name)
@@ -351,5 +364,47 @@ func TestFleet_TargetWithUnusableCredentialsRefusesAStorageCopyThatAsksForTLS(t 
 	resp, err := peer.EnsureDisks(context.Background(), &pb.EnsureDisksRequest{VmName: "pp1", WantMigrationTls: true})
 	if err != nil || resp.GetMigrationTlsReady() {
 		t.Fatalf("EnsureDisks of a memory-only move = %+v, %v; want answered, not ready", resp, err)
+	}
+}
+
+// migrationCAs makes n report a CA set: its digest, and the CA fingerprints
+// that make it up, as a daemon reads them from its CA file.
+func migrationCAs(n *Node, digest string, fps ...string) {
+	migrationCA(n, digest)
+	n.Server.SetMigrationCAList(func() ([]string, error) { return fps, nil })
+}
+
+// Mid-rotation a two-CA host's set digest appears nowhere an operator can
+// look. The refusal names both hosts' real CA fingerprints, carried from the
+// target in its EnsureDisks answer, which lv doctor migration-tls also lists.
+//
+// Mutations: print the digests (the message has neither list); do not send
+// the target's list (the target is shown by its digest).
+func TestFleet_StorageMigrationRefusalNamesTheRealCAFingerprints(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c.openClusterPolicyGate()
+	defer c.Stop()
+	src, dst := c.Nodes[0], c.Nodes[1]
+	migrationTLSReady(src, true)
+	migrationTLSReady(dst, true)
+	// Real-shaped fingerprints: the source drops anything else the target sends.
+	fpA, fpB := strings.Repeat("6c", 32), strings.Repeat("5e", 32)
+	migrationCAs(src, "digest-of-two", fpA, fpB)
+	migrationCAs(dst, "digest-of-one", fpA)
+
+	path := filepath.Join(c.tmpRoot, dst.Name, "data", "disks", "pp1-root.qcow2")
+	storageMigrationVM(t, src, path, 1<<30)
+	err := runStorageMigration(t, c, src, dst.Name)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("migration = %v; want refused", err)
+	}
+	msg := err.Error()
+	for _, want := range []string{src.Name + ": " + fpA + ", " + fpB, dst.Name + ": " + fpA} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("refusal %q does not list %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "digest-of") {
+		t.Errorf("refusal %q quotes a set digest", msg)
 	}
 }

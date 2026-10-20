@@ -2,15 +2,20 @@ package daemon
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"os/user"
 	"strconv"
 	"strings"
+	"time"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/pki"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // qemuConfPath is where libvirt's QEMU driver reads the user QEMU runs as.
@@ -72,12 +77,120 @@ func qemuOwner(confPath string, lookup func(string) (*user.User, error)) (int, i
 // user, and reports whether they are in place. It runs at daemon start and
 // before each storage migration, so credentials pushed by
 // `lv host install-migration-tls` take effect without a restart.
+// MigrationTLSStatus does not run it (see migrationTLSChecker). Calls are
+// serialized on d.migrationTLSMu.
 func (d *Daemon) migrationTLSInstaller() func() (bool, error) {
 	return func() (bool, error) {
-		uid, gid, err := qemuOwner(qemuConfPath, user.Lookup)
-		if err != nil {
-			return false, err
+		ok, _, err := d.installMigrationTLS()
+		return ok, err
+	}
+}
+
+// installMigrationTLS is the install, serialized on d.migrationTLSMu, that
+// also says whether it wrote anything.
+func (d *Daemon) installMigrationTLS() (ok, wrote bool, err error) {
+	d.migrationTLSMu.Lock()
+	defer d.migrationTLSMu.Unlock()
+	uid, gid, err := qemuOwner(qemuConfPath, user.Lookup)
+	if err != nil {
+		return false, false, err
+	}
+	return pki.InstallQemuMigrationTLSReport(d.cfg.PKIDir, pki.QemuTLSDir, uid, gid)
+}
+
+// migrationTLSChecker is the read-only twin of migrationTLSInstaller, for
+// MigrationTLSStatus: it says why the installer would refuse (QEMU's user
+// cannot be resolved, the set does not validate, /etc/pki/qemu is someone
+// else's) and writes nothing.
+func (d *Daemon) migrationTLSChecker() func() error {
+	return func() error {
+		if _, _, err := qemuOwner(qemuConfPath, user.Lookup); err != nil {
+			return err
 		}
-		return pki.InstallQemuMigrationTLS(d.cfg.PKIDir, pki.QemuTLSDir, uid, gid)
+		return pki.CheckQemuMigrationTLS(d.cfg.PKIDir, pki.QemuTLSDir)
+	}
+}
+
+// migrationTLSStatusRow is this host's MigrationTLSStatus answer. The server
+// fills in the host name, the plaintext flag and, by running the install hook,
+// install_error.
+func migrationTLSStatusRow(info pki.MigrationTLSInfo, err error) *pb.MigrationTLSHostStatus {
+	if err != nil {
+		return &pb.MigrationTLSHostStatus{Error: err.Error()}
+	}
+	row := &pb.MigrationTLSHostStatus{
+		Provisioned:           info.Provisioned,
+		ValidationError:       info.ValidationError,
+		CertIssuerFingerprint: info.CertIssuerFingerprint,
+	}
+	if !info.CertNotAfter.IsZero() {
+		row.CertNotAfter = timestamppb.New(info.CertNotAfter)
+	}
+	for _, c := range info.TrustedCAs {
+		row.TrustedCas = append(row.TrustedCas, &pb.MigrationTLSCA{Fingerprint: c.Fingerprint, NotAfter: timestamppb.New(c.NotAfter)})
+	}
+	return row
+}
+
+// logMigrationExpiry logs each migration credential that expires within
+// pki.MigrationExpiryWarning: Warn before, Error after. An expired CA names
+// --no-overlap: the overlapping rotation refuses one, because hosts cannot
+// keep trusting it through the overlap.
+func logMigrationExpiry(log *slog.Logger, info pki.MigrationTLSInfo, now time.Time) {
+	for _, e := range info.Expiring(now) {
+		fix := "`lv host install-migration-tls --reissue`"
+		if strings.HasPrefix(e.What, "CA ") {
+			fix = "`lv host rotate-migration-ca`"
+			if e.Expired {
+				fix = "`lv host rotate-migration-ca --no-overlap`"
+			}
+		}
+		level, verb := slog.LevelWarn, "expires"
+		if e.Expired {
+			level, verb = slog.LevelError, "expired"
+		}
+		log.Log(context.Background(), level, fmt.Sprintf("migration TLS: the %s %s %s; storage "+
+			"migrations with this host will be refused after that. Fix: %s",
+			e.What, verb, e.NotAfter.Format("2006-01-02"), fix))
+	}
+}
+
+// runMigrationExpiryWatch checks at start and every 24 hours.
+func runMigrationExpiryWatch(ctx context.Context, pkiDir string) {
+	check := func() {
+		info, err := pki.InspectMigrationTLS(pkiDir, time.Now())
+		if err == nil && info.Provisioned {
+			logMigrationExpiry(slog.Default(), info, time.Now())
+		}
+	}
+	check()
+	t := time.NewTicker(24 * time.Hour)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			check()
+		}
+	}
+}
+
+// logMigrationTLSInstall reports the start-up install of migration
+// credentials: installed only when the install wrote something, "already up to
+// date" when the set was in place, and the provisioning hint when this host
+// has none.
+func logMigrationTLSInstall(ok, wrote bool, err error) {
+	switch {
+	case err != nil:
+		slog.Warn("migration TLS: not installed; storage migrations from or to this host "+
+			"cannot be encrypted", "error", err)
+	case ok && wrote:
+		slog.Info("migration TLS: credentials installed for QEMU", "dir", pki.QemuTLSDir)
+	case ok:
+		slog.Info("migration TLS: credentials for QEMU already up to date", "dir", pki.QemuTLSDir)
+	default:
+		slog.Info("migration TLS: this host has no migration credentials; provision them with " +
+			"`lv host install-migration-tls`")
 	}
 }

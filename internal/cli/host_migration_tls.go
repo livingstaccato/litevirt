@@ -2,8 +2,10 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
@@ -131,10 +133,37 @@ type migrationFile struct {
 	mode          os.FileMode
 }
 
+// migrationIssuingCA is the CA host certificates are issued from right now and
+// the trust bundle each host's ca.crt gets. Mid-rotation that is the NEW CA,
+// so a host added during a rotation is never left on the old one.
+func migrationIssuingCA(pkiDir string) (caCert, caKey, trustBundle string, err error) {
+	cur := filepath.Join(pkiDir, pki.MigrationCACertName)
+	r, err := loadMigrationRotation(pkiDir)
+	if err != nil {
+		return "", "", "", err
+	}
+	if !r.inProgress() {
+		return cur, filepath.Join(pkiDir, pki.MigrationCAKeyName), cur, nil
+	}
+	next, nextKey := filepath.Join(pkiDir, nextCACertName), filepath.Join(pkiDir, nextCAKeyName)
+	if _, err := os.Stat(next); errors.Is(err, fs.ErrNotExist) {
+		// Finalize already made the new CA current; only "done" is unsaved.
+		return cur, filepath.Join(pkiDir, pki.MigrationCAKeyName), cur, nil
+	}
+	switch r.Phase {
+	case phaseTrustBoth, phaseReissue:
+		return next, nextKey, filepath.Join(pkiDir, bundleCACertName), nil
+	default: // drop-old, cutover
+		return next, nextKey, next, nil
+	}
+}
+
 // issueMigrationCredentials mints the migration CA if needed (and existing
 // allows; see ensureLocalMigrationCA) and issues hostName's migration
 // certificate for ip. It returns the three files to put in the host's
-// migration directory: the CA, the certificate, and the key (0600).
+// migration directory: the trust bundle (ca.crt), the certificate, and the
+// key (0600). Mid-rotation the certificate is issued from the rotation's new
+// CA and the trust bundle reflects the rotation's phase (migrationIssuingCA).
 func issueMigrationCredentials(pkiDir, hostName string, ip net.IP, existing migrationCredentialHolder) ([]migrationFile, error) {
 	// hostName may come from the replicated hosts table, which a peer can
 	// write, and older builds admitted any name: only containment is asked.
@@ -149,7 +178,10 @@ func issueMigrationCredentials(pkiDir, hostName string, ip net.IP, existing migr
 // issueMigrationCredentialsAt is issueMigrationCredentials writing the
 // host's certificate and key to cert and key.
 func issueMigrationCredentialsAt(pkiDir, cert, key, hostName string, ip net.IP, existing migrationCredentialHolder) ([]migrationFile, error) {
-	caCert, caKey, _, err := ensureLocalMigrationCA(pkiDir, existing)
+	if _, _, _, err := ensureLocalMigrationCA(pkiDir, existing); err != nil {
+		return nil, err
+	}
+	caCert, caKey, trust, err := migrationIssuingCA(pkiDir)
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +189,7 @@ func issueMigrationCredentialsAt(pkiDir, cert, key, hostName string, ip net.IP, 
 		return nil, fmt.Errorf("issue %s's migration certificate: %w", hostName, err)
 	}
 	return []migrationFile{
-		{caCert, filepath.Join(remoteMigrationDir, pki.MigrationCAName), 0o644},
+		{trust, filepath.Join(remoteMigrationDir, pki.MigrationCAName), 0o644},
 		{cert, filepath.Join(remoteMigrationDir, pki.MigrationHostCertName), 0o644},
 		// 0600 and root's: the daemon copies it to QEMU's TLS directory owned by
 		// the QEMU user. Nothing else on the host needs to read it.
@@ -189,14 +221,43 @@ type MigrationTLSHost interface {
 	Push(ctx context.Context, files []migrationFile) error
 }
 
+// InstallMigrationTLSVia is InstallMigrationTLS that refuses a rotation in
+// progress before connect reaches any host, so an unreachable host cannot
+// hide the refusal behind its connection error.
+func InstallMigrationTLSVia(ctx context.Context, pkiDir string,
+	connect func(context.Context) ([]MigrationTLSHost, func(), error), reissue bool, out io.Writer) error {
+	if err := rotationInProgressRefusal(pkiDir); err != nil {
+		return err
+	}
+	hosts, closeAll, err := connect(ctx)
+	if err != nil {
+		return err
+	}
+	defer closeAll()
+	return InstallMigrationTLS(ctx, pkiDir, hosts, reissue, out)
+}
+
+// rotationInProgressRefusal refuses provisioning while a rotation runs.
+func rotationInProgressRefusal(pkiDir string) error {
+	if MigrationRotationInProgress(pkiDir) {
+		return fmt.Errorf("a migration-CA rotation is in progress (%s); finish it with "+
+			"`lv host rotate-migration-ca` before provisioning or reissuing", filepath.Join(pkiDir, rotationFileName))
+	}
+	return nil
+}
+
 // InstallMigrationTLS issues and pushes migration credentials to every host
 // that has none (all of them with reissue). A host's daemon installs them for
 // QEMU before its next storage migration; no restart is needed.
 //
 // It refuses to mint a NEW migration CA while a host already holds credentials:
 // those came from another machine's CA, and certificates from a second CA would
-// not verify against them.
+// not verify against them. It also refuses while a migration-CA rotation is in
+// progress.
 func InstallMigrationTLS(ctx context.Context, pkiDir string, hosts []MigrationTLSHost, reissue bool, out io.Writer) error {
+	if err := rotationInProgressRefusal(pkiDir); err != nil {
+		return err
+	}
 	provisioned := make(map[string]bool, len(hosts))
 	for _, h := range hosts {
 		p, err := h.Provisioned(ctx)
@@ -290,6 +351,14 @@ func (h *sshMigrationTLSHost) Push(ctx context.Context, files []migrationFile) e
 	return pushMigrationCredentials(h.sc, files)
 }
 
+// MigrationRotationInProgress reports whether pkiDir holds an unfinished
+// `lv host rotate-migration-ca`. An unreadable state file counts as in
+// progress: guessing "no" would let a reissue mint from the wrong CA.
+func MigrationRotationInProgress(pkiDir string) bool {
+	r, err := loadMigrationRotation(pkiDir)
+	return err != nil || r.inProgress()
+}
+
 // SSHMigrationTLSHosts connects to every host in the cluster as sshUser.
 func SSHMigrationTLSHosts(ctx context.Context, c pb.LiteVirtClient, sshUser string) ([]MigrationTLSHost, func(), error) {
 	resp, err := c.ListHosts(ctx, &pb.ListHostsRequest{})
@@ -315,6 +384,54 @@ func SSHMigrationTLSHosts(ctx context.Context, c pb.LiteVirtClient, sshUser stri
 		if err != nil {
 			closeAll()
 			return nil, nil, fmt.Errorf("SSH to %s (%s): %w", h.Name, h.Address, err)
+		}
+		conns = append(conns, sc)
+		hosts = append(hosts, &sshMigrationTLSHost{name: h.Name, address: h.Address, sc: sc})
+	}
+	return hosts, closeAll, nil
+}
+
+// unreachableMigrationHost is a cluster host SSH could not reach. Its Push
+// returns the connect error, so the rotation stops on it, or skips it under
+// --force, instead of refusing to start.
+type unreachableMigrationHost struct {
+	name, address string
+	err           error
+}
+
+func (h *unreachableMigrationHost) Name() string                              { return h.name }
+func (h *unreachableMigrationHost) Address() string                           { return h.address }
+func (h *unreachableMigrationHost) Provisioned(context.Context) (bool, error) { return false, h.err }
+func (h *unreachableMigrationHost) Push(context.Context, []migrationFile) error {
+	return fmt.Errorf("SSH to %s: %w", h.address, h.err)
+}
+
+// SSHMigrationTLSHostsLenient is SSHMigrationTLSHosts for the rotation: a host
+// SSH cannot reach is returned as unreachable rather than failing the list.
+func SSHMigrationTLSHostsLenient(ctx context.Context, c pb.LiteVirtClient, sshUser string) ([]MigrationTLSHost, func(), error) {
+	resp, err := c.ListHosts(ctx, &pb.ListHostsRequest{})
+	if err != nil {
+		return nil, nil, fmt.Errorf("list hosts: %w", err)
+	}
+	if sshUser == "" {
+		sshUser = "root"
+	}
+	var hosts []MigrationTLSHost
+	var conns []*ssh.Client
+	closeAll := func() {
+		for _, sc := range conns {
+			sc.Close()
+		}
+	}
+	for _, h := range resp.Hosts {
+		if h.Address == "" {
+			hosts = append(hosts, &unreachableMigrationHost{h.Name, "", errors.New("no recorded address")})
+			continue
+		}
+		sc, err := ssh.NewClient(sshUser + "@" + h.Address)
+		if err != nil {
+			hosts = append(hosts, &unreachableMigrationHost{h.Name, h.Address, err})
+			continue
 		}
 		conns = append(conns, sc)
 		hosts = append(hosts, &sshMigrationTLSHost{name: h.Name, address: h.Address, sc: sc})

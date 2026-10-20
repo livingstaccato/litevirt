@@ -156,7 +156,7 @@ func TestChooseMigrationRoute(t *testing.T) {
 		{"unencrypted storage stays on the cluster address", "10.20.0.0/24", "10.20.0.2", routeStorage, false, false, "192.168.1.2", false, true, "stays on the cluster address"},
 		{"cold uses the address (mTLS inherent)", "10.20.0.0/24", "10.20.0.2", routeCold, false, false, "10.20.0.2", false, false, ""},
 		{"memory with TLS leaves the tunnel", "10.20.0.0/24", "10.20.0.2", routeMemory, true, false, "10.20.0.2", true, false, ""},
-		{"memory without TLS stays tunnelled", "10.20.0.0/24", "10.20.0.2", routeMemory, false, false, "192.168.1.2", false, true, "plaintext"},
+		{"memory without TLS stays tunnelled", "10.20.0.0/24", "10.20.0.2", routeMemory, false, false, "192.168.1.2", false, true, "not usable here: a host has no usable migration-TLS credentials"},
 		{"no answer", "10.20.0.0/24", "", routeStorage, true, false, "192.168.1.2", false, true, "reported no address"},
 		{"answer outside the network", "10.20.0.0/24", "172.16.0.2", routeStorage, true, false, "192.168.1.2", false, true, ""},
 		{"loopback answer", "10.20.0.0/24", "127.0.0.1", routeStorage, true, false, "192.168.1.2", false, true, ""},
@@ -173,7 +173,11 @@ func TestChooseMigrationRoute(t *testing.T) {
 				src = "172.31.0.9"
 			}
 			s.SetLocalIPsForTest(func() ([]net.IP, error) { return []net.IP{net.ParseIP(src)}, nil })
-			got := s.chooseMigrationRoute(context.Background(), "vm1", target, c.migAddr, c.kind, c.bothTLS)
+			gap := ""
+			if !c.bothTLS {
+				gap = "a host has no usable migration-TLS credentials"
+			}
+			got := s.chooseMigrationRoute(context.Background(), "vm1", target, c.migAddr, c.kind, gap)
 			if got.addr != c.wantAddr || got.direct != c.wantDirect {
 				t.Errorf("route = %+v, want addr %s direct %v", got, c.wantAddr, c.wantDirect)
 			}

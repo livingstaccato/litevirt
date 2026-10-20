@@ -367,6 +367,10 @@ type Server struct {
 	// CA this host's migration-TLS credentials chain to ("" when it has
 	// none). nil means unknown, and no comparison is made.
 	migrationCAFingerprint func() (string, error)
+	// migrationCAList reports the fingerprint of each CA in this host's
+	// migration CA file, as lv doctor migration-tls lists them; it is shown,
+	// never compared. nil: not reported.
+	migrationCAList func() ([]string, error)
 	// drainAbortGrace bounds how long a drain waits for libvirt to answer the
 	// abort of a timed-out live move before handing the move to a background
 	// owner (drainLiveMigrate). Zero means defaultDrainAbortGrace.
@@ -411,6 +415,12 @@ type Server struct {
 	// installer_iso_resolved does (no map), for tests of a new source against
 	// a main target.
 	isoResolvedWithheld bool
+	// migrationTLSStatus reports this host's migration credentials for
+	// MigrationTLSStatus. nil: this host cannot report them.
+	migrationTLSStatus func() *pb.MigrationTLSHostStatus
+	// migrationTLSCheck says, without writing anything, why this host's
+	// daemon could not install its migration credentials. nil: no check.
+	migrationTLSCheck func() error
 	// enfCanonicalIdentity is this node's kill-switch for natural-key identity
 	// resolution (snapshots/container_snapshots); gated by this flag AND the
 	// CanonicalIdentityV1 latch. Advertised CONDITIONALLY on this flag (like
@@ -2008,6 +2018,22 @@ func (s *Server) SetMigrationTLS(fn func() (bool, error)) { s.migrationTLS = fn 
 // migration CA this host's migration-TLS credentials chain to. A storage
 // copy's readiness check compares the source's with the target's.
 func (s *Server) SetMigrationCAFingerprint(fn func() (string, error)) { s.migrationCAFingerprint = fn }
+
+// SetMigrationCAList sets the hook that lists the fingerprint of each CA in
+// this host's migration CA file (pki.MigrationCAFingerprints).
+func (s *Server) SetMigrationCAList(fn func() ([]string, error)) { s.migrationCAList = fn }
+
+// localMigrationCAList is this host's CA fingerprints, nil when unknown.
+func (s *Server) localMigrationCAList() []string {
+	if s.migrationCAList == nil {
+		return nil
+	}
+	fps, err := s.migrationCAList()
+	if err != nil {
+		return nil
+	}
+	return fps
+}
 
 // SetDrainAbortGraceForTest shortens how long a drain waits for libvirt to
 // answer the abort of a timed-out live move.

@@ -108,10 +108,14 @@ migration-TLS credentials:
   own migration CA refuses the copy, naming the error and the same command.
 - A host whose credentials cannot be used (a CA that is not a certificate or
   not a file, a host certificate the CA did not issue, a key that is not the
-  certificate's) is not ready for migration TLS, and its daemon installs
-  nothing for QEMU. A storage copy from or to it is refused before it starts,
-  naming the host, why, and `lv host install-migration-tls --reissue`, whatever
-  `migration.allow_unencrypted_storage` says. A target in that state refuses
+  certificate's, or an incomplete set: some but not all of `ca.crt`,
+  `host.crt` and `host.key`) is not ready for migration TLS, and its daemon
+  installs nothing for QEMU. A storage copy from or to it is refused before it
+  starts, naming the host and why, whatever
+  `migration.allow_unencrypted_storage` says. An incomplete set is usually a
+  credential push in flight or cut short: let it finish, or re-run
+  `lv host install-migration-tls`. A damaged set is replaced with
+  `lv host install-migration-tls --reissue`. A target in that state refuses
   a storage copy that asks for TLS outright, so a source on an older build
   fails closed rather than falling back to plaintext. Every certificate of
   the CA file is read (an old and a new CA during a rotation), and an expired
@@ -130,12 +134,97 @@ migration-TLS credentials:
   migration, so no restart is needed. It refuses to touch `/etc/pki/qemu` if
   that directory already holds files litevirt did not put there.
 
-If either host has no credentials, the copy would cross the network in
-plaintext, and the source refuses it unless its config sets
+If either host has no credentials (none of the three files; an incomplete set
+is not "no credentials" and is refused as above), the copy would cross the
+network in plaintext, and the source refuses it unless its config sets
 `migration.allow_unencrypted_storage: true` (see
 [configuration](configuration.md#migration)). Set that only where the network
 between hosts is trusted. Migrations of VMs on shared storage copy no disks, so
 they need neither.
+
+**Checking migration credentials.** `lv doctor migration-tls [--json]` asks
+every host which migration CA(s) it trusts, which CA issued its certificate,
+and when each expires — read-only, and non-zero on an unreachable host, an
+install-blocking problem, an expiring credential, a plaintext fallback, or a
+CA-set split across hosts with no rotation running from the operator machine.
+Each host also warns in its own log 90 days before a migration credential
+expires, whether or not anyone runs the doctor command.
+
+**Rotating the migration CA.** `lv host rotate-migration-ca [--no-overlap]
+[--force] [--ssh-user root]` replaces the migration CA on every host, run from
+the machine that holds it. By default it walks three phases, checking every
+host's daemon between them:
+
+1. **trust-both** — every host trusts the old CA and the new one.
+2. **reissue** — every host gets a certificate from the new CA.
+3. **drop-old** — every host trusts the new CA alone; the operator machine
+   retires the old one.
+
+No host needs a restart. While trust-both or drop-old is being pushed, a
+host already updated and one not yet updated hold different CA files, so a
+storage copy between them is refused (never sent in plaintext) and a
+memory-only move stays in libvirt's tunnel; once every host has the phase,
+storage copies work again. Throughout reissue every host holds the same
+two-CA file, so storage copies keep working.
+Before it starts, the command asks every host's daemon for its migration
+credentials and refuses, changing nothing, unless each holds a complete, valid
+set its daemon can install, trusting this machine's migration CA. A host with
+none needs `lv host install-migration-tls` first; one with an incomplete or
+invalid set, `lv host install-migration-tls --reissue`. A host that cannot
+answer refuses the start too, unless you pass `--force`.
+
+If the command stops partway (a host is unreachable), its progress is saved
+beside the CA; running it again resumes from where it left off rather than
+starting over. That state lives in `pki_dir` alongside the current CA:
+`migration-ca.next.crt` / `migration-ca.next.key` (the new CA, key mode 0600)
+and `migration-ca.bundle.crt` (the two-certificate trust bundle pushed during
+trust-both) exist only while a rotation is in progress;
+`migration-rotation.json` (phase and per-host progress) remains after a
+rotation finishes, recording the last one with phase `done`, and is
+overwritten by the next rotation; and `migration-ca.retired-YYYYMMDD.crt`
+(`-2`, `-3`, … for further rotations the same day) is the old CA certificate,
+kept for audit once a rotation finishes; its key is deleted.
+
+`--no-overlap` skips the overlap window entirely: it cuts every host straight
+to the new CA alone in one pass. Use it only when the migration CA key is
+compromised or the CA has already expired — there is no window where both CAs
+are trusted, so migrations between a host already rotated and one not yet
+rotated are refused, never sent in plaintext, until every host is done. `--force` leaves an unreachable host
+behind instead of stopping the whole run; it keeps the old CA's credentials,
+so migrations with it are refused until you run
+`lv host install-migration-tls --reissue` once it is back.
+
+If the migration CA has already expired, every host's credentials fail
+validation, so storage migrations are refused until you run
+`lv host rotate-migration-ca --no-overlap`. The overlapping rotation refuses
+an expired CA, because hosts can no longer trust the old CA through the
+overlap; `--no-overlap` accepts invalid or incomplete sets, since it replaces
+all three files on every host, but still requires each host to answer, to have
+credentials, and to trust this machine's migration CA. Reissuing first does
+not help: `--reissue` issues from the same expired CA.
+
+A rotation already in progress cannot switch to `--no-overlap`: re-run it the
+way it was started and let it finish. If the key is found compromised during
+an overlap rotation, finish that rotation, then immediately run
+`lv host rotate-migration-ca --no-overlap`.
+
+While a rotation is in progress, `lv host add` issues the new node's migration
+credentials from the rotation's new CA. A run of `lv host rotate-migration-ca`
+that is executing when a host joins stops at its next check, naming the host;
+run it again and it brings that host through the remaining phases. Only one
+run at a time: a second one on the same machine refuses. `lv host install-migration-tls`
+refuses to run at all (reissuing from the old CA would hand out credentials
+the rotation is retiring).
+
+*If the migration CA key is compromised:*
+
+1. `lv host rotate-migration-ca --no-overlap`
+2. `lv doctor migration-tls` until it reports no problem other than ones
+   you accept (for example, a host deliberately allowed to fall back to
+   plaintext with `migration.allow_unencrypted_storage`, which keeps it
+   non-zero)
+3. For any host the rotation skipped, `lv host install-migration-tls
+   --reissue` once it is back.
 
 Only the host-local disks (`local` and `dir` pools) are copied. A disk on
 shared storage (NFS, Ceph, iSCSI, a volume manager) is already the same disk on

@@ -10,6 +10,7 @@ const defaultBridgeMTU = 1500
 // BridgeMTU answers this node's MTU for bridge: what SetBridgeMTU set, else
 // 1500.
 func (f *Fake) BridgeMTU(bridge string) (int, error) {
+	defer f.daemon()()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.bridgeMTUErr[bridge]; err != nil {
@@ -24,6 +25,7 @@ func (f *Fake) BridgeMTU(bridge string) (int, error) {
 // SetBridgeMTU sets bridge's MTU on this node, which a NIC MTU is checked
 // against when a domain is defined or migrated here.
 func (f *Fake) SetBridgeMTU(bridge string, mtu int) {
+	defer f.daemon()()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.bridgeMTU == nil {
@@ -35,6 +37,7 @@ func (f *Fake) SetBridgeMTU(bridge string, mtu int) {
 // FailBridgeMTU makes reading bridge's MTU on this node fail with err (a
 // bridge being recreated, say); nil reads it again.
 func (f *Fake) FailBridgeMTU(bridge string, err error) {
+	defer f.daemon()()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.bridgeMTUErr == nil {

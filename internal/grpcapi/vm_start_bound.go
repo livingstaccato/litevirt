@@ -717,7 +717,19 @@ func (s *Server) startDomainWithin(ctx context.Context, vm *corrosion.VMRecord, 
 	name := vm.Name
 	flight := s.beginStartFlight(name)
 	answered := make(chan error, 1)
-	go func() { answered <- s.virt.StartDomain(name) }()
+	go func() {
+		// Answered however this goroutine ends but by a panic, so the held
+		// start's waiter always gets an answer. A panic answers nothing: it
+		// goes on, and the process with it.
+		startErr := errLibvirtCallUnanswered
+		defer func() {
+			if p := recover(); p != nil {
+				panic(p)
+			}
+			answered <- startErr
+		}()
+		startErr = s.virt.StartDomain(name)
+	}()
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {

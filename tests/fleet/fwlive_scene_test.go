@@ -91,10 +91,9 @@ func fwliveSetup(t *testing.T, withDisk bool) *fwliveScene {
 	hlWrite(t, src.FW.NvramPath(fwwVM), fwwNvram)
 	src.LandMigrationsOn(dst)
 	sc.one = fwliveWatchOneCopy(t, src, dst)
-	// A failed test may leave a daemon's goroutine frozen in a handler of a
-	// server that was never replaced (fwlive_restart_test.go kills daemons
-	// that way, and never lets them go): stop every server outright first,
-	// so the cluster's graceful stop does not wait on it.
+	// A failed test may leave a server that was never replaced: stop every
+	// server outright first, so the cluster's graceful stop does not wait on
+	// a call it was serving.
 	t.Cleanup(func() {
 		if t.Failed() {
 			for _, n := range c.Nodes {

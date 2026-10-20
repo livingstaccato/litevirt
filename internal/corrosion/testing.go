@@ -122,7 +122,7 @@ func NewTestClient() (*Client, error) {
 	// contention into spurious test-only refusals.
 	dsn := fmt.Sprintf("file:testdb%d?mode=memory&cache=shared&_pragma=busy_timeout(5000)", id)
 
-	db, gens, keeper, err := openTestDB(dsn)
+	db, gens, keeper, sever, err := openTestDB(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -130,6 +130,7 @@ func NewTestClient() (*Client, error) {
 	c := &Client{
 		db:               db,
 		memKeeper:        keeper,
+		writeSever:       sever,
 		dsn:              dsn,
 		tableGens:        gens,
 		hostName:         "test-node",
@@ -158,15 +159,16 @@ func NewTestClient() (*Client, error) {
 // pinned out of the client's own pool, so that pool's sizing and its Stats
 // stay what production sees. It sets neither an idle time nor a lifetime, so
 // database/sql never closes the connection Ping leaves in it.
-func openTestDB(dsn string) (*sql.DB, *tableGenerations, *sql.DB, error) {
-	db, gens, err := openHookedDB(dsn)
+func openTestDB(dsn string) (*sql.DB, *tableGenerations, *sql.DB, *writeSever, error) {
+	sever := &writeSever{}
+	db, gens, err := openHookedDBSevered(dsn, sever)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	fail := func(err error) (*sql.DB, *tableGenerations, *sql.DB, error) {
+	fail := func(err error) (*sql.DB, *tableGenerations, *sql.DB, *writeSever, error) {
 		db.Close()
 		releaseGenerations(dsn)
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	if err := db.Ping(); err != nil {
 		return fail(err)
@@ -180,7 +182,7 @@ func openTestDB(dsn string) (*sql.DB, *tableGenerations, *sql.DB, error) {
 		keeper.Close()
 		return fail(err)
 	}
-	return db, gens, keeper, nil
+	return db, gens, keeper, sever, nil
 }
 
 // testLeaseTermLedgerOpen is what the test constructors wire into
@@ -200,13 +202,14 @@ func testLeaseTermLedgerOpen() bool { return true }
 // Test-only. The returned client is not started (no replicator, no gossip).
 func NewSharedTestClient(dsnSuffix, hostName string) (*Client, error) {
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared&_pragma=busy_timeout(5000)", dsnSuffix)
-	db, gens, keeper, err := openTestDB(dsn)
+	db, gens, keeper, sever, err := openTestDB(dsn)
 	if err != nil {
 		return nil, err
 	}
 	c := &Client{
 		db:               db,
 		memKeeper:        keeper,
+		writeSever:       sever,
 		dsn:              dsn,
 		tableGens:        gens,
 		hostName:         hostName,

@@ -691,3 +691,35 @@ func r6Exec(t *testing.T, s *Server, q string) {
 		t.Fatalf("%s: %v", q, err)
 	}
 }
+
+// An Admin redeploy dropping the firewall that fails part way through
+// removing the rows has cleared the intent, but the stored file still asks
+// for the deny: the deny stays, re-asserted or not, and an Operator still may
+// not drop it.
+//
+// Mutation: withdraw a stack's deny while its file asks for it — red.
+func TestDeployStack_AFailedAdminDropKeepsTheDeny(t *testing.T) {
+	ctx := context.Background()
+	s, opal, ada := stackFirewallFixture(t)
+	s.db.SetClusterPolicyGate(func() bool { return true })
+	if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: fwStackYAML}, &mockDeployStreamR2{ctx: ada}); err != nil {
+		t.Fatal(err)
+	}
+	r6Exec(t, s, `CREATE TRIGGER block_sg BEFORE UPDATE ON security_groups BEGIN SELECT RAISE(ABORT, 'injected'); END`)
+	if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: fwStackNoBlockYAML}, &mockDeployStreamR2{ctx: ada}); err == nil {
+		t.Fatal("setup: the Admin's drop succeeded")
+	}
+	if in, _, _ := corrosion.GetStackFirewallIntent(ctx, s.db, "fwonly"); in.Declares() {
+		t.Fatalf("setup: the failed drop left intent %+v, want it cleared", in)
+	}
+	r6Exec(t, s, `DROP TRIGGER block_sg`)
+	if err := corrosion.ReassertStackDefaultDeny(ctx, s.db, compose.StoredStackWants); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := corrosion.GetFirewallDefault(ctx, s.db, "cluster"); d == nil || !d.DefaultDeny {
+		t.Errorf("the deny went after a failed Admin drop, its file still asking for it: %+v", d)
+	}
+	if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: fwStackNoBlockYAML}, &mockDeployStreamR2{ctx: opal}); err == nil {
+		t.Error("an Operator dropped the firewall after a failed Admin drop")
+	}
+}

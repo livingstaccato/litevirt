@@ -47,6 +47,7 @@ type Entry struct {
 	Artifacts      map[string]string `json:"artifacts"` // e.g. "old_domain_xml", "prior_driver:<addr>"
 	CreatedAt      string            `json:"created_at"`
 	Checksum       string            `json:"checksum"`
+	Execution      *ExecutionRecord  `json:"execution,omitempty"`
 }
 
 // Matches reports whether this entry still describes the given operation
@@ -74,6 +75,8 @@ type Journal struct {
 	FailRead   func(opID string) error
 	FailWrite  func(opID string) error
 	FailRemove func(opID string) error
+	// Private persistence seam: tests exercise uncertainty after rename as well as before write.
+	writeFailure func(stage, opID string) error
 }
 
 // Open creates (0700) and returns a journal rooted at dir.
@@ -108,6 +111,17 @@ func (j *Journal) Write(e Entry) error {
 			return err
 		}
 	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if e.Execution != nil {
+		return ErrExecutionControlled
+	}
+	return j.writeLocked(e, false)
+}
+
+// writeLocked is available only to the owning controller or the legacy Write
+// entry point. The caller holds j.mu through validation, publication and sync.
+func (j *Journal) writeLocked(e Entry, controlled bool) error {
 	e.Version = entryVersion
 	e.Checksum = e.checksum()
 	b, err := json.Marshal(e)
@@ -118,9 +132,13 @@ func (j *Journal) Write(e Entry) error {
 		return fmt.Errorf("opjournal: entry %s too large (%d > %d bytes)", e.OperationID, len(b), maxEntryBytes)
 	}
 
-	j.mu.Lock()
-	defer j.mu.Unlock()
 	final := j.path(e.OperationID)
+	if err := checkStoredMutation(final, e.OperationID, controlled); err != nil {
+		return err
+	}
+	if err := j.failWriteStage("before-write", e.OperationID); err != nil {
+		return err
+	}
 	tmp := final + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, filePerm)
 	if err != nil {
@@ -131,6 +149,11 @@ func (j *Journal) Write(e Entry) error {
 		os.Remove(tmp)
 		return fmt.Errorf("opjournal: write: %w", err)
 	}
+	if err := j.failWriteStage("file-sync", e.OperationID); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
 	if err := f.Sync(); err != nil {
 		f.Close()
 		os.Remove(tmp)
@@ -140,11 +163,51 @@ func (j *Journal) Write(e Entry) error {
 		os.Remove(tmp)
 		return fmt.Errorf("opjournal: close temp: %w", err)
 	}
+	if err := j.failWriteStage("before-rename", e.OperationID); err != nil {
+		os.Remove(tmp)
+		return err
+	}
 	if err := os.Rename(tmp, final); err != nil {
 		os.Remove(tmp)
 		return fmt.Errorf("opjournal: rename: %w", err)
 	}
+	if err := j.failWriteStage("after-rename", e.OperationID); err != nil {
+		return err
+	}
+	if err := j.failWriteStage("directory-sync", e.OperationID); err != nil {
+		return err
+	}
 	return j.syncDir()
+}
+
+func (j *Journal) failWriteStage(stage, id string) error {
+	if j.writeFailure != nil {
+		return j.writeFailure(stage, id)
+	}
+	return nil
+}
+
+// Generic legacy-shaped calls cannot erase a controlled record. Malformed
+// identities fail closed; checksum-corrupt matching legacy repair is preserved.
+func checkStoredMutation(path, opID string, controlled bool) error {
+	if err := checkStoredOperationIdentity(path, opID); err != nil {
+		return err
+	}
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var entry Entry
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		return ErrCorrupt
+	}
+	if (entry.Execution != nil) != controlled {
+		return ErrExecutionControlled
+	}
+	return nil
 }
 
 func (j *Journal) syncDir() error {
@@ -170,7 +233,33 @@ func (j *Journal) Read(opID string) (e *Entry, found bool, err error) {
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	return readFile(j.path(opID))
+	e, found, err = readFile(j.path(opID))
+	if e != nil && e.OperationID != opID {
+		return nil, true, fmt.Errorf("%w: operation identity mismatch", ErrCorrupt)
+	}
+	return e, found, err
+}
+
+// checkStoredOperationIdentity requires the caller to hold Journal.mu through
+// the following mutation. A sanitized filename never grants another operation
+// access. Checksum-corrupt but parseable matching entries retain the legacy
+// repair/removal behavior; an unreadable identity cannot authorize a mutation.
+func checkStoredOperationIdentity(path, opID string) error {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var e Entry
+	if err := json.Unmarshal(b, &e); err != nil {
+		return fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
+	if e.OperationID != opID {
+		return fmt.Errorf("%w: operation identity mismatch", ErrCorrupt)
+	}
+	return nil
 }
 
 func readFile(path string) (*Entry, bool, error) {
@@ -188,6 +277,9 @@ func readFile(path string) (*Entry, bool, error) {
 	if e.checksum() != e.Checksum {
 		return &e, true, ErrCorrupt
 	}
+	if err := validateExecutionRecord(e); err != nil {
+		return &e, true, err
+	}
 	return &e, true, nil
 }
 
@@ -201,7 +293,11 @@ func (j *Journal) Remove(opID string) error {
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if err := os.Remove(j.path(opID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	path := j.path(opID)
+	if err := checkStoredMutation(path, opID, false); err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return j.syncDir()

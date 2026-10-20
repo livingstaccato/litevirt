@@ -24,10 +24,14 @@ const (
 	// newer epoch — the original host must NOT perform any external rollback; it
 	// archives/removes the now-superseded entry.
 	RecoverySupersede
+	// RecoveryControlled remains with the execution controller, never ordinary GC.
+	RecoveryControlled
 )
 
 func (a RecoveryAction) String() string {
 	switch a {
+	case RecoveryControlled:
+		return "controlled"
 	case RecoveryResume:
 		return "resume"
 	case RecoveryCleanup:
@@ -50,6 +54,9 @@ func (a RecoveryAction) String() string {
 // A takeover or a vanished operation → supersede (no external rollback). Still
 // the authorized owner → resume if non-terminal, cleanup if terminal.
 func DecideRecovery(entry Entry, opExists bool, currentOwnerEpoch int64, opTerminal bool) RecoveryAction {
+	if entry.Execution != nil {
+		return RecoveryControlled
+	}
 	if !opExists || currentOwnerEpoch != entry.OwnerEpoch {
 		return RecoverySupersede
 	}
@@ -83,6 +90,10 @@ func (j *Journal) PlanRecovery(lookup OpStateLookup) (plan []PlannedRecovery, co
 		return nil, corrupt, err
 	}
 	for _, e := range entries {
+		if e.Execution != nil {
+			plan = append(plan, PlannedRecovery{Entry: e, Action: RecoveryControlled})
+			continue
+		}
 		exists, epoch, terminal, lerr := lookup(e.OperationID)
 		if lerr != nil {
 			return plan, corrupt, lerr

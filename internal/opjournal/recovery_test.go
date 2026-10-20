@@ -1,6 +1,7 @@
 package opjournal
 
 import (
+	"context"
 	"testing"
 )
 
@@ -61,5 +62,22 @@ func TestPlanRecovery(t *testing.T) {
 	}
 	if got["resume-op"] != RecoveryResume || got["done-op"] != RecoveryCleanup || got["stolen-op"] != RecoverySupersede {
 		t.Fatalf("unexpected plan: %v", got)
+	}
+}
+
+func TestExecutionRecoveryNeverUsesOrdinaryLookup(t *testing.T) {
+	j, c, p := controllerFixture(t)
+	_ = c
+	_ = p
+	calls := 0
+	plan, corrupt, err := j.PlanRecovery(func(string) (bool, int64, bool, error) { calls++; return false, 999, true, nil })
+	if err != nil || len(corrupt) != 0 || len(plan) != 1 || plan[0].Action != RecoveryControlled || calls != 0 {
+		t.Fatal("execution entry reached ordinary absent-row/terminal supersede")
+	}
+	if DecideRecovery(plan[0].Entry, false, 999, true) != RecoveryControlled {
+		t.Fatal("controlled recovery was discarded by ordinary decision")
+	}
+	if _, err := c.CloseTarget(context.Background(), p); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -595,11 +595,10 @@ import (
 //	     anti-entropy dump while every value of it is '', so a previous-release
 //	     node takes this build's tokens until then. Appended LAST for the v53
 //	     digest reason. Additive.
-const CurrentSchemaVersion = schemaVersionTokenUserIncarnation
+const CurrentSchemaVersion = 72
 
 // schemaVersionTokenUserIncarnation is the version tokens.user_created_at was
-// added in, and the only place that number is written in code: the History
-// line above names it too.
+// added in.
 const schemaVersionTokenUserIncarnation = 72
 
 // schemaVersionProjectIncarnation is the version projects.incarnation was

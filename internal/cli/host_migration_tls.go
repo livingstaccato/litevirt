@@ -221,13 +221,6 @@ type MigrationTLSHost interface {
 	Push(ctx context.Context, files []migrationFile) error
 }
 
-// InstallMigrationTLS issues and pushes migration credentials to every host
-// that has none (all of them with reissue). A host's daemon installs them for
-// QEMU before its next storage migration; no restart is needed.
-//
-// It refuses to mint a NEW migration CA while a host already holds credentials:
-// those came from another machine's CA, and certificates from a second CA would
-// not verify against them.
 // InstallMigrationTLSVia is InstallMigrationTLS that refuses a rotation in
 // progress before connect reaches any host, so an unreachable host cannot
 // hide the refusal behind its connection error.
@@ -253,6 +246,14 @@ func rotationInProgressRefusal(pkiDir string) error {
 	return nil
 }
 
+// InstallMigrationTLS issues and pushes migration credentials to every host
+// that has none (all of them with reissue). A host's daemon installs them for
+// QEMU before its next storage migration; no restart is needed.
+//
+// It refuses to mint a NEW migration CA while a host already holds credentials:
+// those came from another machine's CA, and certificates from a second CA would
+// not verify against them. It also refuses while a migration-CA rotation is in
+// progress.
 func InstallMigrationTLS(ctx context.Context, pkiDir string, hosts []MigrationTLSHost, reissue bool, out io.Writer) error {
 	if err := rotationInProgressRefusal(pkiDir); err != nil {
 		return err

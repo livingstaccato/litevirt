@@ -389,12 +389,22 @@ func userRowUpdatedAt(ctx context.Context, tx *sql.Tx, table string, pk []interf
 // (userIncarnationHeld, "" for no row). onCommit runs its argument once tx
 // commits.
 func (c *Client) settleUserName(ctx context.Context, tx *sql.Tx, name, before string, onCommit func(func())) error {
-	if name == "" || !c.UserIncarnationOn() {
+	if name == "" {
 		return nil
 	}
 	local, err := userIncarnationHeld(ctx, tx, name)
 	if err != nil || local == "" {
 		return err
+	}
+	// A token says which incarnation it was issued to, so this needs no
+	// latch here (token_incarnation.go).
+	if local != before {
+		if err := retireStaleTokens(ctx, tx, name, local); err != nil {
+			return err
+		}
+	}
+	if !c.UserIncarnationOn() {
+		return nil
 	}
 	// Only when the name's incarnation changed here — a re-create, or its
 	// first row — what a deleted account's lagging writes left goes, judged
@@ -498,7 +508,10 @@ func tokenCredentialOf(stmts []Statement, i int) (int, bool) {
 		return 0, false
 	}
 	sh, _, err := parseResolved(s.SQL)
-	if err != nil || stmtFingerprint(sh) != fpTokensInsert {
+	if err != nil {
+		return 0, false
+	}
+	if fp := stmtFingerprint(sh); fp != fpTokensInsert && fp != fpTokensInsertIncarnation {
 		return 0, false
 	}
 	id := coerceString(s.Params[0])

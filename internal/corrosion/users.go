@@ -518,6 +518,12 @@ func clearSecondFactorStatements(username, marker, now string, g *MutationGuard)
 
 // InsertToken stores a new API token. scope_paths, when non-empty, is
 // JSON-encoded and stored verbatim.
+//
+// The token names the account incarnation it is issued to whenever every
+// receiver can decode it (token_incarnation.go). It is then written only if
+// the account still holds that incarnation in the write's own transaction:
+// one deleted and re-created meanwhile fails the write with
+// ErrUserAccountChanged, and nothing is written.
 func InsertToken(ctx context.Context, c *Client, t TokenRecord) error {
 	now := c.NowTS()
 	var scope string
@@ -528,13 +534,36 @@ func InsertToken(ctx context.Context, c *Client, t TokenRecord) error {
 		}
 		scope = string(b)
 	}
-	if c.MayWriteCredentialTables() {
-		return c.executeCredentialBatch(ctx, t.automationAuthentication, "token", t.ID, t.Username, []Statement{
-			{SQL: tokensInsertSQL, Params: []interface{}{t.ID, t.Username, t.Name, c.oldColumnValue(t.TokenHash), t.ExpiresAt, scope, nowRFC3339(), now}},
-			{SQL: tokenCredentialUpsertSQL, Params: []interface{}{t.ID, t.TokenHash, now}},
-		})
+	stamp, err := c.tokenStampFor(ctx, t.Username)
+	if err != nil {
+		return err
 	}
-	return c.executeCredentialBatch(ctx, t.automationAuthentication, "token", t.ID, t.Username, []Statement{{SQL: tokensInsertSQL, Params: []interface{}{t.ID, t.Username, t.Name, t.TokenHash, t.ExpiresAt, scope, nowRFC3339(), now}}})
+	split := c.MayWriteCredentialTables()
+	hash := t.TokenHash
+	if split {
+		hash = c.oldColumnValue(t.TokenHash)
+	}
+	insert := Statement{SQL: tokensInsertSQL, Params: []interface{}{t.ID, t.Username, t.Name, hash, t.ExpiresAt, scope, nowRFC3339(), now}}
+	if stamp != "" {
+		insert = Statement{SQL: tokensInsertIncarnationSQL, Params: []interface{}{t.ID, t.Username, t.Name, hash, t.ExpiresAt, scope, nowRFC3339(), now, stamp}}
+	}
+	stmts := []Statement{insert}
+	if split {
+		stmts = append(stmts, Statement{SQL: tokenCredentialUpsertSQL, Params: []interface{}{t.ID, t.TokenHash, now}})
+	}
+	if userWriteInterleaveHook != nil {
+		userWriteInterleaveHook(t.Username)
+	}
+	// The account check and an automation token's local provenance commit
+	// in the one transaction (executeCredentialBatch).
+	var still func(tx *sql.Tx) (bool, error)
+	if stamp != "" {
+		still = func(tx *sql.Tx) (bool, error) {
+			cur, err := userIncarnationHeld(ctx, tx, t.Username)
+			return err == nil && cur == stamp, err
+		}
+	}
+	return c.executeCredentialBatch(ctx, t.automationAuthentication, "token", t.ID, t.Username, stmts, still)
 }
 
 const tokensInsertSQL = `INSERT INTO tokens (id, username, name, token_hash, expires_at, scope_paths, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
@@ -544,13 +573,15 @@ const tokensInsertSQL = `INSERT INTO tokens (id, username, name, token_hash, exp
 // It also returns the token's created_at, for the account's tokens_not_before.
 func TokenLive(ctx context.Context, c *Client, id string) (bool, string, error) {
 	rows, err := c.Query(ctx,
-		`SELECT t.created_at FROM tokens t JOIN users u ON u.username = t.username
+		`SELECT t.created_at, t.user_created_at, u.created_at AS user_inc FROM tokens t JOIN users u ON u.username = t.username
 		 WHERE t.id = ? AND t.deleted_at IS NULL AND u.deleted_at IS NULL
 		   AND (t.expires_at IS NULL OR t.expires_at = '' OR t.expires_at > ?)`, id, nowRFC3339())
 	if err != nil {
 		return false, "", err
 	}
-	if len(rows) == 0 {
+	// A token opens only the account incarnation it was issued to
+	// (token_incarnation.go).
+	if len(rows) == 0 || !tokenIncarnationHolds(rows[0].String("user_created_at"), rows[0].String("user_inc")) {
 		return false, "", nil
 	}
 	return true, rows[0].String("created_at"), nil
@@ -592,6 +623,11 @@ func ValidateToken(ctx context.Context, c *Client, rawToken string) (*UserRecord
 	}
 
 	for _, r := range rows {
+		// A token opens only the account incarnation it was issued to
+		// (token_incarnation.go).
+		if !tokenIncarnationHolds(r.String("user_created_at"), r.String("user_inc")) {
+			continue
+		}
 		hash := resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("token_hash"))
 		if hash == "" {
 			continue // bcrypt rejects it anyway; skip the cost
@@ -623,6 +659,7 @@ func ValidateToken(ctx context.Context, c *Client, rawToken string) (*UserRecord
 func liveTokenCandidates(ctx context.Context, c *Client, cutoff string) ([]Row, error) {
 	return c.Query(ctx,
 		`SELECT t.id, t.username, t.token_hash, t.scope_paths, u.role, t.created_at,
+		        t.user_created_at, u.created_at AS user_inc,
 		        COALESCE(NULLIF(t.updated_at, ''), t.created_at) AS src_ts,
 		        c.token_id AS cred_key, c.token_hash AS cred_val, c.updated_at AS cred_ts
 		 FROM tokens t

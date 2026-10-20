@@ -608,7 +608,22 @@ import (
 // v82: immutable retained-origin delivery/object/completion pins; no active authority.
 // v83: preserve all recipient stages while allowing the host-incarnation zero domain.
 // v84: derived target operations and complete-key reservations from certified history.
-const CurrentSchemaVersion = 84
+// v85: tokens.user_created_at (TEXT NOT NULL, default empty) — the account
+// incarnation (users.created_at) an API token was issued to
+// (token_incarnation.go). A token authenticates only while its account
+// holds that incarnation; an empty value (a token from before this version) only
+// while the account holds an incarnation made before
+// user_incarnation_v1 latched. The insert that writes it is emitted once
+// that mandatory, ReplicationGated token has latched, or for an account
+// a latched writer made. The column is left out of a node's
+// anti-entropy dump while every value of it is empty, so a previous-release
+// node takes this build's tokens until then. Appended LAST for the v53
+// digest reason. Additive.
+const CurrentSchemaVersion = 85
+
+// schemaVersionTokenUserIncarnation is the version tokens.user_created_at was
+// added in.
+const schemaVersionTokenUserIncarnation = 85
 
 // schemaVersionProjectIncarnation is the version projects.incarnation was
 // added in.
@@ -1969,7 +1984,8 @@ var schemaDDL = []string{
 		scope_paths  TEXT,                -- JSON []string of allowed path prefixes; empty/NULL = inherit user's full perms
 		created_at   TEXT NOT NULL,
 		updated_at   TEXT NOT NULL DEFAULT '', -- bumped on create + revoke (not on last_used_at) so a revoke wins LWW
-		deleted_at   TEXT
+		deleted_at   TEXT,
+		user_created_at TEXT NOT NULL DEFAULT '' -- the account incarnation the token was issued to; '' = before schemaVersionTokenUserIncarnation
 	)`,
 
 	// Custom roles. Built-in roles are seeded on startup with
@@ -3926,6 +3942,9 @@ var schemaMigrations = []string{
 	// The project incarnation (see History, schemaVersionProjectIncarnation).
 	`ALTER TABLE projects ADD COLUMN incarnation TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE local_automation_receiver_current ADD COLUMN established_inventory BLOB NOT NULL DEFAULT x''`,
+	// The account incarnation a token was issued to (see History,
+	// schemaVersionTokenUserIncarnation).
+	`ALTER TABLE tokens ADD COLUMN user_created_at TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -4027,6 +4046,7 @@ var alterVersions = []int{
 	schemaVersionSGProjects,           // security_groups.project
 	schemaVersionProjectIncarnation,   // projects.incarnation
 	81,                                // local_automation_receiver_current.established_inventory
+	schemaVersionTokenUserIncarnation, // tokens.user_created_at
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

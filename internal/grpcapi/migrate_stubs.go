@@ -3,6 +3,8 @@ package grpcapi
 import (
 	"context"
 	"log/slog"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -56,6 +58,24 @@ type migrationStub struct {
 	vm   string
 	mark string // the VM's placement mark when the stub was made (Server.stubMark)
 	at   time.Time
+}
+
+// markOwner splits a placement mark (host#epoch#gen) into its owner and
+// owner epoch; ok=false for a mark not of that form.
+func markOwner(mark string) (host string, epoch int64, ok bool) {
+	i := strings.LastIndex(mark, "#")
+	if i < 0 {
+		return "", 0, false
+	}
+	j := strings.LastIndex(mark[:i], "#")
+	if j < 0 {
+		return "", 0, false
+	}
+	e, err := strconv.ParseInt(mark[j+1:i], 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return mark[:j], e, true
 }
 
 // stubLedgerTTL bounds how long a stub is recognised as this host's own.
@@ -113,6 +133,47 @@ func (l *migrationStubLedger) forget(path string) {
 	delete(l.m, path)
 }
 
+// reset drops every entry.
+func (l *migrationStubLedger) reset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.m = nil
+}
+
+// vms is every VM with an entry.
+func (l *migrationStubLedger) vms() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	seen := map[string]bool{}
+	var out []string
+	for _, e := range l.m {
+		if !seen[e.vm] {
+			seen[e.vm] = true
+			out = append(out, e.vm)
+		}
+	}
+	return out
+}
+
+// moveSeen ends vm's entries whose move has ended by what this host's
+// replica now says of the VM: its row names this host (the move committed
+// here), names another owner or epoch than the entry's (the move committed
+// elsewhere, or the VM moved), or is not known (a state sync skipped past
+// it, so an end may have been missed).
+func (l *migrationStubLedger) moveSeen(vm, host string, epoch int64, known bool, self string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for p, e := range l.m {
+		if e.vm != vm {
+			continue
+		}
+		h, ep, ok := markOwner(e.mark)
+		if !known || !ok || host == self || host != h || epoch != ep {
+			delete(l.m, p)
+		}
+	}
+}
+
 // forgetVM drops every entry recorded for vm.
 func (l *migrationStubLedger) forgetVM(vm string) {
 	l.mu.Lock()
@@ -122,6 +183,22 @@ func (l *migrationStubLedger) forgetVM(vm string) {
 			delete(l.m, p)
 		}
 	}
+}
+
+// wireMoveRecordWatch ends a record with the incoming move that made it, as
+// this host's replica applies that move's end: the commit that names this
+// host or another owner, or anything that moves the VM. It is local and
+// event-driven, so a move out and back that a peer writes without a new
+// placement generation (a peer whose failover_scope_v1 latch has not formed
+// yet) still ends the record at its first leg. A restart forgets every
+// record, so a move whose end this host missed is never honoured.
+func (s *Server) wireMoveRecordWatch() {
+	s.db.SetVMHostWatch(
+		func() []string { return append(s.migrationStubs.vms(), s.migrationISOs.vms()...) },
+		func(vm, host string, epoch int64, known bool) {
+			s.migrationStubs.moveSeen(vm, host, epoch, known, s.hostName)
+			s.migrationISOs.moveSeen(vm, host, epoch, known, s.hostName)
+		})
 }
 
 // endMoveRecords ends every record this host made as a target of a move of

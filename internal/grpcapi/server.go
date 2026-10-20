@@ -2731,6 +2731,7 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 	s.wireConsolePasswordPolicy()
 	if db != nil {
 		db.SetStartedProofCheck(s.operatorStartRecorded)
+		s.wireMoveRecordWatch()
 	}
 	return s
 }

@@ -98,7 +98,19 @@ func NewServerForTests(opts TestServerOpts) *Server {
 	s.wireCertificateVerifier()
 	s.wireReplicationReleaseGates()
 	s.wireConsolePasswordPolicy()
+	if opts.DB != nil {
+		s.wireMoveRecordWatch()
+	}
 	return s
+}
+
+// ForgetMoveRecordsForTest does to this host's stub and seed records what a
+// daemon restart does: they are kept in memory only, so a restart forgets
+// them, and every file at a disk path then reads as one this host did not
+// create.
+func (s *Server) ForgetMoveRecordsForTest() {
+	s.migrationStubs.reset()
+	s.migrationISOs.reset()
 }
 
 // SetLXCCapableForTest makes this server's runtime inventory list (on) or skip

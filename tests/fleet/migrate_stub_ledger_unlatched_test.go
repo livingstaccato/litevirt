@@ -10,9 +10,14 @@ package fleet
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -109,5 +114,40 @@ func TestFleet_LatchedMovesAfterAFailoverBackStillWork(t *testing.T) {
 	sc.c.WaitConverged(t, convergeTimeout)
 	if h := sc.host(t); h != sc.a.Name {
 		t.Fatalf("pp1 after the move back is on %s, want %s", h, sc.a.Name)
+	}
+}
+
+// The crash-mid-move variant of the latch skew (B latched, A not): B
+// restarts while an A→B storage move is under way, after its EnsureDisks
+// made the stub. The record is in memory only, so the restart ends it: the
+// failed move's cleanup leaves the stub, and the retry is refused naming it
+// rather than reusing it, the stub left exactly as it was.
+//
+// Mutation: keep the records across the restart (ForgetMoveRecordsForTest a
+// no-op) — the cleanup removes the stub and the retry goes ahead, red.
+func TestFleet_ATargetRestartedMidMoveHonoursNoRecordOfThatMove(t *testing.T) {
+	sc := newPartitionStubABA(t, false)
+	sc.b.DB.SetClusterPolicyGate(func() bool { return true }) // B latched, A not
+	sc.a.Virt.FailMigrateToTarget = func(string, string) error {
+		sc.b.Server.ForgetMoveRecordsForTest() // B restarts mid-move
+		return errors.New("injected: the target restarted mid-move")
+	}
+	if err := migrateWithStorageAt(t, sc.c, sc.a, "pp1", sc.b.Name); err == nil {
+		t.Fatal("the move whose target restarted mid-move succeeded")
+	}
+	stub, err := os.ReadFile(sc.p)
+	if err != nil {
+		t.Fatalf("the move's stub on %s after its target restarted: %v; the cleanup must leave it", sc.b.Name, err)
+	}
+	sc.a.Virt.FailMigrateToTarget = nil
+	err = migrateWithStorageAt(t, sc.c, sc.a, "pp1", sc.b.Name)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "this migration did not create it") {
+		t.Fatalf("retry after the target restarted = %v, want FailedPrecondition naming the stub", err)
+	}
+	if after, rerr := os.ReadFile(sc.p); rerr != nil || string(after) != string(stub) {
+		t.Fatalf("the stub on %s changed (err %v)", sc.b.Name, rerr)
+	}
+	if h := sc.host(t); h != sc.a.Name {
+		t.Fatalf("pp1 is on %s, want %s", h, sc.a.Name)
 	}
 }

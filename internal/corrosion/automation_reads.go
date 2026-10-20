@@ -38,35 +38,44 @@ func (c *Client) AutomationObserve(ctx context.Context, cluster, uid string, bar
 	return view, found, nil
 }
 
-func automationObserveTx(ctx context.Context, tx *LocalTx, cluster, uid string, barrier uint64) (contract.View, bool, error) {
+func automationReadFrontierTx(ctx context.Context, tx *LocalTx, cluster string, barrier uint64) (AutomationPrefix, error) {
 	unavailable := automationReadError(contract.CodeUnavailable)
 	// Probe types and sizes before the existing typed helpers can coerce SQL
 	// values or load an oversized scalar. SQLite INTEGER already bounds int64.
 	rows, err := tx.Query(ctx, `SELECT CASE WHEN typeof(cluster_uid)='text' AND length(CAST(cluster_uid AS BLOB)) BETWEEN 1 AND ? AND typeof(sequence)='integer' AND sequence>0 AND typeof(digest)='text' AND length(CAST(digest AS BLOB))=64 THEN 1 ELSE 0 END AS valid FROM local_automation_prefix WHERE id=1 UNION ALL SELECT CASE WHEN typeof(cluster_uid)='text' AND length(CAST(cluster_uid AS BLOB)) BETWEEN 1 AND ? AND typeof(sequence)='integer' AND sequence>0 AND typeof(digest)='text' AND length(CAST(digest AS BLOB))=64 THEN 1 ELSE 0 END FROM local_automation_semantic_heads WHERE stage=''`, contract.MaxStringBytes, contract.MaxStringBytes)
 	if err != nil {
-		return contract.View{}, false, err
+		return AutomationPrefix{}, err
 	}
 	if len(rows) != 2 || rows[0].Int64("valid") != 1 || rows[1].Int64("valid") != 1 {
-		return contract.View{}, false, unavailable
+		return AutomationPrefix{}, unavailable
 	}
 	if err := automationProjectionAuthorityTx(ctx, tx); err != nil {
 		if errors.Is(err, errAutomationAuthority) {
-			return contract.View{}, false, unavailable
+			return AutomationPrefix{}, unavailable
 		}
-		return contract.View{}, false, err
+		return AutomationPrefix{}, err
 	}
 	head, err := automationHeadTx(ctx, tx)
 	if err != nil {
-		return contract.View{}, false, err
+		return AutomationPrefix{}, err
 	}
 	retained, err := automationRetainedHeadTx(ctx, tx)
 	if err != nil {
-		return contract.View{}, false, err
+		return AutomationPrefix{}, err
 	}
 	if head != retained || head.ClusterUID != cluster || head.Sequence < barrier || !automationReadString(head.ClusterUID, false) {
-		return contract.View{}, false, unavailable
+		return AutomationPrefix{}, unavailable
 	}
-	rows, err = tx.Query(ctx, `SELECT CASE WHEN typeof(uid)='text' AND typeof(cluster_uid)='text' AND typeof(project_uid)='text' AND typeof(name)='text' AND typeof(domain_uuid)='text' AND typeof(incarnation)='text' AND typeof(owner_id)='text' AND typeof(management_key)='text' AND typeof(revision)='text' AND typeof(last_operation_id)='text' AND typeof(original_operation_id)='text' AND max(length(CAST(uid AS BLOB)),length(CAST(cluster_uid AS BLOB)),length(CAST(project_uid AS BLOB)),length(CAST(name AS BLOB)),length(CAST(domain_uuid AS BLOB)),length(CAST(incarnation AS BLOB)),length(CAST(owner_id AS BLOB)),length(CAST(management_key AS BLOB)),length(CAST(revision AS BLOB)),length(CAST(last_operation_id AS BLOB)),length(CAST(original_operation_id AS BLOB)))<=? AND typeof(binding_generation)='integer' AND binding_generation>=0 AND typeof(retired)='integer' AND retired IN (0,1) AND typeof(applied_sequence)='integer' AND applied_sequence>0 THEN 1 ELSE 0 END AS valid FROM local_automation_resources WHERE stage='' AND uid=? LIMIT 1`, contract.MaxStringBytes, uid)
+	return head, nil
+}
+
+func automationObserveTx(ctx context.Context, tx *LocalTx, cluster, uid string, barrier uint64) (contract.View, bool, error) {
+	unavailable := automationReadError(contract.CodeUnavailable)
+	head, err := automationReadFrontierTx(ctx, tx, cluster, barrier)
+	if err != nil {
+		return contract.View{}, false, err
+	}
+	rows, err := tx.Query(ctx, `SELECT CASE WHEN typeof(uid)='text' AND typeof(cluster_uid)='text' AND typeof(project_uid)='text' AND typeof(name)='text' AND typeof(domain_uuid)='text' AND typeof(incarnation)='text' AND typeof(owner_id)='text' AND typeof(management_key)='text' AND typeof(revision)='text' AND typeof(last_operation_id)='text' AND typeof(original_operation_id)='text' AND max(length(CAST(uid AS BLOB)),length(CAST(cluster_uid AS BLOB)),length(CAST(project_uid AS BLOB)),length(CAST(name AS BLOB)),length(CAST(domain_uuid AS BLOB)),length(CAST(incarnation AS BLOB)),length(CAST(owner_id AS BLOB)),length(CAST(management_key AS BLOB)),length(CAST(revision AS BLOB)),length(CAST(last_operation_id AS BLOB)),length(CAST(original_operation_id AS BLOB)))<=? AND typeof(binding_generation)='integer' AND binding_generation>=0 AND typeof(retired)='integer' AND retired IN (0,1) AND typeof(applied_sequence)='integer' AND applied_sequence>0 THEN 1 ELSE 0 END AS valid FROM local_automation_resources WHERE stage='' AND uid=? LIMIT 1`, contract.MaxStringBytes, uid)
 	if err != nil {
 		return contract.View{}, false, err
 	}

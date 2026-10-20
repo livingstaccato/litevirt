@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -123,27 +124,38 @@ func readmitParams(s Statement) (host, ts string, ok bool) {
 	return host, ts, tok && hok && host != "" && ts != ""
 }
 
-// deleteFingerprint is the wire fingerprint of the host removal (DeleteHost).
-var deleteFingerprint = mustStatementFingerprint(deleteHostSQL)
+// The wire fingerprints of the host removal: DeleteHost's, and
+// DeleteHostAdmissionIf's, which also names the removed admission's serial.
+var (
+	deleteFingerprint          = mustStatementFingerprint(deleteHostSQL)
+	deleteAdmissionFingerprint = mustStatementFingerprint(deleteHostAdmissionSQL)
+)
 
-// isHostDelete reports whether s is a host removal, by fingerprint.
+// isHostDelete reports whether s is a host removal, in either shape, by
+// fingerprint.
 func isHostDelete(s Statement) bool {
 	if !strings.Contains(s.SQL, "hosts") {
 		return false
 	}
 	fp, err := FingerprintSQL(s.SQL)
-	return err == nil && fp == deleteFingerprint
+	return err == nil && (fp == deleteFingerprint || fp == deleteAdmissionFingerprint)
 }
 
-// deleteParams are the host name and updated_at a removal binds:
-// deleted_at, updated_at, name — deleteHostSQL's order.
-func deleteParams(s Statement) (host, ts string, ok bool) {
-	if len(s.Params) != 3 {
-		return "", "", false
+// deleteParams are the host name and updated_at a removal binds, and the
+// serial it names ("" for deleteHostSQL): deleted_at, updated_at, name and,
+// for deleteHostAdmissionSQL, cert_serial.
+func deleteParams(s Statement) (host, ts, serial string, ok bool) {
+	if len(s.Params) != 3 && len(s.Params) != 4 {
+		return "", "", "", false
 	}
 	ts, tok := s.Params[1].(string)
 	host, hok := s.Params[2].(string)
-	return host, ts, tok && hok && host != "" && ts != ""
+	sok := true
+	if len(s.Params) == 4 {
+		serial, sok = s.Params[3].(string)
+		sok = sok && serial != ""
+	}
+	return host, ts, serial, tok && hok && sok && host != "" && ts != ""
 }
 
 // retireReadmittedCredentials retires the fence credential row of every host
@@ -192,7 +204,20 @@ func retireReadmittedCredentials(ctx context.Context, tx *sql.Tx, stmts []Statem
 				}
 			}
 		case isHostDelete(s):
-			host, ts, ok = deleteParams(s)
+			var serial string
+			host, ts, serial, ok = deleteParams(s)
+			if ok && serial != "" {
+				// A removal that names its admission retires the credential
+				// only where the row is that admission: a row under another
+				// serial is a re-admission, whose credential is not this
+				// removal's (host_removal_stands.go).
+				var cur sql.NullString
+				err := tx.QueryRowContext(ctx, `SELECT cert_serial FROM hosts WHERE name = ?`, host).Scan(&cur)
+				if err != nil && !errors.Is(err, sql.ErrNoRows) {
+					return fmt.Errorf("read %s's serial: %w", host, err)
+				}
+				ok = err == nil && strings.EqualFold(cur.String, serial)
+			}
 		}
 		if !ok {
 			continue

@@ -118,7 +118,10 @@ func TestReplicatedUpdatedAtUsesNowTS(t *testing.T) {
 			// or keep the local one, as every apply of a replicated statement
 			// does. A fresh local stamp would make the replica's row differ
 			// from the origin's.
-			if fn.Name.Name == "takeSiblingSpecEdit" || fn.Name.Name == "keepClock" {
+			// applyReplicatedAuthorityRetire is a WAL apply too: it writes the
+			// RECEIVED retirement's own updated_at to the epochs it applies to.
+			if fn.Name.Name == "takeSiblingSpecEdit" || fn.Name.Name == "keepClock" ||
+				fn.Name.Name == "applyReplicatedAuthorityRetire" {
 				continue
 			}
 			body := string(src[fset.Position(fn.Pos()).Offset:fset.Position(fn.End()).Offset])

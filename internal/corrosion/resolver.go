@@ -484,8 +484,12 @@ var capabilityMap = map[string]tableResolver{
 	// Ahead of both, the incarnation counter (host_incarnation.go): two rows
 	// with different keys go to the later incarnation whole, a tombstone of an
 	// earlier one included.
+	//
+	// Then two tombstones of one admission settle by content-max
+	// (host_removal_stands.go).
 	"hosts": {category: "host-control-plane", chain: []tieRule{
 		ruleIncarnationCounter(),
+		ruleRemovedAdmission(),
 		ruleTombstone(),
 		ruleIncarnation(),
 		ruleAnyColUnresolved([]string{

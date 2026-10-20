@@ -38,6 +38,10 @@ var (
 // 3. Push CA + host cert + litevirtd binary + setup script via SSH
 // 4. Run setup script to install deps and start litevirtd
 func HostInit(ctx context.Context, sshTarget string, hostName string, force bool) error {
+	// The name becomes <pkiDir>/<name>.crt|.key beside the CA: checked first.
+	if err := pki.ValidateHostName(hostName); err != nil {
+		return err
+	}
 	// Parse SSH target to get IP for cert SAN
 	parsedHost, _, err := parseSSHTarget(sshTarget)
 	if err != nil {
@@ -256,8 +260,8 @@ func (s stagedEnrollmentIdentity) remove() { _ = os.RemoveAll(s.dir) }
 // not overwrite an operator's active identity while preparing enrollment.
 func stageHostEnrollmentIdentity(pkiDir, hostName, addr string) (stagedEnrollmentIdentity, error) {
 	var staged stagedEnrollmentIdentity
-	if hostName == "" || len(hostName) > 253 || hostName == "." || hostName == ".." || strings.ContainsAny(hostName, "/\\\r\n\x00") {
-		return staged, errors.New("invalid enrollment host name")
+	if err := pki.ValidateHostName(hostName); err != nil {
+		return staged, err
 	}
 	dir, err := os.MkdirTemp("", "litevirt-enrollment-identity-")
 	if err != nil {
@@ -288,6 +292,9 @@ func stageHostEnrollmentIdentity(pkiDir, hostName, addr string) (stagedEnrollmen
 }
 
 func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bool) error {
+	if err := pki.ValidateHostName(hostName); err != nil {
+		return err
+	}
 	// Same hazard as the remote form: the setup script rewrites config.yaml and
 	// passes an explicit empty join_peers, so re-running --local against a node
 	// that is already in a cluster erases its peer list.

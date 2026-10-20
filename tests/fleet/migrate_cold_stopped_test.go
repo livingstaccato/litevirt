@@ -54,7 +54,7 @@ func newColdStoppedScenarioWith(t *testing.T, opts Options) *coldStoppedScenario
 	c := New(t, opts)
 	t.Cleanup(c.Stop)
 	src, dst := c.Nodes[0], c.Nodes[1]
-	for _, n := range []*Node{src, dst} {
+	for _, n := range c.Nodes {
 		n.Server.SetHostDiskRootForTest(filepath.Join(c.tmpRoot, "fs-"+n.Name))
 	}
 
@@ -64,6 +64,11 @@ func newColdStoppedScenarioWith(t *testing.T, opts Options) *coldStoppedScenario
 		// same path is on every host in production.
 		disk:   filepath.Join(c.tmpRoot, dst.Name, "data", "disks", "os1-root.qcow2"),
 		shared: filepath.Join(c.tmpRoot, "nfs", "os1-data.qcow2"),
+	}
+	if opts.SharedDataDir {
+		// Every node's data dir is the one string, so the disk is under every
+		// node's disk-artifact root and can move between any two of them.
+		sc.disk = filepath.Join(c.tmpRoot, "shared-data", "disks", "os1-root.qcow2")
 	}
 	// Not a qcow2, so it is copied as it is; a zero megabyte in the middle is
 	// skipped on the wire and must still read back as zeros.

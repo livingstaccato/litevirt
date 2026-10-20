@@ -82,6 +82,9 @@ type Container struct {
 	Network   []NetworkAttach   // veth attachments, each into an existing bridge
 	Labels    map[string]string // free-form metadata used by compose / UI
 	Image     string            // origin image name (oci://… or alpine:3.19)
+	// ImageGen is the generation of the library item a container was
+	// copied from (ImageGenFile), "" for any other source.
+	ImageGen string
 }
 
 // NetworkAttach describes one container NIC.
@@ -329,6 +332,12 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 	if err := opts.Validate(); err != nil {
 		return nil, err
 	}
+	// The name becomes <lxcpath>/<name>, which a failed create removes: it
+	// must be a container name, whatever the caller (a relocation recreate
+	// from a legacy row among them) checked.
+	if err := safename.ValidateContainerName(opts.Name); err != nil {
+		return nil, err
+	}
 	if opts.PidsMax == 0 {
 		opts.PidsMax = r.DefaultPidsMax
 	}
@@ -340,6 +349,12 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 		}
 	}
 	if opts.Template != "download" {
+		// A rootfs path is copied under its item's lock: a replacing pull
+		// of a library item waits for the copy (LockOCIItem).
+		if p, isPath, _ := TemplatePath(opts.Template); isPath {
+			unlock := LockOCIItem(BundleDir(p))
+			defer unlock()
+		}
 		rootfs, ok, err := resolveRootfs(opts.Template)
 		if err != nil {
 			return nil, err
@@ -348,16 +363,22 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 			return r.createFromRootfs(ctx, opts, rootfs)
 		}
 	}
-	args := []string{"-n", opts.Name, "-t", opts.Template}
-	if opts.Template == "download" {
-		args = append(args, "--",
-			"-d", opts.Distro,
-			"-r", opts.Release,
-			"-a", opts.Arch,
-		)
-	}
-	if _, stderr, err := r.run(ctx, "lxc-create", args...); err != nil {
-		return nil, cmdErr("lxc-create", opts.Name, stderr, err)
+	// A container FetchImage already built for this name and image is moved
+	// into place; otherwise lxc-create builds it.
+	if adopted, err := r.adoptFetched(opts); err != nil {
+		return nil, err
+	} else if !adopted {
+		args := []string{"-n", opts.Name, "-t", opts.Template}
+		if opts.Template == "download" {
+			args = append(args, "--",
+				"-d", opts.Distro,
+				"-r", opts.Release,
+				"-a", opts.Arch,
+			)
+		}
+		if _, stderr, err := r.run(ctx, "lxc-create", args...); err != nil {
+			return nil, cmdErr("lxc-create", opts.Name, stderr, err)
+		}
 	}
 	// lxc-create wrote the base config (with a default NIC from
 	// /etc/lxc/default.conf). Re-render the network from opts (so an explicit
@@ -382,6 +403,207 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 		Labels:    opts.Labels,
 		Image:     opts.Distro + ":" + opts.Release,
 	}, nil
+}
+
+// fetchDirName is the directory in LXC's store under which FetchImage builds
+// containers. "+" is outside every container name's charset (safename), so
+// it never names a container.
+const fetchDirName = ".litevirt+fetch"
+
+// fetchedImageFile is the file in a fetch stage naming the image its
+// container was built from (fetchSignature); its "+" keeps it apart from
+// the container's own directory, whatever its name.
+const fetchedImageFile = ".litevirt+image"
+
+// fetchStageTTL is how long a staged fetch is reused and adopted: one left
+// by a recreate that did not go ahead is not taken by a later, unrelated
+// create of the name, which fetches anew.
+const fetchStageTTL = time.Hour
+
+var fetchLocks sync.Map // container name → *sync.Mutex
+
+// adoptBeforeRename is a test seam run just before adoptFetched's rename.
+var adoptBeforeRename func(built string)
+
+func lockFetch(name string) func() {
+	m, _ := fetchLocks.LoadOrStore(name, &sync.Mutex{})
+	mu := m.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// fetchSignature names the image a create with opts is built from.
+func fetchSignature(opts CreateOpts) string {
+	return strings.Join([]string{opts.Template, opts.Distro, opts.Release, opts.Arch}, "\x00")
+}
+
+// fetchStage is where FetchImage keeps the container it built for name:
+// <lxcpath>/.litevirt+fetch/<name>, an lxcpath holding one container, also
+// named name, so the download template writes the container's own name into
+// the guest (/etc/hostname, /etc/hosts), and it is never the live member's
+// directory.
+func (r *LxcRunner) fetchStage(name string) string {
+	return filepath.Join(r.lxcpath(), fetchDirName, name)
+}
+
+// FetchImage fetches and verifies, on this host, the rootfs a Create with
+// opts would be built from, and creates no container in the store: a caller
+// about to replace a container (a compose recreate) runs it before the
+// delete, so an image this host cannot fetch leaves the container as it is.
+//
+// A rootfs path is resolved as Create resolves it (an existing directory that
+// looks like a root filesystem), under its item's lock. Any other template —
+// "download" above all — is run by lxc-create into a staging lxcpath under
+// fetchDirName (the download template fetches the image and verifies its
+// signature), and the container it built is kept there: the Create of the
+// same name and image that follows moves it into place (adoptFetched)
+// instead of fetching again. A fetch of another image for the name replaces
+// it; SweepFetchDir clears what is left at daemon start.
+func (r *LxcRunner) FetchImage(ctx context.Context, opts CreateOpts) error {
+	// The name becomes a path under the store: it must be a container
+	// name itself, whatever the caller checked.
+	if err := safename.ValidateContainerName(opts.Name); err != nil {
+		return fmt.Errorf("fetch image: %w", err)
+	}
+	if err := opts.Validate(); err != nil {
+		return err
+	}
+	if opts.Template != "download" {
+		if p, isPath, _ := TemplatePath(opts.Template); isPath {
+			unlock := LockOCIItem(BundleDir(p))
+			defer unlock()
+		}
+		_, ok, err := resolveRootfs(opts.Template)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return nil
+		}
+	}
+	unlock := lockFetch(opts.Name)
+	defer unlock()
+	stage := r.fetchStage(opts.Name)
+	if r.freshFetch(stage, opts) {
+		return nil // already fetched and kept
+	}
+	if err := os.RemoveAll(stage); err != nil {
+		return fmt.Errorf("fetch image: %w", err)
+	}
+	if err := os.MkdirAll(stage, 0o700); err != nil {
+		return fmt.Errorf("fetch image: %w", err)
+	}
+	args := []string{"-P", stage, "-n", opts.Name, "-t", opts.Template}
+	if opts.Template == "download" {
+		args = append(args, "--", "-d", opts.Distro, "-r", opts.Release, "-a", opts.Arch)
+	}
+	cmd := dieWithDaemon(exec.CommandContext(ctx, "lxc-create", args...))
+	var stderr strings.Builder
+	cmd.Stderr = stringWriter{&stderr}
+	if err := runPinned(func() error { _, e := cmd.Output(); return e }); err != nil {
+		_ = os.RemoveAll(stage)
+		return cmdErr("lxc-create (fetch image)", opts.Name, []byte(stderr.String()), err)
+	}
+	if err := os.WriteFile(filepath.Join(stage, fetchedImageFile), []byte(fetchSignature(opts)), 0o600); err != nil {
+		_ = os.RemoveAll(stage)
+		return fmt.Errorf("fetch image: %w", err)
+	}
+	return nil
+}
+
+// adoptFetched moves the container FetchImage built for opts.Name into the
+// store as opts.Name, when it was built from the image opts names, and
+// points its config at its new place. It reports whether it did; a staged
+// container of another image is left for the next fetch to replace.
+func (r *LxcRunner) adoptFetched(opts CreateOpts) (bool, error) {
+	if err := safename.ValidateContainerName(opts.Name); err != nil {
+		return false, err
+	}
+	unlock := lockFetch(opts.Name)
+	defer unlock()
+	stage := r.fetchStage(opts.Name)
+	if !r.freshFetch(stage, opts) {
+		return false, nil
+	}
+	built := filepath.Join(stage, opts.Name)
+	dst := filepath.Join(r.lxcpath(), opts.Name)
+	if _, err := os.Lstat(dst); err == nil {
+		return false, fmt.Errorf("container %q already exists at %s", opts.Name, dst)
+	}
+	// Its files name its final place before the one rename that puts it
+	// there: a crash leaves either a stage (swept at start) or a complete
+	// container, never one whose config names the stage.
+	for _, f := range []string{"config", "fstab"} {
+		if err := repointFetched(filepath.Join(built, f), built, dst); err != nil {
+			_ = os.RemoveAll(stage)
+			return false, err
+		}
+	}
+	if adoptBeforeRename != nil {
+		adoptBeforeRename(built)
+	}
+	if err := os.Rename(built, dst); err != nil {
+		_ = os.RemoveAll(stage)
+		return false, fmt.Errorf("move the fetched container into place as %q: %w", opts.Name, err)
+	}
+	_ = os.RemoveAll(stage)
+	return true, nil
+}
+
+// freshFetch reports whether stage holds a container built for opts within
+// fetchStageTTL.
+func (r *LxcRunner) freshFetch(stage string, opts CreateOpts) bool {
+	sig := filepath.Join(stage, fetchedImageFile)
+	b, err := os.ReadFile(sig)
+	if err != nil || string(b) != fetchSignature(opts) {
+		return false
+	}
+	// Fresh is fetched within fetchStageTTL; a fetch time in the future
+	// (the clock was set back) is not.
+	if fi, err := os.Stat(sig); err != nil || time.Since(fi.ModTime()) > fetchStageTTL || time.Until(fi.ModTime()) > time.Minute {
+		return false
+	}
+	_, err = os.Stat(filepath.Join(stage, opts.Name, "config"))
+	return err == nil
+}
+
+// repointFetched points a file of a moved container (its config, its
+// fstab) at its new directory: every mention of from becomes to. A file
+// the template did not write is left alone.
+func repointFetched(f, from, to string) error {
+	b, err := os.ReadFile(f)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(f, []byte(strings.ReplaceAll(string(b), from, to)), 0o644)
+}
+
+// SweepFetchDir removes, at daemon start, every container FetchImage left
+// staged (a recreate refused after its fetch, or a crash).
+func (r *LxcRunner) SweepFetchDir() error {
+	return sweepStage(filepath.Join(r.lxcpath(), fetchDirName))
+}
+
+// sweepStage removes a staging directory at start, after stopping any
+// process still working in it (stopWorkersIn), retrying briefly while one
+// that was stopping releases it.
+func sweepStage(dir string) error {
+	if _, err := os.Lstat(dir); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	stopWorkersIn(dir)
+	var err error
+	for i := 0; i < 10; i++ {
+		if err = os.RemoveAll(dir); err == nil {
+			slog.Info("container staging: removed what an earlier run left staged", "path", dir)
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return err
 }
 
 // createFromRootfs materialises a container around an already-extracted rootfs
@@ -433,6 +655,7 @@ func (r *LxcRunner) createFromRootfs(ctx context.Context, opts CreateOpts, rootf
 		Name:      opts.Name,
 		State:     StateStopped,
 		RootFS:    dstRootfs,
+		ImageGen:  ReadImageGen(BundleDir(rootfs)),
 		CPULimit:  opts.CPULimit,
 		MemoryMiB: opts.MemoryMiB,
 		Network:   opts.Network,
@@ -469,6 +692,9 @@ func (r *LxcRunner) Stop(ctx context.Context, name string, timeoutSec int) error
 // running. Without -f, lxc-destroy refuses a running container ("<name> is
 // running"), so `lv ct rm` and `compose down` of a running container would fail.
 func (r *LxcRunner) Delete(ctx context.Context, name string) error {
+	if err := safename.ValidateContainerName(name); err != nil {
+		return err
+	}
 	if _, stderr, err := r.run(ctx, "lxc-destroy", "-f", "-n", name); err != nil {
 		// Only classify as not-found when the container is ACTUALLY gone on disk
 		// (its config is absent). A broad stderr match would mask a real failure —
@@ -937,6 +1163,11 @@ func (r *LxcRunner) TakeDroppedAttrs(name string) ([]string, error) {
 // Container clones are always full copies (no qcow2 backing), so there's no
 // linked-clone dependency to track.
 func (r *LxcRunner) CloneContainer(ctx context.Context, src, dst string) error {
+	for _, n := range []string{src, dst} {
+		if err := safename.ValidateContainerName(n); err != nil {
+			return err
+		}
+	}
 	srcDir := filepath.Join(r.lxcpath(), src)
 	dstDir := filepath.Join(r.lxcpath(), dst)
 	if _, err := os.Stat(srcDir); err != nil {

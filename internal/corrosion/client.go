@@ -1503,6 +1503,12 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 // between them), so a peer can briefly hold the state after the first entry.
 // Callers order entries so that intermediate is the safe one.
 func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.Tx) (bool, error), entries [][]Statement) (bool, error) {
+	return c.executeEntriesGuardedWithLifecycle(ctx, guard, entries, nil)
+}
+
+// executeEntriesGuardedWithLifecycle keeps originating lifecycle evidence inside
+// the guarded parent transaction. A losing guard never observes or changes it.
+func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard func(tx *sql.Tx) (bool, error), entries [][]Statement, life *lifecycleMutation) (bool, error) {
 	if reason := c.quarantineReason(); reason != "" {
 		return false, errQuarantined(reason)
 	}
@@ -1529,6 +1535,17 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 		tx.Rollback()
 		c.mu.Unlock()
 		return false, nil
+	}
+	if life != nil {
+		life.expected, err = lifecycleParentTx(ctx, tx, life.kind, life.name)
+		if err == nil {
+			err = life.before(ctx, tx)
+		}
+		if err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return false, err
+		}
 	}
 	var mutated []Statement
 	var parks []func() // see executeBatchInternal
@@ -1674,6 +1691,13 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 			tx.Rollback()
 			c.mu.Unlock()
 			return false, fmt.Errorf("write mutation_log: %w", err)
+		}
+	}
+	if life != nil {
+		if err := life.after(ctx, tx); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return false, err
 		}
 	}
 	if err := tx.Commit(); err != nil {

@@ -2584,7 +2584,20 @@ type ContainerRuntime interface {
 	// CloneContainer full-copies src's on-disk dir as dst with a fresh identity
 	// (B4 templates/clones).
 	CloneContainer(ctx context.Context, src, dst string) error
-	PullOCIImage(ctx context.Context, image, dest, tag, username, password string) error
+	// PullOCIImage pulls image into dest. With replace it may replace a
+	// bundle already there (lxc.PullOCIOptions.Replace); without, such a pull
+	// fails with lxc.ErrOCIItemExists.
+	// check judges a local source as the object the runtime opened
+	// (lxc.PullOCIOptions.CheckSource).
+	PullOCIImage(ctx context.Context, image, dest, tag, username, password string, replace bool, check func(transport, path string) error) error
+	// RootfsReferences names the containers on this host whose config uses
+	// dir, or anything under it, as their rootfs in place.
+	RootfsReferences(ctx context.Context, dir string) ([]string, error)
+	// FetchContainerImage fetches and verifies, on this host, the image a
+	// create with opts would be built from (its Template, Distro, Release
+	// and Arch), and creates nothing. A compose recreate runs it on the
+	// member's host before the delete (recreateHostChecks).
+	FetchContainerImage(ctx context.Context, opts CreateContainerOpts) error
 }
 
 // CreateContainerOpts mirrors lxc.CreateOpts at the gRPC boundary so
@@ -2637,6 +2650,9 @@ type ContainerInfo struct {
 	Name  string
 	State string
 	Image string
+	// ImageGen is the generation of the OCI library item the container was
+	// copied from (lxc.ImageGenFile); "" for any other source.
+	ImageGen string
 }
 
 // ContainerMemoryLimit mirrors lxc.MemoryLimit at the gRPC boundary.

@@ -535,17 +535,28 @@ func newCTPullCmd() *cobra.Command {
 				pw = p
 			}
 			if useLocal {
-				return lxc.PullOCI(cmd.Context(), lxc.PullOCIOptions{
+				if err := lxc.PullOCI(cmd.Context(), lxc.PullOCIOptions{
 					Image: args[0], Dest: dest, Tag: tag, Username: username, Password: pw,
-				})
+				}); err != nil {
+					return err
+				}
+				fmt.Printf("Pulled %s into %s.\n", args[0], dest)
+				return nil
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				_, err := c.PullOCIImage(ctx, &pb.PullOCIImageRequest{
+				if _, err := c.PullOCIImage(ctx, &pb.PullOCIImageRequest{
 					Project:  project,
 					HostName: host, Image: args[0], Dest: dest, Tag: tag,
 					Username: username, Password: pw,
-				})
-				return err
+				}); err != nil {
+					return err
+				}
+				where := dest
+				if host != "" {
+					where += " on " + host
+				}
+				fmt.Printf("Pulled %s into %s.\n", args[0], where)
+				return nil
 			})
 		},
 	}

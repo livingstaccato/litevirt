@@ -260,11 +260,15 @@ func TestHostAdd_InstallsOnlyThePairItWasAdmittedWith(t *testing.T) {
 // .<name>.crt.add in its pki directory and kept as <name>.crt, so a host named
 // "ca" overwrote the cluster CA's certificate and key, and one named "host"
 // this machine's own host pair. Neither path is derived from the name now
-// except under a directory of their own.
+// except under a directory of their own, and the names themselves are
+// refused (pki.ValidateHostName): "ca" and "host" touch nothing, and any
+// other name's pair is kept under hosts/<name>/ only.
 //
-// Mutation: keep at <pki>/<name>.crt again — "ca" replaces ca.crt.
+// Mutations: keep at <pki>/<name>.crt again — node-9.crt appears in the
+// operator's directory; drop the name rule in checkAddName, hostAddTo and
+// mintStaged — "ca" is admitted.
 func TestHostAdd_AHostNamedLikeAPKIFileTouchesNone(t *testing.T) {
-	for _, name := range []string{"ca", "host"} {
+	for _, name := range []string{"ca", "host", "node-9"} {
 		t.Run(name, func(t *testing.T) {
 			f := newAddFixture(t)
 			// This machine's own host pair, as a node holds it.
@@ -282,18 +286,38 @@ func TestHostAdd_AHostNamedLikeAPKIFileTouchesNone(t *testing.T) {
 					before[e.Name()] = mustRead(t, filepath.Join(f.opPKI, e.Name()))
 				}
 			}
-			if err := HostAddOn(context.Background(), f.client, f.target, name, "10.0.0.9"); err != nil {
+			err = HostAddOn(context.Background(), f.client, f.target, name, "10.0.0.9")
+			if name != "node-9" {
+				if err == nil || !strings.Contains(err.Error(), "invalid host name") || len(f.client.admitted) != 0 {
+					t.Fatalf("HostAddOn(%q) = %v (admitted %v), want the name refused", name, err, f.client.admitted)
+				}
+			} else if err != nil {
 				t.Fatal(err)
+			}
+			after, err := os.ReadDir(f.opPKI)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, e := range after {
+				// The first add mints the cluster's migration CA; nothing else is new.
+				if e.Name() == pki.MigrationCACertName || e.Name() == pki.MigrationCAKeyName {
+					continue
+				}
+				if _, ok := before[e.Name()]; !ok && !e.IsDir() {
+					t.Errorf("adding a host named %q wrote %s in the operator's pki directory", name, e.Name())
+				}
 			}
 			for n, want := range before {
 				if got, err := os.ReadFile(filepath.Join(f.opPKI, n)); err != nil || !bytes.Equal(got, want) {
 					t.Errorf("adding a host named %q replaced the operator's %s (%v)", name, n, err)
 				}
 			}
-			// The admitted pair is still kept with the operator, out of the way.
-			kept := filepath.Join(f.opPKI, "hosts", name, "host.crt")
-			if got := installedSerial(mustRead(t, kept)); got != f.client.admitted[0] {
-				t.Errorf("kept %s serves %s, want the admitted %s", kept, got, f.client.admitted[0])
+			if name == "node-9" {
+				// The admitted pair is still kept with the operator, out of the way.
+				kept := filepath.Join(f.opPKI, "hosts", name, "host.crt")
+				if got := installedSerial(mustRead(t, kept)); got != f.client.admitted[0] {
+					t.Errorf("kept %s serves %s, want the admitted %s", kept, got, f.client.admitted[0])
+				}
 			}
 			if left, _ := filepath.Glob(filepath.Join(f.opPKI, ".*")); len(left) != 0 {
 				t.Errorf("staging left in the operator's pki directory: %v", left)

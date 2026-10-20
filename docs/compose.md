@@ -403,15 +403,22 @@ never given a silently unprivileged replacement; when the deployer is not an
 Admin, the daemon logs a WARN naming `lv ct convert` and, once the new
 container exists, records a `ct.recreate-security` audit event. A recreate
 that **changes the image** of such a member runs a rootfs of the deployer's
-choosing as root on the host, so it needs the Admin role or `ct.exec` on that
-member (root inside it already). An opt-out the member did not already have
+choosing as root on the host, so it needs what exec in that member needs:
+the Admin role or the `ContainerRoot` role on it (`ct.exec` is not
+enough; see [auth.md](auth.md)). So does a recreate from the same OCI
+library item path after an Admin's `lv ct pull --project` replaced the
+item's content: the member's host checks the item is still the pull the
+member was built from. An opt-out the member did not already have
 needs the Admin role. A recreate judges only the member on the host it
 targets, and only one that carries this stack's label; another stack's
 container of the same name is refused, not replaced. These refusals, and the
 create's own checks — `ct.create`, the host-path authority a rootfs-path
 `image:` needs, and the protected-place and image-owner checks of that path
 on the member's host — come before anything is deleted, whichever host the
-deploy entered on: the member keeps running as it was. (When the member is
+deploy entered on: the member keeps running as it was. So does the fetch of
+the new image: the member's host downloads and verifies it (or, for a
+rootfs path, checks that it is a root filesystem there) first, and an image
+it cannot fetch refuses the recreate with the member left as it is. (When the member is
 on another host, that host runs its checks when it is asked to delete the
 member, and refuses the delete; a host still on an earlier release runs
 them at the create, after the delete.) A member redeployed from the rootfs

@@ -46,7 +46,13 @@ func (r *Runtime) record(bin string, args ...string) {
 func (r *Runtime) start(bin, cfg, pid string) error {
 	key := bin + ":" + cfg
 	r.stop(key)
-	cmd := exec.Command("/bin/sleep", "600")
+	cmd := exec.Command("/bin/cat")
+	// Cmd owns the sole stdin pipe writer in this process. Its close-on-exec
+	// writer cannot survive in sibling commands; owner death gives cat EOF.
+	// Start failure and the actual Wait both close the owned pipe ends.
+	if _, e := cmd.StdinPipe(); e != nil {
+		return e
+	}
 	if e := cmd.Start(); e != nil {
 		return e
 	}

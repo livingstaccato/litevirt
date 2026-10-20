@@ -338,9 +338,12 @@ func describeMACHolder(h corrosion.MACHolder) string {
 // move handed the VM over at. Honoured only from that host as a peer, and
 // only for the VM still at that epoch (drainResumeFromPeer); a client's, this
 // host's own, or one with no epoch (an earlier build's source) is ignored.
+// DrainResumeOpMDKey names the drain operation the start ends, so the
+// target can bind the row's stop intent to it.
 const (
 	DrainResumeFromMDKey  = "x-litevirt-drain-resume-from"
 	DrainResumeEpochMDKey = "x-litevirt-drain-resume-epoch"
+	DrainResumeOpMDKey    = "x-litevirt-drain-resume-op"
 )
 
 // drainResumeFromPeer returns the host a StartVM says it ends a drain move
@@ -350,31 +353,36 @@ const (
 // the drain), whose certificate CN is the claimed host, a trusted host that
 // is not this one (a drain's source is never its target). ok is false
 // otherwise, and when the marker names no epoch.
-func (s *Server) drainResumeFromPeer(ctx context.Context) (source string, epoch int64, ok bool) {
+func (s *Server) drainResumeFromPeer(ctx context.Context) (source string, epoch int64, op string, ok bool) {
 	md, has := metadata.FromIncomingContext(ctx)
 	if !has {
-		return "", 0, false
+		return "", 0, "", false
 	}
 	v := md.Get(DrainResumeFromMDKey)
 	if len(v) == 0 || v[0] == "" {
-		return "", 0, false
+		return "", 0, "", false
 	}
 	claimed := v[0]
 	if callerPrincipalKind(ctx) != principalKindPeer || callerMTLSCommonName(ctx) != claimed ||
 		claimed == s.hostName || !s.isTrustedHostCN(ctx, claimed) {
 		slog.Warn("start: ignoring a drain-resume marker not sent by the claimed source host as a peer", "claimed_source", claimed)
-		return "", 0, false
+		return "", 0, "", false
 	}
 	e := md.Get(DrainResumeEpochMDKey)
 	if len(e) == 0 {
-		return "", 0, false
+		return "", 0, "", false
 	}
 	n, err := strconv.ParseInt(e[0], 10, 64)
 	if err != nil {
 		slog.Warn("start: ignoring a drain-resume marker with an unreadable epoch", "claimed_source", claimed, "epoch", e[0])
-		return "", 0, false
+		return "", 0, "", false
 	}
-	return claimed, n, true
+	// An earlier build's source names no operation: op is "".
+	o := md.Get(DrainResumeOpMDKey)
+	if len(o) == 0 {
+		return claimed, n, "", true
+	}
+	return claimed, n, o[0], true
 }
 
 // refuseStartOnSharedMAC refuses an operator start of the stopped VM name
@@ -385,38 +393,64 @@ func (s *Server) drainResumeFromPeer(ctx context.Context) (source string, epoch 
 // A start that ends a drain's cold move resumes a guest that was running,
 // and this check must never leave it stopped: the drain refused the move
 // before the shutdown when the MAC was shared. Such a start is recognised
-// first, before any MAC is read: from the source host's marker on a VM in
-// the shape a drain's move hands it over in, or from an open move to this host in
-// the replica. A peer's start whose journal cannot be read goes through (a
-// drain's resume arrives from a peer); an operator start whose journal or
-// MACs cannot be read is refused.
+// first, before any MAC is read: from the source host's marker on a VM at
+// the epoch and in the shape that move handed it over in, or, with no
+// marker, from an unfinished move to this host whose handoff the VM still
+// is. A rejected marker never falls back to the journal. A peer's start
+// whose journal cannot be read goes through (a drain's resume arrives from a
+// peer); an operator start whose journal or MACs cannot be read is refused.
 func (s *Server) refuseStartOnSharedMAC(ctx context.Context, name string) error {
 	if s.db == nil {
 		return nil
 	}
-	if src, epoch, ok := s.drainResumeFromPeer(ctx); ok {
-		vm, err := corrosion.GetVM(ctx, s.db, name)
-		if err != nil || vm == nil || (vm.OwnerEpoch == epoch && vm.State == "stopped" &&
-			(vm.StateDetail == "" || strings.HasPrefix(vm.StateDetail, health.DrainStopDetailPrefix))) {
-			// The VM as the drain's move handed it over: at the epoch that
-			// transfer wrote, stopped, with no stop intent (or the drain's
-			// own). A row that cannot be read now may be one.
+	if hasDrainResumeMarker(ctx) {
+		// A marker decides alone: honoured for the VM as its move handed it
+		// over, and otherwise the start is checked as any start — a rejected
+		// marker is never rescued by the journal.
+		if src, epoch, op, ok := s.drainResumeFromPeer(ctx); ok && op != "" {
+			vm, err := corrosion.GetVM(ctx, s.db, name)
+			if err != nil || vm == nil || (vm.OwnerEpoch == epoch && vm.State == "stopped" &&
+				(vm.StateDetail == "" || vm.StateDetail == health.DrainStopDetail(op))) {
+				// The VM as that drain's move handed it over: at the epoch
+				// its transfer wrote, stopped, with no stop intent or that
+				// operation's own — never another drain's. A row that cannot
+				// be read now may be one.
+				return nil
+			}
+			slog.Warn("start: a drain-resume marker for a VM not as that drain's move handed it over; checked as any start",
+				"vm", name, "source", src, "operation", op, "marker_epoch", epoch, "owner_epoch", vm.OwnerEpoch, "state_detail", vm.StateDetail)
+		}
+	} else {
+		// A marker from an earlier build's source names no operation, so it
+		// binds no stop intent: it exempts only the empty-detail handoff it
+		// can name by epoch — the shape every handoff's transfer writes —
+		// with or without a journal here, since that source does not retry
+		// a refused start. A non-empty stop needs a journal that binds it.
+		if src, epoch, op, ok := s.drainResumeFromPeer(ctx); ok && op == "" {
+			vm, err := corrosion.GetVM(ctx, s.db, name)
+			if err != nil || vm == nil || (vm.OwnerEpoch == epoch && vm.State == "stopped" && vm.StateDetail == "") {
+				return nil
+			}
+			slog.Warn("start: an earlier build's drain-resume marker for a VM not in the empty handoff shape; checked by the journal",
+				"vm", name, "source", src, "marker_epoch", epoch, "owner_epoch", vm.OwnerEpoch, "state_detail", vm.StateDetail)
+		}
+		// No marker (an earlier build's source): an open move in this
+		// replica exempts the start only for the VM exactly as that move
+		// handed it over — on this host at its journaled epoch + 1, in the
+		// handoff's shape — the boundary resumeDrainColdMove recovers within.
+		// An operator's stop since, or a later placement, is not covered.
+		resuming, rerr := s.drainHandoffInJournal(ctx, name)
+		if rerr != nil {
+			if callerPrincipalKind(ctx) == principalKindPeer {
+				slog.Warn("start: the drain journal cannot be read; a peer's start may end a drain move, so its MACs are not checked",
+					"vm", name, "error", rerr)
+				return nil
+			}
+			return status.Errorf(codes.Unavailable, "start %q: read the drain journal: %v", name, rerr)
+		}
+		if resuming {
 			return nil
 		}
-		slog.Warn("start: a drain-resume marker for a VM not as that drain's move handed it over; checked as any start",
-			"vm", name, "source", src, "marker_epoch", epoch, "owner_epoch", vm.OwnerEpoch, "state_detail", vm.StateDetail)
-	}
-	resuming, rerr := corrosion.DrainColdMoveOpenTo(ctx, s.db, name, s.hostName)
-	if rerr != nil {
-		if callerPrincipalKind(ctx) == principalKindPeer {
-			slog.Warn("start: the drain journal cannot be read; a peer's start may end a drain move, so its MACs are not checked",
-				"vm", name, "error", rerr)
-			return nil
-		}
-		return status.Errorf(codes.Unavailable, "start %q: read the drain journal: %v", name, rerr)
-	}
-	if resuming {
-		return nil
 	}
 	mac, holder, err := s.sharedNICMAC(ctx, name)
 	if err != nil {
@@ -429,6 +463,46 @@ func (s *Server) refuseStartOnSharedMAC(ctx context.Context, name string) error 
 		"start %q: its NIC's MAC %s is also used by %s (mac_duplicate); started, the two would share one MAC. "+
 			"Give this NIC a new MAC first: `lv detach-nic %s %s`, then `lv attach-nic %s <network>`",
 		name, mac, describeMACHolder(holder), name, mac, name)
+}
+
+// hasDrainResumeMarker reports whether the call carries a drain-resume
+// marker at all, honoured or not.
+//
+// A marker that names no drain operation (an earlier build's source) binds
+// no stop intent: it is judged on the unbound path instead, where it
+// exempts only the empty-detail handoff at its epoch, and the journal decides
+// anything else.
+func hasDrainResumeMarker(ctx context.Context) bool {
+	md, ok := metadata.FromIncomingContext(ctx)
+	return ok && len(md.Get(DrainResumeFromMDKey)) > 0 && len(md.Get(DrainResumeOpMDKey)) > 0
+}
+
+// drainHandoffInJournal reports whether VM name, as this replica holds it,
+// is the handoff of an unfinished drain move to this host
+// (corrosion.DrainColdMovesHandedOver): stopped, with no stop intent or
+// that same move's own. Another drain's stop (a later drain of this host
+// that stopped the VM and failed) is not that move's handoff.
+func (s *Server) drainHandoffInJournal(ctx context.Context, name string) (bool, error) {
+	vm, err := corrosion.GetVM(ctx, s.db, name)
+	if err != nil {
+		return false, err
+	}
+	if vm == nil || vm.State != "stopped" {
+		return false, nil
+	}
+	if vm.StateDetail != "" && !strings.HasPrefix(vm.StateDetail, health.DrainStopDetailPrefix) {
+		return false, nil
+	}
+	ids, err := corrosion.DrainColdMovesHandedOver(ctx, s.db, *vm, s.hostName)
+	if err != nil {
+		return false, err
+	}
+	for _, id := range ids {
+		if vm.StateDetail == "" || vm.StateDetail == health.DrainStopDetail(id) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // refuseColdMoveOnSharedMAC refuses, before the guest is shut down, a cold

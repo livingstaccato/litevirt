@@ -569,3 +569,119 @@ func TestAutomationLifecycleEnrollmentDoesNotBypassAuthenticationPolicy(t *testi
 		})
 	}
 }
+
+// The actual stale revive must miss its guarded transaction without retiring
+// the concurrently born winner's positive source observation.
+func TestAutomationLifecycleProjectGuardMissPreservesWinner(t *testing.T) {
+	ctx := context.Background()
+	c := lifecycleDB(t)
+	if err := InsertProject(ctx, c, ProjectRecord{Name: "acme"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteProject(ctx, c, "acme"); err != nil {
+		t.Fatal(err)
+	}
+	var winner AutomationLifetimeEvidence
+	var logs int
+	projectLifecycleInterleaveHook = func() {
+		projectLifecycleInterleaveHook = nil
+		if err := InsertProject(ctx, c, ProjectRecord{Name: "acme"}); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		winner, err = AutomationLifetime(ctx, c, "project", "acme")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM mutation_log`).Scan(&logs); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { projectLifecycleInterleaveHook = nil })
+	if err := InsertProject(ctx, c, ProjectRecord{Name: "acme"}); err == nil {
+		t.Fatal("stale revival unexpectedly applied")
+	}
+	after, err := AutomationLifetime(ctx, c, "project", "acme")
+	if err != nil || winner.Witness == "" || after != winner {
+		t.Fatalf("loser changed winner evidence: before=%+v after=%+v err=%v", winner, after, err)
+	}
+	var afterLogs int
+	if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM mutation_log`).Scan(&afterLogs); err != nil || afterLogs != logs {
+		t.Fatalf("guard miss changed log: %d -> %d, %v", logs, afterLogs, err)
+	}
+}
+
+func TestAutomationLifecycleProjectGuardedBirthPaths(t *testing.T) {
+	for _, nextName := range []string{"acme", "/acme"} {
+		t.Run(nextName, func(t *testing.T) {
+			ctx := context.Background()
+			c := lifecycleDB(t)
+			if err := InsertProject(ctx, c, ProjectRecord{Name: "acme"}); err != nil {
+				t.Fatal(err)
+			}
+			first, err := AutomationLifetime(ctx, c, "project", "acme")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := DeleteProject(ctx, c, "acme"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := AutomationLifetime(ctx, c, "project", "acme"); err == nil {
+				t.Fatal("guarded delete left current evidence")
+			}
+			if err := InsertProject(ctx, c, ProjectRecord{Name: nextName}); err != nil {
+				t.Fatal(err)
+			}
+			next, err := AutomationLifetime(ctx, c, "project", nextName)
+			if err != nil || next.Witness == "" || next.Witness == first.Witness || next.Origin != "birth" {
+				t.Fatalf("guarded birth lacks fresh coupled evidence: %+v, %v", next, err)
+			}
+		})
+	}
+}
+
+func TestAutomationLifecycleProjectGuardedCallbackRollback(t *testing.T) {
+	ctx := context.Background()
+	c := lifecycleDB(t)
+	if err := InsertProject(ctx, c, ProjectRecord{Name: "acme"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteProject(ctx, c, "acme"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := c.Query(ctx, `SELECT * FROM local_automation_lifetimes WHERE kind='project' AND name='acme'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeJSON, err := json.Marshal(before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs int
+	if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM mutation_log`).Scan(&logs); err != nil {
+		t.Fatal(err)
+	}
+	// after() has run the parent and mutation-log writes when its new positive
+	// observation fails; their common transaction must roll everything back.
+	if _, err := c.db.ExecContext(ctx, `CREATE TRIGGER fail_project_birth BEFORE INSERT ON local_automation_lifetimes WHEN NEW.kind='project' BEGIN SELECT RAISE(ABORT,'injected proof failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertProject(ctx, c, ProjectRecord{Name: "acme"}); err == nil || !strings.Contains(err.Error(), "injected proof failure") {
+		t.Fatalf("expected injected proof failure, got %v", err)
+	}
+	if live, err := GetProject(ctx, c, "acme"); err != nil || live != nil {
+		t.Fatalf("callback failure revived parent: %+v %v", live, err)
+	}
+	after, err := c.Query(ctx, `SELECT * FROM local_automation_lifetimes WHERE kind='project' AND name='acme'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterJSON, err := json.Marshal(after)
+	if err != nil || !bytes.Equal(beforeJSON, afterJSON) {
+		t.Fatalf("callback failure changed prior proof: %s -> %s, %v", beforeJSON, afterJSON, err)
+	}
+	var afterLogs int
+	if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM mutation_log`).Scan(&afterLogs); err != nil || afterLogs != logs {
+		t.Fatalf("callback failure changed log: %d -> %d, %v", logs, afterLogs, err)
+	}
+}

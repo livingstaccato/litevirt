@@ -146,9 +146,10 @@ type hostKey struct {
 //     clock (LWW, then the tie chain) orders them. The certificate serial
 //     orders nothing: a renewal changes it under an unchanged key, and must
 //     not be reverted by whichever copy has the larger serial;
-//   - two legacy rows at 0: the key does not decide.
+//   - two rows at 0: a removal stands over a live copy of the same admission
+//     (sameLegacyAdmission); otherwise the key does not decide.
 //
-// serial is kept for diagnostics only.
+// serial orders nothing; at 0 it only tells a legacy admission from another.
 func compareHostKeys(a, b hostKey) int {
 	switch {
 	case a.n != b.n:
@@ -157,6 +158,12 @@ func compareHostKeys(a, b hostKey) int {
 		}
 		return -1
 	case a.n == 0:
+		if a.deleted != b.deleted && sameLegacyAdmission(a, b) {
+			if a.deleted {
+				return 1
+			}
+			return -1
+		}
 		return 0
 	case a.at != b.at:
 		return strings.Compare(a.at, b.at)

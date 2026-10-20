@@ -897,6 +897,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// answer (startup_bound.go).
 	go func(ha lxc.HostAccess) { d.noteHostAccessOverlaps(ctx, lxc.HostAccessOverlaps(ha)) }(lxcRunner.HostAccess)
 	go refreshHookPolicies(ctx, lxcRunner)
+	// What a crash left of a recreate's image fetch, and of a pull replacing
+	// an OCI library item: before any create can read either.
+	if err := lxcRunner.SweepFetchDir(); err != nil {
+		slog.Warn("container image fetch: could not clear what an earlier run left staged", "error", err)
+	}
+	if err := lxc.RecoverOCILibrary(filepath.Join(d.cfg.DataDir, storage.OCILibraryDir)); err != nil {
+		slog.Warn("oci library: could not finish what an interrupted pull left", "error", err)
+	}
 	lxcRunner.SubIDSpan = &lxc.IDMap{Base: d.cfg.Containers.IDMapBase, Size: int64(d.cfg.Containers.IDMapRanges) * lxc.IDMapSize}
 	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)
 	d.metrics.SetReplicationTargets(repl.Targets)

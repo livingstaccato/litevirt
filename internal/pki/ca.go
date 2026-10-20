@@ -200,6 +200,27 @@ func writePEM(path string, pemType string, data []byte) error {
 	return nil
 }
 
+// IsClientOnlyCert reports whether c is a CLIENT certificate: its extended
+// key usage names ClientAuth and not ServerAuth, which is what
+// GenerateClientCert issues (the distributable lv-cli certificate). Every
+// host certificate (GenerateHostCert, SignRenewal) names both, so such a
+// certificate never speaks for a host, whatever its Common Name.
+func IsClientOnlyCert(c *x509.Certificate) bool {
+	if c == nil {
+		return false
+	}
+	client := false
+	for _, u := range c.ExtKeyUsage {
+		switch u {
+		case x509.ExtKeyUsageServerAuth:
+			return false
+		case x509.ExtKeyUsageClientAuth:
+			client = true
+		}
+	}
+	return client
+}
+
 // GenerateClientCert creates a client-only certificate signed by the CA.
 // Used by CLI machines that connect remotely via mTLS.
 func GenerateClientCert(caCertPath, caKeyPath, certPath, keyPath, cn string) error {

@@ -98,6 +98,14 @@ func (c *Client) executeLifecycleBatch(ctx context.Context, stmts []Statement, k
 	_, err = c.executeBatchWithLifecycle(ctx, stmts, true, false, &lifecycleMutation{kind: kind, name: name, event: event, expected: expected})
 	return err
 }
+
+// executeGuardedLifecycleBatch observes only a successful originating lifecycle
+// decision. The executor captures its parent after the guard passes, and rolls
+// back both the parent and this evidence if either lifecycle callback fails.
+func (c *Client) executeGuardedLifecycleBatch(ctx context.Context, guard func(tx *sql.Tx) (bool, error), stmts []Statement, kind, name, event string) (bool, error) {
+	return c.executeEntriesGuardedWithLifecycle(ctx, guard, [][]Statement{stmts}, &lifecycleMutation{kind: kind, name: name, event: event})
+}
+
 func (m *lifecycleMutation) before(ctx context.Context, tx *sql.Tx) error {
 	current, err := lifecycleParentTx(ctx, tx, m.kind, m.name)
 	if err != nil {

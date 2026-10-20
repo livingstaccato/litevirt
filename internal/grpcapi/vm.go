@@ -2757,7 +2757,7 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 		migratingDetail, migratingSeen = vm.StateDetail, true
 		if active, aerr := s.virt.DomainIsActive(vm.Name); aerr == nil && active {
 			runsHere = true
-		} else if err := s.migratingStopRefusal(ctx, vm); err != nil {
+		} else if err := s.migratingStopRefusal(ctx, "stop", vm); err != nil {
 			return nil, err
 		}
 	}
@@ -2798,9 +2798,16 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 			return nil, status.Errorf(codes.Aborted, "%q went migrating mid-operation; retry", req.Name)
 		}
 		if runsHere {
+			// libvirtd may still run the move's job (its daemon restarted):
+			// aborted first, so no cut-over lands under the stop. With no
+			// job it fails, which says nothing. The guest must still run
+			// here after it, or the stop is retried, asking the target.
+			if aerr := s.virt.AbortMigration(vm.Name); aerr != nil {
+				slog.Info("StopVM: no migration job to abort before stopping a VM recorded migrating", "vm", vm.Name, "error", aerr)
+			}
 			if active, aerr := s.virt.DomainIsActive(vm.Name); aerr != nil || !active {
 				return nil, status.Errorf(codes.Aborted,
-					"%q, recorded migrating, stopped running here mid-operation; retry, which asks the move's target", req.Name)
+					"%q, recorded migrating, no longer runs here; retry, which asks the move's target", req.Name)
 			}
 		}
 	}
@@ -2835,10 +2842,12 @@ func (s *Server) stopVMLockedNote(ctx context.Context, vm *corrosion.VMRecord, f
 	beingStarted := vm.State == "pending" || vm.State == "starting"
 	alreadyStopped := func(op string, err error) bool {
 		active, aerr := s.virt.DomainIsActive(vm.Name)
-		if aerr != nil && beingStarted && lv.IsNoDomain(aerr) {
+		if aerr != nil && (beingStarted || vm.State == "migrating") && lv.IsNoDomain(aerr) {
 			// A start deferred before its define (storage that does not
-			// answer) leaves no domain: nothing runs.
-			slog.Info("StopVM: a VM being started has no domain yet; nothing to stop", "vm", vm.Name, "op", op, "error", err)
+			// answer) leaves no domain: nothing runs. Nor does a VM recorded
+			// migrating whose cut-over undefined it here, its target asked
+			// first (StopVM).
+			slog.Info("StopVM: the VM has no domain here; nothing to stop", "vm", vm.Name, "op", op, "error", err)
 			noop, noDomain = true, true
 			return true
 		}
@@ -3302,6 +3311,22 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 					if k, ok := storage.FixedDeviceKeyOfPath(d.Path); ok {
 						luns = append(luns, k)
 					}
+				}
+			}
+		}
+	}
+	// A VM recorded migrating may run on the move's target: its delete asks
+	// the target first, as its stop does, unless the guest runs here.
+	if !deleteLocalOnly(ctx) && !s.isRemotePeer(ctx) && !isRecreateDelete(ctx) {
+		if vm, gerr := corrosion.GetVM(ctx, s.db, req.Name); gerr == nil && vm != nil && vm.State == "migrating" {
+			runsHere := false
+			if vm.HostName == s.hostName && s.virt != nil {
+				active, aerr := s.virt.DomainIsActive(vm.Name)
+				runsHere = aerr == nil && active
+			}
+			if !runsHere {
+				if rerr := s.migratingStopRefusal(ctx, "delete", vm); rerr != nil {
+					return nil, rerr
 				}
 			}
 		}

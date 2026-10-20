@@ -1505,6 +1505,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// starts, and held until its recovery resolves or parks it.
 	// Unconditional: outside the operation journal's branch above.
 	svc.RecoverFirmwareMoves(ctx)
+	// A VM recorded migrating here with no move of it running (this daemon
+	// stopped mid-move) is named by vm.migration_unresolved.
+	svc.RaiseLeftMigrating(ctx)
 
 	// F1 resource-update recovery: resume any locally-owned VM wedged on a nonterminal
 	// resource_update_running operation (a live resize that crashed after committing its

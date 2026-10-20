@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -356,13 +357,15 @@ func TestFleet_FwLiveCrash_AnAdmittedDatabaseWriteLearnsNothing(t *testing.T) {
 	fwliveRestartUp(t, c, src)
 }
 
-// fix1 I4, files. A goroutine of the daemon opens one of its files for
-// writing while it lives, and writes through that descriptor after the
-// death. The write reaches nothing: the process's descriptors go with it.
+// fix1 I4, files; fix2 I6. A goroutine of the daemon opens one of its files
+// for writing while it lives, and after the death writes through that
+// descriptor and puts the bytes back. The fixture does not take the
+// descriptor from it (its number is not the fixture's to rewrite), so the
+// write is caught: the file's change time moved after the death.
 //
-// On the first fix: modes do not revoke an open descriptor, the write lands,
-// and die reports the files changed, red.
-func TestFleet_FwLiveCrash_ADescriptorOpenedBeforeTheDeathWritesNothing(t *testing.T) {
+// On the second fix: the descriptor is pointed at /dev/null, the write is
+// lost unseen, and nothing is reported, red.
+func TestFleet_FwLiveCrash_AWriteThroughADescriptorOpenedBeforeTheDeathIsCaught(t *testing.T) {
 	c, src, dst, _ := fwliveCluster(t)
 	path := filepath.Join(src.FW.DataDir, "fwlive-open-probe")
 	hlWrite(t, path, []byte("as the daemon left it"))
@@ -371,7 +374,7 @@ func TestFleet_FwLiveCrash_ADescriptorOpenedBeforeTheDeathWritesNothing(t *testi
 	fwliveRestartReach(t, k.reached, done, "the migration call")
 
 	virt := src.Virt
-	opened := make(chan struct{})
+	opened, wrote := make(chan struct{}), make(chan struct{})
 	fwliveWitnessPings(t, c, src, func() {
 		f, err := os.OpenFile(path, os.O_WRONLY, 0)
 		if err != nil {
@@ -381,16 +384,104 @@ func TestFleet_FwLiveCrash_ADescriptorOpenedBeforeTheDeathWritesNothing(t *testi
 		}
 		close(opened)
 		fwliveWitnessUntilGate(src, "dead")
-		_, _ = f.WriteAt([]byte("written after the death"), 0)
+		// The same length: the bytes put back leave the content as it was.
+		_, _ = f.WriteAt(bytes.Repeat([]byte("x"), len("as the daemon left it")), 0)
+		_, _ = f.WriteAt([]byte("as the daemon left it"), 0)
 		_ = f.Close()
+		close(wrote)
 		_ = virt.DomainExists(fwwVM)
 	})
 	<-opened
 
-	k.die(true)
-	if b, _ := os.ReadFile(path); string(b) != "as the daemon left it" {
-		t.Errorf("%s holds %q after the death", path, b)
+	if err := k.killWithin(time.Minute); err != nil {
+		t.Fatal(err)
 	}
+	<-wrote
+	caught := false
+	for _, l := range fwliveWitnessLeaks(k) {
+		if strings.Contains(l, "changed its files") {
+			caught = true
+		}
+	}
+	if !caught {
+		t.Error("a write after the death through a descriptor opened before it went unseen")
+	}
+	k.revive()
+	fwliveRestartUp(t, c, src)
+}
+
+// fix2 I6. A descriptor the scenario itself holds open for writing into the
+// killed node's files is not the daemon's: the kill leaves it as it is, and
+// what the scenario writes through it once the daemon is replaced lands.
+//
+// On the second fix: the kill points every such descriptor at /dev/null,
+// whoever owns it, and the scenario's write is lost, red.
+func TestFleet_FwLiveCrash_TheKillTouchesNoDescriptorItDoesNotOwn(t *testing.T) {
+	c, src, dst, _ := fwliveCluster(t)
+	path := filepath.Join(src.FW.DataDir, "fwlive-scenario-log")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	k := fwliveRestartFreeze(t, c, src, nil)
+	done := fwliveMigrate(t, c, src, dst)
+	fwliveRestartReach(t, k.reached, done, "the migration call")
+
+	k.die(true)
+	fwliveRestartUp(t, c, src)
+	if _, err := f.WriteAt([]byte("the scenario's own line"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(path); string(b) != "the scenario's own line" {
+		t.Errorf("the scenario's write through its own descriptor reached %q, want it in %s", b, path)
+	}
+}
+
+// fix2 I2. A libvirt call admitted before the fence holds libvirt's lock past
+// the kill's bound (a definition's fill hook that does not return). The drain
+// runs out; the kill must still come, and report, within its bounds: it does
+// not read libvirt's state under that lock.
+//
+// On the second fix: the state is taken after a failed drain, the read waits
+// on the held lock, and the kill never comes, red.
+func TestFleet_FwLiveCrash_ACallHoldingLibvirtsLockDoesNotStopTheKill(t *testing.T) {
+	c, src, dst, _ := fwliveCluster(t)
+	k := fwliveRestartFreeze(t, c, src, nil)
+	done := fwliveMigrate(t, c, src, dst)
+	fwliveRestartReach(t, k.reached, done, "the migration call")
+
+	virt := src.Virt
+	in, release := make(chan struct{}), make(chan struct{})
+	var letGo sync.Once
+	t.Cleanup(func() { letGo.Do(func() { close(release) }) })
+	virt.FillDefine = func(x string) string {
+		if strings.Contains(x, "fwlive-filled") {
+			close(in)
+			<-release
+		}
+		return x
+	}
+	fwliveWitnessPings(t, c, src, func() {
+		_ = virt.DefineDomain("<domain><name>fwlive-filled</name><uuid>8a1b2c3d-0000-4000-8000-0000000000dd</uuid></domain>")
+	})
+	<-in
+
+	killed := make(chan error, 1)
+	go func() { killed <- k.killWithin(2 * time.Second) }()
+	select {
+	case err := <-killed:
+		if err == nil {
+			t.Error("the kill succeeded with a call holding libvirt's lock past its bound")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the kill did not come within its bounds with a call holding libvirt's lock")
+	}
+	letGo.Do(func() { close(release) })
+	if err := k.awaitEnd(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	k.revive()
 	fwliveRestartUp(t, c, src)
 }
 
@@ -578,4 +669,13 @@ func TestFleet_FwLiveCrash_APeerGetsNoAnswerAfterTheDeath(t *testing.T) {
 			fwliveRestartUp(t, c, src)
 		})
 	}
+}
+
+// fwliveWitnessLeaks is what the kill's check finds, on a fixture that can
+// list it (nothing on one that cannot).
+func fwliveWitnessLeaks(k any) []string {
+	if l, ok := k.(interface{ leaks() []string }); ok {
+		return l.leaks()
+	}
+	return nil
 }

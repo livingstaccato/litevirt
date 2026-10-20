@@ -12,20 +12,18 @@ package fleet
 //     FenceDaemon), its database client (corrosion FenceWritesForTests, which
 //     takes the client's lock and refuses nothing) and the network both ways
 //     (the node's life gate, node_life.go). A call on a silent fence waits
-//     where it is, with no answer and no error. Then its files: the node's
-//     tree made read-only, and every descriptor the process holds open for
-//     writing into it pointed at /dev/null, as a process's descriptors go
-//     with it. A goroutine refused a file write now can only react through a
-//     channel already fenced. Only once every fence is in place is the kill
-//     on record (died).
+//     where it is, with no answer and no error. The database fence holds
+//     once it has the client's lock, after the client's calls admitted
+//     before it; only then are the files fenced: the node's tree made
+//     read-only. A goroutine refused a file write now can only react through
+//     a channel already fenced. Only once every fence is in place is the
+//     kill on record (died).
 //  2. The calls admitted before the fence run to their end: libvirt's (but
 //     the frozen call; a call of the Fake's on the goroutine of an admitted
-//     one is part of it), the client's (its lock taken) and the peers'
-//     handlers of the node's calls. A commit that got past the client's lock
-//     meanwhile (a raw write) fails the kill.
-//  3. What the world holds is taken: libvirt's whole state, the node's files,
-//     its replicated entries, its calls past each link. This is the moment of
-//     the death.
+//     one is part of it) and the peers' handlers of the node's calls.
+//  3. What the world holds is taken, after a full drain only: libvirt's whole
+//     state, the node's files with each one's change time, its replicated
+//     entries, its calls past each link. This is the moment of the death.
 //  4. The daemon dies: the gates kill every waiting and later call (libvirt:
 //     runtime.Goexit; network: Unavailable; database: every commit refused),
 //     links block everything, and the frozen goroutine ends where it stands
@@ -53,9 +51,12 @@ package fleet
 // which carries the labels of whatever fires it; and the replicator's loops,
 // started by the scenario, which downNode's replicator stop joins. No fwlive
 // scenario has the first two in flight at a death.
-// A descriptor is revoked by number after checking it is still the file its
-// path names; one closed and reused for the same file in that instant would
-// be revoked with it.
+// A descriptor the daemon opened for writing before its death is not taken
+// from it (its number is not the fixture's to rewrite): a write through it
+// after the death is caught, by the change time in the files' digest, and
+// fails the scenario. A commit that got past the client's lock (a raw DB()
+// write) while the fence held it fails the kill, counted once every
+// goroutine of the daemon has ended.
 // File modes do not refuse root, so the kill refuses to run as root. A
 // cluster with SharedDataDir cannot be killed this way.
 
@@ -106,6 +107,9 @@ type fwliveCrash struct {
 	// gone, and only then may the fences lift.
 	died, ended bool
 	downed      bool
+	// beforeKill, when set, runs between the state taken at the death and
+	// the kill (a witness's seam).
+	beforeKill  func()
 	gen, root   string
 	db          *corrosion.WriteFence
 	filesUnlock func()
@@ -199,12 +203,8 @@ func (k *fwliveCrash) killWithin(d time.Duration) error {
 		failed = append(failed, fmt.Errorf("%s's daemon: database calls admitted before the fence did not end within %v", n.Name, d))
 	}
 	k.filesUnlock = fwliveReadOnly(t, k.root)
-	revoked, err := fwliveRevokeWriters(k.root)
-	if err != nil {
-		t.Errorf("%s's files: %v", n.Name, err)
-	}
-	if len(revoked) > 0 {
-		t.Logf("%s's daemon: descriptors open for writing, pointed at /dev/null: %v", n.Name, revoked)
+	if open := fwliveOpenWriters(k.root); len(open) > 0 {
+		t.Logf("%s's daemon: descriptors open for writing into its files at the fence (a write through one after the death fails the check): %v", n.Name, open)
 	}
 	k.netUnblock = fwliveIsolate(c, n)
 	k.died = true
@@ -218,16 +218,20 @@ func (k *fwliveCrash) killWithin(d time.Duration) error {
 		failed = append(failed, fmt.Errorf("%s's daemon: %d calls a peer serves it did not end within %v", n.Name, n.inFlightFrom(), d))
 	}
 
-	// 3. What the world holds at the death.
-	k.virt0 = n.Virt.Fingerprint()
-	k.files0 = fwliveTreeDigest(t, k.root)
-	k.log0 = fwliveOriginEntries(t, n)
-	k.passed0 = fwlivePassed(c, n)
+	// 3. What the world holds at the death, after a full drain only: a call
+	// that did not end may hold what the state is read under (libvirt's
+	// lock), and a failed kill is checked no further.
+	if len(failed) == 0 {
+		k.virt0 = n.Virt.Fingerprint()
+		k.files0 = fwliveTreeDigest(t, k.root)
+		k.log0 = fwliveOriginEntries(t, n)
+		k.passed0 = fwlivePassed(c, n)
+	}
+	if k.beforeKill != nil {
+		k.beforeKill()
+	}
 
 	// 4. The death.
-	if past := k.db.PastTheLock(); past != 0 {
-		failed = append(failed, fmt.Errorf("%s's daemon: %d commits got past its database client's lock while fenced", n.Name, past))
-	}
 	n.Virt.KillDaemon()
 	n.killLife()
 	k.db.Kill()
@@ -236,6 +240,13 @@ func (k *fwliveCrash) killWithin(d time.Duration) error {
 	// 5. Every goroutine of the dead daemon ends.
 	if err := k.awaitEnd(d); err != nil {
 		failed = append(failed, err)
+	}
+	// Every commit that got past the client's lock from the time the fence
+	// held it (a raw DB() write) has been decided by now, and finished with
+	// its goroutine: one is a write of the daemon the database fence did not
+	// stop.
+	if past := k.db.PastTheLock(); past != 0 {
+		failed = append(failed, fmt.Errorf("%s's daemon: %d commits got past its database client's lock while fenced", n.Name, past))
 	}
 	if len(failed) > 0 {
 		k.ended = false
@@ -285,22 +296,32 @@ func (k *fwliveCrash) awaitEnd(d time.Duration) error {
 // check asserts that nothing the dead daemon did reached libvirt, its files,
 // the database or a peer after its death.
 func (k *fwliveCrash) check() {
+	k.t.Helper()
+	for _, l := range k.leaks() {
+		k.t.Error(l)
+	}
+}
+
+// leaks lists what the dead daemon did after its death.
+func (k *fwliveCrash) leaks() []string {
 	t, c, n := k.t, k.c, k.n
 	t.Helper()
+	var out []string
 	if v := n.Virt.Fingerprint(); v != k.virt0 {
-		t.Errorf("%s's dead daemon changed libvirt after its death", n.Name)
+		out = append(out, fmt.Sprintf("%s's dead daemon changed libvirt after its death", n.Name))
 	}
 	if f := fwliveTreeDigest(t, k.root); f != k.files0 {
-		t.Errorf("%s's dead daemon changed its files after its death", n.Name)
+		out = append(out, fmt.Sprintf("%s's dead daemon changed its files after its death", n.Name))
 	}
 	if l := fwliveOriginEntries(t, n); l != k.log0 {
-		t.Errorf("%s's dead daemon wrote %d replicated entries after its death", n.Name, l-k.log0)
+		out = append(out, fmt.Sprintf("%s's dead daemon wrote %d replicated entries after its death", n.Name, l-k.log0))
 	}
 	for name, p := range fwlivePassed(c, n) {
 		if p != k.passed0[name] {
-			t.Errorf("%s's dead daemon reached %s with %d calls after its death", n.Name, name, p-k.passed0[name])
+			out = append(out, fmt.Sprintf("%s's dead daemon reached %s with %d calls after its death", n.Name, name, p-k.passed0[name]))
 		}
 	}
+	return out
 }
 
 // revive lifts the fences for the replacement daemon, once the dead one has
@@ -447,6 +468,53 @@ func TestFleet_FwLiveCrash_AnOwnerHeldPastTheBoundKeepsEveryFence(t *testing.T) 
 	fwliveRestartUp(t, c, src)
 }
 
+// fix2 I4. A goroutine of the daemon commits a raw write past its client's
+// lock after the state at the death was taken and before the kill (the
+// witness's seam). It is counted once every goroutine of the daemon has
+// ended, and fails the kill: no sample taken before the kill can miss it.
+//
+// Mutation: the count read before the kill instead of after the end — the
+// kill succeeds with the write in, red.
+func TestFleet_FwLiveCrash_ARawWriteJustBeforeTheKillFailsIt(t *testing.T) {
+	ctx := context.Background()
+	c, src, dst, _ := fwliveCluster(t)
+	if _, err := src.DB.DB().ExecContext(ctx, `CREATE TABLE fwlive_late_raw_probe (k TEXT PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	k := fwliveRestartFreeze(t, c, src, nil)
+	done := fwliveMigrate(t, c, src, dst)
+	fwliveRestartReach(t, k.reached, done, "the migration call")
+
+	db, virt := src.DB, src.Virt
+	write, wrote, in := make(chan struct{}), make(chan error, 1), make(chan struct{})
+	src.HookUnary("Ping", func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
+		close(in)
+		<-write
+		_, err := db.DB().ExecContext(context.Background(), `INSERT INTO fwlive_late_raw_probe (k) VALUES ('late')`)
+		wrote <- err
+		_ = virt.DomainExists(fwwVM)
+		return h(ctx, req)
+	})
+	go func() { _, _ = c.SelfClient(src).Ping(ctx, &pb.PingRequest{}) }()
+	<-in
+	k.beforeKill = func() {
+		close(write)
+		if err := <-wrote; err != nil {
+			t.Errorf("fixture: the raw write while the fence held the lock: %v", err)
+		}
+	}
+
+	err := k.killWithin(time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "got past") {
+		t.Fatalf("the kill returned %v, want it to report the write past the client's lock", err)
+	}
+	if err := k.awaitEnd(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	k.revive()
+	fwliveRestartUp(t, c, src)
+}
+
 // fwliveGoid is the calling goroutine's id.
 func fwliveGoid() uint64 {
 	var b [64]byte
@@ -533,27 +601,19 @@ func fwliveReadOnly(t *testing.T, root string) (restore func()) {
 	}
 }
 
-// fwliveRevokeWriters points every descriptor this process holds open for
-// writing into a file under root at /dev/null, as a killed process's
-// descriptors go with it: a write through one reaches nothing. It returns
-// the paths it revoked.
-func fwliveRevokeWriters(root string) ([]string, error) {
+// fwliveOpenWriters lists the descriptors this process holds open for
+// writing into a file under root. It only reads /proc/self: a descriptor's
+// number is not the fixture's to rewrite, as its owner may close it and the
+// number name another file by then. A write through one after the death is
+// caught by the files' digest, which holds each file's change time.
+func fwliveOpenWriters(root string) []string {
 	ents, err := os.ReadDir("/proc/self/fd")
 	if err != nil {
-		return nil, err
+		return nil
 	}
-	null, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
-	if err != nil {
-		return nil, err
-	}
-	defer null.Close()
 	prefix := root + string(filepath.Separator)
-	var revoked []string
+	var open []string
 	for _, e := range ents {
-		fd, err := strconv.Atoi(e.Name())
-		if err != nil {
-			continue
-		}
 		path, err := os.Readlink(filepath.Join("/proc/self/fd", e.Name()))
 		if err != nil || !strings.HasPrefix(path, prefix) {
 			continue
@@ -562,23 +622,11 @@ func fwliveRevokeWriters(root string) ([]string, error) {
 		if err != nil {
 			continue
 		}
-		flags, ok := fwliveFDFlags(string(info))
-		if !ok || flags&syscall.O_ACCMODE == syscall.O_RDONLY {
-			continue
+		if flags, ok := fwliveFDFlags(string(info)); ok && flags&syscall.O_ACCMODE != syscall.O_RDONLY {
+			open = append(open, path)
 		}
-		// The number is still the descriptor of that file: the same file
-		// as the path names, just before it is replaced.
-		var byFD, byPath syscall.Stat_t
-		if syscall.Fstat(fd, &byFD) != nil || syscall.Stat(path, &byPath) != nil ||
-			byFD.Dev != byPath.Dev || byFD.Ino != byPath.Ino {
-			continue
-		}
-		if err := syscall.Dup3(int(null.Fd()), fd, syscall.O_CLOEXEC); err != nil {
-			return revoked, fmt.Errorf("revoke the descriptor of %s: %w", path, err)
-		}
-		revoked = append(revoked, path)
 	}
-	return revoked, nil
+	return open
 }
 
 // fwliveFDFlags reads the open flags of a /proc/self/fdinfo entry.
@@ -616,7 +664,14 @@ func fwliveTreeDigest(t *testing.T, root string) string {
 				return err
 			}
 			sum := sha256.Sum256(b)
-			lines = append(lines, "F "+rel+" "+hex.EncodeToString(sum[:]))
+			// The change time moves with every write, one that puts the
+			// bytes back included, and no process can set it back.
+			var st syscall.Stat_t
+			if err := syscall.Stat(p, &st); err != nil {
+				return err
+			}
+			lines = append(lines, fmt.Sprintf("F %s %s ctime=%d.%09d mtime=%d.%09d",
+				rel, hex.EncodeToString(sum[:]), st.Ctim.Sec, st.Ctim.Nsec, st.Mtim.Sec, st.Mtim.Nsec))
 		default:
 			lines = append(lines, "O "+rel)
 		}

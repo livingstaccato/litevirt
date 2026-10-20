@@ -2,6 +2,8 @@ package fleet
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -135,7 +137,18 @@ func TestFleet_StorageMigrationFallsBackToPlaintextOnlyWhenAllowed(t *testing.T)
 
 // migrationCA makes n report fp as the fingerprint of the migration CA its
 // QEMU credentials chain to ("" for none known, as an older build reports).
+// caFP makes a test's CA name a real-shaped SHA-256 fingerprint, which is all
+// a source accepts from a target ("" stays "": the target does not say).
+func caFP(name string) string {
+	if name == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(name))
+	return hex.EncodeToString(sum[:])
+}
+
 func migrationCA(n *Node, fp string) {
+	fp = caFP(fp)
 	n.Server.SetMigrationCAFingerprint(func() (string, error) { return fp, nil })
 }
 
@@ -167,7 +180,7 @@ func TestFleet_StorageMigrationIsRefusedWhenTheHostsHaveDifferentMigrationCAs(t 
 	}
 	msg := err.Error()
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(msg, src.Name) || !strings.Contains(msg, dst.Name) ||
-		!strings.Contains(msg, "aaaa1111") || !strings.Contains(msg, "bbbb2222") ||
+		!strings.Contains(msg, caFP("aaaa1111")) || !strings.Contains(msg, caFP("bbbb2222")) ||
 		!strings.Contains(msg, "lv host install-migration-tls --reissue") {
 		t.Fatalf("refusal = %v; want FailedPrecondition naming %s and %s, both fingerprints, and `lv host install-migration-tls --reissue`",
 			err, src.Name, dst.Name)

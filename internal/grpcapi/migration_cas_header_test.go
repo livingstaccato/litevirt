@@ -15,8 +15,15 @@ func TestReadMigrationCAList_KeepsOnlyFingerprints(t *testing.T) {
 	if len(got) != 2 || got[0] != good1 || got[1] != good2 {
 		t.Fatalf("got %q, want only the two well-formed fingerprints", got)
 	}
-	if got := readMigrationCAList([]string{"junk,more junk"}, nil); got != nil {
-		t.Fatalf("a header with no fingerprint must read as none, got %q", got)
+	if got := readMigrationCAList([]string{"junk,more junk"}, nil); len(got) != 1 || got[0] != migrationCAsUnreadable {
+		t.Fatalf("a header with no fingerprint must read as unreadable, got %q", got)
+	}
+	if got := readMigrationCAList(nil, nil); got != nil {
+		t.Fatalf("no header must read as none, got %q", got)
+	}
+	msg := migrationCAsShown("a", fpN('a'), []string{fpN('a')}, "b", fpN('b'), []string{migrationCAsUnreadable})
+	if !strings.Contains(msg, "could not be read") || strings.Contains(msg, "does not list") || strings.Contains(msg, "(unreadable)") {
+		t.Fatalf("unreadable list shown as %q", msg)
 	}
 }
 
@@ -80,5 +87,26 @@ func TestReadMigrationTLSUnusable_IsSanitised(t *testing.T) {
 	got := sanitizeMigrationTLSUnusable("bad\x1b[31m\nca" + strings.Repeat("x", 2000))
 	if len(got) > 512 || strings.ContainsAny(got, "\x1b\n") {
 		t.Fatalf("not sanitised: %d bytes %q", len(got), got[:20])
+	}
+}
+
+// The single-digest header is peer-supplied too. Anything but a fingerprint
+// reads as absent, so it can reach no message and agreement treats it as an
+// older peer's silence (compares nothing).
+func TestReadMigrationCA_ABadValueReadsAsAbsent(t *testing.T) {
+	good := fpN('c')
+	if got := readMigrationCA([]string{good}); got != good {
+		t.Fatalf("got %q", got)
+	}
+	for _, bad := range []string{"digest-of-one", "evil\x1b[31m", strings.Repeat("c", 63), strings.Repeat("C", 64), ""} {
+		if got := readMigrationCA([]string{bad}); got != "" {
+			t.Fatalf("%q read as %q, want absent", bad, got)
+		}
+	}
+	if readMigrationCA(nil) != "" {
+		t.Fatal("no header must read as absent")
+	}
+	if !migrationCAsAgree(fpN('a'), readMigrationCA([]string{"junk"})) {
+		t.Fatal("a bad value must compare nothing, as an absent header does")
 	}
 }

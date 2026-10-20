@@ -2729,6 +2729,22 @@ func isSHA256Hex(s string) bool {
 	return true
 }
 
+// readMigrationCA is the read side of MigrationCAMD, whose sender is a peer we
+// do not control. A value that is not a SHA-256 fingerprint reads as "", which
+// is what an older peer that sends none reads as: migrationCAsAgree compares
+// nothing then, so a bad value neither makes agreement succeed nor refuse any
+// differently than an absent header.
+func readMigrationCA(v []string) string {
+	if len(v) > 0 && isSHA256Hex(v[0]) {
+		return v[0]
+	}
+	return ""
+}
+
+// migrationCAsUnreadable stands for a list header that was present but held no
+// fingerprint, as the only element readMigrationCAList then returns.
+const migrationCAsUnreadable = "(unreadable)"
+
 // readMigrationCAList is the read side of MigrationCAsMD, whose sender is a
 // peer we do not control: it keeps only well-formed fingerprints, at most
 // maxMigrationCAsShown of them, and drops the rest before they reach an error
@@ -2752,7 +2768,7 @@ func readMigrationCAList(list, more []string) []string {
 		out = append(out, fp)
 	}
 	if len(out) == 0 {
-		return nil
+		return []string{migrationCAsUnreadable}
 	}
 	if len(more) > 0 {
 		if n, err := strconv.Atoi(more[0]); err == nil && n > 0 {
@@ -2827,6 +2843,9 @@ func migrationCAMismatch(vmName, source, sourceCA string, sourceCAs []string, ta
 // list them, the set digest, marked as one.
 func migrationCAsShown(source, sourceCA string, sourceCAs []string, target, targetCA string, targetCAs []string) string {
 	one := func(host, digest string, list []string) string {
+		if len(list) == 1 && list[0] == migrationCAsUnreadable {
+			return host + ": " + digest + " (digest of its CA set; its CA list could not be read)"
+		}
 		if len(list) > 0 {
 			return host + ": " + strings.Join(list, ", ")
 		}
@@ -2994,10 +3013,8 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 			slog.Info("migration: the target opens the installer ISO at its own file", "vm", vmName, "target", targetHost, "here", from, "there", to)
 		}
 	}
-	var targetCA, unusable string
-	if v := hdr.Get(MigrationCAMD); len(v) > 0 {
-		targetCA = v[0]
-	}
+	targetCA := readMigrationCA(hdr.Get(MigrationCAMD))
+	var unusable string
 	targetCAs := readMigrationCAList(hdr.Get(MigrationCAsMD), hdr.Get(MigrationCAsMoreMD))
 	if v := hdr.Get(MigrationTLSUnusableMD); len(v) > 0 {
 		unusable = sanitizeMigrationTLSUnusable(v[0])

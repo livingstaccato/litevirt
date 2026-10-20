@@ -475,3 +475,64 @@ func startWithConsoleBackstop(v snapshotAPI, g StartGuard, name string, policy C
 	}
 	return startDomainGuarded(v, g, name)
 }
+
+// boundConsoleXML checks the identity libvirt will actually redefine. Duplicate
+// identity elements, another root/namespace or trailing XML are not evidence of
+// the original domain. Never include the secure XML in an error or log.
+func boundConsoleXML(x string, dom golibvirt.Domain) bool {
+	var identity struct {
+		XMLName xml.Name `xml:"domain"`
+		Names   []string `xml:"name"`
+		UUIDs   []string `xml:"uuid"`
+	}
+	decoder := xml.NewDecoder(strings.NewReader(x))
+	if err := decoder.Decode(&identity); err != nil || identity.XMLName.Space != "" || len(identity.Names) != 1 || len(identity.UUIDs) != 1 || identity.Names[0] != dom.Name {
+		return false
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return false
+	}
+	uuid, err := boundDomainUUID(strings.ToLower(strings.TrimSpace(identity.UUIDs[0])))
+	return err == nil && uuid == dom.UUID
+}
+
+// The console retry is scoped to the original handle and original secure XML.
+// DomainDefineXML is not a CAS: its backend UUID contract is necessary here,
+// and does not exclude independent backend or remote mutations.
+func startBoundWithConsoleBackstop(v snapshotAPI, g StartGuard, dom golibvirt.Domain, policy ConsolePolicy, unavailable func(string)) error {
+	err := startBoundHandle(v, g, dom)
+	if err == nil || policy == PolicyLeave {
+		return err
+	}
+	refused := IsConsolePasswordRefusal(err)
+	if !refused && !(fipsEnabled() && isConsoleStartFailure(err)) {
+		return err
+	}
+	x, xerr := v.DomainGetXMLDesc(dom, golibvirt.DomainXMLInactive|golibvirt.DomainXMLSecure)
+	if xerr != nil || !boundConsoleXML(x, dom) || !HasConsolePassword(x) {
+		return err
+	}
+	stripped, serr := StripConsolePasswords(x)
+	if serr != nil {
+		return err
+	}
+	redefined, derr := v.DomainDefineXML(stripped)
+	if derr != nil {
+		return err
+	}
+	if redefined.Name != dom.Name || redefined.UUID != dom.UUID {
+		return fmt.Errorf("bound console redefine identity mismatch for %s", dom.Name)
+	}
+	reason := firstLine(err.Error())
+	if refused {
+		slog.Warn("QEMU refused the console password; starting the domain without it, and setting no VNC passwords on this host", "domain", dom.Name, "reason", reason)
+	} else {
+		reason = "the kernel is in FIPS mode and a start with a console password failed on QEMU's console: " + reason
+		slog.Warn("the domain's console option failed on a FIPS-mode host; starting it without its console passwords, and setting no VNC passwords on this host", "domain", dom.Name, "reason", reason)
+	}
+	if unavailable != nil {
+		unavailable(reason)
+	}
+	return startBoundHandle(v, g, dom)
+}

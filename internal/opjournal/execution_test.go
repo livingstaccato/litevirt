@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -599,4 +600,88 @@ func TestExecutionControllerCanceledCloseRetainsAdmission(t *testing.T) {
 			t.Fatal("completed original call did not permit local closure")
 		}
 	})
+}
+
+// Abnormal backend returns must not convert an issued effect into success or
+// leak the active-call accounting that Close waits for. No production recover.
+func TestExecutionAbnormalReturnRetainsUnknown(t *testing.T) {
+	for _, mode := range []string{"panic", "goexit"} {
+		t.Run(mode, func(t *testing.T) {
+			j, c, p := controllerFixture(t)
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			done := make(chan any, 1)
+			defer func() {
+				select {
+				case <-release:
+				default:
+					close(release)
+				}
+			}()
+			sentinel := &struct{ message string }{"backend panic"}
+			go func() {
+				defer func() { done <- recover() }()
+				_ = c.execute(context.Background(), p, "abnormal-effect", controllerFixtureAdmission(p), func() error {
+					close(entered)
+					<-release
+					if mode == "panic" {
+						panic(sentinel)
+					}
+					runtime.Goexit()
+					return nil
+				})
+				done <- "execute unexpectedly returned"
+			}()
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("effect did not start")
+			}
+			retained, found, err := j.Read(p.RecordID)
+			if err != nil || !found || retained.Execution.Effect.State != "issued" {
+				t.Fatal("effect was not durably issued")
+			}
+			close(release)
+			select {
+			case got := <-done:
+				if mode == "panic" && got != sentinel || mode == "goexit" && got != nil {
+					t.Fatalf("abnormal propagation changed: %v", got)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("abnormal effect did not unwind")
+			}
+			record, err := c.RecoverTarget(context.Background(), p)
+			if err != nil || record.Effect == nil || record.Effect.State != "unknown" {
+				t.Fatalf("abnormal effect not unknown: %+v %v", record, err)
+			}
+			retained, found, err = j.Read(p.RecordID)
+			if err != nil || !found || retained.Execution.Effect.State != "unknown" {
+				t.Fatal("unknown outcome not durable")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if closure, err := c.CloseTarget(ctx, p); !errors.Is(err, ErrExecutionUnknown) || closure != (LocalClosure{}) {
+				t.Fatalf("abnormal effect falsely closed: %+v %v", closure, err)
+			}
+			closed := make(chan error, 1)
+			go func() { closed <- c.Close() }()
+			select {
+			case err := <-closed:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("abnormal accounting blocked owner Close")
+			}
+			next, err := OpenExecutionController(j)
+			if err != nil {
+				t.Fatal("owner not released", err)
+			}
+			defer next.Close()
+			cold, err := next.RecoverTarget(context.Background(), p)
+			if err != nil || cold.Effect.State != "unknown" {
+				t.Fatal("reopen lost unknown outcome", err)
+			}
+		})
+	}
 }

@@ -10,6 +10,7 @@ package fleet
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"google.golang.org/grpc"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
@@ -216,5 +218,265 @@ func TestFleet_FwLiveCrash_AnAdmittedLibvirtCallLandsBeforeTheDeath(t *testing.T
 	if _, ok := src.Virt.RawState(admittedVM); ok {
 		t.Errorf("%s is still defined: the admitted undefine did not land", admittedVM)
 	}
+	fwliveRestartUp(t, c, src)
+}
+
+// The schedules of Codex's review of the first fix
+// (resume-incoming-fwlive-crash-fix1-independent-review.md, I2 to I5). Like
+// the ones above, they use only the fixture's surface, here including
+// killWithin, awaitEnd and revive, so they run against the first fix too.
+
+// fwliveWitnessPings arms n's next Ping calls with hooks, in order, and makes
+// one call for each; each hook runs on a goroutine of n's daemon.
+func fwliveWitnessPings(t *testing.T, c *Cluster, n *Node, hooks ...func()) {
+	t.Helper()
+	for _, h := range hooks {
+		h := h
+		n.HookUnary("Ping", func(ctx context.Context, req any, next grpc.UnaryHandler) (any, error) {
+			h()
+			return next(ctx, req)
+		})
+	}
+	for range hooks {
+		go func() { _, _ = c.SelfClient(n).Ping(context.Background(), &pb.PingRequest{}) }()
+	}
+}
+
+// fwliveWitnessUntilGate waits for n's libvirt gate to be in state.
+func fwliveWitnessUntilGate(n *Node, state string) {
+	virt := n.Virt
+	fwliveUntil(time.Minute, func() bool { return virt.DaemonGate() == state })
+}
+
+// fix1 I2. A libvirt call admitted before the fence is held past the kill's
+// bound, so the drain runs out; another goroutine of the daemon, held before
+// a file write, goes on once the kill has returned. The files are fenced all
+// the same: a drain that runs out leaves no fence out, and the daemon's
+// goroutines are still waited for.
+//
+// On the first fix: the kill returns at the drain, before the files are
+// fenced, and the write lands, red.
+func TestFleet_FwLiveCrash_ADrainThatRunsOutLeavesNoFenceOut(t *testing.T) {
+	c, src, dst, _ := fwliveCluster(t)
+	const admittedVM = "fwlive-admitted"
+	src.Virt.DefineStoppedDomain(admittedVM, "52:54:00:aa:bb:01")
+	k := fwliveRestartFreeze(t, c, src, nil)
+	done := fwliveMigrate(t, c, src, dst)
+	fwliveRestartReach(t, k.reached, done, "the migration call")
+
+	virt := src.Virt
+	probe := filepath.Join(src.FW.DataDir, "fwlive-drain-probe")
+	holdCall, holdWrite := make(chan struct{}), make(chan struct{})
+	inCall, inWrite, wrote := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() {
+		for _, ch := range []chan struct{}{holdCall, holdWrite} {
+			select {
+			case <-ch:
+			default:
+				close(ch)
+			}
+		}
+	})
+	virt.FailUndefinePreserv = func(name string) error {
+		if name == admittedVM {
+			close(inCall)
+			<-holdCall
+		}
+		return nil
+	}
+	fwliveWitnessPings(t, c, src,
+		func() { _ = virt.UndefineDomainPreservingState(admittedVM) },
+		func() {
+			close(inWrite)
+			<-holdWrite
+			_ = os.WriteFile(probe, []byte("written after the kill gave up"), 0o600)
+			close(wrote)
+			_ = virt.DomainExists(fwwVM)
+		})
+	<-inCall
+	<-inWrite
+
+	if err := k.killWithin(2 * time.Second); err == nil {
+		t.Fatal("the kill succeeded with an admitted call held past its bound")
+	}
+	close(holdWrite)
+	<-wrote
+	if _, err := os.Stat(probe); err == nil {
+		t.Error("a goroutine of the daemon wrote its file after the kill gave up")
+	}
+	close(holdCall)
+	if err := k.awaitEnd(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	k.revive()
+	fwliveRestartUp(t, c, src)
+}
+
+// fix1 I3. A database write of the daemon's is in its transaction when the
+// fence goes up; its goroutine writes a file once the write returns. The
+// write commits as it would have (the database fence tells it nothing), and
+// the file write after it finds the files fenced.
+//
+// On the first fix: the database fence refuses the commit at once, before
+// the files are fenced, and the goroutine's file write lands, red.
+func TestFleet_FwLiveCrash_AnAdmittedDatabaseWriteLearnsNothing(t *testing.T) {
+	ctx := context.Background()
+	c, src, dst, _ := fwliveCluster(t)
+	if _, err := src.DB.DB().ExecContext(ctx, `CREATE TABLE fwlive_admitted_probe (k TEXT PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	k := fwliveRestartFreeze(t, c, src, nil)
+	done := fwliveMigrate(t, c, src, dst)
+	fwliveRestartReach(t, k.reached, done, "the migration call")
+
+	db, virt := src.DB, src.Virt
+	probe := filepath.Join(src.FW.DataDir, "fwlive-admitted-probe")
+	inTx := make(chan struct{})
+	committed := make(chan error, 1)
+	fwliveWitnessPings(t, c, src, func() {
+		_, err := db.ExecuteBatchGuarded(context.Background(), func(*sql.Tx) (bool, error) {
+			close(inTx)
+			fwliveWitnessUntilGate(src, "fenced")
+			time.Sleep(200 * time.Millisecond)
+			return true, nil
+		}, []corrosion.Statement{{SQL: `INSERT INTO fwlive_admitted_probe (k) VALUES ('admitted')`}})
+		committed <- err
+		_ = os.WriteFile(probe, []byte("written once the write returned"), 0o600)
+		_ = virt.DomainExists(fwwVM)
+	})
+	<-inTx
+
+	k.die(true)
+	if err := <-committed; err != nil {
+		t.Errorf("the admitted write learned of the fence: %v", err)
+	}
+	if _, err := os.Stat(probe); err == nil {
+		t.Error("the goroutine's file write after its database write landed")
+	}
+	fwliveRestartUp(t, c, src)
+}
+
+// fix1 I4, files. A goroutine of the daemon opens one of its files for
+// writing while it lives, and writes through that descriptor after the
+// death. The write reaches nothing: the process's descriptors go with it.
+//
+// On the first fix: modes do not revoke an open descriptor, the write lands,
+// and die reports the files changed, red.
+func TestFleet_FwLiveCrash_ADescriptorOpenedBeforeTheDeathWritesNothing(t *testing.T) {
+	c, src, dst, _ := fwliveCluster(t)
+	path := filepath.Join(src.FW.DataDir, "fwlive-open-probe")
+	hlWrite(t, path, []byte("as the daemon left it"))
+	k := fwliveRestartFreeze(t, c, src, nil)
+	done := fwliveMigrate(t, c, src, dst)
+	fwliveRestartReach(t, k.reached, done, "the migration call")
+
+	virt := src.Virt
+	opened := make(chan struct{})
+	fwliveWitnessPings(t, c, src, func() {
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			t.Errorf("open %s: %v", path, err)
+			close(opened)
+			return
+		}
+		close(opened)
+		fwliveWitnessUntilGate(src, "dead")
+		_, _ = f.WriteAt([]byte("written after the death"), 0)
+		_ = f.Close()
+		_ = virt.DomainExists(fwwVM)
+	})
+	<-opened
+
+	k.die(true)
+	if b, _ := os.ReadFile(path); string(b) != "as the daemon left it" {
+		t.Errorf("%s holds %q after the death", path, b)
+	}
+	fwliveRestartUp(t, c, src)
+}
+
+// fix1 I4, raw database writes. A goroutine of the daemon writes the database
+// past its client (a raw statement on the pool) while the fence holds the
+// client's lock. The kill reports it rather than taking a world the write may
+// or may not be in.
+//
+// On the first fix: the raw write is refused unnoticed and the kill reports
+// nothing, red.
+func TestFleet_FwLiveCrash_ARawDatabaseWriteDuringTheFenceFailsTheKill(t *testing.T) {
+	ctx := context.Background()
+	c, src, dst, _ := fwliveCluster(t)
+	if _, err := src.DB.DB().ExecContext(ctx, `CREATE TABLE fwlive_raw_probe (k TEXT PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	const admittedVM = "fwlive-admitted"
+	src.Virt.DefineStoppedDomain(admittedVM, "52:54:00:aa:bb:02")
+	k := fwliveRestartFreeze(t, c, src, nil)
+	done := fwliveMigrate(t, c, src, dst)
+	fwliveRestartReach(t, k.reached, done, "the migration call")
+
+	db, virt := src.DB, src.Virt
+	holdCall, rawDone, inCall := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	virt.FailUndefinePreserv = func(name string) error {
+		if name == admittedVM {
+			close(inCall)
+			<-holdCall
+		}
+		return nil
+	}
+	fwliveWitnessPings(t, c, src,
+		// Holds the drain until the raw write is in.
+		func() { _ = virt.UndefineDomainPreservingState(admittedVM) },
+		func() {
+			fwliveWitnessUntilGate(src, "fenced")
+			time.Sleep(300 * time.Millisecond)
+			_, _ = db.DB().ExecContext(context.Background(), `INSERT INTO fwlive_raw_probe (k) VALUES ('raw')`)
+			close(rawDone)
+			_ = virt.DomainExists(fwwVM)
+		})
+	<-inCall
+	go func() {
+		<-rawDone
+		close(holdCall)
+	}()
+
+	err := k.killWithin(time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "got past") {
+		t.Fatalf("the kill returned %v, want it to report the write past the client's lock", err)
+	}
+	if err := k.awaitEnd(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	k.revive()
+	fwliveRestartUp(t, c, src)
+}
+
+// fix1 I5. A libvirt call admitted before the fence asks libvirt again on its
+// own goroutine once the fence is up (a hook of the call, as DomainState
+// asks its connection). That is the same call: it passes, ends, and the
+// kill goes on.
+//
+// On the first fix: the nested call waits at the fence, its admitted call
+// never ends, and the kill runs out at the drain, red.
+func TestFleet_FwLiveCrash_ANestedLibvirtCallDoesNotStopTheDeath(t *testing.T) {
+	c, src, dst, _ := fwliveCluster(t)
+	const admittedVM = "fwlive-admitted"
+	src.Virt.DefineStoppedDomain(admittedVM, "52:54:00:aa:bb:03")
+	k := fwliveRestartFreeze(t, c, src, nil)
+	done := fwliveMigrate(t, c, src, dst)
+	fwliveRestartReach(t, k.reached, done, "the migration call")
+
+	virt := src.Virt
+	inCall := make(chan struct{})
+	virt.FailUndefinePreserv = func(name string) error {
+		if name == admittedVM {
+			close(inCall)
+			fwliveWitnessUntilGate(src, "fenced")
+			_ = virt.DomainExists(fwwVM)
+		}
+		return nil
+	}
+	fwliveWitnessPings(t, c, src, func() { _ = virt.UndefineDomainPreservingState(admittedVM) })
+	<-inCall
+
+	k.die(true)
 	fwliveRestartUp(t, c, src)
 }

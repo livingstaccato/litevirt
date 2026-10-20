@@ -4,20 +4,28 @@ package fleet
 // and fwlive_cleanup_hold_test.go.
 //
 // The daemon's goroutine stops at the crash point inside a libvirt call (a
-// fake's hook calls freeze). The scenario then kills the daemon (die, kill):
+// fake's hook calls freeze). The scenario then kills the daemon (die,
+// killWithin):
 //
 //  1. Every channel the daemon has to the world is fenced, before anything of
-//     it can react: its libvirt connection (libvirtfake FenceDaemon), its
-//     database client (corrosion FenceWritesForTests) and the network both
-//     ways (the node's life gate, node_life.go). A call on a fenced channel
-//     waits where it is, with no answer and no error, so no goroutine of the
-//     daemon dies, or learns anything, before the death.
-//  2. The calls admitted before the fence run to their end: the fence waits
-//     for libvirt's (but the frozen call), the client's and the peers'
-//     handlers of the node's calls.
-//  3. The node's files are made read-only, and what the world holds is taken:
-//     libvirt's whole state, the node's files, its replicated entries, its
-//     calls past each link. This is the moment of the death.
+//     it can react. Silent fences first: its libvirt connection (libvirtfake
+//     FenceDaemon), its database client (corrosion FenceWritesForTests, which
+//     takes the client's lock and refuses nothing) and the network both ways
+//     (the node's life gate, node_life.go). A call on a silent fence waits
+//     where it is, with no answer and no error. Then its files: the node's
+//     tree made read-only, and every descriptor the process holds open for
+//     writing into it pointed at /dev/null, as a process's descriptors go
+//     with it. A goroutine refused a file write now can only react through a
+//     channel already fenced. Only once every fence is in place is the kill
+//     on record (died).
+//  2. The calls admitted before the fence run to their end: libvirt's (but
+//     the frozen call; a call of the Fake's on the goroutine of an admitted
+//     one is part of it), the client's (its lock taken) and the peers'
+//     handlers of the node's calls. A commit that got past the client's lock
+//     meanwhile (a raw write) fails the kill.
+//  3. What the world holds is taken: libvirt's whole state, the node's files,
+//     its replicated entries, its calls past each link. This is the moment of
+//     the death.
 //  4. The daemon dies: the gates kill every waiting and later call (libvirt:
 //     runtime.Goexit; network: Unavailable; database: every commit refused),
 //     links block everything, and the frozen goroutine ends where it stands
@@ -28,28 +36,28 @@ package fleet
 //     generation to be gone (server_labels.go: its loops, recovery workers,
 //     handlers, adopters and whatever they started).
 //
-// die then checks that nothing reached libvirt, the database, the files or a
-// peer after the death, and only then lifts the fences, for the replacement:
-// libvirtd, the database and the files are one and cannot be given to the new
-// daemon apart from the old, so they reopen only once no goroutine of the old
-// is left. Any failure or wait that runs out (each is bounded) fails the
-// scenario and leaves every fence in place for good; a wait running out is
-// never taken as an end.
+// A step that fails or runs out (each is bounded) does not stop the kill: the
+// daemon still dies, behind every fence, and its goroutines are still waited
+// for; the failure is reported, and the fences stay in place for good. die
+// lifts them, for the replacement, only after a kill with no failure:
+// libvirtd, the database and the files are one and cannot be given to the
+// new daemon apart from the old, so they reopen only once no goroutine of the
+// old is left. A wait running out is never taken as an end.
 //
 // Limits: the libvirt gate is per Fake, so a scenario must not kill a node
 // whose Fake a live daemon's goroutine still calls (the landing of a migration
 // is libvirtd's own, LandFirmwareLive and LandMigrated*, and is not gated).
 // A goroutine a scenario starts by calling into the server on its own
 // goroutine is the scenario's, not the daemon's, and carries no generation.
-// File modes refuse neither root nor a descriptor opened before the fence; the
-// file digest still catches either. A cluster with SharedDataDir cannot be
-// killed this way.
+// File modes do not refuse root, so the kill refuses to run as root. A
+// cluster with SharedDataDir cannot be killed this way.
 
 import (
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -57,8 +65,10 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -154,52 +164,74 @@ func (k *fwliveCrash) die(check bool) {
 }
 
 // killWithin is steps 1 to 5 above, each bounded by d. An error leaves every
-// fence in place.
+// fence in place; the daemon has still been killed behind them, and its
+// goroutines waited for.
 func (k *fwliveCrash) killWithin(d time.Duration) error {
 	t, c, n := k.t, k.c, k.n
 	t.Helper()
-	k.died = true
 	if c.opts.SharedDataDir {
 		return fmt.Errorf("%s's data dir is shared: its daemon cannot be killed with its files fenced", n.Name)
+	}
+	if os.Geteuid() == 0 {
+		return fmt.Errorf("running as root: file modes would not fence %s's files", n.Name)
 	}
 	k.root = filepath.Join(c.tmpRoot, n.Name)
 	k.gen = n.serverGeneration()
 
-	// 1. Fence every channel.
+	// 1. Fence every channel: the silent ones, then the files.
 	n.fenceLife()
 	n.Virt.FenceDaemon()
 	k.db = n.DB.FenceWritesForTests()
+	k.filesUnlock = fwliveReadOnly(t, k.root)
+	revoked, err := fwliveRevokeWriters(k.root)
+	if err != nil {
+		t.Errorf("%s's files: %v", n.Name, err)
+	}
+	if len(revoked) > 0 {
+		t.Logf("%s's daemon: descriptors open for writing, pointed at /dev/null: %v", n.Name, revoked)
+	}
+	k.netUnblock = fwliveIsolate(c, n)
+	k.died = true
 
 	// 2. What was admitted before the fence runs to its end.
+	var failed []error
 	if !fwliveUntil(d, func() bool { return n.Virt.DaemonInFlight() <= int(k.frozen.Load()) }) {
-		return fmt.Errorf("%s's daemon: %d libvirt calls admitted before the fence did not end within %v",
-			n.Name, n.Virt.DaemonInFlight()-int(k.frozen.Load()), d)
+		failed = append(failed, fmt.Errorf("%s's daemon: %d libvirt calls admitted before the fence did not end within %v",
+			n.Name, n.Virt.DaemonInFlight()-int(k.frozen.Load()), d))
 	}
 	select {
 	case <-k.db.Held():
 	case <-time.After(d):
-		return fmt.Errorf("%s's daemon: database calls admitted before the fence did not end within %v", n.Name, d)
+		failed = append(failed, fmt.Errorf("%s's daemon: database calls admitted before the fence did not end within %v", n.Name, d))
 	}
 	if !fwliveUntil(d, func() bool { return n.inFlightFrom() == 0 }) {
-		return fmt.Errorf("%s's daemon: %d calls a peer serves it did not end within %v", n.Name, n.inFlightFrom(), d)
+		failed = append(failed, fmt.Errorf("%s's daemon: %d calls a peer serves it did not end within %v", n.Name, n.inFlightFrom(), d))
 	}
 
-	// 3. Its files; then what the world holds at the death.
-	k.filesUnlock = fwliveReadOnly(t, k.root)
-	k.netUnblock = fwliveIsolate(c, n)
+	// 3. What the world holds at the death.
 	k.virt0 = n.Virt.Fingerprint()
 	k.files0 = fwliveTreeDigest(t, k.root)
 	k.log0 = fwliveOriginEntries(t, n)
 	k.passed0 = fwlivePassed(c, n)
 
 	// 4. The death.
+	if past := k.db.PastTheLock(); past != 0 {
+		failed = append(failed, fmt.Errorf("%s's daemon: %d commits got past its database client's lock while fenced", n.Name, past))
+	}
 	n.Virt.KillDaemon()
 	n.killLife()
 	k.db.Kill()
 	k.killOnce.Do(func() { close(k.kill) })
 
 	// 5. Every goroutine of the dead daemon ends.
-	return k.awaitEnd(d)
+	if err := k.awaitEnd(d); err != nil {
+		failed = append(failed, err)
+	}
+	if len(failed) > 0 {
+		k.ended = false
+		return errors.Join(failed...)
+	}
+	return nil
 }
 
 // awaitEnd is step 5: the frozen goroutine, the move's handler, downNode and
@@ -489,6 +521,58 @@ func fwliveReadOnly(t *testing.T, root string) (restore func()) {
 			}
 		}
 	}
+}
+
+// fwliveRevokeWriters points every descriptor this process holds open for
+// writing into a file under root at /dev/null, as a killed process's
+// descriptors go with it: a write through one reaches nothing. It returns
+// the paths it revoked.
+func fwliveRevokeWriters(root string) ([]string, error) {
+	ents, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return nil, err
+	}
+	null, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer null.Close()
+	prefix := root + string(filepath.Separator)
+	var revoked []string
+	for _, e := range ents {
+		fd, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		path, err := os.Readlink(filepath.Join("/proc/self/fd", e.Name()))
+		if err != nil || !strings.HasPrefix(path, prefix) {
+			continue
+		}
+		info, err := os.ReadFile(filepath.Join("/proc/self/fdinfo", e.Name()))
+		if err != nil {
+			continue
+		}
+		flags, ok := fwliveFDFlags(string(info))
+		if !ok || flags&syscall.O_ACCMODE == syscall.O_RDONLY {
+			continue
+		}
+		if err := syscall.Dup3(int(null.Fd()), fd, syscall.O_CLOEXEC); err != nil {
+			return revoked, fmt.Errorf("revoke the descriptor of %s: %w", path, err)
+		}
+		revoked = append(revoked, path)
+	}
+	return revoked, nil
+}
+
+// fwliveFDFlags reads the open flags of a /proc/self/fdinfo entry.
+func fwliveFDFlags(info string) (int, bool) {
+	for _, line := range strings.Split(info, "\n") {
+		if v, ok := strings.CutPrefix(line, "flags:"); ok {
+			f, err := strconv.ParseInt(strings.TrimSpace(v), 8, 64)
+			return int(f), err == nil
+		}
+	}
+	return 0, false
 }
 
 // fwliveTreeDigest digests every name, file content and link under root.

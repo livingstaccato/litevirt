@@ -437,7 +437,7 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 
 	// Collect migratable VMs.
 	var toMigrate []corrosion.VMRecord
-	var inFlight int
+	var inFlight []string
 	for _, vm := range vms {
 		switch vm.State {
 		case "running", "stopped":
@@ -445,7 +445,7 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 		case "migrating":
 			// A move of it is in flight — an earlier drain's finishing in the
 			// background, or an `lv migrate`. Nothing may start another.
-			inFlight++
+			inFlight = append(inFlight, vm.Name)
 			if err := stream.Send(&pb.DrainProgress{VmName: vm.Name, Status: "skipped", Strategy: notMoved,
 				Error: "a move of this VM is in flight (an earlier drain's finishing in the background, or a migration); " +
 					"re-run drain once it ends (`lv events " + vm.Name + "`)"}); err != nil {
@@ -458,11 +458,7 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 		// Nothing to move, but the host may still hold a VM in another state
 		// (a move in progress or parked by an earlier drain): it is not drained.
 		s.judgeDrainTimeouts(ctx, req.Name, nil, true)
-		moves := ""
-		if inFlight > 0 {
-			moves = fmt.Sprintf("%d VM(s) have a move in flight; re-run drain once it ends", inFlight)
-		}
-		return s.drainOutcome(ctx, req.Name, nil, nil, moves)
+		return s.drainOutcome(ctx, req.Name, nil, nil, inFlight, inFlightDetail(inFlight))
 	}
 	// Highest compose migrate.priority first, ties in name order: targets are
 	// chosen, and the moves handed to the workers, in this order, so a
@@ -513,7 +509,7 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 
 	if len(drainJobs) == 0 {
 		s.judgeDrainTimeouts(ctx, req.Name, nil, true)
-		return s.drainOutcome(ctx, req.Name, failed, nil, "")
+		return s.drainOutcome(ctx, req.Name, failed, nil, inFlight, inFlightDetail(inFlight))
 	}
 
 	// Worker pool for parallel migrations.
@@ -635,6 +631,9 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	// What the drain's own live moves left here, in words: aborted at their
 	// timeout, cancelled by an operator, or still finishing in the background.
 	var parts []string
+	if d := inFlightDetail(inFlight); d != "" {
+		parts = append(parts, d)
+	}
 	inBackground := func(v string) bool { return slices.Contains(background, v) }
 	if aborted := slices.DeleteFunc(slices.Clone(timedOut), inBackground); len(aborted) > 0 {
 		parts = append(parts, "the live move of "+strings.Join(aborted, ", ")+
@@ -652,7 +651,16 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 		parts = append(parts, "the cancelled move of "+strings.Join(bg, ", ")+
 			" is finishing in the background, and each ends here or on its target")
 	}
-	return s.drainOutcome(ctx, req.Name, failed, notStarted, strings.Join(parts, "; "))
+	return s.drainOutcome(ctx, req.Name, failed, notStarted, append(slices.Clone(inFlight), background...), strings.Join(parts, "; "))
+}
+
+// inFlightDetail is a drain's word on the VMs it found with a move in flight,
+// "" when none.
+func inFlightDetail(inFlight []string) string {
+	if len(inFlight) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d VM(s) have a move in flight (%s); re-run drain once it ends", len(inFlight), strings.Join(inFlight, ", "))
 }
 
 // drainOutcome is a drain's terminal result. The host is drained only when no
@@ -662,9 +670,11 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 // `migrating`, each still has its guest, or may have, on this host, and
 // powering it off then could lose that guest (K-7). failed names the moves
 // that failed or ended in error; notStarted the VMs moved that did not start;
-// moves says what the drain's own live moves left here (timed out,
-// cancelled, finishing in the background), "" when nothing.
-func (s *Server) drainOutcome(ctx context.Context, host string, failed, notStarted []string, moves string) error {
+// moving the VMs with a move in flight, which the drain did not try to move
+// and must not be told to remove; moves says what the drain's own live moves
+// left here (timed out, cancelled, finishing in the background), "" when
+// nothing.
+func (s *Server) drainOutcome(ctx context.Context, host string, failed, notStarted, moving []string, moves string) error {
 	remaining, err := corrosion.ListVMs(ctx, s.db, "", host)
 	if err != nil {
 		return status.Errorf(codes.FailedPrecondition,
@@ -675,7 +685,7 @@ func (s *Server) drainOutcome(ctx context.Context, host string, failed, notStart
 		var untried []string
 		for _, vm := range remaining {
 			here = append(here, fmt.Sprintf("%s (%s)", vm.Name, vm.State))
-			if vm.State != "running" && vm.State != "stopped" {
+			if vm.State != "running" && vm.State != "stopped" && !slices.Contains(moving, vm.Name) {
 				untried = append(untried, vm.Name)
 			}
 		}

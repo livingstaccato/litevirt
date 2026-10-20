@@ -151,7 +151,7 @@ func insertLimitedVM1(t *testing.T, s *Server) {
 		[]corrosion.DiskRecord{{VMName: "vm1", DiskName: "root", HostName: "dead-host", Path: "/gone", SizeBytes: 1 << 20, StorageType: "local"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "dead-host", Address: "10.0.0.66", State: "failed"}); err != nil {
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "dead-host", Address: "10.0.0.66", State: "fenced"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := corrosion.InsertProject(ctx, s.db, corrosion.ProjectRecord{Name: "acme"}); err != nil {

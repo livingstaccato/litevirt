@@ -1257,7 +1257,7 @@ lv replication promote <vm>
   [--replica <file>]          # one of the VM's recorded replicas, <disk>-<time>.<ext> (default: newest)
   [--new-name <name>]         # promote alongside a still-running original
   [--no-localize]             # boot off an overlay backed by the replica (fast; pins it)
-  [--force]                   # promote even if the original is on a healthy host
+  [--force]                   # promote even if the original's host is not fenced or removed
   [--accept-not-point-in-time] # promote a replica recorded as not point-in-time (a -U copy of a running disk)
 ```
 

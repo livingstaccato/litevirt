@@ -39,7 +39,16 @@ func TestPromote_AProoflessRelayedPromotionNeverReattachesWithoutAFencedOwner(t 
 		nfsDisk := nfsPromoteVM(t, s, c.owner)
 		ctx := relayedAdmin(t, s, "entry-node") // relayed by an entry node, or local-root
 		stream := &streamRecorder[pb.PromoteReplicaProgress]{ctx: ctx}
-		if err := s.PromoteReplica(&pb.PromoteReplicaRequest{VmName: "db", TargetPool: "dr", Force: c.force, NoLocalize: true}, stream); err != nil {
+		err := s.PromoteReplica(&pb.PromoteReplicaRequest{VmName: "db", TargetPool: "dr", Force: c.force, NoLocalize: true}, stream)
+		if !c.force {
+			// Without --force the split-brain guard refuses first: the
+			// owner is not fenced or removed (ccguard review I2).
+			if err == nil || !strings.Contains(err.Error(), "may still run it") {
+				t.Fatalf("owner %s, force false: PromoteReplica = %v; want the split-brain refusal", c.owner, err)
+			}
+			continue
+		}
+		if err != nil {
 			t.Fatalf("owner %s, force %v: PromoteReplica: %v", c.owner, c.force, err)
 		}
 		assertSharedUnattached(t, s, nfsDisk, "its owner dead-host is "+c.owner+", not fenced")

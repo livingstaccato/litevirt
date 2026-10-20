@@ -786,8 +786,10 @@ lv replication promote web-1 --no-localize   # fast: boot off an overlay (pins t
 lv replication promote web-1 --accept-not-point-in-time   # a replica recorded as not point-in-time
 ```
 
-A split-brain guard refuses to take over the name while the original is on a
-healthy host (`--force` overrides). The same action is on the VM detail page
+A split-brain guard refuses to take over the name unless the original's host
+is fenced or removed: a host that is active, draining, in maintenance,
+upgrading or offline may still run it (`lv host fence <host>`, or
+`lv host fence-confirm <host>` once it is powered off; `--force` overrides). The same action is on the VM detail page
 ("Promote replica").
 
 **Every disk with a replica is recovered**, manual or automatic: the root from

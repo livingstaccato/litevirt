@@ -175,3 +175,22 @@ func runMigrationExpiryWatch(ctx context.Context, pkiDir string) {
 		}
 	}
 }
+
+// logMigrationTLSInstall reports the start-up install of migration
+// credentials: installed only when the install wrote something, "already up to
+// date" when the set was in place, and the provisioning hint when this host
+// has none.
+func logMigrationTLSInstall(ok, wrote bool, err error) {
+	switch {
+	case err != nil:
+		slog.Warn("migration TLS: not installed; storage migrations from or to this host "+
+			"cannot be encrypted", "error", err)
+	case ok && wrote:
+		slog.Info("migration TLS: credentials installed for QEMU", "dir", pki.QemuTLSDir)
+	case ok:
+		slog.Info("migration TLS: credentials for QEMU already up to date", "dir", pki.QemuTLSDir)
+	default:
+		slog.Info("migration TLS: this host has no migration credentials; provision them with " +
+			"`lv host install-migration-tls`")
+	}
+}

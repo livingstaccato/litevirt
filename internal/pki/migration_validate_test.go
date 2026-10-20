@@ -115,8 +115,14 @@ func TestInstallQemuMigrationTLS_RefusesATornSetAndKeepsTheInstalledOne(t *testi
 	if err := os.WriteFile(filepath.Join(MigrationDir(pkiDir), MigrationHostKeyName), strayKey, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := InstallQemuMigrationTLS(pkiDir, qemu, -1, -1); err == nil || ok {
+	ok, err := InstallQemuMigrationTLS(pkiDir, qemu, -1, -1)
+	if err == nil || ok {
 		t.Fatalf("torn set installed: ok=%v err=%v", ok, err)
+	}
+	// A validation refusal is classifiable on both sides of gRPC.
+	// Mutation: drop the %w of ErrCredentialsInvalid from the refusal.
+	if !errors.Is(err, ErrCredentialsInvalid) || !IsCredentialsInvalidText(err.Error()) {
+		t.Errorf("refusal %q is not ErrCredentialsInvalid", err)
 	}
 	if after := mustRead(t, filepath.Join(qemu, "server-key.pem")); string(after) != string(before) {
 		t.Fatal("a refused install still replaced QEMU's key")

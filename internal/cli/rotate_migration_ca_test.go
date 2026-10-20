@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -791,17 +792,28 @@ func expireMigrationCA(t *testing.T, op string, hosts []*fakeRotHost) string {
 }
 
 // daemonStatus is fakeStatus plus what a real daemon adds for a set that
-// fails validation: its install hook validates first, so install_error
-// repeats the validation error.
+// fails validation: its install hook validates again, separately, and refuses
+// with pki.ErrCredentialsInvalid. That second validation runs at its own
+// moment, here a second after the first.
 func daemonStatus(hosts []*fakeRotHost) MigrationTLSStatusFunc {
 	return func(ctx context.Context) ([]*pb.MigrationTLSHostStatus, error) {
 		rows, err := fakeStatus(hosts)(ctx)
-		for _, r := range rows {
-			if ve := r.GetValidationError(); ve != "" && r.InstallError == "" {
-				r.InstallError = "not installing migration credentials: " + ve
+		if err != nil {
+			return rows, err
+		}
+		for i, r := range rows {
+			if r.GetValidationError() == "" || r.InstallError != "" {
+				continue
+			}
+			dir := pki.MigrationDir(hosts[i].pkiDir)
+			ca, _ := os.ReadFile(filepath.Join(dir, pki.MigrationCAName))
+			cert, _ := os.ReadFile(filepath.Join(dir, pki.MigrationHostCertName))
+			key, _ := os.ReadFile(filepath.Join(dir, pki.MigrationHostKeyName))
+			if _, _, verr := pki.ValidateMigrationCredentials(ca, cert, key, time.Now().Add(time.Second)); verr != nil {
+				r.InstallError = fmt.Errorf("%w: %w", pki.ErrCredentialsInvalid, verr).Error()
 			}
 		}
-		return rows, err
+		return rows, nil
 	}
 }
 

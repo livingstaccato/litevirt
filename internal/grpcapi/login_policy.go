@@ -225,7 +225,16 @@ func (s *Server) hasSecondFactor(ctx context.Context, username string) (bool, er
 	if err != nil {
 		return false, fmt.Errorf("list enrolled second factors for %q: %w", username, err)
 	}
-	return len(factors) > 0, nil
+	if len(factors) > 0 {
+		return true, nil
+	}
+	// A held factor counts: an enrollment-only session must not enroll one
+	// of its own beside it.
+	held, err := corrosion.ListHeldUser2FA(ctx, s.db, username)
+	if err != nil {
+		return false, fmt.Errorf("list held second factors for %q: %w", username, err)
+	}
+	return len(held) > 0, nil
 }
 
 // sessionEnrollOnly reports whether session sid, opened through realm, is

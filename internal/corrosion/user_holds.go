@@ -402,7 +402,10 @@ func (c *Client) settleUserName(ctx context.Context, tx *sql.Tx, name, before st
 	// (retireLaggingLifts). An ordinary write to the users row (a password
 	// change, an anti-entropy merge of the same account) retires nothing.
 	if local != before {
-		if err := retireLaggingLifts(ctx, tx, name, local); err != nil {
+		// Holding an untagged factor set needs an OLDER incarnation replaced
+		// here: a name's first row is not one (a node that pulled the factor
+		// before the account would otherwise hold every account's factor).
+		if err := retireLaggingLifts(ctx, tx, name, local, before != ""); err != nil {
 			return err
 		}
 	}

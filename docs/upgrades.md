@@ -1531,9 +1531,13 @@ host itself, and both only take access away: its session cut-offs, which log
 the new account out once, and its clearing of a directory identity the new
 account is bound to as well, which the new account binds again. A second
 factor enrolled on a host that had not latched the token yet names no
-account, so no host drops it: one given to the deleted account that way
-is asked of the new account as well, until an admin removes it with
-`lv 2fa disable --user <name> --method totp`. The
+account. A host that then learns of the re-create holds it: the factor is
+kept, but never accepted, and the account cannot log in, even with its
+password, until an admin removes it with
+`lv 2fa disable --user <name> --method totp --label <label>` and then
+issues an enrollment code with `lv 2fa enroll-code <name>`. `lv 2fa ls
+--user <name>` lists a held factor with `(held)` after its label, and the
+`held_second_factor` health condition names the account. The
 token latches on its own once every host the cluster replicates to, including
 one parked in `maintenance`, runs this release. Until then hosts write and
 merge users rows as the previous release does.

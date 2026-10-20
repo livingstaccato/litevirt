@@ -4,8 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"log/slog"
 	"strings"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/hlc"
 )
 
 // A deleted account stays deleted (user_incarnation_v1).
@@ -752,7 +756,7 @@ func retireOlderIncarnationRows(ctx context.Context, tx *sql.Tx, username, incar
 		"user:"+username, "user:"+username+"@local"); err != nil {
 		return err
 	}
-	return retireLaggingLifts(ctx, tx, username, incarnation)
+	return retireLaggingLifts(ctx, tx, username, incarnation, true)
 }
 
 // retireLaggingLifts drops, durably, what a deleted account's lagging writes
@@ -769,8 +773,10 @@ func retireOlderIncarnationRows(ctx context.Context, tx *sql.Tx, username, incar
 //     is kept. An untagged epoch (written before the latch, or by a node
 //     that had not latched) is never dropped: a clock cannot tell it from
 //     the account's own, and dropping a live factor would leave a
-//     password-only login. Kept on a re-created account, an older one's
-//     untagged factor still needs the new account's password;
+//     password-only login. When hold is set — this node held an OLDER
+//     incarnation of the name, not merely no row — an untagged active set is
+//     held instead (holdUntaggedFactorSet): kept, never accepted, and the
+//     account fails closed until an admin removes it;
 //   - an enable or an expiry change tagged as written to an older incarnation
 //     while it was live, after inc was made (userLifecycleTag): a lagging
 //     lift, whose later clock would beat the new account's own disable or
@@ -783,9 +789,14 @@ func retireOlderIncarnationRows(ctx context.Context, tx *sql.Tx, username, incar
 //
 // A restriction — a disable, a cut-off — is never dropped here: whoever it
 // was written for, losing it would loosen the account.
-func retireLaggingLifts(ctx context.Context, tx *sql.Tx, username, inc string) error {
+func retireLaggingLifts(ctx context.Context, tx *sql.Tx, username, inc string, hold bool) error {
 	if inc == "" {
 		return nil
+	}
+	if hold {
+		if err := holdUntaggedFactorSet(ctx, tx, username); err != nil {
+			return err
+		}
 	}
 	after := func(ts string) bool { return lwwOrder(inc, ts) < 0 }
 	older := func(tag string) bool { return tag != inc && !incarnationAfter(tag, inc) }
@@ -809,6 +820,9 @@ func retireLaggingLifts(ctx context.Context, tx *sql.Tx, username, inc string) e
 		return out, rows.Err()
 	}
 	epochKeeps := func(epoch string) bool {
+		if _, held := heldEpochBase(epoch); held {
+			return true
+		}
 		tag, ok := userEpochTag(epoch)
 		return !ok || !older(tag)
 	}
@@ -871,6 +885,82 @@ const (
 func userEpochTag(epoch string) (string, bool) {
 	_, tag, ok := strings.Cut(epoch, userEpochTagSep)
 	return tag, ok && tag != ""
+}
+
+// userEpochHeldSuffix marks a factor set as held: its active_epoch is the
+// untagged epoch of its factors with this suffix, so no factor joins the
+// active set (ListUser2FA, VerifyTOTP, WebAuthn), and none is deleted.
+const userEpochHeldSuffix = userEpochTagSep + "held"
+
+// heldEpochBase is the epoch of the factors a held set holds.
+func heldEpochBase(epoch string) (string, bool) {
+	base, ok := strings.CutSuffix(epoch, userEpochHeldSuffix)
+	return base, ok && base != "" && !strings.Contains(base, userEpochTagSep)
+}
+
+// holdUntaggedFactorSet holds, on this node, the name's live factor set when
+// its epoch carries no incarnation and this node has just replaced an older
+// incarnation of the name with a newer one. Such a set may be the deleted
+// account's, enrolled by a node that had not latched user_incarnation_v1, and
+// a clock cannot tell it from the new account's own: dropped, a legitimate
+// factor goes (a password-only login); left active, the deleted holder's
+// device passes the new account's second factor. Held, it is kept, never
+// accepted, and the account counts as having a second factor, so it fails
+// closed (HeldUser2FA, the held_second_factor condition).
+//
+// The hold is this node's own write, stamped just after the set it holds, so
+// anti-entropy carries it over that same set everywhere, while a set written
+// later — the new account's own enrolment — still wins over it.
+func holdUntaggedFactorSet(ctx context.Context, tx *sql.Tx, username string) error {
+	var epoch, ts string
+	err := tx.QueryRowContext(ctx, `SELECT active_epoch, updated_at FROM user_2fa_sets WHERE username = ? AND deleted_at IS NULL`, username).Scan(&epoch, &ts)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if epoch == "" || strings.Contains(epoch, userEpochTagSep) {
+		return nil // tagged, or held already
+	}
+	at, ok := justAfterTS(ts)
+	if !ok {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE user_2fa_sets SET active_epoch = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL AND active_epoch = ?`,
+		epoch+userEpochHeldSuffix, at, username, epoch); err != nil {
+		return err
+	}
+	slog.Warn("held the second factors of an account re-created under the same name: they may be the deleted account's, "+
+		"and none is accepted until an admin removes them",
+		"user", username, "recovery", HeldSecondFactorRecovery(username))
+	return nil
+}
+
+// HeldSecondFactorRecovery is what an admin runs for an account whose second
+// factors are held.
+func HeldSecondFactorRecovery(username string) string {
+	return fmt.Sprintf("lv 2fa disable --user %s --method totp --label <label> for each held factor "+
+		"(lv 2fa ls --user %s lists them), then lv 2fa enroll-code %s", username, username, username)
+}
+
+// justAfterTS is the LWW key that orders immediately after ts: one logical
+// tick for an HLC key, one nanosecond for an RFC3339 one.
+func justAfterTS(ts string) (string, bool) {
+	if t, ok := hlc.Parse(ts); ok {
+		if t.Logical >= 9999 { // four digits on the wire
+			t.PhysicalMS++
+			t.Logical = 0
+		} else {
+			t.Logical++
+		}
+		return t.String(), true
+	}
+	t, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil {
+		return "", false
+	}
+	return t.Add(time.Nanosecond).UTC().Format(time.RFC3339Nano), true
 }
 
 // userLifecycleTag is how a lifecycle row was written: to the incarnation

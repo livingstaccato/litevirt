@@ -177,6 +177,11 @@ type Realm interface {
 // the login handler doesn't log "wrong password" as 5xx.
 var ErrInvalidCredentials = errors.New("invalid credentials")
 
+// ErrSecondFactorHeld refuses a correct password whose account has only held
+// second factors (corrosion.ListHeldUser2FA): fail closed, never
+// password-only.
+var ErrSecondFactorHeld = errors.New("second factor held")
+
 // ErrRealmUnavailable is returned when a realm's backend is unreachable
 // (OIDC issuer down, LDAP timeout). The login handler may fall back to
 // cached group memberships if the realm config allows it.

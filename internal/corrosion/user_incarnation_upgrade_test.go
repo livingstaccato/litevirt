@@ -6,6 +6,7 @@ package corrosion
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 	"time"
 
@@ -140,9 +141,8 @@ func TestUserIncarnation_AnUnlatchedNodesFactorForANewAccountIsKept(t *testing.T
 }
 
 // Ruling of round 4: an untagged factor is never dropped by a clock alone,
-// even when the name IS re-created. Keeping an old account's untagged factor
-// on the new one is fail-closed (it still needs the new account's
-// password); dropping a legitimate one is password-only login.
+// even when the name IS re-created: dropping a legitimate one is a
+// password-only login. Since round 5 it is held there instead of active.
 //
 // Red on 0bef41048 (the untagged factor goes by clock at the re-create).
 // Mutation: the untagged clock rule restored — red.
@@ -173,8 +173,12 @@ func TestUserIncarnation_AnUntaggedFactorIsNotDroppedOnARecreate(t *testing.T) {
 	}
 	lOn = true
 	aeBoth(t, a, l)
-	if fs, err := ListUser2FA(ctx, l, "carol"); err != nil || len(fs) != 1 || fs[0].Secret != "s-l" {
-		t.Errorf("l: carol's factors = %+v (err %v): an untagged factor was dropped by clock", fs, err)
+	// Kept, and since round 5 held, not active (user_held_factor_test.go).
+	if fs, err := ListHeldUser2FA(ctx, l, "carol"); err != nil || len(fs) != 1 || fs[0].Secret != "s-l" {
+		t.Errorf("l: carol's held factors = %+v (err %v): an untagged factor was dropped by clock", fs, err)
+	}
+	if n := liveFactorRows(t, l, "carol"); n != 1 {
+		t.Errorf("l: live factor rows = %d, want 1", n)
 	}
 }
 
@@ -404,6 +408,66 @@ func TestUserIncarnation_APreLatchEnableSurvivesAnOrdinaryUsersWrite(t *testing.
 	}{{"b (wrote it)", b}, {"d (pulled it)", d}} {
 		if lc, err := GetUserLifecycle(ctx, n.c, "carol"); err != nil || lc.Disabled {
 			t.Errorf("%s: carol is disabled after a password change and a pull from a lagging peer (err %v): her enable was retired", n.name, err)
+		}
+	}
+}
+
+// Re-review 5, L1: ruling 1 on the two paths APreLatchEnable does not
+// reach. e takes the lagging c's password change over the WAL, and f writes
+// its own through ExecuteBatchGuarded (ExecuteEntriesGuarded); each then
+// pulls c's older disable, and neither has retired its pre-latch enable.
+//
+// Mutations: the WAL path's prior incarnation lost (replicator.go) — red on
+// e; ExecuteEntriesGuarded's lost (client.go) — red on f.
+func TestUserIncarnation_APreLatchEnableSurvivesWALAndGuardedUsersWrites(t *testing.T) {
+	ctx := context.Background()
+	g := capabilities.GrantForTest(t, capabilities.FeatureLoginPolicy)
+	a, c, e, f := newTestDB(t), newTestDB(t), newTestDB(t), newTestDB(t)
+	on := false
+	for _, n := range []*Client{a, c, e, f} {
+		n.SetUserIncarnationGate(func() bool { return on })
+		n.SetCredentialsSplitGate(func() bool { return true })
+	}
+	re := NewReplicator(e, "", RelayConfig{})
+	yes, no := true, false
+	if err := InsertUser(ctx, a, "carol", "operator", "hash-1"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if err := SetUserLifecycle(ctx, a, g, "carol", &yes, nil, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	aeBoth(t, a, c) // c lags with the disable
+	time.Sleep(10 * time.Millisecond)
+	if err := SetUserLifecycle(ctx, a, g, "carol", &no, nil, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	aeBoth(t, a, e)
+	aeBoth(t, a, f)
+	on = true
+	if err := UpdateUserPassword(ctx, c, "carol", "hash-3"); err != nil {
+		t.Fatal(err)
+	}
+	applyWAL(t, re, walEntries(t, c, "node-c"))
+	if u, _ := GetUser(ctx, e, "carol"); u == nil || u.PasswordHash != "hash-3" {
+		t.Fatalf("fixture: e did not apply c's password change over the WAL: %+v", u)
+	}
+	stmts, err := updateUserPasswordStatements(ctx, f, "carol", "hash-4", f.NowTS())
+	if err != nil || len(stmts) == 0 {
+		t.Fatalf("password statements: %v (%d)", err, len(stmts))
+	}
+	if ok, err := f.ExecuteBatchGuarded(ctx, func(*sql.Tx) (bool, error) { return true, nil }, stmts); err != nil || !ok {
+		t.Fatalf("guarded password change: %v %v", ok, err)
+	}
+	for _, n := range []struct {
+		name string
+		c    *Client
+	}{{"e (over the WAL)", e}, {"f (guarded)", f}} {
+		if err := n.c.MergeStateBytesLWW(c.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if lc, err := GetUserLifecycle(ctx, n.c, "carol"); err != nil || lc.Disabled {
+			t.Errorf("%s: carol is disabled after a users write and a pull from a lagging peer (err %v): her enable was retired", n.name, err)
 		}
 	}
 }

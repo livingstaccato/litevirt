@@ -415,6 +415,11 @@ func InsertUser2FA(ctx context.Context, c *Client, r User2FARecord) error {
 	if err != nil {
 		return err
 	}
+	if _, held := heldEpochBase(epoch); held {
+		// A held set is not the account's to add to: a fresh set replaces
+		// it, so the held factors stay out of the active one (user_incarnation.go).
+		exists = false
+	}
 	now := c.NowTS()
 	stmts := make([]Statement, 0, 2)
 	if !exists {
@@ -480,6 +485,51 @@ func ListUser2FA(ctx context.Context, c *Client, username string) ([]User2FAReco
 	return out, nil
 }
 
+// ListHeldUser2FA returns the user's live factors whose set is held
+// (holdUntaggedFactorSet): kept, never accepted. A user with held factors
+// counts as having a second factor, so its login fails closed.
+func ListHeldUser2FA(ctx context.Context, c *Client, username string) ([]User2FARecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT username, method, secret, COALESCE(label, '') AS label,
+		        enrolled_at, COALESCE(last_used_at, '') AS last_used_at,
+		        COALESCE(last_step, 0) AS last_step
+		 FROM user_2fa WHERE username = ? AND deleted_at IS NULL
+		   AND epoch || ? = (SELECT active_epoch FROM user_2fa_sets
+		                     WHERE username = ? AND deleted_at IS NULL)`, username, userEpochHeldSuffix, username)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]User2FARecord, len(rows))
+	for i, r := range rows {
+		out[i] = User2FARecord{
+			Username: r.String("username"), Method: r.String("method"),
+			Secret: r.String("secret"), Label: r.String("label"),
+			EnrolledAt: r.String("enrolled_at"), LastUsedAt: r.String("last_used_at"),
+			LastStep: r.Int64("last_step"),
+		}
+	}
+	return out, nil
+}
+
+// HeldSecondFactorAccounts lists the live accounts with held second factors
+// (the held_second_factor condition).
+func HeldSecondFactorAccounts(ctx context.Context, c *Client) ([]string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT DISTINCT f.username FROM user_2fa f
+		 JOIN user_2fa_sets s ON s.username = f.username AND s.deleted_at IS NULL
+		 JOIN users u ON u.username = f.username AND u.deleted_at IS NULL
+		 WHERE f.deleted_at IS NULL AND f.epoch || ? = s.active_epoch
+		 ORDER BY f.username`, userEpochHeldSuffix)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.String("username"))
+	}
+	return out, nil
+}
+
 // TouchUser2FA bumps last_used_at on a SPECIFIC live factor in the active set and
 // reports whether it actually touched a row. It returns false when the factor was
 // disabled (tombstoned) or its set deactivated (active epoch changed) since the
@@ -534,13 +584,28 @@ func RecordTOTPStep(ctx context.Context, c *Client, username, method, label, sec
 // user_2fa_sets pointer in the same batch — otherwise the epoch stays live and a
 // peer's unseen factor under it would silently re-enable 2FA (the API treats
 // "no factors" as "no 2FA"). A later enroll mints a fresh epoch.
+//
+// A held set (holdUntaggedFactorSet) is retired only with its last held
+// factor: none of its factors is in it, so the retire's own test would end it
+// at the first, and the account would read as having no second factor.
 func DeleteUser2FA(ctx context.Context, c *Client, username, method, label string) error {
 	now := c.NowTS()
 	marker := nowRFC3339()
-	return c.ExecuteBatch(ctx, []Statement{
-		{SQL: user2FATombstoneSQL, Params: []interface{}{marker, now, username, method, label}},
-		{SQL: user2FASetRetireSQL, Params: []interface{}{marker, now, username}},
-	})
+	stmts := []Statement{{SQL: user2FATombstoneSQL, Params: []interface{}{marker, now, username, method, label}}}
+	held, err := ListHeldUser2FA(ctx, c, username)
+	if err != nil {
+		return err
+	}
+	others := 0
+	for _, f := range held {
+		if f.Method != method || f.Label != label {
+			others++
+		}
+	}
+	if others == 0 {
+		stmts = append(stmts, Statement{SQL: user2FASetRetireSQL, Params: []interface{}{marker, now, username}})
+	}
+	return c.ExecuteBatch(ctx, stmts)
 }
 
 const user2FATombstoneSQL = `UPDATE user_2fa SET deleted_at = ?, updated_at = ?

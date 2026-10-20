@@ -158,6 +158,10 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" invalid credentials ip="+clientIP, "denied")
 			return nil, status.Error(codes.Unauthenticated, "invalid credentials")
 		}
+		if errors.Is(err, auth.ErrSecondFactorHeld) {
+			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" second factor held ip="+clientIP, "denied")
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
 		if errors.Is(err, auth.ErrRealmUnavailable) {
 			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" unavailable ip="+clientIP, "denied")
 			return nil, status.Errorf(codes.Unavailable, "realm unavailable: %v", err)

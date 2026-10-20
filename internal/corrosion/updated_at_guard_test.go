@@ -121,6 +121,14 @@ func TestReplicatedUpdatedAtUsesNowTS(t *testing.T) {
 			if fn.Name.Name == "takeSiblingSpecEdit" || fn.Name.Name == "keepClock" {
 				continue
 			}
+			// holdUntaggedFactorSet stamps a held factor set just after the
+			// set's OWN updated_at (justAfterTS), so the hold wins over that
+			// set alone and a set the account writes later still wins over it.
+			// A fresh NowTS would let the hold beat the account's own later
+			// enrolment everywhere.
+			if fn.Name.Name == "holdUntaggedFactorSet" {
+				continue
+			}
 			body := string(src[fset.Position(fn.Pos()).Offset:fset.Position(fn.End()).Offset])
 			if strings.Contains(body, "NowTS(") {
 				continue

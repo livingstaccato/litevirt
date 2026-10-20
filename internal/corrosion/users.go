@@ -953,6 +953,9 @@ func UserVariants(ctx context.Context, c *Client, username string) ([]UserVarian
 		if f, err := ListUser2FA(ctx, c, v.Username); err == nil {
 			v.Factors = len(f)
 		}
+		if f, err := ListHeldUser2FA(ctx, c, v.Username); err == nil {
+			v.Factors += len(f)
+		}
 		if tk, err := c.Query(ctx, `SELECT COUNT(*) AS n FROM tokens WHERE username = ? AND deleted_at IS NULL`, v.Username); err == nil && len(tk) > 0 {
 			v.Tokens = int(tk[0].Int("n"))
 		}

@@ -1009,6 +1009,18 @@ directory login, so it keeps its disable. Every last-admin refusal names, with
 its arguments, what the refused admin can do instead: create an admin, enable
 one or lift its expiry, resolve a pair, or give an admin the floor reinstated
 with no credential one (`lv user reset-admin --user <name>`, as root).
+
+**Held second factors.** A second factor that a node on the previous
+release enrolled for an account deleted and re-created during the upgrade is
+held (docs/upgrades.md): kept, never accepted, and the account's login is
+refused, even with the right password, until an admin removes it with
+`lv 2fa disable --user <name> --method totp --label <label>` and issues an
+enrollment code with `lv 2fa enroll-code <name>`. `lv 2fa ls --user <name>`
+marks it `(held)`, and every node raises the `held_second_factor` health
+condition (warning) naming the account. An admin whose only factors are
+held cannot log in, so it does not count for `no_unrestricted_admin`, whose
+recovery then names those two commands, run by another admin, or
+`lv user reset-admin --user <name> --clear-2fa` as root on a node.
 Once a credentials clear may have happened (`credentials_clear_v1` has latched
 on the answering node, or a peer's cleared rows have reached it), the guard
 fails closed on an admin whose credential that node cannot judge yet: a users

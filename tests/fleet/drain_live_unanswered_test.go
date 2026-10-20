@@ -24,8 +24,32 @@ import (
 // unansweredMove is the text of grpcapi's errLibvirtCallUnanswered.
 const unansweredMove = "the libvirt call ended without an answer"
 
-// liveDrainWithin drains sc's source, failing the test when the drain has not
-// ended within d.
+// unansweredChild names the scenario a child process runs. A drain that
+// never ends would hold the cluster's teardown, and with it the package, so
+// each scenario that drains runs in a child of its own, which exits when the
+// drain does not end.
+const unansweredChild = "LV_DRAIN_UNANSWERED_CHILD"
+
+// inUnansweredChild runs test in a child process and reports false, failing
+// t when the child fails; in that child it reports true, and the caller runs
+// the scenario.
+func inUnansweredChild(t *testing.T, test string) bool {
+	t.Helper()
+	if os.Getenv(unansweredChild) == test {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^"+test+"$", "-test.count=1", "-test.v")
+	cmd.Env = append(os.Environ(), unansweredChild+"="+test)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%s failed in its child process (%v):\n%s", test, err, out)
+	}
+	return false
+}
+
+// liveDrainWithin drains sc's source. When the drain has not ended within d,
+// it says so and ends the (child) process.
 func liveDrainWithin(t *testing.T, sc *stuckLiveDrain, d time.Duration) (*pb.DrainProgress, error) {
 	t.Helper()
 	type res struct {
@@ -38,7 +62,8 @@ func liveDrainWithin(t *testing.T, sc *stuckLiveDrain, d time.Duration) (*pb.Dra
 	case r := <-out:
 		return r.p, r.err
 	case <-time.After(d):
-		t.Fatalf("the drain did not end within %s: it still waits on a live move whose libvirt call ended without an answer", d)
+		fmt.Fprintf(os.Stderr, "DRAIN-HUNG: the drain did not end within %s: it still waits on a live move whose libvirt call ended without an answer\n", d)
+		os.Exit(3)
 		return nil, nil
 	}
 }
@@ -51,6 +76,9 @@ func liveDrainWithin(t *testing.T, sc *stuckLiveDrain, d time.Duration) (*pb.Dra
 // — the drain never ends, red. The unanswered call taken as an ordinary
 // failure — a cold move shuts slow down, red.
 func TestFleet_DrainLiveMoveWhoseCallEndsUnansweredStaysOnTheSource(t *testing.T) {
+	if !inUnansweredChild(t, "TestFleet_DrainLiveMoveWhoseCallEndsUnansweredStaysOnTheSource") {
+		return
+	}
 	sc := newStuckLiveDrainTimeout(t, false, 0)
 	ctx := context.Background()
 	sc.src.Virt.FailMigrateToTarget = func(name, _ string) error {
@@ -91,6 +119,9 @@ func TestFleet_DrainLiveMoveWhoseCallEndsUnansweredStaysOnTheSource(t *testing.T
 // Mutation: the drain's result sent after the call instead of from a defer
 // — the row stays migrating, red.
 func TestFleet_BackgroundDrainMoveWhoseCallEndsUnansweredSettlesOnTheSource(t *testing.T) {
+	if !inUnansweredChild(t, "TestFleet_BackgroundDrainMoveWhoseCallEndsUnansweredSettlesOnTheSource") {
+		return
+	}
 	sc := newStuckLiveDrain(t, false)
 	release := releaseOnCleanup(t)
 	sc.src.Server.SetDrainAbortGraceForTest(300 * time.Millisecond)

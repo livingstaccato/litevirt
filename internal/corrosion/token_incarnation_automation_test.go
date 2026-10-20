@@ -79,3 +79,54 @@ func TestTokenIncarnation_AutomationProvenanceRefusesAnotherIncarnationsToken(t 
 		t.Errorf("provenance of another incarnation's token = %+v, %v; want refused", id, err)
 	}
 }
+
+// Review I1: tokens.user_created_at is an authority column of an automation
+// token (it decides which account incarnation the token opens), so any raw
+// rewrite of it, an equal-value one or a change put back, invalidates the
+// token's issuance proof, as a rewrite of token_hash does (the control).
+func TestTokenIncarnation_AStampRewriteInvalidatesAutomationIssuance(t *testing.T) {
+	for _, mode := range []string{"token_hash rewritten (control)", "stamp rewritten to itself", "stamp changed then put back"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			c, a := lifecycleCertifiedAccount(t)
+			c.SetUserIncarnationGate(func() bool { return true })
+			raw := strings.Repeat("c", 64)
+			hash, err := bcrypt.GenerateFromPassword([]byte(raw), bcrypt.MinCost)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := InsertAutomationToken(ctx, c, a, TokenRecord{ID: "tok", Username: "alice", Name: "n", TokenHash: string(hash)}); err != nil {
+				t.Fatal(err)
+			}
+			if p, err := AutomationTokenPrincipal(ctx, c, raw); err != nil || p == nil {
+				t.Fatalf("before the rewrite: %+v, %v", p, err)
+			}
+			exec := func(q string, args ...interface{}) {
+				t.Helper()
+				if _, err := c.db.Exec(q, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			switch mode {
+			case "token_hash rewritten (control)":
+				exec(`UPDATE tokens SET token_hash = token_hash WHERE id = 'tok'`)
+				exec(`UPDATE token_credentials SET token_hash = token_hash WHERE token_id = 'tok'`)
+			case "stamp rewritten to itself":
+				exec(`UPDATE tokens SET user_created_at = user_created_at WHERE id = 'tok'`)
+			case "stamp changed then put back":
+				orig := oneString(t, c, `SELECT user_created_at FROM tokens WHERE id = 'tok'`, "user_created_at")
+				exec(`UPDATE tokens SET user_created_at = '2000-01-01T00:00:00.5Z' WHERE id = 'tok'`)
+				if p, err := AutomationTokenPrincipal(ctx, c, raw); err == nil {
+					t.Fatalf("a token with another incarnation's stamp yields a principal: %+v", p)
+				}
+				exec(`UPDATE tokens SET user_created_at = ? WHERE id = 'tok'`, orig)
+			}
+			if v := oneString(t, c, `SELECT CAST(valid AS TEXT) AS v FROM local_automation_credential_issuance WHERE credential_id = 'tok'`, "v"); v != "0" {
+				t.Errorf("issuance.valid = %s after the rewrite, want 0", v)
+			}
+			if p, err := AutomationTokenPrincipal(ctx, c, raw); err == nil {
+				t.Errorf("the issuance proof survived the rewrite: principal %+v", p)
+			}
+		})
+	}
+}

@@ -7,6 +7,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -176,6 +177,97 @@ func TestFleet_TokensKeepWorkingAcrossTheUserIncarnationLatch(t *testing.T) {
 			if err != nil || got == nil || got.Username != user {
 				t.Errorf("%s: %s's token %s… does not authenticate after the latch: %+v, %v", n.Name, user, raw[:4], got, err)
 			}
+		}
+	}
+}
+
+// pushOwnTokenWrites pushes from's own token writes, and nothing else, to to
+// over the real PushMutations RPC.
+func pushOwnTokenWrites(t *testing.T, c *Cluster, from, to *Node) {
+	t.Helper()
+	ctx := context.Background()
+	rows, err := from.DB.Query(ctx,
+		`SELECT seq, hlc, origin, stmts FROM mutation_log WHERE origin = ? AND stmts LIKE '%INTO tokens%' ORDER BY seq`, from.Name)
+	if err != nil {
+		t.Fatalf("read %s mutation_log: %v", from.Name, err)
+	}
+	if len(rows) == 0 {
+		t.Fatalf("%s logged no token write; the push would be vacuous", from.Name)
+	}
+	entries := make([]*pb.MutationEntry, 0, len(rows))
+	for _, r := range rows {
+		entries = append(entries, &pb.MutationEntry{Seq: r.Int64("seq"), Hlc: r.String("hlc"), Origin: r.String("origin"), Stmts: r.String("stmts")})
+	}
+	if _, err := c.PeerClient(from, to).PushMutations(ctx, &pb.ReplicateRequest{
+		Sender: from.Name, SenderVersion: "fleet-test",
+		SenderSchemaVersion: int32(corrosion.CurrentSchemaVersion), Entries: entries,
+	}); err != nil {
+		t.Fatalf("push %s→%s: %v", from.Name, to.Name, err)
+	}
+}
+
+// TestFleet_AStampedTokenOpensOnlyTheIncarnationItNames (review m3): the
+// read rule for a STAMPED token, end to end. node-0 latches, deletes carol
+// and creates her again. node-1 holds the new carol but has not latched; it
+// mints her a token, stamped with her incarnation (a latched writer made it)
+// and unguarded. node-2 still holds the old carol and receives that token
+// before the re-create. The token is the new carol's: it must not open the
+// old carol on node-2, and it opens the new carol once node-2 has taken the
+// re-create and an anti-entropy round.
+func TestFleet_AStampedTokenOpensOnlyTheIncarnationItNames(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3})
+	gates := perNodeUserIncarnationGates(c)
+	admin, x, lag := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	if err := corrosion.InsertUser(ctx, admin.DB, "carol", "operator", "hash-old"); err != nil {
+		t.Fatal(err)
+	}
+	pumpMutations(t, c, admin, x)
+	pumpMutations(t, c, admin, lag)
+	old, err := corrosion.GetUser(ctx, lag.DB, "carol")
+	if err != nil || old == nil {
+		t.Fatalf("node-2 has no carol: %+v, %v", old, err)
+	}
+	gates[admin].Store(true)
+	if err := corrosion.DeleteUser(ctx, admin.DB, "carol"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertUser(ctx, admin.DB, "carol", "operator", "hash-new"); err != nil {
+		t.Fatal(err)
+	}
+	pumpMutations(t, c, admin, x)
+	newCarol, err := corrosion.GetUser(ctx, x.DB, "carol")
+	if err != nil || newCarol == nil || newCarol.CreatedAt == old.CreatedAt {
+		t.Fatalf("node-1 did not take the new carol: %+v, %v", newCarol, err)
+	}
+	if err := corrosion.InsertToken(ctx, x.DB, corrosion.TokenRecord{
+		ID: "tok-new-carol", Username: "carol", Name: "mine", TokenHash: fleetTokenHash(t, fleetTokB)}); err != nil {
+		t.Fatal(err)
+	}
+	pushOwnTokenWrites(t, c, x, lag)
+	if got, err := corrosion.GetUser(ctx, lag.DB, "carol"); err != nil || got == nil || got.CreatedAt != old.CreatedAt {
+		t.Fatalf("precondition: node-2 should still hold the old carol: %+v, %v", got, err)
+	}
+	if rows, err := lag.DB.Query(ctx, `SELECT user_created_at FROM tokens WHERE id = 'tok-new-carol'`); err != nil || len(rows) != 1 || rows[0].String("user_created_at") != newCarol.CreatedAt {
+		t.Fatalf("precondition: node-2 should hold the new carol's stamped token: %v, %v", rows, err)
+	}
+	if got, err := corrosion.ValidateToken(ctx, lag.DB, fleetTokB); err != nil || got != nil {
+		t.Errorf("node-2: the new carol's token opens the old carol: %+v, %v", got, err)
+	}
+	// The re-create reaches node-2. Taking it drops the live tokens of the
+	// name (retireOlderIncarnationRows), this one too; anti-entropy brings
+	// it back, because it is the new carol's own.
+	pumpMutations(t, c, admin, lag)
+	for _, n := range c.Nodes {
+		gates[n].Store(true)
+	}
+	if err := lag.DB.MergeStateBytesLWW(pullDump(t, c, x)); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []*Node{x, lag} {
+		got, err := corrosion.ValidateToken(ctx, n.DB, fleetTokB)
+		if err != nil || got == nil || got.Username != "carol" {
+			t.Errorf("%s: the new carol's own token does not open her: %+v, %v", n.Name, got, err)
 		}
 	}
 }

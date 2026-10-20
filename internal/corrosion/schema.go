@@ -3121,6 +3121,15 @@ var schemaDDL = []string{
  AFTER DELETE ON tokens BEGIN
  UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='token' AND credential_id=OLD.id;
  END`,
+	// v85 (schemaVersionTokenUserIncarnation): tokens.user_created_at decides
+	// which account incarnation a token opens, so any write of it
+	// invalidates the token's issuance proof, as the trigger above does for
+	// the token's other columns. Separate, so that trigger stays as it is and
+	// an upgraded database gets this one too.
+	`CREATE TRIGGER IF NOT EXISTS automation_issuance_tokens_stamp_update
+ AFTER UPDATE OF user_created_at ON tokens BEGIN
+ UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='token' AND credential_id=OLD.id;
+ END`,
 	`CREATE TRIGGER IF NOT EXISTS automation_issuance_token_credentials_insert
  AFTER INSERT ON token_credentials BEGIN
  UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='token' AND credential_id=NEW.token_id;

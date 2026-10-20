@@ -88,7 +88,7 @@ func TestFleet_FwLiveCrash_TheCancelledMovesAdopterEnds(t *testing.T) {
 	if fwliveWitnessStacks("adoptAbandonedMigration") {
 		t.Error("the dead daemon's adopter still waits after its death")
 	}
-	fwliveRestartUp(t, c, src)
+	fwliveWitnessUp(t, c, src)
 }
 
 // I2. The scenario ends, as a failed one does, while the move is inside its
@@ -171,7 +171,7 @@ func TestFleet_FwLiveCrash_DeathWorkRunsOnlyBehindEveryFence(t *testing.T) {
 	if err := src.DB.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM fwlive_death_probe`).Scan(&rows); err != nil || rows != 0 {
 		t.Errorf("the dying goroutine's row: %d rows (%v)", rows, err)
 	}
-	fwliveRestartUp(t, c, src)
+	fwliveWitnessUp(t, c, src)
 }
 
 // I4. A libvirt call of the daemon, admitted before the kill, has its effect
@@ -220,7 +220,7 @@ func TestFleet_FwLiveCrash_AnAdmittedLibvirtCallLandsBeforeTheDeath(t *testing.T
 	if _, ok := src.Virt.RawState(admittedVM); ok {
 		t.Errorf("%s is still defined: the admitted undefine did not land", admittedVM)
 	}
-	fwliveRestartUp(t, c, src)
+	fwliveWitnessUp(t, c, src)
 }
 
 // The schedules of Codex's review of the first fix
@@ -311,7 +311,7 @@ func TestFleet_FwLiveCrash_ADrainThatRunsOutLeavesNoFenceOut(t *testing.T) {
 		t.Fatal(err)
 	}
 	k.revive()
-	fwliveRestartUp(t, c, src)
+	fwliveWitnessUp(t, c, src)
 }
 
 // fix1 I3. A database write of the daemon's is in its transaction when the
@@ -354,7 +354,7 @@ func TestFleet_FwLiveCrash_AnAdmittedDatabaseWriteLearnsNothing(t *testing.T) {
 	if err := <-committed; err != nil {
 		t.Errorf("the admitted write learned of the fence: %v", err)
 	}
-	fwliveRestartUp(t, c, src)
+	fwliveWitnessUp(t, c, src)
 }
 
 // fix1 I4, files; fix2 I6. A goroutine of the daemon opens one of its files
@@ -407,7 +407,7 @@ func TestFleet_FwLiveCrash_AWriteThroughADescriptorOpenedBeforeTheDeathIsCaught(
 		t.Error("a write after the death through a descriptor opened before it went unseen")
 	}
 	k.revive()
-	fwliveRestartUp(t, c, src)
+	fwliveWitnessUp(t, c, src)
 }
 
 // fix2 I6. A descriptor the scenario itself holds open for writing into the
@@ -429,7 +429,7 @@ func TestFleet_FwLiveCrash_TheKillTouchesNoDescriptorItDoesNotOwn(t *testing.T) 
 	fwliveRestartReach(t, k.reached, done, "the migration call")
 
 	k.die(true)
-	fwliveRestartUp(t, c, src)
+	fwliveWitnessUp(t, c, src)
 	if _, err := f.WriteAt([]byte("the scenario's own line"), 0); err != nil {
 		t.Fatal(err)
 	}
@@ -482,7 +482,7 @@ func TestFleet_FwLiveCrash_ACallHoldingLibvirtsLockDoesNotStopTheKill(t *testing
 		t.Fatal(err)
 	}
 	k.revive()
-	fwliveRestartUp(t, c, src)
+	fwliveWitnessUp(t, c, src)
 }
 
 // fix1 I4, raw database writes. A goroutine of the daemon writes the database
@@ -537,7 +537,7 @@ func TestFleet_FwLiveCrash_ARawDatabaseWriteDuringTheFenceFailsTheKill(t *testin
 		t.Fatal(err)
 	}
 	k.revive()
-	fwliveRestartUp(t, c, src)
+	fwliveWitnessUp(t, c, src)
 }
 
 // fix1 I5. A libvirt call admitted before the fence asks libvirt again on its
@@ -569,7 +569,7 @@ func TestFleet_FwLiveCrash_ANestedLibvirtCallDoesNotStopTheDeath(t *testing.T) {
 	<-inCall
 
 	k.die(true)
-	fwliveRestartUp(t, c, src)
+	fwliveWitnessUp(t, c, src)
 }
 
 // The probes of our review of the second fix (fwlivefix-r2-review.md, I-1
@@ -621,7 +621,7 @@ func TestFleet_FwLiveCrash_AReactionToTheFileFenceDoesNotReachTheDatabase(t *tes
 				`SELECT COUNT(*) FROM fwlive_reaction_probe WHERE k = 'reaction'`).Scan(&rows); err != nil || rows != 0 {
 				t.Errorf("the reaction to the file fence reached the database: %d rows (%v)", rows, err)
 			}
-			fwliveRestartUp(t, c, src)
+			fwliveWitnessUp(t, c, src)
 		})
 	}
 }
@@ -666,7 +666,7 @@ func TestFleet_FwLiveCrash_APeerGetsNoAnswerAfterTheDeath(t *testing.T) {
 			case <-time.After(time.Minute):
 				t.Fatal("the peer's call did not end")
 			}
-			fwliveRestartUp(t, c, src)
+			fwliveWitnessUp(t, c, src)
 		})
 	}
 }
@@ -678,4 +678,13 @@ func fwliveWitnessLeaks(k any) []string {
 		return l.leaks()
 	}
 	return nil
+}
+
+// fwliveWitnessUp starts n's daemon again and waits for its start-up firmware
+// move recovery, so nothing of it is still writing n's files when the
+// scenario ends and its directories are removed.
+func fwliveWitnessUp(t *testing.T, c *Cluster, n *Node) {
+	t.Helper()
+	fwliveRestartUp(t, c, n)
+	fwliveRestartRecovered(n)
 }

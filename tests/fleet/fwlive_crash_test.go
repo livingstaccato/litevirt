@@ -374,7 +374,7 @@ func TestFleet_FwLiveCrash_AnOldWorkerCannotActAfterTheRestart(t *testing.T) {
 	<-in
 
 	k.die(true)
-	fwliveRestartUp(t, c, src)
+	fwliveWitnessUp(t, c, src)
 	select {
 	case <-ended:
 	case <-time.After(time.Minute):
@@ -465,7 +465,7 @@ func TestFleet_FwLiveCrash_AnOwnerHeldPastTheBoundKeepsEveryFence(t *testing.T) 
 	}
 	k.check()
 	k.revive()
-	fwliveRestartUp(t, c, src)
+	fwliveWitnessUp(t, c, src)
 }
 
 // fix2 I4. A goroutine of the daemon commits a raw write past its client's
@@ -512,7 +512,7 @@ func TestFleet_FwLiveCrash_ARawWriteJustBeforeTheKillFailsIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	k.revive()
-	fwliveRestartUp(t, c, src)
+	fwliveWitnessUp(t, c, src)
 }
 
 // fwliveGoid is the calling goroutine's id.

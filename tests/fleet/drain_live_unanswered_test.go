@@ -17,6 +17,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -24,6 +27,9 @@ import (
 
 // unansweredMove is the text of grpcapi's errLibvirtCallUnanswered.
 const unansweredMove = "the libvirt call ended without an answer"
+
+// migrationUnresolved is grpcapi's condMigrationUnresolved.
+const migrationUnresolved = "vm.migration_unresolved"
 
 // unansweredChild names the scenario a child process runs. A drain that
 // never ends would hold the cluster's teardown, and with it the package, so
@@ -193,15 +199,49 @@ func TestFleet_DrainLiveMoveWhoseCallEndsUnansweredAfterLandingStaysMigrating(t 
 		return
 	}
 	sc := newStuckLiveDrainTimeout(t, false, 0)
-	ctx := context.Background()
 	landThenEnd(t, sc, false)
+	leftMigratingByDrain(t, sc)
+	ctx := context.Background()
+	if _, err := sc.c.SelfClient(sc.src).StartVM(ctx, &pb.StartVMRequest{Name: "slow"}); status.Code(err) != codes.FailedPrecondition ||
+		!strings.Contains(err.Error(), migrationUnresolved) {
+		t.Fatalf("start of slow on the source = %v; want it refused, naming %s", err, migrationUnresolved)
+	}
+	if sc.src.Virt.DomainExists("slow") {
+		t.Fatal("slow is defined on the source again: a second copy")
+	}
+	if st, _ := sc.dst.Virt.DomainState("slow"); st != "running" {
+		t.Fatalf("target domain state = %q, want running", st)
+	}
+	// A later drain points at the condition, not at a move that never ends.
+	p, _ := liveDrainWithin(t, sc, 15*time.Second)
+	if p == nil || p.Status != "skipped" || !strings.Contains(p.Error, migrationUnresolved) ||
+		!strings.Contains(p.Error, "lv doctor repair-owner slow") {
+		t.Fatalf("a later drain's frame for slow = %+v; want skipped, naming %s and repair-owner", p, migrationUnresolved)
+	}
+	// The operator records slow where it runs: the condition resolves.
+	if _, err := sc.c.SelfClient(sc.dst).RepairVMOwner(ctx, &pb.RepairVMOwnerRequest{Name: "slow", Host: sc.dst.Name}); err != nil {
+		t.Fatalf("repair-owner slow on %s: %v", sc.dst.Name, err)
+	}
+	waitRow(t, sc.src, sc.dst.Name, "running")
+	if c, ok, _ := corrosion.GetHealthCondition(ctx, sc.src.DB, "drain", migrationUnresolved, "vm", "slow"); !ok || c.Lifecycle != corrosion.ConditionResolved {
+		t.Fatalf("%s after repair-owner = %+v (found %v); want resolved", migrationUnresolved, c, ok)
+	}
+}
+
+// leftMigratingByDrain drains sc's source, whose live move of slow ends
+// without an answer after landing it on the target, and checks the drain
+// left slow migrating on the source, the target's reservation held and
+// vm.migration_unresolved raised.
+func leftMigratingByDrain(t *testing.T, sc *stuckLiveDrain) {
+	t.Helper()
+	ctx := context.Background()
 	p, err := liveDrainWithin(t, sc, 15*time.Second)
 	if err == nil || !strings.Contains(err.Error(), "slow") {
 		t.Fatalf("drain = %v; want it incomplete, naming slow", err)
 	}
 	if p == nil || p.Status != "failed" || !strings.Contains(p.Error, unansweredMove) ||
-		!strings.Contains(p.Error, "migrating") {
-		t.Fatalf("frame for slow = %+v; want failed, naming the unanswered call and the row left migrating", p)
+		!strings.Contains(p.Error, "migrating") || !strings.Contains(p.Error, migrationUnresolved) {
+		t.Fatalf("frame for slow = %+v; want failed, naming the unanswered call, the row left migrating and %s", p, migrationUnresolved)
 	}
 	row, err := corrosion.GetVM(ctx, sc.src.DB, "slow")
 	if err != nil || row == nil || row.HostName != sc.src.Name || row.State != "migrating" {
@@ -210,14 +250,9 @@ func TestFleet_DrainLiveMoveWhoseCallEndsUnansweredAfterLandingStaysMigrating(t 
 	if cpu, _, err := corrosion.HostReserved(ctx, sc.dst.DB, sc.dst.Name); err != nil || cpu < 1 {
 		t.Fatalf("the target reserves %d vCPU (err %v) while it may run slow; want the move's 1", cpu, err)
 	}
-	if _, err := sc.c.SelfClient(sc.src).StartVM(ctx, &pb.StartVMRequest{Name: "slow"}); err == nil {
-		t.Fatal("a start of slow on the source was accepted while it may run on the target")
-	}
-	if sc.src.Virt.DomainExists("slow") {
-		t.Fatal("slow is defined on the source again: a second copy")
-	}
-	if st, _ := sc.dst.Virt.DomainState("slow"); st != "running" {
-		t.Fatalf("target domain state = %q, want running", st)
+	c, ok, err := corrosion.GetHealthCondition(ctx, sc.src.DB, "drain", migrationUnresolved, "vm", "slow")
+	if err != nil || !ok || c.Lifecycle == corrosion.ConditionResolved || !strings.Contains(c.Evidence, sc.dst.Name) {
+		t.Fatalf("%s = %+v ok=%v err=%v; want it open, naming %s", migrationUnresolved, c, ok, err, sc.dst.Name)
 	}
 }
 

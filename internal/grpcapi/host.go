@@ -449,8 +449,7 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 			// background, or an `lv migrate`. Nothing may start another.
 			inFlight = append(inFlight, vm.Name)
 			if err := stream.Send(&pb.DrainProgress{VmName: vm.Name, Status: "skipped", Strategy: notMoved,
-				Error: "a move of this VM is in flight (an earlier drain's finishing in the background, or a migration); " +
-					"re-run drain once it ends (`lv events " + vm.Name + "`)"}); err != nil {
+				Error: s.inFlightMoveAdvice(ctx, vm.Name)}); err != nil {
 				s.drainEndedBeforeAnyMove(ctx, req.Name, err)
 				return err
 			}
@@ -1060,11 +1059,12 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			// the lease and the target's copy with it, and nothing here
 			// starts or moves it.
 			detail := fmt.Sprintf("%s, and %s is not running on %s (%v): it may run on %s, "+
-				"so its record is left migrating and nothing is started or moved (watch `lv events %s`)",
-				why, vm.Name, s.hostName, lerr, target.Name, vm.Name)
+				"so its record is left migrating and nothing is started or moved (%s; %s)",
+				why, vm.Name, s.hostName, lerr, target.Name, condMigrationUnresolved, settleMigratingAdvice(vm.Name))
 			slog.Warn("drain: the live move ended without libvirt's answer and the guest is not running here; its record is left migrating",
 				"vm", vm.Name, "target", target.Name, "state", st, "state_error", serr)
 			s.recordVMEvent(context.WithoutCancel(ctx), vm.Name, "vm.migrated", "error", "drain: "+detail)
+			s.raiseMigrationUnresolved(context.WithoutCancel(ctx), vm.Name, target.Name, detail)
 			return &pb.DrainProgress{
 				VmName: vm.Name, TargetHost: target.Name, Status: "failed", Strategy: pb.MigrateStrategy_MIGRATE_LIVE,
 				Error: detail,
@@ -1227,8 +1227,7 @@ func (s *Server) drainLockVM(ctx context.Context, vm, target string) (unlock fun
 		// Read detached: a cancelled drain must still tell a move in flight.
 		if row, err := corrosion.GetVM(context.WithoutCancel(ctx), s.db, vm); err == nil && row != nil && row.State == "migrating" {
 			return &pb.DrainProgress{VmName: vm, TargetHost: target, Status: "skipped", Strategy: notMoved,
-				Error: "a move of this VM is in flight (an earlier drain's finishing in the background, or a migration); " +
-					"re-run drain once it ends (`lv events " + vm + "`)"}
+				Error: s.inFlightMoveAdvice(context.WithoutCancel(ctx), vm)}
 		}
 		return nil
 	}

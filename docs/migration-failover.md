@@ -481,8 +481,12 @@ VM's live firmware move is `lv migrate`'s move, and applies `timeout-sec` as
 `lv migrate` does. A move that libvirt
 completed before the abort took is recorded on the target, as any completed
 move. While a live move runs, the VM's record says `migrating`, as for
-`lv migrate`. If libvirt does not answer the abort within 2 minutes, the drain
-goes on without it: the move is finished in the background, which keeps the
+`lv migrate`, and `lv start` or `lv restart` of a VM recorded `migrating` is
+refused on its source. A live move that ends without libvirt's answer while
+the guest is not running on the drained host leaves the record `migrating` and
+raises `vm.migration_unresolved` (see [Diagnostics](diagnostics.md)). If
+libvirt does not answer the abort within 2 minutes, the drain goes on without
+it: the move is finished in the background, which keeps the
 VM's lock and the target's capacity reservation until libvirt ends it, then
 records the VM on whichever host it ended on and runs `post_migrate` naming
 it. No cold move is tried while the move can still complete, and a drain run

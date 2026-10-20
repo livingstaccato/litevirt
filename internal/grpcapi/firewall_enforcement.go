@@ -321,10 +321,16 @@ func (s *Server) setHostCondition(ctx context.Context, evaluator, code string, a
 // need not be this one (an undrain, run from any host, resolves the drained
 // host's). The writer is still recorded as this host.
 func (s *Server) setHostConditionOf(ctx context.Context, evaluator, code, host string, active bool, severity, detail string) {
+	s.setConditionOf(ctx, evaluator, code, "host", host, []string{host}, active, severity, detail)
+}
+
+// setConditionOf is setHostConditionOf for the condition about any subject
+// (kind/id), naming hosts.
+func (s *Server) setConditionOf(ctx context.Context, evaluator, code, kind, subject string, hosts []string, active bool, severity, detail string) {
 	if s.db == nil {
 		return
 	}
-	row, ok, err := corrosion.GetHealthCondition(ctx, s.db, evaluator, code, "host", host)
+	row, ok, err := corrosion.GetHealthCondition(ctx, s.db, evaluator, code, kind, subject)
 	if err != nil {
 		return
 	}
@@ -337,7 +343,7 @@ func (s *Server) setHostConditionOf(ctx context.Context, evaluator, code, host s
 		if !active {
 			return
 		}
-		row = corrosion.HealthCondition{Evaluator: evaluator, Code: code, SubjectKind: "host", SubjectID: host, FirstSeen: ts}
+		row = corrosion.HealthCondition{Evaluator: evaluator, Code: code, SubjectKind: kind, SubjectID: subject, FirstSeen: ts}
 	}
 	if active {
 		if !isActive {
@@ -348,7 +354,7 @@ func (s *Server) setHostConditionOf(ctx context.Context, evaluator, code, host s
 	} else {
 		row.Lifecycle, row.ResolvedAt, row.ObserveCount, row.CleanCount = corrosion.ConditionResolved, ts, 0, 1
 	}
-	row.Severity, row.Hosts, row.LastSeen, row.Reporter = severity, []string{host}, ts, s.hostName
+	row.Severity, row.Hosts, row.LastSeen, row.Reporter = severity, hosts, ts, s.hostName
 	if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
 		slog.Warn("could not record a health condition", "evaluator", evaluator, "code", code, "error", err)
 		return
@@ -361,7 +367,7 @@ func (s *Server) setHostConditionOf(ctx context.Context, evaluator, code, host s
 	if !active {
 		verb, sev = "resolved", notify.SevInfo
 	}
-	s.notify(ctx, notify.Notification{Kind: code, Severity: sev, Subject: host, Detail: verb + ": " + detail})
+	s.notify(ctx, notify.Notification{Kind: code, Severity: sev, Subject: subject, Detail: verb + ": " + detail})
 }
 
 // SeedFirewallEnforcementLoop records the founder's genesis decision

@@ -2317,6 +2317,10 @@ func (s *Server) takeRepairLease(ctx context.Context, vm *corrosion.VMRecord) (f
 // startVMLocked adds the hardware-adoption gate and PCI preflight, which the
 // automated restart paths share.
 func (s *Server) startGatesLocked(ctx context.Context, method string, vm *corrosion.VMRecord, cpu, memMiB int, allowOvercommit bool) (*reservationLease, error) {
+	// A VM whose row says migrating may run on the move's target.
+	if err := s.inFlightMoveRefusal(ctx, "start", vm); err != nil {
+		return nil, err
+	}
 	// Split-brain gate (Phase 1): bringing an owned VM to running is a runtime action
 	// that, under STALE ownership (the VM was failed over elsewhere during a partition
 	// but this side's row still says stopped+here), would double-run it. Require local
@@ -2777,7 +2781,12 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 		return nil, err
 	}
 
-	return s.stopVMLocked(ctx, vm, req.Force, req.Timeout)
+	out, err := s.stopVMLocked(ctx, vm, req.Force, req.Timeout)
+	if err == nil && vm.State == "migrating" {
+		// The stop settled a row a move left migrating.
+		s.resolveMigrationUnresolved(context.WithoutCancel(ctx), vm.Name)
+	}
+	return out, err
 }
 
 // stopVMLocked stops a LOCAL VM (force ⇒ destroy, else graceful shutdown with a
@@ -3017,6 +3026,9 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
 	}
 	if err := s.firmwareMoveRefusal("restart", vm); err != nil {
+		return nil, err
+	}
+	if err := s.inFlightMoveRefusal(ctx, "restart", vm); err != nil {
 		return nil, err
 	}
 

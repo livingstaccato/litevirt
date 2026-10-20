@@ -155,6 +155,9 @@ func (r *StackReconciler) reconcile(ctx context.Context) {
 	if err := corrosion.ReassertStackDefaultDeny(ctx, r.db, compose.StoredStackWants); err != nil {
 		slog.Warn("stack-reconciler: re-assert the cluster default-deny a stack asks for", "error", err)
 	}
+	// One a live stack owns that nothing asks for any more is kept, and
+	// reported (unasked_deny.go).
+	r.reportUnaskedDeny(ctx)
 }
 
 // teardownInFlight reports a stack whose teardown began less than

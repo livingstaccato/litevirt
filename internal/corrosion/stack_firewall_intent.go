@@ -155,6 +155,27 @@ func StackFirewallIntents(ctx context.Context, c *Client) (map[string]StackFirew
 	return out, nil
 }
 
+// stackFirewallIntentStamps reads every stack name's recorded firewall
+// intent, declaring or not, with the stamp it was written at.
+func stackFirewallIntentStamps(ctx context.Context, c *Client) (map[string]stampedIntent, error) {
+	rows, err := c.Query(ctx,
+		`SELECT key, value, updated_at FROM cluster_policies WHERE key LIKE 'stack\_firewall/%' ESCAPE '\' AND deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]stampedIntent, len(rows))
+	for _, r := range rows {
+		out[strings.TrimPrefix(r.String("key"), stackFirewallKeyPrefix)] = stampedIntent{
+			StackFirewallIntent: decodeStackFirewallIntent(r.String("value")), at: r.String("updated_at")}
+	}
+	return out, nil
+}
+
+type stampedIntent struct {
+	StackFirewallIntent
+	at string
+}
+
 // standingDenyAsk reports whether stack's standing firewall intent asks for
 // the cluster default-deny (StackFirewallIntent): it is an heir of the deny
 // whatever its state, until an Admin's deploy or teardown changes it.

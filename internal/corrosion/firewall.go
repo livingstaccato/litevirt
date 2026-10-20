@@ -3,7 +3,6 @@ package corrosion
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"slices"
 	"strings"
 
@@ -439,31 +438,33 @@ func EnsureClusterDefaultDeny(ctx context.Context, c *Client, stack string) erro
 }
 
 // ReassertStackDefaultDeny sets the cluster default-deny, owned by the first
-// live stack (by name) whose deployed file asks for it, when the cluster has
-// no default row at all: a stack's deploy can miss a handoff from an owner
-// that went down while it was in flight. A row an operator set either way is
-// left as it is.
+// stack (by name) that asks for it (otherStackWants), when the cluster has no
+// live default row: a stack's deploy can miss a handoff from an owner that
+// went down while it was in flight, and a removal written on a replica that
+// had not yet seen the ask (a teardown's handoff, a redeploy's drop) can
+// outrank it. A live row is left as it is: a deny is its owner's, and an
+// allow is an operator's decision (`lv firewall default-deny off`).
 //
-// When the row was removed, only a stack whose record was written after the
-// removal counts: a stack's own redeploy dropping default-deny removes the
-// row before it records its new file, and the old file still in its record
-// must not bring the deny back.
+// A stack whose firewall intent is recorded gets the deny back whatever
+// removed it and whenever: its intent already outranks its file when an
+// Admin's redeploy drops the deny, so its old file does not ask in the
+// meantime. A stack with no recorded intent (deployed before cluster_policies
+// could be written, or by a previous release) is judged by its file alone, as
+// before: only when its record was written after the removal, since its own
+// redeploy dropping the deny removes the row before it records its new file.
 //
-// A live deny a stack owns is withdrawn when nothing asks for it any more
-// (withdrawUnaskedStackDeny); any other live row is left as it is.
+// No pass removes or withdraws a deny. One that nothing asks for any more
+// stays, fail closed, and is reported (UnaskedStackDeny).
 func ReassertStackDefaultDeny(ctx context.Context, c *Client, read StackFileWants) error {
 	rows, err := c.Query(ctx,
-		`SELECT updated_at, deleted_at, default_deny, stack_name FROM firewall_defaults WHERE scope = 'cluster'`)
+		`SELECT updated_at, deleted_at FROM firewall_defaults WHERE scope = 'cluster'`)
 	if err != nil {
 		return err
 	}
 	removedAt := ""
 	if len(rows) > 0 {
 		if rows[0].String("deleted_at") == "" {
-			if owner := rows[0].String("stack_name"); owner != "" && rows[0].Int("default_deny") != 0 {
-				return withdrawUnaskedStackDeny(ctx, c, owner, rows[0].String("updated_at"), read)
-			}
-			return nil // an operator's row, deny or allow: its decision
+			return nil // a live row, deny or allow: its owner's decision
 		}
 		removedAt = rows[0].String("updated_at")
 	}
@@ -472,45 +473,38 @@ func ReassertStackDefaultDeny(ctx context.Context, c *Client, read StackFileWant
 		return err
 	}
 	for _, w := range wants {
-		if w.defaultDeny && (removedAt == "" || lwwOrder(removedAt, w.updatedAt) < 0) {
+		if w.defaultDeny && (w.recorded || removedAt == "" || lwwOrder(removedAt, w.updatedAt) < 0) {
 			return SetFirewallDefault(ctx, c, "cluster", true, w.name)
 		}
 	}
 	return nil
 }
 
-// withdrawUnaskedStackDeny hands on, or removes, the cluster default-deny
-// owner holds (written at denyAt) when nothing asks for it any more: owner is
-// live, its file does not ask for it, and its firewall intent, recorded by a
-// caller with sg.write at the root after the deny was written, does not
-// either. That is the deny a re-assert gave a stack in the moment its record
-// was newer than its intent's clear. Another stack that asks for it takes it
-// (DeleteStackFirewallDefaults); while one's file cannot be read it stays.
-// Anything less certain keeps it: a record not here or being torn down, a
-// file that cannot be read, no intent (a previous release's deploy, judged by
-// its file alone as before), or an intent no newer than the deny (one this
-// replica has not caught up with may be on its way).
-func withdrawUnaskedStackDeny(ctx context.Context, c *Client, owner, denyAt string, read StackFileWants) error {
-	if read == nil {
-		return nil
+// UnaskedStackDeny returns the live stack that owns the cluster default-deny
+// when nothing asks for it any more: neither that stack (its file, and the
+// intent its last deploy with sg.write recorded) nor any other stack, and
+// every stack's file can be read. "" otherwise. The deny stays; the caller
+// reports it, and an Admin turns it off (`lv firewall default-deny off`) or
+// keeps it as an operator's (`lv firewall default-deny on`).
+func UnaskedStackDeny(ctx context.Context, c *Client, read StackFileWants) (string, error) {
+	cur, err := GetFirewallDefault(ctx, c, "cluster")
+	if err != nil || cur == nil || !cur.DefaultDeny || cur.StackName == "" {
+		return "", err
 	}
-	st, err := GetStack(ctx, c, owner)
+	st, err := GetStack(ctx, c, cur.StackName)
 	if err != nil || st == nil || st.State == "deleting" {
-		return err
+		return "", err
 	}
-	if deny, _, rerr := read(st.ComposeYAML); rerr != nil || deny {
-		return nil
+	wants, unreadable, err := otherStackWants(ctx, c, "", read)
+	if err != nil || len(unreadable) > 0 {
+		return "", err
 	}
-	rows, err := c.Query(ctx,
-		`SELECT value, updated_at FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`, stackFirewallKeyPrefix+owner)
-	if err != nil || len(rows) == 0 {
-		return err
+	for _, w := range wants {
+		if w.defaultDeny {
+			return "", nil
+		}
 	}
-	if decodeStackFirewallIntent(rows[0].String("value")).DefaultDeny || lwwOrder(denyAt, rows[0].String("updated_at")) >= 0 {
-		return nil
-	}
-	slog.Info("stack-reconciler: the cluster default-deny a stack owns is asked for by nothing; withdrawn", "stack", owner)
-	return DeleteStackFirewallDefaults(ctx, c, owner, read)
+	return cur.StackName, nil
 }
 
 // ── Stack teardown ───────────────────────────────────────────────────────────

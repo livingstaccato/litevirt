@@ -19,6 +19,9 @@ type stackWants struct {
 	updatedAt   string // the stack record's LWW key
 	defaultDeny bool
 	repos       map[string]bool
+	// recorded is set when a caller with sg.write recorded the stack's
+	// firewall intent, which then arbitrates its ask (otherStackWants).
+	recorded bool
 }
 
 // otherStackWants returns what every live stack other than stack asks for,
@@ -26,6 +29,9 @@ type stackWants struct {
 // asks for it too. A stack being deleted asks for nothing by its file.
 // unreadable names the stacks whose stored file cannot be read, which may
 // ask for anything.
+//
+// A live stack's file asks unless an intent recorded after its record says
+// otherwise.
 //
 // A stack whose standing firewall intent asks for the default-deny
 // (StackFirewallIntent) asks for it whatever its state: live, being torn
@@ -46,6 +52,10 @@ func otherStackWants(ctx context.Context, c *Client, stack string, read StackFil
 	if err != nil {
 		return nil, nil, err
 	}
+	stamped, err := stackFirewallIntentStamps(ctx, c)
+	if err != nil {
+		return nil, nil, err
+	}
 	for _, st := range stacks {
 		if st.Name == stack || st.State == "deleting" {
 			continue
@@ -59,8 +69,17 @@ func otherStackWants(ctx context.Context, c *Client, stack string, read StackFil
 			unreadable = append(unreadable, st.Name)
 			continue
 		}
+		// An intent recorded after the stack's record is an Admin's later
+		// word than its file: a redeploy dropping the deny records it before
+		// it removes the row, and its old file, still in the record until
+		// the deploy ends, does not ask for the deny back. Otherwise the
+		// file asks too.
+		in, recorded := stamped[st.Name]
+		if recorded && lwwOrder(st.UpdatedAt, in.at) < 0 {
+			deny = false
+		}
 		deny = deny || intents[st.Name].DefaultDeny
-		out = append(out, stackWants{name: st.Name, updatedAt: st.UpdatedAt, defaultDeny: deny, repos: repos})
+		out = append(out, stackWants{name: st.Name, updatedAt: st.UpdatedAt, defaultDeny: deny, repos: repos, recorded: recorded})
 	}
 	listed := make(map[string]bool, len(out)+len(unreadable))
 	for _, w := range out {
@@ -85,7 +104,7 @@ func otherStackWants(ctx context.Context, c *Client, stack string, read StackFil
 		if len(rec) > 0 {
 			at = rec[0].String("updated_at")
 		}
-		out = append(out, stackWants{name: name, updatedAt: at, defaultDeny: true})
+		out = append(out, stackWants{name: name, updatedAt: at, defaultDeny: true, recorded: true})
 	}
 	return out, unreadable, nil
 }

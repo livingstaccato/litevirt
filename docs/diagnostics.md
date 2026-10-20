@@ -1930,6 +1930,32 @@ on` keeps it as the operator's; a stack deployed later that asks for
 default-deny takes it over. The condition resolves on the next pass after
 either.
 
+### A cluster default-deny nothing asks for (`stack.firewall_deny_unasked`)
+
+Evaluator `stack_reconciler`, subject kind `cluster`, subject `cluster`,
+severity warning. Raised by the stack reconciler when the cluster default-deny
+is owned by a live compose stack, and neither that stack's file nor the
+intent its last deploy with `sg.write` at `/` recorded asks for it, nor does
+any other stack (every stack's file can be read). For example, a reconciler
+pass gave the deny back to a stack while a deploy without it was being
+recorded, or the stack was deployed before `cluster_policies` could be
+written. No reconciler pass removes a deny on its own: one replica's view may
+miss a newer deploy that asks for it. The deny stays in force.
+`lv firewall default-deny off` turns it off and `lv firewall default-deny on`
+keeps it as the operator's; both need `sg.write` at `/`. A stack that asks
+for default-deny takes it over. The condition resolves on the next pass after
+any of them.
+
+When the cluster has no default-deny row in force and a stack asks for one
+(its file, or the intent its last deploy with `sg.write` recorded, or a torn-down
+stack's standing intent), the stack reconciler sets it again, owned by that
+stack, whatever removed it. An intent recorded after a stack's file outranks
+the file's ask: an Admin's `lv compose up` that drops the deny is not undone
+while its file is still being recorded. A stack with no recorded intent
+(deployed before `cluster_policies` could be written, or by a previous
+release) is judged by its file alone, as before: it gets the deny back only
+when its record is newer than the removal.
+
 ### A VM that outlived its stack's teardown (`stack.vm_outlived_stack`)
 
 Evaluator `stack_reconciler`, subject kind `vm`, subject the VM's name,

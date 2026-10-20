@@ -194,9 +194,14 @@ down, or is redeployed without it, the deny passes to another stack whose file
 asks for it, and is removed only when none does; while another stack's stored
 file cannot be read, it stays. A deploy asking for default-deny sets it again
 once its record is written if the cluster no longer denies, and the background
-stack reconciler sets it for a live stack whose file asks for it when the
-cluster has no default, if that stack was recorded after the default was
-removed (a redeploy that drops default-deny is not undone). Stacks going down
+stack reconciler sets it for a stack that asks for it whenever the cluster has
+no default in force, whatever removed it (a redeploy by a caller with
+`sg.write` that drops default-deny is not undone: it records that before it
+removes the deny; a stack with no recorded intent counts only when it was
+recorded after the removal). A deny a live stack owns and nothing asks for any more is
+kept, never removed by the reconciler, and raises the
+`stack.firewall_deny_unasked` health condition; `lv firewall default-deny off`
+turns it off. Stacks going down
 at the same time never hand the deny or a repo to each other: a stack that
 went down is passed over. The background reconciler hands a deny or repo a
 torn-down stack still holds to a live stack that asks for it. Otherwise it

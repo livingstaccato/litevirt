@@ -435,3 +435,81 @@ func TestStackReconciler_AFailedReadLeavesTheConditionOpen(t *testing.T) {
 		})
 	}
 }
+
+// No stack reconciler pass removes the cluster default-deny on its own: a
+// removal decided on one replica's view can outrank a newer ask it has not
+// seen. A deny a live stack owns that nothing asks for any more is kept and
+// reported (stack.firewall_deny_unasked, naming the stack and
+// `lv firewall default-deny off`), as one a torn-down stack owns is
+// (firewall.default_deny_orphaned). The condition resolves once an operator
+// settles the deny.
+//
+// Mutations: remove an unasked deny in the reconcile pass — "live owner",
+// red. Never raise the condition — red.
+func TestStackReconciler_NeverWithdrawsADenyOnItsOwn(t *testing.T) {
+	ctx := context.Background()
+	newDB := func(t *testing.T) *corrosion.Client {
+		db := corrosion.NewTestClientT(t)
+		if err := corrosion.InitSchema(ctx, db); err != nil {
+			t.Fatal(err)
+		}
+		db.SetClusterPolicyGate(func() bool { return true })
+		return db
+	}
+	pass := func(t *testing.T, db *corrosion.Client) *corrosion.FirewallDefault {
+		t.Helper()
+		r := NewStackReconciler("node-0", db)
+		r.SetCleaner(&failingStackCleaner{})
+		for i := 0; i < 3; i++ {
+			r.ReconcileOnce(ctx)
+		}
+		d, err := corrosion.GetFirewallDefault(ctx, db, "cluster")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	t.Run("live owner", func(t *testing.T) {
+		db := newDB(t)
+		if err := corrosion.UpsertStack(ctx, db, corrosion.StackRecord{Name: "edge", ComposeYAML: "name: edge\n", State: "active"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.SetFirewallDefault(ctx, db, "cluster", true, "edge"); err != nil {
+			t.Fatal(err)
+		}
+		setIntent(t, db, "edge", false, false)
+		if d := pass(t, db); d == nil || !d.DefaultDeny || d.StackName != "edge" {
+			t.Fatalf("the cluster default after the passes = %+v, want edge's deny kept", d)
+		}
+		row, found, err := corrosion.GetHealthCondition(ctx, db, unaskedDenyEvaluator, unaskedDenyCode, unaskedDenyKind, unaskedDenySubject)
+		if err != nil || !found || row.Lifecycle == corrosion.ConditionResolved ||
+			!strings.Contains(row.Evidence, `edge`) || !strings.Contains(row.Evidence, "lv firewall default-deny off") {
+			t.Fatalf("condition = %+v (found %v, err %v), want it open naming edge and the exit", row, found, err)
+		}
+		if err := corrosion.SetFirewallDefault(ctx, db, "cluster", false, ""); err != nil {
+			t.Fatal(err)
+		}
+		if d := pass(t, db); d == nil || d.DefaultDeny {
+			t.Fatalf("the operator's allow = %+v after the passes", d)
+		}
+		row, _, _ = corrosion.GetHealthCondition(ctx, db, unaskedDenyEvaluator, unaskedDenyCode, unaskedDenyKind, unaskedDenySubject)
+		if row.Lifecycle != corrosion.ConditionResolved {
+			t.Errorf("the condition stayed open after `lv firewall default-deny off`: %+v", row)
+		}
+	})
+	t.Run("torn-down owner", func(t *testing.T) {
+		db := newDB(t)
+		if err := corrosion.UpsertStack(ctx, db, corrosion.StackRecord{Name: "gone", ComposeYAML: "name: gone\n", State: "active"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.SetFirewallDefault(ctx, db, "cluster", true, "gone"); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.DeleteStackRecord(ctx, db, "gone"); err != nil {
+			t.Fatal(err)
+		}
+		if d := pass(t, db); d == nil || !d.DefaultDeny {
+			t.Fatalf("the cluster default after the passes = %+v, want the deny kept", d)
+		}
+	})
+}

@@ -534,15 +534,15 @@ func TestDeployStack_AnOperatorFirstDeployOverAStandingIntentIsRefused(t *testin
 // A cluster default-deny re-asserted for a stack in the moment its record
 // was newer than the clear of its intent (here: an Admin's first deploy,
 // without a deny, of a name whose intent stood asking for one; a reconciler
-// pass between the record and the intent) is withdrawn once the clear lands
-// and nothing asks for it, and passes to another stack that still asks.
-// One whose intent is no newer than the deny (a replica that has not caught
-// up) keeps it.
+// pass between the record and the intent, as two writes did) is kept once
+// the clear lands and nothing asks for it: no reconciler pass removes a deny
+// on its own (the stack reconciler reports it, stack.firewall_deny_unasked).
+// UnaskedStackDeny names the stack only when nothing asks.
 //
-// Mutations: never withdraw a live stack's deny — "nothing asks", red.
-// Withdraw whatever the intent's age — "an intent older than the deny", red.
-// Remove it rather than hand it on — "another stack asks", red.
-func TestReassertStackDefaultDeny_WithdrawsADenyNothingAsksFor(t *testing.T) {
+// Mutations: withdraw a live stack's deny nothing asks for — "nothing asks",
+// red. Name the owner although another stack asks — "another stack asks",
+// red.
+func TestReassertStackDefaultDeny_KeepsADenyNothingAsksFor(t *testing.T) {
 	ctx := context.Background()
 	// standing leaves name old torn down by a previous release, its intent
 	// asking for the deny, then writes old's first deploy without a deny as
@@ -597,11 +597,22 @@ func TestReassertStackDefaultDeny_WithdrawsADenyNothingAsksFor(t *testing.T) {
 		d, _ := corrosion.GetFirewallDefault(ctx, s.db, "cluster")
 		return d
 	}
+	unasked := func(t *testing.T, s *Server) string {
+		t.Helper()
+		owner, err := corrosion.UnaskedStackDeny(ctx, s.db, compose.StoredStackWants)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return owner
+	}
 	t.Run("nothing asks", func(t *testing.T) {
 		s := standing(t)
 		clear(t, s)
-		if d := settle(t, s); d != nil && d.DefaultDeny {
-			t.Errorf("a deny nothing asks for stays in force, owned by live stack old: %+v", d)
+		if d := settle(t, s); d == nil || !d.DefaultDeny || d.StackName != "old" {
+			t.Errorf("a deny nothing asks for was withdrawn: %+v, want it kept, owned by old", d)
+		}
+		if owner := unasked(t, s); owner != "old" {
+			t.Errorf("UnaskedStackDeny = %q, want old", owner)
 		}
 	})
 	t.Run("another stack asks", func(t *testing.T) {
@@ -610,21 +621,11 @@ func TestReassertStackDefaultDeny_WithdrawsADenyNothingAsksFor(t *testing.T) {
 			t.Fatal(err)
 		}
 		clear(t, s)
-		if d := settle(t, s); d == nil || !d.DefaultDeny || d.StackName != "edge" {
-			t.Errorf("the cluster default = %+v, want the deny handed to edge, which asks for it", d)
-		}
-	})
-	t.Run("an intent older than the deny", func(t *testing.T) {
-		s := standing(t)
-		clear(t, s)
-		// The deny is written again after the clear, as by a replica whose
-		// re-assert had not seen it: this replica keeps it until an intent
-		// newer than it says otherwise.
-		if err := corrosion.SetFirewallDefault(ctx, s.db, "cluster", true, "old"); err != nil {
-			t.Fatal(err)
-		}
 		if d := settle(t, s); d == nil || !d.DefaultDeny {
-			t.Errorf("a deny newer than the intent was withdrawn: %+v", d)
+			t.Errorf("the cluster default = %+v, want the deny kept", d)
+		}
+		if owner := unasked(t, s); owner != "" {
+			t.Errorf("UnaskedStackDeny = %q, want none: edge asks", owner)
 		}
 	})
 }
@@ -685,9 +686,9 @@ func TestDeployStack_AFailedIntentWriteChangesNothing(t *testing.T) {
 }
 
 // r6Exec runs q on the test database directly, outside replication.
-func r6Exec(t *testing.T, s *Server, q string) {
+func r6Exec(t *testing.T, s *Server, q string, args ...any) {
 	t.Helper()
-	if _, err := s.db.DB().ExecContext(context.Background(), q); err != nil {
+	if _, err := s.db.DB().ExecContext(context.Background(), q, args...); err != nil {
 		t.Fatalf("%s: %v", q, err)
 	}
 }
@@ -721,5 +722,126 @@ func TestDeployStack_AFailedAdminDropKeepsTheDeny(t *testing.T) {
 	}
 	if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: fwStackNoBlockYAML}, &mockDeployStreamR2{ctx: opal}); err == nil {
 		t.Error("an Operator dropped the firewall after a failed Admin drop")
+	}
+}
+
+// Whatever removed the cluster default-deny, and however new the removal, a
+// stack that asks for it gets it back: a removal written on a replica that
+// had not seen the ask (here: a lagging withdrawal, or a teardown's handoff,
+// stamped after the asking stack's record) must not outrank it. This is the
+// review's probe R6b-P6.
+//
+// Mutations: count only stacks recorded after the removal again — "a removal
+// newer than the ask", red. Withdraw a deny nothing asks for (248acdb26) —
+// "a lagging withdrawal", red.
+func TestReassertStackDefaultDeny_ARemovalNeverOutranksAnAsk(t *testing.T) {
+	ctx := context.Background()
+	const asks = "name: s\nfirewall:\n  default-deny: true\n"
+	t.Run("a lagging withdrawal", func(t *testing.T) {
+		s, _, ada := stackFirewallFixture(t)
+		s.db.SetClusterPolicyGate(func() bool { return true })
+		if err := s.DeleteStack(&pb.DeleteStackRequest{Name: "fwonly"}, &mockDeleteStream{ctx: ada}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: asks}, &mockDeployStreamR2{ctx: ada}); err != nil {
+			t.Fatal(err)
+		}
+		st, _ := corrosion.GetStack(ctx, s.db, "s")
+		// B drops the deny: its intent, then its removal.
+		if err := corrosion.SetStackFirewallIntent(ctx, s.db, st, false, false, "B"); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.DeleteStackFirewallDefaults(ctx, s.db, "s", compose.StoredStackWants); err != nil {
+			t.Fatal(err)
+		}
+		// A asks for it: its intent, then its deny row.
+		if err := corrosion.SetStackFirewallIntent(ctx, s.db, st, false, true, "A"); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.SetFirewallDefault(ctx, s.db, "cluster", true, "s"); err != nil {
+			t.Fatal(err)
+		}
+		// B's record and intent.
+		if err := corrosion.UpsertStackWithFirewallIntent(ctx, s.db, corrosion.StackRecord{Name: "s", ComposeYAML: "name: s\n", ComposeHash: "b", State: "active"}, false, false, "B"); err != nil {
+			t.Fatal(err)
+		}
+		// A's record and intent are stamped now, and have not reached this
+		// replica; its reconciler passes.
+		tA3 := s.db.NowTS()
+		if err := corrosion.ReassertStackDefaultDeny(ctx, s.db, compose.StoredStackWants); err != nil {
+			t.Fatal(err)
+		}
+		// As a withdrawal on this view would: at a stamp after A's.
+		if d, _ := corrosion.GetFirewallDefault(ctx, s.db, "cluster"); d != nil && d.DefaultDeny {
+			if err := corrosion.DeleteFirewallDefault(ctx, s.db, "cluster"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// A's entry arrives and wins the record and the intent.
+		r6Exec(t, s, `UPDATE stacks SET compose_yaml = ?, compose_hash = 'a', updated_at = ? WHERE name = 's'`, asks, tA3)
+		r6Exec(t, s, `UPDATE cluster_policies SET value = '{"firewall":true,"default_deny":true}', updated_at = ? WHERE key = 'stack_firewall/s'`, tA3)
+		for i := 0; i < 2; i++ {
+			if err := corrosion.ReassertStackDefaultDeny(ctx, s.db, compose.StoredStackWants); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if d, _ := corrosion.GetFirewallDefault(ctx, s.db, "cluster"); d == nil || !d.DefaultDeny || d.StackName != "s" {
+			t.Errorf("FAIL OPEN: stack s's file and intent ask for the deny, and the cluster default is %+v", d)
+		}
+	})
+	t.Run("a removal newer than the ask", func(t *testing.T) {
+		s, _, ada := stackFirewallFixture(t)
+		s.db.SetClusterPolicyGate(func() bool { return true })
+		if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: asks}, &mockDeployStreamR2{ctx: ada}); err != nil {
+			t.Fatal(err)
+		}
+		// fwonly owns the deny; a teardown's handoff on a replica that has
+		// not seen s removes it, after s's record.
+		if err := corrosion.DeleteFirewallDefault(ctx, s.db, "cluster"); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.ReassertStackDefaultDeny(ctx, s.db, compose.StoredStackWants); err != nil {
+			t.Fatal(err)
+		}
+		if d, _ := corrosion.GetFirewallDefault(ctx, s.db, "cluster"); d == nil || !d.DefaultDeny {
+			t.Errorf("FAIL OPEN: stacks ask for the deny, and the cluster default is %+v", d)
+		}
+	})
+}
+
+// An Admin's redeploy that drops the deny records that before it removes the
+// row, and its old file, still in the record until the deploy ends, does not
+// bring it back on a reconciler pass in between; nor does anything once the
+// record lands.
+//
+// Mutation: let the file ask whatever the intent recorded after it says —
+// red.
+func TestReassertStackDefaultDeny_ARedeployDroppingTheDenyIsNotUndone(t *testing.T) {
+	ctx := context.Background()
+	s, _, ada := stackFirewallFixture(t)
+	s.db.SetClusterPolicyGate(func() bool { return true })
+	// fwonly owns the deny and its file asks; as fwonly's redeploy without a
+	// firewall runs: its intent, then its persist removes the deny.
+	st, _ := corrosion.GetStack(ctx, s.db, "fwonly")
+	if err := corrosion.SetStackFirewallIntent(ctx, s.db, st, false, false, "n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.DeleteStackFirewall(ctx, s.db, "fwonly", compose.StoredStackWants); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.ReassertStackDefaultDeny(ctx, s.db, compose.StoredStackWants); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := corrosion.GetFirewallDefault(ctx, s.db, "cluster"); d != nil && d.DefaultDeny {
+		t.Errorf("a pass during the redeploy gave the deny back to the old file: %+v", d)
+	}
+	if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: fwStackNoBlockYAML}, &mockDeployStreamR2{ctx: ada}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.ReassertStackDefaultDeny(ctx, s.db, compose.StoredStackWants); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := corrosion.GetFirewallDefault(ctx, s.db, "cluster"); d != nil && d.DefaultDeny {
+		t.Errorf("the deny came back after the redeploy without it: %+v", d)
 	}
 }

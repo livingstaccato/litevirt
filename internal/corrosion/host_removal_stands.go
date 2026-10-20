@@ -61,8 +61,8 @@ func sameLegacyAdmission(a, b hostKey) bool {
 //     already refused every other key, so it ends the local admission. At 0 it
 //     is left to the clock, as before, and anti-entropy then decides the row
 //     by created_at and serial (sameLegacyAdmission). A previous-release node
-//     writes only this shape, and so does this build until the host_incarnation
-//     release feature is granted.
+//     writes only this shape, and so does this build until the release token
+//     has latched.
 //
 // A removal stamped implausibly far ahead is left to the clock and its skew
 // guard.

@@ -1747,16 +1747,14 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*pb
 	// re-admission of the name, or a certificate renewal, may have landed
 	// since, and the new machine is not this removal's to delete.
 	//
-	// Once the host_incarnation release feature is available the removal also
-	// names the certificate serial it ends, so a receiver that holds a later
-	// admission of the name never ends it (corrosion.DeleteHostAdmissionIf).
+	// Once the release token has latched, every host this one replicates to
+	// knows the removal that names the certificate serial it ends, so a
+	// receiver that holds a later admission of the name never ends it
+	// (corrosion.DeleteHostAdmissionIf). Before, the previous shape, which
+	// every receiver applies as it always has.
 	var applied bool
-	if s.ReleaseFeatureAvailable(capabilities.FeatureHostIncarnation) {
-		err = s.WithReleaseFeature(ctx, capabilities.FeatureHostIncarnation, func(ctx context.Context, g capabilities.FeatureGrant) error {
-			var derr error
-			applied, derr = corrosion.DeleteHostAdmissionIf(ctx, s.db, req.Name, h.CertSerial, key, g)
-			return derr
-		})
+	if s.ReleaseTokenLatched() {
+		applied, err = corrosion.DeleteHostAdmissionIf(ctx, s.db, req.Name, h.CertSerial, key)
 	} else {
 		applied, err = corrosion.DeleteHostIf(ctx, s.db, req.Name, h.CertSerial, key)
 	}

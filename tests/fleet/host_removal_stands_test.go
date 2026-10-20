@@ -5,9 +5,11 @@ package fleet
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -68,9 +70,9 @@ func removalRace(t *testing.T, aeFirst bool, prepare func(c *Cluster)) *Cluster 
 	return c
 }
 
-// removeAdmission is `lv host rm` of wl on n once the host_incarnation
-// release feature is granted: the removal names the serial of the admission
-// n holds (corrosion.DeleteHostAdmissionIf).
+// removeAdmission is `lv host rm` of wl on n once the release token has
+// latched: the removal names the serial of the admission n holds
+// (corrosion.DeleteHostAdmissionIf).
 func removeAdmission(t *testing.T, n *Node) error {
 	t.Helper()
 	ctx := context.Background()
@@ -78,8 +80,7 @@ func removeAdmission(t *testing.T, n *Node) error {
 	if err != nil || !found || deleted {
 		t.Fatalf("%s: %s is not live to remove: found=%v deleted=%v err=%v", n.Name, removedHost, found, deleted, err)
 	}
-	applied, err := corrosion.DeleteHostAdmissionIf(ctx, n.DB, removedHost, serial, corrosion.HostIncarnation{N: inc, At: at},
-		capabilities.GrantForTest(t, capabilities.FeatureHostIncarnation))
+	applied, err := corrosion.DeleteHostAdmissionIf(ctx, n.DB, removedHost, serial, corrosion.HostIncarnation{N: inc, At: at})
 	if err == nil && !applied {
 		t.Fatalf("%s: the removal of %s was not applied", n.Name, removedHost)
 	}
@@ -428,8 +429,8 @@ func TestFleet_AnEarlierSecondRemovalDoesNotEndALegacyReadd(t *testing.T) {
 }
 
 // The removal that waited out a rolling upgrade (fix round 2). Mid-roll the
-// host_incarnation release feature is not granted, so node-0's removal of wl
-// is the previous shape, naming no serial. node-2 does not hear it. A v1.9.0
+// release token has not latched, so node-0's removal of wl is the previous
+// shape, naming no serial. node-2 does not hear it. A v1.9.0
 // node then re-adds wl, keeping its created_at and changing only the serial
 // (emulated on nodes 0 and 1), and node-2 takes that re-add by anti-entropy.
 // host_membership_split_v1 latches on node-2, and only then does the removal
@@ -494,8 +495,8 @@ func TestFleet_ARemovalPendingAcrossTheRollDoesNotEndAV190Readd(t *testing.T) {
 }
 
 // Mixed versions (fix round 2): a removal in the previous shape, as a
-// previous-release node (or this build before the host_incarnation release
-// feature) writes it, races node-2's later state write. It names no serial,
+// previous-release node (or this build before the release token latches)
+// writes it, races node-2's later state write. It names no serial,
 // so over the WAL it is left to the clock, as before; anti-entropy then
 // removes wl everywhere by created_at and serial. And a removal that names a
 // serial ends only that admission: node-0 removes s1 after node-2 renewed wl
@@ -567,6 +568,40 @@ func TestFleet_HostRemovalShapesMixed(t *testing.T) {
 		})
 		if h, _ := corrosion.GetHost(ctx, n2.DB, removedHost); h == nil || h.CertSerial != "s3" {
 			t.Errorf("%s: a removal of s1 ended its s3 row: %+v", n2.Name, h)
+		}
+	})
+}
+
+// RemoveHost names the removed admission's serial once the release token has
+// latched (fix round 2), for a host that is down too: the removal asks no peer
+// for it.
+//
+// Mutation: RemoveHost always writing the previous shape turns both subtests
+// red.
+func TestFleet_RemoveHostNamesTheAdmissionsSerial(t *testing.T) {
+	const shape = "lower(cert_serial) = lower(?)"
+	t.Run("the release token has latched", func(t *testing.T) {
+		c, _ := incFleet(t, 5542)
+		a, d := c.Nodes[0], c.Nodes[2]
+		if _, err := c.SelfClient(a).RemoveHost(context.Background(), &pb.RemoveHostRequest{Name: d.Name, Force: true}); err != nil {
+			t.Fatalf("remove %s: %v", d.Name, err)
+		}
+		if j := incMutationLog(t, a); !strings.Contains(j, shape) {
+			t.Errorf("%s removed %s without naming its serial:\n%s", a.Name, d.Name, j)
+		}
+	})
+	t.Run("the host being removed is down", func(t *testing.T) {
+		c, _ := incFleet(t, 5543)
+		a, d := c.Nodes[0], c.Nodes[2]
+		c.Crash(d)
+		if _, err := c.SelfClient(a).RemoveHost(context.Background(), &pb.RemoveHostRequest{Name: d.Name, Force: true}); err != nil {
+			t.Fatalf("remove %s: %v", d.Name, err)
+		}
+		if h, _ := corrosion.GetHost(context.Background(), a.DB, d.Name); h != nil {
+			t.Errorf("%s still lists %s", a.Name, d.Name)
+		}
+		if j := incMutationLog(t, a); !strings.Contains(j, shape) {
+			t.Errorf("%s removed the down %s without naming its serial", a.Name, d.Name)
 		}
 	})
 }

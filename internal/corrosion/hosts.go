@@ -1160,12 +1160,10 @@ func DeleteHostIf(ctx context.Context, c *Client, name, serial string, key HostI
 // the row only while it holds that serial, and a row it holds under another
 // serial (a re-admission, even one that kept the created_at) is not this
 // removal's to end (host_removal_stands.go). A previous-release receiver does
-// not know the shape, so it is written only under the host_incarnation
-// release feature's grant.
-func DeleteHostAdmissionIf(ctx context.Context, c *Client, name, serial string, key HostIncarnation, g capabilities.FeatureGrant) (applied bool, err error) {
-	if err := g.Check(capabilities.FeatureHostIncarnation); err != nil {
-		return false, err
-	}
+// not know the shape (latchGatedShapes), so a caller writes it only once the
+// release token has latched (grpcapi.Server.ReleaseTokenLatched), and
+// DeleteHostIf before.
+func DeleteHostAdmissionIf(ctx context.Context, c *Client, name, serial string, key HostIncarnation) (applied bool, err error) {
 	if serial == "" {
 		return false, fmt.Errorf("removal of %s names no certificate serial", name)
 	}

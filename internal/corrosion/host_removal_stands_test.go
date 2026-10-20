@@ -4,8 +4,6 @@ import (
 	"context"
 	"testing"
 	"time"
-
-	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 // A removal stands over a live copy of its own admission at incarnation 0,
@@ -111,8 +109,7 @@ func TestHostRemoval_StandsAgainstAPreviousBuildsDump(t *testing.T) {
 // The statement's own WHERE names the serial, so the WAL rule's serial
 // comparison is a guard no test can tell from its absence. Mutations: the
 // rule taking a serial-less removal turns "no serial" red; the rule always
-// false turns both "the admission's serial" cases red; DeleteHostAdmissionIf
-// without its grant check turns "no grant" red; retiring the credential on a
+// false turns both "the admission's serial" cases red; retiring the credential on a
 // removal whatever serial it names turns both "another serial" cases red.
 func TestHostRemoval_WALRuleNamesTheAdmission(t *testing.T) {
 	ctx := context.Background()
@@ -167,17 +164,4 @@ func TestHostRemoval_WALRuleNamesTheAdmission(t *testing.T) {
 			}
 		})
 	}
-	t.Run("no grant", func(t *testing.T) {
-		c := newTestDB(t)
-		if err := InsertHost(ctx, c, HostRecord{Name: "host-x", Address: "10.0.0.15", State: "active", CertSerial: "01old"}); err != nil {
-			t.Fatal(err)
-		}
-		k := incKey(t, c)
-		if _, err := DeleteHostAdmissionIf(ctx, c, "host-x", "01old", HostIncarnation{N: k.n, At: k.at}, capabilities.FeatureGrant{}); err == nil {
-			t.Error("the removal that names a serial was written without the host_incarnation grant")
-		}
-		if incKey(t, c).deleted {
-			t.Error("a refused removal ended the row")
-		}
-	})
 }

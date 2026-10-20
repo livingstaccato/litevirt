@@ -31,6 +31,22 @@ func onMigrationNet(n *Node, host byte, enable bool) {
 	}
 }
 
+// migrationFallbackMessages joins the details of vm's network-fallback events.
+func migrationFallbackMessages(t *testing.T, n *Node, vm string) string {
+	t.Helper()
+	evs, err := corrosion.ListVMEvents(context.Background(), n.DB, vm, 50, "")
+	if err != nil {
+		t.Fatalf("ListVMEvents: %v", err)
+	}
+	var out []string
+	for _, e := range evs {
+		if e.Type == "vm.migrate.network_fallback" {
+			out = append(out, e.Detail)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
 func hasMigrationFallbackEvent(t *testing.T, n *Node, vm string) bool {
 	t.Helper()
 	evs, err := corrosion.ListVMEvents(context.Background(), n.DB, vm, 50, "")
@@ -287,6 +303,11 @@ func TestFleet_MigrationNetwork_ColdDiskStreamFallsBackWhenTheNetworkIsDown(t *t
 // ready and stays in libvirt's tunnel on the cluster address. Either side
 // reporting no CA (an older build) changes nothing: the move leaves the tunnel.
 //
+// The fallback event names the CA mismatch as the reason.
+//
+// Mutation (event): describe every memory fallback as missing credentials —
+// "plaintext" reappears.
+//
 // Mutations: drop the CA comparison from the memory route in migrateOwnedVM
 // (the migrate case) or in drainOneVM (the drain case) — direct=true is
 // requested, and that case goes red. Treat an unreported CA as a mismatch —
@@ -338,6 +359,11 @@ func TestFleet_MigrationNetwork_MemoryOnlyStaysTunnelledWhenTheMigrationCAsDiffe
 			// drain names no data address for it; `lv migrate` names that one).
 			if !strings.Contains(note, "direct=false") || strings.Contains(note, "addr=10.9.0.2") {
 				t.Fatalf("libvirt migrate = %q; want the tunnel on the cluster address (the CAs differ)", note)
+			}
+			// The warning names the real reason, not a missing credential set.
+			msg := migrationFallbackMessages(t, src, "mem3")
+			if !strings.Contains(msg, "different migration CAs") || strings.Contains(msg, "plaintext") {
+				t.Fatalf("fallback event = %q; want it to name the CA mismatch, not plaintext", msg)
 			}
 		})
 	}

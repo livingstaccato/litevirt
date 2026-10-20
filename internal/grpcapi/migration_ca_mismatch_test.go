@@ -15,10 +15,10 @@ import (
 //
 // Mutation: drop the rotation sentence from migrationCAMismatch — red.
 func TestMigrationCAMismatch_NamesARunningRotation(t *testing.T) {
-	if err := migrationCAMismatch("vm", "a", "x", "b", "x"); err != nil {
+	if err := migrationCAMismatch("vm", "a", "x", nil, "b", "x", nil); err != nil {
 		t.Fatalf("one CA set refused: %v", err)
 	}
-	err := migrationCAMismatch("vm", "a", "old+new", "b", "old")
+	err := migrationCAMismatch("vm", "a", "old+new", nil, "b", "old", nil)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("err = %v; want FailedPrecondition", err)
 	}
@@ -45,5 +45,26 @@ func TestUnusableMigrationCredentialsRefusal_NamesBothRemedies(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal %q does not say %q", err, want)
 		}
+	}
+}
+
+// The refusal names each host's CA fingerprints, the ones lv doctor
+// migration-tls lists, not the digest of a two-CA set that appears nowhere
+// else. A target whose build reports only the digest is shown by it, marked.
+//
+// Mutation: print the set digests instead of the lists — red.
+func TestMigrationCAMismatch_NamesTheRealCAFingerprints(t *testing.T) {
+	err := migrationCAMismatch("vm", "a", "digest-a", []string{"6cee35be", "5eda7fef"}, "b", "digest-b", []string{"6cee35be"})
+	for _, want := range []string{"a: 6cee35be, 5eda7fef", "b: 6cee35be"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not list %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "digest-a") || strings.Contains(err.Error(), "digest-b") {
+		t.Errorf("refusal %q quotes a set digest although both hosts listed their CAs", err)
+	}
+	err = migrationCAMismatch("vm", "a", "digest-a", []string{"6cee35be"}, "b", "digest-b", nil)
+	if !strings.Contains(err.Error(), "b: digest-b (") {
+		t.Errorf("older target: refusal %q; want its digest, marked as one", err)
 	}
 }

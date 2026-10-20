@@ -267,6 +267,28 @@ func readValidMigrationSet(pkiDir string) (ca, cert, key []byte, err error) {
 	return ca, cert, key, nil
 }
 
+// MigrationCAFingerprints is the SHA-256 fingerprint (hex) of each CA in this
+// host's migration CA file under pkiDir, in file order, as lv doctor
+// migration-tls lists them. nil with no error when the host has no CA file.
+func MigrationCAFingerprints(pkiDir string) ([]string, error) {
+	data, err := os.ReadFile(filepath.Join(MigrationDir(pkiDir), MigrationCAName))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read migration CA: %w", err)
+	}
+	cas, err := parseCABundle(data)
+	if err != nil {
+		return nil, err
+	}
+	fps := make([]string, 0, len(cas))
+	for _, c := range cas {
+		fps = append(fps, CertFingerprint(c))
+	}
+	return fps, nil
+}
+
 // CheckQemuMigrationTLS answers what InstallQemuMigrationTLS would, the same
 // way, and writes nothing: the set under pkiDir/migration must be complete
 // and valid, and qemuDir absent, empty, or already litevirt's. An absent set

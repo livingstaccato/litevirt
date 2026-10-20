@@ -693,7 +693,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 						"`lv host install-migration-tls --reissue` (run where the cluster's migration CA lives)",
 					req.VmName, s.hostName, caErr, req.TargetHost)
 			}
-			if err := migrationCAMismatch(req.VmName, s.hostName, localCA, req.TargetHost, ens.migrationCA); err != nil {
+			if err := migrationCAMismatch(req.VmName, s.hostName, localCA, s.localMigrationCAList(), req.TargetHost, ens.migrationCA, ens.migrationCAs); err != nil {
 				return err
 			}
 		}
@@ -702,9 +702,9 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			kind = routeCold
 		}
 		if fwl != nil {
-			route = s.chooseLiveFirmwareRoute(ctx, vm.Name, *targetHost, ens.migAddr, kind, useTLS)
+			route = s.chooseLiveFirmwareRoute(ctx, vm.Name, *targetHost, ens.migAddr, kind, storageTLSGap(srcTLS, dstTLS, s.hostName, req.TargetHost))
 		} else {
-			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, kind, useTLS)
+			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, kind, storageTLSGap(srcTLS, dstTLS, s.hostName, req.TargetHost))
 		}
 		if !dstTLS && ens.tlsUnusable != "" {
 			// The target holds credentials it cannot use. Refused before the
@@ -734,14 +734,15 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		stripVNC, targetNetDevs = ens.vncPasswordUnavailable, ens.netDevices
 		switch {
 		case fwCold || coldStopped:
-			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeCold, true)
+			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeCold, "")
 		case fwl != nil:
 			// QEMU's TLS stream only with both hosts ready and their
 			// migration CAs agreeing (memoryTLSReady).
-			useTLS = s.memoryTLSReady(srcTLS, ens)
-			route = s.chooseLiveFirmwareRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeMemory, useTLS)
+			gap := s.memoryTLSGap(srcTLS, ens, req.TargetHost)
+			useTLS = gap == ""
+			route = s.chooseLiveFirmwareRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeMemory, gap)
 		default:
-			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeMemory, s.memoryTLSReady(srcTLS, ens))
+			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeMemory, s.memoryTLSGap(srcTLS, ens, req.TargetHost))
 		}
 	}
 	if fwl != nil {
@@ -1793,7 +1794,11 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 		// before the copy rather than at QEMU's TLS handshake.
 		resp.MigrationTlsReady = tlsReady
 		if fp, _ := s.localMigrationCA(); resp.MigrationTlsReady && fp != "" {
-			_ = grpc.SetHeader(ctx, metadata.Pairs(MigrationCAMD, fp))
+			md := metadata.Pairs(MigrationCAMD, fp)
+			if list := s.localMigrationCAList(); len(list) > 0 {
+				md.Append(MigrationCAsMD, headerValue(strings.Join(list, ",")))
+			}
+			_ = grpc.SetHeader(ctx, md)
 		}
 		if errors.Is(tlsErr, pki.ErrInvalidMigrationCredentials) {
 			// Not ready because the credentials here are unusable: say why, so
@@ -2664,6 +2669,12 @@ func (s *Server) ensureDisksOnTargetISO(ctx context.Context, targetHost, vmName 
 // its credentials chain to. An older target sends none.
 const MigrationCAMD = "x-litevirt-migration-ca-sha256"
 
+// MigrationCAsMD is the EnsureDisks response header in which a target that
+// sends MigrationCAMD also lists the fingerprint of each CA in its migration
+// CA file, comma-separated, so a refusal can name the CAs lv doctor
+// migration-tls shows. Shown only, never compared; an older target sends none.
+const MigrationCAsMD = "x-litevirt-migration-cas-sha256"
+
 // MigrationTLSUnusableMD is the EnsureDisks response header in which a
 // target that is not ready for migration TLS because its credentials are
 // unusable (pki.ErrInvalidMigrationCredentials) says why. An older target, or
@@ -2701,19 +2712,33 @@ func unusableMigrationCredentialsRefusal(vmName, host, why string) error {
 
 // migrationCAMismatch refuses a storage copy between hosts whose migration
 // credentials chain to different migration CAs: QEMU's TLS handshake would
-// fail mid-copy. Either fingerprint unknown (an older build, or none could be
-// read) compares nothing.
-func migrationCAMismatch(vmName, source, sourceCA, target, targetCA string) error {
+// fail mid-copy. sourceCA and targetCA are the compared set digests, either
+// unknown (an older build, or none could be read) comparing nothing;
+// sourceCAs and targetCAs are what the refusal shows.
+func migrationCAMismatch(vmName, source, sourceCA string, sourceCAs []string, target, targetCA string, targetCAs []string) error {
 	if migrationCAsAgree(sourceCA, targetCA) {
 		return nil
 	}
 	return status.Errorf(codes.FailedPrecondition,
 		"refusing to migrate VM %q with a storage copy: the migration-TLS credentials of %s and %s come from "+
-			"different migration CAs (%s: %s, %s: %s), so QEMU's TLS handshake between them would fail. "+
+			"different migration CAs (%s), so QEMU's TLS handshake between them would fail. "+
 			"While `lv host rotate-migration-ca` runs, hosts hold different CA files until it finishes its current "+
 			"phase: retry once it has. Otherwise reissue every host's credentials from one migration CA with "+
 			"`lv host install-migration-tls --reissue` (run where the cluster's migration CA lives)",
-		vmName, source, target, source, sourceCA, target, targetCA)
+		vmName, source, target, migrationCAsShown(source, sourceCA, sourceCAs, target, targetCA, targetCAs))
+}
+
+// migrationCAsShown names each host's migration CAs for an operator: the
+// fingerprints lv doctor migration-tls lists, or, from a build that does not
+// list them, the set digest, marked as one.
+func migrationCAsShown(source, sourceCA string, sourceCAs []string, target, targetCA string, targetCAs []string) string {
+	one := func(host, digest string, list []string) string {
+		if len(list) > 0 {
+			return host + ": " + strings.Join(list, ", ")
+		}
+		return host + ": " + digest + " (digest of its CA set; its build does not list the CAs)"
+	}
+	return one(source, sourceCA, sourceCAs) + "; " + one(target, targetCA, targetCAs)
 }
 
 // migrationCAsAgree reports whether two hosts' migration CAs (fingerprints,
@@ -2724,15 +2749,33 @@ func migrationCAsAgree(a, b string) bool {
 }
 
 // memoryTLSReady is whether a memory-only move to the target that answered
-// ens may use QEMU's own TLS stream: both hosts ready (srcTLS, ens.tlsReady)
-// and their migration CAs agree. A mismatch is not ready, so the move stays
-// in libvirt's tunnel instead of failing QEMU's handshake.
+// ens may use QEMU's own TLS stream: memoryTLSGap has nothing to say.
 func (s *Server) memoryTLSReady(srcTLS bool, ens ensureOutcome) bool {
-	if !srcTLS || !ens.tlsReady {
-		return false
+	return s.memoryTLSGap(srcTLS, ens, "the target") == ""
+}
+
+// memoryTLSGap says why a memory-only move to target, which answered ens,
+// may not use QEMU's own TLS stream, or "" when it may: both hosts ready
+// (srcTLS, ens.tlsReady) and their migration CAs agreeing. A mismatch is not
+// ready, so the move stays in libvirt's tunnel instead of failing QEMU's
+// handshake.
+func (s *Server) memoryTLSGap(srcTLS bool, ens ensureOutcome, target string) string {
+	if !srcTLS {
+		return "this host (" + s.hostName + ") has no usable migration-TLS credentials (`lv host install-migration-tls`)"
+	}
+	if !ens.tlsReady {
+		return target + " has no usable migration-TLS credentials (`lv host install-migration-tls`)"
 	}
 	localCA, err := s.localMigrationCA()
-	return err == nil && migrationCAsAgree(localCA, ens.migrationCA)
+	if err != nil {
+		return fmt.Sprintf("this host (%s) cannot read its own migration CA (%v)", s.hostName, err)
+	}
+	if !migrationCAsAgree(localCA, ens.migrationCA) {
+		return "the two hosts' migration-TLS credentials come from different migration CAs (" +
+			migrationCAsShown(s.hostName, localCA, s.localMigrationCAList(), target, ens.migrationCA, ens.migrationCAs) +
+			"), as while `lv host rotate-migration-ca` finishes a phase; see `lv doctor migration-tls`"
+	}
+	return ""
 }
 
 // ensureOutcome is what the target's EnsureDisks answered.
@@ -2742,6 +2785,9 @@ type ensureOutcome struct {
 	// migrationCA is the fingerprint of the migration CA the target's
 	// credentials chain to (MigrationCAMD), "" when it did not say.
 	migrationCA string
+	// migrationCAs lists the fingerprint of each CA in the target's CA file
+	// (MigrationCAsMD), nil when it did not say. Shown, never compared.
+	migrationCAs []string
 	// tlsUnusable is why the target's migration-TLS credentials are unusable
 	// (MigrationTLSUnusableMD), "" when it did not say.
 	tlsUnusable string
@@ -2858,10 +2904,14 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 	if v := hdr.Get(MigrationCAMD); len(v) > 0 {
 		targetCA = v[0]
 	}
+	var targetCAs []string
+	if v := hdr.Get(MigrationCAsMD); len(v) > 0 && v[0] != "" {
+		targetCAs = strings.Split(v[0], ",")
+	}
 	if v := hdr.Get(MigrationTLSUnusableMD); len(v) > 0 {
 		unusable = v[0]
 	}
-	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), migrationCA: targetCA, tlsUnusable: unusable, remap: remap, migAddr: resp.GetMigrationAddress(), cgroupMode: resp.GetCgroupMode(), vncPasswordUnavailable: resp.GetVncPasswordUnavailable(), netDevices: resp.GetNetworkDevices()}, nil
+	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), migrationCA: targetCA, migrationCAs: targetCAs, tlsUnusable: unusable, remap: remap, migAddr: resp.GetMigrationAddress(), cgroupMode: resp.GetCgroupMode(), vncPasswordUnavailable: resp.GetVncPasswordUnavailable(), netDevices: resp.GetNetworkDevices()}, nil
 }
 
 // olderTargetISORemap points, for a move to an older target, the CD-ROM that

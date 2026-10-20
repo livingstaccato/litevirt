@@ -974,7 +974,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		progress.Error = "target refused: " + aerr.Error()
 		return progress
 	}
-	route := s.chooseMigrationRoute(ctx, vm.Name, target, ens.migAddr, routeMemory, s.memoryTLSReady(srcTLS, ens))
+	route := s.chooseMigrationRoute(ctx, vm.Name, target, ens.migAddr, routeMemory, s.memoryTLSGap(srcTLS, ens, target.Name))
 	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
 	// The VM's own migration policy, as `lv migrate` reads it, its timeout
 	// included (drainLiveMigrate).

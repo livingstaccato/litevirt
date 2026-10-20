@@ -1265,6 +1265,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	migrationTLS := d.migrationTLSInstaller()
 	svc.SetMigrationTLS(migrationTLS)
 	svc.SetMigrationCAFingerprint(func() (string, error) { return pki.MigrationCAFingerprint(d.cfg.PKIDir) })
+	svc.SetMigrationCAList(func() ([]string, error) { return pki.MigrationCAFingerprints(d.cfg.PKIDir) })
 	svc.SetMigrationTLSCheck(d.migrationTLSChecker())
 	svc.SetMigrationTLSStatus(func() *pb.MigrationTLSHostStatus {
 		return migrationTLSStatusRow(pki.InspectMigrationTLS(d.cfg.PKIDir, time.Now()))

@@ -131,6 +131,10 @@ func (v *ClaimVerifier) VerifyAbandonment(a ClaimAbandonment, host, proofID stri
 	if c.Subject.CommonName != host {
 		return fmt.Errorf("abandonment signed with %q's certificate", c.Subject.CommonName)
 	}
+	// As in verifyAccept: a client certificate never speaks for a host.
+	if pki.IsClientOnlyCert(c) {
+		return fmt.Errorf("abandonment signed with a client certificate, not a host's")
+	}
 	if pki.IsCertRevoked(v.pkiDir, c.SerialNumber) {
 		return fmt.Errorf("abandonment certificate %s is revoked", c.SerialNumber.Text(16))
 	}

@@ -1271,12 +1271,43 @@ func diskRow(ctx context.Context, db *corrosion.Client, m UnresolvedMove) (*corr
 }
 
 // pointRow points m's disk row at path, why being the evidence, and writes a
-// health.condition.auto_repoint audit row.
+// health.condition.auto_repoint audit row. A row pointed back at the source
+// gets the source's backing record in the same write, made only while the row
+// is still the one read; a row already on the source without it gets it back
+// before the move is settled, so the record is never cleared while the base
+// the source reads is unreferenced.
 func pointRow(ctx context.Context, db *corrosion.Client, m UnresolvedMove, row *corrosion.DiskRecord, host, path, typ, pool, why string) error {
+	backed := path != m.Dst && (m.SrcBackingDisk != "" || m.SrcBackingImage != "")
 	if row.Path == path {
+		if !backed || row.BackingDisk != "" || row.BackingImage != "" {
+			return nil
+		}
+		after := *row
+		after.BackingDisk, after.BackingImage = m.SrcBackingDisk, m.SrcBackingImage
+		ok, err := corrosion.ReplaceDiskRowIfStill(ctx, db, *row, after)
+		if err == nil && !ok {
+			err = errors.New("the disk row changed while it was being written")
+		}
+		if err != nil {
+			return refuse(m, true, "%s: the disk row of %s names %s, but without its backing record (%s %s), which could not "+
+				"be restored: %v", m.VM, m.Disk, path, m.SrcBackingDisk, m.SrcBackingImage, err)
+		}
+		slog.Warn("move-volume record: restored the source's backing record", "vm", m.VM, "disk", m.Disk, "path", path)
 		return nil
 	}
-	if err := corrosion.UpdateDiskPlacement(ctx, db, m.VM, m.Disk, host, path, typ, pool); err != nil {
+	if backed {
+		after := *row
+		after.HostName, after.Path, after.StorageType, after.StorageVolume = host, path, typ, pool
+		after.BackingDisk, after.BackingImage = m.SrcBackingDisk, m.SrcBackingImage
+		ok, err := corrosion.ReplaceDiskRowIfStill(ctx, db, *row, after)
+		if err == nil && !ok {
+			err = errors.New("the disk row changed while it was being pointed back")
+		}
+		if err != nil {
+			return refuse(m, true, "%s: point the disk row of %s at %s with its backing record (%s %s): %v",
+				m.VM, m.Disk, path, m.SrcBackingDisk, m.SrcBackingImage, err)
+		}
+	} else if err := corrosion.UpdateDiskPlacement(ctx, db, m.VM, m.Disk, host, path, typ, pool); err != nil {
 		return refuse(m, true, "%s: point the disk row of %s at %s: %v", m.VM, m.Disk, path, err)
 	}
 	auditSystem(ctx, db, host, "health.condition.auto_repoint", MoveUnresolvedCode+"/vm/"+m.VM,
@@ -1287,11 +1318,6 @@ func pointRow(ctx context.Context, db *corrosion.Client, m UnresolvedMove, row *
 			if cerr := corrosion.ClearDiskBacking(ctx, db, m.VM, m.Disk, path); cerr != nil {
 				slog.Warn("move-volume record: clearing the moved disk's backing record failed", "vm", m.VM, "disk", m.Disk, "error", cerr)
 			}
-		}
-	} else if m.SrcBackingDisk != "" || m.SrcBackingImage != "" {
-		if rerr := corrosion.RestoreDiskBacking(ctx, db, m.VM, m.Disk, path, m.SrcBackingDisk, m.SrcBackingImage); rerr != nil {
-			return refuse(m, true, "%s: the disk row of %s was pointed back at %s, but its backing record (%s %s) could not be "+
-				"restored: %v", m.VM, m.Disk, path, m.SrcBackingDisk, m.SrcBackingImage, rerr)
 		}
 	}
 	slog.Warn("move-volume record: pointed the disk row at the file holding the guest's writes",

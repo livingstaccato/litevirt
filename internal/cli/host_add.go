@@ -37,6 +37,13 @@ import (
 
 // HostAdd adds a new host to an existing cluster.
 func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostName string, joinPeers []string) error {
+	// The name becomes <pkiDir>/<name>.crt|.key beside the CA: checked first.
+	// Whether it is new (the full rule) is decided from the cluster's hosts
+	// below, before anything is minted here or any machine is dialled; a list
+	// that cannot be read refuses the add.
+	if err := pki.ValidateExistingHostName(hostName); err != nil {
+		return err
+	}
 	// Before anything is generated or pushed, because a failure here must leave the
 	// target untouched.
 	//
@@ -50,6 +57,13 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 			"hosts, so %s would be provisioned with an empty join_peers and never reach the "+
 			"cluster. Check that a daemon is reachable from here (lv host ls), or that this "+
 			"is not the first host — the first one is `lv host init`", hostName)
+	}
+	hostsResp, err := c.ListHosts(ctx, &pb.ListHostsRequest{})
+	if err != nil {
+		return fmt.Errorf("list the cluster's hosts before adding %s: %w", hostName, err)
+	}
+	if err := checkAddName(hostsResp.GetHosts(), hostName); err != nil {
+		return err
 	}
 	pkiDir := PKIDir()
 
@@ -192,6 +206,9 @@ type addFile struct {
 // rolls back, only files that carry its nonce. `lv host rm` removes every
 // attempt's of the serial it revoked.
 func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddPlan) error {
+	if err := pki.ValidateExistingHostName(p.hostName); err != nil {
+		return err
+	}
 	ip := net.ParseIP(p.hostAddr)
 	hostCrt, hostKey := filepath.Join(remotePKIDir, "host.crt"), filepath.Join(remotePKIDir, "host.key")
 
@@ -200,6 +217,9 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 		return fmt.Errorf("list the cluster's hosts before adding %s: %w", p.hostName, err)
 	}
 	hosts := hostsResp.GetHosts()
+	if err := checkAddName(hosts, p.hostName); err != nil {
+		return err
+	}
 	installed, err := remoteSerial(r, hostCrt)
 	if err != nil {
 		return err
@@ -461,6 +481,31 @@ func remoteSerial(r addRemote, path string) (string, error) {
 }
 
 // liveHost is the listed (live) row of name, or nil.
+// checkAddName applies the new-name rule to a name no live host holds; a live
+// row (an add being resumed, or one already finished) keeps the name an older
+// build admitted. A removed name is not listed, so re-adding it is a new name.
+// An add keeps this machine's copies under hosts/<name>/ (keptHostDir), so no
+// name's pair, migration pair included, can be another host's.
+func checkAddName(hosts []*pb.Host, name string) error {
+	if liveHost(hosts, name) == nil {
+		if err := pki.ValidateHostName(name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrationPairCollision is the refusal for host name whose migration pair,
+// <pkiDir>/<name>-migration.crt|.key, is the file host other's own pair is
+// kept in.
+func migrationPairCollision(pkiDir, name, other string) error {
+	crt := filepath.Join(pkiDir, name+"-migration.crt")
+	return fmt.Errorf("host %s's migration pair would be written to %s and %s, which hold host %s's own "+
+		"certificate and key: the two names collide in this machine's PKI directory. Rename one of the "+
+		"two hosts: remove it (`lv host rm %s`) and add it again under another name (`lv host add --name`)",
+		name, crt, strings.TrimSuffix(crt, ".crt")+".key", other, other)
+}
+
 func liveHost(hosts []*pb.Host, name string) *pb.Host {
 	for _, h := range hosts {
 		if h.GetName() == name {
@@ -497,8 +542,12 @@ func refuseAnotherMember(hosts []*pb.Host, p hostAddPlan, installed string) erro
 
 // mintStaged mints hostName's pair, with the CA in pkiDir, into the
 // attempt's directory minted (as host.crt and host.key, whatever the name)
-// and returns its contents and serial.
+// and returns its contents and serial. The name is checked here too: it is
+// the pair's Common Name, and keepLocal keeps the pair under it.
 func mintStaged(pkiDir, minted, hostName string, ip net.IP) ([2][]byte, string, error) {
+	if err := pki.ValidateExistingHostName(hostName); err != nil {
+		return [2][]byte{}, "", err
+	}
 	crt := filepath.Join(minted, "host.crt")
 	key := filepath.Join(minted, "host.key")
 	var pair [2][]byte
@@ -551,9 +600,10 @@ func addOtherFiles(p hostAddPlan, minted string, ip net.IP) ([]addFile, error) {
 const keptHostsDir = "hosts"
 
 // keptHostDir is hostName's directory under pkiDir/hosts, or "" for a name
-// that is not one plain path element.
+// that is not one plain path element (pki.ValidateHostPathName, the rule for
+// every name, new or admitted by an older release, that becomes a path).
 func keptHostDir(pkiDir, hostName string) string {
-	if hostName == "" || hostName == "." || hostName == ".." || strings.ContainsAny(hostName, "/\\\x00") {
+	if pki.ValidateHostPathName(hostName) != nil {
 		return ""
 	}
 	return filepath.Join(pkiDir, keptHostsDir, hostName)

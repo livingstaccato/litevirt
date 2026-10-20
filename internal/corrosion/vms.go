@@ -1965,15 +1965,6 @@ func ClearDiskBacking(ctx context.Context, c *Client, vmName, diskName, path str
 	return setDiskBacking(ctx, c, vmName, diskName, path, "", "")
 }
 
-// RestoreDiskBacking is ClearDiskBacking's inverse: disk (vmName, diskName),
-// pointed back at path, an overlay whose backing record a move cleared, gets
-// that record back, so the base it reads is again counted as referenced.
-// Written the same way: only while the row names path and is still the one
-// read, in InsertDisk's whole-row shape.
-func RestoreDiskBacking(ctx context.Context, c *Client, vmName, diskName, path, backingDisk, backingImage string) error {
-	return setDiskBacking(ctx, c, vmName, diskName, path, backingDisk, backingImage)
-}
-
 func setDiskBacking(ctx context.Context, c *Client, vmName, diskName, path, backingDisk, backingImage string) error {
 	var cur DiskRecord
 	found := false

@@ -24,6 +24,7 @@ import (
 	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/hooks"
 	"github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/placement"
 	"github.com/litevirt/litevirt/internal/randid"
 )
@@ -1877,6 +1878,25 @@ func (s *Server) removeHostRefusal(ctx context.Context, req *pb.RemoveHostReques
 	return h, key, nil
 }
 
+// checkAdmitName applies the new-name rule (pki.ValidateHostName) to a name
+// no live host holds. A live row is an add being resumed under a name an
+// older build admitted, which keeps it if `lv host add` can keep its pair
+// (pki.ValidateExistingHostName). A removed name is admitted as a new one.
+func (s *Server) checkAdmitName(ctx context.Context, name string) error {
+	rows, err := s.db.Query(ctx, `SELECT name FROM hosts WHERE name = ? AND deleted_at IS NULL`, name)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "read the host row for %s: %v", name, err)
+	}
+	check := pki.ValidateHostName
+	if len(rows) > 0 {
+		check = pki.ValidateExistingHostName
+	}
+	if err := check(name); err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	return nil
+}
+
 // admitGRPCPort is the gRPC port AdmitHost records for an admitted host.
 const admitGRPCPort = 7443
 
@@ -1921,6 +1941,9 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.A
 	}
 	if req.Name == "" || req.Address == "" || req.CertSerial == "" {
 		return nil, status.Error(codes.InvalidArgument, "name, address, and certificate serial are required")
+	}
+	if err := s.checkAdmitName(ctx, req.Name); err != nil {
+		return nil, err
 	}
 	// One machine, one name: an address another live or joining host is
 	// dialled at belongs to that host. Checked here, not only by `lv host

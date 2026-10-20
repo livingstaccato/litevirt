@@ -787,9 +787,10 @@ lv replication promote web-1 --accept-not-point-in-time   # a replica recorded a
 ```
 
 A split-brain guard refuses to take over the name unless the original's host
-is fenced or removed: a host that is active, draining, in maintenance,
-upgrading or offline may still run it (`lv host fence <host>`, or
-`lv host fence-confirm <host>` once it is powered off; `--force` overrides). The same action is on the VM detail page
+is proven fenced or removed (a proof-grade fence: an IPMI power-off, or
+`lv host fence-confirm <host>` once it is powered off) or is no longer in the
+cluster. Any other host may still run it, a fence that is not proof-grade
+among them (`lv host fence <host>`; `--force` overrides). The same action is on the VM detail page
 ("Promote replica").
 
 **Every disk with a replica is recovered**, manual or automatic: the root from

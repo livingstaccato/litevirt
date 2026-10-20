@@ -77,6 +77,22 @@ func TestPromote_ABestEffortFencedOwnerNeverGetsTheSharedDisk(t *testing.T) {
 					for _, r := range c.rows {
 						recordOwnerFence(t, s, r.id, r.method, r.result, r.age)
 					}
+					if !force {
+						// Without --force the split-brain guard refuses the
+						// takeover first, on the same verdict (ccguard
+						// review I2): nothing is promoted.
+						ctx := adminCtx()
+						if relayed {
+							ctx = relayedAdmin(t, s, "entry-node")
+						}
+						err := s.PromoteReplica(&pb.PromoteReplicaRequest{VmName: "db", TargetPool: "dr", NoLocalize: true},
+							&streamRecorder[pb.PromoteReplicaProgress]{ctx: ctx})
+						if err == nil || !strings.Contains(err.Error(), "not proven powered off") ||
+							!strings.Contains(err.Error(), "lv host fence-confirm dead-host") {
+							t.Fatalf("PromoteReplica without --force = %v; want the split-brain refusal naming the remedy", err)
+						}
+						return
+					}
 					promoteVia(t, s, relayed, force)
 					assertSharedUnattached(t, s, nfsDisk, "dead-host is fenced, but not proven powered off")
 					if p := eventDetail(t, s, "db", vmEventPromotedPartial); !strings.Contains(p, "lv host fence-confirm dead-host") {

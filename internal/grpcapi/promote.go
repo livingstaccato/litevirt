@@ -2129,10 +2129,12 @@ func longestCronGap(expr string) (time.Duration, bool) {
 
 // promoteSplitBrainRefusal is the split-brain guard of a promotion of vm to
 // targetName. A same-name takeover without --force goes ahead only when the
-// original's host is shown unable to run it: recorded fenced or removed, or no
-// longer a member (no live row).
-// Any other state, draining, maintenance, upgrading and offline among them,
-// may still run the guest, and a takeover then would double-run the VM.
+// original's host is shown unable to run it: no longer a member (no live
+// row), or proven powered off the way a shared disk's owner is
+// (corrosion.SharedDiskOwnerProvedOff and SharedDiskOwnerVerdict: fenced or
+// removed over a proof-grade fence). Any other host may still run the guest,
+// a fence that is not proof-grade among them, and a takeover then would
+// double-run the VM.
 // A promotion to a new name never replaces another VM, --force or not:
 // --force is for a same-name takeover of a VM still on a host that may run
 // it. With it, a rename onto a live VM's name stopped and undefined that
@@ -2159,11 +2161,20 @@ func (s *Server) promoteSplitBrainRefusal(ctx context.Context, vm *corrosion.VMR
 				"promote of %s: whether its host %s is still healthy cannot be read (%v); nothing was changed; retry",
 				vm.Name, vm.HostName, err)
 		}
-		if h != nil && h.State != "fenced" && h.State != "removed" {
+		if h == nil {
+			return nil // no longer a member
+		}
+		_, provedOff, perr := corrosion.SharedDiskOwnerProvedOff(ctx, s.db, vm.HostName)
+		if perr != nil {
+			return status.Errorf(codes.Unavailable,
+				"promote of %s: whether its host %s is proven powered off cannot be read (%v); nothing was changed; retry",
+				vm.Name, vm.HostName, perr)
+		}
+		if ok, why := corrosion.SharedDiskOwnerVerdict(vm.HostName, h, provedOff, nil); !ok {
 			return status.Errorf(codes.FailedPrecondition,
-				"vm %q still owned by host %q, which is %s and may still run it; fence it (`lv host fence %s`, or "+
+				"vm %q may still run on its host: %s; fence it (`lv host fence %s`, or "+
 					"`lv host fence-confirm %s` once it is powered off) or pass --force/--new-name to avoid split-brain",
-				vm.Name, vm.HostName, h.State, vm.HostName, vm.HostName)
+				vm.Name, why, vm.HostName, vm.HostName)
 		}
 	}
 	return nil

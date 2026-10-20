@@ -58,6 +58,9 @@ func seedPromotableVM(t *testing.T, s *Server, ownerHost, ownerState, project st
 		}); err != nil {
 			t.Fatalf("InsertHost(%s): %v", ownerHost, err)
 		}
+		if ownerState == "fenced" {
+			proveFencedOff(t, s, ownerHost)
+		}
 	}
 	seedReplica(t, poolDir, project, "vm1", "root", "20260101-000000", "raw", 1<<20)
 	return poolDir

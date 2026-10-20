@@ -154,6 +154,7 @@ func insertLimitedVM1(t *testing.T, s *Server) {
 	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "dead-host", Address: "10.0.0.66", State: "fenced"}); err != nil {
 		t.Fatal(err)
 	}
+	proveFencedOff(t, s, "dead-host")
 	if err := corrosion.InsertProject(ctx, s.db, corrosion.ProjectRecord{Name: "acme"}); err != nil {
 		t.Fatal(err)
 	}

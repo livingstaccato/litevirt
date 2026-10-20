@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -54,11 +55,22 @@ func TestPromoteSplitBrainRefusal_UnreadableReadRefusesAsRetryable(t *testing.T)
 	}
 }
 
+// proveFencedOff records a proof-grade fence of host (an IPMI power-off).
+func proveFencedOff(t *testing.T, s *Server, host string) {
+	t.Helper()
+	if err := corrosion.InsertFenceLog(context.Background(), s.db, corrosion.FenceLogRecord{
+		ID: "ipmi-" + host, HostName: host, Method: "ipmi", Result: "fenced",
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // promoteSameName runs an operator's same-name promote of db (no --force)
-// whose owner dead-host is recorded ownerState. With hide, a shut-off domain
+// whose owner dead-host is recorded ownerState ("" for no host row), with a
+// proof-grade fence of it on record when proved. With hide, a shut-off domain
 // db is defined here and that table is hidden at the promotion's DomainState
 // read of it, the last call before the split-brain guard.
-func promoteSameName(t *testing.T, ownerState, hide string) (error, *libvirtfake.Fake) {
+func promoteSameName(t *testing.T, ownerState string, proved bool, hide string) (error, *libvirtfake.Fake) {
 	t.Helper()
 	s := testServer(t)
 	poolDir := setPromoteVMRows(t, s, "db", nil)
@@ -69,6 +81,9 @@ func promoteSameName(t *testing.T, ownerState, hide string) (error, *libvirtfake
 		}); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if proved {
+		proveFencedOff(t, s, "dead-host")
 	}
 	fake := s.virt.(*libvirtfake.Fake)
 	if hide != "" {
@@ -98,41 +113,51 @@ func promoteSameName(t *testing.T, ownerState, hide string) (error, *libvirtfake
 // Mutation: the GetHost error ignored — the promotion goes on and fails
 // elsewhere, not Unavailable from the guard, red.
 func TestPromoteReplica_SameNameOwnerUnreadableRefusesAsRetryable(t *testing.T) {
-	err, _ := promoteSameName(t, "active", "hosts")
+	err, _ := promoteSameName(t, "active", false, "hosts")
 	if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "still healthy cannot be read") {
 		t.Fatalf("promote with hosts unreadable = %v; want Unavailable from the split-brain guard", err)
 	}
 }
 
 // A same-name promote without --force goes ahead only when the original's
-// host is fenced or removed. Every other state may still run the guest:
-// `lv host drain` records draining while its VMs still run there, and
-// maintenance, upgrading and offline hosts can be alive (ccguard review I2).
+// host is no longer a member, or proven powered off the way a shared disk's
+// owner is: fenced or removed over a proof-grade fence. Every other host may
+// still run the guest: `lv host drain` records draining while its VMs still
+// run there, maintenance, upgrading and offline hosts can be alive, and a
+// fence that is not proof-grade (a manual or stale one) can leave the guest
+// running (ccguard review I2, round 2).
 //
-// Mutation: refuse only an active owner (the rule before) — db starts here
-// beside a draining, maintenance, upgrading or offline owner, red.
-func TestPromoteReplica_SameNameRefusedUnlessOwnerFencedOrRemoved(t *testing.T) {
-	for _, st := range []string{"active", "draining", "maintenance", "upgrading", "offline", "joining"} {
-		t.Run(st, func(t *testing.T) {
-			err, fake := promoteSameName(t, st, "")
-			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "may still run it") ||
+// Mutations: refuse only an active owner (the rule before round 1) — db
+// starts beside a live owner, red; accept a recorded fenced or removed state
+// without its proof (round 1) — the unproven cases are not refused, red.
+func TestPromoteReplica_SameNameRefusedUnlessOwnerProvenOff(t *testing.T) {
+	for _, c := range []struct {
+		state  string
+		proved bool
+	}{
+		{"active", false}, {"draining", false}, {"maintenance", false}, {"upgrading", false},
+		{"offline", false}, {"joining", false}, {"fenced", false}, {"removed", false},
+		{"active", true}, {"draining", true},
+	} {
+		t.Run(fmt.Sprintf("%s proved=%v", c.state, c.proved), func(t *testing.T) {
+			err, fake := promoteSameName(t, c.state, c.proved, "")
+			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "may still run on its host") ||
 				!strings.Contains(err.Error(), "lv host fence") {
-				t.Fatalf("promote with owner %s = %v; want FailedPrecondition naming the way out", st, err)
+				t.Fatalf("promote with owner %s (proved %v) = %v; want FailedPrecondition naming the way out", c.state, c.proved, err)
 			}
 			if raw, _ := fake.RawState("db"); raw == libvirtfake.StateRunning {
-				t.Fatalf("db started here while its owner is %s", st)
+				t.Fatalf("db started here while its owner is %s (proved %v)", c.state, c.proved)
 			}
 		})
 	}
-	for _, st := range []string{"fenced", "removed", ""} {
-		name := st
-		if name == "" {
-			name = "no host row"
-		}
-		t.Run(name, func(t *testing.T) {
-			err, _ := promoteSameName(t, st, "")
-			if err != nil && (status.Code(err) == codes.FailedPrecondition && strings.Contains(err.Error(), "may still run it")) {
-				t.Fatalf("promote with owner %s refused by the split-brain guard: %v", name, err)
+	for _, c := range []struct {
+		state  string
+		proved bool
+	}{{"fenced", true}, {"removed", true}, {"", false}} {
+		t.Run(fmt.Sprintf("%q proved=%v", c.state, c.proved), func(t *testing.T) {
+			err, _ := promoteSameName(t, c.state, c.proved, "")
+			if err != nil && strings.Contains(err.Error(), "may still run on its host") {
+				t.Fatalf("promote with owner %q (proved %v) refused by the split-brain guard: %v", c.state, c.proved, err)
 			}
 		})
 	}

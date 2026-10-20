@@ -189,30 +189,10 @@ func IsCredentialsInvalidText(installErr string) bool {
 // qemuDir that holds files litevirt did not put there: that directory is
 // libvirt's default and an operator may already use it.
 func InstallQemuMigrationTLS(pkiDir, qemuDir string, keyUID, keyGID int) (bool, error) {
-	src := MigrationDir(pkiDir)
-	var ca, cert, key []byte
-	for _, f := range []struct {
-		name string
-		dst  *[]byte
-	}{{MigrationCAName, &ca}, {MigrationHostCertName, &cert}, {MigrationHostKeyName, &key}} {
-		data, err := os.ReadFile(filepath.Join(src, f.name))
-		if errors.Is(err, fs.ErrNotExist) {
-			return false, nil
-		}
-		if err != nil {
-			// A directory where the file should be, or a file that cannot be
-			// read: the set is there and unusable, which reissuing fixes.
-			return false, fmt.Errorf("%w: read migration credential %s: %v", ErrInvalidMigrationCredentials, f.name, err)
-		}
-		*f.dst = data
+	ca, cert, key, err := readValidMigrationSet(pkiDir)
+	if err != nil || ca == nil {
+		return false, err
 	}
-	// QEMU parses these only when a migration opens its TLS channel, so a set
-	// it cannot use failed mid-copy with a generic error. Check it here, before
-	// anything is written, and report the host not ready.
-	if _, _, err := ValidateMigrationCredentials(ca, cert, key, time.Now()); err != nil {
-		return false, fmt.Errorf("%w: %w", ErrCredentialsInvalid, err)
-	}
-
 	if err := claimQemuTLSDir(qemuDir); err != nil {
 		return false, err
 	}
@@ -244,6 +224,60 @@ func InstallQemuMigrationTLS(pkiDir, qemuDir string, keyUID, keyGID int) (bool, 
 		}
 	}
 	return true, nil
+}
+
+// readValidMigrationSet reads this host's migration-credential set from
+// pkiDir/migration and validates it. None of the three files is no set and no
+// error (nil ca). Some but not all of them is a set mid-push, which is
+// unusable until the push finishes: ErrInvalidMigrationCredentials, so a
+// storage copy is refused rather than sent in plaintext under the opt-in.
+func readValidMigrationSet(pkiDir string) (ca, cert, key []byte, err error) {
+	src := MigrationDir(pkiDir)
+	var missing []string
+	for _, f := range []struct {
+		name string
+		dst  *[]byte
+	}{{MigrationCAName, &ca}, {MigrationHostCertName, &cert}, {MigrationHostKeyName, &key}} {
+		data, rerr := os.ReadFile(filepath.Join(src, f.name))
+		if errors.Is(rerr, fs.ErrNotExist) {
+			missing = append(missing, f.name)
+			continue
+		}
+		if rerr != nil {
+			// A directory where the file should be, or a file that cannot be
+			// read: the set is there and unusable, which reissuing fixes.
+			return nil, nil, nil, fmt.Errorf("%w: read migration credential %s: %v", ErrInvalidMigrationCredentials, f.name, rerr)
+		}
+		*f.dst = data
+	}
+	switch len(missing) {
+	case 3:
+		return nil, nil, nil, nil
+	case 0:
+	default:
+		return nil, nil, nil, fmt.Errorf("%w: incomplete set, missing %s (a credential push may be in progress)",
+			ErrInvalidMigrationCredentials, strings.Join(missing, ", "))
+	}
+	// QEMU parses these only when a migration opens its TLS channel, so a set
+	// it cannot use failed mid-copy with a generic error. Check it here, before
+	// anything is written, and report the host not ready.
+	if _, _, verr := ValidateMigrationCredentials(ca, cert, key, time.Now()); verr != nil {
+		return nil, nil, nil, fmt.Errorf("%w: %w", ErrCredentialsInvalid, verr)
+	}
+	return ca, cert, key, nil
+}
+
+// CheckQemuMigrationTLS answers what InstallQemuMigrationTLS would, the same
+// way, and writes nothing: the set under pkiDir/migration must be complete
+// and valid, and qemuDir absent, empty, or already litevirt's. An absent set
+// is nil, as the installer's (false, nil) is. MigrationTLSStatus reports this,
+// so a status call never changes /etc/pki/qemu.
+func CheckQemuMigrationTLS(pkiDir, qemuDir string) error {
+	if _, _, _, err := readValidMigrationSet(pkiDir); err != nil {
+		return err
+	}
+	_, err := checkQemuTLSDir(qemuDir)
+	return err
 }
 
 // ValidateMigrationCredentials checks a migration-credential set the way QEMU
@@ -349,29 +383,48 @@ func parsePEMCertificate(data []byte) (*x509.Certificate, error) {
 	return x509.ParseCertificate(block.Bytes)
 }
 
-// claimQemuTLSDir makes qemuDir litevirt's: creates it if absent, accepts it if
-// it is empty or already carries the marker, and refuses anything else.
-func claimQemuTLSDir(qemuDir string) error {
+// checkQemuTLSDir reports whether qemuDir exists, and refuses one that holds
+// files litevirt did not put there. It writes nothing.
+func checkQemuTLSDir(qemuDir string) (exists bool, err error) {
 	entries, err := os.ReadDir(qemuDir)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		if err := os.MkdirAll(qemuDir, 0o755); err != nil {
-			return fmt.Errorf("create %s: %w", qemuDir, err)
-		}
+		return false, nil
 	case err != nil:
-		return fmt.Errorf("read %s: %w", qemuDir, err)
+		return false, fmt.Errorf("read %s: %w", qemuDir, err)
 	case len(entries) > 0:
 		if _, err := os.Stat(filepath.Join(qemuDir, qemuTLSManagedMarker)); err != nil {
-			return fmt.Errorf("%s already holds files litevirt did not put there; refusing to "+
+			return true, fmt.Errorf("%s already holds files litevirt did not put there; refusing to "+
 				"overwrite them, so storage migrations from or to this host stay unencrypted. "+
 				"Move them aside (or point qemu.conf's migrate_tls_x509_cert_dir elsewhere for "+
 				"them) and restart the litevirt daemon", qemuDir)
 		}
 	}
+	return true, nil
+}
+
+// qemuTLSMarkerNote is the marker's content.
+var qemuTLSMarkerNote = []byte("Managed by litevirt: migration TLS credentials, rewritten from " +
+	"pki_dir/migration at daemon start. Do not edit.\n")
+
+// claimQemuTLSDir makes qemuDir litevirt's: creates it if absent, accepts it if
+// it is empty or already carries the marker, and refuses anything else. The
+// marker is written only when it is missing or differs.
+func claimQemuTLSDir(qemuDir string) error {
+	exists, err := checkQemuTLSDir(qemuDir)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		if err := os.MkdirAll(qemuDir, 0o755); err != nil {
+			return fmt.Errorf("create %s: %w", qemuDir, err)
+		}
+	}
 	marker := filepath.Join(qemuDir, qemuTLSManagedMarker)
-	note := []byte("Managed by litevirt: migration TLS credentials, rewritten from " +
-		"pki_dir/migration at daemon start. Do not edit.\n")
-	if err := secretfile.Write(marker, note, 0o444); err != nil {
+	if upToDate(marker, qemuTLSMarkerNote, 0o444, -1, -1) {
+		return nil
+	}
+	if err := secretfile.Write(marker, qemuTLSMarkerNote, 0o444); err != nil {
 		return fmt.Errorf("mark %s as managed: %w", qemuDir, err)
 	}
 	return nil

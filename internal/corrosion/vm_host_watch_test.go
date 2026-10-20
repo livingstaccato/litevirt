@@ -80,3 +80,24 @@ func TestVMHostWatch_AStateSyncIsUnknown(t *testing.T) {
 		t.Fatalf("seen %v, want vm1 unknown", got)
 	}
 }
+
+// With nothing watched, an applied entry costs the watch nothing: no
+// statement of it is parsed (round-13c review m1).
+//
+// Mutation: parse the entry's statements before asking what is watched — red.
+func TestVMHostWatch_NothingWatchedParsesNothing(t *testing.T) {
+	ctx := context.Background()
+	a, b := testClient(t), testClient(t)
+	rb := NewReplicator(b, "", RelayConfig{})
+	b.SetVMHostWatch(func() []string { return nil }, func(string, string, int64, bool) {
+		t.Error("seen called with nothing watched")
+	})
+	if err := InsertVM(ctx, a, VMRecord{Name: "vm1", HostName: "host-a", Spec: "{}", State: "running"}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	before := vmHostWatchParses.Load()
+	applyWAL(t, rb, walEntries(t, a, "node-a"))
+	if n := vmHostWatchParses.Load() - before; n != 0 {
+		t.Fatalf("the idle watch parsed %d statements", n)
+	}
+}

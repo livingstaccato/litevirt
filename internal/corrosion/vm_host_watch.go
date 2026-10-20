@@ -4,7 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sync/atomic"
 )
+
+// vmHostWatchParses counts the statements the watch has parsed, for a test
+// that the idle watch parses none.
+var vmHostWatchParses atomic.Int64
 
 // vmHostWatch is a local observer of the VM rows replication applies here:
 // after each applied entry that wrote the vms table, it is told the owner and
@@ -36,8 +41,14 @@ func (c *Client) noteVMHostsInTx(ctx context.Context, tx *sql.Tx, stmts []Statem
 	if w == nil {
 		return
 	}
+	// Nothing watched is the common case: no statement is parsed for it.
+	watched := w.watched()
+	if len(watched) == 0 {
+		return
+	}
 	touches := false
 	for _, s := range stmts {
+		vmHostWatchParses.Add(1)
 		if structuralTableLabel(s.SQL) == "vms" {
 			touches = true
 			break
@@ -46,7 +57,7 @@ func (c *Client) noteVMHostsInTx(ctx context.Context, tx *sql.Tx, stmts []Statem
 	if !touches {
 		return
 	}
-	for _, vm := range w.watched() {
+	for _, vm := range watched {
 		var host string
 		var epoch int64
 		err := tx.QueryRowContext(ctx, `SELECT host_name, vm_owner_epoch FROM vms WHERE name = ? AND deleted_at IS NULL`, vm).Scan(&host, &epoch)

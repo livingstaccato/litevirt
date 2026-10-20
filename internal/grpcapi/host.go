@@ -1747,7 +1747,20 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*pb
 	// is still the admission the checks above passed: a removal and a
 	// re-admission of the name, or a certificate renewal, may have landed
 	// since, and the new machine is not this removal's to delete.
-	applied, err := corrosion.DeleteHostIf(ctx, s.db, req.Name, h.CertSerial, key)
+	//
+	// Once the release token has latched, every host this one replicates to
+	// knows the removal that names the certificate serial it ends, so a
+	// receiver that holds a later admission of the name never ends it
+	// (corrosion.DeleteHostAdmissionIf). Before, the previous shape, which
+	// every receiver applies as it always has. A row that records no serial
+	// (the schema allows '') has none to name, and is removed in the previous
+	// shape too.
+	var applied bool
+	if s.ReleaseTokenLatched() && h.CertSerial != "" {
+		applied, err = corrosion.DeleteHostAdmissionIf(ctx, s.db, req.Name, h.CertSerial, key)
+	} else {
+		applied, err = corrosion.DeleteHostIf(ctx, s.db, req.Name, h.CertSerial, key)
+	}
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "delete host: %v", err)
 	}

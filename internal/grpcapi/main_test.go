@@ -2,9 +2,12 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"hash/fnv"
 	"net/netip"
 	"os"
+	"runtime"
+	"runtime/pprof"
 	"testing"
 
 	"golang.org/x/crypto/bcrypt"
@@ -37,5 +40,33 @@ func TestMain(m *testing.M) {
 		v := h.Sum32()
 		return []netip.Addr{netip.AddrFrom4([4]byte{198, 18 + byte(v>>16)&1, byte(v >> 8), byte(v)})}, nil
 	})
-	os.Exit(m.Run())
+	code := m.Run()
+	dumpLeakProfile()
+	os.Exit(code)
+}
+
+// dumpLeakProfile writes the goroutineleak profile (debug=1) to $LEAK_OUT.
+func dumpLeakProfile() {
+	out := os.Getenv("LEAK_OUT")
+	if out == "" {
+		return
+	}
+	p := pprof.Lookup("goroutineleak")
+	if p == nil {
+		fmt.Fprintln(os.Stderr, "LEAKPROFILE: profile unavailable (GOEXPERIMENT missing)")
+		return
+	}
+	runtime.GC()
+	f, err := os.Create(out)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "LEAKPROFILE:", err)
+		return
+	}
+	defer f.Close()
+	_ = p.WriteTo(f, 1)
+	if g, err := os.Create(out + ".d2"); err == nil {
+		_ = p.WriteTo(g, 2)
+		g.Close()
+	}
+	fmt.Fprintf(os.Stderr, "LEAKPROFILE: count=%d file=%s\n", p.Count(), out)
 }

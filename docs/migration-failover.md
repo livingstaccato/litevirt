@@ -98,6 +98,33 @@ migration-TLS credentials:
   the first, and every storage migration with the new host would fail its TLS
   handshake. Copy `migration-ca.crt` and `migration-ca.key` (mode 0600) from the
   machine that holds them, or run the command there.
+- Before the copy, the source compares the fingerprint of the migration CA its
+  credentials chain to with the target's, and refuses a mismatch, naming both
+  hosts and both fingerprints, instead of failing at the TLS handshake
+  mid-copy. `migration.allow_unencrypted_storage` does not excuse it. Reissue
+  every host's credentials from one CA with
+  `lv host install-migration-tls --reissue`. A target on an older build does
+  not report its CA, and nothing is compared. A source that cannot read its
+  own migration CA refuses the copy, naming the error and the same command.
+- A host whose credentials cannot be used (a CA that is not a certificate or
+  not a file, a host certificate the CA did not issue, a key that is not the
+  certificate's) is not ready for migration TLS, and its daemon installs
+  nothing for QEMU. A storage copy from or to it is refused before it starts,
+  naming the host, why, and `lv host install-migration-tls --reissue`, whatever
+  `migration.allow_unencrypted_storage` says. A target in that state refuses
+  a storage copy that asks for TLS outright, so a source on an older build
+  fails closed rather than falling back to plaintext. Every certificate of
+  the CA file is read (an old and a new CA during a rotation), and an expired
+  or not-yet-valid certificate counts as unusable. The source and the target
+  compare their CA files as sets: a rotation bundle listed in another order on
+  another host compares equal, and a CA listed twice counts once; hosts with
+  different sets of CAs are refused as holding different migration CAs.
+  During a rotation, a host that holds the old and the new CA and one that
+  still holds only the old hold different sets: storage copies between them
+  are refused, and memory-only moves stay in libvirt's tunnel. Storage copies
+  work again once every host holds the same CA file: the same bundle on every
+  host, or credentials reissued on every host from one CA with
+  `lv host install-migration-tls --reissue`.
 - Each daemon installs its host's credentials into `/etc/pki/qemu`, with the key
   readable only by the QEMU user, at start and again before each storage
   migration, so no restart is needed. It refuses to touch `/etc/pki/qemu` if
@@ -181,7 +208,9 @@ off it in the clear:
 - A memory-only move normally rides inside libvirt's tunnel on the cluster
   address. To use the migration network it leaves the tunnel for QEMU's own
   stream, which is used only when both hosts hold migration-TLS credentials
-  (`lv host install-migration-tls`); otherwise the move stays in the tunnel.
+  (`lv host install-migration-tls`) from the same migration CA; otherwise the
+  move stays in the tunnel. A target on an older build does not report its
+  CA, and nothing is compared.
 - A storage copy uses the network only when it is encrypted (migration TLS on
   both hosts). A copy you allowed unencrypted with
   `migration.allow_unencrypted_storage` stays on the cluster address, as it
@@ -340,7 +369,12 @@ ownership of the VM. If any step before it fails, or the client goes away,
 the VM stays on the source, stopped. The target removes the disk copies and
 the domain that this attempt created there, and nothing else. A file the target
 already has at a disk's path, which this migration did not create, is refused
-rather than overwritten, as for `--with-storage`.
+rather than overwritten, as for `--with-storage`. Until every host runs a release
+that keeps the VM's placement generation (a cluster mid-upgrade), the target
+cannot tell a copy this attempt made from a file an earlier move left there:
+it treats every file at a disk's path as one it did not create, so a failed
+attempt's copies stay on the target and a retry is refused naming each one.
+Move each aside as the refusal says, then migrate again.
 
 A stopped VM is refused when:
 
@@ -437,18 +471,71 @@ policy (bandwidth, auto-converge, maximum downtime) applies, and the
 `pre_migrate`/`post_migrate` hooks run: `post_migrate` runs once, naming the
 host the VM ended on — the target after the live move or after a cold move
 that a failed live attempt fell back to, or the drained host when the VM
-stayed there. Unlike `lv migrate`, a drain's live move applies no
-`timeout-sec`: it runs until libvirt finishes or fails it (bounding it is a
-tracked follow-up). A Secure Boot / vTPM VM's live firmware move is the
-exception: it is `lv migrate`'s move, and applies it. After the cut-over the source's
-cloud-init ISO is removed and DNS, load-balancer backends and VXLAN
-forwarding entries follow the VM, as for a migration. A live attempt that
-fails takes back the cloud-init ISO it put on the target before the cold move
-is tried. (Builds before this put no ISO on the target, so every cloud-init
-VM's live drain failed and fell back to the cold move.)
+stayed there. A live move that outlives the VM's migration policy
+`timeout-sec` is aborted, as `lv migrate` aborts one, and is not followed by a
+cold move: the VM keeps running on the drained host, its result says so, and
+the drain goes on with the other VMs and ends incomplete, naming it. The host
+carries `drain_move_timed_out` (see [Diagnostics](diagnostics.md)) until a
+drain of it has no such move or `lv host undrain` runs. A Secure Boot / vTPM
+VM's live firmware move is `lv migrate`'s move, and applies `timeout-sec` as
+`lv migrate` does. A move that libvirt
+completed before the abort took is recorded on the target, as any completed
+move. While a live move runs, the VM's record says `migrating`, as for
+`lv migrate`. If libvirt does not answer the abort within 2 minutes, the drain
+goes on without it: the move is finished in the background, which keeps the
+VM's lock and the target's capacity reservation until libvirt ends it, then
+records the VM on whichever host it ended on and runs `post_migrate` naming
+it. No cold move is tried while the move can still complete, and a drain run
+meanwhile skips the VM. A move that completes in the background is recorded
+for failback like any other. Watch it with `lv events <vm>`. A drain whose
+client goes away (Ctrl-C) does not stop a move it has started: a live or cold
+move runs to its end, moved or rolled back, and one that completes afterwards
+is recorded on its target. VMs not yet started are left where they are. The
+drained host's audit log records the drain as `cancelled` with each VM's
+outcome (`lv audit`), and each VM gets a `vm.drain` event. A VM whose lock
+another operation holds (a scheduled snapshot, a replication run) is waited
+for, up to 10 minutes, then skipped, naming the operation that holds it.
+
+Parts of a started move are bounded. A cold move's disk copy that the target
+stops taking (alive but wedged) for 5 minutes is aborted, and so is its check
+of the target that goes unanswered as long, and so is a copy whose target does
+not answer within 5 minutes of the last of the disk. The target syncs the disk
+every 64 MiB as it writes, so its sync after the last frame is no larger than
+one during the copy. An aborted copy rolls the move back: the VM is started
+again on the drained host, where its record still names it. Peers also detect
+a host that stops answering during a call within about 6 minutes (gRPC
+keepalive). The move's other calls to the target (its firmware state, the
+hand-over) are not bounded by a timeout. To end any drain move without
+restarting the daemon, run `lv operation abort <vm> --force` (on any host; it
+is forwarded to the VM's host): it cancels the move. A cold move rolls back
+the same way. A live move's libvirt migration job is aborted, with or without
+a migration policy timeout, and the VM keeps running on the drained host,
+never followed by a cold move; if libvirt had already cut the VM over, it runs
+on the target only and is recorded there. A move the daemon recovers after a
+restart copies nothing: it starts the VM on the target when the hand-over had
+committed, and otherwise leaves it running, or starts it again, here. So it is
+not in that registry and needs no abort.
+
+After the cut-over the source's cloud-init ISO is removed and DNS,
+load-balancer backends and VXLAN forwarding entries follow the VM, as for a
+migration. A live attempt that
+fails takes back the cloud-init ISO and any disk stubs it put on the target
+before the cold move is tried. (Builds before this put no ISO on the target,
+so every cloud-init VM's live drain failed and fell back to the cold move.)
+
+During a rolling upgrade, until every host runs a release that keeps the
+VM's placement generation, the target cannot prove that a file is this
+attempt's, so it takes nothing back: the ISO and any disk stub stay on the
+target. The ISO is written again by the next attempt, but a disk stub is not:
+the cold move that follows is refused at it, naming the file, and the VM
+stays on the drained host. Move each named file aside as the refusal says,
+then run `lv host drain` again. A failed `lv migrate --with-storage` or
+`lv migrate --cold` leaves its files the same way, and its retry is refused
+the same way.
 
 A VM that drain cannot move stays on the host with its disks; a failed attempt
-removes what it put on the target. It is never moved without its disks:
+removes what it put on the target (during a rolling upgrade, see above). It is
+never moved without its disks:
 
 - refused before the shutdown, it keeps running;
 - a move that fails after the shutdown starts it again on the host, once its
@@ -1744,7 +1831,10 @@ never removes it on its own. While that VM is in `error`, `pending` or
 back. Once the VM is deleted, its copies are removed by their host when they
 are older than `superseded_disk_retention_days` (default 7 days; `0` keeps
 every copy). The host checks hourly; the age comes from the time in the file
-name. Before this rule a copy was held only while its VM was in `error`,
+name. Until then `lv host superseded-disks <host>` lists a deleted VM's
+copy with its VM shown as `<vm> (deleted)`, a copy in a directory only
+deleted VMs' disks used (a pool directory, say) included, and `--remove
+<copy>` removes it. Before this rule a copy was held only while its VM was in `error`,
 `pending` or `starting`, so seven days after the VM was running again on a
 rebuilt disk the only copy of its data from before the failover was deleted.
 

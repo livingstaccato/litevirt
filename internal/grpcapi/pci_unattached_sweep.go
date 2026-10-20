@@ -94,7 +94,7 @@ func (s *Server) sweepUnattachedForVM(ctx context.Context, vmName string, addrs 
 	if vm.HostName != s.hostName {
 		return skip("the VM lives on another host")
 	}
-	unlock, ok := s.tryLockVM(vmName)
+	unlock, ok := s.tryLockVMAs(vmName, "PCI sweep")
 	if !ok {
 		return skip("the VM is locked by an operation in progress")
 	}

@@ -214,7 +214,7 @@ func resetAdminStatements(ctx context.Context, c *Client, g capabilities.Feature
 				"cannot open (litevirtd is not running here, or the cluster upgrade has not finished); "+
 				"nothing was changed. Run it again with litevirtd running", ErrLoginPolicyGateClosed, capabilities.ReleaseToken)
 		}
-		stmts = append(stmts, clearSecondFactorStatements(name, nowRFC3339(), now)...)
+		stmts = append(stmts, clearSecondFactorStatements(name, nowRFC3339(), now, nil)...)
 	}
 	if !life.Unrestricted() {
 		enable := enableUserStatements(g, name, "user.reset-admin", now)

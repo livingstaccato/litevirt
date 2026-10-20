@@ -171,7 +171,7 @@ func (e *startInFlightError) GRPCStatus() *status.Status {
 // start's startInFlightError rather than queueing behind it, and asks libvirt
 // nothing. It also gives up when ctx is done: the caller is gone.
 func (s *Server) lockVMForStart(ctx context.Context, name string) (func(), error) {
-	unlock, held, err := s.lockVMUnlessStartHeld(ctx, name)
+	unlock, held, err := s.lockVMUnlessStartHeld(ctx, name, "start")
 	if held != nil {
 		return nil, held.inFlightError(name)
 	}
@@ -193,8 +193,8 @@ func (s *Server) lockVMForStart(ctx context.Context, name string) (func(), error
 // waited, or ctx is done) leaves the queue; a lock handed to it meanwhile is
 // let go at once. However many calls give up, the VM costs at most that one
 // goroutine on the mutex.
-func (s *Server) lockVMUnlessStartHeld(ctx context.Context, name string) (func(), *startFlight, error) {
-	if unlock, ok := s.tryLockVM(name); ok {
+func (s *Server) lockVMUnlessStartHeld(ctx context.Context, name, owner string) (func(), *startFlight, error) {
+	if unlock, ok := s.tryLockVMAs(name, owner); ok {
 		return unlock, nil, nil
 	}
 	if f, ok := s.startFlightOf(name); ok && f.heldUnanswered() {
@@ -210,6 +210,8 @@ func (s *Server) lockVMUnlessStartHeld(ctx context.Context, name string) (func()
 	for {
 		select {
 		case unlock := <-got:
+			// Taken by the VM's pump, held from now by this caller.
+			s.setVMLockHolder(name, owner)
 			return unlock, nil, nil
 		case <-done:
 			s.leaveVMLockQueue(name, got)
@@ -275,7 +277,7 @@ func (s *Server) leaveVMLockQueue(name string, ch chan func()) {
 // hands it over; with no caller left, it lets the lock go and ends.
 func (s *Server) pumpVMLock(name string, q *vmLockQueue) {
 	for {
-		unlock := s.lockVM(name)
+		unlock := s.lockVMAs(name, "a queued operation")
 		s.vmLockQueuesMu.Lock()
 		if len(q.waiters) == 0 {
 			q.pumping = false

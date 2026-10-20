@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"log/slog"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -12,6 +13,11 @@ import (
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
+
+// HeldFactorLabelSuffix marks a held factor in ListTwoFactors: kept, never
+// accepted (corrosion.ListHeldUser2FA). It is removed by its label without
+// the suffix.
+const HeldFactorLabelSuffix = " (held)"
 
 // ListTwoFactors returns the second factors enrolled for the given user
 // (or the caller if username is empty). Listing other users' factors
@@ -39,6 +45,19 @@ func (s *Server) ListTwoFactors(ctx context.Context, req *pb.ListTwoFactorsReque
 		resp.Factors = append(resp.Factors, &pb.TwoFactor{
 			Method:     r.Method,
 			Label:      r.Label,
+			EnrolledAt: r.EnrolledAt,
+			LastUsedAt: r.LastUsedAt,
+		})
+	}
+	// Held factors are listed, marked, so an admin can remove them by label.
+	held, err := corrosion.ListHeldUser2FA(ctx, s.db, target)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list held 2fa: %v", err)
+	}
+	for _, r := range held {
+		resp.Factors = append(resp.Factors, &pb.TwoFactor{
+			Method:     r.Method,
+			Label:      r.Label + HeldFactorLabelSuffix,
 			EnrolledAt: r.EnrolledAt,
 			LastUsedAt: r.LastUsedAt,
 		})
@@ -122,8 +141,10 @@ func (s *Server) DisableTwoFactor(ctx context.Context, req *pb.DisableTwoFactorR
 	if u, err := corrosion.GetUser(ctx, s.db, target); err == nil && u != nil {
 		target = u.Username
 	}
+	// A held factor is listed with a marker; its label is without it.
+	req.Label = strings.TrimSuffix(req.Label, HeldFactorLabelSuffix)
 	if err := corrosion.DeleteUser2FA(ctx, s.db, target, req.Method, req.Label); err != nil {
-		return nil, status.Errorf(codes.Internal, "delete 2fa: %v", err)
+		return nil, userWriteStatus(err, "delete 2fa")
 	}
 	slog.Info("2fa disabled", "username", target, "method", req.Method, "label", req.Label, "by", caller)
 	s.audit(ctx, "2fa.disable", target, "method="+req.Method+" label="+req.Label, "ok")

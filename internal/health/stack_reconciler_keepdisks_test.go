@@ -18,7 +18,7 @@ func keepDisksStack(t *testing.T, keepDisks, gate bool) (*corrosion.Client, *Sta
 	t.Helper()
 	db := seedDeletingStack(t, true, false)
 	db.SetClusterPolicyGate(func() bool { return gate })
-	if err := corrosion.MarkStackDeleting(context.Background(), db, "app", keepDisks, "node-0"); err != nil {
+	if err := corrosion.MarkStackDeleting(context.Background(), db, "app", keepDisks, false, "node-0"); err != nil {
 		t.Fatal(err)
 	}
 	c := &recordingStackCleaner{}

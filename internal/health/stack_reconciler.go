@@ -114,6 +114,7 @@ func (r *StackReconciler) reconcile(ctx context.Context) {
 	}
 
 	listed := make(map[string]bool, len(stacks))
+	held := map[string]bool{}
 	for _, stack := range stacks {
 		listed[stack.Name] = true
 		if r.teardownInFlight(stack) {
@@ -121,7 +122,14 @@ func (r *StackReconciler) reconcile(ctx context.Context) {
 				"stack", stack.Name, "updated_at", stack.UpdatedAt)
 			continue
 		}
-		r.reconcileStack(ctx, stack)
+		if r.reconcileStack(ctx, stack) {
+			held[stack.Name] = true
+		}
+	}
+	tornDownRead := r.reportTornDownFirewalls(ctx, held)
+	withdrawnRead := r.reportWithdrawnFirewalls(ctx, held)
+	if tornDownRead && withdrawnRead {
+		r.resolveFirewallHolds(ctx, held)
 	}
 	for name := range r.deletingSeen {
 		if !listed[name] {
@@ -147,6 +155,9 @@ func (r *StackReconciler) reconcile(ctx context.Context) {
 	if err := corrosion.ReassertStackDefaultDeny(ctx, r.db, compose.StoredStackWants); err != nil {
 		slog.Warn("stack-reconciler: re-assert the cluster default-deny a stack asks for", "error", err)
 	}
+	// One a live stack owns that nothing asks for any more is kept, and
+	// reported (unasked_deny.go).
+	r.reportUnaskedDeny(ctx)
 }
 
 // teardownInFlight reports a stack whose teardown began less than
@@ -174,7 +185,10 @@ func (r *StackReconciler) teardownInFlight(stack corrosion.StackRecord) bool {
 	return ok && now.Sub(began) < stackTeardownGrace
 }
 
-func (r *StackReconciler) reconcileStack(ctx context.Context, stack corrosion.StackRecord) {
+// reconcileStack retries the teardown of stack. It reports whether it left
+// the stack's firewall, and the stack "deleting", because the teardown may
+// not remove it (stackFirewallHold).
+func (r *StackReconciler) reconcileStack(ctx context.Context, stack corrosion.StackRecord) (firewallHeld bool) {
 	slog.Info("stack-reconciler: cleaning up stack", "stack", stack.Name)
 
 	// 1. Delete remaining VMs.
@@ -281,6 +295,19 @@ func (r *StackReconciler) reconcileStack(ctx context.Context, stack corrosion.St
 	// DeleteStack that completes; left behind, a security group holds its name
 	// against the next deploy of the same file. A failure keeps the stack
 	// 'deleting', so the next pass retries.
+	//
+	// Only a teardown whose caller held sg.write at the cluster root removes
+	// a firewall this host holds of the stack. Any other was authorized by a
+	// node that saw none, whose replica may lag this one's: the firewall
+	// stays, the stack stays "deleting" (its tombstone would withdraw what its
+	// file asks for), and the condition names who can finish it.
+	if why, err := stackFirewallHold(ctx, r.db, stack); err != nil {
+		slog.Warn("stack-reconciler: read the stack's firewall, will retry", "stack", stack.Name, "error", err)
+		return false
+	} else if why != "" {
+		r.raiseFirewallHold(ctx, stack.Name, why)
+		return true
+	}
 	if err := corrosion.DeleteStackFirewall(ctx, r.db, stack.Name, compose.StoredStackWants); err != nil {
 		slog.Warn("stack-reconciler: tombstone the stack's firewall failed, will retry", "stack", stack.Name, "error", err)
 		return
@@ -296,4 +323,5 @@ func (r *StackReconciler) reconcileStack(ctx context.Context, stack corrosion.St
 	}
 
 	slog.Info("stack-reconciler: stack fully cleaned up", "stack", stack.Name)
+	return false
 }

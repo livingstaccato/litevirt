@@ -66,6 +66,7 @@ func TestFleet_FailedStorageMigrationRemovesOnlyTheStubsItCreated(t *testing.T) 
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := New(t, Options{Nodes: 2, SharedCRDT: true})
+			c.openClusterPolicyGate()
 			defer c.Stop()
 			ctx := context.Background()
 			src, dst := c.Nodes[0], c.Nodes[1]

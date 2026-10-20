@@ -405,6 +405,23 @@ func TestReleaseFeatureSetIsFrozen(t *testing.T) {
 	}
 }
 
+// TestUserIncarnationV1Registered pins user_incarnation_v1: advertised,
+// known, mandatory and replication-gated.
+func TestUserIncarnationV1Registered(t *testing.T) {
+	if UserIncarnationV1 != "user_incarnation_v1" {
+		t.Fatalf("UserIncarnationV1 = %q", UserIncarnationV1)
+	}
+	if !slices.Contains(Supported(), UserIncarnationV1) || !slices.Contains(All(), UserIncarnationV1) {
+		t.Fatal("user_incarnation_v1 must be advertised and known")
+	}
+	if !Mandatory(UserIncarnationV1) {
+		t.Fatal("user_incarnation_v1 must be mandatory: it states how this build orders a delete and a re-create")
+	}
+	if !ReplicationGated(UserIncarnationV1) {
+		t.Fatal("user_incarnation_v1 must be replication-gated: every recipient must decode its statements and keep the tombstone")
+	}
+}
+
 // TestNetBoxIPRepointV1Registered pins netbox_ip_repoint_v1: advertised,
 // known, mandatory (a fact about the binary — it decodes the lease re-point
 // statement) and replication-gated (that statement is a shape a

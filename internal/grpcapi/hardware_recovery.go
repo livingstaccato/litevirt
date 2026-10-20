@@ -75,7 +75,7 @@ func (s *Server) RunHardwareOperationRecovery(ctx context.Context) {
 // filters to device_attach/device_detach, loads the host-local journal artifacts,
 // and dispatches to the directional re-drive: attach → back, detach → forward.
 func (s *Server) recoverOneHardwareOperation(ctx context.Context, name string, wait bool) {
-	unlock, ok := s.lockVMOrSkip(name, wait)
+	unlock, ok := s.lockVMOrSkipAs(name, "hardware recovery", wait)
 	if !ok {
 		slog.Info("hardware op recovery: the VM is locked; left to the next pass", "vm", name)
 		return

@@ -257,3 +257,22 @@ func placementGenStmts(ctx context.Context, c *Client, vm string) []Statement {
 		Params: []interface{}{placementGenKeyPrefix + vm, fmt.Sprintf("%d", n+1), "placement", c.NowTS()},
 	}}
 }
+
+// VMPlacementMark is vm's owner, owner epoch and placement generation on this
+// node's replica, read in one statement so a batch that moved the VM is seen
+// whole or not at all. Every writer that changes a VM's host advances the
+// generation in that batch (while the cluster-policy gate is open), and the
+// transfers also bump the epoch, so the mark changes on every move, a move
+// back to an earlier host included. The generation is its stored text, empty
+// when none is kept. ok=false when the VM has no live row.
+func VMPlacementMark(ctx context.Context, c *Client, vm string) (mark string, ok bool, err error) {
+	rows, err := c.Query(ctx,
+		`SELECT v.host_name, v.vm_owner_epoch,
+			(SELECT p.value FROM cluster_policies p WHERE p.key = ? AND p.deleted_at IS NULL) AS gen
+		 FROM vms v WHERE v.name = ? AND v.deleted_at IS NULL`, placementGenKeyPrefix+vm, vm)
+	if err != nil || len(rows) == 0 {
+		return "", false, err
+	}
+	r := rows[0]
+	return fmt.Sprintf("%s#%d#%s", r.String("host_name"), r.Int64("vm_owner_epoch"), r.String("gen")), true, nil
+}

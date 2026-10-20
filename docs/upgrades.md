@@ -1523,6 +1523,56 @@ with FailedPrecondition until `release_2026_11_v1` has latched, and its first
 use is recorded before the group is written. Global groups are created as
 before throughout, and every existing group stays global.
 
+### Stack firewall changes need sg.write only after the roll
+
+On this release, `lv compose down` and `lv compose up` of a stack need
+`sg.write` at `/` to remove or withdraw the stack's firewall, wherever it is:
+a host keeps a stack's security groups, ip sets, rules and default-deny when
+the teardown's caller did not hold it, and a deploy without it cannot
+withdraw what the stack's last deploy with it declared
+(`stack.firewall_teardown_held`, docs/diagnostics.md). That holds only once
+every host runs this release. A host on the previous release checks neither:
+an Operator's `lv compose down` or `lv compose up` on it changes the stack's
+firewall as before, and its stack reconciler removes the firewall it holds
+of any stack being torn down, whoever began the teardown. A stack whose last
+deploy with `sg.write` ran on the previous release has no recorded intent,
+and its file alone says what it asks for. Finish the roll before relying on
+the check; an Admin's `lv compose up` from an upgraded host records the
+intent of a stack deployed before it. During the roll, a stack torn down on a
+host still on the previous release leaves the intent its last deploy with
+`sg.write` recorded in force for the stack's name: the upgraded hosts turn
+a default-deny it asked for back on, owned by the name, a later deploy of
+that name without `sg.write` is refused, and the name raises
+`stack.firewall_teardown_held`. An Admin's `lv compose down --name <stack>`
+from an upgraded host clears it. Likewise, an Admin's `lv compose up` on a
+host still on the previous release records no intent: when it drops the
+stack's firewall or default-deny, the upgraded hosts keep the default-deny
+the recorded intent asks for and raise the condition. Run it again from an
+upgraded host.
+
+### A stack's default-deny is never removed by the reconciler
+
+On this release the stack reconciler gives the cluster default-deny back to
+a stack that asks for it whenever no default is in force, however new the
+removal, and never removes a deny on its own. Until `failover_scope_v1` has
+latched no firewall intent is recorded, and a stack's file alone says whether
+it asks: an `lv compose up` that drops `default-deny` can leave the deny on,
+owned by the stack, when a reconciler pass runs while it is recorded. The
+stack reconciler raises `stack.firewall_deny_unasked` naming the stack, and
+`lv firewall default-deny off` turns the deny off (docs/diagnostics.md).
+
+### Firewall rules, ip sets and default policies need sg.write
+
+On this release, `lv firewall cluster-rule add/rm`,
+`lv firewall host-rule add/rm`, `lv firewall ipset add/rm` and
+`lv firewall default-deny`, and the same actions in the web UI, need `sg.write` at `/` (Admin or NetworkAdmin)
+where they needed the operator role. An Operator is refused on an upgraded
+host, with the grant that lets it:
+`lv role grant NetworkAdmin <principal> --path / --propagate`. A host still on
+the previous release checks the operator role only until it is upgraded. A
+caller with no role binding of its own is unchanged: its legacy operator role
+still passes.
+
 ### A hand-deleted NetBox address is re-created after the roll
 
 A lease names its NetBox address object by id. When that object is deleted in
@@ -1542,6 +1592,47 @@ until that object is removed in NetBox.
 stand-down is the inventory mirror's own: `netbox.mirror_inventory` off on
 every node stops the only writer. A binary rolled back below the latched token
 enters WAL quarantine, as below every latched token. Roll forward.
+
+### A deleted account stays deleted after the roll
+
+A password change made on a host that has not yet seen an account's
+`lv user delete` used to bring the account back on every host, with that
+password. Once the `user_incarnation_v1` capability token has latched, a
+delete names the account it ends, and no later write to that account from a
+lagging host revives it. `lv user create` of a deleted name makes a new
+account, which replaces the deleted one everywhere. Nor does a lagging
+host's password change, or its delete of the deleted account, reach the new
+account: its password, second factors, recovery codes, role bindings,
+enrollment code, directory bindings and session cut-offs stay its own. The
+same holds for anything else a lagging host gives the deleted account: an API
+token or login session minted there, a role binding, a directory binding, an
+enrollment code, recovery codes, a second-factor change, or an enable or
+expiry change. A host that learns of the re-create drops the deleted
+account's tokens and sessions it holds. A write to an account that is deleted
+or re-created while the write is being made fails and changes nothing; run it
+again. A second factor, a disable or an earlier expiry that reaches a host
+before the account it belongs to does is applied there at once, and taken
+away again only if the host then learns of a newer account of the name. Two
+things of the deleted account can still reach the new one from the lagging
+host itself, and both only take access away: its session cut-offs, which log
+the new account out once, and its clearing of a directory identity the new
+account is bound to as well, which the new account binds again. A second
+factor enrolled on a host that had not latched the token yet names no
+account. A host that then learns of the re-create holds it: the factor is
+kept, but never accepted, and the account cannot log in, even with its
+password, until an admin removes it with
+`lv 2fa disable --user <name> --method <method> --label <label>` (the
+factor's own method, `totp` or `webauthn`) and then issues an enrollment
+code with `lv 2fa enroll-code <name>`. `lv 2fa ls --user <name>` lists a
+held factor with `(held)` after its label, and the `held_second_factor`
+health condition names the account and the commands for each held factor. The
+token latches on its own once every host the cluster replicates to, including
+one parked in `maintenance`, runs this release. Until then hosts write and
+merge users rows as the previous release does.
+
+`user_incarnation_v1` is mandatory and replication-gated, with no flag and no
+stand-down. A binary rolled back below the latched token enters WAL
+quarantine, as below every latched token. Roll forward.
 
 ### Console passwords start after the roll
 
@@ -2200,3 +2291,33 @@ During the roll, a host on the previous build can still retire a re-created
 project's admission authority, and anti-entropy spreads that to upgraded hosts.
 It recovers when the next admission claims a fresh authority epoch, and it
 heals once every host runs this release.
+
+### Migration-TLS credentials checked on every host
+
+A host of this build checks its migration-TLS credentials before it reports
+itself ready for an encrypted storage copy: a CA file that is not a set of
+certificates (or not a file), a host certificate none of them issued, a key
+that is not the certificate's, or a certificate outside its validity is
+unusable. Such a host installs nothing for QEMU and is not ready.
+
+During the roll a source on an older build reads only "ready" or "not
+ready". With `migration.allow_unencrypted_storage: true` it would send a
+storage copy in plaintext to a host that is not ready. So a host of this
+build whose own credentials are unusable refuses a storage copy that asks for
+TLS, naming the fix (`lv host install-migration-tls --reissue`): the older
+source fails closed instead. A host that simply has no credentials answers
+"not ready" as before, and the older source's opt-in applies, as it always
+did.
+
+The migration CA a host reports is a fingerprint of its CA file's
+certificates as a set. For a single CA it is the value every build computes.
+For a rotation bundle (two CAs) a host of this build and one of an older build
+compute different values, so a storage copy between them is refused as
+holding different migration CAs until both run this build. A memory-only move
+between them is not refused: it stays in libvirt's tunnel instead of using
+QEMU's TLS stream, and so does not use the migration network. Finishing the
+upgrade restores both.
+
+Peer connections of this build send gRPC keepalive pings while a call is
+open, every 6 minutes. That is longer than any daemon permits by default (5
+minutes), so a daemon on an older build never rejects them.

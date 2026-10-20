@@ -43,6 +43,7 @@ func (d *Daemon) checkAdminFloor(ctx context.Context, settle time.Duration) {
 		return
 	}
 	d.reportUsableAdmin(ctx)
+	d.reportHeldSecondFactors(ctx)
 	if who == "" {
 		return
 	}
@@ -73,6 +74,11 @@ const (
 	// that would undo a deliberate disable of a compromised account
 	// (t1-auth-review I4) — so this names the recovery paths instead.
 	CondNoUnrestrictedAdmin = "no_unrestricted_admin"
+	// CondHeldSecondFactor is raised by each node while its replica holds an
+	// account whose second factors are held (corrosion.ListHeldUser2FA): an
+	// account re-created under the name of one a lagging node gave a factor.
+	// None of them is accepted, and the account cannot log in on them.
+	CondHeldSecondFactor = "held_second_factor"
 )
 
 // reportUsableAdmin raises or resolves no_unrestricted_admin about this node's
@@ -95,6 +101,11 @@ func (d *Daemon) reportUsableAdmin(ctx context.Context) {
 		recovery = append(recovery, fmt.Sprintf("as root on a node: lv user reset-admin --user %s "+
 			"(the admin floor reinstated %s without its old password)", name, name))
 	}
+	for _, name := range rep.HeldSecondFactor {
+		held, _ := corrosion.ListHeldUser2FA(ctx, d.db, name) // none: the text names the form
+		recovery = append(recovery, "as another admin: "+corrosion.HeldSecondFactorRecovery(name, held)+
+			"; or as root on a node: lv user reset-admin --user "+name+" --clear-2fa")
+	}
 	for _, norm := range rep.Ambiguous {
 		recovery = append(recovery, fmt.Sprintf("as root on a node, with credentials.json moved aside: "+
 			"lv user delete --exact %s (lists the duplicate admin accounts and their ids), then "+
@@ -108,6 +119,26 @@ func (d *Daemon) reportUsableAdmin(ctx context.Context) {
 	}
 	d.writeSelfConditionAs(ctx, adminFloorEvaluator, CondNoUnrestrictedAdmin, !rep.Loggable, corrosion.SeverityCritical,
 		map[string]any{"recovery": strings.Join(recovery, "; or ")})
+}
+
+// reportHeldSecondFactors raises or resolves held_second_factor, naming each
+// account whose second factors are held and how an admin recovers it.
+func (d *Daemon) reportHeldSecondFactors(ctx context.Context) {
+	names, err := corrosion.HeldSecondFactorAccounts(ctx, d.db)
+	if err != nil {
+		slog.Warn("could not check for held second factors", "error", err)
+		return
+	}
+	recovery := make([]string, 0, len(names))
+	for _, name := range names {
+		held, err := corrosion.ListHeldUser2FA(ctx, d.db, name)
+		if err != nil {
+			slog.Warn("could not list held second factors", "user", name, "error", err)
+		}
+		recovery = append(recovery, corrosion.HeldSecondFactorRecovery(name, held))
+	}
+	d.writeSelfConditionAs(ctx, adminFloorEvaluator, CondHeldSecondFactor, len(names) > 0, corrosion.SeverityWarning,
+		map[string]any{"accounts": names, "recovery": strings.Join(recovery, "; ")})
 }
 
 // loginPolicyRun opens the login rules' release feature for the floor's

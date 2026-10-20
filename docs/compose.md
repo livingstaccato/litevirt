@@ -180,7 +180,10 @@ containers is left, none of its networks is deprovisioned: a deleted network
 is torn down on every host, and would be pulled out from under that workload.
 The background retry deletes the remaining VMs and containers first, and
 removes the networks only once they are all gone; when it finishes, the stack's
-security groups, ip sets, cluster rules and backup repos go with it. A first
+security groups, ip sets, cluster rules and backup repos go with it. A host keeps
+the firewall it holds of the stack, and the stack `deleting`, when the teardown's
+caller did not hold `sg.write` at `/` (the `stack.firewall_teardown_held` health
+condition, see [diagnostics.md](diagnostics.md)). A first
 `compose up` of a stack that fails before it issues any workload action removes
 the security groups, ip sets and cluster rules it had just written; the
 cluster default-deny and backup repo registrations stay, and its error says
@@ -191,9 +194,14 @@ down, or is redeployed without it, the deny passes to another stack whose file
 asks for it, and is removed only when none does; while another stack's stored
 file cannot be read, it stays. A deploy asking for default-deny sets it again
 once its record is written if the cluster no longer denies, and the background
-stack reconciler sets it for a live stack whose file asks for it when the
-cluster has no default, if that stack was recorded after the default was
-removed (a redeploy that drops default-deny is not undone). Stacks going down
+stack reconciler sets it for a stack that asks for it whenever the cluster has
+no default in force, whatever removed it (a redeploy by a caller with
+`sg.write` that drops default-deny is not undone: it records that before it
+removes the deny; for a stack with no recorded intent it can be, and the deny
+is then reported as below). A deny a live stack owns and nothing asks for any more is
+kept, never removed by the reconciler, and raises the
+`stack.firewall_deny_unasked` health condition; `lv firewall default-deny off`
+turns it off. Stacks going down
 at the same time never hand the deny or a repo to each other: a stack that
 went down is passed over. The background reconciler hands a deny or repo a
 torn-down stack still holds to a live stack that asks for it. Otherwise it

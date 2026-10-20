@@ -415,6 +415,11 @@ func InsertUser2FA(ctx context.Context, c *Client, r User2FARecord) error {
 	if err != nil {
 		return err
 	}
+	if _, held := heldEpochBase(epoch); held {
+		// A held set is not the account's to add to: a fresh set replaces
+		// it, so the held factors stay out of the active one (user_incarnation.go).
+		exists = false
+	}
 	now := c.NowTS()
 	stmts := make([]Statement, 0, 2)
 	if !exists {
@@ -422,26 +427,37 @@ func InsertUser2FA(ctx context.Context, c *Client, r User2FARecord) error {
 		if err != nil {
 			return err
 		}
-		stmts = append(stmts, Statement{
-			SQL: `INSERT INTO user_2fa_sets (username, active_epoch, updated_at)
+		// Once user_incarnation_v1 has latched the epoch names the account's
+		// incarnation, so a factor enrolled for an account since deleted is
+		// told apart from the new account's own (retireLaggingLifts).
+		if c.UserIncarnationOn() {
+			rows, err := c.Query(ctx, `SELECT created_at FROM users WHERE username = ?`, r.Username)
+			if err != nil {
+				return err
+			}
+			if len(rows) > 0 && rows[0].String("created_at") != "" {
+				epoch += userEpochTagSep + rows[0].String("created_at")
+			}
+		}
+		stmts = append(stmts, Statement{SQL: user2FASetUpsertSQL, Params: []interface{}{r.Username, epoch, now}})
+	}
+	stmts = append(stmts, Statement{SQL: user2FAUpsertSQL,
+		Params: []interface{}{r.Username, r.Method, r.Secret, r.Label, nowRFC3339(), now, epoch}})
+	return c.ExecuteBatch(ctx, stmts)
+}
+
+const user2FASetUpsertSQL = `INSERT INTO user_2fa_sets (username, active_epoch, updated_at)
 				 VALUES (?, ?, ?)
 				 ON CONFLICT(username) DO UPDATE SET
 				   active_epoch = excluded.active_epoch,
 				   updated_at = excluded.updated_at,
-				   deleted_at = NULL`,
-			Params: []interface{}{r.Username, epoch, now},
-		})
-	}
-	stmts = append(stmts, Statement{
-		SQL: `INSERT INTO user_2fa (username, method, secret, label, enrolled_at, updated_at, epoch)
+				   deleted_at = NULL`
+
+const user2FAUpsertSQL = `INSERT INTO user_2fa (username, method, secret, label, enrolled_at, updated_at, epoch)
 			 VALUES (?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(username, method, label) DO UPDATE
 			   SET secret = excluded.secret, updated_at = excluded.updated_at,
-			       deleted_at = NULL, last_step = 0, epoch = excluded.epoch`,
-		Params: []interface{}{r.Username, r.Method, r.Secret, r.Label, nowRFC3339(), now, epoch},
-	})
-	return c.ExecuteBatch(ctx, stmts)
-}
+			       deleted_at = NULL, last_step = 0, epoch = excluded.epoch`
 
 // ListUser2FA returns the user's enrolled (non-deleted) factors in the CURRENT
 // active set. The epoch join means a factor a peer resurrected under a stale
@@ -465,6 +481,51 @@ func ListUser2FA(ctx context.Context, c *Client, username string) ([]User2FAReco
 			EnrolledAt: r.String("enrolled_at"), LastUsedAt: r.String("last_used_at"),
 			LastStep: r.Int64("last_step"),
 		}
+	}
+	return out, nil
+}
+
+// ListHeldUser2FA returns the user's live factors whose set is held
+// (holdUntaggedFactorSet): kept, never accepted. A user with held factors
+// counts as having a second factor, so its login fails closed.
+func ListHeldUser2FA(ctx context.Context, c *Client, username string) ([]User2FARecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT username, method, secret, COALESCE(label, '') AS label,
+		        enrolled_at, COALESCE(last_used_at, '') AS last_used_at,
+		        COALESCE(last_step, 0) AS last_step
+		 FROM user_2fa WHERE username = ? AND deleted_at IS NULL
+		   AND epoch || ? = (SELECT active_epoch FROM user_2fa_sets
+		                     WHERE username = ? AND deleted_at IS NULL)`, username, userEpochHeldSuffix, username)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]User2FARecord, len(rows))
+	for i, r := range rows {
+		out[i] = User2FARecord{
+			Username: r.String("username"), Method: r.String("method"),
+			Secret: r.String("secret"), Label: r.String("label"),
+			EnrolledAt: r.String("enrolled_at"), LastUsedAt: r.String("last_used_at"),
+			LastStep: r.Int64("last_step"),
+		}
+	}
+	return out, nil
+}
+
+// HeldSecondFactorAccounts lists the live accounts with held second factors
+// (the held_second_factor condition).
+func HeldSecondFactorAccounts(ctx context.Context, c *Client) ([]string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT DISTINCT f.username FROM user_2fa f
+		 JOIN user_2fa_sets s ON s.username = f.username AND s.deleted_at IS NULL
+		 JOIN users u ON u.username = f.username AND u.deleted_at IS NULL
+		 WHERE f.deleted_at IS NULL AND f.epoch || ? = s.active_epoch
+		 ORDER BY f.username`, userEpochHeldSuffix)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.String("username"))
 	}
 	return out, nil
 }
@@ -523,22 +584,39 @@ func RecordTOTPStep(ctx context.Context, c *Client, username, method, label, sec
 // user_2fa_sets pointer in the same batch — otherwise the epoch stays live and a
 // peer's unseen factor under it would silently re-enable 2FA (the API treats
 // "no factors" as "no 2FA"). A later enroll mints a fresh epoch.
+//
+// A held set (holdUntaggedFactorSet) is retired only with its last held
+// factor: none of its factors is in it, so the retire's own test would end it
+// at the first, and the account would read as having no second factor.
 func DeleteUser2FA(ctx context.Context, c *Client, username, method, label string) error {
 	now := c.NowTS()
 	marker := nowRFC3339()
-	return c.ExecuteBatch(ctx, []Statement{
-		{SQL: `UPDATE user_2fa SET deleted_at = ?, updated_at = ?
-			 WHERE username = ? AND method = ? AND COALESCE(label,'') = ?`,
-			Params: []interface{}{marker, now, username, method, label}},
-		{SQL: `UPDATE user_2fa_sets SET deleted_at = ?, updated_at = ?
+	stmts := []Statement{{SQL: user2FATombstoneSQL, Params: []interface{}{marker, now, username, method, label}}}
+	held, err := ListHeldUser2FA(ctx, c, username)
+	if err != nil {
+		return err
+	}
+	others := 0
+	for _, f := range held {
+		if f.Method != method || f.Label != label {
+			others++
+		}
+	}
+	if others == 0 {
+		stmts = append(stmts, Statement{SQL: user2FASetRetireSQL, Params: []interface{}{marker, now, username}})
+	}
+	return c.ExecuteBatch(ctx, stmts)
+}
+
+const user2FATombstoneSQL = `UPDATE user_2fa SET deleted_at = ?, updated_at = ?
+			 WHERE username = ? AND method = ? AND COALESCE(label,'') = ?`
+
+const user2FASetRetireSQL = `UPDATE user_2fa_sets SET deleted_at = ?, updated_at = ?
 			 WHERE username = ? AND deleted_at IS NULL
 			   AND NOT EXISTS (SELECT 1 FROM user_2fa f
 			                   WHERE f.username = user_2fa_sets.username
 			                     AND f.deleted_at IS NULL
-			                     AND f.epoch = user_2fa_sets.active_epoch)`,
-			Params: []interface{}{marker, now, username}},
-	})
-}
+			                     AND f.epoch = user_2fa_sets.active_epoch)`
 
 // ────────────────────────────── RECOVERY CODES ──────────────────────────────
 
@@ -574,35 +652,32 @@ func InsertRecoveryCodes(ctx context.Context, c *Client, username string, codeHa
 	marker := nowRFC3339() // bare created_at/deleted_at markers (non-LWW)
 	stmts := make([]Statement, 0, len(codeHashes)+2)
 	// (a) Point the user at the new set (LWW on updated_at).
-	stmts = append(stmts, Statement{
-		SQL: `INSERT INTO recovery_code_sets (username, active_set_id, updated_at)
+	stmts = append(stmts, Statement{SQL: recoveryCodeSetUpsertSQL, Params: []interface{}{username, setID, now}})
+	// (b) Cleanup: soft-delete this node's old unused codes from prior sets.
+	stmts = append(stmts, Statement{SQL: recoveryCodesSupersedeSQL, Params: []interface{}{marker, now, username, setID}})
+	// (c) Insert the new codes. ON CONFLICT re-homes a recurring hash into the new
+	//     set (bcrypt salting makes recurrence practically impossible; defensive).
+	for _, h := range codeHashes {
+		stmts = append(stmts, Statement{SQL: recoveryCodeUpsertSQL, Params: []interface{}{username, h, marker, setID, now}})
+	}
+	return c.ExecuteBatch(ctx, stmts)
+}
+
+const recoveryCodeSetUpsertSQL = `INSERT INTO recovery_code_sets (username, active_set_id, updated_at)
 			 VALUES (?, ?, ?)
 			 ON CONFLICT(username) DO UPDATE SET
 			   active_set_id = excluded.active_set_id,
 			   updated_at = excluded.updated_at,
-			   deleted_at = NULL`,
-		Params: []interface{}{username, setID, now},
-	})
-	// (b) Cleanup: soft-delete this node's old unused codes from prior sets.
-	stmts = append(stmts, Statement{
-		SQL: `UPDATE recovery_codes SET deleted_at = ?, updated_at = ?
-			 WHERE username = ? AND used_at IS NULL AND set_id != ?`,
-		Params: []interface{}{marker, now, username, setID},
-	})
-	// (c) Insert the new codes. ON CONFLICT re-homes a recurring hash into the new
-	//     set (bcrypt salting makes recurrence practically impossible; defensive).
-	for _, h := range codeHashes {
-		stmts = append(stmts, Statement{
-			SQL: `INSERT INTO recovery_codes (username, code_hash, created_at, set_id, updated_at)
+			   deleted_at = NULL`
+
+const recoveryCodesSupersedeSQL = `UPDATE recovery_codes SET deleted_at = ?, updated_at = ?
+			 WHERE username = ? AND used_at IS NULL AND set_id != ?`
+
+const recoveryCodeUpsertSQL = `INSERT INTO recovery_codes (username, code_hash, created_at, set_id, updated_at)
 			 VALUES (?, ?, ?, ?, ?)
 			 ON CONFLICT(username, code_hash) DO UPDATE SET
 			   set_id = excluded.set_id, used_at = NULL,
-			   deleted_at = NULL, updated_at = excluded.updated_at`,
-			Params: []interface{}{username, h, marker, setID, now},
-		})
-	}
-	return c.ExecuteBatch(ctx, stmts)
-}
+			   deleted_at = NULL, updated_at = excluded.updated_at`
 
 // ListUnusedRecoveryCodes returns the bcrypt hashes the verifier should try
 // against a presented code: unused, not tombstoned, and belonging to the user's

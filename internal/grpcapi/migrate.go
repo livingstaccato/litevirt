@@ -29,6 +29,7 @@ import (
 	"github.com/litevirt/litevirt/internal/hooks"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/obs"
+	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/vfio"
@@ -105,7 +106,7 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	// released here UNLESS the migration outlives this request, in which case it
 	// travels with the adopter — dropping it while libvirt is still moving the
 	// guest is what lets a snapshot or delete run against a VM mid-flight.
-	unlock := releaseOnce(s.lockVM(req.VmName))
+	unlock := releaseOnce(s.lockVMAs(req.VmName, "migration"))
 	adopted := false
 	defer func() {
 		if !adopted {
@@ -437,7 +438,13 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// EnsureDisks.
 	srcTLS := false
 	if withStorage {
-		srcTLS = s.migrationTLSReady()
+		var tlsErr error
+		srcTLS, tlsErr = s.migrationTLSState()
+		if errors.Is(tlsErr, pki.ErrInvalidMigrationCredentials) {
+			// This host holds credentials it cannot use: a fault to fix, refused
+			// whatever the plaintext opt-in says.
+			return unusableMigrationCredentialsRefusal(req.VmName, s.hostName, tlsErr.Error())
+		}
 		if !srcTLS && !s.allowPlaintextStorageMigration {
 			return plaintextStorageRefusal(req.VmName, s.hostName, req.TargetHost, s.hostName)
 		}
@@ -571,24 +578,22 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	if err != nil {
 		return err
 	}
+	// The target's capacity lease is held until libvirt ends the move: an
+	// adopted migration (adoptAbandonedMigration) takes it with it, and
+	// releases it when the move ends.
+	leaseHeld := true
 	// fwl is the live firmware move once the target may hold it: an exit
 	// before libvirt has the guest aborts it there first (§7 P2), and drops
 	// its marker once the target answered.
 	var fwl *liveFirmwareRun
 	defer func() {
+		if !leaseHeld {
+			return // the adopter releases it, and clears the marker's lease
+		}
 		// Released, it leaves the marker: a marker that still names the
 		// lease is a dead process's, or one whose release failed, which
 		// every recovery pass releases (review m4).
-		// An adopted move's marker is the adopter's, under the lock it took
-		// over: it is told whether the release succeeded, and clears the
-		// lease when it ends only if it did (re-review 2, m-A; re-review 3,
-		// m-2).
-		ok := migLease.released(ctx)
-		switch {
-		case fwl == nil:
-		case adopted != nil && *adopted && fwl.leaseReleased != nil:
-			fwl.leaseReleased <- ok
-		case ok:
+		if migLease.released(ctx) && fwl != nil {
 			s.clearMarkerLease(fwl.marker.VM, fwl.marker.Attempt)
 		}
 	}()
@@ -675,6 +680,24 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		stripVNC, targetNetDevs = ens.vncPasswordUnavailable, ens.netDevices
 		abort.createdStubs = createdStubs
 		useTLS = srcTLS && dstTLS
+		// Both ready is not enough: their credentials must chain to one
+		// migration CA. A mismatch is refused, never sent in plaintext
+		// instead. The abort undoes the stubs.
+		if useTLS {
+			localCA, caErr := s.localMigrationCA()
+			if caErr != nil {
+				// This host knows it is not an older build: an unreadable CA is
+				// a fault to fix, not a reason to skip the comparison.
+				return status.Errorf(codes.FailedPrecondition,
+					"refusing to migrate VM %q with a storage copy: %s cannot read its own migration CA (%v), so it cannot "+
+						"tell whether %s's migration-TLS credentials come from the same CA. Reissue its credentials with "+
+						"`lv host install-migration-tls --reissue` (run where the cluster's migration CA lives)",
+					req.VmName, s.hostName, caErr, req.TargetHost)
+			}
+			if err := migrationCAMismatch(req.VmName, s.hostName, localCA, req.TargetHost, ens.migrationCA); err != nil {
+				return err
+			}
+		}
 		kind := routeStorage
 		if fwCold || coldStopped {
 			kind = routeCold
@@ -683,6 +706,12 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			route = s.chooseLiveFirmwareRoute(ctx, vm.Name, *targetHost, ens.migAddr, kind, useTLS)
 		} else {
 			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, kind, useTLS)
+		}
+		if !dstTLS && ens.tlsUnusable != "" {
+			// The target holds credentials it cannot use. Refused before the
+			// copy, whatever the plaintext opt-in says; the abort undoes the
+			// stubs.
+			return unusableMigrationCredentialsRefusal(req.VmName, req.TargetHost, ens.tlsUnusable)
 		}
 		if !useTLS && !s.allowPlaintextStorageMigration {
 			// This host could encrypt; the target cannot (no credentials, or an
@@ -708,10 +737,12 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		case fwCold || coldStopped:
 			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeCold, true)
 		case fwl != nil:
-			useTLS = srcTLS && ens.tlsReady
+			// QEMU's TLS stream only with both hosts ready and their
+			// migration CAs agreeing (memoryTLSReady).
+			useTLS = s.memoryTLSReady(srcTLS, ens)
 			route = s.chooseLiveFirmwareRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeMemory, useTLS)
 		default:
-			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeMemory, srcTLS && ens.tlsReady)
+			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeMemory, s.memoryTLSReady(srcTLS, ens))
 		}
 	}
 	if fwl != nil {
@@ -945,18 +976,48 @@ poll:
 	for {
 		select {
 		case <-migrateCtx.Done():
-			s.abortOnMigrateTimeout(ctx, migrateCtx, vm.Name)
+			timedOut := s.abortOnMigrateTimeout(ctx, migrateCtx, vm.Name)
+			if timedOut {
+				// The policy timeout aborted the job: libvirt's answer says
+				// what happened, and the request reports that (lab2-drain
+				// anomaly 5). An error is the abort taken, the guest still
+				// here; nil is a cut-over that won the race. Either goes on
+				// as libvirt's answer does below.
+				grace := time.NewTimer(s.drainAbortGraceOrDefault())
+				select {
+				case migrateErr := <-done:
+					grace.Stop()
+					if migrateErr != nil {
+						migrateErr = fmt.Errorf("it reached its migration policy timeout_sec (%ds) and its libvirt job was aborted; %s stays on %s: %w",
+							migratePolicy.GetTimeoutSec(), vm.Name, s.hostName, migrateErr)
+					}
+					answered := make(chan error, 1)
+					answered <- migrateErr
+					done = answered
+					migrateCtx = context.WithoutCancel(ctx) // the loop now reads libvirt's answer
+					continue poll
+				case <-grace.C:
+				}
+			}
 			// libvirt is still migrating. MigrateToTarget takes no context, so
 			// cancelling this request does not stop the guest moving — it only
 			// stops us watching. Returning bare here left the VM at
 			// host_name=source/state=migrating while it ran on the target, and
 			// the reconciler skips `migrating`, so nothing ever healed it.
 			*adopted = true
+			leaseHeld = false
 			s.adoptAbandonedMigration(context.WithoutCancel(ctx), vm, req.TargetHost,
 				withStorage, disks, done, unlock, migrationFinish{
 					target: targetHost, detachedVFs: detachedVFs, pbVM: pbVM, hspec: hspec, armed: armed,
-					createdStubs: createdStubs, fwLive: fwl,
+					createdStubs: createdStubs, lease: migLease, fwLive: fwl,
 				})
+			if timedOut {
+				return status.Errorf(codes.DeadlineExceeded,
+					"the migration of %q to %s reached its migration policy timeout_sec (%ds) and its libvirt job was aborted, "+
+						"but libvirt did not answer the abort within %s; the move is left to finish in the background, and %s ends "+
+						"running on %s or on %s, never on both — watch `lv events %s`",
+					vm.Name, req.TargetHost, migratePolicy.GetTimeoutSec(), s.drainAbortGraceOrDefault(), vm.Name, s.hostName, req.TargetHost, vm.Name)
+			}
 			return status.Errorf(codes.DeadlineExceeded,
 				"stopped waiting for the migration of %q to %s (%v); it is still running in "+
 					"libvirt and will be completed in the background — watch `lv events %s`",
@@ -1089,29 +1150,21 @@ func (s *Server) adoptAbandonedMigration(
 	unlock func(),
 	finish migrationFinish,
 ) {
-	// The request releases the move's lease when it returns, and says here
-	// whether that succeeded (re-review 3, m-2).
-	var leaseReleased chan bool
-	if fwl := finish.fwLive; fwl != nil {
-		leaseReleased = make(chan bool, 1)
-		fwl.leaseReleased = leaseReleased
-	}
 	s.migrationProducers.retainAdopter()
 	go func() {
 		defer s.migrationProducers.done()
 		defer s.dbWorkerEvent(ctx, "migration_adopter", "exit")
 		s.dbWorkerEvent(ctx, "migration_adopter", "entry")
 		defer unlock()
-		// Under the lock: the marker the adopter leaves no longer names a
-		// lease the request released; one whose release failed stays named,
-		// and the recovery releases it (re-review 2, m-A).
-		if fwl := finish.fwLive; fwl != nil {
-			defer func() {
-				if <-leaseReleased {
-					s.clearMarkerLease(fwl.marker.VM, fwl.marker.Attempt)
-				}
-			}()
-		}
+		// The target keeps counting the guest's room until libvirt ends the
+		// move: the adopter releases the lease, under the lock, and a live
+		// firmware move's marker then no longer names it. One whose release
+		// failed stays named, and the recovery releases it (re-review 2, m-A).
+		defer func() {
+			if finish.lease.released(ctx) && finish.fwLive != nil {
+				s.clearMarkerLease(finish.fwLive.marker.VM, finish.fwLive.marker.Attempt)
+			}
+		}()
 		defer s.invalidateInventoryCache()
 		defer func() {
 			if p := recover(); p != nil {
@@ -1184,6 +1237,11 @@ func (s *Server) adoptAbandonedMigration(
 			if finish.fwLive == nil || unmark != nil {
 				s.cleanupFailedMigrationTarget(ctx, vm.Name, targetHost, finish.createdStubs)
 			}
+			if finish.drainFrom != "" && finish.pbVM != nil {
+				// The drain ran pre_migrate; post_migrate names where the VM is.
+				finish.pbVM.HostName, finish.pbVM.State = s.hostName, vmStateToPB(state)
+				hooks.Run(ctx, hooks.PostMigrate, finish.pbVM, finish.hspec)
+			}
 			slog.Warn("migrate: adopted migration failed", "vm", vm.Name, "target", targetHost, "error", err)
 			s.recordVMEvent(ctx, vm.Name, "vm.migrated", "error", "abandoned request; migration failed: "+err.Error())
 		}
@@ -1206,9 +1264,26 @@ func (s *Server) adoptAbandonedMigration(
 		// libvirt cut over. The commit is the only thing that makes the cluster
 		// agree with reality, and it cannot be skipped just because nobody is
 		// listening any more.
-		if ferr := s.finalizeMigrationOwnership(ctx, vm, targetHost, withStorage, disks); ferr != nil {
+		ferr := s.finalizeMigrationOwnership(ctx, vm, targetHost, withStorage, disks)
+		if finish.drainFrom != "" {
+			// The guest has left the drained host, whatever the commit did. After
+			// the commit, so a judgement reading the row in between cannot find
+			// it still migrating on the source and name it again.
+			if drainForgetHookForTest != nil {
+				drainForgetHookForTest()
+			}
+			s.forgetDrainTimeout(ctx, finish.drainFrom, vm.Name)
+		}
+		if ferr != nil {
 			if finish.fwLive == nil {
 				finish.armed.uncommitted(ctx)
+			}
+			if finish.drainFrom != "" && finish.pbVM != nil {
+				// libvirt reported the cut-over: the guest runs on the target,
+				// whatever the row says. post_migrate names it, as the watched
+				// drain's commit failure does.
+				finish.pbVM.HostName, finish.pbVM.State = targetHost, pb.VMState_VM_RUNNING
+				hooks.Run(ctx, hooks.PostMigrate, finish.pbVM, finish.hspec)
 			}
 			slog.Error("migrate: adopted migration cut over but ownership commit FAILED — "+
 				"the guest is on the target and the cluster does not know",
@@ -1225,6 +1300,10 @@ func (s *Server) adoptAbandonedMigration(
 		}
 		s.releaseSourceVFsAfterCutover(ctx, vm.Name, finish.detachedVFs)
 		slog.Info("migrate: adopted migration completed", "vm", vm.Name, "target", targetHost)
+		if finish.drainFrom != "" {
+			// As a watched drain move: so that undrain can move it back.
+			s.recordDrainOriginBounded(ctx, s.drainRecordJobFor(ctx, vm.Name, finish.drainFrom, targetHost))
+		}
 		s.recordVMEvent(ctx, vm.Name, "vm.migrated", "ok",
 			"abandoned request; completed to "+targetHost)
 		// The same finish a watched migration gets. Committing ownership and
@@ -1521,7 +1600,7 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 		return nil, status.Errorf(codes.Internal, "generate cloud-init ISO: %v", err)
 	}
 	if !existed {
-		s.migrationISOs.add(req.VmName, isoPath)
+		s.recordMade(ctx, &s.migrationISOs, req.VmName, isoPath)
 	}
 	slog.Info("cloud-init ISO generated for migration", "vm", req.VmName, "path", isoPath, "replaced", existed)
 	return &emptypb.Empty{}, nil
@@ -1592,6 +1671,24 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 		}
 		defer release()
 	}
+	// Whether this host's QEMU can take an encrypted copy, settled once.
+	var tlsReady bool
+	var tlsErr error
+	if req.WantMigrationTls {
+		tlsReady, tlsErr = s.migrationTLSState()
+	}
+	// A storage copy (disk stubs) that asks for TLS while this host's own
+	// credentials are unusable is refused, before anything is created: an
+	// older source reads only migration_tls_ready, and with its plaintext
+	// opt-in it would send the copy in plaintext to a host that is merely
+	// misconfigured. A memory-only ask is answered "not ready" below, and
+	// that move stays in libvirt's tunnel.
+	if len(req.Disks) > 0 && errors.Is(tlsErr, pki.ErrInvalidMigrationCredentials) {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%s holds migration-TLS credentials it cannot use (%s), so a storage copy to it cannot be encrypted. "+
+				"Reissue its credentials with `lv host install-migration-tls --reissue` (run where the cluster's migration CA lives)",
+			s.hostName, headerValue(tlsErr.Error()))
+	}
 	// A NIC whose MTU this host's bridge does not equal: answered before
 	// anything is created here, and the source refuses the move.
 	if p := s.nicMTUProblem(ctx, req.GetNicMtu()); p != "" {
@@ -1624,14 +1721,14 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 			return nil, status.Errorf(codes.InvalidArgument, "disk stub path %q is not in a disk-artifact root", stub.Path)
 		}
 		if _, err := os.Lstat(stub.Path); err == nil {
-			if !s.migrationStubs.owns(req.VmName, stub.Path) {
+			if !s.madeHere(ctx, &s.migrationStubs, req.VmName, stub.Path) {
 				return nil, status.Errorf(codes.FailedPrecondition,
 					"disk %s of VM %q already exists on %s, and this migration did not create it. "+
-						"It may be the VM's disk from an earlier stay on %s (a copy partition settle kept, say), "+
-						"and copying the disk there would overwrite it. It may be the only copy of the VM's data from "+
-						"before a failover: do not delete it. Move it aside on %s (rename it to <path>.superseded-<time>, "+
-						"which `lv host superseded-disks` then lists and keeps), then migrate again",
-					stub.Path, req.VmName, s.hostName, s.hostName, s.hostName)
+						"It may be the VM's disk from an earlier stay on %s (a copy partition settle kept, or one a "+
+						"rolled-back move placed after it gave up, say), and copying the disk there would overwrite it. "+
+						"It may be the only copy of the VM's data from before a failover: do not delete it. %s, "+
+						"then migrate again",
+					stub.Path, req.VmName, s.hostName, s.hostName, moveAsideAdvice(s.hostName, stub.Path))
 			}
 		} else if !os.IsNotExist(err) {
 			return nil, status.Errorf(codes.Internal, "stat disk stub %s: %v", stub.Path, err)
@@ -1685,14 +1782,24 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 			return nil, status.Errorf(codes.Internal, "create stub %s: %v", stub.Path, err)
 		}
 		made = append(made, stub.Path)
-		s.migrationStubs.add(req.VmName, stub.Path)
+		s.recordMade(ctx, &s.migrationStubs, req.VmName, stub.Path)
 		resp.CreatedPaths = append(resp.CreatedPaths, stub.Path)
 		slog.Info("disk stub created for migration", "vm", req.VmName, "path", stub.Path, "size_bytes", stub.SizeBytes)
 	}
 	if req.WantMigrationTls {
 		// The source can encrypt the copy; tell it whether this host's QEMU can
-		// take the other end.
-		resp.MigrationTlsReady = s.migrationTLSReady()
+		// take the other end, and, in a response header, which migration CA
+		// its credentials chain to, so the source can refuse a mismatch
+		// before the copy rather than at QEMU's TLS handshake.
+		resp.MigrationTlsReady = tlsReady
+		if fp, _ := s.localMigrationCA(); resp.MigrationTlsReady && fp != "" {
+			_ = grpc.SetHeader(ctx, metadata.Pairs(MigrationCAMD, fp))
+		}
+		if errors.Is(tlsErr, pki.ErrInvalidMigrationCredentials) {
+			// Not ready because the credentials here are unusable: say why, so
+			// the source can refuse with the fix rather than "no credentials".
+			_ = grpc.SetHeader(ctx, metadata.Pairs(MigrationTLSUnusableMD, headerValue(tlsErr.Error())))
+		}
 	}
 	s.answerMigrationNetwork(ctx, req, resp)
 	if req.GetWantNetworkDevices() {
@@ -2299,7 +2406,7 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 	for _, p := range paths {
 		named[p] = true
 	}
-	for p, at := range s.migrationStubs.recordedFor(req.VmName) {
+	for p, at := range s.madeHereFor(ctx, &s.migrationStubs, req.VmName) {
 		if named[p] {
 			continue
 		}
@@ -2325,7 +2432,7 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 		// list is not trusted for it: a source built before EnsureDisks reported
 		// what it created names every disk path, including a disk that was here
 		// already, and removing that by name deleted it (drill D1).
-		if vmLivesHere || !s.migrationStubs.owns(req.VmName, p) {
+		if vmLivesHere || !s.madeHere(ctx, &s.migrationStubs, req.VmName, p) {
 			slog.Warn("cleanup migration artifacts: leaving a disk file this host did not create as a migration stub",
 				"vm", req.VmName, "path", p, "vm_lives_here", vmLivesHere)
 			continue
@@ -2343,7 +2450,7 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 	if req.RemoveCloudInit {
 		if iso, perr := lv.SafeCloudInitISOPath(s.dataDir, req.VmName); perr != nil {
 			slog.Warn("cleanup migration artifacts: invalid vm name for cloud-init path", "vm", req.VmName, "error", perr)
-		} else if vmLivesHere || !s.migrationISOs.owns(req.VmName, iso) {
+		} else if vmLivesHere || !s.madeHere(ctx, &s.migrationISOs, req.VmName, iso) {
 			slog.Warn("cleanup migration artifacts: leaving a cloud-init ISO this host did not create for the migration",
 				"vm", req.VmName, "path", iso, "vm_lives_here", vmLivesHere)
 		} else if err := cloudinit.RemoveSeed(iso); err != nil {
@@ -2566,11 +2673,89 @@ func (s *Server) ensureDisksOnTargetISO(ctx context.Context, targetHost, vmName 
 	return o.created, o.tlsReady, o.remap, o.cgroupMode, err
 }
 
+// MigrationCAMD is the EnsureDisks response header in which a target that is
+// ready for migration TLS names the SHA-256 fingerprint of the migration CA
+// its credentials chain to. An older target sends none.
+const MigrationCAMD = "x-litevirt-migration-ca-sha256"
+
+// MigrationTLSUnusableMD is the EnsureDisks response header in which a
+// target that is not ready for migration TLS because its credentials are
+// unusable (pki.ErrInvalidMigrationCredentials) says why. An older target, or
+// one that simply has none, sends none.
+const MigrationTLSUnusableMD = "x-litevirt-migration-tls-unusable"
+
+// headerValue makes text a valid gRPC (HTTP/2) header value: one line of
+// printable ASCII, at most 512 bytes. Anything else becomes '?'.
+func headerValue(text string) string {
+	const limit = 512
+	b := make([]byte, 0, min(len(text), limit))
+	for _, r := range text {
+		if len(b) >= limit {
+			break
+		}
+		if r < 0x20 || r > 0x7e {
+			r = '?'
+		}
+		b = append(b, byte(r))
+	}
+	return string(b)
+}
+
+// unusableMigrationCredentialsRefusal refuses a storage copy because host's
+// migration-TLS credentials are unusable (why), with the fix.
+func unusableMigrationCredentialsRefusal(vmName, host, why string) error {
+	return status.Errorf(codes.FailedPrecondition,
+		"refusing to migrate VM %q with a storage copy: %s holds migration-TLS credentials it cannot use (%s), so the copy "+
+			"could not be encrypted. Reissue its credentials with `lv host install-migration-tls --reissue` (run where the "+
+			"cluster's migration CA lives)", vmName, host, why)
+}
+
+// migrationCAMismatch refuses a storage copy between hosts whose migration
+// credentials chain to different migration CAs: QEMU's TLS handshake would
+// fail mid-copy. Either fingerprint unknown (an older build, or none could be
+// read) compares nothing.
+func migrationCAMismatch(vmName, source, sourceCA, target, targetCA string) error {
+	if migrationCAsAgree(sourceCA, targetCA) {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"refusing to migrate VM %q with a storage copy: the migration-TLS credentials of %s and %s come from "+
+			"different migration CAs (%s: %s, %s: %s), so QEMU's TLS handshake between them would fail. "+
+			"Reissue every host's credentials from one migration CA with `lv host install-migration-tls --reissue` "+
+			"(run where the cluster's migration CA lives)",
+		vmName, source, target, source, sourceCA, target, targetCA)
+}
+
+// migrationCAsAgree reports whether two hosts' migration CAs (fingerprints,
+// "" when unknown) may be used together for QEMU's TLS stream: the same CA,
+// or either one unknown (an older build), which compares nothing.
+func migrationCAsAgree(a, b string) bool {
+	return a == "" || b == "" || a == b
+}
+
+// memoryTLSReady is whether a memory-only move to the target that answered
+// ens may use QEMU's own TLS stream: both hosts ready (srcTLS, ens.tlsReady)
+// and their migration CAs agree. A mismatch is not ready, so the move stays
+// in libvirt's tunnel instead of failing QEMU's handshake.
+func (s *Server) memoryTLSReady(srcTLS bool, ens ensureOutcome) bool {
+	if !srcTLS || !ens.tlsReady {
+		return false
+	}
+	localCA, err := s.localMigrationCA()
+	return err == nil && migrationCAsAgree(localCA, ens.migrationCA)
+}
+
 // ensureOutcome is what the target's EnsureDisks answered.
 type ensureOutcome struct {
-	created  []string          // disk stubs this call made
-	tlsReady bool              // wantTLS and the target has migration-TLS credentials
-	remap    map[string]string // installer CD-ROM source path -> the target's file
+	created  []string // disk stubs this call made
+	tlsReady bool     // wantTLS and the target has migration-TLS credentials
+	// migrationCA is the fingerprint of the migration CA the target's
+	// credentials chain to (MigrationCAMD), "" when it did not say.
+	migrationCA string
+	// tlsUnusable is why the target's migration-TLS credentials are unusable
+	// (MigrationTLSUnusableMD), "" when it did not say.
+	tlsUnusable string
+	remap       map[string]string // installer CD-ROM source path -> the target's file
 	// migAddr is the target's address inside migration.network, "" when none
 	// was asked for or the target gave none (migration_network.go).
 	migAddr string
@@ -2591,6 +2776,7 @@ type ensureOutcome struct {
 // target's address in migration.network when one is configured, which makes
 // the call even where it would otherwise have nothing to send.
 func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub, wantTLS, runtime bool) (ensureOutcome, error) {
+	s.endMoveRecords(vmName)
 	isoPaths, err := s.domainInstallerISOPaths(vmName, runtime)
 	if err != nil {
 		return ensureOutcome{}, err
@@ -2629,6 +2815,7 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 	}
 	defer closer()
 
+	var hdr metadata.MD
 	resp, err := client.EnsureDisks(ctx, &pb.EnsureDisksRequest{
 		VmName: vmName, Disks: stubs, WantMigrationTls: wantTLS,
 		InstallerIsoListed: true, InstallerIsoPaths: isoPaths, InstallerIsoRuntime: runtime && len(isoPaths) > 0,
@@ -2637,7 +2824,7 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 		NicMtu:             mtus,
 		WantNetworkDevices: wantNetDevs,
 		NetworkArrivalId:   networkArrivalID(ctx),
-	})
+	}, grpc.Header(&hdr))
 	if err != nil && shareOnly {
 		slog.Warn("migration: the target did not answer the migration preflight; cpu-shares, VNC password and NICs move as defined",
 			"vm", vmName, "target", targetHost, "error", err)
@@ -2678,7 +2865,14 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 			slog.Info("migration: the target opens the installer ISO at its own file", "vm", vmName, "target", targetHost, "here", from, "there", to)
 		}
 	}
-	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), remap: remap, migAddr: resp.GetMigrationAddress(), cgroupMode: resp.GetCgroupMode(), vncPasswordUnavailable: resp.GetVncPasswordUnavailable(), netDevices: resp.GetNetworkDevices()}, nil
+	var targetCA, unusable string
+	if v := hdr.Get(MigrationCAMD); len(v) > 0 {
+		targetCA = v[0]
+	}
+	if v := hdr.Get(MigrationTLSUnusableMD); len(v) > 0 {
+		unusable = v[0]
+	}
+	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), migrationCA: targetCA, tlsUnusable: unusable, remap: remap, migAddr: resp.GetMigrationAddress(), cgroupMode: resp.GetCgroupMode(), vncPasswordUnavailable: resp.GetVncPasswordUnavailable(), netDevices: resp.GetNetworkDevices()}, nil
 }
 
 // olderTargetISORemap points, for a move to an older target, the CD-ROM that
@@ -2940,6 +3134,7 @@ func (s *Server) ensureCloudInitRequest(ctx context.Context, vm *corrosion.VMRec
 // ensureCloudInitOnTarget calls the target host to generate the cloud-init ISO
 // before migration starts, so libvirt can find the file when the domain arrives.
 func (s *Server) ensureCloudInitOnTarget(ctx context.Context, targetHost string, vm *corrosion.VMRecord) {
+	s.endMoveRecords(vm.Name)
 	req := s.ensureCloudInitRequest(ctx, vm)
 	if req == nil {
 		return
@@ -3014,10 +3209,22 @@ type migrationFinish struct {
 	// armed lets a guest handed over paused run once its NIC guards are in
 	// force on the target (armedMigration.finish).
 	armed *armedMigration
+	// lease is the target's capacity reservation for the move, released when
+	// an adopted migration ends, not when its request returns.
+	lease *reservationLease
+	// drainFrom is the drained host when a drain handed the move over: a
+	// failed move then runs post_migrate (the drain's one-pre/one-post
+	// pairing), and a completed one writes the drain record and leaves
+	// drain_move_timed_out.
+	drainFrom string
 	// fwLive is a live firmware move: Release on the target lets its guest
 	// run, in place of armed.finish (spec §6.1 step 10).
 	fwLive *liveFirmwareRun
 }
+
+// drainForgetHookForTest runs just before a completed background drain move
+// leaves drain_move_timed_out. Tests only.
+var drainForgetHookForTest func()
 
 // migratingDetailPrefix starts a migrating row's state detail, followed by
 // the target host's name (migratingToward reads it back).
@@ -3033,14 +3240,15 @@ var adoptedMigrationCeiling = time.Hour
 // would not converge kept running, adopted, with the VM's lock held. A client
 // that merely stopped listening (ctx itself done) is not a policy: that
 // migration is adopted and allowed to finish.
-func (s *Server) abortOnMigrateTimeout(ctx, migrateCtx context.Context, vmName string) {
+func (s *Server) abortOnMigrateTimeout(ctx, migrateCtx context.Context, vmName string) bool {
 	if ctx.Err() != nil || !errors.Is(migrateCtx.Err(), context.DeadlineExceeded) {
-		return
+		return false
 	}
 	slog.Warn("migrate: timeout reached; aborting the libvirt migration job", "vm", vmName)
 	if err := s.virt.AbortMigration(vmName); err != nil {
 		slog.Error("migrate: could not abort the timed-out migration", "vm", vmName, "error", err)
 	}
+	return true
 }
 
 // finishMigrationOnTarget is everything after a committed cut-over that makes
@@ -3162,6 +3370,8 @@ type migrationAbort struct {
 	// diskAddr is the target's address in migration.network, when the cold disk
 	// copy is to use it ("" = the cluster address).
 	diskAddr string
+	// copyStarted is set once a cold move began copying a disk to the target.
+	copyStarted bool
 }
 
 // undoMigrationAttempt is MigrateVM's exit path for an attempt that ended before
@@ -3175,13 +3385,19 @@ func (s *Server) undoMigrationAttempt(ctx context.Context, vmName, target string
 	// The VFs first: the guest is staying, and every moment it runs without its
 	// NIC, with the VF free for another VM to claim, is the damage being undone.
 	s.reattachVFsOnSource(ctx, vmName, a.detachedVFs, a.leaseWritten)
+	// A cold move rolls back from here after its disk copy began, too: the
+	// record says which.
+	when := "before the copy started"
+	if a.copyStarted {
+		when = "after its disk copy started"
+	}
 	if a.stateWritten {
 		s.restoreSourceStateAfterFailedMigration(ctx, vmName,
-			fmt.Sprintf("migration to %s abandoned before the copy started", target),
-			fmt.Sprintf("migration to %s abandoned before the copy started, and the domain is not running", target))
+			fmt.Sprintf("migration to %s abandoned %s", target, when),
+			fmt.Sprintf("migration to %s abandoned %s, and the domain is not running", target, when))
 	}
 	s.cleanupFailedMigrationTarget(ctx, vmName, target, a.createdStubs)
-	slog.Warn("migrate: attempt ended before the copy started; undone", "vm", vmName, "target", target)
+	slog.Warn("migrate: attempt ended "+when+"; undone", "vm", vmName, "target", target)
 }
 
 // restoreSourceStateAfterFailedMigration takes a VM's row out of `migrating`

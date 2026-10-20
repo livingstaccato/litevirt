@@ -225,7 +225,16 @@ func (s *Server) hasSecondFactor(ctx context.Context, username string) (bool, er
 	if err != nil {
 		return false, fmt.Errorf("list enrolled second factors for %q: %w", username, err)
 	}
-	return len(factors) > 0, nil
+	if len(factors) > 0 {
+		return true, nil
+	}
+	// A held factor counts: an enrollment-only session must not enroll one
+	// of its own beside it.
+	held, err := corrosion.ListHeldUser2FA(ctx, s.db, username)
+	if err != nil {
+		return false, fmt.Errorf("list held second factors for %q: %w", username, err)
+	}
+	return len(held) > 0, nil
 }
 
 // sessionEnrollOnly reports whether session sid, opened through realm, is
@@ -410,7 +419,7 @@ func (s *Server) SetUserAccount(ctx context.Context, req *pb.SetUserAccountReque
 			if errors.Is(err, corrosion.ErrLoginPolicyGateClosed) {
 				return status.Error(codes.FailedPrecondition, err.Error())
 			}
-			return status.Errorf(codes.Internal, "set account state: %v", err)
+			return userWriteStatus(err, "set account state")
 		}
 		return nil
 	}); err != nil {
@@ -654,7 +663,7 @@ func (s *Server) IssueEnrollmentCode(ctx context.Context, req *pb.IssueEnrollmen
 			if errors.Is(ierr, corrosion.ErrLoginPolicyGateClosed) {
 				return status.Error(codes.FailedPrecondition, ierr.Error())
 			}
-			return status.Errorf(codes.Internal, "issue enrollment code: %v", ierr)
+			return userWriteStatus(ierr, "issue enrollment code")
 		}
 		return nil
 	}); err != nil {

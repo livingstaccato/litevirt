@@ -58,7 +58,7 @@ func (s *Server) SetVMMemory(ctx context.Context, req *pb.SetVMMemoryRequest) (*
 	}
 
 	// Pre-latch: the direct balloon + mem_actual path.
-	unlock := s.lockVM(req.Name)
+	unlock := s.lockVMAs(req.Name, "memory change")
 	defer unlock()
 	vm, err = corrosion.GetVM(ctx, s.db, req.Name)
 	if err != nil || vm == nil {

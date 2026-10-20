@@ -112,7 +112,7 @@ func (s *Server) GrantRole(ctx context.Context, req *pb.GrantRoleRequest) (*pb.G
 		Propagate: req.Propagate,
 	}
 	if err := corrosion.InsertRoleBinding(ctx, s.db, binding); err != nil {
-		return nil, status.Errorf(codes.Internal, "insert binding: %v", err)
+		return nil, userWriteStatus(err, "insert binding")
 	}
 	// Make the grant effective immediately (a grant is additive, so a
 	// best-effort reload is safe — a transient failure is caught by the
@@ -322,7 +322,7 @@ func (s *Server) NormalizeRoleBindings(ctx context.Context, req *pb.NormalizeRol
 				Principal: canonical, Propagate: b.Propagate,
 			}
 			if err := corrosion.InsertRoleBinding(ctx, s.db, nb); err != nil {
-				return nil, status.Errorf(codes.Internal, "insert canonical binding: %v", err)
+				return nil, userWriteStatus(err, "insert canonical binding")
 			}
 			existing[bindingKey(b.Path, b.Role, canonical, b.Propagate)] = true
 		}

@@ -293,7 +293,16 @@ func automationPasswordFactorRequiredTx(ctx context.Context, tx *sql.Tx, name st
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM user_2fa WHERE username=? AND deleted_at IS NULL AND epoch=(SELECT active_epoch FROM user_2fa_sets WHERE username=? AND deleted_at IS NULL)`, name, name).Scan(&count); err != nil {
 		return false, err
 	}
-	return required || count != 0, nil
+	if required || count != 0 {
+		return true, nil
+	}
+	// Held factors are never accepted, but their account cannot fall back to
+	// password-only automation authentication. Match ListHeldUser2FA inside
+	// this same authorization transaction rather than taking a second read.
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM user_2fa WHERE username=? AND deleted_at IS NULL AND epoch || ?=(SELECT active_epoch FROM user_2fa_sets WHERE username=? AND deleted_at IS NULL)`, name, userEpochHeldSuffix, name).Scan(&count); err != nil {
+		return false, err
+	}
+	return count != 0, nil
 }
 
 func automationPasswordAccountCurrentTx(ctx context.Context, tx *sql.Tx, name string) error {

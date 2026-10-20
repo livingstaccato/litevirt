@@ -253,7 +253,7 @@ func (s *Server) executeReservationRelease(ctx context.Context, view *corrosion.
 	if container {
 		unlock, locked = s.TryLockContainer(name)
 	} else {
-		unlock, locked = s.tryLockVM(name)
+		unlock, locked = s.tryLockVMAs(name, "reservation release")
 	}
 	if !locked {
 		noun := "VM"

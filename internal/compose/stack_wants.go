@@ -23,3 +23,10 @@ func StoredStackWants(composeYAML string) (defaultDeny bool, repos map[string]bo
 	}
 	return f.FirewallDefaults != nil && f.FirewallDefaults.DefaultDeny, repos, nil
 }
+
+// DeclaresFirewall reports whether the file declares a firewall: security
+// groups, ip sets or a firewall block. Each is global firewall state, so
+// writing, replacing or removing it needs sg.write at the cluster root.
+func (f *File) DeclaresFirewall() bool {
+	return f != nil && (len(f.SecurityGroups) > 0 || len(f.IPSets) > 0 || f.FirewallDefaults != nil)
+}

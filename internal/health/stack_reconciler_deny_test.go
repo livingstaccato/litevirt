@@ -43,12 +43,14 @@ func TestStackReconciler_ReassertsADenyALiveStackAsksFor(t *testing.T) {
 	}
 }
 
-// cr7 round 2. The re-assert after a removal counts only stacks recorded
-// after it, never a stack being deleted, and leaves an operator's allow row
-// that predates the stack alone.
+// cr7 round 2, as round 6b settles it. The re-assert after a removal counts
+// every stack that asks, however new the removal (one written on a lagging
+// replica must not open the cluster), never a stack being deleted, and
+// leaves an operator's allow row that predates the stack alone.
 //
-// Mutations: ignore the removal's time (the stale stack re-sets the deny);
-// count deleting stacks (the stack mid-down re-sets it).
+// Mutations: count only stacks recorded after the removal (the old rule) —
+// "stack recorded before the removal", red; count deleting stacks (the
+// stack mid-down re-sets it).
 func TestStackReconciler_ReassertRespectsTheRemoval(t *testing.T) {
 	ctx := context.Background()
 	newDB := func() *corrosion.Client {
@@ -81,15 +83,8 @@ func TestStackReconciler_ReassertRespectsTheRemoval(t *testing.T) {
 		if err := corrosion.DeleteFirewallDefault(ctx, db, "cluster"); err != nil {
 			t.Fatal(err)
 		}
-		if d := pass(db); d != nil {
-			t.Errorf("cluster default = %+v, want none: s's record predates the removal", d)
-		}
-		// Recorded again after the removal, it asks anew.
-		if err := corrosion.UpsertStack(ctx, db, corrosion.StackRecord{Name: "s", State: "active", ComposeYAML: denyYAML}); err != nil {
-			t.Fatal(err)
-		}
 		if d := pass(db); d == nil || !d.DefaultDeny || d.StackName != "s" {
-			t.Errorf("cluster default = %+v, want deny owned by s", d)
+			t.Errorf("cluster default = %+v, want deny owned by s: its file asks, whatever removed the deny", d)
 		}
 	})
 	t.Run("stack being deleted", func(t *testing.T) {

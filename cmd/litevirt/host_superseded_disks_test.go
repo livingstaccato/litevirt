@@ -73,6 +73,29 @@ func TestPrintSupersededDisks_SaysAKeptFileIsAnEarlierVMs(t *testing.T) {
 	}
 }
 
+// A copy of a deleted VM is listed under that VM as "<vm> (deleted)", and
+// is not counted as retained; a kept file of a deleted VM keeps the bare
+// name (round-12 review M3).
+//
+// Mutation: drop the "(deleted)" suffix — red.
+func TestPrintSupersededDisks_NamesADeletedVM(t *testing.T) {
+	var out bytes.Buffer
+	printSupersededDisks(&out, &pb.SupersededDisksResponse{Host: "node-a", RetentionDays: 7, Disks: []*pb.SupersededDisk{
+		{Path: "/p/gone-root.qcow2.superseded-x", DiskPath: "/p/gone-root.qcow2", SizeBytes: 9, VmName: "gone", VmState: "deleted"},
+		{Path: "/d/old-root.qcow2.kept-x", DiskPath: "/d/old-root.qcow2", SizeBytes: 9, VmName: "old", VmState: "deleted", Kept: true, Held: "kept"},
+	}}, false, time.Now())
+	s := out.String()
+	if !strings.Contains(s, "gone (deleted)") {
+		t.Fatalf("the deleted VM's copy is not listed as \"gone (deleted)\":\n%s", s)
+	}
+	if strings.Contains(s, "old (deleted)") {
+		t.Fatalf("a kept file is listed with the deleted suffix:\n%s", s)
+	}
+	if strings.Contains(s, "Retained:") {
+		t.Fatalf("a deleted VM's copy is counted as retained:\n%s", s)
+	}
+}
+
 type supersededRestoreClient struct {
 	pb.LiteVirtClient
 	resp *pb.SupersededDisksResponse

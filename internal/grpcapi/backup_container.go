@@ -207,7 +207,7 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 		return status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}
 
-	unlock := s.lockVM("ct/" + req.Name)
+	unlock := s.lockVMAs("ct/"+req.Name, "container backup")
 	defer unlock()
 
 	// When asked to push to a remote sink (sink_host set), archive into a LOCAL
@@ -859,7 +859,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		return err
 	}
 
-	unlock := s.lockVM("ct/" + req.Name)
+	unlock := s.lockVMAs("ct/"+req.Name, "container restore")
 	defer unlock()
 
 	// Refuse to clobber a live container of the same name on this host. Fail CLOSED

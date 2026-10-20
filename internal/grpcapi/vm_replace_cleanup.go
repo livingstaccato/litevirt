@@ -856,7 +856,7 @@ func domainUUIDFromXML(xml string) string {
 // operator just stopped gets started again.
 func (s *Server) lockedFinishVMReplace(ctx context.Context, cl corrosion.VMReplaceCleanup) error {
 	for _, n := range sortedPair(cl.Manifest.ReplacedVM, cl.Manifest.Replacement) {
-		unlock := s.lockVM(n)
+		unlock := s.lockVMAs(n, "VM replace")
 		defer unlock()
 	}
 	// RELOAD under the locks. The snapshot that got us here was taken before them,

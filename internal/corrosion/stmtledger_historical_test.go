@@ -139,7 +139,12 @@ import (
 // vm_disk_host_move_v130 family, receive-only, with the full-PK update
 // disposition it already had. An ADDITION; no previously accepted historical
 // identity was removed or changed.
-const compatibilityDigest = "aebf1f63f1266f122d61f7959cd655c832482a2e816ddaac03bd47f5b0a3a180"
+// Updated again when the legacy network-name pass's VM spec rewrite became a
+// desired-spec edit (MutateDesiredSpec): its bare `UPDATE vms SET spec = ?,
+// updated_at = ?` moved from the current ledger to the vm_spec_rescope_v130
+// family, receive-only, with the full-PK update disposition it already had. An
+// ADDITION; no previously accepted historical identity was removed or changed.
+const compatibilityDigest = "7ca7d5be21fff4328f71e195e58835208638387c30b39484fca5ea56d0c5d03f"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -211,6 +216,7 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"canonical_registry_v1_retired":         2,   // retired canonical registry design: the canonical upsert (DispReject) + consolidation's by-id tombstone; never emitted
 	"rebalance_reap_stale_bulk_v130":        1,   // executor's bulk stale reap with a lexical updated_at cutoff, before updated_at became the LWW key
 	"vm_disk_host_move_v130":                1,   // a disk row's host-only move (migration commit, failover), before moves carried the placement
+	"vm_spec_rescope_v130":                  1,   // the legacy network-name pass's bare VM spec rewrite, before it became a desired-spec edit
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.

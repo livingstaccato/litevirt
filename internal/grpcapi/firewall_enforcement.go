@@ -314,10 +314,17 @@ func (s *Server) setFirewallCondition(ctx context.Context, code string, active b
 // setHostCondition raises or resolves one of this host's conditions of an
 // evaluator, writing and notifying only on a change.
 func (s *Server) setHostCondition(ctx context.Context, evaluator, code string, active bool, severity, detail string) {
+	s.setHostConditionOf(ctx, evaluator, code, s.hostName, active, severity, detail)
+}
+
+// setHostConditionOf is setHostCondition for the condition about host, which
+// need not be this one (an undrain, run from any host, resolves the drained
+// host's). The writer is still recorded as this host.
+func (s *Server) setHostConditionOf(ctx context.Context, evaluator, code, host string, active bool, severity, detail string) {
 	if s.db == nil {
 		return
 	}
-	row, ok, err := corrosion.GetHealthCondition(ctx, s.db, evaluator, code, "host", s.hostName)
+	row, ok, err := corrosion.GetHealthCondition(ctx, s.db, evaluator, code, "host", host)
 	if err != nil {
 		return
 	}
@@ -330,7 +337,7 @@ func (s *Server) setHostCondition(ctx context.Context, evaluator, code string, a
 		if !active {
 			return
 		}
-		row = corrosion.HealthCondition{Evaluator: evaluator, Code: code, SubjectKind: "host", SubjectID: s.hostName, FirstSeen: ts}
+		row = corrosion.HealthCondition{Evaluator: evaluator, Code: code, SubjectKind: "host", SubjectID: host, FirstSeen: ts}
 	}
 	if active {
 		if !isActive {
@@ -341,7 +348,7 @@ func (s *Server) setHostCondition(ctx context.Context, evaluator, code string, a
 	} else {
 		row.Lifecycle, row.ResolvedAt, row.ObserveCount, row.CleanCount = corrosion.ConditionResolved, ts, 0, 1
 	}
-	row.Severity, row.Hosts, row.LastSeen, row.Reporter = severity, []string{s.hostName}, ts, s.hostName
+	row.Severity, row.Hosts, row.LastSeen, row.Reporter = severity, []string{host}, ts, s.hostName
 	if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
 		slog.Warn("could not record a health condition", "evaluator", evaluator, "code", code, "error", err)
 		return
@@ -354,7 +361,7 @@ func (s *Server) setHostCondition(ctx context.Context, evaluator, code string, a
 	if !active {
 		verb, sev = "resolved", notify.SevInfo
 	}
-	s.notify(ctx, notify.Notification{Kind: code, Severity: sev, Subject: s.hostName, Detail: verb + ": " + detail})
+	s.notify(ctx, notify.Notification{Kind: code, Severity: sev, Subject: host, Detail: verb + ": " + detail})
 }
 
 // SeedFirewallEnforcementLoop records the founder's genesis decision

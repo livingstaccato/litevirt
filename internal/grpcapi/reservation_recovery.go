@@ -196,7 +196,7 @@ func (s *Server) SweepReservationsOnce(ctx context.Context) (released int) {
 // the failure is a fault rather than a changed state.
 func (s *Server) releaseSweptReservation(ctx context.Context, v *corrosion.HostReservationView,
 	loadHosts func() ([]corrosion.HostRecord, error)) (ok bool, remedy string) {
-	unlock, locked := s.tryLockVM(v.VMName)
+	unlock, locked := s.tryLockVMAs(v.VMName, "reservation sweep")
 	if !locked {
 		s.reservationMetrics.Skipped("vm_busy")
 		// Not retried this pass: a fault it had stays recorded, so it is

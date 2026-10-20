@@ -84,6 +84,7 @@ func newFWLocalMove(t *testing.T) *fwLocalMove {
 	f.src.virt = f.srcVirt
 	f.dst = testServerWithLocks(t)
 	f.dst.hostName = "dst-host"
+	f.dst.db.SetClusterPolicyGate(func() bool { return true }) // failover_scope_v1 latched: stub records are kept
 	f.dstVirt = libvirtfake.New()
 	f.dst.virt = f.dstVirt
 	// One firmware layout, as every host of a real cluster has; the two test

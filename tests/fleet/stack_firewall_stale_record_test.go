@@ -1,0 +1,504 @@
+package fleet
+
+import (
+	"context"
+	"io"
+	"strings"
+	"testing"
+	"time"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/auth"
+	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
+)
+
+const staleEdgeV1 = `name: edge
+
+images:
+  test:
+    source: file:///dev/null
+
+vms:
+  edge-1:
+    image: test
+    cpu: 1
+    memory: 512
+    placement:
+      host: node-0
+`
+
+const staleEdgeV2 = staleEdgeV1 + `
+security-groups:
+  web:
+    rules:
+      - {direction: ingress, proto: tcp, port: "80", action: accept}
+firewall:
+  default-deny: true
+`
+
+// TestFleet_StackFirewall_AnOlderRecordCannotAuthorizeTearingItDown: the
+// entry node of `lv compose down` holds an OLDER record of the stack, with no
+// firewall, and none of the firewall rows a newer Admin deploy wrote on
+// node-0. It authorizes the teardown on what it sees, and the teardown is
+// applied by the stack's name on every peer. Its member's delete fails, so
+// the stack is left "deleting" for the reconcilers, and node-0's reconciler
+// takes it up once replication resumes.
+//
+// An Operator without sg.write at the root: node-0 keeps the security group
+// and the cluster default-deny, keeps the stack "deleting", and raises
+// stack.firewall_teardown_held naming `lv compose down --name edge`, which an
+// Admin then runs to finish it. An Admin: node-0's reconciler removes them.
+//
+// Mutation: remove the firewall whatever the teardown's authority
+// (stackFirewallHold returns "") — the Operator case loses the group and the
+// deny, red. Record every teardown as one without sg.write — the Admin case
+// keeps them, red.
+func TestFleet_StackFirewall_AnOlderRecordCannotAuthorizeTearingItDown(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		admin bool
+	}{{"operator without sg.write", false}, {"admin", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 7204})
+			a, b := c.Nodes[0], c.Nodes[2]
+			for _, n := range c.Nodes {
+				openNICGuards(t, n)
+			}
+			if err := corrosion.InsertImage(ctx, a.DB, corrosion.ImageRecord{Name: "test", Format: "qcow2",
+				SourceURL: "file:///dev/null", Checksum: "deadbeef", SizeBytes: 1024}); err != nil {
+				t.Fatal(err)
+			}
+			if err := writeEmptyImageFile(a.Server.ImagePathForTests("test")); err != nil {
+				t.Fatal(err)
+			}
+			tok := scopedOperatorToken(t, c, a, "opal", "acme")
+			admin := c.SelfClient(a)
+			deployAndDrain(t, ctx, admin, &pb.DeployStackRequest{ComposeYaml: staleEdgeV1})
+			c.WaitConverged(t, convergeTimeout)
+			// Every node's engine sees opal's binding, so none falls back to
+			// the cluster-wide legacy role for her.
+			for _, n := range c.Nodes {
+				e := auth.NewEngine(n.DB)
+				if err := e.Reload(ctx); err != nil {
+					t.Fatal(err)
+				}
+				n.Server.SetAuthEngine(e)
+			}
+			if vm, _ := corrosion.GetVM(ctx, b.DB, "edge-1"); vm == nil {
+				t.Fatalf("fixture: edge-1 did not reach %s", b.Name)
+			}
+
+			// An Admin adds the firewall while b lags.
+			c.Isolate(b)
+			deployAndDrain(t, ctx, admin, &pb.DeployStackRequest{ComposeYaml: staleEdgeV2})
+			if g, _ := corrosion.ListSecurityGroups(ctx, a.DB, "edge"); len(g) != 1 {
+				t.Fatalf("fixture: the stack's group is not on %s: %+v", a.Name, g)
+			}
+			if st, _ := corrosion.GetStack(ctx, b.DB, "edge"); st == nil || strings.Contains(st.ComposeYAML, "security-groups") {
+				t.Fatalf("fixture: %s does not hold the older record: %+v", b.Name, st)
+			}
+			if owns, _ := corrosion.StackOwnsFirewall(ctx, b.DB, "edge"); owns {
+				t.Fatalf("fixture: %s holds the stack's firewall rows", b.Name)
+			}
+
+			// The member's delete fails (an operation holds it), so the
+			// teardown is left "deleting" for the reconcilers.
+			for _, n := range c.Nodes {
+				if err := localExec(ctx, n.DB, `UPDATE vms SET active_operation_id = 'op-held' WHERE name = 'edge-1'`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			client := c.bearerClient(b, tok)
+			if tc.admin {
+				client = c.SelfClient(b)
+			}
+			stream, err := client.DeleteStack(ctx, &pb.DeleteStackRequest{Name: "edge"})
+			for err == nil {
+				_, err = stream.Recv()
+			}
+			if err != io.EOF {
+				t.Fatalf("compose down on %s, which sees no firewall: %v, want it to run", b.Name, err)
+			}
+			if st, _ := corrosion.GetStack(ctx, b.DB, "edge"); st == nil || st.State != "deleting" {
+				t.Fatalf("fixture: the teardown on %s was not left \"deleting\": %+v", b.Name, st)
+			}
+
+			c.ClearLinkFaults()
+			eventually(t, convergeTimeout, "the teardown reaches "+a.Name, func() bool {
+				st, _ := corrosion.GetStack(ctx, a.DB, "edge")
+				return st != nil && st.State == "deleting"
+			})
+			eventually(t, convergeTimeout, "the firewall rows reach "+b.Name, func() bool {
+				owns, _ := corrosion.StackOwnsFirewall(ctx, b.DB, "edge")
+				return owns
+			})
+			for _, n := range c.Nodes {
+				if err := localExec(ctx, n.DB, `UPDATE vms SET active_operation_id = '' WHERE name = 'edge-1'`); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			r := health.NewStackReconciler(a.Name, a.DB)
+			r.SetCleaner(a.Server)
+			r.SetClock(func() time.Time { return time.Now().Add(2 * time.Minute) }) // past the in-flight grace
+			r.ReconcileOnce(ctx)
+
+			groups, _ := corrosion.ListSecurityGroups(ctx, a.DB, "edge")
+			deny, _ := corrosion.GetFirewallDefault(ctx, a.DB, "cluster")
+			st, _ := corrosion.GetStack(ctx, a.DB, "edge")
+			if vm, _ := corrosion.GetVM(ctx, a.DB, "edge-1"); vm != nil {
+				t.Errorf("the reconciler did not delete the member: %+v", vm)
+			}
+			if tc.admin {
+				if len(groups) != 0 || (deny != nil && deny.DefaultDeny) || st != nil {
+					t.Fatalf("an Admin's teardown on %s left groups %+v, default %+v, stack %+v", a.Name, groups, deny, st)
+				}
+				return
+			}
+			if len(groups) != 1 {
+				t.Errorf("%s: the teardown of a caller without sg.write removed the stack's group: %+v", a.Name, groups)
+			}
+			if deny == nil || !deny.DefaultDeny {
+				t.Errorf("%s: the teardown of a caller without sg.write removed the cluster default-deny: %+v", a.Name, deny)
+			}
+			if st == nil || st.State != "deleting" {
+				t.Errorf("%s: stack = %+v, want it kept \"deleting\" with its firewall", a.Name, st)
+			}
+			cond, found, err := corrosion.GetHealthCondition(ctx, a.DB, "stack_reconciler", "stack.firewall_teardown_held", "stack", "edge")
+			if err != nil || !found || cond.Lifecycle == corrosion.ConditionResolved {
+				t.Fatalf("no open stack.firewall_teardown_held for edge: %+v (found %v, err %v)", cond, found, err)
+			}
+			if !strings.Contains(cond.Evidence, "lv compose down --name edge") {
+				t.Errorf("the condition does not name the remedy: %s", cond.Evidence)
+			}
+
+			// What it names finishes it: an Admin's compose down.
+			stream, err = c.SelfClient(a).DeleteStack(ctx, &pb.DeleteStackRequest{Name: "edge"})
+			for err == nil {
+				_, err = stream.Recv()
+			}
+			if err != io.EOF {
+				t.Fatalf("an Admin's compose down: %v", err)
+			}
+			// stacks is left out: the lagging node's "deleting" write (an
+			// UPDATE of state and updated_at) is newer than the Admin's
+			// redeploy, so that node keeps the older compose_yaml and
+			// compose_hash under the same updated_at, and so does its
+			// tombstone. Every other table converges.
+			c.WaitConvergedExcept(t, convergeTimeout, []string{"stacks"})
+			for _, n := range c.Nodes {
+				if g, _ := corrosion.ListSecurityGroups(ctx, n.DB, "edge"); len(g) != 0 {
+					t.Errorf("%s: groups %+v after the Admin's compose down", n.Name, g)
+				}
+				if st, _ := corrosion.GetStack(ctx, n.DB, "edge"); st != nil {
+					t.Errorf("%s: stack %+v after the Admin's compose down", n.Name, st)
+				}
+			}
+		})
+	}
+}
+
+// TestFleet_StackFirewall_ATeardownThatCompletesOnAnOlderRecordLeavesItSaid:
+// as above, but the teardown on the lagging node completes there and
+// tombstones the stack. node-0 receives the tombstone with the stack's newer
+// security group still in place: it stays in force, and node-0's reconciler
+// says so (stack.firewall_teardown_held) until an Admin's compose down
+// removes it.
+//
+// Mutation: drop reportTornDownFirewalls from the reconcile pass — no
+// condition, red.
+func TestFleet_StackFirewall_ATeardownThatCompletesOnAnOlderRecordLeavesItSaid(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 7205})
+	a, b := c.Nodes[0], c.Nodes[2]
+	for _, n := range c.Nodes {
+		openNICGuards(t, n)
+	}
+	tok := scopedOperatorToken(t, c, a, "opal", "acme")
+	admin := c.SelfClient(a)
+	deployAndDrain(t, ctx, admin, &pb.DeployStackRequest{ComposeYaml: "name: edge\n"})
+	c.WaitConverged(t, convergeTimeout)
+	for _, n := range c.Nodes {
+		e := auth.NewEngine(n.DB)
+		if err := e.Reload(ctx); err != nil {
+			t.Fatal(err)
+		}
+		n.Server.SetAuthEngine(e)
+	}
+
+	c.Isolate(b)
+	deployAndDrain(t, ctx, admin, &pb.DeployStackRequest{ComposeYaml: `name: edge
+security-groups:
+  web:
+    rules:
+      - {direction: ingress, proto: tcp, port: "80", action: accept}
+`})
+	if g, _ := corrosion.ListSecurityGroups(ctx, a.DB, "edge"); len(g) != 1 {
+		t.Fatalf("fixture: the stack's group is not on %s: %+v", a.Name, g)
+	}
+	stream, err := c.bearerClient(b, tok).DeleteStack(ctx, &pb.DeleteStackRequest{Name: "edge"})
+	for err == nil {
+		_, err = stream.Recv()
+	}
+	if err != io.EOF {
+		t.Fatalf("compose down on %s, which sees no firewall: %v", b.Name, err)
+	}
+	if st, _ := corrosion.GetStack(ctx, b.DB, "edge"); st != nil {
+		t.Fatalf("fixture: the teardown on %s did not complete: %+v", b.Name, st)
+	}
+
+	c.ClearLinkFaults()
+	eventually(t, convergeTimeout, "the tombstone reaches "+a.Name, func() bool {
+		st, _ := corrosion.GetStack(ctx, a.DB, "edge")
+		return st == nil
+	})
+	r := health.NewStackReconciler(a.Name, a.DB)
+	r.SetCleaner(a.Server)
+	r.ReconcileOnce(ctx)
+	if g, _ := corrosion.ListSecurityGroups(ctx, a.DB, "edge"); len(g) != 1 {
+		t.Fatalf("%s: the stack's group did not survive the teardown: %+v", a.Name, g)
+	}
+	cond, found, err := corrosion.GetHealthCondition(ctx, a.DB, "stack_reconciler", "stack.firewall_teardown_held", "stack", "edge")
+	if err != nil || !found || cond.Lifecycle == corrosion.ConditionResolved {
+		t.Fatalf("no open stack.firewall_teardown_held for the torn-down edge: %+v (found %v, err %v)", cond, found, err)
+	}
+	if !strings.Contains(cond.Evidence, "lv compose down --name edge") {
+		t.Errorf("the condition does not name the remedy: %s", cond.Evidence)
+	}
+
+	stream, err = c.SelfClient(a).DeleteStack(ctx, &pb.DeleteStackRequest{Name: "edge"})
+	for err == nil {
+		_, err = stream.Recv()
+	}
+	if err != io.EOF {
+		t.Fatalf("an Admin's compose down of the torn-down stack: %v", err)
+	}
+	if g, _ := corrosion.ListSecurityGroups(ctx, a.DB, "edge"); len(g) != 0 {
+		t.Fatalf("the Admin's compose down left the group: %+v", g)
+	}
+	r.ReconcileOnce(ctx)
+	cond, _, _ = corrosion.GetHealthCondition(ctx, a.DB, "stack_reconciler", "stack.firewall_teardown_held", "stack", "edge")
+	if cond.Lifecycle != corrosion.ConditionResolved {
+		t.Errorf("the condition did not resolve once the group was removed: %+v", cond)
+	}
+}
+
+// TestFleet_StackFirewall_AStaleRedeployCannotWithdrawADefaultDeny: stack
+// base owns the cluster default-deny, and an Admin redeploys stack edge on
+// node-0 asking for it too while node-1 lags. An Operator without sg.write
+// redeploys edge on node-1 from the older file, which asks for nothing: it
+// sees no firewall, so it is allowed, and its record replaces edge's file on
+// every node. When an Admin then tears base down, the deny passes to edge,
+// whose last deploy with sg.write asked for it: the cluster stays
+// default-deny, and stack.firewall_teardown_held says edge's file no longer
+// declares it.
+//
+// Mutation: drop the firewall intent from otherStackWants — the deny goes
+// with base, red. Write the intent for a deploy without sg.write — the
+// Operator's redeploy withdraws it, red.
+func TestFleet_StackFirewall_AStaleRedeployCannotWithdrawADefaultDeny(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 2, IndependentReplicas: true, FaultSeed: 7206})
+	a, b := c.Nodes[0], c.Nodes[1]
+	for _, n := range c.Nodes {
+		openNICGuards(t, n)
+	}
+	tok := scopedOperatorToken(t, c, a, "opal", "acme")
+	admin := c.SelfClient(a)
+	deployAndDrain(t, ctx, admin, &pb.DeployStackRequest{ComposeYaml: "name: base\nfirewall:\n  default-deny: true\n"})
+	deployAndDrain(t, ctx, admin, &pb.DeployStackRequest{ComposeYaml: "name: edge\n"})
+	c.WaitConverged(t, convergeTimeout)
+	for _, n := range c.Nodes {
+		e := auth.NewEngine(n.DB)
+		if err := e.Reload(ctx); err != nil {
+			t.Fatal(err)
+		}
+		n.Server.SetAuthEngine(e)
+	}
+	if d, _ := corrosion.GetFirewallDefault(ctx, a.DB, "cluster"); d == nil || !d.DefaultDeny || d.StackName != "base" {
+		t.Fatalf("fixture: the cluster default is %+v, want deny owned by base", d)
+	}
+
+	c.Isolate(b)
+	deployAndDrain(t, ctx, admin, &pb.DeployStackRequest{ComposeYaml: "name: edge\nfirewall:\n  default-deny: true\n"})
+	if st, _ := corrosion.GetStack(ctx, b.DB, "edge"); st == nil || strings.Contains(st.ComposeYAML, "default-deny") {
+		t.Fatalf("fixture: %s does not hold the older edge: %+v", b.Name, st)
+	}
+	deployAndDrain(t, ctx, c.bearerClient(b, tok), &pb.DeployStackRequest{ComposeYaml: "name: edge\n# redeployed\n"})
+
+	c.ClearLinkFaults()
+	eventually(t, convergeTimeout, "the Operator's edge reaches "+a.Name, func() bool {
+		st, _ := corrosion.GetStack(ctx, a.DB, "edge")
+		return st != nil && !strings.Contains(st.ComposeYAML, "default-deny")
+	})
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"stacks"})
+
+	// An Admin tears base down, expecting edge to keep the deny.
+	stream, err := admin.DeleteStack(ctx, &pb.DeleteStackRequest{Name: "base"})
+	for err == nil {
+		_, err = stream.Recv()
+	}
+	if err != io.EOF {
+		t.Fatalf("an Admin's compose down of base: %v", err)
+	}
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"stacks"})
+	for _, n := range c.Nodes {
+		if d, _ := corrosion.GetFirewallDefault(ctx, n.DB, "cluster"); d == nil || !d.DefaultDeny {
+			t.Errorf("%s: the cluster default is %+v: a stale Operator redeploy withdrew edge's default-deny", n.Name, d)
+		}
+	}
+
+	r := health.NewStackReconciler(a.Name, a.DB)
+	r.SetCleaner(a.Server)
+	r.ReconcileOnce(ctx)
+	cond, found, err := corrosion.GetHealthCondition(ctx, a.DB, "stack_reconciler", "stack.firewall_teardown_held", "stack", "edge")
+	if err != nil || !found || cond.Lifecycle == corrosion.ConditionResolved {
+		t.Fatalf("no open stack.firewall_teardown_held for edge: %+v (found %v, err %v)", cond, found, err)
+	}
+	if !strings.Contains(cond.Evidence, "lv compose up") || !strings.Contains(cond.Evidence, "lv compose down --name edge") {
+		t.Errorf("the condition does not name the remedies: %s", cond.Evidence)
+	}
+}
+
+// TestFleet_StackFirewall_AStaleFirstDeployCannotWithdrawADefaultDeny: stack
+// base owns the cluster default-deny. While node-1 is isolated, an Admin
+// first deploys edge asking for it on node-0, and a second later an Operator
+// without sg.write deploys edge on node-1 from a firewall-free file: node-1
+// holds no record of edge, so it is allowed, and the two replicas keep
+// different created_at for edge. An Admin then tears base down, from either
+// node: the deny passes to edge on both, whose last deploy with sg.write
+// asked for it.
+//
+// Mutation: bind the firewall intent to the record's created_at — the
+// teardown from the lagging node removes the deny, red.
+func TestFleet_StackFirewall_AStaleFirstDeployCannotWithdrawADefaultDeny(t *testing.T) {
+	for _, from := range []int{0, 1} {
+		t.Run([]string{"teardown-from-fresh", "teardown-from-lagging"}[from], func(t *testing.T) {
+			ctx := context.Background()
+			c := New(t, Options{Nodes: 2, IndependentReplicas: true, FaultSeed: 7301})
+			a, b := c.Nodes[0], c.Nodes[1]
+			for _, n := range c.Nodes {
+				openNICGuards(t, n)
+			}
+			tok := scopedOperatorToken(t, c, a, "opal", "acme")
+			admin := c.SelfClient(a)
+			deployAndDrain(t, ctx, admin, &pb.DeployStackRequest{ComposeYaml: "name: base\nfirewall:\n  default-deny: true\n"})
+			c.WaitConverged(t, convergeTimeout)
+			for _, n := range c.Nodes {
+				e := auth.NewEngine(n.DB)
+				if err := e.Reload(ctx); err != nil {
+					t.Fatal(err)
+				}
+				n.Server.SetAuthEngine(e)
+			}
+			c.Isolate(b)
+			deployAndDrain(t, ctx, admin, &pb.DeployStackRequest{ComposeYaml: "name: edge\nfirewall:\n  default-deny: true\n"})
+			time.Sleep(1100 * time.Millisecond) // created_at has whole-second precision
+			deployAndDrain(t, ctx, c.bearerClient(b, tok), &pb.DeployStackRequest{ComposeYaml: "name: edge\n# operator\n"})
+			c.ClearLinkFaults()
+			c.WaitConvergedExcept(t, convergeTimeout, []string{"stacks"})
+			sa, _ := corrosion.GetStack(ctx, a.DB, "edge")
+			sb, _ := corrosion.GetStack(ctx, b.DB, "edge")
+			if sa == nil || sb == nil || sa.CreatedAt == sb.CreatedAt {
+				t.Fatalf("fixture: edge's created_at does not differ between the replicas: %+v / %+v", sa, sb)
+			}
+
+			stream, err := c.SelfClient(c.Nodes[from]).DeleteStack(ctx, &pb.DeleteStackRequest{Name: "base"})
+			for err == nil {
+				_, err = stream.Recv()
+			}
+			if err != io.EOF {
+				t.Fatalf("an Admin's compose down of base: %v", err)
+			}
+			c.WaitConvergedExcept(t, convergeTimeout, []string{"stacks"})
+			for _, n := range c.Nodes {
+				if d, _ := corrosion.GetFirewallDefault(ctx, n.DB, "cluster"); d == nil || !d.DefaultDeny {
+					t.Errorf("%s: the cluster default is %+v: a stale Operator first deploy withdrew edge's default-deny", n.Name, d)
+				}
+			}
+		})
+	}
+}
+
+// TestFleet_StackFirewall_AStaleTeardownCannotWithdrawADefaultDeny: base owns
+// the cluster default-deny, and edge is firewall-free everywhere. While
+// node-1 lags, an Admin redeploys edge on node-0 asking for the deny too. An
+// Operator without sg.write runs `compose down` of edge on node-1, which sees
+// no firewall and completes the teardown there. After the heal an Admin
+// tears base down: the deny passes to edge, whose ask a teardown without
+// sg.write did not end, and stack.firewall_teardown_held names edge until an
+// Admin's compose down of it.
+//
+// Mutation: count only live stacks as heirs of the deny (drop the standing
+// asks from otherStackWants) — the cluster goes default-allow, red.
+func TestFleet_StackFirewall_AStaleTeardownCannotWithdrawADefaultDeny(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 2, IndependentReplicas: true, FaultSeed: 7401})
+	a, b := c.Nodes[0], c.Nodes[1]
+	for _, n := range c.Nodes {
+		openNICGuards(t, n)
+	}
+	tok := scopedOperatorToken(t, c, a, "opal", "acme")
+	admin := c.SelfClient(a)
+	deployAndDrain(t, ctx, admin, &pb.DeployStackRequest{ComposeYaml: "name: base\nfirewall:\n  default-deny: true\n"})
+	deployAndDrain(t, ctx, admin, &pb.DeployStackRequest{ComposeYaml: "name: edge\n"})
+	c.WaitConverged(t, convergeTimeout)
+	for _, n := range c.Nodes {
+		e := auth.NewEngine(n.DB)
+		if err := e.Reload(ctx); err != nil {
+			t.Fatal(err)
+		}
+		n.Server.SetAuthEngine(e)
+	}
+	c.Isolate(b)
+	deployAndDrain(t, ctx, admin, &pb.DeployStackRequest{ComposeYaml: "name: edge\nfirewall:\n  default-deny: true\n"})
+	down := func(client pb.LiteVirtClient, name string) {
+		t.Helper()
+		stream, err := client.DeleteStack(ctx, &pb.DeleteStackRequest{Name: name})
+		for err == nil {
+			_, err = stream.Recv()
+		}
+		if err != io.EOF {
+			t.Fatalf("compose down %s: %v", name, err)
+		}
+	}
+	down(c.bearerClient(b, tok), "edge")
+	if st, _ := corrosion.GetStack(ctx, b.DB, "edge"); st != nil {
+		t.Fatalf("fixture: the teardown did not complete on %s: %+v", b.Name, st)
+	}
+	c.ClearLinkFaults()
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"stacks"})
+
+	down(admin, "base")
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"stacks"})
+	for _, n := range c.Nodes {
+		if d, _ := corrosion.GetFirewallDefault(ctx, n.DB, "cluster"); d == nil || !d.DefaultDeny {
+			t.Errorf("%s: the cluster default is %+v: an Operator teardown withdrew edge's default-deny ask", n.Name, d)
+		}
+	}
+	r := health.NewStackReconciler(a.Name, a.DB)
+	r.SetCleaner(a.Server)
+	r.ReconcileOnce(ctx)
+	cond, found, err := corrosion.GetHealthCondition(ctx, a.DB, "stack_reconciler", "stack.firewall_teardown_held", "stack", "edge")
+	if err != nil || !found || cond.Lifecycle == corrosion.ConditionResolved {
+		t.Fatalf("no open stack.firewall_teardown_held for edge: %+v (found %v, err %v)", cond, found, err)
+	}
+	if !strings.Contains(cond.Evidence, "lv compose down --name edge") {
+		t.Errorf("the condition does not name the remedy: %s", cond.Evidence)
+	}
+
+	// What it names ends it: an Admin's compose down of edge.
+	down(admin, "edge")
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"stacks"})
+	r.ReconcileOnce(ctx)
+	if cond, _, _ = corrosion.GetHealthCondition(ctx, a.DB, "stack_reconciler", "stack.firewall_teardown_held", "stack", "edge"); cond.Lifecycle != corrosion.ConditionResolved {
+		t.Errorf("the condition did not resolve after an Admin's compose down of edge: %+v", cond)
+	}
+	for _, n := range c.Nodes {
+		if d, _ := corrosion.GetFirewallDefault(ctx, n.DB, "cluster"); d != nil && d.DefaultDeny {
+			t.Errorf("%s: the cluster default is %+v after an Admin tore down the last stack asking for it", n.Name, d)
+		}
+	}
+}

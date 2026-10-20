@@ -324,6 +324,17 @@ func (r *Replicator) replayParked(ctx context.Context, tx *sql.Tx, s Statement) 
 		// long ago and this node already accepted. A failed UPDATE changes
 		// nothing (SQLite reverts the statement), so the row is left as it
 		// arrived — the pre-park outcome, for anti-entropy to finish.
+		// A statement bound to an account's incarnation replays only while
+		// the name still holds that incarnation: a lagging delete's cascade
+		// parked here must not land on the rows of an account re-created
+		// since (user_incarnation.go).
+		if u.stmt.Guard != nil {
+			matches, gerr := c.mutationGuardMatches(ctx, tx, u.stmt.Guard)
+			if gerr != nil || !matches {
+				done[u.seq] = true
+				continue
+			}
+		}
 		// A live-row update replays through its guarded form, as it would
 		// have applied had the row been here (live_row_update.go).
 		if err := r.applyLWWGated(ctx, tx, appliedForm(u.stmt), u.shape, u.table, u.pkCols, u.hlc); err != nil {

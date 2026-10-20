@@ -196,7 +196,7 @@ func (s *Server) forgetDeletedVMSeedRecord(ctx context.Context, name string) {
 // which the reconciler's convergeOwnerEpochMarker writes again from its row
 // once the VM runs here.
 func (s *Server) removeDeletedVMMarker(ctx context.Context, name string) {
-	unlock := s.lockVM(name)
+	unlock := s.lockVMAs(name, "deleted-VM marker sweep")
 	defer unlock()
 	// A name has one row (vms.name is its key), so a tombstoned row is also
 	// the absence of a live one: a VM created again under the name revives

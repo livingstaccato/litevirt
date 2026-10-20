@@ -1140,7 +1140,8 @@ lv sg rule-ls <sg-id-or-name>
 lv sg rm <sg-id>
 lv sg bind <vm> --network <net> --sg web        # bind SGs to a NIC at runtime
 
-# Cluster tier: rules applied to every NIC on every host
+# Cluster tier: rules applied to every NIC on every host (cluster and host rules,
+# ipsets and default-deny need sg.write at /, as security groups do)
 lv firewall cluster-rule add --direction ingress --proto tcp --port 443 --action accept
 lv firewall cluster-rule ls
 lv firewall cluster-rule rm <id>
@@ -1319,7 +1320,15 @@ CLI, the REST API and the web UI alike, because all three reach the same gRPC
 handlers with the caller's own credential. The same handler therefore decides
 who may make a change and records it: security-group edits need `sg.write` at
 `/` (Admin or NetworkAdmin) whether they come from `lv sg` or the web UI, and
-the row names the user the session belongs to.
+the row names the user the session belongs to. So do cluster and host rules,
+ip sets and default policies (`lv firewall cluster-rule add/rm`,
+`lv firewall host-rule add/rm`, `lv firewall ipset add/rm`,
+`lv firewall default-deny`, and the same actions in the UI): they are global
+rows every host enforces, as a stack's firewall is. Operator holds only
+`sg.read`, and its refusal names the grant that lets it:
+`lv role grant NetworkAdmin <principal> --path / --propagate`. A caller with
+no role binding of its own falls back to its legacy role, where operator
+passes.
 
 | Action | Target | Recorded by |
 |---|---|---|

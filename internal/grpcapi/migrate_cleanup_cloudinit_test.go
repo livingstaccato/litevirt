@@ -138,6 +138,7 @@ func TestCleanupMigrationArtifacts_KeepsACloudInitISOItDidNotCreate(t *testing.T
 func TestCleanupMigrationArtifacts_RemovesTheCloudInitISOItCreated(t *testing.T) {
 	stageGenisoimage(t)
 	s := testServer(t)
+	s.db.SetClusterPolicyGate(func() bool { return true }) // failover_scope_v1 latched: stub records are kept
 	s.dataDir = t.TempDir()
 	insertTestVM(t, adminCtx(), s.db, "mig", "src-host", "running")
 	if _, err := s.EnsureCloudInit(diskPeerCtx(t, s), &pb.EnsureCloudInitRequest{VmName: "mig"}); err != nil {

@@ -26,9 +26,12 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -57,6 +60,7 @@ func newLiveDrainScenario(t *testing.T) *liveDrainScenario {
 	// the ISO, so the stand-in's empty file is all it needs.
 	stageFakeGenisoimage(t)
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c.openClusterPolicyGate()
 	t.Cleanup(c.Stop)
 	sc := &liveDrainScenario{c: c, src: c.Nodes[0], dst: c.Nodes[1], provisioned: map[string]bool{}}
 	for _, n := range c.Nodes {
@@ -356,5 +360,118 @@ func TestFleet_ADrainColdMoveShowsTheVMStoppingWhileItsGuestRuns(t *testing.T) {
 	if v, err := sc.c.SelfClient(sc.dst).InspectVM(context.Background(), &pb.InspectVMRequest{Name: "os1"}); err != nil ||
 		v.GetState() != pb.VMState_VM_RUNNING {
 		t.Fatalf("os1 after the move: %v (err %v), want VM_RUNNING", v.GetState(), err)
+	}
+}
+
+// A live drain move that stops at the target's arming of the guest's NIC
+// guards — refused there, or cancelled by `lv operation abort` while it waits
+// — takes back the cloud-init ISO it put on the target, as every other early
+// stop does. An ISO the target held before the move is not this move's to
+// remove, and stays.
+//
+// Mutation: no target cleanup when the arming fails — the ISO stays, red.
+func TestFleet_ALiveDrainStoppedAtArmingTakesBackTheISOItPutOnTheTarget(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		abort    bool
+		existing bool
+	}{{"refused", false, false}, {"aborted", true, false}, {"an ISO the target held stays", false, true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			sc := newLiveDrainScenario(t)
+			if !tc.abort {
+				// A guarded NIC, on a target that enforces guards: the
+				// target's refusal to arm them stops the move (an unguarded
+				// VM moves anyway).
+				guardLiveDrainVM(t, sc)
+			}
+			if tc.existing {
+				if err := os.MkdirAll(filepath.Dir(sc.dstISO), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(sc.dstISO, []byte("the target's own iso"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			entered := make(chan struct{})
+			var once sync.Once
+			sc.dst.HookUnary("ArmNICFirewall", func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
+				once.Do(func() { close(entered) })
+				if !tc.abort {
+					return nil, status.Error(codes.FailedPrecondition, "test: the target refuses to arm the guest's guards")
+				}
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(15 * time.Second):
+					return h(ctx, req)
+				}
+			})
+			type res struct {
+				p   *pb.DrainProgress
+				err error
+			}
+			out := make(chan res, 1)
+			go func() { p, err := sc.drain(t); out <- res{p, err} }()
+			select {
+			case <-entered:
+			case <-time.After(15 * time.Second):
+				t.Fatal("the live move never reached the target's arming")
+			}
+			if tc.abort {
+				resp, err := sc.c.SelfClient(sc.src).AbortVMOperation(context.Background(),
+					&pb.AbortVMOperationRequest{VmName: "ci", Force: true})
+				if err != nil || !resp.GetAborted() {
+					t.Fatalf("operation abort = %+v, %v", resp, err)
+				}
+			}
+			var r res
+			select {
+			case r = <-out:
+			case <-time.After(20 * time.Second):
+				t.Fatal("the drain did not end")
+			}
+			if r.p == nil || r.p.Status == "done" {
+				t.Fatalf("drain progress for ci = %+v (err %v); want the move stopped", r.p, r.err)
+			}
+			if tc.abort && !strings.HasPrefix(r.p.Error, "live move was cancelled") {
+				t.Fatalf("drain progress for ci = %+v; want the abort reported", r.p)
+			}
+			if !tc.abort && !strings.Contains(r.p.Error, "could not put the NIC guards") {
+				t.Fatalf("drain progress for ci = %+v; want the target's arming refusal", r.p)
+			}
+			if tc.existing {
+				if _, err := os.Stat(sc.dstISO); err != nil {
+					t.Fatalf("the ISO the target held before the move is gone: %v", err)
+				}
+			} else if _, err := os.Stat(sc.dstISO); !os.IsNotExist(err) {
+				t.Fatalf("the target still holds the cloud-init ISO the stopped move put there (stat: %v)", err)
+			}
+			if _, err := os.Stat(sc.srcISO); err != nil {
+				t.Fatalf("the source's own ISO is gone, though ci still runs there: %v", err)
+			}
+			if n := sc.srcOps("migrate"); n != 0 {
+				t.Fatalf("libvirt was asked to migrate %d time(s)", n)
+			}
+		})
+	}
+}
+
+// guardLiveDrainVM turns the guard of ci's NIC on and makes dst a host that
+// enforces guards, so the target's arming decides the move.
+func guardLiveDrainVM(t *testing.T, sc *liveDrainScenario) {
+	t.Helper()
+	ctx := context.Background()
+	for _, n := range sc.c.Nodes {
+		openNICGuards(t, n)
+	}
+	if err := corrosion.UpdateHostVersion(ctx, sc.dst.DB, sc.dst.Name, "fleet-build"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.SetHostLabel(ctx, sc.dst.DB, sc.dst.Name, corrosion.LabelNICGuards, "fleet-build"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.PutNICGuard(ctx, sc.src.DB, capabilities.GrantForTest(t, capabilities.FeatureNICGuards),
+		corrosion.NICGuardRecord{VMName: "ci", MAC: "52:54:00:00:00:01", Mode: corrosion.NICGuardOn}, "test"); err != nil {
+		t.Fatalf("guard ci's NIC: %v", err)
 	}
 }

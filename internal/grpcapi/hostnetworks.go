@@ -93,7 +93,7 @@ func (s *Server) UpsertHostNetwork(ctx context.Context, req *pb.UpsertHostNetwor
 		defer conn.Close()
 		return c.UpsertHostNetwork(ctx, req)
 	}
-	unlock := s.lockVM("hostnet/" + s.hostName)
+	unlock := s.lockVMAs("hostnet/"+s.hostName, "host network change")
 	defer unlock()
 	rec := corrosion.HostNetworkRecord{
 		HostName: n.HostName, Name: n.Name, Kind: n.Kind,
@@ -170,7 +170,7 @@ func (s *Server) ApplyHostNetwork(ctx context.Context, req *pb.ApplyHostNetworkR
 	if err != nil {
 		return nil, err
 	}
-	unlock := s.lockVM("hostnet/" + s.hostName)
+	unlock := s.lockVMAs("hostnet/"+s.hostName, "host network change")
 	defer unlock()
 	if err := ap.Apply(ctx, req.ForceInterface); err != nil {
 		s.audit(ctx, "host.network", s.hostName, "apply", "error")
@@ -200,7 +200,7 @@ func (s *Server) DeleteHostNetwork(ctx context.Context, req *pb.DeleteHostNetwor
 		defer conn.Close()
 		return c.DeleteHostNetwork(ctx, req)
 	}
-	unlock := s.lockVM("hostnet/" + s.hostName)
+	unlock := s.lockVMAs("hostnet/"+s.hostName, "host network change")
 	defer unlock()
 	if err := corrosion.DeleteHostNetwork(ctx, s.db, req.HostName, req.Name); err != nil {
 		s.audit(ctx, "host.network", req.HostName+"/"+req.Name, "delete", "error")

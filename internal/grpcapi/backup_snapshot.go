@@ -69,7 +69,7 @@ func (s *Server) BackupSnapshot(req *pb.BackupSnapshotRequest, stream grpc.Serve
 			req.VmName, vm.HostName)
 	}
 
-	unlock := s.lockVM(req.VmName)
+	unlock := s.lockVMAs(req.VmName, "backup")
 	defer unlock()
 	// The backup reads the VM's disks and firmware state, which a live
 	// firmware move holds (spec §6.9): refused while its record names the VM.

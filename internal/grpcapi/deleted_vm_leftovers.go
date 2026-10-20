@@ -452,7 +452,7 @@ func (s *Server) removeDeletedVMLeftoversHere(ctx context.Context, req *pb.Clean
 	// as late as possible; a create that lands between those reads and the
 	// removals is the residual window, and it needs a row first, which is what
 	// both checks see.
-	unlock := s.lockVM(name)
+	unlock := s.lockVMAs(name, "deleted-VM cleanup")
 	defer unlock()
 	if cur, err := corrosion.GetVM(ctx, s.db, name); err != nil {
 		return nil, status.Errorf(codes.Unavailable, "read the record of %q: %v", name, err)

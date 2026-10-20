@@ -57,9 +57,6 @@ type liveFirmwareRun struct {
 	// waitCtx, when set, bounds the recovery's waits (a migration job): the
 	// daemon's context, where the steps themselves run detached from it.
 	waitCtx context.Context
-	// leaseReleased, set when the move is adopted, carries whether the
-	// request released the move's lease (adoptAbandonedMigration).
-	leaseReleased chan<- bool
 }
 
 // fwLiveSourceState is the Server's test seams for the source half.

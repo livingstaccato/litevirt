@@ -67,7 +67,7 @@ func (s *Server) ResolvePITOverlay(ctx context.Context, req *pb.ResolvePITOverla
 		defer conn.Close()
 		return client.ResolvePITOverlay(ctx, req)
 	}
-	unlock := s.lockVM(vm.Name)
+	unlock := s.lockVMAs(vm.Name, "point-in-time overlay resolve")
 	defer unlock()
 
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)

@@ -471,6 +471,8 @@ type Client struct {
 	// failover_scope_v1 latch. Fails CLOSED when unset: the table's shapes
 	// back-pressure a previous-release peer. See cluster_policy.go.
 	clusterPolicyGate atomic.Pointer[func() bool]
+	// vmHostWatch observes the VM rows replication applies (vm_host_watch.go).
+	vmHostWatch atomic.Pointer[vmHostWatch]
 	// relayHealthGate, when non-nil and returning true, permits writing the
 	// relay_demoted/<host> rows of cluster_policies. Injected via
 	// SetRelayHealthGate, wired to the durable relay_health_v1 latch. Fails
@@ -488,6 +490,17 @@ type Client struct {
 	// Fails CLOSED when unset: the re-point is a shape a previous-release peer
 	// has no ledger entry for. See netbox_repoint.go.
 	netboxRepointGate atomic.Pointer[func() bool]
+	// userIncarnationGate, when set and returning true, says
+	// user_incarnation_v1 has durably latched: users rows are then deleted and
+	// re-created by incarnation (user_incarnation.go). Unset reads false, the
+	// previous release's statements and merge.
+	userIncarnationGate atomic.Pointer[func() bool]
+	// userHolds are the user writes held for an incarnation this node has
+	// not reached, and the restriction rows recorded with the incarnation
+	// they were written for (user_holds.go). userHoldReplay applies a held
+	// write once it is due; the replicator sets it.
+	userHolds      userHolds
+	userHoldReplay atomic.Pointer[func(context.Context, *sql.Tx, Statement, string) error]
 	// specDropsSeen is the spec-edit drops already noted (firstSpecDrop),
 	// with whether each one's event is recorded.
 	specDropsMu   sync.Mutex
@@ -1550,7 +1563,10 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 	var mutated []Statement
 	var parks []func() // see executeBatchInternal
 	relays := make([][]Statement, 0, len(entries))
-	var allCredHosts entryHostRows // every entry's, for the absorb below
+	var allCredHosts entryHostRows  // every entry's, for the absorb below
+	var guardedUserEffects []func() // user_holds.go, run once tx commits
+	guardedOnCommit := func(fn func()) { guardedUserEffects = append(guardedUserEffects, fn) }
+	guardedUserNames := map[string]string{} // name -> its incarnation before this write
 	for _, stmts := range entries {
 		relay := make([]Statement, 0, len(stmts))
 		// See executeBatchInternal.
@@ -1561,6 +1577,13 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 			return false, err
 		}
 		allCredHosts = allCredHosts.addMissing(credHosts)
+		// See executeBatchInternal (user_incarnation.go).
+		stampUsers, err := c.userStampPlan(stmts)
+		if err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return false, err
+		}
 		for _, s := range stmts {
 			// See executeBatchInternal (credentials_revive_guard.go).
 			credPlan, err := planCredentialUpsert(ctx, tx, s, stmts, credHosts)
@@ -1573,6 +1596,20 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 				return false, err
 			} else if credPlan.skip {
 				continue
+			}
+			if stampUsers {
+				if err := stampUserIncarnation(ctx, tx, &s); err != nil {
+					tx.Rollback()
+					c.mu.Unlock()
+					return false, fmt.Errorf("stamp user incarnation: %w", err)
+				}
+			}
+			if c.UserIncarnationOn() {
+				if err := tagUserLifecycle(ctx, tx, &s); err != nil {
+					tx.Rollback()
+					c.mu.Unlock()
+					return false, fmt.Errorf("tag user lifecycle: %w", err)
+				}
 			}
 			if s.Guard != nil {
 				matches, err := c.mutationGuardMatches(ctx, tx, s.Guard)
@@ -1601,6 +1638,17 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 				c.mu.Unlock()
 				return false, err
 			}
+			if name := usersStatementName(s); name != "" {
+				if _, seen := guardedUserNames[name]; !seen {
+					before, err := userIncarnationHeld(ctx, tx, name)
+					if err != nil {
+						tx.Rollback()
+						c.mu.Unlock()
+						return false, err
+					}
+					guardedUserNames[name] = before
+				}
+			}
 			// A live-row update runs here through the same guarded form every
 			// receiver uses; what is logged is the wire form (live_row_update.go).
 			res, err := tx.ExecContext(ctx, appliedForm(s).SQL, s.Params...)
@@ -1619,6 +1667,7 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 				c.mu.Unlock()
 				return false, err
 			}
+			c.recordUserWrite(ctx, tx, s, s.Guard, guardedOnCommit)
 			changed := false
 			if n, e := res.RowsAffected(); e == nil && n > 0 {
 				changed = true
@@ -1634,6 +1683,13 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 			}
 		}
 		relays = append(relays, relay)
+	}
+	for name, before := range guardedUserNames {
+		if err := c.settleUserName(ctx, tx, name, before, guardedOnCommit); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return false, err
+		}
 	}
 	// `relay`, not `stmts` — see relayStatement. This is the site the
 	// seed-then-compare proof validation was written to work around: it seeds a
@@ -1707,6 +1763,9 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 	c.mu.Unlock()
 	for _, park := range parks {
 		park()
+	}
+	for _, fn := range guardedUserEffects {
+		fn()
 	}
 
 	if c.anyUnresolved() {
@@ -1810,6 +1869,17 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 		c.mu.Unlock()
 		return 0, err
 	}
+	// The account a user-keyed statement names is bound to its incarnation
+	// here, in the write's own transaction (user_incarnation.go).
+	stampUsers, err := c.userStampPlan(stmts)
+	if err != nil {
+		tx.Rollback()
+		c.mu.Unlock()
+		return 0, err
+	}
+	var userEffects []func() // user_holds.go, run once tx commits
+	onCommit := func(fn func()) { userEffects = append(userEffects, fn) }
+	userNames := map[string]string{} // name -> its incarnation before this write
 	for _, s := range stmts {
 		// A fence credential carries the retirement it was set after
 		// (credentials_revive_guard.go).
@@ -1833,6 +1903,38 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 			c.mu.Unlock()
 			return 0, fmt.Errorf("stamp host incarnation: %w", err)
 		}
+		// The account's incarnation, as its users row stands just before this
+		// statement runs, and a guard the writer set checked against it.
+		if stampUsers {
+			if err := stampUserIncarnation(ctx, tx, &s); err != nil {
+				tx.Rollback()
+				c.mu.Unlock()
+				return 0, fmt.Errorf("stamp user incarnation: %w", err)
+			}
+		}
+		if c.UserIncarnationOn() {
+			if err := tagUserLifecycle(ctx, tx, &s); err != nil {
+				tx.Rollback()
+				c.mu.Unlock()
+				return 0, fmt.Errorf("tag user lifecycle: %w", err)
+			}
+		}
+		if err := c.checkOwnUserGuard(ctx, tx, s); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return 0, err
+		}
+		if name := usersStatementName(s); name != "" {
+			if _, seen := userNames[name]; !seen {
+				before, err := userIncarnationHeld(ctx, tx, name)
+				if err != nil {
+					tx.Rollback()
+					c.mu.Unlock()
+					return 0, err
+				}
+				userNames[name] = before
+			}
+		}
 		// This host's own row is not written while its own-row hold holds
 		// (own_row_hold.go).
 		if err := c.ownRowStatementRefused(ctx, tx, s); err != nil {
@@ -1853,6 +1955,7 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 			c.mu.Unlock()
 			return 0, err
 		}
+		c.recordUserWrite(ctx, tx, s, s.Guard, onCommit)
 		changed := false
 		if n, e := res.RowsAffected(); e == nil {
 			affected += n
@@ -1871,6 +1974,16 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 		}
 		if relayStatement(s, changed) {
 			relay = append(relay, s)
+		}
+	}
+
+	// A users row this write moved settles what is held or recorded for its
+	// name (user_holds.go).
+	for name, before := range userNames {
+		if err := c.settleUserName(ctx, tx, name, before, onCommit); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return 0, err
 		}
 	}
 
@@ -1945,6 +2058,9 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 	c.mu.Unlock()
 	for _, park := range parks {
 		park()
+	}
+	for _, fn := range userEffects {
+		fn()
 	}
 
 	// A local write that actually CHANGED a row clears any stale unresolved-tie

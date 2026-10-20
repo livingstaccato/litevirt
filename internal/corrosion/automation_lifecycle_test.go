@@ -685,3 +685,180 @@ func TestAutomationLifecycleProjectGuardedCallbackRollback(t *testing.T) {
 		t.Fatalf("callback failure changed log: %d -> %d, %v", logs, afterLogs, err)
 	}
 }
+
+// The automation password entry has its own transaction-local policy check;
+// a held set must not turn into password-only access when its active join is empty.
+func TestAutomationLifecycleHeldFactorPasswordRefusal(t *testing.T) {
+	for _, mode := range []string{"none", "active", "held", "held_and_active"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			c := lifecycleDB(t)
+			hash, err := bcrypt.GenerateFromPassword([]byte("password"), bcrypt.MinCost)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := InsertUser(ctx, c, "alice", "operator", string(hash)); err != nil {
+				t.Fatal(err)
+			}
+			if mode != "none" {
+				epoch := "factor-set"
+				if mode == "held" || mode == "held_and_active" {
+					epoch += userEpochHeldSuffix
+				}
+				if _, err := c.db.ExecContext(ctx, `INSERT INTO user_2fa_sets(username,active_epoch,updated_at) VALUES(?,?,?)`, "alice", epoch, c.NowTS()); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := c.db.ExecContext(ctx, `INSERT INTO user_2fa(username,method,label,secret,enrolled_at,updated_at,epoch) VALUES(?,?,?,?,?,?,?)`, "alice", "totp", "factor", "secret", nowRFC3339(), c.NowTS(), "factor-set"); err != nil {
+					t.Fatal(err)
+				}
+				if mode == "held_and_active" {
+					if _, err := c.db.ExecContext(ctx, `INSERT INTO user_2fa(username,method,label,secret,enrolled_at,updated_at,epoch) VALUES(?,?,?,?,?,?,?)`, "alice", "totp", "active", "secret", nowRFC3339(), c.NowTS(), epoch); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			held, err := ListHeldUser2FA(ctx, c, "alice")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (len(held) != 0) != (mode == "held" || mode == "held_and_active") {
+				t.Fatal("fixture did not establish actual held-factor representation")
+			}
+			active, err := ListUser2FA(ctx, c, "alice")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (len(active) != 0) != (mode == "active" || mode == "held_and_active") {
+				t.Fatal("fixture active-factor join differs from intended state")
+			}
+			_, enrollErr := EnrollAutomationLocalAccount(ctx, c, "alice", "password")
+			_, authErr := AuthenticateAutomationLocalAccount(ctx, c, "alice", "password")
+			if mode == "none" {
+				if enrollErr != nil || authErr != nil {
+					t.Fatalf("no-factor positive refused: enroll=%v auth=%v", enrollErr, authErr)
+				}
+			} else if enrollErr == nil || authErr == nil {
+				t.Fatalf("factor policy bypass: enroll=%v auth=%v", enrollErr, authErr)
+			}
+		})
+	}
+}
+
+func TestAutomationLifecycleUserIncarnationGuardedRevive(t *testing.T) {
+	ctx := context.Background()
+	c := lifecycleDB(t)
+	c.SetUserIncarnationGate(func() bool { return true })
+	c.SetCredentialsSplitGate(func() bool { return true })
+	if err := InsertUser(ctx, c, "alice", "operator", "old-hash"); err != nil {
+		t.Fatal(err)
+	}
+	first, err := AutomationLifetime(ctx, c, "principal", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := GetUser(ctx, c, "alice")
+	if err != nil || old == nil {
+		t.Fatal("old account missing", err)
+	}
+	if err := DeleteUser(ctx, c, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AutomationLifetime(ctx, c, "principal", "alice"); err == nil {
+		t.Fatal("delete retained live witness")
+	}
+	if err := InsertUser(ctx, c, "alice", "operator", "new-hash"); err != nil {
+		t.Fatal(err)
+	}
+	next, err := AutomationLifetime(ctx, c, "principal", "alice")
+	if err != nil || next.Witness == "" || next.Witness == first.Witness || next.Origin != "birth" {
+		t.Fatalf("revive lacks fresh coupled witness: %+v %v", next, err)
+	}
+	current, err := GetUser(ctx, c, "alice")
+	if err != nil || current == nil || current.CreatedAt == old.CreatedAt {
+		t.Fatal("revive did not advance actual user incarnation", err)
+	}
+	rows, err := c.Query(ctx, `SELECT password_hash FROM user_credentials WHERE username='alice' AND deleted_at IS NULL`)
+	if err != nil || len(rows) != 1 || rows[0].String("password_hash") != "new-hash" {
+		t.Fatal("revive lost coupled credential", err)
+	}
+}
+
+func TestAutomationLifecycleUserGuardMissPreservesWinner(t *testing.T) {
+	ctx := context.Background()
+	c := lifecycleDB(t)
+	c.SetUserIncarnationGate(func() bool { return true })
+	c.SetCredentialsSplitGate(func() bool { return true })
+	if err := InsertUser(ctx, c, "alice", "operator", "old-hash"); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteUser(ctx, c, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	var winner AutomationLifetimeEvidence
+	var logs int
+	userWriteInterleaveHook = func(string) {
+		userWriteInterleaveHook = nil
+		if err := InsertUser(ctx, c, "alice", "operator", "winner-hash"); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		winner, err = AutomationLifetime(ctx, c, "principal", "alice")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM mutation_log`).Scan(&logs); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { userWriteInterleaveHook = nil })
+	if err := InsertUser(ctx, c, "alice", "operator", "loser-hash"); err != ErrUserAccountChanged {
+		t.Fatalf("stale revive = %v, want account-changed", err)
+	}
+	after, err := AutomationLifetime(ctx, c, "principal", "alice")
+	if err != nil || winner.Witness == "" || after != winner {
+		t.Fatalf("guard loser changed winner witness: %+v -> %+v, %v", winner, after, err)
+	}
+	var afterLogs int
+	if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM mutation_log`).Scan(&afterLogs); err != nil || afterLogs != logs {
+		t.Fatalf("guard miss changed log: %d -> %d, %v", logs, afterLogs, err)
+	}
+}
+
+func TestAutomationLifecycleUserGuardedCallbackRollback(t *testing.T) {
+	ctx := context.Background()
+	c := lifecycleDB(t)
+	c.SetUserIncarnationGate(func() bool { return true })
+	c.SetCredentialsSplitGate(func() bool { return true })
+	if err := InsertUser(ctx, c, "alice", "operator", "old-hash"); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteUser(ctx, c, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	capture := func() []byte {
+		t.Helper()
+		var state []interface{}
+		for _, query := range []string{`SELECT * FROM users WHERE username='alice'`, `SELECT * FROM user_credentials WHERE username='alice'`, `SELECT * FROM local_automation_lifetimes WHERE kind='principal' AND name='alice'`, `SELECT * FROM mutation_log ORDER BY seq`} {
+			rows, err := c.Query(ctx, query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			state = append(state, rows)
+		}
+		data, err := json.Marshal(state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	before := capture()
+	if _, err := c.db.ExecContext(ctx, `CREATE TRIGGER fail_user_birth BEFORE INSERT ON local_automation_lifetimes WHEN NEW.kind='principal' BEGIN SELECT RAISE(ABORT,'injected user proof failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertUser(ctx, c, "alice", "operator", "new-hash"); err == nil || !strings.Contains(err.Error(), "injected user proof failure") {
+		t.Fatalf("revive did not reach proof failure: %v", err)
+	}
+	if after := capture(); !bytes.Equal(before, after) {
+		t.Fatalf("proof failure changed parent/credential/witness/log: %s -> %s", before, after)
+	}
+}

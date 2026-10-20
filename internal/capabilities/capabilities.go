@@ -506,6 +506,41 @@ const (
 	// included.
 	NetBoxIPRepointV1 = "netbox_ip_repoint_v1"
 
+	// UserIncarnationV1 makes a deleted account stay deleted
+	// (internal/corrosion/user_incarnation.go). A users row's created_at is
+	// its incarnation. Once latched:
+	//
+	//   - re-creating a deleted name (InsertUser over a tombstone, the admin
+	//     floor's reinstatement) stamps a fresh created_at, and a receiver
+	//     applies it over the tombstone of an older incarnation whatever the
+	//     clocks say;
+	//   - a delete names the incarnation it ends, and a receiver applies it to
+	//     that incarnation whatever later write a lagging node made to it,
+	//     keeping the later clock;
+	//   - anti-entropy never lets a live row beat a tombstone of its own
+	//     incarnation;
+	//   - a write that names the account by username alone (a password, a
+	//     token, a session, a grant, a delete's cascade) carries a
+	//     user_incarnation_v1 mutation guard, and applies only to that
+	//     incarnation.
+	//
+	// Retiring it later moves the two statement shapes to the historical
+	// ledger, not out of it: a retained entry still carries them.
+	//
+	// Before, a password change made on a node that had not yet seen the
+	// delete was newer than it, and last-write-wins brought the deleted
+	// account back on every node, with that password.
+	//
+	// It states a fact about the BINARY, which is why it is mandatory and has
+	// no config flag: this build decodes the two incarnation-bearing
+	// statements and keeps a tombstone over its own incarnation. Every
+	// replica must decide alike, or one keeps an account another deleted.
+	//
+	// ReplicationGated: the two statements are shapes a previous-release peer
+	// has no ledger entry for, and every host still receiving replication, a
+	// maintenance host included, must keep the tombstone as the rest do.
+	UserIncarnationV1 = "user_incarnation_v1"
+
 	// RecoveryClaimV1 gates ENFORCEMENT of single-winner recovery claims
 	// (docs/design/recovery-claims.md §3, §5.1–§5.2,
 	// colonelpanik/litevirt#250): a failover coordinator collects a majority
@@ -1190,6 +1225,11 @@ const ReleaseToken = Release202611V1
 //     dropped edit can be made again. A binary rolled back below it enters
 //     WAL quarantine, as below every latched token.
 //
+//   - user_incarnation_v1 has no flag either, and no stand-down of its own:
+//     it changes how replication orders a users row's delete and re-create,
+//     and every replica must order them alike. A binary rolled back below it
+//     enters WAL quarantine, as below every latched token.
+//
 //   - netbox_ip_repoint_v1 has no flag either: it says this build decodes the
 //     lease re-point statement. What it licenses is bounded to a NetBox
 //     address object NetBox answered 404 for while a live
@@ -1335,6 +1375,10 @@ var supported = []string{
 	// NetBoxIPRepointV1 is advertised UNCONDITIONALLY: it says "this build
 	// decodes the lease re-point statement", a fact about the binary.
 	NetBoxIPRepointV1,
+	// UserIncarnationV1 is advertised UNCONDITIONALLY: it says "this build
+	// decodes the incarnation-bearing users statements and keeps a tombstone
+	// over its own incarnation", a fact about the binary.
+	UserIncarnationV1,
 	// RecoveryClaimV1 is advertised CONDITIONALLY: enforcement.recovery_claim
 	// (default on) on AND this node ready (split_brain_gate_v1 latched, voter_config_v1
 	// ready). Withheld while the flag is off because every flag-on node relies
@@ -1378,7 +1422,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, LeaseTermClaimV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, VRRPUnicastV1, Release202611V1, SpecConflictV1, NetBoxIPRepointV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, LeaseTermClaimV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, VRRPUnicastV1, Release202611V1, SpecConflictV1, NetBoxIPRepointV1, UserIncarnationV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -1473,6 +1517,10 @@ var replicationGated = map[string]bool{
 	// statement must be decodable by every host we stream to. See
 	// NetBoxIPRepointV1.
 	NetBoxIPRepointV1: true,
+	// Confirmed against every replication recipient: each must decode the
+	// incarnation-bearing users statements and keep a tombstone over its own
+	// incarnation as the rest do. See UserIncarnationV1.
+	UserIncarnationV1: true,
 	// Confirmed against every replication recipient: the claim_certificate
 	// column's statement shapes on runtime_action_proofs must be decodable by
 	// every host we stream to. Not mandatory: the flag is the opt-in.
@@ -1569,6 +1617,10 @@ var mandatory = map[string]bool{
 	// A fact about the binary (it decodes the lease re-point statement). The
 	// mirror's own opt-in is its stand-down. See NetBoxIPRepointV1.
 	NetBoxIPRepointV1: true,
+	// A fact about the binary (it decodes the incarnation-bearing users
+	// statements and keeps a tombstone over its own incarnation). See
+	// UserIncarnationV1.
+	UserIncarnationV1: true,
 	// A fact about the binary (it decodes, keeps and honours its release's
 	// fields and shapes). Nothing changes until a feature is used, and every
 	// use is recorded first. See Release202611V1.

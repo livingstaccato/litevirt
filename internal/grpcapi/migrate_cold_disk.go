@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
@@ -34,6 +35,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/diskmode"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/storage"
 )
@@ -77,6 +79,7 @@ func coldDiskFrameDigest(h hash.Hash, offset int64, data []byte) {
 // it. The target removes a file only if it recorded writing it for this VM, so
 // naming one it never wrote removes nothing.
 func (s *Server) copyColdDisksToTarget(ctx context.Context, targetHost, vmName string, disks []corrosion.DiskRecord, formats map[string]string, abort *migrationAbort, send func(pb.MigratePhase, float32, float32) error) ([]corrosion.DiskRecord, error) {
+	s.endMoveRecords(vmName)
 	var toCopy []corrosion.DiskRecord
 	for _, d := range disks {
 		if copiedByStorageMigration(d) {
@@ -109,6 +112,7 @@ func (s *Server) copyColdDisksToTarget(ctx context.Context, targetHost, vmName s
 			return nil, status.Errorf(codes.Unavailable, "cannot reach %s to copy the disks of VM %q: %v", targetHost, vmName, err)
 		}
 		abort.createdStubs = append(abort.createdStubs, d.Path)
+		abort.copyStarted = true
 		err = s.streamColdDisk(ctx, client, vmName, d, formats[d.Path])
 		closeConn()
 		if err != nil {
@@ -165,9 +169,53 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 		allocated = sys.Blocks * 512
 	}
 
-	up, err := client.ReceiveMigrationDisk(ctx)
-	if err != nil {
+	// The copy is bounded by its progress, not by the request: a drain's
+	// move runs detached from its client, and a target that is alive but
+	// wedged (a hung write) takes no frame and never fails the stream. A copy
+	// with no accepted frame (or no answer after the last) for the stall
+	// bound is aborted, and the move rolls back as on any failed copy.
+	// After the last frame the target verifies, syncs and places the disk
+	// before it answers. It syncs as it writes (defaultColdDiskSyncEvery), so
+	// that final sync is no larger than one it made mid-copy, and the same
+	// bound covers it.
+	stall := s.coldDiskStallBound()
+	sctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	progressed := make(chan struct{}, 1)
+	tick := func() {
+		select {
+		case progressed <- struct{}{}:
+		default:
+		}
+	}
+	go func() {
+		t := time.NewTimer(stall)
+		defer t.Stop()
+		for {
+			select {
+			case <-sctx.Done():
+				return
+			case <-progressed:
+				if !t.Stop() {
+					<-t.C
+				}
+				t.Reset(stall)
+			case <-t.C:
+				cancel(errColdCopyStalled)
+				return
+			}
+		}
+	}()
+	stalled := func(err error) error {
+		if errors.Is(context.Cause(sctx), errColdCopyStalled) {
+			return status.Errorf(codes.DeadlineExceeded, "the copy of disk %s to the target made no progress for %s, so it was aborted: %v",
+				d.Path, stall, err)
+		}
 		return err
+	}
+	up, err := client.ReceiveMigrationDisk(sctx)
+	if err != nil {
+		return stalled(err)
 	}
 	// The caller (coldMigrateStoppedVM) confirmed the domain shut off before
 	// the first disk, and holds the VM's lock until the handoff.
@@ -175,8 +223,9 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 		VmName: vmName, Path: d.Path, SizeBytes: size, AllocatedBytes: allocated,
 		OwnerDomainShutOff: true,
 	}); err != nil {
-		return coldDiskSendErr(up, err)
+		return stalled(coldDiskSendErr(up, err))
 	}
+	tick()
 	h := sha256.New()
 	buf := make([]byte, coldDiskChunk)
 	for off := int64(0); off < size; {
@@ -188,8 +237,9 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 				coldDiskFrameDigest(h, off, buf[:n])
 				// Send serializes the frame before it returns, so buf can be reused.
 				if err := up.Send(&pb.ReceiveMigrationDiskRequest{Offset: off, Data: buf[:n]}); err != nil {
-					return coldDiskSendErr(up, err)
+					return stalled(coldDiskSendErr(up, err))
 				}
+				tick()
 			}
 			off += int64(n)
 		}
@@ -204,16 +254,60 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 		}
 	}
 	if err := up.Send(&pb.ReceiveMigrationDiskRequest{Sha256: hex.EncodeToString(h.Sum(nil))}); err != nil {
-		return coldDiskSendErr(up, err)
+		return stalled(coldDiskSendErr(up, err))
 	}
+	tick()
 	resp, err := up.CloseAndRecv()
 	if err != nil {
-		return err
+		return stalled(err)
 	}
 	if resp.GetSizeBytes() != size {
 		return status.Errorf(codes.Internal, "target holds %d bytes of disk %s, want %d", resp.GetSizeBytes(), d.Path, size)
 	}
 	return nil
+}
+
+// errColdCopyStalled is the cause of a cold disk copy cancelled for making no
+// progress (streamColdDisk).
+var errColdCopyStalled = errors.New("the cold disk copy made no progress")
+
+// defaultColdDiskStall bounds how long a cold disk copy may go without the
+// target taking a frame (or answering after the last) before it is aborted.
+const defaultColdDiskStall = 5 * time.Minute
+
+func (s *Server) coldDiskStallBound() time.Duration {
+	if s.coldDiskStall > 0 {
+		return s.coldDiskStall
+	}
+	return defaultColdDiskStall
+}
+
+// SetColdDiskStallForTest shortens the cold disk copy's stall bound.
+func (s *Server) SetColdDiskStallForTest(d time.Duration) { s.coldDiskStall = d }
+
+// defaultColdDiskSyncEvery is how many bytes a receive writes between syncs
+// of the scratch file: the final sync then flushes at most this much, a slow
+// target's storage shows in the sender's progress as it writes, and the
+// stall bound that covers each sync mid-copy covers the final one too.
+const defaultColdDiskSyncEvery = 64 << 20
+
+// SetColdDiskSyncEveryForTest shortens the interval between a receive's syncs.
+func (s *Server) SetColdDiskSyncEveryForTest(n int64) { s.coldDiskSyncEvery = n }
+
+// SetColdDiskPlacedHookForTest runs fn after a received disk is placed,
+// before its directory is synced. Tests only.
+func (s *Server) SetColdDiskPlacedHookForTest(fn func()) { s.coldDiskPlacedHook = fn }
+
+// SetColdDiskSyncHookForTest runs fn before each sync of a received disk
+// (final: the one before it is placed). Tests only.
+func (s *Server) SetColdDiskSyncHookForTest(fn func(final bool)) { s.coldDiskSyncHook = fn }
+
+// syncReceivedDisk syncs a receive's scratch file (final: before placing it).
+func (s *Server) syncReceivedDisk(f *os.File, final bool) error {
+	if s.coldDiskSyncHook != nil {
+		s.coldDiskSyncHook(final)
+	}
+	return f.Sync()
 }
 
 // flattenColdDisk writes a standalone copy of disk d's chain (its file src) to
@@ -305,17 +399,29 @@ func (s *Server) checkColdDiskOnTarget(ctx context.Context, client pb.LiteVirtCl
 			allocated = sys.Blocks * 512
 		}
 	}
-	up, err := client.ReceiveMigrationDisk(ctx)
-	if err != nil {
+	// One question and its answer, bounded like a copy's progress: a target
+	// that is alive but wedged would otherwise hold the move here forever.
+	stall := s.coldDiskStallBound()
+	cctx, cancel := context.WithTimeout(ctx, stall)
+	defer cancel()
+	unanswered := func(err error) error {
+		if errors.Is(cctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+			return status.Errorf(codes.DeadlineExceeded, "%s did not answer whether it would take disk %s within %s: %v",
+				"the target", d.Path, stall, err)
+		}
 		return err
+	}
+	up, err := client.ReceiveMigrationDisk(cctx)
+	if err != nil {
+		return unanswered(err)
 	}
 	if err := up.Send(&pb.ReceiveMigrationDiskRequest{
 		VmName: vmName, Path: d.Path, SizeBytes: size, AllocatedBytes: allocated, CheckOnly: true,
 	}); err != nil {
-		return coldDiskSendErr(up, err)
+		return unanswered(coldDiskSendErr(up, err))
 	}
 	_, err = up.CloseAndRecv()
-	return err
+	return unanswered(err)
 }
 
 // nearestExistingDir is dir, or its closest ancestor that exists.
@@ -420,14 +526,14 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	}
 	dst := s.hostDiskFile(hdr.Path)
 	if _, err := os.Lstat(dst); err == nil {
-		if !s.migrationStubs.owns(vm.Name, hdr.Path) {
+		if !s.madeHere(ctx, &s.migrationStubs, vm.Name, hdr.Path) {
 			return status.Errorf(codes.FailedPrecondition,
 				"disk %s of VM %q already exists on %s, and this migration did not create it. "+
-					"It may be the VM's disk from an earlier stay on %s, and the copy would overwrite it. "+
-					"It may be the only copy of the VM's data from before a failover: do not delete it. Move it aside on %s "+
-					"(rename it to <path>.superseded-<time>, which `lv host superseded-disks` then lists and keeps), "+
+					"It may be the VM's disk from an earlier stay on %s, or a copy a move that was rolled back placed "+
+					"after it gave up, and the copy would overwrite it. "+
+					"It may be the only copy of the VM's data from before a failover: do not delete it. %s, "+
 					"then migrate again",
-				hdr.Path, vm.Name, s.hostName, s.hostName, s.hostName)
+				hdr.Path, vm.Name, s.hostName, s.hostName, moveAsideAdvice(s.hostName, dst))
 		}
 	} else if !os.IsNotExist(err) {
 		return status.Errorf(codes.Internal, "stat %s: %v", hdr.Path, err)
@@ -474,7 +580,11 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	}
 
 	h := sha256.New()
-	var next, sinceCheck int64
+	var next, sinceCheck, sinceSync int64
+	syncEvery := int64(defaultColdDiskSyncEvery)
+	if s.coldDiskSyncEvery > 0 {
+		syncEvery = s.coldDiskSyncEvery
+	}
 	var digest string
 	for digest == "" {
 		msg, err := stream.Recv()
@@ -500,6 +610,12 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 		if err != nil {
 			return status.Errorf(codes.Internal, "write %s: %v", hdr.Path, err)
 		}
+		if sinceSync += n; sinceSync >= syncEvery {
+			sinceSync = 0
+			if err := s.syncReceivedDisk(tmp, false); err != nil {
+				return status.Errorf(codes.Internal, "sync %s: %v", hdr.Path, err)
+			}
+		}
 		if sinceCheck += n; sinceCheck >= coldDiskRecheckEvery {
 			sinceCheck = 0
 			if err := s.requireDiskSpace(dir, filepath.Dir(hdr.Path), "receiving disk "+hdr.Path, 0); err != nil {
@@ -519,19 +635,34 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	// (internal/diskmode).
 	// Best effort: a filesystem that refuses chmod never fails the copy.
 	diskmode.Restrict(tmp, diskmode.File)
-	if err := tmp.Sync(); err != nil {
+	if err := s.syncReceivedDisk(tmp, true); err != nil {
 		return status.Errorf(codes.Internal, "sync %s: %v", hdr.Path, err)
 	}
 	if err := tmp.Close(); err != nil {
 		return status.Errorf(codes.Internal, "close %s: %v", hdr.Path, err)
 	}
+	// A source that gave up on the copy (its stall bound, an abort) has
+	// rolled the move back: the copy is not placed, and the scratch file goes.
+	if err := stream.Context().Err(); err != nil {
+		return status.Errorf(codes.Canceled, "the source gave up on the copy of %s before it was placed: %v", hdr.Path, err)
+	}
 	// A stub this host made for the VM's migration is the one file the copy may
 	// take the place of (checked above); anything else at the path — even one
 	// that appeared since the check — makes the placement fail.
-	if s.migrationStubs.owns(vm.Name, hdr.Path) {
+	if s.madeHere(ctx, &s.migrationStubs, vm.Name, hdr.Path) {
 		if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
 			return status.Errorf(codes.Internal, "replace this host's stub %s: %v", hdr.Path, err)
 		}
+		// The stub is gone, and the copy placed at its path is not this
+		// host's stub until the source is known to be there (the add below):
+		// nothing may reuse a file the take-back below may still unlink.
+		s.migrationStubs.forget(hdr.Path)
+	}
+	// The file this receive places: what a re-check below may take back, and
+	// nothing else.
+	ours, err := os.Lstat(tmp.Name())
+	if err != nil {
+		return status.Errorf(codes.Internal, "stat %s: %v", tmp.Name(), err)
 	}
 	if err := placeColdDisk(tmp.Name(), dst); err != nil {
 		if errors.Is(err, os.ErrExist) {
@@ -542,11 +673,32 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 		return status.Errorf(codes.Internal, "place %s: %v", hdr.Path, err)
 	}
 	placed = true
-	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
-		d.Close()
+	if s.coldDiskPlacedHook != nil {
+		s.coldDiskPlacedHook()
 	}
-	s.migrationStubs.add(vm.Name, hdr.Path)
+	syncDir := func() {
+		if d, err := os.Open(dir); err == nil {
+			_ = d.Sync()
+			d.Close()
+		}
+	}
+	syncDir()
+	// A source that gave up while the disk was placed (the directory sync can
+	// stall on storage that just wedged) has had no answer, so it rolled the
+	// move back and keeps the VM's disk: the file this receive just placed is
+	// taken back, and only that file (the same inode at the same path).
+	if err := stream.Context().Err(); err != nil {
+		if fi, lerr := os.Lstat(dst); lerr == nil && os.SameFile(fi, ours) {
+			if rerr := os.Remove(dst); rerr != nil {
+				slog.Warn("cold migration: could not take back a disk placed after the source gave up",
+					"vm", vm.Name, "path", hdr.Path, "error", rerr)
+			} else {
+				syncDir()
+			}
+		}
+		return status.Errorf(codes.Canceled, "the source gave up on the copy of %s as it was placed: %v", hdr.Path, err)
+	}
+	s.recordMade(ctx, &s.migrationStubs, vm.Name, hdr.Path)
 	slog.Info("cold migration: disk received", "vm", vm.Name, "path", hdr.Path, "bytes", hdr.SizeBytes)
 	return stream.SendAndClose(&pb.ReceiveMigrationDiskResponse{SizeBytes: hdr.SizeBytes})
 }
@@ -573,6 +725,14 @@ func (s *Server) removeColdMigratedSourceDisks(ctx context.Context, vmName strin
 		}
 		slog.Info("cold migration: removed the source copy of a migrated disk", "vm", vmName, "path", d.Path)
 	}
+}
+
+// moveAsideAdvice is the way out of a disk file at path on host that a copy
+// would overwrite: the exact rename that sets it aside where
+// `lv host superseded-disks` lists and keeps it. Nothing deletes it.
+func moveAsideAdvice(host, path string) string {
+	return fmt.Sprintf("Move it aside on %s with `mv %s %s` (`lv host superseded-disks %s` then lists and keeps it)",
+		host, path, health.SupersededName(path, time.Now()), host)
 }
 
 // Scratch-file markers. A cold copy's scratch files are hidden (a leading dot)

@@ -221,6 +221,10 @@ func TestSeedAdminUser_TightensAPreExistingLoosePasswordFile(t *testing.T) {
 	if err := os.WriteFile(pwFile, []byte("left over from a restore\n"), 0644); err != nil {
 		t.Fatalf("pre-create the password file: %v", err)
 	}
+	// Establish the loose fixture independently of the process umask.
+	if err := os.Chmod(pwFile, 0644); err != nil {
+		t.Fatalf("make the password fixture loose: %v", err)
+	}
 	if fi, err := os.Stat(pwFile); err != nil || fi.Mode().Perm() != 0644 {
 		t.Fatalf("test setup did not produce a 0644 file (umask?): mode=%v err=%v", fi.Mode().Perm(), err)
 	}

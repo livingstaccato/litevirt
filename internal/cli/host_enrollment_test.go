@@ -155,19 +155,19 @@ func TestAllEnrollmentEntryPathsUseStagedWorkflow(t *testing.T) {
 			stubMigrationProbe(t, func(string) (bool, error) { return false, nil })
 			switch path {
 			case "remote-init":
-				err = HostInit(context.Background(), "root@127.0.0.1", "host", false)
+				err = HostInit(context.Background(), "root@127.0.0.1", "node-9", false)
 			case "remote-add":
-				err = HostAdd(context.Background(), &enrollmentAdmissionClient{remote: remote}, "root@127.0.0.1", "host", []string{"127.0.0.2:7946"})
+				err = HostAdd(context.Background(), &enrollmentAdmissionClient{remote: remote}, "root@127.0.0.1", "node-9", []string{"127.0.0.2:7946"})
 			case "local-init":
-				err = HostInitLocal(context.Background(), "host", "127.0.0.1", false)
+				err = HostInitLocal(context.Background(), "node-9", "127.0.0.1", false)
 			}
 			if err != nil {
 				t.Fatal(err)
 			}
-			if remote.request.Host != "host" || remote.request.Founding != (path != "remote-add") || remote.request.Force {
+			if remote.request.Host != "node-9" || remote.request.Founding != (path != "remote-add") || remote.request.Force {
 				t.Fatal("entry path did not preserve enrollment intent")
 			}
-			if _, err := pki.ValidateHostEnrollment("host", remote.request.CA, remote.request.Certificate, remote.request.Key); err != nil {
+			if _, err := pki.ValidateHostEnrollment("node-9", remote.request.CA, remote.request.Certificate, remote.request.Key); err != nil {
 				t.Fatal("entry staged invalid identity", err)
 			}
 			after, err := os.ReadFile(filepath.Join(source, "host.key"))
@@ -384,7 +384,7 @@ func TestPublishedCLIRevocationWaitsForTrustLease(t *testing.T) {
 }
 
 func TestLegacyHostCacheCleanupCannotRemoveActiveOrAliasedIdentity(t *testing.T) {
-	for _, kind := range []string{"host", "ca", "traversal", "symlink", "hardlink"} {
+	for _, kind := range []string{"host", "ca", "traversal", "symlink", "hardlink", "active-ui", "active-ui-hardlink", "kept-symlink"} {
 		t.Run(kind, func(t *testing.T) {
 			root := t.TempDir()
 			active := filepath.Join(root, "active")
@@ -421,6 +421,32 @@ func TestLegacyHostCacheCleanupCannotRemoveActiveOrAliasedIdentity(t *testing.T)
 					}
 				}
 			}
+			if kind == "active-ui" || kind == "active-ui-hardlink" {
+				name, stem = "ui", "ui"
+				if err := pki.GenerateHostCert(filepath.Join(active, "ca.crt"), filepath.Join(active, "ca.key"), filepath.Join(active, "ui.crt"), filepath.Join(active, "ui.key"), "ui", nil); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "active-ui-hardlink" {
+					name = "alias"
+					for _, suffix := range []string{".crt", ".key"} {
+						if err := os.Link(filepath.Join(active, "ui"+suffix), filepath.Join(active, "alias"+suffix)); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+			}
+			if kind == "kept-symlink" {
+				name = "node-9"
+				dir := keptHostDir(cache, name)
+				if err := os.MkdirAll(dir, 0700); err != nil {
+					t.Fatal(err)
+				}
+				for _, suffix := range []string{".crt", ".key"} {
+					if err := os.Symlink(filepath.Join(active, "host"+suffix), filepath.Join(dir, "host"+suffix)); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
 			certBytes, err := os.ReadFile(filepath.Join(active, stem+".crt"))
 			if err != nil {
 				t.Fatal(err)
@@ -429,15 +455,60 @@ func TestLegacyHostCacheCleanupCannotRemoveActiveOrAliasedIdentity(t *testing.T)
 			if err != nil {
 				t.Fatal(err)
 			}
-			keyBefore, err := os.ReadFile(filepath.Join(cache, name+".key"))
+			keyPath := filepath.Join(cache, name+".key")
+			if kind == "kept-symlink" {
+				keyPath = filepath.Join(keptHostDir(cache, name), "host.key")
+			}
+			keyBefore, err := os.ReadFile(keyPath)
 			if err != nil {
 				t.Fatal(err)
 			}
-			removeCAMachineCopy(cache, name, cert)
-			keyAfter, err := os.ReadFile(filepath.Join(cache, name+".key"))
+			before := dirSnapshot(t, root)
+			if err := removeCAMachineCopy(cache, name, cert); err == nil {
+				t.Fatal("active or aliased identity cleanup was not refused")
+			}
+			sameTree(t, kind, root, before)
+			keyAfter, err := os.ReadFile(keyPath)
 			if err != nil || string(keyAfter) != string(keyBefore) {
 				t.Fatalf("legacy cache cleanup removed active or aliased identity (%s): %v", kind, err)
 			}
+		})
+	}
+}
+
+// A valid serving pair can exist without the unrelated host identity markers.
+// Exercise the actual serving loader before testing direct and aliased cleanup.
+func TestLegacyHostCacheCleanupPreservesUIWithoutHostMarkers(t *testing.T) {
+	for _, kind := range []string{"direct", "hardlink"} {
+		t.Run(kind, func(t *testing.T) {
+			dir := t.TempDir()
+			mustCA(t, dir)
+			if err := pki.GenerateHostCert(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"), filepath.Join(dir, "ui.crt"), filepath.Join(dir, "ui.key"), "ui", nil); err != nil {
+				t.Fatal(err)
+			}
+			for _, marker := range []string{"host.crt", "host.key", "host.d"} {
+				if _, err := os.Lstat(filepath.Join(dir, marker)); !os.IsNotExist(err) {
+					t.Fatalf("fixture has unexpected host marker %s: %v", marker, err)
+				}
+			}
+			pair, err := pki.UICertSource(dir).Get()
+			if err != nil || pair == nil || pair.Leaf == nil {
+				t.Fatalf("genuine UI serving pair failed to load: %v", err)
+			}
+			name := "ui"
+			if kind == "hardlink" {
+				name = "alias"
+				for _, suffix := range []string{".crt", ".key"} {
+					if err := os.Link(filepath.Join(dir, "ui"+suffix), filepath.Join(dir, name+suffix)); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			before := dirSnapshot(t, dir)
+			if err := removeCAMachineCopy(dir, name, pair.Leaf); err == nil {
+				t.Fatal("cleanup accepted active UI identity without host markers")
+			}
+			sameTree(t, kind, dir, before)
 		})
 	}
 }
@@ -448,26 +519,23 @@ func TestEnrollmentStagingNeverUsesHostNameAsActivePath(t *testing.T) {
 	if err := pki.GenerateHostCert(filepath.Join(source, "ca.crt"), filepath.Join(source, "ca.key"), filepath.Join(source, "host.crt"), filepath.Join(source, "host.key"), "original-host", nil); err != nil {
 		t.Fatal(err)
 	}
-	before := map[string]string{}
-	for _, name := range []string{"ca.crt", "ca.key", "host.crt", "host.key"} {
-		b, err := os.ReadFile(filepath.Join(source, name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		before[name] = string(b)
-	}
-	for _, host := range []string{"host", "ca", "../host", "client"} {
-		staged, err := stageHostEnrollmentIdentity(source, host, "127.0.0.1")
-		if host == "../host" {
+	before := dirSnapshot(t, source)
+	for _, host := range []string{"host", "ca", "../host", "client", "gossip", "migration-ca", "ui", "audit-signing", "lv-cli"} {
+		t.Run(host, func(t *testing.T) {
+			staged, err := stageHostEnrollmentIdentity(source, host, "127.0.0.1")
 			if err == nil {
 				staged.remove()
-				t.Fatal("traversal host accepted")
+				t.Fatal("reserved or traversal host accepted")
 			}
-			continue
-		}
+			sameTree(t, host, source, before)
+		})
+	}
+	t.Run("node-9", func(t *testing.T) {
+		staged, err := stageHostEnrollmentIdentity(source, "node-9", "127.0.0.1")
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer staged.remove()
 		if filepath.Dir(staged.dir) == source {
 			t.Fatal("staged host private key remained in active directory")
 		}
@@ -476,7 +544,7 @@ func TestEnrollmentStagingNeverUsesHostNameAsActivePath(t *testing.T) {
 			t.Fatal(err)
 		}
 		leaf, err := pki.ParseCertPEM(cert)
-		if err != nil || leaf.Subject.CommonName != host {
+		if err != nil || leaf.Subject.CommonName != "node-9" {
 			t.Fatal("staging changed requested identity", err)
 		}
 		keyInfo, err := os.Stat(staged.key)
@@ -484,13 +552,11 @@ func TestEnrollmentStagingNeverUsesHostNameAsActivePath(t *testing.T) {
 			t.Fatal("staged private key was not private", err)
 		}
 		staged.remove()
-		for name, want := range before {
-			got, err := os.ReadFile(filepath.Join(source, name))
-			if err != nil || string(got) != want {
-				t.Fatalf("staging host %q changed active %s", host, name)
-			}
+		if _, err := os.Stat(staged.dir); !os.IsNotExist(err) {
+			t.Fatal("staging directory survived cleanup", err)
 		}
-	}
+		sameTree(t, "node-9", source, before)
+	})
 }
 
 func TestCLIClientBundlePreservesActiveTrustDomain(t *testing.T) {

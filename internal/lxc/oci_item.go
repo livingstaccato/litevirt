@@ -60,6 +60,45 @@ func writeImageGen(bundle string) error {
 	return nil
 }
 
+// OwnerFile, in a library item's bundle, names the project the pull that
+// made it was for. It is written into the bundle before the bundle goes in
+// place, so the one rename that publishes the content publishes its owner:
+// no crash or failed write leaves one without the other.
+const OwnerFile = ".litevirt-owner"
+
+// writeOwner records owner in bundle (OwnerFile), durably.
+func writeOwner(bundle, owner string) error {
+	f, err := os.OpenFile(filepath.Join(bundle, OwnerFile), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err == nil {
+		_, err = f.WriteString(owner + "\n")
+		if serr := f.Sync(); err == nil {
+			err = serr
+		}
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("record the image's owner in %s: %w", bundle, err)
+	}
+	return nil
+}
+
+// ReadOwner is the owner recorded in the bundle at dir (OwnerFile): ok is
+// false when it records none (a pull without a project, or by a build
+// before the record moved into the bundle). An unreadable record is an
+// error.
+func ReadOwner(dir string) (owner string, ok bool, err error) {
+	b, err := os.ReadFile(filepath.Join(dir, OwnerFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return strings.TrimSpace(string(b)), true, nil
+}
+
 // ReadImageGen is the generation of the bundle at dir ("" when it has none
 // or it cannot be read).
 func ReadImageGen(dir string) string {
@@ -249,11 +288,18 @@ func replaceBundle(stage, dest string) error {
 		}
 		return fmt.Errorf("replace %s: %w; the old image was kept", dest, err)
 	}
-	if err := os.RemoveAll(old); err != nil {
-		return fmt.Errorf("pulled into %s, but removing the old image at %s failed: %w", dest, old, err)
+	// The new image is in place: the pull has succeeded, whatever becomes
+	// of the old one. One left behind is removed by the item's next pull,
+	// or at daemon start (recoverStaged).
+	if err := removeOldBundle(old); err != nil {
+		slog.Warn("oci library: pulled the new image, but removing the old one failed; the next pull of the item or daemon start removes it",
+			"item", dest, "path", old, "error", err)
 	}
 	return nil
 }
+
+// removeOldBundle is os.RemoveAll; a test seam.
+var removeOldBundle = os.RemoveAll
 
 // RecoverOCILibrary finishes, at daemon start, what a crash left of a
 // replacing pull in the OCI library lib (its unpackDirName), item by item.
@@ -286,13 +332,21 @@ func RecoverOCILibrary(lib string) error {
 			slog.Info("oci library: a pull of this item is running in another process; its staging is left to it", "item", item)
 			continue
 		}
+		quiet := true
 		for _, e := range ents {
 			if !strings.HasSuffix(e.Name(), lockSuffix) && stagedItem(e.Name()) == item {
-				stopWorkersIn(filepath.Join(dir, e.Name()))
+				if err := stopWorkersIn(filepath.Join(dir, e.Name())); err != nil {
+					// Not proven quiet: its entries are kept as they are.
+					slog.Warn("oci library: kept what an interrupted pull left; a process may still be working in it", "item", item, "error", err)
+					errs = append(errs, err)
+					quiet = false
+				}
 			}
 		}
-		if err := recoverStaged(dir, lib, item); err != nil {
-			errs = append(errs, err)
+		if quiet {
+			if err := recoverStaged(dir, lib, item); err != nil {
+				errs = append(errs, err)
+			}
 		}
 		release()
 	}
@@ -321,8 +375,24 @@ func hasStaged(ents []os.DirEntry, item string) bool {
 // recoverItem finishes, under dest's item lock, what a crash left of an
 // earlier replacing pull of dest: PullOCI runs it first, so an item outside
 // the library, which the start-up recovery does not read, is recovered too.
+//
+// Its entries are recovered only once no process works in them
+// (stopWorkersIn): one that cannot be shown quiet (a worker the start-up
+// sweep could not stop) keeps them as they are, and the pull is refused.
 func recoverItem(dest string) error {
-	return recoverStaged(filepath.Join(filepath.Dir(dest), unpackDirName), filepath.Dir(dest), filepath.Base(dest))
+	dir, item := filepath.Join(filepath.Dir(dest), unpackDirName), filepath.Base(dest)
+	ents, err := os.ReadDir(dir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	for _, e := range ents {
+		if !strings.HasSuffix(e.Name(), lockSuffix) && stagedItem(e.Name()) == item {
+			if err := stopWorkersIn(filepath.Join(dir, e.Name())); err != nil {
+				return fmt.Errorf("a process may still be working in %s, so it is kept: %w", filepath.Join(dir, e.Name()), err)
+			}
+		}
+	}
+	return recoverStaged(dir, filepath.Dir(dest), item)
 }
 
 // recoverStaged recovers the entries of the staging directory dir whose

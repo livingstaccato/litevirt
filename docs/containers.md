@@ -87,9 +87,10 @@ paths:
   use any image. A pull over an existing item is refused, except an Admin's
   claim (`lv ct pull --project`), which replaces it with the image pulled
   (unpacked beside the item first; a pull that fails leaves the item as it
-  was). Containers created from it keep their own copy. A claim is refused
-  while a container created by an earlier release uses the item's rootfs in
-  place, naming it. A privileged or legacy-confined stack member built from
+  was). The owner is recorded inside the item, so it goes in place with the
+  image it owns, and a create judges the two together. Containers created
+  from it keep their own copy. A claim is refused while a container created
+  by an earlier release uses the item's rootfs in place, naming it. A privileged or legacy-confined stack member built from
   an item whose content was replaced since counts as changing its image on
   its next recreate (see compose.md).
 - Any other host path (`--template /srv/rootfs`, `rootfs:<path>`, a relative
@@ -551,6 +552,9 @@ Containers are first-class tenancy citizens, at parity with VMs:
   `cpu.stat`) and `litevirt_container_memory_bytes` (cgroup-v2 `memory.current`).
   Usage metrics require cgroup-v2 (the modern default); on a cgroup-v1-only host
   they are quietly omitted (limits/state are still reported).
+  `litevirt_container_image_copies` and `litevirt_container_image_copy_bytes`
+  count the image copies compose recreates took before their delete and have
+  not used yet (a cancelled deploy leaves one; it goes after 24 hours).
 
 ## Backup & restore
 

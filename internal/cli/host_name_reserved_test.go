@@ -95,17 +95,21 @@ func operatorPKIUnder(t *testing.T) (root, dir string) {
 	return root, dir
 }
 
-// `lv host init --local --name ca` minted the host pair over ca.crt and
-// ca.key: the cluster CA was gone.
+// The enrollment stage refuses unsafe names before creating a host pair,
+// leaving the operator's PKI files unchanged.
 //
-// Mutation: drop the name check in mintLocalHostCert — ca.crt is replaced and
-// "../esc" writes beside the config directory.
-func TestMintLocalHostCert_RefusesAnUnsafeName(t *testing.T) {
+// Mutation: drop the name check in stageHostEnrollmentIdentity — an unsafe
+// name is accepted and the test reports the missing refusal.
+func TestStageHostEnrollmentIdentity_RefusesAnUnsafeName(t *testing.T) {
 	for _, name := range unsafeHostNames {
 		root, dir := operatorPKIUnder(t)
 		before := dirSnapshot(t, root)
-		if err := mintLocalHostCert(dir, name, "10.0.0.1"); err == nil {
-			t.Errorf("mintLocalHostCert(%q) = nil, want a refusal", name)
+		staged, err := stageHostEnrollmentIdentity(dir, name, "10.0.0.1")
+		if staged.dir != "" {
+			t.Cleanup(staged.remove)
+		}
+		if err == nil {
+			t.Errorf("stageHostEnrollmentIdentity(%q) = nil, want a refusal", name)
 		}
 		sameTree(t, name, root, before)
 	}
@@ -115,7 +119,7 @@ func TestMintLocalHostCert_RefusesAnUnsafeName(t *testing.T) {
 // certificate yet, init would mint one before it reached the host pair.
 //
 // Mutation: drop the check at the top of HostInitLocal — client.crt is
-// written before mintLocalHostCert refuses.
+// written before stageHostEnrollmentIdentity refuses.
 func TestHostInitLocal_RefusesAnUnsafeName(t *testing.T) {
 	useConfig(t, "")
 	for _, name := range []string{"ca", "client", "../esc"} {
@@ -343,8 +347,8 @@ func writeLegacyPairAt(t *testing.T, caDir, dir, name string) *x509.Certificate 
 }
 
 // Older builds had no host-name rule, so a cluster can hold "Host", "ui",
-// "web-migration" or "node+1". A renewal of one removes this machine's copy
-// of its replaced pair as for any host; the new-name rule silently skipped it.
+// "web-migration" or "node+1". Distinguishable historical copies are removed;
+// a direct ui pair is ambiguous and must be retained with an explicit refusal.
 //
 // Mutation: check the new-name rule (pki.ValidateHostName) in
 // removeCAMachineCopy — every legacy pair stays.
@@ -352,6 +356,15 @@ func TestRemoveCAMachineCopy_RemovesALegacyNamesPair(t *testing.T) {
 	for _, name := range legacyHostNames {
 		_, dir := operatorPKIUnder(t)
 		prev := writeLegacyPair(t, dir, name)
+		if name == "ui" {
+			before := dirSnapshot(t, dir)
+			err := removeCAMachineCopy(dir, name, prev)
+			if err == nil || !strings.Contains(err.Error(), "the renewal is complete") || !strings.Contains(err.Error(), "active or aliased PKI paths") {
+				t.Errorf("removeCAMachineCopy(ui) = %v, want explicit retained-path cleanup refusal", err)
+			}
+			sameTree(t, "ambiguous direct ui", dir, before)
+			continue
+		}
 		if err := removeCAMachineCopy(dir, name, prev); err != nil {
 			t.Errorf("removeCAMachineCopy(%q) = %v", name, err)
 		}

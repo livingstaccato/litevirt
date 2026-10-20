@@ -94,6 +94,11 @@ func TestCloneIdentity_NoSymlinks_WritesIdentity(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(rootfs, f), []byte("old\n"), 0o444); err != nil {
 				t.Fatal(err)
 			}
+			// The preservation assertion requires an actual 0444 source, even
+			// when the test runner has a restrictive umask.
+			if err := os.Chmod(filepath.Join(rootfs, f), 0o444); err != nil {
+				t.Fatal(err)
+			}
 		}
 	})
 	assertSentinelIntact(t, sentinel)

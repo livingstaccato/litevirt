@@ -420,13 +420,7 @@ func removeCAMachineCopy(pkiDir, hostName string, prev *x509.Certificate) error 
 		fmt.Printf("  NOTE: this machine's copy of %s's replaced pair was not looked for: %v\n", hostName, err)
 		return fmt.Errorf("the renewal is complete, but this machine's copy of the replaced pair was not removed: %w", err)
 	}
-	var first error
-	if safeHostCacheCleanup(pkiDir, hostName) {
-		first = removeCAMachineCopyAt(pkiDir, hostName, filepath.Join(pkiDir, hostName+".key"), filepath.Join(pkiDir, hostName+".crt"), prev)
-	} else {
-		fmt.Println("  NOTE: refusing host-cache cleanup of active or aliased PKI paths")
-		first = fmt.Errorf("the renewal is complete, but this machine's copy of the replaced pair was not removed: active or aliased PKI paths")
-	}
+	first := removeCAMachineCopyAt(pkiDir, hostName, filepath.Join(pkiDir, hostName+".key"), filepath.Join(pkiDir, hostName+".crt"), prev)
 	if dir := keptHostDir(pkiDir, hostName); dir != "" {
 		if err := removeCAMachineCopyAt(pkiDir, hostName, filepath.Join(dir, "host.key"), filepath.Join(dir, "host.crt"), prev); err != nil && first == nil {
 			first = err
@@ -454,6 +448,10 @@ func removeCAMachineCopyAt(pkiDir, hostName, keyPath, crtPath string, prev *x509
 				"this directory's own %s, overwritten by an older release; restore %s from a backup", p, hostName, fixed, fixed)
 		}
 	}
+	if !safeHostCacheCleanup(pkiDir, keyPath, crtPath) {
+		fmt.Println("  NOTE: refusing host-cache cleanup of active or aliased PKI paths")
+		return fmt.Errorf("the renewal is complete, but this machine's copy of the replaced pair was not removed: active or aliased PKI paths")
+	}
 	if err := os.Remove(keyPath); err != nil {
 		fmt.Printf("  NOTE: could not remove this machine's copy of the replaced key %s: %v\n", keyPath, err)
 		return nil
@@ -471,21 +469,14 @@ func removeCAMachineCopyAt(pkiDir, hostName, keyPath, crtPath string, prev *x509
 	return nil
 }
 
-// Only historical regular files named directly in the operator directory are
-// cache copies. Pair matching does not authorize removing an active identity,
-// a root, or an alias to one of those files.
-func safeHostCacheCleanup(dir, name string) bool {
-	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\") || filepath.Base(name) != name {
-		return false
-	}
-	protected := []string{"host", "ca", "client", "ui", "migration-ca", "migration-host"}
-	for _, reserved := range protected {
-		if name == reserved {
-			return false
-		}
-	}
-	for _, suffix := range []string{".key", ".crt"} {
-		candidate := filepath.Join(dir, name+suffix)
+// Only regular cache files may be removed, after the operator-file classifier
+// has supplied its precise refusal. Node identities and SameFile aliases remain
+// protected in both historical locations, even without host identity markers.
+// Legacy ui cache ownership is ambiguous here; pair matching is not authority
+// to remove a potentially active serving identity.
+func safeHostCacheCleanup(dir, keyPath, crtPath string) bool {
+	protected := []string{"host", "migration-host", "ui", "audit-signing"}
+	for _, candidate := range []string{keyPath, crtPath} {
 		info, err := os.Lstat(candidate)
 		if errors.Is(err, os.ErrNotExist) {
 			continue

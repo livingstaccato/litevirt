@@ -200,8 +200,8 @@ func daemonShutdownWiringError(run *ast.FuncDecl) error {
 	if started["startSweep"] != 1 || started["startLB"] != 1 || shutdown == nil || len(shutdown.Args) != 6 {
 		return fmt.Errorf("actual worker starts and direct shutdown goroutine must share one coordinator")
 	}
-	if runVar(shutdown.Args[0]) != runVar(workerContext) {
-		return fmt.Errorf("shutdown must use the coordinator's original context")
+	if err := daemonShutdownContextError(run, shutdown, workerContext); err != nil {
+		return err
 	}
 	for i, name := range []string{"ReExecCh", "ShutdownCh"} {
 		selector, ok := shutdown.Args[i+1].(*ast.SelectorExpr)
@@ -283,6 +283,80 @@ func daemonShutdownWiringError(run *ast.FuncDecl) error {
 	return nil
 }
 
+// The signal context must be a child of the coordinator's parent, with its
+// actual cancel function deferred and called immediately after awaitServe.
+// Parent cancellation and an unexpected Serve return must both initiate cleanup.
+func daemonShutdownContextError(run *ast.FuncDecl, shutdown *ast.CallExpr, parent ast.Expr) error {
+	var stop, cancel *ast.Object
+	var declared token.Pos
+	for _, statement := range run.Body.List {
+		a, ok := statement.(*ast.AssignStmt)
+		if !ok || a.Tok != token.DEFINE || len(a.Lhs) != 2 || len(a.Rhs) != 1 || runVar(a.Lhs[0]) != runVar(shutdown.Args[0]) {
+			continue
+		}
+		call, ok := a.Rhs[0].(*ast.CallExpr)
+		if !ok || len(call.Args) != 1 || runVar(call.Args[0]) != runVar(parent) {
+			return fmt.Errorf("shutdown context must derive from the coordinator's parent")
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "WithCancel" {
+			return fmt.Errorf("shutdown context must use context.WithCancel")
+		}
+		pkg, ok := sel.X.(*ast.Ident)
+		if !ok || pkg.Name != "context" || pkg.Obj != nil || stop != nil {
+			return fmt.Errorf("shutdown context factory is shadowed or repeated")
+		}
+		stop, cancel, declared = runVar(a.Lhs[0]), runVar(a.Lhs[1]), a.Pos()
+	}
+	if stop == nil || cancel == nil || declared >= shutdown.Pos() {
+		return fmt.Errorf("shutdown needs its proven child context before launch")
+	}
+	isCancel := func(call *ast.CallExpr) bool { return runVar(call.Fun) == cancel && len(call.Args) == 0 }
+	deferred, afterServe, serveCount := 0, 0, 0
+	for i, statement := range run.Body.List {
+		if d, ok := statement.(*ast.DeferStmt); ok && isCancel(d.Call) && d.Pos() > declared && d.Pos() < shutdown.Pos() {
+			deferred++
+		}
+		a, ok := statement.(*ast.AssignStmt)
+		if !ok || len(a.Rhs) != 1 {
+			continue
+		}
+		call, ok := a.Rhs[0].(*ast.CallExpr)
+		if !ok || !isFuncCall(call, "awaitServe") {
+			continue
+		}
+		serveCount++
+		if a.Pos() <= shutdown.Pos() || i+1 >= len(run.Body.List) {
+			continue
+		}
+		if e, ok := run.Body.List[i+1].(*ast.ExprStmt); ok {
+			if c, ok := e.X.(*ast.CallExpr); ok && isCancel(c) {
+				afterServe++
+			}
+		}
+	}
+	if deferred != 1 || serveCount != 1 || afterServe != 1 {
+		return fmt.Errorf("shutdown cancel must be deferred once and called directly after the sole awaitServe")
+	}
+	// Reject reassignment of either binding: parser identity alone must not
+	// let a different context or cancel function replace the proven pair.
+	var rebound bool
+	ast.Inspect(run.Body, func(n ast.Node) bool {
+		if a, ok := n.(*ast.AssignStmt); ok && a.Pos() != declared {
+			for _, lhs := range a.Lhs {
+				if obj := runVar(lhs); obj == stop || obj == cancel {
+					rebound = true
+				}
+			}
+		}
+		return true
+	})
+	if rebound {
+		return fmt.Errorf("shutdown context or cancel was reassigned")
+	}
+	return nil
+}
+
 func TestRunShutdownWiringRejectsUnsafeCallbacks(t *testing.T) {
 	const stop = "stopServing(d.grpcSrv, svc, 1, 1, stopped, func(){})"
 	const cleanup = "repl.Stop(); d.db.Close(); d.virt.Close()"
@@ -293,9 +367,14 @@ func (d *Daemon) Run(ctx context.Context) error {
  workers := newDBWorkerCoordinator(ctx, svc)
  workers.startSweep()
  workers.startLB(1)
- go workers.shutdown(ctx, svc.ReExecCh, svc.ShutdownCh, func(reason daemonStopReason){},
+ stopCtx, cancelStop := context.WithCancel(ctx)
+ defer cancelStop()
+ go workers.shutdown(stopCtx, svc.ReExecCh, svc.ShutdownCh, func(reason daemonStopReason){},
   func(){ stopServing(d.grpcSrv, svc, 1, 1, stopped, func(){}) },
   func(){ repl.Stop(); d.db.Close(); d.virt.Close() })
+ serveErr := awaitServe(serveErrs, stopped, bound)
+ cancelStop()
+ _ = serveErr
  return nil
 }`
 	for _, tc := range []struct {
@@ -303,7 +382,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}{
 		{name: "correct"},
 		{"wrong_coordinator", "go workers.shutdown", "go other.shutdown"},
-		{"wrong_context", "workers.shutdown(ctx,", "workers.shutdown(other,"},
+		{"wrong_context", "workers.shutdown(stopCtx,", "workers.shutdown(other,"},
+		{"wrong_context_parent", "context.WithCancel(ctx)", "context.WithCancel(other)"},
+		{"wrong_context_factory", "context.WithCancel(ctx)", "context.WithoutCancel(ctx)"},
+		{"missing_deferred_cancel", "defer cancelStop()", "doNothing()"},
+		{"missing_serve_cancel", "\n cancelStop()", "\n doNothing()"},
+		{"conditional_serve_cancel", "\n cancelStop()", "\n if condition { cancelStop() }"},
+		{"cancel_before_serve", "serveErr := awaitServe(serveErrs, stopped, bound)\n cancelStop()", "cancelStop()\n serveErr := awaitServe(serveErrs, stopped, bound)"},
+		{"rebound_stop_context", "defer cancelStop()", "defer cancelStop(); stopCtx = other"},
+		{"rebound_cancel", "defer cancelStop()", "defer cancelStop(); cancelStop = otherCancel"},
 		{"wrong_service_channel", "svc.ReExecCh", "other.ReExecCh"},
 		{"missing_stop", stop, "doNothing()"},
 		{"conditional_stop", stop, "if condition { " + stop + " }"},

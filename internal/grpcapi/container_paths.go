@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -231,7 +232,15 @@ func ociLibraryName(p, dataDir string) string {
 
 // readOCIOwner returns the project that owns library item name, "" when it
 // has no record (an image pulled before records, or by hand): everyone's.
+// The record in the item's bundle (lxc.OwnerFile), published with its
+// content, is the authority; <data_dir>/oci-owners is read for an item an
+// earlier build pulled.
 func (s *Server) readOCIOwner(name string) (string, error) {
+	if owner, ok, err := lxc.ReadOwner(filepath.Join(s.dataDir, storage.OCILibraryDir, name)); err != nil {
+		return "", err
+	} else if ok {
+		return owner, nil
+	}
 	b, err := os.ReadFile(filepath.Join(s.dataDir, ociOwnersDir, name))
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", nil
@@ -242,12 +251,61 @@ func (s *Server) readOCIOwner(name string) (string, error) {
 	return strings.TrimSpace(string(b)), nil
 }
 
+// ociOwnerPending is what <data_dir>/oci-owners/<name> holds while a pull
+// with a project is under way (markOCIOwnerPending). It is no project's
+// name, so an owner-bound caller is refused the item.
+const ociOwnerPending = "!a-claim-of-this-image-was-interrupted"
+
+// markOCIOwnerPending sets the owner record of item to ociOwnerPending for
+// a pull with a project, and returns what puts it back as it was.
+func (s *Server) markOCIOwnerPending(item string) (restore func()) {
+	path := filepath.Join(s.dataDir, ociOwnersDir, item)
+	prev, err := os.ReadFile(path)
+	had := err == nil
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return func() {}
+	}
+	if err := s.writeOCIOwner(item, ociOwnerPending); err != nil {
+		slog.Warn("oci pull: could not mark the image's owner record for earlier builds as pending", "image", item, "error", err)
+		return func() {}
+	}
+	return func() {
+		if had {
+			if err := s.writeOCIOwner(item, strings.TrimSpace(string(prev))); err != nil {
+				slog.Warn("oci pull: could not put the image's owner record back", "image", item, "error", err)
+			}
+			return
+		}
+		_ = os.Remove(path)
+	}
+}
+
+// writeOCIOwner records project in <data_dir>/oci-owners/<name>, whole or
+// not at all (a temporary file renamed over it).
 func (s *Server) writeOCIOwner(name, project string) error {
 	dir := filepath.Join(s.dataDir, ociOwnersDir)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, name), []byte(project+"\n"), 0o600)
+	f, err := os.CreateTemp(dir, "."+name+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	_, err = f.WriteString(project + "\n")
+	if serr := f.Sync(); err == nil {
+		err = serr
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, filepath.Join(dir, name))
+	}
+	if err != nil {
+		_ = os.Remove(tmp)
+	}
+	return err
 }
 
 // refuseForeignOCIItem refuses an owner-bound caller (not an admin, or a peer

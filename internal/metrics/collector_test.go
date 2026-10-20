@@ -294,3 +294,38 @@ func TestCollect_HostPendingUpdates(t *testing.T) {
 		t.Fatalf("got %v, want only host-a all=5 security=2", got)
 	}
 }
+
+type copyCountingStatter struct{}
+
+func (copyCountingStatter) Stats(context.Context, string) (lxc.ContainerStats, error) {
+	return lxc.ContainerStats{}, lxc.ErrStatsUnavailable
+}
+func (copyCountingStatter) PinnedCopies() (int, int64) { return 2, 4096 }
+
+// The image copies recreates took and have not used are reported, with the
+// space they hold.
+func TestCollect_ImageCopies(t *testing.T) {
+	db := testCollectorDB(t)
+	if err := corrosion.InitSchema(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	c := newCollector(db, nil, copyCountingStatter{}, "host-a")
+	ch := make(chan prometheus.Metric, 200)
+	c.Collect(ch)
+	close(ch)
+	got := map[string]float64{}
+	for m := range ch {
+		var dm dto.Metric
+		if m.Write(&dm) != nil {
+			continue
+		}
+		for _, n := range []string{"litevirt_container_image_copies", "litevirt_container_image_copy_bytes"} {
+			if containsStr(m.Desc().String(), `"`+n+`"`) {
+				got[n] = dm.GetGauge().GetValue()
+			}
+		}
+	}
+	if got["litevirt_container_image_copies"] != 2 || got["litevirt_container_image_copy_bytes"] != 4096 {
+		t.Fatalf("image copy metrics %v, want 2 copies of 4096 bytes", got)
+	}
+}

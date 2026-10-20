@@ -3,6 +3,7 @@
 package lxc
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -43,63 +44,114 @@ func runPinned(fn func() error) error {
 	return fn()
 }
 
-// stopWorkersIn sends SIGKILL to every other process working inside dir,
-// and waits up to five seconds for them to exit. /proc/<pid>/{cwd,root,fd}
-// read as paths only within the reader's own mount namespace: a process in
-// another one (a container, a nested litevirt) renders its own paths, which
-// may be spelled like dir without being in it. So a process whose links
-// read as inside dir is stopped only when it shares this mount namespace,
-// or when the object a link leads to is dir or an entry under it (same
-// device and inode). Each is signalled through a pidfd opened before its
-// links are read again, so a reused PID is never hit.
-func stopWorkersIn(dir string) {
+// stopWorkersIn sends SIGKILL to every other process working inside dir and
+// waits for each to exit, then scans again: a worker can fork a child after a
+// scan read /proc, and that child is in no earlier snapshot. It returns nil
+// only once a scan finds nobody working in dir; it fails (and the caller
+// keeps the stage) when a worker cannot be signalled or waited for, or when
+// workers keep appearing.
+//
+// /proc/<pid>/{cwd,root,fd} read as paths only within the reader's own mount
+// namespace: a process in another one (a container, a nested litevirt)
+// renders its own paths, which may be spelled like dir without being in it.
+// So a process whose links read as inside dir is stopped only when it shares
+// this mount namespace, or when the object a link leads to is dir or an entry
+// under it (same device and inode). Each is signalled through a pidfd opened
+// before its links are read again, so a reused PID is never hit.
+func stopWorkersIn(dir string) error {
 	dir = canonPath(dir)
-	objs := stageObjects(dir)
 	selfNS, _ := os.Readlink("/proc/self/ns/mnt")
-	ents, err := os.ReadDir("/proc")
-	if err != nil {
-		return
-	}
 	self := os.Getpid()
-	var fds []int
-	for _, e := range ents {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid == self {
-			continue
-		}
-		if hit, _ := worksIn(pid, dir, objs, selfNS); !hit {
-			continue
-		}
-		pfd, err := unix.PidfdOpen(pid, 0)
+	for round := 0; round < stopRounds; round++ {
+		objs := stageObjects(dir)
+		ents, err := os.ReadDir("/proc")
 		if err != nil {
-			continue
+			return fmt.Errorf("list processes: %w", err)
 		}
-		// The pidfd pins this process: if the PID was reused before it was
-		// opened, the links read again now are the new process's.
-		hit, why := worksIn(pid, dir, objs, selfNS)
-		comm, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/comm")
-		if !hit || unix.PidfdSendSignal(pfd, unix.SIGKILL, nil, 0) != nil {
+		afterProcScan()
+		var fds []int
+		fail := func(err error) error {
+			for _, fd := range fds {
+				_ = unix.Close(fd)
+			}
+			return err
+		}
+		for _, e := range ents {
+			pid, err := strconv.Atoi(e.Name())
+			if err != nil || pid == self {
+				continue
+			}
+			if hit, _ := worksIn(pid, dir, objs, selfNS); !hit {
+				continue
+			}
+			pfd, err := pidfdOpen(pid, 0)
+			if err != nil {
+				if errors.Is(err, unix.ESRCH) {
+					continue // it exited meanwhile
+				}
+				return fail(fmt.Errorf("cannot stop pid %d working in %s: %w", pid, dir, err))
+			}
+			// The pidfd pins this process: if the PID was reused before it
+			// was opened, the links read again now are the new process's.
+			hit, why := worksIn(pid, dir, objs, selfNS)
+			if !hit {
+				_ = unix.Close(pfd)
+				continue
+			}
+			comm, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/comm")
+			if err := unix.PidfdSendSignal(pfd, unix.SIGKILL, nil, 0); err != nil && !errors.Is(err, unix.ESRCH) {
+				_ = unix.Close(pfd)
+				return fail(fmt.Errorf("cannot stop pid %d working in %s: %w", pid, dir, err))
+			}
+			slog.Info("container staging: stopped a process still working in a stage",
+				"pid", pid, "comm", strings.TrimSpace(string(comm)), "stage", dir, "why", why)
+			fds = append(fds, pfd)
+		}
+		if len(fds) == 0 {
+			return nil // a whole scan found nobody: the stage is quiet
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		var waitErr error
+		for _, pfd := range fds {
+			if err := waitPidfd(pfd, deadline); err != nil && waitErr == nil {
+				waitErr = err
+			}
 			_ = unix.Close(pfd)
-			continue
 		}
-		slog.Info("container staging: stopped a process still working in a stage",
-			"pid", pid, "comm", strings.TrimSpace(string(comm)), "stage", dir, "why", why)
-		fds = append(fds, pfd)
+		if waitErr != nil {
+			return fmt.Errorf("a process working in %s did not exit: %w", dir, waitErr)
+		}
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for _, pfd := range fds {
-		for {
-			ms := int(time.Until(deadline) / time.Millisecond)
-			if ms <= 0 {
-				break
-			}
-			if _, err := unix.Poll([]unix.PollFd{{Fd: int32(pfd), Events: unix.POLLIN}}, ms); err != unix.EINTR {
-				break
-			}
+	return fmt.Errorf("processes kept appearing in %s after %d rounds", dir, stopRounds)
+}
+
+// stopRounds bounds how many times stopWorkersIn scans for workers.
+const stopRounds = 20
+
+// waitPidfd waits until the process pfd refers to has exited, or deadline.
+func waitPidfd(pfd int, deadline time.Time) error {
+	for {
+		ms := int(time.Until(deadline) / time.Millisecond)
+		if ms <= 0 {
+			return errors.New("timed out waiting for it to exit")
 		}
-		_ = unix.Close(pfd)
+		n, err := unix.Poll([]unix.PollFd{{Fd: int32(pfd), Events: unix.POLLIN}}, ms)
+		switch {
+		case err == unix.EINTR:
+			continue
+		case err != nil:
+			return err
+		case n > 0:
+			return nil
+		}
 	}
 }
+
+// test seams
+var (
+	afterProcScan = func() {}
+	pidfdOpen     = unix.PidfdOpen
+)
 
 // worksIn reports whether process pid has its cwd, root or an open file
 // inside dir (see stopWorkersIn for what counts).

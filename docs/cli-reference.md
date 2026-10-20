@@ -143,6 +143,11 @@ lv host rm --dead <host> [--dry-run] [--force]  # Remove a host fenced proof-gra
                                           #   at the next claim attempt. --dry-run changes nothing. Refused
                                           #   while a firmware VM's live move to the host is not settled
                                           #   (`lv doctor firmware-move <vm>`); --force removes it anyway
+lv host rm <host> --serial <serial>       # Remove one admission by its certificate: the row of <host> if it
+  [--address <ip>]                        #   holds it, otherwise no row: once the daemon confirms no row
+                                          #   holds it and the machine at --address has its trace and does
+                                          #   not serve it, it is revoked and its adds' files there removed;
+                                          #   a failed step names this command again, which finishes it
 lv host publish-crl                       # Re-publish this machine's crl.pem if `host rm` could not
 lv host renew-cert <host>                 # Renew a host's cluster certificate in place: key made on
   [--ssh root@<addr>] [--keep-old]        #   the host, one atomic switch, served without a restart,

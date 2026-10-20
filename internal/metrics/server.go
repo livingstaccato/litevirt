@@ -28,6 +28,12 @@ type containerStatter interface {
 	Stats(ctx context.Context, name string) (lxc.ContainerStats, error)
 }
 
+// imageCopyCounter counts the image copies compose recreates took before
+// their delete and have not used (*lxc.LxcRunner.PinnedCopies).
+type imageCopyCounter interface {
+	PinnedCopies() (n int, bytes int64)
+}
+
 // Server serves Prometheus metrics on an HTTP endpoint.
 type Server struct {
 	port     int
@@ -336,6 +342,8 @@ type collector struct {
 	vmMemory       *prometheus.Desc
 	hostCtCount    *prometheus.Desc
 	ctState        *prometheus.Desc
+	ctImageCopies  *prometheus.Desc
+	ctImageCopyB   *prometheus.Desc
 	ctCPULimit     *prometheus.Desc
 	ctMemLimit     *prometheus.Desc
 	ctCPUSeconds   *prometheus.Desc // live cgroup CPU usage (A3b)
@@ -418,6 +426,14 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, ctStat containerSt
 		ctState: prometheus.NewDesc(
 			"litevirt_container_state", "Container state (1=running, 0=other)",
 			[]string{"container", "state"}, nil,
+		),
+		ctImageCopies: prometheus.NewDesc(
+			"litevirt_container_image_copies", "Image copies compose recreates took before their delete and have not used yet",
+			nil, prometheus.Labels{"host": hostName},
+		),
+		ctImageCopyB: prometheus.NewDesc(
+			"litevirt_container_image_copy_bytes", "Bytes held by the image copies in litevirt_container_image_copies",
+			nil, prometheus.Labels{"host": hostName},
 		),
 		ctCPULimit: prometheus.NewDesc(
 			"litevirt_container_cpu_limit", "Container CPU limit in cores (0=unlimited)",
@@ -610,6 +626,8 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.vmMemory
 	ch <- c.hostCtCount
 	ch <- c.ctState
+	ch <- c.ctImageCopies
+	ch <- c.ctImageCopyB
 	ch <- c.ctCPULimit
 	ch <- c.ctMemLimit
 	ch <- c.ctCPUSeconds
@@ -680,6 +698,11 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	// actual cgroup cpu/mem usage (A3b) comes from the host-local runtime when
 	// one is wired (ctStat), best-effort — a container with no readable cgroup
 	// (stopped, or a cgroup-v1 host → ErrStatsUnavailable) is silently skipped.
+	if cc, ok := c.ctStat.(imageCopyCounter); ok {
+		n, b := cc.PinnedCopies()
+		ch <- prometheus.MustNewConstMetric(c.ctImageCopies, prometheus.GaugeValue, float64(n))
+		ch <- prometheus.MustNewConstMetric(c.ctImageCopyB, prometheus.GaugeValue, float64(b))
+	}
 	if cts, err := corrosion.ListContainers(ctx, c.db, c.hostName); err == nil {
 		ch <- prometheus.MustNewConstMetric(c.hostCtCount, prometheus.GaugeValue, float64(len(cts)))
 		for _, ct := range cts {

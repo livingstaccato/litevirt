@@ -472,6 +472,73 @@ func TestRenewHostCert_RemovesTheCAMachinesCopyOfTheReplacedKey(t *testing.T) {
 	}
 }
 
+// Cleanup refusal reaches the caller after renewal, revocation and reload.
+// The UI alias retains its bytes and inode, while the independent kept copy
+// is still removed. Returning early, swallowing cleanupErr, deleting the UI
+// alias, or abandoning the kept cleanup each violates a separate assertion.
+func TestRenewHostCert_CompletesWithRetainedUICleanupRefusal(t *testing.T) {
+	f := newRenewFixture(t)
+	before := map[string][]byte{}
+	inodes := map[string]os.FileInfo{}
+	kept := filepath.Join(f.op, keptHostsDir, "node-r")
+	if err := os.MkdirAll(kept, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{".crt", ".key"} {
+		body := mustRead(t, filepath.Join(f.host, "host"+suffix))
+		ui := filepath.Join(f.op, "ui"+suffix)
+		if err := os.WriteFile(ui, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		alias := filepath.Join(f.op, "node-r"+suffix)
+		if err := os.Link(ui, alias); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(kept, "host"+suffix), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for _, path := range []string{ui, alias} {
+			before[path] = mustRead(t, path)
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			inodes[path] = info
+		}
+	}
+	err := f.run(t, RenewCertOptions{}, f.probe)
+	if err == nil || !strings.Contains(err.Error(), "the renewal is complete") || !strings.Contains(err.Error(), "active or aliased PKI paths") {
+		t.Fatalf("renewal = %v, want explicit retained-path cleanup refusal", err)
+	}
+	served, err := pki.ServedHostCertificate(f.host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if from, ok := pki.RenewedFromSerial(served); !ok || from != f.prevSerial || strings.EqualFold(served.SerialNumber.Text(16), f.prevSerial) {
+		t.Fatal("cleanup refusal prevented the host from serving the successor")
+	}
+	if len(f.client.revokeReq) != 1 || f.client.revokeReq[0] != f.prevSerial || !crlHas(t, f.op, f.prevSerial) || crlHas(t, f.op, served.SerialNumber.Text(16)) {
+		t.Fatal("cleanup refusal changed completed renewal revocation")
+	}
+	if !f.target.reloaded {
+		t.Fatal("cleanup refusal prevented libvirt TLS reload")
+	}
+	if _, err := os.Stat(filepath.Join(f.host, "host.d", f.prevSerial)); !os.IsNotExist(err) {
+		t.Fatalf("cleanup refusal left the replaced identity on the host: %v", err)
+	}
+	for path, body := range before {
+		info, err := os.Stat(path)
+		if err != nil || !os.SameFile(inodes[path], info) || string(mustRead(t, path)) != string(body) {
+			t.Errorf("retained UI path changed: %s (%v)", path, err)
+		}
+	}
+	for _, name := range []string{"host.crt", "host.key"} {
+		if _, err := os.Stat(filepath.Join(kept, name)); !os.IsNotExist(err) {
+			t.Errorf("independent kept %s survived the direct-path refusal: %v", name, err)
+		}
+	}
+}
+
 // The rotate-audit-key hint reaches the host the way the renewal did.
 //
 // Mutation: drop the --ssh branch from rotateAuditKeyHint.

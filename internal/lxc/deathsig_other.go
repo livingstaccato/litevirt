@@ -12,7 +12,7 @@ func dieWithDaemon(cmd *exec.Cmd) *exec.Cmd { return cmd }
 
 func runPinned(fn func() error) error { return fn() }
 
-func stopWorkersIn(string) {}
+func stopWorkersIn(string) error { return nil }
 
 func flockTry(*os.File) (bool, error) { return true, nil }
 

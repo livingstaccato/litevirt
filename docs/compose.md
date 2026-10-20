@@ -408,7 +408,13 @@ the Admin role or the `ContainerRoot` role on it (`ct.exec` is not
 enough; see [auth.md](auth.md)). So does a recreate from the same OCI
 library item path after an Admin's `lv ct pull --project` replaced the
 item's content: the member's host checks the item is still the pull the
-member was built from. An opt-out the member did not already have
+member was built from, and copies that pull aside before the delete; the
+member is rebuilt from that copy, whatever becomes of the item meanwhile.
+Any recreate from a rootfs path takes such a copy, so the member's host
+needs room for the rootfs beside the running member, or the recreate is
+refused with the member kept. The copy serves that recreate's own create
+only: a redeploy after a host or deploy died between the delete and the
+create creates the member anew from the item as it is then. An opt-out the member did not already have
 needs the Admin role. A recreate judges only the member on the host it
 targets, and only one that carries this stack's label; another stack's
 container of the same name is refused, not replaced. These refusals, and the

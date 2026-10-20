@@ -2,8 +2,11 @@ package grpcapi
 
 import (
 	"context"
+	"strings"
 
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -71,4 +74,41 @@ func (s *Server) execRootRefused(ctx context.Context) bool {
 // rec's container: the Admin role, or requireContainerRoot.
 func (s *Server) callerMayRoot(ctx context.Context, rec corrosion.ContainerRecord) bool {
 	return RequireRole(ctx, "admin") == nil || s.requireContainerRoot(ctx, rec) == nil
+}
+
+// judgeExecMode refuses exec in a container of root mode (privileged or
+// legacy-confined) to a caller who may not exec as root in it: on the owner
+// of a forwarded exec, by the entry's judgment (execRootRefused), and by
+// requireContainerRoot.
+func (s *Server) judgeExecMode(ctx context.Context, rec corrosion.ContainerRecord, mode string, argv []string) error {
+	if mode == "" {
+		return nil
+	}
+	if s.execRootRefused(ctx) {
+		s.audit(ctx, "ct.exec", rec.Name, "permission denied on the owner ("+mode+"): "+strings.Join(argv, " "), "denied")
+		return status.Errorf(codes.PermissionDenied,
+			"container %q is %s on its host %s, so exec in it needs the Admin role or the ContainerRoot role on it "+
+				"(an Admin grants it with lv role grant ContainerRoot <principal> --path %s)",
+			rec.Name, mode, s.hostName, ctRBACPathFor(rec.Project, rec.Name))
+	}
+	if err := s.requireContainerRoot(ctx, rec); err != nil {
+		s.audit(ctx, "ct.exec", rec.Name, "permission denied ("+mode+"): "+strings.Join(argv, " "), "denied")
+		return status.Errorf(codes.PermissionDenied,
+			"container %q is %s, so exec in it needs the Admin role or the ContainerRoot role on it "+
+				"(an Admin grants it with lv role grant ContainerRoot <principal> --path %s); "+
+				"or move it over first with lv ct convert --unprivileged --confinement default %s",
+			rec.Name, mode, ctRBACPathFor(rec.Project, rec.Name), rec.Name)
+	}
+	return nil
+}
+
+// execAfterJudge is a test seam: it runs after ExecContainer's first
+// judgment of the container's mode, before the judgment under its lock.
+var execAfterJudge = func() {}
+
+// containerExecStarter is a runtime that reports when an exec is attached
+// (LXCRuntimeAdapter.ExecContainerStarted), so ExecContainer holds the
+// container's lock only until then.
+type containerExecStarter interface {
+	ExecContainerStarted(ctx context.Context, name string, argv []string, started func()) (ContainerExecResult, error)
 }

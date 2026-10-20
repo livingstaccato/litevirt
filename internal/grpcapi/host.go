@@ -1027,6 +1027,9 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	if stopped == liveAborted {
 		why = drainLiveAbortedPrefix + " by `lv operation abort " + vm.Name + " --force`"
 	}
+	if stopped == liveUnanswered {
+		why = "libvirt did not answer the live move"
+	}
 	if pending != nil {
 		// libvirt has not answered the abort: the live job may still cut
 		// over. Its outcome goes to a background owner, which takes the VM's
@@ -1131,7 +1134,11 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			where = fmt.Sprintf("%s is not running on %s, and its record there says error (watch `lv events %s`)",
 				vm.Name, s.hostName, vm.Name)
 		}
-		detail := fmt.Sprintf("%s; the move was aborted and %s (%v)", why, where, lerr)
+		how := "the move was aborted"
+		if stopped == liveUnanswered {
+			how = "no cold move follows"
+		}
+		detail := fmt.Sprintf("%s; %s and %s (%v)", why, how, where, lerr)
 		s.recordVMEvent(context.WithoutCancel(ctx), vm.Name, "vm.migrated", "error", "drain: "+detail)
 		s.runDrainPostMigrate(ctx, pbVM, hspec, s.hostName, s.drainVMStateHere(ctx, vm.Name))
 		return &pb.DrainProgress{
@@ -1352,6 +1359,7 @@ const (
 	liveNotStopped liveStop = iota // libvirt ended the move on its own
 	liveTimedOut                   // it reached the VM's migration policy timeout
 	liveAborted                    // `lv operation abort <vm> --force` cancelled it
+	liveUnanswered                 // libvirt's call ended without an answer (errLibvirtCallUnanswered)
 )
 
 // drainLiveMigrate runs a drain's live move under the VM's migration policy
@@ -1364,7 +1372,9 @@ const (
 // cut-over completed before the abort could, and the guest runs on the target
 // only. Either way the drain acts on what libvirt did, never on the timeout
 // or the abort alone. stopped reports why the abort was sent when the guest
-// stayed (or may still move, with pending); liveNotStopped otherwise.
+// stayed (or may still move, with pending); liveUnanswered when libvirt's
+// call ended without an answer (errLibvirtCallUnanswered); liveNotStopped
+// otherwise.
 //
 // When libvirt does not answer within the grace, pending is the channel its
 // outcome will arrive on, and the caller hands it to a background owner: the
@@ -1373,8 +1383,9 @@ func (s *Server) drainLiveMigrate(ctx context.Context, name, dconnuri string, mp
 	if cerr := ctx.Err(); cerr != nil {
 		return fmt.Errorf("the move was aborted before libvirt started it: %w", cerr), liveAborted, nil
 	}
-	done := make(chan error, 1)
-	go func() { done <- s.virt.MigrateToTarget(name, dconnuri, mp) }()
+	// The drain, or the background owner of pending, always gets an answer
+	// (answerLibvirtCall).
+	done := answerLibvirtCall(func() error { return s.virt.MigrateToTarget(name, dconnuri, mp) })
 	var timeout <-chan time.Time
 	if timeoutSec > 0 {
 		timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
@@ -1383,6 +1394,11 @@ func (s *Server) drainLiveMigrate(ctx context.Context, name, dconnuri string, mp
 	}
 	select {
 	case err := <-done:
+		if errors.Is(err, errLibvirtCallUnanswered) {
+			// What libvirt did with the move is not known: no cold move
+			// follows, and the guest is taken as still here.
+			return err, liveUnanswered, nil
+		}
 		return err, liveNotStopped, nil
 	case <-timeout:
 		stopped = liveTimedOut

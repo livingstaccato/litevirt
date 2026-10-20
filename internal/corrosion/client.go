@@ -1515,7 +1515,7 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 	var allCredHosts entryHostRows  // every entry's, for the absorb below
 	var guardedUserEffects []func() // user_holds.go, run once tx commits
 	guardedOnCommit := func(fn func()) { guardedUserEffects = append(guardedUserEffects, fn) }
-	guardedUserNames := map[string]bool{}
+	guardedUserNames := map[string]string{} // name -> its incarnation before this write
 	for _, stmts := range entries {
 		relay := make([]Statement, 0, len(stmts))
 		// See executeBatchInternal.
@@ -1587,6 +1587,17 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 				c.mu.Unlock()
 				return false, err
 			}
+			if name := usersStatementName(s); name != "" {
+				if _, seen := guardedUserNames[name]; !seen {
+					before, err := userIncarnationHeld(ctx, tx, name)
+					if err != nil {
+						tx.Rollback()
+						c.mu.Unlock()
+						return false, err
+					}
+					guardedUserNames[name] = before
+				}
+			}
 			// A live-row update runs here through the same guarded form every
 			// receiver uses; what is logged is the wire form (live_row_update.go).
 			res, err := tx.ExecContext(ctx, appliedForm(s).SQL, s.Params...)
@@ -1606,9 +1617,6 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 				return false, err
 			}
 			c.recordUserWrite(ctx, tx, s, s.Guard, guardedOnCommit)
-			if name := usersStatementName(s); name != "" {
-				guardedUserNames[name] = true
-			}
 			changed := false
 			if n, e := res.RowsAffected(); e == nil && n > 0 {
 				changed = true
@@ -1625,8 +1633,8 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 		}
 		relays = append(relays, relay)
 	}
-	for name := range guardedUserNames {
-		if err := c.settleUserName(ctx, tx, name, guardedOnCommit); err != nil {
+	for name, before := range guardedUserNames {
+		if err := c.settleUserName(ctx, tx, name, before, guardedOnCommit); err != nil {
 			tx.Rollback()
 			c.mu.Unlock()
 			return false, err
@@ -1799,7 +1807,7 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	}
 	var userEffects []func() // user_holds.go, run once tx commits
 	onCommit := func(fn func()) { userEffects = append(userEffects, fn) }
-	userNames := map[string]bool{}
+	userNames := map[string]string{} // name -> its incarnation before this write
 	for _, s := range stmts {
 		// A fence credential carries the retirement it was set after
 		// (credentials_revive_guard.go).
@@ -1845,7 +1853,15 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 			return 0, err
 		}
 		if name := usersStatementName(s); name != "" {
-			userNames[name] = true
+			if _, seen := userNames[name]; !seen {
+				before, err := userIncarnationHeld(ctx, tx, name)
+				if err != nil {
+					tx.Rollback()
+					c.mu.Unlock()
+					return 0, err
+				}
+				userNames[name] = before
+			}
 		}
 		// This host's own row is not written while its own-row hold holds
 		// (own_row_hold.go).
@@ -1891,8 +1907,8 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 
 	// A users row this write moved settles what is held or recorded for its
 	// name (user_holds.go).
-	for name := range userNames {
-		if err := c.settleUserName(ctx, tx, name, onCommit); err != nil {
+	for name, before := range userNames {
+		if err := c.settleUserName(ctx, tx, name, before, onCommit); err != nil {
 			tx.Rollback()
 			c.mu.Unlock()
 			return 0, err

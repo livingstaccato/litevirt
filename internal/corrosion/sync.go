@@ -937,6 +937,29 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		}
 	}
 
+	// The incarnation each users row of the chunk holds before the merge:
+	// only a change retires what an older one left (user_holds.go).
+	var usersBefore map[string]string
+	if table.Name == "users" && c.UserIncarnationOn() {
+		usersBefore = map[string]string{}
+		idx := columnIndexMap(table.Columns)
+		for _, row := range rows {
+			if len(row) != len(table.Columns) {
+				continue
+			}
+			name := cellStr(row, idx, "username")
+			if _, seen := usersBefore[name]; seen || name == "" {
+				continue
+			}
+			inc, ierr := userIncarnationHeld(context.Background(), tx, name)
+			if ierr != nil {
+				_ = tx.Rollback()
+				return 0, len(rows), fmt.Errorf("read user incarnation: %w", ierr)
+			}
+			usersBefore[name] = inc
+		}
+	}
+
 	for _, row := range rows {
 		// A peer dump whose row doesn't match the declared column count is
 		// malformed/corrupt: skip it rather than index out of range below or
@@ -1422,13 +1445,14 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 
 	// A users row that moved settles what is held or recorded for its name
 	// (user_holds.go).
-	if table.Name == "users" && merged > 0 && c.UserIncarnationOn() {
+	if table.Name == "users" && merged > 0 && usersBefore != nil {
 		idx := columnIndexMap(table.Columns)
 		for _, row := range rows {
 			if len(row) != len(table.Columns) {
 				continue
 			}
-			if err := c.settleUserName(context.Background(), tx, cellStr(row, idx, "username"),
+			name := cellStr(row, idx, "username")
+			if err := c.settleUserName(context.Background(), tx, name, usersBefore[name],
 				func(fn func()) { c.deferAfterCommit(tx, fn) }); err != nil {
 				_ = tx.Rollback()
 				return 0, len(rows), fmt.Errorf("settle held user writes: %w", err)

@@ -385,24 +385,26 @@ func userRowUpdatedAt(ctx context.Context, tx *sql.Tx, table string, pk []interf
 
 // settleUserName runs, inside tx, once the users row of name may have moved:
 // held writes for the incarnation it now holds are replayed, those for an
-// older one dropped; restriction rows recorded for an older incarnation are
-// taken away. onCommit runs its argument once tx commits.
-func (c *Client) settleUserName(ctx context.Context, tx *sql.Tx, name string, onCommit func(func())) error {
+// older one dropped. before is the incarnation the row held before it moved
+// (userIncarnationHeld, "" for no row). onCommit runs its argument once tx
+// commits.
+func (c *Client) settleUserName(ctx context.Context, tx *sql.Tx, name, before string, onCommit func(func())) error {
 	if name == "" || !c.UserIncarnationOn() {
 		return nil
 	}
-	var local string
-	err := tx.QueryRowContext(ctx, `SELECT created_at FROM users WHERE username = ?`, name).Scan(&local)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
+	local, err := userIncarnationHeld(ctx, tx, name)
+	if err != nil || local == "" {
 		return err
 	}
-	// What a deleted account's lagging writes left here goes, judged by the
-	// rows alone, so the answer survives a restart (retireLaggingLifts).
-	if err := retireLaggingLifts(ctx, tx, name, local); err != nil {
-		return err
+	// Only when the name's incarnation changed here — a re-create, or its
+	// first row — what a deleted account's lagging writes left goes, judged
+	// by the rows alone, so the answer survives a restart
+	// (retireLaggingLifts). An ordinary write to the users row (a password
+	// change, an anti-entropy merge of the same account) retires nothing.
+	if local != before {
+		if err := retireLaggingLifts(ctx, tx, name, local); err != nil {
+			return err
+		}
 	}
 	held, records := c.userHolds.snapshot(name)
 	if len(held) == 0 && len(records) == 0 {
@@ -454,6 +456,17 @@ func (c *Client) settleUserName(ctx context.Context, tx *sql.Tx, name string, on
 // once its account's incarnation lands.
 func (c *Client) setUserHoldReplay(fn func(context.Context, *sql.Tx, Statement, string) error) {
 	c.userHoldReplay.Store(&fn)
+}
+
+// userIncarnationHeld is the incarnation the users row of name holds in
+// tx, or "" when there is no row.
+func userIncarnationHeld(ctx context.Context, tx *sql.Tx, name string) (string, error) {
+	var created string
+	err := tx.QueryRowContext(ctx, `SELECT created_at FROM users WHERE username = ?`, name).Scan(&created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return created, err
 }
 
 // usersStatementName is the account a users-table statement writes, or "".

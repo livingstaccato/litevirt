@@ -32,8 +32,8 @@ import (
 //
 // Mutations: retireLaggingLifts a no-op — red; the lifecycle row untagged
 // (tagUserLifecycle) — the expiry red. The epoch untagged (InsertUser2FA)
-// leaves this green — an untagged factor written after the new incarnation
-// goes by clock — and turns the new account's own early factor red instead
+// — the factor red, since an untagged factor is never dropped (re-review 4),
+// and the new account's own early factor red too
 // (TestFleet_AFactorPulledBeforeItsUsersRowIsKept and its siblings).
 func TestUserIncarnation_ALaggingFactorAndExtensionAreRetiredDurably(t *testing.T) {
 	for _, tc := range []struct {

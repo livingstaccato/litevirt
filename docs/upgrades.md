@@ -1529,7 +1529,11 @@ away again only if the host then learns of a newer account of the name. Two
 things of the deleted account can still reach the new one from the lagging
 host itself, and both only take access away: its session cut-offs, which log
 the new account out once, and its clearing of a directory identity the new
-account is bound to as well, which the new account binds again. The
+account is bound to as well, which the new account binds again. A second
+factor enrolled on a host that had not latched the token yet names no
+account, so no host drops it: one given to the deleted account that way
+is asked of the new account as well, until an admin removes it with
+`lv 2fa disable --user <name> --method totp`. The
 token latches on its own once every host the cluster replicates to, including
 one parked in `maintenance`, runs this release. Until then hosts write and
 merge users rows as the previous release does.

@@ -1610,6 +1610,14 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 		} else if credPlan.skip {
 			continue
 		}
+		// The incarnation the users row holds before this statement moves
+		// it: only a change retires what an older one left (user_holds.go).
+		userName, userBefore := usersStatementName(s), ""
+		if userName != "" {
+			if userBefore, err = userIncarnationHeld(ctx, tx, userName); err != nil {
+				return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+			}
+		}
 		if err := r.applyStatementLWW(ctx, tx, s, entry.Hlc); err != nil {
 			// A held entry's periodic retry is not a new refusal: counting it
 			// would keep the rejected-rate alert firing while it is held.
@@ -1645,8 +1653,8 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 		// A restriction row written for an incarnation is recorded with it,
 		// and a users row that moved settles its name (user_holds.go).
 		r.client.recordUserWrite(ctx, tx, s, s.Guard, func(fn func()) { r.client.deferAfterCommit(tx, fn) })
-		if name := usersStatementName(s); name != "" {
-			if err := r.client.settleUserName(ctx, tx, name, func(fn func()) { r.client.deferAfterCommit(tx, fn) }); err != nil {
+		if userName != "" {
+			if err := r.client.settleUserName(ctx, tx, userName, userBefore, func(fn func()) { r.client.deferAfterCommit(tx, fn) }); err != nil {
 				return fmt.Errorf("apply mutation (origin=%s seq=%d): settle held user writes: %w", entry.Origin, entry.Seq, err)
 			}
 		}

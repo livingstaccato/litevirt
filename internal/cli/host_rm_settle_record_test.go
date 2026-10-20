@@ -27,17 +27,15 @@ func (m *settleMachine) otherInstall(t *testing.T, at time.Time) (string, string
 }
 
 // recordIs fails unless the machine's install record is want exactly, and
-// neither a copy of it nor the settle's claim of the serial is left.
+// the settle's claim of the serial is not left.
 func (m *settleMachine) recordIs(t *testing.T, want string) {
 	t.Helper()
 	got, err := os.ReadFile(m.f.target.Path(addInstalledMarker))
 	if err != nil || string(got) != want {
 		t.Errorf("install record = %q (%v), want %q", got, err, want)
 	}
-	for _, p := range []string{settlePriorPath(m.serial), settleClaimPath(m.serial)} {
-		if _, err := os.Stat(m.f.target.Path(p)); !os.IsNotExist(err) {
-			t.Errorf("%s is left (stat: %v)", p, err)
-		}
+	if _, err := os.Stat(m.f.target.Path(settleClaimPath(m.serial))); !os.IsNotExist(err) {
+		t.Errorf("the settle's claim is left (stat: %v)", err)
 	}
 }
 
@@ -316,44 +314,6 @@ func TestHostRemoveSerial_AnExistingNameWithABlankIsFinishedByItsPrintedCommand(
 		}
 		if len(c.preflight) != 0 || len(c.calls) != 0 {
 			t.Errorf("name %q reached the cluster: %v", bad, c.calls)
-		}
-	}
-}
-
-// The copy a settle's claim kept (settlePriorPath) is put back only while it
-// is still the one read: one that changed between the read and the locked
-// command (another settle of the serial, say) is not put back over the
-// record, and neither the record nor the copy is changed.
-//
-// Mutation: drop the copy's compare from releaseInstallRecord's condition —
-// the copy read first is written over the record and the newer copy removed.
-func TestReleaseInstallRecord_PutsBackOnlyTheCopyAsRead(t *testing.T) {
-	const serial = "a0a0"
-	for _, how := range []releaseMode{releaseSettled, releaseRemoved} {
-		root := t.TempDir()
-		r := &LocalAddTarget{Root: root, PKIDir: filepath.Join(root, "etc", "litevirt", "pki")}
-		claim := markerLine("node-9", serial, 1_800_000_000, "0123456789ab", "installing") + "\n"
-		writeMarker(t, r, claim)
-		copyPath := r.Path(settlePriorPath(serial))
-		if err := os.WriteFile(copyPath, []byte("node-x b0b0 1799999700 cafecafe0000 installed\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		newer := "node-y c0c0 1799999800 beefbeef0000 installed\n"
-		afterMarkerRead = func() {
-			if err := os.WriteFile(copyPath, []byte(newer), 0o600); err != nil {
-				t.Fatal(err)
-			}
-		}
-		err := releaseInstallRecord(r, serial, how)
-		afterMarkerRead = nil
-		if err != nil {
-			t.Fatalf("mode %d: %v", how, err)
-		}
-		if got := string(mustRead(t, r.Path(addInstalledMarker))); got != claim {
-			t.Errorf("mode %d: install record = %q, want the claim %q left", how, got, claim)
-		}
-		if got, err := os.ReadFile(copyPath); err != nil || string(got) != newer {
-			t.Errorf("mode %d: copy = %q (%v), want the newer copy %q left", how, got, err, newer)
 		}
 	}
 }

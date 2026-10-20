@@ -192,11 +192,7 @@ removes that serial's staged files and records, and removes its claim last.
 It never writes `/etc/litevirt/.lv-add-installed`: another admission's
 install keeps its record, name and time, and so the hour in which it keeps a
 fresh add out, whatever runs between or fails. Only the serial's own add's
-claim is removed from it, and never the installed identity. A record an
-earlier build of this command claimed, with the record it replaced kept in
-`/etc/litevirt/.lv-add-installed.settle-<serial>`, gets that record back when
-the same command runs, and until then an add judges the machine by the kept
-record and names that command. A step that fails after the revocation, the
+claim is removed from it, and never the installed identity. A step that fails after the revocation, the
 publication or the cleanup, says so and names the same command, which
 finishes it. `lv host rm <name>` of a
 joining host whose cleanup on the machine fails does the same. Install and

@@ -563,30 +563,6 @@ func settleClaimPath(serial string) string {
 	return "/etc/litevirt/.lv-add-settle-" + serial
 }
 
-// settlePriorPath is where a settle of an earlier build of this branch kept
-// the install record its claim replaced (its claim was the install record
-// itself; "" stood for none). Read only to put that record back while the
-// install record is still that claim (releaseInstallRecord), and never
-// removed otherwise.
-func settlePriorPath(serial string) string {
-	return addInstalledMarker + ".settle-" + serial
-}
-
-// legacySettleCopy is, when the install record line is a claim of serial X
-// that an earlier build's settle of X wrote (settlePriorPath(X) exists),
-// the record that claim replaced. Such a claim is no add's.
-func legacySettleCopy(r addRemote, line string) (string, bool, error) {
-	f := markerFields(line)
-	if len(f) < 5 || f[4] != "installing" || canonSerial(f[1]) == "" {
-		return "", false, nil
-	}
-	b, ok, err := r.ReadFile(settlePriorPath(canonSerial(f[1])))
-	if err != nil || !ok {
-		return "", false, err
-	}
-	return strings.TrimRight(string(b), "\n"), true, nil
-}
-
 // namesSerial reports whether the install record line is of serial, in any
 // spelling.
 func namesSerial(line, serial string) bool {
@@ -638,48 +614,20 @@ func removeSyncedCmd(r addRemote, path string) string {
 // add lock and only while the record is exactly as read. Only a record of
 // serial is changed: a record of serial goes as how says, and any other
 // admission's record, whenever it was written, is left as it is.
-//
-// The one record of serial that is put back rather than removed is an
-// earlier build's settle claim of serial, with the record it replaced
-// (settlePriorPath): that record goes back exactly, and its copy with it.
-// The copy is otherwise left, unless another admission's finished install
-// has replaced the claim since.
 func releaseInstallRecord(r addRemote, serial string, how releaseMode) error {
 	b, ok, err := r.ReadFile(addInstalledMarker)
 	if err != nil {
 		return err
 	}
 	line := strings.TrimRight(string(b), "\n")
-	kb, kept, err := r.ReadFile(settlePriorPath(serial))
-	if err != nil {
-		return err
-	}
-	prior := strings.TrimRight(string(kb), "\n")
-	cond := markerAbsent(r)
-	if ok {
-		cond = markerIs(r, line)
-	}
-	var body string
 	switch {
-	case kept && (!ok || isClaimOf(line, serial)):
-		put := prior
-		if namesSerial(prior, serial) && (how == releaseRemoved || isClaimOf(prior, serial)) {
-			put = ""
-		}
-		cond += " && " + fileIs(r, settlePriorPath(serial), prior)
-		body = "{ " + setMarkerCmd(r, put, nonceOr(serial)) + "; } && " + removeSyncedCmd(r, settlePriorPath(serial))
-	case kept && !namesSerial(line, serial) && finishedInstall(line):
-		// Another admission installed the machine since: what the copy kept
-		// is no record any more, and no rollback gives the claim back.
-		cond += " && " + fileIs(r, settlePriorPath(serial), prior)
-		body = removeSyncedCmd(r, settlePriorPath(serial))
 	case !ok:
 		return nil
 	case how == releaseRemoved && namesSerial(line, serial), how == releaseSettled && isClaimOf(line, serial):
-		body = setMarkerCmd(r, "", nonceOr(serial))
 	default:
 		return nil // another admission's record, or an install of a settled serial: it stays
 	}
+	cond, body := markerIs(r, line), setMarkerCmd(r, "", nonceOr(serial))
 	if afterMarkerRead != nil {
 		afterMarkerRead()
 	}
@@ -691,13 +639,6 @@ func releaseInstallRecord(r addRemote, serial string, how releaseMode) error {
 		return fmt.Errorf("take the removed admission's record %s off the machine: %w", addInstalledMarker, err)
 	}
 	return nil
-}
-
-// finishedInstall reports whether the install record line is a finished
-// install (an earlier release's form has no state), not a claim.
-func finishedInstall(line string) bool {
-	f := markerFields(line)
-	return len(f) >= 3 && (len(f) < 5 || f[4] == "installed")
 }
 
 // dropSettleClaim removes serial's settle claim (settleClaimPath) under the
@@ -930,13 +871,8 @@ func takeSettleClaim(r addRemote, hostName, serial, address string) (string, err
 	}
 	f := markerFields(prior)
 	if len(f) >= 5 && f[4] == "installing" {
-		// An add's claim, unless an earlier build's settle wrote it.
-		_, settling, err := legacySettleCopy(r, prior)
-		if err != nil {
-			return "", err
-		}
 		at, _ := strconv.ParseInt(f[2], 10, 64)
-		if !settling && addNow().Sub(time.Unix(at, 0)) < staleClaim {
+		if addNow().Sub(time.Unix(at, 0)) < staleClaim {
 			return "", fmt.Errorf("an `lv host add` holds the machine at %s (claimed less than %s ago); nothing was revoked. "+
 				"Run this again once it has finished", address, staleClaim)
 		}

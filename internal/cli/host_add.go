@@ -1914,65 +1914,42 @@ func refuseSecondInstall(r addRemote, p hostAddPlan, serial string, exp addExpec
 		return "", err
 	}
 	prior := strings.TrimRight(string(b), "\n")
-	// An earlier build's settle claim (legacySettleCopy) is judged as a claim,
-	// and the record it replaced as the record; its command puts that back.
-	records, legacy := []string{prior}, ""
-	if kept, ok, err := legacySettleCopy(r, prior); err != nil {
-		return "", err
-	} else if ok {
-		records = append(records, kept)
-		lf := markerFields(prior)
-		x := canonSerial(lf[1])
-		legacy = fmt.Sprintf(". An unfinished `lv host rm --serial %s` holds the install record, and keeps the one it "+
-			"replaced in %s: check that file on the machine", x, settlePriorPath(x))
-		if echoableName(lf[0]) {
-			legacy = fmt.Sprintf(". An unfinished `lv host rm --serial %s` holds the install record, and keeps the one it "+
-				"replaced in %s; `%s` puts it back", x, settlePriorPath(x),
-				settleCmd(hostAddPlan{hostName: lf[0], hostAddr: p.hostAddr}, x))
-		}
+	f := markerFields(prior)
+	if len(f) < 3 {
+		return prior, nil
 	}
-	for i, rec := range records {
-		f := markerFields(rec)
-		if len(f) < 3 {
-			continue
-		}
-		at, _ := strconv.ParseInt(f[2], 10, 64)
-		when := time.Unix(at, 0)
-		// The record's fields come from the machine: printed only once checked.
-		name, other, attempt := "(unreadable)", canonSerial(f[1]), "(unreadable)"
-		if validHostName(f[0]) {
-			name = f[0]
-		}
-		shown := other
-		if shown == "" {
-			shown = "(unreadable)"
-		}
-		if len(f) >= 4 && validAttemptTag(f[3]) {
-			attempt = f[3]
-		}
-		if len(f) >= 5 && f[4] == "installing" && f[3] != nonce && addNow().Sub(when) < staleClaim {
-			return "", fmt.Errorf("another `lv host add` holds this machine (attempt %s, for %s with certificate %s, since "+
-				"%s), and this one installs nothing. Run this again once it has finished; if it died, after %s%s",
-				attempt, name, shown, when.UTC().Format(time.RFC3339), when.Add(staleClaim).UTC().Format(time.RFC3339), legacy)
-		}
-		if i == 0 && len(records) > 1 {
-			continue // a settle's claim, not an install: the record it replaced is judged
-		}
-		// The record's admission, not its name, decides: the same name may be
-		// another admission's (one this replica has not received, say). Its
-		// recent install is replaced only when what the machine serves is
-		// proven not to be it: nothing, this admission's own certificate, or one
-		// this cluster's CA issued and revoked. The record's serial being
-		// revoked proves nothing about the certificate installed.
-		if other == serial || addNow().Sub(when) >= freshInstall || now == "" || now == serial || revokedHere(p.pkiDir, nowPEM) {
-			continue
-		}
-		return "", settled(fmt.Sprintf("another admission installed this machine as %s (certificate %s) at %s, and the "+
-			"machine serves certificate %s, which this cluster has not revoked, so this add installs nothing: a machine is "+
-			"admitted under one name. `%s` undoes this add's admission and leaves the machine as it is%s",
-			name, shown, when.UTC().Format(time.RFC3339), now, settleCmd(p, serial), legacy))
+	at, _ := strconv.ParseInt(f[2], 10, 64)
+	when := time.Unix(at, 0)
+	// The record's fields come from the machine: printed only once checked.
+	name, other, attempt := "(unreadable)", canonSerial(f[1]), "(unreadable)"
+	if validHostName(f[0]) {
+		name = f[0]
 	}
-	return prior, nil
+	shown := other
+	if shown == "" {
+		shown = "(unreadable)"
+	}
+	if len(f) >= 4 && validAttemptTag(f[3]) {
+		attempt = f[3]
+	}
+	if len(f) >= 5 && f[4] == "installing" && f[3] != nonce && addNow().Sub(when) < staleClaim {
+		return "", fmt.Errorf("another `lv host add` holds this machine (attempt %s, for %s with certificate %s, since "+
+			"%s), and this one installs nothing. Run this again once it has finished; if it died, after %s",
+			attempt, name, shown, when.UTC().Format(time.RFC3339), when.Add(staleClaim).UTC().Format(time.RFC3339))
+	}
+	// The record's admission, not its name, decides: the same name may be
+	// another admission's (one this replica has not received, say). Its
+	// recent install is replaced only when what the machine serves is
+	// proven not to be it: nothing, this admission's own certificate, or one
+	// this cluster's CA issued and revoked. The record's serial being
+	// revoked proves nothing about the certificate installed.
+	if other == serial || addNow().Sub(when) >= freshInstall || now == "" || now == serial || revokedHere(p.pkiDir, nowPEM) {
+		return prior, nil
+	}
+	return "", settled(fmt.Sprintf("another admission installed this machine as %s (certificate %s) at %s, and the "+
+		"machine serves certificate %s, which this cluster has not revoked, so this add installs nothing: a machine is "+
+		"admitted under one name. `%s` undoes this add's admission and leaves the machine as it is",
+		name, shown, when.UTC().Format(time.RFC3339), now, settleCmd(p, serial)))
 }
 
 // readPair reads the certificate at crt and the key at key on the host, and

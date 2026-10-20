@@ -18,6 +18,8 @@ package corrosion
 type Disposition string
 
 const (
+	// DispSnapshotClaim is accepted only by the complete three-role entry path.
+	DispSnapshotClaim       Disposition = "snapshot_claim"
 	DispPlainInsert         Disposition = "plain_insert"           // rewrite to a PK-aware upsert
 	DispExplicitUpsert      Disposition = "explicit_upsert"        // apply verbatim (leading algo normalized)
 	DispFullPKUpdate        Disposition = "full_pk_update"         // LWW-gate by updated_at, guards retained

@@ -820,6 +820,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.db.SetVMReplaceAccept(func() bool {
 		return d.checker.DurablyLatched(capabilities.VMReplaceV1)
 	})
+	d.db.SetVMSnapshotClaimCapability(func() bool {
+		return d.checker.DurablyLatched(capabilities.VMSnapshotClaimV1)
+	}, func(ctx context.Context) bool {
+		// Enforced drives/retries persistence; it is not the fresh emission check.
+		if !d.checker.Enforced(ctx, capabilities.VMSnapshotClaimV1) ||
+			!d.checker.DurablyLatched(capabilities.VMSnapshotClaimV1) {
+			return false
+		}
+		ready, _ := d.checker.CapabilityActive(ctx, capabilities.VMSnapshotClaimV1)
+		return ready
+	})
 	// Every push declares this build's release tokens from the first one
 	// (I-R2-2): the server, which wires the live advertisement, is built later,
 	// and a push that declared nothing would be refused by every peer with a

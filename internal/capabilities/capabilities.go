@@ -772,6 +772,8 @@ const (
 	// it stops a domain or touches either VM. A cluster that has not opted in keeps a
 	// cutover that declines, rather than one that half-applies.
 	VMReplaceV1 = "vm_replace_v1"
+	// VMSnapshotClaimV1 is binary support for the exact snapshot claim, not execution authority.
+	VMSnapshotClaimV1 = "vm_snapshot_claim_v1"
 	// ProjectAuthorityV1 gates DELEGATED project-quota admission: a node that does not
 	// hold a project's D1 admission authority asks the holder to decide, instead of
 	// deciding from its own replica. Reserve-then-verify alone makes two racers agree
@@ -1228,6 +1230,7 @@ const ReleaseToken = Release202611V1
 // PingResponse.not_enforcing, and its enforcing peers raise ha_degraded
 // (unsupported_member) because it no longer advertises the token.
 var supported = []string{
+	VMSnapshotClaimV1,
 	SplitBrainGateV1,
 	// Advertised so the cluster can latch these; enforcement stays inert until the
 	// matching config kill-switch is set true (see EnforcementConfig / AuthConfig).
@@ -1378,7 +1381,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, LeaseTermClaimV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, VRRPUnicastV1, Release202611V1, SpecConflictV1, NetBoxIPRepointV1}
+var all = []string{VMSnapshotClaimV1, SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, LeaseTermClaimV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, VRRPUnicastV1, Release202611V1, SpecConflictV1, NetBoxIPRepointV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -1417,6 +1420,7 @@ func Supported() []string {
 // the latch from ever forming, and the fail-closed side of these tokens costs
 // availability of the feature, not of the cluster.
 var replicationGated = map[string]bool{
+	VMSnapshotClaimV1: true,
 	LeaseTermLedgerV1: true,
 	// Confirmed against every replication recipient: the
 	// credential tables' shapes must be decodable by every host we stream to —
@@ -1517,6 +1521,7 @@ func ReplicationGated(token string) bool {
 // appropriate for a token stating a FACT about the binary (what wire shapes it
 // can decode, what merge resolver it carries) rather than a policy.
 var mandatory = map[string]bool{
+	VMSnapshotClaimV1: true,
 	SplitBrainGateV1:  true,
 	LeaseTermLedgerV1: true,
 	// A fact about the binary (it decodes and reads the credential tables),

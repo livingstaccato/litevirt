@@ -228,6 +228,7 @@ var dispIdent = map[corrosion.Disposition]string{
 	corrosion.DispCustomMerge:          "DispCustomMerge",
 	corrosion.DispAuditReseal:          "DispAuditReseal",
 	corrosion.DispCreateBegin:          "DispCreateBegin",
+	corrosion.DispSnapshotClaim:        "DispSnapshotClaim",
 	corrosion.DispGuardedTransition:    "DispGuardedTransition",
 	corrosion.DispWorkloadDelete:       "DispWorkloadDelete",
 	corrosion.DispLegacyWorkloadDelete: "DispLegacyWorkloadDelete",
@@ -519,6 +520,10 @@ func scanPkg(pkg *packages.Package) []finding {
 					if len(call.Args) >= 6 {
 						got = s.resolveBatchArg(call.Args[5])
 					}
+				case "executeSnapshotClaim": // (ctx, prepare func(*sql.Tx) ([]Statement, error))
+					if len(call.Args) >= 2 {
+						got = s.resolveSnapshotCallback(call.Args[1])
+					}
 				case "ExecuteBatchGuarded": // (ctx, guard, stmts)
 					if len(call.Args) >= 3 {
 						got = s.resolveBatchArg(call.Args[2])
@@ -542,7 +547,7 @@ func scanPkg(pkg *packages.Package) []finding {
 func isReplicatingMethod(m string) bool {
 	switch m {
 	case "Execute", "ExecuteRows", "ExecuteRowsStrict", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchGuarded",
-		"ExecuteEntriesGuarded", "executeLifecycleBatch", "executeCredentialBatch", "executeBatchWithLifecycle":
+		"ExecuteEntriesGuarded", "executeLifecycleBatch", "executeCredentialBatch", "executeBatchWithLifecycle", "executeSnapshotClaim":
 		return true
 	}
 	return false
@@ -560,7 +565,7 @@ func isPlumbingMethod(pkg *packages.Package, fd *ast.FuncDecl) bool {
 	}
 	switch fd.Name.Name {
 	case "Execute", "ExecuteRows", "ExecuteRowsStrict", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchGuarded",
-		"ExecuteEntriesGuarded", "executeBatchInternal", "executeBatchWithLifecycle", "executeLifecycleBatch", "executeCredentialBatch", "execLocal", "execLocalRows", "execBatchLocal":
+		"ExecuteEntriesGuarded", "executeBatchInternal", "executeBatchWithLifecycle", "executeLifecycleBatch", "executeCredentialBatch", "executeSnapshotClaim", "execLocal", "execLocalRows", "execBatchLocal":
 		return true
 	}
 	return false
@@ -573,6 +578,7 @@ type scanner struct {
 	fn         *ast.FuncDecl
 	callPos    token.Pos              // only assignments BEFORE this position may define the batch arg
 	visited    map[*ast.FuncDecl]bool // helper-recursion guard, shared across nested scanners
+	localDefs  map[types.Object]bool  // non-nil only for a literal callback: its own body declarations
 }
 
 // isLocalDefinable reports whether obj is a function-local variable whose value at the call
@@ -582,6 +588,9 @@ type scanner struct {
 func (s *scanner) isLocalDefinable(obj types.Object) bool {
 	if obj == nil || obj.Parent() == s.pkg.Types.Scope() {
 		return false
+	}
+	if s.localDefs != nil && !s.localDefs[obj] {
+		return false // captured values are not defined by assignments inside this callback
 	}
 	inFields := func(fl *ast.FieldList) bool {
 		if fl == nil {
@@ -600,6 +609,71 @@ func (s *scanner) isLocalDefinable(obj types.Object) bool {
 		return false
 	}
 	return true
+}
+
+// resolveSnapshotCallback follows only a literal callback's own batch returns.
+// Function values and opaque batches fail closed; nested function returns do
+// not describe what this callback hands to executeSnapshotClaim.
+func (s *scanner) resolveSnapshotCallback(arg ast.Expr) []finding {
+	unresolved := func(pos token.Pos) []finding {
+		return []finding{{pos: s.pkg.Fset.Position(pos), unresolvedBatch: true}}
+	}
+	lit, ok := arg.(*ast.FuncLit)
+	if !ok {
+		return unresolved(arg.Pos())
+	}
+	sig, ok := s.pkg.TypesInfo.TypeOf(lit).(*types.Signature)
+	if !ok || sig.Params().Len() != 1 || sig.Results().Len() != 2 ||
+		!isStatementSlice(sig.Results().At(0).Type()) ||
+		!types.Identical(sig.Results().At(1).Type(), types.Universe.Lookup("error").Type()) {
+		return unresolved(arg.Pos())
+	}
+	// Bind resolution to declarations owned by this literal's body. Assignments
+	// to captured parameters/locals do not establish their initial value, and
+	// declarations in nested closures do not belong to this callback.
+	localDefs := map[types.Object]bool{}
+	ast.Inspect(lit.Body, func(n ast.Node) bool {
+		if _, nested := n.(*ast.FuncLit); nested {
+			return false
+		}
+		if id, ok := n.(*ast.Ident); ok {
+			if obj := s.pkg.TypesInfo.Defs[id]; obj != nil {
+				localDefs[obj] = true
+			}
+		}
+		return true
+	})
+	inner := &scanner{pkg: s.pkg, funcByName: s.funcByName,
+		fn: &ast.FuncDecl{Type: lit.Type, Body: lit.Body}, visited: s.visited,
+		localDefs: localDefs}
+	var out []finding
+	found := false
+	ast.Inspect(lit.Body, func(n ast.Node) bool {
+		if _, nested := n.(*ast.FuncLit); nested {
+			return false
+		}
+		ret, ok := n.(*ast.ReturnStmt)
+		if !ok {
+			return true
+		}
+		found = true
+		if len(ret.Results) != 2 {
+			out = append(out, unresolved(ret.Pos())...)
+			return false
+		}
+		// An explicit nil batch emits no statements (including error returns).
+		if id, ok := ret.Results[0].(*ast.Ident); ok &&
+			s.pkg.TypesInfo.ObjectOf(id) == types.Universe.Lookup("nil") {
+			return false
+		}
+		inner.callPos = ret.Pos()
+		out = append(out, inner.resolveBatchArg(ret.Results[0])...)
+		return false
+	})
+	if !found {
+		return unresolved(arg.Pos())
+	}
+	return out
 }
 
 // resolveBatchArg resolves the []Statement argument of an ExecuteBatch* call to the concrete

@@ -108,10 +108,14 @@ migration-TLS credentials:
   own migration CA refuses the copy, naming the error and the same command.
 - A host whose credentials cannot be used (a CA that is not a certificate or
   not a file, a host certificate the CA did not issue, a key that is not the
-  certificate's) is not ready for migration TLS, and its daemon installs
-  nothing for QEMU. A storage copy from or to it is refused before it starts,
-  naming the host, why, and `lv host install-migration-tls --reissue`, whatever
-  `migration.allow_unencrypted_storage` says. A target in that state refuses
+  certificate's, or an incomplete set: some but not all of `ca.crt`,
+  `host.crt` and `host.key`) is not ready for migration TLS, and its daemon
+  installs nothing for QEMU. A storage copy from or to it is refused before it
+  starts, naming the host and why, whatever
+  `migration.allow_unencrypted_storage` says. An incomplete set is usually a
+  credential push in flight or cut short: let it finish, or re-run
+  `lv host install-migration-tls`. A damaged set is replaced with
+  `lv host install-migration-tls --reissue`. A target in that state refuses
   a storage copy that asks for TLS outright, so a source on an older build
   fails closed rather than falling back to plaintext. Every certificate of
   the CA file is read (an old and a new CA during a rotation), and an expired
@@ -130,8 +134,9 @@ migration-TLS credentials:
   migration, so no restart is needed. It refuses to touch `/etc/pki/qemu` if
   that directory already holds files litevirt did not put there.
 
-If either host has no credentials, the copy would cross the network in
-plaintext, and the source refuses it unless its config sets
+If either host has no credentials (none of the three files; an incomplete set
+is not "no credentials" and is refused as above), the copy would cross the
+network in plaintext, and the source refuses it unless its config sets
 `migration.allow_unencrypted_storage: true` (see
 [configuration](configuration.md#migration)). Set that only where the network
 between hosts is trusted. Migrations of VMs on shared storage copy no disks, so

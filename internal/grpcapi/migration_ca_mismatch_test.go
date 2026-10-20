@@ -28,3 +28,22 @@ func TestMigrationCAMismatch_NamesARunningRotation(t *testing.T) {
 		}
 	}
 }
+
+// An incomplete set is usually a credential push still in flight, not a
+// damaged set: the refusal names both remedies, letting the push finish (or
+// re-running it) and reissuing, so an operator does not reissue over a push.
+//
+// Mutation: drop the incomplete-set sentence — red.
+func TestUnusableMigrationCredentialsRefusal_NamesBothRemedies(t *testing.T) {
+	err := unusableMigrationCredentialsRefusal("vm", "node-2",
+		"migration-TLS credentials are unusable: incomplete set, missing host.key (a credential push may be in progress)")
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("err = %v; want FailedPrecondition", err)
+	}
+	for _, want := range []string{"node-2", "incomplete", "let it finish", "re-run `lv host install-migration-tls`",
+		"`lv host install-migration-tls --reissue`"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not say %q", err, want)
+		}
+	}
+}

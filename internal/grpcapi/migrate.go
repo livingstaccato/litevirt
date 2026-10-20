@@ -2688,12 +2688,15 @@ func headerValue(text string) string {
 }
 
 // unusableMigrationCredentialsRefusal refuses a storage copy because host's
-// migration-TLS credentials are unusable (why), with the fix.
+// migration-TLS credentials are unusable (why), with both fixes: an
+// incomplete set is usually a push still in flight, a damaged one is reissued.
 func unusableMigrationCredentialsRefusal(vmName, host, why string) error {
 	return status.Errorf(codes.FailedPrecondition,
 		"refusing to migrate VM %q with a storage copy: %s holds migration-TLS credentials it cannot use (%s), so the copy "+
-			"could not be encrypted. Reissue its credentials with `lv host install-migration-tls --reissue` (run where the "+
-			"cluster's migration CA lives)", vmName, host, why)
+			"could not be encrypted. If its set is incomplete (some of ca.crt, host.crt and host.key missing), a credential "+
+			"push is in flight or was cut short: let it finish, or re-run `lv host install-migration-tls`. If the set is "+
+			"damaged, reissue it with `lv host install-migration-tls --reissue`. Run either where the cluster's migration "+
+			"CA lives", vmName, host, why)
 }
 
 // migrationCAMismatch refuses a storage copy between hosts whose migration

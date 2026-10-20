@@ -2,12 +2,16 @@ package libvirtfake
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -329,8 +333,10 @@ func TestDaemonGate_ANestedCallOfAnAdmittedOnePasses(t *testing.T) {
 // the Goexit's _panic record, whose fp is the parameter's address; what the
 // parameter held must still be allocated then, or the GC marks a freed object
 // and the process dies: "fatal error: found pointer to free object". Each run
-// is a child process: two cycles while the hook holds, then two more while
-// MigrateToTarget's deferred leave waits on the gate.
+// is a child process: two cycles while the hook holds, then two more once
+// the worker, inside the Goexit, is parked in MigrateToTarget's deferred
+// leave on the gate's lock. Every stage is acknowledged and bounded, and the
+// worker is joined before the child ends.
 //
 // Mutation: without MigrateToTarget's keep-alive of its parameter, the child
 // dies with "found pointer to free object", red.
@@ -338,43 +344,84 @@ const goexitMigrateChild = "LV_LIBVIRTFAKE_GOEXIT_MIGRATE_CHILD"
 
 func TestDaemonGate_AGoexitInTheMigrateHookFreesNothingItsDefersFind(t *testing.T) {
 	if os.Getenv(goexitMigrateChild) == "1" {
-		goexitInTheMigrateHook()
+		goexitInTheMigrateHook(t)
 		return
 	}
 	for i := 0; i < 5; i++ {
-		cmd := exec.Command(os.Args[0], "-test.run=^"+t.Name()+"$", "-test.count=1")
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^"+t.Name()+"$", "-test.count=1", "-test.v")
 		cmd.Env = append(os.Environ(), goexitMigrateChild+"=1")
 		out, err := cmd.CombinedOutput()
-		if err != nil || bytes.Contains(out, []byte("fatal error")) {
-			t.Fatalf("run %d: the child died (%v):\n%s", i, err, out)
+		cancel()
+		if err != nil || bytes.Contains(out, []byte("fatal error")) || !bytes.Contains(out, []byte("--- PASS: "+t.Name())) {
+			t.Fatalf("run %d: the child did not pass (%v):\n%s", i, err, out)
 		}
 	}
 }
 
 // goexitInTheMigrateHook is the child of the test above.
-func goexitInTheMigrateHook() {
+func goexitInTheMigrateHook(t *testing.T) {
+	const bound = 10 * time.Second
 	f := New()
 	f.SetState("vm1", StateRunning)
-	inGoexit := make(chan struct{})
+	var worker atomic.Uint64
+	var exiting atomic.Bool
+	inLeave, done := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	f.gate.leaving = func(id uint64) {
+		// From inside the Goexit's deferred calls: MigrateToTarget's leave.
+		if exiting.Load() && id == worker.Load() {
+			once.Do(func() { close(inLeave) })
+		}
+	}
 	f.OnMigrateToTarget = func(string, string, libvirt.MigrateParams) error {
+		worker.Store(goid())
 		// MigrateToTarget reads its parameter no more: two cycles free what
 		// only the parameter holds, unless it is kept alive.
 		runtime.GC()
 		runtime.GC()
-		// MigrateToTarget's deferred leave waits here, inside the Goexit.
+		// MigrateToTarget's deferred leave parks on this, inside the Goexit.
 		f.gate.mu.Lock()
-		close(inGoexit)
+		exiting.Store(true)
 		kill()
 		return errors.New("unreachable")
 	}
 	go func() {
+		defer close(done)
 		// A fresh allocation that only the parameter references.
 		p := libvirt.MigrateParams{Live: true, TargetAddress: strings.Repeat("a", 512)}
 		_ = f.MigrateToTarget("vm1", "qemu+tls://dst/system", p)
 	}()
-	<-inGoexit
-	time.Sleep(100 * time.Millisecond) // the goroutine parks in leave
+	select {
+	case <-inLeave:
+	case <-time.After(bound):
+		t.Fatal("the worker did not reach MigrateToTarget's deferred leave")
+	}
+	if !parkedInLeave(worker.Load(), bound) {
+		t.Fatal("the worker did not park on the gate's lock in its deferred leave")
+	}
 	runtime.GC()
 	runtime.GC()
 	f.gate.mu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(bound):
+		t.Fatal("the worker did not end after the gate's lock was let go")
+	}
+}
+
+// parkedInLeave reports, within d, that goroutine id is blocked on a mutex
+// in daemonGate.leave.
+func parkedInLeave(id uint64, d time.Duration) bool {
+	head := fmt.Sprintf("goroutine %d [sync.Mutex.Lock", id)
+	for deadline := time.Now().Add(d); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		buf := make([]byte, 1<<20)
+		buf = buf[:runtime.Stack(buf, true)]
+		for _, rec := range strings.Split(string(buf), "\n\n") {
+			if strings.HasPrefix(rec, head) && strings.Contains(rec, "(*daemonGate).leave") {
+				return true
+			}
+		}
+	}
+	return false
 }

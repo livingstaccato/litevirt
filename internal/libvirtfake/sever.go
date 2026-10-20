@@ -53,6 +53,9 @@ type daemonGate struct {
 	inflight int
 	owners   map[uint64]int // goroutine → depth of its admitted call
 	calls    []string       // the calls the dead gate ended
+	// leaving, when set (a test's seam), is told each goroutine that
+	// leaves an admitted call, before it takes the gate's lock.
+	leaving func(id uint64)
 }
 
 // severExempt are the exported methods no daemon calls: the scenario's
@@ -166,6 +169,9 @@ func (f *Fake) daemon() (exit func()) {
 
 // leave ends one level of goroutine id's admitted call.
 func (g *daemonGate) leave(id uint64) {
+	if g.leaving != nil {
+		g.leaving(id)
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.owners[id]--; g.owners[id] <= 0 {

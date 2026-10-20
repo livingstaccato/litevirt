@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/litevirt/litevirt/internal/secretfile"
 )
@@ -78,4 +79,24 @@ func (r *migrationRotation) phases() []string {
 		return []string{phaseCutover}
 	}
 	return []string{phaseTrustBoth, phaseReissue, phaseDropOld}
+}
+
+// rotationFilePrefix begins every file the rotation keeps in the operator's
+// PKI directory beyond migration-ca.crt|.key: next.*, bundle.crt and each
+// retired-<date>[-N].crt.
+const rotationFilePrefix = "migration-ca."
+
+// rotationFileCollisions names each host whose cluster pair (<name>.crt|.key
+// in the operator's PKI directory) would share a file with the rotation's:
+// a name beginning rotationFilePrefix, compared case-insensitively because
+// that directory may be on a case-insensitive filesystem.
+func rotationFileCollisions(hosts []MigrationTLSHost) []string {
+	var out []string
+	for _, h := range hosts {
+		n := h.Name()
+		if len(n) >= len(rotationFilePrefix) && strings.EqualFold(n[:len(rotationFilePrefix)], rotationFilePrefix) {
+			out = append(out, n)
+		}
+	}
+	return out
 }

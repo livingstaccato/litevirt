@@ -939,3 +939,34 @@ func TestRotateMigrationCA_NoOverlapRefusesAnUnrelatedInstallError(t *testing.T)
 	}
 	nothingMinted(t, op)
 }
+
+// A host's cluster pair is <name>.crt|.key in the operator's PKI directory,
+// beside the rotation's migration-ca.next.*, migration-ca.bundle.crt and
+// migration-ca.retired-*.crt. A host whose name begins "migration-ca." (any
+// case) would share a file with the rotation, so the rotation refuses before
+// it mints or pushes anything, on every run.
+//
+// Mutation: drop rotationFileCollisions from RotateMigrationCA — the run
+// mints and pushes.
+func TestRotateMigrationCA_RefusesAHostNamedLikeARotationFile(t *testing.T) {
+	for _, name := range []string{"migration-ca.next", "Migration-CA.bundle", "migration-ca.retired-20261020"} {
+		op, hosts := provisionedCluster(t, 2)
+		hosts[1].name = name
+		err := rotate(t, op, hosts, RotateMigrationCAOptions{})
+		if err == nil || !strings.Contains(err.Error(), name) || !strings.Contains(err.Error(), "migration-ca.") {
+			t.Fatalf("%s: err = %v; want a refusal naming the host", name, err)
+		}
+		nothingMinted(t, op)
+		for _, h := range hosts {
+			if h.pushes != 0 {
+				t.Errorf("%s: %s was pushed %d time(s)", name, h.name, h.pushes)
+			}
+		}
+	}
+	// A name that only looks alike is not refused.
+	op, hosts := provisionedCluster(t, 2)
+	hosts[1].name = "migration-cache"
+	if err := rotate(t, op, hosts, RotateMigrationCAOptions{}); err != nil {
+		t.Fatalf("migration-cache: %v", err)
+	}
+}

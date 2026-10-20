@@ -46,6 +46,12 @@ func RotateMigrationCA(ctx context.Context, pkiDir string, hosts []MigrationTLSH
 		return fmt.Errorf("%s has no %s, so this is not the machine holding the migration CA; "+
 			"run this where `lv host init` ran: %w", pkiDir, pki.MigrationCAKeyName, err)
 	}
+	if bad := rotationFileCollisions(hosts); len(bad) > 0 {
+		return fmt.Errorf("not rotating the migration CA; nothing was changed: host(s) %s are named like the "+
+			"rotation's files (%s*), so their certificates in %s would share a file with the rotation's CA. "+
+			"Remove and re-add each under another name (`lv host rm`, `lv host add`) first",
+			strings.Join(bad, ", "), rotationFilePrefix, pkiDir)
+	}
 	prior, err := loadMigrationRotation(pkiDir)
 	if err != nil {
 		return err

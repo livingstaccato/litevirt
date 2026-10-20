@@ -578,7 +578,34 @@ func (c *Client) dumpTable(table string) (syncTable, bool) {
 		}
 		st.Rows = append(st.Rows, vals)
 	}
-	return st, true
+	return withoutUnsetIncarnation(st), true
+}
+
+// withoutUnsetIncarnation leaves projects.incarnation out of a dump while
+// every row's value is empty (schema v71): a previous-release node, which
+// does not know the column, then still takes the table's rows by
+// anti-entropy during the roll. A receiver of this build keeps its own row
+// over such a row when its own carries an incarnation (projectsDumpDecision).
+func withoutUnsetIncarnation(st syncTable) syncTable {
+	if st.Name != "projects" {
+		return st
+	}
+	at := indexOf(st.Columns, "incarnation")
+	if at < 0 {
+		return st
+	}
+	for _, r := range st.Rows {
+		if v, ok := r[at].(string); !ok || v != "" {
+			return st
+		}
+	}
+	cols := append(append([]string{}, st.Columns[:at]...), st.Columns[at+1:]...)
+	rows := make([][]interface{}, len(st.Rows))
+	for i, r := range st.Rows {
+		rows[i] = append(append([]interface{}{}, r[:at]...), r[at+1:]...)
+	}
+	st.Columns, st.Rows = cols, rows
+	return st
 }
 
 // dumpState serializes the tableNames replicated tables, secret columns
@@ -957,6 +984,28 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				return 0, len(rows), fmt.Errorf("read user incarnation: %w", ierr)
 			}
 			usersBefore[name] = inc
+		}
+	}
+
+	// Likewise each projects row's incarnation (project_incarnation.go).
+	var projectsBefore map[string]string
+	if table.Name == "projects" {
+		projectsBefore = map[string]string{}
+		idx := columnIndexMap(table.Columns)
+		for _, row := range rows {
+			if len(row) != len(table.Columns) {
+				continue
+			}
+			name := cellStr(row, idx, "name")
+			if _, seen := projectsBefore[name]; seen || name == "" {
+				continue
+			}
+			inc, ierr := projectIncarnationHeld(context.Background(), tx, name)
+			if ierr != nil {
+				_ = tx.Rollback()
+				return 0, len(rows), fmt.Errorf("read project incarnation: %w", ierr)
+			}
+			projectsBefore[name] = inc
 		}
 	}
 
@@ -1456,6 +1505,17 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				func(fn func()) { c.deferAfterCommit(tx, fn) }); err != nil {
 				_ = tx.Rollback()
 				return 0, len(rows), fmt.Errorf("settle held user writes: %w", err)
+			}
+		}
+	}
+
+	// A projects row that took another incarnation retires the grants tagged
+	// with an older one (project_incarnation.go).
+	if merged > 0 && projectsBefore != nil {
+		for name, before := range projectsBefore {
+			if err := settleProjectName(context.Background(), tx, name, before); err != nil {
+				_ = tx.Rollback()
+				return 0, len(rows), fmt.Errorf("retire an older project's grants: %w", err)
 			}
 		}
 	}

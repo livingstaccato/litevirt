@@ -467,6 +467,15 @@ var userTighteningShapes = map[string]bool{
 
 var fpUserLifecycleUpsert = mustFingerprint(userLifecycleUpsertSQL)
 
+// noAccessBindingInsert reports whether a statement of shape fp inserts a
+// NoAccess binding. It grants nothing; it only keeps its principal bound, so
+// it never falls back to its legacy role. That tightens the account, so a
+// project delete that leaves one for each of several accounts in one entry
+// is not a multi-account grant (ErrUserMultiAccountGrant).
+func noAccessBindingInsert(fp string, p []interface{}) bool {
+	return fp == fpRoleBindingInsert && len(p) == 6 && coerceString(p[2]) == SentinelRole
+}
+
 // lifecycleTightens reports whether a user_lifecycle upsert tightens the
 // account against the value this node holds (cur, "" for none): a disable, an
 // expiry set or brought earlier, a cut-off moved later (an unchanged value
@@ -569,7 +578,7 @@ func statementOnlyTightens(s Statement) bool {
 		return false
 	}
 	fp := stmtFingerprint(sh)
-	if userTighteningShapes[fp] {
+	if userTighteningShapes[fp] || noAccessBindingInsert(fp, s.Params) {
 		return true
 	}
 	if fp == fpUserLifecycleUpsert && len(s.Params) >= 3 {
@@ -627,7 +636,7 @@ func statementTightensHere(ctx context.Context, tx *sql.Tx, s Statement) (bool, 
 		return false, nil
 	}
 	fp := stmtFingerprint(sh)
-	if userTighteningShapes[fp] {
+	if userTighteningShapes[fp] || noAccessBindingInsert(fp, s.Params) {
 		return true, nil
 	}
 	if fp != fpUserLifecycleUpsert || len(s.Params) < 3 {

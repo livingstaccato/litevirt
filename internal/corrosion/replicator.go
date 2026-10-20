@@ -1618,6 +1618,13 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 				return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
 			}
 		}
+		// Likewise a projects row's incarnation (project_incarnation.go).
+		projectName, projectBefore := projectsStatementName(s), ""
+		if projectName != "" {
+			if projectBefore, err = projectIncarnationHeld(ctx, tx, projectName); err != nil {
+				return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+			}
+		}
 		if err := r.applyStatementLWW(ctx, tx, s, entry.Hlc); err != nil {
 			// A held entry's periodic retry is not a new refusal: counting it
 			// would keep the rejected-rate alert firing while it is held.
@@ -1656,6 +1663,11 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 		if userName != "" {
 			if err := r.client.settleUserName(ctx, tx, userName, userBefore, func(fn func()) { r.client.deferAfterCommit(tx, fn) }); err != nil {
 				return fmt.Errorf("apply mutation (origin=%s seq=%d): settle held user writes: %w", entry.Origin, entry.Seq, err)
+			}
+		}
+		if projectName != "" {
+			if err := settleProjectName(ctx, tx, projectName, projectBefore); err != nil {
+				return fmt.Errorf("apply mutation (origin=%s seq=%d): retire an older project's grants: %w", entry.Origin, entry.Seq, err)
 			}
 		}
 	}
@@ -2513,6 +2525,9 @@ func validateGuardedMutationEntry(stmts []Statement) error {
 		if s.Guard != nil && s.Guard.Protocol == userIncarnationGuardV1 {
 			return validateUserIncarnationEntry(stmts)
 		}
+		if s.Guard != nil && s.Guard.Protocol == projectIncarnationGuardV1 {
+			return validateProjectIncarnationEntry(stmts)
+		}
 	}
 	for _, s := range stmts {
 		if s.Guard != nil && s.Guard.Protocol == workloadRekeyGuardV1 {
@@ -3118,8 +3133,9 @@ func validateGuardedStatementBinding(s Statement, sh StmtShape) error {
 	if g.Protocol == workloadReplaceGuardV1 {
 		return validateReplaceStatementBinding(s, sh, g)
 	}
-	if g.Protocol == userIncarnationGuardV1 {
-		// Bound per entry (validateUserIncarnationEntry).
+	if g.Protocol == userIncarnationGuardV1 || g.Protocol == projectIncarnationGuardV1 {
+		// Bound per entry (validateUserIncarnationEntry,
+		// validateProjectIncarnationEntry).
 		return nil
 	}
 	switch sh.Table {

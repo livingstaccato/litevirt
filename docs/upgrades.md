@@ -1634,6 +1634,32 @@ merge users rows as the previous release does.
 stand-down. A binary rolled back below the latched token enters WAL
 quarantine, as below every latched token. Roll forward.
 
+### A re-created project starts without the old one's grants after the roll
+
+A role binding a host granted on a project before it heard that the project
+was deleted and created again elsewhere used to reach the new project and
+grant there. Once the `project_incarnation_v1` capability token has latched,
+each `lv project create` of a name gives the project a new identity, and a
+role binding grants only on the project it was granted for. One granted on an
+earlier project of the name is kept and grants nothing: `lv role ls` lists it
+with `(held)` after its role, it keeps its principal bound, and
+`lv role revoke <binding-id>` removes it. The same holds for a binding granted
+before the upgrade on a project that is re-created after it; bindings on
+projects that are not re-created keep granting as before. A quota set with
+`lv project quota` is bound to its project the same way: a re-created project
+never enforces the old one's quota. A host's orphaned
+admission authority for a deleted project is retired only on hosts that still
+hold that deleted project, never on one that has the new project. A grant or
+`lv project quota` made while its project is deleted or re-created fails and
+changes nothing; run it again. The token latches on its own once every host
+the cluster replicates to, including one parked in `maintenance`, runs this
+release. Until then hosts write projects and bindings as the previous release
+does.
+
+`project_incarnation_v1` is mandatory and replication-gated, with no flag and
+no stand-down. A binary rolled back below the latched token enters WAL
+quarantine, as below every latched token. Roll forward.
+
 ### Console passwords start after the roll
 
 This release gives each VM's VNC and SPICE consoles a per-VM password

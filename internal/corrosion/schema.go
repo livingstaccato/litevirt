@@ -569,7 +569,26 @@ import (
 //	     ReplicationGated), so a previous-release peer never sees that shape;
 //	     a global group keeps the previous insert. Appended LAST for the v53
 //	     digest reason. Additive.
-const CurrentSchemaVersion = 70
+//	v71: projects.incarnation (TEXT NOT NULL DEFAULT '') — the project
+//	     incarnation (project_incarnation.go): a random 128-bit id written
+//	     with the row by every birth of the name (a first create, a
+//	     re-create over a tombstone) once the mandatory, ReplicationGated
+//	     project_incarnation_v1 has latched, and never changed otherwise. ''
+//	     on every row born before it. A role binding under a project's RBAC
+//	     path names the incarnation it was granted for, and grants only while
+//	     the project holds that incarnation; a quota is keyed by it
+//	     ("<name>~p:<incarnation>", no schema change). The column is left out
+//	     of a node's anti-entropy dump while every value of it is '', so a
+//	     previous-release node takes this build's rows until the first
+//	     latched birth (and none is made before the latch); the statements
+//	     that write it are emitted only after the latch, or for a row that
+//	     already carries an incarnation. Appended LAST for the v53 digest
+//	     reason. Additive.
+const CurrentSchemaVersion = 71
+
+// schemaVersionProjectIncarnation is the version projects.incarnation was
+// added in.
+const schemaVersionProjectIncarnation = 71
 
 // schemaVersionSGProjects is the version security_groups.project was added in.
 const schemaVersionSGProjects = 70
@@ -2609,7 +2628,8 @@ var schemaDDL = []string{
 		parent_name TEXT,                    -- parent project's name; NULL for root
 		created_at  TEXT NOT NULL,
 		updated_at  TEXT NOT NULL,
-		deleted_at  TEXT
+		deleted_at  TEXT,
+		incarnation TEXT NOT NULL DEFAULT ''  -- v71: the project's incarnation; '' = born before project_incarnation_v1
 	)`,
 
 	// project_quotas is the admission-control gate. Each row caps
@@ -3539,6 +3559,8 @@ var schemaMigrations = []string{
 	// The project that owns a security group; '' = global (see History,
 	// schemaVersionSGProjects).
 	`ALTER TABLE security_groups ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
+	// The project incarnation (see History, schemaVersionProjectIncarnation).
+	`ALTER TABLE projects ADD COLUMN incarnation TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -3634,6 +3656,7 @@ var alterVersions = []int{
 	schemaVersionCredentialRetirement, // host_fence_credentials.after_retirement
 	schemaVersionHostIncarnation,      // hosts.incarnation
 	schemaVersionSGProjects,           // security_groups.project
+	schemaVersionProjectIncarnation,   // projects.incarnation
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

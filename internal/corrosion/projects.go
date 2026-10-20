@@ -29,6 +29,10 @@ type ProjectRecord struct {
 	ParentName string // "" for root
 	CreatedAt  string
 	UpdatedAt  string
+	// Incarnation is the project's incarnation: a random id written by each
+	// birth of the name, '' for one born before project_incarnation_v1
+	// (project_incarnation.go). Read-only.
+	Incarnation string
 }
 
 // ProjectQuotaRecord caps one project's resource usage. Zero = unbounded.
@@ -90,6 +94,18 @@ func InsertProject(ctx context.Context, c *Client, p ProjectRecord) error {
 		}
 		if !prev {
 			now := c.NowTS()
+			if c.ProjectIncarnationOn() {
+				// A first birth, carrying over the pre-grants this node holds
+				// (project_incarnation.go).
+				applied, err := createFirstBirth(ctx, c, p)
+				if err != nil {
+					return err
+				}
+				if !applied {
+					return projectLostRace(ctx, c, p.Name)
+				}
+				return nil
+			}
 			return c.Execute(ctx,
 				`INSERT INTO projects (name, display, parent_name, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?)`,
@@ -396,6 +412,16 @@ func commitProjectLifecycle(ctx context.Context, c *Client, kind projectLifecycl
 			if stable[who] {
 				continue
 			}
+			// A local account is matched with its legacy role's group too
+			// (group:<role>@local), so a binding that group holds outside
+			// /projects/ keeps the account bound as it keeps the group's other
+			// members: a later revoke of it returns them all to the legacy role
+			// together.
+			if groupStable, err := legacyGroupStable(ctx, c, who, stable); err != nil {
+				return false, err
+			} else if groupStable {
+				continue
+			}
 			stmts = append(stmts, Statement{
 				SQL:    roleBindingInsertSQL,
 				Params: []interface{}{newSentinelID(), bindingSentinelPath, SentinelRole, who, 0, c.NowTS()},
@@ -408,25 +434,47 @@ func commitProjectLifecycle(ctx context.Context, c *Client, kind projectLifecycl
 	if err != nil {
 		return false, err
 	}
-	if q != nil {
+	// A birth over a tombstone of the name (this spelling's or another's) is a
+	// new incarnation once project_incarnation_v1 has latched, or once a row
+	// of the name carries one, written with the row in this transaction
+	// (project_incarnation.go). Its quota is keyed by it, so the old one's
+	// needs no reset: no incarnation ever reads it again.
+	states, err := loadProjectStates(ctx, c)
+	if err != nil {
+		return false, err
+	}
+	canonName, _ := safename.CanonicalProjectName(name)
+	incarnations := c.ProjectIncarnationOn() || states[canonName].carried()
+	born := newProjectIncarnation(false)
+	if q != nil && !incarnations {
 		stmts = append(stmts, Statement{
 			SQL:    projectQuotaUpsertSQL,
 			Params: []interface{}{name, 0, 0, 0, 0, 0, 0, c.NowTS()},
 		})
 	}
-	switch kind {
-	case lifecycleCreate:
+	switch {
+	case kind == lifecycleCreate && incarnations:
+		stmts = append(stmts, Statement{
+			SQL:    projectsInsertIncarnationSQL,
+			Params: []interface{}{p.Name, p.Display, p.ParentName, nowRFC3339(), c.NowTS(), born},
+		})
+	case kind == lifecycleCreate:
 		stmts = append(stmts, Statement{
 			SQL: `INSERT INTO projects (name, display, parent_name, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?)`,
 			Params: []interface{}{p.Name, p.Display, p.ParentName, nowRFC3339(), c.NowTS()},
 		})
-	case lifecycleRevive:
+	case kind == lifecycleRevive && incarnations:
+		stmts = append(stmts, Statement{
+			SQL:    projectsReviveIncarnationSQL,
+			Params: []interface{}{nil, born, c.NowTS(), p.Name},
+		})
+	case kind == lifecycleRevive:
 		stmts = append(stmts, Statement{
 			SQL:    `UPDATE projects SET deleted_at = ?, updated_at = ? WHERE name = ?`,
 			Params: []interface{}{nil, c.NowTS(), p.Name},
 		})
-	case lifecycleDelete:
+	case kind == lifecycleDelete:
 		stmts = append(stmts, Statement{
 			SQL:    `UPDATE projects SET deleted_at = ?, updated_at = ? WHERE name = ?`,
 			Params: []interface{}{nowRFC3339(), c.NowTS(), p.Name},
@@ -464,6 +512,28 @@ func commitProjectLifecycle(ctx context.Context, c *Client, kind projectLifecycl
 	return c.ExecuteBatchGuarded(ctx, pinned, stmts)
 }
 
+// legacyGroupStable reports whether principal is a local account whose legacy
+// role's group (group:<role>@local, which the auth engine matches it as)
+// holds a binding outside /projects/. A directory account's groups are known
+// only at its login, so it is never stable this way.
+func legacyGroupStable(ctx context.Context, c *Client, principal string, stable map[string]bool) (bool, error) {
+	user, ok := strings.CutPrefix(principal, "user:")
+	if !ok {
+		return false, nil
+	}
+	if local, isLocal := strings.CutSuffix(user, "@local"); isLocal {
+		user = local
+	} else if strings.Contains(user, "@") {
+		return false, nil
+	}
+	rows, err := c.Query(ctx, `SELECT role FROM users WHERE username = ? AND deleted_at IS NULL`, user)
+	if err != nil || len(rows) == 0 {
+		return false, err
+	}
+	role := rows[0].String("role")
+	return role != "" && stable["group:"+role+"@local"], nil
+}
+
 // liveSpellingsOf returns the sorted names, among the live rows read, that are
 // another spelling of name.
 func liveSpellingsOf(name string, rows []Row) []string {
@@ -497,7 +567,7 @@ func GetProject(ctx context.Context, c *Client, name string) (*ProjectRecord, er
 		return &ProjectRecord{Name: DefaultProject, Display: "default"}, nil
 	}
 	rows, err := c.Query(ctx,
-		`SELECT name, display, parent_name, created_at, updated_at
+		`SELECT name, display, parent_name, created_at, updated_at, incarnation
 		 FROM projects WHERE name = ? AND deleted_at IS NULL`, name)
 	if err != nil {
 		return nil, err
@@ -507,11 +577,12 @@ func GetProject(ctx context.Context, c *Client, name string) (*ProjectRecord, er
 	}
 	r := rows[0]
 	return &ProjectRecord{
-		Name:       r.String("name"),
-		Display:    r.String("display"),
-		ParentName: r.String("parent_name"),
-		CreatedAt:  r.String("created_at"),
-		UpdatedAt:  r.String("updated_at"),
+		Name:        r.String("name"),
+		Display:     r.String("display"),
+		ParentName:  r.String("parent_name"),
+		CreatedAt:   r.String("created_at"),
+		UpdatedAt:   r.String("updated_at"),
+		Incarnation: r.String("incarnation"),
 	}, nil
 }
 
@@ -519,7 +590,7 @@ func GetProject(ctx context.Context, c *Client, name string) (*ProjectRecord, er
 // surfaced as the first entry even when no row exists for it.
 func ListProjects(ctx context.Context, c *Client) ([]ProjectRecord, error) {
 	rows, err := c.Query(ctx,
-		`SELECT name, display, parent_name, created_at, updated_at
+		`SELECT name, display, parent_name, created_at, updated_at, incarnation
 		 FROM projects WHERE deleted_at IS NULL
 		 ORDER BY name`)
 	if err != nil {
@@ -528,11 +599,12 @@ func ListProjects(ctx context.Context, c *Client) ([]ProjectRecord, error) {
 	out := []ProjectRecord{{Name: DefaultProject, Display: "default"}}
 	for _, r := range rows {
 		out = append(out, ProjectRecord{
-			Name:       r.String("name"),
-			Display:    r.String("display"),
-			ParentName: r.String("parent_name"),
-			CreatedAt:  r.String("created_at"),
-			UpdatedAt:  r.String("updated_at"),
+			Name:        r.String("name"),
+			Display:     r.String("display"),
+			ParentName:  r.String("parent_name"),
+			CreatedAt:   r.String("created_at"),
+			UpdatedAt:   r.String("updated_at"),
+			Incarnation: r.String("incarnation"),
 		})
 	}
 	return out, nil
@@ -623,10 +695,8 @@ func UpsertProjectQuota(ctx context.Context, c *Client, q ProjectQuotaRecord) er
 	if q.ProjectName == "" {
 		return fmt.Errorf("project_name required")
 	}
-	now := c.NowTS()
-	return c.Execute(ctx, projectQuotaUpsertSQL,
-		q.ProjectName, q.VCPULimit, q.MemMiBLimit, q.DiskGiBLimit,
-		q.NICLimit, q.PublicIPLimit, q.BackupGiBLimit, now)
+	// Bound to the incarnation of a live project (project_incarnation.go).
+	return upsertProjectQuota(ctx, c, q, c.NowTS())
 }
 
 const projectQuotaUpsertSQL = `INSERT INTO project_quotas
@@ -643,12 +713,19 @@ const projectQuotaUpsertSQL = `INSERT INTO project_quotas
 		   updated_at       = excluded.updated_at`
 
 // GetProjectQuota returns the quota row or nil if unset. The default
-// project has no quotas (every limit = 0 = unbounded) — returns nil.
+// project has no quotas (every limit = 0 = unbounded) — returns nil. A live
+// project reads the quota of the incarnation it holds (projectQuotaKey), so
+// a re-created project starts with none, as a new project does, and never
+// reads the old one's (project_incarnation.go).
 func GetProjectQuota(ctx context.Context, c *Client, name string) (*ProjectQuotaRecord, error) {
+	inc, _, err := projectQuotaIncarnation(ctx, c, name)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := c.Query(ctx,
 		`SELECT project_name, vcpu_limit, mem_mib_limit, disk_gib_limit,
 		        nic_limit, public_ip_limit, backup_gib_limit
-		 FROM project_quotas WHERE project_name = ?`, name)
+		 FROM project_quotas WHERE project_name = ?`, projectQuotaKey(name, inc))
 	if err != nil {
 		return nil, err
 	}
@@ -657,7 +734,7 @@ func GetProjectQuota(ctx context.Context, c *Client, name string) (*ProjectQuota
 	}
 	r := rows[0]
 	return &ProjectQuotaRecord{
-		ProjectName:    r.String("project_name"),
+		ProjectName:    name,
 		VCPULimit:      r.Int("vcpu_limit"),
 		MemMiBLimit:    r.Int("mem_mib_limit"),
 		DiskGiBLimit:   r.Int("disk_gib_limit"),

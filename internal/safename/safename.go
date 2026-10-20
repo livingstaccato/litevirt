@@ -110,6 +110,10 @@ var reservedProjectSegments = map[string]bool{
 	"storage_pools": true, "security_groups": true, "stacks": true,
 }
 
+// IsReservedProjectSegment reports whether seg names a resource namespace
+// under a project's RBAC root (see reservedProjectSegments).
+func IsReservedProjectSegment(seg string) bool { return reservedProjectSegments[seg] }
+
 // ValidateNewProjectName refuses a project whose path has a non-leading segment
 // named like a resource namespace of its parent (see reservedProjectSegments).
 func ValidateNewProjectName(in string) error {

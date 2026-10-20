@@ -123,16 +123,29 @@ type RoleBindingRecord struct {
 	Principal string
 	Propagate bool
 	UpdatedAt string
+	// Held: the binding is under a live project that does not hold the
+	// incarnation it was granted for. It is kept and listed, and grants
+	// nothing (project_incarnation.go). Read-only; never written.
+	Held bool
 }
 
-// InsertRoleBinding creates a (path, role, principal) binding.
+// InsertRoleBinding creates a (path, role, principal) binding. An id tagged
+// with a project incarnation (ProjectBindingID) is written only while this
+// node still holds that incarnation of the path's project: ErrProjectChanged
+// otherwise, and nothing is written.
 func InsertRoleBinding(ctx context.Context, c *Client, b RoleBindingRecord) error {
 	now := c.NowTS()
 	prop := 1
 	if !b.Propagate {
 		prop = 0
 	}
-	return c.Execute(ctx, roleBindingInsertSQL, b.ID, b.Path, b.Role, b.Principal, prop, now)
+	params := []interface{}{b.ID, b.Path, b.Role, b.Principal, prop, now}
+	if proj, ok := projectOfRBACPath(b.Path); ok {
+		if tag, tagged := projectBindingTag(b.ID); tagged {
+			return insertProjectBinding(ctx, c, proj, tag, params)
+		}
+	}
+	return c.Execute(ctx, roleBindingInsertSQL, params...)
 }
 
 const roleBindingInsertSQL = `INSERT INTO role_bindings (id, path, role, principal, propagate, updated_at)
@@ -207,7 +220,7 @@ func ListRoleBindings(ctx context.Context, c *Client) ([]RoleBindingRecord, erro
 			UpdatedAt: r.String("updated_at"),
 		}
 	}
-	return out, nil
+	return out, markHeldBindings(ctx, c, out)
 }
 
 // GetRoleBinding returns the live binding with id, or nil when there is none
@@ -223,14 +236,18 @@ func GetRoleBinding(ctx context.Context, c *Client, id string) (*RoleBindingReco
 		return nil, nil
 	}
 	r := rows[0]
-	return &RoleBindingRecord{
+	out := []RoleBindingRecord{{
 		ID:        r.String("id"),
 		Path:      r.String("path"),
 		Role:      r.String("role"),
 		Principal: r.String("principal"),
 		Propagate: r.Int("propagate") == 1,
 		UpdatedAt: r.String("updated_at"),
-	}, nil
+	}}
+	if err := markHeldBindings(ctx, c, out); err != nil {
+		return nil, err
+	}
+	return &out[0], nil
 }
 
 // ListBindingsForPrincipal returns bindings that apply to a single
@@ -253,7 +270,7 @@ func ListBindingsForPrincipal(ctx context.Context, c *Client, principal string) 
 			UpdatedAt: r.String("updated_at"),
 		}
 	}
-	return out, nil
+	return out, markHeldBindings(ctx, c, out)
 }
 
 // ────────────────────────────── SESSIONS ──────────────────────────────

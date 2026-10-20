@@ -486,6 +486,11 @@ type Client struct {
 	// re-created by incarnation (user_incarnation.go). Unset reads false, the
 	// previous release's statements and merge.
 	userIncarnationGate atomic.Pointer[func() bool]
+	// projectIncarnationGate, when set and returning true, says
+	// project_incarnation_v1 has durably latched: a project birth then writes
+	// a fresh incarnation, and grants and quotas under a project are bound to
+	// it (project_incarnation.go). Unset reads false.
+	projectIncarnationGate atomic.Pointer[func() bool]
 	// userHolds are the user writes held for an incarnation this node has
 	// not reached, and the restriction rows recorded with the incarnation
 	// they were written for (user_holds.go). userHoldReplay applies a held
@@ -1522,7 +1527,8 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 	var allCredHosts entryHostRows  // every entry's, for the absorb below
 	var guardedUserEffects []func() // user_holds.go, run once tx commits
 	guardedOnCommit := func(fn func()) { guardedUserEffects = append(guardedUserEffects, fn) }
-	guardedUserNames := map[string]string{} // name -> its incarnation before this write
+	guardedUserNames := map[string]string{}    // name -> its incarnation before this write
+	guardedProjectNames := map[string]string{} // project_incarnation.go, likewise
 	for _, stmts := range entries {
 		relay := make([]Statement, 0, len(stmts))
 		// See executeBatchInternal.
@@ -1605,6 +1611,17 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 					guardedUserNames[name] = before
 				}
 			}
+			if name := projectsStatementName(s); name != "" {
+				if _, seen := guardedProjectNames[name]; !seen {
+					before, err := projectIncarnationHeld(ctx, tx, name)
+					if err != nil {
+						tx.Rollback()
+						c.mu.Unlock()
+						return false, err
+					}
+					guardedProjectNames[name] = before
+				}
+			}
 			// A live-row update runs here through the same guarded form every
 			// receiver uses; what is logged is the wire form (live_row_update.go).
 			res, err := tx.ExecContext(ctx, appliedForm(s).SQL, s.Params...)
@@ -1642,6 +1659,13 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 	}
 	for name, before := range guardedUserNames {
 		if err := c.settleUserName(ctx, tx, name, before, guardedOnCommit); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return false, err
+		}
+	}
+	for name, before := range guardedProjectNames {
+		if err := settleProjectName(ctx, tx, name, before); err != nil {
 			tx.Rollback()
 			c.mu.Unlock()
 			return false, err
@@ -1814,7 +1838,8 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	}
 	var userEffects []func() // user_holds.go, run once tx commits
 	onCommit := func(fn func()) { userEffects = append(userEffects, fn) }
-	userNames := map[string]string{} // name -> its incarnation before this write
+	userNames := map[string]string{}    // name -> its incarnation before this write
+	projectNames := map[string]string{} // project_incarnation.go, likewise
 	for _, s := range stmts {
 		// A fence credential carries the retirement it was set after
 		// (credentials_revive_guard.go).
@@ -1870,6 +1895,17 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 				userNames[name] = before
 			}
 		}
+		if name := projectsStatementName(s); name != "" {
+			if _, seen := projectNames[name]; !seen {
+				before, err := projectIncarnationHeld(ctx, tx, name)
+				if err != nil {
+					tx.Rollback()
+					c.mu.Unlock()
+					return 0, err
+				}
+				projectNames[name] = before
+			}
+		}
 		// This host's own row is not written while its own-row hold holds
 		// (own_row_hold.go).
 		if err := c.ownRowStatementRefused(ctx, tx, s); err != nil {
@@ -1916,6 +1952,15 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	// name (user_holds.go).
 	for name, before := range userNames {
 		if err := c.settleUserName(ctx, tx, name, before, onCommit); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return 0, err
+		}
+	}
+	// A projects row this write gave a new incarnation retires the grants
+	// tagged with an older one (project_incarnation.go).
+	for name, before := range projectNames {
+		if err := settleProjectName(ctx, tx, name, before); err != nil {
 			tx.Rollback()
 			c.mu.Unlock()
 			return 0, err

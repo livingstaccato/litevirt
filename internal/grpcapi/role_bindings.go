@@ -103,7 +103,12 @@ func (s *Server) GrantRole(ctx context.Context, req *pb.GrantRoleRequest) (*pb.G
 		path, principal = cpath, cprincipal
 	}
 
-	id := mustHexID(16)
+	// Under a project, the id names the incarnation of the project this
+	// grant is for (corrosion/project_incarnation.go).
+	id, err := corrosion.ProjectBindingID(ctx, s.db, path, mustHexID(16))
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read project: %v", err)
+	}
 	binding := corrosion.RoleBindingRecord{
 		ID:        id,
 		Path:      path,
@@ -300,6 +305,11 @@ func (s *Server) NormalizeRoleBindings(ctx context.Context, req *pb.NormalizeRol
 		if !ok {
 			continue // group:<role>@<realm> / group:<realm>/<g> — already realm-qualified
 		}
+		if b.Held {
+			// It grants nothing; a copy would grant nothing either.
+			skipped++
+			continue
+		}
 		if _, _, qualified := classifyUserPrincipal(body); qualified {
 			continue
 		}
@@ -318,7 +328,8 @@ func (s *Server) NormalizeRoleBindings(ctx context.Context, req *pb.NormalizeRol
 		}
 		if !existing[bindingKey(b.Path, b.Role, canonical, b.Propagate)] {
 			nb := corrosion.RoleBindingRecord{
-				ID: mustHexID(16), Path: b.Path, Role: b.Role,
+				// The copy names the project incarnation the original did.
+				ID: corrosion.CarryProjectBindingTag(b.ID, mustHexID(16)), Path: b.Path, Role: b.Role,
 				Principal: canonical, Propagate: b.Propagate,
 			}
 			if err := corrosion.InsertRoleBinding(ctx, s.db, nb); err != nil {
@@ -460,10 +471,16 @@ func isCallerGroupPrincipal(principal, realm string, groups []string) bool {
 }
 
 func bindingToPB(b corrosion.RoleBindingRecord) *pb.RoleBinding {
+	role := b.Role
+	if b.Held {
+		// Granted for an earlier project of the name: it grants nothing
+		// (corrosion/project_incarnation.go). lv role revoke removes it.
+		role += corrosion.HeldRoleSuffix
+	}
 	return &pb.RoleBinding{
 		Id:        b.ID,
 		Path:      b.Path,
-		Role:      b.Role,
+		Role:      role,
 		Principal: b.Principal,
 		Propagate: b.Propagate,
 		UpdatedAt: b.UpdatedAt,

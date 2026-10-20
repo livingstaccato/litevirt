@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/auth"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // newRoleCmd is the operator surface for path-based RBAC role
@@ -172,7 +174,7 @@ included — changes with it.`,
 				w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 				fmt.Fprintln(w, "ID\tPATH\tROLE\tPRINCIPAL\tPROPAGATE\tUPDATED")
 				for _, b := range resp.Bindings {
-					if role != "" && b.Role != role {
+					if !bindingHasRole(b.Role, role) {
 						continue
 					}
 					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%v\t%s\n",
@@ -185,4 +187,11 @@ included — changes with it.`,
 	cmd.Flags().StringVar(&principal, "principal", "", "Filter to a single principal (user:foo, group:oidc:corp/bar)")
 	cmd.Flags().StringVar(&role, "role", "", "Show only the bindings of this role")
 	return cmd
+}
+
+// bindingHasRole reports whether a listed binding's role is filter (any role
+// when filter is empty). A held binding is listed as "<role> (held)" and is
+// still a binding of its role.
+func bindingHasRole(listed, filter string) bool {
+	return filter == "" || strings.TrimSuffix(listed, corrosion.HeldRoleSuffix) == filter
 }

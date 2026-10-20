@@ -3974,6 +3974,18 @@ func (d *Daemon) wireCorrosionGates() {
 	d.wireSpecConflictGate()
 	d.wireNetBoxRepointGate()
 	d.wireUserIncarnationGate()
+	d.wireProjectIncarnationGate()
+}
+
+// wireProjectIncarnationGate tells corrosion when project_incarnation_v1 has
+// DURABLY latched: a project birth then writes a fresh incarnation, in two
+// statements a previous-release peer has no ledger entry for, and grants and
+// quotas under a project are bound to it. Mandatory, no config flag; unwired,
+// the gate reads false and the node writes as the previous release.
+func (d *Daemon) wireProjectIncarnationGate() {
+	d.db.SetProjectIncarnationGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.ProjectIncarnationV1)
+	})
 }
 
 // wireUserIncarnationGate tells corrosion when user_incarnation_v1 has

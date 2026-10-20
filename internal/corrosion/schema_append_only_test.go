@@ -108,6 +108,7 @@ var appendOnlyLedger = []struct {
 	{"a089_host_fence_credentials_after_retirement", 68},
 	{"a090_hosts_incarnation", 69},
 	{"a091_security_groups_project", 70},
+	{"a092_projects_incarnation", 71},
 }
 
 const appendOnlyRule = "schemaMigrations is append-only: add new ALTERs at the end; never reorder"

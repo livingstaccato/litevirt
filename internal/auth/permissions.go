@@ -227,6 +227,14 @@ func (e *Engine) Reload(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	for i := range bindings {
+		// A binding granted for an earlier project of the name grants
+		// nothing, and still keeps its principal bound, as a NoAccess binding
+		// does (corrosion/project_incarnation.go).
+		if bindings[i].Held {
+			bindings[i].Role = corrosion.SentinelRole
+		}
+	}
 	e.snap.Store(&engineSnapshot{roleVerbs: rv, bindings: bindings})
 	e.lastReload.Store(time.Now().Unix())
 	return nil

@@ -82,6 +82,10 @@ func (s *Server) withinDiskArtifactRoot(p string) bool {
 	return false
 }
 
+// errLibvirtCallUnanswered is the answer of a libvirt call whose goroutine
+// ended without one: what waits on the call's result is never left waiting.
+var errLibvirtCallUnanswered = errors.New("the libvirt call ended without an answer")
+
 // MigrateVM performs a live migration of a VM to a target host.
 // It streams MigrateProgress messages back to the caller.
 func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreamingServer[pb.MigrateProgress]) error {
@@ -855,6 +859,10 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	abort.armed = false
 	done := make(chan error, 1)
 	go func() {
+		// The answer is sent however this goroutine ends, so the request or
+		// the adopter waiting on done always gets one.
+		migrateErr := errLibvirtCallUnanswered
+		defer func() { done <- migrateErr }()
 		params := lv.MigrateParams{
 			Live:          live,
 			WithStorage:   withStorage,
@@ -889,7 +897,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		}
 		armed.apply(&params)
 		logVNCPasswordStrip(vm.Name, req.TargetHost, params.StripVNCPassword)
-		done <- s.virt.MigrateToTarget(vm.Name, dconnuri, params)
+		migrateErr = s.virt.MigrateToTarget(vm.Name, dconnuri, params)
 	}()
 
 	// failedOnSource ends a migration that left the guest on this host.

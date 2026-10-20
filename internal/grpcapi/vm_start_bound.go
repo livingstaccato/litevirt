@@ -715,7 +715,13 @@ func (s *Server) startDomainWithin(ctx context.Context, vm *corrosion.VMRecord, 
 	name := vm.Name
 	flight := s.beginStartFlight(name)
 	answered := make(chan error, 1)
-	go func() { answered <- s.virt.StartDomain(name) }()
+	go func() {
+		// Answered however this goroutine ends, so the held start's waiter
+		// always gets an answer.
+		startErr := errLibvirtCallUnanswered
+		defer func() { answered <- startErr }()
+		startErr = s.virt.StartDomain(name)
+	}()
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {

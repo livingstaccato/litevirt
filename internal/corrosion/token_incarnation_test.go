@@ -545,11 +545,98 @@ func TestTokenIncarnation_AReplicatedRecreateKeepsTheNewAccountsEarlyToken(t *te
 			if u, err := ValidateToken(ctx, c, tokRawB); err != nil || u == nil || u.TokenID != "t-new" {
 				t.Errorf("the new carol's early token was dropped: %+v, %v", u, err)
 			}
+			if rows, _ := c.Query(ctx, `SELECT token_id FROM token_credentials WHERE token_id = 't-new' AND deleted_at IS NULL`); len(rows) != 1 {
+				t.Errorf("the new carol's early token kept its row but lost its credential")
+			}
 			for _, id := range []string{"t-old", "t-unstamped"} {
 				if rows, _ := c.Query(ctx, `SELECT id FROM tokens WHERE id = ? AND deleted_at IS NULL`, id); len(rows) != 0 {
 					t.Errorf("%s is still live after the re-create", id)
 				}
 			}
 		})
+	}
+}
+
+// A users row that moves by anti-entropy, on a latched node, between two
+// incarnations made before the latch (two creates of the name, each a whole
+// second). retireStaleTokens keeps an unstamped token there (neither
+// incarnation is a latched one), and the read rule would let it open the new
+// account, so the re-create's retirement (retireOlderIncarnationRows) is the
+// only thing that retires the old account's unstamped token.
+func TestTokenIncarnation_AWholeSecondRecreateByAntiEntropyRetiresTheUnstampedToken(t *testing.T) {
+	ctx := context.Background()
+	lag, u := newTestDB(t), newTestDB(t)
+	if err := InsertUser(ctx, lag, "carol", "operator", "h"); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertToken(ctx, lag, TokenRecord{ID: "t-old", Username: "carol", Name: "n", TokenHash: mustBcrypt(t, tokRawA)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := oneString(t, lag, `SELECT user_created_at FROM tokens WHERE id = 't-old'`, "user_created_at"); got != "" {
+		t.Fatalf("precondition: the token is stamped %q, want unstamped", got)
+	}
+	if err := InsertUser(ctx, u, "carol", "operator", "h2"); err != nil {
+		t.Fatal(err)
+	}
+	const second = "2999-01-01T00:00:00Z"
+	if _, err := u.db.Exec(`UPDATE users SET created_at = ?, updated_at = ? WHERE username = 'carol'`, second, second); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ValidateToken(ctx, lag, tokRawA); err != nil || got == nil {
+		t.Fatalf("precondition: the token opens the first carol: %+v, %v", got, err)
+	}
+	lag.SetUserIncarnationGate(func() bool { return true })
+	if err := lag.MergeStateBytesLWW(u.DumpStateBytes()); err != nil {
+		t.Fatal(err)
+	}
+	if got := userCreatedAt(t, lag, "carol"); got != second {
+		t.Fatalf("lag did not take the second carol: %q", got)
+	}
+	if rows, _ := lag.Query(ctx, `SELECT id FROM tokens WHERE id = 't-old' AND deleted_at IS NULL`); len(rows) != 0 {
+		t.Error("the first carol's unstamped token is still live after the second carol landed")
+	}
+	if got, err := ValidateToken(ctx, lag, tokRawA); err == nil && got != nil {
+		t.Errorf("the first carol's unstamped token opens the second carol: %+v", got)
+	}
+}
+
+// The re-create reaches this node by anti-entropy from a peer that does not
+// hold the new account's early token (a third node minted it, and it came
+// here by the WAL). The sender's dump cannot restore it, so the re-create's
+// retirement must keep it, with its credential.
+func TestTokenIncarnation_ARecreateByAntiEntropyKeepsTheNewAccountsEarlyToken(t *testing.T) {
+	ctx := context.Background()
+	lag, u := newTestDB(t), newTestDB(t)
+	if err := InsertUser(ctx, u, "carol", "operator", "h"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lag.MergeStateBytesLWW(u.DumpStateBytes()); err != nil {
+		t.Fatal(err)
+	}
+	u.SetUserIncarnationGate(func() bool { return true })
+	lag.SetUserIncarnationGate(func() bool { return true })
+	recreateUser(t, u, "carol")
+	inc := userCreatedAt(t, u, "carol")
+	const now = "2999-01-01T00:00:01.000000001Z"
+	applyRemote(t, lag, "2999000000001-0000-third",
+		Statement{SQL: tokensInsertIncarnationSQL, Params: []interface{}{"t-new", "carol", "n", mustBcrypt(t, tokRawB), nil, "", now, now, inc}},
+		Statement{SQL: tokenCredentialUpsertSQL, Params: []interface{}{"t-new", mustBcrypt(t, tokRawB), now}})
+	if rows, _ := lag.Query(ctx, `SELECT id FROM tokens WHERE id = 't-new' AND deleted_at IS NULL`); len(rows) != 1 {
+		t.Fatal("precondition: lag should hold the early token")
+	}
+	if got := userCreatedAt(t, lag, "carol"); got == inc {
+		t.Fatal("precondition: lag already holds the new carol")
+	}
+	if err := lag.MergeStateBytesLWW(u.DumpStateBytes()); err != nil {
+		t.Fatal(err)
+	}
+	if got := userCreatedAt(t, lag, "carol"); got != inc {
+		t.Fatalf("lag did not take the new carol by anti-entropy: %q, want %q", got, inc)
+	}
+	if rows, _ := lag.Query(ctx, `SELECT token_id FROM token_credentials WHERE token_id = 't-new'`); len(rows) != 1 {
+		t.Error("the early token's credential was dropped by the re-create")
+	}
+	if got, err := ValidateToken(ctx, lag, tokRawB); err != nil || got == nil || got.TokenID != "t-new" {
+		t.Errorf("the new carol's early token was dropped by the re-create: %+v, %v", got, err)
 	}
 }

@@ -771,8 +771,8 @@ func retireOlderIncarnationRows(ctx context.Context, tx *sql.Tx, username, incar
 	// before its re-create, and stays. An unstamped one goes, as every token
 	// did before.
 	for _, q := range []string{
-		`DELETE FROM token_credentials WHERE token_id IN (SELECT id FROM tokens WHERE username = ? AND deleted_at IS NULL AND user_created_at <> ?) -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
-		`DELETE FROM tokens WHERE username = ? AND deleted_at IS NULL AND user_created_at <> ? -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
+		`DELETE FROM token_credentials WHERE token_id IN (SELECT id FROM tokens WHERE username = ? AND deleted_at IS NULL AND user_created_at IS NOT ?) -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
+		`DELETE FROM tokens WHERE username = ? AND deleted_at IS NULL AND user_created_at IS NOT ? -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
 	} {
 		if _, err := tx.ExecContext(ctx, q, username, incarnation); err != nil {
 			return err

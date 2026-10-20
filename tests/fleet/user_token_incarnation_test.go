@@ -212,8 +212,8 @@ func pushOwnTokenWrites(t *testing.T, c *Cluster, from, to *Node) {
 // mints her a token, stamped with her incarnation (a latched writer made it)
 // and unguarded. node-2 still holds the old carol and receives that token
 // before the re-create. The token is the new carol's: it must not open the
-// old carol on node-2, and it opens the new carol once node-2 has taken the
-// re-create and an anti-entropy round.
+// old carol on node-2, and it opens the new carol as soon as node-2 takes the
+// re-create, and still after an anti-entropy round.
 func TestFleet_AStampedTokenOpensOnlyTheIncarnationItNames(t *testing.T) {
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 3})
@@ -254,10 +254,14 @@ func TestFleet_AStampedTokenOpensOnlyTheIncarnationItNames(t *testing.T) {
 	if got, err := corrosion.ValidateToken(ctx, lag.DB, fleetTokB); err != nil || got != nil {
 		t.Errorf("node-2: the new carol's token opens the old carol: %+v, %v", got, err)
 	}
-	// The re-create reaches node-2. Taking it drops the live tokens of the
-	// name (retireOlderIncarnationRows), this one too; anti-entropy brings
-	// it back, because it is the new carol's own.
+	// The re-create reaches node-2. The token is stamped with the new
+	// carol's incarnation, so taking the re-create keeps it
+	// (retireOlderIncarnationRows): it opens her at once, with no
+	// anti-entropy.
 	pumpMutations(t, c, admin, lag)
+	if got, err := corrosion.ValidateToken(ctx, lag.DB, fleetTokB); err != nil || got == nil || got.Username != "carol" {
+		t.Errorf("node-2: once it took the re-create, the new carol's token does not open her: %+v, %v", got, err)
+	}
 	for _, n := range c.Nodes {
 		gates[n].Store(true)
 	}

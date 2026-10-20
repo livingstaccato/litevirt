@@ -1584,6 +1584,10 @@ func (s *Server) advertisedCapabilities() []string {
 	// the incarnation-bearing users statements and keeps a tombstone over its
 	// own incarnation, a fact about the build. Neither statement is written
 	// until the ReplicationGated latch forms.
+	// project_incarnation_v1 is not withheld either: it says this binary
+	// decodes the incarnation-bearing projects statements and the project
+	// guard, a fact about the build. Neither is written until the
+	// ReplicationGated latch forms.
 	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
 	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
 	// operation_protocol_v1 is active (the crash-safe operation journal is a hard
@@ -2294,6 +2298,10 @@ func (s *Server) tokenEnabled(token string) bool {
 	case capabilities.NetBoxIPRepointV1:
 		// No kill switch: it says this build decodes the lease re-point
 		// statement. The inventory mirror's own opt-in is its stand-down.
+		return true
+	case capabilities.ProjectIncarnationV1:
+		// No kill switch: it says which bindings this build lets grant on a
+		// re-created project, and every replica must decide alike.
 		return true
 	case capabilities.UserIncarnationV1:
 		// No kill switch: it says how this build orders a users row's delete

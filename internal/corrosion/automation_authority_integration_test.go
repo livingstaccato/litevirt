@@ -215,20 +215,20 @@ func TestAutomationSchema76UpgradeAndSourceColumns(t *testing.T) {
 		}
 	}
 	for _, migration := range schemaMigrationLedger {
-		if migration.Version == 76 {
+		if migration.Version == 77 {
 			if _, err := a.c.db.Exec(`DELETE FROM applied_migrations WHERE id=?`, migration.ID); err != nil {
 				t.Fatal(err)
 			}
 		}
 	}
-	if _, err := a.c.db.Exec(`UPDATE schema_state SET version=75 WHERE id=1`); err != nil {
+	if _, err := a.c.db.Exec(`UPDATE schema_state SET version=76 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	if err := InitSchema(ctx, a.c); err != nil {
-		t.Fatal("schema75->76", err)
+		t.Fatal("schema76->77", err)
 	}
 	if storedVersion(t, a.c) != CurrentSchemaVersion {
-		t.Fatal("typed schema76 upgrade did not reach current version")
+		t.Fatal("typed schema77 upgrade did not reach current version")
 	}
 	if err := a.c.ExecuteLocal(ctx, func(tx *LocalTx) error { return automationVerifySemanticSchemaTx(ctx, tx) }); err != nil {
 		t.Fatal(err)

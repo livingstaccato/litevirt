@@ -66,7 +66,11 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 	// to be made once, in the open — each entry drives a latch on every cluster
 	// with no operator opt-in.
 	mandatory := map[string]bool{
-		capabilities.SplitBrainGateV1: true,
+		// vm_snapshot_claim_v1 is binary decoder support for exact snapshot
+		// claims; readiness still needs its real all-recipient gate. It grants
+		// no VM execution authority and has no operator policy flag.
+		capabilities.VMSnapshotClaimV1: true,
+		capabilities.SplitBrainGateV1:  true,
 		// lease_term_ledger_v1 has no flag because it states a fact about the
 		// BINARY — "this build can decode the term ledger's statement shapes" —
 		// which no operator should be able to misreport. See its comment in
@@ -126,6 +130,9 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// users statements and keeps a tombstone over its own incarnation".
 		// Every replica must order a delete and a re-create alike.
 		capabilities.UserIncarnationV1: true,
+		// project_incarnation_v1: "this build decodes the incarnation-bearing
+		// projects statements and the project guard".
+		capabilities.ProjectIncarnationV1: true,
 		// release_2026_11_v1, the release token: "this build decodes, keeps
 		// and honours every field and shape of its release". Nothing changes
 		// when it latches; a feature is opened only through WithFeature,
@@ -174,7 +181,10 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 
 	// (b) lww flag on → split_brain (first unlatched in order) latches cycle 1; the
 	// one-unlatched-per-cycle bound means lww latches only by cycle 2.
-	g2 := &recordingGate{}
+	// Snapshot decoder support precedes split_brain in Supported. Part (a)
+	// already proves its cold, flag-off activation. Here it is latched so
+	// the two remaining unlatched tokens isolate the one-per-cycle rule.
+	g2 := &recordingGate{latched: map[string]bool{capabilities.VMSnapshotClaimV1: true}}
 	s2 := &Server{gate: g2}
 	s2.SetEnforcementConfig(false /*safeFence*/, true /*lww*/, false /*hlcLww*/, false /*vipSelfDemote*/, false /*vipProofReclaim*/, false /*sharedStorageFence*/)
 

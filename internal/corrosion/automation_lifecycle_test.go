@@ -8,6 +8,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/automation/contract"
 	"golang.org/x/crypto/bcrypt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -860,5 +861,73 @@ func TestAutomationLifecycleUserGuardedCallbackRollback(t *testing.T) {
 	}
 	if after := capture(); !bytes.Equal(before, after) {
 		t.Fatalf("proof failure changed parent/credential/witness/log: %s -> %s", before, after)
+	}
+}
+
+// A latched first birth must retain the same guarded parent/proof/log boundary
+// as a tombstone revival; the incarnation protocol does not replace it.
+func TestAutomationLifecycleProjectIncarnationFirstBirth(t *testing.T) {
+	for _, failProof := range []bool{false, true} {
+		name := "success_and_losing_guard"
+		if failProof {
+			name = "proof_failure_rollback"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			c := lifecycleDB(t)
+			c.SetProjectIncarnationGate(func() bool { return true })
+			var beforeLogs int
+			if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM mutation_log`).Scan(&beforeLogs); err != nil {
+				t.Fatal(err)
+			}
+			if failProof {
+				if _, err := c.db.ExecContext(ctx, `CREATE TRIGGER fail_first_birth BEFORE INSERT ON local_automation_lifetimes WHEN NEW.kind='project' BEGIN SELECT RAISE(ABORT,'injected first birth proof failure'); END`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := InsertProject(ctx, c, ProjectRecord{Name: "latched-first"})
+			if failProof {
+				if err == nil || !strings.Contains(err.Error(), "injected first birth proof failure") {
+					t.Fatalf("expected actual proof callback failure, got %v", err)
+				}
+				var parents, proofs, logs int
+				if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM projects WHERE name='latched-first'`).Scan(&parents); err != nil {
+					t.Fatal(err)
+				}
+				if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM local_automation_lifetimes WHERE kind='project' AND name='latched-first'`).Scan(&proofs); err != nil {
+					t.Fatal(err)
+				}
+				if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM mutation_log`).Scan(&logs); err != nil || parents != 0 || proofs != 0 || logs != beforeLogs {
+					t.Fatalf("first birth rollback parents=%d proofs=%d logs=%d/%d: %v", parents, proofs, logs, beforeLogs, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			winner, err := AutomationLifetime(ctx, c, "project", "latched-first")
+			if err != nil || winner.Witness == "" {
+				t.Fatalf("latched first birth lacks lifecycle proof: %+v %v", winner, err)
+			}
+			row, err := c.Query(ctx, `SELECT incarnation FROM projects WHERE name='latched-first'`)
+			if err != nil || len(row) != 1 || row[0].String("incarnation") == "" {
+				t.Fatalf("latched birth lost project incarnation: %+v %v", row, err)
+			}
+			var winnerLogs int
+			if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM mutation_log`).Scan(&winnerLogs); err != nil || winnerLogs <= beforeLogs {
+				t.Fatalf("first birth log absent: %d/%d %v", winnerLogs, beforeLogs, err)
+			}
+			if applied, err := createFirstBirth(ctx, c, ProjectRecord{Name: "latched-first"}); err != nil || applied {
+				t.Fatalf("losing first birth guard applied=%t: %v", applied, err)
+			}
+			after, err := AutomationLifetime(ctx, c, "project", "latched-first")
+			if err != nil || !reflect.DeepEqual(winner, after) {
+				t.Fatalf("losing first birth changed winner proof: %+v -> %+v %v", winner, after, err)
+			}
+			var afterLogs int
+			if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM mutation_log`).Scan(&afterLogs); err != nil || afterLogs != winnerLogs {
+				t.Fatalf("losing first birth changed log: %d -> %d %v", winnerLogs, afterLogs, err)
+			}
+		})
 	}
 }

@@ -383,7 +383,7 @@ func TestAutomationKeyTransitionArchived76Unchanged(t *testing.T) {
 	if before.SourceSchema != 76 {
 		t.Fatal("wrong archived descriptor")
 	}
-	if _, err = a.c.db.Exec(`UPDATE schema_state SET version=82 WHERE id=1`); err != nil {
+	if _, err = a.c.db.Exec(`UPDATE schema_state SET version=83 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	later, err := a.c.FreezeAutomationCut(ctx, 1, nil)

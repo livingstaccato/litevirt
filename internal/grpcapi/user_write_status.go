@@ -15,10 +15,11 @@ import (
 // re-created while the write was prepared) is Aborted, which a caller may
 // retry; a write that grants several accounts at once
 // (corrosion.ErrUserMultiAccountGrant) is FailedPrecondition; anything else
-// is Internal.
+// is Internal. A write the project moved under (corrosion.ErrProjectChanged)
+// is Aborted too.
 func userWriteStatus(err error, format string, args ...any) error {
 	msg := fmt.Sprintf(format, args...)
-	if errors.Is(err, corrosion.ErrUserAccountChanged) {
+	if errors.Is(err, corrosion.ErrUserAccountChanged) || errors.Is(err, corrosion.ErrProjectChanged) {
 		return status.Errorf(codes.Aborted, "%s: %v; retry", msg, err)
 	}
 	if errors.Is(err, corrosion.ErrUserMultiAccountGrant) {

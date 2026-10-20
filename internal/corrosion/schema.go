@@ -569,29 +569,49 @@ import (
 //	     ReplicationGated), so a previous-release peer never sees that shape;
 //	     a global group keeps the previous insert. Appended LAST for the v53
 //	     digest reason. Additive.
-//	v71: node-local automation authority, applied prefix, certified history,
+//	v71: projects.incarnation (TEXT NOT NULL DEFAULT '') — the project
+//	     incarnation (project_incarnation.go): a random 128-bit id written
+//	     with the row by every birth of the name (a first create, a
+//	     re-create over a tombstone) once the mandatory, ReplicationGated
+//	     project_incarnation_v1 has latched, and never changed otherwise. ''
+//	     on every row born before it. A role binding under a project's RBAC
+//	     path names the incarnation it was granted for, and grants only while
+//	     the project holds that incarnation; a quota is keyed by it
+//	     ("<name>~p:<incarnation>", no schema change). The column is left out
+//	     of a node's anti-entropy dump while every value of it is '', so a
+//	     previous-release node takes this build's rows until the first
+//	     latched birth (and none is made before the latch); the statements
+//	     that write it are emitted only after the latch, or for a row that
+//	     already carries an incarnation. Appended LAST for the v53 digest
+//	     reason. Additive.
+
+//	v72: node-local automation authority, applied prefix, certified history,
 //	     permanent request receipts, authenticated anchors and bounded on-disk
 //	     recovery staging. None participates in CRDT replication.
-//	v72: inert node-local audited automation content cuts and bounded immutable
+//	v73: inert node-local audited automation content cuts and bounded immutable
 //	     records. No transfer publication, adoption or capability authority.
-//	v73: completed node-local outgoing automation publications, immutable job
+//	v74: completed node-local outgoing automation publications, immutable job
 //	     pins and retained public trust evidence; excluded from source content.
 //
-// v74: inert receiver attempts, pending metadata and bounded transport inventory.
-// v75: inert per-source audit results, spool references and causal request indexes.
+// v75: inert receiver attempts, pending metadata and bounded transport inventory.
+// v76: inert per-source audit results, spool references and causal request indexes.
 // No active import, origin mode, replication or authority is introduced.
-// v76: typed node-local automation identity and owner projections, isolated
+// v77: typed node-local automation identity and owner projections, isolated
 // by reconstruction stage. No replication or admission authority is introduced.
-// v77: node-local originating account/project lifecycle evidence and exact
+// v78: node-local originating account/project lifecycle evidence and exact
 // credential issuance provenance, with atomic invalidate-only parent triggers.
 // These are source observations, never certified identities or class permits.
-// v78: immutable inert local snapshots and complete fixed-roster aggregates.
+// v79: immutable inert local snapshots and complete fixed-roster aggregates.
 // These rows confer no current proof, origin authority or active adoption.
-// v79: causal key epoch, recipient and payload wrapping projections.
-// v80: signed receiver-established floors and current-row complete inventory; never live proof.
-// v81: immutable retained-origin delivery/object/completion pins; no active authority.
-// v82: preserve all recipient stages while allowing the host-incarnation zero domain.
-const CurrentSchemaVersion = 82
+// v80: causal key epoch, recipient and payload wrapping projections.
+// v81: signed receiver-established floors and current-row complete inventory; never live proof.
+// v82: immutable retained-origin delivery/object/completion pins; no active authority.
+// v83: preserve all recipient stages while allowing the host-incarnation zero domain.
+const CurrentSchemaVersion = 83
+
+// schemaVersionProjectIncarnation is the version projects.incarnation was
+// added in.
+const schemaVersionProjectIncarnation = 71
 
 // schemaVersionSGProjects is the version security_groups.project was added in.
 const schemaVersionSGProjects = 70
@@ -2641,7 +2661,8 @@ var schemaDDL = []string{
 		parent_name TEXT,                    -- parent project's name; NULL for root
 		created_at  TEXT NOT NULL,
 		updated_at  TEXT NOT NULL,
-		deleted_at  TEXT
+		deleted_at  TEXT,
+		incarnation TEXT NOT NULL DEFAULT ''  -- v71: the project's incarnation; '' = born before project_incarnation_v1
 	)`,
 
 	// project_quotas is the admission-control gate. Each row caps
@@ -2943,7 +2964,7 @@ var schemaDDL = []string{
 	// ExecuteLocal, one transaction per voter step, committed before the reply
 	// is built. Rows are never deleted or downgraded.
 	// Inert receiver evidence only: no adoption, voting, import or runtime authority.
-	// Schema78 inert audit storage; original source spool remains the evidence owner.
+	// Schema79 inert audit storage; original source spool remains the evidence owner.
 	`CREATE TABLE IF NOT EXISTS local_automation_local_audits (
  id TEXT PRIMARY KEY, attempt TEXT NOT NULL, dependency TEXT NOT NULL,
  head BLOB NOT NULL, coverage TEXT NOT NULL, records INTEGER NOT NULL, origin BLOB NOT NULL
@@ -3884,6 +3905,8 @@ var schemaMigrations = []string{
 	// The project that owns a security group; '' = global (see History,
 	// schemaVersionSGProjects).
 	`ALTER TABLE security_groups ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
+	// The project incarnation (see History, schemaVersionProjectIncarnation).
+	`ALTER TABLE projects ADD COLUMN incarnation TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE local_automation_receiver_current ADD COLUMN established_inventory BLOB NOT NULL DEFAULT x''`,
 }
 
@@ -3902,7 +3925,7 @@ const (
 	kindRebuildClusterCRL                // v47 final shape; presence = composite primary key
 )
 
-const kindRebuildAutomationCustody migKind = 3 // v82 exact recipient shape and nonnegative host counter
+const kindRebuildAutomationCustody migKind = 3 // v83 exact recipient shape and nonnegative host counter
 
 // migration is one ledgered schema unit.
 type migration struct {
@@ -3984,7 +4007,8 @@ var alterVersions = []int{
 	schemaVersionCredentialRetirement, // host_fence_credentials.after_retirement
 	schemaVersionHostIncarnation,      // hosts.incarnation
 	schemaVersionSGProjects,           // security_groups.project
-	80,                                // local_automation_receiver_current.established_inventory
+	schemaVersionProjectIncarnation,   // projects.incarnation
+	81,                                // local_automation_receiver_current.established_inventory
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema
@@ -4031,35 +4055,35 @@ var createTableUnits = []struct {
 	{65, "host_runtime"},
 	{66, "session_groups"},
 	{67, "host_fence_redfish"},
-	{71, "local_automation_authority"}, {71, "local_automation_prefix"},
-	{71, "local_automation_anchors"}, {71, "local_automation_history"},
-	{71, "local_automation_requests"}, {71, "local_automation_recovery"}, {71, "local_automation_staging"},
-	{72, "local_automation_cuts"}, {72, "local_automation_cut_records"},
-	{73, "local_automation_source_jobs"}, {73, "local_automation_publications"},
-	{81, "local_automation_retained_deliveries"}, {81, "local_automation_retained_objects"}, {81, "local_automation_retained_completions"},
-	{80, "local_automation_receiver_established"},
-	{79, "local_automation_key_epochs"}, {79, "local_automation_key_recipients"}, {79, "local_automation_payload_wrappings"},
-	{78, "local_automation_local_audits"},
-	{78, "local_automation_local_rows"},
-	{78, "local_automation_aggregates"},
-	{78, "local_automation_aggregate_sources"},
-	{78, "local_automation_aggregate_copies"},
-	{78, "local_automation_aggregate_maxima"},
-	{78, "local_automation_aggregate_conflicts"},
-	{77, "local_automation_lifetimes"}, {77, "local_automation_credential_issuance"},
-	{76, "local_automation_identities"}, {76, "local_automation_aliases"},
-	{76, "local_automation_owners"}, {76, "local_automation_semantic_heads"},
-	{76, "local_automation_resources"}, {76, "local_automation_names"}, {76, "local_automation_bindings"}, {76, "local_automation_admissions"},
-	{75, "local_automation_receiver_audits"},
-	{75, "local_automation_receiver_refs"},
-	{75, "local_automation_receiver_requests"},
-	{74, "local_automation_receiver_jobs"},
-	{74, "local_automation_receiver_current"},
-	{74, "local_automation_receiver_validations"},
-	{74, "local_automation_receiver_sources"},
-	{74, "local_automation_receiver_components"},
-	{74, "local_automation_receiver_records"},
-	{74, "local_automation_receiver_pages"},
+	{72, "local_automation_authority"}, {72, "local_automation_prefix"},
+	{72, "local_automation_anchors"}, {72, "local_automation_history"},
+	{72, "local_automation_requests"}, {72, "local_automation_recovery"}, {72, "local_automation_staging"},
+	{73, "local_automation_cuts"}, {73, "local_automation_cut_records"},
+	{74, "local_automation_source_jobs"}, {74, "local_automation_publications"},
+	{82, "local_automation_retained_deliveries"}, {82, "local_automation_retained_objects"}, {82, "local_automation_retained_completions"},
+	{81, "local_automation_receiver_established"},
+	{80, "local_automation_key_epochs"}, {80, "local_automation_key_recipients"}, {80, "local_automation_payload_wrappings"},
+	{79, "local_automation_local_audits"},
+	{79, "local_automation_local_rows"},
+	{79, "local_automation_aggregates"},
+	{79, "local_automation_aggregate_sources"},
+	{79, "local_automation_aggregate_copies"},
+	{79, "local_automation_aggregate_maxima"},
+	{79, "local_automation_aggregate_conflicts"},
+	{78, "local_automation_lifetimes"}, {78, "local_automation_credential_issuance"},
+	{77, "local_automation_identities"}, {77, "local_automation_aliases"},
+	{77, "local_automation_owners"}, {77, "local_automation_semantic_heads"},
+	{77, "local_automation_resources"}, {77, "local_automation_names"}, {77, "local_automation_bindings"}, {77, "local_automation_admissions"},
+	{76, "local_automation_receiver_audits"},
+	{76, "local_automation_receiver_refs"},
+	{76, "local_automation_receiver_requests"},
+	{75, "local_automation_receiver_jobs"},
+	{75, "local_automation_receiver_current"},
+	{75, "local_automation_receiver_validations"},
+	{75, "local_automation_receiver_sources"},
+	{75, "local_automation_receiver_components"},
+	{75, "local_automation_receiver_records"},
+	{75, "local_automation_receiver_pages"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn
@@ -4102,7 +4126,7 @@ func init() {
 	})
 	schemaMigrationLedger = append(schemaMigrationLedger, migration{
 		ID:      automationCustodyMigrationID,
-		Version: 82,
+		Version: 83,
 		Kind:    kindRebuildAutomationCustody,
 		Target:  "local_automation_key_recipients",
 		SQL:     automationCustodyRebuildSQL,

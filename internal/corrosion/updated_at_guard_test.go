@@ -132,6 +132,13 @@ func TestReplicatedUpdatedAtUsesNowTS(t *testing.T) {
 			if fn.Name.Name == "holdUntaggedFactorSet" {
 				continue
 			}
+			// retireOlderProjectGrants likewise stamps a retired binding just
+			// after the binding's OWN updated_at, so every node that retires it
+			// writes the same row, and a later write of the binding (its
+			// revoke) still wins over the retirement.
+			if fn.Name.Name == "retireOlderProjectGrants" {
+				continue
+			}
 			body := string(src[fset.Position(fn.Pos()).Offset:fset.Position(fn.End()).Offset])
 			if strings.Contains(body, "NowTS(") {
 				continue

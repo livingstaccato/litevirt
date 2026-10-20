@@ -28,14 +28,14 @@ func TestAutomationCustodyLifetimeMigration(t *testing.T) {
 	dir := t.TempDir()
 	c := custodyLifetimeFileClient(t, dir)
 	t.Cleanup(func() { _ = c.Close() })
-	custodyLifetimeBuildComposed81(t, c)
+	custodyLifetimeBuildComposed82(t, c)
 	for _, stage := range []string{"", "audit-a", "audit-b"} {
 		if err := custodyLifetimeInsertRecipient(t, c, stage, "positive-control", 17); err != nil {
-			t.Fatalf("SETUP composed81 positive insertion %q: %v", stage, err)
+			t.Fatalf("SETUP composed82 positive insertion %q: %v", stage, err)
 		}
 	}
 	if err := custodyLifetimeInsertRecipient(t, c, "", "old-host-zero", 0); err == nil || !strings.Contains(err.Error(), "host_incarnation>0") {
-		t.Fatalf("SETUP composed81 did not enforce genuine old CHECK: %v", err)
+		t.Fatalf("SETUP composed82 did not enforce genuine old CHECK: %v", err)
 	}
 	before, err := c.Query(ctx, "SELECT "+custodyLifetimeRecipientColumns+" FROM local_automation_key_recipients ORDER BY stage,host")
 	if err != nil {
@@ -45,23 +45,23 @@ func TestAutomationCustodyLifetimeMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if storedVersion(t, c) != 81 {
-		t.Fatal("SETUP composed81 stamp missing")
+	if storedVersion(t, c) != 82 {
+		t.Fatal("SETUP composed82 stamp missing")
 	}
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
 	}
 	c = custodyLifetimeFileClient(t, dir)
-	if storedVersion(t, c) != 81 {
-		t.Fatal("SETUP composed81 did not persist")
+	if storedVersion(t, c) != 82 {
+		t.Fatal("SETUP composed82 did not persist")
 	}
-	// First InitSchema call for this fresh composed81 prerequisite fixture.
+	// First InitSchema call for this fresh composed82 prerequisite fixture.
 	if err := InitSchema(ctx, c); err != nil {
-		t.Fatalf("COMPOSED81_UPGRADE_REFUSED: %v", err)
+		t.Fatalf("COMPOSED82_UPGRADE_REFUSED: %v", err)
 	}
 	after, err := c.Query(ctx, "SELECT "+custodyLifetimeRecipientColumns+" FROM local_automation_key_recipients ORDER BY stage,host")
 	if err != nil || !reflect.DeepEqual(before, after) {
-		t.Fatalf("COMPOSED81_RECIPIENT_BYTES_OR_STAGES_CHANGED: %v", err)
+		t.Fatalf("COMPOSED82_RECIPIENT_BYTES_OR_STAGES_CHANGED: %v", err)
 	}
 	upgraded, err := c.Query(ctx, `SELECT id,applied_at,checksum FROM applied_migrations ORDER BY id`)
 	if err != nil {
@@ -78,13 +78,13 @@ func TestAutomationCustodyLifetimeMigration(t *testing.T) {
 		}
 	}
 	if !reflect.DeepEqual(ledger, preserved) {
-		t.Fatal("COMPOSED81_LEDGER_BYTES_CHANGED")
+		t.Fatal("COMPOSED82_LEDGER_BYTES_CHANGED")
 	}
 	if err := custodyLifetimeInsertRecipient(t, c, "audit-a", "new-host-zero", 0); err != nil {
-		t.Fatalf("COMPOSED81_UPGRADE_N0_REFUSED: %v", err)
+		t.Fatalf("COMPOSED82_UPGRADE_N0_REFUSED: %v", err)
 	}
-	if storedVersion(t, c) != 82 || appliedCount(t, c) != len(ledger)+1 || countAppliedID(t, c, automationCustodyMigrationID) != 1 {
-		t.Fatal("composed81 upgrade did not append exactly one schema82 unit")
+	if storedVersion(t, c) != 83 || appliedCount(t, c) != len(ledger)+1 || countAppliedID(t, c, automationCustodyMigrationID) != 1 {
+		t.Fatal("composed82 upgrade did not append exactly one schema83 unit")
 	}
 	if err := c.ExecuteLocal(ctx, func(tx *LocalTx) error { return automationVerifySemanticSchemaTx(ctx, tx) }); err != nil {
 		t.Fatal("rebuilt semantic/index guards refused", err)
@@ -100,17 +100,19 @@ func TestAutomationCustodyLifetimeMigration(t *testing.T) {
 		}
 	}
 	if !reflect.DeepEqual(complete, custodyLifetimeSnapshot(t, c)) {
-		t.Fatal("migrated82 reopen/init changed all-stage rows or ledger")
+		t.Fatal("migrated83 reopen/init changed all-stage rows or ledger")
 	}
 }
 
-// Fresh composed SQL81, using the frozen old recipient constraint before the
-// owned SQL82 rebuild. No historical database or archived ledger is relabeled.
-func custodyLifetimeBuildComposed81(t *testing.T, c *Client) {
-	custodyLifetimeBuildComposed81DDL(t, c, custodyLifetimeOriginalRecipientDDL)
+// Fresh composed SQL82, using the frozen old recipient constraint before the
+// owned SQL83 rebuild. No historical database or archived ledger is relabeled.
+// This synthetic predecessor is not the archived descriptor82 namespace; it
+// must be upgraded before any new cut is frozen.
+func custodyLifetimeBuildComposed82(t *testing.T, c *Client) {
+	custodyLifetimeBuildComposed82DDL(t, c, custodyLifetimeOriginalRecipientDDL)
 }
 
-func custodyLifetimeBuildComposed81DDL(t *testing.T, c *Client, originalDDL string) {
+func custodyLifetimeBuildComposed82DDL(t *testing.T, c *Client, originalDDL string) {
 	t.Helper()
 	ctx := context.Background()
 	// Install frozen original recipient DDL FIRST. CREATE IF NOT EXISTS in
@@ -120,22 +122,22 @@ func custodyLifetimeBuildComposed81DDL(t *testing.T, c *Client, originalDDL stri
 	}
 	for _, ddl := range schemaDDL {
 		if err := c.execLocal(ctx, ddl); err != nil {
-			t.Fatalf("SETUP composed81 DDL: %v", err)
+			t.Fatalf("SETUP composed82 DDL: %v", err)
 		}
 	}
 	if err := c.execLocal(ctx, appliedMigrationsDDL); err != nil {
 		t.Fatal(err)
 	}
 	for _, m := range schemaMigrationLedger {
-		if m.Version <= 81 {
-			// Fresh composed prerequisite only: published SG70 and relocated SQL71..81.
+		if m.Version <= 82 {
+			// Fresh composed prerequisite only: published SG70/project71 and relocated SQL72..82.
 			// This is not the immutable original80 ledger from tree6edc84a7.
-			if err := c.execLocal(ctx, `INSERT INTO applied_migrations(id,applied_at,checksum) VALUES(?,?,?)`, m.ID, "composed81-fixture", sha256hex(m.SQL)); err != nil {
+			if err := c.execLocal(ctx, `INSERT INTO applied_migrations(id,applied_at,checksum) VALUES(?,?,?)`, m.ID, "composed82-fixture", sha256hex(m.SQL)); err != nil {
 				t.Fatal(err)
 			}
 		}
 	}
-	if err := c.execLocal(ctx, `INSERT OR REPLACE INTO schema_state(id,version,updated_at) VALUES(1,81,'composed81-fixture')`); err != nil {
+	if err := c.execLocal(ctx, `INSERT OR REPLACE INTO schema_state(id,version,updated_at) VALUES(1,82,'composed82-fixture')`); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -225,7 +227,7 @@ func custodyLifetimeInsertRecipient(t *testing.T, c *Client, stage, host string,
 		"2026-10-18T00:00:00Z", "a1", "voter-database-a", "key-"+host, identity.Recipient().String(), ref, ref, ref, int64(2))
 }
 
-func TestAutomationCustodyLifetimeSchema82(t *testing.T) {
+func TestAutomationCustodyLifetimeSchema83(t *testing.T) {
 	ctx := context.Background()
 	t.Run("fresh_reopen_idempotent", func(t *testing.T) {
 		dir := t.TempDir()
@@ -264,8 +266,8 @@ func TestAutomationCustodyLifetimeSchema82(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if storedVersion(t, c) != 82 || countAppliedID(t, c, automationCustodyMigrationID) != 1 || !reflect.DeepEqual(before, custodyLifetimeSnapshot(t, c)) {
-			t.Fatal("fresh82 reopen/init changed schema, rows or ledger")
+		if storedVersion(t, c) != 83 || countAppliedID(t, c, automationCustodyMigrationID) != 1 || !reflect.DeepEqual(before, custodyLifetimeSnapshot(t, c)) {
+			t.Fatal("fresh83 reopen/init changed schema, rows or ledger")
 		}
 	})
 	for _, tc := range []struct {
@@ -283,7 +285,7 @@ func TestAutomationCustodyLifetimeSchema82(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c := custodyLifetimeFileClient(t, t.TempDir())
 			t.Cleanup(func() { _ = c.Close() })
-			custodyLifetimeBuildComposed81DDL(t, c, tc.ddl)
+			custodyLifetimeBuildComposed82DDL(t, c, tc.ddl)
 			if err := custodyLifetimeInsertRecipient(t, c, "audit-preserve", "positive", 17); err != nil {
 				t.Fatal(err)
 			}
@@ -302,7 +304,7 @@ func TestAutomationCustodyLifetimeSchema82(t *testing.T) {
 	t.Run("copy_failure", func(t *testing.T) {
 		c := custodyLifetimeFileClient(t, t.TempDir())
 		t.Cleanup(func() { _ = c.Close() })
-		custodyLifetimeBuildComposed81(t, c)
+		custodyLifetimeBuildComposed82(t, c)
 		if err := custodyLifetimeInsertRecipient(t, c, "active-positive", "positive", 17); err != nil {
 			t.Fatal(err)
 		}
@@ -334,7 +336,7 @@ func TestAutomationCustodyLifetimeSchema82(t *testing.T) {
 	t.Run("ledger_failure_after_rebuild", func(t *testing.T) {
 		c := custodyLifetimeFileClient(t, t.TempDir())
 		t.Cleanup(func() { _ = c.Close() })
-		custodyLifetimeBuildComposed81(t, c)
+		custodyLifetimeBuildComposed82(t, c)
 		if err := custodyLifetimeInsertRecipient(t, c, "audit-preserve", "positive", 17); err != nil {
 			t.Fatal(err)
 		}
@@ -365,7 +367,7 @@ func custodyLifetimeSnapshot(t *testing.T, c *Client) map[string][]Row {
 
 func custodyLifetimeAssertRollback(t *testing.T, c *Client, before map[string][]Row) {
 	t.Helper()
-	if storedVersion(t, c) != 81 || countAppliedID(t, c, automationCustodyMigrationID) != 0 || !reflect.DeepEqual(before, custodyLifetimeSnapshot(t, c)) {
+	if storedVersion(t, c) != 82 || countAppliedID(t, c, automationCustodyMigrationID) != 0 || !reflect.DeepEqual(before, custodyLifetimeSnapshot(t, c)) {
 		t.Fatal("failed recipient migration changed old schema/data/ledger")
 	}
 }

@@ -143,16 +143,16 @@ func TestAutomationPrimary636Upgrade67Through82(t *testing.T) {
 	if storedVersion(t, c) != CurrentSchemaVersion || appliedCount(t, c) != len(schemaMigrationLedger) {
 		t.Fatal("upgrade omitted current schema or ledger units")
 	}
-	want := map[int]int{71: 7, 72: 2, 73: 2, 74: 7, 75: 3, 76: 8, 77: 2, 78: 7, 79: 3, 80: 2, 81: 3, 82: 1}
+	want := map[int]int{72: 7, 73: 2, 74: 2, 75: 7, 76: 3, 77: 8, 78: 2, 79: 7, 80: 3, 81: 2, 82: 3, 83: 1}
 	for _, m := range schemaMigrationLedger {
-		if m.Version < 71 {
+		if m.Version < 72 {
 			continue
 		}
-		custody82 := m.Version == 82 && m.Kind == kindRebuildAutomationCustody && m.ID == automationCustodyMigrationID && m.Target == "local_automation_key_recipients" && m.SQL == automationCustodyRebuildSQL
-		if m.Version == 82 && !custody82 {
-			t.Fatalf("unexpected custody82 migration %+v", m)
+		custody83 := m.Version == 83 && m.Kind == kindRebuildAutomationCustody && m.ID == automationCustodyMigrationID && m.Target == "local_automation_key_recipients" && m.SQL == automationCustodyRebuildSQL
+		if m.Version == 83 && !custody83 {
+			t.Fatalf("unexpected custody83 migration %+v", m)
 		}
-		if !strings.HasPrefix(m.Target, "local_automation_") || (m.Kind != kindCreateTable && !(m.Version == 80 && m.Kind == kindAddColumn && m.Target == "local_automation_receiver_current.established_inventory") && !custody82) {
+		if !strings.HasPrefix(m.Target, "local_automation_") || (m.Kind != kindCreateTable && !(m.Version == 81 && m.Kind == kindAddColumn && m.Target == "local_automation_receiver_current.established_inventory") && !custody83) {
 			t.Fatalf("unexpected relocated migration %+v", m)
 		}
 		want[m.Version]--

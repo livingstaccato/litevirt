@@ -17,14 +17,15 @@ func TestCheckOneCapabilityHealth_DetectsPostLatchRegression(t *testing.T) {
 	// Both configured-on tokens already latched; split_brain still confirms active,
 	// but lww's peer support regressed (CapabilityActiveForHealth → false).
 	//
-	// lease_term_ledger_v1, credentials_split_v1, credentials_clear_v1,
+	// vm_snapshot_claim_v1, lease_term_ledger_v1, credentials_split_v1, credentials_clear_v1,
 	// host_membership_split_v1, host_membership_retire_v1, host_runtime_split_v1, host_runtime_retire_v1, failover_scope_v1, voter_config_v1,
-	// claim_incarnation_v1, lease_term_claim_v1, fence_state_v1, relay_health_v1, spec_conflict_v1, netbox_ip_repoint_v1, user_incarnation_v1 and release_2026_11_v1 are latched too, not because this
+	// claim_incarnation_v1, lease_term_claim_v1, fence_state_v1, relay_health_v1, spec_conflict_v1, netbox_ip_repoint_v1, user_incarnation_v1, project_incarnation_v1 and release_2026_11_v1 are latched too, not because this
 	// test is about them but because they
 	// have no kill switch: an unlatched one would consume the driver's
 	// one-per-cycle budget and the loop below would never reach the freshness
 	// check it is actually asserting on.
 	g.latched = map[string]bool{
+		capabilities.VMSnapshotClaimV1:      true,
 		capabilities.SplitBrainGateV1:       true,
 		capabilities.LeaseTermLedgerV1:      true,
 		capabilities.CredentialsSplitV1:     true,
@@ -42,10 +43,12 @@ func TestCheckOneCapabilityHealth_DetectsPostLatchRegression(t *testing.T) {
 		capabilities.SpecConflictV1:         true,
 		capabilities.NetBoxIPRepointV1:      true,
 		capabilities.UserIncarnationV1:      true,
+		capabilities.ProjectIncarnationV1:   true,
 		capabilities.Release202611V1:        true,
 		capabilities.LWWSkewGuardV1:         true,
 	}
 	g.enforcedTok = map[string]bool{
+		capabilities.VMSnapshotClaimV1:      true,  // binary support is still active
 		capabilities.SplitBrainGateV1:       true,  // still active
 		capabilities.LeaseTermLedgerV1:      true,  // still active
 		capabilities.CredentialsSplitV1:     true,  // still active
@@ -63,6 +66,7 @@ func TestCheckOneCapabilityHealth_DetectsPostLatchRegression(t *testing.T) {
 		capabilities.SpecConflictV1:         true,  // still active
 		capabilities.NetBoxIPRepointV1:      true,  // still active
 		capabilities.UserIncarnationV1:      true,  // still active
+		capabilities.ProjectIncarnationV1:   true,  // still active
 		capabilities.Release202611V1:        true,  // still active
 		capabilities.LWWSkewGuardV1:         false, // regressed: a peer stopped advertising
 	}

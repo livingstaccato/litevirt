@@ -541,6 +541,37 @@ const (
 	// maintenance host included, must keep the tombstone as the rest do.
 	UserIncarnationV1 = "user_incarnation_v1"
 
+	// ProjectIncarnationV1 binds a project's grants to the project they were
+	// made for (internal/corrosion/project_incarnation.go). Every birth of a
+	// project name (a first create, a re-create over a tombstone) writes a
+	// fresh random incarnation into the row. Once latched:
+	//
+	//   - a role binding under a project's RBAC path names, in its id, the
+	//     incarnation the writer held, and grants only while the project holds
+	//     that incarnation; one granted before the latch grants only while the
+	//     project still holds the incarnation it had then (none). Any other is
+	//     kept, listed as held, and grants nothing;
+	//   - a grant or quota write under a project carries a
+	//     project_incarnation_v1 mutation guard, and applies only to that
+	//     incarnation;
+	//   - the orphan reaper's authority retirement names the tombstone it
+	//     retires, so a node that never saw a re-create cannot retire the new
+	//     project's authority.
+	//
+	// Before, a role binding a lagging node granted on a project that was
+	// then deleted and re-created elsewhere reached the new project by the WAL
+	// or anti-entropy and granted there.
+	//
+	// It states a fact about the BINARY, which is why it is mandatory and has
+	// no config flag: this build decodes the incarnation-bearing projects
+	// statements and the guard. Every replica must decide alike, or one grants
+	// what another holds.
+	//
+	// ReplicationGated: the two projects statements and the guard are shapes a
+	// previous-release peer has no ledger entry for, and every host still
+	// receiving replication, a maintenance host included, must decode them.
+	ProjectIncarnationV1 = "project_incarnation_v1"
+
 	// RecoveryClaimV1 gates ENFORCEMENT of single-winner recovery claims
 	// (docs/design/recovery-claims.md §3, §5.1–§5.2,
 	// colonelpanik/litevirt#250): a failover coordinator collects a majority
@@ -1232,6 +1263,12 @@ const ReleaseToken = Release202611V1
 //     and every replica must order them alike. A binary rolled back below it
 //     enters WAL quarantine, as below every latched token.
 //
+//   - project_incarnation_v1 has no flag either, and no stand-down of its
+//     own: it changes which role bindings grant on a re-created project, and
+//     every replica must decide alike. A held binding is removed with
+//     lv role revoke. A binary rolled back below it enters WAL quarantine,
+//     as below every latched token.
+//
 //   - netbox_ip_repoint_v1 has no flag either: it says this build decodes the
 //     lease re-point statement. What it licenses is bounded to a NetBox
 //     address object NetBox answered 404 for while a live
@@ -1382,6 +1419,10 @@ var supported = []string{
 	// decodes the incarnation-bearing users statements and keeps a tombstone
 	// over its own incarnation", a fact about the binary.
 	UserIncarnationV1,
+	// ProjectIncarnationV1 is advertised UNCONDITIONALLY: it says "this build
+	// decodes the incarnation-bearing projects statements and the project
+	// guard", a fact about the binary.
+	ProjectIncarnationV1,
 	// RecoveryClaimV1 is advertised CONDITIONALLY: enforcement.recovery_claim
 	// (default on) on AND this node ready (split_brain_gate_v1 latched, voter_config_v1
 	// ready). Withheld while the flag is off because every flag-on node relies
@@ -1425,7 +1466,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{VMSnapshotClaimV1, SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, LeaseTermClaimV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, VRRPUnicastV1, Release202611V1, SpecConflictV1, NetBoxIPRepointV1, UserIncarnationV1}
+var all = []string{VMSnapshotClaimV1, SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, LeaseTermClaimV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, VRRPUnicastV1, Release202611V1, SpecConflictV1, NetBoxIPRepointV1, UserIncarnationV1, ProjectIncarnationV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -1525,6 +1566,10 @@ var replicationGated = map[string]bool{
 	// incarnation-bearing users statements and keep a tombstone over its own
 	// incarnation as the rest do. See UserIncarnationV1.
 	UserIncarnationV1: true,
+	// Confirmed against every replication recipient: each must decode the
+	// incarnation-bearing projects statements and the project guard. See
+	// ProjectIncarnationV1.
+	ProjectIncarnationV1: true,
 	// Confirmed against every replication recipient: the claim_certificate
 	// column's statement shapes on runtime_action_proofs must be decodable by
 	// every host we stream to. Not mandatory: the flag is the opt-in.
@@ -1626,6 +1671,9 @@ var mandatory = map[string]bool{
 	// statements and keeps a tombstone over its own incarnation). See
 	// UserIncarnationV1.
 	UserIncarnationV1: true,
+	// A fact about the binary (it decodes the incarnation-bearing projects
+	// statements and the project guard). See ProjectIncarnationV1.
+	ProjectIncarnationV1: true,
 	// A fact about the binary (it decodes, keeps and honours its release's
 	// fields and shapes). Nothing changes until a feature is used, and every
 	// use is recorded first. See Release202611V1.

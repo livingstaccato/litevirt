@@ -300,19 +300,13 @@ func (v *VMChecker) recordRestartFailure(ctx context.Context, from *corrosion.VM
 	}
 }
 
-// recordRestarted is the running write of a health restart that brought the
-// guest up, over the row it acted on. A row another writer changed meanwhile
-// that already says running here is taken as recorded; any other change
-// refuses the write (ErrNoRowsAffected), as a vanished row does.
-func (v *VMChecker) recordRestarted(ctx context.Context, from *corrosion.VMRecord, detail string) error {
-	applied, err := corrosion.UpdateVMStateFrom(ctx, v.db, from.Name, from.HostName, from.State, "running", detail)
-	if err != nil {
-		return err
-	}
-	if applied {
-		return nil
-	}
-	cur, err := corrosion.GetVM(ctx, v.db, from.Name)
+// restartedRecordedMeanwhile answers for a health restart's running write
+// that did not apply (UpdateVMStateFrom: the row acted on changed under the
+// restart): a row that already says running here was recorded by another
+// writer and is taken as recorded; any other change refuses the publication
+// (ErrNoRowsAffected), as a vanished row does.
+func (v *VMChecker) restartedRecordedMeanwhile(ctx context.Context, name string) error {
+	cur, err := corrosion.GetVM(ctx, v.db, name)
 	if err != nil {
 		return err
 	}
@@ -939,7 +933,12 @@ func (v *VMChecker) takeAction(ctx context.Context, vm corrosion.VMRecord, hspec
 			return
 		}
 		if err := v.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
-			return v.recordRestarted(ctx, from, "restarted by health checker")
+			// Over the row the restart acted on, and no other.
+			applied, err := corrosion.UpdateVMStateFrom(ctx, v.db, from.Name, from.HostName, from.State, "running", "restarted by health checker")
+			if err != nil || applied {
+				return err
+			}
+			return v.restartedRecordedMeanwhile(ctx, from.Name)
 		}); err != nil {
 			LogPublishRefusal("vmcheck: restart state write failed — NOT publishing restarted event", vm.Name, err)
 			v.noteStateWriteFail(corrosion.OpVMState, err)
@@ -1253,7 +1252,12 @@ func (v *VMChecker) maybeRestartVM(ctx context.Context, vm corrosion.VMRecord, n
 		return
 	}
 	if err := v.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
-		return v.recordRestarted(ctx, from, "restart policy: "+decision)
+		// Over the row the restart acted on, and no other.
+		applied, err := corrosion.UpdateVMStateFrom(ctx, v.db, from.Name, from.HostName, from.State, "running", "restart policy: "+decision)
+		if err != nil || applied {
+			return err
+		}
+		return v.restartedRecordedMeanwhile(ctx, from.Name)
 	}); err != nil {
 		LogPublishRefusal("vmcheck: restart-policy state write failed — NOT publishing restart event", vm.Name, err)
 		v.noteStateWriteFail(corrosion.OpVMState, err)

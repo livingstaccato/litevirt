@@ -30,15 +30,22 @@ func (b *raceBackend) DestroyDomain(name string) error {
 	return b.Fake.DestroyDomain(name)
 }
 
-// destroys is how many destroys of name the fake recorded.
-func destroys(f *libvirtfake.Fake, name string) int {
-	n := 0
+// ops is how many destroys and starts of name the fake recorded: a shut-off
+// domain's destroy records nothing, so a restart that should not have run
+// shows as its start.
+func ops(f *libvirtfake.Fake, name string) (destroys, starts int) {
 	for _, e := range f.EventLog() {
-		if e.Op == "destroy" && e.Domain == name {
-			n++
+		if e.Domain != name {
+			continue
+		}
+		switch e.Op {
+		case "destroy":
+			destroys++
+		case "start":
+			starts++
 		}
 	}
-	return n
+	return destroys, starts
 }
 
 // migratingRefusal is what the start guard answers for a row recorded
@@ -122,8 +129,8 @@ func TestTakeAction_RestartReadsTheRowUnderTheVMLock(t *testing.T) {
 		if !locked {
 			t.Fatal("the restart did not take the VM's lock")
 		}
-		if n := destroys(fake, "web"); n != 0 {
-			t.Fatalf("web destroyed %d time(s) under a row that went migrating", n)
+		if d, st := ops(fake, "web"); d != 0 || st != 0 {
+			t.Fatalf("web destroyed %d and started %d time(s) under a row that went migrating", d, st)
 		}
 		if row := rowOf(t, db, "web"); row.State != "migrating" {
 			t.Fatalf("web = %s; want migrating", row.State)
@@ -133,8 +140,8 @@ func TestTakeAction_RestartReadsTheRowUnderTheVMLock(t *testing.T) {
 		v, fake, db, hspec := runningWebChecker(t)
 		v.SetVMLocker(func(string) (func(), bool) { return nil, false })
 		v.takeAction(context.Background(), corrosion.VMRecord{Name: "web", HostName: "node1", State: "running"}, hspec)
-		if n := destroys(fake, "web"); n != 0 {
-			t.Fatalf("web destroyed %d time(s) while another operation holds its lock", n)
+		if d, st := ops(fake, "web"); d != 0 || st != 0 {
+			t.Fatalf("web destroyed %d and started %d time(s) while another operation holds its lock", d, st)
 		}
 		if row := rowOf(t, db, "web"); row.State != "running" {
 			t.Fatalf("web = %s; want running, untouched", row.State)
@@ -183,8 +190,8 @@ func TestMaybeRestartVM_DoesNotActOnARowAnotherHostTookMeanwhile(t *testing.T) {
 		v, fake, db := crashed(t)
 		v.SetVMLocker(func(string) (func(), bool) { handedOff(db); return func() {}, true })
 		v.maybeRestartVM(context.Background(), *rowOf(t, db, "web"), time.Now())
-		if n := destroys(fake, "web"); n != 0 {
-			t.Fatalf("web destroyed %d time(s) after another host took it", n)
+		if d, st := ops(fake, "web"); d != 0 || st != 0 {
+			t.Fatalf("web destroyed %d and started %d time(s) after another host took it", d, st)
 		}
 		if row := rowOf(t, db, "web"); row.State != "stopped" || row.HostName != "node2" {
 			t.Fatalf("web = %s on %s; want node2's stopped row left alone", row.State, row.HostName)

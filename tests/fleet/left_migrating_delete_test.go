@@ -74,3 +74,23 @@ func TestFleet_DeleteOfAVMLeftMigratingWhoseGuestStopsRunningUnderTheLockIsRetri
 		})
 	}
 }
+
+// A plain delete of a VM recorded migrating whose guest runs on its host
+// aborts the move's job libvirtd may still run before it destroys the guest,
+// as the forced delete and StopVM's runs-here arm do: a cut-over must not
+// land under the destroy.
+//
+// Mutation: the abort before the plain destroy removed — red.
+func TestFleet_PlainDeleteOfAVMLeftMigratingAbortsItsJobBeforeTheDestroy(t *testing.T) {
+	c, src, _ := leftMigrating(t)
+	src.Virt.SetState("web", libvirtfake.StateRunning)
+	if _, err := c.SelfClient(src).DeleteVM(context.Background(), &pb.DeleteVMRequest{Name: "web"}); err != nil {
+		t.Fatalf("plain delete of web running on its source: %v", err)
+	}
+	if n := src.Virt.AbortedMigrations("web"); n < 1 {
+		t.Fatalf("web's migration job aborted %d time(s) before the destroy; want it aborted", n)
+	}
+	if row, _ := corrosion.GetVM(context.Background(), src.DB, "web"); row != nil {
+		t.Fatalf("web after the delete = %+v; want gone", row)
+	}
+}

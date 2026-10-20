@@ -240,27 +240,35 @@ func (v *VMChecker) SetVMLocker(fn func(name string) (release func(), ok bool)) 
 // (UpdateVMStateFrom), so a writer that changed it meanwhile keeps its
 // change: a refused restart recorded `error` over a move's `migrating` would
 // make the row startable again under the start guard. what names the
-// restart in the row's detail. from is the row acted on (nil when nothing
-// was touched); started says the guest is booting again.
-func (v *VMChecker) healthRestart(ctx context.Context, vm corrosion.VMRecord, what string) (from *corrosion.VMRecord, started bool) {
+// restart in the row's detail. onAct, when given, runs once the restart is
+// going ahead — under the lock, the row re-read, before the destroy — and
+// not for a pass that is skipped: the restart policy counts its attempt
+// there, so a pass skipped for a held lock uses none, and a restart is never
+// counted twice. from is the row acted on (nil when nothing was touched);
+// started says the guest is booting again; lockHeld says the pass was
+// skipped for the lock.
+func (v *VMChecker) healthRestart(ctx context.Context, vm corrosion.VMRecord, what string, onAct func()) (from *corrosion.VMRecord, started, lockHeld bool) {
 	if v.vmLock != nil {
 		release, ok := v.vmLock(vm.Name)
 		if !ok {
 			slog.Info("vmcheck: not restarting the VM — another operation holds its lock; next pass", "vm", vm.Name, "restart", what)
-			return nil, false
+			return nil, false, true
 		}
 		defer release()
 	}
 	fresh, err := corrosion.GetVM(ctx, v.db, vm.Name)
 	if err != nil || fresh == nil {
 		slog.Warn("vmcheck: not restarting the VM — its row cannot be read", "vm", vm.Name, "restart", what, "error", err)
-		return nil, false
+		return nil, false, false
 	}
 	if fresh.HostName != v.hostName || fresh.State != vm.State ||
 		(fresh.State == "stopped" && IsOperatorStop(fresh.StateDetail) && !IsOperatorStop(vm.StateDetail)) {
 		slog.Info("vmcheck: not restarting the VM — its row changed since the check read it",
 			"vm", vm.Name, "restart", what, "host", fresh.HostName, "state", fresh.State, "detail", fresh.StateDetail)
-		return nil, false
+		return nil, false, false
+	}
+	if onAct != nil {
+		onAct()
 	}
 	_ = v.virt.DestroyDomain(vm.Name)
 	// hardware_v2 pre-start (adoption gate + PCI preflight), after the
@@ -272,18 +280,18 @@ func (v *VMChecker) healthRestart(ctx context.Context, vm corrosion.VMRecord, wh
 		slog.Warn("vmcheck: hardware pre-start refused/failed the restart", "vm", vm.Name, "restart", what, "error", hwErr)
 		v.noteGateRefused(corrosion.ActionReschedule, hwRefusalReason(hwErr))
 		v.recordRestartFailure(ctx, fresh, fmt.Sprintf("hardware pre-start: %v", hwErr))
-		return fresh, false
+		return fresh, false, false
 	}
 	if err := v.startGuarded(ctx, vm.Name); err != nil {
 		releaseHW() // release any passthrough the preflight bound for this failed start
 		slog.Error("vmcheck: "+what+" failed", "vm", vm.Name, "error", err)
 		v.recordRestartFailure(ctx, fresh, fmt.Sprintf("%s failed: %v", what, err))
-		return fresh, false
+		return fresh, false, false
 	}
 	// The guest is booting again from here, whether or not the running
 	// publication lands: its start grace begins now.
 	v.noteStarted(vm.Name, v.clock())
-	return fresh, true
+	return fresh, true, false
 }
 
 // recordRestartFailure records a health restart that did not bring the
@@ -928,7 +936,7 @@ func (v *VMChecker) takeAction(ctx context.Context, vm corrosion.VMRecord, hspec
 		}
 		// One step under the VM's lock, the row read again under it: a move
 		// recorded migrating since the re-read above is left alone.
-		from, started := v.healthRestart(ctx, *fresh, "health check restart")
+		from, started, _ := v.healthRestart(ctx, *fresh, "health check restart", nil)
 		if !started {
 			return
 		}
@@ -1237,17 +1245,30 @@ func (v *VMChecker) maybeRestartVM(ctx context.Context, vm corrosion.VMRecord, n
 	slog.Info("vmcheck: restarting VM per restart policy", "vm", vm.Name,
 		"condition", rp.Condition, "state", vm.State)
 
-	if err := corrosion.IncrementRestart(ctx, v.db, vm.Name); err != nil {
-		slog.Error("vmcheck: increment restart counter", "vm", vm.Name, "error", err)
+	// The attempt is counted once the restart is going ahead: under the VM's
+	// lock, the row re-read, before the destroy (healthRestart's onAct). A
+	// pass skipped for a lock another operation holds (a backup, a snapshot,
+	// a replication) uses no attempt and sets no delay: it is a deferral,
+	// and the VM restarts on the first pass after the lock frees, instead of
+	// the held passes exhausting the policy's attempts.
+	countAttempt := func() {
+		if err := corrosion.IncrementRestart(ctx, v.db, vm.Name); err != nil {
+			slog.Error("vmcheck: increment restart counter", "vm", vm.Name, "error", err)
+		}
 	}
-
 	if v.virt == nil {
+		countAttempt() // no libvirt: the counter is the record of going ahead
 		return
 	}
 	// One step under the VM's lock, the row read again under it: a VM a cold
 	// move handed over, or an operator stopped, since the re-read above is
 	// left alone.
-	from, started := v.healthRestart(ctx, vm, "restart policy start")
+	from, started, lockHeld := v.healthRestart(ctx, vm, "restart policy start", countAttempt)
+	if lockHeld {
+		v.publish("vm.restart.deferred", vm.Name,
+			"another operation holds the VM's lock; the restart policy retries next pass, no attempt used")
+		return
+	}
 	if !started {
 		return
 	}

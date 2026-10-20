@@ -165,6 +165,7 @@ var explicitPolicyDefs = []explicitPolicyDef{
 	// The receiver additionally requires workload_create_begin_v1 before the
 	// exact statement is applied.
 	{SQL: vmCreateBeginSQL, Disposition: DispCreateBegin},
+	{SQL: vmSnapshotClaimSQL, Disposition: DispReject, RequiresCapability: capabilities.VMSnapshotClaimV1, DispositionAfter: DispSnapshotClaim},
 	{SQL: containerCreateBeginSQL, Disposition: DispCreateBegin},
 	// The terminal workload transition is the commit barrier for the preceding
 	// hardware/journal statements in the same mutation-log transaction. Its

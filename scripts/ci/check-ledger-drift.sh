@@ -69,7 +69,13 @@ if [[ -z "$base_fps" ]]; then
 	exit 0
 fi
 
-missing="$(comm -23 <(echo "$base_fps") <(fingerprints ""))"
+# Complete and check both producers before comparing. Bash process
+# substitutions are asynchronous children, not waited process owners.
+ledger_tmp="$(mktemp -d)"
+trap 'rm -rf -- "$ledger_tmp"' EXIT
+printf '%s\n' "$base_fps" >"$ledger_tmp/base"
+fingerprints "" >"$ledger_tmp/head"
+missing="$(comm -23 "$ledger_tmp/base" "$ledger_tmp/head")"
 if [[ -n "$missing" ]]; then
 	echo "ledger-drift: fingerprints present at ${mergebase} are GONE from HEAD's ledgers:"
 	echo "$missing" | sed 's/^/  /'

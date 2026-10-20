@@ -595,7 +595,9 @@ type Client struct {
 	// is in flight, acceptance must never be revoked — a flag-off restart would
 	// otherwise stall replication on an entry that is already out there. Nil/false ⇒
 	// reject the shape, which is every node that has not latched.
-	vmReplaceAccept func() bool
+	vmReplaceAccept       func() bool
+	vmSnapshotClaimAccept func() bool
+	vmSnapshotClaimEmit   func(context.Context) bool
 
 	// auditChain holds the in-flight tail of each audit sub-chain this client
 	// appends to, keyed by host_name. Per-client, not package-global: a global
@@ -695,6 +697,12 @@ func (c *Client) canonicalIdentityOn() bool {
 // comment). Nil-safe: unset ⇒ reject the guarded replace shape.
 func (c *Client) SetVMReplaceAccept(fn func() bool) { c.vmReplaceAccept = fn }
 
+// SetVMSnapshotClaimCapability separates durable retained-entry acceptance from
+// fresh all-recipient readiness. The daemon owns both predicates.
+func (c *Client) SetVMSnapshotClaimCapability(accept func() bool, emit func(context.Context) bool) {
+	c.vmSnapshotClaimAccept, c.vmSnapshotClaimEmit = accept, emit
+}
+
 // vmReplaceAcceptOn reports whether a replicated guarded VM-name replacement may be applied.
 func (c *Client) vmReplaceAcceptOn() bool {
 	return c.vmReplaceAccept != nil && c.vmReplaceAccept()
@@ -707,6 +715,8 @@ func (c *Client) vmReplaceAcceptOn() bool {
 // rejected outright (registry_creds.go).
 func (c *Client) capabilityActive(name string) bool {
 	switch name {
+	case capabilities.VMSnapshotClaimV1:
+		return c.vmSnapshotClaimAccept != nil && c.vmSnapshotClaimAccept()
 	case capabilities.CanonicalIdentityV1:
 		return c.canonicalIdentityOn()
 	case capabilities.VMReplaceV1:
@@ -1501,6 +1511,58 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 	return c.ExecuteEntriesGuarded(ctx, guard, [][]Statement{stmts})
 }
 
+// executeSnapshotClaim owns the ordinary replicated transaction for this
+// whole-entry protocol. Preparation, decision, writes and WAL share one tx.
+func (c *Client) executeSnapshotClaim(ctx context.Context, prepare func(*sql.Tx) ([]Statement, error)) (bool, error) {
+	if reason := c.quarantineReason(); reason != "" {
+		return false, errQuarantined(reason)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if reason := c.quarantineReason(); reason != "" {
+		return false, errQuarantined(reason)
+	}
+	if c.clock == nil {
+		return false, snapshotClaimUnavailable()
+	}
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	stmts, err := prepare(tx)
+	if err != nil {
+		return false, err
+	}
+	outcome, err := c.applySnapshotClaim(ctx, tx, stmts)
+	if err != nil {
+		return false, err
+	}
+	if outcome == snapshotClaimDuplicate {
+		return true, nil
+	}
+	if outcome != snapshotClaimApplied {
+		return false, snapshotClaimUnavailable()
+	}
+	raw, err := json.Marshal(stmts)
+	if err != nil {
+		return false, err
+	}
+	if err := refuseUnapplicableEntry(stmts, raw); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO mutation_log (hlc, origin, stmts, created_at) VALUES (?, ?, ?, ?)`,
+		c.clock.Now().String(), c.hostName, string(raw), nowRFC3339()); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	c.notifyReplicator()
+	return true, nil
+}
+
 // ExecuteEntriesGuarded is ExecuteBatchGuarded for a write that is ONE local
 // transaction but MORE THAN ONE replicated entry: every statement of every
 // entry commits (or none does) behind the one guard, and each non-empty entry
@@ -1809,6 +1871,13 @@ func refuseUnapplicableEntry(relay []Statement, stmtsJSON []byte) error {
 	var wire []Statement
 	if err := json.Unmarshal(stmtsJSON, &wire); err != nil {
 		return fmt.Errorf("decode own mutation entry: %w", err)
+	}
+	if isSnapshotClaimEntry(relay) {
+		var err error
+		wire, err = decodeSnapshotClaimStatements(string(stmtsJSON))
+		if err != nil {
+			return err
+		}
 	}
 	if err := validateGuardedMutationEntry(wire); err != nil {
 		return fmt.Errorf("refusing a write every peer would reject: %w", err)

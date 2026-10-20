@@ -117,6 +117,13 @@ func TestAutomationObserveRequiresCertifiedFrontier(t *testing.T) {
 // It supplies no fresh business ClaimAccept permit, provider, or reducer result.
 func observeRetainedHistoryFixture(t *testing.T, f *AutomationFixture, through uint64) {
 	t.Helper()
+	observeRetainedHistoryFixtureForRuntime(t, f, through, "project-alias", "legacy-domain")
+}
+
+// Only selectors/runtime facts vary; the retained certificate verification and
+// production Apply/Reduce path are identical to the original Observe fixture.
+func observeRetainedHistoryFixtureForRuntime(t *testing.T, f *AutomationFixture, through uint64, projectAlias, legacyDomainUUID string) {
+	t.Helper()
 	head := f.Head(t, 0)
 	cluster, parent := head.ClusterUID, head.Digest
 	appendDecision := func(d contract.Decision) {
@@ -171,6 +178,9 @@ func observeRetainedHistoryFixture(t *testing.T, f *AutomationFixture, through u
 	}
 	for i, kind := range []string{"project", "principal"} {
 		body := contract.IdentityEnrollment{Version: 1, Kind: kind, Alias: kind + "-alias", Witness: kind + "-source-lifetime", EvidenceID: "closed-cutover"}
+		if kind == "project" {
+			body.Alias = projectAlias
+		}
 		bodyJSON, _ := json.Marshal(body)
 		assignment := contract.Assignment{Version: 1, ClusterUID: cluster, OperationID: kind + "-op", RecordedAt: "2026-10-17T00:00:00Z", Identity: &contract.IdentityAssignment{UID: kind + "-uid", Generation: 1, Enrollment: &contract.IdentityEnrollmentFacts{Version: 1, EvidenceID: body.EvidenceID, ClusterUID: cluster, Kind: kind, Alias: body.Alias, Witness: body.Witness, CoverageDigest: strings.Repeat("b", 64), FenceSequence: 1}}}
 		assignmentJSON, _ := json.Marshal(assignment)
@@ -224,7 +234,7 @@ func observeRetainedHistoryFixture(t *testing.T, f *AutomationFixture, through u
 			if purpose == "source_owner" && source == nil {
 				continue
 			}
-			permission := contract.PermissionFacts{Purpose: purpose, PrincipalUID: command.PrincipalID, ClusterUID: command.ClusterUID, ProjectUID: command.ProjectUID, ProjectName: "project-alias", Verb: "vm.update", EvidenceID: "permission-reference", CoverageDigest: strings.Repeat("e", 64), FenceSequence: seq - 1}
+			permission := contract.PermissionFacts{Purpose: purpose, PrincipalUID: command.PrincipalID, ClusterUID: command.ClusterUID, ProjectUID: command.ProjectUID, ProjectName: projectAlias, Verb: "vm.update", EvidenceID: "permission-reference", CoverageDigest: strings.Repeat("e", 64), FenceSequence: seq - 1}
 			switch purpose {
 			case "source_owner":
 				permission.OwnerID = source.Key.OwnerID
@@ -242,7 +252,7 @@ func observeRetainedHistoryFixture(t *testing.T, f *AutomationFixture, through u
 	ownership(10, "transfer_owner", "resource-uid", "machine", "rev:opaque-alpha", "incarnation", "create-op", "target-key", &contract.BindingReference{Key: contract.BindingKey{ClusterUID: cluster, ProjectUID: "project-uid", OwnerID: "owner", ManagementKey: "key"}, Generation: 1})
 	migration := contract.IdentityEnrollment{Version: 1, Kind: "vm", Alias: "legacy-machine", Witness: "positive-legacy-witness", EvidenceID: "closed-cutover"}
 	encodedBody, _ := json.Marshal(migration)
-	migrationAssignment := contract.Assignment{Version: 1, ClusterUID: cluster, OperationID: "migration-op", RecordedAt: "2026-10-17T00:00:00Z", Identity: &contract.IdentityAssignment{UID: "legacy-uid", Generation: 1, Enrollment: &contract.IdentityEnrollmentFacts{Version: 1, EvidenceID: migration.EvidenceID, ClusterUID: cluster, ProjectUID: "project-uid", Kind: "vm", Alias: migration.Alias, Witness: migration.Witness, CoverageDigest: strings.Repeat("f", 64), FenceSequence: 1, VM: &contract.VMEnrollmentRuntime{Version: 1, DomainUUID: "legacy-domain", Incarnation: "legacy-incarnation", Revision: "legacy-revision"}}}}
+	migrationAssignment := contract.Assignment{Version: 1, ClusterUID: cluster, OperationID: "migration-op", RecordedAt: "2026-10-17T00:00:00Z", Identity: &contract.IdentityAssignment{UID: "legacy-uid", Generation: 1, Enrollment: &contract.IdentityEnrollmentFacts{Version: 1, EvidenceID: migration.EvidenceID, ClusterUID: cluster, ProjectUID: "project-uid", Kind: "vm", Alias: migration.Alias, Witness: migration.Witness, CoverageDigest: strings.Repeat("f", 64), FenceSequence: 1, VM: &contract.VMEnrollmentRuntime{Version: 1, DomainUUID: legacyDomainUUID, Incarnation: "legacy-incarnation", Revision: "legacy-revision"}}}}
 	encodedAssignment, _ := json.Marshal(migrationAssignment)
 	appendDecision(contract.Decision{Sequence: 11, Command: contract.Command{Kind: "assign_identity", ClusterUID: cluster, ProjectUID: "project-uid", PrincipalID: "host", RequestID: "migration-request", Body: encodedBody}, Assignment: encodedAssignment})
 	ownership(12, "adopt_resource", "legacy-uid", "legacy-machine", "legacy-revision", "legacy-incarnation", "migration-op", "legacy-key", nil)

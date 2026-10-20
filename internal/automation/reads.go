@@ -9,6 +9,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/automation/contract"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 var errAbsent = errors.New("automation: authoritatively absent")
@@ -69,6 +70,24 @@ func (e *Engine) Observe(ctx context.Context, uid string, min uint64) (View, err
 	}
 	return view, nil
 }
+
+// ObserveName consumes a complete certified projection after a fresh barrier.
+// Recorded facts supply no authority for ordinary runtime or storage effects.
+func (e *Engine) ObserveName(ctx context.Context, name string, min uint64) (corrosion.AutomationNameObservation, error) {
+	if len(name) > contract.MaxStringBytes || !utf8.ValidString(name) || strings.IndexByte(name, 0) >= 0 || safename.ValidateVMName(name) != nil || min > math.MaxInt64 {
+		return corrosion.AutomationNameObservation{}, fail(CodeValidation)
+	}
+	if err := e.enter(ctx); err != nil {
+		return corrosion.AutomationNameObservation{}, err
+	}
+	defer e.leave()
+	barrier, err := e.readBarrier(ctx, min)
+	if err != nil {
+		return corrosion.AutomationNameObservation{}, err
+	}
+	return e.db.AutomationObserveName(ctx, barrier.ClusterUID, name, barrier.Sequence)
+}
+
 func (e *Engine) Operation(ctx context.Context, id string) (Receipt, error) {
 	if err := e.enter(ctx); err != nil {
 		return Receipt{}, err

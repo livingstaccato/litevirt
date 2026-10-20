@@ -1441,6 +1441,26 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 			"origin", entry.Origin, "seq", entry.Seq)
 		return fmt.Errorf("mutation entry has no statements (origin=%s seq=%d)", entry.Origin, entry.Seq)
 	}
+	if isSnapshotClaimEntry(stmts) {
+		var err error
+		stmts, err = decodeSnapshotClaimStatements(entry.Stmts)
+		if err != nil {
+			return err
+		}
+		outcome, err := r.client.applySnapshotClaim(ctx, tx, stmts)
+		if err != nil {
+			r.client.observeMergeRejected("vms", "wal", "snapshot_claim")
+			return fmt.Errorf("snapshot claim (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+		}
+		if outcome != snapshotClaimApplied {
+			origin, seq, reason := entry.Origin, entry.Seq, string(outcome)
+			r.client.deferAfterCommit(tx, func() {
+				slog.Info("replicator: snapshot claim consumed without claim writes",
+					"origin", origin, "seq", seq, "reason", reason)
+			})
+		}
+		return nil
+	}
 	if err := validateReceivedMutationEntry(stmts); err != nil {
 		r.client.observeMergeRejected("unknown", "wal", "guard")
 		return fmt.Errorf("validate guarded mutation entry (origin=%s seq=%d): %w",
@@ -2509,6 +2529,10 @@ func legacyAtomicRelocationEntry(stmts []Statement) ([]Statement, bool) {
 }
 
 func validateGuardedMutationEntry(stmts []Statement) error {
+	if isSnapshotClaimEntry(stmts) {
+		_, err := validateSnapshotClaimEntry(stmts)
+		return err
+	}
 	for _, s := range stmts {
 		if s.Guard != nil && s.Guard.Protocol == userIncarnationGuardV1 {
 			return validateUserIncarnationEntry(stmts)

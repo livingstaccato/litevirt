@@ -274,6 +274,7 @@ func TestTokenIncarnation_AnUnlatchedNodeTakesNoStaleTokenByAntiEntropy(t *testi
 func TestTokenIncarnation_AnUnlatchedNodeDropsItsStaleTokenWhenTheAccountMoves(t *testing.T) {
 	ctx := context.Background()
 	lag, u := newTestDB(t), newTestDB(t)
+	lag.SetCredentialsSplitGate(func() bool { return true })
 	if err := InsertUser(ctx, lag, "carol", "operator", "h"); err != nil {
 		t.Fatal(err)
 	}
@@ -301,6 +302,98 @@ func TestTokenIncarnation_AnUnlatchedNodeDropsItsStaleTokenWhenTheAccountMoves(t
 	}
 	if rows, _ := lag.Query(ctx, `SELECT id FROM tokens WHERE id = 't-stale' AND deleted_at IS NULL`); len(rows) != 0 {
 		t.Error("lag still holds the deleted carol's token live after taking the new carol")
+	}
+	if rows, _ := lag.Query(ctx, `SELECT token_id FROM token_credentials WHERE token_id = 't-stale'`); len(rows) != 0 {
+		t.Error("lag dropped the stale token but kept its credential")
+	}
+}
+
+// Review M2: a peer's revoke of a token is always taken, even of a token
+// issued to an incarnation the name has left here and even from a sender
+// that holds an older account: a revoke only takes access away. The live
+// row here models one an intermediate build left (unstamped, on an account a
+// latched writer made).
+func TestTokenIncarnation_APeersRevokeOfAStaleTokenIsTaken(t *testing.T) {
+	ctx := context.Background()
+	lag, u := newTestDB(t), newTestDB(t)
+	if err := InsertUser(ctx, lag, "carol", "operator", "h"); err != nil {
+		t.Fatal(err)
+	}
+	if err := u.MergeStateBytesLWW(lag.DumpStateBytes()); err != nil {
+		t.Fatal(err)
+	}
+	u.SetUserIncarnationGate(func() bool { return true })
+	recreateUser(t, u, "carol")
+	const old = "2000-01-01T00:00:00Z"
+	for _, c := range []*Client{lag, u} {
+		if _, err := c.db.Exec(`INSERT INTO tokens (id, username, name, token_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+			"t-stale", "carol", "n", "x", old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := RevokeToken(ctx, lag, "t-stale"); err != nil {
+		t.Fatal(err)
+	}
+	if err := u.MergeStateBytesLWW(lag.DumpStateBytes()); err != nil {
+		t.Fatal(err)
+	}
+	if got := oneString(t, u, `SELECT COALESCE(deleted_at, '') AS d FROM tokens WHERE id = 't-stale'`, "d"); got == "" {
+		t.Error("a peer's revoke of a stale token was refused; the token stays live here")
+	}
+}
+
+// Review M1: a node that has not latched re-creates a deleted name as a NEW
+// incarnation once it holds any account a latched writer made (every host
+// then decodes the form), so a token of the deleted account never opens the
+// new one. Without that evidence it writes the previous release's re-create.
+func TestTokenIncarnation_AnUnlatchedRecreateIsANewIncarnationOnceAnyNodeLatched(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name     string
+		evidence bool
+	}{{"no latched account here", false}, {"another account a latched writer made", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newTestDB(t)
+			var on bool
+			c.SetUserIncarnationGate(func() bool { return on })
+			if err := InsertUser(ctx, c, "carol", "operator", "h"); err != nil {
+				t.Fatal(err)
+			}
+			if tc.evidence {
+				on = true
+				if err := InsertUser(ctx, c, "dave", "operator", "h"); err != nil {
+					t.Fatal(err)
+				}
+				on = false
+			}
+			if err := InsertToken(ctx, c, TokenRecord{ID: "t-old", Username: "carol", Name: "n", TokenHash: mustBcrypt(t, tokRawA)}); err != nil {
+				t.Fatal(err)
+			}
+			old := userCreatedAt(t, c, "carol")
+			if err := DeleteUser(ctx, c, "carol"); err != nil {
+				t.Fatal(err)
+			}
+			if err := InsertUser(ctx, c, "carol", "operator", "h2"); err != nil {
+				t.Fatal(err)
+			}
+			cur := userCreatedAt(t, c, "carol")
+			if tc.evidence && (cur == old || !latchedIncarnation(cur)) {
+				t.Fatalf("the re-create kept the incarnation (%q -> %q)", old, cur)
+			}
+			if !tc.evidence && cur != old {
+				t.Fatalf("with no latched writer anywhere, the re-create changed created_at (%q -> %q): a previous-release peer cannot decode it", old, cur)
+			}
+			if !tc.evidence {
+				return
+			}
+			// The old carol's token, live again as a lagging node would hold it.
+			if _, err := c.db.Exec(`UPDATE tokens SET deleted_at = NULL WHERE id = 't-old'`); err != nil {
+				t.Fatal(err)
+			}
+			if u, err := ValidateToken(ctx, c, tokRawA); err != nil || u != nil {
+				t.Errorf("the deleted carol's token opens the new one: %+v, %v", u, err)
+			}
+		})
 	}
 }
 
@@ -337,7 +430,10 @@ func TestTokenIncarnation_AStaleReplicatedInsertIsSkipped(t *testing.T) {
 	applyRemote(t, c, "2999000000001-0000-peer", tok("t-old", old)...)
 	applyRemote(t, c, "2999000000002-0000-peer", tok("t-unstamped", "")...)
 	applyRemote(t, c, "2999000000003-0000-peer", tok("t-own", cur)...)
-	for id, want := range map[string]bool{"t-old": false, "t-unstamped": false, "t-own": true} {
+	// A token for an incarnation this node has not reached yet is kept: it
+	// opens nothing until the users row arrives, and is the new account's own.
+	applyRemote(t, c, "2999000000004-0000-peer", tok("t-ahead", "2999-01-01T00:00:00.5Z")...)
+	for id, want := range map[string]bool{"t-old": false, "t-unstamped": false, "t-own": true, "t-ahead": true} {
 		if got := has(`SELECT id FROM tokens WHERE id = ?`, id); got != want {
 			t.Errorf("%s: token row present = %v, want %v", id, got, want)
 		}
@@ -377,5 +473,32 @@ func TestTokenIncarnation_TheDumpLeavesOutAnUnsetStamp(t *testing.T) {
 	}
 	if !has() {
 		t.Fatal("a set user_created_at column is missing from the dump")
+	}
+}
+
+// Review M1, the admin floor: a node that has not latched reinstates a
+// deleted admin as a new incarnation too, once any node has latched.
+func TestTokenIncarnation_AnUnlatchedReinstatementIsANewIncarnationOnceAnyNodeLatched(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	var on bool
+	c.SetUserIncarnationGate(func() bool { return on })
+	if err := InsertUser(ctx, c, "root", "admin", "$2a$10$root"); err != nil {
+		t.Fatal(err)
+	}
+	on = true
+	if err := InsertUser(ctx, c, "dave", "viewer", "h"); err != nil {
+		t.Fatal(err)
+	}
+	on = false
+	old := userCreatedAt(t, c, "root")
+	if err := DeleteUser(ctx, c, "root"); err != nil {
+		t.Fatal(err)
+	}
+	if who, err := ReinstateAdminIfNoneRemain(ctx, c, nil); err != nil || who != "root" {
+		t.Fatalf("ReinstateAdminIfNoneRemain = %q, %v", who, err)
+	}
+	if cur := userCreatedAt(t, c, "root"); cur == old || !latchedIncarnation(cur) {
+		t.Errorf("the reinstatement kept the incarnation (%q -> %q)", old, cur)
 	}
 }

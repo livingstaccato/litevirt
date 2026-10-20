@@ -96,7 +96,14 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 			oldColumn = c.oldColumnValue(passwordHash)
 		}
 		reactivate := Statement{SQL: usersReactivateSQL, Params: []interface{}{role, oldColumn, ts, username}}
-		if c.UserIncarnationOn() {
+		// A node that has not latched yet makes a new incarnation too once
+		// any node has (incarnationFormsDecodable): otherwise the deleted
+		// account's tokens would open the new one.
+		newInc, err := c.incarnationFormsDecodable(ctx, created)
+		if err != nil {
+			return err
+		}
+		if newInc {
 			created = c.newIncarnation(created)
 			reactivate = Statement{SQL: usersReactivateIncarnationSQL, Params: []interface{}{role, oldColumn, created, ts, username}}
 		}
@@ -870,15 +877,17 @@ func reinstateAdminStatements(ctx context.Context, c *Client, g capabilities.Fea
 	// incarnation, which replaces the tombstone on every node
 	// (user_incarnation.go).
 	reinstate := Statement{SQL: usersReactivateSQL, Params: []interface{}{"admin", c.oldColumnValue(hash), now, victim}}
-	if c.UserIncarnationOn() {
-		prev, err := c.Query(ctx, `SELECT created_at FROM users WHERE username = ?`, victim)
-		if err != nil {
-			return nil, err
-		}
-		created := ""
-		if len(prev) > 0 {
-			created = prev[0].String("created_at")
-		}
+	prev, err := c.Query(ctx, `SELECT created_at FROM users WHERE username = ?`, victim)
+	if err != nil {
+		return nil, err
+	}
+	created := ""
+	if len(prev) > 0 {
+		created = prev[0].String("created_at")
+	}
+	if newInc, err := c.incarnationFormsDecodable(ctx, created); err != nil {
+		return nil, err
+	} else if newInc {
 		reinstate = Statement{SQL: usersReactivateIncarnationSQL, Params: []interface{}{"admin", c.oldColumnValue(hash), c.newIncarnation(created), now, victim}}
 	}
 	stmts := []Statement{reinstate}

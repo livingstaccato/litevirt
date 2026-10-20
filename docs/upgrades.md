@@ -1612,11 +1612,14 @@ account's tokens and sessions it holds. An API token names the account it
 was issued to, and authenticates only that account: a token of the deleted
 account never opens the new one, on any host, however it got there. A token
 issued before the roll keeps working until its account is deleted and
-created again. This holds for an account created again once any host has
-latched the token. One deleted and created again before any host has latched
-it is still the same account to the cluster, and keeps the old account's
-tokens: revoke them with `lv user token-revoke <token-id>`, or create the
-account again once the token has latched. A write to an account that is deleted
+created again. This holds when the host that runs `lv user create` has
+latched the token itself, or holds an account that a host which had latched
+it created. An account deleted and created again on a host that meets
+neither is still the same account to the cluster, and keeps the old account's
+tokens, including one a lagging host minted for it after the re-create. To
+end them once the token has latched (below), run `lv user delete <username>`
+and then `lv user create <username>`: the delete revokes the account's
+tokens, and the account created after it is a new incarnation. A write to an account that is deleted
 or re-created while the write is being made fails and changes nothing; run it
 again. A second factor, a disable or an earlier expiry that reaches a host
 before the account it belongs to does is applied there at once, and taken

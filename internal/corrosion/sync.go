@@ -581,13 +581,13 @@ func (c *Client) dumpTable(table string) (syncTable, bool) {
 	return withoutUnsetIncarnation(st), true
 }
 
-// withoutUnsetIncarnation leaves projects.incarnation and
-// project_quotas.incarnation out of a dump while every row's value is ”
-// (schema v71): a previous-release node, which does not know the column,
-// then still takes the table's rows by anti-entropy during the roll. A
-// receiver of this build merges such a row without touching its own value.
+// withoutUnsetIncarnation leaves projects.incarnation out of a dump while
+// every row's value is empty (schema v71): a previous-release node, which
+// does not know the column, then still takes the table's rows by
+// anti-entropy during the roll. A receiver of this build keeps its own row
+// over such a row when its own carries an incarnation (projectsDumpDecision).
 func withoutUnsetIncarnation(st syncTable) syncTable {
-	if st.Name != "projects" && st.Name != "project_quotas" {
+	if st.Name != "projects" {
 		return st
 	}
 	at := indexOf(st.Columns, "incarnation")

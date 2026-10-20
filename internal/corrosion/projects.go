@@ -437,8 +437,8 @@ func commitProjectLifecycle(ctx context.Context, c *Client, kind projectLifecycl
 	// A birth over a tombstone of the name (this spelling's or another's) is a
 	// new incarnation once project_incarnation_v1 has latched, or once a row
 	// of the name carries one, written with the row in this transaction
-	// (project_incarnation.go). The quota reset names it too; a delete's names
-	// the incarnation it ends.
+	// (project_incarnation.go). Its quota is keyed by it, so the old one's
+	// needs no reset: no incarnation ever reads it again.
 	states, err := loadProjectStates(ctx, c)
 	if err != nil {
 		return false, err
@@ -446,21 +446,7 @@ func commitProjectLifecycle(ctx context.Context, c *Client, kind projectLifecycl
 	canonName, _ := safename.CanonicalProjectName(name)
 	incarnations := c.ProjectIncarnationOn() || states[canonName].carried()
 	born := newProjectIncarnation(false)
-	quotaInc := born
-	if kind == lifecycleDelete {
-		var cur string
-		if r, err := c.Query(ctx, `SELECT incarnation FROM projects WHERE name = ?`, name); err == nil && len(r) > 0 {
-			cur = r[0].String("incarnation")
-		}
-		quotaInc = cur
-	}
-	switch {
-	case q != nil && incarnations:
-		stmts = append(stmts, Statement{
-			SQL:    projectQuotaUpsertIncarnationSQL,
-			Params: []interface{}{name, 0, 0, 0, 0, 0, 0, quotaInc, c.NowTS()},
-		})
-	case q != nil:
+	if q != nil && !incarnations {
 		stmts = append(stmts, Statement{
 			SQL:    projectQuotaUpsertSQL,
 			Params: []interface{}{name, 0, 0, 0, 0, 0, 0, c.NowTS()},
@@ -727,27 +713,28 @@ const projectQuotaUpsertSQL = `INSERT INTO project_quotas
 		   updated_at       = excluded.updated_at`
 
 // GetProjectQuota returns the quota row or nil if unset. The default
-// project has no quotas (every limit = 0 = unbounded) — returns nil.
+// project has no quotas (every limit = 0 = unbounded) — returns nil. A live
+// project reads the quota of the incarnation it holds (projectQuotaKey), so
+// a re-created project starts with none, as a new project does, and never
+// reads the old one's (project_incarnation.go).
 func GetProjectQuota(ctx context.Context, c *Client, name string) (*ProjectQuotaRecord, error) {
+	inc, _, err := projectQuotaIncarnation(ctx, c, name)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := c.Query(ctx,
 		`SELECT project_name, vcpu_limit, mem_mib_limit, disk_gib_limit,
-		        nic_limit, public_ip_limit, backup_gib_limit, incarnation
-		 FROM project_quotas WHERE project_name = ?`, name)
+		        nic_limit, public_ip_limit, backup_gib_limit
+		 FROM project_quotas WHERE project_name = ?`, projectQuotaKey(name, inc))
 	if err != nil {
 		return nil, err
 	}
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	// A quota set for another incarnation of the project is not this
-	// project's: it starts with none, as a new project does
-	// (project_incarnation.go).
-	if own, err := projectQuotaEnforced(ctx, c, name, rows[0].String("incarnation")); err != nil || !own {
-		return nil, err
-	}
 	r := rows[0]
 	return &ProjectQuotaRecord{
-		ProjectName:    r.String("project_name"),
+		ProjectName:    name,
 		VCPULimit:      r.Int("vcpu_limit"),
 		MemMiBLimit:    r.Int("mem_mib_limit"),
 		DiskGiBLimit:   r.Int("disk_gib_limit"),

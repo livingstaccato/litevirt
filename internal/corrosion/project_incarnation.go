@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sort"
 	"strings"
@@ -50,12 +51,14 @@ import (
 // account keeps user_incarnation_v1's guard, under which a receiver that has
 // not reached the account holds the grant and replays it.
 //
-// A quota row names the incarnation it was set for too
-// (project_quotas.incarnation), and is enforced only while the project holds
-// it (GetProjectQuota). Its write carries a project_live guard, a receiver
-// that has taken a new incarnation drops the quota rows of other ones, and
-// anti-entropy never takes another incarnation's quota over the project's
-// own (projectQuotaDecision).
+// A quota is keyed by its project name and the incarnation it was set for
+// (projectQuotaKey: "<name>~p:<incarnation>"; the bare name for a project
+// born before the latch). A project reads only its own incarnation's row
+// (GetProjectQuota), so another incarnation's quota never displaces or
+// overrides it, by the WAL or anti-entropy, and the new incarnation's own
+// quota lands, whenever it arrives, on a row the project reads once it holds
+// that incarnation. A quota write carries no guard; its writer checks the
+// incarnation in its own transaction (ErrProjectChanged).
 //
 // A node writes these forms once project_incarnation_v1 has latched, and
 // also, before it has, for a project that already carries an incarnation:
@@ -82,9 +85,6 @@ func (c *Client) ProjectIncarnationOn() bool {
 
 const (
 	projectIncarnationGuardV1 = "project_incarnation_v1"
-	// projectGuardLive: the project is live and holds the guard's incarnation
-	// (a quota).
-	projectGuardLive = "project_live"
 	// projectGuardDeleted: the project is deleted, and its tombstone holds the
 	// guard's incarnation (the orphan reaper's authority retirement).
 	projectGuardDeleted = "project_deleted"
@@ -123,22 +123,6 @@ func newProjectIncarnation(first bool) string {
 // incarnation; the previous release's has no incarnation column.
 const projectsInsertIncarnationSQL = `INSERT INTO projects (name, display, parent_name, created_at, updated_at, incarnation)
 		 VALUES (?, ?, ?, ?, ?, ?)`
-
-// projectQuotaUpsertIncarnationSQL is projectQuotaUpsertSQL naming the
-// project incarnation the quota is set for.
-const projectQuotaUpsertIncarnationSQL = `INSERT INTO project_quotas
-		   (project_name, vcpu_limit, mem_mib_limit, disk_gib_limit,
-		    nic_limit, public_ip_limit, backup_gib_limit, incarnation, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(project_name) DO UPDATE SET
-		   vcpu_limit       = excluded.vcpu_limit,
-		   mem_mib_limit    = excluded.mem_mib_limit,
-		   disk_gib_limit   = excluded.disk_gib_limit,
-		   nic_limit        = excluded.nic_limit,
-		   public_ip_limit  = excluded.public_ip_limit,
-		   backup_gib_limit = excluded.backup_gib_limit,
-		   incarnation      = excluded.incarnation,
-		   updated_at       = excluded.updated_at`
 
 // projectFormsFor reports whether a write may use the incarnation-bearing
 // forms: once the gate is on, or when any of incs (the incarnations the rows
@@ -456,34 +440,82 @@ func insertProjectBinding(ctx context.Context, c *Client, proj, tag string, para
 // transaction.
 var projectWriteInterleaveHook func()
 
+// ErrNoLiveProject refuses a quota for a project with no live row once the
+// incarnation forms apply: there is no incarnation it could belong to.
+var ErrNoLiveProject = errors.New("project does not exist")
+
+// projectQuotaKey is the project_quotas key of a quota set for incarnation
+// inc of project name: the bare name for a project born before the latch
+// (”), as every quota was keyed before, and "<name>~p:<inc>" otherwise.
+func projectQuotaKey(name, inc string) string {
+	if inc == "" {
+		return name
+	}
+	return name + projectBindingTagSep + inc
+}
+
+// projectQuotaIncarnation is the incarnation of the live project name whose
+// quota a reader enforces, and whether the name is a live project of this
+// node's (a name that is not, such as _default, reads its bare key).
+func projectQuotaIncarnation(ctx context.Context, c *Client, name string) (string, bool, error) {
+	canon, err := safename.CanonicalProjectName(name)
+	if err != nil || canon == "/" {
+		return "", false, nil
+	}
+	states, err := loadProjectStates(ctx, c)
+	if err != nil {
+		return "", false, err
+	}
+	st := states[canon]
+	if st == nil || len(st.live) == 0 {
+		return "", false, nil
+	}
+	for i, n := range st.liveName {
+		if n == name {
+			return st.live[i], true, nil
+		}
+	}
+	return st.live[0], true, nil
+}
+
 // upsertProjectQuota writes a quota. Once the incarnation forms apply
-// (projectFormsFor), a live project's quota names the project's incarnation
-// and carries a project_live guard: ErrProjectChanged if the project is
-// re-created or deleted before the write. A quota of a project with no live
-// row is written in the previous form, which keeps a row's incarnation.
+// (projectFormsFor), it is keyed by the incarnation of the live project
+// (projectQuotaKey), in a transaction that requires the project still to
+// hold it (ErrProjectChanged); a project with no live row is refused
+// (ErrNoLiveProject). Before, the bare name is the key, as before the latch.
 func upsertProjectQuota(ctx context.Context, c *Client, q ProjectQuotaRecord, now string) error {
-	plain := []interface{}{q.ProjectName, q.VCPULimit, q.MemMiBLimit, q.DiskGiBLimit,
-		q.NICLimit, q.PublicIPLimit, q.BackupGiBLimit, now}
-	proj, err := safename.CanonicalProjectName(q.ProjectName)
-	if err != nil || proj == "/" {
-		return c.Execute(ctx, projectQuotaUpsertSQL, plain...)
+	canon, err := safename.CanonicalProjectName(q.ProjectName)
+	if err != nil || canon == "/" {
+		return c.Execute(ctx, projectQuotaUpsertSQL, q.ProjectName, q.VCPULimit, q.MemMiBLimit, q.DiskGiBLimit,
+			q.NICLimit, q.PublicIPLimit, q.BackupGiBLimit, now)
 	}
 	states, err := loadProjectStates(ctx, c)
 	if err != nil {
 		return err
 	}
-	st := states[proj]
-	if st == nil || len(st.live) == 0 || !c.projectFormsFor(st.live...) {
-		return c.Execute(ctx, projectQuotaUpsertSQL, plain...)
+	st := states[canon]
+	if !c.ProjectIncarnationOn() && !st.carried() {
+		return c.Execute(ctx, projectQuotaUpsertSQL, q.ProjectName, q.VCPULimit, q.MemMiBLimit, q.DiskGiBLimit,
+			q.NICLimit, q.PublicIPLimit, q.BackupGiBLimit, now)
 	}
-	inc := st.live[0]
-	g := &MutationGuard{Protocol: projectIncarnationGuardV1, ResourceKind: projectGuardLive, ResourceID: proj, Incarnation: inc}
+	inc, live, err := projectQuotaIncarnation(ctx, c, q.ProjectName)
+	if err != nil {
+		return err
+	}
+	if !live {
+		return fmt.Errorf("quota for project %q: %w", q.ProjectName, ErrNoLiveProject)
+	}
 	if h := projectWriteInterleaveHook; h != nil {
 		h()
 	}
-	applied, err := c.ExecuteBatchGuarded(ctx, func(*sql.Tx) (bool, error) { return true, nil },
-		[]Statement{{SQL: projectQuotaUpsertIncarnationSQL, Params: []interface{}{q.ProjectName, q.VCPULimit, q.MemMiBLimit,
-			q.DiskGiBLimit, q.NICLimit, q.PublicIPLimit, q.BackupGiBLimit, inc, now}, Guard: g}})
+	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		states, err := loadProjectStatesTx(ctx, tx)
+		if err != nil {
+			return false, err
+		}
+		return states[canon].liveIncarnation(inc), nil
+	}, []Statement{{SQL: projectQuotaUpsertSQL, Params: []interface{}{projectQuotaKey(q.ProjectName, inc),
+		q.VCPULimit, q.MemMiBLimit, q.DiskGiBLimit, q.NICLimit, q.PublicIPLimit, q.BackupGiBLimit, now}}})
 	if err != nil {
 		return err
 	}
@@ -494,10 +526,10 @@ func upsertProjectQuota(ctx context.Context, c *Client, q ProjectQuotaRecord, no
 }
 
 // projectIncarnationGuardMatches: the project (any spelling of the guard's
-// canonical name) is live at the guard's incarnation (projectGuardLive), or
-// deleted with a tombstone at it and no live spelling (projectGuardDeleted).
+// canonical name) is deleted, with a tombstone at the guard's incarnation and
+// no live spelling (projectGuardDeleted).
 func (c *Client) projectIncarnationGuardMatches(ctx context.Context, tx *sql.Tx, g *MutationGuard) (bool, error) {
-	if g.ResourceID == "" || g.TargetResourceID != "" {
+	if g.ResourceID == "" || g.TargetResourceID != "" || g.ResourceKind != projectGuardDeleted {
 		return false, invalidf("invalid project incarnation guard")
 	}
 	states, err := loadProjectStatesTx(ctx, tx)
@@ -505,13 +537,7 @@ func (c *Client) projectIncarnationGuardMatches(ctx context.Context, tx *sql.Tx,
 		return false, err
 	}
 	st := states[g.ResourceID]
-	switch g.ResourceKind {
-	case projectGuardLive:
-		return st.liveIncarnation(g.Incarnation), nil
-	case projectGuardDeleted:
-		return st != nil && len(st.live) == 0 && containsString(st.dead, g.Incarnation), nil
-	}
-	return false, invalidf("invalid project incarnation guard kind %q", g.ResourceKind)
+	return st != nil && len(st.live) == 0 && containsString(st.dead, g.Incarnation), nil
 }
 
 func containsString(list []string, s string) bool {
@@ -524,15 +550,14 @@ func containsString(list []string, s string) bool {
 }
 
 var (
-	fpRoleBindingInsert        = mustFingerprint(roleBindingInsertSQL)
-	fpProjectQuotaUpsertIncarn = mustFingerprint(projectQuotaUpsertIncarnationSQL)
-	fpRetireProjectAuthority   = mustFingerprint(retireProjectAuthoritySQL)
+	fpRoleBindingInsert      = mustFingerprint(roleBindingInsertSQL)
+	fpRetireProjectAuthority = mustFingerprint(retireProjectAuthoritySQL)
 )
 
 // validateProjectIncarnationEntry checks an entry whose statements carry
 // project_incarnation_v1 guards: no other protocol's guard beside them, and
-// each guarded statement one this protocol binds, naming the guard's project
-// (and, for a quota, its incarnation).
+// each guarded statement one this protocol binds (the orphan reaper's
+// authority retirement), naming the guard's project.
 func validateProjectIncarnationEntry(stmts []Statement) error {
 	for _, s := range stmts {
 		if s.Guard == nil {
@@ -557,10 +582,6 @@ func validateProjectIncarnationEntry(stmts []Statement) error {
 			return n
 		}
 		switch fp := stmtFingerprint(sh); {
-		case fp == fpProjectQuotaUpsertIncarn && g.ResourceKind == projectGuardLive && len(s.Params) == 9:
-			if canonOf(s.Params[0]) != g.ResourceID || coerceString(s.Params[7]) != g.Incarnation || g.TargetResourceID != "" {
-				return invalidf("project incarnation guard on a quota it does not bind")
-			}
 		case fp == fpRetireProjectAuthority && g.ResourceKind == projectGuardDeleted && len(s.Params) == 3:
 			if canonOf(s.Params[2]) != g.ResourceID || g.TargetResourceID != "" {
 				return invalidf("project incarnation guard on an authority retirement it does not bind")
@@ -614,114 +635,7 @@ func settleProjectName(ctx context.Context, tx *sql.Tx, name, before string) err
 	if after == before || after == projectNoRow {
 		return nil
 	}
-	if err := dropOtherIncarnationQuotas(ctx, tx, name); err != nil {
-		return err
-	}
 	return retireOlderProjectGrants(ctx, tx, name)
-}
-
-// dropOtherIncarnationQuotas removes, on this node, the quota rows of the
-// project of name that were set for an incarnation the project's live row
-// does not hold: a lagging node's quota for the old project, which a later
-// clock would otherwise keep over the new project's own. The new project's
-// quota, written for its incarnation, lands on no row or on its own. Hard
-// deletes are local: anti-entropy does not bring the rows back
-// (projectQuotaDecision).
-func dropOtherIncarnationQuotas(ctx context.Context, tx *sql.Tx, name string) error {
-	canon, err := safename.CanonicalProjectName(name)
-	if err != nil || canon == "/" {
-		return nil
-	}
-	states, err := loadProjectStatesTx(ctx, tx)
-	if err != nil {
-		return err
-	}
-	st := states[canon]
-	if st == nil || len(st.live) == 0 {
-		return nil
-	}
-	rows, err := tx.QueryContext(ctx, `SELECT project_name, incarnation FROM project_quotas`)
-	if err != nil {
-		return err
-	}
-	var drop []string
-	for rows.Next() {
-		var pn, inc string
-		if err := rows.Scan(&pn, &inc); err != nil {
-			rows.Close()
-			return err
-		}
-		if pc, err := safename.CanonicalProjectName(pn); err == nil && pc == canon && !st.liveIncarnation(inc) {
-			drop = append(drop, pn)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
-	for _, pn := range drop {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM project_quotas WHERE project_name = ? -- full-state-delete-ok: a quota of another incarnation of the project, local only`, pn); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// projectQuotaEnforced reports whether a quota row set for incarnation inc
-// of project name is the project's own: the project is not live (nothing
-// to compare it with), or its live row holds inc.
-func projectQuotaEnforced(ctx context.Context, c *Client, name, inc string) (bool, error) {
-	canon, err := safename.CanonicalProjectName(name)
-	if err != nil || canon == "/" {
-		return true, nil
-	}
-	states, err := loadProjectStates(ctx, c)
-	if err != nil {
-		return false, err
-	}
-	st := states[canon]
-	return st == nil || len(st.live) == 0 || st.liveIncarnation(inc), nil
-}
-
-// projectQuotaDecision is anti-entropy's order for a project_quotas row once
-// the receiver's project of that name is live: a row of the project's own
-// incarnation beats one of another, whatever their clocks, and an incoming
-// row of another incarnation is never taken. Otherwise the clock decides. A
-// dump without the column (a previous release's) is merged by clock.
-func projectQuotaDecision(tx *sql.Tx, table syncTable, row []interface{}) (mergeAuthorityDecision, error) {
-	idx := columnIndexMap(table.Columns)
-	if _, ok := idx["incarnation"]; !ok {
-		return mergeAuthorityNormal, nil
-	}
-	name, incoming := cellStr(row, idx, "project_name"), cellStr(row, idx, "incarnation")
-	canon, err := safename.CanonicalProjectName(name)
-	if err != nil || canon == "/" {
-		return mergeAuthorityNormal, nil
-	}
-	states, err := loadProjectStatesTx(context.Background(), tx)
-	if err != nil {
-		return mergeAuthorityKeepLocal, err
-	}
-	st := states[canon]
-	if st == nil || len(st.live) == 0 {
-		return mergeAuthorityNormal, nil
-	}
-	if !st.liveIncarnation(incoming) {
-		return mergeAuthorityKeepLocal, nil
-	}
-	var local string
-	err = tx.QueryRow(`SELECT incarnation FROM project_quotas WHERE project_name = ?`, name).Scan(&local)
-	if errors.Is(err, sql.ErrNoRows) {
-		return mergeAuthorityNormal, nil
-	}
-	if err != nil {
-		return mergeAuthorityKeepLocal, err
-	}
-	if !st.liveIncarnation(local) {
-		return mergeAuthorityApplyIncoming, nil
-	}
-	return mergeAuthorityNormal, nil
 }
 
 // retireOlderProjectGrants makes, on this node, every live binding under the
@@ -785,8 +699,8 @@ func retireOlderProjectGrants(ctx context.Context, tx *sql.Tx, name string) erro
 
 // createFirstBirth creates a project whose name no row spells, as a first
 // birth (projectFirstBirth), and then carries over to it the pre-grants its
-// creator holds for it (untagged or tagged none: granted while no row
-// existed): each is tombstoned and granted again, tagged with the new
+// creator holds for it (tagged none: granted, after this build latched,
+// while no row existed): each is tombstoned and granted again, tagged with the new
 // incarnation, in a transaction of its own that requires the project still
 // to hold that incarnation and the pre-grant still to be live. One
 // transaction per binding, so each names one account (user_incarnation_v1).
@@ -824,7 +738,10 @@ func createFirstBirth(ctx context.Context, c *Client, p ProjectRecord) (bool, er
 		if proj, ok := projectOfRBACPath(r.String("path")); !ok || proj != canon {
 			continue
 		}
-		if tag, tagged := projectBindingTag(id); tagged && tag != projectTagNone {
+		// Only a pre-grant this build tagged none; an untagged binding may
+		// be an earlier lifetime's, granted before the latch, whose row this
+		// node never held. It stays held.
+		if tag, tagged := projectBindingTag(id); !tagged || tag != projectTagNone {
 			continue
 		}
 		if _, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
@@ -845,4 +762,29 @@ func createFirstBirth(ctx context.Context, c *Client, p ProjectRecord) (bool, er
 		}
 	}
 	return true, nil
+}
+
+// projectsDumpDecision keeps a local projects row that carries an
+// incarnation over an incoming row of a dump without the column. Such a dump
+// comes from a node whose every row has none (withoutUnsetIncarnation): it
+// has never held a birth made after the latch, so its row is of an earlier
+// lifetime of the name, whatever its clock says. Any other row is merged as
+// before.
+func projectsDumpDecision(tx *sql.Tx, table syncTable, row []interface{}) (mergeAuthorityDecision, error) {
+	idx := columnIndexMap(table.Columns)
+	if _, ok := idx["incarnation"]; ok {
+		return mergeAuthorityNormal, nil
+	}
+	var local string
+	err := tx.QueryRow(`SELECT incarnation FROM projects WHERE name = ?`, cellStr(row, idx, "name")).Scan(&local)
+	if errors.Is(err, sql.ErrNoRows) {
+		return mergeAuthorityNormal, nil
+	}
+	if err != nil {
+		return mergeAuthorityKeepLocal, err
+	}
+	if local != "" {
+		return mergeAuthorityKeepLocal, nil
+	}
+	return mergeAuthorityNormal, nil
 }

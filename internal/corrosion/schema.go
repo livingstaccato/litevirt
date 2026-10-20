@@ -576,13 +576,12 @@ import (
 //	     project_incarnation_v1 has latched, and never changed otherwise. ''
 //	     on every row born before it. A role binding under a project's RBAC
 //	     path names the incarnation it was granted for, and grants only while
-//	     the project holds that incarnation. project_quotas.incarnation (TEXT
-//	     NOT NULL DEFAULT '') is the incarnation a quota was set for; a quota
-//	     is enforced only while the project holds it. Both columns are left
-//	     out of a node's anti-entropy dump while every value of them is '',
-//	     so a previous-release node takes this build's rows until the first
+//	     the project holds that incarnation; a quota is keyed by it
+//	     ("<name>~p:<incarnation>", no schema change). The column is left out
+//	     of a node's anti-entropy dump while every value of it is '', so a
+//	     previous-release node takes this build's rows until the first
 //	     latched birth (and none is made before the latch); the statements
-//	     that write them are emitted only after the latch, or for a row that
+//	     that write it are emitted only after the latch, or for a row that
 //	     already carries an incarnation. Appended LAST for the v53 digest
 //	     reason. Additive.
 const CurrentSchemaVersion = 71
@@ -2643,8 +2642,7 @@ var schemaDDL = []string{
 		nic_limit         INTEGER NOT NULL DEFAULT 0,
 		public_ip_limit   INTEGER NOT NULL DEFAULT 0,
 		backup_gib_limit  INTEGER NOT NULL DEFAULT 0,
-		updated_at        TEXT NOT NULL,
-		incarnation       TEXT NOT NULL DEFAULT ''  -- v71: the project incarnation the quota was set for
+		updated_at        TEXT NOT NULL
 	)`,
 
 	// snapshot scheduler. One row per (vm, repo) pair; the
@@ -3563,9 +3561,6 @@ var schemaMigrations = []string{
 	`ALTER TABLE security_groups ADD COLUMN project TEXT NOT NULL DEFAULT ''`,
 	// The project incarnation (see History, schemaVersionProjectIncarnation).
 	`ALTER TABLE projects ADD COLUMN incarnation TEXT NOT NULL DEFAULT ''`,
-	// The incarnation a project quota was set for (see History,
-	// schemaVersionProjectIncarnation).
-	`ALTER TABLE project_quotas ADD COLUMN incarnation TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -3662,7 +3657,6 @@ var alterVersions = []int{
 	schemaVersionHostIncarnation,      // hosts.incarnation
 	schemaVersionSGProjects,           // security_groups.project
 	schemaVersionProjectIncarnation,   // projects.incarnation
-	schemaVersionProjectIncarnation,   // project_quotas.incarnation
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

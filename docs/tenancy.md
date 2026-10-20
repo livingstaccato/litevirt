@@ -64,7 +64,8 @@ first exists carries over to the project when the host that creates it holds
 the grant, under a new binding id; one that reaches the project later from
 another host is held. A quota set with `lv project quota` belongs to the
 project it was set for in the same way: a re-created project never enforces
-the old one's quota, and starts without one. A grant or quota made while its
+the old one's quota, and starts without one; and a quota is set only on a
+project that exists. A grant or quota made while its
 project is deleted or re-created fails and changes nothing; run it again. The re-created project
 keeps the old display name and parent, so a re-create with a different
 `--display` or `--parent` is refused; repeat the old display, or pass none.

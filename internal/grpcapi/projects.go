@@ -4,6 +4,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strings"
 
@@ -111,6 +112,9 @@ func (s *Server) SetProjectQuota(ctx context.Context, req *pb.SetProjectQuotaReq
 		BackupGiBLimit: int(req.Quota.BackupGibLimit),
 	}
 	if err := corrosion.UpsertProjectQuota(ctx, s.db, q); err != nil {
+		if errors.Is(err, corrosion.ErrNoLiveProject) {
+			return nil, status.Errorf(codes.NotFound, "project %q does not exist; create it before setting its quota", q.ProjectName)
+		}
 		return nil, userWriteStatus(err, "upsert quota")
 	}
 	s.audit(ctx, "project.quota.set", q.ProjectName, "", "ok")

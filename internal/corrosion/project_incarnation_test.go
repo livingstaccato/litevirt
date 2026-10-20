@@ -314,8 +314,8 @@ func TestProjectIncarnation_AWriteTheProjectMovedUnderIsRefused(t *testing.T) {
 	}
 }
 
-// Writes carry the guard a receiver checks. A quota carries project_live and
-// names its incarnation. A grant carries no project guard, and a grant to a
+// Writes carry the guard a receiver checks. A quota carries none: it is keyed
+// by its incarnation (review round 2). A grant carries no project guard, and a grant to a
 // local account keeps user_incarnation_v1's (user_live), so a receiver that
 // has not reached the account holds and replays it (review M1). A NoAccess
 // binding carries user_tighten. With the gate closed nothing is tagged.
@@ -350,9 +350,9 @@ func TestProjectIncarnation_WritesCarryTheirGuard(t *testing.T) {
 		userInc = rows[0].String("created_at")
 	}
 	want := map[string]string{
-		grant:    userIncarnationGuardV1 + " " + userGuardLive + " bob " + userInc,
-		sentinel: userIncarnationGuardV1 + " " + userGuardTighten + " bob " + userInc,
-		"/p":     projectIncarnationGuardV1 + " " + projectGuardLive + " /p " + inc,
+		grant:                      userIncarnationGuardV1 + " " + userGuardLive + " bob " + userInc,
+		sentinel:                   userIncarnationGuardV1 + " " + userGuardTighten + " bob " + userInc,
+		projectQuotaKey("/p", inc): "",
 	}
 	for k, w := range want {
 		if guards[k] != w {
@@ -370,8 +370,8 @@ func TestProjectIncarnation_WritesCarryTheirGuard(t *testing.T) {
 }
 
 // loggedGuards reads c's mutation log: for each role binding insert (by id)
-// and quota upsert (by project) its guard as "protocol kind resource
-// incarnation", or "" for none. A quota also checks its incarnation column.
+// and quota upsert (by key) its guard as "protocol kind resource
+// incarnation", or "" for none.
 func loggedGuards(t *testing.T, c *Client) map[string]string {
 	t.Helper()
 	rows, err := c.Query(context.Background(), `SELECT stmts FROM mutation_log ORDER BY seq`)
@@ -393,11 +393,8 @@ func loggedGuards(t *testing.T, c *Client) map[string]string {
 			switch stmtFingerprint(sh) {
 			case fpRoleBindingInsert:
 				key = coerceString(s.Params[0])
-			case fpProjectQuotaUpsertIncarn:
+			case mustFingerprint(projectQuotaUpsertSQL):
 				key = coerceString(s.Params[0])
-				if s.Guard != nil && coerceString(s.Params[7]) != s.Guard.Incarnation {
-					t.Errorf("quota %s written for %q under a guard for %q", key, coerceString(s.Params[7]), s.Guard.Incarnation)
-				}
 			default:
 				continue
 			}
@@ -415,8 +412,7 @@ func loggedGuards(t *testing.T, c *Client) map[string]string {
 // A receiver's verdict on each guard kind, in its own transaction.
 //
 // Mutations: project_deleted matching a live project, or ignoring a live
-// spelling (review L4, m05) — red; project_live ignoring the incarnation —
-// red.
+// spelling (review L4, m05) — red.
 func TestProjectGuard_ReceiverVerdicts(t *testing.T) {
 	ctx := context.Background()
 	c := latchedProjectClient(t)
@@ -440,6 +436,9 @@ func TestProjectGuard_ReceiverVerdicts(t *testing.T) {
 		t.Fatal(err)
 	}
 	live, gone := projectIncarnationOf(t, c, "/live"), projectIncarnationOf(t, c, "/gone")
+	g0 := func(kind string) *MutationGuard {
+		return &MutationGuard{Protocol: projectIncarnationGuardV1, ResourceKind: kind, ResourceID: "/live", Incarnation: live}
+	}
 	g := func(kind, proj, inc string) *MutationGuard {
 		return &MutationGuard{Protocol: projectIncarnationGuardV1, ResourceKind: kind, ResourceID: proj, Incarnation: inc}
 	}
@@ -448,13 +447,11 @@ func TestProjectGuard_ReceiverVerdicts(t *testing.T) {
 		guard *MutationGuard
 		want  bool
 	}{
-		{"a quota for the live incarnation", g(projectGuardLive, "/live", live), true},
-		{"a quota for another incarnation", g(projectGuardLive, "/live", "r0"), false},
-		{"a quota for a deleted project", g(projectGuardLive, "/gone", gone), false},
 		{"a retirement of the tombstone held", g(projectGuardDeleted, "/gone", gone), true},
 		{"a retirement of another tombstone", g(projectGuardDeleted, "/gone", "r0"), false},
 		{"a retirement of a live project", g(projectGuardDeleted, "/live", live), false},
 		{"a retirement of a tombstone beside a live spelling", g(projectGuardDeleted, "/acme", acmeDead), false},
+		{"a kind this build no longer writes", g0("project_live"), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tx, err := c.db.Begin()
@@ -463,6 +460,12 @@ func TestProjectGuard_ReceiverVerdicts(t *testing.T) {
 			}
 			defer tx.Rollback()
 			got, err := c.mutationGuardMatches(ctx, tx, tc.guard)
+			if tc.guard.ResourceKind != projectGuardDeleted {
+				if err == nil {
+					t.Fatal("a non-retirement project guard was accepted")
+				}
+				return
+			}
 			if err != nil || got != tc.want {
 				t.Fatalf("matches = %v (err %v), want %v", got, err, tc.want)
 			}
@@ -471,37 +474,33 @@ func TestProjectGuard_ReceiverVerdicts(t *testing.T) {
 }
 
 // An entry is refused unless every project guard binds the statement it is
-// on: the project and the incarnation, and nothing mixed in. A grant takes no
-// project guard.
+// on (only the orphan reaper's authority retirement takes one), naming its
+// project, with nothing mixed in.
 //
 // Mutation: validateProjectIncarnationEntry returning nil — red.
 func TestValidateProjectIncarnationEntry(t *testing.T) {
 	pg := func(kind, proj, inc string) *MutationGuard {
 		return &MutationGuard{Protocol: projectIncarnationGuardV1, ResourceKind: kind, ResourceID: proj, Incarnation: inc}
 	}
-	quota := func(name, inc string, g *MutationGuard) Statement {
-		return Statement{SQL: projectQuotaUpsertIncarnationSQL, Params: []interface{}{name, 1, 0, 0, 0, 0, 0, inc, "ts"}, Guard: g}
-	}
-	ok := quota("/p", "r1", pg(projectGuardLive, "/p", "r1"))
+	ok := Statement{SQL: retireProjectAuthoritySQL, Params: []interface{}{"d", "ts", "p"}, Guard: pg(projectGuardDeleted, "/p", "")}
 	for _, tc := range []struct {
 		name  string
 		stmts []Statement
 		valid bool
 	}{
-		{"a quota it binds", []Statement{ok}, true},
-		{"a quota of another spelling", []Statement{quota("p", "r1", pg(projectGuardLive, "/p", "r1"))}, true},
-		{"a quota of another project", []Statement{quota("/q", "r1", pg(projectGuardLive, "/p", "r1"))}, false},
-		{"a quota for another incarnation", []Statement{quota("/p", "r2", pg(projectGuardLive, "/p", "r1"))}, false},
-		{"a quota with a retirement's kind", []Statement{quota("/p", "r1", pg(projectGuardDeleted, "/p", "r1"))}, false},
-		{"a quota naming an account", []Statement{func() Statement {
-			s := quota("/p", "r1", pg(projectGuardLive, "/p", "r1"))
-			s.Guard.TargetResourceID = "bob"
+		{"a retirement it binds", []Statement{ok}, true},
+		{"a retirement of another project", []Statement{{SQL: retireProjectAuthoritySQL, Params: []interface{}{"d", "ts", "q"}, Guard: pg(projectGuardDeleted, "/p", "")}}, false},
+		{"a retirement naming an account", []Statement{func() Statement {
+			s := ok
+			g := *ok.Guard
+			g.TargetResourceID = "bob"
+			s.Guard = &g
 			return s
 		}()}, false},
+		{"a quota", []Statement{{SQL: projectQuotaUpsertSQL, Params: []interface{}{"/p~p:r1", 1, 0, 0, 0, 0, 0, "ts"}, Guard: pg(projectGuardDeleted, "/p", "r1")}}, false},
 		{"a grant", []Statement{{SQL: roleBindingInsertSQL, Params: []interface{}{"x~p:r1", "/projects/p", "Operator", "group:ops", 1, "ts"},
-			Guard: pg(projectGuardLive, "/p", "r1")}}, false},
-		{"a retirement it binds", []Statement{{SQL: retireProjectAuthoritySQL, Params: []interface{}{"d", "ts", "p"}, Guard: pg(projectGuardDeleted, "/p", "")}}, true},
-		{"a statement it does not bind", []Statement{{SQL: roleBindingDeleteSQL, Params: []interface{}{"d", "ts", "x"}, Guard: pg(projectGuardLive, "/p", "r1")}}, false},
+			Guard: pg(projectGuardDeleted, "/p", "r1")}}, false},
+		{"a statement it does not bind", []Statement{{SQL: roleBindingDeleteSQL, Params: []interface{}{"d", "ts", "x"}, Guard: pg(projectGuardDeleted, "/p", "r1")}}, false},
 		{"mixed protocols", []Statement{ok, {SQL: roleBindingDeleteSQL, Params: []interface{}{"d", "ts", "x"},
 			Guard: &MutationGuard{Protocol: userIncarnationGuardV1, ResourceKind: userGuardLive, ResourceID: "bob", Incarnation: "t"}}}, false},
 	} {
@@ -593,8 +592,7 @@ func TestDeleteProject_TwoAccountsAfterTheUserLatch(t *testing.T) {
 // The guard kinds are a wire contract: a receiver refuses a kind it does not
 // know.
 func TestProjectGuardKinds_AreTheKnownOnes(t *testing.T) {
-	if projectIncarnationGuardV1 != "project_incarnation_v1" || projectGuardLive != "project_live" ||
-		projectGuardDeleted != "project_deleted" {
+	if projectIncarnationGuardV1 != "project_incarnation_v1" || projectGuardDeleted != "project_deleted" {
 		t.Fatal("a project guard's protocol or kind changed: receivers of the previous build refuse it")
 	}
 	c := latchedProjectClient(t)

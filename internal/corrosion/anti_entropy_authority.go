@@ -308,10 +308,10 @@ func (c *Client) antiEntropyAuthorityDecision(tx *sql.Tx, table syncTable, row [
 		// (user_incarnation.go).
 		return c.userIncarnationDecision(tx, table, row)
 	}
-	if table.Name == "project_quotas" {
-		// A quota of the project's own incarnation beats another's
-		// (project_incarnation.go).
-		return projectQuotaDecision(tx, table, row)
+	if table.Name == "projects" {
+		// A row of a sender that holds no incarnation never displaces one
+		// that does (project_incarnation.go).
+		return projectsDumpDecision(tx, table, row)
 	}
 	if userKeyedTables[table.Name] && c.UserIncarnationOn() {
 		// A row an older account of the name left on the sender is not this

@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -12,7 +13,8 @@ import (
 // this project.
 //
 // Mutations: no pre-grant carried — red at "carried"; a none tag granting on
-// a first birth — red at "late".
+// a first birth — red at "late"; untagged bindings carried too (round 2,
+// L1) — red at "untagged".
 func TestProjectIncarnation_AFirstBirthCarriesItsCreatorsPreGrants(t *testing.T) {
 	ctx := context.Background()
 	c := latchedProjectClient(t)
@@ -44,11 +46,13 @@ func TestProjectIncarnation_AFirstBirthCarriesItsCreatorsPreGrants(t *testing.T)
 	for _, b := range bs {
 		got[b.Principal+" "+b.Path] = b
 	}
-	for _, k := range []string{"user:alice@local /projects/new", "group:ops /projects/new/vms/x"} {
-		b, ok := got[k]
-		if !ok || b.Held || !strings.HasSuffix(b.ID, projectBindingTagSep+inc) {
-			t.Errorf("carried %s: %+v (present %v), want it granting, tagged %s", k, b, ok, inc)
-		}
+	if b, ok := got["user:alice@local /projects/new"]; !ok || b.Held || !strings.HasSuffix(b.ID, projectBindingTagSep+inc) {
+		t.Errorf("carried pre-grant: %+v (present %v), want it granting, tagged %s", b, ok, inc)
+	}
+	// An untagged binding may be an earlier lifetime's, from before the
+	// latch: it is not carried, and is held (review round 2, L1).
+	if b := got["group:ops /projects/new/vms/x"]; b.ID != "legacy" || !b.Held {
+		t.Errorf("untagged binding: %+v, want it left as it is, held", b)
 	}
 	if b := got["group:ops /projects/other"]; b.ID != "elsewhere" {
 		t.Errorf("another project's binding was touched: %+v", b)
@@ -71,7 +75,7 @@ func TestProjectIncarnation_AFirstBirthCarriesItsCreatorsPreGrants(t *testing.T)
 // incarnation, and its grant is tagged. Only a latched writer makes an
 // incarnation, so every replica already decodes the forms.
 //
-// Mutations: projectFormsFor reading the gate only — red (the quota);
+// Mutations: upsertProjectQuota reading the gate only — red (the quota);
 // ProjectBindingID reading the gate only — red (the grant).
 func TestProjectIncarnation_AnUnlatchedNodeKeepsACarriedIncarnationGoing(t *testing.T) {
 	ctx := context.Background()
@@ -94,13 +98,15 @@ func TestProjectIncarnation_AnUnlatchedNodeKeepsACarriedIncarnationGoing(t *test
 	if err != nil || !strings.HasSuffix(id, projectBindingTagSep+projectIncarnationOf(t, c, "/p")) {
 		t.Fatalf("an unlatched grant on a project that carries an incarnation: id %q (err %v), want it tagged", id, err)
 	}
-	// So is its quota: it names the incarnation, and is enforced.
+	// So is its quota: it is keyed by the incarnation, and is enforced.
 	if err := UpsertProjectQuota(ctx, c, ProjectQuotaRecord{ProjectName: "/p", VCPULimit: 3}); err != nil {
 		t.Fatal(err)
 	}
-	if rows, _ := c.Query(ctx, `SELECT incarnation FROM project_quotas WHERE project_name = '/p'`); len(rows) != 1 ||
-		rows[0].String("incarnation") != projectIncarnationOf(t, c, "/p") {
-		t.Fatalf("an unlatched quota on a project that carries an incarnation: %+v, want it named", rows)
+	if rows, _ := c.Query(ctx, `SELECT 1 FROM project_quotas WHERE project_name = ?`, projectQuotaKey("/p", projectIncarnationOf(t, c, "/p"))); len(rows) != 1 {
+		t.Fatal("an unlatched quota on a project that carries an incarnation is not keyed by it")
+	}
+	if q, _ := GetProjectQuota(ctx, c, "/p"); q == nil || q.VCPULimit != 3 {
+		t.Fatalf("an unlatched quota on a project that carries an incarnation: %+v, want vcpu 3", q)
 	}
 	// A project born before any latch stays in the previous form.
 	if err := InsertProject(ctx, c, ProjectRecord{Name: "/old"}); err != nil {
@@ -132,7 +138,7 @@ func TestProjectIncarnation_TheDumpLeavesOutAnUnsetIncarnation(t *testing.T) {
 		}
 		return indexOf(st.Columns, "incarnation") >= 0
 	}
-	if has("projects") || has("project_quotas") {
+	if has("projects") {
 		t.Fatal("an unset incarnation column is in the dump")
 	}
 	c.SetProjectIncarnationGate(func() bool { return true })
@@ -142,93 +148,106 @@ func TestProjectIncarnation_TheDumpLeavesOutAnUnsetIncarnation(t *testing.T) {
 	if err := UpsertProjectQuota(ctx, c, ProjectQuotaRecord{ProjectName: "/q", VCPULimit: 2}); err != nil {
 		t.Fatal(err)
 	}
-	if !has("projects") || !has("project_quotas") {
+	if !has("projects") {
 		t.Fatal("a set incarnation column is missing from the dump")
 	}
 }
 
-// Review M2: a quota set for another incarnation of a project is not
-// enforced on it; a node that takes a new incarnation drops such rows; and
-// anti-entropy takes the project's own quota over another's whatever the
-// clocks, and never another's over its own or over none.
+// A quota is keyed by the incarnation it was set for (rounds 1 and 2,
+// review M2 and R2-B): a project reads only its own incarnation's row, so a
+// quota set for another, at any clock, by the WAL or anti-entropy, neither
+// displaces nor overrides it; and the new incarnation's own row, written
+// before the project reaches it, is read once it does (R2-A).
 //
-// Mutations: GetProjectQuota enforcing any row — red at "read";
-// dropOtherIncarnationQuotas a no-op — red at "settle"; projectQuotaDecision
-// normal — red at "anti-entropy".
+// Mutations: GetProjectQuota reading the bare name — red; a quota written
+// under the bare name — red.
 func TestProjectIncarnation_AQuotaBelongsToItsIncarnation(t *testing.T) {
 	ctx := context.Background()
 	c := latchedProjectClient(t)
 	if err := InsertProject(ctx, c, ProjectRecord{Name: "/p"}); err != nil {
 		t.Fatal(err)
 	}
-	old := projectIncarnationOf(t, c, "/p")
+	inc := projectIncarnationOf(t, c, "/p")
 	if err := UpsertProjectQuota(ctx, c, ProjectQuotaRecord{ProjectName: "/p", VCPULimit: 10}); err != nil {
 		t.Fatal(err)
 	}
-	if q, _ := GetProjectQuota(ctx, c, "/p"); q == nil || q.VCPULimit != 10 {
-		t.Fatalf("own quota: %+v, want vcpu 10", q)
-	}
-	// read: a row of another incarnation, as a lagging node's arrives.
-	stale := func(limit int) {
+	put := func(key string, limit int) {
 		t.Helper()
-		if err := c.Execute(ctx, projectQuotaUpsertIncarnationSQL, "/p", limit, 0, 0, 0, 0, 0, "r0", c.NowTS()); err != nil {
+		if err := c.Execute(ctx, projectQuotaUpsertSQL, key, limit, 0, 0, 0, 0, 0, c.NowTS()); err != nil {
 			t.Fatal(err)
 		}
 	}
-	stale(100)
-	if q, _ := GetProjectQuota(ctx, c, "/p"); q != nil {
-		t.Fatalf("read: another incarnation's quota is enforced: %+v", q)
+	// Later quotas of other incarnations, and of the previous form.
+	put(projectQuotaKey("/p", "r0"), 100)
+	put("/p", 200)
+	if q, _ := GetProjectQuota(ctx, c, "/p"); q == nil || q.VCPULimit != 10 || q.ProjectName != "/p" {
+		t.Fatalf("another incarnation's quota displaced the project's own: %+v, want /p at vcpu 10", q)
 	}
-	// settle: a new incarnation drops the quota rows of others.
-	tx, err := c.db.Begin()
-	if err != nil {
+	// The next incarnation's own quota, here before the project reaches it.
+	next := newProjectIncarnation(false)
+	put(projectQuotaKey("/p", next), 7)
+	if q, _ := GetProjectQuota(ctx, c, "/p"); q == nil || q.VCPULimit != 10 {
+		t.Fatalf("an incarnation not reached yet: %+v, want vcpu 10", q)
+	}
+	if err := c.Execute(ctx, `UPDATE projects SET incarnation = ? WHERE name = '/p'`, next); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Exec(`UPDATE projects SET incarnation = ? WHERE name = '/p'`, "r0"); err != nil {
+	if q, _ := GetProjectQuota(ctx, c, "/p"); q == nil || q.VCPULimit != 7 {
+		t.Fatalf("the new incarnation's own quota: %+v, want vcpu 7", q)
+	}
+	_ = inc
+	// A deleted project's quota is refused once the forms apply.
+	if err := DeleteProject(ctx, c, "/p"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Exec(`UPDATE project_quotas SET incarnation = ? WHERE project_name = '/p'`, old); err != nil {
-		t.Fatal(err)
+	if err := UpsertProjectQuota(ctx, c, ProjectQuotaRecord{ProjectName: "/p", VCPULimit: 9}); !errors.Is(err, ErrNoLiveProject) {
+		t.Fatalf("a quota for a deleted project: err=%v, want ErrNoLiveProject", err)
 	}
-	if err := settleProjectName(ctx, tx, "/p", old); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	if rows, _ := c.Query(ctx, `SELECT 1 FROM project_quotas WHERE project_name = '/p'`); len(rows) != 0 {
-		t.Fatal("settle: the old incarnation's quota row is still there")
-	}
+}
 
-	// anti-entropy, with the project at r0.
-	decide := func(inc string) mergeAuthorityDecision {
+// Review round 2, L2: a dump without the incarnation column comes from a node
+// that never held a birth made after the latch, so its projects row never
+// displaces a local one that carries an incarnation, whatever its clock.
+//
+// Mutation: projectsDumpDecision always normal — red.
+func TestProjectIncarnation_AColumnlessDumpKeepsALocalIncarnation(t *testing.T) {
+	c := latchedProjectClient(t)
+	if err := InsertProject(context.Background(), c, ProjectRecord{Name: "/p"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertProject(context.Background(), c, ProjectRecord{Name: "/old"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Execute(context.Background(), `UPDATE projects SET incarnation = '' WHERE name = '/old'`); err != nil {
+		t.Fatal(err)
+	}
+	decide := func(table syncTable, name string) mergeAuthorityDecision {
 		t.Helper()
 		tx, err := c.db.Begin()
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer tx.Rollback()
-		table := syncTable{Name: "project_quotas", Columns: []string{"project_name", "vcpu_limit", "incarnation", "updated_at"}}
-		d, err := projectQuotaDecision(tx, table, []interface{}{"/p", 1, inc, "ts"})
+		row := make([]interface{}, len(table.Columns))
+		row[0] = name
+		d, err := projectsDumpDecision(tx, table, row)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return d
 	}
-	if d := decide(old); d != mergeAuthorityKeepLocal {
-		t.Errorf("anti-entropy: another incarnation's quota over none: %v, want keep local", d)
+	without := syncTable{Name: "projects", Columns: []string{"name", "display", "updated_at"}}
+	with := syncTable{Name: "projects", Columns: []string{"name", "display", "updated_at", "incarnation"}}
+	if d := decide(without, "/p"); d != mergeAuthorityKeepLocal {
+		t.Errorf("a column-less row over one that carries an incarnation: %v, want keep local", d)
 	}
-	if d := decide("r0"); d != mergeAuthorityNormal {
-		t.Errorf("anti-entropy: the project's own quota over none: %v, want normal", d)
+	if d := decide(without, "/old"); d != mergeAuthorityNormal {
+		t.Errorf("a column-less row over a pre-latch one: %v, want normal", d)
 	}
-	stale(5) // a row of r0 is the project's own now
-	if err := c.Execute(ctx, `UPDATE project_quotas SET incarnation = ? WHERE project_name = '/p'`, old); err != nil {
-		t.Fatal(err)
+	if d := decide(without, "/none"); d != mergeAuthorityNormal {
+		t.Errorf("a column-less row with no local row: %v, want normal", d)
 	}
-	if d := decide("r0"); d != mergeAuthorityApplyIncoming {
-		t.Errorf("anti-entropy: the project's own quota over another's: %v, want apply incoming", d)
-	}
-	if d := decide(old); d != mergeAuthorityKeepLocal {
-		t.Errorf("anti-entropy: another's quota: %v, want keep local", d)
+	if d := decide(with, "/p"); d != mergeAuthorityNormal {
+		t.Errorf("a row with the column: %v, want normal", d)
 	}
 }

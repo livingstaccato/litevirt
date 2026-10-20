@@ -864,8 +864,9 @@ func refuseUnproven(r addRemote, p hostAddPlan, serial string, exp addExpect, no
 		if rec.before != "" {
 			found = "certificate " + rec.before
 		}
-		if !validHostName(rec.name) {
-			// A name the CLI would not take is not printed, nor a command with it.
+		if !settleName(rec.name) {
+			// A name `lv host rm` would not take is not printed, nor a command
+			// with it. One it takes is printed quoted (shellWord).
 			return settled(fmt.Sprintf("an earlier add of this machine (certificate %s, attempt %s) found %s here and "+
 				"was neither finished nor undone; the machine serves certificate %s now, which nothing proves is that "+
 				"add's, so this add changes nothing. Its record %s names a host the CLI cannot name in a command: check it "+

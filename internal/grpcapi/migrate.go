@@ -859,10 +859,16 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	abort.armed = false
 	done := make(chan error, 1)
 	go func() {
-		// The answer is sent however this goroutine ends, so the request or
-		// the adopter waiting on done always gets one.
+		// The answer is sent however this goroutine ends but by a panic, so
+		// the request or the adopter waiting on done always gets one. A panic
+		// answers nothing: it goes on, and the process with it.
 		migrateErr := errLibvirtCallUnanswered
-		defer func() { done <- migrateErr }()
+		defer func() {
+			if p := recover(); p != nil {
+				panic(p)
+			}
+			done <- migrateErr
+		}()
 		params := lv.MigrateParams{
 			Live:          live,
 			WithStorage:   withStorage,

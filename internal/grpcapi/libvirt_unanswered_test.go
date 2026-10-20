@@ -1,9 +1,14 @@
 package grpcapi
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"os"
+	"os/exec"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -74,4 +79,81 @@ func TestStartVM_AHeldStartWhoseCallEndsUnansweredSettles(t *testing.T) {
 	if !found {
 		t.Fatalf("no failed-start event naming the unanswered call: %+v", evs)
 	}
+}
+
+// A panic in the libvirt call answers nothing: it crashes the daemon, and the
+// waiter is not told anything first, so it takes no step against a crash
+// already under way. Each case runs a child process that panics in the call
+// and prints a line whenever the waiter asks libvirt anything after the
+// panic; the line must never show. The interleaving is a race, so the child
+// runs several times.
+//
+// Mutation: the deferred send without the recover and re-panic — the waiter
+// asks libvirt about the source after the panic, red.
+const unansweredPanicChild = "LV_UNANSWERED_PANIC_CHILD"
+
+func unansweredPanicRuns(t *testing.T, test, mode string) {
+	t.Helper()
+	for i := 0; i < 20; i++ {
+		cmd := exec.Command(os.Args[0], "-test.run=^"+test+"$", "-test.count=1")
+		cmd.Env = append(os.Environ(), unansweredPanicChild+"="+mode)
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatalf("run %d: the child did not crash:\n%s", i, out)
+		}
+		if !bytes.Contains(out, []byte("unanswered-probe panic")) {
+			t.Fatalf("run %d: the child did not panic in the libvirt call:\n%s", i, out)
+		}
+		if bytes.Contains(out, []byte("WAITER-ACTED")) {
+			t.Fatalf("run %d: the waiter acted after the panic:\n%s", i, out)
+		}
+	}
+}
+
+// unansweredPanicWatch prints WAITER-ACTED when f is asked a domain's state
+// once panicked is set.
+func unansweredPanicWatch(f *libvirtfake.Fake, panicked *atomic.Bool) {
+	acted := func(string) error {
+		if panicked.Load() {
+			fmt.Fprintln(os.Stderr, "WAITER-ACTED")
+		}
+		return nil
+	}
+	f.FailDomainState = acted
+	f.FailDomainStateReason = acted
+}
+
+func TestMigrateVM_APanicInTheMigrationCallAnswersNothing(t *testing.T) {
+	if os.Getenv(unansweredPanicChild) != "migrate" {
+		unansweredPanicRuns(t, "TestMigrateVM_APanicInTheMigrationCallAnswersNothing", "migrate")
+		return
+	}
+	r := newFwlRig(t, fwlOpts{})
+	var panicked atomic.Bool
+	unansweredPanicWatch(r.srcFake, &panicked)
+	r.srcFake.OnMigrateToTarget = func(string, string, lv.MigrateParams) error {
+		panicked.Store(true)
+		panic("unanswered-probe panic")
+	}
+	_ = r.migrate()
+}
+
+func TestStartVM_APanicInTheHeldStartsCallAnswersNothing(t *testing.T) {
+	if os.Getenv(unansweredPanicChild) != "start" {
+		unansweredPanicRuns(t, "TestStartVM_APanicInTheHeldStartsCallAnswersNothing", "start")
+		return
+	}
+	st := newStuckStart(t)
+	f := st.s.virt.(*libvirtfake.Fake)
+	var panicked atomic.Bool
+	unansweredPanicWatch(f, &panicked)
+	f.FailStartDomain = func(string) error {
+		<-st.release
+		panicked.Store(true)
+		panic("unanswered-probe panic")
+	}
+	_, err := st.s.StartVM(adminCtx(), &pb.StartVMRequest{Name: "web"})
+	wantStartInFlight(t, "start", err)
+	close(st.release)
+	time.Sleep(10 * time.Second) // the panic ends the process first
 }

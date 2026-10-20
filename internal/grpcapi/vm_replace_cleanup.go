@@ -10,6 +10,9 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
@@ -669,18 +672,30 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 	if state == "running" {
 		return nil
 	}
-	if rec, gErr := corrosion.GetVM(ctx, s.db, m.ReplacedVM); gErr == nil && rec != nil {
-		// A row recorded migrating is not started by any path.
-		if e := s.movingVMStartRefusal(ctx, rec); e != nil {
-			return failed("start", e)
-		}
-		if e := s.verifyVMISOForStart(rec); e != nil {
-			return failed("start", e)
-		}
-		// This start runs outside the start hook: a stale seed is rebuilt
-		// here as there, never refusing it.
-		s.retryStaleSeedForStart(ctx, rec)
+	// The row is read again for the start's own checks, and a read that fails
+	// refuses the start: whether a move of the VM is in flight is then unknown.
+	// A row gone since the read above is not started either; the next attempt
+	// finds the name no longer holds this incarnation and skips the handoff.
+	rec, gErr := corrosion.GetVM(ctx, s.db, m.ReplacedVM)
+	if gErr != nil {
+		return failed("start", status.Errorf(codes.Unavailable,
+			"start %q: its row cannot be read (%v), so whether a move of it is in flight is unknown; retry",
+			m.ReplacedVM, gErr))
 	}
+	if rec == nil {
+		return failed("start", status.Errorf(codes.FailedPrecondition,
+			"start %q: its row is gone, so nothing is started under its name", m.ReplacedVM))
+	}
+	// A row recorded migrating is not started by any path.
+	if e := s.movingVMStartRefusal(ctx, rec); e != nil {
+		return failed("start", e)
+	}
+	if e := s.verifyVMISOForStart(rec); e != nil {
+		return failed("start", e)
+	}
+	// This start runs outside the start hook: a stale seed is rebuilt
+	// here as there, never refusing it.
+	s.retryStaleSeedForStart(ctx, rec)
 	if merr := s.resolveUnresolvedMoves(ctx, m.ReplacedVM); merr != nil {
 		return failed("start", merr)
 	}

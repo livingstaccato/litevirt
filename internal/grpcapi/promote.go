@@ -1169,26 +1169,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 	}
 
-	// Split-brain guard. Taking over the original name while the original is
-	// still on a healthy host (and not force) would double-run the VM.
-	// A promotion to a new name never replaces another VM, --force or not:
-	// --force is for a same-name takeover of a VM still on a healthy host.
-	// With it, a rename onto a live VM's name stopped and undefined that VM's
-	// domain here and then failed on its row (dupcreate re-review). Checked
-	// under this promotion's create flight of the name (above).
-	if renamed {
-		if rec, _ := corrosion.GetVM(ctx, s.db, targetName); rec != nil {
-			return status.Errorf(codes.AlreadyExists,
-				"vm %q already exists; choose another --new-name (--force never replaces another VM); nothing was changed", targetName)
-		}
-	}
-	if !req.Force {
-		if !renamed && vm.HostName != "" && vm.HostName != s.hostName {
-			if h, _ := corrosion.GetHost(ctx, s.db, vm.HostName); h != nil && h.State == "active" {
-				return status.Errorf(codes.FailedPrecondition,
-					"vm %q still owned by healthy host %q; fence it or pass --force/--new-name to avoid split-brain", vm.Name, vm.HostName)
-			}
-		}
+	// Checked under this promotion's create flight of the name (above).
+	if err := s.promoteSplitBrainRefusal(ctx, vm, targetName, renamed, req.Force); err != nil {
+		return err
 	}
 	// Admission (fail-closed), BEFORE any disk build, domain destruction,
 	// definition, or start. A promotion defines and starts a full-sized VM — the
@@ -2142,4 +2125,41 @@ func longestCronGap(expr string) (time.Duration, bool) {
 		prev = t
 	}
 	return longest, longest > 0
+}
+
+// promoteSplitBrainRefusal is the split-brain guard of a promotion of vm to
+// targetName. Taking over the original name while the original is still on
+// a healthy host (and not force) would double-run the VM. A promotion to a
+// new name never replaces another VM, --force or not: --force is for a
+// same-name takeover of a VM still on a healthy host. With it, a rename onto
+// a live VM's name stopped and undefined that VM's domain here and then
+// failed on its row (dupcreate re-review). A read either check needs that
+// fails refuses the promotion as retryable: what it would have shown is
+// unknown.
+func (s *Server) promoteSplitBrainRefusal(ctx context.Context, vm *corrosion.VMRecord, targetName string, renamed, force bool) error {
+	if renamed {
+		rec, err := corrosion.GetVM(ctx, s.db, targetName)
+		if err != nil {
+			return status.Errorf(codes.Unavailable,
+				"promote of %s to %s: whether a VM of that name exists cannot be read (%v); nothing was changed; retry",
+				vm.Name, targetName, err)
+		}
+		if rec != nil {
+			return status.Errorf(codes.AlreadyExists,
+				"vm %q already exists; choose another --new-name (--force never replaces another VM); nothing was changed", targetName)
+		}
+	}
+	if !force && !renamed && vm.HostName != "" && vm.HostName != s.hostName {
+		h, err := corrosion.GetHost(ctx, s.db, vm.HostName)
+		if err != nil {
+			return status.Errorf(codes.Unavailable,
+				"promote of %s: whether its host %s is still healthy cannot be read (%v); nothing was changed; retry",
+				vm.Name, vm.HostName, err)
+		}
+		if h != nil && h.State == "active" {
+			return status.Errorf(codes.FailedPrecondition,
+				"vm %q still owned by healthy host %q; fence it or pass --force/--new-name to avoid split-brain", vm.Name, vm.HostName)
+		}
+	}
+	return nil
 }

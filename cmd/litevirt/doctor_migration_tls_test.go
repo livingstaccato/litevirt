@@ -154,3 +154,19 @@ func TestMigrationTLSRowsJSON_TimestampsAreRFC3339(t *testing.T) {
 		t.Errorf("cert_not_after = %v, want %v", parsed, when)
 	}
 }
+
+// A host whose ca.crt is missing trusts no CA at all: that is its own
+// incomplete set, reported once, not a different CA set from every other host.
+//
+// Mutation: put a host with no CAs into the CA-set comparison — every other
+// host is reported as trusting a different set from it.
+func TestMigrationTLSProblems_AMissingCAFileIsReportedOnce(t *testing.T) {
+	now := time.Now()
+	far := now.Add(365 * 24 * time.Hour)
+	missing := row("c", "", far)
+	missing.ValidationError = "migration-TLS credentials are unusable: incomplete set, missing ca.crt"
+	p := migrationTLSProblems([]*pb.MigrationTLSHostStatus{row("a", "x", far, "x"), row("b", "x", far, "x"), missing}, false, now)
+	if len(p) != 1 || !strings.HasPrefix(p[0], "c: ") || !strings.Contains(p[0], "missing ca.crt") {
+		t.Fatalf("problems = %q; want one line, for c's incomplete set", p)
+	}
+}

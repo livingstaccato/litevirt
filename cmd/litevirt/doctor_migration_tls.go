@@ -174,6 +174,14 @@ func migrationTLSProblems(rows []*pb.MigrationTLSHostStatus, rotating bool, now 
 					h, shortFP(ca.GetFingerprint()), verb, t.AsTime().Format("2006-01-02"), fix))
 			}
 		}
+		if len(fps) == 0 {
+			// No CA file: its incomplete set is its own problem, above, not a
+			// different CA set from every other host.
+			if r.GetValidationError() == "" {
+				out = append(out, fmt.Sprintf("%s: holds no migration CA; run `lv host install-migration-tls`", h))
+			}
+			continue
+		}
 		sort.Strings(fps)
 		key := strings.Join(fps, ",")
 		sets[key] = append(sets[key], h)

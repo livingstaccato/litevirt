@@ -901,6 +901,9 @@ func (c *Cluster) crossRegisterHosts() {
 }
 
 func (c *Cluster) buildServer(n *Node) {
+	// Every goroutine this server's daemon starts carries its generation
+	// (server_labels.go).
+	defer n.labelServerGoroutines()()
 	dataDir := filepath.Join(c.tmpRoot, n.Name, "data")
 	if c.opts.SharedDataDir {
 		dataDir = filepath.Join(c.tmpRoot, "shared-data")

@@ -10,16 +10,26 @@ package fleet
 // SeverWritesForTests), its files (the node's directories made read-only)
 // and the network both ways (BlockAll on each link). Then the frozen
 // goroutine is ended where it stands (runtime.Goexit: the libvirt call never
-// returns, its deferred calls run). Every other goroutine of the old daemon
-// ends at its next libvirt call, and what it asks of the database, the files
-// or a peer is refused.
+// returns, its deferred calls run). While the severs hold, any other
+// goroutine of the old daemon ends at its next libvirt call, and what it asks
+// of the database, the files or a peer is refused.
 //
 // die waits for the frozen goroutine to be gone and for the move's own
-// handler to have returned, takes the daemon down (downNode, which joins
-// what the server still owns), and checks that nothing the dead daemon did
-// reached libvirt, the database, the files or a peer. Only then are the
-// severs lifted for the replacement. A goroutine that does not end within a
-// minute fails the scenario; a wait running out is never taken as an end.
+// handler to have returned, takes the daemon down (downNode), and then waits
+// for every goroutine of the old server's generation to be gone
+// (server_labels.go: its loops, recovery workers, handlers and whatever they
+// started), the severs still on. It checks that nothing the dead daemon did
+// reached libvirt, the database, the files or a peer, and only then lifts the
+// severs for the replacement: nothing of the old daemon is left to act on
+// them. A goroutine that does not end within a minute fails the scenario and
+// the severs stay on; a wait running out is never taken as an end.
+//
+// Limits: the libvirt sever is per Fake, so a scenario must not kill a node
+// whose Fake a live daemon's goroutine still calls (the landing of a migration
+// is libvirtd's own, LandFirmwareLive and LandMigrated*, and is not severed).
+// File modes refuse neither root nor a descriptor opened before the kill; the
+// file digest still catches either. The node's tree is all of its files, so a
+// cluster with SharedDataDir cannot be killed this way.
 
 import (
 	"bytes"
@@ -39,6 +49,8 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
 // fwliveCrash is one daemon's death at a crash point.
@@ -66,13 +78,8 @@ func fwliveNewCrash(t *testing.T, c *Cluster, n *Node) *fwliveCrash {
 	t.Helper()
 	k := &fwliveCrash{t: t, c: c, n: n, reached: make(chan struct{}), kill: make(chan struct{})}
 	t.Cleanup(func() {
-		select {
-		case <-k.reached:
-			if !k.died {
-				k.die(false)
-			}
-		default:
-			k.killOnce.Do(func() { close(k.kill) })
+		if !k.died {
+			k.die(false)
 		}
 	})
 	return k
@@ -99,41 +106,57 @@ func (k *fwliveCrash) freeze() {
 }
 
 // die kills the daemon at its crash point (see above). check: the dead
-// daemon's effects are asserted (false only on a failed scenario's way out).
+// daemon's effects are asserted (false only on a failed scenario's way out,
+// where the crash point may not have been reached).
 func (k *fwliveCrash) die(check bool) {
 	t, c, n := k.t, k.c, k.n
 	t.Helper()
 	k.died = true
+	if c.opts.SharedDataDir {
+		t.Fatalf("%s's data dir is shared: its daemon cannot be killed with its files severed", n.Name)
+	}
 	root := filepath.Join(c.tmpRoot, n.Name)
+	gen := n.serverGeneration()
 
 	// Sever everything, then take what the world holds at the death.
 	virtRestore := n.Virt.SeverDaemon()
 	dbRestore := n.DB.SeverWritesForTests()
 	filesRestore := fwliveReadOnly(t, root)
 	netRestore := fwliveIsolate(c, n)
-	lifted := false
-	lift := func() {
-		if lifted {
+	ended := false
+	defer func() {
+		if !ended {
+			// The old daemon may still be running: it stays severed. Its
+			// files get their modes back only once the scenario is over,
+			// so its tree can be removed.
+			t.Cleanup(filesRestore)
 			return
 		}
-		lifted = true
 		calls := virtRestore()
-		refused := dbRestore()
+		refused, landed := dbRestore()
 		filesRestore()
 		netRestore()
 		t.Logf("%s's dead daemon: libvirt calls ended %v, commits refused %d", n.Name, calls, refused)
-	}
-	defer lift()
+		if check && landed != 0 {
+			t.Errorf("%s's dead daemon committed %d rows after its death", n.Name, landed)
+		}
+	}()
 
 	virt0 := n.Virt.Fingerprint()
 	files0 := fwliveTreeDigest(t, root)
 	log0 := fwliveOriginEntries(t, n)
 	passed0 := fwlivePassed(c, n)
 
+	reached := false
+	select {
+	case <-k.reached:
+		reached = true
+	default:
+	}
 	k.killOnce.Do(func() { close(k.kill) })
 	fail := t.Fatalf
 	if !check {
-		fail = t.Logf
+		fail = t.Errorf
 	}
 	if id := k.goid.Load(); id != 0 {
 		if !fwliveUntil(time.Minute, func() bool { return !fwliveGoroutineAlive(id) }) {
@@ -141,7 +164,7 @@ func (k *fwliveCrash) die(check bool) {
 			return
 		}
 	}
-	if k.moveDone != nil {
+	if k.moveDone != nil && reached {
 		select {
 		case <-k.moveDone:
 		case <-time.After(time.Minute):
@@ -150,6 +173,12 @@ func (k *fwliveCrash) die(check bool) {
 		}
 	}
 	downNode(n)
+	if !fwliveUntil(time.Minute, func() bool { live, _ := serverGoroutines(gen); return live == 0 }) {
+		live, stacks := serverGoroutines(gen)
+		fail("%d goroutines of %s's dead daemon (%s) did not end within a minute of the kill:\n%s", live, n.Name, gen, stacks)
+		return
+	}
+	ended = true
 	if !check {
 		return
 	}
@@ -167,6 +196,51 @@ func (k *fwliveCrash) die(check bool) {
 		if p != passed0[name] {
 			t.Errorf("%s's dead daemon reached %s with %d calls after its death", n.Name, name, p-passed0[name])
 		}
+	}
+}
+
+// A goroutine of the dead daemon that outlives both the frozen call and the
+// move's handler (here a call it was serving, which acts 3 s after the kill:
+// a recovery worker retrying a peer is one such) is still the dead daemon's.
+// die waits for it, severed, before the replacement starts, so whatever it
+// does next is refused; nothing it does reaches libvirt after the restart.
+//
+// Mutation: die lifts the severs once the frozen goroutine and the handler
+// are gone, without waiting for the old server's generation — the worker
+// defines its domain next to the replacement daemon, red.
+func TestFleet_FwLiveCrash_AnOldWorkerCannotActAfterTheRestart(t *testing.T) {
+	c, src, dst, _ := fwliveCluster(t)
+	k := fwliveRestartFreeze(t, c, src, nil)
+	done := fwliveMigrate(t, c, src, dst)
+	fwliveRestartReach(t, k.reached, done, "the migration call")
+
+	const oldWorkerVM = "fwlive-old-worker"
+	in, ended := make(chan struct{}), make(chan struct{})
+	var acted atomic.Bool
+	virt := src.Virt // the libvirt the old daemon talks to, and the new one
+	src.HookUnary("Ping", func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
+		defer close(ended)
+		close(in)
+		time.Sleep(3 * time.Second)
+		_ = virt.DefineDomain("<domain><name>" + oldWorkerVM + "</name><uuid>8a1b2c3d-0000-4000-8000-0000000000aa</uuid></domain>")
+		acted.Store(true)
+		return h(ctx, req)
+	})
+	go func() { _, _ = c.SelfClient(src).Ping(context.Background(), &pb.PingRequest{}) }()
+	<-in
+
+	k.die(true)
+	fwliveRestartUp(t, c, src)
+	select {
+	case <-ended:
+	case <-time.After(time.Minute):
+		t.Fatal("the old worker did not end within a minute")
+	}
+	if acted.Load() {
+		t.Error("the dead daemon's worker went on past its libvirt call")
+	}
+	if st, ok := virt.RawState(oldWorkerVM); ok {
+		t.Errorf("the dead daemon's worker defined %s (%s) after the restart", oldWorkerVM, st)
 	}
 }
 

@@ -1167,6 +1167,11 @@ func (n *Node) blocked(fullMethod string, ctx context.Context) bool {
 }
 
 func (n *Node) partitionUnaryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	done, err := n.lifeAdmit(peerCertCN(ctx))
+	if err != nil {
+		return nil, err
+	}
+	defer done()
 	if n.blocked(info.FullMethod, ctx) {
 		return nil, status.Errorf(codes.Unavailable, "fleet partition: %s refused by %s", methodName(info.FullMethod), n.Name)
 	}
@@ -1258,6 +1263,11 @@ func (n *Node) Reconciler() *health.Reconciler {
 }
 
 func (n *Node) partitionStreamInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	done, lerr := n.lifeAdmit(peerCertCN(ss.Context()))
+	if lerr != nil {
+		return lerr
+	}
+	defer done()
 	if n.blocked(info.FullMethod, ss.Context()) {
 		return status.Errorf(codes.Unavailable, "fleet partition: %s refused by %s", methodName(info.FullMethod), n.Name)
 	}

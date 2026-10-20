@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"weak"
 )
 
 // Each server buildServer starts is a generation of its node's daemon. Every
@@ -24,7 +25,7 @@ const serverLabelKey = "fleet-server"
 
 var (
 	serverGenSeq atomic.Int64
-	serverGens   sync.Map // *Node → its current server's generation
+	serverGens   sync.Map // weak *Node → its current server's generation
 )
 
 // labelServerGoroutines labels the goroutines the calling goroutine starts
@@ -32,14 +33,14 @@ var (
 // label off it again.
 func (n *Node) labelServerGoroutines() (unlabel func()) {
 	gen := n.Name + "#" + strconv.FormatInt(serverGenSeq.Add(1), 10)
-	serverGens.Store(n, gen)
+	serverGens.Store(weak.Make(n), gen)
 	pprof.SetGoroutineLabels(pprof.WithLabels(context.Background(), pprof.Labels(serverLabelKey, gen)))
 	return func() { pprof.SetGoroutineLabels(context.Background()) }
 }
 
 // serverGeneration is n's current server generation.
 func (n *Node) serverGeneration() string {
-	g, _ := serverGens.Load(n)
+	g, _ := serverGens.Load(weak.Make(n))
 	s, _ := g.(string)
 	return s
 }

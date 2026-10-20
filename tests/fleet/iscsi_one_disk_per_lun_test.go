@@ -641,7 +641,7 @@ func TestFleet_ISCSI_ARebuildOfAMovedVMMovesTheClaim(t *testing.T) {
 	if err := n2.Virt.DefineDomain(n1.Virt.DefinedXML("web")); err != nil {
 		t.Fatal(err)
 	}
-	_ = n1.Virt.UndefineDomain("web", false)
+	n1.Virt.VanishDomain("web")
 	eventually(t, convergeTimeout, "web to be on node-2 everywhere", func() bool {
 		for _, n := range c.Nodes {
 			rec, _ := corrosion.GetVM(ctx, n.DB, "web")

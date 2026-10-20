@@ -54,9 +54,17 @@ confirmation) delete a running container as before.
 
 ### Host paths a container is given
 
-A rootfs template is copied whole into the new container, and a local
-`oci:<dir>` source is unpacked by root, so naming either is reading a host
-directory as root. Container inputs follow the same rules as a VM's host
+A rootfs template is copied whole into the new container, and a local pull
+source (`oci:<dir>[:tag]`, `dir:<dir>`, `oci-archive:<file>[:tag]`,
+`docker-archive:<file>[:ref]`) is read by root, so naming either is reading a
+host path as root. `lv ct pull` accepts a registry image (`name[:tag]`, which
+includes `docker:dind`, or `docker://registry/name[:tag]`) or one of those
+local forms, and refuses any other transport. A local source must be a
+directory (`oci:`, `dir:`) or a regular file (the archives), not a symbolic
+link, and an archive may not be VM disk storage (the data directory's
+`disks/`, or a storage pool). The daemon opens and judges the source once: a
+directory is then read through that descriptor, and an archive is copied
+from it into the pull's private staging directory and read from the copy. Container inputs follow the same rules as a VM's host
 paths:
 
 - Anyone with `ct.create` may name an **OCI library item**: exactly
@@ -76,9 +84,17 @@ paths:
   Containers of any project may run from such an ownerless item, so claiming
   it with `--project` (a pull over an existing item that has no owner) needs
   the Admin role; pull without `--project`, or into a new name. The Admin may
-  use any image.
+  use any image. A pull over an existing item is refused, except an Admin's
+  claim (`lv ct pull --project`), which replaces it with the image pulled
+  (unpacked beside the item first; a pull that fails leaves the item as it
+  was). The owner is recorded inside the item, so it goes in place with the
+  image it owns, and a create judges the two together. Containers created
+  from it keep their own copy. A claim is refused while a container created
+  by an earlier release uses the item's rootfs in place, naming it. A privileged or legacy-confined stack member built from
+  an item whose content was replaced since counts as changing its image on
+  its next recreate (see compose.md).
 - Any other host path (`--template /srv/rootfs`, `rootfs:<path>`, a relative
-  path, an absolute `lv ct pull --dest`, a local `oci:` source) needs
+  path, an absolute `lv ct pull --dest`, a local pull source) needs
   `storage.hostpath` at the cluster root — the Admin role.
 - Whoever asks, a template or OCI source may not be under, or contain, a
   directory that holds host secrets or live state (`/etc`, `/boot`, `/dev`,
@@ -536,6 +552,9 @@ Containers are first-class tenancy citizens, at parity with VMs:
   `cpu.stat`) and `litevirt_container_memory_bytes` (cgroup-v2 `memory.current`).
   Usage metrics require cgroup-v2 (the modern default); on a cgroup-v1-only host
   they are quietly omitted (limits/state are still reported).
+  `litevirt_container_image_copies` and `litevirt_container_image_copy_bytes`
+  count the image copies compose recreates took before their delete and have
+  not used yet (a cancelled deploy leaves one; it goes after 24 hours).
 
 ## Backup & restore
 
@@ -675,9 +694,27 @@ so a stack that needs them says so; deploying it then needs the Admin role.
 A privileged stack member is a host-root grant to the image it runs: a compose
 recreate keeps its mode for anyone who may deploy the stack only while the
 image is unchanged (the image reference and the template, distro, release and
-arch it was built from). Changing the image needs the Admin role or `ct.exec`
-on the member, and is refused before the member is deleted (see
-[compose.md](compose.md)).
+arch it was built from). Changing the image needs the Admin role or the
+`ContainerRoot` role on the member, and is refused before the member is
+deleted (see [compose.md](compose.md)).
+
+**Exec in a privileged or legacy-confined container is the Admin's.** In a
+privileged container `lv ct exec` is a root shell on the host, and in a
+legacy-confined one it runs with nesting allowed, so it needs the Admin role
+or the `ContainerRoot` role on that container; `ct.exec`, which Operator
+holds, covers only an unprivileged container with default confinement. A
+container created before this release counts as privileged and legacy. An
+Admin grants one container to one principal:
+
+```bash
+lv role grant ContainerRoot user:pat@local --path /projects/acme/containers/build
+```
+
+or the container is moved over, after which Operators may exec in it again:
+
+```bash
+lv ct convert build --unprivileged --confinement default
+```
 
 **Existing containers keep their settings.** A container created before this
 release is privileged with legacy confinement and keeps running exactly as it

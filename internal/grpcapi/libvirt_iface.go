@@ -29,6 +29,36 @@ type LibvirtBackend interface {
 	DestroyDomain(name string) error
 	UndefineDomain(name string, removeStorage bool) error
 	UndefineDomainPreservingState(name string) error // undefine keeping NVRAM/vTPM (redefine-class, G1)
+	// DiscardFirmwareMoveTarget is the one way a held live firmware move's
+	// target domain goes (spec §6.8): destroy if paused, then undefine keeping
+	// its state for the quarantine. Never a running domain.
+	DiscardFirmwareMoveTarget(name, uuid, attempt string) error
+	// ResumeFirmwareMoveTarget is the one way a held live firmware move's
+	// target guest runs (spec §6.6, I5): only with the attempt's hold in
+	// state resuming.
+	ResumeFirmwareMoveTarget(name, uuid, attempt string) error
+	// ResumeFirmwareMoveSource is the one way the source guest of a live
+	// firmware move that failed paused before cutover runs again (§7 M1p,
+	// I5): only with the attempt's marker before cutover.
+	ResumeFirmwareMoveSource(name, uuid, attempt string) error
+	// ResumeFirmwareMoveSourceForOperator is the one way an operator's D-5
+	// --accept-source resumes the source guest of a move parked
+	// source_paused before cutover, once the target's copy is discarded.
+	ResumeFirmwareMoveSourceForOperator(name, uuid, attempt string) error
+	// StopFirmwareMoveTargetForOperator stops a held target guest for an
+	// operator's D-5 --stop-target (destroy when force, else an ACPI
+	// shutdown): the attempt's hold prepared, verified, resuming or
+	// released_unconfirmed.
+	StopFirmwareMoveTargetForOperator(name, uuid, attempt string, force bool) error
+	// StopOwedFirmwareLeftover and UndefineOwedFirmwareLeftover act on a
+	// leftover an owed DISCARD names, under its leftover record (D-5
+	// --discard-target): the only stop and undefine of it.
+	StopOwedFirmwareLeftover(name, uuid, attempt string, force bool) error
+	UndefineOwedFirmwareLeftover(name, uuid, attempt string) error
+	// UndefineFirmwareMoveLeftover is the one way a moved VM's source
+	// definition goes (spec §6.7 step 3, I5): marker cleaning, domain shut
+	// off, its NVRAM and TPM state kept for the wipe that follows.
+	UndefineFirmwareMoveLeftover(name, uuid, attempt string) error
 	DomainState(name string) (string, error)
 	// AbortMigration aborts the domain's running migration job. MigrateToTarget
 	// takes no context, so this is the only way to stop one.
@@ -101,6 +131,9 @@ type LibvirtBackend interface {
 	// Migration.
 	MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) error
 	DomainJobProgress(name string) (memPct, diskPct float32)
+	// DomainJobActive reports whether the domain has a job running (an
+	// outgoing migration among them); an unreadable answer is an error.
+	DomainJobActive(name string) (bool, error)
 
 	// Block-pull (live-restore localize): flatten an NBD-backed overlay's
 	// backing chain into the overlay, polling BlockJobStatus to completion.

@@ -2,23 +2,31 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
+	"strings"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/lxc"
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 // A compose recreate deletes its member and then creates it again. The
 // create's host-side checks — the protected-place check of its template
-// (checkContainerTemplate) and the OCI image-owner check
-// (refuseForeignOCIItem) — read the disk of the host the member lives on.
+// (checkContainerTemplate), the OCI image-owner check (refuseForeignOCIItem),
+// and the fetch of the image it is built from (FetchContainerImage) — read
+// the disk, or reach the image server, of the host the member lives on.
 // When the deploy entered on that host the recreate judgment runs them
 // before the delete (judgeContainerRecreate). When it entered on another
 // host, the delete forwarded to the member's host carries the recreate's
-// template and project, and that host runs the same checks on its own disk
-// before it deletes anything (recreateDeleteCheck): a recreate whose create
-// would be refused is refused at its delete, and the member is kept.
+// template, project and download image, and that host runs the same checks,
+// and the fetch, before it deletes anything (recreateDeleteCheck): a
+// recreate whose create would be refused, or whose image it cannot fetch, is
+// refused at its delete, and the member is kept.
 //
 // The metadata is honoured only from an authenticated cluster peer
 // (isRemotePeer, as for the owner-strict marker): a client cannot set it,
@@ -27,12 +35,30 @@ import (
 const (
 	recreateTemplateMDKey = "x-litevirt-recreate-template-bin"
 	recreateProjectMDKey  = "x-litevirt-recreate-project-bin"
+	recreateDistroMDKey   = "x-litevirt-recreate-distro-bin"
+	recreateReleaseMDKey  = "x-litevirt-recreate-release-bin"
+	recreateArchMDKey     = "x-litevirt-recreate-arch-bin"
+	// recreatePinnedMDKey carries the item generation a privileged or
+	// legacy member was built from, for a deployer who may not change its
+	// image: "1:<gen>" (gen may be empty); "2:" binds any other recreate
+	// from a rootfs path to the generation the fetch finds (bound).
+	recreatePinnedMDKey = "x-litevirt-recreate-pinned-gen-bin"
 )
 
 // recreatePreflight is the create a recreate's delete is followed by, as far
 // as the member's host needs it to judge that create before the delete.
 type recreatePreflight struct {
 	template, project string
+	// distro, release and arch are the download template's image.
+	distro, release, arch string
+	// pinned says the deployer may not change the member's image (a
+	// privileged or legacy member, and neither Admin nor ContainerRoot), so
+	// the rootfs path's content must still be generation pinGen.
+	pinned bool
+	pinGen string
+	// bound: the rootfs path's content is copied aside by the fetch before
+	// the delete, and the create built from that copy (pinned implies it).
+	bound bool
 }
 
 type recreatePreflightKey struct{}
@@ -55,7 +81,14 @@ func (s *Server) recreatePreflightOutgoing(ctx context.Context) context.Context 
 		return ctx
 	}
 	ctx = s.ownerStrictOutgoing(ctx)
-	return metadata.AppendToOutgoingContext(ctx, recreateTemplateMDKey, pf.template, recreateProjectMDKey, pf.project)
+	ctx = metadata.AppendToOutgoingContext(ctx, recreateTemplateMDKey, pf.template, recreateProjectMDKey, pf.project,
+		recreateDistroMDKey, pf.distro, recreateReleaseMDKey, pf.release, recreateArchMDKey, pf.arch)
+	if pf.pinned {
+		ctx = metadata.AppendToOutgoingContext(ctx, recreatePinnedMDKey, "1:"+pf.pinGen)
+	} else if pf.bound {
+		ctx = metadata.AppendToOutgoingContext(ctx, recreatePinnedMDKey, "2:")
+	}
+	return ctx
 }
 
 // recreatePreflightIncoming is the preflight a forwarded recreate delete
@@ -72,9 +105,20 @@ func (s *Server) recreatePreflightIncoming(ctx context.Context) *recreatePreflig
 	if len(t) == 0 {
 		return nil
 	}
-	pf := &recreatePreflight{template: t[0]}
-	if p := md.Get(recreateProjectMDKey); len(p) > 0 {
-		pf.project = p[0]
+	first := func(k string) string {
+		if v := md.Get(k); len(v) > 0 {
+			return v[0]
+		}
+		return ""
+	}
+	pf := &recreatePreflight{
+		template: t[0], project: first(recreateProjectMDKey),
+		distro: first(recreateDistroMDKey), release: first(recreateReleaseMDKey), arch: first(recreateArchMDKey),
+	}
+	if g, ok := strings.CutPrefix(first(recreatePinnedMDKey), "1:"); ok {
+		pf.pinned, pf.pinGen, pf.bound = true, g, true
+	} else if first(recreatePinnedMDKey) == "2:" {
+		pf.bound = true
 	}
 	return pf
 }
@@ -87,7 +131,7 @@ func (s *Server) recreateDeleteCheck(ctx context.Context, name string) error {
 	if pf == nil {
 		return nil
 	}
-	if err := s.recreateHostChecks(ctx, pf.template, pf.project, name); err != nil {
+	if err := s.recreateHostChecks(ctx, *pf, name); err != nil {
 		s.audit(ctx, "ct.delete", name, "recreate of template="+pf.template, "denied")
 		return err
 	}
@@ -101,8 +145,96 @@ func (s *Server) recreateDeleteCheck(ctx context.Context, name string) error {
 // create's project owns, passes as on main; another project's is refused).
 // No grant skips the owner check: library items and their owner records are
 // per host, so the template string a member recorded does not make the item
-// under it the member's.
-func (s *Server) recreateHostChecks(ctx context.Context, template, project, name string) error {
+// under it the member's. Then the image the create is built from is fetched
+// and verified here (recreateFetchImage).
+func (s *Server) recreateHostChecks(ctx context.Context, pf recreatePreflight, name string) error {
+	if err := s.recreateTemplateChecks(ctx, pf.template, pf.project, name); err != nil {
+		return err
+	}
+	if err := s.recreatePinnedImage(ctx, pf, name); err != nil {
+		return err
+	}
+	return s.recreateFetchImage(ctx, pf, name)
+}
+
+// recreatePinnedImage refuses a pinned recreate (recreatePreflight.pinned)
+// whose rootfs path no longer holds the generation the member was built
+// from: an Admin's pull replaced the item since, so the recreate would run
+// a new image as root, which the deployer may not choose.
+func (s *Server) recreatePinnedImage(ctx context.Context, pf recreatePreflight, name string) error {
+	if !pf.pinned {
+		return nil
+	}
+	p, isPath, _ := lxc.TemplatePath(pf.template)
+	if !isPath {
+		return nil
+	}
+	// A fast refusal; the fetch (recreateFetchImage) copies the judged
+	// generation aside under the item's lock, and the create is built from
+	// that copy, so a pull over the item after this cannot reach it.
+	if lxc.ReadImageGen(lxc.BundleDir(p)) != pf.pinGen {
+		return s.pinnedImageReplaced(ctx, pf, name)
+	}
+	return nil
+}
+
+// pinnedImageReplaced is the refusal of a pinned recreate whose item is no
+// longer the generation the member was built from.
+func (s *Server) pinnedImageReplaced(ctx context.Context, pf recreatePreflight, name string) error {
+	s.audit(ctx, "ct.recreate-security", name, "image under "+pf.template+" replaced since the member was built", "denied")
+	return status.Errorf(codes.PermissionDenied,
+		"recreating container %q: it is privileged or legacy-confined, and the image under %q on %s is not the pull it was built from "+
+			"(the item was replaced since by a pull over it, or the member was built on another host, whose items are its own), "+
+			"so this recreate would run another image as root on the host; that needs the Admin role "+
+			"or the ContainerRoot role on it (lv role grant ContainerRoot <principal> --path %s). The member was left as it is",
+		name, pf.template, s.hostName, ctRBACPathFor(pf.project, name))
+}
+
+// recreateFetchImage fetches and verifies, on the member's host and before
+// its delete, the image the recreate's create is built from: an image this
+// host cannot fetch (a release the image server does not have, a server it
+// cannot reach, a rootfs path that is not one here) refuses the recreate,
+// and the member is left as it is. A download preflight without its image
+// (from an entry host that predates sending it) cannot be fetched here, and
+// is left to the create, as before.
+func (s *Server) recreateFetchImage(ctx context.Context, pf recreatePreflight, name string) error {
+	if pf.template == "" || (pf.template == "download" && pf.distro == "") {
+		return nil
+	}
+	if s.containerRuntime == nil {
+		return status.Errorf(codes.Unavailable,
+			"recreating container %q: no container runtime on %s to fetch its image; the member was left as it is", name, s.hostName)
+	}
+	opts := CreateContainerOpts{Name: name, Template: pf.template, Distro: pf.distro, Release: pf.release, Arch: pf.arch}
+	if p, isPath, _ := lxc.TemplatePath(pf.template); isPath && (pf.pinned || pf.bound) {
+		// The copy the create is built from is taken now, before the delete,
+		// and judged where it is taken: its owner, under the item's lock.
+		item := ociLibraryName(p, s.dataDir)
+		opts.Pinned, opts.PinnedGen, opts.PinAnyGen = true, pf.pinGen, !pf.pinned
+		opts.CheckItem = func(string) error { return s.refuseForeignOCIItem(ctx, item, pf.project, "be created from") }
+	}
+	if err := s.containerRuntime.FetchContainerImage(ctx, opts); err != nil {
+		if errors.Is(err, lxc.ErrImageReplaced) {
+			return s.pinnedImageReplaced(ctx, pf, name)
+		}
+		if status.Code(err) == codes.PermissionDenied {
+			return status.Errorf(codes.PermissionDenied, "recreating container %q: %s; the member was left as it is", name, status.Convert(err).Message())
+		}
+		image := pf.template
+		if pf.template == "download" {
+			image = pf.distro + ":" + pf.release
+		}
+		s.audit(ctx, "ct.create", name, "recreate cannot fetch image="+image, "error")
+		return status.Errorf(codes.FailedPrecondition,
+			"recreating container %q: %s cannot fetch its new image %q: %v; the member was left as it is",
+			name, s.hostName, image, err)
+	}
+	return nil
+}
+
+// recreateTemplateChecks is the protected-place and image-owner half of
+// recreateHostChecks.
+func (s *Server) recreateTemplateChecks(ctx context.Context, template, project, name string) error {
 	if err := s.checkContainerTemplate(template, name); err != nil {
 		return status.Errorf(status.Code(err), "recreating container %q: %s; the member was left as it is", name, status.Convert(err).Message())
 	}
@@ -122,4 +254,56 @@ func (s *Server) recreateHostChecks(ctx context.Context, template, project, name
 			name, status.Convert(err).Message(), s.hostName)
 	}
 	return nil
+}
+
+// A recreate whose member is on another host runs that host's checks, and
+// the fetch of the new image, twice: first as a probe in the judgment, on
+// the caller's context, so a caller who gives up during a slow fetch, or a
+// refusal, leaves the member as it is before anything is detached; then
+// again at the delete, where the fetch finds the image it kept
+// (lxc.LxcRunner.FetchImage). The probe rides InspectContainer for the
+// member, with the real name and recreateProbeMDKey: a host that knows the
+// probe answers it and says so in the recreateProbeMDKey response header;
+// a host that predates it serves the plain read InspectContainer always
+// was, and its checks run at the delete only, as before. Whatever the
+// build, the worst a probe can do is a read.
+const recreateProbeMDKey = "x-litevirt-recreate-probe-bin"
+
+// probeRecreateOnMember runs the member host's recreate checks for name
+// (pf), before the delete, on ctx.
+func (s *Server) probeRecreateOnMember(ctx context.Context, host, name string, pf *recreatePreflight) error {
+	c, closer, err := s.dialPeer(ctx, host)
+	if err != nil {
+		// The delete forwards to the same host, and refuses when it cannot
+		// reach it either; its own checks run there.
+		return nil
+	}
+	defer closer()
+	out := metadata.AppendToOutgoingContext(s.recreatePreflightOutgoing(withRecreatePreflight(ctx, pf)), recreateProbeMDKey, "1")
+	var hdr metadata.MD
+	_, err = c.InspectContainer(out, &pb.InspectContainerRequest{Name: name, HostName: host}, grpc.Header(&hdr))
+	if len(hdr.Get(recreateProbeMDKey)) == 0 {
+		if ctx.Err() != nil {
+			return status.Errorf(codes.Canceled, "recreating container %q: %v; the member was left as it is", name, ctx.Err())
+		}
+		return nil // a host that predates the probe: it checks at the delete
+	}
+	return err
+}
+
+// answerRecreateProbe answers a recreate probe (probeRecreateOnMember) from
+// a peer: handled reports whether req was one.
+func (s *Server) answerRecreateProbe(ctx context.Context, req *pb.InspectContainerRequest) (handled bool, err error) {
+	if !s.isRemotePeer(ctx) {
+		return false, nil
+	}
+	md, _ := metadata.FromIncomingContext(ctx)
+	if len(md.Get(recreateProbeMDKey)) == 0 {
+		return false, nil
+	}
+	_ = grpc.SetHeader(ctx, metadata.Pairs(recreateProbeMDKey, "1"))
+	if err := safename.ValidateContainerName(req.Name); err != nil {
+		return true, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	return true, s.recreateDeleteCheck(ctx, req.Name)
 }

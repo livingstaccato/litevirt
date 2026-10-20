@@ -301,6 +301,288 @@ func TestProtoNumbers_FirewallExtras(t *testing.T) {
 	}
 }
 
+// The live firmware migration RPCs' fields, messages and enums keep the
+// numbers they were given. The numbers were checked free against the
+// integration head and every open fork branch that adds proto.
+func TestProtoNumbers_LiveFirmware(t *testing.T) {
+	fields := []struct {
+		msg  protoreflect.ProtoMessage
+		num  protoreflect.FieldNumber
+		name protoreflect.Name
+	}{
+		{&pb.FirmwareRuntime{}, 1, "libvirt"},
+		{&pb.FirmwareRuntime{}, 2, "qemu"},
+		{&pb.FirmwareRuntime{}, 3, "swtpm"},
+		{&pb.FirmwareRuntime{}, 4, "libtpms"},
+		{&pb.FirmwareRuntime{}, 5, "ovmf_fingerprint"},
+		{&pb.FirmwareRuntime{}, 6, "live_firmware_enabled"},
+
+		{&pb.FirmwareApplicability{}, 1, "tpm"},
+		{&pb.FirmwareApplicability{}, 2, "uefi"},
+
+		{&pb.TargetDomain{}, 1, "present"},
+		{&pb.TargetDomain{}, 2, "state"},
+		{&pb.TargetDomain{}, 3, "reason"},
+		{&pb.TargetDomain{}, 4, "uuid"},
+
+		{&pb.PrepareLiveFirmwareTargetRequest{}, 1, "vm_name"},
+		{&pb.PrepareLiveFirmwareTargetRequest{}, 2, "uuid"},
+		{&pb.PrepareLiveFirmwareTargetRequest{}, 3, "created_at"},
+		{&pb.PrepareLiveFirmwareTargetRequest{}, 4, "attempt_id"},
+		{&pb.PrepareLiveFirmwareTargetRequest{}, 5, "protocol_version"},
+		{&pb.PrepareLiveFirmwareTargetRequest{}, 6, "src_runtime"},
+		{&pb.PrepareLiveFirmwareTargetRequest{}, 7, "src_applicability"},
+		{&pb.PrepareLiveFirmwareTargetRequest{}, 8, "source_domain_active"},
+		{&pb.PrepareLiveFirmwareTargetRequest{}, 9, "nvram"},
+		{&pb.PrepareLiveFirmwareTargetResponse{}, 1, "dst_runtime"},
+		{&pb.PrepareLiveFirmwareTargetResponse{}, 2, "dst_applicability"},
+		{&pb.PrepareLiveFirmwareTargetResponse{}, 3, "swtpm_absent"},
+		{&pb.PrepareLiveFirmwareTargetResponse{}, 4, "target_domain"},
+
+		{&pb.VerifyLiveFirmwareTargetRequest{}, 1, "vm_name"},
+		{&pb.VerifyLiveFirmwareTargetRequest{}, 2, "uuid"},
+		{&pb.VerifyLiveFirmwareTargetRequest{}, 3, "attempt_id"},
+		{&pb.VerifyLiveFirmwareTargetRequest{}, 4, "src_permall_sha256"},
+		{&pb.VerifyLiveFirmwareTargetResponse{}, 1, "verdict"},
+		{&pb.VerifyLiveFirmwareTargetResponse{}, 2, "dst_permall_sha256"},
+		{&pb.VerifyLiveFirmwareTargetResponse{}, 3, "target_domain"},
+		{&pb.VerifyLiveFirmwareTargetResponse{}, 4, "detail"},
+
+		{&pb.ReleaseLiveFirmwareTargetRequest{}, 1, "vm_name"},
+		{&pb.ReleaseLiveFirmwareTargetRequest{}, 2, "uuid"},
+		{&pb.ReleaseLiveFirmwareTargetRequest{}, 3, "attempt_id"},
+		{&pb.ReleaseLiveFirmwareTargetRequest{}, 4, "src_nvram_sha256"},
+		{&pb.ReleaseLiveFirmwareTargetRequest{}, 5, "nvram_final"},
+		{&pb.ReleaseLiveFirmwareTargetRequest{}, 6, "created_at"},
+		{&pb.ReleaseLiveFirmwareTargetResponse{}, 1, "nvram_sha256"},
+		{&pb.ReleaseLiveFirmwareTargetResponse{}, 2, "nvram_confirmed"},
+		{&pb.ReleaseLiveFirmwareTargetResponse{}, 3, "target_domain"},
+		{&pb.ReleaseLiveFirmwareTargetResponse{}, 4, "verdict"},
+		{&pb.ReleaseLiveFirmwareTargetResponse{}, 5, "detail"},
+
+		{&pb.AbortLiveFirmwareTargetRequest{}, 1, "vm_name"},
+		{&pb.AbortLiveFirmwareTargetRequest{}, 2, "uuid"},
+		{&pb.AbortLiveFirmwareTargetRequest{}, 3, "created_at"},
+		{&pb.AbortLiveFirmwareTargetRequest{}, 4, "attempt_id"},
+		{&pb.AbortLiveFirmwareTargetRequest{}, 5, "mode"},
+		{&pb.AbortLiveFirmwareTargetRequest{}, 6, "source_domain_active"},
+		{&pb.AbortLiveFirmwareTargetRequest{}, 7, "created_stubs"},
+		{&pb.AbortLiveFirmwareTargetResponse{}, 1, "target_domain"},
+		{&pb.AbortLiveFirmwareTargetResponse{}, 2, "hold_state"},
+		{&pb.AbortLiveFirmwareTargetResponse{}, 3, "refused"},
+		{&pb.AbortLiveFirmwareTargetResponse{}, 4, "detail"},
+
+		// lv doctor firmware-move (D2-18). FirmwareMoveDoctorTarget crosses
+		// builds during a rolling upgrade.
+		{&pb.FirmwareMoveDoctorRequest{}, 1, "vm_name"},
+		{&pb.FirmwareMoveDoctorRequest{}, 2, "action"},
+		{&pb.FirmwareMoveDoctorRequest{}, 3, "acknowledge_rollback"},
+		{&pb.FirmwareMoveDoctorRequest{}, 4, "stop_target"},
+		{&pb.FirmwareMoveDoctorRequest{}, 5, "accept_nvram_hash"},
+		{&pb.FirmwareMoveDoctorRequest{}, 6, "resolve_condition"},
+		{&pb.FirmwareMoveDoctorRequest{}, 7, "host"},
+
+		{&pb.FirmwareMoveDoctorResponse{}, 1, "hosts"},
+		{&pb.FirmwareMoveDoctorResponse{}, 2, "outcome"},
+		{&pb.FirmwareMoveDoctorResponse{}, 3, "unreachable"},
+
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 1, "vm_name"},
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 2, "uuid"},
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 3, "created_at"},
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 4, "attempt_id"},
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 5, "op"},
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 6, "operator"},
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 7, "reason"},
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 8, "accept_nvram_hash"},
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 9, "nvram"},
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 10, "src_nvram_sha256"},
+		{&pb.FirmwareMoveDoctorTargetRequest{}, 11, "acknowledge_rollback"},
+
+		{&pb.FirmwareMoveDoctorTargetResponse{}, 1, "target_domain"},
+		{&pb.FirmwareMoveDoctorTargetResponse{}, 2, "hold_state"},
+		{&pb.FirmwareMoveDoctorTargetResponse{}, 3, "detail"},
+		{&pb.FirmwareMoveDoctorTargetResponse{}, 4, "permall_sha256"},
+		{&pb.FirmwareMoveDoctorTargetResponse{}, 5, "nvram_sha256"},
+		{&pb.FirmwareMoveDoctorTargetResponse{}, 6, "nvram_t0_sha256"},
+
+		{&pb.FirmwareMoveHostRecords{}, 1, "host"},
+		{&pb.FirmwareMoveHostRecords{}, 2, "marker_json"},
+		{&pb.FirmwareMoveHostRecords{}, 3, "hold_json"},
+		{&pb.FirmwareMoveHostRecords{}, 4, "owed_discards"},
+		{&pb.FirmwareMoveHostRecords{}, 5, "quarantines"},
+		{&pb.FirmwareMoveHostRecords{}, 6, "retained"},
+		{&pb.FirmwareMoveHostRecords{}, 7, "domain"},
+		{&pb.FirmwareMoveHostRecords{}, 8, "hashes"},
+		{&pb.FirmwareMoveHostRecords{}, 9, "paths"},
+		{&pb.FirmwareMoveHostRecords{}, 10, "error"},
+		{&pb.FirmwareMoveHostRecords{}, 11, "leftover_json"},
+	}
+	for _, f := range fields {
+		md := f.msg.ProtoReflect().Descriptor()
+		fd := md.Fields().ByNumber(f.num)
+		if fd == nil || fd.Name() != f.name {
+			t.Errorf("%s field %d is %v, want %s", md.FullName(), f.num, fd, f.name)
+		}
+	}
+	enums := []struct {
+		ed   protoreflect.EnumDescriptor
+		num  protoreflect.EnumNumber
+		name protoreflect.Name
+	}{
+		{pb.FirmwareVerdict(0).Descriptor(), 0, "FIRMWARE_VERDICT_UNSPECIFIED"},
+		{pb.FirmwareVerdict(0).Descriptor(), 1, "FIRMWARE_VERDICT_BAD_REQUEST"},
+		{pb.FirmwareVerdict(0).Descriptor(), 2, "FIRMWARE_VERDICT_NOT_HELD"},
+		{pb.FirmwareVerdict(0).Descriptor(), 3, "FIRMWARE_VERDICT_NOT_RUNNING"},
+		{pb.FirmwareVerdict(0).Descriptor(), 4, "FIRMWARE_VERDICT_TARGET_RAN"},
+		{pb.FirmwareVerdict(0).Descriptor(), 5, "FIRMWARE_VERDICT_MATCH"},
+		{pb.FirmwareVerdict(0).Descriptor(), 6, "FIRMWARE_VERDICT_MISMATCH"},
+		{pb.FirmwareAbortMode(0).Descriptor(), 0, "FIRMWARE_ABORT_MODE_UNSPECIFIED"},
+		{pb.FirmwareAbortMode(0).Descriptor(), 1, "FIRMWARE_ABORT_MODE_PRE_CUTOVER"},
+		{pb.FirmwareAbortMode(0).Descriptor(), 2, "FIRMWARE_ABORT_MODE_DISCARD_UNVERIFIED"},
+		// Each value selects an operation, some of them destructive: a
+		// renumbered one would be read as another.
+		{pb.FirmwareMoveDoctorAction(0).Descriptor(), 0, "FIRMWARE_MOVE_DOCTOR_ACTION_UNSPECIFIED"},
+		{pb.FirmwareMoveDoctorAction(0).Descriptor(), 1, "FIRMWARE_MOVE_DOCTOR_ACTION_ACCEPT_TARGET"},
+		{pb.FirmwareMoveDoctorAction(0).Descriptor(), 2, "FIRMWARE_MOVE_DOCTOR_ACTION_ACCEPT_SOURCE"},
+		{pb.FirmwareMoveDoctorAction(0).Descriptor(), 3, "FIRMWARE_MOVE_DOCTOR_ACTION_ADOPT_TARGET_COPY"},
+		{pb.FirmwareMoveDoctorAction(0).Descriptor(), 4, "FIRMWARE_MOVE_DOCTOR_ACTION_DISCARD_TARGET"},
+		{pb.FirmwareMoveDoctorAction(0).Descriptor(), 5, "FIRMWARE_MOVE_DOCTOR_ACTION_CONFIRM_TARGET_NVRAM"},
+		{pb.FirmwareMoveDoctorAction(0).Descriptor(), 6, "FIRMWARE_MOVE_DOCTOR_ACTION_PUSH_SOURCE_NVRAM"},
+		{pb.FirmwareMoveDoctorAction(0).Descriptor(), 7, "FIRMWARE_MOVE_DOCTOR_ACTION_REVERIFY"},
+		{pb.FirmwareMoveDoctorAction(0).Descriptor(), 8, "FIRMWARE_MOVE_DOCTOR_ACTION_RESOLVE_CONDITION"},
+		{pb.FirmwareMoveDoctorTargetOp(0).Descriptor(), 0, "FIRMWARE_MOVE_DOCTOR_TARGET_OP_UNSPECIFIED"},
+		{pb.FirmwareMoveDoctorTargetOp(0).Descriptor(), 1, "FIRMWARE_MOVE_DOCTOR_TARGET_OP_STOP"},
+		{pb.FirmwareMoveDoctorTargetOp(0).Descriptor(), 2, "FIRMWARE_MOVE_DOCTOR_TARGET_OP_ADOPT"},
+		{pb.FirmwareMoveDoctorTargetOp(0).Descriptor(), 3, "FIRMWARE_MOVE_DOCTOR_TARGET_OP_CONFIRM_NVRAM"},
+		{pb.FirmwareMoveDoctorTargetOp(0).Descriptor(), 4, "FIRMWARE_MOVE_DOCTOR_TARGET_OP_PUSH_NVRAM"},
+	}
+	for _, e := range enums {
+		vd := e.ed.Values().ByNumber(e.num)
+		if vd == nil || vd.Name() != e.name {
+			t.Errorf("%s value %d is %v, want %s", e.ed.FullName(), e.num, vd, e.name)
+		}
+	}
+	for _, ed := range []protoreflect.EnumDescriptor{pb.FirmwareVerdict(0).Descriptor(), pb.FirmwareAbortMode(0).Descriptor(),
+		pb.FirmwareMoveDoctorAction(0).Descriptor(), pb.FirmwareMoveDoctorTargetOp(0).Descriptor()} {
+		n := 0
+		for _, e := range enums {
+			if e.ed == ed {
+				n++
+			}
+		}
+		if ed.Values().Len() != n {
+			t.Errorf("%s has %d values, the table pins %d", ed.FullName(), ed.Values().Len(), n)
+		}
+	}
+	svc := pb.File_litevirt_v1_service_proto.Services().ByName("LiteVirt")
+	for _, rpc := range []protoreflect.Name{
+		"PrepareLiveFirmwareTarget", "VerifyLiveFirmwareTarget",
+		"ReleaseLiveFirmwareTarget", "AbortLiveFirmwareTarget",
+		// lv doctor firmware-move (D2-18): the operator's RPC and the target's part.
+		"FirmwareMoveDoctor", "FirmwareMoveDoctorTarget",
+	} {
+		m := svc.Methods().ByName(rpc)
+		if m == nil {
+			t.Errorf("RPC %s is missing", rpc)
+			continue
+		}
+		if m.IsStreamingClient() || m.IsStreamingServer() {
+			t.Errorf("RPC %s streams; it is unary", rpc)
+		}
+		if got, want := m.Input().Name(), rpc+"Request"; got != want {
+			t.Errorf("RPC %s takes %s, want %s", rpc, got, want)
+		}
+		if got, want := m.Output().Name(), rpc+"Response"; got != want {
+			t.Errorf("RPC %s returns %s, want %s", rpc, got, want)
+		}
+	}
+}
+
+// Every live firmware migration message survives a binary and a protojson
+// round trip with every field set, and each of the four responses carries the
+// target's domain (spec §14, I-7).
+func TestProto_LiveFirmwareRoundTrip(t *testing.T) {
+	rt := &pb.FirmwareRuntime{
+		Libvirt: "10.0.0", Qemu: "8.2.2", Swtpm: "0.9.0", Libtpms: "0.9.3",
+		OvmfFingerprint: "sha256:ab12", LiveFirmwareEnabled: true,
+	}
+	app := &pb.FirmwareApplicability{Tpm: true, Uefi: true}
+	dom := &pb.TargetDomain{Present: true, State: "paused", Reason: "migration", Uuid: "6f1c2b3a-0000-4000-8000-000000000001"}
+	msgs := []proto.Message{
+		&pb.PrepareLiveFirmwareTargetRequest{
+			VmName: "web", Uuid: dom.Uuid, CreatedAt: "2026-10-15T10:00:00Z", AttemptId: "att-1",
+			ProtocolVersion: 1, SrcRuntime: rt, SrcApplicability: app, SourceDomainActive: true,
+			Nvram: []byte{0x00, 0xff, 0x10},
+		},
+		&pb.PrepareLiveFirmwareTargetResponse{DstRuntime: rt, DstApplicability: app, SwtpmAbsent: true, TargetDomain: dom},
+		&pb.VerifyLiveFirmwareTargetRequest{VmName: "web", Uuid: dom.Uuid, AttemptId: "att-1", SrcPermallSha256: "aa"},
+		&pb.VerifyLiveFirmwareTargetResponse{
+			Verdict: pb.FirmwareVerdict_FIRMWARE_VERDICT_MISMATCH, DstPermallSha256: "bb", TargetDomain: dom, Detail: "permall differs",
+		},
+		&pb.ReleaseLiveFirmwareTargetRequest{
+			VmName: "web", Uuid: dom.Uuid, AttemptId: "att-1", SrcNvramSha256: "cc",
+			NvramFinal: []byte{0x01, 0x02}, CreatedAt: "2026-10-15T10:00:00Z",
+		},
+		&pb.ReleaseLiveFirmwareTargetResponse{
+			NvramSha256: "cc", NvramConfirmed: true, TargetDomain: dom,
+			Verdict: pb.FirmwareVerdict_FIRMWARE_VERDICT_TARGET_RAN, Detail: "running",
+		},
+		&pb.AbortLiveFirmwareTargetRequest{
+			VmName: "web", Uuid: dom.Uuid, CreatedAt: "2026-10-15T10:00:00Z", AttemptId: "att-1",
+			Mode: pb.FirmwareAbortMode_FIRMWARE_ABORT_MODE_DISCARD_UNVERIFIED, SourceDomainActive: true,
+			CreatedStubs: []string{"/var/lib/litevirt/disks/web-0.qcow2"},
+		},
+		&pb.AbortLiveFirmwareTargetResponse{TargetDomain: dom, HoldState: "prepared", Refused: true, Detail: "domain defined"},
+	}
+	for _, in := range msgs {
+		// Every field is set, so a field the generator dropped or a setter
+		// that wrote the wrong field shows as an unpopulated one here.
+		md := in.ProtoReflect().Descriptor()
+		for i := 0; i < md.Fields().Len(); i++ {
+			if fd := md.Fields().Get(i); !in.ProtoReflect().Has(fd) {
+				t.Errorf("%s.%s is not set in the fixture", md.Name(), fd.Name())
+			}
+		}
+		b, err := proto.Marshal(in)
+		if err != nil {
+			t.Fatalf("marshal %s: %v", md.Name(), err)
+		}
+		bin := in.ProtoReflect().New().Interface()
+		if err := proto.Unmarshal(b, bin); err != nil {
+			t.Fatalf("unmarshal %s: %v", md.Name(), err)
+		}
+		if !proto.Equal(in, bin) {
+			t.Errorf("%s binary round trip: got %v, want %v", md.Name(), bin, in)
+		}
+		js, err := protojson.Marshal(in)
+		if err != nil {
+			t.Fatalf("protojson marshal %s: %v", md.Name(), err)
+		}
+		jo := in.ProtoReflect().New().Interface()
+		if err := protojson.Unmarshal(js, jo); err != nil {
+			t.Fatalf("protojson unmarshal %s: %v", md.Name(), err)
+		}
+		if !proto.Equal(in, jo) {
+			t.Errorf("%s protojson round trip: got %v, want %v", md.Name(), jo, in)
+		}
+		if strings.HasSuffix(string(md.Name()), "Response") {
+			fd := md.Fields().ByName("target_domain")
+			if fd == nil || fd.Message() == nil || fd.Message().Name() != "TargetDomain" {
+				t.Errorf("%s does not carry a TargetDomain", md.Name())
+			}
+		}
+	}
+
+	// The zero verdict and abort mode are UNSPECIFIED: an empty response (an
+	// older peer, a dropped field) never reads as MATCH or as a mode.
+	if v := (&pb.VerifyLiveFirmwareTargetResponse{}).GetVerdict(); v != pb.FirmwareVerdict_FIRMWARE_VERDICT_UNSPECIFIED {
+		t.Errorf("zero verdict = %v, want UNSPECIFIED", v)
+	}
+	if m := (&pb.AbortLiveFirmwareTargetRequest{}).GetMode(); m != pb.FirmwareAbortMode_FIRMWARE_ABORT_MODE_UNSPECIFIED {
+		t.Errorf("zero abort mode = %v, want UNSPECIFIED", m)
+	}
+}
+
 // The scoped operation abort and the Ping bit that gates it keep their numbers;
 // abort_scoped follows delete_force, the last PingResponse feature bit.
 func TestProtoNumbers_ScopedOperationAbort(t *testing.T) {
@@ -318,6 +600,85 @@ func TestProtoNumbers_ScopedOperationAbort(t *testing.T) {
 		fd := md.Fields().ByNumber(f.num)
 		if fd == nil || fd.Name() != f.name {
 			t.Errorf("%s field %d is %v, want %s", md.FullName(), f.num, fd, f.name)
+		}
+	}
+}
+
+// Storage hygiene (older-17 #9, #11): the set-aside overlay and replication
+// checkpoint RPCs, and their messages' numbers.
+func TestProtoNumbers_StorageHygiene(t *testing.T) {
+	fields := []struct {
+		msg  protoreflect.ProtoMessage
+		num  protoreflect.FieldNumber
+		name protoreflect.Name
+	}{
+		{&pb.ListSetAsideOverlaysRequest{}, 1, "host"},
+		{&pb.ListSetAsideOverlaysRequest{}, 2, "vm_name"},
+		{&pb.SetAsideOverlay{}, 1, "vm_name"},
+		{&pb.SetAsideOverlay{}, 2, "disk_name"},
+		{&pb.SetAsideOverlay{}, 3, "name"},
+		{&pb.SetAsideOverlay{}, 4, "path"},
+		{&pb.SetAsideOverlay{}, 5, "disk_path"},
+		{&pb.SetAsideOverlay{}, 6, "set_aside_at"},
+		{&pb.SetAsideOverlay{}, 7, "size_bytes"},
+		{&pb.SetAsideOverlay{}, 8, "in_use"},
+		{&pb.SetAsideOverlay{}, 9, "detached"},
+		{&pb.SetAsideOverlay{}, 10, "owner_vm_uuid"},
+		{&pb.ListSetAsideOverlaysResponse{}, 1, "host"},
+		{&pb.ListSetAsideOverlaysResponse{}, 2, "overlays"},
+		{&pb.RemoveSetAsideOverlayRequest{}, 1, "vm_name"},
+		{&pb.RemoveSetAsideOverlayRequest{}, 2, "disk_name"},
+		{&pb.RemoveSetAsideOverlayRequest{}, 3, "name"},
+		{&pb.RemoveSetAsideOverlayRequest{}, 4, "host"},
+		{&pb.RemoveSetAsideOverlayRequest{}, 5, "path"},
+		{&pb.RemoveSetAsideOverlayResponse{}, 1, "host"},
+		{&pb.RemoveSetAsideOverlayResponse{}, 2, "path"},
+		{&pb.RemoveSetAsideOverlayResponse{}, 3, "size_bytes"},
+		{&pb.ListReplicationCheckpointsRequest{}, 1, "vm_name"},
+		{&pb.ReplicationCheckpointRow{}, 1, "vm_name"},
+		{&pb.ReplicationCheckpointRow{}, 2, "target_pool"},
+		{&pb.ReplicationCheckpointRow{}, 3, "checkpoint"},
+		{&pb.ReplicationCheckpointRow{}, 4, "updated_at"},
+		{&pb.ReplicationCheckpointRow{}, 5, "in_use"},
+		{&pb.ReplicationCheckpointRow{}, 6, "vm_deleted"},
+		{&pb.ListReplicationCheckpointsResponse{}, 1, "checkpoints"},
+		{&pb.DeleteReplicationCheckpointRequest{}, 1, "vm_name"},
+		{&pb.DeleteReplicationCheckpointRequest{}, 2, "target_pool"},
+		{&pb.DeleteReplicationCheckpointResponse{}, 1, "checkpoint"},
+		{&pb.DeleteReplicationCheckpointResponse{}, 2, "bitmap"},
+		{&pb.DeleteReplicationCheckpointResponse{}, 3, "host"},
+	}
+	for _, f := range fields {
+		md := f.msg.ProtoReflect().Descriptor()
+		fd := md.Fields().ByNumber(f.num)
+		if fd == nil || fd.Name() != f.name {
+			t.Errorf("%s field %d is %v, want %s", md.FullName(), f.num, fd, f.name)
+		}
+	}
+	kinds := []struct {
+		msg  protoreflect.ProtoMessage
+		name protoreflect.Name
+		kind protoreflect.Kind
+	}{
+		{&pb.SetAsideOverlay{}, "in_use", protoreflect.StringKind},
+		{&pb.SetAsideOverlay{}, "size_bytes", protoreflect.Int64Kind},
+		{&pb.SetAsideOverlay{}, "detached", protoreflect.BoolKind},
+		{&pb.ReplicationCheckpointRow{}, "in_use", protoreflect.BoolKind},
+		{&pb.ReplicationCheckpointRow{}, "vm_deleted", protoreflect.BoolKind},
+		{&pb.RemoveSetAsideOverlayResponse{}, "size_bytes", protoreflect.Int64Kind},
+		{&pb.ListSetAsideOverlaysResponse{}, "overlays", protoreflect.MessageKind},
+		{&pb.ListReplicationCheckpointsResponse{}, "checkpoints", protoreflect.MessageKind},
+	}
+	for _, k := range kinds {
+		fd := k.msg.ProtoReflect().Descriptor().Fields().ByName(k.name)
+		if fd == nil || fd.Kind() != k.kind {
+			t.Errorf("%s.%s is %v, want kind %v", k.msg.ProtoReflect().Descriptor().FullName(), k.name, fd, k.kind)
+		}
+	}
+	svc := pb.File_litevirt_v1_service_proto.Services().ByName("LiteVirt")
+	for _, rpc := range []protoreflect.Name{"ListSetAsideOverlays", "RemoveSetAsideOverlay", "ListReplicationCheckpoints", "DeleteReplicationCheckpoint"} {
+		if svc.Methods().ByName(rpc) == nil {
+			t.Errorf("RPC %s is missing", rpc)
 		}
 	}
 }

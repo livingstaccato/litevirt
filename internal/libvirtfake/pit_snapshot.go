@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -46,6 +47,10 @@ func (f *Fake) SnapshotDiskExternal(domain, diskPath, overlay string) (bool, err
 }
 
 func (f *Fake) CommitDiskOverlay(domain, diskPath, overlay, diskFormat string, beforePivot func() error) error {
+	// As libvirt.Client: the commit ends in a redefine.
+	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpDefine, Name: domain}); err != nil {
+		return fmt.Errorf("commit %s into %s: %w", overlay, diskPath, err)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if st := f.domains[domain]; st == StateRunning || st == StatePaused {

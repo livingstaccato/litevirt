@@ -20,355 +20,365 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	LiteVirt_ListHosts_FullMethodName                  = "/litevirt.v1.LiteVirt/ListHosts"
-	LiteVirt_InspectHost_FullMethodName                = "/litevirt.v1.LiteVirt/InspectHost"
-	LiteVirt_DrainHost_FullMethodName                  = "/litevirt.v1.LiteVirt/DrainHost"
-	LiteVirt_ShutdownHostWorkloads_FullMethodName      = "/litevirt.v1.LiteVirt/ShutdownHostWorkloads"
-	LiteVirt_UndrainHost_FullMethodName                = "/litevirt.v1.LiteVirt/UndrainHost"
-	LiteVirt_FailbackHost_FullMethodName               = "/litevirt.v1.LiteVirt/FailbackHost"
-	LiteVirt_GetFailbackPolicy_FullMethodName          = "/litevirt.v1.LiteVirt/GetFailbackPolicy"
-	LiteVirt_SetFailbackPolicy_FullMethodName          = "/litevirt.v1.LiteVirt/SetFailbackPolicy"
-	LiteVirt_SetHostLabels_FullMethodName              = "/litevirt.v1.LiteVirt/SetHostLabels"
-	LiteVirt_FenceHost_FullMethodName                  = "/litevirt.v1.LiteVirt/FenceHost"
-	LiteVirt_GetClusterHealth_FullMethodName           = "/litevirt.v1.LiteVirt/GetClusterHealth"
-	LiteVirt_ResolveHealthCondition_FullMethodName     = "/litevirt.v1.LiteVirt/ResolveHealthCondition"
-	LiteVirt_GetFenceReadiness_FullMethodName          = "/litevirt.v1.LiteVirt/GetFenceReadiness"
-	LiteVirt_RemoveHost_FullMethodName                 = "/litevirt.v1.LiteVirt/RemoveHost"
-	LiteVirt_PreflightRemoveHost_FullMethodName        = "/litevirt.v1.LiteVirt/PreflightRemoveHost"
-	LiteVirt_AdmitHost_FullMethodName                  = "/litevirt.v1.LiteVirt/AdmitHost"
-	LiteVirt_ListHostNetworks_FullMethodName           = "/litevirt.v1.LiteVirt/ListHostNetworks"
-	LiteVirt_UpsertHostNetwork_FullMethodName          = "/litevirt.v1.LiteVirt/UpsertHostNetwork"
-	LiteVirt_PlanHostNetwork_FullMethodName            = "/litevirt.v1.LiteVirt/PlanHostNetwork"
-	LiteVirt_ApplyHostNetwork_FullMethodName           = "/litevirt.v1.LiteVirt/ApplyHostNetwork"
-	LiteVirt_DeleteHostNetwork_FullMethodName          = "/litevirt.v1.LiteVirt/DeleteHostNetwork"
-	LiteVirt_IsolateHost_FullMethodName                = "/litevirt.v1.LiteVirt/IsolateHost"
-	LiteVirt_ReseedHost_FullMethodName                 = "/litevirt.v1.LiteVirt/ReseedHost"
-	LiteVirt_PublishCRL_FullMethodName                 = "/litevirt.v1.LiteVirt/PublishCRL"
-	LiteVirt_RevokeReplacedCertificate_FullMethodName  = "/litevirt.v1.LiteVirt/RevokeReplacedCertificate"
-	LiteVirt_RescanHost_FullMethodName                 = "/litevirt.v1.LiteVirt/RescanHost"
-	LiteVirt_ListHostDevices_FullMethodName            = "/litevirt.v1.LiteVirt/ListHostDevices"
-	LiteVirt_SupersededDisks_FullMethodName            = "/litevirt.v1.LiteVirt/SupersededDisks"
-	LiteVirt_UpgradeHost_FullMethodName                = "/litevirt.v1.LiteVirt/UpgradeHost"
-	LiteVirt_PreStageUpgrade_FullMethodName            = "/litevirt.v1.LiteVirt/PreStageUpgrade"
-	LiteVirt_FetchBinary_FullMethodName                = "/litevirt.v1.LiteVirt/FetchBinary"
-	LiteVirt_UninstallHost_FullMethodName              = "/litevirt.v1.LiteVirt/UninstallHost"
-	LiteVirt_ConfigureHost_FullMethodName              = "/litevirt.v1.LiteVirt/ConfigureHost"
-	LiteVirt_CreateVM_FullMethodName                   = "/litevirt.v1.LiteVirt/CreateVM"
-	LiteVirt_ListVMs_FullMethodName                    = "/litevirt.v1.LiteVirt/ListVMs"
-	LiteVirt_InspectVM_FullMethodName                  = "/litevirt.v1.LiteVirt/InspectVM"
-	LiteVirt_ListVMHardware_FullMethodName             = "/litevirt.v1.LiteVirt/ListVMHardware"
-	LiteVirt_StartVM_FullMethodName                    = "/litevirt.v1.LiteVirt/StartVM"
-	LiteVirt_StopVM_FullMethodName                     = "/litevirt.v1.LiteVirt/StopVM"
-	LiteVirt_RestartVM_FullMethodName                  = "/litevirt.v1.LiteVirt/RestartVM"
-	LiteVirt_DeleteVM_FullMethodName                   = "/litevirt.v1.LiteVirt/DeleteVM"
-	LiteVirt_RepairVMOwner_FullMethodName              = "/litevirt.v1.LiteVirt/RepairVMOwner"
-	LiteVirt_GetRuntimeInventory_FullMethodName        = "/litevirt.v1.LiteVirt/GetRuntimeInventory"
-	LiteVirt_CollectOrphanProof_FullMethodName         = "/litevirt.v1.LiteVirt/CollectOrphanProof"
-	LiteVirt_GetMembershipView_FullMethodName          = "/litevirt.v1.LiteVirt/GetMembershipView"
-	LiteVirt_CheckVIPParticipant_FullMethodName        = "/litevirt.v1.LiteVirt/CheckVIPParticipant"
-	LiteVirt_RelayCheckVIPParticipant_FullMethodName   = "/litevirt.v1.LiteVirt/RelayCheckVIPParticipant"
-	LiteVirt_CheckLBPresent_FullMethodName             = "/litevirt.v1.LiteVirt/CheckLBPresent"
-	LiteVirt_CloneVM_FullMethodName                    = "/litevirt.v1.LiteVirt/CloneVM"
-	LiteVirt_ConvertToTemplate_FullMethodName          = "/litevirt.v1.LiteVirt/ConvertToTemplate"
-	LiteVirt_ExecVM_FullMethodName                     = "/litevirt.v1.LiteVirt/ExecVM"
-	LiteVirt_ConsoleVM_FullMethodName                  = "/litevirt.v1.LiteVirt/ConsoleVM"
-	LiteVirt_SetVMIP_FullMethodName                    = "/litevirt.v1.LiteVirt/SetVMIP"
-	LiteVirt_SetBootOrder_FullMethodName               = "/litevirt.v1.LiteVirt/SetBootOrder"
-	LiteVirt_RebuildVM_FullMethodName                  = "/litevirt.v1.LiteVirt/RebuildVM"
-	LiteVirt_CutoverVM_FullMethodName                  = "/litevirt.v1.LiteVirt/CutoverVM"
-	LiteVirt_UpdateVM_FullMethodName                   = "/litevirt.v1.LiteVirt/UpdateVM"
-	LiteVirt_SetVMMemory_FullMethodName                = "/litevirt.v1.LiteVirt/SetVMMemory"
-	LiteVirt_SetVMLabels_FullMethodName                = "/litevirt.v1.LiteVirt/SetVMLabels"
-	LiteVirt_PatchVMSpec_FullMethodName                = "/litevirt.v1.LiteVirt/PatchVMSpec"
-	LiteVirt_AttachDevice_FullMethodName               = "/litevirt.v1.LiteVirt/AttachDevice"
-	LiteVirt_DetachDevice_FullMethodName               = "/litevirt.v1.LiteVirt/DetachDevice"
-	LiteVirt_ResizeDisk_FullMethodName                 = "/litevirt.v1.LiteVirt/ResizeDisk"
-	LiteVirt_SetDiskIO_FullMethodName                  = "/litevirt.v1.LiteVirt/SetDiskIO"
-	LiteVirt_ProxyVNC_FullMethodName                   = "/litevirt.v1.LiteVirt/ProxyVNC"
-	LiteVirt_GetVMLogs_FullMethodName                  = "/litevirt.v1.LiteVirt/GetVMLogs"
-	LiteVirt_DeployStack_FullMethodName                = "/litevirt.v1.LiteVirt/DeployStack"
-	LiteVirt_DeleteStack_FullMethodName                = "/litevirt.v1.LiteVirt/DeleteStack"
-	LiteVirt_ListStacks_FullMethodName                 = "/litevirt.v1.LiteVirt/ListStacks"
-	LiteVirt_DiffStack_FullMethodName                  = "/litevirt.v1.LiteVirt/DiffStack"
-	LiteVirt_ExportStack_FullMethodName                = "/litevirt.v1.LiteVirt/ExportStack"
-	LiteVirt_MigrateVM_FullMethodName                  = "/litevirt.v1.LiteVirt/MigrateVM"
-	LiteVirt_MoveVolume_FullMethodName                 = "/litevirt.v1.LiteVirt/MoveVolume"
-	LiteVirt_ReplicateVolume_FullMethodName            = "/litevirt.v1.LiteVirt/ReplicateVolume"
-	LiteVirt_MigrateStackVolumes_FullMethodName        = "/litevirt.v1.LiteVirt/MigrateStackVolumes"
-	LiteVirt_PullImage_FullMethodName                  = "/litevirt.v1.LiteVirt/PullImage"
-	LiteVirt_ListImages_FullMethodName                 = "/litevirt.v1.LiteVirt/ListImages"
-	LiteVirt_DeleteImage_FullMethodName                = "/litevirt.v1.LiteVirt/DeleteImage"
-	LiteVirt_ImportImage_FullMethodName                = "/litevirt.v1.LiteVirt/ImportImage"
-	LiteVirt_PushImage_FullMethodName                  = "/litevirt.v1.LiteVirt/PushImage"
-	LiteVirt_BuildImage_FullMethodName                 = "/litevirt.v1.LiteVirt/BuildImage"
-	LiteVirt_PruneImages_FullMethodName                = "/litevirt.v1.LiteVirt/PruneImages"
-	LiteVirt_RemoveImage_FullMethodName                = "/litevirt.v1.LiteVirt/RemoveImage"
-	LiteVirt_BackupVM_FullMethodName                   = "/litevirt.v1.LiteVirt/BackupVM"
-	LiteVirt_RestoreVM_FullMethodName                  = "/litevirt.v1.LiteVirt/RestoreVM"
-	LiteVirt_ImportVM_FullMethodName                   = "/litevirt.v1.LiteVirt/ImportVM"
-	LiteVirt_CreateSnapshot_FullMethodName             = "/litevirt.v1.LiteVirt/CreateSnapshot"
-	LiteVirt_ListSnapshots_FullMethodName              = "/litevirt.v1.LiteVirt/ListSnapshots"
-	LiteVirt_RestoreSnapshot_FullMethodName            = "/litevirt.v1.LiteVirt/RestoreSnapshot"
-	LiteVirt_DeleteSnapshot_FullMethodName             = "/litevirt.v1.LiteVirt/DeleteSnapshot"
-	LiteVirt_CreateNetwork_FullMethodName              = "/litevirt.v1.LiteVirt/CreateNetwork"
-	LiteVirt_GetNetwork_FullMethodName                 = "/litevirt.v1.LiteVirt/GetNetwork"
-	LiteVirt_DeleteNetwork_FullMethodName              = "/litevirt.v1.LiteVirt/DeleteNetwork"
-	LiteVirt_ListNetworks_FullMethodName               = "/litevirt.v1.LiteVirt/ListNetworks"
-	LiteVirt_RekeyBinding_FullMethodName               = "/litevirt.v1.LiteVirt/RekeyBinding"
-	LiteVirt_ResumeBinding_FullMethodName              = "/litevirt.v1.LiteVirt/ResumeBinding"
-	LiteVirt_ListLoadBalancers_FullMethodName          = "/litevirt.v1.LiteVirt/ListLoadBalancers"
-	LiteVirt_InspectLoadBalancer_FullMethodName        = "/litevirt.v1.LiteVirt/InspectLoadBalancer"
-	LiteVirt_CreateLoadBalancer_FullMethodName         = "/litevirt.v1.LiteVirt/CreateLoadBalancer"
-	LiteVirt_UpdateLoadBalancer_FullMethodName         = "/litevirt.v1.LiteVirt/UpdateLoadBalancer"
-	LiteVirt_DeleteLoadBalancer_FullMethodName         = "/litevirt.v1.LiteVirt/DeleteLoadBalancer"
-	LiteVirt_LBStats_FullMethodName                    = "/litevirt.v1.LiteVirt/LBStats"
-	LiteVirt_DrainBackend_FullMethodName               = "/litevirt.v1.LiteVirt/DrainBackend"
-	LiteVirt_DisableBackend_FullMethodName             = "/litevirt.v1.LiteVirt/DisableBackend"
-	LiteVirt_EnableBackend_FullMethodName              = "/litevirt.v1.LiteVirt/EnableBackend"
-	LiteVirt_ApplyLB_FullMethodName                    = "/litevirt.v1.LiteVirt/ApplyLB"
-	LiteVirt_RemoveLB_FullMethodName                   = "/litevirt.v1.LiteVirt/RemoveLB"
-	LiteVirt_LBKeepalivedRunning_FullMethodName        = "/litevirt.v1.LiteVirt/LBKeepalivedRunning"
-	LiteVirt_Login_FullMethodName                      = "/litevirt.v1.LiteVirt/Login"
-	LiteVirt_ListRealms_FullMethodName                 = "/litevirt.v1.LiteVirt/ListRealms"
-	LiteVirt_BeginOIDCLogin_FullMethodName             = "/litevirt.v1.LiteVirt/BeginOIDCLogin"
-	LiteVirt_Logout_FullMethodName                     = "/litevirt.v1.LiteVirt/Logout"
-	LiteVirt_ListSessions_FullMethodName               = "/litevirt.v1.LiteVirt/ListSessions"
-	LiteVirt_RevokeSession_FullMethodName              = "/litevirt.v1.LiteVirt/RevokeSession"
-	LiteVirt_CreateUser_FullMethodName                 = "/litevirt.v1.LiteVirt/CreateUser"
-	LiteVirt_ListUsers_FullMethodName                  = "/litevirt.v1.LiteVirt/ListUsers"
-	LiteVirt_DeleteUser_FullMethodName                 = "/litevirt.v1.LiteVirt/DeleteUser"
-	LiteVirt_MarkUserExternal_FullMethodName           = "/litevirt.v1.LiteVirt/MarkUserExternal"
-	LiteVirt_SetUserAccount_FullMethodName             = "/litevirt.v1.LiteVirt/SetUserAccount"
-	LiteVirt_GetLoginPolicy_FullMethodName             = "/litevirt.v1.LiteVirt/GetLoginPolicy"
-	LiteVirt_SetLoginPolicy_FullMethodName             = "/litevirt.v1.LiteVirt/SetLoginPolicy"
-	LiteVirt_IssueEnrollmentCode_FullMethodName        = "/litevirt.v1.LiteVirt/IssueEnrollmentCode"
-	LiteVirt_ListUserVariants_FullMethodName           = "/litevirt.v1.LiteVirt/ListUserVariants"
-	LiteVirt_ClearIdentityBinding_FullMethodName       = "/litevirt.v1.LiteVirt/ClearIdentityBinding"
-	LiteVirt_CreateToken_FullMethodName                = "/litevirt.v1.LiteVirt/CreateToken"
-	LiteVirt_RevokeToken_FullMethodName                = "/litevirt.v1.LiteVirt/RevokeToken"
-	LiteVirt_Whoami_FullMethodName                     = "/litevirt.v1.LiteVirt/Whoami"
-	LiteVirt_CheckPermissions_FullMethodName           = "/litevirt.v1.LiteVirt/CheckPermissions"
-	LiteVirt_ChangePassword_FullMethodName             = "/litevirt.v1.LiteVirt/ChangePassword"
-	LiteVirt_ResetAdminPassword_FullMethodName         = "/litevirt.v1.LiteVirt/ResetAdminPassword"
-	LiteVirt_ListTwoFactors_FullMethodName             = "/litevirt.v1.LiteVirt/ListTwoFactors"
-	LiteVirt_EnrollTOTP_FullMethodName                 = "/litevirt.v1.LiteVirt/EnrollTOTP"
-	LiteVirt_DisableTwoFactor_FullMethodName           = "/litevirt.v1.LiteVirt/DisableTwoFactor"
-	LiteVirt_GrantRole_FullMethodName                  = "/litevirt.v1.LiteVirt/GrantRole"
-	LiteVirt_RevokeRole_FullMethodName                 = "/litevirt.v1.LiteVirt/RevokeRole"
-	LiteVirt_ListRoleBindings_FullMethodName           = "/litevirt.v1.LiteVirt/ListRoleBindings"
-	LiteVirt_NormalizeRoleBindings_FullMethodName      = "/litevirt.v1.LiteVirt/NormalizeRoleBindings"
-	LiteVirt_GetVMOperation_FullMethodName             = "/litevirt.v1.LiteVirt/GetVMOperation"
-	LiteVirt_AbortVMOperation_FullMethodName           = "/litevirt.v1.LiteVirt/AbortVMOperation"
-	LiteVirt_ReleaseHostReservation_FullMethodName     = "/litevirt.v1.LiteVirt/ReleaseHostReservation"
-	LiteVirt_BeginWebAuthnRegistration_FullMethodName  = "/litevirt.v1.LiteVirt/BeginWebAuthnRegistration"
-	LiteVirt_FinishWebAuthnRegistration_FullMethodName = "/litevirt.v1.LiteVirt/FinishWebAuthnRegistration"
-	LiteVirt_BeginWebAuthnLogin_FullMethodName         = "/litevirt.v1.LiteVirt/BeginWebAuthnLogin"
-	LiteVirt_FinishWebAuthnLogin_FullMethodName        = "/litevirt.v1.LiteVirt/FinishWebAuthnLogin"
-	LiteVirt_RestoreLive_FullMethodName                = "/litevirt.v1.LiteVirt/RestoreLive"
-	LiteVirt_BindSecurityGroups_FullMethodName         = "/litevirt.v1.LiteVirt/BindSecurityGroups"
-	LiteVirt_ReloadFirewall_FullMethodName             = "/litevirt.v1.LiteVirt/ReloadFirewall"
-	LiteVirt_SetNICGuard_FullMethodName                = "/litevirt.v1.LiteVirt/SetNICGuard"
-	LiteVirt_ListNICGuards_FullMethodName              = "/litevirt.v1.LiteVirt/ListNICGuards"
-	LiteVirt_GetFirewallEnforcement_FullMethodName     = "/litevirt.v1.LiteVirt/GetFirewallEnforcement"
-	LiteVirt_SetFirewallEnforcement_FullMethodName     = "/litevirt.v1.LiteVirt/SetFirewallEnforcement"
-	LiteVirt_ResetFirewallWouldDrops_FullMethodName    = "/litevirt.v1.LiteVirt/ResetFirewallWouldDrops"
-	LiteVirt_ArmNICFirewall_FullMethodName             = "/litevirt.v1.LiteVirt/ArmNICFirewall"
-	LiteVirt_ResumeHeldVM_FullMethodName               = "/litevirt.v1.LiteVirt/ResumeHeldVM"
-	LiteVirt_SetNetworkGuardConfig_FullMethodName      = "/litevirt.v1.LiteVirt/SetNetworkGuardConfig"
-	LiteVirt_BackupSnapshot_FullMethodName             = "/litevirt.v1.LiteVirt/BackupSnapshot"
-	LiteVirt_RestoreFromBackup_FullMethodName          = "/litevirt.v1.LiteVirt/RestoreFromBackup"
-	LiteVirt_ListBackupFiles_FullMethodName            = "/litevirt.v1.LiteVirt/ListBackupFiles"
-	LiteVirt_RestoreBackupFiles_FullMethodName         = "/litevirt.v1.LiteVirt/RestoreBackupFiles"
-	LiteVirt_HasChunks_FullMethodName                  = "/litevirt.v1.LiteVirt/HasChunks"
-	LiteVirt_PushBackup_FullMethodName                 = "/litevirt.v1.LiteVirt/PushBackup"
-	LiteVirt_VerifyBackupRepo_FullMethodName           = "/litevirt.v1.LiteVirt/VerifyBackupRepo"
-	LiteVirt_GarbageCollectBackupRepo_FullMethodName   = "/litevirt.v1.LiteVirt/GarbageCollectBackupRepo"
-	LiteVirt_PruneBackupRepo_FullMethodName            = "/litevirt.v1.LiteVirt/PruneBackupRepo"
-	LiteVirt_SyncBackupRepo_FullMethodName             = "/litevirt.v1.LiteVirt/SyncBackupRepo"
-	LiteVirt_SetBackupRepoCompression_FullMethodName   = "/litevirt.v1.LiteVirt/SetBackupRepoCompression"
-	LiteVirt_ListBackupRepoSnapshots_FullMethodName    = "/litevirt.v1.LiteVirt/ListBackupRepoSnapshots"
-	LiteVirt_CreateContainer_FullMethodName            = "/litevirt.v1.LiteVirt/CreateContainer"
-	LiteVirt_StartContainer_FullMethodName             = "/litevirt.v1.LiteVirt/StartContainer"
-	LiteVirt_StopContainer_FullMethodName              = "/litevirt.v1.LiteVirt/StopContainer"
-	LiteVirt_DeleteContainer_FullMethodName            = "/litevirt.v1.LiteVirt/DeleteContainer"
-	LiteVirt_ExecContainer_FullMethodName              = "/litevirt.v1.LiteVirt/ExecContainer"
-	LiteVirt_ListContainers_FullMethodName             = "/litevirt.v1.LiteVirt/ListContainers"
-	LiteVirt_InspectContainer_FullMethodName           = "/litevirt.v1.LiteVirt/InspectContainer"
-	LiteVirt_ProbeContainerBackups_FullMethodName      = "/litevirt.v1.LiteVirt/ProbeContainerBackups"
-	LiteVirt_ListContainerReplicas_FullMethodName      = "/litevirt.v1.LiteVirt/ListContainerReplicas"
-	LiteVirt_RemoveContainerReplicas_FullMethodName    = "/litevirt.v1.LiteVirt/RemoveContainerReplicas"
-	LiteVirt_RestoreContainerReplica_FullMethodName    = "/litevirt.v1.LiteVirt/RestoreContainerReplica"
-	LiteVirt_PullOCIImage_FullMethodName               = "/litevirt.v1.LiteVirt/PullOCIImage"
-	LiteVirt_BackupContainer_FullMethodName            = "/litevirt.v1.LiteVirt/BackupContainer"
-	LiteVirt_RestoreContainer_FullMethodName           = "/litevirt.v1.LiteVirt/RestoreContainer"
-	LiteVirt_MigrateContainer_FullMethodName           = "/litevirt.v1.LiteVirt/MigrateContainer"
-	LiteVirt_SnapshotContainer_FullMethodName          = "/litevirt.v1.LiteVirt/SnapshotContainer"
-	LiteVirt_ListContainerSnapshots_FullMethodName     = "/litevirt.v1.LiteVirt/ListContainerSnapshots"
-	LiteVirt_RevertContainerSnapshot_FullMethodName    = "/litevirt.v1.LiteVirt/RevertContainerSnapshot"
-	LiteVirt_DeleteContainerSnapshot_FullMethodName    = "/litevirt.v1.LiteVirt/DeleteContainerSnapshot"
-	LiteVirt_ConvertContainerToTemplate_FullMethodName = "/litevirt.v1.LiteVirt/ConvertContainerToTemplate"
-	LiteVirt_CloneContainer_FullMethodName             = "/litevirt.v1.LiteVirt/CloneContainer"
-	LiteVirt_ConvertContainer_FullMethodName           = "/litevirt.v1.LiteVirt/ConvertContainer"
-	LiteVirt_PrepareContainerTarget_FullMethodName     = "/litevirt.v1.LiteVirt/PrepareContainerTarget"
-	LiteVirt_GetVMStats_FullMethodName                 = "/litevirt.v1.LiteVirt/GetVMStats"
-	LiteVirt_GetHostStats_FullMethodName               = "/litevirt.v1.LiteVirt/GetHostStats"
-	LiteVirt_GetClusterStatus_FullMethodName           = "/litevirt.v1.LiteVirt/GetClusterStatus"
-	LiteVirt_StreamEvents_FullMethodName               = "/litevirt.v1.LiteVirt/StreamEvents"
-	LiteVirt_ListAuditLog_FullMethodName               = "/litevirt.v1.LiteVirt/ListAuditLog"
-	LiteVirt_ListVMEvents_FullMethodName               = "/litevirt.v1.LiteVirt/ListVMEvents"
-	LiteVirt_ListStoragePools_FullMethodName           = "/litevirt.v1.LiteVirt/ListStoragePools"
-	LiteVirt_CreateStoragePool_FullMethodName          = "/litevirt.v1.LiteVirt/CreateStoragePool"
-	LiteVirt_DeleteStoragePool_FullMethodName          = "/litevirt.v1.LiteVirt/DeleteStoragePool"
-	LiteVirt_GetStoragePool_FullMethodName             = "/litevirt.v1.LiteVirt/GetStoragePool"
-	LiteVirt_ListStoragePoolContents_FullMethodName    = "/litevirt.v1.LiteVirt/ListStoragePoolContents"
-	LiteVirt_UploadStoragePoolContent_FullMethodName   = "/litevirt.v1.LiteVirt/UploadStoragePoolContent"
-	LiteVirt_CreateResourceMapping_FullMethodName      = "/litevirt.v1.LiteVirt/CreateResourceMapping"
-	LiteVirt_ListResourceMappings_FullMethodName       = "/litevirt.v1.LiteVirt/ListResourceMappings"
-	LiteVirt_DeleteResourceMapping_FullMethodName      = "/litevirt.v1.LiteVirt/DeleteResourceMapping"
-	LiteVirt_AddMappingDevice_FullMethodName           = "/litevirt.v1.LiteVirt/AddMappingDevice"
-	LiteVirt_RemoveMappingDevice_FullMethodName        = "/litevirt.v1.LiteVirt/RemoveMappingDevice"
-	LiteVirt_CreateNotificationTarget_FullMethodName   = "/litevirt.v1.LiteVirt/CreateNotificationTarget"
-	LiteVirt_ListNotificationTargets_FullMethodName    = "/litevirt.v1.LiteVirt/ListNotificationTargets"
-	LiteVirt_DeleteNotificationTarget_FullMethodName   = "/litevirt.v1.LiteVirt/DeleteNotificationTarget"
-	LiteVirt_TestNotificationTarget_FullMethodName     = "/litevirt.v1.LiteVirt/TestNotificationTarget"
-	LiteVirt_CreateNotificationRoute_FullMethodName    = "/litevirt.v1.LiteVirt/CreateNotificationRoute"
-	LiteVirt_ListNotificationRoutes_FullMethodName     = "/litevirt.v1.LiteVirt/ListNotificationRoutes"
-	LiteVirt_DeleteNotificationRoute_FullMethodName    = "/litevirt.v1.LiteVirt/DeleteNotificationRoute"
-	LiteVirt_SetRegistryCredential_FullMethodName      = "/litevirt.v1.LiteVirt/SetRegistryCredential"
-	LiteVirt_ListRegistryCredentials_FullMethodName    = "/litevirt.v1.LiteVirt/ListRegistryCredentials"
-	LiteVirt_DeleteRegistryCredential_FullMethodName   = "/litevirt.v1.LiteVirt/DeleteRegistryCredential"
-	LiteVirt_CreateClusterFirewallRule_FullMethodName  = "/litevirt.v1.LiteVirt/CreateClusterFirewallRule"
-	LiteVirt_ListClusterFirewallRules_FullMethodName   = "/litevirt.v1.LiteVirt/ListClusterFirewallRules"
-	LiteVirt_DeleteClusterFirewallRule_FullMethodName  = "/litevirt.v1.LiteVirt/DeleteClusterFirewallRule"
-	LiteVirt_CreateHostFirewallRule_FullMethodName     = "/litevirt.v1.LiteVirt/CreateHostFirewallRule"
-	LiteVirt_ListHostFirewallRules_FullMethodName      = "/litevirt.v1.LiteVirt/ListHostFirewallRules"
-	LiteVirt_DeleteHostFirewallRule_FullMethodName     = "/litevirt.v1.LiteVirt/DeleteHostFirewallRule"
-	LiteVirt_CreateIpSet_FullMethodName                = "/litevirt.v1.LiteVirt/CreateIpSet"
-	LiteVirt_ListIpSets_FullMethodName                 = "/litevirt.v1.LiteVirt/ListIpSets"
-	LiteVirt_DeleteIpSet_FullMethodName                = "/litevirt.v1.LiteVirt/DeleteIpSet"
-	LiteVirt_SetFirewallDefault_FullMethodName         = "/litevirt.v1.LiteVirt/SetFirewallDefault"
-	LiteVirt_ListFirewallDefaults_FullMethodName       = "/litevirt.v1.LiteVirt/ListFirewallDefaults"
-	LiteVirt_GetFirewallSynflood_FullMethodName        = "/litevirt.v1.LiteVirt/GetFirewallSynflood"
-	LiteVirt_SetFirewallSynflood_FullMethodName        = "/litevirt.v1.LiteVirt/SetFirewallSynflood"
-	LiteVirt_GetFirewallLogPolicy_FullMethodName       = "/litevirt.v1.LiteVirt/GetFirewallLogPolicy"
-	LiteVirt_SetFirewallLogPolicy_FullMethodName       = "/litevirt.v1.LiteVirt/SetFirewallLogPolicy"
-	LiteVirt_ListFirewallLog_FullMethodName            = "/litevirt.v1.LiteVirt/ListFirewallLog"
-	LiteVirt_ListFirewallTagGroups_FullMethodName      = "/litevirt.v1.LiteVirt/ListFirewallTagGroups"
-	LiteVirt_SetFirewallTagGroup_FullMethodName        = "/litevirt.v1.LiteVirt/SetFirewallTagGroup"
-	LiteVirt_DeleteFirewallTagGroup_FullMethodName     = "/litevirt.v1.LiteVirt/DeleteFirewallTagGroup"
-	LiteVirt_ListFirewallTags_FullMethodName           = "/litevirt.v1.LiteVirt/ListFirewallTags"
-	LiteVirt_SetFirewallTags_FullMethodName            = "/litevirt.v1.LiteVirt/SetFirewallTags"
-	LiteVirt_CreateSecurityGroup_FullMethodName        = "/litevirt.v1.LiteVirt/CreateSecurityGroup"
-	LiteVirt_DeleteSecurityGroup_FullMethodName        = "/litevirt.v1.LiteVirt/DeleteSecurityGroup"
-	LiteVirt_AddSecurityGroupRule_FullMethodName       = "/litevirt.v1.LiteVirt/AddSecurityGroupRule"
-	LiteVirt_RemoveSecurityGroupRule_FullMethodName    = "/litevirt.v1.LiteVirt/RemoveSecurityGroupRule"
-	LiteVirt_ListSecurityGroups_FullMethodName         = "/litevirt.v1.LiteVirt/ListSecurityGroups"
-	LiteVirt_DeleteStoragePoolContent_FullMethodName   = "/litevirt.v1.LiteVirt/DeleteStoragePoolContent"
-	LiteVirt_ListISOs_FullMethodName                   = "/litevirt.v1.LiteVirt/ListISOs"
-	LiteVirt_PullISO_FullMethodName                    = "/litevirt.v1.LiteVirt/PullISO"
-	LiteVirt_GetISOLibraryMode_FullMethodName          = "/litevirt.v1.LiteVirt/GetISOLibraryMode"
-	LiteVirt_SetISOLibraryMode_FullMethodName          = "/litevirt.v1.LiteVirt/SetISOLibraryMode"
-	LiteVirt_FetchISOLibraryFile_FullMethodName        = "/litevirt.v1.LiteVirt/FetchISOLibraryFile"
-	LiteVirt_PushReplicaIncrement_FullMethodName       = "/litevirt.v1.LiteVirt/PushReplicaIncrement"
-	LiteVirt_ListReplicas_FullMethodName               = "/litevirt.v1.LiteVirt/ListReplicas"
-	LiteVirt_PushReplica_FullMethodName                = "/litevirt.v1.LiteVirt/PushReplica"
-	LiteVirt_PruneReplicas_FullMethodName              = "/litevirt.v1.LiteVirt/PruneReplicas"
-	LiteVirt_Ping_FullMethodName                       = "/litevirt.v1.LiteVirt/Ping"
-	LiteVirt_Ready_FullMethodName                      = "/litevirt.v1.LiteVirt/Ready"
-	LiteVirt_ProvisionNetwork_FullMethodName           = "/litevirt.v1.LiteVirt/ProvisionNetwork"
-	LiteVirt_SyncVTEP_FullMethodName                   = "/litevirt.v1.LiteVirt/SyncVTEP"
-	LiteVirt_GetVMIPRemote_FullMethodName              = "/litevirt.v1.LiteVirt/GetVMIPRemote"
-	LiteVirt_RefreshLB_FullMethodName                  = "/litevirt.v1.LiteVirt/RefreshLB"
-	LiteVirt_UpdateFDB_FullMethodName                  = "/litevirt.v1.LiteVirt/UpdateFDB"
-	LiteVirt_EnsureCloudInit_FullMethodName            = "/litevirt.v1.LiteVirt/EnsureCloudInit"
-	LiteVirt_EnsureDisks_FullMethodName                = "/litevirt.v1.LiteVirt/EnsureDisks"
-	LiteVirt_EnsureFirmwareState_FullMethodName        = "/litevirt.v1.LiteVirt/EnsureFirmwareState"
-	LiteVirt_RollbackFirmwareState_FullMethodName      = "/litevirt.v1.LiteVirt/RollbackFirmwareState"
-	LiteVirt_CleanupMigrationArtifacts_FullMethodName  = "/litevirt.v1.LiteVirt/CleanupMigrationArtifacts"
-	LiteVirt_ReceiveMigrationDisk_FullMethodName       = "/litevirt.v1.LiteVirt/ReceiveMigrationDisk"
-	LiteVirt_CheckCPUCompatibility_FullMethodName      = "/litevirt.v1.LiteVirt/CheckCPUCompatibility"
-	LiteVirt_AnnounceMigratedGuest_FullMethodName      = "/litevirt.v1.LiteVirt/AnnounceMigratedGuest"
-	LiteVirt_GetStateDigest_FullMethodName             = "/litevirt.v1.LiteVirt/GetStateDigest"
-	LiteVirt_AcknowledgeLeaseTermTie_FullMethodName    = "/litevirt.v1.LiteVirt/AcknowledgeLeaseTermTie"
-	LiteVirt_GetLeaseTermHighWater_FullMethodName      = "/litevirt.v1.LiteVirt/GetLeaseTermHighWater"
-	LiteVirt_GetStateDump_FullMethodName               = "/litevirt.v1.LiteVirt/GetStateDump"
-	LiteVirt_StreamStateDump_FullMethodName            = "/litevirt.v1.LiteVirt/StreamStateDump"
-	LiteVirt_StreamTableDump_FullMethodName            = "/litevirt.v1.LiteVirt/StreamTableDump"
-	LiteVirt_GetSensitiveStateDigest_FullMethodName    = "/litevirt.v1.LiteVirt/GetSensitiveStateDigest"
-	LiteVirt_StreamSensitiveStateDump_FullMethodName   = "/litevirt.v1.LiteVirt/StreamSensitiveStateDump"
-	LiteVirt_GetTableBucketDigests_FullMethodName      = "/litevirt.v1.LiteVirt/GetTableBucketDigests"
-	LiteVirt_StreamTableRows_FullMethodName            = "/litevirt.v1.LiteVirt/StreamTableRows"
-	LiteVirt_StreamSensitiveTableRows_FullMethodName   = "/litevirt.v1.LiteVirt/StreamSensitiveTableRows"
-	LiteVirt_TriggerAntiEntropy_FullMethodName         = "/litevirt.v1.LiteVirt/TriggerAntiEntropy"
-	LiteVirt_GetClusterStateDigest_FullMethodName      = "/litevirt.v1.LiteVirt/GetClusterStateDigest"
-	LiteVirt_PrepareRecoveryClaim_FullMethodName       = "/litevirt.v1.LiteVirt/PrepareRecoveryClaim"
-	LiteVirt_AcceptRecoveryClaim_FullMethodName        = "/litevirt.v1.LiteVirt/AcceptRecoveryClaim"
-	LiteVirt_GetRecoveryClaim_FullMethodName           = "/litevirt.v1.LiteVirt/GetRecoveryClaim"
-	LiteVirt_ListRecoveryClaims_FullMethodName         = "/litevirt.v1.LiteVirt/ListRecoveryClaims"
-	LiteVirt_AbandonRecoveryProof_FullMethodName       = "/litevirt.v1.LiteVirt/AbandonRecoveryProof"
-	LiteVirt_AttestSharedDiskUnused_FullMethodName     = "/litevirt.v1.LiteVirt/AttestSharedDiskUnused"
-	LiteVirt_ReleaseLegacyHeldClaim_FullMethodName     = "/litevirt.v1.LiteVirt/ReleaseLegacyHeldClaim"
-	LiteVirt_PlanDeadHostRemoval_FullMethodName        = "/litevirt.v1.LiteVirt/PlanDeadHostRemoval"
-	LiteVirt_ForceReconfigureVoters_FullMethodName     = "/litevirt.v1.LiteVirt/ForceReconfigureVoters"
-	LiteVirt_SignForcedVoterConfig_FullMethodName      = "/litevirt.v1.LiteVirt/SignForcedVoterConfig"
-	LiteVirt_InspectRecoveryClaim_FullMethodName       = "/litevirt.v1.LiteVirt/InspectRecoveryClaim"
-	LiteVirt_ConfirmPartitionResume_FullMethodName     = "/litevirt.v1.LiteVirt/ConfirmPartitionResume"
-	LiteVirt_GetVoterConfig_FullMethodName             = "/litevirt.v1.LiteVirt/GetVoterConfig"
-	LiteVirt_ChangeVoterConfig_FullMethodName          = "/litevirt.v1.LiteVirt/ChangeVoterConfig"
-	LiteVirt_DiagnoseDivergence_FullMethodName         = "/litevirt.v1.LiteVirt/DiagnoseDivergence"
-	LiteVirt_ScanSensitiveDivergence_FullMethodName    = "/litevirt.v1.LiteVirt/ScanSensitiveDivergence"
-	LiteVirt_PushMutations_FullMethodName              = "/litevirt.v1.LiteVirt/PushMutations"
-	LiteVirt_AckMutations_FullMethodName               = "/litevirt.v1.LiteVirt/AckMutations"
-	LiteVirt_ListRebalanceProposals_FullMethodName     = "/litevirt.v1.LiteVirt/ListRebalanceProposals"
-	LiteVirt_RunRebalance_FullMethodName               = "/litevirt.v1.LiteVirt/RunRebalance"
-	LiteVirt_ApproveRebalanceProposal_FullMethodName   = "/litevirt.v1.LiteVirt/ApproveRebalanceProposal"
-	LiteVirt_RejectRebalanceProposal_FullMethodName    = "/litevirt.v1.LiteVirt/RejectRebalanceProposal"
-	LiteVirt_GetSpiceInfo_FullMethodName               = "/litevirt.v1.LiteVirt/GetSpiceInfo"
-	LiteVirt_ProxySpice_FullMethodName                 = "/litevirt.v1.LiteVirt/ProxySpice"
-	LiteVirt_PreflightUpgrade_FullMethodName           = "/litevirt.v1.LiteVirt/PreflightUpgrade"
-	LiteVirt_ListRegions_FullMethodName                = "/litevirt.v1.LiteVirt/ListRegions"
-	LiteVirt_RegionStatus_FullMethodName               = "/litevirt.v1.LiteVirt/RegionStatus"
-	LiteVirt_CrossRegionMigrate_FullMethodName         = "/litevirt.v1.LiteVirt/CrossRegionMigrate"
-	LiteVirt_GetFailoverScope_FullMethodName           = "/litevirt.v1.LiteVirt/GetFailoverScope"
-	LiteVirt_SetFailoverScope_FullMethodName           = "/litevirt.v1.LiteVirt/SetFailoverScope"
-	LiteVirt_GetVRRPTransport_FullMethodName           = "/litevirt.v1.LiteVirt/GetVRRPTransport"
-	LiteVirt_SetVRRPTransport_FullMethodName           = "/litevirt.v1.LiteVirt/SetVRRPTransport"
-	LiteVirt_GetHAPolicy_FullMethodName                = "/litevirt.v1.LiteVirt/GetHAPolicy"
-	LiteVirt_SetHAPolicy_FullMethodName                = "/litevirt.v1.LiteVirt/SetHAPolicy"
-	LiteVirt_RestoreRelay_FullMethodName               = "/litevirt.v1.LiteVirt/RestoreRelay"
-	LiteVirt_GetRelayHealth_FullMethodName             = "/litevirt.v1.LiteVirt/GetRelayHealth"
-	LiteVirt_GetUpgradeStatus_FullMethodName           = "/litevirt.v1.LiteVirt/GetUpgradeStatus"
-	LiteVirt_HoldsReleaseFeatureUse_FullMethodName     = "/litevirt.v1.LiteVirt/HoldsReleaseFeatureUse"
-	LiteVirt_UpsertServiceEndpoint_FullMethodName      = "/litevirt.v1.LiteVirt/UpsertServiceEndpoint"
-	LiteVirt_ListServiceEndpoints_FullMethodName       = "/litevirt.v1.LiteVirt/ListServiceEndpoints"
-	LiteVirt_DeleteServiceEndpoint_FullMethodName      = "/litevirt.v1.LiteVirt/DeleteServiceEndpoint"
-	LiteVirt_CreateBackupSchedule_FullMethodName       = "/litevirt.v1.LiteVirt/CreateBackupSchedule"
-	LiteVirt_ListBackupSchedules_FullMethodName        = "/litevirt.v1.LiteVirt/ListBackupSchedules"
-	LiteVirt_DeleteBackupSchedule_FullMethodName       = "/litevirt.v1.LiteVirt/DeleteBackupSchedule"
-	LiteVirt_CreateReplicationSchedule_FullMethodName  = "/litevirt.v1.LiteVirt/CreateReplicationSchedule"
-	LiteVirt_ListReplicationSchedules_FullMethodName   = "/litevirt.v1.LiteVirt/ListReplicationSchedules"
-	LiteVirt_DeleteReplicationSchedule_FullMethodName  = "/litevirt.v1.LiteVirt/DeleteReplicationSchedule"
-	LiteVirt_PromoteReplica_FullMethodName             = "/litevirt.v1.LiteVirt/PromoteReplica"
-	LiteVirt_ResolvePITOverlay_FullMethodName          = "/litevirt.v1.LiteVirt/ResolvePITOverlay"
-	LiteVirt_VerifyAuditChain_FullMethodName           = "/litevirt.v1.LiteVirt/VerifyAuditChain"
-	LiteVirt_ExportAuditChain_FullMethodName           = "/litevirt.v1.LiteVirt/ExportAuditChain"
-	LiteVirt_RetireAuditKey_FullMethodName             = "/litevirt.v1.LiteVirt/RetireAuditKey"
-	LiteVirt_CreateProject_FullMethodName              = "/litevirt.v1.LiteVirt/CreateProject"
-	LiteVirt_ListProjects_FullMethodName               = "/litevirt.v1.LiteVirt/ListProjects"
-	LiteVirt_GetProject_FullMethodName                 = "/litevirt.v1.LiteVirt/GetProject"
-	LiteVirt_DeleteProject_FullMethodName              = "/litevirt.v1.LiteVirt/DeleteProject"
-	LiteVirt_SetProjectQuota_FullMethodName            = "/litevirt.v1.LiteVirt/SetProjectQuota"
-	LiteVirt_GetProjectQuota_FullMethodName            = "/litevirt.v1.LiteVirt/GetProjectQuota"
-	LiteVirt_GetProjectUsage_FullMethodName            = "/litevirt.v1.LiteVirt/GetProjectUsage"
-	LiteVirt_ExecuteCreateVM_FullMethodName            = "/litevirt.v1.LiteVirt/ExecuteCreateVM"
-	LiteVirt_ReserveProjectCapacity_FullMethodName     = "/litevirt.v1.LiteVirt/ReserveProjectCapacity"
-	LiteVirt_ReleaseProjectCapacity_FullMethodName     = "/litevirt.v1.LiteVirt/ReleaseProjectCapacity"
-	LiteVirt_ReserveHostCapacity_FullMethodName        = "/litevirt.v1.LiteVirt/ReserveHostCapacity"
-	LiteVirt_ReleaseHostCapacity_FullMethodName        = "/litevirt.v1.LiteVirt/ReleaseHostCapacity"
-	LiteVirt_ImportLeftoverStatus_FullMethodName       = "/litevirt.v1.LiteVirt/ImportLeftoverStatus"
-	LiteVirt_LUNHolders_FullMethodName                 = "/litevirt.v1.LiteVirt/LUNHolders"
-	LiteVirt_ISCSILUNHolds_FullMethodName              = "/litevirt.v1.LiteVirt/ISCSILUNHolds"
-	LiteVirt_PreflightRecreateVM_FullMethodName        = "/litevirt.v1.LiteVirt/PreflightRecreateVM"
+	LiteVirt_ListHosts_FullMethodName                   = "/litevirt.v1.LiteVirt/ListHosts"
+	LiteVirt_InspectHost_FullMethodName                 = "/litevirt.v1.LiteVirt/InspectHost"
+	LiteVirt_DrainHost_FullMethodName                   = "/litevirt.v1.LiteVirt/DrainHost"
+	LiteVirt_ShutdownHostWorkloads_FullMethodName       = "/litevirt.v1.LiteVirt/ShutdownHostWorkloads"
+	LiteVirt_UndrainHost_FullMethodName                 = "/litevirt.v1.LiteVirt/UndrainHost"
+	LiteVirt_FailbackHost_FullMethodName                = "/litevirt.v1.LiteVirt/FailbackHost"
+	LiteVirt_GetFailbackPolicy_FullMethodName           = "/litevirt.v1.LiteVirt/GetFailbackPolicy"
+	LiteVirt_SetFailbackPolicy_FullMethodName           = "/litevirt.v1.LiteVirt/SetFailbackPolicy"
+	LiteVirt_SetHostLabels_FullMethodName               = "/litevirt.v1.LiteVirt/SetHostLabels"
+	LiteVirt_FenceHost_FullMethodName                   = "/litevirt.v1.LiteVirt/FenceHost"
+	LiteVirt_GetClusterHealth_FullMethodName            = "/litevirt.v1.LiteVirt/GetClusterHealth"
+	LiteVirt_ResolveHealthCondition_FullMethodName      = "/litevirt.v1.LiteVirt/ResolveHealthCondition"
+	LiteVirt_GetFenceReadiness_FullMethodName           = "/litevirt.v1.LiteVirt/GetFenceReadiness"
+	LiteVirt_RemoveHost_FullMethodName                  = "/litevirt.v1.LiteVirt/RemoveHost"
+	LiteVirt_PreflightRemoveHost_FullMethodName         = "/litevirt.v1.LiteVirt/PreflightRemoveHost"
+	LiteVirt_AdmitHost_FullMethodName                   = "/litevirt.v1.LiteVirt/AdmitHost"
+	LiteVirt_ListHostNetworks_FullMethodName            = "/litevirt.v1.LiteVirt/ListHostNetworks"
+	LiteVirt_UpsertHostNetwork_FullMethodName           = "/litevirt.v1.LiteVirt/UpsertHostNetwork"
+	LiteVirt_PlanHostNetwork_FullMethodName             = "/litevirt.v1.LiteVirt/PlanHostNetwork"
+	LiteVirt_ApplyHostNetwork_FullMethodName            = "/litevirt.v1.LiteVirt/ApplyHostNetwork"
+	LiteVirt_DeleteHostNetwork_FullMethodName           = "/litevirt.v1.LiteVirt/DeleteHostNetwork"
+	LiteVirt_IsolateHost_FullMethodName                 = "/litevirt.v1.LiteVirt/IsolateHost"
+	LiteVirt_ReseedHost_FullMethodName                  = "/litevirt.v1.LiteVirt/ReseedHost"
+	LiteVirt_PublishCRL_FullMethodName                  = "/litevirt.v1.LiteVirt/PublishCRL"
+	LiteVirt_RevokeReplacedCertificate_FullMethodName   = "/litevirt.v1.LiteVirt/RevokeReplacedCertificate"
+	LiteVirt_RescanHost_FullMethodName                  = "/litevirt.v1.LiteVirt/RescanHost"
+	LiteVirt_ListHostDevices_FullMethodName             = "/litevirt.v1.LiteVirt/ListHostDevices"
+	LiteVirt_SupersededDisks_FullMethodName             = "/litevirt.v1.LiteVirt/SupersededDisks"
+	LiteVirt_UpgradeHost_FullMethodName                 = "/litevirt.v1.LiteVirt/UpgradeHost"
+	LiteVirt_PreStageUpgrade_FullMethodName             = "/litevirt.v1.LiteVirt/PreStageUpgrade"
+	LiteVirt_FetchBinary_FullMethodName                 = "/litevirt.v1.LiteVirt/FetchBinary"
+	LiteVirt_UninstallHost_FullMethodName               = "/litevirt.v1.LiteVirt/UninstallHost"
+	LiteVirt_ConfigureHost_FullMethodName               = "/litevirt.v1.LiteVirt/ConfigureHost"
+	LiteVirt_CreateVM_FullMethodName                    = "/litevirt.v1.LiteVirt/CreateVM"
+	LiteVirt_ListVMs_FullMethodName                     = "/litevirt.v1.LiteVirt/ListVMs"
+	LiteVirt_InspectVM_FullMethodName                   = "/litevirt.v1.LiteVirt/InspectVM"
+	LiteVirt_ListVMHardware_FullMethodName              = "/litevirt.v1.LiteVirt/ListVMHardware"
+	LiteVirt_StartVM_FullMethodName                     = "/litevirt.v1.LiteVirt/StartVM"
+	LiteVirt_StopVM_FullMethodName                      = "/litevirt.v1.LiteVirt/StopVM"
+	LiteVirt_RestartVM_FullMethodName                   = "/litevirt.v1.LiteVirt/RestartVM"
+	LiteVirt_DeleteVM_FullMethodName                    = "/litevirt.v1.LiteVirt/DeleteVM"
+	LiteVirt_RepairVMOwner_FullMethodName               = "/litevirt.v1.LiteVirt/RepairVMOwner"
+	LiteVirt_FirmwareMoveDoctor_FullMethodName          = "/litevirt.v1.LiteVirt/FirmwareMoveDoctor"
+	LiteVirt_GetRuntimeInventory_FullMethodName         = "/litevirt.v1.LiteVirt/GetRuntimeInventory"
+	LiteVirt_CollectOrphanProof_FullMethodName          = "/litevirt.v1.LiteVirt/CollectOrphanProof"
+	LiteVirt_GetMembershipView_FullMethodName           = "/litevirt.v1.LiteVirt/GetMembershipView"
+	LiteVirt_CheckVIPParticipant_FullMethodName         = "/litevirt.v1.LiteVirt/CheckVIPParticipant"
+	LiteVirt_RelayCheckVIPParticipant_FullMethodName    = "/litevirt.v1.LiteVirt/RelayCheckVIPParticipant"
+	LiteVirt_CheckLBPresent_FullMethodName              = "/litevirt.v1.LiteVirt/CheckLBPresent"
+	LiteVirt_CloneVM_FullMethodName                     = "/litevirt.v1.LiteVirt/CloneVM"
+	LiteVirt_ConvertToTemplate_FullMethodName           = "/litevirt.v1.LiteVirt/ConvertToTemplate"
+	LiteVirt_ExecVM_FullMethodName                      = "/litevirt.v1.LiteVirt/ExecVM"
+	LiteVirt_ConsoleVM_FullMethodName                   = "/litevirt.v1.LiteVirt/ConsoleVM"
+	LiteVirt_SetVMIP_FullMethodName                     = "/litevirt.v1.LiteVirt/SetVMIP"
+	LiteVirt_SetBootOrder_FullMethodName                = "/litevirt.v1.LiteVirt/SetBootOrder"
+	LiteVirt_RebuildVM_FullMethodName                   = "/litevirt.v1.LiteVirt/RebuildVM"
+	LiteVirt_CutoverVM_FullMethodName                   = "/litevirt.v1.LiteVirt/CutoverVM"
+	LiteVirt_UpdateVM_FullMethodName                    = "/litevirt.v1.LiteVirt/UpdateVM"
+	LiteVirt_SetVMMemory_FullMethodName                 = "/litevirt.v1.LiteVirt/SetVMMemory"
+	LiteVirt_SetVMLabels_FullMethodName                 = "/litevirt.v1.LiteVirt/SetVMLabels"
+	LiteVirt_PatchVMSpec_FullMethodName                 = "/litevirt.v1.LiteVirt/PatchVMSpec"
+	LiteVirt_AttachDevice_FullMethodName                = "/litevirt.v1.LiteVirt/AttachDevice"
+	LiteVirt_DetachDevice_FullMethodName                = "/litevirt.v1.LiteVirt/DetachDevice"
+	LiteVirt_ResizeDisk_FullMethodName                  = "/litevirt.v1.LiteVirt/ResizeDisk"
+	LiteVirt_SetDiskIO_FullMethodName                   = "/litevirt.v1.LiteVirt/SetDiskIO"
+	LiteVirt_ProxyVNC_FullMethodName                    = "/litevirt.v1.LiteVirt/ProxyVNC"
+	LiteVirt_GetVMLogs_FullMethodName                   = "/litevirt.v1.LiteVirt/GetVMLogs"
+	LiteVirt_DeployStack_FullMethodName                 = "/litevirt.v1.LiteVirt/DeployStack"
+	LiteVirt_DeleteStack_FullMethodName                 = "/litevirt.v1.LiteVirt/DeleteStack"
+	LiteVirt_ListStacks_FullMethodName                  = "/litevirt.v1.LiteVirt/ListStacks"
+	LiteVirt_DiffStack_FullMethodName                   = "/litevirt.v1.LiteVirt/DiffStack"
+	LiteVirt_ExportStack_FullMethodName                 = "/litevirt.v1.LiteVirt/ExportStack"
+	LiteVirt_MigrateVM_FullMethodName                   = "/litevirt.v1.LiteVirt/MigrateVM"
+	LiteVirt_MoveVolume_FullMethodName                  = "/litevirt.v1.LiteVirt/MoveVolume"
+	LiteVirt_ReplicateVolume_FullMethodName             = "/litevirt.v1.LiteVirt/ReplicateVolume"
+	LiteVirt_MigrateStackVolumes_FullMethodName         = "/litevirt.v1.LiteVirt/MigrateStackVolumes"
+	LiteVirt_PullImage_FullMethodName                   = "/litevirt.v1.LiteVirt/PullImage"
+	LiteVirt_ListImages_FullMethodName                  = "/litevirt.v1.LiteVirt/ListImages"
+	LiteVirt_DeleteImage_FullMethodName                 = "/litevirt.v1.LiteVirt/DeleteImage"
+	LiteVirt_ImportImage_FullMethodName                 = "/litevirt.v1.LiteVirt/ImportImage"
+	LiteVirt_PushImage_FullMethodName                   = "/litevirt.v1.LiteVirt/PushImage"
+	LiteVirt_BuildImage_FullMethodName                  = "/litevirt.v1.LiteVirt/BuildImage"
+	LiteVirt_PruneImages_FullMethodName                 = "/litevirt.v1.LiteVirt/PruneImages"
+	LiteVirt_RemoveImage_FullMethodName                 = "/litevirt.v1.LiteVirt/RemoveImage"
+	LiteVirt_BackupVM_FullMethodName                    = "/litevirt.v1.LiteVirt/BackupVM"
+	LiteVirt_RestoreVM_FullMethodName                   = "/litevirt.v1.LiteVirt/RestoreVM"
+	LiteVirt_ImportVM_FullMethodName                    = "/litevirt.v1.LiteVirt/ImportVM"
+	LiteVirt_CreateSnapshot_FullMethodName              = "/litevirt.v1.LiteVirt/CreateSnapshot"
+	LiteVirt_ListSnapshots_FullMethodName               = "/litevirt.v1.LiteVirt/ListSnapshots"
+	LiteVirt_RestoreSnapshot_FullMethodName             = "/litevirt.v1.LiteVirt/RestoreSnapshot"
+	LiteVirt_DeleteSnapshot_FullMethodName              = "/litevirt.v1.LiteVirt/DeleteSnapshot"
+	LiteVirt_CreateNetwork_FullMethodName               = "/litevirt.v1.LiteVirt/CreateNetwork"
+	LiteVirt_GetNetwork_FullMethodName                  = "/litevirt.v1.LiteVirt/GetNetwork"
+	LiteVirt_DeleteNetwork_FullMethodName               = "/litevirt.v1.LiteVirt/DeleteNetwork"
+	LiteVirt_ListNetworks_FullMethodName                = "/litevirt.v1.LiteVirt/ListNetworks"
+	LiteVirt_RekeyBinding_FullMethodName                = "/litevirt.v1.LiteVirt/RekeyBinding"
+	LiteVirt_ResumeBinding_FullMethodName               = "/litevirt.v1.LiteVirt/ResumeBinding"
+	LiteVirt_ListLoadBalancers_FullMethodName           = "/litevirt.v1.LiteVirt/ListLoadBalancers"
+	LiteVirt_InspectLoadBalancer_FullMethodName         = "/litevirt.v1.LiteVirt/InspectLoadBalancer"
+	LiteVirt_CreateLoadBalancer_FullMethodName          = "/litevirt.v1.LiteVirt/CreateLoadBalancer"
+	LiteVirt_UpdateLoadBalancer_FullMethodName          = "/litevirt.v1.LiteVirt/UpdateLoadBalancer"
+	LiteVirt_DeleteLoadBalancer_FullMethodName          = "/litevirt.v1.LiteVirt/DeleteLoadBalancer"
+	LiteVirt_LBStats_FullMethodName                     = "/litevirt.v1.LiteVirt/LBStats"
+	LiteVirt_DrainBackend_FullMethodName                = "/litevirt.v1.LiteVirt/DrainBackend"
+	LiteVirt_DisableBackend_FullMethodName              = "/litevirt.v1.LiteVirt/DisableBackend"
+	LiteVirt_EnableBackend_FullMethodName               = "/litevirt.v1.LiteVirt/EnableBackend"
+	LiteVirt_ApplyLB_FullMethodName                     = "/litevirt.v1.LiteVirt/ApplyLB"
+	LiteVirt_RemoveLB_FullMethodName                    = "/litevirt.v1.LiteVirt/RemoveLB"
+	LiteVirt_LBKeepalivedRunning_FullMethodName         = "/litevirt.v1.LiteVirt/LBKeepalivedRunning"
+	LiteVirt_Login_FullMethodName                       = "/litevirt.v1.LiteVirt/Login"
+	LiteVirt_ListRealms_FullMethodName                  = "/litevirt.v1.LiteVirt/ListRealms"
+	LiteVirt_BeginOIDCLogin_FullMethodName              = "/litevirt.v1.LiteVirt/BeginOIDCLogin"
+	LiteVirt_Logout_FullMethodName                      = "/litevirt.v1.LiteVirt/Logout"
+	LiteVirt_ListSessions_FullMethodName                = "/litevirt.v1.LiteVirt/ListSessions"
+	LiteVirt_RevokeSession_FullMethodName               = "/litevirt.v1.LiteVirt/RevokeSession"
+	LiteVirt_CreateUser_FullMethodName                  = "/litevirt.v1.LiteVirt/CreateUser"
+	LiteVirt_ListUsers_FullMethodName                   = "/litevirt.v1.LiteVirt/ListUsers"
+	LiteVirt_DeleteUser_FullMethodName                  = "/litevirt.v1.LiteVirt/DeleteUser"
+	LiteVirt_MarkUserExternal_FullMethodName            = "/litevirt.v1.LiteVirt/MarkUserExternal"
+	LiteVirt_SetUserAccount_FullMethodName              = "/litevirt.v1.LiteVirt/SetUserAccount"
+	LiteVirt_GetLoginPolicy_FullMethodName              = "/litevirt.v1.LiteVirt/GetLoginPolicy"
+	LiteVirt_SetLoginPolicy_FullMethodName              = "/litevirt.v1.LiteVirt/SetLoginPolicy"
+	LiteVirt_IssueEnrollmentCode_FullMethodName         = "/litevirt.v1.LiteVirt/IssueEnrollmentCode"
+	LiteVirt_ListUserVariants_FullMethodName            = "/litevirt.v1.LiteVirt/ListUserVariants"
+	LiteVirt_ClearIdentityBinding_FullMethodName        = "/litevirt.v1.LiteVirt/ClearIdentityBinding"
+	LiteVirt_CreateToken_FullMethodName                 = "/litevirt.v1.LiteVirt/CreateToken"
+	LiteVirt_RevokeToken_FullMethodName                 = "/litevirt.v1.LiteVirt/RevokeToken"
+	LiteVirt_Whoami_FullMethodName                      = "/litevirt.v1.LiteVirt/Whoami"
+	LiteVirt_CheckPermissions_FullMethodName            = "/litevirt.v1.LiteVirt/CheckPermissions"
+	LiteVirt_ChangePassword_FullMethodName              = "/litevirt.v1.LiteVirt/ChangePassword"
+	LiteVirt_ResetAdminPassword_FullMethodName          = "/litevirt.v1.LiteVirt/ResetAdminPassword"
+	LiteVirt_ListTwoFactors_FullMethodName              = "/litevirt.v1.LiteVirt/ListTwoFactors"
+	LiteVirt_EnrollTOTP_FullMethodName                  = "/litevirt.v1.LiteVirt/EnrollTOTP"
+	LiteVirt_DisableTwoFactor_FullMethodName            = "/litevirt.v1.LiteVirt/DisableTwoFactor"
+	LiteVirt_GrantRole_FullMethodName                   = "/litevirt.v1.LiteVirt/GrantRole"
+	LiteVirt_RevokeRole_FullMethodName                  = "/litevirt.v1.LiteVirt/RevokeRole"
+	LiteVirt_ListRoleBindings_FullMethodName            = "/litevirt.v1.LiteVirt/ListRoleBindings"
+	LiteVirt_NormalizeRoleBindings_FullMethodName       = "/litevirt.v1.LiteVirt/NormalizeRoleBindings"
+	LiteVirt_GetVMOperation_FullMethodName              = "/litevirt.v1.LiteVirt/GetVMOperation"
+	LiteVirt_AbortVMOperation_FullMethodName            = "/litevirt.v1.LiteVirt/AbortVMOperation"
+	LiteVirt_ReleaseHostReservation_FullMethodName      = "/litevirt.v1.LiteVirt/ReleaseHostReservation"
+	LiteVirt_BeginWebAuthnRegistration_FullMethodName   = "/litevirt.v1.LiteVirt/BeginWebAuthnRegistration"
+	LiteVirt_FinishWebAuthnRegistration_FullMethodName  = "/litevirt.v1.LiteVirt/FinishWebAuthnRegistration"
+	LiteVirt_BeginWebAuthnLogin_FullMethodName          = "/litevirt.v1.LiteVirt/BeginWebAuthnLogin"
+	LiteVirt_FinishWebAuthnLogin_FullMethodName         = "/litevirt.v1.LiteVirt/FinishWebAuthnLogin"
+	LiteVirt_RestoreLive_FullMethodName                 = "/litevirt.v1.LiteVirt/RestoreLive"
+	LiteVirt_BindSecurityGroups_FullMethodName          = "/litevirt.v1.LiteVirt/BindSecurityGroups"
+	LiteVirt_ReloadFirewall_FullMethodName              = "/litevirt.v1.LiteVirt/ReloadFirewall"
+	LiteVirt_SetNICGuard_FullMethodName                 = "/litevirt.v1.LiteVirt/SetNICGuard"
+	LiteVirt_ListNICGuards_FullMethodName               = "/litevirt.v1.LiteVirt/ListNICGuards"
+	LiteVirt_GetFirewallEnforcement_FullMethodName      = "/litevirt.v1.LiteVirt/GetFirewallEnforcement"
+	LiteVirt_SetFirewallEnforcement_FullMethodName      = "/litevirt.v1.LiteVirt/SetFirewallEnforcement"
+	LiteVirt_ResetFirewallWouldDrops_FullMethodName     = "/litevirt.v1.LiteVirt/ResetFirewallWouldDrops"
+	LiteVirt_ArmNICFirewall_FullMethodName              = "/litevirt.v1.LiteVirt/ArmNICFirewall"
+	LiteVirt_ResumeHeldVM_FullMethodName                = "/litevirt.v1.LiteVirt/ResumeHeldVM"
+	LiteVirt_SetNetworkGuardConfig_FullMethodName       = "/litevirt.v1.LiteVirt/SetNetworkGuardConfig"
+	LiteVirt_BackupSnapshot_FullMethodName              = "/litevirt.v1.LiteVirt/BackupSnapshot"
+	LiteVirt_RestoreFromBackup_FullMethodName           = "/litevirt.v1.LiteVirt/RestoreFromBackup"
+	LiteVirt_ListBackupFiles_FullMethodName             = "/litevirt.v1.LiteVirt/ListBackupFiles"
+	LiteVirt_RestoreBackupFiles_FullMethodName          = "/litevirt.v1.LiteVirt/RestoreBackupFiles"
+	LiteVirt_HasChunks_FullMethodName                   = "/litevirt.v1.LiteVirt/HasChunks"
+	LiteVirt_PushBackup_FullMethodName                  = "/litevirt.v1.LiteVirt/PushBackup"
+	LiteVirt_VerifyBackupRepo_FullMethodName            = "/litevirt.v1.LiteVirt/VerifyBackupRepo"
+	LiteVirt_GarbageCollectBackupRepo_FullMethodName    = "/litevirt.v1.LiteVirt/GarbageCollectBackupRepo"
+	LiteVirt_PruneBackupRepo_FullMethodName             = "/litevirt.v1.LiteVirt/PruneBackupRepo"
+	LiteVirt_SyncBackupRepo_FullMethodName              = "/litevirt.v1.LiteVirt/SyncBackupRepo"
+	LiteVirt_SetBackupRepoCompression_FullMethodName    = "/litevirt.v1.LiteVirt/SetBackupRepoCompression"
+	LiteVirt_ListBackupRepoSnapshots_FullMethodName     = "/litevirt.v1.LiteVirt/ListBackupRepoSnapshots"
+	LiteVirt_CreateContainer_FullMethodName             = "/litevirt.v1.LiteVirt/CreateContainer"
+	LiteVirt_StartContainer_FullMethodName              = "/litevirt.v1.LiteVirt/StartContainer"
+	LiteVirt_StopContainer_FullMethodName               = "/litevirt.v1.LiteVirt/StopContainer"
+	LiteVirt_DeleteContainer_FullMethodName             = "/litevirt.v1.LiteVirt/DeleteContainer"
+	LiteVirt_ExecContainer_FullMethodName               = "/litevirt.v1.LiteVirt/ExecContainer"
+	LiteVirt_ListContainers_FullMethodName              = "/litevirt.v1.LiteVirt/ListContainers"
+	LiteVirt_InspectContainer_FullMethodName            = "/litevirt.v1.LiteVirt/InspectContainer"
+	LiteVirt_ProbeContainerBackups_FullMethodName       = "/litevirt.v1.LiteVirt/ProbeContainerBackups"
+	LiteVirt_ListContainerReplicas_FullMethodName       = "/litevirt.v1.LiteVirt/ListContainerReplicas"
+	LiteVirt_RemoveContainerReplicas_FullMethodName     = "/litevirt.v1.LiteVirt/RemoveContainerReplicas"
+	LiteVirt_RestoreContainerReplica_FullMethodName     = "/litevirt.v1.LiteVirt/RestoreContainerReplica"
+	LiteVirt_PullOCIImage_FullMethodName                = "/litevirt.v1.LiteVirt/PullOCIImage"
+	LiteVirt_BackupContainer_FullMethodName             = "/litevirt.v1.LiteVirt/BackupContainer"
+	LiteVirt_RestoreContainer_FullMethodName            = "/litevirt.v1.LiteVirt/RestoreContainer"
+	LiteVirt_MigrateContainer_FullMethodName            = "/litevirt.v1.LiteVirt/MigrateContainer"
+	LiteVirt_SnapshotContainer_FullMethodName           = "/litevirt.v1.LiteVirt/SnapshotContainer"
+	LiteVirt_ListContainerSnapshots_FullMethodName      = "/litevirt.v1.LiteVirt/ListContainerSnapshots"
+	LiteVirt_RevertContainerSnapshot_FullMethodName     = "/litevirt.v1.LiteVirt/RevertContainerSnapshot"
+	LiteVirt_DeleteContainerSnapshot_FullMethodName     = "/litevirt.v1.LiteVirt/DeleteContainerSnapshot"
+	LiteVirt_ConvertContainerToTemplate_FullMethodName  = "/litevirt.v1.LiteVirt/ConvertContainerToTemplate"
+	LiteVirt_CloneContainer_FullMethodName              = "/litevirt.v1.LiteVirt/CloneContainer"
+	LiteVirt_ConvertContainer_FullMethodName            = "/litevirt.v1.LiteVirt/ConvertContainer"
+	LiteVirt_PrepareContainerTarget_FullMethodName      = "/litevirt.v1.LiteVirt/PrepareContainerTarget"
+	LiteVirt_GetVMStats_FullMethodName                  = "/litevirt.v1.LiteVirt/GetVMStats"
+	LiteVirt_GetHostStats_FullMethodName                = "/litevirt.v1.LiteVirt/GetHostStats"
+	LiteVirt_GetClusterStatus_FullMethodName            = "/litevirt.v1.LiteVirt/GetClusterStatus"
+	LiteVirt_StreamEvents_FullMethodName                = "/litevirt.v1.LiteVirt/StreamEvents"
+	LiteVirt_ListAuditLog_FullMethodName                = "/litevirt.v1.LiteVirt/ListAuditLog"
+	LiteVirt_ListVMEvents_FullMethodName                = "/litevirt.v1.LiteVirt/ListVMEvents"
+	LiteVirt_ListStoragePools_FullMethodName            = "/litevirt.v1.LiteVirt/ListStoragePools"
+	LiteVirt_CreateStoragePool_FullMethodName           = "/litevirt.v1.LiteVirt/CreateStoragePool"
+	LiteVirt_DeleteStoragePool_FullMethodName           = "/litevirt.v1.LiteVirt/DeleteStoragePool"
+	LiteVirt_GetStoragePool_FullMethodName              = "/litevirt.v1.LiteVirt/GetStoragePool"
+	LiteVirt_ListStoragePoolContents_FullMethodName     = "/litevirt.v1.LiteVirt/ListStoragePoolContents"
+	LiteVirt_UploadStoragePoolContent_FullMethodName    = "/litevirt.v1.LiteVirt/UploadStoragePoolContent"
+	LiteVirt_CreateResourceMapping_FullMethodName       = "/litevirt.v1.LiteVirt/CreateResourceMapping"
+	LiteVirt_ListResourceMappings_FullMethodName        = "/litevirt.v1.LiteVirt/ListResourceMappings"
+	LiteVirt_DeleteResourceMapping_FullMethodName       = "/litevirt.v1.LiteVirt/DeleteResourceMapping"
+	LiteVirt_AddMappingDevice_FullMethodName            = "/litevirt.v1.LiteVirt/AddMappingDevice"
+	LiteVirt_RemoveMappingDevice_FullMethodName         = "/litevirt.v1.LiteVirt/RemoveMappingDevice"
+	LiteVirt_CreateNotificationTarget_FullMethodName    = "/litevirt.v1.LiteVirt/CreateNotificationTarget"
+	LiteVirt_ListNotificationTargets_FullMethodName     = "/litevirt.v1.LiteVirt/ListNotificationTargets"
+	LiteVirt_DeleteNotificationTarget_FullMethodName    = "/litevirt.v1.LiteVirt/DeleteNotificationTarget"
+	LiteVirt_TestNotificationTarget_FullMethodName      = "/litevirt.v1.LiteVirt/TestNotificationTarget"
+	LiteVirt_CreateNotificationRoute_FullMethodName     = "/litevirt.v1.LiteVirt/CreateNotificationRoute"
+	LiteVirt_ListNotificationRoutes_FullMethodName      = "/litevirt.v1.LiteVirt/ListNotificationRoutes"
+	LiteVirt_DeleteNotificationRoute_FullMethodName     = "/litevirt.v1.LiteVirt/DeleteNotificationRoute"
+	LiteVirt_SetRegistryCredential_FullMethodName       = "/litevirt.v1.LiteVirt/SetRegistryCredential"
+	LiteVirt_ListRegistryCredentials_FullMethodName     = "/litevirt.v1.LiteVirt/ListRegistryCredentials"
+	LiteVirt_DeleteRegistryCredential_FullMethodName    = "/litevirt.v1.LiteVirt/DeleteRegistryCredential"
+	LiteVirt_CreateClusterFirewallRule_FullMethodName   = "/litevirt.v1.LiteVirt/CreateClusterFirewallRule"
+	LiteVirt_ListClusterFirewallRules_FullMethodName    = "/litevirt.v1.LiteVirt/ListClusterFirewallRules"
+	LiteVirt_DeleteClusterFirewallRule_FullMethodName   = "/litevirt.v1.LiteVirt/DeleteClusterFirewallRule"
+	LiteVirt_CreateHostFirewallRule_FullMethodName      = "/litevirt.v1.LiteVirt/CreateHostFirewallRule"
+	LiteVirt_ListHostFirewallRules_FullMethodName       = "/litevirt.v1.LiteVirt/ListHostFirewallRules"
+	LiteVirt_DeleteHostFirewallRule_FullMethodName      = "/litevirt.v1.LiteVirt/DeleteHostFirewallRule"
+	LiteVirt_CreateIpSet_FullMethodName                 = "/litevirt.v1.LiteVirt/CreateIpSet"
+	LiteVirt_ListIpSets_FullMethodName                  = "/litevirt.v1.LiteVirt/ListIpSets"
+	LiteVirt_DeleteIpSet_FullMethodName                 = "/litevirt.v1.LiteVirt/DeleteIpSet"
+	LiteVirt_SetFirewallDefault_FullMethodName          = "/litevirt.v1.LiteVirt/SetFirewallDefault"
+	LiteVirt_ListFirewallDefaults_FullMethodName        = "/litevirt.v1.LiteVirt/ListFirewallDefaults"
+	LiteVirt_GetFirewallSynflood_FullMethodName         = "/litevirt.v1.LiteVirt/GetFirewallSynflood"
+	LiteVirt_SetFirewallSynflood_FullMethodName         = "/litevirt.v1.LiteVirt/SetFirewallSynflood"
+	LiteVirt_GetFirewallLogPolicy_FullMethodName        = "/litevirt.v1.LiteVirt/GetFirewallLogPolicy"
+	LiteVirt_SetFirewallLogPolicy_FullMethodName        = "/litevirt.v1.LiteVirt/SetFirewallLogPolicy"
+	LiteVirt_ListFirewallLog_FullMethodName             = "/litevirt.v1.LiteVirt/ListFirewallLog"
+	LiteVirt_ListFirewallTagGroups_FullMethodName       = "/litevirt.v1.LiteVirt/ListFirewallTagGroups"
+	LiteVirt_SetFirewallTagGroup_FullMethodName         = "/litevirt.v1.LiteVirt/SetFirewallTagGroup"
+	LiteVirt_DeleteFirewallTagGroup_FullMethodName      = "/litevirt.v1.LiteVirt/DeleteFirewallTagGroup"
+	LiteVirt_ListFirewallTags_FullMethodName            = "/litevirt.v1.LiteVirt/ListFirewallTags"
+	LiteVirt_SetFirewallTags_FullMethodName             = "/litevirt.v1.LiteVirt/SetFirewallTags"
+	LiteVirt_CreateSecurityGroup_FullMethodName         = "/litevirt.v1.LiteVirt/CreateSecurityGroup"
+	LiteVirt_DeleteSecurityGroup_FullMethodName         = "/litevirt.v1.LiteVirt/DeleteSecurityGroup"
+	LiteVirt_AddSecurityGroupRule_FullMethodName        = "/litevirt.v1.LiteVirt/AddSecurityGroupRule"
+	LiteVirt_RemoveSecurityGroupRule_FullMethodName     = "/litevirt.v1.LiteVirt/RemoveSecurityGroupRule"
+	LiteVirt_ListSecurityGroups_FullMethodName          = "/litevirt.v1.LiteVirt/ListSecurityGroups"
+	LiteVirt_DeleteStoragePoolContent_FullMethodName    = "/litevirt.v1.LiteVirt/DeleteStoragePoolContent"
+	LiteVirt_ListISOs_FullMethodName                    = "/litevirt.v1.LiteVirt/ListISOs"
+	LiteVirt_PullISO_FullMethodName                     = "/litevirt.v1.LiteVirt/PullISO"
+	LiteVirt_GetISOLibraryMode_FullMethodName           = "/litevirt.v1.LiteVirt/GetISOLibraryMode"
+	LiteVirt_SetISOLibraryMode_FullMethodName           = "/litevirt.v1.LiteVirt/SetISOLibraryMode"
+	LiteVirt_FetchISOLibraryFile_FullMethodName         = "/litevirt.v1.LiteVirt/FetchISOLibraryFile"
+	LiteVirt_PushReplicaIncrement_FullMethodName        = "/litevirt.v1.LiteVirt/PushReplicaIncrement"
+	LiteVirt_ListReplicas_FullMethodName                = "/litevirt.v1.LiteVirt/ListReplicas"
+	LiteVirt_PushReplica_FullMethodName                 = "/litevirt.v1.LiteVirt/PushReplica"
+	LiteVirt_PruneReplicas_FullMethodName               = "/litevirt.v1.LiteVirt/PruneReplicas"
+	LiteVirt_Ping_FullMethodName                        = "/litevirt.v1.LiteVirt/Ping"
+	LiteVirt_Ready_FullMethodName                       = "/litevirt.v1.LiteVirt/Ready"
+	LiteVirt_ProvisionNetwork_FullMethodName            = "/litevirt.v1.LiteVirt/ProvisionNetwork"
+	LiteVirt_SyncVTEP_FullMethodName                    = "/litevirt.v1.LiteVirt/SyncVTEP"
+	LiteVirt_GetVMIPRemote_FullMethodName               = "/litevirt.v1.LiteVirt/GetVMIPRemote"
+	LiteVirt_RefreshLB_FullMethodName                   = "/litevirt.v1.LiteVirt/RefreshLB"
+	LiteVirt_UpdateFDB_FullMethodName                   = "/litevirt.v1.LiteVirt/UpdateFDB"
+	LiteVirt_EnsureCloudInit_FullMethodName             = "/litevirt.v1.LiteVirt/EnsureCloudInit"
+	LiteVirt_EnsureDisks_FullMethodName                 = "/litevirt.v1.LiteVirt/EnsureDisks"
+	LiteVirt_EnsureFirmwareState_FullMethodName         = "/litevirt.v1.LiteVirt/EnsureFirmwareState"
+	LiteVirt_RollbackFirmwareState_FullMethodName       = "/litevirt.v1.LiteVirt/RollbackFirmwareState"
+	LiteVirt_CleanupMigrationArtifacts_FullMethodName   = "/litevirt.v1.LiteVirt/CleanupMigrationArtifacts"
+	LiteVirt_PrepareLiveFirmwareTarget_FullMethodName   = "/litevirt.v1.LiteVirt/PrepareLiveFirmwareTarget"
+	LiteVirt_VerifyLiveFirmwareTarget_FullMethodName    = "/litevirt.v1.LiteVirt/VerifyLiveFirmwareTarget"
+	LiteVirt_ReleaseLiveFirmwareTarget_FullMethodName   = "/litevirt.v1.LiteVirt/ReleaseLiveFirmwareTarget"
+	LiteVirt_AbortLiveFirmwareTarget_FullMethodName     = "/litevirt.v1.LiteVirt/AbortLiveFirmwareTarget"
+	LiteVirt_FirmwareMoveDoctorTarget_FullMethodName    = "/litevirt.v1.LiteVirt/FirmwareMoveDoctorTarget"
+	LiteVirt_ReceiveMigrationDisk_FullMethodName        = "/litevirt.v1.LiteVirt/ReceiveMigrationDisk"
+	LiteVirt_CheckCPUCompatibility_FullMethodName       = "/litevirt.v1.LiteVirt/CheckCPUCompatibility"
+	LiteVirt_AnnounceMigratedGuest_FullMethodName       = "/litevirt.v1.LiteVirt/AnnounceMigratedGuest"
+	LiteVirt_GetStateDigest_FullMethodName              = "/litevirt.v1.LiteVirt/GetStateDigest"
+	LiteVirt_AcknowledgeLeaseTermTie_FullMethodName     = "/litevirt.v1.LiteVirt/AcknowledgeLeaseTermTie"
+	LiteVirt_GetLeaseTermHighWater_FullMethodName       = "/litevirt.v1.LiteVirt/GetLeaseTermHighWater"
+	LiteVirt_GetStateDump_FullMethodName                = "/litevirt.v1.LiteVirt/GetStateDump"
+	LiteVirt_StreamStateDump_FullMethodName             = "/litevirt.v1.LiteVirt/StreamStateDump"
+	LiteVirt_StreamTableDump_FullMethodName             = "/litevirt.v1.LiteVirt/StreamTableDump"
+	LiteVirt_GetSensitiveStateDigest_FullMethodName     = "/litevirt.v1.LiteVirt/GetSensitiveStateDigest"
+	LiteVirt_StreamSensitiveStateDump_FullMethodName    = "/litevirt.v1.LiteVirt/StreamSensitiveStateDump"
+	LiteVirt_GetTableBucketDigests_FullMethodName       = "/litevirt.v1.LiteVirt/GetTableBucketDigests"
+	LiteVirt_StreamTableRows_FullMethodName             = "/litevirt.v1.LiteVirt/StreamTableRows"
+	LiteVirt_StreamSensitiveTableRows_FullMethodName    = "/litevirt.v1.LiteVirt/StreamSensitiveTableRows"
+	LiteVirt_TriggerAntiEntropy_FullMethodName          = "/litevirt.v1.LiteVirt/TriggerAntiEntropy"
+	LiteVirt_GetClusterStateDigest_FullMethodName       = "/litevirt.v1.LiteVirt/GetClusterStateDigest"
+	LiteVirt_PrepareRecoveryClaim_FullMethodName        = "/litevirt.v1.LiteVirt/PrepareRecoveryClaim"
+	LiteVirt_AcceptRecoveryClaim_FullMethodName         = "/litevirt.v1.LiteVirt/AcceptRecoveryClaim"
+	LiteVirt_GetRecoveryClaim_FullMethodName            = "/litevirt.v1.LiteVirt/GetRecoveryClaim"
+	LiteVirt_ListRecoveryClaims_FullMethodName          = "/litevirt.v1.LiteVirt/ListRecoveryClaims"
+	LiteVirt_AbandonRecoveryProof_FullMethodName        = "/litevirt.v1.LiteVirt/AbandonRecoveryProof"
+	LiteVirt_AttestSharedDiskUnused_FullMethodName      = "/litevirt.v1.LiteVirt/AttestSharedDiskUnused"
+	LiteVirt_ReleaseLegacyHeldClaim_FullMethodName      = "/litevirt.v1.LiteVirt/ReleaseLegacyHeldClaim"
+	LiteVirt_PlanDeadHostRemoval_FullMethodName         = "/litevirt.v1.LiteVirt/PlanDeadHostRemoval"
+	LiteVirt_ForceReconfigureVoters_FullMethodName      = "/litevirt.v1.LiteVirt/ForceReconfigureVoters"
+	LiteVirt_SignForcedVoterConfig_FullMethodName       = "/litevirt.v1.LiteVirt/SignForcedVoterConfig"
+	LiteVirt_InspectRecoveryClaim_FullMethodName        = "/litevirt.v1.LiteVirt/InspectRecoveryClaim"
+	LiteVirt_ConfirmPartitionResume_FullMethodName      = "/litevirt.v1.LiteVirt/ConfirmPartitionResume"
+	LiteVirt_GetVoterConfig_FullMethodName              = "/litevirt.v1.LiteVirt/GetVoterConfig"
+	LiteVirt_ChangeVoterConfig_FullMethodName           = "/litevirt.v1.LiteVirt/ChangeVoterConfig"
+	LiteVirt_DiagnoseDivergence_FullMethodName          = "/litevirt.v1.LiteVirt/DiagnoseDivergence"
+	LiteVirt_ScanSensitiveDivergence_FullMethodName     = "/litevirt.v1.LiteVirt/ScanSensitiveDivergence"
+	LiteVirt_PushMutations_FullMethodName               = "/litevirt.v1.LiteVirt/PushMutations"
+	LiteVirt_AckMutations_FullMethodName                = "/litevirt.v1.LiteVirt/AckMutations"
+	LiteVirt_ListRebalanceProposals_FullMethodName      = "/litevirt.v1.LiteVirt/ListRebalanceProposals"
+	LiteVirt_RunRebalance_FullMethodName                = "/litevirt.v1.LiteVirt/RunRebalance"
+	LiteVirt_ApproveRebalanceProposal_FullMethodName    = "/litevirt.v1.LiteVirt/ApproveRebalanceProposal"
+	LiteVirt_RejectRebalanceProposal_FullMethodName     = "/litevirt.v1.LiteVirt/RejectRebalanceProposal"
+	LiteVirt_GetSpiceInfo_FullMethodName                = "/litevirt.v1.LiteVirt/GetSpiceInfo"
+	LiteVirt_ProxySpice_FullMethodName                  = "/litevirt.v1.LiteVirt/ProxySpice"
+	LiteVirt_PreflightUpgrade_FullMethodName            = "/litevirt.v1.LiteVirt/PreflightUpgrade"
+	LiteVirt_ListRegions_FullMethodName                 = "/litevirt.v1.LiteVirt/ListRegions"
+	LiteVirt_RegionStatus_FullMethodName                = "/litevirt.v1.LiteVirt/RegionStatus"
+	LiteVirt_CrossRegionMigrate_FullMethodName          = "/litevirt.v1.LiteVirt/CrossRegionMigrate"
+	LiteVirt_GetFailoverScope_FullMethodName            = "/litevirt.v1.LiteVirt/GetFailoverScope"
+	LiteVirt_SetFailoverScope_FullMethodName            = "/litevirt.v1.LiteVirt/SetFailoverScope"
+	LiteVirt_GetVRRPTransport_FullMethodName            = "/litevirt.v1.LiteVirt/GetVRRPTransport"
+	LiteVirt_SetVRRPTransport_FullMethodName            = "/litevirt.v1.LiteVirt/SetVRRPTransport"
+	LiteVirt_GetHAPolicy_FullMethodName                 = "/litevirt.v1.LiteVirt/GetHAPolicy"
+	LiteVirt_SetHAPolicy_FullMethodName                 = "/litevirt.v1.LiteVirt/SetHAPolicy"
+	LiteVirt_RestoreRelay_FullMethodName                = "/litevirt.v1.LiteVirt/RestoreRelay"
+	LiteVirt_GetRelayHealth_FullMethodName              = "/litevirt.v1.LiteVirt/GetRelayHealth"
+	LiteVirt_GetUpgradeStatus_FullMethodName            = "/litevirt.v1.LiteVirt/GetUpgradeStatus"
+	LiteVirt_HoldsReleaseFeatureUse_FullMethodName      = "/litevirt.v1.LiteVirt/HoldsReleaseFeatureUse"
+	LiteVirt_UpsertServiceEndpoint_FullMethodName       = "/litevirt.v1.LiteVirt/UpsertServiceEndpoint"
+	LiteVirt_ListServiceEndpoints_FullMethodName        = "/litevirt.v1.LiteVirt/ListServiceEndpoints"
+	LiteVirt_DeleteServiceEndpoint_FullMethodName       = "/litevirt.v1.LiteVirt/DeleteServiceEndpoint"
+	LiteVirt_CreateBackupSchedule_FullMethodName        = "/litevirt.v1.LiteVirt/CreateBackupSchedule"
+	LiteVirt_ListBackupSchedules_FullMethodName         = "/litevirt.v1.LiteVirt/ListBackupSchedules"
+	LiteVirt_DeleteBackupSchedule_FullMethodName        = "/litevirt.v1.LiteVirt/DeleteBackupSchedule"
+	LiteVirt_CreateReplicationSchedule_FullMethodName   = "/litevirt.v1.LiteVirt/CreateReplicationSchedule"
+	LiteVirt_ListReplicationSchedules_FullMethodName    = "/litevirt.v1.LiteVirt/ListReplicationSchedules"
+	LiteVirt_DeleteReplicationSchedule_FullMethodName   = "/litevirt.v1.LiteVirt/DeleteReplicationSchedule"
+	LiteVirt_PromoteReplica_FullMethodName              = "/litevirt.v1.LiteVirt/PromoteReplica"
+	LiteVirt_ResolvePITOverlay_FullMethodName           = "/litevirt.v1.LiteVirt/ResolvePITOverlay"
+	LiteVirt_ListSetAsideOverlays_FullMethodName        = "/litevirt.v1.LiteVirt/ListSetAsideOverlays"
+	LiteVirt_RemoveSetAsideOverlay_FullMethodName       = "/litevirt.v1.LiteVirt/RemoveSetAsideOverlay"
+	LiteVirt_ListReplicationCheckpoints_FullMethodName  = "/litevirt.v1.LiteVirt/ListReplicationCheckpoints"
+	LiteVirt_DeleteReplicationCheckpoint_FullMethodName = "/litevirt.v1.LiteVirt/DeleteReplicationCheckpoint"
+	LiteVirt_VerifyAuditChain_FullMethodName            = "/litevirt.v1.LiteVirt/VerifyAuditChain"
+	LiteVirt_ExportAuditChain_FullMethodName            = "/litevirt.v1.LiteVirt/ExportAuditChain"
+	LiteVirt_RetireAuditKey_FullMethodName              = "/litevirt.v1.LiteVirt/RetireAuditKey"
+	LiteVirt_CreateProject_FullMethodName               = "/litevirt.v1.LiteVirt/CreateProject"
+	LiteVirt_ListProjects_FullMethodName                = "/litevirt.v1.LiteVirt/ListProjects"
+	LiteVirt_GetProject_FullMethodName                  = "/litevirt.v1.LiteVirt/GetProject"
+	LiteVirt_DeleteProject_FullMethodName               = "/litevirt.v1.LiteVirt/DeleteProject"
+	LiteVirt_SetProjectQuota_FullMethodName             = "/litevirt.v1.LiteVirt/SetProjectQuota"
+	LiteVirt_GetProjectQuota_FullMethodName             = "/litevirt.v1.LiteVirt/GetProjectQuota"
+	LiteVirt_GetProjectUsage_FullMethodName             = "/litevirt.v1.LiteVirt/GetProjectUsage"
+	LiteVirt_ExecuteCreateVM_FullMethodName             = "/litevirt.v1.LiteVirt/ExecuteCreateVM"
+	LiteVirt_ReserveProjectCapacity_FullMethodName      = "/litevirt.v1.LiteVirt/ReserveProjectCapacity"
+	LiteVirt_ReleaseProjectCapacity_FullMethodName      = "/litevirt.v1.LiteVirt/ReleaseProjectCapacity"
+	LiteVirt_ReserveHostCapacity_FullMethodName         = "/litevirt.v1.LiteVirt/ReserveHostCapacity"
+	LiteVirt_ReleaseHostCapacity_FullMethodName         = "/litevirt.v1.LiteVirt/ReleaseHostCapacity"
+	LiteVirt_ImportLeftoverStatus_FullMethodName        = "/litevirt.v1.LiteVirt/ImportLeftoverStatus"
+	LiteVirt_LUNHolders_FullMethodName                  = "/litevirt.v1.LiteVirt/LUNHolders"
+	LiteVirt_ISCSILUNHolds_FullMethodName               = "/litevirt.v1.LiteVirt/ISCSILUNHolds"
+	LiteVirt_PreflightRecreateVM_FullMethodName         = "/litevirt.v1.LiteVirt/PreflightRecreateVM"
 )
 
 // LiteVirtClient is the client API for LiteVirt service.
@@ -459,6 +469,9 @@ type LiteVirtClient interface {
 	RestartVM(ctx context.Context, in *RestartVMRequest, opts ...grpc.CallOption) (*VM, error)
 	DeleteVM(ctx context.Context, in *DeleteVMRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	RepairVMOwner(ctx context.Context, in *RepairVMOwnerRequest, opts ...grpc.CallOption) (*RepairVMOwnerResponse, error)
+	// FirmwareMoveDoctor shows or resolves a VM's parked live firmware move
+	// (`lv doctor firmware-move`). See FirmwareMoveDoctorRequest.
+	FirmwareMoveDoctor(ctx context.Context, in *FirmwareMoveDoctorRequest, opts ...grpc.CallOption) (*FirmwareMoveDoctorResponse, error)
 	GetRuntimeInventory(ctx context.Context, in *GetRuntimeInventoryRequest, opts ...grpc.CallOption) (*RuntimeInventory, error)
 	// CollectOrphanProof answers, for THIS host, "does anything here still claim
 	// this address" — every defined domain in every state plus this host's local
@@ -817,6 +830,15 @@ type LiteVirtClient interface {
 	EnsureFirmwareState(ctx context.Context, in *EnsureFirmwareStateRequest, opts ...grpc.CallOption) (*EnsureFirmwareStateResponse, error)
 	RollbackFirmwareState(ctx context.Context, in *RollbackFirmwareStateRequest, opts ...grpc.CallOption) (*RollbackFirmwareStateResponse, error)
 	CleanupMigrationArtifacts(ctx context.Context, in *CleanupMigrationArtifactsRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Live firmware migration (peer only): see PrepareLiveFirmwareTargetRequest
+	// and the three after it.
+	PrepareLiveFirmwareTarget(ctx context.Context, in *PrepareLiveFirmwareTargetRequest, opts ...grpc.CallOption) (*PrepareLiveFirmwareTargetResponse, error)
+	VerifyLiveFirmwareTarget(ctx context.Context, in *VerifyLiveFirmwareTargetRequest, opts ...grpc.CallOption) (*VerifyLiveFirmwareTargetResponse, error)
+	ReleaseLiveFirmwareTarget(ctx context.Context, in *ReleaseLiveFirmwareTargetRequest, opts ...grpc.CallOption) (*ReleaseLiveFirmwareTargetResponse, error)
+	AbortLiveFirmwareTarget(ctx context.Context, in *AbortLiveFirmwareTargetRequest, opts ...grpc.CallOption) (*AbortLiveFirmwareTargetResponse, error)
+	// FirmwareMoveDoctorTarget is a target's part of `lv doctor firmware-move`,
+	// asked by the move's source (peer only).
+	FirmwareMoveDoctorTarget(ctx context.Context, in *FirmwareMoveDoctorTargetRequest, opts ...grpc.CallOption) (*FirmwareMoveDoctorTargetResponse, error)
 	// ReceiveMigrationDisk takes one host-local disk file of a STOPPED VM that is
 	// being cold-migrated here, as a client stream. See ReceiveMigrationDiskRequest.
 	ReceiveMigrationDisk(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse], error)
@@ -1035,6 +1057,20 @@ type LiteVirtClient interface {
 	// VM: commit it into the disk, or discard it. Without confirm it only says
 	// what it would do. Audited. lv resolve-pit-overlay.
 	ResolvePITOverlay(ctx context.Context, in *ResolvePITOverlayRequest, opts ...grpc.CallOption) (*ResolvePITOverlayResponse, error)
+	// ListSetAsideOverlays lists the point-in-time overlays set aside
+	// (<overlay>.orphan-<time>) beside the disks of a host's VMs, answered on
+	// that host (the VM's host when vm_name is set). Per-VM read.
+	ListSetAsideOverlays(ctx context.Context, in *ListSetAsideOverlaysRequest, opts ...grpc.CallOption) (*ListSetAsideOverlaysResponse, error)
+	// RemoveSetAsideOverlay removes one set-aside overlay and its binding, on
+	// the VM's host; refused while it is in use. Admin, audited.
+	RemoveSetAsideOverlay(ctx context.Context, in *RemoveSetAsideOverlayRequest, opts ...grpc.CallOption) (*RemoveSetAsideOverlayResponse, error)
+	// ListReplicationCheckpoints lists the live incremental-replication
+	// checkpoint rows. Per-VM read.
+	ListReplicationCheckpoints(ctx context.Context, in *ListReplicationCheckpointsRequest, opts ...grpc.CallOption) (*ListReplicationCheckpointsResponse, error)
+	// DeleteReplicationCheckpoint retires one checkpoint row (the next run of
+	// its chain is a full copy); refused while a live schedule uses it.
+	// Admin, audited.
+	DeleteReplicationCheckpoint(ctx context.Context, in *DeleteReplicationCheckpointRequest, opts ...grpc.CallOption) (*DeleteReplicationCheckpointResponse, error)
 	// ── tamper-evident audit log ──
 	// VerifyAuditChain walks each host's audit sub-chain (a row's
 	// prev_hash links to the previous row from the SAME host, because
@@ -1598,6 +1634,16 @@ func (c *liteVirtClient) RepairVMOwner(ctx context.Context, in *RepairVMOwnerReq
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RepairVMOwnerResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_RepairVMOwner_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) FirmwareMoveDoctor(ctx context.Context, in *FirmwareMoveDoctorRequest, opts ...grpc.CallOption) (*FirmwareMoveDoctorResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FirmwareMoveDoctorResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_FirmwareMoveDoctor_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4032,6 +4078,56 @@ func (c *liteVirtClient) CleanupMigrationArtifacts(ctx context.Context, in *Clea
 	return out, nil
 }
 
+func (c *liteVirtClient) PrepareLiveFirmwareTarget(ctx context.Context, in *PrepareLiveFirmwareTargetRequest, opts ...grpc.CallOption) (*PrepareLiveFirmwareTargetResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PrepareLiveFirmwareTargetResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_PrepareLiveFirmwareTarget_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) VerifyLiveFirmwareTarget(ctx context.Context, in *VerifyLiveFirmwareTargetRequest, opts ...grpc.CallOption) (*VerifyLiveFirmwareTargetResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VerifyLiveFirmwareTargetResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_VerifyLiveFirmwareTarget_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ReleaseLiveFirmwareTarget(ctx context.Context, in *ReleaseLiveFirmwareTargetRequest, opts ...grpc.CallOption) (*ReleaseLiveFirmwareTargetResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseLiveFirmwareTargetResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ReleaseLiveFirmwareTarget_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) AbortLiveFirmwareTarget(ctx context.Context, in *AbortLiveFirmwareTargetRequest, opts ...grpc.CallOption) (*AbortLiveFirmwareTargetResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AbortLiveFirmwareTargetResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_AbortLiveFirmwareTarget_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) FirmwareMoveDoctorTarget(ctx context.Context, in *FirmwareMoveDoctorTargetRequest, opts ...grpc.CallOption) (*FirmwareMoveDoctorTargetResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FirmwareMoveDoctorTargetResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_FirmwareMoveDoctorTarget_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) ReceiveMigrationDisk(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[34], LiteVirt_ReceiveMigrationDisk_FullMethodName, cOpts...)
@@ -4760,6 +4856,46 @@ func (c *liteVirtClient) ResolvePITOverlay(ctx context.Context, in *ResolvePITOv
 	return out, nil
 }
 
+func (c *liteVirtClient) ListSetAsideOverlays(ctx context.Context, in *ListSetAsideOverlaysRequest, opts ...grpc.CallOption) (*ListSetAsideOverlaysResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListSetAsideOverlaysResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ListSetAsideOverlays_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) RemoveSetAsideOverlay(ctx context.Context, in *RemoveSetAsideOverlayRequest, opts ...grpc.CallOption) (*RemoveSetAsideOverlayResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RemoveSetAsideOverlayResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_RemoveSetAsideOverlay_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ListReplicationCheckpoints(ctx context.Context, in *ListReplicationCheckpointsRequest, opts ...grpc.CallOption) (*ListReplicationCheckpointsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListReplicationCheckpointsResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ListReplicationCheckpoints_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) DeleteReplicationCheckpoint(ctx context.Context, in *DeleteReplicationCheckpointRequest, opts ...grpc.CallOption) (*DeleteReplicationCheckpointResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteReplicationCheckpointResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_DeleteReplicationCheckpoint_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) VerifyAuditChain(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*VerifyAuditChainResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(VerifyAuditChainResponse)
@@ -5038,6 +5174,9 @@ type LiteVirtServer interface {
 	RestartVM(context.Context, *RestartVMRequest) (*VM, error)
 	DeleteVM(context.Context, *DeleteVMRequest) (*emptypb.Empty, error)
 	RepairVMOwner(context.Context, *RepairVMOwnerRequest) (*RepairVMOwnerResponse, error)
+	// FirmwareMoveDoctor shows or resolves a VM's parked live firmware move
+	// (`lv doctor firmware-move`). See FirmwareMoveDoctorRequest.
+	FirmwareMoveDoctor(context.Context, *FirmwareMoveDoctorRequest) (*FirmwareMoveDoctorResponse, error)
 	GetRuntimeInventory(context.Context, *GetRuntimeInventoryRequest) (*RuntimeInventory, error)
 	// CollectOrphanProof answers, for THIS host, "does anything here still claim
 	// this address" — every defined domain in every state plus this host's local
@@ -5396,6 +5535,15 @@ type LiteVirtServer interface {
 	EnsureFirmwareState(context.Context, *EnsureFirmwareStateRequest) (*EnsureFirmwareStateResponse, error)
 	RollbackFirmwareState(context.Context, *RollbackFirmwareStateRequest) (*RollbackFirmwareStateResponse, error)
 	CleanupMigrationArtifacts(context.Context, *CleanupMigrationArtifactsRequest) (*emptypb.Empty, error)
+	// Live firmware migration (peer only): see PrepareLiveFirmwareTargetRequest
+	// and the three after it.
+	PrepareLiveFirmwareTarget(context.Context, *PrepareLiveFirmwareTargetRequest) (*PrepareLiveFirmwareTargetResponse, error)
+	VerifyLiveFirmwareTarget(context.Context, *VerifyLiveFirmwareTargetRequest) (*VerifyLiveFirmwareTargetResponse, error)
+	ReleaseLiveFirmwareTarget(context.Context, *ReleaseLiveFirmwareTargetRequest) (*ReleaseLiveFirmwareTargetResponse, error)
+	AbortLiveFirmwareTarget(context.Context, *AbortLiveFirmwareTargetRequest) (*AbortLiveFirmwareTargetResponse, error)
+	// FirmwareMoveDoctorTarget is a target's part of `lv doctor firmware-move`,
+	// asked by the move's source (peer only).
+	FirmwareMoveDoctorTarget(context.Context, *FirmwareMoveDoctorTargetRequest) (*FirmwareMoveDoctorTargetResponse, error)
 	// ReceiveMigrationDisk takes one host-local disk file of a STOPPED VM that is
 	// being cold-migrated here, as a client stream. See ReceiveMigrationDiskRequest.
 	ReceiveMigrationDisk(grpc.ClientStreamingServer[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse]) error
@@ -5614,6 +5762,20 @@ type LiteVirtServer interface {
 	// VM: commit it into the disk, or discard it. Without confirm it only says
 	// what it would do. Audited. lv resolve-pit-overlay.
 	ResolvePITOverlay(context.Context, *ResolvePITOverlayRequest) (*ResolvePITOverlayResponse, error)
+	// ListSetAsideOverlays lists the point-in-time overlays set aside
+	// (<overlay>.orphan-<time>) beside the disks of a host's VMs, answered on
+	// that host (the VM's host when vm_name is set). Per-VM read.
+	ListSetAsideOverlays(context.Context, *ListSetAsideOverlaysRequest) (*ListSetAsideOverlaysResponse, error)
+	// RemoveSetAsideOverlay removes one set-aside overlay and its binding, on
+	// the VM's host; refused while it is in use. Admin, audited.
+	RemoveSetAsideOverlay(context.Context, *RemoveSetAsideOverlayRequest) (*RemoveSetAsideOverlayResponse, error)
+	// ListReplicationCheckpoints lists the live incremental-replication
+	// checkpoint rows. Per-VM read.
+	ListReplicationCheckpoints(context.Context, *ListReplicationCheckpointsRequest) (*ListReplicationCheckpointsResponse, error)
+	// DeleteReplicationCheckpoint retires one checkpoint row (the next run of
+	// its chain is a full copy); refused while a live schedule uses it.
+	// Admin, audited.
+	DeleteReplicationCheckpoint(context.Context, *DeleteReplicationCheckpointRequest) (*DeleteReplicationCheckpointResponse, error)
 	// ── tamper-evident audit log ──
 	// VerifyAuditChain walks each host's audit sub-chain (a row's
 	// prev_hash links to the previous row from the SAME host, because
@@ -5846,6 +6008,9 @@ func (UnimplementedLiteVirtServer) DeleteVM(context.Context, *DeleteVMRequest) (
 }
 func (UnimplementedLiteVirtServer) RepairVMOwner(context.Context, *RepairVMOwnerRequest) (*RepairVMOwnerResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RepairVMOwner not implemented")
+}
+func (UnimplementedLiteVirtServer) FirmwareMoveDoctor(context.Context, *FirmwareMoveDoctorRequest) (*FirmwareMoveDoctorResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method FirmwareMoveDoctor not implemented")
 }
 func (UnimplementedLiteVirtServer) GetRuntimeInventory(context.Context, *GetRuntimeInventoryRequest) (*RuntimeInventory, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetRuntimeInventory not implemented")
@@ -6516,6 +6681,21 @@ func (UnimplementedLiteVirtServer) RollbackFirmwareState(context.Context, *Rollb
 func (UnimplementedLiteVirtServer) CleanupMigrationArtifacts(context.Context, *CleanupMigrationArtifactsRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method CleanupMigrationArtifacts not implemented")
 }
+func (UnimplementedLiteVirtServer) PrepareLiveFirmwareTarget(context.Context, *PrepareLiveFirmwareTargetRequest) (*PrepareLiveFirmwareTargetResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PrepareLiveFirmwareTarget not implemented")
+}
+func (UnimplementedLiteVirtServer) VerifyLiveFirmwareTarget(context.Context, *VerifyLiveFirmwareTargetRequest) (*VerifyLiveFirmwareTargetResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method VerifyLiveFirmwareTarget not implemented")
+}
+func (UnimplementedLiteVirtServer) ReleaseLiveFirmwareTarget(context.Context, *ReleaseLiveFirmwareTargetRequest) (*ReleaseLiveFirmwareTargetResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseLiveFirmwareTarget not implemented")
+}
+func (UnimplementedLiteVirtServer) AbortLiveFirmwareTarget(context.Context, *AbortLiveFirmwareTargetRequest) (*AbortLiveFirmwareTargetResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AbortLiveFirmwareTarget not implemented")
+}
+func (UnimplementedLiteVirtServer) FirmwareMoveDoctorTarget(context.Context, *FirmwareMoveDoctorTargetRequest) (*FirmwareMoveDoctorTargetResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method FirmwareMoveDoctorTarget not implemented")
+}
 func (UnimplementedLiteVirtServer) ReceiveMigrationDisk(grpc.ClientStreamingServer[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse]) error {
 	return status.Error(codes.Unimplemented, "method ReceiveMigrationDisk not implemented")
 }
@@ -6710,6 +6890,18 @@ func (UnimplementedLiteVirtServer) PromoteReplica(*PromoteReplicaRequest, grpc.S
 }
 func (UnimplementedLiteVirtServer) ResolvePITOverlay(context.Context, *ResolvePITOverlayRequest) (*ResolvePITOverlayResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ResolvePITOverlay not implemented")
+}
+func (UnimplementedLiteVirtServer) ListSetAsideOverlays(context.Context, *ListSetAsideOverlaysRequest) (*ListSetAsideOverlaysResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListSetAsideOverlays not implemented")
+}
+func (UnimplementedLiteVirtServer) RemoveSetAsideOverlay(context.Context, *RemoveSetAsideOverlayRequest) (*RemoveSetAsideOverlayResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RemoveSetAsideOverlay not implemented")
+}
+func (UnimplementedLiteVirtServer) ListReplicationCheckpoints(context.Context, *ListReplicationCheckpointsRequest) (*ListReplicationCheckpointsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListReplicationCheckpoints not implemented")
+}
+func (UnimplementedLiteVirtServer) DeleteReplicationCheckpoint(context.Context, *DeleteReplicationCheckpointRequest) (*DeleteReplicationCheckpointResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteReplicationCheckpoint not implemented")
 }
 func (UnimplementedLiteVirtServer) VerifyAuditChain(context.Context, *emptypb.Empty) (*VerifyAuditChainResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method VerifyAuditChain not implemented")
@@ -7491,6 +7683,24 @@ func _LiteVirt_RepairVMOwner_Handler(srv interface{}, ctx context.Context, dec f
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).RepairVMOwner(ctx, req.(*RepairVMOwnerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_FirmwareMoveDoctor_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FirmwareMoveDoctorRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).FirmwareMoveDoctor(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_FirmwareMoveDoctor_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).FirmwareMoveDoctor(ctx, req.(*FirmwareMoveDoctorRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -11277,6 +11487,96 @@ func _LiteVirt_CleanupMigrationArtifacts_Handler(srv interface{}, ctx context.Co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_PrepareLiveFirmwareTarget_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PrepareLiveFirmwareTargetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PrepareLiveFirmwareTarget(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PrepareLiveFirmwareTarget_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PrepareLiveFirmwareTarget(ctx, req.(*PrepareLiveFirmwareTargetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_VerifyLiveFirmwareTarget_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(VerifyLiveFirmwareTargetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).VerifyLiveFirmwareTarget(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_VerifyLiveFirmwareTarget_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).VerifyLiveFirmwareTarget(ctx, req.(*VerifyLiveFirmwareTargetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ReleaseLiveFirmwareTarget_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseLiveFirmwareTargetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ReleaseLiveFirmwareTarget(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ReleaseLiveFirmwareTarget_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ReleaseLiveFirmwareTarget(ctx, req.(*ReleaseLiveFirmwareTargetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_AbortLiveFirmwareTarget_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AbortLiveFirmwareTargetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).AbortLiveFirmwareTarget(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_AbortLiveFirmwareTarget_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).AbortLiveFirmwareTarget(ctx, req.(*AbortLiveFirmwareTargetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_FirmwareMoveDoctorTarget_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FirmwareMoveDoctorTargetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).FirmwareMoveDoctorTarget(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_FirmwareMoveDoctorTarget_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).FirmwareMoveDoctorTarget(ctx, req.(*FirmwareMoveDoctorTargetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_ReceiveMigrationDisk_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(LiteVirtServer).ReceiveMigrationDisk(&grpc.GenericServerStream[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse]{ServerStream: stream})
 }
@@ -12369,6 +12669,78 @@ func _LiteVirt_ResolvePITOverlay_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_ListSetAsideOverlays_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListSetAsideOverlaysRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ListSetAsideOverlays(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ListSetAsideOverlays_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ListSetAsideOverlays(ctx, req.(*ListSetAsideOverlaysRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_RemoveSetAsideOverlay_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveSetAsideOverlayRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).RemoveSetAsideOverlay(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_RemoveSetAsideOverlay_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).RemoveSetAsideOverlay(ctx, req.(*RemoveSetAsideOverlayRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ListReplicationCheckpoints_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListReplicationCheckpointsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ListReplicationCheckpoints(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ListReplicationCheckpoints_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ListReplicationCheckpoints(ctx, req.(*ListReplicationCheckpointsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_DeleteReplicationCheckpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteReplicationCheckpointRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).DeleteReplicationCheckpoint(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_DeleteReplicationCheckpoint_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).DeleteReplicationCheckpoint(ctx, req.(*DeleteReplicationCheckpointRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_VerifyAuditChain_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(emptypb.Empty)
 	if err := dec(in); err != nil {
@@ -12861,6 +13233,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RepairVMOwner",
 			Handler:    _LiteVirt_RepairVMOwner_Handler,
+		},
+		{
+			MethodName: "FirmwareMoveDoctor",
+			Handler:    _LiteVirt_FirmwareMoveDoctor_Handler,
 		},
 		{
 			MethodName: "GetRuntimeInventory",
@@ -13643,6 +14019,26 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LiteVirt_CleanupMigrationArtifacts_Handler,
 		},
 		{
+			MethodName: "PrepareLiveFirmwareTarget",
+			Handler:    _LiteVirt_PrepareLiveFirmwareTarget_Handler,
+		},
+		{
+			MethodName: "VerifyLiveFirmwareTarget",
+			Handler:    _LiteVirt_VerifyLiveFirmwareTarget_Handler,
+		},
+		{
+			MethodName: "ReleaseLiveFirmwareTarget",
+			Handler:    _LiteVirt_ReleaseLiveFirmwareTarget_Handler,
+		},
+		{
+			MethodName: "AbortLiveFirmwareTarget",
+			Handler:    _LiteVirt_AbortLiveFirmwareTarget_Handler,
+		},
+		{
+			MethodName: "FirmwareMoveDoctorTarget",
+			Handler:    _LiteVirt_FirmwareMoveDoctorTarget_Handler,
+		},
+		{
 			MethodName: "CheckCPUCompatibility",
 			Handler:    _LiteVirt_CheckCPUCompatibility_Handler,
 		},
@@ -13861,6 +14257,22 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ResolvePITOverlay",
 			Handler:    _LiteVirt_ResolvePITOverlay_Handler,
+		},
+		{
+			MethodName: "ListSetAsideOverlays",
+			Handler:    _LiteVirt_ListSetAsideOverlays_Handler,
+		},
+		{
+			MethodName: "RemoveSetAsideOverlay",
+			Handler:    _LiteVirt_RemoveSetAsideOverlay_Handler,
+		},
+		{
+			MethodName: "ListReplicationCheckpoints",
+			Handler:    _LiteVirt_ListReplicationCheckpoints_Handler,
+		},
+		{
+			MethodName: "DeleteReplicationCheckpoint",
+			Handler:    _LiteVirt_DeleteReplicationCheckpoint_Handler,
 		},
 		{
 			MethodName: "VerifyAuditChain",

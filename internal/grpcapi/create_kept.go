@@ -104,7 +104,7 @@ func (s *Server) seedOfAKeptVM(ctx context.Context, name, iso string, keptDisks 
 	if u := cloudinit.SpecUUID(spec); u != "" {
 		owners = append(owners, u)
 	}
-	marker, markerOK := lv.ReadRetainedFirmwareMarker(s.dataDir, name)
+	marker, markerOK := s.fw().ReadRetainedFirmwareMarker(name)
 	if markerOK && marker != "" {
 		owners = append(owners, marker)
 	}

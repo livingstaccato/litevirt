@@ -70,9 +70,7 @@ func TestFleet_MigrateScanAtSourceUndefine_DoesNotRecordDualRun(t *testing.T) {
 			src.Virt.SetState("mover", libvirtfake.StatePaused)
 			return nil
 		case 2: // re-probe: listed, then undefined under the probe
-			if err := src.Virt.UndefineDomain("mover", false); err != nil {
-				t.Errorf("undefine source copy: %v", err)
-			}
+			src.Virt.VanishDomain("mover")
 			return noDomainErr(name)
 		}
 		return noDomainErr(name)

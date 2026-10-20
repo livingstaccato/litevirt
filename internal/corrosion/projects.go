@@ -2,10 +2,18 @@ package corrosion
 
 import (
 	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 // DefaultProject is the implicit bucket every VM lands in when no
@@ -34,6 +42,11 @@ type ProjectQuotaRecord struct {
 	BackupGiBLimit int
 }
 
+// projectLifecycleInterleaveHook, when set (tests only), runs after a project
+// create/delete has read the state it will act on and before its guarded
+// transaction: the window a concurrent lifecycle change has to be tolerated in.
+var projectLifecycleInterleaveHook func()
+
 // InsertProject creates a new project. Parent must already exist
 // (or be empty for a root project). Use UpsertProjectQuota afterwards
 // to set quotas; without quotas the project is unbounded.
@@ -50,11 +63,431 @@ func InsertProject(ctx context.Context, c *Client, p ProjectRecord) error {
 			return fmt.Errorf("parent project %q does not exist", p.ParentName)
 		}
 	}
-	now := c.NowTS()
-	return c.Execute(ctx,
-		`INSERT INTO projects (name, display, parent_name, created_at, updated_at)
+	// A tombstone under this name is a previous incarnation. It is revived in
+	// place with the statement shape DeleteProject already replicates, bound with
+	// a NULL deleted_at: no new shape, so no peer needs upgrading and nothing is
+	// gated. The HLC updated_at makes the revive beat the old tombstone on every
+	// replica, and a late copy of that tombstone (older clock) lose; a delete
+	// issued after seeing the revive carries a newer clock and wins.
+	old, err := c.Query(ctx, `SELECT display, parent_name, updated_at FROM projects WHERE name = ? AND deleted_at IS NOT NULL`, p.Name)
+	if err != nil {
+		return fmt.Errorf("check previous incarnation: %w", err)
+	}
+	// A live project is refused before any statement is built.
+	live, err := c.Query(ctx, `SELECT 1 FROM projects WHERE name = ? AND deleted_at IS NULL`, p.Name)
+	if err != nil {
+		return fmt.Errorf("check existing project: %w", err)
+	}
+	if len(live) > 0 {
+		return fmt.Errorf("project %q already exists", p.Name)
+	}
+	if len(old) == 0 {
+		// Another spelling of the name ("acme" for a deleted "/acme") shares its
+		// RBAC root, so a tombstone under it is a previous incarnation too.
+		prev, perr := tombstonedSpellings(ctx, c, p.Name)
+		if perr != nil {
+			return perr
+		}
+		if !prev {
+			now := c.NowTS()
+			return c.Execute(ctx,
+				`INSERT INTO projects (name, display, parent_name, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?)`,
-		p.Name, p.Display, p.ParentName, nowRFC3339(), now)
+				p.Name, p.Display, p.ParentName, nowRFC3339(), now)
+		}
+		if err := refuseOwnedResources(ctx, c, p.Name); err != nil {
+			return err
+		}
+		// The previous incarnation's grants go in the SAME transaction as the
+		// create, and only if the name is still absent in it. A create that loses
+		// has retired nothing.
+		if h := projectLifecycleInterleaveHook; h != nil {
+			h()
+		}
+		applied, err := commitProjectLifecycle(ctx, c, lifecycleCreate, p, projectRowGuard(ctx, p.Name, false, ""))
+		if err != nil {
+			return fmt.Errorf("retire previous incarnation's grants: %w", err)
+		}
+		if !applied {
+			return projectLostRace(ctx, c, p.Name)
+		}
+		return nil
+	}
+	// The revive can only clear the tombstone, not rewrite the row, so display
+	// and parent are those of the old incarnation. Never keep them silently.
+	oldDisplay, oldParent := old[0].String("display"), old[0].String("parent_name")
+	if p.Display != "" && p.Display != oldDisplay {
+		if oldDisplay == "" {
+			return fmt.Errorf("project %q was deleted with no display name and a re-created project keeps that; "+
+				"create it without --display", p.Name)
+		}
+		return fmt.Errorf("project %q was deleted with display %q and a re-created project keeps it; "+
+			"create it with --display %q, or with no --display", p.Name, oldDisplay, oldDisplay)
+	}
+	if !sameProjectPath(p.ParentName, oldParent) {
+		return fmt.Errorf("project %q was deleted under parent %q (%q now); a re-created project keeps its parent",
+			p.Name, oldParent, p.ParentName)
+	}
+	// Project-owned resources an older build let outlive the delete would be
+	// inherited by the new incarnation: refuse, as DeleteProject does.
+	if err := refuseOwnedResources(ctx, c, p.Name); err != nil {
+		return err
+	}
+	// The revive wins or loses ATOMICALLY with the retirement: the guard requires
+	// the tombstone we read (same updated_at) to still be the row, so a concurrent
+	// re-create that won leaves this request with nothing retired, and the grants
+	// it retires are those of the incarnation it actually revives.
+	if h := projectLifecycleInterleaveHook; h != nil {
+		h()
+	}
+	applied, err := commitProjectLifecycle(ctx, c, lifecycleRevive, p, projectRowGuard(ctx, p.Name, true, old[0].String("updated_at")))
+	if err != nil {
+		return fmt.Errorf("retire previous incarnation's grants: %w", err)
+	}
+	if !applied {
+		return projectLostRace(ctx, c, p.Name)
+	}
+	return nil
+}
+
+// projectLostRace names why a guarded create did not apply.
+func projectLostRace(ctx context.Context, c *Client, name string) error {
+	if live, err := c.Query(ctx, `SELECT 1 FROM projects WHERE name = ? AND deleted_at IS NULL`, name); err == nil && len(live) > 0 {
+		return fmt.Errorf("project %q already exists", name)
+	}
+	return fmt.Errorf("project %q was changed concurrently; retry", name)
+}
+
+// projectRowGuard is the in-transaction condition of a project lifecycle batch.
+// tombstoned=true: the row exists, is deleted and still has updated_at == at (the
+// incarnation the caller read). tombstoned=false with at=="": no row of this
+// name exists. A live row (at=="", tombstoned=true is not asked for) never
+// matches either.
+func projectRowGuard(ctx context.Context, name string, tombstoned bool, at string) func(tx *sql.Tx) (bool, error) {
+	return func(tx *sql.Tx) (bool, error) {
+		var deleted sql.NullString
+		var upd string
+		err := tx.QueryRowContext(ctx, `SELECT deleted_at, updated_at FROM projects WHERE name = ?`, name).Scan(&deleted, &upd)
+		if errors.Is(err, sql.ErrNoRows) {
+			return !tombstoned, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return tombstoned && deleted.Valid && upd == at, nil
+	}
+}
+
+// projectLiveRowGuard: the row is live and still has updated_at == at.
+func projectLiveRowGuard(ctx context.Context, name, at string) func(tx *sql.Tx) (bool, error) {
+	return func(tx *sql.Tx) (bool, error) {
+		var deleted sql.NullString
+		var upd string
+		err := tx.QueryRowContext(ctx, `SELECT deleted_at, updated_at FROM projects WHERE name = ?`, name).Scan(&deleted, &upd)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return !deleted.Valid && upd == at, nil
+	}
+}
+
+// projectRBACRoot is the RBAC path root of a project name, built like
+// safename.ProjectRBACPath(CanonicalProjectName(name)). ok=false for a name
+// that has no valid canonical form.
+func projectRBACRoot(name string) (string, bool) {
+	canon, err := safename.CanonicalProjectName(name)
+	if err != nil {
+		return "", false
+	}
+	// A name the validator refuses to create ("/", "/_default", a segment named
+	// like a resource namespace such as "/acme/vms") has a canonical root that is
+	// not the row's own: "/projects", the default project's, or a live parent
+	// project's resource namespace. A row that already carries one (an older
+	// build made it) derives no prefix retirement. One predicate, the creator's.
+	if safename.ValidateNewProjectName(name) != nil {
+		return "", false
+	}
+	return safename.ProjectRBACPath(canon), true
+}
+
+// sameProjectPath reports whether two project names are one project: equal
+// after canonicalisation ("acme" and "/acme"), or equal as raw strings when
+// either has no canonical form. "" is only equal to "".
+func sameProjectPath(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if a == "" || b == "" {
+		return false
+	}
+	ca, ea := safename.CanonicalProjectName(a)
+	cb, eb := safename.CanonicalProjectName(b)
+	return ea == nil && eb == nil && ca == cb
+}
+
+// tombstonedSpellings reports whether a TOMBSTONED project of another spelling
+// of name exists with no LIVE sibling spelling left: the previous incarnation of
+// the same RBAC root.
+func tombstonedSpellings(ctx context.Context, c *Client, name string) (bool, error) {
+	rows, err := c.Query(ctx, `SELECT name, deleted_at FROM projects WHERE name <> ?`, name)
+	if err != nil {
+		return false, err
+	}
+	dead := false
+	for _, r := range rows {
+		if !sameProjectPath(r.String("name"), name) {
+			continue
+		}
+		if r.String("deleted_at") == "" {
+			return false, nil
+		}
+		dead = true
+	}
+	return dead, nil
+}
+
+// refuseOwnedResources refuses while a live resource still belongs to the
+// project, naming each with the command that removes it. These carry the
+// project name in a column and resolve under the project's RBAC root, so a
+// project of the same name created later would inherit them — and with them
+// whatever their owner chose (a network's config, a storage pool and its
+// content, a backup repo, a notification target).
+func refuseOwnedResources(ctx context.Context, c *Client, name string) error {
+	owned := func(p string) bool { return p != "" && sameProjectPath(p, name) }
+	var found []string
+
+	nets, err := c.Query(ctx, `SELECT name, COALESCE(project, '') AS project FROM networks WHERE deleted_at IS NULL`)
+	if err != nil {
+		return err
+	}
+	for _, r := range nets {
+		if owned(r.String("project")) {
+			found = append(found, fmt.Sprintf("network %q (lv network rm %s)", r.String("name"), r.String("name")))
+		}
+	}
+	pools, err := c.Query(ctx, `SELECT DISTINCT name, COALESCE(project, '') AS project FROM storage_pools WHERE deleted_at IS NULL`)
+	if err != nil {
+		return err
+	}
+	for _, r := range pools {
+		if owned(r.String("project")) {
+			found = append(found, fmt.Sprintf("storage pool %q (lv pool delete %s)", r.String("name"), r.String("name")))
+		}
+	}
+	scheds, err := c.Query(ctx, `SELECT vm_name, repo, scope, COALESCE(project_name, '') AS project_name
+		FROM backup_schedules WHERE deleted_at IS NULL AND scope IN ('project', 'container')`)
+	if err != nil {
+		return err
+	}
+	for _, r := range scheds {
+		rec := BackupScheduleRecord{VMName: r.String("vm_name"), Scope: r.String("scope"), ProjectName: r.String("project_name")}
+		proj := rec.ProjectName
+		if rec.Scope == "container" {
+			proj = ContainerScheduleProject(rec)
+		}
+		if owned(proj) {
+			found = append(found, fmt.Sprintf("%s backup schedule %q to repo %q (lv backup schedule ls; lv backup schedule rm)",
+				rec.Scope, rec.VMName, r.String("repo")))
+		}
+	}
+	routes, err := c.Query(ctx, `SELECT id, COALESCE(project, '') AS project FROM notification_routes WHERE deleted_at IS NULL`)
+	if err != nil {
+		return err
+	}
+	for _, r := range routes {
+		if owned(r.String("project")) {
+			found = append(found, fmt.Sprintf("notification route %q (lv notify route rm %s)", r.String("id"), r.String("id")))
+		}
+	}
+	if len(found) > 0 {
+		return fmt.Errorf("project %q still owns %s; delete them first", name, strings.Join(found, ", "))
+	}
+	return nil
+}
+
+// bindingSentinelPath is where the NoAccess binding retireProjectGrants leaves
+// for a principal sits: the root, which no project's RBAC root is under, so a
+// later re-create (which retires everything under ITS root) never removes it.
+const bindingSentinelPath = "/"
+
+// commitProjectLifecycle (below) retires everything granting
+// authority over a project NAME, so a later project of the same name starts with
+// none: its admission authority, every role binding at or under its RBAC path,
+// and its quota. All three are keyed by the name, not by an incarnation. It builds the
+// statements and runs them in the same guarded transaction as the project row's
+// own change (kind), so they apply with it or not at all. Existing
+// statement shapes only.
+//
+// Every principal that loses a binding is left a NoAccess sentinel (bound, no
+// verbs) at the root, unless it already has one. RequirePerm treats a principal
+// with no bindings at all as "use the legacy role, cluster-wide", so retiring the
+// last binding of a principal must never leave it unbound — and "the last" cannot
+// be decided from a snapshot: two projects deleted at once, each seeing the
+// other's binding as the survivor, would both skip the sentinel. Leaving one
+// whenever a binding is retired is correct under any interleaving; a duplicate
+// grants nothing (RevokeRoleBindingLeavingSentinel does the same).
+type projectLifecycleKind int
+
+const (
+	lifecycleCreate projectLifecycleKind = iota // INSERT a project whose name has no row
+	lifecycleRevive                             // clear the tombstone of the row read
+	lifecycleDelete                             // tombstone the live row read
+)
+
+func commitProjectLifecycle(ctx context.Context, c *Client, kind projectLifecycleKind, p ProjectRecord, guard func(tx *sql.Tx) (bool, error)) (bool, error) {
+	name := p.Name
+	stmts := []Statement{{
+		SQL:    retireProjectAuthoritySQL,
+		Params: []interface{}{nowRFC3339(), c.NowTS(), projectOrDefault(name)},
+	}}
+	// Two spellings of one project ("acme", "/acme") are two rows but one RBAC
+	// path: another LIVE spelling still owns these bindings, so leave them.
+	spelled, err := c.Query(ctx, `SELECT name FROM projects WHERE name <> ? AND deleted_at IS NULL`, name)
+	if err != nil {
+		return false, err
+	}
+	root, ok := projectRBACRoot(name)
+	liveSpellings := liveSpellingsOf(name, spelled)
+	for _, r := range spelled {
+		if other, oerr := projectRBACRoot(r.String("name")); oerr && other == root {
+			ok = false
+		}
+	}
+	if h := projectSpellingsReadHook; h != nil {
+		h()
+	}
+	if ok {
+		rows, err := c.Query(ctx,
+			`SELECT id, path, role, principal FROM role_bindings WHERE deleted_at IS NULL`)
+		if err != nil {
+			return false, err
+		}
+		// A binding outside /projects/ cannot be retired by any project delete (the
+		// sentinel itself, at "/", is one, so a principal gets at most one), so
+		// a principal that holds one keeps its authority whatever the deletes do:
+		// root-scope and group-held grants (group:admin@local at "/") need no
+		// sentinel, and giving one would turn a later revoke of that grant into a
+		// lockout instead of a fall-back to the legacy role.
+		stable := map[string]bool{}
+		for _, r := range rows {
+			if pth := r.String("path"); pth != "/projects" && !strings.HasPrefix(pth, "/projects/") {
+				stable[r.String("principal")] = true
+			}
+		}
+		losing := map[string]bool{}
+		var order []string
+		for _, r := range rows {
+			path, who := r.String("path"), r.String("principal")
+			if path == root || strings.HasPrefix(path, root+"/") {
+				stmts = append(stmts, Statement{
+					SQL:    roleBindingDeleteSQL,
+					Params: []interface{}{nowRFC3339(), c.NowTS(), r.String("id")},
+				})
+				if !losing[who] {
+					losing[who] = true
+					order = append(order, who)
+				}
+			}
+		}
+		for _, who := range order {
+			if stable[who] {
+				continue
+			}
+			stmts = append(stmts, Statement{
+				SQL:    roleBindingInsertSQL,
+				Params: []interface{}{newSentinelID(), bindingSentinelPath, SentinelRole, who, 0, c.NowTS()},
+			})
+		}
+	}
+	// project_quotas has no deleted_at, so a quota is reset to unbounded (the
+	// state of a new project) rather than tombstoned.
+	q, err := GetProjectQuota(ctx, c, name)
+	if err != nil {
+		return false, err
+	}
+	if q != nil {
+		stmts = append(stmts, Statement{
+			SQL:    projectQuotaUpsertSQL,
+			Params: []interface{}{name, 0, 0, 0, 0, 0, 0, c.NowTS()},
+		})
+	}
+	switch kind {
+	case lifecycleCreate:
+		stmts = append(stmts, Statement{
+			SQL: `INSERT INTO projects (name, display, parent_name, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+			Params: []interface{}{p.Name, p.Display, p.ParentName, nowRFC3339(), c.NowTS()},
+		})
+	case lifecycleRevive:
+		stmts = append(stmts, Statement{
+			SQL:    `UPDATE projects SET deleted_at = ?, updated_at = ? WHERE name = ?`,
+			Params: []interface{}{nil, c.NowTS(), p.Name},
+		})
+	case lifecycleDelete:
+		stmts = append(stmts, Statement{
+			SQL:    `UPDATE projects SET deleted_at = ?, updated_at = ? WHERE name = ?`,
+			Params: []interface{}{nowRFC3339(), c.NowTS(), p.Name},
+		})
+	}
+	// The retirement was decided with these live spellings of the name; the
+	// transaction must still see exactly them, or a sibling revived since would
+	// have its fresh grants retired by a statement list that predates it.
+	pinned := func(tx *sql.Tx) (bool, error) {
+		ok, err := guard(tx)
+		if err != nil || !ok {
+			return ok, err
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT name FROM projects WHERE name <> ? AND deleted_at IS NULL`, name)
+		if err != nil {
+			return false, err
+		}
+		defer rows.Close()
+		var now []string
+		for rows.Next() {
+			var n string
+			if err := rows.Scan(&n); err != nil {
+				return false, err
+			}
+			if sameProjectPath(n, name) {
+				now = append(now, n)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return false, err
+		}
+		sort.Strings(now)
+		return slices.Equal(now, liveSpellings), nil
+	}
+	return c.ExecuteBatchGuarded(ctx, pinned, stmts)
+}
+
+// liveSpellingsOf returns the sorted names, among the live rows read, that are
+// another spelling of name.
+func liveSpellingsOf(name string, rows []Row) []string {
+	var out []string
+	for _, r := range rows {
+		if n := r.String("name"); sameProjectPath(n, name) {
+			out = append(out, n)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// projectSpellingsReadHook, when set (tests only), runs after a lifecycle has
+// read which other spellings of the name are live and before it reads the
+// bindings it will retire.
+var projectSpellingsReadHook func()
+
+func newSentinelID() string {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		panic("rand.Read: " + err.Error())
+	}
+	return hex.EncodeToString(buf)
 }
 
 // GetProject returns the project by name (canonical path) or nil if
@@ -112,6 +545,16 @@ func DeleteProject(ctx context.Context, c *Client, name string) error {
 	if name == DefaultProject {
 		return fmt.Errorf("cannot delete the default project")
 	}
+	// Deleting a name with no live project has no business revoking anything: it
+	// would retire pre-grants for a project not yet created and bump the clock of
+	// an already-deleted row.
+	liveRow, err := c.Query(ctx, `SELECT updated_at FROM projects WHERE name = ? AND deleted_at IS NULL`, name)
+	if err != nil {
+		return err
+	}
+	if len(liveRow) == 0 {
+		return fmt.Errorf("project %q not found", name)
+	}
 	// Refuse if children exist.
 	children, err := c.Query(ctx,
 		`SELECT 1 FROM projects WHERE parent_name = ? AND deleted_at IS NULL LIMIT 1`, name)
@@ -151,16 +594,26 @@ func DeleteProject(ctx context.Context, c *Client, name string) error {
 	if len(sgRows) > 0 {
 		return fmt.Errorf("project %q still owns security groups; delete them first (lv sg ls --project %s)", name, name)
 	}
-	// Retire the project's admission authority BEFORE tombstoning the project
-	// itself. Done in the other order, a delete that failed halfway would leave a
-	// gone project still holding live authority — the orphan state this prevents.
-	if err := RetireProjectAuthority(ctx, c, name); err != nil {
-		return fmt.Errorf("retire project authority: %w", err)
+	// Refuse if networks, storage pools, backup schedules or notification routes
+	// still belong to it: a later project of the same name would inherit them.
+	if err := refuseOwnedResources(ctx, c, name); err != nil {
+		return err
 	}
-	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE projects SET deleted_at = ?, updated_at = ? WHERE name = ?`,
-		nowRFC3339(), now, name)
+	// The grants go with the tombstone, in ONE guarded transaction that requires
+	// the row we validated above (same updated_at) to still be live: a delete that
+	// lost a race retires nothing, and a crash cannot leave a gone project holding
+	// live authority or a live one without it.
+	if h := projectLifecycleInterleaveHook; h != nil {
+		h()
+	}
+	applied, err := commitProjectLifecycle(ctx, c, lifecycleDelete, ProjectRecord{Name: name}, projectLiveRowGuard(ctx, name, liveRow[0].String("updated_at")))
+	if err != nil {
+		return fmt.Errorf("retire project grants: %w", err)
+	}
+	if !applied {
+		return fmt.Errorf("project %q was changed concurrently; retry", name)
+	}
+	return nil
 }
 
 // UpsertProjectQuota writes a quota row for the project. Zero in
@@ -171,8 +624,12 @@ func UpsertProjectQuota(ctx context.Context, c *Client, q ProjectQuotaRecord) er
 		return fmt.Errorf("project_name required")
 	}
 	now := c.NowTS()
-	return c.Execute(ctx,
-		`INSERT INTO project_quotas
+	return c.Execute(ctx, projectQuotaUpsertSQL,
+		q.ProjectName, q.VCPULimit, q.MemMiBLimit, q.DiskGiBLimit,
+		q.NICLimit, q.PublicIPLimit, q.BackupGiBLimit, now)
+}
+
+const projectQuotaUpsertSQL = `INSERT INTO project_quotas
 		   (project_name, vcpu_limit, mem_mib_limit, disk_gib_limit,
 		    nic_limit, public_ip_limit, backup_gib_limit, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -183,10 +640,7 @@ func UpsertProjectQuota(ctx context.Context, c *Client, q ProjectQuotaRecord) er
 		   nic_limit        = excluded.nic_limit,
 		   public_ip_limit  = excluded.public_ip_limit,
 		   backup_gib_limit = excluded.backup_gib_limit,
-		   updated_at       = excluded.updated_at`,
-		q.ProjectName, q.VCPULimit, q.MemMiBLimit, q.DiskGiBLimit,
-		q.NICLimit, q.PublicIPLimit, q.BackupGiBLimit, now)
-}
+		   updated_at       = excluded.updated_at`
 
 // GetProjectQuota returns the quota row or nil if unset. The default
 // project has no quotas (every limit = 0 = unbounded) — returns nil.

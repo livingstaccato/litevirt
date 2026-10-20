@@ -61,7 +61,11 @@ func migrateWithMidSample(t *testing.T, src, dst *Node, keepSource bool) *corros
 		if keepSource {
 			return nil
 		}
-		return src.Virt.UndefineDomain(name, false)
+		// As libvirt ends a migration with UNDEFINE_SOURCE: the source domain
+		// is gone. (An undefine of the running domain would leave it running,
+		// transient, as libvirt does.)
+		src.Virt.VanishDomain(name)
+		return nil
 	}
 	return mid
 }

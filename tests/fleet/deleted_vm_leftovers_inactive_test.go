@@ -74,9 +74,7 @@ func newLeftoverOnFormerHost(t *testing.T) *leftoverOnFormerHost {
 	if err := migrateAt(t, c, src, "os1", dst.Name); err != nil {
 		t.Fatalf("migrate os1 %s → %s: %v", src.Name, dst.Name, err)
 	}
-	if err := src.Virt.UndefineDomain("os1", false); err != nil {
-		t.Fatal(err)
-	}
+	src.Virt.VanishDomain("os1")
 	dst.Virt.SetState("os1", "running")
 	if !present(l.post1) || !present(l.marker) {
 		t.Fatal("the migration did not leave the detached disk and the marker on the source")

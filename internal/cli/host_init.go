@@ -39,6 +39,10 @@ var (
 // 3. Push CA + host cert + litevirtd binary + setup script via SSH
 // 4. Run setup script to install deps and start litevirtd
 func HostInit(ctx context.Context, sshTarget string, hostName string, force bool) error {
+	// The name becomes <pkiDir>/<name>.crt|.key beside the CA: checked first.
+	if err := pki.ValidateHostName(hostName); err != nil {
+		return err
+	}
 	// Parse SSH target to get IP for cert SAN
 	parsedHost, _, err := parseSSHTarget(sshTarget)
 	if err != nil {
@@ -302,6 +306,9 @@ func findDaemonBinary() (string, error) {
 // cluster network is not the default route, the operator has to say so, and the
 // same value belongs in advertise_address.
 func mintLocalHostCert(pkiDir, hostName, addr string) error {
+	if err := pki.ValidateHostName(hostName); err != nil {
+		return err
+	}
 	caPath := filepath.Join(pkiDir, "ca.crt")
 	caKeyPath := filepath.Join(pkiDir, "ca.key")
 	if addr == "" {
@@ -323,6 +330,9 @@ func mintLocalHostCert(pkiDir, hostName, addr string) error {
 }
 
 func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bool) error {
+	if err := pki.ValidateHostName(hostName); err != nil {
+		return err
+	}
 	// Same hazard as the remote form: the setup script rewrites config.yaml and
 	// passes an explicit empty join_peers, so re-running --local against a node
 	// that is already in a cluster erases its peer list.

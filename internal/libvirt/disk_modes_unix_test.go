@@ -84,20 +84,20 @@ func TestPITSnapshot_TheOverlayIsNarrowed(t *testing.T) {
 //
 // Mutation: ReadFirmwareBundle's nvram MkdirAll at 0o755 — this goes red.
 func TestReadFirmwareBundle_ANewNvramDirIsSearchableOnly(t *testing.T) {
-	redirectSwtpmBase(t)
+	base := testSwtpmBase(t)
 	umask022(t)
-	src := t.TempDir()
+	src := storeAt(base, t.TempDir())
 	seedFirmware(t, src, "src", "uuid-src", true, false)
 	var buf bytes.Buffer
-	if _, err := WriteFirmwareBundle(src, "src", "uuid-src", &buf); err != nil {
+	if _, err := src.WriteFirmwareBundle("src", "uuid-src", &buf); err != nil {
 		t.Fatal(err)
 	}
-	dst := t.TempDir()
-	if err := ReadFirmwareBundle(&buf, dst, "dst", "uuid-dst"); err != nil {
+	dst := storeAt(base, t.TempDir())
+	if err := dst.ReadFirmwareBundle(&buf, "dst", "uuid-dst"); err != nil {
 		t.Fatal(err)
 	}
-	wantMode(t, filepath.Dir(NvramPath(dst, "dst")), 0o711)
-	wantMode(t, NvramPath(dst, "dst"), 0o600)
+	wantMode(t, filepath.Dir(dst.NvramPath("dst")), 0o711)
+	wantMode(t, dst.NvramPath("dst"), 0o600)
 }
 
 // The retained-firmware marker's directory is the NVRAM directory; when the
@@ -107,7 +107,7 @@ func TestReadFirmwareBundle_ANewNvramDirIsSearchableOnly(t *testing.T) {
 func TestWriteRetainedFirmwareMarker_ANewNvramDirIsSearchableOnly(t *testing.T) {
 	umask022(t)
 	dataDir := t.TempDir()
-	if err := WriteRetainedFirmwareMarker(dataDir, "vm", "uuid-keep"); err != nil {
+	if err := storeAt(testSwtpmBase(t), dataDir).WriteRetainedFirmwareMarker("vm", "uuid-keep"); err != nil {
 		t.Fatal(err)
 	}
 	wantMode(t, filepath.Join(dataDir, "nvram"), 0o711)

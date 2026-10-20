@@ -530,3 +530,27 @@ func MintCRLWith(caCertPath, caKeyPath, crlPath string, serials ...string) ([]by
 	}
 	return os.ReadFile(work)
 }
+
+// CanonicalSerial is serial, a certificate serial in hex as an operator or a
+// row may spell it (any case, leading zeroes, a 0x prefix), in the one form
+// the CRL and every certificate read here use: lower-case hex with no
+// leading zero. Anything that is not a positive hex number is refused.
+func CanonicalSerial(serial string) (string, error) {
+	s := strings.TrimSpace(serial)
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		s = s[2:]
+	}
+	if s == "" || len(s) > 128 {
+		return "", fmt.Errorf("certificate serial %q is not a hex number", serial)
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return "", fmt.Errorf("certificate serial %q is not a hex number", serial)
+		}
+	}
+	n, ok := new(big.Int).SetString(s, 16)
+	if !ok || n.Sign() <= 0 {
+		return "", fmt.Errorf("certificate serial %q is not a positive hex number", serial)
+	}
+	return n.Text(16), nil
+}

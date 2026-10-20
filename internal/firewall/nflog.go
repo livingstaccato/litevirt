@@ -29,11 +29,39 @@ type nflogConn interface {
 	Close() error
 }
 
-// openNflog binds a netlink socket to group, copying each packet's headers.
-// FlagSeq numbers the group's records, so a gap is a record the kernel
-// dropped before the listener read it (a full socket buffer).
+// How long the kernel holds a record for the listener, and how many it
+// holds, before it sends them (NFULA_CFG_TIMEOUT, NFULA_CFG_QTHRESH). Left
+// unset the kernel holds them up to 1 s, or until about 21 fill its buffer,
+// and a record without a packet timestamp is stamped that late.
+//
+// The timeout is in 1/100 s and 1 is the least go-nflog sends (it leaves 0
+// at the kernel's 1 s): a record reaches the store within about 10 ms. That
+// is at most 100 timer flushes a second, however many records there are.
+// The threshold sends a batch at once when 16 are held, below the ~21 a
+// buffer holds, so it is what decides under load. The kernel's record rate R
+// is bounded by the log lines' limits (each NIC side's rate, and
+// lv_lg_routed), not by firewall.log_max_rate, which the store applies after
+// it: R records a second cost at most 100 + R/16 sends, against R with a
+// threshold of 1. One side's default burst (10) never reaches 16 alone, and
+// at R = 200 (the default log_max_rate) that is at most about 113 sends a
+// second.
+const (
+	logFlushTimeout = 1  // 1/100 s
+	logQThresh      = 16 // records
+)
+
+// nflogConfig is the group's configuration: each packet's headers, records
+// numbered (FlagSeq: a gap is a record the kernel dropped before the listener
+// read it, a full socket buffer), sent within logFlushTimeout or at
+// logQThresh records.
+func nflogConfig(group uint16) *nflog.Config {
+	return &nflog.Config{Group: group, Copymode: nflog.CopyPacket, Bufsize: logSnaplen, Flags: nflog.FlagSeq,
+		Timeout: logFlushTimeout, QThresh: logQThresh}
+}
+
+// openNflog binds a netlink socket to group (nflogConfig).
 func openNflog(group uint16) (nflogConn, error) {
-	return nflog.Open(&nflog.Config{Group: group, Copymode: nflog.CopyPacket, Bufsize: logSnaplen, Flags: nflog.FlagSeq})
+	return nflog.Open(nflogConfig(group))
 }
 
 // LogListener reads NFLOG group Group into Store.
@@ -154,7 +182,10 @@ func (l *LogListener) handle(a nflog.Attribute) int {
 		return 0
 	}
 	if a.Timestamp != nil {
-		r.Time = *a.Timestamp
+		// The kernel's time for the packet; the store keeps it unless it is
+		// implausible. A packet the host sends carries none, and the store
+		// stamps the time it receives the record.
+		r.Time, r.TimeSource = *a.Timestamp, LogTimePacket
 	}
 	if a.Payload != nil {
 		parseLogPacket(&r, *a.Payload)

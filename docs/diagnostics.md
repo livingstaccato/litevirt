@@ -54,7 +54,7 @@ workload; the amounts and state are shown to every viewer.
 |---|---|---|
 | `in-flight` | the VM's or container's mutation barrier names the operation | the operation, when it finishes |
 | `admitting` | younger than 15 minutes, no barrier: an admission that may still be committing | the operation |
-| `auto-expires` | an admission lease (`kind` `admission-lease`, or `transfer-lease` for a migration or drain); `detail` names the expiry instant | the stale-lease sweep: 15 minutes after creation, 6 hours for a transfer lease |
+| `auto-expires` | an admission lease (`kind` `admission-lease`, or `transfer-lease` for a migration or drain); `detail` names the expiry instant | the stale-lease sweep: 15 minutes after creation, 6 hours for a transfer lease. A live migration of a Secure Boot / vTPM VM whose source daemon died holding its transfer lease has it released by that daemon's recovery of the move, once it restarts |
 | `journal` | a `vm_replace` or `drain_cold_move` journal | its own recovery; never released by hand |
 | `releasable` | the operation finished at a later owner epoch than its header's, or the VM it was for no longer exists (or was re-created after it began) | the reservation sweep on the target host |
 | `stale` | no barrier, past the admission window, and nothing proves the operation finished | `lv operation release-reservation <operation-id> --force` |
@@ -1784,6 +1784,140 @@ text as `sharedDiskWithheld`. It is notified (`vm.shared_disk_withheld` event
 and notification) when raised or when its text changes, and resolves when the
 next build of the VM's domain withholds nothing.
 
+### A volume move that did not finish (`vm.move_unresolved`)
+
+Evaluator `move_volume`, subject kind `vm`, subject the VM's name, severity
+warning. Raised by the host running an `lv move-volume` before its cutover
+changes the persistent config or the disk record, and resolved when the two
+agree again. It stays open after a move that could not be rolled back, or
+whose daemon stopped mid-cutover. The evidence names the host holding the
+move's record and, per disk, both files and whether the guest was pivoted.
+Starts, migrations, replications, clones, image builds, backups and moves
+settle it first or are refused (docs/storage.md, "A move that cannot be
+rolled back"). It is resolved by the host holding the record; by the VM's
+owner once every move it lists is proven settled there; and for every host
+when the VM is deleted or a new VM takes its name. An admin resolves it by
+hand with `lv health resolve vm.move_unresolved vm/<vm> --reason "…"
+[--accept <path> …]`, accepted on the holding host itself, where it also
+removes the record, and from any host once that host is proven powered off:
+fenced or removed over an IPMI power-off or an operator's `lv host
+fence-confirm <host>` of its last life. `lv health` prints each move first:
+both files, whether the guest was pivoted (or the copy was named before the
+move), and the move's error.
+
+`--accept <path>` names the file to keep of one disk's move, once per disk.
+A disk record is pointed at another file only on the VM's owner, and only
+where it reads the same file as the holding host: its own file on a host that
+is both, or a file on a mounted shared pool both hosts define alike (the same
+export mounted at the same directory, the pool's own source). On a holding
+host that does not own the VM, `--accept` may only name the file the disk
+record already names. A resolution never keeps a file the move proves stale:
+after a pivot only the copy is accepted, except in a forked history (below).
+A live move with no pivot recorded is
+refused without an `--accept` for its disk: nothing in the cluster knows
+which file the guest wrote last, and neither the disk record nor a persistent
+config naming the copy is evidence of it (the move names the copy in the
+config before the pivot). The one exception is the holding host that owns the
+VM, whose persistent config and disk record both name the source: no pivot
+happened. Judge it from the holding host's persistent config, or from the two
+files on the shared pool (the later modification time, `qemu-img compare`).
+On the VM's owner, with its domain defined, the persistent config, which `lv
+start` boots, must name the file each disk record is left on (point it there
+with `virsh edit` or pass that file to `--accept`), and no disk record is
+changed while the domain is active (`lv stop` it first); on the holding host
+that owns the VM the domain must be shut off. A condition whose evidence
+cannot be read is resolved only on the VM's owner with its domain shut off and
+its persistent config naming the file each disk record names, and keeps the
+disk records as they are; a holding host that returns with a record of a move
+of one of those disks begun before the resolution drops it, unless the record
+knew a pivot, a catch-up or an error: that one is raised again.
+
+**A forked history.** A pivoted move whose condition reached the VM's new
+owner only after a failover there (replication from the holding host was cut,
+or the condition was resolved over unreadable evidence) leaves two histories:
+the copy holds the writes the holding host made after the pivot, and the
+source, which the VM may have been started on since, holds the writes made
+there. Neither file is complete, and the owner's starts are refused with a
+text naming both exits. Once the holding host is proven powered off, on the
+VM's owner (`LV_HOST=<owner>`; the holding host too, once the VM came back to
+it):
+
+- `lv health resolve vm.move_unresolved vm/<vm> --accept <source> --reason
+  "…"` keeps the writes made on the source. It is accepted when the VM
+  changed hands after the move began (another owner, or a later ownership
+  generation, than the move recorded); the domain may keep running when its
+  persistent config and the disk record already name the source. A persistent
+  config naming the copy is pointed at the source with the domain shut off;
+  with no domain of the VM a start rebuilds it from the disk record. It is
+  refused on any other host than the owner, and while the copy was modified after the
+  source: the holding host wrote only the copy after the pivot, so nothing
+  was written to the source since. `--force` takes it anyway, with the reason
+  audited. A disk record naming the copy is pointed at the source (the
+  domain must be shut off); the copy is kept on disk, and a
+  `health.condition.hand_diverged` audit row names it.
+- `--accept <copy>` keeps the holding host's writes and discards every write
+  made on the source since the failover. With the owner's domain defined it
+  needs the domain stopped (`lv stop`) and its persistent config pointed at
+  the copy, as any other `--accept` of the copy on the owner. Once the VM
+  changed hands it is taken only on the VM's owner, and refused while the
+  source was modified after the copy, or either file cannot be read there,
+  unless `--force` is given, with the reason audited.
+
+With the domain running, only the file the running guest has open is kept,
+whatever its persistent config and the disk record name.
+
+The refusal prints both files' sizes and modification times (a source
+modified after the copy was written since the failover) and the starts of the
+VM recorded since the move began. A start through `lv start`, an HA restart
+or failover, the reconciler, a health check's restart, a replacement's restart
+or a promotion leaves a replicated `vm.starting` event naming the host and the
+ownership generation, and a domain the reconciler finds already running a
+`vm.adopted_running` event; `lv events <vm>` lists both, and the refusal
+lists them; `lv audit ls --target
+<vm>` lists its failover reschedules (action `failover`). The list may be
+incomplete either way: an event stamped by a host whose clock runs behind,
+one pruned with the VM's old events or beyond the newest 1000, one that has
+not reached the host, and a start by a build that records none are not
+listed. Each host also keeps a record of the ownership generation it last
+started a VM at, under `move-started` in its data directory, and the refusal
+names a start there since the move began.
+
+With no domain of the VM on its owner, a start never points the disk record
+at the copy by itself: nothing there proves the VM did not run on the source
+since the move began. So a failover that lands between a pivot and the end
+of the move holds the VM even when nothing ran it since: once the holding
+host is proven powered off, `lv health resolve vm.move_unresolved vm/<vm>
+--accept <copy> --reason "…"` on the owner starts it on the copy. The one
+automatic repoint left is on an owner whose domain is shut off with a
+persistent config naming the copy on a shared pool; it writes a
+`health.condition.auto_repoint` audit row.
+
+A disk record that names the copy is no proof either once the VM changed
+hands after the move began: a host that missed the holding host's commit
+reads the source, and may have run the VM there since. The owner's start is
+then refused with both exits, as above; `--accept <copy>` keeps the record as
+it is, and `--accept <source>` points it at the source. The holding host that
+gets the VM back after it changed hands does not trust its own persistent
+config either: its start is refused with both exits, and an admin's
+resolution made while it was away stands only when its config names the file
+the resolution left the disk record on.
+
+These refusals do not hold an operation that cannot pick the wrong file while
+the VM's domain runs on its owner: a live migration without storage (`lv
+migrate`, a host drain), and a backup, replication, clone or image build
+reading the file the running guest has open. The condition stays open for the
+VM's next start.
+
+A holding host that rejoins after an admin resolved its move from another
+host drops its record of that move instead of raising the condition again,
+unless it now owns the VM. When its record knew more than the evidence the
+admin resolved (a pivot that never replicated, for example), the decision
+still stands, and the host logs a warning and writes a
+`health.condition.hand_diverged` audit row naming what it knew: check that the
+file the disk record names holds the guest's data. While it holds an open
+condition, run the resolution against it (`LV_HOST=<host>`). Removing a host
+does not resolve the condition.
+
 ### A cluster default-deny held by a torn-down stack (`firewall.default_deny_orphaned`)
 
 Evaluator `stack_reconciler`, subject kind `cluster`, subject `cluster`,
@@ -2097,9 +2231,16 @@ holder writes.
   destination, and `virsh domstate <vm>` on that destination shows whether it
   runs there. Only if the claim gave the VM to that host and it runs it there
   is the local copy a superseded duplicate. Stop it on this host with
-  `virsh destroy <vm>`. Its disks are kept, but its definition and NVRAM are
-  removed on the next reconcile pass, because the leftover cleanup undefines
-  a destroyed domain whose row moved. Otherwise leave the local copy running.
+  `virsh destroy <vm>`. Its disks are kept. The next reconcile pass undefines
+  a destroyed domain whose row moved; its NVRAM and vTPM state, if it has
+  any, go into `<data_dir>/fwmig-quarantine/<vm>-reconciled-<unix>/`.
+  `lv host superseded-disks <host>` lists these directories. They are kept
+  while a VM of that name exists, and removed by the hourly sweep once it is
+  gone and they are older than `superseded_disk_retention_days`; remove one
+  by hand with `--remove <dir>`, or put one back as the VM's firmware state
+  with `--restore <dir>`. While the reconciler is part way through one
+  (`<vm>-reconciling-<uuid>`), the VM's start on that host is refused, so it
+  never boots on blank firmware state. Otherwise leave the local copy running.
   The condition resolves once the copy is no longer declined.
 
 ### Audit chain held (`audit_chain_held`)
@@ -2284,6 +2425,11 @@ carries `state`, `path`, `fs`, `error` and `remedy`:
   The vTPM capability label stays false until a pass completes.
 
 A vTPM write made shortly before a power cut on that host can be lost.
+
+While it is open, or before the host's first pass has completed, the host is
+no target of a live firmware move: its `litevirt.fw_live_migrate` label is
+false, and a move's Prepare refuses there with the condition and its remedy.
+vTPM itself is still offered on the host.
 
 | Raised when | Clears when |
 |---|---|
@@ -3022,6 +3168,62 @@ another host, check it and remove its entry from `<data_dir>/kept-disks.json`
 on the host that raised the condition; the file is re-read within 30 s. A file
 that cannot be read is never written over: the condition says so, the disks
 stay named from memory, and fixing or removing the file recovers.
+
+### A firmware move record cannot be read (`firmware_migration_record_unreadable`)
+
+A live firmware migration keeps its records under `<data_dir>/fwmig-inflight/`
+(the source) and `<data_dir>/fwmig-hold/` (the target), and a target keeps a
+leftover an owed DISCARD names under `<data_dir>/fwmig-leftover/`. While a record names a
+VM, its starts, stops, redefines and firmware state writes are refused. A
+record file that cannot be read could name any VM, so the refusal is
+host-wide for every operation that carries a domain uuid (a define, a firmware
+state restore, a wipe), and covers every operation on the VM the file is named
+after. The refusal names the file, and the host raises
+`firmware_migration_record_unreadable` (evaluator `firmware_move`, subject
+`host/<host>`, critical), whose evidence gives each file, why it does not
+read, and every firmware state wipe it refused: that state is still on disk,
+and each such VM also gets a `vm.firmware_wipe_refused` event. Repair the file,
+or move it out of its directory once no firmware move on the host needs it;
+the condition resolves within a pass once every file reads.
+
+### Live firmware migration (`firmware_migration_*`)
+
+A live move of a Secure Boot / vTPM VM
+([migration](migration-failover.md#secure-boot--vtpm-vms)) raises these
+conditions: evaluator `firmware_migration`, subject `vm/<vm>`, shown by
+`lv health`. The evidence gives the VM, the attempt, the source and target,
+the host that raised it, the hashes and paths it is about, a `detail`, and an
+`action` when an operator has one. While a move is parked, its records stay
+on both hosts (`<data_dir>/fwmig-inflight/<vm>.json` on the source,
+`<data_dir>/fwmig-hold/<vm>.json` on the target), so starts, stops, redefines
+and firmware state writes of the VM stay refused there, and nothing is
+deleted on either host. The source's recovery looks at each parked move every
+minute and at daemon start.
+
+| Code | Severity, host | What happened | What you do; when it resolves |
+|---|---|---|---|
+| `firmware_migration_target_unreachable` | critical, source | The source could not finish a call to the target (unreachable, a build without the RPCs, or the target reports no record of the attempt while a domain of the VM is defined there). Also a mismatch whose discard of the target's copy did not get through | Bring the target back; the retry resolves it. If the target is down for good, give it a proof-grade fence: an `ipmi` or `redfish` fence that powered it off, or `lv host fence-confirm <host>`. An `ssh`, `watchdog` or best-effort fence does not count (see [What a fence records](migration-failover.md#what-a-fence-records)). Then, when the VM's row still names the source, and the move had not reached cutover or the source's guest stopped for the migration, the source drops its record and `firmware_migration_discard_owed` follows. The VM's row becomes `running` when its source domain runs, `error` when the domain is active but not running, and `stopped` otherwise; from `stopped`, `lv start <vm>` starts it from the source's firmware state. When the row names the target, it stays parked: with the target proved off, `lv doctor firmware-move <vm> --accept-source --acknowledge-rollback` returns the VM and its disks to the source (not after a storage copy, whose commit deleted the source's disks, and not when a disk row changed since the commit), and `--accept-target` finishes the source cleanup of a released move. A held domain the target lost after the commit (`held_domain_absent` in the detail) takes `--push-source-nvram` or `--accept-source --acknowledge-rollback`. A move parked before cutover whose target keeps refusing the abort takes `--discard-target` |
+| `firmware_migration_discard_owed` | warning, source; critical while the target refuses | The move was resolved by fence, and the target's copy is still to be discarded. The source sends the discard every minute | Nothing while a warning. Resolves when the discard lands on the target's return, or the target host is removed (`lv host rm <host>`). Critical: the target refused it because the VM's domain runs there, or a domain of the VM is still defined there. While the target holds the move's hold, `lv doctor firmware-move <vm> --discard-target --stop-target` stops that guest and discards its copy. With no hold left there, the DISCARD puts the target's domain under a leftover record, which keeps it from being started, stopped or undefined there (`lv doctor firmware-move <vm>` shows it as `leftover`); `lv doctor firmware-move <vm> --discard-target` (with `--stop-target` while its guest runs) moves its state into `<data_dir>/fwmig-quarantine/<vm>-<attempt>/` and undefines it keeping its state. Once no host owes the DISCARD, `--discard-target` still takes a leftover that is shut off, on the target's own record. A shut-off leftover the target's reconciler cleans first has its state moved into `<data_dir>/fwmig-quarantine/<vm>-reconciled-<unix>/`, never wiped (listed by `lv host superseded-disks <host>`, kept while the VM exists and while any firmware move record or open `discard_owed` names it). When the VM's row later names the target for the leftover's own incarnation and no host owes the DISCARD, `lv doctor firmware-move <vm> --adopt-target-copy --acknowledge-rollback` drops the leftover record and keeps the shut-off domain and its state as the VM's own. That state is as old as the leftover: without the acknowledgement the refusal gives its age and names every newer copy the hosts report (a domain of the VM, a `<vm>-reconciled-*` quarantine), and `lv host superseded-disks <host> --restore <dir>` puts such a quarantine back as the VM's firmware state on the host the VM is placed on (the VM stopped there; the state it replaces is set aside the same way) |
+| `firmware_migration_unverified` | critical, source | The target's vTPM state did not match the source's final copy, or the target's guest was no longer there, after the source's guest stopped for the migration. The target's copy is quarantined; the VM is `stopped` on the source with its firmware state | `lv start <vm>` runs it on the source. The quarantine on the target is for inspection (`firmware_migration_quarantine`). `lv doctor firmware-move <vm> --resolve unverified` closes the condition |
+| `firmware_migration_source_state_missing` | critical, source | After the guest left the source, the source's final vTPM state or NVRAM is missing, or the source domain's state cannot be read. The target's guest stays paused | Nothing is deleted. Retried every minute. `lv doctor firmware-move <vm> --adopt-target-copy` takes the target's copy when the source's final state is missing; after the commit `--accept-target` hashes the source's final NVRAM again and resends Release; before it, with the state present, `--reverify` for a park from cutover, and the minute retry for a park from migrating (`--reverify` refuses that one) |
+| `firmware_migration_source_state_suspect` | critical, source | The target's copy did not match, or its guest is gone, and the source's guest had stopped for a reason other than the migration (a host crash or reboot), so the source's copy may be stale. Both copies kept; the target's guest stays paused | Not retried. `lv doctor firmware-move <vm> --adopt-target-copy` takes the target's copy (the source's guest shut off), or `--accept-source --acknowledge-rollback` the source's |
+| `firmware_migration_target_ran` | critical, source | The target's guest was found running before it was released, or a discard of the target's copy was refused because its guest runs | Not retried. Nothing is deleted on either host. Before cutover, with the source's guest running: `lv doctor firmware-move <vm> --discard-target --stop-target`. After it: `--adopt-target-copy`, or `--accept-source --acknowledge-rollback --stop-target` |
+| `firmware_migration_source_paused` | critical, source | The migration failed with the source's guest paused and a domain of the VM on the target. Both guests are paused | Not retried. `lv doctor firmware-move <vm> --accept-source` discards the target's copy, then resumes the source's guest (one already running is left running). It is refused while the target's guest runs, or is paused under a hold that is not `prepared`: that copy ran after the source paused. Shut the source's domain off, then `--adopt-target-copy` |
+| `firmware_migration_nvram_unconfirmed` | critical, source | The guest runs on the target, but the target's NVRAM did not equal the source's final NVRAM within 10 s of the resume. A guest writing EFI variables just after the resume can cause it. The source's state is kept; the VM cannot be started on the source, nor started or stopped on the target | The guest keeps running on the target. `lv doctor firmware-move <vm> --confirm-target-nvram --accept-nvram-hash=<sha256>` accepts the target's NVRAM by the hash it has now; with the guest powered off, `--push-source-nvram --acknowledge-rollback` writes the source's final NVRAM there (`--stop-target` stops the guest first). Either way the source cleans up after |
+| `firmware_migration_cleanup_failed` | critical (warning for a draining, maintenance or removed target, or a VM moved on to a third host), source | The guest runs on the target, but the source cleanup stopped: writing the retained bundle, undefining the source's leftover definition, wiping the source's state, or removing the record failed. The source's state is kept | Fix the cause the detail names; the cleanup is retried every minute and at daemon start, and the condition resolves when it finishes. If the detail says the source's state changed after the cutover, it is never wiped automatically and a retry does not heal it: `lv doctor firmware-move <vm> --accept-target` moves it into `<data_dir>/fwmig-quarantine/<vm>-<attempt>/` on the source and ends the move. The cleanup undefines the source's domain only while the target is active, answers, and shows a domain of the VM's uuid with no error reading its records; in every other case (offline, fenced, proved off, draining, maintenance, removed, unknown, not answering, or answering without the VM's copy) it holds before the undefine and the detail says why. Each of these holds goes on by itself once the target is active, answers and holds the copy again, except the one below for a VM that moved on. A hold for a target in `draining` or `maintenance`, or removed from the cluster, is a warning; for a removed target `--accept-target` is the exit. When the VM's row names a third host (it moved on from the target), the cleanup holds at warning and never goes on by itself: `--accept-target` is the only exit. `lv doctor firmware-move <vm> --accept-target` ends a hold at any time, the source's state quarantined. A target is proved off by an `ipmi` or `redfish` fence that powered it off, or by `lv host fence-confirm <host>`; a target removed after a proof-grade fence counts as proved off for the exits below. A cleanup never takes the state of a VM whose row names the source again. If the target is down for good, once it is powered off and `lv host fence-confirm <host>` recorded, `lv doctor firmware-move <vm> --accept-source --acknowledge-rollback` returns the VM and its disks to the source, stopped, from the source's state (refused when that state changed since the cutover, or when the cleanup already undefined the source's domain); then `lv start <vm>` |
+| `firmware_migration_vf_missing` | critical, source (`runs_on` names where the guest runs) | The guest runs (on the source after a failed move, or on the target) without SR-IOV VFs the move detached from it; `vfs` lists them | Attach the VFs to the guest again, or restart it on that host so its devices are allocated again. Resolves once the guest runs there with all its VFs, or is stopped, deleted, or moved off that host |
+| `firmware_migration_held` | warning, target | A hold with a domain of the VM has existed for 5 minutes (it starts when the target prepares the move). A long storage copy reaches this in a move that is going well | Resolves when the hold goes. A hold whose source holds no marker of the move (its host lost, or only an owed discard left there): `lv doctor firmware-move <vm> --adopt-target-copy` with the source host proved off, or `--discard-target` while the VM's row does not name the target |
+| `firmware_migration_quarantine` | warning, target | The target moved a held copy (vTPM state, NVRAM, record) into `<data_dir>/fwmig-quarantine/<vm>-<attempt>/`, with `reason.txt` giving every hash. This happens on a mismatch, on the abort of a hold that was past `prepared`, when a new move of the VM finds an earlier attempt's hold with no domain, and when the hold sweep finds a hold with no domain older than 2 hours whose VM is gone, recreated, or not migrating to this host | Nothing removes a quarantine. Inspect it and remove the directory by hand when it is no longer needed. `lv doctor firmware-move <vm> --resolve quarantine` closes the condition; the directory stays |
+
+In a quarantine made before the guest resumed on the target, the NVRAM is the
+source's NVRAM the target materialised when it prepared the move, not libvirt's
+template.
+
+`lv doctor firmware-move <vm>` shows each host's records of the move, the
+VM's domain on each host, and every hash and path. With one action it resolves
+a parked move on the host whose record it acts on. Each action refuses a state
+it has no row for and leaves both records and both copies as they were. Every
+action is audited (`vm.firmware-move`).
 
 ### A VM's disk is missing on its own host (`vm_disk_missing`)
 

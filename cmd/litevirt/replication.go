@@ -24,6 +24,7 @@ func newReplicationCmd() *cobra.Command {
 		newReplicationScheduleCmd(),
 		newReplicationPromoteCmd(),
 		newReplicationReplicasCmd(),
+		newReplicationCheckpointsCmd(),
 	)
 	return cmd
 }

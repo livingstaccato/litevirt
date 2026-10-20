@@ -223,7 +223,15 @@ var dataDirOwned = []string{
 	"nic-guard-held",             // grpcapi/nic_guard_held.go heldGuestDir: guests held paused for their guards
 	"promote-started",            // grpcapi/promote_serialize.go: an operator promotion's recorded start, per proof
 	"shared-disk-released",       // health/shared_disk_release.go sharedReleaseDir: shared disks released for a start
+	"move-unresolved",            // health/move_unresolved.go UnresolvedMoveDirName: volume moves whose config and row may disagree
+	"move-started",               // health/move_started.go StartedHereDirName: the generation this host last started each VM at
 	"vfio-host-drivers.json",     // vfio.HostDriversFileName (grpcapi/pci.go vfioHost): each bound device's previous host driver (its .tmp is a dot-name)
+	"fwmig-inflight",             // fwmig.InflightDir: live firmware move source markers
+	"fwmig-discard-owed",         // fwmig.DiscardOwedDir: owed DISCARD records
+	"fwmig-hold",                 // fwmig.HoldDir: live firmware move target holds
+	"fwmig-retained",             // fwmig.RetainedDir: retained firmware bundles
+	"fwmig-quarantine",           // fwmig.QuarantineDir: quarantined firmware state
+	"fwmig-leftover",             // fwmig.LeftoverDir: leftovers an owed DISCARD names
 }
 
 // dataDirOwnedPrefixes are owned by name prefix, each judged within one path

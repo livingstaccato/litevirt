@@ -181,8 +181,9 @@ var recreateMemberRead = corrosion.GetContainer
 //   - a privileged or legacy-confined mode the member already has is kept
 //     for whoever may deploy the stack when the recreate runs the same image
 //     (sameContainerImage), as on main; when the image changes, the deployer
-//     is choosing a new rootfs to run as host root, which needs the Admin
-//     role or ct.exec on the member (root inside it already).
+//     is choosing a new rootfs to run as host root, which needs what exec
+//     in the member needs: the Admin role or the ContainerRoot role on it
+//     (requireContainerRoot).
 //
 // The create's own caller-side checks (authorizeContainerCreate: ct.create,
 // the template's host-path authority, the opt-outs) run here too, on the
@@ -232,6 +233,8 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 	}
 	var dec *recreateDecision
 	var old corrosion.ContainerCreateSpec
+	var pinGen string
+	var pinned bool
 	oldPrivileged, oldConfinement := false, lxc.ConfinementDefault
 	if rec != nil {
 		old = corrosion.DecodeCreateSpec(rec.CreateSpec)
@@ -259,6 +262,13 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 			if err := s.mayChangePrivilegedImage(ctx, a.VMName, rec, d, privileged); err != nil {
 				return nil, nil, err
 			}
+		} else if _, isPath, _ := lxc.TemplatePath(old.Template); isPath && !s.callerMayRoot(ctx, *rec) {
+			// The same rootfs path, whose content an Admin's pull may have
+			// replaced since the member was built: the member's host checks
+			// the item is still the generation it was built from
+			// (recreateHostChecks), or this is an image change too.
+			pinGen, pinned = old.TemplateGen, true
+			dec.pinned, dec.pinGen = true, pinGen
 		}
 		dec.keep = true
 		dec.note = RequireRole(ctx, "admin") != nil
@@ -273,24 +283,40 @@ func (s *Server) judgeContainerRecreate(ctx context.Context, a planner.VMAction,
 		if old.Template != "" && old.Template == req.Template {
 			dec.template = req.Template
 		}
+		// A recreate from a rootfs path is built from a copy its member's
+		// host takes before the delete, so nothing that becomes of the item
+		// afterwards can leave the member deleted and not rebuilt.
+		if _, isPath, _ := lxc.TemplatePath(req.Template); isPath {
+			dec.bound = true
+		}
 		createCtx, _ = dec.apply(ctx, d, req)
 	}
 	if err := s.authorizeContainerCreate(createCtx, req); err != nil {
 		return nil, nil, status.Errorf(status.Code(err), "recreating container %q: %s; the member was left as it is", a.VMName, status.Convert(err).Message())
 	}
 	// The create's host-side checks (the protected-place check and the
-	// image-owner check), on the disk of the host that holds the member,
-	// before anything is deleted: here when that is this host; otherwise
-	// that host runs them at the delete, from the preflight its forwarded
-	// delete carries (recreate_preflight.go).
+	// image-owner check) and the fetch of its image, on the host that holds
+	// the member, before anything is deleted: here when that is this host;
+	// otherwise that host runs them at the delete, from the preflight its
+	// forwarded delete carries (recreate_preflight.go).
+	pf := &recreatePreflight{template: req.Template, project: req.Project, distro: req.Distro, release: req.Release, arch: req.Arch,
+		pinned: pinned, pinGen: pinGen, bound: dec != nil && dec.bound}
 	if a.TargetHost == "" || a.TargetHost == s.hostName {
-		if err := s.recreateHostChecks(createCtx, req.Template, req.Project, req.Name); err != nil {
-			s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
+		if err := s.recreateHostChecks(createCtx, *pf, req.Name); err != nil {
+			if status.Code(err) != codes.FailedPrecondition {
+				s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
+			}
 			return nil, nil, err
 		}
 		return dec, nil, nil
 	}
-	return dec, &recreatePreflight{template: req.Template, project: req.Project}, nil
+	// The member's host runs the same checks, and the fetch, now, on the
+	// caller's context: a refusal, or a caller who gives up, leaves the
+	// member as it is (probeRecreateOnMember). The delete runs them again.
+	if err := s.probeRecreateOnMember(ctx, a.TargetHost, a.VMName, pf); err != nil {
+		return nil, nil, err
+	}
+	return dec, pf, nil
 }
 
 // recordedSecurity is a container record's privilege mode and confinement;
@@ -332,13 +358,11 @@ func sameContainerImage(rec corrosion.ContainerRecord, old corrosion.ContainerCr
 }
 
 // mayChangePrivilegedImage refuses a recreate that runs a new image in a
-// privileged or legacy-confined member for a caller who is neither Admin nor
-// holds ct.exec on the member (root inside it already).
+// privileged or legacy-confined member for a caller who may not exec in it
+// as root: neither Admin nor holding the ContainerRoot role on the member
+// (requireContainerRoot).
 func (s *Server) mayChangePrivilegedImage(ctx context.Context, name string, rec *corrosion.ContainerRecord, d *compose.VMDef, privileged bool) error {
-	if RequireRole(ctx, "admin") == nil {
-		return nil
-	}
-	if err := s.RequirePerm(ctx, ctRBACPathFor(rec.Project, name), "ct.exec", "operator"); err == nil {
+	if s.callerMayRoot(ctx, *rec) {
 		return nil
 	}
 	what := "legacy-confined"
@@ -349,10 +373,10 @@ func (s *Server) mayChangePrivilegedImage(ctx context.Context, name string, rec 
 		fmt.Sprintf("project=%s %s image %q -> %q", rec.Project, what, rec.Image, d.Image), "denied")
 	return status.Errorf(codes.PermissionDenied,
 		"container %q is %s, and this deploy changes its image from %q to %q, which would run as root on the host; "+
-			"that needs the Admin role or ct.exec on it (root inside it already). The member was left as it is: "+
-			"deploy it with its current image, ask an Admin to deploy this change, or move it over first with "+
-			"lv ct convert --unprivileged --confinement default %s",
-		name, what, rec.Image, d.Image, name)
+			"that needs the Admin role or the ContainerRoot role on it (lv role grant ContainerRoot <principal> --path %s). "+
+			"The member was left as it is: deploy it with its current image, ask an Admin to deploy this change, "+
+			"or move it over first with lv ct convert --unprivileged --confinement default %s",
+		name, what, rec.Image, d.Image, ctRBACPathFor(rec.Project, name), name)
 }
 
 // noteKeptMemberSecurity records, as an audit event and a WARN, that a
@@ -383,6 +407,12 @@ type recreateDecision struct {
 	project           string
 	keep, note        bool
 	template          string
+	// pinned: the create must copy generation pinGen of the item under
+	// template (recreatePinnedImage); bound: it is built from the copy its
+	// fetch takes before the delete, whatever generation that is.
+	pinned bool
+	pinGen string
+	bound  bool
 }
 
 // recreateDecisionKey carries one recreate's decision from its judgment to
@@ -408,6 +438,9 @@ func recreateTemplateGranted(ctx context.Context, template string) bool {
 func (dec *recreateDecision) apply(ctx context.Context, d *compose.VMDef, req *pb.CreateContainerRequest) (context.Context, bool) {
 	if dec.template != "" {
 		ctx = context.WithValue(ctx, recreateTemplateKey{}, dec.template)
+	}
+	if dec.pinned || dec.bound {
+		ctx = withRecreatePin(ctx, req.Template, dec.pinGen, !dec.pinned)
 	}
 	if !dec.keep {
 		// Bound to this create, for its member's host when that is

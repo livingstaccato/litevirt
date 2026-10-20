@@ -141,7 +141,8 @@ func TestFleet_MigrateVMAway_TheNextCreateIsNotChargedForIt(t *testing.T) {
 			return err
 		}
 		dst.Virt.SetState(name, libvirtfake.StateRunning)
-		return src.Virt.UndefineDomain(name, false)
+		src.Virt.VanishDomain(name)
+		return nil
 	}
 	if err := migrateAt(t, c, src, "big", dst.Name); err != nil {
 		t.Fatalf("migrate big away: %v", err)

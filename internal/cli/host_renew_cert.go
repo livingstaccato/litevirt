@@ -299,7 +299,7 @@ func renewHostCert(ctx context.Context, c pb.LiteVirtClient, r remotePKI, probe 
 		fmt.Printf("  NOTE: the replaced key was served from %s, outside %s; it is no longer used —\n", outsideKey, remotePKIDir)
 		fmt.Println("  remove it once nothing else needs it (the renewal cannot know)")
 	}
-	removeCAMachineCopy(pkiDir, hostName, prev)
+	cleanupErr := removeCAMachineCopy(pkiDir, hostName, prev)
 	if _, ok, err := r.ReadFile(filepath.Join(remotePKIDir, pki.AuditSigningCertName)); err == nil && !ok {
 		// Without a dedicated audit pair the daemon signs audit rows with the
 		// host key it loaded at boot — the REPLACED one — until it restarts,
@@ -329,11 +329,11 @@ func renewHostCert(ctx context.Context, c pb.LiteVirtClient, r remotePKI, probe 
 		fmt.Printf("  the previous certificate %s was NOT revoked (--keep-old); it stays CA-valid until %s.\n",
 			prevSerial, prev.NotAfter.UTC().Format("2006-01-02"))
 		fmt.Printf("  Revoke it with `lv host revoke-cert %s --serial %s`\n", hostName, prevSerial)
-		return nil
+		return cleanupErr
 	case opts.RevokeOld:
-		return revokeAndPublishSerial(ctx, c, hostName, prevSerial)
+		return errors.Join(revokeAndPublishSerial(ctx, c, hostName, prevSerial), cleanupErr)
 	}
-	return revokeReplaced(ctx, c, hostName, prevSerial)
+	return errors.Join(revokeReplaced(ctx, c, hostName, prevSerial), cleanupErr)
 }
 
 // revokeReplaced hands the cluster a CRL revoking serial and lets it decide:
@@ -409,35 +409,60 @@ func rotateAuditKeyHint(hostName, sshTarget string) string {
 // when it matches the replaced certificate; the certificate goes with it,
 // never alone, and only when it IS the replaced certificate — so no half pair
 // is left behind for a later `lv host add` or a human to trip on.
-func removeCAMachineCopy(pkiDir, hostName string, prev *x509.Certificate) {
-	removeCAMachineCopyAt(filepath.Join(pkiDir, hostName+".key"), filepath.Join(pkiDir, hostName+".crt"), prev)
-	if dir := keptHostDir(pkiDir, hostName); dir != "" {
-		removeCAMachineCopyAt(filepath.Join(dir, "host.key"), filepath.Join(dir, "host.crt"), prev)
+//
+// It refuses, and returns why, when a copy's path is not this host's to
+// remove: a name that leaves the directory (checked before either place is
+// looked at), or a path that is one of the directory's own files (a host an
+// older build admitted as "ca"), in either place. Both places are tried; the
+// first refusal is returned. The renewal itself is complete either way.
+func removeCAMachineCopy(pkiDir, hostName string, prev *x509.Certificate) error {
+	if err := pki.ValidateHostPathName(hostName); err != nil {
+		fmt.Printf("  NOTE: this machine's copy of %s's replaced pair was not looked for: %v\n", hostName, err)
+		return fmt.Errorf("the renewal is complete, but this machine's copy of the replaced pair was not removed: %w", err)
 	}
+	first := removeCAMachineCopyAt(pkiDir, hostName, filepath.Join(pkiDir, hostName+".key"), filepath.Join(pkiDir, hostName+".crt"), prev)
+	if dir := keptHostDir(pkiDir, hostName); dir != "" {
+		if err := removeCAMachineCopyAt(pkiDir, hostName, filepath.Join(dir, "host.key"), filepath.Join(dir, "host.crt"), prev); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }
 
-func removeCAMachineCopyAt(keyPath, crtPath string, prev *x509.Certificate) {
+// removeCAMachineCopyAt is removeCAMachineCopy for one place: keyPath and
+// crtPath, under pkiDir.
+func removeCAMachineCopyAt(pkiDir, hostName, keyPath, crtPath string, prev *x509.Certificate) error {
 	b, err := os.ReadFile(keyPath)
 	if err != nil {
-		return
+		return nil
 	}
 	if _, err := tls.X509KeyPair(pemOfCert(prev), b); err != nil {
-		return // not the replaced key; leave it
+		return nil // not the replaced key; leave it
+	}
+	// The replaced key under one of the directory's own names: an older lv
+	// minted the host's pair over it. Left, and said.
+	for _, p := range []string{keyPath, crtPath} {
+		if fixed, ok := pki.OperatorPKIFileIn(pkiDir, p); ok {
+			fmt.Printf("  NOTE: left %s: it holds %s's replaced pair, but it is this directory's %s\n", p, hostName, fixed)
+			return fmt.Errorf("the renewal is complete, but %s was left: it holds %s's replaced pair under "+
+				"this directory's own %s, overwritten by an older release; restore %s from a backup", p, hostName, fixed, fixed)
+		}
 	}
 	if err := os.Remove(keyPath); err != nil {
 		fmt.Printf("  NOTE: could not remove this machine's copy of the replaced key %s: %v\n", keyPath, err)
-		return
+		return nil
 	}
 	fmt.Printf("  removed this machine's copy of the replaced key (%s)\n", keyPath)
 	if cb, err := os.ReadFile(crtPath); err == nil {
 		if c, err := pki.ParseCertPEM(cb); err == nil && c.Equal(prev) {
 			if err := os.Remove(crtPath); err != nil {
 				fmt.Printf("  NOTE: could not remove this machine's copy of the replaced certificate %s: %v\n", crtPath, err)
-				return
+				return nil
 			}
 			fmt.Printf("  removed this machine's copy of the replaced certificate (%s)\n", crtPath)
 		}
 	}
+	return nil
 }
 
 func pemOfCert(c *x509.Certificate) []byte {

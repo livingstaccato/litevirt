@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/lxc"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // CTFake is an in-process container runtime for the fleet harness — the
@@ -33,6 +35,10 @@ import (
 type CTFake struct {
 	mu   sync.Mutex
 	root string
+
+	// pinnedCopies is what a pinned fetch copied aside, by name: its
+	// template, generation and rootfs/etc/image.
+	pinnedCopies map[string][4]string
 
 	// state tracks the runtime state of each existing container
 	// ("running"/"stopped"). Absence means the container does not exist,
@@ -87,6 +93,15 @@ type CTFake struct {
 
 	ensureIDRangeErr error
 	ensuredRanges    []int64
+
+	// unfetchable is the images this host cannot fetch (Unfetchable): a
+	// create from one fails, as a real lxc-create whose download fails does,
+	// and so does a fetch of one.
+	unfetchable map[string]error
+	fetchCalls  []grpcapi.CreateContainerOpts
+	// onFetch runs inside FetchContainerImage, outside the lock, with the
+	// call's context; what it returns fails the fetch.
+	onFetch func(ctx context.Context) error
 
 	// access is the host-access policy the real lxc renderer judges mounts
 	// and devices against (SetHostAccessPolicy).
@@ -258,6 +273,99 @@ func (f *CTFake) FailDelete(err error) {
 	f.deleteErr = err
 }
 
+// Unfetchable makes image (a download "distro:release", or a rootfs path
+// template) one this host cannot fetch: a create from it fails, as a real
+// lxc-create whose download fails, and so does a fetch of it.
+func (f *CTFake) Unfetchable(image string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.unfetchable == nil {
+		f.unfetchable = map[string]error{}
+	}
+	f.unfetchable[image] = err
+}
+
+// FetchCalls is every FetchContainerImage call, in order.
+func (f *CTFake) FetchCalls() []grpcapi.CreateContainerOpts {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]grpcapi.CreateContainerOpts(nil), f.fetchCalls...)
+}
+
+// fetchErrLocked is what fetching the image opts names fails with here: an
+// Unfetchable image, or a rootfs path template that is not a directory on
+// this node's disk. The caller holds mu.
+func (f *CTFake) fetchErrLocked(opts grpcapi.CreateContainerOpts) error {
+	key := opts.Template
+	if opts.Template == "download" {
+		key = opts.Distro + ":" + opts.Release
+	}
+	if err := f.unfetchable[key]; err != nil {
+		return err
+	}
+	if p, isPath, err := lxc.TemplatePath(opts.Template); err != nil {
+		return err
+	} else if isPath {
+		if st, serr := os.Stat(p); serr != nil || !st.IsDir() {
+			return fmt.Errorf("rootfs template %q is not an existing directory", opts.Template)
+		}
+	}
+	return nil
+}
+
+// FetchContainerImage fetches the image a create with opts is built from,
+// creating nothing: it fails as the create would.
+func (f *CTFake) FetchContainerImage(ctx context.Context, opts grpcapi.CreateContainerOpts) error {
+	f.mu.Lock()
+	f.fetchCalls = append(f.fetchCalls, opts)
+	hook := f.onFetch
+	f.mu.Unlock()
+	if hook != nil {
+		if err := hook(ctx); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	err := f.fetchErrLocked(opts)
+	f.mu.Unlock()
+	if err != nil || !opts.Pinned {
+		return err
+	}
+	// A pinned fetch copies the judged generation aside, under the item's
+	// lock, as lxc.LxcRunner.FetchImage does.
+	p, isPath, _ := lxc.TemplatePath(opts.Template)
+	if !isPath {
+		return nil
+	}
+	unlock := lxc.LockOCIItem(lxc.BundleDir(p))
+	defer unlock()
+	gen := lxc.ReadImageGen(lxc.BundleDir(p))
+	if !opts.PinAnyGen && gen != opts.PinnedGen {
+		return fmt.Errorf("ctfake: fetch %s: %w", opts.Template, lxc.ErrImageReplaced)
+	}
+	if opts.CheckItem != nil {
+		if err := opts.CheckItem(gen); err != nil {
+			return err
+		}
+	}
+	b, _ := os.ReadFile(filepath.Join(lxc.BundleDir(p), "rootfs", "etc", "image"))
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.pinnedCopies == nil {
+		f.pinnedCopies = map[string][4]string{}
+	}
+	f.pinnedCopies[opts.Name] = [4]string{opts.Template, pinWant(opts), string(b), gen}
+	return nil
+}
+
+// OnFetch registers fn to run inside every FetchContainerImage call: a slow
+// download, during which a scenario can cancel the caller.
+func (f *CTFake) OnFetch(fn func(ctx context.Context) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onFetch = fn
+}
+
 // OnExport registers fn to run inside the next ExportContainer call. See the
 // onExport field: this is the mid-migrate window.
 func (f *CTFake) OnExport(fn func()) {
@@ -308,10 +416,47 @@ func (f *CTFake) snapshot(get func() []string) []string {
 // ── grpcapi.ContainerRuntime ────────────────────────────────────────────
 
 func (f *CTFake) CreateContainer(_ context.Context, opts grpcapi.CreateContainerOpts) (*grpcapi.ContainerInfo, error) {
+	// A rootfs path is judged and copied under its item's lock, as the
+	// real create does: a pinned create from its copy, or from the item
+	// while it is still the pinned generation.
+	var fromCopy *[4]string
+	if p, isPath, _ := lxc.TemplatePath(opts.Template); isPath {
+		unlock := lxc.LockOCIItem(lxc.BundleDir(p))
+		defer unlock()
+		f.mu.Lock()
+		c, ok := f.pinnedCopies[opts.Name]
+		delete(f.pinnedCopies, opts.Name)
+		f.mu.Unlock()
+		if opts.Pinned && ok && c[0] == opts.Template && (c[1] == pinWant(opts) || opts.PinAnyGen) {
+			fromCopy = &c
+		} else if opts.Pinned && !opts.PinAnyGen && lxc.ReadImageGen(lxc.BundleDir(p)) != opts.PinnedGen {
+			return nil, fmt.Errorf("ctfake: create %s: %w", opts.Name, lxc.ErrImageReplaced)
+		}
+		if fromCopy == nil && opts.CheckItem != nil {
+			if err := opts.CheckItem(lxc.ReadImageGen(lxc.BundleDir(p))); err != nil {
+				return nil, err
+			}
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.createCalls = append(f.createCalls, opts)
+	if err := f.fetchErrLocked(opts); err != nil {
+		return nil, fmt.Errorf("ctfake: create %s: %w", opts.Name, err)
+	}
 	f.seedLocked(opts.Name, "created-by-"+opts.Name)
+	// A rootfs path's image is copied, as the real create copies it, so a
+	// later replace of the item does not reach this container.
+	var gen string
+	if fromCopy != nil {
+		_ = os.WriteFile(filepath.Join(f.dir(opts.Name), "rootfs", "payload"), []byte("image "+fromCopy[2]), 0o644)
+		gen = fromCopy[3]
+	} else if p, isPath, _ := lxc.TemplatePath(opts.Template); isPath {
+		if b, err := os.ReadFile(filepath.Join(lxc.BundleDir(p), "rootfs", "etc", "image")); err == nil {
+			_ = os.WriteFile(filepath.Join(f.dir(opts.Name), "rootfs", "payload"), append([]byte("image "), b...), 0o644)
+		}
+		gen = lxc.ReadImageGen(lxc.BundleDir(p))
+	}
 	// The security block a real create writes, in the config that travels
 	// with the container through export and import.
 	var idmap *lxc.IDMap
@@ -335,7 +480,7 @@ func (f *CTFake) CreateContainer(_ context.Context, opts grpcapi.CreateContainer
 	for i, n := range opts.Networks {
 		f.links[opts.Name][i] = n.Bridge
 	}
-	return &grpcapi.ContainerInfo{Name: opts.Name, State: "stopped"}, nil
+	return &grpcapi.ContainerInfo{Name: opts.Name, State: "stopped", ImageGen: gen}, nil
 }
 
 // ContainerNICLinks reports the bridge each NIC of name links to.
@@ -457,6 +602,14 @@ func (f *CTFake) DeleteContainer(_ context.Context, name string) error {
 		hook(name)
 	}
 	return err
+}
+
+// ExecContainerStarted is ExecContainer, reporting the attach first.
+func (f *CTFake) ExecContainerStarted(ctx context.Context, name string, argv []string, started func()) (grpcapi.ContainerExecResult, error) {
+	if started != nil {
+		started()
+	}
+	return f.ExecContainer(ctx, name, argv)
 }
 
 func (f *CTFake) ExecContainer(_ context.Context, name string, argv []string) (grpcapi.ContainerExecResult, error) {
@@ -647,11 +800,92 @@ func (f *CTFake) CloneContainer(_ context.Context, src, dst string) error {
 	return nil
 }
 
-func (f *CTFake) PullOCIImage(_ context.Context, _, dest, _, _, _ string) error {
+// PullOCIImage unpacks a bundle at dest as umoci does — config.json, a
+// rootfs whose etc/image names image, and a fresh generation — refusing a
+// dest that already holds one unless replace, as lxc.PullOCI does.
+func (f *CTFake) PullOCIImage(_ context.Context, image, dest, _, _, _ string, replace bool, _ func(transport, path string) error, owner string, publish func() error) error {
 	if dest == "" {
 		return fmt.Errorf("ctfake: empty OCI destination")
 	}
-	return os.MkdirAll(dest, 0o755)
+	unlock := lxc.LockOCIItem(dest)
+	defer unlock()
+	exists, err := lxc.IsBundle(dest)
+	if err != nil {
+		return err
+	}
+	if exists && !replace {
+		return fmt.Errorf("%w: %s", lxc.ErrOCIItemExists, dest)
+	}
+	stage := dest + ".ctfake-unpack"
+	_ = os.RemoveAll(stage)
+	if err := os.MkdirAll(filepath.Join(stage, "rootfs", "etc"), 0o755); err != nil {
+		return err
+	}
+	for p, b := range map[string]string{
+		filepath.Join(stage, "rootfs", "etc", "image"): image,
+		filepath.Join(stage, "config.json"):            "{}",
+		filepath.Join(stage, lxc.ImageGenFile):         randid.New(),
+		filepath.Join(stage, lxc.OwnerFile):            owner,
+	} {
+		if b == "" && filepath.Base(p) == lxc.OwnerFile {
+			continue
+		}
+		if err := os.WriteFile(p, []byte(b), 0o644); err != nil {
+			return err
+		}
+	}
+	if err := os.RemoveAll(dest); err != nil {
+		return err
+	}
+	if err := os.Rename(stage, dest); err != nil {
+		return err
+	}
+	if publish != nil {
+		return publish()
+	}
+	return nil
+}
+
+// RootfsReferences names the containers whose config's lxc.rootfs.path is
+// dir or under it, as the real runtime reads them.
+func (f *CTFake) RootfsReferences(_ context.Context, dir string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	dir = filepath.Clean(dir)
+	var out []string
+	for name := range f.state {
+		b, err := os.ReadFile(filepath.Join(f.dir(name), "config"))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			out = append(out, name) // unreadable: cannot be shown not to use it
+			continue
+		}
+		for _, l := range strings.Split(string(b), "\n") {
+			k, v, ok := strings.Cut(l, "=")
+			if !ok || strings.TrimSpace(k) != "lxc.rootfs.path" {
+				continue
+			}
+			v = filepath.Clean(strings.TrimPrefix(strings.TrimSpace(v), "dir:"))
+			if v == dir || strings.HasPrefix(v, dir+"/") {
+				out = append(out, name)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// SeedByReference materialises a container whose config uses rootfs in
+// place, as one created from a library item by v1.0.5 to v1.1.0 does.
+func (f *CTFake) SeedByReference(name, rootfs string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	d := f.dir(name)
+	_ = os.MkdirAll(d, 0o755)
+	_ = os.WriteFile(filepath.Join(d, "config"), []byte("lxc.rootfs.path = dir:"+rootfs+"\n"), 0o644)
+	f.state[name] = "running"
 }
 
 // ── tar/dir helpers ─────────────────────────────────────────────────────
@@ -829,4 +1063,12 @@ func (f *CTFake) CreateCalls() []grpcapi.CreateContainerOpts {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]grpcapi.CreateContainerOpts(nil), f.createCalls...)
+}
+
+// pinWant is what a pinned copy is bound to: its generation, or any.
+func pinWant(opts grpcapi.CreateContainerOpts) string {
+	if opts.PinAnyGen {
+		return "*"
+	}
+	return "=" + opts.PinnedGen
 }

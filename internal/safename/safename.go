@@ -102,6 +102,36 @@ func CanonicalProjectName(in string) (string, error) {
 	return "/" + strings.Join(segs, "/"), nil
 }
 
+// reservedProjectSegments are the resource namespaces under a project's RBAC
+// root (/projects/<p>/vms/<name>, ...). A child project named like one would
+// have a root that is the prefix of its parent's resource paths.
+var reservedProjectSegments = map[string]bool{
+	"vms": true, "containers": true, "networks": true,
+	"storage_pools": true, "security_groups": true, "stacks": true,
+}
+
+// ValidateNewProjectName refuses a project whose path has a non-leading segment
+// named like a resource namespace of its parent (see reservedProjectSegments).
+func ValidateNewProjectName(in string) error {
+	canon, err := CanonicalProjectName(in)
+	if err != nil {
+		return err
+	}
+	// "/" is the whole project namespace (every spelling of it: "//" too) and
+	// "/_default" the implicit default project: neither is a tenant a caller may
+	// create, and a prefix derived from either would reach grants that are not its.
+	if canon == "/" || canon == "/_default" {
+		return fmt.Errorf("project %q names the project root or the default project; choose another name", in)
+	}
+	segs := strings.Split(strings.Trim(canon, "/"), "/")
+	for i, seg := range segs {
+		if i > 0 && reservedProjectSegments[seg] {
+			return fmt.Errorf("project %q: segment %q is reserved for a project's own %s", in, seg, seg)
+		}
+	}
+	return nil
+}
+
 // ProjectRBACPath maps a canonical project name (from CanonicalProjectName) to
 // its RBAC path root: "/acme/team" -> "/projects/acme/team", "/" -> "/projects".
 // Building RBAC paths only through this avoids the "acme" vs "/acme" mismatch

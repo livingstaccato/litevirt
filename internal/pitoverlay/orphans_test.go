@@ -1,0 +1,162 @@
+package pitoverlay
+
+import (
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+)
+
+// OrphanPath takes only a name SetAside makes for the disk: never a path,
+// another disk's orphan, the live overlay, or a binding.
+//
+// Mutation "no prefix check" (OrphanPath joins any name without a slash):
+// the live overlay and another disk's orphan are taken; red.
+func TestOrphanPath_TakesOnlyThisDisksSetAsideNames(t *testing.T) {
+	disk := filepath.Join("/srv/pool", "web-root.qcow2")
+	good := ".web-root.qcow2.lv-pit.orphan-20261018-120000"
+	if p, err := OrphanPath(disk, good); err != nil || p != filepath.Join("/srv/pool", good) {
+		t.Fatalf("OrphanPath(%q) = %q, %v", good, p, err)
+	}
+	for _, bad := range []string{
+		"../x", "/etc/passwd", ".web-root.qcow2.lv-pit", ".web-root.qcow2.lv-pit.orphan-",
+		good + ".id", ".db-root.qcow2.lv-pit.orphan-20261018-120000",
+		".web-root.qcow2.lv-pit.orphan-x/../../y",
+	} {
+		if p, err := OrphanPath(disk, bad); err == nil {
+			t.Errorf("OrphanPath(%q) = %q, want refused", bad, p)
+		}
+	}
+}
+
+// R2 I-1. Only SetAside's exact shape is an orphan: ".<disk>.lv-pit.orphan-"
+// and a stamp YYYYMMDD-HHMMSS (optionally -N) at the very end. A dotted VM or
+// disk name that merely contains ".lv-pit.orphan-" names a LIVE overlay
+// (ending ".lv-pit"), a binding, or a disk, never an orphan.
+//
+// Mutation "prefix-only shape" (IsOrphanName accepts any name containing
+// the marker): the live overlay of VM w.lv-pit.orphan-1 is an orphan; red.
+func TestIsOrphanName_OnlySetAsidesExactShape(t *testing.T) {
+	for name, want := range map[string]string{
+		".web-root.qcow2.lv-pit.orphan-20261018-120000":               "web-root.qcow2",
+		".web-root.qcow2.lv-pit.orphan-20261018-120000-3":             "web-root.qcow2",
+		".w.lv-pit.orphan-1-root.qcow2.lv-pit.orphan-20261018-120000": "w.lv-pit.orphan-1-root.qcow2",
+	} {
+		if base, ok := IsOrphanName(name); !ok || base != want {
+			t.Errorf("IsOrphanName(%q) = %q, %v; want %q", name, base, ok, want)
+		}
+	}
+	for _, name := range []string{
+		".w.lv-pit.orphan-1-root.qcow2.lv-pit",    // VM w.lv-pit.orphan-1's live overlay
+		".w.lv-pit.orphan-1-root.qcow2.lv-pit.id", // its binding
+		".web-root.qcow2.lv-pit.orphan-20261018-120000.id",
+		".web-root.qcow2.lv-pit.orphan-2026",
+		".web-root.qcow2.lv-pit.orphan-20261018-120000x",
+		".web-root.qcow2.lv-pit.orphan-20261018-120000-",
+		"web-root.qcow2.lv-pit.orphan-20261018-120000",
+	} {
+		if base, ok := IsOrphanName(name); ok {
+			t.Errorf("IsOrphanName(%q) = %q, true; want refused", name, base)
+		}
+	}
+}
+
+// R2 I-1, the VM-scoped side: beside a disk "w", a sibling disk named
+// "w.lv-pit.orphan-1-root.qcow2" has a live overlay ".w.lv-pit.orphan-1-
+// root.qcow2.lv-pit". It is neither listed as w's orphan nor accepted as one.
+//
+// Mutation "glob unfiltered" (orphansWith keeps every glob match): it is
+// listed; red.
+func TestOrphans_ASiblingsLiveOverlayIsNotAnOrphan(t *testing.T) {
+	dir := t.TempDir()
+	disk := filepath.Join(dir, "w")
+	sibling := filepath.Join(dir, "w.lv-pit.orphan-1-root.qcow2")
+	real := Path(disk) + ".orphan-20261018-120000"
+	for _, p := range []string{Path(sibling), real} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := Orphans(disk)
+	if err != nil || len(got) != 1 || got[0] != real {
+		t.Fatalf("Orphans(w) = %v, %v; want only %s", got, err, real)
+	}
+	if _, err := OrphanPath(disk, filepath.Base(Path(sibling))); err == nil {
+		t.Fatal("OrphanPath took the sibling's live overlay as w's orphan")
+	}
+}
+
+// R4 I-1 audit. Two evidence questions about one disk for two VMs (uuid) at
+// the same time are not merged by the bound: the second runs its own look
+// rather than waiting for, and reading, the first one's answer.
+//
+// Mutation "uuid not in the op": the second joins the first and waits; red.
+func TestSetAsideEvidenceBoundedFor_DifferentVMsAreNotMerged(t *testing.T) {
+	disk := filepath.Join(t.TempDir(), "d")
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	var calls int32
+	var mu sync.Mutex
+	defer SetGlobForTest(func(string) ([]string, error) {
+		mu.Lock()
+		calls++
+		first := calls == 1
+		mu.Unlock()
+		if first {
+			entered <- struct{}{}
+			<-release
+		}
+		return nil, nil
+	})()
+	go func() { _, _ = SetAsideEvidenceBoundedFor(disk, "u-a") }()
+	<-entered
+	done := make(chan struct{})
+	go func() { _, _ = SetAsideEvidenceBoundedFor(disk, "u-b"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Error("the question for u-b waited on the one for u-a: it joined its call")
+	}
+	close(release)
+	<-done
+}
+
+// R5 nit. Two assessments of one disk at the same time with different
+// "running on the disk" flags each get their own verdict: the bound that
+// merges concurrent calls is keyed by the owner and the flag too, so a merged
+// call never turns one caller's "pivoted" into the other's "unknown".
+//
+// Mutation "owner and flag not in the op": the second joins the first and
+// reads its verdict; red.
+func TestAssessBounded_DifferentRunningFlagsAreNotMerged(t *testing.T) {
+	disk := filepath.Join(t.TempDir(), "d")
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	defer SetAssessForTest(func(_ string, _ Owner, live bool) Assessment {
+		if !live {
+			entered <- struct{}{}
+			<-release
+			return Assessment{Verdict: Unknown}
+		}
+		return Assessment{Verdict: Pivoted}
+	})()
+	owner := Owner{VM: "web", Disk: "root"}
+	firstDone := make(chan Assessment, 1)
+	go func() { a, _ := AssessBounded(disk, owner, false); firstDone <- a }()
+	<-entered
+	second := make(chan Assessment, 1)
+	go func() { a, _ := AssessBounded(disk, owner, true); second <- a }()
+	select {
+	case a := <-second:
+		if a.Verdict != Pivoted {
+			t.Errorf("the running-on-disk assessment = %s, want %s", a.Verdict, Pivoted)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("the running-on-disk assessment waited on the other: it joined its call")
+	}
+	close(release)
+	if a := <-firstDone; a.Verdict != Unknown {
+		t.Errorf("the first assessment = %s, want %s", a.Verdict, Unknown)
+	}
+}

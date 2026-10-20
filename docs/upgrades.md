@@ -426,6 +426,32 @@ A host rolled back below the release that added `lv lb create --snat` SNATs
 every load balancer made with `lv lb create` that it serves, including one set
 to `--snat=false` ([compose.md](compose.md#snat-via-vip)).
 
+### Rolling back a host in a live firmware move
+
+Do not roll back the litevirt binary on a host whose
+`<data_dir>/fwmig-inflight/` holds a file. Each file is the source's record of
+a live move of a Secure Boot / vTPM VM
+([migration](migration-failover.md#secure-boot--vtpm-vms)), and a build
+without live firmware migration ignores it: the record stops refusing a start
+of the VM's source copy. Check first:
+
+```bash
+ls <data_dir>/fwmig-inflight/
+```
+
+Let the move finish, or wait until its `firmware_migration_*` condition is
+resolved, before rolling back. If a host was rolled back (by hand or by the
+auto-rollback) with a file there, upgrade it again before doing anything else
+with that VM.
+
+A target rolled back mid-move answers the source's calls as unknown; the
+source parks the move `target_unreachable` and keeps both copies.
+
+A target rolled back below the leftover record ignores
+`<data_dir>/fwmig-leftover/`; its reconciler may then wipe the NVRAM and TPM
+state of a leftover an owed DISCARD names. Check `ls <data_dir>/fwmig-leftover/`
+first, and resolve each file with `lv doctor firmware-move <vm> --discard-target`.
+
 ### Rolling back after a release token latched
 
 A rolled-back binary that finds a durable activation marker for a capability
@@ -713,6 +739,17 @@ A security update is one offered from a security suite (`*-security` on
 apt) or listed by `dnf updateinfo --security`. Patch the host with its own
 package manager; drain it first (`lv host drain`) when the update needs a
 reboot. A release check for litevirt itself is not part of this.
+
+A live move of a Secure Boot / vTPM VM needs the same libvirt, QEMU, swtpm,
+libtpms and OVMF on both hosts, and on the source it compares the versions
+the guest's processes were started from. While those packages are updated
+host by host, such a VM does not move live between an updated and a
+not-updated host. Nor does it move off a host whose packages were updated
+after the guest started, until it is restarted (`lv stop <vm>`,
+`lv start <vm>`). A target running a litevirt build without live firmware
+migration refuses the move too. The refusal names
+the first difference and gives the cold move (`lv stop <vm>`, then
+`lv migrate <vm> <host> --cold`).
 
 ---
 
@@ -2160,3 +2197,47 @@ this release. Two effects while the fleet is mixed:
   email target without a password is allowed at any time. The first such create
   after the latch marks the feature used, after which a rollback below this
   release quarantines the host.
+
+### Container exec, recreate and OCI pulls during the roll
+
+Until every host runs this release:
+
+- `lv ct exec` entered on a host still on the previous release reaches a
+  privileged or legacy-confined container with Operator rights, as before.
+  Run exec through an upgraded host.
+- A compose recreate entered on a previous-release host deletes a container
+  member before its new image is fetched, and does not hold a privileged
+  member to the image it was built from. Run `lv compose up` through an
+  upgraded host, and only once the member's own host is upgraded.
+- An `lv ct pull` entered on a previous-release host may still let an
+  Operator pull from a local source (`dir:`, `oci-archive:`,
+  `docker-archive:`). Do not rely on local sources being the Admin's until
+  every host is upgraded.
+- An `lv ct pull --local` of the previous release that is still running does
+  not re-check its item's lock file, which this release removes once the item
+  is gone. Let such pulls finish before upgrading the host.
+- A pull over an existing OCI library item is refused on a previous-release
+  host. An Admin's claim (`lv ct pull --project`) replaces an item only on an
+  upgraded host, entered through an upgraded host.
+- A delegated `PermissionAdmin` on a previous-release host may grant the
+  `ContainerRoot` role through a custom `*.exec` role.
+- A container whose name is not valid today (anything but letters, digits,
+  `_`, `.` and `-`, or exactly `.` or `..`) cannot be started, stopped,
+  deleted, cloned or recreated by this release. Before the roll, on the
+  previous release, clone it under a valid name (`lv ct clone <source>
+  <new-name>`) and remove the original.
+
+Once every host is upgraded, review the `ContainerRoot` bindings and revoke
+any that were not intended:
+
+```bash
+lv role ls --role ContainerRoot
+lv role revoke <binding-id>
+```
+
+### Re-created project names during the roll
+
+During the roll, a host on the previous build can still retire a re-created
+project's admission authority, and anti-entropy spreads that to upgraded hosts.
+It recovers when the next admission claims a fresh authority epoch, and it
+heals once every host runs this release.

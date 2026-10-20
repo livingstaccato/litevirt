@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -580,6 +581,19 @@ type Server struct {
 	// label was derived from.
 	firmware lv.FirmwarePaths
 
+	// fwStore is this host's firmware state (NVRAM and swtpm trees). The
+	// daemon injects the one it shares with the reconciler; NewServer and
+	// NewServerForTests start from the production layout under dataDir, and a
+	// struct-literal Server gets that layout through fw(). Read it through
+	// fw().
+	fwStore *lv.FirmwareStore
+	// fwWipesRefused are the firmware state wipes an unreadable firmware move
+	// record refused, named by firmware_migration_record_unreadable until it
+	// resolves (firmware_records_health.go). Guarded by fwRecordsMu.
+	fwRecordsMu         sync.Mutex
+	fwWipesRefused      []lv.RefusedWipe
+	fwWipesRefusedTotal int
+
 	// lbApplyOverride is a test seam for LB provisioning: when non-nil it
 	// replaces the real haproxy/keepalived Apply (unit tests have no root / no
 	// haproxy). Production leaves it nil so apply failures surface + roll back.
@@ -964,6 +978,12 @@ type Server struct {
 	// RollbackFirmwareState removes (migrate_firmware_rollback.go). Zero value
 	// ready.
 	firmwareTargets firmwareTargetLedger
+	// fwTarget is this host's side of a live firmware move, as its source
+	// (stage A) and as its target (Prepare): the one host check both read
+	// (SetLiveFirmwareHost).
+	fwTarget fwTargetState
+	// fwLive is the source half's test seams (migrate_firmware_live.go).
+	fwLive fwLiveSourceState
 
 	// vmLocks provides per-VM mutual exclusion for operations that must not
 	// run concurrently (e.g. snapshot + migration, backup + delete).
@@ -2004,6 +2024,12 @@ func (s *Server) SetCreateReturnedHook(h func(name string, err error)) { s.creat
 // that proof can land in. Production never calls this.
 func (s *Server) SetRestoreClaimedHook(h func(name string)) { s.restoreClaimedHook = h }
 
+// SetRemoveHostBetweenReadsHook is a test-only seam: removeHostRefusal calls
+// h with the host's name between its read of the host's row and its read of
+// the row's admission key, in RemoveHost and PreflightRemoveHost alike.
+// Production never calls this.
+func (s *Server) SetRemoveHostBetweenReadsHook(h func(name string)) { s.removeHostBetweenReadsHook = h }
+
 // fireCommitFenceHook runs the test hook, if any, naming the operation about to
 // evaluate its commit fence.
 func (s *Server) fireCommitFenceHook(op string) {
@@ -2532,7 +2558,23 @@ type ContainerRuntime interface {
 	// CloneContainer full-copies src's on-disk dir as dst with a fresh identity
 	// (B4 templates/clones).
 	CloneContainer(ctx context.Context, src, dst string) error
-	PullOCIImage(ctx context.Context, image, dest, tag, username, password string) error
+	// PullOCIImage pulls image into dest. With replace it may replace a
+	// bundle already there (lxc.PullOCIOptions.Replace); without, such a pull
+	// fails with lxc.ErrOCIItemExists.
+	// check judges a local source as the object the runtime opened
+	// (lxc.PullOCIOptions.CheckSource). owner, when not "", is recorded in
+	// the bundle with its content (lxc.PullOCIOptions.Owner). publish, when
+	// not nil, runs once the image is in place, under the item's locks
+	// (lxc.PullOCIOptions.Publish).
+	PullOCIImage(ctx context.Context, image, dest, tag, username, password string, replace bool, check func(transport, path string) error, owner string, publish func() error) error
+	// RootfsReferences names the containers on this host whose config uses
+	// dir, or anything under it, as their rootfs in place.
+	RootfsReferences(ctx context.Context, dir string) ([]string, error)
+	// FetchContainerImage fetches and verifies, on this host, the image a
+	// create with opts would be built from (its Template, Distro, Release
+	// and Arch), and creates nothing. A compose recreate runs it on the
+	// member's host before the delete (recreateHostChecks).
+	FetchContainerImage(ctx context.Context, opts CreateContainerOpts) error
 }
 
 // CreateContainerOpts mirrors lxc.CreateOpts at the gRPC boundary so
@@ -2556,6 +2598,15 @@ type CreateContainerOpts struct {
 	// only); the runtime judges them against this host's allowed prefixes.
 	Mounts  []ContainerMountOpt
 	Devices []ContainerDeviceOpt
+	// CheckItem judges a library item's rootfs path as the create copies
+	// it (lxc.CreateOpts.CheckItem).
+	CheckItem func(gen string) error
+	// Pinned, PinnedGen and PinAnyGen bind a rootfs path to one
+	// generation of its library item (lxc.CreateOpts.Pinned): a fetch
+	// copies it aside, a create is built from that copy.
+	Pinned    bool
+	PinnedGen string
+	PinAnyGen bool
 }
 
 // ContainerMountOpt mirrors lxc.Mount; ContainerDeviceOpt mirrors lxc.Device.
@@ -2585,6 +2636,9 @@ type ContainerInfo struct {
 	Name  string
 	State string
 	Image string
+	// ImageGen is the generation of the OCI library item the container was
+	// copied from (lxc.ImageGenFile); "" for any other source.
+	ImageGen string
 }
 
 // ContainerMemoryLimit mirrors lxc.MemoryLimit at the gRPC boundary.
@@ -2620,6 +2674,7 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 		startedAt:      time.Now(),
 		hostName:       hostName,
 		dataDir:        dataDir,
+		fwStore:        lv.NewFirmwareStore(dataDir),
 		pkiDir:         pkiDir,
 		db:             db,
 		virt:           virt,
@@ -2741,6 +2796,34 @@ func (s *Server) reconcileFirewallRequired(ctx context.Context) error {
 // SetFirmwarePaths injects the host's resolved OVMF firmware paths (G1).
 func (s *Server) SetFirmwarePaths(fp lv.FirmwarePaths) { s.firmware = fp }
 
+// SetFirmwareStore injects this host's firmware store, the one the daemon
+// shares with its reconciler (and the fleet harness gives each node). nil is
+// ignored. A store whose DataDir is not the server's panics: the domain XML
+// names the NVRAM under the server's data dir, so the store must be the one
+// that holds it.
+func (s *Server) SetFirmwareStore(fw *lv.FirmwareStore) {
+	if fw == nil {
+		return
+	}
+	if filepath.Clean(fw.DataDir) != filepath.Clean(s.dataDir) {
+		panic(fmt.Sprintf("grpcapi: firmware store data dir %q is not the server's %q", fw.DataDir, s.dataDir))
+	}
+	s.fwStore = fw
+}
+
+// FirmwareStore is this host's firmware store.
+func (s *Server) FirmwareStore() *lv.FirmwareStore { return s.fw() }
+
+// fw is this host's firmware store. A Server built as a struct literal (unit
+// tests) has none and gets the production layout under its dataDir, which is
+// what every such Server used before the store existed.
+func (s *Server) fw() *lv.FirmwareStore {
+	if s.fwStore != nil {
+		return s.fwStore
+	}
+	return lv.NewFirmwareStore(s.dataDir)
+}
+
 // SetTenancyEngine wires the admission + billing engine.
 // nil = unbounded admission, no billing. Daemon constructs the
 // engine with a webhook URL from config.yaml.billing_webhook_url.
@@ -2790,6 +2873,14 @@ func (s *Server) lockVM(vmName string) func() {
 
 // tryLockVM is lockVM without the wait: it returns the unlock function and
 // true when it took the lock, or nil and false when someone else holds it.
+// lockVMOrSkip is lockVM when wait is set, else tryLockVM.
+func (s *Server) lockVMOrSkip(vmName string, wait bool) (func(), bool) {
+	if wait {
+		return s.lockVM(vmName), true
+	}
+	return s.tryLockVM(vmName)
+}
+
 func (s *Server) tryLockVM(vmName string) (func(), bool) {
 	s.vmLocksMu.Lock()
 	if s.vmLocks == nil {

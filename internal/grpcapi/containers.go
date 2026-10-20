@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -164,7 +165,11 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// A library item another project pulled is that project's image, for
 	// every create (a compose recreate's judgment runs this same check before
 	// its delete when the member is on this host).
-	if p, isPath, _ := lxc.TemplatePath(req.Template); isPath {
+	// A recreate built from the copy its member's host took before the
+	// delete was judged where the copy was taken (recreateFetchImage); the
+	// item's owner now is not that copy's, and the runtime judges the item
+	// again (createItemCheck) if it copies the item instead.
+	if p, isPath, _ := lxc.TemplatePath(req.Template); isPath && !recreateBound(ctx, req.Template) {
 		if err := s.refuseForeignOCIItem(ctx, ociLibraryName(p, s.dataDir), req.Project, "be created from"); err != nil {
 			s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
 			return nil, err
@@ -340,6 +345,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	}
 	specMounts, specDevices := hostAccessSpec(req.Mounts, req.Devices)
 	optMounts, optDevices := hostAccessOpts(corrosion.ContainerCreateSpec{Mounts: specMounts, Devices: specDevices})
+	checkItem, pinned, pinnedGen, anyGen := s.createItemCheck(ctx, req)
 	info, err := s.containerRuntime.CreateContainer(ctx, CreateContainerOpts{
 		Name: req.Name, Template: req.Template,
 		Distro: req.Distro, Release: req.Release, Arch: req.Arch,
@@ -347,11 +353,22 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		Networks: plan.lxcNics, Labels: req.Labels,
 		Confinement: confinement, IDMapBase: idmapBase,
 		Mounts: optMounts, Devices: optDevices,
+		CheckItem: checkItem, Pinned: pinned, PinnedGen: pinnedGen, PinAnyGen: anyGen,
 	})
 	if err != nil {
 		_ = s.releaseContainerNICs(ctx, req.Name)
 		s.retireNICGuards(ctx, ctOwner)
 		s.audit(ctx, "ct.create", req.Name, "image="+req.Image, "error")
+		if st, ok := status.FromError(err); ok && st.Code() == codes.PermissionDenied {
+			return nil, st.Err()
+		}
+		if errors.Is(err, lxc.ErrImageReplaced) {
+			return nil, status.Errorf(codes.PermissionDenied,
+				"recreating container %q: it is privileged or legacy-confined, and the image under %q was replaced after the recreate was judged, "+
+					"with no copy of the judged image kept for it, so the create would run another image as root on the host; "+
+					"that needs the Admin role or the ContainerRoot role on it (lv role grant ContainerRoot <principal> --path %s)",
+				req.Name, req.Template, ctRBACPathFor(req.Project, req.Name))
+		}
 		return nil, status.Errorf(codes.Internal, "create: %v", err)
 	}
 
@@ -359,7 +376,8 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// restore can rebuild this container faithfully, not as a bare image recreate.
 	createSpec := corrosion.ContainerCreateSpec{
 		Template: req.Template, Distro: req.Distro, Release: req.Release, Arch: req.Arch,
-		Networks: plan.specNets,
+		TemplateGen: info.ImageGen,
+		Networks:    plan.specNets,
 		// A new lineage: the owner record its files are matched by.
 		OwnerID:     randid.New(),
 		IDMapBase:   idmapBase,
@@ -683,6 +701,14 @@ func (s *Server) deleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")
 	}
+	// A compose recreate's delete forwarded from another entry host: the
+	// create that follows it is judged on this host first, its image
+	// fetched included, so a recreate refused there keeps its member
+	// (recreate_preflight.go). Before the container's lock: a fetch can take
+	// minutes, and judges nothing about the container itself.
+	if err := s.recreateDeleteCheck(ctx, req.Name); err != nil {
+		return nil, err
+	}
 	// Serialize with the other operations on this container and with the
 	// container checker's sweep (LockContainer), so a sweep never reconciles a
 	// container that is half deleted.
@@ -694,12 +720,6 @@ func (s *Server) deleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	// (lab 2 run c2, P-3). Dropping the cache only makes the next admission
 	// read the runtime afresh; it never admits anything unread.
 	defer s.invalidateInventoryCache()
-	// A compose recreate's delete forwarded from another entry host: the
-	// create that follows it is judged on this host's disk first, so a
-	// recreate refused there keeps its member (recreate_preflight.go).
-	if err := s.recreateDeleteCheck(ctx, req.Name); err != nil {
-		return nil, err
-	}
 	// The runtime delete is lxc-destroy -f, which stops a running container
 	// first, so without force a running one is refused. A remote peer's call is
 	// exempt: a current entry node judged it before forwarding, and an older
@@ -818,6 +838,13 @@ func (s *Server) ExecContainer(ctx context.Context, req *pb.ExecContainerRequest
 		s.audit(ctx, "ct.exec", req.Name, "permission denied: "+strings.Join(req.Argv, " "), "denied")
 		return nil, err
 	}
+	// In a privileged or legacy-confined container, exec is a host-level
+	// grant (requireContainerRoot), judged here from the resolved row, and
+	// again on the owner from its own row for a forward (execRootRefused):
+	// an entry whose replica lags may not know the container became one.
+	if err := s.judgeExecMode(ctx, *rec, rootContainerMode(*rec), req.Argv); err != nil {
+		return nil, err
+	}
 	if host != s.hostName {
 		c, conn, err := s.peerClient(ctx, host)
 		if err != nil {
@@ -826,14 +853,42 @@ func (s *Server) ExecContainer(ctx context.Context, req *pb.ExecContainerRequest
 		defer conn.Close()
 		// Pin the resolved host on the forwarded request so the peer does not
 		// re-run the cluster-wide name resolution (same as StartContainer).
-		return c.ExecContainer(ctx, &pb.ExecContainerRequest{
+		return c.ExecContainer(s.execRootOutgoing(ctx, *rec), &pb.ExecContainerRequest{
 			Name: req.Name, HostName: host, Argv: req.Argv,
 		})
 	}
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")
 	}
-	res, err := s.containerRuntime.ExecContainer(ctx, req.Name, req.Argv)
+	execAfterJudge()
+	// Judge again where the exec attaches, from the row read under the
+	// container's lock, which lv ct stop, start and convert hold: the row
+	// judged above may be stale by now.
+	//
+	// The lock is held until the exec is attached, not for the session: a
+	// mode change needs the container stopped (lv ct convert), and the stop
+	// ends what is attached. A runtime that cannot tell when it is attached
+	// keeps the lock for the whole exec.
+	var once sync.Once
+	unlockContainer := s.LockContainer(req.Name)
+	unlock := func() { once.Do(unlockContainer) }
+	defer unlock()
+	cur, err := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "exec: read container: %v", err)
+	}
+	if cur == nil {
+		return nil, status.Errorf(codes.NotFound, "container %q not found on %s", req.Name, s.hostName)
+	}
+	if err := s.judgeExecMode(ctx, *cur, rootContainerMode(*cur), req.Argv); err != nil {
+		return nil, err
+	}
+	var res ContainerExecResult
+	if es, ok := s.containerRuntime.(containerExecStarter); ok {
+		res, err = es.ExecContainerStarted(ctx, req.Name, req.Argv, unlock)
+	} else {
+		res, err = s.containerRuntime.ExecContainer(ctx, req.Name, req.Argv)
+	}
 	if err != nil {
 		s.audit(ctx, "ct.exec", req.Name, strings.Join(req.Argv, " "), "error")
 		return nil, status.Errorf(codes.Internal, "exec: %v", err)
@@ -904,15 +959,22 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 		}
 	}
 	// Dest is where umoci unpacks the (untrusted) image rootfs as root, and a
-	// local oci: source is read as root — both are host-path primitives. A bare
-	// Dest name is contained under the daemon OCI staging dir; an absolute Dest
-	// or a local oci: source requires admin (remote docker:// registry pulls
-	// stay operator). The check binds the real caller on the entry node; a
-	// forwarded peer call runs as admin (daemon mTLS) so it isn't re-denied.
-	if lxc.RegistryHost(req.Image) == "" {
+	// local source (oci:, dir:, oci-archive:, docker-archive:) is read as
+	// root — both are host-path primitives. A bare Dest name is contained
+	// under the daemon OCI staging dir; an absolute Dest or a local source
+	// requires admin (registry pulls stay operator), and any other transport
+	// is refused (lxc.ParseOCISource reads the source as skopeo does). The
+	// check binds the real caller on the entry node; a forwarded peer call
+	// runs as admin (daemon mTLS) so it isn't re-denied, and the host that
+	// reads the source judges its path (checkOCIPullPaths).
+	src, err := lxc.ParseOCISource(req.Image)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if src.Local {
 		if err := RequireRole(ctx, "admin"); err != nil {
-			return nil, status.Error(codes.PermissionDenied,
-				"pulling from a local OCI source path requires the admin role")
+			return nil, status.Errorf(codes.PermissionDenied,
+				"pulling from a local %s: source reads this host as root, which requires the admin role", src.Transport)
 		}
 	}
 	if filepath.IsAbs(req.Dest) {
@@ -947,7 +1009,7 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 	// Forward AFTER resolution so req carries the resolved secret to the host
 	// that actually runs skopeo (it cannot resolve per-user creds itself).
 	if forwarded, err := s.forwardSimpleCT(ctx, req.HostName, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
-		return c.PullOCIImage(s.ownerStrictOutgoing(ctx), req)
+		return c.PullOCIImage(s.ociReplaceOutgoing(ctx, req), req)
 	}); err != nil || forwarded != nil {
 		return forwarded, err
 	}
@@ -976,15 +1038,55 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 	if err := s.refuseClaimingOwnerlessItem(ctx, item, req.Dest, req.Project); err != nil {
 		return nil, err
 	}
-	if err := s.containerRuntime.PullOCIImage(ctx, req.Image, req.Dest, req.Tag, req.Username, req.Password); err != nil {
-		return nil, status.Errorf(codes.Internal, "pull oci: %v", err)
+	replace, err := s.judgeOCIReplace(ctx, req)
+	if err != nil {
+		return nil, err
 	}
 	// Only an explicit --project makes the image a project's; without one it
-	// is everyone's, as on main.
+	// is everyone's, as on main. The owner is recorded in the bundle with
+	// the content (lxc.OwnerFile), so the one rename that publishes the
+	// content publishes its owner; then, under the item's locks, in
+	// <data_dir>/oci-owners too, which an earlier build reads.
+	//
+	// Until the image is in place, that copy holds ociOwnerPending, which
+	// matches no project: an earlier build, rolled back to after a claim was
+	// cut short, refuses the item to every project rather than give the new
+	// image to the old owner. A pull that fails before then puts the copy
+	// back as it was.
+	var owner string
+	var publish func() error
+	restore := func() {}
+	published := false
 	if item != "" && s.dataDir != "" && req.Project != "" {
-		if err := s.writeOCIOwner(item, tenancy.NormalizeProject(req.Project)); err != nil {
-			slog.Warn("oci pull: could not record the image's owner; it stays usable by every project", "image", item, "error", err)
+		owner = tenancy.NormalizeProject(req.Project)
+		restore = s.markOCIOwnerPending(item)
+		publish = func() error {
+			published = true
+			ociOwnerWriteHook(item, owner)
+			if err := s.writeOCIOwner(item, owner); err != nil {
+				slog.Warn("oci pull: the image's owner is recorded with it, but its copy for earlier builds could not be written", "image", item, "project", owner, "error", err)
+			}
+			return nil
 		}
+	}
+	if err := s.containerRuntime.PullOCIImage(ctx, req.Image, req.Dest, req.Tag, req.Username, req.Password, replace, s.checkPullSource, owner, publish); err != nil {
+		if !published {
+			restore()
+		}
+		switch {
+		case errors.Is(err, lxc.ErrOCIItemExists):
+			return nil, ociItemExistsErr(req.Dest, s.hostName)
+		case errors.Is(err, lxc.ErrSourceRefused):
+			return nil, status.Errorf(codes.InvalidArgument, "pull oci: %v", err)
+		case errors.Is(err, lxc.ErrStagingSpace):
+			return nil, status.Errorf(codes.ResourceExhausted, "pull oci: %v", err)
+		}
+		// The source check, run by the runtime on the object it opened,
+		// answers with its own code.
+		if st, ok := status.FromError(err); ok && st.Code() != codes.Unknown && st.Code() != codes.OK {
+			return nil, st.Err()
+		}
+		return nil, status.Errorf(codes.Internal, "pull oci: %v", err)
 	}
 	return &emptypb.Empty{}, nil
 }

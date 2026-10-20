@@ -1829,6 +1829,9 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		// periodic anti-entropy full-row compare raises the safety-fault signal. Mixed-version
 		// safety is enforced on the SEND side (proof-bearing entries are dropped to peers that
 		// don't advertise split_brain_gate_v1), so this receive side just stays monotone.
+		if tableName == "project_authority_epochs" && sh.Kind == KindUpdate && isRetireProjectAuthority(s.SQL) {
+			return applyReplicatedAuthorityRetire(ctx, tx, s.Params)
+		}
 		sqlStmt := s.SQL
 		if sh.Kind == KindInsert {
 			sqlStmt = setInsertOrIgnore(sqlStmt, sh)
@@ -3557,6 +3560,20 @@ func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement,
 		}
 		if refused {
 			return nil
+		}
+		// A removal of the admission this node holds live applies over a
+		// later write to it (host_removal_stands.go).
+		ends, eErr := hostRemovalEndsLocalAdmission(ctx, tx, s, time.Now())
+		if eErr != nil {
+			return eErr
+		}
+		if ends {
+			res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
+			if err == nil && rowsChanged(res) {
+				r.client.noteOwnRowApplied(tx, s, sh)
+				r.client.deferAfterCommit(tx, func() { r.client.clearUnresolvedFromShape(sh, s) })
+			}
+			return err
 		}
 	}
 	skip, err := r.shouldSkipLWW(ctx, tx, tableName, pkCols, s, sh, incomingHLC)

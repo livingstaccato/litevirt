@@ -29,6 +29,8 @@ type pitModel struct {
 	pivotKeepsPersistent bool
 	// consolePasswd is the domain's VNC console password ("" = none).
 	consolePasswd string
+	// rawXML, when set, is every dump of the domain, as it is.
+	rawXML string
 }
 
 func newPITModel() *pitModel {
@@ -64,6 +66,9 @@ func (m *pitModel) DomainGetState(golibvirt.Domain, uint32) (int32, int32, error
 	return int32(m.state), 0, nil
 }
 func (m *pitModel) DomainGetXMLDesc(_ golibvirt.Domain, f golibvirt.DomainXMLFlags) (string, error) {
+	if m.rawXML != "" {
+		return m.rawXML, nil
+	}
 	x := pitDomXML(m.live, nil)
 	if f&golibvirt.DomainXMLInactive != 0 {
 		x = pitDomXML(m.inactive, m.backing)

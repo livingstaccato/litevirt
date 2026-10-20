@@ -90,8 +90,9 @@ func settleRemedy(d settleDecline, self string) string {
 		"which copy is current: `lv cluster claim vm/%[1]s` shows the decided claim and its destination, and "+
 		"`virsh domstate %[1]s` on %[2]s shows whether it runs there. Only if the claim gave %[1]s to %[2]s and %[2]s "+
 		"runs it is the copy on %[3]s a superseded duplicate; stop it on %[3]s with `virsh destroy %[1]s`. Its disks "+
-		"are kept; its definition and NVRAM are removed on the next reconcile pass (the leftover cleanup undefines "+
-		"a destroyed domain whose row moved). Otherwise the copy on %[3]s may be the only one: leave it running, and "+
+		"are kept; the next reconcile pass undefines the destroyed domain whose row moved, and moves its NVRAM and "+
+		"vTPM state, if it has any, into fwmig-quarantine/%[1]s-reconciled-<time>/ under the data directory rather "+
+		"than removing them (`lv host superseded-disks %[3]s` lists it; it is kept while the VM exists). Otherwise the copy on %[3]s may be the only one: leave it running, and "+
 		"owner-assert reclaims the row once every peer reports the VM absent.",
 		d.Name, d.RowHost, self)
 	return b.String()

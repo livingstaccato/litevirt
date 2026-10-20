@@ -123,15 +123,19 @@ func TestSettle_ADeclineSaysWhyAndWhatToDo(t *testing.T) {
 	}
 	// The remedy must make the operator confirm which copy is current first
 	// (a converged-wrong host_name looks the same), and must not promise the
-	// definition survives: the leftover cleanup undefines it, NVRAM included.
+	// definition survives: the leftover cleanup undefines it. Its NVRAM and
+	// vTPM state are quarantined, not removed (D2-18 re-review 3, m-1), and
+	// the remedy says where.
 	for _, want := range []string{"lv cluster claim vm/vm-a", "virsh domstate vm-a", "converged-wrong host_name",
-		"definition and NVRAM are removed"} {
+		"undefines the destroyed domain", "fwmig-quarantine/vm-a-reconciled-", "lv host superseded-disks"} {
 		if !strings.Contains(ev.Remedy, want) {
 			t.Fatalf("remedy lacks %q: %s", want, ev.Remedy)
 		}
 	}
-	if strings.Contains(ev.Remedy, "definition and disks are kept") {
-		t.Fatalf("remedy still claims the definition is kept: %s", ev.Remedy)
+	for _, stale := range []string{"definition and disks are kept", "NVRAM are removed"} {
+		if strings.Contains(ev.Remedy, stale) {
+			t.Fatalf("remedy still says %q: %s", stale, ev.Remedy)
+		}
 	}
 
 	// Past the interval the same reason is logged again.

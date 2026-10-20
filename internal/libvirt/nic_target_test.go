@@ -108,14 +108,14 @@ func TestSnapshotRevert_GoesThroughTheGuard(t *testing.T) {
 			Before:      func(string) (bool, error) { return true, nil },
 			AfterPaused: func(string) error { stateWhileArmed = m.state(); return nil },
 		}
-		if err := revertToLiveSnapshot(m, "vm", "m1", save, nil, nil, g); err != nil {
+		if err := revertToLiveSnapshot(m, "vm", "m1", save, nil, nil, g, FirmwareMoveGuard{}); err != nil {
 			t.Fatalf("revert with an arming guard: %v", err)
 		}
 		if stateWhileArmed != golibvirt.DomainPaused || m.state() != golibvirt.DomainRunning {
 			t.Fatalf("armed in state %v, now %v; want armed while paused, then running", stateWhileArmed, m.state())
 		}
 		bad := StartGuard{Before: func(string) (bool, error) { return true, nil }, AfterPaused: func(string) error { return errors.New("no") }}
-		if err := revertToLiveSnapshot(m, "vm", "m1", save, nil, nil, bad); err == nil {
+		if err := revertToLiveSnapshot(m, "vm", "m1", save, nil, nil, bad, FirmwareMoveGuard{}); err == nil {
 			t.Fatal("a restore whose guard failed while paused succeeded")
 		}
 		if m.state() == golibvirt.DomainRunning {

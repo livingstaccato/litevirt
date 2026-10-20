@@ -265,3 +265,56 @@ func waitFor(cond func() bool) bool {
 	}
 	return false
 }
+
+// A call admitted before the fence that asks the Fake again on its own
+// goroutine (a hook of its, or DomainState asking its connection) is one
+// logical call: it passes the fenced gate and the drain completes. A new
+// call on another goroutine still waits (Codex fix1 review I5).
+//
+// Mutation: admission is per gate pass, not per goroutine — the nested
+// DomainExists waits at the fence and the admitted call never ends, red.
+func TestDaemonGate_ANestedCallOfAnAdmittedOnePasses(t *testing.T) {
+	f := New()
+	f.SetState("vm1", StateRunning)
+	f.DefineStoppedDomain("vm2", "52:54:00:00:00:02")
+	fenced, nested := make(chan struct{}), make(chan bool, 1)
+	f.FailUndefinePreserv = func(name string) error {
+		<-fenced
+		nested <- f.DomainExists("vm1")
+		return nil
+	}
+	admitted := make(chan error, 1)
+	go func() { admitted <- f.UndefineDomainPreservingState("vm2") }()
+	if !waitFor(func() bool { return f.DaemonInFlight() == 1 }) {
+		t.Fatal("the undefine was not admitted")
+	}
+	f.FenceDaemon()
+	close(fenced)
+	select {
+	case ok := <-nested:
+		if !ok {
+			t.Error("the nested DomainExists did not see vm1")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the nested call of an admitted one waited at the fence")
+	}
+	if err := <-admitted; err != nil {
+		t.Fatal(err)
+	}
+	if !waitFor(func() bool { return f.DaemonInFlight() == 0 }) {
+		t.Fatal("the admitted call did not drain")
+	}
+	other := make(chan struct{})
+	go func() {
+		defer close(other)
+		_ = f.DomainExists("vm1")
+	}()
+	select {
+	case <-other:
+		t.Fatal("a new call went past the fence")
+	case <-time.After(100 * time.Millisecond):
+	}
+	f.KillDaemon()
+	<-other
+	f.ReviveDaemon()
+}

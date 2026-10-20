@@ -1,6 +1,7 @@
 package libvirtfake
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"reflect"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -49,7 +51,8 @@ type daemonGate struct {
 	state    gateState
 	changed  chan struct{} // closed, and replaced, on each change of state
 	inflight int
-	calls    []string // the calls the dead gate ended
+	owners   map[uint64]int // goroutine → depth of its admitted call
+	calls    []string       // the calls the dead gate ended
 }
 
 // severExempt are the exported methods no daemon calls: the scenario's
@@ -120,15 +123,31 @@ func (f *Fake) DaemonGate() string {
 }
 
 // daemon is the gate (see above): the caller defers the func it returns.
+//
+// Admission is per logical call: a call the Fake makes on itself, or that a
+// hook it runs makes, on the goroutine of a call already admitted
+// (DomainState asking its connection, a migrate's landing reading the
+// source) is part of that call and passes, fenced or not. Only new work
+// waits, so the gate never waits on a call it holds.
 func (f *Fake) daemon() (exit func()) {
 	g := &f.gate
+	id := goid()
 	g.mu.Lock()
 	for {
+		if g.state != gateDead && g.owners[id] > 0 {
+			g.owners[id]++
+			g.mu.Unlock()
+			return func() { g.leave(id) }
+		}
 		switch g.state {
 		case gateAlive:
+			if g.owners == nil {
+				g.owners = map[uint64]int{}
+			}
+			g.owners[id] = 1
 			g.inflight++
 			g.mu.Unlock()
-			return g.exit
+			return func() { g.leave(id) }
 		case gateFenced:
 			if g.changed == nil {
 				g.changed = make(chan struct{})
@@ -145,10 +164,29 @@ func (f *Fake) daemon() (exit func()) {
 	}
 }
 
-func (g *daemonGate) exit() {
+// leave ends one level of goroutine id's admitted call.
+func (g *daemonGate) leave(id uint64) {
 	g.mu.Lock()
-	g.inflight--
-	g.mu.Unlock()
+	defer g.mu.Unlock()
+	if g.owners[id]--; g.owners[id] <= 0 {
+		delete(g.owners, id)
+		g.inflight--
+	}
+}
+
+// goid is the calling goroutine's id.
+func goid() uint64 {
+	var b [64]byte
+	s := b[:runtime.Stack(b[:], false)]
+	s = bytes.TrimPrefix(s, []byte("goroutine "))
+	if i := bytes.IndexByte(s, ' '); i > 0 {
+		s = s[:i]
+	}
+	id, err := strconv.ParseUint(string(s), 10, 64)
+	if err != nil {
+		panic(fmt.Sprintf("libvirtfake: goroutine id of %q", b[:]))
+	}
+	return id
 }
 
 // callerName is the name of the method that asked the gate.

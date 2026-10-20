@@ -519,12 +519,23 @@ not in that registry and needs no abort.
 After the cut-over the source's cloud-init ISO is removed and DNS,
 load-balancer backends and VXLAN forwarding entries follow the VM, as for a
 migration. A live attempt that
-fails takes back the cloud-init ISO it put on the target before the cold move
-is tried. (Builds before this put no ISO on the target, so every cloud-init
-VM's live drain failed and fell back to the cold move.)
+fails takes back the cloud-init ISO and any disk stubs it put on the target
+before the cold move is tried. (Builds before this put no ISO on the target,
+so every cloud-init VM's live drain failed and fell back to the cold move.)
+
+During a rolling upgrade, until every host runs a release that keeps the
+VM's placement generation, the target cannot prove that a file is this
+attempt's, so it takes nothing back: the ISO and any disk stub stay on the
+target. The ISO is written again by the next attempt, but a disk stub is not:
+the cold move that follows is refused at it, naming the file, and the VM
+stays on the drained host. Move each named file aside as the refusal says,
+then run `lv host drain` again. A failed `lv migrate --with-storage` or
+`lv migrate --cold` leaves its files the same way, and its retry is refused
+the same way.
 
 A VM that drain cannot move stays on the host with its disks; a failed attempt
-removes what it put on the target. It is never moved without its disks:
+removes what it put on the target (during a rolling upgrade, see above). It is
+never moved without its disks:
 
 - refused before the shutdown, it keeps running;
 - a move that fails after the shutdown starts it again on the host, once its

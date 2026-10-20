@@ -278,3 +278,9 @@ func (s *Server) SweepFirewallTagOrphansForTest(ctx context.Context, now time.Ti
 // SetStackMemberDeleteHookForTest sets the seam DeleteStack calls with each
 // member's name right before deleting it.
 func (s *Server) SetStackMemberDeleteHookForTest(fn func(name string)) { s.stackMemberDeleteHook = fn }
+
+// SetDeleteLeaseTakenHookForTest runs fn, with the VM's name, once a delete
+// carried out on this host holds the VM's start lease and its lock, before
+// it reads the row again: where a fleet scenario lands what another actor
+// does meanwhile.
+func (s *Server) SetDeleteLeaseTakenHookForTest(fn func(name string)) { s.deleteLeaseTakenHook = fn }

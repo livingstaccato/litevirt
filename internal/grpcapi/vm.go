@@ -3316,6 +3316,35 @@ func deleteLocalOnly(ctx context.Context) bool {
 	return false
 }
 
+// moveTargetAskedMD marks a delete of a VM recorded migrating whose move's
+// target the entry (DeleteVM) asked and found without a domain of it, on
+// the forward to the VM's host: the owner then deletes the VM although its
+// guest does not run there (deleteVM's re-check under the lock).
+const moveTargetAskedMD = "x-lv-delete-move-target-asked"
+
+type moveTargetAskedKey struct{}
+
+// withMoveTargetAsked marks ctx (moveTargetAsked), for this process and for
+// a forward to the owner.
+func withMoveTargetAsked(ctx context.Context) context.Context {
+	ctx = context.WithValue(ctx, moveTargetAskedKey{}, true)
+	return metadata.AppendToOutgoingContext(ctx, moveTargetAskedMD, "1")
+}
+
+// moveTargetAsked reports whether the entry asked the move's target and
+// found it without the guest: marked in this process, or carried by a peer's
+// forward (over a peer certificate, as forwardedByEntry).
+func (s *Server) moveTargetAsked(ctx context.Context) bool {
+	if v, _ := ctx.Value(moveTargetAskedKey{}).(bool); v {
+		return true
+	}
+	if s.requirePeerCert(ctx) != nil {
+		return false
+	}
+	md, ok := metadata.FromIncomingContext(ctx)
+	return ok && len(md.Get(moveTargetAskedMD)) > 0
+}
+
 func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error) {
 	// A plain delete — not a rebuild's or recreate's teardown, not a peer's
 	// forward or probe of one — ends the VM's claim to its iSCSI LUNs'
@@ -3378,6 +3407,9 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 				if rerr := s.migratingStopRefusal(ctx, "delete", vm); rerr != nil {
 					return nil, rerr
 				}
+				// The target holds no domain of it: the owner deletes the
+				// VM although its guest does not run there either.
+				ctx = withMoveTargetAsked(ctx)
 			}
 		}
 	}
@@ -3626,6 +3658,18 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		}
 		if vm.HostName != s.hostName {
 			return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-delete; retry", req.Name, vm.HostName)
+		}
+		// A row recorded migrating got this far because the entry (DeleteVM)
+		// found the guest running on this host, or asked the move's target
+		// and found it without the guest (moveTargetAsked). The first is
+		// checked again here, under the lock: a guest that cut over to the
+		// target since would otherwise be deleted with the target never
+		// asked. The retry asks it.
+		if vm.State == "migrating" && !s.moveTargetAsked(ctx) {
+			if active, aerr := s.virt.DomainIsActive(req.Name); aerr != nil || !active {
+				return nil, status.Errorf(codes.Aborted,
+					"%q, recorded migrating, no longer runs here; retry, which asks the move's target", req.Name)
+			}
 		}
 	}
 
@@ -3945,6 +3989,15 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		}
 		destroyed = true
 		active = false
+	}
+	if vm.State == "migrating" && activeErr == nil && active {
+		// The guest runs here under a row recorded migrating: libvirtd may
+		// still run the move's job, aborted first so no cut-over lands under
+		// the destroy below (as the forced stop above, and StopVM's runs-here
+		// arm).
+		if aerr := s.virt.AbortMigration(vm.Name); aerr != nil {
+			slog.Info("DeleteVM: no migration job to abort before destroying a VM recorded migrating", "vm", vm.Name, "error", aerr)
+		}
 	}
 	if vm.State == "running" || activeErr != nil || active {
 		if err := s.virt.DestroyDomain(req.Name); err != nil {

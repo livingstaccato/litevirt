@@ -1428,6 +1428,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// adoption-gate + PCI-start-preflight. A strict no-op until hardware_v2 latches, so
 	// this changes nothing on a fleet where the feature is off.
 	vmChecker.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
+	// A health restart runs under the VM's API lock, the one a move, a start
+	// or a stop of the VM holds, so none interleaves with it.
+	vmChecker.SetVMLocker(svc.TryLockVMForHealth)
 	// A health restart moves a stopped VM's NICs onto the devices their
 	// networks are on now, as a start through the Server does.
 	vmChecker.SetNetworkFollower(svc.FollowNetworkDevices)

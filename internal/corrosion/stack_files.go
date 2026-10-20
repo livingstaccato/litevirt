@@ -19,9 +19,6 @@ type stackWants struct {
 	updatedAt   string // the stack record's LWW key
 	defaultDeny bool
 	repos       map[string]bool
-	// recorded is set when a caller with sg.write recorded the stack's
-	// firewall intent, which then arbitrates its ask (otherStackWants).
-	recorded bool
 }
 
 // otherStackWants returns what every live stack other than stack asks for,
@@ -74,12 +71,11 @@ func otherStackWants(ctx context.Context, c *Client, stack string, read StackFil
 		// it removes the row, and its old file, still in the record until
 		// the deploy ends, does not ask for the deny back. Otherwise the
 		// file asks too.
-		in, recorded := stamped[st.Name]
-		if recorded && lwwOrder(st.UpdatedAt, in.at) < 0 {
+		if in, ok := stamped[st.Name]; ok && lwwOrder(st.UpdatedAt, in.at) < 0 {
 			deny = false
 		}
 		deny = deny || intents[st.Name].DefaultDeny
-		out = append(out, stackWants{name: st.Name, updatedAt: st.UpdatedAt, defaultDeny: deny, repos: repos, recorded: recorded})
+		out = append(out, stackWants{name: st.Name, updatedAt: st.UpdatedAt, defaultDeny: deny, repos: repos})
 	}
 	listed := make(map[string]bool, len(out)+len(unreadable))
 	for _, w := range out {
@@ -104,7 +100,7 @@ func otherStackWants(ctx context.Context, c *Client, stack string, read StackFil
 		if len(rec) > 0 {
 			at = rec[0].String("updated_at")
 		}
-		out = append(out, stackWants{name: name, updatedAt: at, defaultDeny: true, recorded: true})
+		out = append(out, stackWants{name: name, updatedAt: at, defaultDeny: true})
 	}
 	return out, unreadable, nil
 }

@@ -1953,8 +1953,9 @@ stack, whatever removed it. An intent recorded after a stack's file outranks
 the file's ask: an Admin's `lv compose up` that drops the deny is not undone
 while its file is still being recorded. A stack with no recorded intent
 (deployed before `cluster_policies` could be written, or by a previous
-release) is judged by its file alone, as before: it gets the deny back only
-when its record is newer than the removal.
+release) is judged by its file alone: a redeploy of it that drops the deny
+can get the deny back from the old file while it runs, and once the new file
+is recorded the deny raises this condition.
 
 ### A VM that outlived its stack's teardown (`stack.vm_outlived_stack`)
 

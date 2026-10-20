@@ -340,13 +340,18 @@ func TestDeleteStack_KeepsReposWhileAnotherStacksFileIsUnreadable(t *testing.T) 
 	}
 }
 
-// cr7 round 2, I1-r1. Stack A owns the deny and redeploys without it. Its
-// persist removes the row before its record holds the new file; a reconcile
-// pass in that gap must not bring the deny back from A's old file. The
-// cluster ends default-allow, as the new file says.
+// cr7 round 2, I1-r1, as round 6b settles it. Stack A, with no recorded
+// firewall intent (deployed while cluster_policies could not be written),
+// owns the deny and redeploys without it. Its persist removes the row before
+// its record holds the new file, and a reconcile pass in that gap gives the
+// deny back to A's old file: a removal never outranks an ask, since one
+// written on a lagging replica must not open the cluster. Once the new file
+// is recorded nothing asks for the deny: it stays (fail closed), is reported
+// as stack.firewall_deny_unasked, and `lv firewall default-deny off` clears
+// it.
 //
-// Mutation: re-assert whatever the removal's time — A's old file re-sets
-// the deny.
+// Mutation: count only stacks recorded after the removal again (the old
+// rule) — the deny is not given back, red.
 func TestDeployStack_DroppingDenyIsNotUndoneByTheReconcilerMidDeploy(t *testing.T) {
 	s := testServer(t)
 	ctx := adminCtx()
@@ -378,16 +383,23 @@ func TestDeployStack_DroppingDenyIsNotUndoneByTheReconcilerMidDeploy(t *testing.
 	if !passed {
 		t.Fatal("fixture: no reconcile pass ran mid-deploy")
 	}
-	if d := clusterDefault(t, ctx, s); d != nil && d.DefaultDeny {
-		t.Errorf("cluster default after a's redeploy without deny = %+v, want no deny", d)
+	if d := clusterDefault(t, ctx, s); d == nil || !d.DefaultDeny || d.StackName != "a" {
+		t.Fatalf("cluster default after a's redeploy without deny = %+v, want the deny kept, owned by a", d)
 	}
-	// The round-1 case still holds after it: a stack recorded after the
-	// removal and asking for deny gets it back from a pass.
-	putStack(t, ctx, s, "c", denyFile("c"))
+	if owner, err := corrosion.UnaskedStackDeny(ctx, s.db, compose.StoredStackWants); err != nil || owner != "a" {
+		t.Errorf("UnaskedStackDeny = %q (%v), want a: the deny is reported", owner, err)
+	}
+	// The Admin's exit.
+	if _, err := s.SetFirewallDefault(ctx, &pb.SetFirewallDefaultRequest{DefaultDeny: false}); err != nil {
+		t.Fatal(err)
+	}
 	if err := corrosion.ReassertStackDefaultDeny(ctx, s.db, compose.StoredStackWants); err != nil {
 		t.Fatal(err)
 	}
-	if d := clusterDefault(t, ctx, s); d == nil || !d.DefaultDeny || d.StackName != "c" {
-		t.Errorf("cluster default after c, recorded later, asked for deny = %+v, want deny owned by c", d)
+	if d := clusterDefault(t, ctx, s); d == nil || d.DefaultDeny {
+		t.Errorf("cluster default after `lv firewall default-deny off` = %+v, want allow", d)
+	}
+	if owner, _ := corrosion.UnaskedStackDeny(ctx, s.db, compose.StoredStackWants); owner != "" {
+		t.Errorf("UnaskedStackDeny = %q after the exit, want none", owner)
 	}
 }

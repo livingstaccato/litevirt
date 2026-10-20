@@ -445,35 +445,28 @@ func EnsureClusterDefaultDeny(ctx context.Context, c *Client, stack string) erro
 // outrank it. A live row is left as it is: a deny is its owner's, and an
 // allow is an operator's decision (`lv firewall default-deny off`).
 //
-// A stack whose firewall intent is recorded gets the deny back whatever
-// removed it and whenever: its intent already outranks its file when an
-// Admin's redeploy drops the deny, so its old file does not ask in the
-// meantime. A stack with no recorded intent (deployed before cluster_policies
-// could be written, or by a previous release) is judged by its file alone, as
-// before: only when its record was written after the removal, since its own
-// redeploy dropping the deny removes the row before it records its new file.
+// A stack that asks gets the deny back whatever removed it and whenever: a
+// removal never outranks an ask. Its recorded intent outranks its file when
+// an Admin's redeploy drops the deny, so its old file does not ask in the
+// meantime. A stack with no recorded intent (deployed before
+// cluster_policies could be written, or by a previous release) is judged by
+// its file alone: its own redeploy dropping the deny can then get it back
+// from the old file still in its record, and once the new file is recorded
+// the deny is one nothing asks for, kept and reported (fail closed).
 //
 // No pass removes or withdraws a deny. One that nothing asks for any more
 // stays, fail closed, and is reported (UnaskedStackDeny).
 func ReassertStackDefaultDeny(ctx context.Context, c *Client, read StackFileWants) error {
-	rows, err := c.Query(ctx,
-		`SELECT updated_at, deleted_at FROM firewall_defaults WHERE scope = 'cluster'`)
-	if err != nil {
-		return err
-	}
-	removedAt := ""
-	if len(rows) > 0 {
-		if rows[0].String("deleted_at") == "" {
-			return nil // a live row, deny or allow: its owner's decision
-		}
-		removedAt = rows[0].String("updated_at")
+	cur, err := GetFirewallDefault(ctx, c, "cluster")
+	if err != nil || cur != nil {
+		return err // a live row, deny or allow: its owner's decision
 	}
 	wants, _, err := otherStackWants(ctx, c, "", read)
 	if err != nil {
 		return err
 	}
 	for _, w := range wants {
-		if w.defaultDeny && (w.recorded || removedAt == "" || lwwOrder(removedAt, w.updatedAt) < 0) {
+		if w.defaultDeny {
 			return SetFirewallDefault(ctx, c, "cluster", true, w.name)
 		}
 	}

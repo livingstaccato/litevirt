@@ -732,8 +732,9 @@ func TestDeployStack_AFailedAdminDropKeepsTheDeny(t *testing.T) {
 // review's probe R6b-P6.
 //
 // Mutations: count only stacks recorded after the removal again — "a removal
-// newer than the ask", red. Withdraw a deny nothing asks for (248acdb26) —
-// "a lagging withdrawal", red.
+// newer than the ask" and "a stack with no recorded intent", red; for
+// intent-less stacks only — the latter, red. Withdraw a deny nothing asks
+// for (248acdb26) — "a lagging withdrawal", red.
 func TestReassertStackDefaultDeny_ARemovalNeverOutranksAnAsk(t *testing.T) {
 	ctx := context.Background()
 	const asks = "name: s\nfirewall:\n  default-deny: true\n"
@@ -787,6 +788,32 @@ func TestReassertStackDefaultDeny_ARemovalNeverOutranksAnAsk(t *testing.T) {
 		}
 		if d, _ := corrosion.GetFirewallDefault(ctx, s.db, "cluster"); d == nil || !d.DefaultDeny || d.StackName != "s" {
 			t.Errorf("FAIL OPEN: stack s's file and intent ask for the deny, and the cluster default is %+v", d)
+		}
+	})
+	// Deployed while cluster_policies could not be written: no intent, its
+	// file alone asks. A removal stamped after its record (a lagging
+	// replica's) must not outrank it either.
+	t.Run("a stack with no recorded intent", func(t *testing.T) {
+		s, _, ada := stackFirewallFixture(t)
+		if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: asks}, &mockDeployStreamR2{ctx: ada}); err != nil {
+			t.Fatal(err)
+		}
+		if _, found, _ := corrosion.GetStackFirewallIntent(ctx, s.db, "s"); found {
+			t.Fatal("setup: s has a recorded intent")
+		}
+		if err := s.DeleteStack(&pb.DeleteStackRequest{Name: "fwonly"}, &mockDeleteStream{ctx: ada}); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.DeleteFirewallDefault(ctx, s.db, "cluster"); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 2; i++ {
+			if err := corrosion.ReassertStackDefaultDeny(ctx, s.db, compose.StoredStackWants); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if d, _ := corrosion.GetFirewallDefault(ctx, s.db, "cluster"); d == nil || !d.DefaultDeny || d.StackName != "s" {
+			t.Errorf("FAIL OPEN: s's file asks for the deny, and the cluster default is %+v", d)
 		}
 	})
 	t.Run("a removal newer than the ask", func(t *testing.T) {

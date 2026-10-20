@@ -1513,6 +1513,17 @@ stack's firewall or default-deny, the upgraded hosts keep the default-deny
 the recorded intent asks for and raise the condition. Run it again from an
 upgraded host.
 
+### A stack's default-deny is never removed by the reconciler
+
+On this release the stack reconciler gives the cluster default-deny back to
+a stack that asks for it whenever no default is in force, however new the
+removal, and never removes a deny on its own. Until `failover_scope_v1` has
+latched no firewall intent is recorded, and a stack's file alone says whether
+it asks: an `lv compose up` that drops `default-deny` can leave the deny on,
+owned by the stack, when a reconciler pass runs while it is recorded. The
+stack reconciler raises `stack.firewall_deny_unasked` naming the stack, and
+`lv firewall default-deny off` turns the deny off (docs/diagnostics.md).
+
 ### Firewall rules, ip sets and default policies need sg.write
 
 On this release, `lv firewall cluster-rule add/rm`,

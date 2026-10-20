@@ -95,10 +95,16 @@ func InsertProject(ctx context.Context, c *Client, p ProjectRecord) error {
 		if !prev {
 			now := c.NowTS()
 			if c.ProjectIncarnationOn() {
-				// A first birth: it takes the grants made while no row existed
+				// A first birth, carrying over the pre-grants this node holds
 				// (project_incarnation.go).
-				return c.Execute(ctx, projectsInsertIncarnationSQL,
-					p.Name, p.Display, p.ParentName, nowRFC3339(), now, newProjectIncarnation(true))
+				applied, err := createFirstBirth(ctx, c, p)
+				if err != nil {
+					return err
+				}
+				if !applied {
+					return projectLostRace(ctx, c, p.Name)
+				}
+				return nil
 			}
 			return c.Execute(ctx,
 				`INSERT INTO projects (name, display, parent_name, created_at, updated_at)
@@ -428,21 +434,43 @@ func commitProjectLifecycle(ctx context.Context, c *Client, kind projectLifecycl
 	if err != nil {
 		return false, err
 	}
-	if q != nil {
+	// A birth over a tombstone of the name (this spelling's or another's) is a
+	// new incarnation once project_incarnation_v1 has latched, or once a row
+	// of the name carries one, written with the row in this transaction
+	// (project_incarnation.go). The quota reset names it too; a delete's names
+	// the incarnation it ends.
+	states, err := loadProjectStates(ctx, c)
+	if err != nil {
+		return false, err
+	}
+	canonName, _ := safename.CanonicalProjectName(name)
+	incarnations := c.ProjectIncarnationOn() || states[canonName].carried()
+	born := newProjectIncarnation(false)
+	quotaInc := born
+	if kind == lifecycleDelete {
+		var cur string
+		if r, err := c.Query(ctx, `SELECT incarnation FROM projects WHERE name = ?`, name); err == nil && len(r) > 0 {
+			cur = r[0].String("incarnation")
+		}
+		quotaInc = cur
+	}
+	switch {
+	case q != nil && incarnations:
+		stmts = append(stmts, Statement{
+			SQL:    projectQuotaUpsertIncarnationSQL,
+			Params: []interface{}{name, 0, 0, 0, 0, 0, 0, quotaInc, c.NowTS()},
+		})
+	case q != nil:
 		stmts = append(stmts, Statement{
 			SQL:    projectQuotaUpsertSQL,
 			Params: []interface{}{name, 0, 0, 0, 0, 0, 0, c.NowTS()},
 		})
 	}
-	// A birth over a tombstone of the name (this spelling's or another's) is a
-	// new incarnation once project_incarnation_v1 has latched, written with
-	// the row in this transaction (project_incarnation.go).
-	incarnations := c.ProjectIncarnationOn()
 	switch {
 	case kind == lifecycleCreate && incarnations:
 		stmts = append(stmts, Statement{
 			SQL:    projectsInsertIncarnationSQL,
-			Params: []interface{}{p.Name, p.Display, p.ParentName, nowRFC3339(), c.NowTS(), newProjectIncarnation(false)},
+			Params: []interface{}{p.Name, p.Display, p.ParentName, nowRFC3339(), c.NowTS(), born},
 		})
 	case kind == lifecycleCreate:
 		stmts = append(stmts, Statement{
@@ -453,7 +481,7 @@ func commitProjectLifecycle(ctx context.Context, c *Client, kind projectLifecycl
 	case kind == lifecycleRevive && incarnations:
 		stmts = append(stmts, Statement{
 			SQL:    projectsReviveIncarnationSQL,
-			Params: []interface{}{nil, newProjectIncarnation(false), c.NowTS(), p.Name},
+			Params: []interface{}{nil, born, c.NowTS(), p.Name},
 		})
 	case kind == lifecycleRevive:
 		stmts = append(stmts, Statement{
@@ -681,14 +709,8 @@ func UpsertProjectQuota(ctx context.Context, c *Client, q ProjectQuotaRecord) er
 	if q.ProjectName == "" {
 		return fmt.Errorf("project_name required")
 	}
-	now := c.NowTS()
-	params := []interface{}{q.ProjectName, q.VCPULimit, q.MemMiBLimit, q.DiskGiBLimit,
-		q.NICLimit, q.PublicIPLimit, q.BackupGiBLimit, now}
-	if c.ProjectIncarnationOn() {
-		// Bound to the incarnation of a live project (project_incarnation.go).
-		return upsertProjectQuotaGuarded(ctx, c, params)
-	}
-	return c.Execute(ctx, projectQuotaUpsertSQL, params...)
+	// Bound to the incarnation of a live project (project_incarnation.go).
+	return upsertProjectQuota(ctx, c, q, c.NowTS())
 }
 
 const projectQuotaUpsertSQL = `INSERT INTO project_quotas
@@ -709,13 +731,19 @@ const projectQuotaUpsertSQL = `INSERT INTO project_quotas
 func GetProjectQuota(ctx context.Context, c *Client, name string) (*ProjectQuotaRecord, error) {
 	rows, err := c.Query(ctx,
 		`SELECT project_name, vcpu_limit, mem_mib_limit, disk_gib_limit,
-		        nic_limit, public_ip_limit, backup_gib_limit
+		        nic_limit, public_ip_limit, backup_gib_limit, incarnation
 		 FROM project_quotas WHERE project_name = ?`, name)
 	if err != nil {
 		return nil, err
 	}
 	if len(rows) == 0 {
 		return nil, nil
+	}
+	// A quota set for another incarnation of the project is not this
+	// project's: it starts with none, as a new project does
+	// (project_incarnation.go).
+	if own, err := projectQuotaEnforced(ctx, c, name, rows[0].String("incarnation")); err != nil || !own {
+		return nil, err
 	}
 	r := rows[0]
 	return &ProjectQuotaRecord{

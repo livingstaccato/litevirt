@@ -270,7 +270,7 @@ func ReconcileOrphanedProjectAuthority(ctx context.Context, c *Client) (int, err
 		// however late this node's clock stamps the retirement
 		// (project_incarnation.go).
 		var guard *MutationGuard
-		if canon, cerr := safename.CanonicalProjectName(project); cerr == nil && canon != "/" && c.ProjectIncarnationOn() {
+		if canon, cerr := safename.CanonicalProjectName(project); cerr == nil && canon != "/" && c.projectFormsFor(r.String("tomb_inc")) {
 			guard = &MutationGuard{Protocol: projectIncarnationGuardV1, ResourceKind: projectGuardDeleted,
 				ResourceID: canon, Incarnation: r.String("tomb_inc")}
 		}

@@ -140,11 +140,9 @@ func InsertRoleBinding(ctx context.Context, c *Client, b RoleBindingRecord) erro
 		prop = 0
 	}
 	params := []interface{}{b.ID, b.Path, b.Role, b.Principal, prop, now}
-	if c.ProjectIncarnationOn() {
-		if proj, ok := projectOfRBACPath(b.Path); ok {
-			if tag, tagged := projectBindingTag(b.ID); tagged {
-				return insertProjectBinding(ctx, c, proj, tag, params, b.Role)
-			}
+	if proj, ok := projectOfRBACPath(b.Path); ok {
+		if tag, tagged := projectBindingTag(b.ID); tagged {
+			return insertProjectBinding(ctx, c, proj, tag, params)
 		}
 	}
 	return c.Execute(ctx, roleBindingInsertSQL, params...)

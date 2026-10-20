@@ -1645,7 +1645,9 @@ earlier project of the name is kept and grants nothing: `lv role ls` lists it
 with `(held)` after its role, it keeps its principal bound, and
 `lv role revoke <binding-id>` removes it. The same holds for a binding granted
 before the upgrade on a project that is re-created after it; bindings on
-projects that are not re-created keep granting as before. A host's orphaned
+projects that are not re-created keep granting as before. A quota set with
+`lv project quota` is bound to its project the same way: a re-created project
+never enforces the old one's quota. A host's orphaned
 admission authority for a deleted project is retired only on hosts that still
 hold that deleted project, never on one that has the new project. A grant or
 `lv project quota` made while its project is deleted or re-created fails and

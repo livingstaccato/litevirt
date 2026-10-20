@@ -578,7 +578,34 @@ func (c *Client) dumpTable(table string) (syncTable, bool) {
 		}
 		st.Rows = append(st.Rows, vals)
 	}
-	return st, true
+	return withoutUnsetIncarnation(st), true
+}
+
+// withoutUnsetIncarnation leaves projects.incarnation and
+// project_quotas.incarnation out of a dump while every row's value is ”
+// (schema v71): a previous-release node, which does not know the column,
+// then still takes the table's rows by anti-entropy during the roll. A
+// receiver of this build merges such a row without touching its own value.
+func withoutUnsetIncarnation(st syncTable) syncTable {
+	if st.Name != "projects" && st.Name != "project_quotas" {
+		return st
+	}
+	at := indexOf(st.Columns, "incarnation")
+	if at < 0 {
+		return st
+	}
+	for _, r := range st.Rows {
+		if v, ok := r[at].(string); !ok || v != "" {
+			return st
+		}
+	}
+	cols := append(append([]string{}, st.Columns[:at]...), st.Columns[at+1:]...)
+	rows := make([][]interface{}, len(st.Rows))
+	for i, r := range st.Rows {
+		rows[i] = append(append([]interface{}{}, r[:at]...), r[at+1:]...)
+	}
+	st.Columns, st.Rows = cols, rows
+	return st
 }
 
 // dumpState serializes the tableNames replicated tables, secret columns

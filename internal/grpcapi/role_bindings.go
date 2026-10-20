@@ -475,7 +475,7 @@ func bindingToPB(b corrosion.RoleBindingRecord) *pb.RoleBinding {
 	if b.Held {
 		// Granted for an earlier project of the name: it grants nothing
 		// (corrosion/project_incarnation.go). lv role revoke removes it.
-		role += " (held)"
+		role += corrosion.HeldRoleSuffix
 	}
 	return &pb.RoleBinding{
 		Id:        b.ID,

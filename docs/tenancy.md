@@ -57,10 +57,15 @@ Grants belong to the project they were made for. Once the
 on an earlier project of the same name grants nothing on the new one, wherever
 and in whatever order it arrives: one a host granted before it heard of the
 delete, or one granted before the upgrade on a project re-created after it.
-`lv role ls` lists such a binding with `(held)` after its role; it keeps its
-principal bound, and `lv role revoke <binding-id>` removes it. A grant or
-`lv project quota` made while its project is deleted or re-created fails and
-changes nothing; run it again. The re-created project
+`lv role ls` lists such a binding with `(held)` after its role (and
+`lv role ls --role <role>` includes it); it keeps its principal bound, and
+`lv role revoke <binding-id>` removes it. A grant made before its project
+first exists carries over to the project when the host that creates it holds
+the grant, under a new binding id; one that reaches the project later from
+another host is held. A quota set with `lv project quota` belongs to the
+project it was set for in the same way: a re-created project never enforces
+the old one's quota, and starts without one. A grant or quota made while its
+project is deleted or re-created fails and changes nothing; run it again. The re-created project
 keeps the old display name and parent, so a re-create with a different
 `--display` or `--parent` is refused; repeat the old display, or pass none.
 Project path segments named `vms`, `containers`, `networks`, `storage_pools`,

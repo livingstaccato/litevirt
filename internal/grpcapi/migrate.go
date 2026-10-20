@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1796,7 +1797,11 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 		if fp, _ := s.localMigrationCA(); resp.MigrationTlsReady && fp != "" {
 			md := metadata.Pairs(MigrationCAMD, fp)
 			if list := s.localMigrationCAList(); len(list) > 0 {
-				md.Append(MigrationCAsMD, headerValue(strings.Join(list, ",")))
+				packed, dropped := packMigrationCAList(list)
+				md.Append(MigrationCAsMD, packed)
+				if dropped > 0 {
+					md.Append(MigrationCAsMoreMD, strconv.Itoa(dropped))
+				}
 			}
 			_ = grpc.SetHeader(ctx, md)
 		}
@@ -2675,6 +2680,95 @@ const MigrationCAMD = "x-litevirt-migration-ca-sha256"
 // migration-tls shows. Shown only, never compared; an older target sends none.
 const MigrationCAsMD = "x-litevirt-migration-cas-sha256"
 
+// MigrationCAsMoreMD accompanies MigrationCAsMD when the sender had more CA
+// fingerprints than fit in the header: it carries how many were left out, so
+// the reader can say the list is incomplete. Shown only.
+const MigrationCAsMoreMD = "x-litevirt-migration-cas-more"
+
+// maxMigrationCAsShown caps how many fingerprints a reader keeps from a peer's
+// MigrationCAsMD.
+const maxMigrationCAsShown = 16
+
+// migrationHeaderLimit is the longest value headerValue lets through.
+const migrationHeaderLimit = 512
+
+// packMigrationCAList joins whole fingerprints, comma-separated, into one
+// header value of at most migrationHeaderLimit bytes. A fingerprint that does
+// not fit whole is left out, never cut; dropped counts those left out.
+func packMigrationCAList(list []string) (packed string, dropped int) {
+	var b strings.Builder
+	for i, fp := range list {
+		fp = headerValue(fp)
+		add := len(fp)
+		if b.Len() > 0 {
+			add++
+		}
+		if b.Len()+add > migrationHeaderLimit {
+			return b.String(), len(list) - i
+		}
+		if b.Len() > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(fp)
+	}
+	return b.String(), 0
+}
+
+// isSHA256Hex reports whether s is a SHA-256 fingerprint as pki.CertFingerprint
+// writes it: 64 lower-case hex digits.
+func isSHA256Hex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// readMigrationCAList is the read side of MigrationCAsMD, whose sender is a
+// peer we do not control: it keeps only well-formed fingerprints, at most
+// maxMigrationCAsShown of them, and drops the rest before they reach an error
+// or an event. more is the peer's MigrationCAsMoreMD; the result ends with a
+// "+N more" marker when the list was incomplete (left out by the sender or by
+// the cap). nil when no valid fingerprint came.
+func readMigrationCAList(list, more []string) []string {
+	if len(list) == 0 {
+		return nil
+	}
+	var out []string
+	extra := 0
+	for _, fp := range strings.Split(list[0], ",") {
+		if !isSHA256Hex(fp) {
+			continue
+		}
+		if len(out) >= maxMigrationCAsShown {
+			extra++
+			continue
+		}
+		out = append(out, fp)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	if len(more) > 0 {
+		if n, err := strconv.Atoi(more[0]); err == nil && n > 0 {
+			extra += min(n, 1<<20)
+		}
+	}
+	if extra > 0 {
+		out = append(out, fmt.Sprintf("+%d more (list incomplete)", extra))
+	}
+	return out
+}
+
+// sanitizeMigrationTLSUnusable bounds a peer-supplied reason to one line of at
+// most 512 printable ASCII bytes before it reaches an error.
+func sanitizeMigrationTLSUnusable(v string) string { return headerValue(v) }
+
 // MigrationTLSUnusableMD is the EnsureDisks response header in which a
 // target that is not ready for migration TLS because its credentials are
 // unusable (pki.ErrInvalidMigrationCredentials) says why. An older target, or
@@ -2904,12 +2998,9 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 	if v := hdr.Get(MigrationCAMD); len(v) > 0 {
 		targetCA = v[0]
 	}
-	var targetCAs []string
-	if v := hdr.Get(MigrationCAsMD); len(v) > 0 && v[0] != "" {
-		targetCAs = strings.Split(v[0], ",")
-	}
+	targetCAs := readMigrationCAList(hdr.Get(MigrationCAsMD), hdr.Get(MigrationCAsMoreMD))
 	if v := hdr.Get(MigrationTLSUnusableMD); len(v) > 0 {
-		unusable = v[0]
+		unusable = sanitizeMigrationTLSUnusable(v[0])
 	}
 	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), migrationCA: targetCA, migrationCAs: targetCAs, tlsUnusable: unusable, remap: remap, migAddr: resp.GetMigrationAddress(), cgroupMode: resp.GetCgroupMode(), vncPasswordUnavailable: resp.GetVncPasswordUnavailable(), netDevices: resp.GetNetworkDevices()}, nil
 }

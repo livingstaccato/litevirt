@@ -50,25 +50,61 @@ func (s *writeSever) refuse() int32 {
 	return 1
 }
 
-// SeverWritesForTests refuses everything this client commits until restore:
-// a scenario's killed process, whose connection the database no longer
-// hears. The caller gets an error and no row changes. It severs this client
-// only; another client of the same shared test database (another node's)
-// writes as before. restore reports how many commits it refused, and how
-// many rows nonetheless reached the database while severed.
+// WriteFence is a test client's database cut off from a scenario's killed
+// process: the commits of the client's connections are refused, and the
+// client's own calls are held at its lock.
+type WriteFence struct {
+	c      *Client
+	held   chan struct{} // closed once the fence holds the client's lock
+	killed atomic.Bool
+}
+
+// FenceWritesForTests fences this client: from now on every commit of its
+// connections is refused (the caller gets an error, no row changes), and the
+// fence takes the client's lock, so that a call of the client's admitted
+// before the fence runs to its end while a later one waits at the lock,
+// asking the database nothing. Held reports when the lock is taken. It
+// fences this client only; another client of the same shared test database
+// (another node's) is untouched. A raw read through DB() still answers.
 //
 // Test clients only (NewTestClient, NewSharedTestClient); it panics on any
 // other.
-func (c *Client) SeverWritesForTests() (restore func() (refused, landed int64)) {
+func (c *Client) FenceWritesForTests() *WriteFence {
 	s := c.writeSever
 	if s == nil {
-		panic("corrosion: SeverWritesForTests on a client that is not a test client")
+		panic("corrosion: FenceWritesForTests on a client that is not a test client")
 	}
 	s.refused.Store(0)
 	s.landed.Store(0)
 	s.on.Store(true)
-	return func() (int64, int64) {
-		s.on.Store(false)
-		return s.refused.Load(), s.landed.Load()
+	w := &WriteFence{c: c, held: make(chan struct{})}
+	go func() {
+		c.mu.Lock()
+		close(w.held)
+	}()
+	return w
+}
+
+// Held is closed once the client's lock is held: every call admitted before
+// the fence has returned.
+func (w *WriteFence) Held() <-chan struct{} { return w.held }
+
+// Kill lets the held calls, and every later one, go on to a database that
+// refuses all they commit. Only once Held.
+func (w *WriteFence) Kill() {
+	<-w.held
+	if w.killed.CompareAndSwap(false, true) {
+		w.c.mu.Unlock()
 	}
+}
+
+// Lift ends the refusal, for the client of the process that replaces the
+// dead one, once nothing of the dead one is left: it reports how many
+// commits were refused, and how many rows nonetheless reached the database
+// while fenced.
+func (w *WriteFence) Lift() (refused, landed int64) {
+	w.Kill()
+	s := w.c.writeSever
+	s.on.Store(false)
+	return s.refused.Load(), s.landed.Load()
 }

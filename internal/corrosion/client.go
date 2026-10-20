@@ -126,7 +126,7 @@ type Client struct {
 	ownHold ownRowHold
 
 	// writeSever refuses a test client's commits while a scenario has its
-	// process dead (SeverWritesForTests). Nil outside tests.
+	// process dead (FenceWritesForTests). Nil outside tests.
 	writeSever *writeSever
 
 	// dsn is what db was opened with; tableGens counts the row changes every

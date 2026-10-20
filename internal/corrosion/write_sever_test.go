@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A severed test client commits nothing, by any path — a replicated write, a
@@ -13,7 +14,7 @@ import (
 //
 // Mutation: refuse returns 0 — the severed writes land, and the landed
 // count reports their rows, red.
-func TestSeverWritesForTests_RefusesOnlyTheSeveredClient(t *testing.T) {
+func TestFenceWritesForTests_RefusesOnlyTheSeveredClient(t *testing.T) {
 	ctx := context.Background()
 	suffix := strings.ReplaceAll(t.Name(), "/", "_")
 	a, err := NewSharedTestClient(suffix, "node-a")
@@ -49,7 +50,9 @@ func TestSeverWritesForTests_RefusesOnlyTheSeveredClient(t *testing.T) {
 		return n
 	}
 
-	restore := a.SeverWritesForTests()
+	fence := a.FenceWritesForTests()
+	<-fence.Held()
+	fence.Kill()
 	if _, err := a.DB().ExecContext(ctx, `INSERT INTO sever_probe (k) VALUES ('raw')`); err == nil {
 		t.Error("a raw write on the severed client succeeded")
 	}
@@ -66,7 +69,7 @@ func TestSeverWritesForTests_RefusesOnlyTheSeveredClient(t *testing.T) {
 	if _, err := b.DB().ExecContext(ctx, `INSERT INTO sever_probe (k) VALUES ('other')`); err != nil {
 		t.Errorf("another client's write while a is severed: %v", err)
 	}
-	refused, landed := restore()
+	refused, landed := fence.Lift()
 	if refused < 2 {
 		t.Errorf("the sever refused %d commits, want at least 2", refused)
 	}
@@ -78,5 +81,42 @@ func TestSeverWritesForTests_RefusesOnlyTheSeveredClient(t *testing.T) {
 	}
 	if n := count(); n != 2 {
 		t.Errorf("%d rows, want 2 (the other client's and the one after restore)", n)
+	}
+}
+
+// A call of the client's admitted before the fence runs to its end and the
+// fence is held only then; a later call waits at the client's lock until the
+// kill, and its commit is then refused.
+//
+// Mutation: the fence does not take the client's lock — the later write
+// runs while fenced, before the kill, red.
+func TestFenceWritesForTests_HoldsLaterCallsUntilTheKill(t *testing.T) {
+	ctx := context.Background()
+	c := NewTestClientT(t)
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.DB().ExecContext(ctx, `CREATE TABLE fence_probe (k TEXT PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	fence := c.FenceWritesForTests()
+	select {
+	case <-fence.Held():
+	case <-time.After(10 * time.Second):
+		t.Fatal("the fence did not take an idle client's lock")
+	}
+	ran := make(chan error, 1)
+	go func() { ran <- c.Execute(ctx, `INSERT INTO fence_probe (k) VALUES ('late')`) }()
+	select {
+	case err := <-ran:
+		t.Fatalf("a write on the fenced client ran before the kill (%v)", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	fence.Kill()
+	if err := <-ran; err == nil {
+		t.Error("the held write was not refused once killed")
+	}
+	if _, landed := fence.Lift(); landed != 0 {
+		t.Errorf("%d rows landed", landed)
 	}
 }

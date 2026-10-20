@@ -5,7 +5,6 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
-	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -251,16 +250,18 @@ func verdictOf(deny bool) string {
 // takes: cluster and host rules, ip sets and default policies are global
 // rows every host enforces, so each needs sg.write at the cluster root, as
 // a stack's firewall does (stackFirewallRefusal). Admin and NetworkAdmin
-// hold it; Operator holds sg.read only. With no role bindings the legacy
-// operator role passes. A refusal for a missing grant names the grant.
+// hold it; Operator holds sg.read only. A caller with no role binding of its
+// own falls back to its legacy role, where operator passes. A refusal names
+// the grant that lifts it, unless the caller's token is scoped below the root,
+// which no grant lifts.
 func (s *Server) requireFirewallWrite(ctx context.Context, what string) error {
 	err := s.requireSGWrite(ctx)
 	if err == nil || status.Code(err) != codes.PermissionDenied {
 		return err
 	}
 	msg := status.Convert(err).Message()
-	if !strings.Contains(msg, "lacks") {
-		return status.Errorf(codes.PermissionDenied, "%s needs sg.write at the cluster root: %s", what, msg)
+	if scopes := callerScopePaths(ctx); len(scopes) > 0 && !pathAllowedByScopes("/", scopes) {
+		return status.Errorf(codes.PermissionDenied, "%s needs sg.write at the cluster root, which a token scoped below it cannot hold: %s", what, msg)
 	}
 	return status.Errorf(codes.PermissionDenied,
 		"%s needs sg.write at the cluster root (%s). An administrator can grant it with "+

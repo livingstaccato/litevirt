@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -105,6 +106,14 @@ func TestFirewallRPCs_NeedSGWriteAtTheRoot(t *testing.T) {
 	}
 	if set, _ := corrosion.GetIPSet(ctx, s.db, adminSet.Id); set == nil {
 		t.Error("the Operator removed an ip set")
+	}
+	// A token scoped below the root is refused without a grant to ask for:
+	// none lifts the scope.
+	scoped := context.WithValue(ada, ctxKeyScopePaths, []string{"/projects/x"})
+	_, err = s.SetFirewallDefault(scoped, &pb.SetFirewallDefaultRequest{DefaultDeny: false})
+	wantSGCode(t, "a scoped token's default-deny off", err, codes.PermissionDenied)
+	if strings.Contains(err.Error(), "lv role grant") || !strings.Contains(err.Error(), "scoped below it") {
+		t.Errorf("a scoped token's refusal: %v, want the scope named and no grant", err)
 	}
 	// A NetworkAdmin at the root holds sg.write, and keeps every write.
 	for _, w := range writes {

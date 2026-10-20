@@ -1522,7 +1522,8 @@ where they needed the operator role. An Operator is refused on an upgraded
 host, with the grant that lets it:
 `lv role grant NetworkAdmin <principal> --path / --propagate`. A host still on
 the previous release checks the operator role only until it is upgraded. A
-cluster with no role bindings is unchanged.
+caller with no role binding of its own is unchanged: its legacy operator role
+still passes.
 
 ### A hand-deleted NetBox address is re-created after the roll
 

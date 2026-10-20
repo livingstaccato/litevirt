@@ -1320,8 +1320,9 @@ ip sets and default policies (`lv firewall cluster-rule add/rm`,
 `lv firewall default-deny`, and the same actions in the UI): they are global
 rows every host enforces, as a stack's firewall is. Operator holds only
 `sg.read`, and its refusal names the grant that lets it:
-`lv role grant NetworkAdmin <principal> --path / --propagate`. A cluster with
-no role bindings falls back to the operator role.
+`lv role grant NetworkAdmin <principal> --path / --propagate`. A caller with
+no role binding of its own falls back to its legacy role, where operator
+passes.
 
 | Action | Target | Recorded by |
 |---|---|---|

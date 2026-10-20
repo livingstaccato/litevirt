@@ -228,10 +228,34 @@ type MigrationTLSHost interface {
 // It refuses to mint a NEW migration CA while a host already holds credentials:
 // those came from another machine's CA, and certificates from a second CA would
 // not verify against them.
-func InstallMigrationTLS(ctx context.Context, pkiDir string, hosts []MigrationTLSHost, reissue bool, out io.Writer) error {
+// InstallMigrationTLSVia is InstallMigrationTLS that refuses a rotation in
+// progress before connect reaches any host, so an unreachable host cannot
+// hide the refusal behind its connection error.
+func InstallMigrationTLSVia(ctx context.Context, pkiDir string,
+	connect func(context.Context) ([]MigrationTLSHost, func(), error), reissue bool, out io.Writer) error {
+	if err := rotationInProgressRefusal(pkiDir); err != nil {
+		return err
+	}
+	hosts, closeAll, err := connect(ctx)
+	if err != nil {
+		return err
+	}
+	defer closeAll()
+	return InstallMigrationTLS(ctx, pkiDir, hosts, reissue, out)
+}
+
+// rotationInProgressRefusal refuses provisioning while a rotation runs.
+func rotationInProgressRefusal(pkiDir string) error {
 	if MigrationRotationInProgress(pkiDir) {
 		return fmt.Errorf("a migration-CA rotation is in progress (%s); finish it with "+
 			"`lv host rotate-migration-ca` before provisioning or reissuing", filepath.Join(pkiDir, rotationFileName))
+	}
+	return nil
+}
+
+func InstallMigrationTLS(ctx context.Context, pkiDir string, hosts []MigrationTLSHost, reissue bool, out io.Writer) error {
+	if err := rotationInProgressRefusal(pkiDir); err != nil {
+		return err
 	}
 	provisioned := make(map[string]bool, len(hosts))
 	for _, h := range hosts {

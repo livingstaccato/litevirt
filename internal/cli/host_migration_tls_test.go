@@ -193,3 +193,20 @@ func TestUnreachableMigrationHost_PushFailsWithTheCause(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// Mid-rotation the refusal comes before any host is dialled, so an
+// unreachable host cannot hide it behind its SSH error.
+//
+// Mutation: connect before the rotation check — the SSH error is returned.
+func TestInstallMigrationTLSVia_ChecksTheRotationBeforeConnecting(t *testing.T) {
+	pkiDir := t.TempDir()
+	writeRotation(t, pkiDir, phaseReissue, false)
+	connected := false
+	err := InstallMigrationTLSVia(context.Background(), pkiDir, func(context.Context) ([]MigrationTLSHost, func(), error) {
+		connected = true
+		return nil, nil, errors.New("ssh: dial node-3: no route to host")
+	}, true, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "rotate-migration-ca") || connected {
+		t.Fatalf("err = %v, connected = %v; want the rotation refusal before any host is dialled", err, connected)
+	}
+}

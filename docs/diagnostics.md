@@ -3241,6 +3241,22 @@ on the host that raised the condition; the file is re-read within 30 s. A file
 that cannot be read is never written over: the condition says so, the disks
 stay named from memory, and fixing or removing the file recovers.
 
+### A drain's live move timed out (`drain_move_timed_out`)
+
+`drain_move_timed_out` (evaluator `drain`, subject `host/<host>`, warning)
+names the VMs whose live move off a drained host did not finish within the
+VM's migration policy `timeout-sec` and was aborted. Each keeps running on
+that host; the drain did not shut it down for a cold move. One whose abort
+libvirt did not answer is finished in the background and ends on that host or
+on its target (its drain result says which may happen; `lv events <vm>` shows
+where it ended); one that completes there leaves the condition. The evidence
+lists the VMs (`vms`) and what to do (`detail`). Raise the VM's
+`timeout-sec`, move it with `lv migrate <vm> <target-host>`, or stop it with
+`lv stop <vm>` and run `lv host drain <host>` again. The condition is resolved
+by a drain of the host that has no such move, and by `lv host undrain <host>`;
+a VM whose move is still finishing in the background stays named until it
+ends.
+
 ### A firmware move record cannot be read (`firmware_migration_record_unreadable`)
 
 A live firmware migration keeps its records under `<data_dir>/fwmig-inflight/`

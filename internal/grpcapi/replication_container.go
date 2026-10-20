@@ -629,7 +629,7 @@ func (s *Server) replicateContainer(ctx context.Context, g capabilities.FeatureG
 		return fmt.Errorf("container runtime not wired on this host")
 	}
 
-	unlock := s.lockVM("ct/" + name)
+	unlock := s.lockVMAs("ct/"+name, "container replication")
 	defer unlock()
 	if rec, err = s.placedContainerRow(ctx, project, rec); err != nil {
 		return err

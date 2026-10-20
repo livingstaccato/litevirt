@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -95,6 +97,32 @@ func fwdBearerStreamInterceptor(ctx context.Context, desc *grpc.StreamDesc, cc *
 //
 // grpc.NewClient is lazy and does not connect here; the first RPC dials. The
 // caller owns the returned connection and must Close it.
+// peerServerKeepaliveMinTime is the shortest keepalive ping interval a
+// daemon's peer server permits (PeerServerOptions).
+const peerServerKeepaliveMinTime = time.Minute
+
+// peerKeepalive is how a peer connection detects a peer that stopped
+// answering while a call is open (a wedged-but-alive host, a partition): a
+// ping after Time without traffic, failed after Timeout without an answer.
+// Time exceeds both this build's server MinTime and grpc's default of five
+// minutes, so neither a daemon of this build nor an older one (which sets no
+// policy) ever sends GOAWAY too_many_pings — which would cut a long disk copy
+// mid-way during a rolling upgrade. Pings only while a call is open: an
+// older daemon's default policy rejects them otherwise. A var so a test can
+// shorten it.
+var peerKeepalive = keepalive.ClientParameters{Time: 6 * time.Minute, Timeout: 20 * time.Second}
+
+// PeerServerOptions are the peer server's keepalive settings: it permits the
+// pings PeerDial sends (peerKeepalive), and itself pings a client that went
+// quiet with a call open, so a call from a peer that died does not hold a
+// handler forever.
+func PeerServerOptions() []grpc.ServerOption {
+	return []grpc.ServerOption{
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{MinTime: peerServerKeepaliveMinTime}),
+		grpc.KeepaliveParams(keepalive.ServerParameters{Time: 6 * time.Minute, Timeout: 20 * time.Second}),
+	}
+}
+
 func PeerDial(pkiDir, target string, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
 	tlsCfg, err := PeerTLSConfig(pkiDir)
 	if err != nil {
@@ -113,6 +141,7 @@ func PeerDial(pkiDir, target string, opts ...grpc.DialOption) (*grpc.ClientConn,
 	if fn := traceDialOptions.Load(); fn != nil {
 		dialOpts = append(dialOpts, (*fn)()...)
 	}
+	dialOpts = append(dialOpts, grpc.WithKeepaliveParams(peerKeepalive))
 	dialOpts = append(dialOpts, opts...)
 	dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
 

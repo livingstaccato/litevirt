@@ -94,10 +94,12 @@ func writeDisk(t *testing.T, path string, size uint64) []byte {
 // Sizes match on purpose: with matching sizes drive-mirror raises no error, so
 // before the fix this migration succeeded and overwrote the kept disk.
 //
-// Mutation: let EnsureDisks reuse an existing file again (skip it, as before) —
-// the migration succeeds and the test goes red on migrateCalls.
+// Mutations: let EnsureDisks reuse an existing file again (skip it, as
+// before) — the migration succeeds and the test goes red on migrateCalls. The
+// old wording (<path>.superseded-<time>) — red.
 func TestFleet_StorageMigrationRefusesATargetDiskItDidNotCreate(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c.openClusterPolicyGate()
 	defer c.Stop()
 	src, dst := c.Nodes[0], c.Nodes[1]
 
@@ -112,6 +114,12 @@ func TestFleet_StorageMigrationRefusesATargetDiskItDidNotCreate(t *testing.T) {
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), path) ||
 		!strings.Contains(err.Error(), dst.Name) {
 		t.Fatalf("refusal = %v, want FailedPrecondition naming %s on %s", err, path, dst.Name)
+	}
+	// The way out, exactly: the rename that sets the file aside, and the
+	// command that then lists and keeps it.
+	if !strings.Contains(err.Error(), "`mv "+path+" "+path+".superseded-") ||
+		!strings.Contains(err.Error(), "`lv host superseded-disks "+dst.Name+"`") {
+		t.Fatalf("refusal = %v, want the exact rename of %s and `lv host superseded-disks %s`", err, path, dst.Name)
 	}
 	if n := migrateCalls(src); n != 0 {
 		t.Fatalf("libvirt was asked to migrate %d time(s); the refusal must come before the copy", n)
@@ -136,6 +144,7 @@ func TestFleet_StorageMigrationRefusesATargetDiskItDidNotCreate(t *testing.T) {
 // fake libvirt migration succeeds and the test goes red.
 func TestFleet_StorageMigrationStopsWhenTheTargetCannotPrepareDisks(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c.openClusterPolicyGate()
 	defer c.Stop()
 	src, dst := c.Nodes[0], c.Nodes[1]
 
@@ -166,6 +175,7 @@ func TestFleet_StorageMigrationStopsWhenTheTargetCannotPrepareDisks(t *testing.T
 // with a message that names neither size, and the test goes red.
 func TestFleet_StorageMigrationRefusesADiskThatDisagreesWithItsRecord(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c.openClusterPolicyGate()
 	defer c.Stop()
 	src, dst := c.Nodes[0], c.Nodes[1]
 
@@ -201,6 +211,7 @@ func TestFleet_StorageMigrationRefusesADiskThatDisagreesWithItsRecord(t *testing
 // the stub removal altogether — the stub stays and the test goes red.
 func TestFleet_TargetRemovesOnlyStubsItCreatedWhateverTheSourceAsks(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c.openClusterPolicyGate()
 	defer c.Stop()
 	ctx := context.Background()
 	src, dst := c.Nodes[0], c.Nodes[1]

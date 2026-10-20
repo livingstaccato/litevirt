@@ -217,7 +217,7 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	// lock, and asks which VMs back on its files only by their rows and the
 	// headers of their disk files, neither of which exists for this clone
 	// until it is made. The source is judged again under it.
-	unlockSrc := s.lockVM(req.Source)
+	unlockSrc := s.lockVMAs(req.Source, "clone")
 	defer unlockSrc()
 	if fresh, gErr := corrosion.GetVM(ctx, s.db, req.Source); gErr != nil || fresh == nil {
 		return nil, status.Errorf(codes.NotFound, "source %q not found", req.Source)

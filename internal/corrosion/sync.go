@@ -1412,6 +1412,12 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		}
 	}
 
+	// A watched VM's row may have moved through states this merge skipped
+	// (vm_host_watch.go).
+	if table.Name == "vms" && merged > 0 {
+		c.noteVMRowsSynced(tx)
+	}
+
 	// Test seam: force a chunk rollback AFTER the rows applied but BEFORE commit, so tests can prove a
 	// rolled-back chunk drops its deferred tracker/clear effects (the marker is not mutated for a
 	// change that never committed). Nil in production.

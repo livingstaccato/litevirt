@@ -4,13 +4,20 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/secretfile"
@@ -46,6 +53,12 @@ const (
 	// qemuTLSManagedMarker marks QemuTLSDir as litevirt's to rewrite.
 	qemuTLSManagedMarker = ".litevirt-migration-tls"
 )
+
+// ErrInvalidMigrationCredentials is a migration-credential set this host
+// holds but cannot use: a CA that is not a certificate (or not a file), a host
+// certificate the CA did not issue, a key that is not the certificate's. The
+// fix is to reissue the set (`lv host install-migration-tls --reissue`).
+var ErrInvalidMigrationCredentials = errors.New("migration-TLS credentials are unusable")
 
 // MigrationDir is the host's migration-credential directory under pkiDir.
 func MigrationDir(pkiDir string) string { return filepath.Join(pkiDir, MigrationDirName) }
@@ -90,6 +103,46 @@ func GenerateMigrationCA(certPath, keyPath string) error {
 	return writePEM(keyPath, "EC PRIVATE KEY", keyDER)
 }
 
+// MigrationCAFingerprint is the SHA-256 fingerprint (hex) of the migration
+// CA file in this host's credential set under pkiDir: the CAs its QEMU trusts,
+// one of which issued its migration certificate. One distinct CA gives its
+// DER's SHA-256; a bundle gives one value for the set of its CAs (see below).
+// "" with no error when the host has no migration credentials.
+func MigrationCAFingerprint(pkiDir string) (string, error) {
+	path := filepath.Join(MigrationDir(pkiDir), MigrationCAName)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read migration CA: %w", err)
+	}
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return "", fmt.Errorf("%s holds no PEM certificate", path)
+	}
+	certs, err := parsePEMCertificates(data)
+	if err != nil {
+		return "", fmt.Errorf("%s: %v", path, err)
+	}
+	// One CA: its DER's SHA-256, as every build computes it. A bundle (an old
+	// and a new CA during a rotation): the SHA-256 of its distinct CAs' sorted
+	// fingerprints, so the same CAs compare equal in any order and however
+	// often one is listed.
+	sums := make([]string, 0, len(certs))
+	for _, c := range certs {
+		sum := sha256.Sum256(c.Raw)
+		sums = append(sums, hex.EncodeToString(sum[:]))
+	}
+	sort.Strings(sums)
+	sums = slices.Compact(sums)
+	if len(sums) == 1 {
+		return sums[0], nil
+	}
+	sum := sha256.Sum256([]byte(strings.Join(sums, "\n")))
+	return hex.EncodeToString(sum[:]), nil
+}
+
 // InstallQemuMigrationTLS copies this host's migration credentials from
 // pkiDir/migration into qemuDir under the names libvirt reads for migration TLS.
 // The keys are written 0400 and, when keyUID >= 0, owned by keyUID:keyGID (the
@@ -111,9 +164,17 @@ func InstallQemuMigrationTLS(pkiDir, qemuDir string, keyUID, keyGID int) (bool, 
 			return false, nil
 		}
 		if err != nil {
-			return false, fmt.Errorf("read migration credential %s: %w", f.name, err)
+			// A directory where the file should be, or a file that cannot be
+			// read: the set is there and unusable, which reissuing fixes.
+			return false, fmt.Errorf("%w: read migration credential %s: %v", ErrInvalidMigrationCredentials, f.name, err)
 		}
 		*f.dst = data
+	}
+	// QEMU parses these only when a migration opens its TLS channel, so a set
+	// it cannot use failed mid-copy with a generic error. Check it here, before
+	// anything is written, and report the host not ready.
+	if err := validateMigrationCredentials(ca, cert, key); err != nil {
+		return false, err
 	}
 
 	if err := claimQemuTLSDir(qemuDir); err != nil {
@@ -144,6 +205,89 @@ func InstallQemuMigrationTLS(pkiDir, qemuDir string, keyUID, keyGID int) (bool, 
 		}
 	}
 	return true, nil
+}
+
+// validateMigrationCredentials checks a migration-credential set the way QEMU
+// will use it: the CA is a CA certificate, the host certificate was issued by
+// it, and the key is the certificate's. Any failure is
+// ErrInvalidMigrationCredentials.
+func validateMigrationCredentials(caPEM, certPEM, keyPEM []byte) error {
+	cas, err := parsePEMCertificates(caPEM)
+	if err != nil {
+		return fmt.Errorf("%w: %s: %v", ErrInvalidMigrationCredentials, MigrationCAName, err)
+	}
+	for _, ca := range cas {
+		if !ca.IsCA {
+			return fmt.Errorf("%w: %s holds a certificate that is not a CA (%s)", ErrInvalidMigrationCredentials, MigrationCAName, ca.Subject)
+		}
+	}
+	cert, err := parsePEMCertificate(certPEM)
+	if err != nil {
+		return fmt.Errorf("%w: %s: %v", ErrInvalidMigrationCredentials, MigrationHostCertName, err)
+	}
+	// Any CA of the bundle (an old and a new one during a rotation).
+	var issuer *x509.Certificate
+	var sigErr error
+	for _, ca := range cas {
+		if sigErr = cert.CheckSignatureFrom(ca); sigErr == nil {
+			issuer = ca
+			break
+		}
+	}
+	if issuer == nil {
+		return fmt.Errorf("%w: %s was not issued by a migration CA in %s: %v",
+			ErrInvalidMigrationCredentials, MigrationHostCertName, MigrationCAName, sigErr)
+	}
+	now := time.Now()
+	for _, c := range []struct {
+		name string
+		cert *x509.Certificate
+	}{{MigrationHostCertName, cert}, {MigrationCAName, issuer}} {
+		if now.Before(c.cert.NotBefore) {
+			return fmt.Errorf("%w: %s is not valid until %s", ErrInvalidMigrationCredentials, c.name, c.cert.NotBefore.UTC().Format(time.RFC3339))
+		}
+		if now.After(c.cert.NotAfter) {
+			return fmt.Errorf("%w: %s expired at %s", ErrInvalidMigrationCredentials, c.name, c.cert.NotAfter.UTC().Format(time.RFC3339))
+		}
+	}
+	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+		return fmt.Errorf("%w: %s does not match %s: %v", ErrInvalidMigrationCredentials, MigrationHostKeyName, MigrationHostCertName, err)
+	}
+	return nil
+}
+
+// parsePEMCertificates parses every PEM CERTIFICATE block of data; there must
+// be at least one, and nothing else.
+func parsePEMCertificates(data []byte) ([]*x509.Certificate, error) {
+	var out []*x509.Certificate
+	for {
+		var block *pem.Block
+		block, data = pem.Decode(data)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			return nil, fmt.Errorf("holds a %s block, not a certificate", block.Type)
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	if len(out) == 0 {
+		return nil, errors.New("holds no PEM certificate")
+	}
+	return out, nil
+}
+
+// parsePEMCertificate parses the first PEM CERTIFICATE block of data.
+func parsePEMCertificate(data []byte) (*x509.Certificate, error) {
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, errors.New("holds no PEM certificate")
+	}
+	return x509.ParseCertificate(block.Bytes)
 }
 
 // claimQemuTLSDir makes qemuDir litevirt's: creates it if absent, accepts it if

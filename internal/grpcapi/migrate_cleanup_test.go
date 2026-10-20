@@ -14,6 +14,7 @@ import (
 // data dir such as state.db.
 func TestCleanupMigrationArtifacts_RefusesStateDB(t *testing.T) {
 	s := testServer(t)
+	s.db.SetClusterPolicyGate(func() bool { return true }) // failover_scope_v1 latched: stub records are kept
 	s.dataDir = t.TempDir()
 	ctx := adminCtx()
 	// The VM runs on another host and this one is its migration target.

@@ -117,7 +117,7 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 		defer lease.release(ctx)
 	}
 
-	unlock := s.lockVM("ct/" + req.Name)
+	unlock := s.lockVMAs("ct/"+req.Name, "container migration")
 	defer unlock()
 
 	// Resolve+authorize the repo on the source; forward the ORIGINAL req.RepoPath

@@ -262,7 +262,7 @@ func (s *Server) AttachDevice(ctx context.Context, req *pb.AttachDeviceRequest) 
 	// Taken HERE rather than inside attachPCIDevice/detachPCIDevice so the
 	// operation barrier and running-state checks below are read under it too;
 	// unlocked, those are a read-then-act both callers pass.
-	unlock := s.lockVM(req.VmName)
+	unlock := s.lockVMAs(req.VmName, "device attach")
 	defer unlock()
 
 	// RE-READ under the lock. Taking the lock and then testing the row fetched
@@ -370,7 +370,7 @@ func (s *Server) DetachDevice(ctx context.Context, req *pb.DetachDeviceRequest) 
 	// Taken HERE rather than inside attachPCIDevice/detachPCIDevice so the
 	// operation barrier and running-state checks below are read under it too;
 	// unlocked, those are a read-then-act both callers pass.
-	unlock := s.lockVM(req.VmName)
+	unlock := s.lockVMAs(req.VmName, "device detach")
 	defer unlock()
 
 	// RE-READ under the lock — see AttachDevice for why testing the pre-lock

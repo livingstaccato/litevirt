@@ -150,6 +150,8 @@ func printSupersededDisks(out io.Writer, resp *pb.SupersededDisksResponse, purge
 		vm := d.VmName
 		if vm == "" {
 			vm = "-"
+		} else if d.VmState == "deleted" && !d.Kept {
+			vm += " (deleted)"
 		}
 		age := d.SetAsideAt
 		if at, err := time.Parse(time.RFC3339, d.SetAsideAt); err == nil {

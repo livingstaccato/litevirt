@@ -80,7 +80,7 @@ func (s *Server) runVMReplication(ctx context.Context, sched corrosion.BackupSch
 	// before the other disks: each of those takes it only for its brief
 	// point-in-time step (replica_set.go).
 	var unlockOnce sync.Once
-	vmUnlock := s.lockVM(sched.VMName)
+	vmUnlock := s.lockVMAs(sched.VMName, "replication")
 	unlock := func() { unlockOnce.Do(vmUnlock) }
 	defer unlock()
 	if err := s.firmwareMoveSkip("scheduled replication", vm); err != nil {
@@ -212,7 +212,7 @@ func (s *Server) runVMReplication(ctx context.Context, sched corrosion.BackupSch
 	// replica set a promotion recovers whole (replica_set.go).
 	unlock()
 	return s.replicateOtherDisks(ctx, sched, vm, replicaSetOthers(disks, src), targetHost, ts, allowForceShare,
-		func() func() { return s.lockVM(sched.VMName) })
+		func() func() { return s.lockVMAs(sched.VMName, "replication") })
 }
 
 // replicateLocal writes the replica into a file-based pool on this host (the

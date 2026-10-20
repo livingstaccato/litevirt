@@ -2250,3 +2250,33 @@ During the roll, a host on the previous build can still retire a re-created
 project's admission authority, and anti-entropy spreads that to upgraded hosts.
 It recovers when the next admission claims a fresh authority epoch, and it
 heals once every host runs this release.
+
+### Migration-TLS credentials checked on every host
+
+A host of this build checks its migration-TLS credentials before it reports
+itself ready for an encrypted storage copy: a CA file that is not a set of
+certificates (or not a file), a host certificate none of them issued, a key
+that is not the certificate's, or a certificate outside its validity is
+unusable. Such a host installs nothing for QEMU and is not ready.
+
+During the roll a source on an older build reads only "ready" or "not
+ready". With `migration.allow_unencrypted_storage: true` it would send a
+storage copy in plaintext to a host that is not ready. So a host of this
+build whose own credentials are unusable refuses a storage copy that asks for
+TLS, naming the fix (`lv host install-migration-tls --reissue`): the older
+source fails closed instead. A host that simply has no credentials answers
+"not ready" as before, and the older source's opt-in applies, as it always
+did.
+
+The migration CA a host reports is a fingerprint of its CA file's
+certificates as a set. For a single CA it is the value every build computes.
+For a rotation bundle (two CAs) a host of this build and one of an older build
+compute different values, so a storage copy between them is refused as
+holding different migration CAs until both run this build. A memory-only move
+between them is not refused: it stays in libvirt's tunnel instead of using
+QEMU's TLS stream, and so does not use the migration network. Finishing the
+upgrade restores both.
+
+Peer connections of this build send gRPC keepalive pings while a call is
+open, every 6 minutes. That is longer than any daemon permits by default (5
+minutes), so a daemon on an older build never rejects them.

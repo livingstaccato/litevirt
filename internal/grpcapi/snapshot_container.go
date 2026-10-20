@@ -96,7 +96,7 @@ func (s *Server) SnapshotContainer(ctx context.Context, req *pb.SnapshotContaine
 		return nil, status.Errorf(codes.AlreadyExists, "snapshot %q already exists for container %q", req.Snapshot, req.Name)
 	}
 
-	unlock := s.lockVM("ct/" + req.Name)
+	unlock := s.lockVMAs("ct/"+req.Name, "container snapshot")
 	defer unlock()
 
 	path := ctSnapshotPath(s.dataDir, req.Name, req.Snapshot)
@@ -264,7 +264,7 @@ func (s *Server) RevertContainerSnapshot(ctx context.Context, req *pb.RevertCont
 		return nil, err
 	}
 
-	unlock := s.lockVM("ct/" + req.Name)
+	unlock := s.lockVMAs("ct/"+req.Name, "container snapshot revert")
 	defer unlock()
 
 	makeSnapshotPrivate(s.dataDir, req.Name, snap.Path)

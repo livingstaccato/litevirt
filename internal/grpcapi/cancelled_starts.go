@@ -469,7 +469,7 @@ func (s *Server) judgeCancelledStart(ctx context.Context, r cancelledStartRecord
 			// Before hardware_v2, a stop releases the VM's legacy PCI claims
 			// (stopVMLockedNote); the start's, held while its outcome was
 			// unknown, are let go here, under the VM lock.
-			unlock, ok := s.tryLockVM(r.VM)
+			unlock, ok := s.tryLockVMAs(r.VM, "cancelled-start check")
 			if !ok {
 				return // a lifecycle call holds the VM: the next pass
 			}
@@ -506,7 +506,7 @@ func (s *Server) judgeCancelledStart(ctx context.Context, r cancelledStartRecord
 	}
 	// The domain runs: the start it cancelled has completed.
 	s.markCancelledStartRan(r)
-	unlock, ok := s.tryLockVM(r.VM)
+	unlock, ok := s.tryLockVMAs(r.VM, "cancelled-start check")
 	if !ok {
 		return // a lifecycle call holds the VM: the next pass
 	}
@@ -587,7 +587,7 @@ func (s *Server) undoCancelledStartLocked(ctx context.Context, r cancelledStartR
 				slog.Warn("StopVM: the destroy of a cancelled start's domain failed late; a later pass looks again", "vm", row.Name, "error", call.err)
 				return
 			}
-			unlock := s.lockVM(row.Name)
+			unlock := s.lockVMAs(row.Name, "cancelled-start undo")
 			defer unlock()
 			destroyed()
 			s.dropCancelledStartIf(r.VM, r.Created)

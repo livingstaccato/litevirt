@@ -77,7 +77,11 @@ or superseded operation can't clear a newer one). Requires --force.
 With --operation <id>, the abort is refused unless <id> is the VM's active
 operation, so an operation that finished, or was followed by another, between
 lv operation show and the abort is never the one cleared. A daemon too old to
-honour --operation is refused before anything is sent.`,
+honour --operation is refused before anything is sent.
+
+Without --operation it also cancels a drain's move of the VM in flight on the
+VM's host, which then rolls back (the VM started again where it was, if the
+move had shut it down).`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !force {
@@ -102,6 +106,10 @@ honour --operation is refused before anything is sent.`,
 				}
 				if !resp.Aborted {
 					fmt.Printf("not aborted: %s\n", resp.Detail)
+					return nil
+				}
+				if resp.PreviousOperationId == "" && resp.Detail != "" {
+					fmt.Printf("%s: %s\n", args[0], resp.Detail)
 					return nil
 				}
 				fmt.Printf("aborted operation %s on %s\n", resp.PreviousOperationId, args[0])

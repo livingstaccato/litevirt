@@ -346,7 +346,7 @@ func (s *Server) attachDiskEntry(ctx context.Context, req *pb.AttachDeviceReques
 // claim proceeds to BeginVMOperation + the attach DAG. This closes the
 // two-entries-both-forward race the VM lock alone cannot.
 func (s *Server) attachDiskOwner(ctx context.Context, req *pb.AttachDeviceRequest, vmName, opID, reqHash, idemKey string) (*pb.VM, error) {
-	unlock := s.lockVM(vmName)
+	unlock := s.lockVMAs(vmName, "disk attach")
 	defer unlock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)
@@ -870,7 +870,7 @@ func (s *Server) detachDiskEntry(ctx context.Context, req *pb.DetachDeviceReques
 
 // detachDiskOwner is the at-most-once owner path for a disk detach.
 func (s *Server) detachDiskOwner(ctx context.Context, req *pb.DetachDeviceRequest, vmName, opID, reqHash, idemKey string) (*pb.VM, error) {
-	unlock := s.lockVM(vmName)
+	unlock := s.lockVMAs(vmName, "disk detach")
 	defer unlock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)

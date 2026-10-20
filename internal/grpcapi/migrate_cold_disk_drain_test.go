@@ -121,7 +121,7 @@ func TestReceiveMigrationDisk_CheckOnlyWritesNothing(t *testing.T) {
 	if left := scratchLeft(t, filepath.Dir(f.path)); len(left) > 0 {
 		t.Errorf("a check-only call left scratch files: %v", left)
 	}
-	if f.dst.migrationStubs.owns("os1", f.path) {
+	if f.dst.madeHere(context.Background(), &f.dst.migrationStubs, "os1", f.path) {
 		t.Error("a check-only call recorded a copy")
 	}
 	if _, err := os.Stat(filepath.Dir(f.path)); !os.IsNotExist(err) {

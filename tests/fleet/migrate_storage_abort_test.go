@@ -63,6 +63,7 @@ func newStorageAbort(t *testing.T, policy *pb.MigrationPolicy, targetISO string)
 	// the ISO, so the stand-in's empty file is all it needs.
 	stageFakeGenisoimage(t)
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c.openClusterPolicyGate()
 	t.Cleanup(c.Stop)
 	f := &storageAbort{c: c, src: c.Nodes[0], dst: c.Nodes[1]}
 	f.stub = filepath.Join(c.tmpRoot, f.dst.Name, "data", "disks", "pp1-root.qcow2")

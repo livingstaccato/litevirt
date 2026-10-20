@@ -26,6 +26,10 @@ import (
 // and is exercised separately in production builds.
 func TestMain(m *testing.M) {
 	auth.BcryptCost = bcrypt.MinCost
+	// Most fixtures call the migration helpers as a peer the VM's row does
+	// not name as its owner; recording a stub would wait out the replica
+	// catch-up for each. The tests of that wait set it themselves.
+	moveCatchUp = 0
 	// Test disks live in temporary directories, which may be a tmpfs; a
 	// layer-2 overlay is refused there in production (pitoverlay.Placement).
 	pitoverlay.AllowVolatileForTest()

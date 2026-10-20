@@ -1622,6 +1622,8 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 			"origin", entry.Origin, "seq", entry.Seq, "error", err)
 		return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
 	}
+	// The VM rows this entry left, for a local observer (vm_host_watch.go).
+	r.client.noteVMHostsInTx(ctx, tx, applied)
 
 	return nil
 }

@@ -457,6 +457,8 @@ type Client struct {
 	// failover_scope_v1 latch. Fails CLOSED when unset: the table's shapes
 	// back-pressure a previous-release peer. See cluster_policy.go.
 	clusterPolicyGate atomic.Pointer[func() bool]
+	// vmHostWatch observes the VM rows replication applies (vm_host_watch.go).
+	vmHostWatch atomic.Pointer[vmHostWatch]
 	// relayHealthGate, when non-nil and returning true, permits writing the
 	// relay_demoted/<host> rows of cluster_policies. Injected via
 	// SetRelayHealthGate, wired to the durable relay_health_v1 latch. Fails

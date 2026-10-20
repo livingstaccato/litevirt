@@ -33505,6 +33505,20 @@ type EnsureDisksResponse struct {
 	// migration_tls_ready: the target has migration-TLS credentials installed
 	// for QEMU, so the copy can be encrypted. An older target never sets it,
 	// which reads as "not ready" and falls back to the plaintext guard.
+	//
+	// A target that sets it also sends the gRPC response header
+	// x-litevirt-migration-ca-sha256: the lowercase hex SHA-256 of the DER of
+	// the migration CA its credentials chain to (pki_dir/migration/ca.crt).
+	// The source compares it with its own: a storage copy is refused on a
+	// mismatch, and a memory-only move stays in libvirt's tunnel. A target
+	// that sends no header (an older build, or no CA it can read) is not
+	// compared.
+	//
+	// A target that is not ready because the credentials it holds are
+	// unusable (a CA that is not a certificate or not a file, a host
+	// certificate the CA did not issue) sends the gRPC response header
+	// x-litevirt-migration-tls-unusable with why. The source then refuses a
+	// storage copy before it starts, naming the target and the fix.
 	MigrationTlsReady bool `protobuf:"varint,2,opt,name=migration_tls_ready,json=migrationTlsReady,proto3" json:"migration_tls_ready,omitempty"`
 	// installer_iso_warning: a stopped VM's move was accepted although this
 	// host cannot attach its installer ISO yet (no such library or file here);

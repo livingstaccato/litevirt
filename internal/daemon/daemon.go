@@ -1255,6 +1255,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetMigrationAddress(d.cfg.Migration.Address)
 	migrationTLS := d.migrationTLSInstaller()
 	svc.SetMigrationTLS(migrationTLS)
+	svc.SetMigrationCAFingerprint(func() (string, error) { return pki.MigrationCAFingerprint(d.cfg.PKIDir) })
 	// Install once at start so the operator sees the state in the log; it runs
 	// again before each storage migration.
 	if ok, err := migrationTLS(); err != nil {
@@ -2199,6 +2200,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// (migrate/failover/replicate) continues the caller's trace. Empty when off —
 	// no otel in the serve path unless an OTLP endpoint is configured.
 	grpcOpts = append(grpcOpts, obs.ServerOptions()...)
+	// Keepalive: permit the pings peers send (pki.PeerDial), and detect a
+	// client that died with a call open.
+	grpcOpts = append(grpcOpts, pki.PeerServerOptions()...)
 	d.grpcSrv = grpc.NewServer(grpcOpts...)
 
 	// Every setter has run: the firmware moves locked at the journal barrier

@@ -633,7 +633,7 @@ func (s *Server) removeDiscardedStubs(ctx context.Context, vmName string, stubs 
 		return
 	}
 	for _, p := range stubs {
-		if p == "" || !s.withinDiskArtifactRoot(p) || !s.migrationStubs.owns(vmName, p) {
+		if p == "" || !s.withinDiskArtifactRoot(p) || !s.madeHere(ctx, &s.migrationStubs, vmName, p) {
 			slog.Warn("live firmware move: discard leaves a disk file this host did not record making as a stub",
 				"vm", vmName, "path", p)
 			continue

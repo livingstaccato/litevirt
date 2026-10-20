@@ -8,8 +8,13 @@ import golibvirt "github.com/digitalocean/go-libvirt"
 // before libvirt is reached. libvirtfake models a migration with it, so the
 // fake answers from the flags a host would send.
 func MigrationOutcome(p MigrateParams) (paused, undefineSource bool, err error) {
-	flags, _, err := migrationFlagsAndParams(p)
+	flags, params, err := migrationFlagsAndParams(p)
 	if err != nil {
+		return false, false, err
+	}
+	// libvirtd decodes the typed parameters before anything else: one it
+	// cannot decode fails the call.
+	if err := checkTypedParams(params); err != nil {
 		return false, false, err
 	}
 	return flags&golibvirt.MigratePaused != 0, flags&golibvirt.MigrateUndefineSource != 0, nil

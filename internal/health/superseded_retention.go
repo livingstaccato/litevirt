@@ -68,6 +68,10 @@ func supersededName(path string, at time.Time) string {
 	return path + supersededInfix + at.UTC().Format(supersededTimeLayout)
 }
 
+// SupersededName is where an operator moves the file at path aside, now, so
+// that `lv host superseded-disks` lists and keeps it.
+func SupersededName(path string, now time.Time) string { return supersededName(path, now) }
+
 // parseSupersededName splits a set-aside copy's name into the disk path it
 // came from and when; ok=false for any other name.
 func parseSupersededName(name string) (diskPath string, at time.Time, ok bool) {
@@ -94,6 +98,9 @@ type SupersededCopy struct {
 	// Retained says why the sweep and a bare purge keep it whatever its age:
 	// its VM still exists. "" when nothing retains it.
 	Retained string
+	// DeletedVM is the deleted VM whose disk it was set aside from, when no
+	// VM has a disk at that path now; "" otherwise. Never a VM to restore to.
+	DeletedVM string
 }
 
 // supersededHoldStates are the VM states that hold a copy: a failover start
@@ -104,10 +111,13 @@ var supersededHoldStates = map[string]bool{"error": true, "pending": true, "star
 // supersededDirs is where set-aside copies can be: next to every host-local
 // disk path recorded anywhere (the same path names a file on every host), and
 // the image store's disk directory, which holds the disks of deleted VMs too.
+// A directory only a deleted VM's disks used (a pool directory, say) is
+// scanned too: a copy there is a deleted VM's like any other, listed and
+// swept by the same retention (lab2-drain anomaly 7).
 func supersededDirs(ctx context.Context, db *corrosion.Client, dataDir string) ([]string, error) {
 	seen := map[string]bool{filepath.Join(dataDir, "disks"): true}
 	rows, err := db.Query(ctx, `SELECT DISTINCT path FROM vm_disks
-		WHERE deleted_at IS NULL AND path != '' AND storage_type IN ('', 'local', 'dir')`)
+		WHERE path != '' AND storage_type IN ('', 'local', 'dir')`)
 	if err != nil {
 		return nil, err
 	}
@@ -120,6 +130,17 @@ func supersededDirs(ctx context.Context, db *corrosion.Client, dataDir string) (
 	}
 	sort.Strings(dirs)
 	return dirs, nil
+}
+
+// deletedVMOfPath is the VM a deleted disk row at path belonged to, "" when
+// none does.
+func deletedVMOfPath(ctx context.Context, db *corrosion.Client, path string) (string, error) {
+	rows, err := db.Query(ctx, `SELECT vm_name FROM vm_disks WHERE path = ? AND deleted_at IS NOT NULL
+		ORDER BY deleted_at DESC LIMIT 1`, path)
+	if err != nil || len(rows) == 0 {
+		return "", err
+	}
+	return rows[0].String("vm_name"), nil
 }
 
 // ListSupersededDisks lists the set-aside disk copies on this host, oldest
@@ -219,6 +240,14 @@ func listSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir stri
 			}
 			if c.VM != "" {
 				c.Retained = fmt.Sprintf("VM %s exists; only an operator removes this copy", c.VM)
+			} else {
+				// Its VM was deleted: shown as such, and swept by the
+				// retention.
+				gone, err := deletedVMOfPath(ctx, db, diskPath)
+				if err != nil {
+					return nil, nil, fmt.Errorf("read the deleted disks at %s: %w", diskPath, err)
+				}
+				c.DeletedVM = gone
 			}
 			out = append(out, c)
 		}

@@ -39,7 +39,7 @@ func (s *Server) AttestSharedDiskUnused(ctx context.Context, req *pb.AttestShare
 	}
 	// The VM's lock first, then the start lock: the order startVMLocked takes
 	// them in (review m3).
-	unlock := s.lockVM(req.GetVmName())
+	unlock := s.lockVMAs(req.GetVmName(), "shared-disk attestation")
 	defer unlock()
 	release := health.LockSharedDiskStarts()
 	defer release()

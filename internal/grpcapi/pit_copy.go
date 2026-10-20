@@ -1065,7 +1065,7 @@ func (s *Server) pitSweepReady(ctx context.Context, caughtUp func() (bool, strin
 // It reports whether a disk of the VM was passed over because its storage
 // did not answer: the sweep then tries the VM again later.
 func (s *Server) sweepPITOverlaysOf(ctx context.Context, name string) (passedOver bool) {
-	unlock := s.lockVM(name)
+	unlock := s.lockVMAs(name, "point-in-time overlay sweep")
 	defer unlock()
 	vm, err := corrosion.GetVM(ctx, s.db, name)
 	if err != nil || vm == nil || vm.HostName != s.hostName {

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
 
 	"google.golang.org/grpc"
@@ -362,6 +363,34 @@ type Server struct {
 	// (internal/pki InstallQemuMigrationTLS) and reports whether they are in
 	// place. nil means never: a storage copy then falls to the plaintext guard.
 	migrationTLS func() (bool, error)
+	// migrationCAFingerprint reports the SHA-256 fingerprint of the migration
+	// CA this host's migration-TLS credentials chain to ("" when it has
+	// none). nil means unknown, and no comparison is made.
+	migrationCAFingerprint func() (string, error)
+	// drainAbortGrace bounds how long a drain waits for libvirt to answer the
+	// abort of a timed-out live move before handing the move to a background
+	// owner (drainLiveMigrate). Zero means defaultDrainAbortGrace.
+	drainAbortGrace time.Duration
+	// drainCondMu serialises the judging of drain_move_timed_out with a
+	// background move's leaving it (judgeDrainTimeouts, forgetDrainTimeout).
+	drainCondMu sync.Mutex
+	// drainCommitFault, set only by tests (SetDrainCommitFaultForTest), makes
+	// a drain's ownership commit after a live cut-over fail. nil in
+	// production, where it is never consulted for anything else.
+	drainCommitFault func(vm string) error
+	// coldDiskStall overrides the cold disk copy's stall bound (tests).
+	coldDiskStall time.Duration
+	// coldDiskSyncEvery and coldDiskSyncHook override the receive's sync
+	// interval and observe its syncs (tests).
+	coldDiskSyncEvery int64
+	coldDiskSyncHook  func(final bool)
+	// coldDiskPlacedHook runs after a receive places its disk (tests).
+	coldDiskPlacedHook func()
+	// drainMoves cancels each VM's drain move in flight (drainOneVM), for
+	// `lv operation abort <vm> --force` (AbortVMOperation). Guarded by
+	// drainMovesMu.
+	drainMovesMu sync.Mutex
+	drainMoves   map[string]context.CancelFunc
 	// migrationNetwork is migration.network: the IPv4 CIDR a migration's data
 	// should travel on (migration_network.go). Empty means the host's cluster
 	// address. localIPs is a test seam for the host's own addresses.
@@ -993,6 +1022,9 @@ type Server struct {
 
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
+	// vmLockHolders records who holds each held VM lock (vmLocksMu), so a
+	// drain that gives up on one can name it.
+	vmLockHolders map[string]vmLockHolder
 	// createFlights holds each create this host runs as the VM's owner until
 	// it returns: a second create of the name is refused while one is in
 	// flight (create_inflight.go).
@@ -1964,6 +1996,41 @@ func (s *Server) SetAllowUnencryptedStorageMigration(on bool) { s.allowPlaintext
 // source before a storage copy and on the target in EnsureDisks.
 func (s *Server) SetMigrationTLS(fn func() (bool, error)) { s.migrationTLS = fn }
 
+// SetMigrationCAFingerprint sets the hook that reports the fingerprint of the
+// migration CA this host's migration-TLS credentials chain to. A storage
+// copy's readiness check compares the source's with the target's.
+func (s *Server) SetMigrationCAFingerprint(fn func() (string, error)) { s.migrationCAFingerprint = fn }
+
+// SetDrainAbortGraceForTest shortens how long a drain waits for libvirt to
+// answer the abort of a timed-out live move.
+func (s *Server) SetDrainAbortGraceForTest(d time.Duration) { s.drainAbortGrace = d }
+
+// SetDrainCommitFaultForTest makes the ownership commit a drain writes after
+// a completed live move fail with fn's error (nil fn: no fault). Outside a
+// test binary it panics, and the drain never consults the fault there.
+func (s *Server) SetDrainCommitFaultForTest(fn func(vm string) error) {
+	if !testing.Testing() {
+		panic("grpcapi.SetDrainCommitFaultForTest called outside a test")
+	}
+	s.drainCommitFault = fn
+}
+
+// localMigrationCA is this host's migration CA fingerprint, "" when it has
+// none (or no hook is set). An error is a CA file that cannot be read: the
+// source then fails closed (a storage copy is refused, a memory-only move
+// stays in libvirt's tunnel), and a target sends no fingerprint.
+func (s *Server) localMigrationCA() (string, error) {
+	if s.migrationCAFingerprint == nil {
+		return "", nil
+	}
+	fp, err := s.migrationCAFingerprint()
+	if err != nil {
+		slog.Warn("cannot read this host's migration CA", "error", err)
+		return "", err
+	}
+	return fp, nil
+}
+
 // AnswerEnsureDisksAsAnOlderTargetForTest makes this host's EnsureDisks return
 // no installer_iso_resolved, as a target on main does.
 func (s *Server) AnswerEnsureDisksAsAnOlderTargetForTest(v bool) { s.isoResolvedWithheld = v }
@@ -1972,16 +2039,24 @@ func (s *Server) AnswerEnsureDisksAsAnOlderTargetForTest(v bool) { s.isoResolved
 // returned, because the caller decides between refusing and the plaintext
 // fallback.
 func (s *Server) migrationTLSReady() bool {
+	ok, _ := s.migrationTLSState()
+	return ok
+}
+
+// migrationTLSState is migrationTLSReady with the reason it is not ready: nil
+// for a host with no credentials, pki.ErrInvalidMigrationCredentials for one
+// whose credentials are unusable (logged).
+func (s *Server) migrationTLSState() (bool, error) {
 	if s.migrationTLS == nil {
-		return false
+		return false, nil
 	}
 	ok, err := s.migrationTLS()
 	if err != nil {
 		slog.Warn("migration TLS is not available on this host; storage migrations "+
 			"from or to it cannot be encrypted", "error", err)
-		return false
+		return false, err
 	}
-	return ok
+	return ok, nil
 }
 
 // SetCanonicalIdentityEnforce sets this node's kill-switch for natural-key identity
@@ -2684,6 +2759,7 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 	s.wireConsolePasswordPolicy()
 	if db != nil {
 		db.SetStartedProofCheck(s.operatorStartRecorded)
+		s.wireMoveRecordWatch()
 	}
 	return s
 }
@@ -2829,7 +2905,9 @@ func (s *Server) SetContainerRuntime(r ContainerRuntime) { s.containerRuntime = 
 // hold (create, start, stop, delete), and returns its unlock. The container
 // checker tries it too (TryLockContainer), so its
 // reconcile never interleaves with an operation on the same container.
-func (s *Server) LockContainer(name string) func() { return s.lockVM("ct/" + name) }
+func (s *Server) LockContainer(name string) func() {
+	return s.lockVMAs("ct/"+name, "container operation")
+}
 
 // SetCapacityPolicy wires the cluster-wide capacity policy (overcommit ratios and
 // host reserves) used by admission and placement.
@@ -2848,7 +2926,15 @@ func (s *Server) SetWebAuthnService(w *auth.WebAuthnService) { s.webauthn = w }
 // lockVM acquires a per-VM mutex. Returns an unlock function. Lazily
 // initialises the map so test servers built without NewServer don't
 // panic on first lock.
-func (s *Server) lockVM(vmName string) func() {
+func (s *Server) lockVM(vmName string) func() { return s.lockVMAs(vmName, defaultVMLockOwner) }
+
+// defaultVMLockOwner names a lock taken by a site that does not name itself.
+const defaultVMLockOwner = "an operation"
+
+// lockVMAs is lockVM for an operation that names itself (owner, in operator
+// words: "backup", "scheduled snapshot"), so a drain that gives up on the
+// lock can say what holds it.
+func (s *Server) lockVMAs(vmName, owner string) func() {
 	s.vmLocksMu.Lock()
 	if s.vmLocks == nil {
 		s.vmLocks = map[string]*sync.Mutex{}
@@ -2860,20 +2946,69 @@ func (s *Server) lockVM(vmName string) func() {
 	}
 	s.vmLocksMu.Unlock()
 	mu.Lock()
-	return mu.Unlock
+	return s.holdVMLock(vmName, mu, owner)
+}
+
+// vmLockHolder is who holds a VM's lock, and since when.
+type vmLockHolder struct {
+	who   string
+	since time.Time
+}
+
+// holdVMLock records the caller that just took vmName's lock (mu) and returns
+// the unlock, which forgets it.
+func (s *Server) holdVMLock(vmName string, mu *sync.Mutex, owner string) func() {
+	s.setVMLockHolder(vmName, owner)
+	return func() {
+		s.vmLocksMu.Lock()
+		delete(s.vmLockHolders, vmName)
+		s.vmLocksMu.Unlock()
+		mu.Unlock()
+	}
+}
+
+// vmLockHolderOf is who holds vmName's lock, when it is recorded.
+func (s *Server) vmLockHolderOf(vmName string) (vmLockHolder, bool) {
+	s.vmLocksMu.Lock()
+	defer s.vmLocksMu.Unlock()
+	h, ok := s.vmLockHolders[vmName]
+	return h, ok
+}
+
+// setVMLockHolder records owner as the holder of vmName's lock, from now.
+// A lock handed over through a queue (lockVMUnlessStartHeld) is re-recorded
+// for the caller it was handed to.
+func (s *Server) setVMLockHolder(vmName, owner string) {
+	s.vmLocksMu.Lock()
+	if s.vmLockHolders == nil {
+		s.vmLockHolders = map[string]vmLockHolder{}
+	}
+	s.vmLockHolders[vmName] = vmLockHolder{who: owner, since: time.Now()}
+	s.vmLocksMu.Unlock()
 }
 
 // tryLockVM is lockVM without the wait: it returns the unlock function and
 // true when it took the lock, or nil and false when someone else holds it.
 // lockVMOrSkip is lockVM when wait is set, else tryLockVM.
 func (s *Server) lockVMOrSkip(vmName string, wait bool) (func(), bool) {
+	return s.lockVMOrSkipAs(vmName, defaultVMLockOwner, wait)
+}
+
+// lockVMOrSkipAs is lockVMOrSkip for an operation that names itself
+// (lockVMAs).
+func (s *Server) lockVMOrSkipAs(vmName, owner string, wait bool) (func(), bool) {
 	if wait {
-		return s.lockVM(vmName), true
+		return s.lockVMAs(vmName, owner), true
 	}
-	return s.tryLockVM(vmName)
+	return s.tryLockVMAs(vmName, owner)
 }
 
 func (s *Server) tryLockVM(vmName string) (func(), bool) {
+	return s.tryLockVMAs(vmName, defaultVMLockOwner)
+}
+
+// tryLockVMAs is tryLockVM for an operation that names itself (lockVMAs).
+func (s *Server) tryLockVMAs(vmName, owner string) (func(), bool) {
 	s.vmLocksMu.Lock()
 	if s.vmLocks == nil {
 		s.vmLocks = map[string]*sync.Mutex{}
@@ -2887,7 +3022,7 @@ func (s *Server) tryLockVM(vmName string) (func(), bool) {
 	if !mu.TryLock() {
 		return nil, false
 	}
-	return mu.Unlock, true
+	return s.holdVMLock(vmName, mu, owner), true
 }
 
 // markBackupActive / clearBackupActive bracket a backup operation so the

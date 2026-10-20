@@ -17,11 +17,16 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 )
@@ -427,6 +432,587 @@ func TestFleet_DrainCountsAVMThatDidNotStartOnItsTarget(t *testing.T) {
 	}
 }
 
+// auditEntries is the audit log's host.drain entries on n: "result detail".
+func auditEntries(t *testing.T, n *Node, action string) []string {
+	t.Helper()
+	rows, err := n.DB.Query(context.Background(), `SELECT result, detail FROM audit_log WHERE action = ?`, action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, r := range rows {
+		out = append(out, r.String("result")+" "+r.String("detail"))
+	}
+	return out
+}
+
+// The client of `lv host drain` goes away (Ctrl-C) while a running VM's cold
+// move is shutting it down. The move does not die with the request: it
+// completes, and the VM runs on the target only. The drain does not end
+// silently: the host's audit log records that its client left and how each
+// VM it had started ended.
+//
+// Mutations: run the cold move on the request's context — the move fails
+// (context canceled), the VM is started again on the source, and goes red.
+// Record nothing when the client leaves — the audit check goes red.
+func TestFleet_DrainColdMoveCompletesWhenTheClientLeaves(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	startsBefore := sc.srcOps("start")
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	sc.src.Virt.FailShutdownDomain = func(name string) error {
+		if name == "os1" {
+			once.Do(func() { close(started) })
+			<-release
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st, err := sc.c.SelfClient(sc.src).DrainHost(ctx, &pb.DrainHostRequest{Name: sc.src.Name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			if _, err := st.Recv(); err != nil {
+				return
+			}
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the cold move never reached the shutdown")
+	}
+	cancel()
+	time.Sleep(150 * time.Millisecond) // the server sees the stream end
+	close(release)
+
+	eventually(t, 15*time.Second, "os1 to run on the target only", func() bool {
+		vm, _ := corrosion.GetVM(context.Background(), sc.src.DB, "os1")
+		dstActive, _ := sc.dst.Virt.DomainIsActive("os1")
+		srcActive, _ := sc.src.Virt.DomainIsActive("os1")
+		return vm != nil && vm.HostName == sc.dst.Name && vm.State == "running" && dstActive && !srcActive
+	})
+	if n := sc.srcOps("start") - startsBefore; n != 0 {
+		t.Errorf("os1 was started again on the source %d time(s)", n)
+	}
+	eventually(t, 15*time.Second, "the drain's end after its client left to be audited", func() bool {
+		for _, e := range auditEntries(t, sc.src, "host.drain") {
+			if strings.HasPrefix(e, "cancelled ") && strings.Contains(e, "os1") && strings.Contains(e, "moved") {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// stallReceive makes dst's ReceiveMigrationDisk take the stream and never
+// read it, as a target wedged in a hung write does, until release. With
+// afterCheck, the move's check of the disk (check_only) is answered first, so
+// the stall is in the copy itself, after the guest's shutdown.
+func stallReceive(dst *Node, afterCheck bool, entered chan<- struct{}, release <-chan struct{}) {
+	var once sync.Once
+	if afterCheck {
+		dst.HookStream("ReceiveMigrationDisk", func(srv any, ss grpc.ServerStream, h grpc.StreamHandler) error {
+			return h(srv, ss)
+		})
+	}
+	dst.HookStream("ReceiveMigrationDisk", func(srv any, ss grpc.ServerStream, h grpc.StreamHandler) error {
+		once.Do(func() { close(entered) })
+		<-release
+		return status.Error(codes.Unavailable, "test: the target was wedged")
+	})
+}
+
+func drainWithin(t *testing.T, sc *coldStoppedScenario, d time.Duration) (map[string]*pb.DrainProgress, error) {
+	t.Helper()
+	type res struct {
+		p   map[string]*pb.DrainProgress
+		err error
+	}
+	out := make(chan res, 1)
+	go func() { p, err := sc.drain(t); out <- res{p, err} }()
+	select {
+	case r := <-out:
+		return r.p, r.err
+	case <-time.After(d):
+		t.Fatalf("the drain did not end within %v", d)
+		return nil, nil
+	}
+}
+
+// A cold move whose target stops taking the disk mid-copy (alive, but wedged)
+// is not waited on forever with the guest shut down: a copy that makes no
+// progress for its bound is aborted, and the move rolls back — the VM is
+// started again on the source, where its row still names it.
+//
+// Mutation: no progress watchdog — the drain waits on the stalled copy, red.
+func TestFleet_DrainColdMoveToAStalledTargetIsRolledBack(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	sc.src.Server.SetColdDiskStallForTest(500 * time.Millisecond)
+	entered, release := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	stallReceive(sc.dst, true, entered, release)
+
+	progress, err := drainWithin(t, sc, 30*time.Second)
+	assertIncomplete(t, err)
+	if p := progress["os1"]; p == nil || p.Status != "failed" || !strings.Contains(p.Error, "no progress") ||
+		!strings.Contains(p.Error, "started again") {
+		t.Fatalf("drain progress for os1 = %+v, want failed, the copy aborted for making no progress, started again", p)
+	}
+	sc.assertRunningOnSource(t)
+}
+
+// The move's check of the disk on the target (before the guest is shut
+// down) is bounded too: a target that never answers leaves the VM running
+// here, not moved, instead of holding the drain.
+//
+// Mutation: no bound on the check — the drain waits, red.
+func TestFleet_DrainColdMoveCheckOfAStalledTargetIsBounded(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	sc.src.Server.SetColdDiskStallForTest(500 * time.Millisecond)
+	entered, release := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	stallReceive(sc.dst, false, entered, release)
+
+	progress, err := drainWithin(t, sc, 30*time.Second)
+	assertIncomplete(t, err)
+	if p := progress["os1"]; p == nil || p.Status != "failed" || !strings.Contains(p.Error, "did not answer") ||
+		!strings.Contains(p.Error, "left running") {
+		t.Fatalf("drain progress for os1 = %+v, want failed, the target did not answer, left running", p)
+	}
+	sc.assertRunningOnSource(t)
+}
+
+// An operator gets a stuck drain move out without restarting the daemon:
+// `lv operation abort <vm> --force` cancels it, and it rolls back.
+//
+// Mutation: abort only the VM's recorded operation — no drain move is
+// cancelled, the drain waits on the stalled copy, red.
+func TestFleet_AStuckDrainMoveIsCancelledByOperationAbort(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	sc.src.Server.SetColdDiskStallForTest(time.Hour)
+	entered, release := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	stallReceive(sc.dst, true, entered, release)
+
+	type res struct {
+		p   map[string]*pb.DrainProgress
+		err error
+	}
+	out := make(chan res, 1)
+	go func() { p, err := sc.drain(t); out <- res{p, err} }()
+	select {
+	case <-entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the copy never reached the target")
+	}
+	resp, err := sc.c.SelfClient(sc.src).AbortVMOperation(context.Background(),
+		&pb.AbortVMOperationRequest{VmName: "os1", Force: true})
+	if err != nil || !resp.GetAborted() {
+		t.Fatalf("operation abort = %+v, %v; want the drain's move of os1 aborted", resp, err)
+	}
+	var r res
+	select {
+	case r = <-out:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the drain did not end after its move was aborted")
+	}
+	assertIncomplete(t, r.err)
+	sc.assertRunningOnSource(t)
+}
+
+// The client leaves before any move has started (during the placement of the
+// VMs): the drain still ends visibly, audited as cancelled.
+//
+// Mutation: return on the failed send without recording — red.
+func TestFleet_DrainCancelledBeforeAnyMoveIsAudited(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	// os1 has no eligible target, so its frame is sent from the placement loop.
+	setHostCapacity(t, sc.c, sc.dst.Name, 0, 0)
+	sc.src.HookStream("DrainHost", func(srv any, ss grpc.ServerStream, h grpc.StreamHandler) error {
+		return h(srv, failingSendStream{ss})
+	})
+	_, _ = sc.drain(t)
+	eventually(t, 15*time.Second, "the drain's end before any move to be audited", func() bool {
+		for _, e := range auditEntries(t, sc.src, "host.drain") {
+			if strings.HasPrefix(e, "cancelled ") {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// failingSendStream is a server stream whose client has gone away.
+type failingSendStream struct{ grpc.ServerStream }
+
+func (failingSendStream) SendMsg(any) error {
+	return status.Error(codes.Canceled, "test: the client went away")
+}
+
+// An abort sent to another host than the VM's reaches the VM's host, where
+// its drain move runs, and cancels it there.
+//
+// Mutation: do not forward — the other host has no move to cancel, the drain
+// waits on the stalled copy, red.
+func TestFleet_OperationAbortSentToAnotherHostCancelsTheDrainMove(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	sc.src.Server.SetColdDiskStallForTest(time.Hour)
+	entered, release := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	stallReceive(sc.dst, true, entered, release)
+
+	out := make(chan error, 1)
+	go func() { _, err := sc.drain(t); out <- err }()
+	select {
+	case <-entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the copy never reached the target")
+	}
+	resp, err := sc.c.SelfClient(sc.dst).AbortVMOperation(context.Background(),
+		&pb.AbortVMOperationRequest{VmName: "os1", Force: true})
+	if err != nil || !resp.GetAborted() {
+		t.Fatalf("operation abort via %s = %+v, %v; want the drain's move of os1 aborted on %s", sc.dst.Name, resp, err, sc.src.Name)
+	}
+	select {
+	case err := <-out:
+		assertIncomplete(t, err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("the drain did not end after its move was aborted from another host")
+	}
+	sc.assertRunningOnSource(t)
+}
+
+// The VM's host cannot be reached: the abort is answered where it was sent,
+// as before (the recorded operation is aborted there), not failed.
+//
+// Mutations: return the forward's Unavailable — red. Do not forward at all —
+// the VM's host is never tried, red.
+func TestFleet_OperationAbortFallsBackWhenTheVMsHostIsUnreachable(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	var tried atomic.Bool
+	sc.src.HookUnary("AbortVMOperation", func(context.Context, any, grpc.UnaryHandler) (any, error) {
+		tried.Store(true)
+		return nil, status.Error(codes.Unavailable, "test: the VM's host cannot be reached")
+	})
+	resp, err := sc.c.SelfClient(sc.dst).AbortVMOperation(context.Background(),
+		&pb.AbortVMOperationRequest{VmName: "os1", Force: true})
+	if !tried.Load() {
+		t.Fatal("the abort was not forwarded to the VM's host before falling back")
+	}
+	if err != nil {
+		t.Fatalf("operation abort with the VM's host unreachable = %v; want it answered locally", err)
+	}
+	if resp.GetAborted() || resp.GetDetail() != "no active operation" {
+		t.Fatalf("operation abort = %+v; want the local answer (no active operation)", resp)
+	}
+}
+
+// A scoped abort (--operation) is never forwarded: it cancels no drain move,
+// its compare-and-swap works on any host, and a VM host on an older build
+// drops operation_id and would abort whatever operation is active.
+//
+// Mutation: forward scoped aborts too — the VM's host is called, red.
+func TestFleet_ScopedOperationAbortIsNotForwarded(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	var called atomic.Bool
+	sc.src.HookUnary("AbortVMOperation", func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
+		called.Store(true)
+		return h(ctx, req)
+	})
+	_, err := sc.c.SelfClient(sc.dst).AbortVMOperation(context.Background(),
+		&pb.AbortVMOperationRequest{VmName: "os1", Force: true, OperationId: "op-x"})
+	if called.Load() {
+		t.Fatal("a scoped abort was forwarded to the VM's host")
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("scoped abort of an operation that is not active = %v; want FailedPrecondition", err)
+	}
+}
+
+// The target's final sync is slow but inside the stall bound: the copy is not
+// aborted for it. After the last frame the wait for the target's answer is
+// the stall bound, as for any frame.
+//
+// Mutation: cap the wait after the last frame below the sync's time — the
+// copy is aborted after it fully arrived, red.
+func TestFleet_DrainColdMoveWaitsForASlowFinalSync(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	sc.src.Server.SetColdDiskStallForTest(3 * time.Second)
+	sc.dst.Server.SetColdDiskSyncHookForTest(func(final bool) {
+		if final {
+			time.Sleep(1500 * time.Millisecond)
+		}
+	})
+	progress, err := drainWithin(t, sc, 30*time.Second)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if p := progress["os1"]; p == nil || p.Status != "done" || p.Error != "" {
+		t.Fatalf("drain progress for os1 = %+v, want done", p)
+	}
+}
+
+// A target that wedges after the last frame (its final sync never returns)
+// holds the guest down for the stall bound, not for a time that grows with
+// the disk's size: the copy is aborted and the move rolls back.
+//
+// Mutations: bound the wait after the last frame by the disk's size at
+// 16 MiB/s (at least the stall bound) — it is 1s for this disk, and the
+// abort names 1s, red. Wait at least 3s after the last frame — the source
+// gives up too late, red.
+func TestFleet_DrainColdMoveToATargetWedgedAfterTheLastFrameIsRolledBack(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	const stall = 300 * time.Millisecond
+	sc.src.Server.SetColdDiskStallForTest(stall)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	finalAt := make(chan time.Time, 1)
+	sc.dst.Server.SetColdDiskSyncHookForTest(func(final bool) {
+		if final {
+			finalAt <- time.Now()
+			<-release
+		}
+	})
+	// The move's check of the disk, then the copy: when the source gave up on
+	// the copy is when the target's stream ends.
+	abandonedAt := make(chan time.Time, 1)
+	sc.dst.HookStream("ReceiveMigrationDisk", func(srv any, ss grpc.ServerStream, h grpc.StreamHandler) error {
+		return h(srv, ss)
+	})
+	sc.dst.HookStream("ReceiveMigrationDisk", func(srv any, ss grpc.ServerStream, h grpc.StreamHandler) error {
+		go func() { <-ss.Context().Done(); abandonedAt <- time.Now() }()
+		return h(srv, ss)
+	})
+	progress, err := drainWithin(t, sc, 30*time.Second)
+	assertIncomplete(t, err)
+	if p := progress["os1"]; p == nil || p.Status != "failed" || !strings.Contains(p.Error, "made no progress for 300ms") ||
+		!strings.Contains(p.Error, "started again") {
+		t.Fatalf("drain progress for os1 = %+v, want failed, the copy aborted after the 300ms stall bound, started again", p)
+	}
+	sc.assertRunningOnSource(t)
+	var from, to time.Time
+	select {
+	case from = <-finalAt:
+	default:
+		t.Fatal("the target never reached its final sync")
+	}
+	select {
+	case to = <-abandonedAt:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the target's stream never ended")
+	}
+	if waited := to.Sub(from); waited >= 1500*time.Millisecond {
+		t.Fatalf("the source waited %v for the target's answer after the last frame; want about the %v stall bound", waited, stall)
+	}
+}
+
+// The target syncs a received disk as it writes, so its final sync is small
+// and the sender's progress reflects what the target's storage takes.
+//
+// Mutation: sync only at the end — no periodic sync, red.
+func TestFleet_ColdDiskReceiveSyncsAsItWrites(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	sc.dst.Server.SetColdDiskSyncEveryForTest(1 << 20)
+	var mu sync.Mutex
+	periodic := 0
+	sc.dst.Server.SetColdDiskSyncHookForTest(func(final bool) {
+		if !final {
+			mu.Lock()
+			periodic++
+			mu.Unlock()
+		}
+	})
+	if _, err := drainWithin(t, sc, 30*time.Second); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if periodic < 2 {
+		t.Fatalf("the target synced %d time(s) while it wrote ~2 MiB in 1 MiB steps; want at least 2", periodic)
+	}
+}
+
+// A target whose final sync returns after the source gave up on the copy
+// (its stall bound) does not place the disk: the source has rolled the move
+// back and runs the VM, and a placed copy would be a stray full copy of its
+// disk on the target. The scratch file goes too.
+//
+// Mutation: place without checking the stream — the disk appears on the
+// target, red.
+func TestFleet_ColdDiskCopyTheSourceGaveUpOnIsNotPlaced(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	sc.src.Server.SetColdDiskStallForTest(300 * time.Millisecond)
+	release := make(chan struct{})
+	var once sync.Once
+	releaseNow := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(releaseNow)
+	sc.dst.Server.SetColdDiskSyncHookForTest(func(final bool) {
+		if final {
+			<-release
+		}
+	})
+	progress, err := drainWithin(t, sc, 30*time.Second)
+	assertIncomplete(t, err)
+	if p := progress["os1"]; p == nil || p.Status != "failed" || !strings.Contains(p.Error, "no progress") {
+		t.Fatalf("drain progress for os1 = %+v, want failed, the copy aborted", p)
+	}
+	dst := sc.file(sc.dst, sc.disk)
+	scratch := filepath.Join(filepath.Dir(dst), "."+filepath.Base(dst)+".receiving-*")
+	if m, _ := filepath.Glob(scratch); len(m) == 0 {
+		t.Fatal("the target holds no scratch file while its final sync is wedged")
+	}
+	releaseNow()
+	eventually(t, 15*time.Second, "the target to finish its receive", func() bool {
+		m, _ := filepath.Glob(scratch)
+		return len(m) == 0
+	})
+	if _, err := os.Lstat(dst); !os.IsNotExist(err) {
+		t.Fatalf("the target placed the disk at %s after the source gave up on the copy (stat: %v)", dst, err)
+	}
+	sc.assertRunningOnSource(t)
+}
+
+// A disk file already on the target that no migration of this attempt made
+// (one a rolled-back move placed in the instant after its source gave up, or
+// an earlier stay's) refuses the move before the guest is shut down, and the
+// refusal names the exact way out: the rename that sets the file aside, and
+// the command that then lists and keeps it. The file is left as it was.
+//
+// Mutation: the old wording (<path>.superseded-<time>) — red.
+func TestFleet_DrainColdMoveNamesTheWayOutOfAStrayTargetDisk(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	dst := sc.file(sc.dst, sc.disk)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst, []byte("a stray copy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	progress, err := drainWithin(t, sc, 30*time.Second)
+	assertIncomplete(t, err)
+	p := progress["os1"]
+	if p == nil || p.Status == "done" {
+		t.Fatalf("drain progress for os1 = %+v, want the move refused", p)
+	}
+	if want := "`mv " + dst + " " + dst + ".superseded-"; !strings.Contains(p.Error, want) ||
+		!strings.Contains(p.Error, "`lv host superseded-disks "+sc.dst.Name+"`") {
+		t.Fatalf("refusal = %q; want the rename (%s<time>`) and `lv host superseded-disks %s`", p.Error, want, sc.dst.Name)
+	}
+	if n := sc.srcOps("shutdown"); n != 0 {
+		t.Fatalf("os1 was shut down %d time(s); the refusal must come before the shutdown", n)
+	}
+	if got, err := os.ReadFile(dst); err != nil || string(got) != "a stray copy" {
+		t.Fatalf("the stray file changed (err %v, %q)", err, got)
+	}
+	if active, _ := sc.src.Virt.DomainIsActive("os1"); !active {
+		t.Fatal("os1 is not running on the source")
+	}
+}
+
+// The source gives up on the copy while the target is placing the disk (its
+// directory sync stalls on storage that just wedged). No answer was sent, so
+// the source rolled the move back and keeps the VM's disk: the target takes
+// back the file it just placed, and only that file — one that took its place
+// at the path in the meantime is left as it is.
+//
+// Mutation: no re-check after the directory sync — the placed copy stays on
+// the target, red. Remove whatever is at the path, or whatever has the placed
+// copy's size — the other file is gone, red.
+func TestFleet_ColdDiskPlacedAfterTheSourceGaveUpIsTakenBack(t *testing.T) {
+	for _, replaced := range []bool{false, true} {
+		name := "placed copy taken back"
+		if replaced {
+			name = "a file that took its place is left"
+		}
+		t.Run(name, func(t *testing.T) {
+			sc := newColdStoppedScenario(t)
+			sc.makeRunning(t)
+			sc.src.Server.SetColdDiskStallForTest(300 * time.Millisecond)
+			dst := sc.file(sc.dst, sc.disk)
+			release := make(chan struct{})
+			var once sync.Once
+			releaseNow := func() { once.Do(func() { close(release) }) }
+			t.Cleanup(releaseNow)
+			sc.dst.Server.SetColdDiskPlacedHookForTest(func() {
+				if replaced {
+					if err := os.Rename(dst, dst+".aside"); err != nil {
+						t.Errorf("move the placed copy aside: %v", err)
+					}
+					// Another file, of exactly the placed copy's size: only
+					// the inode tells them apart.
+					if err := os.WriteFile(dst, []byte("another file"), 0o600); err != nil {
+						t.Errorf("write another file at the path: %v", err)
+					}
+					if aside, err := os.Stat(dst + ".aside"); err != nil {
+						t.Errorf("stat the placed copy: %v", err)
+					} else if err := os.Truncate(dst, aside.Size()); err != nil {
+						t.Errorf("size the other file: %v", err)
+					}
+				}
+				<-release
+			})
+			// The move's check of the disk, then the copy: the copy's handler
+			// signals when it has returned.
+			handled := make(chan struct{})
+			sc.dst.HookStream("ReceiveMigrationDisk", func(srv any, ss grpc.ServerStream, h grpc.StreamHandler) error {
+				return h(srv, ss)
+			})
+			sc.dst.HookStream("ReceiveMigrationDisk", func(srv any, ss grpc.ServerStream, h grpc.StreamHandler) error {
+				defer close(handled)
+				return h(srv, ss)
+			})
+			progress, err := drainWithin(t, sc, 30*time.Second)
+			assertIncomplete(t, err)
+			if p := progress["os1"]; p == nil || p.Status != "failed" || !strings.Contains(p.Error, "no progress") {
+				t.Fatalf("drain progress for os1 = %+v, want failed, the copy aborted", p)
+			}
+			releaseNow()
+			select {
+			case <-handled:
+			case <-time.After(15 * time.Second):
+				t.Fatal("the target's receive never returned")
+			}
+			if replaced {
+				if got, err := os.ReadFile(dst); err != nil || !strings.HasPrefix(string(got), "another file") {
+					t.Fatalf("the file that took the placed copy's place was touched (err %v, %q)", err, got)
+				}
+			} else if _, err := os.Lstat(dst); !os.IsNotExist(err) {
+				t.Fatalf("the target kept the disk it placed after the source gave up (stat: %v)", err)
+			}
+			if active, _ := sc.src.Virt.DomainIsActive("os1"); !active {
+				t.Fatal("os1 is not running on the source")
+			}
+			if vm := sc.vm(t); vm.HostName != sc.src.Name || vm.State != "running" {
+				t.Fatalf("os1 row = host %s state %s, want running on %s", vm.HostName, vm.State, sc.src.Name)
+			}
+		})
+	}
+}
+
 // A drain that finds no target for a VM ends incomplete, naming it. Before
 // D2-17 r1 a drain whose every VM had no target returned nil before its
 // remaining check, and `lv host drain` printed "drained" over a running VM.
@@ -447,5 +1033,35 @@ func TestFleet_DrainWithNoTargetEndsIncomplete(t *testing.T) {
 	}
 	if p := progress["os1"]; p == nil || p.Status != "failed" || !strings.Contains(p.Error, "no eligible target") {
 		t.Errorf("drain progress for os1 = %+v, want failed: no eligible target", p)
+	}
+}
+
+// A cold move rolled back after its disk copy began says so: the log no
+// longer says the attempt ended before the copy started (lab2-drain
+// anomaly 4).
+//
+// Mutation: drop the copy-started mark — the log says "before the copy
+// started", red.
+func TestFleet_AColdMoveRolledBackMidCopyLogsThatTheCopyHadStarted(t *testing.T) {
+	logs := captureLogs(t)
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	sc.src.Server.SetColdDiskStallForTest(300 * time.Millisecond)
+	release := make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	sc.dst.Server.SetColdDiskSyncHookForTest(func(final bool) {
+		if final {
+			<-release
+		}
+	})
+	_, err := drainWithin(t, sc, 30*time.Second)
+	assertIncomplete(t, err)
+	out := logs.String()
+	if strings.Contains(out, "attempt ended before the copy started") {
+		t.Fatal("the log says a move rolled back mid-copy ended before the copy started")
+	}
+	if !strings.Contains(out, "attempt ended after its disk copy started") {
+		t.Fatal("the log does not say the rolled-back move's copy had started")
 	}
 }

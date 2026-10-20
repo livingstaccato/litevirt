@@ -2748,7 +2748,7 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 	// A start held past its wait (vm_start_bound.go) holds the lock for as
 	// long as libvirt does not answer it: the stop answers rather than
 	// queueing behind it, and --force cancels the start.
-	unlock, held, _ := s.lockVMUnlessStartHeld(nil, req.Name)
+	unlock, held, _ := s.lockVMUnlessStartHeld(nil, req.Name, "stop")
 	if held != nil {
 		if !req.Force {
 			if out, done, err := s.heldStartAlreadyCancelled(ctx, req.Name, held); done {
@@ -2761,7 +2761,7 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 		}
 		// libvirt answered meanwhile: the start is settling. Stop the VM
 		// as usual once it has.
-		unlock = s.lockVM(req.Name)
+		unlock = s.lockVMAs(req.Name, "stop")
 	}
 	defer unlock()
 	vm, err = corrosion.GetVM(ctx, s.db, req.Name)
@@ -3004,7 +3004,7 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 
 	// A start held past its wait holds the lock for as long as libvirt does
 	// not answer it: the restart answers rather than queueing behind it.
-	unlock, held, _ := s.lockVMUnlessStartHeld(nil, req.Name)
+	unlock, held, _ := s.lockVMUnlessStartHeld(nil, req.Name, "restart")
 	if held != nil {
 		return nil, startHeldRefusal("restart", req.Name, held)
 	}
@@ -3390,7 +3390,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
-	unlock := s.lockVM(req.Name)
+	unlock := s.lockVMAs(req.Name, "delete")
 	unlocked := false
 	releaseLock := func() {
 		if !unlocked {
@@ -4892,7 +4892,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// firmware state — it was the only destructive VM-lifecycle RPC in this file
 	// without the lock, so it could run straight through a concurrent start,
 	// resize or migrate of the same VM. Same placement as DeleteVM.
-	unlock := releaseOnce(s.lockVM(req.Name))
+	unlock := releaseOnce(s.lockVMAs(req.Name, "rebuild"))
 	defer unlock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.Name)
@@ -5215,7 +5215,7 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	// before calling a peer — not just whichever one happened to be last.
 	var releases []func()
 	for _, n := range sortedPair(req.VmName, nextName) {
-		unlock := releaseOnce(s.lockVM(n))
+		unlock := releaseOnce(s.lockVMAs(n, "cutover"))
 		releases = append(releases, unlock)
 		defer unlock()
 	}
@@ -6152,7 +6152,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 					"VM %q must be stopped to change cpu/memory/machine/firmware/mem-bounds (current: %s); pass --restart-if-needed to reconfigure with a restart",
 					req.Name, vm.State)
 			}
-			unlock := s.lockVM(req.Name)
+			unlock := s.lockVMAs(req.Name, "update")
 			defer unlock()
 			fresh, gerr := corrosion.GetVM(ctx, s.db, req.Name)
 			if gerr != nil || fresh == nil {
@@ -6444,7 +6444,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			if h := s.limitsPreLockHook; h != nil {
 				h(req.Name)
 			}
-			unlock := s.lockVM(req.Name)
+			unlock := s.lockVMAs(req.Name, "update")
 			defer unlock()
 			fresh, gerr := corrosion.GetVM(ctx, s.db, req.Name)
 			if gerr != nil || fresh == nil {

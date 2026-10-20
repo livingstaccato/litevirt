@@ -3,6 +3,7 @@ package fleet
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -277,5 +278,110 @@ func TestFleet_MigrationNetwork_ColdDiskStreamFallsBackWhenTheNetworkIsDown(t *t
 	}
 	if !hasMigrationFallbackEvent(t, sc.src, "os1") {
 		t.Errorf("no fallback warning on the VM's events")
+	}
+}
+
+// Both hosts are ready for migration TLS, but their credentials come from
+// different migration CAs: QEMU's own TLS stream would fail its handshake.
+// A memory-only move, by `lv migrate` or by a drain, treats that as not
+// ready and stays in libvirt's tunnel on the cluster address. Either side
+// reporting no CA (an older build) changes nothing: the move leaves the tunnel.
+//
+// Mutations: drop the CA comparison from the memory route in migrateOwnedVM
+// (the migrate case) or in drainOneVM (the drain case) — direct=true is
+// requested, and that case goes red. Treat an unreported CA as a mismatch —
+// the "target does not say" cases go red.
+func TestFleet_MigrationNetwork_MemoryOnlyStaysTunnelledWhenTheMigrationCAsDiffer(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		dstCA      string
+		drain      bool
+		wantDirect bool
+	}{
+		{"migrate, different CAs", "bbbb2222", false, false},
+		{"drain, different CAs", "bbbb2222", true, false},
+		{"migrate, target does not say", "", false, true},
+		{"drain, target does not say", "", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := New(t, Options{Nodes: 2, SharedCRDT: true})
+			defer c.Stop()
+			src, dst := c.Nodes[0], c.Nodes[1]
+			for _, n := range c.Nodes {
+				setHostCapacity(t, c, n.Name, 64, 65536)
+			}
+			migrationTLSReady(src, true)
+			migrationTLSReady(dst, true)
+			migrationCA(src, "aaaa1111")
+			migrationCA(dst, tc.dstCA)
+			onMigrationNet(src, 1, true)
+			onMigrationNet(dst, 2, false)
+			seedRunningVM(t, c, src, "mem3", "", 1, 256)
+
+			var err error
+			if tc.drain {
+				_, err = drainAll(t, c, src)
+			} else {
+				err = migrateAt(t, c, src, "mem3", dst.Name)
+			}
+			if err != nil {
+				t.Fatalf("the move was refused: %v", err)
+			}
+			note := lastMigrateNote(src)
+			if tc.wantDirect {
+				if !strings.Contains(note, "direct=true") || !strings.Contains(note, "addr=10.9.0.2") {
+					t.Fatalf("libvirt migrate = %q; want QEMU's own TLS stream to the migration address", note)
+				}
+				return
+			}
+			// The tunnel: libvirt's own connection to the cluster address (a
+			// drain names no data address for it; `lv migrate` names that one).
+			if !strings.Contains(note, "direct=false") || strings.Contains(note, "addr=10.9.0.2") {
+				t.Fatalf("libvirt migrate = %q; want the tunnel on the cluster address (the CAs differ)", note)
+			}
+		})
+	}
+}
+
+// drainAll drains n and returns every frame, and the stream's end.
+func drainAll(t *testing.T, c *Cluster, n *Node) ([]*pb.DrainProgress, error) {
+	t.Helper()
+	st, err := c.SelfClient(n).DrainHost(context.Background(), &pb.DrainHostRequest{Name: n.Name})
+	if err != nil {
+		return nil, err
+	}
+	var all []*pb.DrainProgress
+	for {
+		p, rerr := st.Recv()
+		if rerr == io.EOF {
+			return all, nil
+		}
+		if rerr != nil {
+			return all, rerr
+		}
+		all = append(all, p)
+	}
+}
+
+// A source that cannot read its own migration CA does not leave the tunnel:
+// it cannot tell the target's CA is its own.
+//
+// Mutation: read an unreadable CA as unknown — direct=true, red.
+func TestFleet_MigrationNetwork_MemoryOnlyStaysTunnelledWhenTheSourceCannotReadItsMigrationCA(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	defer c.Stop()
+	src, dst := c.Nodes[0], c.Nodes[1]
+	migrationTLSReady(src, true)
+	migrationTLSReady(dst, true)
+	src.Server.SetMigrationCAFingerprint(func() (string, error) { return "", errors.New("unreadable") })
+	migrationCA(dst, "bbbb2222")
+	onMigrationNet(src, 1, true)
+	onMigrationNet(dst, 2, false)
+	seedRunningVM(t, c, src, "mem4", "", 1, 256)
+	if err := migrateAt(t, c, src, "mem4", dst.Name); err != nil {
+		t.Fatalf("migration: %v", err)
+	}
+	if note := lastMigrateNote(src); !strings.Contains(note, "direct=false") {
+		t.Fatalf("libvirt migrate = %q; want the tunnel", note)
 	}
 }

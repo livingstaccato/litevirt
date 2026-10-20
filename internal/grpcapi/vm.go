@@ -2748,6 +2748,19 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 		defer conn.Close()
 		return client.StopVM(ctx, req)
 	}
+	// A row that says migrating: a guest running here is stopped as before.
+	// Otherwise it may run on the move's target, which is asked first, before
+	// the lock (a peer RPC): a stop recorded here while it runs there would
+	// let a later start make a second copy.
+	migratingDetail, migratingSeen, runsHere := "", false, false
+	if vm.State == "migrating" {
+		migratingDetail, migratingSeen = vm.StateDetail, true
+		if active, aerr := s.virt.DomainIsActive(vm.Name); aerr == nil && active {
+			runsHere = true
+		} else if err := s.migratingStopRefusal(ctx, vm); err != nil {
+			return nil, err
+		}
+	}
 
 	// A start held past its wait (vm_start_bound.go) holds the lock for as
 	// long as libvirt does not answer it: the stop answers rather than
@@ -2779,6 +2792,17 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 	// every other VM stops as before.
 	if err := s.firmwareMoveStopRefusal(vm); err != nil {
 		return nil, err
+	}
+	if vm.State == "migrating" {
+		if !migratingSeen || vm.StateDetail != migratingDetail {
+			return nil, status.Errorf(codes.Aborted, "%q went migrating mid-operation; retry", req.Name)
+		}
+		if runsHere {
+			if active, aerr := s.virt.DomainIsActive(vm.Name); aerr != nil || !active {
+				return nil, status.Errorf(codes.Aborted,
+					"%q, recorded migrating, stopped running here mid-operation; retry, which asks the move's target", req.Name)
+			}
+		}
 	}
 
 	out, err := s.stopVMLocked(ctx, vm, req.Force, req.Timeout)
@@ -3304,6 +3328,10 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		ctx = pctx
 		// A deleted VM's partial-recovery marker goes with it (review N5).
 		s.clearPromotedPartial(ctx, req.Name)
+		if !deleteLocalOnly(ctx) {
+			// A move left unresolved ends with the VM.
+			s.resolveMigrationUnresolved(ctx, req.Name)
+		}
 		s.clearDeletedFirewallTags(ctx, corrosion.TagMemberVM, "", req.Name, fwID)
 		if dropSchedules {
 			s.deleteVMSchedules(context.WithoutCancel(ctx), req.Name)

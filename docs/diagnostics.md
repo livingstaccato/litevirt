@@ -3269,7 +3269,11 @@ refused, and a drain skips it, pointing here. The evidence names the drained
 host (`source`), the target (`target`) and the drain's result (`detail`).
 Find where the guest runs (`virsh list` on both hosts). If it runs on a host,
 `lv doctor repair-owner <vm> <host>` records it there; if it runs on none,
-`lv stop <vm>` settles the record. Either resolves the condition.
+`lv stop <vm>` settles the record. Either resolves the condition, and so does
+`lv rm <vm>`; each releases the target's reservation. `lv stop` of a VM
+recorded `migrating` whose guest is not running on that host first asks the
+move's target whether it holds a domain of the VM, and is refused when it does
+(pointing at `lv doctor repair-owner`) or when the target cannot be asked.
 
 ### A firmware move record cannot be read (`firmware_migration_record_unreadable`)
 

@@ -1064,7 +1064,11 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			slog.Warn("drain: the live move ended without libvirt's answer and the guest is not running here; its record is left migrating",
 				"vm", vm.Name, "target", target.Name, "state", st, "state_error", serr)
 			s.recordVMEvent(context.WithoutCancel(ctx), vm.Name, "vm.migrated", "error", "drain: "+detail)
-			s.raiseMigrationUnresolved(context.WithoutCancel(ctx), vm.Name, target.Name, detail)
+			leaseID := ""
+			if migLease != nil {
+				leaseID = migLease.id
+			}
+			s.raiseMigrationUnresolved(context.WithoutCancel(ctx), vm.Name, target.Name, leaseID, detail)
 			return &pb.DrainProgress{
 				VmName: vm.Name, TargetHost: target.Name, Status: "failed", Strategy: pb.MigrateStrategy_MIGRATE_LIVE,
 				Error: detail,

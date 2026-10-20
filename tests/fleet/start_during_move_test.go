@@ -128,7 +128,8 @@ func leftMigrating(t *testing.T) (*Cluster, *Node, *Node) {
 //
 // Mutations: no in-flight-move refusal in the start gates — the start boots
 // web on the source, red. None in RestartVM — the restart boots it, red. The
-// stop does not resolve the condition — red.
+// stop does not resolve the condition — red. The stop taken as allowed when
+// the target cannot be asked — red.
 func TestFleet_AVMLeftMigratingIsNotStartedOnItsSource(t *testing.T) {
 	c, src, dst := leftMigrating(t)
 	ctx := context.Background()
@@ -152,6 +153,18 @@ func TestFleet_AVMLeftMigratingIsNotStartedOnItsSource(t *testing.T) {
 	if n := countOp(src.Virt.EventLog(), "start", "web"); n != 0 {
 		t.Fatalf("web was started %d time(s) on its source", n)
 	}
+	// The target is asked whether the guest runs there first: one that
+	// cannot be asked refuses the stop.
+	restore := dst.RefuseRPCs("GetRuntimeInventory")
+	if _, err := cl.StopVM(ctx, &pb.StopVMRequest{Name: "web"}); status.Code(err) != codes.Unavailable ||
+		!strings.Contains(err.Error(), dst.Name) {
+		t.Fatalf("stop with the target not answering = %v; want Unavailable naming %s", err, dst.Name)
+	}
+	if row, _ := corrosion.GetVM(ctx, src.DB, "web"); row == nil || row.State != "migrating" {
+		t.Fatalf("web after the refused stop = %+v; want still migrating", row)
+	}
+	restore()
+	// The target has no domain of it: the stop goes ahead.
 	if _, err := cl.StopVM(ctx, &pb.StopVMRequest{Name: "web"}); err != nil {
 		t.Fatalf("stop of a VM left migrating: %v", err)
 	}
@@ -163,5 +176,28 @@ func TestFleet_AVMLeftMigratingIsNotStartedOnItsSource(t *testing.T) {
 	}
 	if _, err := cl.StartVM(ctx, &pb.StartVMRequest{Name: "web"}); err != nil {
 		t.Fatalf("start after the stop settled the row: %v", err)
+	}
+}
+
+// Deleting a VM whose move was left unresolved resolves its
+// vm.migration_unresolved.
+//
+// Mutation: the delete does not resolve it — red.
+func TestFleet_DeletingAVMResolvesItsUnresolvedMigration(t *testing.T) {
+	c, src, dst := leftMigrating(t)
+	ctx := context.Background()
+	ts := time.Now().UTC().Format(time.RFC3339)
+	if err := corrosion.UpsertHealthCondition(ctx, src.DB, corrosion.HealthCondition{
+		Evaluator: "drain", Code: "vm.migration_unresolved", SubjectKind: "vm", SubjectID: "web",
+		Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityCritical, Hosts: []string{src.Name, dst.Name},
+		Evidence: "{}", FirstSeen: ts, LastSeen: ts, ConfirmedAt: ts, Reporter: src.Name,
+	}); err != nil {
+		t.Fatalf("raise vm.migration_unresolved: %v", err)
+	}
+	if _, err := c.SelfClient(src).DeleteVM(ctx, &pb.DeleteVMRequest{Name: "web"}); err != nil {
+		t.Fatalf("delete web: %v", err)
+	}
+	if cond, ok, _ := corrosion.GetHealthCondition(ctx, src.DB, "drain", "vm.migration_unresolved", "vm", "web"); !ok || cond.Lifecycle != corrosion.ConditionResolved {
+		t.Fatalf("vm.migration_unresolved after the delete = %+v (found %v); want resolved", cond, ok)
 	}
 }

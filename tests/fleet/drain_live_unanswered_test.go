@@ -219,13 +219,27 @@ func TestFleet_DrainLiveMoveWhoseCallEndsUnansweredAfterLandingStaysMigrating(t 
 		!strings.Contains(p.Error, "lv doctor repair-owner slow") {
 		t.Fatalf("a later drain's frame for slow = %+v; want skipped, naming %s and repair-owner", p, migrationUnresolved)
 	}
-	// The operator records slow where it runs: the condition resolves.
+	// A stop on the source would record it stopped there while it runs on
+	// the target, and a later start would make a second copy: refused,
+	// pointing at repair-owner.
+	if _, err := sc.c.SelfClient(sc.src).StopVM(ctx, &pb.StopVMRequest{Name: "slow"}); status.Code(err) != codes.FailedPrecondition ||
+		!strings.Contains(err.Error(), "lv doctor repair-owner slow "+sc.dst.Name) {
+		t.Fatalf("stop of slow on the source = %v; want it refused, pointing at repair-owner on %s", err, sc.dst.Name)
+	}
+	if row, _ := corrosion.GetVM(ctx, sc.src.DB, "slow"); row == nil || row.State != "migrating" {
+		t.Fatalf("slow after the refused stop = %+v; want still migrating", row)
+	}
+	// The operator records slow where it runs: the condition resolves and
+	// the target's reservation the move kept is released.
 	if _, err := sc.c.SelfClient(sc.dst).RepairVMOwner(ctx, &pb.RepairVMOwnerRequest{Name: "slow", Host: sc.dst.Name}); err != nil {
 		t.Fatalf("repair-owner slow on %s: %v", sc.dst.Name, err)
 	}
 	waitRow(t, sc.src, sc.dst.Name, "running")
 	if c, ok, _ := corrosion.GetHealthCondition(ctx, sc.src.DB, "drain", migrationUnresolved, "vm", "slow"); !ok || c.Lifecycle != corrosion.ConditionResolved {
 		t.Fatalf("%s after repair-owner = %+v (found %v); want resolved", migrationUnresolved, c, ok)
+	}
+	if cpu, mem, err := corrosion.HostReserved(ctx, sc.dst.DB, sc.dst.Name); err != nil || cpu != 0 || mem != 0 {
+		t.Fatalf("the target reserves %d vCPU / %d MiB (err %v) after repair-owner; want the move's reservation released", cpu, mem, err)
 	}
 }
 

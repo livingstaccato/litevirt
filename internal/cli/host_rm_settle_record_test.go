@@ -26,16 +26,18 @@ func (m *settleMachine) otherInstall(t *testing.T, at time.Time) (string, string
 	return rec, x
 }
 
-// recordIs fails unless the machine's install record is want exactly and no
-// copy a settle kept of it is left.
+// recordIs fails unless the machine's install record is want exactly, and
+// neither a copy of it nor the settle's claim of the serial is left.
 func (m *settleMachine) recordIs(t *testing.T, want string) {
 	t.Helper()
 	got, err := os.ReadFile(m.f.target.Path(addInstalledMarker))
 	if err != nil || string(got) != want {
 		t.Errorf("install record = %q (%v), want %q", got, err, want)
 	}
-	if _, err := os.Stat(m.f.target.Path(settlePriorPath(m.serial))); !os.IsNotExist(err) {
-		t.Errorf("the settle's copy of the record is left (stat: %v)", err)
+	for _, p := range []string{settlePriorPath(m.serial), settleClaimPath(m.serial)} {
+		if _, err := os.Stat(m.f.target.Path(p)); !os.IsNotExist(err) {
+			t.Errorf("%s is left (stat: %v)", p, err)
+		}
 	}
 }
 
@@ -64,17 +66,15 @@ func (m *settleMachine) freshAdd(t *testing.T) (*hostAddTestClient, error) {
 // cleanup then deleted the record as its own claim. node-x's certificate
 // stayed, but its record, by which a fresh add is kept out for an hour (the
 // user's ruling), was gone: the next fresh add stopped node-x's daemon and
-// installed over it. The claim keeps the record it replaces and the settle
-// puts it back as it was; a failed revocation puts it back at once; a
-// failed publish or cleanup leaves the claim, which keeps adds out, and the
-// command it prints puts the record back. Composed with the next fresh add:
-// refused while node-x's install is under an hour old, allowed from an hour
-// (the control).
+// installed over it. The settle's claim is a file of the serial's own now
+// (settleClaimPath), and the install record is never written by it: node-x's
+// record stays exactly through every failure and rerun. Composed with the
+// next fresh add: refused while node-x's install is under an hour old,
+// allowed from an hour (the control).
 //
-// Mutations: put back nothing (the claim is removed as before) — every
-// "under an hour" case installs over node-x; keep no copy on a claim — the
-// same; drop the undo after a failed revocation — "the revocation fails"
-// leaves the claim, and its rerun is refused.
+// Mutations: claim in the install record as before — every case loses
+// node-x's record; drop the undo after a failed revocation — "the
+// revocation fails" leaves the claim.
 func TestHostRemoveSerial_SettlingKeepsAnotherAdmissionsInstallRecord(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	again := func(m *settleMachine) string {
@@ -97,7 +97,7 @@ func TestHostRemoveSerial_SettlingKeepsAnotherAdmissionsInstallRecord(t *testing
 			m.dial(t, &failingShell{LocalAddTarget: m.f.target, kind: "unstage", nth: 1})
 			return func() { m.dial(t, m.f.target) }
 		}, true},
-		{"putting the record back fails, then its command", func(t *testing.T, m *settleMachine, _ *serialRemoveClient) func() {
+		{"removing the settle's claim fails, then its command", func(t *testing.T, m *settleMachine, _ *serialRemoveClient) func() {
 			m.dial(t, &failingShell{LocalAddTarget: m.f.target, kind: "unstage", nth: 2})
 			return func() { m.dial(t, m.f.target) }
 		}, true},
@@ -137,10 +137,10 @@ func TestHostRemoveSerial_SettlingKeepsAnotherAdmissionsInstallRecord(t *testing
 						// Nothing was revoked: the record is as it was now.
 						m.recordIs(t, rec)
 					}
-					// Between the runs, a fresh add installs nothing over node-x:
-					// the settle's claim keeps it out, or (nothing revoked)
-					// node-x's own record while it is under an hour old.
-					if sc.revokes || age < freshInstall {
+					// Between the runs, a fresh add installs nothing over node-x
+					// while its record is under an hour old (or, nothing revoked,
+					// while the stranded attempt's record stands).
+					if !sc.revokes || age < freshInstall {
 						if _, err := m.freshAdd(t); err == nil || reachedInstall(m.f.target.Events) {
 							t.Errorf("a fresh add between the runs = %v, events %v: want refused, nothing stopped or installed",
 								err, m.f.target.Events)
@@ -329,7 +329,7 @@ func TestHostRemoveSerial_AnExistingNameWithABlankIsFinishedByItsPrintedCommand(
 // the copy read first is written over the record and the newer copy removed.
 func TestReleaseInstallRecord_PutsBackOnlyTheCopyAsRead(t *testing.T) {
 	const serial = "a0a0"
-	for _, how := range []releaseMode{releaseSettled, releaseUndo, releaseRemoved} {
+	for _, how := range []releaseMode{releaseSettled, releaseRemoved} {
 		root := t.TempDir()
 		r := &LocalAddTarget{Root: root, PKIDir: filepath.Join(root, "etc", "litevirt", "pki")}
 		claim := markerLine("node-9", serial, 1_800_000_000, "0123456789ab", "installing") + "\n"

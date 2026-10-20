@@ -501,7 +501,7 @@ func removeStagedPair(r addRemote, serial string) error {
 }
 
 // removeStaged is removeStagedPair, its install record released as how says
-// (releaseInstallRecord).
+// (releaseInstallRecord), and a settle's claim of serial removed last.
 func removeStaged(r addRemote, serial string, how releaseMode) error {
 	serial = canonSerial(serial)
 	if serial == "" {
@@ -513,7 +513,11 @@ func removeStaged(r addRemote, serial string, how releaseMode) error {
 	if err := releaseInstallRecord(r, serial, how); err != nil {
 		return err
 	}
-	return removeLegacyStagedPair(r, serial)
+	if err := removeLegacyStagedPair(r, serial); err != nil {
+		return err
+	}
+	// Last: until the rest is gone, no add of serial runs on the machine.
+	return dropSettleClaim(r, serial, "")
 }
 
 // removeStagedFiles removes every attempt's staged files and records tagged
@@ -542,12 +546,37 @@ func removeStagedFiles(r addRemote, serial string) error {
 // read of the record and its change.
 var afterMarkerRead func()
 
-// settlePriorPath is where settleAbsentAdmission's claim of the machine keeps
-// the install record it replaced ("" when there was none), so that the record
-// is put back as it was, its admission and time with it: an install younger
-// than freshInstall keeps a fresh add out by that record.
+// settleClaimPath is the claim `lv host rm --serial` takes of the machine
+// while it settles the admission serial (settleAbsentAdmission): a file of
+// that serial's alone, which no add of serial runs past (machineClaim). A
+// settle never writes the machine's install record (addInstalledMarker);
+// it removes it only when it is serial's own (releaseInstallRecord).
+func settleClaimPath(serial string) string {
+	return "/etc/litevirt/.lv-add-settle-" + serial
+}
+
+// settlePriorPath is where a settle of an earlier build of this branch kept
+// the install record its claim replaced (its claim was the install record
+// itself; "" stood for none). Read only to put that record back while the
+// install record is still that claim (releaseInstallRecord), and never
+// removed otherwise.
 func settlePriorPath(serial string) string {
 	return addInstalledMarker + ".settle-" + serial
+}
+
+// legacySettleCopy is, when the install record line is a claim of serial X
+// that an earlier build's settle of X wrote (settlePriorPath(X) exists),
+// the record that claim replaced. Such a claim is no add's.
+func legacySettleCopy(r addRemote, line string) (string, bool, error) {
+	f := markerFields(line)
+	if len(f) < 5 || f[4] != "installing" || canonSerial(f[1]) == "" {
+		return "", false, nil
+	}
+	b, ok, err := r.ReadFile(settlePriorPath(canonSerial(f[1])))
+	if err != nil || !ok {
+		return "", false, err
+	}
+	return strings.TrimRight(string(b), "\n"), true, nil
 }
 
 // namesSerial reports whether the install record line is of serial, in any
@@ -574,9 +603,6 @@ const (
 	// releaseSettled: the serial is revoked with no row (a settle); only its
 	// add's claim goes, and an install record of it stays.
 	releaseSettled
-	// releaseUndo: the settle revoked nothing; the record its claim replaced
-	// is put back exactly.
-	releaseUndo
 )
 
 // fileIs is the shell test that the file at path holds content (without
@@ -594,16 +620,22 @@ func writeSyncedCmd(r addRemote, path, content, nonce string) string {
 		ssh.ShellQuote(content), tmp, tmp, tmp, p, ssh.ShellQuote(filepath.Dir(r.Path(path))))
 }
 
+// removeSyncedCmd removes path and syncs its directory.
+func removeSyncedCmd(r addRemote, path string) string {
+	return fmt.Sprintf("rm -f -- %s && sync -- %s", ssh.ShellQuote(r.Path(path)), ssh.ShellQuote(filepath.Dir(r.Path(path))))
+}
+
 // releaseInstallRecord takes the admission serial, which this removal
-// revoked (or, with releaseUndo, did not), off the machine's install record
-// (addInstalledMarker), under the add lock and only while the record, and
-// what a settle's claim kept of the one it replaced (settlePriorPath), are
-// exactly as read: a record a later add wrote is never changed.
+// revoked, off the machine's install record (addInstalledMarker), under the
+// add lock and only while the record is exactly as read. Only a record of
+// serial is changed: a record of serial goes as how says, and any other
+// admission's record, whenever it was written, is left as it is.
 //
-// Where a settle's claim replaced a record, that record is put back as it
-// was, another admission's install with its time, unless it was the serial's
-// own add's claim (releaseUndo puts back even that). Otherwise a record of
-// the serial goes as how says.
+// The one record of serial that is put back rather than removed is an
+// earlier build's settle claim of serial, with the record it replaced
+// (settlePriorPath): that record goes back exactly, and its copy with it.
+// The copy is otherwise left, unless another admission's finished install
+// has replaced the claim since.
 func releaseInstallRecord(r addRemote, serial string, how releaseMode) error {
 	b, ok, err := r.ReadFile(addInstalledMarker)
 	if err != nil {
@@ -619,35 +651,26 @@ func releaseInstallRecord(r addRemote, serial string, how releaseMode) error {
 	if ok {
 		cond = markerIs(r, line)
 	}
-	side := ssh.ShellQuote(r.Path(settlePriorPath(serial)))
-	dropSide := fmt.Sprintf("rm -f -- %s && sync -- %s", side, ssh.ShellQuote(filepath.Dir(r.Path(addInstalledMarker))))
-	if ok && !namesSerial(line, serial) {
-		// Another add's record since: left, and what the claim kept is stale.
-		if kept {
-			if _, err := r.Shell("unstage", lockedCmd(r, cond, dropSide)); err != nil && exitStatus(err) != notOurMachine {
-				return fmt.Errorf("remove %s: %w", settlePriorPath(serial), err)
-			}
-		}
-		return nil
-	}
-	if !ok && !kept {
-		return nil
-	}
-	var put string
+	var body string
 	switch {
-	case kept && how == releaseUndo:
-		put = prior
-	case kept && !isClaimOf(prior, serial):
-		put = prior
-	case kept:
-	case how == releaseRemoved, how == releaseSettled && isClaimOf(line, serial):
-	default:
-		return nil // an install record of a settled serial: it stays
-	}
-	body := "{ " + setMarkerCmd(r, put, nonceOr(serial)) + "; }"
-	if kept {
+	case kept && (!ok || isClaimOf(line, serial)):
+		put := prior
+		if namesSerial(prior, serial) && (how == releaseRemoved || isClaimOf(prior, serial)) {
+			put = ""
+		}
 		cond += " && " + fileIs(r, settlePriorPath(serial), prior)
-		body += " && " + dropSide
+		body = "{ " + setMarkerCmd(r, put, nonceOr(serial)) + "; } && " + removeSyncedCmd(r, settlePriorPath(serial))
+	case kept && !namesSerial(line, serial) && finishedInstall(line):
+		// Another admission installed the machine since: what the copy kept
+		// is no record any more, and no rollback gives the claim back.
+		cond += " && " + fileIs(r, settlePriorPath(serial), prior)
+		body = removeSyncedCmd(r, settlePriorPath(serial))
+	case !ok:
+		return nil
+	case how == releaseRemoved && namesSerial(line, serial), how == releaseSettled && isClaimOf(line, serial):
+		body = setMarkerCmd(r, "", nonceOr(serial))
+	default:
+		return nil // another admission's record, or an install of a settled serial: it stays
 	}
 	if afterMarkerRead != nil {
 		afterMarkerRead()
@@ -657,8 +680,38 @@ func releaseInstallRecord(r addRemote, serial string, how releaseMode) error {
 		return nil // another add's record since: left
 	}
 	if err != nil {
-		return fmt.Errorf("put back the record %s of the machine's install in place of the removed admission's: %w",
-			addInstalledMarker, err)
+		return fmt.Errorf("take the removed admission's record %s off the machine: %w", addInstalledMarker, err)
+	}
+	return nil
+}
+
+// finishedInstall reports whether the install record line is a finished
+// install (an earlier release's form has no state), not a claim.
+func finishedInstall(line string) bool {
+	f := markerFields(line)
+	return len(f) >= 3 && (len(f) < 5 || f[4] == "installed")
+}
+
+// dropSettleClaim removes serial's settle claim (settleClaimPath) under the
+// add lock: only while it is line, or whatever it is when line is "".
+func dropSettleClaim(r addRemote, serial, line string) error {
+	p := settleClaimPath(serial)
+	if line == "" {
+		_, ok, err := r.ReadFile(p)
+		if err != nil || !ok {
+			return err
+		}
+	}
+	cond := "true"
+	if line != "" {
+		cond = fileIs(r, p, line)
+	}
+	_, err := r.Shell("unstage", lockedCmd(r, cond, removeSyncedCmd(r, p)))
+	if exitStatus(err) == notOurMachine {
+		return nil // another run's claim since: it is that run's to remove
+	}
+	if err != nil {
+		return fmt.Errorf("remove the settle's claim %s of the machine: %w", p, err)
 	}
 	return nil
 }
@@ -727,8 +780,9 @@ func HostRemoveAdmission(ctx context.Context, c pb.LiteVirtClient, hostName, ser
 }
 
 // settleAbsentAdmission revokes serial, which no row holds, and removes what
-// its adds left on the machine at address: its staged files, records and
-// install record, never the installed identity. In order:
+// its adds left on the machine at address: its staged files and records,
+// and an install record of its own add's claim; never the installed
+// identity, and never another admission's install record. In order:
 //
 //  1. the daemon runs an ordinary removal's gates (admin, caught up, voter
 //     majority, a pull of the hosts table) and confirms that no row of
@@ -737,11 +791,12 @@ func HostRemoveAdmission(ctx context.Context, c pb.LiteVirtClient, hostName, ser
 //     naming hostName (a record, an install record or a staged certificate),
 //     no add may hold the machine, and the machine must not serve serial,
 //     which could be a completed add (then only the serial's staged files
-//     go, and nothing is revoked); the command then claims the machine
-//     (addInstalledMarker, compared with what it checked), so no add of it
-//     runs until the revocation is published;
+//     go, and nothing is revoked); the command then claims the machine for
+//     serial (settleClaimPath, compared with the install record and the
+//     certificate it checked), so no add of serial runs there until the
+//     cleanup is done;
 //  3. serial is revoked and the CRL published;
-//  4. the cleanup.
+//  4. the cleanup, its claim last.
 //
 // A step that fails names this same command, which finishes it: once the
 // serial is revoked here, a rerun publishes the CRL and cleans up.
@@ -764,31 +819,32 @@ func settleAbsentAdmission(ctx context.Context, c pb.LiteVirtClient, hostName, s
 	}
 	defer done()
 	if !revoked {
-		if err := claimForSettle(r, hostName, serial, address); err != nil {
+		claim, err := takeSettleClaim(r, hostName, serial, address)
+		if err != nil {
 			return err
 		}
 		if err := revokeHostCert(PKIDir(), hostName, serial); err != nil {
-			// Nothing was revoked: the record the claim replaced goes back.
-			if uerr := releaseInstallRecord(r, serial, releaseUndo); uerr != nil {
-				return fmt.Errorf("%w; putting back the machine's install record failed too (%v), and %s keeps it. "+
-					"Run `%s` once the revocation can be made", err, uerr, settlePriorPath(serial), again)
+			// Nothing was revoked: the claim goes.
+			if uerr := dropSettleClaim(r, serial, claim); uerr != nil {
+				return fmt.Errorf("%w; removing its claim %s of the machine failed too (%v), and it keeps that "+
+					"admission's adds out. Run `%s` once the revocation can be made", err, settleClaimPath(serial), uerr, again)
 			}
 			return err
 		}
 	}
 	version, err := publishClusterCRL(ctx, c, PKIDir())
 	if err != nil {
-		return fmt.Errorf("certificate %s is revoked in %s, but publishing the CRL failed (%v); the machine at %s stays "+
-			"claimed against adds for %s. Run `%s` to publish it and finish", serial,
-			filepath.Join(PKIDir(), "crl.pem"), err, address, staleClaim, again)
+		return fmt.Errorf("certificate %s is revoked in %s, but publishing the CRL failed (%v); its claim %s keeps "+
+			"that admission's adds off the machine at %s. Run `%s` to publish it and finish", serial,
+			filepath.Join(PKIDir(), "crl.pem"), err, settleClaimPath(serial), address, again)
 	}
 	if err := removeStaged(r, serial, releaseSettled); err != nil {
 		return fmt.Errorf("certificate %s is revoked and CRL %d published, but removing what its adds left on %s "+
 			"failed (%v). Run `%s` to finish it", serial, version, address, err, again)
 	}
 	fmt.Printf("Revoked certificate %s in CRL %d; no host row holds it, and none was removed.\n", serial, version)
-	fmt.Printf("  removed its adds' staged files and records on %s; the machine's installed identity and its "+
-		"install record are as they were\n", address)
+	fmt.Printf("  removed its adds' staged files and records on %s; the machine's installed identity and any other "+
+		"admission's install record are as they were\n", address)
 	return nil
 }
 
@@ -831,50 +887,58 @@ func admissionAbsent(err error) bool {
 // and its claim.
 var beforeSettleClaim func()
 
-// claimForSettle checks the machine r for settleAbsentAdmission and claims
-// it, the claim compared under the add lock with the install record and the
-// certificate it checked.
+// claimForSettle is takeSettleClaim without the claim it took.
 func claimForSettle(r addRemote, hostName, serial, address string) error {
+	_, err := takeSettleClaim(r, hostName, serial, address)
+	return err
+}
+
+// takeSettleClaim checks the machine r for settleAbsentAdmission and claims
+// it for serial (settleClaimPath), the claim compared under the add lock
+// with the install record and the certificate it checked. It returns the
+// claim. The install record is read, never written.
+func takeSettleClaim(r addRemote, hostName, serial, address string) (string, error) {
 	crt := filepath.Join(remotePKIDir, "host.crt")
 	pemB, now, err := remoteCert(r, crt)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if now == serial {
 		if err := removeStagedFiles(r, serial); err != nil {
-			return fmt.Errorf("the machine at %s serves certificate %s: a completed add cannot be ruled out, so nothing "+
+			return "", fmt.Errorf("the machine at %s serves certificate %s: a completed add cannot be ruled out, so nothing "+
 				"was revoked; removing its staged files failed too (%v)", address, serial, err)
 		}
-		return fmt.Errorf("the machine at %s serves certificate %s: a completed add cannot be ruled out, so nothing "+
+		return "", fmt.Errorf("the machine at %s serves certificate %s: a completed add cannot be ruled out, so nothing "+
 			"was revoked. Its staged files were removed; the machine's identity and install record are as they were. "+
-			"If its row is still to arrive, run `lv host rm %s` on a host that lists it", address, serial, hostName)
+			"If its row is still to arrive, run `lv host rm %s` on a host that lists it", address, serial, shellWord(hostName))
 	}
 	b, ok, err := r.ReadFile(addInstalledMarker)
 	if err != nil {
-		return err
+		return "", err
 	}
 	prior := ""
 	if ok {
 		prior = strings.TrimRight(string(b), "\n")
 	}
-	sb, kept, err := r.ReadFile(settlePriorPath(serial))
-	if err != nil {
-		return err
-	}
 	f := markerFields(prior)
 	if len(f) >= 5 && f[4] == "installing" {
+		// An add's claim, unless an earlier build's settle wrote it.
+		_, settling, err := legacySettleCopy(r, prior)
+		if err != nil {
+			return "", err
+		}
 		at, _ := strconv.ParseInt(f[2], 10, 64)
-		if addNow().Sub(time.Unix(at, 0)) < staleClaim {
-			return fmt.Errorf("an `lv host add` holds the machine at %s (claimed less than %s ago); nothing was revoked. "+
+		if !settling && addNow().Sub(time.Unix(at, 0)) < staleClaim {
+			return "", fmt.Errorf("an `lv host add` holds the machine at %s (claimed less than %s ago); nothing was revoked. "+
 				"Run this again once it has finished", address, staleClaim)
 		}
 	}
 	trace, err := settleTrace(r, hostName, serial, f)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if !trace {
-		return fmt.Errorf("the machine at %s holds no staged file, record or install record of certificate %s for %s, "+
+		return "", fmt.Errorf("the machine at %s holds no staged file, record or install record of certificate %s for %s, "+
 			"so it is not where that admission's add ran; nothing was revoked", address, serial, hostName)
 	}
 	if beforeSettleClaim != nil {
@@ -882,10 +946,10 @@ func claimForSettle(r addRemote, hostName, serial, address string) error {
 	}
 	nonce, err := attemptNonce()
 	if err != nil {
-		return err
+		return "", err
 	}
 	cond := markerAbsent(r)
-	if prior != "" {
+	if ok {
 		cond = markerIs(r, prior)
 	}
 	q := ssh.ShellQuote(r.Path(crt))
@@ -895,33 +959,23 @@ func claimForSettle(r addRemote, hostName, serial, address string) error {
 		sum := sha256.Sum256(pemB)
 		cond += fmt.Sprintf(" && [ \"$(sha256sum < %s | cut -d' ' -f1)\" = %s ]", q, hex.EncodeToString(sum[:]))
 	}
-	// The record the claim replaces is kept (settlePriorPath) and put back
-	// once the serial is settled. One an earlier claim of this serial
-	// replaced is kept already: the record now is that claim, or none.
-	body := "{ " + setMarkerCmd(r, settleClaimLine(hostName, serial, nonce), nonce) + "; }"
-	if kept && (!ok || namesSerial(prior, serial)) {
-		cond += " && " + fileIs(r, settlePriorPath(serial), strings.TrimRight(string(sb), "\n"))
-	} else {
-		keep := ""
-		if prior != "" {
-			keep = prior + "\n"
-		}
-		body = "{ " + writeSyncedCmd(r, settlePriorPath(serial), keep, nonce) + "; } && " + body
-	}
-	_, err = r.Shell("claim", lockedCmd(r, cond, body))
+	// The claim is serial's own file, taken over one an earlier run of this
+	// command left: the install record stays as it is.
+	claim := settleClaimLine(hostName, serial, nonce)
+	_, err = r.Shell("claim", lockedCmd(r, cond, writeSyncedCmd(r, settleClaimPath(serial), claim+"\n", nonce)))
 	if exitStatus(err) == notOurMachine {
-		return fmt.Errorf("the machine at %s changed while it was checked; nothing was revoked. Run `%s` again",
+		return "", fmt.Errorf("the machine at %s changed while it was checked; nothing was revoked. Run `%s` again",
 			address, settleRmCmd(hostName, serial, address))
 	}
 	if err != nil {
-		return fmt.Errorf("claim the machine at %s before revoking: %w; nothing was revoked", address, err)
+		return "", fmt.Errorf("claim the machine at %s before revoking: %w; nothing was revoked", address, err)
 	}
-	return nil
+	return claim, nil
 }
 
 // settleClaimLine is a settle's claim of the machine for serial.
 func settleClaimLine(hostName, serial, nonce string) string {
-	return markerLine(hostName, serial, addNow().Unix(), nonce, "installing")
+	return markerLine(hostName, serial, addNow().Unix(), nonce, "settling")
 }
 
 // settleName reports whether hostName may be settled with no row to check it

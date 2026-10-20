@@ -184,14 +184,21 @@ the machine at `--address`, under its add lock, the serial must have left a
 staged file, record or install record for `<name>`, and no add may hold the
 machine; a machine that serves the serial may be a completed add, so only the
 serial's staged files are removed and nothing is revoked. The command then
-claims the machine (`/etc/litevirt/.lv-add-installed`, compared with what it
-checked, the record it replaces kept beside it), revokes the serial,
-publishes the CRL, removes that serial's staged files and records, and puts
-the install record back as it was: another admission's install keeps its
-name and time, and so the hour in which it keeps a fresh add out. Only the
-serial's own add's claim is removed, and never the installed identity. A
-step that fails after the revocation, the publication or the cleanup, says so
-and names the same command, which finishes it. `lv host rm <name>` of a
+claims the machine for that serial alone
+(`/etc/litevirt/.lv-add-settle-<serial>`, taken only while the install record
+and the certificate are as it checked), so no add of that admission runs
+there until it has finished; it revokes the serial, publishes the CRL,
+removes that serial's staged files and records, and removes its claim last.
+It never writes `/etc/litevirt/.lv-add-installed`: another admission's
+install keeps its record, name and time, and so the hour in which it keeps a
+fresh add out, whatever runs between or fails. Only the serial's own add's
+claim is removed from it, and never the installed identity. A record an
+earlier build of this command claimed, with the record it replaced kept in
+`/etc/litevirt/.lv-add-installed.settle-<serial>`, gets that record back when
+the same command runs, and until then an add judges the machine by the kept
+record and names that command. A step that fails after the revocation, the
+publication or the cleanup, says so and names the same command, which
+finishes it. `lv host rm <name>` of a
 joining host whose cleanup on the machine fails does the same. Install and
 attempt records quote a host name that holds a blank, and with no row the
 command takes such a name when it prints safely; the machine's trace must
@@ -214,7 +221,8 @@ activates it once the other is removed), and `lv health` shows
 From just before it installs to the end of its setup or rollback, an add
 holds the machine: it claims it in `/etc/litevirt/.lv-add-installed`, and every
 command it then runs there takes an `flock` on `/etc/litevirt/.lv-add.lock` in
-the shell that runs it and acts only while that record is still its claim. A
+the shell that runs it and acts only while that record is still its claim,
+and no `lv host rm --serial` of its admission has claimed the machine. A
 command delayed past a lost connection therefore runs under the lock or does
 nothing, and never acts on a machine another add has claimed since. Without
 `flock` (util-linux) on the machine the add refuses. Another add of the machine

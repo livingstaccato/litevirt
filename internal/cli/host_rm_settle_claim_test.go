@@ -629,3 +629,117 @@ func TestHostRemoveSerial_AClaimGoesWhenTheMachineServesTheSerial(t *testing.T) 
 		t.Errorf("the earlier run's claim is left (stat: %v)", err)
 	}
 }
+
+// Round-5 review m2, R1: the settle's claim is taken only while the
+// machine's certificate is the one it checked, whatever the install record
+// says. An add whose claim is already stale (an earlier release's, or a slow
+// one) installing the serial between the settle's checks and its claim
+// changes only host.crt; the settle then revokes nothing.
+//
+// Mutation: drop the certificate compare from the claim — S is revoked
+// while the machine serves it.
+func TestHostRemoveSerial_AClaimNeedsTheCertificateItChecked(t *testing.T) {
+	m := newSettleMachine(t)
+	staged, _ := filepath.Glob(filepath.Join(m.f.targetPKI, ".host.crt.add-"+m.serial+"-*"))
+	var crt []byte
+	for _, p := range staged {
+		if !strings.HasSuffix(p, ".before") {
+			crt = mustRead(t, p)
+		}
+	}
+	if crt == nil {
+		t.Fatal("no staged certificate")
+	}
+	beforeSettleClaim = func() {
+		if err := os.WriteFile(filepath.Join(m.f.targetPKI, "host.crt"), crt, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { beforeSettleClaim = nil })
+	c := &serialRemoveClient{hostRemoveTestClient: &hostRemoveTestClient{}}
+	err := HostRemoveAdmission(context.Background(), c, "node-9", m.serial, "10.0.0.9", false)
+	if err == nil || !strings.Contains(err.Error(), "changed while it was checked") {
+		t.Fatalf("removal = %v, want refused as changed while checked", err)
+	}
+	if serialInCRL(t, m.f.opPKI, m.serial) || countCalls(c.calls, "publish") != 0 {
+		t.Error("the serial the machine now serves was revoked")
+	}
+	if _, err := os.Stat(m.f.target.Path(settleClaimPath(m.serial))); !os.IsNotExist(err) {
+		t.Error("a claim was taken")
+	}
+}
+
+// claimRacer is the machine with a second run of the same command taking
+// its own claim right after this run's claim.
+type claimRacer struct {
+	*LocalAddTarget
+	serial, other string
+}
+
+func (c *claimRacer) Shell(kind, cmd string) ([]byte, error) {
+	out, err := c.LocalAddTarget.Shell(kind, cmd)
+	if kind == "claim" && err == nil {
+		if werr := os.WriteFile(c.Path(settleClaimPath(c.serial)), []byte(c.other+"\n"), 0o600); werr != nil {
+			return nil, werr
+		}
+	}
+	return out, err
+}
+
+// Round-5 review m2, R13: two runs of S's command at once. A's revocation
+// fails, and its undo removes only the claim A took: B's, taken since,
+// keeps S's adds held off through B's revocation.
+//
+// Mutation: undo with no compare (dropSettleClaim(r, serial, "")) — B's
+// claim goes.
+func TestHostRemoveSerial_AFailedRevocationLeavesAnotherRunsClaim(t *testing.T) {
+	m := newSettleMachine(t)
+	other := markerLine("node-9", m.serial, 2, "bbbbbbbbbbbb", "settling")
+	m.dial(t, &claimRacer{LocalAddTarget: m.f.target, serial: m.serial, other: other})
+	key := filepath.Join(m.f.opPKI, "ca.key")
+	if err := os.Rename(key, key+".away"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Rename(key+".away", key) })
+	c := &serialRemoveClient{hostRemoveTestClient: &hostRemoveTestClient{}}
+	if err := HostRemoveAdmission(context.Background(), c, "node-9", m.serial, "10.0.0.9", false); err == nil {
+		t.Fatal("the run whose revocation fails succeeded")
+	}
+	if got, err := os.ReadFile(m.f.target.Path(settleClaimPath(m.serial))); err != nil || string(got) != other+"\n" {
+		t.Errorf("the other run's claim = %q (%v), want it left", got, err)
+	}
+}
+
+// Round-5 review m2, R11: the refusal of a retry under a settle's claim
+// prints the settle's command with the name as one shell word, for a name
+// with a blank and shell metacharacters.
+//
+// Mutation: print the name unquoted in refuseSettling — the command splits
+// and runs what follows the ';'.
+func TestHostAdd_ARetryUnderASettleClaimPrintsAShellSafeCommand(t *testing.T) {
+	const name = "a b;touch${IFS}pwned"
+	f := newAddFixture(t)
+	S := strandedAddAs(t, f, name)
+	if err := claimForSettle(f.target, name, S, "10.0.0.9"); err != nil {
+		t.Fatal(err)
+	}
+	err := HostAddOn(context.Background(), f.client, f.target, name, "10.0.0.9")
+	if err == nil || !strings.Contains(err.Error(), "has not finished") {
+		t.Fatalf("the retry = %v, want refused under the settle's claim", err)
+	}
+	msg := err.Error()
+	i := strings.LastIndex(msg, "`lv host rm ")
+	j := strings.LastIndex(msg, "` finishes it")
+	if i < 0 || j <= i {
+		t.Fatalf("no settle command in %q", msg)
+	}
+	dir := t.TempDir()
+	got := shellWords(t, dir, msg[i+1:j])
+	want := []string{"lv", "host", "rm", name, "--serial", S, "--address", "10.0.0.9"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("printed %q splits as %q, want %q", msg[i+1:j], got, want)
+	}
+	if ents, _ := os.ReadDir(dir); len(ents) != 0 {
+		t.Errorf("evaluating the printed command ran something: %v", ents)
+	}
+}

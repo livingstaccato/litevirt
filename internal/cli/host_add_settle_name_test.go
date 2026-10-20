@@ -17,7 +17,9 @@ import (
 // now, so the add prints the exact command for those, quoted as the removal
 // quotes it, and that command, evaluated by sh, runs nothing else and
 // settles the attempt. Only a name the removal would refuse keeps the
-// dead end.
+// dead end. A new name outside the host-name charset is refused before
+// anything (checkAddName), so these are records an older build left
+// (strandedAddAs).
 //
 // Mutation: print the command only for validHostName names again — "a b"
 // and the metacharacter names get the dead end.

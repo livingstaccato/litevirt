@@ -67,8 +67,11 @@ func TestAddRerunCommand_IsShellSafe(t *testing.T) {
 			t.Errorf("evaluating the command for %q ran something: %v", n, ents)
 		}
 	}
+	// Such a name is one an older build admitted (a new one is refused
+	// before anything): the rerun of its joining admission fails again.
 	for _, n := range []string{"a b", "x;touch${IFS}pwned"} {
 		f := newAddFixture(t)
+		strandedAddAs(t, f, n)
 		f.target.FailSetup = errors.New("setup failed")
 		err := HostAddOn(context.Background(), f.client, f.target, n, "10.0.0.9")
 		want := addRerunCmd(n, "root@10.0.0.9")

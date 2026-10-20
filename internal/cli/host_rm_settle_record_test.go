@@ -218,16 +218,37 @@ func TestHostRemoveSerial_SettlingARenewedMembersPredecessorKeepsItsInstallRecor
 	}
 }
 
-// strandedAddAs is strandedAdd under name.
+// strandedAddAs is strandedAdd under name. A new name outside the host-name
+// charset is refused before anything now (checkAddName), so such a name is
+// one an older build admitted: the add runs as node-9, and its joining row
+// and attempt records are then written under name, as that build wrote them.
 func strandedAddAs(t *testing.T, f *addFixture, name string) string {
 	t.Helper()
 	f.target.FailSetup = fmt.Errorf("setup failed")
-	if err := HostAddOn(context.Background(), f.client, f.target, name, "10.0.0.9"); err == nil {
+	if err := HostAddOn(context.Background(), f.client, f.target, "node-9", "10.0.0.9"); err == nil {
 		t.Fatal("the first add succeeded")
 	}
 	f.target.FailSetup = nil
 	f.identityUnchanged(t)
-	return f.client.admitted[0]
+	serial := f.client.admitted[0]
+	if name == "node-9" {
+		return serial
+	}
+	recs, err := addRecords(f.target, serial)
+	if err != nil || len(recs) == 0 {
+		t.Fatalf("records of %s: %v, %v", serial, recs, err)
+	}
+	for _, rec := range recs {
+		if err := os.WriteFile(f.target.Path(addRecordPath(rec.tag)), []byte(addRecordLine(name, rec.before)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, h := range f.client.hosts {
+		if h.GetName() == "node-9" {
+			h.Name = name
+		}
+	}
+	return serial
 }
 
 // Codex foreign-install I2 (our review m1): a host name with a blank is one

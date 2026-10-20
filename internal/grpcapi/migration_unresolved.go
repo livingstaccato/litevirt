@@ -92,10 +92,11 @@ func (s *Server) inFlightMoveAdvice(ctx context.Context, vm string) string {
 		"re-run drain once it ends (`lv events " + vm + "`)"
 }
 
-// inFlightMoveRefusal refuses op, a start of vm on this host, while vm's row
+// inFlightMoveRefusal refuses op (a start, restart or reconfigure of vm on
+// this host, or a stop that has not asked the move's target) while vm's row
 // says migrating: a move of it is in flight, or ended leaving the row so, and
 // the guest may run on the move's target. A start here would make a second
-// copy. Restart recovery does not start through here.
+// copy; a stop recorded here would let the next start make one.
 func (s *Server) inFlightMoveRefusal(ctx context.Context, op string, vm *corrosion.VMRecord) error {
 	if vm.State != "migrating" {
 		return nil
@@ -108,10 +109,50 @@ func (s *Server) inFlightMoveRefusal(ctx context.Context, op string, vm *corrosi
 	if s.migrationUnresolved(ctx, vm.Name) {
 		why = fmt.Sprintf("its move to %s ended without libvirt's answer (%s, see `lv health`)", target, condMigrationUnresolved)
 	}
+	done := "nothing is started here"
+	switch op {
+	case "stop":
+		done = "it is not recorded stopped here"
+	case "reconfigure":
+		done = "nothing of it is stopped, redefined or started here"
+	}
 	return status.Errorf(codes.FailedPrecondition,
-		"%s %q refused: its record says migrating, as %s, and the guest may run on %s; nothing is started here. "+
+		"%s %q refused: its record says migrating, as %s, and the guest may run on %s; %s. "+
 			"Once no move of it runs, %s",
-		op, vm.Name, why, target, settleMigratingAdvice(vm.Name))
+		op, vm.Name, why, target, done, settleMigratingAdvice(vm.Name))
+}
+
+// movingVMStartRefusal is the refusal EVERY start of a VM's domain passes
+// through, whatever asked for it: startVMLocked, and PrepareHardwareForStart
+// for the paths that start outside it (the reconciler's and the health
+// checker's restarts, a restore). A row recorded migrating is not started.
+// The row is read again here, so a caller's stale record does not get past
+// it; one that cannot be read refuses the start as retryable, whether a move
+// of the VM is in flight being unknown. A VM with no row yet (a restore's,
+// written once it runs) is not a moving VM.
+//
+// Only a move itself brings up the guest of a row recorded migrating, on the
+// target, through libvirt's migration, never through a start here: no start
+// path is exempt.
+func (s *Server) movingVMStartRefusal(ctx context.Context, vm *corrosion.VMRecord) error {
+	if vm == nil {
+		return nil
+	}
+	if err := s.inFlightMoveRefusal(ctx, "start", vm); err != nil {
+		return err
+	}
+	if s.db == nil {
+		return nil
+	}
+	row, err := corrosion.GetVM(ctx, s.db, vm.Name)
+	if err != nil {
+		return status.Errorf(codes.Unavailable,
+			"start %q: whether a move of it is in flight cannot be read (%v); retry", vm.Name, err)
+	}
+	if row == nil {
+		return nil
+	}
+	return s.inFlightMoveRefusal(ctx, "start", row)
 }
 
 // migratingStopProbeTimeout bounds the ask of a migrating VM's target

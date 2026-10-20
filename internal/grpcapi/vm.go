@@ -2470,6 +2470,11 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	if vm == nil {
 		return releasePreflight, status.Errorf(codes.InvalidArgument, "prepare hardware for start: nil vm record")
 	}
+	// A row recorded migrating is not started by any path: the guest may run
+	// on the move's target (movingVMStartRefusal reads the row again).
+	if err := s.movingVMStartRefusal(ctx, vm); err != nil {
+		return releasePreflight, err
+	}
 	// A cutover that a crash interrupted after its commit owes this name its
 	// runtime handoff: until the resume (which runs in the background, and
 	// waits out storage that does not answer) has put the replacement's
@@ -2590,6 +2595,13 @@ func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb
 // startInFlightError is returned; the caller must hold the VM lock until its
 // settled is closed (heldForStart), not let it go on return.
 func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord, wait time.Duration) (*pb.VM, error) {
+	// A row recorded migrating is not started, whoever asks: the guest may
+	// run on the move's target. Refused before anything of the VM is touched
+	// (PrepareHardwareForStart below refuses it again, for the paths that
+	// start outside this primitive).
+	if err := s.movingVMStartRefusal(ctx, vm); err != nil {
+		return nil, err
+	}
 	// A volume move this host left unresolved points the disk row at the file
 	// the persistent config names before anything reads the rows, or refuses
 	// the start (move_unresolved.go).
@@ -2812,9 +2824,13 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 		}
 	}
 
-	out, err := s.stopVMLocked(ctx, vm, req.Force, req.Timeout)
-	if err == nil && vm.State == "migrating" {
-		// The stop settled a row a move left migrating.
+	if vm.State != "migrating" {
+		return s.stopVMLocked(ctx, vm, req.Force, req.Timeout)
+	}
+	// The guest runs here, or the target was asked above: this stop settles
+	// the row a move left migrating.
+	out, err := s.stopMoveLeftLocked(ctx, vm, req.Force, req.Timeout)
+	if err == nil {
 		s.resolveMigrationUnresolved(context.WithoutCancel(ctx), vm.Name)
 	}
 	return out, err
@@ -2823,6 +2839,11 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 // stopVMLocked stops a LOCAL VM (force ⇒ destroy, else graceful shutdown with a
 // timeout then force-kill). The caller MUST hold the VM lock, have re-read vm under
 // it, and confirmed local ownership; it never locks or forwards.
+//
+// A row recorded migrating is refused: the guest may run on the move's
+// target, and a stop recorded here would let the next start make a second
+// copy. Only StopVM, which asks the target first or finds the guest running
+// here, records such a row stopped (stopMoveLeftLocked).
 func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force bool, timeoutSec int32) (*pb.VM, error) {
 	return s.stopVMLockedNote(ctx, vm, force, timeoutSec, "")
 }
@@ -2830,6 +2851,25 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 // stopVMLockedNote is stopVMLocked recording note as the stop event's detail
 // when the stop has none of its own.
 func (s *Server) stopVMLockedNote(ctx context.Context, vm *corrosion.VMRecord, force bool, timeoutSec int32, note string) (*pb.VM, error) {
+	if err := s.inFlightMoveRefusal(ctx, "stop", vm); err != nil {
+		return nil, err
+	}
+	return s.stopLocked(ctx, vm, force, timeoutSec, note, false)
+}
+
+// stopMoveLeftLocked is stopVMLocked for a row recorded migrating whose
+// guest the caller has found running here, or whose move's target it has
+// asked and found without it (migratingStopRefusal): the stop settles the
+// row. A row with no domain here then counts as stopped (its cut-over
+// undefined it). StopVM's and a delete's, after their checks; no other
+// caller.
+func (s *Server) stopMoveLeftLocked(ctx context.Context, vm *corrosion.VMRecord, force bool, timeoutSec int32) (*pb.VM, error) {
+	return s.stopLocked(ctx, vm, force, timeoutSec, "", true)
+}
+
+// stopLocked is the stop itself. settlesMove says the caller is entitled to
+// stop a row recorded migrating (stopMoveLeftLocked).
+func (s *Server) stopLocked(ctx context.Context, vm *corrosion.VMRecord, force bool, timeoutSec int32, note string, settlesMove bool) (*pb.VM, error) {
 	hspec := vmHooks(vm)
 	pbVM := &pb.VM{Name: vm.Name, HostName: vm.HostName, State: pb.VMState_VM_STOPPING}
 	hooks.Run(ctx, hooks.PreStop, pbVM, hspec)
@@ -2840,13 +2880,15 @@ func (s *Server) stopVMLockedNote(ctx context.Context, vm *corrosion.VMRecord, f
 	// or when whether it is cannot be read, is still the error it was.
 	noop, noDomain := false, false
 	beingStarted := vm.State == "pending" || vm.State == "starting"
+	// No domain here means nothing runs here for a start deferred before its
+	// define (storage that does not answer), and for a row recorded
+	// migrating whose cut-over undefined it here — only once its target has
+	// been asked (settlesMove: stopMoveLeftLocked). Any other row's missing
+	// domain is still the error it was.
+	noDomainIsStopped := beingStarted || (settlesMove && vm.State == "migrating")
 	alreadyStopped := func(op string, err error) bool {
 		active, aerr := s.virt.DomainIsActive(vm.Name)
-		if aerr != nil && (beingStarted || vm.State == "migrating") && lv.IsNoDomain(aerr) {
-			// A start deferred before its define (storage that does not
-			// answer) leaves no domain: nothing runs. Nor does a VM recorded
-			// migrating whose cut-over undefined it here, its target asked
-			// first (StopVM).
+		if aerr != nil && noDomainIsStopped && lv.IsNoDomain(aerr) {
 			slog.Info("StopVM: the VM has no domain here; nothing to stop", "vm", vm.Name, "op", op, "error", err)
 			noop, noDomain = true, true
 			return true
@@ -3316,15 +3358,23 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		}
 	}
 	// A VM recorded migrating may run on the move's target: its delete asks
-	// the target first, as its stop does, unless the guest runs here.
+	// the target first, as its stop does, unless the guest runs on the VM's
+	// host — looked at here when that is this host, asked of it otherwise.
 	if !deleteLocalOnly(ctx) && !s.isRemotePeer(ctx) && !isRecreateDelete(ctx) {
 		if vm, gerr := corrosion.GetVM(ctx, s.db, req.Name); gerr == nil && vm != nil && vm.State == "migrating" {
-			runsHere := false
-			if vm.HostName == s.hostName && s.virt != nil {
-				active, aerr := s.virt.DomainIsActive(vm.Name)
-				runsHere = aerr == nil && active
+			runsOnSource := false
+			if vm.HostName == s.hostName {
+				if s.virt != nil {
+					active, aerr := s.virt.DomainIsActive(vm.Name)
+					runsOnSource = aerr == nil && active
+				}
+			} else {
+				pctx, cancel := context.WithTimeout(ctx, migratingStopProbeTimeout)
+				st, perr := s.CheckPeerVMRuntime(pctx, vm.HostName, vm.Name)
+				cancel()
+				runsOnSource = perr == nil && st == health.RuntimeRunning
 			}
-			if !runsHere {
+			if !runsOnSource {
 				if rerr := s.migratingStopRefusal(ctx, "delete", vm); rerr != nil {
 					return nil, rerr
 				}
@@ -3866,7 +3916,17 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// powered off. It runs the same stop path as StopVM{force} — hooks and the
 	// operator-stop record — under the lock this delete already holds.
 	if req.Force && activeErr == nil && active {
-		if _, err := s.stopVMLocked(ctx, vm, true, 0); err != nil {
+		forceStop := s.stopVMLocked
+		if vm.State == "migrating" {
+			// The guest runs here, and DeleteVM (the entry) has checked the
+			// row: this is StopVM's runs-here arm. libvirtd may still run the
+			// move's job: aborted first, so no cut-over lands under the stop.
+			if aerr := s.virt.AbortMigration(vm.Name); aerr != nil {
+				slog.Info("DeleteVM: no migration job to abort before stopping a VM recorded migrating", "vm", vm.Name, "error", aerr)
+			}
+			forceStop = s.stopMoveLeftLocked
+		}
+		if _, err := forceStop(ctx, vm, true, 0); err != nil {
 			// stopVMLocked can fail after the domain was destroyed (the
 			// pre-latch device release, recording the stop). Ask libvirt: a
 			// domain still active means nothing was touched; a stopped one
@@ -6228,6 +6288,13 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			}
 			if fresh.ActiveOperationID != "" {
 				return nil, status.Errorf(codes.FailedPrecondition, "cannot reconfigure %q: an operation is in progress", req.Name)
+			}
+			// A row recorded migrating: the guest may run on the move's
+			// target, so neither the stop nor the start below may happen
+			// here. Refused before the release gate records anything
+			// (the stop and start primitives refuse such a row too).
+			if err := s.inFlightMoveRefusal(ctx, "reconfigure", fresh); err != nil {
+				return nil, err
 			}
 			// A point-in-time overlay an earlier copy left holds writes the
 			// disk's file lacks; the redefine below would drop it.

@@ -670,6 +670,10 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 		return nil
 	}
 	if rec, gErr := corrosion.GetVM(ctx, s.db, m.ReplacedVM); gErr == nil && rec != nil {
+		// A row recorded migrating is not started by any path.
+		if e := s.movingVMStartRefusal(ctx, rec); e != nil {
+			return failed("start", e)
+		}
 		if e := s.verifyVMISOForStart(rec); e != nil {
 			return failed("start", e)
 		}

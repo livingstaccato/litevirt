@@ -3265,8 +3265,10 @@ move that ended without libvirt's answer while the guest was not running on
 the drained host (or its state there could not be read), or a daemon that
 stopped mid-move, raised when it starts again. The guest may run on the move's
 target, so the record stays `migrating`, a drain's target keeps its capacity
-reservation, and nothing starts or moves the VM: `lv start` and `lv restart`
-of it are refused, and a drain skips it, pointing here. The evidence names the
+reservation, and nothing starts or moves the VM: `lv start`, `lv restart` and
+`lv update --restart-if-needed` of it are refused, and a drain skips it,
+pointing here. No start path starts a VM recorded `migrating`, on any host:
+only the move itself brings its guest up, on the target. The evidence names the
 VM's host (`source`), the target (`target`) and what happened (`detail`).
 Find where the guest runs (`virsh list` on both hosts). If it runs on a host,
 `lv doctor repair-owner <vm> <host>` records it there; if it runs on none,

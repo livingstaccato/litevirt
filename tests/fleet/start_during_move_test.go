@@ -230,7 +230,8 @@ func webState(t *testing.T, n *Node) string {
 // Mutations: an unanswering target taken as absent — not-fenced,
 // returned-after-fence and unproven-fence go red. No proof read — fenced and
 // removed go red. A fenced state taken as proof without its fence row —
-// unproven-fence goes red.
+// unproven-fence goes red. A removed or rowless target taken as off without
+// a proof-grade fence — removed-unproven goes red.
 func TestFleet_StopOfAVMLeftMigratingWhoseTargetIsGone(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
@@ -255,6 +256,13 @@ func TestFleet_StopOfAVMLeftMigratingWhoseTargetIsGone(t *testing.T) {
 			}
 		}, true},
 		{"not-fenced", func(*testing.T, *Node, *Node) {}, false},
+		{"removed-unproven", func(t *testing.T, src, dst *Node) {
+			// Removed without a confirmed power-off (`lv host rm --dead`
+			// alone): it may still run the guest.
+			if err := corrosion.UpdateHostState(ctx, src.DB, dst.Name, "removed"); err != nil {
+				t.Fatal(err)
+			}
+		}, false},
 		{"returned-after-fence", func(t *testing.T, src, dst *Node) {
 			// Confirmed off once, and back since: that fence proves nothing now.
 			if err := corrosion.RecordFenceWithState(ctx, src.DB, corrosion.FenceLogRecord{

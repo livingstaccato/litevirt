@@ -155,7 +155,12 @@ host's daemon between them:
 3. **drop-old** — every host trusts the new CA alone; the operator machine
    retires the old one.
 
-Storage migrations keep working throughout, and no host needs a restart.
+No host needs a restart. While trust-both or drop-old is being pushed, a
+host already updated and one not yet updated hold different CA files, so a
+storage copy between them is refused (never sent in plaintext) and a
+memory-only move stays in libvirt's tunnel; once every host has the phase,
+storage copies work again. Throughout reissue every host holds the same
+two-CA file, so storage copies keep working.
 Before it starts, the command asks every host's daemon for its migration
 credentials and refuses, changing nothing, unless each holds a complete, valid
 set its daemon can install, trusting this machine's migration CA. A host with
@@ -178,9 +183,8 @@ kept for audit once a rotation finishes; its key is deleted.
 `--no-overlap` skips the overlap window entirely: it cuts every host straight
 to the new CA alone in one pass. Use it only when the migration CA key is
 compromised — there is no window where both CAs are trusted, so migrations
-between a host already rotated and one not yet rotated are refused until every
-host is done (falling back to plaintext only if that host set
-`migration.allow_unencrypted_storage`). `--force` leaves an unreachable host
+between a host already rotated and one not yet rotated are refused, never sent
+in plaintext, until every host is done. `--force` leaves an unreachable host
 behind instead of stopping the whole run; it keeps the old CA's credentials,
 so migrations with it are refused until you run
 `lv host install-migration-tls --reissue` once it is back.

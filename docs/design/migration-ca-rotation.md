@@ -88,6 +88,13 @@ current phase's unfinished hosts.
    CA, for its recorded IPv4 address, exactly as `issueMigrationCredentials`
    does today. Hosts on old and new certificates still accept each other,
    because every host trusts both CAs.
+
+A storage-copy source compares its CA file with the target's as a set
+(`migrationCAMismatch` in `internal/grpcapi/migrate.go`) and refuses a
+mismatch. While phase 1 or phase 3 is being pushed, an updated host and one
+not yet updated hold different sets, so storage copies between them are
+refused until the phase reaches every host; memory-only moves stay in
+libvirt's tunnel. Throughout phase 2 every host holds the same bundle.
 3. **drop-old.** Each host's `ca.crt` becomes the new CA alone. Only then does
    the operator machine rename `migration-ca.next.*` over `migration-ca.*`,
    delete the old key, keep the old certificate as `retired-<date>` (`-2`,
@@ -113,10 +120,9 @@ install them (a refused `/etc/pki/qemu`, a failed validation) holds the gate.
 
 For a compromised CA key. It mints the new CA, then pushes the new-CA-only
 `ca.crt` together with the new certificate and key to each host in a single
-pass, and finalizes as phase 3 does. Until every host is done, a migration
-between an updated host and one not yet updated fails the handshake and is
-refused. It is never sent in plaintext unless that host set
-`migration.allow_unencrypted_storage` — which `lv doctor migration-tls` flags.
+pass, and finalizes as phase 3 does. Until every host is done, a storage
+copy between an updated host and one not yet updated is refused by the
+source's migration-CA comparison, never sent in plaintext.
 
 ### `--force`
 

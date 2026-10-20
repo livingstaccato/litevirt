@@ -20,6 +20,7 @@ type Assignment struct {
 	RecordedAt    string                   `json:"recorded_at"`
 	Owner         *OwnerAssignment         `json:"owner,omitempty"`
 	Identity      *IdentityAssignment      `json:"identity,omitempty"`
+	Target        *TargetAssignment        `json:"target,omitempty"`
 }
 type controlBody struct {
 	Version int `json:"version"`
@@ -57,6 +58,13 @@ func decodeFieldsObject(b []byte, out any, fields ...string) error {
 // ValidateSupportedCommand is shared by pre-slot admission and the direct
 // acceptor gate. It is structural capability validation, not a second reducer.
 func ValidateSupportedCommand(c Command) error {
+	if targetCommand(c.Kind) {
+		if _, _, _, _, _, err := targetBody(c); err != nil {
+			return err
+		}
+		_, err := CanonicalCommand(c)
+		return err
+	}
 	if c.Kind == "adopt_resource" || c.Kind == "transfer_owner" {
 		if _, err := DecodeOwnershipBody(c); err != nil {
 			return err
@@ -101,6 +109,9 @@ func ValidateSupportedCommand(c Command) error {
 func DecodeAssignment(d Decision) (Assignment, error) {
 	var a Assignment
 	fields := []string{"version", "cluster_uid", "operation_id", "recorded_at"}
+	if targetCommand(d.Command.Kind) {
+		fields = append(fields, "target")
+	}
 	if keyTransitionKind(d.Command.Kind) {
 		fields = append(fields, "key_transition")
 	}
@@ -136,6 +147,9 @@ func ValidateSupportedDecision(d Decision) error {
 	a, err := DecodeAssignment(d)
 	if err != nil {
 		return err
+	}
+	if targetCommand(d.Command.Kind) {
+		return validateTargetAssignment(d, a)
 	}
 	if keyTransitionKind(d.Command.Kind) {
 		return validateKeyTransition(d, a)

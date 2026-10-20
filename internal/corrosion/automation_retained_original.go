@@ -35,10 +35,26 @@ type retainedAggregateHeader struct {
 // The admitted local layout is the compiled literal C table/column/key/shape
 // inventory, including private observations and stage distinctions. Incoming
 // metadata cannot supply SQL or register a compatible layout.
-func retainedLocalLayoutDigest() string {
+func retainedLocalLayoutDigest() string { return retainedLocalLayoutDigestFor(aggregateLocalTables()) }
+func retainedLocalLayout83Digest() string {
+	return retainedLocalLayoutDigestFor(aggregateLocalTables83())
+}
+
+func retainedLocalTablesForDigest(digest string) ([]aggregateLocalTable, error) {
+	switch digest {
+	case retainedLocalLayoutDigest():
+		return aggregateLocalTables(), nil
+	case retainedLocalLayout83Digest():
+		return aggregateLocalTables83(), nil
+	default:
+		return nil, errors.New("unsupported retained local layout")
+	}
+}
+
+func retainedLocalLayoutDigestFor(tables []aggregateLocalTable) string {
 	h := sha256.New()
 	sourceHash(h, []byte("litevirt/retained-local-layout/v1"))
-	for _, d := range aggregateLocalTables() {
+	for _, d := range tables {
 		stage := byte(0)
 		if d.stage {
 			stage = 1
@@ -53,7 +69,8 @@ func decodeRetainedHeader(raw []byte) (retainedAggregateHeader, error) {
 	if err := retainedCanonical(raw, maxRetainedHeaderBytes, &h); err != nil {
 		return h, err
 	}
-	if h.Version != 1 || h.Purpose != "automation-original-aggregate" || h.LayoutDigest != retainedLocalLayoutDigest() ||
+	_, layoutErr := retainedLocalTablesForDigest(h.LayoutDigest)
+	if h.Version != 1 || h.Purpose != "automation-original-aggregate" || layoutErr != nil ||
 		!retainedField(h.Job, 128) || !retainedField(h.Host, 253) || !retainedField(h.Incarnation, 128) || h.Revision <= 0 ||
 		h.BindingObject <= 0 || h.LocalRowsObject <= 0 || h.BindingObject == h.LocalRowsObject {
 		return h, errors.New("invalid retained original header")

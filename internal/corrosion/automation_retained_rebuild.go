@@ -126,7 +126,7 @@ func rebuildRetainedAggregate(ctx context.Context, tx *LocalTx, h retainedAggreg
 }
 
 func (a retainedFrameAddress) metadata(ctx context.Context, tx *LocalTx, d retainedObjectDescriptor) ([]byte, error) {
-	_, limits, kind := retainedObjectSections(d.Kind)
+	_, limits, kind := retainedDescriptorSections(d)
 	if kind != retainedMetadataStream || len(limits) != 1 {
 		return nil, errors.New("retained metadata object kind differs")
 	}

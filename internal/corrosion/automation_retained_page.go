@@ -152,7 +152,7 @@ func retainedStagePageTx(ctx context.Context, tx *LocalTx, h retainedHolder, p r
 		if !foundObject {
 			return out, errors.New("retained object pin missing")
 		}
-		_, limits, kind := retainedObjectSections(d.Kind)
+		_, limits, kind := retainedDescriptorSections(d)
 		index := p.Component
 		prev = p.Component - 1
 		if kind == retainedNativeStream {
@@ -302,7 +302,7 @@ func retainedStagePageTx(ctx context.Context, tx *LocalTx, h retainedHolder, p r
 			if err = retainedDirectoryTerminal(ctx, tx, h, directoryAddress); err != nil {
 				return out, err
 			}
-		} else if err = retainedComponentTerminal(ctx, tx, address, p.Component, inv, metadata); err != nil {
+		} else if err = retainedComponentTerminal(ctx, tx, address, d, p.Component, inv, metadata); err != nil {
 			return out, err
 		}
 	}
@@ -346,7 +346,7 @@ func retainedDirectoryTerminal(ctx context.Context, tx *LocalTx, h retainedHolde
 	}
 	return nil
 }
-func retainedComponentTerminal(ctx context.Context, tx *LocalTx, a retainedFrameAddress, component int, inv automationCutInventory, metadata bool) error {
+func retainedComponentTerminal(ctx context.Context, tx *LocalTx, a retainedFrameAddress, descriptor retainedObjectDescriptor, component int, inv automationCutInventory, metadata bool) error {
 	h := sha256.New()
 	if !metadata {
 		prefix, _ := automationCutFrame("section/v1", []byte(inv.Section))
@@ -363,7 +363,11 @@ func retainedComponentTerminal(ctx context.Context, tx *LocalTx, a retainedFrame
 		}
 		if !metadata {
 			if a.kind == retainedLocalStream {
-				row, e := decodeAutomationFramedRow(aggregateLocalTables()[component].descriptor(), n, raw, maxAggregateLocalRecordBytes)
+				layout, e := retainedLocalTablesForDigest(descriptor.LayoutDigest)
+				if e != nil || component < 0 || component >= len(layout) {
+					return errors.New("retained local terminal layout differs")
+				}
+				row, e := decodeAutomationFramedRow(layout[component].descriptor(), n, raw, maxAggregateLocalRecordBytes)
 				if e != nil {
 					return e
 				}

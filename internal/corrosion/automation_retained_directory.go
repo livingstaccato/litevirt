@@ -79,17 +79,39 @@ func retainedObjectSections(kind string) (sections []string, limits []int64, str
 	return sections, limits, stream
 }
 
+// The local object's admitted digest selects compiled columns/section order;
+// metadata never authors SQL. Non-local objects keep their existing layout.
+func retainedDescriptorSections(d retainedObjectDescriptor) (sections []string, limits []int64, stream retainedStreamKind) {
+	if d.Kind != "local" {
+		return retainedObjectSections(d.Kind)
+	}
+	tables, err := retainedLocalTablesForDigest(d.LayoutDigest)
+	if err != nil {
+		return nil, nil, 0
+	}
+	for _, table := range tables {
+		sections = append(sections, table.descriptor().name)
+		limits = append(limits, 0)
+	}
+	return sections, limits, retainedLocalStream
+}
+
 func decodeRetainedObject(raw []byte) (retainedObjectDescriptor, error) {
 	var v retainedObjectDescriptor
 	if err := retainedCanonical(raw, maxAutomationCutMetadataBytes, &v); err != nil {
 		return v, err
 	}
-	sections, limits, kind := retainedObjectSections(v.Kind)
+	sections, limits, kind := retainedDescriptorSections(v)
+	layoutOK := v.LayoutDigest == retainedObjectLayout(v.Kind)
+	if v.Kind == "local" {
+		_, err := retainedLocalTablesForDigest(v.LayoutDigest)
+		layoutOK = err == nil
+	}
 	validOriginal := receiverDigest(v.OriginalIdentity)
 	if kind == retainedNativeStream {
 		validOriginal = retainedNativeIdentity(v.OriginalIdentity)
 	}
-	if v.Version != 1 || kind == 0 || v.LayoutDigest != retainedObjectLayout(v.Kind) || !validOriginal ||
+	if v.Version != 1 || kind == 0 || !layoutOK || !validOriginal ||
 		!retainedField(v.Source, 253) || !retainedField(v.Incarnation, 128) || len(v.ComponentInventories) != len(sections) {
 		return v, errors.New("unsupported retained object identity or layout")
 	}

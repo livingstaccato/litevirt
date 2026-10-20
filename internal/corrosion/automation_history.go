@@ -697,6 +697,11 @@ func validateAutomationRecordSize(r AutomationRecord) error {
 
 func cloneAutomationProjection(projection AutomationProjection) AutomationProjection {
 	callbackProjection := projection
+	if projection.Target != nil {
+		raw, _ := json.Marshal(projection.Target)
+		callbackProjection.Target = new(contract.TargetProjection)
+		_ = json.Unmarshal(raw, callbackProjection.Target)
+	}
 	if projection.KeyTransition != nil {
 		raw, _ := json.Marshal(projection.KeyTransition)
 		callbackProjection.KeyTransition = new(contract.KeyTransitionProjection)
@@ -811,6 +816,12 @@ func cloneAutomationProjection(projection AutomationProjection) AutomationProjec
 		if facts.TargetLast != nil {
 			v := *facts.TargetLast
 			facts.TargetLast = &v
+		}
+		if facts.OriginalTarget != nil {
+			v := *facts.OriginalTarget
+			v.Body = append([]byte(nil), v.Body...)
+			v.Assignment = append([]byte(nil), v.Assignment...)
+			facts.OriginalTarget = &v
 		}
 		if facts.OriginalAdmission != nil {
 			// Admission/VMIntent contains no unsupported or recursive JSON types.

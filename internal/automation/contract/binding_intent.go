@@ -286,32 +286,39 @@ func DecodeCreateBindingBody(c Command) (CreateBindingBody, error) {
 	if c.Session == 0 || c.Session > math.MaxInt64 || c.Generation >= math.MaxInt64 || c.ExpectedRevision != 0 || c.ResourceUID != "" {
 		return b, codedError(CodeValidation)
 	}
-	v := b.Desired
-	if safename.ValidateVMName(v.Name) != nil || v.CPU == 0 || v.MemoryMiB == 0 || v.MemoryMiB > math.MaxInt64 || !validPlacement(v.Placement, c.ClusterUID) || !validReferenceInput(v.Image, c.ClusterUID, "image") {
-		return b, codedError(CodeValidation)
+	if err := validateVMIntent(b.Desired, c.ClusterUID); err != nil {
+		return b, err
+	}
+	return b, nil
+}
+
+// validateVMIntent shares the existing pure nonsecret intent rules with ordinary targets.
+func validateVMIntent(v VMIntent, cluster string) error {
+	if safename.ValidateVMName(v.Name) != nil || v.CPU == 0 || v.MemoryMiB == 0 || v.MemoryMiB > math.MaxInt64 || !validPlacement(v.Placement, cluster) || !validReferenceInput(v.Image, cluster, "image") {
+		return codedError(CodeValidation)
 	}
 	if v.MaxCPU != nil && *v.MaxCPU < v.CPU {
-		return b, codedError(CodeValidation)
+		return codedError(CodeValidation)
 	}
 	if v.MemoryHotplugMaxMiB != nil && (*v.MemoryHotplugMaxMiB < v.MemoryMiB || *v.MemoryHotplugMaxMiB > math.MaxInt64) {
-		return b, codedError(CodeValidation)
+		return codedError(CodeValidation)
 	}
 	if v.RequestedState != "" && v.RequestedState != "running" && v.RequestedState != "stopped" {
-		return b, codedError(CodeValidation)
+		return codedError(CodeValidation)
 	}
 	seen := map[string]bool{}
 	for _, disk := range v.Disks {
-		if disk.Key == "" || seen[disk.Key] || disk.SizeBytes == 0 || disk.SizeBytes > math.MaxInt64 || !validReferenceInput(disk.Pool, c.ClusterUID, "pool") || !validReferenceInput(disk.Image, c.ClusterUID, "image") || (disk.Bus != "" && disk.Bus != "virtio" && disk.Bus != "scsi" && disk.Bus != "sata") {
-			return b, codedError(CodeValidation)
+		if disk.Key == "" || seen[disk.Key] || disk.SizeBytes == 0 || disk.SizeBytes > math.MaxInt64 || !validReferenceInput(disk.Pool, cluster, "pool") || !validReferenceInput(disk.Image, cluster, "image") || (disk.Bus != "" && disk.Bus != "virtio" && disk.Bus != "scsi" && disk.Bus != "sata") {
+			return codedError(CodeValidation)
 		}
 		seen[disk.Key] = true
 	}
 	seen = map[string]bool{}
 	for _, nic := range v.NICs {
-		if seen[nic.Key] || !validNIC(nic, c.ClusterUID) {
-			return b, codedError(CodeValidation)
+		if seen[nic.Key] || !validNIC(nic, cluster) {
+			return codedError(CodeValidation)
 		}
 		seen[nic.Key] = true
 	}
-	return b, nil
+	return nil
 }

@@ -143,7 +143,7 @@ func TestAutomationPrimary636Upgrade67Through82(t *testing.T) {
 	if storedVersion(t, c) != CurrentSchemaVersion || appliedCount(t, c) != len(schemaMigrationLedger) {
 		t.Fatal("upgrade omitted current schema or ledger units")
 	}
-	want := map[int]int{72: 7, 73: 2, 74: 2, 75: 7, 76: 3, 77: 8, 78: 2, 79: 7, 80: 3, 81: 2, 82: 3, 83: 1}
+	want := map[int]int{72: 7, 73: 2, 74: 2, 75: 7, 76: 3, 77: 8, 78: 2, 79: 7, 80: 3, 81: 2, 82: 3, 83: 1, 84: 2}
 	for _, m := range schemaMigrationLedger {
 		if m.Version < 72 {
 			continue

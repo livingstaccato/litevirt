@@ -10,7 +10,7 @@ import (
 
 func auditRetainedLocal(ctx context.Context, tx *LocalTx, original receiverAuditContext, h retainedAggregateHeader, a retainedFrameAddress, d retainedObjectDescriptor, directory retainedDirectoryReader, namespace string) (aggregateLocalAudit, error) {
 	out := aggregateLocalAudit{id: h.LocalID, dependency: h.LocalDependency}
-	if h.Attempt != original.id || h.Host != original.request.Target || h.Incarnation != original.facts.Incarnation || d.OriginalIdentity != h.LocalID || d.Source != h.Host || d.Incarnation != h.Incarnation || d.Kind != "local" {
+	if h.Attempt != original.id || h.Host != original.request.Target || h.Incarnation != original.facts.Incarnation || d.OriginalIdentity != h.LocalID || d.Source != h.Host || d.Incarnation != h.Incarnation || d.Kind != "local" || h.LayoutDigest != d.LayoutDigest {
 		return out, errors.New("retained local semantic context differs")
 	}
 	if err := aggregateLocalFreshScratch(ctx, tx, namespace); err != nil {
@@ -23,9 +23,13 @@ func auditRetainedLocal(ctx context.Context, tx *LocalTx, original receiverAudit
 	if len(refs) != 0 {
 		return out, errors.New("retained local scratch index already exists")
 	}
-	observation := aggregateLocalObservation{retained: true}
+	layout, err := retainedLocalTablesForDigest(h.LayoutDigest)
+	if err != nil {
+		return out, err
+	}
+	observation := aggregateLocalObservation{retained: true, layoutDigest: h.LayoutDigest}
 	err = a.walk(ctx, tx, d, func(section int, n int64, raw []byte) error {
-		row, err := decodeAutomationFramedRow(aggregateLocalTables()[section].descriptor(), n, raw, maxAggregateLocalRecordBytes)
+		row, err := decodeAutomationFramedRow(layout[section].descriptor(), n, raw, maxAggregateLocalRecordBytes)
 		if err != nil {
 			return err
 		}
@@ -51,7 +55,21 @@ func (s receiverAuditStore) compareLocalSemantic(ctx context.Context, stage stri
 	if s.localProjectionID == "" {
 		return aggregateLocalCompareSemantic(ctx, s.tx, stage)
 	}
-	for i, d := range aggregateLocalTables()[18 : 18+len(automationSemanticTables)] {
+	layout, err := retainedLocalTablesForDigest(s.localLayoutDigest)
+	if err != nil {
+		return err
+	}
+	for _, d := range aggregateLocalTables()[18 : 18+len(automationSemanticTables)] {
+		section := -1
+		for i, original := range layout {
+			if original.table == d.table {
+				section = i
+				break
+			}
+		}
+		if section < 0 && d.table != "local_automation_target_operations" && d.table != "local_automation_target_reservations" {
+			return errors.New("retained semantic layout incomplete")
+		}
 		digest := func(stored bool) (string, error) {
 			h := sha256.New()
 			sourceHash(h, []byte(d.table))
@@ -70,15 +88,15 @@ func (s receiverAuditStore) compareLocalSemantic(ctx context.Context, stage stri
 				return nil
 			}
 			var err error
-			if stored {
-				err = walkAutomationStoredFrames(ctx, s.tx, "local_automation_local_rows", "local_id=? AND section=?", []any{s.localProjectionID, i + 18}, "section", maxAggregateLocalRecordBytes, func(section int, n int64, raw []byte) error {
+			if stored && section >= 0 {
+				err = walkAutomationStoredFrames(ctx, s.tx, "local_automation_local_rows", "local_id=? AND section=?", []any{s.localProjectionID, section}, "section", maxAggregateLocalRecordBytes, func(section int, n int64, raw []byte) error {
 					row, err := decodeAutomationFramedRow(d.descriptor(), n, raw, maxAggregateLocalRecordBytes)
 					if err != nil {
 						return err
 					}
 					return visit(n, row)
 				})
-			} else {
+			} else if !stored {
 				err = walkAggregateLocalTable(ctx, s.tx, d, stage, visit)
 			}
 			sourceHash(h, []byte("end"), automationCutInteger(count))

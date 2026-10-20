@@ -40,6 +40,8 @@ var nodeLocalClaimTables = map[string]bool{
 	"local_automation_names":                true,
 	"local_automation_bindings":             true,
 	"local_automation_admissions":           true,
+	"local_automation_target_operations":    true,
+	"local_automation_target_reservations":  true,
 	"local_automation_key_epochs":           true,
 	"local_automation_key_recipients":       true,
 	"local_automation_payload_wrappings":    true,

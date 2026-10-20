@@ -169,3 +169,46 @@ func TestAutomationOwnershipAdoptsUnownedWithoutInventingCreate(t *testing.T) {
 		t.Fatalf("adoption invented create admission or omitted ownership effects: %+v %v", r, err)
 	}
 }
+
+func TestAutomationOwnershipOrdinaryTargetOrigin(t *testing.T) {
+	d, p := transferDecision(), ownershipProjection(t)
+	origin, _ := targetContractFixture(t, OrdinaryCreateCommand)
+	var assigned Assignment
+	_ = json.Unmarshal(origin.Assignment, &assigned)
+	v := p.Binding.Resource
+	v.DomainUUID = "11111111-1111-4111-8111-111111111111"
+	assigned.Target.Allocation = &OrdinaryAllocation{ResourceUID: v.UID, DomainUUID: v.DomainUUID, Incarnation: v.Incarnation, Revision: v.Revision, NameGeneration: p.Binding.Name.Generation}
+	assigned.OperationID = v.OriginalOperationID
+	origin.Assignment, _ = json.Marshal(assigned)
+	p.Binding.OriginalTarget = &TargetOperationRecord{ClusterUID: v.ClusterUID, ProjectUID: v.ProjectUID, OperationID: v.OriginalOperationID, Kind: OrdinaryCreateCommand, PrincipalUID: origin.Command.PrincipalID, RequestID: origin.Command.RequestID, ResourceUID: v.UID, TargetName: v.Name, Sequence: origin.Sequence, DecisionDigest: strings.Repeat("f", 64), Body: origin.Command.Body, Assignment: origin.Assignment}
+	admission := p.Binding.OriginalAdmission
+	p.Binding.OriginalAdmission = nil
+	originalTarget := p.Binding.OriginalTarget
+	r, err := Reduce(p, d)
+	if err != nil || r.Receipt.Code != "" || r.ResourceEffect == nil || r.ResourceEffect.OriginalOperationID != v.OriginalOperationID {
+		t.Fatal("ordinary target birth lost on transfer", r, err)
+	}
+	for _, which := range []string{"both", "digest", "body", "uuid", "missing"} {
+		t.Run(which, func(t *testing.T) {
+			saved := *originalTarget
+			p.Binding.OriginalTarget = &saved
+			switch which {
+			case "both":
+				p.Binding.OriginalAdmission = admission
+			case "digest":
+				saved.DecisionDigest = "bad"
+			case "body":
+				saved.Body = []byte(`{}`)
+			case "uuid":
+				saved.ResourceUID = "foreign"
+			case "missing":
+				p.Binding.OriginalTarget = nil
+			}
+			if _, err := Reduce(p, d); Code(err) != CodeUnavailable {
+				t.Fatal("ambiguous or corrupt ordinary origin accepted", err)
+			}
+			p.Binding.OriginalTarget = originalTarget
+			p.Binding.OriginalAdmission = nil
+		})
+	}
+}

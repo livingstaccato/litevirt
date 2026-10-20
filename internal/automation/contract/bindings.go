@@ -57,6 +57,7 @@ type BindingProjection struct {
 	TargetPrincipal                                    *IdentityRecord
 	TargetLast                                         *BindingRecord
 	OriginalAdmission                                  *AdmissionRecord
+	OriginalTarget                                     *TargetOperationRecord
 	Project, Principal, AssignedIdentity, NameIdentity *IdentityRecord
 	Owner                                              *OwnerRecord
 	Last                                               *BindingRecord
@@ -268,6 +269,9 @@ func reduceCreateBinding(out *Reduction, p Projection, d Decision, a Assignment)
 	facts := p.Binding
 	if p.Head.Sequence == 0 || p.Head.ClusterUID != c.ClusterUID || facts == nil {
 		return codedError(CodeUnavailable)
+	}
+	if ok, err := guardTargetReservation(out, p, c.ClusterUID, b.Configuration.Name); err != nil || !ok {
+		return err
 	}
 	if !liveIdentity(facts.Project, c.ClusterUID, "project", c.ProjectUID) || !liveIdentity(facts.Principal, c.ClusterUID, "principal", c.PrincipalID) {
 		return codedError(CodeUnavailable)

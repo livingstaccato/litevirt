@@ -17,7 +17,7 @@ type retainedDirectoryReader struct {
 }
 
 func retainedOriginalLocalDependency(ctx context.Context, tx *LocalTx, h retainedAggregateHeader, binding []byte, a retainedFrameAddress, d retainedObjectDescriptor, directory retainedDirectoryReader) (string, error) {
-	if h.BindingDigest != sourceDigest(binding) || !receiverDigest(h.Attempt) || h.Host != d.Source || h.Incarnation != d.Incarnation || h.LocalID != d.OriginalIdentity || d.Kind != "local" {
+	if h.BindingDigest != sourceDigest(binding) || !receiverDigest(h.Attempt) || h.Host != d.Source || h.Incarnation != d.Incarnation || h.LocalID != d.OriginalIdentity || d.Kind != "local" || h.LayoutDigest != d.LayoutDigest {
 		return "", errors.New("retained original local binding differs")
 	}
 	listed, address, err := directory.find(ctx, tx, "local", h.LocalID)
@@ -31,7 +31,10 @@ func retainedOriginalLocalDependency(ctx context.Context, tx *LocalTx, h retaine
 	}
 	result := sha256.New()
 	sourceHash(result, []byte("litevirt/local-dependencies/v1"), []byte(h.Attempt), binding, []byte(h.Host))
-	layout := aggregateLocalTables()
+	layout, err := retainedLocalTablesForDigest(h.LayoutDigest)
+	if err != nil {
+		return "", err
+	}
 	section := 0
 	var count, nativeRecords, referenceRecords int64
 	var previous []any

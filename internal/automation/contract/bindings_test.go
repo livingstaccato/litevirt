@@ -72,7 +72,7 @@ func TestAutomationBindingAssignmentSchema(t *testing.T) {
 }
 
 func createBindingProjection() Projection {
-	return Projection{Head: Prefix{ClusterUID: "cluster", Sequence: 6}, Binding: &BindingProjection{
+	return Projection{Target: &TargetProjection{}, Head: Prefix{ClusterUID: "cluster", Sequence: 6}, Binding: &BindingProjection{
 		Project:   &IdentityRecord{ClusterUID: "cluster", Kind: "project", UID: "project", Alias: "acme", Witness: "project-lifetime", Generation: 1},
 		Principal: &IdentityRecord{ClusterUID: "cluster", Kind: "principal", UID: "principal", Alias: "alice", Witness: "principal-lifetime", Generation: 1},
 		Owner:     &OwnerRecord{ClusterUID: "cluster", ProjectUID: "project", OwnerID: "owner", FounderPrincipalUID: "principal", SessionPrincipalUID: "principal", SessionID: "session", Activation: 1},

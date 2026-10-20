@@ -22,6 +22,9 @@ var automationSemanticTables = []struct{ table, columns, integers, primaryKey, n
 	{"local_automation_key_epochs", "stage,cluster_uid,recipient_epoch,membership_generation,config_digest,equality_epoch,predecessor_activation_sequence,activation_sequence", "membership_generation,predecessor_activation_sequence,activation_sequence", "stage,cluster_uid,recipient_epoch", ""},
 	{"local_automation_key_recipients", "stage,cluster_uid,recipient_epoch,membership_generation,config_digest,host,host_incarnation,admitted_at,admission_serial,voter_incarnation,key_id,recipient,enrollment_ref,recipient_ack_ref,equality_ack_ref,first_sequence", "membership_generation,host_incarnation,first_sequence", "stage,cluster_uid,recipient_epoch,host", ""},
 	{"local_automation_payload_wrappings", "stage,cluster_uid,operation_id,payload_id,admission_sequence,wrapping_sequence,wrapping_digest,recipient_epoch,membership_generation,config_digest", "admission_sequence,wrapping_sequence,membership_generation", "stage,cluster_uid,operation_id,wrapping_sequence", ""},
+	// Append to preserve the existing first-eight identity/ownership descriptor boundary.
+	{"local_automation_target_operations", "stage,cluster_uid,operation_id,kind,project_uid,principal_uid,request_id,resource_uid,target_name,sequence,decision_digest,body_json,assignment_json", "sequence", "stage,cluster_uid,operation_id", ""},
+	{"local_automation_target_reservations", "stage,cluster_uid,target_key,operation_id,sequence", "sequence", "stage,cluster_uid,target_key", ""},
 }
 
 func automationVerifySemanticSchemaTx(ctx context.Context, tx *LocalTx) error {

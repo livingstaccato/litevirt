@@ -24,7 +24,7 @@ func automationApplySemanticEffectsTx(ctx context.Context, tx *LocalTx, stage st
 	if actual != head {
 		return fmt.Errorf("semantic projection predecessor unavailable")
 	}
-	if r.Receipt.Code != "" && (r.EpochEffect != nil || len(r.RecipientEffects) > 0 || r.WrappingEffect != nil || r.WrappingPrevious != nil || r.IdentityEffect != nil || r.OwnerEffect != nil || r.ResourcePrevious != nil || r.ResourceEffect != nil || r.NameEffect != nil || len(r.BindingEffects) != 0 || r.AdmissionEffect != nil) {
+	if r.Receipt.Code != "" && (r.TargetEffect != nil || len(r.TargetReservations) != 0 || r.EpochEffect != nil || len(r.RecipientEffects) > 0 || r.WrappingEffect != nil || r.WrappingPrevious != nil || r.IdentityEffect != nil || r.OwnerEffect != nil || r.ResourcePrevious != nil || r.ResourceEffect != nil || r.NameEffect != nil || len(r.BindingEffects) != 0 || r.AdmissionEffect != nil) {
 		return fmt.Errorf("rejected decision has semantic effects")
 	}
 	if v := r.IdentityEffect; v != nil {
@@ -70,6 +70,9 @@ func automationApplySemanticEffectsTx(ctx context.Context, tx *LocalTx, stage st
 			return fmt.Errorf("owner activation did not advance")
 		}
 	}
+	if err := automationApplyTargetEffectsTx(ctx, tx, stage, next, r); err != nil {
+		return err
+	}
 	if err := automationApplyBindingEffectsTx(ctx, tx, stage, next, r); err != nil {
 		return err
 	}
@@ -84,6 +87,12 @@ func automationApplySemanticEffectsTx(ctx context.Context, tx *LocalTx, stage st
 // history remain intact. Call before replaying the first historical decision.
 func automationResetSemanticProjectionTx(ctx context.Context, tx *LocalTx, stage string) error {
 	if err := requireAutomationFull(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM local_automation_target_reservations WHERE stage=?`, stage); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM local_automation_target_operations WHERE stage=?`, stage); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM local_automation_key_epochs WHERE stage=?`, stage); err != nil {
@@ -184,7 +193,12 @@ func automationOwnerRecordTx(ctx context.Context, tx *LocalTx, stage, cluster, p
 func automationSemanticProjectionTx(ctx context.Context, tx *LocalTx, stage string, p *contract.Projection, d contract.Decision) error {
 	return automationSemanticProjectionSourceTx(ctx, tx, stage, p, d, nil)
 }
-func automationSemanticProjectionSourceTx(ctx context.Context, tx *LocalTx, stage string, p *contract.Projection, d contract.Decision, source automationKeyHistorySource) error {
+func automationSemanticProjectionSourceTx(ctx context.Context, tx *LocalTx, stage string, p *contract.Projection, d contract.Decision, source automationKeyHistorySource) (result error) {
+	defer func() {
+		if result == nil {
+			result = automationTargetProjectionTx(ctx, tx, stage, p, d, source)
+		}
+	}()
 	head, err := automationSemanticHeadTx(ctx, tx, stage)
 	if err != nil {
 		return err

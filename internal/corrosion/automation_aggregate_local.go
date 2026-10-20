@@ -32,17 +32,33 @@ type aggregateLocalTable struct {
 
 // The first nine descriptors preserve the archive's semantic column order;
 // local-only timestamp suffixes are retained in the private framed snapshot.
-func aggregateLocalTables() []aggregateLocalTable {
-	tables := []aggregateLocalTable{
-		{"local_recovery_claims", automationCutSections[0].columns + ",updated_at", "target_kind,target_name,owner_epoch,attempt", "ttiiitbitbtttit", false},
-		{"local_incarnation_claims", automationCutSections[1].columns + ",updated_at", "target_kind,target_name,incarnation,owner_epoch,attempt", "tttiiitbitbtttit", false},
-		{"local_automation_history", automationCutSections[2].columns, "sequence", "itttti", false},
-		{"local_automation_anchors", automationCutSections[3].columns, "sequence", "ititt", false},
-		{"local_automation_requests", automationCutSections[4].columns, "scope,request_id", "ttbtt", false},
-		{"local_automation_authority", automationCutSections[5].columns, "id", "iittttt", false},
-		{"local_voter_adoption", automationCutSections[6].columns, "generation", "itt", false},
-		{"local_voter_seals", automationCutSections[7].columns, "generation", "itt", false},
-		{"voter_configs", automationCutSections[8].columns + ",updated_at", "generation", "ittttttTt", false},
+// Immutable private layout from signed schema83 checkpoint4b30caf14d7d80a74049799606bf63638e28f003.
+// Keep the archived literals independent of subsequent semantic schema changes.
+var automationArchived83SemanticTables = []struct{ table, columns, integers, primaryKey, nullable string }{
+	{"local_automation_identities", "stage,uid,cluster_uid,project_uid,kind,alias,witness,generation,retired", "generation,retired", "stage,uid", ""},
+	{"local_automation_aliases", "stage,cluster_uid,project_scope,kind,alias,uid,generation", "generation", "stage,cluster_uid,project_scope,kind,alias", ""},
+	{"local_automation_owners", "stage,cluster_uid,project_uid,owner_id,founder_principal_uid,session_id,session_principal_uid,activation", "activation", "stage,cluster_uid,project_uid,owner_id", ""},
+	{"local_automation_semantic_heads", "stage,cluster_uid,sequence,digest", "sequence", "stage", "stage"},
+	{"local_automation_resources", "stage,uid,cluster_uid,project_uid,name,domain_uuid,incarnation,owner_id,management_key,binding_generation,revision,retired,last_operation_id,original_operation_id,applied_sequence", "binding_generation,retired,applied_sequence", "stage,uid", ""},
+	{"local_automation_names", "stage,cluster_uid,name,resource_uid,generation,disposition,retirement_operation_id", "generation", "stage,cluster_uid,name", ""},
+	{"local_automation_bindings", "stage,cluster_uid,project_uid,owner_id,management_key,creation_generation,resource_uid,operation_id,revision,retired", "creation_generation,retired", "stage,cluster_uid,project_uid,owner_id,management_key,creation_generation", ""},
+	{"local_automation_admissions", "stage,operation_id,cluster_uid,project_uid,owner_id,management_key,resource_uid,request_id,principal_uid,method,payload_id,binding_generation,admitted_generation,sequence,configuration_json", "binding_generation,admitted_generation,sequence", "stage,operation_id", ""},
+	{"local_automation_key_epochs", "stage,cluster_uid,recipient_epoch,membership_generation,config_digest,equality_epoch,predecessor_activation_sequence,activation_sequence", "membership_generation,predecessor_activation_sequence,activation_sequence", "stage,cluster_uid,recipient_epoch", ""},
+	{"local_automation_key_recipients", "stage,cluster_uid,recipient_epoch,membership_generation,config_digest,host,host_incarnation,admitted_at,admission_serial,voter_incarnation,key_id,recipient,enrollment_ref,recipient_ack_ref,equality_ack_ref,first_sequence", "membership_generation,host_incarnation,first_sequence", "stage,cluster_uid,recipient_epoch,host", ""},
+	{"local_automation_payload_wrappings", "stage,cluster_uid,operation_id,payload_id,admission_sequence,wrapping_sequence,wrapping_digest,recipient_epoch,membership_generation,config_digest", "admission_sequence,wrapping_sequence,membership_generation", "stage,cluster_uid,operation_id,wrapping_sequence", ""},
+}
+
+func aggregateLocalTables83() []aggregateLocalTable {
+	return []aggregateLocalTable{
+		{"local_recovery_claims", "target_kind,target_name,owner_epoch,attempt,promised_round, promised_coord, promised_nonce, accepted_round, accepted_coord,\n\taccepted_nonce, value_json, value_digest, accept_json, config_generation,updated_at", "target_kind,target_name,owner_epoch,attempt", "ttiiitbitbtttit", false},
+		{"local_incarnation_claims", "target_kind,target_name,incarnation,owner_epoch,attempt,promised_round, promised_coord, promised_nonce, accepted_round, accepted_coord,\n\taccepted_nonce, value_json, value_digest, accept_json, config_generation,updated_at", "target_kind,target_name,incarnation,owner_epoch,attempt", "tttiiitbitbtttit", false},
+		{"local_automation_history", "sequence,digest,value_json,certificate,receipt_json,anchor_sequence", "sequence", "itttti", false},
+		{"local_automation_anchors", "sequence,digest,generation,members_hash,certificate", "sequence", "ititt", false},
+		{"local_automation_requests", "scope,request_id,identity,receipt_json,operation_id", "scope,request_id", "ttbtt", false},
+		{"local_automation_authority", "id,generation,members_hash,incarnation,bootstrap_principal,bootstrap_request,provenance", "id", "iittttt", false},
+		{"local_voter_adoption", "generation,imported_from,adopted_at", "generation", "itt", false},
+		{"local_voter_seals", "generation,reason,sealed_at", "generation", "itt", false},
+		{"voter_configs", "generation,members_json,members_hash,change,certificate,created_by,created_at,deleted_at,updated_at", "generation", "ittttttTt", false},
 		{"local_automation_prefix", "id,cluster_uid,sequence,digest", "id", "itit", false},
 		{"local_voter_incarnation", "id,incarnation,created_at", "id", "itt", false},
 		{"local_automation_recovery", "id,sequence,digest,next_sequence,next_digest,base_sequence,base_digest,generation,members_hash,certificate", "id", "iititititt", false},
@@ -52,11 +68,32 @@ func aggregateLocalTables() []aggregateLocalTable {
 		{"schema_state", "id,version,updated_at", "id", "iit", false},
 		{"local_automation_cuts", "id,generation,incarnation,metadata,root", "id", "titbt", false},
 		{"local_automation_cut_records", "cut_id,section,ordinal,record", "cut_id,section,ordinal", "tiib", false},
+		{"local_automation_identities", "stage,uid,cluster_uid,project_uid,kind,alias,witness,generation,retired", "stage,uid", "tttttttii", true},
+		{"local_automation_aliases", "stage,cluster_uid,project_scope,kind,alias,uid,generation", "stage,cluster_uid,project_scope,kind,alias", "tttttti", true},
+		{"local_automation_owners", "stage,cluster_uid,project_uid,owner_id,founder_principal_uid,session_id,session_principal_uid,activation", "stage,cluster_uid,project_uid,owner_id", "ttttttti", true},
+		{"local_automation_semantic_heads", "stage,cluster_uid,sequence,digest", "stage", "ttit", true},
+		{"local_automation_resources", "stage,uid,cluster_uid,project_uid,name,domain_uuid,incarnation,owner_id,management_key,binding_generation,revision,retired,last_operation_id,original_operation_id,applied_sequence", "stage,uid", "tttttttttititti", true},
+		{"local_automation_names", "stage,cluster_uid,name,resource_uid,generation,disposition,retirement_operation_id", "stage,cluster_uid,name", "ttttitt", true},
+		{"local_automation_bindings", "stage,cluster_uid,project_uid,owner_id,management_key,creation_generation,resource_uid,operation_id,revision,retired", "stage,cluster_uid,project_uid,owner_id,management_key,creation_generation", "tttttittti", true},
+		{"local_automation_admissions", "stage,operation_id,cluster_uid,project_uid,owner_id,management_key,resource_uid,request_id,principal_uid,method,payload_id,binding_generation,admitted_generation,sequence,configuration_json", "stage,operation_id", "tttttttttttiiit", true},
+		{"local_automation_key_epochs", "stage,cluster_uid,recipient_epoch,membership_generation,config_digest,equality_epoch,predecessor_activation_sequence,activation_sequence", "stage,cluster_uid,recipient_epoch", "tttittii", true},
+		{"local_automation_key_recipients", "stage,cluster_uid,recipient_epoch,membership_generation,config_digest,host,host_incarnation,admitted_at,admission_serial,voter_incarnation,key_id,recipient,enrollment_ref,recipient_ack_ref,equality_ack_ref,first_sequence", "stage,cluster_uid,recipient_epoch,host", "tttittitttttttti", true},
+		{"local_automation_payload_wrappings", "stage,cluster_uid,operation_id,payload_id,admission_sequence,wrapping_sequence,wrapping_digest,recipient_epoch,membership_generation,config_digest", "stage,cluster_uid,operation_id,wrapping_sequence", "ttttiittit", true},
+		{"local_automation_lifetimes", "kind,name,witness,origin,retired,valid", "kind,name,witness", "ttttii", false},
+		{"local_automation_credential_issuance", "kind,credential_id,username,witness,principal_uid,cluster_uid,valid", "kind,credential_id", "tttttti", false},
 	}
-	for _, d := range automationSemanticTables {
+}
+
+// Current84 preserves the old semantic prefix and adds target projections
+// before the two private observation suffixes. Old frames use their own layout.
+func aggregateLocalTables() []aggregateLocalTable {
+	old := aggregateLocalTables83()
+	boundary := 18 + len(automationArchived83SemanticTables)
+	tables := append([]aggregateLocalTable(nil), old[:boundary]...)
+	for _, d := range automationSemanticTables[len(automationArchived83SemanticTables):] {
 		var shape strings.Builder
-		for _, col := range strings.Split(d.columns, ",") {
-			if strings.Contains(","+d.integers+",", ","+col+",") {
+		for _, column := range strings.Split(d.columns, ",") {
+			if strings.Contains(","+d.integers+",", ","+column+",") {
 				shape.WriteByte('i')
 			} else {
 				shape.WriteByte('t')
@@ -64,12 +101,7 @@ func aggregateLocalTables() []aggregateLocalTable {
 		}
 		tables = append(tables, aggregateLocalTable{d.table, d.columns, d.primaryKey, shape.String(), true})
 	}
-	// These are private observations only. The credential digest is deliberately
-	// not selected, copied, hashed or exported and supplies no portable authority.
-	tables = append(tables,
-		aggregateLocalTable{"local_automation_lifetimes", "kind,name,witness,origin,retired,valid", "kind,name,witness", "ttttii", false},
-		aggregateLocalTable{"local_automation_credential_issuance", "kind,credential_id,username,witness,principal_uid,cluster_uid,valid", "kind,credential_id", "tttttti", false})
-	return tables
+	return append(tables, old[boundary:]...)
 }
 
 func (d aggregateLocalTable) descriptor() automationCutSection {

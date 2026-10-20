@@ -59,17 +59,19 @@ func TestReceiverCurrentEveryDependencyClass(t *testing.T) {
 	// expected refusal remain independent of the digest implementation. Each
 	// baseline below must pass genuine C before this final-seam corruption runs.
 	semanticMutations := map[string]string{
-		"local_automation_admissions":        `INSERT INTO local_automation_admissions VALUES('','changed','changed','changed','changed','changed','changed','changed','changed','changed','changed',1,1,1,'changed')`,
-		"local_automation_aliases":           `INSERT INTO local_automation_aliases VALUES('','changed','','principal','changed','changed',1)`,
-		"local_automation_bindings":          `INSERT INTO local_automation_bindings VALUES('','changed','changed','changed','changed',1,'changed','changed','changed',0)`,
-		"local_automation_identities":        `INSERT INTO local_automation_identities(stage,uid,cluster_uid,project_uid,kind,alias,witness,generation,retired) VALUES('','changed','changed','','principal','changed','changed',1,0)`,
-		"local_automation_key_epochs":        `INSERT INTO local_automation_key_epochs VALUES('','changed','changed',1,'changed','changed',0,1)`,
-		"local_automation_key_recipients":    `INSERT INTO local_automation_key_recipients VALUES('','changed','changed',1,'changed','changed',1,'changed','changed','changed','changed','changed','changed','changed','changed',1)`,
-		"local_automation_names":             `INSERT INTO local_automation_names VALUES('','changed','changed','changed',1,'live','')`,
-		"local_automation_owners":            `INSERT INTO local_automation_owners VALUES('','changed','changed','changed','changed','changed','changed',0)`,
-		"local_automation_payload_wrappings": `INSERT INTO local_automation_payload_wrappings VALUES('','changed','changed','changed',1,2,'changed','changed',1,'changed')`,
-		"local_automation_resources":         `INSERT INTO local_automation_resources VALUES('','changed','changed','changed','changed','changed','changed','changed','changed',1,'changed',0,'changed','changed',1)`,
-		"local_automation_semantic_heads":    `INSERT INTO local_automation_semantic_heads VALUES('','changed',1,'changed') ON CONFLICT(stage) DO UPDATE SET digest='changed'`,
+		"local_automation_target_operations":   `INSERT INTO local_automation_target_operations VALUES('','changed','changed','admit_legacy_rebuild','','changed','changed','','changed',1,'changed','{}','{}')`,
+		"local_automation_target_reservations": `INSERT INTO local_automation_target_reservations VALUES('','changed','changed','changed',1)`,
+		"local_automation_admissions":          `INSERT INTO local_automation_admissions VALUES('','changed','changed','changed','changed','changed','changed','changed','changed','changed','changed',1,1,1,'changed')`,
+		"local_automation_aliases":             `INSERT INTO local_automation_aliases VALUES('','changed','','principal','changed','changed',1)`,
+		"local_automation_bindings":            `INSERT INTO local_automation_bindings VALUES('','changed','changed','changed','changed',1,'changed','changed','changed',0)`,
+		"local_automation_identities":          `INSERT INTO local_automation_identities(stage,uid,cluster_uid,project_uid,kind,alias,witness,generation,retired) VALUES('','changed','changed','','principal','changed','changed',1,0)`,
+		"local_automation_key_epochs":          `INSERT INTO local_automation_key_epochs VALUES('','changed','changed',1,'changed','changed',0,1)`,
+		"local_automation_key_recipients":      `INSERT INTO local_automation_key_recipients VALUES('','changed','changed',1,'changed','changed',1,'changed','changed','changed','changed','changed','changed','changed','changed',1)`,
+		"local_automation_names":               `INSERT INTO local_automation_names VALUES('','changed','changed','changed',1,'live','')`,
+		"local_automation_owners":              `INSERT INTO local_automation_owners VALUES('','changed','changed','changed','changed','changed','changed',0)`,
+		"local_automation_payload_wrappings":   `INSERT INTO local_automation_payload_wrappings VALUES('','changed','changed','changed',1,2,'changed','changed',1,'changed')`,
+		"local_automation_resources":           `INSERT INTO local_automation_resources VALUES('','changed','changed','changed','changed','changed','changed','changed','changed',1,'changed',0,'changed','changed',1)`,
+		"local_automation_semantic_heads":      `INSERT INTO local_automation_semantic_heads VALUES('','changed',1,'changed') ON CONFLICT(stage) DO UPDATE SET digest='changed'`,
 	}
 	for _, descriptor := range automationSemanticTables {
 		query, ok := semanticMutations[descriptor.table]

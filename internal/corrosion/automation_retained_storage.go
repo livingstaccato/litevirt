@@ -35,7 +35,14 @@ func (a retainedFrameAddress) walk(ctx context.Context, tx *LocalTx, descriptor 
 	if err != nil {
 		return err
 	}
-	_, limits, kind := retainedObjectSections(d.Kind)
+	_, limits, kind := retainedDescriptorSections(d)
+	var localLayout []aggregateLocalTable
+	if kind == retainedLocalStream {
+		localLayout, err = retainedLocalTablesForDigest(d.LayoutDigest)
+		if err != nil {
+			return err
+		}
+	}
 	if kind != a.kind || d.Source != a.source || (kind == retainedLocalStream && a.localID != sourceDigest([]byte("litevirt/retained-local-storage/v1"), []byte(a.namespace), []byte(d.OriginalIdentity))) {
 		return errors.New("retained frame descriptor address differs")
 	}
@@ -87,7 +94,7 @@ func (a retainedFrameAddress) walk(ctx context.Context, tx *LocalTx, descriptor 
 			var row Row
 			var canonical []byte
 			if kind == retainedLocalStream {
-				layout := aggregateLocalTables()[i]
+				layout := localLayout[i]
 				row, err = decodeAutomationFramedRow(layout.descriptor(), n, raw, maxAggregateLocalRecordBytes)
 				if err == nil {
 					canonical, err = encodeAggregateLocalRecord(layout.descriptor().name, n, row)

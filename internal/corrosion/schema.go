@@ -607,7 +607,8 @@ import (
 // v81: signed receiver-established floors and current-row complete inventory; never live proof.
 // v82: immutable retained-origin delivery/object/completion pins; no active authority.
 // v83: preserve all recipient stages while allowing the host-incarnation zero domain.
-const CurrentSchemaVersion = 83
+// v84: derived target operations and complete-key reservations from certified history.
+const CurrentSchemaVersion = 84
 
 // schemaVersionProjectIncarnation is the version projects.incarnation was
 // added in.
@@ -3215,6 +3216,23 @@ var schemaDDL = []string{
   sequence INTEGER NOT NULL CHECK(sequence>0), configuration_json TEXT NOT NULL,
   PRIMARY KEY(stage,operation_id))`,
 
+	// Schema84: derived target history; excluded from replicated/public cut authority.
+	`CREATE TABLE IF NOT EXISTS local_automation_target_operations (
+ stage TEXT NOT NULL, cluster_uid TEXT NOT NULL, operation_id TEXT NOT NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('admit_legacy_rebuild','admit_ordinary_create')),
+ project_uid TEXT NOT NULL, principal_uid TEXT NOT NULL, request_id TEXT NOT NULL,
+ resource_uid TEXT NOT NULL, target_name TEXT NOT NULL,
+ sequence INTEGER NOT NULL CHECK(sequence>0), decision_digest TEXT NOT NULL,
+ body_json TEXT NOT NULL, assignment_json TEXT NOT NULL,
+ PRIMARY KEY(stage,cluster_uid,operation_id))`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS automation_target_sequence
+ ON local_automation_target_operations(stage,cluster_uid,sequence)`,
+	`CREATE TABLE IF NOT EXISTS local_automation_target_reservations (
+ stage TEXT NOT NULL, cluster_uid TEXT NOT NULL, target_key TEXT NOT NULL,
+ operation_id TEXT NOT NULL, sequence INTEGER NOT NULL CHECK(sequence>0),
+ PRIMARY KEY(stage,cluster_uid,target_key))`,
+	`CREATE INDEX IF NOT EXISTS automation_target_operation_keys
+ ON local_automation_target_reservations(stage,cluster_uid,operation_id)`,
 	`CREATE TABLE IF NOT EXISTS local_automation_key_epochs (
  stage TEXT NOT NULL, cluster_uid TEXT NOT NULL, recipient_epoch TEXT NOT NULL,
  membership_generation INTEGER NOT NULL CHECK(membership_generation>0), config_digest TEXT NOT NULL,
@@ -4055,6 +4073,7 @@ var createTableUnits = []struct {
 	{65, "host_runtime"},
 	{66, "session_groups"},
 	{67, "host_fence_redfish"},
+	{84, "local_automation_target_operations"}, {84, "local_automation_target_reservations"},
 	{72, "local_automation_authority"}, {72, "local_automation_prefix"},
 	{72, "local_automation_anchors"}, {72, "local_automation_history"},
 	{72, "local_automation_requests"}, {72, "local_automation_recovery"}, {72, "local_automation_staging"},

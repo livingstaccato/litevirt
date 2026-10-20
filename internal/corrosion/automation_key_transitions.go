@@ -464,10 +464,12 @@ func automationVerifyKeyIndexesTx(ctx context.Context, tx *LocalTx) error {
 		unique        int64
 	}
 	indexes := map[string][]expectedIndex{
-		"local_automation_key_epochs":        {{"sqlite_autoindex_local_automation_key_epochs_1", "stage,cluster_uid,recipient_epoch", 1}, {"automation_key_activation", "stage,cluster_uid,activation_sequence", 1}, {"automation_key_equality", "stage,cluster_uid,equality_epoch", 1}},
-		"local_automation_key_recipients":    {{"sqlite_autoindex_local_automation_key_recipients_1", "stage,cluster_uid,recipient_epoch,host", 1}, {"automation_key_id", "stage,cluster_uid,key_id", 1}, {"automation_key_recipient", "stage,cluster_uid,recipient", 1}},
-		"local_automation_payload_wrappings": {{"sqlite_autoindex_local_automation_payload_wrappings_1", "stage,cluster_uid,operation_id,wrapping_sequence", 1}, {"automation_wrapping_coverage", "stage,cluster_uid,recipient_epoch,operation_id,wrapping_sequence", 0}},
-		"local_automation_admissions":        {{"sqlite_autoindex_local_automation_admissions_1", "stage,operation_id", 1}, {"automation_admission_inventory", "stage,cluster_uid,sequence,operation_id", 0}},
+		"local_automation_target_operations":   {{"sqlite_autoindex_local_automation_target_operations_1", "stage,cluster_uid,operation_id", 1}, {"automation_target_sequence", "stage,cluster_uid,sequence", 1}},
+		"local_automation_target_reservations": {{"sqlite_autoindex_local_automation_target_reservations_1", "stage,cluster_uid,target_key", 1}, {"automation_target_operation_keys", "stage,cluster_uid,operation_id", 0}},
+		"local_automation_key_epochs":          {{"sqlite_autoindex_local_automation_key_epochs_1", "stage,cluster_uid,recipient_epoch", 1}, {"automation_key_activation", "stage,cluster_uid,activation_sequence", 1}, {"automation_key_equality", "stage,cluster_uid,equality_epoch", 1}},
+		"local_automation_key_recipients":      {{"sqlite_autoindex_local_automation_key_recipients_1", "stage,cluster_uid,recipient_epoch,host", 1}, {"automation_key_id", "stage,cluster_uid,key_id", 1}, {"automation_key_recipient", "stage,cluster_uid,recipient", 1}},
+		"local_automation_payload_wrappings":   {{"sqlite_autoindex_local_automation_payload_wrappings_1", "stage,cluster_uid,operation_id,wrapping_sequence", 1}, {"automation_wrapping_coverage", "stage,cluster_uid,recipient_epoch,operation_id,wrapping_sequence", 0}},
+		"local_automation_admissions":          {{"sqlite_autoindex_local_automation_admissions_1", "stage,operation_id", 1}, {"automation_admission_inventory", "stage,cluster_uid,sequence,operation_id", 0}},
 	}
 	for table, list := range indexes {
 		rows, e := tx.Query(ctx, `SELECT count(*) AS n FROM pragma_index_list(?)`, table)

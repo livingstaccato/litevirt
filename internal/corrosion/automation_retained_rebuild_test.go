@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"hash"
 	"os"
 	"path/filepath"
@@ -421,4 +422,41 @@ func retainedTestGraphMetadata(t *testing.T, ctx context.Context, tx *LocalTx, h
 	}
 	sourceHash(digest, []byte("end"), automationCutInteger(directory.objects), automationCutInteger(descriptors), automationCutInteger(bodies))
 	return retainedHolderBody{Donor: h.Host, DonorIncarnation: h.Incarnation, Generation: next.Generation, ConfigDigest: sourceConfigDigest(next), MembersDigest: next.MembersHash, ReceiptDigest: receiptID, AggregateDigest: rebuilt.id, DirectoryRoot: hex.EncodeToString(digest.Sum(nil)), DirectoryObjects: directory.objects, DirectoryBytes: descriptors}
+}
+
+// An old retained layout has no target sections. Current replay must prove
+// those projections empty, not silently omit them from semantic comparison.
+func TestRetainedOriginal83ReplayRequiresEmptyTargets(t *testing.T) {
+	ctx := context.Background()
+	c := NewTestClientT(t)
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []string{"local_automation_target_operations", "local_automation_target_reservations"} {
+		t.Run(table, func(t *testing.T) {
+			err := c.ExecuteLocal(ctx, func(tx *LocalTx) error {
+				store := receiverAuditStore{tx: tx, localProjectionID: "synthetic-empty-original", localLayoutDigest: retainedLocalLayout83Digest()}
+				if err := store.compareLocalSemantic(ctx, "old83-replay"); err != nil {
+					return fmt.Errorf("SETUP empty old replay: %w", err)
+				}
+				var err error
+				if table == "local_automation_target_operations" {
+					_, err = tx.Exec(ctx, `INSERT INTO local_automation_target_operations(stage,cluster_uid,operation_id,kind,project_uid,principal_uid,request_id,resource_uid,target_name,sequence,decision_digest,body_json,assignment_json) VALUES('old83-replay','cluster','operation','admit_legacy_rebuild','','principal','request','','machine',1,'digest','{}','{}')`)
+				} else {
+					_, err = tx.Exec(ctx, `INSERT INTO local_automation_target_reservations(stage,cluster_uid,target_key,operation_id,sequence) VALUES('old83-replay','cluster','key','operation',1)`)
+				}
+				if err != nil {
+					return err
+				}
+				if err = store.compareLocalSemantic(ctx, "old83-replay"); err == nil || !strings.Contains(err.Error(), table) {
+					return fmt.Errorf("RETAINED83_NONEMPTY_NEW_PROJECTION_ACCEPTED: %s: %v", table, err)
+				}
+				_, err = tx.Exec(ctx, "DELETE FROM "+table+" WHERE stage='old83-replay'")
+				return err
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
 }

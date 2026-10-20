@@ -120,7 +120,18 @@ func automationObserveNameTx(ctx context.Context, tx *LocalTx, cluster, name str
 		return AutomationNameObservation{}, err
 	}
 	result := &AutomationNameRecord{Name: *n, Resource: *r, VMIdentity: *identity, Project: *project}
-	if r.OwnerID == "" {
+	if r.OwnerID == "" && r.OriginalOperationID != "" {
+		if err := automationNameOrdinaryOriginTx(ctx, tx, head, *r, *n, *identity); err != nil {
+			return AutomationNameObservation{}, unavailable
+		}
+		refs, err := tx.Query(ctx, `SELECT EXISTS(SELECT 1 FROM local_automation_bindings WHERE stage='' AND resource_uid=?) OR EXISTS(SELECT 1 FROM local_automation_admissions WHERE stage='' AND resource_uid=?) AS bad`, r.UID, r.UID)
+		if err != nil {
+			return AutomationNameObservation{}, err
+		}
+		if len(refs) != 1 || refs[0].Int64("bad") != 0 {
+			return AutomationNameObservation{}, unavailable
+		}
+	} else if r.OwnerID == "" {
 		if r.OriginalOperationID != "" || n.Disposition != "live" {
 			return AutomationNameObservation{}, unavailable
 		}
@@ -200,19 +211,29 @@ func automationObserveNameTx(ctx context.Context, tx *LocalTx, cluster, name str
 			}
 		}
 		if r.OriginalOperationID != "" {
-			original, err := tx.Query(ctx, `SELECT owner_id,management_key,creation_generation FROM local_automation_bindings WHERE stage='' AND resource_uid=? AND operation_id=? LIMIT 2`, r.UID, r.OriginalOperationID)
+			target, err := automationTargetOperationRecordTx(ctx, tx, "", r.ClusterUID, r.OriginalOperationID)
 			if err != nil {
 				return AutomationNameObservation{}, err
 			}
-			if len(original) != 1 {
-				return AutomationNameObservation{}, unavailable
-			}
-			b, err := automationNameBindingTx(ctx, tx, cluster, r.ProjectUID, original[0].String("owner_id"), original[0].String("management_key"), uint64(original[0].Int64("creation_generation")))
-			if err != nil {
-				return AutomationNameObservation{}, err
-			}
-			if err := automationNameAdmissionTx(ctx, tx, head, *r, *b, false); err != nil {
-				return AutomationNameObservation{}, err
+			if target != nil {
+				if err := automationNameOrdinaryOriginTx(ctx, tx, head, *r, *n, *identity); err != nil {
+					return AutomationNameObservation{}, unavailable
+				}
+			} else {
+				original, err := tx.Query(ctx, `SELECT owner_id,management_key,creation_generation FROM local_automation_bindings WHERE stage='' AND resource_uid=? AND operation_id=? LIMIT 2`, r.UID, r.OriginalOperationID)
+				if err != nil {
+					return AutomationNameObservation{}, err
+				}
+				if len(original) != 1 {
+					return AutomationNameObservation{}, unavailable
+				}
+				b, err := automationNameBindingTx(ctx, tx, cluster, r.ProjectUID, original[0].String("owner_id"), original[0].String("management_key"), uint64(original[0].Int64("creation_generation")))
+				if err != nil {
+					return AutomationNameObservation{}, err
+				}
+				if err := automationNameAdmissionTx(ctx, tx, head, *r, *b, false); err != nil {
+					return AutomationNameObservation{}, err
+				}
 			}
 		}
 		result.Owner, result.Binding = owner, binding
@@ -468,6 +489,9 @@ func automationNameAdmissionTx(ctx context.Context, tx *LocalTx, head Automation
 }
 
 func automationNameCandidatesTx(ctx context.Context, tx *LocalTx, head AutomationPrefix, n contract.NameRecord, current contract.ResourceRecord) error {
+	if err := automationNameTargetClosureTx(ctx, tx, head, n.Name); err != nil {
+		return automationReadError(contract.CodeUnavailable)
+	}
 	bad := automationReadError(contract.CodeUnavailable)
 	cursor := int64(math.MinInt64)
 	comparison := ">="
@@ -541,6 +565,16 @@ func automationNameCandidatesTx(ctx context.Context, tx *LocalTx, head Automatio
 }
 
 func automationNameAbsentClosureTx(ctx context.Context, tx *LocalTx, cluster, name string) error {
+	head, err := automationSemanticHeadTx(ctx, tx, "")
+	if err != nil {
+		return err
+	}
+	if head.ClusterUID != cluster {
+		return automationReadError(contract.CodeUnavailable)
+	}
+	if err := automationNameTargetClosureTx(ctx, tx, head, name); err != nil {
+		return automationReadError(contract.CodeUnavailable)
+	}
 	// Fixed anti-joins cover missing counterparts before any configuration or
 	// historical envelope could be considered. Unrelated coherent graphs pass.
 	queries := []string{

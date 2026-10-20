@@ -1,9 +1,12 @@
 package corrosion
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -76,7 +79,7 @@ func TestAutomationKeyTransitionHostLifetimeReplay(t *testing.T) {
 	record = keyCertifiedDecision(t, d, voters...)
 	receipt, err := applySharedAutomation(t, a.c, record, contract.Reduce, automationFreshAnchor)
 	if err != nil {
-		t.Fatalf("SETUP genuine schema83 N0 history persistence: %v", err)
+		t.Fatalf("SETUP genuine schema84 N0 history persistence: %v", err)
 	}
 	stored, err := a.c.Query(ctx, `SELECT host_incarnation,admitted_at,admission_serial FROM local_automation_key_recipients WHERE stage='' AND host='a'`)
 	if err != nil || len(stored) != 1 || stored[0].Int64("host_incarnation") != 0 || stored[0].String("admitted_at") != "2026-10-18T00:00:00Z" || stored[0].String("admission_serial") != "a0" {
@@ -90,7 +93,7 @@ func TestAutomationKeyTransitionHostLifetimeReplay(t *testing.T) {
 	a.c = custodyLifetimeFileClient(t, dir, a.name)
 	a.c.SetVoterConfigGate(func() bool { return true })
 	if err := InitSchema(ctx, a.c); err != nil {
-		t.Fatalf("SETUP schema83 reopen: %v", err)
+		t.Fatalf("SETUP schema84 reopen: %v", err)
 	}
 	err = a.c.ExecuteLocal(ctx, func(tx *LocalTx) error {
 		head, err := automationHeadTx(ctx, tx)
@@ -150,28 +153,64 @@ func TestAutomationKeyTransitionHostLifetimeReplay(t *testing.T) {
 	}
 }
 
-// This is a fresh clone of the frozen d226 original80 source fixture. Its
-// valid archive is created before storage-only rows are added. Later archive
-// reuse proves original byte preservation, not a new cut of uncertified rows.
+// This is an exact private copy of the accepted actual d226 original80 DB.
+// Its retained archive was frozen by OLD80 code before storage-only rows. Current
+// code may reuse that archive, but must never mint SourceSchema80 on old DDL.
 func TestAutomationCustodyLifetimeArchived80CloneUpgradePreservesOriginals(t *testing.T) {
 	ctx := context.Background()
-	a := custodyLifetimeHistoricalVoters(t, 80)[0]
+	database, err := os.ReadFile("testdata/original80_d226_state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawEvidence, err := os.ReadFile("testdata/original80_d226_evidence.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exact bytes exported by actual OLD d226 code; accepted root audit32c0f560
+	// and manuald003d7ba. The database is copied before any test mutation.
+	if original82Hash(database) != "57a64132f5c5bf5cb12cce3c30a54708c1f93c51d511d0fdcdcd98d5a321ee99" || original82Hash(rawEvidence) != "6e937d1b736e69d71d7b45f10c6b483b18fd7b3167ac2e34a933f6cd06cd7a19" {
+		t.Fatal("genuine original80 fixture bytes changed")
+	}
+	var evidence struct {
+		SourceCommit, SourceTree, SourceSchemaBlob, SourceCodecBlob, StateDBSHA256 string
+		Version                                                                    int
+		CutID                                                                      string
+		DDL                                                                        []string
+		Ledger                                                                     []Row
+		Metadata                                                                   []byte
+		Root                                                                       string
+		Records                                                                    [][][]byte
+	}
+	if err := json.Unmarshal(rawEvidence, &evidence); err != nil {
+		t.Fatal(err)
+	}
+	if evidence.SourceCommit != "d2264444ab949de12a5a87da2ed29c9f72a565f3" || evidence.SourceTree != "6edc84a7dc91ca1b5d9244f0735e0743bc7fc3d7" || evidence.SourceSchemaBlob != "266be870323216083d53c751a6cd198cc1487e53" || evidence.SourceCodecBlob != "f546598e68eed889af4489d55a24f7f67058b80c" || evidence.StateDBSHA256 != original82Hash(database) || evidence.Version != 80 || len(evidence.DDL) != 186 || len(evidence.Ledger) != 196 || len(evidence.Records) != 9 {
+		t.Fatal("original80 producer provenance changed")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "state.db"), database, 0600); err != nil {
+		t.Fatal(err)
+	}
+	a := &claimTestVoter{name: "a", c: custodyLifetimeFileClient(t, dir, "a")}
+	t.Cleanup(func() { _ = a.c.Close() })
 	if storedVersion(t, a.c) != 80 {
 		t.Fatal("not a genuine original80 source fixture")
 	}
 	if corrected, err := automationCustodyRecipientShape(ctx, a.c); err != nil || corrected {
 		t.Fatal("original80 fixture already has corrected constraint", corrected, err)
 	}
-	if err := a.c.SealVoterGeneration(ctx, 1, "archive-original80-before-composition"); err != nil {
-		t.Fatal(err)
-	}
-	id, err := a.c.FreezeAutomationCut(ctx, 1, nil)
-	if err != nil {
-		t.Fatal("freeze valid original80 source before storage-only rows", err)
+	id := evidence.CutID
+	archiveBytes, err := a.c.Query(ctx, `SELECT metadata,root FROM local_automation_cuts WHERE id=?`, id)
+	if err != nil || len(archiveBytes) != 1 || !bytes.Equal(archiveBytes[0].Bytes("metadata"), evidence.Metadata) || archiveBytes[0].String("root") != evidence.Root {
+		t.Fatal("genuine old80 retained archive bytes missing", err)
 	}
 	before, records := cutFixtureRead(t, a.c, id)
-	if before.SourceSchema != 80 || len(before.Inventory) != 9 {
-		t.Fatal("original80 descriptor/inventory changed")
+	if before.SourceSchema != 80 || before.Head.Sequence != 0 || before.Head.Digest != "" || len(before.Inventory) != 9 || !reflect.DeepEqual(records, evidence.Records) {
+		t.Fatal("original80 descriptor/inventory/head/record bytes changed")
+	}
+	// This can only take FreezeAutomationCut's existing retained-cut branch.
+	if reused, err := a.c.FreezeAutomationCut(ctx, 1, nil); err != nil || reused != id {
+		t.Fatal("retained old80 archive not reusable before upgrade", reused, err)
 	}
 	// Storage preservation fixtures only. These rows are intentionally added
 	// AFTER the valid historical cut; they confer no certified history or
@@ -195,6 +234,9 @@ func TestAutomationCustodyLifetimeArchived80CloneUpgradePreservesOriginals(t *te
 	if err != nil || len(originalLedger) != 196 {
 		t.Fatal("original80 exact196 applied preimages missing", err)
 	}
+	if !reflect.DeepEqual(originalLedger, evidence.Ledger) {
+		t.Fatal("original80 producer ledger bytes changed")
+	}
 	oldIDs := map[string]bool{}
 	for _, row := range originalLedger {
 		oldIDs[row.String("id")] = true
@@ -204,10 +246,16 @@ func TestAutomationCustodyLifetimeArchived80CloneUpgradePreservesOriginals(t *te
 		t.Fatal("original80 full inventory migration ID missing")
 	}
 	if err := InitSchema(ctx, a.c); err != nil {
-		t.Fatal("fresh original80 clone upgrade to83", err)
+		t.Fatal("fresh original80 clone upgrade to84", err)
 	}
-	if storedVersion(t, a.c) != 83 || len(schemaMigrationLedger) != 199 {
-		t.Fatal("clone did not reach composed83/current199 known units")
+	if storedVersion(t, a.c) != 84 || len(schemaMigrationLedger) != 201 {
+		t.Fatal("clone did not reach composed84/current201 known units")
+	}
+	for _, table := range []string{"local_automation_target_operations", "local_automation_target_reservations"} {
+		rows, err := a.c.Query(ctx, "SELECT stage FROM "+table+" LIMIT 1")
+		if err != nil || len(rows) != 0 {
+			t.Fatal("old80 upgrade omitted target table or invented target projection", table, err)
+		}
 	}
 	afterRows, err := a.c.Query(ctx, "SELECT "+custodyLifetimeRecipientColumns+" FROM local_automation_key_recipients ORDER BY stage,host")
 	if err != nil || !reflect.DeepEqual(originalRows, afterRows) {
@@ -221,14 +269,16 @@ func TestAutomationCustodyLifetimeArchived80CloneUpgradePreservesOriginals(t *te
 		t.Fatal("clone upgrade lost published SG70 global default", err)
 	}
 	upgradedLedger, err := a.c.Query(ctx, `SELECT id,applied_at,checksum FROM applied_migrations ORDER BY id`)
-	if err != nil || len(upgradedLedger) != 200 || len(upgradedLedger) != len(originalLedger)+4 {
-		t.Fatal("clone upgrade must retain196 old plus only4 new applied rows", err)
+	if err != nil || len(upgradedLedger) != 202 || len(upgradedLedger) != len(originalLedger)+6 {
+		t.Fatal("clone upgrade must retain196 old plus only6 new applied rows", err)
 	}
 	newIDs := map[string]bool{
 		"a092_projects_incarnation":                                    false,
 		"a091_security_groups_project":                                 false,
 		"a093_local_automation_receiver_current_established_inventory": false,
 		"r_automation_key_recipients_host_zero":                        false,
+		"t_local_automation_target_operations":                         false,
+		"t_local_automation_target_reservations":                       false,
 	}
 	var preserved []Row
 	applied := map[string]Row{}
@@ -265,15 +315,41 @@ func TestAutomationCustodyLifetimeArchived80CloneUpgradePreservesOriginals(t *te
 	if !reflect.DeepEqual(before, after) || !reflect.DeepEqual(records, later) {
 		t.Fatal("clone upgrade changed original80 cut metadata/records/root")
 	}
+	afterArchiveBytes, err := a.c.Query(ctx, `SELECT metadata,root FROM local_automation_cuts WHERE id=?`, id)
+	if err != nil || !reflect.DeepEqual(archiveBytes, afterArchiveBytes) {
+		t.Fatal("upgrade rewrote original80 raw metadata/root", err)
+	}
 	complete := custodyLifetimeSnapshot(t, a.c)
-	if err := InitSchema(ctx, a.c); err != nil || appliedCount(t, a.c) != 200 || !reflect.DeepEqual(complete, custodyLifetimeSnapshot(t, a.c)) {
+	if err := InitSchema(ctx, a.c); err != nil || appliedCount(t, a.c) != 202 || !reflect.DeepEqual(complete, custodyLifetimeSnapshot(t, a.c)) {
 		t.Fatal("clone re-init changed retained old/current ledger or recipient rows", err)
+	}
+	if err := a.c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	a.c = custodyLifetimeFileClient(t, dir, "a")
+	if err := InitSchema(ctx, a.c); err != nil || storedVersion(t, a.c) != 84 || appliedCount(t, a.c) != 202 || !reflect.DeepEqual(complete, custodyLifetimeSnapshot(t, a.c)) {
+		t.Fatal("cold clone reopen changed old/current ledger or recipient rows", err)
+	}
+	reused, err := a.c.FreezeAutomationCut(ctx, 1, nil)
+	if err != nil || reused != id {
+		t.Fatal("cold upgraded archive not reusable", reused, err)
+	}
+	cold, coldRecords := cutFixtureRead(t, a.c, id)
+	coldRaw, err := a.c.Query(ctx, `SELECT metadata,root FROM local_automation_cuts WHERE id=?`, id)
+	if err != nil || !reflect.DeepEqual(before, cold) || !reflect.DeepEqual(records, coldRecords) || !reflect.DeepEqual(archiveBytes, coldRaw) {
+		t.Fatal("cold upgrade changed original80 metadata/root/records", err)
+	}
+	for _, table := range []string{"local_automation_target_operations", "local_automation_target_reservations"} {
+		rows, err := a.c.Query(ctx, "SELECT stage FROM "+table+" LIMIT 1")
+		if err != nil || len(rows) != 0 {
+			t.Fatal("cold upgrade omitted target table or invented target projection", table, err)
+		}
 	}
 }
 
 // This is a NEW synthetic SQL82 migration predecessor, not the genuine old
 // descriptor82 source namespace. Never freeze a SourceSchema82 archive from it.
-func TestAutomationCustodyLifetimeComposed82UpgradePublishes83(t *testing.T) {
+func TestAutomationCustodyLifetimeComposed82UpgradePublishes84(t *testing.T) {
 	ctx := context.Background()
 	a := custodyLifetimeHistoricalVoters(t, 82)[0]
 	if storedVersion(t, a.c) != 82 {
@@ -289,13 +365,13 @@ func TestAutomationCustodyLifetimeComposed82UpgradePublishes83(t *testing.T) {
 	if err := InitSchema(ctx, a.c); err != nil {
 		t.Fatal(err)
 	}
-	if storedVersion(t, a.c) != 83 {
-		t.Fatal("fresh composed82 migration did not reach truthful current83")
+	if storedVersion(t, a.c) != 84 {
+		t.Fatal("fresh composed82 migration did not reach truthful current84")
 	}
 	if corrected, err := automationCustodyRecipientShape(ctx, a.c); err != nil || !corrected {
 		t.Fatal("migration omitted corrected recipient constraint", corrected, err)
 	}
-	if err := a.c.SealVoterGeneration(ctx, 1, "fresh-current83-after-migration"); err != nil {
+	if err := a.c.SealVoterGeneration(ctx, 1, "fresh-current84-after-migration"); err != nil {
 		t.Fatal(err)
 	}
 	id, err := a.c.FreezeAutomationCut(ctx, 1, nil)
@@ -303,15 +379,15 @@ func TestAutomationCustodyLifetimeComposed82UpgradePublishes83(t *testing.T) {
 		t.Fatal(err)
 	}
 	current, records := cutFixtureRead(t, a.c, id)
-	if current.SourceSchema != 83 || len(current.Inventory) != 9 {
-		t.Fatal("new actual current cut did not declare83", current.SourceSchema)
+	if current.SourceSchema != 84 || len(current.Inventory) != 9 {
+		t.Fatal("new actual current cut did not declare84", current.SourceSchema)
 	}
 	again, err := a.c.FreezeAutomationCut(ctx, 1, nil)
 	if err != nil || again != id {
-		t.Fatal("current83 cut reuse changed identity", err)
+		t.Fatal("current84 cut reuse changed identity", err)
 	}
 	later, laterRecords := cutFixtureRead(t, a.c, again)
 	if !reflect.DeepEqual(current, later) || !reflect.DeepEqual(records, laterRecords) {
-		t.Fatal("current83 cut reuse changed bytes/root")
+		t.Fatal("current84 cut reuse changed bytes/root")
 	}
 }

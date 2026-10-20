@@ -17,6 +17,7 @@ type Request struct {
 	Receipt  Receipt
 }
 type Projection struct {
+	Target        *TargetProjection
 	KeyTransition *KeyTransitionProjection
 	Binding       *BindingProjection
 	Ownership     *OwnershipProjection
@@ -30,25 +31,31 @@ type Projection struct {
 	ReplayOriginal bool
 }
 type Reduction struct {
-	EpochEffect      *KeyEpochRecord
-	RecipientEffects []KeyRecipientRecord
-	WrappingEffect   *PayloadWrappingRecord
-	WrappingPrevious *HistoryReference
-	ResourcePrevious *ResourceRecord
-	ResourceEffect   *ResourceRecord
-	NameEffect       *NameRecord
-	BindingEffects   []BindingRecord
-	AdmissionEffect  *AdmissionRecord
-	OwnerEffect      *OwnerRecord
-	IdentityEffect   *IdentityRecord
-	ClusterUID       string
-	Scope            string
-	Identity         []byte
-	Receipt          Receipt
-	SaveRequest      bool
+	TargetEffect       *TargetOperationRecord
+	TargetReservations []TargetReservation
+	EpochEffect        *KeyEpochRecord
+	RecipientEffects   []KeyRecipientRecord
+	WrappingEffect     *PayloadWrappingRecord
+	WrappingPrevious   *HistoryReference
+	ResourcePrevious   *ResourceRecord
+	ResourceEffect     *ResourceRecord
+	NameEffect         *NameRecord
+	BindingEffects     []BindingRecord
+	AdmissionEffect    *AdmissionRecord
+	OwnerEffect        *OwnerRecord
+	IdentityEffect     *IdentityRecord
+	ClusterUID         string
+	Scope              string
+	Identity           []byte
+	Receipt            Receipt
+	SaveRequest        bool
 }
 
 func Scope(d Decision) string {
+	if targetCommand(d.Command.Kind) {
+		b, _ := json.Marshal([]string{d.Command.ClusterUID, d.Command.ProjectUID, "ordinary-target", d.Command.PrincipalID})
+		return string(b)
+	}
 	if d.Command.Kind == "initialize_cluster" {
 		return "internal:bootstrap"
 	}
@@ -101,6 +108,10 @@ func Reduce(p Projection, d Decision) (Reduction, error) {
 		out.Receipt.State = "rejected"
 	} else {
 		switch d.Command.Kind {
+		case LegacyRebuildCommand, OrdinaryCreateCommand:
+			if err := reduceTarget(&out, p, d, a); err != nil {
+				return out, err
+			}
 		case "rewrap_payload", "activate_key_epoch":
 			if err := reduceKeyTransition(&out, p, d, a); err != nil {
 				return out, err

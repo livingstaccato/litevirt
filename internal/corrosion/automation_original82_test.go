@@ -85,7 +85,26 @@ func original82AssertArchive(t *testing.T, c *Client, e original82FixtureEvidenc
 	}
 }
 
-func TestAutomationOriginal82ArchiveAndCurrent83(t *testing.T) {
+// Frozen82 and83 share these eleven typed tables. Current target tables
+// are asserted separately only after real InitSchema84.
+func original82TypedSnapshot(t *testing.T, c *Client) map[string][]Row {
+	t.Helper()
+	out := map[string][]Row{}
+	for _, table := range []string{
+		"local_automation_identities", "local_automation_aliases", "local_automation_owners", "local_automation_semantic_heads",
+		"local_automation_resources", "local_automation_names", "local_automation_bindings", "local_automation_admissions",
+		"local_automation_key_epochs", "local_automation_key_recipients", "local_automation_payload_wrappings",
+	} {
+		rows, err := c.Query(context.Background(), "SELECT * FROM "+table+" ORDER BY stage,2,3,4")
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[table] = rows
+	}
+	return out
+}
+
+func TestAutomationOriginal82ArchiveAndCurrent84(t *testing.T) {
 	t.Run("genuine_old82_upgrade_cold_reopen", func(t *testing.T) {
 		ctx := context.Background()
 		database, e := original82Fixture(t)
@@ -105,22 +124,23 @@ func TestAutomationOriginal82ArchiveAndCurrent83(t *testing.T) {
 			t.Fatal("genuine old82 lacks corrected recipient shape", corrected, err)
 		}
 		original82AssertArchive(t, c, e)
-		history, typed := sharedActiveRows(t, c), keyTransitionSnapshot(t, c)
+		history, typed := sharedActiveRows(t, c), original82TypedSnapshot(t, c)
 		beforeLedger, err := c.Query(ctx, `SELECT id,applied_at,checksum FROM applied_migrations ORDER BY id`)
 		if err != nil || !reflect.DeepEqual(beforeLedger, e.Ledger) {
 			t.Fatal("genuine original198 ledger rows differ", err)
 		}
 		if err := InitSchema(ctx, c); err != nil {
-			t.Fatal("genuine old82 upgrade to current83 refused", err)
+			t.Fatal("genuine old82 upgrade to current84 refused", err)
 		}
-		if CurrentSchemaVersion != 83 || storedVersion(t, c) != 83 {
-			t.Fatal("current migration did not reach83")
+		if CurrentSchemaVersion != 84 || storedVersion(t, c) != 84 {
+			t.Fatal("current migration did not reach84")
 		}
 		if exists, err := columnExists(ctx, c.db, "projects", "incarnation"); err != nil || !exists {
 			t.Fatal("published project71 migration absent", exists, err)
 		}
 		original82AssertArchive(t, c, e)
-		if !reflect.DeepEqual(history, sharedActiveRows(t, c)) || !reflect.DeepEqual(typed, keyTransitionSnapshot(t, c)) {
+		original83AssertEmptyTargets(t, c)
+		if !reflect.DeepEqual(history, sharedActiveRows(t, c)) || !reflect.DeepEqual(typed, original82TypedSnapshot(t, c)) {
 			t.Fatal("old82 migration changed certified history/receipt/prefix/typed state")
 		}
 		upgraded, err := c.Query(ctx, `SELECT id,applied_at,checksum FROM applied_migrations ORDER BY id`)
@@ -131,7 +151,7 @@ func TestAutomationOriginal82ArchiveAndCurrent83(t *testing.T) {
 		for _, r := range beforeLedger {
 			oldIDs[r.String("id")] = true
 		}
-		newIDs := map[string]bool{"a092_projects_incarnation": false, "a093_local_automation_receiver_current_established_inventory": false}
+		newIDs := map[string]bool{"a092_projects_incarnation": false, "a093_local_automation_receiver_current_established_inventory": false, "t_local_automation_target_operations": false, "t_local_automation_target_reservations": false}
 		var preserved []Row
 		for _, r := range upgraded {
 			id := r.String("id")
@@ -156,7 +176,7 @@ func TestAutomationOriginal82ArchiveAndCurrent83(t *testing.T) {
 				t.Fatal("new ledger ID missing from actual current migration registry", id)
 			}
 		}
-		if len(upgraded) != 200 || !reflect.DeepEqual(beforeLedger, preserved) {
+		if len(upgraded) != 202 || !reflect.DeepEqual(beforeLedger, preserved) {
 			t.Fatal("upgrade rewrote original198 ledger rows or added wrong count")
 		}
 		for id, found := range newIDs {
@@ -168,43 +188,44 @@ func TestAutomationOriginal82ArchiveAndCurrent83(t *testing.T) {
 			t.Fatal(err)
 		}
 		c = custodyLifetimeFileClient(t, dir, "a")
-		if storedVersion(t, c) != 83 {
-			t.Fatal("cold reopened current83 stamp changed")
+		if storedVersion(t, c) != 84 {
+			t.Fatal("cold reopened current84 stamp changed")
 		}
 		original82AssertArchive(t, c, e)
 		if err := InitSchema(ctx, c); err != nil {
-			t.Fatal("current83 cold re-init refused", err)
+			t.Fatal("current84 cold re-init refused", err)
 		}
 		original82AssertArchive(t, c, e)
+		original83AssertEmptyTargets(t, c)
 		laterLedger, err := c.Query(ctx, `SELECT id,applied_at,checksum FROM applied_migrations ORDER BY id`)
-		if err != nil || !reflect.DeepEqual(upgraded, laterLedger) || !reflect.DeepEqual(history, sharedActiveRows(t, c)) || !reflect.DeepEqual(typed, keyTransitionSnapshot(t, c)) {
-			t.Fatal("cold current83 reopen/init changed retained ledger/history/receipt/projections", err)
+		if err != nil || !reflect.DeepEqual(upgraded, laterLedger) || !reflect.DeepEqual(history, sharedActiveRows(t, c)) || !reflect.DeepEqual(typed, original82TypedSnapshot(t, c)) {
+			t.Fatal("cold current84 reopen/init changed retained ledger/history/receipt/projections", err)
 		}
 		// All writes above target the private copy, never the pinned original files.
 		original82Fixture(t)
 	})
-	t.Run("new_current83_cut", func(t *testing.T) {
+	t.Run("new_current84_cut", func(t *testing.T) {
 		ctx := context.Background()
 		_, e := original82Fixture(t)
 		voters := custodyLifetimeHistoricalVoters(t, 0)
 		a := voters[0]
-		if CurrentSchemaVersion != 83 || automationCutSourceSchema != 83 || storedVersion(t, a.c) != 83 {
-			t.Fatal("new source is not actual current83")
+		if CurrentSchemaVersion != 84 || automationCutSourceSchema != 84 || storedVersion(t, a.c) != 84 {
+			t.Fatal("new source is not actual current84")
 		}
-		genesis := sharedAutomationRecord(t, 1, "", "initialize", "current83-initialize", voters...)
+		genesis := sharedAutomationRecord(t, 1, "", "initialize", "current84-initialize", voters...)
 		if receipt, err := applySharedAutomation(t, a.c, genesis, contract.Reduce, automationFreshAnchor); err != nil || receipt.Code != "" || receipt.Sequence != 1 {
-			t.Fatal("actual current83 certified genesis failed", receipt, err)
+			t.Fatal("actual current84 certified genesis failed", receipt, err)
 		}
-		if err := a.c.SealVoterGeneration(ctx, 1, "genuine-current83-new-source"); err != nil {
+		if err := a.c.SealVoterGeneration(ctx, 1, "genuine-current84-new-source"); err != nil {
 			t.Fatal(err)
 		}
 		id, err := a.c.FreezeAutomationCut(ctx, 1, contract.Reduce)
 		if err != nil {
-			t.Fatal("new current83 cut refused", err)
+			t.Fatal("new current84 cut refused", err)
 		}
 		m, _ := cutFixtureRead(t, a.c, id)
-		if m.SourceSchema != 83 || m.Codec != 1 || m.Head.Sequence != 1 || m.Head.Digest != genesis.Value.MustDigest() || len(m.Inventory) != 9 {
-			t.Fatal("new current cut did not declare truthful83")
+		if m.SourceSchema != 84 || m.Codec != 1 || m.Head.Sequence != 1 || m.Head.Digest != genesis.Value.MustDigest() || len(m.Inventory) != 9 {
+			t.Fatal("new current cut did not declare truthful84")
 		}
 		if id == e.CutID {
 			t.Fatal("fresh source reused unrelated original82 cut identity")

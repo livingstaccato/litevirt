@@ -20,6 +20,7 @@ type receiverAuditStore struct {
 	localID, ownedCutID string
 	localCursor         *AutomationPrefix
 	localProjectionID   string
+	localLayoutDigest   string
 	retainedNative      bool
 }
 

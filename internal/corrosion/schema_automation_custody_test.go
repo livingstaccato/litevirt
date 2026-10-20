@@ -83,8 +83,8 @@ func TestAutomationCustodyLifetimeMigration(t *testing.T) {
 	if err := custodyLifetimeInsertRecipient(t, c, "audit-a", "new-host-zero", 0); err != nil {
 		t.Fatalf("COMPOSED82_UPGRADE_N0_REFUSED: %v", err)
 	}
-	if storedVersion(t, c) != 83 || appliedCount(t, c) != len(ledger)+1 || countAppliedID(t, c, automationCustodyMigrationID) != 1 {
-		t.Fatal("composed82 upgrade did not append exactly one schema83 unit")
+	if storedVersion(t, c) != 84 || appliedCount(t, c) != len(ledger)+3 || countAppliedID(t, c, automationCustodyMigrationID) != 1 {
+		t.Fatal("composed82 upgrade did not append schema83 recipient unit and two schema84 target units")
 	}
 	if err := c.ExecuteLocal(ctx, func(tx *LocalTx) error { return automationVerifySemanticSchemaTx(ctx, tx) }); err != nil {
 		t.Fatal("rebuilt semantic/index guards refused", err)
@@ -100,7 +100,7 @@ func TestAutomationCustodyLifetimeMigration(t *testing.T) {
 		}
 	}
 	if !reflect.DeepEqual(complete, custodyLifetimeSnapshot(t, c)) {
-		t.Fatal("migrated83 reopen/init changed all-stage rows or ledger")
+		t.Fatal("migrated84 reopen/init changed all-stage rows or ledger")
 	}
 }
 
@@ -266,8 +266,8 @@ func TestAutomationCustodyLifetimeSchema83(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if storedVersion(t, c) != 83 || countAppliedID(t, c, automationCustodyMigrationID) != 1 || !reflect.DeepEqual(before, custodyLifetimeSnapshot(t, c)) {
-			t.Fatal("fresh83 reopen/init changed schema, rows or ledger")
+		if storedVersion(t, c) != 84 || countAppliedID(t, c, automationCustodyMigrationID) != 1 || !reflect.DeepEqual(before, custodyLifetimeSnapshot(t, c)) {
+			t.Fatal("fresh84 reopen/init changed schema, rows or ledger")
 		}
 	})
 	for _, tc := range []struct {
@@ -305,6 +305,7 @@ func TestAutomationCustodyLifetimeSchema83(t *testing.T) {
 		c := custodyLifetimeFileClient(t, t.TempDir())
 		t.Cleanup(func() { _ = c.Close() })
 		custodyLifetimeBuildComposed82(t, c)
+		custodyLifetimePrimeUnrelatedTargetLedger(t, c)
 		if err := custodyLifetimeInsertRecipient(t, c, "active-positive", "positive", 17); err != nil {
 			t.Fatal(err)
 		}
@@ -337,6 +338,7 @@ func TestAutomationCustodyLifetimeSchema83(t *testing.T) {
 		c := custodyLifetimeFileClient(t, t.TempDir())
 		t.Cleanup(func() { _ = c.Close() })
 		custodyLifetimeBuildComposed82(t, c)
+		custodyLifetimePrimeUnrelatedTargetLedger(t, c)
 		if err := custodyLifetimeInsertRecipient(t, c, "audit-preserve", "positive", 17); err != nil {
 			t.Fatal(err)
 		}
@@ -349,6 +351,35 @@ func TestAutomationCustodyLifetimeSchema83(t *testing.T) {
 		}
 		custodyLifetimeAssertRollback(t, c, before)
 	})
+}
+
+// These synthetic recipient-rebuild fixtures already install ALL current DDL,
+// including the two84 target tables. Pre-record precisely those unrelated
+// already-present create-table units so the rollback assertion isolates the
+// custody transaction, not InitSchema's earlier independent mark-only work.
+// The database remains an explicitly synthetic SQL82 fixture, never an archive.
+func custodyLifetimePrimeUnrelatedTargetLedger(t *testing.T, c *Client) {
+	t.Helper()
+	seen := 0
+	for _, m := range schemaMigrationLedger {
+		if m.ID != "t_local_automation_target_operations" && m.ID != "t_local_automation_target_reservations" {
+			continue
+		}
+		if m.Version != 84 || m.Kind != kindCreateTable {
+			t.Fatal("unexpected target prerequisite unit", m.ID)
+		}
+		present, err := m.present(context.Background(), c)
+		if err != nil || !present {
+			t.Fatal("target prerequisite DDL missing", m.ID, err)
+		}
+		if err := c.execLocal(context.Background(), `INSERT INTO applied_migrations(id,applied_at,checksum) VALUES(?,?,?)`, m.ID, "synthetic-custody-isolation", sha256hex(m.SQL)); err != nil {
+			t.Fatal(err)
+		}
+		seen++
+	}
+	if seen != 2 {
+		t.Fatal("expected exactly two unrelated target units", seen)
+	}
 }
 
 func custodyLifetimeSnapshot(t *testing.T, c *Client) map[string][]Row {

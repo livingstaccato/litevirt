@@ -176,6 +176,9 @@ func reduceOwnership(out *Reduction, p Projection, d Decision, a Assignment) err
 	if v == nil {
 		return codedError(CodeUnavailable)
 	}
+	if ok, err := guardTargetReservation(out, p, c.ClusterUID, v.Name); err != nil || !ok {
+		return err
+	}
 	if v.ClusterUID != body.Resource.ClusterUID || v.ProjectUID != body.Resource.ProjectUID || v.UID != body.Resource.UID {
 		rejectReduction(out, CodeValidation)
 		return nil
@@ -191,12 +194,19 @@ func reduceOwnership(out *Reduction, p Projection, d Decision, a Assignment) err
 	if f.NameIdentity == nil || f.NameIdentity.Retired || f.NameIdentity.Kind != "vm" || f.NameIdentity.ClusterUID != v.ClusterUID || f.NameIdentity.ProjectUID != v.ProjectUID || f.NameIdentity.UID != v.UID || f.NameIdentity.Alias != v.Name || f.Name == nil || f.Name.ClusterUID != v.ClusterUID || f.Name.Name != v.Name || f.Name.ResourceUID != v.UID || f.Name.Generation != f.NameIdentity.Generation || (f.Name.Disposition != "live" && f.Name.Disposition != "reserved") {
 		return codedError(CodeUnavailable)
 	}
-	if v.OriginalOperationID != "" {
+	if f.OriginalAdmission != nil && f.OriginalTarget != nil {
+		return codedError(CodeUnavailable)
+	}
+	if v.OriginalOperationID != "" && f.OriginalTarget != nil {
+		if !validOrdinaryTargetOrigin(f.OriginalTarget, *v, *f.NameIdentity, *f.Name) {
+			return codedError(CodeUnavailable)
+		}
+	} else if v.OriginalOperationID != "" {
 		original := f.OriginalAdmission
 		if original == nil || original.OperationID != v.OriginalOperationID || original.ClusterUID != v.ClusterUID || original.ProjectUID != v.ProjectUID || original.ResourceUID != v.UID || original.Method != "admit_create" || original.Sequence == 0 || original.Sequence > v.AppliedSequence || original.AdmittedGeneration == 0 {
 			return codedError(CodeUnavailable)
 		}
-	} else if f.OriginalAdmission != nil {
+	} else if f.OriginalAdmission != nil || f.OriginalTarget != nil {
 		return codedError(CodeUnavailable)
 	}
 	q := o.Quiescence
@@ -269,4 +279,27 @@ func reduceOwnership(out *Reduction, p Projection, d Decision, a Assignment) err
 	out.Receipt.ResourceRevision = o.Revision
 	out.Receipt.State = "succeeded"
 	return nil
+}
+
+// Origin is immutable certified birth provenance, not a native execution grant.
+// Managed ownership changes retain the ordinary allocation without fabricating
+// a managed-create AdmissionRecord.
+func validOrdinaryTargetOrigin(o *TargetOperationRecord, v ResourceRecord, id IdentityRecord, n NameRecord) bool {
+	if o == nil || o.Kind != OrdinaryCreateCommand || o.OperationID != v.OriginalOperationID || o.ResourceUID != v.UID || o.TargetName != v.Name || o.ClusterUID != v.ClusterUID || o.ProjectUID != v.ProjectUID || o.Sequence == 0 || o.Sequence > v.AppliedSequence || !keyDigest(o.DecisionDigest) {
+		return false
+	}
+	var a Assignment
+	if json.Unmarshal(o.Assignment, &a) != nil || a.Target == nil || a.Target.Allocation == nil {
+		return false
+	}
+	d := Decision{Sequence: o.Sequence, ParentDigest: a.Target.ParentDigest, Command: Command{Kind: o.Kind, ClusterUID: o.ClusterUID, ProjectUID: o.ProjectUID, PrincipalID: o.PrincipalUID, RequestID: o.RequestID, Body: o.Body}, Assignment: o.Assignment}
+	if ValidateSupportedDecision(d) != nil || a.OperationID != o.OperationID {
+		return false
+	}
+	b, e := DecodeOrdinaryCreateBody(d.Command)
+	if e != nil || b.Desired.Name != v.Name {
+		return false
+	}
+	allocation := a.Target.Allocation
+	return allocation.ResourceUID == v.UID && allocation.DomainUUID == v.DomainUUID && allocation.Incarnation == v.Incarnation && allocation.NameGeneration == id.Generation && id.Witness == allocation.Incarnation && n.Generation == allocation.NameGeneration
 }

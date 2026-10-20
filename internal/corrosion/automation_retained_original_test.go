@@ -136,3 +136,47 @@ func TestRetainedOriginalWholeElectorate(t *testing.T) {
 		})
 	}
 }
+
+func TestRetainedOriginal83HeaderLayoutBinding(t *testing.T) {
+	producer, r, q, _, _ := receiverFixture(t)
+	_ = producer
+	a, err := r.Begin(context.Background(), q.Intent, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A minimal canonical header uses a real original binding; this is not a
+	// proof that its synthetic empty aggregate is accepted by full reconstruction.
+	d := strings.Repeat("a", 64)
+	member := a.request.Sources[0]
+	audit := sourceDigest([]byte("litevirt/receiver-source-audit/v1"), []byte(a.id), []byte(member.Name), []byte(d), []byte(d))
+	h := retainedAggregateHeader{Version: 1, Purpose: "automation-original-aggregate", LayoutDigest: retainedLocalLayout83Digest(), Attempt: a.id, Job: a.request.Job, Revision: a.request.Revision, Host: a.request.Target, Incarnation: a.facts.Incarnation, BindingObject: 1, BindingDigest: sourceDigest(a.binding), LocalRowsObject: 2, LocalInventoryDigest: d, LocalID: d, LocalDependency: d, LocalCoverage: d, Coverage: d, Roster: []aggregateRosterEntry{{Source: member.Name, Incarnation: member.Incarnation, Audit: audit, Publication: d, Cut: "0123456789abcdef0123456789abcdef", Root: d, Coverage: d}}}
+	raw, _ := json.Marshal(h)
+	if _, err := decodeRetainedHeader(raw); err != nil {
+		t.Fatal("RETAINED83_HEADER_REFUSED", err)
+	}
+	// Layout binding is checked before consulting scratch/current evidence.
+	descriptor := retainedDescriptorInput("local")
+	descriptor.OriginalIdentity = h.LocalID
+	descriptor.Source = h.Host
+	descriptor.Incarnation = h.Incarnation
+	err = r.client.ExecuteLocal(context.Background(), func(tx *LocalTx) error {
+		_, err := auditRetainedLocal(context.Background(), tx, receiverAuditContext{a.id, a.request, a.facts}, h, retainedFrameAddress{}, descriptor, retainedDirectoryReader{}, "unused")
+		return err
+	})
+	if err == nil || !strings.Contains(err.Error(), "retained local semantic context differs") {
+		t.Fatal("RETAINED83_MIXED_HEADER_OBJECT_ACCEPTED", err)
+	}
+}
+
+func TestRetainedOriginal83SchemaLayoutMismatch(t *testing.T) {
+	for _, tc := range []struct {
+		layout string
+		schema int64
+	}{{retainedLocalLayout83Digest(), 84}, {retainedLocalLayoutDigest(), 83}} {
+		observation := aggregateLocalObservation{retained: true, layoutDigest: tc.layout}
+		err := observation.observe(&aggregateLocalAudit{}, 15, 1, Row{Columns: []string{"id", "version"}, Values: []any{int64(1), tc.schema}})
+		if err == nil || !strings.Contains(err.Error(), "schema/layout differs") {
+			t.Fatal("RETAINED83_SCHEMA_LAYOUT_MISMATCH_ACCEPTED", err)
+		}
+	}
+}

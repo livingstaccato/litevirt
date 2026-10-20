@@ -9,6 +9,7 @@ import (
 
 type aggregateLocalObservation struct {
 	retained       bool
+	layoutDigest   string
 	cursor, prefix AutomationPrefix
 	incarnation    string
 	inventory      [9]int64
@@ -17,7 +18,18 @@ type aggregateLocalObservation struct {
 
 func (o *aggregateLocalObservation) observe(out *aggregateLocalAudit, section int, n int64, row Row) error {
 	if o.counts == nil {
-		o.counts = make([]int64, len(aggregateLocalTables()))
+		layout := aggregateLocalTables()
+		if o.layoutDigest != "" {
+			var err error
+			layout, err = retainedLocalTablesForDigest(o.layoutDigest)
+			if err != nil {
+				return err
+			}
+		}
+		o.counts = make([]int64, len(layout))
+	}
+	if section < 0 || section >= len(o.counts) {
+		return errors.New("local snapshot component outside admitted layout")
 	}
 	o.counts[section] = n
 	if section < 9 {
@@ -59,9 +71,17 @@ func (o *aggregateLocalObservation) observe(out *aggregateLocalAudit, section in
 			return errors.New("local snapshot reseed lineage unavailable")
 		}
 	case 15:
+		if o.layoutDigest != "" {
+			if o.layoutDigest == retainedLocalLayout83Digest() && row.Int64("version") == 84 {
+				return errors.New("local snapshot schema/layout differs")
+			}
+			if o.layoutDigest == retainedLocalLayoutDigest() && row.Int64("version") != 84 {
+				return errors.New("local snapshot schema/layout differs")
+			}
+		}
 		// Current proof inventories the live schema. Retained originals keep
-		// their pre-metadata, host-incarnation union or prior live80/81/82 bytes.
-		if n != 1 || row.Int64("id") != 1 || (row.Int64("version") != 83 && !(o.retained && (row.Int64("version") == 78 || row.Int64("version") == 79 || row.Int64("version") == 80 || row.Int64("version") == 81 || row.Int64("version") == 82))) {
+		// their pre-metadata, host-incarnation union or prior live80/81/82/83 bytes.
+		if n != 1 || row.Int64("id") != 1 || (row.Int64("version") != 84 && !(o.retained && (row.Int64("version") == 78 || row.Int64("version") == 79 || row.Int64("version") == 80 || row.Int64("version") == 81 || row.Int64("version") == 82 || row.Int64("version") == 83))) {
 			return errors.New("local snapshot schema unavailable")
 		}
 	case 21:
@@ -92,6 +112,7 @@ func (o *aggregateLocalObservation) audit(ctx context.Context, tx *LocalTx, orig
 	s := receiverAuditStore{tx: tx, attempt: original.id, source: host, id: namespace, evidenceID: out.id, localID: localID, localCursor: &o.cursor}
 	if projection {
 		s.localProjectionID = localID
+		s.localLayoutDigest = o.layoutDigest
 	}
 	s.publication.manifest.Cut.Head = out.head
 	s.publication.manifest.Cut.Generation = original.request.Generation

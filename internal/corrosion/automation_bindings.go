@@ -18,6 +18,9 @@ func automationApplyBindingEffectsTx(ctx context.Context, tx *LocalTx, stage str
 	if r.ResourcePrevious == nil && r.ResourceEffect == nil && r.NameEffect == nil && len(r.BindingEffects) == 0 && r.AdmissionEffect == nil {
 		return nil
 	}
+	if r.TargetEffect != nil && r.TargetEffect.Kind == contract.OrdinaryCreateCommand {
+		return automationApplyOrdinaryAllocationEffectsTx(ctx, tx, stage, next, r)
+	}
 	if r.AdmissionEffect == nil {
 		return automationApplyVMEnrollmentEffectsTx(ctx, tx, stage, next, r)
 	}

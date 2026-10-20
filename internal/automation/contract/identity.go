@@ -158,6 +158,11 @@ func reduceIdentity(out *Reduction, p Projection, d Decision, a Assignment) erro
 	if p.Head.ClusterUID != c.ClusterUID || p.Head.Sequence == 0 || p.Identity == nil {
 		return codedError(CodeUnavailable)
 	}
+	if b.Kind == "vm" {
+		if ok, err := guardTargetReservation(out, p, c.ClusterUID, b.Alias); err != nil || !ok {
+			return err
+		}
+	}
 	if a.Identity.Enrollment.FenceSequence > p.Head.Sequence {
 		return codedError(CodeUnavailable)
 	}

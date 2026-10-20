@@ -327,6 +327,10 @@ func (r *Reconciler) hwPrepareStart(ctx context.Context, vm *corrosion.VMRecord)
 	return r.prepareHardwareForStart(ctx, vm)
 }
 
+// stopSyncEpochRead is the read of the row an out-of-band stop sync takes its
+// owner epoch from; a test makes it fail.
+var stopSyncEpochRead = corrosion.GetVM
+
 // runtimeGate is the subset of *Checker the reconciler needs (injectable for tests).
 // LeaseTermGate judges a proof read off the replicated row and returns the
 // fence its claim must carry (nil = unfenced), or a countable refusal reason
@@ -1027,7 +1031,7 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			// unfenced. The next pass reads it again.
 			var epoch int64
 			if r.ownerEpochEnforced(ctx) {
-				fresh, gerr := corrosion.GetVM(ctx, r.db, vm.Name)
+				fresh, gerr := stopSyncEpochRead(ctx, r.db, vm.Name)
 				if gerr != nil {
 					slog.Warn("reconciler: VM's owner epoch cannot be read; not syncing its out-of-band stop this pass",
 						"vm", vm.Name, "error", gerr)

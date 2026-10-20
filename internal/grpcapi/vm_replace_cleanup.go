@@ -58,6 +58,25 @@ const vmReplaceStopTimeout = 30 * time.Second
 // calls this.
 func (s *Server) SetCutoverCrashHook(h func(stage string) error) { s.cutoverCrashHook = h }
 
+// VMReplaceCleanupKick is signalled when a cutover returns with its committed
+// phases left journaled, so the daemon's retry loop (resumeVMReplaceCleanups)
+// tries them again without waiting for its next period or a restart.
+func (s *Server) VMReplaceCleanupKick() <-chan struct{} { return s.vmReplaceKickCh() }
+
+func (s *Server) vmReplaceKickCh() chan struct{} {
+	s.vmReplaceKickOnce.Do(func() { s.vmReplaceKick = make(chan struct{}, 1) })
+	return s.vmReplaceKick
+}
+
+// kickVMReplaceCleanups signals VMReplaceCleanupKick; a signal already
+// pending covers this one.
+func (s *Server) kickVMReplaceCleanups() {
+	select {
+	case s.vmReplaceKickCh() <- struct{}{}:
+	default:
+	}
+}
+
 func (s *Server) fireCutoverCrashHook(stage string) error {
 	if h := s.cutoverCrashHook; h != nil {
 		return h(stage)

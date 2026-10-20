@@ -47,31 +47,46 @@ func awaitStartupStep(name string, bound time.Duration, step func()) bool {
 	}
 }
 
-// vmReplaceCleanupRetry is how often a cutover cleanup deferred because its
-// storage did not answer is tried again.
-var vmReplaceCleanupRetry = 5 * time.Minute
+// vmReplaceCleanupRetry is the longest a journaled cutover cleanup waits
+// between attempts, and how often the loop looks for one when none is owed;
+// vmReplaceCleanupMinRetry is the first wait after a failure.
+var (
+	vmReplaceCleanupRetry    = 5 * time.Minute
+	vmReplaceCleanupMinRetry = 15 * time.Second
+)
 
 // resumeVMReplaceCleanups resumes the cutover cleanups a previous process
-// left, and tries again every retry while one was deferred because storage
-// it frees did not answer (storage.IsFSNoAnswer). Any other failure is
-// logged and left to the next start, as before.
+// left, then keeps finishing the ones still journaled for as long as ctx
+// lives. A failed attempt, whatever its cause (storage that does not answer,
+// a row read that failed), is tried again after a wait that starts at
+// minRetry and doubles up to maxRetry, so a transient error heals without a
+// daemon restart. Once none fails, the loop waits for kick (a cutover that
+// left its phases journaled) or maxRetry, and looks again.
 func resumeVMReplaceCleanups(ctx context.Context, r interface {
 	ResumeVMReplaceCleanups(context.Context) error
-}, retry time.Duration) {
+	VMReplaceCleanupKick() <-chan struct{}
+}, minRetry, maxRetry time.Duration) {
+	wait := minRetry
 	for {
 		err := r.ResumeVMReplaceCleanups(ctx)
-		if err == nil {
-			return
+		next := maxRetry
+		if err != nil {
+			slog.Warn("cutover: finishing journaled cleanups failed; trying again", "error", err, "in", wait,
+				"storage_not_answering", storage.IsFSNoAnswer(err))
+			next = wait
+			wait = min(wait*2, maxRetry)
+		} else {
+			wait = minRetry
 		}
-		slog.Warn("cutover: resuming journaled cleanups", "error", err)
-		if !storage.IsFSNoAnswer(err) {
-			return
-		}
+		t := time.NewTimer(next)
 		select {
 		case <-ctx.Done():
+			t.Stop()
 			return
-		case <-time.After(retry):
+		case <-r.VMReplaceCleanupKick():
+		case <-t.C:
 		}
+		t.Stop()
 	}
 }
 

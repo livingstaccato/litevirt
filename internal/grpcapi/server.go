@@ -473,6 +473,10 @@ type Server struct {
 	limitsPreLockHook func(vmName string)
 	// cutoverCrashHook is a test-only seam; see SetCutoverCrashHook.
 	cutoverCrashHook func(stage string) error
+	// vmReplaceKick wakes the daemon's cutover cleanup retry loop when a
+	// cutover leaves its committed phases journaled (VMReplaceCleanupKick).
+	vmReplaceKickOnce sync.Once
+	vmReplaceKick     chan struct{}
 	// enfAuditSignature is this node's kill-switch for tamper-evident audit logging.
 	// It alone turns SIGNING on (a signed row is backward-compatible, so nothing has
 	// to wait); combined with the AuditSignatureV1 latch it also makes an UNSIGNABLE

@@ -2480,9 +2480,15 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	// waits out storage that does not answer) has put the replacement's
 	// domain here, a start would find no definition, or the old one. Refused
 	// as retryable; the resume needs this VM's lock, so the start does not
-	// wait for it holding that lock.
+	// wait for it holding that lock. A journal that cannot be read refuses
+	// the start as retryable too: whether the handoff is owed is unknown.
 	if s.db != nil {
-		if pending, perr := corrosion.VMReplaceHandoffPending(ctx, s.db, s.hostName, vm.Name); perr == nil && pending {
+		pending, perr := corrosion.VMReplaceHandoffPending(ctx, s.db, s.hostName, vm.Name)
+		if perr != nil {
+			return releasePreflight, status.Errorf(codes.Unavailable,
+				"start %q: whether a cutover of this VM is still owed its runtime handoff here cannot be read (%v); retry", vm.Name, perr)
+		}
+		if pending {
 			return releasePreflight, status.Errorf(codes.Unavailable,
 				"start %q: a cutover of this VM is still being finished on this host (its runtime handoff is owed); retry once it completes", vm.Name)
 		}
@@ -5684,6 +5690,7 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	// restart's recovery answer it from the same durable place.
 	accepted, aErr := corrosion.VMReplaceAcceptedState(ctx, s.db, prepared.OperationID, prepared.OwnerEpoch)
 	if aErr != nil {
+		s.kickVMReplaceCleanups()
 		return nil, status.Errorf(codes.Internal,
 			"cutover: read the committed runtime intent: %v (the transition is committed; the "+
 				"journaled phases will be retried)", aErr)
@@ -5698,6 +5705,7 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 		OperationID: prepared.OperationID, OwnerEpoch: prepared.OwnerEpoch, Manifest: manifest,
 		AcceptedState: accepted,
 	}); err != nil {
+		s.kickVMReplaceCleanups()
 		return nil, status.Errorf(codes.Internal,
 			"cutover: finish the replacement: %v (the transition is committed; the journaled "+
 				"phases will be retried)", err)

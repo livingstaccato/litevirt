@@ -109,19 +109,63 @@ func replacedVMHandoffAtStart(t *testing.T, state, detail, act string) (error, b
 
 // The handoff's start reads the row again for the start guard: a read that
 // fails there refuses the start as retryable, as the guard itself does,
-// rather than skipping the guard. Here the row says migrating, so a start
-// would be a second copy of a guest that may run on the move's target.
+// rather than skipping the guard. It is the handoff's own refusal ("its row
+// cannot be read"), not the guard's re-read failing later on its own.
 //
-// Mutation: the read error taken as "no row to check" (the guard run only on
-// a successful read) — x boots, red.
+// Two rows. Recorded migrating, a start would be a second copy of a guest
+// that may run on the move's target; a fallback to the record read at the top
+// of the handoff is refused by the guard, so the words decide that case.
+// Recorded stopped, the same fallback would pass the guard's record check, and
+// only the handoff's own refusal stops it before the guard's re-read.
+//
+// Mutations: the read error taken as "no row to check" (the guard run only on
+// a successful read) — x boots, red in both; a fallback to the stale record —
+// the refusal is not the handoff's, red in both.
 func TestFinishVMReplaceRuntime_UnreadableRowAtStartRefusesTheStart(t *testing.T) {
-	err, started := replacedVMHandoffAtStart(t, "migrating", "→ peer", `ALTER TABLE vms RENAME TO vms_hidden`)
-	if started {
-		t.Fatal("x was started with its row unreadable")
+	for _, tc := range []struct{ state, detail string }{
+		{"migrating", "→ peer"},
+		{"stopped", ""},
+	} {
+		t.Run(tc.state, func(t *testing.T) {
+			err, started := replacedVMHandoffAtStart(t, tc.state, tc.detail, `ALTER TABLE vms RENAME TO vms_hidden`)
+			if started {
+				t.Fatal("x was started with its row unreadable")
+			}
+			if status.Code(errors.Unwrap(err)) != codes.Unavailable || !strings.Contains(err.Error(), "its row cannot be read") ||
+				!strings.Contains(err.Error(), "retry") {
+				t.Fatalf("handoff start with the row unreadable = %v; want the handoff's Unavailable, naming the read error, retryable", err)
+			}
+		})
 	}
-	if status.Code(errors.Unwrap(err)) != codes.Unavailable || !strings.Contains(err.Error(), "cannot be read") ||
-		!strings.Contains(err.Error(), "retry") {
-		t.Fatalf("handoff start with the row unreadable = %v; want Unavailable, naming the read error, retryable", err)
+}
+
+// The shared start hook asks whether a cutover still owes this name its
+// runtime handoff: a journal that cannot be read refuses the start as
+// retryable, as an owed handoff does (ccguard review I1).
+//
+// Mutation: the read error taken as "nothing owed" — the start goes through,
+// red.
+func TestPrepareHardwareForStart_CutoverJournalUnreadableRefuses(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	if err := corrosion.InsertVM(adminCtx(), s.db, corrosion.VMRecord{
+		Name: "x", HostName: s.hostName, State: "stopped",
+		CPUActual: 1, MemActual: 512, Spec: `{"name":"x","cpu":1,"memory_mib":512}`,
+	}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	vm, err := corrosion.GetVM(adminCtx(), s.db, "x")
+	if err != nil || vm == nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Execute(adminCtx(), `ALTER TABLE operations RENAME TO operations_hidden`); err != nil {
+		t.Fatal(err)
+	}
+	release, perr := s.PrepareHardwareForStart(adminCtx(), vm)
+	if release != nil {
+		defer release()
+	}
+	if status.Code(perr) != codes.Unavailable || !strings.Contains(perr.Error(), "runtime handoff here cannot be read") {
+		t.Fatalf("start with the cutover journal unreadable = %v; want Unavailable naming the read, retryable", perr)
 	}
 }
 

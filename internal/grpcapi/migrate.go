@@ -2707,8 +2707,9 @@ func migrationCAMismatch(vmName, source, sourceCA, target, targetCA string) erro
 	return status.Errorf(codes.FailedPrecondition,
 		"refusing to migrate VM %q with a storage copy: the migration-TLS credentials of %s and %s come from "+
 			"different migration CAs (%s: %s, %s: %s), so QEMU's TLS handshake between them would fail. "+
-			"Reissue every host's credentials from one migration CA with `lv host install-migration-tls --reissue` "+
-			"(run where the cluster's migration CA lives)",
+			"While `lv host rotate-migration-ca` runs, hosts hold different CA files until it finishes its current "+
+			"phase: retry once it has. Otherwise reissue every host's credentials from one migration CA with "+
+			"`lv host install-migration-tls --reissue` (run where the cluster's migration CA lives)",
 		vmName, source, target, source, sourceCA, target, targetCA)
 }
 

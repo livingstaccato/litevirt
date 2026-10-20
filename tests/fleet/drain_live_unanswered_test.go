@@ -42,7 +42,9 @@ func inUnansweredChild(t *testing.T, test string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^"+test+"$", "-test.count=1", "-test.v")
-	cmd.Env = append(os.Environ(), unansweredChild+"="+test)
+	// The child's files go under the parent's own temporary directory, which
+	// the parent removes: a child that exits skips its own cleanup.
+	cmd.Env = append(os.Environ(), unansweredChild+"="+test, "TMPDIR="+t.TempDir())
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("%s failed in its child process (%v):\n%s", test, err, out)
 	}
@@ -273,7 +275,7 @@ func TestFleet_APanicInTheDrainsMigrationCallAnswersNothing(t *testing.T) {
 		const name = "TestFleet_APanicInTheDrainsMigrationCallAnswersNothing"
 		for i := 0; i < 20; i++ {
 			cmd := exec.Command(os.Args[0], "-test.run=^"+name+"$", "-test.count=1")
-			cmd.Env = append(os.Environ(), drainPanicChild+"=1")
+			cmd.Env = append(os.Environ(), drainPanicChild+"=1", "TMPDIR="+t.TempDir())
 			out, err := cmd.CombinedOutput()
 			if err == nil {
 				t.Fatalf("run %d: the child did not crash:\n%s", i, out)

@@ -43,7 +43,7 @@ func TestPromote_AProoflessRelayedPromotionNeverReattachesWithoutAFencedOwner(t 
 		if !c.force {
 			// Without --force the split-brain guard refuses first: the
 			// owner is not fenced or removed (ccguard review I2).
-			if err == nil || !strings.Contains(err.Error(), "may still run on its host") {
+			if err == nil || !strings.Contains(err.Error(), "may still be running on its host") {
 				t.Fatalf("owner %s, force false: PromoteReplica = %v; want the split-brain refusal", c.owner, err)
 			}
 			continue

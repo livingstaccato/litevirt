@@ -2129,12 +2129,12 @@ func longestCronGap(expr string) (time.Duration, bool) {
 
 // promoteSplitBrainRefusal is the split-brain guard of a promotion of vm to
 // targetName. A same-name takeover without --force goes ahead only when the
-// original's host is shown unable to run it: no longer a member (no live
-// row), or proven powered off the way a shared disk's owner is
-// (corrosion.SharedDiskOwnerProvedOff and SharedDiskOwnerVerdict: fenced or
-// removed over a proof-grade fence). Any other host may still run the guest,
-// a fence that is not proof-grade among them, and a takeover then would
-// double-run the VM.
+// original's host is proven powered off the way a shared disk's owner is
+// (corrosion.SharedDiskOwnerProvedOff and SharedDiskOwnerVerdict): fenced over
+// a proof-grade fence, or removed (a tombstoned row, or none here) with a
+// proof-grade fence of its last life. Removing a host does not power it off,
+// and a row may not have replicated here yet. Any other host may still run
+// the guest, and a takeover then would double-run the VM.
 // A promotion to a new name never replaces another VM, --force or not:
 // --force is for a same-name takeover of a VM still on a host that may run
 // it. With it, a rename onto a live VM's name stopped and undefined that
@@ -2155,27 +2155,34 @@ func (s *Server) promoteSplitBrainRefusal(ctx context.Context, vm *corrosion.VMR
 		}
 	}
 	if !force && !renamed && vm.HostName != "" && vm.HostName != s.hostName {
-		h, err := corrosion.GetHost(ctx, s.db, vm.HostName)
+		h, provedOff, err := corrosion.SharedDiskOwnerProvedOff(ctx, s.db, vm.HostName)
 		if err != nil {
 			return status.Errorf(codes.Unavailable,
-				"promote of %s: whether its host %s is still healthy cannot be read (%v); nothing was changed; retry",
+				"promote of %s: whether its host %s is proven powered off cannot be read (%v); nothing was changed; retry",
 				vm.Name, vm.HostName, err)
 		}
-		if h == nil {
-			return nil // no longer a member
-		}
-		_, provedOff, perr := corrosion.SharedDiskOwnerProvedOff(ctx, s.db, vm.HostName)
-		if perr != nil {
-			return status.Errorf(codes.Unavailable,
-				"promote of %s: whether its host %s is proven powered off cannot be read (%v); nothing was changed; retry",
-				vm.Name, vm.HostName, perr)
-		}
-		if ok, why := corrosion.SharedDiskOwnerVerdict(vm.HostName, h, provedOff, nil); !ok {
+		if ok, _ := corrosion.SharedDiskOwnerVerdict(vm.HostName, h, provedOff, nil); !ok {
 			return status.Errorf(codes.FailedPrecondition,
-				"vm %q may still run on its host: %s; fence it (`lv host fence %s`, or "+
+				"vm %q may still be running on its host: %s; fence it (`lv host fence %s`, or "+
 					"`lv host fence-confirm %s` once it is powered off) or pass --force/--new-name to avoid split-brain",
-				vm.Name, why, vm.HostName, vm.HostName)
+				vm.Name, promoteOwnerNotProvenOff(vm.HostName, h), vm.HostName, vm.HostName)
 		}
 	}
 	return nil
+}
+
+// promoteOwnerNotProvenOff says why owner (h, nil for no live row) is not
+// shown unable to run a VM, for a promotion's refusal: the shared-disk
+// verdict's reasons, in words about the VM rather than a disk.
+func promoteOwnerNotProvenOff(owner string, h *corrosion.HostRecord) string {
+	switch {
+	case h == nil || h.State == "removed":
+		return fmt.Sprintf("%s is no longer a member of the cluster, but not proven powered off: removing a host "+
+			"does not power it off, and its newest fence is not an IPMI power-off or an operator's confirmation", owner)
+	case h.State == "fenced":
+		return fmt.Sprintf("%s is fenced, but not proven powered off: its newest fence is not an IPMI power-off or "+
+			"an operator's confirmation", owner)
+	default:
+		return fmt.Sprintf("%s is %s, not fenced (and no proof-grade fence was verified)", owner, h.State)
+	}
 }

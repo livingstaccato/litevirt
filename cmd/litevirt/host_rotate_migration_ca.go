@@ -23,7 +23,9 @@ By default it runs three phases, checking every host's daemon between them:
   1. trust-both  every host trusts the old CA and the new one
   2. reissue     every host gets a certificate from the new CA
   3. drop-old    every host trusts the new CA alone; this machine retires the old one
-Storage migrations keep working throughout. No restart is needed.
+No restart is needed. While trust-both or drop-old is being pushed, a storage
+migration between a host already updated and one not yet updated is refused
+(never sent in plaintext); retry once the phase reaches every host.
 
 Before it starts, it asks every host's daemon for its migration credentials and
 refuses, changing nothing, unless each holds a complete, valid set its daemon
@@ -36,9 +38,8 @@ If it stops (a host is unreachable), progress is saved; run it again to continue
 
   --no-overlap  For a compromised or expired CA. One pass straight to the new
                 CA alone: migrations between updated and not-yet-updated
-                hosts are refused until every host is done. Never sent in
-                plaintext unless that host set
-                migration.allow_unencrypted_storage.
+                hosts are refused, never sent in plaintext, until every
+                host is done.
   --force       Leave unreachable hosts behind. They keep the old CA's
                 credentials, so migrations with them are refused, until you run
                 'lv host install-migration-tls --reissue' once they are back.

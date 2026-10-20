@@ -132,12 +132,10 @@ func staleTokenInsert(ctx context.Context, tx *sql.Tx, s Statement) (bool, error
 	return tokenIncarnationStale(stamp, current), nil
 }
 
-// tokenRowDecision is anti-entropy's rule for a tokens row: a live token for
-// an incarnation the name has left here is not taken. A revoke is.
+// tokenRowDecision is anti-entropy's rule for a tokens row: a token for an
+// incarnation the name has left here is not taken (this node never holds
+// one live: retireStaleTokens).
 func tokenRowDecision(tx *sql.Tx, table syncTable, row []interface{}) (mergeAuthorityDecision, error) {
-	if mergeRowIsDeleted(table, row) {
-		return mergeAuthorityNormal, nil
-	}
 	idx := columnIndexMap(table.Columns)
 	var current string
 	err := tx.QueryRow(`SELECT created_at FROM users WHERE username = ?`, cellStr(row, idx, "username")).Scan(&current)
@@ -155,8 +153,7 @@ func tokenRowDecision(tx *sql.Tx, table syncTable, row []interface{}) (mergeAuth
 
 // retireStaleTokens drops, on this node only, the live tokens of name (and
 // their credentials) that were issued to an incarnation the name has left:
-// they could never authenticate again, and a revoke of one still lands as a
-// tombstone. It runs whenever the name's users row takes another incarnation
+// they could never authenticate again. It runs whenever the name's users row takes another incarnation
 // here, latched or not (settleUserName). Each statement is on one line for
 // the hard-delete tripwire (hard_delete_guard_test.go).
 func retireStaleTokens(ctx context.Context, tx *sql.Tx, name, current string) error {

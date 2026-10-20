@@ -40,7 +40,7 @@ func recreateUser(t *testing.T, c *Client, name string) {
 	if err := DeleteUser(ctx, c, name); err != nil {
 		t.Fatal(err)
 	}
-	if err := InsertUser(ctx, c, name, "admin", "hash-new"); err != nil {
+	if err := InsertUser(ctx, c, name, "operator", "hash-new"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -267,29 +267,40 @@ func TestTokenIncarnation_AnUnlatchedNodeTakesNoStaleTokenByAntiEntropy(t *testi
 	}
 }
 
-// A stale token's revoke is still taken: a tombstone grants nothing.
-func TestTokenIncarnation_AStaleTokensRevokeIsTaken(t *testing.T) {
+// A node that has not latched minted a token for carol, then took her
+// delete, and then takes the re-created carol by plain anti-entropy: the
+// token goes with the account it was issued to, so the node holds no live
+// token that no account can use.
+func TestTokenIncarnation_AnUnlatchedNodeDropsItsStaleTokenWhenTheAccountMoves(t *testing.T) {
 	ctx := context.Background()
 	lag, u := newTestDB(t), newTestDB(t)
-	u.SetUserIncarnationGate(func() bool { return true })
-	if err := InsertUser(ctx, lag, "carol", "admin", "h"); err != nil {
+	if err := InsertUser(ctx, lag, "carol", "operator", "h"); err != nil {
+		t.Fatal(err)
+	}
+	if err := u.MergeStateBytesLWW(lag.DumpStateBytes()); err != nil {
 		t.Fatal(err)
 	}
 	if err := InsertToken(ctx, lag, TokenRecord{ID: "t-stale", Username: "carol", Name: "n", TokenHash: "x"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := u.MergeStateBytesLWW(lag.DumpStateBytes()); err != nil {
+	u.SetUserIncarnationGate(func() bool { return true })
+	if err := DeleteUser(ctx, u, "carol"); err != nil {
 		t.Fatal(err)
 	}
-	recreateUser(t, u, "carol") // drops the stale token here
-	if err := RevokeToken(ctx, lag, "t-stale"); err != nil {
+	if err := lag.MergeStateBytesLWW(u.DumpStateBytes()); err != nil {
 		t.Fatal(err)
 	}
-	if err := u.MergeStateBytesLWW(lag.DumpStateBytes()); err != nil {
+	if err := InsertUser(ctx, u, "carol", "operator", "hash-new"); err != nil {
 		t.Fatal(err)
 	}
-	if got := oneString(t, u, `SELECT COALESCE(deleted_at, '') AS d FROM tokens WHERE id = 't-stale'`, "d"); got == "" {
-		t.Error("the stale token's revoke was not taken")
+	if err := lag.MergeStateBytesLWW(u.DumpStateBytes()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := userCreatedAt(t, lag, "carol"), userCreatedAt(t, u, "carol"); got != want {
+		t.Fatalf("lag did not take the new carol (%q, want %q)", got, want)
+	}
+	if rows, _ := lag.Query(ctx, `SELECT id FROM tokens WHERE id = 't-stale' AND deleted_at IS NULL`); len(rows) != 0 {
+		t.Error("lag still holds the deleted carol's token live after taking the new carol")
 	}
 }
 

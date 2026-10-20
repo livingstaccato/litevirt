@@ -8,6 +8,7 @@ package fleet
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -226,6 +227,37 @@ func TestFleet_DrainLiveMoveWhoseCallEndsUnansweredAfterLandingStaysMigrating(t 
 	if c, ok, _ := corrosion.GetHealthCondition(ctx, sc.src.DB, "drain", migrationUnresolved, "vm", "slow"); !ok || c.Lifecycle != corrosion.ConditionResolved {
 		t.Fatalf("%s after repair-owner = %+v (found %v); want resolved", migrationUnresolved, c, ok)
 	}
+}
+
+// As above, with the source's domain state unreadable when the drain asks:
+// where the guest runs is no better known, so the row is left migrating the
+// same way.
+//
+// Mutation: an unreadable state taken as running — the row is written error
+// on the source and the reservation released, red.
+func TestFleet_DrainLiveMoveWhoseCallEndsUnansweredWithTheSourceUnreadableStaysMigrating(t *testing.T) {
+	if !inUnansweredChild(t, "TestFleet_DrainLiveMoveWhoseCallEndsUnansweredWithTheSourceUnreadableStaysMigrating") {
+		return
+	}
+	sc := newStuckLiveDrainTimeout(t, false, 0)
+	landThenEnd(t, sc, false)
+	// Unreadable from the moment libvirt has the move: the drain read it
+	// before, choosing the move.
+	var unreadable atomic.Bool
+	sc.src.Virt.FailDomainState = func(name string) error {
+		if name == "slow" && unreadable.Load() {
+			return errors.New("test: the source's domain state cannot be read")
+		}
+		return nil
+	}
+	land := sc.src.Virt.OnMigrateToTarget
+	sc.src.Virt.OnMigrateToTarget = func(name, d string, p lv.MigrateParams) error {
+		if name == "slow" {
+			unreadable.Store(true)
+		}
+		return land(name, d, p)
+	}
+	leftMigratingByDrain(t, sc)
 }
 
 // leftMigratingByDrain drains sc's source, whose live move of slow ends

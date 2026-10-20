@@ -63,3 +63,27 @@ func TestBuildDrainPlacementRequest_CarriesUSBConstraints(t *testing.T) {
 		t.Errorf("mapped USB: USBMappings %v USBHost %q; want [dongle] and no host", req.USBMappings, req.USBHost)
 	}
 }
+
+// A running Secure Boot / vTPM VM prefers a host labelled for the live
+// firmware move (spec §13), and still requires only the capability labels;
+// a stopped one, which moves cold, and a plain VM prefer nothing new.
+//
+// Mutation: drop the preference in buildDrainPlacementRequest — red.
+func TestBuildDrainPlacementRequest_RunningFirmwareVMPrefersALiveMoveHost(t *testing.T) {
+	spec := `{"secure_boot":true,"tpm":true,"placement":{"prefer":{"rack":"a"}}}`
+	req := buildDrainPlacementRequest(corrosion.VMRecord{Name: "fw", State: "running", Spec: spec}, "draining-host", corrosion.CapacityPolicy{})
+	if req.PreferLabels[corrosion.LabelFwLiveMigrate] != "true" || req.PreferLabels["rack"] != "a" {
+		t.Errorf("PreferLabels = %v, want %s=true beside the spec's own", req.PreferLabels, corrosion.LabelFwLiveMigrate)
+	}
+	if _, ok := req.RequireLabels[corrosion.LabelFwLiveMigrate]; ok {
+		t.Errorf("RequireLabels = %v: the live move label is a preference, not a requirement", req.RequireLabels)
+	}
+	for _, vm := range []corrosion.VMRecord{
+		{Name: "fw", State: "stopped", Spec: spec},
+		{Name: "plain", State: "running", Spec: `{}`},
+	} {
+		if _, ok := buildDrainPlacementRequest(vm, "draining-host", corrosion.CapacityPolicy{}).PreferLabels[corrosion.LabelFwLiveMigrate]; ok {
+			t.Errorf("%s (%s) prefers %s", vm.Name, vm.State, corrosion.LabelFwLiveMigrate)
+		}
+	}
+}

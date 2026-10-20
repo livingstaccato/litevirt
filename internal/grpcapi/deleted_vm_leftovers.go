@@ -2,7 +2,12 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -220,7 +225,8 @@ const LeftoverDomainMD = "x-litevirt-leftover-domain"
 type LeftoverDomain struct {
 	Host string `json:"host"`
 	// Pending: the host had not answered within deletedVMCleanupReportWait;
-	// the delete keeps asking it after it returns.
+	// the request to it carries on after the delete returns, repeated only
+	// while that host's replica has not seen the delete.
 	Pending bool   `json:"pending,omitempty"`
 	Detail  string `json:"detail"`
 }
@@ -235,7 +241,8 @@ var deletedVMCleanupReportWait = 5 * time.Second
 // deletedVMCleanupReportWait for the hosts the VM left, holding no lock, and
 // returns what the delete's caller is told: each host that declined within the
 // wait because a domain of the name is defined there, and each host the VM
-// left that had not answered (it is still asked after the delete returns).
+// left that had not answered (its request carries on after the delete
+// returns, repeated only while that host's replica lags the delete).
 // Without wait it returns at once. A peer call runs on a context detached
 // from the caller's (the receiving host authorises it as the system), and
 // never fails the delete: the VM is gone, and a host that is unreachable or
@@ -291,11 +298,17 @@ collect:
 	for _, host := range plan.hosts {
 		if plan.left[host] && !answered[host] {
 			out = append(out, LeftoverDomain{Host: host, Pending: true,
-				Detail: "it has not answered yet; the delete keeps asking it to remove the VM's leftovers"})
+				Detail: deletedVMLeftoverPendingDetail})
 		}
 	}
 	return out
 }
+
+// deletedVMLeftoverPendingDetail is what `lv rm` says of a host that had not
+// answered within deletedVMCleanupReportWait.
+const deletedVMLeftoverPendingDetail = "it has not answered yet; the delete's request to remove the VM's leftovers there carries on " +
+	"after the delete returns. It is repeated only while that host's replica has not yet seen the delete, and is not sent " +
+	"again if it fails for any other reason, so what the VM left on that host may stay there"
 
 // leftoverSink carries a delete's plan out of deleteVM, which holds the
 // VM's lock and start lease, to DeleteVM, which waits for the hosts once
@@ -461,6 +474,7 @@ func (s *Server) removeDeletedVMLeftoversHere(ctx context.Context, req *pb.Clean
 	if err := health.RemoveVMOwnerEpochMarker(s.dataDir, name); err != nil {
 		slog.Warn("deleted VM leftovers: owner-epoch marker not removed", "vm", name, "error", err)
 	}
+	s.forgetDeletedVMSeedRecord(ctx, name)
 
 	if len(req.DiskPaths) == 0 {
 		return &emptypb.Empty{}, nil
@@ -548,24 +562,73 @@ func (s *Server) localDomainUsesPath(p string) (bool, string) {
 			return true, "cannot read the disks of domain " + d + ": " + serr.Error()
 		}
 		for _, src := range srcs {
-			cur := src
-			for depth := 0; cur != "" && depth < 32; depth++ {
-				if filepath.Clean(cur) == filepath.Clean(p) {
-					return true, "domain " + d + " uses it"
-				}
-				info, ierr := qcow2.Info(cur)
-				if ierr != nil || info.BackingFile == "" {
-					break
-				}
-				next := info.BackingFile
-				if !filepath.IsAbs(next) {
-					next = filepath.Join(filepath.Dir(cur), next)
-				}
-				cur = next
+			if reached, _ := qcow2ChainReaches(src, p, false, cleanPathsEqual); reached {
+				return true, "domain " + d + " uses it"
 			}
 		}
 	}
 	return false, ""
+}
+
+func cleanPathsEqual(a, b string) bool { return filepath.Clean(a) == filepath.Clean(b) }
+
+// qcow2ChainReaches reports whether p is src or anywhere in src's qcow2
+// backing chain (followed from each image's header, to depth 32), comparing
+// with same. A missing link, or one that is not qcow2 (a raw image), ends
+// the chain: it has nothing further to reach. Not strict, any other error
+// ends the chain too; strict, a header that cannot be read is an error, so a
+// caller about to delete p refuses rather than reads "not reached".
+func qcow2ChainReaches(src, p string, strict bool, same func(a, b string) bool) (bool, error) {
+	cur := src
+	for depth := 0; cur != "" && depth < 32; depth++ {
+		if same(cur, p) {
+			return true, nil
+		}
+		isQcow2, err := qcow2Magic(cur)
+		if errors.Is(err, fs.ErrNotExist) || (err == nil && !isQcow2) {
+			return false, nil
+		}
+		var info *qcow2.ImageInfo
+		if err == nil {
+			info, err = qcow2.Info(cur)
+		}
+		if err != nil {
+			if strict {
+				return false, fmt.Errorf("read the qcow2 header of %s: %w", cur, err)
+			}
+			return false, nil
+		}
+		if info.BackingFile == "" {
+			return false, nil
+		}
+		next := info.BackingFile
+		if !filepath.IsAbs(next) {
+			next = filepath.Join(filepath.Dir(cur), next)
+		}
+		cur = next
+	}
+	if strict && cur != "" {
+		return false, fmt.Errorf("the backing chain of %s is deeper than 32", src)
+	}
+	return false, nil
+}
+
+// qcow2Magic reports whether the file at p starts with the qcow2 magic. A
+// file shorter than the magic is not qcow2.
+func qcow2Magic(p string) (bool, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	var b [4]byte
+	if _, err := io.ReadFull(f, b[:]); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return false, nil
+		}
+		return false, err
+	}
+	return binary.BigEndian.Uint32(b[:]) == qcow2.Magic, nil
 }
 
 // modifiedAfter reports whether p's modification time is strictly after t.

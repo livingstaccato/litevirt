@@ -54,6 +54,7 @@ func TestRebuildVM_ISCSI_HoldsTheLUNAcrossTheTeardown(t *testing.T) {
 	if err := corrosion.DeleteVM(ctx, s.db, "a"); err != nil {
 		t.Fatal(err)
 	}
+	_ = s.virt.DestroyDomain("a")
 	_ = s.virt.UndefineDomain("a", false)
 	resp, err := s.LUNHolders(peerCtxFor(t, s, "peer-host"), &pb.LUNHoldersRequest{Luns: []string{mustLUNKey(t, "10.0.0.1", "0")}})
 	if err != nil {

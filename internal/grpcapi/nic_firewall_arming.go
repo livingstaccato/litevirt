@@ -280,13 +280,17 @@ func (s *Server) ArmNICFirewall(ctx context.Context, req *pb.ArmNICFirewallReque
 		// The guest arrived paused: its guards in force under the taps it got
 		// here, then it runs (resumeHeld). A guest this host does not hold —
 		// a source of an earlier round, or a record lost — is armed and
-		// resumed as before.
+		// resumed as before. A guest a live firmware move holds is resumed by
+		// neither branch: only that move's release resumes it.
 		err := s.resumeHeld(ctx, req.GetVmName())
 		switch {
 		case err == nil:
 			return &emptypb.Empty{}, nil
 		case !errors.Is(err, errNotHeld):
 			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+		}
+		if err := s.firmwareMoveHeld(req.GetVmName()); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "%s: %v", req.GetVmName(), err)
 		}
 		if st, serr := s.virt.DomainStateReason(req.GetVmName()); serr == nil && st.State == "running" {
 			return &emptypb.Empty{}, nil // let run already (this host's resumer, or a retry)
@@ -356,10 +360,11 @@ func (s *Server) armMigrationTarget(ctx context.Context, target *corrosion.HostR
 	return am, nil
 }
 
-// apply sets what the move needs in libvirt's parameters.
+// apply sets what the move needs in libvirt's parameters. A firmware move
+// arrives paused whatever its NIC guards need.
 func (am *armedMigration) apply(p *lv.MigrateParams) {
 	if am != nil {
-		p.Paused = am.paused
+		p.Paused = am.paused || p.FirmwareLive
 	}
 }
 

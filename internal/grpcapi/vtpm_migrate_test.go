@@ -28,9 +28,10 @@ func insertFirmwareVM(t *testing.T, ctx context.Context, s *Server, name, state 
 	}
 }
 
-// A firmware VM migrated without --cold is told the command that works: a
-// running one to stop first, a stopped one only to add --cold — not to stop a
-// VM that is already stopped.
+// A firmware VM migrated without --cold, and refused, is told the command that
+// works: a running one (refused here by stage A: this host has no live
+// firmware check) to stop first, a stopped one only to add --cold — not to
+// stop a VM that is already stopped.
 //
 // Mutation: give the stopped VM the running VM's message — it names
 // `lv stop fw` and goes red.
@@ -42,6 +43,7 @@ func TestMigrateVM_FirmwareNotColdNamesTheCommandThatWorks(t *testing.T) {
 		s := testServerWithLocks(t)
 		ctx := adminCtx()
 		insertFirmwareVM(t, ctx, s, "fw", tc.state)
+		insertTestHost(t, ctx, s.db, "t1", "active")
 		err := s.MigrateVM(&pb.MigrateVMRequest{VmName: "fw", TargetHost: "t1"}, &mockMigrateStream{ctx: ctx})
 		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "`lv migrate fw t1 --cold`") {
 			t.Errorf("%s firmware VM migrated live = %v, want FailedPrecondition naming `lv migrate fw t1 --cold`", tc.state, err)
@@ -53,12 +55,14 @@ func TestMigrateVM_FirmwareNotColdNamesTheCommandThatWorks(t *testing.T) {
 	}
 }
 
-// Live migration of an SB/vTPM VM is refused (carry unvalidated; source must not
-// be wiped on an unverified carry) — cold only.
+// Live migration of an SB/vTPM VM on a host that cannot check its own live
+// firmware runtime (no LiveFirmwareHost) is refused, and steered to the cold
+// move.
 func TestMigrateVM_FirmwareLiveRefused(t *testing.T) {
 	s := testServerWithLocks(t)
 	ctx := adminCtx()
 	insertFirmwareVM(t, ctx, s, "fw", "running")
+	insertTestHost(t, ctx, s.db, "t1", "active")
 	err := s.MigrateVM(&pb.MigrateVMRequest{VmName: "fw", TargetHost: "t1"}, &mockMigrateStream{ctx: ctx}) // default strategy = live
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition refusing live firmware migration, got %v", err)
@@ -117,7 +121,7 @@ func TestEnsureFirmwareState_MaterializesNvram(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 	var buf bytes.Buffer
-	has, err := lv.WriteFirmwareBundle(s.dataDir, "src", "", &buf)
+	has, err := lv.NewFirmwareStore(s.dataDir).WriteFirmwareBundle("src", "", &buf)
 	if err != nil || !has {
 		t.Fatalf("WriteFirmwareBundle: has=%v err=%v", has, err)
 	}
@@ -127,7 +131,7 @@ func TestEnsureFirmwareState_MaterializesNvram(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureFirmwareState: %v", err)
 	}
-	if !lv.HasNvram(s.dataDir, "win") {
+	if !s.fw().HasNvram("win") {
 		t.Error("EnsureFirmwareState should have materialized NVRAM for the target VM")
 	}
 }
@@ -143,7 +147,7 @@ func nvramBundle(t *testing.T, dataDir string) []byte {
 		t.Fatalf("write: %v", err)
 	}
 	var buf bytes.Buffer
-	if has, err := lv.WriteFirmwareBundle(dataDir, "bundle-src", "", &buf); err != nil || !has {
+	if has, err := lv.NewFirmwareStore(dataDir).WriteFirmwareBundle("bundle-src", "", &buf); err != nil || !has {
 		t.Fatalf("WriteFirmwareBundle: has=%v err=%v", has, err)
 	}
 	return buf.Bytes()
@@ -183,7 +187,7 @@ func TestEnsureFirmwareState_DefineFailureWipesFirmware(t *testing.T) {
 	if status.Code(err) != codes.Internal {
 		t.Fatalf("expected Internal on define failure, got %v", err)
 	}
-	if lv.HasNvram(s.dataDir, "win") {
+	if s.fw().HasNvram("win") {
 		t.Error("firmware must be wiped after a failed define-on-target")
 	}
 }
@@ -207,7 +211,7 @@ func TestEnsureFirmwareState_FingerprintMismatchRefused(t *testing.T) {
 	if !strings.Contains(err.Error(), "layout differs") {
 		t.Errorf("error should explain the layout mismatch, got: %v", err)
 	}
-	if lv.HasNvram(s.dataDir, "win") {
+	if s.fw().HasNvram("win") {
 		t.Error("firmware must be wiped on a refused define")
 	}
 }
@@ -323,8 +327,9 @@ func TestCleanupMigrationArtifacts_RefusesPathOutsideDataDir(t *testing.T) {
 // A stopped firmware VM with a host-local disk is no longer refused: it moves
 // with its disks and its firmware (TestColdMigrateStoppedVM_CarriesFirmwareWithAHostLocalDisk).
 
-// Drain must refuse an SB/vTPM VM regardless of storage type (firmware isn't
-// transferred by reassignment / raw live-migrate).
+// Drain skips a running SB/vTPM VM it cannot move by the live firmware move
+// (here: neither host is labelled for it), and never by reassignment or its
+// raw live-migrate.
 func TestDrainOneVM_RefusesFirmwareVM(t *testing.T) {
 	s := testServerWithLocks(t)
 	ctx := adminCtx()

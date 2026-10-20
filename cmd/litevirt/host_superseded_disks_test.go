@@ -2,9 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"io"
 	"strings"
 	"testing"
 	"time"
+
+	"google.golang.org/grpc"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
@@ -66,5 +70,39 @@ func TestPrintSupersededDisks_SaysAKeptFileIsAnEarlierVMs(t *testing.T) {
 	s := out.String()
 	if !strings.Contains(s, " web ") || !strings.Contains(s, "it is an earlier VM web's, not the VM web that exists now") {
 		t.Fatalf("the kept disk is not listed under web as an earlier web's:\n%s", s)
+	}
+}
+
+type supersededRestoreClient struct {
+	pb.LiteVirtClient
+	resp *pb.SupersededDisksResponse
+}
+
+func (c *supersededRestoreClient) SupersededDisks(context.Context, *pb.SupersededDisksRequest, ...grpc.CallOption) (*pb.SupersededDisksResponse, error) {
+	return c.resp, nil
+}
+
+// lab2-D2-proof F12: a --restore of a firmware quarantine says what it set
+// aside, not "the disk it replaced".
+//
+// Mutation: the old "The disk it replaced" text — red.
+func TestSupersededDisksRestore_SaysWhatItReplaced(t *testing.T) {
+	orig := withClient
+	withClient = func(ctx context.Context, fn func(context.Context, pb.LiteVirtClient) error) error {
+		return fn(ctx, &supersededRestoreClient{resp: &pb.SupersededDisksResponse{Host: "node-1",
+			Restored: "/var/lib/litevirt/fwmig-quarantine/fw1-reconciled-1", RestoredTo: "fw1",
+			SetAside: "/var/lib/litevirt/fwmig-quarantine/fw1-reconciled-2"}})
+	}
+	t.Cleanup(func() { withClient = orig })
+	cmd := newHostSupersededDisksCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"node-1", "--restore", "/var/lib/litevirt/fwmig-quarantine/fw1-reconciled-1"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("superseded-disks --restore: %v", err)
+	}
+	if got := out.String(); !strings.Contains(got, "What it replaced is kept as /var/lib/litevirt/fwmig-quarantine/fw1-reconciled-2.") || strings.Contains(got, "disk it replaced") {
+		t.Errorf("output:\n%s", got)
 	}
 }

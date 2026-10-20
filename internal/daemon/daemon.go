@@ -34,6 +34,7 @@ import (
 	"github.com/litevirt/litevirt/internal/failover"
 	"github.com/litevirt/litevirt/internal/filerestore"
 	"github.com/litevirt/litevirt/internal/firewall"
+	"github.com/litevirt/litevirt/internal/fwmig"
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hlc"
@@ -84,9 +85,13 @@ type Daemon struct {
 	auditWired     chan struct{}
 	auditWiredDone sync.Once
 
-	cfg     *Config
-	db      *corrosion.Client
-	virt    *libvirt.Client
+	cfg  *Config
+	db   *corrosion.Client
+	virt *libvirt.Client
+	// fwStore is the host's one firmware store, guarded by the firmware move
+	// guard from the moment libvirt is connected, and shared by the server and
+	// the reconciler.
+	fwStore *libvirt.FirmwareStore
 	images  *image.Store
 	grpcSrv *grpc.Server
 	svc     *grpcapi.Server // gRPC service handler; held so background loops can refresh it
@@ -226,6 +231,10 @@ func NewContext(ctx context.Context, cfg *Config) (*Daemon, error) {
 	if err != nil {
 		return nil, fmt.Errorf("libvirt: %w", err)
 	}
+	// The firmware move guard (fwmig) is in force before anything can start,
+	// stop or redefine a domain, and is asked ahead of the start guard below.
+	fwStore := libvirt.NewFirmwareStore(cfg.DataDir)
+	fwmig.Wire(virt, fwStore)
 	// No guarded VM starts before the per-NIC firewall is wired (re-review
 	// R2-I2): after a host boots its nft tables are empty, and an onboot,
 	// self-heal or restart-policy start would run its guest unguarded. Such a
@@ -251,10 +260,11 @@ func NewContext(ctx context.Context, cfg *Config) (*Daemon, error) {
 	}
 
 	return &Daemon{
-		cfg:    cfg,
-		db:     db,
-		virt:   virt,
-		images: store,
+		cfg:     cfg,
+		db:      db,
+		virt:    virt,
+		fwStore: fwStore,
+		images:  store,
 
 		startWaitSvc: startWaitSvc,
 	}, nil
@@ -1178,6 +1188,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	firmwarePaths := libvirt.ResolveFirmwarePaths()
 	svc.SetFirmwarePaths(firmwarePaths)
 	reconciler.SetFirmwarePaths(firmwarePaths)
+	// One firmware store (NVRAM under the data dir, swtpm under libvirt's
+	// root) for the host, the guarded one New built, shared by the server and
+	// the reconciler.
+	svc.SetFirmwareStore(d.fwStore)
+	reconciler.SetFirmwareStore(d.fwStore)
 	svc.SetSessionTimeouts(parseDurationOr(d.cfg.Auth.SessionIdleTimeout, 0), parseDurationOr(d.cfg.Auth.SessionHardExpiry, 0))
 	svc.SetStrictMTLSIdentity(d.cfg.Auth.StrictMTLSIdentity)
 	svc.SetTrustRotatedPeerCerts(d.cfg.Auth.TrustRotatedPeerCerts)
@@ -1288,14 +1303,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 	vtpmMarker := filepath.Join(d.cfg.DataDir, "vtpm-state-sync")
 	vtpmSync := &vtpmStateSync{
 		on:   d.cfg.VTPMStateSyncEnabled(),
-		base: libvirt.SwtpmBase(),
+		base: d.fwStore.SwtpmBase,
 		wait: vtpmPassWait,
-		sync: func(on bool) libvirt.SwtpmSyncReport { return libvirt.SyncSwtpmState(on, vtpmMarker) },
+		// The host's own store: its swtpm tree is the one this host's
+		// guests write.
+		sync: func(on bool) libvirt.SwtpmSyncReport { return d.fwStore.SyncSwtpmState(on, vtpmMarker) },
 		report: func(open bool, evidence map[string]any) bool {
 			return d.syncVTPMCondition(ctx, open, evidence)
 		},
 	}
 	tpmCapable := tpmCapableProbe(exec.LookPath, vtpmSync.probe)
+	// The live firmware move label reads the pass the vTPM label's probe
+	// ran this cycle, so a cycle walks the swtpm tree once.
+	tpmReady := tpmReadyProbe(exec.LookPath, vtpmSync)
 	awaitFirstVTPMPass(tpmCapable)
 	// Finish any cutover cleanup a previous process left committed-but-unfinished.
 	// The replacement transition displaced the rows describing what the replaced VM
@@ -1501,13 +1521,28 @@ func (d *Daemon) Run(ctx context.Context) error {
 		svc.RecoverDeviceLeases(ctx) // roll back device leases a crash orphaned
 	}
 
+	// Resume, park or abort each live firmware move this host is the source
+	// of (spec §8.1): its VM's lock is taken here, before any runtime loop
+	// starts, and held until its recovery resolves or parks it.
+	// Unconditional: outside the operation journal's branch above.
+	dbWorkers := newDBWorkerCoordinator(ctx, svc)
+	workerShutdownStarted := false
+	defer func() {
+		if !workerShutdownStarted {
+			dbWorkers.stopStartup(15 * time.Second)
+		}
+	}()
+	dbWorkers.recoverFirmwareMoves(ctx)
+
 	// F1 resource-update recovery: resume any locally-owned VM wedged on a nonterminal
 	// resource_update_running operation (a live resize that crashed after committing its
 	// desired spec) — converge it to the committed spec + clear the barrier so a partial
 	// failure never wedges active_operation_id. Uses replicated operation state (not the
 	// host-local journal), so it runs regardless of the journal above. A reconciler pass
 	// retries stragglers.
-	svc.RecoverResourceOperations(ctx)
+	// At start a VM whose lock is held (a firmware move's recovery holds it
+	// until the start is wired, below) is skipped; the loop takes it later.
+	svc.RecoverResourceOperationsAtStart(ctx)
 	go svc.RunResourceOperationRecovery(ctx)
 
 	// Release host reservations whose operation provably stopped running (one
@@ -1522,7 +1557,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// FORWARD to a single consistent state, clearing the barrier. Runs synchronously
 	// after DB + libvirt + journal init (uses the host-local journal artifacts), and
 	// a reconciler pass retries stragglers.
-	svc.RecoverHardwareOperations(ctx)
+	svc.RecoverHardwareOperationsAtStart(ctx)
 
 	// Release PCI devices a VM owns but provably does not hold, once the
 	// recoveries above have settled every lease and operation that could
@@ -1662,6 +1697,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Remove the owner-epoch markers of VMs deleted while this host was not
 	// asked (in maintenance, unreachable), each time it becomes active.
 	go svc.RunDeletedVMMarkerSweep(ctx)
+	// Quarantine abandoned target holds and name holds kept too long; retry
+	// source cleanup and sweep retained bundles no live record names.
+	dbWorkers.startFirmwareSweeps(ctx)
+
 	// Remember the clock skews this host sees past their rows' retention: the
 	// margin lv image prune keeps a deleted image's file within reads them.
 	go svc.RunImageSkewRecorder(ctx)
@@ -1669,8 +1708,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// recorded (one written through a daemon that predates the gate), on the
 	// failover lease holder, so a later rollback below the release still
 	// quarantines.
-	dbWorkers := newDBWorkerCoordinator(ctx, svc)
 	dbWorkers.startSweep()
+	// Remove replicas and retire checkpoint rows for removed schedules.
+	dbWorkers.startReplicaOrphanSweep(ctx)
 	// Autostart onboot VMs once, in startup_order (#10). Runs only for VMs not
 	// already running in libvirt, so a daemon restart (qemu kept alive by
 	// KillMode=process) is a no-op while a host reboot brings them up in order;
@@ -1855,11 +1895,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 	//   - Secure Boot: the secboot/MS OVMF pair (resolved above).
 	// Asserted now, before the container checker starts, and re-asserted every
 	// capabilityLabelInterval (keepCapabilityLabels says why).
+	tpmAvailable := func() bool {
+		_, errSwtpm := exec.LookPath("swtpm")
+		_, errSetup := exec.LookPath("swtpm_setup")
+		return errSwtpm == nil && errSetup == nil
+	}
 	capabilityLabels := []capabilityLabel{
 		{key: corrosion.LabelLXCCapable, capable: lxc.Available},
 		{key: corrosion.LabelTPMCapable, capable: tpmCapable},
 		{key: corrosion.LabelSecureBootCapable, capable: firmwarePaths.SecureBootAvailable},
+		// The live firmware move label holds a target to vTPM's own label
+		// (tpmReady: swtpm present and this cycle's vtpm_state_sync pass completed); a
+		// move's Prepare re-checks presence only (tpmAvailable), since the
+		// label already gated it and a pass per Prepare would walk the tree
+		// on every move.
+		{key: corrosion.LabelFwLiveMigrate, capable: newFwLiveLabel(d.cfg.Migration, d.fwStore, firmwarePaths, d.virt.LibvirtVersion, tpmReady, vtpmSync.vtpmDurableErr)},
 	}
+	// A live firmware move's target re-checks the label's conditions itself,
+	// live, in Prepare.
+	// Prepare re-reads the last vTPM pass at move time: a label a cycle
+	// stale never lets a move target a host whose vTPM state is not durable.
+	svc.SetLiveFirmwareHost(newFwLiveHostCheck(d.cfg.Migration, d.fwStore, firmwarePaths, d.virt.LibvirtVersion, tpmAvailable, vtpmSync.vtpmDurableErr))
 	asserted, err := assertCapabilityLabels(ctx, d.db, d.cfg.HostName, capabilityLabels)
 	if err != nil {
 		slog.Warn("set capability host labels failed; retrying in the background", "labels", asserted, "error", err)
@@ -2179,6 +2235,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	grpcOpts = append(grpcOpts, obs.ServerOptions()...)
 	d.grpcSrv = grpc.NewServer(grpcOpts...)
 
+	// Every setter has run: the firmware moves locked at the journal barrier
+	// are recovered from here (review D2-13 N-1). Then, every minute, a
+	// parked move's blocked call is retried, fence resolution tried, and
+	// each owed DISCARD sent (spec §8.1).
+	svc.MarkStartupWired()
+	dbWorkers.startFirmwareMoveRecovery(ctx)
+
 	svc.RegisterServices(d.grpcSrv)
 
 	lis, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", d.cfg.GRPCPort))
@@ -2261,7 +2324,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	grpcStopped := make(chan struct{})
 	reexecRequested := false
 	uninstalled := false
-	go dbWorkers.shutdown(ctx, svc.ReExecCh, svc.ShutdownCh, func(reason daemonStopReason) {
+	stopCtx, requestWorkerShutdown := context.WithCancel(ctx)
+	defer requestWorkerShutdown()
+	workerShutdownStarted = true
+	go dbWorkers.shutdown(stopCtx, svc.ReExecCh, svc.ShutdownCh, func(reason daemonStopReason) {
 		switch reason {
 		case daemonContextStop:
 			stopBootCheck()
@@ -2333,6 +2399,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// handler stuck in the kernel: once the shutdown's stop is over, Serve
 	// is waited on only briefly (awaitServe).
 	serveErr := awaitServe(serveErrs, grpcStopped, serveReturnBound)
+	// An unexpected Serve failure is also an exit: it must not leave the
+	// coordinator waiting forever on an otherwise-live Run context.
+	requestWorkerShutdown()
 
 	// Wait for cleanup to finish (replicator, libvirt, DB) before returning,
 	// but cap at 15s so we don't hang longer than systemd's stop timeout.
@@ -3563,18 +3632,18 @@ func (d *Daemon) runAuthEngineReload(ctx context.Context) {
 // aside on this host (<path>.superseded-<time>) once they are older than
 // superseded_disk_retention_days and the VM they came from no longer exists
 // (health.PurgeSupersededDisks): while it exists, only an operator removes
-// them. 0 keeps every copy.
+// them. 0 keeps every copy. The reconciler's firmware quarantines
+// (<data_dir>/fwmig-quarantine/<vm>-reconciled-<unix>/) follow the same rule
+// (health.SweepSetAside).
 func (d *Daemon) runSupersededDiskSweep(ctx context.Context) {
 	days := d.cfg.SupersededDiskRetentionDays
 	if days <= 0 {
-		slog.Info("superseded disk copies are kept until removed by hand (superseded_disk_retention_days: 0)")
+		slog.Info("superseded disk copies and reconciled firmware quarantines are kept until removed by hand (superseded_disk_retention_days: 0)")
 		return
 	}
 	retention := time.Duration(days) * 24 * time.Hour
 	sweep := func() {
-		if _, err := health.PurgeSupersededDisks(ctx, d.db, d.cfg.DataDir, retention, time.Now()); err != nil {
-			slog.Warn("superseded disk sweep", "error", err)
-		}
+		health.SweepSetAside(ctx, d.db, d.cfg.DataDir, retention, time.Now())
 	}
 	select {
 	case <-ctx.Done():

@@ -240,6 +240,14 @@ func (a *Applier) Apply(ctx context.Context, p Plan) (bool, error) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// Logging is decided again under the lock: a plan loaded before logging
+	// went off (a lost group, a stopping daemon) is applied without its log
+	// lines, so it cannot follow the pass that removed them with them back.
+	if p.LogPolicy.Available && p.logRecheck != nil {
+		if on, _ := p.logRecheck(); !on {
+			p.LogPolicy = LogPolicy{}
+		}
+	}
 	resync := a.resyncDueLocked()
 
 	changed, sent := false, false

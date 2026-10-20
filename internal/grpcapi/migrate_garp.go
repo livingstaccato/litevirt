@@ -68,6 +68,8 @@ func (s *Server) AnnounceMigratedGuest(ctx context.Context, req *pb.AnnounceMigr
 // network.AnnounceGateway also skips a bridge with an uplink). Best effort;
 // each bridge once.
 func (s *Server) announceGatewaysOf(ctx context.Context, vm string) {
+	s.dbWorkerEvent(ctx, "gateway_local", "entry")
+	defer s.dbWorkerEvent(ctx, "gateway_local", "exit")
 	nics, err := corrosion.MergedVMNICs(ctx, s.db, vm)
 	if err != nil {
 		slog.Warn("migrate: cannot read the NICs to announce the gateways of", "vm", vm, "error", err)
@@ -117,6 +119,8 @@ func (s *Server) announceGatewaysOf(ctx context.Context, vm string) {
 // the guest's gateways there (AnnounceMigratedGuest). Best effort: a target on
 // an older build answers Unimplemented, and the guest then recovers on its own.
 func (s *Server) announceOnTarget(ctx context.Context, target *corrosion.HostRecord, vm string) {
+	s.dbWorkerEvent(ctx, "gateway_target", "entry")
+	defer s.dbWorkerEvent(ctx, "gateway_target", "exit")
 	conn, err := s.dialPeerAddr(peerTarget(target.Address, target.GRPCPort))
 	if err != nil {
 		slog.Warn("migrate: dial the target to announce the guest's gateways", "host", target.Name, "vm", vm, "error", err)
@@ -134,10 +138,29 @@ func (s *Server) announceOnTarget(ctx context.Context, target *corrosion.HostRec
 	}
 }
 
-// WaitGatewayAnnouncements joins outgoing announcements after RPC producers
-// have stopped. Each call has its own bounded detached context.
-func (s *Server) WaitGatewayAnnouncements() { s.gatewayAnnouncements.Wait() }
+// WaitGatewayAnnouncements closes migration/Release admission and joins their
+// parents and retained adopters before joining the announcements they launch.
+// Recovery producers and children must already be joined by the caller. Keep
+// DB, libvirt and peer dependencies open throughout; a bounded transport stop
+// or canceled request does not establish any of these terminals. This is a
+// shutdown drain, not a reusable announcement flush while serving migrations.
+func (s *Server) WaitGatewayAnnouncements() {
+	s.StopMigrationAdmission()
+	s.migrationProducers.wg.Wait()
+	s.gatewayAnnouncements.Wait()
+}
 func (s *Server) startGatewayAnnouncement(ctx context.Context, target *corrosion.HostRecord, vm string) {
 	s.gatewayAnnouncements.Add(1)
 	go func() { defer s.gatewayAnnouncements.Done(); s.announceOnTarget(ctx, target, vm) }()
+}
+
+// startLocalGatewayAnnouncement owns the target's detached announcement after
+// Release resumes its guest. Like the peer announcement, it can outlive the
+// caller, and its DB reads must finish before dependency cleanup.
+func (s *Server) startLocalGatewayAnnouncement(ctx context.Context, vm string) {
+	s.gatewayAnnouncements.Add(1)
+	go func() {
+		defer s.gatewayAnnouncements.Done()
+		s.announceGatewaysOf(context.WithoutCancel(ctx), vm)
+	}()
 }

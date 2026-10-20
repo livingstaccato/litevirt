@@ -71,3 +71,52 @@ func TestFirewallLogging_Wiring(t *testing.T) {
 	}
 	refused.Stop(context.Background())
 }
+
+// Codex cand36 review I1: a listener that held the group, had its lines
+// applied, and then lost the group has its loss-triggered passes scheduled on
+// the run context. When SIGTERM cancels that context before they apply, the
+// lines stay; Stop, with a fresh context, must still run its removal pass,
+// because the lines may be in the kernel whatever the bind says now. A host
+// that never held the group keeps no pass at stop (control).
+//
+// Mutation: Stop runs its pass only while the gate is bound — no pass: red.
+func TestFirewallLogging_StopAfterALostBindStillRemovesTheLines(t *testing.T) {
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	var mu sync.Mutex
+	var fresh, cancelled int
+	f := newFirewallLogging(runCtx, 27, nil, func(ctx context.Context) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if ctx.Err() != nil {
+			cancelled++ // the loader fails on a cancelled context: nothing is removed
+			return ctx.Err()
+		}
+		fresh++
+		return nil
+	}, func(error) {})
+	f.followUp = time.Hour // only the immediate loss pass, on the run context
+	f.OnBind(nil)
+	if ok, _ := f.Logging(); !ok { // a loader is told logging is on: the lines are applied
+		t.Fatal("bound, but logging unavailable")
+	}
+	cancelRun()                           // SIGTERM, before the loss pass runs
+	f.OnBind(errors.New("socket closed")) // the listener loses the group
+	time.Sleep(50 * time.Millisecond)     // the loss pass runs on the cancelled context
+	mu.Lock()
+	before := fresh
+	mu.Unlock()
+	f.Stop(context.Background())
+	mu.Lock()
+	defer mu.Unlock()
+	if fresh != before+1 {
+		t.Errorf("Stop after a lost bind ran %d removal pass(es) on a live context, want 1", fresh-before)
+	}
+
+	never := newFirewallLogging(context.Background(), 27, nil,
+		func(context.Context) error {
+			t.Error("a pass at stop for a host that never held the group")
+			return nil
+		}, func(error) {})
+	never.OnBind(errors.New("operation not permitted"))
+	never.Stop(context.Background())
+}

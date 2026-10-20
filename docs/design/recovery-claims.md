@@ -681,7 +681,12 @@ config changes. A voter that lost its state costs availability, never safety.
   2. If the host is a member of the adopted voter config, it removes it first
      through the `voter rm` claim, with seal and transfer (§4.3, §4.4). If no
      majority of the current generation is reachable, it stops and names
-     `lv cluster voter force-reconfigure` (§4.6).
+     `lv cluster voter force-reconfigure` (§4.6). Before it removes the vote,
+     it asks every check of step 3: it checks that this machine can revoke the
+     certificate, and it asks the daemon's removal refusals. The voter majority
+     in those checks is counted without the host. A refusal there leaves the
+     voter set unchanged. A refusal that comes only after the vote is gone
+     says so, and names `lv host rm --dead <host>`, which finishes the removal.
   3. It removes the host as `lv host rm` does, including the CRL publication
      that command already performs. Workloads still recorded on the host do not
      need `--force`: they are the stranded ones, and their rows stay in place

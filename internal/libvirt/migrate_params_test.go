@@ -29,7 +29,7 @@ func stringParam(params []golibvirt.TypedParam, field string) (string, int) {
 // Mutation: delete the `flags |= golibvirt.MigrateTLS` line, or the
 // tls.destination parameter, in migrationFlagsAndParams — red.
 func TestMigrationFlagsAndParams_StorageWithTLS(t *testing.T) {
-	flags, params := migrationFlagsAndParams(MigrateParams{
+	flags, params, _ := migrationFlagsAndParams(MigrateParams{
 		Live:           true,
 		WithStorage:    true,
 		TargetAddress:  "10.0.0.2",
@@ -59,7 +59,7 @@ func TestMigrationFlagsAndParams_StorageWithTLS(t *testing.T) {
 //
 // Mutation: set MigrateTLS unconditionally for storage migrations — red.
 func TestMigrationFlagsAndParams_StoragePlaintextWhenTLSNotRequested(t *testing.T) {
-	flags, params := migrationFlagsAndParams(MigrateParams{
+	flags, params, _ := migrationFlagsAndParams(MigrateParams{
 		Live:           true,
 		WithStorage:    true,
 		TargetAddress:  "10.0.0.2",
@@ -83,7 +83,7 @@ func TestMigrationFlagsAndParams_StoragePlaintextWhenTLSNotRequested(t *testing.
 // A memory-only migration is tunnelled through libvirt's own TLS connection;
 // it carries neither the QEMU TLS flag nor a direct migrate_uri.
 func TestMigrationFlagsAndParams_MemoryOnlyIsTunnelled(t *testing.T) {
-	flags, params := migrationFlagsAndParams(MigrateParams{
+	flags, params, _ := migrationFlagsAndParams(MigrateParams{
 		Live: true, TargetAddress: "10.0.0.2", TLS: true, TLSDestination: "10.0.0.2",
 	})
 	if flags&golibvirt.MigrateTunnelled == 0 {
@@ -108,7 +108,7 @@ func TestMigrationFlagsAndParams_MemoryOnlyIsTunnelled(t *testing.T) {
 // Mutation: drop `p.Direct` from the tunnelled branch, or drop the
 // tls.destination parameter, in migrationFlagsAndParams — red.
 func TestMigrationFlagsAndParams_DirectMemoryOnlyOverMigrationNetwork(t *testing.T) {
-	flags, params := migrationFlagsAndParams(MigrateParams{
+	flags, params, _ := migrationFlagsAndParams(MigrateParams{
 		Live: true, Direct: true, TargetAddress: "10.9.0.2", TLS: true, TLSDestination: "192.168.1.2",
 	})
 	if flags&golibvirt.MigrateTunnelled != 0 {
@@ -131,7 +131,7 @@ func TestMigrationFlagsAndParams_DirectMemoryOnlyOverMigrationNetwork(t *testing
 // Direct without TLS is not a mode: the caller falls back to the tunnel rather
 // than send memory in the clear, and the builder holds that line too.
 func TestMigrationFlagsAndParams_DirectWithoutTLSStaysTunnelled(t *testing.T) {
-	flags, params := migrationFlagsAndParams(MigrateParams{Live: true, Direct: true, TargetAddress: "10.9.0.2"})
+	flags, params, _ := migrationFlagsAndParams(MigrateParams{Live: true, Direct: true, TargetAddress: "10.9.0.2"})
 	if flags&golibvirt.MigrateTunnelled == 0 {
 		t.Fatalf("flags = %#x; a direct migration without TLS must stay tunnelled", uint64(flags))
 	}

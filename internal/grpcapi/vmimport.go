@@ -113,6 +113,11 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return status.Errorf(codes.AlreadyExists,
 			"VM %q already exists (on host %s) — choose a different --name or remove it first", name, existing.HostName)
 	}
+	// The import defines a domain and NVRAM of this name, undefining a
+	// leftover one: not one a live firmware move's record names (spec §6.9).
+	if err := s.firmwareMoveNameRefusal("import", name); err != nil {
+		return err
+	}
 	// ── Stage the source into a temp import dir (always cleaned up) ──
 	if err := os.MkdirAll(filepath.Join(s.dataDir, "imports"), 0o755); err != nil {
 		return status.Errorf(codes.Internal, "prepare import dir: %v", err)
@@ -441,10 +446,11 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		}
 		_ = s.virt.UndefineDomain(name, false)
 	}
+	s.forgetMoveRecords(ctx, name) // a new domain takes the name
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		cleanupDisks()
 		if fwImport {
-			lv.WipeFirmwareState(s.dataDir, name, spec.Uuid)
+			s.fw().WipeFirmwareState(name, spec.Uuid)
 		}
 		return status.Errorf(codes.Internal, "define domain: %v", err)
 	}
@@ -462,7 +468,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	unwindImport := func() {
 		_ = s.virt.UndefineDomain(name, false)
 		if fwImport {
-			lv.WipeFirmwareState(s.dataDir, name, spec.Uuid)
+			s.fw().WipeFirmwareState(name, spec.Uuid)
 		}
 		cleanupDisks()
 	}
@@ -503,7 +509,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	if err := importQuotaLease.allowCommit(ctx); err != nil {
 		_ = s.virt.UndefineDomain(name, false)
 		if fwImport {
-			lv.WipeFirmwareState(s.dataDir, name, spec.Uuid)
+			s.fw().WipeFirmwareState(name, spec.Uuid)
 		}
 		cleanupDisks()
 		return err
@@ -533,7 +539,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		}, ifaceRecords, diskRecords, nicRecords, pciIntents, false); err != nil {
 		_ = s.virt.UndefineDomain(name, false)
 		if fwImport {
-			lv.WipeFirmwareState(s.dataDir, name, spec.Uuid)
+			s.fw().WipeFirmwareState(name, spec.Uuid)
 		}
 		cleanupDisks()
 		return status.Errorf(codes.Internal, "record imported VM: %v", err)
@@ -552,7 +558,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			}
 			_ = s.virt.UndefineDomain(name, false)
 			if fwImport {
-				lv.WipeFirmwareState(s.dataDir, name, spec.Uuid)
+				s.fw().WipeFirmwareState(name, spec.Uuid)
 			}
 			cleanupDisks()
 			return status.Errorf(codes.Internal, "imported but failed to start: %v", err)

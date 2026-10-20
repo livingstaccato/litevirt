@@ -1,6 +1,7 @@
 package firewall
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -81,5 +82,53 @@ func TestLogStore_SequenceSurvivesARestart(t *testing.T) {
 	s3.Add(testRecord(0))
 	if got := s3.List(LogFilter{AfterSeq: cursor}); len(got) != 1 {
 		t.Errorf("a cursor ahead of the store's newest = %d records, want the store read from its start", len(got))
+	}
+}
+
+// Codex cand36 review I3: lowering firewall.log_retain_mib to 0 (memory
+// only) on a host whose directory already holds log files must not exempt
+// them from both bounds: the zero cap keeps no file of ours, so they go at
+// open. A file the store does not own is left alone, and new records make no
+// file.
+//
+// Mutation: drop disk ownership before removing the owned files — they stay:
+// red.
+func TestLogStore_ZeroCapRemovesTheOwnedFilesAtOpen(t *testing.T) {
+	dir := t.TempDir()
+	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	s, err := OpenLogStore(LogStoreOptions{Dir: dir, MaxRate: 1000, RetainBytes: 1 << 20, RetainAge: 24 * time.Hour, Now: clk.now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		s.Add(testRecord(i))
+	}
+	s.Close()
+	owned, _ := filepath.Glob(filepath.Join(dir, logFilePrefix+"*"+logFileSuffix))
+	if len(owned) == 0 {
+		t.Fatal("the disk-backed store wrote no file")
+	}
+	foreign := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(foreign, []byte("not ours"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	clk.t = clk.t.Add(time.Hour)
+	z, err := OpenLogStore(LogStoreOptions{Dir: dir, MaxRate: 1000, RetainBytes: 0, RetainAge: 24 * time.Hour, Now: clk.now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer z.Close()
+	if left, _ := filepath.Glob(filepath.Join(dir, logFilePrefix+"*"+logFileSuffix)); len(left) != 0 {
+		t.Errorf("with a zero cap, %d log file(s) remain on disk: %v", len(left), left)
+	}
+	if _, err := os.Stat(foreign); err != nil {
+		t.Errorf("a file the store does not own was touched: %v", err)
+	}
+	z.Add(testRecord(99))
+	clk.t = clk.t.Add(48 * time.Hour)
+	z.Prune()
+	if left, _ := filepath.Glob(filepath.Join(dir, logFilePrefix+"*"+logFileSuffix)); len(left) != 0 {
+		t.Errorf("a memory-only store wrote a file: %v", left)
 	}
 }

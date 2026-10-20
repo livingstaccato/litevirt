@@ -82,7 +82,8 @@ func mtuCluster(t *testing.T, srcMTU, dstMTU int) (*Cluster, *Node, *Node, func(
 			return err
 		}
 		dst.Virt.SetState(name, libvirtfake.StateRunning)
-		return src.Virt.UndefineDomain(name, false)
+		src.Virt.VanishDomain(name)
+		return nil
 	}
 	return c, src, dst, refresh
 }

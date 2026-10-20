@@ -1063,3 +1063,53 @@ func TestDiskSourceByTarget(t *testing.T) {
 		t.Fatal("unparseable document reported as found")
 	}
 }
+
+// TestGenerateDomainXML_TPMPersistentStateYesNoSource (T-2) pins the vTPM
+// backend a firmware VM renders: persistent_state='yes' and no <source>.
+// Live firmware migration rests on both. Without persistent_state, libvirt
+// deletes the swtpm tree when the domain goes away; with a <source>, the state
+// would leave libvirt's own UUID-keyed root that the firmware store reads.
+func TestGenerateDomainXML_TPMPersistentStateYesNoSource(t *testing.T) {
+	fp := FirmwarePaths{
+		Code: "/usr/share/OVMF/OVMF_CODE_4M.fd", Vars: "/usr/share/OVMF/OVMF_VARS_4M.fd",
+		SecbootCode: "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd", MsVars: "/usr/share/OVMF/OVMF_VARS_4M.ms.fd",
+	}
+	for _, sb := range []bool{true, false} {
+		cfg := VMConfig{
+			Name: "fw-vm", UUID: "5113ced7-9006-4086-b7dd-9d1840181e03",
+			CPU: 2, MemoryMiB: 2048, Machine: "q35", Firmware: "uefi",
+		}
+		fp.ApplyTo(&cfg, "/var/lib/litevirt", cfg.Name, sb, true)
+		out, err := GenerateDomainXML(cfg)
+		if err != nil {
+			t.Fatalf("secureBoot=%v: GenerateDomainXML: %v", sb, err)
+		}
+		var dom struct {
+			TPM []struct {
+				Backend []struct {
+					Type            string `xml:"type,attr"`
+					PersistentState string `xml:"persistent_state,attr"`
+					Source          []struct {
+						Path string `xml:"path,attr"`
+					} `xml:"source"`
+				} `xml:"backend"`
+			} `xml:"devices>tpm"`
+		}
+		if err := xml.Unmarshal([]byte(out), &dom); err != nil {
+			t.Fatalf("secureBoot=%v: unmarshal: %v", sb, err)
+		}
+		if len(dom.TPM) != 1 || len(dom.TPM[0].Backend) != 1 {
+			t.Fatalf("secureBoot=%v: want exactly one TPM with one backend:\n%s", sb, out)
+		}
+		be := dom.TPM[0].Backend[0]
+		if be.Type != "emulator" {
+			t.Errorf("secureBoot=%v: backend type = %q, want emulator", sb, be.Type)
+		}
+		if be.PersistentState != "yes" {
+			t.Errorf("secureBoot=%v: persistent_state = %q, want yes", sb, be.PersistentState)
+		}
+		if len(be.Source) != 0 {
+			t.Errorf("secureBoot=%v: backend has a <source> (%q); the state must stay at libvirt's UUID-keyed default", sb, be.Source[0].Path)
+		}
+	}
+}

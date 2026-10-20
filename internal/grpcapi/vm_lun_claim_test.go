@@ -190,7 +190,10 @@ func TestCreateVM_ISCSI_ADeletedVMsLUNIsFree(t *testing.T) {
 	if err := corrosion.DeleteVM(ctx, s.db, "a"); err != nil {
 		t.Fatalf("DeleteVM: %v", err)
 	}
-	_ = s.virt.UndefineDomain("a", false) // a delete removes its domain too
+	// A delete removes its domain too: a destroy, then the undefine (an
+	// undefine alone leaves a running domain transient, as libvirt does).
+	_ = s.virt.DestroyDomain("a")
+	_ = s.virt.UndefineDomain("a", false)
 	if _, err := s.CreateVM(ctx, lunVM("b", "lun0")); err != nil {
 		t.Fatalf("a VM on a deleted VM's LUN: %v", err)
 	}

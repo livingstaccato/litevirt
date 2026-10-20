@@ -64,7 +64,25 @@ type LogRecord struct {
 	Dport    uint16    `json:"dport,omitempty"`  // destination port
 	Length   uint32    `json:"len,omitempty"`    // packet length
 	TCPFlags string    `json:"tcp_flags,omitempty"`
+	// TimeSource says what Time is: LogTimePacket or LogTimeReceived. A
+	// record written before it existed has none.
+	TimeSource string `json:"time_source,omitempty"`
 }
+
+// LogRecord.TimeSource values.
+const (
+	// LogTimePacket is the kernel's timestamp of the packet (NFULA_TIMESTAMP).
+	LogTimePacket = "packet"
+	// LogTimeReceived is the time the store received the record: the kernel
+	// gave no timestamp (a packet the host sends) or an implausible one.
+	LogTimeReceived = "received"
+)
+
+// logTimeSkew is how far a packet timestamp may be from the time the store
+// receives its record before the store uses the receive time instead. The
+// kernel sends a record within logFlushTimeout; a timestamp on another clock
+// (a monotonic one counts from boot) is decades out.
+const logTimeSkew = time.Minute
 
 // LogStoreOptions configures a LogStore.
 type LogStoreOptions struct {
@@ -141,6 +159,12 @@ func OpenLogStore(opts LogStoreOptions) (*LogStore, error) {
 			}
 		}()
 	}
+	if opts.Dir != "" && opts.RetainBytes <= 0 {
+		// A zero cap keeps no file: the store's own files from an earlier
+		// run go now, or they would outlive both bounds. Nothing else in the
+		// directory is touched, and it is not created.
+		s.removeOwnedFiles()
+	}
 	if opts.Dir == "" || opts.RetainBytes <= 0 {
 		s.opts.Dir = ""
 		return s, nil
@@ -158,6 +182,20 @@ func OpenLogStore(opts LogStoreOptions) (*LogStore, error) {
 	}
 	s.pruneLocked(opts.Now())
 	return s, nil
+}
+
+// removeOwnedFiles removes the store's own log files (fwlog-*.jsonl) from
+// its directory, if it exists.
+func (s *LogStore) removeOwnedFiles() {
+	names, err := s.segments()
+	if err != nil {
+		return // no directory: nothing of ours is there
+	}
+	for _, n := range names {
+		if err := os.Remove(filepath.Join(s.opts.Dir, n)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("firewall log: cannot remove a log file the zero cap no longer allows", "dir", s.opts.Dir, "error", err)
+		}
+	}
 }
 
 // segments lists the directory's log files, oldest first.
@@ -240,7 +278,8 @@ func (s *LogStore) take(now time.Time) bool {
 }
 
 // Add keeps r unless the host-wide rate cap is spent, stamping its sequence
-// (and its time, when zero). It reports whether r was kept.
+// (and the time it receives r, when r's time is zero or more than
+// logTimeSkew from it). It reports whether r was kept.
 func (s *LogStore) Add(r LogRecord) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -251,8 +290,8 @@ func (s *LogStore) Add(r LogRecord) bool {
 	}
 	s.seq++
 	r.Seq = s.seq
-	if r.Time.IsZero() {
-		r.Time = now
+	if r.Time.IsZero() || r.Time.Before(now.Add(-logTimeSkew)) || r.Time.After(now.Add(logTimeSkew)) {
+		r.Time, r.TimeSource = now, LogTimeReceived
 	}
 	s.push(r)
 	s.count(LogOutcomeKept, 1)

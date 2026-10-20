@@ -64,7 +64,7 @@ func TestCreateVM_DefineFailureKeepsVarsItDidNotMake(t *testing.T) {
 	if _, err := s.CreateVM(adminCtx(), req); err == nil || !strings.Contains(err.Error(), "define domain") {
 		t.Fatalf("CreateVM = %v; want the define failure", err)
 	}
-	if !lv.HasNvram(s.dataDir, "win") {
+	if !s.fw().HasNvram("win") {
 		t.Error("a failed define removed UEFI vars it did not make")
 	}
 }

@@ -94,23 +94,59 @@ func deployResult(ctx context.Context, client pb.LiteVirtClient, yaml string) ([
 // restartNode stands in for a daemon restart on n: its gRPC server stops —
 // every RPC it was serving is cancelled, as a process exit cancels them — and
 // a new server comes up on the same port, over the same state database and
-// data directory. Nothing held only in the old server's memory survives.
+// data directory. Nothing held only in the old server's memory survives. The
+// new daemon gets a fresh libvirt fake, and its replicator's push loop is
+// started.
 func restartNode(t *testing.T, c *Cluster, n *Node) {
 	t.Helper()
-	if n.replStarted {
-		n.repl.Stop()
-		n.replStarted = false
-	}
-	if n.stopServerLoops != nil {
-		n.stopServerLoops()
-	}
-	n.Stop()
-	n.rebindPort(t)
-	c.buildServer(n)
+	downNode(n)
+	upNode(t, c, n, false)
 	n.repl.SetProofReplicaGate(func(context.Context, string) bool { return true })
 	n.repl.Start(c.ctx)
 	n.replStarted = true
 	wireLUNReleaseGate(t, c, n)
+}
+
+// downNode takes n's daemon down as a process exit does: its replicator's
+// push loop and its server loops stop, and its gRPC server goes away with
+// every RPC it was serving cancelled. n.Virt (libvirt and its guests) is left
+// as it is.
+func downNode(n *Node) {
+	server := n.Server
+	server.StopDeleteVMAdmission()
+	server.StopFirewallTagAdmission()
+	server.StopMigrationAdmission()
+	if n.stopServerLoops != nil {
+		// This callback owns the old server, not a future n.Server. Keep
+		// replication and peer transports available through its child joins.
+		n.stopServerLoops()
+	}
+	server.WaitFirmwareMoveRecovery()
+	server.WaitFirewallTagWork()
+	server.WaitDeleteVMWork()
+	server.WaitGatewayAnnouncements()
+	if n.replStarted {
+		n.repl.Stop()
+		n.replStarted = false
+	}
+	n.Stop()
+	if n.serveDone != nil {
+		<-n.serveDone
+	}
+}
+
+// upNode starts a new daemon for n on its port, over the same state database
+// and data directory (buildServer). keepLibvirt keeps n.Virt, as a restart of
+// the daemon alone does (libvirt and its guests outlive it, KillMode=process);
+// otherwise the new daemon gets a fresh fake. The replicator's push loop is
+// not started: the caller starts it when its scenario runs one.
+func upNode(t *testing.T, c *Cluster, n *Node, keepLibvirt bool) {
+	t.Helper()
+	n.rebindPort(t)
+	if keepLibvirt {
+		n.keepVirt = n.Virt
+	}
+	c.buildServer(n)
 }
 
 // webOn reports whether n's replica has web live on host.

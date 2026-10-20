@@ -32,6 +32,7 @@ import (
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hooks"
@@ -478,6 +479,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				"result", result, "left_held", keepHeld)
 		}
 	}()
+	// The NVRAM is keyed by name: a live firmware move's record of this name
+	// here holds a domain and state the create would replace (spec §6.9).
+	// After the failure log is set up, so the owner logs the refusal too;
+	// nothing is made before it.
+	if err := s.firmwareMoveNameRefusal("create", spec.Name); err != nil {
+		return nil, err
+	}
 	// Stable domain identity (G1): persisted in the spec so libvirt's default
 	// swtpm path (/var/lib/libvirt/swtpm/<uuid>/) is deterministic across the VM's
 	// life — letting vTPM state be located + carried without an explicit <source>.
@@ -1361,7 +1369,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// when none were at that path before (abortDefined). Vars or a
 	// retained-firmware marker a `delete --keep-disks` left under the name are
 	// never its to remove.
-	_, statErr := os.Lstat(lv.NvramPath(s.dataDir, spec.Name))
+	_, statErr := os.Lstat(s.fw().NvramPath(spec.Name))
 	nvramBefore := !errors.Is(statErr, fs.ErrNotExist)
 	if err := s.applyFirmwareConfig(&vmCfg, spec); err != nil {
 		claims.releaseAll(ctx)
@@ -1445,7 +1453,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err := gs.refusal(spec); err != nil {
 		claims.releaseAll(ctx)
 		cleanupDisks()
-		lv.WipeFirmwareStateByUUID(spec.Uuid)
+		s.fw().WipeFirmwareStateByUUID(spec.Uuid)
 		return nil, status.Errorf(codes.Internal, "vm create: %v", err)
 	}
 
@@ -1455,11 +1463,14 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	stubVM := &pb.VM{Name: spec.Name, HostName: s.hostName, State: pb.VMState_VM_STARTING}
 	hooks.Run(ctx, hooks.PreStart, stubVM, spec.Hooks)
 
+	// A new domain takes the name: a volume move recorded of an earlier VM
+	// by that name is not this one's.
+	s.forgetMoveRecords(ctx, spec.Name)
 	// Define and start in libvirt
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		claims.releaseAll(ctx)
 		cleanupDisks()
-		lv.WipeFirmwareStateByUUID(spec.Uuid) // no orphan swtpm (G1); no vars exist before a start
+		s.fw().WipeFirmwareStateByUUID(spec.Uuid) // no orphan swtpm (G1); no vars exist before a start
 		return nil, status.Errorf(codes.Internal, "define domain: %v", err)
 	}
 	s.EnsureSparePCIeRootPorts(ctx, spec.Name)
@@ -1506,7 +1517,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			noteUndo("domain not undone: " + why + "; disks left as they are")
 			claims.releaseAll(ctx)
 			removeSeed()
-			lv.WipeFirmwareStateByUUID(spec.Uuid)
+			s.fw().WipeFirmwareStateByUUID(spec.Uuid)
 			return fmt.Errorf("%w; %s, so the disks at this create's paths were not touched", cause, why)
 		}
 		if !s.virt.DomainExists(spec.Name) {
@@ -1547,8 +1558,17 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		// this create made, and the vars its start made, at the domain's
 		// path and at the name-keyed path a Secure Boot or vTPM domain uses.
 		cleanupDisks()
+		// The name-keyed vars go through the firmware store, which asks the
+		// firmware move guard first, as every write of that state does.
+		nameVars := s.fw().NvramPath(spec.Name)
 		removeVars := func(p string) {
-			if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			var err error
+			if filepath.Clean(p) == filepath.Clean(nameVars) {
+				err = s.fw().RemoveNvram(spec.Name)
+			} else {
+				err = os.Remove(p)
+			}
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
 				noteUndo(fmt.Sprintf("vars %s not removed (%v)", p, err))
 			} else if err == nil {
 				noteUndo("removed vars " + p)
@@ -1558,7 +1578,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			removeVars(domainVars)
 		}
 		if !nvramBefore {
-			removeVars(lv.NvramPath(s.dataDir, spec.Name))
+			removeVars(nameVars)
 		}
 		// Preserving: vars at the domain's path may be ones a
 		// `delete --keep-disks` kept; this create's own went above.
@@ -1572,7 +1592,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			noteUndo("domain undefined, firmware state kept")
 		}
 		claims.releaseAll(ctx)
-		lv.WipeFirmwareStateByUUID(spec.Uuid) // no orphan swtpm (G1)
+		s.fw().WipeFirmwareStateByUUID(spec.Uuid) // no orphan swtpm (G1)
 		return cause
 	}
 
@@ -2164,6 +2184,9 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	if vm.HostName != s.hostName {
 		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
 	}
+	if err := s.firmwareMoveRefusal("start", vm); err != nil {
+		return nil, err
+	}
 	// A point-in-time overlay an earlier copy left holds writes the disk's
 	// file lacks: settle it before anything reads or starts the disk.
 	if err := s.settlePITOverlays(ctx, vm); err != nil {
@@ -2533,8 +2556,20 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	// A seed here whose last rebuild failed (its stale mark) is tried again
 	// before the domain boots on it, on every start path, once nothing above
 	// refuses the start. Never a refusal: a rebuild that fails again leaves
-	// the seed as it is and warns again, and the VM starts on it.
+	// the seed as it is and warns again, and the VM starts on it. A seed the
+	// domain boots from that is missing here is written again first.
+	s.writeMissingSeedForStart(ctx, vm)
 	s.retryStaleSeedForStart(ctx, vm)
+	// A UEFI VM with Secure Boot or a vTPM keeps its vars under
+	// <data_dir>/nvram, which libvirt does not create: a host that never
+	// created such a VM has none when one is first started there after `lv
+	// update --secure-boot` or `--tpm` (lab2-D2-proof A2).
+	if fs := parseFirmwareSpec(vm.Spec); (fs.SecureBoot || fs.Tpm) && fs.hasNvram() && s.dataDir != "" {
+		if err := diskmode.MkdirAll(filepath.Dir(lv.NvramPath(s.dataDir, vm.Name))); err != nil {
+			releasePreflight()
+			return func() {}, status.Errorf(codes.Internal, "start %q: create the NVRAM directory: %v", vm.Name, err)
+		}
+	}
 	return releasePreflight, nil
 }
 
@@ -2551,6 +2586,15 @@ func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb
 // startInFlightError is returned; the caller must hold the VM lock until its
 // settled is closed (heldForStart), not let it go on return.
 func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord, wait time.Duration) (*pb.VM, error) {
+	// A volume move this host left unresolved points the disk row at the file
+	// the persistent config names before anything reads the rows, or refuses
+	// the start (move_unresolved.go).
+	if err := s.resolveUnresolvedMoves(ctx, vm.Name); err != nil {
+		return nil, err
+	}
+	if err := health.NoteStartingHere(ctx, s.db, s.dataDir, vm.Name); err != nil {
+		slog.Warn("recording this host's start of the VM failed", "vm", vm.Name, "error", err)
+	}
 	// A VM with a shared disk whose row names another host (a partial
 	// promotion's, review R4-I2) has its domain redefined from its rows first,
 	// which judges that host again: a disk it withheld is attached once the
@@ -2726,6 +2770,11 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 	}
 	if vm.HostName != s.hostName {
 		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
+	}
+	// A VM a live firmware move's record names is not stopped (spec §6.9);
+	// every other VM stops as before.
+	if err := s.firmwareMoveStopRefusal(vm); err != nil {
+		return nil, err
 	}
 
 	return s.stopVMLocked(ctx, vm, req.Force, req.Timeout)
@@ -2966,6 +3015,9 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 	}
 	if vm.HostName != s.hostName {
 		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
+	}
+	if err := s.firmwareMoveRefusal("restart", vm); err != nil {
+		return nil, err
 	}
 
 	// Split-brain gate (Phase 1): a restart (destroy+start) is a runtime action on a
@@ -3248,6 +3300,7 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		s.clearDeletedFirewallTags(ctx, corrosion.TagMemberVM, "", req.Name, fwID)
 		if dropSchedules {
 			s.deleteVMSchedules(context.WithoutCancel(ctx), req.Name)
+			s.retireVMCheckpoints(context.WithoutCancel(ctx), req.Name)
 		}
 	}
 	if err == nil && len(luns) > 0 && !s.lunPlainDeleteRecordable(ctx) &&
@@ -3302,9 +3355,14 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 // stored file names a member the caller holds no row of, and a tombstone of
 // an older incarnation says nothing of a newer one a peer may hold), and a
 // tombstone of another incarnation or of another stack's VM.
+//
+// A delete (not a peer-search probe) that finds a tombstone of the name,
+// from a caller who may delete that VM, also finishes a forget of its
+// unresolved-move records that an earlier delete did not reach
+// (forgetMovesOfDeletedVM), whatever it answers.
 func (s *Server) deleteOfNoLiveRow(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error) {
 	notFound := status.Errorf(codes.NotFound, "VM %q not found", req.Name)
-	if req.GetExpectedStack() == "" || req.GetExpectedCreatedAt() == "" || deleteLocalOnly(ctx) {
+	if deleteLocalOnly(ctx) {
 		return nil, notFound
 	}
 	rows, err := s.db.Query(ctx,
@@ -3312,6 +3370,12 @@ func (s *Server) deleteOfNoLiveRow(ctx context.Context, req *pb.DeleteVMRequest)
 		        COALESCE(project, '_default') AS project
 		 FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, req.Name)
 	if err != nil || len(rows) == 0 {
+		return nil, notFound
+	}
+	if s.RequirePerm(ctx, vmRBACPathFor(rows[0].String("project"), req.Name), "vm.delete", "operator") == nil {
+		s.forgetMovesOfDeletedVM(ctx, req.Name)
+	}
+	if req.GetExpectedStack() == "" || req.GetExpectedCreatedAt() == "" {
 		return nil, notFound
 	}
 	row := rows[0]
@@ -3455,6 +3519,14 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest, owner *d
 		}
 	}
 
+	// A VM a live firmware move's record names here is not deleted: its
+	// definition and both copies of its firmware state stay until the move
+	// ends (spec §6.9). A peer's probe is refused the same, and passes the
+	// refusal on.
+	if err := s.firmwareMoveRefusal("delete", vm); err != nil {
+		return nil, err
+	}
+
 	// Verify the domain actually exists in libvirt on this host. If the
 	// Corrosion record says this host but the domain isn't here (stale CRDT,
 	// non-deterministic placement, etc.), don't proceed — the soft-delete
@@ -3527,6 +3599,8 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest, owner *d
 					return nil, status.Errorf(codes.Internal,
 						"VM %q: host %s deleted its domain, but its row here was not tombstoned; retry: %v", req.Name, h.Name, terr)
 				}
+				// The peer dropped its own records; this host's go too.
+				s.forgetMoveRecords(ctx, req.Name)
 				return &emptypb.Empty{}, nil
 			}
 			if len(ptrl.Get(deleteProbeRefusedMD)) > 0 || status.Code(peerErr) == codes.FailedPrecondition {
@@ -3659,6 +3733,9 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest, owner *d
 		s.reportDeletedVM(ctx, deleted)
 		s.retireNICGuards(ctx, req.Name)
 		s.clearDeviceLease(req.Name)
+		// The domain is gone everywhere: a volume move it left unresolved
+		// describes nothing.
+		s.forgetMoveRecords(ctx, req.Name)
 		// This path returns without reaching the main cleanup below, so the
 		// marker has to be dropped here too. A ghost row whose domain is already
 		// gone still leaves <dataDir>/vms/<name>/owner_epoch behind, and the next
@@ -3871,11 +3948,11 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest, owner *d
 			Uuid string `json:"uuid"`
 		}
 		_ = json.Unmarshal([]byte(vm.Spec), &sp)
-		lv.WipeFirmwareState(s.dataDir, req.Name, sp.Uuid)
+		s.fw().WipeFirmwareState(req.Name, sp.Uuid)
 	} else if usesFirmwareState(vm.Spec) {
 		// --keep-disks keeps firmware state too; record name→uuid so the retained
 		// (UUID-keyed) swtpm tree is locatable for an explicit restore later (G1).
-		if err := lv.WriteRetainedFirmwareMarker(s.dataDir, req.Name, parseFirmwareSpec(vm.Spec).UUID); err != nil {
+		if err := s.fw().WriteRetainedFirmwareMarker(req.Name, parseFirmwareSpec(vm.Spec).UUID); err != nil {
 			slog.Warn("failed to write retained-firmware marker", "vm", req.Name, "error", err)
 		}
 	}
@@ -4012,6 +4089,10 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest, owner *d
 	// The row as this delete tombstoned it, for a re-create that follows
 	// (vm_recreate_replaces.go).
 	s.reportDeletedVM(ctx, deleted)
+	// The VM is gone: a volume move it left unresolved describes nothing.
+	// Only now: a delete that fails before its tombstone keeps the row, and
+	// with it the record and condition that guard its next start.
+	s.forgetMoveRecords(ctx, req.Name)
 	s.retireNICGuards(ctx, req.Name)
 	s.resyncDHCPHosts()
 
@@ -4839,6 +4920,11 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		return client.RebuildVM(ctx, req)
 	}
 
+	// Required, not only the guard (spec §6.9): rebuild deletes the disks
+	// after an undefine whose refusal it ignores.
+	if err := s.firmwareMoveRefusal("rebuild", vm); err != nil {
+		return nil, err
+	}
 	// The same three barriers DeleteVM carries, for the same reason: this is a
 	// destructive operation and each of these states means something else owns
 	// the VM's disks right now.
@@ -5040,7 +5126,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	s.sweepVMDiskDebris(ctx, req.Name)
 	// Wipe the old firmware state — rebuild recreates with a FRESH identity, so the
 	// old name-keyed NVRAM + old-UUID swtpm tree would otherwise be orphaned (G1).
-	lv.WipeFirmwareState(s.dataDir, req.Name, spec.Uuid)
+	s.fw().WipeFirmwareState(req.Name, spec.Uuid)
 	_ = cloudinit.RemoveSeed(lv.CloudInitISOPath(s.dataDir, req.Name))
 	// The rebuilt VM gets a fresh uuid: the ISO record of the old one goes.
 	s.forgetVMISOIdentity(req.Name, vm.Spec)
@@ -5063,6 +5149,10 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "rebuild: tombstone old records: %v", err)
 	}
+	// The old VM is gone: a volume move it left unresolved describes nothing.
+	// Only now: a rebuild that fails before its tombstone keeps the row, and
+	// with it the record and condition that guard its next start.
+	s.forgetMoveRecords(ctx, req.Name)
 	s.retireNICGuards(ctx, req.Name)
 	if hook := s.recreateTornDown; hook != nil {
 		hook(req.Name)
@@ -5174,6 +5264,21 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 		return out, err
 	}
 
+	// The cutover stops and deletes the replaced VM and renames the
+	// replacement's NVRAM: neither may be in a live firmware move here.
+	if err := s.firmwareMoveRefusal("cutover", nextVM); err != nil {
+		return nil, err
+	}
+	if old, _ := corrosion.GetVM(ctx, s.db, req.VmName); old != nil {
+		if err := s.firmwareMoveRefusal("cutover", old); err != nil {
+			return nil, err
+		}
+	} else if err := s.firmwareMoveNameRefusal("cutover", req.VmName); err != nil {
+		return nil, err
+	}
+	// The refusals above come first: a cutover refused for a firmware move
+	// takes no create flight, so it is refused for the move, never reported
+	// as a create in progress.
 	// The cutover gives the -next VM the name: no create of the name runs on
 	// this host while it does (beginCreate), so none can land in the window
 	// between the original's tombstone and the rename.
@@ -5667,6 +5772,9 @@ func (s *Server) ResizeDisk(ctx context.Context, req *pb.ResizeDiskRequest) (*pb
 		defer conn.Close()
 		return client.ResizeDisk(ctx, req)
 	}
+	if err := s.firmwareMoveRefusal("disk resize", vm); err != nil {
+		return nil, err
+	}
 
 	// Find the disk record.
 	disks, err := corrosion.GetVMDisks(ctx, s.db, req.VmName)
@@ -5876,6 +5984,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			}
 		}
 		return client.UpdateVM(ctx, req)
+	}
+	if err := s.firmwareMoveRefusal("update", vm); err != nil {
+		return nil, err
 	}
 
 	// Deserialize stored spec.
@@ -6867,13 +6978,13 @@ func (s *Server) validateRedefineRequest(ctx context.Context, spec *pb.VMSpec, r
 	// Toggling secure_boot/tpm once firmware state exists can brick an
 	// unsigned guest (SB) or orphan BitLocker (TPM) — refuse without --force.
 	if req.SecureBoot != nil && *req.SecureBoot != spec.SecureBoot {
-		if !req.Force && (lv.HasNvram(s.dataDir, spec.Name) || lv.HasTPMState(spec.Uuid)) {
+		if !req.Force && (s.fw().HasNvram(spec.Name) || s.fw().HasTPMState(spec.Uuid)) {
 			return status.Errorf(codes.FailedPrecondition,
 				"changing secure_boot on %q with existing firmware state may render it unbootable; pass --force to override", req.Name)
 		}
 	}
 	if req.Tpm != nil && *req.Tpm != spec.Tpm {
-		if !req.Force && lv.HasTPMState(spec.Uuid) {
+		if !req.Force && s.fw().HasTPMState(spec.Uuid) {
 			return status.Errorf(codes.FailedPrecondition,
 				"changing tpm on %q with existing TPM state may orphan BitLocker; pass --force to override", req.Name)
 		}

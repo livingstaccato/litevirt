@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -55,8 +56,21 @@ func (r *backupRunner) RunBackup(ctx context.Context, sched corrosion.BackupSche
 	if r.resolveRepoPath(ctx, sched.Repo) == "" {
 		return r.runBackupInner(ctx, sched, runAt)
 	}
+	// A VM in a live firmware move is skipped, with a log line (spec §6.9):
+	// judged here so the skip records no event, and again under the VM lock.
+	if vm, gerr := corrosion.GetVM(ctx, r.server.db, sched.VMName); gerr == nil && vm != nil && vm.HostName == r.server.hostName {
+		if r.server.firmwareMoveSkip("scheduled backup", vm) != nil {
+			return nil
+		}
+	}
 	r.server.recordVMEvent(ctx, sched.VMName, "backup.started", "ok", "scheduled → "+sched.Repo)
 	err := r.runBackupInner(ctx, sched, runAt)
+	if errors.Is(err, errFirmwareMoveSkipped) {
+		// A move began between the check above and the VM lock: the
+		// started event gets its end.
+		r.server.recordVMEvent(ctx, sched.VMName, "backup.skipped", "ok", err.Error())
+		return nil
+	}
 	if err != nil {
 		r.server.recordVMEvent(ctx, sched.VMName, "backup.failed", "error", err.Error())
 	} else {
@@ -84,7 +98,13 @@ func (r *backupRunner) runBackupInner(ctx context.Context, sched corrosion.Backu
 
 	unlock := r.server.lockVM(sched.VMName)
 	defer unlock()
+	if err := r.server.firmwareMoveSkip("scheduled backup", vm); err != nil {
+		return err
+	}
 
+	if err := r.server.resolveUnresolvedMoves(ctx, sched.VMName); err != nil {
+		return err
+	}
 	disk, derr := pickDisk(ctx, r.server.db, sched.VMName, "")
 	if derr != nil {
 		return fmt.Errorf("pick disk: %v", derr)

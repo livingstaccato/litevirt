@@ -42,7 +42,7 @@ func (m *libvirt10) revert(name string) {
 
 func (m *libvirt10) revertLive(name, save string) {
 	m.t.Helper()
-	if err := revertToLiveSnapshot(m, "vm", name, save, nil, nil, StartGuard{}); err != nil {
+	if err := revertToLiveSnapshot(m, "vm", name, save, nil, nil, StartGuard{}, FirmwareMoveGuard{}); err != nil {
 		m.t.Fatalf("revert (memory) %s: %v", name, err)
 	}
 }
@@ -60,7 +60,11 @@ func (m *libvirt10) rm(name string) {
 	before := len(m.touched)
 	m.mu.Unlock()
 	if err := deleteSnapshot(m, "vm", name); err != nil {
-		m.t.Fatalf("delete %s: %v", name, err)
+		var kept *SnapshotFilesKeptError
+		if !errors.As(err, &kept) {
+			m.t.Fatalf("delete %s: %v", name, err)
+		}
+		m.kept = append(m.kept, kept)
 	}
 	m.mu.Lock()
 	touched := append([]string(nil), m.touched[before:]...)
@@ -240,6 +244,9 @@ func TestSnapshotDelete_WithoutRestoreLibvirtMerges(t *testing.T) {
 		m.snapshot("c")
 		m.rm("c")
 	}
+	if len(m.kept) != 0 {
+		t.Fatalf("a merged delete reported kept files: %+v", m.kept)
+	}
 	if got := m.active(); got != root {
 		t.Fatalf("after 20 cycles the domain is on %s, want %s", got, root)
 	}
@@ -268,9 +275,14 @@ func TestSnapshotDelete_ANonCurrentLeafKeepsItsFiles(t *testing.T) {
 	if currentOf(t, m) != "" {
 		t.Fatal("setup: m1 is current")
 	}
+	overlay := m.active()
 	m.rm("m1")
 	if _, err := os.Stat(root); err != nil {
 		t.Fatalf("the VM's root disk %s is gone: %v", root, err)
+	}
+	// The delete says so, naming the overlay a merge would have removed.
+	if len(m.kept) != 1 || len(m.kept[0].Files) != 1 || m.kept[0].Files[0] != overlay || m.kept[0].Snapshot != "m1" {
+		t.Fatalf("kept = %+v, want m1's overlay %s reported", m.kept, overlay)
 	}
 	m.requireWhole(map[byte]bool{markA: true, markB: true})
 }
@@ -390,6 +402,16 @@ func TestSnapshotDelete_RestoreOlderThenDeleteBoth(t *testing.T) {
 			m.revert("m1")
 			m.rm(order[0])
 			m.rm(order[1])
+			// m2's overlay dropped out of the live chain: its delete
+			// keeps it, and says so.
+			if len(m.kept) == 0 {
+				t.Fatal("no delete reported the files it kept")
+			}
+			for _, k := range m.kept {
+				if len(k.Files) == 0 || k.Reason == "" {
+					t.Errorf("a kept report names no file or no reason: %+v", k)
+				}
+			}
 			m.requireWhole(map[byte]bool{markA: true, markB: false})
 		})
 	}
@@ -433,7 +455,7 @@ func TestRevert_ARefusedCurrentIsReported(t *testing.T) {
 		m.write(markA, 1)
 		save := m.memorySnapshot("m1")
 		m.write(markB, 2)
-		check(t, revertToLiveSnapshot(m, "vm", "m1", save, nil, nil, StartGuard{}))
+		check(t, revertToLiveSnapshot(m, "vm", "m1", save, nil, nil, StartGuard{}, FirmwareMoveGuard{}))
 		m.rm("m1")
 		m.requireWhole(map[byte]bool{markA: true, markB: false})
 	})
@@ -972,7 +994,7 @@ func TestRevert_ABadBaseFailsBeforeTeardown(t *testing.T) {
 				before := fileSum(t, ov)
 				var err error
 				if memory {
-					err = revertToLiveSnapshot(m, "vm", "s1", save, nil, nil, StartGuard{})
+					err = revertToLiveSnapshot(m, "vm", "s1", save, nil, nil, StartGuard{}, FirmwareMoveGuard{})
 				} else {
 					err = revertToSnapshot(m, "vm", "s1", nil, StartGuard{})
 				}

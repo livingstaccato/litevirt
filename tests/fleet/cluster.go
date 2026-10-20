@@ -88,9 +88,11 @@ import (
 	"github.com/litevirt/litevirt/internal/apimeta"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fwmig"
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hlc"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/opjournal"
@@ -265,6 +267,7 @@ type Node struct {
 	Net                *NetProvFake      // per-node network provisioner: what this node set up, on which device
 	GRPCSrv            *grpc.Server
 	Listener           net.Listener
+	FW                 *lv.FirmwareStore // this node's isolated firmware state
 	// portHold keeps Port reserved while the node is stopped (port_hold.go).
 	portHold func()
 	heldPort int
@@ -334,10 +337,22 @@ type Node struct {
 	// zero otherwise.
 	GossipPort int
 
-	// stopServerLoops stops the background loops buildServer started for this
-	// node's current server, as a daemon's exit does (see restartNode).
+	// stopServerLoops closes admission and joins the captured server's loops,
+	// recovery children and migration/announcement work before replacement.
+	// Repeated calls join the same terminals (see restartNode).
 	stopServerLoops context.CancelFunc
 	serveDone       chan struct{}
+
+	// keepVirt, when set, is the libvirt fake the next buildServer gives the
+	// node's new server instead of a fresh one, and is then cleared: a daemon
+	// restart, where libvirt and its guests outlive the daemon
+	// (KillMode=process), so the new daemon finds the domains and their states
+	// the old one left.
+	keepVirt *libvirtfake.Fake
+	// serverSetup, when set, runs on every server buildServer makes for this
+	// node, right after it is made and before any of its loops start: the
+	// configuration a scenario's daemon applies at each start.
+	serverSetup func(*grpcapi.Server)
 }
 
 // StreamWatch observes one server-side streaming handler on a node: Started
@@ -594,26 +609,20 @@ func New(t *testing.T, opts Options) *Cluster {
 
 // Stop tears down every daemon in the fleet. Idempotent.
 func (c *Cluster) Stop() {
-	// Stop new public deletes, then join admitted parents and their retained
-	// cleanup children while every peer and replica still serves.
-	for _, n := range c.Nodes {
+	// Close selected admissions on every current server before waiting. Keep
+	// peers and replication available until the admitted work is terminal.
+	servers := make([]*grpcapi.Server, len(c.Nodes))
+	for i, n := range c.Nodes {
+		servers[i] = n.Server
 		n.Server.StopDeleteVMAdmission()
+		n.Server.StopFirewallTagAdmission()
+		n.Server.StopMigrationAdmission()
 	}
-	for _, n := range c.Nodes {
-		n.Server.WaitDeleteVMWork()
+	for _, server := range servers {
+		server.WaitDeleteVMWork()
 	}
 	// Before anything closes: the logged statements are read from each DB.
 	c.checkReplicatedShapes()
-	if c.cancel != nil {
-		c.cancel()
-	}
-	// Push loops first: they write watermarks into the databases closed below.
-	for _, n := range c.Nodes {
-		if n.replStarted {
-			n.repl.Stop()
-			n.replStarted = false
-		}
-	}
 	for _, n := range c.Nodes {
 		n.Server.StopDHCPReservations()
 		if n.stopServerLoops != nil {
@@ -623,6 +632,17 @@ func (c *Cluster) Stop() {
 	// Finish selected admitted handlers and their children while every peer still
 	// serves. A client timeout does not end an admitted handler's ownership.
 	c.waitLBWork()
+	// Per-server cancellation above has joined firmware work while replication
+	// still served it. Now stop the remaining cluster loops and push writers.
+	if c.cancel != nil {
+		c.cancel()
+	}
+	for _, n := range c.Nodes {
+		if n.replStarted {
+			n.repl.Stop()
+			n.replStarted = false
+		}
+	}
 	// All transports/handlers stop before any node's dependent DB or files close.
 	var transports sync.WaitGroup
 	for _, n := range c.Nodes {
@@ -639,8 +659,9 @@ func (c *Cluster) Stop() {
 	}
 	transports.Wait()
 	c.waitLBWork()
-	for _, n := range c.Nodes {
-		n.Server.WaitGatewayAnnouncements()
+	for _, server := range servers {
+		server.WaitFirewallTagWork()
+		server.WaitGatewayAnnouncements()
 	}
 	for _, n := range c.Nodes {
 		if n.selfConn != nil {
@@ -943,7 +964,11 @@ func (c *Cluster) buildServer(n *Node) {
 	// NewServer demands a *libvirt.Client; for the fleet harness we construct
 	// the Server directly and inject an in-process libvirt fake (n.Virt) so
 	// VM-lifecycle RPCs run without a real libvirtd.
-	n.Virt = libvirtfake.New()
+	if n.keepVirt != nil {
+		n.Virt, n.keepVirt = n.keepVirt, nil
+	} else {
+		n.Virt = libvirtfake.New()
+	}
 	n.Server = grpcapi.NewServerForTests(grpcapi.TestServerOpts{
 		HostName: n.Name,
 		DataDir:  dataDir,
@@ -956,11 +981,31 @@ func (c *Cluster) buildServer(n *Node) {
 			}
 		},
 	})
+	if n.serverSetup != nil {
+		n.serverSetup(n.Server)
+	}
 	// A running VM's replica or copy is point-in-time through the external
 	// snapshot layer, as the daemon wires it from its libvirt client
 	// (grpcapi/pit_copy.go). The fleet has no backup sessions.
 	n.Server.SetPeerUnaryInterceptor(c.networkRPCClient())
 	n.Server.SetPointInTimeSnapshotter(n.Virt)
+
+	// Firmware state: the daemon gives its server one store, with NVRAM under
+	// the data dir and swtpm under libvirt's root. Every node here gets a swtpm
+	// root of its own, so a firmware move between two nodes moves the state
+	// between two directories (a shared root would let a move that copied
+	// nothing pass, and one node's wipe delete another's state).
+	n.FW = &lv.FirmwareStore{DataDir: dataDir, SwtpmBase: filepath.Join(c.tmpRoot, n.Name, "swtpm")}
+	// The firmware move guard, over this node's records, on its libvirt and
+	// its store: the daemon's own helper (internal/daemon New).
+	fwmig.Wire(n.Virt, n.FW)
+	n.Server.SetFirmwareStore(n.FW)
+	// The fake's libvirt acts on the same files (probe (g), the live
+	// firmware migrate model).
+	n.Virt.SetFirmwareStore(n.FW)
+	// The live firmware host check stage A and Prepare read, as the daemon
+	// installs it (daemon.go SetLiveFirmwareHost).
+	n.Server.SetLiveFirmwareHost(fleetLiveFirmwareHost{})
 
 	// Domain lifecycle events: the daemon registers this same handler on its
 	// libvirt client (internal/daemon.Run). Wiring it here lets a scenario call
@@ -1031,18 +1076,7 @@ func (c *Cluster) buildServer(n *Node) {
 	// the reason a scenario that both queues work and counts NetBox writes must
 	// not be made to run for minutes.
 	n.netboxMirror = n.Server.StartNetBoxMirror(c.ctx, 0)
-	// The moved-iSCSI-hold resolver, as the daemon runs it. Its interval is
-	// longer than a scenario's steps take; a re-create that returns kicks it
-	// at once, as in production.
-	loops, stop := context.WithCancel(c.ctx)
-	loopDone := make(chan struct{})
-	server := n.Server
-	n.stopServerLoops = func() {
-		stop()
-		server.StopDHCPReservations()
-		<-loopDone
-	}
-	go func() { defer close(loopDone); server.RunLUNHoldResolver(loops, 10*time.Second) }()
+	c.startServerLoops(n)
 
 	// Wire a real Replicator so the server's PushMutations handler + write-notify
 	// path are exercised. By default its background push loop is NOT started, so
@@ -1185,9 +1219,20 @@ func (n *Node) partitionUnaryInterceptor(ctx context.Context, req any, info *grp
 		return nil, status.Errorf(codes.Unavailable, "fleet partition: %s refused by %s", methodName(info.FullMethod), n.Name)
 	}
 	if n.answersUnimplemented(info.FullMethod) {
-		return nil, status.Errorf(codes.Unimplemented, "unknown method %s", methodName(info.FullMethod))
+		return nil, unknownMethod(info.FullMethod)
 	}
 	return handler(ctx, req)
+}
+
+// unknownMethod is what grpc's server answers for a method it does not have
+// (grpc server.go, handleStream): the code and the text an older
+// build gives.
+func unknownMethod(fullMethod string) error {
+	service, method := "", methodName(fullMethod)
+	if i := strings.LastIndex(fullMethod, "/"); i > 0 {
+		service = strings.TrimPrefix(fullMethod[:i], "/")
+	}
+	return status.Errorf(codes.Unimplemented, "unknown method %v for service %v", method, service)
 }
 
 // answersUnimplemented reports whether this node is pretending not to have the
@@ -1212,12 +1257,60 @@ func (n *Node) DoNotImplement(method string) func() {
 	}
 }
 
+// RefuseRPCs makes this node answer each named RPC as a build without it
+// does (DoNotImplement, for several at once): an older peer in a rolling
+// upgrade. Returns a func that serves them again.
+func (n *Node) RefuseRPCs(names ...string) func() {
+	restores := make([]func(), 0, len(names))
+	for _, m := range names {
+		restores = append(restores, n.DoNotImplement(m))
+	}
+	return func() {
+		for _, r := range restores {
+			r()
+		}
+	}
+}
+
+// LandMigrationsOn lands every live migrate n's fake performs on dst, as
+// libvirt would: a FirmwareLive one through the fake's firmware model
+// (libvirtfake.LandFirmwareLive: dst's store gets the permall, the NVRAM on
+// resume, and the source stays defined and shut off), any other one running,
+// or paused when the migrate asks for it. Every fleet node has the same
+// address, so a hook is how a scenario names the target.
+func (n *Node) LandMigrationsOn(dst *Node) {
+	src := n.Virt
+	src.OnMigrateToTarget = func(name, _ string, p lv.MigrateParams) error {
+		if p.FirmwareLive {
+			return dst.Virt.LandFirmwareLive(src, name, p)
+		}
+		x := p.DestXML
+		if x == "" {
+			var err error
+			if x, err = src.DumpXML(name); err != nil {
+				return err
+			}
+		}
+		dst.Virt.LandMigratedState(x, p.Paused)
+		return nil
+	}
+}
+
+// Reconciler is a health reconciler for this node over the node's own data
+// dir and firmware store, as the daemon builds it: a scenario that runs a
+// reconcile pass sees the firmware state the node's server and fake see.
+func (n *Node) Reconciler() *health.Reconciler {
+	r := health.NewReconciler(n.Name, n.FW.DataDir, n.DB, n.Virt)
+	r.SetFirmwareStore(n.FW)
+	return r
+}
+
 func (n *Node) partitionStreamInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 	if n.blocked(info.FullMethod, ss.Context()) {
 		return status.Errorf(codes.Unavailable, "fleet partition: %s refused by %s", methodName(info.FullMethod), n.Name)
 	}
 	if n.answersUnimplemented(info.FullMethod) {
-		return status.Errorf(codes.Unimplemented, "unknown method %s", methodName(info.FullMethod))
+		return unknownMethod(info.FullMethod)
 	}
 	watches := n.takeStreamWatches(methodName(info.FullMethod))
 	for _, w := range watches {
@@ -1575,4 +1668,42 @@ func (n *Node) HoldPolicyKey(t *testing.T, keys ...string) (release func()) {
 	release = func() { n.DB.SetPolicyApplyHoldForTest(nil) }
 	t.Cleanup(release)
 	return release
+}
+
+// startServerLoops is the loop startup shared by buildServer and lifecycle tests.
+func (c *Cluster) startServerLoops(n *Node) {
+	// The moved-iSCSI-hold resolver, as the daemon runs it. Its interval is
+	// longer than a scenario's steps take; a re-create that returns kicks it
+	// at once, as in production.
+	loops, stop := context.WithCancel(c.ctx)
+	server := n.Server
+	var producers sync.WaitGroup
+	// Count all producers before publishing their stop callback. The periodic
+	// recovery producer can still admit a child on its last canceled pass.
+	producers.Add(4)
+	n.stopServerLoops = func() {
+		server.StopDeleteVMAdmission()
+		server.StopFirewallTagAdmission()
+		server.StopMigrationAdmission()
+		stop()
+		server.StopDHCPReservations()
+		producers.Wait()
+		// Pure joins, never another recovery pass. Detached recovery and
+		// admitted migrations can still launch an announcement before exiting.
+		server.WaitFirmwareMoveRecovery()
+		server.WaitFirewallTagWork()
+		server.WaitDeleteVMWork()
+		server.WaitGatewayAnnouncements()
+	}
+	go func() { defer producers.Done(); server.RunLUNHoldResolver(loops, 10*time.Second) }()
+	// The live firmware hold sweep, as the daemon starts it.
+	go func() { defer producers.Done(); server.RunFirmwareHoldSweep(loops) }()
+	// The source cleanup retry and the retained bundle sweep, as the daemon
+	// starts them.
+	go func() { defer producers.Done(); server.RunFirmwareRetainedSweep(loops) }()
+	// Keep the synchronous startup VM-lock barrier and readiness publication.
+	// The fourth producer cannot finish until this initial admission is done.
+	server.RecoverFirmwareMoves(loops)
+	server.MarkStartupWired()
+	go func() { defer producers.Done(); server.RunFirmwareMoveRecovery(loops) }()
 }

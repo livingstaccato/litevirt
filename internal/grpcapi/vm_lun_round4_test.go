@@ -58,6 +58,7 @@ func TestRebuildVM_ISCSI_TheMovedHoldSurvivesARestart(t *testing.T) {
 	if err := corrosion.DeleteVM(ctx, s.db, "a"); err != nil {
 		t.Fatal(err)
 	}
+	_ = s.virt.DestroyDomain("a")
 	_ = s.virt.UndefineDomain("a", false)
 
 	s2 := restartedLUNServer(s)

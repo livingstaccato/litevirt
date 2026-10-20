@@ -51,6 +51,11 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 	if s.virt == nil {
 		return status.Errorf(codes.Internal, "libvirt not connected on host %s", s.hostName)
 	}
+	// Required, not only the guard (spec §6.9): the redefine below defines
+	// after an undefine whose refusal it ignores.
+	if err := s.firmwareMoveRefusal("domain redefine", vm); err != nil {
+		return err
+	}
 
 	// The NIC snapshot and every whole-domain define/rollback below must
 	// agree with one network transition. This path never provisions a network.

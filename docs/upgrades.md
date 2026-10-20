@@ -1513,6 +1513,17 @@ stack's firewall or default-deny, the upgraded hosts keep the default-deny
 the recorded intent asks for and raise the condition. Run it again from an
 upgraded host.
 
+### Firewall rules, ip sets and default policies need sg.write
+
+On this release, `lv firewall cluster-rule add/rm`,
+`lv firewall host-rule add/rm`, `lv firewall ipset add/rm` and
+`lv firewall default-deny`, and the same actions in the web UI, need `sg.write` at `/` (Admin or NetworkAdmin)
+where they needed the operator role. An Operator is refused on an upgraded
+host, with the grant that lets it:
+`lv role grant NetworkAdmin <principal> --path / --propagate`. A host still on
+the previous release checks the operator role only until it is upgraded. A
+cluster with no role bindings is unchanged.
+
 ### A hand-deleted NetBox address is re-created after the roll
 
 A lease names its NetBox address object by id. When that object is deleted in

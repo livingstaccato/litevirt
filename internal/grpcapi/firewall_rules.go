@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -246,10 +247,30 @@ func verdictOf(deny bool) string {
 	return "accept"
 }
 
+// requireFirewallWrite is the authority a write of cluster firewall policy
+// takes: cluster and host rules, ip sets and default policies are global
+// rows every host enforces, so each needs sg.write at the cluster root, as
+// a stack's firewall does (stackFirewallRefusal). Admin and NetworkAdmin
+// hold it; Operator holds sg.read only. With no role bindings the legacy
+// operator role passes. A refusal for a missing grant names the grant.
+func (s *Server) requireFirewallWrite(ctx context.Context, what string) error {
+	err := s.requireSGWrite(ctx)
+	if err == nil || status.Code(err) != codes.PermissionDenied {
+		return err
+	}
+	msg := status.Convert(err).Message()
+	if !strings.Contains(msg, "lacks") {
+		return status.Errorf(codes.PermissionDenied, "%s needs sg.write at the cluster root: %s", what, msg)
+	}
+	return status.Errorf(codes.PermissionDenied,
+		"%s needs sg.write at the cluster root (%s). An administrator can grant it with "+
+			"`lv role grant NetworkAdmin %s --path / --propagate`", what, msg, "user:"+callerPrincipal(ctx))
+}
+
 // ── Cluster-tier rules ──
 
 func (s *Server) CreateClusterFirewallRule(ctx context.Context, req *pb.CreateClusterFirewallRuleRequest) (*pb.FirewallRule, error) {
-	if err := RequireRole(ctx, "operator"); err != nil {
+	if err := s.requireFirewallWrite(ctx, "adding a cluster rule"); err != nil {
 		return nil, err
 	}
 	r := req.GetRule()
@@ -295,7 +316,7 @@ func (s *Server) ListClusterFirewallRules(ctx context.Context, _ *pb.ListCluster
 }
 
 func (s *Server) DeleteClusterFirewallRule(ctx context.Context, req *pb.DeleteClusterFirewallRuleRequest) (*emptypb.Empty, error) {
-	if err := RequireRole(ctx, "operator"); err != nil {
+	if err := s.requireFirewallWrite(ctx, "removing a cluster rule"); err != nil {
 		return nil, err
 	}
 	before := ruleState(corrosion.GetClusterFirewallRule(ctx, s.db, req.Id))
@@ -310,7 +331,7 @@ func (s *Server) DeleteClusterFirewallRule(ctx context.Context, req *pb.DeleteCl
 // ── Host-tier rules ──
 
 func (s *Server) CreateHostFirewallRule(ctx context.Context, req *pb.CreateHostFirewallRuleRequest) (*pb.FirewallRule, error) {
-	if err := RequireRole(ctx, "operator"); err != nil {
+	if err := s.requireFirewallWrite(ctx, "adding a host rule"); err != nil {
 		return nil, err
 	}
 	r := req.GetRule()
@@ -354,7 +375,7 @@ func (s *Server) ListHostFirewallRules(ctx context.Context, req *pb.ListHostFire
 }
 
 func (s *Server) DeleteHostFirewallRule(ctx context.Context, req *pb.DeleteHostFirewallRuleRequest) (*emptypb.Empty, error) {
-	if err := RequireRole(ctx, "operator"); err != nil {
+	if err := s.requireFirewallWrite(ctx, "removing a host rule"); err != nil {
 		return nil, err
 	}
 	before := ruleState(corrosion.GetHostFirewallRule(ctx, s.db, req.Id))
@@ -369,7 +390,7 @@ func (s *Server) DeleteHostFirewallRule(ctx context.Context, req *pb.DeleteHostF
 // ── IP sets ──
 
 func (s *Server) CreateIpSet(ctx context.Context, req *pb.CreateIpSetRequest) (*pb.IpSet, error) {
-	if err := RequireRole(ctx, "operator"); err != nil {
+	if err := s.requireFirewallWrite(ctx, "adding an ip set"); err != nil {
 		return nil, err
 	}
 	if req.Name == "" {
@@ -410,7 +431,7 @@ func (s *Server) ListIpSets(ctx context.Context, _ *pb.ListIpSetsRequest) (*pb.L
 }
 
 func (s *Server) DeleteIpSet(ctx context.Context, req *pb.DeleteIpSetRequest) (*emptypb.Empty, error) {
-	if err := RequireRole(ctx, "operator"); err != nil {
+	if err := s.requireFirewallWrite(ctx, "removing an ip set"); err != nil {
 		return nil, err
 	}
 	before := ipSetState(corrosion.GetIPSet(ctx, s.db, req.Id))
@@ -425,7 +446,7 @@ func (s *Server) DeleteIpSet(ctx context.Context, req *pb.DeleteIpSetRequest) (*
 // ── Default-deny policy ──
 
 func (s *Server) SetFirewallDefault(ctx context.Context, req *pb.SetFirewallDefaultRequest) (*emptypb.Empty, error) {
-	if err := RequireRole(ctx, "operator"); err != nil {
+	if err := s.requireFirewallWrite(ctx, "setting a default policy"); err != nil {
 		return nil, err
 	}
 	scope, err := s.defaultDenyScope(ctx, req.GetScope())

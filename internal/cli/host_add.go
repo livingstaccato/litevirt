@@ -133,7 +133,7 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 		pkiDir: pkiDir, hostName: hostName, hostAddr: hostAddr, peersYAML: peersYAML,
 		enforcement: enforcement, gossipKeyPath: gossipKeyPath, migHolder: migHolder,
 		binPath: binPath, setupScript: setupScript,
-		rerun: fmt.Sprintf("lv host add --name %s %s", hostName, sshTarget),
+		rerun: addRerunCmd(hostName, sshTarget),
 	})
 }
 
@@ -821,6 +821,12 @@ func (e *settleError) Error() string { return e.msg }
 
 func settled(msg string) error { return &settleError{msg} }
 
+// addRerunCmd is `lv host add --name <host> <target>`, each word shell-safe:
+// the command that finishes an add that failed after its admission.
+func addRerunCmd(hostName, target string) string {
+	return fmt.Sprintf("lv host add --name %s %s", shellWord(hostName), shellWord(target))
+}
+
 // settleCmd is the command that undoes the admission of serial for p, and
 // only that admission: the row of p's name if it holds that certificate,
 // otherwise no row (its staged files on the machine and its revocation).
@@ -1391,7 +1397,7 @@ func (d *LocalAddTarget) Shell(kind, cmd string) ([]byte, error) {
 func HostAddOn(ctx context.Context, c pb.LiteVirtClient, t *LocalAddTarget, hostName, hostAddr string) error {
 	return hostAddTo(ctx, c, t, hostAddPlan{
 		pkiDir: PKIDir(), hostName: hostName, hostAddr: hostAddr, peersYAML: "[]",
-		binPath: t.Binary, rerun: "lv host add --name " + hostName + " root@" + hostAddr,
+		binPath: t.Binary, rerun: addRerunCmd(hostName, "root@"+hostAddr),
 	})
 }
 

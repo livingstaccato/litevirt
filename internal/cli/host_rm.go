@@ -853,12 +853,18 @@ func takeSettleClaim(r addRemote, hostName, serial, address string) (string, err
 		return "", err
 	}
 	if now == serial {
+		// Nothing is revoked, so an earlier run's claim keeps nothing out
+		// that should be: it goes with the staged files.
 		if err := removeStagedFiles(r, serial); err != nil {
 			return "", fmt.Errorf("the machine at %s serves certificate %s: a completed add cannot be ruled out, so nothing "+
 				"was revoked; removing its staged files failed too (%v)", address, serial, err)
 		}
+		if err := dropSettleClaim(r, serial, ""); err != nil {
+			return "", fmt.Errorf("the machine at %s serves certificate %s: a completed add cannot be ruled out, so nothing "+
+				"was revoked; its staged files were removed, but removing an earlier run's claim failed (%v)", address, serial, err)
+		}
 		return "", fmt.Errorf("the machine at %s serves certificate %s: a completed add cannot be ruled out, so nothing "+
-			"was revoked. Its staged files were removed; the machine's identity and install record are as they were. "+
+			"was revoked. Its staged files and any claim of an earlier run of this command were removed; the machine's identity and install record are as they were. "+
 			"If its row is still to arrive, run `lv host rm %s` on a host that lists it", address, serial, shellWord(hostName))
 	}
 	b, ok, err := r.ReadFile(addInstalledMarker)

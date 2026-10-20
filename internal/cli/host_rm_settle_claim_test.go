@@ -591,3 +591,41 @@ func TestHostAdd_ARetryUnderASettleClaimIsRefusedBeforeAnything(t *testing.T) {
 	}
 	f.identityUnchanged(t)
 }
+
+// Round-5 review m3: a settle that died after its claim, then an add of the
+// serial completed on the machine (an earlier release's, which does not read
+// the claim). Every rerun refused, as the machine serves the serial, and
+// left the claim for good. It goes with the staged files now: nothing is
+// revoked, and nothing it held off is to be held off.
+//
+// Mutation: leave the claim on that path — it is still there.
+func TestHostRemoveSerial_AClaimGoesWhenTheMachineServesTheSerial(t *testing.T) {
+	m := newSettleMachine(t)
+	if err := claimForSettle(m.f.target, "node-9", m.serial, "10.0.0.9"); err != nil {
+		t.Fatal(err)
+	}
+	staged, _ := filepath.Glob(filepath.Join(m.f.targetPKI, ".host.*.add-"+m.serial+"-*"))
+	for _, p := range staged {
+		if strings.HasSuffix(p, ".before") {
+			continue
+		}
+		n := "host.crt"
+		if strings.Contains(p, ".host.key.") {
+			n = "host.key"
+		}
+		if err := os.WriteFile(filepath.Join(m.f.targetPKI, n), mustRead(t, p), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := &serialRemoveClient{hostRemoveTestClient: &hostRemoveTestClient{}}
+	err := HostRemoveAdmission(context.Background(), c, "node-9", m.serial, "10.0.0.9", false)
+	if err == nil || !strings.Contains(err.Error(), "completed add") {
+		t.Fatalf("removal = %v, want the refusal of a possibly completed add", err)
+	}
+	if serialInCRL(t, m.f.opPKI, m.serial) {
+		t.Error("a served certificate was revoked")
+	}
+	if _, err := os.Stat(m.f.target.Path(settleClaimPath(m.serial))); !os.IsNotExist(err) {
+		t.Errorf("the earlier run's claim is left (stat: %v)", err)
+	}
+}

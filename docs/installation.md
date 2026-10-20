@@ -183,7 +183,8 @@ serial; a daemon from an earlier release cannot, and the command refuses. On
 the machine at `--address`, under its add lock, the serial must have left a
 staged file, record or install record for `<name>`, and no add may hold the
 machine; a machine that serves the serial may be a completed add, so only the
-serial's staged files are removed and nothing is revoked. The command then
+serial's staged files, and the claim of an earlier run of the command, are
+removed and nothing is revoked. The command then
 claims the machine for that serial alone
 (`/etc/litevirt/.lv-add-settle-<serial>`, taken only while the install record
 and the certificate are as it checked), so no add of that admission runs

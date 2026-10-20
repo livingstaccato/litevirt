@@ -484,7 +484,7 @@ now another admission), and --address is required: the daemon runs a
 removal's checks and a pull and confirms no live row holds the serial; the
 machine at --address must hold a trace of it for <host>, no add may hold the
 machine, and a machine serving it may be a completed add (only its staged
-files go, nothing is revoked). Under the machine's add lock it is claimed
+files and an earlier run's claim go, nothing is revoked). Under the machine's add lock it is claimed
 for that serial alone, which keeps that admission's adds out; then the serial
 is revoked, the CRL published, its adds' staged files and records removed,
 and the claim removed. The machine's install record is never written, and

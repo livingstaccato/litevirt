@@ -4,7 +4,9 @@ import (
 	"sync"
 	"weak"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -19,6 +21,11 @@ import (
 //   - dead: the call is refused Unavailable, as a dead host's connection is.
 //
 // Every node is alive unless a scenario fences it.
+//
+// What the node sends back passes the same gate (lifeAnswer): a call it
+// admitted while alive and answers once fenced waits, and once dead its
+// answer, and each message of a stream, is replaced by Unavailable, as a
+// dead process answers nothing.
 
 type lifeState int
 
@@ -124,4 +131,42 @@ func (n *Node) lifeAdmit(caller string) (done func(), err error) {
 		l.inflight--
 		l.mu.Unlock()
 	}, nil
+}
+
+// lifeAnswer passes an answer n is about to send through its gate.
+func (n *Node) lifeAnswer() error {
+	l := n.life()
+	for {
+		l.mu.Lock()
+		st, ch := l.state, l.changed
+		l.mu.Unlock()
+		switch st {
+		case lifeAlive:
+			return nil
+		case lifeDead:
+			return status.Errorf(codes.Unavailable, "fleet: %s's daemon is dead", n.Name)
+		}
+		<-ch
+	}
+}
+
+// lifeStream passes each message, and the headers, a stream handler of n
+// sends through n's gate.
+type lifeStream struct {
+	grpc.ServerStream
+	n *Node
+}
+
+func (s lifeStream) SendMsg(m any) error {
+	if err := s.n.lifeAnswer(); err != nil {
+		return err
+	}
+	return s.ServerStream.SendMsg(m)
+}
+
+func (s lifeStream) SendHeader(md metadata.MD) error {
+	if err := s.n.lifeAnswer(); err != nil {
+		return err
+	}
+	return s.ServerStream.SendHeader(md)
 }

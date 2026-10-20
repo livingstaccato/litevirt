@@ -10,40 +10,60 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 )
 
 // A daemon killed while it talks to libvirtd: its connection goes with the
 // process, and libvirtd hears nothing more from it.
 //
-// SeverDaemon models that for the daemon this Fake serves. Every method a
-// daemon calls (each exported method but the scenario's own readers,
-// severExempt) and every call on a StateReader connection first asks
-// daemon(); while the Fake is severed that ends the calling goroutine where
-// it stands (runtime.Goexit), before libvirt is asked anything, as a killed
-// process makes no further call. Its deferred calls run, as Goexit runs them;
-// whatever they ask of libvirt ends them the same way.
+// The daemon this Fake serves passes a gate on each call: every exported
+// method but those no daemon calls (severExempt), and every call on a
+// StateReader connection, starts with `defer f.daemon()()`. The gate has
+// three states:
 //
-// A scenario severs the Fake only while the daemon is dead (between its kill
-// and its replacement) and calls nothing on it then but the exempt readers;
-// libvirtd itself (the Fake's state) is untouched by the sever.
+//   - alive: the call is admitted and counted until it returns;
+//   - fenced (FenceDaemon): a new call waits at the gate, asking libvirt
+//     nothing and seeing no error, while the calls already admitted run to
+//     their end (DaemonInFlight counts them). A scenario fences every channel
+//     the daemon has before anything of it can react, so the moment of death
+//     comes after all are fenced;
+//   - dead (KillDaemon): each waiting call, and every later one, ends its
+//     goroutine where it stands (runtime.Goexit), as a killed process makes
+//     no further call. Its deferred calls run, as Goexit runs them; whatever
+//     they ask of libvirt ends them the same way.
+//
+// ReviveDaemon opens the gate again, for the daemon that replaces the dead
+// one: only once no goroutine of the dead daemon is left to pass it.
+// libvirtd itself (the Fake's state) is untouched by the gate.
 
-// severState is the Fake's sever: on while severed, and the calls it ended.
-type severState struct {
-	on    atomic.Bool
-	mu    sync.Mutex
-	calls []string
+type gateState int
+
+const (
+	gateAlive gateState = iota
+	gateFenced
+	gateDead
+)
+
+// daemonGate is the Fake's gate for its daemon's calls.
+type daemonGate struct {
+	mu       sync.Mutex
+	state    gateState
+	changed  chan struct{} // closed, and replaced, on each change of state
+	inflight int
+	calls    []string // the calls the dead gate ended
 }
 
 // severExempt are the exported methods no daemon calls: the scenario's
-// readers, and libvirtd's own landing of a migration. The sever does not end
-// them.
+// readers and the gate's own controls, and libvirtd's own landing of a
+// migration. The gate does not stop them.
 var severExempt = map[string]bool{
-	"EventLog":    true,
-	"RawState":    true,
-	"SeverDaemon": true,
-	"Severed":     true,
-	"Fingerprint": true,
+	"EventLog":       true,
+	"RawState":       true,
+	"Fingerprint":    true,
+	"FenceDaemon":    true,
+	"KillDaemon":     true,
+	"ReviveDaemon":   true,
+	"DaemonInFlight": true,
+	"DaemonGate":     true,
 	// A migration landing here is libvirtd's own doing (the source
 	// libvirtd's), not this daemon's call: a source daemon that lives on
 	// lands its migration on a target whose daemon is dead.
@@ -52,43 +72,100 @@ var severExempt = map[string]bool{
 	"LandMigratedState": true,
 }
 
-// SeverDaemon severs the daemon's connection (see above). restore ends the
-// sever and returns the calls it ended, in order, by method name.
-func (f *Fake) SeverDaemon() (restore func() []string) {
-	f.sever.mu.Lock()
-	f.sever.calls = nil
-	f.sever.mu.Unlock()
-	f.sever.on.Store(true)
-	return func() []string {
-		f.sever.on.Store(false)
-		f.sever.mu.Lock()
-		defer f.sever.mu.Unlock()
-		return append([]string(nil), f.sever.calls...)
+func (g *daemonGate) setLocked(st gateState) {
+	g.state = st
+	if g.changed != nil {
+		close(g.changed)
+	}
+	g.changed = make(chan struct{})
+}
+
+// FenceDaemon fences the gate (see above).
+func (f *Fake) FenceDaemon() {
+	f.gate.mu.Lock()
+	defer f.gate.mu.Unlock()
+	f.gate.calls = nil
+	f.gate.setLocked(gateFenced)
+}
+
+// KillDaemon kills the daemon at the gate (see above).
+func (f *Fake) KillDaemon() {
+	f.gate.mu.Lock()
+	defer f.gate.mu.Unlock()
+	f.gate.setLocked(gateDead)
+}
+
+// ReviveDaemon opens the gate for a new daemon and returns the calls the dead
+// gate ended, in order, by method name.
+func (f *Fake) ReviveDaemon() []string {
+	f.gate.mu.Lock()
+	defer f.gate.mu.Unlock()
+	f.gate.setLocked(gateAlive)
+	return append([]string(nil), f.gate.calls...)
+}
+
+// DaemonInFlight is how many of the daemon's calls are admitted and have not
+// returned.
+func (f *Fake) DaemonInFlight() int {
+	f.gate.mu.Lock()
+	defer f.gate.mu.Unlock()
+	return f.gate.inflight
+}
+
+// DaemonGate names the gate's state: "alive", "fenced" or "dead".
+func (f *Fake) DaemonGate() string {
+	f.gate.mu.Lock()
+	defer f.gate.mu.Unlock()
+	return [...]string{"alive", "fenced", "dead"}[f.gate.state]
+}
+
+// daemon is the gate (see above): the caller defers the func it returns.
+func (f *Fake) daemon() (exit func()) {
+	g := &f.gate
+	g.mu.Lock()
+	for {
+		switch g.state {
+		case gateAlive:
+			g.inflight++
+			g.mu.Unlock()
+			return g.exit
+		case gateFenced:
+			if g.changed == nil {
+				g.changed = make(chan struct{})
+			}
+			ch := g.changed
+			g.mu.Unlock()
+			<-ch
+			g.mu.Lock()
+		default:
+			g.calls = append(g.calls, callerName())
+			g.mu.Unlock()
+			runtime.Goexit()
+		}
 	}
 }
 
-// Severed reports whether the daemon's connection is severed.
-func (f *Fake) Severed() bool { return f.sever.on.Load() }
+func (g *daemonGate) exit() {
+	g.mu.Lock()
+	g.inflight--
+	g.mu.Unlock()
+}
 
-// daemon is the first thing every daemon-facing method does: on a severed
-// Fake it ends the calling goroutine.
-func (f *Fake) daemon() {
-	if !f.sever.on.Load() {
-		return
+// callerName is the name of the method that asked the gate.
+func callerName() string {
+	pc, _, _, ok := runtime.Caller(2)
+	if !ok {
+		return "?"
 	}
-	name := "?"
-	if pc, _, _, ok := runtime.Caller(1); ok {
-		if fn := runtime.FuncForPC(pc); fn != nil {
-			name = fn.Name()
-			if i := strings.LastIndex(name, "."); i >= 0 {
-				name = name[i+1:]
-			}
-		}
+	fn := runtime.FuncForPC(pc)
+	if fn == nil {
+		return "?"
 	}
-	f.sever.mu.Lock()
-	f.sever.calls = append(f.sever.calls, name)
-	f.sever.mu.Unlock()
-	runtime.Goexit()
+	name := fn.Name()
+	if i := strings.LastIndex(name, "."); i >= 0 {
+		name = name[i+1:]
+	}
+	return name
 }
 
 // outsideLock runs fn with f.mu released and takes it back however fn ends,
@@ -123,7 +200,7 @@ func (f *Fake) Fingerprint() string {
 }
 
 // fingerprintSkip are the Fake's fields that are not libvirt's state.
-var fingerprintSkip = map[string]bool{"mu": true, "sever": true, "conns": true}
+var fingerprintSkip = map[string]bool{"mu": true, "gate": true, "conns": true}
 
 var lockTypes = map[reflect.Type]bool{
 	reflect.TypeOf(sync.Mutex{}):     true,

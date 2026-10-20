@@ -34,7 +34,7 @@ var TemplateNVRAM = []byte("libvirtfake: OVMF_VARS template\n")
 // SetFirmwareStore gives the fake the host's firmware store: the files its
 // libvirt model reads and writes.
 func (f *Fake) SetFirmwareStore(s *libvirt.FirmwareStore) {
-	f.daemon()
+	defer f.daemon()()
 	f.mu.Lock()
 	f.fwStore = s
 	f.mu.Unlock()
@@ -42,7 +42,7 @@ func (f *Fake) SetFirmwareStore(s *libvirt.FirmwareStore) {
 
 // FirmwareStore is the store SetFirmwareStore gave the fake, or nil.
 func (f *Fake) FirmwareStore() *libvirt.FirmwareStore {
-	f.daemon()
+	defer f.daemon()()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.fwStore
@@ -261,7 +261,7 @@ func (f *Fake) leftStateLocked(name string) {
 // nothing subscribes to libvirt's events or calls it. A scenario wanting
 // the handler's reaction calls FireEvent itself.
 func (f *Fake) ShutOffDomain(name, reason string) {
-	f.daemon()
+	defer f.daemon()()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.domains[name]; !ok {
@@ -307,7 +307,7 @@ func (f *Fake) migratedOutLocked(name string) {
 // as libvirt does, so it is no stand-in for this. OnUndefined is not called:
 // no undefine of this host's libvirt happens.
 func (f *Fake) VanishDomain(name string) {
-	f.daemon()
+	defer f.daemon()()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.domains[name]; !ok {

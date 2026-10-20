@@ -83,6 +83,37 @@ func SetStackFirewallIntent(ctx context.Context, c *Client, st *StackRecord, fir
 	return c.Execute(ctx, clusterPolicyUpsertSQL, stackFirewallKeyPrefix+st.Name, string(v), setBy, c.NowTS())
 }
 
+// stackUpsertSQL is UpsertStack's statement, for a batch.
+const stackUpsertSQL = `INSERT INTO stacks (name, compose_hash, compose_yaml, state, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(name) DO UPDATE SET
+		   compose_hash = excluded.compose_hash,
+		   compose_yaml = excluded.compose_yaml,
+		   state        = excluded.state,
+		   updated_at   = excluded.updated_at,
+		   deleted_at   = NULL`
+
+// UpsertStackWithFirewallIntent writes a stack's record, as UpsertStack
+// does, and the firewall intent of its file in the same replicated write, for
+// a deploy by a caller holding sg.write at the cluster root, the intent
+// first: no replica sees the new record without the intent, so no re-assert
+// there can act on a record the intent no longer asks for. Where cluster_policies may not be
+// written yet, only the record is.
+func UpsertStackWithFirewallIntent(ctx context.Context, c *Client, s StackRecord, firewall, defaultDeny bool, setBy string) error {
+	if !c.MayWriteClusterPolicy() {
+		return UpsertStack(ctx, c, s)
+	}
+	now := c.NowTS()
+	intent, err := stackFirewallIntentStatement(s.Name, StackFirewallIntent{Firewall: firewall, DefaultDeny: defaultDeny}, setBy, now)
+	if err != nil {
+		return err
+	}
+	return c.ExecuteBatch(ctx, []Statement{
+		intent,
+		{SQL: stackUpsertSQL, Params: []interface{}{s.Name, s.ComposeHash, s.ComposeYAML, s.State, nowRFC3339(), now}},
+	})
+}
+
 // GetStackFirewallIntent reads the firewall intent recorded for stack: found
 // is false when there is none. One this build cannot read declares a firewall
 // and asks for the default-deny (fail closed: a deny is never withdrawn, and a

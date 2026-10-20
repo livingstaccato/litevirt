@@ -277,6 +277,10 @@ func TestStackReconciler_TheFirewallIntentOutlivesAStaleFile(t *testing.T) {
 		r.ReconcileOnce(ctx)
 		if ok, ev := open(db, "edge"); !ok || !strings.Contains(ev, "lv compose up") || !strings.Contains(ev, "lv compose down --name edge") {
 			t.Fatalf("a withdrawn default-deny is not reported: open %v, %s", ok, ev)
+		} else if !strings.Contains(ev, "failed after writing its firewall") {
+			// An Admin redeploy that failed after its persist leaves the
+			// same state: nothing replaced the file.
+			t.Errorf("the condition does not name a recorded deploy that failed: %s", ev)
 		}
 		if err := corrosion.UpsertStack(ctx, db, corrosion.StackRecord{Name: "edge", ComposeYAML: "name: edge\nfirewall:\n  default-deny: true\n", State: "active"}); err != nil {
 			t.Fatal(err)

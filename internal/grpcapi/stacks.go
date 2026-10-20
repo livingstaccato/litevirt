@@ -401,21 +401,27 @@ func (s *Server) recordStackDeploy(ctx context.Context, f *compose.File, compose
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stackRecordTimeout)
 	defer cancel()
 	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(composeYAML)))
-	if dbErr := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{
+	rec := corrosion.StackRecord{
 		Name:        f.Name,
 		ComposeHash: hash,
 		ComposeYAML: composeYAML,
 		State:       state,
-	}); dbErr != nil {
-		slog.Warn("upsert stack record failed", "stack", f.Name, "error", dbErr)
 	}
+	// A caller with sg.write records the intent with the record, in one
+	// write (corrosion.UpsertStackWithFirewallIntent). Should that fail, the
+	// record is still written on its own: the intent then stays as it was,
+	// which keeps whatever it asked for.
+	written := false
 	if s.requireSGWrite(ctx) == nil {
-		st, gErr := corrosion.GetStack(ctx, s.db, f.Name)
-		if gErr == nil {
-			gErr = corrosion.SetStackFirewallIntent(ctx, s.db, st, f.DeclaresFirewall(), fileAsksDefaultDeny(f), s.hostName)
+		if dbErr := corrosion.UpsertStackWithFirewallIntent(ctx, s.db, rec, f.DeclaresFirewall(), fileAsksDefaultDeny(f), s.hostName); dbErr != nil {
+			slog.Warn("record the stack and the firewall it declares failed; recording the stack alone", "stack", f.Name, "error", dbErr)
+		} else {
+			written = true
 		}
-		if gErr != nil {
-			slog.Warn("record the firewall the stack declares failed", "stack", f.Name, "error", gErr)
+	}
+	if !written {
+		if dbErr := corrosion.UpsertStack(ctx, s.db, rec); dbErr != nil {
+			slog.Warn("upsert stack record failed", "stack", f.Name, "error", dbErr)
 		}
 	}
 	if fd := f.FirewallDefaults; fd != nil && fd.DefaultDeny {

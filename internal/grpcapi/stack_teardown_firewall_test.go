@@ -530,3 +530,164 @@ func TestDeployStack_AnOperatorFirstDeployOverAStandingIntentIsRefused(t *testin
 		t.Errorf("the Operator's deploy after the Admin's down brought the deny back: %+v", d)
 	}
 }
+
+// A cluster default-deny re-asserted for a stack in the moment its record
+// was newer than the clear of its intent (here: an Admin's first deploy,
+// without a deny, of a name whose intent stood asking for one; a reconciler
+// pass between the record and the intent) is withdrawn once the clear lands
+// and nothing asks for it, and passes to another stack that still asks.
+// One whose intent is no newer than the deny (a replica that has not caught
+// up) keeps it.
+//
+// Mutations: never withdraw a live stack's deny — "nothing asks", red.
+// Withdraw whatever the intent's age — "an intent older than the deny", red.
+// Remove it rather than hand it on — "another stack asks", red.
+func TestReassertStackDefaultDeny_WithdrawsADenyNothingAsksFor(t *testing.T) {
+	ctx := context.Background()
+	// standing leaves name old torn down by a previous release, its intent
+	// asking for the deny, then writes old's first deploy without a deny as
+	// two writes with a re-assert between them, as recordStackDeploy did:
+	// the deny is old's.
+	standing := func(t *testing.T) *Server {
+		s, _, ada := stackFirewallFixture(t)
+		s.db.SetClusterPolicyGate(func() bool { return true })
+		if err := s.DeleteStack(&pb.DeleteStackRequest{Name: "fwonly"}, &mockDeleteStream{ctx: ada}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: "name: old\nfirewall:\n  default-deny: true\n"}, &mockDeployStreamR2{ctx: ada}); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.SetStackState(ctx, s.db, "old", stackStateDeleting); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.DeleteStackFirewall(ctx, s.db, "old", nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.DeleteStackRecord(ctx, s.db, "old"); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{Name: "old", ComposeYAML: "name: old\n", ComposeHash: "h", State: "active"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.ReassertStackDefaultDeny(ctx, s.db, compose.StoredStackWants); err != nil {
+			t.Fatal(err)
+		}
+		if d, _ := corrosion.GetFirewallDefault(ctx, s.db, "cluster"); d == nil || !d.DefaultDeny || d.StackName != "old" {
+			t.Fatalf("setup: the cluster default between the record and the intent = %+v, want old's deny", d)
+		}
+		return s
+	}
+	clear := func(t *testing.T, s *Server) {
+		t.Helper()
+		st, _ := corrosion.GetStack(ctx, s.db, "old")
+		if err := corrosion.SetStackFirewallIntent(ctx, s.db, st, false, false, "h"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	settle := func(t *testing.T, s *Server) *corrosion.FirewallDefault {
+		t.Helper()
+		for i := 0; i < 2; i++ {
+			if err := corrosion.ReassertStackDefaultDeny(ctx, s.db, compose.StoredStackWants); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := corrosion.SweepOrphanStackRows(ctx, s.db, compose.StoredStackWants); err != nil {
+				t.Fatal(err)
+			}
+		}
+		d, _ := corrosion.GetFirewallDefault(ctx, s.db, "cluster")
+		return d
+	}
+	t.Run("nothing asks", func(t *testing.T) {
+		s := standing(t)
+		clear(t, s)
+		if d := settle(t, s); d != nil && d.DefaultDeny {
+			t.Errorf("a deny nothing asks for stays in force, owned by live stack old: %+v", d)
+		}
+	})
+	t.Run("another stack asks", func(t *testing.T) {
+		s := standing(t)
+		if err := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{Name: "edge", ComposeYAML: "name: edge\nfirewall:\n  default-deny: true\n", State: "active"}); err != nil {
+			t.Fatal(err)
+		}
+		clear(t, s)
+		if d := settle(t, s); d == nil || !d.DefaultDeny || d.StackName != "edge" {
+			t.Errorf("the cluster default = %+v, want the deny handed to edge, which asks for it", d)
+		}
+	})
+	t.Run("an intent older than the deny", func(t *testing.T) {
+		s := standing(t)
+		clear(t, s)
+		// The deny is written again after the clear, as by a replica whose
+		// re-assert had not seen it: this replica keeps it until an intent
+		// newer than it says otherwise.
+		if err := corrosion.SetFirewallDefault(ctx, s.db, "cluster", true, "old"); err != nil {
+			t.Fatal(err)
+		}
+		if d := settle(t, s); d == nil || !d.DefaultDeny {
+			t.Errorf("a deny newer than the intent was withdrawn: %+v", d)
+		}
+	})
+}
+
+// An Admin's first deploy records its stack and the firewall intent of its
+// file in one write, the intent first: no pass, here or on a replica, sees
+// the new record with the intent its name had before.
+//
+// Mutation: write the record and then the intent, apart, again — red.
+func TestDeployStack_TheRecordAndTheIntentAreOneWrite(t *testing.T) {
+	ctx := context.Background()
+	s, _, ada := stackFirewallFixture(t)
+	s.db.SetClusterPolicyGate(func() bool { return true })
+	// What the record's insert finds of the intent, as it is written.
+	r6Exec(t, s, `CREATE TABLE seen (value TEXT)`)
+	r6Exec(t, s, `CREATE TRIGGER seen_intent AFTER INSERT ON stacks WHEN NEW.name = 'q'
+		BEGIN INSERT INTO seen SELECT coalesce((SELECT value FROM cluster_policies
+		  WHERE key = 'stack_firewall/q' AND deleted_at IS NULL), 'none'); END`)
+	if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: "name: q\nfirewall:\n  default-deny: true\n"}, &mockDeployStreamR2{ctx: ada}); err != nil {
+		t.Fatal(err)
+	}
+	var seen string
+	if err := s.db.DB().QueryRowContext(ctx, `SELECT value FROM seen`).Scan(&seen); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(seen, `"default_deny":true`) {
+		t.Errorf("the record of q was written before its intent: the intent then was %s", seen)
+	}
+}
+
+// The intent write before the persist's first row change refuses the deploy
+// with nothing changed when it fails: no deny and no group is written.
+//
+// Mutations: run the hook after the rows (M9) — red. Drop the hook's error
+// — red.
+func TestDeployStack_AFailedIntentWriteChangesNothing(t *testing.T) {
+	ctx := context.Background()
+	s, _, ada := stackFirewallFixture(t)
+	s.db.SetClusterPolicyGate(func() bool { return true })
+	if err := s.DeleteStack(&pb.DeleteStackRequest{Name: "fwonly"}, &mockDeleteStream{ctx: ada}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: "name: p\n"}, &mockDeployStreamR2{ctx: ada}); err != nil {
+		t.Fatal(err)
+	}
+	r6Exec(t, s, `CREATE TRIGGER block_intent BEFORE INSERT ON cluster_policies WHEN NEW.key = 'stack_firewall/p' BEGIN SELECT RAISE(ABORT, 'injected'); END`)
+	r6Exec(t, s, `CREATE TRIGGER block_intent2 BEFORE UPDATE ON cluster_policies WHEN NEW.key = 'stack_firewall/p' BEGIN SELECT RAISE(ABORT, 'injected'); END`)
+	add := "name: p\nsecurity-groups:\n  pg:\n    rules:\n      - {direction: ingress, proto: tcp, port: \"80\", action: accept}\nfirewall:\n  default-deny: true\n"
+	if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: add}, &mockDeployStreamR2{ctx: ada}); err == nil {
+		t.Fatal("the deploy succeeded although its intent could not be written")
+	}
+	if d, _ := corrosion.GetFirewallDefault(ctx, s.db, "cluster"); d != nil && d.DefaultDeny {
+		t.Errorf("the refused deploy wrote the deny: %+v", d)
+	}
+	if g, _ := corrosion.ListSecurityGroups(ctx, s.db, "p"); len(g) != 0 {
+		t.Errorf("the refused deploy wrote groups: %+v", g)
+	}
+}
+
+// r6Exec runs q on the test database directly, outside replication.
+func r6Exec(t *testing.T, s *Server, q string) {
+	t.Helper()
+	if _, err := s.db.DB().ExecContext(context.Background(), q); err != nil {
+		t.Fatalf("%s: %v", q, err)
+	}
+}

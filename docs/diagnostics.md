@@ -1975,7 +1975,8 @@ with `sg.write` recorded) in four cases:
 - the stack is live and its file no longer declares the firewall, or the
   default-deny, its last deploy with `sg.write` declared: a deploy that
   recorded no intent replaced it (one without `sg.write`, or one on a host
-  still on the previous release). What the recorded deploy declared still
+  still on the previous release), or that deploy failed after writing its
+  firewall and before recording its file. What the recorded deploy declared still
   stands: the stack still asks for the default-deny, and a deploy without
   `sg.write` is still refused. A stored file this build cannot read keeps the condition open,
   saying whether it still declares that is unknown.

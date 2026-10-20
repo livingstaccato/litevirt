@@ -133,7 +133,8 @@ const tornDownIntentWhy = "the stack was torn down, and the firewall intent its 
 // firewall its last deploy with sg.write declared.
 const withdrawnWhy = "its stored file no longer declares the firewall its last deploy by a caller with sg.write at the " +
 	"cluster root recorded: a later deploy that recorded none replaced it (one without sg.write, or one on a host " +
-	"still on the previous release); what the recorded deploy declared still stands"
+	"still on the previous release), or the deploy that recorded it failed after writing its firewall and before " +
+	"recording its file; what the recorded deploy declared still stands"
 
 // unreadableWhy is the why of a live stack with a firewall intent whose
 // stored file this build cannot read.

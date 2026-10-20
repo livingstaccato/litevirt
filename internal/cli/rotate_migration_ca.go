@@ -52,6 +52,11 @@ func RotateMigrationCA(ctx context.Context, pkiDir string, hosts []MigrationTLSH
 			"Remove and re-add each under another name (`lv host rm`, `lv host add`) first",
 			strings.Join(bad, ", "), rotationFilePrefix, pkiDir)
 	}
+	unlock, err := lockMigrationRotation(pkiDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	prior, err := loadMigrationRotation(pkiDir)
 	if err != nil {
 		return err
@@ -163,6 +168,11 @@ func preflightRotation(ctx context.Context, pkiDir string, hosts []MigrationTLSH
 	}
 	if err != nil {
 		return fmt.Errorf("check hosts before rotating: %w", err)
+	}
+	if extra := unlistedHosts(rows, hosts); len(extra) > 0 {
+		return fmt.Errorf("not starting a migration-CA rotation; nothing was changed: host(s) %s joined the "+
+			"cluster after this run listed its hosts. Run `lv host rotate-migration-ca` again",
+			strings.Join(extra, ", "))
 	}
 	byHost := map[string]*pb.MigrationTLSHostStatus{}
 	for _, row := range rows {
@@ -307,6 +317,9 @@ func gatePhase(ctx context.Context, pkiDir string, r *migrationRotation, hosts [
 	rows, err := status(ctx)
 	if err != nil {
 		return fmt.Errorf("check hosts after phase %s: %w", r.Phase, err)
+	}
+	if extra := unlistedHosts(rows, hosts); len(extra) > 0 {
+		return unlistedHostsError(extra)
 	}
 	byHost := map[string]*pb.MigrationTLSHostStatus{}
 	for _, row := range rows {

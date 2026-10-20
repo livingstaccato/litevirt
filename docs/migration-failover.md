@@ -204,7 +204,10 @@ an overlap rotation, finish that rotation, then immediately run
 `lv host rotate-migration-ca --no-overlap`.
 
 While a rotation is in progress, `lv host add` issues the new node's migration
-credentials from the rotation's new CA, and `lv host install-migration-tls`
+credentials from the rotation's new CA. A run of `lv host rotate-migration-ca`
+that is executing when a host joins stops at its next check, naming the host;
+run it again and it brings that host through the remaining phases. Only one
+run at a time: a second one on the same machine refuses. `lv host install-migration-tls`
 refuses to run at all (reissuing from the old CA would hand out credentials
 the rotation is retiring).
 

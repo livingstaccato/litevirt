@@ -68,6 +68,7 @@ It sits beside `install-migration-tls` and reaches hosts the same way
 |---|---|
 | `migration-ca.crt` / `.key` | the current CA |
 | `migration-ca.next.crt` / `.key` | the new CA; exists only mid-rotation (key 0600) |
+| `migration-rotation.lock` | flock(2)'d by a running rotation; a second run refuses while it is held |
 | `migration-rotation.json` | `phase` (`trust-both`, `reissue`, `drop-old`, `cutover` (`--no-overlap`'s single pass), `done`), `no_overlap`, the new CA's fingerprint, and per host which phases completed or were `skipped`. It remains after a rotation, recording the last one with phase `done`, and is overwritten by the next |
 | `migration-ca.retired-<YYYYMMDD>.crt` | the old CA certificate, kept for audit after a rotation (`-2`, `-3`, … for further rotations the same day; a retired certificate is never overwritten); its key is deleted |
 
@@ -145,7 +146,14 @@ the message names the host and says to re-run.
 
 - **`lv host add` / `lv host init` during a rotation** issue from the new CA and
   push the `ca.crt` the current phase uses (both CAs before phase 3, the new one
-  after), so a host joining mid-rotation is never left on the old CA.
+  after). A run pushes only to the hosts it listed when it started, so the
+  next gate (or the preflight) stops on any host it did not list, `--force`
+  or not; the re-run lists every host afresh and brings the new one through
+  the remaining phases. A host joining mid-rotation is never left on the old
+  CA.
+- **Two runs at once** on the operator machine: each run holds an flock(2) on
+  `migration-rotation.lock` in `pki_dir`, and a second run refuses while it
+  is held.
 - **`lv host install-migration-tls`** refuses while `migration-rotation.json`
   says a rotation is in progress, and names `rotate-migration-ca`.
 

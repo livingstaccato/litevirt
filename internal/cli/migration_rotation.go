@@ -9,7 +9,9 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/secretfile"
 )
 
@@ -17,6 +19,7 @@ import (
 // runs `lv host rotate-migration-ca`, so a re-run continues where it stopped.
 const (
 	rotationFileName = "migration-rotation.json"
+	rotationLockName = "migration-rotation.lock"
 	nextCACertName   = "migration-ca.next.crt"
 	nextCAKeyName    = "migration-ca.next.key"
 	bundleCACertName = "migration-ca.bundle.crt"
@@ -99,4 +102,51 @@ func rotationFileCollisions(hosts []MigrationTLSHost) []string {
 		}
 	}
 	return out
+}
+
+// lockMigrationRotation takes the operator machine's rotation lock, so two
+// runs cannot each mint a next CA. It never waits: a held lock refuses. The
+// lock file stays in place; only the flock(2) on it is released.
+func lockMigrationRotation(pkiDir string) (unlock func(), err error) {
+	path := filepath.Join(pkiDir, rotationLockName)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open the rotation lock %s: %w", path, err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("another `lv host rotate-migration-ca` is running on this machine (it holds %s); "+
+				"nothing was changed. Let it finish, then run this again if it stopped", path)
+		}
+		return nil, fmt.Errorf("lock %s: %w", path, err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		f.Close()
+	}, nil
+}
+
+// unlistedHosts names each status row's host that is not in hosts: one added
+// after the run listed the cluster's hosts, which the run would never push.
+func unlistedHosts(rows []*pb.MigrationTLSHostStatus, hosts []MigrationTLSHost) []string {
+	listed := map[string]bool{}
+	for _, h := range hosts {
+		listed[h.Name()] = true
+	}
+	var out []string
+	for _, r := range rows {
+		if !listed[r.GetHost()] {
+			out = append(out, r.GetHost())
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// unlistedHostsError refuses to go on past hosts the run is not rotating.
+func unlistedHostsError(names []string) error {
+	return fmt.Errorf("host(s) %s joined the cluster after this run listed its hosts, so this run would "+
+		"never bring them to the new CA; it stopped here with its progress saved. Run "+
+		"`lv host rotate-migration-ca` again: it lists every host afresh and continues", strings.Join(names, ", "))
 }

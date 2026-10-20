@@ -11,6 +11,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/apimeta"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 func absentMarked(err error) bool {
@@ -79,6 +80,21 @@ func TestPreflightRemoveHost_AnAbsentAdmissionIsDecidedAfterAPull(t *testing.T) 
 		_, err := s.PreflightRemoveHost(ctx, &pb.RemoveHostRequest{Name: "gone", ExpectedCertSerial: "ab01"})
 		if status.Code(err) != codes.Unavailable || absentMarked(err) {
 			t.Errorf("preflight = %v, want Unavailable", err)
+		}
+	})
+	// Our review m3: a node outside the voter majority refuses, as an
+	// ordinary removal does, and pulls nothing. Mutation: skip
+	// requireVoterMajority — it answers marked absent from its own pull.
+	t.Run("no voter majority refuses", func(t *testing.T) {
+		for _, st := range []health.QuorumState{health.QuorumNo, health.QuorumUnknown} {
+			s := incServer(t, 0)
+			s.SetGate(&quorumGate{full: st, excluding: st})
+			p := &fakePuller{}
+			s.SetAntiEntropy(p)
+			_, err := s.PreflightRemoveHost(ctx, &pb.RemoveHostRequest{Name: "gone", ExpectedCertSerial: "ab01"})
+			if status.Code(err) != codes.Unavailable || absentMarked(err) || p.pulls != 0 {
+				t.Errorf("%v: preflight = %v (pulls %d), want the quorum refusal, unmarked, before a pull", st, err, p.pulls)
+			}
 		}
 	})
 	t.Run("not an admin", func(t *testing.T) {

@@ -1208,14 +1208,14 @@ func UpdateVMStateStrict(ctx context.Context, c *Client, name, state, detail str
 }
 
 // UpdateVMHost moves a VM's host assignment and state after migration.
+// The placement generation advances in the same batch as the host change,
+// as for every writer of host_name (VMPlacementMark).
 func UpdateVMHost(ctx context.Context, c *Client, name, hostName, state string) error {
 	now := c.NowTS()
-	err := c.Execute(ctx, vmHostStateSQL, hostName, state, now, name)
+	stmts := []Statement{{SQL: vmHostStateSQL, Params: []interface{}{hostName, state, now, name}}}
+	stmts = append(stmts, placementGenStmts(ctx, c, name)...)
+	err := c.ExecuteBatch(ctx, stmts)
 	if err == nil {
-		if c.MayWriteClusterPolicy() {
-			n, _ := GetPlacementGen(ctx, c, name)
-			_ = c.Execute(ctx, clusterPolicyUpsertSQL, placementGenKeyPrefix+name, fmt.Sprintf("%d", n+1), "placement", c.NowTS())
-		}
 		SpendDrainOrigin(ctx, c, name)
 	}
 	return err

@@ -714,3 +714,31 @@ func TestHostRemoveSerial_AnEarlierBuildsFreshSettleClaimIsNoAdds(t *testing.T) 
 		t.Errorf("settle under an add's fresh claim = %v, want refused", err)
 	}
 }
+
+// A retry of the admission a settle has claimed the machine for is refused
+// before it stages anything or asks for an admission, naming the settle's
+// command, also on a machine that still serves what its first attempt found
+// (where nothing else refuses it).
+//
+// Mutations: drop the check from refuseUnproven — the retry stages and is
+// admitted again before its claim fails; make it refuse nothing — the
+// refusal names no command.
+func TestHostAdd_ARetryUnderASettleClaimIsRefusedBeforeAnything(t *testing.T) {
+	f := newAddFixture(t)
+	S := strandedAdd(t, f)
+	if err := claimForSettle(f.target, "node-9", S, "10.0.0.9"); err != nil {
+		t.Fatal(err)
+	}
+	admitted, staged := len(f.client.admitted), len(f.staged(t))
+	f.target.Events = nil
+	err := f.add(t)
+	want := "lv host rm node-9 --serial " + S + " --address 10.0.0.9"
+	if err == nil || !strings.Contains(err.Error(), want) || reachedInstall(f.target.Events) {
+		t.Fatalf("the retry = %v, events %v: want refused naming %q", err, f.target.Events, want)
+	}
+	if len(f.client.admitted) != admitted || len(f.staged(t)) != staged {
+		t.Errorf("the refused retry asked for an admission (%d -> %d) or staged files (%d -> %d)",
+			admitted, len(f.client.admitted), staged, len(f.staged(t)))
+	}
+	f.identityUnchanged(t)
+}

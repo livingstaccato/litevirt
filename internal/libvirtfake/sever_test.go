@@ -1,9 +1,13 @@
 package libvirtfake
 
 import (
+	"bytes"
 	"errors"
+	"os"
+	"os/exec"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -317,4 +321,60 @@ func TestDaemonGate_ANestedCallOfAnAdmittedOnePasses(t *testing.T) {
 	f.KillDaemon()
 	<-other
 	f.ReviveDaemon()
+}
+
+// A goroutine ended inside MigrateToTarget's hook runs MigrateToTarget's
+// deferred calls with its MigrateParams unread since the hook was called.
+// While those run, the Go runtime (1.26) scans the frame's parameter through
+// the Goexit's _panic record, whose fp is the parameter's address; what the
+// parameter held must still be allocated then, or the GC marks a freed object
+// and the process dies: "fatal error: found pointer to free object". Each run
+// is a child process: two cycles while the hook holds, then two more while
+// MigrateToTarget's deferred leave waits on the gate.
+//
+// Mutation: without MigrateToTarget's keep-alive of its parameter, the child
+// dies with "found pointer to free object", red.
+const goexitMigrateChild = "LV_LIBVIRTFAKE_GOEXIT_MIGRATE_CHILD"
+
+func TestDaemonGate_AGoexitInTheMigrateHookFreesNothingItsDefersFind(t *testing.T) {
+	if os.Getenv(goexitMigrateChild) == "1" {
+		goexitInTheMigrateHook()
+		return
+	}
+	for i := 0; i < 5; i++ {
+		cmd := exec.Command(os.Args[0], "-test.run=^"+t.Name()+"$", "-test.count=1")
+		cmd.Env = append(os.Environ(), goexitMigrateChild+"=1")
+		out, err := cmd.CombinedOutput()
+		if err != nil || bytes.Contains(out, []byte("fatal error")) {
+			t.Fatalf("run %d: the child died (%v):\n%s", i, err, out)
+		}
+	}
+}
+
+// goexitInTheMigrateHook is the child of the test above.
+func goexitInTheMigrateHook() {
+	f := New()
+	f.SetState("vm1", StateRunning)
+	inGoexit := make(chan struct{})
+	f.OnMigrateToTarget = func(string, string, libvirt.MigrateParams) error {
+		// MigrateToTarget reads its parameter no more: two cycles free what
+		// only the parameter holds, unless it is kept alive.
+		runtime.GC()
+		runtime.GC()
+		// MigrateToTarget's deferred leave waits here, inside the Goexit.
+		f.gate.mu.Lock()
+		close(inGoexit)
+		kill()
+		return errors.New("unreachable")
+	}
+	go func() {
+		// A fresh allocation that only the parameter references.
+		p := libvirt.MigrateParams{Live: true, TargetAddress: strings.Repeat("a", 512)}
+		_ = f.MigrateToTarget("vm1", "qemu+tls://dst/system", p)
+	}()
+	<-inGoexit
+	time.Sleep(100 * time.Millisecond) // the goroutine parks in leave
+	runtime.GC()
+	runtime.GC()
+	f.gate.mu.Unlock()
 }

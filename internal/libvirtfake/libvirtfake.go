@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -2389,6 +2390,12 @@ func (f *Fake) SetBootOrder(domainName, bootOrder string) error {
 // Migration — record and pretend success.
 
 func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) error {
+	// p stays reachable until this frame's last deferred call has run. A
+	// goroutine ended inside the hook (OnMigrateToTarget) runs them with p
+	// unread since the hook was called, and the Go runtime then scans p
+	// through the Goexit's _panic record (its fp is p's address): what p
+	// held must not have been freed by then.
+	defer runtime.KeepAlive(&p)
 	defer f.daemon()()
 	// The flags libvirt.Client would send: what it refuses never reaches
 	// libvirt, a guest it asks libvirt to pause arrives paused (D2-4 m-2),

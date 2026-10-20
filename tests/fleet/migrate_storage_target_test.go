@@ -99,6 +99,7 @@ func writeDisk(t *testing.T, path string, size uint64) []byte {
 // old wording (<path>.superseded-<time>) — red.
 func TestFleet_StorageMigrationRefusesATargetDiskItDidNotCreate(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c.openClusterPolicyGate()
 	defer c.Stop()
 	src, dst := c.Nodes[0], c.Nodes[1]
 
@@ -143,6 +144,7 @@ func TestFleet_StorageMigrationRefusesATargetDiskItDidNotCreate(t *testing.T) {
 // fake libvirt migration succeeds and the test goes red.
 func TestFleet_StorageMigrationStopsWhenTheTargetCannotPrepareDisks(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c.openClusterPolicyGate()
 	defer c.Stop()
 	src, dst := c.Nodes[0], c.Nodes[1]
 
@@ -173,6 +175,7 @@ func TestFleet_StorageMigrationStopsWhenTheTargetCannotPrepareDisks(t *testing.T
 // with a message that names neither size, and the test goes red.
 func TestFleet_StorageMigrationRefusesADiskThatDisagreesWithItsRecord(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c.openClusterPolicyGate()
 	defer c.Stop()
 	src, dst := c.Nodes[0], c.Nodes[1]
 
@@ -208,6 +211,7 @@ func TestFleet_StorageMigrationRefusesADiskThatDisagreesWithItsRecord(t *testing
 // the stub removal altogether — the stub stays and the test goes red.
 func TestFleet_TargetRemovesOnlyStubsItCreatedWhateverTheSourceAsks(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c.openClusterPolicyGate()
 	defer c.Stop()
 	ctx := context.Background()
 	src, dst := c.Nodes[0], c.Nodes[1]

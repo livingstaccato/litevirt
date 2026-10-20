@@ -62,6 +62,7 @@ func runStorageMigration(t *testing.T, c *Cluster, src *Node, target string) err
 // refused by the guard (allow is off) or, if it ran, records tls=false.
 func TestFleet_StorageMigrationIsEncryptedWhenBothHostsHaveMigrationTLS(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c.openClusterPolicyGate()
 	defer c.Stop()
 	src, dst := c.Nodes[0], c.Nodes[1]
 	migrationTLSReady(src, true)
@@ -88,6 +89,7 @@ func TestFleet_StorageMigrationIsEncryptedWhenBothHostsHaveMigrationTLS(t *testi
 // against a target QEMU has no credentials on (here: records a migrate call).
 func TestFleet_StorageMigrationIsRefusedWhenTheTargetHasNoMigrationTLS(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c.openClusterPolicyGate()
 	defer c.Stop()
 	src, dst := c.Nodes[0], c.Nodes[1]
 	migrationTLSReady(src, true)
@@ -115,6 +117,7 @@ func TestFleet_StorageMigrationIsRefusedWhenTheTargetHasNoMigrationTLS(t *testin
 // it runs, unencrypted, as before.
 func TestFleet_StorageMigrationFallsBackToPlaintextOnlyWhenAllowed(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c.openClusterPolicyGate()
 	defer c.Stop()
 	src, dst := c.Nodes[0], c.Nodes[1]
 	migrationTLSReady(src, true)
@@ -145,6 +148,7 @@ func migrationCA(n *Node, fp string) {
 // call is recorded) and goes red.
 func TestFleet_StorageMigrationIsRefusedWhenTheHostsHaveDifferentMigrationCAs(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c.openClusterPolicyGate()
 	defer c.Stop()
 	src, dst := c.Nodes[0], c.Nodes[1]
 	migrationTLSReady(src, true)
@@ -184,6 +188,7 @@ func TestFleet_StorageMigrationRunsWhenTheMigrationCAsMatchOrTheTargetDoesNotSay
 	for _, tc := range []struct{ name, dstCA string }{{"same CA", "aaaa1111"}, {"target does not say", ""}} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := New(t, Options{Nodes: 2, SharedCRDT: true})
+			c.openClusterPolicyGate()
 			defer c.Stop()
 			src, dst := c.Nodes[0], c.Nodes[1]
 			migrationTLSReady(src, true)
@@ -210,6 +215,7 @@ func TestFleet_StorageMigrationRunsWhenTheMigrationCAsMatchOrTheTargetDoesNotSay
 // Mutation: read an unreadable CA as unknown — the copy runs, and goes red.
 func TestFleet_StorageMigrationIsRefusedWhenTheSourceCannotReadItsMigrationCA(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c.openClusterPolicyGate()
 	defer c.Stop()
 	src, dst := c.Nodes[0], c.Nodes[1]
 	migrationTLSReady(src, true)
@@ -257,6 +263,7 @@ func TestFleet_StorageMigrationIsRefusedWhenTheTargetsMigrationCredentialsAreUnu
 // unusable target is refused before the copy (M3).
 func targetUnusableRefused(t *testing.T, allowPlaintext bool) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c.openClusterPolicyGate()
 	defer c.Stop()
 	src, dst := c.Nodes[0], c.Nodes[1]
 	migrationTLSReady(src, true)
@@ -293,6 +300,7 @@ func TestFleet_StorageMigrationIsRefusedWhenTheSourcesMigrationCredentialsAreUnu
 
 func sourceUnusableRefused(t *testing.T, allowPlaintext bool) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c.openClusterPolicyGate()
 	defer c.Stop()
 	src, dst := c.Nodes[0], c.Nodes[1]
 	migrationTLSInvalid(src, "read ca.crt: is a directory")
@@ -322,6 +330,7 @@ func sourceUnusableRefused(t *testing.T, allowPlaintext bool) {
 // error, red.
 func TestFleet_TargetWithUnusableCredentialsRefusesAStorageCopyThatAsksForTLS(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c.openClusterPolicyGate()
 	defer c.Stop()
 	src, dst := c.Nodes[0], c.Nodes[1]
 	migrationTLSInvalid(dst, "ca.crt holds no PEM certificate")

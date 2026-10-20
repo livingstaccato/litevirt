@@ -35,10 +35,14 @@ import (
 // mark changes on every move — live, cold, drain or failover — a move back to
 // an earlier host included (a live move commits without bumping the epoch,
 // and A→B→A would otherwise make the first move's mark current again). The
-// generation is kept only while the cluster-policy gate is open; for the
-// moves this host drives, its entries for the VM also end when it starts
-// sending the VM elsewhere (endMoveRecords), since a host that owns the VM is
-// no move's target. A path that later holds the VM's live disk, or a file at
+// generation is kept only while the cluster-policy gate is open (the
+// failover_scope_v1 latch). With it closed, a failover's reschedule moves a
+// VM back to an earlier owner with no mark changing, so a record cannot be
+// proven to be this move's: none is kept, none is honoured, and every file
+// at a disk path reads as one this host did not create (a copy over it is
+// refused naming it, a cleanup leaves it). A host also ends its entries for a
+// VM when it starts sending the VM elsewhere (endMoveRecords), since a host
+// that owns the VM is no move's target. A path that later holds the VM's live disk, or a file at
 // it after the VM moved away again, must not read as a stub: a copy would
 // replace it (lab2-drain anomaly 6). It also expires after stubLedgerTTL,
 // past which no attempt that made it can still be running or cleaning up (an
@@ -130,10 +134,15 @@ func (s *Server) endMoveRecords(vm string) {
 
 // stubMark is what binds a ledger entry for vm to the move that made it: the
 // VM's placement mark now (corrosion.VMPlacementMark). ok=false when the row
-// cannot be read; then nothing is recorded, and nothing reads as this host's
-// stub (a stub then is a file this host did not create: a retry is refused
-// naming it, a cleanup leaves it).
+// cannot be read, or when the cluster-policy gate is closed and no placement
+// generation is kept, so the mark does not change on every move; then nothing
+// is recorded, and nothing reads as this host's stub (a stub then is a file
+// this host did not create: a retry is refused naming it, a cleanup leaves
+// it).
 func (s *Server) stubMark(ctx context.Context, vm string) (string, bool) {
+	if !s.db.MayWriteClusterPolicy() {
+		return "", false
+	}
 	mark, ok, err := corrosion.VMPlacementMark(ctx, s.db, vm)
 	if err != nil || !ok {
 		return "", false

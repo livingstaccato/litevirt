@@ -53,6 +53,7 @@ const fwtSpecBIOSTPM = `{"name":"fw1","tpm":true,"firmware":"bios","uuid":"` + f
 func newFwtFixture(t *testing.T, spec string) *fwtFixture {
 	t.Helper()
 	s := testServer(t)
+	s.db.SetClusterPolicyGate(func() bool { return true }) // failover_scope_v1 latched: stub records are kept
 	s.hostName = "dst"
 	s.dataDir = t.TempDir()
 	store := &lv.FirmwareStore{DataDir: s.dataDir, SwtpmBase: t.TempDir()}

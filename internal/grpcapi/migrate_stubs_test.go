@@ -20,6 +20,7 @@ func stubTarget(t *testing.T) (*Server, string) {
 	s := testServer(t)
 	s.dataDir = t.TempDir()
 	insertTestVM(t, adminCtx(), s.db, "mig", "src-host", "running")
+	s.db.SetClusterPolicyGate(func() bool { return true }) // failover_scope_v1 latched: stub records are kept
 	insertTestVM(t, adminCtx(), s.db, "other", "src-host", "running")
 	return s, filepath.Join(s.dataDir, "disks")
 }

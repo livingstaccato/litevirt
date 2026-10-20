@@ -4,11 +4,14 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // sourceCtx is an admin call from cluster host cn, as a move's source makes.
@@ -129,5 +132,32 @@ func TestStubMark_ChangesOnEveryMove(t *testing.T) {
 	}
 	if m, _ := s.stubMark(ctx, "mig"); m == m0 {
 		t.Fatalf("mark after a live move out and back = %q, the same as before it", m)
+	}
+}
+
+// While failover_scope_v1 is unlatched no placement generation is kept, so a
+// record cannot be proven to be this move's: none authorizes anything. A
+// retry over the attempt's own stub is refused naming it, and the cleanup
+// leaves it (round-13 coordinator ruling: refused moves, never lost data).
+//
+// Mutation: honour records with the gate closed — the retry reuses the stub
+// and the cleanup removes it, red.
+func TestEnsureDisks_UnlatchedNoRecordAuthorizesAFile(t *testing.T) {
+	s, disks := stubTarget(t)
+	s.db.SetClusterPolicyGate(func() bool { return false })
+	p := filepath.Join(disks, "mig-root.qcow2")
+	req := &pb.EnsureDisksRequest{VmName: "mig", Disks: []*pb.DiskStub{{Path: p, SizeBytes: 1 << 20}}}
+
+	if r, err := s.EnsureDisks(adminCtx(), req); err != nil || len(r.CreatedPaths) != 1 {
+		t.Fatalf("first EnsureDisks = %v, %v; want the stub made", r, err)
+	}
+	if _, err := s.EnsureDisks(adminCtx(), req); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "this migration did not create it") {
+		t.Fatalf("retry EnsureDisks while unlatched = %v, want FailedPrecondition naming the file", err)
+	}
+	if _, err := s.CleanupMigrationArtifacts(adminCtx(), &pb.CleanupMigrationArtifactsRequest{VmName: "mig", DiskPaths: []string{p}}); err != nil {
+		t.Fatalf("CleanupMigrationArtifacts: %v", err)
+	}
+	if _, err := os.Lstat(p); err != nil {
+		t.Fatalf("the cleanup removed %s while no record could be proven (stat: %v)", p, err)
 	}
 }

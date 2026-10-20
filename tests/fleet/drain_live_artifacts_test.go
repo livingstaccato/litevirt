@@ -60,6 +60,7 @@ func newLiveDrainScenario(t *testing.T) *liveDrainScenario {
 	// the ISO, so the stand-in's empty file is all it needs.
 	stageFakeGenisoimage(t)
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c.openClusterPolicyGate()
 	t.Cleanup(c.Stop)
 	sc := &liveDrainScenario{c: c, src: c.Nodes[0], dst: c.Nodes[1], provisioned: map[string]bool{}}
 	for _, n := range c.Nodes {

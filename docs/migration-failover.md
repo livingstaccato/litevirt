@@ -369,7 +369,12 @@ ownership of the VM. If any step before it fails, or the client goes away,
 the VM stays on the source, stopped. The target removes the disk copies and
 the domain that this attempt created there, and nothing else. A file the target
 already has at a disk's path, which this migration did not create, is refused
-rather than overwritten, as for `--with-storage`.
+rather than overwritten, as for `--with-storage`. Until every host runs a release
+that keeps the VM's placement generation (a cluster mid-upgrade), the target
+cannot tell a copy this attempt made from a file an earlier move left there:
+it treats every file at a disk's path as one it did not create, so a failed
+attempt's copies stay on the target and a retry is refused naming each one.
+Move each aside as the refusal says, then migrate again.
 
 A stopped VM is refused when:
 

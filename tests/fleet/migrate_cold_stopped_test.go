@@ -52,6 +52,7 @@ func newColdStoppedScenario(t *testing.T) *coldStoppedScenario {
 func newColdStoppedScenarioWith(t *testing.T, opts Options) *coldStoppedScenario {
 	t.Helper()
 	c := New(t, opts)
+	c.openClusterPolicyGate()
 	t.Cleanup(c.Stop)
 	src, dst := c.Nodes[0], c.Nodes[1]
 	for _, n := range []*Node{src, dst} {

@@ -799,7 +799,7 @@ func (e *PassthroughSnapshotError) Error() string {
 // MemorySnapshotBlockers names each device in domXML that keeps libvirt from
 // saving the domain's state (qemuMigrationSrcIsAllowedHostdev): every
 // <hostdev> but a USB one ("pci <bdf>", or its type), and every
-// <interface type='hostdev'> ("interface hostdev <mac>"). An unparseable
+// <interface type='hostdev'> or 'vdpa' ("interface <type> <mac>"). An unparseable
 // document is an error, never a domain without such devices.
 func MemorySnapshotBlockers(domXML string) ([]string, error) {
 	var d struct {
@@ -838,8 +838,12 @@ func MemorySnapshotBlockers(domXML string) ([]string, error) {
 		}
 	}
 	for _, i := range d.Interfaces {
-		if i.Type == "hostdev" {
-			out = append(out, strings.TrimSpace("interface hostdev "+i.MAC.Address))
+		// hostdev: a VF attached directly; vdpa: "vDPA devices cannot be
+		// migrated". Not caught: a VF from a <forward mode='hostdev'> network
+		// pool, which the live definition shows as type 'network'; litevirt
+		// renders none, so only an imported or adopted domain could have one.
+		if i.Type == "hostdev" || i.Type == "vdpa" {
+			out = append(out, strings.TrimSpace("interface "+i.Type+" "+i.MAC.Address))
 		}
 	}
 	return out, nil

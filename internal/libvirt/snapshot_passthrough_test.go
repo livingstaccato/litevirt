@@ -27,6 +27,8 @@ func TestMemorySnapshotBlockers(t *testing.T) {
 		{"usb", `<hostdev mode='subsystem' type='usb'><source><vendor id='0x1234'/><product id='0x5678'/></source></hostdev>`, nil},
 		{"mdev", `<hostdev mode='subsystem' type='mdev' model='vfio-pci'><source><address uuid='c2177883-f1bb-47f0-914d-32a22e3a8804'/></source></hostdev>`, []string{"mdev"}},
 		{"interface", `<interface type='hostdev' managed='yes'><mac address='52:54:00:6d:90:02'/><source><address type='pci' domain='0x0000' bus='0x03' slot='0x10' function='0x1'/></source></interface>`, []string{"interface hostdev 52:54:00:6d:90:02"}},
+		// libvirt: "vDPA devices cannot be migrated".
+		{"vdpa", `<interface type='vdpa'><mac address='52:54:00:6d:90:04'/><source dev='/dev/vhost-vdpa-0'/></interface>`, []string{"interface vdpa 52:54:00:6d:90:04"}},
 		{"bridge", `<interface type='bridge'><mac address='52:54:00:6d:90:03'/></interface>`, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

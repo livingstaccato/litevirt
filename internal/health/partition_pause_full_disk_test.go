@@ -1,10 +1,13 @@
 package health
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -193,30 +196,100 @@ func TestPartitionPause_ACrashWithAnInMemoryRecordStaysHeld(t *testing.T) {
 	}
 }
 
-// A pause state the new process cannot read is held: a corrupt reserve slot
-// stops every resume, and ReadPauseRecord reports the error the snapshot and
-// NIC-guard paths refuse on.
+// reservePath is the fixture's reserve file.
+func (f *pauseFixture) reservePath() string {
+	return filepath.Join(f.dataDir, partitionPauseDir, pauseReserveFile)
+}
+
+// reserveSlotsOf lists the reserve slots whose bytes hold name's record.
+func (f *pauseFixture) reserveSlotsOf(name string) []int {
+	f.t.Helper()
+	b, err := os.ReadFile(f.reservePath())
+	if err != nil {
+		f.t.Fatalf("read the reserve: %v", err)
+	}
+	var out []int
+	needle := []byte(`"name":"` + name + `"`)
+	for i := 0; i+reserveSlotSize <= len(b); i += reserveSlotSize {
+		if bytes.Contains(b[i:i+reserveSlotSize], needle) {
+			out = append(out, i/reserveSlotSize)
+		}
+	}
+	return out
+}
+
+// tearSlot writes a half-written header and payload over slot i.
+func (f *pauseFixture) tearSlot(i int) {
+	f.t.Helper()
+	fh, err := os.OpenFile(f.reservePath(), os.O_RDWR, 0)
+	if err != nil {
+		f.t.Fatalf("no reserve: %v", err)
+	}
+	defer fh.Close()
+	if _, err := fh.WriteAt([]byte{0x20, 0, 0, 0, 1, 2, 3, 4, '{'}, int64(i)*reserveSlotSize); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// A torn reserve slot is one record's problem, not the host's: live slots
+// are never overwritten in place, so a slot that fails its checksum is a torn
+// first write (its pause never happened) or a torn clear (no longer the
+// record's copy). It is skipped with a warning; the other records read, the
+// snapshot and NIC-guard readers get an answer for every other workload, and
+// the pauser resumes what it holds.
 //
-// Mutation: skip a slot that fails its checksum in loadReserveLocked — the
-// record on disk resumes and this goes red.
-func TestPartitionPause_AnUnreadableReserveHoldsEverything(t *testing.T) {
+// Mutation: fail the whole reserve on a slot that does not check (the
+// behaviour before) — ReadPauseRecord errors and vm-ha stays paused, red.
+func TestPartitionPause_ATornReserveSlotIsSkipped(t *testing.T) {
 	f := newPauseFixture(t)
+	f.tick() // the first pass, with room on the disk, makes the reserve
+	f.p.SetRecordFaultForTests(enospcOn(PauseRecordLayerDisk))
 	f.loseFor(QuorumNo, PartitionPauseAfter+2*time.Second)
 	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
 		t.Fatalf("setup: vm-ha is %s", st)
 	}
-	path := filepath.Join(f.dataDir, partitionPauseDir, pauseReserveFile)
-	fh, err := os.OpenFile(path, os.O_RDWR, 0)
-	if err != nil {
-		t.Fatalf("no reserve was made at the first pass: %v", err)
+	if got := f.reserveSlotsOf("vm-ha"); len(got) != 1 {
+		t.Fatalf("setup: vm-ha's record is in reserve slots %v, want one", got)
 	}
-	if _, err := fh.WriteAt([]byte{0x20, 0, 0, 0, 1, 2, 3, 4, '{'}, 3*reserveSlotSize); err != nil {
+	f.tearSlot(reserveSlots - 1)
+	forgetPauseProcessStateForTests(f.dataDir) // the daemon dies
+	if _, ok, err := ReadPauseRecord(f.dataDir, PauseKindVM, "other"); err != nil || ok {
+		t.Fatalf("ReadPauseRecord(other) = %v, %v; a torn slot of no record must not block every reader", ok, err)
+	}
+	if _, ok, err := ReadPauseRecord(f.dataDir, PauseKindVM, "vm-ha"); err != nil || !ok {
+		t.Fatalf("ReadPauseRecord(vm-ha) = %v, %v beside a torn slot", ok, err)
+	}
+	restarted := f.restartPauser()
+	restarted.SetRecordFaultForTests(enospcOn(PauseRecordLayerDisk)) // still full
+	for i := 0; i <= int(PartitionPauseAfter/time.Second); i++ {
+		restarted.Evaluate(context.Background())
+		f.advance(time.Second)
+	}
+	if st := f.raw("vm-ha"); st != libvirtfake.StateRunning {
+		t.Fatalf("vm-ha is %s after the majority confirmed it, beside a torn slot", st)
+	}
+}
+
+// A reserve that cannot be read at all (here the wrong size) still holds
+// every resume, and ReadPauseRecord reports the error the snapshot and
+// NIC-guard paths refuse on.
+//
+// Mutation: treat an unreadable reserve as empty — vm-ha's record, which is
+// only in the reserve, is lost and the reader check goes red.
+func TestPartitionPause_AnUnreadableReserveHoldsEverything(t *testing.T) {
+	f := newPauseFixture(t)
+	f.tick()
+	f.p.SetRecordFaultForTests(enospcOn(PauseRecordLayerDisk))
+	f.loseFor(QuorumNo, PartitionPauseAfter+2*time.Second)
+	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+		t.Fatalf("setup: vm-ha is %s", st)
+	}
+	if err := os.Truncate(f.reservePath(), reserveSlotSize*3); err != nil {
 		t.Fatal(err)
 	}
-	fh.Close()
 	forgetPauseProcessStateForTests(f.dataDir)
 	if _, _, err := ReadPauseRecord(f.dataDir, PauseKindVM, "other"); err == nil {
-		t.Fatal("ReadPauseRecord read past a corrupt reserve")
+		t.Fatal("ReadPauseRecord read past an unreadable reserve")
 	}
 	restarted := f.restartPauser()
 	for i := 0; i <= int(PartitionPauseAfter/time.Second); i++ {
@@ -225,5 +298,186 @@ func TestPartitionPause_AnUnreadableReserveHoldsEverything(t *testing.T) {
 	}
 	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
 		t.Fatalf("vm-ha is %s with the pause state unreadable", st)
+	}
+}
+
+// A record held in memory reaches the record directory once space returns,
+// even when the reserve cannot be read: the reserve's trouble must not widen
+// the window in which a crash loses the record.
+//
+// Mutation: return from flush on a reserve that does not read (the behaviour
+// before) — the record never reaches the directory, red.
+func TestPartitionPause_MemoryRecordsFlushPastAnUnreadableReserve(t *testing.T) {
+	f := newPauseFixture(t)
+	dir := filepath.Join(f.dataDir, partitionPauseDir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f.reservePath(), make([]byte, 100), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.p.SetRecordFaultForTests(enospcOn(PauseRecordLayerDisk))
+	f.loseFor(QuorumNo, PartitionPauseAfter+2*time.Second)
+	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+		t.Fatalf("setup: vm-ha is %s", st)
+	}
+	if _, err := os.Stat(f.recordFile()); err == nil {
+		t.Fatal("setup: the record file exists although the directory write failed")
+	}
+	f.p.SetRecordFaultForTests(nil)
+	f.tick()
+	if _, err := os.Stat(f.recordFile()); err != nil {
+		t.Fatalf("the in-memory record did not reach the directory past an unreadable reserve: %v", err)
+	}
+}
+
+// The default mode tries the reserve before memory: the reserve survives a
+// crash, memory does not. And once the record reaches the record directory,
+// its reserve slot is zeroed, so a later resume that removes the file cannot
+// leave a stale copy behind to come back at the next start.
+//
+// Mutations: let the default mode skip the reserve and go straight to memory —
+// the record is not in the reserve, red; leave the slot once the file is
+// written — the reserve still holds vm-ha, red.
+func TestPartitionPause_DefaultModeUsesTheReserveBeforeMemory(t *testing.T) {
+	f := newPauseFixture(t)
+	f.tick()
+	f.p.SetRecordFaultForTests(enospcOn(PauseRecordLayerDisk))
+	f.loseFor(QuorumNo, PartitionPauseAfter+2*time.Second)
+	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+		t.Fatalf("setup: vm-ha is %s", st)
+	}
+	if got := f.reserveSlotsOf("vm-ha"); len(got) != 1 {
+		t.Fatalf("vm-ha's record is in reserve slots %v; the default mode holds it in the reserve before memory", got)
+	}
+	// It survives the process.
+	other := t.TempDir()
+	if err := os.CopyFS(other, os.DirFS(f.dataDir)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := ReadPauseRecord(other, PauseKindVM, "vm-ha"); err != nil || !ok {
+		t.Fatalf("a fresh process reads no record for vm-ha: %v, %v", ok, err)
+	}
+	f.p.SetRecordFaultForTests(nil)
+	f.tick()
+	if _, err := os.Stat(f.recordFile()); err != nil {
+		t.Fatalf("the record is not in the record directory once space returned: %v", err)
+	}
+	if got := f.reserveSlotsOf("vm-ha"); len(got) != 0 {
+		t.Fatalf("reserve slots %v still hold vm-ha once the record directory does", got)
+	}
+}
+
+// A second record of a key whose record is in the reserve goes to another
+// slot, synced before the older is zeroed: a live slot is never overwritten
+// in place, so a write torn by a crash cannot destroy the one copy.
+//
+// Mutation: reuse the key's slot (the behaviour before) — the slot does not
+// change, red.
+func TestPartitionPause_AReserveSlotIsNeverOverwrittenInPlace(t *testing.T) {
+	f := newPauseFixture(t)
+	f.tick()
+	f.p.SetRecordFaultForTests(enospcOn(PauseRecordLayerDisk))
+	f.loseFor(QuorumNo, PartitionPauseAfter+2*time.Second)
+	first := f.reserveSlotsOf("vm-ha")
+	if len(first) != 1 {
+		t.Fatalf("setup: vm-ha's record is in reserve slots %v", first)
+	}
+	// An operator resumes vm-ha by hand while the majority is still lost;
+	// the next pass pauses and records it again.
+	f.virt.SetState("vm-ha", libvirtfake.StateRunning)
+	f.tick()
+	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+		t.Fatalf("setup: vm-ha is %s after the second pass", st)
+	}
+	second := f.reserveSlotsOf("vm-ha")
+	if len(second) != 1 || second[0] == first[0] {
+		t.Fatalf("vm-ha's record went from slot %v to %v; a live slot must not be overwritten in place", first, second)
+	}
+}
+
+// A record write that hangs (a dying disk) is bounded: the pause happens with
+// the record in memory. When the write finally returns after a resume removed
+// the record, it must not bring the record back.
+//
+// Mutations: wait for the write without a bound — the pass never returns, red;
+// drop the generation check when the write lands — the file reappears, red.
+func TestPartitionPause_AHungRecordWriteIsBoundedAndNeverResurrects(t *testing.T) {
+	f := newPauseFixture(t)
+	release := make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	var hang atomic.Bool
+	hang.Store(true)
+	f.p.SetRecordFaultForTests(func(layer string, _ PauseRecord) error {
+		if layer == PauseRecordLayerDisk && hang.Load() {
+			<-release
+		}
+		return nil
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.loseFor(QuorumNo, PartitionPauseAfter+2*time.Second)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the pause passes did not return with the record write hung")
+	}
+	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+		t.Fatalf("vm-ha is %s with its record write hung", st)
+	}
+	if _, ok, err := ReadPauseRecord(f.dataDir, PauseKindVM, "vm-ha"); err != nil || !ok {
+		t.Fatalf("ReadPauseRecord = %v, %v while the write hangs", ok, err)
+	}
+	// A resume removes the record; then the disk answers.
+	if err := RemovePauseRecord(f.dataDir, PauseKindVM, "vm-ha"); err != nil {
+		t.Fatal(err)
+	}
+	hang.Store(false)
+	once.Do(func() { close(release) })
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(f.recordFile()); err == nil {
+			// It may show between the rename and the check that undoes it.
+			time.Sleep(50 * time.Millisecond)
+			if _, err := os.Stat(f.recordFile()); err == nil {
+				t.Fatal("a write that returned after the resume brought the record file back")
+			}
+		}
+		if _, ok, _ := ReadPauseRecord(f.dataDir, PauseKindVM, "vm-ha"); ok {
+			if _, err := os.Stat(f.recordFile()); err == nil {
+				t.Fatal("a write that returned after the resume brought the record back")
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// reserve and self_fence promise a self-fence on a record that cannot be
+// written, and need a verified watchdog to keep it. With none armed they
+// pause as pause does, with the record in memory, and raise nothing.
+//
+// Mutation: fail the pause whatever the watchdog says — vm-ha keeps running,
+// red.
+func TestPartitionPause_RecordFailureModesWithoutAWatchdogPause(t *testing.T) {
+	for _, mode := range []string{PauseRecordFailureReserve, PauseRecordFailureSelfFence} {
+		t.Run(mode, func(t *testing.T) {
+			f := newPauseFixture(t) // its self-fence is not armed
+			f.p.SetRecordFailure(mode)
+			f.tick()
+			f.p.SetRecordFaultForTests(enospcOn(PauseRecordLayerDisk, PauseRecordLayerReserve))
+			f.loseFor(QuorumNo, PartitionPauseAfter+2*time.Second)
+			if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+				t.Fatalf("vm-ha is %s; %s without a verified watchdog pauses", st, mode)
+			}
+			if failed, err := corrosion.HostPartitionPauseFailed(context.Background(), f.db, "node-a"); err != nil || failed {
+				t.Fatalf("partition_pause_failed = %v (%v) for a pause that happened", failed, err)
+			}
+			if _, ok, err := ReadPauseRecord(f.dataDir, PauseKindVM, "vm-ha"); err != nil || !ok {
+				t.Fatalf("ReadPauseRecord = %v, %v", ok, err)
+			}
+		})
 	}
 }

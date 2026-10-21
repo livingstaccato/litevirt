@@ -461,8 +461,17 @@ enforcement:
                               # or the reserve before the pause; with neither writable the
                               # pause fails. self_fence: the directory only, and a write that
                               # fails is a failed pause (partition_pause_failed, and a
-                              # self-fence with a verified watchdog armed), the behaviour
-                              # before this key. Any other value fails the config load.
+                              # self-fence), the behaviour before this key. reserve and
+                              # self_fence need a verified watchdog: without one armed they
+                              # pause as pause does, with the record in memory, and log
+                              # fallback=no_verified_watchdog. A write that has not returned
+                              # within 2 s (less when the pass is short of time) counts as
+                              # failed. The reserve holds 1024 records; more at once are
+                              # held in memory (warned once). It works where blocks are
+                              # overwritten in place: ext4, xfs, and btrfs (made no-COW).
+                              # On zfs it is best effort: give data_dir its own dataset with
+                              # a refreservation, or rely on pause. Any other value fails the
+                              # config load.
   console_password: true      # DEFAULT ON. Give the VNC and SPICE consoles of every domain
                               # this host defines a fresh per-VM password, so a local process
                               # or user on the host can no longer open a console on its

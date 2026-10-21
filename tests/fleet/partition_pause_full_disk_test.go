@@ -28,8 +28,10 @@ import (
 type ppFullDisk struct {
 	on     atomic.Bool
 	layers []string
-	mu     sync.Mutex
-	fenced int
+	// noWatchdog leaves the self-fence unwired: no verified watchdog is armed.
+	noWatchdog bool
+	mu         sync.Mutex
+	fenced     int
 }
 
 func (d *ppFullDisk) hook(owner, mode string) func(n *Node, p *health.PartitionPauser) {
@@ -49,7 +51,9 @@ func (d *ppFullDisk) hook(owner, mode string) func(n *Node, p *health.PartitionP
 			}
 			return nil
 		})
-		p.SetSelfFence(func() bool { return true }, func() { d.mu.Lock(); d.fenced++; d.mu.Unlock() })
+		if !d.noWatchdog {
+			p.SetSelfFence(func() bool { return true }, func() { d.mu.Lock(); d.fenced++; d.mu.Unlock() })
+		}
 	}
 }
 
@@ -238,4 +242,109 @@ func TestFleet_PartitionPause_FullDiskReserveModeWritesTheReserve(t *testing.T) 
 	if !bytes.Contains(b, []byte(`"name":"pp-vm"`)) {
 		t.Fatal("the reserve does not hold pp-vm's record")
 	}
+}
+
+// ppOneCopyThroughSplit splits a 5-node cluster 2|3 with pp-vm on the
+// minority's node-0, whose pauser hook makes its record writes fail or hang
+// once on is set, and asserts that no instant had pp-vm running on two hosts
+// and that the owner paused it. It returns the owner's stack node.
+func ppOneCopyThroughSplit(t *testing.T, hook func(owner string) func(n *Node, p *health.PartitionPauser), on func()) (*Cluster, *ppStack) {
+	t.Helper()
+	c := New(t, Options{Nodes: 5, IndependentReplicas: true, Relays: 5, RealGossip: true})
+	owner := c.Nodes[0]
+	insertVMPolicy(t, owner, "pp-vm", owner.Name, "restart-any")
+	c.WaitConverged(t, convergeTimeout)
+	owner.Virt.SetState("pp-vm", libvirtfake.StateRunning)
+	genesisByTick(t, c, c.Nodes[2])
+	enableRecoveryClaims(t, c)
+	s := newPPStack(t, c, ppOpts{latched: true, coordinators: map[string]bool{c.Nodes[2].Name: true},
+		pauserHook: hook(owner.Name)})
+	rs := sampleRunning(t, c, "pp-vm")
+	eventually(t, time.Minute, "the owner's pauser to be healed before the split", func() bool {
+		return s.node(owner).pauser.HealedForTests()
+	})
+	on()
+	minority, majority := c.Nodes[:2], c.Nodes[2:]
+	c.SplitGossip(minority, majority)
+	eventually(t, ppRecoverBound, "the majority to start pp-vm's replacement", func() bool {
+		for _, n := range majority {
+			if st, ok := n.Virt.RawState("pp-vm"); ok && st == libvirtfake.StateRunning {
+				return true
+			}
+		}
+		return false
+	})
+	time.Sleep(3 * time.Second)
+	rs.mu.Lock()
+	maxRun, overlap := rs.max, rs.overlap
+	rs.mu.Unlock()
+	if maxRun > 1 {
+		t.Fatalf("pp-vm ran on more than one host at once: %v", overlap)
+	}
+	if st, _ := owner.Virt.RawState("pp-vm"); st != libvirtfake.StatePaused {
+		t.Fatalf("pp-vm is %s on %s, want paused", st, owner.Name)
+	}
+	if pauseFailedOn(t, owner) {
+		t.Fatalf("%s raised partition_pause_failed for a pause that happened", owner.Name)
+	}
+	return c, s
+}
+
+// reserve and self_fence promise a self-fence on a record that cannot be
+// written, and that needs a verified watchdog. With none armed, a failed pause
+// keeps the copy running beside the majority's replacement (partition_pause_failed
+// cannot reach the majority across the split), so both fall back to pause:
+// the record is held in memory and the workload is paused.
+//
+// Mutation: fail the pause in reserve/self_fence mode whatever the watchdog
+// says (the behaviour before the fallback) — pp-vm runs on two hosts, red.
+func TestFleet_PartitionPause_FullDiskReserveModeWithoutAWatchdogPauses(t *testing.T) {
+	disk := &ppFullDisk{layers: []string{health.PauseRecordLayerDisk, health.PauseRecordLayerReserve}, noWatchdog: true}
+	ppOneCopyThroughSplit(t, func(owner string) func(*Node, *health.PartitionPauser) {
+		return disk.hook(owner, health.PauseRecordFailureReserve)
+	}, func() { disk.on.Store(true) })
+}
+
+func TestFleet_PartitionPause_FullDiskSelfFenceModeWithoutAWatchdogPauses(t *testing.T) {
+	disk := &ppFullDisk{layers: []string{health.PauseRecordLayerDisk}, noWatchdog: true}
+	ppOneCopyThroughSplit(t, func(owner string) func(*Node, *health.PartitionPauser) {
+		return disk.hook(owner, health.PauseRecordFailureSelfFence)
+	}, func() { disk.on.Store(true) })
+}
+
+// A dying disk: the record write never returns (I/O stuck in D state). The
+// write is bounded, so the owner pauses with the record in memory before the
+// majority starts the replacement, and once the disk answers again the
+// record reaches the record directory.
+//
+// Mutation: wait for the record write without a bound — the suspend never
+// comes, pp-vm runs on two hosts, red.
+func TestFleet_PartitionPause_HungRecordWritePausesAnyway(t *testing.T) {
+	var hang atomic.Bool
+	release := make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	_, s := ppOneCopyThroughSplit(t, func(owner string) func(*Node, *health.PartitionPauser) {
+		return func(n *Node, p *health.PartitionPauser) {
+			if n.Name != owner {
+				return
+			}
+			p.SetRecordFaultForTests(func(layer string, _ health.PauseRecord) error {
+				if hang.Load() && layer == health.PauseRecordLayerDisk {
+					<-release
+				}
+				return nil
+			})
+		}
+	}, func() { hang.Store(true) })
+	recFile := filepath.Join(s.nodes[0].dataDir, "partition-pause", "vm-pp-vm.json")
+	if _, err := os.Stat(recFile); err == nil {
+		t.Fatal("setup: the record file exists although every write hung")
+	}
+	hang.Store(false)
+	once.Do(func() { close(release) })
+	eventually(t, 30*time.Second, "the record to reach the record directory once the disk answers", func() bool {
+		_, err := os.Stat(recFile)
+		return err == nil
+	})
 }

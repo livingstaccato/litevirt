@@ -891,6 +891,11 @@ type EnforcementConfig struct {
 	//   - "self_fence": the directory only, and a write that fails is a failed
 	//     pause (partition_pause_failed, and a self-fence with a verified
 	//     watchdog armed). The behaviour before this key existed.
+	//
+	// reserve and self_fence need a verified watchdog: without one armed they
+	// pause as "pause" does, with the record in memory
+	// (fallback=no_verified_watchdog). A write that has not returned within
+	// 2 s counts as one that failed.
 	PartitionPauseRecordFailure string `yaml:"partition_pause_record_failure,omitempty"`
 	// IsolationEpoch: activate the §A isolation regime on this host
 	// (capabilities.IsolationEpochV1). With the flag on and the token latched

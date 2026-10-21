@@ -207,6 +207,12 @@ func (b passBudget) timeout() time.Duration {
 	return min(partitionPauseCallTimeout, time.Until(b.readsBy))
 }
 
+// recordBound is how long a pause waits for its record: min(2s, what is
+// left of the pass), and never less than pauseRecordWriteFloor.
+func (b passBudget) recordBound() time.Duration {
+	return max(pauseRecordWriteFloor, min(pauseRecordWriteBound, b.timeout()))
+}
+
 // frozenStater is the optional container-runtime capability to tell a FROZEN
 // container from a running one (lxc.Runtime.State folds frozen into running).
 // Without it a container an operator froze is indistinguishable from one
@@ -328,6 +334,7 @@ type PartitionPauser struct {
 	// whose record cannot be written does (partition_pause_reserve.go).
 	recordMode string
 	reserveWhy string // the last reserve error logged, "" once it exists
+	keeping    bool   // a keepRecords run has not returned yet
 	now        func() time.Time
 	after      time.Duration
 	tick       time.Duration
@@ -510,7 +517,8 @@ func (p *PartitionPauser) Evaluate(ctx context.Context) {
 	if p.quorum == nil {
 		return
 	}
-	p.keepRecords()
+	// After the pass, so a disk that hangs cannot delay a pause.
+	defer p.keepRecords()
 	state, live, needed := p.quorum(ctx)
 	now := p.now()
 	lost := state != QuorumYes
@@ -594,8 +602,36 @@ func (p *PartitionPauser) Evaluate(ctx context.Context) {
 
 // keepRecords makes the reserve while the disk has room (every mode but
 // self_fence, with the flag on), and moves any record held in the reserve or
-// in memory to the record directory once a write there succeeds.
+// in memory to the record directory once a write there succeeds. It runs in
+// the background and the pass waits for it at most one call timeout: a disk
+// that hangs stalls the run, never the pauser, and while it is stalled later
+// passes start none.
 func (p *PartitionPauser) keepRecords() {
+	p.mu.Lock()
+	if p.keeping {
+		p.mu.Unlock()
+		return
+	}
+	p.keeping = true
+	p.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		defer func() {
+			p.mu.Lock()
+			p.keeping = false
+			p.mu.Unlock()
+			close(done)
+		}()
+		p.keepRecordsNow()
+	}()
+	select {
+	case <-done:
+	case <-time.After(partitionPauseCallTimeout):
+		slog.Warn("partition-pause: writing the held pause records has not returned; it goes on in the background", "host", p.host)
+	}
+}
+
+func (p *PartitionPauser) keepRecordsNow() {
 	p.store.flush()
 	if p.recordMode == PauseRecordFailureSelfFence || p.enabled == nil || !p.enabled() || p.store.dir == "" {
 		return
@@ -612,6 +648,12 @@ func (p *PartitionPauser) keepRecords() {
 		slog.Warn("partition-pause: cannot make the pause-record reserve; a pause whose record cannot be written falls back as enforcement.partition_pause_record_failure says",
 			"host", p.host, "mode", p.recordModeName(), "error", why)
 	}
+}
+
+// verifiedWatchdog reports whether a failed pause can self-fence: a verified
+// watchdog is armed and the fence is wired.
+func (p *PartitionPauser) verifiedWatchdog() bool {
+	return p.armed != nil && p.armed() && p.selfFence != nil
 }
 
 func (p *PartitionPauser) recordModeName() string {
@@ -743,7 +785,7 @@ func (p *PartitionPauser) pauseVMs(ctx context.Context, budget passBudget, reaso
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := p.pauseOne(rec, func() error { return p.vms.SuspendDomain(name) }); err != nil {
+			if err := p.pauseOne(rec, budget.recordBound(), func() error { return p.vms.SuspendDomain(name) }); err != nil {
 				fail(rec.Key(), err.Error())
 			}
 		}()
@@ -823,7 +865,7 @@ func (p *PartitionPauser) pauseContainers(ctx context.Context, budget passBudget
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := p.pauseOne(rec, func() error {
+			if err := p.pauseOne(rec, budget.recordBound(), func() error {
 				cctx, cancel := context.WithTimeout(ctx, partitionPauseCallTimeout)
 				defer cancel()
 				return p.cts.Freeze(cctx, name)
@@ -835,13 +877,14 @@ func (p *PartitionPauser) pauseContainers(ctx context.Context, budget passBudget
 	wg.Wait()
 }
 
-// pauseOne records rec, then runs pause, bounded by partitionPauseCallTimeout.
+// pauseOne records rec, waiting at most recordBound for the write, then runs
+// pause, bounded by partitionPauseCallTimeout.
 // A pause that fails cleanly drops the record (the workload is not paused);
 // one that times out keeps it, since it may still land, and a paused workload
 // with no record is never resumed. A call that has not returned blocks any
 // second call for the same workload (inflight), so a wedged suspend is never
 // issued twice; it is reported as a failure until it returns.
-func (p *PartitionPauser) pauseOne(rec PauseRecord, pause func() error) error {
+func (p *PartitionPauser) pauseOne(rec PauseRecord, recordBound time.Duration, pause func() error) error {
 	p.mu.Lock()
 	if p.inflight[rec.Key()] {
 		p.mu.Unlock()
@@ -849,7 +892,12 @@ func (p *PartitionPauser) pauseOne(rec PauseRecord, pause func() error) error {
 	}
 	p.inflight[rec.Key()] = true
 	p.mu.Unlock()
-	where, err := p.store.record(rec, p.recordMode)
+	// reserve and self_fence trade the pause for a self-fence; with no
+	// verified watchdog to make one, a failed pause would leave the copy
+	// running beside the majority's replacement, so they pause as pause does.
+	mode := p.recordModeName()
+	memOK := mode == PauseRecordFailurePause || !p.verifiedWatchdog()
+	where, err := p.store.record(rec, p.recordMode, memOK, recordBound)
 	if err != nil {
 		p.mu.Lock()
 		delete(p.inflight, rec.Key())
@@ -860,8 +908,11 @@ func (p *PartitionPauser) pauseOne(rec PauseRecord, pause func() error) error {
 		// What the majority relies on is the pause, not the record
 		// (partition_pause_reserve.go): pause, and write the record to the
 		// directory once it can be.
-		slog.Error("partition-pause: cannot write the pause record to the record directory; pausing with it held in "+where,
-			"kind", rec.Kind, "name", rec.Name, "host", p.host, "mode", p.recordModeName())
+		args := []any{"kind", rec.Kind, "name", rec.Name, "host", p.host, "mode", mode}
+		if where == PauseRecordLayerMemory && mode != PauseRecordFailurePause {
+			args = append(args, "fallback", "no_verified_watchdog")
+		}
+		slog.Error("partition-pause: cannot write the pause record to the record directory; pausing with it held in "+where, args...)
 	}
 	done := make(chan error, 1)
 	go func() {

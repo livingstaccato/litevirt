@@ -2590,7 +2590,14 @@ func (f *Fake) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, 
 	f.snapshots[domainName][snapshotName] = struct{}{}
 	f.cutoverDisks(domainName, snapshotName)
 	f.record("snapshot-live", domainName, snapshotName)
+	unsaveable := unsaveableHostdev(f.liveXMLLocked(domainName))
 	f.mu.Unlock()
+	// As libvirt's save (qemuMigrationSrcIsAllowedHostdev): a domain holding a
+	// non-USB <hostdev> cannot have its state written, and the save is refused
+	// AFTER the overlay has already cut over.
+	if unsaveable != "" {
+		return 0, 0, fmt.Errorf("save guest memory: Requested operation is not valid: cannot migrate a domain with <hostdev mode='subsystem' type='%s'>", unsaveable)
+	}
 	if f.FailCreateLiveSnapshot != nil {
 		if err := f.FailCreateLiveSnapshot(domainName, snapshotName); err != nil {
 			return 0, 0, err
@@ -2602,6 +2609,25 @@ func (f *Fake) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, 
 		}
 	}
 	return time.Now().UnixNano(), 4096, nil
+}
+
+// unsaveableHostdev returns the type of the first <hostdev> in domXML whose
+// state libvirt cannot save (any but usb), or "".
+func unsaveableHostdev(domXML string) string {
+	var d struct {
+		Hostdevs []struct {
+			Type string `xml:"type,attr"`
+		} `xml:"devices>hostdev"`
+	}
+	if xml.Unmarshal([]byte(domXML), &d) != nil {
+		return ""
+	}
+	for _, h := range d.Hostdevs {
+		if h.Type != "usb" {
+			return h.Type
+		}
+	}
+	return ""
 }
 
 // SetDiskSource sets a domain's disk source (test helper).

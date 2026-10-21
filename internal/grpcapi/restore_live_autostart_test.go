@@ -15,8 +15,10 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/pbsstore"
+	"github.com/litevirt/litevirt/internal/vfio"
 )
 
 // seedLiveRepo creates a repo with one root-disk manifest of `data`,
@@ -248,6 +250,13 @@ func TestRestoreLive_AutoStart_PopulatesHardwareTables(t *testing.T) {
 	s.hostName = "host-a"
 	fake := libvirtfake.New()
 	s.virt = fake
+	defer vfio.SetFS(newPCIBindFakeFS())()
+	// The backed-up VM's GPU, free on this host: the restore attaches it.
+	if err := corrosion.UpsertPCIDevice(context.Background(), s.db, corrosion.PCIDeviceRecord{
+		HostName: s.hostName, Address: "41:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1,
+	}); err != nil {
+		t.Fatalf("seed PCI device: %v", err)
+	}
 
 	spec := &pb.VMSpec{
 		Name: "vm1", Cpu: 2, MemoryMib: 2048, Machine: "q35", Firmware: "uefi",
@@ -294,20 +303,25 @@ func TestRestoreLive_AutoStart_PopulatesHardwareTables(t *testing.T) {
 		t.Errorf("vm_nics security_groups = %q, want [\"web\"]", nics[0].SecurityGroups)
 	}
 
+	// The device the domain holds is the one its intent reserves.
+	if got := lv.HostdevSourcePCIAddresses(fake.DefinedXML("vm1")); len(got) != 1 || got[0] != "0000:41:00.0" {
+		t.Fatalf("restored domain hostdevs = %v, want [0000:41:00.0]", got)
+	}
 	intents, err := corrosion.ListVMPCIIntents(ctx, s.db, "vm1")
 	if err != nil {
 		t.Fatalf("ListVMPCIIntents: %v", err)
 	}
-	if len(intents) != 0 {
-		t.Fatalf("vm_pci_intent = %+v, want 0 rows (a restored, device-less domain must not reserve a phantom PCI intent)", intents)
+	wantID := corrosion.DeterministicPCIIntentID(
+		corrosion.CanonicalPCISelector(&pb.DeviceSpec{Address: "0000:41:00.0"}), 0)
+	if len(intents) != 1 || intents[0].DeviceID != wantID {
+		t.Fatalf("vm_pci_intent = %+v, want 1 row with device_id %s", intents, wantID)
 	}
-	// And no phantom exclusive reservation: another VM must be free to claim that BDF.
 	owner, err := corrosion.PCIIntentExclusiveOwner(ctx, s.db, s.hostName, "0000:41:00.0")
 	if err != nil {
 		t.Fatalf("PCIIntentExclusiveOwner: %v", err)
 	}
-	if owner != "" {
-		t.Errorf("PCIIntentExclusiveOwner(0000:41:00.0) = %q, want \"\" (no phantom reservation from a device-less restore)", owner)
+	if owner != "vm1" {
+		t.Errorf("PCIIntentExclusiveOwner(0000:41:00.0) = %q, want vm1", owner)
 	}
 
 	state, _, err := corrosion.GetHardwareAdoptionState(ctx, s.db, "vm1")
@@ -320,6 +334,53 @@ func TestRestoreLive_AutoStart_PopulatesHardwareTables(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+// A backed-up VM's PCI passthrough device that this host cannot give it
+// refuses the auto-start, as a start of the VM would, instead of defining and
+// starting a domain silently without it.
+//
+// Mutation: skip the device allocation in autoDefineRestoredVM — the VM
+// starts without its GPU: red.
+func TestRestoreLive_AutoStart_RefusesAnUnavailablePCIDevice(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	fake := libvirtfake.New()
+	s.virt = fake
+	defer vfio.SetFS(newPCIBindFakeFS())()
+
+	spec := &pb.VMSpec{
+		Name: "vm1", Cpu: 2, MemoryMib: 2048, Machine: "q35", Firmware: "uefi",
+		Devices: []*pb.DeviceSpec{{Type: "gpu", Vendor: "10de"}}, // no GPU on host-a
+	}
+	specJSON, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatalf("marshal spec: %v", err)
+	}
+	repoDir, ts := seedLiveRepo(t, make([]byte, pbsstore.ChunkSize), string(specJSON))
+	target := filepath.Join(t.TempDir(), "live.qcow2")
+
+	stream, cancel, done := runRestoreLiveUntil(t, s, &pb.RestoreLiveRequest{
+		RepoPath: repoDir, VmName: "vm1", DiskName: "root", Timestamp: ts,
+		TargetPath: target, AutoStart: true,
+	}, pb.RestoreLiveProgress_STARTED)
+	defer cancel()
+	if sawPhase(stream, pb.RestoreLiveProgress_STARTED) {
+		cancel()
+		<-done
+		t.Fatalf("restore started vm1 without its PCI device (domain hostdevs %v)",
+			lv.HostdevSourcePCIAddresses(fake.DefinedXML("vm1")))
+	}
+	err = <-done
+	if err == nil || !strings.Contains(status.Convert(err).Message(), "PCI") {
+		t.Fatalf("restore = %v, want a refusal naming the PCI device", err)
+	}
+	if st, ok := fake.RawState("vm1"); ok && st == libvirtfake.StateRunning {
+		t.Error("vm1 is running after the refused restore")
+	}
+	if vm, _ := corrosion.GetVM(context.Background(), s.db, "vm1"); vm != nil {
+		t.Errorf("a refused restore wrote a vms row: %+v", vm)
+	}
 }
 
 func TestRestoreLive_AutoStart_OperatorSuppliedSpec(t *testing.T) {

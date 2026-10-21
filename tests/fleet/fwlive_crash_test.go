@@ -592,13 +592,21 @@ func fwliveReadOnly(t *testing.T, root string) (restore func()) {
 			t.Fatalf("make %s read-only: %v", p, err)
 		}
 	}
-	return func() {
-		for _, p := range paths {
-			if err := os.Chmod(p, modes[p]); err != nil {
-				t.Errorf("give %s its mode back: %v", p, err)
+	var once sync.Once
+	restore = func() {
+		once.Do(func() {
+			for _, p := range paths {
+				if err := os.Chmod(p, modes[p]); err != nil && !errors.Is(err, fs.ErrNotExist) {
+					t.Errorf("give %s its mode back: %v", p, err)
+				}
 			}
-		}
+		})
 	}
+	// A test that fails before the explicit restore would leave a read-only
+	// tree that t.TempDir's RemoveAll cannot delete. Cleanups run last-in
+	// first-out, so this runs before the temp dir's removal.
+	t.Cleanup(restore)
+	return restore
 }
 
 // fwliveOpenWriters lists the descriptors this process holds open for

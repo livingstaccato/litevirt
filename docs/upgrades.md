@@ -659,6 +659,13 @@ host quarantined below a release feature in use must be **drained** of the
 workloads the feature touches (`lv host drain`), then upgraded again or reseeded;
 reseeding alone does not correct a workload already running.
 
+**`lv stop` is refused on a quarantined host.** The stop's `operator-stop`
+record is a replicated write, which the quarantine refuses, and a stop that
+is not recorded is undone: once the quarantine lifts, the stopped domain is
+recorded as an out-of-band stop and its restart policy starts it again. So
+the host answers `FailedPrecondition` before it touches the guest, which is
+left running. Upgrade the host again or reseed it, then stop the VM.
+
 **Before you roll back**, ask the cluster what would block it:
 
 ```bash

@@ -2766,6 +2766,9 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 		defer conn.Close()
 		return client.StopVM(ctx, req)
 	}
+	if err := s.quarantinedStopRefusal(req.Name); err != nil {
+		return nil, err
+	}
 	// A row that says migrating: a guest running here is stopped as before.
 	// Otherwise it may run on the move's target, which is asked first, before
 	// the lock (a peer RPC): a stop recorded here while it runs there would
@@ -2840,6 +2843,32 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 		s.resolveMigrationUnresolved(context.WithoutCancel(ctx), vm.Name)
 	}
 	return out, err
+}
+
+// quarantinedStopRefusal refuses an operator's stop on a host in write
+// quarantine, before anything reaches libvirt. The quarantine refuses every
+// replicated write, so the stop's "operator-stop" record cannot land: the
+// row keeps "running", and once the quarantine lifts the reconciler records
+// the stopped domain as an out-of-band stop that the restart policy starts
+// again. Stopping the guest anyway would answer an error for a stop that
+// was made and then undone. A refusal leaves the guest as it was and says
+// why; nothing is recorded or changed. No local record stands in for the
+// replicated one: peers, failover and a rolled-back binary read only the
+// row, and a full data_dir, the other way into the quarantine, could not
+// hold it either.
+func (s *Server) quarantinedStopRefusal(name string) error {
+	if s.db == nil {
+		return nil
+	}
+	reason := s.db.WriteQuarantineReason()
+	if reason == "" {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"VM %q was not stopped: this host is in write quarantine (%s) and cannot record an operator stop, "+
+			"which its restart policy would then undo; the guest is left running. Lift the quarantine "+
+			"(upgrade the binary again or reseed the host, docs/upgrades.md), then retry `lv stop %s`",
+		name, reason, name)
 }
 
 // stopVMLocked stops a LOCAL VM (force ⇒ destroy, else graceful shutdown with a

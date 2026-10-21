@@ -45,8 +45,14 @@ type PauseRecord struct {
 	// DomainUUID is the paused domain's UUID (VMs), so the record is trusted
 	// only for that domain and never for a later one of the same name.
 	DomainUUID string `json:"domain_uuid,omitempty"`
-	PausedAt   string `json:"paused_at"` // RFC3339, for operators; nothing decides on it
-	Reason     string `json:"reason"`
+	// Token is the mark this pause put on the live domain just before it
+	// suspended it (VMs; libvirt.Client.MarkPartitionPaused). The pauser
+	// resumes the VM only while the domain still carries it, so a record a
+	// crash left behind never resumes a later pause made by someone else.
+	// "" in a record written by a build without the mark.
+	Token    string `json:"token,omitempty"`
+	PausedAt string `json:"paused_at"` // RFC3339, for operators; nothing decides on it
+	Reason   string `json:"reason"`
 }
 
 // Key identifies a record: kind/name.

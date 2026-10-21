@@ -465,7 +465,7 @@ func TestPartitionPause_NoConfirmerHolds(t *testing.T) {
 	}
 }
 
-// DecideResume is the majority check of §3.5, step 3.
+// DecideResume is the majority check of §3.5, step 4.
 //
 // Mutations: count an errored answer — "an error is not an answer" goes red;
 // ignore HostDown — "fenced" goes red; ignore an accepted claim — "accepted"

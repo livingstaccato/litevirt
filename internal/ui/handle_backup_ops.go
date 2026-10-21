@@ -290,6 +290,8 @@ func (s *Server) handleRestoreLive(w http.ResponseWriter, r *http.Request) {
 			NewName:    strings.TrimSpace(r.FormValue("new_name")),
 			AutoStart:  r.FormValue("auto_start") == "on",
 			Blockpull:  r.FormValue("blockpull") == "on",
+			// Meaningful only with auto_start; the daemon refuses it alone.
+			WithoutDevices: r.FormValue("auto_start") == "on" && r.FormValue("without_devices") == "on",
 		})
 		if err != nil {
 			st.Error = err.Error()

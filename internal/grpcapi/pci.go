@@ -1276,3 +1276,50 @@ func pciDeviceToProto(d corrosion.PCIDeviceRecord) *pb.PCIDevice {
 		LinkPeers:     linkPeers,
 	}
 }
+
+// releaseAllocatedDevices gives back the devices a create or restore
+// allocated when it fails with its domain provably not running: the owner is
+// cleared and the device leaves vfio-pci, through the owner-scoped release
+// (an address no longer the VM's is skipped, another VM's is never touched).
+// A release that fails is logged and left to the stranded-ownership sweep.
+func (s *Server) releaseAllocatedDevices(ctx context.Context, op, vmName string, addrs []string) {
+	if len(addrs) == 0 {
+		return
+	}
+	if err := s.unbindAndReleaseOwnership(context.WithoutCancel(ctx), vmName, addrs); err != nil {
+		slog.Warn("pci: a failed "+op+" could not give its devices back; the stranded-ownership sweep releases them",
+			"vm", vmName, "addresses", addrs, "error", err)
+		return
+	}
+	slog.Info("pci: devices of a failed "+op+" released", "vm", vmName, "addresses", addrs)
+}
+
+// deviceSpecsSummary names each requested device for an operator message:
+// its address, or its mapping, or its type/vendor/model, with a count over 1.
+func deviceSpecsSummary(specs []*pb.DeviceSpec) string {
+	parts := make([]string, 0, len(specs))
+	for _, d := range specs {
+		var f []string
+		switch {
+		case d.GetAddress() != "":
+			f = append(f, d.GetAddress())
+		case d.GetMapping() != "":
+			f = append(f, "mapping="+d.GetMapping())
+		}
+		if d.GetAddress() == "" {
+			for _, kv := range [][2]string{{"type", d.GetType()}, {"vendor", d.GetVendor()}, {"model", d.GetModel()}} {
+				if kv[1] != "" {
+					f = append(f, kv[0]+"="+kv[1])
+				}
+			}
+			if d.GetSriov() {
+				f = append(f, "sriov")
+			}
+		}
+		if d.GetCount() > 1 {
+			f = append(f, fmt.Sprintf("count=%d", d.GetCount()))
+		}
+		parts = append(parts, strings.Join(f, " "))
+	}
+	return strings.Join(parts, ", ")
+}

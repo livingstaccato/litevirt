@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/litevirt/litevirt/internal/nictap"
+	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/safename"
 )
 
@@ -728,19 +729,15 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 
 	// PCI passthrough hostdevs
 	for _, hd := range cfg.Hostdevs {
-		parsed := ParsePCIAddress(hd.Address)
+		addr, err := pciHostdevAddress(hd.Address)
+		if err != nil {
+			return "", err
+		}
 		hostdev := hostdevDevice{
 			Mode:    "subsystem",
 			Type:    "pci",
 			Managed: "yes",
-			Source: hostdevSource{
-				Address: &hostdevAddress{
-					Domain:   parsed.Domain,
-					Bus:      parsed.Bus,
-					Slot:     parsed.Slot,
-					Function: parsed.Function,
-				},
-			},
+			Source:  hostdevSource{Address: addr},
 		}
 		if hd.Alias != "" {
 			hostdev.Alias = &hostdevAlias{Name: hd.Alias}
@@ -1318,24 +1315,33 @@ type ParsedPCIAddr struct {
 	Domain, Bus, Slot, Function string
 }
 
-// ParsePCIAddress splits "0000:41:00.0" into domain/bus/slot/function hex strings.
-func ParsePCIAddress(addr string) ParsedPCIAddr {
-	// Format: DDDD:BB:SS.F
-	parts := strings.SplitN(addr, ":", 3)
-	if len(parts) < 3 {
-		return ParsedPCIAddr{Domain: "0x0000", Bus: "0x00", Slot: "0x00", Function: "0x0"}
+// ParsePCIAddress splits a PCI address into the 0x-prefixed domain, bus, slot
+// and function attributes of a <hostdev> source. It accepts any form
+// pci.CanonicalBDF does ("0000:41:00.0", or "41:00.0" with the domain omitted)
+// and reports false for anything that is no BDF: rendering one as some fixed
+// address would hand the guest another device, the host bridge among them.
+func ParsePCIAddress(addr string) (ParsedPCIAddr, bool) {
+	bdf, ok := pci.CanonicalBDF(addr)
+	if !ok {
+		return ParsedPCIAddr{}, false
 	}
-	slotFunc := strings.SplitN(parts[2], ".", 2)
-	fn := "0"
-	if len(slotFunc) == 2 {
-		fn = slotFunc[1]
-	}
+	// dddd:bb:ss.f
 	return ParsedPCIAddr{
-		Domain:   "0x" + parts[0],
-		Bus:      "0x" + parts[1],
-		Slot:     "0x" + slotFunc[0],
-		Function: "0x" + fn,
+		Domain:   "0x" + bdf[0:4],
+		Bus:      "0x" + bdf[5:7],
+		Slot:     "0x" + bdf[8:10],
+		Function: "0x" + bdf[11:12],
+	}, true
+}
+
+// pciHostdevAddress is ParsePCIAddress as a <hostdev> source address, or an
+// error naming the address.
+func pciHostdevAddress(addr string) (*hostdevAddress, error) {
+	p, ok := ParsePCIAddress(addr)
+	if !ok {
+		return nil, fmt.Errorf("invalid PCI address %q for a passthrough device", addr)
 	}
+	return &hostdevAddress{Domain: p.Domain, Bus: p.Bus, Slot: p.Slot, Function: p.Function}, nil
 }
 
 // InterfaceSourceByMAC returns the type and <source> of the interface carrying

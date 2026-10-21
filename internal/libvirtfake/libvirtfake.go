@@ -2332,8 +2332,7 @@ func insertHostdevIntoDomainXML(domainXML, domainName, pciAddress, alias string)
 	// Emit the <source><address> the way real libvirt does so
 	// libvirt.HostdevSourcePCIAddresses (the by-source-BDF membership authority the
 	// legacy detach path reads — legacy hostdevs carry no alias) can find this device.
-	if pciAddress != "" {
-		p := libvirt.ParsePCIAddress(pciAddress)
+	if p, ok := libvirt.ParsePCIAddress(pciAddress); ok {
 		hd += "<source><address domain='" + p.Domain + "' bus='" + p.Bus +
 			"' slot='" + p.Slot + "' function='" + p.Function + "'/></source>"
 	}
@@ -2624,13 +2623,28 @@ func (f *Fake) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, 
 		}
 	}
 	f.mu.Lock()
+	// As libvirt.Client's preflight: a device whose state cannot be saved
+	// refuses the snapshot before the freeze and the overlay cutover.
+	blockers, berr := libvirt.MemorySnapshotBlockers(f.liveXMLLocked(domainName))
+	if berr == nil && len(blockers) > 0 {
+		f.mu.Unlock()
+		return 0, 0, &libvirt.PassthroughSnapshotError{Domain: domainName, Devices: blockers}
+	}
 	if f.snapshots[domainName] == nil {
 		f.snapshots[domainName] = map[string]struct{}{}
 	}
 	f.snapshots[domainName][snapshotName] = struct{}{}
 	f.cutoverDisks(domainName, snapshotName)
 	f.record("snapshot-live", domainName, snapshotName)
+	unsaveable := unsaveableHostdev(f.liveXMLLocked(domainName))
 	f.mu.Unlock()
+	// As libvirt's save (qemuMigrationSrcIsAllowedHostdev), reached only if
+	// the preflight above is bypassed: a domain holding a non-USB <hostdev>
+	// cannot have its state written, and the save is refused AFTER the
+	// overlay has already cut over.
+	if unsaveable != "" {
+		return 0, 0, fmt.Errorf("save guest memory: Requested operation is not valid: cannot migrate a domain with <hostdev mode='subsystem' type='%s'>", unsaveable)
+	}
 	if f.FailCreateLiveSnapshot != nil {
 		if err := f.FailCreateLiveSnapshot(domainName, snapshotName); err != nil {
 			return 0, 0, err
@@ -2642,6 +2656,25 @@ func (f *Fake) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, 
 		}
 	}
 	return time.Now().UnixNano(), 4096, nil
+}
+
+// unsaveableHostdev returns the type of the first <hostdev> in domXML whose
+// state libvirt cannot save (any but usb), or "".
+func unsaveableHostdev(domXML string) string {
+	var d struct {
+		Hostdevs []struct {
+			Type string `xml:"type,attr"`
+		} `xml:"devices>hostdev"`
+	}
+	if xml.Unmarshal([]byte(domXML), &d) != nil {
+		return ""
+	}
+	for _, h := range d.Hostdevs {
+		if h.Type != "usb" {
+			return h.Type
+		}
+	}
+	return ""
 }
 
 // SetDiskSource sets a domain's disk source (test helper).

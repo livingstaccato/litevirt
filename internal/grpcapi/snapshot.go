@@ -185,6 +185,13 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 			return nil, status.Errorf(codes.Internal, "prepare vmstate dir: %v", mkErr)
 		}
 		sizeBytes, vmstateBytes, err = s.virt.CreateLiveSnapshot(req.VmName, req.Name, vmstatePath, captureFW)
+		// A passthrough device is refused before the freeze: nothing was cut
+		// over, so there is no overlay or row to account for.
+		var pe *lv.PassthroughSnapshotError
+		if errors.As(err, &pe) {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"%v: a memory snapshot is not possible; take a disk-only snapshot instead (omit --memory; a Secure Boot or vTPM VM must be stopped for one), or detach the devices first", pe)
+		}
 		snapType = "memory"
 		// CreateLiveSnapshot cuts the disk overlay over before capturing/saving, so
 		// on failure the overlay may already exist — treat as created for cleanup.

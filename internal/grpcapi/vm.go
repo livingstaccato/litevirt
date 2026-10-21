@@ -1379,6 +1379,11 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	// PCI device passthrough.
 	var pciIntents []corrosion.PCIIntentRecord
+	// pciHeld: the domain may be running with the devices. Until its start is
+	// tried, and again once abortDefined has proven it stopped or gone, a
+	// failed create gives its devices back at once (owner-scoped); a domain
+	// that could not be stopped keeps them.
+	pciHeld := false
 	if len(spec.Devices) > 0 {
 		pciAddrs, devFinish, devErr := s.allocateDevices(ctx, spec.Name, spec.Devices, deviceLeaseStageBound)
 		if devErr != nil {
@@ -1388,10 +1393,16 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		// Clear the durable device lease once create returns; a crash before the
 		// VM row is finalized leaves it for startup recovery to roll back.
-		// Cleared on every return, a failed create's too: the device stays
-		// owned and bound under the name, and a lease left behind would have
-		// startup recovery unbind it from a guest that could not be stopped.
+		// Cleared on every return, a failed create's too: a lease left behind
+		// would have startup recovery unbind the device from a guest that
+		// could not be stopped. The release below is the one that runs only
+		// off a guest that is not running.
 		defer devFinish()
+		defer func() {
+			if !pciHeld {
+				s.releaseAllocatedDevices(ctx, "create", spec.Name, pciAddrs)
+			}
+		}()
 		for _, addr := range pciAddrs {
 			vmCfg.Hostdevs = append(vmCfg.Hostdevs, lv.HostdevConfig{Address: addr})
 		}
@@ -1521,10 +1532,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			return fmt.Errorf("%w; %s, so the disks at this create's paths were not touched", cause, why)
 		}
 		if !s.virt.DomainExists(spec.Name) {
+			pciHeld = false
 			return gone(fmt.Sprintf("domain %s no longer exists on %s", spec.Name, s.hostName))
 		}
 		x, xerr := s.virt.DumpXMLInactive(spec.Name)
 		if xerr != nil && lv.IsNotFound(xerr) && !s.virt.DomainExists(spec.Name) {
+			pciHeld = false
 			return gone(fmt.Sprintf("domain %s no longer exists on %s", spec.Name, s.hostName))
 		}
 		u := domainUUIDFromXML(x)
@@ -1554,6 +1567,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			}
 		}
 		noteUndo("domain stopped")
+		pciHeld = false // stopped: its devices go back
 		// While the stopped domain is still defined: the disks and seed
 		// this create made, and the vars its start made, at the domain's
 		// path and at the name-keyed path a Secure Boot or vTPM domain uses.
@@ -1612,6 +1626,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// create's guards, not records an earlier one of the name left.
 	defer s.noteCreatingIncarnation(spec.Name, spec.Uuid)()
 
+	pciHeld = true
 	if err := s.virt.StartDomain(spec.Name); err != nil {
 		// A failed first boot must not strand the domain, disks or TPM/NVRAM (G1).
 		return nil, status.Errorf(codes.Internal, "%v", abortDefined(fmt.Errorf("start domain: %w", err)))

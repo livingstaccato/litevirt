@@ -39,5 +39,11 @@ func TestMain(m *testing.M) {
 	} else if err != nil && !os.IsNotExist(err) {
 		panic(err)
 	}
+	if err := os.RemoveAll(dir); err != nil {
+		fmt.Fprintf(os.Stderr, "fleet network tripwire cleanup: %v\n", err)
+		if rc == 0 {
+			rc = 1
+		}
+	}
 	os.Exit(rc)
 }

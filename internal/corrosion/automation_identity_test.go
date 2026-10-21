@@ -321,6 +321,17 @@ func automationTypedHistoryFixture(t *testing.T, a, b, c *claimTestVoter, verifi
 // its certificate. It never supplies a fresh class permit or reducer result.
 func automationTypedHistoryFixtureWithDecision(t *testing.T, a, b, c *claimTestVoter, verifier *ClaimVerifier, change func(*contract.Decision)) {
 	t.Helper()
+	automationTypedHistoryFixtureThroughDecision(t, a, b, c, verifier, change, 12)
+}
+
+// The sequence11 boundary retains genuinely signed enrollment before adoption.
+// Existing callers retain the complete sequence12 fixture without variation.
+func automationTypedHistoryFixtureThroughDecision(t *testing.T, a, b, c *claimTestVoter, verifier *ClaimVerifier, change func(*contract.Decision), through uint64) {
+	t.Helper()
+	if through != 11 && through != 12 {
+		t.Fatal("unsupported typed history boundary", through)
+	}
+	t.Helper()
 	initial := sharedAutomationRecord(t, 1, "", "initialize", "initialize-op", a, b)
 	if _, err := applySharedAutomation(t, a.c, initial, contract.Reduce, automationFreshAnchor); err != nil {
 		t.Fatal(err)
@@ -433,5 +444,7 @@ func automationTypedHistoryFixtureWithDecision(t *testing.T, a, b, c *claimTestV
 	migrationAssignment := contract.Assignment{Version: 1, ClusterUID: "established-cluster", OperationID: "migration-op", RecordedAt: "2026-10-17T00:00:00Z", Identity: &contract.IdentityAssignment{UID: "legacy-uid", Generation: 1, Enrollment: &contract.IdentityEnrollmentFacts{Version: 1, EvidenceID: migration.EvidenceID, ClusterUID: "established-cluster", ProjectUID: "project-uid", Kind: "vm", Alias: migration.Alias, Witness: migration.Witness, CoverageDigest: strings.Repeat("f", 64), FenceSequence: 1, VM: &contract.VMEnrollmentRuntime{Version: 1, DomainUUID: "legacy-domain", Incarnation: "legacy-incarnation", Revision: "legacy-revision"}}}}
 	encodedAssignment, _ := json.Marshal(migrationAssignment)
 	appendDecision(contract.Decision{Sequence: 11, Command: contract.Command{Kind: "assign_identity", ClusterUID: "established-cluster", ProjectUID: "project-uid", PrincipalID: "host", RequestID: "migration-request", Body: encodedBody}, Assignment: encodedAssignment})
-	ownership(12, "adopt_resource", "legacy-uid", "legacy-machine", "legacy-revision", "legacy-incarnation", "migration-op", "legacy-key", nil)
+	if through == 12 {
+		ownership(12, "adopt_resource", "legacy-uid", "legacy-machine", "legacy-revision", "legacy-incarnation", "migration-op", "legacy-key", nil)
+	}
 }

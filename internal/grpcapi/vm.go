@@ -5098,6 +5098,12 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		return client.RebuildVM(ctx, req)
 	}
 
+	// Definite retained ownership refuses before even LUN admission. Nil is only
+	// absence of a local negative refusal, never an ordered effect permit.
+	if err := s.retainedManagedRebuildRefusal(ctx, req.Name); err != nil {
+		return nil, err
+	}
+
 	// Required, not only the guard (spec §6.9): rebuild deletes the disks
 	// after an undefine whose refusal it ignores.
 	if err := s.firmwareMoveRefusal("rebuild", vm); err != nil {

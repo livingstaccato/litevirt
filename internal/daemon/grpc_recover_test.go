@@ -77,3 +77,22 @@ func TestServerInterceptors_HandlerPanicAnswersInternal(t *testing.T) {
 		t.Fatalf("stream panic: err = %v, want Internal", err)
 	}
 }
+
+// The recovery interceptor must come first in the chain, so a panic in any
+// interceptor after it is answered too. A nil grpcapi.Server panics inside the
+// auth interceptor, after the metrics one; with recovery anywhere but first
+// that panic ends this test binary.
+func TestServerInterceptors_RecoveryIsFirst(t *testing.T) {
+	m := unregisteredRPCMetrics()
+	var svc *grpcapi.Server
+	uinfo := &grpc.UnaryServerInfo{FullMethod: "/litevirt.v1.LiteVirt/ListVMs"}
+	unary := chainUnary(serverUnaryInterceptors(m, svc), uinfo, func(context.Context, any) (any, error) { return nil, nil })
+	if _, err := unary(context.Background(), nil); status.Code(err) != codes.Internal {
+		t.Fatalf("a panic in the auth interceptor: err = %v, want Internal", err)
+	}
+	sinfo := &grpc.StreamServerInfo{FullMethod: "/litevirt.v1.LiteVirt/ListVMs"}
+	stream := chainStream(serverStreamInterceptors(m, svc), sinfo, func(any, grpc.ServerStream) error { return nil })
+	if err := stream(nil, ctxStream{ctx: context.Background()}); status.Code(err) != codes.Internal {
+		t.Fatalf("a panic in the stream auth interceptor: err = %v, want Internal", err)
+	}
+}

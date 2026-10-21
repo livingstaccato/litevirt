@@ -203,21 +203,24 @@ func (c *Client) residualIsTrackedTies(ctx context.Context, st syncTable, inPull
 	}
 
 	c.mu.RLock()
+	held := &heldLock{unlock: c.mu.RUnlock}
+	defer held.release()
 	rows, err := c.db.QueryContext(ctx, "SELECT * FROM "+st.Name)
 	if err != nil {
-		c.mu.RUnlock()
+		held.release()
 		return TableDigest{}, nil, false
 	}
+	defer rows.Close()
 	cols, err := rows.Columns()
 	if err != nil || !sameColumns(cols, st.Columns) {
 		rows.Close()
-		c.mu.RUnlock()
+		held.release()
 		return TableDigest{}, nil, false
 	}
 	pkIdx := columnIndexes(cols, pkCols)
 	if len(pkIdx) != len(pkCols) {
 		rows.Close()
-		c.mu.RUnlock()
+		held.release()
 		return TableDigest{}, nil, false
 	}
 	wantV2 := c.digestV2On()
@@ -230,7 +233,7 @@ func (c *Client) residualIsTrackedTies(ctx context.Context, st syncTable, inPull
 	if inPull != nil {
 		if keyIdx = columnIndexes(cols, bucketKeyColumns(st.Name)); len(keyIdx) == 0 {
 			rows.Close()
-			c.mu.RUnlock()
+			held.release()
 			return TableDigest{}, nil, false
 		}
 	}
@@ -286,7 +289,7 @@ func (c *Client) residualIsTrackedTies(ctx context.Context, st syncTable, inPull
 	}
 	rowsErr := rows.Err()
 	rows.Close()
-	c.mu.RUnlock()
+	held.release()
 	if !scanOK || rowsErr != nil || len(byPK) != len(st.Rows) {
 		return TableDigest{}, nil, false
 	}

@@ -9,7 +9,6 @@ package watchdog
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"os"
 	"strings"
@@ -19,13 +18,14 @@ import (
 )
 
 const (
-	// defaultDev is the standard Linux watchdog device.
-	defaultDev = "/dev/watchdog"
 	// keepaliveByte is written each interval to reset the watchdog timer.
 	keepaliveByte = byte('1')
 	// defaultInterval is how often to write; should be < hardware timeout / 2.
 	defaultInterval = 15 * time.Second
 )
+
+// defaultDev is the standard Linux watchdog device (a var for tests).
+var defaultDev = "/dev/watchdog"
 
 // Controller trips Heartbeat into SELF-FENCE mode: stop writing keepalives and do
 // NOT disarm, so the hardware watchdog times out and reboots the host. Used when a
@@ -49,12 +49,8 @@ type Controller struct {
 	// reads none. Set once, before Heartbeat starts.
 	runDir string
 
-	// Liveness gate (SetDBProbe, SetPauserTick): Heartbeat pets only while
-	// both report recently. Guarded by livenessMu.
-	livenessMu sync.RWMutex
-	dbProbe    func(context.Context) error
-	pauserTick func() time.Time
-	staleAfter time.Duration
+	// live is the liveness gate's wiring (liveness.go).
+	live livenessWiring
 }
 
 // SetRunDir names the tmpfs directory for the self-fence marker. A self-fence
@@ -65,61 +61,6 @@ func (c *Controller) SetRunDir(dir string) {
 	if c != nil {
 		c.runDir = dir
 	}
-}
-
-// SetDBProbe wires a bounded database round trip (a Query under a short
-// timeout). Heartbeat runs it every pet interval and stops petting once no
-// round trip has completed for the stale threshold: a daemon wedged on its
-// state store (a lock left held) answers no probe and runs no pause, and must
-// not live on behind a petted watchdog. A round trip that returns an error
-// still counts: a disk error is not a wedge, and has its own handling.
-func (c *Controller) SetDBProbe(fn func(context.Context) error) {
-	if c == nil {
-		return
-	}
-	c.livenessMu.Lock()
-	c.dbProbe = fn
-	c.livenessMu.Unlock()
-}
-
-// SetPauserTick wires the partition pauser's last completed tick. Heartbeat
-// stops petting once it is older than the stale threshold. A zero time (the
-// pauser has not started) gates nothing.
-func (c *Controller) SetPauserTick(fn func() time.Time) {
-	if c == nil {
-		return
-	}
-	c.livenessMu.Lock()
-	c.pauserTick = fn
-	c.livenessMu.Unlock()
-}
-
-// livenessStaleAfter is how long the DB round trip or the pauser tick may go
-// without completing before Heartbeat stops petting: twice the hardware
-// timeout it sets (2 x 60 s with the default 15 s interval). A healthy
-// pauser completes a pass every second (partitionPauseTick), each bounded by
-// its 5 s execution budget, and a healthy DB probe completes in milliseconds
-// every interval; 120 s is eight missed probes and over twenty times the
-// longest healthy pass, so ordinary load does not reach it. A real wedge
-// reboots the host within 2 x 60 s + 60 s = 3 min.
-func livenessStaleAfter(interval time.Duration) time.Duration {
-	return 2 * time.Duration(watchdogTimeoutSec(interval)) * time.Second
-}
-
-// setStaleAfterForTest shortens the threshold.
-func (c *Controller) setStaleAfterForTest(d time.Duration) {
-	c.livenessMu.Lock()
-	c.staleAfter = d
-	c.livenessMu.Unlock()
-}
-
-func (c *Controller) liveness() (func(context.Context) error, func() time.Time, time.Duration) {
-	if c == nil {
-		return nil, nil, 0
-	}
-	c.livenessMu.RLock()
-	defer c.livenessMu.RUnlock()
-	return c.dbProbe, c.pauserTick, c.staleAfter
 }
 
 // SetOwnershipCheck wires the local-ownership probe consulted at graceful
@@ -342,45 +283,6 @@ func Heartbeat(ctx context.Context, devPath string, interval time.Duration, ctrl
 	HeartbeatFrom(ctx, devPath, interval, ctrl, nil)
 }
 
-// runDB runs probe every interval for as long as ctx lasts, recording when
-// each round trip completed. It runs the probe synchronously: a probe that
-// never returns is exactly what lastOK going stale reports.
-func runDB(ctx context.Context, probe func(context.Context) error, interval time.Duration, lastOK *atomic.Int64) {
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			pctx, cancel := context.WithTimeout(ctx, interval/3)
-			err := probe(pctx)
-			cancel()
-			if err != nil && ctx.Err() == nil {
-				slog.Warn("watchdog: liveness DB round trip returned an error (counted as live)", "error", err)
-			}
-			lastOK.Store(time.Now().UnixNano())
-		}
-	}
-}
-
-// staleReason says why the daemon is not live, or "".
-func staleReason(now time.Time, dbStarted bool, lastDB int64, pauserTick func() time.Time, stale time.Duration) string {
-	if dbStarted {
-		if age := now.Sub(time.Unix(0, lastDB)); age > stale {
-			return fmt.Sprintf("no database round trip has completed for %s", age.Round(time.Second))
-		}
-	}
-	if pauserTick != nil {
-		if at := pauserTick(); !at.IsZero() {
-			if age := now.Sub(at); age > stale {
-				return fmt.Sprintf("the partition pauser has not completed a tick for %s", age.Round(time.Second))
-			}
-		}
-	}
-	return ""
-}
-
 // HeartbeatFrom is Heartbeat continuing on the descriptor boot already holds
 // (KeepBootAlive), so the device is never closed between boot petting and the
 // heartbeat. A nil or already-taken keeper opens the device as Heartbeat does.
@@ -456,7 +358,7 @@ func HeartbeatFrom(ctx context.Context, devPath string, interval time.Duration, 
 	// UNCONFIRMABLE demotion self-fences (vs. staying up + raising HA-degraded); it does NOT
 	// gate self-demotion itself, which runs regardless of any watchdog. Keep petting whatever
 	// is open (so a softdog doesn't fire spuriously), but leave armed=false otherwise.
-	if hw, id := isHardwareWatchdog(f.Fd()); !hw {
+	if hw, id := isHardwareWatchdogFn(f.Fd()); !hw {
 		slog.Error("watchdog is NOT a trusted hardware watchdog (softdog/unknown); self-fencing is not guaranteed — this host stays not-armed, so a demotion failure raises HA-degraded instead of self-fencing (it still self-demotes on quorum loss)",
 			"dev", devPath, "identity", id)
 	} else {
@@ -472,7 +374,7 @@ func HeartbeatFrom(ctx context.Context, devPath string, interval time.Duration, 
 		// of self-fencing), never a silent false-positive.
 		armWatchdog(f.Fd(), watchdogTimeoutSec(interval))
 		_ = pet()
-		if left, ok := watchdogTimeLeft(f.Fd()); ok && left > 0 {
+		if left, ok := watchdogTimeLeftFn(f.Fd()); ok && left > 0 {
 			slog.Info("hardware watchdog armed (self-fencing available; timer verified counting)", "dev", devPath, "identity", id, "timeleft_s", left)
 			if ctrl != nil {
 				ctrl.armed.Store(true)
@@ -541,20 +443,10 @@ func HeartbeatFrom(ctx context.Context, devPath string, interval time.Duration, 
 
 	slog.Info("watchdog heartbeat started", "dev", devPath, "interval", interval)
 
-	// Liveness gate: the DB round trip and the partition pauser's tick.
-	var lastDB atomic.Int64
-	lastDB.Store(time.Now().UnixNano())
-	probe, pauserTick, stale := ctrl.liveness()
-	if stale <= 0 {
-		stale = livenessStaleAfter(interval)
-	}
-	dbStarted := false
-	liveCtx, stopLive := context.WithCancel(ctx)
-	defer stopLive()
-	if probe != nil {
-		dbStarted = true
-		go runDB(liveCtx, probe, interval, &lastDB)
-	}
+	// Liveness gate (liveness.go): only on a configured, verified, armed
+	// watchdog.
+	gate := ctrl.startLivenessGate(ctx, interval, configured && ctrl.Armed())
+	defer gate.stop()
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -570,13 +462,10 @@ func HeartbeatFrom(ctx context.Context, devPath string, interval time.Duration, 
 			slog.Error("watchdog SELF-FENCE tripped — halting keepalives so the hardware watchdog reboots this host")
 			return
 		case <-ticker.C:
-			if _, pt, _ := ctrl.liveness(); pt != nil {
-				pauserTick = pt // wired after the heartbeat started
-			}
-			if why := staleReason(time.Now(), dbStarted, lastDB.Load(), pauserTick, stale); why != "" {
+			if why := gate.check(); why != "" {
 				fenced = true
 				slog.Error("watchdog: this daemon is wedged — SELF-FENCING: halting keepalives so the hardware watchdog reboots this host",
-					"reason", why, "threshold", stale)
+					"reason", why, "threshold", gate.stale)
 				ctrl.SelfFence()
 				return
 			}

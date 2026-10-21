@@ -32,7 +32,7 @@ func returnsWithin(t *testing.T, d time.Duration, what string, fn func() error) 
 			t.Fatalf("%s: %v", what, err)
 		}
 	case <-time.After(d):
-		t.Fatalf("WEDGED: %s still blocked on the corrosion client's lock %s after a recovered panic", what, d)
+		t.Fatalf("WEDGED: %s still blocked %s after a recovered panic (a held lock or an open write transaction)", what, d)
 	}
 }
 
@@ -43,13 +43,18 @@ func returnsWithin(t *testing.T, d time.Duration, what string, fn func() error) 
 // the partition pauser parked on their first read, and the daemon lived on as
 // a zombie that answered nothing and never paused.
 //
-// Mutation: drop the deferred release (heldLock) in ExecuteEntriesGuarded or
-// executeBatchInternal and the matching case goes red.
+// Mutations: drop the deferred release (heldLock) in ExecuteEntriesGuarded or
+// executeBatchInternal, or either deferred tx.Rollback, and the matching case
+// goes red.
 func TestRecoveredPanicUnderClientLock_LeavesTheDBUsable(t *testing.T) {
 	info := &grpc.UnaryServerInfo{FullMethod: "/litevirt.v1.LiteVirt/StartVM"}
 	cases := map[string]func(ctx context.Context, db *corrosion.Client) error{
 		"guard panics (ExecuteEntriesGuarded)": func(ctx context.Context, db *corrosion.Client) error {
-			_, err := db.ExecuteBatchGuarded(ctx, func(*sql.Tx) (bool, error) {
+			_, err := db.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+				// A write first, so the open transaction holds the write lock.
+				if _, err := tx.ExecContext(ctx, `UPDATE hosts SET address = '10.0.0.2' WHERE name = 'nobody'`); err != nil {
+					return false, err
+				}
 				var m map[string]int
 				m["guard bug"]++
 				return true, nil
@@ -57,17 +62,17 @@ func TestRecoveredPanicUnderClientLock_LeavesTheDBUsable(t *testing.T) {
 			return err
 		},
 		"statement panics (executeBatchInternal)": func(ctx context.Context, db *corrosion.Client) error {
-			return db.ExecuteBatch(ctx, []corrosion.Statement{{
-				SQL:    `UPDATE hosts SET address = ? WHERE name = 'nobody'`,
-				Params: []interface{}{panicValuer{}},
-			}})
+			return db.ExecuteBatch(ctx, []corrosion.Statement{
+				{SQL: `UPDATE hosts SET address = ? WHERE name = 'nobody'`, Params: []interface{}{"10.0.0.2"}},
+				{SQL: `UPDATE hosts SET address = ? WHERE name = 'nobody'`, Params: []interface{}{panicValuer{}}},
+			})
 		},
 		"statement panics (guarded)": func(ctx context.Context, db *corrosion.Client) error {
 			_, err := db.ExecuteBatchGuarded(ctx, func(*sql.Tx) (bool, error) { return true, nil },
-				[]corrosion.Statement{{
-					SQL:    `UPDATE hosts SET address = ? WHERE name = 'nobody'`,
-					Params: []interface{}{panicValuer{}},
-				}})
+				[]corrosion.Statement{
+					{SQL: `UPDATE hosts SET address = ? WHERE name = 'nobody'`, Params: []interface{}{"10.0.0.2"}},
+					{SQL: `UPDATE hosts SET address = ? WHERE name = 'nobody'`, Params: []interface{}{panicValuer{}}},
+				})
 			return err
 		},
 	}
@@ -75,6 +80,9 @@ func TestRecoveredPanicUnderClientLock_LeavesTheDBUsable(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			db := corrosion.NewTestClientT(t)
 			ctx := context.Background()
+			if err := corrosion.InitSchema(ctx, db); err != nil {
+				t.Fatal(err)
+			}
 			_, err := RecoverUnaryInterceptor(ctx, nil, info, func(ctx context.Context, _ any) (any, error) {
 				return nil, write(ctx, db)
 			})
@@ -85,9 +93,17 @@ func TestRecoveredPanicUnderClientLock_LeavesTheDBUsable(t *testing.T) {
 				_, err := db.Query(ctx, "SELECT 1")
 				return err
 			})
-			returnsWithin(t, 3*time.Second, "a later write", func() error {
+			returnsWithin(t, 3*time.Second, "a later guarded write", func() error {
 				_, err := db.ExecuteBatchGuarded(ctx, func(*sql.Tx) (bool, error) { return false, nil }, nil)
 				return err
+			})
+			// A write that takes the database's write lock, under a context
+			// nothing cancels: the panicked transaction must have been rolled
+			// back (the deferred tx.Rollback), not left open holding it.
+			returnsWithin(t, 3*time.Second, "a later write under context.Background", func() error {
+				return db.ExecuteBatch(context.Background(), []corrosion.Statement{{
+					SQL: `UPDATE hosts SET address = ? WHERE name = 'nobody'`, Params: []interface{}{"10.0.0.1"},
+				}})
 			})
 		})
 	}

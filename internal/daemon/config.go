@@ -23,6 +23,7 @@ import (
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/obs"
 	"github.com/litevirt/litevirt/internal/pbsstore"
+	"github.com/litevirt/litevirt/internal/watchdog"
 )
 
 const defaultConfigPath = "/etc/litevirt/config.yaml"
@@ -346,11 +347,22 @@ type WatchdogConfig struct {
 	// BootKeeperMaxSec: each boot pets for at most this long before it must
 	// reach the heartbeat (a hung boot). Default 120.
 	BootKeeperMaxSec int `yaml:"boot_keeper_max_sec"`
+	// LivenessStaleSec: on a configured, verified, armed watchdog, the
+	// heartbeat stops petting, and self-fences, once neither a state-store
+	// round trip nor the partition pauser has made progress for this long.
+	// Default 120; 0 turns the gate off; otherwise at least 120 (twice the
+	// hardware timeout).
+	LivenessStaleSec int `yaml:"liveness_stale_sec"`
 }
 
 func (w WatchdogConfig) validate() error {
 	if w.BootKeeperStreakWindowSec < 0 || w.BootKeeperMaxBoots < 0 || w.BootKeeperMaxSec < 0 {
 		return fmt.Errorf("watchdog.boot_keeper_*: values must not be negative (0 turns the boot keeper off)")
+	}
+	if min := int(watchdog.MinLivenessStale / time.Second); w.LivenessStaleSec < 0 ||
+		(w.LivenessStaleSec > 0 && w.LivenessStaleSec < min) {
+		return fmt.Errorf("watchdog.liveness_stale_sec: %d must be 0 (off) or at least %d, twice the hardware watchdog timeout",
+			w.LivenessStaleSec, min)
 	}
 	return nil
 }
@@ -1044,7 +1056,7 @@ func LoadConfig() (*Config, error) {
 
 		ContainerRestoreTimeoutSec: 600,
 
-		Watchdog: WatchdogConfig{BootKeeperStreakWindowSec: 300, BootKeeperMaxBoots: 5, BootKeeperMaxSec: 120},
+		Watchdog: WatchdogConfig{BootKeeperStreakWindowSec: 300, BootKeeperMaxBoots: 5, BootKeeperMaxSec: 120, LivenessStaleSec: 120},
 
 		Containers: ContainersConfig{DefaultPidsMax: 4096, IDMapBase: 1_000_000_000, IDMapRanges: 30000, IDMappedRootfs: "auto"},
 

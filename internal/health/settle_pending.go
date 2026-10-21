@@ -433,7 +433,10 @@ func (w *settleRecorder) raise(ctx context.Context, rec settlePending) error {
 // a stop this run proved counts even when that save failed, and the save is
 // retried on every pass until it holds. A stopping-phase
 // record that already wrote part of its record was proven then.
-func (w *settleRecorder) retry(ctx context.Context, kind string, state func(name string) (settleCopyState, string)) {
+//
+// more, when not nil, is asked before each record and stops the pass when it
+// says no; the records not reached wait for the next pass.
+func (w *settleRecorder) retry(ctx context.Context, kind string, state func(name string) (settleCopyState, string), more func() bool) {
 	store := w.store()
 	recs, err := store.list(kind)
 	if err != nil {
@@ -441,6 +444,9 @@ func (w *settleRecorder) retry(ctx context.Context, kind string, state func(name
 		return
 	}
 	for i := range recs {
+		if more != nil && !more() {
+			return
+		}
 		rec := &recs[i]
 		if rec.Host != w.host {
 			w.noteForeign(*rec)
@@ -552,7 +558,7 @@ func (r *Reconciler) retryPendingSettles(ctx context.Context, localDomains []str
 	}
 	r.settleRec().retry(ctx, PauseKindVM, func(name string) (settleCopyState, string) {
 		return vmSettleCopyState(defined, r.virt.DomainStateReason, name)
-	})
+	}, nil)
 }
 
 // settleRec is the reconciler's settle recorder, built on first use.
@@ -619,8 +625,8 @@ func (p *PartitionPauser) ctSettleCopyState(ctx context.Context, name string) (s
 
 // retryPendingSettles completes this host's container settle records
 // (settleRecorder.retry).
-func (p *PartitionPauser) retryPendingSettles(ctx context.Context) {
+func (p *PartitionPauser) retryPendingSettles(ctx context.Context, passStart time.Time) {
 	p.settleRec().retry(ctx, PauseKindContainer, func(name string) (settleCopyState, string) {
 		return p.ctSettleCopyState(ctx, name)
-	})
+	}, func() bool { return p.passBudgetLeft(passStart) })
 }

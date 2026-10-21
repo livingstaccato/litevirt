@@ -93,7 +93,7 @@ func markSelfFenced(runDir, why string) {
 	}
 	if err := os.MkdirAll(runDir, 0o755); err == nil {
 		err = os.WriteFile(filepath.Join(runDir, selfFenceMarkerName),
-			[]byte(fmt.Sprintf("%s %s\n", time.Now().UTC().Format(time.RFC3339), why)), 0o644)
+			[]byte(fmt.Sprintf("%s %s\n", wallNow().UTC().Format(time.RFC3339), why)), 0o644)
 		if err == nil {
 			return
 		}

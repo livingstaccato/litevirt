@@ -328,7 +328,7 @@ type PartitionPauser struct {
 	now          func() time.Time
 	after        time.Duration
 	tick         time.Duration
-	lastTick     atomic.Int64 // unix nanos; LastTick
+	progress     atomic.Uint64 // Progress
 
 	mu sync.Mutex
 	// samples are this pass's and earlier passes' quorum readings inside the
@@ -464,7 +464,7 @@ func (p *PartitionPauser) Records() ([]PauseRecord, error) { return p.store.list
 
 // Start runs the monitor until ctx ends.
 func (p *PartitionPauser) Start(ctx context.Context) {
-	p.lastTick.Store(time.Now().UnixNano())
+	p.noteProgress()
 	t := time.NewTicker(p.tick)
 	defer t.Stop()
 	for {
@@ -473,20 +473,38 @@ func (p *PartitionPauser) Start(ctx context.Context) {
 			return
 		case <-t.C:
 			p.Evaluate(ctx)
-			p.lastTick.Store(time.Now().UnixNano())
+			p.noteProgress()
 		}
 	}
 }
 
-// LastTick is when Start last completed a pass (or started), zero before it
-// starts. The watchdog heartbeat stops petting when it goes stale: a pauser
-// that is wedged can neither pause nor self-fence, so the hardware watchdog
-// has to (watchdog.Controller.SetPauserTick).
-func (p *PartitionPauser) LastTick() time.Time {
-	if n := p.lastTick.Load(); n != 0 {
-		return time.Unix(0, n)
+// Progress counts the pauser's units of work: its start, every pass, and
+// every record a pass handles. Zero before Start. The watchdog's liveness
+// gate self-fences when it stands still too long (watchdog.Controller.
+// SetPauserProgress): a pauser that is wedged can neither pause nor
+// self-fence, so the hardware watchdog has to. A counter, not a timestamp, so
+// a wall-clock step is not a wedge, and a long pass that moves is not one
+// either.
+func (p *PartitionPauser) Progress() uint64 { return p.progress.Load() }
+
+func (p *PartitionPauser) noteProgress() { p.progress.Add(1) }
+
+// partitionResumePassBudget bounds the resume and settle work of one pass.
+// Each record's work is bounded by its own call timeouts (a container settle
+// at most about 33 s), but nothing bounded their sum: after a heal, a pass
+// over a dozen relocated containers could run for minutes. What is not
+// reached before the budget is spent is left exactly as it was, still paused,
+// for the next pass.
+var partitionResumePassBudget = 30 * time.Second
+
+// passBudgetLeft reports whether a pass begun at start may take on another
+// record, and counts the record as progress when it may.
+func (p *PartitionPauser) passBudgetLeft(start time.Time) bool {
+	if time.Since(start) >= partitionResumePassBudget {
+		return false
 	}
-	return time.Time{}
+	p.noteProgress()
+	return true
 }
 
 // Evaluate is one pass. The quorum readings of the last 2·T_pause are kept,
@@ -873,9 +891,12 @@ func (p *PartitionPauser) stillPausedByUs(rec PauseRecord) (bool, string) {
 
 // tryResume runs the resume checks over every record (§3.5).
 func (p *PartitionPauser) tryResume(ctx context.Context, now time.Time) {
+	// One budget for the whole resume and settle tail (time.Now: monotonic,
+	// unlike p.now).
+	passStart := time.Now()
 	// First, the record of any container settle not yet fully written: it
 	// may drop the pause record of the copy it settled.
-	p.retryPendingSettles(ctx)
+	p.retryPendingSettles(ctx, passStart)
 	recs, err := p.store.list()
 	if err != nil {
 		slog.Error("partition-pause: cannot read the pause records; nothing is resumed", "host", p.host, "error", err)
@@ -886,7 +907,12 @@ func (p *PartitionPauser) tryResume(ctx context.Context, now time.Time) {
 		return
 	}
 	var candidates []PauseRecord
+	deferred := 0
 	for _, rec := range recs {
+		if !p.passBudgetLeft(passStart) {
+			deferred++
+			continue
+		}
 		if ok, why := p.stillPausedByUs(rec); !ok {
 			// Resumed or stopped by someone else, gone, or replaced: the record
 			// would only keep partition_paused open and offer a stale epoch.
@@ -937,10 +963,18 @@ func (p *PartitionPauser) tryResume(ctx context.Context, now time.Time) {
 				case !v.OK:
 					p.hold(rec, v.Reason)
 				default:
+					if !p.passBudgetLeft(passStart) {
+						deferred++
+						continue
+					}
 					p.resume(ctx, rec, v.Reason)
 				}
 			}
 		}
+	}
+	if deferred > 0 {
+		slog.Info("partition-pause: this pass spent its budget; the rest stay paused for the next pass",
+			"host", p.host, "deferred", deferred, "budget", partitionResumePassBudget)
 	}
 	p.syncPausedCondition(ctx, "")
 }

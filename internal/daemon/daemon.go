@@ -212,6 +212,25 @@ func New(cfg *Config) (*Daemon, error) {
 	)
 }
 
+// wireWatchdog wires the heartbeat's controller before the heartbeat starts:
+// the self-fence marker's directory, so a restarted daemon cannot cancel the
+// reboot, and the liveness gate's DB round trip and threshold
+// (watchdog.liveness_stale_sec; 0 turns the gate off). The pauser joins the
+// gate once it exists (wirePauserLiveness).
+func (d *Daemon) wireWatchdog(ctrl *watchdog.Controller) {
+	ctrl.SetRunDir(d.watchdogRunDir)
+	ctrl.SetLivenessStale(time.Duration(d.cfg.Watchdog.LivenessStaleSec) * time.Second)
+	ctrl.SetDBProbe(func(ctx context.Context) error {
+		_, err := d.db.Query(ctx, "SELECT 1")
+		return err
+	})
+}
+
+// wirePauserLiveness adds the partition pauser's progress to the gate.
+func wirePauserLiveness(ctrl *watchdog.Controller, pauser *health.PartitionPauser) {
+	ctrl.SetPauserProgress(pauser.Progress)
+}
+
 // bootKeeperOptions are the boot keeper's bounds (watchdog.boot_keeper_*).
 func bootKeeperOptions(cfg *Config) watchdog.BootOptions {
 	return watchdog.BootOptions{
@@ -1130,15 +1149,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		return false
 	})
-	// A self-fence is recorded where a restarted daemon finds it, so the
-	// restart cannot cancel the reboot.
-	watchdogCtrl.SetRunDir(d.watchdogRunDir)
-	// Liveness gate: a daemon wedged on its state store stops petting
-	// (the pauser's tick joins once it starts, below).
-	watchdogCtrl.SetDBProbe(func(ctx context.Context) error {
-		_, err := d.db.Query(ctx, "SELECT 1")
-		return err
-	})
+	d.wireWatchdog(watchdogCtrl)
 	// Continue on the descriptor boot has been petting (bootUnderWatchdog), so
 	// the device is never closed between the two. Taken here, not in the
 	// goroutine, so the deferred Abandon cannot race it.
@@ -1884,7 +1895,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	pauser.SetSettleVerifier(svc.VerifySettleProof)
 	pauser.SetPeerRuntimeChecker(svc.CheckPeerContainerRuntime)
 	pauser.SetSelfFence(watchdogCtrl.Armed, watchdogCtrl.SelfFence)
-	watchdogCtrl.SetPauserTick(pauser.LastTick)
+	wirePauserLiveness(watchdogCtrl, pauser)
 	go pauser.Start(ctx)
 	// Persistent HA-degraded surface (unsupported member / unfenced demotion failure / VIP
 	// with no holder) — a durable alertable status + transition events.

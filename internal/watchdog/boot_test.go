@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -236,26 +237,54 @@ func TestSelfFenceMarker_BlocksPetting(t *testing.T) {
 	}
 }
 
-// A daemon wedged on its state store stops petting and self-fences; one whose
-// round trips complete keeps petting. Likewise the partition pauser's tick.
-//
-// Mutation: make staleReason return "" and the wedged cases go red.
-func TestHeartbeat_LivenessGate(t *testing.T) {
-	run := func(t *testing.T, setup func(*Controller)) (string, *Controller) {
-		dev := fakeWatchdog(t, "")
-		ctrl := NewController()
-		ctrl.SetRunDir(t.TempDir())
-		ctrl.setStaleAfterForTest(100 * time.Millisecond)
-		setup(ctrl)
-		ctx, cancel := context.WithCancel(context.Background())
-		t.Cleanup(cancel)
-		go HeartbeatFrom(ctx, dev, 10*time.Millisecond, ctrl, nil)
-		return dev, ctrl
+// verifiedDevice makes HeartbeatFrom treat the fake device as a verified,
+// counting hardware watchdog, so the liveness gate applies.
+func verifiedDevice(t *testing.T) {
+	oldHW, oldLeft := isHardwareWatchdogFn, watchdogTimeLeftFn
+	isHardwareWatchdogFn = func(uintptr) (bool, string) { return true, "test watchdog" }
+	watchdogTimeLeftFn = func(uintptr) (int, bool) { return 60, true }
+	t.Cleanup(func() { isHardwareWatchdogFn, watchdogTimeLeftFn = oldHW, oldLeft })
+}
+
+// runGate runs a heartbeat on a fake device with a 100 ms liveness threshold.
+func runGate(t *testing.T, dev string, setup func(*Controller)) *Controller {
+	ctrl := NewController()
+	ctrl.SetRunDir(t.TempDir())
+	ctrl.SetLivenessStale(100 * time.Millisecond)
+	setup(ctrl)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	t.Cleanup(func() { cancel(); <-done })
+	go func() { HeartbeatFrom(ctx, dev, 10*time.Millisecond, ctrl, nil); close(done) }()
+	return ctrl
+}
+
+// counter is a progress counter a test moves.
+type counter struct{ n atomic.Uint64 }
+
+func (c *counter) tick(ctx context.Context, every time.Duration) {
+	for {
+		c.n.Add(1)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(every):
+		}
 	}
+}
+
+// A daemon wedged on its state store, or whose pauser stops making progress,
+// stops petting and self-fences on a verified watchdog; one that keeps making
+// progress keeps petting.
+//
+// Mutation: make check return "" and the wedged cases go red.
+func TestHeartbeat_LivenessGate(t *testing.T) {
 	t.Run("wedged DB stops petting", func(t *testing.T) {
+		verifiedDevice(t)
+		dev := fakeWatchdog(t, "")
 		block := make(chan struct{})
 		t.Cleanup(func() { close(block) })
-		dev, ctrl := run(t, func(c *Controller) {
+		ctrl := runGate(t, dev, func(c *Controller) {
 			c.SetDBProbe(func(context.Context) error { <-block; return nil })
 		})
 		time.Sleep(300 * time.Millisecond)
@@ -268,12 +297,14 @@ func TestHeartbeat_LivenessGate(t *testing.T) {
 		if b := readDev(t, dev); bytes.ContainsRune(b, 'V') {
 			t.Fatalf("the liveness fence disarmed the watchdog: %q", b)
 		}
-		if !SelfFenceMarked(ctrl.runDir) {
+		if !SelfFenceMarked(ctrl.RunDir()) {
 			t.Fatal("the liveness fence was not recorded for the next run")
 		}
 	})
 	t.Run("live DB keeps petting", func(t *testing.T) {
-		dev, ctrl := run(t, func(c *Controller) {
+		verifiedDevice(t)
+		dev := fakeWatchdog(t, "")
+		ctrl := runGate(t, dev, func(c *Controller) {
 			c.SetDBProbe(func(context.Context) error { return nil })
 		})
 		time.Sleep(300 * time.Millisecond)
@@ -282,24 +313,121 @@ func TestHeartbeat_LivenessGate(t *testing.T) {
 		}
 	})
 	t.Run("stalled pauser stops petting", func(t *testing.T) {
-		at := time.Now()
-		_, ctrl := run(t, func(c *Controller) {
-			c.SetPauserTick(func() time.Time { return at })
+		verifiedDevice(t)
+		ctrl := runGate(t, fakeWatchdog(t, ""), func(c *Controller) {
+			c.SetPauserProgress(func() uint64 { return 7 })
 		})
 		time.Sleep(300 * time.Millisecond)
 		if !ctrl.Fenced() {
-			t.Fatal("a pauser that stopped ticking did not self-fence")
+			t.Fatal("a pauser that stopped making progress did not self-fence")
+		}
+	})
+	t.Run("moving pauser keeps petting", func(t *testing.T) {
+		verifiedDevice(t)
+		var c counter
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		go c.tick(ctx, 20*time.Millisecond)
+		dev := fakeWatchdog(t, "")
+		ctrl := runGate(t, dev, func(ctrl *Controller) { ctrl.SetPauserProgress(c.n.Load) })
+		time.Sleep(300 * time.Millisecond)
+		if ctrl.Fenced() || !grows(t, dev, 60*time.Millisecond) {
+			t.Fatal("a pauser making progress stopped petting")
 		}
 	})
 	t.Run("pauser not started gates nothing", func(t *testing.T) {
-		dev, ctrl := run(t, func(c *Controller) {
-			c.SetPauserTick(func() time.Time { return time.Time{} })
+		verifiedDevice(t)
+		dev := fakeWatchdog(t, "")
+		ctrl := runGate(t, dev, func(c *Controller) {
+			c.SetPauserProgress(func() uint64 { return 0 })
 		})
 		time.Sleep(300 * time.Millisecond)
 		if ctrl.Fenced() || !grows(t, dev, 60*time.Millisecond) {
 			t.Fatal("a pauser that has not started stopped petting")
 		}
 	})
+	t.Run("threshold off gates nothing", func(t *testing.T) {
+		verifiedDevice(t)
+		dev := fakeWatchdog(t, "")
+		block := make(chan struct{})
+		t.Cleanup(func() { close(block) })
+		ctrl := runGate(t, dev, func(c *Controller) {
+			c.SetLivenessStale(0) // watchdog.liveness_stale_sec: 0
+			c.SetDBProbe(func(context.Context) error { <-block; return nil })
+		})
+		if _, _, stale := ctrl.LivenessWiring(); stale >= 0 {
+			t.Fatalf("liveness_stale_sec 0 left the gate on, at %s", stale)
+		}
+		time.Sleep(300 * time.Millisecond)
+		if ctrl.Fenced() {
+			t.Fatal("the gate fired with liveness_stale_sec 0")
+		}
+	})
+}
+
+// N3: the gate applies only on a configured, verified, armed watchdog, the
+// condition under which the pauser and the VIP demoter self-fence. An
+// unverified device (softdog, a BMC that never starts its timer) and auto
+// mode (watchdog_dev empty) keep petting a wedged daemon, as before the gate.
+//
+// Mutations: drop "configured" or "ctrl.Armed()" from the gate's condition in
+// HeartbeatFrom, and the matching case goes red.
+func TestHeartbeat_LivenessGateOnlyOnAVerifiedConfiguredWatchdog(t *testing.T) {
+	wedged := func(t *testing.T) func(*Controller) {
+		block := make(chan struct{})
+		t.Cleanup(func() { close(block) })
+		return func(c *Controller) { c.SetDBProbe(func(context.Context) error { <-block; return nil }) }
+	}
+	t.Run("unverified device", func(t *testing.T) {
+		dev := fakeWatchdog(t, "") // a regular file: no hardware identity
+		ctrl := runGate(t, dev, wedged(t))
+		time.Sleep(300 * time.Millisecond)
+		if ctrl.Fenced() || !grows(t, dev, 60*time.Millisecond) {
+			t.Fatal("the gate fired on an unverified watchdog")
+		}
+	})
+	t.Run("auto mode", func(t *testing.T) {
+		verifiedDevice(t)
+		dev := fakeWatchdog(t, "")
+		old := defaultDev
+		defaultDev = dev
+		t.Cleanup(func() { defaultDev = old })
+		ctrl := runGate(t, "", wedged(t))
+		time.Sleep(300 * time.Millisecond)
+		if ctrl.Fenced() || !grows(t, dev, 60*time.Millisecond) {
+			t.Fatal("the gate fired in auto mode (watchdog_dev empty)")
+		}
+	})
+}
+
+// N1: a forward step of the wall clock larger than the threshold (an NTP step
+// at boot, a bad RTC, date -s) is not a wedge. The gate times its counters on
+// the monotonic clock and never reads the wall clock.
+//
+// Mutation: time the gate with wallNow instead of monoNow and this goes red.
+func TestHeartbeat_LivenessGateIgnoresWallClockSteps(t *testing.T) {
+	verifiedDevice(t)
+	var step atomic.Int64
+	oldWall := wallNow
+	wallNow = func() time.Time { return time.Now().Add(time.Duration(step.Load())) }
+	t.Cleanup(func() { wallNow = oldWall })
+	var c counter
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	// The counter moves well inside the threshold, but not on every check,
+	// so a step between two checks lands while it stands still.
+	go c.tick(ctx, 100*time.Millisecond)
+	dev := fakeWatchdog(t, "")
+	ctrl := runGate(t, dev, func(ctrl *Controller) {
+		ctrl.SetLivenessStale(400 * time.Millisecond)
+		ctrl.SetPauserProgress(c.n.Load)
+	})
+	time.Sleep(150 * time.Millisecond)
+	step.Store(int64(10 * time.Minute)) // the wall clock jumps 10 minutes ahead
+	time.Sleep(400 * time.Millisecond)
+	if ctrl.Fenced() || !grows(t, dev, 60*time.Millisecond) {
+		t.Fatal("a forward wall-clock step self-fenced a live daemon")
+	}
 }
 
 func TestBootPetInterval_QuarterOfDeviceTimeout(t *testing.T) {

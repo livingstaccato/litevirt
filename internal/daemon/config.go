@@ -18,6 +18,7 @@ import (
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/grpcapi"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/image"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/lxc"
@@ -874,6 +875,23 @@ type EnforcementConfig struct {
 	// once, exactly as before. False on only SOME hosts after the latch is the
 	// hazard, reported in PingResponse.not_enforcing.
 	PartitionPause bool `yaml:"partition_pause,omitempty"`
+	// PartitionPauseRecordFailure: what a partition pause does when its
+	// durable record cannot be written (a full or failing data_dir;
+	// docs/design/partition-pause.md §3.4). The majority relies on the pause,
+	// never on the record, which only decides what this host resumes later.
+	//
+	//   - "pause" (the default, also for ""): pause anyway, keeping the record
+	//     in the reserve when one exists, else in memory, and write it to
+	//     <data_dir>/partition-pause as soon as a write there succeeds. A
+	//     daemon that dies holding a record in memory only leaves its domain
+	//     paused and never resumes it itself.
+	//   - "reserve": the record must be durable first, in the directory or in
+	//     <data_dir>/partition-pause/reserve, a 1 MiB file made in advance that
+	//     only pause records use; with neither writable the pause fails.
+	//   - "self_fence": the directory only, and a write that fails is a failed
+	//     pause (partition_pause_failed, and a self-fence with a verified
+	//     watchdog armed). The behaviour before this key existed.
+	PartitionPauseRecordFailure string `yaml:"partition_pause_record_failure,omitempty"`
 	// IsolationEpoch: activate the §A isolation regime on this host
 	// (capabilities.IsolationEpochV1). With the flag on and the token latched
 	// cluster-wide, this node REFUSES replication from any host recorded with a
@@ -1112,6 +1130,11 @@ func LoadConfig() (*Config, error) {
 	default:
 		return nil, fmt.Errorf("config vm.default_cpu_mode: invalid mode %q: want %s or %s",
 			cfg.VM.DefaultCPUMode, lv.CPUModeHostModel, lv.CPUModeHostPassthrough)
+	}
+
+	if !health.ValidPauseRecordFailure(cfg.Enforcement.PartitionPauseRecordFailure) {
+		return nil, fmt.Errorf("config enforcement.partition_pause_record_failure: %q is not one of pause, reserve, self_fence",
+			cfg.Enforcement.PartitionPauseRecordFailure)
 	}
 
 	switch cfg.UITLS {

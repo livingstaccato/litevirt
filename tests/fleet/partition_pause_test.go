@@ -77,6 +77,7 @@ type ppNode struct {
 	coord   *failover.Coordinator
 	rec     *health.Reconciler
 	pauseOn *atomic.Bool
+	dataDir string
 }
 
 // setPartitionPause is an operator changing enforcement.partition_pause on
@@ -132,6 +133,9 @@ type ppOpts struct {
 	// clocks replaces a node's health-checker clock, before it starts
 	// (frozenClock).
 	clocks map[string]func() time.Time
+	// pauserHook configures a node's pauser before it starts (its
+	// record-failure mode, a full-disk fault, a self-fence stub).
+	pauserHook func(n *Node, p *health.PartitionPauser)
 }
 
 func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
@@ -159,6 +163,9 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		p.SetTimings(ppTPause, 100*time.Millisecond)
 		if o.pauserOnNodeClock {
 			p.SetClock(n.Now)
+		}
+		if o.pauserHook != nil {
+			o.pauserHook(n, p)
 		}
 		go p.Start(ctx)
 
@@ -199,7 +206,7 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		rec.SetSettleVerifier(n.Server.VerifySettleProof)
 		rec.SetPeerRuntimeChecker(n.Server.CheckPeerVMRuntime)
 
-		pn := &ppNode{n: n, chk: chk, pauser: p, coord: coord, rec: rec, pauseOn: on}
+		pn := &ppNode{n: n, chk: chk, pauser: p, coord: coord, rec: rec, pauseOn: on, dataDir: dataDir}
 		s.nodes = append(s.nodes, pn)
 		// Reconcilers tick fast. Coordinators tick at about a second, each at
 		// its own phase: every node holds the lease in its own replica until

@@ -324,9 +324,13 @@ type PartitionPauser struct {
 	settleProofs func(ctx context.Context, c *corrosion.Client, kind, name string) ([]corrosion.ProofRecord, error)
 	armed        func() bool
 	selfFence    func()
-	now          func() time.Time
-	after        time.Duration
-	tick         time.Duration
+	// recordMode is enforcement.partition_pause_record_failure: what a pause
+	// whose record cannot be written does (partition_pause_reserve.go).
+	recordMode string
+	reserveWhy string // the last reserve error logged, "" once it exists
+	now        func() time.Time
+	after      time.Duration
+	tick       time.Duration
 
 	mu sync.Mutex
 	// samples are this pass's and earlier passes' quorum readings inside the
@@ -442,6 +446,24 @@ func (p *PartitionPauser) SetSelfFence(armed func() bool, fence func()) {
 	p.armed, p.selfFence = armed, fence
 }
 
+// SetRecordFailure wires enforcement.partition_pause_record_failure: what a
+// pause does when its record cannot be written (PauseRecordFailurePause, the
+// default for ""; PauseRecordFailureReserve; PauseRecordFailureSelfFence).
+func (p *PartitionPauser) SetRecordFailure(mode string) { p.recordMode = mode }
+
+// SetRecordFaultForTests makes every record write to a layer
+// (PauseRecordLayerDisk, PauseRecordLayerReserve) for this pauser's data dir
+// fail with what fn returns, nil for success: a full disk, in tests. nil
+// clears it.
+func (p *PartitionPauser) SetRecordFaultForTests(fn func(layer string, rec PauseRecord) error) {
+	if p.store.st == nil {
+		return
+	}
+	p.store.st.mu.Lock()
+	p.store.st.fault = fn
+	p.store.st.mu.Unlock()
+}
+
 // SetClock replaces the monotonic clock (tests).
 func (p *PartitionPauser) SetClock(now func() time.Time) { p.now = now }
 
@@ -488,6 +510,7 @@ func (p *PartitionPauser) Evaluate(ctx context.Context) {
 	if p.quorum == nil {
 		return
 	}
+	p.keepRecords()
 	state, live, needed := p.quorum(ctx)
 	now := p.now()
 	lost := state != QuorumYes
@@ -567,6 +590,35 @@ func (p *PartitionPauser) Evaluate(ctx context.Context) {
 	reason := fmt.Sprintf("lost the voter majority for %s of the last %s (%d of %d needed live)",
 		covered.Round(time.Second), (2 * p.after).Round(time.Second), live, needed)
 	p.pauseAll(ctx, now, reason)
+}
+
+// keepRecords makes the reserve while the disk has room (every mode but
+// self_fence, with the flag on), and moves any record held in the reserve or
+// in memory to the record directory once a write there succeeds.
+func (p *PartitionPauser) keepRecords() {
+	p.store.flush()
+	if p.recordMode == PauseRecordFailureSelfFence || p.enabled == nil || !p.enabled() || p.store.dir == "" {
+		return
+	}
+	why := ""
+	if err := p.store.ensureReserve(); err != nil {
+		why = err.Error()
+	}
+	p.mu.Lock()
+	changed := why != p.reserveWhy
+	p.reserveWhy = why
+	p.mu.Unlock()
+	if changed && why != "" {
+		slog.Warn("partition-pause: cannot make the pause-record reserve; a pause whose record cannot be written falls back as enforcement.partition_pause_record_failure says",
+			"host", p.host, "mode", p.recordModeName(), "error", why)
+	}
+}
+
+func (p *PartitionPauser) recordModeName() string {
+	if p.recordMode == "" {
+		return PauseRecordFailurePause
+	}
+	return p.recordMode
 }
 
 // exempt reports why this host must not pause, or "".
@@ -797,11 +849,19 @@ func (p *PartitionPauser) pauseOne(rec PauseRecord, pause func() error) error {
 	}
 	p.inflight[rec.Key()] = true
 	p.mu.Unlock()
-	if err := p.store.put(rec); err != nil {
+	where, err := p.store.record(rec, p.recordMode)
+	if err != nil {
 		p.mu.Lock()
 		delete(p.inflight, rec.Key())
 		p.mu.Unlock()
 		return fmt.Errorf("record the pause durably: %w", err)
+	}
+	if where != PauseRecordLayerDisk {
+		// What the majority relies on is the pause, not the record
+		// (partition_pause_reserve.go): pause, and write the record to the
+		// directory once it can be.
+		slog.Error("partition-pause: cannot write the pause record to the record directory; pausing with it held in "+where,
+			"kind", rec.Kind, "name", rec.Name, "host", p.host, "mode", p.recordModeName())
 	}
 	done := make(chan error, 1)
 	go func() {

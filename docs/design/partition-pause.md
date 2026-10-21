@@ -216,6 +216,22 @@ The file is written through a temp file, `fsync`, `rename` and a directory
   with no record. The pauser would treat that domain as paused by an operator
   and never resume it.
 
+**When the record cannot be written** (a full or failing `data_dir`),
+`enforcement.partition_pause_record_failure` decides. The default, `pause`,
+pauses anyway: the record goes to the reserve
+(`<data_dir>/partition-pause/reserve`, fixed slots written with zeros while
+the disk has room, so a record overwrites blocks the file already owns) or,
+when that fails too, to the daemon's memory, and every pass writes it to the
+directory once it can. `reserve` requires the directory or the reserve before
+the pause; `self_fence` requires the directory, and a write that fails is a
+failed pause (§3.4), as before the key existed. The majority relies on the
+pause, never on the record: the record is host-local and decides only what
+this host resumes. A daemon that dies holding a record in memory only comes
+back to a paused domain with no record, which it treats as paused by someone
+else and never resumes: held, not free to run. A record or reserve it cannot
+read is held the same way, by the pauser and by every other reader
+(`ReadPauseRecord`: the snapshot and NIC-guard resume paths).
+
 `owner_epoch` and `incarnation` come from the row at the moment of the pause.
 They are what the resume check (§3.5) and Layer 3 (§6) compare against.
 
@@ -237,7 +253,9 @@ a record holds, and `CreateLiveSnapshot` refuses any paused domain.
 
 ### 3.4 Pause failure
 
-If a suspend or a freeze fails, the pauser does three things:
+If a suspend or a freeze fails, or its record cannot be written where
+`enforcement.partition_pause_record_failure` requires it (§3.3), the pauser
+does three things:
 
 - It raises `partition_pause_failed` (evaluator `partition_pause`, subject
   `host/<name>`, severity critical), with the workload and the error. The row
@@ -1124,3 +1142,10 @@ nodes at once, then heals. Grep for `partition-pause: paused` and
    (finding P1). `ReadyResponse.partition_pause` now carries the flag on every
    health probe, and the coordinator reads the latest answer (§4.3).
    `Checker.PeerAdvertisedLast` is gone.
+9. **A record that cannot be written no longer fails the pause by default**
+   A full `data_dir` turned every pause into
+   `partition_pause_failed` and, with a verified watchdog, a self-fence that
+   stopped every VM on the host; without one the host kept running a copy the
+   majority relied on it pausing. `enforcement.partition_pause_record_failure`
+   (§3.3) now defaults to pausing on a record held in the reserve or in
+   memory; `self_fence` keeps the old behaviour.

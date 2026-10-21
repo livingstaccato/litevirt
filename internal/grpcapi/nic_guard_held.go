@@ -331,8 +331,12 @@ func (s *Server) resumeHeld(ctx context.Context, vm string) error {
 		}
 		return errNotHeld
 	}
-	if _, paused, _ := health.ReadPauseRecord(s.dataDir, health.PauseKindVM, vm); paused {
-		// Partition pause holds it too: that is its pauser's to resume.
+	if _, paused, perr := health.ReadPauseRecord(s.dataDir, health.PauseKindVM, vm); paused || perr != nil {
+		// Partition pause holds it too: that is its pauser's to resume. A
+		// pause state this host cannot read is held the same way.
+		if perr != nil {
+			return fmt.Errorf("%s: its partition-pause state is unreadable (%v), so it is held paused", vm, perr)
+		}
 		return fmt.Errorf("%s is also paused for a partition (partition pause); it resumes when the partition does", vm)
 	}
 	actx, cancel := context.WithTimeout(ctx, 30*time.Second)

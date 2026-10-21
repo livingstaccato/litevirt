@@ -446,6 +446,23 @@ enforcement:
                               # is the kill switch: that host pauses nothing and recovers an
                               # assumed fence at once, as before. See
                               # design/partition-pause.md.
+  partition_pause_record_failure: pause
+                              # What a partition pause does when its record under
+                              # <data_dir>/partition-pause cannot be written (a full or
+                              # failing disk). The majority relies on the pause, never on
+                              # the record, which only decides what this host resumes.
+                              # pause (default): pause anyway, keeping the record in the
+                              # reserve (<data_dir>/partition-pause/reserve, 1 MiB made at
+                              # the pauser's first pass while there is room) or, failing
+                              # that, in memory, and write it to the directory once a write
+                              # succeeds. A daemon that dies holding a record in memory only
+                              # comes back to a paused VM with no record, which it never
+                              # resumes itself. reserve: the record must be in the directory
+                              # or the reserve before the pause; with neither writable the
+                              # pause fails. self_fence: the directory only, and a write that
+                              # fails is a failed pause (partition_pause_failed, and a
+                              # self-fence with a verified watchdog armed), the behaviour
+                              # before this key. Any other value fails the config load.
   console_password: true      # DEFAULT ON. Give the VNC and SPICE consoles of every domain
                               # this host defines a fresh per-VM password, so a local process
                               # or user on the host can no longer open a console on its

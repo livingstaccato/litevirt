@@ -114,8 +114,30 @@ func TestLBStandIns_KilledTestLeavesNoneBehind(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer log.Close()
+	// The owner is deliberately killed before its t.TempDir cleanup runs.
+	// Keep its temporary tree under this surviving parent's authority, separate
+	// from the retained logs, and remove it only after process cleanup is proven.
+	helperTmp, err := os.MkdirTemp("", "lb-owner-death-tmp-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpCleanable := true // no observer or owner has started yet
+	t.Cleanup(func() {
+		if !tmpCleanable {
+			t.Logf("retained owner-death TMPDIR %s: process cleanup unverified", helperTmp)
+			return
+		}
+		if err := os.RemoveAll(helperTmp); err != nil {
+			t.Errorf("remove owner-death TMPDIR %s: %v", helperTmp, err)
+		}
+	})
+	t.Logf("owner-death TMPDIR %s; retained evidence %s", helperTmp, dir)
 	cmd := lbDeathCommand("observer", dir)
+	// Command-local override wins over inherited TMPDIR; the owner inherits it
+	// through the observer without changing this fleet process's environment.
+	cmd.Env = append(cmd.Env, "TMPDIR="+helperTmp)
 	cmd.Stdout, cmd.Stderr = log, log
+	tmpCleanable = false
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("observer terminal: %v (retained %s)", err, dir)
 	}
@@ -127,6 +149,9 @@ func TestLBStandIns_KilledTestLeavesNoneBehind(t *testing.T) {
 	if err := json.Unmarshal(body, &result); err != nil {
 		t.Fatal(err)
 	}
+	// Cleaned includes the actual owner terminal, adopted-child reaps and an
+	// empty observer child set, including the emergency cleanup path.
+	tmpCleanable = result.Cleaned && result.CleanupError == ""
 	if result.SetupError != "" || result.CleanupError != "" || !result.Cleaned || !result.OwnerKilled || !result.SiblingHeld || !result.SiblingEOF || len(result.AliveBefore) != 3 || len(result.ReapedPIDs) != 3 {
 		t.Fatalf("owner-death harness failure: %+v (retained %s)", result, dir)
 	}

@@ -477,3 +477,33 @@ func TestConfig_ValidateRejects(t *testing.T) {
 		t.Errorf("degrade off: %v", err)
 	}
 }
+
+// Run samples on its own goroutine while Ready reads the report from others.
+func TestSampler_RunAndReportConcurrently(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.SampleIntervalSec = 1
+	fs := newFakeFS()
+	fs.setFree("/data", 100*gib, 6)
+	s := NewSampler(cfg, "/data", Options{FS: fs, Pools: func(context.Context) []Pool { return []Pool{{Name: "p", Path: "/data"}} }})
+	s.SetObserver(func(Report) {})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { s.Run(ctx); close(done) }()
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				_ = s.Report().Pressured()
+				s.Sample(context.Background())
+			}
+		}()
+	}
+	wg.Wait()
+	cancel()
+	<-done
+	if l := s.Report().Level; l != Degrade {
+		t.Fatalf("level %v after many samples at 6 %%, want degrade", l)
+	}
+}

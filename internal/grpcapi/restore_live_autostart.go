@@ -241,6 +241,45 @@ func (s *Server) autoDefineRestoredVM(
 	// fall through to the default project (InsertVM's "" → _default).
 	spec.Project = project
 
+	// PCI passthrough, as CreateVM attaches it: resolved against this host's
+	// inventory, owned and vfio-bound under a durable device lease, rendered
+	// as hostdevs, and recorded as the VM's intents. A device this host
+	// cannot provide refuses the restore, as it would refuse a start; the VM
+	// is never started silently without it. --without-devices (operator
+	// opt-in) drops them from the spec first, so the row agrees with the
+	// domain, and says so. Allocated before the MAC, guard and firmware work,
+	// so a refusal leaves none of it behind.
+	var devicesDropped string
+	if req.WithoutDevices && len(spec.Devices) > 0 {
+		devicesDropped = deviceSpecsSummary(spec.Devices)
+		spec.Devices = nil
+		_ = send(&pb.RestoreLiveProgress{Status: "PCI passthrough devices not attached (--without-devices): " + devicesDropped})
+	}
+	var pciIntents []corrosion.PCIIntentRecord
+	var pciAddrs []string
+	// pciHeld: the domain may be running with the devices, so they are not
+	// given back. Until it starts, and again once it is provably destroyed, a
+	// failed restore releases them at once (owner-scoped, so never another
+	// VM's): a device left owned by a VM with no row is free again only at the
+	// stranded-ownership sweep.
+	pciHeld, pciKept := false, false
+	if len(spec.Devices) > 0 {
+		addrs, devFinish, devErr := s.allocateDevices(ctx, targetName, spec.Devices, deviceLeaseStageBound)
+		if devErr != nil {
+			return "", "", status.Errorf(status.Code(devErr),
+				"restore %q: the backed-up VM's PCI passthrough devices cannot be attached on host %s: %s (pass --without-devices to start it without them)",
+				targetName, s.hostName, status.Convert(devErr).Message())
+		}
+		pciAddrs = addrs
+		defer devFinish()
+		defer func() {
+			if !pciHeld && !pciKept {
+				s.releaseAllocatedDevices(ctx, "restore", targetName, pciAddrs)
+			}
+		}()
+		pciIntents = s.buildPCIIntents(targetName, spec.Devices)
+	}
+
 	// Firmware-state travel (G1): a Secure-Boot/vTPM VM's NVRAM + swtpm bind
 	// BitLocker. Re-home them onto this host under a FRESH identity (so a
 	// restore-alongside can't collide with the still-running original's
@@ -408,26 +447,8 @@ func (s *Server) autoDefineRestoredVM(
 	// The domain carries the VM's identity, firmware or not, as every definer
 	// does (a later rebuild knows it for the VM's own by it).
 	vmCfg.UUID = spec.Uuid
-	// PCI passthrough, as CreateVM attaches it: resolved against this host's
-	// inventory, owned and vfio-bound under a durable device lease, rendered
-	// as hostdevs, and recorded as the VM's intents. A device this host
-	// cannot provide refuses the restore, as it would refuse a start; the VM
-	// is never defined and started silently without it. As at CreateVM, the
-	// lease is cleared once this returns, and what a failure after this point
-	// leaves owned under the name is the stranded-ownership sweep's.
-	var pciIntents []corrosion.PCIIntentRecord
-	if len(spec.Devices) > 0 {
-		pciAddrs, devFinish, devErr := s.allocateDevices(ctx, targetName, spec.Devices, deviceLeaseStageBound)
-		if devErr != nil {
-			return "", "", status.Errorf(status.Code(devErr),
-				"restore %q: the backed-up VM's PCI passthrough devices cannot be attached on host %s: %s (restore without --auto-start to boot the disk without them)",
-				targetName, s.hostName, status.Convert(devErr).Message())
-		}
-		defer devFinish()
-		for _, addr := range pciAddrs {
-			vmCfg.Hostdevs = append(vmCfg.Hostdevs, lv.HostdevConfig{Address: addr})
-		}
-		pciIntents = s.buildPCIIntents(targetName, spec.Devices)
+	for _, addr := range pciAddrs {
+		vmCfg.Hostdevs = append(vmCfg.Hostdevs, lv.HostdevConfig{Address: addr})
 	}
 	s.withNICMTU(&vmCfg)
 	domXML, err := lv.GenerateDomainXML(vmCfg)
@@ -499,6 +520,7 @@ func (s *Server) autoDefineRestoredVM(
 		_ = s.virt.UndefineDomain(targetName, false)
 		return "", "", status.Errorf(codes.Internal, "start domain: %v", err)
 	}
+	pciHeld = true
 	// STARTED is sent further down, once the row is committed and published: a
 	// client acts on it, and the fence below can still tear this domain down.
 
@@ -516,6 +538,8 @@ func (s *Server) autoDefineRestoredVM(
 		if derr := s.virt.DestroyDomain(targetName); derr != nil {
 			slog.Error("live-restore: fence refused the commit but the running domain could not be destroyed — manual cleanup needed",
 				"vm", targetName, "error", derr)
+		} else {
+			pciHeld = false // destroyed: its devices go back
 		}
 		releaseHW()
 		_ = s.virt.UndefineDomain(targetName, false)
@@ -551,7 +575,13 @@ func (s *Server) autoDefineRestoredVM(
 		if fwVM {
 			// A running firmware domain with no DB row is unmanageable — lifecycle
 			// code wouldn't know to preserve/wipe its state — so fail hard; the
-			// deferred rollback destroys the domain + wipes the firmware.
+			// deferred rollback destroys the domain + wipes the firmware. It runs
+			// after the device release (defers are LIFO), so the domain is
+			// destroyed here first: its devices are released only off a guest
+			// that is gone.
+			if derr := s.virt.DestroyDomain(targetName); derr == nil {
+				pciHeld = false
+			}
 			return "", "", status.Errorf(codes.Internal, "persist restored firmware VM %q: %v", targetName, err)
 		}
 		slog.Error("live-restore: failed to write VM to corrosion", "vm", targetName, "error", err)
@@ -579,7 +609,11 @@ func (s *Server) autoDefineRestoredVM(
 		TargetPath: overlayPath, Status: "VM started off overlay",
 	})
 	restoreOK = true
+	pciKept = true
 	s.recordVMEvent(ctx, targetName, "vm.created", "ok", "host="+s.hostName+" (live-restore)")
+	if devicesDropped != "" {
+		s.audit(ctx, "vm.devices_dropped", targetName, "restore: not attached (--without-devices): "+devicesDropped, "degraded")
+	}
 	s.auditTuningDropped(ctx, ioR, targetName, "restore")
 	if len(limDropped) > 0 {
 		s.audit(ctx, "vm.release_features_dropped", targetName, "restore: not carried: "+strings.Join(limDropped, "; "), "degraded")

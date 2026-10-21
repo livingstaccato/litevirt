@@ -469,7 +469,9 @@ func (m *mockGRPC) RestoreFromBackup(_ context.Context, in *pb.RestoreFromBackup
 	}}, nil
 }
 func (m *mockGRPC) RestoreLive(_ context.Context, in *pb.RestoreLiveRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.RestoreLiveProgress], error) {
+	m.mu.Lock()
 	m.lastRestoreLiveReq = in
+	m.mu.Unlock()
 	return &scriptedStream[pb.RestoreLiveProgress]{frames: []*pb.RestoreLiveProgress{
 		{Phase: pb.RestoreLiveProgress_READY, Status: "ready", NbdUrl: "nbd://127.0.0.1:10809/export", TargetPath: in.GetTargetPath()},
 		{Phase: pb.RestoreLiveProgress_DONE, Status: "localized"},

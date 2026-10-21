@@ -1226,6 +1226,7 @@ lv backup restore-live --repo <p> --vm <v> --disk <d> \
   [--name <new>]      # rename the restored VM (avoids collision with the original)
   [--blockpull]       # after start, localize the disk then tear down the NBD server
   [--from-existing]   # fall back to an existing vms record for the VM spec
+  [--without-devices] # with --auto-start: start without the backup's PCI devices (dropped from the spec, audited)
 
 # Aliases: `lv backup create` is `lv backup snapshot`, `lv backup restore` is `lv backup restore-from`
 lv backup create <vm> --repo <path> [flags as snapshot]

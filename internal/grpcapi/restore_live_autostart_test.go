@@ -236,15 +236,11 @@ func TestRestoreLive_AutoStart_FromManifestMetadata(t *testing.T) {
 
 // TestRestoreLive_AutoStart_PopulatesHardwareTables verifies autoDefineRestoredVM
 // populates the v42 vm_nics table for its network attachment (mirroring
-// CreateVM/task 7.1) but writes NO vm_pci_intent rows even when the restored spec
-// carries a concrete-address Device: the restored domain XML never attaches a
-// matching <hostdev> (a disk replica/NBD overlay carries no physical device to
-// recover), so writing a concrete-address intent would create a phantom
-// cross-VM exclusive reservation (PCIIntentExclusiveOwner ignores adoption_state)
-// blocking another VM from attaching that BDF. The gap is left for the Phase-6
-// backfill audit, which imports from the (device-less) inactive definition and
-// therefore correctly imports nothing. hardware_adoption_state stays 'pending': a
-// live-restore does not self-certify adoption.
+// CreateVM/task 7.1), and that a concrete-address Device in the restored spec is
+// attached as CreateVM attaches it: the domain holds the matching <hostdev>, and
+// its vm_pci_intent row reserves exactly that device (canonical device_id), so
+// the reservation always names a device the VM holds. hardware_adoption_state
+// stays 'pending': a live-restore does not self-certify adoption.
 func TestRestoreLive_AutoStart_PopulatesHardwareTables(t *testing.T) {
 	s := testServer(t)
 	s.hostName = "host-a"

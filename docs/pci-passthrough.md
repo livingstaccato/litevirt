@@ -280,17 +280,22 @@ still running on the source, or releases them if the guest has moved.
 
 A memory snapshot (`lv snapshot create --memory`) saves the guest's RAM and
 device state, and libvirt cannot save the state of a PCI passthrough device
-(nor of an mdev or an `<interface type='hostdev'>`; a USB device is fine). Such
-a snapshot is refused with `FailedPrecondition` before the guest is paused or
-its disks are touched. A disk-only snapshot (without `--memory`) is still
-taken. A running Secure Boot or vTPM VM, which needs `--memory`, must be
+(nor of an mdev, an `<interface type='hostdev'>` or an `<interface type='vdpa'>`;
+a USB device is fine). Such a snapshot is refused with `FailedPrecondition`
+before the guest is paused or its disks are touched. A disk-only snapshot
+(without `--memory`) is still taken. A running Secure Boot or vTPM VM, which needs `--memory`, must be
 stopped for its snapshot.
 
 `lv backup restore-live --auto-start` attaches the backed-up VM's PCI devices
 the way `lv run` does, resolving them against the restoring host's
 inventory. If the host cannot provide one, the restore is refused rather than
-starting the VM without it. Restore without `--auto-start` to boot the disk
-without the devices. `lv clone` never copies PCI devices.
+starting the VM without it. Add `--without-devices` to start it without them:
+they are removed from its spec and the drop is audited. `lv clone` never
+copies PCI devices.
+
+When a create or a live restore fails after its devices were attached, and its
+domain is not running, the devices are released and unbound from vfio-pci
+straight away.
 
 ## Resource mappings
 

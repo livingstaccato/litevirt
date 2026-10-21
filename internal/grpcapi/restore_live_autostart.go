@@ -408,6 +408,27 @@ func (s *Server) autoDefineRestoredVM(
 	// The domain carries the VM's identity, firmware or not, as every definer
 	// does (a later rebuild knows it for the VM's own by it).
 	vmCfg.UUID = spec.Uuid
+	// PCI passthrough, as CreateVM attaches it: resolved against this host's
+	// inventory, owned and vfio-bound under a durable device lease, rendered
+	// as hostdevs, and recorded as the VM's intents. A device this host
+	// cannot provide refuses the restore, as it would refuse a start; the VM
+	// is never defined and started silently without it. As at CreateVM, the
+	// lease is cleared once this returns, and what a failure after this point
+	// leaves owned under the name is the stranded-ownership sweep's.
+	var pciIntents []corrosion.PCIIntentRecord
+	if len(spec.Devices) > 0 {
+		pciAddrs, devFinish, devErr := s.allocateDevices(ctx, targetName, spec.Devices, deviceLeaseStageBound)
+		if devErr != nil {
+			return "", "", status.Errorf(status.Code(devErr),
+				"restore %q: the backed-up VM's PCI passthrough devices cannot be attached on host %s: %s (restore without --auto-start to boot the disk without them)",
+				targetName, s.hostName, status.Convert(devErr).Message())
+		}
+		defer devFinish()
+		for _, addr := range pciAddrs {
+			vmCfg.Hostdevs = append(vmCfg.Hostdevs, lv.HostdevConfig{Address: addr})
+		}
+		pciIntents = s.buildPCIIntents(targetName, spec.Devices)
+	}
 	s.withNICMTU(&vmCfg)
 	domXML, err := lv.GenerateDomainXML(vmCfg)
 	if err != nil {
@@ -447,8 +468,9 @@ func (s *Server) autoDefineRestoredVM(
 
 	// hardware_v2 pre-start (adoption gate + PCI preflight); no-op unless latched, so a
 	// fleet with the feature off restores exactly as before. A restore always targets a
-	// fresh name (name-collision is refused earlier), so it carries no reserved PCI
-	// intents → the preflight is a no-op and only the adoption gate can fire (refusing an
+	// fresh name (name-collision is refused earlier), and its PCI intents are written
+	// with its row after the start (its devices were allocated above, as CreateVM's are),
+	// so the preflight finds none and only the adoption gate can fire (refusing an
 	// auto-start into a name the operator has flagged blocked). release() runs only if the
 	// subsequent StartDomain fails.
 	hwSpecJSON, _ := json.Marshal(spec)
@@ -516,15 +538,8 @@ func (s *Server) autoDefineRestoredVM(
 		State: "creating", CPUActual: int(spec.Cpu), MemActual: int(spec.MemoryMib),
 		Project: project,
 	}
-	// PCI intents: NONE. The restored domain built above (GenerateDomainXML)
-	// emits Disks + Networks only — it never attaches Hostdevs from spec.Devices
-	// (a disk replica / NBD overlay carries no physical device to recover), exactly
-	// like promote.go. Writing a concrete-address intent here would therefore create
-	// a live exclusive_key reservation (PCIIntentExclusiveOwner ignores
-	// adoption_state) for a device the VM never attaches — a phantom cross-VM
-	// reservation blocking another VM from attaching that BDF indefinitely. Pass nil;
-	// if the source VM genuinely had passthrough, the Phase-6 backfill audit imports
-	// it from the (device-less) inactive definition, which correctly imports nothing.
+	// PCI intents: exactly the devices allocated above and rendered as the
+	// domain's hostdevs, so every reservation names a device the VM holds.
 	// adopt=false: best-effort-populate vm_nics, but don't self-certify adoption —
 	// the backfill audit confirms/reconciles.
 	gs := vmSpecGrants{tuning: ioG, passthrough: passthroughG, limits: limitsG, mtu: mtuR.grant}
@@ -532,7 +547,7 @@ func (s *Server) autoDefineRestoredVM(
 	// strips the backup's): what the deleted VM of this name left is read
 	// before the row takes its tombstone over.
 	tagsLeft := s.firewallTagsLeftNote(ctx, corrosion.TagMemberVM, project, targetName, "")
-	if err := s.insertVMWithGrants(ctx, spec, gs, vmRecord, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
+	if err := s.insertVMWithGrants(ctx, spec, gs, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, false); err != nil {
 		if fwVM {
 			// A running firmware domain with no DB row is unmanageable — lifecycle
 			// code wouldn't know to preserve/wipe its state — so fail hard; the

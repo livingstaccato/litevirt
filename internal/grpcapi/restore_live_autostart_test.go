@@ -253,7 +253,7 @@ func TestRestoreLive_AutoStart_PopulatesHardwareTables(t *testing.T) {
 	defer vfio.SetFS(newPCIBindFakeFS())()
 	// The backed-up VM's GPU, free on this host: the restore attaches it.
 	if err := corrosion.UpsertPCIDevice(context.Background(), s.db, corrosion.PCIDeviceRecord{
-		HostName: s.hostName, Address: "41:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1,
+		HostName: s.hostName, Address: "0000:41:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1,
 	}); err != nil {
 		t.Fatalf("seed PCI device: %v", err)
 	}
@@ -261,7 +261,7 @@ func TestRestoreLive_AutoStart_PopulatesHardwareTables(t *testing.T) {
 	spec := &pb.VMSpec{
 		Name: "vm1", Cpu: 2, MemoryMib: 2048, Machine: "q35", Firmware: "uefi",
 		Network: []*pb.NetworkAttachment{{Name: "lo", Model: "e1000", SecurityGroups: []string{"web"}}},
-		Devices: []*pb.DeviceSpec{{Address: "41:00.0"}}, // non-canonical BDF, see the DeviceID assertion below
+		Devices: []*pb.DeviceSpec{{Address: "0000:41:00.0"}},
 	}
 	specJSON, err := json.Marshal(spec)
 	if err != nil {

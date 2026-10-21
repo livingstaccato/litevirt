@@ -51,6 +51,7 @@ import (
 	"github.com/litevirt/litevirt/internal/opjournal"
 	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/pki"
+	"github.com/litevirt/litevirt/internal/pressure"
 	"github.com/litevirt/litevirt/internal/restapi"
 	"github.com/litevirt/litevirt/internal/scheduler"
 	"github.com/litevirt/litevirt/internal/storage"
@@ -1342,6 +1343,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// partition_pause_v1: advertised only with enforcement.partition_pause on
 	// (default on), because the majority relies on this node pausing.
 	svc.SetPartitionPause(d.cfg.Enforcement.PartitionPause)
+	// Resource pressure (docs/configuration.md, "Resource pressure"): this
+	// host grades its own resources and Ready reports the grade. It reports
+	// only; with pressure.enabled false nothing is sampled and peers read this
+	// host's pressure as unknown.
+	if d.cfg.Pressure.Enabled {
+		ps := pressure.NewSampler(d.cfg.Pressure, d.cfg.DataDir, pressure.Options{Pools: d.pressurePools()})
+		ps.SetObserver(metrics.NewPressureMetrics().Observe)
+		svc.SetPressureSource(ps)
+		go ps.Run(ctx)
+	}
 	// The reconciler is the SECOND executor boundary for this regime: a VM
 	// reschedule proof never travels over an RPC, so it is claimed off the
 	// replicated row there rather than in claimCarriedProof. The judgment is
@@ -2082,6 +2093,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// ha.voter.unavailable) and host.address_shared are the lease holder's to
 	// write, like genesis.
 	fc.ClaimHealth = svc.RecoveryClaimHealthTick
+	// host.pressure is the lease holder's to write too, from each host's
+	// probe answer, so a host whose disk is full is still described.
+	fc.PressureHealth = svc.PressureHealthTick
 	// Partition pause, the majority side: rely on a host's pause only with this
 	// node's flag on AND partition_pause_v1 latched (every voter pauses), and
 	// anchor the deadline on the later of the decision and the last contact.
@@ -3038,6 +3052,59 @@ func (d *Daemon) refreshDBPoolCapacity(ctx context.Context) {
 			}
 		}
 		d.svc.SetStoragePoolsByName(refs)
+	}
+}
+
+// pressurePoolsRefresh is how often the pressure sampler re-reads which pools
+// this host has; between reads it grades the last list.
+const pressurePoolsRefresh = time.Minute
+
+// pressurePools lists this host's file-based pools for the pressure sampler:
+// the config pools and this host's rows in storage_pools, as
+// sumPoolDiskTotalGiB walks them. The replicated read is bounded and cached,
+// so a stalled database does not stall the sampler; a failed read keeps the
+// last list.
+func (d *Daemon) pressurePools() func(context.Context) []pressure.Pool {
+	var (
+		last []pressure.Pool
+		read time.Time
+	)
+	return func(ctx context.Context) []pressure.Pool {
+		if !read.IsZero() && time.Since(read) < pressurePoolsRefresh {
+			return last
+		}
+		seen := map[string]bool{}
+		var out []pressure.Pool
+		add := func(name, target string) {
+			if name == "" || target == "" || seen[name] {
+				return
+			}
+			seen[name] = true
+			out = append(out, pressure.Pool{Name: name, Path: target})
+		}
+		for _, p := range d.cfg.StoragePools {
+			if fileBasedPoolDriver(p.Driver) {
+				add(p.Name, p.Target)
+			}
+		}
+		if d.db != nil {
+			rctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			rows, err := corrosion.ListStoragePoolsForHost(rctx, d.db, d.cfg.HostName)
+			cancel()
+			if err != nil {
+				slog.Warn("resource pressure: list storage pools; grading the last list", "error", err)
+				if last != nil {
+					return last
+				}
+			}
+			for _, p := range rows {
+				if fileBasedPoolDriver(p.Driver) {
+					add(p.Name, p.Target)
+				}
+			}
+		}
+		last, read = out, time.Now()
+		return out
 	}
 }
 

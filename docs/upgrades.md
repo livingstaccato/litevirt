@@ -422,6 +422,17 @@ systemctl reset-failed litevirt
 systemctl restart litevirt
 ```
 
+A memory snapshot taken by a build that captures in the running QEMU (see
+[configuration](configuration.md#memory-snapshots)) has its RAM image written
+before the disks switch to their overlays. The capture then rewrites the
+image's definition to name the overlays, so any build reverts it. The
+rewrite is best effort: when it fails, the daemon logs "the image still
+names the disks as they were before the snapshot" and the snapshot is kept.
+A host rolled back to a build whose revert does not repoint the disks (one
+before the overlay repoint, 0fef47979) restores such an image onto the
+snapshot's base disk and writes into it. Before rolling a host back that
+far, delete or retake any memory snapshot that line names.
+
 A host rolled back below the release that added `lv lb create --snat` SNATs
 every load balancer made with `lv lb create` that it serves, including one set
 to `--snat=false` ([compose.md](compose.md#snat-via-vip)).

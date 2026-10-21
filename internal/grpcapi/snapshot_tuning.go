@@ -22,6 +22,13 @@ type MemorySnapshotTuning struct {
 // daemon start, before the server serves.
 func (s *Server) SetMemorySnapshotTuning(t MemorySnapshotTuning) { s.memorySnapshot = t }
 
+// SetCaptureRegistry sets the host's memory snapshot capture registry, which
+// the daemon shares with its partition pauser and settle; called before the
+// server serves. Without it the server keeps one of its own.
+func (s *Server) SetCaptureRegistry(r *lv.CaptureRegistry) {
+	s.captureRegOnce.Do(func() { s.captureReg = r })
+}
+
 // CaptureRegistry is this host's memory snapshot capture registry, which the
 // daemon shares with its partition pauser (lv.CaptureRegistry).
 func (s *Server) CaptureRegistry() *lv.CaptureRegistry {

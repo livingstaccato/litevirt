@@ -685,7 +685,7 @@ func (p *PartitionPauser) pauseVMs(ctx context.Context, budget passBudget, reaso
 		// A memory snapshot in flight holds its guest paused, and resumes it
 		// when it ends: that guest is this pauser's to pause (the registry
 		// hold below stops the resume). Any other paused domain is not ours.
-		if st.State != RuntimeRunning && !p.captures.InFlight(name) {
+		if st.State != RuntimeRunning && (st.Reason != "paused" || !p.captures.InFlight(name)) {
 			continue // not executing: nothing to stop, and a paused one is not ours
 		}
 		vm, err := corrosion.GetVM(ctx, p.db, name)
@@ -722,9 +722,16 @@ func (p *PartitionPauser) pauseVMs(ctx context.Context, budget passBudget, reaso
 			// one in flight and waits out libvirt's cleanup (which resumes a
 			// guest that was running) before the suspend, and keeps any
 			// capture from resuming the guest after it.
-			p.captures.Hold(name, captureWait)
+			_, settled := p.captures.Hold(name, captureWait)
 			if err := p.pauseOne(rec, func() error { return p.vms.SuspendDomain(name) }); err != nil {
 				fail(rec.Key(), err.Error())
+			} else if !settled {
+				// The capture's job outlived the wait: libvirt resumes a guest
+				// that was running when the job began, at the job's end. The
+				// capture re-suspends it, but this pause cannot be guaranteed,
+				// so it counts as failed (§3.4: self-fence when armed).
+				fail(rec.Key(), "a memory snapshot's libvirt job did not end within "+captureWait.String()+
+					"; libvirt may resume the guest when it ends")
 			}
 		}()
 	}

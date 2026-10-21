@@ -68,6 +68,9 @@ const grpcMaxMsgSize = 64 << 20 // 64 MiB
 
 // Daemon is the main litevirtd process.
 type Daemon struct {
+	// captureReg is the host's memory snapshot capture registry, shared by
+	// the gRPC server, the partition pauser and the settle.
+	captureReg *libvirt.CaptureRegistry
 	// ownRowWake is signalled when an apply changes this host's own row;
 	// bootRes keeps the boot report's figures (own_row.go).
 	ownRowWake chan struct{}
@@ -966,6 +969,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// an isolated/latched restart can't run automated starts before the gate can
 	// confirm capability.
 	reconciler := health.NewReconciler(d.cfg.HostName, d.cfg.DataDir, d.db, d.virt)
+	// One memory snapshot capture registry per host: the gRPC server's
+	// captures, the partition pauser and the settle share it.
+	d.captureReg = libvirt.NewCaptureRegistry()
+	reconciler.SetCaptureRegistry(d.captureReg) // a settle drops the pauser's hold with its record
 	reconciler.SetGate(d.checker)
 	reconciler.SetOwnerEpochBackfill(d.cfg.Enforcement.OwnerEpoch) // Phase 4 backfill pass
 	// Unconditional: the out-of-band stop sync waits until this node's replica
@@ -1083,6 +1090,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 
 	svc := d.newServer() // host address and release gate: before the first network pass
+	svc.SetCaptureRegistry(d.captureReg)
 	// A guarded VM recovers only onto a host that enforces NIC guards until
 	// every host does (re-review m8).
 	fc.SetNICGuardPlacement(svc.GuardHostNeeded)
@@ -1797,7 +1805,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	pauser.SetQuorum(d.checker.ExecutionQuorum)
 	pauser.SetEnabled(func() bool { return d.cfg.Enforcement.PartitionPause })
 	pauser.SetVMBackend(d.virt)
-	pauser.SetCaptureRegistry(svc.CaptureRegistry()) // the pause wins over a memory snapshot
+	pauser.SetCaptureRegistry(d.captureReg) // the pause wins over a memory snapshot
 	pauser.SetContainerRuntime(lxcRunner)
 	pauser.SetResumeConfirmer(svc.CheckPartitionResume)
 	pauser.SetSettleVerifier(svc.VerifySettleProof)

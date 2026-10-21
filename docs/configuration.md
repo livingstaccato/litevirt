@@ -1142,12 +1142,17 @@ warning and captures live with the deadline capped at twice the predicted
 write of the guest's RAM, and at least a second.
 
 A partition pause wins over a capture in flight: the capture is aborted, the
-guest is paused, and the capture never resumes it (see
-[partition pause](design/partition-pause.md#33-the-durable-record)).
+guest is paused, and litevirt never resumes it. If libvirt's job outlives the
+pauser's wait, libvirt can resume the guest when the job ends; the capture
+re-suspends it and the pause counts as failed (see
+[partition pause](design/partition-pause.md#33-the-durable-record)). A pause
+made outside litevirt during a capture (`virsh suspend`) is not protected: the
+capture, or libvirt, resumes the guest.
 
 Both values are Go durations and must be positive, and `live_deadline` is at
-most an hour. The daemon refuses to start with one that is not. They are read on the host that captures the snapshot, at
-daemon start, so set them the same on every host. The defaults are design
+most an hour. The daemon refuses to start with one that is not. They are read
+on the host that captures the snapshot, at daemon start, so set them the same
+on every host. The defaults are design
 targets until they are measured on hardware [measure].
 
 ## Capacity and overcommit

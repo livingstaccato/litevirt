@@ -2,6 +2,7 @@ package health
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -104,5 +105,43 @@ func TestPartitionPause_WinsOverAPausedCapture(t *testing.T) {
 	}
 	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
 		t.Fatalf("vm-ha is %s after the capture, want paused (the pauser's)", st)
+	}
+}
+
+// A memory snapshot whose libvirt job outlives the pauser's wait (QEMU does
+// not act on the abort): the pauser suspends and records anyway, and counts
+// the pause as failed, because libvirt resumes the guest at the job's end
+// (§3.3, §3.4: self-fence when armed).
+//
+// Mutation: discard Hold's settled — no failure is raised; red.
+func TestPartitionPause_ACaptureOutlivingTheWaitIsAFailedPause(t *testing.T) {
+	f := newPauseFixture(t)
+	reg := lv.NewCaptureRegistry()
+	f.p.SetCaptureRegistry(reg)
+	f.virt.SetMemoryModel("vm-ha", libvirtfake.MemoryModel{RAMBytes: 1 << 30, WriteBps: 1 << 30, DirtyBps: 2 << 30, ReportBps: 0, IgnoreAbort: true})
+	errc := make(chan error, 1)
+	go func() {
+		_, _, err := f.virt.CreateLiveSnapshot("vm-ha", "s1", filepath.Join(t.TempDir(), "s1.vmstate"), f.captureOpts(reg, "vm-ha"))
+		errc <- err
+	}()
+	waitFor(t, "the live capture's memory write", func() bool { return f.virt.LiveJobRunning("vm-ha") })
+
+	var whys []string
+	f.p.SetSelfFence(func() bool { return true }, func() {
+		f.p.mu.Lock()
+		whys = append(whys, f.p.failed[PauseKindVM+"/vm-ha"])
+		f.p.mu.Unlock()
+	})
+	f.loseFor(QuorumNo, PartitionPauseAfter+time.Second)
+	if len(whys) == 0 || !strings.Contains(whys[0], "memory snapshot") {
+		t.Fatalf("self-fences with pause failures %q, want one for vm-ha's capture job", whys)
+	}
+	select {
+	case <-errc:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the capture did not end")
+	}
+	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+		t.Fatalf("vm-ha is %s, want paused (the capture re-suspends it)", st)
 	}
 }

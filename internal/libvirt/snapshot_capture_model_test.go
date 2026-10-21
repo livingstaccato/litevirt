@@ -71,7 +71,10 @@ type qemuModel struct {
 	failCreate error
 	// postJob runs after a full-system create returned (libvirt's resume
 	// included), with the model unlocked.
-	postJob    func()
+	postJob func()
+	// preCreate runs when a full-system create is called, before its job
+	// exists, with the model unlocked.
+	preCreate  func()
 	dirtyCalcs int // DomainStartDirtyRateCalc calls
 	memGen     int // bumps on every write of guest memory image
 }
@@ -229,6 +232,12 @@ var memoryFileRe = regexp.MustCompile(`<memory\s+snapshot=['"]external['"]\s+fil
 // external memory (qemuSnapshotCreateActiveExternal). Caller holds m.mu;
 // it is released while a non-converging LIVE capture waits for a suspend.
 func (m *libvirt10) createFullSystem(d *modelDomain, dom golibvirt.Domain, x string, flags uint32) (golibvirt.DomainSnapshot, error) {
+	if hook := m.qemu.preCreate; hook != nil {
+		m.qemu.preCreate = nil
+		m.mu.Unlock()
+		hook()
+		m.mu.Lock()
+	}
 	live := flags&uint32(golibvirt.DomainSnapshotCreateLive) != 0
 	mm := memoryFileRe.FindStringSubmatch(x)
 	if d.state == golibvirt.DomainShutoff || len(mm) < 2 {

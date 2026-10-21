@@ -975,8 +975,15 @@ func (f *Fake) SuspendDomain(name string) error {
 	if st != StateRunning {
 		return fmt.Errorf("libvirtfake: domain %q is not running (%s)", name, st)
 	}
-	f.domains[name] = StatePaused
+	f.stopCPUsLocked(name)
 	f.record("suspend", name, "")
+	// A suspend during a live capture's memory write is the job's too
+	// (libvirt admits it): QEMU finishes the write with the vCPUs stopped.
+	if m := f.memLocked(name); m.liveJob != nil {
+		m.suspended = true
+		close(m.liveJob)
+		m.liveJob = nil
+	}
 	return nil
 }
 

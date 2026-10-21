@@ -268,6 +268,21 @@ func (c *capture) settle() error {
 	return err
 }
 
+// preJob refuses to start the libvirt job once the pauser holds the guest:
+// a hold taken while the capture measured the dirty rate found no job to
+// abort, and a LIVE job started after it would be resumed by libvirt's
+// cleanup over the pauser's suspend. A hold taken after this check aborts
+// the job (Hold retries its abort until the create call returns).
+func (c *capture) preJob() error {
+	var err error
+	c.reg.settle(c.dom.Name, c.held, func(held bool) {
+		if held {
+			err = fmt.Errorf("domain %q is held by this host's partition pause — memory snapshot abandoned", c.dom.Name)
+		}
+	})
+	return err
+}
+
 // paused is the paused variant: suspend, snapshot without LIVE (libvirt
 // leaves a domain it found paused paused), firmware at the same instant;
 // settle resumes.
@@ -276,6 +291,9 @@ func (c *capture) paused(snapXML string, captureSuspended func() error) error {
 		return fmt.Errorf("suspend domain %q: %w", c.dom.Name, err)
 	}
 	c.suspended = true
+	if err := c.preJob(); err != nil {
+		return err
+	}
 	_, err := c.v.DomainSnapshotCreateXML(c.dom, snapXML, uint32(golibvirt.DomainSnapshotCreateAtomic))
 	c.e.jobDone()
 	if err != nil {
@@ -296,6 +314,10 @@ func (c *capture) paused(snapXML string, captureSuspended func() error) error {
 // suspend that fails aborts the job instead (libvirt's cleanup resumes the
 // guest), rather than waiting on a job that will not end.
 func (c *capture) live(snapXML string, deadline time.Duration) error {
+	if err := c.preJob(); err != nil {
+		c.e.jobDone()
+		return err
+	}
 	done := make(chan error, 1)
 	go func() {
 		_, err := c.v.DomainSnapshotCreateXML(c.dom, snapXML,

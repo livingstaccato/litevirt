@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -619,5 +620,99 @@ func TestCapture_AnUnknownDirtyRateCapsTheDeadline(t *testing.T) {
 	}
 	if !m.qemu.suspendInJb {
 		t.Fatal("the capture was not suspended at the capped deadline")
+	}
+}
+
+// A hold taken after the capture's last check, before its libvirt job
+// exists: the first abort finds no job, and Hold keeps aborting until the
+// job (which admits an abort for its whole length) ends. The pauser's
+// suspend then lands after libvirt's cleanup, and libvirt never resumes the
+// guest over it.
+//
+// Mutation: Hold aborts once — its wait runs out, the pauser suspends during
+// the job and libvirt resumes the guest at its end; red.
+func TestCapture_AHoldBeforeTheJobExistsStillAbortsIt(t *testing.T) {
+	m := newLibvirt10(t)
+	m.qemu.reportBps = 0
+	m.qemu.dirtyBps = 2 * m.bps()
+	reg := NewCaptureRegistry()
+	var pauserSuspended, ranAfterPause bool
+	var mu sync.Mutex
+	pauserDone := make(chan bool, 1)
+	m.qemu.preCreate = func() {
+		go func() {
+			_, settled := reg.Hold("vm", 2*time.Second)
+			err := m.DomainSuspend(golibvirt.Domain{Name: "vm"})
+			mu.Lock()
+			pauserSuspended = err == nil
+			mu.Unlock()
+			pauserDone <- settled
+		}()
+		time.Sleep(30 * time.Millisecond) // the first abort finds no job
+	}
+	m.qemu.postJob = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if pauserSuspended && m.state() == golibvirt.DomainRunning {
+			ranAfterPause = true
+		}
+	}
+	_, _ = m.capture("s1", CaptureOptions{Deadline: 5 * time.Second, Registry: reg})
+	settled := <-pauserDone
+	if !settled || !m.qemu.aborted {
+		t.Fatalf("the hold: settled=%v, job aborted=%v; want the job aborted and over within the wait", settled, m.qemu.aborted)
+	}
+	if ranAfterPause {
+		t.Fatal("libvirt resumed the guest after the pauser's suspend")
+	}
+	if st := m.state(); st != golibvirt.DomainPaused {
+		t.Fatalf("final state %v, want paused", st)
+	}
+}
+
+// A VM the pauser already holds is not captured at all.
+//
+// Mutation: drop the refusal at begin — the capture suspends and snapshots
+// the held guest; red.
+func TestCapture_AHeldVMIsNotCaptured(t *testing.T) {
+	for _, v := range captureVariants {
+		t.Run(v.name, func(t *testing.T) {
+			m := newLibvirt10(t)
+			reg := NewCaptureRegistry()
+			reg.Hold("vm", time.Second)
+			o := v.opts
+			o.Registry = reg
+			if _, err := m.capture("s1", o); err == nil {
+				t.Fatal("a held VM was captured")
+			}
+			if len(m.qemu.creates) != 0 || m.qemu.dirtyCalcs != 0 || len(m.qemu.pauses) != 0 {
+				t.Fatalf("the refused capture acted: creates=%d dirty-rate calcs=%d pauses=%d",
+					len(m.qemu.creates), m.qemu.dirtyCalcs, len(m.qemu.pauses))
+			}
+		})
+	}
+}
+
+// A hold taken while the capture measures the dirty rate: the capture
+// re-checks under the registry's lock before its job and starts none.
+//
+// Mutation: drop the pre-job check — a LIVE job is started for a held
+// guest; red.
+func TestCapture_AHoldDuringTheProbeStartsNoJob(t *testing.T) {
+	m := newLibvirt10(t)
+	m.qemu.reportBps = 0
+	reg := NewCaptureRegistry()
+	held := false
+	captureSleep = func(time.Duration) {
+		if !held {
+			held = true
+			reg.Hold("vm", time.Millisecond) // no job to abort yet
+		}
+	}
+	if _, err := m.capture("s1", CaptureOptions{Registry: reg}); err == nil {
+		t.Fatal("a capture held during its probe reported success")
+	}
+	if n := len(m.qemu.creates); n != 0 {
+		t.Fatalf("%d snapshot job(s) started for a held guest", n)
 	}
 }

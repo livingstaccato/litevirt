@@ -70,19 +70,43 @@ func (r *CaptureRegistry) Hold(vm string, wait time.Duration) (captured, settled
 	if e == nil {
 		return false, true
 	}
-	if err := e.abort(); err != nil {
-		// No job (the memory write is over) or libvirt refused: the capture
-		// still honours the hold when it settles.
-		slog.Info("partition-pause: abort of an in-flight memory snapshot", "vm", vm, "error", err)
+	// The abort is retried until the create call has returned: a capture
+	// that checked for a hold just before the hold was taken may start its
+	// job after the first abort found none ("no job is active"), and the
+	// job admits an abort for its whole length.
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	retry := time.NewTicker(abortRetry)
+	defer retry.Stop()
+	for {
+		if err := e.abort(); err != nil {
+			slog.Debug("partition-pause: abort of an in-flight memory snapshot", "vm", vm, "error", err)
+		}
+		select {
+		case <-e.done:
+			return true, true
+		case <-deadline.C:
+			slog.Warn("partition-pause: a memory snapshot's libvirt job did not end within the wait; suspending anyway, "+
+				"and libvirt may resume the guest when the job ends",
+				"vm", vm, "wait", wait)
+			return true, false
+		case <-retry.C:
+		}
 	}
-	select {
-	case <-e.done:
-		return true, true
-	case <-time.After(wait):
-		slog.Warn("partition-pause: a memory snapshot's libvirt job did not end within the wait; suspending anyway",
-			"vm", vm, "wait", wait)
-		return true, false
+}
+
+// abortRetry is how often Hold repeats its abort while the capture's create
+// call has not returned.
+const abortRetry = 10 * time.Millisecond
+
+// Holding reports whether the pauser holds vm.
+func (r *CaptureRegistry) Holding(vm string) bool {
+	if r == nil {
+		return false
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.holds[vm]
 }
 
 // Release drops the pauser's hold on vm: its pause record is gone.

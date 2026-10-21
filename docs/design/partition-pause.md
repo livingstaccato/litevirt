@@ -244,9 +244,16 @@ a VM it takes a hold on it there:
    libvirt job (`virDomainAbortJob`) and waits, at most one pause call's
    budget, for libvirt's job cleanup to end. That cleanup resumes a guest
    that was running when the snapshot began, so the pauser's suspend lands
-   after it. A VM a capture holds paused reads paused, and is still the
-   pauser's to record and suspend.
-2. When the wait runs out, the pauser suspends anyway.
+   after it. The abort is repeated until the job has ended: a capture checks
+   for a hold under the registry's lock just before it starts its job, and
+   refuses to start one once held, but a hold taken just after that check
+   finds no job yet. A VM a capture holds paused reads paused, and is still
+   the pauser's to record and suspend.
+2. When the wait runs out (QEMU did not act on the abort), the pauser
+   suspends anyway. libvirt's cleanup may then resume the guest when the job
+   ends, and the capture re-suspends it: for that moment the pause does not
+   hold. The pauser therefore counts the pause as failed (§3.4): it raises
+   `partition_pause_failed`, and self-fences when the watchdog is verified.
 3. A capture decides its last step under the registry's lock: with a hold or
    a pause record it never resumes the guest, and re-suspends one it finds
    running. Otherwise it resumes only a guest it suspended itself.

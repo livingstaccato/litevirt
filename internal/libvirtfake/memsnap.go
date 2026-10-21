@@ -45,6 +45,9 @@ type MemoryModel struct {
 	DirtyBps float64
 	// ReportBps is what a dirty-rate calculation reports; < 0 makes it fail.
 	ReportBps float64
+	// IgnoreAbort: an abort of a LIVE capture succeeds but the job runs on
+	// (a QEMU that does not act on migrate_cancel in time).
+	IgnoreAbort bool
 }
 
 // PauseWindow is one stretch of fake time the guest's vCPUs were stopped.
@@ -390,6 +393,9 @@ func (c captureAPI) DomainAbortJob(dom golibvirt.Domain) error {
 	m := c.f.memLocked(dom.Name)
 	if m.jobAbort == nil {
 		return errors.New("Requested operation is not valid: no job is active on the domain")
+	}
+	if m.model.IgnoreAbort {
+		return nil
 	}
 	close(m.jobAbort)
 	m.jobAbort = nil

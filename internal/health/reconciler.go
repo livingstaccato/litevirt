@@ -569,6 +569,7 @@ func (r *Reconciler) reconcilePass(ctx context.Context) {
 	// the ones litevirt created that have none. Neither touches the runtime.
 	r.adoptManagedDomains(ctx)
 	r.reportOrphanRuntimes(ctx)
+	r.reportIOPausedVMs(ctx)
 	r.resolveGoneSubjects(ctx)
 }
 

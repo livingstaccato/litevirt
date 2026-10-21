@@ -2721,6 +2721,24 @@ pass, and so does any verdict while the owner host is `offline`, `fenced` or in
 (`health` / `healthDetail`), which is the quickest way to see why a
 `vm_healthy` wait is still waiting.
 
+### VM paused on an I/O error (`vm_io_paused`)
+
+When a guest's disk write fails — the storage pool its disks live on is full
+(ENOSPC), or the disk returns EIO — QEMU pauses the guest rather than fail
+the write inside it. The VM's owner host raises `vm_io_paused` about it
+(evaluator `vm_io_pause`, subject `vm/<name>`, **warning** severity), with
+the pause reason (`paused_reason`, `io-error`), the `host` and a `remedy` in
+the evidence. The guest is frozen, not stopped: its row stays `running`, it
+is not recorded as an out-of-band stop, and the restart policy does not
+restart it. A pause an operator asked for raises nothing.
+
+litevirt does not resume the guest by itself. A resume into a pool that is
+still full pauses it again.
+
+| Raised when | Clears when |
+|---|---|
+| The owner's reconcile pass finds the VM's domain paused by libvirt for an I/O error. | The owner sees the domain in any other state: resumed (`virsh resume <vm>` on its host, once space is freed), stopped, or gone. A pass that cannot read the domain's state leaves it as it was. |
+
 ### Runtime owner mismatch (`runtime_owner_mismatch`)
 
 The dual-run detector raises `runtime_owner_mismatch` about a **VM** when the

@@ -180,6 +180,10 @@ type Fake struct {
 	// (migrated, or a ShutOffDomain reason); a start clears it.
 	pendingNvram map[string][]byte
 	offReason    map[string]string
+	// ioPaused names the paused domains PauseOnIOError paused: QEMU's own
+	// pause on a failed disk write, reported with PausedReason io-error.
+	// Any other state change of the domain forgets it.
+	ioPaused map[string]bool
 	// pendingPermall is, per migrated-in TPM guest that has not resumed
 	// yet, the uuid whose permall its swtpm writes back once it runs.
 	pendingPermall map[string]string
@@ -472,6 +476,7 @@ func (f *Fake) SetState(name string, s State) {
 	if s != StatePaused {
 		delete(f.pendingNvram, name)
 	}
+	delete(f.ioPaused, name)
 	if s != StateShutdown {
 		delete(f.offReason, name)
 	}
@@ -961,7 +966,34 @@ func (f *Fake) SuspendDomain(name string) error {
 		return fmt.Errorf("libvirtfake: domain %q is not running (%s)", name, st)
 	}
 	f.domains[name] = StatePaused
+	delete(f.ioPaused, name)
 	f.record("suspend", name, "")
+	return nil
+}
+
+// PauseOnIOError pauses a RUNNING domain as QEMU does when a guest disk
+// write fails — ENOSPC on a full storage pool, or EIO — under libvirt's
+// default error policy: the domain stays active (StatePaused) and
+// DomainStateReason reports Reason "paused" with PausedReason io-error.
+// Scenario helper; resuming it (ResumeDomain) or any other state change
+// clears the I/O error.
+func (f *Fake) PauseOnIOError(name string) error {
+	defer f.daemon()()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.domains[name]
+	if !ok {
+		return fmt.Errorf("libvirtfake: domain %q not defined", name)
+	}
+	if st != StateRunning {
+		return fmt.Errorf("libvirtfake: domain %q is not running (%s)", name, st)
+	}
+	f.domains[name] = StatePaused
+	if f.ioPaused == nil {
+		f.ioPaused = map[string]bool{}
+	}
+	f.ioPaused[name] = true
+	f.record("io-error-pause", name, "")
 	return nil
 }
 
@@ -991,6 +1023,7 @@ func (f *Fake) resumeDomain(name string) error {
 		return fmt.Errorf("libvirtfake: domain %q is not paused (%s)", name, st)
 	}
 	f.domains[name] = StateRunning
+	delete(f.ioPaused, name)
 	f.record("resume", name, "")
 	f.flushPendingNvramLocked(name)
 	defer f.outsideLock(func() { f.running(name) })
@@ -1385,7 +1418,14 @@ func (f *Fake) domainStateReason(name string) (libvirt.DomainStatus, error) {
 			reason = "unknown"
 		}
 	}
-	return libvirt.DomainStatus{State: coarse, Reason: reason}, nil
+	paused := ""
+	if s == StatePaused {
+		paused = "user"
+		if f.ioPaused[name] {
+			paused = libvirt.PausedReasonIOError
+		}
+	}
+	return libvirt.DomainStatus{State: coarse, Reason: reason, PausedReason: paused}, nil
 }
 
 func (f *Fake) ListDomains() ([]string, error) {

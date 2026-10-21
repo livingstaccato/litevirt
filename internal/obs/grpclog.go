@@ -71,6 +71,13 @@ func (g grpcSlog) Errorf(format string, args ...any) {
 }
 
 // Fatal keeps gRPC's contract: log, then exit(1).
+//
+// It stays an exit, unlike a handler panic (grpcapi.RecoverUnaryInterceptor):
+// grpc-go calls Fatal only for programming errors at registration
+// (RegisterService with a bad, duplicate or post-Serve service; a duplicate
+// metric registration) and for CLOCK_PROCESS_CPUTIME_ID failing in ORCA load
+// reporting, which litevirt does not use. None is reachable from a request,
+// and the first two happen during startup, before this host serves anything.
 func (g grpcSlog) Fatal(args ...any)   { g.fatal(fmt.Sprint(args...)) }
 func (g grpcSlog) Fatalln(args ...any) { g.fatal(fmt.Sprintln(args...)) }
 func (g grpcSlog) Fatalf(format string, args ...any) {

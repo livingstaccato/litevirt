@@ -462,6 +462,19 @@ func boundedTelemetryShutdown(shutdown func(context.Context) error, timeout time
 	return shutdown(ctx)
 }
 
+// serverUnaryInterceptors is the daemon's unary chain, outermost first. The
+// panic recovery comes first so a panic anywhere below it, an interceptor
+// included, is answered Internal instead of ending the daemon
+// (grpcapi.RecoverUnaryInterceptor).
+func serverUnaryInterceptors(m *metrics.RPCMetrics, svc *grpcapi.Server) []grpc.UnaryServerInterceptor {
+	return []grpc.UnaryServerInterceptor{grpcapi.RecoverUnaryInterceptor, m.UnaryInterceptor(), svc.UnaryAuthInterceptor}
+}
+
+// serverStreamInterceptors is serverUnaryInterceptors for streaming RPCs.
+func serverStreamInterceptors(m *metrics.RPCMetrics, svc *grpcapi.Server) []grpc.StreamServerInterceptor {
+	return []grpc.StreamServerInterceptor{grpcapi.RecoverStreamInterceptor, m.StreamInterceptor(), svc.StreamAuthInterceptor}
+}
+
 func (d *Daemon) Run(ctx context.Context) error {
 	// Boot keeps a running watchdog petted until the heartbeat takes it over
 	// below; a Run that returns before then leaves it armed (no-op after).
@@ -2247,8 +2260,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	grpcOpts := []grpc.ServerOption{
 		grpc.Creds(connTracker.ServerCreds(credentials.NewTLS(tlsCfg))),
 		grpc.StatsHandler(connTracker.StatsHandler()),
-		grpc.ChainUnaryInterceptor(rpcMetrics.UnaryInterceptor(), svc.UnaryAuthInterceptor),
-		grpc.ChainStreamInterceptor(rpcMetrics.StreamInterceptor(), svc.StreamAuthInterceptor),
+		grpc.ChainUnaryInterceptor(serverUnaryInterceptors(rpcMetrics, svc)...),
+		grpc.ChainStreamInterceptor(serverStreamInterceptors(rpcMetrics, svc)...),
 		// Defense-in-depth for the legacy unary state-dump/replication paths: the
 		// 4 MiB gRPC default silently failed a large full-state dump (the bug
 		// StreamStateDump fixes), and a big PushMutations batch could trip it too.

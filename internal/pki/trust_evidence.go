@@ -202,6 +202,114 @@ func (e *HostTrustEvidence) VerifyRecordedPeer(chain [][]byte, host string) erro
 	return nil
 }
 
+// VerifyRecordedCustodyAt checks consumption-time authorization against this
+// immutable original observation. It does not consult today's trust owner or
+// issue a live capability. The caller must separately bind the original root,
+// local served identity and signed custody artifact to its genuine context.
+func (e *HostTrustEvidence) VerifyRecordedCustodyAt(chain [][]byte, host, serial string, at time.Time) error {
+	if e == nil || e.root == nil || !e.root.IsCA || len(chain) == 0 || len(chain) > maxTrustCertificates || host == "" || len(host) > 253 || serial == "" || len(serial) > maxServingChainBytes || at.IsZero() {
+		return errors.New("invalid recorded custody input")
+	}
+	if len(e.crls) > maxTrustCRLs || len(e.successors) > maxTrustSuccessors {
+		return errors.New("recorded custody evidence exceeds bound")
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(e.root)
+	intermediates := x509.NewCertPool()
+	var leaf *x509.Certificate
+	size := 0
+	for i, raw := range chain {
+		if len(raw) > maxServingChainBytes-size {
+			return errors.New("recorded custody chain exceeds bound")
+		}
+		size += len(raw)
+		cert, err := x509.ParseCertificate(raw)
+		if err != nil {
+			return err
+		}
+		if i == 0 {
+			leaf = cert
+		} else {
+			intermediates.AddCert(cert)
+		}
+	}
+	if leaf.IsCA || leaf.Subject.CommonName != host || leaf.SerialNumber.Sign() < 0 || leaf.SerialNumber.Text(16) != serial || !hasUsage(leaf, x509.ExtKeyUsageClientAuth) || !hasUsage(leaf, x509.ExtKeyUsageServerAuth) {
+		return errors.New("recorded custody identity differs")
+	}
+	// DecodeHostTrustEvidence authenticated these bounded signed objects. As
+	// with the original HostTrust observation, its covering CRL union is the
+	// revocation predicate; later CRLs and current freshness are not consulted.
+	revoked := make(map[string]bool)
+	for _, crl := range e.crls {
+		if crl == nil {
+			return errors.New("invalid recorded custody CRL")
+		}
+		for _, entry := range crl.RevokedCertificateEntries {
+			revoked[entry.SerialNumber.Text(16)] = true
+		}
+	}
+	for _, usage := range []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth} {
+		paths, err := leaf.Verify(x509.VerifyOptions{Roots: roots, Intermediates: intermediates, CurrentTime: at, KeyUsages: []x509.ExtKeyUsage{usage}})
+		if err != nil {
+			return err
+		}
+		usable := false
+		for _, path := range paths {
+			clean := true
+			for _, cert := range path {
+				if revoked[cert.SerialNumber.Text(16)] {
+					clean = false
+					break
+				}
+			}
+			if clean {
+				usable = true
+				break
+			}
+		}
+		if !usable {
+			return errors.New("recorded custody chain is revoked")
+		}
+	}
+	if !e.policy {
+		// Preserve the recorded standing-successor rule: a revoked successor
+		// still retires its predecessor if its own renewal remains standing.
+		// Breadth-first traversal preserves the existing depth bound without
+		// repeatedly expanding branching or cyclic signed successor evidence.
+		edges := make(map[string][]string)
+		for _, cert := range e.successors {
+			if cert == nil {
+				return errors.New("invalid recorded custody successor")
+			}
+			previous, ok := RenewedFromSerial(cert)
+			if !ok {
+				return errors.New("invalid recorded custody successor")
+			}
+			if cert.Subject.CommonName == host {
+				edges[previous] = append(edges[previous], cert.SerialNumber.Text(16))
+			}
+		}
+		frontier := []string{serial}
+		seen := map[string]bool{serial: true}
+		for depth := 0; depth <= maxSupersessionChain && len(frontier) != 0; depth++ {
+			var next []string
+			for _, previous := range frontier {
+				for _, successor := range edges[previous] {
+					if !revoked[successor] {
+						return errors.New("recorded custody peer has a standing successor")
+					}
+					if !seen[successor] {
+						seen[successor] = true
+						next = append(next, successor)
+					}
+				}
+			}
+			frontier = next
+		}
+	}
+	return nil
+}
+
 // ReconcileCompletedHostTrust compares inert evidence with the genuine local
 // domain and installs monotone signed-object floors under the real owner/file
 // lock. The storage startup owner alone selects completed publications. Missing

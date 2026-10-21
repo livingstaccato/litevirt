@@ -390,6 +390,12 @@ type Coordinator struct {
 	// (grpcapi.Server.RecoveryClaimHealthTick — ha.claim.stranded,
 	// ha.voter.unavailable). nil never evaluates them.
 	ClaimHealth func(ctx context.Context)
+	// PressureHealth, when set, runs once per tick in which this coordinator
+	// holds the lease: the host.pressure conditions, written from each
+	// host's latest readiness-probe answer (grpcapi.Server.PressureHealthTick),
+	// so a host that cannot write is still described. It only reports. nil
+	// never evaluates them.
+	PressureHealth func(ctx context.Context)
 	// Claimer decides recovery claims (docs/design/recovery-claims.md §3.13):
 	// *grpcapi.Server, whose proposer reaches every member of the adopted
 	// voter generation. Consulted only while RecoveryClaimEnforced says so.
@@ -821,6 +827,9 @@ func (c *Coordinator) run(ctx context.Context) {
 	}
 	if c.ClaimHealth != nil {
 		c.ClaimHealth(ctx)
+	}
+	if c.PressureHealth != nil {
+		c.PressureHealth(ctx)
 	}
 
 	// The voter set is both halves of the quorum: its size is the

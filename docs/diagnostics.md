@@ -2723,9 +2723,12 @@ pass, and so does any verdict while the owner host is `offline`, `fenced` or in
 
 ### VM paused on an I/O error (`vm_io_paused`)
 
-When a guest's disk write fails — the storage pool its disks live on is full
-(ENOSPC), or the disk returns EIO — QEMU pauses the guest rather than fail
-the write inside it. The VM's owner host raises `vm_io_paused` about it
+When a guest's disk write fails with ENOSPC — the storage pool its disks
+live on is full, or a thin volume has run out of backing space — QEMU pauses
+the guest rather than fail the write inside it. That is QEMU's default
+write-error policy (`werror=enospc`), and litevirt sets no other: any other
+write error (EIO) and every read error are reported to the guest, which is
+not paused. The VM's owner host raises `vm_io_paused` about it
 (evaluator `vm_io_pause`, subject `vm/<name>`, **warning** severity), with
 the pause reason (`paused_reason`, `io-error`), the `host` and a `remedy` in
 the evidence. The guest is frozen, not stopped: its row stays `running`, it

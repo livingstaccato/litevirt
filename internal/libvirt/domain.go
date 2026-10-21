@@ -176,8 +176,8 @@ type DomainStatus struct {
 	Reason string
 	// PausedReason is why a paused domain (Reason "paused") is paused, from
 	// libvirt's VIR_DOMAIN_PAUSED_* reason: PausedReasonIOError for a guest
-	// QEMU paused because a disk write failed (a full storage pool's
-	// ENOSPC, an EIO), "user" for an operator's or litevirt's own suspend,
+	// QEMU paused on a disk I/O error (under QEMU's default werror=enospc,
+	// only an ENOSPC write pauses: a full storage pool), "user" for an operator's or litevirt's own suspend,
 	// and so on. "" for any other state. Reason stays "paused" whatever
 	// this says: every caller that reads "paused" as "active, not
 	// executing" keeps reading it so.
@@ -185,7 +185,9 @@ type DomainStatus struct {
 }
 
 // PausedReasonIOError is DomainStatus.PausedReason for a guest QEMU paused on
-// a disk I/O error (its werror/rerror policy "stop", libvirt's default).
+// a disk I/O error. Under QEMU's default error policy (werror=enospc,
+// rerror=report; litevirt sets no error_policy) only a write failing with
+// ENOSPC pauses the guest; any other error is reported to the guest.
 const PausedReasonIOError = "io-error"
 
 // DomainStateReason returns the domain's coarse State together with the

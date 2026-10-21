@@ -4,14 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
-// A guest disk write that fails — ENOSPC on a full storage pool, EIO —
-// pauses the guest's QEMU under libvirt's default error policy. libvirt
+// A guest disk write that fails with ENOSPC — a full storage pool, a thin
+// volume out of backing space — pauses the guest's QEMU under QEMU's default
+// write-error policy (werror=enospc; litevirt sets no error_policy). Other
+// write errors (EIO) and read errors are reported to the guest instead and
+// do not pause it. libvirt
 // reports the domain paused, as it does an operator's pause, and every
 // caller that reads Reason "paused" as "active, not executing" is right to:
 // the guest holds its RAM and its disks, and is not a stop. What it was
@@ -29,6 +33,39 @@ const (
 	// on a disk I/O error.
 	CondVMIOPaused = "vm_io_paused"
 )
+
+// ioPausedWarnEvery is how often the sweep repeats a warning about one VM
+// whose condition it cannot write: a host in write quarantine refuses every
+// pass's attempt, and one line per VM per pass would bury the log.
+const ioPausedWarnEvery = 10 * time.Minute
+
+// ioPausedWarnings rate-limits those warnings, per VM.
+type ioPausedWarnings struct {
+	mu   sync.Mutex
+	last map[string]time.Time
+}
+
+// due reports whether a warning about vm may be logged at now, and if so
+// records it.
+func (w *ioPausedWarnings) due(vm string, now time.Time) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if t, ok := w.last[vm]; ok && now.Sub(t) < ioPausedWarnEvery {
+		return false
+	}
+	if w.last == nil {
+		w.last = map[string]time.Time{}
+	}
+	w.last[vm] = now
+	return true
+}
+
+// clear forgets vm once its condition was written.
+func (w *ioPausedWarnings) clear(vm string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.last, vm)
+}
 
 // vmIOPausedEvidence is the evidence JSON of a vm_io_paused row.
 type vmIOPausedEvidence struct {
@@ -82,7 +119,8 @@ func (r *Reconciler) reportIOPausedVMs(ctx context.Context) {
 			openHere[row.SubjectID] = row
 		}
 	}
-	now := r.now().UTC().Format(time.RFC3339)
+	at := r.now()
+	now := at.UTC().Format(time.RFC3339)
 	for name := range ioPaused {
 		if _, ok := openHere[name]; ok {
 			continue
@@ -100,10 +138,14 @@ func (r *Reconciler) reportIOPausedVMs(ctx context.Context) {
 			FirstSeen: now, LastSeen: now, ConfirmedAt: now, Reporter: r.hostName,
 		}
 		if err := corrosion.UpsertHealthCondition(ctx, r.db, row); err != nil {
-			slog.Warn("io-paused: raising vm_io_paused failed", "vm", name, "error", err)
+			if r.ioPausedWarn.due(name, at) {
+				slog.Warn("io-paused: VM's guest is paused on a disk write error, and raising vm_io_paused failed (repeated at most every 10m)",
+					"vm", name, "error", err)
+			}
 			continue
 		}
-		slog.Warn("io-paused: VM's guest is paused on a disk I/O error (a full storage pool?)", "vm", name)
+		r.ioPausedWarn.clear(name)
+		slog.Warn("io-paused: VM's guest is paused on a disk write error (a full storage pool?)", "vm", name)
 	}
 	for name, row := range openHere {
 		if ioPaused[name] || unanswered[name] {
@@ -111,9 +153,12 @@ func (r *Reconciler) reportIOPausedVMs(ctx context.Context) {
 		}
 		row.Lifecycle, row.ResolvedAt, row.LastSeen, row.Reporter = corrosion.ConditionResolved, now, now, r.hostName
 		if err := corrosion.UpsertHealthCondition(ctx, r.db, row); err != nil {
-			slog.Warn("io-paused: resolving vm_io_paused failed", "vm", name, "error", err)
+			if r.ioPausedWarn.due(name, at) {
+				slog.Warn("io-paused: resolving vm_io_paused failed (repeated at most every 10m)", "vm", name, "error", err)
+			}
 			continue
 		}
+		r.ioPausedWarn.clear(name)
 		slog.Info("io-paused: VM's guest is no longer paused on an I/O error", "vm", name)
 	}
 }

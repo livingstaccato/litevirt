@@ -1,9 +1,13 @@
 package health
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
@@ -90,5 +94,48 @@ func TestReconciler_IOPausedVMRaisesAndResolves(t *testing.T) {
 	r.reportIOPausedVMs(ctx)
 	if ioPausedOpen(t, db, "full") {
 		t.Errorf("vm_io_paused still open for a resumed guest")
+	}
+}
+
+// On a host in write quarantine every pass's raise is refused. The warning
+// about it is logged once, not once per pass, until ioPausedWarnEvery has
+// gone by.
+//
+// Mutation: log on every failed raise (skip ioPausedWarn.due) — three
+// passes log three warnings and this goes red.
+func TestReconciler_IOPausedRaiseFailureWarnsRateLimited(t *testing.T) {
+	ctx := context.Background()
+	db := testReconcilerDB(t)
+	fake := libvirtfake.New()
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "full", HostName: "node-a", State: "running"}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.DefineDomain(`<domain type='kvm'><name>full</name></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetState("full", libvirtfake.StateRunning)
+	if err := fake.PauseOnIOError("full"); err != nil {
+		t.Fatal(err)
+	}
+	db.SetWriteQuarantine(func() string { return "rolled back below latched token(s): test" })
+	r := NewReconciler("node-a", t.TempDir(), db, fake)
+	now := time.Now()
+	r.Now = func() time.Time { return now }
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	for i := 0; i < 3; i++ {
+		r.reportIOPausedVMs(ctx)
+	}
+	if n := strings.Count(buf.String(), "raising vm_io_paused failed"); n != 1 {
+		t.Errorf("3 refused passes logged %d warnings, want 1:\n%s", n, buf.String())
+	}
+	now = now.Add(ioPausedWarnEvery)
+	r.reportIOPausedVMs(ctx)
+	if n := strings.Count(buf.String(), "raising vm_io_paused failed"); n != 2 {
+		t.Errorf("a refused pass %v later logged no new warning (%d in all)", ioPausedWarnEvery, n)
 	}
 }

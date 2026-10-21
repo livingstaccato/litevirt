@@ -88,6 +88,9 @@ type imagePullFlight struct {
 // and starts them. It also detects split-brain conditions where a VM
 // is running locally in libvirt but corrosion says it belongs to another host.
 type Reconciler struct {
+	// ioPausedWarn rate-limits the io-paused sweep's write-failure
+	// warnings (io_paused.go).
+	ioPausedWarn ioPausedWarnings
 	// stopSyncHook, test-only, runs between the out-of-band stop sync's
 	// decision and its write, where a concurrent `lv stop` can land.
 	stopSyncHook func(ctx context.Context, vmName string)

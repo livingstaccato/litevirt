@@ -972,7 +972,7 @@ func TestDoctorFirmwareMove_NeverRepoints(t *testing.T) {
 			c.caller != "internal/grpcapi.Server.drainOneVM" &&
 			// Failover re-points a migrating row whose failed source left the
 			// guest running on the target; never a firmware VM's.
-			c.caller != "internal/grpcapi.Server.SettleFailedSourceMigration":
+			c.caller != "internal/grpcapi.Server.settleFailedSourceMigration":
 			t.Errorf("RepointMigratedVM called from %s at %s", c.caller, c.pos)
 		case c.sel == "ReturnMigratedVM":
 			n++

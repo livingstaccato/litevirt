@@ -9,14 +9,16 @@ import (
 )
 
 // A VM recorded migrating on a fenced host is rescheduled only on
-// SettleMigratingRow's MigratingRecover. Unwired, or on Hold or Settled, its
-// row is left as it is, and a hold names the VM on the host's hold reason
-// and owes a retry of the recovery. A running VM beside it is rescheduled
-// either way, so the recovery ran.
+// SettleMigratingRows' MigratingRecover. Unwired, or on Hold or Settled (or
+// no decision for it), its row is left as it is, and a hold names the VM on
+// the host's hold reason and owes a retry of the recovery. A running VM
+// beside it is rescheduled either way, so the recovery ran. The hook is
+// called once per pass with every migrating VM of the host, so their targets
+// are asked once, not once per VM.
 //
 // Mutation: drop the migrating check in recoverWorkloads — every arm but
 // "recover" sees mg1 rescheduled pending to good.
-func TestRecoverWorkloads_MigratingRowIsDecidedBySettleMigratingRow(t *testing.T) {
+func TestRecoverWorkloads_MigratingRowIsDecidedBySettleMigratingRows(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		hook     bool
@@ -43,6 +45,9 @@ func TestRecoverWorkloads_MigratingRowIsDecidedBySettleMigratingRow(t *testing.T
 			}
 			for _, v := range []corrosion.VMRecord{
 				{Name: "mg1", HostName: "bad", State: "migrating", StateDetail: "→ tgt"},
+				// mg0 gets no decision from the hook: held, whatever the hook says of mg1.
+				// It sorts first, so mg1's hold reason, when it has one, is the newest.
+				{Name: "mg0", HostName: "bad", State: "migrating", StateDetail: "→ tgt"},
 				{Name: "rv1", HostName: "bad", State: "running"},
 			} {
 				v.CPUActual, v.MemActual, v.Spec = 1, 512, `{"on_host_failure":"restart-any"}`
@@ -53,9 +58,13 @@ func TestRecoverWorkloads_MigratingRowIsDecidedBySettleMigratingRow(t *testing.T
 			c := newTestCoordinator("good", db)
 			var asked []string
 			if tc.hook {
-				c.SettleMigratingRow = func(_ context.Context, vm corrosion.VMRecord, source string) (MigratingVerdict, string) {
-					asked = append(asked, vm.Name+"@"+source)
-					return tc.verdict, "the test's verdict"
+				c.SettleMigratingRows = func(_ context.Context, source string, vms []corrosion.VMRecord) map[string]MigratingDecision {
+					var names []string
+					for _, vm := range vms {
+						names = append(names, vm.Name)
+					}
+					asked = append(asked, strings.Join(names, ",")+"@"+source)
+					return map[string]MigratingDecision{"mg1": {Verdict: tc.verdict, Detail: "the test's verdict"}}
 				}
 			}
 			c.recoverWorkloads(ctx, &corrosion.HostRecord{Name: "bad", State: "fenced"})
@@ -63,8 +72,14 @@ func TestRecoverWorkloads_MigratingRowIsDecidedBySettleMigratingRow(t *testing.T
 			if vm, _ := corrosion.GetVM(ctx, db, "rv1"); vm == nil || vm.HostName != "good" {
 				t.Fatalf("rv1 = %+v, want it rescheduled to good: the recovery did not run", vm)
 			}
-			if tc.hook && (len(asked) != 1 || asked[0] != "mg1@bad") {
-				t.Fatalf("SettleMigratingRow was asked %v, want once for mg1 on bad", asked)
+			if tc.hook && (len(asked) != 1 || asked[0] != "mg0,mg1@bad") {
+				t.Fatalf("SettleMigratingRows was asked %v, want once for mg0 and mg1 on bad", asked)
+			}
+			if vm, _ := corrosion.GetVM(ctx, db, "mg0"); vm == nil || vm.HostName != "bad" || vm.State != "migrating" {
+				t.Fatalf("mg0 = %+v, given no decision; want its row left migrating on bad", vm)
+			}
+			if !c.claimRetry["bad"] {
+				t.Fatal("no retry is owed for mg0's hold")
 			}
 			vm, _ := corrosion.GetVM(ctx, db, "mg1")
 			if tc.moved {
@@ -76,10 +91,9 @@ func TestRecoverWorkloads_MigratingRowIsDecidedBySettleMigratingRow(t *testing.T
 			if vm == nil || vm.HostName != "bad" || vm.State != "migrating" {
 				t.Fatalf("mg1 = %+v, want its row left migrating on bad", vm)
 			}
-			held := strings.Contains(c.holdReason["bad"], "mg1")
-			if held != tc.heldNote || held != c.claimRetry["bad"] {
-				t.Fatalf("hold reason %q, retry owed %v; want a hold naming mg1 and a retry: %v",
-					c.holdReason["bad"], c.claimRetry["bad"], tc.heldNote)
+			held := strings.Contains(c.holdReason["bad"], "VM mg1 ")
+			if held != tc.heldNote {
+				t.Fatalf("hold reason %q; want one naming mg1: %v", c.holdReason["bad"], tc.heldNote)
 			}
 		})
 	}

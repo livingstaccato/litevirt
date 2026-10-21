@@ -7,21 +7,24 @@
 // source is then judged failed and fenced. Recovery must not start the guest
 // anywhere while it may run on the target: that would be two running copies
 // of one VM. The coordinator asks the target first (failover's
-// SettleMigratingRow):
+// SettleMigratingRows):
 //
 //   - the target runs it: the row is re-pointed there, nothing is started;
 //   - the target has no domain of it: recovered as any running VM is;
-//   - anything else (a paused domain, no answer): held, with
-//     vm.migration_unresolved raised for an operator.
+//   - anything else (a paused domain, no answer, no target recorded): held,
+//     with vm.migration_unresolved raised naming what settles it. Each hold's
+//     scenario then takes that step and reaches exactly one running copy.
 package fleet
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
@@ -35,11 +38,19 @@ import (
 // policy: the control that recovery did run.
 func migratingRowFleet(t *testing.T, clock *VirtualClock, claims bool, targetState libvirtfake.State) (c *Cluster, a, b, victim *Node) {
 	t.Helper()
+	return migratingRowFleetWith(t, clock, claims, targetState, func(b *Node) string { return "→ " + b.Name })
+}
+
+// migratingRowFleetWith is migratingRowFleet with mg1's state detail given by
+// detail (b is the node its domain is on).
+func migratingRowFleetWith(t *testing.T, clock *VirtualClock, claims bool, targetState libvirtfake.State,
+	detail func(b *Node) string) (c *Cluster, a, b, victim *Node) {
+	t.Helper()
 	setup := func(_ *Cluster, a, b, victim *Node) {
 		ctx := context.Background()
 		if err := corrosion.InsertVM(ctx, a.DB, corrosion.VMRecord{
 			Name: "mg1", HostName: victim.Name, Spec: `{"on_host_failure":"restart-any"}`,
-			State: "migrating", StateDetail: "→ " + b.Name,
+			State: "migrating", StateDetail: detail(b),
 		}, nil, nil); err != nil {
 			t.Fatalf("InsertVM mg1: %v", err)
 		}
@@ -122,11 +133,67 @@ func mg1Views(t *testing.T, nodes ...*Node) string {
 // vm.migration_unresolved open.
 func migrationUnresolvedOpen(t *testing.T, n *Node) bool {
 	t.Helper()
+	_, open := mg1Unresolved(t, n)
+	return open
+}
+
+// mg1Unresolved is the detail of mg1's vm.migration_unresolved on n's
+// replica, and whether it is open.
+func mg1Unresolved(t *testing.T, n *Node) (string, bool) {
+	t.Helper()
 	row, ok, err := corrosion.GetHealthCondition(context.Background(), n.DB, "drain", "vm.migration_unresolved", "vm", "mg1")
 	if err != nil {
 		t.Fatalf("%s: read vm.migration_unresolved: %v", n.Name, err)
 	}
-	return ok && row.Lifecycle != corrosion.ConditionResolved
+	var ev struct {
+		Detail string `json:"detail"`
+	}
+	_ = json.Unmarshal([]byte(row.Evidence), &ev)
+	return ev.Detail, ok && row.Lifecycle != corrosion.ConditionResolved
+}
+
+// requireHeldNaming checks mg1 is held on victim — its row there, migrating,
+// nothing of it on a, the condition open — with the condition naming each of
+// want (the step that settles the hold).
+func requireHeldNaming(t *testing.T, a, b, victim *Node, want ...string) {
+	t.Helper()
+	detail := mg1Views(t, a, b)
+	if a.Virt.DomainExists("mg1") {
+		t.Fatalf("%s holds a domain of mg1 while it is held\n  %s", a.Name, detail)
+	}
+	for _, ev := range a.Virt.EventLog() {
+		if ev.Domain == "mg1" {
+			t.Fatalf("%s acted on mg1 (%s) while it is held\n  %s", a.Name, ev.Op, detail)
+		}
+	}
+	if vm := vmOn(t, a, "mg1"); vm.HostName != victim.Name || vm.State != "migrating" || vm.PendingActionID != "" {
+		t.Fatalf("mg1 was moved or settled while it is held; want it held on %s\n  %s", victim.Name, detail)
+	}
+	ev, open := mg1Unresolved(t, a)
+	if !open {
+		t.Fatalf("mg1 is held with no vm.migration_unresolved for an operator\n  %s", detail)
+	}
+	// `lv stop` forwards to the VM's host, the failed source: it cannot work.
+	if strings.Contains(ev, "lv stop") {
+		t.Errorf("vm.migration_unresolved names `lv stop`, which forwards to the failed %s: %s", victim.Name, ev)
+	}
+	for _, w := range want {
+		if !strings.Contains(ev, w) {
+			t.Errorf("vm.migration_unresolved does not name %q: %s", w, ev)
+		}
+	}
+}
+
+// tickA runs a's coordinator and reconciler alone, n times: b may be
+// unreachable from a, so nothing waits for the two to converge.
+func tickA(t *testing.T, cs *Coordinators, clock *VirtualClock, a *Node, n int) {
+	t.Helper()
+	ctx := context.Background()
+	for i := 0; i < n; i++ {
+		cs.Tick(ctx, a)
+		health.NewReconciler(a.Name, t.TempDir(), a.DB, a.Virt).ReconcileOnce(ctx)
+		clock.Advance(contentionPoll)
+	}
 }
 
 // TestFleet_Failover_MigratingRowRunningOnTargetIsRepointed: the source of
@@ -175,6 +242,19 @@ func TestFleet_Failover_MigratingRowRunningOnTargetIsRepointed(t *testing.T) {
 			if migrationUnresolvedOpen(t, a) {
 				t.Errorf("vm.migration_unresolved is open for mg1 after its row was settled\n  %s", detail)
 			}
+			// The re-point leaves the disk rows and replication on the source;
+			// its event names the command that moves them.
+			evs, err := corrosion.ListVMEvents(context.Background(), a.DB, "mg1", 20, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			named := false
+			for _, e := range evs {
+				named = named || (e.Type == "vm.failover.repointed" && strings.Contains(e.Detail, "lv doctor repair-owner mg1 "+b.Name))
+			}
+			if !named {
+				t.Errorf("no vm.failover.repointed event naming `lv doctor repair-owner mg1 %s`: %+v", b.Name, evs)
+			}
 		})
 	}
 }
@@ -183,24 +263,113 @@ func TestFleet_Failover_MigratingRowRunningOnTargetIsRepointed(t *testing.T) {
 // holds mg1 paused — a guest whose migration may not have finished, or that
 // is paused after the cutover. Recovery cannot tell, so mg1 is held: its row
 // stays on the fenced source, migrating, nothing of it is started on a, and
-// vm.migration_unresolved names why.
+// vm.migration_unresolved names why and the step that settles it. No lv
+// command settles it while the source is down: the step is resuming the
+// guest on the target, and the next poll then re-points the row there and
+// resolves the condition, with one running copy.
 //
-// Mutation: as above — mg1 is rescheduled to a and started there.
+// Mutations: as above — mg1 is rescheduled to a and started there; drop the
+// condition's resolution after a re-point — red in the second phase.
 func TestFleet_Failover_MigratingRowHeldWhileTargetIsUnsettled(t *testing.T) {
 	clock := NewVirtualClock(time.Now().UTC())
 	c, a, b, victim := migratingRowFleet(t, clock, false, libvirtfake.StatePaused)
+	cs := runRecovery(t, c, clock, false, a, b)
+	assertControlRecovered(t, c, a, victim)
+	// b's reconciler shuts off a paused guest whose row is not its own, so
+	// the target reports it stopped by now: held all the same.
+	requireHeldNaming(t, a, b, victim, "holds a domain of it in state", "virsh start mg1")
+
+	// The operator resumes the guest on b; the next poll settles it there.
+	b.Virt.SetState("mg1", libvirtfake.StateRunning)
+	for i := 0; i < 2; i++ {
+		cs.Tick(context.Background(), a)
+		c.WaitConverged(t, convergeTimeout, a, b)
+		clock.Advance(contentionPoll)
+	}
+	detail := mg1Views(t, a, b)
+	if vm := vmOn(t, a, "mg1"); vm.HostName != b.Name || vm.State != "running" {
+		t.Fatalf("mg1 was not re-pointed to %s once its guest ran there\n  %s", b.Name, detail)
+	}
+	if on := runningOn(c, "mg1"); len(on) != 1 || on[0] != b.Name {
+		t.Fatalf("mg1 runs on %v, want only %s\n  %s", on, b.Name, detail)
+	}
+	if migrationUnresolvedOpen(t, a) {
+		t.Fatalf("vm.migration_unresolved is still open after mg1 was re-pointed\n  %s", detail)
+	}
+}
+
+// TestFleet_Failover_MigratingRowHeldWhileTargetIsUnreachable: the target
+// still runs mg1 but a cannot reach it — the likeliest real shape of this
+// failure, a rack or switch fault taking the source and the target out
+// together. mg1 stays held for as long as recovery would have acted, and no
+// second copy of it starts. The hold names `lv host fence-confirm` of the
+// target: once it is powered off (its guest with it) and confirmed so, the
+// next poll recovers mg1 onto a, with one running copy.
+//
+// Claims off only: with claims on, the claim's voters are a, b and the
+// victim, and with b unreachable no claim forms, so the arm could not tell a
+// hold from a refused claim.
+//
+// Mutation: a probe error recovers (MigratingRecover) — a starts mg1 while b
+// runs it, red.
+func TestFleet_Failover_MigratingRowHeldWhileTargetIsUnreachable(t *testing.T) {
+	clock := NewVirtualClock(time.Now().UTC())
+	c, a, b, victim := migratingRowFleet(t, clock, false, libvirtfake.StateRunning)
+	c.SetLinkFaultBoth(a, b, LinkFault{BlockAll: true})
+	cs := c.NewCoordinators(clock)
+	tickA(t, cs, clock, a, 4)
+	if len(cs.Fences()) == 0 {
+		t.Fatal("victim was never fenced; without a fence there is no recovery and this proves nothing")
+	}
+	if rv := vmOn(t, a, "rv1"); rv.HostName != a.Name {
+		t.Fatalf("the control rv1 = %+v, want it recovered to %s", rv, a.Name)
+	}
+	requireHeldNaming(t, a, b, victim, "cannot be asked", "lv host fence-confirm "+b.Name)
+	if on := runningOn(c, "mg1"); len(on) != 1 || on[0] != b.Name {
+		t.Fatalf("mg1 runs on %v, want only the unreachable %s", on, b.Name)
+	}
+
+	// The operator powers b off, its guest with it, and confirms it.
+	c.Kill(b)
+	_ = b.Virt.DestroyDomain("mg1")
+	PublishHealth(t, a, b.Name, 5, clock.Now())
+	mustFenceConfirm(t, a, b.Name)
+	tickA(t, cs, clock, a, 3)
+	detail := mg1Views(t, a)
+	if on := runningOn(c, "mg1"); len(on) != 1 || on[0] != a.Name {
+		t.Fatalf("after %s was confirmed off, mg1 runs on %v, want only %s\n  %s", b.Name, on, a.Name, detail)
+	}
+}
+
+// TestFleet_Failover_MigratingRowWithNoTargetRecordedIsHeld: mg1's row says
+// migrating but names no target (a legacy or hand-edited row: both of
+// today's writers record it), and its guest runs on b. Nothing can be asked,
+// so mg1 is held, the condition naming `lv doctor repair-owner`. That
+// command, run against b, records mg1 there, with one running copy.
+//
+// Mutation: a row with no target recovers — a starts mg1 while b runs it,
+// red.
+func TestFleet_Failover_MigratingRowWithNoTargetRecordedIsHeld(t *testing.T) {
+	ctx := context.Background()
+	clock := NewVirtualClock(time.Now().UTC())
+	c, a, b, victim := migratingRowFleetWith(t, clock, false, libvirtfake.StateRunning, func(*Node) string { return "" })
 	runRecovery(t, c, clock, false, a, b)
 	assertControlRecovered(t, c, a, victim)
+	requireHeldNaming(t, a, b, victim, "names no target", "lv doctor repair-owner mg1 <host>")
 
+	if _, err := c.SelfClient(a).RepairVMOwner(ctx, &pb.RepairVMOwnerRequest{Name: "mg1", Host: b.Name}); err != nil {
+		t.Fatalf("lv doctor repair-owner mg1 %s: %v", b.Name, err)
+	}
+	c.WaitConverged(t, convergeTimeout, a, b)
 	detail := mg1Views(t, a, b)
-	if a.Virt.DomainExists("mg1") {
-		t.Fatalf("%s holds a domain of mg1 while %s holds it paused\n  %s", a.Name, b.Name, detail)
+	if vm := vmOn(t, a, "mg1"); vm.HostName != b.Name || vm.State != "running" {
+		t.Fatalf("repair-owner did not record mg1 on %s\n  %s", b.Name, detail)
 	}
-	if vm := vmOn(t, a, "mg1"); vm.HostName != victim.Name || vm.State != "migrating" || vm.PendingActionID != "" {
-		t.Fatalf("mg1 was moved or settled while its target holds it paused; want it held on %s\n  %s", victim.Name, detail)
+	if on := runningOn(c, "mg1"); len(on) != 1 || on[0] != b.Name {
+		t.Fatalf("mg1 runs on %v, want only %s\n  %s", on, b.Name, detail)
 	}
-	if !migrationUnresolvedOpen(t, a) {
-		t.Fatalf("mg1 is held with no vm.migration_unresolved for an operator\n  %s", detail)
+	if migrationUnresolvedOpen(t, a) {
+		t.Fatalf("vm.migration_unresolved is still open after repair-owner\n  %s", detail)
 	}
 }
 

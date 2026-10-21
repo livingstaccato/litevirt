@@ -2080,7 +2080,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fc.RecoveryClaimEnforced = svc.RecoveryClaimEnforced
 	// A VM recorded migrating on a failed host is recovered only once the
 	// migration's target says it has no copy; one it runs is re-pointed there.
-	fc.SettleMigratingRow = svc.SettleFailedSourceMigration
+	fc.SettleMigratingRows = svc.SettleFailedSourceMigrations
 	// The recovery-claim health conditions (ha.claim.stranded,
 	// ha.voter.unavailable) and host.address_shared are the lease holder's to
 	// write, like genesis.

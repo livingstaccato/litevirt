@@ -1206,8 +1206,14 @@ them. The thresholds are per host, because each host reads its own
 Pools are the file-based pools of this host (`local`, `dir`, `nfs`, `btrfs`),
 from config and from pools made with `lv pool create`. A pool on the data directory's
 filesystem is graded under both names. A statfs that gets no answer (a hung
-NFS mount) is recorded as the resource's error, and the resource keeps its
-last level.
+NFS mount), or a descriptor or memory count that cannot be read, is recorded
+as the resource's error, and the resource keeps its last level. The pool list
+is read off the sampling path: a read that does not return within 2 seconds is
+abandoned, and the last list is graded.
+
+A report is **stale** when the pool list read is overdue, or when no sample
+has completed for more than three sample intervals. Its levels are then the
+last ones known.
 
 ```yaml
 pressure:
@@ -1261,10 +1267,13 @@ threshold that is off (0) is not checked against the others.
   `critical`, and it resolves when the host is back to `ok`. See
   [diagnostics](diagnostics.md#resource-pressure-hostpressure).
 - `lv host inspect <host>`. `pressure` holds the level, the pressured resources,
-  `since`, `time_to_full_sec` and each resource's free and total.
+  `since`, `time_to_full_sec`, `sampled_at`, `stale` and each resource's free
+  and total.
   `pressure_observed_at` is when the probe that carried it was sent.
-- Metrics: `litevirt_host_pressure_level`, `litevirt_host_free_bytes` and
-  `litevirt_host_time_to_full_seconds` ([telemetry](telemetry.md#resource-pressure-metrics)).
+- Metrics: `litevirt_host_pressure_level`, `litevirt_host_free_bytes`,
+  `litevirt_host_time_to_full_seconds`,
+  `litevirt_host_pressure_last_sample_timestamp_seconds` and
+  `litevirt_host_pressure_stale` ([telemetry](telemetry.md#resource-pressure-metrics)).
 
 This release only reports pressure. Nothing is refused, paused or shed
 because of it.

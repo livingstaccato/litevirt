@@ -2185,7 +2185,12 @@ probe answer, so a host whose disk is full is still described by a peer.
 
 | Raised when | Clears when |
 |---|---|
-| The host reports `warn` or `degrade` (**warning**) or `critical` (**critical**). The evidence names the level, the pressured resources, `since` and `time_to_full_sec`. | The host reports `ok`, answers without pressure (`pressure.enabled: false`, or an older build), or is removed. A host the lease holder has not heard from keeps its condition as it was. |
+| The host reports `warn` or `degrade` (**warning**) or `critical` (**critical**). The evidence names the level, the pressured resources, `since`, `time_to_full_sec`, `sampled_at` and `stale`. | The host reports `ok`, answers without pressure (`pressure.enabled: false`, or an older build), or is removed. |
+
+The lease holder acts only on an answer at most 10 minutes old. A host it has
+no such answer from (down, cut off, or in maintenance) keeps its condition as
+it was, `last_seen` included. With no lease holder, no condition is written,
+while `lv host inspect` and the metrics still show each host's level.
 
 `lv host inspect <host>` shows every resource's free and total. Free space on
 the named filesystem, or move workloads off with `lv host drain <host>`. The

@@ -237,3 +237,29 @@ func equalQuorums(a, b map[string]quorumSnap) bool {
 	}
 	return true
 }
+
+// The production path: the failover coordinator that holds the lease writes
+// host.pressure on its own cycle (Coordinator.PressureHealth, wired as the
+// daemon wires it). Mutation: drop the call in Coordinator.run and it is red.
+func TestFleet_HostPressure_TheLeaseHoldersCycleWritesTheCondition(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3})
+	ps := newPressureStack(t, c)
+	holder, target := ps[0], ps[1]
+	target.fs.set(6)
+	target.sample(ctx)
+	target.sample(ctx)
+	probeAll(ctx, ps)
+	if l := holder.n.Server.PeerPressure(target.n.Name).Level(); l != "degrade" {
+		t.Fatalf("setup: %s sees %q, want degrade", target.n.Name, l)
+	}
+	cs := c.NewCoordinators(NewVirtualClock(time.Now().UTC()))
+	cs.Tick(ctx, holder.n)
+	if !cs.ByNode[holder.n.Name].HoldsLease() {
+		t.Fatalf("setup: %s does not hold the lease after its tick", holder.n.Name)
+	}
+	cond, ok := pressureCondition(t, holder.n, target.n.Name)
+	if !ok || cond.Lifecycle == corrosion.ConditionResolved || cond.Reporter != holder.n.Name {
+		t.Fatalf("after the lease holder's cycle: %+v (found %v), want host.pressure raised by %s", cond, ok, holder.n.Name)
+	}
+}

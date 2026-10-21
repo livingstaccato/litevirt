@@ -241,6 +241,8 @@ is on.
 | `litevirt_host_pressure_level{resource}` | gauge | 0 ok, 1 warn, 2 degrade, 3 critical, per resource (`data_dir.space`, `pool.<name>.inodes`, `fds.daemon`, `memory.daemon`, ...). `resource="host"` is the worst of them. |
 | `litevirt_host_free_bytes{fs}` | gauge | Bytes free to the daemon on the data directory's filesystem (`fs="data_dir"`) or a pool's (`fs="pool.<name>"`). |
 | `litevirt_host_time_to_full_seconds{resource}` | gauge | Projected seconds until the resource has nothing free, from the slope over `pressure.trend_window_sec`. Absent while it is not filling. |
+| `litevirt_host_pressure_last_sample_timestamp_seconds` | gauge | Unix time of the last completed sample. `time()` minus it growing past a few `pressure.sample_interval_sec` is a frozen sampler. |
+| `litevirt_host_pressure_stale` | gauge | 1 while the latest report is stale (the read of this host's pool list did not return in time), else 0. |
 
 The levels already have hysteresis, so alert on the level directly: for
 example `litevirt_host_pressure_level{resource="host"} >= 2`.

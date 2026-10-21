@@ -13,6 +13,9 @@ type PressureMetrics struct {
 	level *prometheus.GaugeVec
 	free  *prometheus.GaugeVec
 	ttf   *prometheus.GaugeVec
+
+	sampledAt prometheus.Gauge
+	stale     prometheus.Gauge
 }
 
 // NewPressureMetrics registers the series on the default registry.
@@ -38,7 +41,15 @@ func newPressureMetrics(reg prometheus.Registerer) *PressureMetrics {
 			Help: "Projected seconds until a filesystem resource has nothing free at its fill rate over pressure.trend_window_sec; absent while it is not filling.",
 		}, []string{"resource"}),
 	}
-	reg.MustRegister(m.level, m.free, m.ttf)
+	m.sampledAt = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "litevirt_host_pressure_last_sample_timestamp_seconds",
+		Help: "Unix time of this host's last completed resource-pressure sample. time() minus it growing past a few sample intervals is a frozen sampler.",
+	})
+	m.stale = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "litevirt_host_pressure_stale",
+		Help: "1 while the latest pressure report is stale (the read of this host's pool list did not return in time), else 0.",
+	})
+	reg.MustRegister(m.level, m.free, m.ttf, m.sampledAt, m.stale)
 	return m
 }
 
@@ -52,6 +63,14 @@ func (m *PressureMetrics) Observe(r pressure.Report) {
 	m.free.Reset()
 	m.ttf.Reset()
 	m.level.WithLabelValues("host").Set(float64(r.Level))
+	if !r.SampledAt.IsZero() {
+		m.sampledAt.Set(float64(r.SampledAt.Unix()))
+	}
+	stale := 0.0
+	if r.Stale {
+		stale = 1
+	}
+	m.stale.Set(stale)
 	for _, res := range r.Resources {
 		m.level.WithLabelValues(res.Name).Set(float64(res.Level))
 		if fs, ok := strings.CutSuffix(res.Name, ".space"); ok && res.Err == "" {

@@ -1347,12 +1347,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// host grades its own resources and Ready reports the grade. It reports
 	// only; with pressure.enabled false nothing is sampled and peers read this
 	// host's pressure as unknown.
-	if d.cfg.Pressure.Enabled {
-		ps := pressure.NewSampler(d.cfg.Pressure, d.cfg.DataDir, pressure.Options{Pools: d.pressurePools()})
-		ps.SetObserver(metrics.NewPressureMetrics().Observe)
-		svc.SetPressureSource(ps)
-		go ps.Run(ctx)
-	}
+	d.startPressure(ctx, svc, func() func(pressure.Report) { return metrics.NewPressureMetrics().Observe })
 	// The reconciler is the SECOND executor boundary for this regime: a VM
 	// reschedule proof never travels over an RPC, so it is claimed off the
 	// replicated row there rather than in claimCarriedProof. The judgment is
@@ -3055,15 +3050,37 @@ func (d *Daemon) refreshDBPoolCapacity(ctx context.Context) {
 	}
 }
 
+// pressureSink is where startPressure wires the sampler: the gRPC server,
+// whose Ready reports it.
+type pressureSink interface {
+	SetPressureSource(grpcapi.PressureSource)
+}
+
+// startPressure starts this host's resource-pressure sampler and wires it
+// into sink, with newObserver's observer (metrics) seeing every sample. With
+// pressure.enabled false it does nothing: peers then read this host's
+// pressure as unknown.
+func (d *Daemon) startPressure(ctx context.Context, sink pressureSink, newObserver func() func(pressure.Report)) {
+	if !d.cfg.Pressure.Enabled {
+		return
+	}
+	ps := pressure.NewSampler(d.cfg.Pressure, d.cfg.DataDir, pressure.Options{Pools: d.pressurePools()})
+	ps.SetObserver(newObserver())
+	sink.SetPressureSource(ps)
+	go ps.Run(ctx)
+}
+
 // pressurePoolsRefresh is how often the pressure sampler re-reads which pools
 // this host has; between reads it grades the last list.
 const pressurePoolsRefresh = time.Minute
 
 // pressurePools lists this host's file-based pools for the pressure sampler:
 // the config pools and this host's rows in storage_pools, as
-// sumPoolDiskTotalGiB walks them. The replicated read is bounded and cached,
-// so a stalled database does not stall the sampler; a failed read keeps the
-// last list.
+// sumPoolDiskTotalGiB walks them. The replicated read is cached for
+// pressurePoolsRefresh, and a failed read keeps the last list. Its context does
+// not bound it (Query takes the client lock first), so the sampler runs it off
+// its sampling path and abandons a read that does not return
+// (Sampler.currentPools); one at a time, so this closure's state is not shared.
 func (d *Daemon) pressurePools() func(context.Context) []pressure.Pool {
 	var (
 		last []pressure.Pool

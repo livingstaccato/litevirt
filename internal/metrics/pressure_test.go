@@ -40,3 +40,22 @@ func TestPressureMetrics_Observe(t *testing.T) {
 	var nilM *PressureMetrics
 	nilM.Observe(pressure.Report{})
 }
+
+// A frozen sampler shows in metrics: the last sample's time is published, so
+// time() minus it grows, and a stale report (pool list overdue) says so.
+func TestPressureMetrics_SampleTimeAndStale(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewPressureMetricsWith(reg)
+	at := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	m.Observe(pressure.Report{SampledAt: at, Stale: true})
+	if v := testutil.ToFloat64(m.sampledAt); v != float64(at.Unix()) {
+		t.Errorf("last sample %v, want %d", v, at.Unix())
+	}
+	if v := testutil.ToFloat64(m.stale); v != 1 {
+		t.Errorf("stale %v, want 1", v)
+	}
+	m.Observe(pressure.Report{SampledAt: at.Add(time.Minute)})
+	if v := testutil.ToFloat64(m.stale); v != 0 {
+		t.Errorf("stale %v after a fresh report, want 0", v)
+	}
+}

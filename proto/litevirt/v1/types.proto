@@ -904,6 +904,13 @@ message HostPressure {
   // The shortest projected time until a filesystem resource has nothing
   // free at its fill rate over the trend window; 0 when none is filling.
   int64 time_to_full_sec = 7;
+  // When the host's sampler last completed a sample (RFC 3339, as
+  // Host.pressure_observed_at); "" before the first.
+  string sampled_at = 8;
+  // The levels are the last ones known, not current: the sampler has not
+  // completed a sample for more than three sample intervals, or its latest
+  // read of the host's pool list did not return in time.
+  bool stale = 9;
 }
 
 // PressureResource is one graded resource of a host.

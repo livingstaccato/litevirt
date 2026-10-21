@@ -30,6 +30,11 @@ const (
 	// pressureRefresh is how often an unchanged open condition is rewritten,
 	// to keep its last_seen and its time-to-full projection current.
 	pressureRefresh = 5 * time.Minute
+	// pressureAnswerMaxAge is how old a peer's latest answer may be and still
+	// be acted on. A host that stopped answering (down, cut off, in
+	// maintenance, which the probe plan skips) keeps its condition exactly as
+	// it was, rather than having an old answer re-asserted as current.
+	pressureAnswerMaxAge = 2 * pressureRefresh
 )
 
 // PressureSource is this host's sampler (*pressure.Sampler).
@@ -65,6 +70,8 @@ func pressureToPB(r pressure.Report, detail bool) *pb.HostPressure {
 		Resources:     r.Pressured(),
 		Since:         rfc3339(r.Since),
 		TimeToFullSec: int64(r.TimeToFull / time.Second),
+		SampledAt:     rfc3339(r.SampledAt),
+		Stale:         r.Stale,
 	}
 	if detail {
 		for _, res := range r.Resources {
@@ -191,7 +198,7 @@ func (s *Server) PressureHealthTick(ctx context.Context) {
 	for _, h := range hosts {
 		live[h.Name] = true
 		v := s.pressureView(h.Name, false)
-		if !v.Answered {
+		if !v.Answered || (!v.Asked.IsZero() && now.Sub(v.Asked) > pressureAnswerMaxAge) {
 			continue
 		}
 		cur, isOpen := openBy[h.Name]
@@ -242,6 +249,7 @@ func (s *Server) raisePressureCond(ctx context.Context, host string, v PeerPress
 	ev := map[string]any{
 		"host": host, "level": p.GetLevel(), "resources": p.GetResources(), "since": p.GetSince(),
 		"time_to_full_sec": p.GetTimeToFullSec(),
+		"sampled_at":       p.GetSampledAt(), "stale": p.GetStale(),
 		"detail": "host " + host + " reports resource pressure " + p.GetLevel() + " on " + joinSorted(p.GetResources()) +
 			"; `lv host inspect " + host + "` shows each resource. Nothing is refused because of it yet",
 	}

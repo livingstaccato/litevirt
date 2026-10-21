@@ -5911,6 +5911,13 @@ type HostPressure struct {
 	// The shortest projected time until a filesystem resource has nothing
 	// free at its fill rate over the trend window; 0 when none is filling.
 	TimeToFullSec int64 `protobuf:"varint,7,opt,name=time_to_full_sec,json=timeToFullSec,proto3" json:"time_to_full_sec,omitempty"`
+	// When the host's sampler last completed a sample (RFC 3339, as
+	// Host.pressure_observed_at); "" before the first.
+	SampledAt string `protobuf:"bytes,8,opt,name=sampled_at,json=sampledAt,proto3" json:"sampled_at,omitempty"`
+	// The levels are the last ones known, not current: the sampler has not
+	// completed a sample for more than three sample intervals, or its latest
+	// read of the host's pool list did not return in time.
+	Stale         bool `protobuf:"varint,9,opt,name=stale,proto3" json:"stale,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -5978,6 +5985,20 @@ func (x *HostPressure) GetTimeToFullSec() int64 {
 		return x.TimeToFullSec
 	}
 	return 0
+}
+
+func (x *HostPressure) GetSampledAt() string {
+	if x != nil {
+		return x.SampledAt
+	}
+	return ""
+}
+
+func (x *HostPressure) GetStale() bool {
+	if x != nil {
+		return x.Stale
+	}
+	return false
 }
 
 // PressureResource is one graded resource of a host.
@@ -8476,13 +8497,16 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x14pressure_observed_at\x18# \x01(\tR\x12pressureObservedAt\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb8\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xed\x01\n" +
 	"\fHostPressure\x12\x14\n" +
 	"\x05level\x18\x01 \x01(\tR\x05level\x12\x1c\n" +
 	"\tresources\x18\x02 \x03(\tR\tresources\x12\x14\n" +
 	"\x05since\x18\x03 \x01(\tR\x05since\x125\n" +
 	"\x06detail\x18\x06 \x03(\v2\x1d.litevirt.v1.PressureResourceR\x06detail\x12'\n" +
-	"\x10time_to_full_sec\x18\a \x01(\x03R\rtimeToFullSec\"\xea\x01\n" +
+	"\x10time_to_full_sec\x18\a \x01(\x03R\rtimeToFullSec\x12\x1d\n" +
+	"\n" +
+	"sampled_at\x18\b \x01(\tR\tsampledAt\x12\x14\n" +
+	"\x05stale\x18\t \x01(\bR\x05stale\"\xea\x01\n" +
 	"\x10PressureResource\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05level\x18\x02 \x01(\tR\x05level\x12\x14\n" +

@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -302,5 +303,104 @@ func TestInspectHost_ShowsPressure(t *testing.T) {
 	h, _ := s.InspectHost(ctx, &pb.InspectHostRequest{Name: "test-host"})
 	if len(h.GetPressure().GetDetail()) != 2 {
 		t.Errorf("self: %d detail rows, want 2", len(h.GetPressure().GetDetail()))
+	}
+}
+
+// G1: an answer from another host than the one dialled (an address re-used
+// by a different daemon) says nothing about this host's pressure, whatever it
+// carries.
+func TestPeerReady_AnotherHostsPressureIsNotRecorded(t *testing.T) {
+	s := serverWithPeerReady(t, readyClient{resp: &pb.ReadyResponse{HostName: "host-x", Ready: true,
+		Pressure: &pb.HostPressure{Level: "critical", Resources: []string{"data_dir.space"}}}})
+	s.PeerReady(context.Background(), "host-b", "127.0.0.1:1")
+	if l := s.PeerPressure("host-b").Level(); l != PressureUnknown {
+		t.Fatalf("host-x answered for host-b: host-b's pressure %q, want unknown", l)
+	}
+}
+
+// G2: two probes of one host can be in flight at once; the answer to the one
+// sent LATER is kept, whichever arrives last.
+func TestPeerPressure_TheLaterProbeWins(t *testing.T) {
+	s := testServer(t)
+	now := time.Now()
+	s.peerPressure.record("host-b", now, &pb.HostPressure{Level: "warn"})
+	s.peerPressure.record("host-b", now.Add(-time.Second), &pb.HostPressure{Level: "critical"})
+	if l := s.PeerPressure("host-b").Level(); l != "warn" {
+		t.Fatalf("an earlier probe's late answer replaced the later one: %q, want warn", l)
+	}
+}
+
+// The probe answer says when its sampler last sampled, and whether its levels
+// are stale.
+func TestReady_PressureCarriesSampledAtAndStale(t *testing.T) {
+	s := testServer(t)
+	insertReadyHost(t, s, "test-host")
+	rep := degradedReport(pressure.Warn)
+	rep.SampledAt = time.Date(2026, 10, 21, 12, 5, 0, 0, time.UTC)
+	rep.Stale = true
+	s.SetPressureSource(&fakePressure{rep: rep})
+	resp, _ := s.Ready(context.Background(), &pb.ReadyRequest{})
+	if p := resp.GetPressure(); p.GetSampledAt() != "2026-10-21T12:05:00Z" || !p.GetStale() {
+		t.Fatalf("pressure %+v, want sampled_at 12:05 and stale", p)
+	}
+}
+
+// G4: a host removed from the cluster has its open condition resolved.
+func TestPressureHealthTick_ResolvesARemovedHost(t *testing.T) {
+	ctx := context.Background()
+	s := serverWithPeerReady(t, readyClient{resp: &pb.ReadyResponse{HostName: "host-b", Ready: true,
+		Pressure: &pb.HostPressure{Level: "degrade", Resources: []string{"data_dir.space"}}}})
+	insertReadyHost(t, s, "test-host")
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "host-b", Address: "10.0.0.2", SSHUser: "root", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	s.PeerReady(ctx, "host-b", "127.0.0.1:1")
+	s.PressureHealthTick(ctx)
+	if c, ok := pressureCond(t, s, "host-b"); !ok || c.Lifecycle == corrosion.ConditionResolved {
+		t.Fatalf("setup: host-b condition %+v (found %v), want open", c, ok)
+	}
+	if err := corrosion.DeleteHost(ctx, s.db, "host-b"); err != nil {
+		t.Fatal(err)
+	}
+	s.PressureHealthTick(ctx)
+	c, _ := pressureCond(t, s, "host-b")
+	if c.Lifecycle != corrosion.ConditionResolved || !strings.Contains(c.Evidence, "removed") {
+		t.Fatalf("after host-b was removed: %+v, want resolved as removed", c)
+	}
+}
+
+// N1: an answer older than pressureAnswerMaxAge (a host that stopped
+// answering: down, cut off, in maintenance) is not re-asserted as current:
+// its condition is left exactly as it was, last_seen included.
+func TestPressureHealthTick_AnOldAnswerIsNotRefreshed(t *testing.T) {
+	ctx := context.Background()
+	s := testServer(t)
+	insertReadyHost(t, s, "test-host")
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "host-b", Address: "10.0.0.2", SSHUser: "root", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertHealthCondition(ctx, s.db, corrosion.HealthCondition{Evaluator: PressureEvaluator,
+		Code: CondHostPressure, SubjectKind: "host", SubjectID: "host-b", Lifecycle: corrosion.ConditionConfirmed,
+		Severity: corrosion.SeverityWarning, LastSeen: "2026-10-21T10:00:00Z", Reporter: "host-c"}); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	for name, p := range map[string]*pb.HostPressure{
+		"still pressured": {Level: "degrade", Resources: []string{"data_dir.space"}},
+		"ok":              {Level: "ok"},
+	} {
+		s.peerPressure.m = nil
+		s.peerPressure.record("host-b", old, p)
+		s.PressureHealthTick(ctx)
+		c, _ := pressureCond(t, s, "host-b")
+		if c.LastSeen != "2026-10-21T10:00:00Z" || c.Reporter != "host-c" || c.Lifecycle != corrosion.ConditionConfirmed {
+			t.Fatalf("%s, answered an hour ago: %+v, want the row untouched", name, c)
+		}
+	}
+	// A fresh answer is acted on.
+	s.peerPressure.record("host-b", time.Now(), &pb.HostPressure{Level: "ok"})
+	s.PressureHealthTick(ctx)
+	if c, _ := pressureCond(t, s, "host-b"); c.Lifecycle != corrosion.ConditionResolved {
+		t.Fatalf("a fresh ok answer: %s, want resolved", c.Lifecycle)
 	}
 }

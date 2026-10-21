@@ -952,10 +952,15 @@ Operational notes:
 - **Re-image / dataDir wipe.** A node whose `dataDir` is wiped loses its high-water and
   regains the regression window until its wall clock passes the pre-wipe ceiling. Ensure
   NTP is healthy before rejoining.
+- **A full disk does not stop the clock.** `nowts.hwm` has a fixed size and is
+  overwritten in place, so saving the ceiling needs no new disk space. The daemon writes
+  it in that layout at start; a node upgraded from an earlier build converts the file
+  then, and a node rolled back to an earlier build still reads it.
 - **Persistence failure is fail-closed.** If the daemon cannot persist a higher ceiling
   and its in-memory headroom is exhausted, it **exits** rather than emit a key below the
-  last durable ceiling. Because the state DB shares the `dataDir` filesystem, a full disk
-  already fails writes; the crash surfaces it loudly. Recovery = free space.
+  last durable ceiling. That takes an error the in-place save cannot write around: an
+  I/O error, a read-only filesystem, or a disk that was already full when the file
+  needed creating or converting. The crash surfaces it loudly. Recovery = fix the filesystem.
 
 ## Equal-timestamp tie resolution
 

@@ -1096,12 +1096,14 @@ func (c *Client) initClockPersistence() error {
 		// DELIBERATE fail-closed decision: when the monotonic ceiling can't be
 		// persisted AND the in-memory headroom is exhausted, exit rather than emit an
 		// LWW key below the last durable ceiling (which would silently lose updates
-		// after a restart). Sustained failure (e.g. a full dataDir disk) therefore
-		// crash-loops the daemon — an accepted trade-off: the SQLite state DB lives on
-		// the SAME filesystem, so a full disk already fails authoritative writes; a loud
-		// crash surfaces it instead of silently corrupting LWW ordering. Recovery = free
-		// space (or, as a last resort, delete <dataDir>/nowts.hwm to reset the ceiling,
-		// re-opening the regression window until wall time passes the old ceiling).
+		// after a restart). A full disk does not get here: a save overwrites
+		// nowts.hwm in place and needs no new space (hwm.go). What does is an error
+		// the store cannot write around (EIO, a read-only remount, or a file that a
+		// full disk kept from being created or converted to the in-place layout), and
+		// a loud crash surfaces it instead of silently corrupting LWW ordering.
+		// Recovery = fix the filesystem (or, as a last resort, delete
+		// <dataDir>/nowts.hwm to reset the ceiling, re-opening the regression window
+		// until wall time passes the old ceiling).
 		c.onPersistFatal = func(err error) {
 			slog.Error("nowts: monotonic clock persistence failing and headroom exhausted — exiting to avoid a silent lost update", "error", err)
 			os.Exit(1)
@@ -1117,6 +1119,13 @@ func (c *Client) initClockPersistence() error {
 	}
 	if found {
 		c.lastTS, c.durableTS, c.durableHLCMS = lww, lww, hlcMS
+	}
+	// Convert or create the file now, so later saves overwrite it in place and a full
+	// disk cannot fail them. Failing here changes nothing: the file keeps its ceilings
+	// and the next save retries the conversion.
+	if err := c.hwm.prepare(); err != nil {
+		slog.Warn("nowts: could not convert the clock high-water file to its in-place layout; saves keep needing new disk space until it converts",
+			"path", c.hwm.path, "error", err)
 	}
 	if c.clock != nil {
 		// The HLC clock shares nowts.hwm; a sustained persist failure there is the same

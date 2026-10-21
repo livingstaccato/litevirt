@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -11,6 +12,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/failover"
 	"github.com/litevirt/litevirt/internal/health"
@@ -281,6 +283,11 @@ var (
 // inventory (SettleFailedSourceMigrations). Test-only.
 var migratingInventoryHook func(ctx context.Context, s *Server, host string) (runtimeInventory, error)
 
+// migratingFirmwareHook, when set, replaces the read of a target's firmware
+// move records of a Secure Boot / vTPM VM (SettleFailedSourceMigrations).
+// Test-only.
+var migratingFirmwareHook func(ctx context.Context, s *Server, host, vm string) (*pb.FirmwareMoveHostRecords, error)
+
 // targetAnswer is one target's answer: its inventory, or why it gave none.
 type targetAnswer struct {
 	inv runtimeInventory
@@ -288,15 +295,13 @@ type targetAnswer struct {
 }
 
 // askMigrationTargets asks each target once for its runtime inventory, under
-// the bounds above. A target not asked within the budget answers with the
-// budget's error.
-func (s *Server) askMigrationTargets(ctx context.Context, targets []string) map[string]targetAnswer {
+// the bounds above, within bctx (the pass's budget). A target not asked
+// within it answers with the budget's error.
+func (s *Server) askMigrationTargets(bctx context.Context, targets []string) map[string]targetAnswer {
 	out := make(map[string]targetAnswer, len(targets))
 	if len(targets) == 0 {
 		return out
 	}
-	bctx, cancel := context.WithTimeout(ctx, migratingProbeBudget)
-	defer cancel()
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, max(1, migratingProbeConcurrency))
@@ -309,7 +314,7 @@ func (s *Server) askMigrationTargets(ctx context.Context, targets []string) map[
 				defer func() { <-sem }()
 			case <-bctx.Done():
 				mu.Lock()
-				out[host] = targetAnswer{err: fmt.Errorf("not asked within the pass's %s budget", migratingProbeBudget)}
+				out[host] = targetAnswer{err: errors.New("not asked within the poll's time budget for these asks")}
 				mu.Unlock()
 				return
 			}
@@ -347,7 +352,11 @@ func (s *Server) askMigrationTargets(ctx context.Context, targets []string) map[
 //   - anything else — no target recorded, no answer, a paused or shut-off
 //     domain, an incomplete inventory — holds the VM, with
 //     vm.migration_unresolved raised naming why and what settles it.
-func (s *Server) SettleFailedSourceMigrations(ctx context.Context, source string, vms []corrosion.VMRecord) map[string]failover.MigratingDecision {
+//
+// Every ask ends by askBy, the coordinator's one deadline for all of a
+// poll's asks, whatever the number of hosts it recovers, and within
+// migratingProbeBudget of this call.
+func (s *Server) SettleFailedSourceMigrations(ctx context.Context, source string, vms []corrosion.VMRecord, askBy time.Time) map[string]failover.MigratingDecision {
 	out := make(map[string]failover.MigratingDecision, len(vms))
 	proven := map[string]bool{}
 	var ask []string
@@ -368,15 +377,23 @@ func (s *Server) SettleFailedSourceMigrations(ctx context.Context, source string
 			ask = append(ask, target)
 		}
 	}
-	answers := s.askMigrationTargets(ctx, ask)
+	bctx, cancel := context.WithTimeout(ctx, migratingProbeBudget)
+	defer cancel()
+	if !askBy.IsZero() {
+		var dcancel context.CancelFunc
+		bctx, dcancel = context.WithDeadline(bctx, askBy)
+		defer dcancel()
+	}
+	answers := s.askMigrationTargets(bctx, ask)
 	for _, vm := range vms {
-		out[vm.Name] = s.settleFailedSourceMigration(ctx, vm, source, proven, answers)
+		out[vm.Name] = s.settleFailedSourceMigration(ctx, bctx, vm, source, proven, answers)
 	}
 	return out
 }
 
-// settleFailedSourceMigration decides one VM from its target's answer.
-func (s *Server) settleFailedSourceMigration(ctx context.Context, vm corrosion.VMRecord, source string,
+// settleFailedSourceMigration decides one VM from its target's answer. bctx
+// bounds any further ask (a firmware VM's records); ctx carries the writes.
+func (s *Server) settleFailedSourceMigration(ctx, bctx context.Context, vm corrosion.VMRecord, source string,
 	proven map[string]bool, answers map[string]targetAnswer) failover.MigratingDecision {
 	target := migratingToward(vm.StateDetail)
 	firmware := corrosion.VMUsesFirmwareState(vm)
@@ -399,19 +416,7 @@ func (s *Server) settleFailedSourceMigration(ctx context.Context, vm corrosion.V
 		return recoverVM(fmt.Sprintf("its target %s is proven powered off", target))
 	}
 	if firmware {
-		// A live firmware move's guest is settled by its own records, never
-		// by moving the row alone, whatever the target reports.
-		a := answers[target]
-		why := fmt.Sprintf("its target %s cannot be asked whether the guest runs there (%v)", target, a.err)
-		if a.err == nil {
-			st := runtimeStateIn(a.inv, corrosion.WorkloadVM, vm.Name)
-			if st == health.RuntimeAbsent {
-				return recoverVM(fmt.Sprintf("its target %s has no domain of it", target))
-			}
-			why = fmt.Sprintf("its target %s holds a domain of it in state %s", target, st)
-		}
-		return hold(why+", and it is a Secure Boot / vTPM VM, whose move is settled by its firmware records",
-			s.firmwareMoveAdvice(ctx, vm.Name, source, target))
+		return s.settleFirmwareMigration(ctx, bctx, vm, source, target, answers[target], hold, recoverVM)
 	}
 	a := answers[target]
 	if a.err != nil {
@@ -462,4 +467,56 @@ func (s *Server) firmwareMoveAdvice(ctx context.Context, vm, source, target stri
 		return adopt
 	}
 	return fmt.Sprintf("Once %s is powered off, `lv host fence-confirm %s`; then %s", source, source, adopt)
+}
+
+// settleFirmwareMigration decides a Secure Boot / vTPM VM recorded migrating
+// on source toward target. Its move is settled by its firmware records, never
+// by moving the row alone, so it is never re-pointed: it is recovered when
+// the target holds no domain of it, and held otherwise, with the step that
+// settles it picked by what the target holds.
+func (s *Server) settleFirmwareMigration(ctx, bctx context.Context, vm corrosion.VMRecord, source, target string, a targetAnswer,
+	hold func(why, fix string) failover.MigratingDecision, recoverVM func(string) failover.MigratingDecision) failover.MigratingDecision {
+	const fw = "it is a Secure Boot / vTPM VM, whose move is settled by its firmware records"
+	if a.err != nil {
+		return hold(fmt.Sprintf("its target %s cannot be asked whether the guest runs there (%v), and %s", target, a.err, fw),
+			fmt.Sprintf("If %s answers again, the next poll settles it by what %s holds. If %s is down, once it is powered off, "+
+				"`lv host fence-confirm %s`: the next poll goes on with %s's recovery", target, target, target, target, vm.Name))
+	}
+	if runtimeStateIn(a.inv, corrosion.WorkloadVM, vm.Name) == health.RuntimeAbsent {
+		return recoverVM(fmt.Sprintf("its target %s has no domain of it", target))
+	}
+	// The inventory reads every domain that is not running as stopped; the
+	// target's firmware records say which.
+	pctx, cancel := context.WithTimeout(bctx, migratingProbeTimeout)
+	defer cancel()
+	var rec *pb.FirmwareMoveHostRecords
+	var err error
+	if hook := migratingFirmwareHook; hook != nil {
+		rec, err = hook(pctx, s, target, vm.Name)
+	} else {
+		rec, err = s.inspectFirmwareMoveHost(pctx, target, vm.Name)
+	}
+	if err != nil {
+		return hold(fmt.Sprintf("its target %s holds a domain of it, whose firmware move records cannot be read (%v), and %s", target, err, fw),
+			"The next poll asks again")
+	}
+	td := rec.GetDomain()
+	state := domainWord(td)
+	why := fmt.Sprintf("its target %s holds a domain of it %s, and %s", target, state, fw)
+	switch {
+	case !td.GetPresent():
+		return hold(fmt.Sprintf("its target %s lists a domain of it its firmware records do not show, and %s", target, fw),
+			"The next poll asks again")
+	case state == "paused":
+		return hold(why, s.firmwareMoveAdvice(ctx, vm.Name, source, target))
+	case state == "running":
+		return hold(why, fmt.Sprintf("No lv command settles a Secure Boot / vTPM VM that runs on its target while its record "+
+			"names the failed source. On %s, `virsh suspend %s` pauses the guest; the next poll then names the firmware move "+
+			"doctor, whose --adopt-target-copy takes the paused copy, records it on %s and resumes it", target, vm.Name, target))
+	default:
+		return hold(why, fmt.Sprintf("No lv command settles a Secure Boot / vTPM VM whose copy on its target is %s while its "+
+			"record names the failed source. On %s, `virsh start --paused %s` brings the copy up paused; the next poll then names "+
+			"the firmware move doctor, whose --adopt-target-copy takes the paused copy, records it on %s and resumes it",
+			state, target, vm.Name, target))
+	}
 }

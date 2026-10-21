@@ -275,8 +275,8 @@ func TestFleet_Failover_MigratingRowHeldWhileTargetIsUnsettled(t *testing.T) {
 	c, a, b, victim := migratingRowFleet(t, clock, false, libvirtfake.StatePaused)
 	cs := runRecovery(t, c, clock, false, a, b)
 	assertControlRecovered(t, c, a, victim)
-	// b's reconciler shuts off a paused guest whose row is not its own, so
-	// the target reports it stopped by now: held all the same.
+	// The guest stays paused on b; the runtime inventory reports every domain
+	// that is not running as defined_stopped.
 	requireHeldNaming(t, a, b, victim, "holds a domain of it in state", "virsh start mg1")
 
 	// The operator resumes the guest on b; the next poll settles it there.

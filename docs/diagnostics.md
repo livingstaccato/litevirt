@@ -3309,10 +3309,15 @@ answer holds only its own VMs.
     (`virsh start` or `virsh resume`) and the next poll records it there;
   - the record names no target: find where the guest runs, and
     `lv doctor repair-owner <vm> <host>` records it there;
-  - a Secure Boot / vTPM VM: once the source is powered off,
-    `lv host fence-confirm <source>`, then
-    `lv doctor firmware-move <vm> --adopt-target-copy` adopts the copy the
-    target holds paused.
+  - a Secure Boot / vTPM VM is never moved by its record alone. Its target
+    does not answer: once it is powered off, `lv host fence-confirm <target>`,
+    and the next poll goes on with the recovery. Its target holds it paused:
+    once the source is powered off, `lv host fence-confirm <source>`, then
+    `lv doctor firmware-move <vm> --adopt-target-copy` adopts that copy,
+    records it on the target and resumes it. Its target runs it, or holds it
+    shut off: no `lv` command settles that yet. Pause it on the target
+    (`virsh suspend <vm>`, or `virsh start --paused <vm>` for a shut-off
+    copy); the next poll then names the steps for a paused copy.
 
 ### A firmware move record cannot be read (`firmware_migration_record_unreadable`)
 

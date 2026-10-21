@@ -3,6 +3,7 @@ package failover
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -32,6 +33,29 @@ type MigratingDecision struct {
 	Detail  string
 }
 
+// MigratingAskBudget bounds, per poll, the time all of the poll's asks of
+// migration targets may take together, across every host it recovers: a
+// held source whose target does not answer costs each poll at most this,
+// however many sources are held. A var so tests can shorten it.
+var MigratingAskBudget = 10 * time.Second
+
+// beginMigratingAsks starts a poll's budget for its asks of migration
+// targets. Called once at the start of each run. It reads the real clock,
+// never c.Now or c.Mono, which scenarios may make virtual: the asks run in
+// real time, against a context deadline.
+func (c *Coordinator) beginMigratingAsks() {
+	c.migratingAskBy = c.askClock().Add(MigratingAskBudget)
+}
+
+// askClock is the real clock the ask budget is read on; a unit test replaces
+// it (askNow).
+func (c *Coordinator) askClock() time.Time {
+	if c.askNow != nil {
+		return c.askNow()
+	}
+	return time.Now()
+}
+
 // settleMigratingVMs decides, once per recovery pass, every VM in vms whose
 // row says `migrating` on h. A live migration that cut over in libvirt runs
 // the guest on its target, and a source that died before the ownership
@@ -55,7 +79,12 @@ func (c *Coordinator) settleMigratingVMs(ctx context.Context, h *corrosion.HostR
 	if c.SettleMigratingRows == nil {
 		return map[string]MigratingDecision{}
 	}
-	return c.SettleMigratingRows(ctx, h.Name, migrating)
+	askBy := c.migratingAskBy
+	if askBy.IsZero() {
+		// recoverWorkloads called outside run (a test): a budget of its own.
+		askBy = c.askClock().Add(MigratingAskBudget)
+	}
+	return c.SettleMigratingRows(ctx, h.Name, migrating, askBy)
 }
 
 // recoverMigratingVM acts on vm's decision. Reports whether the VM is

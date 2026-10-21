@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/failover"
 	"github.com/litevirt/litevirt/internal/fwmig"
@@ -39,67 +41,84 @@ func unresolvedDetail(t *testing.T, s *Server, vm string) (string, bool) {
 
 // A Secure Boot / vTPM VM recorded migrating on a failed source is never
 // re-pointed by failover, whatever its target reports: its move is settled by
-// its firmware records. The hold names the firmware move doctor, and the
-// fence-confirm of the source while it is not proven off. Taking those steps
-// — the source confirmed off, then `lv doctor firmware-move --adopt-target-copy`
-// — leaves the VM running on the target alone, its row there.
+// its firmware records. The hold names the step that settles it, by what the
+// target holds, and each arm takes that step:
 //
-// Mutation: re-point a firmware VM like any other (drop the firmware branch)
-// — the "running" arm's row moves to dst-host, red.
+//   - unreachable: fence-confirm of the target; the next poll recovers;
+//   - paused: fence-confirm of the source, then --adopt-target-copy: the VM
+//     runs on the target alone, its row there;
+//   - running or shut off: no lv command; `virsh suspend` or
+//     `virsh start --paused` on the target pauses it, and the paused arm's
+//     steps follow.
+//
+// Mutations: re-point a firmware VM like any other (drop the firmware
+// branch) — the running arm's row moves to dst-host, red; give every held
+// state the paused advice — the running and shut-off arms, red; give the
+// unreachable target the paused advice — red.
 func TestSettleFailedSourceMigrations_FirmwareVMIsHeldForTheDoctor(t *testing.T) {
 	ctx := context.Background()
-	t.Run("running_on_target/never_repointed", func(t *testing.T) {
-		r, _ := lostWithOwed(t, false, false, libvirtfake.StateRunning)
-		withMigratingInventory(t, func(ctx context.Context, host string) (runtimeInventory, error) {
-			if host != "dst-host" {
-				return runtimeInventory{}, fmt.Errorf("no such host %s", host)
-			}
-			return r.dst.collectRuntimeInventory(ctx), nil
-		})
-		row := r.row()
-		if row.State != "migrating" || row.HostName != "src-host" {
-			t.Fatalf("fixture: row %s on %s, want migrating on src-host", row.State, row.HostName)
-		}
-		d := r.src.SettleFailedSourceMigrations(ctx, "src-host", []corrosion.VMRecord{*row})[fwlVM]
+	settle := func(t *testing.T, r *fwlRig) failover.MigratingDecision {
+		t.Helper()
+		return r.src.SettleFailedSourceMigrations(ctx, "src-host", []corrosion.VMRecord{*r.row()}, time.Time{})[fwlVM]
+	}
+	held := func(t *testing.T, r *fwlRig, d failover.MigratingDecision, want, notWant []string) {
+		t.Helper()
 		if d.Verdict != failover.MigratingHold {
 			t.Fatalf("decision %+v, want a hold", d)
 		}
-		if after := r.row(); after.HostName != "src-host" || after.State != "migrating" {
-			t.Fatalf("the firmware VM's row was moved to %s %s", after.HostName, after.State)
+		if row := r.row(); row.HostName != "src-host" || row.State != "migrating" {
+			t.Fatalf("the firmware VM's row was moved to %s %s", row.HostName, row.State)
 		}
 		detail, open := unresolvedDetail(t, r.src, fwlVM)
-		if !open || !strings.Contains(detail, "lv doctor firmware-move "+fwlVM+" --adopt-target-copy") ||
-			!strings.Contains(detail, "lv host fence-confirm src-host") {
-			t.Fatalf("condition open %v, detail %q; want it naming fence-confirm of src-host and the doctor", open, detail)
+		if !open {
+			t.Fatal("held with no vm.migration_unresolved")
 		}
-	})
-	t.Run("paused_on_target/the_hinted_steps_leave_one_copy", func(t *testing.T) {
-		r, _ := lostWithOwed(t, false, false, "")
+		for _, w := range want {
+			if !strings.Contains(detail, w) {
+				t.Errorf("the hold does not name %q: %s", w, detail)
+			}
+		}
+		for _, w := range notWant {
+			if strings.Contains(detail, w) {
+				t.Errorf("the hold names %q, which does not settle this state: %s", w, detail)
+			}
+		}
+	}
+	rig := func(t *testing.T, st libvirtfake.State) *fwlRig {
+		r, _ := lostWithOwed(t, false, false, st)
 		withMigratingInventory(t, func(ctx context.Context, host string) (runtimeInventory, error) {
 			return r.dst.collectRuntimeInventory(ctx), nil
 		})
-		if st, _ := r.dstFake.RawState(fwlVM); st != libvirtfake.StatePaused {
-			t.Fatalf("fixture: target %s, want paused", st)
+		old := migratingFirmwareHook
+		migratingFirmwareHook = func(ctx context.Context, _ *Server, host, vm string) (*pb.FirmwareMoveHostRecords, error) {
+			return r.dst.localFirmwareMoveRecords(ctx, vm), nil
 		}
-		d := r.src.SettleFailedSourceMigrations(ctx, "src-host", []corrosion.VMRecord{*r.row()})[fwlVM]
-		if d.Verdict != failover.MigratingHold || !strings.Contains(d.Detail, "lv host fence-confirm src-host") {
-			t.Fatalf("decision %+v, want a hold naming the source's fence-confirm", d)
+		t.Cleanup(func() { migratingFirmwareHook = old })
+		if row := r.row(); row.State != "migrating" || row.HostName != "src-host" {
+			t.Fatalf("fixture: row %s on %s, want migrating on src-host", row.State, row.HostName)
 		}
+		return r
+	}
+	// adoptPaused takes the paused arm's steps on a target that holds the
+	// guest paused: the source confirmed off, then the doctor's adopt. The
+	// VM ends running on dst-host alone, its row there.
+	adoptPaused := func(t *testing.T, r *fwlRig) {
+		t.Helper()
+		held(t, r, settle(t, r), []string{"lv host fence-confirm src-host", "lv doctor firmware-move " + fwlVM + " --adopt-target-copy"},
+			[]string{"No lv command"})
 		// `lv host fence-confirm src-host`, as it records it.
 		if err := corrosion.RecordFenceWithState(ctx, r.src.db,
 			corrosion.FenceLogRecord{ID: "fc-src", HostName: "src-host", Method: "manual", Result: "manual-confirmed"}, "fenced"); err != nil {
 			t.Fatal(err)
 		}
-		d = r.src.SettleFailedSourceMigrations(ctx, "src-host", []corrosion.VMRecord{*r.row()})[fwlVM]
-		if d.Verdict != failover.MigratingHold || strings.Contains(d.Detail, "fence-confirm") ||
+		if d := settle(t, r); d.Verdict != failover.MigratingHold || strings.Contains(d.Detail, "fence-confirm") ||
 			!strings.Contains(d.Detail, "--adopt-target-copy") {
 			t.Fatalf("decision %+v, want a hold naming the doctor alone once the source is proven off", d)
 		}
 		if _, err := r.doctor(actAdopt); err != nil {
 			t.Fatalf("lv doctor firmware-move %s --adopt-target-copy: %v", fwlVM, err)
 		}
-		row := r.row()
-		if row.HostName != "dst-host" || row.State != "running" {
+		if row := r.row(); row.HostName != "dst-host" || row.State != "running" {
 			t.Fatalf("row %s %s after the doctor, want running on dst-host", row.HostName, row.State)
 		}
 		var running []string
@@ -114,7 +133,66 @@ func TestSettleFailedSourceMigrations_FirmwareVMIsHeldForTheDoctor(t *testing.T)
 		if _, ok, _ := fwmig.New(r.dst.dataDir).GetHold(fwlVM); ok {
 			t.Error("the target's hold is still there after the adoption")
 		}
+	}
+
+	t.Run("unreachable/fence_confirm_the_target", func(t *testing.T) {
+		r := rig(t, "")
+		withMigratingInventory(t, func(context.Context, string) (runtimeInventory, error) {
+			return runtimeInventory{}, errors.New("connection refused")
+		})
+		held(t, r, settle(t, r), []string{"cannot be asked", "lv host fence-confirm dst-host"}, []string{"--adopt-target-copy", "No lv command"})
+		// The target powered off, its guest with it, and confirmed so.
+		_ = r.dstFake.DestroyDomain(fwlVM)
+		if err := corrosion.RecordFenceWithState(ctx, r.src.db,
+			corrosion.FenceLogRecord{ID: "fc-dst", HostName: "dst-host", Method: "manual", Result: "manual-confirmed"}, "fenced"); err != nil {
+			t.Fatal(err)
+		}
+		if d := settle(t, r); d.Verdict != failover.MigratingRecover {
+			t.Fatalf("decision %+v once dst-host is proven off, want the recovery to go on", d)
+		}
 	})
+	t.Run("paused/fence_confirm_the_source_then_adopt", func(t *testing.T) {
+		r := rig(t, "")
+		if st, _ := r.dstFake.RawState(fwlVM); st != libvirtfake.StatePaused {
+			t.Fatalf("fixture: target %s, want paused", st)
+		}
+		adoptPaused(t, r)
+	})
+	t.Run("running/no_lv_command_then_suspend", func(t *testing.T) {
+		r := rig(t, libvirtfake.StateRunning)
+		held(t, r, settle(t, r), []string{"No lv command", "virsh suspend " + fwlVM}, []string{"lv host fence-confirm"})
+		r.dstFake.SetState(fwlVM, libvirtfake.StatePaused) // `virsh suspend` on dst-host
+		adoptPaused(t, r)
+	})
+	t.Run("shut_off/no_lv_command_then_start_paused", func(t *testing.T) {
+		r := rig(t, libvirtfake.StateShutdown)
+		held(t, r, settle(t, r), []string{"No lv command", "virsh start --paused " + fwlVM}, []string{"lv host fence-confirm"})
+		r.dstFake.SetState(fwlVM, libvirtfake.StatePaused) // `virsh start --paused` on dst-host
+		adoptPaused(t, r)
+	})
+}
+
+// A target that answers with an incomplete inventory that does not list the
+// VM may still run it: the VM is held, its condition naming the next poll
+// and repair-owner.
+//
+// Mutation: an incomplete inventory recovers (RuntimeUnknown → recover) — red.
+func TestSettleFailedSourceMigrations_IncompleteInventoryHolds(t *testing.T) {
+	ctx := context.Background()
+	withMigratingInventory(t, func(_ context.Context, host string) (runtimeInventory, error) {
+		return runtimeInventory{Host: host, Complete: false}, nil
+	})
+	s := testServerWithLocks(t)
+	vm := corrosion.VMRecord{Name: "vm-u", HostName: "src", State: "migrating", StateDetail: migratingDetailPrefix + "tgt"}
+	d := s.SettleFailedSourceMigrations(ctx, "src", []corrosion.VMRecord{vm}, time.Time{})["vm-u"]
+	if d.Verdict != failover.MigratingHold {
+		t.Fatalf("decision %+v, want a hold: an incomplete inventory is no proof of absence", d)
+	}
+	detail, open := unresolvedDetail(t, s, "vm-u")
+	if !open || !strings.Contains(detail, "incomplete inventory") || !strings.Contains(detail, "next poll") ||
+		!strings.Contains(detail, "lv doctor repair-owner vm-u tgt") {
+		t.Fatalf("condition open %v, detail %q; want it naming the incomplete inventory, the next poll and repair-owner", open, detail)
+	}
 }
 
 // Failover asks each migration target once per pass, whatever the number of
@@ -125,7 +203,9 @@ func TestSettleFailedSourceMigrations_FirmwareVMIsHeldForTheDoctor(t *testing.T)
 //
 // Mutations: ask per VM (no per-target memo) — the call count per target is
 // 3, red; drop the semaphore — the in-flight peak exceeds the bound, red;
-// drop the pass's budget — the second arm runs past it, red.
+// drop the pass's budget, or bound each ask by the caller's ctx and not the
+// budget's — the second arm runs past it, red; ignore askBy — the third arm
+// runs to the 5s budget, red.
 func TestSettleFailedSourceMigrations_AsksEachTargetOnceWithinABudget(t *testing.T) {
 	ctx := context.Background()
 	setBounds := func(t *testing.T, timeout, budget time.Duration, conc int) {
@@ -151,11 +231,18 @@ func TestSettleFailedSourceMigrations_AsksEachTargetOnceWithinABudget(t *testing
 		calls     map[string]int
 		in, peak  atomic.Int32
 		completed atomic.Int32
+		// latest is the latest deadline any ask was given.
+		latest time.Time
 	}
 	ask := func(p *probe) func(ctx context.Context, host string) (runtimeInventory, error) {
 		return func(ctx context.Context, host string) (runtimeInventory, error) {
 			p.mu.Lock()
 			p.calls[host]++
+			if dl, ok := ctx.Deadline(); !ok {
+				p.latest = time.Now().Add(time.Hour)
+			} else if dl.After(p.latest) {
+				p.latest = dl
+			}
 			p.mu.Unlock()
 			n := p.in.Add(1)
 			defer p.in.Add(-1)
@@ -181,7 +268,7 @@ func TestSettleFailedSourceMigrations_AsksEachTargetOnceWithinABudget(t *testing
 		s := testServerWithLocks(t)
 		vms := vmsFor("fast-a", "fast-b", "dead-a", "dead-b", "dead-c", "dead-d")
 		start := time.Now()
-		got := s.SettleFailedSourceMigrations(ctx, "src", vms)
+		got := s.SettleFailedSourceMigrations(ctx, "src", vms, time.Time{})
 		if el := time.Since(start); el > 2*time.Second {
 			t.Errorf("the pass took %s; 4 dead targets at 2 at a time and 100ms each should take ~200ms", el)
 		}
@@ -214,8 +301,12 @@ func TestSettleFailedSourceMigrations_AsksEachTargetOnceWithinABudget(t *testing
 		s := testServerWithLocks(t)
 		vms := vmsFor("dead-a", "dead-b", "dead-c", "dead-d", "dead-e", "dead-f")
 		start := time.Now()
-		got := s.SettleFailedSourceMigrations(ctx, "src", vms)
-		if el := time.Since(start); el > time.Second {
+		got := s.SettleFailedSourceMigrations(ctx, "src", vms, time.Time{})
+		// Every ask ends by the budget, not by its own timeout past it.
+		if late := p.latest.Sub(start); late > 250*time.Millisecond+50*time.Millisecond {
+			t.Fatalf("an ask was given until %s after the pass began, past its 250ms budget", late)
+		}
+		if el := time.Since(start); el > 2*time.Second {
 			t.Fatalf("the pass took %s against a 250ms budget (6 dead targets at 200ms each, 1 at a time)", el)
 		}
 		unasked := 0
@@ -230,6 +321,28 @@ func TestSettleFailedSourceMigrations_AsksEachTargetOnceWithinABudget(t *testing
 		}
 		if unasked == 0 {
 			t.Error("every target was asked; the budget did not cut the pass short")
+		}
+	})
+	t.Run("the_polls_deadline_bounds_the_pass", func(t *testing.T) {
+		// The coordinator's one deadline for the poll, already mostly spent
+		// by another held host: it, not this call's own budget, ends the asks.
+		setBounds(t, 5*time.Second, 5*time.Second, 4)
+		p := &probe{calls: map[string]int{}}
+		withMigratingInventory(t, ask(p))
+		s := testServerWithLocks(t)
+		vms := vmsFor("dead-a", "dead-b")
+		start := time.Now()
+		got := s.SettleFailedSourceMigrations(ctx, "src", vms, start.Add(150*time.Millisecond))
+		if late := p.latest.Sub(start); late > 150*time.Millisecond+50*time.Millisecond {
+			t.Fatalf("an ask was given until %s after the pass began, past the poll's deadline 150ms out", late)
+		}
+		if el := time.Since(start); el > 2*time.Second {
+			t.Fatalf("the pass took %s against the poll's deadline 150ms out", el)
+		}
+		for _, vm := range vms {
+			if d := got[vm.Name]; d.Verdict != failover.MigratingHold {
+				t.Errorf("%s: %+v, want a hold", vm.Name, d)
+			}
 		}
 	})
 }

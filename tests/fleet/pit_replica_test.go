@@ -208,12 +208,30 @@ func TestFleet_FailoverMidWindowKeepsTheWindowsWrites(t *testing.T) {
 
 // I7 of the #256 review: a VM whose only replica is not point-in-time and
 // whose disk is host-local is HELD by failover — not rescheduled onto a host
-// that cannot start it — the hold is visible, and the manual command the hold
-// prints works as printed.
+// that cannot start it — the hold is visible, and the manual steps the hold
+// prints work as printed, in order.
 //
-// Mutation "held VMs are rescheduled": the coordinator's holdsDown returns
-// false — red.
+// A same-name promote needs its owner proven powered off (the split-brain
+// guard). Fenced by a method that proves nothing, the hold names
+// `lv host fence-confirm` first, and the promote alone is refused until it
+// has run; fenced proof-grade, it names the promote alone, which works.
+//
+// Mutations: "held VMs are rescheduled" (the coordinator's holdsDown returns
+// false) — red; the fence-confirm step dropped from the hold — the printed
+// promote is refused, red.
 func TestFleet_AHeldPromotionStaysDownAndItsCommandWorks(t *testing.T) {
+	for _, tc := range []struct {
+		name, method string
+		confirm      bool // the hold must name lv host fence-confirm first
+	}{
+		{"fence that proves nothing", "fleet-test", true},
+		{"proof-grade fence", "ipmi", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) { heldPromotionCommandsWork(t, tc.method, tc.confirm) })
+	}
+}
+
+func heldPromotionCommandsWork(t *testing.T, fenceMethod string, wantConfirm bool) {
 	c := New(t, Options{Nodes: 3, SharedCRDT: true})
 	ctx := context.Background()
 	victim, replicaHost, coord := c.Nodes[0], c.Nodes[1], c.Nodes[2]
@@ -260,9 +278,10 @@ func TestFleet_AHeldPromotionStaysDownAndItsCommandWorks(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	c.Kill(victim) // it does not answer: it is down, and powered off
 	fc := failover.NewCoordinator(coord.Name, coord.DB)
 	fc.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
-		return fence.Result{Method: "fleet-test", Success: true}
+		return fence.Result{Method: fenceMethod, Success: true}
 	})
 	fc.Promoter = coord.Server
 	fc.RunOnce(ctx)
@@ -289,8 +308,11 @@ func TestFleet_AHeldPromotionStaysDownAndItsCommandWorks(t *testing.T) {
 	if err != nil || !strings.Contains(inspected.GetFailoverHeld(), "not point-in-time") {
 		t.Errorf("inspect failover_held = %q (%v), want the hold", inspected.GetFailoverHeld(), err)
 	}
+	if inspected.GetFailoverHeld() != held {
+		t.Errorf("inspect failover_held = %q, want the hold's own text %q", inspected.GetFailoverHeld(), held)
+	}
 
-	// The command the hold printed, run as printed.
+	// The commands the hold printed, run as printed, in order.
 	i := strings.Index(held, "lv replication promote ")
 	if i < 0 {
 		t.Fatalf("the hold names no command: %s", held)
@@ -314,18 +336,40 @@ func TestFleet_AHeldPromotionStaysDownAndItsCommandWorks(t *testing.T) {
 			t.Fatalf("the printed command has a flag this test does not map: %s", args[j])
 		}
 	}
-	st, err := c.SelfClient(coord).PromoteReplica(ctx, req)
-	if err == nil {
-		for {
-			if _, err = st.Recv(); err != nil {
-				break
+	promote := func() error {
+		st, err := c.SelfClient(coord).PromoteReplica(ctx, req)
+		if err == nil {
+			for {
+				if _, err = st.Recv(); err != nil {
+					break
+				}
+			}
+			if err == io.EOF {
+				err = nil
 			}
 		}
-		if err == io.EOF {
-			err = nil
+		return err
+	}
+	k := strings.Index(held, "lv host fence-confirm ")
+	if wantConfirm != (k >= 0 && k < i) {
+		t.Fatalf("hold names fence-confirm before the promote = %v, want %v: %s", k >= 0 && k < i, wantConfirm, held)
+	}
+	if wantConfirm {
+		// Run out of order, the promote is refused: the step is needed.
+		if err := promote(); err == nil || !strings.Contains(err.Error(), "not proven powered off") {
+			t.Fatalf("the printed promote before the printed fence-confirm = %v; want it refused, not proven off", err)
+		}
+		host := strings.TrimRight(strings.Fields(held[k:])[3], ",")
+		// fencing_log is stamped to the second, and a fence and a
+		// confirmation in the same second count as the weaker of the two
+		// (corrosion.FenceRecordProvesOff): the operator confirms later.
+		time.Sleep(time.Until(time.Now().Truncate(time.Second).Add(time.Second)))
+		if _, err := c.SelfClient(coord).FenceHost(ctx,
+			&pb.FenceHostRequest{Name: host, Confirmed: true, ConfirmManualOnly: true}); err != nil {
+			t.Fatalf("the printed lv host fence-confirm %s failed: %v", host, err)
 		}
 	}
-	if err != nil {
+	if err := promote(); err != nil {
 		t.Fatalf("the printed command %q failed: %v", held[i:], err)
 	}
 	if !replicaHost.Virt.DomainExists("hw") {

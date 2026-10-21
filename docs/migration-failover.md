@@ -1749,7 +1749,8 @@ it. A host comes back
 `lv host undrain <host>`. A removed host does not block this: adding the
 machine back under its name (`lv host add`) brings the held VM back with it.
 If the host is gone for good, its data is gone with it: promote a replica if
-there is one (`lv replication promote <vm>`), or remove the host first
+there is one (once the host is powered off, `lv host fence-confirm <host>`,
+then `lv replication promote <vm>`), or remove the host first
 (`lv host rm --dead <host>`, try `--dry-run`) and then the VM (`lv rm <vm>`),
 and create it again; `lv rm` cannot reach a VM on a host that is fenced but
 not removed. The coordinator decides the hold once per fence, so changing the
@@ -1935,7 +1936,8 @@ one of these happens:
   `lv host undrain`. One that answers again without having restarted
   stays `fenced` or `offline` if failover moved anything off it, and
   `lv host undrain <host>` makes it active again;
-- an operator promotes a replica of it, `lv replication promote <vm>`;
+- an operator promotes a replica of it, `lv replication promote <vm>`, once
+  the host is proven powered off (`lv host fence-confirm <host>`);
 - the host is gone for good, is fenced proof-grade, and is removed with
   `lv host rm --dead <host>` (try `--dry-run` first). With recovery claims on
   (the default), the coordinator then recovers the VMs still recorded on the

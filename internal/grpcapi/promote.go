@@ -651,18 +651,44 @@ func vmAllowsAutoPromoteNotPIT(vm *corrosion.VMRecord) bool {
 
 // holdNotPointInTime refuses an automatic promotion whose only replica is
 // not point-in-time, loudly: an event (which InspectVM shows), a
-// notification, and the command that promotes it by hand. The replica is
-// not touched, and the VM's record is not changed.
+// notification, and the commands that promote it by hand, which work as
+// printed (promoteByHandSteps). The replica is not touched, and the VM's
+// record is not changed.
 func (s *Server) holdNotPointInTime(ctx context.Context, vm *corrosion.VMRecord, pool, host, replica string) error {
 	cmd := fmt.Sprintf("lv replication promote %s --pool %s --host %s --replica %s --accept-not-point-in-time", vm.Name, pool, host, replica)
-	detail := fmt.Sprintf("automatic promotion held: the only replica is not point-in-time (%s in pool %s on %s, copied with qemu-img convert -U after every point-in-time copy failed). The VM stays down and the replica is untouched. To promote it anyway: %s. To let failover do so for this VM, set the label %s=true",
-		replica, pool, host, cmd, corrosion.LabelAutoPromoteNotPointInTime)
+	detail := fmt.Sprintf("automatic promotion held: the only replica is not point-in-time (%s in pool %s on %s, copied with qemu-img convert -U after every point-in-time copy failed). The VM stays down and the replica is untouched. %s. To let failover do so for this VM, set the label %s=true",
+		replica, pool, host, s.promoteByHandSteps(ctx, vm, cmd), corrosion.LabelAutoPromoteNotPointInTime)
 	slog.Error("failover: automatic promotion held; the only replica is not point-in-time", "vm", vm.Name, "replica", replica, "pool", pool, "host", host)
 	s.recordVMEventSeverity(ctx, vm.Name, vmEventFailoverHeld, "error", "error", detail)
 	s.notify(ctx, notify.Notification{
 		Kind: "replication.promote_held", Severity: notify.SevError, Subject: vm.Name, Detail: detail,
 	})
 	return fmt.Errorf("%w: %s", errReplicaNotPointInTime, detail)
+}
+
+// promoteByHandSteps is the instruction to promote vm by hand with cmd, a
+// same-name `lv replication promote` without --force: the split-brain guard
+// (promoteSplitBrainRefusal) lets it through only once vm's host is proven
+// off, so when it is not, the instruction names `lv host fence-confirm`
+// first. One whose proof cannot be read now names it too: a confirmation of
+// a host already proven off records nothing new.
+func (s *Server) promoteByHandSteps(ctx context.Context, vm *corrosion.VMRecord, cmd string) string {
+	owner := vm.HostName
+	if owner == "" || owner == s.hostName {
+		return "To promote it anyway: " + cmd
+	}
+	h, provedOff, err := corrosion.SharedDiskOwnerProvedOff(ctx, s.db, owner)
+	if err == nil {
+		if ok, _ := corrosion.SharedDiskOwnerVerdict(owner, h, provedOff, nil); ok {
+			return "To promote it anyway: " + cmd
+		}
+	}
+	why := "whether it is proven off cannot be read"
+	if err == nil {
+		why = promoteOwnerNotProvenOff(owner, h)
+	}
+	return fmt.Sprintf("To promote it anyway, once %s is powered off (%s): lv host fence-confirm %s, then %s",
+		owner, why, owner, cmd)
 }
 
 // reportPromotedNotPointInTime is the event and notification of an automatic

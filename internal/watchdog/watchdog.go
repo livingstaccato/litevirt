@@ -260,6 +260,13 @@ func identityIsHardware(identity string) bool {
 // tripped via SelfFence, in which case it stops petting WITHOUT disarming so the
 // watchdog fires and reboots the host. ctrl may be nil (no self-fence path).
 func Heartbeat(ctx context.Context, devPath string, interval time.Duration, ctrl *Controller) {
+	HeartbeatFrom(ctx, devPath, interval, ctrl, nil)
+}
+
+// HeartbeatFrom is Heartbeat continuing on the descriptor boot already holds
+// (KeepBootAlive), so the device is never closed between boot petting and the
+// heartbeat. A nil or already-taken keeper opens the device as Heartbeat does.
+func HeartbeatFrom(ctx context.Context, devPath string, interval time.Duration, ctrl *Controller, boot *BootKeeper) {
 	// A non-empty devPath means the operator explicitly enabled watchdog
 	// fencing (and preflightWatchdog already validated the device exists). An
 	// empty path is the auto/optional case — fall back to the default device
@@ -272,7 +279,11 @@ func Heartbeat(ctx context.Context, devPath string, interval time.Duration, ctrl
 		interval = defaultInterval
 	}
 
-	f, err := os.OpenFile(devPath, os.O_WRONLY, 0)
+	f := boot.Handoff()
+	var err error
+	if f == nil {
+		f, err = os.OpenFile(devPath, os.O_WRONLY, 0)
+	}
 	if err != nil {
 		if configured {
 			// Startup preflight passed, so a failure to open the configured

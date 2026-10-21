@@ -99,6 +99,10 @@ type Daemon struct {
 	// startWaitSvc is svc for the libvirt start-guard wait, which is wired
 	// before svc exists and asks it which incarnation a create is starting.
 	startWaitSvc *atomic.Pointer[grpcapi.Server]
+	// bootWatchdog pets a watchdog timer a previous run left running, from the
+	// start of New until Run hands it to the heartbeat (bootUnderWatchdog).
+	// Nil when there is none.
+	bootWatchdog *watchdog.BootKeeper
 
 	// buildServer replaces grpcapi.NewServer in newServer (tests, which have
 	// no libvirt); nil in a daemon.
@@ -194,7 +198,45 @@ type Daemon struct {
 }
 
 // New creates a new daemon instance.
+//
+// A watchdog timer a previous run left running is petted before anything
+// else, and through the rest of New and Run until Heartbeat takes it over
+// (bootUnderWatchdog).
 func New(cfg *Config) (*Daemon, error) {
+	return bootUnderWatchdog(
+		func() *watchdog.BootKeeper { return watchdog.KeepBootAlive(cfg.WatchdogDev, 0) },
+		func(bk *watchdog.BootKeeper) (*Daemon, error) { return newDaemon(cfg, bk) },
+	)
+}
+
+// bootUnderWatchdog enforces the load-bearing boot order for the hardware
+// watchdog: pet a timer a previous run left running FIRST, then boot.
+//
+// After a crash the timer counts from the crashed run's last pet (60 s with
+// the default interval), and systemd restarts the unit 5 s later. Everything
+// boot does before the heartbeat can be slow or fail on a full or read-only
+// disk: opening the state store, the rollback check, the schema, the boot
+// write. Petting only once the heartbeat started let a slow boot, or a crash
+// loop failing in any of them, reboot the host and kill every VM on it.
+//
+// A boot that fails here abandons the keeper, which leaves the timer exactly
+// as armed as the previous run left it. A boot that succeeds hands it to Run,
+// which hands it to Heartbeat (or abandons it if Run fails first). Split out
+// so the ordering is unit-tested without a live daemon.
+func bootUnderWatchdog(
+	keep func() *watchdog.BootKeeper,
+	boot func(*watchdog.BootKeeper) (*Daemon, error),
+) (*Daemon, error) {
+	bk := keep()
+	d, err := boot(bk)
+	if err != nil {
+		bk.Abandon()
+		return nil, err
+	}
+	return d, nil
+}
+
+func newDaemon(cfg *Config, bootWatchdog *watchdog.BootKeeper) (*Daemon, error) {
 	// Create HLC clock for this node
 	clock := hlc.NewClock(cfg.HostName)
 
@@ -261,6 +303,7 @@ func New(cfg *Config) (*Daemon, error) {
 		images:  store,
 
 		startWaitSvc: startWaitSvc,
+		bootWatchdog: bootWatchdog,
 	}, nil
 }
 
@@ -420,6 +463,9 @@ func boundedTelemetryShutdown(shutdown func(context.Context) error, timeout time
 }
 
 func (d *Daemon) Run(ctx context.Context) error {
+	// Boot keeps a running watchdog petted until the heartbeat takes it over
+	// below; a Run that returns before then leaves it armed (no-op after).
+	defer d.bootWatchdog.Abandon()
 	// qemu writes UEFI vars files with no flush and libvirt has no cache mode
 	// for <nvram>: flush them from the first moment, so a host power cut
 	// loses at most about a second of a guest's UEFI variable writes.
@@ -1056,7 +1102,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		return false
 	})
-	go watchdog.Heartbeat(ctx, d.cfg.WatchdogDev, 0, watchdogCtrl)
+	// Continue on the descriptor boot has been petting (bootUnderWatchdog), so
+	// the device is never closed between the two.
+	go watchdog.HeartbeatFrom(ctx, d.cfg.WatchdogDev, 0, watchdogCtrl, d.bootWatchdog)
 	// Central self-fence hard gate: once this node self-fences, the checker's Execution/
 	// DecisionGate fail closed regardless of quorum, so every gate consumer (reconciler,
 	// grpcapi server, failover coordinator) refuses runtime-ownership work during the

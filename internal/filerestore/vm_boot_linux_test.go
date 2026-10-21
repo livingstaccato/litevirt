@@ -378,7 +378,28 @@ func TestRestoreVM_DiesWithTheDaemon(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "qemu.pid")
 	_ = os.Chmod(filepath.Dir(pidFile), 0o755)
 	cmd := exec.Command(os.Args[0], "-test.run", "^TestRestoreVM_DiesWithTheDaemon$", "-test.count=1")
-	cmd.Env = append(os.Environ(), "LITEVIRT_FR_HELPER=1", "LITEVIRT_FR_PIDFILE="+pidFile)
+	// The helper exits with os.Exit and never runs its own t.TempDir or
+	// bootLauncher cleanups, so each run leaked a TestRestoreVM_... and a
+	// frboot-... directory. Give it a TMPDIR of its own that this parent
+	// owns and removes. 0711 because, as root, qemu runs as another user
+	// who must traverse to the frboot-... directory created inside.
+	helperTmp, err := os.MkdirTemp("", "frhelper-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		// Restore write permission first: a helper killed mid-run can leave
+		// read-only directories that RemoveAll cannot descend into.
+		_ = filepath.WalkDir(helperTmp, func(p string, d os.DirEntry, err error) error {
+			if err == nil && d.IsDir() {
+				_ = os.Chmod(p, 0o700)
+			}
+			return nil
+		})
+		_ = os.RemoveAll(helperTmp)
+	})
+	_ = os.Chmod(helperTmp, 0o711)
+	cmd.Env = append(os.Environ(), "TMPDIR="+helperTmp, "LITEVIRT_FR_HELPER=1", "LITEVIRT_FR_PIDFILE="+pidFile)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("helper daemon: %v\n%s", err, out)
 	}

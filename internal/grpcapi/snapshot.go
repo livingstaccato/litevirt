@@ -184,10 +184,20 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		if mkErr := diskmode.MkdirAll(filepath.Dir(vmstatePath)); mkErr != nil {
 			return nil, status.Errorf(codes.Internal, "prepare vmstate dir: %v", mkErr)
 		}
-		sizeBytes, vmstateBytes, err = s.virt.CreateLiveSnapshot(req.VmName, req.Name, vmstatePath, captureFW)
+		// A VM with firmware state is captured with its vCPUs stopped, the
+		// firmware tar taken at that instant; any other is captured live
+		// when its dirty rate lets it converge (internal/libvirt
+		// CaptureMemorySnapshot).
+		opts := lv.CaptureOptions{Firmware: hasFW,
+			PauseBudget: s.memorySnapshot.PauseBudget, Deadline: s.memorySnapshot.LiveDeadline}
+		if hasFW {
+			opts.CaptureSuspended = captureFW
+		}
+		sizeBytes, vmstateBytes, err = s.virt.CreateLiveSnapshot(req.VmName, req.Name, vmstatePath, opts)
 		snapType = "memory"
-		// CreateLiveSnapshot cuts the disk overlay over before capturing/saving, so
-		// on failure the overlay may already exist — treat as created for cleanup.
+		// A failure after libvirt took the snapshot (the firmware capture,
+		// the resume) leaves the disks on their overlays — treat as created
+		// for cleanup.
 		snapCreated = true
 	} else {
 		if sizeBytes, err = s.virt.CreateSnapshot(req.VmName, req.Name); err == nil {
@@ -198,9 +208,9 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		}
 	}
 	if err != nil {
-		// The disk overlay may already have cut over (a live snapshot always cuts
-		// the overlay before the RAM save; a disk snapshot cuts on success) while
-		// capture/RAM-save failed. A bare metadata delete would strand the VM on an
+		// The disk overlay may already have cut over (a memory snapshot's
+		// firmware capture runs after it; a disk snapshot cuts on success)
+		// while the capture failed. A bare metadata delete would strand the VM on an
 		// untracked overlay, so reconcile the active disk path and record the
 		// snapshot ERRORED — visible + deletable, and DeleteSnapshot flattens an
 		// error record even when it's memory-typed. Drop any partial firmware

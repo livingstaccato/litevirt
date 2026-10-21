@@ -1185,6 +1185,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetFirmwareStore(d.fwStore)
 	reconciler.SetFirmwareStore(d.fwStore)
 	svc.SetSessionTimeouts(parseDurationOr(d.cfg.Auth.SessionIdleTimeout, 0), parseDurationOr(d.cfg.Auth.SessionHardExpiry, 0))
+	// Validated at load (MemorySnapshotConfig.validate).
+	if budget, deadline, err := d.cfg.MemorySnapshot.Durations(); err == nil {
+		svc.SetMemorySnapshotTuning(grpcapi.MemorySnapshotTuning{PauseBudget: budget, LiveDeadline: deadline})
+	}
 	svc.SetStrictMTLSIdentity(d.cfg.Auth.StrictMTLSIdentity)
 	svc.SetTrustRotatedPeerCerts(d.cfg.Auth.TrustRotatedPeerCerts)
 	svc.SetForwardedIdentity(d.cfg.Auth.ForwardedIdentity)

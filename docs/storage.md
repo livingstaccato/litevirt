@@ -2089,8 +2089,9 @@ disk to choose either way (see [compose.md](compose.md)).
 The **Snapshots** row describes each backend's *native* snapshot capability
 (what the driver could do). It is not the `lv snapshot create` code path: that
 command always goes through libvirt — an external qcow2 overlay for disk
-snapshots, plus `DomainSaveFlags` for the RAM state of a `--memory` snapshot —
-regardless of the underlying pool driver.
+snapshots, plus libvirt's external memory snapshot (RAM written by the running
+QEMU, see [configuration](configuration.md#memory-snapshots)) for a `--memory`
+snapshot — regardless of the underlying pool driver.
 
 For HA scenarios use NFS, Ceph RBD, or iSCSI — the disk must survive any
 single host failing.

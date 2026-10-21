@@ -124,6 +124,10 @@ type Config struct {
 	// Migration governs migrations this node sends.
 	Migration MigrationConfig `yaml:"migration"`
 
+	// MemorySnapshot tunes the memory snapshots (`lv snapshot create
+	// --memory`) this node captures.
+	MemorySnapshot MemorySnapshotConfig `yaml:"memory_snapshot,omitempty"`
+
 	// Capacity is the cluster-wide default for how much of a host may be handed
 	// to workloads. Per-host overrides live on the host record (`lv host config`)
 	// and win where set.
@@ -1128,6 +1132,9 @@ func LoadConfig() (*Config, error) {
 	if err := cfg.Firewall.validate(); err != nil {
 		return nil, err
 	}
+	if err := cfg.MemorySnapshot.validate(); err != nil {
+		return nil, err
+	}
 
 	// A typo'd bandwidth limit must fail load, not silently run unlimited.
 	if _, err := cfg.BackupBandwidthLimits(); err != nil {
@@ -1351,6 +1358,51 @@ type VMDefaultsConfig struct {
 	// QEMU's qemu64 — no SSE4.2, no AVX, no AVX2. Per-VM, `lv run --cpu-mode`
 	// still wins over this.
 	DefaultCPUMode string `yaml:"default_cpu_mode,omitempty"`
+}
+
+// MemorySnapshotConfig tunes memory snapshot capture. A VM with firmware
+// state (UEFI NVRAM, vTPM) is always captured with its vCPUs stopped; any
+// other is captured live, its RAM written while it runs, when its measured
+// dirty rate predicts the final pause fits PauseBudget. Empty fields take
+// the built-in defaults (1s and 2m), which the P1 lab measurements may
+// change.
+type MemorySnapshotConfig struct {
+	// PauseBudget is the longest predicted guest pause a live capture is
+	// chosen for, a Go duration ("1s", "500ms").
+	PauseBudget string `yaml:"pause_budget,omitempty"`
+	// LiveDeadline is how long a live capture runs before the guest is
+	// suspended so the rest is written with it stopped, a Go duration.
+	LiveDeadline string `yaml:"live_deadline,omitempty"`
+}
+
+// Durations returns the configured pause budget and live deadline; zero for
+// one that is not set.
+func (m MemorySnapshotConfig) Durations() (budget, deadline time.Duration, err error) {
+	parse := func(key, v string) (time.Duration, error) {
+		if v == "" {
+			return 0, nil
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return 0, fmt.Errorf("config memory_snapshot.%s: %q is not a duration: %w", key, v, err)
+		}
+		if d <= 0 {
+			return 0, fmt.Errorf("config memory_snapshot.%s: %q must be positive", key, v)
+		}
+		return d, nil
+	}
+	if budget, err = parse("pause_budget", m.PauseBudget); err != nil {
+		return 0, 0, err
+	}
+	if deadline, err = parse("live_deadline", m.LiveDeadline); err != nil {
+		return 0, 0, err
+	}
+	return budget, deadline, nil
+}
+
+func (m MemorySnapshotConfig) validate() error {
+	_, _, err := m.Durations()
+	return err
 }
 
 // MigrationConfig governs migrations this node sends.

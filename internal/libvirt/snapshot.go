@@ -70,6 +70,12 @@ func domainExists(v snapshotAPI, name string) bool {
 	return err == nil
 }
 
+// snapshotListAPI is what naming a new snapshot's overlays reads.
+type snapshotListAPI interface {
+	DomainListAllSnapshots(dom golibvirt.Domain, needResults int32, flags uint32) ([]golibvirt.DomainSnapshot, int32, error)
+	DomainGetXMLDesc(dom golibvirt.Domain, flags golibvirt.DomainXMLFlags) (string, error)
+}
+
 // snapshotCreateXML is the definition a new disk-only snapshot is created
 // with. libvirt names a new overlay by cutting the disk's current source at
 // its last dot; when that source is the overlay of a snapshot whose name has
@@ -78,8 +84,19 @@ func domainExists(v snapshotAPI, name string) bool {
 // (snapshot-lab.md, Round 3 "4b"). For such a disk the overlay is named
 // here: the disk's stem, cut by the VM's known snapshot names, then the new
 // name. Every other disk is left to libvirt, as before.
-func snapshotCreateXML(v snapshotAPI, dom golibvirt.Domain, snapshotName string) (string, error) {
-	plain := "<domainsnapshot><name>" + xmlText(snapshotName) + "</name></domainsnapshot>"
+func snapshotCreateXML(v snapshotListAPI, dom golibvirt.Domain, snapshotName string) (string, error) {
+	return snapshotCreateXMLMemory(v, dom, snapshotName, "")
+}
+
+// snapshotCreateXMLMemory is snapshotCreateXML for a full-system snapshot
+// whose memory libvirt writes to memoryFile (external memory); "" is a
+// disk-only snapshot's definition.
+func snapshotCreateXMLMemory(v snapshotListAPI, dom golibvirt.Domain, snapshotName, memoryFile string) (string, error) {
+	head := "<domainsnapshot><name>" + xmlText(snapshotName) + "</name>"
+	if memoryFile != "" {
+		head += "<memory snapshot='external' file='" + xmlAttr(memoryFile) + "'/>"
+	}
+	plain := head + "</domainsnapshot>"
 	snaps, _, err := v.DomainListAllSnapshots(dom, -1, 0)
 	if err != nil || len(snaps) == 0 {
 		return plain, nil
@@ -107,7 +124,7 @@ func snapshotCreateXML(v snapshotAPI, dom golibvirt.Domain, snapshotName string)
 	if disks.Len() == 0 {
 		return plain, nil
 	}
-	return "<domainsnapshot><name>" + xmlText(snapshotName) + "</name><disks>" + disks.String() + "</disks></domainsnapshot>", nil
+	return head + "<disks>" + disks.String() + "</disks></domainsnapshot>", nil
 }
 
 // stemByNames cuts a known snapshot's name — the longest that fits — off
@@ -176,7 +193,7 @@ func (c *Client) CreateSnapshot(domainName, snapshotName string) (int64, error) 
 // snapshotDisksNarrowed takes the disk snapshot xml describes and narrows the
 // overlays libvirt made for it to their owner (best effort; the snapshot
 // stands either way). Files the domain named before are never touched.
-func snapshotDisksNarrowed(v snapshotAPI, dom golibvirt.Domain, xml string, flags uint32) error {
+func snapshotDisksNarrowed(v snapshotCreateAPI, dom golibvirt.Domain, xml string, flags uint32) error {
 	before, _ := v.DomainGetXMLDesc(dom, 0)
 	if _, err := v.DomainSnapshotCreateXML(dom, xml, flags); err != nil {
 		return err
@@ -185,6 +202,12 @@ func snapshotDisksNarrowed(v snapshotAPI, dom golibvirt.Domain, xml string, flag
 		narrowNew(newDiskSources(before, after)...)
 	}
 	return nil
+}
+
+// snapshotCreateAPI is what taking a snapshot and narrowing its files uses.
+type snapshotCreateAPI interface {
+	DomainGetXMLDesc(dom golibvirt.Domain, flags golibvirt.DomainXMLFlags) (string, error)
+	DomainSnapshotCreateXML(dom golibvirt.Domain, xml string, flags uint32) (golibvirt.DomainSnapshot, error)
 }
 
 // newDiskSources returns the disk files afterXML names that beforeXML did
@@ -659,100 +682,22 @@ func leafNotCurrent(v snapshotAPI, dom golibvirt.Domain, snap golibvirt.DomainSn
 }
 
 // CreateLiveSnapshot captures both the guest's disks AND its RAM/CPU state at a
-// single instant, leaving the VM running. The saved RAM image is written to
-// vmstatePath; a later RevertToLiveSnapshot restores both disk and RAM to this
-// exact point. Returns (disk allocation bytes, vmstate file bytes).
+// single instant, leaving the VM running in the same QEMU process. The RAM
+// image is written to vmstatePath; a later RevertToLiveSnapshot restores both
+// disk and RAM to this exact point. Returns (disk allocation bytes, vmstate
+// file bytes). See CaptureMemorySnapshot for the variants.
 //
-// Sequence (the suspend is the single freeze point, so disk and RAM are the
-// same instant):
-//  1. suspend the guest
-//  2. external disk-only snapshot of the frozen guest (overlay cutover)
-//  3. save RAM to vmstatePath (libvirt stops the domain when the save finishes)
-//  4. restore from that image as running — the VM resumes with its exact RAM,
-//     now writing to the post-snapshot overlay
-//
-// The VM is unavailable only for the suspend→save→restore window (seconds for
-// small guests); it does NOT reboot. Memory snapshots are not compatible with a
-// stopped VM — callers must fall back to CreateSnapshot for that case.
-// captureSuspended, when non-nil, is invoked while the guest is frozen (disks
-// snapshotted, guest paused) so firmware state (NVRAM + swtpm) is captured at the
-// SAME instant as the disk+RAM snapshot — see CreateLiveSnapshot (G1).
-//
-// The capture stops the guest (the RAM save) and starts it again (the
-// restore), so the firmware move guard is asked for both, OpStop and OpStart,
-// before the guest is suspended: a refusal after the save would leave it
-// stopped.
-func (c *Client) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, captureSuspended func() error) (diskBytes, vmstateBytes int64, err error) {
-	for _, op := range []FirmwareOp{OpStop, OpStart} {
+// The capture pauses and resumes the guest, and records a point a revert
+// later starts it from, so the firmware move guard is asked for a resume and
+// a start before anything is done: a refusal of either refuses it, which is
+// every record that names the VM, as before.
+func (c *Client) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, o CaptureOptions) (diskBytes, vmstateBytes int64, err error) {
+	for _, op := range []FirmwareOp{OpStart, OpResume} {
 		if err := c.firmwareGuard().check(FirmwareCall{Op: op, Name: domainName}); err != nil {
 			return 0, 0, fmt.Errorf("memory snapshot of %q: %w", domainName, err)
 		}
 	}
-	dom, err := c.virt.DomainLookupByName(domainName)
-	if err != nil {
-		return 0, 0, fmt.Errorf("lookup domain %q: %w", domainName, err)
-	}
-	state, _, _ := c.virt.DomainGetState(dom, 0)
-	if state == int32(golibvirt.DomainPaused) {
-		// The capture ends by resuming the guest. A paused domain is paused by
-		// someone — an operator, or this host's partition pause, which must
-		// keep it stopped — so a memory snapshot of it is refused rather than
-		// resuming it behind their back (docs/design/partition-pause.md §3.3).
-		return 0, 0, fmt.Errorf("domain %q is paused — a memory snapshot would resume it; resume it first", domainName)
-	}
-	if state != int32(golibvirt.DomainRunning) {
-		return 0, 0, fmt.Errorf("domain %q is not running — memory snapshot requires a running VM", domainName)
-	}
-
-	// 1. Freeze point.
-	if err := c.virt.DomainSuspend(dom); err != nil {
-		return 0, 0, fmt.Errorf("suspend domain %q: %w", domainName, err)
-	}
-	resumed := false
-	// On any early error, best-effort resume so we don't leave the guest paused.
-	defer func() {
-		if !resumed {
-			_ = c.virt.DomainResume(dom)
-		}
-	}()
-
-	// 2. External disk snapshot of the frozen guest.
-	snapXML, err := snapshotCreateXML(c.virt, dom, snapshotName)
-	if err != nil {
-		return 0, 0, err
-	}
-	flags := uint32(golibvirt.DomainSnapshotCreateDiskOnly | golibvirt.DomainSnapshotCreateAtomic)
-	if err := snapshotDisksNarrowed(c.virt, dom, snapXML, flags); err != nil {
-		return 0, 0, fmt.Errorf("disk snapshot: %w", err)
-	}
-	allocation, _, _, _ := c.virt.DomainGetBlockInfo(dom, "vda", 0)
-
-	// 2b. Capture firmware (NVRAM + swtpm) at this frozen instant — consistent
-	// with the disk+RAM snapshot. Must be here (guest paused), not after resume.
-	if captureSuspended != nil {
-		if err := captureSuspended(); err != nil {
-			return 0, 0, fmt.Errorf("capture firmware state: %w", err)
-		}
-	}
-
-	// 3. Save RAM. This stops the (already-paused) domain and writes the full
-	// domain XML (referencing the new overlay paths) into the image.
-	if err := c.virt.DomainSaveFlags(dom, vmstatePath, nil, uint32(domainSavePaused)); err != nil {
-		return 0, 0, fmt.Errorf("save guest memory: %w", err)
-	}
-	narrowNew(vmstatePath) // the guest's RAM
-
-	// 4. Resume from the saved image as running (disks already point at the
-	// overlay, so no Dxml override is needed here).
-	if err := c.restoreWithRetry(domainName, vmstatePath, ""); err != nil {
-		return 0, 0, fmt.Errorf("resume from saved memory: %w", err)
-	}
-	resumed = true // the domain is running again; the deferred resume is a no-op
-
-	if fi, statErr := os.Stat(vmstatePath); statErr == nil {
-		vmstateBytes = fi.Size()
-	}
-	return int64(allocation), vmstateBytes, nil
+	return CaptureMemorySnapshot(c.virt, domainName, snapshotName, vmstatePath, o)
 }
 
 // RevertToLiveSnapshot reverts disk AND RAM to a memory snapshot taken by

@@ -17,6 +17,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -37,7 +38,8 @@ func seedRestorableVM(t *testing.T, s *Server, typ string) *libvirtfake.Fake {
 		if err := os.WriteFile(rec.VMStatePath, []byte("ram"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := fake.CreateLiveSnapshot("rs", "s1", rec.VMStatePath, nil); err != nil {
+		fake.SetState("rs", libvirtfake.StateRunning) // a memory snapshot is of a running domain
+		if _, _, err := fake.CreateLiveSnapshot("rs", "s1", rec.VMStatePath, libvirt.CaptureOptions{}); err != nil {
 			t.Fatal(err)
 		}
 		fake.SetSavedImageXML(rec.VMStatePath, "<domain type='kvm'><name>rs</name><devices></devices></domain>")

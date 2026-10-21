@@ -24,16 +24,21 @@ func TestParsePCIAddress(t *testing.T) {
 			ParsedPCIAddr{Domain: "0x0000", Bus: "0xb4", Slot: "0x02", Function: "0x3"},
 		},
 		{
-			// Short input with no function
-			"0000:41:00",
+			// Domain omitted, as lspci prints it.
+			"41:00.0",
 			ParsedPCIAddr{Domain: "0x0000", Bus: "0x41", Slot: "0x00", Function: "0x0"},
+		},
+		{
+			// Upper case, canonicalized.
+			"0000:B4:02.3",
+			ParsedPCIAddr{Domain: "0x0000", Bus: "0xb4", Slot: "0x02", Function: "0x3"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			got := ParsePCIAddress(tt.input)
-			if got != tt.want {
+			got, ok := ParsePCIAddress(tt.input)
+			if !ok || got != tt.want {
 				t.Errorf("ParsePCIAddress(%q) = %+v, want %+v", tt.input, got, tt.want)
 			}
 		})
@@ -41,10 +46,11 @@ func TestParsePCIAddress(t *testing.T) {
 }
 
 func TestParsePCIAddress_Invalid(t *testing.T) {
-	// Too few colons — should return zero defaults
-	got := ParsePCIAddress("41:00.0")
-	if got.Domain != "0x0000" {
-		t.Errorf("invalid address: Domain = %q, want 0x0000", got.Domain)
+	// No BDF: refused, never a fixed fallback address.
+	for _, in := range []string{"", "41", "0000:41:00", "zz:00.0", "0000:41:00.9"} {
+		if got, ok := ParsePCIAddress(in); ok {
+			t.Errorf("ParsePCIAddress(%q) = %+v, want refused", in, got)
+		}
 	}
 }
 

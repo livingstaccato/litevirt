@@ -98,14 +98,16 @@ func TestParsePCIAddress_Variants(t *testing.T) {
 	}{
 		{"0000:00:00.0", ParsedPCIAddr{"0x0000", "0x00", "0x00", "0x0"}},
 		{"0000:ff:1f.7", ParsedPCIAddr{"0x0000", "0xff", "0x1f", "0x7"}},
-		// Too few colons.
-		{"short", ParsedPCIAddr{"0x0000", "0x00", "0x00", "0x0"}},
 	}
 	for _, tt := range tests {
-		got := ParsePCIAddress(tt.input)
-		if got != tt.want {
-			t.Errorf("ParsePCIAddress(%q) = %+v, want %+v", tt.input, got, tt.want)
+		got, ok := ParsePCIAddress(tt.input)
+		if !ok || got != tt.want {
+			t.Errorf("ParsePCIAddress(%q) = %+v, %v, want %+v", tt.input, got, ok, tt.want)
 		}
+	}
+	// Too few colons.
+	if got, ok := ParsePCIAddress("short"); ok {
+		t.Errorf("ParsePCIAddress(\"short\") = %+v, want refused", got)
 	}
 }
 

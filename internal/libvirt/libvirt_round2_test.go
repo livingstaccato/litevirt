@@ -254,7 +254,7 @@ func TestGenerateDomainXML_EmptyFirmwareIsUEFI(t *testing.T) {
 // ── ParsePCIAddress detailed structure ──────────────────────────────────────
 
 func TestParsePCIAddress_FullAddress(t *testing.T) {
-	got := ParsePCIAddress("abcd:ef:12.3")
+	got, _ := ParsePCIAddress("abcd:ef:12.3")
 	want := ParsedPCIAddr{
 		Domain:   "0xabcd",
 		Bus:      "0xef",
@@ -267,7 +267,7 @@ func TestParsePCIAddress_FullAddress(t *testing.T) {
 }
 
 func TestParsePCIAddress_ZeroPadded(t *testing.T) {
-	got := ParsePCIAddress("0000:00:1f.0")
+	got, _ := ParsePCIAddress("0000:00:1f.0")
 	want := ParsedPCIAddr{
 		Domain:   "0x0000",
 		Bus:      "0x00",

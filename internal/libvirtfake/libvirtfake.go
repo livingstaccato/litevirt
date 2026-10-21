@@ -2292,8 +2292,7 @@ func insertHostdevIntoDomainXML(domainXML, domainName, pciAddress, alias string)
 	// Emit the <source><address> the way real libvirt does so
 	// libvirt.HostdevSourcePCIAddresses (the by-source-BDF membership authority the
 	// legacy detach path reads — legacy hostdevs carry no alias) can find this device.
-	if pciAddress != "" {
-		p := libvirt.ParsePCIAddress(pciAddress)
+	if p, ok := libvirt.ParsePCIAddress(pciAddress); ok {
 		hd += "<source><address domain='" + p.Domain + "' bus='" + p.Bus +
 			"' slot='" + p.Slot + "' function='" + p.Function + "'/></source>"
 	}

@@ -151,7 +151,11 @@ func PatchInactiveDevices(inactiveXML string, want WantDevices) (string, error) 
 				continue
 			}
 			seenHostdev[e.key] = true
-			if patched := rewriteHostdevSource(e.raw, h.Address); patched != e.raw {
+			patched, err := rewriteHostdevSource(e.raw, h.Address)
+			if err != nil {
+				return "", err
+			}
+			if patched != e.raw {
 				edits = append(edits, spanEdit{e.start, e.end, patched})
 			}
 		}
@@ -399,18 +403,21 @@ var reHostdevSourceBlock = regexp.MustCompile(`(?s)<source\b[^>]*>.*?</source>`)
 // leaving the guest <address> (a sibling of <source>) and the <alias> intact.
 // This is the topology-preserving re-resolve: the passthrough device can move to
 // a different host PCI address without changing the guest-visible slot.
-func rewriteHostdevSource(raw, bdf string) string {
+func rewriteHostdevSource(raw, bdf string) (string, error) {
 	if bdf == "" {
-		return raw
+		return raw, nil
 	}
-	p := ParsePCIAddress(bdf)
+	p, err := pciHostdevAddress(bdf)
+	if err != nil {
+		return "", err
+	}
 	return reHostdevSourceBlock.ReplaceAllStringFunc(raw, func(src string) string {
 		src = replaceAttrIfPresent(src, "domain", p.Domain)
 		src = replaceAttrIfPresent(src, "bus", p.Bus)
 		src = replaceAttrIfPresent(src, "slot", p.Slot)
 		src = replaceAttrIfPresent(src, "function", p.Function)
 		return src
-	})
+	}), nil
 }
 
 // replaceAttrIfPresent rewrites attr="val" (either quote style) everywhere it
@@ -503,14 +510,15 @@ func marshalNewNIC(childIndent string, n WantNIC) (string, error) {
 }
 
 func marshalNewHostdev(childIndent string, h WantHostdev) (string, error) {
-	p := ParsePCIAddress(h.Address)
+	addr, err := pciHostdevAddress(h.Address)
+	if err != nil {
+		return "", err
+	}
 	hd := hostdevDevice{
 		Mode:    "subsystem",
 		Type:    "pci",
 		Managed: "yes",
-		Source: hostdevSource{
-			Address: &hostdevAddress{Domain: p.Domain, Bus: p.Bus, Slot: p.Slot, Function: p.Function},
-		},
+		Source:  hostdevSource{Address: addr},
 	}
 	if h.Alias != "" {
 		hd.Alias = &hostdevAlias{Name: h.Alias}

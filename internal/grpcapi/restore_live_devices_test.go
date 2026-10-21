@@ -26,7 +26,7 @@ const restoreGPU = "0000:41:00.0"
 func seedRestoreGPU(t *testing.T, s *Server) {
 	t.Helper()
 	if err := corrosion.UpsertPCIDevice(context.Background(), s.db, corrosion.PCIDeviceRecord{
-		HostName: s.hostName, Address: restoreGPU, Type: "gpu", VendorID: "10de", IOMMUGroup: -1,
+		HostName: s.hostName, Address: restoreGPU, Type: "gpu", VendorID: "10de", IOMMUGroup: soloIOMMUGroup(restoreGPU),
 	}); err != nil {
 		t.Fatalf("seed PCI device: %v", err)
 	}
@@ -215,7 +215,7 @@ func TestCreateVM_AFailedStartReleasesTheDevices(t *testing.T) {
 		t.Fatalf("InsertHost: %v", err)
 	}
 	if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
-		HostName: "test-host", Address: restoreGPU, Type: "gpu", VendorID: "10de", IOMMUGroup: -1,
+		HostName: "test-host", Address: restoreGPU, Type: "gpu", VendorID: "10de", IOMMUGroup: soloIOMMUGroup(restoreGPU),
 	}); err != nil {
 		t.Fatalf("seed PCI device: %v", err)
 	}

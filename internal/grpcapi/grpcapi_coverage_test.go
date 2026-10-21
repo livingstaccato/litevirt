@@ -1318,10 +1318,11 @@ func TestCheckIOMMUConflict_NoConflict(t *testing.T) {
 	s := testServerCov(t)
 	ctx := adminCtx()
 
-	// No devices at all — should succeed.
+	// No devices at all — the device's IOMMU group is unknown, so it is refused
+	// (this test used to pin the fail-open nil).
 	err := s.checkIOMMUConflict(ctx, "0000:01:00.0", "vm1")
-	if err != nil {
-		t.Errorf("expected no conflict, got %v", err)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("device absent from inventory: got %v, want a FailedPrecondition refusal", err)
 	}
 }
 

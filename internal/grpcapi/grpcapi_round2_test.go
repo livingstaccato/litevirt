@@ -528,10 +528,11 @@ func TestCheckIOMMUConflict_UnknownDevice(t *testing.T) {
 	s := testServerR2(t)
 	ctx := adminCtx()
 
-	// Device not in DB — should return nil (no conflict possible).
+	// Device not in DB — its IOMMU group is unknown, so it is refused (this
+	// test used to pin the fail-open nil).
 	err := s.checkIOMMUConflict(ctx, "0000:ff:00.0", "my-vm")
-	if err != nil {
-		t.Errorf("expected nil for unknown device, got %v", err)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("unknown device: got %v, want a FailedPrecondition refusal", err)
 	}
 }
 

@@ -14,7 +14,14 @@ GRUB_CMDLINE_LINUX="intel_iommu=on iommu=pt"
 GRUB_CMDLINE_LINUX="amd_iommu=on iommu=pt"
 ```
 
-Update GRUB and reboot after changes.
+Update GRUB and reboot after changes, then run `lv host rescan` so the inventory records each device's IOMMU group.
+
+litevirt refuses to pass through a device whose IOMMU group it cannot establish, because it cannot tell whether the device shares a group with another VM's device. This covers devices chosen by address, mapping or type; create, start, attach and restore all refuse, with the reason, when:
+
+- the IOMMU is off: the kernel lists no groups under `/sys/kernel/iommu_groups`. The refusal names the kernel parameter to set;
+- the device has no IOMMU group link (`/sys/bus/pci/devices/<address>/iommu_group`), or the inventory was scanned before the IOMMU was turned on. Run `lv host rescan`;
+- the device is not in the host's inventory. Run `lv host rescan`;
+- the host's PCI inventory cannot be read. Retry once the local database is readable.
 
 2. **vfio-pci module loaded:**
 

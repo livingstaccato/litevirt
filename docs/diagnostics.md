@@ -2261,7 +2261,15 @@ holder writes.
   could not pause a workload it had to. While it is open, the majority does
   not rely on this host's pause and recovers on an `assumed` fence as before.
   With a verified hardware watchdog armed the host also self-fences. It
-  resolves once every pause succeeds or the majority returns.
+  resolves once every pause succeeds or the majority returns. A record that
+  cannot be written (a full `data_dir`), or whose write does not return within
+  2 s, raises it only under `enforcement.partition_pause_record_failure:
+  self_fence`, or `reserve` with the reserve unwritable too, and only with a
+  verified watchdog armed; otherwise the host pauses anyway and logs
+  `partition-pause: cannot write the pause record to the record directory;
+  pausing with it held in reserve` (or `memory`), with
+  `fallback=no_verified_watchdog` when `reserve` or `self_fence` fell back for
+  want of a watchdog.
 - `partition_one_way` (host, critical): a quorum of voters cannot reach the
   host while the host's own rows, written after those failures began, still
   mark a majority healthy. That is a one-way partition, in which the host may

@@ -1792,6 +1792,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	pauser := health.NewPartitionPauser(d.cfg.HostName, d.cfg.DataDir, d.db)
 	pauser.SetQuorum(d.checker.ExecutionQuorum)
 	pauser.SetEnabled(func() bool { return d.cfg.Enforcement.PartitionPause })
+	pauser.SetRecordFailure(d.cfg.Enforcement.PartitionPauseRecordFailure)
 	pauser.SetVMBackend(d.virt)
 	pauser.SetContainerRuntime(lxcRunner)
 	pauser.SetResumeConfirmer(svc.CheckPartitionResume)

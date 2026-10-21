@@ -216,6 +216,56 @@ The file is written through a temp file, `fsync`, `rename` and a directory
   with no record. The pauser would treat that domain as paused by an operator
   and never resume it.
 
+**When the record cannot be written** (a full or failing `data_dir`),
+`enforcement.partition_pause_record_failure` decides. The default, `pause`,
+pauses anyway: the record goes to the reserve
+(`<data_dir>/partition-pause/reserve`, fixed slots written with zeros while
+the disk has room, so a record overwrites blocks the file already owns) or,
+when that fails too, to the daemon's memory, and every pass writes it to the
+directory once it can. `reserve` requires the directory or the reserve before
+the pause; `self_fence` requires the directory, and a write that fails is a
+failed pause (§3.4), as before the key existed.
+
+`reserve` and `self_fence` trade the pause for a self-fence, so they need a
+verified watchdog. **Without one armed they pause as `pause` does**, with the
+record held in memory, and log the fallback with
+`fallback=no_verified_watchdog`; `partition_pause_failed` is not raised,
+because the pause happened. A failed pause with nothing to self-fence would
+leave the copy running beside the majority's replacement, and the failure
+cannot reach the majority inside a full partition (F2).
+
+The write is bounded: a pause waits for its record at most
+`min(2 s, what is left of the pass's read budget)`, never less than 100 ms.
+A write that has not returned by then (a dying disk, an `fsync` stuck in D
+state) counts as one that failed: the record is held in memory and the
+workload is paused, or, in `reserve` and `self_fence` with a verified
+watchdog, the pause fails. The write goes on in the background. Each record
+and each removal of a workload's record bumps a generation in the daemon, and
+a write that returns after the generation moved removes its file again, so a
+late write never brings back a record that a resume removed.
+
+The reserve is 1024 slots of 1 KiB. A slot is never overwritten in place: a
+newer record of the same workload goes to a free slot, synced before the
+older is zeroed. A slot that fails its checksum is therefore a torn first
+write (its pause never happened) or a torn clear, and is skipped with a
+warning and zeroed before reuse; a reserve of the wrong size, or one that
+cannot be read, still holds every resume. Memory records reach the directory
+even while the reserve cannot be read. More than 1024 records at once
+overflow it: the rest are held in memory (or fail the pause, as above), and
+the first overflow is logged once. The reserve relies on overwriting blocks
+the file owns: true on ext4 and xfs, and on btrfs because the file is made
+with `FS_NOCOW_FL` (until a snapshot of the subvolume shares its blocks). On
+zfs, which allocates on every write, the reserve is best effort: give
+`data_dir` its own dataset with a `refreservation`, or rely on `pause`.
+
+The majority relies on the
+pause, never on the record: the record is host-local and decides only what
+this host resumes. A daemon that dies holding a record in memory only comes
+back to a paused domain with no record, which it treats as paused by someone
+else and never resumes: held, not free to run. A record or reserve it cannot
+read is held the same way, by the pauser and by every other reader
+(`ReadPauseRecord`: the snapshot and NIC-guard resume paths).
+
 `owner_epoch` and `incarnation` come from the row at the moment of the pause.
 They are what the resume check (§3.5) and Layer 3 (§6) compare against.
 
@@ -237,7 +287,11 @@ a record holds, and `CreateLiveSnapshot` refuses any paused domain.
 
 ### 3.4 Pause failure
 
-If a suspend or a freeze fails, the pauser does three things:
+If a suspend or a freeze fails, or its record cannot be written where
+`enforcement.partition_pause_record_failure` requires it (§3.3) and a
+verified watchdog is armed, the pauser does three things (without a verified
+watchdog, `reserve` and `self_fence` pause with the record in memory
+instead, §3.3):
 
 - It raises `partition_pause_failed` (evaluator `partition_pause`, subject
   `host/<name>`, severity critical), with the workload and the error. The row
@@ -1005,6 +1059,7 @@ container (`split_brain`), so a certified relocation can only lead to a stop.
 |---|---|---|---|
 | F1 | The minority's daemon is dead (crash, OOM, hung) | Nothing pauses. The majority still waits `W` and then recovers. | A dual run, as today. A hardware watchdog closes it, because daemon death trips it. Layer 3 settles it when the daemon returns. |
 | F2 | A suspend fails inside a full partition | The minority raises `partition_pause_failed`, retries every tick, and self-fences if a verified watchdog is armed. | Without a watchdog, the majority cannot learn of the failure until the heal, so it counts a pause that did not happen. Layer 3 settles it on return. |
+| F2a | The record cannot be written, or its write hangs (a full or dying `data_dir`) | `pause` (the default) pauses with the record in the reserve or in memory. `reserve` and `self_fence` fail the pause and self-fence when a verified watchdog is armed; without one they pause with the record in memory (`fallback=no_verified_watchdog`). A write that has not returned within `min(2 s, pass budget)` counts as failed (§3.3). | A daemon that dies holding a record in memory only comes back to a paused domain with no record, which it never resumes itself: held, with no `lv` path to resume it yet. |
 | F3 | The daemon restarts during the partition | Its loss clock starts at its own start, so it pauses at most `T_pause` + warmup after the restart. | If the restart lands after the majority's decision, the pause can miss the deadline by up to the restart's length. Layer 3 settles it. |
 | F4 | One-way partition (A→M works, M→A does not) | M can count a majority that cannot count it, so it may not pause while the majority fences it. The coordinator raises `partition_one_way` (evaluator `partition_pause`, subject `host/<M>`, critical) when it sees both views at once: a quorum of voters with at least `F` consecutive failures of M, and M's own rows marking enough voters healthy for a majority, each written AFTER that voter's failure streak against M began, with that voter still failing M after M saw it healthy. The last clause is what a heal lacks: there the host's new healthy rows are newer than the voters' last failures. It does not recover any differently. | Still open. The fix is mutual reachability: a probe answer that states the responder's own view of the caller. Detection is partial, because the checker does not re-stamp a steadily healthy edge. M's "healthy" rows are fresh only after a transition (a restart, or a flap), so a one-way split that starts with every edge already healthy is not seen. |
 | F5 | More than 17 hosts | `D_M` grows by one probe batch per 16 peers. | Closed: `W` is computed from the cluster's size (§4.4). The one gap is a host added inside the minority during the partition. |
@@ -1124,3 +1179,10 @@ nodes at once, then heals. Grep for `partition-pause: paused` and
    (finding P1). `ReadyResponse.partition_pause` now carries the flag on every
    health probe, and the coordinator reads the latest answer (§4.3).
    `Checker.PeerAdvertisedLast` is gone.
+9. **A record that cannot be written no longer fails the pause by default**
+   A full `data_dir` turned every pause into
+   `partition_pause_failed` and, with a verified watchdog, a self-fence that
+   stopped every VM on the host; without one the host kept running a copy the
+   majority relied on it pausing. `enforcement.partition_pause_record_failure`
+   (§3.3) now defaults to pausing on a record held in the reserve or in
+   memory; `self_fence` keeps the old behaviour.

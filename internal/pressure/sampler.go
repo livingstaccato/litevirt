@@ -2,6 +2,7 @@ package pressure
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sort"
 	"sync"
@@ -89,7 +90,25 @@ type Report struct {
 	Since      time.Time
 	Resources  []ResourceReport // sorted by name
 	TimeToFull time.Duration    // the shortest over the resources; 0 none
+	// SampledAt is when the last sample completed; zero before the first.
+	SampledAt time.Time
+	// PoolsStale: the latest read of this host's pool list did not return
+	// in time, so the pools graded are the last list read.
+	PoolsStale bool
+	// Stale: PoolsStale, or no sample has completed for more than
+	// staleIntervals sample intervals (a frozen sampler). The levels are
+	// then the last ones known.
+	Stale bool
 }
+
+// staleIntervals is how many sample intervals without a completed sample
+// make a report stale.
+const staleIntervals = 3
+
+// defaultPoolsWait bounds how long a sample waits for the pool list. A read
+// still outstanding past it is abandoned: the sample grades the last list,
+// and later samples do not wait on that read again.
+const defaultPoolsWait = 2 * time.Second
 
 // Pressured names every resource above ok, sorted.
 func (r Report) Pressured() []string {
@@ -224,16 +243,30 @@ type Sampler struct {
 	mem     func() (uint64, bool)
 	memLim  uint64
 
-	mu        sync.Mutex
-	res       map[string]*resource
-	hostLevel Level
-	hostSince time.Time
-	observer  func(Report)
+	poolsWait  time.Duration
+	poolMu     sync.Mutex
+	poolFlight *poolFlight // the outstanding pool-list read, nil when none
+	lastPools  []Pool
+
+	mu         sync.Mutex
+	res        map[string]*resource
+	hostLevel  Level
+	hostSince  time.Time
+	sampledAt  time.Time
+	poolsStale bool
+	observer   func(Report)
+}
+
+// poolFlight is one pool-list read. pools is written before done is closed.
+type poolFlight struct {
+	started time.Time
+	done    chan struct{}
+	pools   []Pool
 }
 
 // NewSampler builds a sampler over dataDir. cfg must have been validated.
 func NewSampler(cfg Config, dataDir string, o Options) *Sampler {
-	s := &Sampler{cfg: cfg, dataDir: dataDir, fs: o.FS, now: o.Now, pools: o.Pools, fds: o.FDs, mem: o.Mem, res: map[string]*resource{}}
+	s := &Sampler{cfg: cfg, dataDir: dataDir, fs: o.FS, now: o.Now, pools: o.Pools, fds: o.FDs, mem: o.Mem, res: map[string]*resource{}, poolsWait: defaultPoolsWait}
 	if s.fs == nil {
 		s.fs = OSFS{}
 	}
@@ -293,6 +326,52 @@ func (s *Sampler) Run(ctx context.Context) {
 	}
 }
 
+// currentPools is the pool list for this sample, and whether it is stale.
+//
+// The read runs on its own goroutine, never on the sampling path: the
+// daemon's read is a replicated query, and Query takes the client lock before
+// it honours any context, so a writer stuck in a commit (a stalled disk, the
+// case this package exists to see) would otherwise freeze every resource's
+// grade. As boundedReadyQuery does for Ready, a sample waits at most poolsWait
+// for a read, a read already outstanding longer than that is not waited on
+// again, and the sample grades the last list it has.
+func (s *Sampler) currentPools(ctx context.Context) ([]Pool, bool) {
+	s.poolMu.Lock()
+	f := s.poolFlight
+	switch {
+	case f != nil && time.Since(f.started) > s.poolsWait:
+		last := s.lastPools
+		s.poolMu.Unlock()
+		return last, true
+	case f == nil:
+		f = &poolFlight{started: time.Now(), done: make(chan struct{})}
+		s.poolFlight = f
+		read := s.pools
+		go func() {
+			f.pools = read(context.Background())
+			s.poolMu.Lock()
+			s.lastPools = f.pools
+			if s.poolFlight == f {
+				s.poolFlight = nil
+			}
+			s.poolMu.Unlock()
+			close(f.done)
+		}()
+	}
+	s.poolMu.Unlock()
+	t := time.NewTimer(s.poolsWait)
+	defer t.Stop()
+	select {
+	case <-f.done:
+		return f.pools, false
+	case <-t.C:
+	case <-ctx.Done():
+	}
+	s.poolMu.Lock()
+	defer s.poolMu.Unlock()
+	return s.lastPools, true
+}
+
 // Sample takes one sample of every resource.
 func (s *Sampler) Sample(ctx context.Context) {
 	type fsTarget struct {
@@ -301,7 +380,8 @@ func (s *Sampler) Sample(ctx context.Context) {
 		th     FSThresholds
 	}
 	targets := []fsTarget{{prefix: "data_dir", path: s.dataDir, th: s.cfg.DataDir}}
-	for _, p := range s.pools(ctx) {
+	pools, poolsStale := s.currentPools(ctx)
+	for _, p := range pools {
 		targets = append(targets, fsTarget{prefix: "pool." + p.Name, path: p.Path, th: s.cfg.PoolThresholds(p.Name)})
 	}
 	type fsResult struct {
@@ -336,11 +416,21 @@ func (s *Sampler) Sample(ctx context.Context) {
 			s.observe(now, t.prefix+".inodes", "inodes", fsInodeRule(t.th), res.st.FreeInodes, res.st.TotalInodes, true)
 		}
 	}
-	if fdOK && fdLimit > 0 {
+	// A count that cannot be read keeps the resource and its level, as a
+	// failed statfs does: counting descriptors itself needs one, so the read
+	// fails at exactly the moment the resource is exhausted. Only a platform
+	// that never had the resource leaves it out.
+	switch {
+	case fdOK && fdLimit > 0:
 		s.observe(now, "fds.daemon", "fds", usageRule(s.cfg.FDs), fdLimit-min(fdUsed, fdLimit), fdLimit, false)
+	case s.res["fds.daemon"] != nil:
+		s.fail(now, "fds.daemon", "fds", errFDCount)
 	}
-	if memOK && s.memLim > 0 {
+	switch {
+	case memOK && s.memLim > 0:
 		s.observe(now, "memory.daemon", "bytes", usageRule(s.cfg.Memory.UsageThresholds), s.memLim-min(memUsed, s.memLim), s.memLim, false)
+	case s.res["memory.daemon"] != nil:
+		s.fail(now, "memory.daemon", "bytes", errMemRead)
 	}
 	for name, r := range s.res {
 		if !r.seen {
@@ -355,6 +445,7 @@ func (s *Sampler) Sample(ctx context.Context) {
 		slog.Info("resource pressure: host level changed", "from", s.hostLevel.String(), "to", host.String())
 		s.hostLevel, s.hostSince = host, now
 	}
+	s.sampledAt, s.poolsStale = now, poolsStale
 	rep := s.reportLocked()
 	obs := s.observer
 	s.mu.Unlock()
@@ -405,6 +496,11 @@ func (s *Sampler) observe(now time.Time, name, unit string, ru rule, free, total
 	}
 }
 
+var (
+	errFDCount = errors.New("the descriptor count could not be read (at the descriptor limit?)")
+	errMemRead = errors.New("the daemon's memory could not be read")
+)
+
 // minTrendSpan is the shortest history a projection is made from.
 const minTrendSpan = time.Minute
 
@@ -444,11 +540,14 @@ func timeToFull(pts []point, free float64) time.Duration {
 func (s *Sampler) Report() Report {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.reportLocked()
+	rep := s.reportLocked()
+	frozen := rep.SampledAt.IsZero() || s.now().Sub(rep.SampledAt) > staleIntervals*time.Duration(s.cfg.SampleIntervalSec)*time.Second
+	rep.Stale = rep.Stale || frozen
+	return rep
 }
 
 func (s *Sampler) reportLocked() Report {
-	rep := Report{Level: s.hostLevel, Since: s.hostSince}
+	rep := Report{Level: s.hostLevel, Since: s.hostSince, SampledAt: s.sampledAt, PoolsStale: s.poolsStale, Stale: s.poolsStale}
 	for _, r := range s.res {
 		rr := r.last
 		rr.Name, rr.Unit, rr.Level, rr.Since = r.name, r.unit, r.m.level, r.m.since

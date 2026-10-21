@@ -3,8 +3,14 @@ package pressure
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -505,5 +511,197 @@ func TestSampler_RunAndReportConcurrently(t *testing.T) {
 	<-done
 	if l := s.Report().Level; l != Degrade {
 		t.Fatalf("level %v after many samples at 6 %%, want degrade", l)
+	}
+}
+
+// B1: a descriptor count that cannot be read (EMFILE: counting needs a
+// descriptor) keeps the last level, as a failed statfs does. It never drops
+// the resource, which would take the host from critical to ok in one sample.
+func TestSampler_FDReadFailureKeepsTheLevel(t *testing.T) {
+	r := newRig(t, nil)
+	ok := true
+	r.s.fds = func() (uint64, uint64, bool) { return 99, 100, ok }
+	r.tick(t)
+	if l := resourceLevel(t, r.tick(t), "fds.daemon"); l != Critical {
+		t.Fatalf("99 of 100: %v, want critical", l)
+	}
+	ok = false
+	rep := r.tick(t)
+	res, found := findResource(rep, "fds.daemon")
+	if !found || res.Level != Critical || res.Err == "" {
+		t.Fatalf("count unreadable: %+v (found %v), want critical kept with the error recorded", res, found)
+	}
+	if rep.Level != Critical {
+		t.Fatalf("host level %v, want critical kept", rep.Level)
+	}
+	// The same for the daemon's memory.
+	r.s.mem = func() (uint64, bool) { return 0, false }
+	r2 := newRig(t, func(c *Config) { c.Memory.DaemonLimitMiB = 100 })
+	memOK := true
+	r2.s.mem = func() (uint64, bool) { return 99 << 20, memOK }
+	r2.tick(t)
+	r2.tick(t)
+	memOK = false
+	if res, found := findResource(r2.tick(t), "memory.daemon"); !found || res.Level != Critical {
+		t.Fatalf("memory unreadable: %+v (found %v), want critical kept", res, found)
+	}
+}
+
+// B1 against the kernel: in a child process with RLIMIT_NOFILE 64, fill the
+// table to the last descriptor. The real counter still answers (it reads a
+// descriptor it holds open) and the level stays critical.
+func TestSampler_FDsAtRealExhaustion(t *testing.T) {
+	if os.Getenv("PRESSURE_FD_CHILD") != "1" {
+		if runtime.GOOS != "linux" {
+			t.Skip("counts /proc/self/fd")
+		}
+		cmd := exec.Command(os.Args[0], "-test.run=^TestSampler_FDsAtRealExhaustion$", "-test.v")
+		cmd.Env = append(os.Environ(), "PRESSURE_FD_CHILD=1")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("child: %v\n%s", err, out)
+		}
+		if !strings.Contains(string(out), "CHILD-OK") {
+			t.Fatalf("child did not run the check:\n%s", out)
+		}
+		return
+	}
+	if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &syscall.Rlimit{Cur: 64, Max: 64}); err != nil {
+		t.Fatalf("setrlimit: %v", err)
+	}
+	cfg := DefaultConfig()
+	fs := newFakeFS()
+	fs.setFree("/data", 100*gib, 50)
+	s := NewSampler(cfg, "/data", Options{FS: fs, Mem: func() (uint64, bool) { return 0, false }})
+	s.Sample(context.Background()) // opens the held counting descriptor while there is room
+	var held []*os.File
+	defer func() {
+		for _, f := range held {
+			f.Close()
+		}
+	}()
+	for {
+		f, err := os.Open("/dev/null")
+		if err != nil {
+			if !errors.Is(err, syscall.EMFILE) {
+				t.Fatalf("open: %v", err)
+			}
+			break
+		}
+		held = append(held, f)
+	}
+	s.Sample(context.Background())
+	s.Sample(context.Background())
+	res, found := findResource(s.Report(), "fds.daemon")
+	if !found || res.Level != Critical || res.Err != "" || res.Free != 0 {
+		t.Fatalf("at EMFILE: %+v (found %v), want critical, counted, nothing free", res, found)
+	}
+	fmt.Println("CHILD-OK")
+}
+
+// B2: a pools read that does not return (a replica whose writer is stuck in a
+// commit) does not stop the sample. The data directory is still graded, the
+// last pool list is kept and marked stale, and the next completed read
+// replaces it.
+func TestSampler_StuckPoolsReadIsAbandoned(t *testing.T) {
+	r := newRig(t, nil)
+	r.s.poolsWait = 50 * time.Millisecond
+	release := make(chan struct{})
+	var stuck atomic.Bool
+	r.s.pools = func(context.Context) []Pool {
+		if stuck.Load() {
+			<-release
+		}
+		return []Pool{{Name: "p", Path: "/pools/p"}}
+	}
+	r.fs.setFree("/pools/p", 100*gib, 50)
+	r.tick(t)
+	if r.s.Report().PoolsStale {
+		t.Fatal("pools stale after a read that completed")
+	}
+	stuck.Store(true)
+	r.fs.setFree("/data", 100*gib, 6)
+	done := make(chan struct{})
+	go func() {
+		r.tick(t)
+		r.tick(t)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Sample blocked behind a pools read that does not return")
+	}
+	rep := r.s.Report()
+	if l := resourceLevel(t, rep, "data_dir.space"); l != Degrade {
+		t.Fatalf("data_dir while the pools read hangs: %v, want degrade (still graded)", l)
+	}
+	if _, ok := findResource(rep, "pool.p.space"); !ok {
+		t.Fatal("the last pool list was dropped while the read hangs")
+	}
+	if !rep.PoolsStale || !rep.Stale {
+		t.Fatalf("report %+v, want pools stale and the report stale", rep)
+	}
+	close(release)
+	stuck.Store(false)
+	deadline := time.Now().Add(5 * time.Second)
+	for r.s.Report().PoolsStale && time.Now().Before(deadline) {
+		r.tick(t)
+		time.Sleep(10 * time.Millisecond)
+	}
+	if r.s.Report().PoolsStale {
+		t.Fatal("pools still stale after the read returned")
+	}
+}
+
+// B2: the report says when it was sampled, and a sampler that stopped
+// sampling (a frozen goroutine) reports stale.
+func TestSampler_ReportIsStampedAndGoesStale(t *testing.T) {
+	r := newRig(t, nil)
+	at := r.clk.now()
+	r.s.Sample(context.Background())
+	rep := r.s.Report()
+	if !rep.SampledAt.Equal(at) || rep.Stale {
+		t.Fatalf("fresh report %+v, want sampled at %v and not stale", rep, at)
+	}
+	r.clk.step(3 * time.Duration(r.s.cfg.SampleIntervalSec) * time.Second)
+	if r.s.Report().Stale {
+		t.Fatal("stale at three intervals, want only past three")
+	}
+	r.clk.step(time.Second)
+	if !r.s.Report().Stale {
+		t.Fatal("no sample for more than three intervals: not stale")
+	}
+}
+
+// P7: leaving a level goes to the WORST level seen during the dwell, not the
+// mildest.
+func TestLevel_ClearGoesToTheWorstLevelSeenInTheDwell(t *testing.T) {
+	r := newRig(t, nil)
+	r.fs.setFree("/data", 100*gib, 1)
+	r.tick(t)
+	r.tick(t)
+	r.fs.setFree("/data", 100*gib, 50) // clear to ok...
+	r.tick(t)
+	r.fs.setFree("/data", 100*gib, 14) // ...then warn for the rest of the dwell
+	// The dwell started at the 50 % sample; the 24th sample after it is 120 s
+	// on, and the one that leaves critical. Checked there: a level that left
+	// to ok would re-enter warn two samples later.
+	for i := 0; i < 23; i++ {
+		if l := resourceLevel(t, r.tick(t), "data_dir.space"); l != Critical {
+			t.Fatalf("sample %d of the dwell: %v, want critical", i, l)
+		}
+	}
+	if l := resourceLevel(t, r.tick(t), "data_dir.space"); l != Warn {
+		t.Fatalf("critical cleared during a dwell that touched warn: %v, want warn", l)
+	}
+}
+
+// P6: the auto daemon-memory limit is 10 % of RAM within [1 GiB, 4 GiB].
+func TestAutoDaemonLimit(t *testing.T) {
+	for ram, want := range map[uint64]uint64{0: 4 * gib, 4 * gib: gib, 16 * gib: 16 * gib / 10, 64 * gib: 4 * gib} {
+		if got := autoDaemonLimit(ram); got != want {
+			t.Errorf("RAM %d: limit %d, want %d", ram, got, want)
+		}
 	}
 }

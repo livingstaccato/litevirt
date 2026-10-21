@@ -194,7 +194,8 @@ type Options struct {
 	// anti-entropy exchange says it is. Off (the default), the fleet
 	// bootstraps as a cluster that has already converged. A founder alone in
 	// its cluster never completes an exchange, so every gate that waits for
-	// one meets it as it does on a real first host.
+	// one meets it as it does on a real first host. A founder, lone-node or
+	// first-add scenario sets it; rebuildWithEmptyDB honours it too.
 	RealCatchUp bool
 }
 

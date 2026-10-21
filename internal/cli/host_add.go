@@ -1456,7 +1456,8 @@ func HostAddOn(ctx context.Context, c pb.LiteVirtClient, t *LocalAddTarget, host
 // config is read from configPath (a path that does not exist means none), and
 // `lv host rm` reaches the machine at each address of machines through its
 // LocalAddTarget instead of SSH (an address not listed fails to connect). It
-// returns what puts both back.
+// returns what puts both back. It swaps process globals without a lock: not
+// for parallel tests.
 func UseMachinesForTests(configPath string, machines map[string]*LocalAddTarget) (restore func()) {
 	oldPath, oldDial := daemonConfigPath, dialAdmissionMachine
 	daemonConfigPath = configPath

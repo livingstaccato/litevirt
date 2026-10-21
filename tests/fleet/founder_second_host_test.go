@@ -110,9 +110,11 @@ func bootAdded(t *testing.T, c *Cluster, m, founder *Node, serial string) {
 			return []corrosion.PeerInfo{{Name: n.Name, Addr: net.JoinHostPort(n.Address, "7946")}}
 		}
 	}
+	// In the cluster before anything can dial it: nothing reaches the
+	// founder until it sees m, so c.Nodes is not read concurrently here.
+	c.Nodes = append(c.Nodes, m)
 	db.SetMembersForTests(peer(founder))
 	founder.DB.SetMembersForTests(peer(m))
-	c.Nodes = append(c.Nodes, m)
 	c.buildServer(m)
 	m.repl.SetProofReplicaGate(func(context.Context, string) bool { return true })
 	m.repl.Start(c.ctx)
@@ -201,6 +203,10 @@ func TestFleet_FounderRemovesAHalfAdmittedHost(t *testing.T) {
 		refused(t, "AdmitHost of node-2 beside the joining "+m.Name,
 			&pb.AdmitHostRequest{Name: "node-2", Address: "127.0.0.3", CertSerial: "0a0b0c0d0e"})
 	})
+	t.Run("another name with this admission's serial is not vouched for", func(t *testing.T) {
+		refused(t, "AdmitHost of node-2 with "+m.Name+"'s serial",
+			&pb.AdmitHostRequest{Name: "node-2", Address: "127.0.0.3", CertSerial: serial})
+	})
 	t.Run("another admission of the name is not vouched for", func(t *testing.T) {
 		refused(t, "AdmitHost of "+m.Name+" with another serial",
 			&pb.AdmitHostRequest{Name: m.Name, Address: m.Address, CertSerial: "0a0b0c0d0e"})
@@ -226,6 +232,39 @@ func TestFleet_FounderRemovesAHalfAdmittedHost(t *testing.T) {
 		}()
 		refused(t, "AdmitHost of the booted "+m.Name+" with its own serial",
 			&pb.AdmitHostRequest{Name: m.Name, Address: m.Address, CertSerial: serial})
+	})
+	// The hosts-write side: the exception covers writes to the joining host
+	// itself and nothing else.
+	notCaughtUp := func(t *testing.T, what string, err error) {
+		t.Helper()
+		if err == nil || !strings.Contains(err.Error(), "has not caught up") {
+			t.Fatalf("%s = %v, want refused: the founder has not caught up", what, err)
+		}
+		if h, gerr := corrosion.GetHost(ctx, founder.DB, m.Name); gerr != nil || h == nil {
+			t.Fatalf("a refused %s removed %s's row: %+v, %v", what, m.Name, h, gerr)
+		}
+	}
+	t.Run("a write to the founder's own row is not let through", func(t *testing.T) {
+		_, err := cl.SetHostLabels(ctx, &pb.SetHostLabelsRequest{Name: founder.Name, Labels: map[string]string{"rack": "r1"}})
+		notCaughtUp(t, "label "+founder.Name, err)
+	})
+	t.Run("rm with a gossip peer is not let through", func(t *testing.T) {
+		founder.DB.SetMembersForTests(func() []corrosion.PeerInfo {
+			return []corrosion.PeerInfo{{Name: "node-9", Addr: "127.0.0.9:7946"}}
+		})
+		defer founder.DB.SetMembersForTests(func() []corrosion.PeerInfo { return nil })
+		notCaughtUp(t, "lv host rm "+m.Name+" with a gossip peer", cli.HostRemove(ctx, cl, m.Name, false))
+	})
+	t.Run("rm of a host whose daemon has booted is not let through", func(t *testing.T) {
+		if err := corrosion.UpdateHostState(ctx, founder.DB, m.Name, "active"); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := corrosion.UpdateHostState(ctx, founder.DB, m.Name, corrosion.HostStateJoining); err != nil {
+				t.Fatal(err)
+			}
+		}()
+		notCaughtUp(t, "lv host rm of the booted "+m.Name, cli.HostRemove(ctx, cl, m.Name, false))
 	})
 	t.Run("the re-ask of the standing admission is vouched for", func(t *testing.T) {
 		if _, err := cl.AdmitHost(ctx, &pb.AdmitHostRequest{Name: m.Name, Address: m.Address, CertSerial: serial}); err != nil {

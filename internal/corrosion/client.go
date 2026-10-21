@@ -166,7 +166,9 @@ type Client struct {
 	// fallback in ResolvePeerTarget is what lets a node dial a peer whose hosts row
 	// has not replicated yet — the bootstrap case — and it had no test at all,
 	// because a harness without a real memberlist can never reach that branch.
-	membersForTests func() []PeerInfo
+	// Atomic: a test may swap it while the replicator and anti-entropy loops
+	// read it.
+	membersForTests atomic.Pointer[func() []PeerInfo]
 	// gossipForTests overrides the RAW memberlist view that Members() filters
 	// through admission. See SetGossipForTests.
 	gossipForTests func() []PeerInfo
@@ -2173,8 +2175,8 @@ func (c *Client) MembershipChanged() <-chan struct{} {
 // changed — bootstrap-trusted before this node learned the cluster, tombstoned
 // by a removal, or re-addressed by a re-admission.
 func (c *Client) Members() []PeerInfo {
-	if fn := c.membersForTests; fn != nil {
-		return fn()
+	if fn := c.membersForTests.Load(); fn != nil && *fn != nil {
+		return (*fn)()
 	}
 	var raw []PeerInfo
 	if fn := c.gossipForTests; fn != nil {
@@ -2208,7 +2210,14 @@ func (c *Client) Members() []PeerInfo {
 // SetMembersForTests injects the ADMITTED membership view directly, bypassing
 // admission — for tests that model what a node has already let in. Test-only;
 // production membership comes from memberlist.
-func (c *Client) SetMembersForTests(fn func() []PeerInfo) { c.membersForTests = fn }
+// It may be called while the client is in use.
+func (c *Client) SetMembersForTests(fn func() []PeerInfo) {
+	if fn == nil {
+		c.membersForTests.Store(nil)
+		return
+	}
+	c.membersForTests.Store(&fn)
+}
 
 // SetWallClockForTests makes now this node's wall clock, for its row stamps
 // and its HLC alike: a node whose clock runs ahead or behind. It takes no lock

@@ -223,7 +223,9 @@ func (c *Cluster) openGossipDB(n *Node) {
 	if err := corrosion.InitSchema(context.Background(), db); err != nil {
 		c.t.Fatalf("InitSchema for %s: %v", n.Name, err)
 	}
-	db.MarkReplicaCaughtUpForTests("fleet-bootstrap")
+	if !c.opts.RealCatchUp {
+		db.MarkReplicaCaughtUpForTests("fleet-bootstrap")
+	}
 	n.DB = db
 }
 

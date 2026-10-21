@@ -179,6 +179,7 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		coord.Gate = ppGate{chk}
 		coord.Claimer = n.Server
 		coord.RecoveryClaimEnforced = n.Server.RecoveryClaimEnforced
+		coord.SettleMigratingRow = n.Server.SettleFailedSourceMigration
 		coord.ClaimHealth = n.Server.RecoveryClaimHealthTick
 		latched := o.latched
 		coord.PartitionPauseEnforced = func(context.Context) bool { return latched }

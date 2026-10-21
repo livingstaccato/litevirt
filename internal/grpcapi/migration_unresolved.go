@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/failover"
 	"github.com/litevirt/litevirt/internal/health"
 )
 
@@ -33,8 +34,30 @@ type migrationUnresolvedEvidence struct {
 // raiseMigrationUnresolved raises vm.migration_unresolved for vm, left
 // migrating on this host by a move to target, which keeps leaseID.
 func (s *Server) raiseMigrationUnresolved(ctx context.Context, vm, target, leaseID, detail string) {
-	ev, _ := json.Marshal(migrationUnresolvedEvidence{Source: s.hostName, Target: target, Detail: detail, LeaseID: leaseID})
-	hosts := []string{s.hostName}
+	s.raiseMigrationUnresolvedOf(ctx, vm, s.hostName, target, leaseID, detail)
+}
+
+// raiseMigrationUnresolvedFrom raises vm.migration_unresolved for vm, left
+// migrating on source by a move to target, from a host that is not source
+// (failover's hold). A target capacity reservation an earlier raise recorded
+// is kept, so resolving the condition still releases it.
+func (s *Server) raiseMigrationUnresolvedFrom(ctx context.Context, vm, source, target, detail string) {
+	var leaseID string
+	if row, ok, err := corrosion.GetHealthCondition(ctx, s.db, drainEvaluator, condMigrationUnresolved, "vm", vm); err == nil && ok &&
+		row.Lifecycle != corrosion.ConditionResolved {
+		var ev migrationUnresolvedEvidence
+		if json.Unmarshal([]byte(row.Evidence), &ev) == nil && ev.Target == target {
+			leaseID = ev.LeaseID
+		}
+	}
+	s.raiseMigrationUnresolvedOf(ctx, vm, source, target, leaseID, detail)
+}
+
+// raiseMigrationUnresolvedOf raises vm.migration_unresolved for vm, left
+// migrating on source by a move to target, which keeps leaseID.
+func (s *Server) raiseMigrationUnresolvedOf(ctx context.Context, vm, source, target, leaseID, detail string) {
+	ev, _ := json.Marshal(migrationUnresolvedEvidence{Source: source, Target: target, Detail: detail, LeaseID: leaseID})
+	hosts := []string{source}
 	if target != "" {
 		hosts = append(hosts, target)
 	}
@@ -237,5 +260,80 @@ func (s *Server) RaiseLeftMigrating(ctx context.Context) {
 		detail := fmt.Sprintf("%s is recorded migrating on %s, and no move of it runs there (its daemon stopped mid-move); "+
 			"it may run on %s, so nothing starts or moves it: %s", vm.Name, s.hostName, target, settleMigratingAdvice(vm.Name))
 		s.raiseMigrationUnresolved(ctx, vm.Name, target, "", detail)
+	}
+}
+
+// migratingRecoveryProbeTimeout bounds failover's ask of a migrating VM's
+// target (SettleFailedSourceMigration). Shorter than a stop's: it runs inside
+// the coordinator's tick, and a target that does not answer in time only
+// holds the VM until the next one.
+const migratingRecoveryProbeTimeout = 5 * time.Second
+
+// SettleFailedSourceMigration is failover's decision on a VM whose row says
+// migrating on source, a host it is recovering (failover.SettleMigratingRow).
+// A migration that cut over in libvirt runs the guest on its target; a source
+// that died before the ownership commit leaves the row on itself, and a
+// restart elsewhere would be a second running copy. So the target is asked,
+// as a stop of such a row asks it (migratingStopRefusal):
+//
+//   - it runs the guest: the row is re-pointed there, running
+//     (RepointMigratedVM, which writes only while the row is still the
+//     migration's on source), and nothing is started;
+//   - it has no domain of it, or it is proven powered off: the guest runs
+//     nowhere, and the VM is recovered as a running one;
+//   - anything else — no target named, no answer, a paused or shut-off
+//     domain, an incomplete inventory — holds the VM, with
+//     vm.migration_unresolved raised naming why.
+func (s *Server) SettleFailedSourceMigration(ctx context.Context, vm corrosion.VMRecord, source string) (failover.MigratingVerdict, string) {
+	target := migratingToward(vm.StateDetail)
+	hold := func(why string) (failover.MigratingVerdict, string) {
+		detail := fmt.Sprintf("%s is recorded migrating on %s, which failed, and %s; nothing starts or moves it: %s",
+			vm.Name, source, why, settleMigratingAdvice(vm.Name))
+		s.raiseMigrationUnresolvedFrom(ctx, vm.Name, source, target, detail)
+		return failover.MigratingHold, why
+	}
+	if target == "" || target == source {
+		return hold("its record names no target to ask whether the guest runs there")
+	}
+	if h, off, perr := corrosion.SharedDiskOwnerProvedOff(ctx, s.db, target); perr == nil {
+		if ok, _ := corrosion.SharedDiskOwnerVerdict(target, h, off, nil); ok {
+			s.resolveMigrationUnresolved(ctx, vm.Name)
+			return failover.MigratingRecover, fmt.Sprintf("its target %s is proven powered off", target)
+		}
+	}
+	pctx, cancel := context.WithTimeout(ctx, migratingRecoveryProbeTimeout)
+	state, err := s.CheckPeerVMRuntime(pctx, target, vm.Name)
+	cancel()
+	if err != nil {
+		return hold(fmt.Sprintf("its target %s cannot be asked whether the guest runs there (%v)", target, err))
+	}
+	switch state {
+	case health.RuntimeAbsent:
+		s.resolveMigrationUnresolved(ctx, vm.Name)
+		return failover.MigratingRecover, fmt.Sprintf("its target %s has no domain of it", target)
+	case health.RuntimeRunning:
+		if corrosion.VMUsesFirmwareState(vm) {
+			// A live firmware move's VM is settled by its own records, never by
+			// moving the row alone (`lv doctor firmware-move`).
+			return hold(fmt.Sprintf("the guest runs on its target %s, and its firmware move is settled with "+
+				"`lv doctor firmware-move %s`, not by failover", target, vm.Name))
+		}
+		//runningcheck:allow ownership handoff after cutover, as RepointMigratedVM's other callers: the guest runs
+		// on the target, which reported it so, and the target's convergence marks its own runtime.
+		moved, rerr := corrosion.RepointMigratedVM(ctx, s.db, vm.Name, source, target, "running")
+		if rerr != nil {
+			return hold(fmt.Sprintf("the guest runs on its target %s, and its record could not be moved there (%v)", target, rerr))
+		}
+		if !moved {
+			return failover.MigratingSettled, "its record changed since it was read; the next recovery reads it again"
+		}
+		s.resolveMigrationUnresolved(ctx, vm.Name)
+		detail := fmt.Sprintf("%s failed with %s recorded migrating to %s, where the guest runs: its record now names %s; "+
+			"its disk rows were left as they are", source, vm.Name, target, target)
+		s.recordVMEvent(ctx, vm.Name, "vm.failover.repointed", "ok", detail)
+		return failover.MigratingSettled, detail
+	default:
+		return hold(fmt.Sprintf("its target %s holds a domain of it in state %s (a guest paused mid-migration reads so too)",
+			target, state))
 	}
 }

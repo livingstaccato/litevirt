@@ -3285,6 +3285,19 @@ with `lv host fence-confirm <target>` once it is powered off (and then
 `lv host rm <target> --dead`). A guest still running on its host is stopped
 there, after any migration job libvirtd still runs for it is aborted.
 
+Failover asks the same question of a VM recorded `migrating` on a host it
+recovers: a migration that cut over in libvirt runs the guest on its target
+even when the source died before recording the move. Before anything is
+started, the coordinator asks the target. When the guest runs there, the
+record is moved to the target, running, with a `vm.failover.repointed` event,
+and nothing is started (its disk rows are left as they are); a Secure Boot /
+vTPM VM is held instead, for `lv doctor firmware-move <vm>`. When the target
+has no domain of the VM, or is proven powered off as above, the VM is recovered
+as any running VM. Anything else (no target recorded, no answer, a paused or
+shut-off domain) holds the VM where it is recorded, raises
+`vm.migration_unresolved` naming why, and is asked again on the next poll; it
+counts in the failover metrics with error class `migrating`.
+
 ### A firmware move record cannot be read (`firmware_migration_record_unreadable`)
 
 A live firmware migration keeps its records under `<data_dir>/fwmig-inflight/`

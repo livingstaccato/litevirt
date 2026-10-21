@@ -12,7 +12,7 @@ import (
 
 // TestFleet_FullDiskClockHighWaterKeepsServing: a node whose data disk is full
 // keeps serving writes, which replicate, and its clock high-water keeps
-// persisting. On lab 2 (2026-10-17) a full disk exited the daemon 214 ms after
+// persisting. On lab 2 (2026-10-20) a full disk exited the daemon 214 ms after
 // the first failed nowts.hwm save, and its peers fenced the host: each save
 // wrote a temp file and renamed it, so it needed a new block every ~2 s.
 func TestFleet_FullDiskClockHighWaterKeepsServing(t *testing.T) {

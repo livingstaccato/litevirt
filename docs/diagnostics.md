@@ -952,8 +952,12 @@ Operational notes:
 - **Re-image / dataDir wipe.** A node whose `dataDir` is wiped loses its high-water and
   regains the regression window until its wall clock passes the pre-wipe ceiling. Ensure
   NTP is healthy before rejoining.
-- **A full disk does not stop the clock.** `nowts.hwm` has a fixed size and is
-  overwritten in place, so saving the ceiling needs no new disk space. The daemon writes
+- **A full disk does not stop the clock** on ext4 and xfs. `nowts.hwm` has a fixed size
+  and is overwritten in place, so saving the ceiling needs no new disk space there. On
+  btrfs and ZFS an in-place write still needs new space (copy-on-write). The daemon marks
+  the file no-copy-on-write when it creates it, which avoids that on btrfs except for the
+  first save after each snapshot of the subvolume; ZFS has no equivalent, so a full ZFS
+  data directory still stops the daemon as described below. The daemon writes
   it in that layout at start; a node upgraded from an earlier build converts the file
   then, and a node rolled back to an earlier build still reads it.
 - **Persistence failure is fail-closed.** If the daemon cannot persist a higher ceiling

@@ -2763,11 +2763,16 @@ To clear it, look at the file, then record the stop with `lv stop <vm>`: a
 stop recorded on the VM's row removes its marker, whatever the marker holds.
 Then `lv start <vm>` starts it.
 
-Two cases have no stop to record, and the file is removed by hand on the
-host the condition names (`rm <data_dir>/operator-stops/<vm>.json`): the VM
-was deleted (`lv stop` answers `NotFound`), or the host is still in write
-quarantine (no stop can be recorded). The condition resolves on the host's
-next reconcile pass once the file is gone.
+While the host is still in write quarantine, leave the file: nothing can
+start the VM there meanwhile (`lv start` is refused, and the automated starts
+cannot take their lease), and removing it loses the operator's stop — the row
+still reads `running`, so once the quarantine lifts the reconciler would
+start the guest again. Wait for the lift, then `lv stop <vm>`.
+
+Only when the VM was deleted (`lv stop` answers `NotFound`) is there no stop
+to record: remove the file by hand on the host the condition names
+(`rm <data_dir>/operator-stops/<vm>.json`). The condition resolves on that
+host's next reconcile pass.
 
 | Raised when | Clears when |
 |---|---|

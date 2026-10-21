@@ -452,3 +452,27 @@ func TestFinishVMReplaceRuntime_HonoursOperatorStopMarker(t *testing.T) {
 		t.Fatal("the handoff started a VM its operator force-stopped")
 	}
 }
+
+// The owner-epoch backfill waits only for a pending marker at owner epoch 0:
+// the backfill graduates only epoch 0, so a marker at a later epoch cannot
+// be moved by it and must not stop it for every VM on the host.
+//
+// Mutation: report any pending marker (pending > 0) — red.
+func TestReplayOperatorStopMarkers_ReportsOnlyEpochZeroPending(t *testing.T) {
+	s := testServerWithLocks(t)
+	s.db.SetWriteQuarantine(func() string { return "rolled back below latched token(s): x" })
+	put := func(epoch int64) {
+		if err := health.WriteOperatorStopMarker(s.dataDir, health.OperatorStopMarker{
+			VM: "web", Host: s.hostName, Incarnation: "i", OwnerEpoch: epoch}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put(2)
+	if s.ReplayOperatorStopMarkers(adminCtx()) {
+		t.Error("a pending marker at owner epoch 2 holds the backfill")
+	}
+	put(0)
+	if !s.ReplayOperatorStopMarkers(adminCtx()) {
+		t.Error("a pending marker at owner epoch 0 does not hold the backfill")
+	}
+}

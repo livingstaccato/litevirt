@@ -860,13 +860,17 @@ func (r *Reconciler) retryOnbootPending(ctx context.Context, only func(name stri
 }
 
 func (r *Reconciler) reconcile(ctx context.Context) {
-	// A marker still waiting for its replay names its row's owner epoch: the
-	// backfill below would move a pre-epoch row's generation from under it
-	// (0 to 1), and the marker would stop holding the VM. The backfill waits
-	// for the replay; it is retried every pass.
+	// A marker at owner epoch 0 still waiting for its replay: the backfill
+	// below would move that pre-epoch row's generation from under it (0 to
+	// 1), and the marker would stop holding the VM. The backfill waits for
+	// the replay; it is retried every pass, and the wait is logged.
 	markersPending := false
 	if r.operatorStopReplay != nil {
 		markersPending = r.operatorStopReplay(ctx)
+	}
+	if r.ownerEpochBackfill && markersPending && operatorStopBackfillWaitDue(r.now()) {
+		slog.Warn("reconciler: owner-epoch backfill waits — an operator-stop marker at owner epoch 0 has not been replayed yet; " +
+			"`lv stop` of its VM records the stop and ends the wait (repeated at most every 10m)")
 	}
 	if r.ownerEpochBackfill && !markersPending {
 		// Phase 4 backfill: graduate every workload this host owns out of the

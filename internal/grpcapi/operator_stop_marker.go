@@ -184,7 +184,10 @@ func operatorStopReplayLogDue(key string) bool {
 // removes each marker it has recorded (or that no longer applies). Run at the
 // start of every reconciler pass, so it lands before the walk reads the
 // rows. A marker that cannot be read is alerted on, never replayed. It
-// reports whether a marker of this host is still waiting for its replay.
+// reports whether a marker of this host at owner epoch 0 is still waiting
+// for its replay (or the markers cannot be listed): the owner-epoch
+// backfill would move that row's generation from under it. A marker at a
+// later epoch is not moved by the backfill (0 to 1) and does not hold it.
 func (s *Server) ReplayOperatorStopMarkers(ctx context.Context) bool {
 	if s.dataDir == "" {
 		return false
@@ -198,7 +201,7 @@ func (s *Server) ReplayOperatorStopMarkers(ctx context.Context) bool {
 		return true
 	}
 	reason := s.stopQuarantineReason()
-	pending := 0
+	pending, pendingEpoch0 := 0, false
 	corrupt := map[string]string{}
 	for _, name := range names {
 		m, ok, rerr := health.ReadOperatorStopMarker(s.dataDir, name)
@@ -215,17 +218,20 @@ func (s *Server) ReplayOperatorStopMarkers(ctx context.Context) bool {
 		}
 		if reason != "" {
 			pending++
+			pendingEpoch0 = pendingEpoch0 || m.OwnerEpoch == 0
 			continue
 		}
 		unlock, locked := s.tryLockVMAs(name, "operator-stop replay")
 		if !locked {
 			pending++
+			pendingEpoch0 = pendingEpoch0 || m.OwnerEpoch == 0
 			continue // an operation holds the VM; next pass
 		}
 		err := s.replayOperatorStopLocked(ctx, m)
 		unlock()
 		if err != nil {
 			pending++
+			pendingEpoch0 = pendingEpoch0 || m.OwnerEpoch == 0
 			if operatorStopReplayLogDue(name) {
 				slog.Warn("operator-stop replay: recording the forced stop failed; the VM stays held and it is tried again next pass (repeated at most every 10m)",
 					"vm", name, "error", err)
@@ -240,7 +246,7 @@ func (s *Server) ReplayOperatorStopMarkers(ctx context.Context) bool {
 			slog.Warn("operator-stop replay: raising or resolving operator_stop_marker_corrupt failed (repeated at most every 10m)", "error", err)
 		}
 	}
-	return pending > 0
+	return pendingEpoch0
 }
 
 // errReplayHeld is a marker whose VM's row is in a state the replay does not

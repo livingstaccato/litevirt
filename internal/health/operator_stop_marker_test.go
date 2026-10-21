@@ -1,12 +1,16 @@
 package health
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -221,7 +225,8 @@ func TestHealthRestart_HonoursOperatorStopMarker(t *testing.T) {
 // pending, and runs once none is.
 //
 // Red on 195477326: does not compile (the replay hook reports nothing).
-// Mutation: the backfill run regardless — the row graduates while pending: red.
+// Mutation: the backfill run regardless — the row graduates while pending:
+// red; the wait not logged — red.
 func TestReconciler_OwnerEpochBackfillWaitsForPendingMarkers(t *testing.T) {
 	ctx := context.Background()
 	db := testReconcilerDB(t)
@@ -242,9 +247,19 @@ func TestReconciler_OwnerEpochBackfillWaitsForPendingMarkers(t *testing.T) {
 	r.SetOwnerEpochBackfill(true)
 	pending := true
 	r.SetOperatorStopReplay(func(context.Context) bool { return pending })
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	operatorStopBackfillWait.mu.Lock()
+	operatorStopBackfillWait.last = time.Time{}
+	operatorStopBackfillWait.mu.Unlock()
 	r.ReconcileOnce(ctx)
 	if e := epoch(); e != 0 {
 		t.Errorf("the backfill graduated a row (epoch %d) while a marker waited for its replay", e)
+	}
+	if !strings.Contains(buf.String(), "owner-epoch backfill waits") {
+		t.Errorf("the backfill's wait was not logged:\n%s", buf.String())
 	}
 	pending = false
 	r.ReconcileOnce(ctx)

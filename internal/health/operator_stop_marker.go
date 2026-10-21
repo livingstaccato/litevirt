@@ -290,8 +290,9 @@ type operatorStopMarkerEvidence struct {
 func OperatorStopMarkerCorruptRemedy(vm string) string {
 	return "the VM is held stopped on this host and is not started by its restart policy, onboot or `lv start`: " +
 		"look at the file, then record the stop with `lv stop " + vm + "` (which removes the marker once the stop " +
-		"is recorded) and start it with `lv start " + vm + "`. If the VM was deleted, or the host is still in write " +
-		"quarantine (no stop can be recorded), remove the file by hand on this host: rm <data_dir>/" + operatorStopDir +
+		"is recorded) and start it with `lv start " + vm + "`. While the host is in write quarantine, leave the file " +
+		"and wait for the quarantine to lift, then `lv stop " + vm + "`: removing it then loses the stop. Only if the VM " +
+		"was deleted (`lv stop` answers NotFound) remove the file by hand on this host: rm <data_dir>/" + operatorStopDir +
 		"/" + vm + ".json"
 }
 
@@ -340,4 +341,23 @@ func ReportCorruptOperatorStopMarkers(ctx context.Context, db *corrosion.Client,
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// operatorStopBackfillWait rate-limits the reconciler's log line about a
+// backfill waiting for a marker's replay.
+var operatorStopBackfillWait struct {
+	mu   sync.Mutex
+	last time.Time
+}
+
+// operatorStopBackfillWaitDue reports whether the wait may be logged at now,
+// and if so records it.
+func operatorStopBackfillWaitDue(now time.Time) bool {
+	operatorStopBackfillWait.mu.Lock()
+	defer operatorStopBackfillWait.mu.Unlock()
+	if !operatorStopBackfillWait.last.IsZero() && now.Sub(operatorStopBackfillWait.last) < ioPausedWarnEvery {
+		return false
+	}
+	operatorStopBackfillWait.last = now
+	return true
 }

@@ -265,7 +265,7 @@ func TestPromoteReplica_NetworkProjectAdmission(t *testing.T) {
 		s := testServer(t)
 		s.dataDir = t.TempDir()
 		seedAdmissionNetworks(t, s)
-		poolDir := seedPromotableVM(t, s, "dead-host", "failed", "acme", 1, 512)
+		poolDir := seedPromotableVM(t, s, "dead-host", "fenced", "acme", 1, 512)
 		setPromotableNetwork(t, s, "beta-net")
 
 		err := promoteVM(s, &pb.PromoteReplicaRequest{VmName: "vm1", NewName: "vm1-copy"})
@@ -285,7 +285,7 @@ func TestPromoteReplica_NetworkProjectAdmission(t *testing.T) {
 		s := testServer(t)
 		s.dataDir = t.TempDir()
 		seedAdmissionNetworks(t, s)
-		seedPromotableVM(t, s, "dead-host", "failed", "acme", 1, 512)
+		seedPromotableVM(t, s, "dead-host", "fenced", "acme", 1, 512)
 		setPromotableNetwork(t, s, "beta-net")
 
 		if err := promoteVM(s, &pb.PromoteReplicaRequest{VmName: "vm1"}); err != nil {
@@ -300,7 +300,7 @@ func TestPromoteReplica_NetworkProjectAdmission(t *testing.T) {
 		s := testServer(t)
 		s.dataDir = t.TempDir()
 		seedAdmissionNetworks(t, s)
-		seedPromotableVM(t, s, "dead-host", "failed", "acme", 1, 512)
+		seedPromotableVM(t, s, "dead-host", "fenced", "acme", 1, 512)
 		setPromotableNetwork(t, s, "shared-net")
 
 		if err := promoteVM(s, &pb.PromoteReplicaRequest{VmName: "vm1"}); err != nil {
@@ -708,7 +708,7 @@ func TestPromoteReplica_FailedTakeoverLeavesNoForeignNetworkAudit(t *testing.T) 
 	fake.FailDefineDomain = func(string) error { return errors.New("define boom") }
 	s.virt = fake
 	seedAdmissionNetworks(t, s)
-	seedPromotableVM(t, s, "dead-host", "failed", "acme", 1, 512)
+	seedPromotableVM(t, s, "dead-host", "fenced", "acme", 1, 512)
 	setPromotableNetwork(t, s, "beta-net")
 
 	if err := promoteVM(s, &pb.PromoteReplicaRequest{VmName: "vm1"}); err == nil {

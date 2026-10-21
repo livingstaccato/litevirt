@@ -786,8 +786,12 @@ lv replication promote web-1 --no-localize   # fast: boot off an overlay (pins t
 lv replication promote web-1 --accept-not-point-in-time   # a replica recorded as not point-in-time
 ```
 
-A split-brain guard refuses to take over the name while the original is on a
-healthy host (`--force` overrides). The same action is on the VM detail page
+A split-brain guard refuses to take over the name unless the original's host
+is proven fenced, or proven off after it was removed: its newest fence is
+proof-grade (an IPMI power-off, or `lv host fence-confirm <host>` once it is
+powered off). Any other host may still run it: one fenced without proof
+(`lv host fence <host>`), and one removed (`lv host rm`) or not yet known
+here, since removing a host does not power it off (`--force` overrides). The same action is on the VM detail page
 ("Promote replica").
 
 **Every disk with a replica is recovered**, manual or automatic: the root from
@@ -973,10 +977,12 @@ last choice:
   are all too old and a newer one is not point-in-time), automatic promotion
   **holds the VM down** by default: the replica is left untouched, and a
   `vm.failover.held` event and a `replication.promote_held` notification give
-  the reason and the exact command that promotes it by hand. A VM with any
+  the reason and the exact commands that promote it by hand: when the failed
+  host is not proven powered off, `lv host fence-confirm <host>` (once it is
+  off) and then the promote; when it is, the promote alone. A VM with any
   disk that is not on shared storage is not rescheduled either — its record
   stays on its failed host, `lv inspect <vm>` shows the hold as `failoverHeld`,
-  and the printed command works as printed. A VM whose disks are all on shared
+  and the printed commands work as printed, in order. A VM whose disks are all on shared
   storage is restarted from its own disk by its `on_host_failure` policy, as
   before (a `vm.failover.restart_shared` event says so).
 - A VM can opt in, one VM at a time, to automatic promotion of such a replica

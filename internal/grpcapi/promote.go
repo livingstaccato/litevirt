@@ -651,18 +651,44 @@ func vmAllowsAutoPromoteNotPIT(vm *corrosion.VMRecord) bool {
 
 // holdNotPointInTime refuses an automatic promotion whose only replica is
 // not point-in-time, loudly: an event (which InspectVM shows), a
-// notification, and the command that promotes it by hand. The replica is
-// not touched, and the VM's record is not changed.
+// notification, and the commands that promote it by hand, which work as
+// printed (promoteByHandSteps). The replica is not touched, and the VM's
+// record is not changed.
 func (s *Server) holdNotPointInTime(ctx context.Context, vm *corrosion.VMRecord, pool, host, replica string) error {
 	cmd := fmt.Sprintf("lv replication promote %s --pool %s --host %s --replica %s --accept-not-point-in-time", vm.Name, pool, host, replica)
-	detail := fmt.Sprintf("automatic promotion held: the only replica is not point-in-time (%s in pool %s on %s, copied with qemu-img convert -U after every point-in-time copy failed). The VM stays down and the replica is untouched. To promote it anyway: %s. To let failover do so for this VM, set the label %s=true",
-		replica, pool, host, cmd, corrosion.LabelAutoPromoteNotPointInTime)
+	detail := fmt.Sprintf("automatic promotion held: the only replica is not point-in-time (%s in pool %s on %s, copied with qemu-img convert -U after every point-in-time copy failed). The VM stays down and the replica is untouched. %s. To let failover do so for this VM, set the label %s=true",
+		replica, pool, host, s.promoteByHandSteps(ctx, vm, cmd), corrosion.LabelAutoPromoteNotPointInTime)
 	slog.Error("failover: automatic promotion held; the only replica is not point-in-time", "vm", vm.Name, "replica", replica, "pool", pool, "host", host)
 	s.recordVMEventSeverity(ctx, vm.Name, vmEventFailoverHeld, "error", "error", detail)
 	s.notify(ctx, notify.Notification{
 		Kind: "replication.promote_held", Severity: notify.SevError, Subject: vm.Name, Detail: detail,
 	})
 	return fmt.Errorf("%w: %s", errReplicaNotPointInTime, detail)
+}
+
+// promoteByHandSteps is the instruction to promote vm by hand with cmd, a
+// same-name `lv replication promote` without --force: the split-brain guard
+// (promoteSplitBrainRefusal) lets it through only once vm's host is proven
+// off, so when it is not, the instruction names `lv host fence-confirm`
+// first. One whose proof cannot be read now names it too: a confirmation of
+// a host already proven off records nothing new.
+func (s *Server) promoteByHandSteps(ctx context.Context, vm *corrosion.VMRecord, cmd string) string {
+	owner := vm.HostName
+	if owner == "" || owner == s.hostName {
+		return "To promote it anyway: " + cmd
+	}
+	h, provedOff, err := corrosion.SharedDiskOwnerProvedOff(ctx, s.db, owner)
+	if err == nil {
+		if ok, _ := corrosion.SharedDiskOwnerVerdict(owner, h, provedOff, nil); ok {
+			return "To promote it anyway: " + cmd
+		}
+	}
+	why := "whether it is proven off cannot be read"
+	if err == nil {
+		why = promoteOwnerNotProvenOff(owner, h)
+	}
+	return fmt.Sprintf("To promote it anyway, once %s is powered off (%s): lv host fence-confirm %s, then %s",
+		owner, why, owner, cmd)
 }
 
 // reportPromotedNotPointInTime is the event and notification of an automatic
@@ -1169,26 +1195,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 	}
 
-	// Split-brain guard. Taking over the original name while the original is
-	// still on a healthy host (and not force) would double-run the VM.
-	// A promotion to a new name never replaces another VM, --force or not:
-	// --force is for a same-name takeover of a VM still on a healthy host.
-	// With it, a rename onto a live VM's name stopped and undefined that VM's
-	// domain here and then failed on its row (dupcreate re-review). Checked
-	// under this promotion's create flight of the name (above).
-	if renamed {
-		if rec, _ := corrosion.GetVM(ctx, s.db, targetName); rec != nil {
-			return status.Errorf(codes.AlreadyExists,
-				"vm %q already exists; choose another --new-name (--force never replaces another VM); nothing was changed", targetName)
-		}
-	}
-	if !req.Force {
-		if !renamed && vm.HostName != "" && vm.HostName != s.hostName {
-			if h, _ := corrosion.GetHost(ctx, s.db, vm.HostName); h != nil && h.State == "active" {
-				return status.Errorf(codes.FailedPrecondition,
-					"vm %q still owned by healthy host %q; fence it or pass --force/--new-name to avoid split-brain", vm.Name, vm.HostName)
-			}
-		}
+	// Checked under this promotion's create flight of the name (above).
+	if err := s.promoteSplitBrainRefusal(ctx, vm, targetName, renamed, req.Force); err != nil {
+		return err
 	}
 	// Admission (fail-closed), BEFORE any disk build, domain destruction,
 	// definition, or start. A promotion defines and starts a full-sized VM — the
@@ -2142,4 +2151,64 @@ func longestCronGap(expr string) (time.Duration, bool) {
 		prev = t
 	}
 	return longest, longest > 0
+}
+
+// promoteSplitBrainRefusal is the split-brain guard of a promotion of vm to
+// targetName. A same-name takeover without --force goes ahead only when the
+// original's host is proven powered off the way a shared disk's owner is
+// (corrosion.SharedDiskOwnerProvedOff and SharedDiskOwnerVerdict): fenced over
+// a proof-grade fence, or removed (a tombstoned row, or none here) with a
+// proof-grade fence of its last life. Removing a host does not power it off,
+// and a row may not have replicated here yet. Any other host may still run
+// the guest, and a takeover then would double-run the VM.
+// A promotion to a new name never replaces another VM, --force or not:
+// --force is for a same-name takeover of a VM still on a host that may run
+// it. With it, a rename onto a live VM's name stopped and undefined that
+// VM's domain here and then failed on its row (dupcreate re-review). A read
+// either check needs that fails refuses the promotion as retryable: what it
+// would have shown is unknown.
+func (s *Server) promoteSplitBrainRefusal(ctx context.Context, vm *corrosion.VMRecord, targetName string, renamed, force bool) error {
+	if renamed {
+		rec, err := corrosion.GetVM(ctx, s.db, targetName)
+		if err != nil {
+			return status.Errorf(codes.Unavailable,
+				"promote of %s to %s: whether a VM of that name exists cannot be read (%v); nothing was changed; retry",
+				vm.Name, targetName, err)
+		}
+		if rec != nil {
+			return status.Errorf(codes.AlreadyExists,
+				"vm %q already exists; choose another --new-name (--force never replaces another VM); nothing was changed", targetName)
+		}
+	}
+	if !force && !renamed && vm.HostName != "" && vm.HostName != s.hostName {
+		h, provedOff, err := corrosion.SharedDiskOwnerProvedOff(ctx, s.db, vm.HostName)
+		if err != nil {
+			return status.Errorf(codes.Unavailable,
+				"promote of %s: whether its host %s is proven powered off cannot be read (%v); nothing was changed; retry",
+				vm.Name, vm.HostName, err)
+		}
+		if ok, _ := corrosion.SharedDiskOwnerVerdict(vm.HostName, h, provedOff, nil); !ok {
+			return status.Errorf(codes.FailedPrecondition,
+				"vm %q may still be running on its host: %s; fence it (`lv host fence %s`, or "+
+					"`lv host fence-confirm %s` once it is powered off) or pass --force/--new-name to avoid split-brain",
+				vm.Name, promoteOwnerNotProvenOff(vm.HostName, h), vm.HostName, vm.HostName)
+		}
+	}
+	return nil
+}
+
+// promoteOwnerNotProvenOff says why owner (h, nil for no live row) is not
+// shown unable to run a VM, for a promotion's refusal: the shared-disk
+// verdict's reasons, in words about the VM rather than a disk.
+func promoteOwnerNotProvenOff(owner string, h *corrosion.HostRecord) string {
+	switch {
+	case h == nil || h.State == "removed":
+		return fmt.Sprintf("%s is no longer a member of the cluster, but not proven powered off: removing a host "+
+			"does not power it off, and its newest fence is not an IPMI power-off or an operator's confirmation", owner)
+	case h.State == "fenced":
+		return fmt.Sprintf("%s is fenced, but not proven powered off: its newest fence is not an IPMI power-off or "+
+			"an operator's confirmation", owner)
+	default:
+		return fmt.Sprintf("%s is %s, not fenced (and no proof-grade fence was verified)", owner, h.State)
+	}
 }

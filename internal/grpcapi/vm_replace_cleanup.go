@@ -10,6 +10,9 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
@@ -54,6 +57,25 @@ const vmReplaceStopTimeout = 30 * time.Second
 // survive every retry) are the whole reason the journal exists. Production never
 // calls this.
 func (s *Server) SetCutoverCrashHook(h func(stage string) error) { s.cutoverCrashHook = h }
+
+// VMReplaceCleanupKick is signalled when a cutover returns with its committed
+// phases left journaled, so the daemon's retry loop (resumeVMReplaceCleanups)
+// tries them again without waiting for its next period or a restart.
+func (s *Server) VMReplaceCleanupKick() <-chan struct{} { return s.vmReplaceKickCh() }
+
+func (s *Server) vmReplaceKickCh() chan struct{} {
+	s.vmReplaceKickOnce.Do(func() { s.vmReplaceKick = make(chan struct{}, 1) })
+	return s.vmReplaceKick
+}
+
+// kickVMReplaceCleanups signals VMReplaceCleanupKick; a signal already
+// pending covers this one.
+func (s *Server) kickVMReplaceCleanups() {
+	select {
+	case s.vmReplaceKickCh() <- struct{}{}:
+	default:
+	}
+}
 
 func (s *Server) fireCutoverCrashHook(stage string) error {
 	if h := s.cutoverCrashHook; h != nil {
@@ -669,18 +691,30 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 	if state == "running" {
 		return nil
 	}
-	if rec, gErr := corrosion.GetVM(ctx, s.db, m.ReplacedVM); gErr == nil && rec != nil {
-		// A row recorded migrating is not started by any path.
-		if e := s.movingVMStartRefusal(ctx, rec); e != nil {
-			return failed("start", e)
-		}
-		if e := s.verifyVMISOForStart(rec); e != nil {
-			return failed("start", e)
-		}
-		// This start runs outside the start hook: a stale seed is rebuilt
-		// here as there, never refusing it.
-		s.retryStaleSeedForStart(ctx, rec)
+	// The row is read again for the start's own checks, and a read that fails
+	// refuses the start: whether a move of the VM is in flight is then unknown.
+	// A row gone since the read above is not started either; the next attempt
+	// finds the name no longer holds this incarnation and skips the handoff.
+	rec, gErr := corrosion.GetVM(ctx, s.db, m.ReplacedVM)
+	if gErr != nil {
+		return failed("start", status.Errorf(codes.Unavailable,
+			"start %q: its row cannot be read (%v), so whether a move of it is in flight is unknown; retry",
+			m.ReplacedVM, gErr))
 	}
+	if rec == nil {
+		return failed("start", status.Errorf(codes.FailedPrecondition,
+			"start %q: its row is gone, so nothing is started under its name", m.ReplacedVM))
+	}
+	// A row recorded migrating is not started by any path.
+	if e := s.movingVMStartRefusal(ctx, rec); e != nil {
+		return failed("start", e)
+	}
+	if e := s.verifyVMISOForStart(rec); e != nil {
+		return failed("start", e)
+	}
+	// This start runs outside the start hook: a stale seed is rebuilt
+	// here as there, never refusing it.
+	s.retryStaleSeedForStart(ctx, rec)
 	if merr := s.resolveUnresolvedMoves(ctx, m.ReplacedVM); merr != nil {
 		return failed("start", merr)
 	}

@@ -61,3 +61,29 @@ func TestCutoverRestart_TheBackfillBeforeTheResumeDoesNotBlockTheVM(t *testing.T
 		t.Fatalf("a start after the resume: %v", err)
 	}
 }
+
+// ccguard I3: a cutover that returns with its committed phases journaled
+// wakes the daemon's retry loop, so the owed handoff is finished without a
+// daemon restart; the loop's attempt is ResumeVMReplaceCleanups.
+//
+// Mutation: no kick on that return — nothing wakes the loop, red.
+func TestCutoverVM_AJournaledFailureKicksTheCleanupRetry(t *testing.T) {
+	s, _, _, _ := restartFixture(t)
+	ctx := adminCtx()
+	crashAt(s, "before-runtime")
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the cutover did not abandon before the runtime handoff")
+	}
+	s.SetCutoverCrashHook(nil)
+	select {
+	case <-s.VMReplaceCleanupKick():
+	default:
+		t.Fatal("a cutover that left its handoff journaled did not wake the cleanup retry")
+	}
+	if err := s.ResumeVMReplaceCleanups(ctx); err != nil {
+		t.Fatalf("the retry: %v", err)
+	}
+	if _, err := s.virt.DumpXMLInactive("app"); err != nil {
+		t.Fatalf("after the retry the handoff has not run: %v", err)
+	}
+}

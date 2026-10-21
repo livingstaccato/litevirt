@@ -766,7 +766,7 @@ func heldFix(vm, host string) string {
 		"fenced or offline until `lv host undrain %[2]s`). If %[2]s was removed "+
 		"(`lv host rm --dead`), adding the machine back under that name (`lv host add`) brings %[1]s back with it. "+
 		"If %[2]s is gone for good, its data is gone with it: promote a replica if there is one "+
-		"(`lv replication promote %[1]s`), or remove the host first (`lv host rm --dead %[2]s`, try `--dry-run`) and then "+
+		"(once %[2]s is powered off, `lv host fence-confirm %[2]s`, then `lv replication promote %[1]s`), or remove the host first (`lv host rm --dead %[2]s`, try `--dry-run`) and then "+
 		"the VM (`lv rm %[1]s`), and create it again. Disk copies a failover set aside are listed by "+
 		"`lv host superseded-disks <host>`", vm, host)
 }

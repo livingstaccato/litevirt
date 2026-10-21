@@ -1037,6 +1037,8 @@ lv snapshot create <vm> <name>            # disk-only (external qcow2 overlay)
 lv snapshot create <vm> <name> --memory   # also capture guest RAM (live snapshot);
                                           # revert resumes the running VM at that instant.
                                           # Falls back to disk-only if the VM is stopped.
+                                          # Refused for a VM holding a PCI passthrough
+                                          # device (docs/pci-passthrough.md).
 lv snapshot ls <vm>                       # TYPE column shows disk | memory
 lv snapshot restore <vm> <name>           # repeatable; memory snapshots are host-local
 lv snapshot rm <vm> <name>

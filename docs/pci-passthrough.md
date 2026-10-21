@@ -276,6 +276,22 @@ records them before the first detach. If the daemon restarts in the middle of
 the move, startup recovery reads that lease and puts the VFs back into a guest
 still running on the source, or releases them if the guest has moved.
 
+## Snapshots and restores with PCI devices
+
+A memory snapshot (`lv snapshot create --memory`) saves the guest's RAM and
+device state, and libvirt cannot save the state of a PCI passthrough device
+(nor of an mdev or an `<interface type='hostdev'>`; a USB device is fine). Such
+a snapshot is refused with `FailedPrecondition` before the guest is paused or
+its disks are touched. A disk-only snapshot (without `--memory`) is still
+taken. A running Secure Boot or vTPM VM, which needs `--memory`, must be
+stopped for its snapshot.
+
+`lv backup restore-live --auto-start` attaches the backed-up VM's PCI devices
+the way `lv run` does, resolving them against the restoring host's
+inventory. If the host cannot provide one, the restore is refused rather than
+starting the VM without it. Restore without `--auto-start` to boot the disk
+without the devices. `lv clone` never copies PCI devices.
+
 ## Resource mappings
 
 A **resource mapping** is a cluster-wide alias for an equivalent passthrough device

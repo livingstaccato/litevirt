@@ -2584,6 +2584,13 @@ func (f *Fake) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, 
 		}
 	}
 	f.mu.Lock()
+	// As libvirt.Client's preflight: a device whose state cannot be saved
+	// refuses the snapshot before the freeze and the overlay cutover.
+	blockers, berr := libvirt.MemorySnapshotBlockers(f.liveXMLLocked(domainName))
+	if berr == nil && len(blockers) > 0 {
+		f.mu.Unlock()
+		return 0, 0, &libvirt.PassthroughSnapshotError{Domain: domainName, Devices: blockers}
+	}
 	if f.snapshots[domainName] == nil {
 		f.snapshots[domainName] = map[string]struct{}{}
 	}
@@ -2592,9 +2599,10 @@ func (f *Fake) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, 
 	f.record("snapshot-live", domainName, snapshotName)
 	unsaveable := unsaveableHostdev(f.liveXMLLocked(domainName))
 	f.mu.Unlock()
-	// As libvirt's save (qemuMigrationSrcIsAllowedHostdev): a domain holding a
-	// non-USB <hostdev> cannot have its state written, and the save is refused
-	// AFTER the overlay has already cut over.
+	// As libvirt's save (qemuMigrationSrcIsAllowedHostdev), reached only if
+	// the preflight above is bypassed: a domain holding a non-USB <hostdev>
+	// cannot have its state written, and the save is refused AFTER the
+	// overlay has already cut over.
 	if unsaveable != "" {
 		return 0, 0, fmt.Errorf("save guest memory: Requested operation is not valid: cannot migrate a domain with <hostdev mode='subsystem' type='%s'>", unsaveable)
 	}

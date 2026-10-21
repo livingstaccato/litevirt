@@ -311,10 +311,11 @@ const (
 )
 
 // chooseMigrationRoute decides, on the source, where vm's data goes, given the
-// target's answer to EnsureDisks (migAddr, "" when it gave none) and whether
-// both hosts hold migration-TLS credentials (bothTLS). It warns, in the log and
-// on the VM's events, whenever a configured network is not used.
-func (s *Server) chooseMigrationRoute(ctx context.Context, vmName string, target corrosion.HostRecord, migAddr string, kind routeKind, bothTLS bool) migrationRoute {
+// target's answer to EnsureDisks (migAddr, "" when it gave none) and tlsGap,
+// why QEMU's own TLS stream is not usable between the two hosts ("" when it
+// is). It warns, in the log and on the VM's events, whenever a configured
+// network is not used, naming the reason.
+func (s *Server) chooseMigrationRoute(ctx context.Context, vmName string, target corrosion.HostRecord, migAddr string, kind routeKind, tlsGap string) migrationRoute {
 	fallback := migrationRoute{addr: target.Address}
 	if s.migrationNetwork == "" {
 		return fallback
@@ -347,15 +348,14 @@ func (s *Server) chooseMigrationRoute(ctx context.Context, vmName string, target
 	case routeCold:
 		return migrationRoute{addr: migAddr, onNetwork: true}
 	case routeStorage:
-		if !bothTLS {
-			return warn("the storage copy is not encrypted (a host has no migration-TLS credentials, `lv host install-migration-tls`), " +
-				"and an unencrypted copy stays on the cluster address")
+		if tlsGap != "" {
+			return warn("the storage copy is not encrypted (" + tlsGap + "), and an unencrypted copy stays on the cluster address")
 		}
 		return migrationRoute{addr: migAddr, onNetwork: true}
 	}
-	if !bothTLS {
-		return warn("a memory-only migration leaves libvirt's tunnel to use it, and that stream is encrypted only when both hosts " +
-			"hold migration-TLS credentials (`lv host install-migration-tls`); this one would otherwise be sent in plaintext")
+	if tlsGap != "" {
+		return warn("a memory-only migration leaves libvirt's tunnel to use it, which needs QEMU's own TLS stream, and that " +
+			"is not usable here: " + tlsGap + ". It stays in libvirt's encrypted tunnel")
 	}
 	return migrationRoute{addr: migAddr, direct: true, onNetwork: true}
 }
@@ -391,8 +391,8 @@ func firmwareRouteOverride(r migrationRoute, kind routeKind, target corrosion.Ho
 // its answer with firmwareRouteOverride applied. When the override moves the
 // data off the migration network it says so, in the log and on the VM's
 // events, as every other fallback does.
-func (s *Server) chooseLiveFirmwareRoute(ctx context.Context, vmName string, target corrosion.HostRecord, migAddr string, kind routeKind, bothTLS bool) migrationRoute {
-	r := s.chooseMigrationRoute(ctx, vmName, target, migAddr, kind, bothTLS)
+func (s *Server) chooseLiveFirmwareRoute(ctx context.Context, vmName string, target corrosion.HostRecord, migAddr string, kind routeKind, tlsGap string) migrationRoute {
+	r := s.chooseMigrationRoute(ctx, vmName, target, migAddr, kind, tlsGap)
 	o := firmwareRouteOverride(r, kind, target)
 	if o != r {
 		why := "a live firmware move does not copy storage over it (not probed)"
@@ -480,4 +480,17 @@ func (s *Server) SetPingWithoutMigratePreconditionsForTest(on bool) {
 // reads every NIC number of an UpdateVM as a spec index.
 func (s *Server) SetPingWithoutNICListPositionForTest(on bool) {
 	s.pingWithoutNICListPositionForTest = on
+}
+
+// storageTLSGap says why a storage copy between source and target is not
+// encrypted, or "" when both hold usable migration-TLS credentials (a CA
+// mismatch is refused before a route is chosen).
+func storageTLSGap(srcTLS, dstTLS bool, source, target string) string {
+	switch {
+	case !srcTLS:
+		return source + " has no usable migration-TLS credentials, `lv host install-migration-tls`"
+	case !dstTLS:
+		return target + " has no usable migration-TLS credentials, `lv host install-migration-tls`"
+	}
+	return ""
 }

@@ -1,0 +1,287 @@
+# Rotating the migration CA
+
+Status: **implemented.**
+
+## Why
+
+Storage migrations (`--with-storage`) are encrypted with credentials from a
+separate migration CA (`internal/pki/migration.go`). `lv host init`, `lv host
+add` and `lv host install-migration-tls` issue one certificate per host from it,
+and each daemon installs its host's set into `/etc/pki/qemu` for QEMU.
+
+Three things are missing:
+
+- **The CA cannot be replaced.** `install-migration-tls --reissue` re-signs host
+  certificates from the *same* CA, and every path refuses to mint a second CA
+  once any host holds credentials. A leaked `migration-ca.key`, a decommissioned
+  operator machine, or plain hygiene has no remedy short of re-provisioning by
+  hand.
+- **Nothing warns before expiry.** The CA is valid for 10 years and host
+  certificates for 5. No code reads a certificate's `NotAfter` except
+  `lv acme` (`cmd/litevirt/acme.go`). An expired migration certificate surfaces
+  as a refused storage migration — or, where `allow_unencrypted_storage` is set,
+  a plaintext one.
+- **A credential push can be torn.** `pushMigrationCredentials` copies
+  `ca.crt`, `host.crt` and `host.key` one at a time, and the daemon re-installs
+  into `/etc/pki/qemu` before every storage migration. A migration that starts
+  between the certificate copy and the key copy hands QEMU a new certificate
+  with the old key, and the handshake fails. Today's `--reissue` already has
+  this race; a rotation pushes to every host twice.
+
+## What this adds
+
+1. `lv host rotate-migration-ca [--no-overlap] [--force] [--ssh-user]` — replaces
+   the migration CA across the cluster, with an overlap window by default.
+2. `lv doctor migration-tls`, backed by a `MigrationTLSStatus` RPC — per-host
+   view of which CAs each host trusts, who issued its certificate, and when
+   things expire. The rotation's phase gates use the same RPC.
+3. A daemon log warning when migration credentials are within 90 days of expiry.
+4. A validated, change-only install into `/etc/pki/qemu`, which closes the torn
+   write for `--reissue` as well.
+
+Out of scope: automatic renewal. It would need the CA key on every host so the
+daemons could sign; today it lives only on the operator machine, and copying it
+out would undo the containment the separate migration CA exists for.
+
+## Why no restart is needed
+
+`Server.migrationTLSReady()` (`internal/grpcapi/server.go`) runs the installer
+before each storage migration, and libvirt builds QEMU's `tls-creds-x509` object
+fresh for each migration. Files pushed into `<pki_dir>/migration/` therefore
+take effect on the next migration. A migration already in flight has loaded its
+credentials and is unaffected.
+
+## The command
+
+```
+lv host rotate-migration-ca [--no-overlap] [--force] [--ssh-user USER]
+```
+
+It sits beside `install-migration-tls` and reaches hosts the same way
+(`SSHMigrationTLSHosts`). It runs only on the machine holding
+`migration-ca.key`; anywhere else it refuses with the wording of
+`secondMigrationCAError`.
+
+### Operator-machine state (in `pki_dir`)
+
+| File | Meaning |
+|---|---|
+| `migration-ca.crt` / `.key` | the current CA |
+| `migration-ca.next.crt` / `.key` | the new CA; exists only mid-rotation (key 0600) |
+| `migration-rotation.lock` | flock(2)'d by a running rotation; a second run refuses while it is held |
+| `migration-rotation.json` | `phase` (`trust-both`, `reissue`, `drop-old`, `cutover` (`--no-overlap`'s single pass), `done`), `no_overlap`, the new CA's fingerprint, and per host which phases completed or were `skipped`. It remains after a rotation, recording the last one with phase `done`, and is overwritten by the next |
+| `migration-ca.retired-<YYYYMMDD>.crt` | the old CA certificate, kept for audit after a rotation (`-2`, `-3`, … for further rotations the same day; a retired certificate is never overwritten); its key is deleted |
+
+Re-running the command reads `migration-rotation.json` and continues from where
+it stopped. It never mints a second `next` CA: if `migration-ca.next.crt`
+exists, it is the rotation's CA.
+
+### Phases
+
+One run walks all three. Every push is idempotent, so a re-run redoes the
+current phase's unfinished hosts.
+
+1. **trust-both.** Each host's `migration/ca.crt` becomes a two-certificate PEM:
+   old CA, then new CA. QEMU's GnuTLS loads every certificate in
+   `ca-cert.pem` (proven with real QEMU; see Testing). Host
+   certificates are unchanged.
+2. **reissue.** Each host gets a new `host.crt` / `host.key` issued by the new
+   CA, for its recorded IPv4 address, exactly as `issueMigrationCredentials`
+   does today. Hosts on old and new certificates still accept each other,
+   because every host trusts both CAs.
+
+A storage-copy source compares its CA file with the target's as a set
+(`migrationCAMismatch` in `internal/grpcapi/migrate.go`) and refuses a
+mismatch. While phase 1 or phase 3 is being pushed, an updated host and one
+not yet updated hold different sets, so storage copies between them are
+refused until the phase reaches every host; memory-only moves stay in
+libvirt's tunnel. Throughout phase 2 every host holds the same bundle.
+3. **drop-old.** Each host's `ca.crt` becomes the new CA alone. Only then does
+   the operator machine rename `migration-ca.next.*` over `migration-ca.*`,
+   delete the old key, keep the old certificate as `retired-<date>` (`-2`,
+   `-3`, … for further rotations the same day), and mark
+   the rotation `done`.
+
+### Gates
+
+Before each phase advances, the command calls `MigrationTLSStatus` and requires
+every host to report what that phase delivered — asking the daemon what it
+would *install*, not reading files over SSH, so a host whose daemon cannot
+install them (a refused `/etc/pki/qemu`, a failed validation) holds the gate.
+
+- Before a fresh start (not on resume), before anything is minted: every host
+  answers, holds a complete set that passes validation and that its daemon can
+  install, and trusts this machine's current migration CA. `--force` passes a
+  host that cannot answer; nothing passes the rest. Under `--no-overlap` the
+  set need not be valid, complete or installable (see `--no-overlap`).
+- Before phase 2: every host trusts the new CA's fingerprint, with a set that
+  passes validation.
+- Before phase 3: every host's certificate was issued by the new CA.
+
+### `--no-overlap`
+
+For a compromised CA key. It mints the new CA, then pushes the new-CA-only
+`ca.crt` together with the new certificate and key to each host in a single
+pass, and finalizes as phase 3 does. Until every host is done, a storage
+copy between an updated host and one not yet updated is refused by the
+source's migration-CA comparison, never sent in plaintext.
+It is also the only way to rotate an already-expired CA: its preflight passes a
+host whose set is invalid or incomplete (or whose install refusal only repeats
+that validation failure), because cutover replaces the whole set, while the
+overlapping rotation refuses an expired CA and names `--no-overlap`.
+
+### `--force`
+
+Means what it means elsewhere in the CLI: override a safety check. Here it skips
+a host that cannot be reached, or that runs a build without
+`MigrationTLSStatus`. The host is recorded as `skipped`. When the rotation
+finishes it still holds the old certificate, which its peers no longer trust,
+so migrations with it are refused. The final output names each skipped host and
+the remedy: `lv host install-migration-tls --reissue` once it is back.
+
+Without `--force`, an unreachable host stops the run with progress saved, and
+the message names the host and says to re-run.
+
+### Interactions
+
+- **`lv host add` / `lv host init` during a rotation** issue from the new CA and
+  push the `ca.crt` the current phase uses (both CAs before phase 3, the new one
+  after). A run pushes only to the hosts it listed when it started, so the
+  next gate (or the preflight) stops on any host it did not list, `--force`
+  or not; the re-run lists every host afresh and brings the new one through
+  the remaining phases. A host joining mid-rotation is never left on the old
+  CA.
+- **Two runs at once** on the operator machine: each run holds an flock(2) on
+  `migration-rotation.lock` in `pki_dir`, and a second run refuses while it
+  is held.
+- **`lv host install-migration-tls`** refuses while `migration-rotation.json`
+  says a rotation is in progress, and names `rotate-migration-ca`.
+
+## The installer: validate, and write only what changed
+
+`pki.InstallQemuMigrationTLS` changes in two ways. This is its own commit; it
+fixes `--reissue` whether or not rotation lands.
+
+1. **Validate before installing.** The key must match the certificate
+   (`tls.X509KeyPair`), and the certificate must verify against the `ca.crt`
+   bundle. A set that fails, or one missing some of its three files, is not
+   installed; the error makes that migration not TLS-ready, so it is refused
+   whatever `migration.allow_unencrypted_storage` says. A torn push
+   resolves itself once the copy finishes, so a retry a few seconds later
+   succeeds.
+2. **Skip unchanged files.** Today every storage migration rewrites all five
+   files, so two concurrent migrations can tear each other's server pair. Only
+   files whose bytes, mode or owner differ are rewritten, and the marker only
+   when it is missing or differs, so an install that changes nothing writes
+   nothing.
+
+## `MigrationTLSStatus` and `lv doctor migration-tls`
+
+### RPC
+
+`MigrationTLSStatus(MigrationTLSStatusRequest{local_only})` returns one row per
+host:
+
+- `host`, and `error` when the host could not answer;
+- `provisioned` — the host holds at least one of the three files;
+- `validation_error` — why the set fails the installer's validation above,
+  empty when it passes;
+- `trusted_cas` — SHA-256 fingerprint and `not_after` of each CA in `ca.crt`;
+- `cert_issuer_fingerprint` — the CA that issued the host certificate;
+- `cert_not_after` — when the host certificate expires;
+- `allow_unencrypted_storage` — this host would fall back to plaintext;
+- `install_error` — why the daemon's installer would refuse the set (a refused
+  `/etc/pki/qemu`, an unresolvable QEMU user, a failed validation), from a
+  read-only check (`pki.CheckQemuMigrationTLS`) that installs nothing. Every
+  gate requires it empty.
+
+The daemon the CLI calls answers for itself and fans out to every host in the
+`hosts` table through `s.peerClient`, with `local_only=true` so the fan-out does
+not recurse. An unreachable host, or one returning `Unimplemented` (an older
+build), becomes a row with `error` set, not a failed call. At most 8 peers
+are asked at once. The RPC writes nothing on any host and returns nothing
+secret, so a peer or a viewer may call it (`requirePeerOrRole`); a scoped
+token is refused. A peer's answer counts only as one row for that peer.
+
+### Command
+
+```
+HOST    STATUS   TRUSTS          CERT FROM  EXPIRES
+node-1  ok       a1b2…           a1b2…      2031-10-04 (1826d)
+node-2  ok       a1b2…,9f8e…     9f8e…      2031-10-04 (1826d)
+node-3  expiring a1b2…           a1b2…      2026-12-01 (58d)
+node-4  error    —               —          unreachable
+```
+
+`--json` gives machine-readable rows. It exits non-zero when any host:
+
+- expires (certificate or a trusted CA) within 90 days;
+- is unreachable, or fails validation;
+- trusts a different CA set from its peers while no rotation is running;
+- has `allow_unencrypted_storage` on.
+
+### Daemon log
+
+At startup and every 24 hours, a daemon with migration credentials logs a
+**Warn** when its certificate or any CA it trusts expires within 90 days, naming
+`lv host install-migration-tls --reissue` (certificate) or
+`lv host rotate-migration-ca` (CA). Once something has expired it logs an
+**Error**. 90 days is a constant, not a config key.
+
+## Testing
+
+**The assumption, proven.** `TestQemuMigrationTLS_RotationPairings`
+(`internal/pki`, run with `LITEVIRT_QEMU_TLS=1`) migrates a paused guest between
+two real QEMU processes over QEMU's own TLS, with directories laid out as the
+installer lays them out, for every pairing a rotation produces: across a
+trust-both host and one not yet updated, both ways; across the mid-reissue
+pair (certificates from either CA, one two-CA bundle), both ways; and after
+drop-old. All complete. Its controls, two hosts with no CA in common, fail at
+the handshake ("The certificate hasn't got a known issuer"). Proven on QEMU
+10.2.1; the lab run below is still owed before release.
+
+**Unit.**
+
+- `internal/pki`: a mismatched key/certificate is refused; a certificate from a
+  CA outside the bundle is refused; a two-CA bundle validates; an unchanged
+  file is not rewritten (same inode).
+- `internal/cli`: the rotation state machine against fakes of
+  `MigrationTLSHost` and of the status source — interruption at each phase then
+  resume; refusal without the CA key; `--force` recording `skipped`;
+  `--no-overlap`; `host add` mid-rotation issuing from the new CA;
+  `install-migration-tls` refusing mid-rotation.
+- `internal/daemon`: the expiry warning with an injected clock — none at 91
+  days, Warn at 89, Error once expired.
+
+**Fleet** (`tests/fleet/`): the `MigrationTLSStatus` fan-out returns a row per
+node, with a stopped node as an error row; the phase gate refuses while one node
+reports the old CA. `libvirtfake` does no TLS, so a real handshake is lab-only.
+
+**Lab** (kvm003, 5 nodes): a storage migration with a tcpdump TLS-record count,
+as for the original migration-TLS proof, before rotation, after phase 1 (across
+a phase-1 host and one not yet updated), after phase 2 and after phase 3. With
+`--no-overlap`, a migration between an updated and a not-yet-updated host is
+refused, never plaintext.
+
+Every assertion is mutation-verified.
+
+## Delivery
+
+Three stacked PRs on the fork:
+
+1. `fix(pki)`: validate before installing, and skip unchanged files.
+2. `feat(doctor)`: `MigrationTLSStatus`, `lv doctor migration-tls`, and the
+   expiry warning.
+3. `feat(cli)`: `lv host rotate-migration-ca`, with the lab proof.
+
+Docs: `docs/cli-reference.md` for both commands, and a "Rotating the migration
+CA" section in `docs/migration-failover.md` including the compromised-key
+runbook (`--no-overlap`).
+
+## Future work: rotating the cluster CA
+
+The cluster CA has the same gaps — a 10-year CA, 5-year host certificates, no
+rotation and no expiry warning — but every gRPC and gossip connection trusts it,
+so rotating it is a rolling-trust problem across the whole fleet rather than a
+refused migration. It needs its own design. `MigrationTLSStatus` and the expiry
+warning are the pattern to extend to it.

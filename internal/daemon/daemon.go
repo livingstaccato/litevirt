@@ -114,6 +114,12 @@ type Daemon struct {
 	// start before the server exists. See wireLeaseMintClearance.
 	mintClearance atomic.Pointer[grpcapi.Server]
 
+	// migrationTLSMu serializes the migration-TLS install hook. Storage
+	// migrations and the start-up install both run it, and
+	// two installs interleaving their per-file skip/write could leave QEMU a
+	// certificate from one set and a key from the other.
+	migrationTLSMu sync.Mutex
+
 	// authEngine is wired into the gRPC server below; kept on the daemon
 	// struct so the backstop reload loop (runAuthEngineReload) can refresh it.
 	authEngine *auth.Engine
@@ -1300,17 +1306,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	migrationTLS := d.migrationTLSInstaller()
 	svc.SetMigrationTLS(migrationTLS)
 	svc.SetMigrationCAFingerprint(func() (string, error) { return pki.MigrationCAFingerprint(d.cfg.PKIDir) })
+	svc.SetMigrationCAList(func() ([]string, error) { return pki.MigrationCAFingerprints(d.cfg.PKIDir) })
+	svc.SetMigrationTLSCheck(d.migrationTLSChecker())
+	svc.SetMigrationTLSStatus(func() *pb.MigrationTLSHostStatus {
+		return migrationTLSStatusRow(pki.InspectMigrationTLS(d.cfg.PKIDir, time.Now()))
+	})
+	go runMigrationExpiryWatch(ctx, d.cfg.PKIDir)
 	// Install once at start so the operator sees the state in the log; it runs
 	// again before each storage migration.
-	if ok, err := migrationTLS(); err != nil {
-		slog.Warn("migration TLS: not installed; storage migrations from or to this host "+
-			"cannot be encrypted", "error", err)
-	} else if ok {
-		slog.Info("migration TLS: credentials installed for QEMU", "dir", pki.QemuTLSDir)
-	} else {
-		slog.Info("migration TLS: this host has no migration credentials; provision them with " +
-			"`lv host install-migration-tls`")
-	}
+	ok, wrote, err := d.installMigrationTLS()
+	logMigrationTLSInstall(ok, wrote, err)
 	// Cluster-wide capacity policy (overcommit ratios + host reserves). Per-host
 	// overrides live on the host record and win where set.
 	svc.SetCapacityPolicy(capacity)

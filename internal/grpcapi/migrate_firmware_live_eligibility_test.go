@@ -737,7 +737,7 @@ func TestChooseLiveFirmwareRoute(t *testing.T) {
 			s := testServer(t)
 			s.migrationNetwork = "10.20.0.0/24"
 			s.SetLocalIPsForTest(func() ([]net.IP, error) { return []net.IP{net.ParseIP("10.20.0.50")}, nil })
-			got := s.chooseLiveFirmwareRoute(context.Background(), "os1", target, "10.20.0.2", c.kind, true)
+			got := s.chooseLiveFirmwareRoute(context.Background(), "os1", target, "10.20.0.2", c.kind, "")
 			if got != (migrationRoute{addr: "192.168.1.2"}) {
 				t.Fatalf("route %+v, want the cluster address", got)
 			}

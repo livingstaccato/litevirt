@@ -37,12 +37,9 @@ alone unless --reissue.
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				hosts, closeAll, err := cli.SSHMigrationTLSHosts(ctx, c, sshUser)
-				if err != nil {
-					return err
-				}
-				defer closeAll()
-				return cli.InstallMigrationTLS(ctx, cli.PKIDir(), hosts, reissue, cmd.OutOrStdout())
+				return cli.InstallMigrationTLSVia(ctx, cli.PKIDir(), func(ctx context.Context) ([]cli.MigrationTLSHost, func(), error) {
+					return cli.SSHMigrationTLSHosts(ctx, c, sshUser)
+				}, reissue, cmd.OutOrStdout())
 			})
 		},
 	}

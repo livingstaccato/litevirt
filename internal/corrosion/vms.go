@@ -1191,6 +1191,43 @@ func SyncVMStopIfRunning(ctx context.Context, c *Client, name, state, detail str
 	return nil
 }
 
+// UpdateVMStateIfOwner is UpdateVMState only while name's live row is still
+// the one a caller recorded: on host, of incarnation createdAt, at owner
+// epoch expectedEpoch — checked inside the write's transaction. A row moved
+// to another host, re-created, or owned again under a later generation since
+// (away and back) is not written: ErrNoRowsAffected. With expectedEpoch > 0
+// the statement carries the epoch too (UpdateVMStateAtEpoch's), so it cannot
+// travel onto a peer's newer generation; the statements are the plain state
+// writes', and the guard is local. For the replay of an operator stop
+// recorded on a host while it could not write (health/operator_stop_marker.go).
+func UpdateVMStateIfOwner(ctx context.Context, c *Client, name, host, createdAt string, expectedEpoch int64, state, detail string) error {
+	now := c.NowTS()
+	stmt := Statement{SQL: vmStateUpdateSQL, Params: []interface{}{state, detail, now, name}}
+	if expectedEpoch > 0 {
+		stmt = Statement{SQL: vmStateAtEpochSQL, Params: []interface{}{state, detail, now, name, expectedEpoch}}
+	}
+	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var curHost, curCreated string
+		var epoch int64
+		err := tx.QueryRowContext(ctx,
+			`SELECT host_name, created_at, vm_owner_epoch FROM vms WHERE name = ? AND deleted_at IS NULL`, name).Scan(&curHost, &curCreated, &epoch)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return curHost == host && IncarnationOf(curCreated) == IncarnationOf(createdAt) && epoch == expectedEpoch, nil
+	}, []Statement{stmt})
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return ErrNoRowsAffected
+	}
+	return nil
+}
+
 // UpdateVMStateStrict is UpdateVMState that reports a zero-row update as
 // ErrNoRowsAffected instead of a silent success. Use it where the write's success
 // GATES a subsequent action (an event, audit, LB refresh, hook, or ownership

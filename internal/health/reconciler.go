@@ -127,8 +127,9 @@ type Reconciler struct {
 	virt             LibvirtBackend
 	// operatorStopReplay records the forced stops made here under write
 	// quarantine once it has lifted (operator_stop_marker.go); run first in
-	// every pass, before the walk reads the rows.
-	operatorStopReplay func(context.Context)
+	// every pass, before the walk reads the rows. It reports whether a
+	// marker of this host is still waiting for its replay.
+	operatorStopReplay func(context.Context) bool
 	// heldStartLive / recordVMEvent: a held start whose daemon restarted
 	// before libvirt answered it (held_start_orphan.go).
 	heldStartLive func(name string) bool
@@ -320,7 +321,7 @@ type Reconciler struct {
 
 // SetOperatorStopReplay wires the replay of operator-stop markers
 // (grpcapi.Server.ReplayOperatorStopMarkers), run at the start of every pass.
-func (r *Reconciler) SetOperatorStopReplay(fn func(context.Context)) { r.operatorStopReplay = fn }
+func (r *Reconciler) SetOperatorStopReplay(fn func(context.Context) bool) { r.operatorStopReplay = fn }
 
 // SetHardwareStartPreparer wires the hardware_v2 pre-start hook (adoption gate + PCI
 // start-preflight). nil-safe; unwired means every start behaves exactly as before.
@@ -859,10 +860,15 @@ func (r *Reconciler) retryOnbootPending(ctx context.Context, only func(name stri
 }
 
 func (r *Reconciler) reconcile(ctx context.Context) {
+	// A marker still waiting for its replay names its row's owner epoch: the
+	// backfill below would move a pre-epoch row's generation from under it
+	// (0 to 1), and the marker would stop holding the VM. The backfill waits
+	// for the replay; it is retried every pass.
+	markersPending := false
 	if r.operatorStopReplay != nil {
-		r.operatorStopReplay(ctx)
+		markersPending = r.operatorStopReplay(ctx)
 	}
-	if r.ownerEpochBackfill {
+	if r.ownerEpochBackfill && !markersPending {
 		// Phase 4 backfill: graduate every workload this host owns out of the
 		// pre-epoch 0. Idempotent by predicate; the convergence pass below then
 		// writes the runtime markers for whatever just graduated. Readiness

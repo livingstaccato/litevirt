@@ -43,6 +43,10 @@ import (
 // know it: a host rolled back below this build ignores the marker
 // (docs/upgrades.md).
 
+// operatorStopSyncDir fsyncs a directory; a test seam over syncDir, so the
+// fsync that makes the rename durable can be seen to happen.
+var operatorStopSyncDir = syncDir
+
 // operatorStopDir is the marker directory under the daemon's data dir.
 const operatorStopDir = "operator-stops"
 
@@ -58,8 +62,12 @@ type OperatorStopMarker struct {
 	// Incarnation is the row's created_at at the stop
 	// (corrosion.IncarnationOf): the marker holds only that incarnation.
 	Incarnation string `json:"incarnation"`
-	StoppedAt   string `json:"stopped_at"` // RFC3339, for operators; nothing decides on it
-	Quarantine  string `json:"quarantine"` // why writes were refused, for operators
+	// OwnerEpoch is the row's vm_owner_epoch at the stop: an ownership
+	// that left this host and came back (a later generation) is not held,
+	// and the replay never records the stop over it.
+	OwnerEpoch int64  `json:"owner_epoch"`
+	StoppedAt  string `json:"stopped_at"` // RFC3339, for operators; nothing decides on it
+	Quarantine string `json:"quarantine"` // why writes were refused, for operators
 }
 
 // ErrOperatorStopMarkerCorrupt is a marker that exists and cannot be read,
@@ -126,7 +134,7 @@ func WriteOperatorStopMarker(dataDir string, m OperatorStopMarker) error {
 	if err := os.Rename(tmp.Name(), p); err != nil {
 		return err
 	}
-	if err := syncDir(dir); err != nil {
+	if err := operatorStopSyncDir(dir); err != nil {
 		return fmt.Errorf("fsync %s: %w", dir, err)
 	}
 	return nil
@@ -214,8 +222,8 @@ func OperatorStopHold(dataDir, host string, vm *corrosion.VMRecord) (why string,
 		return fmt.Sprintf("its operator-stop marker %s cannot be read (%v); the VM is held stopped until it is", p, err), true
 	case !ok:
 		return "", false
-	case m.Host != host || m.Incarnation != corrosion.IncarnationOf(vm.CreatedAt):
-		return "", false // another host's, or another incarnation of the name
+	case m.Host != host || m.Incarnation != corrosion.IncarnationOf(vm.CreatedAt) || m.OwnerEpoch != vm.OwnerEpoch:
+		return "", false // another host's, another incarnation of the name, or a later ownership of it
 	}
 	return fmt.Sprintf("its operator stopped it with `lv stop --force` at %s while this host was in write quarantine; "+
 		"the stop is recorded once the quarantine lifts", m.StoppedAt), false
@@ -282,7 +290,9 @@ type operatorStopMarkerEvidence struct {
 func OperatorStopMarkerCorruptRemedy(vm string) string {
 	return "the VM is held stopped on this host and is not started by its restart policy, onboot or `lv start`: " +
 		"look at the file, then record the stop with `lv stop " + vm + "` (which removes the marker once the stop " +
-		"is recorded) and start it with `lv start " + vm + "`"
+		"is recorded) and start it with `lv start " + vm + "`. If the VM was deleted, or the host is still in write " +
+		"quarantine (no stop can be recorded), remove the file by hand on this host: rm <data_dir>/" + operatorStopDir +
+		"/" + vm + ".json"
 }
 
 // ReportCorruptOperatorStopMarkers raises operator_stop_marker_corrupt,

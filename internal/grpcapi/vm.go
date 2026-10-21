@@ -2199,6 +2199,13 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 			return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
 		}
 	}
+	// A host in write quarantine cannot record a start: the row would keep
+	// saying what it says while the guest runs, and every peer decides from
+	// the row. The automated starts fail closed on their own replicated
+	// writes; an operator's start is refused here, before anything runs.
+	if err := s.quarantinedStartRefusal(vm.Name); err != nil {
+		return nil, err
+	}
 	// A point-in-time overlay an earlier copy left holds writes the disk's
 	// file lacks: settle it before anything reads or starts the disk.
 	if err := s.settlePITOverlays(ctx, vm); err != nil {

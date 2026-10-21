@@ -60,6 +60,7 @@ func (s *Server) quarantinedForceStopLocked(ctx context.Context, vm *corrosion.V
 		VM:          vm.Name,
 		Host:        s.hostName,
 		Incarnation: corrosion.IncarnationOf(vm.CreatedAt),
+		OwnerEpoch:  vm.OwnerEpoch,
 		StoppedAt:   time.Now().UTC().Format(time.RFC3339),
 		Quarantine:  reason,
 	}); err != nil {
@@ -125,6 +126,12 @@ func (s *Server) operatorStopStartRefusal(ctx context.Context, vm *corrosion.VMR
 		return status.Errorf(codes.Unavailable, "VM %q: read its operator-stop marker again: %v; retry", vm.Name, err)
 	}
 	if err := s.replayOperatorStopLocked(ctx, m); err != nil {
+		if errors.Is(err, errReplayHeld) {
+			return status.Errorf(codes.FailedPrecondition,
+				"VM %q was not started: %s, and its row is %s, which that stop is not recorded over. Record the stop "+
+					"with `lv stop %s` (which removes the marker), then retry `lv start %s`",
+				vm.Name, why, vm.State, vm.Name, vm.Name)
+		}
 		return status.Errorf(codes.Unavailable,
 			"VM %q was not started: recording the forced stop made under write quarantine failed (%v); retry `lv start %s`",
 			vm.Name, err, vm.Name)
@@ -176,10 +183,11 @@ func operatorStopReplayLogDue(key string) bool {
 // write quarantine on its VM's row, once the quarantine has lifted, and
 // removes each marker it has recorded (or that no longer applies). Run at the
 // start of every reconciler pass, so it lands before the walk reads the
-// rows. A marker that cannot be read is alerted on, never replayed.
-func (s *Server) ReplayOperatorStopMarkers(ctx context.Context) {
+// rows. A marker that cannot be read is alerted on, never replayed. It
+// reports whether a marker of this host is still waiting for its replay.
+func (s *Server) ReplayOperatorStopMarkers(ctx context.Context) bool {
 	if s.dataDir == "" {
-		return
+		return false
 	}
 	names, err := health.ListOperatorStopMarkers(s.dataDir)
 	if err != nil {
@@ -187,7 +195,7 @@ func (s *Server) ReplayOperatorStopMarkers(ctx context.Context) {
 			slog.Error("operator-stop replay: the marker directory cannot be read; every VM with a marker stays held (repeated at most every 10m)",
 				"dir", health.OperatorStopMarkerDir(s.dataDir), "error", err)
 		}
-		return
+		return true
 	}
 	reason := s.stopQuarantineReason()
 	pending := 0
@@ -232,6 +240,7 @@ func (s *Server) ReplayOperatorStopMarkers(ctx context.Context) {
 			slog.Warn("operator-stop replay: raising or resolving operator_stop_marker_corrupt failed (repeated at most every 10m)", "error", err)
 		}
 	}
+	return pending > 0
 }
 
 // errReplayHeld is a marker whose VM's row is in a state the replay does not
@@ -255,6 +264,10 @@ func (s *Server) replayOperatorStopLocked(ctx context.Context, m health.Operator
 		return drop("the VM was deleted and created again (created_at " + vm.CreatedAt + ")")
 	case vm.HostName != s.hostName:
 		return drop("the VM is now on host " + vm.HostName)
+	case vm.OwnerEpoch != m.OwnerEpoch:
+		// It left this host and came back, or was handed over again: a
+		// later ownership, which this stop is not recorded over.
+		return drop(fmt.Sprintf("the VM is owned under a later generation (owner epoch %d, the stop's %d)", vm.OwnerEpoch, m.OwnerEpoch))
 	case vm.State == "stopped" && vm.StateDetail == "operator-stop":
 		return drop("its operator stop is already recorded")
 	}
@@ -282,7 +295,9 @@ func (s *Server) replayOperatorStopLocked(ctx context.Context, m health.Operator
 			return fmt.Errorf("release PCI device(s): %w", err)
 		}
 	}
-	if err := s.persistVMState(ctx, vm.Name, "stopped", "operator-stop", corrosion.OpVMState); err != nil {
+	// Guarded by the MARKER's identity, not the row just read: a row that
+	// moved on between that read and this write is not written.
+	if err := s.persistVMStateIfOwner(ctx, vm.Name, m.Incarnation, m.OwnerEpoch, "stopped", "operator-stop", corrosion.OpVMState); err != nil {
 		return fmt.Errorf("record operator-stop: %w", err)
 	}
 	s.recordVMEvent(ctx, vm.Name, "vm.stopped", "ok",
@@ -290,4 +305,54 @@ func (s *Server) replayOperatorStopLocked(ctx context.Context, m health.Operator
 	go s.refreshLBForStack(context.Background(), vm.StackName)
 	slog.Info("operator-stop replay: the forced stop made under write quarantine is recorded", "vm", vm.Name)
 	return health.RemoveOperatorStopMarker(s.dataDir, m.VM)
+}
+
+// persistVMStateIfOwner is persistVMState for the replay: the write lands
+// only while name's row is still on this host, of incarnation and at owner
+// epoch (corrosion.UpdateVMStateIfOwner), so a stop made under one ownership
+// is never recorded over another. ErrNoRowsAffected otherwise; the next pass
+// reads the row again.
+func (s *Server) persistVMStateIfOwner(ctx context.Context, name, incarnation string, epoch int64, state, detail, op string) error {
+	committed := false
+	err := s.publishRunning(ctx, name, state, func(ctx context.Context) error {
+		committed = true
+		if s.stateWriteHook != nil {
+			if err := s.stateWriteHook(name, state); err != nil {
+				s.noteStateWriteFail(op, err)
+				return err
+			}
+		}
+		err := corrosion.UpdateVMStateIfOwner(ctx, s.db, name, s.hostName, incarnation, epoch, state, detail)
+		if err != nil {
+			s.noteStateWriteFail(op, err)
+		}
+		return err
+	})
+	if err != nil && !committed {
+		s.noteStateWriteFail(op, err)
+	}
+	return err
+}
+
+// quarantinedStartRefusal refuses `lv start` of name on a host in write
+// quarantine: the start, its admission and its running state are replicated
+// records, which the quarantine refuses, so a guest started now would run
+// unrecorded. It says how the quarantine lifts.
+func (s *Server) quarantinedStartRefusal(name string) error {
+	reason := s.stopQuarantineReason()
+	if reason == "" {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"VM %q was not started: this host is in write quarantine (%s) and cannot record a start, so the guest "+
+			"would run while the cluster's record of it says otherwise; nothing was changed. %s, then retry `lv start %s`",
+		name, reason, capitalize(s.quarantineRemedy()), name)
+}
+
+// capitalize upper-cases s's first letter (an ASCII remedy text).
+func capitalize(s string) string {
+	if s == "" || s[0] < 'a' || s[0] > 'z' {
+		return s
+	}
+	return string(s[0]-'a'+'A') + s[1:]
 }

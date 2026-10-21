@@ -2763,6 +2763,12 @@ To clear it, look at the file, then record the stop with `lv stop <vm>`: a
 stop recorded on the VM's row removes its marker, whatever the marker holds.
 Then `lv start <vm>` starts it.
 
+Two cases have no stop to record, and the file is removed by hand on the
+host the condition names (`rm <data_dir>/operator-stops/<vm>.json`): the VM
+was deleted (`lv stop` answers `NotFound`), or the host is still in write
+quarantine (no stop can be recorded). The condition resolves on the host's
+next reconcile pass once the file is gone.
+
 | Raised when | Clears when |
 |---|---|
 | A reconcile pass on a host out of write quarantine finds a marker it cannot read. | The marker is gone: removed by a recorded `lv stop`, or by hand. |

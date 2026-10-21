@@ -103,6 +103,9 @@ type Daemon struct {
 	// start of New until Run hands it to the heartbeat (bootUnderWatchdog).
 	// Nil when there is none.
 	bootWatchdog *watchdog.BootKeeper
+	// watchdogRunDir holds the self-fence marker and the boot streak
+	// (watchdog.RunDir); "" in tests that build a Daemon by hand.
+	watchdogRunDir string
 
 	// buildServer replaces grpcapi.NewServer in newServer (tests, which have
 	// no libvirt); nil in a daemon.
@@ -204,9 +207,20 @@ type Daemon struct {
 // (bootUnderWatchdog).
 func New(cfg *Config) (*Daemon, error) {
 	return bootUnderWatchdog(
-		func() *watchdog.BootKeeper { return watchdog.KeepBootAlive(cfg.WatchdogDev, 0) },
+		func() *watchdog.BootKeeper { return watchdog.KeepBootAlive(cfg.WatchdogDev, bootKeeperOptions(cfg)) },
 		func(bk *watchdog.BootKeeper) (*Daemon, error) { return newDaemon(cfg, bk) },
 	)
+}
+
+// bootKeeperOptions are the boot keeper's bounds (watchdog.boot_keeper_*).
+func bootKeeperOptions(cfg *Config) watchdog.BootOptions {
+	return watchdog.BootOptions{
+		RunDir:       watchdog.RunDir,
+		Configured:   cfg.WatchdogDev != "",
+		StreakWindow: time.Duration(cfg.Watchdog.BootKeeperStreakWindowSec) * time.Second,
+		MaxBoots:     cfg.Watchdog.BootKeeperMaxBoots,
+		MaxDuration:  time.Duration(cfg.Watchdog.BootKeeperMaxSec) * time.Second,
+	}
 }
 
 // bootUnderWatchdog enforces the load-bearing boot order for the hardware
@@ -302,8 +316,9 @@ func newDaemon(cfg *Config, bootWatchdog *watchdog.BootKeeper) (*Daemon, error) 
 		fwStore: fwStore,
 		images:  store,
 
-		startWaitSvc: startWaitSvc,
-		bootWatchdog: bootWatchdog,
+		startWaitSvc:   startWaitSvc,
+		bootWatchdog:   bootWatchdog,
+		watchdogRunDir: watchdog.RunDir,
 	}, nil
 }
 
@@ -1115,9 +1130,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		return false
 	})
+	// A self-fence is recorded where a restarted daemon finds it, so the
+	// restart cannot cancel the reboot.
+	watchdogCtrl.SetRunDir(d.watchdogRunDir)
+	// Liveness gate: a daemon wedged on its state store stops petting
+	// (the pauser's tick joins once it starts, below).
+	watchdogCtrl.SetDBProbe(func(ctx context.Context) error {
+		_, err := d.db.Query(ctx, "SELECT 1")
+		return err
+	})
 	// Continue on the descriptor boot has been petting (bootUnderWatchdog), so
-	// the device is never closed between the two.
-	go watchdog.HeartbeatFrom(ctx, d.cfg.WatchdogDev, 0, watchdogCtrl, d.bootWatchdog)
+	// the device is never closed between the two. Taken here, not in the
+	// goroutine, so the deferred Abandon cannot race it.
+	go watchdog.HeartbeatFrom(ctx, d.cfg.WatchdogDev, 0, watchdogCtrl, d.bootWatchdog.Handoff())
 	// Central self-fence hard gate: once this node self-fences, the checker's Execution/
 	// DecisionGate fail closed regardless of quorum, so every gate consumer (reconciler,
 	// grpcapi server, failover coordinator) refuses runtime-ownership work during the
@@ -1859,6 +1884,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	pauser.SetSettleVerifier(svc.VerifySettleProof)
 	pauser.SetPeerRuntimeChecker(svc.CheckPeerContainerRuntime)
 	pauser.SetSelfFence(watchdogCtrl.Armed, watchdogCtrl.SelfFence)
+	watchdogCtrl.SetPauserTick(pauser.LastTick)
 	go pauser.Start(ctx)
 	// Persistent HA-degraded surface (unsupported member / unfenced demotion failure / VIP
 	// with no holder) — a durable alertable status + transition events.

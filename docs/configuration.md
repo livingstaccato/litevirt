@@ -124,6 +124,18 @@ dns_domain: "litevirt.local"
 # (split-brain risk). Override with LITEVIRT_UNSAFE_SKIP_WATCHDOG_CHECK=1.
 watchdog_dev: ""
 
+# Bounds on petting, during startup, a watchdog timer that a previous daemon
+# left running (a crash, or a stop while it owned workloads). Each startup
+# pets for at most boot_keeper_max_sec; startups that never reach the
+# heartbeat stop being petted after boot_keeper_max_boots, or once the first
+# of them is boot_keeper_streak_window_sec old. A host whose daemon cannot
+# come back then reboots at the watchdog timeout. 0 in any turns startup
+# petting off (the timer is then first petted when the heartbeat starts).
+watchdog:
+  boot_keeper_streak_window_sec: 300
+  boot_keeper_max_boots: 5
+  boot_keeper_max_sec: 120
+
 # Load-balancer VIP split-brain safety (see migration-failover.md).
 # quorum_loss_demote_after_sec: sustained local quorum loss before an isolated
 #   LB host stands its own VIPs down (must be > 0). Default 12.

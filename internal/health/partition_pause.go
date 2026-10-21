@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -327,6 +328,7 @@ type PartitionPauser struct {
 	now          func() time.Time
 	after        time.Duration
 	tick         time.Duration
+	lastTick     atomic.Int64 // unix nanos; LastTick
 
 	mu sync.Mutex
 	// samples are this pass's and earlier passes' quorum readings inside the
@@ -462,6 +464,7 @@ func (p *PartitionPauser) Records() ([]PauseRecord, error) { return p.store.list
 
 // Start runs the monitor until ctx ends.
 func (p *PartitionPauser) Start(ctx context.Context) {
+	p.lastTick.Store(time.Now().UnixNano())
 	t := time.NewTicker(p.tick)
 	defer t.Stop()
 	for {
@@ -470,8 +473,20 @@ func (p *PartitionPauser) Start(ctx context.Context) {
 			return
 		case <-t.C:
 			p.Evaluate(ctx)
+			p.lastTick.Store(time.Now().UnixNano())
 		}
 	}
+}
+
+// LastTick is when Start last completed a pass (or started), zero before it
+// starts. The watchdog heartbeat stops petting when it goes stale: a pauser
+// that is wedged can neither pause nor self-fence, so the hardware watchdog
+// has to (watchdog.Controller.SetPauserTick).
+func (p *PartitionPauser) LastTick() time.Time {
+	if n := p.lastTick.Load(); n != 0 {
+		return time.Unix(0, n)
+	}
+	return time.Time{}
 }
 
 // Evaluate is one pass. The quorum readings of the last 2·T_pause are kept,

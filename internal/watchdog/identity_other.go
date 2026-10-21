@@ -2,7 +2,10 @@
 
 package watchdog
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 // isHardwareWatchdog is a no-op off Linux (the watchdog device is Linux-only). It
 // reports "not a hardware watchdog" so self-fencing capability is never advertised on
@@ -18,3 +21,6 @@ func disarmWatchdog(uintptr)               {}
 
 // watchdogOptions cannot be read off Linux, so nothing is proven.
 func watchdogOptions(uintptr) (uint32, bool) { return 0, false }
+
+// bootClock off Linux is the wall clock; nothing there keeps a boot streak.
+func bootClock() time.Duration { return time.Duration(time.Now().UnixNano()) }

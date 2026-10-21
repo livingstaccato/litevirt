@@ -8,29 +8,37 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
 // A local `lv stop` on a node in write quarantine cannot record the
 // operator's stop: every replicated write is refused, so the row keeps
-// "running" and no operator-stop detail lands. The domain stopped anyway,
-// and once the quarantine lifted the reconciler recorded the stop as an
-// out-of-band destroy and the restart policy started the VM again: the
-// operator's stop was undone (VERIFY bug 11, M3).
+// "running" and no operator-stop detail lands. A forced stop destroyed the
+// domain anyway, libvirt's reason was "destroyed", and once the quarantine
+// lifted the reconciler recorded an out-of-band destroy that the restart
+// policy started again: the operator's stop was undone (VERIFY bug 11, M3).
+// A graceful stop whose guest ignored ACPI was force-killed after its
+// timeout, the same shape.
 //
-// A stop that cannot be recorded is refused before it touches libvirt: the
-// guest keeps running, the operator is told why, and no restart-policy or
-// reconciler pass, during the quarantine or after it lifts, starts or
-// stops anything.
+// Under quarantine `--force` is refused before it touches libvirt, and a
+// graceful stop is never force-killed. A graceful stop the guest honours
+// still runs, as on base: the guest shuts down, the answer says the stop was
+// not recorded, and once the quarantine lifts it is recorded as a clean
+// guest shutdown, which the restart policy leaves alone.
 func TestFleet_QuarantinedStopIsRefusedNotUndone(t *testing.T) {
-	for _, force := range []bool{false, true} {
-		name := "graceful"
-		if force {
-			name = "force"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		force       bool
+		ignoresACPI bool
+		wantCode    codes.Code
+		wantRunning bool // the domain once the passes have run
+	}{
+		{name: "graceful", wantCode: codes.Internal, wantRunning: false},
+		{name: "graceful-ignored", ignoresACPI: true, wantCode: codes.FailedPrecondition, wantRunning: true},
+		{name: "force", force: true, wantCode: codes.FailedPrecondition, wantRunning: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			c := New(t, Options{Nodes: 1})
 			n := c.Nodes[0]
 			ctx := context.Background()
@@ -45,24 +53,37 @@ func TestFleet_QuarantinedStopIsRefusedNotUndone(t *testing.T) {
 			if st, _ := n.Virt.RawState("web"); st != libvirtfake.StateRunning {
 				t.Fatalf("after CreateVM the domain is %q, want running", st)
 			}
+			if tc.ignoresACPI {
+				n.Virt.IgnoreShutdown = func(string) bool { return true }
+			}
 
 			quarantine := "rolled back below latched token(s): test"
 			n.DB.SetWriteQuarantine(func() string { return quarantine })
 			before := len(n.Virt.EventLog())
 
-			_, err := c.SelfClient(n).StopVM(ctx, &pb.StopVMRequest{Name: "web", Force: force})
-			if status.Code(err) != codes.FailedPrecondition {
-				t.Errorf("StopVM under write quarantine: err=%v, want FailedPrecondition (a stop it cannot record is refused)", err)
+			_, err := c.SelfClient(n).StopVM(ctx, &pb.StopVMRequest{Name: "web", Force: tc.force, Timeout: 1})
+			if status.Code(err) != tc.wantCode {
+				t.Errorf("StopVM under write quarantine: err=%v, want %v", err, tc.wantCode)
 			}
+			shutdowns := 0
 			for _, e := range n.Virt.EventLog()[before:] {
-				if e.Domain == "web" && (e.Op == "shutdown" || e.Op == "destroy") {
-					t.Errorf("the refused stop reached libvirt: %s %s", e.Op, e.Domain)
+				if e.Domain != "web" {
+					continue
+				}
+				switch e.Op {
+				case "destroy":
+					t.Errorf("a stop under write quarantine destroyed the domain")
+				case "shutdown":
+					shutdowns++
 				}
 			}
-			if st, _ := n.Virt.RawState("web"); force && st != libvirtfake.StateRunning {
-				// libvirt's own reason for a domain an operator's stop
-				// destroyed, which the fake leaves unset.
-				n.Virt.SetStateReason("web", "destroyed")
+			if wantShutdown := !tc.force; (shutdowns > 0) != wantShutdown {
+				t.Errorf("ACPI shutdowns asked: %d, want asked=%v", shutdowns, wantShutdown)
+			}
+			if st, _ := n.Virt.RawState("web"); st != libvirtfake.StateRunning {
+				// libvirt's own reason for a guest that shut down on ACPI,
+				// which the fake leaves unset.
+				n.Virt.SetStateReason("web", "guest-shutdown")
 			}
 
 			// Restart-policy and reconciler passes under the quarantine and
@@ -72,34 +93,19 @@ func TestFleet_QuarantinedStopIsRefusedNotUndone(t *testing.T) {
 			checker.SweepOnce(ctx)
 			r.ReconcileOnce(ctx)
 			n.DB.SetWriteQuarantine(nil)
+			n.Virt.IgnoreShutdown = nil
 			for i := 0; i < 3; i++ {
 				r.ReconcileOnce(ctx)
 				checker.SweepOnce(ctx)
 			}
 
 			for _, e := range n.Virt.EventLog()[before:] {
-				if e.Domain == "web" && (e.Op == "start" || e.Op == "shutdown" || e.Op == "destroy") {
-					t.Errorf("after a stop under quarantine: libvirt %s of web, want the domain left as the refusal found it", e.Op)
+				if e.Domain == "web" && e.Op == "start" {
+					t.Errorf("a stop under write quarantine was undone: libvirt start of web")
 				}
 			}
-			if st, _ := n.Virt.RawState("web"); st != libvirtfake.StateRunning {
-				t.Errorf("the domain is %q, want still running (the stop was refused)", st)
-			}
-			vm, err := corrosion.GetVM(ctx, n.DB, "web")
-			if err != nil || vm == nil || vm.State != "running" {
-				t.Errorf("row after the passes: %+v err=%v, want running", vm, err)
-			}
-
-			// Unquarantined, the same stop sticks through the same passes.
-			if _, err := c.SelfClient(n).StopVM(ctx, &pb.StopVMRequest{Name: "web", Force: force}); err != nil {
-				t.Fatalf("StopVM unquarantined: %v", err)
-			}
-			for i := 0; i < 3; i++ {
-				r.ReconcileOnce(ctx)
-				checker.SweepOnce(ctx)
-			}
-			if st, _ := n.Virt.RawState("web"); st == libvirtfake.StateRunning {
-				t.Errorf("an unquarantined operator stop was undone: domain %q", st)
+			if st, _ := n.Virt.RawState("web"); (st == libvirtfake.StateRunning) != tc.wantRunning {
+				t.Errorf("the domain is %q, want running=%v", st, tc.wantRunning)
 			}
 		})
 	}

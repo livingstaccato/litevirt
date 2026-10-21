@@ -227,3 +227,33 @@ func TestPromoteReplica_SameNameRemovedThenConfirmedProceeds(t *testing.T) {
 		t.Fatalf("promote of a VM whose removed host is confirmed off = %v; want it promoted", err)
 	}
 }
+
+// The steps a held promotion prints when its owner's fence record cannot be
+// read name `lv host fence-confirm <host>` before the promote: whether the
+// owner is proven off is unknown, and the promote alone is refused until it
+// is (ccguard round 4 re-check M4-1). The owner here is fenced proof-grade,
+// so only the failed read keeps the confirmation in the text.
+//
+// Mutation: a failed proof read prints the promote alone — red.
+func TestPromoteByHandSteps_ProofUnreadableNamesFenceConfirmFirst(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	ctx := adminCtx()
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "dead-host", Address: "10.0.0.79", State: "fenced"}); err != nil {
+		t.Fatal(err)
+	}
+	proveFencedOff(t, s, "dead-host")
+	vm := &corrosion.VMRecord{Name: "db", HostName: "dead-host", State: "running"}
+	const cmd = "lv replication promote db --pool dr --host node-1 --replica r --accept-not-point-in-time"
+	// Control: readable, proven off — the promote alone.
+	if got := s.promoteByHandSteps(ctx, vm, cmd); strings.Contains(got, "fence-confirm") || !strings.Contains(got, cmd) {
+		t.Fatalf("steps with the owner proven off = %q; want the promote alone", got)
+	}
+	if err := s.db.Execute(ctx, `ALTER TABLE fencing_log RENAME TO fencing_log_hidden`); err != nil {
+		t.Fatal(err)
+	}
+	got := s.promoteByHandSteps(ctx, vm, cmd)
+	c, p := strings.Index(got, "lv host fence-confirm dead-host"), strings.Index(got, cmd)
+	if c < 0 || p < 0 || c > p {
+		t.Fatalf("steps with the fence record unreadable = %q; want `lv host fence-confirm dead-host` before the promote", got)
+	}
+}

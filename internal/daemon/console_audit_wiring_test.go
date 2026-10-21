@@ -502,7 +502,112 @@ func TestRunWiresItsStopToItsServeWait(t *testing.T) {
 	}
 }
 
-// parseRun parses daemon.go and returns (*Daemon).Run.
+// executionOwnedRun unwraps only the actual first-return ownership boundary.
+// Parser-resolved receiver and parameter objects survive in the shallow copy,
+// so the existing coordinator/context/shutdown oracle remains unchanged.
+func executionOwnerSelector(e ast.Expr, pkg, name string) bool {
+	selector, ok := e.(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != name {
+		return false
+	}
+	qualifier, ok := selector.X.(*ast.Ident)
+	return ok && qualifier.Name == pkg
+}
+
+func executionOwnedRun(run *ast.FuncDecl) (*ast.FuncDecl, error) {
+	if run.Recv == nil || len(run.Recv.List) != 1 || len(run.Recv.List[0].Names) != 1 || run.Body == nil || len(run.Body.List) != 1 {
+		return nil, fmt.Errorf("Run must consist of its owned startup return")
+	}
+	receiver := runVar(run.Recv.List[0].Names[0])
+	ret, ok := run.Body.List[0].(*ast.ReturnStmt)
+	if !ok || len(ret.Results) != 1 {
+		return nil, fmt.Errorf("Run must return its owner continuation")
+	}
+	call, ok := ret.Results[0].(*ast.CallExpr)
+	if !ok || !isFuncCall(call, "withExecutionOwner") || len(call.Args) != 2 {
+		return nil, fmt.Errorf("Run must call the actual execution owner")
+	}
+	path, ok := call.Args[0].(*ast.CallExpr)
+	if !ok || len(path.Args) != 2 || !executionOwnerSelector(path.Fun, "filepath", "Join") {
+		return nil, fmt.Errorf("owner path must be the daemon journal")
+	}
+	data, ok := path.Args[0].(*ast.SelectorExpr)
+	if !ok || data.Sel.Name != "DataDir" {
+		return nil, fmt.Errorf("owner data directory missing")
+	}
+	config, ok := data.X.(*ast.SelectorExpr)
+	if !ok || config.Sel.Name != "cfg" || runVar(config.X) != receiver {
+		return nil, fmt.Errorf("owner must use the actual daemon config")
+	}
+	leaf, ok := path.Args[1].(*ast.BasicLit)
+	if !ok || leaf.Kind != token.STRING || leaf.Value != `"opjournal"` {
+		return nil, fmt.Errorf("owner journal path differs")
+	}
+	body, ok := call.Args[1].(*ast.FuncLit)
+	if !ok || body.Type.Params == nil || len(body.Type.Params.List) != 2 || body.Type.Results == nil || len(body.Type.Results.List) != 1 || exprString(body.Type.Results.List[0].Type) != "error" || len(body.Body.List) == 0 {
+		return nil, fmt.Errorf("owner continuation signature differs")
+	}
+	wantTypes := []string{"Journal", "ExecutionController"}
+	for i, f := range body.Type.Params.List {
+		pointer, ok := f.Type.(*ast.StarExpr)
+		if len(f.Names) != 1 || !ok || !executionOwnerSelector(pointer.X, "opjournal", wantTypes[i]) {
+			return nil, fmt.Errorf("owner continuation parameter differs")
+		}
+	}
+	install, ok := body.Body.List[0].(*ast.AssignStmt)
+	if !ok || install.Tok != token.ASSIGN || len(install.Lhs) != 2 || len(install.Rhs) != 2 {
+		return nil, fmt.Errorf("owner fields must be installed first")
+	}
+	for i, name := range []string{"opJournal", "executionController"} {
+		field, ok := install.Lhs[i].(*ast.SelectorExpr)
+		if !ok || field.Sel.Name != name || runVar(field.X) != receiver || runVar(install.Rhs[i]) != runVar(body.Type.Params.List[i].Names[0]) {
+			return nil, fmt.Errorf("owner field is not the actual supplied owner")
+		}
+	}
+	owned := *run
+	owned.Body = body.Body
+	return &owned, nil
+}
+
+func TestRunOwnershipWiringRejectsWrongContinuation(t *testing.T) {
+	const fixture = `package daemon
+func (d *Daemon) Run(ctx context.Context) error {
+ return withExecutionOwner(filepath.Join(d.cfg.DataDir,"opjournal"),func(j *opjournal.Journal,c *opjournal.ExecutionController)error{
+ d.opJournal,d.executionController=j,c
+ return nil
+ })
+}`
+	for _, tc := range []struct{ name, old, replacement string }{
+		{name: "correct"},
+		{"wrong-helper", "withExecutionOwner(", "otherOwner("},
+		{"wrong-config", "d.cfg.DataDir", "other.cfg.DataDir"},
+		{"wrong-path", `"opjournal"`, `"elsewhere"`},
+		{"wrong-owner", "d.opJournal,d.executionController=j,c", "d.opJournal,d.executionController=j,other"},
+		{"wrong-receiver", "d.opJournal,d.executionController=j,c", "other.opJournal,other.executionController=j,c"},
+		{"work-before-owner", "return withExecutionOwner", "work(); return withExecutionOwner"},
+		{"wrong-signature", "*opjournal.ExecutionController", "*OtherController"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := fixture
+			if tc.old != "" {
+				if strings.Count(source, tc.old) != 1 {
+					t.Fatal("mutation must match exactly once")
+				}
+				source = strings.Replace(source, tc.old, tc.replacement, 1)
+			}
+			file, err := parser.ParseFile(token.NewFileSet(), "owner-fixture.go", source, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = executionOwnedRun(file.Decls[0].(*ast.FuncDecl))
+			if (err == nil) != (tc.name == "correct") {
+				t.Fatalf("owner wiring result: %v", err)
+			}
+		})
+	}
+}
+
+// parseRun parses the actual owned startup body of (*Daemon).Run.
 func parseRun(t *testing.T) *ast.FuncDecl {
 	t.Helper()
 	file, err := parser.ParseFile(token.NewFileSet(), "daemon.go", nil, 0)
@@ -511,7 +616,11 @@ func parseRun(t *testing.T) *ast.FuncDecl {
 	}
 	for _, decl := range file.Decls {
 		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv != nil && fn.Name.Name == "Run" {
-			return fn
+			owned, err := executionOwnedRun(fn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return owned
 		}
 	}
 	t.Fatal("no (*Daemon).Run in daemon.go")

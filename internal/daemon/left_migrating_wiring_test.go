@@ -8,8 +8,8 @@ import (
 )
 
 // A row left migrating is named after the owned synchronous firmware recovery
-// took its VM locks. Both calls stay unconditional top-level startup steps,
-// outside the optional operation-journal branch. The coordinator's owned context
+// took its VM locks. Both calls stay unconditional direct steps of the verified
+// owned startup continuation. The coordinator's owned context
 // and delegation are part of the guarantee, not merely its method's spelling.
 // Mutation: drop/reorder/nest either Run call, duplicate/bypass recovery, make
 // its coordinator delegation asynchronous, or pass the unowned caller context.
@@ -27,6 +27,10 @@ func TestRunRaisesLeftMigratingAfterFirmwareMoveRecovery(t *testing.T) {
 	}
 	if run == nil {
 		t.Fatal("no (*Daemon).Run in daemon.go")
+	}
+	run, err = executionOwnedRun(run)
+	if err != nil {
+		t.Fatal(err)
 	}
 	counts := map[string]int{}
 	ast.Inspect(run.Body, func(n ast.Node) bool {
@@ -76,7 +80,7 @@ func TestRunRaisesLeftMigratingAfterFirmwareMoveRecovery(t *testing.T) {
 		}
 	}
 	if recoveryIndex < 0 || raiseIndex < 0 {
-		t.Fatal("coordinator recovery and raise must be direct Run statements outside the optional journal branch")
+		t.Fatal("coordinator recovery and raise must be direct owned startup statements")
 	}
 	if raiseIndex <= recoveryIndex {
 		t.Fatal("RaiseLeftMigrating must follow synchronous coordinator recovery")

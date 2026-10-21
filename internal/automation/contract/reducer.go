@@ -17,6 +17,7 @@ type Request struct {
 	Receipt  Receipt
 }
 type Projection struct {
+	Execution     *ExecutionProjection
 	Target        *TargetProjection
 	KeyTransition *KeyTransitionProjection
 	Binding       *BindingProjection
@@ -31,6 +32,10 @@ type Projection struct {
 	ReplayOriginal bool
 }
 type Reduction struct {
+	ExecutorEffect     *ExecutorGrant
+	ProgressEffect     *ExecutionProgress
+	TerminalEffect     *ExecutionTerminal
+	ArtifactEffects    []ArtifactRecord
 	TargetEffect       *TargetOperationRecord
 	TargetReservations []TargetReservation
 	EpochEffect        *KeyEpochRecord
@@ -108,6 +113,10 @@ func Reduce(p Projection, d Decision) (Reduction, error) {
 		out.Receipt.State = "rejected"
 	} else {
 		switch d.Command.Kind {
+		case "claim_executor", "record_progress", "complete_operation", "retire_artifact":
+			if err := reduceExecution(&out, p, d, a); err != nil {
+				return out, err
+			}
 		case LegacyRebuildCommand, OrdinaryCreateCommand:
 			if err := reduceTarget(&out, p, d, a); err != nil {
 				return out, err
@@ -144,6 +153,9 @@ func Reduce(p Projection, d Decision) (Reduction, error) {
 		}
 	}
 	if p.ReplayOriginal && out.Receipt != p.Existing.Receipt {
+		if executionKind(d.Command.Kind) {
+			return Reduction{}, codedError(CodeUnavailable)
+		}
 		return out, codedError(CodeUnavailable)
 	}
 	return out, nil

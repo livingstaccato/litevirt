@@ -42,7 +42,7 @@ func TestReducerRejectsIncompatibleHistory(t *testing.T) {
 	for _, kind := range []string{"admit_create", "admit_delete", "complete_operation", "unknown"} {
 		_, err := reduce(corrosion.AutomationProjection{}, Decision{Command: Command{Kind: kind, RequestID: "request"}})
 		want := CodeUnsupported
-		if kind == "admit_create" || kind == "adopt_resource" || kind == "transfer_owner" {
+		if kind == "admit_create" || kind == "adopt_resource" || kind == "transfer_owner" || kind == "complete_operation" {
 			want = CodeValidation
 		}
 		if Code(err) != want {

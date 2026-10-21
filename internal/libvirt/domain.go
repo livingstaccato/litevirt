@@ -2,6 +2,7 @@ package libvirt
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -43,6 +44,65 @@ func (c *Client) StartDomain(name string) error {
 		return fmt.Errorf("start domain %s: %w", name, err)
 	}
 	return startWithConsoleBackstop(c.virt, g, name, c.consoleDecision(), c.SetVNCPasswordUnavailable)
+}
+
+// StartDomainBound starts only the domain with the supplied ordinary UUID.
+// It is a local identity check, not certified admission or backend fencing.
+// A vanished original is never retried against a successor sharing its name.
+func (c *Client) StartDomainBound(name, expectedUUID string) error {
+	g, err := c.guard(name)
+	if err != nil {
+		return fmt.Errorf("start domain %s: %w", name, err)
+	}
+	return startDomainBound(c.virt, g, name, expectedUUID, c.consoleDecision(), c.SetVNCPasswordUnavailable)
+}
+
+func boundDomainUUID(value string) (golibvirt.UUID, error) {
+	var uuid golibvirt.UUID
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' || value != strings.ToLower(value) {
+		return uuid, fmt.Errorf("bound start requires canonical nonzero UUID")
+	}
+	raw, err := hex.DecodeString(strings.ReplaceAll(value, "-", ""))
+	if err != nil || len(raw) != len(uuid) {
+		return uuid, fmt.Errorf("bound start requires canonical nonzero UUID")
+	}
+	copy(uuid[:], raw)
+	if uuid == (golibvirt.UUID{}) {
+		return uuid, fmt.Errorf("bound start requires canonical nonzero UUID")
+	}
+	return uuid, nil
+}
+
+func startDomainBound(v snapshotAPI, g StartGuard, name, expectedUUID string, policy ConsolePolicy, unavailable func(string)) error {
+	uuid, err := boundDomainUUID(expectedUUID)
+	if err != nil {
+		return err
+	}
+	dom, err := v.DomainLookupByName(name)
+	if err != nil {
+		return fmt.Errorf("lookup domain %s: %w", name, err)
+	}
+	if dom.Name != name || dom.UUID != uuid {
+		return fmt.Errorf("bound start domain identity mismatch for %s", name)
+	}
+	return startBoundWithConsoleBackstop(v, g, dom, policy, unavailable)
+}
+
+// All effect closures retain the exact looked-up handle, including cleanup
+// after a paused guard or resume failure. No closure looks up the name again.
+func startBoundHandle(v snapshotAPI, g StartGuard, dom golibvirt.Domain) error {
+	return guardedStart(g, dom.Name, func(paused bool) error {
+		var err error
+		if paused {
+			_, err = v.DomainCreateWithFlags(dom, uint32(golibvirt.DomainStartPaused))
+		} else {
+			err = v.DomainCreate(dom)
+		}
+		if err != nil {
+			return fmt.Errorf("start domain %s: %w", dom.Name, err)
+		}
+		return nil
+	}, func() error { return v.DomainResume(dom) }, func() { _ = v.DomainDestroy(dom) })
 }
 
 // startDomainGuarded starts name through g.

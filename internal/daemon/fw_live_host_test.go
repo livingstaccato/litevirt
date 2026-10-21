@@ -169,6 +169,10 @@ func firmwareWiringError(daemonSource, workerSource, registrationSource string) 
 	if run == nil {
 		return fmt.Errorf("missing daemon Run")
 	}
+	run, err = executionOwnedRun(run)
+	if err != nil {
+		return err
+	}
 	if len(run.Type.Params.List) == 0 || len(run.Type.Params.List[0].Names) != 1 {
 		return fmt.Errorf("missing Run context")
 	}
@@ -237,8 +241,8 @@ func firmwareWiringError(daemonSource, workerSource, registrationSource string) 
 			return fmt.Errorf("missing %s", name)
 		}
 	}
-	// All but device recovery (inside the journal branch) must be direct Run
-	// statements. In particular initial recovery must not become asynchronous.
+	// Other than device recovery, every site must be a direct owned-startup
+	// statement. In particular initial recovery must not become asynchronous.
 	direct := map[string]bool{}
 	for _, statement := range run.Body.List {
 		var call *ast.CallExpr
@@ -258,7 +262,7 @@ func firmwareWiringError(daemonSource, workerSource, registrationSource string) 
 	}
 	for name := range wanted {
 		if name != "RecoverDeviceLeases" && !direct[name] {
-			return fmt.Errorf("%s must remain direct Run wiring", name)
+			return fmt.Errorf("%s must remain direct owned-startup wiring", name)
 		}
 	}
 	order := []string{"RecoverDeviceLeases", "recoverFirmwareMoves", "RecoverResourceOperationsAtStart", "RecoverHardwareOperationsAtStart", "RunDrainColdMoveRecovery", "startFirmwareSweeps", "MarkStartupWired", "startFirmwareMoveRecovery", "RegisterServices"}
@@ -446,7 +450,7 @@ func TestFirmwareWiringRejectsUnsafeDelegation(t *testing.T) {
 		{"wrong_context", "daemon", "dbWorkers.recoverFirmwareMoves(ctx)", "dbWorkers.recoverFirmwareMoves(other)"},
 		{"async_initial_recovery", "daemon", "dbWorkers.recoverFirmwareMoves(ctx)", "go dbWorkers.recoverFirmwareMoves(ctx)"},
 		{"late_initial_recovery", "daemon", "dbWorkers.recoverFirmwareMoves(ctx)", ""},
-		{"early_periodic_recovery", "daemon", "svc.MarkStartupWired()\n\tdbWorkers.startFirmwareMoveRecovery(ctx)", "dbWorkers.startFirmwareMoveRecovery(ctx)\n\tsvc.MarkStartupWired()"},
+		{"early_periodic_recovery", "daemon", "svc.MarkStartupWired()\n\t\tdbWorkers.startFirmwareMoveRecovery(ctx)", "dbWorkers.startFirmwareMoveRecovery(ctx)\n\t\tsvc.MarkStartupWired()"},
 		{"wrong_registration_service", "registration", "pb.RegisterLiteVirtServer(registrar, s)", "pb.RegisterLiteVirtServer(registrar, other)"},
 		{"missing_registration", "registration", "pb.RegisterLiteVirtServer(registrar, s)", ""},
 		{"wrong_registration_server", "daemon", "svc.RegisterServices(d.grpcSrv)", "svc.RegisterServices(other.grpcSrv)"},
@@ -468,7 +472,7 @@ func TestFirmwareWiringRejectsUnsafeDelegation(t *testing.T) {
 				}
 				*target = strings.Replace(*target, tc.old, tc.replacement, 1)
 				if tc.name == "late_initial_recovery" {
-					d = strings.Replace(d, "svc.MarkStartupWired()", "dbWorkers.recoverFirmwareMoves(ctx)\n\tsvc.MarkStartupWired()", 1)
+					d = strings.Replace(d, "svc.MarkStartupWired()", "dbWorkers.recoverFirmwareMoves(ctx)\n\t\tsvc.MarkStartupWired()", 1)
 				}
 			}
 			err := firmwareWiringError(d, w, r)

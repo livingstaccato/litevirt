@@ -128,6 +128,8 @@ type Daemon struct {
 	// artifacts only this host can restore); the startup recovery barrier reduces
 	// it against replicated state before runtime loops + API serving start.
 	opJournal *opjournal.Journal
+	// executionController owns the local execution journal for the entire Run lifetime.
+	executionController *opjournal.ExecutionController
 
 	// realmRegistry holds Local + every configured OIDC/LDAP realm.
 	// Login dispatches by name through this registry.
@@ -439,2031 +441,2054 @@ func boundedTelemetryShutdown(shutdown func(context.Context) error, timeout time
 	return shutdown(ctx)
 }
 
+// A successful close must preserve Run's exact ErrReExec/ErrUninstalled
+// identity: the CLI uses direct equality. A real close failure instead blocks
+// that successful dispatch and retains both causes for errors.Is inspection.
+func executionOwnerResult(result, closeErr error) error {
+	if closeErr == nil {
+		return result
+	}
+	return errors.Join(result, closeErr)
+}
+
+// withExecutionOwner establishes filesystem ownership before any startup work.
+// The continuation's defers finish before the owner is released; Close also
+// joins this controller's participating calls. Unrelated legacy workers and
+// independent backend requests are not thereby physically fenced.
+func withExecutionOwner(dir string, start func(*opjournal.Journal, *opjournal.ExecutionController) error) (result error) {
+	j, err := opjournal.Open(dir)
+	if err != nil {
+		return fmt.Errorf("operation journal: open before startup: %w", err)
+	}
+	controller, err := opjournal.OpenExecutionController(j)
+	if err != nil {
+		return fmt.Errorf("execution owner before startup: %w", err)
+	}
+	defer func() { result = executionOwnerResult(result, controller.Close()) }()
+	return start(j, controller)
+}
+
 func (d *Daemon) Run(ctx context.Context) error {
-	// Also cover package-local/test construction that bypasses NewContext.
-	if err := pki.RegisterDaemonHostDomain(ctx, d.cfg.PKIDir); err != nil {
-		return fmt.Errorf("host domain admission: %w", err)
-	}
-	// qemu writes UEFI vars files with no flush and libvirt has no cache mode
-	// for <nvram>: flush them from the first moment, so a host power cut
-	// loses at most about a second of a guest's UEFI variable writes.
-	nvramFlusher, stopNvramFlusher := d.startNvramFlusher(ctx)
-	defer stopNvramFlusher()
-	if err := d.checkMigrationNetwork(); err != nil {
-		return err
-	}
-	// Boot order is load-bearing: arm the post-upgrade watchdog FIRST, then run
-	// telemetry setup (which can block on a slow/unreachable collector — production
-	// sets none of the PROVIDE_*_TIMEOUT caps). If setup ran first and hung, a
-	// boot-hang would never roll back. Extracted to a helper so the ordering is
-	// unit-tested without a live daemon (see daemon_telemetry_test.go). Fail-open:
-	// a setup error degrades to local logging and never blocks boot.
-	// Assigned BEFORE the watchdog is armed: startUpgradeWatchdog (below) can
-	// spawn a goroutine that calls exit() while Setup is still running (or
-	// hung), so this field must never be nil/racing at that point. It reads
-	// telemetryShutdown — set at the bottom of this block, once Setup
-	// returns — via atomic.Pointer, so the closure itself is safe to assign
-	// once and call at any time; a call before Setup completes is a safe
-	// no-op instead of a lost-rollback-telemetry bug. Finding 7.
-	d.flushTelemetry = func() {
-		if fn := d.telemetryShutdown.Load(); fn != nil {
-			_ = boundedTelemetryShutdown(*fn, telemetryShutdownTimeout)
+	return withExecutionOwner(filepath.Join(d.cfg.DataDir, "opjournal"), func(j *opjournal.Journal, controller *opjournal.ExecutionController) error {
+		d.opJournal, d.executionController = j, controller
+		// Also cover package-local/test construction that bypasses NewContext.
+		if err := pki.RegisterDaemonHostDomain(ctx, d.cfg.PKIDir); err != nil {
+			return fmt.Errorf("host domain admission: %w", err)
 		}
-	}
-	shutdownTelemetry, terr := armWatchdogThenSetupTelemetry(
-		func() { d.startUpgradeWatchdog(ctx) },
-		func() (func(context.Context) error, error) {
-			return obs.Setup(ctx, obs.Config{
-				ServiceName:  "litevirt",
-				Version:      d.cfg.Version,
-				Environment:  d.cfg.Telemetry.Environment,
-				HostName:     d.cfg.HostName,
-				OTLPEndpoint: d.cfg.Telemetry.OTLPEndpoint,
-				SampleRate:   d.cfg.Telemetry.SampleRate,
-				LogLevel:     d.cfg.Telemetry.LogLevel,
-				LogFormat:    d.cfg.Telemetry.LogFormat,
-			})
-		},
-	)
-	if terr != nil {
-		slog.Warn("telemetry setup degraded to local logging", "error", terr)
-	}
-	d.telemetryShutdown.Store(&shutdownTelemetry)
-	// Every telemetry flush is bounded (abnormal os.Exit path and normal defer
-	// alike) so a wedged collector can't stall graceful stop / a rolling upgrade
-	// past systemd's TimeoutStopSec into SIGKILL.
-	defer func() { _ = boundedTelemetryShutdown(shutdownTelemetry, telemetryShutdownTimeout) }()
-	// Wire tracing dial options into every pki.PeerDial caller (including the
-	// corrosion replicator/anti-entropy dials, which pass none of their own —
-	// finding 8), now that obs.Setup has resolved whether tracing is active.
-	// Safe here: replication/anti-entropy start later in this method.
-	pki.SetTraceDialOptions(obs.ClientDialOptions)
-
-	// Finish or repair a host certificate renewal a crash interrupted
-	// (pki/hostswap.go), before anything reads host.crt/host.key. A pair that
-	// already loads is left alone.
-	if _, err := pki.RecoverHostIdentity(d.cfg.PKIDir, d.cfg.HostName); err != nil {
-		slog.Error("the host identity does not load and could not be recovered", "error", err)
-	}
-
-	// Pre-flight: refuse to start under a systemd unit that would kill
-	// child QEMU processes on stop. See preflight.go for the rationale.
-	if err := preflightUnitCheck(); err != nil {
-		return fmt.Errorf("preflight: %w", err)
-	}
-	// Pre-flight: if watchdog self-fencing is configured, refuse to start with a
-	// missing/unusable device so we don't discover it only at fence time.
-	if err := preflightWatchdog(d.cfg.WatchdogDev); err != nil {
-		return fmt.Errorf("preflight: %w", err)
-	}
-	// Pre-flight: detect that this binary is a rollback below a capability token
-	// this node already latched. Deliberately NOT fatal. Exiting non-zero here
-	// would, under the unit's OnFailure rollback, be a rollback loop; and the node
-	// has to stay up anyway so peers can see it degraded and an operator can reseed
-	// it. Fail-closed happens at the write path instead, wired below.
-	// Release probation (C1): rolled back below a safe_if_unused release token
-	// with no use in this replica. No replicated writes until a voter majority
-	// confirms (RunReleaseProbation, below).
-	if toks := BootRollbackCheck(ctx, d.cfg.DataDir, d.db); len(toks) > 0 {
-		d.rolledBackTokens = toks
-		slog.Error("preflight: this binary is a ROLLBACK below capability tokens this node "+
-			"already latched; entering WAL quarantine — no replicated writes will be emitted "+
-			"until this node is upgraded again or reseeded by an operator",
-			"tokens", toks)
-	}
-	// Install the quarantine before InitSchema so nothing this daemon does can
-	// emit. Local-only execs (schema DDL, replication apply) stay open by design,
-	// so a reseed still works.
-	d.db.SetWriteQuarantine(func() string {
-		if len(d.rolledBackTokens) == 0 {
-			return ""
+		// qemu writes UEFI vars files with no flush and libvirt has no cache mode
+		// for <nvram>: flush them from the first moment, so a host power cut
+		// loses at most about a second of a guest's UEFI variable writes.
+		nvramFlusher, stopNvramFlusher := d.startNvramFlusher(ctx)
+		defer stopNvramFlusher()
+		if err := d.checkMigrationNetwork(); err != nil {
+			return err
 		}
-		return "rolled back below latched token(s): " + strings.Join(d.rolledBackTokens, ",")
-	})
-
-	// Initialize corrosion schema
-	if err := corrosion.InitSchema(ctx, d.db); err != nil {
-		return fmt.Errorf("init schema: %w", err)
-	}
-	// Record, once, whether this node held users rows before anything could
-	// replicate in: the positive evidence an external-realm login needs on a
-	// node that is not credentials-live yet (corrosion/credentials_live.go).
-	if err := d.db.NoteCredentialsBaseline(ctx); err != nil {
-		return fmt.Errorf("record the credentials baseline: %w", err)
-	}
-
-	// Derive the cluster record from this node's CA if the cluster has none.
-	// Presence-gated and idempotent — see corrosion.EnsureClusterRecord for why
-	// it is derived rather than minted, and why it never rewrites a row.
-	d.ensureClusterRecord(ctx)
-
-	// Hold this host's audit rows while its own chain is still arriving, before
-	// anything can write one. Only a host re-added under an old name, whose
-	// CA-signed admission record (pki_dir/audit-rejoin.json, written by
-	// `lv host add`) names history this replica does not have yet, holds: a
-	// normal restart and a brand-new name never do. Without it a rebuilt host
-	// chains its first rows onto an empty tail and forks its chain for good
-	// (corrosion/audit_hold.go). Rows held across a restart are in the spool and
-	// land first.
-	d.configureAuditHold(ctx)
-	// Whether this replica holds the cluster's history, decided once per
-	// state.db: an existing member is seeded at its first start on this build;
-	// a fresh replica becomes seeded at genesis or by an exchange with a seeded
-	// peer (corrosion/audit_seeded.go). AdmitHost vouches only when seeded.
-	if _, err := corrosion.DecideAuditSeeded(ctx, d.db, d.cfg.HostName); err != nil {
-		slog.Error("could not decide whether this replica is seeded; it is treated as NOT seeded and "+
-			"does not vouch for audit chain positions until an exchange with a seeded peer", "error", err)
-	}
-	go d.runAuditSeeded(ctx)
-
-	// Before anything that writes an audit row is built: every writer signs with
-	// the keyring this installs on d.db.
-	d.wireAuditKeyring(ctx)
-
-	// An operator's seeded assertion is audited here, signed, exactly once: not
-	// in DecideAuditSeeded, which runs before the keyring exists.
-	if err := corrosion.RecordAuditSeededAssertion(ctx, d.db, d.cfg.HostName); err != nil {
-		slog.Error("could not audit this replica's seeded assertion; retried at the next start",
-			"error", err)
-	}
-
-	// After the keyring: rows an earlier process left in the spool may land on
-	// the first poll, and landed before it they would be written unsigned
-	// (runAuditHold also waits for the wiring, whatever the order here).
-	go d.runAuditHold(ctx)
-
-	// Re-base THIS host's audit sub-chain at startup — but ONLY when it is
-	// still entirely unsigned.
-	//
-	// This used to run unconditionally, and that was the single biggest hole in
-	// the audit log's tamper-evidence: reseal recomputes hashes from whatever
-	// the rows currently say, so an attacker with database write access could
-	// edit a row, wait for (or cause) a restart, and have the daemon itself
-	// rewrite the chain around the edit. `lv audit verify` then came back clean.
-	//
-	// Reseal now exists solely to heal rows written under the old global-chain
-	// model, which were never tamper-evident to begin with. Once a host has any
-	// signed row, its chain is verified rather than repaired: a hash that does
-	// not recompute is a FINDING, and rewriting it would destroy the only
-	// evidence that anything happened. resealHostChainLocked enforces the same
-	// rule per row, in the SQL as well as in Go, because the statement
-	// replicates.
-	if signed, err := corrosion.HostHasSignedAuditRows(ctx, d.db, d.cfg.HostName); err != nil {
-		slog.Warn("could not determine audit chain signing state", "error", err)
-	} else if signed {
-		slog.Debug("audit: chain is signed; skipping the legacy reseal", "host", d.cfg.HostName)
-		d.db.NoteAuditResealNotNeeded(d.cfg.HostName)
-	} else if n, err := corrosion.ResealAuditChain(ctx, d.db, d.cfg.HostName); errors.Is(err, corrosion.ErrAuditChainNotCaughtUp) {
-		// A rebuilt host whose history has not arrived: a reseal of a partial
-		// replica would rewrite rows its peers hold intact.
-		slog.Info("audit: skipping the legacy reseal while this host's audit history is still arriving",
-			"host", d.cfg.HostName)
-	} else if err != nil {
-		// Logged, not fatal. Until a reseal succeeds the legacy tail is not
-		// anchored (corrosion.ErrAuditAnchorWithheld): an anchor over the
-		// un-rebased tail would read as a truncation once it is rebased.
-		slog.Warn("audit chain reseal at startup failed; the legacy chain is not anchored until a restart reseals it", "error", err)
-	} else if n > 0 {
-		slog.Info("audit: re-based legacy unsigned rows at startup",
-			"host", d.cfg.HostName, "rows", n)
-	}
-
-	// Repair any private key this node holds that other local users can read.
-	//
-	// Unconditional, because the damage was: `lv host init root@<host>` pushed
-	// host.key mode 0644 on every node it provisioned, and host.key is the
-	// peer-mTLS identity — any local user on such a node could impersonate it to
-	// the cluster. The push path is fixed, but nobody re-provisions an existing
-	// cluster, so a repair at start is the only thing that reaches one. It used
-	// to hang off enforcement.audit_signature, which then defaulted to false, so an
-	// operator who upgraded specifically for this fix got neither the repair nor
-	// a warning.
-	if err := pki.TightenPrivateKeys(d.cfg.PKIDir); err != nil {
-		slog.Error("a private key in the PKI directory is readable by other local users and "+
-			"could not be tightened", "error", err)
-	}
-
-	// Set up libvirt TLS symlinks so qemu+tls:// migration works
-	// using our existing PKI certs. Best-effort — log warning if it fails.
-	if err := pki.SetupLibvirtTLS(d.cfg.PKIDir); err != nil {
-		slog.Warn("failed to set up libvirt TLS certs", "error", err)
-	}
-
-	// Seed admin user on first start (if no users exist).
-	if err := d.seedAdminUser(ctx); err != nil {
-		slog.Warn("failed to seed admin user", "error", err)
-	}
-
-	// seed the built-in RBAC roles (Admin, Operator, Viewer,
-	// Auditor, BackupOperator, NetworkAdmin, VMOperator, NoAccess) and
-	// initialize the auth engine. The engine reloads on daemon start, then
-	// mid-run: local grants reload synchronously, local revokes/deletes apply
-	// in-memory deltas, and runAuthEngineReload (below) is the ~30s backstop
-	// that picks up peer-replicated mutations.
-	if err := auth.SeedBuiltinRoles(ctx, d.db); err != nil {
-		slog.Warn("failed to seed built-in roles", "error", err)
-	}
-	d.authEngine = auth.NewEngine(d.db)
-	if err := d.authEngine.Reload(ctx); err != nil {
-		slog.Warn("failed to load role bindings", "error", err)
-	}
-
-	// build the realm registry from auth.realms YAML. The
-	// "local" realm is always installed by BuildRegistry; OIDC/LDAP
-	// realms come from config. A realm that fails to construct (e.g.
-	// OIDC issuer unreachable at startup) downgrades to a warning so
-	// the daemon can still serve local-only Logins; the operator gets
-	// to see the error and fix the config without the daemon refusing
-	// to start.
-	registry, err := auth.BuildRegistry(ctx, d.db, d.cfg.Auth.Realms)
-	if err != nil {
-		slog.Warn("auth.realms config failed; falling back to local-only", "error", err)
-		registry = auth.NewRegistry()
-		registry.Register(auth.NewLocalRealm(d.db))
-	}
-	d.realmRegistry = registry
-	if names := registry.Names(); len(names) > 0 {
-		slog.Info("auth realms ready", "realms", names)
-	}
-
-	// The membership split gate goes in BEFORE this host's first write. The
-	// boot state below is a state write, and on a node that has already split
-	// it must reach host_membership too. Written to hosts.state alone, this
-	// node's own host_membership row would miss it until anti-entropy.
-	d.wireHostMembershipGate()
-	d.wireHostMembershipRetireGate()
-	// Likewise the runtime split gate: the boot report below is a runtime
-	// write, and on a node that has already split it must reach host_runtime.
-	d.wireHostRuntimeGate()
-	d.wireHostRuntimeRetireGate()
-
-	// The own-row hold goes in before this host's first own-row write
-	// (corrosion/own_row_hold.go).
-	d.configureOwnRowHold(ctx)
-	// Register this host in corrosion
-	if err := d.registerHost(ctx); err != nil {
-		slog.Warn("failed to register host", "error", err)
-	}
-	// And correct the address if it has changed since the row was created —
-	// registerHost is an INSERT, so it cannot.
-	if err := d.reconcileHostAddress(ctx); err != nil {
-		slog.Warn("could not reconcile this host's recorded address", "error", err)
-	}
-	// Write boot state in ONE batched mutation: state + version (+ resources if the
-	// probe succeeded) share a single updated_at. Doing these as separate writes in
-	// the same wall-clock second produced equal updated_at values, and on a peer the
-	// later writes lost the LWW tie and were stranded (a re-exec upgrade's new
-	// version never propagated). InsertHost is a no-op if the row already exists, so
-	// this explicit write is what carries the new state/version after a re-exec.
-	cpus, memMiB, niErr := d.virt.NodeInfo()
-	diskGiB := 0
-	if niErr == nil {
-		diskGiB = d.sumPoolDiskTotalGiB(ctx)
-	} else {
-		slog.Warn("NodeInfo failed at startup; writing host state without resources", "error", niErr)
-	}
-	// On an upgrade boot, stay "upgrading" until the watchdog confirms local gRPC
-	// is healthy (it flips to "active"); version + resources are still written
-	// here either way so the new version propagates immediately. After a
-	// graceful stop (SIGTERM), or a crash of an active host, the host likewise
-	// stays "upgrading" until this daemon answers its own Ping
-	// (awaitServingThenActivate): recorded active
-	// before its gRPC server listened, it was fenced on the failure count its
-	// observers carried through the restart (hostboot).
-	d.bootRes.mu.Lock()
-	d.bootRes.cpus, d.bootRes.memMiB, d.bootRes.diskGiB, d.bootRes.hasResources = cpus, memMiB, diskGiB, niErr == nil
-	d.bootRes.mu.Unlock()
-	bootCtx, stopBootCheck := context.WithCancel(ctx)
-	bootDone := d.checkerThenBootWrite(bootCtx, cpus, memMiB, diskGiB, niErr == nil)
-	ownRowDone := d.startOwnRowHold(bootCtx)
-	defer func() { stopBootCheck(); <-bootDone; <-ownRowDone }()
-	// Record version on the corrosion client so it goes into Crescent
-	// peer handshakes (used by skew detection).
-	d.db.SetLocalVersion(d.cfg.Version)
-
-	// Register storage pools in the cluster DB and start periodic refresh.
-	// Their statfs and path resolutions are bounded (poolStatfs,
-	// storage.Bounded). The in-place hardening of an NFS mount runs a remount
-	// command, and is waited for only up to startupStepBound
-	// (startup_bound.go).
-	d.registerStoragePools(ctx)
-	awaitStartupStep("harden NFS pool mounts", startupStepBound, func() { d.hardenNFSPoolMounts(ctx) })
-	d.refreshDBPoolCapacity(ctx)
-	go d.refreshStoragePools(ctx)
-
-	// Install the anti-entropy timing sink on the Client BEFORE starting the
-	// replicator / anti-entropy loops (and the gRPC server) that read it — the
-	// field is set-once-then-read, so wiring it here establishes happens-before
-	// and avoids a data race with those goroutines. It lives on the Client so
-	// dumps served directly through grpcapi (DumpStateBytes / StreamStateDump)
-	// are observed too.
-	d.db.SetSyncMetrics(metrics.NewAntiEntropyMetrics())
-
-	// The host health checker was created (above, before the boot write) BEFORE
-	// the replicator so the proof-table WAL gate is installed before any
-	// replication goroutine runs (a nil gate fails closed, but wiring it up front
-	// means no reliance on that), with the durable split-brain activation latch
-	// loaded before any runtime work is wired, so a previously-enforced node that
-	// restarts (including mid-partition) gates onboot VM starts / LB (re)apply
-	// instead of running them ungated. (Peer capability is wired later via
-	// SetPeerPinger; until then PeerSupports fails closed, so proof WAL entries
-	// defer rather than leak — never a schema-version guess.)
-	gateMetrics := metrics.NewRuntimeGateMetrics()      // shared by all gate observers
-	stateWriteMetrics := metrics.NewStateWriteMetrics() // shared by all state-write observers
-
-	// Start WAL-based replicator with Crescent relay protocol.
-	// One relay election for both the replicator and anti-entropy, whose
-	// scheduled pass always contacts this node's relays.
-	relayCfg := corrosion.RelayConfig{
-		BaseRelays:      3,
-		NodesPerRelay:   50,
-		FallbackTimeout: 15 * time.Second,
-	}
-	repl := corrosion.NewReplicator(d.db, d.cfg.PKIDir, relayCfg)
-	// Token-based (fresh-Ping-cached) gate for proof-table WAL replication, wired
-	// BEFORE Start: only send runtime_action_proofs mutations to a peer that
-	// advertises the gate. Fail-closed until SetPeerPinger (below) — proofs defer.
-	repl.SetProofReplicaGate(func(ctx context.Context, peer string) bool {
-		return d.checker.PeerSupports(ctx, peer, capabilities.SplitBrainGateV1)
-	})
-	// LWW future-skew quarantine (partial): enabled only once LWWSkewGuardV1 has
-	// latched on this node (cheap marker read, no ping/I/O), so a future-skewed peer's
-	// rows can't win a conflict. The token is advertised, so enforcement is gated on the
-	// enforcement.lww_skew_guard config flag AND the latch — behavior-neutral until an
-	// operator enables it (and the flag is the reversible kill switch).
-	// NOTE: does not address the backward-clock case (NowTS still emits wall-clock) —
-	// that's deferred to a separate conflict-key migration.
-	d.db.SetHLCSkewGuard(func() bool {
-		// Config kill-switch AND the latched capability (the HA monitor drives the
-		// latch while healthy). Latched (not Enforced) keeps this merge-hot-path read
-		// off any peer dial.
-		return d.cfg.Enforcement.LWWSkewGuard && d.checker.Latched(capabilities.LWWSkewGuardV1)
-	})
-	// Emit the LWW conflict key (updated_at) as HLC instead of RFC3339Nano once
-	// enforcement.hlc_lww is set AND the token has latched cluster-wide (the HA monitor
-	// drives the latch while healthy). Cheap Latched read on the per-write path; the
-	// instant-based comparator makes the RFC3339↔HLC switch and a flag-off rollback safe.
-	d.db.SetHLCEmit(func() bool {
-		return d.cfg.Enforcement.HLCLww && d.checker.Latched(capabilities.HLCLwwV1)
-	})
-	// Emit the order-invariant digest_v2 hashes unless enforcement.digest_v2 is
-	// explicitly off (it defaults on). No capability latch: v2 is negotiated PAIRWISE by wire-field presence (each node emits
-	// v2 only when locally enabled; two peers compare v2 only when both emitted it), so a
-	// non-uniform rollout only affects which node initiates a pull, never a decision.
-	d.db.SetDigestV2Enabled(func() bool { return d.cfg.Enforcement.DigestV2 })
-	// Resolve the natural-key identity tables (snapshots, container_snapshots) by their UNIQUE
-	// natural key once enforcement.canonical_identity is set AND the token has latched
-	// cluster-wide. Unlike digest_v2 this is NOT pairwise-negotiated — identity resolution
-	// mutates shared state, so a per-sender flip would be non-convergent; it must be
-	// fleet-uniform, which the cluster-wide latch guarantees. Cheap Latched read (no peer dial)
-	// on the merge/apply hot path; the config flag is the reversible kill switch.
-	d.db.SetCanonicalIdentity(func() bool {
-		return d.cfg.Enforcement.CanonicalIdentity && d.checker.Latched(capabilities.CanonicalIdentityV1)
-	})
-
-	d.wireCorrosionGates()
-
-	// Migrate legacy unscoped network names to stack-scoped names. After the
-	// gates: its VM spec rewrites are desired-spec edits, which carry their
-	// owner epoch once spec_conflict_v1 has latched, so receivers order them
-	// by generation rather than by the row clock.
-	if err := corrosion.MigrateLegacyNetworkNames(ctx, d.db); err != nil {
-		slog.Warn("failed to migrate legacy network names", "error", err)
-	}
-
-	// Apply a replicated guarded VM-name replacement once vm_replace_v1 is DURABLY
-	// LATCHED. Durable, not Latched or the config flag: a replace batch already on
-	// the wire must not become unacceptable across a restart — a node that latched
-	// only in memory would reload no marker and refuse it — or it stalls that
-	// sender's stream forever.
-	d.db.SetVMReplaceAccept(func() bool {
-		return d.checker.DurablyLatched(capabilities.VMReplaceV1)
-	})
-	d.db.SetVMSnapshotClaimCapability(func() bool {
-		return d.checker.DurablyLatched(capabilities.VMSnapshotClaimV1)
-	}, func(ctx context.Context) bool {
-		// Enforced drives/retries persistence; it is not the fresh emission check.
-		if !d.checker.Enforced(ctx, capabilities.VMSnapshotClaimV1) ||
-			!d.checker.DurablyLatched(capabilities.VMSnapshotClaimV1) {
-			return false
+		// Boot order is load-bearing: arm the post-upgrade watchdog FIRST, then run
+		// telemetry setup (which can block on a slow/unreachable collector — production
+		// sets none of the PROVIDE_*_TIMEOUT caps). If setup ran first and hung, a
+		// boot-hang would never roll back. Extracted to a helper so the ordering is
+		// unit-tested without a live daemon (see daemon_telemetry_test.go). Fail-open:
+		// a setup error degrades to local logging and never blocks boot.
+		// Assigned BEFORE the watchdog is armed: startUpgradeWatchdog (below) can
+		// spawn a goroutine that calls exit() while Setup is still running (or
+		// hung), so this field must never be nil/racing at that point. It reads
+		// telemetryShutdown — set at the bottom of this block, once Setup
+		// returns — via atomic.Pointer, so the closure itself is safe to assign
+		// once and call at any time; a call before Setup completes is a safe
+		// no-op instead of a lost-rollback-telemetry bug. Finding 7.
+		d.flushTelemetry = func() {
+			if fn := d.telemetryShutdown.Load(); fn != nil {
+				_ = boundedTelemetryShutdown(*fn, telemetryShutdownTimeout)
+			}
 		}
-		ready, _ := d.checker.CapabilityActive(ctx, capabilities.VMSnapshotClaimV1)
-		return ready
-	})
-	// Every push declares this build's release tokens from the first one
-	// (I-R2-2): the server, which wires the live advertisement, is built later,
-	// and a push that declared nothing would be refused by every peer with a
-	// release feature in use.
-	repl.SetAdvertisedCapabilities(capabilities.ReleaseTokens)
-	repl.Start(ctx)
-
-	// Audit key lifecycle, deferred until replication is running.
-	//
-	// Adoption and retirement both record a SEQUENCE, and both are permanent:
-	// records are append-only and the strictest verified value wins, so a boundary
-	// taken from a local tail that is behind the cluster can never be corrected.
-	// Running this before the replicator meant a rebuilt or snapshot-restored node
-	// pinned its contract start — or its predecessor's retirement — below its own
-	// real history, and every row in the gap became a permanent finding on every
-	// node the moment anti-entropy delivered it.
-	go d.finishAuditKeyLifecycle(ctx)
-
-	// Fold what `lv user reset-admin` journalled while this daemon could not be
-	// reached, signed and at the time it happened (corrosion/pending_audit.go).
-	go d.runPendingAuditFold(ctx)
-
-	// Move the secret columns onto the sensitive lane once credentials_split_v1
-	// has durably latched, and empty them once credentials_clear_v1 has too.
-	// Inert until then; see corrosion.SplitCredentials.
-	go d.runCredentialsSplit(ctx)
-
-	// Give host state and isolation their own row once host_membership_split_v1
-	// has durably latched. Inert until then; see corrosion.SplitHostMembership.
-	go d.runHostMembershipSplit(ctx)
-
-	// Give the host's own reports (version, schema version, resource totals)
-	// their own row once host_runtime_split_v1 has durably latched. Inert
-	// until then; see corrosion.SplitHostRuntime.
-	go d.runHostRuntimeSplit(ctx)
-
-	// Restore "at least one live admin" after racing deletes on two nodes
-	// (corrosion/admin_floor.go).
-	go d.runAdminFloor(ctx)
-
-	// Start anti-entropy (periodic digest comparison + full sync as safety net).
-	// Interval is operator-configurable (anti_entropy_interval_sec); 0 → 60s
-	// default inside NewAntiEntropy. (P2-2)
-	ae := corrosion.NewAntiEntropy(d.db, d.cfg.PKIDir, time.Duration(d.cfg.AntiEntropyIntervalSec)*time.Second)
-	ae.SetRelayConfig(relayCfg)
-	ae.SetLegacyRepair(d.cfg.AntiEntropyLegacyRepair)
-	go ae.Start(ctx)
-	// Release probation (entered only from a marker at boot) is lifted only by
-	// asking a voter majority.
-	go RunReleaseProbation(ctx, d.db, ae)
-
-	// Start metrics server. Create the LXC runner ONCE here and share it with the
-	// gRPC container adapter + health checker below, so the metrics collector can
-	// also read live container cgroup usage (host-local, no RPC).
-	lxcRunner := lxc.NewLxcRunner()
-	lxcRunner.HostName = d.cfg.HostName
-	lxcRunner.DefaultPidsMax = d.cfg.Containers.DefaultPidsMax
-	lxcRunner.IDMappedRootfs = d.cfg.Containers.IDMappedRootfs
-	lxcRunner.HostAccess = d.cfg.Containers.hostAccess(d.cfg.DataDir, d.cfg.PKIDir)
-	lxcRunner.HostAccess.Deny = append(lxcRunner.HostAccess.Deny, d.storeDenyStatic()...)
-	lxcRunner.HostAccess.DenyFunc = d.storeDenyDynamic
-	lxcRunner.HostAccess.BlockInUse = d.vmDiskBlockInUse
-	// In the background: it stats every protected tree, backup repos
-	// included, and one of those may be on an NFS mount whose server does not
-	// answer (startup_bound.go).
-	go func(ha lxc.HostAccess) { d.noteHostAccessOverlaps(ctx, lxc.HostAccessOverlaps(ha)) }(lxcRunner.HostAccess)
-	go refreshHookPolicies(ctx, lxcRunner)
-	// What a crash left of a recreate's image fetch, and of a pull replacing
-	// an OCI library item: before any create can read either.
-	if err := lxcRunner.SweepFetchDir(); err != nil {
-		slog.Warn("container image fetch: could not clear what an earlier run left staged", "error", err)
-	}
-	if err := lxc.RecoverOCILibrary(filepath.Join(d.cfg.DataDir, storage.OCILibraryDir)); err != nil {
-		slog.Warn("oci library: could not finish what an interrupted pull left", "error", err)
-	}
-	lxcRunner.SubIDSpan = &lxc.IDMap{Base: d.cfg.Containers.IDMapBase, Size: int64(d.cfg.Containers.IDMapRanges) * lxc.IDMapSize}
-	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)
-	d.metrics.SetReplicationTargets(repl.Targets)
-	d.metrics.SetRelayRoles(repl.RelayRoles)
-	d.metrics.SetParkedEntries(repl.ParkedCounts)
-	// metrics_port: 0 DISABLES the endpoint, matching rest_port below and what
-	// docs/configuration.md says about it. Without the guard, 0 composed ":0"
-	// and bound an EPHEMERAL port on every interface — an unauthenticated
-	// inventory endpoint on an unpredictable port, which is the opposite of
-	// what an operator setting 0 is asking for, and the exposure warning then
-	// named port 0, so the one datum needed to firewall it was useless.
-	if d.cfg.MetricsPort > 0 {
-		go d.metrics.Start()
-	} else {
-		slog.Info("metrics endpoint disabled (metrics_port: 0)")
-	}
-
-	// Start the host health checker (created above, before the replicator).
-	go d.checker.Start(ctx)
-
-	// One capacity policy shared by admission (svc below), failover, and the
-	// rebalancer, so placement and admission can never disagree.
-	capacity := d.cfg.Capacity.Policy()
-
-	// Create the failover coordinator; started after the gRPC server is built
-	// so its replica-promoter (auto_promote recovery) can be wired first.
-	fc := failover.NewCoordinator(d.cfg.HostName, d.db)
-	fc.SetCapacityPolicy(capacity)
-	// The relay-health floor is the replicator's own BaseRelays.
-	fc.RelayConfig = relayCfg
-
-	// Start snapshot scheduler. Leader-gated like the
-	// rebalancer; the runner is wired below once the gRPC Server is
-	// constructed (it reuses lockVM + pickDisk).
-	d.snapScheduler = scheduler.NewSnapshotScheduler(d.db, d.cfg.HostName, nil /* runner set after server build */)
-
-	// Create the VM health checker (event bus wired after gRPC server is created
-	// below). Gate restart-policy starts on local quorum (once enforced). The sweep
-	// loop is NOT started here — it launches below, only after the full gate
-	// (SetPeerPinger) and its callbacks are wired, so a gated runtime start never
-	// runs in a window where capability can't yet be confirmed.
-	vmChecker := health.NewVMChecker(d.cfg.HostName, d.cfg.DataDir, d.db, d.virt)
-	vmChecker.SetGate(d.checker)
-	vmChecker.SetGateRefusedObserver(gateMetrics.Refused)
-	vmChecker.SetStateWriteFailObserver(stateWriteMetrics.Failed)
-
-	// Start libvirt reconnect loop — auto-reconnects if libvirtd restarts (#42).
-	go d.virt.StartReconnectLoop(ctx)
-
-	// Can this host's QEMU do a VNC console password? A FIPS-mode host has no
-	// DES for VNC authentication and would refuse every passworded start, so
-	// it sets none and reports console_password_v1 in not_enforcing
-	// (docs/ui.md "Console passwords"). Asynchronous: until it answers, a
-	// refused start is still caught by the start backstop.
-	if reason := libvirt.SpiceUnusableReason(); reason != "" {
-		slog.Warn("SPICE consoles cannot connect on this host; VMs still run and VNC still works", "reason", reason)
-	}
-	go func() {
-		defer d.virt.MarkVNCProbed()
-		if reason := libvirt.ProbeVNCPassword(ctx); reason != "" {
-			d.virt.SetVNCPasswordUnavailable(reason)
-			slog.Warn("this host cannot give VNC consoles a password; they stay open here (SPICE keeps its own)",
-				"reason", reason)
+		shutdownTelemetry, terr := armWatchdogThenSetupTelemetry(
+			func() { d.startUpgradeWatchdog(ctx) },
+			func() (func(context.Context) error, error) {
+				return obs.Setup(ctx, obs.Config{
+					ServiceName:  "litevirt",
+					Version:      d.cfg.Version,
+					Environment:  d.cfg.Telemetry.Environment,
+					HostName:     d.cfg.HostName,
+					OTLPEndpoint: d.cfg.Telemetry.OTLPEndpoint,
+					SampleRate:   d.cfg.Telemetry.SampleRate,
+					LogLevel:     d.cfg.Telemetry.LogLevel,
+					LogFormat:    d.cfg.Telemetry.LogFormat,
+				})
+			},
+		)
+		if terr != nil {
+			slog.Warn("telemetry setup degraded to local logging", "error", terr)
 		}
-	}()
+		d.telemetryShutdown.Store(&shutdownTelemetry)
+		// Every telemetry flush is bounded (abnormal os.Exit path and normal defer
+		// alike) so a wedged collector can't stall graceful stop / a rolling upgrade
+		// past systemd's TimeoutStopSec into SIGKILL.
+		defer func() { _ = boundedTelemetryShutdown(shutdownTelemetry, telemetryShutdownTimeout) }()
+		// Wire tracing dial options into every pki.PeerDial caller (including the
+		// corrosion replicator/anti-entropy dials, which pass none of their own —
+		// finding 8), now that obs.Setup has resolved whether tracing is active.
+		// Safe here: replication/anti-entropy start later in this method.
+		pki.SetTraceDialOptions(obs.ClientDialOptions)
 
-	// Register domain event callback for immediate VM death detection (#44).
-	eventHandler := health.NewDomainEventHandler(d.cfg.HostName, d.db)
-	eventHandler.SetStateWriteFailObserver(stateWriteMetrics.Failed)
-	d.virt.RegisterDomainEventCallback(eventHandler.Callback(ctx))
-
-	// Create the VM reconciler (picks up "pending" VMs from failover and starts
-	// them). Wire the split-brain gate now, but DON'T start the reconcile loop or
-	// onboot autostart yet — they launch below, after SetPeerPinger and the
-	// reconciler's callbacks (LB refresh, image pull, firmware paths) are wired, so
-	// an isolated/latched restart can't run automated starts before the gate can
-	// confirm capability.
-	reconciler := health.NewReconciler(d.cfg.HostName, d.cfg.DataDir, d.db, d.virt)
-	reconciler.SetGate(d.checker)
-	reconciler.SetOwnerEpochBackfill(d.cfg.Enforcement.OwnerEpoch) // Phase 4 backfill pass
-	// Unconditional: the out-of-band stop sync waits until this node's replica
-	// has caught up with a peer (anti-entropy, above) since start / last rejoin.
-	reconciler.SetReplicaFreshness(d.db.ReplicaCaughtUp)
-	reconciler.SetGateRefusedObserver(gateMetrics.Refused)
-	reconciler.SetStateWriteFailObserver(stateWriteMetrics.Failed)
-	reconciler.SetSharedStorageFenceEnforce(d.cfg.Enforcement.SharedStorageFence) // shared-disk transfer fence kill-switch
-
-	// Daily prune of this host's vm_events rows so the operational event store
-	// stays bounded (see config vm_event_*).
-	go d.runVMEventPrune(ctx)
-
-	// Hourly local GC of superseded/orphaned auth + LB rows (re-enroll / LB-recreate
-	// churn). Local-only deterministic deletes — runs on every node.
-	go d.runSupersededGC(ctx, metrics.NewGCMetrics())
-
-	// Hourly removal of the disk copies a failover start set aside here, once
-	// past superseded_disk_retention_days (health/superseded_retention.go).
-	go d.runSupersededDiskSweep(ctx)
-
-	// A UEFI vars file whose flush failed is a host condition
-	// (nvram_flush_failed); the flusher itself started with Run.
-	go d.runNvramFlushCondition(ctx, nvramFlusher)
-
-	// Sample this host's aggregate disk/net rates into host_runtime_usage for the
-	// placement engine's DiskIOPS/NetBW dimensions.
-	go d.runRuntimeUsageSampler(ctx)
-
-	// Backstop reload of the RBAC engine so peer-replicated role/binding
-	// mutations take effect without a restart (local grants/revokes already
-	// apply synchronously via reload/delta in the handlers).
-	go d.runAuthEngineReload(ctx)
-
-	// Install any cluster CRL this node is missing. Removing a host revokes its
-	// certificate, and a revocation that never arrives is a decommissioned node
-	// still holding a working peer credential.
-	go d.runCRLSync(ctx)
-
-	// Keep the live gossip keyring in step with pki_dir/gossip.key, and report
-	// what it is using to pki_dir/gossip-keyring.state — the barrier
-	// `lv host rotate-gossip-key` waits on between phases. Runs when gossip
-	// encryption is off too, so the rotate and install commands can tell an
-	// off node from one that never started.
-	go d.db.WatchGossipKeyFile(ctx,
-		filepath.Join(d.cfg.PKIDir, pki.GossipKeyName),
-		filepath.Join(d.cfg.PKIDir, pki.GossipKeyringStateName),
-		gossipKeyReloadInterval)
-
-	// Publish this host's signed audit chain head periodically and at shutdown.
-	// Nothing else can detect a truncated tail: the hash chain links backward,
-	// so removing the last N rows leaves every surviving link verifying.
-	go d.runAuditChainHeads(ctx)
-
-	// Verify this node's view of the audit chain on a schedule and publish the
-	// result. A check that only runs when an operator asks for it finds an
-	// intrusion after the incident that prompted them to look.
-	go d.runAuditChainVerify(ctx)
-
-	// Start embedded DNS server, and tell the network layer to chain per-bridge
-	// dnsmasq instances to it for the litevirt domain so guests can resolve
-	// VM/container/anycast names (SetLocalResolver must precede network provisioning).
-	dnsSrv := dns.NewServer(d.cfg.DNSDomain, d.cfg.DNSPort, d.db)
-	network.SetLocalResolver(d.cfg.DNSDomain, d.cfg.DNSPort)
-	go dnsSrv.Start(ctx)
-
-	// Start hardware watchdog heartbeat (optional). The controller lets Phase-2 VIP
-	// self-demotion trip a self-fence when a demotion can't be confirmed.
-	watchdogCtrl := watchdog.NewController()
-	// Clean-shutdown disarm hole (§B Phase 5): only a host that owns nothing may
-	// disarm on SIGTERM. A restart re-pets inside the timeout; a stop that
-	// abandons running workloads lets the watchdog reboot the host into a safely
-	// fenced state. Probe errors count as NOT owned — the probe runs through the
-	// same clients the daemon manages workloads with, so a host that cannot
-	// answer is overwhelmingly one with no runtime at all (containers-only or
-	// fresh hosts must not reboot on every daemon stop). VIP ownership is not
-	// yet probed here — Phase 5 adds it with the quorum-gated handoff.
-	watchdogCtrl.SetOwnershipCheck(func() bool {
-		if names, err := d.virt.ListRunningDomains(); err == nil && len(names) > 0 {
-			slog.Warn("watchdog: refusing shutdown disarm — running VMs owned", "count", len(names))
-			return true
+		// Finish or repair a host certificate renewal a crash interrupted
+		// (pki/hostswap.go), before anything reads host.crt/host.key. A pair that
+		// already loads is left alone.
+		if _, err := pki.RecoverHostIdentity(d.cfg.PKIDir, d.cfg.HostName); err != nil {
+			slog.Error("the host identity does not load and could not be recovered", "error", err)
 		}
-		probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer probeCancel()
-		if names, err := lxcRunner.ListRunning(probeCtx); err == nil && len(names) > 0 {
-			slog.Warn("watchdog: refusing shutdown disarm — running containers owned", "count", len(names))
-			return true
+
+		// Pre-flight: refuse to start under a systemd unit that would kill
+		// child QEMU processes on stop. See preflight.go for the rationale.
+		if err := preflightUnitCheck(); err != nil {
+			return fmt.Errorf("preflight: %w", err)
 		}
-		return false
-	})
-	go watchdog.Heartbeat(ctx, d.cfg.WatchdogDev, 0, watchdogCtrl)
-	// Central self-fence hard gate: once this node self-fences, the checker's Execution/
-	// DecisionGate fail closed regardless of quorum, so every gate consumer (reconciler,
-	// grpcapi server, failover coordinator) refuses runtime-ownership work during the
-	// doomed fence-timeout window.
-	d.checker.SetSelfFenced(watchdogCtrl.Fenced)
-
-	// PCI device startup scan
-	d.runPCIScan(ctx)
-
-	// Start periodic PCI rescan timer (if configured).
-	if interval := d.parsePCIRescanInterval(); interval > 0 {
-		go d.runPeriodicPCIScan(ctx, interval)
-	}
-
-	// Ensure libvirt storage pools exist. libvirtd may stat a pool's
-	// directory to define or refresh it, and block on an NFS server that does
-	// not answer: waited for only up to startupStepBound.
-	awaitStartupStep("ensure libvirt storage pools", startupStepBound, d.ensureStoragePools)
-
-	// Start gRPC server with mTLS
-	tlsCfg, err := pki.ServerTLSConfig(d.cfg.PKIDir)
-	if err != nil {
-		return fmt.Errorf("TLS config: %w", err)
-	}
-
-	svc := d.newServer() // host address and release gate: before the first network pass
-	// A guarded VM recovers only onto a host that enforces NIC guards until
-	// every host does (re-review m8).
-	fc.SetNICGuardPlacement(svc.GuardHostNeeded)
-	d.svc = svc
-	if d.startWaitSvc != nil {
-		d.startWaitSvc.Store(svc)
-	}
-	svc.SetSupersededDiskRetentionDays(d.cfg.SupersededDiskRetentionDays)
-	{
-		iv := d.cfg.HostUpdates.IntervalMinutes
-		if iv <= 0 {
-			iv = 360
-		} else if iv < 5 {
-			iv = 5
+		// Pre-flight: if watchdog self-fencing is configured, refuse to start with a
+		// missing/unusable device so we don't discover it only at fence time.
+		if err := preflightWatchdog(d.cfg.WatchdogDev); err != nil {
+			return fmt.Errorf("preflight: %w", err)
 		}
-		svc.SetHostUpdates(grpcapi.HostUpdatesConfig{
-			Enabled:      d.cfg.HostUpdates.Enabled,
-			Interval:     time.Duration(iv) * time.Minute,
-			RefreshIndex: d.cfg.HostUpdates.RefreshIndex,
+		// Pre-flight: detect that this binary is a rollback below a capability token
+		// this node already latched. Deliberately NOT fatal. Exiting non-zero here
+		// would, under the unit's OnFailure rollback, be a rollback loop; and the node
+		// has to stay up anyway so peers can see it degraded and an operator can reseed
+		// it. Fail-closed happens at the write path instead, wired below.
+		// Release probation (C1): rolled back below a safe_if_unused release token
+		// with no use in this replica. No replicated writes until a voter majority
+		// confirms (RunReleaseProbation, below).
+		if toks := BootRollbackCheck(ctx, d.cfg.DataDir, d.db); len(toks) > 0 {
+			d.rolledBackTokens = toks
+			slog.Error("preflight: this binary is a ROLLBACK below capability tokens this node "+
+				"already latched; entering WAL quarantine — no replicated writes will be emitted "+
+				"until this node is upgraded again or reseeded by an operator",
+				"tokens", toks)
+		}
+		// Install the quarantine before InitSchema so nothing this daemon does can
+		// emit. Local-only execs (schema DDL, replication apply) stay open by design,
+		// so a reseed still works.
+		d.db.SetWriteQuarantine(func() string {
+			if len(d.rolledBackTokens) == 0 {
+				return ""
+			}
+			return "rolled back below latched token(s): " + strings.Join(d.rolledBackTokens, ",")
 		})
-	}
-	svc.SetContainerIDMapRange(d.cfg.Containers.IDMapBase, d.cfg.Containers.IDMapRanges)
 
-	// Re-provision every network (bridge, gateway, DHCP, NAT, VXLAN) and tear
-	// down every deleted one. dnsmasq is a child process that dies when the
-	// daemon restarts; this brings it back. The same pass then runs on an
-	// interval (StartNetworkReconciler, below), which is what carries a
-	// network created or deleted on another node to this one.
-	if err := svc.ReconcileNetworksOnce(ctx); err != nil {
-		slog.Warn("startup network reconcile failed", "error", err)
-	}
-	// Wire the split-brain gate onto the gRPC server BEFORE ReconcileLBs (below)
-	// re-applies VIPs, so an isolated/latched restart can't bring up a VIP ungated.
-	svc.SetGate(d.checker)
-	// The operator's hosts writes refuse on a replica that has not caught up
-	// (grpcapi/host_incarnation.go).
-	svc.SetHostWriteCurrencyCheck(true)
-	// Start rebalance coordinator. Leader-gated; safe to start on
-	// every host. Defaults to dry-run on every VM unless compose says otherwise.
-	// Its lease stands down on the server's LeaseQuorumLost, as RunRebalance's
-	// and the rebalance executor's do: one predicate for the one lease.
-	rc := scheduler.NewRebalancer(d.cfg.HostName, d.db)
-	rc.SetCapacityPolicy(capacity)
-	rc.QuorumLost = svc.LeaseQuorumLost
-	go rc.Start(ctx)
-	d.checker.SetReleaseUseConfirmer(svc.PeerHoldsReleaseFeatureUse)
-	// A peer advertising a release token this build does not know is, almost
-	// always, a forward roll: a non-blocking look at its used records, never a
-	// probation (N2). Probation comes only from a marker at boot.
-	corrosion.WireUnknownReleaseObserver(ctx, d.checker, ae)
-	// Take no replicated state from a peer that cannot keep a release feature
-	// in use: pushes are refused in PushMutations, pulls here.
-	d.db.SetReplicationSourceGate(svc.ReleaseSourceAllowed)
-	// A probation round that hears of a newer voter generation adopts it (each
-	// certificate verified) and counts against it (I-R4-2).
-	ae.SetVoterAdopter(svc.AdoptVoterConfigs)
-	// The server can answer the lease-mint clearance from here on: it has the
-	// gate whose quorum and healthy-peer set its high-water read uses.
-	d.mintClearance.Store(svc)
-	svc.SetGateRefusedObserver(gateMetrics.Refused)
-	svc.SetLeaseBarrierIncompleteObserver(gateMetrics.LeaseBarrierIncomplete)
-	svc.SetLeaseClaimNoMajorityObserver(gateMetrics.LeaseTermClaimNoMajority)
-	svc.SetStateWriteFailObserver(stateWriteMetrics.Failed)
-	// SR-IOV VF-pool policy: which PFs litevirt may adopt for VF creation, the pool
-	// cap, and the degraded gauge. Validate the allowlist against live hardware now,
-	// and re-validate on the rescan cadence.
-	svc.SetSRIOVMetrics(metrics.NewSRIOVMetrics())
-	svc.SetSRIOVPolicy(d.cfg.PCI.SRIOV.Managed, d.cfg.PCI.SRIOV.MaxVFsPerPF, d.cfg.PCI.SRIOV.ManagedPFs)
-	svc.ValidateSRIOVPolicy()
-	// Spare pcie-root-ports on every newly-defined q35 domain, so hot-plug has a
-	// free slot to attach into (see daemon.PCIConfig.SparePCIeRootPorts). Both the
-	// server (create/import/clone/promote/update) and the reconciler (sweep
-	// redefines) need it — a redefine that goes through either must agree on the
-	// node's current value.
-	svc.SetSparePCIeRootPorts(d.cfg.PCI.SparePCIeRootPorts)
-	reconciler.SetSparePCIeRootPorts(d.cfg.PCI.SparePCIeRootPorts)
-	if d.cfg.PCI.SRIOV.Managed {
-		go svc.RunSRIOVValidation(ctx, d.parsePCIRescanInterval())
-	}
-	// The udev_hook is deprecated: real-time PCI events are covered by the rescan
-	// interval. Warn (don't fail) so operators migrate off the broken curl-to-REST rule.
-	if d.cfg.PCI.UdevHook {
-		slog.Warn("pci.udev_hook is deprecated and no longer installs a udev rule; rely on pci.rescan_interval instead. Remove any /etc/udev/rules.d/99-litevirt-pci.rules left from an older install.")
-	}
-	// Target the upgrade swap at the binary we're actually running (re-exec uses
-	// os.Executable()), so a non-/usr/local/bin install upgrades correctly.
-	if exe, err := os.Executable(); err == nil {
-		svc.SetBinaryPath(exe)
-	}
-	svc.SetVersion(d.cfg.Version)
-	svc.SetDNSDomain(d.cfg.DNSDomain)
-	// Resolve OVMF firmware paths once (G1) and share with the server + reconciler
-	// so every domain-builder renders the same files the capability label reflects.
-	firmwarePaths := libvirt.ResolveFirmwarePaths()
-	svc.SetFirmwarePaths(firmwarePaths)
-	reconciler.SetFirmwarePaths(firmwarePaths)
-	// One firmware store (NVRAM under the data dir, swtpm under libvirt's
-	// root) for the host, the guarded one New built, shared by the server and
-	// the reconciler.
-	svc.SetFirmwareStore(d.fwStore)
-	reconciler.SetFirmwareStore(d.fwStore)
-	svc.SetSessionTimeouts(parseDurationOr(d.cfg.Auth.SessionIdleTimeout, 0), parseDurationOr(d.cfg.Auth.SessionHardExpiry, 0))
-	svc.SetStrictMTLSIdentity(d.cfg.Auth.StrictMTLSIdentity)
-	svc.SetTrustRotatedPeerCerts(d.cfg.Auth.TrustRotatedPeerCerts)
-	defer svc.StopDHCPReservations()
-	if err := svc.InitializeAutomationSource(ctx); err != nil {
-		slog.Warn("automation source publication unavailable after completed-evidence reconciliation", "error", err)
-	}
-	svc.SetForwardedIdentity(d.cfg.Auth.ForwardedIdentity)
-	svc.SetRBACRealm(d.cfg.Auth.RBACRealm)
-	// Split-brain-family enforcement kill-switches — so the HA monitor drives the
-	// right tokens' latches (mandatory ∪ configured-on) and gates degraded/paging on
-	// config intent. The actual enforcement predicates live on the consumers
-	// (Coordinator, the lww/vip closures above), wired from the same config below.
-	svc.SetEnforcementConfig(
-		d.cfg.Enforcement.SafeFenceDefault,
-		d.cfg.Enforcement.LWWSkewGuard,
-		d.cfg.Enforcement.HLCLww,
-		d.cfg.Enforcement.VIPSelfDemote,
-		d.cfg.Enforcement.VIPProofReclaim,
-		d.cfg.Enforcement.SharedStorageFence,
-	)
-	// netbox_ipam_v1 is advertised only while this node's config enables the
-	// NetBox integration, so the cluster-wide latch requires config uniformity,
-	// not just a uniform build (see capabilities.NetBoxIPAMV1).
-	svc.SetNetBoxIPAM(d.cfg.NetBox.Enabled)
-	// The INVENTORY MIRROR is a second, narrower opt-in, driving its own token
-	// (netbox_mirror_v1) the same conditional-advertisement way. Default off:
-	// NetBox is pure IPAM unless this node asks for inventory too, and the latch
-	// requires every node to ask — the sweep runs on one lease holder, so a
-	// non-uniform flag makes the inventory follow leadership. Set BEFORE
-	// StartNetBoxMirror, which declines outright when it is off.
-	svc.SetNetBoxMirrorInventory(d.cfg.NetBox.MirrorInventory)
-	// BEFORE the mirror starts. The name decides which NetBox cluster object
-	// every mirrored VM hangs off, and the CA re-key resolves the same one.
-	svc.SetNetBoxClusterName(d.cfg.NetBox.ClusterName)
-	svc.SetNetBoxSite(d.cfg.NetBox.Site)
-	// The client itself. A node whose config ENABLES the integration but whose
-	// client cannot be built (missing/empty token file, no URL) must not start:
-	// it would advertise netbox_ipam_v1 — helping the cluster latch — while
-	// every bind and claim on it refused for want of a client. Failing startup
-	// keeps the "config uniformity" the latch depends on honest.
-	if d.cfg.NetBox.Enabled {
-		nbClient, err := netbox.New(netbox.Config{
-			BaseURL:   d.cfg.NetBox.URL,
-			TokenPath: d.cfg.NetBox.TokenPath,
-			Timeout:   time.Duration(d.cfg.NetBox.TimeoutSec) * time.Second,
-		})
+		// Initialize corrosion schema
+		if err := corrosion.InitSchema(ctx, d.db); err != nil {
+			return fmt.Errorf("init schema: %w", err)
+		}
+		// Record, once, whether this node held users rows before anything could
+		// replicate in: the positive evidence an external-realm login needs on a
+		// node that is not credentials-live yet (corrosion/credentials_live.go).
+		if err := d.db.NoteCredentialsBaseline(ctx); err != nil {
+			return fmt.Errorf("record the credentials baseline: %w", err)
+		}
+
+		// Derive the cluster record from this node's CA if the cluster has none.
+		// Presence-gated and idempotent — see corrosion.EnsureClusterRecord for why
+		// it is derived rather than minted, and why it never rewrites a row.
+		d.ensureClusterRecord(ctx)
+
+		// Hold this host's audit rows while its own chain is still arriving, before
+		// anything can write one. Only a host re-added under an old name, whose
+		// CA-signed admission record (pki_dir/audit-rejoin.json, written by
+		// `lv host add`) names history this replica does not have yet, holds: a
+		// normal restart and a brand-new name never do. Without it a rebuilt host
+		// chains its first rows onto an empty tail and forks its chain for good
+		// (corrosion/audit_hold.go). Rows held across a restart are in the spool and
+		// land first.
+		d.configureAuditHold(ctx)
+		// Whether this replica holds the cluster's history, decided once per
+		// state.db: an existing member is seeded at its first start on this build;
+		// a fresh replica becomes seeded at genesis or by an exchange with a seeded
+		// peer (corrosion/audit_seeded.go). AdmitHost vouches only when seeded.
+		if _, err := corrosion.DecideAuditSeeded(ctx, d.db, d.cfg.HostName); err != nil {
+			slog.Error("could not decide whether this replica is seeded; it is treated as NOT seeded and "+
+				"does not vouch for audit chain positions until an exchange with a seeded peer", "error", err)
+		}
+		go d.runAuditSeeded(ctx)
+
+		// Before anything that writes an audit row is built: every writer signs with
+		// the keyring this installs on d.db.
+		d.wireAuditKeyring(ctx)
+
+		// An operator's seeded assertion is audited here, signed, exactly once: not
+		// in DecideAuditSeeded, which runs before the keyring exists.
+		if err := corrosion.RecordAuditSeededAssertion(ctx, d.db, d.cfg.HostName); err != nil {
+			slog.Error("could not audit this replica's seeded assertion; retried at the next start",
+				"error", err)
+		}
+
+		// After the keyring: rows an earlier process left in the spool may land on
+		// the first poll, and landed before it they would be written unsigned
+		// (runAuditHold also waits for the wiring, whatever the order here).
+		go d.runAuditHold(ctx)
+
+		// Re-base THIS host's audit sub-chain at startup — but ONLY when it is
+		// still entirely unsigned.
+		//
+		// This used to run unconditionally, and that was the single biggest hole in
+		// the audit log's tamper-evidence: reseal recomputes hashes from whatever
+		// the rows currently say, so an attacker with database write access could
+		// edit a row, wait for (or cause) a restart, and have the daemon itself
+		// rewrite the chain around the edit. `lv audit verify` then came back clean.
+		//
+		// Reseal now exists solely to heal rows written under the old global-chain
+		// model, which were never tamper-evident to begin with. Once a host has any
+		// signed row, its chain is verified rather than repaired: a hash that does
+		// not recompute is a FINDING, and rewriting it would destroy the only
+		// evidence that anything happened. resealHostChainLocked enforces the same
+		// rule per row, in the SQL as well as in Go, because the statement
+		// replicates.
+		if signed, err := corrosion.HostHasSignedAuditRows(ctx, d.db, d.cfg.HostName); err != nil {
+			slog.Warn("could not determine audit chain signing state", "error", err)
+		} else if signed {
+			slog.Debug("audit: chain is signed; skipping the legacy reseal", "host", d.cfg.HostName)
+			d.db.NoteAuditResealNotNeeded(d.cfg.HostName)
+		} else if n, err := corrosion.ResealAuditChain(ctx, d.db, d.cfg.HostName); errors.Is(err, corrosion.ErrAuditChainNotCaughtUp) {
+			// A rebuilt host whose history has not arrived: a reseal of a partial
+			// replica would rewrite rows its peers hold intact.
+			slog.Info("audit: skipping the legacy reseal while this host's audit history is still arriving",
+				"host", d.cfg.HostName)
+		} else if err != nil {
+			// Logged, not fatal. Until a reseal succeeds the legacy tail is not
+			// anchored (corrosion.ErrAuditAnchorWithheld): an anchor over the
+			// un-rebased tail would read as a truncation once it is rebased.
+			slog.Warn("audit chain reseal at startup failed; the legacy chain is not anchored until a restart reseals it", "error", err)
+		} else if n > 0 {
+			slog.Info("audit: re-based legacy unsigned rows at startup",
+				"host", d.cfg.HostName, "rows", n)
+		}
+
+		// Repair any private key this node holds that other local users can read.
+		//
+		// Unconditional, because the damage was: `lv host init root@<host>` pushed
+		// host.key mode 0644 on every node it provisioned, and host.key is the
+		// peer-mTLS identity — any local user on such a node could impersonate it to
+		// the cluster. The push path is fixed, but nobody re-provisions an existing
+		// cluster, so a repair at start is the only thing that reaches one. It used
+		// to hang off enforcement.audit_signature, which then defaulted to false, so an
+		// operator who upgraded specifically for this fix got neither the repair nor
+		// a warning.
+		if err := pki.TightenPrivateKeys(d.cfg.PKIDir); err != nil {
+			slog.Error("a private key in the PKI directory is readable by other local users and "+
+				"could not be tightened", "error", err)
+		}
+
+		// Set up libvirt TLS symlinks so qemu+tls:// migration works
+		// using our existing PKI certs. Best-effort — log warning if it fails.
+		if err := pki.SetupLibvirtTLS(d.cfg.PKIDir); err != nil {
+			slog.Warn("failed to set up libvirt TLS certs", "error", err)
+		}
+
+		// Seed admin user on first start (if no users exist).
+		if err := d.seedAdminUser(ctx); err != nil {
+			slog.Warn("failed to seed admin user", "error", err)
+		}
+
+		// seed the built-in RBAC roles (Admin, Operator, Viewer,
+		// Auditor, BackupOperator, NetworkAdmin, VMOperator, NoAccess) and
+		// initialize the auth engine. The engine reloads on daemon start, then
+		// mid-run: local grants reload synchronously, local revokes/deletes apply
+		// in-memory deltas, and runAuthEngineReload (below) is the ~30s backstop
+		// that picks up peer-replicated mutations.
+		if err := auth.SeedBuiltinRoles(ctx, d.db); err != nil {
+			slog.Warn("failed to seed built-in roles", "error", err)
+		}
+		d.authEngine = auth.NewEngine(d.db)
+		if err := d.authEngine.Reload(ctx); err != nil {
+			slog.Warn("failed to load role bindings", "error", err)
+		}
+
+		// build the realm registry from auth.realms YAML. The
+		// "local" realm is always installed by BuildRegistry; OIDC/LDAP
+		// realms come from config. A realm that fails to construct (e.g.
+		// OIDC issuer unreachable at startup) downgrades to a warning so
+		// the daemon can still serve local-only Logins; the operator gets
+		// to see the error and fix the config without the daemon refusing
+		// to start.
+		registry, err := auth.BuildRegistry(ctx, d.db, d.cfg.Auth.Realms)
 		if err != nil {
-			return fmt.Errorf("netbox client: %w", err)
+			slog.Warn("auth.realms config failed; falling back to local-only", "error", err)
+			registry = auth.NewRegistry()
+			registry.Register(auth.NewLocalRealm(d.db))
 		}
-		svc.SetNetBoxClient(nbClient)
-		// The real counter sink, replacing the noop. Registered on the default
-		// registry, so it is served wherever /metrics is.
-		svc.SetNetBoxMetrics(metrics.NewNetBoxMetrics())
-		// Binding revalidation + the orphan sweep, on the configured cadence.
-		// Started ONLY here: a node with no NetBox configuration creates no
-		// goroutine and never enters the `netbox` leader-lease race. The sweep
-		// itself is leader-gated, so every configured node running this loop
-		// still means exactly one reclaiming node cluster-wide.
-		svc.StartNetBoxMaintenance(ctx, time.Duration(d.cfg.NetBox.SweepIntervalSec)*time.Second)
-		// The inventory mirror, on the SAME cadence and the SAME leader lease.
-		// One key, not two: the sweeper reclaims addresses and the mirror
-		// rewrites the objects that name them, so a cluster where two different
-		// nodes led the two would have each acting on state the other was
-		// changing underneath it.
-		svc.StartNetBoxMirror(ctx, time.Duration(d.cfg.NetBox.SweepIntervalSec)*time.Second)
-	}
-	// One operator switch drives both operation_protocol_v1 and its dependent
-	// capacity_admission_v1 token; capacity admission has no standalone flag.
-	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
-	svc.SetDefaultCPUMode(d.cfg.VM.DefaultCPUMode)
-	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
-	// Console passwords: every define on this host (grpcapi's and the health
-	// reconciler's, which share d.virt) applies svc.ConsolePasswordActive —
-	// this flag AND the console_password_v1 latch. NewServer wired the hook.
-	svc.SetConsolePassword(d.cfg.Enforcement.ConsolePassword)
-	// vrrp_unicast_v1: advertised only with enforcement.vrrp_unicast on; an
-	// LB renders unicast VRRP only with this flag AND the durable latch.
-	svc.SetVRRPUnicast(d.cfg.Enforcement.VRRPUnicast)
-	svc.SetAllowUnencryptedStorageMigration(d.cfg.Migration.AllowUnencryptedStorage)
-	svc.SetMigrationNetwork(d.cfg.Migration.Network)
-	svc.SetMigrationAddress(d.cfg.Migration.Address)
-	migrationTLS := d.migrationTLSInstaller()
-	svc.SetMigrationTLS(migrationTLS)
-	svc.SetMigrationCAFingerprint(func() (string, error) { return pki.MigrationCAFingerprint(d.cfg.PKIDir) })
-	svc.SetMigrationCAList(func() ([]string, error) { return pki.MigrationCAFingerprints(d.cfg.PKIDir) })
-	svc.SetMigrationTLSCheck(d.migrationTLSChecker())
-	svc.SetMigrationTLSStatus(func() *pb.MigrationTLSHostStatus {
-		return migrationTLSStatusRow(pki.InspectMigrationTLS(d.cfg.PKIDir, time.Now()))
-	})
-	go runMigrationExpiryWatch(ctx, d.cfg.PKIDir)
-	// Install once at start so the operator sees the state in the log; it runs
-	// again before each storage migration.
-	ok, wrote, err := d.installMigrationTLS()
-	logMigrationTLSInstall(ok, wrote, err)
-	// Cluster-wide capacity policy (overcommit ratios + host reserves). Per-host
-	// overrides live on the host record and win where set.
-	svc.SetCapacityPolicy(capacity)
-	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
-	svc.SetVMReplaceEnforce(d.cfg.Enforcement.VMReplace)                 // drives the latch + conditional advertisement; gates `lv cutover`
-	// The first pass over the swtpm tree (vtpm_state_sync), before anything
-	// on this host can start a VM: the cutover resume below, the startup
-	// recovery barrier, the runtime loops, onboot autostart and the API.
-	// It completes, or runs past vtpmPassWait and raises
-	// vtpm_state_not_durable; either way no vTPM guest writes state here
-	// before the attempt to make that state synchronous. The vTPM capability
-	// label (below) reuses the same probe.
-	vtpmMarker := filepath.Join(d.cfg.DataDir, "vtpm-state-sync")
-	vtpmSync := &vtpmStateSync{
-		on:   d.cfg.VTPMStateSyncEnabled(),
-		base: d.fwStore.SwtpmBase,
-		wait: vtpmPassWait,
-		// The host's own store: its swtpm tree is the one this host's
-		// guests write.
-		sync: func(on bool) libvirt.SwtpmSyncReport { return d.fwStore.SyncSwtpmState(on, vtpmMarker) },
-		report: func(open bool, evidence map[string]any) bool {
-			return d.syncVTPMCondition(ctx, open, evidence)
-		},
-	}
-	tpmCapable := tpmCapableProbe(exec.LookPath, vtpmSync.probe)
-	// The live firmware move label reads the pass the vTPM label's probe
-	// ran this cycle, so a cycle walks the swtpm tree once.
-	tpmReady := tpmReadyProbe(exec.LookPath, vtpmSync)
-	awaitFirstVTPMPass(tpmCapable)
-	// Finish any cutover cleanup a previous process left committed-but-unfinished.
-	// The replacement transition displaced the rows describing what the replaced VM
-	// owned, so its journaled manifest is the only surviving record of the volumes
-	// to free — and nothing else will ever look at it.
-	// In the background: it removes the replaced VM's volumes, which may be on
-	// an NFS pool whose server does not answer, and it is safe at any time
-	// (each cleanup is taken under its VMs' locks and re-read there). A
-	// cleanup whose storage does not answer is deferred, not run under the
-	// locks, and any cleanup left journaled is retried (startup_bound.go).
-	go resumeVMReplaceCleanups(ctx, svc, vmReplaceCleanupMinRetry, vmReplaceCleanupRetry)
-	svc.SetProjectAuthorityEnforce(d.cfg.Enforcement.ProjectAuthority) // F2: delegate project-quota admission to the authority holder
-	svc.SetAuditSignatureEnforce(d.cfg.Enforcement.AuditSignature)     // drives the latch + conditional advertisement
-	// Phase 4: owner_epoch_v1 is advertised only when the operator opted in AND
-	// this node.s owned workloads have all graduated out of the pre-epoch 0, so
-	// the fleet can never latch across a node whose generations do not exist yet.
-	svc.SetOwnerEpochEnforce(d.cfg.Enforcement.OwnerEpoch)
-	svc.SetIsolationEpochEnforce(d.cfg.Enforcement.IsolationEpoch)
-	svc.SetOwnerEpochReady(func() bool {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		ready, reason := svc.OwnerEpochReadiness(ctx)
-		if !ready {
-			slog.Debug("owner_epoch_v1 readiness withheld", "reason", reason)
+		d.realmRegistry = registry
+		if names := registry.Names(); len(names) > 0 {
+			slog.Info("auth realms ready", "realms", names)
 		}
-		return ready
-	})
-	// Phase 2: lease_term_v1 is advertised only when the operator opted in AND
-	// this node can enforce — a readable ledger, split_brain_gate_v1 already
-	// latched, and a cluster large enough that the quorum barrier does not break
-	// failover.
-	svc.SetLeaseTermEnforce(d.cfg.Enforcement.LeaseTerm)
-	// recovery_claim_v1: advertised only with the flag on and this node ready
-	// (split_brain_gate_v1 latched, able to vote durably), enforced only with
-	// the flag AND the latch AND an adopted voter generation.
-	svc.SetRecoveryClaimEnforce(d.cfg.Enforcement.RecoveryClaim)
-	// partition_pause_v1: advertised only with enforcement.partition_pause on
-	// (default on), because the majority relies on this node pausing.
-	svc.SetPartitionPause(d.cfg.Enforcement.PartitionPause)
-	// The reconciler is the SECOND executor boundary for this regime: a VM
-	// reschedule proof never travels over an RPC, so it is claimed off the
-	// replicated row there rather than in claimCarriedProof. The judgment is
-	// injected because internal/grpcapi imports internal/health and cannot be
-	// imported back — one implementation, wired to both callers.
-	reconciler.SetLeaseTermGate(svc.LeaseTermGateForPendingProof)
-	// The recovery-claim certificate is checked at the same boundary, for the
-	// same reason: a reschedule proof is claimed off the replicated row here,
-	// and a relocate-recreate proof by the container checker.
-	reconciler.SetRecoveryClaimGate(svc.RecoveryClaimGateForPendingProof)
-	// Layer 3 of partition pause (docs/design/partition-pause.md §6): a local
-	// copy whose row a VERIFIED recovery-claim certificate gave to another
-	// host is stopped on that proof, and only on it.
-	reconciler.SetSettleVerifier(svc.VerifySettleProof)
-	reconciler.SetPITOverlayReporter(svc.ReportPITOverlayHeld, svc.ClearPITOverlayHold)
-	reconciler.SetPITOverlayFeature(svc.PITOverlayFeature)
-	reconciler.SetSharedDiskWithheldReporter(svc.ReportSharedDiskWithheld, svc.ClearSharedDiskWithheld)
-	svc.SetLeaseTermReady(func() bool {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		ready, reason := svc.LeaseTermReadiness(ctx)
-		if !ready {
-			slog.Debug("lease_term_v1 readiness withheld", "reason", reason)
-		}
-		return ready
-	})
-	// Once the whole cluster has latched audit_signature_v1, a write this node
-	// cannot sign is an error-level event rather than a normal one.
-	//
-	// It is NOT a refusal. Refusing was the first design and it lost the record
-	// of operations that had already happened, because every caller of
-	// InsertAuditLog discards its error — so the delete or the fence went ahead
-	// with no audit row at all, which is exactly what an attacker would arrange
-	// by making one file unreadable. The row is written unsigned and the
-	// verifier reports it: a host that has signed once cannot legitimately stop,
-	// so every such row is tampering on every node that reads the log.
-	//
-	// Latched, not Enforced: this is read on the audit write path, which must
-	// not ping peers.
-	d.db.SetAuditSignatureRequired(func() bool {
-		return d.cfg.Enforcement.AuditSignature && d.checker.Latched(capabilities.AuditSignatureV1)
-	})
-	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
-	svc.SetLBMetrics(metrics.NewLBMetrics())
-	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())
-	svc.SetDualRunMetrics(metrics.NewDualRunMetrics())
-	svc.SetSMARTMetrics(metrics.NewSMARTMetrics())
-	svc.SetReservationMetrics(metrics.NewReservationMetrics())
-	svc.SetStoragePoolsByName(d.storagePoolRefs())
-	// The ceph pools' libvirt secrets (ephemeral: gone after a libvirtd
-	// restart): defined now, then kept in line with the pools and keyrings.
-	// An rbd disk's domain takes its monitors from its pool as configured on
-	// this host when the domain is defined, not from when the disk was made.
-	libvirt.SetCephMonitorResolver(svc.CephMonitorsForPool)
-	// Deleted ceph images wait in their pool's trash for a background purge;
-	// the ones a previous run had not finished are resumed (and named by
-	// ceph_trash_leftover while they fail).
-	if err := storage.ResumeCephPurges(d.cfg.DataDir); err != nil {
-		slog.Warn("ceph: trash purges of a previous run not resumed", "error", err)
-	}
-	svc.ReconcileCephSecrets(ctx)
-	go d.runCephSecretReconcile(ctx)
-	// The iscsi pools' sessions: a host reboot drops them, and node records
-	// at node.startup = manual bring none back. Logged back in now and kept
-	// (grpcapi.ReconcileISCSISessions), off the start path: a portal that
-	// does not answer must not hold the daemon's start.
-	go d.runISCSISessionReconcile(ctx)
-	// Two NICs of the cluster on one MAC (grpcapi.ReconcileMACCollisions).
-	go d.runMACCollisionReconcile(ctx)
-	// The nfs pools' exports: a host reboot unmounts them, and nothing but a
-	// pool's Prepare mounted them. Mounted back now and kept
-	// (grpcapi.ReconcileNFSMounts), off the start path: a server that does
-	// not answer must not hold the daemon's start.
-	go d.runNFSMountReconcile(ctx)
-	// Before this daemon serves: no cold-migration copy can be in flight yet.
-	svc.SweepColdMigrationScratch()
-	svc.SetReplicator(repl)
-	svc.SetAuthEngine(d.authEngine)
-	svc.SetRealmRegistry(d.realmRegistry)
-	vmChecker.SetEventBus(svc.EventBus())
-	vmChecker.SetMigrateFunc(svc.MigrateVMForHealthCheck)
-	// Every guest start the Server performs opens the healthcheck's start grace,
-	// including RestartVM's, which keeps the row "running" and is otherwise
-	// invisible to the checker's sweep.
-	svc.SetVMStartObserver(vmChecker)
-	reconciler.SetVMStartObserver(vmChecker) // onboot and failover starts open the healthcheck start grace too
-	// hardware_v2 pre-start hook: the automated (re)start paths (failover reconciler +
-	// health auto-restart) bypass startVMLocked, so wire them to the Server's shared
-	// adoption-gate + PCI-start-preflight. A strict no-op until hardware_v2 latches, so
-	// this changes nothing on a fleet where the feature is off.
-	vmChecker.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
-	// A health restart runs under the VM's API lock, the one a move, a start
-	// or a stop of the VM holds, so none interleaves with it.
-	vmChecker.SetVMLocker(svc.TryLockVMForHealth)
-	// A health restart moves a stopped VM's NICs onto the devices their
-	// networks are on now, as a start through the Server does.
-	vmChecker.SetNetworkFollower(svc.FollowNetworkDevices)
-	vmChecker.SetNetworkStarter(svc.StartDomainOnNetwork)
-	reconciler.SetNetworkStarter(svc.StartDomainOnNetwork)
-	reconciler.SetSpareRootPortPreparer(svc.EnsureSparePCIeRootPorts)
-	vmChecker.SetCancelledStartProbe(svc.HasCancelledStart) // cancelled_starts.go: neither healed to running nor restarted
 
-	// Wire reconciler callbacks now that gRPC server exists.
-	reconciler.SetOnVMStarted(svc.RefreshLBForStack)
-	reconciler.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
-	reconciler.SetCancelledStartProbe(svc.HasCancelledStart) // cancelled_starts.go: an error row's late-started domain is the sweep's
-	// A held start whose daemon restarted before libvirt answered it: its
-	// lease is taken over once the domain runs, and its outcome recorded
-	// (health/held_start_orphan.go).
-	reconciler.SetHeldStartProbe(svc.HasStartInFlight)
-	reconciler.SetVMEventRecorder(svc.RecordVMEvent)
-	// A start whose ceph key must be proven, late in a walk with no time left
-	// for it, is left untouched for the next pass rather than half-started.
-	reconciler.SetStartDeferral(svc.CephStartDeferral)
-	// A cancel of a start records whether it was a proof-less transfer.
-	svc.SetStartTransferProbe(reconciler.IsDeferredTransfer)
-	reconciler.SetAutoPullImage(svc.AutoPullImage)
-	reconciler.SetRecreateOverlay(svc.RecreateOverlayDisk) // under an image hold (m-6)
-	reconciler.SetDiskStrandedObserver(svc.NotifyVMDiskStranded)
-	reconciler.SetBackupInProgress(svc.BackupInProgress)
-	reconciler.SetNetworkProvision(svc.ProvisionNetworkHere) // a failover start provisions like a VM create
-	// Runtime owner-assert (Phase 3): corroborate a locally-running VM whose DB
-	// row points elsewhere against every other active host's libvirt before
-	// reclaiming it.
-	reconciler.SetPeerRuntimeChecker(svc.CheckPeerVMRuntime)
-	// Split-brain hardening (Phase 1): fresh-Ping peers for capability tokens so
-	// cluster-wide activation of fail-closed gates is computed from live
-	// reachability, never stale replicated rows. Once this is set, the proof-table
-	// WAL gate (wired before repl.Start above) can positively confirm peers; until
-	// now PeerSupports failed closed, deferring proof entries rather than leaking.
-	// Paired with the readiness probe, which turns the peer health check from a
-	// TLS handshake into an application-level question — see wirePeerProbes.
-	wirePeerProbes(d.checker, svc)
-	// Runtime ownership repair metrics (Phase 5): VM owner-assert + CT re-key
-	// outcomes → litevirt_runtime_owner_assert_total.
-	runtimeRepairMetrics := metrics.NewRuntimeRepairMetrics()
-	reconciler.SetOwnerAssertObserver(func(_, result string) { runtimeRepairMetrics.OwnerAssert("vm", result) })
-	// Orphaned runtimes: litevirt domains/containers with no live record, reported
-	// (never reaped) as vm_orphan_runtime / ct_orphan_runtime and this gauge.
-	orphanMetrics := metrics.NewOrphanRuntimeMetrics()
-	observeOrphans := func(kind string, found []health.OrphanRuntime) {
-		samples := make([]metrics.OrphanRuntimeSample, 0, len(found))
-		for _, o := range found {
-			samples = append(samples, metrics.OrphanRuntimeSample{Name: o.Name, Row: o.Row})
-		}
-		orphanMetrics.Set(kind, d.cfg.HostName, samples)
-	}
-	reconciler.SetOrphanRuntimeObserver(observeOrphans)
+		// The membership split gate goes in BEFORE this host's first write. The
+		// boot state below is a state write, and on a node that has already split
+		// it must reach host_membership too. Written to hosts.state alone, this
+		// node's own host_membership row would miss it until anti-entropy.
+		d.wireHostMembershipGate()
+		d.wireHostMembershipRetireGate()
+		// Likewise the runtime split gate: the boot report below is a runtime
+		// write, and on a node that has already split it must reach host_runtime.
+		d.wireHostRuntimeGate()
+		d.wireHostRuntimeRetireGate()
 
-	// F1 startup recovery barrier: reduce the host-local operation journal against
-	// replicated state BEFORE any runtime loop or API mutation runs — DB +
-	// capability latch + membership are all wired by this point.
-	if j, err := opjournal.Open(filepath.Join(d.cfg.DataDir, "opjournal")); err != nil {
-		slog.Error("operation journal: open failed; skipping recovery", "error", err)
-	} else {
-		d.opJournal = j
-		svc.SetOpJournal(j) // so the device-lease path can durably record allocations
-		// Host network apply protocol (v48): the real netplan-touching System,
-		// plus crash recovery INSIDE this barrier — a half-applied netplan
-		// change is restored before any RPC or runtime loop can observe it.
+		// The own-row hold goes in before this host's first own-row write
+		// (corrosion/own_row_hold.go).
+		d.configureOwnRowHold(ctx)
+		// Register this host in corrosion
+		if err := d.registerHost(ctx); err != nil {
+			slog.Warn("failed to register host", "error", err)
+		}
+		// And correct the address if it has changed since the row was created —
+		// registerHost is an INSERT, so it cannot.
+		if err := d.reconcileHostAddress(ctx); err != nil {
+			slog.Warn("could not reconcile this host's recorded address", "error", err)
+		}
+		// Write boot state in ONE batched mutation: state + version (+ resources if the
+		// probe succeeded) share a single updated_at. Doing these as separate writes in
+		// the same wall-clock second produced equal updated_at values, and on a peer the
+		// later writes lost the LWW tie and were stranded (a re-exec upgrade's new
+		// version never propagated). InsertHost is a no-op if the row already exists, so
+		// this explicit write is what carries the new state/version after a re-exec.
+		cpus, memMiB, niErr := d.virt.NodeInfo()
+		diskGiB := 0
+		if niErr == nil {
+			diskGiB = d.sumPoolDiskTotalGiB(ctx)
+		} else {
+			slog.Warn("NodeInfo failed at startup; writing host state without resources", "error", niErr)
+		}
+		// On an upgrade boot, stay "upgrading" until the watchdog confirms local gRPC
+		// is healthy (it flips to "active"); version + resources are still written
+		// here either way so the new version propagates immediately. After a
+		// graceful stop (SIGTERM), or a crash of an active host, the host likewise
+		// stays "upgrading" until this daemon answers its own Ping
+		// (awaitServingThenActivate): recorded active
+		// before its gRPC server listened, it was fenced on the failure count its
+		// observers carried through the restart (hostboot).
+		d.bootRes.mu.Lock()
+		d.bootRes.cpus, d.bootRes.memMiB, d.bootRes.diskGiB, d.bootRes.hasResources = cpus, memMiB, diskGiB, niErr == nil
+		d.bootRes.mu.Unlock()
+		bootCtx, stopBootCheck := context.WithCancel(ctx)
+		bootDone := d.checkerThenBootWrite(bootCtx, cpus, memMiB, diskGiB, niErr == nil)
+		ownRowDone := d.startOwnRowHold(bootCtx)
+		defer func() { stopBootCheck(); <-bootDone; <-ownRowDone }()
+		// Record version on the corrosion client so it goes into Crescent
+		// peer handshakes (used by skew detection).
+		d.db.SetLocalVersion(d.cfg.Version)
+
+		// Register storage pools in the cluster DB and start periodic refresh.
+		// Their statfs and path resolutions are bounded (poolStatfs,
+		// storage.Bounded). The in-place hardening of an NFS mount runs a remount
+		// command, and is waited for only up to startupStepBound
+		// (startup_bound.go).
+		d.registerStoragePools(ctx)
+		awaitStartupStep("harden NFS pool mounts", startupStepBound, func() { d.hardenNFSPoolMounts(ctx) })
+		d.refreshDBPoolCapacity(ctx)
+		go d.refreshStoragePools(ctx)
+
+		// Install the anti-entropy timing sink on the Client BEFORE starting the
+		// replicator / anti-entropy loops (and the gRPC server) that read it — the
+		// field is set-once-then-read, so wiring it here establishes happens-before
+		// and avoids a data race with those goroutines. It lives on the Client so
+		// dumps served directly through grpcapi (DumpStateBytes / StreamStateDump)
+		// are observed too.
+		d.db.SetSyncMetrics(metrics.NewAntiEntropyMetrics())
+
+		// The host health checker was created (above, before the boot write) BEFORE
+		// the replicator so the proof-table WAL gate is installed before any
+		// replication goroutine runs (a nil gate fails closed, but wiring it up front
+		// means no reliance on that), with the durable split-brain activation latch
+		// loaded before any runtime work is wired, so a previously-enforced node that
+		// restarts (including mid-partition) gates onboot VM starts / LB (re)apply
+		// instead of running them ungated. (Peer capability is wired later via
+		// SetPeerPinger; until then PeerSupports fails closed, so proof WAL entries
+		// defer rather than leak — never a schema-version guess.)
+		gateMetrics := metrics.NewRuntimeGateMetrics()      // shared by all gate observers
+		stateWriteMetrics := metrics.NewStateWriteMetrics() // shared by all state-write observers
+
+		// Start WAL-based replicator with Crescent relay protocol.
+		// One relay election for both the replicator and anti-entropy, whose
+		// scheduled pass always contacts this node's relays.
+		relayCfg := corrosion.RelayConfig{
+			BaseRelays:      3,
+			NodesPerRelay:   50,
+			FallbackTimeout: 15 * time.Second,
+		}
+		repl := corrosion.NewReplicator(d.db, d.cfg.PKIDir, relayCfg)
+		// Token-based (fresh-Ping-cached) gate for proof-table WAL replication, wired
+		// BEFORE Start: only send runtime_action_proofs mutations to a peer that
+		// advertises the gate. Fail-closed until SetPeerPinger (below) — proofs defer.
+		repl.SetProofReplicaGate(func(ctx context.Context, peer string) bool {
+			return d.checker.PeerSupports(ctx, peer, capabilities.SplitBrainGateV1)
+		})
+		// LWW future-skew quarantine (partial): enabled only once LWWSkewGuardV1 has
+		// latched on this node (cheap marker read, no ping/I/O), so a future-skewed peer's
+		// rows can't win a conflict. The token is advertised, so enforcement is gated on the
+		// enforcement.lww_skew_guard config flag AND the latch — behavior-neutral until an
+		// operator enables it (and the flag is the reversible kill switch).
+		// NOTE: does not address the backward-clock case (NowTS still emits wall-clock) —
+		// that's deferred to a separate conflict-key migration.
+		d.db.SetHLCSkewGuard(func() bool {
+			// Config kill-switch AND the latched capability (the HA monitor drives the
+			// latch while healthy). Latched (not Enforced) keeps this merge-hot-path read
+			// off any peer dial.
+			return d.cfg.Enforcement.LWWSkewGuard && d.checker.Latched(capabilities.LWWSkewGuardV1)
+		})
+		// Emit the LWW conflict key (updated_at) as HLC instead of RFC3339Nano once
+		// enforcement.hlc_lww is set AND the token has latched cluster-wide (the HA monitor
+		// drives the latch while healthy). Cheap Latched read on the per-write path; the
+		// instant-based comparator makes the RFC3339↔HLC switch and a flag-off rollback safe.
+		d.db.SetHLCEmit(func() bool {
+			return d.cfg.Enforcement.HLCLww && d.checker.Latched(capabilities.HLCLwwV1)
+		})
+		// Emit the order-invariant digest_v2 hashes unless enforcement.digest_v2 is
+		// explicitly off (it defaults on). No capability latch: v2 is negotiated PAIRWISE by wire-field presence (each node emits
+		// v2 only when locally enabled; two peers compare v2 only when both emitted it), so a
+		// non-uniform rollout only affects which node initiates a pull, never a decision.
+		d.db.SetDigestV2Enabled(func() bool { return d.cfg.Enforcement.DigestV2 })
+		// Resolve the natural-key identity tables (snapshots, container_snapshots) by their UNIQUE
+		// natural key once enforcement.canonical_identity is set AND the token has latched
+		// cluster-wide. Unlike digest_v2 this is NOT pairwise-negotiated — identity resolution
+		// mutates shared state, so a per-sender flip would be non-convergent; it must be
+		// fleet-uniform, which the cluster-wide latch guarantees. Cheap Latched read (no peer dial)
+		// on the merge/apply hot path; the config flag is the reversible kill switch.
+		d.db.SetCanonicalIdentity(func() bool {
+			return d.cfg.Enforcement.CanonicalIdentity && d.checker.Latched(capabilities.CanonicalIdentityV1)
+		})
+
+		d.wireCorrosionGates()
+
+		// Migrate legacy unscoped network names to stack-scoped names. After the
+		// gates: its VM spec rewrites are desired-spec edits, which carry their
+		// owner epoch once spec_conflict_v1 has latched, so receivers order them
+		// by generation rather than by the row clock.
+		if err := corrosion.MigrateLegacyNetworkNames(ctx, d.db); err != nil {
+			slog.Warn("failed to migrate legacy network names", "error", err)
+		}
+
+		// Apply a replicated guarded VM-name replacement once vm_replace_v1 is DURABLY
+		// LATCHED. Durable, not Latched or the config flag: a replace batch already on
+		// the wire must not become unacceptable across a restart — a node that latched
+		// only in memory would reload no marker and refuse it — or it stalls that
+		// sender's stream forever.
+		d.db.SetVMReplaceAccept(func() bool {
+			return d.checker.DurablyLatched(capabilities.VMReplaceV1)
+		})
+		d.db.SetVMSnapshotClaimCapability(func() bool {
+			return d.checker.DurablyLatched(capabilities.VMSnapshotClaimV1)
+		}, func(ctx context.Context) bool {
+			// Enforced drives/retries persistence; it is not the fresh emission check.
+			if !d.checker.Enforced(ctx, capabilities.VMSnapshotClaimV1) ||
+				!d.checker.DurablyLatched(capabilities.VMSnapshotClaimV1) {
+				return false
+			}
+			ready, _ := d.checker.CapabilityActive(ctx, capabilities.VMSnapshotClaimV1)
+			return ready
+		})
+		// Every push declares this build's release tokens from the first one
+		// (I-R2-2): the server, which wires the live advertisement, is built later,
+		// and a push that declared nothing would be refused by every peer with a
+		// release feature in use.
+		repl.SetAdvertisedCapabilities(capabilities.ReleaseTokens)
+		repl.Start(ctx)
+
+		// Audit key lifecycle, deferred until replication is running.
+		//
+		// Adoption and retirement both record a SEQUENCE, and both are permanent:
+		// records are append-only and the strictest verified value wins, so a boundary
+		// taken from a local tail that is behind the cluster can never be corrected.
+		// Running this before the replicator meant a rebuilt or snapshot-restored node
+		// pinned its contract start — or its predecessor's retirement — below its own
+		// real history, and every row in the gap became a permanent finding on every
+		// node the moment anti-entropy delivered it.
+		go d.finishAuditKeyLifecycle(ctx)
+
+		// Fold what `lv user reset-admin` journalled while this daemon could not be
+		// reached, signed and at the time it happened (corrosion/pending_audit.go).
+		go d.runPendingAuditFold(ctx)
+
+		// Move the secret columns onto the sensitive lane once credentials_split_v1
+		// has durably latched, and empty them once credentials_clear_v1 has too.
+		// Inert until then; see corrosion.SplitCredentials.
+		go d.runCredentialsSplit(ctx)
+
+		// Give host state and isolation their own row once host_membership_split_v1
+		// has durably latched. Inert until then; see corrosion.SplitHostMembership.
+		go d.runHostMembershipSplit(ctx)
+
+		// Give the host's own reports (version, schema version, resource totals)
+		// their own row once host_runtime_split_v1 has durably latched. Inert
+		// until then; see corrosion.SplitHostRuntime.
+		go d.runHostRuntimeSplit(ctx)
+
+		// Restore "at least one live admin" after racing deletes on two nodes
+		// (corrosion/admin_floor.go).
+		go d.runAdminFloor(ctx)
+
+		// Start anti-entropy (periodic digest comparison + full sync as safety net).
+		// Interval is operator-configurable (anti_entropy_interval_sec); 0 → 60s
+		// default inside NewAntiEntropy. (P2-2)
+		ae := corrosion.NewAntiEntropy(d.db, d.cfg.PKIDir, time.Duration(d.cfg.AntiEntropyIntervalSec)*time.Second)
+		ae.SetRelayConfig(relayCfg)
+		ae.SetLegacyRepair(d.cfg.AntiEntropyLegacyRepair)
+		go ae.Start(ctx)
+		// Release probation (entered only from a marker at boot) is lifted only by
+		// asking a voter majority.
+		go RunReleaseProbation(ctx, d.db, ae)
+
+		// Start metrics server. Create the LXC runner ONCE here and share it with the
+		// gRPC container adapter + health checker below, so the metrics collector can
+		// also read live container cgroup usage (host-local, no RPC).
+		lxcRunner := lxc.NewLxcRunner()
+		lxcRunner.HostName = d.cfg.HostName
+		lxcRunner.DefaultPidsMax = d.cfg.Containers.DefaultPidsMax
+		lxcRunner.IDMappedRootfs = d.cfg.Containers.IDMappedRootfs
+		lxcRunner.HostAccess = d.cfg.Containers.hostAccess(d.cfg.DataDir, d.cfg.PKIDir)
+		lxcRunner.HostAccess.Deny = append(lxcRunner.HostAccess.Deny, d.storeDenyStatic()...)
+		lxcRunner.HostAccess.DenyFunc = d.storeDenyDynamic
+		lxcRunner.HostAccess.BlockInUse = d.vmDiskBlockInUse
+		// In the background: it stats every protected tree, backup repos
+		// included, and one of those may be on an NFS mount whose server does not
+		// answer (startup_bound.go).
+		go func(ha lxc.HostAccess) { d.noteHostAccessOverlaps(ctx, lxc.HostAccessOverlaps(ha)) }(lxcRunner.HostAccess)
+		go refreshHookPolicies(ctx, lxcRunner)
+		// What a crash left of a recreate's image fetch, and of a pull replacing
+		// an OCI library item: before any create can read either.
+		if err := lxcRunner.SweepFetchDir(); err != nil {
+			slog.Warn("container image fetch: could not clear what an earlier run left staged", "error", err)
+		}
+		if err := lxc.RecoverOCILibrary(filepath.Join(d.cfg.DataDir, storage.OCILibraryDir)); err != nil {
+			slog.Warn("oci library: could not finish what an interrupted pull left", "error", err)
+		}
+		lxcRunner.SubIDSpan = &lxc.IDMap{Base: d.cfg.Containers.IDMapBase, Size: int64(d.cfg.Containers.IDMapRanges) * lxc.IDMapSize}
+		d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)
+		d.metrics.SetReplicationTargets(repl.Targets)
+		d.metrics.SetRelayRoles(repl.RelayRoles)
+		d.metrics.SetParkedEntries(repl.ParkedCounts)
+		// metrics_port: 0 DISABLES the endpoint, matching rest_port below and what
+		// docs/configuration.md says about it. Without the guard, 0 composed ":0"
+		// and bound an EPHEMERAL port on every interface — an unauthenticated
+		// inventory endpoint on an unpredictable port, which is the opposite of
+		// what an operator setting 0 is asking for, and the exposure warning then
+		// named port 0, so the one datum needed to firewall it was useless.
+		if d.cfg.MetricsPort > 0 {
+			go d.metrics.Start()
+		} else {
+			slog.Info("metrics endpoint disabled (metrics_port: 0)")
+		}
+
+		// Start the host health checker (created above, before the replicator).
+		go d.checker.Start(ctx)
+
+		// One capacity policy shared by admission (svc below), failover, and the
+		// rebalancer, so placement and admission can never disagree.
+		capacity := d.cfg.Capacity.Policy()
+
+		// Create the failover coordinator; started after the gRPC server is built
+		// so its replica-promoter (auto_promote recovery) can be wired first.
+		fc := failover.NewCoordinator(d.cfg.HostName, d.db)
+		fc.SetCapacityPolicy(capacity)
+		// The relay-health floor is the replicator's own BaseRelays.
+		fc.RelayConfig = relayCfg
+
+		// Start snapshot scheduler. Leader-gated like the
+		// rebalancer; the runner is wired below once the gRPC Server is
+		// constructed (it reuses lockVM + pickDisk).
+		d.snapScheduler = scheduler.NewSnapshotScheduler(d.db, d.cfg.HostName, nil /* runner set after server build */)
+
+		// Create the VM health checker (event bus wired after gRPC server is created
+		// below). Gate restart-policy starts on local quorum (once enforced). The sweep
+		// loop is NOT started here — it launches below, only after the full gate
+		// (SetPeerPinger) and its callbacks are wired, so a gated runtime start never
+		// runs in a window where capability can't yet be confirmed.
+		vmChecker := health.NewVMChecker(d.cfg.HostName, d.cfg.DataDir, d.db, d.virt)
+		vmChecker.SetGate(d.checker)
+		vmChecker.SetGateRefusedObserver(gateMetrics.Refused)
+		vmChecker.SetStateWriteFailObserver(stateWriteMetrics.Failed)
+
+		// Start libvirt reconnect loop — auto-reconnects if libvirtd restarts (#42).
+		go d.virt.StartReconnectLoop(ctx)
+
+		// Can this host's QEMU do a VNC console password? A FIPS-mode host has no
+		// DES for VNC authentication and would refuse every passworded start, so
+		// it sets none and reports console_password_v1 in not_enforcing
+		// (docs/ui.md "Console passwords"). Asynchronous: until it answers, a
+		// refused start is still caught by the start backstop.
+		if reason := libvirt.SpiceUnusableReason(); reason != "" {
+			slog.Warn("SPICE consoles cannot connect on this host; VMs still run and VNC still works", "reason", reason)
+		}
+		go func() {
+			defer d.virt.MarkVNCProbed()
+			if reason := libvirt.ProbeVNCPassword(ctx); reason != "" {
+				d.virt.SetVNCPasswordUnavailable(reason)
+				slog.Warn("this host cannot give VNC consoles a password; they stay open here (SPICE keeps its own)",
+					"reason", reason)
+			}
+		}()
+
+		// Register domain event callback for immediate VM death detection (#44).
+		eventHandler := health.NewDomainEventHandler(d.cfg.HostName, d.db)
+		eventHandler.SetStateWriteFailObserver(stateWriteMetrics.Failed)
+		d.virt.RegisterDomainEventCallback(eventHandler.Callback(ctx))
+
+		// Create the VM reconciler (picks up "pending" VMs from failover and starts
+		// them). Wire the split-brain gate now, but DON'T start the reconcile loop or
+		// onboot autostart yet — they launch below, after SetPeerPinger and the
+		// reconciler's callbacks (LB refresh, image pull, firmware paths) are wired, so
+		// an isolated/latched restart can't run automated starts before the gate can
+		// confirm capability.
+		reconciler := health.NewReconciler(d.cfg.HostName, d.cfg.DataDir, d.db, d.virt)
+		reconciler.SetGate(d.checker)
+		reconciler.SetOwnerEpochBackfill(d.cfg.Enforcement.OwnerEpoch) // Phase 4 backfill pass
+		// Unconditional: the out-of-band stop sync waits until this node's replica
+		// has caught up with a peer (anti-entropy, above) since start / last rejoin.
+		reconciler.SetReplicaFreshness(d.db.ReplicaCaughtUp)
+		reconciler.SetGateRefusedObserver(gateMetrics.Refused)
+		reconciler.SetStateWriteFailObserver(stateWriteMetrics.Failed)
+		reconciler.SetSharedStorageFenceEnforce(d.cfg.Enforcement.SharedStorageFence) // shared-disk transfer fence kill-switch
+
+		// Daily prune of this host's vm_events rows so the operational event store
+		// stays bounded (see config vm_event_*).
+		go d.runVMEventPrune(ctx)
+
+		// Hourly local GC of superseded/orphaned auth + LB rows (re-enroll / LB-recreate
+		// churn). Local-only deterministic deletes — runs on every node.
+		go d.runSupersededGC(ctx, metrics.NewGCMetrics())
+
+		// Hourly removal of the disk copies a failover start set aside here, once
+		// past superseded_disk_retention_days (health/superseded_retention.go).
+		go d.runSupersededDiskSweep(ctx)
+
+		// A UEFI vars file whose flush failed is a host condition
+		// (nvram_flush_failed); the flusher itself started with Run.
+		go d.runNvramFlushCondition(ctx, nvramFlusher)
+
+		// Sample this host's aggregate disk/net rates into host_runtime_usage for the
+		// placement engine's DiskIOPS/NetBW dimensions.
+		go d.runRuntimeUsageSampler(ctx)
+
+		// Backstop reload of the RBAC engine so peer-replicated role/binding
+		// mutations take effect without a restart (local grants/revokes already
+		// apply synchronously via reload/delta in the handlers).
+		go d.runAuthEngineReload(ctx)
+
+		// Install any cluster CRL this node is missing. Removing a host revokes its
+		// certificate, and a revocation that never arrives is a decommissioned node
+		// still holding a working peer credential.
+		go d.runCRLSync(ctx)
+
+		// Keep the live gossip keyring in step with pki_dir/gossip.key, and report
+		// what it is using to pki_dir/gossip-keyring.state — the barrier
+		// `lv host rotate-gossip-key` waits on between phases. Runs when gossip
+		// encryption is off too, so the rotate and install commands can tell an
+		// off node from one that never started.
+		go d.db.WatchGossipKeyFile(ctx,
+			filepath.Join(d.cfg.PKIDir, pki.GossipKeyName),
+			filepath.Join(d.cfg.PKIDir, pki.GossipKeyringStateName),
+			gossipKeyReloadInterval)
+
+		// Publish this host's signed audit chain head periodically and at shutdown.
+		// Nothing else can detect a truncated tail: the hash chain links backward,
+		// so removing the last N rows leaves every surviving link verifying.
+		go d.runAuditChainHeads(ctx)
+
+		// Verify this node's view of the audit chain on a schedule and publish the
+		// result. A check that only runs when an operator asks for it finds an
+		// intrusion after the incident that prompted them to look.
+		go d.runAuditChainVerify(ctx)
+
+		// Start embedded DNS server, and tell the network layer to chain per-bridge
+		// dnsmasq instances to it for the litevirt domain so guests can resolve
+		// VM/container/anycast names (SetLocalResolver must precede network provisioning).
+		dnsSrv := dns.NewServer(d.cfg.DNSDomain, d.cfg.DNSPort, d.db)
+		network.SetLocalResolver(d.cfg.DNSDomain, d.cfg.DNSPort)
+		go dnsSrv.Start(ctx)
+
+		// Start hardware watchdog heartbeat (optional). The controller lets Phase-2 VIP
+		// self-demotion trip a self-fence when a demotion can't be confirmed.
+		watchdogCtrl := watchdog.NewController()
+		// Clean-shutdown disarm hole (§B Phase 5): only a host that owns nothing may
+		// disarm on SIGTERM. A restart re-pets inside the timeout; a stop that
+		// abandons running workloads lets the watchdog reboot the host into a safely
+		// fenced state. Probe errors count as NOT owned — the probe runs through the
+		// same clients the daemon manages workloads with, so a host that cannot
+		// answer is overwhelmingly one with no runtime at all (containers-only or
+		// fresh hosts must not reboot on every daemon stop). VIP ownership is not
+		// yet probed here — Phase 5 adds it with the quorum-gated handoff.
+		watchdogCtrl.SetOwnershipCheck(func() bool {
+			if names, err := d.virt.ListRunningDomains(); err == nil && len(names) > 0 {
+				slog.Warn("watchdog: refusing shutdown disarm — running VMs owned", "count", len(names))
+				return true
+			}
+			probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer probeCancel()
+			if names, err := lxcRunner.ListRunning(probeCtx); err == nil && len(names) > 0 {
+				slog.Warn("watchdog: refusing shutdown disarm — running containers owned", "count", len(names))
+				return true
+			}
+			return false
+		})
+		go watchdog.Heartbeat(ctx, d.cfg.WatchdogDev, 0, watchdogCtrl)
+		// Central self-fence hard gate: once this node self-fences, the checker's Execution/
+		// DecisionGate fail closed regardless of quorum, so every gate consumer (reconciler,
+		// grpcapi server, failover coordinator) refuses runtime-ownership work during the
+		// doomed fence-timeout window.
+		d.checker.SetSelfFenced(watchdogCtrl.Fenced)
+
+		// PCI device startup scan
+		d.runPCIScan(ctx)
+
+		// Start periodic PCI rescan timer (if configured).
+		if interval := d.parsePCIRescanInterval(); interval > 0 {
+			go d.runPeriodicPCIScan(ctx, interval)
+		}
+
+		// Ensure libvirt storage pools exist. libvirtd may stat a pool's
+		// directory to define or refresh it, and block on an NFS server that does
+		// not answer: waited for only up to startupStepBound.
+		awaitStartupStep("ensure libvirt storage pools", startupStepBound, d.ensureStoragePools)
+
+		// Start gRPC server with mTLS
+		tlsCfg, err := pki.ServerTLSConfig(d.cfg.PKIDir)
+		if err != nil {
+			return fmt.Errorf("TLS config: %w", err)
+		}
+
+		svc := d.newServer() // host address and release gate: before the first network pass
+		// A guarded VM recovers only onto a host that enforces NIC guards until
+		// every host does (re-review m8).
+		fc.SetNICGuardPlacement(svc.GuardHostNeeded)
+		d.svc = svc
+		if d.startWaitSvc != nil {
+			d.startWaitSvc.Store(svc)
+		}
+		svc.SetSupersededDiskRetentionDays(d.cfg.SupersededDiskRetentionDays)
+		{
+			iv := d.cfg.HostUpdates.IntervalMinutes
+			if iv <= 0 {
+				iv = 360
+			} else if iv < 5 {
+				iv = 5
+			}
+			svc.SetHostUpdates(grpcapi.HostUpdatesConfig{
+				Enabled:      d.cfg.HostUpdates.Enabled,
+				Interval:     time.Duration(iv) * time.Minute,
+				RefreshIndex: d.cfg.HostUpdates.RefreshIndex,
+			})
+		}
+		svc.SetContainerIDMapRange(d.cfg.Containers.IDMapBase, d.cfg.Containers.IDMapRanges)
+
+		// Re-provision every network (bridge, gateway, DHCP, NAT, VXLAN) and tear
+		// down every deleted one. dnsmasq is a child process that dies when the
+		// daemon restarts; this brings it back. The same pass then runs on an
+		// interval (StartNetworkReconciler, below), which is what carries a
+		// network created or deleted on another node to this one.
+		if err := svc.ReconcileNetworksOnce(ctx); err != nil {
+			slog.Warn("startup network reconcile failed", "error", err)
+		}
+		// Wire the split-brain gate onto the gRPC server BEFORE ReconcileLBs (below)
+		// re-applies VIPs, so an isolated/latched restart can't bring up a VIP ungated.
+		svc.SetGate(d.checker)
+		// The operator's hosts writes refuse on a replica that has not caught up
+		// (grpcapi/host_incarnation.go).
+		svc.SetHostWriteCurrencyCheck(true)
+		// Start rebalance coordinator. Leader-gated; safe to start on
+		// every host. Defaults to dry-run on every VM unless compose says otherwise.
+		// Its lease stands down on the server's LeaseQuorumLost, as RunRebalance's
+		// and the rebalance executor's do: one predicate for the one lease.
+		rc := scheduler.NewRebalancer(d.cfg.HostName, d.db)
+		rc.SetCapacityPolicy(capacity)
+		rc.QuorumLost = svc.LeaseQuorumLost
+		go rc.Start(ctx)
+		d.checker.SetReleaseUseConfirmer(svc.PeerHoldsReleaseFeatureUse)
+		// A peer advertising a release token this build does not know is, almost
+		// always, a forward roll: a non-blocking look at its used records, never a
+		// probation (N2). Probation comes only from a marker at boot.
+		corrosion.WireUnknownReleaseObserver(ctx, d.checker, ae)
+		// Take no replicated state from a peer that cannot keep a release feature
+		// in use: pushes are refused in PushMutations, pulls here.
+		d.db.SetReplicationSourceGate(svc.ReleaseSourceAllowed)
+		// A probation round that hears of a newer voter generation adopts it (each
+		// certificate verified) and counts against it (I-R4-2).
+		ae.SetVoterAdopter(svc.AdoptVoterConfigs)
+		// The server can answer the lease-mint clearance from here on: it has the
+		// gate whose quorum and healthy-peer set its high-water read uses.
+		d.mintClearance.Store(svc)
+		svc.SetGateRefusedObserver(gateMetrics.Refused)
+		svc.SetLeaseBarrierIncompleteObserver(gateMetrics.LeaseBarrierIncomplete)
+		svc.SetLeaseClaimNoMajorityObserver(gateMetrics.LeaseTermClaimNoMajority)
+		svc.SetStateWriteFailObserver(stateWriteMetrics.Failed)
+		// SR-IOV VF-pool policy: which PFs litevirt may adopt for VF creation, the pool
+		// cap, and the degraded gauge. Validate the allowlist against live hardware now,
+		// and re-validate on the rescan cadence.
+		svc.SetSRIOVMetrics(metrics.NewSRIOVMetrics())
+		svc.SetSRIOVPolicy(d.cfg.PCI.SRIOV.Managed, d.cfg.PCI.SRIOV.MaxVFsPerPF, d.cfg.PCI.SRIOV.ManagedPFs)
+		svc.ValidateSRIOVPolicy()
+		// Spare pcie-root-ports on every newly-defined q35 domain, so hot-plug has a
+		// free slot to attach into (see daemon.PCIConfig.SparePCIeRootPorts). Both the
+		// server (create/import/clone/promote/update) and the reconciler (sweep
+		// redefines) need it — a redefine that goes through either must agree on the
+		// node's current value.
+		svc.SetSparePCIeRootPorts(d.cfg.PCI.SparePCIeRootPorts)
+		reconciler.SetSparePCIeRootPorts(d.cfg.PCI.SparePCIeRootPorts)
+		if d.cfg.PCI.SRIOV.Managed {
+			go svc.RunSRIOVValidation(ctx, d.parsePCIRescanInterval())
+		}
+		// The udev_hook is deprecated: real-time PCI events are covered by the rescan
+		// interval. Warn (don't fail) so operators migrate off the broken curl-to-REST rule.
+		if d.cfg.PCI.UdevHook {
+			slog.Warn("pci.udev_hook is deprecated and no longer installs a udev rule; rely on pci.rescan_interval instead. Remove any /etc/udev/rules.d/99-litevirt-pci.rules left from an older install.")
+		}
+		// Target the upgrade swap at the binary we're actually running (re-exec uses
+		// os.Executable()), so a non-/usr/local/bin install upgrades correctly.
+		if exe, err := os.Executable(); err == nil {
+			svc.SetBinaryPath(exe)
+		}
+		svc.SetVersion(d.cfg.Version)
+		svc.SetDNSDomain(d.cfg.DNSDomain)
+		// Resolve OVMF firmware paths once (G1) and share with the server + reconciler
+		// so every domain-builder renders the same files the capability label reflects.
+		firmwarePaths := libvirt.ResolveFirmwarePaths()
+		svc.SetFirmwarePaths(firmwarePaths)
+		reconciler.SetFirmwarePaths(firmwarePaths)
+		// One firmware store (NVRAM under the data dir, swtpm under libvirt's
+		// root) for the host, the guarded one New built, shared by the server and
+		// the reconciler.
+		svc.SetFirmwareStore(d.fwStore)
+		reconciler.SetFirmwareStore(d.fwStore)
+		svc.SetSessionTimeouts(parseDurationOr(d.cfg.Auth.SessionIdleTimeout, 0), parseDurationOr(d.cfg.Auth.SessionHardExpiry, 0))
+		svc.SetStrictMTLSIdentity(d.cfg.Auth.StrictMTLSIdentity)
+		svc.SetTrustRotatedPeerCerts(d.cfg.Auth.TrustRotatedPeerCerts)
+		defer svc.StopDHCPReservations()
+		if err := svc.InitializeAutomationSource(ctx); err != nil {
+			slog.Warn("automation source publication unavailable after completed-evidence reconciliation", "error", err)
+		}
+		svc.SetForwardedIdentity(d.cfg.Auth.ForwardedIdentity)
+		svc.SetRBACRealm(d.cfg.Auth.RBACRealm)
+		// Split-brain-family enforcement kill-switches — so the HA monitor drives the
+		// right tokens' latches (mandatory ∪ configured-on) and gates degraded/paging on
+		// config intent. The actual enforcement predicates live on the consumers
+		// (Coordinator, the lww/vip closures above), wired from the same config below.
+		svc.SetEnforcementConfig(
+			d.cfg.Enforcement.SafeFenceDefault,
+			d.cfg.Enforcement.LWWSkewGuard,
+			d.cfg.Enforcement.HLCLww,
+			d.cfg.Enforcement.VIPSelfDemote,
+			d.cfg.Enforcement.VIPProofReclaim,
+			d.cfg.Enforcement.SharedStorageFence,
+		)
+		// netbox_ipam_v1 is advertised only while this node's config enables the
+		// NetBox integration, so the cluster-wide latch requires config uniformity,
+		// not just a uniform build (see capabilities.NetBoxIPAMV1).
+		svc.SetNetBoxIPAM(d.cfg.NetBox.Enabled)
+		// The INVENTORY MIRROR is a second, narrower opt-in, driving its own token
+		// (netbox_mirror_v1) the same conditional-advertisement way. Default off:
+		// NetBox is pure IPAM unless this node asks for inventory too, and the latch
+		// requires every node to ask — the sweep runs on one lease holder, so a
+		// non-uniform flag makes the inventory follow leadership. Set BEFORE
+		// StartNetBoxMirror, which declines outright when it is off.
+		svc.SetNetBoxMirrorInventory(d.cfg.NetBox.MirrorInventory)
+		// BEFORE the mirror starts. The name decides which NetBox cluster object
+		// every mirrored VM hangs off, and the CA re-key resolves the same one.
+		svc.SetNetBoxClusterName(d.cfg.NetBox.ClusterName)
+		svc.SetNetBoxSite(d.cfg.NetBox.Site)
+		// The client itself. A node whose config ENABLES the integration but whose
+		// client cannot be built (missing/empty token file, no URL) must not start:
+		// it would advertise netbox_ipam_v1 — helping the cluster latch — while
+		// every bind and claim on it refused for want of a client. Failing startup
+		// keeps the "config uniformity" the latch depends on honest.
+		if d.cfg.NetBox.Enabled {
+			nbClient, err := netbox.New(netbox.Config{
+				BaseURL:   d.cfg.NetBox.URL,
+				TokenPath: d.cfg.NetBox.TokenPath,
+				Timeout:   time.Duration(d.cfg.NetBox.TimeoutSec) * time.Second,
+			})
+			if err != nil {
+				return fmt.Errorf("netbox client: %w", err)
+			}
+			svc.SetNetBoxClient(nbClient)
+			// The real counter sink, replacing the noop. Registered on the default
+			// registry, so it is served wherever /metrics is.
+			svc.SetNetBoxMetrics(metrics.NewNetBoxMetrics())
+			// Binding revalidation + the orphan sweep, on the configured cadence.
+			// Started ONLY here: a node with no NetBox configuration creates no
+			// goroutine and never enters the `netbox` leader-lease race. The sweep
+			// itself is leader-gated, so every configured node running this loop
+			// still means exactly one reclaiming node cluster-wide.
+			svc.StartNetBoxMaintenance(ctx, time.Duration(d.cfg.NetBox.SweepIntervalSec)*time.Second)
+			// The inventory mirror, on the SAME cadence and the SAME leader lease.
+			// One key, not two: the sweeper reclaims addresses and the mirror
+			// rewrites the objects that name them, so a cluster where two different
+			// nodes led the two would have each acting on state the other was
+			// changing underneath it.
+			svc.StartNetBoxMirror(ctx, time.Duration(d.cfg.NetBox.SweepIntervalSec)*time.Second)
+		}
+		// One operator switch drives both operation_protocol_v1 and its dependent
+		// capacity_admission_v1 token; capacity admission has no standalone flag.
+		svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
+		svc.SetDefaultCPUMode(d.cfg.VM.DefaultCPUMode)
+		svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
+		// Console passwords: every define on this host (grpcapi's and the health
+		// reconciler's, which share d.virt) applies svc.ConsolePasswordActive —
+		// this flag AND the console_password_v1 latch. NewServer wired the hook.
+		svc.SetConsolePassword(d.cfg.Enforcement.ConsolePassword)
+		// vrrp_unicast_v1: advertised only with enforcement.vrrp_unicast on; an
+		// LB renders unicast VRRP only with this flag AND the durable latch.
+		svc.SetVRRPUnicast(d.cfg.Enforcement.VRRPUnicast)
+		svc.SetAllowUnencryptedStorageMigration(d.cfg.Migration.AllowUnencryptedStorage)
+		svc.SetMigrationNetwork(d.cfg.Migration.Network)
+		svc.SetMigrationAddress(d.cfg.Migration.Address)
+		migrationTLS := d.migrationTLSInstaller()
+		svc.SetMigrationTLS(migrationTLS)
+		svc.SetMigrationCAFingerprint(func() (string, error) { return pki.MigrationCAFingerprint(d.cfg.PKIDir) })
+		svc.SetMigrationCAList(func() ([]string, error) { return pki.MigrationCAFingerprints(d.cfg.PKIDir) })
+		svc.SetMigrationTLSCheck(d.migrationTLSChecker())
+		svc.SetMigrationTLSStatus(func() *pb.MigrationTLSHostStatus {
+			return migrationTLSStatusRow(pki.InspectMigrationTLS(d.cfg.PKIDir, time.Now()))
+		})
+		go runMigrationExpiryWatch(ctx, d.cfg.PKIDir)
+		// Install once at start so the operator sees the state in the log; it runs
+		// again before each storage migration.
+		ok, wrote, err := d.installMigrationTLS()
+		logMigrationTLSInstall(ok, wrote, err)
+		// Cluster-wide capacity policy (overcommit ratios + host reserves). Per-host
+		// overrides live on the host record and win where set.
+		svc.SetCapacityPolicy(capacity)
+		svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
+		svc.SetVMReplaceEnforce(d.cfg.Enforcement.VMReplace)                 // drives the latch + conditional advertisement; gates `lv cutover`
+		// The first pass over the swtpm tree (vtpm_state_sync), before anything
+		// on this host can start a VM: the cutover resume below, the startup
+		// recovery barrier, the runtime loops, onboot autostart and the API.
+		// It completes, or runs past vtpmPassWait and raises
+		// vtpm_state_not_durable; either way no vTPM guest writes state here
+		// before the attempt to make that state synchronous. The vTPM capability
+		// label (below) reuses the same probe.
+		vtpmMarker := filepath.Join(d.cfg.DataDir, "vtpm-state-sync")
+		vtpmSync := &vtpmStateSync{
+			on:   d.cfg.VTPMStateSyncEnabled(),
+			base: d.fwStore.SwtpmBase,
+			wait: vtpmPassWait,
+			// The host's own store: its swtpm tree is the one this host's
+			// guests write.
+			sync: func(on bool) libvirt.SwtpmSyncReport { return d.fwStore.SyncSwtpmState(on, vtpmMarker) },
+			report: func(open bool, evidence map[string]any) bool {
+				return d.syncVTPMCondition(ctx, open, evidence)
+			},
+		}
+		tpmCapable := tpmCapableProbe(exec.LookPath, vtpmSync.probe)
+		// The live firmware move label reads the pass the vTPM label's probe
+		// ran this cycle, so a cycle walks the swtpm tree once.
+		tpmReady := tpmReadyProbe(exec.LookPath, vtpmSync)
+		awaitFirstVTPMPass(tpmCapable)
+		// Finish any cutover cleanup a previous process left committed-but-unfinished.
+		// The replacement transition displaced the rows describing what the replaced VM
+		// owned, so its journaled manifest is the only surviving record of the volumes
+		// to free — and nothing else will ever look at it.
+		// In the background: it removes the replaced VM's volumes, which may be on
+		// an NFS pool whose server does not answer, and it is safe at any time
+		// (each cleanup is taken under its VMs' locks and re-read there). A
+		// cleanup whose storage does not answer is deferred, not run under the
+		// locks, and any cleanup left journaled is retried (startup_bound.go).
+		go resumeVMReplaceCleanups(ctx, svc, vmReplaceCleanupMinRetry, vmReplaceCleanupRetry)
+		svc.SetProjectAuthorityEnforce(d.cfg.Enforcement.ProjectAuthority) // F2: delegate project-quota admission to the authority holder
+		svc.SetAuditSignatureEnforce(d.cfg.Enforcement.AuditSignature)     // drives the latch + conditional advertisement
+		// Phase 4: owner_epoch_v1 is advertised only when the operator opted in AND
+		// this node.s owned workloads have all graduated out of the pre-epoch 0, so
+		// the fleet can never latch across a node whose generations do not exist yet.
+		svc.SetOwnerEpochEnforce(d.cfg.Enforcement.OwnerEpoch)
+		svc.SetIsolationEpochEnforce(d.cfg.Enforcement.IsolationEpoch)
+		svc.SetOwnerEpochReady(func() bool {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			ready, reason := svc.OwnerEpochReadiness(ctx)
+			if !ready {
+				slog.Debug("owner_epoch_v1 readiness withheld", "reason", reason)
+			}
+			return ready
+		})
+		// Phase 2: lease_term_v1 is advertised only when the operator opted in AND
+		// this node can enforce — a readable ledger, split_brain_gate_v1 already
+		// latched, and a cluster large enough that the quorum barrier does not break
+		// failover.
+		svc.SetLeaseTermEnforce(d.cfg.Enforcement.LeaseTerm)
+		// recovery_claim_v1: advertised only with the flag on and this node ready
+		// (split_brain_gate_v1 latched, able to vote durably), enforced only with
+		// the flag AND the latch AND an adopted voter generation.
+		svc.SetRecoveryClaimEnforce(d.cfg.Enforcement.RecoveryClaim)
+		// partition_pause_v1: advertised only with enforcement.partition_pause on
+		// (default on), because the majority relies on this node pausing.
+		svc.SetPartitionPause(d.cfg.Enforcement.PartitionPause)
+		// The reconciler is the SECOND executor boundary for this regime: a VM
+		// reschedule proof never travels over an RPC, so it is claimed off the
+		// replicated row there rather than in claimCarriedProof. The judgment is
+		// injected because internal/grpcapi imports internal/health and cannot be
+		// imported back — one implementation, wired to both callers.
+		reconciler.SetLeaseTermGate(svc.LeaseTermGateForPendingProof)
+		// The recovery-claim certificate is checked at the same boundary, for the
+		// same reason: a reschedule proof is claimed off the replicated row here,
+		// and a relocate-recreate proof by the container checker.
+		reconciler.SetRecoveryClaimGate(svc.RecoveryClaimGateForPendingProof)
+		// Layer 3 of partition pause (docs/design/partition-pause.md §6): a local
+		// copy whose row a VERIFIED recovery-claim certificate gave to another
+		// host is stopped on that proof, and only on it.
+		reconciler.SetSettleVerifier(svc.VerifySettleProof)
+		reconciler.SetPITOverlayReporter(svc.ReportPITOverlayHeld, svc.ClearPITOverlayHold)
+		reconciler.SetPITOverlayFeature(svc.PITOverlayFeature)
+		reconciler.SetSharedDiskWithheldReporter(svc.ReportSharedDiskWithheld, svc.ClearSharedDiskWithheld)
+		svc.SetLeaseTermReady(func() bool {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			ready, reason := svc.LeaseTermReadiness(ctx)
+			if !ready {
+				slog.Debug("lease_term_v1 readiness withheld", "reason", reason)
+			}
+			return ready
+		})
+		// Once the whole cluster has latched audit_signature_v1, a write this node
+		// cannot sign is an error-level event rather than a normal one.
+		//
+		// It is NOT a refusal. Refusing was the first design and it lost the record
+		// of operations that had already happened, because every caller of
+		// InsertAuditLog discards its error — so the delete or the fence went ahead
+		// with no audit row at all, which is exactly what an attacker would arrange
+		// by making one file unreadable. The row is written unsigned and the
+		// verifier reports it: a host that has signed once cannot legitimately stop,
+		// so every such row is tampering on every node that reads the log.
+		//
+		// Latched, not Enforced: this is read on the audit write path, which must
+		// not ping peers.
+		d.db.SetAuditSignatureRequired(func() bool {
+			return d.cfg.Enforcement.AuditSignature && d.checker.Latched(capabilities.AuditSignatureV1)
+		})
+		svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
+		svc.SetLBMetrics(metrics.NewLBMetrics())
+		svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())
+		svc.SetDualRunMetrics(metrics.NewDualRunMetrics())
+		svc.SetSMARTMetrics(metrics.NewSMARTMetrics())
+		svc.SetReservationMetrics(metrics.NewReservationMetrics())
+		svc.SetStoragePoolsByName(d.storagePoolRefs())
+		// The ceph pools' libvirt secrets (ephemeral: gone after a libvirtd
+		// restart): defined now, then kept in line with the pools and keyrings.
+		// An rbd disk's domain takes its monitors from its pool as configured on
+		// this host when the domain is defined, not from when the disk was made.
+		libvirt.SetCephMonitorResolver(svc.CephMonitorsForPool)
+		// Deleted ceph images wait in their pool's trash for a background purge;
+		// the ones a previous run had not finished are resumed (and named by
+		// ceph_trash_leftover while they fail).
+		if err := storage.ResumeCephPurges(d.cfg.DataDir); err != nil {
+			slog.Warn("ceph: trash purges of a previous run not resumed", "error", err)
+		}
+		svc.ReconcileCephSecrets(ctx)
+		go d.runCephSecretReconcile(ctx)
+		// The iscsi pools' sessions: a host reboot drops them, and node records
+		// at node.startup = manual bring none back. Logged back in now and kept
+		// (grpcapi.ReconcileISCSISessions), off the start path: a portal that
+		// does not answer must not hold the daemon's start.
+		go d.runISCSISessionReconcile(ctx)
+		// Two NICs of the cluster on one MAC (grpcapi.ReconcileMACCollisions).
+		go d.runMACCollisionReconcile(ctx)
+		// The nfs pools' exports: a host reboot unmounts them, and nothing but a
+		// pool's Prepare mounted them. Mounted back now and kept
+		// (grpcapi.ReconcileNFSMounts), off the start path: a server that does
+		// not answer must not hold the daemon's start.
+		go d.runNFSMountReconcile(ctx)
+		// Before this daemon serves: no cold-migration copy can be in flight yet.
+		svc.SweepColdMigrationScratch()
+		svc.SetReplicator(repl)
+		svc.SetAuthEngine(d.authEngine)
+		svc.SetRealmRegistry(d.realmRegistry)
+		vmChecker.SetEventBus(svc.EventBus())
+		vmChecker.SetMigrateFunc(svc.MigrateVMForHealthCheck)
+		// Every guest start the Server performs opens the healthcheck's start grace,
+		// including RestartVM's, which keeps the row "running" and is otherwise
+		// invisible to the checker's sweep.
+		svc.SetVMStartObserver(vmChecker)
+		reconciler.SetVMStartObserver(vmChecker) // onboot and failover starts open the healthcheck start grace too
+		// hardware_v2 pre-start hook: the automated (re)start paths (failover reconciler +
+		// health auto-restart) bypass startVMLocked, so wire them to the Server's shared
+		// adoption-gate + PCI-start-preflight. A strict no-op until hardware_v2 latches, so
+		// this changes nothing on a fleet where the feature is off.
+		vmChecker.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
+		// A health restart runs under the VM's API lock, the one a move, a start
+		// or a stop of the VM holds, so none interleaves with it.
+		vmChecker.SetVMLocker(svc.TryLockVMForHealth)
+		// A health restart moves a stopped VM's NICs onto the devices their
+		// networks are on now, as a start through the Server does.
+		vmChecker.SetNetworkFollower(svc.FollowNetworkDevices)
+		vmChecker.SetNetworkStarter(svc.StartDomainOnNetwork)
+		reconciler.SetNetworkStarter(svc.StartDomainOnNetwork)
+		reconciler.SetSpareRootPortPreparer(svc.EnsureSparePCIeRootPorts)
+		vmChecker.SetCancelledStartProbe(svc.HasCancelledStart) // cancelled_starts.go: neither healed to running nor restarted
+
+		// Wire reconciler callbacks now that gRPC server exists.
+		reconciler.SetOnVMStarted(svc.RefreshLBForStack)
+		reconciler.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
+		reconciler.SetCancelledStartProbe(svc.HasCancelledStart) // cancelled_starts.go: an error row's late-started domain is the sweep's
+		// A held start whose daemon restarted before libvirt answered it: its
+		// lease is taken over once the domain runs, and its outcome recorded
+		// (health/held_start_orphan.go).
+		reconciler.SetHeldStartProbe(svc.HasStartInFlight)
+		reconciler.SetVMEventRecorder(svc.RecordVMEvent)
+		// A start whose ceph key must be proven, late in a walk with no time left
+		// for it, is left untouched for the next pass rather than half-started.
+		reconciler.SetStartDeferral(svc.CephStartDeferral)
+		// A cancel of a start records whether it was a proof-less transfer.
+		svc.SetStartTransferProbe(reconciler.IsDeferredTransfer)
+		reconciler.SetAutoPullImage(svc.AutoPullImage)
+		reconciler.SetRecreateOverlay(svc.RecreateOverlayDisk) // under an image hold (m-6)
+		reconciler.SetDiskStrandedObserver(svc.NotifyVMDiskStranded)
+		reconciler.SetBackupInProgress(svc.BackupInProgress)
+		reconciler.SetNetworkProvision(svc.ProvisionNetworkHere) // a failover start provisions like a VM create
+		// Runtime owner-assert (Phase 3): corroborate a locally-running VM whose DB
+		// row points elsewhere against every other active host's libvirt before
+		// reclaiming it.
+		reconciler.SetPeerRuntimeChecker(svc.CheckPeerVMRuntime)
+		// Split-brain hardening (Phase 1): fresh-Ping peers for capability tokens so
+		// cluster-wide activation of fail-closed gates is computed from live
+		// reachability, never stale replicated rows. Once this is set, the proof-table
+		// WAL gate (wired before repl.Start above) can positively confirm peers; until
+		// now PeerSupports failed closed, deferring proof entries rather than leaking.
+		// Paired with the readiness probe, which turns the peer health check from a
+		// TLS handshake into an application-level question — see wirePeerProbes.
+		wirePeerProbes(d.checker, svc)
+		// Runtime ownership repair metrics (Phase 5): VM owner-assert + CT re-key
+		// outcomes → litevirt_runtime_owner_assert_total.
+		runtimeRepairMetrics := metrics.NewRuntimeRepairMetrics()
+		reconciler.SetOwnerAssertObserver(func(_, result string) { runtimeRepairMetrics.OwnerAssert("vm", result) })
+		// Orphaned runtimes: litevirt domains/containers with no live record, reported
+		// (never reaped) as vm_orphan_runtime / ct_orphan_runtime and this gauge.
+		orphanMetrics := metrics.NewOrphanRuntimeMetrics()
+		observeOrphans := func(kind string, found []health.OrphanRuntime) {
+			samples := make([]metrics.OrphanRuntimeSample, 0, len(found))
+			for _, o := range found {
+				samples = append(samples, metrics.OrphanRuntimeSample{Name: o.Name, Row: o.Row})
+			}
+			orphanMetrics.Set(kind, d.cfg.HostName, samples)
+		}
+		reconciler.SetOrphanRuntimeObserver(observeOrphans)
+
+		// F1 startup recovery barrier: reduce the host-local operation journal against
+		// replicated state BEFORE any runtime loop or API mutation runs — DB +
+		// capability latch + membership are all wired by this point.
+		// Ownership/load already succeeded before the first startup callback. Only
+		// dependency-dependent recovery belongs here; never reopen or skip on error.
+		svc.SetOpJournal(d.opJournal)
 		svc.SetHostNetworkEnv(&hostnet.RealSystem{
-			AdvertiseIP: d.hostAddress(),
-			GRPCPort:    d.cfg.GRPCPort,
+			AdvertiseIP: d.hostAddress(), GRPCPort: d.cfg.GRPCPort,
 		}, d.hostAddress())
 		svc.RecoverHostNetworks(ctx)
 		d.runOperationRecovery(ctx)
-		svc.RecoverDeviceLeases(ctx) // roll back device leases a crash orphaned
-	}
+		svc.RecoverDeviceLeases(ctx)
 
-	// Resume, park or abort each live firmware move this host is the source
-	// of (spec §8.1): its VM's lock is taken here, before any runtime loop
-	// starts, and held until its recovery resolves or parks it.
-	// Unconditional: outside the operation journal's branch above.
-	dbWorkers := newDBWorkerCoordinator(ctx, svc)
-	workerShutdownStarted := false
-	defer func() {
-		if !workerShutdownStarted {
-			dbWorkers.stopStartup(15 * time.Second)
-		}
-	}()
-	dbWorkers.recoverFirmwareMoves(ctx)
-	// A VM recorded migrating here with no move of it running (this daemon
-	// stopped mid-move) is named by vm.migration_unresolved.
-	svc.RaiseLeftMigrating(ctx)
-
-	// F1 resource-update recovery: resume any locally-owned VM wedged on a nonterminal
-	// resource_update_running operation (a live resize that crashed after committing its
-	// desired spec) — converge it to the committed spec + clear the barrier so a partial
-	// failure never wedges active_operation_id. Uses replicated operation state (not the
-	// host-local journal), so it runs regardless of the journal above. A reconciler pass
-	// retries stragglers.
-	// At start a VM whose lock is held (a firmware move's recovery holds it
-	// until the start is wired, below) is skipped; the loop takes it later.
-	svc.RecoverResourceOperationsAtStart(ctx)
-	go svc.RunResourceOperationRecovery(ctx)
-
-	// Release host reservations whose operation provably stopped running (one
-	// finished past its header's owner epoch, or whose VM is gone), after the
-	// recovery above has finished what it could.
-	svc.SweepReservationsOnce(ctx)
-	go svc.RunReservationRecovery(ctx)
-
-	// F1 hardware-operation recovery: resume any locally-owned VM wedged on a
-	// nonterminal device_attach/device_detach operation (a hot-plug that crashed
-	// with the mutation barrier held) — roll an incomplete attach BACK and a detach
-	// FORWARD to a single consistent state, clearing the barrier. Runs synchronously
-	// after DB + libvirt + journal init (uses the host-local journal artifacts), and
-	// a reconciler pass retries stragglers.
-	svc.RecoverHardwareOperationsAtStart(ctx)
-
-	// Release PCI devices a VM owns but provably does not hold, once the
-	// recoveries above have settled every lease and operation that could
-	// explain one (lab finding L1: a failed SR-IOV attach on an older build
-	// left its VF owned). What it cannot prove it reports and leaves owned.
-	svc.SweepUnattachedPCIOwnership(ctx)
-	go svc.RunHardwareOperationRecovery(ctx)
-
-	// v42 hardware foundation (CONTRACT h): backfill the typed-hardware tables
-	// (vm_nics, vm_disks.bus, vm_pci_intent) and record each owned VM's adoption
-	// verdict, THEN mark this node hardware_v2-advertise-ready. Started here —
-	// AFTER the schema is applied (InitSchema, above) and the operation-protocol
-	// config/latch is wired (hardware mutations depend on the crash-safe
-	// operation journal) — but run in the BACKGROUND, because the pass waits for
-	// this node's replica to catch up: it publishes rows for the VMs the local
-	// replica says this host owns, and a replica back from a fence still names
-	// VMs failover has moved away (RunHardwareBackfill). Until it succeeds the
-	// readiness flag advertisedCapabilities gates hardware_v2 on stays false, so
-	// no peer reads hardware_v2 from this node early. A failed pass DEGRADES
-	// (logged and retried) rather than crashing the daemon.
-	go svc.RunHardwareBackfill(ctx)
-	// Continuous legacy→vm_nics bridge: mirrors vm_interfaces writes an OLD peer
-	// makes during the rolling-upgrade window into vm_nics (one-directional; old
-	// peers ignore vm_nics), converging the read overlay toward vm_nics completeness.
-	go svc.RunHardwareBridge(ctx)
-
-	// Now that the split-brain gate is FULLY wired (activation latch + SetPeerPinger
-	// for cluster-wide capability confirmation) and every reconciler/vmChecker
-	// callback is set, start the runtime loops. Launching them here — not at
-	// construction — guarantees no automated runtime start (reschedule, restart
-	// policy, onboot autostart) ever runs in the window before the gate can confirm
-	// capability, closing the fail-open race for a should-enforce node.
-	// distributed firewall: poll cluster security_groups +
-	// sg_rules every 30s and atomically replace this host's nftables
-	// table. The applier short-circuits when the rendered ruleset
-	// hasn't changed, so idle clusters cost ~one corrosion query/tick.
-	fwApplier := firewall.NewApplier(firewall.NftBinary{})
-	// Observe-mode evidence outlives every table reload and daemon restart
-	// (re-review I-4): harvested before each replace, kept in data_dir.
-	fwApplier.SetTally(firewall.NewWouldDropTally(filepath.Join(d.cfg.DataDir, "firewall-would-drop.json"), time.Now()))
-	fwMetrics := metrics.NewFirewallMetrics()
-	// VMs about to start or migrate in here, and NICs whose rows are not
-	// written yet: rendered ahead of their rows (firewall.Arming).
-	fwArming := firewall.NewArming()
-	// Per-NIC rules need bridge connection tracking. Loaded once here; a host
-	// that cannot load it renders the guards only and raises a health
-	// condition (firewall.nic.unavailable), never an empty firewall.
-	bridgeCT := firewall.BridgeConntrackAvailable(ctx, true)
-	// Firewall logging needs the kernel to load a named limit and a log line
-	// to an NFLOG group. Probed once here (nft -c, nothing committed); a host
-	// that refuses renders no log line and raises firewall.log.unavailable.
-	fwLogGroup := uint16(d.cfg.Firewall.LogGroup)
-	fwLogErr := firewall.ProbeLogging(ctx, fwLogGroup)
-	if fwLogErr != nil {
-		slog.Warn("firewall: logging is unavailable on this host; no packet is logged here", "error", fwLogErr)
-	}
-	svc.RecordFirewallLogAvailability(ctx, fwLogErr)
-	// Log lines are rendered only while this daemon's listener holds the
-	// group (firewallLogging); each bind change runs passes. The listener
-	// starts below, once d.fwReconciler exists.
-	fwLogging := newFirewallLogging(ctx, fwLogGroup, fwLogErr,
-		func(c context.Context) error { return d.fwReconciler.Reconcile(c) },
-		func(err error) { svc.RecordFirewallLogListener(ctx, err) })
-	// SYN-flood protection needs the kernel's per-source meters (nft_limit).
-	// Probed once here, check only; a host whose kernel refuses renders none
-	// and raises a health condition (firewall.synflood.unavailable).
-	synFloodProbe := firewall.ProbeSynFlood(ctx)
-	if synFloodProbe.V4 != nil || synFloodProbe.V6 != nil {
-		slog.Warn("firewall: the kernel refused a SYN-flood probe; that family gets no SYN-flood protection on guest NICs here",
-			"ipv4", synFloodProbe.V4, "ipv6", synFloodProbe.V6)
-	}
-	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{},
-		firewall.LoaderOptions{RunningTaps: d.virt.RunningDomainTaps, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs,
-			OnTagGroupMembers:    fwMetrics.SetTagGroupMembers,
-			OnDuplicateAddresses: firewall.NewDuplicateAddressReporter(d.db, d.cfg.HostName).Report,
-			BridgeConntrack:      func() bool { return bridgeCT }, Arming: fwArming,
-			Logging:       fwLogging.Logging,
-			SynFloodProbe: func() firewall.SynFloodProbeResult { return synFloodProbe }})
-	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
-	d.fwReconciler.SetArming(fwArming)
-	// Every domain start — an API start, a restart policy, a failover
-	// reschedule, a restore — first puts the VM's NIC firewall in force here,
-	// its guards above all, and a guarded VM whose guards cannot be is not
-	// started (re-review I-10).
-	d.virt.SetStartGuard(svc.NICStartGuard(ctx))
-	d.fwReconciler.SetStateHook(svc.RecordFirewallState)
-	// Firewall logging: the listener reads the NFLOG group every rendered log
-	// line sends to into a bounded store (docs/firewall.md, "Logging").
-	fwLogStore := openFirewallLogStore(d.cfg, fwMetrics)
-	svc.SetFirewallLogStore(fwLogStore)
-	if fwLogErr == nil {
-		go (&firewall.LogListener{Group: fwLogGroup, Store: fwLogStore,
-			Resolve: d.fwReconciler.ResolveLogDevice,
-			OnBind:  fwLogging.OnBind}).Run(ctx)
-	}
-	go pruneFirewallLog(ctx, fwLogStore)
-	// Whether this host enforces NIC guards, after every pass, the boot pass
-	// included (re-review m8, m2, m5): the label carries this build's
-	// version while the last pass put the per-NIC table in force, so a host
-	// rolled back to an older build — which reports its own version and
-	// knows nothing of the label — stops counting, and so does one whose
-	// kernel refuses the table or whose pass failed or ran out of time. Until
-	// every host enforces them, a guarded VM is placed only on such a host.
-	d.fwReconciler.SetPassHook(nicGuardLabelHook(d.db, d.cfg.HostName, d.cfg.Version))
-	// Upgrade migration: once the reconciler renders a bridge's NAT/isolation into
-	// litevirt-fw, clear the pre-consolidation out-of-band rules (old iptables
-	// masquerade + `inet litevirt` chains) a prior binary left for it.
-	d.fwReconciler.SetLegacyCleanup(network.RemoveLegacyBridgeFirewall)
-	svc.SetFirewallReconciler(d.fwReconciler)
-	// This build's units, before the first per-NIC table is loaded: the main
-	// unit's ExecStartPre removes that table when a build that does not own it
-	// starts, so a rollback leaves no stale per-NIC rules enforcing. An upgrade
-	// only ever installs the OLD binary's units.
-	grpcapi.EnsureSystemdUnits()
-	// One pass now, before any runtime start: the tables a host boots with
-	// are empty (re-review R2-I2). Bounded (m3): a hung nft must not hold the
-	// whole daemon start; a guarded start arms its own pass.
-	if err := bootFirewallPass(ctx, d.fwReconciler, bootFirewallPassBudget); err != nil {
-		slog.Warn("firewall: the first pass failed; starts arm their own", "error", err)
-	}
-	d.fwReconciler.Start(ctx)
-	go svc.RecordExistingTrunkVLANsLoop(ctx, 0)
-	// A guest handed over paused for its NIC guards runs once they are in
-	// force here, even when the source's resume never arrives (re-review
-	// R3-I2).
-	go svc.RunHeldGuestResumer(ctx, 0)
-
-	go vmChecker.Start(ctx)
-	go reconciler.Start(ctx)
-	// Finish any drain cold move a previous process died in the middle of: the
-	// VM was running, was (or was about to be) shut down for the move, and must
-	// run again on exactly one host. It starts VMs, so it runs with the runtime
-	// loops above — after the startup recovery barrier has restored host
-	// networks and every late setter has run — and in its own goroutine,
-	// because finishing one can wait for a guest's shutdown or for the target.
-	go svc.RunDrainColdMoveRecovery(ctx)
-	// Remove the owner-epoch markers of VMs deleted while this host was not
-	// asked (in maintenance, unreachable), each time it becomes active.
-	go svc.RunDeletedVMMarkerSweep(ctx)
-	// Quarantine abandoned target holds and name holds kept too long; retry
-	// source cleanup and sweep retained bundles no live record names.
-	dbWorkers.startFirmwareSweeps(ctx)
-
-	// Remember the clock skews this host sees past their rows' retention: the
-	// margin lv image prune keeps a deleted image's file within reads them.
-	go svc.RunImageSkewRecorder(ctx)
-	// Record a release feature's use found in replicated data with none
-	// recorded (one written through a daemon that predates the gate), on the
-	// failover lease holder, so a later rollback below the release still
-	// quarantines.
-	dbWorkers.startSweep()
-	// Remove replicas and retire checkpoint rows for removed schedules.
-	dbWorkers.startReplicaOrphanSweep(ctx)
-	// Autostart onboot VMs once, in startup_order (#10). Runs only for VMs not
-	// already running in libvirt, so a daemon restart (qemu kept alive by
-	// KillMode=process) is a no-op while a host reboot brings them up in order;
-	// one its operator stopped only when the kernel's boot ID says the host
-	// booted (health/onboot_boot.go).
-	go reconciler.StartOnbootVMs(ctx)
-
-	// Rebalance executor: leader-gated loop that applies operator-approved
-	// migration proposals (rc above only *proposes*). Reuses the rebalancer's
-	// leader lease so exactly one node executes; honors the cluster rebalance
-	// budget. Needs svc for the in-process live-migration call.
-	go grpcapi.NewRebalanceExecutor(svc, d.cfg.HostName, d.db).Start(ctx)
-
-	// Start stack deletion reconciler — retries cleanup for stacks stuck in "deleting" state.
-	stackReconciler := health.NewStackReconciler(d.cfg.HostName, d.db)
-	stackReconciler.SetCleaner(svc)
-	stackReconciler.SetReplicaFreshness(d.db.ReplicaCaughtUp)
-	go stackReconciler.Start(ctx)
-
-	// Re-apply LB configs (haproxy + keepalived) that should run on this host.
-	// These are child processes that die when the daemon restarts.
-	svc.ReconcileLBs(ctx)
-	// Keep litevirt_lb_keepalived_up tracking live keepalived state, not just
-	// the last apply.
-	go svc.RunLBMetricsRefresher(ctx, 30*time.Second)
-	// Periodically re-apply this host's LBs whose keepalived is dead — recovers a sole VIP
-	// holder after a restart/upgrade (the one-shot boot ReconcileLBs above is refused during
-	// warmup / while 'upgrading') and a self-demoted VIP on quorum heal. Only touches dead LBs.
-	dbWorkers.startLB(30 * time.Second)
-
-	// Split-brain Phase 2: minority VIP self-demotion. On sustained local quorum
-	// loss, an isolated LB host drops its own VIPs (stop keepalived + remove the
-	// address). This runs WITHOUT a hardware watchdog — the minority stops answering
-	// its own VIP regardless. A watchdog is an OPTIONAL backstop: if the demote can't
-	// be confirmed AND a verified watchdog is armed, the node self-fences; otherwise it
-	// keeps retrying + raises HA-degraded and the majority holds in the safe gap.
-	// Inert until vip_demote_v1 is enforced cluster-wide (validate on an ephemeral
-	// partition before flipping).
-	vipDemoter := health.NewVIPDemoter(d.checker, time.Duration(d.cfg.QuorumLossDemoteAfterSec)*time.Second)
-	keepalivedStopTimeout := time.Duration(d.cfg.KeepalivedStopTimeoutSec) * time.Second
-	vipDemoter.SetDemoteLocalVIPs(func(ctx context.Context) (bool, error) {
-		// Runtime-driven: demote whatever keepalived is actually configured/running on
-		// THIS host (not the possibly-stale DB view), using the exact rendered tuple.
-		return lb.NewManager().DemoteAll(keepalivedStopTimeout)
-	})
-	// A demotion FAILURE self-fences only when a verified watchdog is armed; without one
-	// the demoter stays up + raises HA-degraded (safe gap). SetArmed feeds that decision.
-	vipDemoter.SetSelfFence(watchdogCtrl.SelfFence)
-	vipDemoter.SetArmed(watchdogCtrl.Armed)
-	// Active when vip_demote_v1 is ENFORCED CLUSTER-WIDE (the durable Enforced() latch —
-	// every enforcement-relevant member advertises it, latched so a later partition can't
-	// un-arm it). NO watchdog gate: routing through the same latch as Phase 1 means the
-	// flip doesn't activate a lone rolled node before the whole cluster can participate,
-	// but a watchdog-less node still self-demotes (only its failure-handling differs).
-	vipDemoter.SetEnabled(func(ctx context.Context) bool {
-		// Config kill-switch AND the cluster-wide latch (HA monitor drives it while
-		// healthy). Flag false ⇒ never self-demote (legacy: keepalived VRRP handles it).
-		return d.cfg.Enforcement.VIPSelfDemote && d.checker.Enforced(ctx, capabilities.VIPDemoteV1)
-	})
-	vipDemoter.SetRefusedObserver(gateMetrics.Refused)
-	// Surface an unfenced demotion failure (demote failed + no verified self-fence) as a
-	// durable HA-degraded condition so an operator can provide a fence / intervene.
-	vipDemoter.SetDemotionUnfencedObserver(svc.SetDemotionUnfenced)
-	// On quorum heal after a self-demotion, re-apply this host's LBs — DemoteAll stopped
-	// keepalived + removed the VIP, and nothing else recovers it otherwise.
-	vipDemoter.SetOnQuorumRestored(svc.ReconcileLBs)
-	// Once this node self-fences it de-advertises ALL split-brain capabilities — it is
-	// committed to rebooting, so it stops presenting as a healthy member for the
-	// fence-timeout window (defense-in-depth; reclaim still gates on VIPAssigned/fence-proof).
-	// Wired BEFORE the goroutines below: the HA-health monitor self-Pings into
-	// advertisedCapabilities, which reads this predicate. (Storage is atomic, so a late wire
-	// is race-free regardless, but wiring first means a self-fence is honored immediately.)
-	svc.SetWatchdogFenced(watchdogCtrl.Fenced)
-	// A rolled-back node stops advertising capabilities, so the cluster cannot
-	// latch anything further across a member that could not honour it, and peers
-	// raise ha_degraded against it.
-	// Quarantined below a latched token found at startup, OR since startup by
-	// a use of a newer release's feature arriving by replication.
-	// A rollback quarantine or a tripped release use — never a release
-	// probation, which is not a rollback below anything known to be used and
-	// must not get this node isolated by its peers (N1).
-	svc.SetWALQuarantined(func() bool {
-		return len(d.rolledBackTokens) > 0 || d.db.WALQuarantined()
-	})
-	go vipDemoter.Start(ctx)
-	// Partition pause (docs/design/partition-pause.md): on losing the execution
-	// quorum for T_pause, suspend/freeze every workload the majority would
-	// recover elsewhere, recorded under <data_dir>/partition-pause; resume on a
-	// majority's confirmation. Runs on the flag alone — a node advertises
-	// partition_pause_v1 only while it already acts on it — and whether or not
-	// a watchdog is armed; a verified watchdog is only the backstop for a
-	// pause that fails.
-	pauser := health.NewPartitionPauser(d.cfg.HostName, d.cfg.DataDir, d.db)
-	pauser.SetQuorum(d.checker.ExecutionQuorum)
-	pauser.SetEnabled(func() bool { return d.cfg.Enforcement.PartitionPause })
-	pauser.SetVMBackend(d.virt)
-	pauser.SetContainerRuntime(lxcRunner)
-	pauser.SetResumeConfirmer(svc.CheckPartitionResume)
-	pauser.SetSettleVerifier(svc.VerifySettleProof)
-	pauser.SetPeerRuntimeChecker(svc.CheckPeerContainerRuntime)
-	pauser.SetSelfFence(watchdogCtrl.Armed, watchdogCtrl.SelfFence)
-	go pauser.Start(ctx)
-	// Persistent HA-degraded surface (unsupported member / unfenced demotion failure / VIP
-	// with no holder) — a durable alertable status + transition events.
-	go svc.RunHAHealthMonitor(ctx, 15*time.Second)
-
-	// Read-only report of this host's pending OS package updates (host_updates).
-	go svc.RunHostUpdateLoop(ctx)
-	// Leader-gated dual-run detector: alert-only cross-check that no workload/VIP runs on
-	// two hosts and no DB owner disagrees with runtime. One node (the lease holder) does
-	// the work so the fleet pages once, not N times.
-	go svc.RunDualRunDetector(ctx, 60*time.Second)
-	// Per-host disk SMART health: gauges + a notification on a failing/prefail disk.
-	if iv := parseSMARTInterval(d.cfg.SMART.Interval); iv > 0 {
-		go svc.RunSMARTMonitor(ctx, iv)
-	}
-	go svc.RunSharedLUNDetector(ctx, 60*time.Second)
-	// The holds this host keeps on iSCSI LUNs whose claims its rebuilds and
-	// recreates moved: released only on positive evidence, re-judged here.
-	go svc.RunLUNHoldResolver(ctx, 0)
-	// Effective-capacity sampler: every host publishes what it is ACTUALLY
-	// carrying (union of DB and runtime workloads), so placement counts rogue
-	// runtimes and refuses hosts whose observation is stale or incomplete.
-	capacityCtx, stopCapacity := context.WithCancel(ctx)
-	capacityDone := make(chan struct{})
-	go func() { defer close(capacityDone); svc.RunCapacitySampler(capacityCtx, 60*time.Second) }()
-	defer func() { stopCapacity(); <-capacityDone }()
-
-	// Start periodic IP scanner — discovers VM IPs via ARP/DHCP and broadcasts FDB entries.
-	ipScanner := grpcapi.NewIPScanner(svc)
-	go ipScanner.Start(ctx)
-
-	svc.SetAntiEntropy(ae) // `lv cluster converge` kicks an immediate debounced pass
-	// Record the founder's genesis decision of the per-NIC enforcement mode
-	// (enforce) once it can; a cluster with no mode recorded observes. And keep
-	// dnsmasq's host reservations in step with the NICs guarded on its
-	// networks.
-	go svc.SeedFirewallEnforcementLoop(ctx, 0, filepath.Join(d.cfg.DataDir, firewallInitialModeName))
-	go svc.SeedFirewallSynfloodLoop(ctx, 0, filepath.Join(d.cfg.DataDir, firewallSynfloodDecisionName))
-	svc.StartDHCPReservations(ctx, 0)
-
-	// Converge this host's network devices on the replicated networks table
-	// every 30s: a network created elsewhere is provisioned here, a deleted
-	// one is torn down here. Started after the firewall reconciler so a pass
-	// that records NAT/isolation intent has something to apply it.
-	svc.StartNetworkReconciler(ctx, 0)
-
-	// tenancy + billing engine. The webhook URL is empty
-	// for most clusters; the emitter resolves to a no-op in that
-	// case so production-without-billing is the zero-config default.
-	tenancyEngine := tenancy.NewEngine(d.db, billing.NewWebhookEmitter(d.cfg.BillingWebhookURL))
-	svc.SetTenancyEngine(tenancyEngine)
-
-	// Seed the default notification webhook from config (#5), if any.
-	d.seedNotificationDefaults(ctx)
-
-	// wire the LXC runtime so the Containers RPCs work.
-	// We always wire it — when lxc-* binaries aren't installed, the
-	// individual RPCs surface the error from the binary lookup, which
-	// is more useful than a blanket "container runtime not wired".
-	// lxcRunner was created above (shared with the metrics collector).
-	svc.SetContainerRuntime(grpcapi.NewLXCRuntimeAdapter(lxcRunner))
-	// The runtime-inventory collector reads owner-epoch markers from the same
-	// root the container checker converges them into.
-	svc.SetContainersRoot(filepath.Join(d.cfg.DataDir, "containers"))
-	// An LB's TLS files are read as root; never from litevirt's own keys.
-	lb.SetProtectedDirs(d.cfg.PKIDir, d.cfg.DataDir)
-
-	// Advertise the host's capabilities as labels so placement puts a workload
-	// only on a host that can run it:
-	//   - LXC (strict: litevirt.lxc=true, see corrosion.HostRunsContainers). The
-	//     runtime is always wired, but the lxc-* binaries may be absent — probe
-	//     for lxc-create.
-	//   - vTPM (G1): both swtpm_setup and swtpm are needed to START a vTPM VM —
-	//     libvirt runs swtpm_setup to initialize state, then swtpm. (The first
-	//     G1 drill failed in swtpm_setup with swtpm alone present.)
-	//     The label is also held false until a pass over the swtpm tree
-	//     (vtpm_state_sync) has completed, so placement offers vTPM here only
-	//     after the attempt to make its state synchronous; a pass that cannot
-	//     raises vtpm_state_not_durable instead. The pass runs in its own
-	//     goroutine and the probe waits at most vtpmPassWait for it.
-	//   - Secure Boot: the secboot/MS OVMF pair (resolved above).
-	// Asserted now, before the container checker starts, and re-asserted every
-	// capabilityLabelInterval (keepCapabilityLabels says why).
-	tpmAvailable := func() bool {
-		_, errSwtpm := exec.LookPath("swtpm")
-		_, errSetup := exec.LookPath("swtpm_setup")
-		return errSwtpm == nil && errSetup == nil
-	}
-	capabilityLabels := []capabilityLabel{
-		{key: corrosion.LabelLXCCapable, capable: lxc.Available},
-		{key: corrosion.LabelTPMCapable, capable: tpmCapable},
-		{key: corrosion.LabelSecureBootCapable, capable: firmwarePaths.SecureBootAvailable},
-		// The live firmware move label holds a target to vTPM's own label
-		// (tpmReady: swtpm present and this cycle's vtpm_state_sync pass completed); a
-		// move's Prepare re-checks presence only (tpmAvailable), since the
-		// label already gated it and a pass per Prepare would walk the tree
-		// on every move.
-		{key: corrosion.LabelFwLiveMigrate, capable: newFwLiveLabel(d.cfg.Migration, d.fwStore, firmwarePaths, d.virt.LibvirtVersion, tpmReady, vtpmSync.vtpmDurableErr)},
-	}
-	// A live firmware move's target re-checks the label's conditions itself,
-	// live, in Prepare.
-	// Prepare re-reads the last vTPM pass at move time: a label a cycle
-	// stale never lets a move target a host whose vTPM state is not durable.
-	svc.SetLiveFirmwareHost(newFwLiveHostCheck(d.cfg.Migration, d.fwStore, firmwarePaths, d.virt.LibvirtVersion, tpmAvailable, vtpmSync.vtpmDurableErr))
-	asserted, err := assertCapabilityLabels(ctx, d.db, d.cfg.HostName, capabilityLabels)
-	if err != nil {
-		slog.Warn("set capability host labels failed; retrying in the background", "labels", asserted, "error", err)
-		asserted = nil // nothing this daemon published stands on the row yet
-	}
-	go keepCapabilityLabels(ctx, d.db, d.cfg.HostName, capabilityLabels, asserted, capabilityLabelInterval)
-
-	// Container reconciler + restart engine: every cycle, sync each locally-owned
-	// container's cluster row to the LXC runtime's reality and auto-restart one
-	// that stopped unexpectedly per its restart policy. Shares the runtime wired
-	// above; operator-stopped containers are left alone (state_detail).
-	ctChecker := health.NewContainerChecker(d.cfg.HostName, d.db, lxcRunner)
-	ctChecker.SetDaemonDirs(d.cfg.DataDir, d.cfg.PKIDir)
-	ctChecker.SetContainersRoot(filepath.Join(d.cfg.DataDir, "containers"))
-	ctChecker.SetEventBus(svc.EventBus())
-	// Runtime container re-key (Phase 4): corroborate a locally-running container
-	// whose only live DB row points elsewhere against every workload-capable peer
-	// before reclaiming it (a PK re-key).
-	ctChecker.SetPeerContainerRuntimeChecker(svc.CheckPeerContainerRuntime)
-	// Guarded v44 re-key WAL is emitted only after the operation protocol's
-	// config kill-switch is on and both the operation + dependent capacity
-	// capabilities have latched cluster-wide. Until then modern authority fails
-	// closed; pre-authority rows retain the exact v1.3 envelope.
-	ctChecker.SetGuardedContainerRekeyActive(func() bool {
-		return d.cfg.Enforcement.OperationProtocol &&
-			d.checker.Latched(capabilities.OperationProtocolV1) &&
-			d.checker.Latched(capabilities.CapacityAdmissionV1)
-	})
-	ctChecker.SetContainerRekeyObserver(func(_, result string) { runtimeRepairMetrics.OwnerAssert("ct", result) })
-	ctChecker.SetOrphanRuntimeObserver(observeOrphans)
-	ctChecker.SetReplicaFreshness(d.db.ReplicaCaughtUp)
-	// Split-brain safety gate (Phase 1): a container re-key needs local quorum once
-	// enforced — wired before the container reconcile loop starts.
-	ctChecker.SetGate(d.checker)
-	ctChecker.SetRecoveryClaimGate(svc.RecoveryClaimGateForPendingProof)
-	ctChecker.SetGateRefusedObserver(gateMetrics.Refused)
-	ctChecker.SetStateWriteFailObserver(stateWriteMetrics.Failed)
-	// The sweep holds the same per-container lock as this host's container
-	// operations, so it never reconciles a container mid-create/start/stop.
-	ctChecker.SetContainerLock(svc.TryLockContainer)
-	go ctChecker.Start(ctx)
-
-	// wire the libvirt blockdev-mirror driver so MoveVolume
-	// supports running VMs without stopping them.
-	svc.SetLiveMover(grpcapi.NewLibvirtLiveMover(d.virt))
-
-	// (content rewrite): wire the guest-content backup engine.
-	// Reads the guest disk over qemu's NBD pull-backup export (not the
-	// qcow2 container), so full + incremental + the dirty bitmap all share
-	// the guest-virtual address space — the correct, consistent model.
-	// nil-safe: if BeginBackup fails, BackupSnapshot falls back to a full
-	// container backup.
-	svc.SetBackupSource(grpcapi.NewLibvirtBackupSource(d.virt))
-	// Point-in-time copies fall back to an external disk-only snapshot when
-	// no backup session opens (grpcapi/pit_copy.go, layer 2).
-	svc.SetPointInTimeSnapshotter(d.virt)
-	// A daemon that died while a layer-2 copy was in its window left the VM
-	// on the overlay with no event: settle every such overlay now.
-	go svc.SweepPITOverlays(ctx, svc.PITSweepReady(ctx))
-
-	// wire the WebAuthn second-factor engine. Empty
-	// rp_id disables — the gRPC handlers then return Unimplemented
-	// instead of a confusing "missing config" surface.
-	if d.cfg.WebAuthn.RPID != "" {
-		wa, err := auth.NewWebAuthnService(d.db, auth.WebAuthnConfig{
-			RPDisplayName: d.cfg.WebAuthn.RPDisplayName,
-			RPID:          d.cfg.WebAuthn.RPID,
-			RPOrigins:     d.cfg.WebAuthn.RPOrigins,
-		})
-		if err != nil {
-			return fmt.Errorf("webauthn init: %w", err)
-		}
-		svc.SetWebAuthnService(wa)
-	}
-
-	// snapshot scheduler runner — built after `svc` exists so it
-	// can reuse lockVM + pickDisk. Backup repo names resolve through
-	// `backup_repos:` in config; an empty map disables the scheduler
-	// effectively (every schedule errors with ErrNoRepoConfigured until
-	// the operator adds a repo).
-	d.snapScheduler.Runner = grpcapi.BackupRunnerForScheduler(svc, d.cfg.BackupRepos)
-	svc.SetBackupRepos(d.cfg.BackupRepos) // let RPC handlers resolve repo names
-	// Per-repo backup bandwidth limits. LoadConfig already refused a bad value.
-	if bw, err := d.cfg.BackupBandwidthLimits(); err == nil {
-		svc.SetBackupBandwidthLimits(bw)
-	} else {
-		slog.Error("backup_bwlimits", "error", err)
-	}
-	// Restore VMs a previous daemon left running (a crash, a restart, an
-	// upgrade) are killed whether or not file restore is still enabled.
-	frRunDir := fileRestoreRunDir(d.cfg.DataDir)
-	frUIDBase := d.cfg.FileRestore.UIDBase
-	if frUIDBase == 0 {
-		frUIDBase = filerestore.DefaultUIDBase
-	}
-	if n := filerestore.SweepStale(frRunDir, frUIDBase, d.cfg.Containers.ContainerIDRange()); n > 0 {
-		slog.Warn("file restore: killed restore VMs a previous daemon left running", "count", n)
-	}
-	if fr := d.cfg.FileRestore; fr.On() {
-		if err := filerestore.EnsureRestoreUser(); err != nil {
-			// File restore then refuses, naming the missing user.
-			slog.Warn("file restore: no restore VM user", "error", err)
-		}
-		// Round-1 builds kept the boot files in data_dir, owned by qemu's
-		// user; they are never read again.
-		_ = os.RemoveAll(filepath.Join(d.cfg.DataDir, "file-restore", "cache"))
-		idle := time.Duration(fr.IdleTimeoutSec) * time.Second
-		if idle <= 0 {
-			idle = 5 * time.Minute
-		}
-		svc.SetFileRestore(grpcapi.FileRestoreOptions{
-			Launcher: filerestore.NewLauncher(filerestore.Config{
-				QEMU: fr.QEMU, Kernel: fr.Kernel, ModulesDir: fr.ModulesDir,
-				MemoryMiB: fr.MemoryMiB, RunAs: fr.RunAs,
-				CacheDir: fileRestoreCacheDir(d.cfg.DataDir),
-				RunDir:   frRunDir,
-				OnTamper: svc.FileRestoreTampered,
-				// The agent outlives the host's idle timeout by a minute, so
-				// it only ever powers off on its own when the host is gone.
-				AgentIdle: idle + time.Minute,
-				Unsandboxed: filerestore.Barriers{
-					Seccomp: fr.AllowUnsandboxed.Seccomp, MAC: fr.AllowUnsandboxed.MAC, Root: fr.AllowUnsandboxed.Root,
-				},
-				AllowSharedRunAs: fr.AllowSharedRunAs,
-				UIDBase:          frUIDBase,
-				ContainerIDs:     d.cfg.Containers.ContainerIDRange(),
-			}),
-			IdleTimeout:     idle,
-			MaxSessions:     fr.MaxSessions,
-			MaxExtractions:  fr.MaxExtractions,
-			MaxExtractBytes: fr.ExtractLimit(),
-		})
-	}
-	// While a key that lifts a restore VM barrier is set, this host carries
-	// an informational file_restore_unsandboxed condition (resolved once it
-	// is not).
-	svc.ReconcileFileRestoreCondition(ctx, d.cfg.FileRestore.ReducedBarrierKeys())
-	svc.SweepTransferStaging()                          // clear orphaned peer-transfer staging repos from a prior incarnation
-	blockedCIDRs, _ := d.cfg.ImagePullBlockedPrefixes() // already validated in LoadConfig
-	svc.SetImageLimits(d.cfg.MaxImageBytes, time.Duration(d.cfg.ImagePullTimeoutSec)*time.Second, blockedCIDRs)
-	d.snapScheduler.ReplRunner = svc // *grpcapi.Server implements RunReplication
-	go d.snapScheduler.Run(ctx)
-
-	// Sweep staging temp files leaked by a prior hard crash (SIGKILL skips the
-	// deferred cleanup of replicate/upload/import/restore temps — they'd
-	// otherwise accumulate and fill the pool/image dirs). Then retry the
-	// pool-file records marks SweepStaleStaging wrote until the replicated
-	// rows are writable: on a new cluster failover_scope_v1 latches after the
-	// first start (pool_records.go). Both in the background: they read every
-	// pool directory, and one on an NFS mount whose server does not answer
-	// blocked this start for good (lab 2 F-1; startup_bound.go).
-	startStorageSweeps(ctx, svc)
-	startLegacyImageProvenance(ctx, svc)
-
-	// Now that the gRPC server exists, wire it as the failover coordinator's
-	// replica promoter (auto_promote recovery) and start the coordinator.
-	fc.Promoter = svc // *grpcapi.Server implements failover.ReplicaPromoter
-	fc.Restorer = svc // implements failover.ContainerRestorer (tier-2 relocate-from-backup)
-	fc.RelocateRestoreTimeout = time.Duration(d.cfg.ContainerRestoreTimeoutSec) * time.Second
-	fc.OnFence = svc.NotifyHostFenced                                   // operator notification on fence (#5)
-	fc.OnDiskStranded = svc.NotifyVMDiskStranded                        // a VM restarted elsewhere left its host-local disk behind
-	fc.OnRootfsStranded = svc.NotifyCTRootfsStranded                    // a relocated container left its own rootfs behind
-	fc.OnRecoveryStalled = svc.NotifyRecoveryStalled                    // a fenced host's recovery that is not proceeding
-	fc.Events = svc.EventBus()                                          // a stopped workload left on a failed host
-	fc.Metrics = metrics.NewFailoverMetrics()                           // structured failover counters (U9)
-	fc.SafeFenceEnforce = d.cfg.Enforcement.SafeFenceDefault            // safe-fence kill-switch (config AND SafeFenceDefaultV1)
-	fc.SharedStorageFenceEnforce = d.cfg.Enforcement.SharedStorageFence // decide-side shared-disk fence kill-switch (config AND SharedStorageFenceV1)
-	// The coordinator half of lease-term enforcement: a local precheck that
-	// refuses to stamp a superseded term. svc.SetLeaseTermEnforce above is the
-	// executor half, and both read this one flag so the source and the enforcer
-	// can never disagree about whether enforcement is on.
-	fc.LeaseTermEnforce = d.cfg.Enforcement.LeaseTerm
-	// Recovery claims (docs/design/recovery-claims.md §3.13): the coordinator
-	// claims through the server's proposer before it mints a reschedule or
-	// relocate proof (the server claims a promote itself, once it knows the
-	// replica's host), and reads the server's enforcement predicate, so the
-	// mint side and the executor side on this node read one answer.
-	fc.Claimer = svc
-	fc.RecoveryClaimEnforced = svc.RecoveryClaimEnforced
-	// The recovery-claim health conditions (ha.claim.stranded,
-	// ha.voter.unavailable) and host.address_shared are the lease holder's to
-	// write, like genesis.
-	fc.ClaimHealth = svc.RecoveryClaimHealthTick
-	// Partition pause, the majority side: rely on a host's pause only with this
-	// node's flag on AND partition_pause_v1 latched (every voter pauses), and
-	// anchor the deadline on the later of the decision and the last contact.
-	fc.PartitionPauseEnforced = func(ctx context.Context) bool {
-		return d.cfg.Enforcement.PartitionPause && d.checker.Enforced(ctx, capabilities.PartitionPauseV1)
-	}
-	fc.LastContact = d.checker.LastContact
-	fc.PeerClockSkew = d.checker.MeasuredClockSkew
-	fc.PeerVoterGeneration = svc.PeerVoterGeneration
-	fc.PeerPausesOnLoss = svc.PeerPausesOnLoss
-	// Once pit_overlay is used, no VM recovery onto a peer whose Ping says it
-	// is WAL-quarantined, or that does not answer (it may be a build that
-	// knows nothing of overlays).
-	fc.PeerRecoveryExclusions = svc.PeerRecoveryExclusions
-	// A coordinator that was itself cut off moments ago decides no new fence
-	// on the failure rows the cut left behind (a fleet-wide blip).
-	fc.QuorumRegain = d.checker.InQuorumRegainGraceFor
-	// Split-brain safety gate (Phase 1): the coordinator gates the reschedule
-	// decide site + writes a durable proof; the reconciler validates/claims it
-	// before start. Both are enforced only once split_brain_gate_v1 is
-	// cluster-wide (fail-open/log-only until then).
-	fc.Gate = d.checker // reconciler + svc gates were wired earlier (before their runtime work)
-	fc.SetGateRefusedObserver(gateMetrics.Refused)
-	// A self-fenced coordinator stops driving failover during the fence-timeout window.
-	fc.SelfFenced = watchdogCtrl.Fenced
-	// A coordinator that was itself suspended or starved a moment ago decides no
-	// fence until it has watched for a full grace window (health/stall.go).
-	fc.LocalStall = d.checker.InStallGrace
-	// Automatic voter genesis runs on the leader-lease holder's tick
-	// (docs/design/recovery-claims.md §4.2). Inert until voter_config_v1 has
-	// durably latched, and once any voter generation exists.
-	fc.VoterGenesis = svc.VoterGenesisTick
-	// Cluster HA disarm: the peers' HA answers for the coordinator, the fence
-	// candidates for the HA policy handler, the cache Ready answers from, and
-	// the lease holder's first-use record of ha_disarm.
-	d.wirePeerHAState(fc, svc)
-	d.wireFenceCandidates(svc)
-	d.startHAPolicyCache(ctx, svc)
-	d.startHADisarmPreRecord(ctx, fc)
-	preRecordCtx, stopPreRecord := context.WithCancel(ctx)
-	preRecordDone := d.startReturningBootPreRecord(preRecordCtx, fc)
-	defer func() { stopPreRecord(); <-preRecordDone }()
-	go fc.Start(ctx)
-	// Adopt each decided voter generation once its certificate verifies,
-	// importing claim state first where this node is a member of it (§4.4).
-	go d.runVoterAdoption(ctx, svc)
-
-	// The global ISO library in sync mode: bring this host's copy of every
-	// library file to the recorded version (iso_library.go).
-	go d.runISOLibrarySync(ctx, svc)
-
-	// Certificates this node serves: re-record a host certificate renewed in
-	// place, export expiry, and notify ahead of it (cert_watch.go).
-	d.certWatch = newCertWatch(d.cfg.HostName, d.cfg.PKIDir, d.db, svc, metrics.NewCertMetrics())
-	go d.certWatch.run(ctx)
-
-	// Peer self-upgrade: a daemon that comes back on an old binary (e.g. it was
-	// down during a cluster upgrade) pulls the newer binary from a healthy peer
-	// and re-execs. Default on; disable with auto_upgrade.from_peer: false.
-	if d.cfg.AutoUpgrade.FromPeerEnabled() {
-		go svc.RunSelfUpgradeWatcher(ctx, d.cfg.AutoUpgrade.Interval())
-	} else {
-		slog.Info("peer self-upgrade disabled (auto_upgrade.from_peer: false)")
-	}
-
-	// Reap orphaned auto DNS records (VMs deleted without their A-record being
-	// removed). Runs an initial sweep shortly after start (clears pre-existing
-	// orphans on upgrade) then periodically. Idempotent + grace-windowed, so
-	// safe to run on every node.
-	go func() {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(90 * time.Second):
-		}
-		svc.ReapOrphanDNSRecords(ctx)
-		ticker := time.NewTicker(15 * time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				svc.ReapOrphanDNSRecords(ctx)
+		// Resume, park or abort each live firmware move this host is the source
+		// of (spec §8.1): its VM's lock is taken here, before any runtime loop
+		// starts, and held until its recovery resolves or parks it.
+		// Synchronous after the mandatory operation-journal recovery barrier.
+		dbWorkers := newDBWorkerCoordinator(ctx, svc)
+		workerShutdownStarted := false
+		defer func() {
+			if !workerShutdownStarted {
+				dbWorkers.stopStartup(15 * time.Second)
 			}
-		}
-	}()
+		}()
+		dbWorkers.recoverFirmwareMoves(ctx)
+		// A VM recorded migrating here with no move of it running (this daemon
+		// stopped mid-move) is named by vm.migration_unresolved.
+		svc.RaiseLeftMigrating(ctx)
 
-	// refresh group caches from external realms (LDAP /
-	// OIDC) every 5 min. Errors are per-realm and logged but not fatal
-	// — one IdP being down doesn't take the cluster offline.
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for {
+		// F1 resource-update recovery: resume any locally-owned VM wedged on a nonterminal
+		// resource_update_running operation (a live resize that crashed after committing its
+		// desired spec) — converge it to the committed spec + clear the barrier so a partial
+		// failure never wedges active_operation_id. Uses replicated operation state (not the
+		// host-local journal), and runs after the journal barrier above. A reconciler pass
+		// retries stragglers.
+		// At start a VM whose lock is held (a firmware move's recovery holds it
+		// until the start is wired, below) is skipped; the loop takes it later.
+		svc.RecoverResourceOperationsAtStart(ctx)
+		go svc.RunResourceOperationRecovery(ctx)
+
+		// Release host reservations whose operation provably stopped running (one
+		// finished past its header's owner epoch, or whose VM is gone), after the
+		// recovery above has finished what it could.
+		svc.SweepReservationsOnce(ctx)
+		go svc.RunReservationRecovery(ctx)
+
+		// F1 hardware-operation recovery: resume any locally-owned VM wedged on a
+		// nonterminal device_attach/device_detach operation (a hot-plug that crashed
+		// with the mutation barrier held) — roll an incomplete attach BACK and a detach
+		// FORWARD to a single consistent state, clearing the barrier. Runs synchronously
+		// after DB + libvirt + journal init (uses the host-local journal artifacts), and
+		// a reconciler pass retries stragglers.
+		svc.RecoverHardwareOperationsAtStart(ctx)
+
+		// Release PCI devices a VM owns but provably does not hold, once the
+		// recoveries above have settled every lease and operation that could
+		// explain one (lab finding L1: a failed SR-IOV attach on an older build
+		// left its VF owned). What it cannot prove it reports and leaves owned.
+		svc.SweepUnattachedPCIOwnership(ctx)
+		go svc.RunHardwareOperationRecovery(ctx)
+
+		// v42 hardware foundation (CONTRACT h): backfill the typed-hardware tables
+		// (vm_nics, vm_disks.bus, vm_pci_intent) and record each owned VM's adoption
+		// verdict, THEN mark this node hardware_v2-advertise-ready. Started here —
+		// AFTER the schema is applied (InitSchema, above) and the operation-protocol
+		// config/latch is wired (hardware mutations depend on the crash-safe
+		// operation journal) — but run in the BACKGROUND, because the pass waits for
+		// this node's replica to catch up: it publishes rows for the VMs the local
+		// replica says this host owns, and a replica back from a fence still names
+		// VMs failover has moved away (RunHardwareBackfill). Until it succeeds the
+		// readiness flag advertisedCapabilities gates hardware_v2 on stays false, so
+		// no peer reads hardware_v2 from this node early. A failed pass DEGRADES
+		// (logged and retried) rather than crashing the daemon.
+		go svc.RunHardwareBackfill(ctx)
+		// Continuous legacy→vm_nics bridge: mirrors vm_interfaces writes an OLD peer
+		// makes during the rolling-upgrade window into vm_nics (one-directional; old
+		// peers ignore vm_nics), converging the read overlay toward vm_nics completeness.
+		go svc.RunHardwareBridge(ctx)
+
+		// Now that the split-brain gate is FULLY wired (activation latch + SetPeerPinger
+		// for cluster-wide capability confirmation) and every reconciler/vmChecker
+		// callback is set, start the runtime loops. Launching them here — not at
+		// construction — guarantees no automated runtime start (reschedule, restart
+		// policy, onboot autostart) ever runs in the window before the gate can confirm
+		// capability, closing the fail-open race for a should-enforce node.
+		// distributed firewall: poll cluster security_groups +
+		// sg_rules every 30s and atomically replace this host's nftables
+		// table. The applier short-circuits when the rendered ruleset
+		// hasn't changed, so idle clusters cost ~one corrosion query/tick.
+		fwApplier := firewall.NewApplier(firewall.NftBinary{})
+		// Observe-mode evidence outlives every table reload and daemon restart
+		// (re-review I-4): harvested before each replace, kept in data_dir.
+		fwApplier.SetTally(firewall.NewWouldDropTally(filepath.Join(d.cfg.DataDir, "firewall-would-drop.json"), time.Now()))
+		fwMetrics := metrics.NewFirewallMetrics()
+		// VMs about to start or migrate in here, and NICs whose rows are not
+		// written yet: rendered ahead of their rows (firewall.Arming).
+		fwArming := firewall.NewArming()
+		// Per-NIC rules need bridge connection tracking. Loaded once here; a host
+		// that cannot load it renders the guards only and raises a health
+		// condition (firewall.nic.unavailable), never an empty firewall.
+		bridgeCT := firewall.BridgeConntrackAvailable(ctx, true)
+		// Firewall logging needs the kernel to load a named limit and a log line
+		// to an NFLOG group. Probed once here (nft -c, nothing committed); a host
+		// that refuses renders no log line and raises firewall.log.unavailable.
+		fwLogGroup := uint16(d.cfg.Firewall.LogGroup)
+		fwLogErr := firewall.ProbeLogging(ctx, fwLogGroup)
+		if fwLogErr != nil {
+			slog.Warn("firewall: logging is unavailable on this host; no packet is logged here", "error", fwLogErr)
+		}
+		svc.RecordFirewallLogAvailability(ctx, fwLogErr)
+		// Log lines are rendered only while this daemon's listener holds the
+		// group (firewallLogging); each bind change runs passes. The listener
+		// starts below, once d.fwReconciler exists.
+		fwLogging := newFirewallLogging(ctx, fwLogGroup, fwLogErr,
+			func(c context.Context) error { return d.fwReconciler.Reconcile(c) },
+			func(err error) { svc.RecordFirewallLogListener(ctx, err) })
+		// SYN-flood protection needs the kernel's per-source meters (nft_limit).
+		// Probed once here, check only; a host whose kernel refuses renders none
+		// and raises a health condition (firewall.synflood.unavailable).
+		synFloodProbe := firewall.ProbeSynFlood(ctx)
+		if synFloodProbe.V4 != nil || synFloodProbe.V6 != nil {
+			slog.Warn("firewall: the kernel refused a SYN-flood probe; that family gets no SYN-flood protection on guest NICs here",
+				"ipv4", synFloodProbe.V4, "ipv6", synFloodProbe.V6)
+		}
+		fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{},
+			firewall.LoaderOptions{RunningTaps: d.virt.RunningDomainTaps, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs,
+				OnTagGroupMembers:    fwMetrics.SetTagGroupMembers,
+				OnDuplicateAddresses: firewall.NewDuplicateAddressReporter(d.db, d.cfg.HostName).Report,
+				BridgeConntrack:      func() bool { return bridgeCT }, Arming: fwArming,
+				Logging:       fwLogging.Logging,
+				SynFloodProbe: func() firewall.SynFloodProbeResult { return synFloodProbe }})
+		d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
+		d.fwReconciler.SetArming(fwArming)
+		// Every domain start — an API start, a restart policy, a failover
+		// reschedule, a restore — first puts the VM's NIC firewall in force here,
+		// its guards above all, and a guarded VM whose guards cannot be is not
+		// started (re-review I-10).
+		d.virt.SetStartGuard(svc.NICStartGuard(ctx))
+		d.fwReconciler.SetStateHook(svc.RecordFirewallState)
+		// Firewall logging: the listener reads the NFLOG group every rendered log
+		// line sends to into a bounded store (docs/firewall.md, "Logging").
+		fwLogStore := openFirewallLogStore(d.cfg, fwMetrics)
+		svc.SetFirewallLogStore(fwLogStore)
+		if fwLogErr == nil {
+			go (&firewall.LogListener{Group: fwLogGroup, Store: fwLogStore,
+				Resolve: d.fwReconciler.ResolveLogDevice,
+				OnBind:  fwLogging.OnBind}).Run(ctx)
+		}
+		go pruneFirewallLog(ctx, fwLogStore)
+		// Whether this host enforces NIC guards, after every pass, the boot pass
+		// included (re-review m8, m2, m5): the label carries this build's
+		// version while the last pass put the per-NIC table in force, so a host
+		// rolled back to an older build — which reports its own version and
+		// knows nothing of the label — stops counting, and so does one whose
+		// kernel refuses the table or whose pass failed or ran out of time. Until
+		// every host enforces them, a guarded VM is placed only on such a host.
+		d.fwReconciler.SetPassHook(nicGuardLabelHook(d.db, d.cfg.HostName, d.cfg.Version))
+		// Upgrade migration: once the reconciler renders a bridge's NAT/isolation into
+		// litevirt-fw, clear the pre-consolidation out-of-band rules (old iptables
+		// masquerade + `inet litevirt` chains) a prior binary left for it.
+		d.fwReconciler.SetLegacyCleanup(network.RemoveLegacyBridgeFirewall)
+		svc.SetFirewallReconciler(d.fwReconciler)
+		// This build's units, before the first per-NIC table is loaded: the main
+		// unit's ExecStartPre removes that table when a build that does not own it
+		// starts, so a rollback leaves no stale per-NIC rules enforcing. An upgrade
+		// only ever installs the OLD binary's units.
+		grpcapi.EnsureSystemdUnits()
+		// One pass now, before any runtime start: the tables a host boots with
+		// are empty (re-review R2-I2). Bounded (m3): a hung nft must not hold the
+		// whole daemon start; a guarded start arms its own pass.
+		if err := bootFirewallPass(ctx, d.fwReconciler, bootFirewallPassBudget); err != nil {
+			slog.Warn("firewall: the first pass failed; starts arm their own", "error", err)
+		}
+		d.fwReconciler.Start(ctx)
+		go svc.RecordExistingTrunkVLANsLoop(ctx, 0)
+		// A guest handed over paused for its NIC guards runs once they are in
+		// force here, even when the source's resume never arrives (re-review
+		// R3-I2).
+		go svc.RunHeldGuestResumer(ctx, 0)
+
+		go vmChecker.Start(ctx)
+		go reconciler.Start(ctx)
+		// Finish any drain cold move a previous process died in the middle of: the
+		// VM was running, was (or was about to be) shut down for the move, and must
+		// run again on exactly one host. It starts VMs, so it runs with the runtime
+		// loops above — after the startup recovery barrier has restored host
+		// networks and every late setter has run — and in its own goroutine,
+		// because finishing one can wait for a guest's shutdown or for the target.
+		go svc.RunDrainColdMoveRecovery(ctx)
+		// Remove the owner-epoch markers of VMs deleted while this host was not
+		// asked (in maintenance, unreachable), each time it becomes active.
+		go svc.RunDeletedVMMarkerSweep(ctx)
+		// Quarantine abandoned target holds and name holds kept too long; retry
+		// source cleanup and sweep retained bundles no live record names.
+		dbWorkers.startFirmwareSweeps(ctx)
+
+		// Remember the clock skews this host sees past their rows' retention: the
+		// margin lv image prune keeps a deleted image's file within reads them.
+		go svc.RunImageSkewRecorder(ctx)
+		// Record a release feature's use found in replicated data with none
+		// recorded (one written through a daemon that predates the gate), on the
+		// failover lease holder, so a later rollback below the release still
+		// quarantines.
+		dbWorkers.startSweep()
+		// Remove replicas and retire checkpoint rows for removed schedules.
+		dbWorkers.startReplicaOrphanSweep(ctx)
+		// Autostart onboot VMs once, in startup_order (#10). Runs only for VMs not
+		// already running in libvirt, so a daemon restart (qemu kept alive by
+		// KillMode=process) is a no-op while a host reboot brings them up in order;
+		// one its operator stopped only when the kernel's boot ID says the host
+		// booted (health/onboot_boot.go).
+		go reconciler.StartOnbootVMs(ctx)
+
+		// Rebalance executor: leader-gated loop that applies operator-approved
+		// migration proposals (rc above only *proposes*). Reuses the rebalancer's
+		// leader lease so exactly one node executes; honors the cluster rebalance
+		// budget. Needs svc for the in-process live-migration call.
+		go grpcapi.NewRebalanceExecutor(svc, d.cfg.HostName, d.db).Start(ctx)
+
+		// Start stack deletion reconciler — retries cleanup for stacks stuck in "deleting" state.
+		stackReconciler := health.NewStackReconciler(d.cfg.HostName, d.db)
+		stackReconciler.SetCleaner(svc)
+		stackReconciler.SetReplicaFreshness(d.db.ReplicaCaughtUp)
+		go stackReconciler.Start(ctx)
+
+		// Re-apply LB configs (haproxy + keepalived) that should run on this host.
+		// These are child processes that die when the daemon restarts.
+		svc.ReconcileLBs(ctx)
+		// Keep litevirt_lb_keepalived_up tracking live keepalived state, not just
+		// the last apply.
+		go svc.RunLBMetricsRefresher(ctx, 30*time.Second)
+		// Periodically re-apply this host's LBs whose keepalived is dead — recovers a sole VIP
+		// holder after a restart/upgrade (the one-shot boot ReconcileLBs above is refused during
+		// warmup / while 'upgrading') and a self-demoted VIP on quorum heal. Only touches dead LBs.
+		dbWorkers.startLB(30 * time.Second)
+
+		// Split-brain Phase 2: minority VIP self-demotion. On sustained local quorum
+		// loss, an isolated LB host drops its own VIPs (stop keepalived + remove the
+		// address). This runs WITHOUT a hardware watchdog — the minority stops answering
+		// its own VIP regardless. A watchdog is an OPTIONAL backstop: if the demote can't
+		// be confirmed AND a verified watchdog is armed, the node self-fences; otherwise it
+		// keeps retrying + raises HA-degraded and the majority holds in the safe gap.
+		// Inert until vip_demote_v1 is enforced cluster-wide (validate on an ephemeral
+		// partition before flipping).
+		vipDemoter := health.NewVIPDemoter(d.checker, time.Duration(d.cfg.QuorumLossDemoteAfterSec)*time.Second)
+		keepalivedStopTimeout := time.Duration(d.cfg.KeepalivedStopTimeoutSec) * time.Second
+		vipDemoter.SetDemoteLocalVIPs(func(ctx context.Context) (bool, error) {
+			// Runtime-driven: demote whatever keepalived is actually configured/running on
+			// THIS host (not the possibly-stale DB view), using the exact rendered tuple.
+			return lb.NewManager().DemoteAll(keepalivedStopTimeout)
+		})
+		// A demotion FAILURE self-fences only when a verified watchdog is armed; without one
+		// the demoter stays up + raises HA-degraded (safe gap). SetArmed feeds that decision.
+		vipDemoter.SetSelfFence(watchdogCtrl.SelfFence)
+		vipDemoter.SetArmed(watchdogCtrl.Armed)
+		// Active when vip_demote_v1 is ENFORCED CLUSTER-WIDE (the durable Enforced() latch —
+		// every enforcement-relevant member advertises it, latched so a later partition can't
+		// un-arm it). NO watchdog gate: routing through the same latch as Phase 1 means the
+		// flip doesn't activate a lone rolled node before the whole cluster can participate,
+		// but a watchdog-less node still self-demotes (only its failure-handling differs).
+		vipDemoter.SetEnabled(func(ctx context.Context) bool {
+			// Config kill-switch AND the cluster-wide latch (HA monitor drives it while
+			// healthy). Flag false ⇒ never self-demote (legacy: keepalived VRRP handles it).
+			return d.cfg.Enforcement.VIPSelfDemote && d.checker.Enforced(ctx, capabilities.VIPDemoteV1)
+		})
+		vipDemoter.SetRefusedObserver(gateMetrics.Refused)
+		// Surface an unfenced demotion failure (demote failed + no verified self-fence) as a
+		// durable HA-degraded condition so an operator can provide a fence / intervene.
+		vipDemoter.SetDemotionUnfencedObserver(svc.SetDemotionUnfenced)
+		// On quorum heal after a self-demotion, re-apply this host's LBs — DemoteAll stopped
+		// keepalived + removed the VIP, and nothing else recovers it otherwise.
+		vipDemoter.SetOnQuorumRestored(svc.ReconcileLBs)
+		// Once this node self-fences it de-advertises ALL split-brain capabilities — it is
+		// committed to rebooting, so it stops presenting as a healthy member for the
+		// fence-timeout window (defense-in-depth; reclaim still gates on VIPAssigned/fence-proof).
+		// Wired BEFORE the goroutines below: the HA-health monitor self-Pings into
+		// advertisedCapabilities, which reads this predicate. (Storage is atomic, so a late wire
+		// is race-free regardless, but wiring first means a self-fence is honored immediately.)
+		svc.SetWatchdogFenced(watchdogCtrl.Fenced)
+		// A rolled-back node stops advertising capabilities, so the cluster cannot
+		// latch anything further across a member that could not honour it, and peers
+		// raise ha_degraded against it.
+		// Quarantined below a latched token found at startup, OR since startup by
+		// a use of a newer release's feature arriving by replication.
+		// A rollback quarantine or a tripped release use — never a release
+		// probation, which is not a rollback below anything known to be used and
+		// must not get this node isolated by its peers (N1).
+		svc.SetWALQuarantined(func() bool {
+			return len(d.rolledBackTokens) > 0 || d.db.WALQuarantined()
+		})
+		go vipDemoter.Start(ctx)
+		// Partition pause (docs/design/partition-pause.md): on losing the execution
+		// quorum for T_pause, suspend/freeze every workload the majority would
+		// recover elsewhere, recorded under <data_dir>/partition-pause; resume on a
+		// majority's confirmation. Runs on the flag alone — a node advertises
+		// partition_pause_v1 only while it already acts on it — and whether or not
+		// a watchdog is armed; a verified watchdog is only the backstop for a
+		// pause that fails.
+		pauser := health.NewPartitionPauser(d.cfg.HostName, d.cfg.DataDir, d.db)
+		pauser.SetQuorum(d.checker.ExecutionQuorum)
+		pauser.SetEnabled(func() bool { return d.cfg.Enforcement.PartitionPause })
+		pauser.SetVMBackend(d.virt)
+		pauser.SetContainerRuntime(lxcRunner)
+		pauser.SetResumeConfirmer(svc.CheckPartitionResume)
+		pauser.SetSettleVerifier(svc.VerifySettleProof)
+		pauser.SetPeerRuntimeChecker(svc.CheckPeerContainerRuntime)
+		pauser.SetSelfFence(watchdogCtrl.Armed, watchdogCtrl.SelfFence)
+		go pauser.Start(ctx)
+		// Persistent HA-degraded surface (unsupported member / unfenced demotion failure / VIP
+		// with no holder) — a durable alertable status + transition events.
+		go svc.RunHAHealthMonitor(ctx, 15*time.Second)
+
+		// Read-only report of this host's pending OS package updates (host_updates).
+		go svc.RunHostUpdateLoop(ctx)
+		// Leader-gated dual-run detector: alert-only cross-check that no workload/VIP runs on
+		// two hosts and no DB owner disagrees with runtime. One node (the lease holder) does
+		// the work so the fleet pages once, not N times.
+		go svc.RunDualRunDetector(ctx, 60*time.Second)
+		// Per-host disk SMART health: gauges + a notification on a failing/prefail disk.
+		if iv := parseSMARTInterval(d.cfg.SMART.Interval); iv > 0 {
+			go svc.RunSMARTMonitor(ctx, iv)
+		}
+		go svc.RunSharedLUNDetector(ctx, 60*time.Second)
+		// The holds this host keeps on iSCSI LUNs whose claims its rebuilds and
+		// recreates moved: released only on positive evidence, re-judged here.
+		go svc.RunLUNHoldResolver(ctx, 0)
+		// Effective-capacity sampler: every host publishes what it is ACTUALLY
+		// carrying (union of DB and runtime workloads), so placement counts rogue
+		// runtimes and refuses hosts whose observation is stale or incomplete.
+		capacityCtx, stopCapacity := context.WithCancel(ctx)
+		capacityDone := make(chan struct{})
+		go func() { defer close(capacityDone); svc.RunCapacitySampler(capacityCtx, 60*time.Second) }()
+		defer func() { stopCapacity(); <-capacityDone }()
+
+		// Start periodic IP scanner — discovers VM IPs via ARP/DHCP and broadcasts FDB entries.
+		ipScanner := grpcapi.NewIPScanner(svc)
+		go ipScanner.Start(ctx)
+
+		svc.SetAntiEntropy(ae) // `lv cluster converge` kicks an immediate debounced pass
+		// Record the founder's genesis decision of the per-NIC enforcement mode
+		// (enforce) once it can; a cluster with no mode recorded observes. And keep
+		// dnsmasq's host reservations in step with the NICs guarded on its
+		// networks.
+		go svc.SeedFirewallEnforcementLoop(ctx, 0, filepath.Join(d.cfg.DataDir, firewallInitialModeName))
+		go svc.SeedFirewallSynfloodLoop(ctx, 0, filepath.Join(d.cfg.DataDir, firewallSynfloodDecisionName))
+		svc.StartDHCPReservations(ctx, 0)
+
+		// Converge this host's network devices on the replicated networks table
+		// every 30s: a network created elsewhere is provisioned here, a deleted
+		// one is torn down here. Started after the firewall reconciler so a pass
+		// that records NAT/isolation intent has something to apply it.
+		svc.StartNetworkReconciler(ctx, 0)
+
+		// tenancy + billing engine. The webhook URL is empty
+		// for most clusters; the emitter resolves to a no-op in that
+		// case so production-without-billing is the zero-config default.
+		tenancyEngine := tenancy.NewEngine(d.db, billing.NewWebhookEmitter(d.cfg.BillingWebhookURL))
+		svc.SetTenancyEngine(tenancyEngine)
+
+		// Seed the default notification webhook from config (#5), if any.
+		d.seedNotificationDefaults(ctx)
+
+		// wire the LXC runtime so the Containers RPCs work.
+		// We always wire it — when lxc-* binaries aren't installed, the
+		// individual RPCs surface the error from the binary lookup, which
+		// is more useful than a blanket "container runtime not wired".
+		// lxcRunner was created above (shared with the metrics collector).
+		svc.SetContainerRuntime(grpcapi.NewLXCRuntimeAdapter(lxcRunner))
+		// The runtime-inventory collector reads owner-epoch markers from the same
+		// root the container checker converges them into.
+		svc.SetContainersRoot(filepath.Join(d.cfg.DataDir, "containers"))
+		// An LB's TLS files are read as root; never from litevirt's own keys.
+		lb.SetProtectedDirs(d.cfg.PKIDir, d.cfg.DataDir)
+
+		// Advertise the host's capabilities as labels so placement puts a workload
+		// only on a host that can run it:
+		//   - LXC (strict: litevirt.lxc=true, see corrosion.HostRunsContainers). The
+		//     runtime is always wired, but the lxc-* binaries may be absent — probe
+		//     for lxc-create.
+		//   - vTPM (G1): both swtpm_setup and swtpm are needed to START a vTPM VM —
+		//     libvirt runs swtpm_setup to initialize state, then swtpm. (The first
+		//     G1 drill failed in swtpm_setup with swtpm alone present.)
+		//     The label is also held false until a pass over the swtpm tree
+		//     (vtpm_state_sync) has completed, so placement offers vTPM here only
+		//     after the attempt to make its state synchronous; a pass that cannot
+		//     raises vtpm_state_not_durable instead. The pass runs in its own
+		//     goroutine and the probe waits at most vtpmPassWait for it.
+		//   - Secure Boot: the secboot/MS OVMF pair (resolved above).
+		// Asserted now, before the container checker starts, and re-asserted every
+		// capabilityLabelInterval (keepCapabilityLabels says why).
+		tpmAvailable := func() bool {
+			_, errSwtpm := exec.LookPath("swtpm")
+			_, errSetup := exec.LookPath("swtpm_setup")
+			return errSwtpm == nil && errSetup == nil
+		}
+		capabilityLabels := []capabilityLabel{
+			{key: corrosion.LabelLXCCapable, capable: lxc.Available},
+			{key: corrosion.LabelTPMCapable, capable: tpmCapable},
+			{key: corrosion.LabelSecureBootCapable, capable: firmwarePaths.SecureBootAvailable},
+			// The live firmware move label holds a target to vTPM's own label
+			// (tpmReady: swtpm present and this cycle's vtpm_state_sync pass completed); a
+			// move's Prepare re-checks presence only (tpmAvailable), since the
+			// label already gated it and a pass per Prepare would walk the tree
+			// on every move.
+			{key: corrosion.LabelFwLiveMigrate, capable: newFwLiveLabel(d.cfg.Migration, d.fwStore, firmwarePaths, d.virt.LibvirtVersion, tpmReady, vtpmSync.vtpmDurableErr)},
+		}
+		// A live firmware move's target re-checks the label's conditions itself,
+		// live, in Prepare.
+		// Prepare re-reads the last vTPM pass at move time: a label a cycle
+		// stale never lets a move target a host whose vTPM state is not durable.
+		svc.SetLiveFirmwareHost(newFwLiveHostCheck(d.cfg.Migration, d.fwStore, firmwarePaths, d.virt.LibvirtVersion, tpmAvailable, vtpmSync.vtpmDurableErr))
+		asserted, err := assertCapabilityLabels(ctx, d.db, d.cfg.HostName, capabilityLabels)
+		if err != nil {
+			slog.Warn("set capability host labels failed; retrying in the background", "labels", asserted, "error", err)
+			asserted = nil // nothing this daemon published stands on the row yet
+		}
+		go keepCapabilityLabels(ctx, d.db, d.cfg.HostName, capabilityLabels, asserted, capabilityLabelInterval)
+
+		// Container reconciler + restart engine: every cycle, sync each locally-owned
+		// container's cluster row to the LXC runtime's reality and auto-restart one
+		// that stopped unexpectedly per its restart policy. Shares the runtime wired
+		// above; operator-stopped containers are left alone (state_detail).
+		ctChecker := health.NewContainerChecker(d.cfg.HostName, d.db, lxcRunner)
+		ctChecker.SetDaemonDirs(d.cfg.DataDir, d.cfg.PKIDir)
+		ctChecker.SetContainersRoot(filepath.Join(d.cfg.DataDir, "containers"))
+		ctChecker.SetEventBus(svc.EventBus())
+		// Runtime container re-key (Phase 4): corroborate a locally-running container
+		// whose only live DB row points elsewhere against every workload-capable peer
+		// before reclaiming it (a PK re-key).
+		ctChecker.SetPeerContainerRuntimeChecker(svc.CheckPeerContainerRuntime)
+		// Guarded v44 re-key WAL is emitted only after the operation protocol's
+		// config kill-switch is on and both the operation + dependent capacity
+		// capabilities have latched cluster-wide. Until then modern authority fails
+		// closed; pre-authority rows retain the exact v1.3 envelope.
+		ctChecker.SetGuardedContainerRekeyActive(func() bool {
+			return d.cfg.Enforcement.OperationProtocol &&
+				d.checker.Latched(capabilities.OperationProtocolV1) &&
+				d.checker.Latched(capabilities.CapacityAdmissionV1)
+		})
+		ctChecker.SetContainerRekeyObserver(func(_, result string) { runtimeRepairMetrics.OwnerAssert("ct", result) })
+		ctChecker.SetOrphanRuntimeObserver(observeOrphans)
+		ctChecker.SetReplicaFreshness(d.db.ReplicaCaughtUp)
+		// Split-brain safety gate (Phase 1): a container re-key needs local quorum once
+		// enforced — wired before the container reconcile loop starts.
+		ctChecker.SetGate(d.checker)
+		ctChecker.SetRecoveryClaimGate(svc.RecoveryClaimGateForPendingProof)
+		ctChecker.SetGateRefusedObserver(gateMetrics.Refused)
+		ctChecker.SetStateWriteFailObserver(stateWriteMetrics.Failed)
+		// The sweep holds the same per-container lock as this host's container
+		// operations, so it never reconciles a container mid-create/start/stop.
+		ctChecker.SetContainerLock(svc.TryLockContainer)
+		go ctChecker.Start(ctx)
+
+		// wire the libvirt blockdev-mirror driver so MoveVolume
+		// supports running VMs without stopping them.
+		svc.SetLiveMover(grpcapi.NewLibvirtLiveMover(d.virt))
+
+		// (content rewrite): wire the guest-content backup engine.
+		// Reads the guest disk over qemu's NBD pull-backup export (not the
+		// qcow2 container), so full + incremental + the dirty bitmap all share
+		// the guest-virtual address space — the correct, consistent model.
+		// nil-safe: if BeginBackup fails, BackupSnapshot falls back to a full
+		// container backup.
+		svc.SetBackupSource(grpcapi.NewLibvirtBackupSource(d.virt))
+		// Point-in-time copies fall back to an external disk-only snapshot when
+		// no backup session opens (grpcapi/pit_copy.go, layer 2).
+		svc.SetPointInTimeSnapshotter(d.virt)
+		// A daemon that died while a layer-2 copy was in its window left the VM
+		// on the overlay with no event: settle every such overlay now.
+		go svc.SweepPITOverlays(ctx, svc.PITSweepReady(ctx))
+
+		// wire the WebAuthn second-factor engine. Empty
+		// rp_id disables — the gRPC handlers then return Unimplemented
+		// instead of a confusing "missing config" surface.
+		if d.cfg.WebAuthn.RPID != "" {
+			wa, err := auth.NewWebAuthnService(d.db, auth.WebAuthnConfig{
+				RPDisplayName: d.cfg.WebAuthn.RPDisplayName,
+				RPID:          d.cfg.WebAuthn.RPID,
+				RPOrigins:     d.cfg.WebAuthn.RPOrigins,
+			})
+			if err != nil {
+				return fmt.Errorf("webauthn init: %w", err)
+			}
+			svc.SetWebAuthnService(wa)
+		}
+
+		// snapshot scheduler runner — built after `svc` exists so it
+		// can reuse lockVM + pickDisk. Backup repo names resolve through
+		// `backup_repos:` in config; an empty map disables the scheduler
+		// effectively (every schedule errors with ErrNoRepoConfigured until
+		// the operator adds a repo).
+		d.snapScheduler.Runner = grpcapi.BackupRunnerForScheduler(svc, d.cfg.BackupRepos)
+		svc.SetBackupRepos(d.cfg.BackupRepos) // let RPC handlers resolve repo names
+		// Per-repo backup bandwidth limits. LoadConfig already refused a bad value.
+		if bw, err := d.cfg.BackupBandwidthLimits(); err == nil {
+			svc.SetBackupBandwidthLimits(bw)
+		} else {
+			slog.Error("backup_bwlimits", "error", err)
+		}
+		// Restore VMs a previous daemon left running (a crash, a restart, an
+		// upgrade) are killed whether or not file restore is still enabled.
+		frRunDir := fileRestoreRunDir(d.cfg.DataDir)
+		frUIDBase := d.cfg.FileRestore.UIDBase
+		if frUIDBase == 0 {
+			frUIDBase = filerestore.DefaultUIDBase
+		}
+		if n := filerestore.SweepStale(frRunDir, frUIDBase, d.cfg.Containers.ContainerIDRange()); n > 0 {
+			slog.Warn("file restore: killed restore VMs a previous daemon left running", "count", n)
+		}
+		if fr := d.cfg.FileRestore; fr.On() {
+			if err := filerestore.EnsureRestoreUser(); err != nil {
+				// File restore then refuses, naming the missing user.
+				slog.Warn("file restore: no restore VM user", "error", err)
+			}
+			// Round-1 builds kept the boot files in data_dir, owned by qemu's
+			// user; they are never read again.
+			_ = os.RemoveAll(filepath.Join(d.cfg.DataDir, "file-restore", "cache"))
+			idle := time.Duration(fr.IdleTimeoutSec) * time.Second
+			if idle <= 0 {
+				idle = 5 * time.Minute
+			}
+			svc.SetFileRestore(grpcapi.FileRestoreOptions{
+				Launcher: filerestore.NewLauncher(filerestore.Config{
+					QEMU: fr.QEMU, Kernel: fr.Kernel, ModulesDir: fr.ModulesDir,
+					MemoryMiB: fr.MemoryMiB, RunAs: fr.RunAs,
+					CacheDir: fileRestoreCacheDir(d.cfg.DataDir),
+					RunDir:   frRunDir,
+					OnTamper: svc.FileRestoreTampered,
+					// The agent outlives the host's idle timeout by a minute, so
+					// it only ever powers off on its own when the host is gone.
+					AgentIdle: idle + time.Minute,
+					Unsandboxed: filerestore.Barriers{
+						Seccomp: fr.AllowUnsandboxed.Seccomp, MAC: fr.AllowUnsandboxed.MAC, Root: fr.AllowUnsandboxed.Root,
+					},
+					AllowSharedRunAs: fr.AllowSharedRunAs,
+					UIDBase:          frUIDBase,
+					ContainerIDs:     d.cfg.Containers.ContainerIDRange(),
+				}),
+				IdleTimeout:     idle,
+				MaxSessions:     fr.MaxSessions,
+				MaxExtractions:  fr.MaxExtractions,
+				MaxExtractBytes: fr.ExtractLimit(),
+			})
+		}
+		// While a key that lifts a restore VM barrier is set, this host carries
+		// an informational file_restore_unsandboxed condition (resolved once it
+		// is not).
+		svc.ReconcileFileRestoreCondition(ctx, d.cfg.FileRestore.ReducedBarrierKeys())
+		svc.SweepTransferStaging()                          // clear orphaned peer-transfer staging repos from a prior incarnation
+		blockedCIDRs, _ := d.cfg.ImagePullBlockedPrefixes() // already validated in LoadConfig
+		svc.SetImageLimits(d.cfg.MaxImageBytes, time.Duration(d.cfg.ImagePullTimeoutSec)*time.Second, blockedCIDRs)
+		d.snapScheduler.ReplRunner = svc // *grpcapi.Server implements RunReplication
+		go d.snapScheduler.Run(ctx)
+
+		// Sweep staging temp files leaked by a prior hard crash (SIGKILL skips the
+		// deferred cleanup of replicate/upload/import/restore temps — they'd
+		// otherwise accumulate and fill the pool/image dirs). Then retry the
+		// pool-file records marks SweepStaleStaging wrote until the replicated
+		// rows are writable: on a new cluster failover_scope_v1 latches after the
+		// first start (pool_records.go). Both in the background: they read every
+		// pool directory, and one on an NFS mount whose server does not answer
+		// blocked this start for good (lab 2 F-1; startup_bound.go).
+		startStorageSweeps(ctx, svc)
+		startLegacyImageProvenance(ctx, svc)
+
+		// Now that the gRPC server exists, wire it as the failover coordinator's
+		// replica promoter (auto_promote recovery) and start the coordinator.
+		fc.Promoter = svc // *grpcapi.Server implements failover.ReplicaPromoter
+		fc.Restorer = svc // implements failover.ContainerRestorer (tier-2 relocate-from-backup)
+		fc.RelocateRestoreTimeout = time.Duration(d.cfg.ContainerRestoreTimeoutSec) * time.Second
+		fc.OnFence = svc.NotifyHostFenced                                   // operator notification on fence (#5)
+		fc.OnDiskStranded = svc.NotifyVMDiskStranded                        // a VM restarted elsewhere left its host-local disk behind
+		fc.OnRootfsStranded = svc.NotifyCTRootfsStranded                    // a relocated container left its own rootfs behind
+		fc.OnRecoveryStalled = svc.NotifyRecoveryStalled                    // a fenced host's recovery that is not proceeding
+		fc.Events = svc.EventBus()                                          // a stopped workload left on a failed host
+		fc.Metrics = metrics.NewFailoverMetrics()                           // structured failover counters (U9)
+		fc.SafeFenceEnforce = d.cfg.Enforcement.SafeFenceDefault            // safe-fence kill-switch (config AND SafeFenceDefaultV1)
+		fc.SharedStorageFenceEnforce = d.cfg.Enforcement.SharedStorageFence // decide-side shared-disk fence kill-switch (config AND SharedStorageFenceV1)
+		// The coordinator half of lease-term enforcement: a local precheck that
+		// refuses to stamp a superseded term. svc.SetLeaseTermEnforce above is the
+		// executor half, and both read this one flag so the source and the enforcer
+		// can never disagree about whether enforcement is on.
+		fc.LeaseTermEnforce = d.cfg.Enforcement.LeaseTerm
+		// Recovery claims (docs/design/recovery-claims.md §3.13): the coordinator
+		// claims through the server's proposer before it mints a reschedule or
+		// relocate proof (the server claims a promote itself, once it knows the
+		// replica's host), and reads the server's enforcement predicate, so the
+		// mint side and the executor side on this node read one answer.
+		fc.Claimer = svc
+		fc.RecoveryClaimEnforced = svc.RecoveryClaimEnforced
+		// The recovery-claim health conditions (ha.claim.stranded,
+		// ha.voter.unavailable) and host.address_shared are the lease holder's to
+		// write, like genesis.
+		fc.ClaimHealth = svc.RecoveryClaimHealthTick
+		// Partition pause, the majority side: rely on a host's pause only with this
+		// node's flag on AND partition_pause_v1 latched (every voter pauses), and
+		// anchor the deadline on the later of the decision and the last contact.
+		fc.PartitionPauseEnforced = func(ctx context.Context) bool {
+			return d.cfg.Enforcement.PartitionPause && d.checker.Enforced(ctx, capabilities.PartitionPauseV1)
+		}
+		fc.LastContact = d.checker.LastContact
+		fc.PeerClockSkew = d.checker.MeasuredClockSkew
+		fc.PeerVoterGeneration = svc.PeerVoterGeneration
+		fc.PeerPausesOnLoss = svc.PeerPausesOnLoss
+		// Once pit_overlay is used, no VM recovery onto a peer whose Ping says it
+		// is WAL-quarantined, or that does not answer (it may be a build that
+		// knows nothing of overlays).
+		fc.PeerRecoveryExclusions = svc.PeerRecoveryExclusions
+		// A coordinator that was itself cut off moments ago decides no new fence
+		// on the failure rows the cut left behind (a fleet-wide blip).
+		fc.QuorumRegain = d.checker.InQuorumRegainGraceFor
+		// Split-brain safety gate (Phase 1): the coordinator gates the reschedule
+		// decide site + writes a durable proof; the reconciler validates/claims it
+		// before start. Both are enforced only once split_brain_gate_v1 is
+		// cluster-wide (fail-open/log-only until then).
+		fc.Gate = d.checker // reconciler + svc gates were wired earlier (before their runtime work)
+		fc.SetGateRefusedObserver(gateMetrics.Refused)
+		// A self-fenced coordinator stops driving failover during the fence-timeout window.
+		fc.SelfFenced = watchdogCtrl.Fenced
+		// A coordinator that was itself suspended or starved a moment ago decides no
+		// fence until it has watched for a full grace window (health/stall.go).
+		fc.LocalStall = d.checker.InStallGrace
+		// Automatic voter genesis runs on the leader-lease holder's tick
+		// (docs/design/recovery-claims.md §4.2). Inert until voter_config_v1 has
+		// durably latched, and once any voter generation exists.
+		fc.VoterGenesis = svc.VoterGenesisTick
+		// Cluster HA disarm: the peers' HA answers for the coordinator, the fence
+		// candidates for the HA policy handler, the cache Ready answers from, and
+		// the lease holder's first-use record of ha_disarm.
+		d.wirePeerHAState(fc, svc)
+		d.wireFenceCandidates(svc)
+		d.startHAPolicyCache(ctx, svc)
+		d.startHADisarmPreRecord(ctx, fc)
+		preRecordCtx, stopPreRecord := context.WithCancel(ctx)
+		preRecordDone := d.startReturningBootPreRecord(preRecordCtx, fc)
+		defer func() { stopPreRecord(); <-preRecordDone }()
+		go fc.Start(ctx)
+		// Adopt each decided voter generation once its certificate verifies,
+		// importing claim state first where this node is a member of it (§4.4).
+		go d.runVoterAdoption(ctx, svc)
+
+		// The global ISO library in sync mode: bring this host's copy of every
+		// library file to the recorded version (iso_library.go).
+		go d.runISOLibrarySync(ctx, svc)
+
+		// Certificates this node serves: re-record a host certificate renewed in
+		// place, export expiry, and notify ahead of it (cert_watch.go).
+		d.certWatch = newCertWatch(d.cfg.HostName, d.cfg.PKIDir, d.db, svc, metrics.NewCertMetrics())
+		go d.certWatch.run(ctx)
+
+		// Peer self-upgrade: a daemon that comes back on an old binary (e.g. it was
+		// down during a cluster upgrade) pulls the newer binary from a healthy peer
+		// and re-execs. Default on; disable with auto_upgrade.from_peer: false.
+		if d.cfg.AutoUpgrade.FromPeerEnabled() {
+			go svc.RunSelfUpgradeWatcher(ctx, d.cfg.AutoUpgrade.Interval())
+		} else {
+			slog.Info("peer self-upgrade disabled (auto_upgrade.from_peer: false)")
+		}
+
+		// Reap orphaned auto DNS records (VMs deleted without their A-record being
+		// removed). Runs an initial sweep shortly after start (clears pre-existing
+		// orphans on upgrade) then periodically. Idempotent + grace-windowed, so
+		// safe to run on every node.
+		go func() {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				if errs := d.realmRegistry.SyncAll(ctx); len(errs) > 0 {
-					for name, err := range errs {
-						slog.Warn("realm sync failed", "realm", name, "error", err)
+			case <-time.After(90 * time.Second):
+			}
+			svc.ReapOrphanDNSRecords(ctx)
+			ticker := time.NewTicker(15 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					svc.ReapOrphanDNSRecords(ctx)
+				}
+			}
+		}()
+
+		// refresh group caches from external realms (LDAP /
+		// OIDC) every 5 min. Errors are per-realm and logged but not fatal
+		// — one IdP being down doesn't take the cluster offline.
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if errs := d.realmRegistry.SyncAll(ctx); len(errs) > 0 {
+						for name, err := range errs {
+							slog.Warn("realm sync failed", "realm", name, "error", err)
+						}
 					}
 				}
 			}
+		}()
+
+		rpcMetrics := metrics.NewRPCMetrics()
+		// Established connections are re-judged every few seconds (pki.ConnTracker):
+		// one made with a certificate since revoked, or with a host certificate a
+		// renewal replaced, drains and is closed, and its client re-handshakes. The
+		// auth interceptors refuse a new RPC on such a connection at once, without
+		// waiting for a sweep (Server.connIdentityGate).
+		connTracker := pki.NewConnTracker(d.cfg.PKIDir)
+		go connTracker.Run(ctx, connSweepInterval, func() func(pki.TrackedConn) pki.Verdict { return svc.ConnJudge(ctx) })
+		grpcOpts := []grpc.ServerOption{
+			grpc.Creds(connTracker.ServerCreds(credentials.NewTLS(tlsCfg))),
+			grpc.StatsHandler(connTracker.StatsHandler()),
+			grpc.ChainUnaryInterceptor(rpcMetrics.UnaryInterceptor(), svc.UnaryAuthInterceptor),
+			grpc.ChainStreamInterceptor(rpcMetrics.StreamInterceptor(), svc.StreamAuthInterceptor),
+			// Defense-in-depth for the legacy unary state-dump/replication paths: the
+			// 4 MiB gRPC default silently failed a large full-state dump (the bug
+			// StreamStateDump fixes), and a big PushMutations batch could trip it too.
+			// StreamStateDump itself stays well under this; this only backstops the
+			// non-chunked paths during/after a mixed-version rollout.
+			grpc.MaxRecvMsgSize(grpcMaxMsgSize),
+			grpc.MaxSendMsgSize(grpcMaxMsgSize),
 		}
-	}()
+		// otelgrpc server handler (only when tracing is active): creates a server span
+		// per RPC and extracts inbound W3C trace context, so a peer-mesh call
+		// (migrate/failover/replicate) continues the caller's trace. Empty when off —
+		// no otel in the serve path unless an OTLP endpoint is configured.
+		grpcOpts = append(grpcOpts, obs.ServerOptions()...)
+		// Keepalive: permit the pings peers send (pki.PeerDial), and detect a
+		// client that died with a call open.
+		grpcOpts = append(grpcOpts, pki.PeerServerOptions()...)
+		d.grpcSrv = grpc.NewServer(grpcOpts...)
 
-	rpcMetrics := metrics.NewRPCMetrics()
-	// Established connections are re-judged every few seconds (pki.ConnTracker):
-	// one made with a certificate since revoked, or with a host certificate a
-	// renewal replaced, drains and is closed, and its client re-handshakes. The
-	// auth interceptors refuse a new RPC on such a connection at once, without
-	// waiting for a sweep (Server.connIdentityGate).
-	connTracker := pki.NewConnTracker(d.cfg.PKIDir)
-	go connTracker.Run(ctx, connSweepInterval, func() func(pki.TrackedConn) pki.Verdict { return svc.ConnJudge(ctx) })
-	grpcOpts := []grpc.ServerOption{
-		grpc.Creds(connTracker.ServerCreds(credentials.NewTLS(tlsCfg))),
-		grpc.StatsHandler(connTracker.StatsHandler()),
-		grpc.ChainUnaryInterceptor(rpcMetrics.UnaryInterceptor(), svc.UnaryAuthInterceptor),
-		grpc.ChainStreamInterceptor(rpcMetrics.StreamInterceptor(), svc.StreamAuthInterceptor),
-		// Defense-in-depth for the legacy unary state-dump/replication paths: the
-		// 4 MiB gRPC default silently failed a large full-state dump (the bug
-		// StreamStateDump fixes), and a big PushMutations batch could trip it too.
-		// StreamStateDump itself stays well under this; this only backstops the
-		// non-chunked paths during/after a mixed-version rollout.
-		grpc.MaxRecvMsgSize(grpcMaxMsgSize),
-		grpc.MaxSendMsgSize(grpcMaxMsgSize),
-	}
-	// otelgrpc server handler (only when tracing is active): creates a server span
-	// per RPC and extracts inbound W3C trace context, so a peer-mesh call
-	// (migrate/failover/replicate) continues the caller's trace. Empty when off —
-	// no otel in the serve path unless an OTLP endpoint is configured.
-	grpcOpts = append(grpcOpts, obs.ServerOptions()...)
-	// Keepalive: permit the pings peers send (pki.PeerDial), and detect a
-	// client that died with a call open.
-	grpcOpts = append(grpcOpts, pki.PeerServerOptions()...)
-	d.grpcSrv = grpc.NewServer(grpcOpts...)
+		// Every setter has run: the firmware moves locked at the journal barrier
+		// are recovered from here (review D2-13 N-1). Then, every minute, a
+		// parked move's blocked call is retried, fence resolution tried, and
+		// each owed DISCARD sent (spec §8.1).
+		svc.MarkStartupWired()
+		dbWorkers.startFirmwareMoveRecovery(ctx)
 
-	// Every setter has run: the firmware moves locked at the journal barrier
-	// are recovered from here (review D2-13 N-1). Then, every minute, a
-	// parked move's blocked call is retried, fence resolution tried, and
-	// each owed DISCARD sent (spec §8.1).
-	svc.MarkStartupWired()
-	dbWorkers.startFirmwareMoveRecovery(ctx)
+		svc.RegisterServices(d.grpcSrv)
 
-	svc.RegisterServices(d.grpcSrv)
-
-	lis, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", d.cfg.GRPCPort))
-	if err != nil {
-		return fmt.Errorf("listen: %w", err)
-	}
-
-	slog.Info("litevirtd starting",
-		"host", d.cfg.HostName,
-		"grpc", fmt.Sprintf("0.0.0.0:%d", d.cfg.GRPCPort),
-		// From the metrics server, not reassembled: this line said 0.0.0.0
-		// unconditionally, so a host that had applied metrics_bind: 127.0.0.1
-		// got two startup lines asserting opposite things, and the louder one
-		// was wrong. Reads "disabled" when metrics_port is 0.
-		"metrics", d.metricsAddrForBanner(),
-		"ui", fmt.Sprintf("%s:%d", d.cfg.UIBind, d.cfg.UIPort),
-	)
-
-	// Start web UI (connects back to local gRPC as a client).
-	go func() {
-		// Recycled when this host's certificate is renewed: the connection
-		// made with the replaced one accepts no new RPC (pki.RecyclingConn).
-		localConn, err := d.localRecyclingConn()
+		lis, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", d.cfg.GRPCPort))
 		if err != nil {
-			slog.Warn("UI gRPC dial failed", "error", err)
-			return
+			return fmt.Errorf("listen: %w", err)
 		}
-		uiClient := pb.NewLiteVirtClient(localConn)
-		uiSrv, err := ui.NewServer(uiClient, d.cfg.HostName)
-		if err != nil {
-			slog.Warn("UI server init failed", "error", err)
-			return
-		}
-		// hand the UI a corrosion DB handle so read-only
-		// pages (security-groups, etc.) can query cluster state without
-		// adding a dedicated gRPC RPC for every list view.
-		uiSrv.SetCorrosionDB(d.db)
-		uiSrv.SetBackupRepos(d.cfg.BackupRepos)
-		uiSrv.SetWSOriginPatterns(d.cfg.UIAllowedOrigins)
-		// Validated at LoadConfig; a parse error here cannot happen.
-		proxies, _ := auth.ParseTrustedProxies(d.cfg.TrustedProxies)
-		uiSrv.SetTrustedProxies(proxies)
-		// UI TLS (acme.go): a custom certificate (`lv host ui-cert set`), else
-		// ACME (HTTP-01 on :80, or DNS-01), else the cluster certificate. The
-		// listener re-decides TLS vs plain HTTP while running, so installing or
-		// clearing a custom certificate needs no restart.
-		uiTLS, challenge := d.buildUITLS(ctx)
-		startACMEChallengeServer(ctx, challenge)
-		d.certWatch.addUI(uiTLS)
-		uiAddr := fmt.Sprintf("%s:%d", d.cfg.UIBind, d.cfg.UIPort)
-		warnPlainUI(d.cfg.UIBind, uiTLS.wantTLS())
-		warnOIDCBehindProxy(d.cfg)
-		uiSrv.StartCollector(ctx)
-		if err := uiSrv.ServeSupervised(ctx, uiAddr, uiTLS.tlsConfig(), uiTLS.wantTLS, 5*time.Second); err != nil {
-			slog.Warn("UI server stopped", "error", err)
-		}
-	}()
 
-	// Start REST API gateway.
-	if d.cfg.RESTPort > 0 {
+		slog.Info("litevirtd starting",
+			"host", d.cfg.HostName,
+			"grpc", fmt.Sprintf("0.0.0.0:%d", d.cfg.GRPCPort),
+			// From the metrics server, not reassembled: this line said 0.0.0.0
+			// unconditionally, so a host that had applied metrics_bind: 127.0.0.1
+			// got two startup lines asserting opposite things, and the louder one
+			// was wrong. Reads "disabled" when metrics_port is 0.
+			"metrics", d.metricsAddrForBanner(),
+			"ui", fmt.Sprintf("%s:%d", d.cfg.UIBind, d.cfg.UIPort),
+		)
+
+		// Start web UI (connects back to local gRPC as a client).
 		go func() {
-			restConn, err := d.localRecyclingConn()
+			// Recycled when this host's certificate is renewed: the connection
+			// made with the replaced one accepts no new RPC (pki.RecyclingConn).
+			localConn, err := d.localRecyclingConn()
 			if err != nil {
-				slog.Warn("REST gRPC dial failed", "error", err)
+				slog.Warn("UI gRPC dial failed", "error", err)
 				return
 			}
-			restClient := pb.NewLiteVirtClient(restConn)
-			restSrv := restapi.NewServer(restClient, "")
+			uiClient := pb.NewLiteVirtClient(localConn)
+			uiSrv, err := ui.NewServer(uiClient, d.cfg.HostName)
+			if err != nil {
+				slog.Warn("UI server init failed", "error", err)
+				return
+			}
+			// hand the UI a corrosion DB handle so read-only
+			// pages (security-groups, etc.) can query cluster state without
+			// adding a dedicated gRPC RPC for every list view.
+			uiSrv.SetCorrosionDB(d.db)
+			uiSrv.SetBackupRepos(d.cfg.BackupRepos)
+			uiSrv.SetWSOriginPatterns(d.cfg.UIAllowedOrigins)
+			// Validated at LoadConfig; a parse error here cannot happen.
 			proxies, _ := auth.ParseTrustedProxies(d.cfg.TrustedProxies)
-			restSrv.SetTrustedProxies(proxies)
-			restAddr := fmt.Sprintf("127.0.0.1:%d", d.cfg.RESTPort)
-			if err := restSrv.ListenAndServe(restAddr); err != nil {
-				slog.Warn("REST API server stopped", "error", err)
+			uiSrv.SetTrustedProxies(proxies)
+			// UI TLS (acme.go): a custom certificate (`lv host ui-cert set`), else
+			// ACME (HTTP-01 on :80, or DNS-01), else the cluster certificate. The
+			// listener re-decides TLS vs plain HTTP while running, so installing or
+			// clearing a custom certificate needs no restart.
+			uiTLS, challenge := d.buildUITLS(ctx)
+			startACMEChallengeServer(ctx, challenge)
+			d.certWatch.addUI(uiTLS)
+			uiAddr := fmt.Sprintf("%s:%d", d.cfg.UIBind, d.cfg.UIPort)
+			warnPlainUI(d.cfg.UIBind, uiTLS.wantTLS())
+			warnOIDCBehindProxy(d.cfg)
+			uiSrv.StartCollector(ctx)
+			if err := uiSrv.ServeSupervised(ctx, uiAddr, uiTLS.tlsConfig(), uiTLS.wantTLS, 5*time.Second); err != nil {
+				slog.Warn("UI server stopped", "error", err)
 			}
 		}()
-	}
 
-	// Handle shutdown, re-exec, and uninstall signals.
-	shutdownDone := make(chan struct{})
-	grpcStopped := make(chan struct{})
-	reexecRequested := false
-	uninstalled := false
-	stopCtx, requestWorkerShutdown := context.WithCancel(ctx)
-	defer requestWorkerShutdown()
-	workerShutdownStarted = true
-	go dbWorkers.shutdown(stopCtx, svc.ReExecCh, svc.ShutdownCh, func(reason daemonStopReason) {
-		switch reason {
-		case daemonContextStop:
+		// Start REST API gateway.
+		if d.cfg.RESTPort > 0 {
+			go func() {
+				restConn, err := d.localRecyclingConn()
+				if err != nil {
+					slog.Warn("REST gRPC dial failed", "error", err)
+					return
+				}
+				restClient := pb.NewLiteVirtClient(restConn)
+				restSrv := restapi.NewServer(restClient, "")
+				proxies, _ := auth.ParseTrustedProxies(d.cfg.TrustedProxies)
+				restSrv.SetTrustedProxies(proxies)
+				restAddr := fmt.Sprintf("127.0.0.1:%d", d.cfg.RESTPort)
+				if err := restSrv.ListenAndServe(restAddr); err != nil {
+					slog.Warn("REST API server stopped", "error", err)
+				}
+			}()
+		}
+
+		// Handle shutdown, re-exec, and uninstall signals.
+		shutdownDone := make(chan struct{})
+		grpcStopped := make(chan struct{})
+		reexecRequested := false
+		uninstalled := false
+		stopCtx, requestWorkerShutdown := context.WithCancel(ctx)
+		defer requestWorkerShutdown()
+		workerShutdownStarted = true
+		go dbWorkers.shutdown(stopCtx, svc.ReExecCh, svc.ShutdownCh, func(reason daemonStopReason) {
+			switch reason {
+			case daemonContextStop:
+				stopBootCheck()
+				<-bootDone
+				<-ownRowDone
+				slog.Info("shutting down")
+				// A graceful stop (SIGTERM from `systemctl restart/stop`) must not
+				// look like a host failure: flag ourselves 'upgrading' so peers skip
+				// fence candidacy during the brief downtime. We set 'active' again on
+				// healthy startup; the failover coordinator still fences a host stuck
+				// 'upgrading' past its timeout, so a host that never returns fails
+				// over. (Re-exec already runs under 'upgrading'; uninstall is removing
+				// the host, so neither needs this.)
+				d.markRestarting()
+			case daemonReExecStop:
+				slog.Info("re-exec requested after upgrade")
+				reexecRequested = true
+			case daemonUninstallStop:
+				slog.Info("shutdown requested by uninstall")
+				uninstalled = true
+			}
+		}, func() {
+			// Bounded whatever the RPCs in flight do: one stuck on storage that
+			// does not answer must not hold the restart (stopGRPC). stopServing
+			// closes grpcStopped as soon as that stop returns or is given up on.
+			stopServing(d.grpcSrv, svc, grpcGracefulStop, grpcForcedStop, grpcStopped, func() {
+				// A vfio-pci unbind still blocked in the kernel keeps this process alive
+				// past every step below; name the devices so an operator knows which
+				// holder to stop.
+				vfio.LogStuckUnbinds()
+				// A drain returns before its failback records are written, and this
+				// is the host it drained: give them a moment to land while the
+				// replicator still runs, and name every VM whose record is lost.
+				svc.FinishDrainRecords(grpcapi.DrainRecordStopWait)
+			})
+		}, func() {
+			if d.fwReconciler != nil {
+				// No log line outlives the listener: once this process exits,
+				// another program could take the group.
+				stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				fwLogging.Stop(stopCtx)
+				cancel()
+				d.fwReconciler.Stop()
+			}
+			if d.snapScheduler != nil {
+				d.snapScheduler.Stop()
+			}
 			stopBootCheck()
-			<-bootDone
-			<-ownRowDone
-			slog.Info("shutting down")
-			// A graceful stop (SIGTERM from `systemctl restart/stop`) must not
-			// look like a host failure: flag ourselves 'upgrading' so peers skip
-			// fence candidacy during the brief downtime. We set 'active' again on
-			// healthy startup; the failover coordinator still fences a host stuck
-			// 'upgrading' past its timeout, so a host that never returns fails
-			// over. (Re-exec already runs under 'upgrading'; uninstall is removing
-			// the host, so neither needs this.)
-			d.markRestarting()
-		case daemonReExecStop:
-			slog.Info("re-exec requested after upgrade")
-			reexecRequested = true
-		case daemonUninstallStop:
-			slog.Info("shutdown requested by uninstall")
-			uninstalled = true
-		}
-	}, func() {
-		// Bounded whatever the RPCs in flight do: one stuck on storage that
-		// does not answer must not hold the restart (stopGRPC). stopServing
-		// closes grpcStopped as soon as that stop returns or is given up on.
-		stopServing(d.grpcSrv, svc, grpcGracefulStop, grpcForcedStop, grpcStopped, func() {
-			// A vfio-pci unbind still blocked in the kernel keeps this process alive
-			// past every step below; name the devices so an operator knows which
-			// holder to stop.
-			vfio.LogStuckUnbinds()
-			// A drain returns before its failback records are written, and this
-			// is the host it drained: give them a moment to land while the
-			// replicator still runs, and name every VM whose record is lost.
-			svc.FinishDrainRecords(grpcapi.DrainRecordStopWait)
+			<-bootDone   // the boot worker no longer owns the DB or local client
+			<-ownRowDone // includes every reconcile serving/fence child
+			stopPreRecord()
+			<-preRecordDone
+			stopCapacity()
+			<-capacityDone
+			svc.StopDHCPReservations()
+			repl.Stop()
+			// The database closes first: closing libvirt fails the calls still
+			// waiting on it, and their error paths would otherwise write what
+			// that failure is not (a held start recorded failed over a domain
+			// libvirtd goes on to start).
+			d.db.Close()
+			d.virt.Close()
+			close(shutdownDone)
 		})
-	}, func() {
-		if d.fwReconciler != nil {
-			// No log line outlives the listener: once this process exits,
-			// another program could take the group.
-			stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			fwLogging.Stop(stopCtx)
-			cancel()
-			d.fwReconciler.Stop()
+
+		serveErrs := make(chan error, 1)
+		go func() { serveErrs <- d.grpcSrv.Serve(lis) }()
+		// Serve returns only once a stop has finished, and a stop can wait on a
+		// handler stuck in the kernel: once the shutdown's stop is over, Serve
+		// is waited on only briefly (awaitServe).
+		serveErr := awaitServe(serveErrs, grpcStopped, serveReturnBound)
+		// An unexpected Serve failure is also an exit: it must not leave the
+		// coordinator waiting forever on an otherwise-live Run context.
+		requestWorkerShutdown()
+
+		// Wait for cleanup to finish (replicator, libvirt, DB) before returning,
+		// but cap at 15s so we don't hang longer than systemd's stop timeout.
+		select {
+		case <-shutdownDone:
+		case <-time.After(15 * time.Second):
+			slog.Warn("shutdown cleanup timed out after 15s, exiting anyway")
 		}
-		if d.snapScheduler != nil {
-			d.snapScheduler.Stop()
+
+		if reexecRequested {
+			return ErrReExec
 		}
-		stopBootCheck()
-		<-bootDone   // the boot worker no longer owns the DB or local client
-		<-ownRowDone // includes every reconcile serving/fence child
-		stopPreRecord()
-		<-preRecordDone
-		stopCapacity()
-		<-capacityDone
-		svc.StopDHCPReservations()
-		repl.Stop()
-		// The database closes first: closing libvirt fails the calls still
-		// waiting on it, and their error paths would otherwise write what
-		// that failure is not (a held start recorded failed over a domain
-		// libvirtd goes on to start).
-		d.db.Close()
-		d.virt.Close()
-		close(shutdownDone)
+		// Uninstall has already removed the unit files and the binary. Under
+		// Restart=always systemd would restart a unit whose ExecStart no longer
+		// exists, so this exit has to be distinguishable from an ordinary one — the
+		// unit's RestartPreventExitStatus pins the status the caller exits with.
+		if uninstalled {
+			return ErrUninstalled
+		}
+
+		// Serve returns ErrServerStopped on graceful shutdown — not a real error.
+		if serveErr != nil && serveErr != grpc.ErrServerStopped {
+			return fmt.Errorf("gRPC serve: %w", serveErr)
+		}
+		return nil
 	})
-
-	serveErrs := make(chan error, 1)
-	go func() { serveErrs <- d.grpcSrv.Serve(lis) }()
-	// Serve returns only once a stop has finished, and a stop can wait on a
-	// handler stuck in the kernel: once the shutdown's stop is over, Serve
-	// is waited on only briefly (awaitServe).
-	serveErr := awaitServe(serveErrs, grpcStopped, serveReturnBound)
-	// An unexpected Serve failure is also an exit: it must not leave the
-	// coordinator waiting forever on an otherwise-live Run context.
-	requestWorkerShutdown()
-
-	// Wait for cleanup to finish (replicator, libvirt, DB) before returning,
-	// but cap at 15s so we don't hang longer than systemd's stop timeout.
-	select {
-	case <-shutdownDone:
-	case <-time.After(15 * time.Second):
-		slog.Warn("shutdown cleanup timed out after 15s, exiting anyway")
-	}
-
-	if reexecRequested {
-		return ErrReExec
-	}
-	// Uninstall has already removed the unit files and the binary. Under
-	// Restart=always systemd would restart a unit whose ExecStart no longer
-	// exists, so this exit has to be distinguishable from an ordinary one — the
-	// unit's RestartPreventExitStatus pins the status the caller exits with.
-	if uninstalled {
-		return ErrUninstalled
-	}
-
-	// Serve returns ErrServerStopped on graceful shutdown — not a real error.
-	if serveErr != nil && serveErr != grpc.ErrServerStopped {
-		return fmt.Errorf("gRPC serve: %w", serveErr)
-	}
-	return nil
 }
 
 // ErrReExec is returned by Run when the daemon should re-exec itself
@@ -3614,6 +3639,12 @@ func (d *Daemon) runOperationRecovery(ctx context.Context) {
 		slog.Error("operation recovery: CORRUPT journal entries — host degraded for affected mutations", "files", corrupt)
 	}
 	for _, p := range plan {
+		// Controlled records never enter legacy absent-row/epoch cleanup. They
+		// retain their original durable preparation until exact owner reconciliation.
+		if p.Action == opjournal.RecoveryControlled {
+			slog.Warn("operation recovery: execution reconciliation unavailable; retaining controlled record", "op", p.Entry.OperationID, "vm", p.Entry.ResourceID, "stage", p.Entry.Stage)
+			continue
+		}
 		// device_lease entries are not operation-table ops; they're recovered
 		// (with device rollback) by grpcapi.RecoverDeviceLeases, not here.
 		if p.Entry.Kind == "device_lease" {

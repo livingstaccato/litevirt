@@ -40,7 +40,8 @@ import (
 //     and device state. Chosen from the guest's measured dirty rate; one
 //     that does not converge is suspended at its deadline, which turns the
 //     remainder into a stopped copy (libvirt admits a suspend during the
-//     snapshot job, qemu_snapshot.c:1389-1392, and still resumes at the end).
+//     snapshot job's memory write, qemu_snapshot.c:1377-1380 at the v10.0.0
+//     tag, and its cleanup still resumes the guest at the end, 1445).
 
 // Capture defaults. All three are design targets until the P1 lab
 // measurements replace them [measure].
@@ -80,6 +81,12 @@ type CaptureOptions struct {
 	// Deadline bounds a live capture: past it the guest is suspended so the
 	// remainder is written with vCPUs stopped. 0 is DefaultCaptureDeadline.
 	Deadline time.Duration
+	// Registry is this host's capture registry, shared with the partition
+	// pauser; nil is a registry of this capture alone.
+	Registry *CaptureRegistry
+	// Held reports whether the guest has a pause record (the partition
+	// pauser paused it): such a guest is never resumed by the capture.
+	Held func() bool
 }
 
 // LiveCaptureAPI is the part of libvirt a memory snapshot capture uses. It
@@ -96,6 +103,9 @@ type LiveCaptureAPI interface {
 	DomainGetBlockInfo(dom golibvirt.Domain, path string, flags uint32) (uint64, uint64, uint64, error)
 	DomainStartDirtyRateCalc(dom golibvirt.Domain, seconds int32, flags uint32) error
 	ConnectGetAllDomainStats(doms []golibvirt.Domain, stats uint32, flags uint32) ([]golibvirt.DomainStatsRecord, error)
+	DomainAbortJob(dom golibvirt.Domain) error
+	DomainSaveImageGetXMLDesc(file string, flags uint32) (string, error)
+	DomainSaveImageDefineXML(file string, dxml string, flags uint32) error
 }
 
 var _ LiveCaptureAPI = (*golibvirt.Libvirt)(nil)
@@ -106,6 +116,11 @@ var _ LiveCaptureAPI = (*golibvirt.Libvirt)(nil)
 // image's size. A paused or stopped domain is refused: the capture ends by
 // resuming the guest, and a paused domain is paused by someone (an operator,
 // or this host's partition pause, docs/design/partition-pause.md §3.3).
+//
+// The partition pause wins over the capture (CaptureRegistry). The capture
+// is registered while it runs; it never resumes a guest that the pauser
+// holds or that has a pause record (o.Held), and re-suspends one it finds
+// running then. Otherwise it resumes only a guest it suspended itself.
 func CaptureMemorySnapshot(v LiveCaptureAPI, domainName, snapshotName, vmstatePath string, o CaptureOptions) (diskBytes, vmstateBytes int64, err error) {
 	dom, err := v.DomainLookupByName(domainName)
 	if err != nil {
@@ -118,6 +133,21 @@ func CaptureMemorySnapshot(v LiveCaptureAPI, domainName, snapshotName, vmstatePa
 	if state != int32(golibvirt.DomainRunning) {
 		return 0, 0, fmt.Errorf("domain %q is not running — memory snapshot requires a running VM", domainName)
 	}
+	reg := o.Registry
+	if reg == nil {
+		reg = NewCaptureRegistry()
+	}
+	e, err := reg.begin(domainName, func() error { return v.DomainAbortJob(dom) })
+	if err != nil {
+		return 0, 0, err
+	}
+	defer reg.end(domainName, e)
+	held := false
+	reg.settle(domainName, o.Held, func(h bool) { held = h })
+	if held {
+		return 0, 0, fmt.Errorf("domain %q is held paused by this host's partition pause — no memory snapshot", domainName)
+	}
+
 	budget, deadline := o.PauseBudget, o.Deadline
 	if budget <= 0 {
 		budget = DefaultCapturePauseBudget
@@ -129,25 +159,45 @@ func CaptureMemorySnapshot(v LiveCaptureAPI, domainName, snapshotName, vmstatePa
 
 	live, why := false, "firmware state is captured with the vCPUs stopped"
 	if !o.Firmware && o.CaptureSuspended == nil && !hasFirmwareState(before) {
-		rate := measureDirtyRate(v, dom)
-		live, why = chooseCaptureVariant(domainRAMBytes(before), rate, captureWriteBps, budget, deadline)
+		ram := domainRAMBytes(before)
+		rate, rerr := measureDirtyRate(v, dom)
+		if rerr != nil {
+			// The live capture is then bounded only by its deadline: cap it
+			// at twice the predicted RAM write, so a guest that will not
+			// converge is not precopied for the whole configured deadline.
+			if c := unknownRateDeadline(ram); c < deadline {
+				deadline = c
+			}
+			slog.Warn("memory snapshot: the guest's dirty rate could not be measured; capturing live with a capped deadline",
+				"vm", domainName, "deadline", deadline, "error", rerr)
+		}
+		live, why = chooseCaptureVariant(ram, rate, captureWriteBps, budget, deadline)
 	}
 	snapXML, err := snapshotCreateXMLMemory(v, dom, snapshotName, vmstatePath)
 	if err != nil {
 		return 0, 0, err
 	}
 	start := time.Now()
-	var suspended bool
+	c := &capture{v: v, dom: dom, reg: reg, e: e, held: o.Held}
 	if live {
-		suspended, err = captureLive(v, dom, snapXML, deadline)
+		err = c.live(snapXML, deadline)
 	} else {
-		err = capturePaused(v, dom, snapXML, o.CaptureSuspended)
+		err = c.paused(snapXML, o.CaptureSuspended)
+	}
+	if serr := c.settle(); serr != nil && err == nil {
+		err = serr
 	}
 	if err != nil {
 		return 0, 0, err
 	}
-	if after, aerr := v.DomainGetXMLDesc(dom, 0); aerr == nil {
+	after, aerr := v.DomainGetXMLDesc(dom, 0)
+	if aerr == nil {
 		narrowNew(newDiskSources(before, after)...)
+		if rerr := rewriteImageOntoOverlays(v, vmstatePath, before, after); rerr != nil {
+			slog.Warn("memory snapshot: the image still names the disks as they were before the snapshot; "+
+				"a revert by a build without the overlay repoint (0fef47979) would restore onto them",
+				"vm", domainName, "snapshot", snapshotName, "error", rerr)
+		}
 	}
 	narrowNew(vmstatePath) // the guest's RAM
 	allocation, _, _, _ := v.DomainGetBlockInfo(dom, "vda", 0)
@@ -156,24 +206,79 @@ func CaptureMemorySnapshot(v LiveCaptureAPI, domainName, snapshotName, vmstatePa
 	}
 	slog.Info("memory snapshot captured in process", "vm", domainName, "snapshot", snapshotName,
 		"variant", map[bool]string{true: "live", false: "paused"}[live], "why", why,
-		"deadline_suspended", suspended, "took", time.Since(start).Round(time.Millisecond))
+		"deadline_suspended", c.suspended, "took", time.Since(start).Round(time.Millisecond))
 	return int64(allocation), vmstateBytes, nil
 }
 
-// capturePaused is the paused variant: suspend, snapshot without LIVE (libvirt
-// leaves a domain it found paused paused), firmware at the same instant,
-// resume. Any failure resumes the guest before it returns.
-func capturePaused(v LiveCaptureAPI, dom golibvirt.Domain, snapXML string, captureSuspended func() error) error {
-	if err := v.DomainSuspend(dom); err != nil {
-		return fmt.Errorf("suspend domain %q: %w", dom.Name, err)
+// unknownRateDeadline caps a live capture whose guest's dirty rate is
+// unknown: twice the predicted write of its RAM, at least a second; the
+// configured deadline when its RAM is unknown too.
+func unknownRateDeadline(ram uint64) time.Duration {
+	if ram == 0 {
+		return DefaultCaptureDeadline
 	}
-	resumed := false
-	defer func() {
-		if !resumed {
-			_ = v.DomainResume(dom)
+	d := time.Duration(2 * float64(ram) / captureWriteBps * float64(time.Second))
+	if d < time.Second {
+		d = time.Second
+	}
+	return d
+}
+
+// capture is one capture's resume bookkeeping.
+type capture struct {
+	v    LiveCaptureAPI
+	dom  golibvirt.Domain
+	reg  *CaptureRegistry
+	e    *captureEntry
+	held func() bool
+	// suspended: this capture suspended the guest (the paused variant, or a
+	// live capture's deadline), so it may resume it — unless it is held.
+	suspended bool
+}
+
+// settle is every capture's end, success or failure, under the registry's
+// lock: a held guest (the pauser's hold, or a pause record) is never resumed
+// and is re-suspended if it runs (libvirt's own cleanup resumes a guest that
+// was running when the snapshot began); otherwise a guest this capture
+// suspended and finds paused is resumed.
+func (c *capture) settle() error {
+	var err error
+	c.reg.settle(c.dom.Name, c.held, func(held bool) {
+		st, _, serr := c.v.DomainGetState(c.dom, 0)
+		if serr != nil {
+			err = fmt.Errorf("read domain %q state after the memory snapshot: %w", c.dom.Name, serr)
+			return
 		}
-	}()
-	if _, err := v.DomainSnapshotCreateXML(dom, snapXML, uint32(golibvirt.DomainSnapshotCreateAtomic)); err != nil {
+		if held {
+			if st == int32(golibvirt.DomainRunning) {
+				if serr := c.v.DomainSuspend(c.dom); serr != nil {
+					err = fmt.Errorf("re-suspend partition-paused domain %q after the memory snapshot: %w", c.dom.Name, serr)
+				}
+			}
+			slog.Warn("memory snapshot: the guest is held by this host's partition pause; the capture leaves it paused",
+				"vm", c.dom.Name)
+			return
+		}
+		if c.suspended && st == int32(golibvirt.DomainPaused) {
+			if rerr := c.v.DomainResume(c.dom); rerr != nil {
+				err = fmt.Errorf("resume domain %q after the memory snapshot: %w", c.dom.Name, rerr)
+			}
+		}
+	})
+	return err
+}
+
+// paused is the paused variant: suspend, snapshot without LIVE (libvirt
+// leaves a domain it found paused paused), firmware at the same instant;
+// settle resumes.
+func (c *capture) paused(snapXML string, captureSuspended func() error) error {
+	if err := c.v.DomainSuspend(c.dom); err != nil {
+		return fmt.Errorf("suspend domain %q: %w", c.dom.Name, err)
+	}
+	c.suspended = true
+	_, err := c.v.DomainSnapshotCreateXML(c.dom, snapXML, uint32(golibvirt.DomainSnapshotCreateAtomic))
+	c.e.jobDone()
+	if err != nil {
 		return fmt.Errorf("memory snapshot: %w", err)
 	}
 	if captureSuspended != nil {
@@ -181,54 +286,74 @@ func capturePaused(v LiveCaptureAPI, dom golibvirt.Domain, snapXML string, captu
 			return fmt.Errorf("capture firmware state: %w", err)
 		}
 	}
-	resumed = true
-	if err := v.DomainResume(dom); err != nil {
-		return fmt.Errorf("resume domain %q after the memory snapshot: %w", dom.Name, err)
-	}
 	return nil
 }
 
-// captureLive is the live variant. Past the deadline the guest is
-// suspended, so QEMU writes the remainder with the vCPUs stopped; libvirt
-// resumes the domain when the snapshot ends, because it was running when the
-// snapshot began. A guest still paused afterwards (the suspend landed after
-// libvirt's resume, or libvirt's resume failed) is resumed here, since this
-// capture paused it. Reports whether the deadline suspended the guest.
-func captureLive(v LiveCaptureAPI, dom golibvirt.Domain, snapXML string, deadline time.Duration) (bool, error) {
+// live is the live variant. Past the deadline the guest is suspended, so
+// QEMU writes the remainder with the vCPUs stopped; libvirt resumes the
+// domain when the snapshot ends, because it was running when the snapshot
+// began, and a suspend that lands after that resume is undone by settle. A
+// suspend that fails aborts the job instead (libvirt's cleanup resumes the
+// guest), rather than waiting on a job that will not end.
+func (c *capture) live(snapXML string, deadline time.Duration) error {
 	done := make(chan error, 1)
 	go func() {
-		_, err := v.DomainSnapshotCreateXML(dom, snapXML,
+		_, err := c.v.DomainSnapshotCreateXML(c.dom, snapXML,
 			uint32(golibvirt.DomainSnapshotCreateLive|golibvirt.DomainSnapshotCreateAtomic))
+		c.e.jobDone()
 		done <- err
 	}()
 	timer := time.NewTimer(deadline)
 	defer timer.Stop()
 	var err error
-	suspended := false
 	select {
 	case err = <-done:
 	case <-timer.C:
-		if serr := v.DomainSuspend(dom); serr != nil {
-			slog.Warn("memory snapshot: the live capture passed its deadline and the guest could not be suspended",
-				"vm", dom.Name, "deadline", deadline, "error", serr)
+		if serr := c.v.DomainSuspend(c.dom); serr != nil {
+			slog.Warn("memory snapshot: the live capture passed its deadline and the guest could not be suspended; aborting it",
+				"vm", c.dom.Name, "deadline", deadline, "error", serr)
+			if aerr := c.v.DomainAbortJob(c.dom); aerr != nil {
+				slog.Warn("memory snapshot: abort of the live capture failed", "vm", c.dom.Name, "error", aerr)
+			}
 		} else {
-			suspended = true
+			c.suspended = true
 			slog.Info("memory snapshot: the live capture passed its deadline; finishing it with the guest suspended",
-				"vm", dom.Name, "deadline", deadline)
+				"vm", c.dom.Name, "deadline", deadline)
 		}
 		err = <-done
 	}
-	if suspended {
-		if st, _, serr := v.DomainGetState(dom, 0); serr == nil && st == int32(golibvirt.DomainPaused) {
-			if rerr := v.DomainResume(dom); rerr != nil && err == nil {
-				err = fmt.Errorf("resume domain %q after the memory snapshot: %w", dom.Name, rerr)
-			}
+	if err != nil {
+		return fmt.Errorf("memory snapshot: %w", err)
+	}
+	return nil
+}
+
+// rewriteImageOntoOverlays makes the image's definition name each disk's
+// overlay instead of the disk the snapshot was taken of: libvirt writes the
+// image before it switches the disks. Every build's revert then restores
+// onto the overlay, including one without repointRevertedDisk, which
+// restores the image's disks as written and would write into the snapshot's
+// base. Only disk sources change, which libvirt's ABI check accepts.
+func rewriteImageOntoOverlays(v LiveCaptureAPI, path, beforeXML, afterXML string) error {
+	before, after := parseDomainDiskSources(beforeXML), parseDomainDiskSources(afterXML)
+	x, err := v.DomainSaveImageGetXMLDesc(path, uint32(golibvirt.DomainSaveImageXMLSecure))
+	if err != nil {
+		return err
+	}
+	saved := parseDomainDiskSources(x)
+	out := x
+	for _, dev := range sortedDevs(after) {
+		if after[dev] == before[dev] || saved[dev] == after[dev] {
+			continue
+		}
+		if out, err = repointRevertedDisk(out, dev, after[dev]); err != nil {
+			return err
 		}
 	}
-	if err != nil {
-		return suspended, fmt.Errorf("memory snapshot: %w", err)
+	if out == x {
+		return nil
 	}
-	return suspended, nil
+	return v.DomainSaveImageDefineXML(path, out, 0)
 }
 
 // chooseCaptureVariant predicts a live capture of a guest with ram bytes
@@ -280,11 +405,10 @@ const qemuDowntimeLimit = 300 * time.Millisecond
 
 // measureDirtyRate asks QEMU for the guest's dirty rate (libvirt 7.2:
 // virDomainStartDirtyRateCalc, then the "dirtyrate" stats group), in
-// bytes/s; -1 when it cannot be measured.
-func measureDirtyRate(v LiveCaptureAPI, dom golibvirt.Domain) float64 {
+// bytes/s; -1 and why when it cannot be measured.
+func measureDirtyRate(v LiveCaptureAPI, dom golibvirt.Domain) (float64, error) {
 	if err := v.DomainStartDirtyRateCalc(dom, dirtyRateCalcSeconds, 0); err != nil {
-		slog.Debug("memory snapshot: dirty rate unavailable", "vm", dom.Name, "error", err)
-		return -1
+		return -1, fmt.Errorf("start dirty rate calculation: %w", err)
 	}
 	sleep := captureSleep
 	if cs, ok := v.(interface{ CaptureSleep(time.Duration) }); ok {
@@ -294,8 +418,11 @@ func measureDirtyRate(v LiveCaptureAPI, dom golibvirt.Domain) float64 {
 	for i := 0; i < 4; i++ {
 		sleep(wait)
 		recs, err := v.ConnectGetAllDomainStats([]golibvirt.Domain{dom}, uint32(golibvirt.DomainStatsDirtyrate), 0)
-		if err != nil || len(recs) == 0 {
-			return -1
+		if err != nil {
+			return -1, fmt.Errorf("read the dirty rate: %w", err)
+		}
+		if len(recs) == 0 {
+			return -1, fmt.Errorf("read the dirty rate: no stats for the domain")
 		}
 		status, rate := int64(-1), int64(-1)
 		for _, p := range recs[0].Params {
@@ -307,11 +434,11 @@ func measureDirtyRate(v LiveCaptureAPI, dom golibvirt.Domain) float64 {
 			}
 		}
 		if status == 2 && rate >= 0 { // VIR_DOMAIN_DIRTYRATE_MEASURED
-			return float64(rate) * (1 << 20)
+			return float64(rate) * (1 << 20), nil
 		}
 		wait = 250 * time.Millisecond
 	}
-	return -1
+	return -1, fmt.Errorf("the dirty rate calculation did not finish")
 }
 
 func typedInt(i interface{}) int64 {

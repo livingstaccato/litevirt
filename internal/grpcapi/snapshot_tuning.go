@@ -1,6 +1,10 @@
 package grpcapi
 
-import "time"
+import (
+	"time"
+
+	lv "github.com/litevirt/litevirt/internal/libvirt"
+)
 
 // MemorySnapshotTuning is this node's memory snapshot configuration
 // (memory_snapshot.* in the daemon config). Zero values are the libvirt
@@ -17,3 +21,10 @@ type MemorySnapshotTuning struct {
 // SetMemorySnapshotTuning sets the memory snapshot tuning; called once at
 // daemon start, before the server serves.
 func (s *Server) SetMemorySnapshotTuning(t MemorySnapshotTuning) { s.memorySnapshot = t }
+
+// CaptureRegistry is this host's memory snapshot capture registry, which the
+// daemon shares with its partition pauser (lv.CaptureRegistry).
+func (s *Server) CaptureRegistry() *lv.CaptureRegistry {
+	s.captureRegOnce.Do(func() { s.captureReg = lv.NewCaptureRegistry() })
+	return s.captureReg
+}

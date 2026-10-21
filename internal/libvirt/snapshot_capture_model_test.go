@@ -12,17 +12,19 @@ import (
 )
 
 // The libvirt10 model's QEMU process and vCPUs, for memory snapshots. It
-// follows libvirt v10.0.0 src/qemu/qemu_snapshot.c:
+// follows libvirt v10.0.0 src/qemu/qemu_snapshot.c (line numbers at the
+// v10.0.0 tag):
 //
 //   - VIR_DOMAIN_SNAPSHOT_CREATE_LIVE is refused unless the domain is active
-//     and the memory location is external (qemuSnapshotPrepare, 1533-1539);
+//     and the memory location is external (qemuSnapshotCreateXMLValidateDef,
+//     1533-1539);
 //   - qemuSnapshotCreateActiveExternal (1287-1480): a RUNNING domain is to be
 //     resumed at the end (resume = true); without LIVE its vCPUs are stopped
 //     up front; with LIVE QEMU runs a precopy into the file and stops the
 //     vCPUs itself once the remainder fits its downtime limit. The memory is
 //     written BEFORE the disks switch over, so the image's definition names
 //     the disks as they were; a PAUSED domain is left paused;
-//   - while the memory is written, the job mask admits SUSPEND (1389-1392),
+//   - while the memory is written, the job mask admits SUSPEND (1377-1380),
 //     and qemuDomainSuspend (qemu_driver.c:1663) stops the vCPUs with reason
 //     PAUSED_SNAPSHOT; the snapshot still ends by resuming a domain that was
 //     running when it began.
@@ -52,8 +54,26 @@ type qemuModel struct {
 	liveJob     bool          // a LIVE memory write is in progress
 	jobSuspend  chan struct{} // closed by a DomainSuspend during liveJob
 	suspendInJb bool          // a DomainSuspend arrived during a live job
-	dirtyCalcs  int           // DomainStartDirtyRateCalc calls
-	memGen      int           // bumps on every write of guest memory image
+	jobAbort    chan struct{} // closed by a DomainAbortJob during liveJob
+	aborted     bool          // a DomainAbortJob ended a live job
+	// abortIgnored: DomainAbortJob succeeds but the job runs on (a QEMU
+	// that does not act on migrate_cancel in time).
+	abortIgnored bool
+	// slowJob: a LIVE capture converges on its own after this much real
+	// time, during which a DomainSuspend blocks on the job lock and lands
+	// only after the job (and libvirt's resume) is over, as libvirt's does
+	// once the memory phase has ended (the async job mask is back to the
+	// default, which does not admit SUSPEND).
+	slowJob time.Duration
+	jobOver chan struct{} // closed when a slow job ends
+	// failCreate fails the next full-system create before anything is
+	// written, as a refused or failed memory write does.
+	failCreate error
+	// postJob runs after a full-system create returned (libvirt's resume
+	// included), with the model unlocked.
+	postJob    func()
+	dirtyCalcs int // DomainStartDirtyRateCalc calls
+	memGen     int // bumps on every write of guest memory image
 }
 
 // createCall is one DomainSnapshotCreateXML and the vCPU state it ran in.
@@ -143,6 +163,11 @@ func (m *libvirt10) decorate(x string) string {
 func (m *libvirt10) DomainSuspend(dom golibvirt.Domain) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if over := m.qemu.jobOver; over != nil {
+		m.mu.Unlock()
+		<-over
+		m.mu.Lock()
+	}
 	d, err := m.lookup(dom.Name)
 	if err != nil {
 		return err
@@ -222,8 +247,26 @@ func (m *libvirt10) createFullSystem(d *modelDomain, dom golibvirt.Domain, x str
 	if resume && !live {
 		m.stopCPUs(d)
 	}
+	if err := m.qemu.failCreate; err != nil {
+		m.qemu.failCreate = nil
+		if resume {
+			m.startCPUs(d)
+		}
+		return golibvirt.DomainSnapshot{}, err
+	}
 	remaining := m.ramBytes()
-	if live && d.state == golibvirt.DomainRunning {
+	if live && d.state == golibvirt.DomainRunning && m.qemu.slowJob > 0 {
+		over := make(chan struct{})
+		m.qemu.jobOver = over
+		m.mu.Unlock()
+		time.Sleep(m.qemu.slowJob)
+		m.mu.Lock()
+		m.qemu.now += m.ramTime(remaining)
+		m.stopCPUs(d)
+		m.qemu.jobOver = nil
+		defer close(over) // after libvirt's resume below
+		remaining = 0
+	} else if live && d.state == golibvirt.DomainRunning {
 		// Precopy: passes over the dirtied memory while the guest runs.
 		set := float64(remaining)
 		converged := false
@@ -242,16 +285,29 @@ func (m *libvirt10) createFullSystem(d *modelDomain, dom golibvirt.Domain, x str
 		}
 		if !converged {
 			// Never fits the downtime limit: QEMU keeps copying until
-			// someone stops the vCPUs.
-			ch := make(chan struct{})
-			m.qemu.liveJob, m.qemu.jobSuspend = true, ch
+			// someone stops the vCPUs or aborts the job.
+			ch, ab := make(chan struct{}), make(chan struct{})
+			m.qemu.liveJob, m.qemu.jobSuspend, m.qemu.jobAbort = true, ch, ab
 			m.mu.Unlock()
+			aborted := false
 			select {
 			case <-ch:
+			case <-ab:
+				aborted = true
 			case <-time.After(10 * time.Second):
 			}
 			m.mu.Lock()
-			m.qemu.liveJob = false
+			m.qemu.liveJob, m.qemu.jobAbort = false, nil
+			if aborted {
+				// migrate_cancel: the job fails, nothing is written, and
+				// libvirt's cleanup resumes a guest that was running.
+				m.qemu.jobSuspend = nil
+				m.qemu.aborted = true
+				if resume {
+					m.startCPUs(d)
+				}
+				return golibvirt.DomainSnapshot{}, fmt.Errorf("operation aborted: snapshot job: canceled by client")
+			}
 			if !m.qemu.suspendInJb {
 				m.qemu.jobSuspend = nil
 				return golibvirt.DomainSnapshot{}, fmt.Errorf("model: the live capture never converged and nobody suspended the guest")
@@ -281,7 +337,39 @@ func (m *libvirt10) createFullSystem(d *modelDomain, dom golibvirt.Domain, x str
 	if resume {
 		m.startCPUs(d)
 	}
+	if hook := m.qemu.postJob; hook != nil {
+		m.qemu.postJob = nil
+		m.mu.Unlock()
+		hook()
+		m.mu.Lock()
+	}
 	return golibvirt.DomainSnapshot{Name: name, Dom: dom}, nil
+}
+
+// DomainAbortJob is virDomainAbortJob: a snapshot job's memory write is
+// cancelled (qemuDomainAbortJobMigration); with no job it is refused.
+func (m *libvirt10) DomainAbortJob(dom golibvirt.Domain) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.qemu.liveJob || m.qemu.jobAbort == nil {
+		return fmt.Errorf("Requested operation is not valid: no job is active on the domain")
+	}
+	if !m.qemu.abortIgnored {
+		close(m.qemu.jobAbort)
+		m.qemu.jobAbort = nil
+	}
+	return nil
+}
+
+// DomainSaveImageDefineXML replaces a save image's definition.
+func (m *libvirt10) DomainSaveImageDefineXML(file, dxml string, _ uint32) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.saved[file]; !ok {
+		return fmt.Errorf("no saved image %s", file)
+	}
+	m.saved[file] = dxml
+	return nil
 }
 
 // unlinkMemory removes a deleted snapshot's memory image, as

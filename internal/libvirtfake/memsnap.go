@@ -18,7 +18,8 @@ import (
 // (libvirt.CaptureMemorySnapshot) over captureAPI, a model of the libvirt
 // calls it makes, so a scenario exercises the real variant choice, deadline
 // and resume handling. The model follows libvirt v10.0.0
-// src/qemu/qemu_snapshot.c (qemuSnapshotPrepare 1533-1539,
+// src/qemu/qemu_snapshot.c at the v10.0.0 tag
+// (qemuSnapshotCreateXMLValidateDef 1533-1539,
 // qemuSnapshotCreateActiveExternal 1287-1480):
 //
 //   - VIR_DOMAIN_SNAPSHOT_CREATE_LIVE is refused unless the domain is active
@@ -77,6 +78,7 @@ type memState struct {
 	captures   []CaptureCall
 	liveJob    chan struct{} // set while a non-converging LIVE capture waits
 	suspended  bool          // a suspend arrived during liveJob
+	jobAbort   chan struct{} // closed by DomainAbortJob during liveJob
 }
 
 func (f *Fake) memLocked(name string) *memState {
@@ -125,6 +127,15 @@ func (f *Fake) MemoryGeneration(name string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.memLocked(name).gen
+}
+
+// LiveJobRunning reports whether a LIVE capture of the domain is in its
+// memory write, waiting to converge.
+func (f *Fake) LiveJobRunning(name string) bool {
+	defer f.daemon()()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.memLocked(name).liveJob != nil
 }
 
 // Captures returns the full-system snapshot calls the domain's captures made.
@@ -307,15 +318,27 @@ func (c captureAPI) DomainSnapshotCreateXML(dom golibvirt.Domain, x string, flag
 			}
 		}
 		if !converged {
-			ch := make(chan struct{})
-			m.liveJob, m.suspended = ch, false
+			ch, ab := make(chan struct{}), make(chan struct{})
+			m.liveJob, m.suspended, m.jobAbort = ch, false, ab
 			f.mu.Unlock()
+			aborted := false
 			select {
 			case <-ch:
+			case <-ab:
+				aborted = true
 			case <-time.After(30 * time.Second):
 			}
 			f.mu.Lock()
-			m.liveJob = nil
+			m.liveJob, m.jobAbort = nil, nil
+			if aborted {
+				// migrate_cancel: nothing written; libvirt's cleanup
+				// resumes a guest that was running.
+				if resume {
+					f.runCPUsLocked(name)
+				}
+				f.mu.Unlock()
+				return golibvirt.DomainSnapshot{}, errors.New("operation aborted: snapshot job: canceled by client")
+			}
 			if !m.suspended {
 				f.mu.Unlock()
 				return golibvirt.DomainSnapshot{}, errors.New("libvirtfake: the live capture never converged and nothing suspended the guest")
@@ -357,6 +380,60 @@ func (c captureAPI) DomainSnapshotCreateXML(dom golibvirt.Domain, x string, flag
 		return golibvirt.DomainSnapshot{}, herr
 	}
 	return golibvirt.DomainSnapshot{Name: snapName, Dom: dom}, nil
+}
+
+// DomainAbortJob cancels a LIVE capture's memory write; with no job it is
+// refused, as libvirt does.
+func (c captureAPI) DomainAbortJob(dom golibvirt.Domain) error {
+	c.f.mu.Lock()
+	defer c.f.mu.Unlock()
+	m := c.f.memLocked(dom.Name)
+	if m.jobAbort == nil {
+		return errors.New("Requested operation is not valid: no job is active on the domain")
+	}
+	close(m.jobAbort)
+	m.jobAbort = nil
+	return nil
+}
+
+// DomainSaveImageGetXMLDesc and DomainSaveImageDefineXML read and replace
+// the definition a capture's image carries (SetSavedImageXML's map).
+func (c captureAPI) DomainSaveImageGetXMLDesc(file string, _ uint32) (string, error) {
+	c.f.mu.Lock()
+	defer c.f.mu.Unlock()
+	if _, err := os.Stat(file); err != nil {
+		return "", fmt.Errorf("libvirtfake: no saved image %s: %w", file, err)
+	}
+	if x, ok := c.f.savedImageXML[file]; ok {
+		return x, nil
+	}
+	return c.f.liveXMLLocked(fakeDomainOfImage(file)), nil
+}
+
+func (c captureAPI) DomainSaveImageDefineXML(file, dxml string, _ uint32) error {
+	c.f.mu.Lock()
+	defer c.f.mu.Unlock()
+	if _, err := os.Stat(file); err != nil {
+		return fmt.Errorf("libvirtfake: no saved image %s: %w", file, err)
+	}
+	if c.f.savedImageXML == nil {
+		c.f.savedImageXML = map[string]string{}
+	}
+	c.f.savedImageXML[file] = dxml
+	return nil
+}
+
+// fakeDomainOfImage is the domain a fake capture's image holds ("" when
+// unreadable).
+func fakeDomainOfImage(file string) string {
+	b, err := os.ReadFile(file)
+	if err != nil {
+		return ""
+	}
+	if m := vmstateGenRe.FindSubmatch(b); m != nil {
+		return string(m[1])
+	}
+	return ""
 }
 
 func (c captureAPI) DomainSuspend(dom golibvirt.Domain) error {
@@ -408,7 +485,7 @@ func (c captureAPI) CaptureSleep(d time.Duration) {
 }
 
 func (c captureAPI) DomainGetBlockInfo(golibvirt.Domain, string, uint32) (uint64, uint64, uint64, error) {
-	return uint64(time.Now().UnixNano()), 0, 0, nil
+	return 4 << 20, 0, 0, nil
 }
 
 func (c captureAPI) DomainStartDirtyRateCalc(dom golibvirt.Domain, _ int32, _ uint32) error {

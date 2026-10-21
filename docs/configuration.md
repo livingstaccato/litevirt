@@ -1135,9 +1135,18 @@ QEMU's downtime limit. If the predicted final pause is longer than
 cannot converge only adds work before the same pause. A live capture that
 runs longer than `live_deadline` (the guest got busier than measured) is
 finished with the guest suspended, and it resumes when the capture ends.
+A guest whose predicted final set fits `pause_budget` but never shrinks below
+QEMU's downtime limit is captured live and runs the whole `live_deadline`
+before that suspend. When the dirty rate cannot be measured, the daemon logs a
+warning and captures live with the deadline capped at twice the predicted
+write of the guest's RAM, and at least a second.
 
-Both values are Go durations and must be positive. The daemon refuses to start
-with one that is not. They are read on the host that captures the snapshot, at
+A partition pause wins over a capture in flight: the capture is aborted, the
+guest is paused, and the capture never resumes it (see
+[partition pause](design/partition-pause.md#33-the-durable-record)).
+
+Both values are Go durations and must be positive, and `live_deadline` is at
+most an hour. The daemon refuses to start with one that is not. They are read on the host that captures the snapshot, at
 daemon start, so set them the same on every host. The defaults are design
 targets until they are measured on hardware [measure].
 

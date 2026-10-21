@@ -1797,6 +1797,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	pauser.SetQuorum(d.checker.ExecutionQuorum)
 	pauser.SetEnabled(func() bool { return d.cfg.Enforcement.PartitionPause })
 	pauser.SetVMBackend(d.virt)
+	pauser.SetCaptureRegistry(svc.CaptureRegistry()) // the pause wins over a memory snapshot
 	pauser.SetContainerRuntime(lxcRunner)
 	pauser.SetResumeConfirmer(svc.CheckPartitionResume)
 	pauser.SetSettleVerifier(svc.VerifySettleProof)

@@ -1,8 +1,10 @@
 package libvirt
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -358,5 +360,264 @@ func TestHasFirmwareStateAndRAM(t *testing.T) {
 		if got := domainRAMBytes("<domain>" + x + "</domain>"); got != want {
 			t.Errorf("domainRAMBytes(%s) = %d, want %d", x, got, want)
 		}
+	}
+}
+
+// ── The partition pause wins over a capture (review B1) ──────────────────
+
+// A pauser on the model: takes its hold on the registry (aborting a capture
+// in flight and waiting for libvirt's cleanup), then suspends.
+func (m *libvirt10) pauseAsPauser(reg *CaptureRegistry, wait time.Duration) (captured, settled bool) {
+	captured, settled = reg.Hold("vm", wait)
+	if err := m.DomainSuspend(golibvirt.Domain{Name: "vm"}); err != nil {
+		m.t.Errorf("pauser suspend: %v", err)
+	}
+	return captured, settled
+}
+
+func (m *libvirt10) liveJobRunning() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.qemu.liveJob
+}
+
+// Live variant: the pauser pauses the guest while the precopy runs (the
+// domain reads running). The capture's job is aborted, libvirt's cleanup
+// resume is over before the pauser suspends, and the guest stays paused.
+//
+// Mutation: Hold does not abort, or the capture's settle resumes regardless
+// of the hold — red.
+func TestCapture_PauserDuringALiveCaptureWins(t *testing.T) {
+	m := newLibvirt10(t)
+	m.qemu.reportBps = 0
+	m.qemu.dirtyBps = 2 * m.bps() // never converges: the job runs until stopped
+	reg := NewCaptureRegistry()
+	type res struct{ captured, settled bool }
+	got := make(chan res, 1)
+	go func() {
+		for i := 0; i < 5000 && !m.liveJobRunning(); i++ {
+			time.Sleep(time.Millisecond)
+		}
+		c, s := m.pauseAsPauser(reg, 2*time.Second)
+		got <- res{c, s}
+	}()
+	_, err := m.capture("s1", CaptureOptions{Deadline: 5 * time.Second, Registry: reg})
+	if err == nil {
+		t.Fatal("an aborted capture reported success")
+	}
+	r := <-got
+	if !r.captured || !r.settled || !m.qemu.aborted {
+		t.Fatalf("pauser hold: captured=%v settled=%v aborted=%v, want the job aborted and over", r.captured, r.settled, m.qemu.aborted)
+	}
+	if st := m.state(); st != golibvirt.DomainPaused {
+		t.Fatalf("a guest the pauser paused during a live capture is %v, want paused", st)
+	}
+	if reg.InFlight("vm") {
+		t.Fatal("the capture is still registered")
+	}
+}
+
+// The job ignores the abort past the pauser's wait: the pauser suspends
+// anyway (during the job), libvirt resumes at the end of the job, and the
+// capture re-suspends the guest it finds held.
+//
+// Mutation: drop the re-suspend in the capture's settle — red.
+func TestCapture_APauserPastItsWaitIsReSuspended(t *testing.T) {
+	m := newLibvirt10(t)
+	m.qemu.reportBps = 0
+	m.qemu.dirtyBps = 2 * m.bps()
+	m.qemu.abortIgnored = true
+	reg := NewCaptureRegistry()
+	done := make(chan bool, 1)
+	go func() {
+		for i := 0; i < 5000 && !m.liveJobRunning(); i++ {
+			time.Sleep(time.Millisecond)
+		}
+		_, settled := m.pauseAsPauser(reg, 20*time.Millisecond)
+		done <- settled
+	}()
+	m.mustCapture("s1", CaptureOptions{Deadline: 5 * time.Second, Registry: reg})
+	if settled := <-done; settled {
+		t.Fatal("the pauser's wait reported the job over; the scenario needs it past the wait")
+	}
+	if st := m.state(); st != golibvirt.DomainPaused {
+		t.Fatalf("a held guest is %v after the capture, want paused", st)
+	}
+}
+
+// Paused variant: the guest reads paused for the whole capture, the pauser
+// takes its hold in that window, and the capture's final resume is skipped.
+//
+// Mutation: resume in the paused variant without consulting the hold — red.
+func TestCapture_PauserDuringAPausedCaptureWins(t *testing.T) {
+	m := newLibvirt10(t)
+	reg := NewCaptureRegistry()
+	o := CaptureOptions{Firmware: true, Registry: reg, CaptureSuspended: func() error {
+		if !reg.InFlight("vm") {
+			t.Error("the capture is not registered while it runs")
+		}
+		m.pauseAsPauser(reg, time.Second)
+		return nil
+	}}
+	m.mustCapture("s1", o)
+	if st := m.state(); st != golibvirt.DomainPaused {
+		t.Fatalf("a guest the pauser paused during the paused capture is %v, want paused", st)
+	}
+}
+
+// A pause record (the pauser's durable claim) stops every resume too, with
+// no hold in this registry: the record was written by a pauser of another
+// registry, or before a daemon restart.
+//
+// Mutation: settle ignores Held — red.
+func TestCapture_APauseRecordStopsTheResume(t *testing.T) {
+	for _, v := range captureVariants {
+		t.Run(v.name, func(t *testing.T) {
+			m := newLibvirt10(t)
+			o := v.opts
+			held := false
+			o.Held = func() bool { return held }
+			m.qemu.postJob = func() {
+				held = true
+				_ = m.DomainSuspend(golibvirt.Domain{Name: "vm"})
+			}
+			m.mustCapture("s1", o)
+			if st := m.state(); st != golibvirt.DomainPaused {
+				t.Fatalf("a guest with a pause record is %v after the capture, want paused", st)
+			}
+		})
+	}
+}
+
+// ── Resume sites (review S3) ─────────────────────────────────────────────
+
+// A guest someone else suspended after libvirt's own resume (no record, no
+// hold: an operator) is not the capture's to resume.
+//
+// Mutation: resume after every live capture (`if suspended` → `if true`) — red.
+func TestCapture_LiveDoesNotResumeAGuestItDidNotSuspend(t *testing.T) {
+	m := newLibvirt10(t)
+	m.qemu.postJob = func() { _ = m.DomainSuspend(golibvirt.Domain{Name: "vm"}) }
+	m.mustCapture("s1", CaptureOptions{})
+	if st := m.state(); st != golibvirt.DomainPaused {
+		t.Fatalf("an operator's pause after the capture is %v, want paused", st)
+	}
+}
+
+// The deadline's suspend blocks on the job lock until the job (and libvirt's
+// resume) is over, then lands: the capture suspended the guest, so it
+// resumes it.
+//
+// Mutation: drop the post-deadline resume — red.
+func TestCapture_ADeadlineSuspendThatLandsLateIsResumed(t *testing.T) {
+	m := newLibvirt10(t)
+	m.qemu.slowJob = 200 * time.Millisecond
+	m.mustCapture("s1", CaptureOptions{Deadline: 20 * time.Millisecond})
+	if st := m.state(); st != golibvirt.DomainRunning {
+		t.Fatalf("after a capture whose deadline suspend landed late the guest is %v, want running", st)
+	}
+}
+
+// A paused capture that fails (the memory write, or the firmware capture)
+// resumes the guest it suspended.
+//
+// Mutation: drop the failure resume of the paused variant — red.
+func TestCapture_AFailedPausedCaptureResumesTheGuest(t *testing.T) {
+	t.Run("memory write", func(t *testing.T) {
+		m := newLibvirt10(t)
+		m.qemu.failCreate = fmt.Errorf("operation failed: migration job: unexpectedly failed")
+		if _, err := m.capture("s1", CaptureOptions{Firmware: true}); err == nil {
+			t.Fatal("a failed memory write reported success")
+		}
+		if st := m.state(); st != golibvirt.DomainRunning {
+			t.Fatalf("after a failed capture the guest is %v, want running", st)
+		}
+	})
+	t.Run("firmware", func(t *testing.T) {
+		m := newLibvirt10(t)
+		o := CaptureOptions{Firmware: true, CaptureSuspended: func() error { return fmt.Errorf("swtpm state unreadable") }}
+		if _, err := m.capture("s1", o); err == nil {
+			t.Fatal("a failed firmware capture reported success")
+		}
+		if st := m.state(); st != golibvirt.DomainRunning {
+			t.Fatalf("after a failed capture the guest is %v, want running", st)
+		}
+	})
+}
+
+// A failed deadline suspend aborts the job instead of waiting on it forever
+// (review S1).
+//
+// Mutation: wait on the job after a failed suspend — the model gives up
+// after 10s and the capture is slow; red.
+func TestCapture_AFailedDeadlineSuspendAbortsTheJob(t *testing.T) {
+	m := newLibvirt10(t)
+	m.qemu.reportBps = 0
+	m.qemu.dirtyBps = 2 * m.bps()
+	start := time.Now()
+	_, _, err := CaptureMemorySnapshot(failingSuspend{m}, "vm", "s1", filepath.Join(m.dir, "vm-s1.vmstate"), CaptureOptions{Deadline: 20 * time.Millisecond})
+	if err == nil {
+		t.Fatal("a capture whose job was aborted reported success")
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("the capture took %v", took)
+	}
+	if st := m.state(); st != golibvirt.DomainRunning {
+		t.Fatalf("after the aborted capture the guest is %v, want running", st)
+	}
+}
+
+type failingSuspend struct{ *libvirt10 }
+
+func (failingSuspend) DomainSuspend(golibvirt.Domain) error {
+	return fmt.Errorf("Timed out during operation: cannot acquire state change lock")
+}
+
+// ── The image names the overlays (review B2) ────────────────────────────
+
+// libvirt writes the image before the disks switch, so its definition names
+// the old disks; the capture rewrites it onto the overlays, the layout every
+// build's revert expects (a revert before 0fef47979 restores the image's
+// disks as written).
+//
+// Mutation: skip the rewrite — red.
+func TestCapture_TheImageNamesTheOverlays(t *testing.T) {
+	m := newLibvirt10Disks(t, 2)
+	save := m.mustCapture("s1", CaptureOptions{})
+	x, err := m.DomainSaveImageGetXMLDesc(save, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disks := parseDomainDiskSources(x)
+	for _, dev := range []string{"vda", "vdb"} {
+		if disks[dev] != m.activeOf(dev) {
+			t.Fatalf("the image's %s is %s, want the overlay %s", dev, disks[dev], m.activeOf(dev))
+		}
+	}
+	if !strings.Contains(x, "litevirt-managed") {
+		t.Fatal("the rewrite lost the image's metadata")
+	}
+}
+
+// ── An unknown dirty rate (review S2) ────────────────────────────────────
+
+// When the dirty rate cannot be measured, the live capture's deadline is
+// capped at twice the predicted RAM write (at least a second).
+//
+// Mutation: keep the configured deadline — the capture waits the model's
+// 10s; red.
+func TestCapture_AnUnknownDirtyRateCapsTheDeadline(t *testing.T) {
+	m := newLibvirt10(t)
+	m.qemu.ram = 64 << 20
+	m.qemu.writeBps = 64 << 20 // a slow disk: the 64 MiB guest never fits the downtime limit
+	m.qemu.reportBps = -1
+	m.qemu.dirtyBps = 2 * m.bps()
+	start := time.Now()
+	m.mustCapture("s1", CaptureOptions{Deadline: time.Minute})
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("the capture took %v; an unknown rate should cap the 1m deadline", took)
+	}
+	if !m.qemu.suspendInJb {
+		t.Fatal("the capture was not suspended at the capped deadline")
 	}
 }

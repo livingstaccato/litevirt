@@ -356,6 +356,10 @@ type PartitionPauser struct {
 	lastConfirm  time.Time
 	heldWhy      map[string]string // key → last logged hold reason
 	exemptWhy    string
+	// captures is the host's memory snapshot registry: a VM being captured
+	// is aborted out of its capture before it is paused, and no capture
+	// resumes a VM this pauser holds (lv.CaptureRegistry).
+	captures *lv.CaptureRegistry
 }
 
 // NewPartitionPauser builds the monitor for host, recording under dataDir.
@@ -409,6 +413,26 @@ func (p *PartitionPauser) SetEnabled(fn func() bool) { p.enabled = fn }
 
 // SetVMBackend wires the libvirt client (nil: no VMs).
 func (p *PartitionPauser) SetVMBackend(b PauseVMBackend) { p.vms = b }
+
+// SetCaptureRegistry wires the host's memory snapshot capture registry,
+// shared with the gRPC server (lv.CaptureRegistry).
+func (p *PartitionPauser) SetCaptureRegistry(r *lv.CaptureRegistry) { p.captures = r }
+
+// captureWait bounds how long a pause waits for an aborted memory snapshot's
+// libvirt job to end before it suspends anyway: one pause call's budget.
+const captureWait = partitionPauseCallTimeout
+
+// removeRecord drops kind/name's pause record and, for a VM, the capture
+// registry hold that went with it.
+func (p *PartitionPauser) removeRecord(kind, name string) error {
+	if err := p.store.remove(kind, name); err != nil {
+		return err
+	}
+	if kind == PauseKindVM {
+		p.captures.Release(name)
+	}
+	return nil
+}
 
 // SetContainerRuntime wires the LXC runtime (nil: no containers).
 func (p *PartitionPauser) SetContainerRuntime(r lxc.Runtime) { p.cts = r }
@@ -658,7 +682,10 @@ func (p *PartitionPauser) pauseVMs(ctx context.Context, budget passBudget, reaso
 			fail(key, "domain state unreadable: "+err.Error())
 			continue
 		}
-		if st.State != RuntimeRunning {
+		// A memory snapshot in flight holds its guest paused, and resumes it
+		// when it ends: that guest is this pauser's to pause (the registry
+		// hold below stops the resume). Any other paused domain is not ours.
+		if st.State != RuntimeRunning && !p.captures.InFlight(name) {
 			continue // not executing: nothing to stop, and a paused one is not ours
 		}
 		vm, err := corrosion.GetVM(ctx, p.db, name)
@@ -691,6 +718,11 @@ func (p *PartitionPauser) pauseVMs(ctx context.Context, budget passBudget, reaso
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			// The partition pause wins over a memory snapshot: the hold aborts
+			// one in flight and waits out libvirt's cleanup (which resumes a
+			// guest that was running) before the suspend, and keeps any
+			// capture from resuming the guest after it.
+			p.captures.Hold(name, captureWait)
 			if err := p.pauseOne(rec, func() error { return p.vms.SuspendDomain(name) }); err != nil {
 				fail(rec.Key(), err.Error())
 			}
@@ -801,6 +833,9 @@ func (p *PartitionPauser) pauseOne(rec PauseRecord, pause func() error) error {
 		p.mu.Lock()
 		delete(p.inflight, rec.Key())
 		p.mu.Unlock()
+		if rec.Kind == PauseKindVM {
+			p.captures.Release(rec.Name) // nothing paused, nothing recorded
+		}
 		return fmt.Errorf("record the pause durably: %w", err)
 	}
 	done := make(chan error, 1)
@@ -814,7 +849,7 @@ func (p *PartitionPauser) pauseOne(rec PauseRecord, pause func() error) error {
 	select {
 	case err := <-done:
 		if err != nil {
-			if rerr := p.store.remove(rec.Kind, rec.Name); rerr != nil {
+			if rerr := p.removeRecord(rec.Kind, rec.Name); rerr != nil {
 				slog.Warn("partition-pause: could not drop the record of a pause that failed", "kind", rec.Kind, "name", rec.Name, "error", rerr)
 			}
 			return err
@@ -875,7 +910,7 @@ func (p *PartitionPauser) tryResume(ctx context.Context, now time.Time) {
 		if ok, why := p.stillPausedByUs(rec); !ok {
 			// Resumed or stopped by someone else, gone, or replaced: the record
 			// would only keep partition_paused open and offer a stale epoch.
-			if err := p.store.remove(rec.Kind, rec.Name); err == nil {
+			if err := p.removeRecord(rec.Kind, rec.Name); err == nil {
 				slog.Info("partition-pause: dropped a pause record that no longer describes a paused workload",
 					"kind", rec.Kind, "name", rec.Name, "host", p.host, "reason", why)
 			}
@@ -1056,7 +1091,7 @@ func (p *PartitionPauser) resume(ctx context.Context, rec PauseRecord, why strin
 			}
 		}
 	}
-	if err := p.store.remove(rec.Kind, rec.Name); err != nil {
+	if err := p.removeRecord(rec.Kind, rec.Name); err != nil {
 		slog.Warn("partition-pause: resumed, but could not drop the record", "kind", rec.Kind, "name", rec.Name, "error", err)
 	}
 	p.mu.Lock()

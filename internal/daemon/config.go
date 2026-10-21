@@ -1397,8 +1397,15 @@ func (m MemorySnapshotConfig) Durations() (budget, deadline time.Duration, err e
 	if deadline, err = parse("live_deadline", m.LiveDeadline); err != nil {
 		return 0, 0, err
 	}
+	if deadline > maxLiveDeadline {
+		// A capture holds its VM's lock for as long as it runs.
+		return 0, 0, fmt.Errorf("config memory_snapshot.live_deadline: %q is longer than %v", m.LiveDeadline, maxLiveDeadline)
+	}
 	return budget, deadline, nil
 }
+
+// maxLiveDeadline is the longest memory_snapshot.live_deadline.
+const maxLiveDeadline = time.Hour
 
 func (m MemorySnapshotConfig) validate() error {
 	_, _, err := m.Durations()

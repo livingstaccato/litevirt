@@ -951,7 +951,8 @@ func (f *Fake) startDomain(name string, paused bool) error {
 
 // SuspendDomain pauses a RUNNING domain: it stays active (StatePaused) and
 // DomainStateReason reports reason "paused", as libvirt does. Suspending a
-// domain that is not running is an error, as in libvirt.
+// paused domain succeeds and changes nothing; suspending one that is not
+// active is an error, as in libvirt.
 func (f *Fake) SuspendDomain(name string) error {
 	defer f.daemon()()
 	if f.FailSuspendDomain != nil {
@@ -964,6 +965,12 @@ func (f *Fake) SuspendDomain(name string) error {
 	st, ok := f.domains[name]
 	if !ok {
 		return fmt.Errorf("libvirtfake: domain %q not defined", name)
+	}
+	if st == StatePaused {
+		// As libvirt's qemuDomainSuspend: a paused domain is left as it is,
+		// and the call succeeds.
+		f.record("suspend", name, "already paused")
+		return nil
 	}
 	if st != StateRunning {
 		return fmt.Errorf("libvirtfake: domain %q is not running (%s)", name, st)

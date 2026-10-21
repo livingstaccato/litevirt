@@ -188,8 +188,17 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		// firmware tar taken at that instant; any other is captured live
 		// when its dirty rate lets it converge (internal/libvirt
 		// CaptureMemorySnapshot).
+		// The partition pause wins over the capture: the pauser takes its
+		// hold through the registry, and a guest with a pause record is
+		// never resumed by the capture (partition-pause.md §3.3).
+		vmName := req.VmName
 		opts := lv.CaptureOptions{Firmware: hasFW,
-			PauseBudget: s.memorySnapshot.PauseBudget, Deadline: s.memorySnapshot.LiveDeadline}
+			PauseBudget: s.memorySnapshot.PauseBudget, Deadline: s.memorySnapshot.LiveDeadline,
+			Registry: s.CaptureRegistry(),
+			Held: func() bool {
+				_, held, perr := health.ReadPauseRecord(s.dataDir, health.PauseKindVM, vmName)
+				return perr != nil || held
+			}}
 		if hasFW {
 			opts.CaptureSuspended = captureFW
 		}

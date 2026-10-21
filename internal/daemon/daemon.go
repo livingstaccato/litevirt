@@ -1450,6 +1450,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// (health/held_start_orphan.go).
 	reconciler.SetHeldStartProbe(svc.HasStartInFlight)
 	reconciler.SetVMEventRecorder(svc.RecordVMEvent)
+	// `lv stop --force` made under write quarantine: recorded on the VM's
+	// row once the quarantine lifts, first in every pass
+	// (grpcapi/operator_stop_marker.go).
+	reconciler.SetOperatorStopReplay(svc.ReplayOperatorStopMarkers)
+	svc.SetOperatorStopMarkerObserver(metrics.NewOperatorStopMetrics().Observe)
 	// A start whose ceph key must be proven, late in a walk with no time left
 	// for it, is left untouched for the next pass rather than half-started.
 	reconciler.SetStartDeferral(svc.CephStartDeferral)

@@ -125,6 +125,10 @@ type Reconciler struct {
 	dataDir          string
 	db               *corrosion.Client
 	virt             LibvirtBackend
+	// operatorStopReplay records the forced stops made here under write
+	// quarantine once it has lifted (operator_stop_marker.go); run first in
+	// every pass, before the walk reads the rows.
+	operatorStopReplay func(context.Context)
 	// heldStartLive / recordVMEvent: a held start whose daemon restarted
 	// before libvirt answered it (held_start_orphan.go).
 	heldStartLive func(name string) bool
@@ -313,6 +317,10 @@ type Reconciler struct {
 	orphans   orphanReporter
 	onOrphans func(kind string, orphans []OrphanRuntime)
 }
+
+// SetOperatorStopReplay wires the replay of operator-stop markers
+// (grpcapi.Server.ReplayOperatorStopMarkers), run at the start of every pass.
+func (r *Reconciler) SetOperatorStopReplay(fn func(context.Context)) { r.operatorStopReplay = fn }
 
 // SetHardwareStartPreparer wires the hardware_v2 pre-start hook (adoption gate + PCI
 // start-preflight). nil-safe; unwired means every start behaves exactly as before.
@@ -851,6 +859,9 @@ func (r *Reconciler) retryOnbootPending(ctx context.Context, only func(name stri
 }
 
 func (r *Reconciler) reconcile(ctx context.Context) {
+	if r.operatorStopReplay != nil {
+		r.operatorStopReplay(ctx)
+	}
 	if r.ownerEpochBackfill {
 		// Phase 4 backfill: graduate every workload this host owns out of the
 		// pre-epoch 0. Idempotent by predicate; the convergence pass below then
@@ -980,6 +991,12 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 				break
 			}
 			if IsOperatorStop(vm.StateDetail) {
+				break
+			}
+			// An operator's forced stop made here under write quarantine is
+			// recorded by its marker's replay as the operator's stop, not
+			// synced as an out-of-band one (operator_stop_marker.go).
+			if why, _ := OperatorStopHold(r.dataDir, r.hostName, &vm); why != "" {
 				break
 			}
 			// A cutover whose RUNTIME HANDOFF has not finished has, by definition,
@@ -1770,6 +1787,13 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	if r.virt != nil && !r.domainAnswers(vm.Name) {
 		return
 	}
+	// An operator's forced stop made here under write quarantine and not
+	// yet recorded (operator_stop_marker.go) holds every start of the VM
+	// here: self-heal, onboot, a re-driven start. Asked again of the fresh
+	// row under the lease below.
+	if operatorStopHeld("reconciler", r.dataDir, r.hostName, &vm) {
+		return
+	}
 	// Take a per-VM startup lease before doing anything destructive.
 	// Without this, two reconcilers on different hosts that both briefly
 	// see vm.HostName=self in CRDT-stale state would both call libvirt.Start
@@ -1805,6 +1829,10 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	if (vm.State == "pending" || vm.State == "starting") && fresh.State == "stopped" && IsOperatorStop(fresh.StateDetail) {
 		slog.Info("reconciler: VM's start was cancelled after the walk read it; not starting it",
 			"vm", vm.Name, "state", fresh.State, "detail", fresh.StateDetail)
+		r.releaseVMLock(ctx, vm.Name)
+		return
+	}
+	if operatorStopHeld("reconciler", r.dataDir, r.hostName, fresh) {
 		r.releaseVMLock(ctx, vm.Name)
 		return
 	}

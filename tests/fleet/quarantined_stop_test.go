@@ -21,11 +21,11 @@ import (
 // A graceful stop whose guest ignored ACPI was force-killed after its
 // timeout, the same shape.
 //
-// Under quarantine `--force` is refused before it touches libvirt, and a
-// graceful stop is never force-killed. A graceful stop the guest honours
-// still runs, as on base: the guest shuts down, the answer says the stop was
-// not recorded, and once the quarantine lifts it is recorded as a clean
-// guest shutdown, which the restart policy leaves alone.
+// Under quarantine a graceful stop is never force-killed. A graceful stop
+// the guest honours still runs, as on base: the guest shuts down, the answer
+// says the stop was not recorded, and once the quarantine lifts it is
+// recorded as a clean guest shutdown, which the restart policy leaves alone.
+// `--force` records itself on the host first (quarantined_force_stop_test.go).
 func TestFleet_QuarantinedStopIsRefusedNotUndone(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -36,7 +36,6 @@ func TestFleet_QuarantinedStopIsRefusedNotUndone(t *testing.T) {
 	}{
 		{name: "graceful", wantCode: codes.Internal, wantRunning: false},
 		{name: "graceful-ignored", ignoresACPI: true, wantCode: codes.FailedPrecondition, wantRunning: true},
-		{name: "force", force: true, wantCode: codes.FailedPrecondition, wantRunning: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := New(t, Options{Nodes: 1})

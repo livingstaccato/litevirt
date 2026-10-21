@@ -1849,6 +1849,13 @@ command that moves it elsewhere onto a blank disk. It counts in the failover met
 release a `restart-same` VM was restarted on any healthy host whatever its
 disks, because the original host is never available while it is fenced.
 
+A VM with PCI passthrough devices is held the same way, with the same
+condition, when no surviving host has a free device of the kind it needs.
+Unlike a `restart-same` hold, it is placed again on every failover pass. See
+[Failover with PCI devices](pci-passthrough.md#failover-with-pci-devices),
+which also covers the `litevirt.failover_without_devices` label that recovers
+it without them.
+
 A VM with a local disk that is restarted on another host does not get its disk
 back, because the disk stayed on the failed host. The new host rebuilds the disk
 from the VM's image at the disk's recorded size. That is the cost

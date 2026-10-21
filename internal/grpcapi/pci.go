@@ -453,6 +453,17 @@ func (s *Server) resolveDeviceIntents(ctx context.Context, vmName string, intent
 			if intent.ExclusiveKey != nil {
 				addr = *intent.ExclusiveKey
 			}
+			// The address is a slot on the host it was recorded on. On any
+			// other host (a failover) it is realized by a device of its kind
+			// here, never by whatever sits at the same address
+			// (pci_failover.go).
+			if intent.HostName != "" && intent.HostName != s.hostName {
+				local, err := s.addressOnThisHost(ctx, vmName, intent.HostName, addr, selected)
+				if err != nil {
+					return nil, err
+				}
+				addr = local
+			}
 			specMembers, err := s.resolveDeviceSpec(ctx, vmName, &pb.DeviceSpec{Address: addr}, intent.DeviceID, selected)
 			if err != nil {
 				return nil, err

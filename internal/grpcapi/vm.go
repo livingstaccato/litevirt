@@ -2569,7 +2569,10 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	// the start and releases whatever was claimed. GATED on hardwareV2Latched AND the
 	// VM actually having intents, so a non-PCI or pre-latch VM's start path is
 	// byte-for-behavior unchanged (no preflight, no bind attempt).
-	if s.hardwareV2Latched(ctx) {
+	//
+	// Not for a start the reconciler makes without the devices, by the VM's
+	// own opt-in, on a host that has none for it (health.WithPassthroughDropped).
+	if !health.PassthroughDropped(ctx) && s.hardwareV2Latched(ctx) {
 		intents, ierr := corrosion.ListVMPCIIntents(ctx, s.db, vm.Name)
 		if ierr != nil {
 			return releasePreflight, status.Errorf(codes.Internal, "read PCI intents for %q: %v", vm.Name, ierr)

@@ -40,6 +40,9 @@ import (
 // firewallIDNonWriters reference a statement that writes an identity column
 // without executing it.
 var firewallIDNonWriters = map[string]string{
+	"isSnapshotClaimEntry": "fingerprints the dedicated snapshot SQL/protocol to select whole-entry validation; never executes a write",
+	"snapshotClaimStatements": "builds the guarded snapshot batch without executing it; BeginVMOperationAtSnapshot " +
+		"calls keepFirewallID on origin, retained retry uses the stored spec/facts, and validateSnapshotClaimEntry reconstructs received bytes",
 	"validateGuardedCreateBeginEntry":      "fingerprints a received create-begin envelope",
 	"validateGuardedVMReplaceEntry":        "fingerprints a received guarded-replace envelope",
 	"validateLegacyContainerRekeyEnvelope": "fingerprints a received legacy re-key envelope",

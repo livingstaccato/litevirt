@@ -19,6 +19,10 @@ import (
 // mutation barrier or the generation counter. If you add a legitimate new writer,
 // add it here WITH a comment justifying why it can't use the sanctioned APIs.
 var sanctionedSpecWriters = map[string]string{
+	"isSnapshotClaimEntry": "fingerprints the dedicated snapshot SQL/protocol; it does not execute a write",
+	"snapshotClaimStatements": "builds the three-role guarded snapshot batch without executing it; " +
+		"BeginVMOperationAtSnapshot protects origin spec with keepFirewallID and NowTS, retained retry preserves stored spec/time, " +
+		"and validateSnapshotClaimEntry reconstructs received bytes under the snapshot guard",
 	"InsertVMWithHardware":    "creates the row (InsertVM delegates here with nics/pciIntents nil)",
 	"BeginVMCreateOperation":  "creates the provisional row with its operation barrier in the same transaction",
 	"CommitVMCreateOperation": "commits the provisional row's desired/observed fields under operation+owner+generation fencing",

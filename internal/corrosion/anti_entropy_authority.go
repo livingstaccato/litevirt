@@ -313,6 +313,15 @@ func (c *Client) antiEntropyAuthorityDecision(tx *sql.Tx, table syncTable, row [
 		// that does (project_incarnation.go).
 		return projectsDumpDecision(tx, table, row)
 	}
+	if table.Name == "tokens" {
+		// A token names the incarnation it was issued to, so this needs no
+		// latch here (token_incarnation.go).
+		// A revoke is merged by its clock alone, past the per-sender rule
+		// below (final).
+		if d, final, err := tokenRowDecision(tx, table, row); err != nil || final || d != mergeAuthorityNormal {
+			return d, err
+		}
+	}
 	if userKeyedTables[table.Name] && c.UserIncarnationOn() {
 		// A row an older account of the name left on the sender is not this
 		// node's account's (user_incarnation.go).

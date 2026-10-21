@@ -72,16 +72,16 @@ func (o *aggregateLocalObservation) observe(out *aggregateLocalAudit, section in
 		}
 	case 15:
 		if o.layoutDigest != "" {
-			if o.layoutDigest == retainedLocalLayout83Digest() && row.Int64("version") == 84 {
+			if o.layoutDigest == retainedLocalLayout83Digest() && (row.Int64("version") == 84 || row.Int64("version") == 85) {
 				return errors.New("local snapshot schema/layout differs")
 			}
-			if o.layoutDigest == retainedLocalLayoutDigest() && row.Int64("version") != 84 {
+			if o.layoutDigest == retainedLocalLayoutDigest() && row.Int64("version") != 84 && row.Int64("version") != 85 {
 				return errors.New("local snapshot schema/layout differs")
 			}
 		}
 		// Current proof inventories the live schema. Retained originals keep
-		// their pre-metadata, host-incarnation union or prior live80/81/82/83 bytes.
-		if n != 1 || row.Int64("id") != 1 || (row.Int64("version") != 84 && !(o.retained && (row.Int64("version") == 78 || row.Int64("version") == 79 || row.Int64("version") == 80 || row.Int64("version") == 81 || row.Int64("version") == 82 || row.Int64("version") == 83))) {
+		// their pre-metadata, host-incarnation union or prior live80..84 bytes.
+		if n != 1 || row.Int64("id") != 1 || (row.Int64("version") != 85 && !(o.retained && (row.Int64("version") == 78 || row.Int64("version") == 79 || row.Int64("version") == 80 || row.Int64("version") == 81 || row.Int64("version") == 82 || row.Int64("version") == 83 || row.Int64("version") == 84))) {
 			return errors.New("local snapshot schema unavailable")
 		}
 	case 21:

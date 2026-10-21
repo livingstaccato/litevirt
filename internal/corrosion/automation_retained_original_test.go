@@ -172,11 +172,24 @@ func TestRetainedOriginal83SchemaLayoutMismatch(t *testing.T) {
 	for _, tc := range []struct {
 		layout string
 		schema int64
-	}{{retainedLocalLayout83Digest(), 84}, {retainedLocalLayoutDigest(), 83}} {
+	}{{retainedLocalLayout83Digest(), 84}, {retainedLocalLayout83Digest(), 85}, {retainedLocalLayoutDigest(), 83}} {
 		observation := aggregateLocalObservation{retained: true, layoutDigest: tc.layout}
 		err := observation.observe(&aggregateLocalAudit{}, 15, 1, Row{Columns: []string{"id", "version"}, Values: []any{int64(1), tc.schema}})
 		if err == nil || !strings.Contains(err.Error(), "schema/layout differs") {
 			t.Fatal("RETAINED83_SCHEMA_LAYOUT_MISMATCH_ACCEPTED", err)
 		}
+	}
+}
+
+// Format-level positive cases only. Genuine old84 frames require the separately
+// accepted signed84 exporter; this matrix is not historical export evidence.
+func TestRetainedOriginal84And85SharedLayout(t *testing.T) {
+	for _, version := range []int64{84, 85} {
+		t.Run(fmt.Sprintf("schema%d", version), func(t *testing.T) {
+			observation := aggregateLocalObservation{retained: true, layoutDigest: retainedLocalLayoutDigest()}
+			if err := observation.observe(&aggregateLocalAudit{}, 15, 1, Row{Columns: []string{"id", "version"}, Values: []any{int64(1), version}}); err != nil {
+				t.Fatal("retained33 schema refused", version, err)
+			}
+		})
 	}
 }

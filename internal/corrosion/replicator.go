@@ -1613,6 +1613,19 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 			refusedIncarnation[i] = true
 			continue
 		}
+		// A token issued to an incarnation the name has left here is skipped
+		// with its credential, whoever wrote it, latched or not
+		// (token_incarnation.go).
+		if stale, serr := staleTokenInsert(ctx, tx, s); serr != nil {
+			return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, serr)
+		} else if stale {
+			r.client.observeMergeRejected("tokens", "wal", "older_incarnation")
+			refusedIncarnation[i] = true
+			if j, ok := tokenCredentialOf(stmts, i); ok {
+				refusedIncarnation[j] = true
+			}
+			continue
+		}
 		// A fence credential carries the retirement it was set after
 		// (credentials_revive_guard.go). One that rides with a hosts write
 		// this node refuses as another incarnation's — before or after it in

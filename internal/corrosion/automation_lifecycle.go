@@ -75,7 +75,10 @@ func lifecycleParentTx(ctx context.Context, tx *sql.Tx, kind, name string) (life
 }
 
 type lifecycleMutation struct {
-	issuance          *automationIssuance
+	issuance *automationIssuance
+	// account, when set, is a credential's account check, run first in the
+	// transaction (executeCredentialBatch).
+	account           func(tx *sql.Tx) (bool, error)
 	kind, name, event string
 	expected          lifecycleParent
 	previous          AutomationLifetimeEvidence
@@ -107,6 +110,13 @@ func (c *Client) executeGuardedLifecycleBatch(ctx context.Context, guard func(tx
 }
 
 func (m *lifecycleMutation) before(ctx context.Context, tx *sql.Tx) error {
+	if m.account != nil {
+		if ok, err := m.account(tx); err != nil {
+			return err
+		} else if !ok {
+			return ErrUserAccountChanged
+		}
+	}
 	current, err := lifecycleParentTx(ctx, tx, m.kind, m.name)
 	if err != nil {
 		return err

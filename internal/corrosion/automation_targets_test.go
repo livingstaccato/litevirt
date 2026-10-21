@@ -1070,9 +1070,9 @@ func TestAutomationTargetSchema84(t *testing.T) {
 			c := custodyLifetimeFileClient(t, dir)
 			t.Cleanup(func() { _ = c.Close() })
 			if err := InitSchema(ctx, c); err != nil {
-				t.Fatal("SETUP actual schema84", err)
+				t.Fatal("SETUP current schema85", err)
 			}
-			if CurrentSchemaVersion != 84 || automationCutSourceSchema != 84 || storedVersion(t, c) != 84 {
+			if CurrentSchemaVersion != 85 || automationCutSourceSchema != 85 || storedVersion(t, c) != 85 {
 				t.Fatal("TARGET84_CURRENT_PROVENANCE")
 			}
 			units := map[string]bool{"local_automation_target_operations": false, "local_automation_target_reservations": false}
@@ -1090,7 +1090,7 @@ func TestAutomationTargetSchema84(t *testing.T) {
 					t.Fatal("TARGET84_LOCAL", table)
 				}
 			}
-			if !supportedAutomationCutDescriptor(83, 1) || !supportedAutomationCutDescriptor(84, 1) || supportedAutomationCutDescriptor(85, 1) {
+			if !supportedAutomationCutDescriptor(83, 1) || !supportedAutomationCutDescriptor(84, 1) || !supportedAutomationCutDescriptor(85, 1) || supportedAutomationCutDescriptor(86, 1) {
 				t.Fatal("TARGET84_DESCRIPTOR_BOUNDARY")
 			}
 			before, err := c.Query(ctx, `SELECT id,applied_at,checksum FROM applied_migrations ORDER BY id`)

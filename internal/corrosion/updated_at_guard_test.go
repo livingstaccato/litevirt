@@ -113,6 +113,16 @@ func TestReplicatedUpdatedAtUsesNowTS(t *testing.T) {
 			if fn.Name.Name == "HistoricalShapes" {
 				continue
 			}
+			// isSnapshotClaimEntry only fingerprints the snapshot protocol/SQL.
+			// snapshotClaimStatements only builds its three guarded roles with
+			// op.UpdatedAt: BeginVMOperationAtSnapshot mints it with c.NowTS on
+			// origin, but retained retry and validateSnapshotClaimEntry preserve
+			// the original operation timestamp. Neither helper executes a write.
+			// Keep the origin entrypoint scanned; never fresh-stamp replay.
+			if rel == "corrosion/operations_legacy_rebuild.go" &&
+				(fn.Name.Name == "isSnapshotClaimEntry" || fn.Name.Name == "snapshotClaimStatements") {
+				continue
+			}
 			// takeSiblingSpecEdit and keepClock are WAL applies: they write a
 			// RECEIVED edit's own updated_at (stamped by NowTS on its origin),
 			// or keep the local one, as every apply of a replicated statement

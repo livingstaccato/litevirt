@@ -110,6 +110,7 @@ var appendOnlyLedger = []struct {
 	{"a091_security_groups_project", 70},
 	{"a092_projects_incarnation", 71},
 	{"a093_local_automation_receiver_current_established_inventory", 81},
+	{"a094_tokens_user_created_at", schemaVersionTokenUserIncarnation},
 }
 
 const appendOnlyRule = "schemaMigrations is append-only: add new ALTERs at the end; never reorder"

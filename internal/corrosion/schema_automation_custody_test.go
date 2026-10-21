@@ -83,8 +83,8 @@ func TestAutomationCustodyLifetimeMigration(t *testing.T) {
 	if err := custodyLifetimeInsertRecipient(t, c, "audit-a", "new-host-zero", 0); err != nil {
 		t.Fatalf("COMPOSED82_UPGRADE_N0_REFUSED: %v", err)
 	}
-	if storedVersion(t, c) != 84 || appliedCount(t, c) != len(ledger)+3 || countAppliedID(t, c, automationCustodyMigrationID) != 1 {
-		t.Fatal("composed82 upgrade did not append schema83 recipient unit and two schema84 target units")
+	if storedVersion(t, c) != 85 || appliedCount(t, c) != len(ledger)+4 || countAppliedID(t, c, automationCustodyMigrationID) != 1 {
+		t.Fatal("composed82 upgrade did not append schema83 recipient unit, two schema84 target units and schema85 token stamp")
 	}
 	if err := c.ExecuteLocal(ctx, func(tx *LocalTx) error { return automationVerifySemanticSchemaTx(ctx, tx) }); err != nil {
 		t.Fatal("rebuilt semantic/index guards refused", err)
@@ -100,7 +100,7 @@ func TestAutomationCustodyLifetimeMigration(t *testing.T) {
 		}
 	}
 	if !reflect.DeepEqual(complete, custodyLifetimeSnapshot(t, c)) {
-		t.Fatal("migrated84 reopen/init changed all-stage rows or ledger")
+		t.Fatal("migrated85 reopen/init changed all-stage rows or ledger")
 	}
 }
 
@@ -266,8 +266,8 @@ func TestAutomationCustodyLifetimeSchema83(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if storedVersion(t, c) != 84 || countAppliedID(t, c, automationCustodyMigrationID) != 1 || !reflect.DeepEqual(before, custodyLifetimeSnapshot(t, c)) {
-			t.Fatal("fresh84 reopen/init changed schema, rows or ledger")
+		if storedVersion(t, c) != 85 || countAppliedID(t, c, automationCustodyMigrationID) != 1 || !reflect.DeepEqual(before, custodyLifetimeSnapshot(t, c)) {
+			t.Fatal("fresh85 reopen/init changed schema, rows or ledger")
 		}
 	})
 	for _, tc := range []struct {
@@ -354,31 +354,39 @@ func TestAutomationCustodyLifetimeSchema83(t *testing.T) {
 }
 
 // These synthetic recipient-rebuild fixtures already install ALL current DDL,
-// including the two84 target tables. Pre-record precisely those unrelated
-// already-present create-table units so the rollback assertion isolates the
+// including the two84 target tables and the SQL85 token stamp. Pre-record
+// precisely these already-present unrelated units so rollback isolates the
 // custody transaction, not InitSchema's earlier independent mark-only work.
 // The database remains an explicitly synthetic SQL82 fixture, never an archive.
 func custodyLifetimePrimeUnrelatedTargetLedger(t *testing.T, c *Client) {
 	t.Helper()
-	seen := 0
+	seen, stampUnits := 0, 0
 	for _, m := range schemaMigrationLedger {
-		if m.ID != "t_local_automation_target_operations" && m.ID != "t_local_automation_target_reservations" {
+		if m.ID != "t_local_automation_target_operations" && m.ID != "t_local_automation_target_reservations" && m.ID != "a094_tokens_user_created_at" {
 			continue
 		}
-		if m.Version != 84 || m.Kind != kindCreateTable {
-			t.Fatal("unexpected target prerequisite unit", m.ID)
+		if m.ID == "a094_tokens_user_created_at" {
+			stampUnits++
+			if m.Version != 85 || m.Kind != kindAddColumn || m.Target != "tokens.user_created_at" || m.SQL != "ALTER TABLE tokens ADD COLUMN user_created_at TEXT NOT NULL DEFAULT ''" {
+				t.Fatal("unexpected token stamp prerequisite unit", m)
+			}
+		} else {
+			target := map[string]string{"t_local_automation_target_operations": "local_automation_target_operations", "t_local_automation_target_reservations": "local_automation_target_reservations"}[m.ID]
+			if m.Version != 84 || m.Kind != kindCreateTable || m.Target != target || m.SQL != "" {
+				t.Fatal("unexpected target prerequisite unit", m)
+			}
 		}
 		present, err := m.present(context.Background(), c)
 		if err != nil || !present {
-			t.Fatal("target prerequisite DDL missing", m.ID, err)
+			t.Fatal("unrelated prerequisite DDL missing", m.ID, err)
 		}
 		if err := c.execLocal(context.Background(), `INSERT INTO applied_migrations(id,applied_at,checksum) VALUES(?,?,?)`, m.ID, "synthetic-custody-isolation", sha256hex(m.SQL)); err != nil {
 			t.Fatal(err)
 		}
 		seen++
 	}
-	if seen != 2 {
-		t.Fatal("expected exactly two unrelated target units", seen)
+	if seen != 3 || stampUnits != 1 {
+		t.Fatal("expected exactly two target units and one token stamp prerequisite", seen, stampUnits)
 	}
 }
 

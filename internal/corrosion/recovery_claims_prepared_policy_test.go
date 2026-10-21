@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -108,7 +109,7 @@ func preparedLaterCertificate(t *testing.T, f *certFixture, kind string) (ClaimC
 }
 
 func TestPreparedProofWriterAndAEHonorOrdinaryPredicates(t *testing.T) {
-	for _, kind := range []string{"rebound-policy", "wrong-cn", "wrong-member", "wrong-incarnation", "duplicate-majority", "expired", "historical-expired", "future", "revoked", "pinned", "client-only", "no-pin", "historical-revoked", "renewal-blind", "pinned-after-policy", "no-pin-after-policy", "renewal-blind-after-policy"} {
+	for _, kind := range []string{"genuine-host", "rebound-policy", "wrong-cn", "wrong-member", "wrong-incarnation", "duplicate-majority", "expired", "historical-expired", "future", "revoked", "pinned", "client-only", "no-pin", "historical-revoked", "renewal-blind", "pinned-after-policy", "no-pin-after-policy", "renewal-blind-after-policy"} {
 		t.Run(kind, func(t *testing.T) {
 			f := newCertFixture(t)
 			ctx := context.Background()
@@ -145,6 +146,22 @@ func TestPreparedProofWriterAndAEHonorOrdinaryPredicates(t *testing.T) {
 				c.SetRecoveryClaimGate(func() bool { return true })
 				c.SetClaimCertificateVerifier(func() *ClaimVerifier { return verifier })
 			}
+			// Compare the exact candidate and electorate used by the prepared
+			// writer below. A client-only signer is refused by the shared host
+			// predicate; a genuine host remains eligible on both paths.
+			if kind == "client-only" || kind == "genuine-host" {
+				want := f.want
+				want.ConfigGeneration = next.ConfigGeneration
+				ordinaryErr := verifier.Verify(next, want)
+				if kind == "client-only" {
+					if ordinaryErr == nil || !strings.Contains(ordinaryErr.Error(), "client certificate") {
+						t.Fatalf("ordinary client-only candidate: %v; want client certificate refusal", ordinaryErr)
+					}
+					t.Logf("ordinary client-only refusal: %v", ordinaryErr)
+				} else if ordinaryErr != nil {
+					t.Fatal("ordinary genuine-host candidate refused", ordinaryErr)
+				}
+			}
 			oldRaw, _ := f.cert.Encode()
 			nextRaw, _ := next.Encode()
 			proof := *f.value.Proof
@@ -154,12 +171,25 @@ func TestPreparedProofWriterAndAEHonorOrdinaryPredicates(t *testing.T) {
 			}
 			proof.ClaimCertificate = nextRaw
 			err := SetProofClaimCertificate(ctx, a, proof)
-			allow := kind == "client-only" || kind == "no-pin" || kind == "historical-revoked" || kind == "renewal-blind" || kind == "no-pin-after-policy" || kind == "renewal-blind-after-policy"
+			allow := kind == "genuine-host" || kind == "no-pin" || kind == "historical-revoked" || kind == "renewal-blind" || kind == "no-pin-after-policy" || kind == "renewal-blind-after-policy"
 			if allow && err != nil {
-				t.Fatal("ordinary compatible certificate was refused", err)
+				t.Fatal("eligible host certificate was refused by prepared writer", err)
 			}
 			if !allow && !errors.Is(err, ErrNoRowsAffected) {
 				t.Fatalf("prepared writer ignored %s: %v", kind, err)
+			}
+			if kind == "client-only" || kind == "genuine-host" {
+				want := oldRaw
+				if allow {
+					want = nextRaw
+				}
+				got, ok, readErr := GetActionProof(ctx, a, proof.ID)
+				if readErr != nil || !ok || got.ClaimCertificate != want {
+					t.Fatalf("prepared writer winner before AE ignored %s: %v", kind, readErr)
+				}
+				if kind == "client-only" {
+					t.Logf("prepared client-only refusal: %v; original proof retained before AE", err)
+				}
 			}
 			if err := WriteActionProof(ctx, b, proof); err != nil {
 				t.Fatal(err)

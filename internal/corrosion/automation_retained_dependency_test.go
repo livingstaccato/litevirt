@@ -117,7 +117,7 @@ func TestRetainedOriginalLocalDependencyOwnedCuts(t *testing.T) {
 	if _, err = tx.Exec(ctx, `UPDATE local_automation_receiver_records SET record=? WHERE attempt=? AND source=? AND component=0 AND ordinal=1`, entry, dir.namespace, dir.source); err != nil {
 		t.Fatal(err)
 	}
-	h := retainedAggregateHeader{Attempt: f.attempt.id, BindingDigest: sourceDigest(f.attempt.binding), Host: f.local.name, Incarnation: f.attempt.facts.Incarnation, LocalID: id, LocalDependency: expected}
+	h := retainedAggregateHeader{LayoutDigest: retainedLocalLayoutDigest(), Attempt: f.attempt.id, BindingDigest: sourceDigest(f.attempt.binding), Host: f.local.name, Incarnation: f.attempt.facts.Incarnation, LocalID: id, LocalDependency: expected}
 	got, err := retainedOriginalLocalDependency(ctx, tx, h, f.attempt.binding, local, d, directory)
 	if err != nil || got != expected {
 		t.Fatalf("exact original local dependency including owned bytes refused: got=%s want=%s err=%v", got, expected, err)

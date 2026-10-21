@@ -160,9 +160,25 @@ type automationIssuance struct {
 	identity      *contract.IdentityRecord
 }
 
-func (c *Client) executeCredentialBatch(ctx context.Context, a *AutomationAccountAuthentication, kind, id, username string, stmts []Statement) (err error) {
+// accountCheck, when given (at most one, after stmts so the statement
+// checkers keep their argument position), is checked inside the same
+// transaction before anything is written: false fails the write with
+// ErrUserAccountChanged (the token's account was re-created since its
+// incarnation was read; token_incarnation.go).
+func (c *Client) executeCredentialBatch(ctx context.Context, a *AutomationAccountAuthentication, kind, id, username string, stmts []Statement, accountCheck ...func(tx *sql.Tx) (bool, error)) (err error) {
+	var account func(tx *sql.Tx) (bool, error)
+	if len(accountCheck) > 0 {
+		account = accountCheck[0]
+	}
 	if a == nil {
-		return c.ExecuteBatch(ctx, stmts)
+		if account == nil {
+			return c.ExecuteBatch(ctx, stmts)
+		}
+		applied, err := c.ExecuteBatchGuarded(ctx, account, stmts)
+		if err == nil && !applied {
+			err = ErrUserAccountChanged
+		}
+		return err
 	}
 	defer func() { err = automationCredentialFailure(err, AutomationCredentialProofInvalid) }()
 	if c.CredentialsUnhydrated() {
@@ -171,7 +187,7 @@ func (c *Client) executeCredentialBatch(ctx context.Context, a *AutomationAccoun
 	if username != a.username || id == "" {
 		return ErrAutomationLifecycleUnavailable
 	}
-	mutation := &lifecycleMutation{kind: "principal", name: username, event: "issue", expected: a.parent, issuance: &automationIssuance{kind: kind, id: id, authenticated: a}}
+	mutation := &lifecycleMutation{kind: "principal", name: username, event: "issue", expected: a.parent, account: account, issuance: &automationIssuance{kind: kind, id: id, authenticated: a}}
 	_, err = c.executeBatchWithLifecycle(ctx, stmts, true, false, mutation)
 	return err
 }
@@ -275,7 +291,14 @@ func automationCredentialSnapshotTx(ctx context.Context, tx *sql.Tx, kind, id st
 	var err error
 	switch kind {
 	case "token":
-		err = tx.QueryRowContext(ctx, `SELECT t.username,CASE WHEN c.token_id IS NOT NULL THEN c.token_hash ELSE t.token_hash END,t.name,COALESCE(t.scope_paths,''),t.created_at,COALESCE(t.expires_at,''),COALESCE(t.deleted_at,'') FROM tokens t LEFT JOIN token_credentials c ON c.token_id=t.id AND c.deleted_at IS NULL WHERE t.id=?`, id).Scan(&s.Username, &s.Secret, &s.Name, &s.Scopes, &s.Created, &s.Expires, &revoked)
+		// The token's account incarnation is read beside it, outside the
+		// snapshot (and its digest): a token opens only the incarnation it
+		// was issued to (token_incarnation.go).
+		var stamp, current string
+		err = tx.QueryRowContext(ctx, `SELECT t.username,CASE WHEN c.token_id IS NOT NULL THEN c.token_hash ELSE t.token_hash END,t.name,COALESCE(t.scope_paths,''),t.created_at,COALESCE(t.expires_at,''),COALESCE(t.deleted_at,''),t.user_created_at,COALESCE(u.created_at,'') FROM tokens t LEFT JOIN token_credentials c ON c.token_id=t.id AND c.deleted_at IS NULL LEFT JOIN users u ON u.username=t.username WHERE t.id=?`, id).Scan(&s.Username, &s.Secret, &s.Name, &s.Scopes, &s.Created, &s.Expires, &revoked, &stamp, &current)
+		if err == nil && !tokenIncarnationHolds(stamp, current) {
+			return s, ErrAutomationLifecycleUnavailable
+		}
 	case "session":
 		err = tx.QueryRowContext(ctx, `SELECT username,realm,ip,user_agent,created_at,expires_at,COALESCE(revoked_at,'') FROM sessions WHERE id=?`, id).Scan(&s.Username, &s.Realm, &s.IP, &s.Agent, &s.Created, &s.Expires, &revoked)
 	default:

@@ -79,7 +79,7 @@ func TestAutomationKeyTransitionHostLifetimeReplay(t *testing.T) {
 	record = keyCertifiedDecision(t, d, voters...)
 	receipt, err := applySharedAutomation(t, a.c, record, contract.Reduce, automationFreshAnchor)
 	if err != nil {
-		t.Fatalf("SETUP genuine schema84 N0 history persistence: %v", err)
+		t.Fatalf("SETUP current schema85 N0 history persistence: %v", err)
 	}
 	stored, err := a.c.Query(ctx, `SELECT host_incarnation,admitted_at,admission_serial FROM local_automation_key_recipients WHERE stage='' AND host='a'`)
 	if err != nil || len(stored) != 1 || stored[0].Int64("host_incarnation") != 0 || stored[0].String("admitted_at") != "2026-10-18T00:00:00Z" || stored[0].String("admission_serial") != "a0" {
@@ -93,7 +93,7 @@ func TestAutomationKeyTransitionHostLifetimeReplay(t *testing.T) {
 	a.c = custodyLifetimeFileClient(t, dir, a.name)
 	a.c.SetVoterConfigGate(func() bool { return true })
 	if err := InitSchema(ctx, a.c); err != nil {
-		t.Fatalf("SETUP schema84 reopen: %v", err)
+		t.Fatalf("SETUP schema85 reopen: %v", err)
 	}
 	err = a.c.ExecuteLocal(ctx, func(tx *LocalTx) error {
 		head, err := automationHeadTx(ctx, tx)
@@ -246,10 +246,10 @@ func TestAutomationCustodyLifetimeArchived80CloneUpgradePreservesOriginals(t *te
 		t.Fatal("original80 full inventory migration ID missing")
 	}
 	if err := InitSchema(ctx, a.c); err != nil {
-		t.Fatal("fresh original80 clone upgrade to84", err)
+		t.Fatal("fresh original80 clone upgrade to85", err)
 	}
-	if storedVersion(t, a.c) != 84 || len(schemaMigrationLedger) != 201 {
-		t.Fatal("clone did not reach composed84/current201 known units")
+	if storedVersion(t, a.c) != 85 || len(schemaMigrationLedger) != 202 {
+		t.Fatal("clone did not reach composed85/current202 known units")
 	}
 	for _, table := range []string{"local_automation_target_operations", "local_automation_target_reservations"} {
 		rows, err := a.c.Query(ctx, "SELECT stage FROM "+table+" LIMIT 1")
@@ -269,10 +269,11 @@ func TestAutomationCustodyLifetimeArchived80CloneUpgradePreservesOriginals(t *te
 		t.Fatal("clone upgrade lost published SG70 global default", err)
 	}
 	upgradedLedger, err := a.c.Query(ctx, `SELECT id,applied_at,checksum FROM applied_migrations ORDER BY id`)
-	if err != nil || len(upgradedLedger) != 202 || len(upgradedLedger) != len(originalLedger)+6 {
-		t.Fatal("clone upgrade must retain196 old plus only6 new applied rows", err)
+	if err != nil || len(upgradedLedger) != 203 || len(upgradedLedger) != len(originalLedger)+7 {
+		t.Fatal("clone upgrade must retain196 old plus only7 new applied rows", err)
 	}
 	newIDs := map[string]bool{
+		"a094_tokens_user_created_at":                                  false,
 		"a092_projects_incarnation":                                    false,
 		"a091_security_groups_project":                                 false,
 		"a093_local_automation_receiver_current_established_inventory": false,
@@ -320,14 +321,14 @@ func TestAutomationCustodyLifetimeArchived80CloneUpgradePreservesOriginals(t *te
 		t.Fatal("upgrade rewrote original80 raw metadata/root", err)
 	}
 	complete := custodyLifetimeSnapshot(t, a.c)
-	if err := InitSchema(ctx, a.c); err != nil || appliedCount(t, a.c) != 202 || !reflect.DeepEqual(complete, custodyLifetimeSnapshot(t, a.c)) {
+	if err := InitSchema(ctx, a.c); err != nil || appliedCount(t, a.c) != 203 || !reflect.DeepEqual(complete, custodyLifetimeSnapshot(t, a.c)) {
 		t.Fatal("clone re-init changed retained old/current ledger or recipient rows", err)
 	}
 	if err := a.c.Close(); err != nil {
 		t.Fatal(err)
 	}
 	a.c = custodyLifetimeFileClient(t, dir, "a")
-	if err := InitSchema(ctx, a.c); err != nil || storedVersion(t, a.c) != 84 || appliedCount(t, a.c) != 202 || !reflect.DeepEqual(complete, custodyLifetimeSnapshot(t, a.c)) {
+	if err := InitSchema(ctx, a.c); err != nil || storedVersion(t, a.c) != 85 || appliedCount(t, a.c) != 203 || !reflect.DeepEqual(complete, custodyLifetimeSnapshot(t, a.c)) {
 		t.Fatal("cold clone reopen changed old/current ledger or recipient rows", err)
 	}
 	reused, err := a.c.FreezeAutomationCut(ctx, 1, nil)
@@ -349,7 +350,7 @@ func TestAutomationCustodyLifetimeArchived80CloneUpgradePreservesOriginals(t *te
 
 // This is a NEW synthetic SQL82 migration predecessor, not the genuine old
 // descriptor82 source namespace. Never freeze a SourceSchema82 archive from it.
-func TestAutomationCustodyLifetimeComposed82UpgradePublishes84(t *testing.T) {
+func TestAutomationCustodyLifetimeComposed82UpgradePublishes85(t *testing.T) {
 	ctx := context.Background()
 	a := custodyLifetimeHistoricalVoters(t, 82)[0]
 	if storedVersion(t, a.c) != 82 {
@@ -365,13 +366,13 @@ func TestAutomationCustodyLifetimeComposed82UpgradePublishes84(t *testing.T) {
 	if err := InitSchema(ctx, a.c); err != nil {
 		t.Fatal(err)
 	}
-	if storedVersion(t, a.c) != 84 {
-		t.Fatal("fresh composed82 migration did not reach truthful current84")
+	if storedVersion(t, a.c) != 85 {
+		t.Fatal("fresh composed82 migration did not reach truthful current85")
 	}
 	if corrected, err := automationCustodyRecipientShape(ctx, a.c); err != nil || !corrected {
 		t.Fatal("migration omitted corrected recipient constraint", corrected, err)
 	}
-	if err := a.c.SealVoterGeneration(ctx, 1, "fresh-current84-after-migration"); err != nil {
+	if err := a.c.SealVoterGeneration(ctx, 1, "fresh-current85-after-migration"); err != nil {
 		t.Fatal(err)
 	}
 	id, err := a.c.FreezeAutomationCut(ctx, 1, nil)
@@ -379,15 +380,15 @@ func TestAutomationCustodyLifetimeComposed82UpgradePublishes84(t *testing.T) {
 		t.Fatal(err)
 	}
 	current, records := cutFixtureRead(t, a.c, id)
-	if current.SourceSchema != 84 || len(current.Inventory) != 9 {
-		t.Fatal("new actual current cut did not declare84", current.SourceSchema)
+	if current.SourceSchema != 85 || len(current.Inventory) != 9 {
+		t.Fatal("new actual current cut did not declare85", current.SourceSchema)
 	}
 	again, err := a.c.FreezeAutomationCut(ctx, 1, nil)
 	if err != nil || again != id {
-		t.Fatal("current84 cut reuse changed identity", err)
+		t.Fatal("current85 cut reuse changed identity", err)
 	}
 	later, laterRecords := cutFixtureRead(t, a.c, again)
 	if !reflect.DeepEqual(current, later) || !reflect.DeepEqual(records, laterRecords) {
-		t.Fatal("current84 cut reuse changed bytes/root")
+		t.Fatal("current85 cut reuse changed bytes/root")
 	}
 }

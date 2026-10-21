@@ -98,6 +98,11 @@ func incarnationAfterAll(now time.Time, prev string) string {
 	if p, err := time.Parse(time.RFC3339Nano, prev); err == nil && !now.After(p) {
 		now = p.Add(time.Nanosecond)
 	}
+	// Never a whole second: a fractional second is what marks an incarnation
+	// made after the latch (latchedIncarnation, token_incarnation.go).
+	if now.Nanosecond() == 0 {
+		now = now.Add(time.Nanosecond)
+	}
 	return now.Format(time.RFC3339Nano)
 }
 
@@ -384,18 +389,19 @@ var userGuardedShapes = map[string]func(p []interface{}) string{
 	mustFingerprint(identityBindingClearSQL):    paramAt(2),
 	mustFingerprint(userLifecycleUpsertSQL):     paramAt(0),
 	// Grants, and the changes that lift a restriction.
-	mustFingerprint(tokensInsertSQL):           paramAt(1),
-	mustFingerprint(sessionsInsertSQL):         paramAt(1),
-	mustFingerprint(identityBindingUpsertSQL):  paramAt(0),
-	mustFingerprint(enrollmentCodeUpsertSQL):   paramAt(0),
-	mustFingerprint(roleBindingInsertSQL):      roleBindingAccount,
-	mustFingerprint(user2FASetUpsertSQL):       paramAt(0),
-	mustFingerprint(user2FAUpsertSQL):          paramAt(0),
-	mustFingerprint(user2FATombstoneSQL):       paramAt(2),
-	mustFingerprint(user2FASetRetireSQL):       paramAt(2),
-	mustFingerprint(recoveryCodeSetUpsertSQL):  paramAt(0),
-	mustFingerprint(recoveryCodesSupersedeSQL): paramAt(2),
-	mustFingerprint(recoveryCodeUpsertSQL):     paramAt(0),
+	mustFingerprint(tokensInsertSQL):            paramAt(1),
+	mustFingerprint(tokensInsertIncarnationSQL): paramAt(1),
+	mustFingerprint(sessionsInsertSQL):          paramAt(1),
+	mustFingerprint(identityBindingUpsertSQL):   paramAt(0),
+	mustFingerprint(enrollmentCodeUpsertSQL):    paramAt(0),
+	mustFingerprint(roleBindingInsertSQL):       roleBindingAccount,
+	mustFingerprint(user2FASetUpsertSQL):        paramAt(0),
+	mustFingerprint(user2FAUpsertSQL):           paramAt(0),
+	mustFingerprint(user2FATombstoneSQL):        paramAt(2),
+	mustFingerprint(user2FASetRetireSQL):        paramAt(2),
+	mustFingerprint(recoveryCodeSetUpsertSQL):   paramAt(0),
+	mustFingerprint(recoveryCodesSupersedeSQL):  paramAt(2),
+	mustFingerprint(recoveryCodeUpsertSQL):      paramAt(0),
 }
 
 func paramAt(i int) func(p []interface{}) string {
@@ -436,17 +442,18 @@ func roleBindingAccount(p []interface{}) string {
 // still lands there (retireOlderIncarnationRows keeps it). A delete's cascade
 // carries its own guard (DeleteUserCounted).
 var userStampedShapes = map[string]bool{
-	mustFingerprint(usersUpdatePasswordSQL):   true,
-	mustFingerprint(userCredentialUpsertSQL):  true,
-	mustFingerprint(tokensInsertSQL):          true,
-	mustFingerprint(sessionsInsertSQL):        true,
-	mustFingerprint(identityBindingUpsertSQL): true,
-	mustFingerprint(enrollmentCodeUpsertSQL):  true,
-	mustFingerprint(roleBindingInsertSQL):     true,
-	mustFingerprint(user2FASetUpsertSQL):      true,
-	mustFingerprint(user2FAUpsertSQL):         true,
-	mustFingerprint(user2FATombstoneSQL):      true,
-	mustFingerprint(user2FASetRetireSQL):      true,
+	mustFingerprint(usersUpdatePasswordSQL):     true,
+	mustFingerprint(userCredentialUpsertSQL):    true,
+	mustFingerprint(tokensInsertSQL):            true,
+	mustFingerprint(tokensInsertIncarnationSQL): true,
+	mustFingerprint(sessionsInsertSQL):          true,
+	mustFingerprint(identityBindingUpsertSQL):   true,
+	mustFingerprint(enrollmentCodeUpsertSQL):    true,
+	mustFingerprint(roleBindingInsertSQL):       true,
+	mustFingerprint(user2FASetUpsertSQL):        true,
+	mustFingerprint(user2FAUpsertSQL):           true,
+	mustFingerprint(user2FATombstoneSQL):        true,
+	mustFingerprint(user2FASetRetireSQL):        true,
 	mustFingerprint(`UPDATE user_2fa SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`):           true,
 	mustFingerprint(`UPDATE user_2fa_sets SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`):      true,
 	mustFingerprint(`UPDATE recovery_codes SET deleted_at = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`):     true,
@@ -721,7 +728,8 @@ func validateUserIncarnationEntry(stmts []Statement) error {
 //   - a row that grants (a credential, a recovery code or its active set, an
 //     enrollment code, a directory binding, a role binding — bindings are
 //     union-only, so losing one never widens access — an API token, a
-//     session) goes only while LIVE.
+//     session) goes only while LIVE. An API token stamped with the new
+//     incarnation is the new account's own, and stays.
 //     Its tombstone stays: dropped, an older live row of the same key could
 //     land under it and grant again (a consumed code, an unbound identity);
 //   - a row that restricts (a second factor or its active set, a lifecycle
@@ -748,8 +756,6 @@ func retireOlderIncarnationRows(ctx context.Context, tx *sql.Tx, username, incar
 		`DELETE FROM recovery_code_sets WHERE username = ? AND deleted_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
 		`DELETE FROM user_enrollment_codes WHERE username = ? AND deleted_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
 		`DELETE FROM user_identity_bindings WHERE username = ? AND deleted_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
-		`DELETE FROM token_credentials WHERE token_id IN (SELECT id FROM tokens WHERE username = ? AND deleted_at IS NULL) -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
-		`DELETE FROM tokens WHERE username = ? AND deleted_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
 		`DELETE FROM sessions WHERE username = ? AND revoked_at IS NULL -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
 		// Restrictions: tombstones only.
 		`DELETE FROM user_2fa WHERE username = ? AND deleted_at IS NOT NULL -- full-state-delete-ok: an older incarnation's lifted restriction, replaced by a re-create`,
@@ -757,6 +763,18 @@ func retireOlderIncarnationRows(ctx context.Context, tx *sql.Tx, username, incar
 		`DELETE FROM user_lifecycle WHERE username = ? AND deleted_at IS NOT NULL -- full-state-delete-ok: an older incarnation's lifted restriction, replaced by a re-create`,
 	} {
 		if _, err := tx.ExecContext(ctx, q, username); err != nil {
+			return err
+		}
+	}
+	// A token says which incarnation it was issued to (token_incarnation.go):
+	// one stamped with the new incarnation is the new account's own, heard
+	// before its re-create, and stays. An unstamped one goes, as every token
+	// did before.
+	for _, q := range []string{
+		`DELETE FROM token_credentials WHERE token_id IN (SELECT id FROM tokens WHERE username = ? AND deleted_at IS NULL AND user_created_at IS NOT ?) -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
+		`DELETE FROM tokens WHERE username = ? AND deleted_at IS NULL AND user_created_at IS NOT ? -- full-state-delete-ok: an older incarnation's live grant, replaced by a re-create`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, username, incarnation); err != nil {
 			return err
 		}
 	}

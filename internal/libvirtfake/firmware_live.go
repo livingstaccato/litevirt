@@ -250,6 +250,7 @@ func (f *Fake) leftStateLocked(name string) {
 	delete(f.pendingNvram, name)
 	delete(f.pendingPermall, name)
 	delete(f.offReason, name)
+	delete(f.ioPaused, name)
 }
 
 // ShutOffDomain takes a domain to shut off with reason, as a crash of its

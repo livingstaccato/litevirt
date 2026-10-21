@@ -62,3 +62,33 @@ func TestNormalizeDomainReason(t *testing.T) {
 		})
 	}
 }
+
+// A guest QEMU paused because a disk write failed (ENOSPC on a full pool,
+// EIO) is still reported with Reason "paused", which every caller reads as
+// "active, not executing" — but carries why in PausedReason, so an I/O
+// error pause can be told from an operator's. Other states carry none.
+func TestNormalizePausedReason(t *testing.T) {
+	cases := []struct {
+		state  golibvirt.DomainState
+		reason int32
+		want   string
+	}{
+		{golibvirt.DomainPaused, int32(golibvirt.DomainPausedIoerror), PausedReasonIOError},
+		{golibvirt.DomainPaused, int32(golibvirt.DomainPausedUser), "user"},
+		{golibvirt.DomainPaused, int32(golibvirt.DomainPausedMigration), "migration"},
+		{golibvirt.DomainPaused, int32(golibvirt.DomainPausedUnknown), "unknown"},
+		{golibvirt.DomainPaused, 999, "unknown"},
+		{golibvirt.DomainRunning, int32(golibvirt.DomainPausedIoerror), ""},
+		{golibvirt.DomainShutoff, int32(golibvirt.DomainShutoffCrashed), ""},
+	}
+	for _, tc := range cases {
+		if got := normalizePausedReason(tc.state, tc.reason); got != tc.want {
+			t.Errorf("normalizePausedReason(%v, %d) = %q; want %q", tc.state, tc.reason, got, tc.want)
+		}
+		if tc.state == golibvirt.DomainPaused {
+			if got := normalizeDomainReason(tc.state, tc.reason); got != "paused" {
+				t.Errorf("normalizeDomainReason(paused, %d) = %q; want paused whatever the pause reason", tc.reason, got)
+			}
+		}
+	}
+}

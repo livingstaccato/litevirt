@@ -2766,6 +2766,9 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 		defer conn.Close()
 		return client.StopVM(ctx, req)
 	}
+	if err := s.quarantinedForceStopRefusal(req.Name, req.Force); err != nil {
+		return nil, err
+	}
 	// A row that says migrating: a guest running here is stopped as before.
 	// Otherwise it may run on the move's target, which is asked first, before
 	// the lock (a peer RPC): a stop recorded here while it runs there would
@@ -2840,6 +2843,46 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 		s.resolveMigrationUnresolved(context.WithoutCancel(ctx), vm.Name)
 	}
 	return out, err
+}
+
+// stopQuarantineReason is why this host refuses replicated writes, or "".
+// While it is non-empty a stop's "operator-stop" record cannot land: the row
+// keeps "running", and once the quarantine lifts the reconciler records the
+// stopped domain by libvirt's reason. A clean guest shutdown is recorded as
+// one and sticks; a destroyed domain is recorded as an out-of-band destroy,
+// which the restart policy starts again.
+func (s *Server) stopQuarantineReason() string {
+	if s.db == nil {
+		return ""
+	}
+	return s.db.WriteQuarantineReason()
+}
+
+// quarantineRemedy is how the write quarantine behind reason lifts: release
+// probation lifts by itself once a voter majority has confirmed it; any
+// other quarantine needs this host upgraded again or reseeded.
+func (s *Server) quarantineRemedy() string {
+	if s.db != nil && s.db.InReleaseProbation() && !s.db.WALQuarantined() {
+		return "wait for its release probation, which lifts by itself once a voter majority has been asked (`lv cluster upgrade-status`)"
+	}
+	return "upgrade this host's binary again or reseed the host (docs/upgrades.md)"
+}
+
+// quarantinedForceStopRefusal refuses `lv stop --force` on a host in write
+// quarantine, before anything reaches libvirt: the destroy could not be
+// recorded as the operator's, and the restart policy would undo it (above).
+// A graceful stop still runs (stopLocked never force-kills it while the
+// quarantine holds).
+func (s *Server) quarantinedForceStopRefusal(name string, force bool) error {
+	reason := s.stopQuarantineReason()
+	if !force || reason == "" {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"VM %q was not stopped: this host is in write quarantine (%s) and cannot record a forced stop, "+
+			"which its restart policy would then undo; the guest is left running. A graceful `lv stop %s` "+
+			"still shuts the guest down; or %s, then retry `lv stop --force %s`",
+		name, reason, name, s.quarantineRemedy(), name)
 }
 
 // stopVMLocked stops a LOCAL VM (force ⇒ destroy, else graceful shutdown with a
@@ -2919,6 +2962,15 @@ func (s *Server) stopLocked(ctx context.Context, vm *corrosion.VMRecord, force b
 		timeout := resolveStopTimeout(timeoutSec, vm.Spec)
 		if timeout > 0 {
 			if !s.virt.WaitForShutdown(vm.Name, time.Duration(timeout)*time.Second) {
+				// Under write quarantine the kill could not be recorded as
+				// the operator's, and the restart policy would undo it.
+				if reason := s.stopQuarantineReason(); reason != "" {
+					return nil, status.Errorf(codes.FailedPrecondition,
+						"VM %q did not shut down within %ds and was not force-killed: this host is in write quarantine (%s), "+
+							"so a kill could not be recorded and its restart policy would undo it; the guest is left running. "+
+							"Shut it down from inside the guest, or %s",
+						vm.Name, timeout, reason, s.quarantineRemedy())
+				}
 				slog.Info("ACPI shutdown timed out, force-killing", "vm", vm.Name, "timeout_sec", timeout)
 				_ = s.virt.DestroyDomain(vm.Name)
 			}
@@ -2994,6 +3046,13 @@ func (s *Server) stopLocked(ctx context.Context, vm *corrosion.VMRecord, force b
 	// the VM (#29), so this one is fail-closed: retry, then surface an error if it
 	// still can't land, rather than signal a clean stop.
 	if err := s.persistVMState(ctx, vm.Name, "stopped", "operator-stop", corrosion.OpVMState); err != nil {
+		if reason := s.stopQuarantineReason(); reason != "" {
+			return nil, status.Errorf(codes.Internal,
+				"stopped but recording operator-stop failed: this host is in write quarantine (%s). The guest is shut down "+
+					"and stays down: once the quarantine lifts it is recorded stopped by the reconciler, not as an operator stop, "+
+					"so an onboot VM starts at the next host boot. To record stops again, %s: %v",
+				reason, s.quarantineRemedy(), err)
+		}
 		return nil, status.Errorf(codes.Internal, "stopped but recording operator-stop failed: %v", err)
 	}
 	evDetail := note

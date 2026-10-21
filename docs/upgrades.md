@@ -659,6 +659,27 @@ host quarantined below a release feature in use must be **drained** of the
 workloads the feature touches (`lv host drain`), then upgraded again or reseeded;
 reseeding alone does not correct a workload already running.
 
+**`lv stop` on a quarantined host.** A stop's `operator-stop` record is a
+replicated write, which the quarantine refuses, so the host cannot record
+the stop as the operator's. Once the quarantine lifts, the reconciler records
+the stopped VM from libvirt's reason instead. A clean guest shutdown is
+recorded as one and stays down. A killed domain is recorded as an
+out-of-band destroy, and its restart policy starts it again. So, while the
+quarantine holds:
+
+- `lv stop` asks the guest to shut down, as elsewhere. It answers an error
+  saying the stop was not recorded, but the guest stays down. An `onboot` VM
+  starts again at the host's next boot.
+- If the guest does not shut down within its timeout, it is **not**
+  force-killed. The stop answers `FailedPrecondition` and the guest keeps
+  running.
+- `lv stop --force` is refused with `FailedPrecondition` before it touches
+  the guest.
+
+Release probation lifts by itself (`lv cluster upgrade-status`). Any other
+quarantine needs the host upgraded again or reseeded before a forced stop
+can be recorded.
+
 **Before you roll back**, ask the cluster what would block it:
 
 ```bash

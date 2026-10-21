@@ -58,6 +58,9 @@ func seedPromotableVM(t *testing.T, s *Server, ownerHost, ownerState, project st
 		}); err != nil {
 			t.Fatalf("InsertHost(%s): %v", ownerHost, err)
 		}
+		if ownerState == "fenced" {
+			proveFencedOff(t, s, ownerHost)
+		}
 	}
 	seedReplica(t, poolDir, project, "vm1", "root", "20260101-000000", "raw", 1<<20)
 	return poolDir
@@ -95,7 +98,7 @@ func TestPromoteReplica_SameName_RefusedWhenHostLacksCapacity(t *testing.T) {
 	s := testServer(t)
 	s.dataDir = t.TempDir()
 	admissionHost(t, s) // allocatable 1536 MiB
-	poolDir := seedPromotableVM(t, s, "dead-host", "failed", "", 2, 2048)
+	poolDir := seedPromotableVM(t, s, "dead-host", "fenced", "", 2, 2048)
 
 	err := promoteVM(s, &pb.PromoteReplicaRequest{VmName: "vm1"})
 	if status.Code(err) != codes.ResourceExhausted {
@@ -119,7 +122,7 @@ func TestPromoteReplica_SameName_RefusedWhenInventoryIncomplete(t *testing.T) {
 	fake.FailListDomains = func() error { return fmt.Errorf("libvirtd unreachable") }
 	s.virt = fake
 	s.invalidateInventoryCache()
-	poolDir := seedPromotableVM(t, s, "dead-host", "failed", "", 1, 512)
+	poolDir := seedPromotableVM(t, s, "dead-host", "fenced", "", 1, 512)
 
 	err := promoteVM(s, &pb.PromoteReplicaRequest{VmName: "vm1"})
 	if status.Code(err) != codes.FailedPrecondition {
@@ -135,7 +138,7 @@ func TestPromoteReplica_Renamed_RefusedWhenQuotaExhausted(t *testing.T) {
 	s := testServer(t)
 	s.dataDir = t.TempDir()
 	ctx := context.Background()
-	poolDir := seedPromotableVM(t, s, "dead-host", "failed", "acme", 2, 2048)
+	poolDir := seedPromotableVM(t, s, "dead-host", "fenced", "acme", 2, 2048)
 	if err := corrosion.InsertProject(ctx, s.db, corrosion.ProjectRecord{Name: "acme"}); err != nil {
 		t.Fatalf("InsertProject: %v", err)
 	}
@@ -166,7 +169,7 @@ func TestPromoteReplica_SameName_DoesNotDoubleChargeQuota(t *testing.T) {
 	s := testServer(t)
 	s.dataDir = t.TempDir()
 	ctx := context.Background()
-	seedPromotableVM(t, s, "dead-host", "failed", "acme", 2, 2048)
+	seedPromotableVM(t, s, "dead-host", "fenced", "acme", 2, 2048)
 	if err := corrosion.InsertProject(ctx, s.db, corrosion.ProjectRecord{Name: "acme"}); err != nil {
 		t.Fatalf("InsertProject: %v", err)
 	}
@@ -200,7 +203,7 @@ func TestPromoteReplica_Renamed_FenceRefusalUnwindsTheStartedDomain(t *testing.T
 	s.enfProjectAuthority.Store(true)
 	s.SetGate(fakeServerGate{execOK: true, enforcedTok: map[string]bool{capabilities.ProjectAuthorityV1: true}})
 	authorityHost(t, s, "acme") // this host holds acme's authority at epoch 1
-	poolDir := seedPromotableVM(t, s, "dead-host", "failed", "acme", 1, 512)
+	poolDir := seedPromotableVM(t, s, "dead-host", "fenced", "acme", 1, 512)
 
 	// Move the authority between admission and the insert. StartDomain is the
 	// last runtime step before persistence, so its hook is exactly the window
@@ -240,7 +243,7 @@ func TestPromoteReplica_MarkedRunningRetry_AdoptedWithoutDoubleReserve(t *testin
 	admissionHost(t, s) // allocatable 1536 MiB
 	fake := libvirtfake.New()
 	s.virt = fake
-	seedPromotableVM(t, s, "dead-host", "failed", "", 1, 1536)
+	seedPromotableVM(t, s, "dead-host", "fenced", "", 1, 1536)
 
 	// The prior attempt started the domain and wrote the marker, then crashed
 	// before persisting the row.

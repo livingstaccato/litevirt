@@ -78,6 +78,11 @@ func insertPromotableVM(t *testing.T, s *Server, name, project, host, disk strin
 	}}); err != nil {
 		t.Fatal(err)
 	}
+	// A dead owner with no host row here is promotable only once it is
+	// proven off (the split-brain guard, ccguard I2).
+	if host != s.hostName {
+		proveFencedOff(t, s, host)
+	}
 }
 
 // recordReplicaForTest writes the upload record a replica gets on its pool's

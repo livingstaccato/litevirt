@@ -575,10 +575,11 @@ func (s *Server) autoDefineRestoredVM(
 		if fwVM {
 			// A running firmware domain with no DB row is unmanageable — lifecycle
 			// code wouldn't know to preserve/wipe its state — so fail hard; the
-			// deferred rollback destroys the domain + wipes the firmware. It runs
-			// after the device release (defers are LIFO), so the domain is
-			// destroyed here first: its devices are released only off a guest
-			// that is gone.
+			// deferred rollback destroys the domain + wipes the firmware. That
+			// rollback was registered after the device allocation, so it runs
+			// first (defers are LIFO); the release is still decided here, by
+			// pciHeld, which clears only once this explicit destroy succeeds,
+			// so the devices are released only off a guest that is gone.
 			if derr := s.virt.DestroyDomain(targetName); derr == nil {
 				pciHeld = false
 			}

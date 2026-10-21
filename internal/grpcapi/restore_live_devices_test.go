@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
@@ -228,5 +229,61 @@ func TestCreateVM_AFailedStartReleasesTheDevices(t *testing.T) {
 	}
 	if o := pciOwner(t, s, restoreGPU); o != "" || fs.isBound(restoreGPU) {
 		t.Fatalf("after the failed create (%v): owner=%q bound=%v, want released and unbound", err, o, fs.isBound(restoreGPU))
+	}
+}
+
+// A fence that refuses the restore's commit after its domain started gives
+// the devices back only once that domain is destroyed: a guest whose destroy
+// failed may still hold them, and keeps them.
+//
+// Mutation: clear pciHeld on the fence branch whether or not the destroy
+// succeeded: red (destroy-failed).
+func TestRestoreLive_AutoStart_FenceRefusalReleasesOnlyADestroyedDomainsDevices(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		failDestroy bool
+		wantOwner   string
+		wantBound   bool
+	}{
+		{"destroyed", false, "", false},
+		{"destroy-failed", true, "vm1", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := testServer(t)
+			s.hostName = "host-a"
+			s.dataDir = t.TempDir()
+			ctx := context.Background()
+			fake := libvirtfake.New()
+			if tc.failDestroy {
+				fake.FailDestroyDomain = func(string) error { return errors.New("destroy boom") }
+			}
+			s.virt = fake
+			s.enfProjectAuthority.Store(true)
+			s.SetGate(fakeServerGate{execOK: true, enforcedTok: map[string]bool{capabilities.ProjectAuthorityV1: true}})
+			authorityHost(t, s, "_default")
+			fs := newPCIUnbindRecordingFS()
+			fs.setHostDriver(restoreGPU, "nvidia")
+			defer vfio.SetFS(fs)()
+			seedRestoreGPU(t, s)
+			s.commitFenceHook = func(op string) {
+				if op != "RestoreLive" {
+					return
+				}
+				if _, applied, err := corrosion.TakeoverProjectAuthority(ctx, s.db, "_default", "usurper", "planned", "", 1); err != nil || !applied {
+					t.Errorf("takeover: applied=%v err=%v", applied, err)
+				}
+			}
+			repoDir, ts := gpuSpecRepo(t, &pb.DeviceSpec{Address: restoreGPU})
+			err := restoreLiveBounded(s, &pb.RestoreLiveRequest{
+				RepoPath: repoDir, VmName: "vm1", DiskName: "root", Timestamp: ts,
+				TargetPath: filepath.Join(t.TempDir(), "live.qcow2"), AutoStart: true,
+			})
+			if err == nil {
+				t.Fatal("restore succeeded; the fence did not refuse")
+			}
+			if o, b := pciOwner(t, s, restoreGPU), fs.isBound(restoreGPU); o != tc.wantOwner || b != tc.wantBound {
+				t.Fatalf("err=%v: owner=%q bound=%v, want owner=%q bound=%v", err, o, b, tc.wantOwner, tc.wantBound)
+			}
+		})
 	}
 }

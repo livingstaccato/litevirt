@@ -29,11 +29,13 @@ import (
 //     another rebuilt host as empty as itself;
 //   - its replica has caught up since it started, or it is alone — a seeded
 //     replica holds everything it ever received, and a founder alone in its
-//     cluster has nobody to catch up with;
+//     cluster has nobody to catch up with. The joining row of this same
+//     admission (name, with this certificate) does not count against being
+//     alone: the add's re-ask finds it there (clusterOfOneBut);
 //   - the name's tail here is not below a retirement the cluster CA recorded for
 //     one of its keys (`lv host rm` writes it at the tail it removed the host
 //     at): this replica would be behind the one that removed it.
-func (s *Server) auditAdmissionPosition(ctx context.Context, name string) (int64, string, error) {
+func (s *Server) auditAdmissionPosition(ctx context.Context, name, serial string) (int64, string, error) {
 	if s.db.AuditChainHeld(ctx, s.hostName) {
 		return 0, "", status.Errorf(codes.Unavailable,
 			"%s cannot admit %s: it is itself holding its own audit rows until its history arrives from its "+
@@ -50,7 +52,9 @@ func (s *Server) auditAdmissionPosition(ctx context.Context, name string) (int64
 			s.hostName, name, name)
 	}
 	if ok, why := s.db.ReplicaCaughtUp(); !ok {
-		alone, err := s.clusterOfOne(ctx)
+		// name's own joining row with this certificate is this admission's,
+		// written by its first ask: `lv host add` asks again before installing.
+		alone, err := s.clusterOfOneBut(ctx, name, serial)
 		if err != nil {
 			return 0, "", status.Errorf(codes.Unavailable, "read this node's peers: %v", err)
 		}

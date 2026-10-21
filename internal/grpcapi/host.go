@@ -2744,7 +2744,7 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.A
 				"remove the workload (`lv rm <vm>`, `lv ct rm <name>`). Then add the host again",
 			req.Name, len(left), strings.Join(left, ", "))
 	}
-	tailSeq, tailHash, err := s.auditAdmissionPosition(ctx, req.Name)
+	tailSeq, tailHash, err := s.auditAdmissionPosition(ctx, req.Name, req.CertSerial)
 	if err != nil {
 		return nil, err
 	}

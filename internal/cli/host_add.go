@@ -1451,6 +1451,24 @@ func HostAddOn(ctx context.Context, c pb.LiteVirtClient, t *LocalAddTarget, host
 	})
 }
 
+// UseMachinesForTests stands this process in for an operator machine that is
+// not a cluster node, whatever the machine running the test is: its daemon
+// config is read from configPath (a path that does not exist means none), and
+// `lv host rm` reaches the machine at each address of machines through its
+// LocalAddTarget instead of SSH (an address not listed fails to connect). It
+// returns what puts both back.
+func UseMachinesForTests(configPath string, machines map[string]*LocalAddTarget) (restore func()) {
+	oldPath, oldDial := daemonConfigPath, dialAdmissionMachine
+	daemonConfigPath = configPath
+	dialAdmissionMachine = func(addr string) (addRemote, func(), error) {
+		if m, ok := machines[addr]; ok {
+			return m, func() {}, nil
+		}
+		return nil, nil, fmt.Errorf("SSH connect: no machine at %s (test)", addr)
+	}
+	return func() { daemonConfigPath, dialAdmissionMachine = oldPath, oldDial }
+}
+
 const remoteConfig = "/etc/litevirt/config.yaml"
 
 // maxConfigRead is the most of a config.yaml the add reads (ReadFile over

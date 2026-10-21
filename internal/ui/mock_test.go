@@ -233,6 +233,7 @@ type mockGRPC struct {
 	lastVMEventsReq       *pb.ListVMEventsRequest
 	lastRestoreFromReq    *pb.RestoreFromBackupRequest
 	lastRestoreLiveReq    *pb.RestoreLiveRequest
+	restoreLiveGate       chan struct{} // when set, RestoreLive returns its stream only once closed
 	deleteScheduleErr     error
 	lastDeleteScheduleReq *pb.DeleteBackupScheduleRequest
 	createReplErr         error
@@ -471,7 +472,11 @@ func (m *mockGRPC) RestoreFromBackup(_ context.Context, in *pb.RestoreFromBackup
 func (m *mockGRPC) RestoreLive(_ context.Context, in *pb.RestoreLiveRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.RestoreLiveProgress], error) {
 	m.mu.Lock()
 	m.lastRestoreLiveReq = in
+	gate := m.restoreLiveGate
 	m.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
 	return &scriptedStream[pb.RestoreLiveProgress]{frames: []*pb.RestoreLiveProgress{
 		{Phase: pb.RestoreLiveProgress_READY, Status: "ready", NbdUrl: "nbd://127.0.0.1:10809/export", TargetPath: in.GetTargetPath()},
 		{Phase: pb.RestoreLiveProgress_DONE, Status: "localized"},

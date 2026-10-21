@@ -404,7 +404,12 @@ func (s *Server) settleFailedSourceMigration(ctx, bctx context.Context, vm corro
 		return failover.MigratingDecision{Verdict: failover.MigratingHold, Detail: why + ". " + fix}
 	}
 	recoverVM := func(why string) failover.MigratingDecision {
-		s.resolveMigrationUnresolved(ctx, vm.Name)
+		if !firmware {
+			// Failover never restarts a Secure Boot / vTPM VM: its recovery
+			// skips it (its firmware state lives on the source and the
+			// target), so its condition stays, saying what brings it back.
+			s.resolveMigrationUnresolved(ctx, vm.Name)
+		}
 		return failover.MigratingDecision{Verdict: failover.MigratingRecover, Detail: why}
 	}
 	if target == "" || target == source {
@@ -479,8 +484,13 @@ func (s *Server) settleFirmwareMigration(ctx, bctx context.Context, vm corrosion
 	const fw = "it is a Secure Boot / vTPM VM, whose move is settled by its firmware records"
 	if a.err != nil {
 		return hold(fmt.Sprintf("its target %s cannot be asked whether the guest runs there (%v), and %s", target, a.err, fw),
-			fmt.Sprintf("If %s answers again, the next poll settles it by what %s holds. If %s is down, once it is powered off, "+
-				"`lv host fence-confirm %s`: the next poll goes on with %s's recovery", target, target, target, target, vm.Name))
+			fmt.Sprintf("No lv command can start a Secure Boot / vTPM VM while its source %[1]s and its target %[2]s are both "+
+				"down: failover never restarts one, because its NVRAM and TPM state live on those two hosts. Bring one of them "+
+				"back. When %[2]s answers again, the next poll names the step for the copy %[2]s holds. When %[1]s comes back, "+
+				"its daemon takes the move up from its own records and raises firmware_migration_target_unreachable while %[2]s "+
+				"does not answer; once %[2]s is powered off and `lv host fence-confirm %[2]s` records it, %[1]s resolves the move "+
+				"by fence and records %[3]s stopped there, and `lv start %[3]s` starts it from %[1]s's firmware state",
+				source, target, vm.Name))
 	}
 	if runtimeStateIn(a.inv, corrosion.WorkloadVM, vm.Name) == health.RuntimeAbsent {
 		return recoverVM(fmt.Sprintf("its target %s has no domain of it", target))
@@ -505,7 +515,7 @@ func (s *Server) settleFirmwareMigration(ctx, bctx context.Context, vm corrosion
 	why := fmt.Sprintf("its target %s holds a domain of it %s, and %s", target, state, fw)
 	switch {
 	case !td.GetPresent():
-		return hold(fmt.Sprintf("its target %s lists a domain of it its firmware records do not show, and %s", target, fw),
+		return hold(fmt.Sprintf("its target %s did not list it as absent, and its firmware records show no domain of it there, and %s", target, fw),
 			"The next poll asks again")
 	case state == "paused":
 		return hold(why, s.firmwareMoveAdvice(ctx, vm.Name, source, target))
@@ -513,10 +523,17 @@ func (s *Server) settleFirmwareMigration(ctx, bctx context.Context, vm corrosion
 		return hold(why, fmt.Sprintf("No lv command settles a Secure Boot / vTPM VM that runs on its target while its record "+
 			"names the failed source. On %s, `virsh suspend %s` pauses the guest; the next poll then names the firmware move "+
 			"doctor, whose --adopt-target-copy takes the paused copy, records it on %s and resumes it", target, vm.Name, target))
-	default:
-		return hold(why, fmt.Sprintf("No lv command settles a Secure Boot / vTPM VM whose copy on its target is %s while its "+
+	case state == "shutoff":
+		return hold(why, fmt.Sprintf("No lv command settles a Secure Boot / vTPM VM whose copy on its target is shut off while its "+
 			"record names the failed source. On %s, `virsh start --paused %s` brings the copy up paused; the next poll then names "+
 			"the firmware move doctor, whose --adopt-target-copy takes the paused copy, records it on %s and resumes it",
-			state, target, vm.Name, target))
+			target, vm.Name, target))
+	default:
+		// Active, and neither running nor paused: pm-suspended, shutting down,
+		// crashed. `virsh start` refuses an active domain, and no host-side
+		// step is known to lead from these to a paused copy safely.
+		return hold(why, fmt.Sprintf("No lv command settles a Secure Boot / vTPM VM whose copy on its target is %s, and no "+
+			"host-side step is known to be safe for a copy in that state: contact the litevirt maintainers before acting on it. "+
+			"If the copy on %s comes to run, pause or shut off, the next poll names the step for that state", state, target))
 	}
 }

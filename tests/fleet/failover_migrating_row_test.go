@@ -41,6 +41,10 @@ func migratingRowFleet(t *testing.T, clock *VirtualClock, claims bool, targetSta
 	return migratingRowFleetWith(t, clock, claims, targetState, func(b *Node) string { return "→ " + b.Name })
 }
 
+// mg1Spec is mg1's spec (migratingRowFleetWith); a scenario may set it before
+// building the fleet.
+var mg1Spec = `{"on_host_failure":"restart-any"}`
+
 // migratingRowFleetWith is migratingRowFleet with mg1's state detail given by
 // detail (b is the node its domain is on).
 func migratingRowFleetWith(t *testing.T, clock *VirtualClock, claims bool, targetState libvirtfake.State,
@@ -49,7 +53,7 @@ func migratingRowFleetWith(t *testing.T, clock *VirtualClock, claims bool, targe
 	setup := func(_ *Cluster, a, b, victim *Node) {
 		ctx := context.Background()
 		if err := corrosion.InsertVM(ctx, a.DB, corrosion.VMRecord{
-			Name: "mg1", HostName: victim.Name, Spec: `{"on_host_failure":"restart-any"}`,
+			Name: "mg1", HostName: victim.Name, Spec: mg1Spec,
 			State: "migrating", StateDetail: detail(b),
 		}, nil, nil); err != nil {
 			t.Fatalf("InsertVM mg1: %v", err)
@@ -393,5 +397,63 @@ func TestFleet_Failover_MigratingRowWithNoCopyOnTargetIsRecovered(t *testing.T) 
 				t.Fatalf("mg1 runs on %v, want exactly one survivor\n  %s", on, detail)
 			}
 		})
+	}
+}
+
+// TestFleet_Failover_MigratingFirmwareRowWithBothHostsDownIsNotStarted: mg1
+// is a Secure Boot / vTPM VM recorded migrating from the victim to b, and b
+// does not answer. Its hold says no lv command can start it while both
+// hosts are down, and that bringing one back is the remedy. Once b is
+// powered off and confirmed so, the recovery goes on past the hold into
+// failover's firmware skip: nothing of mg1 runs anywhere, its row stays
+// migrating on the victim, the skip is audited, and the condition stays,
+// still saying what brings it back.
+//
+// Mutations: resolve the condition when a firmware VM is recovered — red;
+// give the unreachable firmware hold the paused advice — red.
+func TestFleet_Failover_MigratingFirmwareRowWithBothHostsDownIsNotStarted(t *testing.T) {
+	ctx := context.Background()
+	old := mg1Spec
+	mg1Spec = `{"on_host_failure":"restart-any","secure_boot":true,"tpm":true,"firmware":"uefi","uuid":"6f1c2d3e-4b5a-4c6d-8e7f-0011223344cc"}`
+	t.Cleanup(func() { mg1Spec = old })
+	clock := NewVirtualClock(time.Now().UTC())
+	c, a, b, victim := migratingRowFleet(t, clock, false, libvirtfake.StateRunning)
+	c.SetLinkFaultBoth(a, b, LinkFault{BlockAll: true})
+	cs := c.NewCoordinators(clock)
+	tickA(t, cs, clock, a, 3)
+	if len(cs.Fences()) == 0 {
+		t.Fatal("victim was never fenced; without a fence there is no recovery and this proves nothing")
+	}
+	bringBack := []string{"No lv command can start", "both down", "Bring one of them back", "lv start mg1"}
+	requireHeldNaming(t, a, b, victim, bringBack...)
+
+	// b powered off, its guest with it, and confirmed so.
+	c.Kill(b)
+	_ = b.Virt.DestroyDomain("mg1")
+	PublishHealth(t, a, b.Name, 5, clock.Now())
+	mustFenceConfirm(t, a, b.Name)
+	tickA(t, cs, clock, a, 3)
+
+	if on := runningOn(c, "mg1"); len(on) != 0 {
+		t.Fatalf("mg1 runs on %v; nothing can start a firmware VM whose source and target are both down", on)
+	}
+	if a.Virt.DomainExists("mg1") {
+		t.Fatalf("%s defined mg1", a.Name)
+	}
+	if vm := vmOn(t, a, "mg1"); vm.HostName != victim.Name || vm.State != "migrating" {
+		t.Fatalf("mg1 = %s %s, want its row left migrating on %s", vm.HostName, vm.State, victim.Name)
+	}
+	rows, err := a.DB.Query(ctx, `SELECT detail FROM audit_log WHERE action = 'failover.skip' AND target = 'mg1'`)
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("failover.skip audit rows for mg1 = %d (err %v): the recovery did not reach the firmware skip", len(rows), err)
+	}
+	detail, open := mg1Unresolved(t, a)
+	if !open {
+		t.Fatal("vm.migration_unresolved was resolved, though nothing brought mg1 back")
+	}
+	for _, w := range bringBack {
+		if !strings.Contains(detail, w) {
+			t.Errorf("vm.migration_unresolved no longer names %q: %s", w, detail)
+		}
 	}
 }

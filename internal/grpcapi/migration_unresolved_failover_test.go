@@ -44,17 +44,24 @@ func unresolvedDetail(t *testing.T, s *Server, vm string) (string, bool) {
 // its firmware records. The hold names the step that settles it, by what the
 // target holds, and each arm takes that step:
 //
-//   - unreachable: fence-confirm of the target; the next poll recovers;
+//   - unreachable: no lv command can start it while the source and the
+//     target are both down; bringing one back is the remedy. A target
+//     proven off then lets the recovery go on (where failover skips a
+//     firmware VM), and the condition stays, still saying so;
 //   - paused: fence-confirm of the source, then --adopt-target-copy: the VM
 //     runs on the target alone, its row there;
 //   - running or shut off: no lv command; `virsh suspend` or
 //     `virsh start --paused` on the target pauses it, and the paused arm's
-//     steps follow.
+//     steps follow;
+//   - any other active state (pm-suspended, crashed, shutting down): no
+//     lv command and no known safe host step — contact the maintainers.
 //
 // Mutations: re-point a firmware VM like any other (drop the firmware
 // branch) — the running arm's row moves to dst-host, red; give every held
 // state the paused advice — the running and shut-off arms, red; give the
-// unreachable target the paused advice — red.
+// unreachable target the paused advice — red; resolve the condition when a
+// firmware VM is recovered — the unreachable arm, red; name `virsh start`
+// for every active state — the pmsuspended arm, red.
 func TestSettleFailedSourceMigrations_FirmwareVMIsHeldForTheDoctor(t *testing.T) {
 	ctx := context.Background()
 	settle := func(t *testing.T, r *fwlRig) failover.MigratingDecision {
@@ -135,13 +142,18 @@ func TestSettleFailedSourceMigrations_FirmwareVMIsHeldForTheDoctor(t *testing.T)
 		}
 	}
 
-	t.Run("unreachable/fence_confirm_the_target", func(t *testing.T) {
+	t.Run("unreachable/no_lv_command_while_both_are_down", func(t *testing.T) {
 		r := rig(t, "")
 		withMigratingInventory(t, func(context.Context, string) (runtimeInventory, error) {
 			return runtimeInventory{}, errors.New("connection refused")
 		})
-		held(t, r, settle(t, r), []string{"cannot be asked", "lv host fence-confirm dst-host"}, []string{"--adopt-target-copy", "No lv command"})
-		// The target powered off, its guest with it, and confirmed so.
+		want := []string{"cannot be asked", "No lv command can start", "both down", "Bring one of them back",
+			"lv host fence-confirm dst-host", "lv start " + fwlVM}
+		held(t, r, settle(t, r), want, []string{"--adopt-target-copy", "goes on with"})
+		// The target powered off, its guest with it, and confirmed so. The
+		// recovery goes on — failover then skips a firmware VM, which
+		// TestFleet_Failover_MigratingFirmwareRowWithBothHostsDownIsNotStarted
+		// follows — and the condition stays, still saying what brings it back.
 		_ = r.dstFake.DestroyDomain(fwlVM)
 		if err := corrosion.RecordFenceWithState(ctx, r.src.db,
 			corrosion.FenceLogRecord{ID: "fc-dst", HostName: "dst-host", Method: "manual", Result: "manual-confirmed"}, "fenced"); err != nil {
@@ -149,6 +161,9 @@ func TestSettleFailedSourceMigrations_FirmwareVMIsHeldForTheDoctor(t *testing.T)
 		}
 		if d := settle(t, r); d.Verdict != failover.MigratingRecover {
 			t.Fatalf("decision %+v once dst-host is proven off, want the recovery to go on", d)
+		}
+		if detail, open := unresolvedDetail(t, r.src, fwlVM); !open || !strings.Contains(detail, "No lv command can start") {
+			t.Fatalf("condition open %v, detail %q: it must stay, saying what brings the VM back", open, detail)
 		}
 	})
 	t.Run("paused/fence_confirm_the_source_then_adopt", func(t *testing.T) {
@@ -163,6 +178,15 @@ func TestSettleFailedSourceMigrations_FirmwareVMIsHeldForTheDoctor(t *testing.T)
 		held(t, r, settle(t, r), []string{"No lv command", "virsh suspend " + fwlVM}, []string{"lv host fence-confirm"})
 		r.dstFake.SetState(fwlVM, libvirtfake.StatePaused) // `virsh suspend` on dst-host
 		adoptPaused(t, r)
+	})
+	t.Run("pmsuspended/no_known_step", func(t *testing.T) {
+		r := rig(t, libvirtfake.StateRunning)
+		migratingFirmwareHook = func(ctx context.Context, _ *Server, host, vm string) (*pb.FirmwareMoveHostRecords, error) {
+			rec := r.dst.localFirmwareMoveRecords(ctx, vm)
+			rec.Domain = &pb.TargetDomain{Present: true, State: "pmsuspended"}
+			return rec, nil
+		}
+		held(t, r, settle(t, r), []string{"pmsuspended", "contact the litevirt maintainers"}, []string{"virsh start", "virsh suspend", "lv host fence-confirm"})
 	})
 	t.Run("shut_off/no_lv_command_then_start_paused", func(t *testing.T) {
 		r := rig(t, libvirtfake.StateShutdown)
@@ -231,13 +255,17 @@ func TestSettleFailedSourceMigrations_AsksEachTargetOnceWithinABudget(t *testing
 		calls     map[string]int
 		in, peak  atomic.Int32
 		completed atomic.Int32
-		// latest is the latest deadline any ask was given.
-		latest time.Time
+		// latest is the latest deadline any ask was given; first is when the
+		// first ask began.
+		latest, first time.Time
 	}
 	ask := func(p *probe) func(ctx context.Context, host string) (runtimeInventory, error) {
 		return func(ctx context.Context, host string) (runtimeInventory, error) {
 			p.mu.Lock()
 			p.calls[host]++
+			if p.first.IsZero() {
+				p.first = time.Now()
+			}
 			if dl, ok := ctx.Deadline(); !ok {
 				p.latest = time.Now().Add(time.Hour)
 			} else if dl.After(p.latest) {
@@ -302,9 +330,10 @@ func TestSettleFailedSourceMigrations_AsksEachTargetOnceWithinABudget(t *testing
 		vms := vmsFor("dead-a", "dead-b", "dead-c", "dead-d", "dead-e", "dead-f")
 		start := time.Now()
 		got := s.SettleFailedSourceMigrations(ctx, "src", vms, time.Time{})
-		// Every ask ends by the budget, not by its own timeout past it.
-		if late := p.latest.Sub(start); late > 250*time.Millisecond+50*time.Millisecond {
-			t.Fatalf("an ask was given until %s after the pass began, past its 250ms budget", late)
+		// Every ask ends by the budget, set before the first ask began, not
+		// by its own timeout past it.
+		if late := p.latest.Sub(p.first); late > 250*time.Millisecond {
+			t.Fatalf("an ask was given until %s after the first ask began, past the pass's 250ms budget", late)
 		}
 		if el := time.Since(start); el > 2*time.Second {
 			t.Fatalf("the pass took %s against a 250ms budget (6 dead targets at 200ms each, 1 at a time)", el)

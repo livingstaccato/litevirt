@@ -3309,15 +3309,26 @@ answer holds only its own VMs.
     (`virsh start` or `virsh resume`) and the next poll records it there;
   - the record names no target: find where the guest runs, and
     `lv doctor repair-owner <vm> <host>` records it there;
-  - a Secure Boot / vTPM VM is never moved by its record alone. Its target
-    does not answer: once it is powered off, `lv host fence-confirm <target>`,
-    and the next poll goes on with the recovery. Its target holds it paused:
+  - a Secure Boot / vTPM VM is never moved by its record alone, and
+    failover never restarts one: its NVRAM and TPM state live on its source
+    and its target. Its target does not answer: no `lv` command can start
+    it while both hosts are down; bring one back. When the target answers
+    again, the next poll names the step for the copy it holds. When the
+    source comes back, its daemon takes the move up from its own records
+    (`firmware_migration_target_unreachable` while the target does not
+    answer); once the target is powered off and
+    `lv host fence-confirm <target>` records it, the source resolves the
+    move by fence and records the VM stopped there, and `lv start <vm>`
+    starts it from the source's firmware state. Its target holds it paused:
     once the source is powered off, `lv host fence-confirm <source>`, then
     `lv doctor firmware-move <vm> --adopt-target-copy` adopts that copy,
     records it on the target and resumes it. Its target runs it, or holds it
     shut off: no `lv` command settles that yet. Pause it on the target
     (`virsh suspend <vm>`, or `virsh start --paused <vm>` for a shut-off
-    copy); the next poll then names the steps for a paused copy.
+    copy); the next poll then names the steps for a paused copy. A copy in
+    any other state (pm-suspended, crashed, shutting down) has no `lv`
+    command and no host-side step known to be safe: contact the litevirt
+    maintainers before acting on it.
 
 ### A firmware move record cannot be read (`firmware_migration_record_unreadable`)
 

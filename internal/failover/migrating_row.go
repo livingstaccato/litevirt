@@ -81,8 +81,9 @@ func (c *Coordinator) settleMigratingVMs(ctx context.Context, h *corrosion.HostR
 	}
 	askBy := c.migratingAskBy
 	if askBy.IsZero() {
-		// recoverWorkloads called outside run (a test): a budget of its own.
-		askBy = c.askClock().Add(MigratingAskBudget)
+		// No poll started a budget (run sets it first): ask nothing, and
+		// hold, rather than give this host a budget of its own.
+		askBy = c.askClock()
 	}
 	return c.SettleMigratingRows(ctx, h.Name, migrating, askBy)
 }

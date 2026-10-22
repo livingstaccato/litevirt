@@ -69,6 +69,15 @@ type Server struct {
 	// (host_updates.go).
 	hostUpdates HostUpdatesConfig
 
+	// memorySnapshot is this node's memory snapshot tuning
+	// (memory_snapshot.*, SetMemorySnapshotTuning); zero values are the
+	// libvirt package defaults.
+	memorySnapshot MemorySnapshotTuning
+	// captureReg coordinates memory snapshot captures with the partition
+	// pauser (CaptureRegistry).
+	captureReg     *lv.CaptureRegistry
+	captureRegOnce sync.Once
+
 	// replRuns is each replication schedule's reporting state
 	// (replication_outcome.go).
 	replRuns replRuns

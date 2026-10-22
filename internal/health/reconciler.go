@@ -88,6 +88,9 @@ type imagePullFlight struct {
 // and starts them. It also detects split-brain conditions where a VM
 // is running locally in libvirt but corrosion says it belongs to another host.
 type Reconciler struct {
+	// captures is the host's memory snapshot capture registry
+	// (SetCaptureRegistry).
+	captures *lv.CaptureRegistry
 	// ioPausedWarn rate-limits the io-paused sweep's write-failure
 	// warnings (io_paused.go).
 	ioPausedWarn ioPausedWarnings
@@ -377,6 +380,11 @@ func selfFenceHardGate(g runtimeGate) bool { return g != nil && g.SelfFenced() }
 
 // SetGate injects the split-brain safety gate (the health.Checker).
 func (r *Reconciler) SetGate(g runtimeGate) { r.gate = g }
+
+// SetCaptureRegistry wires the host's memory snapshot capture registry: a
+// settle that drops a VM's pause record drops the pauser's hold with it.
+// Set before the reconciler runs.
+func (r *Reconciler) SetCaptureRegistry(c *lv.CaptureRegistry) { r.captures = c }
 
 // SetCancelledStartProbe wires the probe that says whether this host holds a
 // start of the VM `lv stop --force` cancelled while libvirt had not answered

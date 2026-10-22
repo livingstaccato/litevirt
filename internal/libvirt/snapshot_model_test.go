@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
 
@@ -61,6 +62,9 @@ type libvirt10 struct {
 	consolePasswd string
 	// defined is the last XML DomainDefineXML was handed.
 	defined string
+	// qemu models the QEMU process and the guest's vCPUs for memory
+	// snapshots (snapshot_capture_model_test.go).
+	qemu qemuModel
 }
 
 // withConsole adds the VNC console to a model dump: with its password only
@@ -107,8 +111,11 @@ func metadataOf(x string) string {
 
 type modelSnap struct {
 	name, parent string
-	overlays     map[string]string // dev → the overlay the snapshot created (<disks>)
-	bases        map[string]string // dev → the disk it was taken of (<domain>)
+	// memory is the external memory image a full-system snapshot wrote
+	// (<memory snapshot='external' file=...>), "" for a disk-only one.
+	memory   string
+	overlays map[string]string // dev → the overlay the snapshot created (<disks>)
+	bases    map[string]string // dev → the disk it was taken of (<domain>)
 }
 
 var _ snapshotAPI = (*libvirt10)(nil)
@@ -140,9 +147,9 @@ func newLibvirt10Disks(t *testing.T, n int) *libvirt10 {
 			t.Skipf("%s not installed", bin)
 		}
 	}
-	oldPoll, oldSettle := revertUndefinePoll, revertUndefineSettle
-	revertUndefinePoll, revertUndefineSettle = 0, 0
-	t.Cleanup(func() { revertUndefinePoll, revertUndefineSettle = oldPoll, oldSettle })
+	oldPoll, oldSettle, oldSleep := revertUndefinePoll, revertUndefineSettle, captureSleep
+	revertUndefinePoll, revertUndefineSettle, captureSleep = 0, 0, func(time.Duration) {}
+	t.Cleanup(func() { revertUndefinePoll, revertUndefineSettle, captureSleep = oldPoll, oldSettle, oldSleep })
 	dir := t.TempDir()
 	disks := map[string]string{}
 	for i := 0; i < n; i++ {
@@ -162,6 +169,7 @@ func newLibvirt10Disks(t *testing.T, n int) *libvirt10 {
 		dom:   &modelDomain{name: "vm", disks: devs, state: golibvirt.DomainRunning, persistent: true, metadata: litevirtMetadata},
 		snaps: map[string]*modelSnap{},
 		saved: map[string]string{},
+		qemu:  qemuModel{stoppedAt: -1, pid: 1, restarts: 1},
 	}
 }
 
@@ -306,7 +314,7 @@ func (m *libvirt10) DomainGetXMLDesc(dom golibvirt.Domain, f golibvirt.DomainXML
 	if err != nil {
 		return "", err
 	}
-	return m.withConsole(domainXMLWithChains(d.name, d.disks, d.chainsOf(), d.metadata), f&golibvirt.DomainXMLSecure != 0), nil
+	return m.withConsole(m.decorate(domainXMLWithChains(d.name, d.disks, d.chainsOf(), d.metadata)), f&golibvirt.DomainXMLSecure != 0), nil
 }
 
 func (m *libvirt10) DomainDestroy(dom golibvirt.Domain) error {
@@ -421,7 +429,8 @@ func (m *libvirt10) DomainCreate(dom golibvirt.Domain) error {
 	if err := m.openDisks(d); err != nil {
 		return err
 	}
-	d.state = golibvirt.DomainRunning
+	m.qemuStarted()
+	m.startCPUs(d)
 	return nil
 }
 
@@ -431,7 +440,7 @@ func (m *libvirt10) DomainCreateWithFlags(dom golibvirt.Domain, flags uint32) (g
 	}
 	if flags&uint32(golibvirt.DomainStartPaused) != 0 {
 		m.mu.Lock()
-		m.dom.state = golibvirt.DomainPaused
+		m.stopCPUs(m.dom)
 		m.mu.Unlock()
 	}
 	return dom, nil
@@ -447,7 +456,7 @@ func (m *libvirt10) DomainResume(dom golibvirt.Domain) error {
 	if d.state != golibvirt.DomainPaused {
 		return fmt.Errorf("Requested operation is not valid: domain is not paused")
 	}
-	d.state = golibvirt.DomainRunning
+	m.startCPUs(d)
 	return nil
 }
 
@@ -476,6 +485,12 @@ func (m *libvirt10) DomainRestoreFlags(from string, dxml golibvirt.OptString, _ 
 		return err
 	}
 	m.dom = d
+	// A restore is a new QEMU process reading the whole image back.
+	m.qemuStarted()
+	m.qemu.now += m.ramTime(m.ramBytes())
+	if m.qemu.stoppedAt < 0 {
+		m.qemu.stoppedAt = m.qemu.now
+	}
 	return nil
 }
 
@@ -504,7 +519,11 @@ func snapXMLOf(s *modelSnap, domName string) string {
 	if s.parent != "" {
 		fmt.Fprintf(&b, "<parent><name>%s</name></parent>", s.parent)
 	}
-	b.WriteString("<state>disk-snapshot</state><memory snapshot='no'/><disks>")
+	if s.memory != "" {
+		fmt.Fprintf(&b, "<state>running</state><memory snapshot='external' file='%s'/><disks>", s.memory)
+	} else {
+		b.WriteString("<state>disk-snapshot</state><memory snapshot='no'/><disks>")
+	}
 	for _, dev := range sortedKeys(s.overlays) {
 		fmt.Fprintf(&b, "<disk name='%s' snapshot='external' type='file'><driver type='qcow2'/><source file='%s'/></disk>", dev, s.overlays[dev])
 	}
@@ -520,6 +539,10 @@ func parseModelSnap(x string) *modelSnap {
 		Parent struct {
 			Name string `xml:"name"`
 		} `xml:"parent"`
+		Memory struct {
+			Snapshot string `xml:"snapshot,attr"`
+			File     string `xml:"file,attr"`
+		} `xml:"memory"`
 		Disks struct {
 			Disk []struct {
 				Name     string `xml:"name,attr"`
@@ -534,6 +557,9 @@ func parseModelSnap(x string) *modelSnap {
 		return nil
 	}
 	s := &modelSnap{name: v.Name, parent: v.Parent.Name, overlays: map[string]string{}, bases: parseSnapshotDomainDisks(x)}
+	if v.Memory.Snapshot == "external" {
+		s.memory = v.Memory.File
+	}
 	for _, d := range v.Disks.Disk {
 		if d.Snapshot == "external" && d.Source.File != "" {
 			s.overlays[d.Name] = d.Source.File
@@ -574,12 +600,29 @@ func (m *libvirt10) DomainSnapshotCreateXML(dom golibvirt.Domain, x string, flag
 		return golibvirt.DomainSnapshot{Name: s.name, Dom: dom}, nil
 	}
 	if flags&uint32(golibvirt.DomainSnapshotCreateDiskOnly) == 0 {
-		return golibvirt.DomainSnapshot{}, fmt.Errorf("the model takes disk-only snapshots only")
+		return m.createFullSystem(d, dom, x, flags)
 	}
+	if flags&uint32(golibvirt.DomainSnapshotCreateLive) != 0 {
+		return golibvirt.DomainSnapshot{}, errLiveNeedsMemory
+	}
+	m.qemu.creates = append(m.qemu.creates, createCall{flags: flags})
 	name := xmlName(x)
 	if _, ok := m.snaps[name]; ok {
 		return golibvirt.DomainSnapshot{}, fmt.Errorf("snapshot %s exists", name)
 	}
+	s, err := m.switchDisks(d, name, x)
+	if err != nil {
+		return golibvirt.DomainSnapshot{}, err
+	}
+	m.snaps[name] = s
+	m.current = name
+	return golibvirt.DomainSnapshot{Name: name, Dom: dom}, nil
+}
+
+// switchDisks cuts every disk of d over to a new overlay for snapshot name,
+// as qemuSnapshotCreateActiveExternalDisks does, and returns the snapshot
+// (not yet registered). Caller holds m.mu.
+func (m *libvirt10) switchDisks(d *modelDomain, name, x string) (*modelSnap, error) {
 	explicit := map[string]string{}
 	if sx := parseModelSnap(x); sx != nil {
 		explicit = sx.overlays
@@ -592,7 +635,7 @@ func (m *libvirt10) DomainSnapshotCreateXML(dom golibvirt.Domain, x string, flag
 			ov = e
 		}
 		if _, err := os.Stat(ov); err == nil {
-			return golibvirt.DomainSnapshot{}, fmt.Errorf("external snapshot file for disk %s already exists and is not a block device: %s", dev, ov)
+			return nil, fmt.Errorf("external snapshot file for disk %s already exists and is not a block device: %s", dev, ov)
 		}
 		run(m.t, "qemu-img", "create", "-q", "-f", "qcow2", "-F", fmtOf(src), "-b", src, ov)
 		s.overlays[dev], s.bases[dev] = ov, src
@@ -603,9 +646,7 @@ func (m *libvirt10) DomainSnapshotCreateXML(dom golibvirt.Domain, x string, flag
 		}
 		d.disks[dev] = ov
 	}
-	m.snaps[name] = s
-	m.current = name
-	return golibvirt.DomainSnapshot{Name: name, Dom: dom}, nil
+	return s, nil
 }
 
 func (m *libvirt10) children(name string) []*modelSnap {
@@ -673,6 +714,7 @@ func (m *libvirt10) DomainSnapshotDelete(snap golibvirt.DomainSnapshot, flags go
 			m.unlinks = append(m.unlinks, s.bases[dev])
 			m.touched = append(m.touched, s.bases[dev])
 		}
+		m.unlinkMemory(s)
 		delete(m.snaps, s.name)
 		return nil
 	}
@@ -719,6 +761,7 @@ func (m *libvirt10) DomainSnapshotDelete(snap golibvirt.DomainSnapshot, flags go
 			c.bases[mg.dev] = mg.base
 		}
 	}
+	m.unlinkMemory(s)
 	m.drop(s)
 	return nil
 }
@@ -767,8 +810,10 @@ func (m *libvirt10) snapshot(name string) {
 	}
 }
 
-// memorySnapshot is snapshot plus the RAM image CreateLiveSnapshot saves,
-// which restores the domain onto its new overlays.
+// memorySnapshot is what an older litevirt's memory snapshot left: a
+// disk-only snapshot plus a RAM image DomainSaveFlags wrote AFTER the
+// overlay cut-over, so the image's definition names the new overlays. Rows
+// of such snapshots stay on clusters through a rolling upgrade.
 func (m *libvirt10) memorySnapshot(name string) string {
 	m.t.Helper()
 	m.snapshot(name)

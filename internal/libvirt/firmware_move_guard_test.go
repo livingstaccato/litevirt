@@ -266,9 +266,10 @@ func fwPrims() map[FirmwareOp][]fwPrim {
 				return e.client.RevertToLiveSnapshot(fwTestVM, "s1", "/nonexistent", nil, nil)
 			}},
 			{name: "restore", refuseOnly: true, run: func(e *fwEnv) error { return e.client.restoreWithRetry(fwTestVM, "/nonexistent", "") }},
-			// The memory snapshot's restore: asked before the suspend.
+			// The point a memory snapshot records is one a revert starts the
+			// guest from: asked before the suspend.
 			{name: "Client.CreateLiveSnapshot", refuseOnly: true, run: func(e *fwEnv) error {
-				_, _, err := e.client.CreateLiveSnapshot(fwTestVM, "s1", "/nonexistent", nil)
+				_, _, err := e.client.CreateLiveSnapshot(fwTestVM, "s1", "/nonexistent", CaptureOptions{})
 				return err
 			}},
 		},
@@ -277,6 +278,12 @@ func fwPrims() map[FirmwareOp][]fwPrim {
 				return resumeDomain(e.api, e.guard, FirmwareCall{Op: OpResume, Name: fwTestVM})
 			}, acted: func(e *fwEnv) bool { return e.api.called("resume") }},
 			{name: "Client.ResumeDomain", refuseOnly: true, run: func(e *fwEnv) error { return e.client.ResumeDomain(fwTestVM) }},
+			// The memory snapshot pauses and resumes the guest: asked before
+			// the suspend, so a refusal never leaves it paused.
+			{name: "Client.CreateLiveSnapshot", refuseOnly: true, run: func(e *fwEnv) error {
+				_, _, err := e.client.CreateLiveSnapshot(fwTestVM, "s1", "/nonexistent", CaptureOptions{})
+				return err
+			}},
 		},
 		OpStop: {
 			{name: "DestroyDomain", dom: running, run: func(e *fwEnv) error { return destroyDomain(e.api, e.guard, fwTestVM) },
@@ -287,12 +294,6 @@ func fwPrims() map[FirmwareOp][]fwPrim {
 				acted: func(e *fwEnv) bool { return e.api.called("destroy") }},
 			{name: "Client.DestroyDomain", refuseOnly: true, run: func(e *fwEnv) error { return e.client.DestroyDomain(fwTestVM) }},
 			{name: "Client.ShutdownDomain", refuseOnly: true, run: func(e *fwEnv) error { return e.client.ShutdownDomain(fwTestVM) }},
-			// The memory snapshot's save stops the guest: asked before the
-			// suspend, so a refusal never leaves it saved and stopped.
-			{name: "Client.CreateLiveSnapshot", refuseOnly: true, run: func(e *fwEnv) error {
-				_, _, err := e.client.CreateLiveSnapshot(fwTestVM, "s1", "/nonexistent", nil)
-				return err
-			}},
 		},
 		OpDefine: {
 			{name: "DefineDomain", run: func(e *fwEnv) error {
@@ -864,14 +865,15 @@ func TestWipeFirmwareMoveSource_ReportsFailure(t *testing.T) {
 	}
 }
 
-// I-2: a memory snapshot asks the guard for the stop (the RAM save) AND the
-// start (the restore) before it suspends anything; either refusal alone
-// refuses it. The client here has no libvirt connection: a call that got past
+// I-2: a memory snapshot asks the guard for the resume that ends it AND the
+// start a revert makes from it before it suspends anything; either refusal
+// alone refuses it (together: every record that names the VM, as the old
+// save+restore capture's stop+start did). The client here has no libvirt connection: a call that got past
 // the guard would panic on it.
 //
 // Mutation: drop either op from CreateLiveSnapshot's check — red.
-func TestCreateLiveSnapshot_AsksStopAndStart(t *testing.T) {
-	for _, only := range []FirmwareOp{OpStop, OpStart} {
+func TestCreateLiveSnapshot_AsksResumeAndStart(t *testing.T) {
+	for _, only := range []FirmwareOp{OpResume, OpStart} {
 		t.Run(string(only), func(t *testing.T) {
 			refused := errors.New("refused")
 			c := &Client{}
@@ -888,7 +890,7 @@ func TestCreateLiveSnapshot_AsksStopAndStart(t *testing.T) {
 						err = fmt.Errorf("reached libvirt: %v", r)
 					}
 				}()
-				_, _, err = c.CreateLiveSnapshot(fwTestVM, "s1", "/nonexistent", nil)
+				_, _, err = c.CreateLiveSnapshot(fwTestVM, "s1", "/nonexistent", CaptureOptions{})
 			}()
 			if !errors.Is(err, refused) {
 				t.Fatalf("err = %v, want the %s refusal before any libvirt call", err, only)

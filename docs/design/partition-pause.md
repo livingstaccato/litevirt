@@ -285,6 +285,37 @@ gone. A container still present keeps its record and stays frozen.
 A memory snapshot, which resumes the guest when it finishes, is refused for a VM
 a record holds, and `CreateLiveSnapshot` refuses any paused domain.
 
+**The pause wins over a memory snapshot in flight.** A capture registers its
+VM in the host's capture registry (`libvirt.CaptureRegistry`, shared by the
+gRPC server and the pauser) for as long as it runs. Before the pauser pauses
+a VM it takes a hold on it there:
+
+1. When a capture of the VM is in flight, the hold aborts the capture's
+   libvirt job (`virDomainAbortJob`) and waits for libvirt's job cleanup to
+   end. The wait is at most one pause call's timeout, cut to what the pass
+   has left before its suspend (so the suspend still ends within E), and
+   nothing in it blocks past it: the aborts run in the background, the
+   capture's settle lock is per VM and the hold gives up on it at the
+   deadline, and the registry's own lock is never held across a libvirt
+   call. That cleanup resumes a guest
+   that was running when the snapshot began, so the pauser's suspend lands
+   after it. The abort is repeated until the job has ended: a capture checks
+   for a hold under the registry's lock just before it starts its job, and
+   refuses to start one once held, but a hold taken just after that check
+   finds no job yet. A VM a capture holds paused reads paused, and is still
+   the pauser's to record and suspend.
+2. When the wait runs out (QEMU did not act on the abort, libvirt did not
+   answer it, or the capture was still deciding a resume), the pauser
+   suspends anyway. libvirt's cleanup may then resume the guest when the job
+   ends, and the capture re-suspends it: for that moment the pause does not
+   hold. The pauser therefore counts the pause as failed (§3.4): it raises
+   `partition_pause_failed`, and self-fences when the watchdog is verified.
+3. A capture decides its last step under the registry's lock: with a hold or
+   a pause record it never resumes the guest, and re-suspends one it finds
+   running. Otherwise it resumes only a guest it suspended itself.
+
+The pauser drops the hold with the record.
+
 ### 3.4 Pause failure
 
 If a suspend or a freeze fails, or its record cannot be written where

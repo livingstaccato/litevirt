@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -407,5 +408,26 @@ func TestSettle_VMSettledResolvesWhenTheRowNamesThisHostAgain(t *testing.T) {
 	f.r.selfFence(ctx)
 	if c, _ := settledRow(t, f); c.Lifecycle != corrosion.ConditionResolved {
 		t.Fatalf("vm_settled is %s while vm-a's row names node-a again, want resolved", c.Lifecycle)
+	}
+}
+
+// A settle that drops a VM's pause record drops the pauser's capture
+// registry hold with it: a kept hold would refuse every later memory
+// snapshot of the name on this host.
+//
+// Mutation: drop the Release in dropMatchingPause — red.
+func TestSettle_DroppingThePauseRecordReleasesTheCaptureHold(t *testing.T) {
+	f := newSettleFixture(t)
+	reg := lv.NewCaptureRegistry()
+	f.r.SetCaptureRegistry(reg)
+	reg.Hold("vm-a", time.Second) // the pauser's, taken when it paused vm-a
+	if st := f.run(); st != libvirtfake.StateShutdown {
+		t.Fatalf("vm-a is %s, want the settled copy stopped", st)
+	}
+	if _, ok, _ := ReadPauseRecord(f.dataDir, PauseKindVM, "vm-a"); ok {
+		t.Fatal("the pause record outlived the settled copy")
+	}
+	if reg.Holding("vm-a") {
+		t.Fatal("the capture hold outlived the pause record")
 	}
 }

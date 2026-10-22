@@ -375,6 +375,11 @@ type Fake struct {
 	// finds no job yet.
 	FailAbortMigration func(name string) error
 	abortedMigrations  map[string]int
+
+	// mem is each domain's memory-snapshot model, memClock the fake clock
+	// its pause windows are on (memsnap.go). Guarded by f.mu.
+	mem      map[string]*memState
+	memClock time.Duration
 }
 
 // New returns a Fake ready to use. Safe for concurrent use.
@@ -942,13 +947,17 @@ func (f *Fake) startDomain(name string, paused bool) error {
 	// and keeps them until it stops, whatever a later define says.
 	f.captureConsolePasswordsLocked(name, f.liveXMLLocked(name))
 	f.starts[name]++
+	ms := f.memLocked(name)
+	ms.qemuStarts++
+	ms.gen++
 	f.record("start", name, "")
 	return nil
 }
 
 // SuspendDomain pauses a RUNNING domain: it stays active (StatePaused) and
 // DomainStateReason reports reason "paused", as libvirt does. Suspending a
-// domain that is not running is an error, as in libvirt.
+// paused domain succeeds and changes nothing; suspending one that is not
+// active is an error, as in libvirt.
 func (f *Fake) SuspendDomain(name string) error {
 	defer f.daemon()()
 	if f.FailSuspendDomain != nil {
@@ -962,12 +971,25 @@ func (f *Fake) SuspendDomain(name string) error {
 	if !ok {
 		return fmt.Errorf("libvirtfake: domain %q not defined", name)
 	}
+	if st == StatePaused {
+		// As libvirt's qemuDomainSuspend: a paused domain is left as it is,
+		// and the call succeeds.
+		f.record("suspend", name, "already paused")
+		return nil
+	}
 	if st != StateRunning {
 		return fmt.Errorf("libvirtfake: domain %q is not running (%s)", name, st)
 	}
-	f.domains[name] = StatePaused
+	f.stopCPUsLocked(name)
 	delete(f.ioPaused, name)
 	f.record("suspend", name, "")
+	// A suspend during a live capture's memory write is the job's too
+	// (libvirt admits it): QEMU finishes the write with the vCPUs stopped.
+	if m := f.memLocked(name); m.liveJob != nil {
+		m.suspended = true
+		close(m.liveJob)
+		m.liveJob = nil
+	}
 	return nil
 }
 
@@ -2613,68 +2635,17 @@ func (f *Fake) FlattenSnapshot(domainName, snapshotName string) error {
 	return nil
 }
 
-func (f *Fake) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, captureSuspended func() error) (diskBytes, vmstateBytes int64, err error) {
+// CreateLiveSnapshot mirrors libvirt.Client.CreateLiveSnapshot: the firmware
+// move guard is asked for a start and a resume, then the production capture
+// runs over the fake's model of libvirt (memsnap.go).
+func (f *Fake) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, o libvirt.CaptureOptions) (diskBytes, vmstateBytes int64, err error) {
 	defer f.daemon()()
-	// As libvirt.Client: the capture stops and restarts the guest, so both
-	// are asked before anything is done.
-	for _, op := range []libvirt.FirmwareOp{libvirt.OpStop, libvirt.OpStart} {
+	for _, op := range []libvirt.FirmwareOp{libvirt.OpStart, libvirt.OpResume} {
 		if err := f.fwCheck(libvirt.FirmwareCall{Op: op, Name: domainName}); err != nil {
 			return 0, 0, fmt.Errorf("memory snapshot of %q: %w", domainName, err)
 		}
 	}
-	f.mu.Lock()
-	// As libvirt.Client's preflight: a device whose state cannot be saved
-	// refuses the snapshot before the freeze and the overlay cutover.
-	blockers, berr := libvirt.MemorySnapshotBlockers(f.liveXMLLocked(domainName))
-	if berr == nil && len(blockers) > 0 {
-		f.mu.Unlock()
-		return 0, 0, &libvirt.PassthroughSnapshotError{Domain: domainName, Devices: blockers}
-	}
-	if f.snapshots[domainName] == nil {
-		f.snapshots[domainName] = map[string]struct{}{}
-	}
-	f.snapshots[domainName][snapshotName] = struct{}{}
-	f.cutoverDisks(domainName, snapshotName)
-	f.record("snapshot-live", domainName, snapshotName)
-	unsaveable := unsaveableHostdev(f.liveXMLLocked(domainName))
-	f.mu.Unlock()
-	// As libvirt's save (qemuMigrationSrcIsAllowedHostdev), reached only if
-	// the preflight above is bypassed: a domain holding a non-USB <hostdev>
-	// cannot have its state written, and the save is refused AFTER the
-	// overlay has already cut over.
-	if unsaveable != "" {
-		return 0, 0, fmt.Errorf("save guest memory: Requested operation is not valid: cannot migrate a domain with <hostdev mode='subsystem' type='%s'>", unsaveable)
-	}
-	if f.FailCreateLiveSnapshot != nil {
-		if err := f.FailCreateLiveSnapshot(domainName, snapshotName); err != nil {
-			return 0, 0, err
-		}
-	}
-	if captureSuspended != nil {
-		if err := captureSuspended(); err != nil {
-			return 0, 0, err
-		}
-	}
-	return time.Now().UnixNano(), 4096, nil
-}
-
-// unsaveableHostdev returns the type of the first <hostdev> in domXML whose
-// state libvirt cannot save (any but usb), or "".
-func unsaveableHostdev(domXML string) string {
-	var d struct {
-		Hostdevs []struct {
-			Type string `xml:"type,attr"`
-		} `xml:"devices>hostdev"`
-	}
-	if xml.Unmarshal([]byte(domXML), &d) != nil {
-		return ""
-	}
-	for _, h := range d.Hostdevs {
-		if h.Type != "usb" {
-			return h.Type
-		}
-	}
-	return ""
+	return libvirt.CaptureMemorySnapshot(captureAPI{f}, domainName, snapshotName, vmstatePath, o)
 }
 
 // SetDiskSource sets a domain's disk source (test helper).
@@ -2775,6 +2746,12 @@ func (f *Fake) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string
 	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpStart, Name: domainName}); err != nil {
 		return fmt.Errorf("revert %s: %w", domainName, err)
 	}
+	// As libvirt.revertToLiveSnapshot: nothing is torn down when the RAM
+	// image is gone, and the restore reads it back.
+	gen, err := readVMState(vmstatePath, domainName)
+	if err != nil {
+		return fmt.Errorf("vmstate image %q missing — cannot restore memory snapshot: %w", vmstatePath, err)
+	}
 	f.mu.Lock()
 	if _, ok := f.snapshots[domainName][snapshotName]; !ok {
 		f.mu.Unlock()
@@ -2807,6 +2784,12 @@ func (f *Fake) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("revert-live", domainName, snapshotName+" dxml="+restoreXML)
+	// The restore is a new QEMU process, holding the image's memory.
+	ms := f.memLocked(domainName)
+	ms.qemuStarts++
+	if gen >= 0 {
+		ms.gen = gen
+	}
 	if saved != "" {
 		f.xml[domainName] = saved
 	}

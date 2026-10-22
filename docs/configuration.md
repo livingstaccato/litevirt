@@ -1139,6 +1139,54 @@ Boot VM does not use `network`: its data goes to the target's cluster address
 (its memory in libvirt's tunnel), with a `vm.migrate.network_fallback` event
 on the VM when `network` is set.
 
+## Memory snapshots
+
+```yaml
+memory_snapshot:
+  pause_budget: 1s      # default 1s [measure]
+  live_deadline: 2m     # default 2m [measure]
+```
+
+A memory snapshot (`lv snapshot create --memory`) is captured inside the VM's
+running QEMU process with libvirt's external memory snapshot. QEMU is not
+restarted: the guest keeps its process, its disk locks and its devices, and is
+not paused for a read of its RAM back. Earlier releases saved the guest and
+restored it, pausing it for a full write and a full read of its RAM.
+
+A VM with Secure Boot or a vTPM (and any VM whose definition carries UEFI
+NVRAM or a TPM) is captured with its vCPUs stopped: litevirt pauses it,
+libvirt writes its RAM and switches its disks to their overlays, the firmware
+state is captured at that instant, and the guest resumes. The pause is one
+write of its RAM.
+
+Any other VM is captured live when it can be. litevirt first measures the
+guest's dirty rate, then predicts the precopy QEMU would run: RAM is written
+while the guest runs, then what it dirtied meanwhile, until the remainder fits
+QEMU's downtime limit. If the predicted final pause is longer than
+`pause_budget`, the VM is captured stopped instead, because a precopy that
+cannot converge only adds work before the same pause. A live capture that
+runs longer than `live_deadline` (the guest got busier than measured) is
+finished with the guest suspended, and it resumes when the capture ends.
+A guest whose predicted final set fits `pause_budget` but never shrinks below
+QEMU's downtime limit is captured live and runs the whole `live_deadline`
+before that suspend. When the dirty rate cannot be measured, the daemon logs a
+warning and captures live with the deadline capped at twice the predicted
+write of the guest's RAM, and at least a second.
+
+A partition pause wins over a capture in flight: the capture is aborted, the
+guest is paused, and litevirt never resumes it. If libvirt's job outlives the
+pauser's wait, libvirt can resume the guest when the job ends; the capture
+re-suspends it and the pause counts as failed (see
+[partition pause](design/partition-pause.md#33-the-durable-record)). A pause
+made outside litevirt during a capture (`virsh suspend`) is not protected: the
+capture, or libvirt, resumes the guest.
+
+Both values are Go durations and must be positive, and `live_deadline` is at
+most an hour. The daemon refuses to start with one that is not. They are read
+on the host that captures the snapshot, at daemon start, so set them the same
+on every host. The defaults are design
+targets until they are measured on hardware [measure].
+
 ## Capacity and overcommit
 
 How much of a host litevirt is willing to hand to workloads. Cluster-wide

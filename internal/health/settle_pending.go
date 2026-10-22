@@ -234,6 +234,9 @@ type settleRecorder struct {
 	// foreignLogged rate-limits the line for a record another host name wrote
 	// (file name → last logged).
 	foreignLogged sync.Map
+	// captures is the host's memory snapshot registry: dropping a VM's
+	// pause record drops the pauser's hold with it.
+	captures *lv.CaptureRegistry
 	// waitLogged rate-limits the line for a record waiting on a copy that is
 	// neither live nor shut off (file name → last logged).
 	waitLogged sync.Map
@@ -502,6 +505,10 @@ func (w *settleRecorder) dropMatchingPause(rec settlePending) {
 	}
 	if err := RemovePauseRecord(w.dataDir, rec.Kind, rec.Name); err != nil {
 		slog.Warn("partition-settle: could not drop the pause record", "kind", rec.Kind, "name", rec.Name, "error", err)
+		return
+	}
+	if rec.Kind == PauseKindVM {
+		w.captures.Release(rec.Name)
 	}
 }
 
@@ -559,6 +566,7 @@ func (r *Reconciler) retryPendingSettles(ctx context.Context, localDomains []str
 func (r *Reconciler) settleRec() *settleRecorder {
 	r.settleRecOnce.Do(func() {
 		r.settleRecorder = &settleRecorder{db: r.db, host: r.hostName, dataDir: r.dataDir, now: func() time.Time { return r.now() },
+			captures: r.captures,
 			fault: func(step string) error {
 				if r.settleFault == nil {
 					return nil
@@ -573,6 +581,7 @@ func (r *Reconciler) settleRec() *settleRecorder {
 func (p *PartitionPauser) settleRec() *settleRecorder {
 	p.settleRecOnce.Do(func() {
 		p.settleRecorder = &settleRecorder{db: p.db, host: p.host, dataDir: p.dataDir, now: func() time.Time { return p.now() },
+			captures: p.captures,
 			fault: func(step string) error {
 				if p.settleFault == nil {
 					return nil

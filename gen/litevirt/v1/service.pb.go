@@ -45744,12 +45744,19 @@ func (x *PreflightRecreateVMRequest) GetSpec() *VMSpec {
 // sshd anew (no cached evaluation) and logs in to it, before it answers; the
 // fan-out passes it on. An older host ignores it and answers
 // evaluated_for_request=false.
+//
+// reevaluate_hosts narrows reevaluate: empty, every answering host
+// re-evaluates; else only the named ones do (the fan-out sends reevaluate
+// only to named peers and reads the others plainly). The answering host,
+// when not named, still marks its own node reevaluate_outcome "not asked",
+// so a reader can tell it knows reevaluate. A name no host has is ignored.
 type FenceSSHStatusRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	FanOut        bool                   `protobuf:"varint,1,opt,name=fan_out,json=fanOut,proto3" json:"fan_out,omitempty"`
-	Reevaluate    bool                   `protobuf:"varint,2,opt,name=reevaluate,proto3" json:"reevaluate,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	FanOut          bool                   `protobuf:"varint,1,opt,name=fan_out,json=fanOut,proto3" json:"fan_out,omitempty"`
+	Reevaluate      bool                   `protobuf:"varint,2,opt,name=reevaluate,proto3" json:"reevaluate,omitempty"`
+	ReevaluateHosts []string               `protobuf:"bytes,3,rep,name=reevaluate_hosts,json=reevaluateHosts,proto3" json:"reevaluate_hosts,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *FenceSSHStatusRequest) Reset() {
@@ -45794,6 +45801,13 @@ func (x *FenceSSHStatusRequest) GetReevaluate() bool {
 		return x.Reevaluate
 	}
 	return false
+}
+
+func (x *FenceSSHStatusRequest) GetReevaluateHosts() []string {
+	if x != nil {
+		return x.ReevaluateHosts
+	}
+	return nil
 }
 
 // FenceSSHPeer is one host as the reporting host holds and reaches it.
@@ -45971,9 +45985,11 @@ type FenceSSHNode struct {
 	// reevaluate_outcome: set by a host whose build knows reevaluate, every
 	// time the request carries it: "proved" when evaluated_for_request is
 	// true, else why its re-evaluation proved nothing (it timed out, its sync
-	// failed, sshd could not be evaluated, no row was published). Empty: the
-	// host predates reevaluate, or was not asked. Only the host itself sets
-	// it, never the origin of a fan-out on a peer's behalf.
+	// failed, sshd could not be evaluated, no row was published), or "not
+	// asked" from the answering host when reevaluate_hosts leaves it out.
+	// Empty: the host predates reevaluate, or (a peer) was not asked. Only
+	// the host itself sets it, never the origin of a fan-out on a peer's
+	// behalf.
 	ReevaluateOutcome string `protobuf:"bytes,8,opt,name=reevaluate_outcome,json=reevaluateOutcome,proto3" json:"reevaluate_outcome,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
@@ -49822,12 +49838,13 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"load_error\x18\x04 \x01(\tR\tloadError\"E\n" +
 	"\x1aPreflightRecreateVMRequest\x12'\n" +
-	"\x04spec\x18\x01 \x01(\v2\x13.litevirt.v1.VMSpecR\x04spec\"P\n" +
+	"\x04spec\x18\x01 \x01(\v2\x13.litevirt.v1.VMSpecR\x04spec\"{\n" +
 	"\x15FenceSSHStatusRequest\x12\x17\n" +
 	"\afan_out\x18\x01 \x01(\bR\x06fanOut\x12\x1e\n" +
 	"\n" +
 	"reevaluate\x18\x02 \x01(\bR\n" +
-	"reevaluate\"\x9b\x03\n" +
+	"reevaluate\x12)\n" +
+	"\x10reevaluate_hosts\x18\x03 \x03(\tR\x0freevaluateHosts\"\x9b\x03\n" +
 	"\fFenceSSHPeer\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x10\n" +
 	"\x03row\x18\x02 \x01(\tR\x03row\x12\x1d\n" +

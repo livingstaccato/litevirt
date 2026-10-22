@@ -294,3 +294,107 @@ func TestFleet_FenceSSH_ReevaluateReadFollowsTheEvaluation(t *testing.T) {
 		}
 	}
 }
+
+// TestFleet_FenceSSH_ReevaluateOnlyNamedHosts: reevaluate_hosts narrows who
+// re-evaluates. Asked through node-0 for node-2 and a name no host has, only
+// node-2's sshd is evaluated; the unknown name is ignored; node-0, not
+// named, marks itself "not asked" (so a reader still sees it knows
+// reevaluate); node-1 gets a plain read. node-1 runs an older build: given a
+// plain read when unnamed and reevaluate when named, which it ignores, it
+// proves nothing and carries no outcome, so the CLI falls back for it.
+//
+// Mutations: the fan-out asks every peer: node-1's handler sees reevaluate,
+// red; the origin re-evaluates itself unnamed: node-0's sshd is evaluated,
+// red; the origin leaves its own outcome empty unnamed: red.
+func TestFleet_FenceSSH_ReevaluateOnlyNamedHosts(t *testing.T) {
+	var evals sync.Map // name -> *atomic.Int32
+	count := func(name string) *atomic.Int32 {
+		v, _ := evals.LoadOrStore(name, new(atomic.Int32))
+		return v.(*atomic.Int32)
+	}
+	c, fs := fenceSSHFleetWith(t, 3, 2635, func(name string) bool { count(name).Add(1); return true },
+		func(string) string { return fencessh.ModeAuto })
+	for _, n := range c.Nodes {
+		n.Server.SetFenceSSH(fs[n.Name].agent)
+	}
+	publishAndRender(t, c, fs)
+
+	// node-1 is an older build; record what each of its reads asked.
+	var node1Asked []bool
+	var node1Mu sync.Mutex
+	for range 20 {
+		c.Nodes[1].HookUnary("GetFenceSSHStatus", func(ctx context.Context, req any, handler grpc.UnaryHandler) (any, error) {
+			r := proto.Clone(req.(*pb.FenceSSHStatusRequest)).(*pb.FenceSSHStatusRequest)
+			node1Mu.Lock()
+			node1Asked = append(node1Asked, r.GetReevaluate())
+			node1Mu.Unlock()
+			r.Reevaluate, r.ReevaluateHosts = false, nil
+			resp, err := handler(ctx, r)
+			if st, ok := resp.(*pb.FenceSSHStatus); ok {
+				for _, node := range st.GetNodes() {
+					node.EvaluatedForRequest, node.ReevaluateOutcome = false, ""
+				}
+			}
+			return resp, err
+		})
+	}
+	read := func(names ...string) map[string]*pb.FenceSSHNode {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 70*time.Second)
+		defer cancel()
+		st, err := c.SelfClient(c.Nodes[0]).GetFenceSSHStatus(ctx,
+			&pb.FenceSSHStatusRequest{FanOut: true, Reevaluate: true, ReevaluateHosts: names})
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]*pb.FenceSSHNode{}
+		for _, n := range st.GetNodes() {
+			out[n.GetHost()] = n
+		}
+		return out
+	}
+	before := map[string]int32{}
+	for _, n := range c.Nodes {
+		before[n.Name] = count(n.Name).Load()
+	}
+
+	got := read("node-2", "no-such-host")
+	if n := got["node-2"]; !n.GetEvaluatedForRequest() || n.GetReevaluateOutcome() != "proved" {
+		t.Fatalf("node-2, named: %+v", n)
+	}
+	if n := got["node-0"]; n.GetEvaluatedForRequest() || n.GetReevaluateOutcome() != "not asked" {
+		t.Fatalf("node-0, the origin, unnamed: %+v", n)
+	}
+	if n := got["node-1"]; n.GetEvaluatedForRequest() || n.GetReevaluateOutcome() != "" || n.GetError() != "" {
+		t.Fatalf("node-1, unnamed: %+v", n)
+	}
+	if _, ok := got["no-such-host"]; ok || len(got) != 3 {
+		t.Fatalf("the unknown name was answered for: %v", got)
+	}
+	for name, want := range map[string]int32{"node-0": 0, "node-1": 0, "node-2": 1} {
+		if d := count(name).Load() - before[name]; d != want {
+			t.Fatalf("%s's sshd was evaluated %d times, want %d", name, d, want)
+		}
+	}
+	node1Mu.Lock()
+	if len(node1Asked) != 1 || node1Asked[0] {
+		t.Fatalf("node-1, unnamed, was asked to re-evaluate: %v", node1Asked)
+	}
+	node1Mu.Unlock()
+
+	// Named, the older node-1 is sent reevaluate, ignores it, and proves
+	// nothing with no outcome: the CLI's time-based fallback, not a failure.
+	got = read("node-1")
+	if n := got["node-1"]; n.GetEvaluatedForRequest() || n.GetReevaluateOutcome() != "" {
+		t.Fatalf("node-1, older, named: %+v", n)
+	}
+	node1Mu.Lock()
+	if len(node1Asked) != 2 || !node1Asked[1] {
+		t.Fatalf("node-1, named, was not sent reevaluate: %v", node1Asked)
+	}
+	node1Mu.Unlock()
+	err, out, took := reevalInstall(t, c, fs, c.Nodes[0], 3*time.Second, 60*time.Second)
+	if err != nil || took < 3*time.Second {
+		t.Fatalf("with the older node-1: err %v after %s\n%s", err, took, out)
+	}
+}

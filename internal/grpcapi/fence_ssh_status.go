@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -58,13 +59,26 @@ func (s *Server) GetFenceSSHStatus(ctx context.Context, req *pb.FenceSSHStatusRe
 		out.Nodes = append(out.Nodes, n)
 		mu.Unlock()
 	}
+	// asked: whether host is to re-evaluate. reevaluate_hosts narrows it;
+	// a name no host has matches nothing.
+	asked := func(host string) bool {
+		names := req.GetReevaluateHosts()
+		return reevaluate && (len(names) == 0 || slices.Contains(names, host))
+	}
 	// This host re-evaluates alongside its peers, not before them.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if reevaluate {
+		switch {
+		case asked(s.hostName):
 			add(s.reevaluatedOwnFenceSSHNode(ctx))
-		} else {
+		case reevaluate:
+			// Not named, it still marks its own node, so a reader can tell
+			// this build (which knows reevaluate) from an older one.
+			n := s.ownFenceSSHNode(ctx)
+			n.ReevaluateOutcome = fenceSSHNotAsked
+			add(n)
+		default:
 			add(s.ownFenceSSHNode(ctx))
 		}
 	}()
@@ -75,7 +89,7 @@ func (s *Server) GetFenceSSHStatus(ctx context.Context, req *pb.FenceSSHStatusRe
 		wg.Add(1)
 		go func(name string) {
 			defer wg.Done()
-			add(s.peerFenceSSHNode(ctx, name, reevaluate))
+			add(s.peerFenceSSHNode(ctx, name, asked(name)))
 		}(h.Name)
 	}
 	wg.Wait()
@@ -128,6 +142,10 @@ func (s *Server) ownFenceSSHNode(ctx context.Context) *pb.FenceSSHNode {
 	}
 	return n
 }
+
+// fenceSSHNotAsked is the reevaluate_outcome of an answering host that a
+// re-evaluating read did not name.
+const fenceSSHNotAsked = "not asked"
 
 // fenceSSHReevaluateOutcome is this host's evaluated_for_request and
 // reevaluate_outcome: "proved" only for a proven evaluation and a status

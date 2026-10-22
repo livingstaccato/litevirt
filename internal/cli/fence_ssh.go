@@ -175,11 +175,24 @@ func InstallFenceSSH(ctx context.Context, c pb.LiteVirtClient, hosts []FenceSSHH
 	var why map[string]string
 	reevaluate := true
 	warnedOlderOrigin := false
+	// A host that confirmed stays confirmed for the run (the confirmation is
+	// point-in-time anyway), so each read asks only the selected hosts still
+	// pending to re-evaluate: never one outside --host, never one again.
+	confirmed := map[string]bool{}
 	for {
+		var pending []FenceSSHHost
+		var ask []string
+		for _, h := range hosts {
+			if !confirmed[h.Name()] {
+				pending = append(pending, h)
+				ask = append(ask, h.Name())
+			}
+		}
 		// The installs already happened: a read that fails is retried until
 		// the wait ends, and fails the run only then.
 		cctx, cancel := context.WithTimeout(ctx, fenceSSHStatusCall)
-		st, err := c.GetFenceSSHStatus(cctx, &pb.FenceSSHStatusRequest{FanOut: true, Reevaluate: reevaluate})
+		st, err := c.GetFenceSSHStatus(cctx, &pb.FenceSSHStatusRequest{FanOut: true, Reevaluate: reevaluate,
+			ReevaluateHosts: ask})
 		cancel()
 		if reevaluate && status.Code(err) == codes.PermissionDenied {
 			// Only an admin may have hosts re-evaluate; anyone else waits.
@@ -200,7 +213,12 @@ func InstallFenceSSH(ctx context.Context, c pb.LiteVirtClient, hosts []FenceSSHH
 				warnedOlderOrigin = true
 				fenceSSHWarnOlderOrigin(ctx, c, opt.Out)
 			}
-			why = fenceSSHUnconfirmed(st, hosts, doneAt, opt.now(), opt.FreshAfter)
+			why = fenceSSHUnconfirmed(st, pending, doneAt, opt.now(), opt.FreshAfter)
+			for _, h := range pending {
+				if _, no := why[h.Name()]; !no {
+					confirmed[h.Name()] = true
+				}
+			}
 			if len(why) == 0 || !opt.now().Before(deadline) {
 				break
 			}

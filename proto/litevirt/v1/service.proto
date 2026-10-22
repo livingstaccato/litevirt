@@ -6502,9 +6502,16 @@ message PreflightRecreateVMRequest {
 // sshd anew (no cached evaluation) and logs in to it, before it answers; the
 // fan-out passes it on. An older host ignores it and answers
 // evaluated_for_request=false.
+//
+// reevaluate_hosts narrows reevaluate: empty, every answering host
+// re-evaluates; else only the named ones do (the fan-out sends reevaluate
+// only to named peers and reads the others plainly). The answering host,
+// when not named, still marks its own node reevaluate_outcome "not asked",
+// so a reader can tell it knows reevaluate. A name no host has is ignored.
 message FenceSSHStatusRequest {
-    bool fan_out    = 1;
-    bool reevaluate = 2;
+    bool fan_out                      = 1;
+    bool reevaluate                   = 2;
+    repeated string reevaluate_hosts  = 3;
 }
 
 // FenceSSHPeer is one host as the reporting host holds and reaches it.
@@ -6550,9 +6557,11 @@ message FenceSSHNode {
     // reevaluate_outcome: set by a host whose build knows reevaluate, every
     // time the request carries it: "proved" when evaluated_for_request is
     // true, else why its re-evaluation proved nothing (it timed out, its sync
-    // failed, sshd could not be evaluated, no row was published). Empty: the
-    // host predates reevaluate, or was not asked. Only the host itself sets
-    // it, never the origin of a fan-out on a peer's behalf.
+    // failed, sshd could not be evaluated, no row was published), or "not
+    // asked" from the answering host when reevaluate_hosts leaves it out.
+    // Empty: the host predates reevaluate, or (a peer) was not asked. Only
+    // the host itself sets it, never the origin of a fan-out on a peer's
+    // behalf.
     string reevaluate_outcome = 8;
 }
 

@@ -1233,7 +1233,8 @@ accept the managed key. Its exit code is unchanged.
    accepting the managed key in its own row. Asked by an admin, each host
    re-evaluates its sshd for that read, logging in to it over the managed key, and
    proves the evaluation began after the read reached it, so a host confirms in
-   seconds. An upgraded host that cannot prove it (its agent did not finish within
+   seconds. Each read asks only the named hosts not yet confirmed; a host that
+   confirmed stays confirmed for the run. An upgraded host that cannot prove it (its agent did not finish within
    its bound) fails, with the reason. Only a host whose daemon is older than this
    counts a row read long enough after the change to reflect it (about two
    minutes); so does every host when the credential is not an admin's, and when the

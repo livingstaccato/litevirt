@@ -249,6 +249,40 @@ func TestFleet_ProjectAdoption_APartitionedHostHealsToTheSameRow(t *testing.T) {
 	}
 }
 
+// Scenario B, anti-entropy only (review m-T): a host that never takes the
+// adoption over the WAL (it refuses every push) takes it from anti-entropy
+// alone, and grants and bounds the same throughout.
+func TestFleet_ProjectAdoption_AnAntiEntropyOnlyHostTakesTheAdoption(t *testing.T) {
+	ctx := context.Background()
+	c, gates := adoptionFleet(t, 2705, "/acme")
+	a, cut := c.Nodes[0], c.Nodes[2]
+	before := fleetAdoptionView(t, cut, "/acme")
+	eventually(t, convergeTimeout, "the first use of project_adoption", func() bool {
+		return gates[a.Name].WithFeature(ctx, capabilities.FeatureProjectAdoption,
+			func(context.Context, capabilities.FeatureGrant) error { return nil }) == nil
+	})
+	c.WaitConverged(t, convergeTimeout)
+	restore := cut.RefuseRPCs("PushMutations")
+	defer restore()
+	if n, err := adoptionPass(t, a, gates[a.Name], true, time.Now().Add(365*24*time.Hour)).Run(ctx); err != nil || n != 1 {
+		t.Fatalf("adopt on %s: %d %v", a.Name, n, err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if strings.HasSuffix(fleetProjectRow(t, cut, "/acme"), "|"+adoptedAcme) {
+		t.Fatal("fixture: the adoption reached the cut host over the WAL")
+	}
+	aeRounds(t, c, 2)
+	if got := fleetAdoptionView(t, cut, "/acme"); got != before {
+		t.Fatalf("after anti-entropy the host grants or bounds differently:\n%s\nbefore:\n%s", got, before)
+	}
+	if row := fleetProjectRow(t, cut, "/acme"); row != fleetProjectRow(t, a, "/acme") || !strings.HasSuffix(row, "|"+adoptedAcme) {
+		t.Fatalf("the anti-entropy-only host holds %s, %s holds %s", row, a.Name, fleetProjectRow(t, a, "/acme"))
+	}
+	if k := cut.DB.UnresolvedTieCount(); k != 0 {
+		t.Fatalf("%d unresolved ties", k)
+	}
+}
+
 // Scenario C (re-review I-1): a host that saw the project deletes it while
 // partitioned, after another host adopted it. On heal the hosts that took the
 // adoption first hold the adopted tombstone and the deleter skips the older

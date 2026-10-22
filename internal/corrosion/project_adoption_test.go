@@ -46,6 +46,10 @@ func legacyProject(t *testing.T, c *Client, name string) {
 		{"pregrant" + sfx + "~p:none", root + "/vms/x", "Viewer"},
 		{"latched" + sfx + "~p:pre", root, "Admin"},
 		{"sentinel" + sfx, root, SentinelRole},
+		// Granted for another incarnation of the name: held before and
+		// after (the settle may retire it to NoAccess, which grants the
+		// same nothing).
+		{"older" + sfx + "~p:r0123456789abcdef0123456789abcdef", root, "Operator"},
 	} {
 		if err := c.Execute(ctx, roleBindingInsertSQL, b.id, b.path, b.role, "user:bob@local", 1, c.NowTS()); err != nil {
 			t.Fatal(err)
@@ -55,7 +59,8 @@ func legacyProject(t *testing.T, c *Client, name string) {
 }
 
 // adoptionView is what a receiver grants and bounds for project name: every
-// live binding's role, whether it is held, and its clock, and the quota read.
+// live binding's effective role (NoAccess when held, as the auth engine reads
+// it) and the quota read.
 func adoptionView(t *testing.T, c *Client, name string) string {
 	t.Helper()
 	ctx := context.Background()
@@ -65,7 +70,11 @@ func adoptionView(t *testing.T, c *Client, name string) string {
 	}
 	var out []string
 	for _, b := range bs {
-		out = append(out, fmt.Sprintf("%s=%s held=%v at=%s", b.ID, b.Role, b.Held, b.UpdatedAt))
+		role := b.Role
+		if b.Held {
+			role = SentinelRole
+		}
+		out = append(out, b.ID+"="+role)
 	}
 	sort.Strings(out)
 	q, err := GetProjectQuota(ctx, c, name)
@@ -191,7 +200,8 @@ func TestProjectAdoption_ChangesNothingAReceiverSees(t *testing.T) {
 		walTo(t, src, "src", r)
 	}
 	before := map[*Client]string{src: adoptionView(t, src, "/acme"), wal: adoptionView(t, wal, "/acme"), ae: adoptionView(t, ae, "/acme")}
-	if !strings.Contains(before[src], "quota=8/4096") || strings.Contains(before[src], "held=true") {
+	if !strings.Contains(before[src], "quota=8/4096") || !strings.Contains(before[src], "latched_acme~p:pre=Admin") ||
+		!strings.Contains(before[src], "~p:r0123456789abcdef0123456789abcdef="+SentinelRole) {
 		t.Fatalf("fixture:\n%s", before[src])
 	}
 	u := strings.Split(projectRow(t, src, "/acme"), "|")[4]
@@ -405,6 +415,13 @@ func TestProjectAdoption_ADeleteThatOvertakesTheAdoptionConverges(t *testing.T) 
 	if got := strings.Split(projectRow(t, l, "/acme"), "|"); got[6] != "" || got[5] == "" {
 		t.Fatalf("fixture: the overtaken receiver holds %v, want a '' tombstone", got)
 	}
+	// A pre-tagged grant of the pre-latch lifetime that only l holds (one the
+	// delete never saw). When the tie rule turns l's '' tombstone into the
+	// adopted one, l settles; the adopted tombstone keeps pre out of
+	// retirement exactly as a '' tombstone does (review m-R1).
+	if err := l.Execute(ctx, roleBindingInsertSQL, "only-l~p:pre", "/projects/acme", "Operator", "user:carol@local", 1, l.NowTS()); err != nil {
+		t.Fatal(err)
+	}
 	walTo(t, n, "n", r)
 	for i := 0; i < 2; i++ {
 		for _, from := range []*Client{r, n, l} {
@@ -423,6 +440,9 @@ func TestProjectAdoption_ADeleteThatOvertakesTheAdoptionConverges(t *testing.T) 
 		if got := projectRow(t, c, "/acme"); got != want {
 			t.Errorf("%s holds %s, want %s", name, got, want)
 		}
+	}
+	if b, err := GetRoleBinding(ctx, l, "only-l~p:pre"); err != nil || b == nil || b.Role != "Operator" {
+		t.Errorf("l's pre-tagged grant after the adopted tombstone settled: %+v (err %v), want it untouched", b, err)
 	}
 	for name, c := range map[string]*Client{"r": r, "n": n, "l": l} {
 		if got := c.UnresolvedTieCount(); got != 0 {

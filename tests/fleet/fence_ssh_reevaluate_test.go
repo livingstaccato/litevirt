@@ -242,3 +242,55 @@ func wantEvaluated(t *testing.T, c *Cluster, via *Node, want map[string]bool) ma
 	}
 	return outcome
 }
+
+// TestFleet_FenceSSH_ReevaluateReadFollowsTheEvaluation: one re-evaluating
+// read. node-0 (the origin) and node-2 (a peer) published accepting, and
+// their sshd stopped accepting after their agents cached that answer. The
+// row each reports beside evaluated_for_request must be the one its fresh
+// evaluation wrote, not the one before it: a proof paired with the stale
+// accepting row is the false confirmation this feature exists to prevent.
+//
+// Mutation: read the host's own status before Reevaluate: the stale
+// accepting row comes back marked proved, red.
+func TestFleet_FenceSSH_ReevaluateReadFollowsTheEvaluation(t *testing.T) {
+	var refusing sync.Map
+	c, fs := fenceSSHFleetWith(t, 3, 2634, func(name string) bool { _, no := refusing.Load(name); return !no },
+		func(string) string { return fencessh.ModeAuto })
+	for _, n := range c.Nodes {
+		n.Server.SetFenceSSH(fs[n.Name].agent)
+	}
+	publishAndRender(t, c, fs)
+	refusing.Store("node-0", true)
+	refusing.Store("node-2", true)
+	for _, name := range []string{"node-0", "node-2"} {
+		if err := fs[name].agent.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if acc, _, _ := getFenceSSHRow(t, fs[name]); !acc {
+			t.Fatalf("premise: %s's cached evaluation did not hold its row at accepting", name)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 70*time.Second)
+	defer cancel()
+	st, err := c.SelfClient(c.Nodes[0]).GetFenceSSHStatus(ctx, &pb.FenceSSHStatusRequest{FanOut: true, Reevaluate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range st.GetNodes() {
+		var self *pb.FenceSSHPeer
+		for _, p := range n.GetPeers() {
+			if p.GetHost() == n.GetHost() {
+				self = p
+			}
+		}
+		if !n.GetEvaluatedForRequest() || self == nil {
+			t.Fatalf("%s: not proven, or no own row: %+v", n.GetHost(), n)
+		}
+		_, refused := refusing.Load(n.GetHost())
+		if self.GetAccepting() == refused {
+			t.Fatalf("%s: proved, with its own row accepting=%v; its fresh evaluation says %v",
+				n.GetHost(), self.GetAccepting(), !refused)
+		}
+	}
+}

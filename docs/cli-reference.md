@@ -169,7 +169,8 @@ lv host install-fence-ssh                 # Give every host's sshd the managed f
   [--remove] [--wait 3m]                  #   wait until each reports accepting the managed fence key.
                                           #   --host: exactly those hosts (an unknown name changes
                                           #   nothing). Seconds when each host re-evaluates for an
-                                          #   admin; ~2 min from a daemon older than that; non-zero
+                                          #   admin; ~2 min from a daemon older than that (so --wait
+                                          #   must be at least 2m10s); non-zero
                                           #   exit when any host's sshd refused or was not reloaded,
                                           #   or did not confirm. See migration-failover.md
                                           #   "Managed fence SSH"

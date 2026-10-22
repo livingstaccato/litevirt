@@ -2,6 +2,7 @@ package fencessh
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -11,6 +12,13 @@ import (
 // zero: its sshd evaluation (one `sshd -T` per peer), the self-check login
 // (probeTimeout) and the publish.
 const ReevaluateTimeout = 40 * time.Second
+
+// freshSelfCheckWindow is how much of its bound a fresh sync of a host that
+// self-checks needs left to start: the self-check login's full probeTimeout
+// (ssh's ConnectTimeout is cut to what is left, so a shorter window could
+// fail a login that a full one completes), and a margin for the sshd -T
+// calls before it and the publish after it.
+const freshSelfCheckWindow = probeTimeout + 5*time.Second
 
 // Reevaluate runs one fresh sync for this request and reports whether it
 // proves this host's row: the sync STARTED after Reevaluate was called,
@@ -106,6 +114,10 @@ func (a *Agent) freshSync(until time.Time) (bool, string) {
 	if ctx.Err() != nil {
 		return false, "every caller's bound passed before the sync could start"
 	}
+	if left := time.Until(until); a.cfg.SelfCheck && left < freshSelfCheckWindow {
+		return false, fmt.Sprintf("only %s of the request's bound was left, less than a full self-check needs (%s)",
+			left.Round(time.Millisecond), freshSelfCheckWindow)
+	}
 	f := &freshSyncState{}
 	if err := a.Sync(context.WithValue(ctx, freshSyncKey{}, f)); err != nil {
 		slog.Info("fence ssh: a requested re-evaluation failed", "error", err)
@@ -135,6 +147,33 @@ type freshSyncState struct {
 	ran     bool
 	evalErr error
 	pub     bool
+}
+
+// selfCheckWindow is an error when this fresh sync has less than a full
+// probeTimeout left for its self-check login: cut short, ssh's
+// ConnectTimeout would be too, and a login that a full window completes
+// could fail and be published as not accepting. The login is then not made,
+// and the evaluation counts as failed: no proof, not cached, the row keeps
+// its answer. nil for an ordinary sync, which runs under no deadline.
+func (f *freshSyncState) selfCheckWindow(ctx context.Context) error {
+	if f == nil {
+		return nil
+	}
+	d, ok := ctx.Deadline()
+	if left := time.Until(d); ok && left < probeTimeout {
+		return fmt.Errorf("only %s of the request's bound was left for the self-check login, less than a "+
+			"full self-check needs (%s)", left.Round(time.Millisecond), probeTimeout)
+	}
+	return nil
+}
+
+// cacheable reports whether an evaluation that ended in err may stand for
+// acceptTTL: always for an ordinary sync; for a fresh one only when it
+// succeeded. A fresh evaluation that failed (a cut-short self-check
+// included) may have failed on its request's deadline, which says nothing
+// about sshd: the agent's own next sync evaluates for itself.
+func (f *freshSyncState) cacheable(err error) bool {
+	return f == nil || err == nil
 }
 
 // freshSyncOf is ctx's fresh-sync record, nil for an ordinary sync.

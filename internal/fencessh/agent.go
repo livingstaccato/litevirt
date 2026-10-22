@@ -223,6 +223,11 @@ func (a *Agent) Sync(ctx context.Context) error {
 	a.syncMu.Lock()
 	defer a.syncMu.Unlock()
 	err := a.sync(ctx)
+	if err != nil && freshSyncOf(ctx) != nil {
+		// A requested sync's failure is its request's (reevaluate_outcome),
+		// not the agent's last_error.
+		return err
+	}
 	a.mu.Lock()
 	a.lastErr = ""
 	if err != nil {
@@ -462,14 +467,18 @@ func (a *Agent) sshdAccepting(ctx context.Context, addrs []string, self *x509.Ce
 		ok, why, err = a.cfg.Accepting(ctx, addrs)
 	}
 	if ok && err == nil && a.cfg.SelfCheck {
-		if serr := a.selfCheck(ctx, self); serr != nil {
+		if werr := fresh.selfCheckWindow(ctx); werr != nil {
+			ok, err = false, werr
+		} else if serr := a.selfCheck(ctx, self); serr != nil {
 			ok, why = false, "sshd's configuration reads the managed key, but the running sshd does not accept it "+
 				"(reload or restart sshd): "+serr.Error()
 		}
 	}
-	a.mu.Lock()
-	a.accepting, a.acceptWhy, a.acceptErr, a.acceptPeers, a.acceptUntil = ok, why, err, key, time.Now().Add(acceptTTL)
-	a.mu.Unlock()
+	if fresh.cacheable(err) {
+		a.mu.Lock()
+		a.accepting, a.acceptWhy, a.acceptErr, a.acceptPeers, a.acceptUntil = ok, why, err, key, time.Now().Add(acceptTTL)
+		a.mu.Unlock()
+	}
 	fresh.evaluated(err)
 	return ok, why, err
 }

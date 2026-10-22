@@ -311,7 +311,8 @@ func TestInstallFenceSSH_NonAdminFallsBackToTheBound(t *testing.T) {
 	if d := clk.t.Sub(start); d < 2*time.Minute {
 		t.Fatalf("confirmed %s after the install without a re-evaluation", d)
 	}
-	if !strings.Contains(out.String(), "may not ask hosts to re-evaluate") {
+	if o := out.String(); !strings.Contains(o, "WARNING: this credential may not ask hosts to re-evaluate") ||
+		!strings.Contains(o, "time-based only") || !strings.Contains(o, "admin credential") {
 		t.Fatalf("the fallback is not explained:\n%s", out.String())
 	}
 }
@@ -424,5 +425,24 @@ func TestInstallFenceSSH_OlderOriginFallsBackWithAWarning(t *testing.T) {
 	if !strings.Contains(o, "node-2") || !strings.Contains(o, "older") || !strings.Contains(o, "time-based") ||
 		strings.Count(o, "time-based") != 1 {
 		t.Fatalf("the older-origin warning (once, naming node-2):\n%s", o)
+	}
+}
+
+// TestInstallFenceSSH_ProofIsNotAccepting: a proof says the row is fresh,
+// not that it says yes. A host proven fresh whose row says not accepting
+// never confirms.
+//
+// Mutation: confirm on evaluated_for_request before the accepting check:
+// red.
+func TestInstallFenceSSH_ProofIsNotAccepting(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	c := &ownViewClient{clock: clk, hosts: []string{"node-1"}, origin: "node-1",
+		row:       func(string, time.Time) (bool, string) { return false, "" },
+		evaluated: func(string) bool { return true }}
+	h := &scriptedFenceSSHHost{name: "node-1", addr: "10.78.0.1", result: fencessh.ResultInstalled}
+	var out bytes.Buffer
+	err := InstallFenceSSH(context.Background(), c, []FenceSSHHost{h}, map[string]string{"node-1": h.addr}, confirmOpts(&out, clk))
+	if err == nil || !strings.Contains(out.String(), "not accepting") {
+		t.Fatalf("a proven, not-accepting host: err %v\n%s", err, out.String())
 	}
 }

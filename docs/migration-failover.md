@@ -1239,8 +1239,11 @@ accept the managed key. Its exit code is unchanged.
    minutes); so does every host when the credential is not an admin's, and when the
    command talks to an older host, which asks no peer to re-evaluate: it then warns
    that the confirmation was time-based only, and re-running it against an upgraded
-   host confirms by proof. From then on, fences toward it take the managed path. It exits non-zero when any host's sshd refused the drop-in or was not
-   reloaded, or does not confirm within `--wait`.
+   host confirms by proof. From then on, fences toward it take the managed path.
+   It exits non-zero when any host's sshd refused the drop-in or was not reloaded,
+   or does not confirm within `--wait`. Keep `--wait` at 2m10s or more (the default
+   is 3m): an older host needs that long, so a shorter `--wait` is refused before
+   anything is changed.
 3. Check `lv doctor fence`: every pair `managed`, every probe `ok`. A probe
    result can predate the install for up to `fence_ssh_probe_interval_sec`
    (default 15 minutes); a stale `FAILED` clears at the next probe.

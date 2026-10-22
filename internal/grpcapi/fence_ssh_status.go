@@ -62,19 +62,11 @@ func (s *Server) GetFenceSSHStatus(ctx context.Context, req *pb.FenceSSHStatusRe
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		evaluated, why := false, "no fence ssh agent on this host"
-		if reevaluate && s.fenceSSH != nil {
-			if evaluated, why = s.fenceSSH.Reevaluate(ctx); !evaluated {
-				slog.Info("fence ssh: a requested re-evaluation proved nothing", "why", why)
-			}
-		}
-		n := s.ownFenceSSHNode(ctx)
 		if reevaluate {
-			// Always set when asked, so the CLI can tell this build, whose
-			// re-evaluation may prove nothing, from one that predates it.
-			n.EvaluatedForRequest, n.ReevaluateOutcome = fenceSSHReevaluateOutcome(evaluated, why, n.GetError())
+			add(s.reevaluatedOwnFenceSSHNode(ctx))
+		} else {
+			add(s.ownFenceSSHNode(ctx))
 		}
-		add(n)
 	}()
 	for _, h := range hosts {
 		if h.Name == s.hostName {
@@ -89,6 +81,26 @@ func (s *Server) GetFenceSSHStatus(ctx context.Context, req *pb.FenceSSHStatusRe
 	wg.Wait()
 	sort.Slice(out.Nodes, func(i, j int) bool { return out.Nodes[i].Host < out.Nodes[j].Host })
 	return out, nil
+}
+
+// reevaluatedOwnFenceSSHNode is this host's own view, read AFTER one fresh
+// sync for this request (fencessh.Agent.Reevaluate). The order is the proof:
+// evaluated_for_request vouches for the row returned beside it only because
+// that row is read once the fresh evaluation has published it. Read first, a
+// stale accepting row would come back marked proved. So the read lives here,
+// after the evaluation, and nowhere else sets the two fields.
+func (s *Server) reevaluatedOwnFenceSSHNode(ctx context.Context) *pb.FenceSSHNode {
+	evaluated, why := false, "no fence ssh agent on this host"
+	if s.fenceSSH != nil {
+		if evaluated, why = s.fenceSSH.Reevaluate(ctx); !evaluated {
+			slog.Info("fence ssh: a requested re-evaluation proved nothing", "why", why)
+		}
+	}
+	n := s.ownFenceSSHNode(ctx)
+	// Always set when asked, so the CLI can tell this build, whose
+	// re-evaluation may prove nothing, from one that predates it.
+	n.EvaluatedForRequest, n.ReevaluateOutcome = fenceSSHReevaluateOutcome(evaluated, why, n.GetError())
+	return n
 }
 
 // ownFenceSSHNode is this host's own view.

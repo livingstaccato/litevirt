@@ -31,9 +31,13 @@ type evaluator struct {
 }
 
 func (e *evaluator) agent(n *node, gate fencessh.Gate, timeout time.Duration) *fencessh.Agent {
+	return e.agentWith(n, gate, timeout, false)
+}
+
+func (e *evaluator) agentWith(n *node, gate fencessh.Gate, timeout time.Duration, selfCheck bool) *fencessh.Agent {
 	return fencessh.New(fencessh.Config{
 		Self: n.name, PKIDir: n.pkiDir, DB: n.w.db, Gate: gate, Dir: n.dir, SSHUser: n.w.user,
-		HostKeyGlob: n.hkPath + ".pub", ReevaluateTimeout: timeout,
+		HostKeyGlob: n.hkPath + ".pub", ReevaluateTimeout: timeout, SelfCheck: selfCheck,
 		Accepting: func(ctx context.Context, _ []string) (bool, string, error) {
 			return e.answer(ctx, e.calls.Add(1))
 		},
@@ -243,5 +247,122 @@ func TestReevaluate_LogsInToTheRunningSSHD(t *testing.T) {
 	}
 	if r, _ := y.row(); !r.Accepting {
 		t.Fatalf("node-y's row = %+v, want accepting", r)
+	}
+}
+
+// acceptingRow publishes x's row as accepting, through an agent with no
+// self-check, so a test can watch whether a later run changes it.
+func acceptingRow(t *testing.T, x *node) {
+	t.Helper()
+	if err := x.publisher(true, false).Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := x.row(); !r.Accepting {
+		t.Fatalf("premise: %+v", r)
+	}
+}
+
+// TestReevaluate_TooLittleBoundLeftDoesNotStart: a fresh sync that could not
+// give its self-check login a full window (ssh's ConnectTimeout is cut to
+// what is left) does not start: no evaluation, no publication, no proof.
+//
+// Mutation: drop the start check: sshd is evaluated, red.
+func TestReevaluate_TooLittleBoundLeftDoesNotStart(t *testing.T) {
+	x := reevalWorld(t)
+	acceptingRow(t, x)
+	e := &evaluator{answer: func(context.Context, int32) (bool, string, error) { return true, "", nil }}
+	a := e.agentWith(x, openGate{t}, 2*time.Second, true)
+	ok, why := a.Reevaluate(context.Background())
+	if ok || !strings.Contains(why, "full self-check") {
+		t.Fatalf("ok %v, why %q", ok, why)
+	}
+	if got := e.calls.Load(); got != 0 {
+		t.Fatalf("sshd was evaluated %d times by a run with 2s left", got)
+	}
+	if r, _ := x.row(); !r.Accepting || r.Detail != "" {
+		t.Fatalf("the row changed: %+v", r)
+	}
+}
+
+// TestReevaluate_TruncatedSelfCheckIsNotProofNorCached: a fresh sync whose
+// sshd evaluation left less than a full window for the self-check login
+// does not log in on a cut-short window, whose failure would publish
+// not-accepting as a proven answer: the evaluation counts as failed (the row
+// keeps its answer), proves nothing, and is not cached for the next sync.
+//
+// Mutations: log in anyway (drop the window check in sshdAccepting): the
+// login fails with no sshd here and publishes not-accepting, red; cache
+// the cut-short result: the next sync does not evaluate, red.
+func TestReevaluate_TruncatedSelfCheckIsNotProofNorCached(t *testing.T) {
+	x := reevalWorld(t)
+	acceptingRow(t, x)
+	bound := fencessh.FreshWindowForTest + time.Second
+	slow := bound - fencessh.ProbeTimeoutForTest + time.Second // leaves under probeTimeout
+	e := &evaluator{answer: func(_ context.Context, call int32) (bool, string, error) {
+		if call == 1 {
+			time.Sleep(slow)
+		}
+		return true, "", nil
+	}}
+	a := e.agentWith(x, openGate{t}, bound, true)
+	ok, why := a.Reevaluate(context.Background())
+	if ok || !strings.Contains(why, "full self-check") {
+		t.Fatalf("ok %v, why %q", ok, why)
+	}
+	if r, _ := x.row(); !r.Accepting {
+		t.Fatalf("a cut-short self-check changed the row: %+v", r)
+	}
+	_ = a.Sync(context.Background()) // ordinary: logs in (and fails: no sshd here)
+	if got := e.calls.Load(); got != 2 {
+		t.Fatalf("sshd evaluated %d times: the cut-short evaluation was cached", got)
+	}
+}
+
+// TestReevaluate_FailureKeepsTheAgentsLastError: a fresh sync that fails
+// reports it to its request (reevaluate_outcome), not as the agent's
+// last_error, which stays what its own syncs last said.
+//
+// Mutations: record a fresh sync's error in last_error: red; cache a failed
+// fresh evaluation (the next ordinary sync reports it as its own): red.
+func TestReevaluate_FailureKeepsTheAgentsLastError(t *testing.T) {
+	ctx := context.Background()
+	x := reevalWorld(t)
+	var mode atomic.Int32
+	e := &evaluator{answer: func(context.Context, int32) (bool, string, error) {
+		switch mode.Load() {
+		case 1:
+			return false, "", errors.New("modelled: the ordinary sync's sshd -T failed")
+		case 2:
+			return false, "", errors.New("modelled: the requested sync's sshd -T failed")
+		}
+		return true, "", nil
+	}}
+	a := e.agent(x, openGate{t}, 0)
+	if err := a.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mode.Store(2)
+	if ok, _ := a.Reevaluate(ctx); ok || a.LastError() != "" {
+		t.Fatalf("after a failed fresh sync: ok %v, last_error %q", ok, a.LastError())
+	}
+	// The failed fresh evaluation is not cached: the agent's next sync
+	// evaluates for itself, and its success is what last_error says.
+	mode.Store(0)
+	if err := a.Sync(ctx); err != nil || a.LastError() != "" {
+		t.Fatalf("the ordinary sync after it: %v, last_error %q", err, a.LastError())
+	}
+
+	// An agent whose own sync failed keeps that error through a failed
+	// fresh sync.
+	b := e.agent(x, openGate{t}, 0)
+	mode.Store(1)
+	_ = b.Sync(ctx)
+	want := b.LastError()
+	if !strings.Contains(want, "ordinary sync") {
+		t.Fatalf("premise: last_error %q", want)
+	}
+	mode.Store(2)
+	if ok, _ := b.Reevaluate(ctx); ok || b.LastError() != want {
+		t.Fatalf("after a failed fresh sync: ok %v, last_error %q, want %q", ok, b.LastError(), want)
 	}
 }

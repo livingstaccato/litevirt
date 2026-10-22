@@ -183,8 +183,10 @@ func InstallFenceSSH(ctx context.Context, c pb.LiteVirtClient, hosts []FenceSSHH
 		cancel()
 		if reevaluate && status.Code(err) == codes.PermissionDenied {
 			// Only an admin may have hosts re-evaluate; anyone else waits.
-			fmt.Fprintf(opt.Out, "This credential may not ask hosts to re-evaluate their sshd (%v);\n"+
-				"waiting for rows %s newer than each install instead.\n", status.Convert(err).Message(), opt.FreshAfter)
+			fmt.Fprintf(opt.Out, "WARNING: this credential may not ask hosts to re-evaluate their sshd (%v), so no host\n"+
+				"is asked to prove a fresh evaluation: every confirmation below is time-based only (a row read %s\n"+
+				"after the install), which a wedged agent can pass with a stale row. Re-run with an admin credential\n"+
+				"to confirm by proof.\n", status.Convert(err).Message(), opt.FreshAfter)
 			reevaluate = false
 			continue
 		}

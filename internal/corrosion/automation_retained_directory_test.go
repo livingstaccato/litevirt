@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -124,13 +125,13 @@ func TestRetainedOriginal83LayoutDispatch(t *testing.T) {
 	if retainedLocalLayout83Digest() != "dad4d14693e2ba5b6637571a8a80f6ba3c37bf55094ff2be92dfae26bbb36b1a" {
 		t.Fatal("RETAINED83_ARCHIVED_LAYOUT_BYTES_CHANGED")
 	}
-	if len(old) != 31 || len(current) != 33 || old[29].table != "local_automation_lifetimes" || old[30].table != "local_automation_credential_issuance" || current[29].table != "local_automation_target_operations" || current[30].table != "local_automation_target_reservations" {
+	if len(old) != 31 || len(current) != 37 || old[29].table != "local_automation_lifetimes" || old[30].table != "local_automation_credential_issuance" || current[29].table != "local_automation_target_operations" || current[30].table != "local_automation_target_reservations" {
 		t.Fatal("RETAINED83_SECTION_SHIFT")
 	}
 	if retainedLocalLayout83Digest() == retainedLocalLayoutDigest() {
 		t.Fatal("RETAINED83_LAYOUT_RELABELED")
 	}
-	for _, which := range []string{"old83", "current84"} {
+	for _, which := range []string{"old83", "current86"} {
 		t.Run(which, func(t *testing.T) {
 			d := retainedDescriptorInput("local")
 			if which == "old83" {
@@ -259,6 +260,171 @@ func TestRetainedOriginal83ShiftedFrames(t *testing.T) {
 			})
 			if err != nil {
 				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// These are consumed-format matrix controls, not claims of historical export
+// or authenticated aggregate acceptance. The genuine85 companion is separate.
+func TestRetainedCompatibilityDescriptorAndFrameBounds(t *testing.T) {
+	ctx := context.Background()
+	c := NewTestClientT(t)
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	layouts := []struct {
+		name, digest string
+		tables       []aggregateLocalTable
+		suffix       int
+	}{
+		{"archived31", "dad4d14693e2ba5b6637571a8a80f6ba3c37bf55094ff2be92dfae26bbb36b1a", aggregateLocalTables83(), 29},
+		{"old33", "09e38c2616d9155ed46e134be62b051aaef50a549c538b11c644040f4e710fec", automationExecutionArchived85PrivateLayoutForTest(), 31},
+		{"current37", "5bc44346e864a2ccfa79a754ad45a697f60e71952b6db325d4289b92674a92a3", automationExecutionCurrent86PrivateLayoutForTest(), 35},
+	}
+	for _, layout := range layouts {
+		t.Run(layout.name, func(t *testing.T) {
+			admitted, dispatchErr := retainedLocalTablesForDigest(layout.digest)
+			if dispatchErr != nil || !reflect.DeepEqual(admitted, layout.tables) {
+				t.Fatal("production descriptor dispatch differs from frozen literal", dispatchErr)
+			}
+			if retainedLocalLayoutDigestFor(layout.tables) != layout.digest || len(layout.tables) != layout.suffix+2 || layout.tables[layout.suffix].table != "local_automation_lifetimes" || layout.tables[layout.suffix+1].table != "local_automation_credential_issuance" {
+				t.Fatal("literal positional layout differs")
+			}
+			for _, mode := range []string{"original", "unknown", "changed-table", "changed-columns", "changed-key", "changed-shape", "mixed-layout", "truncated-inventory", "extra-inventory", "swapped-inventory", "swapped-frames", "truncated-frame", "extra-component", "malformed-frame", "oversized-frame"} {
+				t.Run(mode, func(t *testing.T) {
+					sqltx, err := c.db.BeginTx(ctx, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer sqltx.Rollback()
+					tx := &LocalTx{tx: sqltx}
+					descriptor := retainedDescriptorInput("local")
+					descriptor.LayoutDigest = layout.digest
+					descriptor.ComponentInventories = nil
+					for _, table := range layout.tables {
+						sum := sha256.New()
+						prefix, _ := automationCutFrame("section/v1", []byte(table.descriptor().name))
+						sum.Write(prefix)
+						descriptor.ComponentInventories = append(descriptor.ComponentInventories, automationCutInventory{table.descriptor().name, 1, 0, 0, hex.EncodeToString(sum.Sum(nil))})
+					}
+					address, err := retainedAddress(strings.Repeat("d", 64), 1, descriptor.Source, descriptor.OriginalIdentity, retainedLocalStream)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, section := range []int{layout.suffix, layout.suffix + 1} {
+						table := layout.tables[section]
+						values := []any{}
+						for _, kind := range table.shape {
+							if kind == 'i' {
+								values = append(values, int64(1))
+							} else {
+								values = append(values, "original")
+							}
+						}
+						body, err := encodeAggregateLocalRecord(table.descriptor().name, 1, Row{Columns: strings.Split(table.columns, ","), Values: values})
+						if err != nil {
+							t.Fatal(err)
+						}
+						destination := section
+						if mode == "swapped-frames" {
+							destination = 2*layout.suffix + 1 - section
+						}
+						if mode == "malformed-frame" && section == layout.suffix {
+							body = []byte("not-a-canonical-frame")
+						}
+						sum := sha256.New()
+						prefix, _ := automationCutFrame("section/v1", []byte(table.descriptor().name))
+						sum.Write(prefix)
+						sum.Write(body)
+						descriptor.ComponentInventories[section] = automationCutInventory{table.descriptor().name, 1, 1, int64(len(body)), hex.EncodeToString(sum.Sum(nil))}
+						if mode == "truncated-frame" && section == layout.suffix {
+							continue
+						}
+						if err = address.save(ctx, tx, destination, 1, body); err != nil {
+							t.Fatal("bounded frame setup", err)
+						}
+					}
+					if mode == "extra-component" {
+						beforeSave := retainedCompatibilityRawRows(t, ctx, tx, "")
+						err = address.save(ctx, tx, len(layout.tables), 1, []byte("extra"))
+						if err != nil {
+							if layout.name != "current37" {
+								t.Fatal("old frame address ceiling setup", err)
+							}
+							if !reflect.DeepEqual(beforeSave, retainedCompatibilityRawRows(t, ctx, tx, "")) {
+								t.Fatal("storage ceiling refusal changed raw rows")
+							}
+							return
+						}
+					}
+					if mode == "oversized-frame" {
+						if _, err = tx.Exec(ctx, `UPDATE local_automation_local_rows SET record=? WHERE local_id=? AND section=? AND ordinal=1`, make([]byte, maxAggregateLocalRecordBytes+1), address.localID, layout.suffix); err != nil {
+							t.Fatal(err)
+						}
+					}
+					switch mode {
+					case "unknown":
+						descriptor.LayoutDigest = strings.Repeat("f", 64)
+					case "changed-table", "changed-columns", "changed-key", "changed-shape":
+						changed := append([]aggregateLocalTable(nil), layout.tables...)
+						switch mode {
+						case "changed-table":
+							changed[layout.suffix].table += "_future"
+						case "changed-columns":
+							changed[layout.suffix].columns += ",future"
+						case "changed-key":
+							changed[layout.suffix].keys += "_future"
+						case "changed-shape":
+							changed[layout.suffix].shape += "t"
+						}
+						descriptor.LayoutDigest = retainedLocalLayoutDigestFor(changed)
+					case "mixed-layout":
+						if layout.name == "current37" {
+							descriptor.LayoutDigest = layouts[1].digest
+						} else {
+							descriptor.LayoutDigest = layouts[2].digest
+						}
+					case "truncated-inventory":
+						descriptor.ComponentInventories = descriptor.ComponentInventories[:len(descriptor.ComponentInventories)-1]
+					case "extra-inventory":
+						descriptor.ComponentInventories = append(descriptor.ComponentInventories, descriptor.ComponentInventories[0])
+					case "swapped-inventory":
+						descriptor.ComponentInventories[layout.suffix], descriptor.ComponentInventories[layout.suffix+1] = descriptor.ComponentInventories[layout.suffix+1], descriptor.ComponentInventories[layout.suffix]
+					}
+					directoryAddress, err := retainedAddress(strings.Repeat("d", 64), 0, descriptor.Source, strings.Repeat("a", 64), retainedMetadataStream)
+					if err != nil {
+						t.Fatal(err)
+					}
+					// Keep ordinals closed while exercising real directory.find and storage.walk.
+					entry, _ := json.Marshal(retainedDirectoryEntry{1, descriptor})
+					if err = directoryAddress.save(ctx, tx, 0, 1, entry); err != nil {
+						t.Fatal(err)
+					}
+					hostile := retainedCompatibilityRawRows(t, ctx, tx, "")
+					directory := retainedDirectoryReader{directoryAddress, 1}
+					got, objectAddress, err := directory.find(ctx, tx, "local", descriptor.OriginalIdentity)
+					if err == nil {
+						visited := 0
+						err = objectAddress.walk(ctx, tx, got, func(section int, n int64, body []byte) error { visited++; return nil })
+						if mode == "original" && visited != 2 {
+							t.Fatal("original suffix frames not visited", visited)
+						}
+					}
+					if mode == "original" {
+						if err != nil {
+							t.Fatal("literal complete frames refused", err)
+						}
+					} else if err == nil {
+						t.Fatal("invalid directory/layout/frame accepted", mode)
+					}
+					if !reflect.DeepEqual(hostile, retainedCompatibilityRawRows(t, ctx, tx, "")) {
+						t.Fatal("directory/storage traversal changed hostile original or ACTIVE before rollback", mode)
+					}
+					if err = sqltx.Rollback(); err != nil {
+						t.Fatal(err)
+					}
+				})
 			}
 		})
 	}

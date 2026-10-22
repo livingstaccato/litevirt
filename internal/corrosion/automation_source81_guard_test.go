@@ -14,12 +14,14 @@ func TestAutomationSource82NewCutRequiresSemanticSchema(t *testing.T) {
 		{"clean_new_cut", "", ""},
 		{"generated_semantic_column", `ALTER TABLE local_automation_resources ADD COLUMN unexpected_schema81 TEXT GENERATED ALWAYS AS (uid) VIRTUAL`, "unsupported automation semantic schema: local_automation_resources"},
 		{"missing_semantic_index", `DROP INDEX automation_key_id`, "key projection index inventory differs"},
+		{"generated_execution_column", `ALTER TABLE local_automation_executors ADD COLUMN unexpected_execution TEXT GENERATED ALWAYS AS (operation_id) VIRTUAL`, "unsupported automation semantic schema: local_automation_executors"},
+		{"missing_execution_artifact_index", `DROP INDEX automation_execution_artifact_object`, "execution projection index inventory differs"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			_, a, _, _ := threeVoters(t)
-			if storedVersion(t, a.c) != 85 {
-				t.Fatal("SETUP actual schema85 required")
+			if storedVersion(t, a.c) != 86 {
+				t.Fatal("SETUP actual schema86 required")
 			}
 			if err := a.c.SealVoterGeneration(ctx, 1, "new82-shape-regression"); err != nil {
 				t.Fatal("SETUP seal genuine old generation", err)
@@ -49,7 +51,7 @@ func TestAutomationSource82NewCutRequiresSemanticSchema(t *testing.T) {
 					t.Fatal("SETUP clean NEW82 cut creation failed", err)
 				}
 				metadata, _ := cutFixtureRead(t, a.c, id)
-				if metadata.SourceSchema != 85 || len(metadata.Inventory) != 9 {
+				if metadata.SourceSchema != 86 || len(metadata.Inventory) != 9 {
 					t.Fatal("SETUP clean NEW82 cut has wrong provenance/inventory")
 				}
 				return
@@ -59,7 +61,7 @@ func TestAutomationSource82NewCutRequiresSemanticSchema(t *testing.T) {
 					t.Fatal("SETUP cut returned empty ID without refusal")
 				}
 				metadata, _ := cutFixtureRead(t, a.c, id)
-				if metadata.SourceSchema != 85 || len(metadata.Inventory) != 9 {
+				if metadata.SourceSchema != 86 || len(metadata.Inventory) != 9 {
 					t.Fatal("SETUP accepted cut is not actual NEW82 provenance")
 				}
 				t.Fatalf("RED_NEW82_MALFORMED_CUT_ACCEPTED: mode=%s cut=%s", tc.name, id)

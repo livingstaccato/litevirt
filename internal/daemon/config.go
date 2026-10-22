@@ -24,6 +24,7 @@ import (
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/obs"
 	"github.com/litevirt/litevirt/internal/pbsstore"
+	"github.com/litevirt/litevirt/internal/pressure"
 )
 
 const defaultConfigPath = "/etc/litevirt/config.yaml"
@@ -114,6 +115,11 @@ type Config struct {
 	// Firewall is the `firewall:` block: this host's firewall log listener
 	// and store (docs/firewall.md, "Logging").
 	Firewall FirewallConfig `yaml:"firewall"`
+
+	// Pressure is the `pressure:` block: this host's resource-pressure
+	// sampler and its thresholds (docs/configuration.md, "Resource pressure").
+	// It reports only.
+	Pressure pressure.Config `yaml:"pressure"`
 
 	// HostUpdates is the read-only check for pending OS package updates on this
 	// host (docs/upgrades.md, "Pending OS updates"). litevirt installs nothing.
@@ -1033,6 +1039,8 @@ func LoadConfig() (*Config, error) {
 
 		HostUpdates: HostUpdatesConfig{Enabled: true, IntervalMinutes: 360},
 
+		Pressure: pressure.DefaultConfig(),
+
 		UpgradeWatchdogEnabled:   true,
 		UpgradeHealthDeadlineSec: 120,
 
@@ -1069,6 +1077,10 @@ func LoadConfig() (*Config, error) {
 
 	if err := normalizeAdvertiseAddress(cfg); err != nil {
 		return nil, err
+	}
+
+	if err := cfg.Pressure.Validate(); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
 	}
 
 	if err := cfg.Containers.validate(); err != nil {

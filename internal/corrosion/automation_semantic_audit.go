@@ -25,6 +25,10 @@ var automationSemanticTables = []struct{ table, columns, integers, primaryKey, n
 	// Append to preserve the existing first-eight identity/ownership descriptor boundary.
 	{"local_automation_target_operations", "stage,cluster_uid,operation_id,kind,project_uid,principal_uid,request_id,resource_uid,target_name,sequence,decision_digest,body_json,assignment_json", "sequence", "stage,cluster_uid,operation_id", ""},
 	{"local_automation_target_reservations", "stage,cluster_uid,target_key,operation_id,sequence", "sequence", "stage,cluster_uid,target_key", ""},
+	{"local_automation_executors", "stage,cluster_uid,operation_id,resource_uid,executor_generation,grant_sequence,grant_digest,admission_sequence,admission_digest,grant_json", "executor_generation,grant_sequence,admission_sequence", "stage,cluster_uid,operation_id", ""},
+	{"local_automation_execution_progress", "stage,cluster_uid,operation_id,resource_uid,applied_sequence,progress_json", "applied_sequence", "stage,cluster_uid,operation_id", ""},
+	{"local_automation_execution_artifacts", "stage,cluster_uid,operation_id,artifact_id,resource_uid,artifact_key,artifact_kind,backend,object_id,applied_sequence,artifact_json", "applied_sequence", "stage,cluster_uid,operation_id,artifact_id", ""},
+	{"local_automation_execution_terminals", "stage,cluster_uid,operation_id,resource_uid,applied_sequence,terminal_json", "applied_sequence", "stage,cluster_uid,operation_id", ""},
 }
 
 func automationVerifySemanticSchemaTx(ctx context.Context, tx *LocalTx) error {
@@ -60,7 +64,10 @@ func automationVerifySemanticSchemaTx(ctx context.Context, tx *LocalTx) error {
 			}
 		}
 	}
-	return automationVerifyKeyIndexesTx(ctx, tx)
+	if err := automationVerifyKeyIndexesTx(ctx, tx); err != nil {
+		return err
+	}
+	return automationVerifyExecutionIndexesTx(ctx, tx)
 }
 
 func automationVerifySemanticStageTx(ctx context.Context, tx *LocalTx, stage string) error {

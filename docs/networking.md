@@ -153,7 +153,7 @@ networks:
 
 Requires:
 
-- IOMMU enabled in BIOS and kernel (`intel_iommu=on` or `amd_iommu=on`)
+- IOMMU enabled in firmware and kernel (Intel: `intel_iommu=on`; AMD: AMD-Vi on in firmware, with neither `amd_iommu=off` nor `iommu=off` set)
 - SR-IOV capable NIC with VFs created
 - `vfio-pci` kernel module loaded
 

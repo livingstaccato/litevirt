@@ -3724,6 +3724,14 @@ message ReadyResponse {
   bool ha_disarmed = 5;
   string ha_policy_at = 6;
   bool ha_known = 7;
+  // pressure is this host's resource pressure as its own sampler grades it
+  // (docs/configuration.md, "Resource pressure"). It is ORTHOGONAL to ready: a
+  // pressured host still answers ready=true, and keeps its quorum weight.
+  // Absent from a build that predates the field and from a host with
+  // pressure.enabled false; a reader takes absent as "unknown", never as "ok"
+  // and never as a licence to act sooner. A self-report that may only make
+  // the cluster more conservative, as ready is.
+  HostPressure pressure = 8;
 }
 
 // FetchBinary: pull this daemon's binary for peer self-upgrade.

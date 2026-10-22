@@ -30,7 +30,7 @@ func TestReceiverSchemaInertInventory(t *testing.T) {
 			t.Fatalf("explicit compatible descriptor %d/1 missing", schema)
 		}
 	}
-	if !supportedAutomationCutDescriptor(83, 1) || !supportedAutomationCutDescriptor(84, 1) || !supportedAutomationCutDescriptor(85, 1) || supportedAutomationCutDescriptor(86, 1) || supportedAutomationCutDescriptor(71, 2) {
+	if !supportedAutomationCutDescriptor(83, 1) || !supportedAutomationCutDescriptor(84, 1) || !supportedAutomationCutDescriptor(85, 1) || !supportedAutomationCutDescriptor(86, 1) || supportedAutomationCutDescriptor(87, 1) || supportedAutomationCutDescriptor(71, 2) {
 		t.Fatal("unknown source provenance accepted")
 	}
 }

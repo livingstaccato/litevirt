@@ -10,6 +10,7 @@ import (
 	mathrand "math/rand/v2"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/automation/contract"
 	"github.com/litevirt/litevirt/internal/claims"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -53,6 +54,14 @@ func randomID() string {
 // Each call uses fresh ballot nonce and bounded rounds; no proposer retains
 // per-slot maps for the lifetime of an unbounded stream.
 func (e *Engine) decide(ctx context.Context, cfg *corrosion.VoterConfig, seq uint64, proposal *corrosion.ClaimValue) (claims.Outcome, error) {
+	return e.decideOwner(ctx, cfg, seq, proposal, nil)
+}
+
+type ownerPhase2Transport interface {
+	PrepareOwnerPhase2(context.Context, corrosion.ClaimKey, corrosion.Ballot, corrosion.ClaimValue, *corrosion.VoterConfig, *corrosion.AutomationOwnerSubmission) (corrosion.Ballot, error)
+}
+
+func (e *Engine) decideOwner(ctx context.Context, cfg *corrosion.VoterConfig, seq uint64, proposal *corrosion.ClaimValue, owner *corrosion.AutomationOwnerSubmission) (claims.Outcome, error) {
 	key, err := corrosion.AutomationClaimKey(seq)
 	if err != nil {
 		return claims.Outcome{}, err
@@ -63,7 +72,42 @@ func (e *Engine) decide(ctx context.Context, cfg *corrosion.VoterConfig, seq uin
 	if proposal != nil {
 		spec.Propose = func(map[string]corrosion.PrepareResult) (corrosion.ClaimValue, error) { return *proposal, nil }
 	}
+	spec.BeforeAccept = func(ctx context.Context, b corrosion.Ballot, selected corrosion.ClaimValue) (corrosion.Ballot, error) {
+		d, err := contractDecode(selected)
+		if err != nil {
+			return corrosion.Ballot{}, err
+		}
+		if !corrosion.IsAutomationOwnerKind(d.Command.Kind) {
+			return corrosion.Ballot{}, nil
+		}
+		t, ok := e.transport.(ownerPhase2Transport)
+		if !ok {
+			return corrosion.Ballot{}, fail(CodeUnavailable)
+		}
+		native := owner
+		if proposal == nil || selected.MustDigest() != proposal.MustDigest() {
+			native = nil
+		}
+		return t.PrepareOwnerPhase2(ctx, key, b, selected, cfg, native)
+	}
 	return p.Decide(ctx, spec)
+}
+
+// SubmitOwner preserves the original command encoding and carries its target
+// assignment separately. It is available only with a genuine local credential
+// submission; neither generic Submit nor a peer can manufacture native authority.
+func (e *Engine) SubmitOwner(ctx context.Context, owner *corrosion.AutomationOwnerSubmission) (Receipt, error) {
+	if owner == nil || !owner.UsesClient(e.db) {
+		return Receipt{}, fail(CodeUnavailable)
+	}
+	if err := e.enter(ctx); err != nil {
+		return Receipt{}, err
+	}
+	defer e.leave()
+	if err := owner.Authorize(ctx); err != nil {
+		return Receipt{}, err
+	}
+	return e.submitOwner(ctx, owner.Command(), owner)
 }
 func (e *Engine) Submit(ctx context.Context, c Command) (Receipt, error) {
 	if err := validateCommand(c); err != nil {
@@ -79,6 +123,9 @@ func (e *Engine) Submit(ctx context.Context, c Command) (Receipt, error) {
 	return e.submit(ctx, c)
 }
 func (e *Engine) submit(ctx context.Context, c Command) (Receipt, error) {
+	return e.submitOwner(ctx, c, nil)
+}
+func (e *Engine) submitOwner(ctx context.Context, c Command, owner *corrosion.AutomationOwnerSubmission) (Receipt, error) {
 	if err := e.recover(ctx); err != nil && !(c.Kind == "initialize_cluster" && errors.Is(err, claims.ErrNoValue)) {
 		return Receipt{}, fmt.Errorf("recover automation: %w", fail(CodeUnavailable))
 	}
@@ -91,6 +138,9 @@ func (e *Engine) submit(ctx context.Context, c Command) (Receipt, error) {
 		a.ClusterUID = randomID()
 	} else {
 		a.ClusterUID = c.ClusterUID
+	}
+	if owner != nil && owner.TargetSessionID() != "" {
+		a.Owner = &contract.OwnerAssignment{SessionID: owner.TargetSessionID()}
 	}
 	assigned, _ := json.Marshal(a)
 	// Bounded work per call; a retry resumes from durable applied progress.
@@ -112,10 +162,18 @@ func (e *Engine) submit(ctx context.Context, c Command) (Receipt, error) {
 			if !equalBytes(identity, existing.Identity) {
 				return Receipt{}, fail(CodeIdempotencyConflict)
 			}
+			if owner != nil {
+				if _, err := owner.Original(ctx, existing.Receipt); err != nil {
+					return Receipt{}, err
+				}
+			}
 			if existing.Receipt.Code != "" {
 				return existing.Receipt, fail(existing.Receipt.Code)
 			}
 			return existing.Receipt, nil
+		}
+		if owner != nil && c.Kind == "handoff_session" && owner.TargetSessionID() == c.SessionID {
+			return Receipt{}, fail(CodeValidation)
 		}
 		if c.Kind == "initialize_cluster" && h.Sequence != 0 {
 			return Receipt{}, fail(CodeOwnershipConflict)
@@ -134,8 +192,11 @@ func (e *Engine) submit(ctx context.Context, c Command) (Receipt, error) {
 			return Receipt{}, err
 		}
 		value := corrosion.ClaimValue{Automation: &corrosion.AutomationClaimValue{Envelope: encoded}}
-		out, err := e.decide(ctx, cfg, d.Sequence, &value)
+		out, err := e.decideOwner(ctx, cfg, d.Sequence, &value, owner)
 		if err != nil {
+			if owner != nil {
+				return Receipt{}, err
+			}
 			return Receipt{}, fail(CodeUnavailable)
 		}
 		rec := corrosion.AutomationRecord{Value: out.Value, Certificate: out.Certificate}

@@ -225,6 +225,20 @@ func NewSharedTestClient(dsnSuffix, hostName string) (*Client, error) {
 	return c, nil
 }
 
+// NewPersistentTestClient uses the production on-disk WAL/FULL opener with the
+// same surrounding test-fixture state as NewSharedTestClient. It never copies
+// an in-memory database or retains a keeper connection across Close.
+func NewPersistentTestClient(dataDir, hostName string) (*Client, error) {
+	c, err := NewLocalClient(dataDir, hostName)
+	if err != nil {
+		return nil, err
+	}
+	c.outOfProcess = false
+	c.SetLeaseTermLedgerGate(testLeaseTermLedgerOpen)
+	c.sensitiveMerges.assumeForTests(true)
+	return c, nil
+}
+
 // ExecOutOfProcessForTest runs one statement on this client's database
 // through a handle of its own that carries no pre-update hook — the write
 // another process makes, which this client's digest cache cannot see.

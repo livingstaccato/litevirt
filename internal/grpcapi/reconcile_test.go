@@ -106,7 +106,7 @@ func TestReconcile_HotplugDiskSurvivesRedefine(t *testing.T) {
 func seedOwnedPCI(t *testing.T, ctx context.Context, s *Server, addr, vmName string) {
 	t.Helper()
 	if err := corrosion.ObservePCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
-		HostName: "test-host", Address: addr, Type: "gpu", IOMMUGroup: -1,
+		HostName: "test-host", Address: addr, Type: "gpu", IOMMUGroup: soloIOMMUGroup(addr),
 	}); err != nil {
 		t.Fatalf("observe %s: %v", addr, err)
 	}

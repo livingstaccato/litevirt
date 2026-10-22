@@ -55,11 +55,13 @@ func TestFleet_ComposeCountedGPUsThenAVFGetTheVF(t *testing.T) {
 	_, node, client := newComposeFailNode(t)
 	ctx := context.Background()
 	defer vfio.SetFS(vfioBoundSysfs{})()
+	// One IOMMU group per device, as on a host with the IOMMU on. A group of -1
+	// (no IOMMU) is refused for passthrough.
 	seedPCI(t, ctx, node,
-		corrosion.PCIDeviceRecord{Address: "0000:41:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1},
-		corrosion.PCIDeviceRecord{Address: "0000:42:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1},
-		corrosion.PCIDeviceRecord{Address: "0000:43:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1},
-		corrosion.PCIDeviceRecord{Address: "0000:81:00.1", Type: "network", VendorID: "8086", IOMMUGroup: -1},
+		corrosion.PCIDeviceRecord{Address: "0000:41:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: 41},
+		corrosion.PCIDeviceRecord{Address: "0000:42:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: 42},
+		corrosion.PCIDeviceRecord{Address: "0000:43:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: 43},
+		corrosion.PCIDeviceRecord{Address: "0000:81:00.1", Type: "network", VendorID: "8086", IOMMUGroup: 81},
 	)
 
 	deployClean(t, ctx, client, composeGPUsAndVF)

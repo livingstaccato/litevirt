@@ -13,6 +13,13 @@ import (
 
 var _ automationv1.AutomationServer = (*Server)(nil)
 
+// Only locally constructed public statuses survive the interceptor's final
+// sanitization. Remote/underlying statuses cannot smuggle messages or details.
+type automationPublicStatus struct{ value *status.Status }
+
+func (e *automationPublicStatus) Error() string              { return e.value.Err().Error() }
+func (e *automationPublicStatus) GRPCStatus() *status.Status { return e.value }
+
 // RegisterServices keeps both services on the same authenticated transport and
 // Server lifetime. Registration does not enable automation authority/readiness.
 func (s *Server) RegisterServices(registrar grpc.ServiceRegistrar) {
@@ -62,6 +69,10 @@ func automationPublicError(err error) error {
 	if err == nil {
 		return nil
 	}
+	var public *automationPublicStatus
+	if errors.As(err, &public) {
+		return public
+	}
 	code := status.Code(err)
 	application := automationv1.ErrorCode_ERROR_CODE_AUTHORITY_UNAVAILABLE
 	message := "automation authority unavailable"
@@ -93,7 +104,7 @@ func automationPublicError(err error) error {
 	if detailErr != nil {
 		return status.Error(codes.Unavailable, "automation authority unavailable")
 	}
-	return st.Err()
+	return &automationPublicStatus{value: st}
 }
 
 // Current Login credential/lifetime validation installs this proof; legacy
@@ -114,18 +125,6 @@ func automationPublicRefusal(ctx context.Context) error {
 }
 
 func (s *Server) GetAutomationCapabilities(ctx context.Context, _ *automationv1.GetAutomationCapabilitiesRequest) (*automationv1.GetAutomationCapabilitiesResponse, error) {
-	return nil, automationPublicRefusal(ctx)
-}
-
-func (s *Server) EnsureOwner(ctx context.Context, _ *automationv1.EnsureOwnerRequest) (*automationv1.EnsureOwnerResponse, error) {
-	return nil, automationPublicRefusal(ctx)
-}
-
-func (s *Server) AcquireOwnerSession(ctx context.Context, _ *automationv1.AcquireOwnerSessionRequest) (*automationv1.AcquireOwnerSessionResponse, error) {
-	return nil, automationPublicRefusal(ctx)
-}
-
-func (s *Server) HandoffOwnerSession(ctx context.Context, _ *automationv1.HandoffOwnerSessionRequest) (*automationv1.HandoffOwnerSessionResponse, error) {
 	return nil, automationPublicRefusal(ctx)
 }
 

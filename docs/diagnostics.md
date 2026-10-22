@@ -2184,6 +2184,28 @@ then keeps the fence: its daemon runs and serves, and the host stays `fenced` or
 Fix what the cause names, confirm the host should run workloads again, then
 run `lv host undrain <host>`.
 
+### Resource pressure (`host.pressure`)
+
+A host's own sampler grades its data directory, its pools, and the daemon's
+descriptors and memory ([configuration](configuration.md#resource-pressure)).
+The host reports the grade on the readiness probe. Evaluator `pressure`,
+subject the host. The failover lease holder writes it from each host's latest
+probe answer, so a host whose disk is full is still described by a peer.
+
+| Raised when | Clears when |
+|---|---|
+| The host reports `warn` or `degrade` (**warning**) or `critical` (**critical**). The evidence names the level, the pressured resources, `since`, `time_to_full_sec`, `sampled_at` and `stale`. | The host reports `ok`, answers without pressure (`pressure.enabled: false`, or an older build), or is removed. |
+
+The lease holder acts only on an answer at most 10 minutes old. A host it has
+no such answer from (down, cut off, or in maintenance) keeps its condition as
+it was, `last_seen` included. With no lease holder, no condition is written,
+while `lv host inspect` and the metrics still show each host's level.
+
+`lv host inspect <host>` shows every resource's free and total. Free space on
+the named filesystem, or move workloads off with `lv host drain <host>`. The
+condition clears on its own once the level does. Nothing is refused because of
+it in this release, and a pressured host stays ready and keeps its vote.
+
 ### Two hosts admitted at one address (`host.address_shared`)
 
 `lv host add` admits one name per machine: the admission write is refused, in
@@ -2759,6 +2781,42 @@ still full pauses it again.
 |---|---|
 | The owner's reconcile pass finds the VM's domain paused by libvirt for an I/O error. | The owner sees the domain in any other state: resumed (`virsh resume <vm>` on its host, once space is freed), stopped, or gone. A pass that cannot read the domain's state leaves it as it was. |
 
+### Corrupt operator-stop marker (`operator_stop_marker_corrupt`)
+
+`lv stop --force` on a host in write quarantine records the stop in a local
+marker, `<data_dir>/operator-stops/<vm>.json`, before it kills the guest, and
+the host records the stop on the VM once the quarantine lifts
+([upgrades.md](upgrades.md#rolling-back-after-a-release-token-latched)). A marker that cannot be read or
+parsed — truncated, another format version, naming another VM — **fails
+closed**: the VM is held stopped on that host (no restart policy, `onboot`,
+self-heal or `lv start`), and the stop is not replayed, so the VM's row can
+still read `running` with its domain shut off. The host logs an error every
+10 minutes, `litevirt_operator_stop_markers{state="corrupt"}` counts the
+marker, and once the host can write again it raises
+`operator_stop_marker_corrupt` (evaluator `operator_stop_marker`, subject
+`vm/<name>`, **critical** severity) with the `host`, the marker's `path`, the
+read `error` and a `remedy` in the evidence. `lv start` is refused with
+`FailedPrecondition`, naming the file.
+
+To clear it, look at the file, then record the stop with `lv stop <vm>`: a
+stop recorded on the VM's row removes its marker, whatever the marker holds.
+Then `lv start <vm>` starts it.
+
+While the host is still in write quarantine, leave the file: nothing can
+start the VM there meanwhile (`lv start` is refused, and the automated starts
+cannot take their lease), and removing it loses the operator's stop — the row
+still reads `running`, so once the quarantine lifts the reconciler would
+start the guest again. Wait for the lift, then `lv stop <vm>`.
+
+Only when the VM was deleted (`lv stop` answers `NotFound`) is there no stop
+to record: remove the file by hand on the host the condition names
+(`rm <data_dir>/operator-stops/<vm>.json`). The condition resolves on that
+host's next reconcile pass.
+
+| Raised when | Clears when |
+|---|---|
+| A reconcile pass on a host out of write quarantine finds a marker it cannot read. | The marker is gone: removed by a recorded `lv stop`, or by hand. |
+
 ### Runtime owner mismatch (`runtime_owner_mismatch`)
 
 The dual-run detector raises `runtime_owner_mismatch` about a **VM** when the
@@ -3311,7 +3369,11 @@ VM's host (`source`), the target (`target`) and what happened (`detail`).
 Find where the guest runs (`virsh list` on both hosts). If it runs on a host,
 `lv doctor repair-owner <vm> <host>` records it there; if it runs on none,
 `lv stop <vm>` settles the record. Either resolves the condition, and so does
-`lv rm <vm>`; each releases the target's reservation.
+`lv rm <vm>`; each releases the target's reservation. Any other ending that
+moves the record off `migrating` on its host resolves it too, within a minute,
+on the host the record then names: a re-point, a `lv doctor firmware-move`
+action (at once), or a live firmware move's own recovery. A firmware move still
+marked on that host keeps it open.
 
 `lv stop` and `lv rm` of a VM recorded `migrating` whose guest is not running
 on its host first ask the move's target whether it holds a domain of the VM.
@@ -3322,6 +3384,69 @@ or removed, over a verified IPMI or Redfish power-off or an operator's
 with `lv host fence-confirm <target>` once it is powered off (and then
 `lv host rm <target> --dead`). A guest still running on its host is stopped
 there, after any migration job libvirtd still runs for it is aborted.
+
+Failover asks the same question of a VM recorded `migrating` on a host it
+recovers: a migration that cut over in libvirt runs the guest on its target
+even when the source died before recording the move. Before anything is
+started, the coordinator asks each such VM's target, once per target per
+poll, a few at a time and within a bounded time, so a target that does not
+answer holds only its own VMs.
+
+- The guest runs there: the record is moved to the target, running, with a
+  `vm.failover.repointed` event, and nothing is started. Its disk rows still
+  name the source and its replication still runs from there:
+  `lv doctor repair-owner <vm> <target>` moves them.
+- The target has no domain of the VM, or is proven powered off as above: the
+  VM is recovered as any running VM (a Secure Boot / vTPM VM excepted, below).
+- Anything else holds the VM where it is recorded, raises
+  `vm.migration_unresolved` naming why, and is asked again on the next poll.
+  It counts in the failover metrics with error class `migrating`. `lv stop`
+  does not settle it, since it forwards to the failed source. What does:
+  - the target does not answer: if it is down, once it is powered off,
+    `lv host fence-confirm <target>`, and the next poll recovers the VM;
+  - the target holds the VM paused or shut off: no `lv` command settles it
+    while the source is down. Start or resume the guest on the target
+    (`virsh start` or `virsh resume`) and the next poll records it there;
+  - the record names no target: find where the guest runs, and
+    `lv doctor repair-owner <vm> <host>` records it there;
+  - a Secure Boot / vTPM VM is never moved by its record alone, and
+    failover never restarts one: its NVRAM and TPM state live on its source
+    and its target. What settles it depends on what its target holds:
+    - the target holds it paused: once the source is powered off,
+      `lv host fence-confirm <source>`, then
+      `lv doctor firmware-move <vm> --adopt-target-copy` adopts that copy,
+      records it on the target and resumes it;
+    - the target runs it, or holds it shut off: no `lv` command handles that
+      yet. Pause it on the target (`virsh suspend <vm>`, or
+      `virsh start --paused <vm>` for a shut-off copy); the next poll then
+      names the steps for a paused copy. A copy in any other state
+      (pm-suspended, crashed, shutting down) has no `lv` command and no
+      host-side step known to be safe: contact the litevirt maintainers;
+    - the target does not answer: no `lv` command starts the VM while both
+      hosts are down, and none handles this yet. Bring the target back and
+      the next poll names the step for what it holds; or bring the source
+      back (below);
+    - the target answers with no copy, or is proven powered off: failover
+      goes on and skips the VM, and no `lv` command starts it while the
+      source is down. Bring the source back (below). If the source cannot
+      come back, its firmware state is lost with it, and no `lv` command
+      handles that.
+
+    When the source comes back, its daemon takes the move up from its own
+    records and asks the target. A target that holds the guest takes it: the
+    move commits there. A target that holds no copy parks the move as
+    `firmware_migration_source_state_suspect`;
+    `lv doctor firmware-move <vm> --accept-source --acknowledge-rollback`
+    then `lv start <vm>` start it on the source (a move that had not reached
+    libvirt's migration is undone instead, and `lv start <vm>` alone starts
+    it). While the target does not answer, the move stays parked as
+    `firmware_migration_target_unreachable`; `lv doctor firmware-move <vm>`
+    shows the phase it parked from. From `prepared`,
+    `lv host fence-confirm <target>` once the target is powered off resolves
+    it within a minute, recording the VM stopped on the source, and
+    `lv start <vm>` starts it. From `cutover`, no `lv` command handles it yet,
+    and a fence of the target does not resolve it: only the target answering
+    again settles it.
 
 ### A firmware move record cannot be read (`firmware_migration_record_unreadable`)
 

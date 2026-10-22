@@ -173,10 +173,12 @@ func (s *Server) WaitFirmwareMoveRecovery() {
 	s.fwLive.recovering.Wait()
 }
 
-// FirmwareMoveRecoveryOnce is one recovery pass, waited for.
+// FirmwareMoveRecoveryOnce is one recovery pass, waited for, then the
+// sweep of the vm.migration_unresolved conditions the pass may have settled.
 func (s *Server) FirmwareMoveRecoveryOnce(ctx context.Context) {
 	s.startFirmwareMoveRecoveryPass(ctx)
 	s.fwLive.recovering.Wait()
+	s.ResolveSettledMigrationsOnce(ctx)
 }
 
 // startFirmwareMoveRecoveryPass takes each marker whose VM's lock is free (a
@@ -184,7 +186,9 @@ func (s *Server) FirmwareMoveRecoveryOnce(ctx context.Context) {
 // cleaning one, which the cleanup retry takes, each in its own goroutine and
 // at most firmwareRecoveryParallel at once, so one move that waits does not
 // hold up the others; then sends each owed DISCARD. Nothing is decided from a
-// replica that has not caught up.
+// replica that has not caught up. Each pass first resolves the
+// vm.migration_unresolved conditions settled since the last
+// (ResolveSettledMigrationsOnce).
 func (s *Server) startFirmwareMoveRecoveryPass(ctx context.Context) {
 	s.dbWorkerEvent(ctx, "firmware_recovery", "pass")
 	if s.db != nil {
@@ -193,6 +197,7 @@ func (s *Server) startFirmwareMoveRecoveryPass(ctx context.Context) {
 			return
 		}
 	}
+	s.ResolveSettledMigrationsOnce(ctx)
 	for _, vm := range s.firmwareMarkerVMs() {
 		unlock, ok := s.tryLockVM(vm)
 		if !ok {

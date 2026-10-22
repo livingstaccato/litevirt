@@ -56,7 +56,7 @@ func TestPCI_AttachRecordsTheHostDriverAndDetachReturnsTheDeviceToIt(t *testing.
 		t.Fatalf("host-driver record after attach = %v, want %s → igbvf", got, addr)
 	}
 	if err := corrosion.ObservePCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
-		HostName: "test-host", Address: addr, Type: "gpu", VendorID: "10de", IOMMUGroup: -1, Driver: "vfio-pci",
+		HostName: "test-host", Address: addr, Type: "gpu", VendorID: "10de", IOMMUGroup: soloIOMMUGroup(addr), Driver: "vfio-pci",
 	}); err != nil {
 		t.Fatalf("rescan: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestReleaseDevices_LogsTheDriverTheDeviceLandedOn(t *testing.T) {
 		t.Fatalf("attach: %v", err)
 	}
 	if err := corrosion.ObservePCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
-		HostName: "test-host", Address: addr, Type: "gpu", VendorID: "10de", IOMMUGroup: -1, Driver: "vfio-pci",
+		HostName: "test-host", Address: addr, Type: "gpu", VendorID: "10de", IOMMUGroup: soloIOMMUGroup(addr), Driver: "vfio-pci",
 	}); err != nil {
 		t.Fatalf("rescan: %v", err)
 	}

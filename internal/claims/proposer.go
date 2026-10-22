@@ -47,6 +47,11 @@ type Spec struct {
 	// Propose builds this proposer's own value, from the promises, when no
 	// promise reports an accepted value.
 	Propose func(promises map[string]corrosion.PrepareResult) (corrosion.ClaimValue, error)
+	// BeforeAccept prepares provenance for the EXACT selected phase-two value.
+	// It runs after highest-accepted selection and ballot binding, never changes
+	// the value/quorum, and its accepted votes still have to pass normal fanout.
+	// A stale promise lets Decide retry at a higher ballot in the usual way.
+	BeforeAccept func(context.Context, corrosion.Ballot, corrosion.ClaimValue) (corrosion.Ballot, error)
 	// StartRound seeds the first ballot's round (the lease term, §3.2). 0 → 1.
 	StartRound uint64
 	// MaxRounds bounds how many ballots one Decide tries. 0 → 8.
@@ -424,6 +429,11 @@ func (p *Proposer) try(ctx context.Context, spec Spec, b corrosion.Ballot, own m
 	targets, quorum := spec.Voters, spec.PrepareQuorum
 	if spec.Electorate != nil {
 		targets, quorum = spec.Electorate(*value)
+	}
+	if spec.BeforeAccept != nil {
+		if promised, err := spec.BeforeAccept(ctx, b, *value); err != nil {
+			return Outcome{}, promised, err
+		}
 	}
 	accepts, arefusals := p.acceptAll(ctx, spec, b, *value, targets, quorum)
 	for _, r := range arefusals {

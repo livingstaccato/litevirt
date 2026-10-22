@@ -958,7 +958,8 @@ func TestFirmwareMoveDoctorTarget_AdoptTransition(t *testing.T) {
 // The post-commit --accept-source returns the VM with the return writer,
 // never with RepointMigratedVM, which needs `migrating` on the source and
 // moves the VM row alone (spec §17 D-5). Only the commits' own fallbacks
-// (a migration's and a drain's live move) call it.
+// (a migration's and a drain's live move) call it, and failover's settle of
+// a non-firmware VM whose failed source left it running on the target.
 //
 // Mutation: call RepointMigratedVM from the doctor — red.
 func TestDoctorFirmwareMove_NeverRepoints(t *testing.T) {
@@ -968,7 +969,10 @@ func TestDoctorFirmwareMove_NeverRepoints(t *testing.T) {
 		case c.sel == "RepointMigratedVM" && c.caller != "internal/grpcapi.Server.finalizeMigrationOwnership" &&
 			// A drain's live move commits with its own fresh-read transfer, and
 			// re-points as the same fallback after a cut-over (host.go).
-			c.caller != "internal/grpcapi.Server.drainOneVM":
+			c.caller != "internal/grpcapi.Server.drainOneVM" &&
+			// Failover re-points a migrating row whose failed source left the
+			// guest running on the target; never a firmware VM's.
+			c.caller != "internal/grpcapi.Server.settleFailedSourceMigration":
 			t.Errorf("RepointMigratedVM called from %s at %s", c.caller, c.pos)
 		case c.sel == "ReturnMigratedVM":
 			n++

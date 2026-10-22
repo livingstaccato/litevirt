@@ -111,6 +111,10 @@ const (
 	// failed host to wait for it, never restarted elsewhere on a blank disk
 	// (restart_same.go).
 	ErrHeldForHost = "held_for_host"
+	// ErrMigrating: the VM's row says migrating, and its guest may run on
+	// the migration's target, so it is not restarted elsewhere
+	// (migrating_row.go).
+	ErrMigrating = "migrating"
 	// ErrLocalStall: quorum agreed a host failed, but this coordinator itself
 	// stopped running within health.StallGrace, so the fence is deferred.
 	ErrLocalStall = "local_stall"

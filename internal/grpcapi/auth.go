@@ -807,7 +807,7 @@ func (s *Server) authenticateSession(ctx context.Context, sid string) (context.C
 		return nil, err
 	}
 	if sess.Realm == "local" && !enrollOnly {
-		identity, proofErr := corrosion.AutomationSessionPrincipal(ctx, s.db, sid)
+		identity, ownerSession, proofErr := corrosion.AuthenticateAutomationOwnerSession(ctx, s.db, sid, s.idleTimeout())
 		var failure *corrosion.AutomationCredentialError
 		switch {
 		case errors.Is(proofErr, corrosion.ErrAutomationCredentialUnstamped):
@@ -816,7 +816,7 @@ func (s *Server) authenticateSession(ctx context.Context, sid string) (context.C
 			if identity == nil || identity.Kind != "principal" || identity.Alias != user.Username || identity.UID == "" || identity.ClusterUID == "" {
 				return nil, status.Error(codes.Unauthenticated, "invalid automation session proof")
 			}
-			ctx = context.WithValue(ctx, automationPrincipalContextKey{}, verifiedAutomationPrincipal{clusterUID: identity.ClusterUID, principalUID: identity.UID})
+			ctx = context.WithValue(ctx, automationPrincipalContextKey{}, verifiedAutomationPrincipal{clusterUID: identity.ClusterUID, principalUID: identity.UID, session: ownerSession})
 		case errors.As(proofErr, &failure):
 			return nil, status.Error(codes.Unauthenticated, "invalid automation session proof")
 		default:

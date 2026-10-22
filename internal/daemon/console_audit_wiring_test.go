@@ -235,6 +235,9 @@ func daemonShutdownWiringError(run *ast.FuncDecl) error {
 		if selector.Sel.Name == "Stop" && runVar(selector.X) == repl {
 			return "repl.Stop"
 		}
+		if selector.Sel.Name == "closeDatabase" && runVar(selector.X) == daemon {
+			return "closeDatabase"
+		}
 		field, ok := selector.X.(*ast.SelectorExpr)
 		if ok && selector.Sel.Name == "Close" && runVar(field.X) == daemon && (field.Sel.Name == "db" || field.Sel.Name == "virt") {
 			return field.Sel.Name + ".Close"
@@ -242,7 +245,9 @@ func daemonShutdownWiringError(run *ast.FuncDecl) error {
 		return ""
 	}
 	// Each dependency close must appear exactly once in Run and as a direct
-	// cleanup statement. A hidden earlier close in prepare/stop is unsafe too.
+	// cleanup statement. The database goes through closeDatabase, which stops
+	// the pressure sampler first. A hidden earlier helper or raw database
+	// close in prepare/stop is unsafe too.
 	counts := map[string]int{}
 	ast.Inspect(run.Body, func(node ast.Node) bool {
 		if call, ok := node.(*ast.CallExpr); ok {
@@ -271,13 +276,16 @@ func daemonShutdownWiringError(run *ast.FuncDecl) error {
 	if !ok || grpcServer.Sel.Name != "grpcSrv" || runVar(grpcServer.X) != daemon {
 		return fmt.Errorf("stopServing must stop the actual daemon's gRPC server")
 	}
+	if counts["db.Close"] != 0 {
+		return fmt.Errorf("Run must close the database through closeDatabase, never directly")
+	}
 	indices, _ := direct(callbacks[2].Body)
-	for _, name := range []string{"repl.Stop", "db.Close", "virt.Close"} {
+	for _, name := range []string{"repl.Stop", "closeDatabase", "virt.Close"} {
 		if _, ok := indices[name]; !ok || counts[name] != 1 {
 			return fmt.Errorf("%s must occur once, directly in the actual cleanup callback", name)
 		}
 	}
-	if !(indices["repl.Stop"] < indices["db.Close"] && indices["db.Close"] < indices["virt.Close"]) {
+	if !(indices["repl.Stop"] < indices["closeDatabase"] && indices["closeDatabase"] < indices["virt.Close"]) {
 		return fmt.Errorf("cleanup must stop replication, close the database, then close libvirt")
 	}
 	return nil
@@ -359,7 +367,7 @@ func daemonShutdownContextError(run *ast.FuncDecl, shutdown *ast.CallExpr, paren
 
 func TestRunShutdownWiringRejectsUnsafeCallbacks(t *testing.T) {
 	const stop = "stopServing(d.grpcSrv, svc, 1, 1, stopped, func(){})"
-	const cleanup = "repl.Stop(); d.db.Close(); d.virt.Close()"
+	const cleanup = "repl.Stop(); d.closeDatabase(); d.virt.Close()"
 	const fixture = `package daemon
 func (d *Daemon) Run(ctx context.Context) error {
  repl := newReplicator()
@@ -371,7 +379,7 @@ func (d *Daemon) Run(ctx context.Context) error {
  defer cancelStop()
  go workers.shutdown(stopCtx, svc.ReExecCh, svc.ShutdownCh, func(reason daemonStopReason){},
   func(){ stopServing(d.grpcSrv, svc, 1, 1, stopped, func(){}) },
-  func(){ repl.Stop(); d.db.Close(); d.virt.Close() })
+  func(){ repl.Stop(); d.closeDatabase(); d.virt.Close() })
  serveErr := awaitServe(serveErrs, stopped, bound)
  cancelStop()
  _ = serveErr
@@ -397,12 +405,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 		{"wrong_stop_service", "stopServing(d.grpcSrv, svc,", "stopServing(d.grpcSrv, other,"},
 		{"wrong_stop_server", "stopServing(d.grpcSrv, svc,", "stopServing(other.grpcSrv, svc,"},
 		{"swapped_callbacks", "func(){ " + stop + " },\n  func(){ " + cleanup + " }", "func(){ " + cleanup + " },\n  func(){ " + stop + " }"},
-		{"early_db_in_stop", stop, "d.db.Close(); " + stop},
-		{"early_db_in_prepare", "func(reason daemonStopReason){}", "func(reason daemonStopReason){ d.db.Close() }"},
-		{"conditional_db_cleanup", "d.db.Close()", "if condition { d.db.Close() }"},
-		{"db_before_repl", cleanup, "d.db.Close(); repl.Stop(); d.virt.Close()"},
-		{"virt_before_db", cleanup, "repl.Stop(); d.virt.Close(); d.db.Close()"},
-		{"wrong_daemon_close", "d.db.Close()", "other.db.Close()"},
+		{"early_db_in_stop", stop, "d.closeDatabase(); " + stop},
+		{"raw_db_in_stop", stop, "d.db.Close(); " + stop},
+		{"raw_db_in_prepare", "func(reason daemonStopReason){}", "func(reason daemonStopReason){ d.db.Close() }"},
+		{"raw_db_cleanup", "d.closeDatabase()", "d.db.Close()"},
+		{"early_db_in_prepare", "func(reason daemonStopReason){}", "func(reason daemonStopReason){ d.closeDatabase() }"},
+		{"conditional_db_cleanup", "d.closeDatabase()", "if condition { d.closeDatabase() }"},
+		{"db_before_repl", cleanup, "d.closeDatabase(); repl.Stop(); d.virt.Close()"},
+		{"virt_before_db", cleanup, "repl.Stop(); d.virt.Close(); d.closeDatabase()"},
+		{"wrong_daemon_close", "d.closeDatabase()", "other.closeDatabase()"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			source := fixture

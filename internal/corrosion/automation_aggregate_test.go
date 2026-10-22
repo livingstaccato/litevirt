@@ -88,7 +88,7 @@ func TestAutomationAggregateSchemaInventory(t *testing.T) {
 			t.Fatalf("aggregate evidence not exclusively inert local: %s", table)
 		}
 	}
-	if !supportedAutomationCutDescriptor(75, 1) || !supportedAutomationCutDescriptor(76, 1) || !supportedAutomationCutDescriptor(77, 1) || !supportedAutomationCutDescriptor(78, 1) || !supportedAutomationCutDescriptor(79, 1) || !supportedAutomationCutDescriptor(80, 1) || !supportedAutomationCutDescriptor(81, 1) || !supportedAutomationCutDescriptor(82, 1) || !supportedAutomationCutDescriptor(83, 1) || !supportedAutomationCutDescriptor(84, 1) || !supportedAutomationCutDescriptor(85, 1) || supportedAutomationCutDescriptor(86, 1) {
+	if !supportedAutomationCutDescriptor(75, 1) || !supportedAutomationCutDescriptor(76, 1) || !supportedAutomationCutDescriptor(77, 1) || !supportedAutomationCutDescriptor(78, 1) || !supportedAutomationCutDescriptor(79, 1) || !supportedAutomationCutDescriptor(80, 1) || !supportedAutomationCutDescriptor(81, 1) || !supportedAutomationCutDescriptor(82, 1) || !supportedAutomationCutDescriptor(83, 1) || !supportedAutomationCutDescriptor(84, 1) || !supportedAutomationCutDescriptor(85, 1) || !supportedAutomationCutDescriptor(86, 1) || supportedAutomationCutDescriptor(87, 1) {
 		t.Fatal("archived75-81/current82 source inventory not classified")
 	}
 }

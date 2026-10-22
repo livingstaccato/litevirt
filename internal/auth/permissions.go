@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/auth/policy"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -23,17 +24,7 @@ import (
 // Trailing slashes are stripped; case is preserved (Linux conventions).
 // Empty string and "/" both refer to the cluster root.
 func canonicalPath(p string) string {
-	if p == "" {
-		return "/"
-	}
-	// Strip trailing "/" for any path other than the root itself.
-	for len(p) > 1 && p[len(p)-1] == '/' {
-		p = p[:len(p)-1]
-	}
-	if p[0] != '/' {
-		p = "/" + p
-	}
-	return p
+	return policy.CanonicalPath(p)
 }
 
 // pathPrefixOf reports whether `prefix` is an ancestor of (or equal to)
@@ -42,18 +33,7 @@ func canonicalPath(p string) string {
 //
 // "/foo/bar" is a prefix of "/foo/bar/baz" but NOT of "/foo/barred".
 func pathPrefixOf(prefix, path string) bool {
-	prefix = canonicalPath(prefix)
-	path = canonicalPath(path)
-	if prefix == "/" {
-		return true
-	}
-	if !strings.HasPrefix(path, prefix) {
-		return false
-	}
-	if len(path) == len(prefix) {
-		return true
-	}
-	return path[len(prefix)] == '/'
+	return policy.PathPrefixOf(prefix, path)
 }
 
 // verbMatches reports whether a role's grant matches the requested verb.
@@ -67,30 +47,7 @@ func pathPrefixOf(prefix, path string) bool {
 // We explicitly do NOT support arbitrary glob (e.g. "v*.read") to keep the
 // matcher fast and the security review surface small.
 func verbMatches(grants []string, verb string) bool {
-	for _, g := range grants {
-		if g == "*" {
-			return true
-		}
-		if g == verb {
-			return true
-		}
-		// "<ns>.*" — namespace-wildcard.
-		if strings.HasSuffix(g, ".*") && !strings.HasPrefix(g, "*") {
-			ns := g[:len(g)-2]
-			if strings.HasPrefix(verb, ns+".") {
-				return true
-			}
-		}
-		// "*.<verb>" — verb-wildcard across namespaces; never a verb only
-		// granted by name (suffixWildcardExempt).
-		if strings.HasPrefix(g, "*.") && !strings.HasSuffix(g, ".*") && !suffixWildcardExempt(verb) {
-			suffix := g[1:] // "*.read" → ".read"
-			if strings.HasSuffix(verb, suffix) {
-				return true
-			}
-		}
-	}
-	return false
+	return policy.VerbMatches(grants, verb)
 }
 
 // VerbPermModify is the delegated-administration verb (Proxmox:
@@ -619,6 +576,7 @@ var BuiltinRoles = []BuiltinRole{
 		Name: "Operator",
 		Verbs: []string{
 			"vm.*", "ct.*",
+			policy.OwnerManage,
 			"network.read", "network.create", "network.delete",
 			"lb.*",
 			"image.read", "image.pull", "image.import", "image.push", "image.build",

@@ -619,7 +619,8 @@ import (
 // anti-entropy dump while every value of it is empty, so a previous-release
 // node takes this build's tokens until then. Appended LAST for the v53
 // digest reason. Additive.
-const CurrentSchemaVersion = 85
+// v86: four local certified-history-derived execution projections; no native authority.
+const CurrentSchemaVersion = 86
 
 // schemaVersionTokenUserIncarnation is the version tokens.user_created_at was
 // added in.
@@ -3241,6 +3242,51 @@ var schemaDDL = []string{
   sequence INTEGER NOT NULL CHECK(sequence>0), configuration_json TEXT NOT NULL,
   PRIMARY KEY(stage,operation_id))`,
 
+	// Schema86: derived execution rows, rebuilt from unchanged certified history.
+	`CREATE TABLE IF NOT EXISTS local_automation_executors (
+ stage TEXT NOT NULL,
+ cluster_uid TEXT NOT NULL,
+ operation_id TEXT NOT NULL,
+ resource_uid TEXT NOT NULL,
+ executor_generation INTEGER NOT NULL CHECK(executor_generation>0),
+ grant_sequence INTEGER NOT NULL CHECK(grant_sequence>0),
+ grant_digest TEXT NOT NULL,
+ admission_sequence INTEGER NOT NULL CHECK(admission_sequence>0),
+ admission_digest TEXT NOT NULL,
+ grant_json TEXT NOT NULL,
+ PRIMARY KEY(stage,cluster_uid,operation_id))`,
+	`CREATE TABLE IF NOT EXISTS local_automation_execution_progress (
+ stage TEXT NOT NULL,
+ cluster_uid TEXT NOT NULL,
+ operation_id TEXT NOT NULL,
+ resource_uid TEXT NOT NULL,
+ applied_sequence INTEGER NOT NULL CHECK(applied_sequence>0),
+ progress_json TEXT NOT NULL,
+ PRIMARY KEY(stage,cluster_uid,operation_id))`,
+	`CREATE TABLE IF NOT EXISTS local_automation_execution_artifacts (
+ stage TEXT NOT NULL,
+ cluster_uid TEXT NOT NULL,
+ operation_id TEXT NOT NULL,
+ artifact_id TEXT NOT NULL,
+ resource_uid TEXT NOT NULL,
+ artifact_key TEXT NOT NULL,
+ artifact_kind TEXT NOT NULL,
+ backend TEXT NOT NULL,
+ object_id TEXT NOT NULL,
+ applied_sequence INTEGER NOT NULL CHECK(applied_sequence>0),
+ artifact_json TEXT NOT NULL,
+ PRIMARY KEY(stage,cluster_uid,operation_id,artifact_id))`,
+	`CREATE TABLE IF NOT EXISTS local_automation_execution_terminals (
+ stage TEXT NOT NULL,
+ cluster_uid TEXT NOT NULL,
+ operation_id TEXT NOT NULL,
+ resource_uid TEXT NOT NULL,
+ applied_sequence INTEGER NOT NULL CHECK(applied_sequence>0),
+ terminal_json TEXT NOT NULL,
+ PRIMARY KEY(stage,cluster_uid,operation_id))`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS automation_execution_artifact_key ON local_automation_execution_artifacts(stage,cluster_uid,operation_id,artifact_kind,artifact_key)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS automation_execution_artifact_object ON local_automation_execution_artifacts(stage,cluster_uid,operation_id,backend,object_id)`,
+
 	// Schema84: derived target history; excluded from replicated/public cut authority.
 	`CREATE TABLE IF NOT EXISTS local_automation_target_operations (
  stage TEXT NOT NULL, cluster_uid TEXT NOT NULL, operation_id TEXT NOT NULL,
@@ -4132,6 +4178,10 @@ var createTableUnits = []struct {
 	{75, "local_automation_receiver_components"},
 	{75, "local_automation_receiver_records"},
 	{75, "local_automation_receiver_pages"},
+	{86, "local_automation_executors"},
+	{86, "local_automation_execution_progress"},
+	{86, "local_automation_execution_artifacts"},
+	{86, "local_automation_execution_terminals"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

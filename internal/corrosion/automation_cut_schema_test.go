@@ -2,9 +2,49 @@ package corrosion
 
 import (
 	"context"
+	"github.com/litevirt/litevirt/internal/automation/contract"
 	"reflect"
 	"testing"
 )
+
+func TestAutomationCut86NonemptyExecutionOriginalReplay(t *testing.T) {
+	f, _ := executionReplayCompletedFixture(t)
+	ctx := context.Background()
+	if storedVersion(t, f.c) != 86 {
+		t.Fatal("actual InitSchema execution86 required")
+	}
+	before := executionStorageSnapshot(t, f.c)
+	if err := f.c.SealVoterGeneration(ctx, 1, "execution86-original-cut"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := f.c.FreezeAutomationCut(ctx, 1, contract.Reduce)
+	if err != nil {
+		t.Fatal("actual nonempty execution86 cut", err)
+	}
+	m, records := cutFixtureRead(t, f.c, id)
+	if m.SourceSchema != 86 || m.Codec != 1 || len(m.Inventory) != 9 {
+		t.Fatal("execution86 cut changed certified inventory", m)
+	}
+	after := executionStorageSnapshot(t, f.c)
+	for _, table := range executionStorageTables {
+		if !reflect.DeepEqual(before[table], after[table]) {
+			t.Fatal("cut changed active execution", table)
+		}
+	}
+	again, err := f.c.FreezeAutomationCut(ctx, 1, contract.Reduce)
+	if err != nil || again != id {
+		t.Fatal("execution86 archive retry", again, err)
+	}
+	later, laterRecords := cutFixtureRead(t, f.c, id)
+	if !reflect.DeepEqual(m, later) || !reflect.DeepEqual(records, laterRecords) {
+		t.Fatal("execution86 archive bytes changed")
+	}
+	for schema := 69; schema <= 85; schema++ {
+		if !supportedAutomationCutDescriptor(schema, 1) {
+			t.Fatal("archived public descriptor lost", schema)
+		}
+	}
+}
 
 // A forward schema can contain required provenance this binary cannot inventory.
 // It must not silently produce a new lower-schema complete cut.

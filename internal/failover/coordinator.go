@@ -390,6 +390,12 @@ type Coordinator struct {
 	// (grpcapi.Server.RecoveryClaimHealthTick — ha.claim.stranded,
 	// ha.voter.unavailable). nil never evaluates them.
 	ClaimHealth func(ctx context.Context)
+	// PressureHealth, when set, runs once per tick in which this coordinator
+	// holds the lease: the host.pressure conditions, written from each
+	// host's latest readiness-probe answer (grpcapi.Server.PressureHealthTick),
+	// so a host that cannot write is still described. It only reports. nil
+	// never evaluates them.
+	PressureHealth func(ctx context.Context)
 	// Claimer decides recovery claims (docs/design/recovery-claims.md §3.13):
 	// *grpcapi.Server, whose proposer reaches every member of the adopted
 	// voter generation. Consulted only while RecoveryClaimEnforced says so.
@@ -400,6 +406,20 @@ type Coordinator struct {
 	// executors on its node read one answer. nil (a hand-built coordinator)
 	// never claims.
 	RecoveryClaimEnforced func(ctx context.Context) bool
+	// SettleMigratingRows decides the VMs whose rows say `migrating` on
+	// source, a host being recovered, in one call per pass: it asks each
+	// migration's target once whether the guest runs there, and re-points a
+	// row to a target that runs it (grpcapi.Server.SettleFailedSourceMigrations).
+	// A VM it gives no decision, or a nil hook (a hand-built coordinator),
+	// is held (migrating_row.go).
+	// askBy is the poll's one deadline for every ask of a target, across all
+	// the hosts it recovers (migratingAskBy).
+	SettleMigratingRows func(ctx context.Context, source string, vms []corrosion.VMRecord, askBy time.Time) map[string]MigratingDecision
+	// migratingAskBy is this poll's deadline for SettleMigratingRows' asks,
+	// set once at the start of each run.
+	migratingAskBy time.Time
+	// askNow replaces the real clock migratingAskBy is read on (unit tests).
+	askNow func() time.Time
 	// claimRetry records hosts whose recovery had a claim refused, so the next
 	// tick re-runs it; a fenced host is otherwise processed once (claims.go).
 	claimRetry map[string]bool
@@ -776,6 +796,7 @@ func (c *Coordinator) Start(ctx context.Context) {
 func (c *Coordinator) RunOnce(ctx context.Context) { c.run(ctx) }
 
 func (c *Coordinator) run(ctx context.Context) {
+	c.beginMigratingAsks()
 	// Self-fence is a HARD local gate: a doomed node (waiting for the watchdog to reboot
 	// it) must not drive any failover decision during the live-but-doomed window, even if
 	// it briefly reacquires quorum/lease. Checked before the lease so a fenced node also
@@ -821,6 +842,9 @@ func (c *Coordinator) run(ctx context.Context) {
 	}
 	if c.ClaimHealth != nil {
 		c.ClaimHealth(ctx)
+	}
+	if c.PressureHealth != nil {
+		c.PressureHealth(ctx)
 	}
 
 	// The voter set is both halves of the quorum: its size is the
@@ -4062,7 +4086,13 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 	plans := make([]failoverPlan, 0, len(vms))
 	placementReqs := make([]placement.Request, 0, len(vms))
 
+	// A VM recorded migrating may run on the migration's target: it is
+	// started nowhere until the target is asked (migrating_row.go).
+	migrating := c.settleMigratingVMs(ctx, h, vms)
 	for _, vm := range vms {
+		if vm.State == "migrating" && !c.recoverMigratingVM(h, vm, migrating) {
+			continue
+		}
 		// A stopped VM is decided FIRST, ahead of auto-promote, which defines
 		// and starts a VM too (skip_stopped.go):
 		//   - stopped by intent: never started. On shared storage only, it is

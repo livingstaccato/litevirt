@@ -16,8 +16,8 @@ func TestAutomationIntegration69MigrationAndDescriptor(t *testing.T) {
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	if CurrentSchemaVersion != 85 || automationCutSourceSchema != 85 {
-		t.Fatalf("current SQL/source descriptor = %d/%d, want85/85", CurrentSchemaVersion, automationCutSourceSchema)
+	if CurrentSchemaVersion != 86 || automationCutSourceSchema != 86 {
+		t.Fatalf("current SQL/source descriptor = %d/%d, want86/86", CurrentSchemaVersion, automationCutSourceSchema)
 	}
 	units := 0
 	for _, m := range schemaMigrationLedger {
@@ -52,8 +52,8 @@ func TestAutomationIntegration69MigrationAndDescriptor(t *testing.T) {
 			}
 		}
 	}
-	if projectUnits != 1 || !supportedAutomationCutDescriptor(82, 1) || !supportedAutomationCutDescriptor(83, 1) || !supportedAutomationCutDescriptor(84, 1) || !supportedAutomationCutDescriptor(85, 1) || supportedAutomationCutDescriptor(86, 1) {
-		t.Fatalf("project71 or archived82/83/84/current85 descriptor boundary changed: units=%d", projectUnits)
+	if projectUnits != 1 || !supportedAutomationCutDescriptor(82, 1) || !supportedAutomationCutDescriptor(83, 1) || !supportedAutomationCutDescriptor(84, 1) || !supportedAutomationCutDescriptor(85, 1) || !supportedAutomationCutDescriptor(86, 1) || supportedAutomationCutDescriptor(87, 1) {
+		t.Fatalf("project71 or archived82/83/84/current86 descriptor boundary changed: units=%d", projectUnits)
 	}
 }
 
@@ -98,16 +98,18 @@ func TestAutomationIntegration80LocalSchemaProvenance(t *testing.T) {
 	}{
 		{"live", "", false},
 		{"retained31", retainedLocalLayout83Digest(), true},
-		{"retained33", retainedLocalLayoutDigest(), true},
+		{"retained33", retainedLocalLayoutDigestFor(automationExecutionArchived85PrivateLayoutForTest()), true},
+		{"retained37", retainedLocalLayoutDigest(), true},
 	} {
-		for _, version := range []int64{77, 78, 79, 80, 81, 82, 83, 84, 85, 86} {
+		for _, version := range []int64{77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87} {
 			t.Run(fmt.Sprintf("%s_schema%d", layout.name, version), func(t *testing.T) {
 				observation := aggregateLocalObservation{retained: layout.retained, layoutDigest: layout.digest}
 				row := Row{Columns: []string{"id", "version"}, Values: []interface{}{int64(1), version}}
 				err := observation.observe(&aggregateLocalAudit{}, 15, 1, row)
-				want := (layout.name == "live" && version == 85) ||
+				want := (layout.name == "live" && version == 86) ||
 					(layout.name == "retained31" && version >= 78 && version <= 83) ||
-					(layout.name == "retained33" && (version == 84 || version == 85))
+					(layout.name == "retained33" && (version == 84 || version == 85)) ||
+					(layout.name == "retained37" && version == 86)
 				if (err == nil) != want {
 					t.Fatalf("schema=%d layout=%s retained=%t: %v", version, layout.name, layout.retained, err)
 				}
@@ -124,7 +126,7 @@ func TestAutomationIntegration85TokenStampInventory(t *testing.T) {
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	if storedVersion(t, c) != 85 || len(schemaMigrationLedger) != 202 {
+	if storedVersion(t, c) != 86 || len(schemaMigrationLedger) != 206 {
 		t.Fatal("SQL85 migration boundary")
 	}
 	units := 0
@@ -175,7 +177,7 @@ func TestAutomationIntegration85TokenStampInventory(t *testing.T) {
 			t.Fatal("SQL85 local issuance trigger inventory differs", trigger.name, err)
 		}
 	}
-	for schema := 69; schema <= 85; schema++ {
+	for schema := 69; schema <= 86; schema++ {
 		if !supportedAutomationCutDescriptor(schema, 1) {
 			t.Fatal("retained descriptor refused", schema)
 		}
@@ -185,7 +187,7 @@ func TestAutomationIntegration85TokenStampInventory(t *testing.T) {
 			}
 		}
 	}
-	if supportedAutomationCutDescriptor(68, 1) || supportedAutomationCutDescriptor(86, 1) {
+	if supportedAutomationCutDescriptor(68, 1) || supportedAutomationCutDescriptor(87, 1) {
 		t.Fatal("unsupported source accepted")
 	}
 	wantSections := []string{"claims", "incarnation_claims", "history", "anchors", "requests", "authority", "adoptions", "seals", "membership"}
@@ -202,7 +204,7 @@ func TestAutomationIntegration85TokenStampInventory(t *testing.T) {
 	for _, layout := range []struct {
 		tables []aggregateLocalTable
 		count  int
-	}{{aggregateLocalTables83(), 31}, {aggregateLocalTables(), 33}} {
+	}{{aggregateLocalTables83(), 31}, {automationExecutionArchived85PrivateLayoutForTest(), 33}, {aggregateLocalTables(), 37}} {
 		if len(layout.tables) != layout.count {
 			t.Fatal("private layout count changed", len(layout.tables))
 		}

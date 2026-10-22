@@ -93,7 +93,7 @@ func validateAutomationBallot(b Ballot, zeroOK bool) error {
 	return nil
 }
 
-func (c *Client) admitAutomationTx(ctx context.Context, tx *LocalTx, key ClaimKey, b Ballot, gen int64, v *ClaimValue) (string, error) {
+func (c *Client) admitAutomationTx(ctx context.Context, tx *LocalTx, key ClaimKey, b Ballot, gen int64, v *ClaimValue, owner *ownerAcceptPreparation) (string, error) {
 	if !key.IsAutomation() {
 		return "", nil
 	}
@@ -179,6 +179,10 @@ func (c *Client) admitAutomationTx(ctx context.Context, tx *LocalTx, key ClaimKe
 			// branch can admit business work. Promise-only Prepare has no class.
 			switch d.Command.Kind {
 			case "initialize_cluster", "read_barrier":
+			case "ensure_owner", "acquire_session", "handoff_session":
+				if refusal, err := c.admitAutomationOwnerTx(ctx, tx, key, gen, *v, cfg, d, owner); err != nil || refusal != "" {
+					return refusal, err
+				}
 			default:
 				return RefusalAutomationUnavailable, nil
 			}

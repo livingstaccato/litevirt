@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"hash/fnv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -41,10 +42,24 @@ func pciOwnerOf(t *testing.T, ctx context.Context, s *Server, addr string) strin
 // (newPCIBindFakeFS). Every test installs the vfio fake so a bind never touches
 // host sysfs.
 
-// seedPCIDevice inserts a host_pci_devices inventory row so the resolver can
+// soloIOMMUGroup is an IOMMU group number of its own for addr, for fixtures that
+// want a device with no siblings. A real scan records -1 only for a device with
+// no IOMMU group, which passthrough refuses (checkIOMMUConflict), so -1 cannot
+// stand for "no siblings" in a fixture that expects the passthrough to work.
+func soloIOMMUGroup(addr string) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(addr))
+	return 1000 + int(h.Sum32()%1000000)
+}
+
+// seedPCIGPU inserts a host_pci_devices inventory row so the resolver can
 // resolve a concrete BDF (and its IOMMU-group siblings) for a VM's passthrough.
+// A negative iommuGroup seeds the device in a group of its own (soloIOMMUGroup).
 func seedPCIGPU(t *testing.T, s *Server, addr string, iommuGroup int) {
 	t.Helper()
+	if iommuGroup < 0 {
+		iommuGroup = soloIOMMUGroup(addr)
+	}
 	if err := corrosion.UpsertPCIDevice(adminCtx(), s.db, corrosion.PCIDeviceRecord{
 		HostName: "test-host", Address: addr, Type: "gpu", VendorID: "10de", IOMMUGroup: iommuGroup,
 	}); err != nil {

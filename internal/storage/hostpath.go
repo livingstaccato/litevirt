@@ -187,6 +187,7 @@ var dataDirOwned = []string{
 	"opjournal",                  // daemon.go: the operation journal
 	"acme",                       // daemon/acme.go: ACME cache_dir default
 	"partition-pause",            // health/partition_pause_store.go partitionPauseDir
+	"operator-stops",             // health/operator_stop_marker.go operatorStopDir: operator-stop markers kept under write quarantine
 	"settle-pending",             // health/settle_pending.go settlePendingDir: VM settles whose record is not yet written
 	"onboot-boot-id",             // health/onboot_boot.go onbootBootFile (and its .tmp, dataDirOwnedPrefixes)
 	"pending-audit",              // corrosion/pending_audit.go PendingAuditDirName

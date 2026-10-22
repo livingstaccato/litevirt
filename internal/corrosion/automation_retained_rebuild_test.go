@@ -11,9 +11,12 @@ import (
 	"hash"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/pki"
 )
 
 // Copy genuinely produced C inputs into isolated retained addresses. This
@@ -458,5 +461,390 @@ func TestRetainedOriginal83ReplayRequiresEmptyTargets(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+// All semantic decisions are the existing retained certified-history premise,
+// signed by this aggregate's own electorate and applied by the real FULL owner.
+func retainedCompatibilityCurrent37Fixture(t *testing.T) (*aggregateFixture, string) {
+	t.Helper()
+	ctx := context.Background()
+	f := newAggregateFixture(t, aggregateFixtureOptions{Old: 3, Sources: 2, Continuing: true, BeforeFreeze: func(t *testing.T, voters []*claimTestVoter, local *claimTestVoter) {
+		verifier, err := LoadClaimVerifier(voters[0].pki)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var common AutomationPrefix
+		for _, v := range voters {
+			head, err := v.c.AutomationHead(ctx)
+			if err != nil || head.Sequence != 0 {
+				t.Fatal("aggregate prerequisite has prior history", head, err)
+			}
+			// Complete newAggregateFixture's test-only native G1 bootstrap
+			// premise before history. targetCertifiedHistoryOn uses the
+			// automationFixture principal "fixture" with request "initialize";
+			// installAutomationEvidence's default request "req" would differ.
+			// This supplies no production bootstrap writer or native issuer.
+			err = v.c.ExecuteLocal(ctx, func(tx *LocalTx) error {
+				head, err := automationHeadTx(ctx, tx)
+				if err != nil {
+					return err
+				}
+				if head != (AutomationPrefix{}) {
+					return fmt.Errorf("current37 bootstrap premise requires an empty head")
+				}
+				for _, table := range []string{"local_automation_authority", "local_automation_history"} {
+					rows, err := tx.Query(ctx, "SELECT 1 AS present FROM "+table+" LIMIT 1")
+					if err != nil {
+						return err
+					}
+					if len(rows) != 0 {
+						return fmt.Errorf("current37 bootstrap premise requires empty %s", table)
+					}
+				}
+				standing, err := readStandingTx(ctx, tx, v.name)
+				if err != nil {
+					return err
+				}
+				if standing.adopted != 1 || standing.cfg == nil || standing.cfg.Generation != 1 || standing.cfg.Change != VoterChangeGenesis || standing.cfg.Certificate == "" || standing.sealed || !reflect.DeepEqual(standing.cfg.Members, membersOf(voters...)) || standing.cfg.MembersHash != MembersHash(standing.cfg.Members) {
+					return fmt.Errorf("current37 bootstrap premise requires the actual unsealed adopted G1 electorate")
+				}
+				member, ok := standing.cfg.Member(v.name)
+				if !ok || standing.incarnation == "" || standing.incarnation != v.inc || member.Incarnation != standing.incarnation {
+					return fmt.Errorf("current37 bootstrap premise voter incarnation differs")
+				}
+				_, err = tx.Exec(ctx, `INSERT INTO local_automation_authority(id,generation,members_hash,incarnation,bootstrap_principal,bootstrap_request,provenance) VALUES(1,?,?,?,?,?,?)`, standing.adopted, standing.cfg.MembersHash, standing.incarnation, "fixture", "initialize", "test-only:current37-native-G1-bootstrap-premise")
+				return err
+			})
+			if err != nil {
+				t.Fatal("current37 native G1 component-fixture premise", v.name, err)
+			}
+			signed, _ := targetCertifiedHistoryOn(t, v.c, voters, verifier)
+			c, grant, admission, config, signed := automationExecutionCertifiedFirstGrantOn(t, v.c, signed)
+			if c != v.c {
+				t.Fatal("retained setup replaced aggregate client")
+			}
+			execution := &executionStorageFixture{c: c, grant: grant, admission: admission, config: config, sign: signed, want: automationExecutionFirstGrantWant(t, grant, admission, config)}
+			execution.start(t)
+			artifacts := execution.artifacts()
+			execution.apply(t, execution.progress(t, "running", artifacts))
+			receipt := execution.apply(t, execution.terminal(t, "succeeded", artifacts))
+			projection := execution.projection(t)
+			if receipt.Sequence != 14 || receipt.State != "succeeded" || projection.Execution == nil || projection.Execution.Grant == nil || projection.Execution.Progress == nil || projection.Execution.Terminal == nil || projection.Execution.Terminal.Result.Outcome != "succeeded" || !reflect.DeepEqual(projection.Execution.Terminal.Artifacts, artifacts) {
+				t.Fatal("genuine FULL aggregate continuation incomplete")
+			}
+			head, err = c.AutomationHead(ctx)
+			if err != nil || head.Sequence != 14 {
+				t.Fatal("current37 original head", head, err)
+			}
+			if common.Sequence == 0 {
+				common = head
+			} else if head != common {
+				t.Fatal("independent producers received different certified histories")
+			}
+		}
+	}})
+	if CurrentSchemaVersion != 86 || storedVersion(t, f.local.c) != 86 || len(aggregateLocalTables()) != 37 {
+		t.Fatal("current37 requires actual86 schema")
+	}
+	before := receiverActive(t, f.local.c)
+	for i := range f.producers {
+		f.stage(t, i, 11, true)
+	}
+	bundle, err := f.receiver.auditAggregate(ctx, f.attempt)
+	if err != nil {
+		t.Fatal("complete nonempty current37 authenticated audit", err)
+	}
+	if receiverActive(t, f.local.c) != before {
+		t.Fatal("source stage/audit changed ACTIVE")
+	}
+	return f, bundle
+}
+
+func retainedCompatibilityFrames(t *testing.T, ctx context.Context, tx *LocalTx, directory retainedDirectoryReader) map[string][]byte {
+	t.Helper()
+	out := map[string][]byte{}
+	err := directory.walk(ctx, tx, func(n int64, d retainedObjectDescriptor) error {
+		entry, err := directory.address.read(ctx, tx, 0, n)
+		if err != nil {
+			return err
+		}
+		out[fmt.Sprintf("%d/entry", n)] = append([]byte(nil), entry...)
+		descriptor, err := json.Marshal(d)
+		if err != nil {
+			return err
+		}
+		out[fmt.Sprintf("%d/descriptor", n)] = descriptor
+		_, _, kind := retainedObjectSections(d.Kind)
+		address, err := retainedAddress(strings.Split(directory.address.namespace, ":")[1], n, d.Source, d.OriginalIdentity, kind)
+		if err != nil {
+			return err
+		}
+		return address.walk(ctx, tx, d, func(component int, ordinal int64, body []byte) error {
+			out[fmt.Sprintf("%d/%d/%d", n, component, ordinal)] = append([]byte(nil), body...)
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatal("complete retained frame read", err)
+	}
+	return out
+}
+
+func retainedCompatibilityExecutionRows(t *testing.T, ctx context.Context, tx *LocalTx, stage string) map[string][]Row {
+	t.Helper()
+	out := map[string][]Row{}
+	for _, table := range executionStorageTables {
+		order := "operation_id"
+		if table == "local_automation_execution_artifacts" {
+			order += ",artifact_id"
+		}
+		rows, err := tx.Query(ctx, "SELECT * FROM "+table+" WHERE stage=? ORDER BY "+order, stage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range rows {
+			if len(rows[i].Columns) == 0 || rows[i].Columns[0] != "stage" {
+				t.Fatal("execution row stage column differs")
+			}
+			rows[i].Values = append([]any(nil), rows[i].Values...)
+			rows[i].Values[0] = ""
+		}
+		out[table] = rows
+	}
+	return out
+}
+
+func retainedCompatibilityClean(t *testing.T, ctx context.Context, tx *LocalTx, got retainedAggregateRebuild) {
+	t.Helper()
+	seen := map[string]bool{}
+	for _, id := range append(got.scratch, got.temporary) {
+		if id != "" && !seen[id] {
+			if err := aggregateCleanScratchTx(ctx, tx, id); err != nil {
+				t.Fatal(err)
+			}
+			seen[id] = true
+		}
+	}
+}
+
+// Raw snapshots deliberately do not decode hostile frames. They retain the
+// original source tables, ACTIVE/ledger/native rows, active semantic rows and
+// original bundle claim rows; derived reconstruction scratch is excluded.
+func retainedCompatibilityRawRows(t *testing.T, ctx context.Context, tx *LocalTx, bundle string) map[string][]Row {
+	t.Helper()
+	out := map[string][]Row{}
+	for _, table := range []string{"local_automation_local_rows", "local_automation_receiver_records", "local_recovery_claims", "local_incarnation_claims", "local_voter_incarnation", "local_voter_adoption", "local_voter_seals", "local_automation_history", "local_automation_prefix", "local_automation_anchors", "local_automation_requests", "local_automation_authority", "local_automation_recovery", "local_automation_staging", "voter_configs", "hosts", "mutation_log", "schema_state", "applied_migrations"} {
+		rows, err := tx.Query(ctx, "SELECT * FROM "+table+" ORDER BY rowid")
+		if err != nil {
+			t.Fatal("raw original snapshot", table, err)
+		}
+		out[table] = rows
+	}
+	for _, d := range automationSemanticTables {
+		rows, err := tx.Query(ctx, "SELECT * FROM "+d.table+" WHERE stage='' ORDER BY "+d.primaryKey)
+		if err != nil {
+			t.Fatal("raw active semantic snapshot", d.table, err)
+		}
+		out["active/"+d.table] = rows
+	}
+	if bundle != "" {
+		for _, d := range []aggregateTable{aggregateCopiesTable, aggregateMaximaTable, aggregateConflictsTable} {
+			rows, err := tx.Query(ctx, "SELECT * FROM "+d.name+" WHERE bundle=? ORDER BY rowid", bundle)
+			if err != nil {
+				t.Fatal("raw original claims snapshot", d.name, err)
+			}
+			out["claims/"+d.name] = rows
+		}
+	}
+	return out
+}
+
+func TestRetainedCurrent37NonemptyExecutionWarmCold(t *testing.T) {
+	ctx := context.Background()
+	f, bundle := retainedCompatibilityCurrent37Fixture(t)
+	c := f.local.c
+	active := receiverActive(t, c)
+	sqltx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := &LocalTx{tx: sqltx}
+	defer sqltx.Rollback()
+	header, directory := retainedCopyOriginalAggregate(t, ctx, tx, f, bundle)
+	headerRaw, err := json.Marshal(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantFrames := retainedCompatibilityFrames(t, ctx, tx, directory)
+	wantExecution := retainedCompatibilityExecutionRows(t, ctx, tx, "")
+	for table, count := range map[string]int{"local_automation_executors": 1, "local_automation_execution_progress": 1, "local_automation_execution_artifacts": 2, "local_automation_execution_terminals": 1} {
+		if len(wantExecution[table]) != count {
+			t.Fatal("genuine applied execution inventory", table)
+		}
+	}
+	wantClaims, err := retainedClaimsDigest(ctx, tx, bundle, bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := f.attempt.view
+	public, err := view.PublicEvidence()
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(tx *LocalTx) {
+		t.Helper()
+		decoded, err := decodeRetainedHeader(headerRaw)
+		if err != nil || !reflect.DeepEqual(decoded, header) || header.Head.Sequence != 14 || header.LayoutDigest != retainedLocalLayoutDigest() {
+			t.Fatal("current37 original header", err)
+		}
+		descriptor, _, err := directory.find(ctx, tx, "local", header.LocalID)
+		if err != nil || len(descriptor.ComponentInventories) != 37 {
+			t.Fatal("current37 descriptor", err)
+		}
+		got, err := rebuildRetainedAggregate(ctx, tx, decoded, f.attempt.binding, directory, view)
+		if err != nil || got.id != bundle || got.claims != wantClaims || got.local.head != header.Head || got.local.coverage != header.LocalCoverage || got.local.dependency != header.LocalDependency {
+			t.Fatal("complete current37 retained reconstruction", err)
+		}
+		for _, table := range []aggregateTable{aggregateCopiesTable, aggregateMaximaTable, aggregateConflictsTable} {
+			if err = aggregateCompareTable(ctx, tx, table, bundle, got.temporary); err != nil {
+				t.Fatal("exact current37 claims", err)
+			}
+		}
+		if !reflect.DeepEqual(wantExecution, retainedCompatibilityExecutionRows(t, ctx, tx, "receiver-audit:"+got.local.store.id)) || !reflect.DeepEqual(wantFrames, retainedCompatibilityFrames(t, ctx, tx, directory)) {
+			t.Fatal("retained execution/terminal/artifacts or original bytes differ")
+		}
+		if !reflect.DeepEqual(wantExecution, retainedCompatibilityExecutionRows(t, ctx, tx, "")) {
+			t.Fatal("rebuild changed active execution")
+		}
+		retainedCompatibilityClean(t, ctx, tx, got)
+	}
+	check(tx)
+	if err = sqltx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if receiverActive(t, c) != active {
+		t.Fatal("warm rebuild changed ACTIVE")
+	}
+	if err = c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	c, err = NewLocalClient(f.dir, f.local.name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	c.SetVoterConfigGate(func() bool { return true })
+	if storedVersion(t, c) != 86 || receiverActive(t, c) != active {
+		t.Fatal("cold current86 state changed")
+	}
+	view, err = pki.CaptureHostTrust(ctx, f.local.pki, f.local.name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coldPublic, err := view.PublicEvidence()
+	if err != nil || !reflect.DeepEqual(public, coldPublic) {
+		t.Fatal("cold native trust capture changed", err)
+	}
+	cold, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cold.Rollback()
+	check(&LocalTx{tx: cold})
+	if err = cold.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if receiverActive(t, c) != active {
+		t.Fatal("cold rebuild changed ACTIVE")
+	}
+}
+
+func TestRetainedCurrent37RejectsOriginalCorruption(t *testing.T) {
+	ctx := context.Background()
+	f, bundle := retainedCompatibilityCurrent37Fixture(t)
+	active := receiverActive(t, f.local.c)
+	sqltx, err := f.local.c.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqltx.Rollback()
+	tx := &LocalTx{tx: sqltx}
+	header, directory := retainedCopyOriginalAggregate(t, ctx, tx, f, bundle)
+	original := retainedCompatibilityFrames(t, ctx, tx, directory)
+	for _, mode := range []string{"unknown-layout", "mixed-header-object", "swapped-suffix", "missing-history", "extra-component", "malformed-frame", "oversized-frame"} {
+		t.Run(mode, func(t *testing.T) {
+			if _, err := sqltx.ExecContext(ctx, "SAVEPOINT compatibility_corrupt"); err != nil {
+				t.Fatal(err)
+			}
+			// Keep the case isolated even when a fatal assertion exits early.
+			// Transaction controls belong to the already-owned SQL transaction;
+			// application data mutations still go through LocalTx below.
+			defer func() {
+				if _, err := sqltx.ExecContext(ctx, "ROLLBACK TO compatibility_corrupt"); err != nil {
+					t.Errorf("rollback hostile case: %v", err)
+					_ = sqltx.Rollback()
+					return
+				}
+				if _, err := sqltx.ExecContext(ctx, "RELEASE compatibility_corrupt"); err != nil {
+					t.Errorf("release hostile case: %v", err)
+					_ = sqltx.Rollback()
+				}
+			}()
+			descriptor, address, err := directory.find(ctx, tx, "local", header.LocalID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bad := header
+			pristine := retainedCompatibilityRawRows(t, ctx, tx, bundle)
+			switch mode {
+			case "unknown-layout":
+				bad.LayoutDigest = strings.Repeat("f", 64)
+			case "mixed-header-object":
+				bad.LayoutDigest = "09e38c2616d9155ed46e134be62b051aaef50a549c538b11c644040f4e710fec"
+			case "swapped-suffix":
+				descriptor.ComponentInventories[35], descriptor.ComponentInventories[36] = descriptor.ComponentInventories[36], descriptor.ComponentInventories[35]
+				raw, _ := json.Marshal(retainedDirectoryEntry{header.LocalRowsObject, descriptor})
+				_, err = tx.Exec(ctx, `UPDATE local_automation_receiver_records SET record=? WHERE attempt=? AND source=? AND component=0 AND ordinal=?`, raw, directory.address.namespace, directory.address.source, header.LocalRowsObject)
+			case "missing-history":
+				_, err = tx.Exec(ctx, `DELETE FROM local_automation_local_rows WHERE local_id=? AND section=2 AND ordinal=1`, address.localID)
+			case "extra-component":
+				_, err = tx.Exec(ctx, `INSERT INTO local_automation_local_rows(local_id,section,ordinal,record) VALUES(?,?,1,?)`, address.localID, 37, []byte("extra"))
+			case "malformed-frame":
+				_, err = tx.Exec(ctx, `UPDATE local_automation_local_rows SET record=? WHERE local_id=? AND section=2 AND ordinal=1`, []byte("malformed"), address.localID)
+			case "oversized-frame":
+				_, err = tx.Exec(ctx, `UPDATE local_automation_local_rows SET record=? WHERE local_id=? AND section=2 AND ordinal=1`, make([]byte, maxAggregateLocalRecordBytes+1), address.localID)
+			}
+			if err != nil {
+				t.Fatal("explicit hostile fixture mutation", err)
+			}
+			hostile := retainedCompatibilityRawRows(t, ctx, tx, bundle)
+			if mode != "unknown-layout" && mode != "mixed-header-object" && reflect.DeepEqual(pristine, hostile) {
+				t.Fatal("hostile source mutation did not change a stored row", mode)
+			}
+			if _, err = rebuildRetainedAggregate(ctx, tx, bad, f.attempt.binding, directory, f.attempt.view); err == nil {
+				t.Fatal("corrupt original accepted", mode)
+			}
+			if !reflect.DeepEqual(hostile, retainedCompatibilityRawRows(t, ctx, tx, bundle)) {
+				t.Fatal("refusal mutated hostile originals or ACTIVE before rollback", mode)
+			}
+			if _, err = sqltx.ExecContext(ctx, "ROLLBACK TO compatibility_corrupt"); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(original, retainedCompatibilityFrames(t, ctx, tx, directory)) {
+				t.Fatal("refusal/rollback changed original rows")
+			}
+			got, err := rebuildRetainedAggregate(ctx, tx, header, f.attempt.binding, directory, f.attempt.view)
+			if err != nil || got.id != bundle {
+				t.Fatal("restored original refused", err)
+			}
+			retainedCompatibilityClean(t, ctx, tx, got)
+		})
+	}
+	if err = sqltx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if receiverActive(t, f.local.c) != active {
+		t.Fatal("refusal changed ACTIVE")
 	}
 }

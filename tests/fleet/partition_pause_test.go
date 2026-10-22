@@ -136,6 +136,8 @@ type ppOpts struct {
 	// pauserHook configures a node's pauser before it starts (its
 	// record-failure mode, a full-disk fault, a self-fence stub).
 	pauserHook func(n *Node, p *health.PartitionPauser)
+	// tPause replaces a node's pauser T_pause (ppTPause), before it starts.
+	tPause map[string]time.Duration
 }
 
 func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
@@ -160,7 +162,11 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		p.SetEnabled(on.Load)
 		p.SetVMBackend(n.Virt)
 		p.SetResumeConfirmer(n.Server.CheckPartitionResume)
-		p.SetTimings(ppTPause, 100*time.Millisecond)
+		tp := ppTPause
+		if d := o.tPause[n.Name]; d > 0 {
+			tp = d
+		}
+		p.SetTimings(tp, 100*time.Millisecond)
 		if o.pauserOnNodeClock {
 			p.SetClock(n.Now)
 		}
@@ -186,6 +192,7 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		coord.Gate = ppGate{chk}
 		coord.Claimer = n.Server
 		coord.RecoveryClaimEnforced = n.Server.RecoveryClaimEnforced
+		coord.SettleMigratingRows = n.Server.SettleFailedSourceMigrations
 		coord.ClaimHealth = n.Server.RecoveryClaimHealthTick
 		latched := o.latched
 		coord.PartitionPauseEnforced = func(context.Context) bool { return latched }

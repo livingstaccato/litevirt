@@ -39,6 +39,9 @@ func retainedLocalLayoutDigest() string { return retainedLocalLayoutDigestFor(ag
 func retainedLocalLayout83Digest() string {
 	return retainedLocalLayoutDigestFor(aggregateLocalTables83())
 }
+func retainedLocalLayout85Digest() string {
+	return retainedLocalLayoutDigestFor(aggregateLocalTables85())
+}
 
 func retainedLocalTablesForDigest(digest string) ([]aggregateLocalTable, error) {
 	switch digest {
@@ -46,6 +49,8 @@ func retainedLocalTablesForDigest(digest string) ([]aggregateLocalTable, error) 
 		return aggregateLocalTables(), nil
 	case retainedLocalLayout83Digest():
 		return aggregateLocalTables83(), nil
+	case retainedLocalLayout85Digest():
+		return aggregateLocalTables85(), nil
 	default:
 		return nil, errors.New("unsupported retained local layout")
 	}

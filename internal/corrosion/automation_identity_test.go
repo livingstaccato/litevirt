@@ -298,7 +298,7 @@ func TestAutomationIdentityCertifiedReplayWithoutEnrollmentProvider(t *testing.T
 	}
 }
 
-var automationTypedTables = []string{"local_automation_target_operations", "local_automation_target_reservations", "local_automation_identities", "local_automation_aliases", "local_automation_owners", "local_automation_semantic_heads", "local_automation_resources", "local_automation_names", "local_automation_bindings", "local_automation_admissions"}
+var automationTypedTables = []string{"local_automation_executors", "local_automation_execution_progress", "local_automation_execution_artifacts", "local_automation_execution_terminals", "local_automation_target_operations", "local_automation_target_reservations", "local_automation_identities", "local_automation_aliases", "local_automation_owners", "local_automation_semantic_heads", "local_automation_resources", "local_automation_names", "local_automation_bindings", "local_automation_admissions"}
 
 func automationTypedSnapshot(t *testing.T, c *Client) map[string][]Row {
 	t.Helper()

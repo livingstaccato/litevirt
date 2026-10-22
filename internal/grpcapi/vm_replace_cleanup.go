@@ -709,6 +709,18 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 	if e := s.movingVMStartRefusal(ctx, rec); e != nil {
 		return failed("start", e)
 	}
+	// An operator's `lv stop --force` made here under write quarantine and
+	// not yet recorded (operator_stop_marker.go) is that explicit operator
+	// stop too: the handoff is finished with the VM down, and the marker's
+	// replay records the stop. A marker that cannot be read holds the VM
+	// and fails the handoff, which is retried.
+	if why, corrupt := health.OperatorStopHold(s.dataDir, s.hostName, rec); why != "" {
+		if corrupt {
+			return failed("start", status.Errorf(codes.FailedPrecondition, "start %q: %s", m.ReplacedVM, why))
+		}
+		slog.Info("replace cutover: not starting the VM — "+why, "vm", m.ReplacedVM)
+		return nil
+	}
 	if e := s.verifyVMISOForStart(ctx, rec); e != nil {
 		return failed("start", e)
 	}

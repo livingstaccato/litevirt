@@ -101,6 +101,9 @@ import (
 
 // Options control fleet bootstrap. Zero values are sane defaults.
 type Options struct {
+	// PersistentDB opens each node's production-format state.db before schema
+	// initialization. It is for actual close/reopen durability scenarios.
+	PersistentDB bool
 	// DBWorkerEvent observes real server bodies; configure before construction.
 	DBWorkerEvent func(string, context.Context, string, string)
 
@@ -481,6 +484,9 @@ func New(t *testing.T, opts Options) *Cluster {
 	if opts.IndependentReplicas && opts.SharedCRDT {
 		t.Fatal("fleet: IndependentReplicas and SharedCRDT are mutually exclusive")
 	}
+	if opts.PersistentDB && (opts.SharedCRDT || opts.RealGossip) {
+		t.Fatal("fleet: PersistentDB requires independent local replicas without RealGossip")
+	}
 	if opts.RealGossip && opts.SharedCRDT {
 		t.Fatal("fleet: RealGossip and SharedCRDT are mutually exclusive")
 	}
@@ -842,7 +848,13 @@ func (c *Cluster) openDB(n *Node, shared bool) {
 		db  *corrosion.Client
 		err error
 	)
-	if shared {
+	if c.opts.PersistentDB {
+		dir := filepath.Join(c.tmpRoot, n.Name, "state")
+		if err := mkdirAll(dir); err != nil {
+			c.t.Fatalf("persistent DB directory for %s: %v", n.Name, err)
+		}
+		db, err = corrosion.NewPersistentTestClient(dir, n.Name)
+	} else if shared {
 		db, err = corrosion.NewSharedTestClient(c.dbName("shared"), n.Name)
 	} else {
 		db, err = corrosion.NewSharedTestClient(c.dbName(n.Name), n.Name)
@@ -1325,6 +1337,9 @@ func (n *Node) LandMigrationsOn(dst *Node) {
 func (n *Node) Reconciler() *health.Reconciler {
 	r := health.NewReconciler(n.Name, n.FW.DataDir, n.DB, n.Virt)
 	r.SetFirmwareStore(n.FW)
+	if n.Server != nil {
+		r.SetOperatorStopReplay(n.Server.ReplayOperatorStopMarkers) // as the daemon wires it
+	}
 	return r
 }
 

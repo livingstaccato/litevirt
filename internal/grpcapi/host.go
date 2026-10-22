@@ -96,6 +96,7 @@ func (s *Server) InspectHost(ctx context.Context, req *pb.InspectHostRequest) (*
 	pools := s.storagePoolsForHost(ctx, h.Name)
 	diskUsed, diskTotal := hostDiskFromPools(pools, int64(h.DiskTotal))
 	reservations, reservedCPU, reservedMem, reservationsErr := s.hostReservations(ctx, h.Name)
+	hostPressure, pressureAt := s.inspectPressure(h.Name)
 
 	return &pb.Host{
 		Name:                h.Name,
@@ -128,6 +129,8 @@ func (s *Server) InspectHost(ctx context.Context, req *pb.InspectHostRequest) (*
 		ReservedMemMib:      reservedMem,
 		ReservationsError:   reservationsErr,
 		ReservationsPartial: reservationsErr != "",
+		Pressure:            hostPressure,
+		PressureObservedAt:  pressureAt,
 	}, nil
 }
 

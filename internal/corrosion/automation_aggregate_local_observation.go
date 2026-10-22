@@ -71,17 +71,33 @@ func (o *aggregateLocalObservation) observe(out *aggregateLocalAudit, section in
 			return errors.New("local snapshot reseed lineage unavailable")
 		}
 	case 15:
-		if o.layoutDigest != "" {
-			if o.layoutDigest == retainedLocalLayout83Digest() && (row.Int64("version") == 84 || row.Int64("version") == 85) {
-				return errors.New("local snapshot schema/layout differs")
-			}
-			if o.layoutDigest == retainedLocalLayoutDigest() && row.Int64("version") != 84 && row.Int64("version") != 85 {
-				return errors.New("local snapshot schema/layout differs")
-			}
+		if n != 1 || row.Int64("id") != 1 {
+			return errors.New("local snapshot schema unavailable")
 		}
-		// Current proof inventories the live schema. Retained originals keep
-		// their pre-metadata, host-incarnation union or prior live80..84 bytes.
-		if n != 1 || row.Int64("id") != 1 || (row.Int64("version") != 85 && !(o.retained && (row.Int64("version") == 78 || row.Int64("version") == 79 || row.Int64("version") == 80 || row.Int64("version") == 81 || row.Int64("version") == 82 || row.Int64("version") == 83 || row.Int64("version") == 84))) {
+		// Original schema_state bytes keep the meaning of their literal
+		// retained inventory. Live observations always use the current layout.
+		version := row.Int64("version")
+		layout := o.layoutDigest
+		if layout == "" {
+			layout = retainedLocalLayoutDigest()
+		}
+		valid := false
+		if o.retained {
+			switch layout {
+			case retainedLocalLayout83Digest():
+				valid = version >= 78 && version <= 83
+			case retainedLocalLayout85Digest():
+				valid = version == 84 || version == 85
+			case retainedLocalLayoutDigest():
+				valid = version == 86
+			}
+		} else {
+			valid = layout == retainedLocalLayoutDigest() && version == 86
+		}
+		if !valid {
+			if o.layoutDigest != "" {
+				return errors.New("local snapshot schema/layout differs")
+			}
 			return errors.New("local snapshot schema unavailable")
 		}
 	case 21:

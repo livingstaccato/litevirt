@@ -24,7 +24,7 @@ func automationApplySemanticEffectsTx(ctx context.Context, tx *LocalTx, stage st
 	if actual != head {
 		return fmt.Errorf("semantic projection predecessor unavailable")
 	}
-	if r.Receipt.Code != "" && (r.TargetEffect != nil || len(r.TargetReservations) != 0 || r.EpochEffect != nil || len(r.RecipientEffects) > 0 || r.WrappingEffect != nil || r.WrappingPrevious != nil || r.IdentityEffect != nil || r.OwnerEffect != nil || r.ResourcePrevious != nil || r.ResourceEffect != nil || r.NameEffect != nil || len(r.BindingEffects) != 0 || r.AdmissionEffect != nil) {
+	if r.Receipt.Code != "" && (r.ExecutorEffect != nil || r.ProgressEffect != nil || r.TerminalEffect != nil || len(r.ArtifactEffects) != 0 || r.TargetEffect != nil || len(r.TargetReservations) != 0 || r.EpochEffect != nil || len(r.RecipientEffects) > 0 || r.WrappingEffect != nil || r.WrappingPrevious != nil || r.IdentityEffect != nil || r.OwnerEffect != nil || r.ResourcePrevious != nil || r.ResourceEffect != nil || r.NameEffect != nil || len(r.BindingEffects) != 0 || r.AdmissionEffect != nil) {
 		return fmt.Errorf("rejected decision has semantic effects")
 	}
 	if v := r.IdentityEffect; v != nil {
@@ -79,6 +79,9 @@ func automationApplySemanticEffectsTx(ctx context.Context, tx *LocalTx, stage st
 	if err := automationApplyKeyEffectsTx(ctx, tx, stage, next, r); err != nil {
 		return err
 	}
+	if err := automationApplyExecutionEffectsTx(ctx, tx, stage, head, next, r); err != nil {
+		return err
+	}
 	_, err = tx.Exec(ctx, `INSERT INTO local_automation_semantic_heads(stage,cluster_uid,sequence,digest) VALUES(?,?,?,?) ON CONFLICT(stage) DO UPDATE SET cluster_uid=excluded.cluster_uid,sequence=excluded.sequence,digest=excluded.digest`, stage, next.ClusterUID, next.Sequence, next.Digest)
 	return err
 }
@@ -87,6 +90,18 @@ func automationApplySemanticEffectsTx(ctx context.Context, tx *LocalTx, stage st
 // history remain intact. Call before replaying the first historical decision.
 func automationResetSemanticProjectionTx(ctx context.Context, tx *LocalTx, stage string) error {
 	if err := requireAutomationFull(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM local_automation_execution_terminals WHERE stage=?`, stage); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM local_automation_execution_artifacts WHERE stage=?`, stage); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM local_automation_execution_progress WHERE stage=?`, stage); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM local_automation_executors WHERE stage=?`, stage); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM local_automation_target_reservations WHERE stage=?`, stage); err != nil {
@@ -215,6 +230,8 @@ func automationSemanticProjectionSourceTx(ctx context.Context, tx *LocalTx, stag
 		return nil
 	case "adopt_resource", "transfer_owner":
 		return automationOwnershipProjectionTx(ctx, tx, stage, p, d)
+	case "claim_executor", "record_progress", "retire_artifact", "complete_operation":
+		return automationExecutionProjectionTx(ctx, tx, stage, p, d, source)
 	case "admit_create":
 		return automationBindingProjectionTx(ctx, tx, stage, p, d)
 	case "assign_identity":

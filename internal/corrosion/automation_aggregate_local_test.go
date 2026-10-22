@@ -16,6 +16,105 @@ import (
 	"github.com/litevirt/litevirt/internal/automation/contract"
 )
 
+// This exercises actual migrated86 snapshot creation and its live observer with
+// nonempty certified-history execution. The attempt below supplies only the
+// private snapshot hash domain; this is not whole-roster aggregate acceptance.
+func TestAggregateLocal86NonemptyExecutionSnapshot(t *testing.T) {
+	f, _ := executionReplayCompletedFixture(t)
+	ctx := context.Background()
+	if storedVersion(t, f.c) != 86 {
+		t.Fatal("actual InitSchema86 required")
+	}
+	before := executionStorageSnapshot(t, f.c)
+	attempt := &AutomationReceiverAttempt{id: "execution86-snapshot-component", binding: []byte("execution86-snapshot-component")}
+	seen := map[string]int64{}
+	err := f.c.ExecuteLocal(ctx, func(tx *LocalTx) error {
+		var observation aggregateLocalObservation
+		var out aggregateLocalAudit
+		_, err := aggregateLocalSnapshot(ctx, tx, attempt, f.c, func(section int, n int64, row Row, raw []byte) error {
+			if err := observation.observe(&out, section, n, row); err != nil {
+				return err
+			}
+			d := aggregateLocalTables()[section]
+			if strings.HasPrefix(d.table, "local_automation_exec") {
+				seen[d.table]++
+				decoded, err := decodeAutomationFramedRow(d.descriptor(), n, raw, maxAggregateLocalRecordBytes)
+				if err != nil {
+					return err
+				}
+				if decoded.String("operation_id") != "create-op" {
+					return fmt.Errorf("execution frame lost original operation")
+				}
+				wrong := aggregateLocalTables()[18].descriptor()
+				if _, err := decodeAutomationFramedRow(wrong, n, raw, maxAggregateLocalRecordBytes); err == nil {
+					return fmt.Errorf("swapped execution section accepted")
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if len(observation.counts) != 37 || observation.cursor != observation.prefix || observation.cursor != out.head {
+			return fmt.Errorf("current execution37 observation lost certified cursors")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal("actual nonempty execution86 snapshot observer", err)
+	}
+	for _, table := range executionStorageTables {
+		if seen[table] == 0 {
+			t.Fatal("snapshot omitted nonempty execution table", table)
+		}
+	}
+	if !reflect.DeepEqual(before, executionStorageSnapshot(t, f.c)) {
+		t.Fatal("snapshot component changed active state")
+	}
+}
+
+func TestAggregateLocal86ExecutionCorruptionBounds(t *testing.T) {
+	for _, mode := range []string{"wrong-live85", "oversized-json", "blob-json", "missing-unique-index"} {
+		t.Run(mode, func(t *testing.T) {
+			f, _ := executionReplayCompletedFixture(t)
+			ctx := context.Background()
+			if err := f.c.ExecuteLocal(ctx, func(tx *LocalTx) error {
+				var err error
+				switch mode {
+				case "wrong-live85":
+					_, err = tx.Exec(ctx, `UPDATE schema_state SET version=85 WHERE id=1`)
+				case "oversized-json":
+					_, err = tx.Exec(ctx, `UPDATE local_automation_executors SET grant_json=? WHERE stage=''`, strings.Repeat("x", MaxAutomationClaimBytes+1))
+				case "blob-json":
+					_, err = tx.Exec(ctx, `UPDATE local_automation_execution_artifacts SET artifact_json=CAST(artifact_json AS BLOB) WHERE stage=''`)
+				case "missing-unique-index":
+					_, err = tx.Exec(ctx, `DROP INDEX automation_execution_artifact_key`)
+				}
+				return err
+			}); err != nil {
+				t.Fatal("negative snapshot corruption", err)
+			}
+			before := executionStorageSnapshot(t, f.c)
+			attempt := &AutomationReceiverAttempt{id: "execution86-negative-component", binding: []byte("execution86-negative-component")}
+			err := f.c.ExecuteLocal(ctx, func(tx *LocalTx) error {
+				var observation aggregateLocalObservation
+				var out aggregateLocalAudit
+				_, err := aggregateLocalSnapshot(ctx, tx, attempt, f.c, func(section int, n int64, row Row, _ []byte) error { return observation.observe(&out, section, n, row) })
+				return err
+			})
+			if err == nil {
+				t.Fatal("malformed execution86 snapshot accepted", mode)
+			}
+			if mode == "wrong-live85" && !strings.Contains(err.Error(), "local snapshot schema unavailable") {
+				t.Fatal("wrong live schema refusal", err)
+			}
+			if !reflect.DeepEqual(before, executionStorageSnapshot(t, f.c)) {
+				t.Fatal("failed snapshot changed corrupt predecessor")
+			}
+		})
+	}
+}
+
 func TestAggregateLocalSnapshotAndFreshRehash(t *testing.T) {
 	for _, partial := range []bool{false, true} {
 		t.Run(fmt.Sprint(partial), func(t *testing.T) {

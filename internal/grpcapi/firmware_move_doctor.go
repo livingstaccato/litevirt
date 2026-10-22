@@ -506,6 +506,10 @@ func (s *Server) firmwareMoveDoctorAct(ctx context.Context, req *pb.FirmwareMove
 	}
 	defer unlock()
 	ctx = context.WithoutCancel(ctx)
+	// An action that settled the VM's row (adopted on the target, returned
+	// or stopped here) settles a vm.migration_unresolved failover or a drain
+	// raised for it, at once rather than on the next minute's sweep.
+	defer s.resolveMigrationUnresolvedIfSettled(ctx, vm)
 	recs := s.fwRecords()
 	m, ok, err := recs.GetMarker(vm)
 	if err != nil {
@@ -1089,6 +1093,14 @@ func (s *Server) doctorAcceptSource(ctx context.Context, m fwmig.Marker, req *pb
 		// target's copy is the committed one, and the source's state is
 		// still its own until the wipe (lab2-D2-proof F3).
 		if !fwPostCommit(from) {
+			if !m.BeforeCutover() && m.SrcStopReason != fwmig.StopReasonMigrated {
+				// The fence resolution leaves this park (fenceResolves): the
+				// source may hold stale TPM state (I6).
+				return "", doctorRefuse(m, action, fmt.Sprintf("no `lv` command handles it yet: after the cutover the source stopped with reason %q, "+
+					"not as a completed migration, so a fence of %s does not resolve it either. It is retried each minute and settles once %s answers: "+
+					"the move finishes there when %s holds the guest, and parks as source_state_suspect when it holds none, which this action then takes",
+					m.SrcStopReason, m.Target, m.Target, m.Target))
+			}
 			return "", doctorRefuse(m, action, "it is retried each minute, and resolved by fence when the target is proved off")
 		}
 	default:

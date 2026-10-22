@@ -29,8 +29,11 @@ func newAutomationFixture(t *testing.T, nodes int, initialize bool) *AutomationF
 	return newAutomationFixtureWith(t, nodes, initialize, nil)
 }
 func newAutomationFixtureWith(t *testing.T, nodes int, initialize bool, beforeGenesis func(*Cluster)) *AutomationFixture {
+	return newAutomationFixtureWithStorage(t, nodes, initialize, beforeGenesis, false)
+}
+func newAutomationFixtureWithStorage(t *testing.T, nodes int, initialize bool, beforeGenesis func(*Cluster), persistent bool) *AutomationFixture {
 	t.Helper()
-	c := New(t, Options{Nodes: nodes, IndependentReplicas: true, FaultSeed: 4102026})
+	c := New(t, Options{Nodes: nodes, IndependentReplicas: true, FaultSeed: 4102026, PersistentDB: persistent})
 	c.WaitConverged(t, convergeTimeout)
 	if beforeGenesis != nil {
 		beforeGenesis(c)

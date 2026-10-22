@@ -63,12 +63,27 @@ func (s receiverAuditStore) compareLocalSemantic(ctx context.Context, stage stri
 		section := -1
 		for i, original := range layout {
 			if original.table == d.table {
+				if original != d {
+					return errors.New("retained semantic descriptor differs")
+				}
 				section = i
 				break
 			}
 		}
-		if section < 0 && d.table != "local_automation_target_operations" && d.table != "local_automation_target_reservations" {
-			return errors.New("retained semantic layout incomplete")
+		if section < 0 {
+			// A missing historical section supplies zero original rows, never
+			// permission to skip current replay. history calls this comparison
+			// at the authenticated original cursor in its isolated stage.
+			missing := false
+			switch d.table {
+			case "local_automation_target_operations", "local_automation_target_reservations":
+				missing = s.localLayoutDigest == retainedLocalLayout83Digest()
+			case "local_automation_executors", "local_automation_execution_progress", "local_automation_execution_artifacts", "local_automation_execution_terminals":
+				missing = s.localLayoutDigest == retainedLocalLayout83Digest() || s.localLayoutDigest == retainedLocalLayout85Digest()
+			}
+			if !missing {
+				return errors.New("retained semantic layout incomplete")
+			}
 		}
 		digest := func(stored bool) (string, error) {
 			h := sha256.New()

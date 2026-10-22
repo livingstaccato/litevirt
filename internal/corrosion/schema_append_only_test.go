@@ -141,3 +141,27 @@ func TestSchemaMigrations_AreAppendOnlyNeverReordered(t *testing.T) {
 		t.Errorf("%s. %q (v%d) is appended after the pinned list; append it to appendOnlyLedger too", appendOnlyRule, m.ID, m.Version)
 	}
 }
+
+func TestSchemaExecution86HasFourAdditiveLocalUnits(t *testing.T) {
+	want := map[string]bool{"local_automation_executors": false, "local_automation_execution_progress": false, "local_automation_execution_artifacts": false, "local_automation_execution_terminals": false}
+	for _, m := range schemaMigrationLedger {
+		if m.Version != 86 {
+			continue
+		}
+		if _, ok := want[m.Target]; !ok || m.Kind != kindCreateTable {
+			t.Fatal("unexpected execution86 migration unit", m)
+		}
+		if want[m.Target] {
+			t.Fatal("duplicate execution86 migration unit", m)
+		}
+		want[m.Target] = true
+	}
+	for table, seen := range want {
+		if !seen {
+			t.Fatal("missing execution86 table migration", table)
+		}
+	}
+	if CurrentSchemaVersion != 86 || schemaVersionTokenUserIncarnation != 85 {
+		t.Fatal("execution86 changed an allocated predecessor meaning")
+	}
+}

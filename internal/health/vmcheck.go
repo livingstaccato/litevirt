@@ -268,6 +268,11 @@ func (v *VMChecker) healthRestart(ctx context.Context, vm corrosion.VMRecord, wh
 			"vm", vm.Name, "restart", what, "host", fresh.HostName, "state", fresh.State, "detail", fresh.StateDetail)
 		return nil, false, false
 	}
+	// An operator's forced stop made here under write quarantine and not
+	// yet recorded (operator_stop_marker.go) is never undone by a restart.
+	if operatorStopHeld("vmcheck", v.dataDir, v.hostName, fresh) {
+		return nil, false, false
+	}
 	if onAct != nil {
 		onAct()
 	}
@@ -1203,6 +1208,12 @@ func (v *VMChecker) maybeRestartVM(ctx context.Context, vm corrosion.VMRecord, n
 	if fresh.HostName != v.hostName {
 		slog.Info("vmcheck: restart-policy skipped — VM no longer owned by this host",
 			"vm", vm.Name, "owner", fresh.HostName)
+		return
+	}
+	// An operator's forced stop made here under write quarantine and not
+	// yet recorded (operator_stop_marker.go): no lease taken, no attempt
+	// counted. healthRestart asks again under the VM's lock.
+	if operatorStopHeld("vmcheck", v.dataDir, v.hostName, fresh) {
 		return
 	}
 

@@ -281,12 +281,20 @@ func (c *Client) automationApply(ctx context.Context, r AutomationRecord, d cont
 		out, err = automationApplyTx(ctx, tx, r, d, digest, reduce, source, nil)
 		return err
 	})
+	if e != nil {
+		out = contract.Receipt{}
+	}
 	return
 }
 
 // automationApplyTx is the sole reducer/application persistence path. History,
 // anchors, permanent receipts, typed projections and prefix share this FULL tx.
 func automationApplyTx(ctx context.Context, tx *LocalTx, r AutomationRecord, d contract.Decision, digest string, reduce AutomationReducer, source automationApplicationProvenance, prepared *contract.KeyTransitionProjection) (out contract.Receipt, e error) {
+	defer func() {
+		if e != nil {
+			out = contract.Receipt{}
+		}
+	}()
 	if err := requireAutomationFull(ctx, tx); err != nil {
 		return out, err
 	}
@@ -697,6 +705,13 @@ func validateAutomationRecordSize(r AutomationRecord) error {
 
 func cloneAutomationProjection(projection AutomationProjection) AutomationProjection {
 	callbackProjection := projection
+	if projection.Execution != nil {
+		// All nested requirements, dispositions, snapshots and exclusion
+		// predecessor requirements belong exclusively to the callback copy.
+		raw, _ := json.Marshal(projection.Execution)
+		callbackProjection.Execution = new(contract.ExecutionProjection)
+		_ = json.Unmarshal(raw, callbackProjection.Execution)
+	}
 	if projection.Target != nil {
 		raw, _ := json.Marshal(projection.Target)
 		callbackProjection.Target = new(contract.TargetProjection)

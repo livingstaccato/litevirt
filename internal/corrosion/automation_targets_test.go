@@ -181,43 +181,7 @@ func targetCertifiedFixtureAt(t *testing.T, kind, dir string) (*Client, Automati
 	if err != nil {
 		t.Fatal(err)
 	}
-	initial := sharedAutomationRecord(t, 1, "", "initialize", "initialize-op", a, b)
-	if _, err := applySharedAutomation(t, a.c, initial, contract.Reduce, automationFreshAnchor); err != nil {
-		t.Fatal(err)
-	}
-	parent := initial.Value.MustDigest()
-	signed := func(d contract.Decision) AutomationRecord {
-		t.Helper()
-		envelope, err := contract.EncodeDecision(d)
-		if err != nil {
-			t.Fatal(err)
-		}
-		value := ClaimValue{Automation: &AutomationClaimValue{Envelope: envelope}}
-		key, _ := AutomationClaimKey(d.Sequence)
-		ballot := testBallot(2, "a")
-		r := AutomationRecord{Value: value, Certificate: ClaimCertificate{Key: key, Ballot: ballot, ConfigGeneration: 1, ValueDigest: value.MustDigest()}}
-		for _, v := range []*claimTestVoter{a, b} {
-			accept, err := v.signer.Sign(key, 1, ballot, value.MustDigest(), v.inc)
-			if err != nil {
-				t.Fatal(err)
-			}
-			r.Certificate.Accepts = append(r.Certificate.Accepts, accept)
-		}
-		if err := verifier.Verify(r.Certificate, CertExpectation{Key: key, ValueDigest: value.MustDigest(), ConfigGeneration: 1, Electorate: membersOf(a, b, c), Quorum: 2}); err != nil {
-			t.Fatal(err)
-		}
-		return r
-	}
-	for i, k := range []string{"project", "principal"} {
-		body := contract.IdentityEnrollment{Version: 1, Kind: k, Alias: k + "-alias", Witness: k + "-source-lifetime", EvidenceID: "retained-cutover"}
-		raw, _ := json.Marshal(body)
-		assignment, _ := json.Marshal(contract.Assignment{Version: 1, ClusterUID: "established-cluster", OperationID: k + "-op", RecordedAt: "2026-10-20T00:00:00Z", Identity: &contract.IdentityAssignment{UID: k + "-uid", Generation: 1, Enrollment: &contract.IdentityEnrollmentFacts{Version: 1, EvidenceID: body.EvidenceID, ClusterUID: "established-cluster", Kind: k, Alias: body.Alias, Witness: body.Witness, CoverageDigest: strings.Repeat("b", 64), FenceSequence: 1}}})
-		r := signed(contract.Decision{Sequence: uint64(i + 2), ParentDigest: parent, Command: contract.Command{Kind: "assign_identity", ClusterUID: "established-cluster", PrincipalID: "host", RequestID: k + "-request", Body: raw}, Assignment: assignment})
-		if _, err := applySharedAutomation(t, a.c, r, contract.Reduce, automationFreshAnchor); err != nil {
-			t.Fatal(err)
-		}
-		parent = r.Value.MustDigest()
-	}
+	signed, parent := targetCertifiedHistoryOn(t, a.c, []*claimTestVoter{a, b, c}, verifier)
 	key := contract.TargetKey{Kind: "vm_name", Name: "ordinary"}
 	expected := contract.TargetPredecessor{Kind: "none"}
 	snapshot := contract.OrdinarySnapshot{CreatedAt: "retained-lifetime", HostName: "a", IdentityHash: strings.Repeat("a", 64)}
@@ -246,6 +210,53 @@ func targetCertifiedFixtureAt(t *testing.T, kind, dir string) (*Client, Automati
 	}
 	assignment, _ := json.Marshal(contract.Assignment{Version: 1, ClusterUID: "established-cluster", OperationID: "target-op", RecordedAt: "2026-10-20T00:00:00Z", Target: target})
 	return a.c, signed(contract.Decision{Sequence: 4, ParentDigest: parent, Command: contract.Command{Kind: kind, ClusterUID: "established-cluster", ProjectUID: "project-uid", PrincipalID: "principal-uid", RequestID: "target-request", Body: body}, Assignment: assignment}), signed, a.signer
+}
+
+// Reuse retained certified history with the existing caller-owned electorate.
+// No client, CA, membership, native permit or fresh business issuer is created.
+func targetCertifiedHistoryOn(t *testing.T, client *Client, voters []*claimTestVoter, verifier *ClaimVerifier) (func(contract.Decision) AutomationRecord, string) {
+	t.Helper()
+	if len(voters) != 3 || client == nil || verifier == nil {
+		t.Fatal("three existing initialized retained-history voters required")
+	}
+	initial := sharedAutomationRecord(t, 1, "", "initialize", "initialize-op", voters[:2]...)
+	if _, err := applySharedAutomation(t, client, initial, contract.Reduce, automationFreshAnchor); err != nil {
+		t.Fatal(err)
+	}
+	parent := initial.Value.MustDigest()
+	signed := func(d contract.Decision) AutomationRecord {
+		t.Helper()
+		envelope, err := contract.EncodeDecision(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		value := ClaimValue{Automation: &AutomationClaimValue{Envelope: envelope}}
+		key, _ := AutomationClaimKey(d.Sequence)
+		ballot := testBallot(2, "a")
+		r := AutomationRecord{Value: value, Certificate: ClaimCertificate{Key: key, Ballot: ballot, ConfigGeneration: 1, ValueDigest: value.MustDigest()}}
+		for _, v := range voters[:2] {
+			accept, err := v.signer.Sign(key, 1, ballot, value.MustDigest(), v.inc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.Certificate.Accepts = append(r.Certificate.Accepts, accept)
+		}
+		if err := verifier.Verify(r.Certificate, CertExpectation{Key: key, ValueDigest: value.MustDigest(), ConfigGeneration: 1, Electorate: membersOf(voters...), Quorum: 2}); err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	for i, k := range []string{"project", "principal"} {
+		body := contract.IdentityEnrollment{Version: 1, Kind: k, Alias: k + "-alias", Witness: k + "-source-lifetime", EvidenceID: "retained-cutover"}
+		raw, _ := json.Marshal(body)
+		assignment, _ := json.Marshal(contract.Assignment{Version: 1, ClusterUID: "established-cluster", OperationID: k + "-op", RecordedAt: "2026-10-20T00:00:00Z", Identity: &contract.IdentityAssignment{UID: k + "-uid", Generation: 1, Enrollment: &contract.IdentityEnrollmentFacts{Version: 1, EvidenceID: body.EvidenceID, ClusterUID: "established-cluster", Kind: k, Alias: body.Alias, Witness: body.Witness, CoverageDigest: strings.Repeat("b", 64), FenceSequence: 1}}})
+		r := signed(contract.Decision{Sequence: uint64(i + 2), ParentDigest: parent, Command: contract.Command{Kind: "assign_identity", ClusterUID: "established-cluster", PrincipalID: "host", RequestID: k + "-request", Body: raw}, Assignment: assignment})
+		if _, err := applySharedAutomation(t, client, r, contract.Reduce, automationFreshAnchor); err != nil {
+			t.Fatal(err)
+		}
+		parent = r.Value.MustDigest()
+	}
+	return signed, parent
 }
 
 func TestLegacyTargetWholeEntryApply(t *testing.T) {
@@ -1070,9 +1081,9 @@ func TestAutomationTargetSchema84(t *testing.T) {
 			c := custodyLifetimeFileClient(t, dir)
 			t.Cleanup(func() { _ = c.Close() })
 			if err := InitSchema(ctx, c); err != nil {
-				t.Fatal("SETUP current schema85", err)
+				t.Fatal("SETUP current schema86", err)
 			}
-			if CurrentSchemaVersion != 85 || automationCutSourceSchema != 85 || storedVersion(t, c) != 85 {
+			if CurrentSchemaVersion != 86 || automationCutSourceSchema != 86 || storedVersion(t, c) != 86 {
 				t.Fatal("TARGET84_CURRENT_PROVENANCE")
 			}
 			units := map[string]bool{"local_automation_target_operations": false, "local_automation_target_reservations": false}
@@ -1090,7 +1101,7 @@ func TestAutomationTargetSchema84(t *testing.T) {
 					t.Fatal("TARGET84_LOCAL", table)
 				}
 			}
-			if !supportedAutomationCutDescriptor(83, 1) || !supportedAutomationCutDescriptor(84, 1) || !supportedAutomationCutDescriptor(85, 1) || supportedAutomationCutDescriptor(86, 1) {
+			if !supportedAutomationCutDescriptor(83, 1) || !supportedAutomationCutDescriptor(84, 1) || !supportedAutomationCutDescriptor(85, 1) || !supportedAutomationCutDescriptor(86, 1) || supportedAutomationCutDescriptor(87, 1) {
 				t.Fatal("TARGET84_DESCRIPTOR_BOUNDARY")
 			}
 			before, err := c.Query(ctx, `SELECT id,applied_at,checksum FROM applied_migrations ORDER BY id`)

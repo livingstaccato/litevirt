@@ -3,13 +3,17 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"github.com/litevirt/litevirt/internal/corrosion"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 type automationPrincipalContextKey struct{}
-type verifiedAutomationPrincipal struct{ clusterUID, principalUID string }
+type verifiedAutomationPrincipal struct {
+	clusterUID, principalUID string
+	session                  *corrosion.AutomationOwnerSession
+}
 
 func callerAutomationPrincipal(ctx context.Context) (verifiedAutomationPrincipal, bool) {
 	if ctx == nil {

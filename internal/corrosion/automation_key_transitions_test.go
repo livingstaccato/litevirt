@@ -119,7 +119,7 @@ func TestAutomationKeyTransitionSchemaIsClassified(t *testing.T) {
 			t.Fatal("used derived table missing", e)
 		}
 	}
-	if !supportedAutomationCutDescriptor(77, 1) || !supportedAutomationCutDescriptor(78, 1) || !supportedAutomationCutDescriptor(79, 1) || !supportedAutomationCutDescriptor(80, 1) || !supportedAutomationCutDescriptor(81, 1) || !supportedAutomationCutDescriptor(82, 1) || !supportedAutomationCutDescriptor(83, 1) || !supportedAutomationCutDescriptor(84, 1) || !supportedAutomationCutDescriptor(85, 1) || supportedAutomationCutDescriptor(86, 1) {
+	if !supportedAutomationCutDescriptor(77, 1) || !supportedAutomationCutDescriptor(78, 1) || !supportedAutomationCutDescriptor(79, 1) || !supportedAutomationCutDescriptor(80, 1) || !supportedAutomationCutDescriptor(81, 1) || !supportedAutomationCutDescriptor(82, 1) || !supportedAutomationCutDescriptor(83, 1) || !supportedAutomationCutDescriptor(84, 1) || !supportedAutomationCutDescriptor(85, 1) || !supportedAutomationCutDescriptor(86, 1) || supportedAutomationCutDescriptor(87, 1) {
 		t.Fatal("new schema descriptor not explicitly classified")
 	}
 }

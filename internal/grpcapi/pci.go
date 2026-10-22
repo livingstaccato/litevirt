@@ -366,7 +366,13 @@ func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.
 		members = append(members, ResolvedMember{DeviceID: deviceID, MemberID: fmt.Sprintf("m%d", ordinal), Address: primary, Ordinal: ordinal})
 		ordinal++
 		exclude[primary] = true
-		groupAddrs, _ := s.iommuGroupSiblings(ctx, primary)
+		groupAddrs, err := s.iommuGroupSiblings(ctx, primary)
+		if err != nil {
+			return status.Errorf(codes.Unavailable,
+				"refusing PCI passthrough of %s: cannot read host %s's PCI inventory (host_pci_devices) "+
+					"for its IOMMU-group siblings: %v; retry once the local database is readable",
+				primary, s.hostName, err)
+		}
 		for _, a := range groupAddrs {
 			if a != primary {
 				members = append(members, ResolvedMember{DeviceID: deviceID, MemberID: fmt.Sprintf("m%d", ordinal), Address: a, Ordinal: ordinal})
@@ -1195,29 +1201,42 @@ func (s *Server) reclaimLeasedDevices(ctx context.Context, vmName string, addrs 
 	return nil
 }
 
-// checkIOMMUConflict verifies that no device in the same IOMMU group
-// is already assigned to a different VM. If a sibling is assigned to
-// another VM, the allocation is rejected.
+// checkIOMMUConflict verifies that no device in the same IOMMU group is already
+// assigned to a different VM. It fails CLOSED: a device whose group cannot be
+// established — the inventory is unreadable, the device is not in it, or it is
+// recorded with no group (the IOMMU is off, or the device has none) — is refused
+// with the reason, because a device that cannot be isolated may share DMA with
+// another VM's device or the host.
+//
+// The group's members come from the same inventory read as the device itself, so
+// the lookup and the conflict check see one snapshot.
 func (s *Server) checkIOMMUConflict(ctx context.Context, address, vmName string) error {
-	devices, _ := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
-	var iommuGroup int = -1
+	devices, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
+	if err != nil {
+		return status.Errorf(codes.Unavailable,
+			"refusing PCI passthrough of %s: cannot read host %s's PCI inventory (host_pci_devices) "+
+				"to check its IOMMU group: %v; retry once the local database is readable",
+			address, s.hostName, err)
+	}
+	iommuGroup, found := -1, false
 	for _, d := range devices {
 		if d.Address == address {
-			iommuGroup = d.IOMMUGroup
+			iommuGroup, found = d.IOMMUGroup, true
 			break
 		}
 	}
+	if !found {
+		return status.Errorf(codes.FailedPrecondition,
+			"refusing PCI passthrough of %s: it is not in host %s's PCI inventory, so its IOMMU group "+
+				"cannot be checked; confirm the address with `lspci -D` on the host and run `lv host rescan %s`",
+			address, s.hostName, s.hostName)
+	}
 	if iommuGroup < 0 {
-		return nil // no IOMMU group — no conflict possible
+		return s.noIOMMUGroupError(address)
 	}
 
-	group, err := corrosion.GetDevicesByIOMMUGroup(ctx, s.db, s.hostName, iommuGroup)
-	if err != nil {
-		return nil // can't check — allow
-	}
-
-	for _, d := range group {
-		if d.VMName != "" && d.VMName != vmName {
+	for _, d := range devices {
+		if d.IOMMUGroup == iommuGroup && d.VMName != "" && d.VMName != vmName {
 			return status.Errorf(codes.FailedPrecondition,
 				"IOMMU group %d conflict: device %s is already assigned to VM %q, "+
 					"cannot assign device %s from the same group to VM %q",
@@ -1227,23 +1246,69 @@ func (s *Server) checkIOMMUConflict(ctx context.Context, address, vmName string)
 	return nil
 }
 
-// iommuGroupSiblings returns all PCI addresses in the same IOMMU group.
+// noIOMMUGroupError is the refusal for a device the inventory records with no
+// IOMMU group. It reads sysfs only to say WHY and what to do; the refusal itself
+// does not depend on what sysfs shows.
+func (s *Server) noIOMMUGroupError(address string) error {
+	prefix := fmt.Sprintf("refusing PCI passthrough of %s on host %s: the PCI inventory records no IOMMU group for it", address, s.hostName)
+	groups := pci.IOMMUGroupsPath()
+	on, err := pci.IOMMUEnabled()
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition,
+			"%s, and cannot read %s to tell whether the IOMMU is on: %v; check that the daemon can read sysfs, then run `lv host rescan %s`",
+			prefix, groups, err, s.hostName)
+	}
+	if !on {
+		return status.Errorf(codes.FailedPrecondition,
+			"%s: the IOMMU is off (%s lists no groups), so the device cannot be isolated from other VMs or the host; "+
+				"on Intel, enable VT-d in the firmware and add intel_iommu=on to the kernel command line; "+
+				"on AMD, enable IOMMU / AMD-Vi in the firmware and make sure neither amd_iommu=off nor iommu=off is on the kernel command line; "+
+				"reboot, then run `lv host rescan %s`",
+			prefix, groups, s.hostName)
+	}
+	link := pci.DeviceIOMMUGroupLink(address)
+	if !pci.DeviceInSysfs(address) {
+		return status.Errorf(codes.FailedPrecondition,
+			"%s, and %s does not exist: the device is no longer present; run `lv host rescan %s`",
+			prefix, filepath.Join(pci.SysDevicesPath(), address), s.hostName)
+	}
+	group, gerr := pci.DeviceIOMMUGroup(address)
+	if gerr == nil {
+		return status.Errorf(codes.FailedPrecondition,
+			"%s, but %s now names group %d: the inventory is stale (scanned before the IOMMU was on); run `lv host rescan %s`",
+			prefix, link, group, s.hostName)
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"%s, and the device has no IOMMU group (%v), so it cannot be isolated; "+
+			"check `dmesg | grep -i -e DMAR -e AMD-Vi -e iommu` for why the IOMMU does not cover it, then run `lv host rescan %s`",
+		prefix, gerr, s.hostName)
+}
+
+// iommuGroupSiblings returns all PCI addresses in the same IOMMU group. A device
+// absent from the inventory or recorded with no group yields just itself; an
+// inventory read error is returned, never papered over with the device alone.
 func (s *Server) iommuGroupSiblings(ctx context.Context, address string) ([]string, error) {
-	devices, _ := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
+	devices, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
+	if err != nil {
+		return nil, err
+	}
+	group := -1
 	for _, d := range devices {
-		if d.Address == address && d.IOMMUGroup >= 0 {
-			group, err := corrosion.GetDevicesByIOMMUGroup(ctx, s.db, s.hostName, d.IOMMUGroup)
-			if err != nil {
-				return nil, err
-			}
-			addrs := make([]string, len(group))
-			for i, g := range group {
-				addrs[i] = g.Address
-			}
-			return addrs, nil
+		if d.Address == address {
+			group = d.IOMMUGroup
+			break
 		}
 	}
-	return []string{address}, nil
+	if group < 0 {
+		return []string{address}, nil
+	}
+	var addrs []string
+	for _, d := range devices {
+		if d.IOMMUGroup == group {
+			addrs = append(addrs, d.Address)
+		}
+	}
+	return addrs, nil
 }
 
 func pciDeviceToProto(d corrosion.PCIDeviceRecord) *pb.PCIDevice {

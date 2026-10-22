@@ -360,9 +360,15 @@ func automationCredentialPrincipal(ctx context.Context, c *Client, kind, id stri
 		return nil, err
 	}
 	defer tx.Rollback()
+	return automationCredentialPrincipalTx(ctx, tx, kind, id)
+}
+
+// The caller owns Client.mu and this transaction. Never call the public,
+// self-locking credential reader from a local admission transaction.
+func automationCredentialPrincipalTx(ctx context.Context, tx *sql.Tx, kind, id string) (*contract.IdentityRecord, error) {
 	var username, witness, principal, cluster, digest string
 	var valid int
-	err = tx.QueryRowContext(ctx, `SELECT username,witness,principal_uid,cluster_uid,credential_digest,valid FROM local_automation_credential_issuance WHERE kind=? AND credential_id=?`, kind, id).Scan(&username, &witness, &principal, &cluster, &digest, &valid)
+	err := tx.QueryRowContext(ctx, `SELECT username,witness,principal_uid,cluster_uid,credential_digest,valid FROM local_automation_credential_issuance WHERE kind=? AND credential_id=?`, kind, id).Scan(&username, &witness, &principal, &cluster, &digest, &valid)
 	if errors.Is(err, sql.ErrNoRows) {
 		if kind == "session" {
 			return nil, ErrAutomationCredentialUnstamped

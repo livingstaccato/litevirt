@@ -484,7 +484,7 @@ func (c *Client) ClaimPrepare(ctx context.Context, key ClaimKey, b Ballot, gen i
 		return res, nil
 	}
 	err := c.ExecuteLocal(ctx, func(tx *LocalTx) error {
-		if r, err := c.admitAutomationTx(ctx, tx, key, b, gen, nil); err != nil {
+		if r, err := c.admitAutomationTx(ctx, tx, key, b, gen, nil, nil); err != nil {
 			return err
 		} else if r != "" {
 			res.Refusal = r
@@ -562,6 +562,11 @@ var errClaimNeedsSourceCheck = errors.New("claim value needs the source cross-ch
 // transaction: it is network I/O and must not hold the database lock.
 func (c *Client) ClaimAccept(ctx context.Context, key ClaimKey, b Ballot, v ClaimValue, gen int64,
 	signer *ClaimSigner, probe OwnerProbe) (AcceptResult, error) {
+	return c.claimAccept(ctx, key, b, v, gen, signer, probe, nil)
+}
+
+func (c *Client) claimAccept(ctx context.Context, key ClaimKey, b Ballot, v ClaimValue, gen int64,
+	signer *ClaimSigner, probe OwnerProbe, owner *ownerAcceptPreparation) (AcceptResult, error) {
 	res := AcceptResult{Voter: c.hostName}
 	digest, err := v.Digest()
 	if err != nil {
@@ -586,7 +591,7 @@ func (c *Client) ClaimAccept(ctx context.Context, key ClaimKey, b Ballot, v Clai
 	for {
 		res = AcceptResult{Voter: c.hostName}
 		err := c.executeLocal(ctx, func(tx *LocalTx) error {
-			if r, err := c.admitAutomationTx(ctx, tx, key, b, gen, &v); err != nil {
+			if r, err := c.admitAutomationTx(ctx, tx, key, b, gen, &v, owner); err != nil {
 				return err
 			} else if r != "" {
 				res.Refusal = r

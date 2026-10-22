@@ -630,14 +630,18 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// user-data). It is set only once GenerateISO has placed it, after the
 	// orphan sweep below removed whatever an earlier incomplete delete left at
 	// that name, so the file there is this create's own.
-	// createdSeedFile is the file it placed (its identity, from the Stat right
-	// after): a concurrent create of the same name may have placed its own
-	// seed at that name since, and that one is not this create's to remove.
+	// createdSeedFile is the file it placed, held open from right after until
+	// the create returns (pinnedFile): a concurrent create of the same name
+	// may have placed its own seed at that name since, and that one is not
+	// this create's to remove. Only a held file's inode cannot be reused by
+	// that other seed, which would then read as this create's own.
 	var createdSeed string
-	var createdSeedFile os.FileInfo
+	var createdSeedFile *pinnedFile
+	defer func() { createdSeedFile.release() }()
 	recordSeed := func(path string) {
-		if fi, err := os.Stat(path); err == nil {
-			createdSeed, createdSeedFile = path, fi
+		if pf, ok := pinFile(path); ok {
+			createdSeedFile.release()
+			createdSeed, createdSeedFile = path, pf
 		}
 	}
 	// removeSeed removes the seed this create placed, if it is still the
@@ -646,8 +650,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		if createdSeed == "" {
 			return
 		}
-		fi, err := os.Stat(createdSeed)
-		if err != nil || !os.SameFile(fi, createdSeedFile) {
+		if !createdSeedFile.stillAt(createdSeed) {
 			noteUndo("seed " + createdSeed + " left: it is no longer the file this create placed")
 			return
 		}
@@ -2202,6 +2205,25 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	if err := s.firmwareMoveRefusal("start", vm); err != nil {
 		return nil, err
 	}
+	// A forced stop made here under write quarantine and not yet recorded
+	// holds the start; out of the quarantine it is recorded first, and the
+	// start goes on from the row that records it (operator_stop_marker.go).
+	if why, _ := health.OperatorStopHold(s.dataDir, s.hostName, vm); why != "" {
+		if err := s.operatorStopStartRefusal(ctx, vm); err != nil {
+			return nil, err
+		}
+		vm, err = corrosion.GetVM(ctx, s.db, req.Name)
+		if err != nil || vm == nil {
+			return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+		}
+	}
+	// A host in write quarantine cannot record a start: the row would keep
+	// saying what it says while the guest runs, and every peer decides from
+	// the row. The automated starts fail closed on their own replicated
+	// writes; an operator's start is refused here, before anything runs.
+	if err := s.quarantinedStartRefusal(vm.Name); err != nil {
+		return nil, err
+	}
 	// A point-in-time overlay an earlier copy left holds writes the disk's
 	// file lacks: settle it before anything reads or starts the disk.
 	if err := s.settlePITOverlays(ctx, vm); err != nil {
@@ -2623,6 +2645,11 @@ func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord
 	if err := s.movingVMStartRefusal(ctx, vm); err != nil {
 		return nil, err
 	}
+	// A forced stop made here under write quarantine and not yet recorded
+	// holds the start (operator_stop_marker.go).
+	if err := s.operatorStopStartRefusal(ctx, vm); err != nil {
+		return nil, err
+	}
 	// A volume move this host left unresolved points the disk row at the file
 	// the persistent config names before anything reads the rows, or refuses
 	// the start (move_unresolved.go).
@@ -2781,9 +2808,6 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 		defer conn.Close()
 		return client.StopVM(ctx, req)
 	}
-	if err := s.quarantinedForceStopRefusal(req.Name, req.Force); err != nil {
-		return nil, err
-	}
 	// A row that says migrating: a guest running here is stopped as before.
 	// Otherwise it may run on the move's target, which is asked first, before
 	// the lock (a peer RPC): a stop recorded here while it runs there would
@@ -2809,6 +2833,13 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 			}
 			return nil, startHeldRefusal("stop", req.Name, held)
 		}
+		// Cancelling it is a replicated record, which a write quarantine
+		// refuses.
+		if reason := s.stopQuarantineReason(); reason != "" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"VM %q is being started and libvirt has not answered: under write quarantine (%s) the start's cancel cannot be recorded, and the stop was not applied; %s, then retry `lv stop --force %s`",
+				req.Name, reason, s.quarantineRemedy(), req.Name)
+		}
 		if out, done, err := s.cancelHeldStart(ctx, req.Name, held); done {
 			return out, err
 		}
@@ -2828,6 +2859,14 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 	// every other VM stops as before.
 	if err := s.firmwareMoveStopRefusal(vm); err != nil {
 		return nil, err
+	}
+	// Under write quarantine a forced stop records itself on this host
+	// before it kills (operator_stop_marker.go): unrecorded, the restart
+	// policy would undo it once the quarantine lifts.
+	if req.Force {
+		if reason := s.stopQuarantineReason(); reason != "" {
+			return s.quarantinedForceStopLocked(ctx, vm, reason)
+		}
 	}
 	if vm.State == "migrating" {
 		if !migratingSeen || vm.StateDetail != migratingDetail {
@@ -2871,33 +2910,6 @@ func (s *Server) stopQuarantineReason() string {
 		return ""
 	}
 	return s.db.WriteQuarantineReason()
-}
-
-// quarantineRemedy is how the write quarantine behind reason lifts: release
-// probation lifts by itself once a voter majority has confirmed it; any
-// other quarantine needs this host upgraded again or reseeded.
-func (s *Server) quarantineRemedy() string {
-	if s.db != nil && s.db.InReleaseProbation() && !s.db.WALQuarantined() {
-		return "wait for its release probation, which lifts by itself once a voter majority has been asked (`lv cluster upgrade-status`)"
-	}
-	return "upgrade this host's binary again or reseed the host (docs/upgrades.md)"
-}
-
-// quarantinedForceStopRefusal refuses `lv stop --force` on a host in write
-// quarantine, before anything reaches libvirt: the destroy could not be
-// recorded as the operator's, and the restart policy would undo it (above).
-// A graceful stop still runs (stopLocked never force-kills it while the
-// quarantine holds).
-func (s *Server) quarantinedForceStopRefusal(name string, force bool) error {
-	reason := s.stopQuarantineReason()
-	if !force || reason == "" {
-		return nil
-	}
-	return status.Errorf(codes.FailedPrecondition,
-		"VM %q was not stopped: this host is in write quarantine (%s) and cannot record a forced stop, "+
-			"which its restart policy would then undo; the guest is left running. A graceful `lv stop %s` "+
-			"still shuts the guest down; or %s, then retry `lv stop --force %s`",
-		name, reason, name, s.quarantineRemedy(), name)
 }
 
 // stopVMLocked stops a LOCAL VM (force ⇒ destroy, else graceful shutdown with a
@@ -3070,6 +3082,8 @@ func (s *Server) stopLocked(ctx context.Context, vm *corrosion.VMRecord, force b
 		}
 		return nil, status.Errorf(codes.Internal, "stopped but recording operator-stop failed: %v", err)
 	}
+	// The row now holds the stop an operator-stop marker held, if any.
+	s.clearOperatorStopMarker(vm.Name)
 	evDetail := note
 	switch {
 	case cancelled != "":

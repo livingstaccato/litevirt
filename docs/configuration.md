@@ -816,6 +816,12 @@ host_updates:
   interval_minutes: 360    # 0 -> 360; minimum 5
   refresh_index: false     # true runs `apt-get update` / `dnf makecache` first: a network call (and the apt lock), so opt-in
 
+# Resource pressure: this host grades its data directory, its storage pools,
+# and the daemon's file descriptors and memory, and reports the grade. It
+# reports only. Every key is in "Resource pressure" below.
+pressure:
+  enabled: true
+
 # Post-upgrade health watchdog. After a self-upgrade re-exec, verify the NEW
 # binary's local gRPC becomes pingable within the deadline; if not, roll back to
 # the previous binary (.old) and exit so systemd restarts it. Catches a binary
@@ -1208,6 +1214,95 @@ refusing there would strand the ones that lost the race.
 To exceed the policy deliberately for one VM, pass `--allow-overcommit` to
 `lv run` or `lv start`; the host check is skipped (project quota still applies)
 and the bypass is audited.
+
+## Resource pressure
+
+Each host samples its own resources every `sample_interval_sec` and grades each
+one `ok`, `warn`, `degrade` or `critical`. The host's level is the worst of
+them. The thresholds are per host, because each host reads its own
+`config.yaml`, and per pool through `pool_overrides`.
+
+| Resource | Graded by |
+|---|---|
+| `data_dir.space`, `pool.<name>.space` | Bytes free to the daemon (`f_bavail`), as a percentage and against a MiB floor. A level is entered when either one is crossed. |
+| `data_dir.inodes`, `pool.<name>.inodes` | Free inodes, as a percentage. Skipped on a filesystem without an inode count (btrfs). |
+| `fds.daemon` | Open descriptors as a percentage of the soft `RLIMIT_NOFILE`. |
+| `memory.daemon` | The Go runtime's mapped memory, less what it returned to the kernel, as a percentage of `daemon_limit_mib`. |
+
+Pools are the file-based pools of this host (`local`, `dir`, `nfs`, `btrfs`),
+from config and from pools made with `lv pool create`. A pool on the data directory's
+filesystem is graded under both names. A statfs that gets no answer (a hung
+NFS mount), or a descriptor or memory count that cannot be read, is recorded
+as the resource's error, and the resource keeps its last level. The pool list
+is read off the sampling path: a read that does not return within 2 seconds is
+abandoned, and the last list is graded.
+
+A report is **stale** when the pool list read is overdue, or when no sample
+has completed for more than three sample intervals. Its levels are then the
+last ones known.
+
+```yaml
+pressure:
+  enabled: true              # false: sample and report nothing; peers see this host's pressure as unknown
+  sample_interval_sec: 5
+  enter_samples: 2           # consecutive samples past a threshold to enter its level
+  clear_margin_pct: 2        # points better than a threshold to count toward leaving it (a MiB floor: 25 % of the floor)
+  clear_after_sec: 120       # every sample past the margin for this long before a level is left
+  trend_window_sec: 900      # window of the time-to-full projection (minimum 60)
+  data_dir:                  # 0 turns a threshold off
+    warn_free_pct: 15
+    degrade_free_pct: 8
+    critical_free_pct: 3
+    warn_free_mib: 4096
+    degrade_free_mib: 2048
+    critical_free_mib: 512
+    warn_free_inodes_pct: 10
+    degrade_free_inodes_pct: 5
+    critical_free_inodes_pct: 1
+  pools:                     # the same keys and defaults as data_dir, for every pool
+    warn_free_pct: 15
+  pool_overrides:            # per pool name; a key left out keeps the pools: value
+    fast-nvme:
+      warn_free_pct: 25
+      degrade_free_pct: 15
+  memory:
+    daemon_limit_mib: 0      # 0 = auto: 10 % of RAM, at least 1 GiB and at most 4 GiB
+    warn_pct: 60             # percentage IN USE
+    degrade_pct: 75
+    critical_pct: 90
+  fds:
+    warn_pct: 70             # percentage of the descriptor limit IN USE
+    degrade_pct: 85
+    critical_pct: 95
+```
+
+The daemon refuses to start if a worse level's threshold is looser than a
+milder one's, for example `degrade_free_pct` above `warn_free_pct`. A
+threshold that is off (0) is not checked against the others.
+
+**Where it shows.**
+
+- The readiness probe. `Ready` carries the level, the pressured resources
+  and the time to full. Each peer keeps the latest answer from every host.
+  Pressure never makes a host unready, so a pressured host keeps its vote. A
+  host on an older build, or with `enabled: false`, answers without the field,
+  and its pressure is unknown, never ok.
+- The `host.pressure` condition in `lv health`. The failover lease holder
+  writes it for every host from that host's latest probe answer, so a host
+  that cannot write is still described. It is a warning, or critical at
+  `critical`, and it resolves when the host is back to `ok`. See
+  [diagnostics](diagnostics.md#resource-pressure-hostpressure).
+- `lv host inspect <host>`. `pressure` holds the level, the pressured resources,
+  `since`, `time_to_full_sec`, `sampled_at`, `stale` and each resource's free
+  and total.
+  `pressure_observed_at` is when the probe that carried it was sent.
+- Metrics: `litevirt_host_pressure_level`, `litevirt_host_free_bytes`,
+  `litevirt_host_time_to_full_seconds`,
+  `litevirt_host_pressure_last_sample_timestamp_seconds` and
+  `litevirt_host_pressure_stale` ([telemetry](telemetry.md#resource-pressure-metrics)).
+
+This release only reports pressure. Nothing is refused, paused or shed
+because of it.
 
 ## Metrics endpoint exposure
 

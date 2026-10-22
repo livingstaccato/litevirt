@@ -251,7 +251,12 @@ func failoverLog(out string) string {
 // it.
 func TestFleet_PartitionPause_TwoVoterChangesSinceTheOutageHold(t *testing.T) {
 	ctx := context.Background()
-	c, s, _ := bridgeFleet(t, ppOpts{coordinators: map[string]bool{"node-3": true}})
+	// node-0 must not pause before it is healed to node-1 and node-2: a
+	// pause it reports there replicates to the majority, and its own word
+	// then lets the deadline go ahead (as it should). On ppTPause that
+	// ordering is a race the fence decision wins only under light load.
+	c, s, rs := bridgeFleet(t, ppOpts{coordinators: map[string]bool{"node-3": true},
+		tPause: map[string]time.Duration{"node-0": ppHoldOwnerTPause}})
 	owner, n1, n2, n3, n5 := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[3], c.Nodes[5]
 	measureSkews(t, c, s)
 	settleVoterHistory(t, c, 45*time.Second)
@@ -271,6 +276,9 @@ func TestFleet_PartitionPause_TwoVoterChangesSinceTheOutageHold(t *testing.T) {
 		return err == nil && h != nil && (h.State == "fenced" || h.State == "offline")
 	})
 	fencedAt := time.Now()
+	if ev, ok := firstEvent(owner, "suspend", "pp-vm"); ok {
+		t.Fatalf("setup: node-0 paused pp-vm at %s, before the heal: its report would reach the majority", ev.When.Format("15:04:05.000"))
+	}
 	c.HealGossipBetween([]*Node{owner}, []*Node{n1, n2})
 	late := fencedAt.Add(10 * time.Second)
 	eventually(t, ppRecoverBound, "node-3 to hold node-1's and node-2's answers from node-0, 10 s after the fence", func() bool {
@@ -297,7 +305,18 @@ func TestFleet_PartitionPause_TwoVoterChangesSinceTheOutageHold(t *testing.T) {
 		noStart()
 		time.Sleep(time.Second)
 	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.max > 1 {
+		t.Fatalf("pp-vm ran on more than one host at once: %v", rs.overlap)
+	}
 }
+
+// ppHoldOwnerTPause is node-0's T_pause in TwoVoterChangesSinceTheOutageHold:
+// well past the majority's fence decision even under heavy load (about 9 s
+// after node-0 loses the majority at 20 tests at once), so node-0 cannot
+// pause before the test heals it.
+const ppHoldOwnerTPause = 40 * time.Second
 
 // measureSkews has every node's checker Ping every peer, as the daemon's
 // capability sweeps do, until each has measured every peer's clock skew and

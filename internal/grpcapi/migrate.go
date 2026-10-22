@@ -222,6 +222,17 @@ func (s *Server) sourceGateRefused(ctx context.Context, vm *corrosion.VMRecord, 
 // its whole step, calls this directly for its cold moves (drainColdMove), with
 // the same lock discipline.
 func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, vm *corrosion.VMRecord, send func(pb.MigratePhase, float32, float32) error, unlock func(), adopted *bool, opts ownedMigrateOpts) error {
+	// A move out ends in an ownership commit this host writes, after a
+	// cut-over that cannot be undone, and starts with a `migrating` row this
+	// host writes. Under write quarantine both are refused: the guest would
+	// run on the target while every row names this host, and failover of
+	// this host would then start a second copy. Refused before anything is
+	// done anywhere.
+	if reason := s.stopQuarantineReason(); reason != "" {
+		return status.Errorf(codes.FailedPrecondition,
+			"%s cannot move VM %q to %s: it is under write quarantine (%s), so the move's ownership commit cannot be recorded; %s, then retry",
+			s.hostName, vm.Name, req.TargetHost, reason, s.quarantineRemedy())
+	}
 	// A volume move left unresolved: the rows name the file holding the
 	// guest's writes before anything reads them for the migration
 	// (move_unresolved.go).

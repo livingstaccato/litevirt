@@ -656,7 +656,8 @@ applied a feature's data it cannot interpret — before the quarantine came up,
 or on a build from before this mechanism — may still run that host's workloads
 without it (a VM defined without the limits a feature set, for example). So a
 host quarantined below a release feature in use must be **drained** of the
-workloads the feature touches (`lv host drain`), then upgraded again or reseeded;
+workloads the feature touches (`lv host drain`) once it is upgraded again or
+reseeded: while the quarantine holds it moves nothing off itself (below), and
 reseeding alone does not correct a workload already running.
 
 **`lv stop` on a quarantined host.** A stop's `operator-stop` record is a
@@ -681,6 +682,12 @@ quarantine holds:
 - `lv start` is refused with `FailedPrecondition`: a start cannot be
   recorded either, and a guest started now would run while the cluster's
   record of it says otherwise.
+- `lv migrate` of a VM off the host, live or `--cold`, is refused with
+  `FailedPrecondition` naming the quarantine, before anything is done on the
+  target. The move's ownership commit is a write this host makes after
+  libvirt's cut-over: refused, it would leave the guest running on the target
+  while every row names this host, and failover of this host would start a
+  second copy. `lv host drain` of the host is refused too.
 
 Release probation lifts by itself (`lv cluster upgrade-status`). Any other
 quarantine needs the host upgraded again or reseeded.

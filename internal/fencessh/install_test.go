@@ -68,6 +68,16 @@ func (w *installWorld) rootList(t *testing.T, addr string) string {
 	return parseSSHDT(out)["authorizedkeysfile"]
 }
 
+// rootAKC is root's effective AuthorizedKeysCommand for a connection from addr.
+func (w *installWorld) rootAKC(t *testing.T, addr string) string {
+	t.Helper()
+	out, err := exec.Command(SSHDPath(), "-T", "-f", w.cfg, "-C", "user=root,host=,addr="+addr).Output()
+	if err != nil {
+		t.Fatalf("sshd -T: %v", err)
+	}
+	return parseSSHDT(out)["authorizedkeyscommand"]
+}
+
 // TestInstallScript_RollsBackWhatSSHDRefuses: an sshd that refuses the result
 // (`sshd -t` fails) gets its previous drop-in back, unchanged.
 func TestInstallScript_RollsBackWhatSSHDRefuses(t *testing.T) {
@@ -242,6 +252,10 @@ func TestInstallScript_FindsAnAuthorizedKeysCommandUnderAnyMatch(t *testing.T) {
 		"=AuthorizedKeysCommand /usr/bin/true %u",
 		"= AuthorizedKeysCommand /usr/bin/true %u",
 		`""AuthorizedKeysCommand /usr/bin/true %u`,
+		// sshd reads a carriage return as a blank, before the keyword and
+		// between it and its value.
+		"\rAuthorizedKeysCommand /usr/bin/true %u",
+		"AuthorizedKeysCommand\r/usr/bin/true %u",
 	} {
 		t.Run(line, func(t *testing.T) {
 			inc := filepath.Join(t.TempDir(), "admin.conf")
@@ -249,6 +263,9 @@ func TestInstallScript_FindsAnAuthorizedKeysCommandUnderAnyMatch(t *testing.T) {
 				t.Fatal(err)
 			}
 			w := newInstallWorld(t, "Include "+inc+"\n")
+			if got := w.rootAKC(t, "192.168.50.5"); got != "/usr/bin/true %u" {
+				t.Fatalf("%q: sshd does not read it as root's AuthorizedKeysCommand (%q)", line, got)
+			}
 			out := w.run(t, "FENCE_SSH_PEERS=10.77.0.3")
 			if w.dropIn(t) != "" || !strings.Contains(out, "already has an AuthorizedKeysCommand") {
 				t.Fatalf("%q: drop-in %q, output %q", line, w.dropIn(t), out)

@@ -52,16 +52,17 @@ lv_fence_ssh_reload() {
     systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null
 }
 # lv_fence_ssh_akc_line prints the first line of file $1 whose keyword,
-# read the way sshd reads one (leading blanks and "=" skipped, quotes
-# removed, any case), is AuthorizedKeysCommand. Conservative: a line that is
-# only close to one still counts, since a false match only means no drop-in.
+# read the way sshd reads one (leading blanks, carriage returns and "="
+# skipped, a carriage return a blank, quotes removed, any case), is
+# AuthorizedKeysCommand. Conservative: a line that is only close to one still
+# counts, since a false match only means no drop-in.
 lv_fence_ssh_akc_line() {
     awk '{
         l = $0
         gsub("[\"\047]", "", l)
-        sub("^[ \t=]+", "", l)
+        sub("^[ \t\r=]+", "", l)
         if (l ~ /^#/) next
-        split(l, w, "[ \t=]+")
+        split(l, w, "[ \t\r=]+")
         if (tolower(w[1]) == "authorizedkeyscommand") { print $0; exit }
     }' "$1"
 }

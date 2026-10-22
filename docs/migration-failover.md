@@ -1102,12 +1102,13 @@ host's daemon generates a fence key of its own (`/etc/litevirt/ssh/fence_ed25519
 row, its public half and the host's sshd host keys, signed with the host's
 cluster certificate. Every daemon verifies every peer's row against the cluster
 CA and the CRL (the certificate must name the row's host and not be revoked) and
-renders the verified ones every 30 seconds:
+renders the verified ones every 30 seconds, leaving out a peer whose certificate
+has expired:
 
 | File | Contents |
 |---|---|
 | `/etc/litevirt/ssh/authorized_keys` | one line per peer: `restrict,from="<the peer's certificate address>",command="/etc/litevirt/ssh/fence-command"` and its key |
-| `/etc/litevirt/ssh/known_hosts` | each peer's sshd host keys, pinned under `litevirt-fence.<hex of its name>` |
+| `/etc/litevirt/ssh/known_hosts` | each peer's sshd host keys, pinned under `litevirt-fence.<hex of its name>`; an expired peer is not listed, though a fence of it still carries its pin |
 | `/etc/litevirt/ssh/fence-command` | the forced command: powers this host off only for a request naming it (`litevirt-fence v1 poweroff <hex name>`), answers a probe's `check` without arming, refuses anything else with exit 3 |
 
 The address a key is accepted from is the one IPv4 address the peer's

@@ -1089,12 +1089,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// every host does (re-review m8).
 	fc.SetNICGuardPlacement(svc.GuardHostNeeded)
 	d.svc = svc
-	// Managed fence SSH (internal/fencessh): this host's signed row, and
-	// every verified peer rendered into /etc/litevirt/ssh.
+	// Managed fence SSH (internal/fencessh): this host's signed row, every
+	// verified peer rendered into /etc/litevirt/ssh, and how each ssh fence
+	// from here — the coordinator's and FenceHost's — reaches its target.
 	fenceSSH := fencessh.New(fencessh.Config{
 		Self: d.cfg.HostName, PKIDir: d.cfg.PKIDir, DB: d.db, Gate: svc,
 		Accepting: fencessh.SSHDAccepting(fencessh.SSHDPath(), "", fencessh.DefaultDir),
+		Mode:      func() string { return d.cfg.Enforcement.FenceSSH },
 	})
+	svc.SetFenceSSH(fenceSSH)
+	fc.FenceSSH = fenceSSH.FenceConfig
 	go fenceSSH.Run(ctx)
 	if d.startWaitSvc != nil {
 		d.startWaitSvc.Store(svc)

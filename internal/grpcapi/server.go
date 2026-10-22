@@ -21,6 +21,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
+	"github.com/litevirt/litevirt/internal/fencessh"
 	"github.com/litevirt/litevirt/internal/firewall"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hostnet"
@@ -53,6 +54,10 @@ type Server struct {
 	// operatorStopMarkerObs is the litevirt_operator_stop_markers gauge
 	// (operator_stop_marker.go); nil records nothing.
 	operatorStopMarkerObs func(pending, corrupt int)
+	// fenceSSH is this host's managed fence SSH agent: how FenceHost's ssh
+	// fence reaches its target, and the probe `lv doctor fence` reports. Nil
+	// leaves every SSH fence on the legacy path (tests that wire none).
+	fenceSSH *fencessh.Agent
 	// fenceExec, when set, replaces fence.Execute for FenceHost (tests only;
 	// SetFenceExecutor).
 	fenceExec fenceExecutorFunc

@@ -46,6 +46,57 @@ type HostConfig struct {
 	// Only the watchdog strategy reads it, and it FAILS CLOSED: a caller that
 	// forgets to set it gets a refusal, not somebody else's watchdog armed.
 	IsSelf bool
+	// SSH is how an ssh or best-effort fence reaches the host: the managed
+	// path, the legacy path with the host's published sshd keys pinned, a
+	// refusal, or (the zero value) the legacy path unpinned. The caller
+	// decides it from the target's verified host_fence_ssh row
+	// (fencessh.Agent.FenceConfig).
+	SSH SSHFence
+}
+
+// The paths an SSH fence takes (SSHFence.Path).
+const (
+	// SSHPathLegacy is the command fenceSSH always ran: root's own ssh
+	// configuration and keys, and no host-key check. Only for a host that
+	// has published no fence SSH row.
+	SSHPathLegacy = ""
+	// SSHPathPinned is the legacy command with the host's published sshd
+	// keys pinned: a machine answering at its address with any other key
+	// fails before it is asked to do anything.
+	SSHPathPinned = "pinned"
+	// SSHPathManaged is this host's own fence key, pinned, with no ssh
+	// configuration of root's in play, asking the target's forced command
+	// to power off the host the request names.
+	SSHPathManaged = "managed"
+)
+
+// SSHFence is an SSH fence's path to its target (HostConfig.SSH).
+type SSHFence struct {
+	Path string
+	// Refusal, when set, fails the fence without dialling anything, and says
+	// why. A managed failure is never retried down another path.
+	Refusal string
+	// KnownHosts is the target's pinned sshd keys in known_hosts form under
+	// HostKeyAlias (pinned and managed).
+	KnownHosts   []byte
+	HostKeyAlias string
+	// The managed path's own key, source address, account and request.
+	IdentityFile string
+	BindAddress  string
+	User         string
+	Request      string
+}
+
+// pathLabel is the path as fencing_log records it.
+func (s SSHFence) pathLabel() string {
+	switch s.Path {
+	case SSHPathManaged:
+		return "managed"
+	case SSHPathPinned:
+		return "legacy-pinned"
+	default:
+		return "legacy-unpinned"
+	}
 }
 
 // Execute runs the fencing strategy specified by h.FenceStrategy.
@@ -164,23 +215,103 @@ const sshFenceArmed = "litevirt-fence-armed"
 const sshPowerOffCommand = "printf '%s-%s\\n' litevirt-fence armed; sleep 1; " +
 	"systemctl poweroff --force --force || echo o > /proc/sysrq-trigger"
 
-// fenceSSH powers the host off immediately over SSH (see sshPowerOffCommand).
-// If lenient=true, failures are reported as successful (best-effort mode).
-func fenceSSH(ctx context.Context, h HostConfig, lenient bool) Result {
+// sshBinary is the ssh client a fence runs. A var only so a test can wrap it.
+var sshBinary = "ssh"
+
+// OverrideSSHBinaryForTest makes every SSH fence run path instead of ssh and
+// returns the function that restores it. Tests only: a test's stand-in for
+// root's own ssh configuration on the legacy path.
+func OverrideSSHBinaryForTest(path string) (restore func()) {
+	prev := sshBinary
+	sshBinary = path
+	return func() { sshBinary = prev }
+}
+
+// sshArgs is the ssh argument list for h's path, ending with the target and
+// remote command, and a cleanup for the pinned known_hosts file it writes.
+func sshArgs(ctx context.Context, h HostConfig, remote string) (target string, args []string, cleanup func(), err error) {
+	cleanup = func() {}
 	port := h.SSHPort
 	if port == 0 {
 		port = 22
 	}
 	user := h.SSHUser
+	if h.SSH.Path == SSHPathManaged {
+		// The drop-in covers root only; ssh_user is for the legacy path.
+		user = h.SSH.User
+	}
 	if user == "" {
 		user = "root"
 	}
-	target := fmt.Sprintf("%s@%s", user, h.Address)
+	target = fmt.Sprintf("%s@%s", user, h.Address)
 
-	slog.Info("fencing host via SSH", "host", h.Name, "target", target, "lenient", lenient)
+	var kh string
+	if h.SSH.Path == SSHPathManaged || h.SSH.Path == SSHPathPinned {
+		if len(h.SSH.KnownHosts) == 0 || h.SSH.HostKeyAlias == "" {
+			return target, nil, cleanup, errors.New("no pinned host key to check the target against")
+		}
+		f, ferr := os.CreateTemp("", "litevirt-fence-known-hosts-")
+		if ferr != nil {
+			return target, nil, cleanup, ferr
+		}
+		kh = f.Name()
+		cleanup = func() { os.Remove(kh) }
+		if _, werr := f.Write(h.SSH.KnownHosts); werr != nil {
+			f.Close()
+			cleanup()
+			return target, nil, func() {}, werr
+		}
+		if cerr := f.Close(); cerr != nil {
+			cleanup()
+			return target, nil, func() {}, cerr
+		}
+	}
 
-	cmd := exec.CommandContext(ctx, "ssh",
-		"-o", "StrictHostKeyChecking=no",
+	switch h.SSH.Path {
+	case SSHPathManaged:
+		// -F /dev/null: root's own ssh configuration — a hand-made fence key,
+		// a Host stanza, an agent — plays no part in a managed fence.
+		args = []string{"-F", "/dev/null",
+			"-i", h.SSH.IdentityFile,
+			"-o", "IdentitiesOnly=yes",
+			"-o", "IdentityAgent=none",
+			"-o", "StrictHostKeyChecking=yes",
+			"-o", "UserKnownHostsFile=" + kh,
+			"-o", "GlobalKnownHostsFile=/dev/null",
+			"-o", "HostKeyAlias=" + h.SSH.HostKeyAlias,
+			"-o", "CheckHostIP=no",
+			"-o", "UpdateHostKeys=no",
+			"-o", "PasswordAuthentication=no",
+			"-o", "KbdInteractiveAuthentication=no",
+			"-o", "ControlMaster=no",
+			"-o", "ControlPath=none",
+			"-o", "ProxyCommand=none",
+			"-o", "ProxyJump=none",
+			"-o", "ForwardAgent=no",
+			"-o", "ClearAllForwardings=yes",
+		}
+		// The source address must be the one the target's authorized_keys
+		// accepts this key from: on a multi-homed host the default route's
+		// would be refused.
+		if h.SSH.BindAddress != "" {
+			args = append(args, "-o", "BindAddress="+h.SSH.BindAddress)
+		}
+	case SSHPathPinned:
+		// Root's configuration still supplies the identity, so a hand-made
+		// fence key keeps working; only the host-key check changes. Options on
+		// the command line override root's ssh_config.
+		args = []string{
+			"-o", "StrictHostKeyChecking=yes",
+			"-o", "UserKnownHostsFile=" + kh,
+			"-o", "GlobalKnownHostsFile=/dev/null",
+			"-o", "HostKeyAlias=" + h.SSH.HostKeyAlias,
+			"-o", "CheckHostIP=no",
+			"-o", "UpdateHostKeys=no",
+		}
+	default:
+		args = []string{"-o", "StrictHostKeyChecking=no"}
+	}
+	args = append(args,
 		"-o", "BatchMode=yes",
 		"-o", fmt.Sprintf("ConnectTimeout=%d", connectTimeout(ctx, 10)),
 		// A forced power-off takes the host down without closing the TCP
@@ -192,11 +323,44 @@ func fenceSSH(ctx context.Context, h HostConfig, lenient bool) Result {
 		"-o", "ServerAliveCountMax=3",
 		"-p", fmt.Sprintf("%d", port),
 		target,
-		sshPowerOffCommand,
+		remote,
 	)
+	return target, args, cleanup, nil
+}
+
+// fenceSSH powers the host off immediately over SSH (see sshPowerOffCommand).
+// If lenient=true, failures are reported as successful (best-effort mode).
+//
+// h.SSH decides the path, and it is taken as given: a managed or pinned
+// failure is never retried down a path with less checking, because whoever
+// can break the checked path would otherwise earn the unchecked one.
+func fenceSSH(ctx context.Context, h HostConfig, lenient bool) Result {
+	path := " [path=" + h.SSH.pathLabel() + "]"
+	if h.SSH.Refusal != "" {
+		return sshFailure(h, lenient, errors.New(h.SSH.Refusal), "SSH fence refused before dialling"+path, nil)
+	}
+	remote := sshPowerOffCommand
+	if h.SSH.Path == SSHPathManaged {
+		remote = h.SSH.Request
+	}
+	target, args, cleanup, err := sshArgs(ctx, h, remote)
+	defer cleanup()
+	if err != nil {
+		return sshFailure(h, lenient, err, "SSH fence could not start"+path, nil)
+	}
+	if h.SSH.Path == SSHPathLegacy {
+		slog.Warn("fencing host via SSH WITHOUT a pinned host key: it has published no fence SSH row, so a machine "+
+			"answering at its address would be powered off in its place. Its row is published once the cluster "+
+			"runs release_2026_12_v1; `lv doctor fence` lists every host fenced this way",
+			"host", h.Name, "target", target)
+	}
+
+	slog.Info("fencing host via SSH", "host", h.Name, "target", target, "lenient", lenient, "path", h.SSH.pathLabel())
+
+	cmd := exec.CommandContext(ctx, sshBinary, args...)
 	out, runErr := cmd.CombinedOutput()
 	armed := sawFenceArmed(out)
-	detail := fmt.Sprintf("SSH forced poweroff to %s: %s", target, strings.TrimSpace(string(out)))
+	detail := fmt.Sprintf("SSH forced poweroff to %s: %s%s", target, strings.TrimSpace(string(out)), path)
 
 	// Classification. A success requires the marker, always: it is the only
 	// evidence that OUR command ran on the target. An exit 0 without it means
@@ -239,15 +403,54 @@ func fenceSSH(ctx context.Context, h HostConfig, lenient bool) Result {
 	if runErr == nil {
 		runErr = errors.New("remote command exited 0 without confirming it ran")
 	}
+	return sshFailure(h, lenient, runErr, detail, out)
+}
+
+// sshFailure is an SSH fence that did not land: a failure, or for a lenient
+// (best-effort) fence the assumed success that strategy has always reported.
+func sshFailure(h HostConfig, lenient bool, runErr error, detail string, out []byte) Result {
 	if lenient {
 		slog.Warn("SSH fence failed (best-effort, ignoring)", "host", h.Name, "error", runErr)
 		return Result{
-			Method:  "best-effort-ssh",
-			Detail:  fmt.Sprintf("SSH failed (%v), proceeding anyway: %s", runErr, strings.TrimSpace(string(out))),
+			Method: "best-effort-ssh",
+			Detail: fmt.Sprintf("SSH failed (%v), proceeding anyway: %s [path=%s]", runErr, strings.TrimSpace(string(out)),
+				h.SSH.pathLabel()),
 			Success: true,
 		}
 	}
 	return Result{Method: "ssh", Detail: fmt.Sprintf("%s (%v)", detail, runErr), Success: false}
+}
+
+// ProbeSSH checks h's managed path end to end without arming anything: the
+// pin, the key, the source address and the target's forced command, which
+// answers a check request naming it with CheckOK. It never powers anything
+// off: a check is not the poweroff request, and the forced command prints no
+// marker for it.
+func ProbeSSH(ctx context.Context, h HostConfig, checkOK string) error {
+	if h.SSH.Refusal != "" {
+		return errors.New(h.SSH.Refusal)
+	}
+	if h.SSH.Path != SSHPathManaged {
+		return fmt.Errorf("%s has no managed fence path", h.Name)
+	}
+	_, args, cleanup, err := sshArgs(ctx, h, h.SSH.Request)
+	defer cleanup()
+	if err != nil {
+		return err
+	}
+	out, err := exec.CommandContext(ctx, sshBinary, args...).CombinedOutput()
+	if sawFenceArmed(out) {
+		return fmt.Errorf("the check ARMED a fence on %s: its forced command is not litevirt's", h.Name)
+	}
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.TrimSpace(line) == checkOK {
+			return nil
+		}
+	}
+	return fmt.Errorf("the target answered without %q: %s", checkOK, strings.TrimSpace(string(out)))
 }
 
 // sawFenceArmed reports whether out contains the fence marker as a whole line.

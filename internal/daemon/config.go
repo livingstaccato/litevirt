@@ -17,6 +17,7 @@ import (
 	"github.com/litevirt/litevirt/internal/acmedns"
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fencessh"
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/image"
@@ -738,6 +739,19 @@ type EnforcementConfig struct {
 	// DEFAULT TRUE (LoadConfig sets it before parsing; an explicit
 	// `vrrp_unicast: false` wins).
 	VRRPUnicast bool `yaml:"vrrp_unicast,omitempty"`
+	// FenceSSH is how this host's ssh and best-effort fences reach their
+	// targets (internal/fencessh): "managed" uses each target's managed
+	// fence key path only, and fails a fence toward a host whose sshd does
+	// not accept it; "auto" (the default, "" included) uses the managed path
+	// toward a host that accepts it and the legacy path with the host's
+	// published sshd keys pinned toward one that does not; "legacy" never
+	// uses the managed path (the kill switch), pinned wherever a host has
+	// published. No mode fences a host that has published a fence ssh row
+	// without its pinned host key. Not a capability: the fence is decided
+	// where it is created, and no peer relies on another's setting. `lv host
+	// init` writes managed for a new cluster; `lv host add` copies the
+	// cluster's block.
+	FenceSSH string `yaml:"fence_ssh,omitempty"`
 	// DigestV2: emit the order-invariant anti-entropy row digest (digest_v2) so
 	// column-order-only differences (fresh CREATE vs ALTER ADD COLUMN) stop showing as
 	// row-content divergence + perpetual no-op merges. Negotiated PAIRWISE by wire-field
@@ -1131,6 +1145,10 @@ func LoadConfig() (*Config, error) {
 			"(a takeover-without-proof tier is intentionally not implemented; to recover an "+
 			"unreachable VIP holder, verify it is down and run `lv host fence-confirm <host>`)",
 			cfg.NoQuorumVIPPolicy)
+	}
+
+	if !fencessh.ValidMode(cfg.Enforcement.FenceSSH) {
+		return nil, fmt.Errorf("invalid enforcement.fence_ssh %q: managed, auto or legacy", cfg.Enforcement.FenceSSH)
 	}
 
 	// A typo'd vm.default_cpu_mode must fail load, not silently stamp an invalid

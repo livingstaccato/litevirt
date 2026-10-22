@@ -139,6 +139,10 @@ type Coordinator struct {
 	hostName string
 	db       *corrosion.Client
 	fencer   Fencer
+	// FenceSSH decides how an ssh or best-effort fence from this node
+	// reaches its target (fencessh.Agent.FenceConfig): managed, pinned, or
+	// refused. Nil is the legacy path, unpinned.
+	FenceSSH func(ctx context.Context, target string) fence.SSHFence
 	// capacity is the cluster-wide capacity policy; see placement.Request.Capacity.
 	capacity corrosion.CapacityPolicy
 	// nicGuardPlacement: SetNICGuardPlacement.
@@ -664,6 +668,15 @@ func (c *Coordinator) upgradingTimeout() time.Duration {
 		return c.UpgradingTimeout
 	}
 	return upgradingTimeout
+}
+
+// fenceSSHPath is how an SSH fence from this coordinator reaches target
+// (FenceSSH), the legacy path when none is wired.
+func (c *Coordinator) fenceSSHPath(ctx context.Context, target string) fence.SSHFence {
+	if c.FenceSSH == nil {
+		return fence.SSHFence{}
+	}
+	return c.FenceSSH(ctx, target)
 }
 
 // SetFencer replaces the fence implementation. Test-only; production code
@@ -3580,6 +3593,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 		WatchdogDev:   h.WatchdogDev,
 		// A retired credential is reported, never sent as an empty password.
 		IPMICredentialRetired: h.IPMIPassRetired,
+		SSH:                   c.fenceSSHPath(fenceCtx, h.Name),
 	})
 	// A best-effort fence that did not reach the host is recorded as
 	// self-pause when this coordinator relies on the host's partition pause

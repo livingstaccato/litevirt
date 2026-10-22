@@ -778,3 +778,106 @@ func TestPartitionPause_AHungMarkWriteNeverStrandsItsClear(t *testing.T) {
 		})
 	}
 }
+
+// clearsDone waits up to 3 s for every background clear to end.
+func (f *pauseFixture) clearsDone() bool {
+	for d := time.Now().Add(3 * time.Second); time.Now().Before(d); time.Sleep(5 * time.Millisecond) {
+		f.p.mu.Lock()
+		n := len(f.p.clearing)
+		f.p.mu.Unlock()
+		if n == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// hangMarkWrites makes vm-ha's mark writes hang until the returned release
+// runs (after which they pass at once), and shortens the clear's wait for
+// them.
+func (f *pauseFixture) hangMarkWrites(t *testing.T) (release func()) {
+	ch := make(chan struct{})
+	var once sync.Once
+	release = func() { once.Do(func() { close(ch) }) }
+	t.Cleanup(release)
+	f.virt.FailMarkPartitionPaused = func(string) error { <-ch; return nil }
+	f.p.mu.Lock()
+	f.p.markWaitBound = 200 * time.Millisecond
+	f.p.mu.Unlock()
+	return release
+}
+
+// ppio re-review r4, F-r4-1: a mark that lands after its clear gave up
+// waiting for it is still taken off. The write hangs, the operator resumes
+// vm-ha, the heal drops the record and its clear gives up; then the mark
+// lands on the running VM, and no record is left for a sweep to find.
+//
+// Mutation: give up without handing the mark to its write (no clearWanted)
+// — the late mark stays on the running VM, red.
+func TestPartitionPause_ALateMarkAfterItsClearGaveUpIsTakenOff(t *testing.T) {
+	f := newPauseFixture(t)
+	release := f.hangMarkWrites(t)
+	f.loseFor(QuorumNo, PartitionPauseAfter+2*time.Second)
+	recs := f.records()
+	if len(recs) != 1 || f.raw("vm-ha") != libvirtfake.StatePaused {
+		t.Fatalf("setup: vm-ha %s, records %+v; want it paused", f.raw("vm-ha"), recs)
+	}
+	if err := f.virt.ResumeDomain("vm-ha"); err != nil { // virsh resume
+		t.Fatal(err)
+	}
+	f.regain()
+	if !f.clearsDone() {
+		t.Fatal("setup: the clear did not give up")
+	}
+	if n := len(f.records()); n != 0 {
+		t.Fatalf("setup: %d records left; want the heal to drop it", n)
+	}
+	release()
+	// More passes: a sustained Yes, then a short Yes after a blip.
+	f.regain()
+	f.loseFor(QuorumNo, 2*time.Second)
+	f.set(QuorumYes)
+	for i := 0; i < 5; i++ {
+		f.tick()
+		f.advance(time.Second)
+	}
+	if st := f.raw("vm-ha"); st != libvirtfake.StateRunning {
+		t.Fatalf("setup: vm-ha is %s", st)
+	}
+	for d := time.Now().Add(2 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		tok, ok, _ := f.virt.PartitionPauseMark("vm-ha")
+		if !ok {
+			break
+		}
+		if time.Now().After(d) {
+			t.Fatalf("running vm-ha keeps the late mark %q: nothing took it off once it landed", tok)
+		}
+	}
+}
+
+// ppio re-review r4: the same give-up while the record is still there (a Yes
+// not yet sustained runs clearMarksOfRunning): the late mark goes too.
+func TestPartitionPause_ALateMarkAfterItsClearGaveUpGoesWithTheRecordKept(t *testing.T) {
+	f := newPauseFixture(t)
+	release := f.hangMarkWrites(t)
+	f.loseFor(QuorumNo, PartitionPauseAfter+2*time.Second)
+	if err := f.virt.ResumeDomain("vm-ha"); err != nil {
+		t.Fatal(err)
+	}
+	f.set(QuorumYes)
+	f.tick() // a short Yes: clearMarksOfRunning starts a clear, which gives up
+	f.advance(time.Second)
+	if !f.clearsDone() {
+		t.Fatal("setup: the clear did not give up")
+	}
+	if len(f.records()) != 1 {
+		t.Fatal("setup: the record should still exist")
+	}
+	release()
+	time.Sleep(200 * time.Millisecond)
+	f.tick() // still a short Yes: the sweep runs again
+	f.clearsDone()
+	if tok, ok, _ := f.virt.PartitionPauseMark("vm-ha"); ok {
+		t.Fatalf("late mark %q stayed on the running vm-ha with its record present", tok)
+	}
+}

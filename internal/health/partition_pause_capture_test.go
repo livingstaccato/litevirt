@@ -184,9 +184,20 @@ func TestPartitionPause_ACapturedVMThatShutOffIsSkipped(t *testing.T) {
 	}
 }
 
-// domainPaused is "paused, any reason", and nothing else.
+// domainPaused is "paused, any reason", and nothing else: a guest QEMU
+// paused on an I/O error during a capture, or one the capture or libvirt
+// paused (user, snapshot), is the pauser's as much as one with no reason.
+//
+// Mutation: narrow it by PausedReason (exclude io-error, or accept only
+// user/snapshot) — red.
 func TestDomainPaused_AnyPausedReason(t *testing.T) {
-	for _, st := range []lv.DomainStatus{{State: "stopped", Reason: "paused"}} {
+	for _, st := range []lv.DomainStatus{
+		{State: "stopped", Reason: "paused"},
+		{State: "stopped", Reason: "paused", PausedReason: lv.PausedReasonIOError},
+		{State: "stopped", Reason: "paused", PausedReason: "user"},
+		{State: "stopped", Reason: "paused", PausedReason: "snapshot"},
+		{State: "stopped", Reason: "paused", PausedReason: "unknown"},
+	} {
 		if !domainPaused(st) {
 			t.Errorf("%+v is not paused", st)
 		}

@@ -7,8 +7,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/metrics"
 )
 
 type adoptionFixture struct {
@@ -218,5 +221,42 @@ func TestProjectAdoptionPass_NeedsTheProjectIncarnationLatch(t *testing.T) {
 	f.db.SetProjectIncarnationGate(func() bool { return true })
 	if n, err := f.pass(t, "node-1").Run(ctx); err != nil || n != 1 {
 		t.Fatalf("after it: adopted %d, err %v", n, err)
+	}
+}
+
+// Review N-2: an error on the first-latched file (a read-only data dir, a
+// full disk) holds off only the projects this host would adopt as a
+// fallback; it still adopts the ones it holds, and counts the skipped ones.
+//
+// Mutation: the file error returned from the pass — red.
+func TestProjectAdoptionPass_AFileErrorSkipsOnlyTheFallback(t *testing.T) {
+	ctx := context.Background()
+	f := newAdoptionFixture(t)
+	f.project(t, "/a-other", true) // sorts first: its file read fails before the held one
+	f.project(t, "/b-held", true)
+	for p, h := range map[string]string{"/a-other": "elsewhere", "/b-held": "holder"} {
+		if _, err := corrosion.ClaimInitialProjectAuthority(ctx, f.db, p, h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	blocker := filepath.Join(f.dir, "not-a-dir")
+	if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := f.pass(t, "holder")
+	p.DataDir = filepath.Join(blocker, "data") // every read and write fails
+	f.now = time.Now().Add(365 * 24 * time.Hour)
+	n, err := p.Run(ctx)
+	if err != nil || n != 1 {
+		t.Fatalf("with an unusable first-latched file: adopted %d, err %v; want the held project adopted", n, err)
+	}
+	if inc := incarnationOf(t, f.db, "/b-held"); inc == "" {
+		t.Fatal("the held project was not adopted")
+	}
+	if inc := incarnationOf(t, f.db, "/a-other"); inc != "" {
+		t.Fatal("a fallback project was adopted without a fallback clock")
+	}
+	if got := testutil.ToFloat64(metrics.ProjectAdoptionBlockedGauge().WithLabelValues("fallback_clock")); got != 1 {
+		t.Fatalf("blocked{reason=fallback_clock} = %v, want 1", got)
 	}
 }

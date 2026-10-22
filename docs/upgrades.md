@@ -1898,6 +1898,11 @@ counted in `litevirt_project_adoption_blocked{reason="spellings"}` and listed
 by `lv doctor project-spellings`
 ([diagnostics.md](diagnostics.md#lv-doctor-project-spellings)).
 
+A host that cannot read or write the file in its data directory that times
+its fallback (a read-only or full disk) still adopts the projects it holds; it
+skips the ones it would adopt for another holder, logs a warning and counts
+them in `litevirt_project_adoption_blocked{reason="fallback_clock"}`.
+
 `enforcement.project_adoption` (default true) holds a host's own pass off when
 false. It decides nothing else: a host with it off applies and reads its peers'
 adoptions, and the token is advertised regardless. It keeps the rollback below

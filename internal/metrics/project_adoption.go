@@ -19,7 +19,9 @@ func projectAdoptionInit() {
 			Name: "litevirt_project_adoption_blocked",
 			Help: "Projects created before project_incarnation_v1 latched that this host's adoption pass " +
 				"cannot adopt, by reason. reason=\"spellings\": more than one spelling of the name is live " +
-				"(\"acme\" beside \"/acme\"); `lv doctor project-spellings` lists them.",
+				"(\"acme\" beside \"/acme\"); `lv doctor project-spellings` lists them. " +
+				"reason=\"fallback_clock\": projects this host would adopt as a fallback for another holder, " +
+				"skipped because its first-latched file in the data directory cannot be read or written.",
 		}, []string{"reason"})
 		prometheus.DefaultRegisterer.MustRegister(projectAdoptionBlocked)
 	})

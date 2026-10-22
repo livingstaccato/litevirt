@@ -75,24 +75,40 @@ func (p ProjectAdoptionPass) Run(ctx context.Context) (int, error) {
 	}
 	var todo []string
 	var since *time.Time
+	var clockErr error
+	skipped := 0
 	for _, cand := range scan.Candidates {
 		preferred, err := p.preferred(ctx, cand.Name, hosts)
 		if err != nil {
 			return 0, err
 		}
-		if !preferred && since == nil {
-			// Read only for a host that is not the preferred adopter, so
-			// the holder never depends on the file.
+		if preferred {
+			todo = append(todo, cand.Name)
+			continue
+		}
+		// Read only for a host that is not the preferred adopter, so the
+		// holder never depends on the file. An error on it (a read-only data
+		// dir, a full disk) holds off only these fallback candidates (review
+		// N-2): logged once per pass and counted, never the whole pass.
+		if since == nil && clockErr == nil {
 			t, err := firstLatchedAt(p.DataDir, now)
 			if err != nil {
-				return 0, err
+				clockErr = err
+				slog.Warn("project adoption: the fallback clock is unreadable, so this host adopts only the projects it holds this pass",
+					"error", err)
+			} else {
+				since = &t
 			}
-			since = &t
 		}
-		if preferred || projectAdoptionOverdue(cand.UpdatedAt, *since, now) {
+		if clockErr != nil {
+			skipped++
+			continue
+		}
+		if projectAdoptionOverdue(cand.UpdatedAt, *since, now) {
 			todo = append(todo, cand.Name)
 		}
 	}
+	metrics.ProjectAdoptionBlocked("fallback_clock", skipped)
 	if len(todo) == 0 {
 		return 0, nil
 	}
@@ -140,6 +156,10 @@ func (p ProjectAdoptionPass) preferred(ctx context.Context, name string, hosts [
 // projectAdoptionOverdue: a non-preferred host adopts once both the row's last
 // write and this node's first-latched time are ProjectAdoptionFallback
 // old. Both are durable, so neither a restart nor a crash loop resets them.
+//
+// A backward clock step can shorten the wait (review N-1, accepted): an
+// early fallback adoption is harmless, because adoption is idempotent and
+// every adopter writes the identical statement.
 func projectAdoptionOverdue(updatedAt string, since, now time.Time) bool {
 	from := since
 	if u, ok := corrosion.ParseUpdatedAt(updatedAt); ok && u.After(from) {

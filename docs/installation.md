@@ -341,10 +341,18 @@ by OpenSSH itself. Only the per-user `~/.ssh/config` is read; `/etc/ssh/ssh_conf
   and `SSH_AUTH_SOCK` or no setting uses `$SSH_AUTH_SOCK`.
 - `ProxyJump` and `ProxyCommand` are not supported. lv warns, naming the directive, and
   dials the address directly, as it always did.
-- Host-key checking is never loosened by the config. A changed key for a known host is
-  always refused. A host with no entry in the known_hosts files is accepted on first contact
-  (accept-new), unless `StrictHostKeyChecking yes`, which refuses it. `StrictHostKeyChecking no`
-  or `accept-new` change nothing.
+- Nothing in the config makes lv accept a host key that `ssh <alias>` would refuse. lv refuses:
+  a changed key for a known host (always; `StrictHostKeyChecking no` or `accept-new` change
+  nothing); a host with no known_hosts entry under `StrictHostKeyChecking yes` (otherwise it is
+  accepted on first contact, accept-new); a key, or a certificate over a key or from a CA, listed
+  in `RevokedHostKeys`; a host certificate its CA signed with SHA-1 `ssh-rsa`, as OpenSSH's
+  default `CASignatureAlgorithms` does; and any key whose check depends on something lv cannot
+  read:
+  - `KnownHostsCommand` (anything but `none`): lv does not run it, so every dial refuses, naming
+    it. Put the keys it serves in a known_hosts file instead.
+  - `RevokedHostKeys` must be a plain list of public keys (`#` comments allowed). A binary KRL,
+    a line that is not a public key, or a missing or unreadable file refuses every dial, naming
+    the file.
 - The known_hosts files checked: `~/.ssh/known_hosts` and `~/.ssh/known_hosts2` always;
   `UserKnownHostsFile` adds files on top of them, so `/dev/null` or `none` drops no entry; and
   `GlobalKnownHostsFile`, by default `/etc/ssh/ssh_known_hosts` and `ssh_known_hosts2`, so a host

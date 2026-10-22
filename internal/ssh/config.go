@@ -49,6 +49,11 @@ type resolved struct {
 	// HostKeyAlias is the name host keys are looked up under instead of the
 	// dialled address ("" when unset).
 	HostKeyAlias string
+	// KnownHostsCommand is the configured command ("" when none). lv does
+	// not run it, so a set one refuses the connection.
+	KnownHostsCommand string
+	// RevokedHostKeys is the configured revocation file ("" when none).
+	RevokedHostKeys string
 	// AgentSet: IdentityAgent chose the agent socket, AgentSock ("" for
 	// none). Otherwise SSH_AUTH_SOCK is used.
 	AgentSet  bool
@@ -221,6 +226,16 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 		}
 		warnIfAbsent("UserKnownHostsFile", kh, host)
 		r.KnownHosts = append(r.KnownHosts, kh)
+	}
+	if c := strings.Join(got["knownhostscommand"], " "); c != "" && c != "none" {
+		r.KnownHostsCommand = c
+	}
+	if rv := strings.Join(got["revokedhostkeys"], " "); rv != "" && rv != "none" {
+		p, ok := tk.expand(rv)
+		if !ok {
+			return nil, fmt.Errorf("RevokedHostKeys %q for %s uses a %% token litevirt does not expand", rv, host)
+		}
+		r.RevokedHostKeys = p
 	}
 	switch ia := got.one("identityagent"); {
 	case ia == "" || ia == "SSH_AUTH_SOCK":

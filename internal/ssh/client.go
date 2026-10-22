@@ -108,6 +108,21 @@ func dialTarget(t *Target, start time.Time, timeout time.Duration, keepDeadline 
 // config: a config could re-add SHA-1 ssh-rsa, or ask for a type known_hosts
 // does not record and so turn a known host into a refused one.
 func clientConfig(sshUser string, auth []ssh.AuthMethod, cfg *resolved, addr string) (*ssh.ClientConfig, error) {
+	// Options with which ssh would refuse keys lv cannot otherwise see: a
+	// pin source lv does not run refuses outright; a revocation list lv
+	// cannot read refuses too. Neither is ever skipped.
+	if cfg != nil && cfg.KnownHostsCommand != "" {
+		return nil, fmt.Errorf("your ssh config sets KnownHostsCommand (%s); litevirt does not run it, "+
+			"so the host keys it would supply cannot be checked -- refusing. Put the host's key in a "+
+			"known_hosts file (UserKnownHostsFile or GlobalKnownHostsFile) instead", cfg.KnownHostsCommand)
+	}
+	var revoked map[string]bool
+	if cfg != nil && cfg.RevokedHostKeys != "" {
+		var err error
+		if revoked, err = loadRevokedHostKeys(cfg.RevokedHostKeys); err != nil {
+			return nil, err
+		}
+	}
 	hostKeyCallback, hostKeyAlgos, err := hostKeyPolicyFor(cfg, addr)
 	if err != nil {
 		// Only the ABSENCE of any known_hosts reaches the first-contact
@@ -137,9 +152,68 @@ func clientConfig(sshUser string, auth []ssh.AuthMethod, cfg *resolved, addr str
 	return &ssh.ClientConfig{
 		User:              sshUser,
 		Auth:              auth,
-		HostKeyCallback:   hostKeyCallback,
+		HostKeyCallback:   refuseRevokedAndSHA1CA(hostKeyCallback, revoked, revokedFile(cfg)),
 		HostKeyAlgorithms: hostKeyAlgos,
 	}, nil
+}
+
+func revokedFile(cfg *resolved) string {
+	if cfg == nil {
+		return ""
+	}
+	return cfg.RevokedHostKeys
+}
+
+// refuseRevokedAndSHA1CA runs before next, on every path including first
+// contact: a key RevokedHostKeys lists -- presented plainly, as the key inside
+// a certificate, or as the CA that signed one -- is refused, and so is a host
+// certificate whose CA signed it with SHA-1 ssh-rsa (or DSA), which OpenSSH's
+// default CASignatureAlgorithms refuses.
+func refuseRevokedAndSHA1CA(next ssh.HostKeyCallback, revoked map[string]bool, file string) ssh.HostKeyCallback {
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		isRevoked := func(k ssh.PublicKey) bool { return k != nil && revoked[string(k.Marshal())] }
+		cert, isCert := key.(*ssh.Certificate)
+		if isRevoked(key) || (isCert && (isRevoked(cert.Key) || isRevoked(cert.SignatureKey))) {
+			return fmt.Errorf("host key for %s is revoked (RevokedHostKeys %s) -- refusing", hostname, file)
+		}
+		if isCert && cert.Signature != nil {
+			switch cert.Signature.Format {
+			case ssh.KeyAlgoRSA, ssh.KeyAlgoDSA: //nolint:staticcheck // naming them to refuse them
+				return fmt.Errorf("host certificate for %s is signed by its CA with SHA-1 (%s) -- refusing, "+
+					"as OpenSSH does by default; re-sign it with rsa-sha2-512", hostname, cert.Signature.Format)
+			}
+		}
+		return next(hostname, remote, key)
+	}
+}
+
+// loadRevokedHostKeys reads a RevokedHostKeys file that is a plain list of
+// public keys (blank lines and # comments allowed). ssh also accepts a binary
+// KRL, which x/crypto cannot parse; that, a line that is not a public key, or
+// a file that cannot be read (absent included -- ssh refuses then too) is an
+// error, never an empty list.
+func loadRevokedHostKeys(path string) (map[string]bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("RevokedHostKeys %s cannot be read: %w", path, err)
+	}
+	if bytes.HasPrefix(data, []byte("SSHKRL\n\x00")) {
+		return nil, fmt.Errorf("RevokedHostKeys %s is a binary KRL, which litevirt cannot read -- "+
+			"refusing rather than skip the revocations; list the revoked public keys instead", path)
+	}
+	out := map[string]bool{}
+	for i, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, _, _, _, err := ssh.ParseAuthorizedKey([]byte(line))
+		if err != nil {
+			return nil, fmt.Errorf("RevokedHostKeys %s:%d is not a public key: %w", path, i+1, err)
+		}
+		out[string(k.Marshal())] = true
+	}
+	return out, nil
 }
 
 // hostKeyAlgorithmPreference is the order known host-key types are asked for

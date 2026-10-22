@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -141,5 +142,65 @@ func TestNewClient_ConfigCannotLoosenHostKeyChecking(t *testing.T) {
 				t.Fatalf("err = %v, want a CHANGED refusal", err)
 			}
 		})
+	}
+}
+
+// Reviewer probe (sshcfg M3): ssh -G prints known_hosts paths space-separated
+// and unquoted, so a configured path with a space must be joined back, not
+// split into two absent files and dropped with its pin.
+func TestNewClient_KnownHostsPathWithSpace(t *testing.T) {
+	for _, kind := range []string{"UserKnownHostsFile", "GlobalKnownHostsFile"} {
+		t.Run(kind, func(t *testing.T) {
+			home, addr := configServer(t, "  "+kind+" \"%H/my keys/kh\" %H/other_kh\n", ed25519Signer(t))
+			os.Mkdir(filepath.Join(home, "my keys"), 0o700)
+			pin := filepath.Join(home, "my keys", "kh")
+			writeFile(t, pin, knownhosts.Line([]string{knownhosts.Normalize(addr)}, ed25519Signer(t).PublicKey()))
+			if err := dialLabnode(t); err == nil || !strings.Contains(err.Error(), pin) {
+				t.Fatalf("err = %v, want the pin in %q enforced", err, pin)
+			}
+		})
+	}
+}
+
+// A configured known_hosts file that does not exist is skipped, as ssh skips
+// it, but not silently: a pin the operator believes is there is not.
+func TestResolveConfig_WarnsAboutAbsentKnownHostsFile(t *testing.T) {
+	home, _ := sshHome(t, "id_ed25519")
+	var warned []string
+	old := warnf
+	warnf = func(f string, a ...any) { warned = append(warned, fmt.Sprintf(f, a...)) }
+	t.Cleanup(func() { warnf = old })
+	missing := filepath.Join(home, "no_such_kh")
+	writeSSHConfig(t, home, "Host h\n  UserKnownHostsFile "+missing+" /dev/null\n  GlobalKnownHostsFile "+missing+"2\n")
+	if _, err := resolveConfig("h", "", "22", false, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	if len(warned) != 2 || !strings.Contains(warned[0], missing) || !strings.Contains(warned[1], missing+"2") {
+		t.Fatalf("warnings %q, want one for each absent configured file", warned)
+	}
+
+	// The defaults are not warned about: they are usually absent.
+	warned = nil
+	writeSSHConfig(t, home, "Host h\n  Port 2200\n")
+	if _, err := resolveConfig("h", "", "22", false, false, 0); err != nil || len(warned) != 0 {
+		t.Fatalf("err %v, warnings %q, want none for the default files", err, warned)
+	}
+}
+
+// A known_hosts path litevirt cannot expand refuses rather than being dropped.
+// (OpenSSH 10's ssh -G expands these tokens itself; an ssh that does not must
+// not turn the pin into nothing.)
+func TestResolveConfig_UnexpandableKnownHostsRefused(t *testing.T) {
+	home, _ := sshHome(t, "id_ed25519")
+	writeSSHConfig(t, home, "Host h\n  Port 2200\n")
+	old := sshG
+	t.Cleanup(func() { sshG = old })
+	for _, line := range []string{"userknownhostsfile /a/%C", "userknownhostsfile /x /a/%C"} {
+		sshG = func(time.Duration, ...string) ([]byte, error) {
+			return []byte("hostname h\nport 22\n" + line + "\n"), nil
+		}
+		if r, err := resolveConfig("h", "", "22", false, false, 0); err == nil {
+			t.Fatalf("%q: resolved %+v, want a refusal", line, r)
+		}
 	}
 }

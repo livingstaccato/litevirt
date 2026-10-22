@@ -338,7 +338,8 @@ by OpenSSH itself. Only the per-user `~/.ssh/config` is read; `/etc/ssh/ssh_conf
   checked; `UserKnownHostsFile` adds files to check on top of them, so `/dev/null` or `none`
   drops no entry. `GlobalKnownHostsFile` is checked as `ssh` checks it, by default
   `/etc/ssh/ssh_known_hosts` and `ssh_known_hosts2`, so a host key distributed there is
-  enforced. lv only reads these files; it never records a key in any of them. `HostKeyAlias` is honoured as
+  enforced. lv only reads these files; it never records a key in any of them. A configured file that
+  does not exist is skipped, as `ssh` skips it, with a warning naming it. `HostKeyAlias` is honoured as
   `ssh` honours it: the host's key (and a host certificate's principal) is looked up under the
   alias, so a key pinned there is enforced. When known_hosts has nothing under the alias, lv
   checks the dialled address instead rather than treating the host as new, except under

@@ -3,6 +3,7 @@ package ssh
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -202,17 +203,18 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 	case "yes", "true", "on":
 		r.StrictYes = true
 	}
-	for _, kh := range strings.Fields(strings.Join(got["userknownhostsfile"], " ")) {
-		if kh == "none" || kh == defaultKH || kh == defaultKH2 {
+	ukh, err := knownHostsPaths(got["userknownhostsfile"], func(p string) (string, bool) {
+		return expandIdentity(p, host, r.Hostname, eff, r.Port)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("UserKnownHostsFile for %s: %w", host, err)
+	}
+	for _, kh := range ukh {
+		if kh == defaultKH || kh == defaultKH2 {
 			continue // ~/.ssh/known_hosts{,2} are always checked (knownHostsFiles)
 		}
-		p, ok := expandIdentity(kh, host, r.Hostname, eff, r.Port)
-		if !ok {
-			// A known_hosts file we cannot name is never silently dropped:
-			// it could hold the key that contradicts the default store.
-			return nil, fmt.Errorf("UserKnownHostsFile %q for %s uses a %% token litevirt does not expand", kh, host)
-		}
-		r.KnownHosts = append(r.KnownHosts, p)
+		warnIfAbsent("UserKnownHostsFile", kh, host)
+		r.KnownHosts = append(r.KnownHosts, kh)
 	}
 	switch ia := got.one("identityagent"); {
 	case ia == "" || ia == "SSH_AUTH_SOCK":
@@ -229,10 +231,15 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 		r.AgentSet, r.AgentSock = true, p
 	}
 	if v := got["globalknownhostsfile"]; len(v) > 0 {
-		for _, kh := range strings.Fields(strings.Join(v, " ")) {
-			if kh != "none" {
-				r.GlobalKnownHosts = append(r.GlobalKnownHosts, expandHome(kh))
+		gkh, err := knownHostsPaths(v, func(p string) (string, bool) { return expandHome(p), true })
+		if err != nil {
+			return nil, fmt.Errorf("GlobalKnownHostsFile for %s: %w", host, err)
+		}
+		for _, kh := range gkh {
+			if !slices.Contains(defaultGlobalKnownHosts, kh) {
+				warnIfAbsent("GlobalKnownHostsFile", kh, host)
 			}
+			r.GlobalKnownHosts = append(r.GlobalKnownHosts, kh)
 		}
 	} else {
 		r.GlobalKnownHosts = slices.Clone(defaultGlobalKnownHosts)
@@ -329,6 +336,57 @@ func expandIdentity(p, orig, hostname, usr, port string) (string, bool) {
 		}
 	}
 	return expandHome(b.String()), true
+}
+
+// knownHostsPaths splits ssh -G's known-hosts values into paths. ssh -G
+// prints them space-separated and unquoted, so a configured path containing a
+// space ("/home/x/my keys/kh") arrives as several words; adjacent words are
+// joined back while the word alone names no existing file and the joined path
+// does. A path with a token expand cannot handle is an error: a known_hosts
+// file litevirt cannot name is never silently dropped, since it could hold the
+// key that contradicts the others.
+func knownHostsPaths(values []string, expand func(string) (string, bool)) ([]string, error) {
+	words := strings.Fields(strings.Join(values, " "))
+	exists := func(w string) bool {
+		p, ok := expand(w)
+		if !ok {
+			return false
+		}
+		_, err := os.Stat(p)
+		return err == nil
+	}
+	var out []string
+	for i := 0; i < len(words); i++ {
+		w := words[i]
+		if w == "none" {
+			continue
+		}
+		if !exists(w) {
+			joined := w
+			for j := i + 1; j < len(words); j++ {
+				joined += " " + words[j]
+				if exists(joined) {
+					w, i = joined, j
+					break
+				}
+			}
+		}
+		p, ok := expand(w)
+		if !ok {
+			return nil, fmt.Errorf("%q uses a %% token litevirt does not expand", w)
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// warnIfAbsent says when a configured known_hosts file does not exist: ssh
+// skips it, and so does litevirt, but a pin the operator believes is there
+// is not.
+func warnIfAbsent(kind, path, host string) {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		warnf("%s %s for %s does not exist; host keys it would pin are not checked", kind, path, host)
+	}
 }
 
 // validSSHName reports whether s holds only hostname, IP-literal and

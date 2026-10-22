@@ -6,6 +6,7 @@ package fleet
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -271,4 +272,79 @@ func TestFleet_PCIFailover_GPUAndItsAudioFunction(t *testing.T) {
 			}
 		}
 	})
+}
+
+// The VM names only its GPU by address, so its first start realizes the
+// audio function as the GPU's group sibling. Its audio function is then
+// named by address too. A crash restart runs it with each function once,
+// and each intent's realization holds only its own device.
+func TestFleet_PCIStart_NamingTheSiblingLaterKeepsItRestartable(t *testing.T) {
+	defer vfio.SetFS(vfioBoundSysfs{})()
+	ctx := context.Background()
+	pair := []string{"0000:81:00.0", "0000:81:00.1"}
+	_, n := pciStartFleet(t, ctx, "svm",
+		[]*pb.DeviceSpec{{Address: pair[0]}},
+		[]pciStartDev{{pair[0], "2330", "gpu", 50}, {pair[1], "22a3", "audio", 50}})
+	if v := pciStartRun(t, ctx, n, "svm"); v.State != "running" {
+		t.Fatalf("setup: first start: %s %q", v.State, v.StateDetail)
+	}
+	if got := pciStartRealized(t, ctx, n, "svm"); !eqStrings(got, pair) {
+		t.Fatalf("setup: realized %v after the first start; want %v (the audio function as the GPU's sibling)", got, pair)
+	}
+	audio := &pb.DeviceSpec{Address: pair[1]}
+	kind, key := corrosion.ClassifyPCISelector(audio)
+	payload, err := protojson.Marshal(audio)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertPCIIntent(ctx, n.DB, corrosion.PCIIntentRecord{VMName: "svm",
+		DeviceID: corrosion.DeterministicPCIIntentID(corrosion.CanonicalPCISelector(audio), 0), HostName: n.Name,
+		SelectorKind: kind, SelectorPayload: string(payload), ExclusiveKey: key}); err != nil {
+		t.Fatal(err)
+	}
+	v := pciStartCrash(t, ctx, n, "svm")
+	if v.State != "running" {
+		t.Fatalf("crash restart after naming the audio function refused: %s %q", v.State, v.StateDetail)
+	}
+	if got := pciStartHostdevs(n.Virt.DefinedXML("svm")); !eqStrings(got, pair) {
+		t.Errorf("svm has hostdevs %v; want %v, each once", got, pair)
+	}
+	if got := pciStartRealized(t, ctx, n, "svm"); !eqStrings(got, pair) {
+		t.Errorf("svm's realizations are %v; want %v, each once", got, pair)
+	}
+}
+
+// The VM's GPU on the failed host shares its IOMMU group with an audio
+// function, realized as the GPU's sibling. b has an H100 alone in its group.
+// After the failover the VM starts on b with that H100, and its realization
+// is the H100 alone: the failed host's sibling row does not refuse it.
+func TestFleet_PCIFailover_SiblingRealizedOnTheOldHostDoesNotRefuseTheStart(t *testing.T) {
+	defer vfio.SetFS(vfioBoundSysfs{})()
+	ctx := context.Background()
+	clock := NewVirtualClock(time.Now().UTC())
+	c, a, b, victim := pciFoFleetWith(t, clock, pciFoSetup{latched: true, onB: []pciFoDevice{h100.at(pciFoThere)}})
+	if err := corrosion.UpsertPCIDevice(ctx, a.DB, corrosion.PCIDeviceRecord{HostName: victim.Name, Address: "0000:41:00.1",
+		VendorID: "10de", DeviceID: "22a3", DeviceName: "GH100 HD Audio", Type: "audio", Driver: "vfio-pci", IOMMUGroup: 40, VMName: pciFoVM}); err != nil {
+		t.Fatal(err)
+	}
+	intents, err := corrosion.ListVMPCIIntents(ctx, a.DB, pciFoVM)
+	if err != nil || len(intents) != 1 {
+		t.Fatalf("setup: intents %+v (%v); want one", intents, err)
+	}
+	for i, addr := range []string{pciFoBDF, "0000:41:00.1"} {
+		if err := corrosion.UpsertPCIRealization(ctx, a.DB, corrosion.PCIRealizationRecord{VMName: pciFoVM, DeviceID: intents[0].DeviceID,
+			MemberID: fmt.Sprintf("m%d", i), HostName: victim.Name, ResolvedAddress: addr, Ordinal: i}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.WaitConverged(t, convergeTimeout, a, b)
+	pciFoFailOver(t, ctx, c, clock, a, b)
+	pciFoStart(t, ctx, b)
+	v := vmOn(t, b, pciFoVM)
+	if v == nil || v.State != "running" || v.HostName != b.Name {
+		t.Fatalf("%s did not start on %s: %+v", pciFoVM, b.Name, v)
+	}
+	if got := pciStartRealized(t, ctx, b, pciFoVM); !eqStrings(got, []string{pciFoThere}) {
+		t.Errorf("%s's realizations on %s are %v; want [%s]", pciFoVM, b.Name, got, pciFoThere)
+	}
 }

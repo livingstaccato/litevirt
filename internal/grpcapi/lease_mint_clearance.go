@@ -150,53 +150,29 @@ func liveLeaseElsewhere(rows []peerLeaseRow, self, now string) (peerLeaseRow, bo
 
 // clusterOfOneBut is clusterOfOne for a decision about subject, a host whose
 // admission this node may itself have just written: subject's row does not
-// make this node "not alone" while it is still 'joining' — admitted by `lv
-// host add`, its daemon never booted — and, when serial is set, while it holds
-// that certificate (the admission being asked about again). A joining host has
-// written nothing: a daemon that had booted would have recorded it active and
-// would be a gossip member. Without this, a founder that has never had a peer
-// (whose replica therefore never completes a catch-up) wedged on its first
-// `lv host add`: the add's first AdmitHost wrote the joining row, and its re-ask
-// before the install, and `lv host rm` of the half-admitted host, both found it
-// no longer alone. Any gossip member, any other host, or another admission of
-// subject still means it is not.
+// make this node "not alone" while it is still 'joining' and, when serial is
+// set, while it holds that certificate (the admission being asked about
+// again). See corrosion.ClusterOfOneBut for why a joining host is no peer.
+// Without this, a founder that has never had a peer wedged on its first `lv
+// host add`: the add's first AdmitHost wrote the joining row, and its re-ask
+// before the install, and `lv host rm` of the half-admitted host, both found
+// it no longer alone. Any gossip member, any other host, or another admission
+// of subject still means it is not.
 func (s *Server) clusterOfOneBut(ctx context.Context, subject, serial string) (bool, error) {
-	if len(s.db.Members()) > 0 {
-		return false, nil
-	}
-	hosts, err := corrosion.ListHosts(ctx, s.db)
-	if err != nil {
-		return false, err
-	}
-	for _, h := range hosts {
-		if h.Name == s.hostName {
-			continue
-		}
-		if h.Name == subject && h.State == corrosion.HostStateJoining && (serial == "" || sameSerial(h.CertSerial, serial)) {
-			continue
-		}
-		return false, nil
-	}
-	return true, nil
+	return corrosion.ClusterOfOneBut(ctx, s.db, s.hostName, func(h corrosion.HostRecord) bool {
+		return h.Name == subject && (serial == "" || sameSerial(h.CertSerial, serial))
+	})
 }
 
 // clusterOfOne reports whether this node has no peer at all: no other host in
-// its hosts table AND no gossip member. Both, because each alone can be empty
-// on a node that does have peers — the hosts table on a node that has joined
-// gossip but not yet received the table, gossip on a node whose memberlist has
-// not formed. A node that knows of any peer, reachable or not, asks.
+// its hosts table AND no gossip member (corrosion.ClusterOfOneBut, with no
+// joining host let through). A node that knows of any peer, reachable or not,
+// asks.
+//
+// LeaseMintClearance asks this, and not the joining-host exception: a joining
+// host is a voter (corrosion.HostStateJoining), so a node alone with one is
+// not a voter majority, and once that host boots it may mint from the same
+// ledger before this node sees it in gossip.
 func (s *Server) clusterOfOne(ctx context.Context) (bool, error) {
-	if len(s.db.Members()) > 0 {
-		return false, nil
-	}
-	hosts, err := corrosion.ListHosts(ctx, s.db)
-	if err != nil {
-		return false, err
-	}
-	for _, h := range hosts {
-		if h.Name != s.hostName {
-			return false, nil
-		}
-	}
-	return true, nil
+	return corrosion.ClusterOfOneBut(ctx, s.db, s.hostName, corrosion.NoAdmission)
 }

@@ -191,7 +191,8 @@ type Options struct {
 	Joiners int
 	// RealCatchUp starts every replica the way a real daemon's starts: not
 	// caught up (corrosion.Client.ReplicaCaughtUp), until a completed
-	// anti-entropy exchange says it is. Off (the default), the fleet
+	// anti-entropy exchange says it is, and every node runs the daemon's
+	// anti-entropy loop to complete one (buildServer). Off (the default), the fleet
 	// bootstraps as a cluster that has already converged. A founder alone in
 	// its cluster never completes an exchange, so every gate that waits for
 	// one meets it as it does on a real first host. A founder, lone-node or
@@ -1042,6 +1043,16 @@ func (c *Cluster) buildServer(n *Node) {
 	n.Server.RecoverFirmwareMoves(loops)
 	n.Server.MarkStartupWired()
 	go n.Server.RunFirmwareMoveRecovery(loops)
+	// A replica that starts not caught up (RealCatchUp) catches up the way
+	// the daemon's does: by its own anti-entropy loop, which also serves the
+	// server's pulls and triggers. Without it nothing would ever mark it
+	// caught up, and every gate that waits for a peer would stay shut on a
+	// node that has one.
+	if c.opts.RealCatchUp {
+		ae := corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0)
+		n.Server.SetAntiEntropy(ae)
+		go ae.Start(loops)
+	}
 
 	// Wire a real Replicator so the server's PushMutations handler + write-notify
 	// path are exercised. By default its background push loop is NOT started, so

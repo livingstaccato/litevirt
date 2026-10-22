@@ -195,11 +195,11 @@ func SeedFirewallSynflood(ctx context.Context, c *Client, g capabilities.Feature
 		return false, nil
 	}
 	if caught, _ := c.ReplicaCaughtUp(); !caught {
-		rows, err := c.Query(ctx, `SELECT COUNT(*) AS n FROM hosts WHERE name != ?`, hostName)
+		alone, err := soleOrOnlyJoiners(ctx, c, hostName)
 		if err != nil {
 			return false, err
 		}
-		if len(rows) != 1 || rows[0].Int("n") != 0 {
+		if !alone {
 			return false, nil
 		}
 	}

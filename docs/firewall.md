@@ -284,7 +284,8 @@ and a nightly or weekly flow shows as well as a constant one. Only
 observes. A cluster's **founder** decides at genesis — when `lv host init`
 founded it and its first daemon minted the admin account — that the new
 cluster enforces, and records it once `failover_scope_v1` has latched, from a
-replica that has caught up with its peers (or is the cluster's only host). No
+replica that has caught up with its peers (or is the cluster's only host, or
+has no gossip peer and no other host but ones still `joining`). No
 other host ever records a mode on its own: a host that joins, or rejoins after
 an upgrade, never changes it. The seed is stamped before any real write, so an
 operator's `lv firewall enforce` written anywhere, at any time, outranks it;

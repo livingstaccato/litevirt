@@ -924,7 +924,10 @@ What a node waits for, concretely:
   sees a peer's live lease never gets as far as asking.
 - **A cluster of one does not wait at all.** A node with no other host in its
   `hosts` table and no gossip member has nobody to ask and nobody who could hold
-  a higher term. It claims at once, including during the checker's warm-up.
+  a higher term. It claims at once, including during the checker's warm-up. A
+  host `lv host add` admitted that is still `joining` counts as a peer here,
+  because it is a voter: a founder adding its second host claims no new term
+  until it has caught up with that host once its daemon starts.
 - **A node that has peers but reaches no quorum of them does not claim.** It
   cannot tell whether a peer already took the term. This withholds a number,
   not an action: everything the lease authorises (a fence, a reschedule) needs

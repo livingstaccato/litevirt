@@ -1474,7 +1474,7 @@ wait:
 // by a drain that has none and by undrain.
 const (
 	condDrainMoveTimedOut = "drain_move_timed_out"
-	drainEvaluator        = "drain"
+	drainEvaluator        = corrosion.DrainEvaluator
 )
 
 // drainTimeoutEvidence is drain_move_timed_out's evidence: the VMs it names,

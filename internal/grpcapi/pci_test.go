@@ -182,7 +182,7 @@ func TestResolveDeviceIntents_PureTypeSelector(t *testing.T) {
 	defer restore()
 
 	corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
-		HostName: "test-host", Address: "0000:43:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1,
+		HostName: "test-host", Address: "0000:43:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: soloIOMMUGroup("0000:43:00.0"),
 	})
 
 	payload, err := protojson.Marshal(&pb.DeviceSpec{Type: "gpu", Vendor: "10de", Count: 1})
@@ -225,10 +225,10 @@ func TestAllocateDevices_MultiTypeSpec_DistinctDevices(t *testing.T) {
 
 	// Two free GPUs, distinct IOMMU groups (no siblings).
 	corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
-		HostName: "test-host", Address: "0000:44:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1,
+		HostName: "test-host", Address: "0000:44:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: soloIOMMUGroup("0000:44:00.0"),
 	})
 	corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
-		HostName: "test-host", Address: "0000:45:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1,
+		HostName: "test-host", Address: "0000:45:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: soloIOMMUGroup("0000:45:00.0"),
 	})
 
 	addrs, finish, err := s.allocateDevices(ctx, "vm-2gpu", []*pb.DeviceSpec{
@@ -257,10 +257,10 @@ func TestAllocateDevices_AddressPinThenTypeSpec_NoRepick(t *testing.T) {
 	defer restore()
 
 	corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
-		HostName: "test-host", Address: "0000:44:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1,
+		HostName: "test-host", Address: "0000:44:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: soloIOMMUGroup("0000:44:00.0"),
 	})
 	corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
-		HostName: "test-host", Address: "0000:45:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1,
+		HostName: "test-host", Address: "0000:45:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: soloIOMMUGroup("0000:45:00.0"),
 	})
 
 	addrs, finish, err := s.allocateDevices(ctx, "vm-pin-type", []*pb.DeviceSpec{
@@ -293,7 +293,7 @@ func TestAllocateDevices_MappingSpec_FreezesAddress(t *testing.T) {
 	defer restore()
 
 	corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
-		HostName: "test-host", Address: "0000:46:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1,
+		HostName: "test-host", Address: "0000:46:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: soloIOMMUGroup("0000:46:00.0"),
 	})
 	if err := corrosion.CreateResourceMapping(ctx, s.db, "gpu-map", "test mapping"); err != nil {
 		t.Fatalf("CreateResourceMapping: %v", err)

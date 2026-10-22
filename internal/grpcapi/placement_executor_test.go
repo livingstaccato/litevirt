@@ -305,7 +305,7 @@ func TestCreateVMMappingOnlySelectsMappedHost(t *testing.T) {
 	for _, host := range []string{"test-host", "unmapped"} {
 		if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
 			HostName: host, Address: "0000:41:00.0", Type: "gpu",
-			VendorID: "10de", DeviceName: "A100", IOMMUGroup: -1,
+			VendorID: "10de", DeviceName: "A100", IOMMUGroup: soloIOMMUGroup("0000:41:00.0"),
 		}); err != nil {
 			t.Fatalf("UpsertPCIDevice(%s): %v", host, err)
 		}
@@ -339,7 +339,7 @@ func TestExecuteCreateVMMappingOutranksSRIOV(t *testing.T) {
 	insertPlacementExecutorHost(t, s, "entry", 8, 16384, nil)
 	if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
 		HostName: "test-host", Address: "0000:41:00.0", Type: "gpu",
-		VendorID: "10de", DeviceName: "A100", IOMMUGroup: -1,
+		VendorID: "10de", DeviceName: "A100", IOMMUGroup: soloIOMMUGroup("0000:41:00.0"),
 	}); err != nil {
 		t.Fatalf("UpsertPCIDevice: %v", err)
 	}
@@ -380,7 +380,7 @@ func TestExecuteCreateVMMappingOnly(t *testing.T) {
 	insertPlacementExecutorHost(t, s, "entry", 8, 16384, nil)
 	if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
 		HostName: "test-host", Address: "0000:41:00.0", Type: "gpu",
-		VendorID: "10de", DeviceName: "A100", IOMMUGroup: -1,
+		VendorID: "10de", DeviceName: "A100", IOMMUGroup: soloIOMMUGroup("0000:41:00.0"),
 	}); err != nil {
 		t.Fatalf("UpsertPCIDevice: %v", err)
 	}
@@ -504,11 +504,11 @@ func TestCreateAndExecuteTypeModelSelectorIgnoreFrozenAddress(t *testing.T) {
 			for _, device := range []corrosion.PCIDeviceRecord{
 				{
 					HostName: "test-host", Address: stale, Type: "gpu",
-					VendorID: "10de", DeviceName: "A100", IOMMUGroup: -1,
+					VendorID: "10de", DeviceName: "A100", IOMMUGroup: soloIOMMUGroup(stale),
 				},
 				{
 					HostName: "test-host", Address: matched, Type: "gpu",
-					VendorID: "10de", DeviceName: "H100", IOMMUGroup: -1,
+					VendorID: "10de", DeviceName: "H100", IOMMUGroup: soloIOMMUGroup(matched),
 				},
 			} {
 				if err := corrosion.UpsertPCIDevice(context.Background(), s.db, device); err != nil {
@@ -554,15 +554,15 @@ func TestCreateAndExecuteVendorOnlySelectorAcrossDeviceTypes(t *testing.T) {
 			for _, device := range []corrosion.PCIDeviceRecord{
 				{
 					HostName: "test-host", Address: stale, Type: "gpu",
-					VendorID: "1002", DeviceName: "stale-amd", IOMMUGroup: -1,
+					VendorID: "1002", DeviceName: "stale-amd", IOMMUGroup: soloIOMMUGroup(stale),
 				},
 				{
 					HostName: "test-host", Address: "0000:42:00.0", Type: "network",
-					VendorID: "8086", DeviceName: "unrelated-nic", IOMMUGroup: -1,
+					VendorID: "8086", DeviceName: "unrelated-nic", IOMMUGroup: soloIOMMUGroup("0000:42:00.0"),
 				},
 				{
 					HostName: "test-host", Address: matched, Type: "nvme",
-					VendorID: "10de", DeviceName: "vendor-match", IOMMUGroup: -1,
+					VendorID: "10de", DeviceName: "vendor-match", IOMMUGroup: soloIOMMUGroup(matched),
 				},
 			} {
 				if err := corrosion.UpsertPCIDevice(context.Background(), s.db, device); err != nil {
@@ -595,7 +595,7 @@ func TestCreateAndExecuteRejectWrongDeviceModel(t *testing.T) {
 		insertPlacementExecutorHost(t, s, "test-host", 8, 16384, nil)
 		if err := corrosion.UpsertPCIDevice(context.Background(), s.db, corrosion.PCIDeviceRecord{
 			HostName: "test-host", Address: "0000:41:00.0", Type: "gpu",
-			VendorID: "10de", DeviceName: "A100", IOMMUGroup: -1,
+			VendorID: "10de", DeviceName: "A100", IOMMUGroup: soloIOMMUGroup("0000:41:00.0"),
 		}); err != nil {
 			t.Fatalf("UpsertPCIDevice: %v", err)
 		}

@@ -313,6 +313,14 @@ alias that works with `ssh <alias>` works here, even when the alias is not in DN
 `HostName`, `User`, `Port` and `IdentityFile` are used, and `Include` and `Match` are resolved
 by OpenSSH itself. Only the per-user `~/.ssh/config` is read; `/etc/ssh/ssh_config` is not.
 
+- The `--ssh-user` commands (gossip and migration key rotation) and `lv host rm` dial
+  `user@<recorded address>`, so a config `User` never applies to them, but a `Host` block that
+  matches the recorded address (`Host 10.0.0.*`) does: its `HostName`, `Port` and `IdentityFile`
+  redirect those dials as they would `ssh`.
+- `lv host renew-cert` and `lv host ui-cert set` default to `root@<host name>`. When your ssh
+  config turns that name into a `HostName` that does not resolve to the address the cluster
+  records for the host, they refuse rather than carry the host's credentials elsewhere; fix the
+  config or name the target with `--ssh`.
 - The config is read once per command, and its `HostName` is the one address used everywhere:
   the DNS step, the certificate SAN, the address recorded for the host, and the SSH dial.
   It must still be IPv4.

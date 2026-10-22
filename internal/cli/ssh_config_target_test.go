@@ -131,3 +131,45 @@ func TestHostInit_ResolvesTheSSHConfigOnce(t *testing.T) {
 		t.Fatalf("ssh -G ran %d times for one init, want 1", n)
 	}
 }
+
+type listHostsAt struct {
+	pb.LiteVirtClient
+	name, addr string
+}
+
+func (l listHostsAt) ListHosts(context.Context, *pb.ListHostsRequest, ...grpc.CallOption) (*pb.ListHostsResponse, error) {
+	return &pb.ListHostsResponse{Hosts: []*pb.Host{{Name: l.name, Address: l.addr}}}, nil
+}
+
+// renew-cert and ui-cert default to root@<host name>. An ssh config alias of
+// that name whose HostName points elsewhere (stale, or another machine) must
+// not carry the host's credentials there (sshcfg M5): refuse before dialling.
+func TestHostCredentialCommands_RefuseAnAliasAwayFromTheRecordedAddress(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(c pb.LiteVirtClient) error
+	}{
+		{"renew-cert", func(c pb.LiteVirtClient) error {
+			return HostRenewCert(context.Background(), c, "labnode", RenewCertOptions{})
+		}},
+		{"ui-cert set", func(c pb.LiteVirtClient) error {
+			return HostUICertSet(context.Background(), c, "labnode", UICertOptions{CertPath: "x", KeyPath: "y"})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sshAliasEnv(t, "10.0.0.99") // the alias labnode -> 10.0.0.99
+			err := tc.run(listHostsAt{name: "labnode", addr: "10.0.0.5"})
+			if err == nil || !strings.Contains(err.Error(), "10.0.0.99") || !strings.Contains(err.Error(), "--ssh") {
+				t.Fatalf("err = %v, want a refusal naming 10.0.0.99 and --ssh", err)
+			}
+
+			// The alias pointing at the recorded address is fine (the dial
+			// itself then fails here: nothing listens on port 1).
+			sshAliasEnv(t, "10.0.0.5")
+			err = tc.run(listHostsAt{name: "labnode", addr: "10.0.0.5"})
+			if err != nil && strings.Contains(err.Error(), "records") {
+				t.Fatalf("alias at the recorded address refused: %v", err)
+			}
+		})
+	}
+}

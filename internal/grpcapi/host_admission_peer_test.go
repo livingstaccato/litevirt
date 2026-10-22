@@ -74,6 +74,79 @@ func fakeDestinationAdmission(s *Server) *fakeDestPeer {
 	return f
 }
 
+// fakeMoveSource stands in for the SOURCE of a move IN, which the
+// destination Pings before it admits (incomingMoveSourceRefusal).
+type fakeMoveSource struct {
+	pb.LiteVirtClient
+	ping    *pb.PingResponse
+	pingErr error
+	pings   int
+}
+
+func (f *fakeMoveSource) Ping(context.Context, *pb.PingRequest, ...grpc.CallOption) (*pb.PingResponse, error) {
+	f.pings++
+	if f.pingErr != nil {
+		return nil, f.pingErr
+	}
+	return f.ping, nil
+}
+
+// pingableSource wires s to a move source that answers Ping healthy, and
+// returns it.
+func pingableSource(s *Server) *fakeMoveSource {
+	f := &fakeMoveSource{ping: &pb.PingResponse{HostName: "src-node"}}
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return f, func() {}, nil
+	}
+	return f
+}
+
+// TestReserveHostCapacity_RefusesAMoveFromASourceThatCannotWrite: the
+// destination asks the source of a move IN whether it can record the move's
+// ownership commit, and refuses one in WAL quarantine or release probation,
+// and one it cannot ask (fail closed, retryable). Only a move is asked
+// about; a healthy source is admitted.
+func TestReserveHostCapacity_RefusesAMoveFromASourceThatCannotWrite(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		method string
+		ping   *pb.PingResponse
+		err    error
+		want   codes.Code
+		pinged bool
+	}{
+		{name: "healthy", method: "MigrateVM", ping: &pb.PingResponse{}, want: codes.OK, pinged: true},
+		{name: "wal-quarantined", method: "MigrateVM", ping: &pb.PingResponse{WalQuarantined: true}, want: codes.FailedPrecondition, pinged: true},
+		{name: "release-probation", method: "DrainHost", ping: &pb.PingResponse{ReleaseProbation: true}, want: codes.FailedPrecondition, pinged: true},
+		{name: "container", method: "MigrateContainer", ping: &pb.PingResponse{WalQuarantined: true}, want: codes.FailedPrecondition, pinged: true},
+		{name: "unreachable", method: "MigrateVM", err: status.Error(codes.Unavailable, "down"), want: codes.Unavailable, pinged: true},
+		{name: "not-a-move", method: "RestoreVM", ping: &pb.PingResponse{WalQuarantined: true}, want: codes.OK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := testServer(t)
+			admissionHost(t, s)
+			src := pingableSource(s)
+			src.ping, src.pingErr = tc.ping, tc.err
+			_, err := s.ReserveHostCapacity(peerCtxFor(t, s, "src-node"), &pb.ReserveHostCapacityRequest{
+				Host: "test-host", Project: "proj", Method: tc.method, Principal: "op@local",
+				ResourceId: "vm:mover", CpuDelta: 1, MemMibDelta: 256, NewResidency: true, VmOverhead: true,
+			})
+			if status.Code(err) != tc.want {
+				t.Fatalf("ReserveHostCapacity(%s) from a source answering %+v / %v: got %v, want %v", tc.method, tc.ping, tc.err, err, tc.want)
+			}
+			if (src.pings > 0) != tc.pinged {
+				t.Errorf("source pinged %d time(s), want pinged=%v", src.pings, tc.pinged)
+			}
+			if err == nil {
+				return
+			}
+			if cpu, mem, _ := corrosion.HostReserved(context.Background(), s.db, "test-host"); cpu != 0 || mem != 0 {
+				t.Errorf("a refused move reserved %d vCPU/%d MiB", cpu, mem)
+			}
+		})
+	}
+}
+
 // TestReserveHostCapacity_PeerOnlyAndSelfAddressed: the RPC is peer-mTLS-only,
 // and the destination answers only for ITSELF — a request naming another host
 // is a routing error, not a decision to make on that host's behalf.
@@ -104,6 +177,7 @@ func TestReserveHostCapacity_PeerOnlyAndSelfAddressed(t *testing.T) {
 func TestReserveHostCapacity_LeaseVisibleUntilReleased(t *testing.T) {
 	s := testServer(t)
 	admissionHost(t, s)
+	pingableSource(s)
 	ctx := peerCtxFor(t, s, "src-node")
 
 	resp, err := s.ReserveHostCapacity(ctx, &pb.ReserveHostCapacityRequest{
@@ -149,6 +223,7 @@ func TestReserveHostCapacity_LocalRogueChargesTheDecision(t *testing.T) {
 
 	s := testServer(t)
 	admissionHost(t, s) // allocatable 1536 MiB
+	pingableSource(s)
 	s.SetContainerRuntime(&fakeCT{
 		names:  []string{"finite-rogue"},
 		states: map[string]string{"finite-rogue": "running"},

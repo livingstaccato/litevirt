@@ -667,7 +667,8 @@ applied a feature's data it cannot interpret — before the quarantine came up,
 or on a build from before this mechanism — may still run that host's workloads
 without it (a VM defined without the limits a feature set, for example). So a
 host quarantined below a release feature in use must be **drained** of the
-workloads the feature touches (`lv host drain`), then upgraded again or reseeded;
+workloads the feature touches (`lv host drain`) once it is upgraded again or
+reseeded: while the quarantine holds it moves nothing off itself (below), and
 reseeding alone does not correct a workload already running.
 
 **`lv stop` on a quarantined host.** A stop's `operator-stop` record is a
@@ -692,6 +693,24 @@ quarantine holds:
 - `lv start` is refused with `FailedPrecondition`: a start cannot be
   recorded either, and a guest started now would run while the cluster's
   record of it says otherwise.
+- `lv migrate` of a VM off the host, live or `--cold`, is refused with
+  `FailedPrecondition` naming the quarantine, before anything is done on the
+  target. The move's ownership commit is a write this host makes after
+  libvirt's cut-over: refused, it would leave the guest running on the target
+  while every row names this host, and failover of this host would start a
+  second copy. `lv region migrate` is refused the same way, before any disk
+  is copied to the target pool, and `lv host drain` of the host is refused
+  too.
+- `lv ct migrate` of a container off the host is refused with
+  `FailedPrecondition` the same way, before the target is prepared and
+  before the container is stopped.
+- The target refuses as well. A move's first call to its target asks for
+  the target's capacity, and the target then pings the source. A source that
+  reports WAL quarantine or release probation is refused with
+  `FailedPrecondition`, so the refusal also holds for a source rolled back
+  to a build without its own. A source the target cannot ping is refused
+  with `Unavailable`; retry the move once the two hosts can reach each
+  other.
 
 Release probation lifts by itself (`lv cluster upgrade-status`). Any other
 quarantine needs the host upgraded again or reseeded.

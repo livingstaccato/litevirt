@@ -113,3 +113,43 @@ func TestReceiveMigrationDisk_ATakeBackNeverUnlinksAFileEnsureDisksReused(t *tes
 		t.Fatal("the taken-back copy is still recorded as this host's stub")
 	}
 }
+
+// A take-back removes the copy it placed only while that file is still at the
+// path. Here, while the directory sync stalls, the placed copy is removed and
+// a retried receive of the VM places its own copy at the path, given the
+// freed inode: by device and inode it reads as the copy the take-back placed.
+// After the retry commits, its copy is the VM's only one (the source copy is
+// removed), so a take-back that unlinked it would lose the disk. The receive
+// holds the copy it places open until it returns, so the inode stays that
+// file's and no other can take it.
+//
+// Mutation: release the pin right after placing — the retry's copy takes the
+// inode and the take-back unlinks it, red.
+func TestReceiveMigrationDisk_ATakeBackNeverUnlinksARetrysCopyOnTheReusedInode(t *testing.T) {
+	f := newColdDiskFixture(t)
+	f.writeSource(t, []byte("the VM's disk"))
+	requireInodeReuse(t, filepath.Join(filepath.Dir(f.path), "reuse-control"))
+	up := &captureDiskUp{size: int64(len("the VM's disk"))}
+	if err := f.src.streamColdDisk(adminCtx(), &captureDiskClient{up: up}, "os1", f.disk, "raw"); err != nil {
+		t.Fatalf("streamColdDisk: %v", err)
+	}
+
+	sctx, giveUp := context.WithCancel(f.peer)
+	defer giveUp()
+	var reused bool
+	f.dst.SetColdDiskPlacedHookForTest(func() {
+		// The source gives up while the copy is placed; meanwhile the copy
+		// goes and a retry's copy is placed at the path.
+		giveUp()
+		reused = replaceOnItsInode(t, f.path, "a retry's copy")
+	})
+	err := f.dst.ReceiveMigrationDisk(&diskRecvStream{ctx: sctx, frames: up.frames})
+	if status.Code(err) != codes.Canceled {
+		t.Fatalf("receive whose source gave up = %v, want Canceled", err)
+	}
+	t.Logf("the retry's copy took the placed copy's inode: %v", reused)
+	got, rerr := os.ReadFile(f.path)
+	if rerr != nil || string(got) != "a retry's copy" {
+		t.Fatalf("the take-back removed a copy it did not place (it had the placed copy's inode: %v): read %q, %v", reused, got, rerr)
+	}
+}

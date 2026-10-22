@@ -302,7 +302,8 @@ func SetAsideBeforeCreate(ctx context.Context, db *corrosion.Client, dataDir, ho
 			"retry once the replica has caught up (shortly), or place the VM on another host", strings.Join(present, ", "), name, why)
 	}
 	clean := func(p string) string { return filepath.Clean(hostPath(p)) }
-	noted, err := keptDisksOf(dataDir, name)
+	note, err := keptNoteOf(dataDir, name)
+	noted := note.Paths
 	if err != nil {
 		if len(present) == 0 {
 			return BeforeCreate{}, nil
@@ -357,6 +358,20 @@ func SetAsideBeforeCreate(ctx context.Context, db *corrosion.Client, dataDir, ho
 				} else {
 					kept[clean(d.Path)] = true // the delete's decision is not here
 				}
+			}
+		}
+	}
+	// A file a kept disk backs on is not moved: that breaks the kept disk's
+	// chain, whose overlay names it by its path. The create refuses while
+	// one is at a path it clears, before anything is moved.
+	for _, u := range note.Under {
+		for _, p := range present {
+			if filepath.Clean(p) == u {
+				f, _ := keptDisksFile(dataDir, name)
+				return BeforeCreate{}, &KeptBackingFileError{msg: fmt.Sprintf("the create clears %s, which a disk the deleted VM %s was kept with backs on (%s): "+
+					"moving it would break that disk's backing chain, and the sweep would remove it; nothing was moved. "+
+					"Move the kept disk and the files under it off that path yourself (then `qemu-img rebase -u -b <new path>` "+
+					"the overlay above it), or place the VM on another host", p, name, f)}
 			}
 		}
 	}

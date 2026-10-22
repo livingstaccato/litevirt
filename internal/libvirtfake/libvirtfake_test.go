@@ -1,6 +1,7 @@
 package libvirtfake
 
 import (
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -253,4 +254,103 @@ func TestFake_RedefineKeepsActiveRuntimeState(t *testing.T) {
 			}
 		})
 	}
+}
+
+// libvirt refuses to undefine a SHUT-OFF domain that holds snapshot metadata
+// unless SNAPSHOTS_METADATA is passed ("cannot delete inactive domain with N
+// snapshots"), and the fake refuses it the same way: the keep-state undefine
+// and the plain undefine without removeStorage are refused, the plain
+// undefine with removeStorage is not. An ACTIVE domain
+// is not refused: it survives as a transient one.
+//
+// Mutation: drop undefineRefusalLocked from undefinePreservingState: red.
+func TestFake_UndefineRefusedWhileSnapshotsExist(t *testing.T) {
+	setup := func(t *testing.T, name string) *Fake {
+		t.Helper()
+		f := New()
+		if err := f.DefineDomain(`<domain><name>` + name + `</name><uuid>uuid-` + name + `</uuid></domain>`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.CreateSnapshot(name, "s1"); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	refused := func(t *testing.T, f *Fake, name string, err error) {
+		t.Helper()
+		if err == nil || !strings.Contains(err.Error(), "cannot delete inactive domain with 1 snapshots") {
+			t.Fatalf("undefine of a shut-off domain with a snapshot = %v; want libvirt's refusal", err)
+		}
+		if !f.DomainExists(name) {
+			t.Fatal("a refused undefine removed the domain")
+		}
+	}
+	t.Run("preserving state", func(t *testing.T) {
+		f := setup(t, "vm1")
+		refused(t, f, "vm1", f.UndefineDomainPreservingState("vm1"))
+	})
+	t.Run("plain without storage", func(t *testing.T) {
+		f := setup(t, "vm1")
+		refused(t, f, "vm1", f.UndefineDomain("vm1", false))
+	})
+	for name, undef := range map[string]func(*Fake) error{
+		"plain with storage": func(f *Fake) error { return f.UndefineDomain("vm1", true) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := setup(t, "vm1")
+			if err := undef(f); err != nil {
+				t.Fatalf("undefine: %v", err)
+			}
+			if f.DomainExists("vm1") {
+				t.Fatal("the domain is still defined")
+			}
+		})
+	}
+	t.Run("active", func(t *testing.T) {
+		f := setup(t, "vm1")
+		if err := f.StartDomain("vm1"); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.UndefineDomainPreservingState("vm1"); err != nil {
+			t.Fatalf("keep-state undefine of an active domain with a snapshot: %v", err)
+		}
+	})
+}
+
+// A domain with a managed-save image is refused an undefine without
+// MANAGED_SAVE, as libvirt refuses it, whatever its state; the plain undefine
+// with removeStorage (which passes MANAGED_SAVE) is not.
+//
+// Mutation: drop the managed-save check from undefineRefusalLocked: red.
+func TestFake_UndefineRefusedWhileAManagedSaveImageExists(t *testing.T) {
+	setup := func(t *testing.T) *Fake {
+		t.Helper()
+		f := New()
+		if err := f.DefineDomain(`<domain><name>vm1</name><uuid>uuid-vm1</uuid></domain>`); err != nil {
+			t.Fatal(err)
+		}
+		f.SetManagedSaveImage("vm1", true)
+		return f
+	}
+	for name, undef := range map[string]func(*Fake) error{
+		"preserving state":      func(f *Fake) error { return f.UndefineDomainPreservingState("vm1") },
+		"plain without storage": func(f *Fake) error { return f.UndefineDomain("vm1", false) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := setup(t)
+			err := undef(f)
+			if err == nil || !strings.Contains(err.Error(), "managed save image exists") {
+				t.Fatalf("undefine of a domain with a managed-save image = %v; want libvirt's refusal", err)
+			}
+			if !f.DomainExists("vm1") {
+				t.Fatal("a refused undefine removed the domain")
+			}
+		})
+	}
+	t.Run("plain with storage", func(t *testing.T) {
+		f := setup(t)
+		if err := f.UndefineDomain("vm1", true); err != nil {
+			t.Fatalf("undefine with MANAGED_SAVE: %v", err)
+		}
+	})
 }

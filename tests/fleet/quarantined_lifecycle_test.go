@@ -252,6 +252,9 @@ func TestFleet_QuarantinedContainerDelete_RefusedWithNothingChanged(t *testing.T
 	}{{n0, "ct1"}, {n1, "ct1"}, {n0, "ct2"}} {
 		_, err := c.SelfClient(tc.entry).DeleteContainer(ctx, &pb.DeleteContainerRequest{Name: tc.name, Force: true})
 		qlcRefused(t, "ct rm "+tc.name+" entering on "+tc.entry.Name, err)
+		if tc.name == "ct2" && !strings.Contains(status.Convert(err).Message(), "run it from a host that is not in write quarantine") {
+			t.Errorf("a quarantined entry's refusal %q does not say another host can take it", status.Convert(err).Message())
+		}
 	}
 	if !n0.CT.Exists("ct1") || !n1.CT.Exists("ct2") {
 		t.Errorf("a container was removed under the quarantine: ct1 %v, ct2 %v", n0.CT.Exists("ct1"), n1.CT.Exists("ct2"))
@@ -368,5 +371,59 @@ func TestFleet_QuarantinedRepairOwnerAndRestart(t *testing.T) {
 	}
 	if ops := qfsOps(n0, "web", before); ops["destroy"] != 1 || ops["start"] != 1 {
 		t.Errorf("libvirt ops of the restart: %v, want one destroy and one start", ops)
+	}
+}
+
+// `lv resize-disk` on a quarantined host is refused before the disk grows.
+// The recorded size is what refuses a later shrink, and a grow it did not
+// record would let that shrink through.
+//
+// Red on 352316c2b: OK, with libvirt's block-resize on the running VM and
+// the stopped VM's qcow2 grown, and both rows at the old size.
+//
+// Mutation: drop ResizeDisk's refusal: red.
+func TestFleet_QuarantinedResizeDisk_RefusedWithNothingChanged(t *testing.T) {
+	c, n0, n1 := qlcCluster(t)
+	ctx := context.Background()
+	qlcVM(t, c, n0, "run")
+	qlcVM(t, c, n0, "stp")
+	if _, err := c.SelfClient(n0).StopVM(ctx, &pb.StopVMRequest{Name: "stp"}); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 15*time.Second, n1.Name+" to see run", func() bool {
+		vm, _ := corrosion.GetVM(ctx, n1.DB, "run")
+		return vm != nil
+	})
+	n0.DB.SetWriteQuarantine(func() string { return qfsQuarantine })
+	for _, tc := range []struct {
+		name  string
+		entry *Node
+	}{{"run", n0}, {"stp", n0}, {"run", n1}} {
+		ds, err := corrosion.GetVMDisks(ctx, n0.DB, tc.name)
+		if err != nil || len(ds) == 0 {
+			t.Fatalf("disks of %s: %v %v", tc.name, ds, err)
+		}
+		fi0, err := os.Stat(ds[0].Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before := len(n0.Virt.EventLog())
+		_, err = c.SelfClient(tc.entry).ResizeDisk(ctx, &pb.ResizeDiskRequest{VmName: tc.name, DiskName: ds[0].DiskName, Size: "50G"})
+		qlcRefused(t, "resize-disk "+tc.name+" entering on "+tc.entry.Name, err)
+		if ops := qfsOps(n0, tc.name, before); len(ops) != 0 {
+			t.Errorf("libvirt ops on %s under the quarantine: %v, want none", tc.name, ops)
+		}
+		if fi1, _ := os.Stat(ds[0].Path); fi1 == nil || fi1.Size() != fi0.Size() {
+			t.Errorf("%s's disk file changed size under the quarantine", tc.name)
+		}
+	}
+
+	n0.DB.SetWriteQuarantine(nil)
+	ds, _ := corrosion.GetVMDisks(ctx, n0.DB, "stp")
+	if _, err := c.SelfClient(n0).ResizeDisk(ctx, &pb.ResizeDiskRequest{VmName: "stp", DiskName: ds[0].DiskName, Size: "50G"}); err != nil {
+		t.Fatalf("resize-disk after the lift: %v", err)
+	}
+	if after, _ := corrosion.GetVMDisks(ctx, n0.DB, "stp"); len(after) == 0 || after[0].SizeBytes <= ds[0].SizeBytes {
+		t.Errorf("the resize after the lift did not record the new size: %+v", after)
 	}
 }

@@ -6083,6 +6083,13 @@ func (s *Server) ResizeDisk(ctx context.Context, req *pb.ResizeDiskRequest) (*pb
 	if err := s.firmwareMoveRefusal("disk resize", vm); err != nil {
 		return nil, err
 	}
+	// The disk grows before its row records the new size, and the row is
+	// what refuses a later shrink (quarantine_lifecycle.go).
+	if err := s.quarantinedLifecycleRefusal("resize", fmt.Sprintf("disk %q of VM %q", req.DiskName, req.VmName),
+		"the disk would grow while the cluster records its old size, which a later resize could then shrink it below",
+		"lv resize-disk "+req.VmName+" --disk "+req.DiskName+" --size "+req.Size, false); err != nil {
+		return nil, err
+	}
 
 	// Find the disk record.
 	disks, err := corrosion.GetVMDisks(ctx, s.db, req.VmName)
@@ -6146,8 +6153,13 @@ func (s *Server) ResizeDisk(ctx context.Context, req *pb.ResizeDiskRequest) (*pb
 	}
 
 	// Update DB.
+	// The recorded size is what refuses a later shrink: a grow it does not
+	// record is an error, never an OK.
 	if err := corrosion.UpdateDiskSize(ctx, s.db, req.VmName, req.DiskName, newSizeBytes); err != nil {
-		slog.Warn("failed to update disk size in DB", "vm", req.VmName, "disk", req.DiskName, "error", err)
+		slog.Error("disk resized but its new size was not recorded", "vm", req.VmName, "disk", req.DiskName, "bytes", newSizeBytes, "error", err)
+		return nil, status.Errorf(codes.Internal,
+			"disk %q of VM %q was resized to %d bytes, but its new size was not recorded (%v); retry `lv resize-disk %s --disk %s --size %s` to record it",
+			req.DiskName, req.VmName, newSizeBytes, err, req.VmName, req.DiskName, req.Size)
 	}
 
 	slog.Info("disk resized", "vm", req.VmName, "disk", req.DiskName, "new_size", req.Size, "bytes", newSizeBytes)

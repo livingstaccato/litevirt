@@ -748,8 +748,8 @@ wait for release probation), and says nothing was changed:
   other host whether it has the domain. A quarantined host that has it
   refuses, and the asking host keeps the VM's record. Nothing is removed on
   either host.
-- `lv rebuild`, `lv snapshot rm` and `lv ct snapshot rm` on the VM's or
-  container's host.
+- `lv rebuild`, `lv snapshot rm`, `lv ct snapshot rm`, `lv resize-disk` and
+  `lv backup restore-from --in-place` on the VM's or container's host.
 - `lv doctor repair-owner`, on the host it names.
 - `lv restart` of a VM that is not running, which is a start (as `lv start`,
   above). `lv restart` of a running VM still restarts it: its row reads

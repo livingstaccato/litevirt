@@ -3200,6 +3200,14 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 	if err := s.inFlightMoveRefusal(ctx, "restart", vm); err != nil {
 		return nil, err
 	}
+	// A restart of a VM that is not running is a start, which a host in
+	// write quarantine cannot record (quarantinedStartRefusal). A running
+	// VM's row says running before and after, and it is restarted.
+	if vm.State != "running" {
+		if err := s.quarantinedStartRefusal(vm.Name); err != nil {
+			return nil, err
+		}
+	}
 
 	// Split-brain gate (Phase 1): a restart (destroy+start) is a runtime action on a
 	// possibly-stale-owned VM; require local quorum on the SOURCE (we forwarded here)
@@ -3672,6 +3680,19 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// deletes locally if the domain is here, else reports NotFound.
 	localOnly := deleteLocalOnly(ctx)
 
+	// A host in write quarantine cannot record the delete, so it does not
+	// start one: as the owner it would free the disks under a row that stays
+	// live, and as the entry of a forward it records the firewall tags and
+	// schedules part (quarantine_lifecycle.go). A peer-search probe is
+	// refused below, once it is known the domain is here.
+	if !localOnly {
+		if err := s.quarantinedLifecycleRefusal("delete", fmt.Sprintf("VM %q", req.Name),
+			"its domain and disks would be removed while the cluster still records the VM",
+			"lv rm "+req.Name, vm.HostName != s.hostName); err != nil {
+			return nil, err
+		}
+	}
+
 	// Mutation barrier: an operator delete must not race an in-flight operation
 	// (ordinary --force does NOT bypass it — abort the stuck operation first). A
 	// peer-search probe is part of an already-in-flight delete, not a new mutation,
@@ -3764,6 +3785,17 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 				return nil, status.Errorf(codes.Aborted,
 					"%q, recorded migrating, no longer runs here; retry, which asks the move's target", req.Name)
 			}
+		}
+	}
+
+	// A probe that found the domain here, on a host in write quarantine,
+	// is refused before it acts: the probing host passes the refusal on and
+	// keeps the record, and the domain and disks stay here.
+	if localOnly {
+		if err := s.quarantinedLifecycleRefusal("delete", fmt.Sprintf("VM %q", req.Name),
+			"its domain and disks would be removed while the cluster still records the VM",
+			"lv rm "+req.Name, false); err != nil {
+			return nil, err
 		}
 	}
 
@@ -5187,6 +5219,13 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		return client.RebuildVM(ctx, req)
 	}
 
+	// The rebuild deletes the disks before it tombstones the row, which a
+	// host in write quarantine cannot record (quarantine_lifecycle.go).
+	if err := s.quarantinedLifecycleRefusal("rebuild", fmt.Sprintf("VM %q", req.Name),
+		"its disks would be deleted while the cluster still records the VM on them",
+		"lv rebuild "+req.Name, false); err != nil {
+		return nil, err
+	}
 	// Required, not only the guard (spec §6.9): rebuild deletes the disks
 	// after an undefine whose refusal it ignores.
 	if err := s.firmwareMoveRefusal("rebuild", vm); err != nil {

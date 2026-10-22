@@ -100,8 +100,14 @@ func (s *Server) RepairVMOwner(ctx context.Context, req *pb.RepairVMOwnerRequest
 		return client.RepairVMOwner(fwdCtx, req)
 	}
 
-	// We are the target host. Require positive proof the VM runs HERE before
-	// claiming ownership for this host.
+	// We are the target host. Its write is the whole repair, which a host
+	// in write quarantine cannot record (quarantine_lifecycle.go).
+	if err := s.quarantinedLifecycleRefusal("repair the owner of", fmt.Sprintf("VM %q", req.GetName()),
+		"its row cannot be re-stamped", "lv doctor repair-owner "+req.GetName()+" "+req.GetHost(), false); err != nil {
+		return nil, err
+	}
+	// Require positive proof the VM runs HERE before claiming ownership for
+	// this host.
 	if s.virt == nil {
 		return nil, status.Error(codes.Unavailable, "libvirt not wired on this host")
 	}

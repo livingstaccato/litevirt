@@ -310,7 +310,8 @@ Repeat for each additional host.
 Every command that reaches a host over SSH (`lv host init`, `lv host add`, `lv host rotate-audit-key`
 and the `--ssh-user` commands) reads `~/.ssh/config` through the system `ssh -G`, so a `Host`
 alias that works with `ssh <alias>` works here, even when the alias is not in DNS.
-`HostName`, `User`, `Port` and `IdentityFile` are used, and `Include` and `Match` are resolved
+`HostName`, `User`, `Port`, `IdentityFile`, `IdentitiesOnly`, `IdentityAgent` and the host-key
+options below are used, and `Include` and `Match` are resolved
 by OpenSSH itself. Only the per-user `~/.ssh/config` is read; `/etc/ssh/ssh_config` is not.
 
 - The `--ssh-user` commands (gossip and migration key rotation) and `lv host rm` dial
@@ -329,12 +330,13 @@ by OpenSSH itself. Only the per-user `~/.ssh/config` is read; `/etc/ssh/ssh_conf
 - Keys are offered in one publickey attempt, as OpenSSH orders them: the configured
   `IdentityFile` keys first (the agent's copy of one when it holds it, matched by public key, so
   a passphrase-protected key or a `.pub`-only hardware-token key held by the agent still goes
-  first), then the agent's other
-  keys, then `~/.ssh/id_ed25519`, `id_ecdsa` and `id_rsa`. A key is never offered twice, and a
-  busy agent cannot use up the server's attempts before the configured key. `%d %h %i %k %l %L %n %p %r %u %%` are
-  expanded; an `IdentityFile` with any other `%` token is skipped with a warning, and under
-  `IdentitiesOnly yes` nothing is offered in its place. `IdentitiesOnly yes` limits the ssh agent (which is still used) and the key files to the configured identities,
-  matched by public key, so an `IdentityFile` that is a `.pub` file whose private key is in the agent works.
+  first), then the agent's other keys, then `~/.ssh/id_ed25519`, `id_ecdsa` and `id_rsa`. A key
+  is never offered twice, and a busy agent cannot use up the server's attempts before the
+  configured key. `%d %h %i %k %l %L %n %p %r %u %%` are expanded; an `IdentityFile` with any
+  other `%` token is skipped with a warning, and under `IdentitiesOnly yes` nothing is offered
+  in its place. `IdentitiesOnly yes` limits the ssh agent (which is still used) and the key
+  files to the configured identities, matched by public key, so an `IdentityFile` that is a
+  `.pub` file whose private key is in the agent works.
 - `IdentityAgent` is honoured: `none` uses no agent, a socket path (or `$VAR`) uses that agent,
   and `SSH_AUTH_SOCK` or no setting uses `$SSH_AUTH_SOCK`.
 - `ProxyJump` and `ProxyCommand` are not supported. lv warns, naming the directive, and
@@ -342,19 +344,27 @@ by OpenSSH itself. Only the per-user `~/.ssh/config` is read; `/etc/ssh/ssh_conf
 - Host-key checking is never loosened by the config. A changed key for a known host is
   always refused. A host with no entry in the known_hosts files is accepted on first contact
   (accept-new), unless `StrictHostKeyChecking yes`, which refuses it. `StrictHostKeyChecking no`
-  or `accept-new` change nothing. `~/.ssh/known_hosts` and `~/.ssh/known_hosts2` are always
-  checked; `UserKnownHostsFile` adds files to check on top of them, so `/dev/null` or `none`
-  drops no entry. `GlobalKnownHostsFile` is checked as `ssh` checks it, by default
-  `/etc/ssh/ssh_known_hosts` and `ssh_known_hosts2`, so a host key distributed there is
-  enforced. lv only reads these files; it never records a key in any of them. A configured file that
-  does not exist is skipped, as `ssh` skips it, with a warning naming it. `HostKeyAlias` is honoured as
-  `ssh` honours it: the host's key (and a host certificate's principal) is looked up under the
-  alias, so a key pinned there is enforced. When known_hosts has nothing under the alias, lv
-  checks the dialled address instead rather than treating the host as new, except under
-  `StrictHostKeyChecking yes`, which refuses an unknown alias as `ssh` does. A known_hosts file that exists but cannot be
-  read or parsed (a default one, a configured one or a global one) refuses the connection and
-  names the file; with no known_hosts file at all there is nothing to compare and first contact is accepted
-  with a warning.
+  or `accept-new` change nothing.
+- The known_hosts files checked: `~/.ssh/known_hosts` and `~/.ssh/known_hosts2` always;
+  `UserKnownHostsFile` adds files on top of them, so `/dev/null` or `none` drops no entry; and
+  `GlobalKnownHostsFile`, by default `/etc/ssh/ssh_known_hosts` and `ssh_known_hosts2`, so a host
+  key distributed there is enforced. A `GlobalKnownHostsFile` set in `/etc/ssh/ssh_config` is
+  not seen, since that file is not read; set it in `~/.ssh/config`. lv only reads these files;
+  it never records a key in any of them. A configured file that does not exist is skipped, as
+  `ssh` skips it, with a warning naming it. A file that exists but cannot be read or parsed (a
+  default, configured or global one) refuses the connection and names the file. With no
+  known_hosts file at all there is nothing to compare, and first contact is accepted with a
+  warning.
+- `HostKeyAlias` is honoured as `ssh` honours it: the host's key (and a host certificate's
+  principal) is looked up under the alias, so a key pinned there is enforced. When known_hosts
+  has nothing under the alias, lv checks the dialled address instead rather than treating the
+  host as new, except under `StrictHostKeyChecking yes`, which refuses an unknown alias as `ssh`
+  does.
+- lv asks a known host only for the key types its known_hosts entries record (and for a host
+  certificate when a `@cert-authority` line covers it), so a host that also holds keys of other
+  types is not refused as changed; a host known_hosts does not know is asked for any plain key
+  type. RSA keys are asked for with SHA-2 signatures only: an sshd that can sign only SHA-1
+  `ssh-rsa` is refused. `HostKeyAlgorithms` in the config is not used.
 - `Match exec` lines in your config run with lv's privileges, as they do for `ssh`: as root
   under `sudo lv host init`. OpenSSH refuses a config file not owned by that user.
 - With no `~/.ssh/config` the defaults apply even without an `ssh` binary. If a config exists

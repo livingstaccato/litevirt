@@ -239,15 +239,51 @@ func TestInstallScript_FindsAnAuthorizedKeysCommandUnderAnyMatch(t *testing.T) {
 		"AuthorizedKeysCommand /usr/bin/true %u",
 		"authorizedkeyscommand=/usr/bin/true %u",
 		`"AuthorizedKeysCommand" /usr/bin/true %u`,
+		"=AuthorizedKeysCommand /usr/bin/true %u",
+		"= AuthorizedKeysCommand /usr/bin/true %u",
+		`""AuthorizedKeysCommand /usr/bin/true %u`,
 	} {
-		inc := filepath.Join(t.TempDir(), "admin.conf")
-		if err := os.WriteFile(inc, []byte("Match Address 192.168.50.0/24\n    "+line+"\n    AuthorizedKeysCommandUser nobody\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		w := newInstallWorld(t, "Include "+inc+"\n")
-		out := w.run(t, "FENCE_SSH_PEERS=10.77.0.3")
-		if w.dropIn(t) != "" || !strings.Contains(out, "already has an AuthorizedKeysCommand") {
-			t.Fatalf("%q: drop-in %q, output %q", line, w.dropIn(t), out)
-		}
+		t.Run(line, func(t *testing.T) {
+			inc := filepath.Join(t.TempDir(), "admin.conf")
+			if err := os.WriteFile(inc, []byte("Match Address 192.168.50.0/24\n    "+line+"\n    AuthorizedKeysCommandUser nobody\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			w := newInstallWorld(t, "Include "+inc+"\n")
+			out := w.run(t, "FENCE_SSH_PEERS=10.77.0.3")
+			if w.dropIn(t) != "" || !strings.Contains(out, "already has an AuthorizedKeysCommand") {
+				t.Fatalf("%q: drop-in %q, output %q", line, w.dropIn(t), out)
+			}
+		})
+	}
+}
+
+// TestInstallScript_ABlindScanInstallsNothing: when sshd -ddd -T does not
+// name the files it reads (another debug format, a failing run), an
+// AuthorizedKeysCommand in one of them cannot be ruled out, so nothing is
+// installed. An Include path with a space is read whole.
+func TestInstallScript_ABlindScanInstallsNothing(t *testing.T) {
+	blind := filepath.Join(t.TempDir(), "sshd")
+	if err := os.WriteFile(blind, []byte("#!/bin/sh\nfor a; do if [ \"$a\" = -ddd ]; then \""+SSHDPath()+
+		"\" \"$@\" 2>&1 | grep -v load_server_config; exit 0; fi; done\nexec \""+SSHDPath()+"\" \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w := newInstallWorld(t, "")
+	out := w.run(t, "FENCE_SSH_PEERS=10.77.0.3", "FENCE_SSH_SSHD="+blind)
+	if w.dropIn(t) != "" || !strings.Contains(out, "could not list the files sshd reads") {
+		t.Fatalf("drop-in %q, output %q", w.dropIn(t), out)
+	}
+
+	spaced := filepath.Join(t.TempDir(), "with space")
+	if err := os.MkdirAll(spaced, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inc := filepath.Join(spaced, "admin.conf")
+	if err := os.WriteFile(inc, []byte("Match Address 192.168.50.0/24\n    AuthorizedKeysCommand /usr/bin/true %u\n    AuthorizedKeysCommandUser nobody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w = newInstallWorld(t, "Include \""+inc+"\"\n")
+	if out := w.run(t, "FENCE_SSH_PEERS=10.77.0.3"); w.dropIn(t) != "" || !strings.Contains(out, "already has an AuthorizedKeysCommand") ||
+		!strings.Contains(out, inc) || !strings.Contains(out, "/usr/bin/true") {
+		t.Fatalf("an Include path with a space: drop-in %q, output %q", w.dropIn(t), out)
 	}
 }

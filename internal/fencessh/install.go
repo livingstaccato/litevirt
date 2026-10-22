@@ -51,6 +51,20 @@ lv_fence_ssh_reload() {
     if systemctl is-active --quiet ssh.socket 2>/dev/null; then return 0; fi
     systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null
 }
+# lv_fence_ssh_akc_line prints the first line of file $1 whose keyword,
+# read the way sshd reads one (leading blanks and "=" skipped, quotes
+# removed, any case), is AuthorizedKeysCommand. Conservative: a line that is
+# only close to one still counts, since a false match only means no drop-in.
+lv_fence_ssh_akc_line() {
+    awk '{
+        l = $0
+        gsub("[\"\047]", "", l)
+        sub("^[ \t=]+", "", l)
+        if (l ~ /^#/) next
+        split(l, w, "[ \t=]+")
+        if (tolower(w[1]) == "authorizedkeyscommand") { print $0; exit }
+    }' "$1"
+}
 lv_fence_ssh_install() {
     local cfg="${FENCE_SSH_SSHD_CONFIG:-/etc/ssh/sshd_config}"
     local ddir="${FENCE_SSH_DROPIN_DIR:-/etc/ssh/sshd_config.d}"
@@ -98,16 +112,33 @@ lv_fence_ssh_install() {
     fi
     # The operator's own AuthorizedKeysCommand is never replaced: sshd takes
     # the first one it reads, and the drop-in is Included first. Every file
-    # sshd reads (sshd -ddd names each), any spelling (Keyword value,
-    # Keyword=value, any case), and root's effective value for every
-    # evaluated address.
-    local f own=""
-    for f in $("$sshd" -ddd -T -f "$cfg" -C "user=root,host=,addr=127.0.0.1" 2>&1 | tr -d '\r' | sed -n 's/.*load_server_config: filename //p'); do
-        [ -f "$f" ] || continue
+    # sshd reads (sshd -ddd names each; a scan that fails or does not name the
+    # main config is no scan, and nothing is installed), every line tokenised
+    # the way sshd reads it (leading blanks and "=", quotes), and root's
+    # effective value for every evaluated address.
+    local f own="" scan files
+    if ! scan="$("$sshd" -ddd -T -f "$cfg" -C "user=root,host=,addr=127.0.0.1" 2>&1)"; then
+        if [ -n "$prev" ]; then mv "$prev" "$dropin"; fi
+        echo "fence ssh: sshd -ddd -T failed, so the files sshd reads cannot be checked for an AuthorizedKeysCommand;"
+        echo "fence ssh: no drop-in was written. Have sshd also read $ak for root"
+        return 0
+    fi
+    files="$(printf '%s\n' "$scan" | tr -d '\r' | sed -n 's/.*load_server_config: filename //p')"
+    if ! printf '%s\n' "$files" | grep -Fxq -- "$cfg"; then
+        if [ -n "$prev" ]; then mv "$prev" "$dropin"; fi
+        echo "fence ssh: could not list the files sshd reads (sshd -ddd -T named no $cfg), so they cannot be checked"
+        echo "fence ssh: for an AuthorizedKeysCommand; no drop-in was written. Have sshd also read $ak for root"
+        return 0
+    fi
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
         [ "$f" = "$dropin" ] && continue
-        own="$(grep -iE '^[[:space:]]*"?AuthorizedKeysCommand"?([[:space:]=]|$)' "$f" | head -1)"
+        if [ ! -r "$f" ]; then own="$f: unreadable, so it cannot be checked"; break; fi
+        own="$(lv_fence_ssh_akc_line "$f")"
         if [ -n "$own" ]; then own="$f: $own"; break; fi
-    done
+    done <<LVFILES
+$files
+LVFILES
     local addrs="${FENCE_SSH_PEERS:-} ${FENCE_SSH_SELF:-}"
     if [ -z "$(echo $addrs)" ]; then addrs=127.0.0.1; fi
     local a out akc before="" seen=" "

@@ -48,7 +48,7 @@ func TestSSHArgs_Managed(t *testing.T) {
 		"HostKeyAlias": "litevirt-fence.6e6f64652d78", "GlobalKnownHostsFile": "/dev/null", "ProxyCommand": "none",
 		"ProxyJump": "none", "ControlMaster": "no", "ControlPath": "none", "ForwardAgent": "no",
 		"ClearAllForwardings": "yes", "BindAddress": "10.77.0.2", "BatchMode": "yes", "UpdateHostKeys": "no",
-		"PasswordAuthentication": "no",
+		"PasswordAuthentication": "no", "VerifyHostKeyDNS": "no",
 	} {
 		if o[k] != want {
 			t.Errorf("-o %s=%q, want %q", k, o[k], want)
@@ -68,7 +68,10 @@ func TestSSHArgs_Managed(t *testing.T) {
 }
 
 // TestSSHArgs_PinnedKeepsRootsIdentity: the pinned legacy path changes only
-// the host-key check; root's configuration still supplies the identity.
+// the host-key check; root's configuration still supplies the identity. It
+// never rides a master connection root's configuration multiplexes over (a
+// mux session checks no host key) or takes a key from SSHFP or a
+// KnownHostsCommand.
 func TestSSHArgs_PinnedKeepsRootsIdentity(t *testing.T) {
 	h := HostConfig{Name: "node-x", Address: "10.77.0.3", SSH: SSHFence{Path: SSHPathPinned,
 		KnownHosts: []byte("a ssh-ed25519 AAAA\n"), HostKeyAlias: "a"}}
@@ -80,6 +83,7 @@ func TestSSHArgs_PinnedKeepsRootsIdentity(t *testing.T) {
 	o := opts(args)
 	if target != "root@10.77.0.3" || o["StrictHostKeyChecking"] != "yes" || o["HostKeyAlias"] != "a" ||
 		o["KnownHostsCommand"] != "none" || o["GlobalKnownHostsFile"] != "/dev/null" ||
+		o["ControlMaster"] != "no" || o["ControlPath"] != "none" || o["VerifyHostKeyDNS"] != "no" ||
 		slices.Contains(args, "-F") || slices.Contains(args, "-i") {
 		t.Fatalf("pinned args = %q", args)
 	}

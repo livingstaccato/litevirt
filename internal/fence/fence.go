@@ -278,6 +278,7 @@ func sshArgs(ctx context.Context, h HostConfig, remote string) (target string, a
 			"-o", "StrictHostKeyChecking=yes",
 			"-o", "UserKnownHostsFile=" + kh,
 			"-o", "GlobalKnownHostsFile=/dev/null",
+			"-o", "VerifyHostKeyDNS=no",
 			"-o", "HostKeyAlias=" + h.SSH.HostKeyAlias,
 			"-o", "CheckHostIP=no",
 			"-o", "UpdateHostKeys=no",
@@ -304,8 +305,15 @@ func sshArgs(ctx context.Context, h HostConfig, remote string) (target string, a
 			"-o", "StrictHostKeyChecking=yes",
 			"-o", "UserKnownHostsFile=" + kh,
 			"-o", "GlobalKnownHostsFile=/dev/null",
-			// A KnownHostsCommand in root's config would add keys to the pin.
+			// A KnownHostsCommand or an SSHFP lookup in root's config would add
+			// keys to the pin.
 			"-o", "KnownHostsCommand=none",
+			"-o", "VerifyHostKeyDNS=no",
+			// A multiplexed session never checks a host key: a master
+			// connection root's config left open to the address (one that
+			// reached the wrong machine) would carry the fence past the pin.
+			"-o", "ControlMaster=no",
+			"-o", "ControlPath=none",
 			"-o", "HostKeyAlias=" + h.SSH.HostKeyAlias,
 			"-o", "CheckHostIP=no",
 			"-o", "UpdateHostKeys=no",

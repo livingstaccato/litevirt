@@ -17,15 +17,16 @@ import (
 )
 
 // ProjectAdoptionFallback is how long after both a candidate's last write
-// and this node's first sight of the latch a host that is not the project's
+// and this node's first-latched time a host that is not the project's
 // preferred adopter adopts it anyway (a dead or stuck holder). Adopters write
 // identical statements, so this only bounds write volume, not correctness.
 const ProjectAdoptionFallback = 2 * time.Hour
 
-// projectAdoptionFirstLatchedFile is this node's record of when it first saw
-// project_adoption's release token latched. Written once (O_EXCL) and never
-// rewritten, so a restart, or a marker rewrite, cannot restart the fallback
-// clock (re-review M-3).
+// projectAdoptionFirstLatchedFile is this node's first-latched time: when its
+// first pass after the latch found a project waiting for another host.
+// Written once (O_EXCL) and not rewritten while it holds a time no later than
+// now, so a restart, or a marker rewrite, cannot restart the fallback clock
+// (re-review M-3); firstLatchedAt replaces one it cannot read (review m-F).
 const projectAdoptionFirstLatchedFile = "project-adoption-first-latched"
 
 // ProjectAdoptionPass is one run of this host's project adoption
@@ -61,25 +62,34 @@ func (p ProjectAdoptionPass) Run(ctx context.Context) (int, error) {
 		slog.Warn("project adoption: more than one spelling of the project is live, so it keeps the pre-latch incarnation; see `lv doctor project-spellings`",
 			"project", canon)
 	}
-	if len(scan.Candidates) == 0 || !p.Enabled() || !p.Available() {
+	// project_incarnation_v1 must have latched here too (design §3): an
+	// adopted incarnation is never written while this host still writes the
+	// pre-latch forms.
+	if len(scan.Candidates) == 0 || !p.Enabled() || !p.Available() || !p.DB.ProjectIncarnationOn() {
 		return 0, nil
 	}
 	now := p.now()
-	since, err := firstLatchedAt(p.DataDir, now)
-	if err != nil {
-		return 0, err
-	}
 	hosts, err := corrosion.ListHosts(ctx, p.DB)
 	if err != nil {
 		return 0, err
 	}
 	var todo []string
+	var since *time.Time
 	for _, cand := range scan.Candidates {
 		preferred, err := p.preferred(ctx, cand.Name, hosts)
 		if err != nil {
 			return 0, err
 		}
-		if preferred || projectAdoptionOverdue(cand.UpdatedAt, since, now) {
+		if !preferred && since == nil {
+			// Read only for a host that is not the preferred adopter, so
+			// the holder never depends on the file.
+			t, err := firstLatchedAt(p.DataDir, now)
+			if err != nil {
+				return 0, err
+			}
+			since = &t
+		}
+		if preferred || projectAdoptionOverdue(cand.UpdatedAt, *since, now) {
 			todo = append(todo, cand.Name)
 		}
 	}
@@ -128,7 +138,7 @@ func (p ProjectAdoptionPass) preferred(ctx context.Context, name string, hosts [
 }
 
 // projectAdoptionOverdue: a non-preferred host adopts once both the row's last
-// write and this node's first sight of the latch are ProjectAdoptionFallback
+// write and this node's first-latched time are ProjectAdoptionFallback
 // old. Both are durable, so neither a restart nor a crash loop resets them.
 func projectAdoptionOverdue(updatedAt string, since, now time.Time) bool {
 	from := since
@@ -139,16 +149,25 @@ func projectAdoptionOverdue(updatedAt string, since, now time.Time) bool {
 }
 
 // firstLatchedAt reads this node's first-latched time, writing now the first
-// time it is asked. The file is created with O_EXCL and never rewritten.
+// time it is asked. The file is created with O_EXCL and not rewritten while it
+// holds a time no later than now. A file that does not hold one — empty or
+// garbled after a crash or a full disk between its create and its write, or a
+// time in the future, written while the clock was ahead — is replaced with
+// now (review m-F): the fallback clock restarts, which only delays a
+// non-holder's adoption, and never wedges the pass.
 func firstLatchedAt(dir string, now time.Time) (time.Time, error) {
 	path := filepath.Join(dir, projectAdoptionFirstLatchedFile)
-	if b, err := os.ReadFile(path); err == nil {
+	b, err := os.ReadFile(path)
+	switch {
+	case err == nil:
 		t, perr := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(b)))
-		if perr != nil {
-			return time.Time{}, fmt.Errorf("%s: %w", path, perr)
+		if perr == nil && !t.After(now) {
+			return t, nil
 		}
-		return t, nil
-	} else if !os.IsNotExist(err) {
+		slog.Warn("project adoption: the first-latched time is unreadable or in the future; restarting the fallback clock",
+			"file", path, "content", strings.TrimSpace(string(b)))
+		return now, replaceFirstLatched(path, now)
+	case !os.IsNotExist(err):
 		return time.Time{}, err
 	}
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
@@ -158,15 +177,39 @@ func firstLatchedAt(dir string, now time.Time) (time.Time, error) {
 		}
 		return time.Time{}, err
 	}
+	if err := writeFirstLatched(f, now); err != nil {
+		return time.Time{}, err
+	}
+	return now, syncDir(dir)
+}
+
+// replaceFirstLatched writes now to a temporary file and renames it over path.
+func replaceFirstLatched(path string, now time.Time) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := writeFirstLatched(f, now); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
+
+// writeFirstLatched writes now, syncs and closes f.
+func writeFirstLatched(f *os.File, now time.Time) error {
 	if _, err := f.WriteString(now.UTC().Format(time.RFC3339Nano) + "\n"); err != nil {
 		f.Close()
-		return time.Time{}, err
+		return err
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
-		return time.Time{}, err
+		return err
 	}
-	return now, f.Close()
+	return f.Close()
 }
 
 // projectAdoptionInterval is how often the daemon runs its pass, and
@@ -175,6 +218,8 @@ func firstLatchedAt(dir string, now time.Time) (time.Time, error) {
 var (
 	projectAdoptionInterval = time.Hour
 	projectAdoptionPoll     = time.Minute
+	// projectAdoptionFirstJitter bounds the extra wait before the first pass.
+	projectAdoptionFirstJitter = time.Minute
 )
 
 // startProjectAdoption runs the pass in its own goroutine: once, with jitter,
@@ -190,6 +235,7 @@ func (d *Daemon) startProjectAdoption(ctx context.Context) {
 	}
 	go func() {
 		wait := projectAdoptionPoll
+		first := true
 		for {
 			select {
 			case <-ctx.Done():
@@ -198,6 +244,13 @@ func (d *Daemon) startProjectAdoption(ctx context.Context) {
 			}
 			if !p.Available() {
 				wait = projectAdoptionPoll
+				continue
+			}
+			if first {
+				// The first pass after the latch waits 0-60s more, so the
+				// hosts that saw the latch together do not all adopt at once.
+				first = false
+				wait = time.Duration(rand.Int63n(int64(projectAdoptionFirstJitter) + 1))
 				continue
 			}
 			if n, err := p.Run(ctx); err != nil {

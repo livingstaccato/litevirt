@@ -103,8 +103,8 @@ func TestProjectAdoptionPass_RecordsNoUseWithoutWork(t *testing.T) {
 }
 
 // The preferred adopter (the authority holder) adopts at once; another host
-// waits until both the row's last write and its own first sight of the
-// latch are ProjectAdoptionFallback old. The first sight is written once and
+// waits until both the row's last write and its own first-latched time are
+// ProjectAdoptionFallback old. The first-latched time is written once and
 // survives a restart (a new pass); a rewrite is never made.
 //
 // Mutations: the first-latched file rewritten on every pass — red; the
@@ -148,5 +148,75 @@ func TestProjectAdoptionPass_TheHolderAdoptsAtOnce(t *testing.T) {
 	}
 	if n, err := f.pass(t, "holder").Run(ctx); err != nil || n != 1 {
 		t.Fatalf("the holder: adopted %d, err %v", n, err)
+	}
+}
+
+// Review m-F: an empty or garbled first-latched file (a crash or a full disk
+// between its create and its write) never wedges the pass: the holder adopts
+// whatever the file holds, and the file is rewritten so a non-holder's
+// fallback clock starts from now. A first-latched time in the future (written
+// while the clock was ahead) is rewritten to now rather than postponing the
+// fallback until real time catches up.
+//
+// Mutations: an unparsable file returned as an error — red; a future time
+// kept — red.
+func TestProjectAdoptionPass_ABadFirstLatchedFileNeverWedges(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name    string
+		content func(now time.Time) string
+	}{
+		{"empty", func(time.Time) string { return "" }},
+		{"garbled", func(time.Time) string { return "not a time\n" }},
+		{"in the future", func(now time.Time) string { return now.Add(365*24*time.Hour).Format(time.RFC3339Nano) + "\n" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAdoptionFixture(t)
+			f.project(t, "/held", true)
+			f.project(t, "/other", true)
+			for p, h := range map[string]string{"/held": "holder", "/other": "elsewhere"} {
+				if _, err := corrosion.ClaimInitialProjectAuthority(ctx, f.db, p, h); err != nil {
+					t.Fatal(err)
+				}
+			}
+			start := time.Now().Add(365 * 24 * time.Hour) // the rows are a year old
+			f.now = start
+			path := filepath.Join(f.dir, projectAdoptionFirstLatchedFile)
+			if err := os.WriteFile(path, []byte(tc.content(start)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if n, err := f.pass(t, "holder").Run(ctx); err != nil || n != 1 {
+				t.Fatalf("the holder with a bad file: adopted %d, err %v", n, err)
+			}
+			if got, err := firstLatchedAt(f.dir, start); err != nil || !got.Equal(start) {
+				t.Fatalf("the file after the pass: %v %v, want rewritten to %v", got, err, start)
+			}
+			f.now = start.Add(ProjectAdoptionFallback)
+			if n, err := f.pass(t, "holder").Run(ctx); err != nil || n != 1 {
+				t.Fatalf("the fallback from the rewritten time: adopted %d, err %v", n, err)
+			}
+		})
+	}
+}
+
+// Design §3: the pass needs project_incarnation_v1 latched here as well as
+// the release token, so it never writes an incarnation while this host still
+// writes the pre-latch forms.
+//
+// Mutation: the ProjectIncarnationOn check dropped — red.
+func TestProjectAdoptionPass_NeedsTheProjectIncarnationLatch(t *testing.T) {
+	ctx := context.Background()
+	f := newAdoptionFixture(t)
+	f.project(t, "/legacy", true)
+	if _, err := corrosion.ClaimInitialProjectAuthority(ctx, f.db, "/legacy", "node-1"); err != nil {
+		t.Fatal(err)
+	}
+	f.db.SetProjectIncarnationGate(func() bool { return false })
+	if n, err := f.pass(t, "node-1").Run(ctx); err != nil || n != 0 || f.gated != 0 {
+		t.Fatalf("before project_incarnation_v1: adopted %d, gate asked %d times, err %v", n, f.gated, err)
+	}
+	f.db.SetProjectIncarnationGate(func() bool { return true })
+	if n, err := f.pass(t, "node-1").Run(ctx); err != nil || n != 1 {
+		t.Fatalf("after it: adopted %d, err %v", n, err)
 	}
 }

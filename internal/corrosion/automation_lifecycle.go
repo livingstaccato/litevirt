@@ -6,6 +6,8 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+
+	"github.com/litevirt/litevirt/internal/automation/contract"
 	"golang.org/x/crypto/bcrypt"
 	"time"
 )
@@ -124,12 +126,12 @@ func (m *lifecycleMutation) before(ctx context.Context, tx *sql.Tx) error {
 	if current != m.expected {
 		return ErrAutomationLifecycleUnavailable
 	}
-	m.previous, err = automationLifetimeTx(ctx, tx, m.kind, m.name)
-	if errors.Is(err, ErrAutomationLifecycleUnavailable) && m.issuance == nil {
-		return nil
-	}
-	if err == nil && m.issuance != nil {
+	if m.issuance != nil {
 		return m.issuance.check(ctx, tx, m)
+	}
+	m.previous, err = automationLifetimeTx(ctx, tx, m.kind, m.name)
+	if errors.Is(err, ErrAutomationLifecycleUnavailable) {
+		return nil
 	}
 	return err
 }
@@ -202,7 +204,11 @@ func (m *lifecycleMutation) after(ctx context.Context, tx *sql.Tx) error {
 func (*AutomationAccountAuthentication) String() string { return "automation-account-authentication" }
 
 type AutomationAccountAuthentication struct {
+	identity                 contract.IdentityRecord
+	db                       *Client
+	proof                    automationCredentialProof
 	username, witness        string
+	origin                   string
 	principalUID, clusterUID string
 	parent                   lifecycleParent
 }
@@ -244,7 +250,7 @@ func AuthenticateAutomationLocalAccount(ctx context.Context, c *Client, username
 	if m.previous.Witness == "" {
 		return nil, ErrAutomationLifecycleUnavailable
 	}
-	return &AutomationAccountAuthentication{username: m.name, witness: m.previous.Witness, parent: m.expected}, nil
+	return &AutomationAccountAuthentication{db: c, proof: automationCredentialProof{mode: automationProofOrigin, witness: m.previous.Witness}, username: m.name, witness: m.previous.Witness, origin: m.previous.Origin, parent: m.expected}, nil
 }
 
 func authenticateAutomationLocal(ctx context.Context, c *Client, username, password string) (*lifecycleMutation, error) {

@@ -63,7 +63,7 @@ func (r *AutomationIdentityContinuity) currentTx(ctx context.Context, tx *LocalT
 	if a == nil || a.db == nil || a.db.CredentialsUnhydrated() || a.idle <= 0 {
 		return nil, origin, parent, ErrAutomationLifecycleUnavailable
 	}
-	i, err := automationCredentialPrincipalTx(ctx, tx.tx, "session", a.id)
+	i, err := automationCredentialPrincipalTx(ctx, a.db, tx.tx, "session", a.id)
 	if err != nil {
 		return nil, origin, parent, err
 	}
@@ -199,7 +199,7 @@ func (r *AutomationIdentityContinuity) Original(ctx context.Context, receipt con
 // observation nor a native acceptance permit. Callers own this FULL transaction.
 func automationContinuityRecordTx(ctx context.Context, tx *LocalTx, stage, cluster, uid string, generation uint64) (*contract.IdentityContinuity, error) {
 	if len(stage) > contract.MaxStringBytes || !utf8.ValidString(stage) || cluster == "" || uid == "" || len(cluster) > contract.MaxStringBytes || len(uid) > contract.MaxStringBytes || !utf8.ValidString(cluster) || !utf8.ValidString(uid) || generation == 0 || generation > math.MaxInt64 {
-		return nil, fmt.Errorf("invalid continuity projection key")
+		return nil, &automationProofCorruptionError{cause: fmt.Errorf("invalid continuity projection key")}
 	}
 	// Do not filter cluster: a row at the exact PK under the wrong cluster is
 	// corruption, not absence. Probe types and individual byte bounds first.
@@ -218,19 +218,19 @@ func automationContinuityRecordTx(ctx context.Context, tx *LocalTx, stage, clust
 		return nil, nil
 	}
 	if len(probe) != 1 || probe[0].Int64("bad") != 0 {
-		return nil, fmt.Errorf("malformed continuity projection")
+		return nil, &automationProofCorruptionError{cause: fmt.Errorf("malformed continuity projection")}
 	}
 	rows, err := tx.Query(ctx, `SELECT stage,cluster_uid,uid,generation,original_witness,parent_kind,parent_alias,parent_realm,parent_birth`+where, stage, uid, generation)
 	if err != nil {
 		return nil, err
 	}
 	if len(rows) != 1 {
-		return nil, fmt.Errorf("continuity projection disappeared")
+		return nil, &automationProofCorruptionError{cause: fmt.Errorf("continuity projection disappeared")}
 	}
 	row := rows[0]
 	f := contract.IdentityContinuity{ClusterUID: row.String("cluster_uid"), UID: row.String("uid"), Generation: uint64(row.Int64("generation")), OriginalWitness: row.String("original_witness"), Parent: contract.ParentLifetime{Kind: row.String("parent_kind"), Alias: row.String("parent_alias"), Realm: row.String("parent_realm"), Birth: row.String("parent_birth")}}
 	if row.String("stage") != stage || f.ClusterUID != cluster || f.UID != uid || f.Generation != generation || contract.ValidateIdentityContinuity(f) != nil {
-		return nil, fmt.Errorf("invalid continuity projection facts")
+		return nil, &automationProofCorruptionError{cause: fmt.Errorf("invalid continuity projection facts")}
 	}
 	return &f, nil
 }

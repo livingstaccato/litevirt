@@ -95,12 +95,13 @@ func (r *AutomationOwnerSubmission) Authorize(ctx context.Context) error {
 	return r.session.db.ExecuteLocal(ctx, func(tx *LocalTx) error { return r.authorizeTx(ctx, tx) })
 }
 
-func (r *AutomationOwnerSubmission) authorizeTx(ctx context.Context, tx *LocalTx) error {
+func (r *AutomationOwnerSubmission) authorizeTx(ctx context.Context, tx *LocalTx) (resultErr error) {
+	defer func() { resultErr = automationCredentialFailure(resultErr, AutomationCredentialProofInvalid) }()
 	a := r.session
 	if a == nil || a.db == nil || a.db.CredentialsUnhydrated() {
 		return ErrAutomationLifecycleUnavailable
 	}
-	identity, err := automationCredentialPrincipalTx(ctx, tx.tx, "session", a.id)
+	identity, err := automationCredentialPrincipalTx(ctx, a.db, tx.tx, "session", a.id)
 	if err != nil {
 		return err
 	}
@@ -132,12 +133,25 @@ func (r *AutomationOwnerSubmission) authorizeTx(ctx context.Context, tx *LocalTx
 	if len(aliases) != 1 {
 		return ErrAutomationLifecycleUnavailable
 	}
-	lifetime, err := automationLifetimeTx(ctx, tx.tx, "project", project.Alias)
+	certified, err := automationCertifiedIdentityForAliasTx(ctx, tx.tx, "project", project.Alias)
 	if err != nil {
 		return err
 	}
-	if lifetime.Witness != project.Witness {
+	if certified == nil || *certified != *project {
 		return ErrAutomationLifecycleUnavailable
+	}
+	continuity, err := automationIdentityContinuityProofTx(ctx, a.db, tx.tx, project)
+	if err != nil {
+		return err
+	}
+	if continuity == nil {
+		lifetime, err := automationLifetimeTx(ctx, tx.tx, "project", project.Alias)
+		if err != nil {
+			return err
+		}
+		if lifetime.Witness != project.Witness || lifetime.Origin == "" {
+			return ErrAutomationLifecycleUnavailable
+		}
 	}
 	name, err := safename.CanonicalProjectName(project.Alias)
 	if err != nil || name == "" {

@@ -632,7 +632,8 @@ import (
 // digest reason. Additive.
 // v87: four local certified-history-derived execution projections; no native authority.
 // v88: local certified-history-derived identity continuity; no native authority.
-const CurrentSchemaVersion = 88
+// v89: local session issuance pins origin or continuity proof and exact attachment.
+const CurrentSchemaVersion = 89
 
 // schemaVersionTokenUserIncarnation is the version tokens.user_created_at was
 // added in.
@@ -4043,6 +4044,14 @@ var schemaMigrations = []string{
 	// The account incarnation a token was issued to (see History,
 	// schemaVersionTokenUserIncarnation).
 	`ALTER TABLE tokens ADD COLUMN user_created_at TEXT NOT NULL DEFAULT ''`,
+	// v89: private issuance only; old rows retain their origin-mode semantics.
+	`ALTER TABLE local_automation_credential_issuance ADD COLUMN proof_mode TEXT NOT NULL DEFAULT 'origin'`,
+	`ALTER TABLE local_automation_credential_issuance ADD COLUMN identity_generation INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE local_automation_credential_issuance ADD COLUMN original_witness TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE local_automation_credential_issuance ADD COLUMN parent_kind TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE local_automation_credential_issuance ADD COLUMN parent_alias TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE local_automation_credential_issuance ADD COLUMN parent_realm TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE local_automation_credential_issuance ADD COLUMN parent_birth TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -4145,6 +4154,7 @@ var alterVersions = []int{
 	schemaVersionProjectIncarnation,   // projects.incarnation
 	82,                                // local_automation_receiver_current.established_inventory
 	schemaVersionTokenUserIncarnation, // tokens.user_created_at
+	89, 89, 89, 89, 89, 89, 89,        // local issuance proof mode/attachment
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

@@ -281,6 +281,8 @@ func TestRetainedCompatibilityDescriptorAndFrameBounds(t *testing.T) {
 		{"archived31", "dad4d14693e2ba5b6637571a8a80f6ba3c37bf55094ff2be92dfae26bbb36b1a", aggregateLocalTables83(), 29},
 		{"old33", "09e38c2616d9155ed46e134be62b051aaef50a549c538b11c644040f4e710fec", automationExecutionArchived85PrivateLayoutForTest(), 31},
 		{"current37", "5bc44346e864a2ccfa79a754ad45a697f60e71952b6db325d4289b92674a92a3", automationExecutionCurrent86PrivateLayoutForTest(), 35},
+		{"archived38", login88Layout, aggregateLocalTables88(), 36},
+		{"current89", "82aab9aae0d6cd4aada95900cf66bb4564e48a8795486f43e9de7b8e0ac58494", aggregateLocalTables(), 36},
 	}
 	for _, layout := range layouts {
 		t.Run(layout.name, func(t *testing.T) {
@@ -349,8 +351,8 @@ func TestRetainedCompatibilityDescriptorAndFrameBounds(t *testing.T) {
 						beforeSave := retainedCompatibilityRawRows(t, ctx, tx, "")
 						err = address.save(ctx, tx, len(layout.tables), 1, []byte("extra"))
 						if err != nil {
-							if layout.name != "current37" {
-								t.Fatal("old frame address ceiling setup", err)
+							if len(layout.tables) != len(aggregateLocalTables()) {
+								t.Fatal("frame address ceiling differs from compiled current layout", err)
 							}
 							if !reflect.DeepEqual(beforeSave, retainedCompatibilityRawRows(t, ctx, tx, "")) {
 								t.Fatal("storage ceiling refusal changed raw rows")

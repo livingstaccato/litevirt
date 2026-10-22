@@ -94,6 +94,19 @@ func PrepareAutomationLocalSession(ctx context.Context, c *Client, username, pas
 	if unsupported {
 		return nil, AutomationCredentialUnsupportedFlow, nil
 	}
+	identity, err := automationCertifiedIdentityForAliasTx(ctx, tx, "principal", m.name)
+	if err != nil {
+		return nil, AutomationCredentialUnknown, automationCredentialFailure(err, AutomationCredentialProofInvalid)
+	}
+	if identity != nil {
+		proof, err := automationIdentityContinuityProofTx(ctx, c, tx, identity)
+		if err != nil {
+			return nil, AutomationCredentialUnknown, automationCredentialFailure(err, AutomationCredentialProofInvalid)
+		}
+		if proof != nil {
+			return &AutomationAccountAuthentication{db: c, identity: *identity, proof: *proof, username: m.name, parent: current, principalUID: identity.UID, clusterUID: identity.ClusterUID}, AutomationCredentialEligible, nil
+		}
+	}
 	var witness, origin string
 	var valid, retired int
 	err = tx.QueryRowContext(ctx, `SELECT witness,origin,valid,retired FROM local_automation_lifetimes WHERE kind='principal' AND name=? ORDER BY retired LIMIT 1`, m.name).Scan(&witness, &origin, &valid, &retired)
@@ -118,11 +131,11 @@ func PrepareAutomationLocalSession(ctx context.Context, c *Client, username, pas
 	if candidates == 0 {
 		return nil, AutomationCredentialNoLocalProof, nil
 	}
-	identity, err := automationPrincipalForLifetimeTx(ctx, tx, AutomationLifetimeEvidence{Kind: "principal", Name: m.name, Witness: witness, Origin: origin})
+	identity, err = automationPrincipalForLifetimeTx(ctx, tx, AutomationLifetimeEvidence{Kind: "principal", Name: m.name, Witness: witness, Origin: origin})
 	if err != nil {
 		return nil, AutomationCredentialUnknown, automationCredentialFailure(err, AutomationCredentialProofInvalid)
 	}
-	return &AutomationAccountAuthentication{username: m.name, witness: witness, parent: current, principalUID: identity.UID, clusterUID: identity.ClusterUID}, AutomationCredentialEligible, nil
+	return &AutomationAccountAuthentication{db: c, identity: *identity, proof: automationCredentialProof{mode: automationProofOrigin, witness: witness}, username: m.name, witness: witness, origin: origin, parent: current, principalUID: identity.UID, clusterUID: identity.ClusterUID}, AutomationCredentialEligible, nil
 }
 
 // InsertAutomationSessionWithLoginData preserves the composite issuer's grant
@@ -184,7 +197,7 @@ func (c *Client) executeCredentialBatch(ctx context.Context, a *AutomationAccoun
 	if c.CredentialsUnhydrated() {
 		return ErrAutomationLifecycleUnavailable
 	}
-	if username != a.username || id == "" {
+	if a.db != c || !a.proof.valid(kind) || username != a.username || id == "" {
 		return ErrAutomationLifecycleUnavailable
 	}
 	mutation := &lifecycleMutation{kind: "principal", name: username, event: "issue", expected: a.parent, account: account, issuance: &automationIssuance{kind: kind, id: id, authenticated: a}}
@@ -192,25 +205,60 @@ func (c *Client) executeCredentialBatch(ctx context.Context, a *AutomationAccoun
 	return err
 }
 func (i *automationIssuance) check(ctx context.Context, tx *sql.Tx, m *lifecycleMutation) error {
-	current, err := automationLifetimeTx(ctx, tx, "principal", m.name)
+	a := i.authenticated
+	if a == nil || a.db == nil || !a.proof.valid(i.kind) {
+		return ErrAutomationLifecycleUnavailable
+	}
+	current, err := lifecycleParentTx(ctx, tx, "principal", m.name)
 	if err != nil {
 		return err
 	}
-	if current != m.previous {
-		return ErrAutomationLifecycleUnavailable
-	}
-
-	if m.previous.Witness == "" || m.previous.Witness != i.authenticated.witness {
+	if current != a.parent {
 		return ErrAutomationLifecycleUnavailable
 	}
 	if err := automationPasswordAccountAllowedTx(ctx, tx, m.name); err != nil {
 		return err
 	}
-	identity, err := automationPrincipalForLifetimeTx(ctx, tx, m.previous)
-	if err != nil {
-		return err
+	var identity *contract.IdentityRecord
+	switch a.proof.mode {
+	case automationProofOrigin:
+		evidence, err := automationLifetimeTx(ctx, tx, "principal", m.name)
+		if err != nil {
+			return err
+		}
+		if evidence.Witness != a.proof.witness || evidence.Origin != a.origin || a.witness != a.proof.witness {
+			return ErrAutomationLifecycleUnavailable
+		}
+		m.previous = evidence
+		identity, err = automationPrincipalForLifetimeTx(ctx, tx, evidence)
+		if err != nil {
+			return err
+		}
+	case automationProofContinuity:
+		identity, err = automationCertifiedIdentityForAliasTx(ctx, tx, "principal", m.name)
+		if err != nil {
+			return err
+		}
+		if identity == nil {
+			return ErrAutomationLifecycleUnavailable
+		}
+		proof, err := automationIdentityContinuityProofTx(ctx, a.db, tx, identity)
+		if err != nil {
+			return err
+		}
+		if proof == nil || *proof != a.proof {
+			return ErrAutomationLifecycleUnavailable
+		}
+	default:
+		return ErrAutomationLifecycleUnavailable
 	}
-	if (i.authenticated.principalUID != "" && i.authenticated.principalUID != identity.UID) || (i.authenticated.clusterUID != "" && i.authenticated.clusterUID != identity.ClusterUID) {
+	if (a.principalUID != "" && a.principalUID != identity.UID) || (a.clusterUID != "" && a.clusterUID != identity.ClusterUID) {
+		return ErrAutomationLifecycleUnavailable
+	}
+	// Prepared handles pin the complete certified identity observed at login.
+	// Legacy origin handles select it in this transaction; every later check
+	// must preserve that first selection across the actual credential INSERT.
+	if (a.identity.UID != "" && a.identity != *identity) || (i.identity != nil && *i.identity != *identity) {
 		return ErrAutomationLifecycleUnavailable
 	}
 	i.identity = identity
@@ -241,7 +289,7 @@ func (i *automationIssuance) persist(ctx context.Context, tx *sql.Tx, m *lifecyc
 			return ErrAutomationLifecycleUnavailable
 		}
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO local_automation_credential_issuance(kind,credential_id,username,witness,principal_uid,cluster_uid,credential_digest,valid) VALUES(?,?,?,?,?,?,?,1)`, i.kind, i.id, m.name, m.previous.Witness, i.identity.UID, i.identity.ClusterUID, snapshot.digest())
+	_, err = tx.ExecContext(ctx, `INSERT INTO local_automation_credential_issuance(kind,credential_id,username,witness,principal_uid,cluster_uid,credential_digest,valid,proof_mode,identity_generation,original_witness,parent_kind,parent_alias,parent_realm,parent_birth) VALUES(?,?,?,?,?,?,?,1,?,?,?,?,?,?,?)`, i.kind, i.id, m.name, i.authenticated.proof.witness, i.identity.UID, i.identity.ClusterUID, snapshot.digest(), i.authenticated.proof.mode, i.authenticated.proof.generation, i.authenticated.proof.originalWitness, i.authenticated.proof.parent.Kind, i.authenticated.proof.parent.Alias, i.authenticated.proof.parent.Realm, i.authenticated.proof.parent.Birth)
 	return err
 }
 
@@ -360,15 +408,20 @@ func automationCredentialPrincipal(ctx context.Context, c *Client, kind, id stri
 		return nil, err
 	}
 	defer tx.Rollback()
-	return automationCredentialPrincipalTx(ctx, tx, kind, id)
+	return automationCredentialPrincipalTx(ctx, c, tx, kind, id)
 }
 
 // The caller owns Client.mu and this transaction. Never call the public,
 // self-locking credential reader from a local admission transaction.
-func automationCredentialPrincipalTx(ctx context.Context, tx *sql.Tx, kind, id string) (*contract.IdentityRecord, error) {
-	var username, witness, principal, cluster, digest string
-	var valid int
-	err := tx.QueryRowContext(ctx, `SELECT username,witness,principal_uid,cluster_uid,credential_digest,valid FROM local_automation_credential_issuance WHERE kind=? AND credential_id=?`, kind, id).Scan(&username, &witness, &principal, &cluster, &digest, &valid)
+func automationCredentialPrincipalTx(ctx context.Context, c *Client, tx *sql.Tx, kind, id string) (*contract.IdentityRecord, error) {
+	var username, principal, cluster, digest string
+	var proof automationCredentialProof
+	var generation int64
+	var valid, wellFormed int
+	const columns = `username,witness,principal_uid,cluster_uid,credential_digest,valid,proof_mode,identity_generation,original_witness,parent_kind,parent_alias,parent_realm,parent_birth`
+	// Probe SQL types before scanning: conversion of a malformed present value
+	// is proof corruption, while an actual query failure preserves its cause.
+	err := tx.QueryRowContext(ctx, `SELECT typeof(username)='text' AND length(CAST(username AS BLOB))<=? AND typeof(witness)='text' AND length(CAST(witness AS BLOB))<=? AND typeof(principal_uid)='text' AND length(CAST(principal_uid AS BLOB))<=? AND typeof(cluster_uid)='text' AND length(CAST(cluster_uid AS BLOB))<=? AND typeof(credential_digest)='text' AND length(CAST(credential_digest AS BLOB))=64 AND typeof(valid)='integer' AND valid IN(0,1) AND typeof(proof_mode)='text' AND proof_mode IN('origin','continuity') AND typeof(identity_generation)='integer' AND identity_generation>=0 AND typeof(original_witness)='text' AND length(CAST(original_witness AS BLOB))<=? AND typeof(parent_kind)='text' AND length(CAST(parent_kind AS BLOB))<=? AND typeof(parent_alias)='text' AND length(CAST(parent_alias AS BLOB))<=? AND typeof(parent_realm)='text' AND length(CAST(parent_realm AS BLOB))<=? AND typeof(parent_birth)='text' AND length(CAST(parent_birth AS BLOB))<=? FROM local_automation_credential_issuance WHERE kind=? AND credential_id=?`, contract.MaxStringBytes, contract.MaxStringBytes, contract.MaxStringBytes, contract.MaxStringBytes, contract.MaxStringBytes, contract.MaxStringBytes, contract.MaxStringBytes, contract.MaxStringBytes, contract.MaxStringBytes, kind, id).Scan(&wellFormed)
 	if errors.Is(err, sql.ErrNoRows) {
 		if kind == "session" {
 			return nil, ErrAutomationCredentialUnstamped
@@ -378,15 +431,26 @@ func automationCredentialPrincipalTx(ctx context.Context, tx *sql.Tx, kind, id s
 	if err != nil {
 		return nil, err
 	}
-	if valid != 1 {
+	if wellFormed != 1 {
 		return nil, ErrAutomationLifecycleUnavailable
 	}
-	evidence, err := automationLifetimeTx(ctx, tx, "principal", username)
+	err = tx.QueryRowContext(ctx, `SELECT `+columns+` FROM local_automation_credential_issuance WHERE kind=? AND credential_id=?`, kind, id).Scan(&username, &proof.witness, &principal, &cluster, &digest, &valid, &proof.mode, &generation, &proof.originalWitness, &proof.parent.Kind, &proof.parent.Alias, &proof.parent.Realm, &proof.parent.Birth)
 	if err != nil {
 		return nil, err
 	}
-	if evidence.Witness != witness {
+	proof.generation = uint64(generation)
+	if valid != 1 || !proof.valid(kind) || principal == "" || cluster == "" {
 		return nil, ErrAutomationLifecycleUnavailable
+	}
+	var evidence AutomationLifetimeEvidence
+	if proof.mode == automationProofOrigin {
+		evidence, err = automationLifetimeTx(ctx, tx, "principal", username)
+		if err != nil {
+			return nil, err
+		}
+		if evidence.Witness != proof.witness {
+			return nil, ErrAutomationLifecycleUnavailable
+		}
 	}
 	if err := automationPasswordAccountAllowedTx(ctx, tx, username); err != nil {
 		return nil, err
@@ -405,7 +469,21 @@ func automationCredentialPrincipalTx(ctx context.Context, tx *sql.Tx, kind, id s
 	if (kind == "token" && life.TokenPredates(snapshot.Created)) || (kind == "session" && life.SessionPredates(snapshot.Created)) {
 		return nil, ErrAutomationLifecycleUnavailable
 	}
-	identity, err := automationPrincipalForLifetimeTx(ctx, tx, evidence)
+	var identity *contract.IdentityRecord
+	if proof.mode == automationProofOrigin {
+		identity, err = automationPrincipalForLifetimeTx(ctx, tx, evidence)
+	} else {
+		identity, err = automationCertifiedIdentityForAliasTx(ctx, tx, "principal", username)
+		if err == nil && identity != nil {
+			var current *automationCredentialProof
+			current, err = automationIdentityContinuityProofTx(ctx, c, tx, identity)
+			if err == nil && (current == nil || *current != proof) {
+				err = ErrAutomationLifecycleUnavailable
+			}
+		} else if err == nil {
+			err = ErrAutomationLifecycleUnavailable
+		}
+	}
 	if err != nil {
 		return nil, err
 	}

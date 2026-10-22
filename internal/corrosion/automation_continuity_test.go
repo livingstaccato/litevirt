@@ -491,9 +491,9 @@ func TestAutomationContinuityFrozen87AndCurrent38Layouts(t *testing.T) {
 	if !reflect.DeepEqual(old, independent) || retainedLocalLayout87Digest() != "5bc44346e864a2ccfa79a754ad45a697f60e71952b6db325d4289b92674a92a3" {
 		t.Fatal("immutable signed87 literal changed")
 	}
-	current := aggregateLocalTables()
-	if len(old) != 37 || len(current) != 38 || len(automationSemanticTables) != 18 || CurrentSchemaVersion != 88 || automationCutSourceSchema != 88 {
-		t.Fatal("current88 descriptor boundary")
+	current := aggregateLocalTables88()
+	if len(old) != 37 || len(current) != 38 || len(automationSemanticTables) != 18 {
+		t.Fatal("frozen88 descriptor boundary")
 	}
 	if !reflect.DeepEqual(old[:35], current[:35]) || !reflect.DeepEqual(old[35:], current[36:]) || current[35].table != "local_automation_identity_continuity" {
 		t.Fatal("private suffix offsets changed")
@@ -501,7 +501,7 @@ func TestAutomationContinuityFrozen87AndCurrent38Layouts(t *testing.T) {
 	for _, v := range []struct {
 		digest string
 		count  int
-	}{{retainedLocalLayout83Digest(), 31}, {retainedLocalLayout85Digest(), 33}, {retainedLocalLayout87Digest(), 37}, {retainedLocalLayoutDigest(), 38}} {
+	}{{retainedLocalLayout83Digest(), 31}, {retainedLocalLayout85Digest(), 33}, {retainedLocalLayout87Digest(), 37}, {retainedLocalLayout88Digest(), 38}} {
 		got, err := retainedLocalTablesForDigest(v.digest)
 		if err != nil || len(got) != v.count {
 			t.Fatal("literal layout dispatch", v, err)
@@ -556,8 +556,8 @@ func TestAutomationContinuityGenuine87PublicCold88(t *testing.T) {
 	if err = InitSchema(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	if storedVersion(t, c) != 88 {
-		t.Fatal("consumer did not migrate88")
+	if storedVersion(t, c) != 89 {
+		t.Fatal("consumer did not migrate89")
 	}
 	if len(schemaDDL) != len(evidence.DDL)+2 || !reflect.DeepEqual(schemaDDL[:len(evidence.DDL)], evidence.DDL) {
 		t.Fatal("schema88 changed prior DDL")
@@ -636,8 +636,8 @@ func TestAutomationContinuityGenuine87PrivateCold88(t *testing.T) {
 	if err = InitSchema(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	if storedVersion(t, c) != 88 {
-		t.Fatal("consumer88 not active")
+	if storedVersion(t, c) != 89 {
+		t.Fatal("consumer89 not active")
 	}
 	header, err := decodeRetainedHeader(e.Header)
 	if err != nil || header.LayoutDigest != retainedLocalLayout87Digest() || header.Head.Sequence != 14 {
@@ -671,12 +671,19 @@ func TestAutomationContinuityGenuine87PrivateCold88(t *testing.T) {
 	}
 }
 
-func TestAutomationContinuityCurrent38NonemptySnapshot(t *testing.T) {
+func TestAutomationContinuityCurrent89NonemptySnapshot(t *testing.T) {
 	a, b, _, verifier := continuityStorageHistory(t)
 	ctx := context.Background()
 	head, _ := a.c.AutomationHead(ctx)
 	r := continuityStorageRecord(t, a, b, head, "snapshot", continuityStorageFact())
-	receipt, err := a.c.AutomationApplyOwned(ctx, &r, verifier, contract.Reduce)
+	cfg, err := a.c.AutomationMembership(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifier.Verify(r.Certificate, CertExpectation{Key: r.Certificate.Key, ValueDigest: r.Value.MustDigest(), ConfigGeneration: cfg.Generation, Electorate: cfg.Members, Quorum: MajorityOf(len(cfg.Members))}); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := applySharedAutomation(t, a.c, r, contract.Reduce, automationFreshAnchor)
 	if err != nil || receipt.Code != "" {
 		t.Fatal(receipt, err)
 	}
@@ -732,7 +739,7 @@ func TestAutomationContinuityCurrent38NonemptySnapshot(t *testing.T) {
 
 // Historical signed-history prerequisites on actual FULL replicas. This uses
 // the existing test-only G1 authority premise, never a fresh native class issuer.
-func TestAutomationContinuityCurrent38RetainedWarmCold(t *testing.T) {
+func TestAutomationContinuityCurrent89RetainedWarmCold(t *testing.T) {
 	ctx := context.Background()
 	f := newAggregateFixture(t, aggregateFixtureOptions{Old: 3, Sources: 2, Continuing: true, BeforeFreeze: func(t *testing.T, voters []*claimTestVoter, local *claimTestVoter) {
 		verifier, err := LoadClaimVerifier(voters[0].pki)
@@ -751,7 +758,10 @@ func TestAutomationContinuityCurrent38RetainedWarmCold(t *testing.T) {
 				t.Fatal(err)
 			}
 			record := continuityStorageRecord(t, voters[0], voters[1], head, "retained38", continuityStorageFact())
-			receipt, err := v.c.AutomationApplyOwned(ctx, &record, verifier, contract.Reduce)
+			if err := verifier.Verify(record.Certificate, CertExpectation{Key: record.Certificate.Key, ValueDigest: record.Value.MustDigest(), ConfigGeneration: 1, Electorate: membersOf(voters...), Quorum: 2}); err != nil {
+				t.Fatal(err)
+			}
+			receipt, err := applySharedAutomation(t, v.c, record, contract.Reduce, automationFreshAnchor)
 			if err != nil || receipt.Code != "" {
 				t.Fatal("signed continuity storage prerequisite", receipt, err)
 			}
@@ -817,7 +827,7 @@ func TestAutomationContinuityCurrent38RetainedWarmCold(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if storedVersion(t, cold) != 88 {
+	if storedVersion(t, cold) != 89 {
 		t.Fatal("cold continuity38 source schema")
 	}
 	coldtx, err := cold.db.BeginTx(ctx, nil)

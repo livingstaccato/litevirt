@@ -111,6 +111,13 @@ var appendOnlyLedger = []struct {
 	{"a092_projects_incarnation", 71},
 	{"a093_local_automation_receiver_current_established_inventory", 82},
 	{"a094_tokens_user_created_at", schemaVersionTokenUserIncarnation},
+	{"a095_local_automation_credential_issuance_proof_mode", 89},
+	{"a096_local_automation_credential_issuance_identity_generation", 89},
+	{"a097_local_automation_credential_issuance_original_witness", 89},
+	{"a098_local_automation_credential_issuance_parent_kind", 89},
+	{"a099_local_automation_credential_issuance_parent_alias", 89},
+	{"a100_local_automation_credential_issuance_parent_realm", 89},
+	{"a101_local_automation_credential_issuance_parent_birth", 89},
 }
 
 const appendOnlyRule = "schemaMigrations is append-only: add new ALTERs at the end; never reorder"
@@ -161,7 +168,7 @@ func TestSchemaExecution86HasFourAdditiveLocalUnits(t *testing.T) {
 			t.Fatal("missing execution86 table migration", table)
 		}
 	}
-	if CurrentSchemaVersion != 87 || schemaVersionTokenUserIncarnation != 86 {
+	if CurrentSchemaVersion < 87 || schemaVersionTokenUserIncarnation != 86 {
 		t.Fatal("execution86 changed an allocated predecessor meaning")
 	}
 }

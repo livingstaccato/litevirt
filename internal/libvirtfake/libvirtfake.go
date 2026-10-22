@@ -184,6 +184,9 @@ type Fake struct {
 	// pause on a failed disk write, reported with PausedReason io-error.
 	// Any other state change of the domain forgets it.
 	ioPaused map[string]bool
+	// ppMark is the partition-pause mark (MarkPartitionPaused), live only:
+	// it holds for the run it was set in (starts) while the domain is active.
+	ppMark map[string]ppMark
 	// pendingPermall is, per migrated-in TPM guest that has not resumed
 	// yet, the uuid whose permall its swtpm writes back once it runs.
 	pendingPermall map[string]string
@@ -225,6 +228,10 @@ type Fake struct {
 	// FailKillPartitionPaused fails KillPartitionPaused (a missing or
 	// foreign pid file).
 	FailKillPartitionPaused func(name string) error
+	// FailMarkPartitionPaused / FailClearPartitionPauseMark inject a failure
+	// to set or remove the partition-pause mark.
+	FailMarkPartitionPaused     func(name string) error
+	FailClearPartitionPauseMark func(name string) error
 	// FailListDomains makes domain enumeration fail — the shape of a libvirtd
 	// outage, which marks the host's runtime inventory INCOMPLETE and must
 	// refuse new residency at admission time.
@@ -487,6 +494,9 @@ func (f *Fake) SetState(name string, s State) {
 	delete(f.ioPaused, name)
 	if s != StateShutdown {
 		delete(f.offReason, name)
+	}
+	if prev := f.domains[name]; (s != StateRunning && s != StatePaused) || (prev != StateRunning && prev != StatePaused) {
+		delete(f.ppMark, name) // a new QEMU process, or none: the live mark is gone
 	}
 	started := s == StateRunning && f.domains[name] != StateRunning
 	f.domains[name] = s
@@ -1248,6 +1258,7 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	}
 	f.dropPITLocked(name, "")
 	delete(f.domains, name)
+	delete(f.ppMark, name)
 	delete(f.xml, name)
 	delete(f.activeXML, name)
 	delete(f.liveConsolePw, name)
@@ -1301,6 +1312,7 @@ func (f *Fake) undefinePreservingState(name string) error {
 	}
 	f.dropPITLocked(name, "")
 	delete(f.domains, name)
+	delete(f.ppMark, name)
 	delete(f.xml, name)
 	delete(f.activeXML, name)
 	delete(f.snapshots, name)

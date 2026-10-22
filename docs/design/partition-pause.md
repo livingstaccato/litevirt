@@ -196,7 +196,7 @@ Before it pauses a workload, the pauser writes a record to a host-local file:
 
 ```
 <data_dir>/partition-pause/<kind>-<name>.json
-  {kind, name, owner_epoch, incarnation, domain_uuid, host, paused_at, reason}
+  {kind, name, owner_epoch, incarnation, domain_uuid, token, host, paused_at, reason}
 ```
 
 The file is written through a temp file, `fsync`, `rename` and a directory
@@ -274,6 +274,33 @@ when a record exists for it. A workload an operator paused (with `virsh
 suspend`, or `lxc-freeze` by hand) has no record, so the pauser never resumes
 it. A container someone else froze is told apart with `lxc-info`'s raw state
 (`IsFrozen`), since `lxc.Runtime.State` folds frozen into running.
+
+**Resume only a pause this host made.** A record alone does not prove that
+its VM is paused by this host's pause: a crash between a resume and the
+record's removal leaves the record beside a VM that runs again, and an
+operator's `virsh suspend` or QEMU's pause on a disk I/O error can pause it
+later. So, once it has suspended a VM, the pauser puts a live-only
+metadata mark on the domain (namespace
+`https://litevirt.dev/xmlns/partition-pause/1`) carrying a random token, which
+the record holds as `token`. It resumes a paused VM only when libvirt's
+paused reason is `user` (a suspend: never `io-error`, `migration` or any
+other) and the domain carries the record's token. It takes the mark off
+before the resume, and puts it back if the resume fails, is never issued,
+or lands late and is undone; it also takes it off any recorded VM it sees
+running. In a healed pass the mark's read and its removal are calls of the
+resume step, bounded by `R` like the rest (§4.1): a removal abandoned at the
+deadline holds the VM, and puts the mark back once it returns. A VM paused
+again because the majority went away mid-pass (§4.1) gets a fresh token, and,
+as in a pause pass, its suspend comes after the memory snapshot registry's
+hold. The mark is set outside the suspend's
+timed window (a metadata write can wait behind a libvirt job), so a mark
+that is slow or fails never makes the pause late or failed. A VM that fails
+either check is held: it stays paused, its record stays, and
+`partition_paused` names it under `not_paused_by_this_host` with the reason.
+The record is dropped once the VM is no longer paused (an operator resumed
+or stopped it). A mark that cannot be set does not stop the pause; that VM is
+held after the heal. A record without a token, written by an older build, is
+resumed on the paused reason alone.
 
 **A record is true only while it describes the domain.** It carries the paused
 domain's UUID. When the majority is back, a VM record whose domain is gone, is
@@ -364,9 +391,11 @@ The pauser resumes a paused workload only when **all** of these hold, checked
 in this order:
 
 1. **QuorumYes.** The execution quorum is back, from this host's own probes.
-2. **The local row still names this host** at the recorded `owner_epoch` and
+2. **The pause is this host's** (§3.3): a VM is paused with libvirt's reason
+   `user` and carries the record's token.
+3. **The local row still names this host** at the recorded `owner_epoch` and
    incarnation (`created_at`).
-3. **A majority of the voter set confirms it.** The pauser asks every other
+4. **A majority of the voter set confirms it.** The pauser asks every other
    voter it can reach, with one peer-only, read-only RPC,
    `ConfirmPartitionResume`, answered from that voter's OWN replica and claim
    tables. It needs answers from enough of them that, counting itself, they
@@ -435,7 +464,7 @@ checks, so a paused workload stays paused across a daemon restart.
 While this host holds any self-paused workload, it holds a
 `partition_paused` condition (evaluator `partition_pause`, subject
 `host/<name>`, severity warning). It lists the paused workloads and the reason,
-and it is resolved when the last record goes, by this process or, after a
+and names any it holds because something else paused them (§3.3), and it is resolved when the last record goes, by this process or, after a
 restart, by the first pass that finds no record. A fleet-wide blip therefore
 leaves one resolved condition per host in the history.
 

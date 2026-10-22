@@ -2275,6 +2275,25 @@ holder writes.
   ```
   A record whose VM domain is undefined, or whose container has no live row on
   this host and no longer exists in LXC, is dropped with the last line.
+  A VM is resumed only while it is paused by this host's own pause: libvirt's
+  paused reason is `user`, and the domain carries the mark the pause set. One
+  that an operator suspended or QEMU paused on a disk I/O error is held, and
+  the evidence names it under `not_paused_by_this_host`:
+  ```
+  partition-pause: workload stays paused kind=vm name=<vm> reason="the domain is paused on a disk I/O error, not by this host's partition pause; …"
+  ```
+  No `lv` command resumes a paused VM (`lv stop` and `lv start` drop the
+  record but reboot the guest). On the VM's host, once it should run:
+  ```
+  virsh resume <vm>
+  ```
+  The next pass drops the record. For an I/O-error pause, free space in the
+  storage pool or repair the disk first: a resume into the same failure
+  pauses the guest again at once. A VM whose pause mark could not be set is
+  held the same way, and the reason then reads "this host's pause could not
+  mark the domain". A VM left paused on purpose keeps `partition_paused`
+  open, and memory snapshots and NIC firewall arming stay refused for it,
+  until it is resumed or stopped.
   A host the majority fenced while it was paused stays paused until
   `lv host undrain` (or until failover returns it to active, when its fence
   moved nothing). A workload that a certified claim moved is stopped by the

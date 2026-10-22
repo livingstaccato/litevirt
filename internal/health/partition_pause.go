@@ -2,6 +2,8 @@ package health
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -46,6 +48,9 @@ const (
 	PartitionPauseExecBudget = 5 * time.Second
 	// partitionPauseCallTimeout bounds one suspend or freeze.
 	partitionPauseCallTimeout = 2 * time.Second
+	// markWaitBoundDefault: how long a clear waits for its own mark write,
+	// well past libvirt's 30 s job wait.
+	markWaitBoundDefault = 2 * time.Minute
 	// partitionPauseSlack covers scheduling and monotonic-clock rate error.
 	partitionPauseSlack = 2 * time.Second
 	// PartitionResumeStepBound is R: the longest one step of a healed pass
@@ -131,6 +136,14 @@ type PauseVMBackend interface {
 	// for a domain whose resume is still out in a libvirt call that may never
 	// return, and that must not land. nil when no such process runs any more.
 	KillPartitionPaused(name, uuid string) error
+	// MarkPartitionPaused puts a live-only mark carrying token on the
+	// running domain, just before the pauser suspends it; the pauser resumes
+	// only a paused domain that still carries its record's token, and
+	// ClearPartitionPauseMark removes the mark before the resume.
+	// PartitionPauseMark reads it (ok=false: no mark).
+	MarkPartitionPaused(name, token string) error
+	PartitionPauseMark(name string) (token string, ok bool, err error)
+	ClearPartitionPauseMark(name string) error
 }
 
 // Read kinds the pauser's abandoned-call guard tracks (callGuard).
@@ -138,6 +151,7 @@ const (
 	readListDomains = "ListDomains"
 	readDomainState = "DomainStateReason"
 	readDomainXML   = "DumpXMLInactive"
+	readPauseMark   = "PartitionPauseMark"
 )
 
 // callGuard admits one call of each kind at a time. A libvirt call can hang
@@ -258,7 +272,7 @@ type ResumeVerdict struct {
 }
 
 // ResumeConfirmer asks the voter set whether each record may resume
-// (docs/design/partition-pause.md §3.5 step 3). Keyed by PauseRecord.Key. A
+// (docs/design/partition-pause.md §3.5 step 4). Keyed by PauseRecord.Key. A
 // record missing from the result is not confirmed. Wired to
 // grpcapi.Server.ConfirmPartitionResume.
 type ResumeConfirmer func(ctx context.Context, recs []PauseRecord) map[string]ResumeVerdict
@@ -414,7 +428,31 @@ type PartitionPauser struct {
 	pausedSynced bool
 	lastConfirm  time.Time
 	heldWhy      map[string]string // key → last logged hold reason
-	exemptWhy    string
+	// notOurs: key → why, for a record whose VM something other than this
+	// host's pause has paused (an operator, an I/O error). Held, and named
+	// in partition_paused's evidence.
+	notOurs map[string]string
+	// markFailed: key → the token of this host's pause whose mark could not
+	// be set, so its hold says so instead of blaming someone else.
+	markFailed map[string]string
+	// markPending: key → the token of this host's pause whose mark is still
+	// being written (libvirt can be slow): not yet set, not failed.
+	markPending map[string]string
+	// markWritten: key/token → closed once that pause's mark write returns
+	// (set or failed), for a clear of that token to wait on.
+	markWritten map[string]chan struct{}
+	// clearWanted: key/token of a mark whose clear gave up waiting for its
+	// write; markPaused takes it off once the write returns.
+	clearWanted map[string]bool
+	// markWaitBound caps how long a clear waits for its own mark write
+	// (markWaitBoundDefault; tests shorten it).
+	markWaitBound time.Duration
+	// clearing: name/token of each mark a background clear is taking off.
+	clearing map[string]bool
+	// markLocks serialise every mark write and clear of one VM, so a slow
+	// clear can never land after, and erase, a newer pause's mark.
+	markLocks map[string]*sync.Mutex
+	exemptWhy string
 	// captures is the host's memory snapshot registry: a VM being captured
 	// is aborted out of its capture before it is paused, and no capture
 	// resumes a VM this pauser holds (lv.CaptureRegistry).
@@ -427,7 +465,10 @@ func NewPartitionPauser(host, dataDir string, db *corrosion.Client) *PartitionPa
 		host: host, db: db, store: newPauseStore(dataDir), dataDir: dataDir,
 		now: time.Now, after: PartitionPauseAfter, tick: partitionPauseTick, ctCapable: lxc.Available,
 		failed: map[string]string{}, heldWhy: map[string]string{}, inflight: map[string]bool{}, resuming: map[string]bool{},
-		killed: map[string]bool{},
+		killed: map[string]bool{}, notOurs: map[string]string{},
+		markFailed: map[string]string{}, markPending: map[string]string{}, clearing: map[string]bool{},
+		markWritten: map[string]chan struct{}{}, clearWanted: map[string]bool{}, markWaitBound: markWaitBoundDefault,
+		markLocks: map[string]*sync.Mutex{},
 	}
 }
 
@@ -697,13 +738,23 @@ func (p *PartitionPauser) majorityLost(ctx context.Context) bool {
 // with key still held: the pass reported the workload still paused, so
 // landed either lets it stand (lateResume) or pauses it again.
 func (p *PartitionPauser) callWithin(key string, timeout time.Duration, resume bool, fn func() error, landed func()) error {
+	_, err := p.callWithinThen(key, timeout, resume, fn, landed, nil)
+	return err
+}
+
+// callWithinThen is callWithin, and then, when fn was started (started),
+// runs after in the call's own goroutine once fn and any landed have
+// returned, however long after the deadline that is. When fn was not started
+// (no time left, or an earlier call still out) after is not run: the caller
+// still owns what after would release.
+func (p *PartitionPauser) callWithinThen(key string, timeout time.Duration, resume bool, fn func() error, landed, after func()) (started bool, err error) {
 	if timeout <= 0 {
-		return errPassBudget
+		return false, errPassBudget
 	}
 	p.mu.Lock()
 	if p.inflight[key] {
 		p.mu.Unlock()
-		return fmt.Errorf("an earlier call on %s has not returned yet", key)
+		return false, fmt.Errorf("an earlier call on %s has not returned yet", key)
 	}
 	p.inflight[key] = true
 	if resume {
@@ -722,6 +773,9 @@ func (p *PartitionPauser) callWithin(key string, timeout time.Duration, resume b
 		if !state.CompareAndSwap(running, returned) && err == nil && landed != nil {
 			landed()
 		}
+		if after != nil {
+			after()
+		}
 		p.mu.Lock()
 		delete(p.inflight, key)
 		delete(p.resuming, key)
@@ -733,12 +787,12 @@ func (p *PartitionPauser) callWithin(key string, timeout time.Duration, resume b
 	defer t.Stop()
 	select {
 	case err := <-done:
-		return err
+		return true, err
 	case <-t.C:
 		if state.CompareAndSwap(running, abandoned) {
-			return fmt.Errorf("%w within %v", errCallTimeout, timeout)
+			return true, fmt.Errorf("%w within %v", errCallTimeout, timeout)
 		}
-		return <-done
+		return true, <-done
 	}
 }
 
@@ -775,6 +829,8 @@ func (p *PartitionPauser) lateResume(rec PauseRecord, yesAt time.Time, undo func
 		}
 		p.mu.Lock()
 		delete(p.heldWhy, key)
+		delete(p.notOurs, key)
+		delete(p.markFailed, key)
 		p.mu.Unlock()
 		slog.Warn("partition-pause: an abandoned resume landed late with the voter majority there throughout and confirming again; it stands",
 			"kind", rec.Kind, "name", rec.Name, "host", p.host)
@@ -919,13 +975,17 @@ func (p *PartitionPauser) repause(recs []PauseRecord) {
 		rec.PausedAt = p.now().UTC().Format(time.RFC3339)
 		rec.Reason = "the voter majority was lost again while this host was resuming"
 		var pause func() error
+		var paused func()
 		switch rec.Kind {
 		case PauseKindVM:
 			if p.vms == nil {
 				continue
 			}
-			name := rec.Name
-			pause = func() error { return p.vms.SuspendDomain(name) }
+			// A pause of its own, marked as the pass's are: its mark went
+			// before the resume, and the record is written again.
+			rec.Token = newPauseToken()
+			pause = func() error { return p.suspendPendingMark(rec) }
+			paused = func() { p.markPaused(rec) }
 		case PauseKindContainer:
 			if p.cts == nil {
 				continue
@@ -949,7 +1009,7 @@ func (p *PartitionPauser) repause(recs []PauseRecord) {
 			if rec.Kind == PauseKindVM {
 				_, settled = p.captures.Hold(rec.Name, budget.holdWait())
 			}
-			err := p.pauseOne(rec, budget.recordBound(), pause)
+			err := p.pauseOne(rec, budget.recordBound(), pause, paused)
 			if err == nil && !settled {
 				err = errors.New("a memory snapshot of the guest did not let go within the re-pause's budget" +
 					"; libvirt or the capture may resume the guest after this pause")
@@ -1070,7 +1130,11 @@ func (p *PartitionPauser) Evaluate(ctx context.Context) {
 		return
 	}
 	if !lost {
-		return // a Yes, but not yet a sustained one: neither pause nor resume
+		// A Yes, but not yet a sustained one: neither pause nor resume. A
+		// recorded VM that runs again (an operator resumed it) loses its
+		// mark now, so a later suspend by anyone else never matches it.
+		p.clearMarksOfRunning(ctx)
+		return
 	}
 	// Unknown (warmup, an unreadable voter set) counts as loss, but is not
 	// reported as one: every daemon start passes through it.
@@ -1351,6 +1415,7 @@ func (p *PartitionPauser) pauseVMs(ctx context.Context, budget passBudget, reaso
 		xml, _ := guardedCall(&p.reads, readDomainXML, budget.timeout(), func() (string, error) { return p.vms.DumpXMLInactive(name) })
 		rec := PauseRecord{Kind: PauseKindVM, Name: name, Host: p.host, OwnerEpoch: vm.OwnerEpoch,
 			Incarnation: corrosion.IncarnationOf(vm.CreatedAt), DomainUUID: lv.UUIDFromXML(xml),
+			Token:    newPauseToken(),
 			PausedAt: p.now().UTC().Format(time.RFC3339), Reason: reason}
 		// Every pause in its own goroutine: the pass ends within one call
 		// timeout of its last read, however many workloads there are.
@@ -1362,7 +1427,7 @@ func (p *PartitionPauser) pauseVMs(ctx context.Context, budget passBudget, reaso
 			// guest that was running) before the suspend, and keeps any
 			// capture from resuming the guest after it.
 			_, settled := p.captures.Hold(name, budget.holdWait())
-			if err := p.pauseOne(rec, budget.recordBound(), func() error { return p.vms.SuspendDomain(name) }); err != nil {
+			if err := p.pauseOne(rec, budget.recordBound(), func() error { return p.suspendPendingMark(rec) }, func() { p.markPaused(rec) }); err != nil {
 				fail(rec.Key(), err.Error())
 			} else if !settled {
 				// The capture's job outlived the wait: libvirt resumes a guest
@@ -1457,7 +1522,7 @@ func (p *PartitionPauser) pauseContainers(ctx context.Context, budget passBudget
 				cctx, cancel := context.WithTimeout(ctx, partitionPauseCallTimeout)
 				defer cancel()
 				return p.cts.Freeze(cctx, name)
-			}); err != nil {
+			}, nil); err != nil {
 				fail(rec.Key(), err.Error())
 			}
 		}()
@@ -1470,13 +1535,15 @@ func (p *PartitionPauser) pauseContainers(ctx context.Context, budget passBudget
 const whyResumeInFlight = "a resume abandoned at the end of its step has not returned and may yet land"
 
 // pauseOne records rec, waiting at most recordBound for the write, then runs
-// pause, bounded by partitionPauseCallTimeout.
+// pause, bounded by partitionPauseCallTimeout. Once pause has returned
+// success, however late, paused runs in its own goroutine: nothing it does
+// counts toward the pause or delays it.
 // A pause that fails cleanly drops the record (the workload is not paused);
 // one that times out keeps it, since it may still land, and a paused workload
 // with no record is never resumed. A call that has not returned blocks any
 // second call for the same workload (inflight), so a wedged suspend is never
 // issued twice; it is reported as a failure until it returns.
-func (p *PartitionPauser) pauseOne(rec PauseRecord, recordBound time.Duration, pause func() error) error {
+func (p *PartitionPauser) pauseOne(rec PauseRecord, recordBound time.Duration, pause func() error, paused func()) error {
 	p.mu.Lock()
 	if p.inflight[rec.Key()] {
 		p.mu.Unlock()
@@ -1515,6 +1582,9 @@ func (p *PartitionPauser) pauseOne(rec PauseRecord, recordBound time.Duration, p
 		p.mu.Lock()
 		delete(p.inflight, rec.Key())
 		p.mu.Unlock()
+		if err == nil && paused != nil {
+			go paused()
+		}
 		done <- err
 	}()
 	select {
@@ -1531,6 +1601,340 @@ func (p *PartitionPauser) pauseOne(rec PauseRecord, recordBound time.Duration, p
 	slog.Warn("partition-pause: paused workload", "kind", rec.Kind, "name", rec.Name,
 		"host", p.host, "owner_epoch", rec.OwnerEpoch, "reason", rec.Reason)
 	return nil
+}
+
+// newPauseToken is a fresh token for one pause's mark.
+func newPauseToken() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b) // never fails (crypto/rand)
+	return hex.EncodeToString(b)
+}
+
+// suspendPendingMark suspends rec's domain and, once it is suspended, notes
+// its mark as pending before markPaused is even started: a clear for the same
+// token waits for the mark to be written, so it never runs first and leaves
+// the mark behind.
+func (p *PartitionPauser) suspendPendingMark(rec PauseRecord) error {
+	if err := p.vms.SuspendDomain(rec.Name); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.markPending[rec.Key()] = rec.Token
+	p.markWritten[rec.Key()+"/"+rec.Token] = make(chan struct{})
+	p.mu.Unlock()
+	return nil
+}
+
+// markPaused puts the mark carrying rec.Token on rec's domain, after the
+// suspend and outside its timed window: libvirt can hold the metadata write
+// behind a running job for up to 30 s, and the majority relies on the
+// suspend alone. A mark that is late holds the VM at the heal until it lands;
+// one that never lands holds it for good, which says so. A mark whose clear
+// gave up waiting for it (clearWanted) is taken off as soon as it lands,
+// still under the mark lock: its record may be gone, and nothing else would.
+func (p *PartitionPauser) markPaused(rec PauseRecord) {
+	l := p.markLock(rec.Name)
+	l.Lock()
+	defer l.Unlock()
+	err := p.vms.MarkPartitionPaused(rec.Name, rec.Token)
+	wk := rec.Key() + "/" + rec.Token
+	p.mu.Lock()
+	if p.markPending[rec.Key()] == rec.Token {
+		delete(p.markPending, rec.Key())
+	}
+	// In the same critical section as the close, so a clear that gives up
+	// either sees the channel closed or leaves its flag for this read.
+	wanted := p.clearWanted[wk]
+	delete(p.clearWanted, wk)
+	if ch := p.markWritten[wk]; ch != nil {
+		close(ch)
+		delete(p.markWritten, wk)
+	}
+	if err != nil {
+		p.markFailed[rec.Key()] = rec.Token
+	} else if p.markFailed[rec.Key()] == rec.Token {
+		delete(p.markFailed, rec.Key())
+	}
+	p.mu.Unlock()
+	if err != nil {
+		slog.Warn("partition-pause: cannot mark the paused domain as paused by this host; it stays paused after the heal until an operator resumes it",
+			"name", rec.Name, "host", p.host, "error", err)
+		return
+	}
+	if wanted {
+		if cerr := p.clearMarkLocked(rec.Name, rec.Token); cerr != nil && !lv.IsNotFound(cerr) {
+			slog.Warn("partition-pause: could not take a late mark off a running domain", "name", rec.Name, "error", cerr)
+		}
+	}
+}
+
+// markLock is name's mark lock (markLocks).
+func (p *PartitionPauser) markLock(name string) *sync.Mutex {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	l := p.markLocks[name]
+	if l == nil {
+		l = &sync.Mutex{}
+		p.markLocks[name] = l
+	}
+	return l
+}
+
+// clearMarkLocked takes name's mark off only while it is token's: a mark a
+// newer pause wrote is never cleared. The caller holds name's mark lock.
+func (p *PartitionPauser) clearMarkLocked(name, token string) error {
+	cur, ok, err := p.vms.PartitionPauseMark(name)
+	if err != nil {
+		return err
+	}
+	if !ok || cur != token {
+		return nil
+	}
+	return p.vms.ClearPartitionPauseMark(name)
+}
+
+// clearMarkWithin takes rec's mark off, as clearMarkLocked, for a resume
+// step: the caller holds the mark lock, and the clear is abandoned at
+// deadline (errCallTimeout), as every call of a resume step is. owned: the
+// clear was abandoned and its goroutine now owns the lock; once the clear
+// returns it puts the mark back if the clear took it off (the resume was not
+// issued, and the VM is still this host's pause), then runs unlock. When not
+// owned the caller still holds the lock.
+func (p *PartitionPauser) clearMarkWithin(rec PauseRecord, deadline time.Time, unlock func()) (owned bool, err error) {
+	timeout := min(partitionPauseCallTimeout, time.Until(deadline))
+	if timeout <= 0 {
+		return false, errPassBudget
+	}
+	const (
+		running = iota
+		returned
+		abandoned
+	)
+	var state atomic.Int32
+	done := make(chan error, 1)
+	go func() {
+		err := p.clearMarkLocked(rec.Name, rec.Token)
+		if !state.CompareAndSwap(running, returned) {
+			if err == nil {
+				p.remark(rec)
+			}
+			unlock()
+		}
+		done <- err
+	}()
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case err := <-done:
+		return false, err
+	case <-t.C:
+		if state.CompareAndSwap(running, abandoned) {
+			return true, fmt.Errorf("%w within %v", errCallTimeout, timeout)
+		}
+		return false, <-done
+	}
+}
+
+// remark puts rec's mark back on its domain, which this host's pause still
+// holds paused (a resume that failed, was not issued, or was undone). The
+// caller holds the mark lock.
+func (p *PartitionPauser) remark(rec PauseRecord) {
+	if err := p.vms.MarkPartitionPaused(rec.Name, rec.Token); err != nil {
+		slog.Warn("partition-pause: could not put the mark back after a failed resume; the VM stays held until an operator resumes it",
+			"name", rec.Name, "host", p.host, "error", err)
+	}
+}
+
+// forgetMark drops what this process remembers about key's mark, once its
+// record is gone.
+func (p *PartitionPauser) forgetMark(key string) {
+	p.mu.Lock()
+	delete(p.markFailed, key)
+	p.mu.Unlock()
+}
+
+// clearMarkBackground takes token's mark off name in the background, one
+// clear per VM at a time: a running VM must never carry a mark, and a clear
+// can wait behind a libvirt job. It runs under name's mark lock and clears
+// only token's mark, so a later pause's mark survives it.
+//
+// A clear first waits for token's own mark write, so it never runs before
+// that mark lands and leaves it behind. The wait ends with ctx (the
+// pauser's lifetime) or after markWaitBound, since libvirt's metadata write
+// has no timeout: the clear then hands the mark to its write (clearWanted),
+// and markPaused takes it off once it lands. Giving up resumes nothing; a
+// resume of the VM is held while its mark write is in flight.
+func (p *PartitionPauser) clearMarkBackground(ctx context.Context, name, token string) {
+	ck := name + "/" + token // one clear per mark: a newer token's clear is never dropped
+	p.mu.Lock()
+	if p.clearing[ck] {
+		p.mu.Unlock()
+		return
+	}
+	p.clearing[ck] = true
+	p.mu.Unlock()
+	go func() {
+		defer func() {
+			p.mu.Lock()
+			delete(p.clearing, ck)
+			p.mu.Unlock()
+		}()
+		// The mark this clear is for may still be being written: wait for it.
+		p.mu.Lock()
+		written := p.markWritten[PauseKindVM+"/"+ck]
+		bound := p.markWaitBound
+		p.mu.Unlock()
+		if written != nil {
+			t := time.NewTimer(bound)
+			select {
+			case <-written:
+				t.Stop()
+			case <-ctx.Done():
+				t.Stop()
+				if p.handMarkToWrite(ck, written) {
+					return
+				}
+			case <-t.C:
+				if p.handMarkToWrite(ck, written) {
+					slog.Warn("partition-pause: this host's pause mark is still being written; it is taken off once the write returns",
+						"name", name, "host", p.host, "waited", bound)
+					return
+				}
+			}
+		}
+		l := p.markLock(name)
+		l.Lock()
+		err := p.clearMarkLocked(name, token)
+		l.Unlock()
+		if err != nil && !lv.IsNotFound(err) {
+			slog.Warn("partition-pause: could not take the mark off a running domain", "name", name, "error", err)
+		}
+	}()
+}
+
+// handMarkToWrite asks the still-running write of ck's mark (written open)
+// to take the mark off once it lands, and reports whether it did; false: the
+// write has returned meanwhile, and the caller clears it itself.
+func (p *PartitionPauser) handMarkToWrite(ck string, written chan struct{}) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	select {
+	case <-written:
+		return false
+	default:
+	}
+	p.clearWanted[PauseKindVM+"/"+ck] = true
+	return true
+}
+
+// clearMarksOfRunning takes the mark off every recorded VM that runs.
+func (p *PartitionPauser) clearMarksOfRunning(ctx context.Context) {
+	if p.vms == nil {
+		return
+	}
+	recs, err := p.store.list()
+	if err != nil {
+		return
+	}
+	for _, rec := range recs {
+		if rec.Kind != PauseKindVM || rec.Token == "" {
+			continue
+		}
+		st, err := guardedCall(&p.reads, readDomainState, partitionPauseCallTimeout, func() (lv.DomainStatus, error) { return p.vms.DomainStateReason(rec.Name) })
+		if err == nil && st.State == RuntimeRunning {
+			p.clearMarkBackground(ctx, rec.Name, rec.Token)
+		}
+	}
+}
+
+// pauseNotOurs is why rec's paused VM, whose state st is, is not paused by
+// this host's pause, "" when it is. foreign=false when the answer is not
+// known yet (the mark is unreadable): held, and asked again next pass.
+//
+// Only a suspend pauses with libvirt's paused reason "user": an I/O error, a
+// migration, a save or a snapshot is never this host's pause. And this
+// host's pause marks the live domain with the record's token once it has
+// suspended it, and removes the mark before it resumes, and from any
+// recorded VM it sees running, so a record a crash
+// left behind beside a VM that ran again (or a late write's) never matches a
+// later pause someone else made. A record without a token comes from a build
+// without the mark, and the reason alone decides it.
+func (p *PartitionPauser) pauseNotOurs(rec PauseRecord, st lv.DomainStatus, deadline time.Time) (why string, foreign bool) {
+	if rec.Kind != PauseKindVM {
+		return "", false
+	}
+	if st.PausedReason != "user" {
+		r := st.PausedReason
+		if r == "" {
+			r = "unknown"
+		}
+		if r == lv.PausedReasonIOError {
+			return "the domain is paused on a disk I/O error, not by this host's partition pause", true
+		}
+		return "the domain is paused for reason " + r + ", not by this host's partition pause", true
+	}
+	if rec.Token == "" {
+		return "", false
+	}
+	type mark struct {
+		token string
+		ok    bool
+	}
+	m, err := guardedCall(&p.reads, readPauseMark, min(partitionPauseCallTimeout, time.Until(deadline)), func() (mark, error) {
+		t, ok, err := p.vms.PartitionPauseMark(rec.Name)
+		return mark{t, ok}, err
+	})
+	switch {
+	case err != nil:
+		return "the domain's partition-pause mark is unreadable: " + err.Error(), false
+	case !m.ok || m.token != rec.Token:
+		p.mu.Lock()
+		unmarked := p.markFailed[rec.Key()] == rec.Token
+		pending := p.markPending[rec.Key()] == rec.Token
+		p.mu.Unlock()
+		if pending && !m.ok {
+			return "this host's pause mark is still being written (libvirt is slow); the VM is held until it lands", false
+		}
+		if unmarked && !m.ok {
+			return "this host's pause could not mark the domain, so it cannot be told from a pause someone else made", true
+		}
+		return "the domain does not carry this pause's mark: someone else paused it (an operator?), or the mark was never written (a daemon restart while writing it)", true
+	}
+	return "", false
+}
+
+// heldNotOurs holds rec when its VM is not paused by this host's pause, or
+// that cannot be told yet, and reports whether it did. One that something
+// else paused is named in partition_paused; the record stays until the
+// domain is no longer paused (stillPausedByUs drops it then).
+func (p *PartitionPauser) heldNotOurs(rec PauseRecord, deadline time.Time) bool {
+	if rec.Kind != PauseKindVM || p.vms == nil {
+		return false
+	}
+	st, err := guardedCall(&p.reads, readDomainState, min(partitionPauseCallTimeout, time.Until(deadline)), func() (lv.DomainStatus, error) { return p.vms.DomainStateReason(rec.Name) })
+	if err != nil {
+		p.hold(rec, "domain state unreadable: "+err.Error())
+		return true
+	}
+	if st.Reason != "paused" {
+		return false // resume touches only a paused domain
+	}
+	why, foreign := p.pauseNotOurs(rec, st, deadline)
+	p.mu.Lock()
+	if foreign {
+		p.notOurs[rec.Key()] = why
+	} else {
+		delete(p.notOurs, rec.Key())
+	}
+	p.mu.Unlock()
+	if why == "" {
+		return false
+	}
+	if foreign {
+		why += "; it is left paused, and its record is dropped once it is not"
+	}
+	p.hold(rec, why)
+	return true
 }
 
 // stillPausedByUs reports whether rec's VM is still the domain this host
@@ -1601,7 +2005,7 @@ func (p *PartitionPauser) tryResume(ctx context.Context, now time.Time) {
 		prev := p.resumeCursor
 		p.resumeCursor = rec.Key()
 		sctx, cancel := context.WithDeadline(ctx, st.deadline)
-		ok, short := p.checkRecord(sctx, rec, st.deadline)
+		ok, short := p.checkRecord(ctx, sctx, rec, st.deadline)
 		cancel()
 		if short || st.ranOut() {
 			// Cut short by the pass's end, not slow of its own: the next
@@ -1634,18 +2038,29 @@ func (p *PartitionPauser) tryResume(ctx context.Context, now time.Time) {
 	p.syncPausedCondition(ctx, "")
 }
 
-// checkRecord is §3.5 steps 1 and 2 for one record, and Layer 3 for a
+// checkRecord is §3.5 steps 1 to 3 for one record, and Layer 3 for a
 // container: it reports whether rec is a candidate for the majority's
 // confirmation, and whether a settle could not start its stop for want of
-// time (short).
-func (p *PartitionPauser) checkRecord(ctx context.Context, rec PauseRecord, deadline time.Time) (candidate, short bool) {
+// time (short). ctx is the step's; life, the pauser's own (a mark's
+// background clear outlives the step).
+func (p *PartitionPauser) checkRecord(life, ctx context.Context, rec PauseRecord, deadline time.Time) (candidate, short bool) {
 	if ok, why := p.stillPausedByUs(rec, deadline); !ok {
 		// Resumed or stopped by someone else, gone, or replaced: the record
 		// would only keep partition_paused open and offer a stale epoch.
+		if rec.Kind == PauseKindVM && rec.Token != "" && p.vms != nil {
+			p.clearMarkBackground(life, rec.Name, rec.Token) // runs again, or is gone: no mark may stay
+		}
+		p.forgetMark(rec.Key())
 		if err := p.removeRecord(rec.Kind, rec.Name); err == nil {
+			p.mu.Lock()
+			delete(p.notOurs, rec.Key())
+			p.mu.Unlock()
 			slog.Info("partition-pause: dropped a pause record that no longer describes a paused workload",
 				"kind", rec.Kind, "name", rec.Name, "host", p.host, "reason", why)
 		}
+		return false, false
+	}
+	if p.heldNotOurs(rec, deadline) {
 		return false, false
 	}
 	why := p.localRowMatches(ctx, rec)
@@ -1735,7 +2150,7 @@ func (p *PartitionPauser) resumeConfirmed(ctx context.Context, pass *resumePass,
 	}
 }
 
-// localRowMatches is §3.5 step 2: the row in this host's replica still names
+// localRowMatches is §3.5 step 3: the row in this host's replica still names
 // this host, at the recorded epoch and incarnation. "" when it does.
 func (p *PartitionPauser) localRowMatches(ctx context.Context, rec PauseRecord) string {
 	var host, inc string
@@ -1853,10 +2268,64 @@ func (p *PartitionPauser) resume(ctx context.Context, rec PauseRecord, why strin
 			p.hold(rec, "domain state unreadable: "+err.Error())
 			return false, timedOutErr(err)
 		case err == nil && st.Reason == "paused":
+			// Asked again at the resume itself: the voters' answer took time.
+			if why, _ := p.pauseNotOurs(rec, st, deadline); why != "" {
+				p.hold(rec, why)
+				return false, !time.Now().Before(deadline)
+			}
 			name, uuid := rec.Name, rec.DomainUUID
-			if err := p.callWithin(rec.Key(), time.Until(deadline), true,
-				func() error { return p.vms.ResumePartitionPaused(name, uuid) },
-				func() { p.lateResume(rec, yesAt, func() error { return p.vms.SuspendDomain(name) }) }); err != nil {
+			// The mark goes first, so no crash can leave it beside a running
+			// VM for a later pause someone else makes to match. Under the
+			// mark lock, never waiting on it: a mark write or clear in flight
+			// holds the resume to a later pass. The lock is held until every
+			// mark call and the resume itself have returned, past the step's
+			// deadline when one is abandoned (callWithin), so the mark a late
+			// failure or a late landing's undo puts back is ordered with
+			// every other mark write and clear of the VM.
+			var unlock func()
+			if rec.Token != "" {
+				l := p.markLock(name)
+				if !l.TryLock() {
+					p.hold(rec, "a write of the partition-pause mark is in flight")
+					return false, false
+				}
+				var once sync.Once
+				unlock = func() { once.Do(l.Unlock) }
+				if owned, err := p.clearMarkWithin(rec, deadline, unlock); err != nil {
+					if !owned {
+						unlock()
+					}
+					p.hold(rec, "cannot take the partition-pause mark off before the resume: "+err.Error())
+					return false, timedOutErr(err)
+				}
+			}
+			resumeVM := func() error {
+				err := p.vms.ResumePartitionPaused(name, uuid)
+				if err != nil && rec.Token != "" {
+					// Still this host's pause: put the mark back so a later
+					// pass can resume it.
+					p.remark(rec)
+				}
+				return err
+			}
+			undo := func() error {
+				if err := p.vms.SuspendDomain(name); err != nil {
+					return err
+				}
+				if rec.Token != "" {
+					p.remark(rec) // paused again by this host: its mark again
+				}
+				return nil
+			}
+			started, err := p.callWithinThen(rec.Key(), time.Until(deadline), true, resumeVM,
+				func() { p.lateResume(rec, yesAt, undo) }, unlock)
+			if !started && unlock != nil {
+				// The resume was never issued, and the mark is off: put it
+				// back, off the step (the write has no timeout), still under
+				// the lock.
+				go func() { p.remark(rec); unlock() }()
+			}
+			if err != nil {
 				p.hold(rec, "resume failed: "+err.Error())
 				return false, timedOutErr(err)
 			}
@@ -1895,6 +2364,8 @@ func (p *PartitionPauser) resume(ctx context.Context, rec PauseRecord, why strin
 	}
 	p.mu.Lock()
 	delete(p.heldWhy, rec.Key())
+	delete(p.notOurs, rec.Key())
+	delete(p.markFailed, rec.Key())
 	p.mu.Unlock()
 	slog.Warn("partition-pause: resumed workload", "kind", rec.Kind, "name", rec.Name,
 		"host", p.host, "reason", why)
@@ -1907,6 +2378,10 @@ type pausedEvidence struct {
 	Paused []string `json:"paused"`
 	Reason string   `json:"reason,omitempty"`
 	Detail string   `json:"detail"`
+	// NotPausedByThisHost names, with why, the recorded workloads that
+	// something other than this host's pause has paused: held, never resumed
+	// by the pauser.
+	NotPausedByThisHost map[string]string `json:"not_paused_by_this_host,omitempty"`
 }
 
 // syncPausedCondition keeps partition_paused open exactly while a record
@@ -1917,13 +2392,20 @@ func (p *PartitionPauser) syncPausedCondition(ctx context.Context, reason string
 		return
 	}
 	keys := make([]string, 0, len(recs))
+	var notOurs map[string]string
+	p.mu.Lock()
 	for _, r := range recs {
 		keys = append(keys, r.Key())
 		if reason == "" {
 			reason = r.Reason
 		}
+		if why, ok := p.notOurs[r.Key()]; ok {
+			if notOurs == nil {
+				notOurs = map[string]string{}
+			}
+			notOurs[r.Key()] = why
+		}
 	}
-	p.mu.Lock()
 	prevOpen, prevEvid, synced := p.pausedOpen, p.pausedEvid, p.pausedSynced
 	p.mu.Unlock()
 	if len(keys) == 0 {
@@ -1941,7 +2423,7 @@ func (p *PartitionPauser) syncPausedCondition(ctx context.Context, reason string
 		}
 		return
 	}
-	b, _ := json.Marshal(pausedEvidence{Paused: keys, Reason: reason,
+	b, _ := json.Marshal(pausedEvidence{Paused: keys, Reason: reason, NotPausedByThisHost: notOurs,
 		Detail: "this host lost the voter majority and paused these workloads itself; each resumes once a majority of voters confirms nothing moved it"})
 	if prevOpen && string(b) == prevEvid {
 		return

@@ -79,6 +79,7 @@ func TestSSHArgs_PinnedKeepsRootsIdentity(t *testing.T) {
 	}
 	o := opts(args)
 	if target != "root@10.77.0.3" || o["StrictHostKeyChecking"] != "yes" || o["HostKeyAlias"] != "a" ||
+		o["KnownHostsCommand"] != "none" || o["GlobalKnownHostsFile"] != "/dev/null" ||
 		slices.Contains(args, "-F") || slices.Contains(args, "-i") {
 		t.Fatalf("pinned args = %q", args)
 	}

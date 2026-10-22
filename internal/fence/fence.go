@@ -304,6 +304,8 @@ func sshArgs(ctx context.Context, h HostConfig, remote string) (target string, a
 			"-o", "StrictHostKeyChecking=yes",
 			"-o", "UserKnownHostsFile=" + kh,
 			"-o", "GlobalKnownHostsFile=/dev/null",
+			// A KnownHostsCommand in root's config would add keys to the pin.
+			"-o", "KnownHostsCommand=none",
 			"-o", "HostKeyAlias=" + h.SSH.HostKeyAlias,
 			"-o", "CheckHostIP=no",
 			"-o", "UpdateHostKeys=no",

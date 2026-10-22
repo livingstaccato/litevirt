@@ -273,6 +273,9 @@ func TestRun_ANewTenureMidCycleAbortsWithoutSteppingDown(t *testing.T) {
 
 	fenceQuorum(t, ctx, db, []string{"coord", "down1", "down2"}, "down1")
 	fenceQuorum(t, ctx, db, []string{"coord", "down1", "down2"}, "down2")
+	// Workloads that need the fences this test makes run.
+	needsFence(t, db, "down1")
+	needsFence(t, db, "down2")
 	var fenced []string
 	c.SetFencer(func(ctx context.Context, h fence.HostConfig) fence.Result {
 		if len(fenced) == 0 {

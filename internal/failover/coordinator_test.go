@@ -112,6 +112,8 @@ func TestCoordinator_FailedHost_MarkedOffline(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("InsertHost: %v", err)
 	}
+	// A workload that needs the fence: what this test pins is the fence.
+	needsFence(t, db, "bad-host")
 
 	// Simulate health check failures exceeding the threshold, from both of
 	// the other voters.
@@ -285,15 +287,19 @@ func TestCoordinator_FencedHostAutoRecoversWhenNoVMsMoved(t *testing.T) {
 		t.Fatalf("InsertHost: %v", err)
 	}
 	c := newTestCoordinator("coordinator", db) // stub fencer succeeds → 'fenced'
+	// A VM that needs the fence and is never moved off: restart-same on a
+	// host-local disk is held for its host. A host with no workload at all is
+	// not fenced (holdUnneededFence).
+	needsFence(t, db, "spur")
 
-	// Phase 1: quorum sees it down; it owns no VMs → fenced, nothing relocated.
+	// Phase 1: quorum sees it down; its one VM is held for it → fenced, nothing relocated.
 	downObservers(t, db, "spur", "h1", "h2", "h3")
 	c.run(ctx)
 	if h, _ := corrosion.GetHost(ctx, db, "spur"); h == nil || h.State != "fenced" {
 		t.Fatalf("phase 1: expected fenced, got %+v", h)
 	}
 	if c.fenceRelocated["spur"] {
-		t.Fatal("no VMs existed — fenceRelocated must be false")
+		t.Fatal("no VM was moved off — fenceRelocated must be false")
 	}
 
 	// Phase 2: quorum now sees it healthy → auto-recover (safe: nothing moved).
@@ -412,6 +418,11 @@ func TestCoordinator_VMWithNonePolicy_NotRescheduled(t *testing.T) {
 	}, nil, nil); err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
+	// The fence needs something to recover: a host with nothing recoverable
+	// is not fenced (holdUnneededFence). A restart-same VM on a host-local
+	// disk needs the fence and stays put, so the policy alone still decides
+	// whether sticky-vm moves.
+	needsFence(t, db, "dying")
 
 	// Three voters (dying, alive, and the coordinator as a witness), so the
 	// quorum is 2 and the two other voters reach it.
@@ -528,6 +539,8 @@ func TestCoordinator_NoDoubleFailover(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("InsertHost: %v", err)
 	}
+	// A workload that needs the fence: what this test pins is the fence.
+	needsFence(t, db, "flaky")
 
 	for _, o := range []string{"coordinator", "witness"} {
 		ensureVoter(t, db, o)

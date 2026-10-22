@@ -351,6 +351,8 @@ type Coordinator struct {
 	// onGateRefused observes gate refusals at decide sites (nil-safe; daemon wires
 	// it to litevirt_runtime_action_refused_total).
 	onGateRefused func(action, reason string)
+	// fenceHeldDecided is a test seam (SetFenceHeldDecidedForTest).
+	fenceHeldDecided func(host string)
 	// scope is this cycle's quorum rule — the failover_scope policy and the
 	// voter set with every host's region — read once at the top of run. The
 	// zero value is the cluster-wide rule, so a path reached outside run (a
@@ -1109,6 +1111,12 @@ func (c *Coordinator) run(ctx context.Context) {
 				// (an operator's, another coordinator's), or its own failed
 				// fence due a retry: the cache must not hide either (lab drill
 				// S5). The ordinary path below re-reads both and decides.
+			case h.State == "offline" && c.fenceHeldStands(ctx, target):
+				// A held fence (ha.fence_held) whose condition reached this
+				// replica after the 'offline' it records: the two replicate as
+				// separate entries, so this coordinator may have cached the
+				// host as terminal first. The hold is re-decided every cycle
+				// until a fence of the host is recorded since it was raised.
 			default:
 				continue
 			}
@@ -1221,7 +1229,21 @@ func (c *Coordinator) run(ctx context.Context) {
 				}
 			}
 		}
-		if !afresh && !retry && (h.State == "offline" || h.State == "maintenance" || h.State == "fenced") {
+		// held: h is 'offline' because its fence was held, nothing on it
+		// needing one (ha.fence_held, holdUnneededFence). That is a decision
+		// re-made every cycle, never a terminal state: it goes down the path
+		// below, where the fence runs the moment something needs it. Unread,
+		// the host is skipped this cycle without the cache.
+		held := false
+		if !afresh && !retry && !recorded && h.State == "offline" {
+			var herr error
+			if held, herr = c.fenceHeld(ctx, target); herr != nil {
+				slog.Warn("failover: read "+CondFenceHeld+" failed, skipping", "host", target, "error", herr)
+				c.mAttempt(PhaseHealth, ResultError, ErrDBError)
+				continue
+			}
+		}
+		if !afresh && !retry && !held && (h.State == "offline" || h.State == "maintenance" || h.State == "fenced") {
 			// A 'fenced' host WITHOUT that proof is not settled, it is unproven:
 			// hosts.state and fencing_log replicate independently, so the state
 			// can land here a cycle or more before the row that authorises the
@@ -1327,6 +1349,14 @@ func (c *Coordinator) run(ctx context.Context) {
 			continue
 		}
 
+		// Last, immediately before the fence: a fence that nothing on the host
+		// needs is held, the host recorded offline and ha.fence_held raised
+		// (holdUnneededFence). Not for a fence afresh on an operator's
+		// confirmation: the operator has already powered the host off.
+		if !afresh && c.holdUnneededFence(ctx, h) {
+			continue
+		}
+
 		slog.Warn("failover: quorum reached — host exceeded failure threshold",
 			"host", target, "observers", cand.Observers, "quorum", c.scope.quorum(target),
 			"region_scoped", c.scope.region)
@@ -1363,6 +1393,7 @@ func (c *Coordinator) run(ctx context.Context) {
 	}
 	c.resolveOneWayGone(ctx, candTargets)
 	c.resolveRefenceSettled(ctx)
+	c.resolveFenceHeldSettled(ctx)
 
 	// Recovery pass: bring a host the coordinator marked down (offline, or a
 	// spurious no-VMs-moved fence) back to 'active' once a fresh quorum agrees
@@ -3889,6 +3920,26 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 			return
 		}
 		slog.Info("failover: operator confirmed best-effort fence, proceeding", "host", h.Name)
+		c.mAttempt(PhaseSplitBrain, ResultOK, ErrManualConfirmed)
+	}
+
+	// A fence that ends a hold (ha.fence_held) and did not reach the host
+	// recovers nothing until an operator confirms the host off: what it would
+	// recover became recoverable during the hold, so the host's partition pause
+	// never paused it, and it may still run there (heldThisOutage).
+	if fr.Method == "best-effort-ssh" && c.heldThisOutage(ctx, h.Name) {
+		if why, ok := c.confirmedOffNow(ctx, h.Name, life, lifeKnown); !ok {
+			if why != "" {
+				return // refused with its remedy (noteConfirmationStale)
+			}
+			slog.Error("failover: the fence ending a held fence did not reach the host, NOT rescheduling",
+				"host", h.Name, "detail", fr.Detail,
+				"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off; the recovery resumes from it")
+			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
+			c.noteHold(h.Name, "best-effort fence after a held fence did not reach the host; awaiting 'lv host fence-confirm "+h.Name+"'")
+			return
+		}
+		slog.Info("failover: operator confirmed a host whose fence was held, proceeding", "host", h.Name)
 		c.mAttempt(PhaseSplitBrain, ResultOK, ErrManualConfirmed)
 	}
 

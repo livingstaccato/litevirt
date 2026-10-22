@@ -1495,6 +1495,38 @@ The condition resolves once the host is removed; a fenced or offline host
 once no recoverable workload is left on it; any other host once it is no
 longer held (a quorum of voters sees it answer, or its pause is over).
 
+### A fence held because nothing needs it (`ha.fence_held`)
+
+Evaluator `failover`, subject the host, severity warning, written by the
+failover lease holder. A quorum of voters fails the host, but nothing on it
+needs a fence: no workload a failover would move (every VM and container on it
+is `on_host_failure: none`, stopped on a host-local disk, or otherwise left in
+place; a VM stopped on shared storage with a policy is moved off still stopped,
+and does need the fence), no workload recorded mid-transfer, no container
+relocation marker and no pending recovery proof. Fencing it would power off what nothing restarts elsewhere, so the host
+is recorded `offline`, **not fenced**, and no `fencing_log` row is written.
+Whatever runs there keeps running. `lv status` shows the host `offline`; the
+evidence names each workload left on it with its state and policy.
+
+The decision is made again every cycle. Once something recoverable is recorded
+on the host (a VM's policy changed to `restart-any`, a workload placed there),
+the next cycle fences it as any failed host is fenced, and recovers its
+workloads. If that fence is a best-effort one that did not reach the host, it
+recovers nothing until `lv host fence-confirm <host>`: what became recoverable
+during the hold was never paused by the host's partition pause, so it may
+still run there. This holds even for a host labelled
+`litevirt.unsafe_auto_failover=true`: that label opts out of the safe-fence
+policy, not out of this. An `offline` host whose fence is held is not proven
+off: a move off it still needs `lv host fence-confirm <host>` once it is
+powered off. Bring its daemon back and it returns to `active` once a quorum
+sees it healthy. The
+condition resolves when the host leaves `offline` (back `active`, or fenced),
+when a fence of it is recorded, or when it is removed.
+
+A failover leader on an older release reads such a host as one whose fence
+already failed, and does not fence it again, even if something recoverable is
+recorded on it later. Upgrade the leader, or confirm the host off.
+
 ### A failed re-fence (`refence_failed`)
 
 Evaluator `failover`, subject the host, severity critical, written by the

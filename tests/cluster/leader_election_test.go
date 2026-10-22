@@ -61,6 +61,7 @@ func TestLeaderElection_OnlyOneFences(t *testing.T) {
 			t.Fatalf("InsertHost %s: %v", h, err)
 		}
 	}
+	needsFence(t, db, "victim")
 
 	// Quorum-of-2 observers (node-a and node-b) report victim failing.
 	nowRFC := time.Now().UTC().Format(time.RFC3339)
@@ -154,5 +155,19 @@ func TestQuorumIgnoresStaleHealth(t *testing.T) {
 	v, _ := corrosion.GetHost(ctx, db, "victim")
 	if v == nil || v.State != "active" {
 		t.Errorf("victim should still be active; got state=%v", v)
+	}
+}
+
+// needsFence records on host a workload that needs its fence and is never
+// moved: a restart-same VM on a host-local disk. A host with nothing to
+// recover is not fenced, and these scenarios count fences.
+func needsFence(t *testing.T, db *corrosion.Client, host string) {
+	t.Helper()
+	name := "held-for-" + host
+	if err := corrosion.InsertVM(context.Background(), db, corrosion.VMRecord{
+		Name: name, HostName: host, State: "running", Spec: `{"on_host_failure":"restart-same"}`,
+	}, nil, []corrosion.DiskRecord{{VMName: name, DiskName: "root", HostName: host,
+		Path: "/var/lib/litevirt/disks/" + name + ".qcow2", SizeBytes: 1 << 30, StorageType: "local"}}); err != nil {
+		t.Fatalf("InsertVM %s: %v", name, err)
 	}
 }

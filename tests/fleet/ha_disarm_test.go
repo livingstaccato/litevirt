@@ -128,6 +128,18 @@ func (f *haFleet) probe(ctx context.Context, n *Node) {
 // every gate's live set.
 func (f *haFleet) down(t *testing.T, target *Node, observers ...*Node) {
 	t.Helper()
+	// target holds a workload that needs its fence: a host with nothing to
+	// recover is not fenced at all, and every scenario here asks whether HA
+	// lets a fence run.
+	needsFenceOn(t, observers[0], target.Name)
+	eventually(t, convergeTimeout, "the workload on "+target.Name+" to reach every observer", func() bool {
+		for _, o := range observers {
+			if vm, err := corrosion.GetVM(context.Background(), o.DB, "held-for-"+target.Name); err != nil || vm == nil {
+				return false
+			}
+		}
+		return true
+	})
 	now := f.clock.Now()
 	for _, o := range observers {
 		PublishHealthRun(t, o, target.Name, 5, now, now)

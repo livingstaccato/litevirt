@@ -992,6 +992,29 @@ func UpdateHostState(ctx context.Context, c *Client, name, state string) error {
 // landing on a host that is turning active — is not overwritten. The
 // statements are UpdateHostState's; the guard is local only. applied=false,
 // with no error, when the host is recorded as something else (or absent).
+// UpdateHostStateFromWithCondition is UpdateHostStateFrom that commits the
+// health condition cond in the same replicated entry as the state, behind the
+// same guard: a peer applies both or neither, so it never holds the state
+// without the condition that explains it (failover's held fence, which a
+// successor reads 'offline' without its ha.fence_held as terminal).
+func UpdateHostStateFromWithCondition(ctx context.Context, c *Client, name, from, to string, cond HealthCondition) (bool, error) {
+	params, err := healthConditionParams(cond, c.NowTS())
+	if err != nil {
+		return false, err
+	}
+	var applied bool
+	err = c.withMembershipWrite(ctx, func(live bool) error {
+		stmts, err := hostStateStatements(ctx, c, name, to, live)
+		if err != nil {
+			return err
+		}
+		stmts = append(stmts, Statement{SQL: upsertHealthConditionSQL, Params: params})
+		applied, err = c.ExecuteBatchGuarded(ctx, hostStateIs(ctx, c, name, from), stmts)
+		return err
+	})
+	return applied, err
+}
+
 func UpdateHostStateFrom(ctx context.Context, c *Client, name, from, to string) (bool, error) {
 	var applied bool
 	err := c.withMembershipWrite(ctx, func(live bool) error {

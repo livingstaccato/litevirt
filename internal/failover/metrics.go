@@ -115,6 +115,10 @@ const (
 	// the migration's target, so it is not restarted elsewhere
 	// (migrating_row.go).
 	ErrMigrating = "migrating"
+	// ErrNothingRecoverable: a quorum fails the host, but nothing on it needs
+	// a fence (fenceNeeds), so it is recorded offline, not fenced, and
+	// ha.fence_held is raised (fence_held.go).
+	ErrNothingRecoverable = "nothing_recoverable"
 	// ErrLocalStall: quorum agreed a host failed, but this coordinator itself
 	// stopped running within health.StallGrace, so the fence is deferred.
 	ErrLocalStall = "local_stall"

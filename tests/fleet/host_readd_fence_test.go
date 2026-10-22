@@ -167,6 +167,10 @@ func TestFleet_ReaddedHostIsNotFencedWhileItJoins(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("admit %s again: %v", d.Name, err)
 	}
+	// What this scenario pins is when d is fenced: give it a workload that
+	// needs the fence (a host with nothing to recover is not fenced), from
+	// the moment it is admitted, so a fence while it joins would still run.
+	needsFenceOn(t, a, d.Name)
 
 	// It joins for twice the time a fence takes to build, and no observer
 	// counts a failure against it meanwhile: there is nothing to probe yet,

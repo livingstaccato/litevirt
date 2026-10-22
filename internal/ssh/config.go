@@ -37,6 +37,9 @@ type resolved struct {
 	IdentitiesOnly bool
 	StrictYes      bool     // StrictHostKeyChecking yes/true/on
 	KnownHosts     []string // configured UserKnownHostsFile entries, defaults excluded
+	// HostKeyAlias is the name host keys are looked up under instead of the
+	// dialled address ("" when unset).
+	HostKeyAlias string
 }
 
 // sshG runs `ssh -G args...` and returns its stdout, giving up after timeout
@@ -152,6 +155,9 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 	eff := r.User
 	if eff == "" {
 		eff = "root"
+	}
+	if a := got.one("hostkeyalias"); a != "" && a != "none" {
+		r.HostKeyAlias = a
 	}
 
 	// ProxyJump and ProxyCommand are not supported by this client. They are

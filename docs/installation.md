@@ -329,8 +329,13 @@ by OpenSSH itself. Only the per-user `~/.ssh/config` is read; `/etc/ssh/ssh_conf
   dials the address directly, as it always did.
 - Host-key checking is never loosened by the config. A changed key for a known host is
   always refused. A host with no entry in the known_hosts files is accepted on first contact
-  (accept-new), unless `StrictHostKeyChecking yes`, which refuses it. `UserKnownHostsFile` adds
-  files to check on top of `~/.ssh/known_hosts`. A known_hosts file that exists but cannot be
+  (accept-new), unless `StrictHostKeyChecking yes`, which refuses it. `StrictHostKeyChecking no`
+  or `accept-new` change nothing. `UserKnownHostsFile` adds files to check on top of
+  `~/.ssh/known_hosts`, so `/dev/null` or `none` drops no entry. `HostKeyAlias` is honoured as
+  `ssh` honours it: the host's key (and a host certificate's principal) is looked up under the
+  alias, so a key pinned there is enforced. When known_hosts has nothing under the alias, lv
+  checks the dialled address instead rather than treating the host as new, except under
+  `StrictHostKeyChecking yes`, which refuses an unknown alias as `ssh` does. A known_hosts file that exists but cannot be
   read or parsed (the default one or a configured one) refuses the connection and names the
   file; with no known_hosts file at all there is nothing to compare and first contact is accepted
   with a warning.

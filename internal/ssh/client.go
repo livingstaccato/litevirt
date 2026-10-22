@@ -203,18 +203,11 @@ var firstContactHostKeyAlgorithms = func() []string {
 // recorded for addr. isHostAuthority sorts them. The same in-memory database
 // then verifies the real key, so the two answers cannot disagree about the file.
 func knownHostKeyAlgorithms(raw ssh.HostKeyCallback, addr string) []string {
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return nil
-	}
-	probe, err := ssh.NewPublicKey(priv.Public())
-	if err != nil {
-		return nil
-	}
-	var keyErr *knownhosts.KeyError
-	if !errors.As(raw(addr, &net.TCPAddr{IP: net.IPv4zero}, probe), &keyErr) || len(keyErr.Want) == 0 {
+	probe, want := knownHostEntries(raw, addr)
+	if len(want) == 0 {
 		return slices.Clone(firstContactHostKeyAlgorithms)
 	}
+	keyErr := &knownhosts.KeyError{Want: want}
 	authority := false
 	recorded := map[string]bool{}
 	for _, k := range keyErr.Want {
@@ -239,6 +232,32 @@ func knownHostKeyAlgorithms(raw ssh.HostKeyCallback, addr string) []string {
 		return slices.Clone(firstContactHostKeyAlgorithms)
 	}
 	return algos
+}
+
+// knownHostEntries asks raw for addr with a fresh key, which can match no
+// entry, and returns that key and every entry recorded for addr (none for a
+// host known_hosts does not know).
+func knownHostEntries(raw ssh.HostKeyCallback, addr string) (ssh.PublicKey, []knownhosts.KnownKey) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, nil
+	}
+	probe, err := ssh.NewPublicKey(priv.Public())
+	if err != nil {
+		return nil, nil
+	}
+	var keyErr *knownhosts.KeyError
+	if !errors.As(raw(addr, &net.TCPAddr{IP: net.IPv4zero}, probe), &keyErr) {
+		return probe, nil
+	}
+	return probe, keyErr.Want
+}
+
+// hostIsKnown reports whether known_hosts holds any entry -- plain or
+// @cert-authority -- for addr.
+func hostIsKnown(raw ssh.HostKeyCallback, addr string) bool {
+	_, want := knownHostEntries(raw, addr)
+	return len(want) > 0
 }
 
 // isHostAuthority reports whether key is a @cert-authority entry for addr
@@ -840,10 +859,17 @@ func knownHostsFiles(cfg *resolved) ([]string, error) {
 // database, so they cannot disagree.
 //
 // Nothing in the ssh config makes it accept more than the defaults do:
-// UserKnownHostsFile only adds files to check; StrictHostKeyChecking yes
-// refuses an unknown host too, and no or accept-new are not read at all -- a
-// CHANGED key is always refused; HostKeyAlgorithms is not read (see
-// clientConfig).
+//   - UserKnownHostsFile only adds files to check;
+//   - StrictHostKeyChecking yes refuses an unknown host too, and no or
+//     accept-new are not read at all -- a CHANGED key is always refused;
+//   - HostKeyAlias makes the alias the name a key is looked up under, as ssh
+//     does (certificate principals included), so a key pinned under it is
+//     enforced. When known_hosts has no entry for the alias, the dialled
+//     address is checked instead of taking the host as new, so a key pinned
+//     under the address is not bypassed either -- except under
+//     StrictHostKeyChecking yes, where an unknown alias is refused as ssh
+//     refuses it;
+//   - HostKeyAlgorithms is not read (see clientConfig).
 func hostKeyPolicyFor(cfg *resolved, addr string) (ssh.HostKeyCallback, []string, error) {
 	files, err := knownHostsFiles(cfg)
 	if err != nil {
@@ -853,22 +879,44 @@ func hostKeyPolicyFor(cfg *resolved, addr string) (ssh.HostKeyCallback, []string
 	if err != nil {
 		return nil, nil, err
 	}
-	strict := cfg != nil && cfg.StrictYes
+	var alias string
+	var strict bool
+	if cfg != nil {
+		alias, strict = cfg.HostKeyAlias, cfg.StrictYes
+	}
+	// lookup is the name hostname's key is looked up under. The offer and
+	// the verification both use it, so they agree on which entries apply.
+	lookup := func(hostname string) string {
+		if alias == "" {
+			return hostname
+		}
+		// ssh looks the alias up with no port; for knownhosts that is 22,
+		// which a bare "alias" line matches.
+		a := net.JoinHostPort(alias, "22")
+		if strict || hostIsKnown(raw, a) {
+			return a
+		}
+		return hostname
+	}
 	var algos []string
 	if addr != "" {
-		algos = knownHostKeyAlgorithms(raw, addr)
+		algos = knownHostKeyAlgorithms(raw, lookup(addr))
 	}
 	// accept-new, not accept-anything: see hostKeyVerdict for why a CHANGED
 	// key is refused even though an unknown one is not. Strict wraps the raw
 	// answer, so the verdict's refusals stay reachable under it.
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-		err := raw(hostname, remote, key)
+		name, label := lookup(hostname), hostname
+		if name != hostname {
+			label = fmt.Sprintf("%s (HostKeyAlias %s)", hostname, alias)
+		}
+		err := raw(name, remote, key)
 		if strict && err != nil {
 			if keyErr := (*knownhosts.KeyError)(nil); errors.As(err, &keyErr) && len(keyErr.Want) == 0 {
-				return fmt.Errorf("host key for %s is not in known_hosts and StrictHostKeyChecking is yes: %w", hostname, err)
+				return fmt.Errorf("host key for %s is not in known_hosts and StrictHostKeyChecking is yes: %w", label, err)
 			}
 		}
-		return hostKeyVerdictFor(hostname, key, err)
+		return hostKeyVerdictFor(label, key, err)
 	}, algos, nil
 }
 

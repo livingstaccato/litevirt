@@ -686,6 +686,26 @@ host that does publish). `lv cluster upgrade-status` lists `fence_ssh` with
 whether it is used, and its token once latched. Its rollout summary (hosts on the
 release, features waiting) counts `release_2026_11_v1` only.
 
+**`release_2027_01_v1`** is the rc2 train's token, with the same rules. A
+rollback below it lands on a `release_2026_12_v1` build, which reads the rule,
+so it quarantines only for a feature of it that was used. Its one feature is
+`project_adoption`
+([below](#projects-created-before-the-upgrade-get-a-stable-identity)), and it
+is used by default on any cluster that holds a project created before
+`project_incarnation_v1` latched: the first adoption pass after the latch
+gives each such project its stable identity. So on every cluster upgraded from
+v1.9 with a project of its own, a rollback below `release_2027_01_v1`
+quarantines from that pass on. A cluster founded on v1.10, or one with no such
+project, never uses it. To keep the ability to roll back, set
+`enforcement.project_adoption: false` in every host's config, a host added
+later included, before the last host upgrades, and restart the daemon of a
+host that already runs this build: no host then adopts, so nothing uses the
+feature. One host left with it on adopts on its own once the fallback delay
+has passed. `lv cluster upgrade-status` lists `project_adoption` with whether
+it is used; its rollout summary still counts `release_2026_11_v1` only (the
+`ReleaseToken` of this train, which names the readiness of that token's own
+shapes, not the newest token).
+
 **What this does not change.** A binary built before `release_2026_11_v1`
 understands no rollback rule. Rolled back below any token it does not know —
 this release's token included — it quarantines, used or not. Tokens other than
@@ -1850,6 +1870,32 @@ does.
 `project_incarnation_v1` is mandatory and replication-gated, with no flag and
 no stand-down. A binary rolled back below the latched token enters WAL
 quarantine, as below every latched token. Roll forward.
+
+### Projects created before the upgrade get a stable identity
+
+A project created before `project_incarnation_v1` latched has no identity of
+its own: its grants and quota are those of whatever lifetime of the name was
+live at the latch. Once `release_2027_01_v1` has latched, each host runs an
+adoption pass hourly (and once at the latch) that gives every such project a
+stable identity, computed from its name, so every host that adopts it writes
+the same thing. Adoption names the project's existing lifetime; it starts no
+new one. Every grant made before or after it, on any host, in any order, keeps
+granting, and the quota set before it keeps bounding; a later delete and
+re-create of the name gives the new project a fresh identity as before. The
+project's authority holder adopts it first; any other host adopts it two hours
+after both the project's last change and its own first sight of the latch.
+
+A name with more than one live spelling (`acme` beside `/acme`, which a
+create on a much older release could leave) is not adopted. Such projects are
+counted in `litevirt_project_adoption_blocked{reason="spellings"}` and listed
+by `lv doctor project-spellings`
+([diagnostics.md](diagnostics.md#lv-doctor-project-spellings)).
+
+`enforcement.project_adoption` (default true) holds a host's own pass off when
+false. It decides nothing else: a host with it off applies and reads its peers'
+adoptions, and the token is advertised regardless. It keeps the rollback below
+`release_2027_01_v1` open only while it is false on every host (see the release
+token above).
 
 ### Console passwords start after the roll
 

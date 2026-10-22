@@ -903,6 +903,27 @@ move one over, stop it and run
 `--privileged` or `--confinement legacy` is listed too: that is the point of
 the report.
 
+## `lv doctor project-spellings`
+
+Read-only. Lists project names that are live under more than one spelling
+(`acme` beside `/acme`): two rows of one canonical name, which a create on a
+much older release could leave.
+
+```
+lv doctor project-spellings
+```
+
+Such a project is never given a stable identity by the adoption pass
+([upgrades.md](upgrades.md#projects-created-before-the-upgrade-get-a-stable-identity))
+while one of its spellings still holds the pre-upgrade identity, and its
+parent references stay in conflict for automation. The pass counts them in
+`litevirt_project_adoption_blocked{reason="spellings"}`.
+
+There is no repair command yet. Do **not** delete one spelling to merge them:
+both spellings share one RBAC root, and a delete retires the grants under it,
+so the surviving spelling can lose its grants. Leave both in place; the
+project keeps working as it does today.
+
 ## `lv doctor vm-uuids`
 
 Read-only. Lists VMs whose **persisted spec** carries no domain uuid.
@@ -1012,7 +1033,7 @@ converge the row, so the two paths can never disagree.
 
 - `litevirt_lww_tie_break_total{table,resolver,winner}` — ties that converged by a
   deterministic resolver (`content_max`/`numeric_max`/`timestamp_max`/
-  `non_null_wins`/`lb_generation`/`incarnation`). A steadily climbing value means a node is
+  `non_null_wins`/`lb_generation`/`incarnation`/`project_adoption`). A steadily climbing value means a node is
   minting colliding timestamps (the upstream smell), not just a one-off split.
 - `litevirt_lww_tie_unresolved_total{table,path,category}` — **monotonic counter**
   of distinct unresolved ties *observed* (counted once per row, not per cycle).

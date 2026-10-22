@@ -525,6 +525,15 @@ enforcement:
                               # the whole cluster. Once latched it decides nothing: the transport
                               # is cluster-wide, and its stand-down is
                               # `lv cluster vrrp-transport multicast`. See upgrades.md.
+  project_adoption: true      # DEFAULT ON. Run this host's project adoption pass: once
+                              # release_2027_01_v1 has latched, give each project created
+                              # before project_incarnation_v1 latched its stable identity
+                              # (the release feature project_adoption). false holds this
+                              # host's pass off and nothing else: the token is advertised
+                              # regardless, and the host still applies its peers'
+                              # adoptions. It keeps a rollback below release_2027_01_v1
+                              # open only while it is false on every host. See upgrades.md
+                              # "Projects created before the upgrade get a stable identity".
   gossip_encryption: false    # encrypt and authenticate gossip (memberlist, gossip_port)
                               # with the cluster key in <pki_dir>/gossip.key. false is
                               # plaintext; true is encrypted-only (anything unencrypted or

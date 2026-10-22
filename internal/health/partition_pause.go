@@ -387,7 +387,7 @@ type PartitionPauser struct {
 	// markPending: key → the token of this host's pause whose mark is still
 	// being written (libvirt can be slow): not yet set, not failed.
 	markPending map[string]string
-	// clearing: the VMs whose mark a background clear is taking off.
+	// clearing: name/token of each mark a background clear is taking off.
 	clearing map[string]bool
 	// markLocks serialise every mark write and clear of one VM, so a slow
 	// clear can never land after, and erase, a newer pause's mark.
@@ -818,7 +818,7 @@ func (p *PartitionPauser) pauseVMs(ctx context.Context, budget passBudget, reaso
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := p.pauseOne(rec, budget.recordBound(), func() error { return p.vms.SuspendDomain(name) }, func() { p.markPaused(rec) }); err != nil {
+			if err := p.pauseOne(rec, budget.recordBound(), func() error { return p.suspendPendingMark(rec) }, func() { p.markPaused(rec) }); err != nil {
 				fail(rec.Key(), err.Error())
 			}
 		}()
@@ -983,15 +983,26 @@ func newPauseToken() string {
 	return hex.EncodeToString(b)
 }
 
+// suspendPendingMark suspends rec's domain and, once it is suspended, notes
+// its mark as pending before markPaused is even started: a clear for the same
+// token waits for the mark to be written, so it never runs first and leaves
+// the mark behind.
+func (p *PartitionPauser) suspendPendingMark(rec PauseRecord) error {
+	if err := p.vms.SuspendDomain(rec.Name); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.markPending[rec.Key()] = rec.Token
+	p.mu.Unlock()
+	return nil
+}
+
 // markPaused puts the mark carrying rec.Token on rec's domain, after the
 // suspend and outside its timed window: libvirt can hold the metadata write
 // behind a running job for up to 30 s, and the majority relies on the
 // suspend alone. A mark that is late holds the VM at the heal until it lands;
 // one that never lands holds it for good, which says so.
 func (p *PartitionPauser) markPaused(rec PauseRecord) {
-	p.mu.Lock()
-	p.markPending[rec.Key()] = rec.Token
-	p.mu.Unlock()
 	l := p.markLock(rec.Name)
 	l.Lock()
 	err := p.vms.MarkPartitionPaused(rec.Name, rec.Token)
@@ -1050,20 +1061,31 @@ func (p *PartitionPauser) forgetMark(key string) {
 // can wait behind a libvirt job. It runs under name's mark lock and clears
 // only token's mark, so a later pause's mark survives it.
 func (p *PartitionPauser) clearMarkBackground(name, token string) {
+	ck := name + "/" + token // one clear per mark: a newer token's clear is never dropped
 	p.mu.Lock()
-	if p.clearing[name] {
+	if p.clearing[ck] {
 		p.mu.Unlock()
 		return
 	}
-	p.clearing[name] = true
+	p.clearing[ck] = true
 	p.mu.Unlock()
 	go func() {
+		// The mark this clear is for may still be being written: wait for it.
+		for {
+			p.mu.Lock()
+			pending := p.markPending[PauseKindVM+"/"+name] == token
+			p.mu.Unlock()
+			if !pending {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
 		l := p.markLock(name)
 		l.Lock()
 		err := p.clearMarkLocked(name, token)
 		l.Unlock()
 		p.mu.Lock()
-		delete(p.clearing, name)
+		delete(p.clearing, ck)
 		p.mu.Unlock()
 		if err != nil && !lv.IsNotFound(err) {
 			slog.Warn("partition-pause: could not take the mark off a running domain", "name", name, "error", err)
@@ -1142,7 +1164,7 @@ func (p *PartitionPauser) pauseNotOurs(rec PauseRecord, st lv.DomainStatus) (why
 		if unmarked && !m.ok {
 			return "this host's pause could not mark the domain, so it cannot be told from a pause someone else made", true
 		}
-		return "the domain does not carry this pause's mark: something other than this host's partition pause paused it (an operator?)", true
+		return "the domain does not carry this pause's mark: someone else paused it (an operator?), or the mark was never written (a daemon restart while writing it)", true
 	}
 	return "", false
 }

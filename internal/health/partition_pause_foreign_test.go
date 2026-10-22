@@ -545,3 +545,130 @@ func TestPartitionPause_ADroppedRecordTakesItsMarkWithIt(t *testing.T) {
 		}
 	})
 }
+
+// ppio re-review r2, F1: a clear takes a mark off only while it carries the
+// token the clear was for. Here the clear for token A gets the mark lock only
+// after a newer pause wrote its mark B: B stays.
+//
+// Mutation: clear whatever mark is there (no token comparison) — B is
+// erased, red.
+func TestPartitionPause_AClearForAnOlderTokenLeavesANewerMark(t *testing.T) {
+	f := newPauseFixture(t)
+	l := f.p.markLock("vm-ha")
+	l.Lock()
+	f.p.clearMarkBackground("vm-ha", "token-a") // waits for the lock
+	if err := f.virt.MarkPartitionPaused("vm-ha", "token-b"); err != nil {
+		t.Fatal(err) // the newer pause's mark, written first
+	}
+	l.Unlock()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		f.p.mu.Lock()
+		busy := len(f.p.clearing) > 0
+		f.p.mu.Unlock()
+		if !busy {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if tok, ok, _ := f.virt.PartitionPauseMark("vm-ha"); !ok || tok != "token-b" {
+		t.Fatalf("mark = %q, %v after a clear for token-a; the newer pause's token-b must stay", tok, ok)
+	}
+}
+
+// ppio re-review r2, F2: the resume never waits on the mark lock. While a
+// mark write or clear of the VM is in flight (here the lock is held), the
+// heal's passes return promptly and hold the VM; it resumes on a later pass.
+//
+// Mutations: take no lock in resume — vm-ha resumes while the lock is held,
+// red; wait for the lock (Lock, not TryLock) — the passes do not return, red.
+func TestPartitionPause_AResumeNeverWaitsOnTheMarkLock(t *testing.T) {
+	f := newPauseFixture(t)
+	f.loseFor(QuorumNo, PartitionPauseAfter+2*time.Second)
+	f.waitMark("vm-ha")
+	l := f.p.markLock("vm-ha")
+	l.Lock()
+	done := make(chan struct{})
+	go func() { defer close(done); f.regain() }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		l.Unlock()
+		t.Fatal("the heal's passes waited on the mark lock")
+	}
+	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+		l.Unlock()
+		t.Fatalf("vm-ha is %s: resumed while a mark write was in flight", st)
+	}
+	f.p.mu.Lock()
+	why := f.p.heldWhy["vm/vm-ha"]
+	f.p.mu.Unlock()
+	if !strings.Contains(why, "in flight") {
+		t.Errorf("held as %q, want the in-flight mark write named", why)
+	}
+	l.Unlock()
+	for i := 0; i <= int(2*partitionResumeRecheck/time.Second); i++ {
+		f.tick()
+		f.advance(time.Second)
+	}
+	if st := f.raw("vm-ha"); st != libvirtfake.StateRunning {
+		t.Fatalf("vm-ha is %s once the mark lock was free", st)
+	}
+}
+
+// ppio re-review r2, F3: a clear is per mark, not per VM. A slow clear of
+// token A's mark is in flight when vm-ha is paused again under token B and an
+// operator resumes it once more: B's clear must still run, and no mark may
+// stay on the running VM.
+//
+// Mutation: dedupe clears by VM name only (the r2 code) — B's clear is
+// dropped and its mark stays on the running VM, red.
+func TestPartitionPause_ANewerTokensClearIsNotDropped(t *testing.T) {
+	f := newPauseFixture(t)
+	f.loseFor(QuorumNo, PartitionPauseAfter+2*time.Second)
+	first := f.waitMark("vm-ha")
+	var calls atomic.Int32
+	f.virt.FailClearPartitionPauseMark = func(string) error {
+		if calls.Add(1) == 1 {
+			time.Sleep(2 * time.Second) // waits behind a libvirt job
+		}
+		return nil
+	}
+	f.set(QuorumYes)
+	if err := f.virt.ResumeDomain("vm-ha"); err != nil { // virsh resume
+		t.Fatal(err)
+	}
+	f.tick() // a Yes, not yet sustained: A's clear starts, and is slow
+	f.advance(time.Second)
+	f.loseFor(QuorumNo, PartitionPauseAfter+2*time.Second)
+	recs := f.records()
+	if len(recs) != 1 || recs[0].Token == first || f.raw("vm-ha") != libvirtfake.StatePaused {
+		t.Fatalf("setup: vm-ha %s, records %+v; want a new pause", f.raw("vm-ha"), recs)
+	}
+	// The operator resumes it again, and the heal drops the record while A's
+	// clear is still in flight.
+	f.set(QuorumYes)
+	if err := f.virt.ResumeDomain("vm-ha"); err != nil {
+		t.Fatal(err)
+	}
+	f.regain()
+	if recs := f.records(); len(recs) != 0 {
+		t.Fatalf("setup: records %+v after vm-ha ran again", recs)
+	}
+	deadline := time.Now().Add(6 * time.Second)
+	for {
+		f.p.mu.Lock()
+		busy := len(f.p.clearing) > 0 || len(f.p.markPending) > 0
+		f.p.mu.Unlock()
+		if _, ok, _ := f.virt.PartitionPauseMark("vm-ha"); !ok && !busy {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("vm-ha runs and still carries this host's pause mark: a newer token's clear was dropped")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if st := f.raw("vm-ha"); st != libvirtfake.StateRunning {
+		t.Fatalf("setup: vm-ha is %s", st)
+	}
+}

@@ -187,3 +187,67 @@ func TestInstallScript_SaysWhenSSHDCannotBeReloaded(t *testing.T) {
 		t.Fatalf("output %q", out)
 	}
 }
+
+// TestInstallScript_NeverOverridesAnAuthorizedKeysCommandAnywhere: an
+// operator's AuthorizedKeysCommand for root in a file Included from outside
+// the drop-in directory, or spelled Keyword=value in any case, is found too,
+// and nothing is written: root's LDAP or sss keys would otherwise stop working.
+func TestInstallScript_NeverOverridesAnAuthorizedKeysCommandAnywhere(t *testing.T) {
+	for _, tc := range []struct{ name, line string }{
+		{"included from elsewhere", "AuthorizedKeysCommand /usr/bin/true %u"},
+		{"Keyword=value, any case", "authorizedKeysCommand=/usr/bin/true %u"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ldap := filepath.Join(t.TempDir(), "ldap.conf")
+			if err := os.WriteFile(ldap, []byte(tc.line+"\nAuthorizedKeysCommandUser nobody\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			w := newInstallWorld(t, "Include "+ldap+"\n")
+			out := w.run(t, "FENCE_SSH_PEERS=10.77.0.3")
+			if w.dropIn(t) != "" || !strings.Contains(out, "already has an AuthorizedKeysCommand") {
+				t.Fatalf("drop-in %q, output %q", w.dropIn(t), out)
+			}
+			cmd, err := exec.Command(SSHDPath(), "-T", "-f", w.cfg, "-C", "user=root,host=,addr=10.77.0.3").Output()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := parseSSHDT(cmd)["authorizedkeyscommand"]; got != "/usr/bin/true %u" {
+				t.Fatalf("root's AuthorizedKeysCommand after the install = %q, want the operator's", got)
+			}
+		})
+	}
+}
+
+// TestInstallScript_RefusesWithoutAnAbsoluteCat: sshd runs an
+// AuthorizedKeysCommand by absolute path; with no cat there the drop-in would
+// have sshd exec the keys file. Nothing is written, and it says why.
+func TestInstallScript_RefusesWithoutAnAbsoluteCat(t *testing.T) {
+	for _, cat := range []string{"cat", "/nonexistent/cat"} {
+		w := newInstallWorld(t, "")
+		out := w.run(t, "FENCE_SSH_PEERS=10.77.0.3", "FENCE_SSH_CAT="+cat)
+		if w.dropIn(t) != "" || !strings.Contains(out, "no cat binary at an absolute path") {
+			t.Fatalf("FENCE_SSH_CAT=%s: drop-in %q, output %q", cat, w.dropIn(t), out)
+		}
+	}
+}
+
+// TestInstallScript_FindsAnAuthorizedKeysCommandUnderAnyMatch: one the
+// operator sets for root only from an admin network, an address the installer
+// never evaluates, is found in the files sshd reads, and nothing is written.
+func TestInstallScript_FindsAnAuthorizedKeysCommandUnderAnyMatch(t *testing.T) {
+	for _, line := range []string{
+		"AuthorizedKeysCommand /usr/bin/true %u",
+		"authorizedkeyscommand=/usr/bin/true %u",
+		`"AuthorizedKeysCommand" /usr/bin/true %u`,
+	} {
+		inc := filepath.Join(t.TempDir(), "admin.conf")
+		if err := os.WriteFile(inc, []byte("Match Address 192.168.50.0/24\n    "+line+"\n    AuthorizedKeysCommandUser nobody\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		w := newInstallWorld(t, "Include "+inc+"\n")
+		out := w.run(t, "FENCE_SSH_PEERS=10.77.0.3")
+		if w.dropIn(t) != "" || !strings.Contains(out, "already has an AuthorizedKeysCommand") {
+			t.Fatalf("%q: drop-in %q, output %q", line, w.dropIn(t), out)
+		}
+	}
+}

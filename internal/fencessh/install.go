@@ -64,7 +64,9 @@ lv_fence_ssh_install() {
     if [ -z "$sshd" ]; then sshd="$(command -v sshd || true)"; fi
     if [ -z "$sshd" ]; then sshd=/usr/sbin/sshd; fi
     if [ -z "$catbin" ]; then
-        for c in /usr/bin/cat /bin/cat; do if [ -x "$c" ]; then catbin="$c"; break; fi; done
+        for c in /usr/bin/cat /bin/cat "$(command -v cat 2>/dev/null || true)"; do
+            if [ -n "$c" ] && [ -x "$c" ]; then catbin="$c"; break; fi
+        done
     fi
     install -d -m 0755 "$dir"
     if [ ! -x "$sshd" ]; then
@@ -82,16 +84,10 @@ lv_fence_ssh_install() {
         echo "fence ssh: $ak for root (lv doctor fence shows whether it does)"
         return 0
     fi
-    local f own=""
-    for f in "$cfg" "$ddir"/*.conf; do
-        [ -f "$f" ] || continue
-        [ "$f" = "$dropin" ] && continue
-        own="$(grep -iE '^[[:space:]]*AuthorizedKeysCommand([[:space:]]|$)' "$f" | head -1)"
-        if [ -n "$own" ]; then own="$f: $own"; break; fi
-    done
-    if [ -n "$own" ]; then
-        echo "fence ssh: sshd already has an AuthorizedKeysCommand ($own), which a drop-in would override, so"
-        echo "fence ssh: none was written. Have it also print the keys in $ak for root"
+    case "$catbin" in /*) ;; *) catbin="" ;; esac
+    if [ -z "$catbin" ] || [ ! -x "$catbin" ]; then
+        echo "fence ssh: no cat binary at an absolute path (sshd runs an AuthorizedKeysCommand by its absolute path),"
+        echo "fence ssh: so no drop-in was written. Have sshd also read $ak for root"
         return 0
     fi
     local prev=""
@@ -100,9 +96,21 @@ lv_fence_ssh_install() {
         cp -p "$dropin" "$prev"
         rm -f "$dropin"
     fi
+    # The operator's own AuthorizedKeysCommand is never replaced: sshd takes
+    # the first one it reads, and the drop-in is Included first. Every file
+    # sshd reads (sshd -ddd names each), any spelling (Keyword value,
+    # Keyword=value, any case), and root's effective value for every
+    # evaluated address.
+    local f own=""
+    for f in $("$sshd" -ddd -T -f "$cfg" -C "user=root,host=,addr=127.0.0.1" 2>&1 | tr -d '\r' | sed -n 's/.*load_server_config: filename //p'); do
+        [ -f "$f" ] || continue
+        [ "$f" = "$dropin" ] && continue
+        own="$(grep -iE '^[[:space:]]*"?AuthorizedKeysCommand"?([[:space:]=]|$)' "$f" | head -1)"
+        if [ -n "$own" ]; then own="$f: $own"; break; fi
+    done
     local addrs="${FENCE_SSH_PEERS:-} ${FENCE_SSH_SELF:-}"
     if [ -z "$(echo $addrs)" ]; then addrs=127.0.0.1; fi
-    local a out before="" seen=" "
+    local a out akc before="" seen=" "
     for a in $addrs; do
         case "$seen" in *" $a "*) continue ;; esac
         seen="$seen$a "
@@ -111,8 +119,9 @@ lv_fence_ssh_install() {
             echo "fence ssh: sshd -T failed ($out); nothing changed"
             return 0
         fi
-        before="$before$a $(printf '%s
-' "$out" | awk '$1=="authorizedkeysfile"' | head -1)
+        akc="$(printf '%s\n' "$out" | awk '$1=="authorizedkeyscommand" { $1=""; sub(/^ +/, ""); print; exit }')"
+        if [ -z "$own" ] && [ -n "$akc" ] && [ "$akc" != none ]; then own="root's effective AuthorizedKeysCommand from $a: $akc"; fi
+        before="$before$a $(printf '%s\n' "$out" | awk '$1=="authorizedkeysfile"' | head -1)
 "
         if [ "$(printf '%s
 ' "$out" | awk '$1=="permitrootlogin" { print $2; exit }')" = no ]; then
@@ -120,6 +129,12 @@ lv_fence_ssh_install() {
             echo "fence ssh: reports that it does not accept the managed fence key"
         fi
     done
+    if [ -n "$own" ]; then
+        if [ -n "$prev" ]; then mv "$prev" "$dropin"; fi
+        echo "fence ssh: sshd already has an AuthorizedKeysCommand ($own), which a drop-in would replace for root, so"
+        echo "fence ssh: none was written. Have it also print the keys in $ak for root"
+        return 0
+    fi
     local tmp="$dropin.tmp.$$"
     {
         echo "# Written by litevirt (lv host init, lv host add, lv host install-fence-ssh): sshd also accepts the"
@@ -134,7 +149,11 @@ lv_fence_ssh_install() {
     local after=""
     if out="$("$sshd" -t -f "$cfg" 2>&1)"; then
         for a in $(echo "$before" | awk '{print $1}'); do
-            after="$after$a $("$sshd" -T -f "$cfg" -C "user=root,host=,addr=$a" 2>/dev/null | awk '$1=="authorizedkeysfile"' | head -1)
+            out="$("$sshd" -T -f "$cfg" -C "user=root,host=,addr=$a" 2>/dev/null)"
+            akc="$(printf '%s\n' "$out" | awk '$1=="authorizedkeyscommand" { $1=""; sub(/^ +/, ""); print; exit }')"
+            if [ "$akc" != "$catbin $ak" ]; then after="$after$a authorizedkeyscommand $akc
+"; continue; fi
+            after="$after$a $(printf '%s\n' "$out" | awk '$1=="authorizedkeysfile"' | head -1)
 "
         done
     fi

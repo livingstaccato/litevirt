@@ -31,6 +31,7 @@ func TestThreeCoordinators_AtMostOneFences(t *testing.T) {
 			t.Fatalf("InsertHost %s: %v", h, err)
 		}
 	}
+	needsFence(t, db, "victim")
 
 	// Quorum: three observers all report victim suspect. Without the
 	// lease, naive logic would fence three times.

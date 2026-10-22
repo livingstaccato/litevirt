@@ -159,6 +159,11 @@ func TestFleet_RegionScopedFailover_SitePartition(t *testing.T) {
 			ctx := context.Background()
 			clock := NewVirtualClock(time.Now().UTC())
 			c, east, west := siteFleet(t, scope)
+			// Both west hosts run something recoverable: a host with nothing
+			// to recover is not fenced, and the contract pinned here is that
+			// cluster scope fences every west host it sees down.
+			insertVM(t, c.Nodes[0], "vm-west-2", west[1].Name)
+			c.WaitConverged(t, convergeTimeout)
 			cutSites(c, east, west)
 			reportDown(t, clock, east, west)
 			reportDown(t, clock, west, east)
@@ -421,6 +426,9 @@ func TestFleet_RegionScopedFailover_ChangeFromTheFarSide(t *testing.T) {
 	ctx := context.Background()
 	clock := NewVirtualClock(time.Now().UTC())
 	c, east, west := siteFleet(t, corrosion.FailoverScopeCluster)
+	// Both west hosts run something recoverable (see SitePartition).
+	insertVM(t, c.Nodes[0], "vm-west-2", west[1].Name)
+	c.WaitConverged(t, convergeTimeout)
 	cutSites(c, east, west)
 	if err := corrosion.SetFailoverScope(ctx, west[0].DB, corrosion.FailoverScopeRegion, "fleet"); err != nil {
 		t.Fatalf("SetFailoverScope on the west side: %v", err)

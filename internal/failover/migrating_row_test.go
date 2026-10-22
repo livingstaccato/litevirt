@@ -149,7 +149,8 @@ func TestRecoverWorkloads_OneAskDeadlinePerPoll(t *testing.T) {
 // which re-points the row when the guest runs there — is taken only under
 // the decision gate and this coordinator's tenure, as the reschedule beside
 // it is: refused, SettleMigratingRows is not called and the VM is held.
-// Before the gate is enforced it is asked as before.
+// The hold names the refusal, not the target's reachability. Before the gate
+// is enforced it is asked as before.
 //
 // Mutations: drop the decision gate in settleMigratingVMs — "gate refuses"
 // red; drop the tenure check — "tenure lost" red.
@@ -159,11 +160,12 @@ func TestSettleMigratingVMs_TakesTheDecisionGateAndTenure(t *testing.T) {
 		gate     *bool // nil: no gate (not enforced)
 		lease    bool
 		wantAsks bool
+		wantWhy  string // a refusal's hold names it
 	}{
 		{name: "not enforced", gate: nil, lease: false, wantAsks: true},
 		{name: "gate and tenure", gate: ptrBool(true), lease: true, wantAsks: true},
-		{name: "gate refuses", gate: ptrBool(false), lease: true},
-		{name: "tenure lost", gate: ptrBool(true), lease: false},
+		{name: "gate refuses", gate: ptrBool(false), lease: true, wantWhy: "decision gate refused"},
+		{name: "tenure lost", gate: ptrBool(true), lease: false, wantWhy: "failover lease"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := newTestDB(t)
@@ -186,8 +188,11 @@ func TestSettleMigratingVMs_TakesTheDecisionGateAndTenure(t *testing.T) {
 			if (asked == 1) != tc.wantAsks {
 				t.Fatalf("SettleMigratingRows asked %d times, want asked: %v", asked, tc.wantAsks)
 			}
-			if !tc.wantAsks && len(got) != 0 {
-				t.Fatalf("decisions %v without an ask; want none, so mg1 is held", got)
+			if !tc.wantAsks {
+				d, ok := got["mg1"]
+				if !ok || d.Verdict != MigratingHold || !strings.Contains(d.Detail, tc.wantWhy) {
+					t.Fatalf("decision for mg1 = %+v (present %v); want a hold naming %q", d, ok, tc.wantWhy)
+				}
 			}
 		})
 	}

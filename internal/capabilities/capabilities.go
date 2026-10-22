@@ -551,12 +551,13 @@ const (
 	//     that incarnation; one granted before the latch grants only while the
 	//     project still holds the incarnation it had then (none). Any other is
 	//     kept, listed as held, and grants nothing;
-	//   - a grant or quota write under a project carries a
-	//     project_incarnation_v1 mutation guard, and applies only to that
-	//     incarnation;
-	//   - the orphan reaper's authority retirement names the tombstone it
-	//     retires, so a node that never saw a re-create cannot retire the new
-	//     project's authority.
+	//   - a grant or quota write under a project carries NO project guard: its
+	//     writer checks the incarnation in its own transaction, and a receiver
+	//     applies it whatever its project holds. The binding's tag, and the
+	//     quota's key ("<name>~p:<incarnation>"), decide whether it counts;
+	//   - the orphan reaper's authority retirement carries the one project
+	//     guard (project_deleted), naming the tombstone it retires, so a node
+	//     that never saw a re-create cannot retire the new project's authority.
 	//
 	// Before, a role binding a lagging node granted on a project that was
 	// then deleted and re-created elsewhere reached the new project by the WAL

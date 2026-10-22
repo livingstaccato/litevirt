@@ -368,6 +368,79 @@ func projectBindingHeld(b RoleBindingRecord, states map[string]*projectState) bo
 	return true
 }
 
+// projectParentVerdict is what a project's rows say of a parent reference
+// (name, incarnation) held by a dependent record. The zero value is no
+// verdict, so a caller that drops an error cannot read it as Current.
+type projectParentVerdict int
+
+const (
+	projectParentUnknown projectParentVerdict = iota
+	// projectParentCurrent: exactly one live spelling of the canonical name,
+	// spelled as asked, holding the incarnation asked.
+	projectParentCurrent
+	// projectParentConflict: live, but not as asked: another incarnation, the
+	// name live under another spelling, or more than one live spelling
+	// ("acme" beside "/acme", which a create with the gate off can leave).
+	projectParentConflict
+	// projectParentAbsent: no live row of the canonical name.
+	projectParentAbsent
+	// projectParentImplicit: the default project (or the root), which has no
+	// row by design and is never deleted or re-created.
+	projectParentImplicit
+)
+
+func (v projectParentVerdict) String() string {
+	switch v {
+	case projectParentCurrent:
+		return "current"
+	case projectParentConflict:
+		return "conflict"
+	case projectParentAbsent:
+		return "absent"
+	case projectParentImplicit:
+		return "implicit"
+	}
+	return "unknown"
+}
+
+// projectParentVerdictTx judges a parent reference (name, inc) against the
+// project rows in tx. It only reads, every project row, so it is safe inside a
+// caller's guarded transaction and needs no gate.
+//
+// Equality only: incarnations are random, so one is never newer or older than
+// another, and a mismatch is a Conflict, whatever arrives later. inc == "" is
+// the pre-latch incarnation, a value like any other; it names the lifetime
+// live at the latch, and a pre-latch delete and revive also keeps it, so it
+// cannot tell those lifetimes apart.
+//
+// A tombstone and no row at all are both Absent: neither is a live parent, and
+// a tombstone's incarnation never makes one current. They differ only in what
+// comes next: a create over a tombstone is a rebirth (a fresh incarnation once
+// latched; with the gate off, a revive that keeps ""), a create over no row a
+// first birth. Production never removes a project row, so no row means the
+// name was never created here (or has not replicated yet).
+func projectParentVerdictTx(ctx context.Context, tx *sql.Tx, name, inc string) (projectParentVerdict, error) {
+	canon, err := safename.CanonicalProjectName(name)
+	if err != nil {
+		return projectParentUnknown, err
+	}
+	if canon == "/" || canon == "/"+DefaultProject {
+		return projectParentImplicit, nil
+	}
+	states, err := loadProjectStatesTx(ctx, tx)
+	if err != nil {
+		return projectParentUnknown, err
+	}
+	st := states[canon]
+	switch {
+	case st == nil || len(st.live) == 0:
+		return projectParentAbsent, nil
+	case len(st.live) > 1, st.liveName[0] != name, st.live[0] != inc:
+		return projectParentConflict, nil
+	}
+	return projectParentCurrent, nil
+}
+
 // markHeldBindings sets Held on every binding projectBindingHeld holds.
 func markHeldBindings(ctx context.Context, c *Client, bs []RoleBindingRecord) error {
 	if len(bs) == 0 {

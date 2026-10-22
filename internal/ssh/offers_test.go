@@ -236,3 +236,49 @@ func TestNewClient_UnloadableIdentityFileAgentCopyFirst(t *testing.T) {
 		})
 	}
 }
+
+// IdentityAgent is honoured (reviewer probe sshcfg M1): "none" uses no agent,
+// a path uses that socket even with SSH_AUTH_SOCK unset, and SSH_AUTH_SOCK or
+// unset keeps the environment's agent.
+func TestNewClient_IdentityAgent(t *testing.T) {
+	t.Run("none", func(t *testing.T) {
+		home, _ := sshHome(t, "unused")
+		pk, sk, _ := ed25519.GenerateKey(rand.Reader)
+		pub, _ := ssh.NewPublicKey(pk)
+		startAgent(t, sk)
+		srv := startFakeSSHD(t, pub)
+		writeSSHConfig(t, home, "Host 127.0.0.1\n  IdentityAgent none\n")
+		if c, err := NewClient("deploy@127.0.0.1:" + srv.port()); err == nil {
+			c.Close()
+			t.Fatal("IdentityAgent none: the agent's key was used")
+		}
+	})
+	t.Run("path", func(t *testing.T) {
+		home, _ := sshHome(t, "unused")
+		pk, sk, _ := ed25519.GenerateKey(rand.Reader)
+		pub, _ := ssh.NewPublicKey(pk)
+		startAgent(t, sk)
+		sock := os.Getenv("SSH_AUTH_SOCK")
+		t.Setenv("SSH_AUTH_SOCK", "")
+		srv := startFakeSSHD(t, pub)
+		writeSSHConfig(t, home, "Host 127.0.0.1\n  IdentityAgent "+sock+"\n")
+		c, err := NewClient("deploy@127.0.0.1:" + srv.port())
+		if err != nil {
+			t.Fatalf("IdentityAgent <socket> with SSH_AUTH_SOCK unset: %v", err)
+		}
+		c.Close()
+	})
+	t.Run("SSH_AUTH_SOCK", func(t *testing.T) {
+		home, _ := sshHome(t, "unused")
+		pk, sk, _ := ed25519.GenerateKey(rand.Reader)
+		pub, _ := ssh.NewPublicKey(pk)
+		startAgent(t, sk)
+		srv := startFakeSSHD(t, pub)
+		writeSSHConfig(t, home, "Host 127.0.0.1\n  IdentityAgent SSH_AUTH_SOCK\n")
+		c, err := NewClient("deploy@127.0.0.1:" + srv.port())
+		if err != nil {
+			t.Fatalf("IdentityAgent SSH_AUTH_SOCK: %v", err)
+		}
+		c.Close()
+	})
+}

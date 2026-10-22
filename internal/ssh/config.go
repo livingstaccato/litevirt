@@ -44,6 +44,10 @@ type resolved struct {
 	// HostKeyAlias is the name host keys are looked up under instead of the
 	// dialled address ("" when unset).
 	HostKeyAlias string
+	// AgentSet: IdentityAgent chose the agent socket, AgentSock ("" for
+	// none). Otherwise SSH_AUTH_SOCK is used.
+	AgentSet  bool
+	AgentSock string
 }
 
 // sshG runs `ssh -G args...` and returns its stdout, giving up after timeout
@@ -202,6 +206,20 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 			return nil, fmt.Errorf("UserKnownHostsFile %q for %s uses a %% token litevirt does not expand", kh, host)
 		}
 		r.KnownHosts = append(r.KnownHosts, p)
+	}
+	switch ia := got.one("identityagent"); {
+	case ia == "" || ia == "SSH_AUTH_SOCK":
+		// the default: SSH_AUTH_SOCK
+	case ia == "none":
+		r.AgentSet = true
+	case strings.HasPrefix(ia, "$"):
+		r.AgentSet, r.AgentSock = true, os.Getenv(strings.TrimPrefix(ia, "$"))
+	default:
+		p, ok := expandIdentity(ia, host, r.Hostname, eff, r.Port)
+		if !ok {
+			warnf("IdentityAgent %q for %s uses a %% token litevirt does not expand; using no agent", ia, host)
+		}
+		r.AgentSet, r.AgentSock = true, p
 	}
 	if v := got["globalknownhostsfile"]; len(v) > 0 {
 		for _, kh := range strings.Fields(strings.Join(v, " ")) {

@@ -69,7 +69,7 @@ func dialTarget(t *Target, start time.Time, timeout time.Duration, keepDeadline 
 	cfg, sshUser, host, port := t.cfg, t.user, t.host, t.port
 	dialHost := cfg.Hostname
 
-	auth, err := authMethodsFor(cfg.IdentityFiles, cfg.IdentitiesOnly)
+	auth, err := authMethodsFor(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("SSH auth: %w", err)
 	}
@@ -497,17 +497,28 @@ func parseTargetExplicit(target string) (user, host, port string, userSet, portS
 	return
 }
 
-func authMethods() ([]ssh.AuthMethod, error) { return authMethodsFor(nil, false) }
+func authMethods() ([]ssh.AuthMethod, error) { return authMethodsFor(nil) }
 
-// authMethodsFor is authMethods with the config's IdentityFile entries tried
-// before the default key files.
-func authMethodsFor(extraKeys []string, identitiesOnly bool) ([]ssh.AuthMethod, error) {
+// authMethodsFor is authMethods under cfg: its IdentityFile entries tried
+// before the default key files, IdentitiesOnly, and IdentityAgent. A nil cfg
+// is the defaults (SSH_AUTH_SOCK, the default key files).
+func authMethodsFor(cfg *resolved) ([]ssh.AuthMethod, error) {
+	var (
+		extraKeys      []string
+		identitiesOnly bool
+	)
+	sock, sockFrom := os.Getenv("SSH_AUTH_SOCK"), "SSH_AUTH_SOCK not set"
+	if cfg != nil {
+		extraKeys, identitiesOnly = cfg.IdentityFiles, cfg.IdentitiesOnly
+		if cfg.AgentSet {
+			sock, sockFrom = cfg.AgentSock, "disabled by IdentityAgent in the ssh config"
+		}
+	}
 	var tried []string
 	// agentSigners is nil without a usable agent.
 	var agentSigners func() ([]ssh.Signer, error)
 
 	// Try SSH agent first
-	sock := os.Getenv("SSH_AUTH_SOCK")
 	home, _ := os.UserHomeDir()
 	defaults := []string{
 		filepath.Join(home, ".ssh", "id_ed25519"),
@@ -519,7 +530,7 @@ func authMethodsFor(extraKeys []string, identitiesOnly bool) ([]ssh.AuthMethod, 
 		identities = extraKeys // ssh offers only the configured identities
 	}
 	if sock == "" {
-		tried = append(tried, "agent: SSH_AUTH_SOCK not set")
+		tried = append(tried, "agent: "+sockFrom)
 	} else {
 		conn, err := net.Dial("unix", sock)
 		if err != nil {

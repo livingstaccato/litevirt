@@ -327,6 +327,8 @@ by OpenSSH itself. Only the per-user `~/.ssh/config` is read; `/etc/ssh/ssh_conf
   `IdentityFile` with any other `%` token is skipped with a warning. `IdentitiesOnly yes`
   limits the ssh agent (which is still used) and the key files to the configured identities,
   matched by public key, so an `IdentityFile` that is a `.pub` file whose private key is in the agent works.
+- `IdentityAgent` is honoured: `none` uses no agent, a socket path (or `$VAR`) uses that agent,
+  and `SSH_AUTH_SOCK` or no setting uses `$SSH_AUTH_SOCK`.
 - `ProxyJump` and `ProxyCommand` are not supported. lv warns, naming the directive, and
   dials the address directly, as it always did.
 - Host-key checking is never loosened by the config. A changed key for a known host is

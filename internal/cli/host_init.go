@@ -39,6 +39,20 @@ var (
 // 3. Push CA + host cert + litevirtd binary + setup script via SSH
 // 4. Run setup script to install deps and start litevirtd
 func HostInit(ctx context.Context, sshTarget string, hostName string, force bool) error {
+	// Checked before anything (even reading the ssh config) happens.
+	if err := pki.ValidateHostName(hostName); err != nil {
+		return err
+	}
+	rt, err := ssh.Resolve(sshTarget)
+	if err != nil {
+		return err
+	}
+	return HostInitResolved(ctx, sshTarget, rt, hostName, force)
+}
+
+// HostInitResolved is HostInit for a target already resolved through the ssh
+// config, so the cluster-member check and the init name the same address.
+func HostInitResolved(ctx context.Context, sshTarget string, rt *ssh.Target, hostName string, force bool) error {
 	// The name becomes <pkiDir>/<name>.crt|.key beside the CA: checked first.
 	if err := pki.ValidateHostName(hostName); err != nil {
 		return err
@@ -48,6 +62,9 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 	if err != nil {
 		return err
 	}
+	// The address is the one the ssh config gives this target, so the DNS step,
+	// the certificate SAN and the dial all name the same machine.
+	parsedHost = rt.Host()
 	hostAddr, err := resolveHost(parsedHost)
 	if err != nil {
 		return err
@@ -56,7 +73,7 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 	// Connect and inspect the target BEFORE anything is minted or pushed, so a
 	// refusal leaves both this machine's PKI dir and the target untouched.
 	slog.Info("connecting to host", "target", sshTarget)
-	sc, err := connectEnrollmentRemote(sshTarget)
+	sc, err := connectEnrollmentRemote(rt)
 	if err != nil {
 		return fmt.Errorf("SSH connect: %w", err)
 	}

@@ -127,14 +127,15 @@ func HostRenewCert(ctx context.Context, c pb.LiteVirtClient, hostName string, op
 	if err := requireCAKey(PKIDir(), "renewing a host certificate"); err != nil {
 		return err
 	}
-	if opts.SSHTarget == "" {
-		opts.SSHTarget = "root@" + hostName
-	}
 	addr, err := hostAddress(ctx, c, hostName)
 	if err != nil {
 		return err
 	}
-	sc, err := ssh.NewClient(opts.SSHTarget)
+	rt, err := sshTargetForHost(hostName, opts.SSHTarget, addr)
+	if err != nil {
+		return err
+	}
+	sc, err := ssh.NewClientResolved(rt)
 	if err != nil {
 		return fmt.Errorf("SSH connect: %w", err)
 	}
@@ -781,6 +782,31 @@ func waitRecordedSerial(ctx context.Context, c pb.LiteVirtClient, hostName, want
 		case <-time.After(2 * time.Second):
 		}
 	}
+}
+
+// sshTargetForHost resolves the SSH target a credential command uses for the
+// cluster host hostName, recorded at addr. With no --ssh target the default is
+// root@<hostName>, and an ssh config alias of that name decides where it goes;
+// one whose HostName resolves anywhere but addr (stale, or another machine)
+// would carry the host's key material there, so it is refused. An explicit
+// target is the operator's choice and is used as given.
+func sshTargetForHost(hostName, sshTarget, addr string) (*ssh.Target, error) {
+	explicit := sshTarget != ""
+	if !explicit {
+		sshTarget = "root@" + hostName
+	}
+	rt, err := ssh.Resolve(sshTarget)
+	if err != nil {
+		return nil, err
+	}
+	if !explicit && rt.Host() != hostName {
+		if ip, err := resolveHost(rt.Host()); err != nil || ip != addr {
+			return nil, fmt.Errorf("your ssh config sends %s to %s, but the cluster records %s at %s; "+
+				"refusing to carry its credentials there. Fix the ssh config's HostName, or name the "+
+				"target with --ssh", hostName, rt.Host(), hostName, addr)
+		}
+	}
+	return rt, nil
 }
 
 func hostAddress(ctx context.Context, c pb.LiteVirtClient, hostName string) (string, error) {

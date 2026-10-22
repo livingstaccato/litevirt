@@ -13,9 +13,8 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/pki"
-	"google.golang.org/grpc"
+	"github.com/litevirt/litevirt/internal/ssh"
 )
 
 func TestEnrollmentServiceStopRequiresVerifiedState(t *testing.T) {
@@ -117,18 +116,11 @@ func (f *enrollmentRemoteFixture) RunOutput(command string) ([]byte, error) {
 	return []byte("/var/tmp/litevirt-enrollment.1234567890\n"), nil
 }
 
-type enrollmentAdmissionClient struct {
-	pb.LiteVirtClient
-	remote *enrollmentRemoteFixture
-}
-
-func (c *enrollmentAdmissionClient) AdmitHost(context.Context, *pb.AdmitHostRequest, ...grpc.CallOption) (*pb.AdmitHostResponse, error) {
-	c.remote.events = append(c.remote.events, "admit")
-	return &pb.AdmitHostResponse{AuditPositionProven: true}, nil
-}
-
-func TestAllEnrollmentEntryPathsUseStagedWorkflow(t *testing.T) {
-	for _, path := range []string{"remote-init", "remote-add", "local-init"} {
+// HostAdd has its own staged admission workflow in hostAddTo; its actual
+// stage-before-admission, refusal, install and rollback controls live in
+// host_add_order_test.go and host_add_attempt_test.go.
+func TestHostInitEntryPathsUseStagedWorkflow(t *testing.T) {
+	for _, path := range []string{"remote-init", "local-init"} {
 		t.Run(path, func(t *testing.T) {
 			source := addOperatorPKI(t)
 			useConfig(t, "")
@@ -142,7 +134,7 @@ func TestAllEnrollmentEntryPathsUseStagedWorkflow(t *testing.T) {
 			}
 			remote := &enrollmentRemoteFixture{}
 			oldConnect := connectEnrollmentRemote
-			connectEnrollmentRemote = func(string) (enrollmentConnection, error) { return remote, nil }
+			connectEnrollmentRemote = func(*ssh.Target) (enrollmentConnection, error) { return remote, nil }
 			defer func() { connectEnrollmentRemote = oldConnect }()
 			oldLocal := enrollLocalHost
 			enrollLocalHost = func(_ context.Context, r HostEnrollmentRequest) error {
@@ -156,15 +148,13 @@ func TestAllEnrollmentEntryPathsUseStagedWorkflow(t *testing.T) {
 			switch path {
 			case "remote-init":
 				err = HostInit(context.Background(), "root@127.0.0.1", "node-9", false)
-			case "remote-add":
-				err = HostAdd(context.Background(), &enrollmentAdmissionClient{remote: remote}, "root@127.0.0.1", "node-9", []string{"127.0.0.2:7946"})
 			case "local-init":
 				err = HostInitLocal(context.Background(), "node-9", "127.0.0.1", false)
 			}
 			if err != nil {
 				t.Fatal(err)
 			}
-			if remote.request.Host != "node-9" || remote.request.Founding != (path != "remote-add") || remote.request.Force {
+			if remote.request.Host != "node-9" || !remote.request.Founding || remote.request.Force {
 				t.Fatal("entry path did not preserve enrollment intent")
 			}
 			if _, err := pki.ValidateHostEnrollment("node-9", remote.request.CA, remote.request.Certificate, remote.request.Key); err != nil {
@@ -178,10 +168,6 @@ func TestAllEnrollmentEntryPathsUseStagedWorkflow(t *testing.T) {
 			switch path {
 			case "remote-init":
 				if events != "probe,stage,current-helper,invoke,cleanup,close" {
-					t.Fatal(events)
-				}
-			case "remote-add":
-				if events != "admit,stage,current-helper,invoke,cleanup,close" {
 					t.Fatal(events)
 				}
 			case "local-init":
@@ -690,7 +676,7 @@ func TestHostInitDoesNotRegenerateMissingEstablishedOperatorCA(t *testing.T) {
 				t.Setenv("LITEVIRT_PKI_DIR", alias)
 				remote := &enrollmentRemoteFixture{}
 				oldConnect := connectEnrollmentRemote
-				connectEnrollmentRemote = func(string) (enrollmentConnection, error) { return remote, nil }
+				connectEnrollmentRemote = func(*ssh.Target) (enrollmentConnection, error) { return remote, nil }
 				defer func() { connectEnrollmentRemote = oldConnect }()
 				oldLocal := enrollLocalHost
 				enrollLocalHost = func(context.Context, HostEnrollmentRequest) error { return nil }

@@ -14,6 +14,8 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cli"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/pki"
+	"github.com/litevirt/litevirt/internal/ssh"
 )
 
 func newHostCmd() *cobra.Command {
@@ -100,10 +102,18 @@ and refuses an address that cluster lists beside other hosts.`,
 			}
 			// A founder's own join_peers is empty, so the target-side check
 			// cannot tell it from a half-finished first node; the cluster can.
-			if err := cli.RefuseInitOfAClusterMember(cmd.Context(), args[0], force); err != nil {
+			// One look at the ssh config serves the check and the init.
+			if err := pki.ValidateHostName(name); err != nil {
 				return err
 			}
-			return cli.HostInit(cmd.Context(), args[0], name, force)
+			rt, err := ssh.Resolve(args[0])
+			if err != nil {
+				return err
+			}
+			if err := cli.RefuseInitOfAClusterMemberResolved(cmd.Context(), args[0], rt, force); err != nil {
+				return err
+			}
+			return cli.HostInitResolved(cmd.Context(), args[0], rt, name, force)
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "Host name (required)")

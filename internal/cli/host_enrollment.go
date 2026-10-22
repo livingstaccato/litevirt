@@ -309,7 +309,9 @@ type enrollmentConnection interface {
 	Close() error
 }
 
-var connectEnrollmentRemote = func(target string) (enrollmentConnection, error) { return ssh.NewClient(target) }
+var connectEnrollmentRemote = func(target *ssh.Target) (enrollmentConnection, error) {
+	return ssh.NewClientResolved(target)
+}
 var enrollLocalHost = RunHostEnrollment
 
 func runRemoteEnrollment(sc enrollmentRemote, r HostEnrollmentRequest) error {

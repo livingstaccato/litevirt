@@ -8,6 +8,7 @@ import (
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/ssh"
 )
 
 // The cluster's half of the "already a member" check for `lv host init`
@@ -42,11 +43,23 @@ func RefuseInitOfAClusterMember(ctx context.Context, sshTarget string, force boo
 	if force {
 		return nil
 	}
-	host, _, err := parseSSHTarget(sshTarget)
+	rt, err := ssh.Resolve(sshTarget)
 	if err != nil {
+		return err // never skip the check on a target that will not resolve
+	}
+	return RefuseInitOfAClusterMemberResolved(ctx, sshTarget, rt, force)
+}
+
+// RefuseInitOfAClusterMemberResolved is the check for a target already
+// resolved through the ssh config.
+func RefuseInitOfAClusterMemberResolved(ctx context.Context, sshTarget string, rt *ssh.Target, force bool) error {
+	if force {
+		return nil
+	}
+	if _, _, err := parseSSHTarget(sshTarget); err != nil {
 		return nil // HostInit reports a bad target itself
 	}
-	addr, err := resolveHost(host)
+	addr, err := resolveHost(rt.Host())
 	if err != nil {
 		return nil
 	}

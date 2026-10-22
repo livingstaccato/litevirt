@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/pki"
+	"github.com/litevirt/litevirt/internal/ssh"
 )
 
 // These controls distinguish a missing retained assignment from a caller,
@@ -109,8 +110,8 @@ func captureNativeFirstMemberInit(t *testing.T, mode string) nativeFirstMemberIn
 	t.Cleanup(func() {
 		connectEnrollmentRemote, enrollLocalHost = oldConnect, oldLocal
 	})
-	connectEnrollmentRemote = func(target string) (enrollmentConnection, error) {
-		if mode != "remote" || target != "root@127.0.0.1" {
+	connectEnrollmentRemote = func(target *ssh.Target) (enrollmentConnection, error) {
+		if mode != "remote" || target.Host() != "127.0.0.1" {
 			return nil, errors.New("unexpected native init remote connection")
 		}
 		return remote, nil

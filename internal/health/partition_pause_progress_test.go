@@ -2,12 +2,14 @@ package health
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
 // slowStopCT stops every container slowly, as lxc-stop -t 10 does on a frozen
@@ -26,9 +28,18 @@ func (s slowStopCT) Stop(ctx context.Context, name string, timeout int) error {
 // quorum, then has the majority relocate every one of them to node-b on a
 // completed, verified claim, so the next healed pass settles all n.
 func relocatedContainersFixture(t *testing.T, n int, stopDelay time.Duration) (*pauseFixture, *fakeCT) {
+	return relocatedContainersFixtureVMs(t, n, stopDelay, false)
+}
+
+// relocatedContainersFixtureVMs is relocatedContainersFixture that, with
+// vms, also pauses the fixture's recoverable VM (vm-ha), whose row stays here
+// so the healed pass resumes it.
+func relocatedContainersFixtureVMs(t *testing.T, n int, stopDelay time.Duration, vms bool) (*pauseFixture, *fakeCT) {
 	t.Helper()
 	f := newPauseFixture(t)
-	f.p.SetVMBackend(nil)
+	if !vms {
+		f.p.SetVMBackend(nil)
+	}
 	ctx := context.Background()
 	var names []string
 	for i := 0; i < n; i++ {
@@ -46,9 +57,14 @@ func relocatedContainersFixture(t *testing.T, n int, stopDelay time.Duration) (*
 	for _, r := range f.records() {
 		recs[r.Name] = r
 	}
-	if len(recs) != n {
-		t.Fatalf("setup: %d records, want %d", len(recs), n)
+	want := n
+	if vms {
+		want++
 	}
+	if len(recs) != want {
+		t.Fatalf("setup: %d records, want %d", len(recs), want)
+	}
+	delete(recs, "vm-ha")
 	for _, name := range names {
 		if err := corrosion.RelocateContainer(ctx, f.db, "node-a", name, "node-b"); err != nil {
 			t.Fatal(err)
@@ -179,5 +195,115 @@ func TestPartitionPause_ResumePassIsBounded(t *testing.T) {
 	}
 	if got := count(); got != n {
 		t.Fatalf("later passes settled only %d of %d", got, n)
+	}
+}
+
+// healedPass makes the next tick a healed pass: the majority has been back
+// for longer than T_pause.
+func (f *pauseFixture) healedPass() {
+	f.set(QuorumYes)
+	f.p.mu.Lock()
+	f.p.samples = []lossSample{{at: f.now}}
+	f.p.yesSince = f.now.Add(-2 * PartitionPauseAfter)
+	f.p.mu.Unlock()
+}
+
+// stuckHeadCT fails ct-0's stop slowly on every call, as lxc-stop does on a
+// container hung in D state on a dead NFS rootfs: its settle overruns the
+// pass budget on every pass.
+type stuckHeadCT struct {
+	*fakeCT
+	delay time.Duration
+}
+
+func (s stuckHeadCT) Stop(ctx context.Context, name string, timeout int) error {
+	if name == "ct-0" {
+		time.Sleep(s.delay)
+		return errors.New("lxc-stop: timed out")
+	}
+	return s.fakeCT.Stop(ctx, name, timeout)
+}
+
+// One record that is slow and fails on every pass, at the head of the sorted
+// records ("ct/" sorts before "vm/"), must not starve the rest: each pass
+// starts where the last one stopped. Before the cursor, every other container
+// and every paused VM on the host stayed paused for as long as that one
+// container was stuck (re-review 2, N4).
+//
+// Mutation: drop the cursor (start every pass at the first record) and no
+// healthy settle runs and the VM stays paused.
+func TestPartitionPause_AStuckRecordDoesNotStarveTheRest(t *testing.T) {
+	const n, delay = 5, 80 * time.Millisecond
+	f, rt := relocatedContainersFixtureVMs(t, n, 0, true)
+	f.p.SetContainerRuntime(stuckHeadCT{fakeCT: rt, delay: delay})
+	old := partitionResumePassBudget
+	partitionResumePassBudget = delay / 2
+	t.Cleanup(func() { partitionResumePassBudget = old })
+	f.healedPass()
+	for i := 0; i < 20; i++ {
+		f.tick()
+		f.advance(time.Second)
+	}
+	settled := 0
+	for i := 1; i < n; i++ {
+		if rt.get(fmt.Sprintf("ct-%d", i)) == "stopped" {
+			settled++
+		}
+	}
+	if settled != n-1 {
+		t.Errorf("after 20 passes %d of %d healthy settles ran: one stuck record starves the rest", settled, n-1)
+	}
+	if st := f.raw("vm-ha"); st != libvirtfake.StateRunning {
+		t.Errorf("vm-ha is %s after 20 healed passes: the stuck container starves every VM", st)
+	}
+}
+
+// quorumFlipVMs loses the majority (via flip) right after the first resume.
+type quorumFlipVMs struct {
+	PauseVMBackend
+	once sync.Once
+	flip func()
+}
+
+func (q *quorumFlipVMs) ResumePartitionPaused(name, uuid string) error {
+	err := q.PauseVMBackend.ResumePartitionPaused(name, uuid)
+	q.once.Do(q.flip)
+	return err
+}
+
+// The partition comes back in the middle of a resume pass: the pass stops
+// resuming at once, and what it already resumed is paused again, so nothing
+// it resumed runs beside a replacement the majority's wait may now start
+// (re-review 2, N5).
+//
+// Mutations: drop the quorum re-check between resumes — the other VMs resume
+// too; drop the re-pause — the first stays running.
+func TestPartitionPause_MajorityLostMidPassStopsAndRepauses(t *testing.T) {
+	f := newPauseFixture(t)
+	ctx := context.Background()
+	names := []string{"vm-ha", "vm-r1", "vm-r2", "vm-r3"}
+	for _, name := range names[1:] {
+		if err := corrosion.InsertVM(ctx, f.db, corrosion.VMRecord{Name: name, HostName: "node-a",
+			Spec: `{"on_host_failure":"restart-any"}`, State: "running"}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		f.virt.SetState(name, libvirtfake.StateRunning)
+	}
+	f.loseFor(QuorumNo, PartitionPauseAfter+time.Second)
+	for _, name := range names {
+		if st := f.raw(name); st != libvirtfake.StatePaused {
+			t.Fatalf("setup: %s is %s, want paused", name, st)
+		}
+	}
+	f.p.SetVMBackend(&quorumFlipVMs{PauseVMBackend: f.virt, flip: func() { f.set(QuorumNo) }})
+	f.healedPass()
+	f.tick()
+	for _, name := range names {
+		if st := f.raw(name); st != libvirtfake.StatePaused {
+			t.Errorf("%s is %s after the majority was lost mid-pass, want paused", name, st)
+		}
+	}
+	if recs := f.records(); len(recs) != len(names) {
+		t.Errorf("records = %+v, want one for each of %v", recs, names)
 	}
 }

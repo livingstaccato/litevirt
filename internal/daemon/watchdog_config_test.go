@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -85,28 +86,56 @@ func TestWatchdogConfig_Validation(t *testing.T) {
 	}
 }
 
-// wireWatchdog gives the heartbeat's controller the marker directory, the
-// DB round trip and the configured threshold, and wirePauserLiveness the
-// pauser's progress; Run calls both.
+// startWatchdog wires the heartbeat's controller before it starts the
+// heartbeat on it, and wirePauserLiveness adds the pauser to that same
+// controller. Pinned by behaviour: a daemon restarted after its host
+// self-fenced must not pet the watchdog (the marker in the run directory
+// reaches the heartbeat only if wiring came first), and the controller
+// startWatchdog returns carries the DB probe, the configured threshold and,
+// once wired, the pauser. Run calls both.
 //
-// Mutations: drop any Set call from wireWatchdog or wirePauserLiveness, or
-// either call from Run, and this goes red.
+// Mutations: start the heartbeat before wireWatchdog, or on another
+// controller — the restarted daemon pets past its marker; wire the pauser or
+// the DB probe into another controller, or drop a Set call or a call from
+// Run — the matching check goes red.
 func TestRun_WiresTheWatchdogController(t *testing.T) {
-	d := &Daemon{cfg: &Config{Watchdog: WatchdogConfig{LivenessStaleSec: 300}}, db: corrosion.NewTestClientT(t),
-		watchdogRunDir: t.TempDir()}
-	ctrl := watchdog.NewController()
-	d.wireWatchdog(ctrl)
-	if ctrl.RunDir() != d.watchdogRunDir {
-		t.Fatalf("run dir = %q, want %q", ctrl.RunDir(), d.watchdogRunDir)
+	dev := filepath.Join(t.TempDir(), "watchdog0")
+	if err := os.WriteFile(dev, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(runDir, "self-fenced"), []byte("earlier run\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d := &Daemon{cfg: &Config{WatchdogDev: dev, Watchdog: WatchdogConfig{LivenessStaleSec: 300}},
+		db: corrosion.NewTestClientT(t), watchdogRunDir: runDir}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctrl := d.startWatchdog(ctx, func() bool { return true })
+	deadline := time.Now().Add(2 * time.Second)
+	for !ctrl.Fenced() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !ctrl.Fenced() {
+		t.Fatal("a daemon restarted after a self-fence did not start fenced")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if b, _ := os.ReadFile(dev); len(b) != 0 {
+		t.Fatalf("a daemon restarted after a self-fence wrote %q to the watchdog", b)
+	}
+	if ctrl.RunDir() != runDir {
+		t.Fatalf("run dir = %q, want %q", ctrl.RunDir(), runDir)
 	}
 	db, pauser, stale := ctrl.LivenessWiring()
 	if !db || pauser || stale != 300*time.Second {
-		t.Fatalf("after wireWatchdog: db=%v pauser=%v stale=%v, want db, no pauser yet, 300s", db, pauser, stale)
+		t.Fatalf("after startWatchdog: db=%v pauser=%v stale=%v, want db, no pauser yet, 300s", db, pauser, stale)
 	}
-	wirePauserLiveness(ctrl, health.NewPartitionPauser("h", t.TempDir(), d.db))
+	d.wirePauserLiveness(health.NewPartitionPauser("h", t.TempDir(), d.db))
 	if _, pauser, _ := ctrl.LivenessWiring(); !pauser {
-		t.Fatal("wirePauserLiveness did not wire the pauser's progress")
+		t.Fatal("wirePauserLiveness did not wire the pauser into the heartbeat's controller")
 	}
+
+	// liveness_stale_sec 0 turns the gate off.
 	d.cfg.Watchdog.LivenessStaleSec = 0
 	off := watchdog.NewController()
 	d.wireWatchdog(off)
@@ -128,19 +157,18 @@ func TestRun_WiresTheWatchdogController(t *testing.T) {
 		}
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
 			if c, ok := n.(*ast.CallExpr); ok {
-				switch fun := c.Fun.(type) {
-				case *ast.SelectorExpr:
-					calls[fun.Sel.Name] = true
-				case *ast.Ident:
-					calls[fun.Name] = true
+				if sel, ok := c.Fun.(*ast.SelectorExpr); ok {
+					if x, ok := sel.X.(*ast.Ident); ok && x.Name == "d" {
+						calls[sel.Sel.Name] = true
+					}
 				}
 			}
 			return true
 		})
 	}
-	for _, want := range []string{"wireWatchdog", "wirePauserLiveness"} {
+	for _, want := range []string{"startWatchdog", "wirePauserLiveness"} {
 		if !calls[want] {
-			t.Errorf("Daemon.Run does not call %s", want)
+			t.Errorf("Daemon.Run does not call d.%s", want)
 		}
 	}
 }

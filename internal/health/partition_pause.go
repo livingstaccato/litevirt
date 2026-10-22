@@ -328,6 +328,10 @@ type PartitionPauser struct {
 	now          func() time.Time
 	after        time.Duration
 	tick         time.Duration
+	// resumeCursor is the Key of the last record a resume pass took on; the
+	// next pass starts after it (rotateAfter). Only the pauser's own loop
+	// touches it.
+	resumeCursor string
 	progress     atomic.Uint64 // Progress
 
 	mu sync.Mutex
@@ -489,22 +493,85 @@ func (p *PartitionPauser) Progress() uint64 { return p.progress.Load() }
 
 func (p *PartitionPauser) noteProgress() { p.progress.Add(1) }
 
-// partitionResumePassBudget bounds the resume and settle work of one pass.
-// Each record's work is bounded by its own call timeouts (a container settle
-// at most about 33 s), but nothing bounded their sum: after a heal, a pass
-// over a dozen relocated containers could run for minutes. What is not
-// reached before the budget is spent is left exactly as it was, still paused,
-// for the next pass.
-var partitionResumePassBudget = 30 * time.Second
+// partitionResumePassBudget bounds the resume and settle work of one pass to
+// E, the pause pass's own budget, so a healed pass delays the next quorum
+// sample by about E plus one record, as a pause pass does: the majority's
+// wait W already counts E (docs/design/partition-pause.md §4.1). Each record's
+// work is bounded by its own call timeouts (a container settle at most about
+// 33 s); the pass as a whole is bounded by the budget plus the one record
+// that overruns it. What the budget does not reach is left exactly as it
+// was, still paused, and the next pass starts there (resumeCursor), so a
+// record that is slow on every pass cannot starve the ones after it.
+var partitionResumePassBudget = PartitionPauseExecBudget
 
 // passBudgetLeft reports whether a pass begun at start may take on another
-// record, and counts the record as progress when it may.
-func (p *PartitionPauser) passBudgetLeft(start time.Time) bool {
-	if time.Since(start) >= partitionResumePassBudget {
+// record, and counts the record as progress when it may. The first record of
+// each loop is always taken (first), so every pass moves.
+func (p *PartitionPauser) passBudgetLeft(start time.Time, first bool) bool {
+	if !first && time.Since(start) >= partitionResumePassBudget {
 		return false
 	}
 	p.noteProgress()
 	return true
+}
+
+// majorityLost re-reads the quorum between the records of a resume pass. A
+// pass takes time, and the partition can come back during it (a flap, the
+// ordinary case just after a heal): the pass must not go on resuming behind
+// a majority that is gone again.
+func (p *PartitionPauser) majorityLost(ctx context.Context) bool {
+	st, _, _ := p.quorum(ctx)
+	return st != QuorumYes
+}
+
+// rotateAfter is recs (sorted by Key) starting at the first record after
+// cursor, wrapping around: where the last pass stopped.
+func rotateAfter(recs []PauseRecord, cursor string) []PauseRecord {
+	if cursor == "" {
+		return recs
+	}
+	i := sort.Search(len(recs), func(i int) bool { return recs[i].Key() > cursor })
+	return append(append([]PauseRecord{}, recs[i:]...), recs[:i]...)
+}
+
+// repause pauses again, at once, the workloads this pass resumed, when the
+// majority went away again before the pass ended. They were resumed on the
+// majority's word a moment ago; with it gone, the majority's own wait may be
+// running, and a copy resumed here could run beside its replacement.
+func (p *PartitionPauser) repause(recs []PauseRecord) {
+	for _, rec := range recs {
+		rec.PausedAt = p.now().UTC().Format(time.RFC3339)
+		rec.Reason = "the voter majority was lost again while this host was resuming"
+		var pause func() error
+		switch rec.Kind {
+		case PauseKindVM:
+			if p.vms == nil {
+				continue
+			}
+			name := rec.Name
+			pause = func() error { return p.vms.SuspendDomain(name) }
+		case PauseKindContainer:
+			if p.cts == nil {
+				continue
+			}
+			name := rec.Name
+			pause = func() error {
+				cctx, cancel := context.WithTimeout(context.Background(), partitionPauseCallTimeout)
+				defer cancel()
+				return p.cts.Freeze(cctx, name)
+			}
+		default:
+			continue
+		}
+		if err := p.pauseOne(rec, pause); err != nil {
+			slog.Error("partition-pause: could not pause again a workload resumed just before the majority was lost",
+				"kind", rec.Kind, "name", rec.Name, "host", p.host, "error", err)
+			p.raiseFailed(context.Background(), map[string]string{rec.Key(): err.Error()})
+			continue
+		}
+		slog.Warn("partition-pause: paused again a workload resumed just before the majority was lost",
+			"kind", rec.Kind, "name", rec.Name, "host", p.host)
+	}
 }
 
 // Evaluate is one pass. The quorum readings of the last 2·T_pause are kept,
@@ -894,6 +961,7 @@ func (p *PartitionPauser) tryResume(ctx context.Context, now time.Time) {
 	// One budget for the whole resume and settle tail (time.Now: monotonic,
 	// unlike p.now).
 	passStart := time.Now()
+	lost := false
 	// First, the record of any container settle not yet fully written: it
 	// may drop the pause record of the copy it settled.
 	p.retryPendingSettles(ctx, passStart)
@@ -907,12 +975,18 @@ func (p *PartitionPauser) tryResume(ctx context.Context, now time.Time) {
 		return
 	}
 	var candidates []PauseRecord
-	deferred := 0
-	for _, rec := range recs {
-		if !p.passBudgetLeft(passStart) {
+	deferred, handled := 0, 0
+	for _, rec := range rotateAfter(recs, p.resumeCursor) {
+		if !p.passBudgetLeft(passStart, handled == 0) {
 			deferred++
 			continue
 		}
+		if handled > 0 && p.majorityLost(ctx) {
+			lost = true
+			break
+		}
+		handled++
+		p.resumeCursor = rec.Key()
 		if ok, why := p.stillPausedByUs(rec); !ok {
 			// Resumed or stopped by someone else, gone, or replaced: the record
 			// would only keep partition_paused open and offer a stale epoch.
@@ -941,7 +1015,7 @@ func (p *PartitionPauser) tryResume(ctx context.Context, now time.Time) {
 		}
 		candidates = append(candidates, rec)
 	}
-	if len(candidates) > 0 {
+	if len(candidates) > 0 && !lost {
 		p.mu.Lock()
 		due := p.lastConfirm.IsZero() || now.Sub(p.lastConfirm) >= partitionResumeRecheck
 		if due {
@@ -953,7 +1027,11 @@ func (p *PartitionPauser) tryResume(ctx context.Context, now time.Time) {
 			if p.confirm != nil {
 				verdicts = p.confirm(ctx, candidates)
 			}
+			var resumed []PauseRecord
 			for _, rec := range candidates {
+				if lost {
+					break
+				}
 				v, ok := verdicts[rec.Key()]
 				switch {
 				case p.confirm == nil:
@@ -963,14 +1041,27 @@ func (p *PartitionPauser) tryResume(ctx context.Context, now time.Time) {
 				case !v.OK:
 					p.hold(rec, v.Reason)
 				default:
-					if !p.passBudgetLeft(passStart) {
+					if !p.passBudgetLeft(passStart, len(resumed) == 0) {
 						deferred++
 						continue
 					}
-					p.resume(ctx, rec, v.Reason)
+					if p.majorityLost(ctx) {
+						lost = true
+						continue
+					}
+					if p.resume(ctx, rec, v.Reason) {
+						resumed = append(resumed, rec)
+					}
 				}
 			}
+			if lost {
+				p.repause(resumed)
+			}
 		}
+	}
+	if lost {
+		slog.Warn("partition-pause: the voter majority was lost again during a resume pass; it stopped, and what it resumed is paused again",
+			"host", p.host)
 	}
 	if deferred > 0 {
 		slog.Info("partition-pause: this pass spent its budget; the rest stay paused for the next pass",
@@ -1072,25 +1163,26 @@ func (p *PartitionPauser) hold(rec PauseRecord, why string) {
 	}
 }
 
-// resume continues rec's workload and drops its record.
-func (p *PartitionPauser) resume(ctx context.Context, rec PauseRecord, why string) {
+// resume continues rec's workload and drops its record. It reports whether
+// the workload runs again.
+func (p *PartitionPauser) resume(ctx context.Context, rec PauseRecord, why string) bool {
 	switch rec.Kind {
 	case PauseKindVM:
 		if p.vms == nil {
 			p.hold(rec, "no libvirt backend on this host")
-			return
+			return false
 		}
 		st, err := p.vms.DomainStateReason(rec.Name)
 		if err == nil && st.Reason == "paused" {
 			if err := p.vms.ResumePartitionPaused(rec.Name, rec.DomainUUID); err != nil {
 				p.hold(rec, "resume failed: "+err.Error())
-				return
+				return false
 			}
 		}
 	case PauseKindContainer:
 		if p.cts == nil {
 			p.hold(rec, "no container runtime on this host")
-			return
+			return false
 		}
 		cctx, cancel := context.WithTimeout(ctx, partitionPauseCallTimeout)
 		err := p.cts.Unfreeze(cctx, rec.Name)
@@ -1098,10 +1190,10 @@ func (p *PartitionPauser) resume(ctx context.Context, rec PauseRecord, why strin
 		if err != nil {
 			if fs, ok := p.cts.(frozenStater); !ok {
 				p.hold(rec, "unfreeze failed: "+err.Error())
-				return
+				return false
 			} else if frozen, ferr := fs.IsFrozen(ctx, rec.Name); ferr != nil || frozen {
 				p.hold(rec, "unfreeze failed: "+err.Error())
-				return
+				return false
 			}
 		}
 	}
@@ -1113,6 +1205,7 @@ func (p *PartitionPauser) resume(ctx context.Context, rec PauseRecord, why strin
 	p.mu.Unlock()
 	slog.Warn("partition-pause: resumed workload", "kind", rec.Kind, "name", rec.Name,
 		"host", p.host, "reason", why)
+	return true
 }
 
 // ── conditions ──────────────────────────────────────────────────────────────

@@ -366,6 +366,7 @@ partition-pause: workload stays paused kind=vm name=d1a reason="voter node-4 has
 | `F` | 5 | consecutive failures for a fence vote (`FailuresToFence`) |
 | `Δ` | 1 s | pauser tick |
 | `E` | 5 s | bound on executing the pauses (per-call timeout, all workloads) |
+| `R` | `E` + one record | bound on a healed pass's resume and settle work, during which no quorum sample is taken: the pass takes on records only while within `E` (the first always), re-reads the quorum before each one, stops at once if the majority is gone, and pauses again what it resumed; the next pass starts where it stopped. One record is at most about 33 s (a container settle), a VM resume a libvirt call |
 
 **Minority detection, `D_M`.** Let `b` be the moment the link from the
 minority host M to a majority voter V breaks. M's first probe of V that starts

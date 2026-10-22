@@ -292,6 +292,36 @@ func Heartbeat(ctx context.Context, devPath string, interval time.Duration, ctrl
 // itself, and leaves the device armed so the reboot happens. Reaching here
 // ends the boot streak (KeepBootAlive).
 func HeartbeatFrom(ctx context.Context, devPath string, interval time.Duration, ctrl *Controller, pre *os.File) {
+	heartbeat(ctx, devPath, interval, ctrl, pre, ctrl.wiring())
+}
+
+// StartHeartbeat is HeartbeatFrom in a goroutine of its own, with ctrl's
+// wiring (the marker's directory, the DB probe, the threshold) read now, in
+// the caller: wiring set after this returns is not seen, so a caller that
+// starts the heartbeat before wiring it gets a heartbeat that pets past its
+// own self-fence marker, which its tests can then see. The pauser's progress
+// is read on every check, so it may be wired later.
+func StartHeartbeat(ctx context.Context, devPath string, interval time.Duration, ctrl *Controller, pre *os.File) {
+	w := ctrl.wiring()
+	go heartbeat(ctx, devPath, interval, ctrl, pre, w)
+}
+
+// controllerWiring is what the heartbeat reads from its controller at start.
+type controllerWiring struct {
+	runDir string
+	probe  func(context.Context) error
+	stale  time.Duration
+}
+
+func (c *Controller) wiring() controllerWiring {
+	if c == nil {
+		return controllerWiring{stale: -1}
+	}
+	probe, _, stale := c.liveness()
+	return controllerWiring{runDir: c.runDir, probe: probe, stale: stale}
+}
+
+func heartbeat(ctx context.Context, devPath string, interval time.Duration, ctrl *Controller, pre *os.File, w controllerWiring) {
 	// A non-empty devPath means the operator explicitly enabled watchdog
 	// fencing (and preflightWatchdog already validated the device exists). An
 	// empty path is the auto/optional case — fall back to the default device
@@ -304,10 +334,7 @@ func HeartbeatFrom(ctx context.Context, devPath string, interval time.Duration, 
 		interval = defaultInterval
 	}
 
-	var runDir string
-	if ctrl != nil {
-		runDir = ctrl.runDir
-	}
+	runDir := w.runDir
 	clearBootStreak(runDir)
 	f := pre
 	var err error
@@ -445,7 +472,7 @@ func HeartbeatFrom(ctx context.Context, devPath string, interval time.Duration, 
 
 	// Liveness gate (liveness.go): only on a configured, verified, armed
 	// watchdog.
-	gate := ctrl.startLivenessGate(ctx, interval, configured && ctrl.Armed())
+	gate := ctrl.startLivenessGate(ctx, interval, configured && ctrl.Armed(), w)
 	defer gate.stop()
 
 	ticker := time.NewTicker(interval)

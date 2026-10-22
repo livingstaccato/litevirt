@@ -106,6 +106,8 @@ type Daemon struct {
 	// watchdogRunDir holds the self-fence marker and the boot streak
 	// (watchdog.RunDir); "" in tests that build a Daemon by hand.
 	watchdogRunDir string
+	// watchdogCtrl is the heartbeat's controller (startWatchdog).
+	watchdogCtrl *watchdog.Controller
 
 	// buildServer replaces grpcapi.NewServer in newServer (tests, which have
 	// no libvirt); nil in a daemon.
@@ -226,9 +228,25 @@ func (d *Daemon) wireWatchdog(ctrl *watchdog.Controller) {
 	})
 }
 
-// wirePauserLiveness adds the partition pauser's progress to the gate.
-func wirePauserLiveness(ctrl *watchdog.Controller, pauser *health.PartitionPauser) {
-	ctrl.SetPauserProgress(pauser.Progress)
+// startWatchdog builds the heartbeat's controller, wires it (owned: the
+// shutdown ownership probe; wireWatchdog), and only then starts the
+// heartbeat on it, continuing on the descriptor boot has been petting
+// (bootUnderWatchdog) so the device is never closed between the two. The
+// order is load-bearing: the heartbeat reads its wiring when it starts, and
+// one started unwired would pet past this host's self-fence marker.
+func (d *Daemon) startWatchdog(ctx context.Context, owned func() bool) *watchdog.Controller {
+	ctrl := watchdog.NewController()
+	ctrl.SetOwnershipCheck(owned)
+	d.wireWatchdog(ctrl)
+	d.watchdogCtrl = ctrl
+	watchdog.StartHeartbeat(ctx, d.cfg.WatchdogDev, 0, ctrl, d.bootWatchdog.Handoff())
+	return ctrl
+}
+
+// wirePauserLiveness adds the partition pauser's progress to the gate of
+// the heartbeat startWatchdog started.
+func (d *Daemon) wirePauserLiveness(pauser *health.PartitionPauser) {
+	d.watchdogCtrl.SetPauserProgress(pauser.Progress)
 }
 
 // bootKeeperOptions are the boot keeper's bounds (watchdog.boot_keeper_*).
@@ -1127,7 +1145,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Start hardware watchdog heartbeat (optional). The controller lets Phase-2 VIP
 	// self-demotion trip a self-fence when a demotion can't be confirmed.
-	watchdogCtrl := watchdog.NewController()
 	// Clean-shutdown disarm hole (§B Phase 5): only a host that owns nothing may
 	// disarm on SIGTERM. A restart re-pets inside the timeout; a stop that
 	// abandons running workloads lets the watchdog reboot the host into a safely
@@ -1136,7 +1153,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// answer is overwhelmingly one with no runtime at all (containers-only or
 	// fresh hosts must not reboot on every daemon stop). VIP ownership is not
 	// yet probed here — Phase 5 adds it with the quorum-gated handoff.
-	watchdogCtrl.SetOwnershipCheck(func() bool {
+	watchdogCtrl := d.startWatchdog(ctx, func() bool {
 		if names, err := d.virt.ListRunningDomains(); err == nil && len(names) > 0 {
 			slog.Warn("watchdog: refusing shutdown disarm — running VMs owned", "count", len(names))
 			return true
@@ -1149,11 +1166,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		return false
 	})
-	d.wireWatchdog(watchdogCtrl)
-	// Continue on the descriptor boot has been petting (bootUnderWatchdog), so
-	// the device is never closed between the two. Taken here, not in the
-	// goroutine, so the deferred Abandon cannot race it.
-	go watchdog.HeartbeatFrom(ctx, d.cfg.WatchdogDev, 0, watchdogCtrl, d.bootWatchdog.Handoff())
 	// Central self-fence hard gate: once this node self-fences, the checker's Execution/
 	// DecisionGate fail closed regardless of quorum, so every gate consumer (reconciler,
 	// grpcapi server, failover coordinator) refuses runtime-ownership work during the
@@ -1895,7 +1907,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	pauser.SetSettleVerifier(svc.VerifySettleProof)
 	pauser.SetPeerRuntimeChecker(svc.CheckPeerContainerRuntime)
 	pauser.SetSelfFence(watchdogCtrl.Armed, watchdogCtrl.SelfFence)
-	wirePauserLiveness(watchdogCtrl, pauser)
+	d.wirePauserLiveness(pauser)
 	go pauser.Start(ctx)
 	// Persistent HA-degraded surface (unsupported member / unfenced demotion failure / VIP
 	// with no holder) — a durable alertable status + transition events.

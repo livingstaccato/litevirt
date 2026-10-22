@@ -97,7 +97,7 @@ func (c *Controller) SetLivenessStale(d time.Duration) {
 // pauser moves its counter at least once a second (its tick) and on every
 // record a pass handles, each record's work bounded by its own call timeouts
 // (at most 33 s for a container settle) and a pass's resume and settle work
-// by partitionResumePassBudget. A real wedge reboots the host within
+// by its budget (E) plus the one record that overruns it. A real wedge reboots the host within
 // 120 s + 60 s = 3 min.
 const DefaultLivenessStale = 120 * time.Second
 
@@ -152,8 +152,8 @@ type livenessGate struct {
 
 // startLivenessGate starts the DB probe loop when the gate applies. An
 // inactive gate's check always passes.
-func (c *Controller) startLivenessGate(ctx context.Context, interval time.Duration, applies bool) *livenessGate {
-	probe, _, stale := c.liveness()
+func (c *Controller) startLivenessGate(ctx context.Context, interval time.Duration, applies bool, w controllerWiring) *livenessGate {
+	probe, stale := w.probe, w.stale
 	g := &livenessGate{ctrl: c, stale: stale, cancel: func() {}}
 	if !applies || stale <= 0 {
 		return g

@@ -242,6 +242,9 @@ type settleRecorder struct {
 	// that could not be saved does not let a later live copy of the name drop
 	// the record.
 	provenStopped sync.Map
+	// retryCursor (kind → record file) is where the last budgeted retry pass
+	// stopped; the next starts after it. Only the owning loop touches it.
+	retryCursor map[string]string
 }
 
 // settleWaitLogEvery is how often a record still waiting on its copy is
@@ -443,9 +446,24 @@ func (w *settleRecorder) retry(ctx context.Context, kind string, state func(name
 		slog.Warn("partition-settle: pending-settle records unreadable", "kind", kind, "error", err)
 		return
 	}
+	if more != nil {
+		// A budgeted pass starts where the last one stopped, so one record
+		// that is slow on every pass cannot starve the rest.
+		sort.Slice(recs, func(i, j int) bool { return settleKey(recs[i]) < settleKey(recs[j]) })
+		if cur := w.retryCursor[kind]; cur != "" {
+			k := sort.Search(len(recs), func(i int) bool { return settleKey(recs[i]) > cur })
+			recs = append(append([]settlePending{}, recs[k:]...), recs[:k]...)
+		}
+	}
 	for i := range recs {
-		if more != nil && !more() {
-			return
+		if more != nil {
+			if !more() {
+				return
+			}
+			if w.retryCursor == nil {
+				w.retryCursor = map[string]string{}
+			}
+			w.retryCursor[kind] = settleKey(recs[i])
 		}
 		rec := &recs[i]
 		if rec.Host != w.host {
@@ -626,7 +644,20 @@ func (p *PartitionPauser) ctSettleCopyState(ctx context.Context, name string) (s
 // retryPendingSettles completes this host's container settle records
 // (settleRecorder.retry).
 func (p *PartitionPauser) retryPendingSettles(ctx context.Context, passStart time.Time) {
+	first := true
 	p.settleRec().retry(ctx, PauseKindContainer, func(name string) (settleCopyState, string) {
 		return p.ctSettleCopyState(ctx, name)
-	}, func() bool { return p.passBudgetLeft(passStart) })
+	}, func() bool {
+		ok := p.passBudgetLeft(passStart, first)
+		first = false
+		return ok
+	})
+}
+
+// settleKey orders pending-settle records for a budgeted pass.
+func settleKey(r settlePending) string {
+	if fn, err := settlePendingFile(r); err == nil {
+		return fn
+	}
+	return r.Kind + "/" + r.Name + "/" + r.AuditID
 }

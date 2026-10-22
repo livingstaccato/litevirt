@@ -132,6 +132,9 @@ type ppOpts struct {
 	// clocks replaces a node's health-checker clock, before it starts
 	// (frozenClock).
 	clocks map[string]func() time.Time
+	// vmBackend, when set, wraps a node's VM backend as its pauser sees it
+	// (a slow resume, a hook mid-pass).
+	vmBackend func(n *Node) health.PauseVMBackend
 }
 
 func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
@@ -154,7 +157,11 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		p := health.NewPartitionPauser(n.Name, dataDir, n.DB)
 		p.SetQuorum(chk.ExecutionQuorum)
 		p.SetEnabled(on.Load)
-		p.SetVMBackend(n.Virt)
+		if o.vmBackend != nil {
+			p.SetVMBackend(o.vmBackend(n))
+		} else {
+			p.SetVMBackend(n.Virt)
+		}
 		p.SetResumeConfirmer(n.Server.CheckPartitionResume)
 		p.SetTimings(ppTPause, 100*time.Millisecond)
 		if o.pauserOnNodeClock {

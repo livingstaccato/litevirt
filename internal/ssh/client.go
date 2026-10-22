@@ -1,7 +1,10 @@
 package ssh
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -46,21 +49,21 @@ func NewClientDeadline(target string, timeout time.Duration) (*Client, error) {
 
 func newClient(target string, timeout time.Duration, keepDeadline bool) (*Client, error) {
 	start := time.Now()
-	sshUser, host, port, userSet, portSet := parseTargetExplicit(target)
-
-	// ~/.ssh/config fills in only what the command line did not say. The ssh -G
-	// run counts against the caller's bound, not before it.
-	cfg, err := resolveConfig(host, sshUser, port, userSet, portSet, timeout)
+	// The ssh -G run counts against the caller's bound, not before it.
+	t, err := resolveTarget(target, timeout)
 	if err != nil {
 		return nil, err
 	}
-	if cfg == nil {
-		cfg = &resolved{Hostname: host, Port: port}
-	}
-	if cfg.User != "" {
-		sshUser = cfg.User
-	}
-	port = cfg.Port
+	return dialTarget(t, start, timeout, keepDeadline)
+}
+
+// NewClientResolved connects to a target already resolved with Resolve.
+func NewClientResolved(t *Target) (*Client, error) {
+	return dialTarget(t, time.Now(), 0, false)
+}
+
+func dialTarget(t *Target, start time.Time, timeout time.Duration, keepDeadline bool) (*Client, error) {
+	cfg, sshUser, host, port := t.cfg, t.user, t.host, t.port
 	dialHost := cfg.Hostname
 
 	auth, err := authMethodsFor(cfg.IdentityFiles, cfg.IdentitiesOnly)
@@ -337,9 +340,17 @@ func authMethodsFor(extraKeys []string, identitiesOnly bool) ([]ssh.AuthMethod, 
 
 	// Try SSH agent first
 	sock := os.Getenv("SSH_AUTH_SOCK")
-	if identitiesOnly {
-		tried = append(tried, "agent: skipped, IdentitiesOnly yes")
-	} else if sock == "" {
+	home, _ := os.UserHomeDir()
+	defaults := []string{
+		filepath.Join(home, ".ssh", "id_ed25519"),
+		filepath.Join(home, ".ssh", "id_ecdsa"),
+		filepath.Join(home, ".ssh", "id_rsa"),
+	}
+	identities := append(append([]string(nil), extraKeys...), defaults...)
+	if identitiesOnly && len(extraKeys) > 0 {
+		identities = extraKeys // ssh offers only the configured identities
+	}
+	if sock == "" {
 		tried = append(tried, "agent: SSH_AUTH_SOCK not set")
 	} else {
 		conn, err := net.Dial("unix", sock)
@@ -357,20 +368,36 @@ func authMethodsFor(extraKeys []string, identitiesOnly bool) ([]ssh.AuthMethod, 
 				tried = append(tried, "agent: connected but no keys loaded")
 			} else {
 				tried = append(tried, fmt.Sprintf("agent: %d key(s) available", len(keys)))
-				methods = append(methods, ssh.PublicKeysCallback(ac.Signers))
+				if identitiesOnly {
+					// As OpenSSH does: keep the agent, offer only its keys
+					// that match the identities (by public key, so a .pub
+					// IdentityFile whose private half lives in the agent works).
+					want := identityPublicKeys(identities)
+					tried = append(tried, fmt.Sprintf("agent: IdentitiesOnly yes, %d identity public key(s) to match", len(want)))
+					methods = append(methods, ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
+						all, err := ac.Signers()
+						if err != nil {
+							return nil, err
+						}
+						var keep []ssh.Signer
+						for _, sg := range all {
+							if want[string(sg.PublicKey().Marshal())] {
+								keep = append(keep, sg)
+							}
+						}
+						return keep, nil
+					}))
+				} else {
+					methods = append(methods, ssh.PublicKeysCallback(ac.Signers))
+				}
 			}
 		}
 	}
 
 	// Try default key files
-	home, _ := os.UserHomeDir()
-	keyFiles := append(append([]string(nil), extraKeys...),
-		filepath.Join(home, ".ssh", "id_ed25519"),
-		filepath.Join(home, ".ssh", "id_ecdsa"),
-		filepath.Join(home, ".ssh", "id_rsa"),
-	)
-	if identitiesOnly && len(extraKeys) > 0 {
-		keyFiles = extraKeys // ssh offers only the configured identities
+	keyFiles := identities
+	if !identitiesOnly {
+		keyFiles = append(append([]string(nil), extraKeys...), defaults...)
 	}
 	for _, kf := range keyFiles {
 		key, err := loadPrivateKey(kf)
@@ -389,6 +416,72 @@ func authMethodsFor(extraKeys []string, identitiesOnly bool) ([]ssh.AuthMethod, 
 	}
 
 	return methods, nil
+}
+
+// identityPublicKeys returns the marshalled public keys of the identity files,
+// read from <file>.pub, from the file itself when it holds a public key, or
+// from the cleartext public half of an OpenSSH private key (so a passphrase
+// protected key held by the agent still matches).
+func identityPublicKeys(paths []string) map[string]bool {
+	out := map[string]bool{}
+	for _, p := range paths {
+		for _, f := range []string{p + ".pub", p} {
+			data, err := os.ReadFile(f)
+			if err != nil {
+				continue
+			}
+			if k, _, _, _, err := ssh.ParseAuthorizedKey(data); err == nil {
+				out[string(k.Marshal())] = true
+				break
+			}
+			if k := openSSHPrivatePublic(data); k != nil {
+				out[string(k.Marshal())] = true
+				break
+			}
+		}
+	}
+	return out
+}
+
+// openSSHPrivatePublic extracts the public key stored in the clear in an
+// "openssh-key-v1" private key file, or nil.
+func openSSHPrivatePublic(data []byte) ssh.PublicKey {
+	blk, _ := pem.Decode(data)
+	if blk == nil || blk.Type != "OPENSSH PRIVATE KEY" {
+		return nil
+	}
+	b := blk.Bytes
+	const magic = "openssh-key-v1\x00"
+	if !bytes.HasPrefix(b, []byte(magic)) {
+		return nil
+	}
+	b = b[len(magic):]
+	readString := func() []byte {
+		if len(b) < 4 {
+			return nil
+		}
+		n := binary.BigEndian.Uint32(b)
+		if uint64(n) > uint64(len(b)-4) {
+			return nil
+		}
+		v := b[4 : 4+n]
+		b = b[4+n:]
+		return v
+	}
+	for i := 0; i < 3; i++ { // cipher, kdf, kdf options
+		if readString() == nil && len(b) < 4 {
+			return nil
+		}
+	}
+	if len(b) < 4 || binary.BigEndian.Uint32(b) < 1 {
+		return nil
+	}
+	b = b[4:]
+	k, err := ssh.ParsePublicKey(readString())
+	if err != nil {
+		return nil
+	}
+	return k
 }
 
 func joinLines(ss []string) string {

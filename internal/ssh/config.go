@@ -79,23 +79,40 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 	// Wrapper: the operator's config first (ssh keeps the first value it
 	// obtains), then a sentinel User for any host that config left without one.
 	var wrapper strings.Builder
+	haveConfig := false
+	defaultKH := ""
 	if home, err := os.UserHomeDir(); err == nil {
 		p := filepath.Join(home, ".ssh", "config")
 		if st, err := os.Stat(p); err == nil && st.Mode().IsRegular() {
 			fmt.Fprintf(&wrapper, "Include %q\n", p)
+			haveConfig = true
 		}
+		// ssh would default this to the passwd home; pin it to $HOME so the
+		// file lv checks is the one the rest of lv uses.
+		defaultKH = filepath.Join(home, ".ssh", "known_hosts")
 	}
 	wrapper.WriteString("Host *\n  User " + userSentinel + "\n")
+	if defaultKH != "" {
+		fmt.Fprintf(&wrapper, "  UserKnownHostsFile %q\n", defaultKH)
+	}
+	// An unreadable config must not silently drop what it pins (host-key
+	// files, StrictHostKeyChecking): with a config present, failing to read it
+	// refuses. With none, there is nothing to honour and the old defaults hold.
+	fail := func(err error) (*resolved, error) {
+		if haveConfig {
+			return nil, fmt.Errorf("cannot read ~/.ssh/config for %s: %w "+
+				"(lv reads it with `ssh -G`; fix the config, or move it aside to use lv's defaults)", host, err)
+		}
+		return nil, nil
+	}
 	f, err := os.CreateTemp("", "lv-sshcfg-*")
 	if err != nil {
-		warnf("not reading ~/.ssh/config for %s (%v); using defaults", host, err)
-		return nil, nil
+		return fail(err)
 	}
 	defer os.Remove(f.Name())
 	if _, err := f.WriteString(wrapper.String()); err != nil {
 		f.Close()
-		warnf("not reading ~/.ssh/config for %s (%v); using defaults", host, err)
-		return nil, nil
+		return fail(err)
 	}
 	f.Close()
 
@@ -109,8 +126,7 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 	args = append(args, "--", host)
 	out, err := sshG(timeout, args...)
 	if err != nil {
-		warnf("not reading ~/.ssh/config for %s (%v); using defaults", host, err)
-		return nil, nil
+		return fail(err)
 	}
 	got := parseSSHG(out)
 
@@ -161,7 +177,7 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 		r.StrictYes = true
 	}
 	for _, kh := range strings.Fields(strings.Join(got["userknownhostsfile"], " ")) {
-		if kh == "none" || kh == "~/.ssh/known_hosts" || kh == "~/.ssh/known_hosts2" {
+		if kh == "none" || kh == defaultKH {
 			continue
 		}
 		p, ok := expandIdentity(kh, host, r.Hostname, eff, r.Port)
@@ -175,20 +191,46 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 	return r, nil
 }
 
+// Target is a connection target resolved once through the ssh config. The
+// address a command records (certificate SAN, cluster address) and the address
+// the client dials come from the same Target, so they cannot differ.
+type Target struct {
+	user, host, port string
+	cfg              *resolved
+}
+
+// Resolve applies ~/.ssh/config to target once.
+func Resolve(target string) (*Target, error) { return resolveTarget(target, 0) }
+
+func resolveTarget(target string, timeout time.Duration) (*Target, error) {
+	u, host, port, userSet, portSet := parseTargetExplicit(target)
+	cfg, err := resolveConfig(host, u, port, userSet, portSet, timeout)
+	if err != nil {
+		return nil, err
+	}
+	if cfg == nil {
+		cfg = &resolved{Hostname: host, Port: port}
+	}
+	if cfg.User != "" {
+		u = cfg.User
+	}
+	return &Target{user: u, host: host, port: cfg.Port, cfg: cfg}, nil
+}
+
+// Host is the address that will be dialled: the config's HostName for an
+// alias, the given host otherwise.
+func (t *Target) Host() string { return t.cfg.Hostname }
+
 // ResolveHostName returns the address lv would dial for target once
 // ~/.ssh/config is applied: HostName for an alias, the given host otherwise.
 // Provisioning commands use it for the DNS step, the certificate SAN and the
 // recorded cluster address, so those and the dial name the same machine.
 func ResolveHostName(target string) (string, error) {
-	u, host, port, userSet, portSet := parseTargetExplicit(target)
-	r, err := resolveConfig(host, u, port, userSet, portSet, 0)
+	t, err := Resolve(target)
 	if err != nil {
 		return "", err
 	}
-	if r == nil {
-		return host, nil
-	}
-	return r.Hostname, nil
+	return t.Host(), nil
 }
 
 func isDefaultIdentity(p string) bool {

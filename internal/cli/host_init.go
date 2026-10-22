@@ -50,10 +50,11 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 	}
 	// The address is the one the ssh config gives this target, so the DNS step,
 	// the certificate SAN and the dial all name the same machine.
-	parsedHost, err = ssh.ResolveHostName(sshTarget)
+	rt, err := ssh.Resolve(sshTarget)
 	if err != nil {
 		return err
 	}
+	parsedHost = rt.Host()
 	hostAddr, err := resolveHost(parsedHost)
 	if err != nil {
 		return err
@@ -62,7 +63,7 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 	// Connect and inspect the target BEFORE anything is minted or pushed, so a
 	// refusal leaves both this machine's PKI dir and the target untouched.
 	slog.Info("connecting to host", "target", sshTarget)
-	sc, err := ssh.NewClient(sshTarget)
+	sc, err := ssh.NewClientResolved(rt)
 	if err != nil {
 		return fmt.Errorf("SSH connect: %w", err)
 	}

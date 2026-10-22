@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
 
@@ -353,17 +354,13 @@ func TestNewClient_UnusableKnownHostsFailsClosed(t *testing.T) {
 func TestResolveConfig_TimeoutBoundsMatchExec(t *testing.T) {
 	home, _ := sshHome(t, "id_ed25519")
 	writeSSHConfig(t, home, "Match exec \"sleep 25\"\n  User x\n")
-	var warned []string
-	old := warnf
-	warnf = func(f string, a ...any) { warned = append(warned, fmt.Sprintf(f, a...)) }
-	t.Cleanup(func() { warnf = old })
 	start := time.Now()
 	r, err := resolveConfig("labnode", "", "22", false, false, time.Second)
 	if el := time.Since(start); el > 6*time.Second {
 		t.Fatalf("resolveConfig took %v against a 1s bound", el)
 	}
-	if err != nil || r != nil || len(warned) == 0 {
-		t.Fatalf("r=%v err=%v warned=%v, want defaults and a warning", r, err, warned)
+	if err == nil || r != nil || !strings.Contains(err.Error(), "ssh -G") {
+		t.Fatalf("r=%v err=%v, want a refusal naming ssh -G (the config could not be read)", r, err)
 	}
 	start = time.Now()
 	_, _ = NewClientDeadline("labnode", time.Second)
@@ -411,9 +408,6 @@ func TestResolveConfig_IdentityTokensAndIdentitiesOnly(t *testing.T) {
 	if !r.IdentitiesOnly {
 		t.Fatal("IdentitiesOnly not read")
 	}
-	if _, err := authMethodsFor(nil, true); err == nil || !strings.Contains(err.Error(), "IdentitiesOnly") {
-		t.Fatalf("authMethodsFor(IdentitiesOnly) = %v, want the agent skipped by name", err)
-	}
 }
 
 func TestResolveHostName(t *testing.T) {
@@ -427,4 +421,154 @@ func TestResolveHostName(t *testing.T) {
 			t.Errorf("ResolveHostName(%q) = %q, %v; want %q", target, got, err, want)
 		}
 	}
+}
+
+// When ssh -G fails and a config exists, what the config pins must not be
+// silently dropped: refuse, naming ssh -G. With no config the defaults hold.
+func TestNewClient_SSHGFailureFailsClosed(t *testing.T) {
+	home, pub := sshHome(t, "id_ed25519")
+	srv := startFakeSSHD(t, pub)
+	pin := filepath.Join(home, "pinned_kh")
+	wrong, _ := ssh.NewPublicKey(mustEd25519(t))
+	os.WriteFile(pin, []byte(knownhosts.Line([]string{net.JoinHostPort("127.0.0.1", srv.port())}, wrong)+"\n"), 0o600)
+	old := sshG
+	sshG = func(time.Duration, ...string) ([]byte, error) { return nil, fmt.Errorf("simulated failure") }
+	t.Cleanup(func() { sshG = old })
+	target := "deploy@127.0.0.1:" + srv.port()
+
+	writeSSHConfig(t, home, "Host 127.0.0.1\n  UserKnownHostsFile "+pin+"\n  StrictHostKeyChecking yes\n")
+	if c, err := NewClient(target); err == nil || !strings.Contains(err.Error(), "ssh -G") {
+		if c != nil {
+			c.Close()
+		}
+		t.Fatalf("err = %v, want a refusal naming ssh -G", err)
+	}
+
+	os.Remove(filepath.Join(home, ".ssh", "config"))
+	c, err := NewClient(target)
+	if err != nil {
+		t.Fatalf("with no config the defaults must hold: %v", err)
+	}
+	c.Close()
+}
+
+// ssh -G time comes out of the NewClientDeadline bound.
+func TestNewClientDeadline_CountsConfigLookup(t *testing.T) {
+	sshHome(t, "id_ed25519")
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() { // accept, never speak
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+		}
+	}()
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	old := sshG
+	sshG = func(time.Duration, ...string) ([]byte, error) {
+		time.Sleep(800 * time.Millisecond)
+		return []byte("hostname 127.0.0.1\nport " + port + "\nuser __lv_unset__\n"), nil
+	}
+	t.Cleanup(func() { sshG = old })
+	start := time.Now()
+	_, err := NewClientDeadline("silent", time.Second)
+	if el := time.Since(start); err == nil || el > 1400*time.Millisecond {
+		t.Fatalf("NewClientDeadline(1s) took %v, err %v: ssh -G time not counted against the bound", el, err)
+	}
+}
+
+// The default known_hosts is the one under $HOME, never the passwd home's.
+func TestResolveConfig_DefaultKnownHostsIsHOME(t *testing.T) {
+	home, _ := sshHome(t, "id_ed25519")
+	writeSSHConfig(t, home, "Host h\n  Port 2200\n")
+	r, err := resolveConfig("h", "", "22", false, false, 0)
+	if err != nil || r == nil {
+		t.Fatalf("r=%v err=%v", r, err)
+	}
+	if len(r.KnownHosts) != 0 {
+		t.Fatalf("KnownHosts = %v, want none: the real user's known_hosts leaked in", r.KnownHosts)
+	}
+}
+
+// startAgent serves keys over a unix socket and exports it as SSH_AUTH_SOCK.
+func startAgent(t *testing.T, keys ...ed25519.PrivateKey) {
+	t.Helper()
+	kr := agent.NewKeyring()
+	for _, k := range keys {
+		if err := kr.Add(agent.AddedKey{PrivateKey: k}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sock := filepath.Join(os.Getenv("TMPDIR"), fmt.Sprintf("ag%d.sock", time.Now().UnixNano()%1000000))
+	al, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { al.Close() })
+	go func() {
+		for {
+			c, err := al.Accept()
+			if err != nil {
+				return
+			}
+			go agent.ServeAgent(kr, c)
+		}
+	}()
+	t.Setenv("SSH_AUTH_SOCK", sock)
+}
+
+// IdentitiesOnly filters the agent to the configured identities; it does not
+// drop the agent. Both setups work without the config and must with it.
+func TestNewClient_IdentitiesOnlyKeepsTheAgent(t *testing.T) {
+	t.Run("pub identity file, private key only in agent", func(t *testing.T) {
+		home, _ := sshHome(t, "unused")
+		pk, sk, _ := ed25519.GenerateKey(rand.Reader)
+		pub, _ := ssh.NewPublicKey(pk)
+		os.WriteFile(filepath.Join(home, ".ssh", "agentkey.pub"), ssh.MarshalAuthorizedKey(pub), 0o644)
+		startAgent(t, sk)
+		srv := startFakeSSHD(t, pub)
+		target := "deploy@127.0.0.1:" + srv.port()
+		writeSSHConfig(t, home, "Host 127.0.0.1\n  IdentitiesOnly yes\n  IdentityFile ~/.ssh/agentkey.pub\n")
+		c, err := NewClient(target)
+		if err != nil {
+			t.Fatalf("IdentitiesOnly + .pub identity with the key in the agent: %v", err)
+		}
+		c.Close()
+	})
+	t.Run("passphrase default key held by the agent", func(t *testing.T) {
+		home, _ := sshHome(t, "unused")
+		pk, sk, _ := ed25519.GenerateKey(rand.Reader)
+		pub, _ := ssh.NewPublicKey(pk)
+		blk, err := ssh.MarshalPrivateKeyWithPassphrase(sk, "", []byte("pw"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.WriteFile(filepath.Join(home, ".ssh", "id_ed25519"), pem.EncodeToMemory(blk), 0o600)
+		startAgent(t, sk)
+		srv := startFakeSSHD(t, pub)
+		writeSSHConfig(t, home, "Host *\n  IdentitiesOnly yes\n")
+		c, err := NewClient("deploy@127.0.0.1:" + srv.port())
+		if err != nil {
+			t.Fatalf("Host * IdentitiesOnly with an encrypted default key in the agent: %v", err)
+		}
+		c.Close()
+	})
+	t.Run("agent keys outside the identities are not offered", func(t *testing.T) {
+		home, _ := sshHome(t, "unused")
+		pk, sk, _ := ed25519.GenerateKey(rand.Reader)
+		pub, _ := ssh.NewPublicKey(pk)
+		startAgent(t, sk) // authorized on the server, but not an identity
+		srv := startFakeSSHD(t, pub)
+		other, _, _ := ed25519.GenerateKey(rand.Reader)
+		op, _ := ssh.NewPublicKey(other)
+		os.WriteFile(filepath.Join(home, ".ssh", "other.pub"), ssh.MarshalAuthorizedKey(op), 0o644)
+		writeSSHConfig(t, home, "Host 127.0.0.1\n  IdentitiesOnly yes\n  IdentityFile ~/.ssh/other.pub\n")
+		if c, err := NewClient("deploy@127.0.0.1:" + srv.port()); err == nil {
+			c.Close()
+			t.Fatal("an agent key that is not a configured identity was offered under IdentitiesOnly")
+		}
+	})
 }

@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/fencessh"
@@ -44,16 +46,29 @@ type ownViewClient struct {
 	hosts   []string
 	row     func(host string, now time.Time) (accepting bool, lastErr string)
 	fanOuts int
+	// evaluated is whether host proves a fresh evaluation for a
+	// re-evaluating read (nil: none does, as an older daemon); denyReevaluate
+	// refuses such a read as a non-admin's.
+	evaluated      func(host string) bool
+	denyReevaluate bool
+	reevaluations  int
 }
 
 func (c *ownViewClient) GetFenceSSHStatus(_ context.Context, req *pb.FenceSSHStatusRequest, _ ...grpc.CallOption) (*pb.FenceSSHStatus, error) {
 	if req.GetFanOut() {
 		c.fanOuts++
 	}
+	if req.GetReevaluate() {
+		if c.denyReevaluate {
+			return nil, status.Error(codes.PermissionDenied, `role "admin" required, caller has "operator"`)
+		}
+		c.reevaluations++
+	}
 	st := &pb.FenceSSHStatus{}
 	for _, h := range c.hosts {
 		acc, lastErr := c.row(h, c.clock.now())
-		st.Nodes = append(st.Nodes, &pb.FenceSSHNode{Host: h, Reachable: true, LastError: lastErr, Peers: []*pb.FenceSSHPeer{
+		ev := req.GetReevaluate() && c.evaluated != nil && c.evaluated(h)
+		st.Nodes = append(st.Nodes, &pb.FenceSSHNode{Host: h, Reachable: true, LastError: lastErr, EvaluatedForRequest: ev, Peers: []*pb.FenceSSHPeer{
 			{Host: h, Row: fencessh.RowVerified, Accepting: acc, Address: "10.78.0.9", Path: fencessh.PathSelf}}})
 		if !req.GetFanOut() {
 			break
@@ -182,5 +197,87 @@ func TestInstallFenceSSH_WaitShorterThanFreshnessRefusesUpFront(t *testing.T) {
 	err := InstallFenceSSH(context.Background(), &ownViewClient{clock: clk}, []FenceSSHHost{h}, map[string]string{"node-1": h.addr}, opt)
 	if err == nil || h.ran {
 		t.Fatalf("--wait 1m against a 2m freshness: err %v, host touched %v", err, h.ran)
+	}
+}
+
+// TestInstallFenceSSH_EvaluatedHostConfirmsAtOnce: a host that proves an
+// evaluation made for the read confirms on the first read, long before the
+// freshness bound; one that does not (an older daemon) in the same run still
+// waits the bound out. A false is never confirmation.
+//
+// Mutations: confirm on freshness alone (ignore evaluated_for_request): the
+// run waits the bound, red; treat every answer as evaluated: the old host
+// confirms early, red; send no reevaluate: red.
+func TestInstallFenceSSH_EvaluatedHostConfirmsAtOnce(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	start := clk.t
+	var oldSeen []time.Duration
+	c := &ownViewClient{clock: clk, hosts: []string{"node-new"},
+		row:       func(string, time.Time) (bool, string) { return true, "" },
+		evaluated: func(h string) bool { return h == "node-new" }}
+	h := &scriptedFenceSSHHost{name: "node-new", addr: "10.78.0.1", result: fencessh.ResultInstalled}
+	var out bytes.Buffer
+	if err := InstallFenceSSH(context.Background(), c, []FenceSSHHost{h}, map[string]string{"node-new": h.addr}, confirmOpts(&out, clk)); err != nil {
+		t.Fatalf("InstallFenceSSH: %v\n%s", err, out.String())
+	}
+	if d := clk.t.Sub(start); d != 0 || c.reevaluations != 1 {
+		t.Fatalf("a host that proved its evaluation confirmed after %s and %d re-evaluating reads, want at once", d, c.reevaluations)
+	}
+
+	// Mixed: node-old answers evaluated_for_request=false (an older daemon).
+	clk.t = start
+	c = &ownViewClient{clock: clk, hosts: []string{"node-new", "node-old"},
+		row: func(h string, now time.Time) (bool, string) {
+			if h == "node-old" {
+				oldSeen = append(oldSeen, now.Sub(start))
+			}
+			return true, ""
+		},
+		evaluated: func(h string) bool { return h == "node-new" }}
+	hn := &scriptedFenceSSHHost{name: "node-new", addr: "10.78.0.1", result: fencessh.ResultInstalled}
+	ho := &scriptedFenceSSHHost{name: "node-old", addr: "10.78.0.2", result: fencessh.ResultInstalled}
+	out.Reset()
+	if err := InstallFenceSSH(context.Background(), c, []FenceSSHHost{hn, ho},
+		map[string]string{"node-new": hn.addr, "node-old": ho.addr}, confirmOpts(&out, clk)); err != nil {
+		t.Fatalf("mixed: %v\n%s", err, out.String())
+	}
+	if d := clk.t.Sub(start); d < 2*time.Minute {
+		t.Fatalf("mixed: confirmed %s after the install; node-old proved nothing and its bound is 2m", d)
+	}
+
+	// The old host alone, with a wait that ends before its bound: fails.
+	clk.t = start
+	c.hosts = []string{"node-old"}
+	opt := confirmOpts(&out, clk)
+	opt.Wait = 2*time.Minute + time.Second
+	opt.FreshAfter = 2 * time.Minute
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	opt.pause = func(context.Context, time.Duration) error { cancel(); return context.Canceled }
+	if err := InstallFenceSSH(ctx, c, []FenceSSHHost{ho}, map[string]string{"node-old": ho.addr}, opt); err == nil {
+		t.Fatalf("an older daemon's false confirmed on the first read:\n%s", out.String())
+	}
+}
+
+// TestInstallFenceSSH_NonAdminFallsBackToTheBound: a credential refused a
+// re-evaluation (not an admin) is not a failure: the run falls back to the
+// freshness bound, and still confirms only after it.
+//
+// Mutation: abort on the refusal instead of falling back: red.
+func TestInstallFenceSSH_NonAdminFallsBackToTheBound(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	start := clk.t
+	c := &ownViewClient{clock: clk, hosts: []string{"node-1"}, denyReevaluate: true,
+		row: func(string, time.Time) (bool, string) { return true, "" }, evaluated: func(string) bool { return true }}
+	h := &scriptedFenceSSHHost{name: "node-1", addr: "10.78.0.1", result: fencessh.ResultInstalled}
+	var out bytes.Buffer
+	if err := InstallFenceSSH(context.Background(), c, []FenceSSHHost{h}, map[string]string{"node-1": h.addr}, confirmOpts(&out, clk)); err != nil {
+		t.Fatalf("InstallFenceSSH: %v\n%s", err, out.String())
+	}
+	if d := clk.t.Sub(start); d < 2*time.Minute {
+		t.Fatalf("confirmed %s after the install without a re-evaluation", d)
+	}
+	if !strings.Contains(out.String(), "may not ask hosts to re-evaluate") {
+		t.Fatalf("the fallback is not explained:\n%s", out.String())
 	}
 }

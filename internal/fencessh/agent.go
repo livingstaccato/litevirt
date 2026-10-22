@@ -60,6 +60,8 @@ type Config struct {
 	ProbeInterval time.Duration
 	// SyncInterval is how often Run syncs (RenderInterval when zero).
 	SyncInterval time.Duration
+	// ReevaluateTimeout bounds one Reevaluate (ReevaluateTimeout when zero).
+	ReevaluateTimeout time.Duration
 	// SelfCheck: before publishing that it accepts the managed key, the host
 	// logs in to its own sshd over it (its own key, rendered for its own
 	// address, and a check request), so the claim is about the RUNNING sshd,
@@ -89,6 +91,8 @@ type Agent struct {
 	probes  map[string]ProbeResult
 	// syncMu serialises Sync.
 	syncMu sync.Mutex
+	// reeval coalesces Reevaluate's fresh syncs (reevaluate.go).
+	reeval reevalQueue
 }
 
 // ProbeResult is one peer's last managed-path check.
@@ -442,8 +446,9 @@ func (a *Agent) peerAddresses(ctx context.Context, peers []*Verified, self net.I
 // sshd itself. err is an evaluation that could not be made.
 func (a *Agent) sshdAccepting(ctx context.Context, addrs []string, self *x509.Certificate) (bool, string, error) {
 	key := strings.Join(addrs, ",")
+	fresh := freshSyncOf(ctx)
 	a.mu.Lock()
-	if key == a.acceptPeers && time.Now().Before(a.acceptUntil) {
+	if fresh == nil && key == a.acceptPeers && time.Now().Before(a.acceptUntil) {
 		ok, why, err := a.accepting, a.acceptWhy, a.acceptErr
 		a.mu.Unlock()
 		return ok, why, err
@@ -462,6 +467,7 @@ func (a *Agent) sshdAccepting(ctx context.Context, addrs []string, self *x509.Ce
 	a.mu.Lock()
 	a.accepting, a.acceptWhy, a.acceptErr, a.acceptPeers, a.acceptUntil = ok, why, err, key, time.Now().Add(acceptTTL)
 	a.mu.Unlock()
+	fresh.evaluated(err)
 	return ok, why, err
 }
 
@@ -564,6 +570,7 @@ func (a *Agent) publish(ctx context.Context, self *x509.Certificate, signer cryp
 	}
 	if ours && PublicationOf(prev) == p {
 		if _, err := Verify(prev, tr); err == nil {
+			freshSyncOf(ctx).published()
 			return nil
 		}
 	}
@@ -579,6 +586,7 @@ func (a *Agent) publish(ctx context.Context, self *x509.Certificate, signer cryp
 		return fmt.Errorf("publish this host's fence ssh row: %w", err)
 	}
 	a.setGenerationHighWater(p.Generation)
+	freshSyncOf(ctx).published()
 	slog.Info("fence ssh: published this host's row", "generation", p.Generation, "accepting", accepting,
 		"detail", why, "serial", strings.ToLower(self.SerialNumber.Text(16)))
 	return nil

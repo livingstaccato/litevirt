@@ -10,6 +10,9 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/fencessh"
 	"github.com/litevirt/litevirt/internal/ssh"
@@ -49,13 +52,21 @@ const fenceSSHResultMarker = "lv-fence-ssh-result: "
 // fenceSSHPoll is how often InstallFenceSSH reads the hosts' own rows.
 const fenceSSHPoll = 5 * time.Second
 
+// fenceSSHStatusCall bounds one re-evaluating status read: each host's own
+// re-evaluation (fencessh.ReevaluateTimeout), the fan-out's peer read after
+// it, and the call itself.
+const fenceSSHStatusCall = fencessh.ReevaluateTimeout + 30*time.Second
+
 // InstallFenceSSH gives every host's sshd the managed fence SSH drop-in, as
 // `lv host init` and `lv host add` do for a new host: the migration of an
 // existing cluster (docs/migration-failover.md "Managed fence SSH"). Each host
 // is evaluated for a fence from every other host's address. It then waits
-// until every host's own row, read late enough to reflect an evaluation of
-// its sshd made after this run changed it, reports accepting, and prints what
-// each host reports. It fails when any host's script refused or did not
+// until every host's own row, reflecting an evaluation of its sshd made after
+// this run changed it, reports accepting, and prints what each host reports.
+// A host proves that evaluation by answering a re-evaluating read
+// (FenceSSHStatusRequest.reevaluate) with evaluated_for_request, which takes
+// seconds; a host that does not (an older daemon, a wedged agent, a caller
+// who is not an admin) counts only rows read FreshAfter after its install. It fails when any host's script refused or did not
 // reload sshd, and when any host does not confirm before the wait ends: a row
 // that predates the run (it can say accepting for a minute or more after a
 // --remove) never counts.
@@ -147,11 +158,22 @@ func InstallFenceSSH(ctx context.Context, c pb.LiteVirtClient, hosts []FenceSSHH
 		return nil
 	}
 	fmt.Fprintf(opt.Out, "Waiting up to %s for every host to report that its sshd accepts the managed fence key\n"+
-		"(a host's row counts once it is %s newer than its install)...\n", opt.Wait, opt.FreshAfter)
+		"(each host re-evaluates its sshd on request; one that cannot prove it did counts its row once it is\n"+
+		"%s newer than its install)...\n", opt.Wait, opt.FreshAfter)
 	deadline := opt.now().Add(opt.Wait)
 	var why map[string]string
+	reevaluate := true
 	for {
-		st, err := c.GetFenceSSHStatus(ctx, &pb.FenceSSHStatusRequest{FanOut: true})
+		cctx, cancel := context.WithTimeout(ctx, fenceSSHStatusCall)
+		st, err := c.GetFenceSSHStatus(cctx, &pb.FenceSSHStatusRequest{FanOut: true, Reevaluate: reevaluate})
+		cancel()
+		if reevaluate && status.Code(err) == codes.PermissionDenied {
+			// Only an admin may have hosts re-evaluate; anyone else waits.
+			fmt.Fprintf(opt.Out, "This credential may not ask hosts to re-evaluate their sshd (%v);\n"+
+				"waiting for rows %s newer than each install instead.\n", status.Convert(err).Message(), opt.FreshAfter)
+			reevaluate = false
+			continue
+		}
 		if err != nil {
 			return fmt.Errorf("read the hosts' fence ssh rows: %w", err)
 		}
@@ -189,8 +211,11 @@ func InstallFenceSSH(ctx context.Context, c pb.LiteVirtClient, hosts []FenceSSHH
 
 // fenceSSHUnconfirmed is, for each host that does not confirm yet, why: a
 // host confirms only by its own view of its own row (no replication lag),
-// read at least freshAfter after its install finished, from an agent whose
-// last sync succeeded, verified and accepting.
+// from an agent whose last sync succeeded, verified and accepting, and
+// either evaluated for this very read (evaluated_for_request: the read was
+// sent after the install finished, and the host's evaluation began after the
+// read reached it) or read at least freshAfter after its install finished.
+// evaluated_for_request false is never proof: it is the old path.
 func fenceSSHUnconfirmed(st *pb.FenceSSHStatus, hosts []FenceSSHHost, doneAt map[string]time.Time, now time.Time, freshAfter time.Duration) map[string]string {
 	own := map[string]*pb.FenceSSHNode{}
 	for _, n := range st.GetNodes() {
@@ -217,8 +242,9 @@ func fenceSSHUnconfirmed(st *pb.FenceSSHStatus, hosts []FenceSSHHost, doneAt map
 			why[name] = "no fence ssh row yet (the release must have latched and its daemon be up)"
 		case p.GetRow() != fencessh.RowVerified:
 			why[name] = fmt.Sprintf("row %s: %s", p.GetRow(), p.GetRowDetail())
-		case now.Sub(doneAt[name]) < freshAfter:
-			why[name] = "its row predates the install's evaluation by its daemon"
+		case !n.GetEvaluatedForRequest() && now.Sub(doneAt[name]) < freshAfter:
+			why[name] = fmt.Sprintf("its row may predate the install: it proved no evaluation for this read (an older "+
+				"daemon, or its agent did not finish one in time), and it counts only once %s has passed", freshAfter)
 		case !p.GetAccepting():
 			why[name] = "not accepting: " + p.GetRowDetail()
 		}

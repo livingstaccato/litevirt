@@ -166,8 +166,10 @@ lv host install-gossip-key                # Put the cluster gossip key on every 
                                           #   gossip stage. See auth.md "Gossip encryption"
 lv host install-fence-ssh                 # Give every host's sshd the managed fence SSH drop-in (an
   [--host <name>]... [--ssh-user root]    #   existing cluster; init and add do it for a new host), then
-  [--remove] [--wait 3m]                  #   wait until each reports accepting the managed fence key.
-                                          #   See migration-failover.md "Managed fence SSH"
+  [--remove] [--wait 3m]                  #   wait until each reports accepting the managed fence key
+                                          #   (seconds when each host re-evaluates for an admin; about
+                                          #   2m from an older daemon). See migration-failover.md
+                                          #   "Managed fence SSH"
 lv host install-migration-tls             # Issue every host the migration-TLS credentials that
   [--reissue] [--ssh-user root]           #   encrypt storage migrations (mints the migration CA if
                                           #   none). See migration-failover.md "Migration with local disks"

@@ -45739,10 +45739,15 @@ func (x *PreflightRecreateVMRequest) GetSpec() *VMSpec {
 }
 
 // FenceSSHStatusRequest: fan_out asks the answering host to collect every
-// other live host's own view as well.
+// other live host's own view as well. reevaluate (admin only) has every host
+// answering run one fresh sync of its fence ssh agent, which evaluates its
+// sshd anew (no cached evaluation) and logs in to it, before it answers; the
+// fan-out passes it on. An older host ignores it and answers
+// evaluated_for_request=false.
 type FenceSSHStatusRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	FanOut        bool                   `protobuf:"varint,1,opt,name=fan_out,json=fanOut,proto3" json:"fan_out,omitempty"`
+	Reevaluate    bool                   `protobuf:"varint,2,opt,name=reevaluate,proto3" json:"reevaluate,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -45780,6 +45785,13 @@ func (*FenceSSHStatusRequest) Descriptor() ([]byte, []int) {
 func (x *FenceSSHStatusRequest) GetFanOut() bool {
 	if x != nil {
 		return x.FanOut
+	}
+	return false
+}
+
+func (x *FenceSSHStatusRequest) GetReevaluate() bool {
+	if x != nil {
+		return x.Reevaluate
 	}
 	return false
 }
@@ -45945,13 +45957,19 @@ type FenceSSHNode struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Host  string                 `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`
 	// reachable=false: the host did not answer, and its view is unknown.
-	Reachable     bool            `protobuf:"varint,2,opt,name=reachable,proto3" json:"reachable,omitempty"`
-	Error         string          `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
-	Mode          string          `protobuf:"bytes,4,opt,name=mode,proto3" json:"mode,omitempty"`                            // its enforcement.fence_ssh: managed | auto | legacy
-	LastError     string          `protobuf:"bytes,5,opt,name=last_error,json=lastError,proto3" json:"last_error,omitempty"` // its agent's last sync failure
-	Peers         []*FenceSSHPeer `protobuf:"bytes,6,rep,name=peers,proto3" json:"peers,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Reachable bool            `protobuf:"varint,2,opt,name=reachable,proto3" json:"reachable,omitempty"`
+	Error     string          `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
+	Mode      string          `protobuf:"bytes,4,opt,name=mode,proto3" json:"mode,omitempty"`                            // its enforcement.fence_ssh: managed | auto | legacy
+	LastError string          `protobuf:"bytes,5,opt,name=last_error,json=lastError,proto3" json:"last_error,omitempty"` // its agent's last sync failure
+	Peers     []*FenceSSHPeer `protobuf:"bytes,6,rep,name=peers,proto3" json:"peers,omitempty"`
+	// evaluated_for_request: with reevaluate, this host's agent ran a sync
+	// that STARTED after this request reached it, evaluated its sshd in that
+	// sync (no cached or failed evaluation), and published its row or found
+	// it identical, before it answered. false is no proof either way: an
+	// older host, a timeout, a failed sync, or no reevaluate asked.
+	EvaluatedForRequest bool `protobuf:"varint,7,opt,name=evaluated_for_request,json=evaluatedForRequest,proto3" json:"evaluated_for_request,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *FenceSSHNode) Reset() {
@@ -46024,6 +46042,13 @@ func (x *FenceSSHNode) GetPeers() []*FenceSSHPeer {
 		return x.Peers
 	}
 	return nil
+}
+
+func (x *FenceSSHNode) GetEvaluatedForRequest() bool {
+	if x != nil {
+		return x.EvaluatedForRequest
+	}
+	return false
 }
 
 type FenceSSHStatus struct {
@@ -49783,9 +49808,12 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"load_error\x18\x04 \x01(\tR\tloadError\"E\n" +
 	"\x1aPreflightRecreateVMRequest\x12'\n" +
-	"\x04spec\x18\x01 \x01(\v2\x13.litevirt.v1.VMSpecR\x04spec\"0\n" +
+	"\x04spec\x18\x01 \x01(\v2\x13.litevirt.v1.VMSpecR\x04spec\"P\n" +
 	"\x15FenceSSHStatusRequest\x12\x17\n" +
-	"\afan_out\x18\x01 \x01(\bR\x06fanOut\"\x9b\x03\n" +
+	"\afan_out\x18\x01 \x01(\bR\x06fanOut\x12\x1e\n" +
+	"\n" +
+	"reevaluate\x18\x02 \x01(\bR\n" +
+	"reevaluate\"\x9b\x03\n" +
 	"\fFenceSSHPeer\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x10\n" +
 	"\x03row\x18\x02 \x01(\tR\x03row\x12\x1d\n" +
@@ -49806,7 +49834,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x06probed\x18\v \x01(\bR\x06probed\x12\x19\n" +
 	"\bprobe_ok\x18\f \x01(\bR\aprobeOk\x12!\n" +
 	"\fprobe_detail\x18\r \x01(\tR\vprobeDetail\x12\x1b\n" +
-	"\tprobed_at\x18\x0e \x01(\tR\bprobedAt\"\xba\x01\n" +
+	"\tprobed_at\x18\x0e \x01(\tR\bprobedAt\"\xee\x01\n" +
 	"\fFenceSSHNode\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x1c\n" +
 	"\treachable\x18\x02 \x01(\bR\treachable\x12\x14\n" +
@@ -49814,7 +49842,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04mode\x18\x04 \x01(\tR\x04mode\x12\x1d\n" +
 	"\n" +
 	"last_error\x18\x05 \x01(\tR\tlastError\x12/\n" +
-	"\x05peers\x18\x06 \x03(\v2\x19.litevirt.v1.FenceSSHPeerR\x05peers\"d\n" +
+	"\x05peers\x18\x06 \x03(\v2\x19.litevirt.v1.FenceSSHPeerR\x05peers\x122\n" +
+	"\x15evaluated_for_request\x18\a \x01(\bR\x13evaluatedForRequest\"d\n" +
 	"\x0eFenceSSHStatus\x12/\n" +
 	"\x05nodes\x18\x01 \x03(\v2\x19.litevirt.v1.FenceSSHNodeR\x05nodes\x12!\n" +
 	"\fgenerated_at\x18\x02 \x01(\tR\vgeneratedAt*V\n" +

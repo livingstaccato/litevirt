@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"sync"
 	"time"
@@ -12,29 +13,66 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fencessh"
 )
 
 // fenceSSHPeerTimeout bounds one peer's answer to a fanned-out status read.
 const fenceSSHPeerTimeout = 10 * time.Second
 
+// fenceSSHReevaluatePeerTimeout bounds one peer's answer to a fanned-out
+// re-evaluation: its agent's own bound, and the status read after it.
+const fenceSSHReevaluatePeerTimeout = fencessh.ReevaluateTimeout + fenceSSHPeerTimeout
+
 // GetFenceSSHStatus is this host's view of managed fence SSH and, with
 // fan_out, every other live host's own view (`lv doctor fence`). A diagnostic:
 // nothing decides on it.
+//
+// With reevaluate (admin: each answering host logs in to its own sshd), each
+// host answers only after one fresh sync of its agent that started after the
+// request reached it (fencessh.Agent.Reevaluate), and sets
+// evaluated_for_request when that sync proves its row. `lv host
+// install-fence-ssh` confirms a host in seconds on it; an older host leaves it
+// false, and the CLI then waits out fencessh.RowFreshAfter instead.
 func (s *Server) GetFenceSSHStatus(ctx context.Context, req *pb.FenceSSHStatusRequest) (*pb.FenceSSHStatus, error) {
 	if err := RequireRole(ctx, "viewer"); err != nil {
 		return nil, err
 	}
+	reevaluate := req.GetReevaluate()
+	if reevaluate {
+		if err := RequireRole(ctx, "admin"); err != nil {
+			return nil, err
+		}
+	}
+	var hosts []corrosion.HostRecord
+	if req.GetFanOut() {
+		var err error
+		if hosts, err = corrosion.ListHosts(ctx, s.db); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "list hosts: %v", err)
+		}
+	}
 	out := &pb.FenceSSHStatus{GeneratedAt: time.Now().UTC().Format(time.RFC3339)}
-	out.Nodes = append(out.Nodes, s.ownFenceSSHNode(ctx))
-	if !req.GetFanOut() {
-		return out, nil
-	}
-	hosts, err := corrosion.ListHosts(ctx, s.db)
-	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "list hosts: %v", err)
-	}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
+	add := func(n *pb.FenceSSHNode) {
+		mu.Lock()
+		out.Nodes = append(out.Nodes, n)
+		mu.Unlock()
+	}
+	// This host re-evaluates alongside its peers, not before them.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		evaluated := false
+		if reevaluate && s.fenceSSH != nil {
+			var why string
+			if evaluated, why = s.fenceSSH.Reevaluate(ctx); !evaluated {
+				slog.Info("fence ssh: a requested re-evaluation proved nothing", "why", why)
+			}
+		}
+		n := s.ownFenceSSHNode(ctx)
+		n.EvaluatedForRequest = evaluated && n.GetError() == ""
+		add(n)
+	}()
 	for _, h := range hosts {
 		if h.Name == s.hostName {
 			continue
@@ -42,10 +80,7 @@ func (s *Server) GetFenceSSHStatus(ctx context.Context, req *pb.FenceSSHStatusRe
 		wg.Add(1)
 		go func(name string) {
 			defer wg.Done()
-			n := s.peerFenceSSHNode(ctx, name)
-			mu.Lock()
-			out.Nodes = append(out.Nodes, n)
-			mu.Unlock()
+			add(s.peerFenceSSHNode(ctx, name, reevaluate))
 		}(h.Name)
 	}
 	wg.Wait()
@@ -79,16 +114,22 @@ func (s *Server) ownFenceSSHNode(ctx context.Context) *pb.FenceSSHNode {
 	return n
 }
 
-// peerFenceSSHNode asks host for its own view.
-func (s *Server) peerFenceSSHNode(ctx context.Context, host string) *pb.FenceSSHNode {
-	pctx, cancel := context.WithTimeout(ctx, fenceSSHPeerTimeout)
+// peerFenceSSHNode asks host for its own view, re-evaluated when reevaluate
+// says so. Only host's own answer sets evaluated_for_request: an older host
+// does not know the field and leaves it false.
+func (s *Server) peerFenceSSHNode(ctx context.Context, host string, reevaluate bool) *pb.FenceSSHNode {
+	timeout := fenceSSHPeerTimeout
+	if reevaluate {
+		timeout = fenceSSHReevaluatePeerTimeout
+	}
+	pctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	c, closeConn, err := s.dialPeer(pctx, host)
 	if err != nil {
 		return &pb.FenceSSHNode{Host: host, Error: fmt.Sprintf("dial: %v", err)}
 	}
 	defer closeConn()
-	resp, err := c.GetFenceSSHStatus(pctx, &pb.FenceSSHStatusRequest{})
+	resp, err := c.GetFenceSSHStatus(pctx, &pb.FenceSSHStatusRequest{Reevaluate: reevaluate})
 	if err != nil {
 		if status.Code(err) == codes.Unimplemented {
 			return &pb.FenceSSHNode{Host: host, Reachable: true, Error: "its build predates managed fence ssh"}

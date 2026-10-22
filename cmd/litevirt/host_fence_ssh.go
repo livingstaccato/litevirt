@@ -35,9 +35,12 @@ and rolled back on a refusal, and never overrides PermitRootLogin no.
 
 With --host, exactly the named hosts are changed; a name the cluster does not list
 changes nothing. The command fails when a host's sshd refused the change or was not
-reloaded. It then waits until every host it changed reports, in its own row and
-read long enough after the change to reflect it (about two minutes), that it accepts
-the managed key, and fails for any host that does not. Fences in
+reloaded. It then waits until every host it changed reports, in its own row, that it
+accepts the managed key, and fails for any host that does not. Each host re-evaluates
+its sshd for the request (logging in to it over the managed key) and proves it did, so
+that takes seconds; this needs an admin credential. A host that cannot prove it (an
+older daemon, an agent that did not finish in time) or a credential that may not ask
+counts only a row read long enough after the change to reflect it (about two minutes). Fences in
 the default mode (enforcement.fence_ssh: auto) then take the managed path toward
 each host that does. Check the probe matrix with 'lv doctor fence', then set
 enforcement.fence_ssh: managed on each host. Hand-made fence keys and root's ssh

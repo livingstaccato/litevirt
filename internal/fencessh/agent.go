@@ -162,11 +162,14 @@ const RenderInterval = 30 * time.Second
 const acceptTTL = time.Minute
 
 // RowFreshAfter is how long after a change to a host's sshd its own row is
-// sure to reflect an sshd evaluation that began after the change, while its
-// agent syncs: an evaluation in flight at the change (its self-check bounded
-// by probeTimeout) stands for acceptTTL, the next sync starts within
-// RenderInterval, and its own evaluation and publish take up to probeTimeout.
-// `lv host install-fence-ssh` counts no row it read sooner.
+// expected to reflect an sshd evaluation that began after the change, while
+// its agent syncs on schedule: an evaluation in flight at the change (its
+// self-check bounded by probeTimeout) stands for acceptTTL, the next sync
+// starts within RenderInterval, and its own evaluation and publish take about
+// probeTimeout. It is an estimate, not a bound: the sshd -T calls, the
+// replicated write and a sync that overruns its tick are not bounded. `lv
+// host install-fence-ssh` counts no row it read sooner, and no row from an
+// agent whose last sync failed.
 const RowFreshAfter = probeTimeout + acceptTTL + RenderInterval + probeTimeout
 
 // Run syncs at once, then every RenderInterval, and probes every
@@ -539,6 +542,9 @@ func (a *Agent) publish(ctx context.Context, self *x509.Certificate, signer cryp
 	// node wrote under its name, or a removed machine's under the same name,
 	// carries nothing over.
 	ours := havePrev && !prev.Deleted && a.ownLineage(prev, self, tr)
+	// evalReport is what this sync returns once the row is published (or
+	// already current): nil, or why sshd could not be evaluated.
+	var evalReport error
 	if evalErr != nil {
 		// No answer is not "no": keep what was published, and say why.
 		accepting = ours && prev.Accepting
@@ -546,6 +552,11 @@ func (a *Agent) publish(ctx context.Context, self *x509.Certificate, signer cryp
 		if accepting {
 			why = ""
 		}
+		// The sync still fails, so the agent's last_error shows it: a row
+		// carried over is not a fresh answer (`lv doctor fence` warns, and
+		// `lv host install-fence-ssh` does not confirm it).
+		evalReport = fmt.Errorf("sshd could not be evaluated, so this host's row keeps accepting=%v from before: %w",
+			accepting, evalErr)
 	}
 	p := Publication{
 		HostName: a.cfg.Self, Generation: 1, FencePubkeys: KeyLine(fk), SSHDHostkeys: hostKeys,
@@ -571,7 +582,7 @@ func (a *Agent) publish(ctx context.Context, self *x509.Certificate, signer cryp
 	if ours && PublicationOf(prev) == p {
 		if _, err := Verify(prev, tr); err == nil {
 			freshSyncOf(ctx).published()
-			return nil
+			return evalReport
 		}
 	}
 	row, err := Sign(p, signer)
@@ -589,7 +600,7 @@ func (a *Agent) publish(ctx context.Context, self *x509.Certificate, signer cryp
 	freshSyncOf(ctx).published()
 	slog.Info("fence ssh: published this host's row", "generation", p.Generation, "accepting", accepting,
 		"detail", why, "serial", strings.ToLower(self.SerialNumber.Text(16)))
-	return nil
+	return evalReport
 }
 
 // hasOwnRow reports whether this host holds a live row it published itself

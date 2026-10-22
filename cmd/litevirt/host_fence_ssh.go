@@ -64,7 +64,7 @@ config are left alone; a managed fence never reads them.
 	}
 	cmd.Flags().StringVar(&sshUser, "ssh-user", "root", "user to SSH to each host as")
 	cmd.Flags().StringSliceVar(&only, "host", nil, "provision exactly these hosts (repeatable; an unknown name changes nothing); each is still evaluated for a fence from every host")
-	cmd.Flags().BoolVar(&remove, "remove", false, "remove the drop-in instead (the daemon then reports the host as not accepting)")
+	cmd.Flags().BoolVar(&remove, "remove", false, "remove the drop-in instead (the daemon then reports the host as not accepting; a host that ever accepted is still fenced over the managed key, so its fences fail until it is re-installed)")
 	cmd.Flags().DurationVar(&wait, "wait", 3*time.Minute, "how long to wait for every host to report that it accepts the managed key")
 	return cmd
 }

@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -52,6 +53,8 @@ type ownViewClient struct {
 	evaluated      func(host string) bool
 	denyReevaluate bool
 	reevaluations  int
+	// failUntil: every read before this time fails, as a transient error.
+	failUntil time.Time
 }
 
 func (c *ownViewClient) GetFenceSSHStatus(_ context.Context, req *pb.FenceSSHStatusRequest, _ ...grpc.CallOption) (*pb.FenceSSHStatus, error) {
@@ -63,6 +66,9 @@ func (c *ownViewClient) GetFenceSSHStatus(_ context.Context, req *pb.FenceSSHSta
 			return nil, status.Error(codes.PermissionDenied, `role "admin" required, caller has "operator"`)
 		}
 		c.reevaluations++
+	}
+	if c.clock.now().Before(c.failUntil) {
+		return nil, errors.New("rpc error: code = Unavailable desc = connection reset")
 	}
 	st := &pb.FenceSSHStatus{}
 	for _, h := range c.hosts {
@@ -117,10 +123,17 @@ func TestInstallFenceSSH_RemoveFailsUnlessRemoved(t *testing.T) {
 	c := &ownViewClient{clock: clk, hosts: []string{"node-1"}, row: func(string, time.Time) (bool, string) { return false, "" }}
 	for r, wantErr := range map[string]bool{fencessh.ResultRemoved: false, fencessh.ResultUnreloaded: true, fencessh.ResultRefused: true, "": true} {
 		h := &scriptedFenceSSHHost{name: "node-1", addr: "10.78.0.1", result: r}
-		opt := confirmOpts(&bytes.Buffer{}, clk)
+		var out bytes.Buffer
+		opt := confirmOpts(&out, clk)
 		opt.Remove = true
 		if err := InstallFenceSSH(context.Background(), c, []FenceSSHHost{h}, map[string]string{"node-1": h.addr}, opt); (err != nil) != wantErr {
 			t.Fatalf("remove outcome %q: err %v, want error %v", r, err, wantErr)
+		}
+		// A host that accepted the managed key stays on the managed path, so
+		// the operator is told its fences are refused until it is re-installed.
+		if !wantErr && (!strings.Contains(out.String(), "refused by its sshd") ||
+			!strings.Contains(out.String(), "install-fence-ssh --host node-1")) {
+			t.Fatalf("--remove does not warn that fences of node-1 will be refused:\n%s", out.String())
 		}
 	}
 }
@@ -279,5 +292,26 @@ func TestInstallFenceSSH_NonAdminFallsBackToTheBound(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "may not ask hosts to re-evaluate") {
 		t.Fatalf("the fallback is not explained:\n%s", out.String())
+	}
+}
+
+// TestInstallFenceSSH_TransientStatusErrorIsRetried: the installs already
+// happened, so a status read that fails is retried until the wait ends, and
+// a read that never succeeds fails naming the last error.
+func TestInstallFenceSSH_TransientStatusErrorIsRetried(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	start := clk.t
+	h := &scriptedFenceSSHHost{name: "node-1", addr: "10.78.0.1", result: fencessh.ResultInstalled}
+	c := &ownViewClient{clock: clk, hosts: []string{"node-1"}, failUntil: start.Add(3 * time.Minute),
+		row: func(string, time.Time) (bool, string) { return true, "" }}
+	var out bytes.Buffer
+	if err := InstallFenceSSH(context.Background(), c, []FenceSSHHost{h}, map[string]string{"node-1": h.addr}, confirmOpts(&out, clk)); err != nil {
+		t.Fatalf("a transient status error ended the wait: %v\n%s", err, out.String())
+	}
+	clk.t = start
+	c.failUntil = start.Add(time.Hour)
+	err := InstallFenceSSH(context.Background(), c, []FenceSSHHost{h}, map[string]string{"node-1": h.addr}, confirmOpts(&out, clk))
+	if err == nil || !strings.Contains(err.Error(), "connection reset") {
+		t.Fatalf("a status read that never succeeds: %v", err)
 	}
 }

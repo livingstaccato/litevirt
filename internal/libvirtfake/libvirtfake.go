@@ -187,6 +187,10 @@ type Fake struct {
 	// ppMark is the partition-pause mark (MarkPartitionPaused), live only:
 	// it holds for the run it was set in (starts) while the domain is active.
 	ppMark map[string]ppMark
+
+	// imageLocks is the shared-storage image-lock registry this fake joined
+	// (image_lock.go); nil models storage with no cross-host locking.
+	imageLocks *ImageLocks
 	// pendingPermall is, per migrated-in TPM guest that has not resumed
 	// yet, the uuid whose permall its swtpm writes back once it runs.
 	pendingPermall map[string]string
@@ -974,6 +978,10 @@ func (f *Fake) StartDomain(name string) error {
 }
 
 func (f *Fake) startDomain(name string, paused bool) error {
+	return f.lockedStart(name, func() error { return f.startDomainUnlocked(name, paused) })
+}
+
+func (f *Fake) startDomainUnlocked(name string, paused bool) error {
 	if f.FailStartDomain != nil {
 		if err := f.FailStartDomain(name); err != nil {
 			return err

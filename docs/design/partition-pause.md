@@ -1098,6 +1098,22 @@ with the heal) for which all of these hold:
    runtime inventory, `CheckPeerVMRuntime`). An unreachable destination, or no
    runtime check wired, is no proof.
 
+Clauses 1a and 4 protect a copy that RUNS. A copy this host's partition pause
+holds paused (its record still describes the domain: paused, with the
+recorded UUID) runs nothing, so stopping it cannot leave zero running copies,
+and the pauser never resumes a workload a decided claim moved (§3.5). For it,
+a live proof is enough in place of 1a and 4: prepared and not claimed by
+another host, or in progress or completed on its own destination. A failed
+proof, or one another host executes, is not. Waiting for the replacement to
+run first can wait forever: a paused QEMU keeps its image locks, so on shared
+storage the destination's start fails with `Failed to get "write" lock`
+until the paused copy is gone (lab 2, B4). Clauses 2 and 3 still hold in
+full, so a move with no certificate (F9) still leaves the copy paused.
+The destroy of such a copy runs under the VM's mark lock, the lock a resume
+takes before it clears the mark, and only while no abandoned resume is out and
+the domain is still paused with the record's mark; otherwise that pass
+declines (`pause_changed`) and the next decides again.
+
 Proofs `ReapSpentProofs` has tombstoned are still read: a host that comes back
 more than a day later still needs the certificate.
 
@@ -1301,7 +1317,8 @@ nodes at once, then heals. Grep for `partition-pause: paused` and
    remains open.
 7. **Safety review, applied.** Settle requires a completed proof executed by
    its destination and the destination's runtime reporting the workload
-   running (H2); the resume check reads the voters' own rows over
+   running (H2), for a copy that runs; a copy this host holds paused needs
+   only a live proof (§6, lab 2 B4); the resume check reads the voters' own rows over
    `ConfirmPartitionResume` (M1); records carry the domain UUID and the local
    epoch is the highest evidence (M2); a relied-on fence keeps method
    `best-effort-ssh` (M3); the target must have advertised the token (M4);

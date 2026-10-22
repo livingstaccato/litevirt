@@ -218,6 +218,7 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		rec.SetGate(epochGate{})
 		rec.SetRecoveryClaimGate(n.Server.RecoveryClaimGateForPendingProof)
 		rec.SetSettleVerifier(n.Server.VerifySettleProof)
+		rec.SetPauseGuard(p.SettleDestroy)
 		rec.SetPeerRuntimeChecker(n.Server.CheckPeerVMRuntime)
 
 		pn := &ppNode{n: n, chk: chk, pauser: p, coord: coord, rec: rec, pauseOn: on, dataDir: dataDir}

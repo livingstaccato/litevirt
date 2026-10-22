@@ -148,8 +148,11 @@ type Reconciler struct {
 	// settleVerify / settleProofs are Layer 3 of partition pause (settle.go):
 	// the certificate check and the proof source. nil verifier settles nothing.
 	settleVerify SettleVerifier
-	pitReport    func(ctx context.Context, vm, disk, detail string)
-	pitCleared   func(ctx context.Context, vm, disk string)
+	// pauseGuard runs the destroy of a copy this host's partition pause holds
+	// paused under the pauser's mark lock (PartitionPauser.SettleDestroy).
+	pauseGuard PauseSettleGuard
+	pitReport  func(ctx context.Context, vm, disk, detail string)
+	pitCleared func(ctx context.Context, vm, disk string)
 	// pitFeature is this host's pit_overlay release-feature gate
 	// (SetPITOverlayFeature); nil is closed: overlays are held, never settled.
 	pitFeature pitoverlay.Gate

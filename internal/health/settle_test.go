@@ -565,3 +565,95 @@ func TestSettle_DroppingThePauseRecordReleasesTheCaptureHold(t *testing.T) {
 		t.Fatal("the capture hold outlived the pause record")
 	}
 }
+
+// guardedFixture is the paused fixture with the pauser's guard wired, as the
+// daemon wires it: the record carries a token and the domain its mark.
+func guardedFixture(t *testing.T) (*settleFixture, *PartitionPauser) {
+	t.Helper()
+	f := newSettleFixture(t)
+	rec, ok, err := ReadPauseRecord(f.dataDir, PauseKindVM, "vm-a")
+	if err != nil || !ok {
+		t.Fatalf("setup: record %v %v", ok, err)
+	}
+	rec.Token = "tok-1"
+	if err := newPauseStore(f.dataDir).put(rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.virt.MarkPartitionPaused("vm-a", "tok-1"); err != nil {
+		t.Fatal(err)
+	}
+	p := NewPartitionPauser("node-a", f.dataDir, f.db)
+	p.SetVMBackend(f.virt)
+	f.r.SetPauseGuard(p.SettleDestroy)
+	f.proof.Status = corrosion.ProofInProgress
+	f.destState = RuntimeDefinedStopped
+	return f, p
+}
+
+// Settle decides on a copy that is paused, then verifies certificates (RPCs,
+// seconds), then destroys. A resume that lands in between — it clears the
+// mark and resumes the guest, under the VM's mark lock — must not be followed
+// by a destroy of what now runs: the destroy runs under the same lock, after
+// re-checking that the domain is still paused with this pause's mark. With the
+// guard in place, a still-paused copy settles as before; a resumed one, or one
+// whose mark lock is held, is declined for this pass.
+//
+// Mutation: SettleDestroy calls destroy without the re-checks — the
+// "resumed" case destroys a running copy and goes red; without the TryLock —
+// the "lock held" case goes red.
+func TestSettle_APausedCopyIsDestroyedOnlyWhileStillPaused(t *testing.T) {
+	t.Run("still paused", func(t *testing.T) {
+		f, _ := guardedFixture(t)
+		if st := f.run(); st != libvirtfake.StateShutdown {
+			t.Fatalf("vm-a is %s; the guard must let the destroy of a copy still paused by this pause through", st)
+		}
+	})
+	t.Run("resumed between the decision and the destroy", func(t *testing.T) {
+		f, p := guardedFixture(t)
+		verify := f.r.settleVerify
+		f.r.SetSettleVerifier(func(ctx context.Context, ap corrosion.ActionProof) (corrosion.ClaimCertificate, error) {
+			// The pauser's resume lands now, as resume() does it: under the
+			// mark lock, the mark first, then the guest.
+			l := p.markLock("vm-a")
+			l.Lock()
+			if err := f.virt.ClearPartitionPauseMark("vm-a"); err != nil {
+				t.Error(err)
+			}
+			f.virt.SetState("vm-a", libvirtfake.StateRunning)
+			l.Unlock()
+			return verify(ctx, ap)
+		})
+		if st := f.run(); st != libvirtfake.StateRunning {
+			t.Fatalf("vm-a is %s; settle destroyed a copy that a resume had made run again", st)
+		}
+		if _, ok := firstVirtEvent(f.virt, "destroy", "vm-a"); ok {
+			t.Fatal("settle destroyed vm-a after it was resumed")
+		}
+	})
+	t.Run("mark lock held", func(t *testing.T) {
+		f, p := guardedFixture(t)
+		l := p.markLock("vm-a")
+		l.Lock()
+		defer l.Unlock()
+		if st := f.run(); st != libvirtfake.StatePaused {
+			t.Fatalf("vm-a is %s; settle destroyed it while a mark write or resume held its mark lock", st)
+		}
+		vm, err := corrosion.GetVM(context.Background(), f.db, "vm-a")
+		if err != nil || vm == nil {
+			t.Fatalf("GetVM: %v", err)
+		}
+		settled, why, _ := f.r.settleCertifiedMove(context.Background(), "vm-a", vm)
+		if settled || settleReasonClass(why) != "pause_changed" {
+			t.Fatalf("settle = (%v, %q), want a pause_changed decline", settled, why)
+		}
+	})
+}
+
+func firstVirtEvent(v *libvirtfake.Fake, op, dom string) (libvirtfake.Event, bool) {
+	for _, ev := range v.EventLog() {
+		if ev.Op == op && ev.Domain == dom {
+			return ev, true
+		}
+	}
+	return libvirtfake.Event{}, false
+}

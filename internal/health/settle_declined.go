@@ -136,6 +136,8 @@ func settleReasonClass(reason string) string {
 		return "not_wired"
 	case strings.HasPrefix(reason, "proofs unreadable"):
 		return "proofs_unreadable"
+	case strings.HasPrefix(reason, errPauseChanged.Error()):
+		return "pause_changed"
 	case strings.HasPrefix(reason, "destroy failed"):
 		return "destroy_failed"
 	case strings.HasPrefix(reason, "no verified recovery-claim certificate"):

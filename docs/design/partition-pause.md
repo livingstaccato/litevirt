@@ -1109,6 +1109,10 @@ run first can wait forever: a paused QEMU keeps its image locks, so on shared
 storage the destination's start fails with `Failed to get "write" lock`
 until the paused copy is gone (lab 2, B4). Clauses 2 and 3 still hold in
 full, so a move with no certificate (F9) still leaves the copy paused.
+The destroy of such a copy runs under the VM's mark lock, the lock a resume
+takes before it clears the mark, and only while no abandoned resume is out and
+the domain is still paused with the record's mark; otherwise that pass
+declines (`pause_changed`) and the next decides again.
 
 Proofs `ReapSpentProofs` has tombstoned are still read: a host that comes back
 more than a day later still needs the certificate.

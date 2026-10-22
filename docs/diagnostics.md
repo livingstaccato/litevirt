@@ -2401,7 +2401,10 @@ holder writes.
   host's partition pause holds paused does not wait for that: it is stopped
   as soon as the proof is live (not failed, not taken by another host),
   because a paused QEMU keeps a shared disk's image lock and the destination
-  cannot start the VM until it is gone. The host
+  cannot start the VM until it is gone. That destroy waits for no resume:
+  it runs under the pause's mark lock, only while the domain is still
+  paused with the pause's mark, and a pass that finds otherwise declines
+  with reason class `pause_changed`. The host
   stopped its copy (a VM is destroyed, which keeps its definition and disks)
   and wrote a `partition.settle` audit row. The leftover cleanup then handles the shut-off domain as usual.
   The host resolves `vm_settled` on the pass that finds no domain of that

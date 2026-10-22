@@ -1953,6 +1953,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	pauser.SetContainerRuntime(lxcRunner)
 	pauser.SetResumeConfirmer(svc.CheckPartitionResume)
 	pauser.SetSettleVerifier(svc.VerifySettleProof)
+	reconciler.SetPauseGuard(pauser.SettleDestroy) // settle destroys a paused copy only under its mark lock
 	pauser.SetPeerRuntimeChecker(svc.CheckPeerContainerRuntime)
 	pauser.SetSelfFence(watchdogCtrl.Armed, watchdogCtrl.SelfFence)
 	d.wirePauserLiveness(pauser)

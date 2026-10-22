@@ -291,3 +291,20 @@ func (s *Server) replayContainerOperatorStopLocked(ctx context.Context, m health
 	slog.Info("operator-stop replay: the forced container stop made under write quarantine is recorded", "container", m.Container)
 	return health.RemoveContainerOperatorStopMarker(s.dataDir, m.Container)
 }
+
+// quarantinedContainerStartRefusal refuses `lv ct start` of name on a host in
+// write quarantine: the start, its admission and its running state are
+// replicated records, which the quarantine refuses, so a container started
+// now would run unrecorded. It says how the quarantine lifts. (A held
+// container gets containerOperatorStopStartRefusal's message first.)
+func (s *Server) quarantinedContainerStartRefusal(name string) error {
+	reason := s.stopQuarantineReason()
+	if reason == "" {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"container %q was not started: host %s is in write quarantine (%s) and cannot record a start, so the "+
+			"container would run while the cluster's record of it says otherwise; nothing was changed. %s, then "+
+			"retry `lv ct start %s`",
+		name, s.hostName, reason, capitalize(s.quarantineRemedy()), name)
+}

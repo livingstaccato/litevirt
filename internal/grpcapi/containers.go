@@ -515,6 +515,14 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 			return nil, status.Errorf(codes.Unavailable, "start: read the container row again after recording its stop: %v; retry `lv ct start %s`", err, req.Name)
 		}
 	}
+	// Under write quarantine a start cannot be recorded (its admission and its
+	// running state are replicated writes), so the container would run while
+	// the cluster's record of it says otherwise: refused before anything
+	// changes, as StartVM does.
+	if err := s.quarantinedContainerStartRefusal(req.Name); err != nil {
+		s.audit(ctx, "ct.start", req.Name, "project="+project+" write quarantine", "denied")
+		return nil, err
+	}
 	// Host capacity admission — memory only (see CreateContainer). Starting is when
 	// the memory is actually taken: a stopped container is accounted as nothing, so
 	// checking only at create would be sidestepped by creating several that each fit

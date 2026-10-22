@@ -357,3 +357,52 @@ func TestFleet_QuarantinedContainerForceStop_CorruptMarkerFailsClosed(t *testing
 		t.Fatalf("StartContainer after the remedy: %v", err)
 	}
 }
+
+// `lv ct start` of a container no marker holds, on a node in write
+// quarantine: refused before anything changes (the start could not be
+// recorded), naming the quarantine and its remedy.
+//
+// Red on fc53141a7: a stopped row is answered Internal by the capacity
+// reservation's refused write (no remedy); a row still recorded running
+// whose container went down (db) skips admission, so the runtime starts it
+// and only then does the running write fail (Internal): it runs unrecorded.
+//
+// Mutation, the refusal removed: the same, red.
+func TestFleet_QuarantinedContainerStart_RefusedBeforeAnythingChanges(t *testing.T) {
+	c := New(t, Options{Nodes: 1})
+	n := c.Nodes[0]
+	ctx := context.Background()
+	qcsContainer(t, c, n, "web")
+	if _, err := c.SelfClient(n).StopContainer(ctx, qcsStopReq(t, n.Name, "web", false)); err != nil {
+		t.Fatalf("StopContainer: %v", err)
+	}
+	qcsContainer(t, c, n, "db")
+	if err := n.CT.StopContainer(ctx, "db", 0); err != nil { // down, its row still running
+		t.Fatal(err)
+	}
+	n.DB.SetWriteQuarantine(func() string { return qfsQuarantine })
+	dbStarts := qcsCount(n.CT.StartCalls(), "db")
+	_, err := c.SelfClient(n).StartContainer(ctx, &pb.StartContainerRequest{HostName: n.Name, Name: "db"})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "write quarantine") {
+		t.Errorf("StartContainer db under write quarantine: %v, want FailedPrecondition naming the quarantine", err)
+	}
+	if k := qcsCount(n.CT.StartCalls(), "db") - dbStarts; k != 0 || n.CT.State("db") != "stopped" {
+		t.Errorf("db was started unrecorded under quarantine: %d start(s), state %q", k, n.CT.State("db"))
+	}
+	startsBefore := qcsCount(n.CT.StartCalls(), "web")
+	_, err = c.SelfClient(n).StartContainer(ctx, &pb.StartContainerRequest{HostName: n.Name, Name: "web"})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "write quarantine") ||
+		!strings.Contains(err.Error(), "reseed") || !strings.Contains(err.Error(), "nothing was changed") {
+		t.Errorf("StartContainer under write quarantine: %v, want FailedPrecondition naming the quarantine and its remedy", err)
+	}
+	if k := qcsCount(n.CT.StartCalls(), "web") - startsBefore; k != 0 || n.CT.State("web") != "stopped" {
+		t.Errorf("the refused start touched the runtime: %d start(s), state %q", k, n.CT.State("web"))
+	}
+	if row := qcsRow(t, n, "web"); row.State != "stopped" || row.StateDetail != "operator-stop" {
+		t.Errorf("row %s/%q, want unchanged stopped/operator-stop", row.State, row.StateDetail)
+	}
+	n.DB.SetWriteQuarantine(nil)
+	if _, err := c.SelfClient(n).StartContainer(ctx, &pb.StartContainerRequest{HostName: n.Name, Name: "web"}); err != nil {
+		t.Fatalf("StartContainer after the lift: %v", err)
+	}
+}

@@ -740,7 +740,12 @@ first writes `ct-operator-stops/<name>.json` under the `data_dir` (durably,
 naming the host, the container's `created_at` and its owner epoch), then
 stops the container; if the marker cannot be written it is refused and the
 container keeps running. While the marker is there, the container's restart
-policy does not start it and `lv ct start` is refused. Once the quarantine
+policy does not start it. `lv ct start` is refused with `FailedPrecondition`
+on a quarantined host whether or not a marker holds the container: a start
+cannot be recorded either (its admission and its `running` state are
+replicated writes), and a container started there would run while the
+cluster's record of it says otherwise. The refusal names the quarantine and
+its remedy, and nothing is changed. Once the quarantine
 lifts, the host's next reconcile pass, or an `lv ct start` that comes first,
 records the stop on the container's row (`stopped` / `operator-stop`) and
 removes the marker, only while the row is still that incarnation at that

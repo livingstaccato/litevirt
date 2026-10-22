@@ -286,7 +286,10 @@ named by `address` as the vendor and device id that the failed host's
 inventory records at that address. The address itself is not carried over. The
 device at the same address on another host is whatever that host has there,
 and it is never bound. The new host starts the VM with a matching device of
-its own, at whatever address that device has.
+its own, at whatever address that device has, and records it: from then on
+that device, not the failed host's inventory, says what kind the VM needs.
+A VM moved while stopped gets its device the same way at `lv start`, which
+refuses when the host has none.
 
 When no surviving host has a free device of that kind, the VM stays on its
 failed host and is not started anywhere without its devices. Failover records
@@ -301,10 +304,15 @@ To recover such a VM without its devices, give it the label
 `litevirt.failover_without_devices=true` in its spec's `labels`. The next
 failover pass then recovers it like any other VM. Its new host starts it with
 its devices if it has all of them, and otherwise without any. The VM's state
-detail reads `running without its PCI passthrough devices: ...` and a
-`vm.passthrough_dropped` event is recorded. A host that rebuilds a VM's domain
+detail reads `running without its PCI passthrough devices: ...`, and a
+`vm.passthrough_dropped` event and audit entry are recorded. A host that rebuilds a VM's domain
 for any other reason (a guest that died under a running row) also starts it
 only with its devices, or under the same label.
+
+These guarantees hold once every node runs a build that has them: during a
+rolling upgrade, an older coordinator or host can still recover the VM
+without its devices, or with whatever device sits at its old address, as
+earlier releases did.
 
 ## Snapshots and restores with PCI devices
 

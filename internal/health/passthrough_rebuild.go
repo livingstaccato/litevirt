@@ -54,11 +54,30 @@ func (r *Reconciler) rebuildPassthrough(ctx context.Context, vm *corrosion.VMRec
 	return r.passthroughForRebuild(ctx, vm)
 }
 
+// PassthroughDroppedDetail is the state detail of a VM running without its
+// PCI passthrough devices, why being the reason PassthroughRebuild.Dropped
+// gives.
+func PassthroughDroppedDetail(why string) string {
+	return "running without its PCI passthrough devices: " + why
+}
+
+// RecordPassthroughDropped records, as host and as actor, the warning event
+// of vm's start without its PCI passthrough devices (detail). The caller
+// audits the drop itself through its own audit writer.
+func RecordPassthroughDropped(ctx context.Context, db *corrosion.Client, host, actor, vm, detail string) {
+	if err := corrosion.InsertVMEvent(ctx, db, corrosion.VMEventRecord{
+		ID: randid.New(), VMName: vm, HostName: host, Type: "vm.passthrough_dropped",
+		Result: "ok", Severity: "warn", Detail: detail, Username: actor,
+	}); err != nil {
+		slog.Warn("record the running-without-devices event", "vm", vm, "error", err)
+	}
+}
+
 // reportPassthroughDropped records that vm runs here without its PCI
 // passthrough devices: in its state detail, which a running row otherwise
-// reads as a VM with all of its hardware, and as a warning event.
+// reads as a VM with all of its hardware, and as an event and audit row.
 func (r *Reconciler) reportPassthroughDropped(ctx context.Context, vm, why string) {
-	detail := "running without its PCI passthrough devices: " + why
+	detail := PassthroughDroppedDetail(why)
 	slog.Warn("reconciler: "+detail, "vm", vm)
 	if err := r.publishRunning(ctx, vm, "running", func(ctx context.Context) error {
 		return corrosion.UpdateVMState(ctx, r.db, vm, "running", detail)
@@ -66,12 +85,8 @@ func (r *Reconciler) reportPassthroughDropped(ctx context.Context, vm, why strin
 		LogPublishRefusal("reconciler: the running-without-devices detail was not written", vm, err)
 		r.noteStateWriteFail(corrosion.OpVMState, err)
 	}
-	if err := corrosion.InsertVMEvent(ctx, r.db, corrosion.VMEventRecord{
-		ID: randid.New(), VMName: vm, HostName: r.hostName, Type: "vm.passthrough_dropped",
-		Result: "ok", Severity: "warn", Detail: detail, Username: "reconciler",
-	}); err != nil {
-		slog.Warn("reconciler: record the running-without-devices event", "vm", vm, "error", err)
-	}
+	RecordPassthroughDropped(ctx, r.db, r.hostName, "reconciler", vm, detail)
+	auditSystem(ctx, r.db, r.hostName, "vm.passthrough_dropped", vm, detail, "ok")
 }
 
 type passthroughDroppedKey struct{}

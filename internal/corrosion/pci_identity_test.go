@@ -44,7 +44,7 @@ func TestPCIAddressIdentity(t *testing.T) {
 		{"on an owner host, not the VM's", "", "0000:45:00.0", "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, host, err := PCIAddressIdentity(ctx, c, "vm", tc.origin, tc.bdf)
+			got, host, err := PCIAddressIdentity(ctx, c, "vm", "", tc.origin, tc.bdf)
 			if tc.want == "" {
 				if !errors.Is(err, ErrPCIIdentityUnknown) {
 					t.Fatalf("got %+v on %q, %v; want ErrPCIIdentityUnknown", got, host, err)
@@ -55,5 +55,54 @@ func TestPCIAddressIdentity(t *testing.T) {
 				t.Fatalf("got %+v on %q, %v; want %s on %s", got, host, err, tc.want, tc.wantHost)
 			}
 		})
+	}
+}
+
+// Once the intent is realized on another host, the device that realizes it
+// says what kind it needs: not the row it was recorded on, which a rescan
+// may have rewritten, or which may be gone.
+func TestPCIAddressIdentity_RealizationFirst(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	for _, h := range []string{"a", "b", "c"} {
+		if err := InsertHost(ctx, c, HostRecord{Name: h, Address: "10.0.0.1", State: "active", CertSerial: "s-" + h}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put := func(d PCIDeviceRecord) {
+		t.Helper()
+		if err := UpsertPCIDevice(ctx, c, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	realize := func(dev, host, addr string) {
+		t.Helper()
+		if err := UpsertPCIRealization(ctx, c, PCIRealizationRecord{VMName: "vm", DeviceID: dev, MemberID: "m0",
+			HostName: host, ResolvedAddress: addr, Ordinal: 0}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Recorded on a at 41; a rescanned since: an L40S there, still "owned".
+	put(PCIDeviceRecord{HostName: "a", Address: "0000:41:00.0", VendorID: "10de", DeviceID: "26b9", VMName: "vm"})
+	// Realized on b at 81, the VM's H100.
+	put(PCIDeviceRecord{HostName: "b", Address: "0000:81:00.0", VendorID: "10de", DeviceID: "2330", VMName: "vm"})
+	realize("d1", "b", "0000:81:00.0")
+	got, host, err := PCIAddressIdentity(ctx, c, "vm", "d1", "a", "0000:41:00.0")
+	if err != nil || got.DeviceID != "2330" || host != "b" || got.Address != "0000:81:00.0" {
+		t.Fatalf("realized on b: got %+v on %q, %v; want the H100 at b 0000:81:00.0", got, host, err)
+	}
+
+	// Realized on c at 82, which no longer records it as the VM's: the rows
+	// the VM left are not trusted, and nothing else says.
+	put(PCIDeviceRecord{HostName: "c", Address: "0000:82:00.0", VendorID: "10de", DeviceID: "2330"})
+	realize("d2", "c", "0000:82:00.0")
+	if got, host, err := PCIAddressIdentity(ctx, c, "vm", "d2", "a", "0000:41:00.0"); !errors.Is(err, ErrPCIIdentityUnknown) {
+		t.Fatalf("realized elsewhere, not owned: got %+v on %q, %v; want ErrPCIIdentityUnknown", got, host, err)
+	}
+
+	// Never realized elsewhere: the origin's row, if it is not another VM's.
+	put(PCIDeviceRecord{HostName: "a", Address: "0000:43:00.0", VendorID: "10de", DeviceID: "2330", VMName: "other"})
+	if got, host, err := PCIAddressIdentity(ctx, c, "vm", "d3", "a", "0000:43:00.0"); !errors.Is(err, ErrPCIIdentityUnknown) {
+		t.Fatalf("origin row another VM's: got %+v on %q, %v; want ErrPCIIdentityUnknown", got, host, err)
 	}
 }

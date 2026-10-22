@@ -13,6 +13,7 @@ package fleet
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +25,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/placement"
 	"github.com/litevirt/litevirt/internal/vfio"
 )
 
@@ -50,7 +52,31 @@ func (d pciFoDevice) at(addr string) pciFoDevice { d.addr = addr; return d }
 // victim is isolated. With latched, hardware_v2 is latched fleet-wide first.
 func pciFoFleet(t *testing.T, clock *VirtualClock, latched bool, labels map[string]string, onA, onB []pciFoDevice) (c *Cluster, a, b, victim *Node) {
 	t.Helper()
+	return pciFoFleetWith(t, clock, pciFoSetup{latched: latched, labels: labels, onA: onA, onB: onB})
+}
+
+// pciFoSetup is a pciFoFleet scenario. victimDevs (default: the H100 at
+// pciFoBDF) are the VM's devices on the victim; devs (default: each of them
+// by address) its spec's selectors.
+type pciFoSetup struct {
+	latched    bool
+	labels     map[string]string
+	onA, onB   []pciFoDevice
+	victimDevs []pciFoDevice
+	devs       []*pb.DeviceSpec
+}
+
+func pciFoFleetWith(t *testing.T, clock *VirtualClock, o pciFoSetup) (c *Cluster, a, b, victim *Node) {
+	t.Helper()
 	ctx := context.Background()
+	if len(o.victimDevs) == 0 {
+		o.victimDevs = []pciFoDevice{h100.at(pciFoBDF)}
+	}
+	if len(o.devs) == 0 {
+		for _, d := range o.victimDevs {
+			o.devs = append(o.devs, &pb.DeviceSpec{Address: d.addr})
+		}
+	}
 	disk := filepath.Join(t.TempDir(), pciFoVM+"-root.qcow2")
 	if err := os.WriteFile(disk, nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -65,48 +91,56 @@ func pciFoFleet(t *testing.T, clock *VirtualClock, latched bool, labels map[stri
 				t.Fatal(err)
 			}
 		}
-		put(victim.Name, h100.at(pciFoBDF), pciFoVM, 40)
-		for i, d := range onA {
+		hostdevs := ""
+		for i, d := range o.victimDevs {
+			put(victim.Name, d, pciFoVM, 40+i)
+			bus, slot, fn := d.addr[5:7], d.addr[8:10], d.addr[11:12]
+			hostdevs += `<hostdev mode='subsystem' type='pci' managed='yes'><source><address domain='0x0000' bus='0x` + bus +
+				`' slot='0x` + slot + `' function='0x` + fn + `'/></source></hostdev>`
+		}
+		for i, d := range o.onA {
 			put(a.Name, d, "", 50+i)
 		}
-		for i, d := range onB {
+		for i, d := range o.onB {
 			put(b.Name, d, "", 60+i)
 		}
-		dev := &pb.DeviceSpec{Address: pciFoBDF}
 		if err := corrosion.InsertVM(ctx, a.DB, corrosion.VMRecord{Name: pciFoVM, HostName: victim.Name, State: "running",
 			CPUActual: 1, MemActual: 256,
-			Spec: vmSpecJSON(t, &pb.VMSpec{Name: pciFoVM, Cpu: 1, MemoryMib: 256, Labels: labels, Devices: []*pb.DeviceSpec{dev}})},
+			Spec: vmSpecJSON(t, &pb.VMSpec{Name: pciFoVM, Cpu: 1, MemoryMib: 256, Labels: o.labels, Devices: o.devs})},
 			nil, []corrosion.DiskRecord{{VMName: pciFoVM, DiskName: "root", HostName: victim.Name, Path: disk, StorageType: "nfs"}}); err != nil {
 			t.Fatal(err)
 		}
-		if !latched {
-			// The intent CreateVM writes beside the claim, whatever the latch.
-			kind, key := corrosion.ClassifyPCISelector(dev)
-			payload, err := protojson.Marshal(dev)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := corrosion.UpsertPCIIntent(ctx, a.DB, corrosion.PCIIntentRecord{
-				VMName: pciFoVM, DeviceID: corrosion.DeterministicPCIIntentID(corrosion.CanonicalPCISelector(dev), 0),
-				HostName: victim.Name, SelectorKind: kind, SelectorPayload: string(payload), ExclusiveKey: key,
-			}); err != nil {
-				t.Fatal(err)
+		if !o.latched {
+			// The intents CreateVM writes beside the claim, whatever the latch.
+			occ := map[string]int{}
+			for _, dev := range o.devs {
+				kind, key := corrosion.ClassifyPCISelector(dev)
+				payload, err := protojson.Marshal(dev)
+				if err != nil {
+					t.Fatal(err)
+				}
+				canon := corrosion.CanonicalPCISelector(dev)
+				if err := corrosion.UpsertPCIIntent(ctx, a.DB, corrosion.PCIIntentRecord{
+					VMName: pciFoVM, DeviceID: corrosion.DeterministicPCIIntentID(canon, occ[canon]),
+					HostName: victim.Name, SelectorKind: kind, SelectorPayload: string(payload), ExclusiveKey: key,
+				}); err != nil {
+					t.Fatal(err)
+				}
+				occ[canon]++
 			}
 			return
 		}
-		// The VM's domain on the victim passes the H100 through: the audit
-		// adopts the VM from it and writes its intent.
+		// The VM's domain on the victim passes its devices through: the
+		// audit adopts the VM from it and writes its intents.
 		c.WaitConverged(t, convergeTimeout)
-		if err := victim.Virt.DefineDomain(`<domain type='kvm'><name>` + pciFoVM + `</name><devices>` +
-			`<hostdev mode='subsystem' type='pci' managed='yes'><source><address domain='0x0000' bus='0x41' slot='0x00' function='0x0'/></source></hostdev>` +
-			`</devices></domain>`); err != nil {
+		if err := victim.Virt.DefineDomain(`<domain type='kvm'><name>` + pciFoVM + `</name><devices>` + hostdevs + `</devices></domain>`); err != nil {
 			t.Fatal(err)
 		}
 		latchHardwareV2(t, c, gateAll(t, c))
 		c.WaitConverged(t, convergeTimeout)
 		intents, err := corrosion.ListVMPCIIntents(ctx, a.DB, pciFoVM)
-		if err != nil || len(intents) != 1 || intents[0].SelectorKind != "address" {
-			t.Fatalf("after the latch %s has intents %+v (%v); want its one address intent", pciFoVM, intents, err)
+		if err != nil || len(intents) != len(o.devs) {
+			t.Fatalf("after the latch %s has intents %+v (%v); want %d", pciFoVM, intents, err, len(o.devs))
 		}
 	})
 }
@@ -352,5 +386,327 @@ func TestFleet_PCIFailover_OptInRecoversWithoutDevices(t *testing.T) {
 		if o := pciFoOwner(t, ctx, n, n.Name, pciFoBDF); o != "" {
 			t.Errorf("the device at %s on %s was claimed by %q", pciFoBDF, n.Name, o)
 		}
+		pciFoDropRecorded(t, ctx, n)
 	})
+}
+
+// pciFoDropRecorded checks that n recorded pciFoVM's start without its
+// devices: a vm.passthrough_dropped event and an audit row of the drop.
+func pciFoDropRecorded(t *testing.T, ctx context.Context, n *Node) {
+	t.Helper()
+	evs, err := corrosion.ListVMEvents(ctx, n.DB, pciFoVM, 100, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev := false
+	for _, e := range evs {
+		ev = ev || e.Type == "vm.passthrough_dropped"
+	}
+	if !ev {
+		t.Errorf("no vm.passthrough_dropped event for %s on %s: %+v", pciFoVM, n.Name, evs)
+	}
+	rows, err := n.DB.Query(ctx, `SELECT detail FROM audit_log WHERE action = 'vm.passthrough_dropped' AND target = ?`, pciFoVM)
+	if err != nil || len(rows) == 0 {
+		t.Errorf("no vm.passthrough_dropped audit row for %s on %s (%v)", pciFoVM, n.Name, err)
+	}
+}
+
+// pciFoLanded fails the VM over onto b, which has the H100 at pciFoThere,
+// and starts it there.
+const pciFoThere = "0000:81:00.0"
+
+func pciFoLanded(t *testing.T, ctx context.Context, latched bool) (c *Cluster, a, b, victim *Node) {
+	t.Helper()
+	clock := NewVirtualClock(time.Now().UTC())
+	c, a, b, victim = pciFoFleet(t, clock, latched, nil, nil, []pciFoDevice{h100.at(pciFoThere)})
+	pciFoFailOver(t, ctx, c, clock, a, b)
+	pciFoStart(t, ctx, b)
+	if v := vmOn(t, b, pciFoVM); v == nil || v.State != "running" || v.HostName != b.Name {
+		t.Fatalf("setup: %s did not start on %s: %+v", pciFoVM, b.Name, v)
+	}
+	return c, a, b, victim
+}
+
+// pciFoRestart has pciFoVM's domain on n die and n's reconciler start it
+// again, as after a guest crash.
+func pciFoRestart(t *testing.T, ctx context.Context, c *Cluster, a, n *Node) *corrosion.VMRecord {
+	t.Helper()
+	_ = n.Virt.DestroyDomain(pciFoVM)
+	if err := corrosion.RescheduleVMHost(ctx, a.DB, pciFoVM, n.Name, "pending"); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConverged(t, convergeTimeout, a, n)
+	pciFoStart(t, ctx, n)
+	return vmOn(t, n, pciFoVM)
+}
+
+// After a failover onto b the failed host's GPU leaves its inventory (it was
+// the bad part, pulled in the repair). A restart on b, which owns an H100,
+// is not refused: the device that realizes the VM's intent on b says what
+// kind it needs, not the row it was first recorded on.
+func TestFleet_PCIFailover_RestartAfterOriginInventoryGone(t *testing.T) {
+	defer vfio.SetFS(vfioBoundSysfs{})()
+	pciFoRegimes(t, func(t *testing.T, latched bool) {
+		ctx := context.Background()
+		c, a, b, victim := pciFoLanded(t, ctx, latched)
+		if err := corrosion.SoftDeletePCIDevice(ctx, a.DB, victim.Name, pciFoBDF); err != nil {
+			t.Fatal(err)
+		}
+		if v := pciFoRestart(t, ctx, c, a, b); v == nil || v.State != "running" {
+			t.Fatalf("restart on %s refused although it owns an H100 there: %+v", b.Name, v)
+		}
+		if buses := pciFoHostdevBuses(b.Virt.DefinedXML(pciFoVM)); len(buses) != 1 || buses[0] != "0x81" {
+			t.Errorf("%s restarted on %s with buses %v, want the H100 at %s", pciFoVM, b.Name, buses, pciFoThere)
+		}
+	})
+}
+
+// After a failover onto b the failed host comes back with another card in
+// the GPU's slot, and its rescan rewrites the row (still recording the VM as
+// its owner). The kind the VM needs does not follow the row: a restart on b
+// takes b's H100 again.
+func TestFleet_PCIFailover_RescannedOriginDoesNotChangeTheKind(t *testing.T) {
+	defer vfio.SetFS(vfioBoundSysfs{})()
+	pciFoRegimes(t, func(t *testing.T, latched bool) {
+		ctx := context.Background()
+		c, a, b, victim := pciFoLanded(t, ctx, latched)
+		if err := corrosion.ObservePCIDevice(ctx, a.DB, corrosion.PCIDeviceRecord{
+			HostName: victim.Name, Address: pciFoBDF, VendorID: l40s.vendor, DeviceID: l40s.device,
+			DeviceName: l40s.name, Type: l40s.typ, Driver: "vfio-pci", IOMMUGroup: 40,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// What a further failover would need of a host: an H100 still.
+		c.WaitConverged(t, convergeTimeout, a, b)
+		if vm := vmOn(t, a, pciFoVM); vm != nil {
+			reqs, descs, err := placement.FailoverDeviceRequests(ctx, a.DB, *vm)
+			if err != nil || len(reqs) != 1 || reqs[0].Vendor != h100.vendor || reqs[0].DeviceID != h100.device {
+				t.Errorf("a failover of %s off %s would need %+v (%v, %v); want an H100", pciFoVM, b.Name, reqs, descs, err)
+			}
+		}
+		// b has a free L40S too: a kind read from the rewritten row would take it.
+		if err := corrosion.UpsertPCIDevice(ctx, a.DB, corrosion.PCIDeviceRecord{
+			HostName: b.Name, Address: "0000:c1:00.0", VendorID: l40s.vendor, DeviceID: l40s.device,
+			DeviceName: l40s.name, Type: l40s.typ, Driver: "vfio-pci", IOMMUGroup: 71,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if v := pciFoRestart(t, ctx, c, a, b); v == nil || v.State != "running" {
+			t.Fatalf("restart on %s refused although it owns an H100 there: %+v", b.Name, v)
+		}
+		if buses := pciFoHostdevBuses(b.Virt.DefinedXML(pciFoVM)); len(buses) != 1 || buses[0] != "0x81" {
+			t.Errorf("%s restarted on %s with buses %v, want the H100 at %s alone", pciFoVM, b.Name, buses, pciFoThere)
+		}
+		if o := pciFoOwner(t, ctx, b, b.Name, "0000:c1:00.0"); o != "" {
+			t.Errorf("the L40S on %s was claimed by %q", b.Name, o)
+		}
+	})
+}
+
+// Two devices of one kind, named by address: each takes its own device on
+// the new host.
+func TestFleet_PCIFailover_TwoDevicesOfOneKindTakeTwoDevices(t *testing.T) {
+	defer vfio.SetFS(vfioBoundSysfs{})()
+	pciFoRegimes(t, func(t *testing.T, latched bool) {
+		ctx := context.Background()
+		clock := NewVirtualClock(time.Now().UTC())
+		c, a, b, _ := pciFoFleetWith(t, clock, pciFoSetup{latched: latched,
+			victimDevs: []pciFoDevice{h100.at(pciFoBDF), h100.at("0000:42:00.0")},
+			onB:        []pciFoDevice{h100.at("0000:81:00.0"), h100.at("0000:82:00.0")}})
+		pciFoFailOver(t, ctx, c, clock, a, b)
+		if vm := vmOn(t, a, pciFoVM); vm == nil || vm.HostName != b.Name {
+			t.Fatalf("%s on %+v; want it on %s, which has two H100s", pciFoVM, vm, b.Name)
+		}
+		pciFoStart(t, ctx, b)
+		if v := vmOn(t, b, pciFoVM); v == nil || v.State != "running" {
+			t.Fatalf("%s did not start on %s: %+v", pciFoVM, b.Name, v)
+		}
+		buses := pciFoHostdevBuses(b.Virt.DefinedXML(pciFoVM))
+		if len(buses) != 2 || buses[0] == buses[1] {
+			t.Errorf("%s on %s passes through buses %v, want both H100s once each:\n%s", pciFoVM, b.Name, buses, b.Virt.DefinedXML(pciFoVM))
+		}
+		for _, addr := range []string{"0000:81:00.0", "0000:82:00.0"} {
+			if o := pciFoOwner(t, ctx, b, b.Name, addr); o != pciFoVM {
+				t.Errorf("%s on %s is owned by %q, want %s", addr, b.Name, o, pciFoVM)
+			}
+		}
+	})
+}
+
+// A start on the new host that fails gives back the device claimed for it.
+func TestFleet_PCIFailover_FailedStartGivesTheDeviceBack(t *testing.T) {
+	defer vfio.SetFS(vfioBoundSysfs{})()
+	pciFoRegimes(t, func(t *testing.T, latched bool) {
+		ctx := context.Background()
+		clock := NewVirtualClock(time.Now().UTC())
+		c, a, b, _ := pciFoFleet(t, clock, latched, nil, nil, []pciFoDevice{h100.at(pciFoThere)})
+		pciFoFailOver(t, ctx, c, clock, a, b)
+		b.Virt.FailStartDomain = func(string) error { return errors.New("qemu: injected start failure") }
+		pciFoStart(t, ctx, b)
+		if v := vmOn(t, b, pciFoVM); v != nil && v.State == "running" {
+			t.Fatalf("%s running on %s although its start failed", pciFoVM, b.Name)
+		}
+		if o := pciFoOwner(t, ctx, b, b.Name, pciFoThere); o != "" {
+			t.Errorf("the H100 on %s is still owned by %q after the start failed", b.Name, o)
+		}
+	})
+}
+
+// The device the VM owns on its host has vanished from the inventory: the
+// VM is not rebuilt there without it.
+func TestFleet_PCIFailover_VanishedOwnedDeviceRefusesTheRestart(t *testing.T) {
+	defer vfio.SetFS(vfioBoundSysfs{})()
+	pciFoRegimes(t, func(t *testing.T, latched bool) {
+		ctx := context.Background()
+		c, a, b, _ := pciFoLanded(t, ctx, latched)
+		// As b's own rescan would, the device being gone from its bus.
+		if err := corrosion.SoftDeletePCIDevice(ctx, b.DB, b.Name, pciFoThere); err != nil {
+			t.Fatal(err)
+		}
+		v := pciFoRestart(t, ctx, c, a, b)
+		if v != nil && v.State == "running" {
+			t.Fatalf("%s restarted on %s without the H100 it owns there, which vanished", pciFoVM, b.Name)
+		}
+		if !latched && (v == nil || !strings.Contains(v.StateDetail, "vanished")) {
+			t.Errorf("%s's state detail does not say its device vanished: %+v", pciFoVM, v)
+		}
+	})
+}
+
+// A stopped GPU VM on shared storage is moved, still stopped, onto a survivor
+// with an H100 (before the latch); its definition there is built from its
+// spec. `lv start` there passes the survivor's H100 through, or refuses when
+// what it needs cannot be told (a spec device with no intent naming the host
+// it was recorded on), unless the spec opts in to starting without it. It
+// never boots the VM silently without its GPU.
+func TestFleet_PCIFailover_StartOfAMovedStoppedVMGivesItItsDevice(t *testing.T) {
+	defer vfio.SetFS(vfioBoundSysfs{})()
+	for _, tc := range []struct {
+		name      string
+		intent    bool
+		labels    string
+		failStart bool
+	}{
+		{"with its intent", true, "", false},
+		{"with its intent, start fails", true, "", true},
+		{"spec device only", false, "", false},
+		{"opted out", false, `,"labels":{"` + corrosion.LabelFailoverWithoutDevices + `":"true"}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := New(t, Options{Nodes: 3, SharedCRDT: true})
+			ctx := context.Background()
+			a, b, victim := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+			sharedDiskVM(t, c, a, "sg", victim.Name, "stopped", "operator-stop")
+			if _, _, err := corrosion.MutateDesiredSpec(ctx, a.DB, "sg", func(string) (string, error) {
+				return `{"name":"sg","cpu":1,"memory_mib":256,"on_host_failure":"restart-any","devices":[{"address":"0000:41:00.0"}]` + tc.labels + `}`, nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			put := func(host, addr string, grp int) {
+				if err := corrosion.UpsertPCIDevice(ctx, a.DB, corrosion.PCIDeviceRecord{
+					HostName: host, Address: addr, VendorID: h100.vendor, DeviceID: h100.device,
+					DeviceName: h100.name, Type: "gpu", Driver: "vfio-pci", IOMMUGroup: grp,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			put(victim.Name, "0000:41:00.0", 40) // released when the VM stopped
+			put(a.Name, "0000:81:00.0", 50)
+			put(b.Name, "0000:81:00.0", 60)
+			if tc.intent {
+				dev := &pb.DeviceSpec{Address: "0000:41:00.0"}
+				kind, key := corrosion.ClassifyPCISelector(dev)
+				payload, _ := protojson.Marshal(dev)
+				if err := corrosion.UpsertPCIIntent(ctx, a.DB, corrosion.PCIIntentRecord{
+					VMName: "sg", DeviceID: corrosion.DeterministicPCIIntentID(corrosion.CanonicalPCISelector(dev), 0),
+					HostName: victim.Name, SelectorKind: kind, SelectorPayload: string(payload), ExclusiveKey: key,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := fenceVictim(t, c, a, victim, a, b); got != 1 {
+				t.Fatalf("fencer fired %d times", got)
+			}
+			vm, _ := corrosion.GetVM(ctx, a.DB, "sg")
+			if vm == nil || vm.HostName == victim.Name || vm.State != "stopped" {
+				t.Fatalf("sg was not moved off %s still stopped: %+v", victim.Name, vm)
+			}
+			dest := c.Node(vm.HostName)
+			reconcileAll(t, c, a, b)
+			if x := dest.Virt.DefinedXML("sg"); x == "" || len(pciFoHostdevBuses(x)) != 0 {
+				t.Fatalf("setup: sg's definition on %s is not the device-less one a re-key defines:\n%s", dest.Name, x)
+			}
+
+			if tc.failStart {
+				dest.Virt.FailStartDomain = func(string) error { return errors.New("qemu: injected start failure") }
+			}
+			_, err := c.SelfClient(dest).StartVM(ctx, &pb.StartVMRequest{Name: "sg"})
+			st, _ := dest.Virt.DomainState("sg")
+			buses := pciFoHostdevBuses(dest.Virt.DefinedXML("sg"))
+			owner := ""
+			if devs, lerr := corrosion.ListPCIDevices(ctx, dest.DB, dest.Name, ""); lerr == nil {
+				for _, d := range devs {
+					if d.Address == "0000:81:00.0" {
+						owner = d.VMName
+					}
+				}
+			}
+			switch {
+			case tc.failStart:
+				// What the start claimed is given back, and the definition
+				// is as it was: a later start does not boot devices the
+				// inventory says are free.
+				if err == nil || st == "running" || len(buses) != 0 || owner != "" {
+					t.Errorf("failed lv start on %s: err=%v state=%s buses=%v owner=%q; want an error, the H100 free and no hostdev left defined",
+						dest.Name, err, st, buses, owner)
+				}
+			case tc.intent:
+				if err != nil || st != "running" || len(buses) != 1 || buses[0] != "0x81" || owner != "sg" {
+					t.Errorf("lv start on %s: err=%v state=%s buses=%v owner=%q; want sg running with the H100 at 0000:81:00.0",
+						dest.Name, err, st, buses, owner)
+				}
+			case tc.labels == "":
+				if err == nil || st == "running" || len(buses) != 0 || owner != "" {
+					t.Errorf("lv start on %s: err=%v state=%s buses=%v owner=%q; want it refused, nothing claimed", dest.Name, err, st, buses, owner)
+				}
+			default:
+				v, _ := corrosion.GetVM(ctx, dest.DB, "sg")
+				if err != nil || st != "running" || len(buses) != 0 || v == nil ||
+					!strings.Contains(v.StateDetail, "running without its PCI passthrough devices") {
+					t.Errorf("lv start on %s: err=%v state=%s buses=%v vm=%+v; want it running without devices, saying so", dest.Name, err, st, buses, v)
+				}
+				if rows, qerr := dest.DB.Query(ctx, `SELECT detail FROM audit_log WHERE action = 'vm.passthrough_dropped' AND target = 'sg'`); qerr != nil || len(rows) == 0 {
+					t.Errorf("no vm.passthrough_dropped audit row for sg's start on %s (%v)", dest.Name, qerr)
+				}
+			}
+		})
+	}
+}
+
+// A VM with a type selector, recovered onto b, restarts there with the GPU it
+// already owns there: owned, that GPU is not free, and a fresh pick would
+// find none. Before the latch only: after it, the start preflight's type
+// resolution picks free devices alone, and refuses this restart whether or
+// not a failover came first (a separate finding).
+func TestFleet_PCIFailover_RestartKeepsTheDeviceItOwns(t *testing.T) {
+	defer vfio.SetFS(vfioBoundSysfs{})()
+	const latched = false
+	{
+		ctx := context.Background()
+		clock := NewVirtualClock(time.Now().UTC())
+		c, a, b, _ := pciFoFleetWith(t, clock, pciFoSetup{latched: latched,
+			devs: []*pb.DeviceSpec{{Type: "gpu", Vendor: h100.vendor}},
+			onB:  []pciFoDevice{h100.at(pciFoThere)}})
+		pciFoFailOver(t, ctx, c, clock, a, b)
+		pciFoStart(t, ctx, b)
+		if v := vmOn(t, b, pciFoVM); v == nil || v.State != "running" || v.HostName != b.Name {
+			t.Fatalf("setup: %s did not start on %s: %+v", pciFoVM, b.Name, v)
+		}
+		if v := pciFoRestart(t, ctx, c, a, b); v == nil || v.State != "running" {
+			t.Fatalf("restart on %s of a VM owning its GPU there refused: %+v", b.Name, v)
+		}
+		if buses := pciFoHostdevBuses(b.Virt.DefinedXML(pciFoVM)); len(buses) != 1 || buses[0] != "0x81" {
+			t.Errorf("%s restarted on %s with buses %v, want its H100 at %s", pciFoVM, b.Name, buses, pciFoThere)
+		}
+	}
 }

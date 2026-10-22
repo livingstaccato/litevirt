@@ -29,8 +29,9 @@ func FailoverDeviceRequests(ctx context.Context, db *corrosion.Client, vm corros
 		return nil, nil, fmt.Errorf("read the PCI intents of %s: %w", vm.Name, err)
 	}
 	type selector struct {
-		dev    *pb.DeviceSpec
-		origin string
+		dev      *pb.DeviceSpec
+		deviceID string
+		origin   string
 	}
 	var sels []selector
 	if len(intents) > 0 {
@@ -44,7 +45,7 @@ func FailoverDeviceRequests(ctx context.Context, db *corrosion.Client, vm corros
 				if origin == "" {
 					origin = vm.HostName
 				}
-				sels = append(sels, selector{dev: &pb.DeviceSpec{Address: addr}, origin: origin})
+				sels = append(sels, selector{dev: &pb.DeviceSpec{Address: addr}, deviceID: in.DeviceID, origin: origin})
 				continue
 			}
 			d := &pb.DeviceSpec{}
@@ -67,7 +68,7 @@ func FailoverDeviceRequests(ctx context.Context, db *corrosion.Client, vm corros
 	var descs []string
 	for _, s := range sels {
 		if kind, _ := corrosion.ClassifyPCISelector(s.dev); kind == "address" {
-			ident, _, err := corrosion.PCIAddressIdentity(ctx, db, vm.Name, s.origin, s.dev.Address)
+			ident, _, err := corrosion.PCIAddressIdentity(ctx, db, vm.Name, s.deviceID, s.origin, s.dev.Address)
 			if err != nil {
 				return nil, nil, err
 			}

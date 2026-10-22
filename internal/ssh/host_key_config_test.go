@@ -204,3 +204,30 @@ func TestResolveConfig_UnexpandableKnownHostsRefused(t *testing.T) {
 		}
 	}
 }
+
+// The offer reads every file, not just the first: with ~/.ssh/known_hosts
+// present (holding other hosts) and this host recorded, as ecdsa, only in a
+// configured or global file, the host is asked for ecdsa although it offers
+// ed25519 first -- and a CA line there gets its certificate asked for.
+func TestNewClient_OfferReadsEveryKnownHostsFile(t *testing.T) {
+	for _, kind := range []string{"UserKnownHostsFile", "GlobalKnownHostsFile"} {
+		t.Run(kind+"/plain", func(t *testing.T) {
+			ed, ec := ed25519Signer(t), ecdsaSigner(t)
+			home, addr := configServer(t, "  "+kind+" %H/pinned_kh\n", ed, ec)
+			writeFile(t, filepath.Join(home, ".ssh", "known_hosts"), knownhosts.Line([]string{"other.example"}, ed25519Signer(t).PublicKey()))
+			writeFile(t, filepath.Join(home, "pinned_kh"), knownhosts.Line([]string{knownhosts.Normalize(addr)}, ec.PublicKey()))
+			if err := dialLabnode(t); err != nil {
+				t.Fatalf("host recorded (ecdsa) only in %s, with ~/.ssh/known_hosts present, was refused: %v", kind, err)
+			}
+		})
+		t.Run(kind+"/cert-authority", func(t *testing.T) {
+			ca, ed := ed25519Signer(t), ed25519Signer(t)
+			home, addr := configServer(t, "  "+kind+" %H/pinned_kh\n", hostCert(t, ca, ed, "127.0.0.1"), ed)
+			writeFile(t, filepath.Join(home, ".ssh", "known_hosts"), knownhosts.Line([]string{"other.example"}, ed25519Signer(t).PublicKey()))
+			writeFile(t, filepath.Join(home, "pinned_kh"), caLine(addr, ca.PublicKey()))
+			if err := dialLabnode(t); err != nil {
+				t.Fatalf("CA line only in %s, with ~/.ssh/known_hosts present: %v", kind, err)
+			}
+		})
+	}
+}

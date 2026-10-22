@@ -441,7 +441,7 @@ func TestSetAsideBeforeCreate_KeepsTheDiskOfAnUndecidedDelete(t *testing.T) {
 func TestSetAsideBeforeCreate_MatchesANotedPathInAnyForm(t *testing.T) {
 	db, _, _, dataDir, path := strandedFixture(t)
 	ctx := context.Background()
-	if err := writeKeptDisks(dataDir, "web", []string{filepath.Dir(path) + "//./" + filepath.Base(path)}); err != nil {
+	if err := writeKeptDisks(dataDir, "web", keptDisksNote{Paths: []string{filepath.Dir(path) + "//./" + filepath.Base(path)}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := corrosion.DeleteVM(ctx, db, "web"); err != nil {
@@ -453,5 +453,40 @@ func TestSetAsideBeforeCreate_MatchesANotedPathInAnyForm(t *testing.T) {
 	}
 	if noted, err := keptDisksOf(dataDir, "web"); err != nil || len(noted) != 0 {
 		t.Fatalf("the note still lists %v (%v) once the disk was moved", noted, err)
+	}
+}
+
+// A file a kept disk backs on (noted with NoteKeptBackingFiles) refuses a
+// create that clears its path, naming it, with nothing moved: moving it
+// breaks the kept chain, and the sweep would remove it. The note lists it as
+// a kept disk too, for a build that does not know Under, and forgetting it
+// drops it from both.
+//
+// Mutation: drop the Under refusal in SetAsideBeforeCreate: the file is
+// moved to a .kept- name, red.
+func TestSetAsideBeforeCreate_RefusesOverAFileAKeptDiskBacksOn(t *testing.T) {
+	db, _, _, dataDir, path := strandedFixture(t)
+	ctx := context.Background()
+	if err := NoteKeptBackingFiles(dataDir, "web", []string{path}); err != nil {
+		t.Fatal(err)
+	}
+	if noted, err := keptDisksOf(dataDir, "web"); err != nil || len(noted) != 1 || noted[0] != path {
+		t.Fatalf("the note lists %v (%v); want %s as a kept disk too", noted, err, path)
+	}
+	if err := corrosion.DeleteVM(ctx, db, "web"); err != nil {
+		t.Fatal(err)
+	}
+	done, err := SetAsideBeforeCreate(ctx, db, dataDir, "node-a", "web", []string{path}, samePath, trustedReplica, time.Now())
+	if err == nil || !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), "backs on") || len(done.Moved) != 0 {
+		t.Fatalf("SetAsideBeforeCreate = %+v, %v; want a refusal naming %s, nothing moved", done, err, path)
+	}
+	if b, err := os.ReadFile(path); err != nil || string(b) != "the real disk" {
+		t.Fatalf("the file a kept disk backs on was touched: %q, %v", b, err)
+	}
+	if err := forgetKeptDisks(dataDir, "web", []string{path}); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := keptNoteOf(dataDir, "web"); err != nil || len(n.Paths)+len(n.Under) != 0 {
+		t.Fatalf("the note after forgetting %s = %+v, %v; want none", path, n, err)
 	}
 }

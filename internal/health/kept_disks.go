@@ -36,6 +36,12 @@ func keptDisksFile(dataDir, name string) (string, error) {
 
 type keptDisksNote struct {
 	Paths []string `json:"paths"`
+	// Under: the noted files a kept disk backs on, below its top (a qcow2
+	// backing chain over the VM's own <vm>-<disk>.qcow2). Each is in Paths
+	// too, so a build that does not know Under still moves it to a .kept-
+	// name rather than removing it. A create of the name refuses while one
+	// is at its path (SetAsideBeforeCreate): moving it breaks the chain.
+	Under []string `json:"under,omitempty"`
 }
 
 // KeptDisksNoteError is a note of the disks deletes kept on this host that
@@ -51,47 +57,70 @@ func (e *KeptDisksNoteError) Unwrap() error { return e.Err }
 // keptDisksOf returns the paths noted for name here, each cleaned. A note
 // that cannot be read or parsed is a *KeptDisksNoteError.
 func keptDisksOf(dataDir, name string) ([]string, error) {
+	n, err := keptNoteOf(dataDir, name)
+	return n.Paths, err
+}
+
+// keptNoteOf is name's note here, every path cleaned; no note is an empty
+// one. A note that cannot be read or parsed is a *KeptDisksNoteError.
+func keptNoteOf(dataDir, name string) (keptDisksNote, error) {
 	if dataDir == "" {
-		return nil, nil
+		return keptDisksNote{}, nil
 	}
 	f, err := keptDisksFile(dataDir, name)
 	if err != nil {
-		return nil, err
+		return keptDisksNote{}, err
 	}
 	b, err := os.ReadFile(f)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
+		return keptDisksNote{}, nil
 	}
 	if err != nil {
-		return nil, &KeptDisksNoteError{File: f, Err: err}
+		return keptDisksNote{}, &KeptDisksNoteError{File: f, Err: err}
 	}
 	var n keptDisksNote
 	if err := json.Unmarshal(b, &n); err != nil {
-		return nil, &KeptDisksNoteError{File: f, Err: err}
+		return keptDisksNote{}, &KeptDisksNoteError{File: f, Err: err}
 	}
-	for i, p := range n.Paths {
-		n.Paths[i] = filepath.Clean(p)
+	for _, l := range [][]string{n.Paths, n.Under} {
+		for i, p := range l {
+			l[i] = filepath.Clean(p)
+		}
 	}
-	return n.Paths, nil
+	return n, nil
 }
 
 // NoteKeptDisks adds paths to name's note here.
 func NoteKeptDisks(dataDir, name string, paths []string) error {
+	return noteKept(dataDir, name, paths, false)
+}
+
+// NoteKeptBackingFiles adds files to name's note here as files a kept disk
+// backs on (keptDisksNote.Under), and as kept disks.
+func NoteKeptBackingFiles(dataDir, name string, files []string) error {
+	return noteKept(dataDir, name, files, true)
+}
+
+func noteKept(dataDir, name string, paths []string, under bool) error {
 	if dataDir == "" || len(paths) == 0 {
 		return nil
 	}
 	keptDisksMu.Lock()
 	defer keptDisksMu.Unlock()
-	have, err := keptDisksOf(dataDir, name)
+	n, err := keptNoteOf(dataDir, name)
 	if err != nil {
 		return err
 	}
 	for _, p := range paths {
-		if p = filepath.Clean(p); !slices.Contains(have, p) {
-			have = append(have, p)
+		p = filepath.Clean(p)
+		if !slices.Contains(n.Paths, p) {
+			n.Paths = append(n.Paths, p)
+		}
+		if under && !slices.Contains(n.Under, p) {
+			n.Under = append(n.Under, p)
 		}
 	}
-	return writeKeptDisks(dataDir, name, have)
+	return writeKeptDisks(dataDir, name, n)
 }
 
 // forgetKeptDisks drops paths from name's note here, and the note once it is
@@ -102,22 +131,24 @@ func forgetKeptDisks(dataDir, name string, paths []string) error {
 	}
 	keptDisksMu.Lock()
 	defer keptDisksMu.Unlock()
-	have, err := keptDisksOf(dataDir, name)
-	if err != nil || len(have) == 0 {
+	n, err := keptNoteOf(dataDir, name)
+	if err != nil || len(n.Paths) == 0 {
 		return err
 	}
-	left := slices.DeleteFunc(have, func(p string) bool {
+	gone := func(p string) bool {
 		return slices.ContainsFunc(paths, func(q string) bool { return filepath.Clean(q) == p })
-	})
-	return writeKeptDisks(dataDir, name, left)
+	}
+	n.Paths = slices.DeleteFunc(n.Paths, gone)
+	n.Under = slices.DeleteFunc(n.Under, gone)
+	return writeKeptDisks(dataDir, name, n)
 }
 
-func writeKeptDisks(dataDir, name string, paths []string) error {
+func writeKeptDisks(dataDir, name string, n keptDisksNote) error {
 	f, err := keptDisksFile(dataDir, name)
 	if err != nil {
 		return err
 	}
-	if len(paths) == 0 {
+	if len(n.Paths) == 0 {
 		if err := os.Remove(f); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
@@ -127,7 +158,7 @@ func writeKeptDisks(dataDir, name string, paths []string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	b, err := json.Marshal(keptDisksNote{Paths: paths})
+	b, err := json.Marshal(n)
 	if err != nil {
 		return err
 	}

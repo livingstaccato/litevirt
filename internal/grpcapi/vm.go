@@ -3819,12 +3819,6 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			"cannot delete %q: an operation is in progress (abort it first with `lv operation abort %s`)", req.Name, req.Name)
 	}
 
-	// Before the delete is forwarded or acts anywhere; asked again below
-	// under this host's lock, where the delete acts.
-	if err := s.keepDisksSnapshotRefusal(ctx, req); err != nil {
-		return nil, err
-	}
-
 	if !localOnly && vm.HostName != s.hostName {
 		// A removed host is not dialled: its rows are deleted here
 		// (removed_host_delete.go).
@@ -3832,6 +3826,13 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			return nil, err
 		} else if removed {
 			return s.deleteVMOnRemovedHost(ctx, vm)
+		}
+		// Asked of this host's replica before the forward too, for an owner
+		// on an older build; the owner asks again, under its own lock. Not on
+		// a removed host above: that delete frees nothing there, and `lv
+		// snapshot rm` cannot reach it.
+		if err := s.keepDisksSnapshotRefusal(ctx, req); err != nil {
+			return nil, err
 		}
 		releaseLock() // never hold a process lock across a peer RPC
 		client, closePeer, err := s.dialPeer(ctx, vm.HostName)
@@ -3929,12 +3930,12 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	if err := s.firmwareMoveRefusal("delete", vm); err != nil {
 		return nil, err
 	}
-	// Under the VM's lock, which a snapshot create of it takes too, on the
-	// host that holds its disks.
+	// On the host that holds the VM's disks, under the VM's lock, which a
+	// snapshot create of it takes too.
 	if err := s.keepDisksSnapshotRefusal(ctx, req); err != nil {
 		return nil, err
 	}
-	if err := s.keepDisksChainRefusal(ctx, req); err != nil {
+	if err := s.keptChainRefusal(ctx, req); err != nil {
 		return nil, err
 	}
 

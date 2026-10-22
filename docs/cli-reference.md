@@ -264,7 +264,13 @@ on the same host would take `<data_dir>/disks/<vm>-<disk>.qcow2`, so the create
 first renames a kept disk there to `<path>.kept-<time>`, and the kept VM's
 cloud-init seed (`cloudinit/<vm>.iso`) to `<seed>.kept-<time>`. Nothing removes
 those files; each rename is recorded as a `vm.disk.kept` event of the VM. A disk
-recorded `delete_with_vm=false` is handled the same way. The create renames
+recorded `delete_with_vm=false` is handled the same way, except a file such a
+disk backs on: when the kept disk is a qcow2 overlay on another
+`<vm>-<disk>.qcow2` (a snapshot chain), renaming the file under it would break
+the overlay's backing reference, so the create is refused, naming that file,
+with nothing moved. Move the kept disk and the files under it elsewhere
+yourself (then `qemu-img rebase -u -b <new path> <overlay>`), or place the VM
+on another host. The create renames
 nothing until the refusals it can judge up front have passed (Secure Boot or
 vTPM over kept UEFI vars, a USB device the host does not have, the image not
 available), and a create that fails
@@ -288,13 +294,22 @@ done. Kept, such a disk is a backing chain whose base sits at the path a later
 VM of the same name creates its disk at, and the snapshots' records, memory
 images and firmware bundles are kept under the VM's name, where that later VM
 would list them and remove them. Remove the snapshots first
-(`lv snapshot rm <vm> <name>`, which merges each into its disk), or delete
-without `--keep-disks`. A disk that is still an overlay on another of the VM's
-own disk files (`<vm>-<disk>.qcow2`) with no snapshot left, as a snapshot
-restore or a metadata-only `lv snapshot rm` can leave it, is refused the same way: copy it
-out to a standalone image first, or delete without `--keep-disks`. A disk
-whose backing chain cannot be read, or snapshot records that cannot be read,
-refuse the delete too, and a retry is safe.
+(`lv snapshot rm <vm> <name>`; a snapshot libvirt can merge goes into its
+disk, and one it deletes as metadata only leaves its overlay in place), or
+delete without `--keep-disks`. A disk that is still an overlay on another of
+the VM's own disk files (`<vm>-<disk>.qcow2`) with no snapshot left, as a
+snapshot restore or a metadata-only `lv snapshot rm` can leave it, is refused
+the same way: copy the disk out to a standalone image, then delete without
+`--keep-disks`. A VM recorded on a host removed for good is not refused for
+its snapshots: that delete removes only its records, as a plain `lv rm` does
+there.
+
+Any delete that keeps a disk (`--keep-disks`, or a disk recorded
+`delete_with_vm=false`) reads the disk's whole qcow2 backing chain first. A
+file in the chain that cannot be read (a missing backing file, or a header
+that is not valid qcow2) refuses the delete before anything is done, naming
+the file. Snapshot records that cannot be read refuse a `--keep-disks` delete
+the same way. Fix the file or the storage, then retry.
 
 With `--keep-disks`, libvirt refuses the undefine of a domain that still holds
 snapshots litevirt has no record of (taken with `virsh`, "cannot delete inactive domain with N

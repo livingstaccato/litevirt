@@ -221,3 +221,112 @@ func TestFleet_RmKeepDisks_AfterItsSnapshotsGoKeepsDiskAndNVRAM(t *testing.T) {
 		t.Errorf("the new sv lists snapshots %+v (%v); want none", snaps, err)
 	}
 }
+
+// rkdCorruptHeader leaves path a file qemu cannot read as qcow2 while its
+// magic still says qcow2: cluster_bits (header offset 20) is out of range.
+func rkdCorruptHeader(t *testing.T, path string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteAt([]byte{0, 0, 0, 99}, 20); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := qcow2.Info(path); err == nil {
+		t.Fatalf("%s still reads as qcow2 after its header was broken", path)
+	}
+}
+
+// A plain `lv rm` of a VM whose disk recorded delete_with_vm=false is an
+// overlay on the VM's own <vm>-root.qcow2 keeps both files, and a later
+// create of the name on the host refuses, naming the base, rather than
+// moving it off its path (which breaks the overlay's backing reference) or
+// letting its sweep remove it and write the new root disk there
+// (re-review 1, P1). Nothing is moved; the overlay still backs on the base,
+// byte for byte. Once the operator has moved the kept files away, the create
+// goes ahead.
+//
+// Red on f4b919f9c (and on 4b13deaf1): the create succeeds and the base is
+// replaced, with no .kept- copy. Mutation: drop the backing-file refusal in
+// SetAsideBeforeCreate: red; drop the noting of backing files in
+// noteKeptDisks: red.
+func TestFleet_PlainRm_KeptChainIsNotTakenByARecreate(t *testing.T) {
+	ctx := context.Background()
+	n, cl := rkdCluster(t)
+	base, ov := rkdRealOverlay(t, n, cl)
+	if err := n.DB.Execute(ctx, `UPDATE vm_disks SET delete_with_vm = 0 WHERE vm_name = 'sv'`); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string][]byte{base: readFileT(t, base), ov: readFileT(t, ov)}
+	if _, err := cl.DeleteVM(ctx, &pb.DeleteVMRequest{Name: "sv", Force: true}); err != nil {
+		t.Fatalf("lv rm sv: %v", err)
+	}
+
+	_, err := cl.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "sv", Image: "ubuntu", Cpu: 1, MemoryMib: 256, Placement: &pb.PlacementSpec{Host: n.Name}}})
+	if err == nil || !strings.Contains(err.Error(), base) || !strings.Contains(err.Error(), "backs on") {
+		t.Fatalf("create of sv over the kept chain = %v; want a refusal naming %s", err, base)
+	}
+	for p, b := range files {
+		if got, err := os.ReadFile(p); err != nil || !bytes.Equal(got, b) {
+			t.Errorf("%s changed or went (err=%v)", p, err)
+		}
+	}
+	if info, err := qcow2.Info(ov); err != nil || info.BackingFile != base {
+		t.Errorf("the kept overlay's backing file = %+v, %v; want %s", info, err, base)
+	}
+	if m := globT(t, base+".kept-*"); len(m) != 0 {
+		t.Errorf("the base was moved to %v, which leaves the kept overlay backing on nothing", m)
+	}
+
+	moved := filepath.Join(filepath.Dir(base), "operator-moved")
+	if err := os.MkdirAll(moved, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for p := range files {
+		if err := os.Rename(p, filepath.Join(moved, filepath.Base(p))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rkdCreate(t, cl, n)
+}
+
+// The keep is decided from the kept disk's whole backing chain, so a layer
+// whose header cannot be read (here the overlay's, which hides the base
+// under it) refuses the delete before anything is done, naming the file, with --keep-disks and for a disk recorded
+// delete_with_vm=false alike (re-review 1, N3): the walk used to end at such
+// a layer as at the bottom of the chain, and the delete went through.
+//
+// Red on f4b919f9c: both deletes succeed. Mutation: end the walk at an
+// unreadable header (keptChainLayers returns what it has): red.
+func TestFleet_RmKeepDisks_UnreadableChainIsRefused(t *testing.T) {
+	for _, keep := range []bool{true, false} {
+		name := "keep-disks"
+		if !keep {
+			name = "delete_with_vm=false"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			n, cl := rkdCluster(t)
+			base, ov := rkdRealOverlay(t, n, cl)
+			if _, err := cl.DeleteSnapshot(ctx, &pb.DeleteSnapshotRequest{VmName: "sv", SnapshotName: "s1"}); err != nil {
+				t.Fatalf("lv snapshot rm sv s1: %v", err)
+			}
+			if !keep {
+				if err := n.DB.Execute(ctx, `UPDATE vm_disks SET delete_with_vm = 0 WHERE vm_name = 'sv'`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rkdCorruptHeader(t, ov)
+			vm, _ := corrosion.GetVM(ctx, n.DB, "sv")
+			files := map[string][]byte{base: readFileT(t, base), ov: readFileT(t, ov)}
+			from := len(n.Virt.EventLog())
+
+			_, err := cl.DeleteVM(ctx, &pb.DeleteVMRequest{Name: "sv", KeepDisks: keep, Force: true})
+			rkdRefused(t, err, ov)
+			rkdUntouched(t, n, files, vm.State, from)
+		})
+	}
+}

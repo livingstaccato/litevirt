@@ -700,6 +700,7 @@ func (c *Cluster) NewCoordinators(clock *VirtualClock) *Coordinators {
 		// scenario enables them (enableRecoveryClaims).
 		coord.Claimer = n.Server
 		coord.RecoveryClaimEnforced = n.Server.RecoveryClaimEnforced
+		coord.SettleMigratingRows = n.Server.SettleFailedSourceMigrations
 		coord.ClaimHealth = n.Server.RecoveryClaimHealthTick
 		// host.pressure is the lease holder's to write, as the daemon wires it.
 		coord.PressureHealth = n.Server.PressureHealthTick

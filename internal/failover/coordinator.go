@@ -4085,6 +4085,9 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 	}
 	plans := make([]failoverPlan, 0, len(vms))
 	placementReqs := make([]placement.Request, 0, len(vms))
+	// The PCI passthrough devices of each VM placed with them, described
+	// for its hold (pci_devices.go).
+	devHeld := map[string][]string{}
 
 	// A VM recorded migrating may run on the migration's target: it is
 	// started nowhere until the target is asked (migrating_row.go).
@@ -4117,6 +4120,10 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 					req := buildFailoverPlacementRequest(vm, h.Name, c.capacity, pinDown)
 					c.addPlacementLabels(ctx, &req, vm.Name)
 					c.resolveUSBPlacement(ctx, &req)
+					if _, hold := c.addDevicePlacement(ctx, &req, vm); hold != "" {
+						c.skipStoppedVM(ctx, h.Name, vm, stoppedVMDetail(h.Name)+"; not moved: "+hold)
+						continue
+					}
 					req.RequireRegion = c.vmRecoveryRegion(h.Name, vm)
 					placementReqs = append(placementReqs, req)
 					plans = append(plans, failoverPlan{vm: vm, needsPlacement: true, rekeyStopped: true})
@@ -4314,6 +4321,14 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			req := buildFailoverPlacementRequest(vm, h.Name, c.capacity, pinDown)
 			c.addPlacementLabels(ctx, &req, vm.Name)
 			c.resolveUSBPlacement(ctx, &req)
+			devs, hold := c.addDevicePlacement(ctx, &req, vm)
+			if hold != "" {
+				c.holdForDevices(ctx, h.Name, vm, nil, hold)
+				continue
+			}
+			if len(devs) > 0 {
+				devHeld[vm.Name] = devs
+			}
 			if pin := vmSpecPin(vm); pin != "" && pin != h.Name && req.PinHost == "" {
 				slog.Warn("failover: the VM's pinned host is down; recovering it elsewhere for this outage, its pin unchanged",
 					"vm", vm.Name, "pinned_host", pin, "pinned_host_state", hostState[pin], "from", h.Name)
@@ -4358,7 +4373,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		// and the operator (or the next placement input change) recovers them;
 		// hard constraints that no surviving host satisfies must strand the
 		// workload, not relocate it somewhere it was never allowed to run.
-		if selected, err := placement.SelectBatch(c.pitOverlaySafeTargets(ctx, candidates), allVMs, nil, ctMem,
+		if selected, err := c.selectBatch(ctx, c.pitOverlaySafeTargets(ctx, candidates), allVMs, ctMem,
 			observations, c.now(), placementReqs); err != nil {
 			slog.Error("failover: batch placement failed — affected VMs are left for operator recovery, NOT round-robined",
 				"host", h.Name, "error", err)
@@ -4387,6 +4402,14 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				detail := "no eligible host satisfies its placement constraints after fencing " + h.Name
 				if result.Err != nil {
 					detail += ": " + result.Err.Error()
+				}
+				if devs := devHeld[vm.Name]; len(devs) > 0 {
+					why := ""
+					if result.Err != nil {
+						why = result.Err.Error()
+					}
+					c.holdForDevices(ctx, h.Name, vm, devs, why)
+					continue
 				}
 				slog.Warn("failover: no eligible host for VM — left for operator recovery, NOT round-robined",
 					"vm", vm.Name, "from", h.Name, "reason", result.Err)
@@ -4527,6 +4550,10 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		c.mVM(ActionReschedule, ResultSuccess, errClassNone)
 
 		c.audit(ctx, "failover", vm.Name, "rescheduled from "+h.Name+" to "+targetName, "ok")
+		// A hold an earlier pass recorded (for its PCI devices) is over.
+		if err := health.ResolveHeldMoved(ctx, c.db, c.hostName, vm.Name, h.Name, c.now()); err != nil {
+			slog.Warn("failover: could not clear the hold of a VM recovered since", "vm", vm.Name, "error", err)
+		}
 		c.noteDiskStranded(ctx, h.Name, vm, targetName)
 		// The VM may now run on its own replica target: replicate back to the
 		// host it left (or leave the schedule suspended, reported by its runs).

@@ -34,6 +34,8 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
 const (
@@ -236,6 +238,21 @@ const LabelFailoverAnyRegion = "litevirt.failover_any_region"
 // the manual promote command instead. A build that does not know the label
 // ignores it, which is the default.
 const LabelAutoPromoteNotPointInTime = "litevirt.auto_promote_not_point_in_time"
+
+// LabelFailoverWithoutDevices, when "true" in a VM spec's labels, lets
+// failover recover a VM with PCI passthrough devices onto a host that has no
+// free device of the kind they need, and that host start it without them,
+// saying so in its state detail and an event. Absent, or anything else, holds
+// such a VM on its failed host (vm_failover_held) until a host with matching
+// devices can take it. A build that does not know the label recovers the VM
+// as it always did.
+const LabelFailoverWithoutDevices = "litevirt.failover_without_devices"
+
+// FailoverWithoutDevices reports whether spec opts in to
+// LabelFailoverWithoutDevices.
+func FailoverWithoutDevices(spec *pb.VMSpec) bool {
+	return spec != nil && spec.Labels[LabelFailoverWithoutDevices] == "true"
+}
 
 // ErrPromoteHeld is wrapped by an automatic promotion that deliberately holds
 // the VM down — its only replicas are not point-in-time and it has not opted

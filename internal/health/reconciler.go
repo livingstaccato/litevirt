@@ -312,6 +312,10 @@ type Reconciler struct {
 	// release func is invoked ONLY if the subsequent StartDomain fails.
 	prepareHardwareForStart func(ctx context.Context, vm *corrosion.VMRecord) (func(), error)
 
+	// passthroughForRebuild claims the PCI passthrough a rebuilt domain
+	// carries (passthrough_rebuild.go). nil: none.
+	passthroughForRebuild func(ctx context.Context, vm *corrosion.VMRecord) (PassthroughRebuild, error)
+
 	// seedRefreshRaced, set only by tests, runs in refreshOwnSeed between the
 	// derivation of the network-config and the rewrite.
 	seedRefreshRaced func()
@@ -2368,7 +2372,24 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// Every disk is in place: a parked transfer has done its rebuilding.
 	r.deferredTransfers.drop(vm.Name)
 
-	domXML, retryable, failure := r.domainXMLFor(ctx, vm, spec, diskConfigs)
+	// The PCI passthrough the domain is built with, claimed on this host
+	// (passthrough_rebuild.go). A VM this host has no devices for is not
+	// started, rather than started without them; what was claimed is given
+	// back by every return below that does not start it.
+	pt, ptErr := r.rebuildPassthrough(ctx, fresh)
+	if ptErr != nil {
+		slog.Warn("reconciler: PCI passthrough not available here — not starting VM", "vm", vm.Name, "error", ptErr)
+		r.noteGateRefused(corrosion.ActionReschedule, ReasonHardwareBlocked)
+		r.failPendingStart(ctx, vm.Name, proofID, hwPrepareRetryable(ptErr), fmt.Sprintf("PCI passthrough: %v", ptErr))
+		return
+	}
+	ptStarted := false
+	defer func() { pt.done(ptStarted) }()
+	if pt.Dropped != "" {
+		ctx = WithPassthroughDropped(ctx)
+	}
+
+	domXML, retryable, failure := r.domainXMLWith(ctx, vm, spec, diskConfigs, pt.Addresses)
 	if failure != "" {
 		r.failPendingStart(ctx, vm.Name, proofID, retryable, failure)
 		return
@@ -2513,6 +2534,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		r.failPendingStart(ctx, vm.Name, proofID, true, fmt.Sprintf("start: %v", err)) // transient libvirt
 		return
 	}
+	ptStarted = true
 	// The guest is booting: the healthcheck's start grace runs from now (every
 	// reconciler start — failover, reschedule, onboot — comes through here).
 	if r.vmStartObserver != nil {
@@ -2562,6 +2584,9 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		return
 	}
 	r.reportSharedWithheld(commitCtx, vm.Name, corrosion.WithheldSharedDiskDetail(vm.Name, r.hostName, withheld))
+	if pt.Dropped != "" {
+		r.reportPassthroughDropped(commitCtx, vm.Name, pt.Dropped)
+	}
 	slog.Info("reconciler: VM started successfully", "vm", vm.Name)
 
 	// Notify LB to refresh backends now that this VM is running.
@@ -2830,6 +2855,12 @@ func (r *Reconciler) seedIsCurrent(ctx context.Context, vmName, iso string) bool
 // (provisioned here), firmware and resources. On failure it returns "" with
 // whether a later attempt may succeed and what failed.
 func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, spec *pb.VMSpec, diskConfigs []lv.DiskConfig) (domXML string, retryable bool, failure string) {
+	return r.domainXMLWith(ctx, vm, spec, diskConfigs, nil)
+}
+
+// domainXMLWith is domainXMLFor with the PCI devices, at pciAddrs on this
+// host, that the domain passes through (passthrough_rebuild.go).
+func (r *Reconciler) domainXMLWith(ctx context.Context, vm corrosion.VMRecord, spec *pb.VMSpec, diskConfigs []lv.DiskConfig, pciAddrs []string) (domXML string, retryable bool, failure string) {
 	// Check for cloud-init ISO. The reconciler acts on a stored (possibly
 	// peer-replicated) row, so build the ISO path through the validated builder
 	// — a malformed vm.Name must not escape the cloudinit dir.
@@ -3017,6 +3048,9 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		vmCfg.BridgeMTU = br.BridgeMTU
 	}
 	vmCfg.HostName = r.hostName
+	for _, addr := range pciAddrs {
+		vmCfg.Hostdevs = append(vmCfg.Hostdevs, lv.HostdevConfig{Address: addr})
+	}
 	domXML, err = lv.GenerateDomainXML(vmCfg)
 	if err != nil {
 		slog.Error("reconciler: generate domain XML", "vm", vm.Name, "error", err)

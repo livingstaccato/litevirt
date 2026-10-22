@@ -2591,7 +2591,10 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	// the start and releases whatever was claimed. GATED on hardwareV2Latched AND the
 	// VM actually having intents, so a non-PCI or pre-latch VM's start path is
 	// byte-for-behavior unchanged (no preflight, no bind attempt).
-	if s.hardwareV2Latched(ctx) {
+	//
+	// Not for a start the reconciler makes without the devices, by the VM's
+	// own opt-in, on a host that has none for it (health.WithPassthroughDropped).
+	if !health.PassthroughDropped(ctx) && s.hardwareV2Latched(ctx) {
 		intents, ierr := corrosion.ListVMPCIIntents(ctx, s.db, vm.Name)
 		if ierr != nil {
 			return releasePreflight, status.Errorf(codes.Internal, "read PCI intents for %q: %v", vm.Name, ierr)
@@ -2674,10 +2677,21 @@ func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord
 	// Adoption gate + PCI start-preflight (shared with the automated restart paths).
 	// No-op pre-latch, so every start behaves byte-for-behavior as before until
 	// hardware_v2 latches.
-	releasePreflight, err := s.PrepareHardwareForStart(ctx, vm)
+	//
+	// Before the latch, a VM whose definition lacks the PCI devices its spec
+	// declares (moved here stopped by a failover) gets them here first, or
+	// is refused (pci_failover.go).
+	ptDone, ptDropped, err := s.passthroughForStart(ctx, vm)
 	if err != nil {
 		return nil, err
 	}
+	releasePreflight, err := s.PrepareHardwareForStart(ctx, vm)
+	if err != nil {
+		ptDone(false)
+		return nil, err
+	}
+	prepared := releasePreflight
+	releasePreflight = func() { prepared(); ptDone(false) }
 
 	hspec := vmHooks(vm)
 	pbVM := &pb.VM{Name: vm.Name, HostName: vm.HostName, State: pb.VMState_VM_STARTING}
@@ -2704,7 +2718,16 @@ func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord
 	}
 	finish := func(ctx context.Context, startErr error) (*pb.VM, error) {
 		releaseGuard()
-		return s.finishStartLocked(ctx, vm, startErr, releasePreflight, pbVM, hspec)
+		out, err := s.finishStartLocked(ctx, vm, startErr, releasePreflight, pbVM, hspec)
+		// Started: libvirt said so, or the domain was found running. A
+		// read-back of the VM that fails after that does not undo it.
+		if startErr == nil || err == nil {
+			ptDone(true)
+			if ptDropped != "" {
+				s.notePassthroughDropped(ctx, vm.Name, ptDropped)
+			}
+		}
+		return out, err
 	}
 	if wait <= 0 {
 		return finish(ctx, s.virt.StartDomain(vm.Name))

@@ -444,11 +444,17 @@ func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.
 // the acquire phase (allocateSRIOVVFs) — wiring pure SR-IOV candidate selection
 // into this resolver is deferred to the start-path task.
 func (s *Server) resolveDeviceIntents(ctx context.Context, vmName string, intents []corrosion.PCIIntentRecord) ([]ResolvedMember, error) {
-	var members []ResolvedMember
 	// Cross-intent exclusion set (see resolveDeviceSpec): a scratch map so two
 	// type/vendor intents resolve to distinct devices, exactly as the live-spec
 	// path. Local to this call — resolveDeviceIntents stays pure.
-	selected := map[string]bool{}
+	return s.resolveDeviceIntentsExcluding(ctx, vmName, intents, map[string]bool{})
+}
+
+// resolveDeviceIntentsExcluding is resolveDeviceIntents with a caller-owned
+// exclusion set, for a caller that resolves a VM's intents one at a time:
+// each takes a device none before it took.
+func (s *Server) resolveDeviceIntentsExcluding(ctx context.Context, vmName string, intents []corrosion.PCIIntentRecord, selected map[string]bool) ([]ResolvedMember, error) {
+	var members []ResolvedMember
 	for _, intent := range intents {
 		switch intent.SelectorKind {
 		case "sriov":
@@ -458,6 +464,17 @@ func (s *Server) resolveDeviceIntents(ctx context.Context, vmName string, intent
 			addr := ""
 			if intent.ExclusiveKey != nil {
 				addr = *intent.ExclusiveKey
+			}
+			// The address is a slot on the host it was recorded on. On any
+			// other host (a failover) it is realized by a device of its kind
+			// here, never by whatever sits at the same address
+			// (pci_failover.go).
+			if intent.HostName != "" && intent.HostName != s.hostName {
+				local, err := s.addressOnThisHost(ctx, vmName, intent.DeviceID, intent.HostName, addr, selected)
+				if err != nil {
+					return nil, err
+				}
+				addr = local
 			}
 			specMembers, err := s.resolveDeviceSpec(ctx, vmName, &pb.DeviceSpec{Address: addr}, intent.DeviceID, selected)
 			if err != nil {
@@ -674,6 +691,9 @@ func (s *Server) pciStartPreflight(ctx context.Context, vm *corrosion.VMRecord, 
 	// ── Resolve every intent to concrete members (routing SR-IOV to the allocator) ──
 	var members []ResolvedMember
 	var claimedSriov []string // VFs allocateSRIOVVFs CAS-claimed (released on a resolve failure)
+	// Every device an earlier intent of this start took: two intents of one
+	// kind take two devices.
+	selected := map[string]bool{}
 	resolveFail := func(e error) (func(), error) {
 		if len(claimedSriov) > 0 {
 			// The VFs were CAS-claimed but never vfio-bound (allocateSRIOVVFs binds nothing),
@@ -705,11 +725,12 @@ func (s *Server) pciStartPreflight(ctx context.Context, vm *corrosion.VMRecord, 
 			for i, a := range vfAddrs {
 				members = append(members, ResolvedMember{DeviceID: in.DeviceID, MemberID: fmt.Sprintf("m%d", i), Address: a, Ordinal: i})
 				claimedSriov = append(claimedSriov, a)
+				selected[a] = true
 			}
 			continue
 		}
 		// address / mapping / type: the pure resolver.
-		specMembers, rerr := s.resolveDeviceIntents(ctx, vm.Name, []corrosion.PCIIntentRecord{in})
+		specMembers, rerr := s.resolveDeviceIntentsExcluding(ctx, vm.Name, []corrosion.PCIIntentRecord{in}, selected)
 		if rerr != nil {
 			return resolveFail(rerr)
 		}

@@ -1462,6 +1462,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Wire reconciler callbacks now that gRPC server exists.
 	reconciler.SetOnVMStarted(svc.RefreshLBForStack)
 	reconciler.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
+	// A rebuilt domain's PCI passthrough (health/passthrough_rebuild.go).
+	reconciler.SetPassthroughForRebuild(svc.PassthroughForRebuild)
 	reconciler.SetCancelledStartProbe(svc.HasCancelledStart) // cancelled_starts.go: an error row's late-started domain is the sweep's
 	// A held start whose daemon restarted before libvirt answered it: its
 	// lease is taken over once the domain runs, and its outcome recorded

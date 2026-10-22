@@ -1094,8 +1094,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// from here — the coordinator's and FenceHost's — reaches its target.
 	fenceSSH := fencessh.New(fencessh.Config{
 		Self: d.cfg.HostName, PKIDir: d.cfg.PKIDir, DB: d.db, Gate: svc,
-		Accepting: fencessh.SSHDAccepting(fencessh.SSHDPath(), "", fencessh.DefaultDir),
-		Mode:      func() string { return d.cfg.Enforcement.FenceSSH },
+		Accepting:     fencessh.SSHDAccepting(fencessh.SSHDPath(), "", fencessh.DefaultDir),
+		Mode:          func() string { return d.cfg.Enforcement.FenceSSH },
+		ProbeInterval: d.cfg.FenceSSHProbeInterval(),
 	})
 	svc.SetFenceSSH(fenceSSH)
 	fc.FenceSSH = fenceSSH.FenceConfig

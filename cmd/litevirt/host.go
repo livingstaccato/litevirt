@@ -47,6 +47,7 @@ func newHostCmd() *cobra.Command {
 		newHostCephCmd(),
 		newHostRotateAuditKeyCmd(),
 		newHostInstallGossipKeyCmd(),
+		newHostInstallFenceSSHCmd(),
 		newHostInstallMigrationTLSCmd(),
 		newHostRotateMigrationCACmd(),
 		newHostRotateGossipKeyCmd(),

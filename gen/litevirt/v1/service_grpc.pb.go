@@ -33,6 +33,7 @@ const (
 	LiteVirt_GetClusterHealth_FullMethodName            = "/litevirt.v1.LiteVirt/GetClusterHealth"
 	LiteVirt_ResolveHealthCondition_FullMethodName      = "/litevirt.v1.LiteVirt/ResolveHealthCondition"
 	LiteVirt_GetFenceReadiness_FullMethodName           = "/litevirt.v1.LiteVirt/GetFenceReadiness"
+	LiteVirt_GetFenceSSHStatus_FullMethodName           = "/litevirt.v1.LiteVirt/GetFenceSSHStatus"
 	LiteVirt_RemoveHost_FullMethodName                  = "/litevirt.v1.LiteVirt/RemoveHost"
 	LiteVirt_PreflightRemoveHost_FullMethodName         = "/litevirt.v1.LiteVirt/PreflightRemoveHost"
 	LiteVirt_AdmitHost_FullMethodName                   = "/litevirt.v1.LiteVirt/AdmitHost"
@@ -407,6 +408,12 @@ type LiteVirtClient interface {
 	// possibly stale UEFI vars store (accept_stale_uefi_vars).
 	ResolveHealthCondition(ctx context.Context, in *ResolveHealthConditionRequest, opts ...grpc.CallOption) (*ResolveHealthConditionResponse, error)
 	GetFenceReadiness(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*FenceReadiness, error)
+	// GetFenceSSHStatus is the answering host's view of managed fence SSH
+	// (internal/fencessh): every host's row as it holds it, the path a fence
+	// from it would take to each, and its last probe of each. With fan_out it
+	// also asks every other host for its own view, for the pair matrix
+	// `lv doctor fence` prints. DIAGNOSTIC ONLY.
+	GetFenceSSHStatus(ctx context.Context, in *FenceSSHStatusRequest, opts ...grpc.CallOption) (*FenceSSHStatus, error)
 	RemoveHost(ctx context.Context, in *RemoveHostRequest, opts ...grpc.CallOption) (*RemoveHostResponse, error)
 	// PreflightRemoveHost runs every refusal RemoveHost would give the same
 	// request and removes nothing. `lv host rm` calls it before it revokes the
@@ -1336,6 +1343,16 @@ func (c *liteVirtClient) GetFenceReadiness(ctx context.Context, in *emptypb.Empt
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(FenceReadiness)
 	err := c.cc.Invoke(ctx, LiteVirt_GetFenceReadiness_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) GetFenceSSHStatus(ctx context.Context, in *FenceSSHStatusRequest, opts ...grpc.CallOption) (*FenceSSHStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FenceSSHStatus)
+	err := c.cc.Invoke(ctx, LiteVirt_GetFenceSSHStatus_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -5128,6 +5145,12 @@ type LiteVirtServer interface {
 	// possibly stale UEFI vars store (accept_stale_uefi_vars).
 	ResolveHealthCondition(context.Context, *ResolveHealthConditionRequest) (*ResolveHealthConditionResponse, error)
 	GetFenceReadiness(context.Context, *emptypb.Empty) (*FenceReadiness, error)
+	// GetFenceSSHStatus is the answering host's view of managed fence SSH
+	// (internal/fencessh): every host's row as it holds it, the path a fence
+	// from it would take to each, and its last probe of each. With fan_out it
+	// also asks every other host for its own view, for the pair matrix
+	// `lv doctor fence` prints. DIAGNOSTIC ONLY.
+	GetFenceSSHStatus(context.Context, *FenceSSHStatusRequest) (*FenceSSHStatus, error)
 	RemoveHost(context.Context, *RemoveHostRequest) (*RemoveHostResponse, error)
 	// PreflightRemoveHost runs every refusal RemoveHost would give the same
 	// request and removes nothing. `lv host rm` calls it before it revokes the
@@ -5944,6 +5967,9 @@ func (UnimplementedLiteVirtServer) ResolveHealthCondition(context.Context, *Reso
 }
 func (UnimplementedLiteVirtServer) GetFenceReadiness(context.Context, *emptypb.Empty) (*FenceReadiness, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetFenceReadiness not implemented")
+}
+func (UnimplementedLiteVirtServer) GetFenceSSHStatus(context.Context, *FenceSSHStatusRequest) (*FenceSSHStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetFenceSSHStatus not implemented")
 }
 func (UnimplementedLiteVirtServer) RemoveHost(context.Context, *RemoveHostRequest) (*RemoveHostResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RemoveHost not implemented")
@@ -7216,6 +7242,24 @@ func _LiteVirt_GetFenceReadiness_Handler(srv interface{}, ctx context.Context, d
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).GetFenceReadiness(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_GetFenceSSHStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FenceSSHStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetFenceSSHStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetFenceSSHStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetFenceSSHStatus(ctx, req.(*FenceSSHStatusRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -13173,6 +13217,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetFenceReadiness",
 			Handler:    _LiteVirt_GetFenceReadiness_Handler,
+		},
+		{
+			MethodName: "GetFenceSSHStatus",
+			Handler:    _LiteVirt_GetFenceSSHStatus_Handler,
 		},
 		{
 			MethodName: "RemoveHost",

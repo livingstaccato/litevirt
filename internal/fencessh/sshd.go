@@ -46,8 +46,8 @@ func SSHDAccepting(sshd, configFile, dir string) AcceptingFunc {
 			}
 			eff := parseSSHDT(out)
 			if akf := eff["authorizedkeysfile"]; !slices.Contains(strings.Fields(akf), want) {
-				return false, fmt.Sprintf("sshd does not read %s for root from %s (AuthorizedKeysFile %q)",
-					want, addr, akf)
+				return false, fmt.Sprintf("sshd does not read %s for root from %s (AuthorizedKeysFile %q); "+
+					"`lv host install-fence-ssh` adds it", want, addr, akf)
 			}
 			if v := eff["pubkeyauthentication"]; v != "yes" {
 				return false, fmt.Sprintf("sshd has PubkeyAuthentication %s for root from %s", v, addr)

@@ -11,7 +11,7 @@ import (
 )
 
 // installHint is the operator's next step toward a managed path.
-const installHint = "its sshd must read /etc/litevirt/ssh/authorized_keys for root"
+const installHint = "run `lv host install-fence-ssh` and check `lv doctor fence`"
 
 // FenceConfig decides how a fence from this host reaches target, from the
 // target's host_fence_ssh row as this node holds it:

@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"strings"
 	"testing"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -27,6 +30,11 @@ func (c *fenceReadinessClient) GetClusterHealth(context.Context, *pb.GetClusterH
 
 func (c *fenceReadinessClient) GetFenceReadiness(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.FenceReadiness, error) {
 	return c.resp, nil
+}
+
+// GetFenceSSHStatus answers as a daemon that predates managed fence SSH.
+func (c *fenceReadinessClient) GetFenceSSHStatus(context.Context, *pb.FenceSSHStatusRequest, ...grpc.CallOption) (*pb.FenceSSHStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "unknown method GetFenceSSHStatus")
 }
 
 // runDoctorFence executes the command against a canned response, returning its
@@ -319,5 +327,33 @@ func TestDoctorFence_DerivesAssuranceFromAnOlderServer(t *testing.T) {
 	})
 	if !strings.Contains(out, "requested") || !strings.Contains(out, "not verified") {
 		t.Errorf("an ssh fence with no server-sent assurance was not labelled:\n%s", out)
+	}
+}
+
+// TestDoctorFence_FenceSSHMatrixWarnsOfAnUnpinnedFence: a pair fenced
+// legacy-unpinned is a warning naming both hosts; a host that does not accept
+// the managed key names the command that fixes it.
+func TestDoctorFence_FenceSSHMatrixWarnsOfAnUnpinnedFence(t *testing.T) {
+	st := &pb.FenceSSHStatus{Nodes: []*pb.FenceSSHNode{
+		{Host: "node-0", Reachable: true, Mode: "auto", Peers: []*pb.FenceSSHPeer{
+			{Host: "node-0", Row: "verified", Accepting: true, Path: "self"},
+			{Host: "node-1", Row: "verified", Accepting: true, Address: "10.77.0.2", Path: "managed", Probed: true, ProbeOk: true},
+			{Host: "node-2", Row: "missing", Path: "legacy-unpinned"},
+			{Host: "node-3", Row: "verified", RowDetail: "PermitRootLogin no", Path: "legacy-pinned"},
+		}},
+		{Host: "node-9", Error: "dial: refused"},
+	}}
+	var b bytes.Buffer
+	printFenceSSHStatus(&b, st)
+	out := b.String()
+	for _, want := range []string{
+		"node-0  auto  node-1  managed",
+		"WARNING: node-0 fences node-2 WITHOUT a pinned host key",
+		"`lv host install-fence-ssh --host node-3`",
+		"node-9",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
 	}
 }

@@ -138,6 +138,12 @@ quorum_loss_demote_after_sec: 12
 keepalived_stop_timeout_sec: 3
 no_quorum_vip_policy: safe
 
+# How often this host checks the managed fence SSH path to every peer: the
+# pin, the key, the source address and the forced command, without arming a
+# fence (`lv doctor fence`, litevirt_fence_ssh_probe_ok). Default 900 (15
+# minutes); 0 disables the probe. See migration-failover.md "Managed fence SSH".
+fence_ssh_probe_interval_sec: 900
+
 # Peers to join on startup. At least one existing host.
 join_peers:
   - "10.0.50.10:7946"

@@ -259,6 +259,13 @@ type Config struct {
 	// above, not a weaker policy. Empty → "safe".
 	NoQuorumVIPPolicy string `yaml:"no_quorum_vip_policy"`
 
+	// FenceSSHProbeIntervalSec is how often this host checks the managed
+	// fence SSH path to every peer (`lv doctor fence`,
+	// litevirt_fence_ssh_probe_ok). Unset is 900 (15 minutes); 0 disables
+	// the probe. A check logs in as root on each peer and runs only the
+	// forced command's check, which never arms a fence.
+	FenceSSHProbeIntervalSec *int `yaml:"fence_ssh_probe_interval_sec,omitempty"`
+
 	// WebAuthn configures the second-factor enrolment dance. Required
 	// fields: rp_id (the bare host operators reach via the UI, e.g.
 	// "litevirt.corp") and rp_origins (full origins, e.g.
@@ -1150,6 +1157,9 @@ func LoadConfig() (*Config, error) {
 	if !fencessh.ValidMode(cfg.Enforcement.FenceSSH) {
 		return nil, fmt.Errorf("invalid enforcement.fence_ssh %q: managed, auto or legacy", cfg.Enforcement.FenceSSH)
 	}
+	if cfg.FenceSSHProbeIntervalSec != nil && *cfg.FenceSSHProbeIntervalSec < 0 {
+		return nil, fmt.Errorf("invalid fence_ssh_probe_interval_sec %d: 0 disables the probe", *cfg.FenceSSHProbeIntervalSec)
+	}
 
 	// A typo'd vm.default_cpu_mode must fail load, not silently stamp an invalid
 	// mode into every VM created on this node — those specs would then fail at
@@ -1738,4 +1748,13 @@ func (f FileRestoreConfig) validate(containers ContainersConfig) error {
 			f.UIDBase, r[0], r[1]-1)
 	}
 	return nil
+}
+
+// FenceSSHProbeInterval is fence_ssh_probe_interval_sec as a duration: 15
+// minutes when unset, 0 (disabled) when set to 0.
+func (c *Config) FenceSSHProbeInterval() time.Duration {
+	if c.FenceSSHProbeIntervalSec == nil {
+		return 15 * time.Minute
+	}
+	return time.Duration(*c.FenceSSHProbeIntervalSec) * time.Second
 }

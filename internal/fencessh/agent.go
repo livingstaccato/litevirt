@@ -140,10 +140,12 @@ func (a *Agent) Mode() string { return NormalizeMode(a.cfg.Mode()) }
 // the CRL is picked up on the next tick.
 const RenderInterval = 30 * time.Second
 
-// acceptTTL is how long an sshd evaluation stands for an unchanged peer set.
-const acceptTTL = 5 * time.Minute
+// acceptTTL is how long an sshd evaluation stands for an unchanged peer set:
+// `lv host install-fence-ssh` waits for the next one.
+const acceptTTL = time.Minute
 
-// Run syncs at once, then every RenderInterval, until ctx ends.
+// Run syncs at once, then every RenderInterval, and probes every
+// ProbeInterval, until ctx ends.
 func (a *Agent) Run(ctx context.Context) {
 	a.syncLogged(ctx)
 	every := a.cfg.SyncInterval
@@ -152,12 +154,20 @@ func (a *Agent) Run(ctx context.Context) {
 	}
 	tick := time.NewTicker(every)
 	defer tick.Stop()
+	var probe <-chan time.Time
+	if a.cfg.ProbeInterval > 0 {
+		pt := time.NewTicker(a.cfg.ProbeInterval)
+		defer pt.Stop()
+		probe = pt.C
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
 			a.syncLogged(ctx)
+		case <-probe:
+			a.ProbeAll(ctx)
 		}
 	}
 }

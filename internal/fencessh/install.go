@@ -5,7 +5,8 @@ import (
 	"strings"
 )
 
-// DropInPath is the sshd drop-in `lv host init` and `lv host add` write. The daemon never writes it: sshd's configuration
+// DropInPath is the sshd drop-in `lv host init`, `lv host add` and `lv host
+// install-fence-ssh` write. The daemon never writes it: sshd's configuration
 // is changed only by an operator's command.
 const DropInPath = "/etc/ssh/sshd_config.d/60-litevirt-fence.conf"
 
@@ -90,7 +91,7 @@ lv_fence_ssh_install() {
     done
     local tmp="$dropin.tmp.$$"
     {
-        echo "# Written by litevirt (lv host init, lv host add): sshd also reads"
+        echo "# Written by litevirt (lv host init, lv host add, lv host install-fence-ssh): sshd also reads"
         echo "# $ak for root, keeping the list it read for root when this was written."
         if [ "$same" = 1 ]; then
             echo "Match User root"

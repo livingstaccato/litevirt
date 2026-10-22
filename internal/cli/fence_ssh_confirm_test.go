@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/fencessh"
@@ -45,6 +49,20 @@ type ownViewClient struct {
 	hosts   []string
 	row     func(host string, now time.Time) (accepting bool, lastErr string)
 	fanOuts int
+	// evaluated is whether host proves a fresh evaluation for a
+	// re-evaluating read (nil: none does, as an older daemon); denyReevaluate
+	// refuses such a read as a non-admin's.
+	evaluated      func(host string) bool
+	denyReevaluate bool
+	reevaluations  int
+	// outcome is host's reevaluate_outcome for a re-evaluating read (nil:
+	// "proved" for an evaluated host, else empty, as an older build);
+	// origin is the host the client talks to, as Ping names it.
+	outcome func(host string) string
+	origin  string
+	pings   int
+	// asked is each re-evaluating read's reevaluate_hosts.
+	asked [][]string
 	// failUntil: every read before this time fails, as a transient error.
 	failUntil time.Time
 }
@@ -53,19 +71,48 @@ func (c *ownViewClient) GetFenceSSHStatus(_ context.Context, req *pb.FenceSSHSta
 	if req.GetFanOut() {
 		c.fanOuts++
 	}
+	if req.GetReevaluate() {
+		if c.denyReevaluate {
+			return nil, status.Error(codes.PermissionDenied, `role "admin" required, caller has "operator"`)
+		}
+		c.reevaluations++
+		c.asked = append(c.asked, append([]string(nil), req.GetReevaluateHosts()...))
+	}
+	named := func(h string) bool {
+		return len(req.GetReevaluateHosts()) == 0 || slices.Contains(req.GetReevaluateHosts(), h)
+	}
 	if c.clock.now().Before(c.failUntil) {
 		return nil, errors.New("rpc error: code = Unavailable desc = connection reset")
 	}
 	st := &pb.FenceSSHStatus{}
 	for _, h := range c.hosts {
 		acc, lastErr := c.row(h, c.clock.now())
-		st.Nodes = append(st.Nodes, &pb.FenceSSHNode{Host: h, Reachable: true, LastError: lastErr, Peers: []*pb.FenceSSHPeer{
-			{Host: h, Row: fencessh.RowVerified, Accepting: acc, Address: "10.78.0.9", Path: fencessh.PathSelf}}})
+		ev := req.GetReevaluate() && named(h) && c.evaluated != nil && c.evaluated(h)
+		oc := ""
+		switch {
+		case !req.GetReevaluate():
+		case !named(h):
+			if h == c.origin {
+				oc = "not asked"
+			}
+		case c.outcome != nil:
+			oc = c.outcome(h)
+		case ev:
+			oc = "proved"
+		}
+		st.Nodes = append(st.Nodes, &pb.FenceSSHNode{Host: h, Reachable: true, LastError: lastErr, EvaluatedForRequest: ev,
+			ReevaluateOutcome: oc, Peers: []*pb.FenceSSHPeer{
+				{Host: h, Row: fencessh.RowVerified, Accepting: acc, Address: "10.78.0.9", Path: fencessh.PathSelf}}})
 		if !req.GetFanOut() {
 			break
 		}
 	}
 	return st, nil
+}
+
+func (c *ownViewClient) Ping(context.Context, *pb.PingRequest, ...grpc.CallOption) (*pb.PingResponse, error) {
+	c.pings++
+	return &pb.PingResponse{HostName: c.origin, Version: "v1.10.0-rc1"}, nil
 }
 
 func confirmOpts(out *bytes.Buffer, clk *fakeClock) FenceSSHOptions {
@@ -198,6 +245,89 @@ func TestInstallFenceSSH_WaitShorterThanFreshnessRefusesUpFront(t *testing.T) {
 	}
 }
 
+// TestInstallFenceSSH_EvaluatedHostConfirmsAtOnce: a host that proves an
+// evaluation made for the read confirms on the first read, long before the
+// freshness bound; one that does not (an older daemon) in the same run still
+// waits the bound out. A false is never confirmation.
+//
+// Mutations: confirm on freshness alone (ignore evaluated_for_request): the
+// run waits the bound, red; treat every answer as evaluated: the old host
+// confirms early, red; send no reevaluate: red.
+func TestInstallFenceSSH_EvaluatedHostConfirmsAtOnce(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	start := clk.t
+	var oldSeen []time.Duration
+	c := &ownViewClient{clock: clk, hosts: []string{"node-new"},
+		row:       func(string, time.Time) (bool, string) { return true, "" },
+		evaluated: func(h string) bool { return h == "node-new" }}
+	h := &scriptedFenceSSHHost{name: "node-new", addr: "10.78.0.1", result: fencessh.ResultInstalled}
+	var out bytes.Buffer
+	if err := InstallFenceSSH(context.Background(), c, []FenceSSHHost{h}, map[string]string{"node-new": h.addr}, confirmOpts(&out, clk)); err != nil {
+		t.Fatalf("InstallFenceSSH: %v\n%s", err, out.String())
+	}
+	if d := clk.t.Sub(start); d != 0 || c.reevaluations != 1 {
+		t.Fatalf("a host that proved its evaluation confirmed after %s and %d re-evaluating reads, want at once", d, c.reevaluations)
+	}
+
+	// Mixed: node-old answers evaluated_for_request=false (an older daemon).
+	clk.t = start
+	c = &ownViewClient{clock: clk, hosts: []string{"node-new", "node-old"},
+		row: func(h string, now time.Time) (bool, string) {
+			if h == "node-old" {
+				oldSeen = append(oldSeen, now.Sub(start))
+			}
+			return true, ""
+		},
+		evaluated: func(h string) bool { return h == "node-new" }}
+	hn := &scriptedFenceSSHHost{name: "node-new", addr: "10.78.0.1", result: fencessh.ResultInstalled}
+	ho := &scriptedFenceSSHHost{name: "node-old", addr: "10.78.0.2", result: fencessh.ResultInstalled}
+	out.Reset()
+	if err := InstallFenceSSH(context.Background(), c, []FenceSSHHost{hn, ho},
+		map[string]string{"node-new": hn.addr, "node-old": ho.addr}, confirmOpts(&out, clk)); err != nil {
+		t.Fatalf("mixed: %v\n%s", err, out.String())
+	}
+	if d := clk.t.Sub(start); d < 2*time.Minute {
+		t.Fatalf("mixed: confirmed %s after the install; node-old proved nothing and its bound is 2m", d)
+	}
+
+	// The old host alone, with a wait that ends before its bound: fails.
+	clk.t = start
+	c.hosts = []string{"node-old"}
+	opt := confirmOpts(&out, clk)
+	opt.Wait = 2*time.Minute + time.Second
+	opt.FreshAfter = 2 * time.Minute
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	opt.pause = func(context.Context, time.Duration) error { cancel(); return context.Canceled }
+	if err := InstallFenceSSH(ctx, c, []FenceSSHHost{ho}, map[string]string{"node-old": ho.addr}, opt); err == nil {
+		t.Fatalf("an older daemon's false confirmed on the first read:\n%s", out.String())
+	}
+}
+
+// TestInstallFenceSSH_NonAdminFallsBackToTheBound: a credential refused a
+// re-evaluation (not an admin) is not a failure: the run falls back to the
+// freshness bound, and still confirms only after it.
+//
+// Mutation: abort on the refusal instead of falling back: red.
+func TestInstallFenceSSH_NonAdminFallsBackToTheBound(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	start := clk.t
+	c := &ownViewClient{clock: clk, hosts: []string{"node-1"}, denyReevaluate: true,
+		row: func(string, time.Time) (bool, string) { return true, "" }, evaluated: func(string) bool { return true }}
+	h := &scriptedFenceSSHHost{name: "node-1", addr: "10.78.0.1", result: fencessh.ResultInstalled}
+	var out bytes.Buffer
+	if err := InstallFenceSSH(context.Background(), c, []FenceSSHHost{h}, map[string]string{"node-1": h.addr}, confirmOpts(&out, clk)); err != nil {
+		t.Fatalf("InstallFenceSSH: %v\n%s", err, out.String())
+	}
+	if d := clk.t.Sub(start); d < 2*time.Minute {
+		t.Fatalf("confirmed %s after the install without a re-evaluation", d)
+	}
+	if o := out.String(); !strings.Contains(o, "WARNING: this credential may not ask hosts to re-evaluate") ||
+		!strings.Contains(o, "time-based only") || !strings.Contains(o, "admin credential") {
+		t.Fatalf("the fallback is not explained:\n%s", out.String())
+	}
+}
+
 // TestInstallFenceSSH_TransientStatusErrorIsRetried: the installs already
 // happened, so a status read that fails is retried until the wait ends, and
 // a read that never succeeds fails naming the last error.
@@ -216,5 +346,160 @@ func TestInstallFenceSSH_TransientStatusErrorIsRetried(t *testing.T) {
 	err := InstallFenceSSH(context.Background(), c, []FenceSSHHost{h}, map[string]string{"node-1": h.addr}, confirmOpts(&out, clk))
 	if err == nil || !strings.Contains(err.Error(), "connection reset") {
 		t.Fatalf("a status read that never succeeds: %v", err)
+	}
+}
+
+// TestInstallFenceSSH_NewBuildWithoutProofFails: a host whose build knows
+// reevaluate but whose re-evaluation proved nothing (its agent wedged, here)
+// does not fall back to the freshness bound, which could confirm the stale
+// row it still holds: it fails, named with its reason, however long the
+// wait. A host that predates reevaluate (empty outcome) still falls back.
+//
+// Red on 903ddfc66: node-1 falls back and confirms after 2m. Mutation: take
+// the fallback for any unproven host: red.
+func TestInstallFenceSSH_NewBuildWithoutProofFails(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	const wedged = "no fresh sync finished in time (its agent may be wedged in a sync): context deadline exceeded"
+	c := &ownViewClient{clock: clk, hosts: []string{"node-0", "node-1", "node-old"}, origin: "node-0",
+		row:       func(string, time.Time) (bool, string) { return true, "" },
+		evaluated: func(h string) bool { return h == "node-0" },
+		outcome: func(h string) string {
+			switch h {
+			case "node-0":
+				return "proved"
+			case "node-1":
+				return wedged
+			}
+			return ""
+		}}
+	var hosts []FenceSSHHost
+	all := map[string]string{}
+	for i, n := range c.hosts {
+		h := &scriptedFenceSSHHost{name: n, addr: fmt.Sprintf("10.78.0.%d", i+1), result: fencessh.ResultInstalled}
+		hosts = append(hosts, h)
+		all[n] = h.addr
+	}
+	var out bytes.Buffer
+	err := InstallFenceSSH(context.Background(), c, hosts, all, confirmOpts(&out, clk))
+	if err == nil || !strings.Contains(err.Error(), "node-1") || strings.Contains(err.Error(), "node-old") ||
+		strings.Contains(err.Error(), "node-0") {
+		t.Fatalf("a new-build host without proof: err %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "wedged") {
+		t.Fatalf("node-1's reason is not shown:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "older") {
+		t.Fatalf("an upgraded origin was called older:\n%s", out.String())
+	}
+
+	// No host proves anything, the origin included: it is still an upgraded
+	// origin (every outcome is set), so nothing falls back and no warning
+	// calls it older.
+	c.evaluated = func(string) bool { return false }
+	c.outcome = func(h string) string {
+		if h == "node-old" {
+			return ""
+		}
+		return wedged
+	}
+	out.Reset()
+	err = InstallFenceSSH(context.Background(), c, hosts, all, confirmOpts(&out, clk))
+	if err == nil || !strings.Contains(err.Error(), "node-0") || !strings.Contains(err.Error(), "node-1") ||
+		strings.Contains(err.Error(), "node-old") || strings.Contains(out.String(), "older") {
+		t.Fatalf("an upgraded origin that proved nothing: err %v\n%s", err, out.String())
+	}
+}
+
+// TestInstallFenceSSH_OlderOriginFallsBackWithAWarning: the host the CLI
+// talks to predates reevaluate (no node carries an outcome), so it asked no
+// peer to re-evaluate either: every host falls back to the freshness bound,
+// and the run says the confirmation was time-based only, naming the origin.
+//
+// Mutations: treat an empty origin outcome as a failure: red; drop the
+// warning: red.
+func TestInstallFenceSSH_OlderOriginFallsBackWithAWarning(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	start := clk.t
+	c := &ownViewClient{clock: clk, hosts: []string{"node-1", "node-2"}, origin: "node-2",
+		row: func(string, time.Time) (bool, string) { return true, "" }}
+	h1 := &scriptedFenceSSHHost{name: "node-1", addr: "10.78.0.1", result: fencessh.ResultInstalled}
+	h2 := &scriptedFenceSSHHost{name: "node-2", addr: "10.78.0.2", result: fencessh.ResultInstalled}
+	var out bytes.Buffer
+	if err := InstallFenceSSH(context.Background(), c, []FenceSSHHost{h1, h2},
+		map[string]string{"node-1": h1.addr, "node-2": h2.addr}, confirmOpts(&out, clk)); err != nil {
+		t.Fatalf("InstallFenceSSH: %v\n%s", err, out.String())
+	}
+	if d := clk.t.Sub(start); d < 2*time.Minute {
+		t.Fatalf("confirmed %s after the install with no proof", d)
+	}
+	o := out.String()
+	if !strings.Contains(o, "node-2") || !strings.Contains(o, "older") || !strings.Contains(o, "time-based") ||
+		strings.Count(o, "time-based") != 1 {
+		t.Fatalf("the older-origin warning (once, naming node-2):\n%s", o)
+	}
+}
+
+// TestInstallFenceSSH_ProofIsNotAccepting: a proof says the row is fresh,
+// not that it says yes. A host proven fresh whose row says not accepting
+// never confirms.
+//
+// Mutation: confirm on evaluated_for_request before the accepting check:
+// red.
+func TestInstallFenceSSH_ProofIsNotAccepting(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	c := &ownViewClient{clock: clk, hosts: []string{"node-1"}, origin: "node-1",
+		row:       func(string, time.Time) (bool, string) { return false, "" },
+		evaluated: func(string) bool { return true }}
+	h := &scriptedFenceSSHHost{name: "node-1", addr: "10.78.0.1", result: fencessh.ResultInstalled}
+	var out bytes.Buffer
+	err := InstallFenceSSH(context.Background(), c, []FenceSSHHost{h}, map[string]string{"node-1": h.addr}, confirmOpts(&out, clk))
+	if err == nil || !strings.Contains(out.String(), "not accepting") {
+		t.Fatalf("a proven, not-accepting host: err %v\n%s", err, out.String())
+	}
+}
+
+// TestInstallFenceSSH_ReevaluatesOnlyUnconfirmedSelectedHosts: each read
+// asks only the selected hosts not yet confirmed to re-evaluate, never a
+// host outside --host; and a host proved accepting once stays confirmed for
+// the run, whatever a later read (which no longer asks it) shows.
+//
+// Mutations: name every unconfirmed host in the cluster, or none (empty list
+// = all): red; forget confirmations between reads: red.
+func TestInstallFenceSSH_ReevaluatesOnlyUnconfirmedSelectedHosts(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	start := clk.t
+	reads := 0
+	c := &ownViewClient{clock: clk, hosts: []string{"node-0", "node-1", "node-2"}, origin: "node-0",
+		row: func(h string, now time.Time) (bool, string) {
+			if h == "node-1" {
+				reads++
+				return reads == 1, "" // accepting on the read that proved it, not after
+			}
+			return true, ""
+		},
+		evaluated: func(h string) bool { return h != "node-2" || clk.t.Sub(start) >= 10*time.Second }}
+	c.outcome = func(h string) string {
+		if c.evaluated(h) {
+			return "proved"
+		}
+		return "no fresh sync finished in time"
+	}
+	h1 := &scriptedFenceSSHHost{name: "node-1", addr: "10.78.0.2", result: fencessh.ResultInstalled}
+	h2 := &scriptedFenceSSHHost{name: "node-2", addr: "10.78.0.3", result: fencessh.ResultInstalled}
+	all := map[string]string{"node-0": "10.78.0.1", "node-1": h1.addr, "node-2": h2.addr}
+	var out bytes.Buffer
+	if err := InstallFenceSSH(context.Background(), c, []FenceSSHHost{h1, h2}, all, confirmOpts(&out, clk)); err != nil {
+		t.Fatalf("InstallFenceSSH: %v\n%s", err, out.String())
+	}
+	if len(c.asked) < 3 {
+		t.Fatalf("premise: %d re-evaluating reads", len(c.asked))
+	}
+	if got := strings.Join(c.asked[0], ","); got != "node-1,node-2" {
+		t.Fatalf("first read asked %q, want node-1,node-2", got)
+	}
+	for i, a := range c.asked[1:] {
+		if got := strings.Join(a, ","); got != "node-2" {
+			t.Fatalf("read %d asked %q, want only the unconfirmed node-2", i+2, got)
+		}
 	}
 }

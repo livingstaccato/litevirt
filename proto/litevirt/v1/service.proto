@@ -6497,9 +6497,21 @@ message PreflightRecreateVMRequest {
 // message keeps its index.
 
 // FenceSSHStatusRequest: fan_out asks the answering host to collect every
-// other live host's own view as well.
+// other live host's own view as well. reevaluate (admin only) has every host
+// answering run one fresh sync of its fence ssh agent, which evaluates its
+// sshd anew (no cached evaluation) and logs in to it, before it answers; the
+// fan-out passes it on. An older host ignores it and answers
+// evaluated_for_request=false.
+//
+// reevaluate_hosts narrows reevaluate: empty, every answering host
+// re-evaluates; else only the named ones do (the fan-out sends reevaluate
+// only to named peers and reads the others plainly). The answering host,
+// when not named, still marks its own node reevaluate_outcome "not asked",
+// so a reader can tell it knows reevaluate. A name no host has is ignored.
 message FenceSSHStatusRequest {
-    bool fan_out = 1;
+    bool fan_out                      = 1;
+    bool reevaluate                   = 2;
+    repeated string reevaluate_hosts  = 3;
 }
 
 // FenceSSHPeer is one host as the reporting host holds and reaches it.
@@ -6536,6 +6548,21 @@ message FenceSSHNode {
     string mode                = 4;  // its enforcement.fence_ssh: managed | auto | legacy
     string last_error          = 5;  // its agent's last sync failure
     repeated FenceSSHPeer peers = 6;
+    // evaluated_for_request: with reevaluate, this host's agent ran a sync
+    // that STARTED after this request reached it, evaluated its sshd in that
+    // sync (no cached or failed evaluation), and published its row or found
+    // it identical, before it answered. false is no proof either way: an
+    // older host, a timeout, a failed sync, or no reevaluate asked.
+    bool evaluated_for_request = 7;
+    // reevaluate_outcome: set by a host whose build knows reevaluate, every
+    // time the request carries it: "proved" when evaluated_for_request is
+    // true, else why its re-evaluation proved nothing (it timed out, its sync
+    // failed, sshd could not be evaluated, no row was published), or "not
+    // asked" from the answering host when reevaluate_hosts leaves it out.
+    // Empty: the host predates reevaluate, or (a peer) was not asked. Only
+    // the host itself sets it, never the origin of a fan-out on a peer's
+    // behalf.
+    string reevaluate_outcome = 8;
 }
 
 message FenceSSHStatus {

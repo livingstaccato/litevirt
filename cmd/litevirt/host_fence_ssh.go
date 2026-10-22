@@ -35,9 +35,14 @@ and rolled back on a refusal, and never overrides PermitRootLogin no.
 
 With --host, exactly the named hosts are changed; a name the cluster does not list
 changes nothing. The command fails when a host's sshd refused the change or was not
-reloaded. It then waits until every host it changed reports, in its own row and
-read long enough after the change to reflect it (about two minutes), that it accepts
-the managed key, and fails for any host that does not. Fences in
+reloaded. It then waits until every host it changed reports, in its own row, that it
+accepts the managed key, and fails for any host that does not. Each host re-evaluates
+its sshd for the request (logging in to it over the managed key) and proves it did, so
+that takes seconds; this needs an admin credential. An upgraded host that cannot prove
+it (its agent did not finish in time) fails. Only a host whose daemon predates this,
+or every host when the credential may not ask, counts a row read long enough after the
+change to reflect it (about two minutes); asked through an older host, every host does,
+and the command warns that the confirmation was time-based only. Fences in
 the default mode (enforcement.fence_ssh: auto) then take the managed path toward
 each host that does. Check the probe matrix with 'lv doctor fence', then set
 enforcement.fence_ssh: managed on each host. Hand-made fence keys and root's ssh
@@ -62,6 +67,6 @@ config are left alone; a managed fence never reads them.
 	cmd.Flags().StringVar(&sshUser, "ssh-user", "root", "user to SSH to each host as")
 	cmd.Flags().StringSliceVar(&only, "host", nil, "provision exactly these hosts (repeatable; an unknown name changes nothing); each is still evaluated for a fence from every host")
 	cmd.Flags().BoolVar(&remove, "remove", false, "remove the drop-in instead (the daemon then reports the host as not accepting; a host that ever accepted is still fenced over the managed key, so its fences fail until it is re-installed)")
-	cmd.Flags().DurationVar(&wait, "wait", 3*time.Minute, "how long to wait for every host to report that it accepts the managed key")
+	cmd.Flags().DurationVar(&wait, "wait", 3*time.Minute, "how long to wait for every host to report that it accepts the managed key; at least 2m10s, which an older host's daemon needs (a shorter wait is refused before anything changes)")
 	return cmd
 }

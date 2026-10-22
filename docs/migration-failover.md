@@ -1230,10 +1230,21 @@ accept the managed key. Its exit code is unchanged.
 2. Run `lv host install-fence-ssh` (from the machine `lv` runs on, as root on each
    host, or `--ssh-user`). It writes the drop-in on every host (or exactly the
    `--host` ones; an unknown name changes nothing) and waits until each reports
-   accepting the managed key in its own row, read long enough after the change to
-   reflect it (about two minutes); from then on, fences toward it take the managed
-   path. It exits non-zero when any host's sshd refused the drop-in or was not
-   reloaded, or does not confirm within `--wait`.
+   accepting the managed key in its own row. Asked by an admin, each host
+   re-evaluates its sshd for that read, logging in to it over the managed key, and
+   proves the evaluation began after the read reached it, so a host confirms in
+   seconds. Each read asks only the named hosts not yet confirmed; a host that
+   confirmed stays confirmed for the run. An upgraded host that cannot prove it (its agent did not finish within
+   its bound) fails, with the reason. Only a host whose daemon is older than this
+   counts a row read long enough after the change to reflect it (about two
+   minutes); so does every host when the credential is not an admin's, and when the
+   command talks to an older host, which asks no peer to re-evaluate: it then warns
+   that the confirmation was time-based only, and re-running it against an upgraded
+   host confirms by proof. From then on, fences toward it take the managed path.
+   It exits non-zero when any host's sshd refused the drop-in or was not reloaded,
+   or does not confirm within `--wait`. Keep `--wait` at 2m10s or more (the default
+   is 3m): an older host needs that long, so a shorter `--wait` is refused before
+   anything is changed.
 3. Check `lv doctor fence`: every pair `managed`, every probe `ok`. A probe
    result can predate the install for up to `fence_ssh_probe_interval_sec`
    (default 15 minutes); a stale `FAILED` clears at the next probe.

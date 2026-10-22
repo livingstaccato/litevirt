@@ -150,6 +150,18 @@ var releaseFeatures = map[Feature]FeatureInfo{
 	// rollback below release_2026_12_v1 quarantines.
 	FeatureFenceSSH: {Token: Release202612V1, Description: "Managed node-to-node fence SSH: each host's signed fence key and sshd host keys, rendered into a restricted authorized_keys and a pinned known_hosts on every peer (used by default once the release latches)",
 		Writers: []string{"internal/corrosion.PutHostFenceSSH"}},
+
+	// release_2027_01_v1. release_2026_12_v1 shipped in v1.10.0-rc1, so a
+	// feature declared after it gates on the next release token.
+	//
+	// project_adoption is used by default on a cluster that holds a project
+	// created before project_incarnation_v1 latched: the first adoption pass
+	// after the latch gives each such project its stable incarnation. A
+	// cluster with no such project, or with enforcement.project_adoption
+	// false on every host, never uses it (the pass decides it has work and
+	// reads the flag before it asks the gate).
+	FeatureProjectAdoption: {Token: Release202701V1, Description: "Project incarnation adoption: each project created before project_incarnation_v1 latched is given a stable incarnation of its own (used by default once the release latches on any cluster with such a project, unless enforcement.project_adoption is false on every host)",
+		Writers: []string{"internal/corrosion.AdoptProjectIncarnation"}},
 }
 
 // firewallRuleWriters write the three rule tables. Each takes one grant per
@@ -238,6 +250,12 @@ const (
 	FeatureAutomationIdentityContinuity Feature = "automation_identity_continuity"
 )
 
+// The features of release_2027_01_v1. Each name is written into a replicated
+// key once used, so it never changes.
+const (
+	FeatureProjectAdoption Feature = "project_adoption"
+)
+
 // LookupFeature returns a declared feature's token and description.
 func LookupFeature(f Feature) (FeatureInfo, bool) {
 	info, ok := releaseFeatures[f]
@@ -279,6 +297,7 @@ const MarkerRollbackKey = "rollback"
 var rollbackRules = map[string]string{
 	Release202611V1: RollbackSafeIfUnused,
 	Release202612V1: RollbackSafeIfUnused,
+	Release202701V1: RollbackSafeIfUnused,
 	Release202702V1: RollbackSafeIfUnused,
 }
 
@@ -312,6 +331,7 @@ func Honoured(token string, feature Feature) bool {
 var ruleAwareBelow = map[string]bool{
 	Release202611V1: false,
 	Release202612V1: true,
+	Release202701V1: true,
 	Release202702V1: true,
 }
 

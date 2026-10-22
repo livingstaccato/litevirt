@@ -19,6 +19,12 @@ import (
 // fresh enrollment provider exists. All origin/session rows use real issuers.
 func continuityNativeAccount(t *testing.T) (*claimTestVoter, *AutomationOwnerSession) {
 	t.Helper()
+	a, _, _, session := continuityNativeFixture(t)
+	return a, session
+}
+
+func continuityNativeFixture(t *testing.T) (*claimTestVoter, *claimTestVoter, *claimTestVoter, *AutomationOwnerSession) {
+	t.Helper()
 	ctx := context.Background()
 	ca, old, b, c := threeVoters(t)
 	db, err := NewLocalClient(t.TempDir(), "a")
@@ -99,7 +105,7 @@ func continuityNativeAccount(t *testing.T) (*claimTestVoter, *AutomationOwnerSes
 	if err != nil || identity.UID != "principal-uid" {
 		t.Fatalf("real local session: %+v %v", identity, err)
 	}
-	return a, session
+	return a, b, c, session
 }
 
 func TestContinuityNativePreparationFromGenuineSession(t *testing.T) {

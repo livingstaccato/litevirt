@@ -25,6 +25,9 @@ var latchGatedShapes = map[string][]string{
 	capabilities.Release202612V1: {
 		HostFenceSSHUpsertSQL, // PutHostFenceSSH (fence_ssh)
 	},
+	capabilities.Release202701V1: {
+		projectsAdoptIncarnationSQL, // AdoptProjectIncarnation (project_adoption)
+	},
 }
 
 // LatchGatedShapes returns token's latch-gated statements (latchGatedShapes).

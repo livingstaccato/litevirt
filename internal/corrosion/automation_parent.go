@@ -3,9 +3,14 @@ package corrosion
 import (
 	"context"
 	"database/sql"
+	"fmt"
 
 	"github.com/litevirt/litevirt/internal/automation/contract"
 )
+
+// ErrAutomationProjectParentUnavailable is retryable until the project owner
+// reports an unambiguous, adopted live lifetime.
+var ErrAutomationProjectParentUnavailable = fmt.Errorf("automation project parent unavailable: %w", ErrAutomationLifecycleUnavailable)
 
 // readAutomationParentLifetimeTx consumes the caller's transaction under c.mu.
 // It reads current owner facts, not originating evidence or a certified identity.
@@ -13,6 +18,21 @@ import (
 // public client query or independent snapshot belongs inside this boundary.
 func readAutomationParentLifetimeTx(ctx context.Context, c *Client, tx *sql.Tx, kind, alias string) (contract.ParentLifetime, error) {
 	var parent contract.ParentLifetime
+	if kind == "project" {
+		birth, verdict, err := projectParentIncarnationTx(ctx, tx, alias)
+		if err != nil {
+			return parent, err
+		}
+		if verdict != projectParentCurrent || birth == "" {
+			return parent, ErrAutomationProjectParentUnavailable
+		}
+		// The implicit default has no stored row or private origin. Give its
+		// empty supported spelling the owner's public name only.
+		if alias == "" {
+			alias = DefaultProject
+		}
+		return contract.ParentLifetime{Kind: kind, Alias: alias, Birth: birth}, nil
+	}
 	if kind != "principal" || !c.UserIncarnationOn() {
 		return parent, ErrAutomationLifecycleUnavailable
 	}

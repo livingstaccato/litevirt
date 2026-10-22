@@ -140,6 +140,9 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		capabilities.Release202611V1: true,
 		// release_2026_12_v1, the next release's token, on the same terms.
 		capabilities.Release202612V1: true,
+		// release_2027_01_v1, the rc2 train's token, on the same terms.
+		capabilities.Release202701V1: true,
+		capabilities.Release202702V1: true,
 	}
 
 	// Cross-check the hand-written list against the ONE declaration, so adding a

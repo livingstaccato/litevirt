@@ -46,30 +46,34 @@ func TestCheckOneCapabilityHealth_DetectsPostLatchRegression(t *testing.T) {
 		capabilities.ProjectIncarnationV1:   true,
 		capabilities.Release202611V1:        true,
 		capabilities.Release202612V1:        true,
+		capabilities.Release202701V1:        true,
+		capabilities.Release202702V1:        true,
 		capabilities.LWWSkewGuardV1:         true,
 	}
 	g.enforcedTok = map[string]bool{
-		capabilities.VMSnapshotClaimV1:      true,  // binary support is still active
-		capabilities.SplitBrainGateV1:       true,  // still active
-		capabilities.LeaseTermLedgerV1:      true,  // still active
-		capabilities.CredentialsSplitV1:     true,  // still active
-		capabilities.CredentialsClearV1:     true,  // still active
-		capabilities.HostMembershipSplitV1:  true,  // still active
-		capabilities.HostMembershipRetireV1: true,  // still active
-		capabilities.HostRuntimeSplitV1:     true,  // still active
-		capabilities.HostRuntimeRetireV1:    true,  // still active
-		capabilities.FailoverScopeV1:        true,  // still active
-		capabilities.VoterConfigV1:          true,  // still active
-		capabilities.ClaimIncarnationV1:     true,  // still active
-		capabilities.LeaseTermClaimV1:       true,  // still active
-		capabilities.FenceStateV1:           true,  // still active
-		capabilities.RelayHealthV1:          true,  // still active
-		capabilities.SpecConflictV1:         true,  // still active
-		capabilities.NetBoxIPRepointV1:      true,  // still active
-		capabilities.UserIncarnationV1:      true,  // still active
-		capabilities.ProjectIncarnationV1:   true,  // still active
-		capabilities.Release202611V1:        true,  // still active
-		capabilities.Release202612V1:        true,  // still active
+		capabilities.VMSnapshotClaimV1:      true, // binary support is still active
+		capabilities.SplitBrainGateV1:       true, // still active
+		capabilities.LeaseTermLedgerV1:      true, // still active
+		capabilities.CredentialsSplitV1:     true, // still active
+		capabilities.CredentialsClearV1:     true, // still active
+		capabilities.HostMembershipSplitV1:  true, // still active
+		capabilities.HostMembershipRetireV1: true, // still active
+		capabilities.HostRuntimeSplitV1:     true, // still active
+		capabilities.HostRuntimeRetireV1:    true, // still active
+		capabilities.FailoverScopeV1:        true, // still active
+		capabilities.VoterConfigV1:          true, // still active
+		capabilities.ClaimIncarnationV1:     true, // still active
+		capabilities.LeaseTermClaimV1:       true, // still active
+		capabilities.FenceStateV1:           true, // still active
+		capabilities.RelayHealthV1:          true, // still active
+		capabilities.SpecConflictV1:         true, // still active
+		capabilities.NetBoxIPRepointV1:      true, // still active
+		capabilities.UserIncarnationV1:      true, // still active
+		capabilities.ProjectIncarnationV1:   true, // still active
+		capabilities.Release202611V1:        true, // still active
+		capabilities.Release202612V1:        true, // still active
+		capabilities.Release202701V1:        true,
+		capabilities.Release202702V1:        true,  // still active
 		capabilities.LWWSkewGuardV1:         false, // regressed: a peer stopped advertising
 	}
 	s := testServer(t) // real db so evaluateHADegraded's stranded-pending query is safe

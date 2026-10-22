@@ -2362,6 +2362,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		preRecordCtx, stopPreRecord := context.WithCancel(ctx)
 		preRecordDone := d.startReturningBootPreRecord(preRecordCtx, fc)
 		defer func() { stopPreRecord(); <-preRecordDone }()
+		// Give each project created before project_incarnation_v1 latched its
+		// stable incarnation, once release_2027_01_v1 has latched (project_adoption).
+		d.startProjectAdoption(ctx)
 		go fc.Start(ctx)
 		// Adopt each decided voter generation once its certificate verifies,
 		// importing claim state first where this node is a member of it (§4.4).

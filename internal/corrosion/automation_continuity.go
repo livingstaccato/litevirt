@@ -16,18 +16,19 @@ import (
 // AutomationIdentityContinuity retains exact intent and genuine local session
 // provenance. It carries neither a release grant nor a reusable permission bit.
 type AutomationIdentityContinuity struct {
-	session  *AutomationOwnerSession
-	command  contract.Command
-	identity []byte
-	facts    contract.IdentityContinuity
-	origin   AutomationLifetimeEvidence
+	kind, uid string
+	session   *AutomationOwnerSession
+	command   contract.Command
+	identity  []byte
+	facts     contract.IdentityContinuity
+	origin    AutomationLifetimeEvidence
 }
 
 func PrepareAutomationIdentityContinuity(ctx context.Context, c *Client, session *AutomationOwnerSession, kind, uid, requestID string) (*AutomationIdentityContinuity, error) {
-	if c == nil || session == nil || session.db != c || kind != "principal" || session.principal != uid || requestID == "" {
+	if c == nil || session == nil || session.db != c || (kind != "principal" && kind != "project") || (kind == "principal" && session.principal != uid) || uid == "" || requestID == "" {
 		return nil, ErrAutomationLifecycleUnavailable
 	}
-	r := &AutomationIdentityContinuity{session: session}
+	r := &AutomationIdentityContinuity{session: session, kind: kind, uid: uid}
 	err := c.ExecuteLocal(ctx, func(tx *LocalTx) error {
 		identity, origin, parent, err := r.currentTx(ctx, tx)
 		if err != nil {
@@ -39,7 +40,10 @@ func PrepareAutomationIdentityContinuity(ctx context.Context, c *Client, session
 		if err != nil {
 			return err
 		}
-		r.command = contract.Command{Kind: contract.IdentityContinuityCommand, ClusterUID: identity.ClusterUID, PrincipalID: identity.UID, ResourceUID: identity.UID, Generation: identity.Generation, RequestID: requestID, Body: body}
+		r.command = contract.Command{Kind: contract.IdentityContinuityCommand, ClusterUID: identity.ClusterUID, PrincipalID: session.principal, ResourceUID: identity.UID, Generation: identity.Generation, RequestID: requestID, Body: body}
+		if kind == "project" {
+			r.command.ProjectUID = identity.UID
+		}
 		if err = contract.ValidateSupportedCommand(r.command); err != nil {
 			return err
 		}
@@ -75,16 +79,41 @@ func (r *AutomationIdentityContinuity) currentTx(ctx context.Context, tx *LocalT
 	if err != nil || realm != "local" || username != i.Alias || time.Since(used) > a.idle {
 		return nil, origin, parent, ErrAutomationLifecycleUnavailable
 	}
-	origin, err = automationLifetimeTx(ctx, tx.tx, "principal", i.Alias)
+	// A project attachment still authenticates a current principal. Its public
+	// parent refusal (including an actual held newer incarnation) is independent
+	// of the target project's lifetime stored in the attachment.
+	principalParent, err := readAutomationParentLifetimeTx(ctx, a.db, tx.tx, "principal", i.Alias)
+	if err != nil {
+		return nil, origin, parent, err
+	}
+	if r.kind == "project" {
+		owner := &AutomationOwnerSubmission{session: a, command: contract.Command{ClusterUID: a.cluster, PrincipalID: a.principal, ProjectUID: r.uid}}
+		if err := owner.authorizeTx(ctx, tx); err != nil {
+			return nil, origin, parent, err
+		}
+		i, err = automationIdentityRecordTx(ctx, tx, "", r.uid)
+		if err != nil {
+			return nil, origin, parent, err
+		}
+		if i == nil || i.Kind != "project" || i.Retired || i.ClusterUID != a.cluster || i.ProjectUID != "" || i.UID != r.uid || i.Alias == "" {
+			return nil, origin, parent, ErrAutomationLifecycleUnavailable
+		}
+	} else if r.kind != "principal" || i.UID != r.uid {
+		return nil, origin, parent, ErrAutomationLifecycleUnavailable
+	}
+	origin, err = automationLifetimeTx(ctx, tx.tx, r.kind, i.Alias)
 	if err != nil {
 		return nil, origin, parent, err
 	}
 	if origin.Witness != i.Witness || origin.Origin == "" {
 		return nil, origin, parent, ErrAutomationLifecycleUnavailable
 	}
-	parent, err = readAutomationParentLifetimeTx(ctx, a.db, tx.tx, "principal", i.Alias)
-	if err != nil {
-		return nil, origin, parent, err
+	parent = principalParent
+	if r.kind == "project" {
+		parent, err = readAutomationParentLifetimeTx(ctx, a.db, tx.tx, r.kind, i.Alias)
+		if err != nil {
+			return nil, origin, parent, err
+		}
 	}
 	return i, origin, parent, nil
 }

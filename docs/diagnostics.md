@@ -3383,8 +3383,11 @@ afresh from its disks. It leaves the start pending instead, and logs why, and
 the condition stays open on the host the record names while that host holds a
 paused domain of the VM and the record does not say running there. Resume the
 guest there (`virsh resume <vm>`) and it is recorded running; or discard it
-(`virsh destroy <vm>`) and the VM is started there from its disks. Either
-resolves the condition within a minute.
+(`virsh destroy <vm>`) and the VM is started there from its disks. `lv stop
+<vm>` and `lv rm <vm>` discard the paused copy too, without asking: it may be
+the guest's only copy. Each resolves the condition within a minute. A guest
+held paused there for its NIC guards (`firewall.nic.held`) is resumed by its
+host once its guards are in force, which is the resume above.
 
 `lv stop` and `lv rm` of a VM recorded `migrating` whose guest is not running
 on its host first ask the move's target whether it holds a domain of the VM.

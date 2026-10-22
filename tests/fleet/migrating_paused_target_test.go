@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
@@ -97,14 +98,18 @@ func requirePausedCopyKept(t *testing.T, a, b *Node) {
 //   - resumed: the guest runs on b, its row is recorded running there, and
 //     the condition is resolved;
 //   - discarded (`virsh destroy` on b): the condition is resolved, and the VM
-//     is started on b from its disks.
+//     is started on b from its disks;
+//   - nic-guard-resumed: mg1 was handed over paused for its NIC guards, so b
+//     holds a record that it resumes the guest. While the row names the
+//     source it does not; once the reschedule names b, b's resumer resumes
+//     it by itself, which is the "resumed" exit: one copy, on b.
 //
 // Mutations: drop the reconciler's hold (unresolved_move_hold.go) — b
 // destroys the paused copy and boots mg1 afresh, red; drop the resolution
 // hold (resolveMigrationUnresolvedIfSettled) — b's sweep resolves the
 // condition, and the next pass destroys the copy, red.
 func TestFleet_MigratingRow_PausedTargetCopyIsKeptWhenAnOlderLeaseHolderReschedulesIt(t *testing.T) {
-	for _, exit := range []string{"resumed", "discarded"} {
+	for _, exit := range []string{"resumed", "discarded", "nic-guard-resumed"} {
 		t.Run(exit, func(t *testing.T) {
 			clock := NewVirtualClock(time.Now().UTC())
 			c, a, b, victim := migratingRowFleet(t, clock, false, libvirtfake.StatePaused)
@@ -112,6 +117,24 @@ func TestFleet_MigratingRow_PausedTargetCopyIsKeptWhenAnOlderLeaseHolderReschedu
 			assertControlRecovered(t, c, a, victim)
 			requireHeldNaming(t, a, b, victim, "holds a domain of it in state")
 
+			if exit == "nic-guard-resumed" {
+				// The move handed mg1 over paused for its NIC guards: b
+				// recorded, before it arrived, that it lets the guest run
+				// once they are in force (nic_guard_held.go).
+				if _, err := c.PeerClient(a, b).ArmNICFirewall(context.Background(),
+					&pb.ArmNICFirewallRequest{VmName: "mg1", PausedHandover: true}); err != nil {
+					t.Fatalf("arm mg1's paused hand-over on %s: %v", b.Name, err)
+				}
+				if held := b.Server.HeldGuestsForTests(); len(held) != 1 || held[0] != "mg1" {
+					t.Fatalf("%s holds %v, want mg1", b.Name, held)
+				}
+				// While the row names the fenced source, b's resumer does
+				// not resume it: the move's commit is not recorded.
+				b.Server.ResumeHeldGuestsOnce(context.Background())
+				if st, _ := b.Virt.RawState("mg1"); st != libvirtfake.StatePaused {
+					t.Fatalf("%s's resumer let mg1 run (%s) while its row names %s", b.Name, st, victim.Name)
+				}
+			}
 			olderLeaseHolderReschedules(t, c, a, b)
 			settlePasses(t, c, 3, a, b)
 			requirePausedCopyKept(t, a, b)
@@ -121,6 +144,13 @@ func TestFleet_MigratingRow_PausedTargetCopyIsKeptWhenAnOlderLeaseHolderReschedu
 				b.Virt.SetState("mg1", libvirtfake.StateRunning) // `virsh resume mg1` on b
 			case "discarded":
 				b.Virt.SetState("mg1", libvirtfake.StateShutdown) // `virsh destroy mg1` on b
+			case "nic-guard-resumed":
+				// The row names b now, so b's NIC-guard resumer lets the
+				// guest it held run, by itself: the resume exit.
+				b.Server.ResumeHeldGuestsOnce(context.Background())
+				if st, _ := b.Virt.RawState("mg1"); st != libvirtfake.StateRunning {
+					t.Fatalf("%s's resumer did not let mg1 run once its row names it: %s", b.Name, st)
+				}
 			}
 			settlePasses(t, c, 3, a, b)
 			detail := mg1Views(t, a, b)

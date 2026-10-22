@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 )
 
 // vm.migration_unresolved's identity and evidence, read by the server that
@@ -28,14 +29,16 @@ type MigrationUnresolvedEvidence struct {
 }
 
 // OpenMigrationUnresolved reads vm's vm.migration_unresolved: its evidence
-// and whether it is open. Evidence that does not parse reads as an open
-// condition naming no host.
+// and whether it is open. Evidence of an open condition that does not parse
+// is an error, with open true: a reader that must fail closed holds.
 func OpenMigrationUnresolved(ctx context.Context, c *Client, vm string) (MigrationUnresolvedEvidence, bool, error) {
 	row, ok, err := GetHealthCondition(ctx, c, DrainEvaluator, CondMigrationUnresolved, "vm", vm)
 	if err != nil || !ok || row.Lifecycle == ConditionResolved {
 		return MigrationUnresolvedEvidence{}, false, err
 	}
 	var ev MigrationUnresolvedEvidence
-	_ = json.Unmarshal([]byte(row.Evidence), &ev)
+	if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil {
+		return MigrationUnresolvedEvidence{}, true, fmt.Errorf("%s evidence of %s does not parse: %w", CondMigrationUnresolved, vm, err)
+	}
 	return ev, true, nil
 }

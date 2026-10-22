@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -13,10 +14,16 @@ import (
 // host as the move's target. A shut-off domain, a move toward another host,
 // a resolved condition or none at all leave the start as it was.
 //
+// What cannot be read holds (fail closed): the domain's state while the
+// condition names this host, and the condition's evidence. A condition that
+// names no target is taken to name this host.
+//
 // Mutations: drop the target check — "toward another host" red; hold any
 // existing domain (drop the paused check) — "shut off" red; ignore the
 // lifecycle (OpenMigrationUnresolved returns open for a resolved row) —
-// "resolved" red.
+// "resolved" red; fail open on a state-read error — "state unreadable,
+// toward here" red; fail open on unparsable evidence — "evidence unreadable"
+// red.
 func TestUnresolvedMoveHolds(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -24,24 +31,40 @@ func TestUnresolvedMoveHolds(t *testing.T) {
 		target    string
 		lifecycle string // "" no condition
 		want      bool
+		failState bool   // the domain's state cannot be read
+		evidence  string // raw evidence instead of one naming target
 	}{
-		{"paused, toward here", libvirtfake.StatePaused, "node-a", corrosion.ConditionObserved, true},
-		{"paused, toward another host", libvirtfake.StatePaused, "node-c", corrosion.ConditionObserved, false},
-		{"paused, resolved", libvirtfake.StatePaused, "node-a", corrosion.ConditionResolved, false},
-		{"paused, no condition", libvirtfake.StatePaused, "node-a", "", false},
-		{"shut off, toward here", libvirtfake.StateShutdown, "node-a", corrosion.ConditionObserved, false},
-		{"running, toward here", libvirtfake.StateRunning, "node-a", corrosion.ConditionObserved, false},
+		{"paused, toward here", libvirtfake.StatePaused, "node-a", corrosion.ConditionObserved, true, false, ""},
+		{"paused, toward another host", libvirtfake.StatePaused, "node-c", corrosion.ConditionObserved, false, false, ""},
+		{"paused, resolved", libvirtfake.StatePaused, "node-a", corrosion.ConditionResolved, false, false, ""},
+		{"paused, no condition", libvirtfake.StatePaused, "node-a", "", false, false, ""},
+		{"shut off, toward here", libvirtfake.StateShutdown, "node-a", corrosion.ConditionObserved, false, false, ""},
+		{"running, toward here", libvirtfake.StateRunning, "node-a", corrosion.ConditionObserved, false, false, ""},
+		// Fail closed: what cannot be read keeps the domain.
+		{"state unreadable, toward here", libvirtfake.StatePaused, "node-a", corrosion.ConditionObserved, true, true, ""},
+		{"state unreadable, toward another host", libvirtfake.StatePaused, "node-c", corrosion.ConditionObserved, false, true, ""},
+		{"state unreadable, no condition", libvirtfake.StatePaused, "node-a", "", false, true, ""},
+		{"evidence unreadable", libvirtfake.StateShutdown, "", corrosion.ConditionObserved, true, false, "{not json"},
+		{"paused, no target named", libvirtfake.StatePaused, "", corrosion.ConditionObserved, true, false, ""},
+		{"shut off, no target named", libvirtfake.StateShutdown, "", corrosion.ConditionObserved, false, false, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			db := testReconcilerDB(t)
 			fake := libvirtfake.New()
 			fake.SetState("mg1", tc.state)
+			if tc.failState {
+				fake.FailDomainStateReason = func(string) error { return errors.New("libvirt: no answer") }
+			}
 			if tc.lifecycle != "" {
+				ev := `{"source":"node-b","target":"` + tc.target + `"}`
+				if tc.evidence != "" {
+					ev = tc.evidence
+				}
 				if err := corrosion.UpsertHealthCondition(ctx, db, corrosion.HealthCondition{
 					Evaluator: corrosion.DrainEvaluator, Code: corrosion.CondMigrationUnresolved,
 					SubjectKind: "vm", SubjectID: "mg1", Lifecycle: tc.lifecycle, Severity: corrosion.SeverityCritical,
-					Evidence: `{"source":"node-b","target":"` + tc.target + `"}`,
+					Evidence: ev,
 				}); err != nil {
 					t.Fatal(err)
 				}

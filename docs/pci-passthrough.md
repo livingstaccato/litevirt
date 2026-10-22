@@ -83,6 +83,10 @@ vms:
 
 The placement engine selects a host with enough free devices matching the criteria. It prefers devices in the same NUMA node as the VM's CPU allocation and in the same NVLink clique for multi-GPU workloads.
 
+Once the VM has its devices on a host, a restart there (`lv start`, or the
+restart after a guest crash) runs it with the same devices. It does not need a
+free device of the kind, and it does not take one beside those it has.
+
 ### By exact PCI address
 
 ```yaml

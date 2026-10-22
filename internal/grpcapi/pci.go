@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"google.golang.org/grpc/codes"
@@ -385,6 +386,37 @@ func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.
 		return members, nil
 	}
 
+	// A device that realizes this intent here, and the VM still owns, realizes
+	// it again: a restart keeps the device it has, and never takes a second
+	// one for an intent the first already satisfies. Only the remainder, if
+	// any, is searched for among the free devices.
+	matches := func(d corrosion.PCIDeviceRecord) bool {
+		return (spec.Type == "" || d.Type == spec.Type) &&
+			(spec.Vendor == "" || d.VendorID == spec.Vendor) &&
+			(spec.Model == "" || d.DeviceName == spec.Model)
+	}
+	if deviceID != "" {
+		owned, err := s.ownedRealizationsHere(ctx, vmName, deviceID)
+		if err != nil {
+			return nil, err
+		}
+		for _, d := range owned {
+			if count == 0 {
+				break
+			}
+			if exclude[d.Address] || !matches(d) {
+				continue
+			}
+			if err := addPrimary(d.Address); err != nil {
+				return nil, err
+			}
+			count--
+		}
+		if count == 0 {
+			return members, nil
+		}
+	}
+
 	// Type/vendor allocation. A vendor-only selector is classified as type-kind
 	// even when Type is empty, so it must search the whole unassigned inventory;
 	// querying GetAvailableDevicesByType with "" would incorrectly require a
@@ -404,13 +436,7 @@ func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.
 	// earlier spec in this request (the cross-spec pool-shrinking exclusion).
 	var matched []corrosion.PCIDeviceRecord
 	for _, d := range available {
-		if exclude[d.Address] {
-			continue
-		}
-		if spec.Vendor != "" && d.VendorID != spec.Vendor {
-			continue
-		}
-		if spec.Model != "" && d.DeviceName != spec.Model {
+		if exclude[d.Address] || !matches(d) {
 			continue
 		}
 		matched = append(matched, d)
@@ -1343,4 +1369,40 @@ func deviceSpecsSummary(specs []*pb.DeviceSpec) string {
 		parts = append(parts, strings.Join(f, " "))
 	}
 	return strings.Join(parts, ", ")
+}
+
+// ownedRealizationsHere is the devices on this host that realize vmName's
+// intent deviceID, by its live vm_pci_realizations rows, and that the VM
+// still owns, in member order. A row the VM no longer owns there (released,
+// or another VM's since) is not its device.
+func (s *Server) ownedRealizationsHere(ctx context.Context, vmName, deviceID string) ([]corrosion.PCIDeviceRecord, error) {
+	reals, err := corrosion.ListVMPCIRealizations(ctx, s.db, vmName)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read the PCI realizations of %s: %v", vmName, err)
+	}
+	var mine []corrosion.PCIRealizationRecord
+	for _, r := range reals {
+		if r.DeviceID == deviceID && r.HostName == s.hostName && r.ResolvedAddress != "" {
+			mine = append(mine, r)
+		}
+	}
+	if len(mine) == 0 {
+		return nil, nil
+	}
+	sort.Slice(mine, func(i, j int) bool { return mine[i].Ordinal < mine[j].Ordinal })
+	devs, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "query devices: %v", err)
+	}
+	byAddr := make(map[string]corrosion.PCIDeviceRecord, len(devs))
+	for _, d := range devs {
+		byAddr[d.Address] = d
+	}
+	var out []corrosion.PCIDeviceRecord
+	for _, r := range mine {
+		if d, ok := byAddr[r.ResolvedAddress]; ok && d.VMName == vmName {
+			out = append(out, d)
+		}
+	}
+	return out, nil
 }

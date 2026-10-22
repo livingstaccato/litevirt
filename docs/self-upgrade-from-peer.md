@@ -46,8 +46,11 @@ downgrade-safe**:
    binary onto a *single* node lets it flow to the entire fleet, which is the only
    model that scales past a handful of nodes. Movement is forward-only (never to an
    older `version`), so a lone stale peer can't drag anyone backwards, and an
-   unparseable `version` (a `dev` or git-describe ephemeral build) is never a
-   target, so a local build can't pull the cluster onto an un-orderable version.
+   unparseable `version` (a `dev` or git-describe ephemeral build) or a pre-release
+   (`v1.10.0-rc1`) is never a target, so a local or candidate build can't pull the
+   cluster onto it. A skipped pre-release is logged once per version and shown by
+   `lv cluster upgrade-status`; push it with `lv host upgrade <host>` (see
+   upgrades.md → Pre-release builds).
 
 **Hard guard:** never apply a binary whose advertised `schema_version` is **less
 than** ours (no schema downgrade — the daemon already refuses to start against a

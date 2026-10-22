@@ -5759,6 +5759,9 @@ message UpgradeStatus {
     // refused_peers are the peers this host is refusing replication from
     // because they cannot keep a release feature in use.
     repeated string refused_peers = 12;
+    // self_upgrade_skipped names each pre-release peer build the automatic
+    // self-upgrade declined to follow, with how to upgrade to it.
+    repeated string self_upgrade_skipped = 13;
 }
 
 // LaggingHost is a host not yet on the answering host's release.

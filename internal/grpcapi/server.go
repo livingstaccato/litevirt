@@ -1332,6 +1332,10 @@ type Server struct {
 	// releaseRollout: the HA monitor's cached rollout answers
 	// (releaseRolloutLagging). Guarded by releasePeerMu.
 	releaseRollout map[string]*rolloutAnswer
+	// selfUpgradeSkipMu guards selfUpgradeSkipped: the pre-release peer versions
+	// the self-upgrade watcher declined to follow, keyed by version (self_upgrade.go).
+	selfUpgradeSkipMu  sync.Mutex
+	selfUpgradeSkipped map[string]string
 	// schemaRefusedMu guards schemaRefused: each sender whose push this node
 	// refused because its schema is ahead (schema_refusal_health.go).
 	schemaRefusedMu sync.Mutex

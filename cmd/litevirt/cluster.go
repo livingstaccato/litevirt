@@ -401,6 +401,9 @@ func printUpgradeStatus(out io.Writer, st *pb.UpgradeStatus) {
 		fmt.Fprintf(out, "Refusing replication from: %s (they do not advertise a release token in use)\n",
 			strings.Join(peers, ", "))
 	}
+	for _, l := range st.GetSelfUpgradeSkipped() {
+		fmt.Fprintf(out, "Self-upgrade skipped: %s\n", l)
+	}
 	fmt.Fprintln(out)
 	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
 	fmt.Fprintf(w, "TOKEN\tDURABLE\tMANDATORY\tROLLBACK RULE\tBLOCKS ROLLBACK\tIF RULE-AWARE\n")

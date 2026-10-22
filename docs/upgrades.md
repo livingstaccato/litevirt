@@ -302,6 +302,21 @@ the complementary "starts but doesn't function" gap. Together they do NOT cover:
   decisions — the binary is intrinsically functional). Catch these with
   metrics + alerts, not auto-rollback.
 
+## Pre-release builds are not followed automatically
+
+The `from_peer` self-upgrade only follows **clean tagged releases** (`v1.10.0`).
+A peer on a pre-release (`v1.10.0-rc1`) or a dev build (`v1.0.51-2-gabc1234`) is
+never a target, so release candidates do not spread by themselves, even to a node
+that is behind on schema. The skip is not silent: the node logs one INFO line per
+distinct skipped version (`self-upgrade: peer runs a pre-release build; not
+following it`, with the peer, its version and the reason), and
+`lv cluster upgrade-status` shows a `Self-upgrade skipped:` line for each one. To
+move a host onto a pre-release, push it yourself:
+
+```bash
+lv host upgrade <host> --binary ./litevirt
+```
+
 ## Post-upgrade health watchdog
 
 When the upgrade RPC (or the `from_peer` self-upgrade) swaps in a new binary, it

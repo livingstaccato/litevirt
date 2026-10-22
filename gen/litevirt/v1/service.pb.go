@@ -41225,9 +41225,12 @@ type UpgradeStatus struct {
 	ProbationReason  string `protobuf:"bytes,11,opt,name=probation_reason,json=probationReason,proto3" json:"probation_reason,omitempty"`
 	// refused_peers are the peers this host is refusing replication from
 	// because they cannot keep a release feature in use.
-	RefusedPeers  []string `protobuf:"bytes,12,rep,name=refused_peers,json=refusedPeers,proto3" json:"refused_peers,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	RefusedPeers []string `protobuf:"bytes,12,rep,name=refused_peers,json=refusedPeers,proto3" json:"refused_peers,omitempty"`
+	// self_upgrade_skipped names each pre-release peer build the automatic
+	// self-upgrade declined to follow, with how to upgrade to it.
+	SelfUpgradeSkipped []string `protobuf:"bytes,13,rep,name=self_upgrade_skipped,json=selfUpgradeSkipped,proto3" json:"self_upgrade_skipped,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *UpgradeStatus) Reset() {
@@ -41340,6 +41343,13 @@ func (x *UpgradeStatus) GetProbationReason() string {
 func (x *UpgradeStatus) GetRefusedPeers() []string {
 	if x != nil {
 		return x.RefusedPeers
+	}
+	return nil
+}
+
+func (x *UpgradeStatus) GetSelfUpgradeSkipped() []string {
+	if x != nil {
+		return x.SelfUpgradeSkipped
 	}
 	return nil
 }
@@ -49396,7 +49406,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\vwas_demoted\x18\x02 \x01(\bR\n" +
 	"wasDemoted\x12\x1d\n" +
 	"\n" +
-	"hold_until\x18\x03 \x01(\tR\tholdUntil\"\xa3\x04\n" +
+	"hold_until\x18\x03 \x01(\tR\tholdUntil\"\xd5\x04\n" +
 	"\rUpgradeStatus\x12#\n" +
 	"\rrelease_token\x18\x01 \x01(\tR\freleaseToken\x121\n" +
 	"\x06tokens\x18\x02 \x03(\v2\x19.litevirt.v1.UpgradeTokenR\x06tokens\x12=\n" +
@@ -49411,7 +49421,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x11release_probation\x18\n" +
 	" \x01(\bR\x10releaseProbation\x12)\n" +
 	"\x10probation_reason\x18\v \x01(\tR\x0fprobationReason\x12#\n" +
-	"\rrefused_peers\x18\f \x03(\tR\frefusedPeers\"S\n" +
+	"\rrefused_peers\x18\f \x03(\tR\frefusedPeers\x120\n" +
+	"\x14self_upgrade_skipped\x18\r \x03(\tR\x12selfUpgradeSkipped\"S\n" +
 	"\vLaggingHost\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x12\x16\n" +

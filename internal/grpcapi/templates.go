@@ -379,7 +379,27 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 			pf.release()
 		}
 	}()
+	// cloneSeed is the cloud-init seed this clone wrote, once it has, and
+	// cloneSeedFile that file, held open until the clone returns
+	// (pinnedFile): a failed clone removes the seed only while it is still
+	// the file at that name, never another's placed there since.
+	var cloneSeed string
+	var cloneSeedFile *pinnedFile
+	defer func() { cloneSeedFile.release() }()
+	removeCloneSeed := func() {
+		if cloneSeed == "" {
+			return
+		}
+		if !cloneSeedFile.stillAt(cloneSeed) {
+			slog.Warn("clone cleanup: seed left, it is no longer the file this clone wrote", "path", cloneSeed)
+			return
+		}
+		if e := cloudinit.RemoveSeed(cloneSeed); e != nil {
+			slog.Warn("clone cleanup: remove cloud-init seed", "path", cloneSeed, "error", e)
+		}
+	}
 	cleanup := func() {
+		removeCloneSeed()
 		for _, p := range created {
 			if drv := createdBy[p]; drv != nil {
 				rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
@@ -663,6 +683,10 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 				"vm", req.Target, "error", err)
 		}
 		cloudInitISO = isoPath
+		cloneSeed = isoPath
+		if pf, ok := pinFile(isoPath); ok {
+			cloneSeedFile = pf
+		}
 	}
 
 	// ── Derive the clone's spec + domain ─────────────────────────────────
@@ -798,7 +822,6 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 		}
 		s.virt.UndefineDomain(req.Target, false)
 		cleanup()
-		os.Remove(cloudInitISO)
 		s.fw().WipeFirmwareState(req.Target, srcSpec.Uuid)
 	}
 

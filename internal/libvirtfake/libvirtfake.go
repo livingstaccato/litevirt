@@ -1239,6 +1239,30 @@ func notRunning(op, name string) error {
 		Message: "Requested operation is not valid: domain is not running"})
 }
 
+// undefineRefusalLocked is libvirt's refusal of an undefine without
+// MANAGED_SAVE and SNAPSHOTS_METADATA (qemuDomainUndefineFlags), which only
+// the client's UndefineDomain(removeStorage=true) passes: a domain with a
+// managed-save image is refused ("Refusing to undefine while domain managed
+// save image exists"), and so is an INACTIVE domain that still holds snapshot
+// metadata ("cannot delete inactive domain with %d snapshots"). An active
+// domain with snapshots is not refused: it survives as a transient one.
+// Called with f.mu held.
+func (f *Fake) undefineRefusalLocked(op, name string) error {
+	if f.managedSave[name] {
+		return fmt.Errorf("%s domain %s: %w", op, name, golibvirt.Error{Code: uint32(golibvirt.ErrOperationInvalid),
+			Message: "Requested operation is not valid: Refusing to undefine while domain managed save image exists"})
+	}
+	n := len(f.snapshots[name])
+	if n == 0 {
+		return nil
+	}
+	if st := f.domains[name]; st == StateRunning || st == StatePaused {
+		return nil
+	}
+	return fmt.Errorf("%s domain %s: %w", op, name, golibvirt.Error{Code: uint32(golibvirt.ErrOperationInvalid),
+		Message: fmt.Sprintf("Requested operation is not valid: cannot delete inactive domain with %d snapshots", n)})
+}
+
 func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	defer f.daemon()()
 	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpUndefine, Name: name}); err != nil {
@@ -1261,6 +1285,13 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	st, ok := f.domains[name]
 	if !ok {
 		return noDomain(name)
+	}
+	// libvirt.Client passes MANAGED_SAVE and SNAPSHOTS_METADATA only with
+	// removeStorage.
+	if !removeStorage {
+		if err := f.undefineRefusalLocked("undefine", name); err != nil {
+			return err
+		}
 	}
 	if st == StateRunning || st == StatePaused {
 		// An active domain survives as a transient one (see
@@ -1318,6 +1349,11 @@ func (f *Fake) undefinePreservingState(name string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// KEEP_NVRAM|KEEP_TPM carries neither MANAGED_SAVE nor
+	// SNAPSHOTS_METADATA: refused as libvirt refuses it.
+	if err := f.undefineRefusalLocked("undefine (keep state)", name); err != nil {
+		return err
+	}
 	// An ACTIVE domain survives an undefine as a TRANSIENT one: it keeps running,
 	// keeps its UUID, and loses only its persistent definition. Deleting it
 	// outright — as this fake used to — is what made the cutover handoff look like

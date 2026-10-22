@@ -340,6 +340,10 @@ func (s *Server) removeOwnDiskLayers(ctx context.Context, vmName string, files [
 		if kept == nil || kept[filepath.Clean(f)] {
 			continue
 		}
+		if held, why := s.keptNoteHolds(f); held {
+			s.reportKeptNoteHold(ctx, vmName, "the delete's snapshot-layer cleanup", f, why)
+			continue
+		}
 		// A user's upload is a project's file whatever its name; unreadable
 		// records protect, as for the debris sweep (protectedDiskPathsFrom).
 		if recs, rerr := s.recordsOf(ctx, f); rerr != nil || slices.ContainsFunc(recs, func(u poolUpload) bool { return u.VM == "" && !u.Peer }) {

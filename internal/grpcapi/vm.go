@@ -855,7 +855,14 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 	}()
 	if debrisErr != nil {
-		return nil, status.Errorf(codes.Unavailable, "create %s refused on %s: %v; nothing was created", spec.Name, s.hostName, debrisErr)
+		// A file a kept disk backs on stands until an operator moves it: not
+		// a transient refusal.
+		code := codes.Unavailable
+		var kb *health.KeptBackingFileError
+		if errors.As(debrisErr, &kb) {
+			code = codes.FailedPrecondition
+		}
+		return nil, status.Errorf(code, "create %s refused on %s: %v; nothing was created", spec.Name, s.hostName, debrisErr)
 	}
 	keptDisks := slices.ContainsFunc(moved, func(m health.MovedBeforeCreate) bool { return m.Kept })
 	if seedKept, err = s.setAsideKeptSeed(ctx, spec.Name, keptDisks, setAt); err != nil {
@@ -3832,6 +3839,13 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest, owner *d
 		} else if removed {
 			return s.deleteVMOnRemovedHost(ctx, vm)
 		}
+		// Asked of this host's replica before the forward too, for an owner
+		// on an older build; the owner asks again, under its own lock. Not on
+		// a removed host above: that delete frees nothing there, and `lv
+		// snapshot rm` cannot reach it.
+		if err := s.keepDisksSnapshotRefusal(ctx, req); err != nil {
+			return nil, err
+		}
 		releaseLock() // never hold a process lock across a peer RPC
 		client, closePeer, err := s.dialPeer(ctx, vm.HostName)
 		if err != nil {
@@ -3926,6 +3940,14 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest, owner *d
 	// ends (spec §6.9). A peer's probe is refused the same, and passes the
 	// refusal on.
 	if err := s.firmwareMoveRefusal("delete", vm); err != nil {
+		return nil, err
+	}
+	// On the host that holds the VM's disks, under the VM's lock, which a
+	// snapshot create of it takes too.
+	if err := s.keepDisksSnapshotRefusal(ctx, req); err != nil {
+		return nil, err
+	}
+	if err := s.keptChainRefusal(ctx, req); err != nil {
 		return nil, err
 	}
 
@@ -4134,7 +4156,14 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest, owner *d
 		}
 		s.reportDeletedVM(ctx, deleted)
 		if !req.KeepDisks {
-			s.removeVMFirmwareBundles(ctx, req.Name)
+			// The record is gone: the snapshots' RAM images and firmware
+			// bundles here go, and then the records of those whose files did.
+			// While a peer did not answer whether the VM runs there, the RAM
+			// images are kept, as its disks are above.
+			done := s.removeVMSnapshotRAMImages(ctx, req.Name, len(unknown) == 0)
+			if s.removeVMFirmwareBundles(ctx, req.Name) {
+				s.tombstoneVMSnapshotRecords(ctx, req.Name, done)
+			}
 		}
 		s.retireNICGuards(ctx, req.Name)
 		s.clearDeviceLease(req.Name)
@@ -4327,6 +4356,9 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest, owner *d
 		}
 	}()
 	if req.KeepDisks {
+		// No SNAPSHOTS_METADATA: a VM with snapshots is refused before
+		// anything is done (keepDisksSnapshotRefusal), and libvirt refuses
+		// this undefine of one it holds that litevirt has no record of.
 		undefErr = s.virt.UndefineDomainPreservingState(req.Name)
 	} else if err := s.virt.UndefineDomain(req.Name, true); err != nil {
 		slog.Warn("failed to undefine domain", "vm", req.Name, "error", err)
@@ -4350,6 +4382,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest, owner *d
 	// BEFORE the corrosion tombstone, then glob the default dir for any debris.
 	var diskLeftovers []diskLeftover
 	var keptDisks []KeptDisk
+	var snapsDone []string // snapshots whose RAM images here are gone
 	if !req.KeepDisks {
 		// The VM is deleted even when a disk is not freed (a ceph image a
 		// client still has open), as on main; each image left in its pool is
@@ -4362,7 +4395,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest, owner *d
 		setKeptHeader(ctx, cephKept)
 		s.sweepVMDiskDebris(ctx, req.Name)
 		s.removeOwnDiskLayers(ctx, req.Name, layers)
-		s.removeVMSnapshotRAMImages(ctx, req.Name)
+		snapsDone = s.removeVMSnapshotRAMImages(ctx, req.Name, true)
 		// Remove cloud-init ISO
 		_ = cloudinit.RemoveSeed(lv.CloudInitISOPath(s.dataDir, req.Name))
 		// Firmware state (G1): wipe nvram (name-keyed) + swtpm (uuid-keyed). With
@@ -4515,8 +4548,10 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest, owner *d
 	s.reportDeletedVM(ctx, deleted)
 	// Its snapshots' firmware bundles (nvram, vTPM state) go with it, only now
 	// that the delete has committed; --keep-disks keeps firmware state.
-	if !req.KeepDisks {
-		s.removeVMFirmwareBundles(ctx, req.Name)
+	// The records of the snapshots whose files here are gone go then too, so a
+	// later VM of the name does not list them.
+	if !req.KeepDisks && s.removeVMFirmwareBundles(ctx, req.Name) {
+		s.tombstoneVMSnapshotRecords(ctx, req.Name, snapsDone)
 	}
 	// The VM is gone: a volume move it left unresolved describes nothing.
 	// Only now: a delete that fails before its tombstone keeps the row, and

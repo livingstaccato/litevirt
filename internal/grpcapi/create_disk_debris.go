@@ -50,7 +50,11 @@ func (s *Server) tombstoneDeletedVM(ctx context.Context, name string, keepDisks 
 
 // noteKeptDisks notes, on this host, the host-local files of name's disks
 // recorded here that the delete leaves: every one with keepDisks, and one
-// recorded delete_with_vm=false.
+// recorded delete_with_vm=false. The files of such a disk's backing chain
+// that a create of the name clears (<vm>-<disk>.qcow2) are noted as files a
+// kept disk backs on, which a create refuses to move or clear
+// (health.SetAsideBeforeCreate). The tops are noted even when a chain cannot
+// be read, and that is the error returned.
 func (s *Server) noteKeptDisks(ctx context.Context, name string, keepDisks bool) error {
 	disks, err := corrosion.GetVMDisks(ctx, s.db, name)
 	if err != nil {
@@ -65,7 +69,33 @@ func (s *Server) noteKeptDisks(ctx context.Context, name string, keepDisks bool)
 			paths = append(paths, s.hostDiskFile(d.Path))
 		}
 	}
-	return health.NoteKeptDisks(s.dataDir, name, paths)
+	if err := health.NoteKeptDisks(s.dataDir, name, paths); err != nil {
+		return err
+	}
+	return s.noteKeptBackingFiles(ctx, name, keepDisks)
+}
+
+func (s *Server) noteKeptBackingFiles(ctx context.Context, name string, keepDisks bool) error {
+	if s.images == nil {
+		return nil
+	}
+	_, chains, err := s.keptDiskChains(ctx, name, keepDisks)
+	if err != nil {
+		return fmt.Errorf("the files a disk it keeps backs on cannot be noted: %w", err)
+	}
+	taken, err := s.vmDiskCandidateSet(name)
+	if err != nil {
+		return fmt.Errorf("the files a disk it keeps backs on cannot be noted: %w", err)
+	}
+	var under []string
+	for _, layers := range chains {
+		for _, l := range layers[min(1, len(layers)):] {
+			if taken[l] {
+				under = append(under, l)
+			}
+		}
+	}
+	return health.NoteKeptBackingFiles(s.dataDir, name, under)
 }
 
 // clearDiskDebrisBeforeCreate is createVM's debris sweep: it removes the

@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -325,6 +326,90 @@ func knownHostEntries(raw ssh.HostKeyCallback, addr string) (ssh.PublicKey, []kn
 		return probe, nil
 	}
 	return probe, keyErr.Want
+}
+
+// sourceHasCA reports whether raw holds a @cert-authority line covering addr.
+func sourceHasCA(raw ssh.HostKeyCallback, addr string) bool {
+	probe, want := knownHostEntries(raw, addr)
+	for _, k := range want {
+		if isHostAuthority(raw, addr, probe, k.Key) {
+			return true
+		}
+	}
+	return false
+}
+
+// commonHostKeyAlgorithms keeps, in union's order, the algorithms every
+// per-source offer lists. When a CA line is in one file and plain entries in
+// another it is empty, and the union (certificates first) is right: a plain
+// source then checks the key inside the certificate.
+func commonHostKeyAlgorithms(union []string, per [][]string) []string {
+	var out []string
+	for _, a := range union {
+		ok := true
+		for _, p := range per {
+			if !slices.Contains(p, a) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// wildcardPortPattern is a known_hosts host pattern with a wildcard in its
+// port ("[10.0.0.*]:*"). x/crypto matches ports exactly, so it never matches
+// one, while OpenSSH does: a pin written that way would be silently ignored.
+type wildcardPortPattern struct {
+	file, pattern, host string
+	line                int
+}
+
+// mayMatch reports whether the pattern's host part could match host. A
+// pattern path.Match cannot read counts as a match (fail closed).
+func (w wildcardPortPattern) mayMatch(host string) bool {
+	ok, err := path.Match(strings.ToLower(w.host), strings.ToLower(host))
+	return ok || err != nil
+}
+
+// wildcardPortPatterns lists the wildcard-port host patterns in a known_hosts
+// file. @revoked lines are skipped: their host field is not consulted.
+func wildcardPortPatterns(file string) ([]wildcardPortPattern, error) {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return nil, err
+	}
+	var out []wildcardPortPattern
+	for i, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 || strings.HasPrefix(f[0], "#") {
+			continue
+		}
+		if f[0] == "@revoked" {
+			continue
+		}
+		if strings.HasPrefix(f[0], "@") {
+			f = f[1:]
+			if len(f) == 0 {
+				continue
+			}
+		}
+		for _, p := range strings.Split(f[0], ",") {
+			p = strings.TrimPrefix(p, "!")
+			if !strings.HasPrefix(p, "[") {
+				continue
+			}
+			end := strings.LastIndex(p, "]:")
+			if end < 0 || !strings.ContainsAny(p[end+2:], "*?") {
+				continue
+			}
+			out = append(out, wildcardPortPattern{file: file, pattern: p, host: p[1:end], line: i + 1})
+		}
+	}
+	return out, nil
 }
 
 // hostIsKnown reports whether known_hosts holds any entry -- plain or
@@ -1001,6 +1086,38 @@ func hostKeyPolicyFor(cfg *resolved, addr string) (ssh.HostKeyCallback, []string
 	if err != nil {
 		return nil, nil, err
 	}
+	// Each file is also a source of its own: the merged database accepts as
+	// soon as ANY line for the host matches, so a stale or planted entry in
+	// one file would override a pin in another. Every source that has entries
+	// for the host must accept the key.
+	type source struct {
+		file string
+		cb   ssh.HostKeyCallback
+	}
+	var sources []source
+	var wildcards []wildcardPortPattern
+	for _, f := range files {
+		cb, err := knownhosts.New(f)
+		if err != nil {
+			return nil, nil, err
+		}
+		sources = append(sources, source{f, cb})
+		w, err := wildcardPortPatterns(f)
+		if err != nil {
+			return nil, nil, err
+		}
+		wildcards = append(wildcards, w...)
+	}
+	// knownSources are the sources with an entry (plain or CA) for name.
+	knownSources := func(name string) []source {
+		var out []source
+		for _, src := range sources {
+			if hostIsKnown(src.cb, name) {
+				out = append(out, src)
+			}
+		}
+		return out
+	}
 	var alias string
 	var strict bool
 	if cfg != nil {
@@ -1022,7 +1139,19 @@ func hostKeyPolicyFor(cfg *resolved, addr string) (ssh.HostKeyCallback, []string
 	}
 	var algos []string
 	if addr != "" {
-		algos = knownHostKeyAlgorithms(raw, lookup(addr))
+		name := lookup(addr)
+		algos = knownHostKeyAlgorithms(raw, name)
+		// Ask for what EVERY source that knows the host can vouch for: with
+		// the union, a host all files record under RSA would be asked for an
+		// ed25519 key one file holds, and the others would refuse it. An
+		// empty intersection keeps the union, which then refuses.
+		var per [][]string
+		for _, src := range knownSources(name) {
+			per = append(per, knownHostKeyAlgorithms(src.cb, name))
+		}
+		if common := commonHostKeyAlgorithms(algos, per); len(common) > 0 {
+			algos = common
+		}
 	}
 	// accept-new, not accept-anything: see hostKeyVerdict for why a CHANGED
 	// key is refused even though an unknown one is not. Strict wraps the raw
@@ -1032,13 +1161,48 @@ func hostKeyPolicyFor(cfg *resolved, addr string) (ssh.HostKeyCallback, []string
 		if name != hostname {
 			label = fmt.Sprintf("%s (HostKeyAlias %s)", hostname, alias)
 		}
+		// A pattern x/crypto cannot evaluate (a wildcard port) could be the
+		// pin for this host; it would silently never match.
+		if h, _, err := net.SplitHostPort(name); err == nil {
+			for _, w := range wildcards {
+				if w.mayMatch(h) {
+					return fmt.Errorf("%s:%d: known_hosts pattern %q has a wildcard port, which litevirt "+
+						"cannot evaluate, and could pin %s -- refusing. List the port explicitly",
+						w.file, w.line, w.pattern, label)
+				}
+			}
+		}
 		err := raw(name, remote, key)
 		if strict && err != nil {
 			if keyErr := (*knownhosts.KeyError)(nil); errors.As(err, &keyErr) && len(keyErr.Want) == 0 {
 				return fmt.Errorf("host key for %s is not in known_hosts and StrictHostKeyChecking is yes: %w", label, err)
 			}
 		}
-		return hostKeyVerdictFor(label, key, err)
+		if err != nil {
+			// No source matches (or the key is revoked, or a certificate
+			// fails): the merged answer already decides -- CHANGED, or first
+			// contact when no source has any entry.
+			return hostKeyVerdictFor(label, key, err)
+		}
+		// Some source matched. Every other source that records the host must
+		// match too; one that records a different key (or another type, or
+		// no CA for a presented certificate) refuses.
+		for _, src := range knownSources(name) {
+			checked := key
+			if cert, ok := key.(*ssh.Certificate); ok && !sourceHasCA(src.cb, name) {
+				// A source with only plain entries vouches for the key inside
+				// the certificate: the same key agrees, a different one refuses.
+				checked = cert.Key
+			}
+			if serr := src.cb(name, remote, checked); serr != nil {
+				if v := hostKeyVerdictFor(label, checked, serr); v != nil {
+					return fmt.Errorf("%w (known_hosts sources disagree: each file that records the "+
+						"host must hold the presented key; %s does not)", v, src.file)
+				}
+				return fmt.Errorf("host key for %s does not match %s -- refusing", label, src.file)
+			}
+		}
+		return nil
 	}, algos, nil
 }
 

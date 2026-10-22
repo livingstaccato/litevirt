@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -12,6 +13,8 @@ import (
 	"github.com/litevirt/litevirt/internal/image"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func firmwareSnapshotVM(t *testing.T, name string) *Server {
@@ -129,17 +132,30 @@ func TestDeleteVM_RemovesItsSnapshotFirmwareBundles(t *testing.T) {
 	}
 }
 
-func TestDeleteVM_KeepDisksKeepsSnapshotFirmwareBundles(t *testing.T) {
+// A --keep-disks delete of a VM with snapshots is refused, here on the path
+// of a VM whose domain is gone: its snapshot records and firmware bundles
+// would stay keyed by the name, for a later VM of the name to list and
+// remove. The VM, its snapshot record and its bundle stay.
+//
+// Mutation: drop keepDisksSnapshotRefusal from deleteVM: red.
+func TestDeleteVM_KeepDisksOfAVMWithSnapshotsIsRefused(t *testing.T) {
 	ctx := adminCtx()
 	s := firmwareSnapshotVM(t, "fwkeep")
 	if _, err := s.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VmName: "fwkeep", Name: "s1"}); err != nil {
 		t.Fatalf("CreateSnapshot: %v", err)
 	}
-	if _, err := s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: "fwkeep", Force: true, KeepDisks: true}); err != nil {
-		t.Fatalf("DeleteVM: %v", err)
+	_, err := s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: "fwkeep", Force: true, KeepDisks: true})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "lv snapshot rm fwkeep") {
+		t.Fatalf("DeleteVM --keep-disks of a VM with a snapshot = %v; want FailedPrecondition naming lv snapshot rm", err)
 	}
 	if _, err := os.Stat(lv.SnapshotFirmwareBundlePath(s.dataDir, "fwkeep", "s1")); err != nil {
-		t.Errorf("--keep-disks removed the firmware bundle: %v", err)
+		t.Errorf("the refused delete removed the firmware bundle: %v", err)
+	}
+	if vm, err := corrosion.GetVM(ctx, s.db, "fwkeep"); err != nil || vm == nil {
+		t.Errorf("the refused delete took the VM's record: %+v, %v", vm, err)
+	}
+	if snaps, err := corrosion.ListSnapshots(ctx, s.db, "fwkeep"); err != nil || len(snaps) != 1 {
+		t.Errorf("snapshot records after the refused delete = %+v, %v; want s1", snaps, err)
 	}
 }
 

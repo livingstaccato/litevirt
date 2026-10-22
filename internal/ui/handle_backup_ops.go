@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/pbsstore"
@@ -15,7 +16,18 @@ import (
 // backupOpState tracks the progress of an in-flight PBS-style backup,
 // restore, or live-restore for HTMX polling. One struct serves all three;
 // only the relevant counters are populated per kind.
+//
+// The op's goroutine writes while the poll handlers and backupInFlight read,
+// so every access goes through update / snapshot; the data fields are never
+// touched directly after the state is stored.
 type backupOpState struct {
+	mu sync.Mutex
+	backupOpData
+}
+
+// backupOpData is the progress a poll renders; the template reads it from a
+// snapshot, never from the live state.
+type backupOpData struct {
 	Kind           string // "backup" | "restore" | "restore-live"
 	VMName         string
 	Repo           string
@@ -33,6 +45,21 @@ type backupOpState struct {
 	PollURL        string // HTMX self-poll endpoint for the progress partial
 	Error          string
 	Done           bool
+}
+
+// update applies fn to the progress under the lock.
+func (st *backupOpState) update(fn func(d *backupOpData)) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	fn(&st.backupOpData)
+}
+
+// snapshot returns a consistent copy of the progress for rendering.
+func (st *backupOpState) snapshot() *backupOpData {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	d := st.backupOpData
+	return &d
 }
 
 // repoNames returns the configured backup-repo names, sorted, for dropdowns.
@@ -96,8 +123,8 @@ func (s *Server) handleCreateBackupSnapshot(w http.ResponseWriter, r *http.Reque
 	}
 	repoPath := s.resolveRepoPath(repo)
 
-	st := &backupOpState{Kind: "backup", VMName: name, Repo: repo, Phase: "SNAPSHOT", Status: "Starting backup…",
-		PollURL: "/ui/vms/" + name + "/backup-progress"}
+	st := &backupOpState{backupOpData: backupOpData{Kind: "backup", VMName: name, Repo: repo, Phase: "SNAPSHOT", Status: "Starting backup…",
+		PollURL: "/ui/vms/" + name + "/backup-progress"}}
 	s.backupOps.Store(backupOpKey("backup", name), st)
 
 	// Detached from the request (survives the handler returning) but still
@@ -105,7 +132,7 @@ func (s *Server) handleCreateBackupSnapshot(w http.ResponseWriter, r *http.Reque
 	// as them rather than falling through to the host-cert admin identity.
 	opCtx := context.WithoutCancel(s.uiBearerCtx(r))
 	go func() {
-		defer func() { st.Done = true }()
+		defer st.update(func(d *backupOpData) { d.Done = true })
 		stream, err := s.grpc.BackupSnapshot(opCtx, &pb.BackupSnapshotRequest{
 			VmName:      name,
 			DiskName:    disk,
@@ -114,38 +141,44 @@ func (s *Server) handleCreateBackupSnapshot(w http.ResponseWriter, r *http.Reque
 			Quiesce:     quiesce,
 		})
 		if err != nil {
-			st.Error = err.Error()
-			st.Status = "Backup failed"
+			st.update(func(d *backupOpData) {
+				d.Error = err.Error()
+				d.Status = "Backup failed"
+			})
 			return
 		}
 		for {
 			prog, recvErr := stream.Recv()
 			if recvErr != nil {
-				if !isEOF(recvErr) {
-					st.Error = recvErr.Error()
-					st.Status = "Backup failed"
-				} else if st.Error == "" {
-					st.Status = "Backup complete"
-				}
+				st.update(func(d *backupOpData) {
+					if !isEOF(recvErr) {
+						d.Error = recvErr.Error()
+						d.Status = "Backup failed"
+					} else if d.Error == "" {
+						d.Status = "Backup complete"
+					}
+				})
 				return
 			}
-			st.Phase = prog.Phase.String()
-			st.Status = prog.Status
-			st.BytesProcessed = prog.BytesProcessed
-			st.BytesRead = prog.BytesRead
-			st.ChunksTotal = prog.ChunksTotal
-			st.ChunksDeduped = prog.ChunksDeduped
-			if prog.ManifestTs != "" {
-				st.ManifestTS = prog.ManifestTs
-			}
-			if prog.Error != "" {
-				st.Error = prog.Error
-				st.Status = "Backup failed"
-			}
+			st.update(func(d *backupOpData) {
+				d.Phase = prog.Phase.String()
+				d.Status = prog.Status
+				d.BytesProcessed = prog.BytesProcessed
+				d.BytesRead = prog.BytesRead
+				d.ChunksTotal = prog.ChunksTotal
+				d.ChunksDeduped = prog.ChunksDeduped
+				if prog.ManifestTs != "" {
+					d.ManifestTS = prog.ManifestTs
+				}
+				if prog.Error != "" {
+					d.Error = prog.Error
+					d.Status = "Backup failed"
+				}
+			})
 		}
 	}()
 
-	s.renderFragment(w, "backup_progress.html", st)
+	s.renderFragment(w, "backup_progress.html", st.snapshot())
 }
 
 // handleBackupProgress returns the current backup progress for HTMX polling.
@@ -157,7 +190,7 @@ func (s *Server) handleBackupProgress(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	s.renderFragment(w, "backup_progress.html", val.(*backupOpState))
+	s.renderFragment(w, "backup_progress.html", val.(*backupOpState).snapshot())
 }
 
 // handleExportDisk is DEPRECATED. The raw full-disk stream (BackupVM) is retired
@@ -199,49 +232,55 @@ func (s *Server) handleRestoreFrom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	opID := restoreOpID(vm, disk, ts)
-	st := &backupOpState{Kind: "restore", VMName: vm, Phase: "RESTORE", Status: "Starting restore…", TargetPath: target,
-		PollURL: "/ui/backups/op-progress?id=" + url.QueryEscape(opID)}
+	st := &backupOpState{backupOpData: backupOpData{Kind: "restore", VMName: vm, Phase: "RESTORE", Status: "Starting restore…", TargetPath: target,
+		PollURL: "/ui/backups/op-progress?id=" + url.QueryEscape(opID)}}
 	s.backupOps.Store(opID, st)
 
 	opCtx := context.WithoutCancel(s.uiBearerCtx(r))
 	go func() {
-		defer func() { st.Done = true }()
+		defer st.update(func(d *backupOpData) { d.Done = true })
 		stream, err := s.grpc.RestoreFromBackup(opCtx, &pb.RestoreFromBackupRequest{
 			RepoPath: repoPath, VmName: vm, DiskName: disk, Timestamp: ts, TargetPath: target,
 			InPlace: inPlace,
 		})
 		if err != nil {
-			st.Error = err.Error()
-			st.Status = "Restore failed"
+			st.update(func(d *backupOpData) {
+				d.Error = err.Error()
+				d.Status = "Restore failed"
+			})
 			return
 		}
 		for {
 			prog, recvErr := stream.Recv()
 			if recvErr != nil {
-				if !isEOF(recvErr) {
-					st.Error = recvErr.Error()
-					st.Status = "Restore failed"
-				} else if st.Error == "" {
-					st.Status = "Restore complete"
-				}
+				st.update(func(d *backupOpData) {
+					if !isEOF(recvErr) {
+						d.Error = recvErr.Error()
+						d.Status = "Restore failed"
+					} else if d.Error == "" {
+						d.Status = "Restore complete"
+					}
+				})
 				return
 			}
-			st.Phase = prog.Phase.String()
-			st.Status = prog.Status
-			st.BytesWritten = prog.BytesWritten
-			st.ChunksDone = prog.ChunksDone
-			st.ChunksTotal = prog.ChunksTotal
-			if prog.TargetPath != "" {
-				st.TargetPath = prog.TargetPath
-			}
-			if prog.Error != "" {
-				st.Error = prog.Error
-				st.Status = "Restore failed"
-			}
+			st.update(func(d *backupOpData) {
+				d.Phase = prog.Phase.String()
+				d.Status = prog.Status
+				d.BytesWritten = prog.BytesWritten
+				d.ChunksDone = prog.ChunksDone
+				d.ChunksTotal = prog.ChunksTotal
+				if prog.TargetPath != "" {
+					d.TargetPath = prog.TargetPath
+				}
+				if prog.Error != "" {
+					d.Error = prog.Error
+					d.Status = "Restore failed"
+				}
+			})
 		}
 	}()
 
-	s.renderFragment(w, "backup_progress.html", st)
+	s.renderFragment(w, "backup_progress.html", st.snapshot())
 }
 
 // handleRestoreLiveModal renders the live-restore (NBD overlay) modal.
@@ -274,13 +313,13 @@ func (s *Server) handleRestoreLive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	opID := restoreOpID(vm, disk, ts) + ":live"
-	st := &backupOpState{Kind: "restore-live", VMName: vm, Phase: "STARTING_NBD", Status: "Starting NBD overlay…", TargetPath: target,
-		PollURL: "/ui/backups/op-progress?id=" + url.QueryEscape(opID)}
+	st := &backupOpState{backupOpData: backupOpData{Kind: "restore-live", VMName: vm, Phase: "STARTING_NBD", Status: "Starting NBD overlay…", TargetPath: target,
+		PollURL: "/ui/backups/op-progress?id=" + url.QueryEscape(opID)}}
 	s.backupOps.Store(opID, st)
 
 	opCtx := context.WithoutCancel(s.uiBearerCtx(r))
 	go func() {
-		defer func() { st.Done = true }()
+		defer st.update(func(d *backupOpData) { d.Done = true })
 		stream, err := s.grpc.RestoreLive(opCtx, &pb.RestoreLiveRequest{
 			RepoPath:   repoPath,
 			VmName:     vm,
@@ -294,33 +333,39 @@ func (s *Server) handleRestoreLive(w http.ResponseWriter, r *http.Request) {
 			WithoutDevices: r.FormValue("auto_start") == "on" && r.FormValue("without_devices") == "on",
 		})
 		if err != nil {
-			st.Error = err.Error()
-			st.Status = "Live restore failed"
+			st.update(func(d *backupOpData) {
+				d.Error = err.Error()
+				d.Status = "Live restore failed"
+			})
 			return
 		}
 		for {
 			prog, recvErr := stream.Recv()
 			if recvErr != nil {
-				if !isEOF(recvErr) {
-					st.Error = recvErr.Error()
-					st.Status = "Live restore failed"
-				} else if st.Error == "" {
-					st.Status = "Live restore finished"
-				}
+				st.update(func(d *backupOpData) {
+					if !isEOF(recvErr) {
+						d.Error = recvErr.Error()
+						d.Status = "Live restore failed"
+					} else if d.Error == "" {
+						d.Status = "Live restore finished"
+					}
+				})
 				return
 			}
-			st.Phase = prog.Phase.String()
-			st.Status = prog.Status
-			if prog.NbdUrl != "" {
-				st.NBDURL = prog.NbdUrl
-			}
-			if prog.TargetPath != "" {
-				st.TargetPath = prog.TargetPath
-			}
+			st.update(func(d *backupOpData) {
+				d.Phase = prog.Phase.String()
+				d.Status = prog.Status
+				if prog.NbdUrl != "" {
+					d.NBDURL = prog.NbdUrl
+				}
+				if prog.TargetPath != "" {
+					d.TargetPath = prog.TargetPath
+				}
+			})
 		}
 	}()
 
-	s.renderFragment(w, "backup_progress.html", st)
+	s.renderFragment(w, "backup_progress.html", st.snapshot())
 }
 
 // handleRestoreProgress polls restore / live-restore progress by op id.
@@ -332,7 +377,7 @@ func (s *Server) handleRestoreProgress(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	s.renderFragment(w, "backup_progress.html", val.(*backupOpState))
+	s.renderFragment(w, "backup_progress.html", val.(*backupOpState).snapshot())
 }
 
 // vmBackupRow is one PBS manifest for a VM, surfaced on the VM detail page.

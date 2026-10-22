@@ -92,34 +92,43 @@ func fenceSSHFleetFull(t *testing.T, nodes int, seed int64, accepting func(strin
 	}
 	out := map[string]*fenceSSHNode{}
 	for i, n := range c.Nodes {
-		root := t.TempDir()
-		hk := filepath.Join(root, "etc")
-		if err := os.MkdirAll(hk, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		pub, _, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		sp, _ := ssh.NewPublicKey(pub)
-		if err := os.WriteFile(filepath.Join(hk, "ssh_host_ed25519_key.pub"), ssh.MarshalAuthorizedKey(sp), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		dir := filepath.Join(root, "ssh")
-		name := n.Name
-		out[n.Name] = &fenceSSHNode{n: n, dir: dir, ip: ips[i], agent: fencessh.New(fencessh.Config{
-			Self: n.Name, PKIDir: n.PKIDir, DB: n.DB, Gate: n.Server, Dir: dir,
-			HostKeyGlob: filepath.Join(hk, "ssh_host_*_key.pub"),
-			Accepting: func(context.Context, []string) (bool, string) {
-				if accepting(name) {
-					return true, ""
-				}
-				return false, "sshd does not read the rendered authorized_keys (modelled)"
-			},
-			Mode: func() string { return mode(name) },
-		})}
+		out[n.Name] = newFenceSSHNode(t, n, ips[i], accepting, mode)
 	}
 	return c, out, gates
+}
+
+// newFenceSSHNode is n's fence ssh agent over its real database, PKI dir and
+// release gate, with one sshd host key file and an sshd evaluation that
+// answers accepting(n).
+func newFenceSSHNode(t *testing.T, n *Node, ip string, accepting func(string) bool, mode func(string) string) *fenceSSHNode {
+	t.Helper()
+	root := t.TempDir()
+	hk := filepath.Join(root, "etc")
+	if err := os.MkdirAll(hk, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp, _ := ssh.NewPublicKey(pub)
+	if err := os.WriteFile(filepath.Join(hk, "ssh_host_ed25519_key.pub"), ssh.MarshalAuthorizedKey(sp), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "ssh")
+	name := n.Name
+	return &fenceSSHNode{n: n, dir: dir, ip: ip, agent: fencessh.New(fencessh.Config{
+		Self: n.Name, PKIDir: n.PKIDir, DB: n.DB, Gate: n.Server, Dir: dir,
+		HostKeyGlob: filepath.Join(hk, "ssh_host_*_key.pub"),
+		Accepting: func(context.Context, []string) (bool, string, error) {
+			if accepting(name) {
+				return true, "", nil
+			}
+			return false, "sshd does not read the rendered authorized_keys (modelled)", nil
+		},
+		Mode:        func() string { return mode(name) },
+		OnAccepting: n.Server.FenceSSHAccepting,
+	})}
 }
 
 // syncAll runs every listed agent's Sync, failing on an error.

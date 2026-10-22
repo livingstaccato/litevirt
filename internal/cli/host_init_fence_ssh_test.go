@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/litevirt/litevirt/internal/fencessh"
 )
 
 // TestSetupEnv_FenceSSH: the setup script is told every join peer's address
@@ -43,5 +45,18 @@ func TestNewClusterEnforcement_FenceSSHManaged(t *testing.T) {
 	}
 	if block := enforcementBlockOf("host_name: a\n" + newClusterEnforcement); !strings.Contains(block, "fence_ssh: managed") {
 		t.Fatalf("a joiner's inherited block lacks fence_ssh: %q", block)
+	}
+}
+
+// TestOwedRevocationNote_SaysWhyItIsHeld: a revocation held for the host's
+// fence ssh row says so, not that some node does not pin.
+func TestOwedRevocationNote_SaysWhyItIsHeld(t *testing.T) {
+	fenceHold := strings.Join(owedRevocationNote("node-1", "ab", fencessh.RevocationHoldPrefix+"node-1's row is still signed by ab"), "\n")
+	if !strings.Contains(fenceHold, "re-signs its fence ssh row") || strings.Contains(fenceHold, "does not pin") {
+		t.Fatalf("fence ssh hold note:\n%s", fenceHold)
+	}
+	pinHold := strings.Join(owedRevocationNote("node-1", "ab", "hosts run different builds"), "\n")
+	if !strings.Contains(pinHold, "does not pin") || strings.Contains(pinHold, "fence ssh row") {
+		t.Fatalf("pin hold note:\n%s", pinHold)
 	}
 }

@@ -2,7 +2,6 @@ package grpcapi
 
 import (
 	"context"
-	"github.com/litevirt/litevirt/internal/fencessh"
 	"log/slog"
 	"os/exec"
 
@@ -10,6 +9,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/fencessh"
 )
 
 // UninstallHost removes litevirt from a host.

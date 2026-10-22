@@ -62,8 +62,12 @@ type node struct {
 	port    int
 	hostKey ssh.PublicKey
 	hkPath  string
-	fenceKy ssh.PublicKey
-	sshdLog string
+	// skipRendered starts n's sshd without the rendered authorized_keys:
+	// its configuration on disk may say otherwise, the running sshd does not
+	// read it.
+	skipRendered bool
+	fenceKy      ssh.PublicKey
+	sshdLog      string
 }
 
 func requireOrSkip(t *testing.T, format string, args ...any) {
@@ -170,11 +174,12 @@ func (w *world) node(name, ip string) *node {
 	caCrt, _ := os.ReadFile(filepath.Join(w.ca, "ca.crt"))
 	writeFile(t, filepath.Join(n.pkiDir, "ca.crt"), string(caCrt), 0o644)
 	if err := pki.GenerateHostCert(filepath.Join(w.ca, "ca.crt"), filepath.Join(w.ca, "ca.key"),
-		filepath.Join(n.pkiDir, "host.crt"), filepath.Join(n.pkiDir, "host.key"), name, net.ParseIP(ip)); err != nil {
+		filepath.Join(n.pkiDir, "host.crt"), filepath.Join(n.pkiDir, "host.key"), name, parseIPOrNil(ip)); err != nil {
 		t.Fatal(err)
 	}
 	n.hkPath = filepath.Join(base, "ssh_host_ed25519_key")
 	n.hostKey = writeOpenSSHKey(t, n.hkPath)
+	writeFile(t, n.hkPath+".pub", fencessh.KeyLine(n.hostKey)+"\n", 0o644)
 	n.fenceKy = writeOpenSSHKey(t, filepath.Join(n.dir, fencessh.KeyName))
 	writeFile(t, filepath.Join(n.dir, fencessh.CommandName), string(fencessh.ForcedCommand(name)), 0o755)
 	writeFile(t, filepath.Join(base, "bin", "systemctl"),
@@ -290,6 +295,10 @@ func (n *node) start(legacy bool) {
 	}
 	n.port = l.Addr().(*net.TCPAddr).Port
 	l.Close()
+	readAK := ak
+	if n.skipRendered {
+		readAK = ""
+	}
 	cfg := filepath.Join(filepath.Dir(n.dir), "sshd_config")
 	writeFile(t, cfg, fmt.Sprintf(`Port %d
 ListenAddress %s
@@ -304,7 +313,7 @@ PubkeyAuthentication yes
 AllowTcpForwarding yes
 SetEnv PATH=%s:/usr/bin:/bin
 LogLevel VERBOSE
-`, n.port, n.ip, n.hkPath, rootAK, ak, filepath.Join(filepath.Dir(n.dir), "bin")), 0o600)
+`, n.port, n.ip, n.hkPath, rootAK, readAK, filepath.Join(filepath.Dir(n.dir), "bin")), 0o600)
 	logf, err := os.Create(n.sshdLog)
 	if err != nil {
 		t.Fatal(err)
@@ -361,4 +370,12 @@ func (n *node) fence(a *fencessh.Agent, target string) fence.Result {
 		Name: h.Name, Address: h.Address, SSHUser: h.SSHUser, SSHPort: h.SSHPort, FenceStrategy: "ssh",
 		SSH: a.FenceConfig(ctx, target),
 	})
+}
+
+// parseIPOrNil is ip, or nil for "" (a certificate naming only 127.0.0.1).
+func parseIPOrNil(ip string) net.IP {
+	if ip == "" {
+		return nil
+	}
+	return net.ParseIP(ip)
 }

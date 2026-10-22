@@ -21,6 +21,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fencessh"
 	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/pki"
 )
@@ -337,8 +338,9 @@ func (s *Server) fenceSSHHold(ctx context.Context, host, serial string) string {
 	if err != nil || !strings.EqualFold(cert.SerialNumber.Text(16), serial) {
 		return ""
 	}
-	return fmt.Sprintf("%s's fence ssh row is still signed by %s, and every peer refuses to fence a host whose row "+
-		"does not verify; it is revoked once %s's daemon re-signs the row with its renewed certificate", host, serial, host)
+	return fencessh.RevocationHoldPrefix + fmt.Sprintf("%s's row is still signed by %s, and every peer refuses to fence a "+
+		"host whose row does not verify; it is revoked once %s's daemon re-signs the row with its renewed certificate",
+		host, serial, host)
 }
 
 // revocationSafeForVoters reports whether revoking serial keeps the newest

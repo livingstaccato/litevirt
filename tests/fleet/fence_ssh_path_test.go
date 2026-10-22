@@ -101,29 +101,36 @@ func TestFleet_FenceSSH_OperatorFenceUsesTheDecidedPath(t *testing.T) {
 	}
 }
 
-// TestFleet_FenceSSH_NeverDowngradedAfterAccepting: node-2 accepted the
-// managed key, then its sshd stops reading the rendered file (its drop-in
-// removed, say) and its daemon restarts with no memory of it. Its row says
-// so, but keeps ever_accepting, which only node-2's own signed rows carry, so
-// node-0 refuses to fence it down a lesser path in auto rather than fall back
-// to the pinned legacy command; legacy mode, the operator's kill switch, still
-// may.
+// TestFleet_FenceSSH_AHostThatStopsAcceptingIsStillFenced: node-2 accepted
+// the managed key; then its own evaluation of its sshd says it does not, for
+// one peer's address — a host added after node-2 was provisioned, at an
+// address its sshd configuration was never evaluated for — and node-2
+// republishes accepting=false (keeping its own signed ever_accepting). That
+// one evaluation must not make node-2 unfenceable: every peer still fences it
+// over the managed key, which is never less safe than refusing (pin,
+// restricted key, from= and forced command all hold), in auto and in managed
+// mode, and legacy mode takes the pinned path. node-2 raises
+// fence_ssh_not_accepting (warning) for itself, which every node sees, and
+// resolves it once it accepts again.
 //
-// Mutation: drop the replicated bit from the publisher (publish) — the
-// restarted daemon publishes ever_accepting=0 and node-0 fences it pinned,
-// red; drop the never-downgrade case from FenceConfig — red.
-func TestFleet_FenceSSH_NeverDowngradedAfterAccepting(t *testing.T) {
+// Mutation: refuse an ever-accepting host that does not accept now
+// (fenceConfig) — red; drop the condition (FenceSSHAccepting) — red.
+func TestFleet_FenceSSH_AHostThatStopsAcceptingIsStillFenced(t *testing.T) {
 	ctx := context.Background()
 	c, fs := fenceSSHFleet(t, 3, 2620)
 	publishAndRender(t, c, fs)
 	n2 := fs["node-2"]
-	// A restarted node-2 daemon whose sshd no longer accepts the key.
+	accepting := false
 	restarted := fencessh.New(fencessh.Config{
 		Self: "node-2", PKIDir: n2.n.PKIDir, DB: n2.n.DB, Gate: n2.n.Server, Dir: n2.dir,
 		HostKeyGlob: filepath.Join(filepath.Dir(n2.dir), "etc", "ssh_host_*_key.pub"),
-		Accepting: func(context.Context, []string) (bool, string) {
-			return false, "sshd does not read the rendered authorized_keys (modelled)"
+		Accepting: func(context.Context, []string) (bool, string, error) {
+			if accepting {
+				return true, "", nil
+			}
+			return false, "sshd does not read /etc/litevirt/ssh/authorized_keys for root from 10.77.0.9 (a host added later)", nil
 		},
+		OnAccepting: n2.n.Server.FenceSSHAccepting,
 	})
 	if err := restarted.Sync(ctx); err != nil {
 		t.Fatal(err)
@@ -133,13 +140,41 @@ func TestFleet_FenceSSH_NeverDowngradedAfterAccepting(t *testing.T) {
 	if err != nil || !ok || r.Accepting || !r.EverAccepting {
 		t.Fatalf("node-2's row on node-0 = %+v (%v %v), want not accepting, ever accepting", r, ok, err)
 	}
-	sf := fs["node-0"].agent.FenceConfig(ctx, "node-2")
-	if sf.Refusal == "" || !strings.Contains(sf.Refusal, "never fenced down a lesser path") {
-		t.Fatalf("auto fence of node-2 = %+v, want refused", sf)
+	for _, mode := range []string{fencessh.ModeAuto, fencessh.ModeManaged} {
+		ag := fencessh.New(fencessh.Config{Self: "node-0", PKIDir: c.Nodes[0].PKIDir, DB: c.Nodes[0].DB,
+			Dir: fs["node-0"].dir, Mode: func() string { return mode }})
+		if sf := ag.FenceConfig(ctx, "node-2"); sf.Refusal != "" || sf.Path != fence.SSHPathManaged {
+			t.Fatalf("%s fence of node-2 = %+v, want the managed path", mode, sf)
+		}
 	}
 	legacy := fencessh.New(fencessh.Config{Self: "node-0", PKIDir: c.Nodes[0].PKIDir, DB: c.Nodes[0].DB,
 		Dir: fs["node-0"].dir, Mode: func() string { return fencessh.ModeLegacy }})
 	if sf := legacy.FenceConfig(ctx, "node-2"); sf.Refusal != "" || sf.Path != fence.SSHPathPinned {
 		t.Fatalf("legacy-mode fence of node-2 = %+v, want pinned", sf)
 	}
+	condOn := func(n *Node) (bool, string) {
+		cnd, ok, err := corrosion.GetHealthCondition(ctx, n.DB, "fence_ssh", "fence_ssh_not_accepting", "host", "node-2")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ok && cnd.Lifecycle != corrosion.ConditionResolved, cnd.Severity
+	}
+	eventually(t, convergeTimeout, "node-0 to see node-2's fence_ssh_not_accepting", func() bool {
+		on, sev := condOn(c.Nodes[0])
+		return on && sev == corrosion.SeverityWarning
+	})
+	accepting = true
+	restarted = fencessh.New(fencessh.Config{
+		Self: "node-2", PKIDir: n2.n.PKIDir, DB: n2.n.DB, Gate: n2.n.Server, Dir: n2.dir,
+		HostKeyGlob: filepath.Join(filepath.Dir(n2.dir), "etc", "ssh_host_*_key.pub"),
+		Accepting:   func(context.Context, []string) (bool, string, error) { return true, "", nil },
+		OnAccepting: n2.n.Server.FenceSSHAccepting,
+	})
+	if err := restarted.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, convergeTimeout, "node-2's condition to resolve", func() bool {
+		on, _ := condOn(c.Nodes[0])
+		return !on
+	})
 }

@@ -44,11 +44,11 @@ Match User root
 Match all
 `)
 	acc := SSHDAccepting(SSHDPath(), cfg, dir)
-	if ok, why := acc(context.Background(), []string{"192.168.7.2", "127.0.0.1"}); !ok {
+	if ok, why, err := acc(context.Background(), []string{"192.168.7.2", "127.0.0.1"}); !ok || err != nil {
 		t.Fatalf("peers outside 10/8: not accepting (%s)", why)
 	}
-	ok, why := acc(context.Background(), []string{"192.168.7.2", "10.77.0.3"})
-	if ok || !strings.Contains(why, "10.77.0.3") {
+	ok, why, err := acc(context.Background(), []string{"192.168.7.2", "10.77.0.3"})
+	if ok || err != nil || !strings.Contains(why, "10.77.0.3") {
 		t.Fatalf("a peer in 10/8 = %v %q, want not accepting, naming 10.77.0.3", ok, why)
 	}
 }
@@ -57,9 +57,19 @@ Match all
 // overrides PermitRootLogin no; the host reports not accepting and why.
 func TestSSHDAccepting_PermitRootLoginNoIsNotOverridden(t *testing.T) {
 	cfg := sshdConfig(t, "PermitRootLogin no\nAuthorizedKeysFile .ssh/authorized_keys /etc/litevirt/ssh/authorized_keys\n")
-	ok, why := SSHDAccepting(SSHDPath(), cfg, "/etc/litevirt/ssh")(context.Background(), []string{"10.77.0.3"})
-	if ok || !strings.Contains(why, "PermitRootLogin no") {
+	ok, why, err := SSHDAccepting(SSHDPath(), cfg, "/etc/litevirt/ssh")(context.Background(), []string{"10.77.0.3"})
+	if ok || err != nil || !strings.Contains(why, "PermitRootLogin no") {
 		t.Fatalf("= %v %q, want not accepting for PermitRootLogin no", ok, why)
+	}
+}
+
+// TestSSHDAccepting_AFailedEvaluationIsNoAnswer: an sshd -T that cannot run
+// is an error, never "not accepting".
+func TestSSHDAccepting_AFailedEvaluationIsNoAnswer(t *testing.T) {
+	cfg := sshdConfig(t, "")
+	ok, why, err := SSHDAccepting(SSHDPath(), cfg+".missing", "/etc/litevirt/ssh")(context.Background(), []string{"10.77.0.3"})
+	if ok || why != "" || err == nil {
+		t.Fatalf("= %v %q %v, want an evaluation error", ok, why, err)
 	}
 }
 

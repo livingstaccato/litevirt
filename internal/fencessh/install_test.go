@@ -51,48 +51,21 @@ func (w *installWorld) dropIn(t *testing.T) string {
 
 func (w *installWorld) accepting(t *testing.T, peers ...string) (bool, string) {
 	t.Helper()
-	return SSHDAccepting(SSHDPath(), w.cfg, w.dir)(context.Background(), peers)
+	ok, why, err := SSHDAccepting(SSHDPath(), w.cfg, w.dir)(context.Background(), peers)
+	if err != nil {
+		t.Fatalf("sshd evaluation: %v", err)
+	}
+	return ok, why
 }
 
-// TestInstallScript_KeepsRootsListAndIsIdempotent: the drop-in adds the
-// rendered file to the list sshd already had for root, sshd then accepts the
-// fence key from every peer, and a re-run writes the same drop-in rather than
-// adding the file twice.
-func TestInstallScript_KeepsRootsListAndIsIdempotent(t *testing.T) {
-	w := newInstallWorld(t, "AuthorizedKeysFile .ssh/authorized_keys /etc/ssh/keys/%u\n")
-	if ok, _ := w.accepting(t, "10.77.0.2"); ok {
-		t.Fatal("accepting before the drop-in")
+// rootList is root's effective AuthorizedKeysFile for a connection from addr.
+func (w *installWorld) rootList(t *testing.T, addr string) string {
+	t.Helper()
+	out, err := exec.Command(SSHDPath(), "-T", "-f", w.cfg, "-C", "user=root,host=,addr="+addr).Output()
+	if err != nil {
+		t.Fatalf("sshd -T: %v", err)
 	}
-	out := w.run(t, "FENCE_SSH_PEERS=10.77.0.2 10.77.0.3", "FENCE_SSH_SELF=10.77.0.4")
-	d := w.dropIn(t)
-	want := "    AuthorizedKeysFile .ssh/authorized_keys /etc/ssh/keys/%u " + filepath.Join(w.dir, "authorized_keys") + "\n"
-	if !strings.Contains(d, "Match User root\n"+want) || !strings.Contains(out, "installed") {
-		t.Fatalf("drop-in =\n%s\noutput:\n%s", d, out)
-	}
-	if ok, why := w.accepting(t, "10.77.0.2", "10.77.0.3"); !ok {
-		t.Fatalf("not accepting after the drop-in: %s", why)
-	}
-	w.run(t, "FENCE_SSH_PEERS=10.77.0.2 10.77.0.3", "FENCE_SSH_SELF=10.77.0.4")
-	if again := w.dropIn(t); again != d {
-		t.Fatalf("a re-run changed the drop-in:\n%s\nto\n%s", d, again)
-	}
-}
-
-// TestInstallScript_KeepsAPerAddressList: a Match Address block later in the
-// main config gives root another list for 10/8. The drop-in comes first, so a
-// single Match User root block would override it; per-address blocks keep it.
-func TestInstallScript_KeepsAPerAddressList(t *testing.T) {
-	w := newInstallWorld(t, "AuthorizedKeysFile .ssh/authorized_keys\nMatch Address 10.0.0.0/8\n    AuthorizedKeysFile /etc/ssh/ten/%u\n")
-	w.run(t, "FENCE_SSH_PEERS=10.77.0.3 192.168.7.2")
-	d := w.dropIn(t)
-	ak := filepath.Join(w.dir, "authorized_keys")
-	if !strings.Contains(d, "Match User root Address 10.77.0.3\n    AuthorizedKeysFile /etc/ssh/ten/%u "+ak) ||
-		!strings.Contains(d, "Match User root Address 192.168.7.2\n    AuthorizedKeysFile .ssh/authorized_keys "+ak) {
-		t.Fatalf("drop-in =\n%s", d)
-	}
-	if ok, why := w.accepting(t, "10.77.0.3", "192.168.7.2"); !ok {
-		t.Fatalf("not accepting: %s", why)
-	}
+	return parseSSHDT(out)["authorizedkeysfile"]
 }
 
 // TestInstallScript_RollsBackWhatSSHDRefuses: an sshd that refuses the result
@@ -148,36 +121,69 @@ func TestPeerAddresses(t *testing.T) {
 	}
 }
 
-// TestInstallScript_ReRunPicksUpAChangedGlobalList: the drop-in freezes
-// root's list, so after an operator edits the global AuthorizedKeysFile a
-// re-run must read the new list — with its own earlier drop-in set aside, not
-// the frozen list it wrote.
-func TestInstallScript_ReRunPicksUpAChangedGlobalList(t *testing.T) {
-	w := newInstallWorld(t, "AuthorizedKeysFile .ssh/authorized_keys\n")
-	w.run(t, "FENCE_SSH_PEERS=10.77.0.3")
-	main, err := os.ReadFile(w.cfg)
-	if err != nil {
-		t.Fatal(err)
+// TestInstallScript_OperatorKeysStillReadFromEveryAddress: the drop-in never
+// changes which files sshd reads for root, from any address — including one
+// the installer was never told about, under a Match rule of the operator's
+// that comes after the Included drop-in. An unscoped AuthorizedKeysFile there
+// would have taken root's admin keys away from the admin network.
+func TestInstallScript_OperatorKeysStillReadFromEveryAddress(t *testing.T) {
+	w := newInstallWorld(t, "AuthorizedKeysFile .ssh/authorized_keys /etc/ssh/keys/%u\n"+
+		"Match Address 192.168.50.0/24\n    AuthorizedKeysFile /etc/ssh/admin/%u\n")
+	before := map[string]string{}
+	for _, a := range []string{"192.168.50.5", "10.77.0.2", "172.16.0.1"} {
+		before[a] = w.rootList(t, a)
 	}
-	edited := strings.Replace(string(main), "AuthorizedKeysFile .ssh/authorized_keys\n", "AuthorizedKeysFile /etc/ssh/keys/%u\n", 1)
-	if err := os.WriteFile(w.cfg, []byte(edited), 0o600); err != nil {
-		t.Fatal(err)
+	out := w.run(t, "FENCE_SSH_PEERS=10.77.0.2 10.77.0.3", "FENCE_SSH_SELF=10.77.0.4")
+	if !strings.Contains(out, "installed") {
+		t.Fatalf("output:\n%s", out)
 	}
-	w.run(t, "FENCE_SSH_PEERS=10.77.0.3")
-	if d := w.dropIn(t); !strings.Contains(d, "AuthorizedKeysFile /etc/ssh/keys/%u "+filepath.Join(w.dir, "authorized_keys")+"\n") {
-		t.Fatalf("drop-in after the edit =\n%s", d)
+	for a, want := range before {
+		if got := w.rootList(t, a); got != want {
+			t.Errorf("root's AuthorizedKeysFile from %s = %q after the drop-in, was %q", a, got, want)
+		}
+	}
+	if got := w.rootList(t, "192.168.50.5"); got != "/etc/ssh/admin/%u" {
+		t.Errorf("the admin network's list for root = %q", got)
+	}
+	if ok, why := w.accepting(t, "10.77.0.2", "10.77.0.3"); !ok {
+		t.Fatalf("not accepting after the drop-in: %s", why)
+	}
+	d := w.dropIn(t)
+	w.run(t, "FENCE_SSH_PEERS=10.77.0.2 10.77.0.3", "FENCE_SSH_SELF=10.77.0.4")
+	if again := w.dropIn(t); again != d {
+		t.Fatalf("a re-run changed the drop-in:\n%s\nto\n%s", d, again)
 	}
 }
 
-// TestInstallScript_NeverListsTheFileTwice: an operator who already added the
-// rendered file to the global list by hand gets it once.
-func TestInstallScript_NeverListsTheFileTwice(t *testing.T) {
-	root := t.TempDir()
-	ak := filepath.Join(root, "litevirt-ssh", "authorized_keys")
-	w := newInstallWorld(t, "AuthorizedKeysFile .ssh/authorized_keys "+ak+"\n")
-	w.dir = filepath.Dir(ak)
-	w.run(t, "FENCE_SSH_PEERS=10.77.0.3")
-	if d := w.dropIn(t); strings.Count(d, ak) != 2 { // once in the header comment, once in the list
-		t.Fatalf("drop-in lists %s %d times:\n%s", ak, strings.Count(d, ak)-1, d)
+// TestInstallScript_AcceptsAPeerAddedLater: a host added after the install,
+// at an address the installer never saw — even one a Match rule gives root
+// another list for — is accepted from, so `lv host add` cannot stop an
+// existing host accepting the managed key.
+func TestInstallScript_AcceptsAPeerAddedLater(t *testing.T) {
+	w := newInstallWorld(t, "AuthorizedKeysFile .ssh/authorized_keys\nMatch Address 10.0.0.0/8\n    AuthorizedKeysFile /etc/ssh/ten/%u\n")
+	w.run(t, "FENCE_SSH_PEERS=10.0.0.2 192.168.1.2")
+	if ok, why := w.accepting(t, "10.0.0.2", "192.168.1.2", "10.0.0.9", "172.20.0.4"); !ok {
+		t.Fatalf("not accepting from a peer added later: %s", why)
+	}
+}
+
+// TestInstallScript_NeverOverridesTheOperatorsAuthorizedKeysCommand: sshd
+// takes the first AuthorizedKeysCommand, so a drop-in would take the
+// operator's own away; none is written, and the operator is told what to do.
+func TestInstallScript_NeverOverridesTheOperatorsAuthorizedKeysCommand(t *testing.T) {
+	w := newInstallWorld(t, "AuthorizedKeysCommand /usr/bin/true %u\nAuthorizedKeysCommandUser nobody\n")
+	out := w.run(t, "FENCE_SSH_PEERS=10.77.0.3")
+	if w.dropIn(t) != "" || !strings.Contains(out, "already has an AuthorizedKeysCommand") {
+		t.Fatalf("drop-in %q, output %q", w.dropIn(t), out)
+	}
+}
+
+// TestInstallScript_SaysWhenSSHDCannotBeReloaded: a failed reload is loud,
+// not "installed" and nothing else.
+func TestInstallScript_SaysWhenSSHDCannotBeReloaded(t *testing.T) {
+	w := newInstallWorld(t, "")
+	out := w.run(t, "FENCE_SSH_PEERS=10.77.0.3", "FENCE_SSH_RELOAD=false")
+	if !strings.Contains(out, "WARNING: sshd could not be reloaded") {
+		t.Fatalf("output %q", out)
 	}
 }

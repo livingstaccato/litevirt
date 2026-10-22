@@ -137,8 +137,9 @@ func InstallFenceSSH(ctx context.Context, c pb.LiteVirtClient, hosts []FenceSSHH
 		}
 	}
 	if len(pending) > 0 {
-		return fmt.Errorf("%d host(s) do not accept the managed fence key yet (%s); fences toward them stay on "+
-			"the pinned legacy path. Check `lv doctor fence`", len(pending), strings.Join(pending, ", "))
+		return fmt.Errorf("%d host(s) do not accept the managed fence key yet (%s): a host that never did is "+
+			"fenced over the pinned legacy path, one that did over the managed key, which its sshd may refuse. "+
+			"Check `lv doctor fence`", len(pending), strings.Join(pending, ", "))
 	}
 	fmt.Fprintln(opt.Out, "Every host accepts the managed fence key. Check the probe matrix with `lv doctor fence`;")
 	fmt.Fprintln(opt.Out, "then set enforcement.fence_ssh: managed on each host so no fence falls back to root's own ssh setup.")

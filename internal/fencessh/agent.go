@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/pki"
 )
 
@@ -32,8 +34,9 @@ type Gate interface {
 
 // AcceptingFunc reports whether this host's sshd reads Dir/authorized_keys
 // for root, with public-key authentication on and root login not refused, for
-// a connection from every one of peers. The reason says why not.
-type AcceptingFunc func(ctx context.Context, peers []string) (bool, string)
+// a connection from every one of peers. The reason says why not. err is an
+// evaluation that could not be made (sshd -T did not run), which is no answer.
+type AcceptingFunc func(ctx context.Context, peers []string) (ok bool, why string, err error)
 
 // Config is an Agent's wiring.
 type Config struct {
@@ -57,6 +60,15 @@ type Config struct {
 	ProbeInterval time.Duration
 	// SyncInterval is how often Run syncs (RenderInterval when zero).
 	SyncInterval time.Duration
+	// SelfCheck: before publishing that it accepts the managed key, the host
+	// logs in to its own sshd over it (its own key, rendered for its own
+	// address, and a check request), so the claim is about the RUNNING sshd,
+	// not about its configuration files. The daemon sets it; a fleet node,
+	// which has no sshd, does not.
+	SelfCheck bool
+	// OnAccepting is told, after every publish, what the host published:
+	// the daemon raises the fence_ssh_not_accepting health condition from it.
+	OnAccepting func(ctx context.Context, accepting, everAccepting bool, detail string)
 }
 
 // Agent publishes this host's row, renders its peers' verified rows, resolves
@@ -69,6 +81,7 @@ type Agent struct {
 	// acceptUntil.
 	accepting   bool
 	acceptWhy   string
+	acceptErr   error
 	acceptPeers string
 	acceptUntil time.Time
 	// lastErr is the last publish or render failure, for the status read.
@@ -154,11 +167,21 @@ func (a *Agent) Run(ctx context.Context) {
 	}
 	tick := time.NewTicker(every)
 	defer tick.Stop()
-	var probe <-chan time.Time
+	// The probe runs on its own: a peer that blackholes its checks must not
+	// hold this host's rendering and publishing back.
 	if a.cfg.ProbeInterval > 0 {
-		pt := time.NewTicker(a.cfg.ProbeInterval)
-		defer pt.Stop()
-		probe = pt.C
+		go func() {
+			pt := time.NewTicker(a.cfg.ProbeInterval)
+			defer pt.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-pt.C:
+					a.ProbeAll(ctx)
+				}
+			}
+		}()
 	}
 	for {
 		select {
@@ -166,8 +189,6 @@ func (a *Agent) Run(ctx context.Context) {
 			return
 		case <-tick.C:
 			a.syncLogged(ctx)
-		case <-probe:
-			a.ProbeAll(ctx)
 		}
 	}
 }
@@ -216,7 +237,7 @@ func (a *Agent) sync(ctx context.Context) error {
 	}
 	if out, why := a.outOfCluster(ctx, self, tr); out {
 		slog.Warn("fence ssh: this host is out of the cluster; trusting no peer's fence key", "why", why)
-		return a.render(nil)
+		return a.render(nil, nil)
 	}
 
 	peers, rejected, err := a.verifiedPeers(ctx, tr)
@@ -226,11 +247,33 @@ func (a *Agent) sync(ctx context.Context) error {
 	for host, why := range rejected {
 		slog.Warn("fence ssh: a peer's row did not verify; it is not rendered", "peer", host, "why", why)
 	}
-	var pubErr error
-	if a.cfg.Gate != nil && a.cfg.Gate.ReleaseFeatureAvailable(capabilities.FeatureFenceSSH) {
-		pubErr = a.publish(ctx, self, selfSigner, peers, tr)
+	// Rendered first: the self-check before a publish logs in over the file.
+	if err := a.render(peers, a.selfEntry(self)); err != nil {
+		return err
 	}
-	return errors.Join(pubErr, a.render(peers))
+	// enforcement.fence_ssh: legacy publishes nothing, so the release feature
+	// stays unused and a rollback below release_2026_12_v1 stays possible.
+	if a.Mode() == ModeLegacy || a.cfg.Gate == nil || !a.cfg.Gate.ReleaseFeatureAvailable(capabilities.FeatureFenceSSH) {
+		return nil
+	}
+	return a.publish(ctx, self, selfSigner, peers, tr)
+}
+
+// selfEntry is this host's own key, accepted from its own certificate
+// address, for the self-check (Config.SelfCheck); nil without one.
+func (a *Agent) selfEntry(self *x509.Certificate) *Verified {
+	if !a.cfg.SelfCheck {
+		return nil
+	}
+	addr, err := FenceAddress(self)
+	if err != nil {
+		return nil
+	}
+	fk, err := a.ownFenceKey()
+	if err != nil {
+		return nil
+	}
+	return &Verified{Host: a.cfg.Self, FenceKeys: []ssh.PublicKey{fk}, Addr: addr}
 }
 
 // ownIdentity is the certificate and key this host serves, which follows a
@@ -298,9 +341,14 @@ func (a *Agent) verifiedPeers(ctx context.Context, tr Trust) ([]*Verified, map[s
 	return out, rejected, nil
 }
 
-// render writes peers' keys and pins.
-func (a *Agent) render(peers []*Verified) error {
-	if _, err := writeIfChanged(filepath.Join(a.cfg.Dir, AuthorizedKeysName), AuthorizedKeys(a.cfg.Dir, peers), 0o644); err != nil {
+// render writes peers' keys and pins, and self's own key (for the
+// self-check) when self is not nil.
+func (a *Agent) render(peers []*Verified, self *Verified) error {
+	keys := peers
+	if self != nil {
+		keys = append(append([]*Verified(nil), peers...), self)
+	}
+	if _, err := writeIfChanged(filepath.Join(a.cfg.Dir, AuthorizedKeysName), AuthorizedKeys(a.cfg.Dir, keys), 0o644); err != nil {
 		return fmt.Errorf("write authorized_keys: %w", err)
 	}
 	if _, err := writeIfChanged(filepath.Join(a.cfg.Dir, KnownHostsName), KnownHosts(peers), 0o644); err != nil {
@@ -367,28 +415,78 @@ func (a *Agent) peerAddresses(ctx context.Context, peers []*Verified, self net.I
 }
 
 // sshdAccepting evaluates (or reuses) whether sshd accepts the fence key
-// from addrs.
-func (a *Agent) sshdAccepting(ctx context.Context, addrs []string) (bool, string) {
+// from addrs: its configuration (Accepting) and, with SelfCheck, the running
+// sshd itself. err is an evaluation that could not be made.
+func (a *Agent) sshdAccepting(ctx context.Context, addrs []string, self *x509.Certificate) (bool, string, error) {
 	key := strings.Join(addrs, ",")
 	a.mu.Lock()
 	if key == a.acceptPeers && time.Now().Before(a.acceptUntil) {
-		ok, why := a.accepting, a.acceptWhy
+		ok, why, err := a.accepting, a.acceptWhy, a.acceptErr
 		a.mu.Unlock()
-		return ok, why
+		return ok, why, err
 	}
 	a.mu.Unlock()
-	ok, why := false, "no sshd evaluation is wired"
+	ok, why, err := false, "no sshd evaluation is wired", error(nil)
 	if a.cfg.Accepting != nil {
-		ok, why = a.cfg.Accepting(ctx, addrs)
+		ok, why, err = a.cfg.Accepting(ctx, addrs)
+	}
+	if ok && err == nil && a.cfg.SelfCheck {
+		if serr := a.selfCheck(ctx, self); serr != nil {
+			ok, why = false, "sshd's configuration reads the managed key, but the running sshd does not accept it "+
+				"(reload or restart sshd): "+serr.Error()
+		}
 	}
 	a.mu.Lock()
-	a.accepting, a.acceptWhy, a.acceptPeers, a.acceptUntil = ok, why, key, time.Now().Add(acceptTTL)
+	a.accepting, a.acceptWhy, a.acceptErr, a.acceptPeers, a.acceptUntil = ok, why, err, key, time.Now().Add(acceptTTL)
 	a.mu.Unlock()
-	return ok, why
+	return ok, why, err
+}
+
+// selfCheck logs in to this host's own sshd over the managed key: its own
+// key (rendered for its own address), its own sshd keys pinned, from its own
+// certificate address, with a check request its forced command answers
+// without arming.
+func (a *Agent) selfCheck(ctx context.Context, self *x509.Certificate) error {
+	addr, err := FenceAddress(self)
+	if err != nil {
+		return err
+	}
+	hostKeys, err := readHostKeys(a.cfg.HostKeyGlob)
+	if err != nil {
+		return err
+	}
+	keys, err := parseKeys(hostKeys, "sshd host key")
+	if err != nil {
+		return err
+	}
+	port := 22
+	if h, herr := corrosion.GetHost(ctx, a.cfg.DB, a.cfg.Self); herr == nil && h != nil && h.SSHPort != 0 {
+		port = h.SSHPort
+	}
+	cctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	return fence.ProbeSSH(cctx, fence.HostConfig{Name: a.cfg.Self, Address: addr.String(), SSHPort: port,
+		SSH: fence.SSHFence{Path: fence.SSHPathManaged, KnownHosts: KnownHostsLines(&Verified{Host: a.cfg.Self, HostKeys: keys}),
+			HostKeyAlias: Alias(a.cfg.Self), IdentityFile: filepath.Join(a.cfg.Dir, KeyName), BindAddress: addr.String(),
+			User: a.cfg.SSHUser, Request: CheckRequest(a.cfg.Self)}}, CheckOK)
 }
 
 // publish writes this host's row when anything in it changed.
+//
+// A host whose certificate names no single fence address, or is not valid
+// now, publishes nothing: its peers keep fencing it the legacy way, unpinned
+// (`lv doctor fence` warns), rather than refuse a row that could never verify.
 func (a *Agent) publish(ctx context.Context, self *x509.Certificate, signer crypto.Signer, peers []*Verified, tr Trust) error {
+	selfAddr, addrErr := FenceAddress(self)
+	if addrErr != nil {
+		slog.Warn("fence ssh: publishing no row: this host's certificate gives it no fence address", "why", addrErr)
+		return nil
+	}
+	if now := time.Now(); now.Before(self.NotBefore) || now.After(self.NotAfter) {
+		slog.Warn("fence ssh: publishing no row: this host's certificate is not valid now",
+			"not_before", self.NotBefore, "not_after", self.NotAfter)
+		return nil
+	}
 	fk, err := a.ownFenceKey()
 	if err != nil {
 		return fmt.Errorf("fence key: %w", err)
@@ -397,13 +495,7 @@ func (a *Agent) publish(ctx context.Context, self *x509.Certificate, signer cryp
 	if err != nil {
 		return err
 	}
-	selfAddr, addrErr := FenceAddress(self)
-	accepting, why := false, ""
-	if addrErr != nil {
-		why = addrErr.Error()
-	} else {
-		accepting, why = a.sshdAccepting(ctx, a.peerAddresses(ctx, peers, selfAddr))
-	}
+	accepting, why, evalErr := a.sshdAccepting(ctx, a.peerAddresses(ctx, peers, selfAddr), self)
 	if accepting {
 		why = ""
 	}
@@ -413,26 +505,41 @@ func (a *Agent) publish(ctx context.Context, self *x509.Certificate, signer cryp
 	if err != nil {
 		return err
 	}
+	// The previous row counts only when this host signed it under its
+	// current certificate or the one that certificate renewed: a row another
+	// node wrote under its name, or a removed machine's under the same name,
+	// carries nothing over.
+	ours := havePrev && !prev.Deleted && a.ownLineage(prev, self, tr)
+	if evalErr != nil {
+		// No answer is not "no": keep what was published, and say why.
+		accepting = ours && prev.Accepting
+		why = "sshd could not be evaluated: " + evalErr.Error()
+		if accepting {
+			why = ""
+		}
+	}
 	p := Publication{
 		HostName: a.cfg.Self, Generation: 1, FencePubkeys: KeyLine(fk), SSHDHostkeys: hostKeys,
 		Accepting: accepting, Detail: why, CertPEM: certPEM,
 	}
-	if havePrev && !prev.Deleted {
+	high := a.generationHighWater()
+	if ours {
 		p.Generation = prev.Generation
 		if prev.FencePubkeys != p.FencePubkeys || prev.SSHDHostkeys != p.SSHDHostkeys {
 			p.Generation++
 		}
-		// The never-downgrade bit comes from the replicated row, and only
-		// from one this host signed: a row another node wrote under this
-		// host's name cannot clear it, nor a renewal (the predecessor
-		// certificate may be revoked by now, so revocation is not checked
-		// here).
-		if _, err := Verify(prev, Trust{Roots: tr.Roots}); err == nil {
-			p.EverAccepting = prev.EverAccepting
-		}
+		p.EverAccepting = prev.EverAccepting
+	}
+	// Never below a generation this host published before: a replay of an
+	// older row of its own does not set the count back.
+	if p.Generation < high || (!ours && p.Generation <= high) {
+		p.Generation = high + 1
 	}
 	p.EverAccepting = p.EverAccepting || accepting
-	if havePrev && !prev.Deleted && PublicationOf(prev) == p {
+	if a.cfg.OnAccepting != nil {
+		a.cfg.OnAccepting(ctx, p.Accepting, p.EverAccepting, p.Detail)
+	}
+	if ours && PublicationOf(prev) == p {
 		if _, err := Verify(prev, tr); err == nil {
 			return nil
 		}
@@ -448,7 +555,50 @@ func (a *Agent) publish(ctx context.Context, self *x509.Certificate, signer cryp
 	if err != nil {
 		return fmt.Errorf("publish this host's fence ssh row: %w", err)
 	}
+	a.setGenerationHighWater(p.Generation)
 	slog.Info("fence ssh: published this host's row", "generation", p.Generation, "accepting", accepting,
 		"detail", why, "serial", strings.ToLower(self.SerialNumber.Text(16)))
 	return nil
+}
+
+// ownLineage reports whether prev was signed by this host under its current
+// certificate or under the one its current certificate renewed.
+func (a *Agent) ownLineage(prev corrosion.HostFenceSSHRow, self *x509.Certificate, tr Trust) bool {
+	if _, err := Verify(prev, Trust{Roots: tr.Roots}); err != nil {
+		return false
+	}
+	cert, err := pki.ParseCertPEM([]byte(prev.CertPEM))
+	if err != nil {
+		return false
+	}
+	got := strings.ToLower(cert.SerialNumber.Text(16))
+	if got == strings.ToLower(self.SerialNumber.Text(16)) {
+		return true
+	}
+	from, ok := pki.RenewedFromSerial(self)
+	return ok && strings.EqualFold(from, got)
+}
+
+// generationFile records the highest generation this host has published.
+const generationFile = "generation"
+
+func (a *Agent) generationHighWater() int64 {
+	raw, err := os.ReadFile(filepath.Join(a.cfg.Dir, generationFile))
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+func (a *Agent) setGenerationHighWater(n int64) {
+	if n <= a.generationHighWater() {
+		return
+	}
+	if _, err := writeIfChanged(filepath.Join(a.cfg.Dir, generationFile), []byte(strconv.FormatInt(n, 10)+"\n"), 0o644); err != nil {
+		slog.Warn("fence ssh: could not record the published generation", "error", err)
+	}
 }

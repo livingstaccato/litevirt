@@ -40,7 +40,8 @@ func TestFenceConfig_Decisions(t *testing.T) {
 		{"accepting, auto: managed", accepting, fencessh.ModeAuto, fence.SSHPathManaged, ""},
 		{"accepting, managed: managed", accepting, fencessh.ModeManaged, fence.SSHPathManaged, ""},
 		{"accepting, legacy: pinned", accepting, fencessh.ModeLegacy, fence.SSHPathPinned, ""},
-		{"was accepting, auto: never downgraded", wasAccepting, fencessh.ModeAuto, "", "never fenced down"},
+		{"was accepting, auto: still the managed key", wasAccepting, fencessh.ModeAuto, fence.SSHPathManaged, ""},
+		{"was accepting, managed: still the managed key", wasAccepting, fencessh.ModeManaged, fence.SSHPathManaged, ""},
 		{"was accepting, legacy: pinned", wasAccepting, fencessh.ModeLegacy, fence.SSHPathPinned, ""},
 	}
 	for _, tc := range cases {
@@ -94,5 +95,32 @@ func TestFenceConfig_Decisions(t *testing.T) {
 				t.Fatalf("managed path = %+v, want BindAddress 127.0.0.2 and node-x's poweroff request", sf)
 			}
 		})
+	}
+}
+
+// TestFenceConfig_ClonedHostKeysRefuseThePinnedPath: two hosts publishing the
+// same sshd key (a cloned image) cannot be told apart by the pin, and the
+// legacy command has no forced command to refuse a request for the other
+// host, so the pinned path toward either is refused; the managed path, whose
+// forced command checks the name, is not.
+func TestFenceConfig_ClonedHostKeysRefuseThePinnedPath(t *testing.T) {
+	w := newWorld(t)
+	a := w.node("node-a", "127.0.0.2")
+	x := w.node("node-x", "127.0.0.3")
+	y := w.node("node-y", "127.0.0.4")
+	y.hkPath, y.hostKey = x.hkPath, x.hostKey
+	a.publish(true, false, "127.0.0.2", 22)
+	x.publish(false, false, "127.0.0.3", 22)
+	y.publish(true, true, "127.0.0.4", 22)
+	ctx := context.Background()
+	if sf := a.agent(fencessh.ModeAuto).FenceConfig(ctx, "node-x"); sf.Refusal == "" ||
+		!strings.Contains(sf.Refusal, "node-y publishes one of node-x's sshd host keys") {
+		t.Fatalf("pinned path toward a cloned host = %+v, want refused", sf)
+	}
+	if sf := a.agent(fencessh.ModeLegacy).FenceConfig(ctx, "node-y"); sf.Refusal == "" {
+		t.Fatalf("legacy-mode pinned path toward a cloned host = %+v, want refused", sf)
+	}
+	if sf := a.agent(fencessh.ModeAuto).FenceConfig(ctx, "node-y"); sf.Refusal != "" || sf.Path != fence.SSHPathManaged {
+		t.Fatalf("managed path toward a cloned host = %+v, want managed", sf)
 	}
 }

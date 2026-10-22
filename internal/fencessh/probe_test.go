@@ -2,6 +2,7 @@ package fencessh_test
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 
@@ -63,5 +64,28 @@ func TestProbeAll_ChecksEachPeerWithoutArmingIt(t *testing.T) {
 		if paths[h] != wp {
 			t.Fatalf("status of %s = %q, want %q (all: %v)", h, paths[h], wp, paths)
 		}
+	}
+}
+
+// TestProbeAll_SkipsHostsNotFencedOverSSH: an ipmi, redfish, manual or
+// watchdog host is never logged in to by the probe.
+func TestProbeAll_SkipsHostsNotFencedOverSSH(t *testing.T) {
+	w := newWorld(t)
+	a := w.node("node-a", "127.0.0.2")
+	x := w.node("node-x", "127.0.0.3")
+	a.publish(true, false, "127.0.0.2", 22)
+	x.publish(true, false, "127.0.0.3", 22)
+	x.start(false)
+	x.hostRow(x.ip, x.port)
+	if _, err := w.db.DB().Exec(`UPDATE hosts SET fence_strategy = 'ipmi' WHERE name = 'node-x'`); err != nil {
+		t.Fatal(err)
+	}
+	ag := a.agent(fencessh.ModeAuto)
+	ag.ProbeAll(context.Background())
+	if p, ok := ag.Probes()["node-x"]; ok {
+		t.Fatalf("an ipmi host was probed: %+v", p)
+	}
+	if raw, _ := os.ReadFile(x.sshdLog); strings.Contains(string(raw), "Accepted publickey") {
+		t.Fatal("the probe logged in to an ipmi host")
 	}
 }

@@ -102,3 +102,28 @@ func (s *Server) peerFenceSSHNode(ctx context.Context, host string) *pb.FenceSSH
 	}
 	return &pb.FenceSSHNode{Host: host, Reachable: true, Error: "it answered for another host"}
 }
+
+// The health condition a host raises for itself while its fence ssh row says
+// its sshd accepted the managed fence key once and does not now.
+const (
+	fenceSSHEvaluator        = "fence_ssh"
+	condFenceSSHNotAccepting = "fence_ssh_not_accepting"
+)
+
+// FenceSSHAccepting is the fence ssh agent's report of what this host just
+// published (fencessh.Config.OnAccepting). While the row says it accepted the
+// managed key before and does not now, peers still fence it over the managed
+// key, but its sshd may refuse that login, so it raises
+// fence_ssh_not_accepting (warning) for itself, and resolves it once it
+// accepts again.
+func (s *Server) FenceSSHAccepting(ctx context.Context, accepting, everAccepting bool, detail string) {
+	raised := everAccepting && !accepting
+	msg := ""
+	if raised {
+		msg = s.hostName + "'s sshd accepted the managed fence key before and does not now (" + detail +
+			"); a peer's fence of it may fail. Run `lv host install-fence-ssh --host " + s.hostName +
+			"` and check `lv doctor fence`"
+	}
+	s.setConditionOf(ctx, fenceSSHEvaluator, condFenceSSHNotAccepting, "host", s.hostName, []string{s.hostName},
+		raised, corrosion.SeverityWarning, msg)
+}

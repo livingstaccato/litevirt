@@ -17,17 +17,25 @@ const installHint = "run `lv host install-fence-ssh` and check `lv doctor fence`
 // target's host_fence_ssh row as this node holds it:
 //
 //   - no row: the legacy path, unpinned — today's fence, for a host that has
-//     not published (the release has not latched). enforcement.fence_ssh:
-//     managed refuses it.
-//   - a row that does not verify (forged, revoked, retired, a certificate
-//     with no address): refused. A host that has published is never fenced
-//     without its pin, whatever the mode, so breaking a row never earns an
-//     unchecked fence.
-//   - a verified row: managed when the target accepts the managed key (and
-//     the mode is not legacy); refused when it accepted it once and no
-//     longer does, unless the mode is legacy (never downgraded: the bit is
-//     the target's own signed ever_accepting, not this node's memory);
-//     otherwise the legacy path with its sshd keys pinned.
+//     not published (the release has not latched, enforcement.fence_ssh:
+//     legacy on it, or a certificate with no fence address).
+//     enforcement.fence_ssh: managed refuses it.
+//   - a row that does not verify (forged, revoked, retired): refused. A host
+//     that has published is never fenced without its pin, whatever the mode,
+//     so breaking a row never earns an unchecked fence.
+//   - a verified row whose host accepts the managed key, or accepted it once
+//     (ever_accepting, its own signed bit): the managed path. Its `accepting`
+//     is one host's evaluation of its own sshd, for every peer at once; a
+//     false one (a peer it was not provisioned for, an evaluation that
+//     failed) must not make it unfenceable, and trying the managed key is
+//     never less safe than refusing: pin, restricted key, from= and forced
+//     command all still apply. legacy mode takes the pinned path.
+//   - a verified row whose host never accepted it: the legacy path with its
+//     sshd keys pinned; managed mode refuses.
+//
+// The pinned path is refused toward a host whose sshd keys another host also
+// publishes (a cloned image): the pin cannot tell them apart, and the legacy
+// command has no forced command to refuse a request for another host.
 func (a *Agent) FenceConfig(ctx context.Context, target string) fence.SSHFence {
 	sf, _ := a.fenceConfig(ctx, target, PoweroffRequest(target))
 	return sf
@@ -59,27 +67,60 @@ func (a *Agent) fenceConfig(ctx context.Context, target, request string) (fence.
 			"without its pinned host key", target, err), nil
 	}
 	pinned := fence.SSHFence{Path: fence.SSHPathPinned, KnownHosts: KnownHostsLines(v), HostKeyAlias: Alias(target)}
-	if mode == ModeLegacy {
-		return pinned, v
+	pinnedOr := func(why string) fence.SSHFence {
+		if other := a.sharedHostKey(ctx, target, v, tr); other != "" {
+			return refuse("%s; and %s publishes one of %s's sshd host keys (a cloned image?), so the pinned legacy "+
+				"path cannot tell the two apart: regenerate the sshd host keys on one of them", why, other, target)
+		}
+		return pinned
 	}
-	if !v.Accepting {
-		switch {
-		case mode == ModeManaged:
+	if mode == ModeLegacy {
+		return pinnedOr("enforcement.fence_ssh is legacy"), v
+	}
+	if !v.Accepting && !v.EverAccepting {
+		if mode == ModeManaged {
 			return refuse("enforcement.fence_ssh is managed and %s's sshd does not accept the managed fence key (%s); %s",
 				target, orUnknown(v.Detail), installHint), v
-		case v.EverAccepting:
-			return refuse("%s accepted the managed fence key before and no longer does (%s); it is never fenced down "+
-				"a lesser path (set enforcement.fence_ssh: legacy on this host to allow the pinned legacy path); %s",
-				target, orUnknown(v.Detail), installHint), v
 		}
-		return pinned, v
+		return pinnedOr(target + " does not accept the managed fence key"), v
 	}
 	own, err := a.ownManaged()
 	if err != nil {
-		return refuse("%s accepts the managed fence key, but this host cannot use it: %v", target, err), v
+		if mode == ModeManaged {
+			return refuse("%s accepts the managed fence key, but this host cannot use it: %v", target, err), v
+		}
+		return pinnedOr("this host cannot use the managed fence key (" + err.Error() + ")"), v
 	}
 	own.KnownHosts, own.HostKeyAlias, own.Request = pinned.KnownHosts, pinned.HostKeyAlias, request
 	return own, v
+}
+
+// sharedHostKey is another live host whose verified row publishes one of v's
+// sshd host keys, "" for none.
+func (a *Agent) sharedHostKey(ctx context.Context, target string, v *Verified, tr Trust) string {
+	mine := map[string]bool{}
+	for _, k := range v.HostKeys {
+		mine[KeyLine(k)] = true
+	}
+	rows, err := corrosion.ListHostFenceSSH(ctx, a.cfg.DB)
+	if err != nil {
+		return ""
+	}
+	for _, r := range rows {
+		if r.HostName == target || r.Deleted {
+			continue
+		}
+		o, err := Verify(r, tr)
+		if err != nil {
+			continue
+		}
+		for _, k := range o.HostKeys {
+			if mine[KeyLine(k)] {
+				return r.HostName
+			}
+		}
+	}
+	return ""
 }
 
 func orUnknown(s string) string {

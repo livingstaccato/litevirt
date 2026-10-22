@@ -1097,6 +1097,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 		Accepting:     fencessh.SSHDAccepting(fencessh.SSHDPath(), "", fencessh.DefaultDir),
 		Mode:          func() string { return d.cfg.Enforcement.FenceSSH },
 		ProbeInterval: d.cfg.FenceSSHProbeInterval(),
+		SelfCheck:     true,
+		OnAccepting:   svc.FenceSSHAccepting,
 	})
 	svc.SetFenceSSH(fenceSSH)
 	fc.FenceSSH = fenceSSH.FenceConfig

@@ -51,8 +51,8 @@ func TestFleet_FenceSSH_DoctorMatrix(t *testing.T) {
 		}
 	}
 	// node-2 has no fence key of its own yet, so it cannot use node-0's
-	// managed path; it is refused, never downgraded.
-	if p := path["node-2>node-0"]; p != "refused/verified" {
-		t.Errorf("node-2>node-0 = %q, want refused/verified", p)
+	// managed path; in auto it fences node-0 pinned meanwhile.
+	if p := path["node-2>node-0"]; p != "legacy-pinned/verified" {
+		t.Errorf("node-2>node-0 = %q, want legacy-pinned/verified", p)
 	}
 }

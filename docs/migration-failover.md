@@ -1228,9 +1228,12 @@ accept the managed key. Its exit code is unchanged.
    and fences run exactly as before. Every host then publishes its row, which pins
    its sshd keys for every fence toward it, the legacy path included.
 2. Run `lv host install-fence-ssh` (from the machine `lv` runs on, as root on each
-   host, or `--ssh-user`). It writes the drop-in on every host and waits until each
-   reports accepting the managed key; from then on, fences toward it take the
-   managed path.
+   host, or `--ssh-user`). It writes the drop-in on every host (or exactly the
+   `--host` ones; an unknown name changes nothing) and waits until each reports
+   accepting the managed key in its own row, read long enough after the change to
+   reflect it (about two minutes); from then on, fences toward it take the managed
+   path. It exits non-zero when any host's sshd refused the drop-in or was not
+   reloaded, or does not confirm within `--wait`.
 3. Check `lv doctor fence`: every pair `managed`, every probe `ok`. A probe
    result can predate the install for up to `fence_ssh_probe_interval_sec`
    (default 15 minutes); a stale `FAILED` clears at the next probe.
@@ -1246,7 +1249,9 @@ off, and only from the removed host's address. `lv host renew-cert` does not
 revoke the replaced certificate until the host's daemon has re-signed its row
 with the renewed one (see [auth.md](auth.md)). `lv uninstall` removes the
 drop-in and `/etc/litevirt/ssh`; `lv host install-fence-ssh --remove` removes
-only the drop-in.
+only the drop-in. A host that ever accepted the managed key is still fenced over
+it afterwards, so its sshd refuses those fences until the drop-in is installed
+again.
 
 **Rolling back.** Every host not in `legacy` publishes as soon as
 `release_2026_12_v1` latches, so the feature `fence_ssh` is used from then on, and

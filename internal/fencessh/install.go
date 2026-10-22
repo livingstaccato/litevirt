@@ -43,7 +43,9 @@ const DropInPath = "/etc/ssh/sshd_config.d/60-litevirt-fence.conf"
 //     own login over the managed key works against the running sshd.
 //   - FENCE_SSH_REMOVE=1 removes the drop-in instead.
 //
-// It always returns 0 and reports on stdout. FENCE_SSH_SSHD,
+// It always returns 0 and reports on stdout, and sets LV_FENCE_SSH_RESULT to
+// its outcome: ResultInstalled, ResultRemoved, ResultUnreloaded or
+// ResultRefused. FENCE_SSH_SSHD,
 // FENCE_SSH_SSHD_CONFIG, FENCE_SSH_DROPIN_DIR, FENCE_SSH_DIR,
 // FENCE_SSH_RELOAD, FENCE_SSH_CAT and FENCE_SSH_AKC_USER override sshd's
 // binary, its config, the drop-in directory, the rendered files' directory,
@@ -117,6 +119,7 @@ lv_fence_ssh_install() {
     local dropin="$ddir/60-litevirt-fence.conf"
     local ak="$dir/authorized_keys"
     local c
+    LV_FENCE_SSH_RESULT=refused
     if [ -z "$sshd" ]; then sshd="$(command -v sshd || true)"; fi
     if [ -z "$sshd" ]; then sshd=/usr/sbin/sshd; fi
     if [ -z "$catbin" ]; then
@@ -131,7 +134,12 @@ lv_fence_ssh_install() {
     fi
     if [ "${FENCE_SSH_REMOVE:-}" = 1 ]; then
         rm -f "$dropin"
-        lv_fence_ssh_reload || echo "fence ssh: WARNING: sshd could not be reloaded; it reads the change once it is"
+        if lv_fence_ssh_reload; then
+            LV_FENCE_SSH_RESULT=removed
+        else
+            LV_FENCE_SSH_RESULT=unreloaded
+            echo "fence ssh: WARNING: sshd could not be reloaded; it reads the change once it is"
+        fi
         echo "fence ssh: removed $dropin"
         return 0
     fi
@@ -162,7 +170,8 @@ lv_fence_ssh_install() {
     if ! scan="$("$sshd" -ddd -T -f "$cfg" -C "user=root,host=,addr=127.0.0.1" 2>&1)"; then
         if [ -n "$prev" ]; then mv "$prev" "$dropin"; fi
         echo "fence ssh: sshd -ddd -T failed, so the files sshd reads cannot be checked for an AuthorizedKeysCommand;"
-        echo "fence ssh: no drop-in was written. Have sshd also read $ak for root"
+        echo "fence ssh: no drop-in was written. Have sshd also read $ak for root. sshd said:"
+        printf '%s\n' "$scan" | tr -d '\r' | grep -v '^debug' | tail -n 3 | sed 's/^/fence ssh:   /'
         return 0
     fi
     files="$(printf '%s\n' "$scan" | tr -d '\r' | sed -n 's/.*load_server_config: filename //p')"
@@ -241,7 +250,9 @@ LVFILES
         return 0
     fi
     if [ -n "$prev" ]; then rm -f "$prev"; fi
+    LV_FENCE_SSH_RESULT=installed
     if ! lv_fence_ssh_reload; then
+        LV_FENCE_SSH_RESULT=unreloaded
         echo "fence ssh: WARNING: sshd could not be reloaded, so it does not read $dropin yet. This host reports that it"
         echo "fence ssh: does not accept the managed fence key until sshd does (reload or restart it)"
     fi
@@ -249,6 +260,20 @@ LVFILES
     return 0
 }
 `
+
+// The outcomes InstallScript sets LV_FENCE_SSH_RESULT to.
+const (
+	// ResultInstalled: the drop-in is in place and sshd was reloaded (or a
+	// listening socket unit starts it from the new configuration).
+	ResultInstalled = "installed"
+	// ResultRemoved: the drop-in is gone and sshd was reloaded.
+	ResultRemoved = "removed"
+	// ResultUnreloaded: the drop-in was written or removed, but the running
+	// sshd was not reloaded, so it does not read the change yet.
+	ResultUnreloaded = "unreloaded"
+	// ResultRefused: nothing was changed (every refusal the script says why).
+	ResultRefused = "refused"
+)
 
 // RevocationHoldPrefix starts the reason a replaced certificate's revocation
 // is held as owed while its host's fence ssh row is still signed by it.

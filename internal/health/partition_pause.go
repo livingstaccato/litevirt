@@ -47,6 +47,9 @@ const (
 	PartitionPauseExecBudget = 5 * time.Second
 	// partitionPauseCallTimeout bounds one suspend or freeze.
 	partitionPauseCallTimeout = 2 * time.Second
+	// markWaitBoundDefault: how long a clear waits for its own mark write,
+	// well past libvirt's 30 s job wait.
+	markWaitBoundDefault = 2 * time.Minute
 	// partitionPauseSlack covers scheduling and monotonic-clock rate error.
 	partitionPauseSlack = 2 * time.Second
 	// PartitionPauseMargin is what the majority adds to T_pause for a cluster
@@ -387,6 +390,12 @@ type PartitionPauser struct {
 	// markPending: key → the token of this host's pause whose mark is still
 	// being written (libvirt can be slow): not yet set, not failed.
 	markPending map[string]string
+	// markWritten: key/token → closed once that pause's mark write returns
+	// (set or failed), for a clear of that token to wait on.
+	markWritten map[string]chan struct{}
+	// markWaitBound caps how long a clear waits for its own mark write
+	// (markWaitBoundDefault; tests shorten it).
+	markWaitBound time.Duration
 	// clearing: name/token of each mark a background clear is taking off.
 	clearing map[string]bool
 	// markLocks serialise every mark write and clear of one VM, so a slow
@@ -402,6 +411,7 @@ func NewPartitionPauser(host, dataDir string, db *corrosion.Client) *PartitionPa
 		now: time.Now, after: PartitionPauseAfter, tick: partitionPauseTick, ctCapable: lxc.Available,
 		failed: map[string]string{}, heldWhy: map[string]string{}, inflight: map[string]bool{}, notOurs: map[string]string{},
 		markFailed: map[string]string{}, markPending: map[string]string{}, clearing: map[string]bool{},
+		markWritten: map[string]chan struct{}{}, markWaitBound: markWaitBoundDefault,
 		markLocks: map[string]*sync.Mutex{},
 	}
 }
@@ -600,7 +610,7 @@ func (p *PartitionPauser) Evaluate(ctx context.Context) {
 		// A Yes, but not yet a sustained one: neither pause nor resume. A
 		// recorded VM that runs again (an operator resumed it) loses its
 		// mark now, so a later suspend by anyone else never matches it.
-		p.clearMarksOfRunning()
+		p.clearMarksOfRunning(ctx)
 		return
 	}
 	// Unknown (warmup, an unreadable voter set) counts as loss, but is not
@@ -993,6 +1003,7 @@ func (p *PartitionPauser) suspendPendingMark(rec PauseRecord) error {
 	}
 	p.mu.Lock()
 	p.markPending[rec.Key()] = rec.Token
+	p.markWritten[rec.Key()+"/"+rec.Token] = make(chan struct{})
 	p.mu.Unlock()
 	return nil
 }
@@ -1010,6 +1021,10 @@ func (p *PartitionPauser) markPaused(rec PauseRecord) {
 	p.mu.Lock()
 	if p.markPending[rec.Key()] == rec.Token {
 		delete(p.markPending, rec.Key())
+	}
+	if ch := p.markWritten[rec.Key()+"/"+rec.Token]; ch != nil {
+		close(ch)
+		delete(p.markWritten, rec.Key()+"/"+rec.Token)
 	}
 	if err != nil {
 		p.markFailed[rec.Key()] = rec.Token
@@ -1060,7 +1075,14 @@ func (p *PartitionPauser) forgetMark(key string) {
 // clear per VM at a time: a running VM must never carry a mark, and a clear
 // can wait behind a libvirt job. It runs under name's mark lock and clears
 // only token's mark, so a later pause's mark survives it.
-func (p *PartitionPauser) clearMarkBackground(name, token string) {
+//
+// A clear first waits for token's own mark write, so it never runs before
+// that mark lands and leaves it behind. The wait ends with ctx (the
+// pauser's lifetime) or after markWaitBound, since libvirt's metadata write
+// has no timeout: the clear then gives up and a later pass's sweep
+// (clearMarksOfRunning) tries again. Giving up resumes nothing; a resume of
+// the VM is held while its mark write is in flight.
+func (p *PartitionPauser) clearMarkBackground(ctx context.Context, name, token string) {
 	ck := name + "/" + token // one clear per mark: a newer token's clear is never dropped
 	p.mu.Lock()
 	if p.clearing[ck] {
@@ -1070,23 +1092,34 @@ func (p *PartitionPauser) clearMarkBackground(name, token string) {
 	p.clearing[ck] = true
 	p.mu.Unlock()
 	go func() {
-		// The mark this clear is for may still be being written: wait for it.
-		for {
+		defer func() {
 			p.mu.Lock()
-			pending := p.markPending[PauseKindVM+"/"+name] == token
+			delete(p.clearing, ck)
 			p.mu.Unlock()
-			if !pending {
-				break
+		}()
+		// The mark this clear is for may still be being written: wait for it.
+		p.mu.Lock()
+		written := p.markWritten[PauseKindVM+"/"+ck]
+		bound := p.markWaitBound
+		p.mu.Unlock()
+		if written != nil {
+			t := time.NewTimer(bound)
+			select {
+			case <-written:
+				t.Stop()
+			case <-ctx.Done():
+				t.Stop()
+				return
+			case <-t.C:
+				slog.Warn("partition-pause: this host's pause mark is still being written; not clearing it yet, a later pass tries again",
+					"name", name, "host", p.host, "waited", bound)
+				return
 			}
-			time.Sleep(50 * time.Millisecond)
 		}
 		l := p.markLock(name)
 		l.Lock()
 		err := p.clearMarkLocked(name, token)
 		l.Unlock()
-		p.mu.Lock()
-		delete(p.clearing, ck)
-		p.mu.Unlock()
 		if err != nil && !lv.IsNotFound(err) {
 			slog.Warn("partition-pause: could not take the mark off a running domain", "name", name, "error", err)
 		}
@@ -1094,7 +1127,7 @@ func (p *PartitionPauser) clearMarkBackground(name, token string) {
 }
 
 // clearMarksOfRunning takes the mark off every recorded VM that runs.
-func (p *PartitionPauser) clearMarksOfRunning() {
+func (p *PartitionPauser) clearMarksOfRunning(ctx context.Context) {
 	if p.vms == nil {
 		return
 	}
@@ -1108,7 +1141,7 @@ func (p *PartitionPauser) clearMarksOfRunning() {
 		}
 		st, err := guardedCall(&p.reads, readDomainState, partitionPauseCallTimeout, func() (lv.DomainStatus, error) { return p.vms.DomainStateReason(rec.Name) })
 		if err == nil && st.State == RuntimeRunning {
-			p.clearMarkBackground(rec.Name, rec.Token)
+			p.clearMarkBackground(ctx, rec.Name, rec.Token)
 		}
 	}
 }
@@ -1252,7 +1285,7 @@ func (p *PartitionPauser) tryResume(ctx context.Context, now time.Time) {
 			// Resumed or stopped by someone else, gone, or replaced: the record
 			// would only keep partition_paused open and offer a stale epoch.
 			if rec.Kind == PauseKindVM && rec.Token != "" && p.vms != nil {
-				p.clearMarkBackground(rec.Name, rec.Token) // runs again, or is gone: no mark may stay
+				p.clearMarkBackground(ctx, rec.Name, rec.Token) // runs again, or is gone: no mark may stay
 			}
 			p.forgetMark(rec.Key())
 			if err := p.store.remove(rec.Kind, rec.Name); err == nil {

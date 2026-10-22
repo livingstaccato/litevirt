@@ -556,7 +556,7 @@ func TestPartitionPause_AClearForAnOlderTokenLeavesANewerMark(t *testing.T) {
 	f := newPauseFixture(t)
 	l := f.p.markLock("vm-ha")
 	l.Lock()
-	f.p.clearMarkBackground("vm-ha", "token-a") // waits for the lock
+	f.p.clearMarkBackground(context.Background(), "vm-ha", "token-a") // waits for the lock
 	if err := f.virt.MarkPartitionPaused("vm-ha", "token-b"); err != nil {
 		t.Fatal(err) // the newer pause's mark, written first
 	}
@@ -670,5 +670,111 @@ func TestPartitionPause_ANewerTokensClearIsNotDropped(t *testing.T) {
 	}
 	if st := f.raw("vm-ha"); st != libvirtfake.StateRunning {
 		t.Fatalf("setup: vm-ha is %s", st)
+	}
+}
+
+// ppio re-review r3, F-r3-1: a clear waits for its own mark. vm-ha is
+// suspended as token T and an operator resumes it before T's mark write has
+// even started; a clear for T is queued then. It must wait for the mark to
+// land and take it off, not find nothing, return, and leave the mark that
+// lands after it on the running VM.
+//
+// Mutations: drop the wait in clearMarkBackground — the clear runs first,
+// red; note the mark as pending only in markPaused, not at the suspend
+// (suspendPendingMark) — nothing to wait on yet, red.
+func TestPartitionPause_AClearWaitsForItsOwnMark(t *testing.T) {
+	f := newPauseFixture(t)
+	rec := PauseRecord{Kind: PauseKindVM, Name: "vm-ha", Token: "token-t"}
+	if err := f.p.suspendPendingMark(rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.virt.ResumeDomain("vm-ha"); err != nil { // virsh resume
+		t.Fatal(err)
+	}
+	f.p.clearMarkBackground(context.Background(), "vm-ha", rec.Token)
+	clearDone := func() bool {
+		f.p.mu.Lock()
+		defer f.p.mu.Unlock()
+		return len(f.p.clearing) == 0
+	}
+	for deadline := time.Now().Add(300 * time.Millisecond); time.Now().Before(deadline) && !clearDone(); {
+		time.Sleep(5 * time.Millisecond)
+	}
+	f.p.markPaused(rec) // the mark lands only now
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline) && !clearDone(); {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !clearDone() {
+		t.Fatal("the clear did not finish once its mark landed")
+	}
+	if tok, ok, _ := f.virt.PartitionPauseMark("vm-ha"); ok {
+		t.Fatalf("vm-ha runs and carries mark %q: the clear ran before its own mark landed", tok)
+	}
+}
+
+// ppio re-review r3, F-r3-2: a clear's wait for its own mark is bounded. The
+// mark write hangs (libvirt's metadata write has no timeout): a clear for its
+// token gives up when the pauser's ctx ends, or after markWaitBound, so its
+// goroutine does not leak; and the VM stays held while the write is in flight.
+//
+// Mutations: ignore ctx in the wait — the cancel subtest's clear never ends,
+// red; no deadline — the bound subtest's clear never ends, red.
+func TestPartitionPause_AHungMarkWriteNeverStrandsItsClear(t *testing.T) {
+	for _, tc := range []string{"cancel", "bound"} {
+		t.Run(tc, func(t *testing.T) {
+			f := newPauseFixture(t)
+			release := make(chan struct{})
+			var released sync.Once
+			unhang := func() { released.Do(func() { close(release) }) }
+			defer unhang()
+			f.virt.FailMarkPartitionPaused = func(string) error { <-release; return nil }
+			f.loseFor(QuorumNo, PartitionPauseAfter+2*time.Second)
+			recs := f.records()
+			if len(recs) != 1 || f.raw("vm-ha") != libvirtfake.StatePaused {
+				t.Fatalf("setup: vm-ha %s, records %+v; want it paused", f.raw("vm-ha"), recs)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc == "bound" {
+				f.p.mu.Lock()
+				f.p.markWaitBound = 200 * time.Millisecond
+				f.p.mu.Unlock()
+			}
+			f.p.clearMarkBackground(ctx, "vm-ha", recs[0].Token)
+			if tc == "cancel" {
+				time.Sleep(100 * time.Millisecond)
+				cancel()
+			}
+			ended := false
+			for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+				f.p.mu.Lock()
+				ended = len(f.p.clearing) == 0
+				f.p.mu.Unlock()
+				if ended {
+					break
+				}
+			}
+			if !ended {
+				t.Fatal("the clear still waits on a hung mark write: its goroutine leaks")
+			}
+			// The heal holds the VM: its mark write is still in flight.
+			done := make(chan struct{})
+			go func() { defer close(done); f.regain() }()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the heal's passes waited on the hung mark write")
+			}
+			if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+				t.Fatalf("vm-ha is %s: resumed while its mark write hung", st)
+			}
+			f.p.mu.Lock()
+			why := f.p.heldWhy["vm/vm-ha"]
+			f.p.mu.Unlock()
+			if !strings.Contains(why, "in flight") && !strings.Contains(why, "still being written") {
+				t.Errorf("held as %q, want the mark write in flight named", why)
+			}
+			unhang()
+		})
 	}
 }

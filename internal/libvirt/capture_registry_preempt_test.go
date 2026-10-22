@@ -136,3 +136,47 @@ func TestCapture_APreemptedCaptureNeverStartsItsJob(t *testing.T) {
 		t.Fatalf("the guest is %v after the refused capture, want running (nothing held it)", st)
 	}
 }
+
+// lostConnection is the libvirt10 model whose connection breaks during the
+// snapshot create: the create call fails (libvirtd may still finish the job
+// and switch the disks), and every domain XML read after it fails too.
+type lostConnection struct {
+	*libvirt10
+	broken *atomic.Bool
+}
+
+func (l lostConnection) DomainSnapshotCreateXML(dom golibvirt.Domain, x string, flags uint32) (golibvirt.DomainSnapshot, error) {
+	l.broken.Store(true)
+	return golibvirt.DomainSnapshot{}, errors.New("libvirt: connection reset by peer")
+}
+
+func (l lostConnection) DomainGetXMLDesc(dom golibvirt.Domain, f golibvirt.DomainXMLFlags) (string, error) {
+	if l.broken.Load() {
+		return "", errors.New("libvirt: not connected")
+	}
+	return l.libvirt10.DomainGetXMLDesc(dom, f)
+}
+
+// A create that failed when nothing can show the disks unmoved (the after
+// XML unreadable) is not "nothing taken": the caller must account for a
+// snapshot that may exist (an error row, the disk paths reconciled).
+//
+// Mutation: switched() drops its unreadable-after-XML guard — the failure is
+// reported as nothing taken; red.
+func TestCapture_AFailedCreateWithAnUnreadableDomainMayHaveSwitched(t *testing.T) {
+	for _, v := range captureVariants {
+		t.Run(v.name, func(t *testing.T) {
+			m := newLibvirt10(t)
+			o := v.opts
+			o.Registry = NewCaptureRegistry()
+			_, _, err := CaptureMemorySnapshot(lostConnection{m, new(atomic.Bool)}, "vm", "s1", filepath.Join(m.dir, "vm-s1.vmstate"), o)
+			if err == nil {
+				t.Fatal("the failed create succeeded")
+			}
+			var nt *CaptureNotTakenError
+			if errors.As(err, &nt) {
+				t.Fatalf("a create that failed with the domain unreadable after it is reported as nothing taken: %v", err)
+			}
+		})
+	}
+}

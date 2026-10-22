@@ -4,7 +4,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -33,8 +37,22 @@ func TestCreateSnapshot_AMemorySnapshotRefusedBeforeTheSwitchWritesNoErrorRow(t 
 	if err := os.MkdirAll(img, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.CreateSnapshot(adminCtx(), &pb.CreateSnapshotRequest{VmName: "pm", Name: "s1", WithMemory: true}); err == nil {
+	_, err = s.CreateSnapshot(adminCtx(), &pb.CreateSnapshotRequest{VmName: "pm", Name: "s1", WithMemory: true})
+	if err == nil {
 		t.Fatal("a capture whose memory image could not be written succeeded")
+	}
+	if c := status.Code(err); c != codes.Aborted {
+		t.Fatalf("code %v, want Aborted (nothing taken): %v", c, err)
+	}
+	evs, _ := corrosion.ListVMEvents(adminCtx(), s.db, "pm", 50, "")
+	refused := false
+	for _, e := range evs {
+		if e.Type == "snapshot.created" && e.Result == "refused" && strings.Contains(e.Detail, "s1") {
+			refused = true
+		}
+	}
+	if !refused {
+		t.Fatalf("no snapshot.created/refused event recorded: %+v", evs)
 	}
 	if rec, _ := corrosion.GetSnapshot(adminCtx(), s.db, "pm", "s1"); rec != nil {
 		t.Fatalf("a capture refused before the disk switch left a snapshot row %+v", rec)

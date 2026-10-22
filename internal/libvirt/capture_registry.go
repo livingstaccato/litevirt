@@ -41,6 +41,12 @@ type CaptureRegistry struct {
 	caps  map[string]*captureEntry
 	holds map[string]bool
 	locks map[string]chan struct{} // per-VM settle lock: a one-slot semaphore
+	// lostWhy, when set, refuses every new capture (the host has lost the
+	// voter majority); passes counts pause passes running, which refuse
+	// them too: a capture may not start where a pause pass could meet it
+	// after its start-of-pass preemption.
+	lostWhy string
+	passes  int
 }
 
 type captureEntry struct {
@@ -183,6 +189,11 @@ func (e *captureEntry) abortUntilDone() {
 			defer retry.Stop()
 			for {
 				select {
+				case <-e.done: // ended: no stray abort for a later job
+					return
+				default:
+				}
+				select {
 				case <-idle:
 					go func() {
 						if err := e.abort(); err != nil {
@@ -229,10 +240,61 @@ func (r *CaptureRegistry) Release(vm string) {
 	r.mu.Unlock()
 }
 
+// RefuseCaptures refuses every new capture with why (this host lost the
+// voter majority); "" admits them again.
+func (r *CaptureRegistry) RefuseCaptures(why string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.lostWhy = why
+	r.mu.Unlock()
+}
+
+// PausePass marks a pause pass running until the returned end is called: no
+// capture starts meanwhile, so every capture the pass can meet was in flight
+// when it began, and its start-of-pass Preempt saw it.
+func (r *CaptureRegistry) PausePass() (end func()) {
+	if r == nil {
+		return func() {}
+	}
+	r.mu.Lock()
+	r.passes++
+	r.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			r.mu.Lock()
+			r.passes--
+			r.mu.Unlock()
+		})
+	}
+}
+
+// InFlightNow is the set of VMs with a capture in flight.
+func (r *CaptureRegistry) InFlightNow() map[string]bool {
+	out := map[string]bool{}
+	if r == nil {
+		return out
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for vm := range r.caps {
+		out[vm] = true
+	}
+	return out
+}
+
 // begin registers a capture of vm whose libvirt job abort aborts.
 func (r *CaptureRegistry) begin(vm string, abort func() error) (*captureEntry, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.lostWhy != "" {
+		return nil, fmt.Errorf("a memory snapshot of %q is refused: %s", vm, r.lostWhy)
+	}
+	if r.passes > 0 {
+		return nil, fmt.Errorf("a memory snapshot of %q is refused: this host's partition pause is pausing its workloads", vm)
+	}
 	if r.caps[vm] != nil {
 		return nil, fmt.Errorf("a memory snapshot of %q is already in flight", vm)
 	}

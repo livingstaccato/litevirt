@@ -293,7 +293,13 @@ flight on a VM its rows say it will pause (this host's, not a migration
 source, recoverable): the capture is told not to start its libvirt job, and
 its job is aborted in the background while the pass reads the other VMs. A
 VM's place in the pass therefore does not decide whether its capture's job
-has ended by the time its hold comes. Before the pauser pauses a VM it takes
+has ended by the time its hold comes. No capture starts while a pass runs,
+or while this host reads the voter majority as lost with
+`enforcement.partition_pause` on: it is refused before it takes anything, so
+every capture a pass can meet is one its start saw. A VM whose capture the
+pass saw in flight at its start is the pass's to pause even if it reads
+paused and the capture has ended (and resumed it) by the time the pass looks
+again. Before the pauser pauses a VM it takes
 a hold on it there:
 
 1. When a capture of the VM is in flight, the hold aborts the capture's

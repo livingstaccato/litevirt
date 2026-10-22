@@ -327,8 +327,11 @@ func (c *capture) settle() error {
 func (c *capture) preJob() error {
 	var err error
 	c.reg.settle(c.dom.Name, c.held, func(held bool) {
-		if held || c.e.preempted() {
+		switch {
+		case held:
 			err = fmt.Errorf("domain %q is held by this host's partition pause — memory snapshot abandoned", c.dom.Name)
+		case c.e.preempted():
+			err = fmt.Errorf("domain %q is about to be paused by this host's partition pause — memory snapshot abandoned", c.dom.Name)
 		}
 	})
 	return err

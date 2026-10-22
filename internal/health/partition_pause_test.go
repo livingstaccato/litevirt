@@ -465,7 +465,7 @@ func TestPartitionPause_NoConfirmerHolds(t *testing.T) {
 	}
 }
 
-// DecideResume is the majority check of §3.5, step 3.
+// DecideResume is the majority check of §3.5, step 4.
 //
 // Mutations: count an errored answer — "an error is not an answer" goes red;
 // ignore HostDown — "fenced" goes red; ignore an accepted claim — "accepted"
@@ -522,20 +522,24 @@ func TestDecideResume(t *testing.T) {
 // §4.1 and §4.4 against the live constants: for each cluster size, the
 // majority's wait, measured from its fence decision, must cover the minority's
 // worst-case detection after its last contact with the quorum observers (less
-// the observers' own streak), the pauser's tick quantisation twice, T_pause,
-// the time to execute the pauses, and slack.
+// the observers' own streak), the pauser's tick quantisation twice, one
+// resume step R (a healed pass takes no quorum reading during a step, so the
+// partition returning mid-step is seen up to R late), T_pause, the time to
+// execute the pauses, and slack.
 //
 // It recomputes the bound from first principles — a cycle waits for its
 // slowest probe, probeConcurrency at a time — rather than calling the
 // functions under test.
 //
-// Mutations: shorten partitionPauseSlack, or compute C(n) for one batch
-// regardless of n — this goes red.
+// Mutations: shorten partitionPauseSlack, compute C(n) for one batch
+// regardless of n, drop R from the margin, run the resume steps on a bound
+// other than R, or bound the re-pause past T_pause less a tick or past E —
+// this goes red.
 func TestPartitionPauseWaitCoversTheMinority(t *testing.T) {
 	for _, tc := range []struct {
 		hosts int
 		want  time.Duration // docs/design/partition-pause.md §4.4's table
-	}{{5, 23 * time.Second}, {17, 23 * time.Second}, {18, 35 * time.Second}, {40, 47 * time.Second}} {
+	}{{5, 26 * time.Second}, {17, 26 * time.Second}, {18, 38 * time.Second}, {40, 50 * time.Second}} {
 		targets := tc.hosts - 1
 		batches := (targets + probeConcurrency - 1) / probeConcurrency
 		cycle := checkInterval
@@ -547,11 +551,14 @@ func TestPartitionPauseWaitCoversTheMinority(t *testing.T) {
 		if head < 0 {
 			head = 0
 		}
-		need := head + 2*partitionPauseTick + PartitionPauseExecBudget + PartitionPauseAfter + 2*time.Second
+		// §4.1, "So M pauses by": the first lost reading may wait one tick
+		// and one resume step (R), then T_pause of loss, a tick, and E.
+		pausesBy := head + partitionPauseTick + PartitionResumeStepBound + PartitionPauseAfter + partitionPauseTick + PartitionPauseExecBudget
+		need := pausesBy + 2*time.Second
 		got := PartitionPauseWaitFor(targets)
 		if got < need {
-			t.Errorf("%d hosts: W = %v, but the minority may pause as late as %v after the decision "+
-				"(cycle %v, detect %v)", tc.hosts, got, need, cycle, detect)
+			t.Errorf("%d hosts: W = %v, but the minority may pause as late as %v after the decision, %v with slack "+
+				"(cycle %v, detect %v)", tc.hosts, got, pausesBy, need, cycle, detect)
 		}
 		if got != tc.want {
 			t.Errorf("%d hosts: W = %v, want the design's %v", tc.hosts, got, tc.want)
@@ -560,6 +567,18 @@ func TestPartitionPauseWaitCoversTheMinority(t *testing.T) {
 	if PartitionPauseWait != PartitionPauseWaitFor(1) || PartitionPauseWait != PartitionPauseAfter+PartitionPauseMargin {
 		t.Fatalf("PartitionPauseWait %v is not the one-batch W(1) %v = T_pause %v + margin %v",
 			PartitionPauseWait, PartitionPauseWaitFor(1), PartitionPauseAfter, PartitionPauseMargin)
+	}
+	// The bound the resume pass runs on is the one W counts.
+	if partitionResumeStepBound != PartitionResumeStepBound {
+		t.Fatalf("a resume step is bounded by %v, but W counts %v", partitionResumeStepBound, PartitionResumeStepBound)
+	}
+	// The re-pause after a mid-pass loss holds the pauser's loop from the
+	// first lost reading. §4.1 adds nothing for it because the loop is free
+	// again, with a tick to spare, before T_pause of loss can have built up:
+	// the ordinary pause of what earlier passes resumed is not delayed.
+	if partitionRepauseBound+partitionPauseTick > PartitionPauseAfter || partitionRepauseBound > PartitionPauseExecBudget {
+		t.Fatalf("the re-pause is bounded by %v: with a tick (%v) it must fit in T_pause %v, and in E %v",
+			partitionRepauseBound, partitionPauseTick, PartitionPauseAfter, PartitionPauseExecBudget)
 	}
 	// A loss the majority could not fence must not pause: T_pause is the
 	// majority's own verdict-building time.

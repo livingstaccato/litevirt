@@ -184,6 +184,9 @@ type Fake struct {
 	// pause on a failed disk write, reported with PausedReason io-error.
 	// Any other state change of the domain forgets it.
 	ioPaused map[string]bool
+	// ppMark is the partition-pause mark (MarkPartitionPaused), live only:
+	// it holds for the run it was set in (starts) while the domain is active.
+	ppMark map[string]ppMark
 	// pendingPermall is, per migrated-in TPM guest that has not resumed
 	// yet, the uuid whose permall its swtpm writes back once it runs.
 	pendingPermall map[string]string
@@ -222,6 +225,13 @@ type Fake struct {
 	// (partition pause, docs/design/partition-pause.md §3.4).
 	FailSuspendDomain func(name string) error
 	FailResumeDomain  func(name string) error
+	// FailKillPartitionPaused fails KillPartitionPaused (a missing or
+	// foreign pid file).
+	FailKillPartitionPaused func(name string) error
+	// FailMarkPartitionPaused / FailClearPartitionPauseMark inject a failure
+	// to set or remove the partition-pause mark.
+	FailMarkPartitionPaused     func(name string) error
+	FailClearPartitionPauseMark func(name string) error
 	// FailListDomains makes domain enumeration fail — the shape of a libvirtd
 	// outage, which marks the host's runtime inventory INCOMPLETE and must
 	// refuse new residency at admission time.
@@ -485,6 +495,9 @@ func (f *Fake) SetState(name string, s State) {
 	if s != StateShutdown {
 		delete(f.offReason, name)
 	}
+	if prev := f.domains[name]; (s != StateRunning && s != StatePaused) || (prev != StateRunning && prev != StatePaused) {
+		delete(f.ppMark, name) // a new QEMU process, or none: the live mark is gone
+	}
 	started := s == StateRunning && f.domains[name] != StateRunning
 	f.domains[name] = s
 	f.mu.Unlock()
@@ -710,6 +723,45 @@ func (f *Fake) ResumeFirmwareMoveSourceForOperator(name, uuid, attempt string) e
 func (f *Fake) ResumePartitionPaused(name, uuid string) error {
 	defer f.daemon()()
 	return f.fwExemptResume(libvirt.FirmwareCall{Op: libvirt.OpResume, Name: name, UUID: uuid, Via: libvirt.ViaResumePartitionPaused})
+}
+
+// KillPartitionPaused mirrors libvirt.Client.KillPartitionPaused: the
+// domain's QEMU is killed without libvirt (so the firmware move guard is not
+// asked; the daemon gate is, since a dead daemon kills nothing), and the
+// domain is shut off, crashed. A
+// domain that is not running or paused has no QEMU, which is success; one
+// that is not defined, or whose uuid is not uuid, has no pid file to prove
+// it, which is an error. FailKillPartitionPaused fails it.
+func (f *Fake) KillPartitionPaused(name, uuid string) error {
+	defer f.daemon()()
+	if f.FailKillPartitionPaused != nil {
+		if err := f.FailKillPartitionPaused(name); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.domains[name]
+	if !ok {
+		return fmt.Errorf("libvirtfake: kill qemu of %s: no pid file", name)
+	}
+	if uuid != "" {
+		if got := domainUUIDFromXML(f.liveXMLLocked(name)); !strings.EqualFold(got, uuid) {
+			return fmt.Errorf("libvirtfake: kill qemu of %s: its QEMU has uuid %q, not %q", name, got, uuid)
+		}
+	}
+	if st != StateRunning && st != StatePaused {
+		return nil
+	}
+	f.leftStateLocked(name)
+	f.domains[name] = StateShutdown
+	delete(f.liveConsolePw, name)
+	if f.offReason == nil {
+		f.offReason = map[string]string{}
+	}
+	f.offReason[name] = "crashed"
+	f.record("kill", name, "")
+	return nil
 }
 
 // ResumeFirmwareMoveTarget mirrors libvirt.Client.ResumeFirmwareMoveTarget.
@@ -1218,6 +1270,7 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	}
 	f.dropPITLocked(name, "")
 	delete(f.domains, name)
+	delete(f.ppMark, name)
 	delete(f.xml, name)
 	delete(f.activeXML, name)
 	delete(f.liveConsolePw, name)
@@ -1271,6 +1324,7 @@ func (f *Fake) undefinePreservingState(name string) error {
 	}
 	f.dropPITLocked(name, "")
 	delete(f.domains, name)
+	delete(f.ppMark, name)
 	delete(f.xml, name)
 	delete(f.activeXML, name)
 	delete(f.snapshots, name)
@@ -2654,7 +2708,7 @@ func (f *Fake) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, 
 	defer f.daemon()()
 	for _, op := range []libvirt.FirmwareOp{libvirt.OpStart, libvirt.OpResume} {
 		if err := f.fwCheck(libvirt.FirmwareCall{Op: op, Name: domainName}); err != nil {
-			return 0, 0, fmt.Errorf("memory snapshot of %q: %w", domainName, err)
+			return 0, 0, libvirt.NotTakenCapture(fmt.Errorf("memory snapshot of %q: %w", domainName, err))
 		}
 	}
 	return libvirt.CaptureMemorySnapshot(captureAPI{f}, domainName, snapshotName, vmstatePath, o)

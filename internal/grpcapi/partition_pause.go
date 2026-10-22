@@ -19,7 +19,7 @@ import (
 const partitionResumeRPCTimeout = 3 * time.Second
 
 // CheckPartitionResume is the majority check a self-paused workload must pass
-// before it resumes (docs/design/partition-pause.md §3.5 step 3), wired as the
+// before it resumes (docs/design/partition-pause.md §3.5 step 4), wired as the
 // PartitionPauser's ResumeConfirmer.
 //
 // It asks every OTHER voter of this node's voter set, directly and not through

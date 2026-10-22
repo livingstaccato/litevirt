@@ -1107,8 +1107,9 @@ func (c *Cluster) buildServer(n *Node) {
 	}
 	srv := grpc.NewServer(append(append(trackOpts, pki.PeerServerOptions()...),
 		grpc.Creds(creds),
-		grpc.ChainUnaryInterceptor(n.peerAddrUnaryInterceptor, n.partitionUnaryInterceptor, n.aeMeterUnaryInterceptor, n.probeMeterUnaryInterceptor, n.faultUnaryInterceptor, n.Server.UnaryAuthInterceptor, n.hookUnaryInterceptor),
-		grpc.ChainStreamInterceptor(n.peerAddrStreamInterceptor, n.partitionStreamInterceptor, n.aeMeterStreamInterceptor, n.Server.StreamAuthInterceptor, n.hookStreamInterceptor),
+		// Panic recovery first, as the daemon chains it (serverUnaryInterceptors).
+		grpc.ChainUnaryInterceptor(grpcapi.RecoverUnaryInterceptor, n.peerAddrUnaryInterceptor, n.partitionUnaryInterceptor, n.aeMeterUnaryInterceptor, n.probeMeterUnaryInterceptor, n.faultUnaryInterceptor, n.Server.UnaryAuthInterceptor, n.hookUnaryInterceptor),
+		grpc.ChainStreamInterceptor(grpcapi.RecoverStreamInterceptor, n.peerAddrStreamInterceptor, n.partitionStreamInterceptor, n.aeMeterStreamInterceptor, n.Server.StreamAuthInterceptor, n.hookStreamInterceptor),
 	)...)
 	pb.RegisterLiteVirtServer(srv, n.Server)
 	n.GRPCSrv = srv

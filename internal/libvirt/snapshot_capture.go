@@ -121,13 +121,17 @@ var _ LiveCaptureAPI = (*golibvirt.Libvirt)(nil)
 // is registered while it runs; it never resumes a guest that the pauser
 // holds or that has a pause record (o.Held), and re-suspends one it finds
 // running then. Otherwise it resumes only a guest it suspended itself.
+//
+// An error that comes before libvirt switched any disk is a
+// *CaptureNotTakenError: nothing was taken, and there is nothing to record or
+// clean up.
 func CaptureMemorySnapshot(v LiveCaptureAPI, domainName, snapshotName, vmstatePath string, o CaptureOptions) (diskBytes, vmstateBytes int64, err error) {
 	// Running, not paused, and no device whose state cannot be saved: a
 	// passthrough device is refused here, before the registry, the probe
 	// or any suspend (*PassthroughSnapshotError).
 	dom, err := liveSnapshotPreflight(v, domainName)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, notTaken(err)
 	}
 	reg := o.Registry
 	if reg == nil {
@@ -135,13 +139,13 @@ func CaptureMemorySnapshot(v LiveCaptureAPI, domainName, snapshotName, vmstatePa
 	}
 	e, err := reg.begin(domainName, func() error { return v.DomainAbortJob(dom) })
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, notTaken(err)
 	}
 	defer reg.end(domainName, e)
 	held := false
 	reg.settle(domainName, o.Held, func(h bool) { held = h })
 	if held {
-		return 0, 0, fmt.Errorf("domain %q is held paused by this host's partition pause — no memory snapshot", domainName)
+		return 0, 0, notTaken(fmt.Errorf("domain %q is held paused by this host's partition pause — no memory snapshot", domainName))
 	}
 
 	budget, deadline := o.PauseBudget, o.Deadline
@@ -171,7 +175,7 @@ func CaptureMemorySnapshot(v LiveCaptureAPI, domainName, snapshotName, vmstatePa
 	}
 	snapXML, err := snapshotCreateXMLMemory(v, dom, snapshotName, vmstatePath)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, notTaken(err)
 	}
 	start := time.Now()
 	c := &capture{v: v, dom: dom, reg: reg, e: e, held: o.Held}
@@ -184,6 +188,9 @@ func CaptureMemorySnapshot(v LiveCaptureAPI, domainName, snapshotName, vmstatePa
 		err = serr
 	}
 	if err != nil {
+		if !c.switched(before) {
+			return 0, 0, notTaken(err)
+		}
 		return 0, 0, err
 	}
 	after, aerr := v.DomainGetXMLDesc(dom, 0)
@@ -230,6 +237,53 @@ type capture struct {
 	// suspended: this capture suspended the guest (the paused variant, or a
 	// live capture's deadline), so it may resume it — unless it is held.
 	suspended bool
+	// jobIssued: the libvirt create call was made; jobOK: it returned
+	// success, so the disks are on their overlays.
+	jobIssued, jobOK bool
+}
+
+// switched reports whether a failed capture may have left the disks on new
+// overlays: the create call succeeded, or it failed and the domain's disk
+// sources (or the lack of a readable before/after) do not show every disk
+// where it was. Only a capture whose job was never issued, or whose job
+// failed with every disk provably unmoved, took nothing.
+func (c *capture) switched(beforeXML string) bool {
+	if c.jobOK {
+		return true
+	}
+	if !c.jobIssued {
+		return false
+	}
+	if len(parseDomainDiskSources(beforeXML)) == 0 {
+		return true // cannot tell: treat as taken
+	}
+	after, err := c.v.DomainGetXMLDesc(c.dom, 0)
+	if err != nil || len(parseDomainDiskSources(after)) == 0 {
+		return true
+	}
+	return len(newDiskSources(beforeXML, after)) > 0
+}
+
+// CaptureNotTakenError is a memory snapshot that failed before libvirt
+// switched any disk: refused (a pause hold, a passthrough device, a firmware
+// move), or failed in libvirt's own pre-switch steps (the memory write). No
+// overlay, libvirt snapshot or image was left, so there is no snapshot to
+// record; the guest is left as the capture found it (or as the partition
+// pause holds it).
+type CaptureNotTakenError struct{ Err error }
+
+func (e *CaptureNotTakenError) Error() string { return e.Err.Error() }
+func (e *CaptureNotTakenError) Unwrap() error { return e.Err }
+
+// NotTakenCapture wraps err as a capture that took nothing
+// (*CaptureNotTakenError); nil stays nil.
+func NotTakenCapture(err error) error { return notTaken(err) }
+
+func notTaken(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &CaptureNotTakenError{Err: err}
 }
 
 // settle is every capture's end, success or failure, under the registry's
@@ -264,16 +318,20 @@ func (c *capture) settle() error {
 	return err
 }
 
-// preJob refuses to start the libvirt job once the pauser holds the guest:
-// a hold taken while the capture measured the dirty rate found no job to
-// abort, and a LIVE job started after it would be resumed by libvirt's
-// cleanup over the pauser's suspend. A hold taken after this check aborts
-// the job (Hold retries its abort until the create call returns).
+// preJob refuses to start the libvirt job once the pauser holds the guest,
+// or has preempted the capture at the start of its pass: a hold taken while
+// the capture measured the dirty rate found no job to abort, and a LIVE job
+// started after it would be resumed by libvirt's cleanup over the pauser's
+// suspend. A hold or preemption after this check aborts the job (the abort
+// repeats until the create call returns).
 func (c *capture) preJob() error {
 	var err error
 	c.reg.settle(c.dom.Name, c.held, func(held bool) {
-		if held {
+		switch {
+		case held:
 			err = fmt.Errorf("domain %q is held by this host's partition pause — memory snapshot abandoned", c.dom.Name)
+		case c.e.preempted():
+			err = fmt.Errorf("domain %q is about to be paused by this host's partition pause — memory snapshot abandoned", c.dom.Name)
 		}
 	})
 	return err
@@ -290,7 +348,9 @@ func (c *capture) paused(snapXML string, captureSuspended func() error) error {
 	if err := c.preJob(); err != nil {
 		return err
 	}
+	c.jobIssued = true
 	_, err := c.v.DomainSnapshotCreateXML(c.dom, snapXML, uint32(golibvirt.DomainSnapshotCreateAtomic))
+	c.jobOK = err == nil
 	c.e.jobDone()
 	if err != nil {
 		return fmt.Errorf("memory snapshot: %w", err)
@@ -314,6 +374,7 @@ func (c *capture) live(snapXML string, deadline time.Duration) error {
 		c.e.jobDone()
 		return err
 	}
+	c.jobIssued = true
 	done := make(chan error, 1)
 	go func() {
 		_, err := c.v.DomainSnapshotCreateXML(c.dom, snapXML,
@@ -340,6 +401,7 @@ func (c *capture) live(snapXML string, deadline time.Duration) error {
 		}
 		err = <-done
 	}
+	c.jobOK = err == nil
 	if err != nil {
 		return fmt.Errorf("memory snapshot: %w", err)
 	}

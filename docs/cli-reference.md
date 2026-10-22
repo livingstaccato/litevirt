@@ -1054,6 +1054,14 @@ lv snapshot restore <vm> <name>           # repeatable; memory snapshots are hos
 lv snapshot rm <vm> <name>
 ```
 
+A memory snapshot that fails before libvirt switched any disk (refused, for
+example while the VM's host has lost the voter majority, or its memory image
+could not be written) took nothing: it leaves no snapshot
+row, `lv snapshot create` fails with `Aborted`, the VM gets the event
+`snapshot.created` with result `refused`, and the same name can be used
+again. One that fails after the switch is recorded with state `error`, so it
+stays visible and `lv snapshot rm` can remove it.
+
 `lv snapshot rm` lets libvirt merge the snapshot's overlay into the disk it
 was taken of and remove the overlay; deleting the last disk-only snapshot of a
 running VM does the same with a block commit of its own. A restore leaves the

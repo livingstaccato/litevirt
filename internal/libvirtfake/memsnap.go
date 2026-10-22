@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -52,6 +53,9 @@ type MemoryModel struct {
 	// libvirt does not answer the abort (its job lock held by a stuck call,
 	// or the connection wedged).
 	AbortBlock chan struct{}
+	// AbortDelay is how long libvirt takes to answer a DomainAbortJob (the
+	// job's cancel and cleanup); the job ends when the answer comes.
+	AbortDelay time.Duration
 }
 
 // PauseWindow is one stretch of fake time the guest's vCPUs were stopped.
@@ -260,7 +264,29 @@ func (c captureAPI) DomainGetXMLDesc(dom golibvirt.Domain, _ golibvirt.DomainXML
 			x = "<domain><name>" + dom.Name + "</name>" + mem + "</domain>"
 		}
 	}
+	if srcs := c.f.diskSources[dom.Name]; len(srcs) > 0 && !strings.Contains(x, "<disk") {
+		// The live disk sources a test set (SetDiskSource), as libvirt
+		// shows them: on their overlays once a capture switched them.
+		var b strings.Builder
+		for _, dev := range sortedKeys(srcs) {
+			fmt.Fprintf(&b, "<disk type='file' device='disk'><source file='%s'/><target dev='%s'/></disk>", srcs[dev], dev)
+		}
+		if i := strings.Index(x, "</devices>"); i >= 0 {
+			x = x[:i] + b.String() + x[i:]
+		} else if i := strings.LastIndex(x, "</domain>"); i >= 0 {
+			x = x[:i] + "<devices>" + b.String() + "</devices>" + x[i:]
+		}
+	}
 	return x, nil
+}
+
+func sortedKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 var memoryElemRe = regexp.MustCompile(`<memory[\s>]`)
@@ -403,11 +429,12 @@ func (c captureAPI) DomainSnapshotCreateXML(dom golibvirt.Domain, x string, flag
 // refused, as libvirt does.
 func (c captureAPI) DomainAbortJob(dom golibvirt.Domain) error {
 	c.f.mu.Lock()
-	block := c.f.memLocked(dom.Name).model.AbortBlock
+	block, delay := c.f.memLocked(dom.Name).model.AbortBlock, c.f.memLocked(dom.Name).model.AbortDelay
 	c.f.mu.Unlock()
 	if block != nil {
 		<-block
 	}
+	time.Sleep(delay)
 	c.f.mu.Lock()
 	defer c.f.mu.Unlock()
 	m := c.f.memLocked(dom.Name)

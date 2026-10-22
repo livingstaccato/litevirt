@@ -742,6 +742,38 @@ killed guest may be started again, as before this change, and the marker is
 left on disk. Upgrading again replays it if it still applies (or removes it
 if the guest runs again).
 
+**`lv ct stop` on a quarantined host.** A container's stop is kept by the
+same `operator-stop` record, so a stop the host cannot record is undone by
+the container's restart policy. A plain `lv ct stop` there is refused with
+`FailedPrecondition` before the container is touched, naming
+`lv ct stop --force`. The forced stop works as `lv stop --force` does: it
+first writes `ct-operator-stops/<name>.json` under the `data_dir` (durably,
+naming the host, the container's `created_at` and its owner epoch), then
+stops the container; if the marker cannot be written it is refused and the
+container keeps running. While the marker is there, the container's restart
+policy does not start it. `lv ct start` is refused with `FailedPrecondition`
+on a quarantined host whether or not a marker holds the container: a start
+cannot be recorded either (its admission and its `running` state are
+replicated writes), and a container started there would run while the
+cluster's record of it says otherwise. The refusal names the quarantine and
+its remedy, and nothing is changed. Once the quarantine
+lifts, the host's next reconcile pass, or an `lv ct start` that comes first,
+records the stop on the container's row (`stopped` / `operator-stop`) and
+removes the marker, only while the row is still that incarnation at that
+owner epoch; a marker whose container was deleted, created again, moved or
+owned again under a later generation, or that runs again, is removed with
+nothing recorded. A marker that cannot be read fails closed, as a VM's does,
+and raises `operator_stop_marker_corrupt` with subject `container/<name>`.
+Out of quarantine `--force` changes nothing. A daemon older than this
+build ignores `--force` (it does not know the field): on a quarantined owner
+of that build `lv ct stop --force` stops the container, answers `Internal`
+because the stop cannot be recorded, and once the quarantine lifts the
+container's restart policy starts it again. A migrate (`lv ct migrate`)
+made after the lift and before the stop is recorded records it first, so
+the container lands on the target stopped. The same rollback limit
+applies: a build older than this one ignores the directory, so its restart
+policy may start the container again.
+
 **Deletes, rebuilds and repairs on a quarantined host.** Each of these
 removes something on the host and then records that on a replicated row,
 which the quarantine refuses. So a quarantined host refuses them with

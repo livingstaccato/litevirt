@@ -723,6 +723,14 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 		return
 	}
 
+	// A forced stop made under write quarantine and not yet recorded
+	// (container_operator_stop_marker.go): neither recorded as an
+	// out-of-band stop nor restarted. The replay records it as the
+	// operator's once the quarantine lifts.
+	if containerOperatorStopHeld("containercheck", c.dataDir, c.hostName, &ct) {
+		return
+	}
+
 	// Created and never started: it has not stopped, so there is neither drift
 	// to heal nor a restart to make — the start that follows a create is the
 	// operator's (compose, `lv ct create` then `lv ct start`), and restarting it

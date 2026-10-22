@@ -47,6 +47,13 @@ lv ct stop web --timeout 10
 lv ct rm web
 ```
 
+On a host in write quarantine `lv ct stop` is refused, because the stop
+cannot be recorded and the restart policy would undo it; `lv ct stop --force`
+stops the container anyway and records the stop once the quarantine lifts
+([upgrades.md](upgrades.md#rolling-back-after-a-release-token-latched)).
+`lv ct start` there is refused with the quarantine's remedy: a start cannot
+be recorded either.
+
 `lv ct rm` deletes a stopped container. A running one is refused with a
 message naming `lv ct stop`; `lv ct rm --force` stops it and deletes it.
 `compose down`, a compose recreate and the web UI's delete (behind its

@@ -742,6 +742,33 @@ killed guest may be started again, as before this change, and the marker is
 left on disk. Upgrading again replays it if it still applies (or removes it
 if the guest runs again).
 
+**Deletes, rebuilds and repairs on a quarantined host.** Each of these
+removes something on the host and then records that on a replicated row,
+which the quarantine refuses. So a quarantined host refuses them with
+`FailedPrecondition` before it changes anything. The error names the
+quarantine and its remedy (upgrade the host's binary again or reseed it, or
+wait for release probation), and says nothing was changed:
+
+- `lv rm` of a VM and `lv ct rm` of a container, on the host that runs it
+  (whichever host the command entered on). A quarantined host the command
+  entered on refuses it too, whatever host runs the workload, because the
+  entry host records part of the delete (the workload's firewall tags and
+  schedules). That error also says to run the command from a host that is
+  not in write quarantine.
+- A delete whose VM has no domain on the host its row names asks every
+  other host whether it has the domain. A quarantined host that has it
+  refuses, and the asking host keeps the VM's record. Nothing is removed on
+  either host.
+- `lv rebuild`, `lv snapshot rm`, `lv ct snapshot rm`, `lv resize-disk` and
+  `lv backup restore-from --in-place` on the VM's or container's host.
+- `lv doctor repair-owner`, on the host it names.
+- `lv restart` of a VM that is not running, which is a start (as `lv start`,
+  above). `lv restart` of a running VM still restarts it: its row reads
+  `running` before and after.
+
+None of these is recorded locally to replay later, as a forced stop is. Once
+the quarantine lifts, run the command again.
+
 **Before you roll back**, ask the cluster what would block it:
 
 ```bash

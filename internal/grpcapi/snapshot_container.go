@@ -349,6 +349,13 @@ func (s *Server) DeleteContainerSnapshot(ctx context.Context, req *pb.DeleteCont
 		req.HostName = host
 		return c.DeleteContainerSnapshot(s.ownerStrictOutgoing(ctx), req)
 	}
+	// The file goes before the row, which a host in write quarantine cannot
+	// tombstone (quarantine_lifecycle.go).
+	if err := s.quarantinedLifecycleRefusal("delete", fmt.Sprintf("snapshot %q of container %q", req.Snapshot, req.Name),
+		"its file would be removed while the cluster still lists it", "lv ct snapshot rm "+req.Name+" "+req.Snapshot,
+		false); err != nil {
+		return nil, err
+	}
 	op := s.startContainerOp("snapshot delete", req.Name, "snapshot", req.Snapshot)
 	defer func() { op.done(retErr) }()
 	snap, _ := corrosion.GetContainerSnapshot(ctx, s.db, host, req.Name, req.Snapshot)

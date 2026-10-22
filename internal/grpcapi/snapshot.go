@@ -682,6 +682,14 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 		return out, err
 	}
 
+	// libvirt merges the snapshot before its row is tombstoned and the disk
+	// paths reconciled, which a host in write quarantine cannot record
+	// (quarantine_lifecycle.go).
+	if err := s.quarantinedLifecycleRefusal("delete", fmt.Sprintf("snapshot %q of VM %q", req.SnapshotName, req.VmName),
+		"it would be merged into the VM's disks while the cluster still lists it and records the disk paths it had",
+		"lv snapshot rm "+req.VmName+" "+req.SnapshotName, false); err != nil {
+		return nil, err
+	}
 	// Fetch the record first so we know whether to clean up a vmstate file.
 	snap, _ := corrosion.GetSnapshot(ctx, s.db, req.VmName, req.SnapshotName)
 

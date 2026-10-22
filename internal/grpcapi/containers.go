@@ -654,6 +654,15 @@ func (s *Server) deleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 		}
 		targetHost = h
 	}
+	// A host in write quarantine cannot record the delete: as the owner it
+	// would remove the container under a row that stays live, and as the
+	// entry of a forward it records the firewall tags and schedules part
+	// (quarantine_lifecycle.go).
+	if err := s.quarantinedLifecycleRefusal("delete", fmt.Sprintf("container %q", req.Name),
+		"it would be removed while the cluster still records it", "lv ct rm "+req.Name,
+		targetHost != s.hostName); err != nil {
+		return nil, err
+	}
 	// A delete ends the container's firewall identity, so its tags row is
 	// cleared once the delete succeeds (spec §4.3), by the entry host only:
 	// a forward to the owner says so (entryForwardCtx). Moves and

@@ -280,6 +280,13 @@ func (s *Server) inPlaceRestoreTarget(ctx context.Context, vmName, diskName, aut
 		return restoreDest{}, status.Errorf(codes.FailedPrecondition,
 			"in_place: vm %q lives on %q; run the restore there", vmName, vm.HostName)
 	}
+	// The disk is replaced before its backing record is cleared, which a
+	// host in write quarantine cannot record (quarantine_lifecycle.go).
+	if err := s.quarantinedLifecycleRefusal("restore over", fmt.Sprintf("disk %q of VM %q", diskName, vmName),
+		"the disk would be replaced while the cluster keeps the backing record of the old one",
+		"lv backup restore-from --in-place", false); err != nil {
+		return restoreDest{}, err
+	}
 	unlock := s.lockVMAs(vmName, "restore")
 	d, err := s.inPlaceRestoreLocked(ctx, vmName, diskName)
 	if err != nil {

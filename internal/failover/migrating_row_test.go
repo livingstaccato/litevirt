@@ -144,3 +144,53 @@ func TestRecoverWorkloads_OneAskDeadlinePerPoll(t *testing.T) {
 		t.Fatalf("ask deadlines %v; want one, the poll's start + %s (%s)", got, MigratingAskBudget, start.Add(MigratingAskBudget))
 	}
 }
+
+// With the split-brain gate enforced, the ask of a migrating row's target —
+// which re-points the row when the guest runs there — is taken only under
+// the decision gate and this coordinator's tenure, as the reschedule beside
+// it is: refused, SettleMigratingRows is not called and the VM is held.
+// Before the gate is enforced it is asked as before.
+//
+// Mutations: drop the decision gate in settleMigratingVMs — "gate refuses"
+// red; drop the tenure check — "tenure lost" red.
+func TestSettleMigratingVMs_TakesTheDecisionGateAndTenure(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		gate     *bool // nil: no gate (not enforced)
+		lease    bool
+		wantAsks bool
+	}{
+		{name: "not enforced", gate: nil, lease: false, wantAsks: true},
+		{name: "gate and tenure", gate: ptrBool(true), lease: true, wantAsks: true},
+		{name: "gate refuses", gate: ptrBool(false), lease: true},
+		{name: "tenure lost", gate: ptrBool(true), lease: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := newTestDB(t)
+			ctx := context.Background()
+			c := newTestCoordinator("good", db)
+			if tc.gate != nil {
+				c.Gate = switchableGate{open: tc.gate}
+			}
+			if tc.lease && !c.acquireLease(ctx) {
+				t.Fatal("could not take the failover lease")
+			}
+			asked := 0
+			c.SettleMigratingRows = func(_ context.Context, _ string, _ []corrosion.VMRecord, _ time.Time) map[string]MigratingDecision {
+				asked++
+				return map[string]MigratingDecision{"mg1": {Verdict: MigratingSettled}}
+			}
+			c.beginMigratingAsks()
+			got := c.settleMigratingVMs(ctx, &corrosion.HostRecord{Name: "bad", State: "fenced"},
+				[]corrosion.VMRecord{{Name: "mg1", HostName: "bad", State: "migrating", StateDetail: "→ tgt"}})
+			if (asked == 1) != tc.wantAsks {
+				t.Fatalf("SettleMigratingRows asked %d times, want asked: %v", asked, tc.wantAsks)
+			}
+			if !tc.wantAsks && len(got) != 0 {
+				t.Fatalf("decisions %v without an ask; want none, so mg1 is held", got)
+			}
+		})
+	}
+}
+
+func ptrBool(b bool) *bool { return &b }

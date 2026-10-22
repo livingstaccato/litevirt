@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // MigratingVerdict is what recovery may do with a VM recorded `migrating` on
@@ -78,6 +79,23 @@ func (c *Coordinator) settleMigratingVMs(ctx context.Context, h *corrosion.HostR
 	}
 	if c.SettleMigratingRows == nil {
 		return map[string]MigratingDecision{}
+	}
+	// The ask can end in a write: the re-point of a row to the target that
+	// runs its guest. With the split-brain gate enforced, it is taken only
+	// under the decision gate and this coordinator's tenure, as the
+	// reschedule beside it is; refused, every such VM is held and nothing
+	// is asked or written. Before the gate is enforced it goes ahead as the
+	// legacy reschedule does.
+	if c.gateEnforced(ctx) {
+		if g := c.decideGate(ctx, h.Name); !g.OK {
+			slog.Warn("failover: decision gate refused settling migrating rows", "host", h.Name, "reason", g.Reason)
+			c.noteGateRefused(ActionReschedule, g.Reason)
+			return map[string]MigratingDecision{}
+		}
+		if !c.stillOurTenure(ctx) {
+			c.noteGateRefused(ActionReschedule, health.ReasonStaleLeaseTerm)
+			return map[string]MigratingDecision{}
+		}
 	}
 	askBy := c.migratingAskBy
 	if askBy.IsZero() {

@@ -45,7 +45,7 @@ func RefuseInitOfAClusterMember(ctx context.Context, sshTarget string, force boo
 	}
 	rt, err := ssh.Resolve(sshTarget)
 	if err != nil {
-		return nil // HostInit reports a bad target itself
+		return err // never skip the check on a target that will not resolve
 	}
 	return RefuseInitOfAClusterMemberResolved(ctx, sshTarget, rt, force)
 }

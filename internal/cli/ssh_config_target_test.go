@@ -173,3 +173,12 @@ func TestHostCredentialCommands_RefuseAnAliasAwayFromTheRecordedAddress(t *testi
 		})
 	}
 }
+
+// A target the ssh config cannot resolve fails the member check rather than
+// skipping it (sshcfg M7): nothing else guarantees the init refuses too.
+func TestRefuseInitOfAClusterMember_ResolveErrorRefuses(t *testing.T) {
+	sshAliasEnv(t, "127.0.0.1")
+	if err := RefuseInitOfAClusterMember(context.Background(), "root@bad;host", false); err == nil {
+		t.Fatal("an unresolvable target skipped the cluster-member check")
+	}
+}

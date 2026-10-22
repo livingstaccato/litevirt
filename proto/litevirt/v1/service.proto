@@ -6547,6 +6547,13 @@ message FenceSSHNode {
     // it identical, before it answered. false is no proof either way: an
     // older host, a timeout, a failed sync, or no reevaluate asked.
     bool evaluated_for_request = 7;
+    // reevaluate_outcome: set by a host whose build knows reevaluate, every
+    // time the request carries it: "proved" when evaluated_for_request is
+    // true, else why its re-evaluation proved nothing (it timed out, its sync
+    // failed, sshd could not be evaluated, no row was published). Empty: the
+    // host predates reevaluate, or was not asked. Only the host itself sets
+    // it, never the origin of a fan-out on a peer's behalf.
+    string reevaluate_outcome = 8;
 }
 
 message FenceSSHStatus {

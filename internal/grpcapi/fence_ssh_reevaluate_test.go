@@ -33,7 +33,31 @@ func TestGetFenceSSHStatus_ReevaluateIsAdminOnly(t *testing.T) {
 		t.Fatalf("admin: %v", err)
 	}
 	// No agent on this host: nothing was evaluated, so nothing is proven.
-	if n := st.GetNodes(); len(n) != 1 || n[0].GetEvaluatedForRequest() {
+	if n := st.GetNodes(); len(n) != 1 || n[0].GetEvaluatedForRequest() || n[0].GetReevaluateOutcome() != "no fence ssh agent on this host" {
 		t.Fatalf("admin, no agent: %+v", n)
+	}
+}
+
+// TestFenceSSHReevaluateOutcome: an upgraded host asked to re-evaluate always
+// answers a non-empty outcome, "proved" only with the proof, so the CLI never
+// mistakes it for a host that predates reevaluate.
+//
+// Mutation: return the reason as given (it may be empty): red.
+func TestFenceSSHReevaluateOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		evaluated bool
+		why, err  string
+		wantOK    bool
+		want      string
+	}{
+		{true, "", "", true, "proved"},
+		{true, "", "list hosts: closed", false, "its status could not be read: list hosts: closed"},
+		{false, "no fresh sync finished in time", "", false, "no fresh sync finished in time"},
+		{false, "", "", false, "its re-evaluation proved nothing"},
+	} {
+		ok, got := fenceSSHReevaluateOutcome(tc.evaluated, tc.why, tc.err)
+		if ok != tc.wantOK || got != tc.want {
+			t.Fatalf("%+v: got %v %q", tc, ok, got)
+		}
 	}
 }

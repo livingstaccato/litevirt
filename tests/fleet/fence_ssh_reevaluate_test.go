@@ -49,7 +49,7 @@ func actAsOlderBuild(n *Node) {
 			resp, err := handler(ctx, r)
 			if st, ok := resp.(*pb.FenceSSHStatus); ok {
 				for _, node := range st.GetNodes() {
-					node.EvaluatedForRequest = false
+					node.EvaluatedForRequest, node.ReevaluateOutcome = false, ""
 				}
 			}
 			return resp, err
@@ -125,7 +125,10 @@ func TestFleet_FenceSSH_ReevaluateOlderBuildFallsBack(t *testing.T) {
 	syncAll(t, fs["node-0"], fs["node-1"], fs["node-2"])
 	actAsOlderBuild(c.Nodes[2])
 
-	wantEvaluated(t, c, c.Nodes[0], map[string]bool{"node-0": true, "node-1": true, "node-2": false})
+	oc := wantEvaluated(t, c, c.Nodes[0], map[string]bool{"node-0": true, "node-1": true, "node-2": false})
+	if oc["node-0"] != "proved" || oc["node-1"] != "proved" || oc["node-2"] != "" {
+		t.Fatalf("reevaluate_outcome via node-0: %q", oc)
+	}
 	err, out, _ := reevalInstall(t, c, fs, c.Nodes[0], time.Hour, 12*time.Second)
 	if err == nil || strings.Contains(out, "Every host accepts") {
 		t.Fatalf("node-2's older build confirmed without proof: err %v\n%s", err, out)
@@ -139,11 +142,23 @@ func TestFleet_FenceSSH_ReevaluateOlderBuildFallsBack(t *testing.T) {
 	if took < bound {
 		t.Fatalf("node-2 confirmed after %s, before its %s bound", took, bound)
 	}
+	if strings.Contains(out, "WARNING") {
+		t.Fatalf("an upgraded origin (node-0) was warned about:\n%s", out)
+	}
 
 	wantEvaluated(t, c, c.Nodes[2], map[string]bool{"node-0": false, "node-1": false, "node-2": false})
 	err, out, _ = reevalInstall(t, c, fs, c.Nodes[2], time.Hour, 12*time.Second)
 	if err == nil || strings.Contains(out, "Every host accepts") {
 		t.Fatalf("through the older origin: err %v\n%s", err, out)
+	}
+	// Through the older origin, every host falls back, with a warning that
+	// names it and says the confirmation was time-based only.
+	err, out, took = reevalInstall(t, c, fs, c.Nodes[2], bound, 60*time.Second)
+	if err != nil || took < bound {
+		t.Fatalf("through the older origin with a %s bound: err %v after %s\n%s", bound, err, took, out)
+	}
+	if !strings.Contains(out, "WARNING: node-2") || !strings.Contains(out, "time-based only") {
+		t.Fatalf("no older-origin warning naming node-2:\n%s", out)
 	}
 }
 
@@ -191,11 +206,22 @@ func TestFleet_FenceSSH_ReevaluateWedgedAgentIsNotProof(t *testing.T) {
 	if err == nil || strings.Contains(out, "Every host accepts") {
 		t.Fatalf("a wedged agent's stale row confirmed: err %v\n%s", err, out)
 	}
+	// Its build knows reevaluate, so it does not fall back to the freshness
+	// bound even once that bound has passed: the run fails, naming it and why.
+	// Red on 903ddfc66, which confirmed node-1 here after 2s.
+	err, out, _ = reevalInstall(t, c, fs, c.Nodes[0], 2*time.Second, 60*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "node-1") || strings.Contains(err.Error(), "node-0") ||
+		strings.Contains(err.Error(), "node-2") {
+		t.Fatalf("a wedged new-build host fell back to the freshness bound: err %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "proved nothing") || !strings.Contains(out, "wedged") {
+		t.Fatalf("node-1's reason is not shown:\n%s", out)
+	}
 }
 
 // wantEvaluated asks via for a re-evaluating fanned-out read and checks which
 // hosts prove their evaluation.
-func wantEvaluated(t *testing.T, c *Cluster, via *Node, want map[string]bool) {
+func wantEvaluated(t *testing.T, c *Cluster, via *Node, want map[string]bool) map[string]string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 70*time.Second)
 	defer cancel()
@@ -204,12 +230,15 @@ func wantEvaluated(t *testing.T, c *Cluster, via *Node, want map[string]bool) {
 		t.Fatal(err)
 	}
 	got := map[string]bool{}
+	outcome := map[string]string{}
 	for _, n := range st.GetNodes() {
 		got[n.GetHost()] = n.GetEvaluatedForRequest()
+		outcome[n.GetHost()] = n.GetReevaluateOutcome()
 	}
 	for h, w := range want {
 		if got[h] != w {
 			t.Fatalf("via %s: evaluated_for_request = %v, want %v", via.Name, got, want)
 		}
 	}
+	return outcome
 }

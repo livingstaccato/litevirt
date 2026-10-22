@@ -45968,8 +45968,15 @@ type FenceSSHNode struct {
 	// it identical, before it answered. false is no proof either way: an
 	// older host, a timeout, a failed sync, or no reevaluate asked.
 	EvaluatedForRequest bool `protobuf:"varint,7,opt,name=evaluated_for_request,json=evaluatedForRequest,proto3" json:"evaluated_for_request,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// reevaluate_outcome: set by a host whose build knows reevaluate, every
+	// time the request carries it: "proved" when evaluated_for_request is
+	// true, else why its re-evaluation proved nothing (it timed out, its sync
+	// failed, sshd could not be evaluated, no row was published). Empty: the
+	// host predates reevaluate, or was not asked. Only the host itself sets
+	// it, never the origin of a fan-out on a peer's behalf.
+	ReevaluateOutcome string `protobuf:"bytes,8,opt,name=reevaluate_outcome,json=reevaluateOutcome,proto3" json:"reevaluate_outcome,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *FenceSSHNode) Reset() {
@@ -46049,6 +46056,13 @@ func (x *FenceSSHNode) GetEvaluatedForRequest() bool {
 		return x.EvaluatedForRequest
 	}
 	return false
+}
+
+func (x *FenceSSHNode) GetReevaluateOutcome() string {
+	if x != nil {
+		return x.ReevaluateOutcome
+	}
+	return ""
 }
 
 type FenceSSHStatus struct {
@@ -49834,7 +49848,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x06probed\x18\v \x01(\bR\x06probed\x12\x19\n" +
 	"\bprobe_ok\x18\f \x01(\bR\aprobeOk\x12!\n" +
 	"\fprobe_detail\x18\r \x01(\tR\vprobeDetail\x12\x1b\n" +
-	"\tprobed_at\x18\x0e \x01(\tR\bprobedAt\"\xee\x01\n" +
+	"\tprobed_at\x18\x0e \x01(\tR\bprobedAt\"\x9d\x02\n" +
 	"\fFenceSSHNode\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x1c\n" +
 	"\treachable\x18\x02 \x01(\bR\treachable\x12\x14\n" +
@@ -49843,7 +49857,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"last_error\x18\x05 \x01(\tR\tlastError\x12/\n" +
 	"\x05peers\x18\x06 \x03(\v2\x19.litevirt.v1.FenceSSHPeerR\x05peers\x122\n" +
-	"\x15evaluated_for_request\x18\a \x01(\bR\x13evaluatedForRequest\"d\n" +
+	"\x15evaluated_for_request\x18\a \x01(\bR\x13evaluatedForRequest\x12-\n" +
+	"\x12reevaluate_outcome\x18\b \x01(\tR\x11reevaluateOutcome\"d\n" +
 	"\x0eFenceSSHStatus\x12/\n" +
 	"\x05nodes\x18\x01 \x03(\v2\x19.litevirt.v1.FenceSSHNodeR\x05nodes\x12!\n" +
 	"\fgenerated_at\x18\x02 \x01(\tR\vgeneratedAt*V\n" +

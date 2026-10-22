@@ -52,6 +52,11 @@ func (c *statusClient) GetFenceSSHStatus(context.Context, *pb.FenceSSHStatusRequ
 	return st, nil
 }
 
+// Ping answers as an older origin would: it sets no reevaluate_outcome.
+func (c *statusClient) Ping(context.Context, *pb.PingRequest, ...grpc.CallOption) (*pb.PingResponse, error) {
+	return &pb.PingResponse{HostName: "node-0"}, nil
+}
+
 // TestInstallFenceSSH_ProvisionsEveryHostForEveryPeer: each host's drop-in is
 // evaluated for a fence from every other host's address, written and
 // validated against a real sshd configuration; the command waits for every

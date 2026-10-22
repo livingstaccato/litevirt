@@ -174,6 +174,7 @@ func InstallFenceSSH(ctx context.Context, c pb.LiteVirtClient, hosts []FenceSSHH
 	deadline := opt.now().Add(opt.Wait)
 	var why map[string]string
 	reevaluate := true
+	warnedOlderOrigin := false
 	for {
 		// The installs already happened: a read that fails is retried until
 		// the wait ends, and fails the run only then.
@@ -193,6 +194,10 @@ func InstallFenceSSH(ctx context.Context, c pb.LiteVirtClient, hosts []FenceSSHH
 			}
 			fmt.Fprintf(opt.Out, "  (reading the hosts' fence ssh rows failed, retrying: %v)\n", err)
 		} else {
+			if reevaluate && !warnedOlderOrigin && fenceSSHOlderOrigin(st) {
+				warnedOlderOrigin = true
+				fenceSSHWarnOlderOrigin(ctx, c, opt.Out)
+			}
 			why = fenceSSHUnconfirmed(st, hosts, doneAt, opt.now(), opt.FreshAfter)
 			if len(why) == 0 || !opt.now().Before(deadline) {
 				break
@@ -232,7 +237,9 @@ func InstallFenceSSH(ctx context.Context, c pb.LiteVirtClient, hosts []FenceSSHH
 // either evaluated for this very read (evaluated_for_request: the read was
 // sent after the install finished, and the host's evaluation began after the
 // read reached it) or read at least freshAfter after its install finished.
-// evaluated_for_request false is never proof: it is the old path.
+// evaluated_for_request false is never proof. A host that answers it with a
+// reevaluate_outcome (its build knows reevaluate) does not confirm at all;
+// only one with none (an older build, or not asked) takes the freshness path.
 func fenceSSHUnconfirmed(st *pb.FenceSSHStatus, hosts []FenceSSHHost, doneAt map[string]time.Time, now time.Time, freshAfter time.Duration) map[string]string {
 	own := map[string]*pb.FenceSSHNode{}
 	for _, n := range st.GetNodes() {
@@ -259,6 +266,11 @@ func fenceSSHUnconfirmed(st *pb.FenceSSHStatus, hosts []FenceSSHHost, doneAt map
 			why[name] = "no fence ssh row yet (the release must have latched and its daemon be up)"
 		case p.GetRow() != fencessh.RowVerified:
 			why[name] = fmt.Sprintf("row %s: %s", p.GetRow(), p.GetRowDetail())
+		case !n.GetEvaluatedForRequest() && n.GetReevaluateOutcome() != "":
+			// Its build knows reevaluate, and its re-evaluation proved
+			// nothing (its agent may be wedged): the freshness bound could
+			// confirm the stale row it still holds, so it is not taken.
+			why[name] = "its re-evaluation proved nothing, so its row is not counted: " + n.GetReevaluateOutcome()
 		case !n.GetEvaluatedForRequest() && now.Sub(doneAt[name]) < freshAfter:
 			why[name] = fmt.Sprintf("its row may predate the install: it proved no evaluation for this read (an older "+
 				"daemon, or its agent did not finish one in time), and it counts only once %s has passed", freshAfter)
@@ -267,6 +279,37 @@ func fenceSSHUnconfirmed(st *pb.FenceSSHStatus, hosts []FenceSSHHost, doneAt map
 		}
 	}
 	return why
+}
+
+// fenceSSHOlderOrigin reports whether a re-evaluating read was answered by a
+// host that predates reevaluate: an upgraded origin always sets its own
+// node's reevaluate_outcome, so a read in which no node carries one came from
+// an older origin, which asked no peer to re-evaluate either.
+func fenceSSHOlderOrigin(st *pb.FenceSSHStatus) bool {
+	for _, n := range st.GetNodes() {
+		if n.GetReevaluateOutcome() != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// fenceSSHWarnOlderOrigin says that every host's confirmation will rest on
+// time alone, naming the host the CLI talks to when it answers a Ping.
+func fenceSSHWarnOlderOrigin(ctx context.Context, c pb.LiteVirtClient, out io.Writer) {
+	origin := "the host this command talks to"
+	pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if p, err := c.Ping(pctx, &pb.PingRequest{}); err == nil && p.GetHostName() != "" {
+		origin = p.GetHostName()
+		if v := p.GetVersion(); v != "" {
+			origin += " (" + v + ")"
+		}
+	}
+	fmt.Fprintf(out, "WARNING: %s runs a build older than re-evaluation on request, so no host was asked to prove a\n"+
+		"fresh evaluation of its sshd: every confirmation below is time-based only (a row read long enough after\n"+
+		"the install), which a wedged agent can pass with a stale row. Re-run against an upgraded host to confirm\n"+
+		"by proof.\n", origin)
 }
 
 // dialFenceSSHHost opens an SSH session to one host (tests swap it).

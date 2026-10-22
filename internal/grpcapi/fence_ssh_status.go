@@ -62,15 +62,18 @@ func (s *Server) GetFenceSSHStatus(ctx context.Context, req *pb.FenceSSHStatusRe
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		evaluated := false
+		evaluated, why := false, "no fence ssh agent on this host"
 		if reevaluate && s.fenceSSH != nil {
-			var why string
 			if evaluated, why = s.fenceSSH.Reevaluate(ctx); !evaluated {
 				slog.Info("fence ssh: a requested re-evaluation proved nothing", "why", why)
 			}
 		}
 		n := s.ownFenceSSHNode(ctx)
-		n.EvaluatedForRequest = evaluated && n.GetError() == ""
+		if reevaluate {
+			// Always set when asked, so the CLI can tell this build, whose
+			// re-evaluation may prove nothing, from one that predates it.
+			n.EvaluatedForRequest, n.ReevaluateOutcome = fenceSSHReevaluateOutcome(evaluated, why, n.GetError())
+		}
 		add(n)
 	}()
 	for _, h := range hosts {
@@ -112,6 +115,21 @@ func (s *Server) ownFenceSSHNode(ctx context.Context) *pb.FenceSSHNode {
 		n.Peers = append(n.Peers, pp)
 	}
 	return n
+}
+
+// fenceSSHReevaluateOutcome is this host's evaluated_for_request and
+// reevaluate_outcome: "proved" only for a proven evaluation and a status
+// that reads, else a reason that is never empty.
+func fenceSSHReevaluateOutcome(evaluated bool, why, statusErr string) (bool, string) {
+	switch {
+	case evaluated && statusErr == "":
+		return true, "proved"
+	case evaluated:
+		return false, "its status could not be read: " + statusErr
+	case why == "":
+		return false, "its re-evaluation proved nothing"
+	}
+	return false, why
 }
 
 // peerFenceSSHNode asks host for its own view, re-evaluated when reevaluate

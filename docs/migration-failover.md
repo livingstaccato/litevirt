@@ -1233,10 +1233,13 @@ accept the managed key. Its exit code is unchanged.
    accepting the managed key in its own row. Asked by an admin, each host
    re-evaluates its sshd for that read, logging in to it over the managed key, and
    proves the evaluation began after the read reached it, so a host confirms in
-   seconds. A host that cannot prove it (a daemon older than this, or an agent that
-   did not finish within its bound) counts only a row read long enough after the
-   change to reflect it (about two minutes); so does every host when the credential
-   is not an admin's. From then on, fences toward it take the managed path. It exits non-zero when any host's sshd refused the drop-in or was not
+   seconds. An upgraded host that cannot prove it (its agent did not finish within
+   its bound) fails, with the reason. Only a host whose daemon is older than this
+   counts a row read long enough after the change to reflect it (about two
+   minutes); so does every host when the credential is not an admin's, and when the
+   command talks to an older host, which asks no peer to re-evaluate: it then warns
+   that the confirmation was time-based only, and re-running it against an upgraded
+   host confirms by proof. From then on, fences toward it take the managed path. It exits non-zero when any host's sshd refused the drop-in or was not
    reloaded, or does not confirm within `--wait`.
 3. Check `lv doctor fence`: every pair `managed`, every probe `ok`. A probe
    result can predate the install for up to `fence_ssh_probe_interval_sec`

@@ -941,7 +941,7 @@ When a host goes offline, the failover coordinator:
 |--------|-------------|
 | `ipmi` | Power cycle via IPMI/BMC (requires `ipmi_address`, `ipmi_user`, `ipmi_pass` on host). Verified post-fence by polling `chassis power status`. |
 | `redfish` | Power-off through the BMC's Redfish service over HTTPS: a `ComputerSystem.Reset` with `ForceOff`, then `PowerState` polled until it reads `Off`. Same weight as `ipmi`: the fence succeeds, and is verified, only once `Off` is observed. Requires `redfish_endpoint`, `redfish_user` and `redfish_pass` on the host. See [Redfish](#redfish) below. |
-| `ssh` | Forced, immediate power-off over SSH: `systemctl poweroff --force --force`, falling back to `echo o > /proc/sysrq-trigger`. Not a graceful shutdown — no units are stopped, so `libvirt-guests` does not get to shut guests down cleanly first; the host stops now, as if its power were pulled. The session dies with the host, and that is reported as success only when the remote shell had already confirmed it was issuing the power-off. Reports failure if the host is unreachable or both power-off commands fail. |
+| `ssh` | Forced, immediate power-off over SSH: `systemctl poweroff --force --force`, falling back to `echo o > /proc/sysrq-trigger`. Not a graceful shutdown — no units are stopped, so `libvirt-guests` does not get to shut guests down cleanly first; the host stops now, as if its power were pulled. The session dies with the host, and that is reported as success only when the remote shell had already confirmed it was issuing the power-off. Reports failure if the host is unreachable or both power-off commands fail. How the session reaches the host — the managed fence key, root's own ssh setup, and whether the host's sshd key is pinned — is [Managed fence SSH](#managed-fence-ssh). |
 | `watchdog` | Local watchdog self-fence (the host writes its own watchdog timer dead). Requires `watchdog_dev` in config. When `watchdog_dev` is set the daemon validates the device at startup and refuses to start if it's absent, so a broken watchdog is caught before it's needed rather than at fence time (override: `LITEVIRT_UNSAFE_SKIP_WATCHDOG_CHECK=1`). On a graceful daemon shutdown the watchdog is disarmed only when this host owns no running VMs or containers; while it owns any, the device stays armed — a restarting daemon resumes petting well inside the timeout, and a daemon stopped for good with workloads left behind lets the watchdog reboot the host into a safely fenced state. Drain (or `lv host shutdown-workloads`) before planned maintenance. |
 | `manual` | Coordinator does NOT auto-reschedule; operator must run `lv host fence-confirm <host>` after physically powering it off. Required when shared storage would corrupt under split-brain. |
 | `best-effort` | Tries the same forced SSH power-off as `ssh`; succeeds regardless. Used in homelabs / single-tenant clusters that explicitly opt out of split-brain protection. |
@@ -1088,6 +1088,125 @@ below the release quarantines itself rather than fence a Redfish host over SSH
 a host with no Redfish settings, is accepted throughout. A server that predates
 the flags ignores them; the CLI reports an error when the host it gets back has
 no Redfish endpoint.
+
+### Managed fence SSH
+
+An `ssh` or `best-effort` fence logs in to the target as root. litevirt
+provisions that login itself, per host, so a fence key can do one thing — power
+its target off — and a machine answering at the wrong address cannot be powered
+off in the target's place.
+
+**What each host holds.** Once the cluster runs `release_2026_12_v1`, each
+host's daemon generates a fence key of its own (`/etc/litevirt/ssh/fence_ed25519`,
+0600, never leaving the host) and publishes, in the replicated `host_fence_ssh`
+row, its public half and the host's sshd host keys, signed with the host's
+cluster certificate. Every daemon verifies every peer's row against the cluster
+CA and the CRL (the certificate must name the row's host and not be revoked) and
+renders the verified ones every 30 seconds:
+
+| File | Contents |
+|---|---|
+| `/etc/litevirt/ssh/authorized_keys` | one line per peer: `restrict,from="<the peer's certificate address>",command="/etc/litevirt/ssh/fence-command"` and its key |
+| `/etc/litevirt/ssh/known_hosts` | each peer's sshd host keys, pinned under `litevirt-fence.<hex of its name>` |
+| `/etc/litevirt/ssh/fence-command` | the forced command: powers this host off only for a request naming it (`litevirt-fence v1 poweroff <hex name>`), answers a probe's `check` without arming, refuses anything else with exit 3 |
+
+The address a key is accepted from is the one IPv4 address the peer's
+certificate names besides 127.0.0.1 — what `lv host init` and `lv host add`
+put in it — never a field of the row. A host whose certificate names only
+127.0.0.1 can neither fence nor be fenced over the managed key. Every file sshd
+reads at fence time is static, so a frozen or dead daemon does not stop its host
+being fenced. A host whose own certificate is revoked, or whose host row is
+removed, renders no peer at all.
+
+**sshd.** `lv host init` and `lv host add` add
+`/etc/ssh/sshd_config.d/60-litevirt-fence.conf`, which has root also read
+`/etc/litevirt/ssh/authorized_keys`, keeping the list sshd had for root. The list
+is evaluated with `sshd -T` for a connection from each peer's address, so a
+`Match Address` block that gives root another list for one peer keeps it there
+(one `Match User root Address <peer>` block each). The drop-in freezes root's
+list as it was: after editing the global `AuthorizedKeysFile`, run `lv host
+install-fence-ssh --host <host>` again. It is validated with `sshd -t` and
+rolled back on a refusal, and never overrides `PermitRootLogin no` — such a host
+reports that it does not accept the managed key. `--no-fence-ssh` skips the
+drop-in, for an sshd configured elsewhere: add `/etc/litevirt/ssh/authorized_keys`
+to root's `AuthorizedKeysFile` there. Each daemon evaluates its sshd the same way
+every minute and publishes whether it accepts the managed key.
+
+**How a fence reaches its target** (`enforcement.fence_ssh`, per host; the
+fencing node's setting decides, so no host relies on another's):
+
+| The target's row | `auto` (default) | `managed` | `legacy` |
+|---|---|---|---|
+| none (it has not published) | today's command, unpinned, with a warning | refused | today's command, unpinned |
+| does not verify (forged, revoked, retired) | refused | refused | refused |
+| verified, sshd accepts the managed key | managed | managed | legacy, pinned |
+| verified, does not accept it | legacy, pinned | refused | legacy, pinned |
+| verified, accepted it before and no longer does | refused | refused | legacy, pinned |
+
+- **managed**: `ssh -F /dev/null` with the host's own fence key, no agent, no
+  configuration of root's, `StrictHostKeyChecking=yes` against the target's
+  pinned sshd keys, `BindAddress` = the fencing host's certificate address, and
+  the request naming the target.
+- **legacy, pinned**: the command fences always ran — root's own identity and ssh
+  configuration, so a hand-made fence key keeps working — with the target's
+  published sshd keys pinned.
+- A host that cannot use the managed key itself (no fence key yet, or a
+  certificate with no address) refuses a fence toward a host that accepts it,
+  rather than take a lesser path.
+- A host that has published is never fenced without its pin, in any mode, and a
+  managed fence that fails is never retried down another path. A refused fence
+  fails (a `best-effort` fence keeps its contract and reports an assumed
+  success). `fencing_log`'s detail records the path: `[path=managed]`,
+  `[path=legacy-pinned]` or `[path=legacy-unpinned]`.
+- A new cluster's `lv host init` writes `fence_ssh: managed`, and `lv host add`
+  copies it with the enforcement block. An upgraded cluster stays `auto`.
+
+**Every member fences.** Any host can hold the failover lease and any host
+answers `lv host fence`, so every admitted host's key is rendered on every
+other host.
+
+**The probe.** Every `fence_ssh_probe_interval_sec` (default 900; 0 disables)
+each host runs the managed path's `check` against every peer: pin, key, source
+address and forced command, without arming anything. The result is
+`litevirt_fence_ssh_probe_ok{peer}` and a warning in the log when it fails. A
+check does not prove the power-off itself works. The probe is a root login on
+every peer each interval, and shows in their auth logs.
+
+**`lv doctor fence`** prints the pair matrix — how a fence from each host reaches
+each other host, and its last probe — and each row as the queried host holds it.
+It warns of every pair fenced without a pinned key and every host that does not
+accept the managed key. Its exit code is unchanged.
+
+**Migrating an existing cluster.**
+
+1. Upgrade with a normal rolling upgrade. `release_2026_12_v1` latches once every
+   host the cluster replicates to runs this build; until then nothing is published
+   and fences run exactly as before. Every host then publishes its row, which pins
+   its sshd keys for every fence toward it, the legacy path included.
+2. Run `lv host install-fence-ssh` (from the machine `lv` runs on, as root on each
+   host, or `--ssh-user`). It writes the drop-in on every host and waits until each
+   reports accepting the managed key; from then on, fences toward it take the
+   managed path.
+3. Check `lv doctor fence`: every pair `managed`, every probe `ok`.
+4. Set `enforcement.fence_ssh: managed` on each host.
+5. Remove any hand-made fence keys and `Host` stanzas from `/root/.ssh` yourself;
+   litevirt never edits it.
+
+**Removal and renewal.** `lv host rm` and `lv host rm --dead` retire the host's
+row on every node, so its key leaves every authorized_keys and its pin every
+known_hosts; its revoked certificate would refuse the row anyway. A partitioned
+node keeps the stale line until it heals; that line still only powers the host
+off, and only from the removed host's address. `lv host renew-cert` does not
+revoke the replaced certificate until the host's daemon has re-signed its row
+with the renewed one (see [auth.md](auth.md)). `lv uninstall` removes the
+drop-in and `/etc/litevirt/ssh`; `lv host install-fence-ssh --remove` removes
+only the drop-in.
+
+**Rolling back.** Every host publishes as soon as `release_2026_12_v1` latches,
+so the feature `fence_ssh` is used from then on, and a host rolled back below
+the release quarantines (see [upgrades.md](upgrades.md)). A rolled-back binary
+leaves the drop-in and the rendered files in place: they keep accepting peers'
+fences, and are not updated when a host is removed until it is upgraded again.
 
 ### Manual fence confirmation flow
 

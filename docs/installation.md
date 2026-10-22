@@ -634,7 +634,7 @@ lv host rm host-a --force
 lv uninstall root@10.0.50.10 --confirmed
 ```
 
-This stops the daemon, removes the binary, config, PKI certificates, systemd unit, and udev rules. By default it also deletes all VM data (images, disks). To keep VM data:
+This stops the daemon, removes the binary, config, PKI certificates, systemd unit, udev rules and the managed fence SSH sshd drop-in (`/etc/ssh/sshd_config.d/60-litevirt-fence.conf`). By default it also deletes all VM data (images, disks). To keep VM data:
 
 ```bash
 lv uninstall root@10.0.50.10 --confirmed --keep-data
@@ -650,6 +650,7 @@ rm -f /usr/local/bin/litevirt
 rm -rf /etc/litevirt
 rm -rf /var/lib/litevirt          # remove VM data
 rm -f /etc/udev/rules.d/99-litevirt-pci.rules
+rm -f /etc/ssh/sshd_config.d/60-litevirt-fence.conf && systemctl reload ssh   # managed fence SSH
 systemctl daemon-reload
 # File restore's host state:
 apparmor_parser -R /dev/stdin <<<'profile litevirt-restore-qemu {}' 2>/dev/null || true  # or reboot

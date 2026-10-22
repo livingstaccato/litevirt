@@ -156,7 +156,8 @@ lv host publish-crl                       # Re-publish this machine's crl.pem if
 lv host renew-cert <host>                 # Renew a host's cluster certificate in place: key made on
   [--ssh root@<addr>] [--keep-old]        #   the host, one atomic switch, served without a restart,
   [--revoke-old] [--force]                #   confirmed, then the old one revoked (owed while the
-  [--grpc-port 7443] [--wait 90s]         #   voter chain needs it). See auth.md
+  [--grpc-port 7443] [--wait 90s]         #   voter chain needs it, or the host's fence ssh row is
+                                          #   still signed by it). See auth.md
 lv host revoke-cert <host> --serial <hex> # Revoke a certificate a renewal replaced; --force for the
   [--force] [--grpc-port 7443]            #   live/presented one (fences the host)
 lv host install-gossip-key                # Put the cluster gossip key on every host (mints it if

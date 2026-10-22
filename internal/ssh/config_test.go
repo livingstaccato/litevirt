@@ -8,10 +8,12 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -122,13 +124,12 @@ func writeSSHConfig(t *testing.T, home, body string) {
 // The alias works in `ssh <alias>`; it must work for lv too: HostName, User,
 // Port and IdentityFile all come from the config.
 func TestNewClient_HonoursSSHConfigAlias(t *testing.T) {
-	home, pub := sshHome(t, "lab_key")
+	home, pub := sshHome(t, "id_ed25519")
 	srv := startFakeSSHD(t, pub)
 	writeSSHConfig(t, home, fmt.Sprintf(`Host labnode
   HostName 127.0.0.1
   User deploy
   Port %s
-  IdentityFile ~/.ssh/lab_key
 `, srv.port()))
 
 	c, err := NewClient("labnode")
@@ -141,16 +142,33 @@ func TestNewClient_HonoursSSHConfigAlias(t *testing.T) {
 	}
 }
 
-// root@alias names the user explicitly; the config's User must not replace it,
-// but HostName, Port and the key still resolve.
-func TestNewClient_CommandLineUserBeatsConfig(t *testing.T) {
-	home, pub := sshHome(t, "lab_key")
+// A configured IdentityFile is used (no default key exists here), with %d and
+// %h expanded.
+func TestNewClient_ConfigIdentityFile(t *testing.T) {
+	home, pub := sshHome(t, "k_127.0.0.1")
 	srv := startFakeSSHD(t, pub)
 	writeSSHConfig(t, home, fmt.Sprintf(`Host labnode
   HostName 127.0.0.1
   User deploy
   Port %s
-  IdentityFile ~/.ssh/lab_key
+  IdentityFile %%d/.ssh/k_%%h
+`, srv.port()))
+	c, err := NewClient("labnode")
+	if err != nil {
+		t.Fatalf("NewClient = %v", err)
+	}
+	c.Close()
+}
+
+// root@alias names the user explicitly; the config's User must not replace it,
+// but HostName, Port and the key still resolve.
+func TestNewClient_CommandLineUserBeatsConfig(t *testing.T) {
+	home, pub := sshHome(t, "id_ed25519")
+	srv := startFakeSSHD(t, pub)
+	writeSSHConfig(t, home, fmt.Sprintf(`Host labnode
+  HostName 127.0.0.1
+  User deploy
+  Port %s
 `, srv.port()))
 
 	if _, err := NewClient("other@labnode"); err == nil {
@@ -163,13 +181,12 @@ func TestNewClient_CommandLineUserBeatsConfig(t *testing.T) {
 
 // An explicit port beats the config's Port.
 func TestNewClient_CommandLinePortBeatsConfig(t *testing.T) {
-	home, pub := sshHome(t, "lab_key")
+	home, pub := sshHome(t, "id_ed25519")
 	srv := startFakeSSHD(t, pub)
 	writeSSHConfig(t, home, `Host labnode
   HostName 127.0.0.1
   User deploy
   Port 1
-  IdentityFile ~/.ssh/lab_key
 `)
 	c, err := NewClient("labnode:" + srv.port())
 	if err != nil {
@@ -180,14 +197,13 @@ func TestNewClient_CommandLinePortBeatsConfig(t *testing.T) {
 
 // Include is resolved (OpenSSH does it).
 func TestNewClient_ConfigInclude(t *testing.T) {
-	home, pub := sshHome(t, "lab_key")
+	home, pub := sshHome(t, "id_ed25519")
 	srv := startFakeSSHD(t, pub)
 	inc := filepath.Join(home, "extra.conf")
 	if err := os.WriteFile(inc, []byte(fmt.Sprintf(`Host labnode
   HostName 127.0.0.1
   User deploy
   Port %s
-  IdentityFile ~/.ssh/lab_key
 `, srv.port())), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -216,17 +232,32 @@ func TestNewClient_NoConfigKeepsDefaults(t *testing.T) {
 	c.Close()
 }
 
-// A ProxyJump the pure-Go client cannot follow is a loud refusal, not a
-// silent direct dial.
-func TestNewClient_ProxyJumpIsRefused(t *testing.T) {
-	home, _ := sshHome(t, "lab_key")
-	writeSSHConfig(t, home, `Host behind
+// ProxyJump and ProxyCommand are unsupported but not refused: lv dials the
+// address directly, as it always did, and says so.
+func TestNewClient_ProxyDirectivesWarnAndDialDirectly(t *testing.T) {
+	for _, directive := range []string{"ProxyJump bastion.example.com", "ProxyCommand false"} {
+		t.Run(strings.Fields(directive)[0], func(t *testing.T) {
+			home, pub := sshHome(t, "id_ed25519")
+			srv := startFakeSSHD(t, pub)
+			var warned []string
+			old := warnf
+			warnf = func(f string, a ...any) { warned = append(warned, fmt.Sprintf(f, a...)) }
+			t.Cleanup(func() { warnf = old })
+			writeSSHConfig(t, home, fmt.Sprintf(`Host behind
   HostName 127.0.0.1
-  ProxyJump bastion.example.com
-`)
-	_, err := NewClient("behind")
-	if err == nil || !strings.Contains(err.Error(), "ProxyJump") {
-		t.Fatalf("err = %v, want a refusal naming ProxyJump", err)
+  User deploy
+  Port %s
+  %s
+`, srv.port(), directive))
+			c, err := NewClient("behind")
+			if err != nil {
+				t.Fatalf("NewClient = %v, want a direct dial", err)
+			}
+			c.Close()
+			if len(warned) == 0 || !strings.Contains(strings.Join(warned, "\n"), strings.Fields(directive)[0]) {
+				t.Fatalf("warnings %v, want one naming %s", warned, strings.Fields(directive)[0])
+			}
+		})
 	}
 }
 
@@ -234,13 +265,12 @@ func TestNewClient_ProxyJumpIsRefused(t *testing.T) {
 // refuses an unknown host; StrictHostKeyChecking no must NOT accept a changed
 // key.
 func TestNewClient_HostKeyCheckingNeverWeaker(t *testing.T) {
-	home, pub := sshHome(t, "lab_key")
+	home, pub := sshHome(t, "id_ed25519")
 	srv := startFakeSSHD(t, pub)
 	base := fmt.Sprintf(`Host labnode
   HostName 127.0.0.1
   User deploy
   Port %s
-  IdentityFile ~/.ssh/lab_key
 `, srv.port())
 
 	t.Run("yes refuses an unknown host", func(t *testing.T) {
@@ -251,8 +281,8 @@ func TestNewClient_HostKeyCheckingNeverWeaker(t *testing.T) {
 		if err := os.WriteFile(kh, []byte(line+"\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := NewClient("labnode"); err == nil {
-			t.Fatal("unknown host accepted under StrictHostKeyChecking yes")
+		if _, err := NewClient("labnode"); err == nil || !strings.Contains(err.Error(), "StrictHostKeyChecking") {
+			t.Fatalf("err = %v, want an unknown-host refusal naming StrictHostKeyChecking", err)
 		}
 	})
 
@@ -264,8 +294,8 @@ func TestNewClient_HostKeyCheckingNeverWeaker(t *testing.T) {
 		if err := os.WriteFile(kh, []byte(line+"\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := NewClient("labnode"); err == nil {
-			t.Fatal("changed host key accepted under StrictHostKeyChecking no")
+		if _, err := NewClient("labnode"); err == nil || !strings.Contains(err.Error(), "CHANGED") {
+			t.Fatalf("err = %v, want a CHANGED host key refusal", err)
 		}
 	})
 }
@@ -277,4 +307,124 @@ func mustEd25519(t *testing.T) ed25519.PublicKey {
 		t.Fatal(err)
 	}
 	return p
+}
+
+// An unusable known_hosts input fails closed, naming the file: it must never
+// fall to the accept-any-key path, or a config could switch off the check for
+// a changed key.
+func TestNewClient_UnusableKnownHostsFailsClosed(t *testing.T) {
+	for _, mode := range []string{"extra-garbage", "extra-dir", "default-garbage"} {
+		t.Run(mode, func(t *testing.T) {
+			home, pub := sshHome(t, "id_ed25519")
+			srv := startFakeSSHD(t, pub)
+			bad := filepath.Join(home, "bad_kh")
+			cfg := fmt.Sprintf("Host labnode\n  HostName 127.0.0.1\n  User deploy\n  Port %s\n", srv.port())
+			wrong, _ := ssh.NewPublicKey(mustEd25519(t))
+			line := knownhosts.Line([]string{net.JoinHostPort("127.0.0.1", srv.port())}, wrong) + "\n"
+			def := filepath.Join(home, ".ssh", "known_hosts")
+			switch mode {
+			case "extra-garbage":
+				os.WriteFile(bad, []byte("this is not a known_hosts line\n"), 0o600)
+				cfg += "  UserKnownHostsFile " + bad + "\n"
+				os.WriteFile(def, []byte(line), 0o600)
+			case "extra-dir":
+				os.Mkdir(bad, 0o700)
+				cfg += "  UserKnownHostsFile " + bad + "\n"
+				os.WriteFile(def, []byte(line), 0o600)
+			case "default-garbage":
+				bad = def
+				os.WriteFile(def, []byte("this is not a known_hosts line\n"), 0o600)
+			}
+			writeSSHConfig(t, home, cfg)
+			c, err := NewClient("labnode")
+			if err == nil {
+				c.Close()
+				t.Fatal("connection accepted with an unusable known_hosts input")
+			}
+			if !strings.Contains(err.Error(), bad) {
+				t.Fatalf("err = %v, want it to name %s", err, bad)
+			}
+		})
+	}
+}
+
+// ssh -G is bounded even when a Match exec grandchild holds its pipes open,
+// and the NewClientDeadline bound covers the config lookup.
+func TestResolveConfig_TimeoutBoundsMatchExec(t *testing.T) {
+	home, _ := sshHome(t, "id_ed25519")
+	writeSSHConfig(t, home, "Match exec \"sleep 25\"\n  User x\n")
+	var warned []string
+	old := warnf
+	warnf = func(f string, a ...any) { warned = append(warned, fmt.Sprintf(f, a...)) }
+	t.Cleanup(func() { warnf = old })
+	start := time.Now()
+	r, err := resolveConfig("labnode", "", "22", false, false, time.Second)
+	if el := time.Since(start); el > 6*time.Second {
+		t.Fatalf("resolveConfig took %v against a 1s bound", el)
+	}
+	if err != nil || r != nil || len(warned) == 0 {
+		t.Fatalf("r=%v err=%v warned=%v, want defaults and a warning", r, err, warned)
+	}
+	start = time.Now()
+	_, _ = NewClientDeadline("labnode", time.Second)
+	if el := time.Since(start); el > 6*time.Second {
+		t.Fatalf("NewClientDeadline took %v against a 1s bound", el)
+	}
+}
+
+// A config User equal to the local login is still a configured User.
+func TestResolveConfig_UserEqualToLocalLogin(t *testing.T) {
+	home, _ := sshHome(t, "id_ed25519")
+	cur, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSSHConfig(t, home, "Host same\n  User "+cur.Username+"\nHost none\n  Port 2200\n")
+	r, err := resolveConfig("same", "", "22", false, false, 0)
+	if err != nil || r == nil || r.User != cur.Username {
+		t.Fatalf("r=%+v err=%v, want User %s", r, err, cur.Username)
+	}
+	r, err = resolveConfig("none", "", "22", false, false, 0)
+	if err != nil || r == nil || r.User != "" || r.Port != "2200" {
+		t.Fatalf("r=%+v err=%v, want User unset and port 2200", r, err)
+	}
+}
+
+func TestResolveConfig_IdentityTokensAndIdentitiesOnly(t *testing.T) {
+	home, _ := sshHome(t, "unused_key")
+	var warned []string
+	old := warnf
+	warnf = func(f string, a ...any) { warned = append(warned, fmt.Sprintf(f, a...)) }
+	t.Cleanup(func() { warnf = old })
+	writeSSHConfig(t, home, "Host h\n  HostName real.example\n  IdentitiesOnly yes\n  IdentityFile %d/.ssh/k_%h\n  IdentityFile ~/.ssh/odd_%L\n")
+	r, err := resolveConfig("h", "", "22", false, false, 0)
+	if err != nil || r == nil {
+		t.Fatalf("r=%v err=%v", r, err)
+	}
+	want := filepath.Join(home, ".ssh", "k_real.example")
+	if len(r.IdentityFiles) != 1 || r.IdentityFiles[0] != want {
+		t.Fatalf("IdentityFiles = %v, want [%s]", r.IdentityFiles, want)
+	}
+	if len(warned) != 1 || !strings.Contains(warned[0], "odd_%L") {
+		t.Fatalf("warnings %v, want one naming the unexpanded IdentityFile", warned)
+	}
+	if !r.IdentitiesOnly {
+		t.Fatal("IdentitiesOnly not read")
+	}
+	if _, err := authMethodsFor(nil, true); err == nil || !strings.Contains(err.Error(), "IdentitiesOnly") {
+		t.Fatalf("authMethodsFor(IdentitiesOnly) = %v, want the agent skipped by name", err)
+	}
+}
+
+func TestResolveHostName(t *testing.T) {
+	home, _ := sshHome(t, "id_ed25519")
+	writeSSHConfig(t, home, "Host labnode\n  HostName 10.1.2.3\n")
+	for target, want := range map[string]string{
+		"labnode": "10.1.2.3", "root@labnode": "10.1.2.3", "labnode:2222": "10.1.2.3",
+		"other": "other", "10.9.9.9": "10.9.9.9",
+	} {
+		if got, err := ResolveHostName(target); err != nil || got != want {
+			t.Errorf("ResolveHostName(%q) = %q, %v; want %q", target, got, err, want)
+		}
+	}
 }

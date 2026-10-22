@@ -307,22 +307,29 @@ Repeat for each additional host.
 
 ## SSH targets and `~/.ssh/config`
 
-Every command that reaches a host over SSH (`lv host init`, `lv host add`, and the
-`--ssh-user` commands) reads `~/.ssh/config` through the system `ssh -G`, so a `Host`
-alias that works with `ssh <alias>` works here: `HostName`, `User`, `Port` and
-`IdentityFile` are used, and `Include` and `Match` are resolved by OpenSSH itself.
+Every command that reaches a host over SSH (`lv host init`, `lv host add`, `lv host rotate-audit-key`
+and the `--ssh-user` commands) reads `~/.ssh/config` through the system `ssh -G`, so a `Host`
+alias that works with `ssh <alias>` works here, even when the alias is not in DNS.
+`HostName`, `User`, `Port` and `IdentityFile` are used, and `Include` and `Match` are resolved
+by OpenSSH itself. Only the per-user `~/.ssh/config` is read; `/etc/ssh/ssh_config` is not.
 
+- The `HostName` is the one address used everywhere: the DNS step, the certificate SAN, the
+  address recorded for the host, and the SSH dial. It must still be IPv4.
 - A user or port written on the command line (`admin@alias`, `alias:2222`) beats the
-  config; the config beats the defaults (user `root`, port 22). A config `User` equal to
-  your local login name cannot be told apart from "unset" and falls back to `root`.
+  config; the config beats the defaults (user `root`, port 22).
 - Configured `IdentityFile` entries are tried before `~/.ssh/id_ed25519`, `id_ecdsa`
-  and `id_rsa`, after the ssh agent.
-- `ProxyJump` and `ProxyCommand` are not supported. A host that sets one is refused with
-  an error naming it, rather than dialled directly.
+  and `id_rsa`, after the ssh agent. `%d %h %n %p %r %u %%` are expanded; an
+  `IdentityFile` with any other `%` token is skipped with a warning. `IdentitiesOnly yes`
+  skips the agent and offers only the configured identities.
+- `ProxyJump` and `ProxyCommand` are not supported. lv warns, naming the directive, and
+  dials the address directly, as it always did.
 - Host-key checking is never loosened by the config. A changed key for a known host is
   always refused. `StrictHostKeyChecking yes` additionally refuses an unknown host, and
-  `UserKnownHostsFile` adds files to check on top of `~/.ssh/known_hosts`.
-- Without an `ssh` binary, or if `ssh -G` fails, lv warns and uses the defaults.
+  `UserKnownHostsFile` adds files to check on top of `~/.ssh/known_hosts`. A known_hosts
+  file that exists but cannot be read or parsed (the default one or a configured one)
+  refuses the connection and names the file; only having no known_hosts at all allows first contact.
+- Without an `ssh` binary, or if `ssh -G` fails or takes longer than 10 seconds, lv warns
+  and uses the defaults.
 
 ## CLI setup
 

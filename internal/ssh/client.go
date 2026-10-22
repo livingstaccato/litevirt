@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -44,10 +45,12 @@ func NewClientDeadline(target string, timeout time.Duration) (*Client, error) {
 }
 
 func newClient(target string, timeout time.Duration, keepDeadline bool) (*Client, error) {
+	start := time.Now()
 	sshUser, host, port, userSet, portSet := parseTargetExplicit(target)
 
-	// ~/.ssh/config fills in only what the command line did not say.
-	cfg, err := resolveConfig(host, sshUser, port, userSet, portSet)
+	// ~/.ssh/config fills in only what the command line did not say. The ssh -G
+	// run counts against the caller's bound, not before it.
+	cfg, err := resolveConfig(host, sshUser, port, userSet, portSet, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -60,17 +63,21 @@ func newClient(target string, timeout time.Duration, keepDeadline bool) (*Client
 	port = cfg.Port
 	dialHost := cfg.Hostname
 
-	auth, err := authMethodsFor(cfg.IdentityFiles)
+	auth, err := authMethodsFor(cfg.IdentityFiles, cfg.IdentitiesOnly)
 	if err != nil {
 		return nil, fmt.Errorf("SSH auth: %w", err)
 	}
 
 	hostKeyCallback, err := hostKeyCallbackFor(cfg.KnownHosts, cfg.StrictYes)
 	if err != nil {
-		if cfg.StrictYes {
-			return nil, fmt.Errorf("no usable known_hosts and StrictHostKeyChecking is yes for %s: %w", host, err)
+		// Only the ABSENCE of any known_hosts reaches the first-contact
+		// fallback. A store that exists but cannot be read or parsed fails
+		// closed: accepting any key there would let a corrupt file (or one
+		// named by the config) switch off the check for a changed key.
+		if !errors.Is(err, errNoKnownHosts) || cfg.StrictYes {
+			return nil, fmt.Errorf("host key check for %s: %w", host, err)
 		}
-		// No usable known_hosts (no HOME, unreadable file). Accept-new still
+		// No known_hosts at all (no HOME, no file). Accept-new still
 		// applies -- there is nothing to compare against, and refusing here
 		// would make provisioning impossible on a fresh workstation -- but say
 		// so, because this connection carries the cluster CA-signed host key
@@ -91,7 +98,11 @@ func newClient(target string, timeout time.Duration, keepDeadline bool) (*Client
 	addr := net.JoinHostPort(dialHost, port)
 	var conn *ssh.Client
 	if timeout > 0 {
-		conn, err = dialTimeout(addr, config, timeout, keepDeadline)
+		remaining := timeout - time.Since(start)
+		if remaining <= 0 {
+			return nil, fmt.Errorf("SSH dial %s: %w", addr, context.DeadlineExceeded)
+		}
+		conn, err = dialTimeout(addr, config, remaining, keepDeadline)
 	} else {
 		conn, err = ssh.Dial("tcp", addr, config)
 	}
@@ -316,17 +327,19 @@ func parseTargetExplicit(target string) (user, host, port string, userSet, portS
 	return
 }
 
-func authMethods() ([]ssh.AuthMethod, error) { return authMethodsFor(nil) }
+func authMethods() ([]ssh.AuthMethod, error) { return authMethodsFor(nil, false) }
 
 // authMethodsFor is authMethods with the config's IdentityFile entries tried
 // before the default key files.
-func authMethodsFor(extraKeys []string) ([]ssh.AuthMethod, error) {
+func authMethodsFor(extraKeys []string, identitiesOnly bool) ([]ssh.AuthMethod, error) {
 	var methods []ssh.AuthMethod
 	var tried []string
 
 	// Try SSH agent first
 	sock := os.Getenv("SSH_AUTH_SOCK")
-	if sock == "" {
+	if identitiesOnly {
+		tried = append(tried, "agent: skipped, IdentitiesOnly yes")
+	} else if sock == "" {
 		tried = append(tried, "agent: SSH_AUTH_SOCK not set")
 	} else {
 		conn, err := net.Dial("unix", sock)
@@ -356,6 +369,9 @@ func authMethodsFor(extraKeys []string) ([]ssh.AuthMethod, error) {
 		filepath.Join(home, ".ssh", "id_ecdsa"),
 		filepath.Join(home, ".ssh", "id_rsa"),
 	)
+	if identitiesOnly && len(extraKeys) > 0 {
+		keyFiles = extraKeys // ssh offers only the configured identities
+	}
 	for _, kf := range keyFiles {
 		key, err := loadPrivateKey(kf)
 		if err != nil {
@@ -441,6 +457,10 @@ func firstContactOnlyCallback(host string) ssh.HostKeyCallback {
 	}
 }
 
+// errNoKnownHosts marks the one condition under which first contact may be
+// accepted unchecked: there is no known_hosts store at all.
+var errNoKnownHosts = errors.New("no known_hosts")
+
 func defaultHostKeyCallback() (ssh.HostKeyCallback, error) {
 	return hostKeyCallbackFor(nil, false)
 }
@@ -452,19 +472,28 @@ func defaultHostKeyCallback() (ssh.HostKeyCallback, error) {
 func hostKeyCallbackFor(extra []string, strict bool) (ssh.HostKeyCallback, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", errNoKnownHosts, err)
 	}
-	files := []string{filepath.Join(home, ".ssh", "known_hosts")}
+	var files []string
+	def := filepath.Join(home, ".ssh", "known_hosts")
+	if _, err := knownhosts.New(def); err == nil {
+		files = append(files, def)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("known_hosts %s is unusable: %w", def, err)
+	}
 	for _, f := range extra {
-		if _, serr := os.Stat(f); serr == nil {
-			files = append(files, f)
+		if _, serr := os.Stat(f); errors.Is(serr, os.ErrNotExist) {
+			continue // ssh ignores an absent UserKnownHostsFile too
 		}
+		if _, err := knownhosts.New(f); err != nil {
+			return nil, fmt.Errorf("UserKnownHostsFile %s is unusable: %w", f, err)
+		}
+		files = append(files, f)
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("%w: %s does not exist", errNoKnownHosts, def)
 	}
 	cb, err := knownhosts.New(files...)
-	if err != nil && len(files) > 1 {
-		// The default store may be the missing one; check the rest.
-		cb, err = knownhosts.New(files[1:]...)
-	}
 	if err != nil {
 		return nil, err
 	}

@@ -48,6 +48,12 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 	if err != nil {
 		return err
 	}
+	// The address is the one the ssh config gives this target, so the DNS step,
+	// the certificate SAN and the dial all name the same machine.
+	parsedHost, err = ssh.ResolveHostName(sshTarget)
+	if err != nil {
+		return err
+	}
 	hostAddr, err := resolveHost(parsedHost)
 	if err != nil {
 		return err

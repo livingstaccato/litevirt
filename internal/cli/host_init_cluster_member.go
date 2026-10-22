@@ -8,6 +8,7 @@ import (
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/ssh"
 )
 
 // The cluster's half of the "already a member" check for `lv host init`
@@ -45,6 +46,10 @@ func RefuseInitOfAClusterMember(ctx context.Context, sshTarget string, force boo
 	host, _, err := parseSSHTarget(sshTarget)
 	if err != nil {
 		return nil // HostInit reports a bad target itself
+	}
+	host, err = ssh.ResolveHostName(sshTarget)
+	if err != nil {
+		return nil
 	}
 	addr, err := resolveHost(host)
 	if err != nil {

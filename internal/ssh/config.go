@@ -6,69 +6,110 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
+
+// userSentinel is the User the wrapper config gives a host that nothing
+// configured, so "configured" and "defaulted to the local login" differ even
+// when the config names the local login.
+const userSentinel = "__lv_unset__"
+
+// configTimeout bounds one `ssh -G` run (a Match exec can run anything).
+const configTimeout = 10 * time.Second
+
+// warnf reports a non-fatal config problem to the operator. A variable so a
+// test can capture it.
+var warnf = func(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "warning: "+format+"\n", args...)
+}
 
 // resolved is what the operator's OpenSSH configuration says about a target,
 // reduced to the fields the pure-Go client can act on.
 type resolved struct {
-	Hostname      string
-	User          string // "" when neither the command line nor the config chose one
-	Port          string
-	IdentityFiles []string // configured IdentityFile entries, defaults excluded
-	StrictYes     bool     // StrictHostKeyChecking yes/true/on
-	KnownHosts    []string // configured UserKnownHostsFile entries, defaults excluded
+	Hostname       string
+	User           string // "" when neither the command line nor the config chose one
+	Port           string
+	IdentityFiles  []string // configured IdentityFile entries, defaults excluded
+	IdentitiesOnly bool
+	StrictYes      bool     // StrictHostKeyChecking yes/true/on
+	KnownHosts     []string // configured UserKnownHostsFile entries, defaults excluded
 }
 
-// sshG runs `ssh -G args...` and returns its stdout. A variable so a test can
-// stand in for a machine with no ssh binary.
-var sshG = func(args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+// sshG runs `ssh -G args...` and returns its stdout, giving up after timeout
+// even when a Match exec grandchild holds the pipes open: the whole process
+// group is killed and WaitDelay stops Wait from blocking on the pipes. A
+// variable so a test can stand in for a machine with no ssh binary.
+var sshG = func(timeout time.Duration, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "ssh", append([]string{"-G"}, args...)...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = time.Second
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("ssh -G: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
-	return out, nil
+	return stdout.Bytes(), nil
 }
 
-// resolveConfig asks the system ssh what ~/.ssh/config (the one under
-// $HOME, so a test or a `HOME=... lv` run is honoured) makes of host.
-// OpenSSH is the parser because it already implements Host patterns, Match,
-// Include and token expansion exactly as the operator's own `ssh <alias>`
-// does; the pure-Go client only consumes the answer.
+// resolveConfig asks the system ssh what ~/.ssh/config (the one under $HOME)
+// makes of host. OpenSSH is the parser because it already implements Host
+// patterns, Match, Include and token expansion exactly as the operator's own
+// `ssh <alias>` does. Only the per-user file is read: -F replaces it and also
+// makes ssh skip /etc/ssh/ssh_config.
 //
-// A command-line user or port is passed through to ssh, so it beats the
-// config the same way it does for `ssh -l`/`-p`. A missing ssh binary or an
-// unreadable config falls back to the old defaults with a warning: provisioning
-// from a workstation without OpenSSH worked before and must keep working.
-func resolveConfig(host, user, port string, userSet, portSet bool) (*resolved, error) {
-	if strings.HasPrefix(host, "-") {
+// A command-line user or port is passed as -l/-p, so it beats the config the
+// way it does for ssh. A missing ssh binary or an unreadable config falls back
+// to the old defaults with a warning, because provisioning from a workstation
+// without OpenSSH worked before and must keep working.
+func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.Duration) (*resolved, error) {
+	if host == "" || strings.HasPrefix(host, "-") || strings.ContainsAny(host, " \t\r\n\x00") {
 		return nil, fmt.Errorf("invalid SSH host %q", host)
 	}
-	cfgFile := os.DevNull
+	if timeout <= 0 || timeout > configTimeout {
+		timeout = configTimeout
+	}
+
+	// Wrapper: the operator's config first (ssh keeps the first value it
+	// obtains), then a sentinel User for any host that config left without one.
+	var wrapper strings.Builder
 	if home, err := os.UserHomeDir(); err == nil {
 		p := filepath.Join(home, ".ssh", "config")
 		if st, err := os.Stat(p); err == nil && st.Mode().IsRegular() {
-			cfgFile = p
+			fmt.Fprintf(&wrapper, "Include %q\n", p)
 		}
 	}
-	args := []string{"-F", cfgFile}
+	wrapper.WriteString("Host *\n  User " + userSentinel + "\n")
+	f, err := os.CreateTemp("", "lv-sshcfg-*")
+	if err != nil {
+		warnf("not reading ~/.ssh/config for %s (%v); using defaults", host, err)
+		return nil, nil
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.WriteString(wrapper.String()); err != nil {
+		f.Close()
+		warnf("not reading ~/.ssh/config for %s (%v); using defaults", host, err)
+		return nil, nil
+	}
+	f.Close()
+
+	args := []string{"-F", f.Name()}
 	if userSet {
-		args = append(args, "-l", user)
+		args = append(args, "-l", usr)
 	}
 	if portSet {
 		args = append(args, "-p", port)
 	}
 	args = append(args, "--", host)
-	out, err := sshG(args...)
+	out, err := sshG(timeout, args...)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: not reading ~/.ssh/config for %s (%v); using defaults\n", host, err)
+		warnf("not reading ~/.ssh/config for %s (%v); using defaults", host, err)
 		return nil, nil
 	}
 	got := parseSSHG(out)
@@ -84,52 +125,119 @@ func resolveConfig(host, user, port string, userSet, portSet bool) (*resolved, e
 		r.Port = "22"
 	}
 	if userSet {
-		r.User = user
-	} else if u := got.one("user"); u != "" {
-		// ssh -G always prints a user (the local login when nothing set one).
-		// Compare with a config-less run to tell "configured" from "defaulted".
-		// A config User equal to the local login is indistinguishable and
-		// falls to the lv default.
-		base, berr := sshG("-F", os.DevNull, "--", host)
-		if berr != nil || parseSSHG(base).one("user") != u {
-			r.User = u
-		}
+		r.User = usr
+	} else if u := got.one("user"); u != "" && u != userSentinel {
+		r.User = u
+	}
+	eff := r.User
+	if eff == "" {
+		eff = "root"
 	}
 
+	// ProxyJump and ProxyCommand are not supported by this client. They are
+	// not refused: every caller dialled the address directly before, and a
+	// host reachable both ways must keep working.
 	if pj := got.one("proxyjump"); pj != "" && pj != "none" {
-		return nil, fmt.Errorf("%s uses ProxyJump %s in your ssh config, which lv does not support: "+
-			"connect to a directly reachable address, or remove the ProxyJump for this host", host, pj)
+		warnf("%s sets ProxyJump %s in your ssh config; lv does not support it and dials %s:%s directly", host, pj, r.Hostname, r.Port)
 	}
 	if pc := got.one("proxycommand"); pc != "" && pc != "none" {
-		return nil, fmt.Errorf("%s uses ProxyCommand in your ssh config, which lv does not support: "+
-			"connect to a directly reachable address, or remove the ProxyCommand for this host", host)
+		warnf("%s sets ProxyCommand in your ssh config; lv does not support it and dials %s:%s directly", host, r.Hostname, r.Port)
 	}
 
-	baseline, _ := sshG("-F", os.DevNull, "--", host)
-	bg := parseSSHG(baseline)
-	def := map[string]bool{}
-	for _, f := range bg["identityfile"] {
-		def[f] = true
-	}
-	for _, f := range got["identityfile"] {
-		if f != "none" && !def[f] {
-			r.IdentityFiles = append(r.IdentityFiles, expandHome(f))
+	for _, id := range got["identityfile"] {
+		if id == "none" || isDefaultIdentity(id) {
+			continue
 		}
+		p, ok := expandIdentity(id, host, r.Hostname, eff, r.Port)
+		if !ok {
+			warnf("ignoring IdentityFile %q for %s: it uses a %% token lv does not expand", id, host)
+			continue
+		}
+		r.IdentityFiles = append(r.IdentityFiles, p)
 	}
+	r.IdentitiesOnly = strings.EqualFold(got.one("identitiesonly"), "yes")
 	switch strings.ToLower(got.one("stricthostkeychecking")) {
 	case "yes", "true", "on":
 		r.StrictYes = true
 	}
-	defKH := map[string]bool{}
-	for _, f := range strings.Fields(strings.Join(bg["userknownhostsfile"], " ")) {
-		defKH[f] = true
-	}
-	for _, f := range strings.Fields(strings.Join(got["userknownhostsfile"], " ")) {
-		if f != "none" && !defKH[f] {
-			r.KnownHosts = append(r.KnownHosts, expandHome(f))
+	for _, kh := range strings.Fields(strings.Join(got["userknownhostsfile"], " ")) {
+		if kh == "none" || kh == "~/.ssh/known_hosts" || kh == "~/.ssh/known_hosts2" {
+			continue
 		}
+		p, ok := expandIdentity(kh, host, r.Hostname, eff, r.Port)
+		if !ok {
+			// A known_hosts file we cannot name is never silently dropped:
+			// it could hold the key that contradicts the default store.
+			return nil, fmt.Errorf("UserKnownHostsFile %q for %s uses a %% token lv does not expand", kh, host)
+		}
+		r.KnownHosts = append(r.KnownHosts, p)
 	}
 	return r, nil
+}
+
+// ResolveHostName returns the address lv would dial for target once
+// ~/.ssh/config is applied: HostName for an alias, the given host otherwise.
+// Provisioning commands use it for the DNS step, the certificate SAN and the
+// recorded cluster address, so those and the dial name the same machine.
+func ResolveHostName(target string) (string, error) {
+	u, host, port, userSet, portSet := parseTargetExplicit(target)
+	r, err := resolveConfig(host, u, port, userSet, portSet, 0)
+	if err != nil {
+		return "", err
+	}
+	if r == nil {
+		return host, nil
+	}
+	return r.Hostname, nil
+}
+
+func isDefaultIdentity(p string) bool {
+	switch p {
+	case "~/.ssh/id_rsa", "~/.ssh/id_ecdsa", "~/.ssh/id_ecdsa_sk", "~/.ssh/id_ed25519",
+		"~/.ssh/id_ed25519_sk", "~/.ssh/id_xmss", "~/.ssh/id_dsa":
+		return true
+	}
+	return false
+}
+
+// expandIdentity expands ~ and the tokens ssh accepts in these paths that are
+// knowable here (%% %d %h %n %p %r %u); any other token reports ok=false.
+func expandIdentity(p, orig, hostname, usr, port string) (string, bool) {
+	home, _ := os.UserHomeDir()
+	local := ""
+	if u, err := user.Current(); err == nil {
+		local = u.Username
+	}
+	var b strings.Builder
+	for i := 0; i < len(p); i++ {
+		if p[i] != '%' {
+			b.WriteByte(p[i])
+			continue
+		}
+		i++
+		if i >= len(p) {
+			return "", false
+		}
+		switch p[i] {
+		case '%':
+			b.WriteByte('%')
+		case 'd':
+			b.WriteString(home)
+		case 'h':
+			b.WriteString(hostname)
+		case 'n':
+			b.WriteString(orig)
+		case 'p':
+			b.WriteString(port)
+		case 'r':
+			b.WriteString(usr)
+		case 'u':
+			b.WriteString(local)
+		default:
+			return "", false
+		}
+	}
+	return expandHome(b.String()), true
 }
 
 type sshGOut map[string][]string

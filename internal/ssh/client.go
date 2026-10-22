@@ -401,6 +401,11 @@ func authMethodsFor(extraKeys []string, identitiesOnly bool) ([]ssh.AuthMethod, 
 		keyFiles = append(append([]string(nil), extraKeys...), defaults...)
 	}
 	var fileSigners []ssh.Signer
+	isConfigured := map[string]bool{}
+	for _, k := range extraKeys {
+		isConfigured[k] = true
+	}
+	configured := map[int]bool{} // indexes into fileSigners that came from IdentityFile
 	for _, kf := range keyFiles {
 		key, err := loadPrivateKey(kf)
 		if err != nil {
@@ -410,6 +415,9 @@ func authMethodsFor(extraKeys []string, identitiesOnly bool) ([]ssh.AuthMethod, 
 			continue
 		}
 		tried = append(tried, fmt.Sprintf("key %s: loaded", filepath.Base(kf)))
+		if isConfigured[kf] {
+			configured[len(fileSigners)] = true
+		}
 		fileSigners = append(fileSigners, key)
 	}
 
@@ -419,27 +427,46 @@ func authMethodsFor(extraKeys []string, identitiesOnly bool) ([]ssh.AuthMethod, 
 
 	// ONE publickey method: the client tries each method name once, so an
 	// agent whose keys all fail would otherwise use up "publickey" and the key
-	// files after it would never be offered. Agent keys first, then the files,
-	// without repeating a key.
+	// files after it would never be offered. Order, as OpenSSH does: the
+	// configured IdentityFile keys first (the agent's copy of one when it has
+	// it), then the agent's other keys, then the remaining key files, never
+	// repeating a key -- so unrelated agent keys cannot use up MaxAuthTries
+	// before the key the operator named.
 	return []ssh.AuthMethod{ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
-		var all []ssh.Signer
-		seen := map[string]bool{}
+		var agentAll []ssh.Signer
 		if agentSigners != nil {
-			if as, err := agentSigners(); err == nil {
-				for _, sg := range as {
-					if k := string(sg.PublicKey().Marshal()); !seen[k] {
-						seen[k] = true
-						all = append(all, sg)
-					}
-				}
-			} else if len(fileSigners) == 0 {
+			as, err := agentSigners()
+			if err != nil && len(fileSigners) == 0 {
 				return nil, err
 			}
+			agentAll = as
 		}
-		for _, sg := range fileSigners {
+		byPub := map[string]ssh.Signer{}
+		for _, sg := range agentAll {
+			byPub[string(sg.PublicKey().Marshal())] = sg
+		}
+		var all []ssh.Signer
+		seen := map[string]bool{}
+		add := func(sg ssh.Signer) {
 			if k := string(sg.PublicKey().Marshal()); !seen[k] {
 				seen[k] = true
 				all = append(all, sg)
+			}
+		}
+		for i, sg := range fileSigners {
+			if configured[i] {
+				if a, ok := byPub[string(sg.PublicKey().Marshal())]; ok {
+					sg = a
+				}
+				add(sg)
+			}
+		}
+		for _, sg := range agentAll {
+			add(sg)
+		}
+		for i, sg := range fileSigners {
+			if !configured[i] {
+				add(sg)
 			}
 		}
 		return all, nil

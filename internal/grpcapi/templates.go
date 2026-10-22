@@ -198,7 +198,7 @@ func cloneTargetIgnored(req *pb.CloneVMRequest, vm *pb.VM, srcHost string) error
 // cloneVMOnSource is CloneVM on the host that holds the source's disks, with
 // every permission check made and the target name known to be free. On the
 // source's host it places the disks in req.TargetPool when one is named.
-func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, src *corrosion.VMRecord, project string, staging bool) (*pb.VM, error) {
+func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, src *corrosion.VMRecord, project string, staging bool) (_ *pb.VM, cloneErr error) {
 	var err error
 	// The clone makes a VM of the name here: no create of the name runs on
 	// this host while it does (beginCreate), and the name is checked again
@@ -374,20 +374,34 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	// failed clone removes a path only while that file is still there, never
 	// another's that took the path since, even one given the copy's inode.
 	createdFile := map[string]*pinnedFile{}
+	// createdPinErr is why a copy could not be held open: a failed clone
+	// leaves it (it cannot be told from another file at the path).
+	createdPinErr := map[string]error{}
 	defer func() {
 		for _, pf := range createdFile {
 			pf.release()
 		}
 	}()
+	// cloneLeft is what a failed clone's cleanup leaves of what it made; the
+	// clone's error names each (withLeftovers), not only the daemon log.
+	var cloneLeft []string
+	noteLeft := func(what string) { cloneLeft = append(cloneLeft, what) }
+	defer func() { cloneErr = withLeftovers(cloneErr, "clone", cloneLeft) }()
 	// cloneSeed is the cloud-init seed this clone wrote, once it has, and
 	// cloneSeedFile that file, held open until the clone returns
 	// (pinnedFile): a failed clone removes the seed only while it is still
 	// the file at that name, never another's placed there since.
 	var cloneSeed string
 	var cloneSeedFile *pinnedFile
+	var cloneSeedPinErr error
 	defer func() { cloneSeedFile.release() }()
 	removeCloneSeed := func() {
 		if cloneSeed == "" {
+			return
+		}
+		if cloneSeedPinErr != nil {
+			slog.Warn("clone cleanup: seed left, it could not be held open when it was written", "path", cloneSeed, "error", cloneSeedPinErr)
+			noteLeft(fmt.Sprintf("seed %s (it could not be held open to tell it from another file there: %v)", cloneSeed, cloneSeedPinErr))
 			return
 		}
 		if !cloneSeedFile.stillAt(cloneSeed) {
@@ -396,6 +410,7 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 		}
 		if e := cloudinit.RemoveSeed(cloneSeed); e != nil {
 			slog.Warn("clone cleanup: remove cloud-init seed", "path", cloneSeed, "error", e)
+			noteLeft(fmt.Sprintf("seed %s (not removed: %v)", cloneSeed, e))
 		}
 	}
 	cleanup := func() {
@@ -405,8 +420,17 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 				rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 				if e := drv.DeleteDisk(rmCtx, p); e != nil {
 					slog.Warn("clone cleanup: remove disk", "path", p, "error", e)
+					noteLeft(fmt.Sprintf("disk %s (not removed: %v)", p, e))
 				}
 				cancel()
+				continue
+			}
+			if perr := createdPinErr[p]; perr != nil {
+				if _, serr := os.Lstat(p); serr != nil && os.IsNotExist(serr) {
+					continue
+				}
+				slog.Warn("clone cleanup: disk left, it could not be held open when it was written", "path", p, "error", perr)
+				noteLeft(fmt.Sprintf("disk %s (it could not be held open to tell it from another file there: %v)", p, perr))
 				continue
 			}
 			if !createdFile[p].stillAt(p) {
@@ -415,6 +439,7 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 			}
 			if e := os.Remove(p); e != nil && !os.IsNotExist(e) {
 				slog.Warn("clone cleanup: remove disk", "path", p, "error", e)
+				noteLeft(fmt.Sprintf("disk %s (not removed: %v)", p, e))
 			}
 		}
 	}
@@ -511,7 +536,10 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 			}
 		}
 		created = append(created, hostFile)
-		if pf, ok := pinFile(hostFile); ok {
+		if pf, perr := s.pinMade(hostFile); perr != nil {
+			createdPinErr[hostFile] = perr
+		} else {
+			delete(createdPinErr, hostFile)
 			createdFile[hostFile].release()
 			createdFile[hostFile] = pf
 		}
@@ -684,9 +712,7 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 		}
 		cloudInitISO = isoPath
 		cloneSeed = isoPath
-		if pf, ok := pinFile(isoPath); ok {
-			cloneSeedFile = pf
-		}
+		cloneSeedFile, cloneSeedPinErr = s.pinMade(isoPath)
 	}
 
 	// ── Derive the clone's spec + domain ─────────────────────────────────

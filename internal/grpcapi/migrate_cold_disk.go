@@ -664,11 +664,11 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	// and a retried receive place its own at the path, and only a held
 	// file's inode cannot be given to that copy, which would then read as
 	// this receive's own. After the retry commits it is the VM's only copy.
-	ours, ok := pinFile(tmp.Name())
-	if !ok {
+	ours, perr := pinFile(tmp.Name())
+	if perr != nil {
 		return status.Errorf(codes.Internal,
-			"could not hold the copy of %s open (%s) to tell it apart from another file at its path; it is not placed",
-			hdr.Path, tmp.Name())
+			"could not hold the copy of %s open to tell it apart from another file at its path (%v); it is not placed",
+			hdr.Path, perr)
 	}
 	defer ours.release()
 	if err := placeColdDisk(tmp.Name(), dst); err != nil {

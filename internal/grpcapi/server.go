@@ -393,6 +393,9 @@ type Server struct {
 	coldDiskSyncHook  func(final bool)
 	// coldDiskPlacedHook runs after a receive places its disk (tests).
 	coldDiskPlacedHook func()
+	// pinFault fails pinning a file a create or clone made (pinMade), as an
+	// open refused by the fd limit or the file's mode would (tests).
+	pinFault func(path string) error
 	// drainMoves cancels each VM's drain move in flight (drainOneVM), for
 	// `lv operation abort <vm> --force` (AbortVMOperation). Guarded by
 	// drainMovesMu.

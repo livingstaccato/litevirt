@@ -459,6 +459,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// so the owner's log shows both and not only "creating VM" (lab 2, O5).
 	var undone []string
 	noteUndo := func(what string) { undone = append(undone, what) }
+	// left is what the cleanup leaves of what this create made: a disk or
+	// seed it could not hold open (so cannot tell from another file at the
+	// path) or could not remove. The failed create's error names each, so
+	// the operator who meets the name taken on a retry knows why and what
+	// to remove.
+	var left []string
+	noteLeft := func(what string) { noteUndo(what); left = append(left, what) }
 	rowCommitted, keepHeld := false, false
 	// leftDefined: the abort stopped this create's domain but could not
 	// undefine it, so a domain of the name still names the disk paths.
@@ -477,6 +484,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			}
 			slog.Warn("vm create: cleanup after the failed create", "name", spec.Name, "host", s.hostName,
 				"result", result, "left_held", keepHeld)
+			retErr = withLeftovers(retErr, "create", left)
 		}
 	}()
 	// The NVRAM is keyed by name: a live firmware move's record of this name
@@ -616,6 +624,11 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// path since. Only a held file's inode cannot be given to that other
 	// file, which would then read as this create's own.
 	createdDiskFile := map[string]*pinnedFile{}
+	// createdDiskPinErr is why a disk this create made could not be held
+	// open. Such a disk is left by a failed create (it cannot be told from
+	// another file at the path), and named in its error. A disk that is
+	// not a file (rbd, a volume) is removed by its driver whatever this says.
+	createdDiskPinErr := map[string]error{}
 	defer func() {
 		for _, pf := range createdDiskFile {
 			pf.release()
@@ -623,10 +636,14 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	}()
 	recordDisk := func(p string) {
 		createdDiskPaths = append(createdDiskPaths, p)
-		if pf, ok := pinFile(p); ok {
-			createdDiskFile[p].release()
-			createdDiskFile[p] = pf
+		pf, perr := s.pinMade(p)
+		if perr != nil {
+			createdDiskPinErr[p] = perr
+			return
 		}
+		delete(createdDiskPinErr, p)
+		createdDiskFile[p].release()
+		createdDiskFile[p] = pf
 	}
 	// A disk that is not a file (an rbd image) is removed by the driver that
 	// created it: os.Remove of "rbd:pool/image" removes nothing, which is how a
@@ -645,17 +662,24 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// that other seed, which would then read as this create's own.
 	var createdSeed string
 	var createdSeedFile *pinnedFile
+	var createdSeedPinErr error // why it could not be held: it is left
 	defer func() { createdSeedFile.release() }()
 	recordSeed := func(path string) {
-		if pf, ok := pinFile(path); ok {
-			createdSeedFile.release()
-			createdSeed, createdSeedFile = path, pf
-		}
+		pf, perr := s.pinMade(path)
+		createdSeedFile.release()
+		createdSeed, createdSeedFile, createdSeedPinErr = path, pf, perr
 	}
 	// removeSeed removes the seed this create placed, if it is still the
 	// file at that name.
 	removeSeed := func() {
 		if createdSeed == "" {
+			return
+		}
+		if createdSeedPinErr != nil {
+			slog.Warn("cleanup: cloud-init seed left, it could not be held open when it was placed",
+				"path", createdSeed, "error", createdSeedPinErr)
+			noteLeft(fmt.Sprintf("seed %s (it could not be held open to tell it from another file there: %v)",
+				createdSeed, createdSeedPinErr))
 			return
 		}
 		if !createdSeedFile.stillAt(createdSeed) {
@@ -664,7 +688,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		if rmErr := cloudinit.RemoveSeed(createdSeed); rmErr != nil {
 			slog.Warn("cleanup: failed to remove cloud-init seed", "path", createdSeed, "error", rmErr)
-			noteUndo(fmt.Sprintf("seed %s not removed (%v)", createdSeed, rmErr))
+			noteLeft(fmt.Sprintf("seed %s (not removed: %v)", createdSeed, rmErr))
 			return
 		}
 		noteUndo("removed seed " + createdSeed)
@@ -687,7 +711,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				cancel()
 				if rmErr != nil {
 					slog.Warn("cleanup: failed to remove disk", "path", p, "error", rmErr)
-					noteUndo(fmt.Sprintf("disk %s not removed (%v)", p, rmErr))
+					noteLeft(fmt.Sprintf("disk %s (not removed: %v)", p, rmErr))
 					continue
 				}
 				noteUndo("removed disk " + p)
@@ -696,13 +720,18 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			if _, serr := os.Lstat(p); serr != nil && os.IsNotExist(serr) {
 				continue
 			}
+			if perr := createdDiskPinErr[p]; perr != nil {
+				slog.Warn("cleanup: disk left, it could not be held open when it was made", "path", p, "error", perr)
+				noteLeft(fmt.Sprintf("disk %s (it could not be held open to tell it from another file there: %v)", p, perr))
+				continue
+			}
 			if !createdDiskFile[p].stillAt(p) {
 				noteUndo("disk " + p + " left: it is no longer the file this create made")
 				continue
 			}
 			if rmErr := os.Remove(p); rmErr != nil && !os.IsNotExist(rmErr) {
 				slog.Warn("cleanup: failed to remove disk", "path", p, "error", rmErr)
-				noteUndo(fmt.Sprintf("disk %s not removed (%v)", p, rmErr))
+				noteLeft(fmt.Sprintf("disk %s (not removed: %v)", p, rmErr))
 				continue
 			}
 			noteUndo("removed disk " + p)

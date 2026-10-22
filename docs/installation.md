@@ -305,6 +305,25 @@ lv host ls
 
 Repeat for each additional host.
 
+## SSH targets and `~/.ssh/config`
+
+Every command that reaches a host over SSH (`lv host init`, `lv host add`, and the
+`--ssh-user` commands) reads `~/.ssh/config` through the system `ssh -G`, so a `Host`
+alias that works with `ssh <alias>` works here: `HostName`, `User`, `Port` and
+`IdentityFile` are used, and `Include` and `Match` are resolved by OpenSSH itself.
+
+- A user or port written on the command line (`admin@alias`, `alias:2222`) beats the
+  config; the config beats the defaults (user `root`, port 22). A config `User` equal to
+  your local login name cannot be told apart from "unset" and falls back to `root`.
+- Configured `IdentityFile` entries are tried before `~/.ssh/id_ed25519`, `id_ecdsa`
+  and `id_rsa`, after the ssh agent.
+- `ProxyJump` and `ProxyCommand` are not supported. A host that sets one is refused with
+  an error naming it, rather than dialled directly.
+- Host-key checking is never loosened by the config. A changed key for a known host is
+  always refused. `StrictHostKeyChecking yes` additionally refuses an unknown host, and
+  `UserKnownHostsFile` adds files to check on top of `~/.ssh/known_hosts`.
+- Without an `ssh` binary, or if `ssh -G` fails, lv warns and uses the defaults.
+
 ## CLI setup
 
 The `lv` binary connects to litevirtd over gRPC/mTLS. On a node with

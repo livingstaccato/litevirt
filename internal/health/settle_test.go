@@ -657,3 +657,66 @@ func firstVirtEvent(v *libvirtfake.Fake, op, dom string) (libvirtfake.Event, boo
 	}
 	return libvirtfake.Event{}, false
 }
+
+// The destroy itself runs under the mark lock, not only the re-checks before
+// it: a resume could otherwise take the lock between the re-check and the
+// destroy.
+//
+// Mutation: SettleDestroy re-checks under the lock, unlocks, then destroys —
+// this goes red.
+func TestSettle_APausedCopysDestroyHoldsTheMarkLock(t *testing.T) {
+	f, p := guardedFixture(t)
+	f.r.SetPauseGuard(func(rec PauseRecord, destroy func() error) error {
+		return p.SettleDestroy(rec, func() error {
+			if l := p.markLock(rec.Name); l.TryLock() {
+				l.Unlock()
+				t.Error("the destroy ran outside the mark lock: a resume could take it now")
+			}
+			return destroy()
+		})
+	})
+	if st := f.run(); st != libvirtfake.StateShutdown {
+		t.Fatalf("vm-a is %s", st)
+	}
+}
+
+// A record from a build before the mark carries no token, so there is no mark
+// to re-check; what orders settle and the pauser's resume for it is the mark
+// lock alone, which resume takes for such a record too. Here the pauser's own
+// resume of the tokenless record runs between settle's re-check and its
+// destroy: it must be held (the lock is settle's), not land, so the destroy
+// stops a copy that is still paused.
+//
+// Mutation: resume takes the mark lock only for a record with a token (as
+// before) — the resume lands, the destroy stops a running copy, and this goes
+// red.
+func TestSettle_ATokenlessRecordsResumeCannotLandInsideTheDestroy(t *testing.T) {
+	f, p := guardedFixture(t)
+	rec, ok, err := ReadPauseRecord(f.dataDir, PauseKindVM, "vm-a")
+	if err != nil || !ok {
+		t.Fatalf("setup: record %v %v", ok, err)
+	}
+	rec.Token = ""
+	if err := newPauseStore(f.dataDir).put(rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.virt.ClearPartitionPauseMark("vm-a"); err != nil {
+		t.Fatal(err)
+	}
+	var resumed bool
+	f.r.SetPauseGuard(func(rec PauseRecord, destroy func() error) error {
+		return p.SettleDestroy(rec, func() error {
+			resumed, _ = p.resume(context.Background(), rec, "test: a confirmed resume", time.Now().Add(3*time.Second))
+			if st, _ := f.virt.RawState("vm-a"); st != libvirtfake.StatePaused {
+				t.Errorf("the resume landed inside settle's destroy: vm-a is %s at the destroy", st)
+			}
+			return destroy()
+		})
+	})
+	if st := f.run(); st != libvirtfake.StateShutdown {
+		t.Fatalf("vm-a is %s, want the still-paused copy destroyed", st)
+	}
+	if resumed {
+		t.Fatal("the pauser resumed vm-a while settle held its mark lock")
+	}
+}

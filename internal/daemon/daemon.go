@@ -1824,6 +1824,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go svc.RunHeldGuestResumer(ctx, 0)
 
 	go vmChecker.Start(ctx)
+	// The partition pauser is built here, before the reconciler starts, so
+	// settle's guard is wired before any pass reads it (its destroy of a
+	// paused copy runs under the pauser's mark lock); the rest of its wiring
+	// and its Start come below.
+	pauser := health.NewPartitionPauser(d.cfg.HostName, d.cfg.DataDir, d.db)
+	pauser.SetVMBackend(d.virt)
+	reconciler.SetPauseGuard(pauser.SettleDestroy) // settle destroys a paused copy only under its mark lock
 	go reconciler.Start(ctx)
 	// Finish any drain cold move a previous process died in the middle of: the
 	// VM was running, was (or was about to be) shut down for the move, and must
@@ -1944,16 +1951,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// partition_pause_v1 only while it already acts on it — and whether or not
 	// a watchdog is armed; a verified watchdog is only the backstop for a
 	// pause that fails.
-	pauser := health.NewPartitionPauser(d.cfg.HostName, d.cfg.DataDir, d.db)
 	pauser.SetQuorum(d.checker.ExecutionQuorum)
 	pauser.SetEnabled(func() bool { return d.cfg.Enforcement.PartitionPause })
 	pauser.SetRecordFailure(d.cfg.Enforcement.PartitionPauseRecordFailure)
-	pauser.SetVMBackend(d.virt)
 	pauser.SetCaptureRegistry(d.captureReg) // the pause wins over a memory snapshot
 	pauser.SetContainerRuntime(lxcRunner)
 	pauser.SetResumeConfirmer(svc.CheckPartitionResume)
 	pauser.SetSettleVerifier(svc.VerifySettleProof)
-	reconciler.SetPauseGuard(pauser.SettleDestroy) // settle destroys a paused copy only under its mark lock
 	pauser.SetPeerRuntimeChecker(svc.CheckPeerContainerRuntime)
 	pauser.SetSelfFence(watchdogCtrl.Armed, watchdogCtrl.SelfFence)
 	d.wirePauserLiveness(pauser)

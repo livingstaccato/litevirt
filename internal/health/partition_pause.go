@@ -2301,16 +2301,20 @@ func (p *PartitionPauser) resume(ctx context.Context, rec PauseRecord, why strin
 			// mark call and the resume itself have returned, past the step's
 			// deadline when one is abandoned (callWithin), so the mark a late
 			// failure or a late landing's undo puts back is ordered with
-			// every other mark write and clear of the VM.
+			// every other mark write and clear of the VM. A record without a
+			// token (from a build before the mark) has no mark to clear, but
+			// its resume takes the lock all the same: settle destroys a paused
+			// copy under it (SettleDestroy), and no resume may land between
+			// settle's re-check and its destroy.
 			var unlock func()
+			l := p.markLock(name)
+			if !l.TryLock() {
+				p.hold(rec, "a write of the partition-pause mark, or a settle of the VM, is in flight")
+				return false, false
+			}
+			var once sync.Once
+			unlock = func() { once.Do(l.Unlock) }
 			if rec.Token != "" {
-				l := p.markLock(name)
-				if !l.TryLock() {
-					p.hold(rec, "a write of the partition-pause mark is in flight")
-					return false, false
-				}
-				var once sync.Once
-				unlock = func() { once.Do(l.Unlock) }
 				if owned, err := p.clearMarkWithin(rec, deadline, unlock); err != nil {
 					if !owned {
 						unlock()
@@ -2341,22 +2345,24 @@ func (p *PartitionPauser) resume(ctx context.Context, rec PauseRecord, why strin
 				putBack.Store(true) // paused again by this host: its mark again
 				return nil
 			}
-			var after func()
-			if unlock != nil {
-				after = func() {
-					if putBack.Load() {
-						p.putMarkBack(rec)
-					}
-					unlock()
+			after := func() {
+				if putBack.Load() && rec.Token != "" {
+					p.putMarkBack(rec)
 				}
+				unlock()
 			}
 			started, err := p.callWithinThen(rec.Key(), time.Until(deadline), true, resumeVM,
 				func() { p.lateResume(rec, yesAt, undo) }, after)
-			if !started && unlock != nil {
+			if !started {
 				// The resume was never issued, and the mark is off: put it
 				// back, off the step (the write has no timeout), still under
-				// the lock.
-				go func() { p.putMarkBack(rec); unlock() }()
+				// the lock. A tokenless record has no mark to put back.
+				go func() {
+					if rec.Token != "" {
+						p.putMarkBack(rec)
+					}
+					unlock()
+				}()
 			}
 			if err != nil {
 				p.hold(rec, "resume failed: "+err.Error())

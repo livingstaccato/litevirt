@@ -352,8 +352,13 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			return status.Errorf(codes.Internal, "check PCI intent for %q: %v", vm.Name, err)
 		}
 		if len(intents) > 0 {
+			addr := "<pci-address>"
+			if intents[0].ExclusiveKey != nil {
+				addr = *intents[0].ExclusiveKey
+			}
 			return status.Errorf(codes.FailedPrecondition,
-				"VM %q holds PCI passthrough intent; cross-host migration of PCI devices is not supported in this release", vm.Name)
+				"VM %q holds PCI passthrough intent; cross-host migration of PCI devices is not supported in this release; %s",
+				vm.Name, pciMoveRoute(vm.Name, addr, req.TargetHost))
 		}
 	}
 
@@ -518,15 +523,15 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			detachedVFs = append(detachedVFs, d)
 		} else if req.Strategy == pb.MigrateStrategy_MIGRATE_LIVE {
 			return status.Errorf(codes.FailedPrecondition,
-				"VM %q has PCI passthrough device %s (%s) — live migration is not possible; stop the VM first, then migrate --cold",
-				req.VmName, d.Address, d.Type)
+				"VM %q has PCI passthrough device %s (%s) — live migration is not possible; %s",
+				req.VmName, d.Address, d.Type, pciMoveRoute(req.VmName, d.Address, req.TargetHost))
 		} else if req.Strategy == pb.MigrateStrategy_MIGRATE_COLD && !coldStopped {
 			// --cold moves a STOPPED VM. A running one would still go through
 			// libvirt's migration, which cannot move a PF, and would fail only
 			// after the target had been prepared.
 			return status.Errorf(codes.FailedPrecondition,
-				"VM %q is running and has PCI passthrough device %s (%s), which cannot be moved while the guest runs; stop the VM first, then migrate --cold",
-				req.VmName, d.Address, d.Type)
+				"VM %q is running and has PCI passthrough device %s (%s), which cannot be moved while the guest runs; %s",
+				req.VmName, d.Address, d.Type, pciMoveRoute(req.VmName, d.Address, req.TargetHost))
 		}
 	}
 	// A live firmware move detaches its VFs only under a durable lease, which
@@ -2029,6 +2034,15 @@ func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vm
 	return fwTargetDefined, nil
 }
 
+// pciMoveRoute is the one route that moves a VM holding a PCI passthrough
+// device: no migration, live or cold, carries the device, so it is released
+// from the VM first and given to it again on the target. Proven end to end by
+// TestFleet_PCIMoveRouteThePassthroughRefusalsAdviseWorks.
+func pciMoveRoute(vm, addr, target string) string {
+	return fmt.Sprintf("no migration carries a passthrough device, so stop the VM, `lv detach-pci %s %s`, `lv migrate %s %s --cold`, then `lv attach-pci %s` on the target",
+		vm, addr, vm, target, vm)
+}
+
 // coldMoveDisks reads the VM's disk records and applies the cold path's
 // refusals that need no domain: a VM holding a PCI passthrough device, and a
 // VM with no domain defined here.
@@ -2054,7 +2068,8 @@ func (s *Server) coldMoveDisks(ctx context.Context, vm *corrosion.VMRecord) ([]c
 		for _, d := range assigned {
 			if d.VMName == vm.Name {
 				return nil, status.Errorf(codes.FailedPrecondition,
-					"VM %q has PCI passthrough device %s — migrating a stopped VM with hostdevs is not supported yet", vm.Name, d.Address)
+					"VM %q has PCI passthrough device %s — migrating a stopped VM with hostdevs is not supported yet; %s",
+					vm.Name, d.Address, pciMoveRoute(vm.Name, d.Address, "<target>"))
 			}
 		}
 	}

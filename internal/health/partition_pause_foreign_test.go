@@ -1,6 +1,7 @@
 package health
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -14,6 +15,20 @@ import (
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
+// waitMark waits for the mark the pause sets on name after its suspend.
+func (f *pauseFixture) waitMark(name string) string {
+	f.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if tok, ok, _ := f.virt.PartitionPauseMark(name); ok {
+			return tok
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	f.t.Fatalf("setup: %s never got its pause mark", name)
+	return ""
+}
+
 // pauseAndResume runs one real pause of vm-ha and its resume, and returns the
 // record the pause wrote.
 func (f *pauseFixture) pauseAndResume() PauseRecord {
@@ -23,6 +38,7 @@ func (f *pauseFixture) pauseAndResume() PauseRecord {
 	if len(recs) != 1 || f.raw("vm-ha") != libvirtfake.StatePaused {
 		f.t.Fatalf("setup: vm-ha %s, records %+v", f.raw("vm-ha"), recs)
 	}
+	f.waitMark("vm-ha")
 	f.regain()
 	if st := f.raw("vm-ha"); st != libvirtfake.StateRunning {
 		f.t.Fatalf("setup: vm-ha is %s after the heal", st)
@@ -91,6 +107,7 @@ func TestPartitionPause_NeverResumesAnIOErrorPause(t *testing.T) {
 	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
 		t.Fatalf("setup: vm-ha is %s", st)
 	}
+	f.waitMark("vm-ha")
 	if err := f.virt.ResumeDomain("vm-ha"); err != nil {
 		t.Fatal(err)
 	}
@@ -146,6 +163,9 @@ func TestPartitionPause_AnUnsettableMarkStillPausesAndHolds(t *testing.T) {
 	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
 		t.Fatalf("vm-ha is %s: resumed without this pause's mark", st)
 	}
+	if c, ok := f.condition(corrosion.CondPartitionPaused); !ok || !strings.Contains(c.Evidence, "could not mark") {
+		t.Fatalf("partition_paused does not say this host's pause could not be marked (ok=%v %+v)", ok, c)
+	}
 }
 
 // The mark is taken off before the resume, so a resume that fails puts it
@@ -158,6 +178,7 @@ func TestPartitionPause_AFailedResumeKeepsItsMark(t *testing.T) {
 	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
 		t.Fatalf("setup: vm-ha is %s", st)
 	}
+	f.waitMark("vm-ha")
 	var fails atomic.Int32
 	f.virt.FailResumeDomain = func(string) error {
 		if fails.Add(1) == 1 {
@@ -276,5 +297,97 @@ func TestPartitionPause_ATimedOutRecordOfAFailedPauseIsCancelled(t *testing.T) {
 	}
 	if c, ok := f.condition(corrosion.CondPartitionPauseFailed); !ok || !strings.Contains(c.Evidence, "vm/vm-ha") {
 		t.Fatalf("partition_pause_failed does not name vm-ha (ok=%v %+v)", ok, c)
+	}
+}
+
+// F1 (ppio review): the mark is set after the suspend, outside the pause's
+// timed window. libvirt can hold the metadata write behind a running job for
+// up to 30 s; a mark that slow must not make the pause late or failed, and
+// with a verified watchdog it must not self-fence the host.
+//
+// Mutation: mark before the suspend, inside the pause call (the first cut) —
+// vm-ha is still running at the end of the pass, the pause is reported
+// failed and the host self-fences, red.
+func TestPartitionPause_ASlowMarkNeverDelaysThePause(t *testing.T) {
+	f := newPauseFixture(t)
+	f.armedFence()
+	f.virt.FailMarkPartitionPaused = func(string) error {
+		time.Sleep(3 * time.Second) // a MODIFY job waiting behind an async job
+		return errors.New("libvirtd: cannot acquire state change lock")
+	}
+	f.set(QuorumNo)
+	for i := 0; i <= int(PartitionPauseAfter/time.Second)+2 && f.raw("vm-ha") == libvirtfake.StateRunning; i++ {
+		f.tick()
+		f.advance(time.Second)
+	}
+	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+		t.Fatalf("vm-ha is %s at the end of the pausing pass; a slow mark held the suspend back", st)
+	}
+	f.tick()
+	if failed, err := corrosion.HostPartitionPauseFailed(context.Background(), f.db, "node-a"); err != nil || failed {
+		t.Fatalf("partition_pause_failed = %v (%v): a slow mark failed a pause that happened", failed, err)
+	}
+	if n := f.fences(); n != 0 {
+		t.Fatalf("the host self-fenced %d time(s) over a slow mark", n)
+	}
+}
+
+// The mark must carry THIS record's token: a mark of another pause (a later
+// one's, or one a downgrade left) is not this pause's.
+//
+// Mutation: accept any mark (token not compared) — vm-ha is resumed, red.
+func TestPartitionPause_AMarkWithAnotherTokenIsNotThisPause(t *testing.T) {
+	f := newPauseFixture(t)
+	f.loseFor(QuorumNo, PartitionPauseAfter+2*time.Second)
+	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+		t.Fatalf("setup: vm-ha is %s", st)
+	}
+	if tok := f.waitMark("vm-ha"); tok == "someone-elses" {
+		t.Fatal("setup: token collision")
+	}
+	if err := f.virt.MarkPartitionPaused("vm-ha", "someone-elses"); err != nil {
+		t.Fatal(err)
+	}
+	f.regain()
+	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+		t.Fatalf("vm-ha is %s: resumed under a mark whose token is not the record's", st)
+	}
+}
+
+// A recorded VM seen running loses its mark at once, before the heal is
+// sustained: an operator resumes it by hand as the partition heals and
+// suspends it again; that suspend is the operator's, and the VM is held.
+//
+// Mutation: do not clear the marks of running recorded VMs — the stale mark
+// matches the operator's suspend and vm-ha is resumed, red.
+func TestPartitionPause_ARunningRecordedVMLosesItsMark(t *testing.T) {
+	f := newPauseFixture(t)
+	f.loseFor(QuorumNo, PartitionPauseAfter+2*time.Second)
+	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+		t.Fatalf("setup: vm-ha is %s", st)
+	}
+	f.waitMark("vm-ha")
+	f.set(QuorumYes)
+	if err := f.virt.ResumeDomain("vm-ha"); err != nil { // virsh resume
+		t.Fatal(err)
+	}
+	f.tick() // a Yes, not yet sustained
+	f.advance(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, ok, _ := f.virt.PartitionPauseMark("vm-ha"); !ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("vm-ha runs and still carries this host's pause mark")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := f.virt.SuspendDomain("vm-ha"); err != nil { // virsh suspend
+		t.Fatal(err)
+	}
+	f.regain()
+	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+		t.Fatalf("vm-ha is %s: an operator's suspend matched a mark left on a running VM", st)
 	}
 }

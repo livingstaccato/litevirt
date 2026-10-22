@@ -279,13 +279,16 @@ it. A container someone else froze is told apart with `lxc-info`'s raw state
 its VM is paused by this host's pause: a crash between a resume and the
 record's removal leaves the record beside a VM that runs again, and an
 operator's `virsh suspend` or QEMU's pause on a disk I/O error can pause it
-later. So, just before it suspends a VM, the pauser puts a live-only
+later. So, once it has suspended a VM, the pauser puts a live-only
 metadata mark on the domain (namespace
 `https://litevirt.dev/xmlns/partition-pause/1`) carrying a random token, which
 the record holds as `token`. It resumes a paused VM only when libvirt's
 paused reason is `user` (a suspend: never `io-error`, `migration` or any
 other) and the domain carries the record's token. It takes the mark off
-before the resume, and puts it back if the resume fails. A VM that fails
+before the resume, and puts it back if the resume fails; it also takes it
+off any recorded VM it sees running. The mark is set outside the suspend's
+timed window (a metadata write can wait behind a libvirt job), so a mark
+that is slow or fails never makes the pause late or failed. A VM that fails
 either check is held: it stays paused, its record stays, and
 `partition_paused` names it under `not_paused_by_this_host` with the reason.
 The record is dropped once the VM is no longer paused (an operator resumed

@@ -61,7 +61,7 @@ func (f *Fake) ClearPartitionPauseMark(name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.domains[name]; !ok {
-		return fmt.Errorf("libvirtfake: domain %q not defined", name)
+		return fmt.Errorf("libvirtfake: domain %q not found", name) // libvirt's lookup error reads so
 	}
 	delete(f.ppMark, name)
 	return nil

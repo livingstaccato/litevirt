@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"google.golang.org/grpc/codes"
@@ -52,6 +53,24 @@ func (s *Server) addressOnThisHost(ctx context.Context, vmName, deviceID, origin
 				return d.Address, nil
 			}
 		}
+	}
+	// Say why each device of the kind here is not this one's.
+	var taken []string
+	for _, d := range devs {
+		if !ident.Matches(d) {
+			continue
+		}
+		switch {
+		case exclude[d.Address]:
+			taken = append(taken, fmt.Sprintf("%s is taken by another of %s's devices", d.Address, vmName))
+		case d.VMName != "" && d.VMName != vmName:
+			taken = append(taken, fmt.Sprintf("%s is owned by VM %s", d.Address, d.VMName))
+		}
+	}
+	if len(taken) > 0 {
+		return "", status.Errorf(codes.FailedPrecondition,
+			"%s needs a free PCI device %s on host %s (it had one at %s on %s), and none is free: %s",
+			vmName, ident.String(), s.hostName, bdf, origin, strings.Join(taken, "; "))
 	}
 	return "", status.Errorf(codes.FailedPrecondition,
 		"%s needs a free PCI device %s on host %s (it had one at %s on %s) and there is none: the device at the same address here, if any, is not that device",

@@ -250,6 +250,13 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 	// device. Threading this set restores the pool-shrinking semantics PURELY — no
 	// assignment in the resolve phase, just in-memory exclusion.
 	selected := map[string]bool{}
+	// A device named by address is its own selector's, never another's IOMMU
+	// sibling or type pick.
+	for _, spec := range specs {
+		if kind, key := corrosion.ClassifyPCISelector(spec); kind == "address" && key != nil {
+			selected[*key] = true
+		}
+	}
 
 	for _, spec := range specs {
 		count := int(spec.Count)
@@ -359,7 +366,10 @@ func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.
 	ordinal := 0
 	// addPrimary appends primary + its IOMMU-group siblings as ordered members.
 	// The conflict check is on the primary only (a sibling shares the group, so a
-	// conflicting other-VM owner is already caught by the primary's check).
+	// conflicting other-VM owner is already caught by the primary's check). A
+	// sibling already in exclude is not added: another selector of this
+	// request took it or names it (a GPU and its audio function, each named
+	// by address), and each device is passed through once.
 	addPrimary := func(primary string) error {
 		if err := s.checkIOMMUConflict(ctx, primary, vmName); err != nil {
 			return err
@@ -369,7 +379,7 @@ func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.
 		exclude[primary] = true
 		groupAddrs, _ := s.iommuGroupSiblings(ctx, primary)
 		for _, a := range groupAddrs {
-			if a != primary {
+			if a != primary && !exclude[a] {
 				members = append(members, ResolvedMember{DeviceID: deviceID, MemberID: fmt.Sprintf("m%d", ordinal), Address: a, Ordinal: ordinal})
 				ordinal++
 				exclude[a] = true
@@ -471,9 +481,58 @@ func (s *Server) resolveDeviceIntents(ctx context.Context, vmName string, intent
 }
 
 // resolveDeviceIntentsExcluding is resolveDeviceIntents with a caller-owned
-// exclusion set, for a caller that resolves a VM's intents one at a time:
-// each takes a device none before it took.
+// exclusion set: each intent takes a device none before it took.
 func (s *Server) resolveDeviceIntentsExcluding(ctx context.Context, vmName string, intents []corrosion.PCIIntentRecord, selected map[string]bool) ([]ResolvedMember, error) {
+	local, err := s.addressIntentsHere(ctx, vmName, intents, selected)
+	if err != nil {
+		return nil, err
+	}
+	return s.resolveIntentsHere(ctx, vmName, intents, selected, local)
+}
+
+// addressIntentsHere is the device on this host that realizes each
+// concrete-address intent of intents, by intent id, each marked in selected
+// before any intent is realized: a device the VM names by address is realized
+// by its own intent, never as the IOMMU-group sibling of another (a GPU and
+// its audio function, each named), and no type selector takes it. An address
+// recorded on this host is that device; one recorded on another host (a
+// failover) is a device of its kind here (pci_failover.go), none taken twice.
+func (s *Server) addressIntentsHere(ctx context.Context, vmName string, intents []corrosion.PCIIntentRecord, selected map[string]bool) (map[string]string, error) {
+	local := map[string]string{}
+	var moved []corrosion.PCIIntentRecord
+	for _, in := range intents {
+		if in.SelectorKind != "address" {
+			continue
+		}
+		if in.HostName != "" && in.HostName != s.hostName {
+			moved = append(moved, in)
+			continue
+		}
+		addr := ""
+		if in.ExclusiveKey != nil {
+			addr = *in.ExclusiveKey
+		}
+		local[in.DeviceID] = addr
+		selected[addr] = true
+	}
+	for _, in := range moved {
+		addr := ""
+		if in.ExclusiveKey != nil {
+			addr = *in.ExclusiveKey
+		}
+		here, err := s.addressOnThisHost(ctx, vmName, in.DeviceID, in.HostName, addr, selected)
+		if err != nil {
+			return nil, err
+		}
+		local[in.DeviceID] = here
+		selected[here] = true
+	}
+	return local, nil
+}
+
+// resolveIntentsHere resolves intents, each concrete address to its device in
+// local (addressIntentsHere).
+func (s *Server) resolveIntentsHere(ctx context.Context, vmName string, intents []corrosion.PCIIntentRecord, selected map[string]bool, local map[string]string) ([]ResolvedMember, error) {
 	var members []ResolvedMember
 	for _, intent := range intents {
 		switch intent.SelectorKind {
@@ -481,20 +540,13 @@ func (s *Server) resolveDeviceIntentsExcluding(ctx context.Context, vmName strin
 			return nil, status.Errorf(codes.Unimplemented,
 				"SR-IOV intent %s: VF realization is side-effecting and handled by the acquire path, not the pure resolver", intent.DeviceID)
 		case "address":
-			addr := ""
-			if intent.ExclusiveKey != nil {
-				addr = *intent.ExclusiveKey
-			}
 			// The address is a slot on the host it was recorded on. On any
 			// other host (a failover) it is realized by a device of its kind
 			// here, never by whatever sits at the same address
-			// (pci_failover.go).
-			if intent.HostName != "" && intent.HostName != s.hostName {
-				local, err := s.addressOnThisHost(ctx, vmName, intent.DeviceID, intent.HostName, addr, selected)
-				if err != nil {
-					return nil, err
-				}
-				addr = local
+			// (addressIntentsHere).
+			addr, ok := local[intent.DeviceID]
+			if !ok {
+				return nil, status.Errorf(codes.Internal, "PCI device %s of %s has no address on host %s", intent.DeviceID, vmName, s.hostName)
 			}
 			specMembers, err := s.resolveDeviceSpec(ctx, vmName, &pb.DeviceSpec{Address: addr}, intent.DeviceID, selected)
 			if err != nil {
@@ -714,6 +766,10 @@ func (s *Server) pciStartPreflight(ctx context.Context, vm *corrosion.VMRecord, 
 	// Every device an earlier intent of this start took: two intents of one
 	// kind take two devices.
 	selected := map[string]bool{}
+	local, lerr := s.addressIntentsHere(ctx, vm.Name, intents, selected)
+	if lerr != nil {
+		return nil, lerr
+	}
 	resolveFail := func(e error) (func(), error) {
 		if len(claimedSriov) > 0 {
 			// The VFs were CAS-claimed but never vfio-bound (allocateSRIOVVFs binds nothing),
@@ -750,7 +806,7 @@ func (s *Server) pciStartPreflight(ctx context.Context, vm *corrosion.VMRecord, 
 			continue
 		}
 		// address / mapping / type: the pure resolver.
-		specMembers, rerr := s.resolveDeviceIntentsExcluding(ctx, vm.Name, []corrosion.PCIIntentRecord{in}, selected)
+		specMembers, rerr := s.resolveIntentsHere(ctx, vm.Name, []corrosion.PCIIntentRecord{in}, selected, local)
 		if rerr != nil {
 			return resolveFail(rerr)
 		}

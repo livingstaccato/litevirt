@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"testing"
+	"time"
 
 	"google.golang.org/protobuf/encoding/protojson"
 
@@ -194,4 +195,80 @@ func TestFleet_PCIStart_TypeSelectorRestartKeepsItsDevice(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A GPU and its audio function share an IOMMU group, and the VM names both
+// by address. It starts on its host with each function passed through once,
+// and restarts after a guest crash the same way.
+func TestFleet_PCIStart_GPUAndItsAudioFunctionByAddress(t *testing.T) {
+	defer vfio.SetFS(vfioBoundSysfs{})()
+	ctx := context.Background()
+	pair := []string{"0000:81:00.0", "0000:81:00.1"}
+	_, n := pciStartFleet(t, ctx, "avm",
+		[]*pb.DeviceSpec{{Address: pair[0]}, {Address: pair[1]}},
+		[]pciStartDev{{pair[0], "2330", "gpu", 50}, {pair[1], "22a3", "audio", 50}})
+	for _, step := range []string{"start", "restart"} {
+		var v *corrosion.VMRecord
+		if step == "start" {
+			v = pciStartRun(t, ctx, n, "avm")
+		} else {
+			v = pciStartCrash(t, ctx, n, "avm")
+		}
+		if v.State != "running" {
+			t.Fatalf("%s of avm refused: %s %q", step, v.State, v.StateDetail)
+		}
+		if got := pciStartHostdevs(n.Virt.DefinedXML("avm")); !eqStrings(got, pair) {
+			t.Errorf("%s: avm has hostdevs %v; want %v, each once", step, got, pair)
+		}
+		if got := pciStartOwned(t, ctx, n, "avm"); !eqStrings(got, pair) {
+			t.Errorf("%s: avm owns %v; want %v", step, got, pair)
+		}
+		if got := pciStartRealized(t, ctx, n, "avm"); !eqStrings(got, pair) {
+			t.Errorf("%s: avm's realizations are %v; want %v, each once", step, got, pair)
+		}
+	}
+}
+
+// The same VM fails over onto b, which has the same pair in one IOMMU group:
+// it starts there with b's GPU and b's audio function, each once.
+func TestFleet_PCIFailover_GPUAndItsAudioFunction(t *testing.T) {
+	defer vfio.SetFS(vfioBoundSysfs{})()
+	audio := pciFoDevice{vendor: "10de", device: "22a3", name: "GH100 HD Audio", typ: "audio"}
+	pair := []string{"0000:81:00.0", "0000:81:00.1"}
+	pciFoRegimes(t, func(t *testing.T, latched bool) {
+		ctx := context.Background()
+		clock := NewVirtualClock(time.Now().UTC())
+		c, a, b, victim := pciFoFleetWith(t, clock, pciFoSetup{latched: latched,
+			victimDevs: []pciFoDevice{h100.at(pciFoBDF), audio.at("0000:41:00.1")},
+			onB:        []pciFoDevice{h100.at(pair[0]), audio.at(pair[1])}})
+		// One IOMMU group per pair, as the hardware has it.
+		for _, r := range []struct {
+			host, addr, owner string
+			group             int
+		}{{victim.Name, "0000:41:00.1", pciFoVM, 40}, {b.Name, pair[1], "", 60}} {
+			if err := corrosion.UpsertPCIDevice(ctx, a.DB, corrosion.PCIDeviceRecord{HostName: r.host, Address: r.addr,
+				VendorID: audio.vendor, DeviceID: audio.device, DeviceName: audio.name, Type: audio.typ, Driver: "vfio-pci",
+				IOMMUGroup: r.group, VMName: r.owner}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		c.WaitConverged(t, convergeTimeout, a, b)
+		pciFoFailOver(t, ctx, c, clock, a, b)
+		if vm := vmOn(t, a, pciFoVM); vm == nil || vm.HostName != b.Name {
+			t.Fatalf("%s on %+v; want it on %s", pciFoVM, vm, b.Name)
+		}
+		pciFoStart(t, ctx, b)
+		v := vmOn(t, b, pciFoVM)
+		if v == nil || v.State != "running" {
+			t.Fatalf("%s did not start on %s: %+v", pciFoVM, b.Name, v)
+		}
+		if got := pciStartHostdevs(b.Virt.DefinedXML(pciFoVM)); !eqStrings(got, pair) {
+			t.Errorf("%s on %s has hostdevs %v; want %v, each once", pciFoVM, b.Name, got, pair)
+		}
+		for _, addr := range pair {
+			if o := pciFoOwner(t, ctx, b, b.Name, addr); o != pciFoVM {
+				t.Errorf("%s on %s is owned by %q; want %s", addr, b.Name, o, pciFoVM)
+			}
+		}
+	})
 }

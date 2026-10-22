@@ -100,6 +100,10 @@ that device. Add a `placement.host` when more than one host has a device at
 that address. After a failover the address is not carried over: see
 [Failover with PCI devices](#failover-with-pci-devices).
 
+The other devices in that device's IOMMU group are passed through with it. You
+can also name them, as a GPU and its audio function are often named, each by
+its address: each device is then passed through once.
+
 A device's selector is read in a fixed order: `mapping`, then `sriov`, then
 `type` / `vendor`, then `address`. The first one set decides, and the fields
 after it are ignored. So `type: "gpu"` with an `address` is a request for any

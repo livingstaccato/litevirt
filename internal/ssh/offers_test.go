@@ -198,3 +198,41 @@ func TestNewClient_DedupUnderMaxAuthTries(t *testing.T) {
 	}
 	c.Close()
 }
+
+// Reviewer probe (sshcfg I3): the configured IdentityFile's private key does
+// not load -- passphrase-protected (with and without a .pub sibling: an
+// OpenSSH key carries its public half in the clear), or only the .pub is on
+// disk (hardware token) -- and the key is in the agent behind six unrelated
+// ones, IdentitiesOnly no, MaxAuthTries 6. The agent's copy of the configured
+// key must still be offered first, and the first offer must be that key.
+func TestNewClient_UnloadableIdentityFileAgentCopyFirst(t *testing.T) {
+	for _, variant := range []string{"encrypted+pub", "encrypted-no-pub", "pub-only"} {
+		t.Run(variant, func(t *testing.T) {
+			home, _ := sshHome(t, "unused")
+			pk, sk, _ := ed25519.GenerateKey(rand.Reader)
+			pub, _ := ssh.NewPublicKey(pk)
+			key := filepath.Join(home, ".ssh", "deploy")
+			if variant != "pub-only" {
+				blk, err := ssh.MarshalPrivateKeyWithPassphrase(sk, "", []byte("pw"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				os.WriteFile(key, pem.EncodeToMemory(blk), 0o600)
+			}
+			if variant != "encrypted-no-pub" {
+				os.WriteFile(key+".pub", ssh.MarshalAuthorizedKey(pub), 0o644)
+			}
+			startAgent(t, append(edKeys(6), sk)...)
+			srv := startCountingSSHD(t, pub, 6)
+			writeSSHConfig(t, home, "Host 127.0.0.1\n  IdentityFile ~/.ssh/deploy\n")
+			c, err := NewClient("deploy@127.0.0.1:" + srv.port())
+			if err != nil {
+				t.Fatalf("configured IdentityFile (key in agent) not offered first: %d offers, %v", srv.n(), err)
+			}
+			c.Close()
+			if srv.n() != 1 {
+				t.Fatalf("%d offers, want the configured key first and alone", srv.n())
+			}
+		})
+	}
+}

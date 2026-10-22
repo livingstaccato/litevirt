@@ -568,11 +568,6 @@ func authMethodsFor(extraKeys []string, identitiesOnly bool) ([]ssh.AuthMethod, 
 		keyFiles = append(append([]string(nil), extraKeys...), defaults...)
 	}
 	var fileSigners []ssh.Signer
-	isConfigured := map[string]bool{}
-	for _, k := range extraKeys {
-		isConfigured[k] = true
-	}
-	configured := map[int]bool{} // indexes into fileSigners that came from IdentityFile
 	for _, kf := range keyFiles {
 		key, err := loadPrivateKey(kf)
 		if err != nil {
@@ -584,10 +579,31 @@ func authMethodsFor(extraKeys []string, identitiesOnly bool) ([]ssh.AuthMethod, 
 			continue
 		}
 		tried = append(tried, fmt.Sprintf("key %s: loaded", kf))
-		if isConfigured[kf] {
-			configured[len(fileSigners)] = true
-		}
 		fileSigners = append(fileSigners, key)
+	}
+
+	// The configured identities' public keys, in config order. They come from
+	// the key files' public halves (a .pub sibling, a public-key file, the
+	// clear half of an OpenSSH private key) as well as from loading the
+	// private key: a passphrase-protected key, or one whose private half lives
+	// only in the agent or on a hardware token, is still the key the operator
+	// named, and its agent copy must still be offered first.
+	var configuredPubs []string
+	seenPub := map[string]bool{}
+	addPub := func(k string) {
+		if !seenPub[k] {
+			seenPub[k] = true
+			configuredPubs = append(configuredPubs, k)
+		}
+	}
+	for _, kf := range extraKeys {
+		if sg, err := loadPrivateKey(kf); err == nil {
+			addPub(string(sg.PublicKey().Marshal()))
+			continue
+		}
+		for k := range identityPublicKeys([]string{kf}) {
+			addPub(k)
+		}
 	}
 
 	if agentSigners == nil && len(fileSigners) == 0 {
@@ -611,7 +627,10 @@ func authMethodsFor(extraKeys []string, identitiesOnly bool) ([]ssh.AuthMethod, 
 			agentAll = as
 		}
 		byPub := map[string]ssh.Signer{}
-		for _, sg := range agentAll {
+		for _, sg := range fileSigners {
+			byPub[string(sg.PublicKey().Marshal())] = sg
+		}
+		for _, sg := range agentAll { // the agent's copy wins
 			byPub[string(sg.PublicKey().Marshal())] = sg
 		}
 		var all []ssh.Signer
@@ -622,21 +641,16 @@ func authMethodsFor(extraKeys []string, identitiesOnly bool) ([]ssh.AuthMethod, 
 				all = append(all, sg)
 			}
 		}
-		for i, sg := range fileSigners {
-			if configured[i] {
-				if a, ok := byPub[string(sg.PublicKey().Marshal())]; ok {
-					sg = a
-				}
+		for _, k := range configuredPubs {
+			if sg, ok := byPub[k]; ok {
 				add(sg)
 			}
 		}
 		for _, sg := range agentAll {
 			add(sg)
 		}
-		for i, sg := range fileSigners {
-			if !configured[i] {
-				add(sg)
-			}
+		for _, sg := range fileSigners {
+			add(sg)
 		}
 		return all, nil
 	})}, nil

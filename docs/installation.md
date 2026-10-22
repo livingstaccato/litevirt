@@ -319,7 +319,9 @@ by OpenSSH itself. Only the per-user `~/.ssh/config` is read; `/etc/ssh/ssh_conf
 - A user or port written on the command line (`admin@alias`, `alias:2222`) beats the
   config; the config beats the defaults (user `root`, port 22).
 - Keys are offered in one publickey attempt, as OpenSSH orders them: the configured
-  `IdentityFile` keys first (the agent's copy of one when it holds it), then the agent's other
+  `IdentityFile` keys first (the agent's copy of one when it holds it, matched by public key, so
+  a passphrase-protected key or a `.pub`-only hardware-token key held by the agent still goes
+  first), then the agent's other
   keys, then `~/.ssh/id_ed25519`, `id_ecdsa` and `id_rsa`. A key is never offered twice, and a
   busy agent cannot use up the server's attempts before the configured key. `%d %h %n %p %r %u %%` are expanded; an
   `IdentityFile` with any other `%` token is skipped with a warning. `IdentitiesOnly yes`

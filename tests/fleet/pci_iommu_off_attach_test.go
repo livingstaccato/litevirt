@@ -79,7 +79,7 @@ func TestFleet_PCIAttachRefusedWhenIOMMUOff(t *testing.T) {
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("attach on an IOMMU-off host: got %v, want a FailedPrecondition refusal", err)
 	}
-	for _, want := range []string{"IOMMU is off", groups, "intel_iommu=on", "amd_iommu=on", "lv host rescan " + owner.Name} {
+	for _, want := range []string{"IOMMU is off", groups, "intel_iommu=on", "amd_iommu=off", "iommu=off", "lv host rescan " + owner.Name} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal %q does not name %q", err.Error(), want)
 		}

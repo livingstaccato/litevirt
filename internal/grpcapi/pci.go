@@ -1261,7 +1261,8 @@ func (s *Server) noIOMMUGroupError(address string) error {
 	if !on {
 		return status.Errorf(codes.FailedPrecondition,
 			"%s: the IOMMU is off (%s lists no groups), so the device cannot be isolated from other VMs or the host; "+
-				"enable VT-d / AMD-Vi in the firmware, add intel_iommu=on (Intel) or amd_iommu=on (AMD) to the kernel command line, "+
+				"on Intel, enable VT-d in the firmware and add intel_iommu=on to the kernel command line; "+
+				"on AMD, enable IOMMU / AMD-Vi in the firmware and make sure neither amd_iommu=off nor iommu=off is on the kernel command line; "+
 				"reboot, then run `lv host rescan %s`",
 			prefix, groups, s.hostName)
 	}

@@ -85,7 +85,7 @@ func TestCheckIOMMUConflict_IOMMUOffRefuses(t *testing.T) {
 	_, groups := fakeIOMMUSysfs(t) // no groups: IOMMU off
 	seedNoGroupDevice(t, s, "0000:41:00.0")
 	err := s.checkIOMMUConflict(adminCtx(), "0000:41:00.0", "vm-a")
-	wantRefusal(t, err, codes.FailedPrecondition, "IOMMU is off", groups, "intel_iommu=on", "amd_iommu=on", "lv host rescan test-host")
+	wantRefusal(t, err, codes.FailedPrecondition, "IOMMU is off", groups, "intel_iommu=on", "amd_iommu=off", "iommu=off", "lv host rescan test-host")
 }
 
 // Exit 3, IOMMU off, the groups directory absent altogether (no IOMMU driver).

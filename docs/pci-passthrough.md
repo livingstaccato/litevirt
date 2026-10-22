@@ -4,15 +4,15 @@ litevirt supports assigning PCI devices (GPUs, NICs, NVMe drives) directly to VM
 
 ## Prerequisites
 
-1. **IOMMU enabled** in BIOS and kernel:
+1. **IOMMU enabled** in firmware and kernel:
 
-```bash
-# Intel
-GRUB_CMDLINE_LINUX="intel_iommu=on iommu=pt"
+- **Intel:** enable VT-d in the firmware and add `intel_iommu=on` to the kernel command line:
 
-# AMD
-GRUB_CMDLINE_LINUX="amd_iommu=on iommu=pt"
-```
+  ```bash
+  GRUB_CMDLINE_LINUX="intel_iommu=on iommu=pt"
+  ```
+
+- **AMD:** enable IOMMU / AMD-Vi in the firmware. The kernel turns AMD-Vi on by default, so no parameter is needed. Make sure neither `amd_iommu=off` nor `iommu=off` is on the kernel command line.
 
 Update GRUB and reboot after changes, then run `lv host rescan` so the inventory records each device's IOMMU group.
 

@@ -369,7 +369,15 @@ reads the system file the way `ssh -F` does, which would look for it under `~/.s
 - The known_hosts files checked: `~/.ssh/known_hosts` and `~/.ssh/known_hosts2` always;
   `UserKnownHostsFile` adds files on top of them, so `/dev/null` or `none` drops no entry; and
   `GlobalKnownHostsFile`, by default `/etc/ssh/ssh_known_hosts` and `ssh_known_hosts2`, so a host
-  key distributed there is enforced. lv only reads these files;
+  key distributed there is enforced. Each file is checked on its own: a key is accepted only
+  when at least one file matches it and every file that has an entry for the host (under the
+  `HostKeyAlias`, or the dialled address) agrees. One file with a different key for the host, a
+  key only of another type, or no `@cert-authority` for a presented certificate refuses the
+  connection as changed and names that file. This is stricter than `ssh`, which reads a
+  configured `UserKnownHostsFile` instead of `~/.ssh/known_hosts` and accepts any match: a stale
+  entry in `~/.ssh/known_hosts` for a host you pinned elsewhere must be removed
+  (`ssh-keygen -R <host>`) before lv connects. Several keys for the host in one file still
+  accept on any match. A host no file has an entry for is first contact. lv only reads these files;
   it never records a key in any of them. A configured file that does not exist is skipped, as
   `ssh` skips it, with a warning naming it. A file that exists but cannot be read or parsed (a
   default, configured or global one) refuses the connection and names the file and line.

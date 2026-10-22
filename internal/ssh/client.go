@@ -1001,6 +1001,22 @@ func hostKeyPolicyFor(cfg *resolved, addr string) (ssh.HostKeyCallback, []string
 	if err != nil {
 		return nil, nil, err
 	}
+	// Each file is also a source of its own: the merged database accepts as
+	// soon as ANY line for the host matches, so a stale or planted entry in
+	// one file would override a pin in another. Every source that has entries
+	// for the host must accept the key.
+	type source struct {
+		file string
+		cb   ssh.HostKeyCallback
+	}
+	var sources []source
+	for _, f := range files {
+		cb, err := knownhosts.New(f)
+		if err != nil {
+			return nil, nil, err
+		}
+		sources = append(sources, source{f, cb})
+	}
 	var alias string
 	var strict bool
 	if cfg != nil {
@@ -1038,7 +1054,28 @@ func hostKeyPolicyFor(cfg *resolved, addr string) (ssh.HostKeyCallback, []string
 				return fmt.Errorf("host key for %s is not in known_hosts and StrictHostKeyChecking is yes: %w", label, err)
 			}
 		}
-		return hostKeyVerdictFor(label, key, err)
+		if err != nil {
+			// No source matches (or the key is revoked, or a certificate
+			// fails): the merged answer already decides -- CHANGED, or first
+			// contact when no source has any entry.
+			return hostKeyVerdictFor(label, key, err)
+		}
+		// Some source matched. Every other source that records the host must
+		// match too; one that records a different key (or another type, or
+		// no CA for a presented certificate) refuses.
+		for _, src := range sources {
+			if !hostIsKnown(src.cb, name) {
+				continue
+			}
+			if serr := src.cb(name, remote, key); serr != nil {
+				if v := hostKeyVerdictFor(label, key, serr); v != nil {
+					return fmt.Errorf("%w (known_hosts sources disagree: each file that records the "+
+						"host must hold the presented key; %s does not)", v, src.file)
+				}
+				return fmt.Errorf("host key for %s does not match %s -- refusing", label, src.file)
+			}
+		}
+		return nil
 	}, algos, nil
 }
 

@@ -62,7 +62,10 @@ func (pf *pinnedFile) stillAt(p string) bool {
 	return err == nil && os.SameFile(now, pf.fi)
 }
 
-// release closes the pinned file; a nil one is a no-op.
+// release closes the pinned file; a nil one is a no-op. A file is released
+// as soon as it is removed: the pin protects nothing once the file is gone,
+// and on NFS a removed file still held lingers at a .nfsXXXX name, taking its
+// full size, until it is released.
 func (pf *pinnedFile) release() {
 	if pf != nil {
 		pf.f.Close()

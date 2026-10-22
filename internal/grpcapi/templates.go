@@ -411,7 +411,10 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 		if e := cloudinit.RemoveSeed(cloneSeed); e != nil {
 			slog.Warn("clone cleanup: remove cloud-init seed", "path", cloneSeed, "error", e)
 			noteLeft(fmt.Sprintf("seed %s (not removed: %v)", cloneSeed, e))
+			return
 		}
+		cloneSeedFile.release()
+		cloneSeed, cloneSeedFile = "", nil
 	}
 	cleanup := func() {
 		removeCloneSeed()
@@ -440,7 +443,13 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 			if e := os.Remove(p); e != nil && !os.IsNotExist(e) {
 				slog.Warn("clone cleanup: remove disk", "path", p, "error", e)
 				noteLeft(fmt.Sprintf("disk %s (not removed: %v)", p, e))
+				continue
 			}
+			createdFile[p].release()
+			delete(createdFile, p)
+		}
+		if s.cleanedUpHook != nil {
+			s.cleanedUpHook()
 		}
 	}
 	// Only a copy that is not where main puts a clone is admitted for space with

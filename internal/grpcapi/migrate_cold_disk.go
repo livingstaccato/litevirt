@@ -700,6 +700,10 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 				slog.Warn("cold migration: could not take back a disk placed after the source gave up",
 					"vm", vm.Name, "path", hdr.Path, "error", rerr)
 			} else {
+				ours.release()
+				if s.cleanedUpHook != nil {
+					s.cleanedUpHook()
+				}
 				syncDir()
 			}
 		}

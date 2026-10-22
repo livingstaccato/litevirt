@@ -692,6 +692,8 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			return
 		}
 		noteUndo("removed seed " + createdSeed)
+		createdSeedFile.release()
+		createdSeed, createdSeedFile = "", nil
 	}
 	cleanupDisks := func() {
 		removeSeed()
@@ -734,7 +736,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				noteLeft(fmt.Sprintf("disk %s (not removed: %v)", p, rmErr))
 				continue
 			}
+			createdDiskFile[p].release()
+			delete(createdDiskFile, p)
 			noteUndo("removed disk " + p)
+		}
+		if s.cleanedUpHook != nil {
+			s.cleanedUpHook()
 		}
 	}
 

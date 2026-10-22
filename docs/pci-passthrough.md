@@ -270,10 +270,16 @@ When a VM requests PCI devices, the placement engine considers:
 PCI passthrough devices cannot be live-migrated. Options:
 
 1. Hot-detach the device, migrate, hot-attach on the new host
-2. Cold migrate (stops the VM)
+2. Stop the VM, then `lv migrate <vm> <host> --cold`
 3. Use SR-IOV VFs which can be detached/reattached more gracefully
 
-The migration command will fail with an error if the VM has PCI devices attached and `--cold` is not specified.
+`--cold` moves a stopped VM. On a running VM that holds a PF passthrough device
+it is refused before anything is done on the target, naming the device: stop the
+VM first, then migrate it with `--cold`. The stopped-VM cold path does not
+carry passthrough devices either: it refuses a VM that is still assigned one, so
+release the device from the VM first.
+
+A live migration fails with an error if the VM has a PF passthrough device attached.
 
 SR-IOV VFs are hot-detached from the guest just before the copy starts. The VM
 keeps owning them on the source until the cutover commits, so no other VM can

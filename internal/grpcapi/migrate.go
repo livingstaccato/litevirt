@@ -518,7 +518,14 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			detachedVFs = append(detachedVFs, d)
 		} else if req.Strategy == pb.MigrateStrategy_MIGRATE_LIVE {
 			return status.Errorf(codes.FailedPrecondition,
-				"VM %q has PCI passthrough device %s (%s) — live migration is not possible; use --cold",
+				"VM %q has PCI passthrough device %s (%s) — live migration is not possible; stop the VM first, then migrate --cold",
+				req.VmName, d.Address, d.Type)
+		} else if req.Strategy == pb.MigrateStrategy_MIGRATE_COLD && !coldStopped {
+			// --cold moves a STOPPED VM. A running one would still go through
+			// libvirt's migration, which cannot move a PF, and would fail only
+			// after the target had been prepared.
+			return status.Errorf(codes.FailedPrecondition,
+				"VM %q is running and has PCI passthrough device %s (%s), which cannot be moved while the guest runs; stop the VM first, then migrate --cold",
 				req.VmName, d.Address, d.Type)
 		}
 	}

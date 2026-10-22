@@ -366,7 +366,7 @@ partition-pause: workload stays paused kind=vm name=d1a reason="voter node-4 has
 | `F` | 5 | consecutive failures for a fence vote (`FailuresToFence`) |
 | `Δ` | 1 s | pauser tick |
 | `E` | 5 s | bound on executing the pauses (per-call timeout, all workloads) |
-| `R` | `E` + one record | bound on a healed pass's resume and settle work, during which no quorum sample is taken: the pass takes on records only while within `E` (the first always), re-reads the quorum before each one, stops at once if the majority is gone, and pauses again what it resumed; the next pass starts where it stopped. One record is at most about 33 s (a container settle), a VM resume a libvirt call |
+| `R` | 3 s | bound on one step of a healed pass (`health.PartitionResumeStepBound`), the longest the pass goes without a quorum reading. A step is one pending-settle retry, one record's checks and settle, the majority confirmation, or one resume; everything it does ends by its deadline, and a call still running then is abandoned and its workload stays paused for a later pass. The pass reads the quorum before every step after its first and once more after its last resume, stops at once if the majority is gone, and pauses again what it resumed. It takes on steps only while within `E` of its start (the first of each phase always, with the whole of `R`), and the next pass starts where it stopped |
 
 **Minority detection, `D_M`.** Let `b` be the moment the link from the
 minority host M to a majority voter V breaks. M's first probe of V that starts
@@ -407,10 +407,20 @@ same arithmetic over the region's voters.
 **So M pauses by:**
 
 ```
-max_V b_V + D_M + Δ + T_pause + Δ + E
-  ≤ t_d − 8 + 12 + 1 + T_pause + 1 + 5
-  = t_d + T_pause + 11 s
+max_V b_V + D_M + Δ + R + T_pause + Δ + E
+  ≤ t_d − 8 + 12 + 1 + 3 + T_pause + 1 + 5
+  = t_d + T_pause + 14 s
 ```
+
+The `R` term is a healed M that is inside a resume pass when the link breaks:
+it takes its first not-Yes reading at most one step later than a quiet M
+would. That reading counts toward the loss like any other, and the
+workloads that pass resumed are paused again at once; the ones earlier passes
+resumed are paused on the ordinary path, by the bound above. A resume
+abandoned at its step's deadline keeps its record, and if it lands later it is
+paused again at once. Until it returns, a pause pass reports that workload as
+a failed pause (`partition_pause_failed`, and the self-fence when a verified
+watchdog is armed), since it cannot promise the call will not land.
 
 **Choices.**
 
@@ -418,10 +428,10 @@ max_V b_V + D_M + Δ + T_pause + Δ + E
   own verdict. A loss shorter than that would never have been fenced, so
   pausing for it buys nothing. A blip that is shorter than `D_M + T_pause`
   (12–22 s, depending on where the probe cycles fall) pauses nothing.
-- **Margin** = `max(0, D_M − (F−1)·P) + 2Δ + E + slack`, which is
-  `4 + 2 + 5 + 2 = 13 s`. The 2 s of slack covers scheduling and the monotonic
+- **Margin** = `max(0, D_M − (F−1)·P) + 2Δ + R + E + slack`, which is
+  `4 + 2 + 3 + 5 + 2 = 16 s`. The 2 s of slack covers scheduling and the monotonic
   clocks' rate error (well under 0.1% over 30 s).
-- **`W` = `T_pause` + margin = 23 s**, measured from `t_d`.
+- **`W` = `T_pause` + margin = 26 s**, measured from `t_d`.
 
 **Accumulated loss changes nothing here** (§3.1). From the moment M's links to
 the quorum observers are continuously broken, M's readings are continuously
@@ -461,12 +471,12 @@ means: from the latest instant the majority can prove M was still in contact.
 
 **What it costs.** On the lab, quorum came 23 s after the partition
 (`t_d` ≈ +23 s) and d1a started 10 s after that, at about +33 s. With Layer 2
-latched it starts no earlier than `t_d + W` = `t_d + 23 s`, so at about +46 s
+latched it starts no earlier than `t_d + W` = `t_d + 26 s`, so at about +49 s
 after the partition instead of +33 s.
 
 All of these values are constants in `internal/health/partition_pause.go`.
 `TestPartitionPauseWaitCoversTheMinority` pins the inequality
-`W(n) ≥ max(0, D_M(n) − (F−1)·P) + 2Δ + E + T_pause + slack` against the live
+`W(n) ≥ max(0, D_M(n) − (F−1)·P) + 2Δ + R + E + T_pause + slack` against the live
 constants, for 5, 17, 18 and 40 hosts, so retuning a probe constant cannot
 silently break it. None of them is a config key. The majority computes `W` from
 the same constants the minority runs on, and a per-node knob would break that
@@ -768,15 +778,15 @@ fixed size (`health.PartitionPauseWaitFor(n)`):
 ```
 C(n)   = max(P, ⌈n/16⌉·τ)
 D_M(n) = (k+1)·C(n)
-W(n)   = T_pause + max(0, D_M(n) − (F−1)·P) + 2Δ + E + slack
+W(n)   = T_pause + max(0, D_M(n) − (F−1)·P) + 2Δ + R + E + slack
 ```
 
 | Hosts | Probe targets `n` | `C(n)` | `D_M(n)` | `W(n)` |
 |---|---|---|---|---|
-| 5 | 4 | 3 s | 12 s | 23 s |
-| 17 | 16 | 3 s | 12 s | 23 s |
-| 18 | 17 | 6 s | 24 s | 35 s |
-| 40 | 39 | 9 s | 36 s | 47 s |
+| 5 | 4 | 3 s | 12 s | 26 s |
+| 17 | 16 | 3 s | 12 s | 26 s |
+| 18 | 17 | 6 s | 24 s | 38 s |
+| 40 | 39 | 9 s | 36 s | 50 s |
 
 **Which `n`.** The minority's probe count is what matters, and the coordinator
 cannot read it. It takes the largest count either side could be running with,

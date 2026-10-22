@@ -48,11 +48,19 @@ const (
 	partitionPauseCallTimeout = 2 * time.Second
 	// partitionPauseSlack covers scheduling and monotonic-clock rate error.
 	partitionPauseSlack = 2 * time.Second
+	// PartitionResumeStepBound is R: the longest one step of a healed pass
+	// (one pending-settle retry, one record's checks and settle, the majority
+	// confirmation, or one resume) runs. The pass reads the quorum between
+	// steps and after its last resume, so R is the longest a healed host goes
+	// without a quorum reading; a step that does not finish in R is abandoned
+	// and its workload stays paused for a later pass. The majority's wait
+	// counts it (§4.1).
+	PartitionResumeStepBound = 3 * time.Second
 	// PartitionPauseMargin is what the majority adds to T_pause for a cluster
 	// of up to probeConcurrency+1 hosts (one probe batch);
 	// PartitionPauseMarginFor scales it.
 	PartitionPauseMargin = max(0, (suspectThreshold+1)*max(checkInterval, checkTimeout)-(FailuresToFence-1)*checkInterval) +
-		2*partitionPauseTick + PartitionPauseExecBudget + partitionPauseSlack
+		2*partitionPauseTick + PartitionResumeStepBound + PartitionPauseExecBudget + partitionPauseSlack
 	// PartitionPauseWait is W for a cluster of up to probeConcurrency+1 hosts.
 	PartitionPauseWait = PartitionPauseAfter + PartitionPauseMargin
 	// partitionResumeRecheck spaces the majority confirmation while a resume
@@ -87,10 +95,11 @@ func minorityDetectBoundFor(targets int) time.Duration {
 // FailuresToFence consecutive failures, so every one of their links broke at
 // least (FailuresToFence-1) probe intervals before it: only the part of the
 // minority's detection beyond that head start remains, plus two tick
-// quantisations, the pauses themselves and slack.
+// quantisations, one resume step during which the minority takes no quorum
+// reading (R), the pauses themselves and slack.
 func PartitionPauseMarginFor(targets int) time.Duration {
 	return max(0, minorityDetectBoundFor(targets)-(FailuresToFence-1)*checkInterval) +
-		2*partitionPauseTick + PartitionPauseExecBudget + partitionPauseSlack
+		2*partitionPauseTick + PartitionResumeStepBound + PartitionPauseExecBudget + partitionPauseSlack
 }
 
 // PartitionPauseWaitFor is W(n): how long after its fence decision the majority
@@ -184,9 +193,13 @@ func guardedCall[T any](g *callGuard, kind string, timeout time.Duration, fn fun
 	case r := <-ch:
 		return r.v, r.err
 	case <-time.After(timeout):
-		return zero, fmt.Errorf("did not return within %v", timeout)
+		return zero, fmt.Errorf("%w within %v", errCallTimeout, timeout)
 	}
 }
+
+// errCallTimeout is a call abandoned at its deadline (guardedCall,
+// callWithin).
+var errCallTimeout = errors.New("did not return")
 
 // errPassBudget is a read the pause pass had no budget left for.
 var errPassBudget = errors.New("the pause pass ran out of its budget before this read")
@@ -329,10 +342,13 @@ type PartitionPauser struct {
 	after        time.Duration
 	tick         time.Duration
 	// resumeCursor is the Key of the last record a resume pass took on; the
-	// next pass starts after it (rotateAfter). Only the pauser's own loop
-	// touches it.
-	resumeCursor string
-	progress     atomic.Uint64 // Progress
+	// next pass starts after it (rotateAfter). resumeLoopCursor is the same
+	// for the resumes themselves, so a resume that fails slowly on every pass
+	// is not tried first on every pass. Only the pauser's own loop touches
+	// them.
+	resumeCursor     string
+	resumeLoopCursor string
+	progress         atomic.Uint64 // Progress
 
 	mu sync.Mutex
 	// samples are this pass's and earlier passes' quorum readings inside the
@@ -347,9 +363,13 @@ type PartitionPauser struct {
 	sawYes, sawNo bool
 	// reads guards the abandoned libvirt reads, one call per kind (callGuard).
 	reads callGuard
-	// inflight marks the workloads whose pause call has not returned yet (a
-	// timed-out call is abandoned, not cancelled): no second call is issued.
+	// inflight marks the workloads whose pause, resume or settle stop call
+	// has not returned yet (a timed-out call is abandoned, not cancelled): no
+	// second call is issued. resuming marks those among them whose call is a
+	// resume, which may yet land: a pause pass cannot promise such a workload
+	// stays paused, and reports it failed until the call returns.
 	inflight   map[string]bool
+	resuming   map[string]bool
 	failed     map[string]string // key → error, this loss episode
 	failedOpen bool
 	pausedEvid string // evidence last written to partition_paused, "" when resolved
@@ -369,7 +389,7 @@ func NewPartitionPauser(host, dataDir string, db *corrosion.Client) *PartitionPa
 	return &PartitionPauser{
 		host: host, db: db, store: newPauseStore(dataDir), dataDir: dataDir,
 		now: time.Now, after: PartitionPauseAfter, tick: partitionPauseTick, ctCapable: lxc.Available,
-		failed: map[string]string{}, heldWhy: map[string]string{}, inflight: map[string]bool{},
+		failed: map[string]string{}, heldWhy: map[string]string{}, inflight: map[string]bool{}, resuming: map[string]bool{},
 	}
 }
 
@@ -493,35 +513,167 @@ func (p *PartitionPauser) Progress() uint64 { return p.progress.Load() }
 
 func (p *PartitionPauser) noteProgress() { p.progress.Add(1) }
 
-// partitionResumePassBudget bounds the resume and settle work of one pass to
-// E, the pause pass's own budget, so a healed pass delays the next quorum
-// sample by about E plus one record, as a pause pass does: the majority's
-// wait W already counts E (docs/design/partition-pause.md §4.1). Each record's
-// work is bounded by its own call timeouts (a container settle at most about
-// 33 s); the pass as a whole is bounded by the budget plus the one record
-// that overruns it. What the budget does not reach is left exactly as it
-// was, still paused, and the next pass starts there (resumeCursor), so a
-// record that is slow on every pass cannot starve the ones after it.
+// partitionResumePassBudget bounds how long one healed pass goes on taking
+// up steps: E, the pause pass's own budget. What it does not reach is left
+// exactly as it was, still paused, and the next pass starts there
+// (resumeCursor, resumeLoopCursor), so a record that is slow on every pass
+// cannot starve the ones after it.
 var partitionResumePassBudget = PartitionPauseExecBudget
 
-// passBudgetLeft reports whether a pass begun at start may take on another
-// record, and counts the record as progress when it may. The first record of
-// each loop is always taken (first), so every pass moves.
-func (p *PartitionPauser) passBudgetLeft(start time.Time, first bool) bool {
-	if !first && time.Since(start) >= partitionResumePassBudget {
+// partitionResumeStepBound is R (PartitionResumeStepBound); tests shorten it.
+var partitionResumeStepBound = PartitionResumeStepBound
+
+// settleStopMin is the least time left in its step for a settle to start
+// its stop: lxc-stop waits a second for the frozen container's SIGPWR before
+// it kills it. With less, the settle waits for a later pass.
+var settleStopMin = 1500 * time.Millisecond
+
+// resumePass is one healed pass's budget, steps and outcome.
+type resumePass struct {
+	p     *PartitionPauser
+	ctx   context.Context
+	start time.Time
+	end   time.Time // start + partitionResumePassBudget
+	steps int
+	// lost: a quorum reading between steps was not Yes, so the pass stopped.
+	lost     bool
+	deferred int
+}
+
+func (p *PartitionPauser) newResumePass(ctx context.Context) *resumePass {
+	now := time.Now() // monotonic, unlike p.now
+	return &resumePass{p: p, ctx: ctx, start: now, end: now.Add(partitionResumePassBudget)}
+}
+
+// passStep is one step's deadline. cut: the pass's end, not R, set it.
+type passStep struct {
+	deadline time.Time
+	cut      bool
+}
+
+// ranOut reports whether a step cut short by the pass's end used all of
+// it: the step did not finish for want of time, not for anything of its own,
+// so the next pass starts with it.
+func (s passStep) ranOut() bool { return s.cut && !time.Now().Before(s.deadline) }
+
+// step reports whether the pass takes on one more step, and its deadline.
+// The first step of each phase is always taken (first), with the whole of
+// R, so every pass moves; any other only while the budget lasts, and never
+// past its end. Before every step but the pass's first (which Evaluate's own
+// reading just preceded) the quorum is read again: a step is at most R, so
+// the pass never goes longer than R without a reading. A step taken counts
+// as progress (Progress).
+func (ps *resumePass) step(first bool) (passStep, bool) {
+	if ps.lost {
+		return passStep{}, false
+	}
+	now := time.Now()
+	if !first && !now.Before(ps.end) {
+		ps.deferred++
+		return passStep{}, false
+	}
+	if ps.steps > 0 && ps.p.majorityLost(ps.ctx) {
+		ps.lost = true
+		return passStep{}, false
+	}
+	ps.steps++
+	ps.p.noteProgress()
+	st := passStep{deadline: now.Add(partitionResumeStepBound)}
+	if !first && ps.end.Before(st.deadline) {
+		st = passStep{deadline: ps.end, cut: true}
+	}
+	return st, true
+}
+
+// majorityLost re-reads the quorum between the steps of a resume pass. A
+// pass takes time, and the partition can come back during it (a flap, the
+// ordinary case just after a heal): the pass must not go on resuming behind
+// a majority that is gone again. A reading that is not Yes is recorded like
+// Evaluate's own: it counts toward the loss window and breaks the run of Yes
+// readings, so the next resume needs a full heal again (§4.1).
+func (p *PartitionPauser) majorityLost(ctx context.Context) bool {
+	st, _, _ := p.quorum(ctx)
+	if st == QuorumYes {
 		return false
 	}
-	p.noteProgress()
+	now := p.now()
+	p.mu.Lock()
+	p.samples = append(p.samples, lossSample{at: now, lost: true})
+	p.yesSince = time.Time{}
+	if st == QuorumNo {
+		p.sawNo = true
+	}
+	p.mu.Unlock()
 	return true
 }
 
-// majorityLost re-reads the quorum between the records of a resume pass. A
-// pass takes time, and the partition can come back during it (a flap, the
-// ordinary case just after a heal): the pass must not go on resuming behind
-// a majority that is gone again.
-func (p *PartitionPauser) majorityLost(ctx context.Context) bool {
-	st, _, _ := p.quorum(ctx)
-	return st != QuorumYes
+// callWithin runs fn for the workload key, waiting at most timeout. A call
+// that does not return in time is abandoned, not cancelled: it holds key in
+// inflight until it returns, so no second call for the workload is issued
+// meanwhile (and a pause of it fails). A resume (resume) also marks it in
+// resuming, and should one land after it was abandoned, undo runs at once:
+// the pass reported the workload still paused, so it is paused again, and a
+// later pass resumes it on a fresh confirmation.
+func (p *PartitionPauser) callWithin(key string, timeout time.Duration, resume bool, fn func() error, undo func() error) error {
+	if timeout <= 0 {
+		return errPassBudget
+	}
+	p.mu.Lock()
+	if p.inflight[key] {
+		p.mu.Unlock()
+		return fmt.Errorf("an earlier call on %s has not returned yet", key)
+	}
+	p.inflight[key] = true
+	if resume {
+		p.resuming[key] = true
+	}
+	p.mu.Unlock()
+	const (
+		running = iota
+		returned
+		abandoned
+	)
+	var state atomic.Int32
+	done := make(chan error, 1)
+	go func() {
+		err := fn()
+		if !state.CompareAndSwap(running, returned) && err == nil && undo != nil {
+			if uerr := undo(); uerr != nil {
+				slog.Error("partition-pause: an abandoned call landed late and could not be undone",
+					"key", key, "host", p.host, "error", uerr)
+			} else {
+				slog.Warn("partition-pause: an abandoned resume landed late; paused again", "key", key, "host", p.host)
+			}
+		}
+		p.mu.Lock()
+		delete(p.inflight, key)
+		delete(p.resuming, key)
+		p.mu.Unlock()
+		done <- err
+	}()
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-t.C:
+		if state.CompareAndSwap(running, abandoned) {
+			return fmt.Errorf("%w within %v", errCallTimeout, timeout)
+		}
+		return <-done
+	}
+}
+
+// timedOutErr: err is a call abandoned at, or refused for, its deadline.
+func timedOutErr(err error) bool {
+	return errors.Is(err, errCallTimeout) || errors.Is(err, errPassBudget)
+}
+
+// resumeInFlight reports whether an abandoned resume of key has not returned.
+func (p *PartitionPauser) resumeInFlight(key string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.resuming[key]
 }
 
 // rotateAfter is recs (sorted by Key) starting at the first record after
@@ -752,6 +904,12 @@ func (p *PartitionPauser) pauseVMs(ctx context.Context, budget passBudget, reaso
 	var wg sync.WaitGroup
 	for _, name := range names {
 		key := PauseKindVM + "/" + name
+		if p.resumeInFlight(key) {
+			// Paused now, but a resume a healed pass abandoned is still out
+			// and may land: this pass cannot promise it stays paused.
+			fail(key, whyResumeInFlight)
+			continue
+		}
 		st, err := guardedCall(&p.reads, readDomainState, budget.timeout(), func() (lv.DomainStatus, error) { return p.vms.DomainStateReason(name) })
 		if err != nil {
 			// Not knowing whether it runs is not knowing it is stopped.
@@ -837,6 +995,10 @@ func (p *PartitionPauser) pauseContainers(ctx context.Context, budget passBudget
 		if !ok || !corrosion.ContainerRecoverableOnHostFailure(row) {
 			continue
 		}
+		if p.resumeInFlight(key) {
+			fail(key, whyResumeInFlight)
+			continue
+		}
 		if budget.timeout() <= 0 {
 			fail(key, "container state unreadable: "+errPassBudget.Error())
 			continue
@@ -882,6 +1044,10 @@ func (p *PartitionPauser) pauseContainers(ctx context.Context, budget passBudget
 	}
 	wg.Wait()
 }
+
+// whyResumeInFlight is a pause failure for a workload whose abandoned resume
+// has not returned.
+const whyResumeInFlight = "a resume abandoned at the end of its step has not returned and may yet land"
 
 // pauseOne records rec, then runs pause, bounded by partitionPauseCallTimeout.
 // A pause that fails cleanly drops the record (the workload is not paused);
@@ -930,11 +1096,11 @@ func (p *PartitionPauser) pauseOne(rec PauseRecord, pause func() error) error {
 // stillPausedByUs reports whether rec's VM is still the domain this host
 // paused: present, paused, and (when both are known) the same domain UUID. A
 // record failing it describes nothing any more and is dropped.
-func (p *PartitionPauser) stillPausedByUs(rec PauseRecord) (bool, string) {
+func (p *PartitionPauser) stillPausedByUs(rec PauseRecord, deadline time.Time) (bool, string) {
 	if rec.Kind != PauseKindVM || p.vms == nil {
 		return true, ""
 	}
-	st, err := guardedCall(&p.reads, readDomainState, partitionPauseCallTimeout, func() (lv.DomainStatus, error) { return p.vms.DomainStateReason(rec.Name) })
+	st, err := guardedCall(&p.reads, readDomainState, min(partitionPauseCallTimeout, time.Until(deadline)), func() (lv.DomainStatus, error) { return p.vms.DomainStateReason(rec.Name) })
 	if lv.IsNotFound(err) {
 		// Undefined since: there is nothing left to resume, and a kept record
 		// would hold partition_paused open for good.
@@ -947,7 +1113,7 @@ func (p *PartitionPauser) stillPausedByUs(rec PauseRecord) (bool, string) {
 		return false, "the domain is " + st.State + "/" + st.Reason + ", no longer paused"
 	}
 	if rec.DomainUUID != "" {
-		if xml, err := guardedCall(&p.reads, readDomainXML, partitionPauseCallTimeout, func() (string, error) { return p.vms.DumpXMLInactive(rec.Name) }); err == nil {
+		if xml, err := guardedCall(&p.reads, readDomainXML, min(partitionPauseCallTimeout, time.Until(deadline)), func() (string, error) { return p.vms.DumpXMLInactive(rec.Name) }); err == nil {
 			if u := lv.UUIDFromXML(xml); u != "" && u != rec.DomainUUID {
 				return false, "the domain is another one (uuid " + u + ")"
 			}
@@ -956,15 +1122,17 @@ func (p *PartitionPauser) stillPausedByUs(rec PauseRecord) (bool, string) {
 	return true, ""
 }
 
-// tryResume runs the resume checks over every record (§3.5).
+// tryResume runs the resume checks over every record (§3.5), as one bounded
+// pass of steps (resumePass): the pending-settle retries, each record's
+// checks and settle, the majority confirmation, and each resume. Every step
+// runs under its own deadline, at most R; the quorum is read between steps
+// and after the last resume, and a pass that finds it lost stops and pauses
+// again what it resumed (§4.1).
 func (p *PartitionPauser) tryResume(ctx context.Context, now time.Time) {
-	// One budget for the whole resume and settle tail (time.Now: monotonic,
-	// unlike p.now).
-	passStart := time.Now()
-	lost := false
+	pass := p.newResumePass(ctx)
 	// First, the record of any container settle not yet fully written: it
 	// may drop the pause record of the copy it settled.
-	p.retryPendingSettles(ctx, passStart)
+	p.retryPendingSettles(ctx, pass)
 	recs, err := p.store.list()
 	if err != nil {
 		slog.Error("partition-pause: cannot read the pause records; nothing is resumed", "host", p.host, "error", err)
@@ -975,99 +1143,156 @@ func (p *PartitionPauser) tryResume(ctx context.Context, now time.Time) {
 		return
 	}
 	var candidates []PauseRecord
-	deferred, handled := 0, 0
+	handled, spent := 0, false
 	for _, rec := range rotateAfter(recs, p.resumeCursor) {
-		if !p.passBudgetLeft(passStart, handled == 0) {
-			deferred++
-			continue
-		}
-		if handled > 0 && p.majorityLost(ctx) {
-			lost = true
+		if pass.lost {
 			break
 		}
+		if spent {
+			pass.deferred++
+			continue
+		}
+		st, ok := pass.step(handled == 0)
+		if !ok {
+			spent = true
+			continue
+		}
 		handled++
+		prev := p.resumeCursor
 		p.resumeCursor = rec.Key()
-		if ok, why := p.stillPausedByUs(rec); !ok {
-			// Resumed or stopped by someone else, gone, or replaced: the record
-			// would only keep partition_paused open and offer a stale epoch.
-			if err := p.store.remove(rec.Kind, rec.Name); err == nil {
-				slog.Info("partition-pause: dropped a pause record that no longer describes a paused workload",
-					"kind", rec.Kind, "name", rec.Name, "host", p.host, "reason", why)
-			}
+		sctx, cancel := context.WithDeadline(ctx, st.deadline)
+		ok, short := p.checkRecord(sctx, rec, st.deadline)
+		cancel()
+		if short || st.ranOut() {
+			// Cut short by the pass's end, not slow of its own: the next
+			// pass starts with it, with the whole of R.
+			p.resumeCursor = prev
+			spent = true
+			pass.deferred++
 			continue
 		}
-		if why := p.localRowMatches(ctx, rec); why != "" {
-			if why == whyNoLocalContainerRow {
-				if gone, gwhy := p.containerGone(ctx, rec.Name); gone {
-					p.dropGoneContainer(rec, gwhy)
-					continue
-				}
-			}
-			if rec.Kind == PauseKindContainer {
-				if settled, swhy := p.settleContainer(ctx, rec); settled {
-					continue
-				} else if swhy != "" {
-					why += "; " + swhy
-				}
-			}
-			p.hold(rec, why)
-			continue
+		if ok {
+			candidates = append(candidates, rec)
 		}
-		candidates = append(candidates, rec)
 	}
-	if len(candidates) > 0 && !lost {
+	if len(candidates) > 0 && !pass.lost {
 		p.mu.Lock()
 		due := p.lastConfirm.IsZero() || now.Sub(p.lastConfirm) >= partitionResumeRecheck
-		if due {
-			p.lastConfirm = now
-		}
 		p.mu.Unlock()
 		if due {
-			var verdicts map[string]ResumeVerdict
-			if p.confirm != nil {
-				verdicts = p.confirm(ctx, candidates)
-			}
-			var resumed []PauseRecord
-			for _, rec := range candidates {
-				if lost {
-					break
-				}
-				v, ok := verdicts[rec.Key()]
-				switch {
-				case p.confirm == nil:
-					p.hold(rec, "no majority confirmation is wired on this host")
-				case !ok:
-					p.hold(rec, "the voter set returned no verdict")
-				case !v.OK:
-					p.hold(rec, v.Reason)
-				default:
-					if !p.passBudgetLeft(passStart, len(resumed) == 0) {
-						deferred++
-						continue
-					}
-					if p.majorityLost(ctx) {
-						lost = true
-						continue
-					}
-					if p.resume(ctx, rec, v.Reason) {
-						resumed = append(resumed, rec)
-					}
-				}
-			}
-			if lost {
-				p.repause(resumed)
-			}
+			p.resumeConfirmed(ctx, pass, now, candidates)
 		}
 	}
-	if lost {
+	if pass.lost {
 		slog.Warn("partition-pause: the voter majority was lost again during a resume pass; it stopped, and what it resumed is paused again",
 			"host", p.host)
 	}
-	if deferred > 0 {
+	if pass.deferred > 0 {
 		slog.Info("partition-pause: this pass spent its budget; the rest stay paused for the next pass",
-			"host", p.host, "deferred", deferred, "budget", partitionResumePassBudget)
+			"host", p.host, "deferred", pass.deferred, "budget", partitionResumePassBudget)
 	}
 	p.syncPausedCondition(ctx, "")
+}
+
+// checkRecord is §3.5 steps 1 and 2 for one record, and Layer 3 for a
+// container: it reports whether rec is a candidate for the majority's
+// confirmation, and whether a settle could not start its stop for want of
+// time (short).
+func (p *PartitionPauser) checkRecord(ctx context.Context, rec PauseRecord, deadline time.Time) (candidate, short bool) {
+	if ok, why := p.stillPausedByUs(rec, deadline); !ok {
+		// Resumed or stopped by someone else, gone, or replaced: the record
+		// would only keep partition_paused open and offer a stale epoch.
+		if err := p.store.remove(rec.Kind, rec.Name); err == nil {
+			slog.Info("partition-pause: dropped a pause record that no longer describes a paused workload",
+				"kind", rec.Kind, "name", rec.Name, "host", p.host, "reason", why)
+		}
+		return false, false
+	}
+	why := p.localRowMatches(ctx, rec)
+	if why == "" {
+		return true, false
+	}
+	if why == whyNoLocalContainerRow {
+		if gone, gwhy := p.containerGone(ctx, rec.Name); gone {
+			p.dropGoneContainer(rec, gwhy)
+			return false, false
+		}
+	}
+	if rec.Kind == PauseKindContainer {
+		settled, swhy, sshort := p.settleContainer(ctx, rec, deadline)
+		if settled {
+			return false, false
+		}
+		if swhy != "" {
+			why += "; " + swhy
+		}
+		short = sshort
+	}
+	p.hold(rec, why)
+	return false, short
+}
+
+// resumeConfirmed asks the voter set about the candidates (one step), then
+// resumes those it confirms, one step each, starting after the last resume
+// the previous pass attempted (resumeLoopCursor): a resume that fails slowly
+// takes its step and its turn like any other, and does not come first on
+// every pass. The quorum is read before every resume and once more after
+// the last; once it is lost, what this pass resumed is paused again.
+func (p *PartitionPauser) resumeConfirmed(ctx context.Context, pass *resumePass, now time.Time, candidates []PauseRecord) {
+	st, ok := pass.step(true)
+	if !ok {
+		return
+	}
+	p.mu.Lock()
+	p.lastConfirm = now
+	p.mu.Unlock()
+	var verdicts map[string]ResumeVerdict
+	if p.confirm != nil {
+		cctx, cancel := context.WithDeadline(ctx, st.deadline)
+		verdicts = p.confirm(cctx, candidates)
+		cancel()
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Key() < candidates[j].Key() })
+	var resumed []PauseRecord
+	attempted := 0
+	for _, rec := range rotateAfter(candidates, p.resumeLoopCursor) {
+		if pass.lost {
+			break
+		}
+		v, ok := verdicts[rec.Key()]
+		switch {
+		case p.confirm == nil:
+			p.hold(rec, "no majority confirmation is wired on this host")
+			continue
+		case !ok:
+			p.hold(rec, "the voter set returned no verdict")
+			continue
+		case !v.OK:
+			p.hold(rec, v.Reason)
+			continue
+		}
+		st, ok := pass.step(attempted == 0)
+		if !ok {
+			continue
+		}
+		attempted++
+		prev := p.resumeLoopCursor
+		p.resumeLoopCursor = rec.Key()
+		sctx, cancel := context.WithDeadline(ctx, st.deadline)
+		done, timedOut := p.resume(sctx, rec, v.Reason, st.deadline)
+		cancel()
+		if done {
+			resumed = append(resumed, rec)
+		} else if timedOut && st.cut {
+			p.resumeLoopCursor = prev
+		}
+	}
+	if len(resumed) > 0 && !pass.lost && p.majorityLost(ctx) {
+		pass.lost = true
+	}
+	if pass.lost {
+		p.repause(resumed)
+	}
 }
 
 // localRowMatches is §3.5 step 2: the row in this host's replica still names
@@ -1163,37 +1388,58 @@ func (p *PartitionPauser) hold(rec PauseRecord, why string) {
 	}
 }
 
-// resume continues rec's workload and drops its record. It reports whether
-// the workload runs again.
-func (p *PartitionPauser) resume(ctx context.Context, rec PauseRecord, why string) bool {
+// resume continues rec's workload and drops its record, every call bounded
+// by deadline. It reports whether the workload runs again, and whether a
+// call was abandoned at the deadline (callWithin): the workload keeps its
+// record and stays paused, and a resume that lands late is undone.
+func (p *PartitionPauser) resume(ctx context.Context, rec PauseRecord, why string, deadline time.Time) (resumed, timedOut bool) {
 	switch rec.Kind {
 	case PauseKindVM:
 		if p.vms == nil {
 			p.hold(rec, "no libvirt backend on this host")
-			return false
+			return false, false
 		}
-		st, err := p.vms.DomainStateReason(rec.Name)
-		if err == nil && st.Reason == "paused" {
-			if err := p.vms.ResumePartitionPaused(rec.Name, rec.DomainUUID); err != nil {
+		st, err := guardedCall(&p.reads, readDomainState, min(partitionPauseCallTimeout, time.Until(deadline)),
+			func() (lv.DomainStatus, error) { return p.vms.DomainStateReason(rec.Name) })
+		switch {
+		case err != nil && !lv.IsNotFound(err):
+			// Unreadable: dropping the record here would leave a paused
+			// guest no pass ever resumes.
+			p.hold(rec, "domain state unreadable: "+err.Error())
+			return false, timedOutErr(err)
+		case err == nil && st.Reason == "paused":
+			name, uuid := rec.Name, rec.DomainUUID
+			if err := p.callWithin(rec.Key(), time.Until(deadline), true,
+				func() error { return p.vms.ResumePartitionPaused(name, uuid) },
+				func() error { return p.vms.SuspendDomain(name) }); err != nil {
 				p.hold(rec, "resume failed: "+err.Error())
-				return false
+				return false, timedOutErr(err)
 			}
 		}
 	case PauseKindContainer:
 		if p.cts == nil {
 			p.hold(rec, "no container runtime on this host")
-			return false
+			return false, false
 		}
-		cctx, cancel := context.WithTimeout(ctx, partitionPauseCallTimeout)
-		err := p.cts.Unfreeze(cctx, rec.Name)
-		cancel()
+		name := rec.Name
+		err := p.callWithin(rec.Key(), time.Until(deadline), true,
+			func() error { return p.cts.Unfreeze(ctx, name) },
+			func() error {
+				fctx, cancel := context.WithTimeout(context.Background(), partitionPauseCallTimeout)
+				defer cancel()
+				return p.cts.Freeze(fctx, name)
+			})
 		if err != nil {
+			if timedOutErr(err) {
+				p.hold(rec, "unfreeze failed: "+err.Error())
+				return false, true
+			}
 			if fs, ok := p.cts.(frozenStater); !ok {
 				p.hold(rec, "unfreeze failed: "+err.Error())
-				return false
+				return false, false
 			} else if frozen, ferr := fs.IsFrozen(ctx, rec.Name); ferr != nil || frozen {
 				p.hold(rec, "unfreeze failed: "+err.Error())
-				return false
+				return false, false
 			}
 		}
 	}
@@ -1205,7 +1451,7 @@ func (p *PartitionPauser) resume(ctx context.Context, rec PauseRecord, why strin
 	p.mu.Unlock()
 	slog.Warn("partition-pause: resumed workload", "kind", rec.Kind, "name", rec.Name,
 		"host", p.host, "reason", why)
-	return true
+	return true, false
 }
 
 // ── conditions ──────────────────────────────────────────────────────────────

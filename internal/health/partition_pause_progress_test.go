@@ -131,7 +131,7 @@ func longestStill(p *PartitionPauser, fn func()) (still, took time.Duration) {
 // never the whole pass. Timing the pass as a whole made a healthy, just
 // healed host look wedged and self-fence.
 //
-// Mutation: drop the per-record progress (passBudgetLeft's noteProgress) and
+// Mutation: drop the per-record progress (resumePass.step's noteProgress) and
 // the counter stands still for the whole pass.
 func TestPartitionPause_ASlowSettlePassKeepsMakingProgress(t *testing.T) {
 	const n, delay = 8, 60 * time.Millisecond
@@ -163,7 +163,7 @@ func TestPartitionPause_ASlowSettlePassKeepsMakingProgress(t *testing.T) {
 // The resume and settle work of one pass is bounded: what the budget does
 // not reach stays paused, untouched, for the next pass.
 //
-// Mutation: drop the budget check in passBudgetLeft and the first pass
+// Mutation: drop the budget check in resumePass.step and the first pass
 // settles everything.
 func TestPartitionPause_ResumePassIsBounded(t *testing.T) {
 	const n, delay = 6, 50 * time.Millisecond
@@ -276,8 +276,12 @@ func (q *quorumFlipVMs) ResumePartitionPaused(name, uuid string) error {
 // it resumed runs beside a replacement the majority's wait may now start
 // (re-review 2, N5).
 //
+// A container resumed in the same pass (ct-ha: "ct/" sorts first, so it is
+// resumed before any VM) is frozen again too.
+//
 // Mutations: drop the quorum re-check between resumes — the other VMs resume
-// too; drop the re-pause — the first stays running.
+// too; drop the re-pause — the first stays running; skip containers in the
+// re-pause — ct-ha stays running.
 func TestPartitionPause_MajorityLostMidPassStopsAndRepauses(t *testing.T) {
 	f := newPauseFixture(t)
 	ctx := context.Background()
@@ -289,11 +293,20 @@ func TestPartitionPause_MajorityLostMidPassStopsAndRepauses(t *testing.T) {
 		}
 		f.virt.SetState(name, libvirtfake.StateRunning)
 	}
+	if err := corrosion.UpsertContainer(ctx, f.db, corrosion.ContainerRecord{HostName: "node-a", Name: "ct-ha",
+		State: "running", Image: "alpine:3.19", OnHostFailure: "image-recreate"}); err != nil {
+		t.Fatal(err)
+	}
+	rt := newFakeCT("ct-ha")
+	f.p.SetContainerRuntime(rt)
 	f.loseFor(QuorumNo, PartitionPauseAfter+time.Second)
 	for _, name := range names {
 		if st := f.raw(name); st != libvirtfake.StatePaused {
 			t.Fatalf("setup: %s is %s, want paused", name, st)
 		}
+	}
+	if st := rt.get("ct-ha"); st != "frozen" {
+		t.Fatalf("setup: ct-ha is %s, want frozen", st)
 	}
 	f.p.SetVMBackend(&quorumFlipVMs{PauseVMBackend: f.virt, flip: func() { f.set(QuorumNo) }})
 	f.healedPass()
@@ -303,7 +316,10 @@ func TestPartitionPause_MajorityLostMidPassStopsAndRepauses(t *testing.T) {
 			t.Errorf("%s is %s after the majority was lost mid-pass, want paused", name, st)
 		}
 	}
-	if recs := f.records(); len(recs) != len(names) {
-		t.Errorf("records = %+v, want one for each of %v", recs, names)
+	if st := rt.get("ct-ha"); st != "frozen" {
+		t.Errorf("ct-ha is %s after the majority was lost mid-pass, want frozen again", st)
+	}
+	if recs := f.records(); len(recs) != len(names)+1 {
+		t.Errorf("records = %+v, want one for each of %v and ct-ha", recs, names)
 	}
 }

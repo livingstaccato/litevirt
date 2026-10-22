@@ -458,7 +458,7 @@ enforcement:
                               # confirms nothing moved it. Advertises partition_pause_v1
                               # only while on; once that latches, a coordinator whose
                               # best-effort fence cannot reach a host waits out that host's
-                              # pause (23 s after its decision on up to 17 hosts, longer on
+                              # pause (26 s after its decision on up to 17 hosts, longer on
                               # larger clusters) before recovering, and records the fence as
                               # self_paused. Runs whether or not a hardware watchdog is armed
                               # (the watchdog fires only when the daemon dies); a verified

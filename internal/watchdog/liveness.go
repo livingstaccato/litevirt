@@ -95,9 +95,8 @@ func (c *Controller) SetLivenessStale(d time.Duration) {
 // DefaultLivenessStale is twice the hardware timeout Heartbeat sets (60 s at
 // the default 15 s pet interval): eight DB probe intervals, while a healthy
 // pauser moves its counter at least once a second (its tick) and on every
-// record a pass handles, each record's work bounded by its own call timeouts
-// (at most 33 s for a container settle) and a pass's resume and settle work
-// by its budget (E) plus the one record that overruns it. A real wedge reboots the host within
+// step a resume pass takes, each step bounded by R (3 s,
+// health.PartitionResumeStepBound). A real wedge reboots the host within
 // 120 s + 60 s = 3 min.
 const DefaultLivenessStale = 120 * time.Second
 

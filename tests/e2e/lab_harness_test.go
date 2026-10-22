@@ -109,7 +109,9 @@ var (
 	// majority voter healthy.
 	minorityDetect = (suspectAfter + 1) * probeCycle
 	// minorityPauseBy bounds the minority's pause from the moment the link
-	// breaks: b + D_M + Δ + T_pause + Δ + E (§4.1, "So M pauses by").
+	// breaks: b + D_M + Δ + T_pause + Δ + E (§4.1, "So M pauses by", for a
+	// host not in a resume pass when the link breaks, as in every drill: one
+	// in a pass may see the loss up to R later).
 	minorityPauseBy = minorityDetect + pauserTick + tPause + pauserTick + health.PartitionPauseExecBudget
 	// decisionHeadStart is (F−1)·P: a fence decision rests on F consecutive
 	// failures by each quorum observer, so t_d ≥ b + (F−1)·P.
@@ -134,11 +136,12 @@ func checkDesignTimings(t *testing.T, hosts int) {
 	if tPause != 10*time.Second {
 		t.Fatalf("T_pause = %v, design says 10 s: update the drills' expectations with the design", tPause)
 	}
-	if hosts <= 17 && pauseWait(hosts) != 23*time.Second {
-		t.Fatalf("W(%d hosts) = %v, design table says 23 s", hosts, pauseWait(hosts))
+	if hosts <= 17 && pauseWait(hosts) != 26*time.Second {
+		t.Fatalf("W(%d hosts) = %v, design table says 26 s", hosts, pauseWait(hosts))
 	}
-	// W = T_pause + max(0, D_M − (F−1)·P) + 2Δ + E + slack, slack = 2 s.
-	recomputed := tPause + max(0, minorityDetect-decisionHeadStart) + 2*pauserTick + health.PartitionPauseExecBudget + 2*time.Second
+	// W = T_pause + max(0, D_M − (F−1)·P) + 2Δ + R + E + slack, slack = 2 s.
+	recomputed := tPause + max(0, minorityDetect-decisionHeadStart) + 2*pauserTick + health.PartitionResumeStepBound +
+		health.PartitionPauseExecBudget + 2*time.Second
 	if hosts <= 17 && recomputed != pauseWait(hosts) {
 		t.Fatalf("W recomputed from the restated constants = %v, internal/health says %v", recomputed, pauseWait(hosts))
 	}

@@ -402,12 +402,13 @@ func TestFleet_Failover_MigratingRowWithNoCopyOnTargetIsRecovered(t *testing.T) 
 
 // TestFleet_Failover_MigratingFirmwareRowWithBothHostsDownIsNotStarted: mg1
 // is a Secure Boot / vTPM VM recorded migrating from the victim to b, and b
-// does not answer. Its hold says no lv command can start it while both
-// hosts are down, and that bringing one back is the remedy. Once b is
-// powered off and confirmed so, the recovery goes on past the hold into
-// failover's firmware skip: nothing of mg1 runs anywhere, its row stays
-// migrating on the victim, the skip is audited, and the condition stays,
-// still saying what brings it back.
+// does not answer. Its hold says no `lv` command starts it while both hosts
+// are down, and that bringing one back is the remedy. Once b is powered off
+// and confirmed so, the recovery goes on past the hold into failover's
+// firmware skip: nothing of mg1 runs anywhere, its row stays migrating on
+// the victim, the skip is audited, and the condition stays, saying what the
+// victim's return then takes (internal/grpcapi TestFailedFirmwareSource_*
+// follow it to one running copy).
 //
 // Mutations: resolve the condition when a firmware VM is recovered — red;
 // give the unreachable firmware hold the paused advice — red.
@@ -424,8 +425,8 @@ func TestFleet_Failover_MigratingFirmwareRowWithBothHostsDownIsNotStarted(t *tes
 	if len(cs.Fences()) == 0 {
 		t.Fatal("victim was never fenced; without a fence there is no recovery and this proves nothing")
 	}
-	bringBack := []string{"No lv command can start", "both down", "Bring one of them back", "lv start mg1"}
-	requireHeldNaming(t, a, b, victim, bringBack...)
+	requireHeldNaming(t, a, b, victim, "No `lv` command starts it", "both down", "Bring "+b.Name+" back",
+		"Or bring "+victim.Name+" back", "lv start mg1")
 
 	// b powered off, its guest with it, and confirmed so.
 	c.Kill(b)
@@ -451,7 +452,8 @@ func TestFleet_Failover_MigratingFirmwareRowWithBothHostsDownIsNotStarted(t *tes
 	if !open {
 		t.Fatal("vm.migration_unresolved was resolved, though nothing brought mg1 back")
 	}
-	for _, w := range bringBack {
+	for _, w := range []string{"proven powered off", "No `lv` command starts it while " + victim.Name + " is down",
+		"Power " + victim.Name + " back on", "lv start mg1"} {
 		if !strings.Contains(detail, w) {
 			t.Errorf("vm.migration_unresolved no longer names %q: %s", w, detail)
 		}

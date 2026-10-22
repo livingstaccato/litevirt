@@ -44,13 +44,15 @@ func unresolvedDetail(t *testing.T, s *Server, vm string) (string, bool) {
 // its firmware records. The hold names the step that settles it, by what the
 // target holds, and each arm takes that step:
 //
-//   - unreachable: no lv command can start it while the source and the
-//     target are both down; bringing one back is the remedy. A target
-//     proven off then lets the recovery go on (where failover skips a
-//     firmware VM), and the condition stays, still saying so;
+//   - unreachable: no `lv` command starts it while the source and the
+//     target are both down; bringing one back is the remedy
+//     (TestFailedFirmwareSource_* follow each return). A target proven off
+//     then lets the recovery go on (where failover skips a firmware VM), and
+//     the condition stays, saying what the source's return then takes;
 //   - paused: fence-confirm of the source, then --adopt-target-copy: the VM
-//     runs on the target alone, its row there;
-//   - running or shut off: no lv command; `virsh suspend` or
+//     runs on the target alone, its row there, and the condition is
+//     resolved;
+//   - running or shut off: no `lv` command; `virsh suspend` or
 //     `virsh start --paused` on the target pauses it, and the paused arm's
 //     steps follow;
 //   - any other active state (pm-suspended, crashed, shutting down): no
@@ -61,7 +63,9 @@ func unresolvedDetail(t *testing.T, s *Server, vm string) (string, bool) {
 // state the paused advice — the running and shut-off arms, red; give the
 // unreachable target the paused advice — red; resolve the condition when a
 // firmware VM is recovered — the unreachable arm, red; name `virsh start`
-// for every active state — the pmsuspended arm, red.
+// for every active state — the pmsuspended arm, red; leave the condition
+// open once the doctor settled the row (no resolution after the doctor's
+// action) — the paused, running and shut-off arms, red.
 func TestSettleFailedSourceMigrations_FirmwareVMIsHeldForTheDoctor(t *testing.T) {
 	ctx := context.Background()
 	settle := func(t *testing.T, r *fwlRig) failover.MigratingDecision {
@@ -112,7 +116,7 @@ func TestSettleFailedSourceMigrations_FirmwareVMIsHeldForTheDoctor(t *testing.T)
 	adoptPaused := func(t *testing.T, r *fwlRig) {
 		t.Helper()
 		held(t, r, settle(t, r), []string{"lv host fence-confirm src-host", "lv doctor firmware-move " + fwlVM + " --adopt-target-copy"},
-			[]string{"No lv command"})
+			[]string{"No `lv` command"})
 		// `lv host fence-confirm src-host`, as it records it.
 		if err := corrosion.RecordFenceWithState(ctx, r.src.db,
 			corrosion.FenceLogRecord{ID: "fc-src", HostName: "src-host", Method: "manual", Result: "manual-confirmed"}, "fenced"); err != nil {
@@ -140,6 +144,9 @@ func TestSettleFailedSourceMigrations_FirmwareVMIsHeldForTheDoctor(t *testing.T)
 		if _, ok, _ := fwmig.New(r.dst.dataDir).GetHold(fwlVM); ok {
 			t.Error("the target's hold is still there after the adoption")
 		}
+		if detail, open := unresolvedDetail(t, r.src, fwlVM); open {
+			t.Fatalf("vm.migration_unresolved is still open after the adoption left one copy, on dst-host: %s", detail)
+		}
 	}
 
 	t.Run("unreachable/no_lv_command_while_both_are_down", func(t *testing.T) {
@@ -147,7 +154,7 @@ func TestSettleFailedSourceMigrations_FirmwareVMIsHeldForTheDoctor(t *testing.T)
 		withMigratingInventory(t, func(context.Context, string) (runtimeInventory, error) {
 			return runtimeInventory{}, errors.New("connection refused")
 		})
-		want := []string{"cannot be asked", "No lv command can start", "both down", "Bring one of them back",
+		want := []string{"cannot be asked", "No `lv` command starts it", "both down", "Bring dst-host back", "Or bring src-host back",
 			"lv host fence-confirm dst-host", "lv start " + fwlVM}
 		held(t, r, settle(t, r), want, []string{"--adopt-target-copy", "goes on with"})
 		// The target powered off, its guest with it, and confirmed so. The
@@ -162,7 +169,8 @@ func TestSettleFailedSourceMigrations_FirmwareVMIsHeldForTheDoctor(t *testing.T)
 		if d := settle(t, r); d.Verdict != failover.MigratingRecover {
 			t.Fatalf("decision %+v once dst-host is proven off, want the recovery to go on", d)
 		}
-		if detail, open := unresolvedDetail(t, r.src, fwlVM); !open || !strings.Contains(detail, "No lv command can start") {
+		if detail, open := unresolvedDetail(t, r.src, fwlVM); !open || !strings.Contains(detail, "proven powered off") ||
+			!strings.Contains(detail, "No `lv` command starts it while src-host is down") {
 			t.Fatalf("condition open %v, detail %q: it must stay, saying what brings the VM back", open, detail)
 		}
 	})
@@ -175,7 +183,7 @@ func TestSettleFailedSourceMigrations_FirmwareVMIsHeldForTheDoctor(t *testing.T)
 	})
 	t.Run("running/no_lv_command_then_suspend", func(t *testing.T) {
 		r := rig(t, libvirtfake.StateRunning)
-		held(t, r, settle(t, r), []string{"No lv command", "virsh suspend " + fwlVM}, []string{"lv host fence-confirm"})
+		held(t, r, settle(t, r), []string{"No `lv` command", "virsh suspend " + fwlVM}, []string{"lv host fence-confirm"})
 		r.dstFake.SetState(fwlVM, libvirtfake.StatePaused) // `virsh suspend` on dst-host
 		adoptPaused(t, r)
 	})
@@ -190,7 +198,7 @@ func TestSettleFailedSourceMigrations_FirmwareVMIsHeldForTheDoctor(t *testing.T)
 	})
 	t.Run("shut_off/no_lv_command_then_start_paused", func(t *testing.T) {
 		r := rig(t, libvirtfake.StateShutdown)
-		held(t, r, settle(t, r), []string{"No lv command", "virsh start --paused " + fwlVM}, []string{"lv host fence-confirm"})
+		held(t, r, settle(t, r), []string{"No `lv` command", "virsh start --paused " + fwlVM}, []string{"lv host fence-confirm"})
 		r.dstFake.SetState(fwlVM, libvirtfake.StatePaused) // `virsh start --paused` on dst-host
 		adoptPaused(t, r)
 	})

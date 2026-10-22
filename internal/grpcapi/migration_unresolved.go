@@ -20,8 +20,10 @@ import (
 
 // condMigrationUnresolved names a VM whose row a drain left migrating: its
 // live move ended without libvirt's answer and the guest was not running on
-// the source, so it may run on the target. Raised by that drain; resolved by
-// `lv doctor repair-owner` and `lv stop`, which settle the row.
+// the source, so it may run on the target. Raised by that drain (and by
+// failover's hold of such a row); resolved by `lv doctor repair-owner` and
+// `lv stop`, which settle the row, and by any other ending that settles it
+// (ResolveSettledMigrationsOnce).
 const condMigrationUnresolved = "vm.migration_unresolved"
 
 // migrationUnresolvedEvidence is vm.migration_unresolved's evidence.
@@ -89,6 +91,88 @@ func (s *Server) resolveMigrationUnresolved(ctx context.Context, vm string) {
 		}
 	}
 	s.setConditionOf(ctx, drainEvaluator, condMigrationUnresolved, "vm", vm, nil, false, corrosion.SeverityCritical, "")
+}
+
+// migrationSettled reports whether row, the VM's row now, settles a
+// vm.migration_unresolved whose evidence names source: the row no longer
+// records the VM migrating on source (and, on the host it names, no live
+// firmware move of it is still marked: resolveMigrationUnresolvedIfSettled). Each ending that leaves one copy of the
+// guest writes such a row: a re-point or repair-owner records it where it
+// runs, a firmware move's doctor or fence resolution records it on the host
+// whose copy it took (stopped or running), a stop records it stopped.
+func migrationSettled(row *corrosion.VMRecord, source string) bool {
+	return row != nil && !(row.State == "migrating" && row.HostName == source)
+}
+
+// resolveMigrationUnresolvedIfSettled resolves vm's vm.migration_unresolved
+// when its row, read now, is settled (migrationSettled). Reports whether it
+// resolved it.
+func (s *Server) resolveMigrationUnresolvedIfSettled(ctx context.Context, vm string) bool {
+	if s.db == nil {
+		return false
+	}
+	c, ok, err := corrosion.GetHealthCondition(ctx, s.db, drainEvaluator, condMigrationUnresolved, "vm", vm)
+	if err != nil || !ok || c.Lifecycle == corrosion.ConditionResolved {
+		return false
+	}
+	var ev migrationUnresolvedEvidence
+	if json.Unmarshal([]byte(c.Evidence), &ev) != nil {
+		return false
+	}
+	row, err := corrosion.GetVM(ctx, s.db, vm)
+	if err != nil || !migrationSettled(row, ev.Source) {
+		return false
+	}
+	if row.HostName == s.hostName {
+		// A live firmware move still marked here is not settled, whatever
+		// its row says: its recovery may have restored the row while the
+		// move stays parked, the guest's start refused until it resolves.
+		if _, marked, merr := s.fwRecords().GetMarker(vm); marked || merr != nil {
+			return false
+		}
+	}
+	s.resolveMigrationUnresolved(ctx, vm)
+	slog.Info("vm.migration_unresolved: resolved, the VM's row no longer records the move",
+		"vm", vm, "source", ev.Source, "host", row.HostName, "state", row.State)
+	return true
+}
+
+// ResolveSettledMigrationsOnce resolves each open vm.migration_unresolved
+// whose VM's row names this host and is settled (migrationSettled), whatever
+// settled it: an operator's doctor action, a firmware move's own recovery or
+// fence resolution, a re-point, a host-side step the next poll recorded. Only
+// the host the row names judges it, from a replica that has caught up, so a
+// replica holding the condition but an older row cannot resolve it; a VM a
+// move or another action holds is left to the next pass. A deleted VM's
+// condition is `lv rm`'s.
+func (s *Server) ResolveSettledMigrationsOnce(ctx context.Context) {
+	if s.db == nil {
+		return
+	}
+	if ok, _ := s.db.ReplicaCaughtUp(); !ok {
+		return
+	}
+	conds, err := corrosion.ListOpenHealthConditionsByCode(ctx, s.db, drainEvaluator, condMigrationUnresolved)
+	if err != nil {
+		slog.Debug("vm.migration_unresolved: the open conditions cannot be listed", "error", err)
+		return
+	}
+	for _, c := range conds {
+		if c.SubjectKind != "vm" {
+			continue
+		}
+		vm := c.SubjectID
+		row, err := corrosion.GetVM(ctx, s.db, vm)
+		if err != nil || row == nil || row.HostName != s.hostName {
+			continue
+		}
+		unlock, ok := s.tryLockVM(vm)
+		if !ok {
+			continue
+		}
+		s.resolveMigrationUnresolvedIfSettled(ctx, vm)
+		unlock()
+	}
 }
 
 // migrationUnresolved reports whether vm's vm.migration_unresolved is open.
@@ -404,13 +488,18 @@ func (s *Server) settleFailedSourceMigration(ctx, bctx context.Context, vm corro
 		return failover.MigratingDecision{Verdict: failover.MigratingHold, Detail: why + ". " + fix}
 	}
 	recoverVM := func(why string) failover.MigratingDecision {
-		if !firmware {
-			// Failover never restarts a Secure Boot / vTPM VM: its recovery
-			// skips it (its firmware state lives on the source and the
-			// target), so its condition stays, saying what brings it back.
-			s.resolveMigrationUnresolved(ctx, vm.Name)
-		}
+		s.resolveMigrationUnresolved(ctx, vm.Name)
 		return failover.MigratingDecision{Verdict: failover.MigratingRecover, Detail: why}
+	}
+	// notRestarted is a Secure Boot / vTPM VM whose guest runs nowhere
+	// failover could find: the recovery goes on, and skips it, since failover
+	// never restarts one (its firmware state lives on the source and the
+	// target). Its condition is raised again, saying what brings it back.
+	notRestarted := func(why, fix string) failover.MigratingDecision {
+		detail := fmt.Sprintf("%s is recorded migrating on %s, which failed, and %s; failover does not restart it. %s",
+			vm.Name, source, why, fix)
+		s.raiseMigrationUnresolvedFrom(ctx, vm.Name, source, target, detail)
+		return failover.MigratingDecision{Verdict: failover.MigratingRecover, Detail: why + ". " + fix}
 	}
 	if target == "" || target == source {
 		return hold("its record names no target to ask whether the guest runs there",
@@ -418,10 +507,14 @@ func (s *Server) settleFailedSourceMigration(ctx, bctx context.Context, vm corro
 				"`lv doctor repair-owner %s <host>` records it there", vm.Name))
 	}
 	if proven[target] {
+		if firmware {
+			return notRestarted(fmt.Sprintf("its target %s is proven powered off, and %s", target, fwSettledByRecords),
+				firmwareTargetOffAdvice(vm.Name, source, target))
+		}
 		return recoverVM(fmt.Sprintf("its target %s is proven powered off", target))
 	}
 	if firmware {
-		return s.settleFirmwareMigration(ctx, bctx, vm, source, target, answers[target], hold, recoverVM)
+		return s.settleFirmwareMigration(ctx, bctx, vm, source, target, answers[target], hold, notRestarted)
 	}
 	a := answers[target]
 	if a.err != nil {
@@ -458,7 +551,7 @@ func (s *Server) settleFailedSourceMigration(ctx, bctx context.Context, vm corro
 	default:
 		return hold(fmt.Sprintf("its target %s holds a domain of it in state %s (a guest paused mid-migration reads so too); "+
 			"a guest that ran there may hold the only data written since the cutover", target, state),
-			fmt.Sprintf("No lv command settles this while %s is down: if the guest should run on %s, start or resume it there "+
+			fmt.Sprintf("No `lv` command settles this while %s is down: if the guest should run on %s, start or resume it there "+
 				"(`virsh start %s` or `virsh resume %s` on %s) and the next poll records it there", source, target, vm.Name, vm.Name, target))
 	}
 }
@@ -474,26 +567,84 @@ func (s *Server) firmwareMoveAdvice(ctx context.Context, vm, source, target stri
 	return fmt.Sprintf("Once %s is powered off, `lv host fence-confirm %s`; then %s", source, source, adopt)
 }
 
+// fwSettledByRecords is why a Secure Boot / vTPM VM's hold is its own.
+const fwSettledByRecords = "it is a Secure Boot / vTPM VM, whose move is settled by its firmware records"
+
+// fwNeverRestarted is why failover never starts a Secure Boot / vTPM VM
+// elsewhere.
+const fwNeverRestarted = "failover never restarts a Secure Boot / vTPM VM, because its NVRAM and TPM state live on its source and its target"
+
+// firmwareSourceReturnsAdvice is what happens to a Secure Boot / vTPM VM's
+// move, recorded from source to target, once source comes back, by what
+// target holds; each step is the one a test takes to one running copy
+// (TestFailedFirmwareSource_*).
+func firmwareSourceReturnsAdvice(vm, source, target string) string {
+	return fmt.Sprintf("When %[2]s comes back, its daemon takes the move up from its own records and asks %[3]s. "+
+		"If %[3]s holds the guest, the move finishes there and %[1]s runs on %[3]s. "+
+		"If %[3]s holds no copy, the move parks as firmware_migration_source_state_suspect; "+
+		"`lv doctor firmware-move %[1]s --accept-source --acknowledge-rollback` then `lv start %[1]s` start it on %[2]s "+
+		"from its own firmware state (a move that had not reached libvirt's migration is undone instead, and `lv start %[1]s` "+
+		"alone starts it). While %[3]s does not answer, the move stays parked as firmware_migration_target_unreachable, "+
+		"and `lv doctor firmware-move %[1]s` shows the phase it parked from: from prepared, `lv host fence-confirm %[3]s` "+
+		"once %[3]s is powered off resolves it, recording %[1]s stopped on %[2]s, and `lv start %[1]s` starts it; "+
+		"from cutover, no `lv` command handles it yet and a fence of %[3]s does not resolve it, so only %[3]s answering again settles it",
+		vm, source, target)
+}
+
+// firmwareTargetDownAdvice settles a Secure Boot / vTPM VM held because its
+// target does not answer while its source is down.
+func firmwareTargetDownAdvice(vm, source, target string) string {
+	return fmt.Sprintf("No `lv` command starts it while its source %[2]s and its target %[3]s are both down, and none handles "+
+		"this yet: %[4]s. Bring %[3]s back (power it on, or restore its network): the next poll asks it and names the step "+
+		"for what it holds. Or bring %[2]s back. %[5]s",
+		vm, source, target, fwNeverRestarted, firmwareSourceReturnsAdvice(vm, source, target))
+}
+
+// firmwareTargetEmptyAdvice settles a Secure Boot / vTPM VM whose target
+// answered with no domain of it while its source is down: only the source's
+// firmware state is left.
+func firmwareTargetEmptyAdvice(vm, source, target string) string {
+	return fmt.Sprintf("No copy of the guest is on %[3]s, and only %[2]s's firmware state is left. No `lv` command starts it "+
+		"while %[2]s is down, and none handles this yet: %[4]s. Power %[2]s back on: its daemon takes the move up from its "+
+		"own records and asks %[3]s, which holds no copy, so the move parks as firmware_migration_source_state_suspect; "+
+		"`lv doctor firmware-move %[1]s --accept-source --acknowledge-rollback` then `lv start %[1]s` start it on %[2]s from "+
+		"its own firmware state (a move that had not reached libvirt's migration is undone instead, and `lv start %[1]s` "+
+		"alone starts it). If %[2]s cannot come back, its firmware state is lost with it, and no `lv` command handles that",
+		vm, source, target, fwNeverRestarted)
+}
+
+// firmwareTargetOffAdvice settles a Secure Boot / vTPM VM whose target is
+// proven powered off while its source is down.
+func firmwareTargetOffAdvice(vm, source, target string) string {
+	return fmt.Sprintf("No `lv` command starts it while %[2]s is down, and none handles this yet: %[4]s. Power %[2]s back on: "+
+		"its daemon takes the move up from its own records and, with %[3]s not answering, parks it as "+
+		"firmware_migration_target_unreachable; `lv doctor firmware-move %[1]s` shows the phase it parked from. From prepared, "+
+		"the fence of %[3]s resolves it on the daemon's next pass, within a minute, recording %[1]s stopped on %[2]s, and "+
+		"`lv start %[1]s` starts it. From cutover, no `lv` command handles it yet and the fence does not resolve it: "+
+		"only %[3]s answering again settles it: when %[3]s holds the guest, the move commits there and %[1]s runs on %[3]s "+
+		"(%[2]s keeps its own copy of the state until its cleanup can run, firmware_migration_cleanup_failed saying why); "+
+		"when it holds none, the move parks as "+
+		"firmware_migration_source_state_suspect, and "+
+		"`lv doctor firmware-move %[1]s --accept-source --acknowledge-rollback` then `lv start %[1]s` start it on %[2]s",
+		vm, source, target, fwNeverRestarted)
+}
+
 // settleFirmwareMigration decides a Secure Boot / vTPM VM recorded migrating
 // on source toward target. Its move is settled by its firmware records, never
-// by moving the row alone, so it is never re-pointed: it is recovered when
-// the target holds no domain of it, and held otherwise, with the step that
-// settles it picked by what the target holds.
+// by moving the row alone, so it is never re-pointed, and failover never
+// restarts it: a target that holds no domain of it lets the recovery go on
+// (notRestarted, which skips it), and anything else holds it, with the step
+// that settles it picked by what the target holds.
 func (s *Server) settleFirmwareMigration(ctx, bctx context.Context, vm corrosion.VMRecord, source, target string, a targetAnswer,
-	hold func(why, fix string) failover.MigratingDecision, recoverVM func(string) failover.MigratingDecision) failover.MigratingDecision {
-	const fw = "it is a Secure Boot / vTPM VM, whose move is settled by its firmware records"
+	hold, notRestarted func(why, fix string) failover.MigratingDecision) failover.MigratingDecision {
+	const fw = fwSettledByRecords
 	if a.err != nil {
 		return hold(fmt.Sprintf("its target %s cannot be asked whether the guest runs there (%v), and %s", target, a.err, fw),
-			fmt.Sprintf("No lv command can start a Secure Boot / vTPM VM while its source %[1]s and its target %[2]s are both "+
-				"down: failover never restarts one, because its NVRAM and TPM state live on those two hosts. Bring one of them "+
-				"back. When %[2]s answers again, the next poll names the step for the copy %[2]s holds. When %[1]s comes back, "+
-				"its daemon takes the move up from its own records and raises firmware_migration_target_unreachable while %[2]s "+
-				"does not answer; once %[2]s is powered off and `lv host fence-confirm %[2]s` records it, %[1]s resolves the move "+
-				"by fence and records %[3]s stopped there, and `lv start %[3]s` starts it from %[1]s's firmware state",
-				source, target, vm.Name))
+			firmwareTargetDownAdvice(vm.Name, source, target))
 	}
 	if runtimeStateIn(a.inv, corrosion.WorkloadVM, vm.Name) == health.RuntimeAbsent {
-		return recoverVM(fmt.Sprintf("its target %s has no domain of it", target))
+		return notRestarted(fmt.Sprintf("its target %s answered and holds no domain of it, and %s", target, fw),
+			firmwareTargetEmptyAdvice(vm.Name, source, target))
 	}
 	// The inventory reads every domain that is not running as stopped; the
 	// target's firmware records say which.
@@ -520,11 +671,11 @@ func (s *Server) settleFirmwareMigration(ctx, bctx context.Context, vm corrosion
 	case state == "paused":
 		return hold(why, s.firmwareMoveAdvice(ctx, vm.Name, source, target))
 	case state == "running":
-		return hold(why, fmt.Sprintf("No lv command settles a Secure Boot / vTPM VM that runs on its target while its record "+
+		return hold(why, fmt.Sprintf("No `lv` command settles a Secure Boot / vTPM VM that runs on its target while its record "+
 			"names the failed source. On %s, `virsh suspend %s` pauses the guest; the next poll then names the firmware move "+
 			"doctor, whose --adopt-target-copy takes the paused copy, records it on %s and resumes it", target, vm.Name, target))
 	case state == "shutoff":
-		return hold(why, fmt.Sprintf("No lv command settles a Secure Boot / vTPM VM whose copy on its target is shut off while its "+
+		return hold(why, fmt.Sprintf("No `lv` command settles a Secure Boot / vTPM VM whose copy on its target is shut off while its "+
 			"record names the failed source. On %s, `virsh start --paused %s` brings the copy up paused; the next poll then names "+
 			"the firmware move doctor, whose --adopt-target-copy takes the paused copy, records it on %s and resumes it",
 			target, vm.Name, target))
@@ -532,7 +683,7 @@ func (s *Server) settleFirmwareMigration(ctx, bctx context.Context, vm corrosion
 		// Active, and neither running nor paused: pm-suspended, shutting down,
 		// crashed. `virsh start` refuses an active domain, and no host-side
 		// step is known to lead from these to a paused copy safely.
-		return hold(why, fmt.Sprintf("No lv command settles a Secure Boot / vTPM VM whose copy on its target is %s, and no "+
+		return hold(why, fmt.Sprintf("No `lv` command settles a Secure Boot / vTPM VM whose copy on its target is %s, and no "+
 			"host-side step is known to be safe for a copy in that state: contact the litevirt maintainers before acting on it. "+
 			"If the copy on %s comes to run, pause or shut off, the next poll names the step for that state", state, target))
 	}

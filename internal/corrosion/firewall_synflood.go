@@ -183,9 +183,10 @@ var seedFirewallSynfloodBeforeWrite = func() {}
 // (DECISION S-1). It takes the firewall_synflood grant, so it runs only once
 // release_2026_11_v1 has latched, and writes only while no cluster row is
 // recorded (decided in the write's own transaction), the cluster_policies
-// gate is open, and this replica has caught up with a peer or knows no host
-// but hostName (SeedFirewallEnforcement's guard). The row is stamped seedTS, before any real write, so any
-// operator's write outranks it on every replica. It reports whether it
+// gate is open, and this replica has caught up with a peer or has nothing to
+// catch up with (SeedFirewallEnforcement's guard: no host but hostName, or no
+// gossip member and only hosts still joining). The row is stamped seedTS,
+// before any real write, so any operator's write outranks it on every replica. It reports whether it
 // wrote.
 func SeedFirewallSynflood(ctx context.Context, c *Client, g capabilities.FeatureGrant, hostName string) (bool, error) {
 	if err := g.Check(capabilities.FeatureFirewallSynflood); err != nil {

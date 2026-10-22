@@ -7,9 +7,12 @@ import "context"
 // that admitted accepts.
 //
 // A joining host was admitted by `lv host add` and its daemon has never
-// booted: it has written nothing, holds nothing (no placement targets it) and
-// is no gossip member, since a daemon that had booted would have recorded
-// itself 'upgrading' or 'active'. Without the exception a founder that has
+// booted on this admission: it has written nothing, no placement targets it,
+// and it is no gossip member, since a daemon that had booted would have
+// recorded itself 'upgrading' or 'active'. Workloads can still be recorded
+// under a re-admitted name (stopped VMs, restart-same VMs failover holds), but
+// those were already this node's to decide while the name was removed, when
+// it was alone on any count. Without the exception a founder that has
 // never had a peer (whose replica therefore never completes a catch-up) took
 // its own half-admitted second host for a peer the moment `lv host add`
 // wrote the joining row, and was no longer alone. admitted narrows which

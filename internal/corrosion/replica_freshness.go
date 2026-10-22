@@ -177,7 +177,9 @@ func (c *Client) MarkReplicaCaughtUpForTests(peer string) {
 // workload. "Of one" is read from the local hosts table: any other admitted
 // host, reachable or not, means another owner is possible and the gate holds —
 // except a host still joining, while this node has no gossip member
-// (ClusterOfOneBut): its daemon has never booted, so it owns nothing, and a
+// (ClusterOfOneBut): its daemon has never booted on this admission, so it has
+// written nothing this node lacks (see ClusterOfOneBut for a re-admitted
+// name's recorded workloads), and a
 // founder holding its own half-added second host stays a cluster of one.
 // An unreadable hosts table fails closed. A nil caughtUp is unwired and
 // trusted, for tests that do not exercise the gate.

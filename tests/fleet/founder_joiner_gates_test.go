@@ -7,8 +7,8 @@
 // peer, so from `lv host add`'s admission until the new host's daemon booted —
 // for good, when its setup failed — the founder refused every workload
 // mutation and its reconciler's stop sync, and deferred its genesis firewall
-// seeds. A host that is still joining has never booted: it holds nothing and
-// has written nothing, so it is no owner the founder's replica can be behind.
+// seeds. A host that is still joining has never booted on this admission: it
+// has written nothing, so the founder's replica cannot be behind it.
 //
 // The lease mint keeps the refusal: a joining host is a voter, so the founder
 // alone is no voter majority.
@@ -110,17 +110,21 @@ func TestFleet_FounderWithAJoiningHost(t *testing.T) {
 		defer founder.DB.SetMembersForTests(func() []corrosion.PeerInfo { return nil })
 		stillGated(t, "with a gossip peer")
 	})
-	t.Run("a host whose daemon has booted holds every gate", func(t *testing.T) {
-		if err := corrosion.UpdateHostState(ctx, founder.DB, m.Name, "active"); err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			if err := corrosion.UpdateHostState(ctx, founder.DB, m.Name, corrosion.HostStateJoining); err != nil {
+	// A joiner's first boot write records it 'upgrading' (hostboot), then
+	// 'active' once its daemon serves.
+	for _, state := range []string{"upgrading", "active"} {
+		t.Run("a host whose daemon has booted holds every gate/"+state, func(t *testing.T) {
+			if err := corrosion.UpdateHostState(ctx, founder.DB, m.Name, state); err != nil {
 				t.Fatal(err)
 			}
-		}()
-		stillGated(t, "with "+m.Name+" booted")
-	})
+			defer func() {
+				if err := corrosion.UpdateHostState(ctx, founder.DB, m.Name, corrosion.HostStateJoining); err != nil {
+					t.Fatal(err)
+				}
+			}()
+			stillGated(t, "with "+m.Name+" "+state)
+		})
+	}
 	t.Run("another host beside the joining one holds every gate", func(t *testing.T) {
 		if err := corrosion.InsertHost(ctx, founder.DB, corrosion.HostRecord{
 			Name: "node-2", Address: "127.0.0.3", State: "maintenance"}); err != nil {
@@ -139,6 +143,12 @@ func TestFleet_FounderWithAJoiningHost(t *testing.T) {
 		if ok || !strings.Contains(why, "not caught up") {
 			t.Fatalf("LeaseMintClearance = (%v, %q), want refused: %s is a voter, so %s alone is no majority",
 				ok, why, m.Name, founder.Name)
+		}
+		// The refusal names the joining host and the way out of a failed add.
+		for _, want := range []string{"only peers are " + m.Name, "still joining", "lv host rm " + m.Name} {
+			if !strings.Contains(why, want) {
+				t.Errorf("the lease refusal %q does not say %q", why, want)
+			}
 		}
 	})
 

@@ -506,3 +506,63 @@ func TestFenceHeld_AnUnchangedHoldIsNotRewritten(t *testing.T) {
 		t.Fatalf("hold row %+v after a new workload: want it rewritten naming vm/other", row)
 	}
 }
+
+// TestFenceHeld_TheHoldIsOneEntry: the 'offline' a hold records and the
+// ha.fence_held that explains it replicate as ONE mutation_log entry, so no
+// peer holds the state without the condition — a successor would read that
+// host as terminal, and if the holder died between two entries the condition
+// might never reach anyone.
+//
+// Mutation: write the state with UpdateHostStateFrom and the condition on its
+// own — two entries.
+func TestFenceHeld_TheHoldIsOneEntry(t *testing.T) {
+	db, c, _, _ := heldFixture(t, "none")
+	c.run(context.Background())
+	rows, err := db.Query(context.Background(), `SELECT stmts FROM mutation_log`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var withCond, stateAlone int
+	for _, r := range rows {
+		s := r.String("stmts")
+		cond := strings.Contains(s, "INTO health_conditions") && strings.Contains(s, CondFenceHeld)
+		state := strings.Contains(s, `"offline"`) && (strings.Contains(s, "UPDATE hosts SET state") || strings.Contains(s, "host_membership"))
+		switch {
+		case cond && state:
+			withCond++
+		case state:
+			stateAlone++
+		}
+	}
+	if withCond != 1 || stateAlone != 0 {
+		t.Fatalf("entries carrying the hold's state with its condition: %d, without it: %d; want 1 and 0", withCond, stateAlone)
+	}
+	if h, _ := corrosion.GetHost(context.Background(), db, "bad"); h == nil || h.State != "offline" {
+		t.Fatalf("bad = %+v, want offline", h)
+	}
+}
+
+// TestFenceHeld_AFenceSinceTheHoldEndsIt: the successor re-check applies only
+// to a hold this replica has not seen end: once a fence of the host is
+// recorded after the hold was raised, the hold no longer stands, even while
+// its condition is still open here.
+//
+// Mutation: drop the fence-attempt check from fenceHeldStands.
+func TestFenceHeld_AFenceSinceTheHoldEndsIt(t *testing.T) {
+	db, c, _, _ := heldFixture(t, "none")
+	ctx := context.Background()
+	c.run(ctx)
+	if !c.fenceHeldStands(ctx, "bad") {
+		t.Fatal("premise: the hold does not stand")
+	}
+	if err := corrosion.InsertFenceLog(ctx, db, corrosion.FenceLogRecord{
+		ID: "later", HostName: "bad", Method: "ssh", Result: "partial"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, open := fenceHeldRow(t, db, "bad"); !open {
+		t.Fatal("premise: the condition is resolved already")
+	}
+	if c.fenceHeldStands(ctx, "bad") {
+		t.Fatal("a hold with a fence recorded since still stands")
+	}
+}

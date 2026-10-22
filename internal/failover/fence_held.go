@@ -164,15 +164,18 @@ func (c *Coordinator) holdUnneededFence(ctx context.Context, h *corrosion.HostRe
 	if c.fenceHeldDecided != nil {
 		c.fenceHeldDecided(h.Name)
 	}
-	// The condition first: it is what keeps an 'offline' host with no fence
-	// on record out of the terminal-state skip, so a host recorded offline
-	// without it would be cached as handled and never re-checked.
-	if !c.raiseFenceHeld(ctx, h) {
+	// The condition and the 'offline' it explains are one replicated entry
+	// (UpdateHostStateFromWithCondition): a peer that held the state without
+	// the condition would read the host as terminal and cache it as handled,
+	// and if this node died between two entries no survivor might ever get
+	// the condition. A host already offline gets the condition alone.
+	row, write, err := c.fenceHeldCondition(ctx, h)
+	if err != nil {
 		c.mAttempt(PhaseSkip, ResultError, ErrDBError)
 		return true // not fenced, not recorded offline: the next cycle decides again
 	}
 	if h.State != "offline" {
-		applied, err := corrosion.UpdateHostStateFrom(ctx, c.db, h.Name, h.State, "offline")
+		applied, err := corrosion.UpdateHostStateFromWithCondition(ctx, c.db, h.Name, h.State, "offline", row)
 		if err != nil {
 			// No fence ran, and the next cycle judges again.
 			slog.Error("failover: record a host offline whose fence is held", "host", h.Name, "error", err)
@@ -184,6 +187,14 @@ func (c *Coordinator) holdUnneededFence(ctx context.Context, h *corrosion.HostRe
 			// boot): the next cycle decides from the new state.
 			return true
 		}
+		c.noteFenceHeldRaised(h.Name, row)
+	} else if write {
+		if err := corrosion.UpsertHealthCondition(ctx, c.db, row); err != nil {
+			slog.Warn("failover: could not record "+CondFenceHeld, "host", h.Name, "error", err)
+			c.mAttempt(PhaseSkip, ResultError, ErrDBError)
+			return true
+		}
+		c.noteFenceHeldRaised(h.Name, row)
 	}
 	// After the 'offline' write: anything recorded on h before it landed is
 	// visible now.
@@ -210,20 +221,36 @@ func (c *Coordinator) fenceHeld(ctx context.Context, host string) (bool, error) 
 	return ok && row.Lifecycle != corrosion.ConditionResolved, nil
 }
 
-// fenceHeldOpen is fenceHeld with a read error reported as not open.
-func (c *Coordinator) fenceHeldOpen(ctx context.Context, host string) bool {
-	open, err := c.fenceHeld(ctx, host)
-	return err == nil && open
+// fenceHeldStands reports whether host's hold has not ended as this replica
+// sees it: ha.fence_held is open and no fence attempt of the host is recorded
+// since it was raised (resolveFenceHeldSettled's rule). A read error reports
+// false.
+func (c *Coordinator) fenceHeldStands(ctx context.Context, host string) bool {
+	row, ok, err := corrosion.GetHealthCondition(ctx, c.db, RefenceEvaluator, CondFenceHeld, "host", host)
+	if err != nil || !ok || row.Lifecycle == corrosion.ConditionResolved {
+		return false
+	}
+	since, sok := corrosion.ParseUpdatedAt(row.FirstSeen)
+	if !sok {
+		return true
+	}
+	_, at, found, err := c.readNewestFenceAttempt(ctx, host)
+	if err != nil {
+		return false
+	}
+	return !found || at.Before(since)
 }
 
-// raiseFenceHeld writes ha.fence_held for h, naming the workloads left running
-// on it and their policies. It reports whether the condition is recorded.
-func (c *Coordinator) raiseFenceHeld(ctx context.Context, h *corrosion.HostRecord) bool {
+// fenceHeldCondition is the ha.fence_held row for h, naming the workloads
+// left running on it and their policies. write is false when the row is
+// already open with this evidence: a hold can last days, and rewriting the
+// replicated row every cycle would only move its counters.
+func (c *Coordinator) fenceHeldCondition(ctx context.Context, h *corrosion.HostRecord) (row corrosion.HealthCondition, write bool, err error) {
 	ts := c.now().UTC().Format(time.RFC3339)
 	row, ok, err := corrosion.GetHealthCondition(ctx, c.db, RefenceEvaluator, CondFenceHeld, "host", h.Name)
 	if err != nil {
 		slog.Warn("failover: could not read "+CondFenceHeld, "host", h.Name, "error", err)
-		return false
+		return row, false, err
 	}
 	fresh := !ok || row.Lifecycle == corrosion.ConditionResolved
 	if fresh {
@@ -258,23 +285,24 @@ func (c *Coordinator) raiseFenceHeld(ctx context.Context, h *corrosion.HostRecor
 		"still needs it proven off: once it is powered off, `lv host fence-confirm %s`", h.Name, h.Name)
 	b, _ := json.Marshal(fenceHeldEvidence{Detail: detail, Workloads: capList(left), Remedy: remedy})
 	if !fresh && row.Evidence == string(b) && row.Severity == corrosion.SeverityWarning {
-		// Open and unchanged: a hold can last days, and rewriting the
-		// replicated row every cycle would only move its counters.
-		return true
+		return row, false, nil
 	}
 	row.Lifecycle, row.ResolvedAt, row.CleanCount = corrosion.ConditionConfirmed, "", 0
 	row.ObserveCount++
 	row.Evidence = string(b)
 	row.Severity, row.Hosts, row.LastSeen, row.Reporter = corrosion.SeverityWarning, []string{h.Name}, ts, c.hostName
-	if err := corrosion.UpsertHealthCondition(ctx, c.db, row); err != nil {
-		slog.Warn("failover: could not record "+CondFenceHeld, "host", h.Name, "error", err)
-		return false
+	return row, true, nil
+}
+
+// noteFenceHeldRaised logs a hold the first time it is recorded.
+func (c *Coordinator) noteFenceHeldRaised(host string, row corrosion.HealthCondition) {
+	if row.ObserveCount != 1 {
+		return
 	}
-	if fresh {
-		slog.Warn("failover: quorum reached, but nothing on the host needs a fence; recorded offline, not fenced",
-			"host", h.Name, "left_running", strings.Join(capList(left), ","))
-	}
-	return true
+	var ev fenceHeldEvidence
+	_ = json.Unmarshal([]byte(row.Evidence), &ev)
+	slog.Warn("failover: quorum reached, but nothing on the host needs a fence; recorded offline, not fenced",
+		"host", host, "left_running", strings.Join(ev.Workloads, ","))
 }
 
 // resolveFenceHeld resolves host's ha.fence_held, when open, recording by

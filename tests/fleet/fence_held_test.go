@@ -322,3 +322,30 @@ func needsFenceOn(t *testing.T, n *Node, host string) {
 		t.Fatalf("InsertVM %s: %v", name, err)
 	}
 }
+
+// TestFleet_AHoldReplicatesAsOneEntry: on independent replicas, every peer
+// applies the hold's 'offline' and its ha.fence_held together: no peer ever
+// reads the host offline without the condition, which would have it cache the
+// host as terminal. What this pins is that a receiver accepts the combined
+// entry; that it is one entry is TestFenceHeld_TheHoldIsOneEntry's.
+func TestFleet_AHoldReplicatesAsOneEntry(t *testing.T) {
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2610})
+	a, b, victim := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	c.WaitConverged(t, convergeTimeout)
+	fhPutVM(t, a, "mtl", victim.Name, "none")
+	c.WaitConverged(t, convergeTimeout)
+	fhFailVictim(t, victim, a, b)
+	c.WaitConverged(t, convergeTimeout)
+	fences := 0
+	fhCoordinator(a, victim, &fences, "mtl").RunOnce(context.Background())
+	if fences != 0 {
+		t.Fatalf("premise: fenced %d times", fences)
+	}
+	eventually(t, convergeTimeout, b.Name+" to apply the hold", func() bool {
+		h, err := corrosion.GetHost(context.Background(), b.DB, victim.Name)
+		return err == nil && h != nil && h.State == "offline"
+	})
+	if !fhOpen(t, b, victim.Name) {
+		t.Fatalf("%s reads %s offline without its %s", b.Name, victim.Name, fenceHeldCode)
+	}
+}

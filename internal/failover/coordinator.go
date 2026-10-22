@@ -1111,11 +1111,12 @@ func (c *Coordinator) run(ctx context.Context) {
 				// (an operator's, another coordinator's), or its own failed
 				// fence due a retry: the cache must not hide either (lab drill
 				// S5). The ordinary path below re-reads both and decides.
-			case h.State == "offline" && c.fenceHeldOpen(ctx, target):
+			case h.State == "offline" && c.fenceHeldStands(ctx, target):
 				// A held fence (ha.fence_held) whose condition reached this
 				// replica after the 'offline' it records: the two replicate as
 				// separate entries, so this coordinator may have cached the
-				// host as terminal first. The hold is re-decided every cycle.
+				// host as terminal first. The hold is re-decided every cycle
+				// until a fence of the host is recorded since it was raised.
 			default:
 				continue
 			}

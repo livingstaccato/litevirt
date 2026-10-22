@@ -102,21 +102,17 @@ const healthConditionCreatedAt = "1970-01-01T00:00:00Z"
 // UpsertHealthCondition writes a condition's full current state. The caller (the
 // evaluator) has already decided the lifecycle transition; this persists it.
 func UpsertHealthCondition(ctx context.Context, c *Client, h HealthCondition) error {
-	if h.Evaluator == "" || h.Code == "" || h.SubjectKind == "" {
-		return fmt.Errorf("corrosion: health condition requires evaluator, code and subject_kind (got %q/%q/%q)",
-			h.Evaluator, h.Code, h.SubjectKind)
+	params, err := healthConditionParams(h, c.NowTS())
+	if err != nil {
+		return err
 	}
-	hosts := ""
-	if len(h.Hosts) > 0 {
-		b, err := json.Marshal(h.Hosts)
-		if err != nil {
-			return err
-		}
-		hosts = string(b)
-	}
-	now := c.NowTS()
-	return c.Execute(ctx,
-		`INSERT INTO health_conditions (evaluator, code, subject_kind, subject_id,
+	return c.Execute(ctx, upsertHealthConditionSQL, params...)
+}
+
+// upsertHealthConditionSQL is UpsertHealthCondition's statement, shared with
+// UpdateHostStateFromWithCondition, which commits it in one entry with a host
+// state.
+const upsertHealthConditionSQL = `INSERT INTO health_conditions (evaluator, code, subject_kind, subject_id,
 		   lifecycle, severity, hosts, evidence, observe_count, clean_count,
 		   first_seen, last_seen, confirmed_at, resolved_at, reporter,
 		   created_at, updated_at)
@@ -134,11 +130,28 @@ func UpsertHealthCondition(ctx context.Context, c *Client, h HealthCondition) er
 		   resolved_at = excluded.resolved_at,
 		   reporter = excluded.reporter,
 		   updated_at = excluded.updated_at,
-		   deleted_at = NULL`,
+		   deleted_at = NULL`
+
+// healthConditionParams are upsertHealthConditionSQL's parameters for h,
+// stamped updated_at now (the caller's Client.NowTS()).
+func healthConditionParams(h HealthCondition, now string) ([]interface{}, error) {
+	if h.Evaluator == "" || h.Code == "" || h.SubjectKind == "" {
+		return nil, fmt.Errorf("corrosion: health condition requires evaluator, code and subject_kind (got %q/%q/%q)",
+			h.Evaluator, h.Code, h.SubjectKind)
+	}
+	hosts := ""
+	if len(h.Hosts) > 0 {
+		b, err := json.Marshal(h.Hosts)
+		if err != nil {
+			return nil, err
+		}
+		hosts = string(b)
+	}
+	return []interface{}{
 		h.Evaluator, h.Code, h.SubjectKind, h.SubjectID,
 		h.Lifecycle, h.Severity, hosts, h.Evidence, h.ObserveCount, h.CleanCount,
 		h.FirstSeen, h.LastSeen, nullIfEmpty(h.ConfirmedAt), nullIfEmpty(h.ResolvedAt), h.Reporter,
-		healthConditionCreatedAt, now)
+		healthConditionCreatedAt, now}, nil
 }
 
 // GetHealthCondition reads one condition by identity; ok=false when absent.

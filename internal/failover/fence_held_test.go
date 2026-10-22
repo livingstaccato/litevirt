@@ -194,6 +194,24 @@ func TestFenceHeld_WorkWaitingOnTheFenceStillFences(t *testing.T) {
 				t.Fatal(err)
 			}
 		},
+		"pending VM": func(t *testing.T, db *corrosion.Client) {
+			if err := db.Execute(context.Background(), `UPDATE vms SET state = 'pending' WHERE name = 'mtl'`); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"starting VM": func(t *testing.T, db *corrosion.Client) {
+			if err := db.Execute(context.Background(), `UPDATE vms SET state = 'starting' WHERE name = 'mtl'`); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"relocating container": func(t *testing.T, db *corrosion.Client) {
+			if err := corrosion.UpsertContainer(context.Background(), db, corrosion.ContainerRecord{
+				HostName: "bad", Name: "web", State: "relocating", Image: "alpine:3.19",
+				CPULimit: 1, MemMiB: 128, Project: "p1", OnHostFailure: "none",
+			}); err != nil {
+				t.Fatal(err)
+			}
+		},
 		"stopped VM on shared storage": func(t *testing.T, db *corrosion.Client) {
 			if err := corrosion.InsertVM(context.Background(), db, corrosion.VMRecord{
 				Name: "sv", HostName: "bad", State: "stopped", StateDetail: "operator-stop",
@@ -310,6 +328,11 @@ func TestFenceHeld_AnUnreachedFenceAfterAHoldRecoversNothing(t *testing.T) {
 			db, c, _, fm := heldFixture(t, map[bool]string{true: "none", false: "restart-any"}[held])
 			ctx := context.Background()
 			c.SetFencer(unreached)
+			// The unsafe_auto_failover opt-out does not lift this refusal:
+			// it waives the safe-fence policy, not the pause gap.
+			if err := corrosion.SetHostLabel(ctx, db, "bad", corrosion.LabelUnsafeAutoFailover, "true"); err != nil {
+				t.Fatal(err)
+			}
 			if held {
 				c.run(ctx)
 				if h, _ := corrosion.GetHost(ctx, db, "bad"); h == nil || h.State != "offline" {
@@ -412,5 +435,74 @@ func TestFenceHeld_AFenceThatDidNotRunLeavesTheHostRechecked(t *testing.T) {
 	c.run(ctx)
 	if len(*fenced) != 1 {
 		t.Fatalf("fenced %v after the aborted fence, want bad once", *fenced)
+	}
+}
+
+// TestFenceHeld_ASuccessorThatSawTheStateFirstRechecks: a successor's replica
+// holds the hold's 'offline' before its ha.fence_held (two entries, either
+// order), so it caches bad as terminal. Once the condition arrives the cache
+// is dropped, and a VM made recoverable since is fenced for.
+//
+// Mutation: drop the fenceHeldOpen case from the handled branch — the
+// successor never fences bad.
+func TestFenceHeld_ASuccessorThatSawTheStateFirstRechecks(t *testing.T) {
+	db, c, _, _ := heldFixture(t, "none")
+	ctx := context.Background()
+	c.run(ctx)
+	cond, open := fenceHeldRow(t, db, "bad")
+	if !open {
+		t.Fatal("premise: no hold")
+	}
+	// The successor's replica: the state, not yet the condition.
+	if err := db.Execute(ctx, `DELETE FROM health_conditions WHERE code = ?`, CondFenceHeld); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Execute(ctx, `DELETE FROM leader_election`); err != nil {
+		t.Fatal(err)
+	}
+	var fenced []string
+	succ := NewCoordinator("coordinator", db)
+	succ.SetFencer(recordingFencer(&fenced))
+	succ.run(ctx)
+	if !succ.fenced["bad"] {
+		t.Fatal("premise: the successor did not cache the offline host without its condition")
+	}
+	// The condition arrives; then mtl becomes recoverable.
+	if err := corrosion.UpsertHealthCondition(ctx, db, cond); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Execute(ctx, `UPDATE vms SET spec = ? WHERE name = 'mtl'`, `{"on_host_failure":"restart-any"}`); err != nil {
+		t.Fatal(err)
+	}
+	succ.run(ctx)
+	if len(fenced) != 1 {
+		t.Fatalf("the successor fenced %v, want bad once", fenced)
+	}
+}
+
+// TestFenceHeld_AnUnchangedHoldIsNotRewritten: a hold that lasts does not
+// rewrite its replicated row every cycle.
+//
+// Mutation: drop the unchanged early return in raiseFenceHeld — the row is
+// rewritten each cycle.
+func TestFenceHeld_AnUnchangedHoldIsNotRewritten(t *testing.T) {
+	db, c, _, _ := heldFixture(t, "none")
+	ctx := context.Background()
+	for i := 0; i < 4; i++ {
+		c.run(ctx)
+	}
+	row, open := fenceHeldRow(t, db, "bad")
+	if !open || row.ObserveCount != 1 {
+		t.Fatalf("hold row %+v: want open, written once (observe_count 1)", row)
+	}
+	// A change in what is left there is written.
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "other", HostName: "bad", State: "running", Spec: `{"on_host_failure":"none"}`,
+	}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	c.run(ctx)
+	if row, _ := fenceHeldRow(t, db, "bad"); row.ObserveCount != 2 || !strings.Contains(row.Evidence, "vm/other") {
+		t.Fatalf("hold row %+v after a new workload: want it rewritten naming vm/other", row)
 	}
 }

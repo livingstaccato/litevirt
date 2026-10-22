@@ -1500,8 +1500,9 @@ longer held (a quorum of voters sees it answer, or its pause is over).
 Evaluator `failover`, subject the host, severity warning, written by the
 failover lease holder. A quorum of voters fails the host, but nothing on it
 needs a fence: no workload a failover would move (every VM and container on it
-is `on_host_failure: none`, stopped, or otherwise left in place), no workload
-recorded mid-transfer, no container relocation marker and no pending recovery
+is `on_host_failure: none`, stopped on a host-local disk, or otherwise left in
+place; a VM stopped on shared storage with a policy is moved off still stopped,
+and does need the fence), no workload recorded mid-transfer, no container relocation marker and no pending recovery
 proof. Fencing it would power off what nothing restarts elsewhere, so the host
 is recorded `offline`, **not fenced**, and no `fencing_log` row is written.
 Whatever runs there keeps running. `lv status` shows the host `offline`; the
@@ -1513,7 +1514,9 @@ the next cycle fences it as any failed host is fenced, and recovers its
 workloads. If that fence is a best-effort one that did not reach the host, it
 recovers nothing until `lv host fence-confirm <host>`: what became recoverable
 during the hold was never paused by the host's partition pause, so it may
-still run there. An `offline` host whose fence is held is not proven off: a move off
+still run there. This holds even for a host labelled
+`litevirt.unsafe_auto_failover=true`: that label opts out of the safe-fence
+policy, not out of this. An `offline` host whose fence is held is not proven off: a move off
 it still needs `lv host fence-confirm <host>` once it is powered off. Bring its
 daemon back and it returns to `active` once a quorum sees it healthy. The
 condition resolves when the host leaves `offline` (back `active`, or fenced),

@@ -261,6 +261,10 @@ func TestRecoverHosts_OfflineAfterASpuriousUnverifiedFenceRecovers(t *testing.T)
 	}); err != nil {
 		t.Fatalf("InsertHost: %v", err)
 	}
+	// A workload that needs the fence and is never moved off: a host with
+	// nothing to recover is held, not fenced, and there would be no spurious
+	// fence to recover from.
+	needsFence(t, db, "spur")
 	c := newTestCoordinator("coordinator", db)
 	c.Gate = fenceStateLatched()
 	c.SetFencer(fencerReturning("ssh", true))

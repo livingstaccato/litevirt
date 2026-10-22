@@ -71,6 +71,8 @@ func TestFailover_BestEffort_LegacyProceedsPreFlip(t *testing.T) {
 		t.Fatal(err)
 	}
 	downObservers(t, db, "bad", "h1", "h2", "h3")
+	// A workload that needs the fence: what this test pins is the fence.
+	needsFence(t, db, "bad")
 
 	c := NewCoordinator("coordinator", db)
 	c.SetFencer(bestEffortFencer())
@@ -162,6 +164,8 @@ func TestFailover_BestEffort_OptOutProceedsUnderPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	downObservers(t, db, "bad", "h1", "h2", "h3")
+	// A workload that needs the fence: what this test pins is the fence.
+	needsFence(t, db, "bad")
 
 	c := NewCoordinator("coordinator", db)
 	c.SetFencer(bestEffortFencer())

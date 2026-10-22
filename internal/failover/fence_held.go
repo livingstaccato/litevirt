@@ -210,6 +210,12 @@ func (c *Coordinator) fenceHeld(ctx context.Context, host string) (bool, error) 
 	return ok && row.Lifecycle != corrosion.ConditionResolved, nil
 }
 
+// fenceHeldOpen is fenceHeld with a read error reported as not open.
+func (c *Coordinator) fenceHeldOpen(ctx context.Context, host string) bool {
+	open, err := c.fenceHeld(ctx, host)
+	return err == nil && open
+}
+
 // raiseFenceHeld writes ha.fence_held for h, naming the workloads left running
 // on it and their policies. It reports whether the condition is recorded.
 func (c *Coordinator) raiseFenceHeld(ctx context.Context, h *corrosion.HostRecord) bool {
@@ -251,6 +257,11 @@ func (c *Coordinator) raiseFenceHeld(ctx context.Context, h *corrosion.HostRecor
 	remedy := fmt.Sprintf("bring %s's daemon back: it returns to active once a quorum sees it healthy. A move off it "+
 		"still needs it proven off: once it is powered off, `lv host fence-confirm %s`", h.Name, h.Name)
 	b, _ := json.Marshal(fenceHeldEvidence{Detail: detail, Workloads: capList(left), Remedy: remedy})
+	if !fresh && row.Evidence == string(b) && row.Severity == corrosion.SeverityWarning {
+		// Open and unchanged: a hold can last days, and rewriting the
+		// replicated row every cycle would only move its counters.
+		return true
+	}
 	row.Lifecycle, row.ResolvedAt, row.CleanCount = corrosion.ConditionConfirmed, "", 0
 	row.ObserveCount++
 	row.Evidence = string(b)

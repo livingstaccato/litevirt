@@ -380,6 +380,11 @@ var frozenReleaseFeatures = map[string][]Feature{
 	Release202612V1: {
 		"fence_ssh",
 	},
+	// Not shipped yet (the rc2 train): corrected only by one reviewed change
+	// here and in releaseFeatures together.
+	Release202701V1: {
+		"project_adoption",
+	},
 }
 
 // TestReleaseFeatureSetIsFrozen (m6): every release token's declared features
@@ -483,5 +488,33 @@ func TestNextReleaseTokenRegistered(t *testing.T) {
 	}
 	if info, ok := LookupFeature(FeatureFenceSSH); !ok || info.Token != tok {
 		t.Errorf("fence_ssh is declared under %q, want %s", info.Token, tok)
+	}
+}
+
+// TestRc2ReleaseTokenRegistered pins release_2027_01_v1's registration, as
+// TestNextReleaseTokenRegistered pins release_2026_12_v1's: its name is
+// written into every node's data directory, its one feature is
+// project_adoption, and a rollback below it lands on a build that reads its
+// marker's rule.
+func TestRc2ReleaseTokenRegistered(t *testing.T) {
+	const tok = "release_2027_01_v1"
+	if Release202701V1 != tok {
+		t.Fatalf("Release202701V1 = %q, want %q: the marker name is frozen", Release202701V1, tok)
+	}
+	if !slices.Contains(Supported(), tok) || !slices.Contains(All(), tok) || !Mandatory(tok) || !ReplicationGated(tok) {
+		t.Fatalf("%s: supported=%v all=%v mandatory=%v replicationGated=%v; want all true", tok,
+			slices.Contains(Supported(), tok), slices.Contains(All(), tok), Mandatory(tok), ReplicationGated(tok))
+	}
+	if RollbackRule(tok) != RollbackSafeIfUnused || !slices.Contains(ReleaseTokens(), tok) {
+		t.Fatalf("%s: rollback rule %q, release tokens %v", tok, RollbackRule(tok), ReleaseTokens())
+	}
+	if !RuleHonouredBelow(tok) {
+		t.Errorf("RuleHonouredBelow(%s) = false; the build below it is a release-token build", tok)
+	}
+	if info, ok := LookupFeature(FeatureProjectAdoption); !ok || info.Token != tok || string(FeatureProjectAdoption) != "project_adoption" {
+		t.Errorf("project_adoption is declared as %q under %q, want project_adoption under %s", FeatureProjectAdoption, info.Token, tok)
+	}
+	if ReleaseToken != Release202611V1 {
+		t.Errorf("ReleaseToken = %s: it is release_2026_11_v1's readiness for its own shapes, not the newest token", ReleaseToken)
 	}
 }

@@ -340,10 +340,12 @@ func loadProjectStatesTx(ctx context.Context, tx *sql.Tx) (map[string]*projectSt
 // outside every project, or under one with no live row, is never held.
 //
 //   - untagged (granted before the latch, or by a host that had not latched),
-//     or tagged none (granted while no row of the project existed): grants
-//     only while the project holds its pre-latch incarnation. A first birth
-//     carries the pre-grants its creator holds over to itself
-//     (carryPreGrants); one it did not hold is held;
+//     tagged none (granted while no row of the project existed) or tagged
+//     pre (granted while the project held ""): grants only while the
+//     project holds its pre-latch incarnation, "" or its adopted one
+//     (projectPreIncarnation, project_adoption.go). A first birth carries
+//     the pre-grants its creator holds over to itself (carryPreGrants); one
+//     it did not hold is held;
 //   - tagged with an incarnation: grants only on it.
 func projectBindingHeld(b RoleBindingRecord, states map[string]*projectState) bool {
 	proj, ok := projectOfRBACPath(b.Path)
@@ -357,16 +359,23 @@ func projectBindingHeld(b RoleBindingRecord, states map[string]*projectState) bo
 	tag, tagged := projectBindingTag(b.ID)
 	for _, inc := range st.live {
 		switch {
-		case !tagged || tag == projectTagNone:
-			if inc == "" {
+		case !tagged || tag == projectTagNone || tag == projectTagPre:
+			if projectPreIncarnation(proj, inc) {
 				return false
 			}
-		case tag == projectIncarnationTag(inc):
+		case inc != "" && tag == inc:
 			return false
 		}
 	}
 	return true
 }
+
+// defaultProjectIncarnation is the identity of the default project, which
+// has no projects row by design and can never be deleted or re-created: its
+// one lifetime is this constant. It is never stored in projects, but
+// dependent records (automation) store it, so its bytes are pinned by a
+// test.
+const defaultProjectIncarnation = "default"
 
 // projectParentVerdict is what a project's rows say of a parent reference
 // (name, incarnation) held by a dependent record. The zero value is no
@@ -376,7 +385,8 @@ type projectParentVerdict int
 const (
 	projectParentUnknown projectParentVerdict = iota
 	// projectParentCurrent: exactly one live spelling of the canonical name,
-	// spelled as asked, holding the incarnation asked.
+	// spelled as asked, holding the incarnation asked; or the default
+	// project asked with defaultProjectIncarnation.
 	projectParentCurrent
 	// projectParentConflict: live, but not as asked: another incarnation, the
 	// name live under another spelling, or more than one live spelling
@@ -384,9 +394,12 @@ const (
 	projectParentConflict
 	// projectParentAbsent: no live row of the canonical name.
 	projectParentAbsent
-	// projectParentImplicit: the default project (or the root), which has no
-	// row by design and is never deleted or re-created.
-	projectParentImplicit
+	// projectParentUnadopted: the one live spelling still holds the
+	// pre-latch incarnation "", which is not a recordable identity. Retry
+	// later: the adoption pass gives it its adopted incarnation
+	// (project_adoption.go), unless enforcement.project_adoption is false on
+	// every host. Never a sign the parent is gone.
+	projectParentUnadopted
 )
 
 func (v projectParentVerdict) String() string {
@@ -397,8 +410,8 @@ func (v projectParentVerdict) String() string {
 		return "conflict"
 	case projectParentAbsent:
 		return "absent"
-	case projectParentImplicit:
-		return "implicit"
+	case projectParentUnadopted:
+		return "unadopted"
 	}
 	return "unknown"
 }
@@ -407,38 +420,60 @@ func (v projectParentVerdict) String() string {
 // project rows in tx. It only reads, every project row, so it is safe inside a
 // caller's guarded transaction and needs no gate.
 //
-// Equality only: incarnations are random, so one is never newer or older than
-// another, and a mismatch is a Conflict, whatever arrives later. inc == "" is
-// the pre-latch incarnation, a value like any other; it names the lifetime
-// live at the latch, and a pre-latch delete and revive also keeps it, so it
-// cannot tell those lifetimes apart.
+// Equality only: incarnations are random (or, adopted, a function of the
+// name), so one is never newer or older than another, and a mismatch is a
+// Conflict, whatever arrives later. A live row still holding "" is Unadopted
+// whatever inc is asked; an adopted row asked with "" is a Conflict.
+//
+// The default project ("", "/", "_default" or "/_default") is Current for
+// defaultProjectIncarnation and a Conflict otherwise, never Absent. "/" is
+// accepted only as the canonical form of "", which stored rows use for the
+// default project; the root itself is not a project, and the two have one
+// canonical form (safename.CanonicalProjectName).
 //
 // A tombstone and no row at all are both Absent: neither is a live parent, and
 // a tombstone's incarnation never makes one current. They differ only in what
-// comes next: a create over a tombstone is a rebirth (a fresh incarnation once
-// latched; with the gate off, a revive that keeps ""), a create over no row a
+// comes next: a create over a tombstone is a rebirth, a create over no row a
 // first birth. Production never removes a project row, so no row means the
 // name was never created here (or has not replicated yet).
 func projectParentVerdictTx(ctx context.Context, tx *sql.Tx, name, inc string) (projectParentVerdict, error) {
+	cur, v, err := projectParentIncarnationTx(ctx, tx, name)
+	if err != nil || v != projectParentCurrent {
+		return v, err
+	}
+	if cur != inc {
+		return projectParentConflict, nil
+	}
+	return projectParentCurrent, nil
+}
+
+// projectParentIncarnationTx is the identity a dependent record of project
+// name records: the live incarnation of its one live spelling, spelled as
+// asked (Current), or defaultProjectIncarnation for the default project
+// (Current). Otherwise it returns "" with Unadopted, Conflict or Absent (or
+// Unknown and the error of a name with no canonical form).
+func projectParentIncarnationTx(ctx context.Context, tx *sql.Tx, name string) (string, projectParentVerdict, error) {
 	canon, err := safename.CanonicalProjectName(name)
 	if err != nil {
-		return projectParentUnknown, err
+		return "", projectParentUnknown, err
 	}
 	if canon == "/" || canon == "/"+DefaultProject {
-		return projectParentImplicit, nil
+		return defaultProjectIncarnation, projectParentCurrent, nil
 	}
 	states, err := loadProjectStatesTx(ctx, tx)
 	if err != nil {
-		return projectParentUnknown, err
+		return "", projectParentUnknown, err
 	}
 	st := states[canon]
 	switch {
 	case st == nil || len(st.live) == 0:
-		return projectParentAbsent, nil
-	case len(st.live) > 1, st.liveName[0] != name, st.live[0] != inc:
-		return projectParentConflict, nil
+		return "", projectParentAbsent, nil
+	case len(st.live) > 1, st.liveName[0] != name:
+		return "", projectParentConflict, nil
+	case st.live[0] == "":
+		return "", projectParentUnadopted, nil
 	}
-	return projectParentCurrent, nil
+	return st.live[0], projectParentCurrent, nil
 }
 
 // markHeldBindings sets Held on every binding projectBindingHeld holds.
@@ -520,8 +555,12 @@ var ErrNoLiveProject = errors.New("project does not exist")
 // projectQuotaKey is the project_quotas key of a quota set for incarnation
 // inc of project name: the bare name for a project born before the latch
 // (”), as every quota was keyed before, and "<name>~p:<inc>" otherwise.
+//
+// The adopted incarnation is the same lifetime as "" and keys the bare name
+// too (project_adoption.go), so adoption needs no re-key and a late bare-key
+// write still lands on the key that is read.
 func projectQuotaKey(name, inc string) string {
-	if inc == "" {
+	if projectPreIncarnationOfName(name, inc) {
 		return name
 	}
 	return name + projectBindingTagSep + inc
@@ -614,7 +653,19 @@ func (c *Client) projectIncarnationGuardMatches(ctx context.Context, tx *sql.Tx,
 		return false, err
 	}
 	st := states[g.ResourceID]
-	return st != nil && len(st.live) == 0 && containsString(st.dead, g.Incarnation), nil
+	if st == nil || len(st.live) != 0 {
+		return false, nil
+	}
+	// "" and the name's adopted incarnation are one lifetime
+	// (project_adoption.go): a reaper that read either retires a tombstone
+	// holding the other, and a re-created name (r…) is still protected.
+	pre := projectPreIncarnation(g.ResourceID, g.Incarnation)
+	for _, d := range st.dead {
+		if d == g.Incarnation || (pre && projectPreIncarnation(g.ResourceID, d)) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func containsString(list []string, s string) bool {
@@ -736,6 +787,11 @@ func retireOlderProjectGrants(ctx context.Context, tx *sql.Tx, name string) erro
 	if st != nil {
 		for _, inc := range append(append([]string{}, st.live...), st.dead...) {
 			keep[projectIncarnationTag(inc)] = true
+			// The adopted incarnation is the pre-latch lifetime named
+			// (project_adoption.go): its pre-tagged grants stay.
+			if projectPreIncarnation(canon, inc) {
+				keep[projectTagPre] = true
+			}
 		}
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT id, path, updated_at FROM role_bindings
@@ -841,12 +897,13 @@ func createFirstBirth(ctx context.Context, c *Client, p ProjectRecord) (bool, er
 	return true, nil
 }
 
-// projectsDumpDecision keeps a local projects row that carries an
+// projectsDumpDecision keeps a local projects row that carries a born
 // incarnation over an incoming row of a dump without the column. Such a dump
 // comes from a node whose every row has none (withoutUnsetIncarnation): it
 // has never held a birth made after the latch, so its row is of an earlier
-// lifetime of the name, whatever its clock says. Any other row is merged as
-// before.
+// lifetime of the name, whatever its clock says. A local row holding the
+// name's adopted incarnation is the same lifetime as the incoming "" row
+// (project_adoption.go), so it merges by LWW like any other row.
 func projectsDumpDecision(tx *sql.Tx, table syncTable, row []interface{}) (mergeAuthorityDecision, error) {
 	idx := columnIndexMap(table.Columns)
 	if _, ok := idx["incarnation"]; ok {
@@ -860,7 +917,7 @@ func projectsDumpDecision(tx *sql.Tx, table syncTable, row []interface{}) (merge
 	if err != nil {
 		return mergeAuthorityKeepLocal, err
 	}
-	if local != "" {
+	if !projectPreIncarnationOfName(cellStr(row, idx, "name"), local) {
 		return mergeAuthorityKeepLocal, nil
 	}
 	return mergeAuthorityNormal, nil

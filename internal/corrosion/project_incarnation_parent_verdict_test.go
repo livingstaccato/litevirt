@@ -23,8 +23,8 @@ func projectRowForVerdict(t *testing.T, c *Client, name, inc, deletedAt string) 
 // spelling of the canonical name, spelled as asked, holding the incarnation
 // asked; any other live state is Conflict, never "newer". No live row is
 // Absent, a tombstone exactly as no row at all. The default project has no
-// row by design and is Implicit. A pre-latch "" is an incarnation like any
-// other.
+// row by design and is Current only for its constant. A live row still
+// holding "" is Unadopted whatever is asked.
 //
 // Mutations (each red here): tombstones counted as spellings ("tombstone
 // beside the live spelling"); tombstones counted as live ("tombstone only
@@ -56,8 +56,12 @@ func TestProjectParentVerdict_EqualityOnly(t *testing.T) {
 		{"live and equal", []row{{"/acme", incA, ""}}, "/acme", incA, projectParentCurrent, false},
 		{"legacy spelling live and equal", []row{{"acme", incA, ""}}, "acme", incA, projectParentCurrent, false},
 		{"another incarnation", []row{{"/acme", incB, ""}}, "/acme", incA, projectParentConflict, false},
-		{"pre-latch '' asked of ''", []row{{"/acme", "", ""}}, "/acme", "", projectParentCurrent, false},
-		{"marker asked of a '' row", []row{{"/acme", "", ""}}, "/acme", incA, projectParentConflict, false},
+		{"pre-latch '' asked of ''", []row{{"/acme", "", ""}}, "/acme", "", projectParentUnadopted, false},
+		{"marker asked of a '' row", []row{{"/acme", "", ""}}, "/acme", incA, projectParentUnadopted, false},
+		{"adopted asked of a '' row", []row{{"/acme", "", ""}}, "/acme", adoptedProjectIncarnation("/acme"), projectParentUnadopted, false},
+		{"adopted row and its incarnation", []row{{"/acme", adoptedProjectIncarnation("/acme"), ""}}, "/acme", adoptedProjectIncarnation("/acme"), projectParentCurrent, false},
+		{"'' asked of an adopted row", []row{{"/acme", adoptedProjectIncarnation("/acme"), ""}}, "/acme", "", projectParentConflict, false},
+		{"another name's adopted incarnation", []row{{"/acme", adoptedProjectIncarnation("/acme"), ""}}, "/acme", adoptedProjectIncarnation("/other"), projectParentConflict, false},
 		{"'' asked of a marker row", []row{{"/acme", incA, ""}}, "/acme", "", projectParentConflict, false},
 		{"prefix of the incarnation", []row{{"/acme", incA, ""}}, "/acme", incA[:1], projectParentConflict, false},
 		{"two spellings holding the same marker", []row{{"/acme", incA, ""}, {"acme", incA, ""}}, "/acme", incA, projectParentConflict, false},
@@ -69,11 +73,16 @@ func TestProjectParentVerdict_EqualityOnly(t *testing.T) {
 		{"no row", []row{{"/other", incA, ""}}, "/acme", incA, projectParentAbsent, false},
 		{"no row, '' asked", nil, "/acme", "", projectParentAbsent, false},
 		{"child is its own name", []row{{"/acme", incA, ""}}, "/acme/team", incA, projectParentAbsent, false},
-		{"_default with no row", nil, DefaultProject, "", projectParentImplicit, false},
-		{"_default even with a row", []row{{DefaultProject, incB, ""}}, DefaultProject, incA, projectParentImplicit, false},
-		{"/_default", nil, "/" + DefaultProject, incA, projectParentImplicit, false},
-		{"root", nil, "/", "", projectParentImplicit, false},
-		{"empty name", nil, "", "", projectParentImplicit, false},
+		{"_default and its constant", nil, DefaultProject, defaultProjectIncarnation, projectParentCurrent, false},
+		{"_default asked with ''", nil, DefaultProject, "", projectParentConflict, false},
+		{"_default even with a row", []row{{DefaultProject, incB, ""}}, DefaultProject, incB, projectParentConflict, false},
+		{"/_default", nil, "/" + DefaultProject, defaultProjectIncarnation, projectParentCurrent, false},
+		{"/_default asked with another", nil, "/" + DefaultProject, incA, projectParentConflict, false},
+		// "/" is accepted only as the canonical form of "", the default
+		// project in stored rows; the root itself is not a project.
+		{"root, as the canonical form of ''", nil, "/", defaultProjectIncarnation, projectParentCurrent, false},
+		{"empty name", nil, "", defaultProjectIncarnation, projectParentCurrent, false},
+		{"empty name asked with ''", nil, "", "", projectParentConflict, false},
 		{"invalid name", []row{{"/acme", incA, ""}}, "/acme/../x", incA, projectParentUnknown, true},
 	}
 	for _, tc := range cases {

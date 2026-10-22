@@ -635,6 +635,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// still that directory and empty, so a retry of the name can make it
 	// again and nothing put in it since is ever deleted with it.
 	createdSubvol := map[string]*pinnedFile{}
+	// createdSubvolPinErr is why a disk's subvolume could not be held: it
+	// is left once the disk is removed, and named in the create's error.
+	createdSubvolPinErr := map[string]error{}
 	defer func() {
 		for _, pf := range createdDiskFile {
 			pf.release()
@@ -712,12 +715,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	removeSubvol := func(p string, sv *pinnedFile) {
 		dir := filepath.Dir(p)
 		delete(createdSubvol, p)
+		// Released after the rmdir, not before: until then no directory
+		// put at the name can be the one this create made.
+		defer sv.release()
 		if !sv.stillAt(dir) {
-			sv.release()
 			noteUndo("subvolume " + dir + " left: it is no longer the one this create made")
 			return
 		}
-		sv.release()
 		if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
 			slog.Warn("cleanup: failed to remove the disk's btrfs subvolume", "path", dir, "error", err)
 			noteLeft(fmt.Sprintf("subvolume %s (not removed: %v)", dir, err))
@@ -771,6 +775,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			noteUndo("removed disk " + p)
 			if sv := createdSubvol[p]; sv != nil {
 				removeSubvol(p, sv)
+			} else if perr := createdSubvolPinErr[p]; perr != nil {
+				noteLeft(fmt.Sprintf("subvolume %s (it could not be held open to tell it from another directory there: %v)",
+					filepath.Dir(p), perr))
 			}
 		}
 		if s.cleanedUpHook != nil {
@@ -929,9 +936,10 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			}
 			if err == nil {
 				if sub, ok := storage.BtrfsDiskSubvolume(volCfg, spec.Name, d.Name, diskPath); ok {
-					if sv, perr := pinDir(sub); perr == nil {
+					if sv, perr := s.pinMadeDir(sub); perr == nil {
 						createdSubvol[diskPath] = sv
 					} else {
+						createdSubvolPinErr[diskPath] = perr
 						slog.Warn("a failed create will leave this disk's btrfs subvolume: it could not be held open",
 							"path", sub, "error", perr)
 					}

@@ -67,6 +67,16 @@ func (s *Server) pinMade(p string) (*pinnedFile, error) {
 	return pinFile(p)
 }
 
+// pinMadeDir is pinMade for a directory a create just made (pinDir).
+func (s *Server) pinMadeDir(p string) (*pinnedFile, error) {
+	if s.pinFault != nil {
+		if err := s.pinFault(p); err != nil {
+			return nil, err
+		}
+	}
+	return pinDir(p)
+}
+
 // stillAt reports whether the file at p is still the pinned one.
 func (pf *pinnedFile) stillAt(p string) bool {
 	if pf == nil {

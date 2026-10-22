@@ -101,3 +101,63 @@ func TestCreateVM_AFailedCreateLeavesASubvolumeThatHoldsAnotherFile(t *testing.T
 		t.Errorf("the create's error does not name the subvolume it left: %v", err)
 	}
 }
+
+// The subvolume is removed only while it is still the one this create made:
+// here it is swapped out from under the create (moved aside, another made at
+// its name, and the create's disk moved into that one, keeping its inode, so
+// the disk is still this create's and is removed). The directory now at the
+// name is not this create's and must never be removed, even empty.
+//
+// Mutation: skip the subvolume's identity check (stillAt) — the other
+// directory, empty once the disk is removed, is rmdir'ed, red.
+func TestCreateVM_AFailedCreateNeverRemovesASubvolumeSwappedIn(t *testing.T) {
+	s, fake, root := btrfsPoolServer(t)
+	const name = "bsvs"
+	subvol := filepath.Join(root, name+"-data")
+	aside := subvol + ".aside"
+	disk := name + "-data.qcow2"
+	fake.FailStartDomain = func(string) error {
+		if err := os.Rename(subvol, aside); err != nil {
+			t.Errorf("setup: move the subvolume aside: %v", err)
+		}
+		if err := os.Mkdir(subvol, 0o755); err != nil {
+			t.Errorf("setup: make another at its name: %v", err)
+		}
+		if err := os.Rename(filepath.Join(aside, disk), filepath.Join(subvol, disk)); err != nil {
+			t.Errorf("setup: move the disk into it: %v", err)
+		}
+		return errors.New("start failed")
+	}
+	if _, err := s.CreateVM(adminCtx(), btrfsCreateRequest(t, s, name)); err == nil {
+		t.Fatal("the create was meant to fail")
+	}
+	if _, err := os.Lstat(filepath.Join(subvol, disk)); !os.IsNotExist(err) {
+		t.Fatalf("setup: the create's own disk was not removed, so the subvolume check never ran: %v", err)
+	}
+	if fi, err := os.Lstat(subvol); err != nil || !fi.IsDir() {
+		t.Errorf("the failed create removed a subvolume it did not make: %v", err)
+	}
+}
+
+// A subvolume that could not be held open is left once its disk is removed,
+// and named in the create's error: a retry of the name meets it.
+//
+// Mutation: only log the pin failure (no leftover) — the error does not name
+// it, red.
+func TestCreateVM_AFailedCreateNamesASubvolumeItCouldNotHold(t *testing.T) {
+	s, fake, root := btrfsPoolServer(t)
+	const name = "bsvh"
+	subvol := filepath.Join(root, name+"-data")
+	pinFails(s, subvol)
+	fake.FailStartDomain = func(string) error { return errors.New("start failed") }
+	_, err := s.CreateVM(adminCtx(), btrfsCreateRequest(t, s, name))
+	if err == nil {
+		t.Fatal("the create was meant to fail")
+	}
+	if _, serr := os.Lstat(subvol); serr != nil {
+		t.Errorf("a subvolume that could not be held open was removed: %v", serr)
+	}
+	if !strings.Contains(err.Error(), subvol) || !strings.Contains(err.Error(), "could not be held open") {
+		t.Errorf("the create's error does not name the subvolume it left: %v", err)
+	}
+}

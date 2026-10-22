@@ -646,6 +646,21 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	if err := stream.Context().Err(); err != nil {
 		return status.Errorf(codes.Canceled, "the source gave up on the copy of %s before it was placed: %v", hdr.Path, err)
 	}
+	// The file this receive places: what a re-check below may take back, and
+	// nothing else. It is held open until the receive returns (pinnedFile):
+	// while the directory sync below stalls, the placed copy may be removed
+	// and a retried receive place its own at the path, and only a held
+	// file's inode cannot be given to that copy, which would then read as
+	// this receive's own. After the retry commits it is the VM's only copy.
+	// Pinned before the stub below is replaced, so a copy refused here
+	// leaves the target as it was.
+	ours, perr := pinFile(tmp.Name())
+	if perr != nil {
+		return status.Errorf(codes.Internal,
+			"could not hold the copy of %s open to tell it apart from another file at its path (%v); it is not placed",
+			hdr.Path, perr)
+	}
+	defer ours.release()
 	// A stub this host made for the VM's migration is the one file the copy may
 	// take the place of (checked above); anything else at the path — even one
 	// that appeared since the check — makes the placement fail.
@@ -658,19 +673,6 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 		// nothing may reuse a file the take-back below may still unlink.
 		s.migrationStubs.forget(hdr.Path)
 	}
-	// The file this receive places: what a re-check below may take back, and
-	// nothing else. It is held open until the receive returns (pinnedFile):
-	// while the directory sync below stalls, the placed copy may be removed
-	// and a retried receive place its own at the path, and only a held
-	// file's inode cannot be given to that copy, which would then read as
-	// this receive's own. After the retry commits it is the VM's only copy.
-	ours, perr := pinFile(tmp.Name())
-	if perr != nil {
-		return status.Errorf(codes.Internal,
-			"could not hold the copy of %s open to tell it apart from another file at its path (%v); it is not placed",
-			hdr.Path, perr)
-	}
-	defer ours.release()
 	if err := placeColdDisk(tmp.Name(), dst); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return status.Errorf(codes.FailedPrecondition,

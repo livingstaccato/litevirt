@@ -408,6 +408,12 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 			slog.Warn("clone cleanup: seed left, it is no longer the file this clone wrote", "path", cloneSeed)
 			return
 		}
+		// RemoveSeed also removes the seed's sidecars (.owner, .stale,
+		// .removed), as a failed create's cleanup does. This clone wrote
+		// .owner (StampSeed). The other two record a seed of a VM of this
+		// name that moved away or went stale; the clone holds the name (its
+		// flight, and no VM row of it), so they describe no VM that is
+		// still here, and they are metadata only, never a disk.
 		if e := cloudinit.RemoveSeed(cloneSeed); e != nil {
 			slog.Warn("clone cleanup: remove cloud-init seed", "path", cloneSeed, "error", e)
 			noteLeft(fmt.Sprintf("seed %s (not removed: %v)", cloneSeed, e))

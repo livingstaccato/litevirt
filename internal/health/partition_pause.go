@@ -744,9 +744,13 @@ func (p *PartitionPauser) callWithin(key string, timeout time.Duration, resume b
 
 // callWithinThen is callWithin, and then, when fn was started (started),
 // runs after in the call's own goroutine once fn and any landed have
-// returned, however long after the deadline that is. When fn was not started
-// (no time left, or an earlier call still out) after is not run: the caller
-// still owns what after would release.
+// returned, however long after the deadline that is. By then the call no
+// longer holds key (inflight, resuming, killed) and its result has been
+// handed back: after is not part of the call, so a slow after neither keeps
+// the workload counted as a resume that may yet land (killInFlightResumes)
+// nor holds the step. When fn was not started (no time left, or an earlier
+// call still out) after is not run: the caller still owns what after would
+// release.
 func (p *PartitionPauser) callWithinThen(key string, timeout time.Duration, resume bool, fn func() error, landed, after func()) (started bool, err error) {
 	if timeout <= 0 {
 		return false, errPassBudget
@@ -773,15 +777,15 @@ func (p *PartitionPauser) callWithinThen(key string, timeout time.Duration, resu
 		if !state.CompareAndSwap(running, returned) && err == nil && landed != nil {
 			landed()
 		}
-		if after != nil {
-			after()
-		}
 		p.mu.Lock()
 		delete(p.inflight, key)
 		delete(p.resuming, key)
 		delete(p.killed, key)
 		p.mu.Unlock()
 		done <- err
+		if after != nil {
+			after()
+		}
 	}()
 	t := time.NewTimer(timeout)
 	defer t.Stop()
@@ -1716,7 +1720,7 @@ func (p *PartitionPauser) clearMarkWithin(rec PauseRecord, deadline time.Time, u
 		err := p.clearMarkLocked(rec.Name, rec.Token)
 		if !state.CompareAndSwap(running, returned) {
 			if err == nil {
-				p.remark(rec)
+				p.putMarkBack(rec)
 			}
 			unlock()
 		}
@@ -1743,6 +1747,22 @@ func (p *PartitionPauser) remark(rec PauseRecord) {
 		slog.Warn("partition-pause: could not put the mark back after a failed resume; the VM stays held until an operator resumes it",
 			"name", rec.Name, "host", p.host, "error", err)
 	}
+}
+
+// putMarkBack is remark for a mark the resume path took off: while the write
+// is out the mark reads as still being written (markPending), so a pass that
+// meets the VM meanwhile holds it as this host's pause, not someone else's.
+// The caller holds the mark lock.
+func (p *PartitionPauser) putMarkBack(rec PauseRecord) {
+	p.mu.Lock()
+	p.markPending[rec.Key()] = rec.Token
+	p.mu.Unlock()
+	p.remark(rec)
+	p.mu.Lock()
+	if p.markPending[rec.Key()] == rec.Token {
+		delete(p.markPending, rec.Key())
+	}
+	p.mu.Unlock()
 }
 
 // forgetMark drops what this process remembers about key's mark, once its
@@ -2299,12 +2319,18 @@ func (p *PartitionPauser) resume(ctx context.Context, rec PauseRecord, why strin
 					return false, timedOutErr(err)
 				}
 			}
+			// A resume that failed, or a late landing that was undone, leaves
+			// the VM paused by this host's pause: its mark goes back on
+			// (putBack). Not inside the call: the metadata write has no
+			// timeout, and while the call holds the VM's key a pause pass
+			// counts it as a resume that may yet land and kills its QEMU. It
+			// runs in after, once the call has let go of the key, still
+			// under the mark lock.
+			var putBack atomic.Bool
 			resumeVM := func() error {
 				err := p.vms.ResumePartitionPaused(name, uuid)
-				if err != nil && rec.Token != "" {
-					// Still this host's pause: put the mark back so a later
-					// pass can resume it.
-					p.remark(rec)
+				if err != nil {
+					putBack.Store(true)
 				}
 				return err
 			}
@@ -2312,18 +2338,25 @@ func (p *PartitionPauser) resume(ctx context.Context, rec PauseRecord, why strin
 				if err := p.vms.SuspendDomain(name); err != nil {
 					return err
 				}
-				if rec.Token != "" {
-					p.remark(rec) // paused again by this host: its mark again
-				}
+				putBack.Store(true) // paused again by this host: its mark again
 				return nil
 			}
+			var after func()
+			if unlock != nil {
+				after = func() {
+					if putBack.Load() {
+						p.putMarkBack(rec)
+					}
+					unlock()
+				}
+			}
 			started, err := p.callWithinThen(rec.Key(), time.Until(deadline), true, resumeVM,
-				func() { p.lateResume(rec, yesAt, undo) }, unlock)
+				func() { p.lateResume(rec, yesAt, undo) }, after)
 			if !started && unlock != nil {
 				// The resume was never issued, and the mark is off: put it
 				// back, off the step (the write has no timeout), still under
 				// the lock.
-				go func() { p.remark(rec); unlock() }()
+				go func() { p.putMarkBack(rec); unlock() }()
 			}
 			if err != nil {
 				p.hold(rec, "resume failed: "+err.Error())

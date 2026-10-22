@@ -305,6 +305,42 @@ lv host ls
 
 Repeat for each additional host.
 
+## SSH targets and `~/.ssh/config`
+
+Every command that reaches a host over SSH (`lv host init`, `lv host add`, `lv host rotate-audit-key`
+and the `--ssh-user` commands) reads `~/.ssh/config` through the system `ssh -G`, so a `Host`
+alias that works with `ssh <alias>` works here, even when the alias is not in DNS.
+`HostName`, `User`, `Port` and `IdentityFile` are used, and `Include` and `Match` are resolved
+by OpenSSH itself. Only the per-user `~/.ssh/config` is read; `/etc/ssh/ssh_config` is not.
+
+- The config is read once per command, and its `HostName` is the one address used everywhere:
+  the DNS step, the certificate SAN, the address recorded for the host, and the SSH dial.
+  It must still be IPv4.
+- A user or port written on the command line (`admin@alias`, `alias:2222`) beats the
+  config; the config beats the defaults (user `root`, port 22).
+- Keys are offered in one publickey attempt, as OpenSSH orders them: the configured
+  `IdentityFile` keys first (the agent's copy of one when it holds it), then the agent's other
+  keys, then `~/.ssh/id_ed25519`, `id_ecdsa` and `id_rsa`. A key is never offered twice, and a
+  busy agent cannot use up the server's attempts before the configured key. `%d %h %n %p %r %u %%` are expanded; an
+  `IdentityFile` with any other `%` token is skipped with a warning. `IdentitiesOnly yes`
+  limits the ssh agent (which is still used) and the key files to the configured identities,
+  matched by public key, so an `IdentityFile` that is a `.pub` file whose private key is in the agent works.
+- `ProxyJump` and `ProxyCommand` are not supported. lv warns, naming the directive, and
+  dials the address directly, as it always did.
+- Host-key checking is never loosened by the config. A changed key for a known host is
+  always refused. A host with no entry in the known_hosts files is accepted on first contact
+  (accept-new), unless `StrictHostKeyChecking yes`, which refuses it. `UserKnownHostsFile` adds
+  files to check on top of `~/.ssh/known_hosts`. A known_hosts file that exists but cannot be
+  read or parsed (the default one or a configured one) refuses the connection and names the
+  file; with no known_hosts file at all there is nothing to compare and first contact is accepted
+  with a warning.
+- `Match exec` lines in your config run with lv's privileges, as they do for `ssh`: as root
+  under `sudo lv host init`. OpenSSH refuses a config file not owned by that user.
+- With no `~/.ssh/config` the defaults apply even without an `ssh` binary. If a config exists
+  but `ssh -G` fails or takes longer than 10 seconds, the command refuses with an error naming
+  `ssh -G`, rather than dropping what the config pins; move the config aside to use the defaults.
+  `ssh` also refuses a config it does not own: under `sudo -E`, run lv as the config's owner or without `-E`.
+
 ## CLI setup
 
 The `lv` binary connects to litevirtd over gRPC/mTLS. On a node with

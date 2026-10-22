@@ -97,7 +97,10 @@ func writeKnownHosts(t *testing.T, lines ...string) {
 func dialTest(t *testing.T, addr string) error {
 	t.Helper()
 	host, _, _ := net.SplitHostPort(addr)
-	cfg := clientConfig("root", nil, host, addr)
+	cfg, err := clientConfig("root", nil, &resolved{Hostname: host}, addr)
+	if err != nil {
+		return err
+	}
 	cfg.Timeout = 10 * time.Second
 	c, err := ssh.Dial("tcp", addr, cfg)
 	if err == nil {

@@ -80,6 +80,11 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	if err != nil {
 		return err
 	}
+	rt, err := ssh.Resolve(sshTarget) // the ssh config's HostName, as the dial uses
+	if err != nil {
+		return err
+	}
+	parsedHost = rt.Host()
 	hostAddr, err := resolveHost(parsedHost)
 	if err != nil {
 		return err
@@ -137,7 +142,7 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 		return fmt.Errorf("read setup script: %w", err)
 	}
 
-	sc, err := ssh.NewClient(sshTarget)
+	sc, err := ssh.NewClientResolved(rt)
 	if err != nil {
 		return fmt.Errorf("SSH connect: %w", err)
 	}

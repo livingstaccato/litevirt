@@ -5,7 +5,7 @@
 // migration, which cannot move a PF, so it used to pass the live-only PF guard,
 // prepare the target (disk stubs, domain-side work) and fail inside libvirt.
 // It is now refused before anything is asked of the target, and the message
-// names the detach route. A stopped VM's cold migration is unaffected, and a
+// gives the pre-hardware_v2 advice. A stopped VM's cold migration is unaffected, and a
 // VF is detached and reattached as before.
 
 package fleet
@@ -25,9 +25,14 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/hotplugreq"
 	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/vfio"
 )
+
+// noRouteYet is the pre-hardware_v2 advice: stopped-VM detach and attach are
+// refused until it is active, so no route is advised.
+const noRouteYet = "no supported way to move this VM until it is"
 
 // vfSysfs reports one address as a VF (it has a physfn link); everything else
 // reads as absent.
@@ -96,8 +101,8 @@ func TestFleet_ColdMigrationOfARunningVMWithAPFIsRefusedUpFront(t *testing.T) {
 
 	err := sc.migrateColdStorage(t)
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), pf) ||
-		!strings.Contains(err.Error(), "lv detach-pci") {
-		t.Fatalf("cold migrate of a running VM with a PF = %v; want FailedPrecondition naming %s and saying to detach it first", err, pf)
+		!strings.Contains(err.Error(), noRouteYet) {
+		t.Fatalf("cold migrate of a running VM with a PF = %v; want FailedPrecondition naming %s and the pre-hardware_v2 advice", err, pf)
 	}
 	if _, serr := os.Stat(sc.file(sc.dst, sc.disk)); !os.IsNotExist(serr) {
 		t.Errorf("the refused migration left a disk stub on %s (stat: %v)", sc.dst.Name, serr)
@@ -119,8 +124,8 @@ func TestFleet_ColdMigrationOfARunningVMWithAPFIsRefusedUpFront(t *testing.T) {
 	for lerr == nil {
 		_, lerr = st.Recv()
 	}
-	if status.Code(lerr) != codes.FailedPrecondition || !strings.Contains(lerr.Error(), "lv detach-pci") {
-		t.Errorf("live migrate of a VM with a PF = %v; want a refusal that names the detach route", lerr)
+	if status.Code(lerr) != codes.FailedPrecondition || !strings.Contains(lerr.Error(), noRouteYet) {
+		t.Errorf("live migrate of a VM with a PF = %v; want a refusal that gives the pre-hardware_v2 advice", lerr)
 	}
 }
 
@@ -133,6 +138,9 @@ func TestFleet_ColdMigrationOfAStoppedVMWithAPFKeepsItsOwnRefusal(t *testing.T) 
 	err := sc.migrateCold(t)
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "migrating a stopped VM with hostdevs") {
 		t.Fatalf("cold migrate of a stopped VM with a PF = %v; want the stopped path's hostdev refusal", err)
+	}
+	if !strings.Contains(err.Error(), noRouteYet) || strings.Contains(err.Error(), "lv detach-pci") {
+		t.Fatalf("pre-hardware_v2 the stopped refusal must not advise a route that cannot run: %v", err)
 	}
 	if strings.Contains(err.Error(), "is running") {
 		t.Fatalf("a stopped VM was told it is running: %v", err)
@@ -149,19 +157,15 @@ func TestFleet_ColdMigrationPFRefusalIgnoresVFs(t *testing.T) {
 	sc.setState(t, "running")
 
 	err := sc.migrateColdStorage(t)
-	if err != nil && strings.Contains(err.Error(), "lv detach-pci") {
+	if err != nil && strings.Contains(err.Error(), "which cannot be moved while the guest runs") {
 		t.Fatalf("a VF was refused as a PF: %v", err)
 	}
 }
 
-// The route the refusals advise: stop, detach the device, cold-migrate, attach
-// again on the target. Each step is run over the real RPCs, and the same
-// migration is refused while the device is still assigned, so the detach is
-// what makes it work. (A stopped VM cannot cold-migrate while it holds ANY PCI
-// device, whatever its disks: coldMoveDisks refuses it.)
-func TestFleet_PCIMoveRouteThePassthroughRefusalsAdviseWorks(t *testing.T) {
-	const addr = "0000:41:00.0"
-	sc := newColdStoppedScenario(t)
+// latchPCIScenario brings the scenario to an active hardware_v2 with the device
+// in both hosts' inventories and an IOMMU group for it.
+func latchPCIScenario(t *testing.T, sc *coldStoppedScenario, addr string) {
+	t.Helper()
 	ctx := context.Background()
 	gates := runCheckers(t, sc.c)
 	latchOperationProtocol(t, sc.c, gates)
@@ -189,41 +193,109 @@ func TestFleet_PCIMoveRouteThePassthroughRefusalsAdviseWorks(t *testing.T) {
 			return gates[n.Name].Enforced(ctx, capabilities.HardwareV2)
 		})
 	}
+}
 
-	// Stopped VM, device assigned: the cold path refuses, and says the route.
-	if _, err := sc.c.SelfClient(sc.src).AttachDevice(ctx, &pb.AttachDeviceRequest{
-		VmName: "os1", PciDevice: &pb.DeviceSpec{Address: addr},
+// attachCLI sends what `lv attach-pci <vm> --address <addr>` sends, built by the
+// CLI's own request builder.
+func attachCLI(t *testing.T, n *Node, c *Cluster, vm, addr string) error {
+	t.Helper()
+	req, err := hotplugreq.AttachPCI(vm, hotplugreq.AttachPCIOptions{Address: addr, Type: "gpu", Count: 1})
+	if err != nil {
+		t.Fatalf("build the attach-pci request: %v", err)
+	}
+	_, err = c.SelfClient(n).AttachDevice(context.Background(), req)
+	return err
+}
+
+// The route the refusals advise, once hardware_v2 is active: stop, detach the
+// device, cold-migrate, attach one on the target. Each step is run over the real
+// RPCs with the CLI's request shapes, and the same migration is refused while
+// the device is still assigned, so the detach is what makes it work. The
+// target's device is a DIFFERENT address from the source's.
+func TestFleet_PCIMoveRouteTheRefusalsAdviseWorks(t *testing.T) {
+	const addr, targetAddr = "0000:41:00.0", "0000:42:00.0"
+	sc := newColdStoppedScenario(t)
+	ctx := context.Background()
+	latchPCIScenario(t, sc, addr)
+	if err := os.MkdirAll(filepath.Join(pci.SysDevicesPath(), targetAddr), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertPCIDevice(ctx, sc.dst.DB, corrosion.PCIDeviceRecord{
+		HostName: sc.dst.Name, Address: targetAddr, VendorID: "10de", DeviceID: "1eb8", Type: "gpu", IOMMUGroup: 42,
 	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(pci.IOMMUGroupsPath(), "42"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := attachCLI(t, sc.src, sc.c, "os1", addr); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
 	err := sc.migrateCold(t)
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "lv detach-pci os1 "+addr) {
-		t.Fatalf("cold migrate of a stopped VM holding a device = %v; want the refusal naming the detach route", err)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "lv detach-pci os1 "+addr) ||
+		!strings.Contains(err.Error(), "lv migrate os1 "+sc.dst.Name+" --cold") ||
+		!strings.Contains(err.Error(), "--address") || !strings.Contains(err.Error(), "not carried") {
+		t.Fatalf("cold migrate of a stopped VM holding a device = %v; want the refusal naming the whole route", err)
 	}
 
-	// The route.
 	if _, err := sc.c.SelfClient(sc.src).DetachDevice(ctx, &pb.DetachDeviceRequest{VmName: "os1", PciAddress: addr}); err != nil {
 		t.Fatalf("detach-pci: %v", err)
 	}
 	if err := sc.migrateCold(t); err != nil {
 		t.Fatalf("cold migrate after the detach: %v", err)
 	}
-	if vm := sc.vm(t); vm.HostName != sc.dst.Name {
-		t.Fatalf("VM row names %s, want %s", vm.HostName, sc.dst.Name)
+	if vm := sc.vm(t); vm.HostName != sc.dst.Name || vm.State != "stopped" {
+		t.Fatalf("VM row = host %s state %s, want %s stopped", vm.HostName, vm.State, sc.dst.Name)
 	}
-	if _, err := sc.c.SelfClient(sc.dst).AttachDevice(ctx, &pb.AttachDeviceRequest{
-		VmName: "os1", PciDevice: &pb.DeviceSpec{Address: addr},
-	}); err != nil {
-		t.Fatalf("attach-pci on the target: %v", err)
+	if err := attachCLI(t, sc.dst, sc.c, "os1", targetAddr); err != nil {
+		t.Fatalf("attach-pci --address on the target: %v", err)
 	}
 	devs, _ := corrosion.ListPCIDevices(ctx, sc.dst.DB, sc.dst.Name, "")
-	owned := false
+	owned := map[string]string{}
 	for _, d := range devs {
-		if d.Address == addr && d.VMName == "os1" {
-			owned = true
-		}
+		owned[d.Address] = d.VMName
 	}
-	if !owned {
-		t.Fatalf("the target's device %s is not assigned to os1 after the attach", addr)
+	if owned[targetAddr] != "os1" {
+		t.Fatalf("target's %s is not os1's after the attach: %v", targetAddr, owned)
+	}
+}
+
+// The stopped-VM hostdev refusal of the cold path (a device recorded for the VM
+// with no PCI intent row) gives the same route, with the real target name.
+//
+// Mutation: drop the route from that message — red.
+func TestFleet_ColdMoveStoppedHostdevRefusalGivesTheRoute(t *testing.T) {
+	const addr = "0000:41:00.0"
+	sc := newColdStoppedScenario(t)
+	latchPCIScenario(t, sc, addr)
+	sc.assignPCI(t, addr)
+	err := sc.migrateCold(t)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "migrating a stopped VM with hostdevs") ||
+		!strings.Contains(err.Error(), "lv migrate os1 "+sc.dst.Name+" --cold") || strings.Contains(err.Error(), "<target>") {
+		t.Fatalf("cold move of a stopped VM with a recorded device = %v; want the route naming the real target", err)
+	}
+}
+
+// Before hardware_v2 is active the stopped-VM detach and attach the route
+// would need are refused, and the refusals say there is no route yet rather
+// than advising one. Both halves are asserted: the steps really are refused,
+// and no refusal advises them.
+func TestFleet_PCIMoveRouteIsNotAdvisedBeforeHardwareV2(t *testing.T) {
+	const addr = "0000:41:00.0"
+	sc := newColdStoppedScenario(t)
+	sc.assignPCI(t, addr)
+	ctx := context.Background()
+
+	if err := attachCLI(t, sc.src, sc.c, "os1", "0000:42:00.0"); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("stopped-VM attach pre-latch = %v; the advice relies on it being refused", err)
+	}
+	_, derr := sc.c.SelfClient(sc.src).DetachDevice(ctx, &pb.DetachDeviceRequest{VmName: "os1", PciAddress: addr})
+	if status.Code(derr) != codes.FailedPrecondition {
+		t.Errorf("stopped-VM detach pre-latch = %v; the advice relies on it being refused", derr)
+	}
+	err := sc.migrateCold(t)
+	if err == nil || !strings.Contains(err.Error(), noRouteYet) || strings.Contains(err.Error(), "lv detach-pci") {
+		t.Fatalf("pre-latch cold move refusal = %v; want the no-route-yet advice and no detach-pci step", err)
 	}
 }

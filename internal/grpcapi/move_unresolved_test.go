@@ -538,11 +538,11 @@ func TestColdMoveDisks_HonoursAnUnresolvedMove(t *testing.T) {
 	vm, _ := corrosion.GetVM(context.Background(), s.db, "vm1")
 
 	f.FailDumpXMLInactive = func(string) error { return errors.New("libvirt connection lost") }
-	if _, err := s.coldMoveDisks(context.Background(), vm); status.Code(err) != codes.FailedPrecondition {
+	if _, err := s.coldMoveDisks(context.Background(), vm, "target"); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("want a refusal while the config cannot be read, got %v", err)
 	}
 	f.FailDumpXMLInactive = nil
-	disks, err := s.coldMoveDisks(context.Background(), vm)
+	disks, err := s.coldMoveDisks(context.Background(), vm, "target")
 	if err != nil {
 		t.Fatalf("coldMoveDisks: %v", err)
 	}

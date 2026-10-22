@@ -34,10 +34,13 @@ const DropInPath = "/etc/ssh/sshd_config.d/60-litevirt-fence.conf"
 //     reports the host as not accepting the managed fence key.
 //   - It validates with `sshd -t` and, on a refusal, puts the previous
 //     drop-in back (or none) and says why: provisioning never breaks sshd.
-//   - It reloads sshd (nothing to reload under ssh.socket activation, where
-//     each connection reads the configuration) and says so loudly when it
-//     cannot: the daemon publishes the host as accepting only once its own
-//     login over the managed key works against the running sshd.
+//   - It reloads a running ssh.service or sshd.service, also when ssh.socket
+//     starts it (Ubuntu 24.04 and later: one persistent sshd listener, whose
+//     children take its configuration). Only with no service running and a
+//     socket unit listening is there nothing to reload: the next connection
+//     starts sshd from the new configuration. It says so loudly when it
+//     cannot reload: the daemon publishes the host as accepting only once its
+//     own login over the managed key works against the running sshd.
 //   - FENCE_SSH_REMOVE=1 removes the drop-in instead.
 //
 // It always returns 0 and reports on stdout. FENCE_SSH_SSHD,
@@ -46,10 +49,39 @@ const DropInPath = "/etc/ssh/sshd_config.d/60-litevirt-fence.conf"
 // binary, its config, the drop-in directory, the rendered files' directory,
 // the reload command, the cat binary and the command's user (tests).
 const InstallScript = `
+# lv_fence_ssh_reload has the running sshd read its configuration again, and
+# returns non-zero, saying why, when it cannot tell that it will.
+#   - A running ssh.service or sshd.service is reloaded, whether or not a
+#     socket unit starts it: under ssh.socket with Accept=no (Ubuntu 24.04 and
+#     later) the service is one persistent listener whose children take its
+#     configuration, so a reload is the only way it reads the drop-in.
+#   - With no service running but ssh.socket or sshd.socket listening, there
+#     is nothing to reload: the next connection starts sshd (or, with
+#     Accept=yes, an sshd per connection) from the configuration on disk.
+#   - With neither, nothing here knows how sshd is run: it is not reloaded.
+# Either way the daemon publishes the host as accepting only once its own
+# login over the managed key works against the running sshd.
 lv_fence_ssh_reload() {
     if [ -n "${FENCE_SSH_RELOAD:-}" ]; then sh -c "$FENCE_SSH_RELOAD"; return $?; fi
-    if systemctl is-active --quiet ssh.socket 2>/dev/null; then return 0; fi
-    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null
+    local u st
+    for u in ssh.service sshd.service; do
+        st="$(systemctl is-active "$u" 2>/dev/null)"
+        case "$st" in
+        active|reloading|activating)
+            if systemctl reload "$u" 2>/dev/null; then return 0; fi
+            echo "fence ssh: systemctl reload $u failed"
+            return 1 ;;
+        esac
+    done
+    for u in ssh.socket sshd.socket; do
+        if [ "$(systemctl is-active "$u" 2>/dev/null)" = active ]; then
+            echo "fence ssh: $u is listening and no sshd service runs yet; the next connection starts sshd with this configuration"
+            return 0
+        fi
+    done
+    echo "fence ssh: neither ssh.service nor sshd.service runs, and neither ssh.socket nor sshd.socket listens, so litevirt"
+    echo "fence ssh: cannot reload sshd"
+    return 1
 }
 # lv_fence_ssh_akc_line prints the first line of file $1 whose keyword,
 # read the way sshd reads one (leading blanks, carriage returns and "="

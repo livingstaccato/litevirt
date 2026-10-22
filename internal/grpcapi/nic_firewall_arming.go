@@ -92,6 +92,11 @@ func (s *Server) armWorkload(ctx context.Context, display string, macs func() ([
 // its NIC firewall in force first: a guarded container whose guards are not
 // is not started (re-review m10). Every container start goes through it.
 func (s *Server) startContainerArmed(ctx context.Context, name string) error {
+	// Nor is one an operator force-stopped under write quarantine, until
+	// that stop is recorded (container_operator_stop_marker.go).
+	if err := s.containerOperatorStopHeldHere(ctx, name); err != nil {
+		return err
+	}
 	s.followNetworkDevicesCT(ctx, name)
 	if err := s.armWorkload(ctx, name, func() ([]string, error) { return s.containerGuardedMACs(ctx, name) }); err != nil {
 		return status.Errorf(codes.FailedPrecondition, "%v", err)

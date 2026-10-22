@@ -513,7 +513,8 @@ func TestRunWiresItsStopToItsServeWait(t *testing.T) {
 	}
 }
 
-// executionOwnedRun unwraps only the actual first-return ownership boundary.
+// executionOwnedRun unwraps only the actual owned return after the exact
+// deferred boot-keeper cleanup. No startup work may precede the owner.
 // Parser-resolved receiver and parameter objects survive in the shallow copy,
 // so the existing coordinator/context/shutdown oracle remains unchanged.
 func executionOwnerSelector(e ast.Expr, pkg, name string) bool {
@@ -526,11 +527,23 @@ func executionOwnerSelector(e ast.Expr, pkg, name string) bool {
 }
 
 func executionOwnedRun(run *ast.FuncDecl) (*ast.FuncDecl, error) {
-	if run.Recv == nil || len(run.Recv.List) != 1 || len(run.Recv.List[0].Names) != 1 || run.Body == nil || len(run.Body.List) != 1 {
-		return nil, fmt.Errorf("Run must consist of its owned startup return")
+	if run.Recv == nil || len(run.Recv.List) != 1 || len(run.Recv.List[0].Names) != 1 || run.Body == nil || len(run.Body.List) != 2 {
+		return nil, fmt.Errorf("Run must consist of its boot cleanup defer and owned startup return")
 	}
 	receiver := runVar(run.Recv.List[0].Names[0])
-	ret, ok := run.Body.List[0].(*ast.ReturnStmt)
+	cleanup, ok := run.Body.List[0].(*ast.DeferStmt)
+	if !ok || len(cleanup.Call.Args) != 0 {
+		return nil, fmt.Errorf("Run must defer only its boot keeper abandonment")
+	}
+	abandon, ok := cleanup.Call.Fun.(*ast.SelectorExpr)
+	if !ok || abandon.Sel.Name != "Abandon" {
+		return nil, fmt.Errorf("Run boot keeper cleanup method differs")
+	}
+	keeper, ok := abandon.X.(*ast.SelectorExpr)
+	if !ok || keeper.Sel.Name != "bootWatchdog" || runVar(keeper.X) != receiver {
+		return nil, fmt.Errorf("Run must abandon the actual daemon boot keeper")
+	}
+	ret, ok := run.Body.List[1].(*ast.ReturnStmt)
 	if !ok || len(ret.Results) != 1 {
 		return nil, fmt.Errorf("Run must return its owner continuation")
 	}
@@ -583,6 +596,7 @@ func executionOwnedRun(run *ast.FuncDecl) (*ast.FuncDecl, error) {
 func TestRunOwnershipWiringRejectsWrongContinuation(t *testing.T) {
 	const fixture = `package daemon
 func (d *Daemon) Run(ctx context.Context) error {
+ defer d.bootWatchdog.Abandon()
  return withExecutionOwner(filepath.Join(d.cfg.DataDir,"opjournal"),func(j *opjournal.Journal,c *opjournal.ExecutionController)error{
  d.opJournal,d.executionController=j,c
  return nil
@@ -590,6 +604,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 }`
 	for _, tc := range []struct{ name, old, replacement string }{
 		{name: "correct"},
+		{"missing-boot-defer", "defer d.bootWatchdog.Abandon()", ""},
+		{"boot-call-before-owner", "defer d.bootWatchdog.Abandon()", "d.bootWatchdog.Abandon()"},
+		{"wrong-boot-receiver", "defer d.bootWatchdog.Abandon()", "defer other.bootWatchdog.Abandon()"},
+		{"wrong-boot-field", "defer d.bootWatchdog.Abandon()", "defer d.otherKeeper.Abandon()"},
+		{"wrong-boot-method", "defer d.bootWatchdog.Abandon()", "defer d.bootWatchdog.Handoff()"},
+		{"boot-defer-argument", "defer d.bootWatchdog.Abandon()", "defer d.bootWatchdog.Abandon(work())"},
 		{"wrong-helper", "withExecutionOwner(", "otherOwner("},
 		{"wrong-config", "d.cfg.DataDir", "other.cfg.DataDir"},
 		{"wrong-path", `"opjournal"`, `"elsewhere"`},

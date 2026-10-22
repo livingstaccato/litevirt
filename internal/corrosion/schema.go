@@ -584,31 +584,42 @@ import (
 //	     that write it are emitted only after the latch, or for a row that
 //	     already carries an incarnation. Appended LAST for the v53 digest
 //	     reason. Additive.
+//	v72: managed fence SSH — host_fence_ssh (host_name PK; generation,
+//	     fence_pubkeys, sshd_hostkeys, accepting, ever_accepting, detail,
+//	     cert_pem, signature): a host's own publication of its fence key's
+//	     public half and its sshd host keys, signed with its CA-issued host
+//	     key (internal/fencessh). Every daemon verifies each row against the
+//	     cluster CA and the CRL and renders the verified ones into its
+//	     restricted authorized_keys and its pinned known_hosts. Written only
+//	     with the release feature fence_ssh (release_2026_12_v1,
+//	     ReplicationGated), so a previous-release peer never sees a statement
+//	     of it. Retired locally on a host's removal or re-admission. One new
+//	     table.
 
-//	v72: node-local automation authority, applied prefix, certified history,
+//	v73: node-local automation authority, applied prefix, certified history,
 //	     permanent request receipts, authenticated anchors and bounded on-disk
 //	     recovery staging. None participates in CRDT replication.
-//	v73: inert node-local audited automation content cuts and bounded immutable
+//	v74: inert node-local audited automation content cuts and bounded immutable
 //	     records. No transfer publication, adoption or capability authority.
-//	v74: completed node-local outgoing automation publications, immutable job
+//	v75: completed node-local outgoing automation publications, immutable job
 //	     pins and retained public trust evidence; excluded from source content.
 //
-// v75: inert receiver attempts, pending metadata and bounded transport inventory.
-// v76: inert per-source audit results, spool references and causal request indexes.
+// v76: inert receiver attempts, pending metadata and bounded transport inventory.
+// v77: inert per-source audit results, spool references and causal request indexes.
 // No active import, origin mode, replication or authority is introduced.
-// v77: typed node-local automation identity and owner projections, isolated
+// v78: typed node-local automation identity and owner projections, isolated
 // by reconstruction stage. No replication or admission authority is introduced.
-// v78: node-local originating account/project lifecycle evidence and exact
+// v79: node-local originating account/project lifecycle evidence and exact
 // credential issuance provenance, with atomic invalidate-only parent triggers.
 // These are source observations, never certified identities or class permits.
-// v79: immutable inert local snapshots and complete fixed-roster aggregates.
+// v80: immutable inert local snapshots and complete fixed-roster aggregates.
 // These rows confer no current proof, origin authority or active adoption.
-// v80: causal key epoch, recipient and payload wrapping projections.
-// v81: signed receiver-established floors and current-row complete inventory; never live proof.
-// v82: immutable retained-origin delivery/object/completion pins; no active authority.
-// v83: preserve all recipient stages while allowing the host-incarnation zero domain.
-// v84: derived target operations and complete-key reservations from certified history.
-// v85: tokens.user_created_at (TEXT NOT NULL, default empty) — the account
+// v81: causal key epoch, recipient and payload wrapping projections.
+// v82: signed receiver-established floors and current-row complete inventory; never live proof.
+// v83: immutable retained-origin delivery/object/completion pins; no active authority.
+// v84: preserve all recipient stages while allowing the host-incarnation zero domain.
+// v85: derived target operations and complete-key reservations from certified history.
+// v86: tokens.user_created_at (TEXT NOT NULL, default empty) — the account
 // incarnation (users.created_at) an API token was issued to
 // (token_incarnation.go). A token authenticates only while its account
 // holds that incarnation; an empty value (a token from before this version) only
@@ -619,12 +630,12 @@ import (
 // anti-entropy dump while every value of it is empty, so a previous-release
 // node takes this build's tokens until then. Appended LAST for the v53
 // digest reason. Additive.
-// v86: four local certified-history-derived execution projections; no native authority.
-const CurrentSchemaVersion = 86
+// v87: four local certified-history-derived execution projections; no native authority.
+const CurrentSchemaVersion = 87
 
 // schemaVersionTokenUserIncarnation is the version tokens.user_created_at was
 // added in.
-const schemaVersionTokenUserIncarnation = 85
+const schemaVersionTokenUserIncarnation = 86
 
 // schemaVersionProjectIncarnation is the version projects.incarnation was
 // added in.
@@ -3122,7 +3133,7 @@ var schemaDDL = []string{
  AFTER DELETE ON tokens BEGIN
  UPDATE local_automation_credential_issuance SET valid=0 WHERE kind='token' AND credential_id=OLD.id;
  END`,
-	// v85 (schemaVersionTokenUserIncarnation): tokens.user_created_at decides
+	// v86 (schemaVersionTokenUserIncarnation): tokens.user_created_at decides
 	// which account incarnation a token opens, so any write of it
 	// invalidates the token's issuance proof, as the trigger above does for
 	// the token's other columns. Separate, so that trigger stays as it is and
@@ -3544,6 +3555,22 @@ var schemaDDL = []string{
 		updated_at TEXT NOT NULL,
 		deleted_at TEXT
 	)`,
+	// v72 a host's managed fence SSH publication, signed with its host key;
+	// see host_fence_ssh.go. One row per host, written whole by that host,
+	// only with the release feature fence_ssh.
+	`CREATE TABLE IF NOT EXISTS host_fence_ssh (
+		host_name      TEXT PRIMARY KEY,
+		generation     INTEGER NOT NULL DEFAULT 0,
+		fence_pubkeys  TEXT NOT NULL DEFAULT '',
+		sshd_hostkeys  TEXT NOT NULL DEFAULT '',
+		accepting      INTEGER NOT NULL DEFAULT 0,
+		ever_accepting INTEGER NOT NULL DEFAULT 0,
+		detail         TEXT NOT NULL DEFAULT '',
+		cert_pem       TEXT NOT NULL DEFAULT '',
+		signature      TEXT NOT NULL DEFAULT '',
+		updated_at     TEXT NOT NULL,
+		deleted_at     TEXT
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -3745,6 +3772,7 @@ var tablePrimaryKeys = map[string][]string{
 	"host_runtime":            {"host_name"},
 	"session_groups":          {"session_id"},
 	"host_fence_redfish":      {"host_name"},
+	"host_fence_ssh":          {"host_name"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -4017,7 +4045,7 @@ const (
 	kindRebuildClusterCRL                // v47 final shape; presence = composite primary key
 )
 
-const kindRebuildAutomationCustody migKind = 3 // v83 exact recipient shape and nonnegative host counter
+const kindRebuildAutomationCustody migKind = 3 // v84 exact recipient shape and nonnegative host counter
 
 // migration is one ledgered schema unit.
 type migration struct {
@@ -4100,7 +4128,7 @@ var alterVersions = []int{
 	schemaVersionHostIncarnation,      // hosts.incarnation
 	schemaVersionSGProjects,           // security_groups.project
 	schemaVersionProjectIncarnation,   // projects.incarnation
-	81,                                // local_automation_receiver_current.established_inventory
+	82,                                // local_automation_receiver_current.established_inventory
 	schemaVersionTokenUserIncarnation, // tokens.user_created_at
 }
 
@@ -4148,40 +4176,41 @@ var createTableUnits = []struct {
 	{65, "host_runtime"},
 	{66, "session_groups"},
 	{67, "host_fence_redfish"},
-	{84, "local_automation_target_operations"}, {84, "local_automation_target_reservations"},
-	{72, "local_automation_authority"}, {72, "local_automation_prefix"},
-	{72, "local_automation_anchors"}, {72, "local_automation_history"},
-	{72, "local_automation_requests"}, {72, "local_automation_recovery"}, {72, "local_automation_staging"},
-	{73, "local_automation_cuts"}, {73, "local_automation_cut_records"},
-	{74, "local_automation_source_jobs"}, {74, "local_automation_publications"},
-	{82, "local_automation_retained_deliveries"}, {82, "local_automation_retained_objects"}, {82, "local_automation_retained_completions"},
-	{81, "local_automation_receiver_established"},
-	{80, "local_automation_key_epochs"}, {80, "local_automation_key_recipients"}, {80, "local_automation_payload_wrappings"},
-	{79, "local_automation_local_audits"},
-	{79, "local_automation_local_rows"},
-	{79, "local_automation_aggregates"},
-	{79, "local_automation_aggregate_sources"},
-	{79, "local_automation_aggregate_copies"},
-	{79, "local_automation_aggregate_maxima"},
-	{79, "local_automation_aggregate_conflicts"},
-	{78, "local_automation_lifetimes"}, {78, "local_automation_credential_issuance"},
-	{77, "local_automation_identities"}, {77, "local_automation_aliases"},
-	{77, "local_automation_owners"}, {77, "local_automation_semantic_heads"},
-	{77, "local_automation_resources"}, {77, "local_automation_names"}, {77, "local_automation_bindings"}, {77, "local_automation_admissions"},
-	{76, "local_automation_receiver_audits"},
-	{76, "local_automation_receiver_refs"},
-	{76, "local_automation_receiver_requests"},
-	{75, "local_automation_receiver_jobs"},
-	{75, "local_automation_receiver_current"},
-	{75, "local_automation_receiver_validations"},
-	{75, "local_automation_receiver_sources"},
-	{75, "local_automation_receiver_components"},
-	{75, "local_automation_receiver_records"},
-	{75, "local_automation_receiver_pages"},
-	{86, "local_automation_executors"},
-	{86, "local_automation_execution_progress"},
-	{86, "local_automation_execution_artifacts"},
-	{86, "local_automation_execution_terminals"},
+	{72, "host_fence_ssh"},
+	{85, "local_automation_target_operations"}, {85, "local_automation_target_reservations"},
+	{73, "local_automation_authority"}, {73, "local_automation_prefix"},
+	{73, "local_automation_anchors"}, {73, "local_automation_history"},
+	{73, "local_automation_requests"}, {73, "local_automation_recovery"}, {73, "local_automation_staging"},
+	{74, "local_automation_cuts"}, {74, "local_automation_cut_records"},
+	{75, "local_automation_source_jobs"}, {75, "local_automation_publications"},
+	{83, "local_automation_retained_deliveries"}, {83, "local_automation_retained_objects"}, {83, "local_automation_retained_completions"},
+	{82, "local_automation_receiver_established"},
+	{81, "local_automation_key_epochs"}, {81, "local_automation_key_recipients"}, {81, "local_automation_payload_wrappings"},
+	{80, "local_automation_local_audits"},
+	{80, "local_automation_local_rows"},
+	{80, "local_automation_aggregates"},
+	{80, "local_automation_aggregate_sources"},
+	{80, "local_automation_aggregate_copies"},
+	{80, "local_automation_aggregate_maxima"},
+	{80, "local_automation_aggregate_conflicts"},
+	{79, "local_automation_lifetimes"}, {79, "local_automation_credential_issuance"},
+	{78, "local_automation_identities"}, {78, "local_automation_aliases"},
+	{78, "local_automation_owners"}, {78, "local_automation_semantic_heads"},
+	{78, "local_automation_resources"}, {78, "local_automation_names"}, {78, "local_automation_bindings"}, {78, "local_automation_admissions"},
+	{77, "local_automation_receiver_audits"},
+	{77, "local_automation_receiver_refs"},
+	{77, "local_automation_receiver_requests"},
+	{76, "local_automation_receiver_jobs"},
+	{76, "local_automation_receiver_current"},
+	{76, "local_automation_receiver_validations"},
+	{76, "local_automation_receiver_sources"},
+	{76, "local_automation_receiver_components"},
+	{76, "local_automation_receiver_records"},
+	{76, "local_automation_receiver_pages"},
+	{87, "local_automation_executors"},
+	{87, "local_automation_execution_progress"},
+	{87, "local_automation_execution_artifacts"},
+	{87, "local_automation_execution_terminals"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn
@@ -4224,7 +4253,7 @@ func init() {
 	})
 	schemaMigrationLedger = append(schemaMigrationLedger, migration{
 		ID:      automationCustodyMigrationID,
-		Version: 83,
+		Version: 84,
 		Kind:    kindRebuildAutomationCustody,
 		Target:  "local_automation_key_recipients",
 		SQL:     automationCustodyRebuildSQL,

@@ -32,6 +32,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/failover"
+	"github.com/litevirt/litevirt/internal/fencessh"
 	"github.com/litevirt/litevirt/internal/filerestore"
 	"github.com/litevirt/litevirt/internal/firewall"
 	"github.com/litevirt/litevirt/internal/fwmig"
@@ -69,6 +70,9 @@ const grpcMaxMsgSize = 64 << 20 // 64 MiB
 
 // Daemon is the main litevirtd process.
 type Daemon struct {
+	// captureReg is the host's memory snapshot capture registry, shared by
+	// the gRPC server, the partition pauser and the settle.
+	captureReg *libvirt.CaptureRegistry
 	// ownRowWake is signalled when an apply changes this host's own row;
 	// bootRes keeps the boot report's figures (own_row.go).
 	ownRowWake chan struct{}
@@ -108,6 +112,15 @@ type Daemon struct {
 	// startWaitSvc is svc for the libvirt start-guard wait, which is wired
 	// before svc exists and asks it which incarnation a create is starting.
 	startWaitSvc *atomic.Pointer[grpcapi.Server]
+	// bootWatchdog pets a watchdog timer a previous run left running, from the
+	// start of New until Run hands it to the heartbeat (bootUnderWatchdog).
+	// Nil when there is none.
+	bootWatchdog *watchdog.BootKeeper
+	// watchdogRunDir holds the self-fence marker and the boot streak
+	// (watchdog.RunDir); "" in tests that build a Daemon by hand.
+	watchdogRunDir string
+	// watchdogCtrl is the heartbeat's controller (startWatchdog).
+	watchdogCtrl *watchdog.Controller
 
 	// buildServer replaces grpcapi.NewServer in newServer (tests, which have
 	// no libvirt); nil in a daemon.
@@ -213,6 +226,86 @@ func New(cfg *Config) (*Daemon, error) {
 // consumer. Neither construction errors nor bounded Run cleanup prove that
 // every consumer stopped; only process exit/exec releases this registration.
 func NewContext(ctx context.Context, cfg *Config) (*Daemon, error) {
+	return bootUnderWatchdog(
+		func() *watchdog.BootKeeper { return watchdog.KeepBootAlive(cfg.WatchdogDev, bootKeeperOptions(cfg)) },
+		func(bk *watchdog.BootKeeper) (*Daemon, error) { return newDaemon(ctx, cfg, bk) },
+	)
+}
+
+// wireWatchdog wires the heartbeat's controller before the heartbeat starts:
+// the self-fence marker's directory, so a restarted daemon cannot cancel the
+// reboot, and the liveness gate's DB round trip and threshold
+// (watchdog.liveness_stale_sec; 0 turns the gate off). The pauser joins the
+// gate once it exists (wirePauserLiveness).
+func (d *Daemon) wireWatchdog(ctrl *watchdog.Controller) {
+	ctrl.SetRunDir(d.watchdogRunDir)
+	ctrl.SetLivenessStale(time.Duration(d.cfg.Watchdog.LivenessStaleSec) * time.Second)
+	ctrl.SetDBProbe(func(ctx context.Context) error {
+		_, err := d.db.Query(ctx, "SELECT 1")
+		return err
+	})
+}
+
+// startWatchdog builds the heartbeat's controller, wires it (owned: the
+// shutdown ownership probe; wireWatchdog), and only then starts the
+// heartbeat on it, continuing on the descriptor boot has been petting
+// (bootUnderWatchdog) so the device is never closed between the two. The
+// order is load-bearing: the heartbeat reads its wiring when it starts, and
+// one started unwired would pet past this host's self-fence marker.
+func (d *Daemon) startWatchdog(ctx context.Context, owned func() bool) *watchdog.Controller {
+	ctrl := watchdog.NewController()
+	ctrl.SetOwnershipCheck(owned)
+	d.wireWatchdog(ctrl)
+	d.watchdogCtrl = ctrl
+	watchdog.StartHeartbeat(ctx, d.cfg.WatchdogDev, 0, ctrl, d.bootWatchdog.Handoff())
+	return ctrl
+}
+
+// wirePauserLiveness adds the partition pauser's progress to the gate of
+// the heartbeat startWatchdog started.
+func (d *Daemon) wirePauserLiveness(pauser *health.PartitionPauser) {
+	d.watchdogCtrl.SetPauserProgress(pauser.Progress)
+}
+
+// bootKeeperOptions are the boot keeper's bounds (watchdog.boot_keeper_*).
+func bootKeeperOptions(cfg *Config) watchdog.BootOptions {
+	return watchdog.BootOptions{
+		RunDir:       watchdog.RunDir,
+		Configured:   cfg.WatchdogDev != "",
+		StreakWindow: time.Duration(cfg.Watchdog.BootKeeperStreakWindowSec) * time.Second,
+		MaxBoots:     cfg.Watchdog.BootKeeperMaxBoots,
+		MaxDuration:  time.Duration(cfg.Watchdog.BootKeeperMaxSec) * time.Second,
+	}
+}
+
+// bootUnderWatchdog enforces the load-bearing boot order for the hardware
+// watchdog: pet a timer a previous run left running FIRST, then boot.
+//
+// After a crash the timer counts from the crashed run's last pet (60 s with
+// the default interval), and systemd restarts the unit 5 s later. Everything
+// boot does before the heartbeat can be slow or fail on a full or read-only
+// disk: opening the state store, the rollback check, the schema, the boot
+// write. Petting only once the heartbeat started let a slow boot, or a crash
+// loop failing in any of them, reboot the host and kill every VM on it.
+//
+// A boot that fails here abandons the keeper, which leaves the timer exactly
+// as armed as the previous run left it. A boot that succeeds hands it to Run,
+// which hands it to Heartbeat (or abandons it if Run fails first). Split out
+// so the ordering is unit-tested without a live daemon.
+func bootUnderWatchdog(
+	keep func() *watchdog.BootKeeper,
+	boot func(*watchdog.BootKeeper) (*Daemon, error),
+) (*Daemon, error) {
+	bk := keep()
+	d, err := boot(bk)
+	if err != nil {
+		bk.Abandon()
+		return nil, err
+	}
+	return d, nil
+}
+
+func newDaemon(ctx context.Context, cfg *Config, bootWatchdog *watchdog.BootKeeper) (*Daemon, error) {
 	if err := pki.RegisterDaemonHostDomain(ctx, cfg.PKIDir); err != nil {
 		return nil, fmt.Errorf("host domain admission: %w", err)
 	}
@@ -281,7 +374,9 @@ func NewContext(ctx context.Context, cfg *Config) (*Daemon, error) {
 		fwStore: fwStore,
 		images:  store,
 
-		startWaitSvc: startWaitSvc,
+		startWaitSvc:   startWaitSvc,
+		bootWatchdog:   bootWatchdog,
+		watchdogRunDir: watchdog.RunDir,
 	}, nil
 }
 
@@ -475,7 +570,21 @@ func withExecutionOwner(dir string, start func(*opjournal.Journal, *opjournal.Ex
 	return start(j, controller)
 }
 
+// serverUnaryInterceptors is the daemon's unary chain, outermost first. The
+// panic recovery comes first so a panic anywhere below it, an interceptor
+// included, is answered Internal instead of ending the daemon
+// (grpcapi.RecoverUnaryInterceptor).
+func serverUnaryInterceptors(m *metrics.RPCMetrics, svc *grpcapi.Server) []grpc.UnaryServerInterceptor {
+	return []grpc.UnaryServerInterceptor{grpcapi.RecoverUnaryInterceptor, m.UnaryInterceptor(), svc.UnaryAuthInterceptor}
+}
+
+// serverStreamInterceptors is serverUnaryInterceptors for streaming RPCs.
+func serverStreamInterceptors(m *metrics.RPCMetrics, svc *grpcapi.Server) []grpc.StreamServerInterceptor {
+	return []grpc.StreamServerInterceptor{grpcapi.RecoverStreamInterceptor, m.StreamInterceptor(), svc.StreamAuthInterceptor}
+}
+
 func (d *Daemon) Run(ctx context.Context) error {
+	defer d.bootWatchdog.Abandon()
 	return withExecutionOwner(filepath.Join(d.cfg.DataDir, "opjournal"), func(j *opjournal.Journal, controller *opjournal.ExecutionController) error {
 		d.opJournal, d.executionController = j, controller
 		// Also cover package-local/test construction that bypasses NewContext.
@@ -1041,6 +1150,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// an isolated/latched restart can't run automated starts before the gate can
 		// confirm capability.
 		reconciler := health.NewReconciler(d.cfg.HostName, d.cfg.DataDir, d.db, d.virt)
+		// One memory snapshot capture registry per host: the gRPC server's
+		// captures, the partition pauser and the settle share it.
+		d.captureReg = libvirt.NewCaptureRegistry()
+		reconciler.SetCaptureRegistry(d.captureReg) // a settle drops the pauser's hold with its record
 		reconciler.SetGate(d.checker)
 		reconciler.SetOwnerEpochBackfill(d.cfg.Enforcement.OwnerEpoch) // Phase 4 backfill pass
 		// Unconditional: the out-of-band stop sync waits until this node's replica
@@ -1109,7 +1222,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 		// Start hardware watchdog heartbeat (optional). The controller lets Phase-2 VIP
 		// self-demotion trip a self-fence when a demotion can't be confirmed.
-		watchdogCtrl := watchdog.NewController()
 		// Clean-shutdown disarm hole (§B Phase 5): only a host that owns nothing may
 		// disarm on SIGTERM. A restart re-pets inside the timeout; a stop that
 		// abandons running workloads lets the watchdog reboot the host into a safely
@@ -1118,7 +1230,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// answer is overwhelmingly one with no runtime at all (containers-only or
 		// fresh hosts must not reboot on every daemon stop). VIP ownership is not
 		// yet probed here — Phase 5 adds it with the quorum-gated handoff.
-		watchdogCtrl.SetOwnershipCheck(func() bool {
+		watchdogCtrl := d.startWatchdog(ctx, func() bool {
 			if names, err := d.virt.ListRunningDomains(); err == nil && len(names) > 0 {
 				slog.Warn("watchdog: refusing shutdown disarm — running VMs owned", "count", len(names))
 				return true
@@ -1131,7 +1243,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 			return false
 		})
-		go watchdog.Heartbeat(ctx, d.cfg.WatchdogDev, 0, watchdogCtrl)
 		// Central self-fence hard gate: once this node self-fences, the checker's Execution/
 		// DecisionGate fail closed regardless of quorum, so every gate consumer (reconciler,
 		// grpcapi server, failover coordinator) refuses runtime-ownership work during the
@@ -1158,10 +1269,25 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 
 		svc := d.newServer() // host address and release gate: before the first network pass
+		svc.SetCaptureRegistry(d.captureReg)
 		// A guarded VM recovers only onto a host that enforces NIC guards until
 		// every host does (re-review m8).
 		fc.SetNICGuardPlacement(svc.GuardHostNeeded)
 		d.svc = svc
+		// Managed fence SSH (internal/fencessh): this host's signed row, every
+		// verified peer rendered into /etc/litevirt/ssh, and how each ssh fence
+		// from here — the coordinator's and FenceHost's — reaches its target.
+		fenceSSH := fencessh.New(fencessh.Config{
+			Self: d.cfg.HostName, PKIDir: d.cfg.PKIDir, DB: d.db, Gate: svc,
+			Accepting:     fencessh.SSHDAccepting(fencessh.SSHDPath(), "", fencessh.DefaultDir),
+			Mode:          func() string { return d.cfg.Enforcement.FenceSSH },
+			ProbeInterval: d.cfg.FenceSSHProbeInterval(),
+			SelfCheck:     true,
+			OnAccepting:   svc.FenceSSHAccepting,
+		})
+		svc.SetFenceSSH(fenceSSH)
+		fc.FenceSSH = fenceSSH.FenceConfig
+		go fenceSSH.Run(ctx)
 		if d.startWaitSvc != nil {
 			d.startWaitSvc.Store(svc)
 		}
@@ -1260,6 +1386,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		svc.SetFirmwareStore(d.fwStore)
 		reconciler.SetFirmwareStore(d.fwStore)
 		svc.SetSessionTimeouts(parseDurationOr(d.cfg.Auth.SessionIdleTimeout, 0), parseDurationOr(d.cfg.Auth.SessionHardExpiry, 0))
+		// Validated at load (MemorySnapshotConfig.validate).
+		if budget, deadline, err := d.cfg.MemorySnapshot.Durations(); err == nil {
+			svc.SetMemorySnapshotTuning(grpcapi.MemorySnapshotTuning{PauseBudget: budget, LiveDeadline: deadline})
+		}
 		svc.SetStrictMTLSIdentity(d.cfg.Auth.StrictMTLSIdentity)
 		svc.SetTrustRotatedPeerCerts(d.cfg.Auth.TrustRotatedPeerCerts)
 		defer svc.StopDHCPReservations()
@@ -1531,6 +1661,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// Wire reconciler callbacks now that gRPC server exists.
 		reconciler.SetOnVMStarted(svc.RefreshLBForStack)
 		reconciler.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
+		// A rebuilt domain's PCI passthrough (health/passthrough_rebuild.go).
+		reconciler.SetPassthroughForRebuild(svc.PassthroughForRebuild)
 		reconciler.SetCancelledStartProbe(svc.HasCancelledStart) // cancelled_starts.go: an error row's late-started domain is the sweep's
 		// A held start whose daemon restarted before libvirt answered it: its
 		// lease is taken over once the domain runs, and its outcome recorded
@@ -1761,6 +1893,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		go svc.RunHeldGuestResumer(ctx, 0)
 
 		go vmChecker.Start(ctx)
+		// The partition pauser is built here, before the reconciler starts, so
+		// settle's guard is wired before any pass reads it (its destroy of a
+		// paused copy runs under the pauser's mark lock); the rest of its wiring
+		// and its Start come below.
+		pauser := health.NewPartitionPauser(d.cfg.HostName, d.cfg.DataDir, d.db)
+		pauser.SetVMBackend(d.virt)
+		reconciler.SetPauseGuard(pauser.SettleDestroy) // settle destroys a paused copy only under its mark lock
 		go reconciler.Start(ctx)
 		// Finish any drain cold move a previous process died in the middle of: the
 		// VM was running, was (or was about to be) shut down for the move, and must
@@ -1878,16 +2017,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// partition_pause_v1 only while it already acts on it — and whether or not
 		// a watchdog is armed; a verified watchdog is only the backstop for a
 		// pause that fails.
-		pauser := health.NewPartitionPauser(d.cfg.HostName, d.cfg.DataDir, d.db)
 		pauser.SetQuorum(d.checker.ExecutionQuorum)
 		pauser.SetEnabled(func() bool { return d.cfg.Enforcement.PartitionPause })
 		pauser.SetRecordFailure(d.cfg.Enforcement.PartitionPauseRecordFailure)
-		pauser.SetVMBackend(d.virt)
+		pauser.SetCaptureRegistry(d.captureReg) // the pause wins over a memory snapshot
 		pauser.SetContainerRuntime(lxcRunner)
 		pauser.SetResumeConfirmer(svc.CheckPartitionResume)
 		pauser.SetSettleVerifier(svc.VerifySettleProof)
 		pauser.SetPeerRuntimeChecker(svc.CheckPeerContainerRuntime)
 		pauser.SetSelfFence(watchdogCtrl.Armed, watchdogCtrl.SelfFence)
+		d.wirePauserLiveness(pauser)
 		go pauser.Start(ctx)
 		// Persistent HA-degraded surface (unsupported member / unfenced demotion failure / VIP
 		// with no holder) — a durable alertable status + transition events.
@@ -2300,8 +2439,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 		grpcOpts := []grpc.ServerOption{
 			grpc.Creds(connTracker.ServerCreds(credentials.NewTLS(tlsCfg))),
 			grpc.StatsHandler(connTracker.StatsHandler()),
-			grpc.ChainUnaryInterceptor(rpcMetrics.UnaryInterceptor(), svc.UnaryAuthInterceptor),
-			grpc.ChainStreamInterceptor(rpcMetrics.StreamInterceptor(), svc.StreamAuthInterceptor),
+			grpc.ChainUnaryInterceptor(serverUnaryInterceptors(rpcMetrics, svc)...),
+			grpc.ChainStreamInterceptor(serverStreamInterceptors(rpcMetrics, svc)...),
 			// Defense-in-depth for the legacy unary state-dump/replication paths: the
 			// 4 MiB gRPC default silently failed a large full-state dump (the bug
 			// StreamStateDump fixes), and a big PushMutations batch could trip it too.

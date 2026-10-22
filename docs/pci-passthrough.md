@@ -90,6 +90,14 @@ vms:
 
 The placement engine selects a host with enough free devices matching the criteria. It prefers devices in the same NUMA node as the VM's CPU allocation and in the same NVLink clique for multi-GPU workloads.
 
+Once a start has given the VM its devices on a host, a restart there
+(`lv start`, or the restart after a guest crash) runs it with the same devices.
+It does not need a free device of the kind, and it does not take one beside
+those it has. This holds for the devices a start recorded for the VM on that host.
+A device the VM holds that no start there recorded, such as one claimed before
+the hardware_v2 latch and never adopted, is not kept this way: the restart
+looks for a free device of the kind instead.
+
 ### By exact PCI address
 
 ```yaml
@@ -100,7 +108,12 @@ The placement engine selects a host with enough free devices matching the criter
 Name the address alone. The VM is placed on the host that has that device free
 (with no other member of its IOMMU group held by another VM), and takes exactly
 that device. Add a `placement.host` when more than one host has a device at
-that address.
+that address. After a failover the address is not carried over: see
+[Failover with PCI devices](#failover-with-pci-devices).
+
+The other devices in that device's IOMMU group are passed through with it. You
+can also name them, as a GPU and its audio function are often named, each by
+its address: each device is then passed through once.
 
 A device's selector is read in a fixed order: `mapping`, then `sriov`, then
 `type` / `vendor`, then `address`. The first one set decides, and the fields
@@ -267,13 +280,30 @@ When a VM requests PCI devices, the placement engine considers:
 
 ## Migration with PCI devices
 
-PCI passthrough devices cannot be live-migrated. Options:
+No migration, live or cold, carries a passthrough device, and a stopped VM
+cannot be cold-migrated while it holds one either, whatever its disks. Once
+`hardware_v2` is active, the route that works is to release the device from the
+VM, move the VM, and attach a device on the target:
 
-1. Hot-detach the device, migrate, hot-attach on the new host
-2. Cold migrate (stops the VM)
-3. Use SR-IOV VFs which can be detached/reattached more gracefully
+1. Stop the VM.
+2. `lv detach-pci <vm> <pci-address>`
+3. `lv migrate <vm> <host> --cold`
+4. `lv attach-pci <vm> --address <pci-address on the target>`; find a free one
+   with `lv host devices <host>`.
 
-The migration command will fail with an error if the VM has PCI devices attached and `--cold` is not specified.
+The target needs its own free device: the source's address is not reused, and
+the device's ROM, multifunction and vGPU settings are not carried over, so
+re-attach them as you did the first time. `lv attach-pci <vm> --address` is the
+form that works on a stopped VM; the `--type` form attaches to a running VM only.
+
+Before `hardware_v2` is active, detaching and attaching on a stopped VM are
+refused, so there is no supported way to move a VM that holds a device.
+
+A migration of a VM that still holds a device is refused up front, naming the
+device and (once `hardware_v2` is active) this route, before anything is done on
+the target. This covers `--cold` of a running VM with a PF, a live migration,
+and `--cold` of a stopped VM. Once the cluster has latched `hardware_v2`, any VM
+holding PCI intent is refused this way.
 
 SR-IOV VFs are hot-detached from the guest just before the copy starts. The VM
 keeps owning them on the source until the cutover commits, so no other VM can
@@ -282,6 +312,43 @@ If the migration fails, they go back into the guest. A host-local device lease
 records them before the first detach. If the daemon restarts in the middle of
 the move, startup recovery reads that lease and puts the VFs back into a guest
 still running on the source, or releases them if the guest has moved.
+
+## Failover with PCI devices
+
+When a host fails, a VM with PCI passthrough devices is recovered only onto a
+host that has a free device of the kind each of its devices needs: a `type`,
+`vendor`, `model`, `mapping` or SR-IOV selector as it is written, and a device
+named by `address` as the vendor and device id that the failed host's
+inventory records at that address. The address itself is not carried over. The
+device at the same address on another host is whatever that host has there,
+and it is never bound. The new host starts the VM with a matching device of
+its own, at whatever address that device has, and records it: from then on
+that device, not the failed host's inventory, says what kind the VM needs.
+A VM moved while stopped gets its device the same way at `lv start`, which
+refuses when the host has none.
+
+When no surviving host has a free device of that kind, the VM stays on its
+failed host and is not started anywhere without its devices. Failover records
+the condition `vm_failover_held` (subject `vm/<name>@<host>`, a warning), a
+`vm.failover.held` event and a `failover.skip` audit entry, each naming the
+device it waits for and what you can do. Each failover pass tries again, so
+freeing a device of that kind on a surviving host, or adding a host with one,
+recovers the VM there. When the failed host comes back, it starts the VM there
+with its own devices. Either way the record clears.
+
+To recover such a VM without its devices, give it the label
+`litevirt.failover_without_devices=true` in its spec's `labels`. The next
+failover pass then recovers it like any other VM. Its new host starts it with
+its devices if it has all of them, and otherwise without any. The VM's state
+detail reads `running without its PCI passthrough devices: ...`, and a
+`vm.passthrough_dropped` event and audit entry are recorded. A host that rebuilds a VM's domain
+for any other reason (a guest that died under a running row) also starts it
+only with its devices, or under the same label.
+
+These guarantees hold once every node runs a build that has them: during a
+rolling upgrade, an older coordinator or host can still recover the VM
+without its devices, or with whatever device sits at its old address, as
+earlier releases did.
 
 ## Snapshots and restores with PCI devices
 

@@ -18,13 +18,14 @@ import (
 )
 
 const (
-	// defaultDev is the standard Linux watchdog device.
-	defaultDev = "/dev/watchdog"
 	// keepaliveByte is written each interval to reset the watchdog timer.
 	keepaliveByte = byte('1')
 	// defaultInterval is how often to write; should be < hardware timeout / 2.
 	defaultInterval = 15 * time.Second
 )
+
+// defaultDev is the standard Linux watchdog device (a var for tests).
+var defaultDev = "/dev/watchdog"
 
 // Controller trips Heartbeat into SELF-FENCE mode: stop writing keepalives and do
 // NOT disarm, so the hardware watchdog times out and reboots the host. Used when a
@@ -43,6 +44,23 @@ type Controller struct {
 	// to decide whether disarming is safe. Nil = not wired = disarm as always.
 	ownershipMu   sync.RWMutex
 	ownershipHeld func() bool
+
+	// runDir holds the self-fence marker (BootOptions.RunDir); "" writes and
+	// reads none. Set once, before Heartbeat starts.
+	runDir string
+
+	// live is the liveness gate's wiring (liveness.go).
+	live livenessWiring
+}
+
+// SetRunDir names the tmpfs directory for the self-fence marker. A self-fence
+// writes it, and while it exists neither boot nor Heartbeat pets the watchdog,
+// so a daemon restarted after a self-fence cannot cancel the reboot. Only a
+// reboot (which empties /run) clears it; there is no operator command.
+func (c *Controller) SetRunDir(dir string) {
+	if c != nil {
+		c.runDir = dir
+	}
 }
 
 // SetOwnershipCheck wires the local-ownership probe consulted at graceful
@@ -99,7 +117,9 @@ func (c *Controller) SelfFence() {
 	if c == nil {
 		return
 	}
-	c.tripped.Store(true)
+	if c.tripped.CompareAndSwap(false, true) {
+		markSelfFenced(c.runDir, "self-fence")
+	}
 	c.once.Do(func() { close(c.fence) })
 }
 
@@ -260,6 +280,48 @@ func identityIsHardware(identity string) bool {
 // tripped via SelfFence, in which case it stops petting WITHOUT disarming so the
 // watchdog fires and reboots the host. ctrl may be nil (no self-fence path).
 func Heartbeat(ctx context.Context, devPath string, interval time.Duration, ctrl *Controller) {
+	HeartbeatFrom(ctx, devPath, interval, ctrl, nil)
+}
+
+// HeartbeatFrom is Heartbeat continuing on the descriptor boot already holds
+// (KeepBootAlive), so the device is never closed between boot petting and the
+// heartbeat. A nil or already-taken keeper opens the device as Heartbeat does.
+//
+// A daemon run after this host self-fenced (the marker in ctrl's run
+// directory) does not pet at all: it trips ctrl, so the run stops trusting
+// itself, and leaves the device armed so the reboot happens. Reaching here
+// ends the boot streak (KeepBootAlive).
+func HeartbeatFrom(ctx context.Context, devPath string, interval time.Duration, ctrl *Controller, pre *os.File) {
+	heartbeat(ctx, devPath, interval, ctrl, pre, ctrl.wiring())
+}
+
+// StartHeartbeat is HeartbeatFrom in a goroutine of its own, with ctrl's
+// wiring (the marker's directory, the DB probe, the threshold) read now, in
+// the caller: wiring set after this returns is not seen, so a caller that
+// starts the heartbeat before wiring it gets a heartbeat that pets past its
+// own self-fence marker, which its tests can then see. The pauser's progress
+// is read on every check, so it may be wired later.
+func StartHeartbeat(ctx context.Context, devPath string, interval time.Duration, ctrl *Controller, pre *os.File) {
+	w := ctrl.wiring()
+	go heartbeat(ctx, devPath, interval, ctrl, pre, w)
+}
+
+// controllerWiring is what the heartbeat reads from its controller at start.
+type controllerWiring struct {
+	runDir string
+	probe  func(context.Context) error
+	stale  time.Duration
+}
+
+func (c *Controller) wiring() controllerWiring {
+	if c == nil {
+		return controllerWiring{stale: -1}
+	}
+	probe, _, stale := c.liveness()
+	return controllerWiring{runDir: c.runDir, probe: probe, stale: stale}
+}
+
+func heartbeat(ctx context.Context, devPath string, interval time.Duration, ctrl *Controller, pre *os.File, w controllerWiring) {
 	// A non-empty devPath means the operator explicitly enabled watchdog
 	// fencing (and preflightWatchdog already validated the device exists). An
 	// empty path is the auto/optional case — fall back to the default device
@@ -272,7 +334,22 @@ func Heartbeat(ctx context.Context, devPath string, interval time.Duration, ctrl
 		interval = defaultInterval
 	}
 
-	f, err := os.OpenFile(devPath, os.O_WRONLY, 0)
+	runDir := w.runDir
+	clearBootStreak(runDir)
+	f := pre
+	var err error
+	if f == nil {
+		f, err = os.OpenFile(devPath, os.O_WRONLY, 0)
+	}
+	if SelfFenceMarked(runDir) {
+		slog.Error("watchdog: this host self-fenced since it last booted; this run does not pet the watchdog and stays fenced until the host reboots",
+			"dev", devPath, "marker", runDir)
+		ctrl.SelfFence()
+		if err == nil {
+			leaveArmed(f, devPath, "watchdog left ARMED (self-fenced before this run) — this host will reboot at the hardware watchdog timeout", true)
+		}
+		return
+	}
 	if err != nil {
 		if configured {
 			// Startup preflight passed, so a failure to open the configured
@@ -308,7 +385,7 @@ func Heartbeat(ctx context.Context, devPath string, interval time.Duration, ctrl
 	// UNCONFIRMABLE demotion self-fences (vs. staying up + raising HA-degraded); it does NOT
 	// gate self-demotion itself, which runs regardless of any watchdog. Keep petting whatever
 	// is open (so a softdog doesn't fire spuriously), but leave armed=false otherwise.
-	if hw, id := isHardwareWatchdog(f.Fd()); !hw {
+	if hw, id := isHardwareWatchdogFn(f.Fd()); !hw {
 		slog.Error("watchdog is NOT a trusted hardware watchdog (softdog/unknown); self-fencing is not guaranteed — this host stays not-armed, so a demotion failure raises HA-degraded instead of self-fencing (it still self-demotes on quorum loss)",
 			"dev", devPath, "identity", id)
 	} else {
@@ -324,7 +401,7 @@ func Heartbeat(ctx context.Context, devPath string, interval time.Duration, ctrl
 		// of self-fencing), never a silent false-positive.
 		armWatchdog(f.Fd(), watchdogTimeoutSec(interval))
 		_ = pet()
-		if left, ok := watchdogTimeLeft(f.Fd()); ok && left > 0 {
+		if left, ok := watchdogTimeLeftFn(f.Fd()); ok && left > 0 {
 			slog.Info("hardware watchdog armed (self-fencing available; timer verified counting)", "dev", devPath, "identity", id, "timeleft_s", left)
 			if ctrl != nil {
 				ctrl.armed.Store(true)
@@ -393,6 +470,11 @@ func Heartbeat(ctx context.Context, devPath string, interval time.Duration, ctrl
 
 	slog.Info("watchdog heartbeat started", "dev", devPath, "interval", interval)
 
+	// Liveness gate (liveness.go): only on a configured, verified, armed
+	// watchdog.
+	gate := ctrl.startLivenessGate(ctx, interval, configured && ctrl.Armed(), w)
+	defer gate.stop()
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -407,6 +489,13 @@ func Heartbeat(ctx context.Context, devPath string, interval time.Duration, ctrl
 			slog.Error("watchdog SELF-FENCE tripped — halting keepalives so the hardware watchdog reboots this host")
 			return
 		case <-ticker.C:
+			if why := gate.check(); why != "" {
+				fenced = true
+				slog.Error("watchdog: this daemon is wedged — SELF-FENCING: halting keepalives so the hardware watchdog reboots this host",
+					"reason", why, "threshold", gate.stale)
+				ctrl.SelfFence()
+				return
+			}
 			if err := pet(); err != nil {
 				slog.Error("watchdog keepalive failed", "dev", devPath, "error", err)
 				// Don't return — keep trying; a transient error may recover.

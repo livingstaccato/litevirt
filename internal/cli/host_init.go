@@ -19,6 +19,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fencessh"
 	"github.com/litevirt/litevirt/internal/netutil"
 	"gopkg.in/yaml.v3"
 
@@ -871,7 +872,32 @@ func setupScriptEnvWith(hostName, advertiseAddr, joinPeers, enforcement string) 
 		// Base64: the remote path joins this env into one shell command line,
 		// so a multi-line YAML block must travel as a single token.
 		"ENFORCEMENT_B64=" + base64.StdEncoding.EncodeToString([]byte(enforcement)),
+		// Managed fence SSH: the sshd drop-in that has root read the rendered
+		// authorized_keys (fencessh.InstallScript), evaluated for a fence from
+		// each join peer's address and from this host's own. 0 is
+		// --no-fence-ssh, for a site whose sshd is configuration-managed.
+		"FENCE_SSH_DROPIN=" + fenceSSHDropInEnv(),
+		"FENCE_SSH_PEERS=" + fencessh.PeerAddresses(joinPeers),
+		"FENCE_SSH_SELF=" + fencessh.PeerAddresses(advertiseAddr),
 	}
+}
+
+// installFenceSSHDropIn is whether `lv host init` and `lv host add` install
+// the sshd drop-in; --no-fence-ssh clears it (SetFenceSSHDropIn).
+var installFenceSSHDropIn = true
+
+// SetFenceSSHDropIn sets whether this command's `lv host init` or `lv host
+// add` installs the managed fence SSH sshd drop-in (--no-fence-ssh: false).
+// Without it the daemon still renders /etc/litevirt/ssh, and the host
+// reports that it does not accept the managed fence key until its sshd reads
+// the file; `lv doctor fence` says what to add.
+func SetFenceSSHDropIn(on bool) { installFenceSSHDropIn = on }
+
+func fenceSSHDropInEnv() string {
+	if installFenceSSHDropIn {
+		return "1"
+	}
+	return "0"
 }
 
 // newClusterEnforcement is the enforcement block a brand-new cluster starts
@@ -914,6 +940,8 @@ const newClusterEnforcement = `enforcement:
   recovery_claim: true        # this build's default, written out so a host rolled back to
                               # an older build (which reads a missing key as false) keeps
                               # enforcing single-winner recovery claims
+  fence_ssh: managed          # an ssh fence uses the managed fence key only, pinned to the
+                              # target's published sshd keys; never root's own ssh setup
 `
 
 // enforcementYAML decides what enforcement block a host being initialised
@@ -1109,6 +1137,18 @@ mkdir -p "$(dirname ` + systemdunit.NeedrestartPath + `)"
 cat > ` + systemdunit.NeedrestartPath + ` << 'DROPIN'
 ` + systemdunit.Needrestart + `DROPIN
 systemctl daemon-reload
+
+# Managed fence SSH: have sshd read the rendered fence authorized_keys for
+# root (validated with sshd -t and rolled back on a refusal). The daemon
+# renders the files and publishes whether sshd accepts the managed key.
+` + fencessh.InstallScript + `
+if [ "${FENCE_SSH_DROPIN:-1}" != 0 ]; then
+    lv_fence_ssh_install || echo "fence ssh: the drop-in was not installed"
+else
+    install -d -m 0755 /etc/litevirt/ssh
+    echo "fence ssh: --no-fence-ssh; add /etc/litevirt/ssh/authorized_keys to root's AuthorizedKeysFile by hand"
+fi
+
 systemctl enable litevirt.service
 if [ "${LITEVIRT_DEFER_START:-}" != "1" ]; then
     systemctl restart litevirt.service

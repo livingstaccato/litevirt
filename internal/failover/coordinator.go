@@ -139,6 +139,10 @@ type Coordinator struct {
 	hostName string
 	db       *corrosion.Client
 	fencer   Fencer
+	// FenceSSH decides how an ssh or best-effort fence from this node
+	// reaches its target (fencessh.Agent.FenceConfig): managed, pinned, or
+	// refused. Nil is the legacy path, unpinned.
+	FenceSSH func(ctx context.Context, target string) fence.SSHFence
 	// capacity is the cluster-wide capacity policy; see placement.Request.Capacity.
 	capacity corrosion.CapacityPolicy
 	// nicGuardPlacement: SetNICGuardPlacement.
@@ -351,6 +355,8 @@ type Coordinator struct {
 	// onGateRefused observes gate refusals at decide sites (nil-safe; daemon wires
 	// it to litevirt_runtime_action_refused_total).
 	onGateRefused func(action, reason string)
+	// fenceHeldDecided is a test seam (SetFenceHeldDecidedForTest).
+	fenceHeldDecided func(host string)
 	// scope is this cycle's quorum rule — the failover_scope policy and the
 	// voter set with every host's region — read once at the top of run. The
 	// zero value is the cluster-wide rule, so a path reached outside run (a
@@ -664,6 +670,15 @@ func (c *Coordinator) upgradingTimeout() time.Duration {
 		return c.UpgradingTimeout
 	}
 	return upgradingTimeout
+}
+
+// fenceSSHPath is how an SSH fence from this coordinator reaches target
+// (FenceSSH), the legacy path when none is wired.
+func (c *Coordinator) fenceSSHPath(ctx context.Context, target string) fence.SSHFence {
+	if c.FenceSSH == nil {
+		return fence.SSHFence{}
+	}
+	return c.FenceSSH(ctx, target)
 }
 
 // SetFencer replaces the fence implementation. Test-only; production code
@@ -1109,6 +1124,12 @@ func (c *Coordinator) run(ctx context.Context) {
 				// (an operator's, another coordinator's), or its own failed
 				// fence due a retry: the cache must not hide either (lab drill
 				// S5). The ordinary path below re-reads both and decides.
+			case h.State == "offline" && c.fenceHeldStands(ctx, target):
+				// A held fence (ha.fence_held) whose condition reached this
+				// replica after the 'offline' it records: the two replicate as
+				// separate entries, so this coordinator may have cached the
+				// host as terminal first. The hold is re-decided every cycle
+				// until a fence of the host is recorded since it was raised.
 			default:
 				continue
 			}
@@ -1221,7 +1242,21 @@ func (c *Coordinator) run(ctx context.Context) {
 				}
 			}
 		}
-		if !afresh && !retry && (h.State == "offline" || h.State == "maintenance" || h.State == "fenced") {
+		// held: h is 'offline' because its fence was held, nothing on it
+		// needing one (ha.fence_held, holdUnneededFence). That is a decision
+		// re-made every cycle, never a terminal state: it goes down the path
+		// below, where the fence runs the moment something needs it. Unread,
+		// the host is skipped this cycle without the cache.
+		held := false
+		if !afresh && !retry && !recorded && h.State == "offline" {
+			var herr error
+			if held, herr = c.fenceHeld(ctx, target); herr != nil {
+				slog.Warn("failover: read "+CondFenceHeld+" failed, skipping", "host", target, "error", herr)
+				c.mAttempt(PhaseHealth, ResultError, ErrDBError)
+				continue
+			}
+		}
+		if !afresh && !retry && !held && (h.State == "offline" || h.State == "maintenance" || h.State == "fenced") {
 			// A 'fenced' host WITHOUT that proof is not settled, it is unproven:
 			// hosts.state and fencing_log replicate independently, so the state
 			// can land here a cycle or more before the row that authorises the
@@ -1327,6 +1362,14 @@ func (c *Coordinator) run(ctx context.Context) {
 			continue
 		}
 
+		// Last, immediately before the fence: a fence that nothing on the host
+		// needs is held, the host recorded offline and ha.fence_held raised
+		// (holdUnneededFence). Not for a fence afresh on an operator's
+		// confirmation: the operator has already powered the host off.
+		if !afresh && c.holdUnneededFence(ctx, h) {
+			continue
+		}
+
 		slog.Warn("failover: quorum reached — host exceeded failure threshold",
 			"host", target, "observers", cand.Observers, "quorum", c.scope.quorum(target),
 			"region_scoped", c.scope.region)
@@ -1363,6 +1406,7 @@ func (c *Coordinator) run(ctx context.Context) {
 	}
 	c.resolveOneWayGone(ctx, candTargets)
 	c.resolveRefenceSettled(ctx)
+	c.resolveFenceHeldSettled(ctx)
 
 	// Recovery pass: bring a host the coordinator marked down (offline, or a
 	// spurious no-VMs-moved fence) back to 'active' once a fresh quorum agrees
@@ -3580,6 +3624,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 		WatchdogDev:   h.WatchdogDev,
 		// A retired credential is reported, never sent as an empty password.
 		IPMICredentialRetired: h.IPMIPassRetired,
+		SSH:                   c.fenceSSHPath(fenceCtx, h.Name),
 	})
 	// A best-effort fence that did not reach the host is recorded as
 	// self-pause when this coordinator relies on the host's partition pause
@@ -3892,6 +3937,26 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 		c.mAttempt(PhaseSplitBrain, ResultOK, ErrManualConfirmed)
 	}
 
+	// A fence that ends a hold (ha.fence_held) and did not reach the host
+	// recovers nothing until an operator confirms the host off: what it would
+	// recover became recoverable during the hold, so the host's partition pause
+	// never paused it, and it may still run there (heldThisOutage).
+	if fr.Method == "best-effort-ssh" && c.heldThisOutage(ctx, h.Name) {
+		if why, ok := c.confirmedOffNow(ctx, h.Name, life, lifeKnown); !ok {
+			if why != "" {
+				return // refused with its remedy (noteConfirmationStale)
+			}
+			slog.Error("failover: the fence ending a held fence did not reach the host, NOT rescheduling",
+				"host", h.Name, "detail", fr.Detail,
+				"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off; the recovery resumes from it")
+			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
+			c.noteHold(h.Name, "best-effort fence after a held fence did not reach the host; awaiting 'lv host fence-confirm "+h.Name+"'")
+			return
+		}
+		slog.Info("failover: operator confirmed a host whose fence was held, proceeding", "host", h.Name)
+		c.mAttempt(PhaseSplitBrain, ResultOK, ErrManualConfirmed)
+	}
+
 	// Per-host "an unverified fence is not enough" (LabelFenceRequiresConfirmation).
 	// A successful fence that did not VERIFY the power-off — SSH, or best-effort
 	// in either of its forms — is treated like a manual one: reschedule only on
@@ -4085,6 +4150,9 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 	}
 	plans := make([]failoverPlan, 0, len(vms))
 	placementReqs := make([]placement.Request, 0, len(vms))
+	// The PCI passthrough devices of each VM placed with them, described
+	// for its hold (pci_devices.go).
+	devHeld := map[string][]string{}
 
 	// A VM recorded migrating may run on the migration's target: it is
 	// started nowhere until the target is asked (migrating_row.go).
@@ -4117,6 +4185,10 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 					req := buildFailoverPlacementRequest(vm, h.Name, c.capacity, pinDown)
 					c.addPlacementLabels(ctx, &req, vm.Name)
 					c.resolveUSBPlacement(ctx, &req)
+					if _, hold := c.addDevicePlacement(ctx, &req, vm); hold != "" {
+						c.skipStoppedVM(ctx, h.Name, vm, stoppedVMDetail(h.Name)+"; not moved: "+hold)
+						continue
+					}
 					req.RequireRegion = c.vmRecoveryRegion(h.Name, vm)
 					placementReqs = append(placementReqs, req)
 					plans = append(plans, failoverPlan{vm: vm, needsPlacement: true, rekeyStopped: true})
@@ -4314,6 +4386,14 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			req := buildFailoverPlacementRequest(vm, h.Name, c.capacity, pinDown)
 			c.addPlacementLabels(ctx, &req, vm.Name)
 			c.resolveUSBPlacement(ctx, &req)
+			devs, hold := c.addDevicePlacement(ctx, &req, vm)
+			if hold != "" {
+				c.holdForDevices(ctx, h.Name, vm, nil, hold)
+				continue
+			}
+			if len(devs) > 0 {
+				devHeld[vm.Name] = devs
+			}
 			if pin := vmSpecPin(vm); pin != "" && pin != h.Name && req.PinHost == "" {
 				slog.Warn("failover: the VM's pinned host is down; recovering it elsewhere for this outage, its pin unchanged",
 					"vm", vm.Name, "pinned_host", pin, "pinned_host_state", hostState[pin], "from", h.Name)
@@ -4358,7 +4438,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		// and the operator (or the next placement input change) recovers them;
 		// hard constraints that no surviving host satisfies must strand the
 		// workload, not relocate it somewhere it was never allowed to run.
-		if selected, err := placement.SelectBatch(c.pitOverlaySafeTargets(ctx, candidates), allVMs, nil, ctMem,
+		if selected, err := c.selectBatch(ctx, c.pitOverlaySafeTargets(ctx, candidates), allVMs, ctMem,
 			observations, c.now(), placementReqs); err != nil {
 			slog.Error("failover: batch placement failed — affected VMs are left for operator recovery, NOT round-robined",
 				"host", h.Name, "error", err)
@@ -4387,6 +4467,14 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				detail := "no eligible host satisfies its placement constraints after fencing " + h.Name
 				if result.Err != nil {
 					detail += ": " + result.Err.Error()
+				}
+				if devs := devHeld[vm.Name]; len(devs) > 0 {
+					why := ""
+					if result.Err != nil {
+						why = result.Err.Error()
+					}
+					c.holdForDevices(ctx, h.Name, vm, devs, why)
+					continue
 				}
 				slog.Warn("failover: no eligible host for VM — left for operator recovery, NOT round-robined",
 					"vm", vm.Name, "from", h.Name, "reason", result.Err)
@@ -4527,6 +4615,10 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		c.mVM(ActionReschedule, ResultSuccess, errClassNone)
 
 		c.audit(ctx, "failover", vm.Name, "rescheduled from "+h.Name+" to "+targetName, "ok")
+		// A hold an earlier pass recorded (for its PCI devices) is over.
+		if err := health.ResolveHeldMoved(ctx, c.db, c.hostName, vm.Name, h.Name, c.now()); err != nil {
+			slog.Warn("failover: could not clear the hold of a VM recovered since", "vm", vm.Name, "error", err)
+		}
 		c.noteDiskStranded(ctx, h.Name, vm, targetName)
 		// The VM may now run on its own replica target: replicate back to the
 		// host it left (or leave the schedule suspended, reported by its runs).

@@ -138,6 +138,17 @@ var releaseFeatures = map[Feature]FeatureInfo{
 
 	FeatureAutomationStream: {Token: Release202611V1, Description: "Certified automation history, retained recovery provenance, and managed-resource state"},
 	FeatureSGProjects:       {Token: Release202611V1, Description: "Security groups owned by a project (used when a group is created with a project)", Writers: []string{"internal/corrosion.InsertProjectSecurityGroup"}},
+
+	// release_2026_12_v1. release_2026_11_v1's set is frozen, so a feature
+	// declared after it gates on the next release token.
+	//
+	// fence_ssh is used by default: every host publishes its own row as soon
+	// as the token latches, because a published row is what pins its sshd
+	// host keys for every fence aimed at it (the legacy path included). So
+	// the first daemon tick after the latch marks it used, and from then on a
+	// rollback below release_2026_12_v1 quarantines.
+	FeatureFenceSSH: {Token: Release202612V1, Description: "Managed node-to-node fence SSH: each host's signed fence key and sshd host keys, rendered into a restricted authorized_keys and a pinned known_hosts on every peer (used by default once the release latches)",
+		Writers: []string{"internal/corrosion.PutHostFenceSSH"}},
 }
 
 // firewallRuleWriters write the three rule tables. Each takes one grant per
@@ -219,6 +230,12 @@ const (
 	FeatureSGProjects        Feature = "sg_projects"
 )
 
+// The features of release_2026_12_v1. Each name is written into a replicated
+// key once used, so it never changes.
+const (
+	FeatureFenceSSH Feature = "fence_ssh"
+)
+
 // LookupFeature returns a declared feature's token and description.
 func LookupFeature(f Feature) (FeatureInfo, bool) {
 	info, ok := releaseFeatures[f]
@@ -259,6 +276,7 @@ const MarkerRollbackKey = "rollback"
 // "nothing written that a previous build cannot keep".
 var rollbackRules = map[string]string{
 	Release202611V1: RollbackSafeIfUnused,
+	Release202612V1: RollbackSafeIfUnused,
 }
 
 // RollbackRule returns the rollback rule token's marker carries, or "".
@@ -290,6 +308,7 @@ func Honoured(token string, feature Feature) bool {
 // token's entry is true, because the build below it is a release-token build.
 var ruleAwareBelow = map[string]bool{
 	Release202611V1: false,
+	Release202612V1: true,
 }
 
 // RuleHonouredBelow reports whether a rollback below token lands on a build

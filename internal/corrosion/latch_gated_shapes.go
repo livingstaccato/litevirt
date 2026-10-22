@@ -22,6 +22,9 @@ var latchGatedShapes = map[string][]string{
 		hostOwnEndpointSQL,        // WriteOwnEndpoint (host_incarnation)
 		deleteHostAdmissionSQL,    // DeleteHostAdmissionIf (RemoveHost, ReleaseTokenLatched)
 	},
+	capabilities.Release202612V1: {
+		HostFenceSSHUpsertSQL, // PutHostFenceSSH (fence_ssh)
+	},
 }
 
 // LatchGatedShapes returns token's latch-gated statements (latchGatedShapes).

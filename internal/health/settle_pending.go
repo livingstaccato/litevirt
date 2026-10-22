@@ -234,6 +234,9 @@ type settleRecorder struct {
 	// foreignLogged rate-limits the line for a record another host name wrote
 	// (file name → last logged).
 	foreignLogged sync.Map
+	// captures is the host's memory snapshot registry: dropping a VM's
+	// pause record drops the pauser's hold with it.
+	captures *lv.CaptureRegistry
 	// waitLogged rate-limits the line for a record waiting on a copy that is
 	// neither live nor shut off (file name → last logged).
 	waitLogged sync.Map
@@ -242,6 +245,9 @@ type settleRecorder struct {
 	// that could not be saved does not let a later live copy of the name drop
 	// the record.
 	provenStopped sync.Map
+	// retryCursor (kind → record file) is where the last budgeted retry pass
+	// stopped; the next starts after it. Only the owning loop touches it.
+	retryCursor map[string]string
 }
 
 // settleWaitLogEvery is how often a record still waiting on its copy is
@@ -433,59 +439,93 @@ func (w *settleRecorder) raise(ctx context.Context, rec settlePending) error {
 // a stop this run proved counts even when that save failed, and the save is
 // retried on every pass until it holds. A stopping-phase
 // record that already wrote part of its record was proven then.
-func (w *settleRecorder) retry(ctx context.Context, kind string, state func(name string) (settleCopyState, string)) {
+//
+// more, when not nil, is asked before each record and stops the pass when it
+// says no; the records not reached wait for the next pass. When it says yes
+// it gives the record's deadline: everything the record does runs under a
+// context that ends then (a partition-pause pass bounds each step, §4.1 R).
+func (w *settleRecorder) retry(ctx context.Context, kind string, state func(ctx context.Context, name string) (settleCopyState, string),
+	more func() (time.Time, bool)) {
 	store := w.store()
 	recs, err := store.list(kind)
 	if err != nil {
 		slog.Warn("partition-settle: pending-settle records unreadable", "kind", kind, "error", err)
 		return
 	}
-	for i := range recs {
-		rec := &recs[i]
-		if rec.Host != w.host {
-			w.noteForeign(*rec)
-			continue
+	if more != nil {
+		// A budgeted pass starts where the last one stopped, so one record
+		// that is slow on every pass cannot starve the rest.
+		sort.Slice(recs, func(i, j int) bool { return settleKey(recs[i]) < settleKey(recs[j]) })
+		if cur := w.retryCursor[kind]; cur != "" {
+			k := sort.Search(len(recs), func(i int) bool { return settleKey(recs[i]) > cur })
+			recs = append(append([]settlePending{}, recs[k:]...), recs[:k]...)
 		}
-		proven := rec.Phase == settlePhaseStopped || rec.Audited || rec.Raised
-		if detail, ok := w.provenThisRun(*rec); ok && !proven {
-			// The stopped-phase save failed when this run proved the stop;
-			// retry it now, since the in-run proof dies with the daemon.
-			rec.Phase, rec.Detail, proven = settlePhaseStopped, detail, true
-			if err := w.putStopped(store, *rec); err != nil {
-				slog.Warn("partition-settle: could not mark the pending-settle record stopped", "kind", rec.Kind, "name", rec.Name, "error", err)
-			}
-		}
-		if !proven {
-			st, seen := state(rec.Name)
-			switch st {
-			case copyLive:
-				slog.Warn("partition-settle: a settle begun before a restart or a failed stop never stopped its copy; "+
-					"the settle decides again", "kind", rec.Kind, "name", rec.Name)
-				if err := store.remove(*rec); err != nil {
-					slog.Warn("partition-settle: could not drop the pending-settle record", "kind", rec.Kind, "name", rec.Name, "error", err)
-				}
-				continue
-			case copyUnproven:
-				w.noteWaiting(*rec, seen)
-				continue
-			}
-			if seen != "" && !strings.Contains(rec.Detail, "; found ") {
-				rec.Detail += "; found " + seen + " after a restart or a failed stop, so the settle's own stop may not be what stopped it"
-			}
-			rec.Phase = settlePhaseStopped
-			w.markProven(*rec)
-			if err := w.putStopped(store, *rec); err != nil {
-				slog.Warn("partition-settle: could not mark the pending-settle record stopped", "kind", rec.Kind, "name", rec.Name, "error", err)
-			}
-		}
-		if !w.write(ctx, store, rec, true) {
-			continue
-		}
-		slog.Info("partition-settle: wrote the record of an earlier settle", "kind", rec.Kind, "name", rec.Name,
-			"proof", rec.Proof, "stopped_at", rec.At)
-		w.dropMatchingPause(*rec)
-		w.dropRecord(store, *rec)
 	}
+	for i := range recs {
+		if more == nil {
+			w.retryOne(ctx, store, &recs[i], state)
+			continue
+		}
+		deadline, ok := more()
+		if !ok {
+			return
+		}
+		if w.retryCursor == nil {
+			w.retryCursor = map[string]string{}
+		}
+		w.retryCursor[kind] = settleKey(recs[i])
+		rctx, cancel := context.WithDeadline(ctx, deadline)
+		w.retryOne(rctx, store, &recs[i], state)
+		cancel()
+	}
+}
+
+// retryOne is retry for one record.
+func (w *settleRecorder) retryOne(ctx context.Context, store settlePendingStore, rec *settlePending,
+	state func(ctx context.Context, name string) (settleCopyState, string)) {
+	if rec.Host != w.host {
+		w.noteForeign(*rec)
+		return
+	}
+	proven := rec.Phase == settlePhaseStopped || rec.Audited || rec.Raised
+	if detail, ok := w.provenThisRun(*rec); ok && !proven {
+		// The stopped-phase save failed when this run proved the stop;
+		// retry it now, since the in-run proof dies with the daemon.
+		rec.Phase, rec.Detail, proven = settlePhaseStopped, detail, true
+		if err := w.putStopped(store, *rec); err != nil {
+			slog.Warn("partition-settle: could not mark the pending-settle record stopped", "kind", rec.Kind, "name", rec.Name, "error", err)
+		}
+	}
+	if !proven {
+		st, seen := state(ctx, rec.Name)
+		switch st {
+		case copyLive:
+			slog.Warn("partition-settle: a settle begun before a restart or a failed stop never stopped its copy; "+
+				"the settle decides again", "kind", rec.Kind, "name", rec.Name)
+			if err := store.remove(*rec); err != nil {
+				slog.Warn("partition-settle: could not drop the pending-settle record", "kind", rec.Kind, "name", rec.Name, "error", err)
+			}
+			return
+		case copyUnproven:
+			w.noteWaiting(*rec, seen)
+			return
+		}
+		if seen != "" && !strings.Contains(rec.Detail, "; found ") {
+			rec.Detail += "; found " + seen + " after a restart or a failed stop, so the settle's own stop may not be what stopped it"
+		}
+		rec.Phase = settlePhaseStopped
+		w.markProven(*rec)
+		if err := w.putStopped(store, *rec); err != nil {
+			slog.Warn("partition-settle: could not mark the pending-settle record stopped", "kind", rec.Kind, "name", rec.Name, "error", err)
+		}
+	}
+	if !w.write(ctx, store, rec, true) {
+		return
+	}
+	slog.Info("partition-settle: wrote the record of an earlier settle", "kind", rec.Kind, "name", rec.Name,
+		"proof", rec.Proof, "stopped_at", rec.At)
+	w.dropMatchingPause(*rec)
+	w.dropRecord(store, *rec)
 }
 
 // dropMatchingPause drops the pause record of the copy rec settled, and only
@@ -502,6 +542,10 @@ func (w *settleRecorder) dropMatchingPause(rec settlePending) {
 	}
 	if err := RemovePauseRecord(w.dataDir, rec.Kind, rec.Name); err != nil {
 		slog.Warn("partition-settle: could not drop the pause record", "kind", rec.Kind, "name", rec.Name, "error", err)
+		return
+	}
+	if rec.Kind == PauseKindVM {
+		w.captures.Release(rec.Name)
 	}
 }
 
@@ -550,15 +594,16 @@ func (r *Reconciler) retryPendingSettles(ctx context.Context, localDomains []str
 	for _, d := range localDomains {
 		defined[d] = true
 	}
-	r.settleRec().retry(ctx, PauseKindVM, func(name string) (settleCopyState, string) {
+	r.settleRec().retry(ctx, PauseKindVM, func(_ context.Context, name string) (settleCopyState, string) {
 		return vmSettleCopyState(defined, r.virt.DomainStateReason, name)
-	})
+	}, nil)
 }
 
 // settleRec is the reconciler's settle recorder, built on first use.
 func (r *Reconciler) settleRec() *settleRecorder {
 	r.settleRecOnce.Do(func() {
 		r.settleRecorder = &settleRecorder{db: r.db, host: r.hostName, dataDir: r.dataDir, now: func() time.Time { return r.now() },
+			captures: r.captures,
 			fault: func(step string) error {
 				if r.settleFault == nil {
 					return nil
@@ -573,6 +618,7 @@ func (r *Reconciler) settleRec() *settleRecorder {
 func (p *PartitionPauser) settleRec() *settleRecorder {
 	p.settleRecOnce.Do(func() {
 		p.settleRecorder = &settleRecorder{db: p.db, host: p.host, dataDir: p.dataDir, now: func() time.Time { return p.now() },
+			captures: p.captures,
 			fault: func(step string) error {
 				if p.settleFault == nil {
 					return nil
@@ -618,9 +664,22 @@ func (p *PartitionPauser) ctSettleCopyState(ctx context.Context, name string) (s
 }
 
 // retryPendingSettles completes this host's container settle records
-// (settleRecorder.retry).
-func (p *PartitionPauser) retryPendingSettles(ctx context.Context) {
-	p.settleRec().retry(ctx, PauseKindContainer, func(name string) (settleCopyState, string) {
-		return p.ctSettleCopyState(ctx, name)
+// (settleRecorder.retry), each a step of the resume pass.
+func (p *PartitionPauser) retryPendingSettles(ctx context.Context, pass *resumePass) {
+	first := true
+	p.settleRec().retry(ctx, PauseKindContainer, func(sctx context.Context, name string) (settleCopyState, string) {
+		return p.ctSettleCopyState(sctx, name)
+	}, func() (time.Time, bool) {
+		st, ok := pass.step(first)
+		first = false
+		return st.deadline, ok
 	})
+}
+
+// settleKey orders pending-settle records for a budgeted pass.
+func settleKey(r settlePending) string {
+	if fn, err := settlePendingFile(r); err == nil {
+		return fn
+	}
+	return r.Kind + "/" + r.Name + "/" + r.AuditID
 }

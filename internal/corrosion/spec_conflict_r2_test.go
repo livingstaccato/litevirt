@@ -9,15 +9,25 @@ import (
 
 // These use only what 58f7754f already had, so each can be shown red there.
 
+// eventsQuoting counts the dropped-edit events on p whose detail quotes part.
+// The events are recorded asynchronously, one per dropped edit, and a replica
+// can drop more than one (c here drops both the owner's edit and b's first), so
+// the first event to land is not necessarily the one asked about: wait for one
+// that quotes part, not for any.
 func eventsQuoting(t *testing.T, p *specPeer, part string) int {
 	t.Helper()
-	n := 0
-	for _, e := range droppedEvents(t, p, 1) {
-		if strings.Contains(e.Detail, part) {
-			n++
+	for want := 1; ; want++ {
+		evs := droppedEvents(t, p, want)
+		n := 0
+		for _, e := range evs {
+			if strings.Contains(e.Detail, part) {
+				n++
+			}
+		}
+		if n > 0 || len(evs) < want {
+			return n
 		}
 	}
-	return n
 }
 
 func edit(t *testing.T, p *specPeer, spec string) {

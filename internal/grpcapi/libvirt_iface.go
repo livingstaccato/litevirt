@@ -157,8 +157,9 @@ type LibvirtBackend interface {
 	// type, from its definition on this host.
 	DomainDiskFormats(domainName string) (map[string]string, error)
 	// Live/RAM snapshots (#3): capture guest RAM into vmstatePath alongside the
-	// external disk snapshot, and revert both to the snapshot instant.
-	CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, captureSuspended func() error) (diskBytes, vmstateBytes int64, err error)
+	// external disk snapshot, in the running QEMU process, and revert both to
+	// the snapshot instant.
+	CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, o libvirt.CaptureOptions) (diskBytes, vmstateBytes int64, err error)
 	RevertToLiveSnapshot(domainName, snapshotName, vmstatePath string, restorePreDefine func() error, rewriteSaved func(savedXML string) (string, error)) error
 	// DomainDiskSources returns target-dev → live source-file. Used to reconcile
 	// vm_disks.path after a snapshot op moves the domain onto an overlay

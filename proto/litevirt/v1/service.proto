@@ -1752,7 +1752,18 @@ message ConvertContainerRequest {
 }
 
 message StartContainerRequest  { string host_name = 1; string name = 2; }
-message StopContainerRequest   { string host_name = 1; string name = 2; int32 timeout_sec = 3; }
+message StopContainerRequest {
+    string host_name = 1;
+    string name = 2;
+    int32 timeout_sec = 3;
+    // force lets the stop go ahead on a host in write quarantine, which cannot
+    // record it on the container's row: the stop is first recorded in a local
+    // marker on that host, then the container is stopped, and the host records
+    // it on the row once the quarantine lifts. Without it such a stop is refused
+    // (FailedPrecondition). Out of quarantine it changes nothing. A server older
+    // than the field ignores it.
+    bool force = 4;
+}
 message DeleteContainerRequest {
     string host_name = 1;
     string name = 2;
@@ -4693,6 +4704,12 @@ service LiteVirt {
     // possibly stale UEFI vars store (accept_stale_uefi_vars).
     rpc ResolveHealthCondition(ResolveHealthConditionRequest) returns (ResolveHealthConditionResponse);
     rpc GetFenceReadiness(google.protobuf.Empty)  returns (FenceReadiness);
+    // GetFenceSSHStatus is the answering host's view of managed fence SSH
+    // (internal/fencessh): every host's row as it holds it, the path a fence
+    // from it would take to each, and its last probe of each. With fan_out it
+    // also asks every other host for its own view, for the pair matrix
+    // `lv doctor fence` prints. DIAGNOSTIC ONLY.
+    rpc GetFenceSSHStatus(FenceSSHStatusRequest) returns (FenceSSHStatus);
     rpc RemoveHost(RemoveHostRequest)          returns (RemoveHostResponse);
     // PreflightRemoveHost runs every refusal RemoveHost would give the same
     // request and removes nothing. `lv host rm` calls it before it revokes the
@@ -5758,6 +5775,9 @@ message UpgradeStatus {
     // refused_peers are the peers this host is refusing replication from
     // because they cannot keep a release feature in use.
     repeated string refused_peers = 12;
+    // self_upgrade_skipped names each pre-release peer build the automatic
+    // self-upgrade declined to follow, with how to upgrade to it.
+    repeated string self_upgrade_skipped = 13;
 }
 
 // LaggingHost is a host not yet on the answering host's release.
@@ -6521,4 +6541,56 @@ message AutomationSourceExportResponse {
     int64 terminal_records = 9;
     int64 terminal_bytes = 10;
     string terminal_digest = 11;
+}
+
+// ── Managed fence SSH status (diagnostic) ──
+//
+// Appended at the end, like the fence readiness messages, so every existing
+// message keeps its index.
+
+// FenceSSHStatusRequest: fan_out asks the answering host to collect every
+// other live host's own view as well.
+message FenceSSHStatusRequest {
+    bool fan_out = 1;
+}
+
+// FenceSSHPeer is one host as the reporting host holds and reaches it.
+message FenceSSHPeer {
+    string host           = 1;
+    // row: verified | unverified | missing | retired. Only a verified row is
+    // rendered or pinned; a host with any other row except missing is never
+    // fenced without its pin, so it is refused.
+    string row            = 2;
+    // Why the row does not verify, or the host's own reason it does not
+    // accept the managed fence key.
+    string row_detail     = 3;
+    bool   accepting      = 4;
+    bool   ever_accepting = 5;
+    int64  generation     = 6;
+    string cert_serial    = 7;  // the certificate that signed the row
+    string address        = 8;  // the certificate address its key is accepted from
+    // path: how a fence from the reporting host reaches it — managed,
+    // legacy-pinned, legacy-unpinned, refused, or self.
+    string path           = 9;
+    string path_detail    = 10;
+    bool   probed         = 11;
+    bool   probe_ok       = 12;
+    string probe_detail   = 13;
+    string probed_at      = 14; // RFC3339
+}
+
+// FenceSSHNode is one host's own view.
+message FenceSSHNode {
+    string host                = 1;
+    // reachable=false: the host did not answer, and its view is unknown.
+    bool   reachable           = 2;
+    string error               = 3;
+    string mode                = 4;  // its enforcement.fence_ssh: managed | auto | legacy
+    string last_error          = 5;  // its agent's last sync failure
+    repeated FenceSSHPeer peers = 6;
+}
+
+message FenceSSHStatus {
+    repeated FenceSSHNode nodes = 1;
+    string generated_at         = 2;  // RFC3339
 }

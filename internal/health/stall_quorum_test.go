@@ -163,6 +163,21 @@ func (sc *stallCluster) fencedHosts() []string {
 	return append([]string(nil), sc.fenced...)
 }
 
+// needsFence records a running restart-same VM on host, so a quorum that
+// fails host has something to recover and fences it. A failed host with
+// nothing on it needing a fence is held, not fenced (failover.CondFenceHeld);
+// a scenario about WHEN a dead host is fenced needs one that must be.
+func (sc *stallCluster) needsFence(host string) {
+	sc.t.Helper()
+	name := "held-for-" + host
+	if err := corrosion.InsertVM(context.Background(), sc.db, corrosion.VMRecord{
+		Name: name, HostName: host, State: "running", Spec: `{"on_host_failure":"restart-same"}`,
+	}, nil, []corrosion.DiskRecord{{VMName: name, DiskName: "root", HostName: host,
+		Path: "/var/lib/litevirt/disks/" + name + ".qcow2", SizeBytes: 1 << 30}}); err != nil {
+		sc.t.Fatalf("InsertVM %s: %v", name, err)
+	}
+}
+
 // A cluster whose observers are all being descheduled — the lab's laptop,
 // out of memory and swapping its qemu processes — must not agree that a
 // healthy peer died. Each observer's probe of node-4 runs out its deadline
@@ -265,6 +280,7 @@ func TestStall_ClusterWidePauseAloneDoesNotFence(t *testing.T) {
 // discarded, not topped up.
 func TestStall_ADeadHostIsStillFencedWithinTheBound(t *testing.T) {
 	sc := newStallCluster(t, "node-1", "node-2", "node-3", "node-4")
+	sc.needsFence("node-4")
 	sc.tick()
 
 	sc.setDead("node-4", true)
@@ -303,6 +319,44 @@ func TestStall_ADeadHostIsStillFencedWithinTheBound(t *testing.T) {
 	if earliest := health.StallGrace + (failuresNeeded-1)*probeTick; fencedAfter < earliest {
 		t.Fatalf("dead host fenced %v after resume; a verdict made only of probes after the %v grace window needs at least %v",
 			fencedAfter, health.StallGrace, earliest)
+	}
+}
+
+// The bound above is for a dead host that something needs fenced. One with
+// nothing to recover is held instead (failover.CondFenceHeld): once the stall
+// guard lets its failures count, a quorum fails it and it is recorded offline,
+// never fenced, however long it stays dead.
+func TestStall_ADeadHostWithNothingToRecoverIsHeldNotFenced(t *testing.T) {
+	sc := newStallCluster(t, "node-1", "node-2", "node-3", "node-4")
+	sc.tick()
+
+	sc.setDead("node-4", true)
+	for i := 0; i < 4; i++ {
+		sc.tick()
+	}
+	for _, n := range sc.nodes {
+		n.clock.advance(10 * time.Minute)
+	}
+	for i := 0; i < 40; i++ {
+		sc.tick()
+	}
+	if got := sc.fencedHosts(); len(got) != 0 {
+		t.Fatalf("fenced %v: node-4 runs nothing a failover would move, so its fence must be held", got)
+	}
+	ctx := context.Background()
+	h, err := corrosion.GetHost(ctx, sc.db, "node-4")
+	if err != nil || h == nil {
+		t.Fatalf("GetHost node-4: %v", err)
+	}
+	if h.State != "offline" {
+		t.Fatalf("node-4 state %q, want offline: the quorum's verdict must still be recorded", h.State)
+	}
+	row, ok, err := corrosion.GetHealthCondition(ctx, sc.db, failover.RefenceEvaluator, failover.CondFenceHeld, "host", "node-4")
+	if err != nil {
+		t.Fatalf("read %s: %v", failover.CondFenceHeld, err)
+	}
+	if !ok || row.Lifecycle == corrosion.ConditionResolved {
+		t.Fatalf("%s for node-4: present=%v lifecycle=%q, want an open hold", failover.CondFenceHeld, ok, row.Lifecycle)
 	}
 }
 
@@ -367,6 +421,7 @@ func TestStall_PeersGetAGraceWindowToAnswerAfterAClusterWidePause(t *testing.T) 
 // same evidence.
 func TestStall_ACoordinatorThatStalledDefersTheFence(t *testing.T) {
 	sc := newStallCluster(t, "node-1", "node-2", "node-3", "node-4", "node-5")
+	sc.needsFence("node-5")
 	sc.tick()
 
 	sc.setDead("node-5", true)

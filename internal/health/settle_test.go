@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -79,6 +80,31 @@ func newSettleFixture(t *testing.T) *settleFixture {
 		return f.cert, f.certErr
 	})
 	return f
+}
+
+// runningCopy turns the local copy into a RUNNING one on a host that never
+// paused: no pause record, identified by its managed stamp and owner-epoch
+// metadata (TestSettle_DomainMetadataIsEvidenceToo).
+func (f *settleFixture) runningCopy() {
+	f.t.Helper()
+	if err := RemovePauseRecord(f.dataDir, PauseKindVM, "vm-a"); err != nil {
+		f.t.Fatal(err)
+	}
+	f.virt.SetState("vm-a", libvirtfake.StateRunning)
+	if err := f.virt.SetDomainManagedIncarnation("vm-a", corrosion.IncarnationOf(f.row.CreatedAt), true); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := f.virt.SetDomainOwnerEpoch("vm-a", 3, true); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// onRunning is edit applied to a RUNNING local copy (runningCopy).
+func onRunning(edit func(f *settleFixture)) func(f *settleFixture) {
+	return func(f *settleFixture) {
+		f.runningCopy()
+		edit(f)
+	}
 }
 
 func (f *settleFixture) run() libvirtfake.State {
@@ -191,6 +217,11 @@ func TestSettle_TheLocalEpochIsTheHighestEvidence(t *testing.T) {
 // incarnation"; skip the epoch check — "older epoch"; skip the row-incarnation
 // check — "row is another incarnation"; accept an unknown identity — the two
 // "unknown" cases; skip the destination check — "proof for a third host".
+//
+// The cases wrapped in onRunning hold a RUNNING local copy (a host that never
+// paused, identified by its domain metadata): the replacement-runs clauses
+// (H2) protect a copy that runs, and a copy this host holds paused yields to
+// a live decided claim without them (TestSettle_APausedCopyYieldsToALiveDecidedClaim).
 func TestSettle_NeverWithoutPositiveProof(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -236,22 +267,126 @@ func TestSettle_NeverWithoutPositiveProof(t *testing.T) {
 		// prepared (the destination has not started it), have failed, or have
 		// been executed by someone other than its destination. Settling then
 		// would stop the ONLY running copy.
-		{"proof prepared, not executed", func(f *settleFixture) { f.proof.Status = corrosion.ProofPrepared; f.proof.ExecutorHost = "" }},
-		{"proof failed", func(f *settleFixture) { f.proof.Status = corrosion.ProofFailed }},
-		{"proof executed by another host", func(f *settleFixture) { f.proof.ExecutorHost = "node-c" }},
-		{"destination does not run it", func(f *settleFixture) { f.destState = RuntimeDefinedStopped }},
-		{"destination unreachable", func(f *settleFixture) {
+		{"proof prepared, not executed", onRunning(func(f *settleFixture) { f.proof.Status = corrosion.ProofPrepared; f.proof.ExecutorHost = "" })},
+		{"proof in progress, not executed", onRunning(func(f *settleFixture) { f.proof.Status = corrosion.ProofInProgress })},
+		{"proof failed", onRunning(func(f *settleFixture) { f.proof.Status = corrosion.ProofFailed })},
+		{"proof executed by another host", onRunning(func(f *settleFixture) { f.proof.ExecutorHost = "node-c" })},
+		{"destination does not run it", onRunning(func(f *settleFixture) { f.destState = RuntimeDefinedStopped })},
+		{"destination unreachable", onRunning(func(f *settleFixture) {
 			f.r.SetPeerRuntimeChecker(func(context.Context, string, string) (string, error) {
 				return "", errors.New("unreachable")
 			})
+		})},
+		{"no destination runtime check wired", onRunning(func(f *settleFixture) { f.r.SetPeerRuntimeChecker(nil) })},
+		// A copy this host holds paused does not wait for the replacement to
+		// run, but it still yields only to a proof its destination may
+		// execute: never to a failed one, nor to one another host took.
+		{"paused: proof failed", func(f *settleFixture) {
+			f.proof.Status = corrosion.ProofFailed
+			f.destState = RuntimeDefinedStopped
 		}},
-		{"no destination runtime check wired", func(f *settleFixture) { f.r.SetPeerRuntimeChecker(nil) }},
+		{"paused: proof completed by another host", func(f *settleFixture) { f.proof.ExecutorHost = "node-c" }},
+		{"paused: proof in progress on another host", func(f *settleFixture) {
+			f.proof.Status, f.proof.ExecutorHost = corrosion.ProofInProgress, "node-c"
+			f.destState = RuntimeDefinedStopped
+		}},
+		{"paused: proof prepared, claimed by another host", func(f *settleFixture) {
+			f.proof.Status, f.proof.ExecutorHost = corrosion.ProofPrepared, "node-c"
+			f.destState = RuntimeDefinedStopped
+		}},
+		// The paused path is taken on the domain being paused NOW, never on a
+		// pause record alone: a record left beside a copy that runs again (a
+		// resume that landed before the record was dropped, an operator's
+		// resume) says nothing about what runs.
+		{"running beside a stale pause record: proof prepared", func(f *settleFixture) {
+			rec, ok, err := ReadPauseRecord(f.dataDir, PauseKindVM, "vm-a")
+			if err != nil || !ok {
+				f.t.Fatalf("setup: record %v %v", ok, err)
+			}
+			f.runningCopy()
+			if err := newPauseStore(f.dataDir).put(rec); err != nil {
+				f.t.Fatal(err)
+			}
+			f.proof.Status, f.proof.ExecutorHost = corrosion.ProofPrepared, ""
+			f.destState = RuntimeAbsent
+		}},
+		// On a proof not yet executed the certificate's epoch and incarnation
+		// are the last line before the destroy of a paused copy: no
+		// destination check follows them.
+		{"paused: in progress, certificate at an older epoch", func(f *settleFixture) {
+			f.proof.Status = corrosion.ProofInProgress
+			f.cert.Key.OwnerEpoch = 2
+			f.destState = RuntimeAbsent
+		}},
+		{"paused: prepared, certificate for another incarnation", func(f *settleFixture) {
+			f.proof.Status, f.proof.ExecutorHost = corrosion.ProofPrepared, ""
+			f.cert.Key.Incarnation = "2001-01-01T00:00:00Z"
+			f.destState = RuntimeAbsent
+		}},
+		{"paused: in progress, certificate for another incarnation", func(f *settleFixture) {
+			f.proof.Status = corrosion.ProofInProgress
+			f.cert.Key.Incarnation = "2001-01-01T00:00:00Z"
+			f.destState = RuntimeAbsent
+		}},
+		{"paused: prepared, certificate at an older epoch", func(f *settleFixture) {
+			f.proof.Status, f.proof.ExecutorHost = corrosion.ProofPrepared, ""
+			f.cert.Key.OwnerEpoch = 2
+			f.destState = RuntimeAbsent
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newSettleFixture(t)
 			tc.edit(f)
 			if st := f.run(); st == libvirtfake.StateShutdown {
 				t.Fatalf("vm-a is %s; without positive proof the non-destruction guard must stand", st)
+			}
+		})
+	}
+}
+
+// Lab 2, B4: a copy this host's partition pause holds paused still holds its
+// image locks on shared storage, so the replacement the decided claim sent to
+// node-b cannot start until it is gone, and waiting for the replacement to run
+// first left zero copies running until an operator destroyed it. A paused
+// copy runs nothing, and a decided claim moved it, so it yields to the live
+// proof: prepared, or in progress on its destination, before the destination
+// runs it, and even with the destination unreachable.
+//
+// Mutations: require an executed proof for a paused copy too — the first
+// three cases go red; require the destination to run it — every case goes
+// red; take a running copy for a paused one (SelfPaused without the record) —
+// TestSettle_NeverWithoutPositiveProof's running cases go red.
+func TestSettle_APausedCopyYieldsToALiveDecidedClaim(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(f *settleFixture)
+	}{
+		{"in progress on the destination, which cannot start it", func(f *settleFixture) {
+			f.proof.Status = corrosion.ProofInProgress
+			f.destState = RuntimeDefinedStopped
+		}},
+		{"prepared, not yet claimed", func(f *settleFixture) {
+			f.proof.Status, f.proof.ExecutorHost = corrosion.ProofPrepared, ""
+			f.destState = RuntimeAbsent
+		}},
+		{"in progress, destination unreachable", func(f *settleFixture) {
+			f.proof.Status = corrosion.ProofInProgress
+			f.r.SetPeerRuntimeChecker(func(context.Context, string, string) (string, error) {
+				return "", errors.New("unreachable")
+			})
+		}},
+		{"completed, destination not running it", func(f *settleFixture) { f.destState = RuntimeDefinedStopped }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSettleFixture(t)
+			tc.edit(f)
+			if st := f.run(); st != libvirtfake.StateShutdown {
+				t.Fatalf("vm-a is %s; a copy this host holds paused must yield to the decided claim, "+
+					"or the replacement waits forever on its image lock", st)
+			}
+			rows, err := f.db.Query(context.Background(), `SELECT detail FROM audit_log WHERE action = 'partition.settle' AND target = 'vm-a'`)
+			if err != nil || len(rows) != 1 {
+				t.Fatalf("partition.settle audit rows = %d (%v), want 1", len(rows), err)
 			}
 		})
 	}
@@ -407,5 +542,181 @@ func TestSettle_VMSettledResolvesWhenTheRowNamesThisHostAgain(t *testing.T) {
 	f.r.selfFence(ctx)
 	if c, _ := settledRow(t, f); c.Lifecycle != corrosion.ConditionResolved {
 		t.Fatalf("vm_settled is %s while vm-a's row names node-a again, want resolved", c.Lifecycle)
+	}
+}
+
+// A settle that drops a VM's pause record drops the pauser's capture
+// registry hold with it: a kept hold would refuse every later memory
+// snapshot of the name on this host.
+//
+// Mutation: drop the Release in dropMatchingPause — red.
+func TestSettle_DroppingThePauseRecordReleasesTheCaptureHold(t *testing.T) {
+	f := newSettleFixture(t)
+	reg := lv.NewCaptureRegistry()
+	f.r.SetCaptureRegistry(reg)
+	reg.Hold("vm-a", time.Second) // the pauser's, taken when it paused vm-a
+	if st := f.run(); st != libvirtfake.StateShutdown {
+		t.Fatalf("vm-a is %s, want the settled copy stopped", st)
+	}
+	if _, ok, _ := ReadPauseRecord(f.dataDir, PauseKindVM, "vm-a"); ok {
+		t.Fatal("the pause record outlived the settled copy")
+	}
+	if reg.Holding("vm-a") {
+		t.Fatal("the capture hold outlived the pause record")
+	}
+}
+
+// guardedFixture is the paused fixture with the pauser's guard wired, as the
+// daemon wires it: the record carries a token and the domain its mark.
+func guardedFixture(t *testing.T) (*settleFixture, *PartitionPauser) {
+	t.Helper()
+	f := newSettleFixture(t)
+	rec, ok, err := ReadPauseRecord(f.dataDir, PauseKindVM, "vm-a")
+	if err != nil || !ok {
+		t.Fatalf("setup: record %v %v", ok, err)
+	}
+	rec.Token = "tok-1"
+	if err := newPauseStore(f.dataDir).put(rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.virt.MarkPartitionPaused("vm-a", "tok-1"); err != nil {
+		t.Fatal(err)
+	}
+	p := NewPartitionPauser("node-a", f.dataDir, f.db)
+	p.SetVMBackend(f.virt)
+	f.r.SetPauseGuard(p.SettleDestroy)
+	f.proof.Status = corrosion.ProofInProgress
+	f.destState = RuntimeDefinedStopped
+	return f, p
+}
+
+// Settle decides on a copy that is paused, then verifies certificates (RPCs,
+// seconds), then destroys. A resume that lands in between — it clears the
+// mark and resumes the guest, under the VM's mark lock — must not be followed
+// by a destroy of what now runs: the destroy runs under the same lock, after
+// re-checking that the domain is still paused with this pause's mark. With the
+// guard in place, a still-paused copy settles as before; a resumed one, or one
+// whose mark lock is held, is declined for this pass.
+//
+// Mutation: SettleDestroy calls destroy without the re-checks — the
+// "resumed" case destroys a running copy and goes red; without the TryLock —
+// the "lock held" case goes red.
+func TestSettle_APausedCopyIsDestroyedOnlyWhileStillPaused(t *testing.T) {
+	t.Run("still paused", func(t *testing.T) {
+		f, _ := guardedFixture(t)
+		if st := f.run(); st != libvirtfake.StateShutdown {
+			t.Fatalf("vm-a is %s; the guard must let the destroy of a copy still paused by this pause through", st)
+		}
+	})
+	t.Run("resumed between the decision and the destroy", func(t *testing.T) {
+		f, p := guardedFixture(t)
+		verify := f.r.settleVerify
+		f.r.SetSettleVerifier(func(ctx context.Context, ap corrosion.ActionProof) (corrosion.ClaimCertificate, error) {
+			// The pauser's resume lands now, as resume() does it: under the
+			// mark lock, the mark first, then the guest.
+			l := p.markLock("vm-a")
+			l.Lock()
+			if err := f.virt.ClearPartitionPauseMark("vm-a"); err != nil {
+				t.Error(err)
+			}
+			f.virt.SetState("vm-a", libvirtfake.StateRunning)
+			l.Unlock()
+			return verify(ctx, ap)
+		})
+		if st := f.run(); st != libvirtfake.StateRunning {
+			t.Fatalf("vm-a is %s; settle destroyed a copy that a resume had made run again", st)
+		}
+		if _, ok := firstVirtEvent(f.virt, "destroy", "vm-a"); ok {
+			t.Fatal("settle destroyed vm-a after it was resumed")
+		}
+	})
+	t.Run("mark lock held", func(t *testing.T) {
+		f, p := guardedFixture(t)
+		l := p.markLock("vm-a")
+		l.Lock()
+		defer l.Unlock()
+		if st := f.run(); st != libvirtfake.StatePaused {
+			t.Fatalf("vm-a is %s; settle destroyed it while a mark write or resume held its mark lock", st)
+		}
+		vm, err := corrosion.GetVM(context.Background(), f.db, "vm-a")
+		if err != nil || vm == nil {
+			t.Fatalf("GetVM: %v", err)
+		}
+		settled, why, _ := f.r.settleCertifiedMove(context.Background(), "vm-a", vm)
+		if settled || settleReasonClass(why) != "pause_changed" {
+			t.Fatalf("settle = (%v, %q), want a pause_changed decline", settled, why)
+		}
+	})
+}
+
+func firstVirtEvent(v *libvirtfake.Fake, op, dom string) (libvirtfake.Event, bool) {
+	for _, ev := range v.EventLog() {
+		if ev.Op == op && ev.Domain == dom {
+			return ev, true
+		}
+	}
+	return libvirtfake.Event{}, false
+}
+
+// The destroy itself runs under the mark lock, not only the re-checks before
+// it: a resume could otherwise take the lock between the re-check and the
+// destroy.
+//
+// Mutation: SettleDestroy re-checks under the lock, unlocks, then destroys —
+// this goes red.
+func TestSettle_APausedCopysDestroyHoldsTheMarkLock(t *testing.T) {
+	f, p := guardedFixture(t)
+	f.r.SetPauseGuard(func(rec PauseRecord, destroy func() error) error {
+		return p.SettleDestroy(rec, func() error {
+			if l := p.markLock(rec.Name); l.TryLock() {
+				l.Unlock()
+				t.Error("the destroy ran outside the mark lock: a resume could take it now")
+			}
+			return destroy()
+		})
+	})
+	if st := f.run(); st != libvirtfake.StateShutdown {
+		t.Fatalf("vm-a is %s", st)
+	}
+}
+
+// A record from a build before the mark carries no token, so there is no mark
+// to re-check; what orders settle and the pauser's resume for it is the mark
+// lock alone, which resume takes for such a record too. Here the pauser's own
+// resume of the tokenless record runs between settle's re-check and its
+// destroy: it must be held (the lock is settle's), not land, so the destroy
+// stops a copy that is still paused.
+//
+// Mutation: resume takes the mark lock only for a record with a token (as
+// before) — the resume lands, the destroy stops a running copy, and this goes
+// red.
+func TestSettle_ATokenlessRecordsResumeCannotLandInsideTheDestroy(t *testing.T) {
+	f, p := guardedFixture(t)
+	rec, ok, err := ReadPauseRecord(f.dataDir, PauseKindVM, "vm-a")
+	if err != nil || !ok {
+		t.Fatalf("setup: record %v %v", ok, err)
+	}
+	rec.Token = ""
+	if err := newPauseStore(f.dataDir).put(rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.virt.ClearPartitionPauseMark("vm-a"); err != nil {
+		t.Fatal(err)
+	}
+	var resumed bool
+	f.r.SetPauseGuard(func(rec PauseRecord, destroy func() error) error {
+		return p.SettleDestroy(rec, func() error {
+			resumed, _ = p.resume(context.Background(), rec, "test: a confirmed resume", time.Now().Add(3*time.Second))
+			if st, _ := f.virt.RawState("vm-a"); st != libvirtfake.StatePaused {
+				t.Errorf("the resume landed inside settle's destroy: vm-a is %s at the destroy", st)
+			}
+			return destroy()
+		})
+	})
+	if st := f.run(); st != libvirtfake.StateShutdown {
+		t.Fatalf("vm-a is %s, want the still-paused copy destroyed", st)
+	}
+	if resumed {
+		t.Fatal("the pauser resumed vm-a while settle held its mark lock")
 	}
 }

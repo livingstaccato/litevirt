@@ -298,3 +298,8 @@ func (s *Server) SetStackMemberDeleteHookForTest(fn func(name string)) { s.stack
 // it reads the row again: where a fleet scenario lands what another actor
 // does meanwhile.
 func (s *Server) SetDeleteLeaseTakenHookForTest(fn func(name string)) { s.deleteLeaseTakenHook = fn }
+
+// FailVMReadBackForTests makes the read of a VM a start has just started
+// fail (vmReadBackHook): a start libvirt answered whose answer cannot be
+// read back. nil restores the real read.
+func (s *Server) FailVMReadBackForTests(fn func(name string) error) { s.vmReadBackHook = fn }

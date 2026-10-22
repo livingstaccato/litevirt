@@ -214,6 +214,7 @@ func (s *Server) GetUpgradeStatus(ctx context.Context, _ *emptypb.Empty) (*pb.Up
 		}
 	}
 	out.RefusedPeers = s.RefusedReleasePeers()
+	out.SelfUpgradeSkipped = s.selfUpgradeSkippedLines()
 	return out, nil
 }
 

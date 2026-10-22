@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"google.golang.org/grpc/codes"
@@ -249,8 +250,28 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 	// device. Threading this set restores the pool-shrinking semantics PURELY — no
 	// assignment in the resolve phase, just in-memory exclusion.
 	selected := map[string]bool{}
+	// A device named by address, or by a mapping, is its own selector's, never
+	// another's IOMMU sibling or type pick; type selectors are then satisfied
+	// first, and the named devices' siblings are added last (pciSelectorPhase).
+	kinds := make([]string, len(specs))
+	for i, spec := range specs {
+		kind, key := corrosion.ClassifyPCISelector(spec)
+		kinds[i] = kind
+		switch kind {
+		case "address":
+			if key != nil {
+				selected[*key] = true
+			}
+		case "mapping":
+			if addr, err := corrosion.ResolveMappingAddress(ctx, s.db, spec.Mapping, s.hostName); err == nil && addr != "" {
+				selected[addr] = true
+			}
+		}
+	}
 
-	for _, spec := range specs {
+	bySpec := make([][]ResolvedMember, len(specs))
+	for _, i := range pciSelectorOrder(kinds) {
+		spec := specs[i]
 		count := int(spec.Count)
 		if count == 0 {
 			count = 1
@@ -270,8 +291,8 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 			if err != nil {
 				return fail(err)
 			}
-			for i, a := range vfAddrs {
-				members = append(members, ResolvedMember{MemberID: fmt.Sprintf("m%d", i), Address: a, Ordinal: i})
+			for j, a := range vfAddrs {
+				bySpec[i] = append(bySpec[i], ResolvedMember{MemberID: fmt.Sprintf("m%d", j), Address: a, Ordinal: j})
 				selected[a] = true
 				sriovClaimed = append(sriovClaimed, a)
 			}
@@ -290,7 +311,10 @@ func (s *Server) allocateDevices(ctx context.Context, vmName string, specs []*pb
 		if spec.Mapping != "" && len(specMembers) > 0 {
 			spec.Address = specMembers[0].Address
 		}
-		members = append(members, specMembers...)
+		bySpec[i] = specMembers
+	}
+	for _, m := range bySpec {
+		members = append(members, m...)
 	}
 
 	// On its own failures acquireDeviceLeases releases sriovClaimed too.
@@ -358,7 +382,10 @@ func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.
 	ordinal := 0
 	// addPrimary appends primary + its IOMMU-group siblings as ordered members.
 	// The conflict check is on the primary only (a sibling shares the group, so a
-	// conflicting other-VM owner is already caught by the primary's check).
+	// conflicting other-VM owner is already caught by the primary's check). A
+	// sibling already in exclude is not added: another selector of this
+	// request took it or names it (a GPU and its audio function, each named
+	// by address), and each device is passed through once.
 	addPrimary := func(primary string) error {
 		if err := s.checkIOMMUConflict(ctx, primary, vmName); err != nil {
 			return err
@@ -374,7 +401,7 @@ func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.
 				primary, s.hostName, err)
 		}
 		for _, a := range groupAddrs {
-			if a != primary {
+			if a != primary && !exclude[a] {
 				members = append(members, ResolvedMember{DeviceID: deviceID, MemberID: fmt.Sprintf("m%d", ordinal), Address: a, Ordinal: ordinal})
 				ordinal++
 				exclude[a] = true
@@ -389,6 +416,37 @@ func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.
 			return nil, err
 		}
 		return members, nil
+	}
+
+	// A device that realizes this intent here, and the VM still owns, realizes
+	// it again: a restart keeps the device it has, and never takes a second
+	// one for an intent the first already satisfies. Only the remainder, if
+	// any, is searched for among the free devices.
+	matches := func(d corrosion.PCIDeviceRecord) bool {
+		return (spec.Type == "" || d.Type == spec.Type) &&
+			(spec.Vendor == "" || d.VendorID == spec.Vendor) &&
+			(spec.Model == "" || d.DeviceName == spec.Model)
+	}
+	if deviceID != "" {
+		owned, err := s.ownedRealizationsHere(ctx, vmName, deviceID)
+		if err != nil {
+			return nil, err
+		}
+		for _, d := range owned {
+			if count == 0 {
+				break
+			}
+			if exclude[d.Address] || !matches(d) {
+				continue
+			}
+			if err := addPrimary(d.Address); err != nil {
+				return nil, err
+			}
+			count--
+		}
+		if count == 0 {
+			return members, nil
+		}
 	}
 
 	// Type/vendor allocation. A vendor-only selector is classified as type-kind
@@ -410,13 +468,7 @@ func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.
 	// earlier spec in this request (the cross-spec pool-shrinking exclusion).
 	var matched []corrosion.PCIDeviceRecord
 	for _, d := range available {
-		if exclude[d.Address] {
-			continue
-		}
-		if spec.Vendor != "" && d.VendorID != spec.Vendor {
-			continue
-		}
-		if spec.Model != "" && d.DeviceName != spec.Model {
+		if exclude[d.Address] || !matches(d) {
 			continue
 		}
 		matched = append(matched, d)
@@ -444,20 +496,101 @@ func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.
 // the acquire phase (allocateSRIOVVFs) — wiring pure SR-IOV candidate selection
 // into this resolver is deferred to the start-path task.
 func (s *Server) resolveDeviceIntents(ctx context.Context, vmName string, intents []corrosion.PCIIntentRecord) ([]ResolvedMember, error) {
-	var members []ResolvedMember
 	// Cross-intent exclusion set (see resolveDeviceSpec): a scratch map so two
 	// type/vendor intents resolve to distinct devices, exactly as the live-spec
 	// path. Local to this call — resolveDeviceIntents stays pure.
-	selected := map[string]bool{}
-	for _, intent := range intents {
+	return s.resolveDeviceIntentsExcluding(ctx, vmName, intents, map[string]bool{})
+}
+
+// resolveDeviceIntentsExcluding is resolveDeviceIntents with a caller-owned
+// exclusion set: each intent takes a device none before it took.
+func (s *Server) resolveDeviceIntentsExcluding(ctx context.Context, vmName string, intents []corrosion.PCIIntentRecord, selected map[string]bool) ([]ResolvedMember, error) {
+	local, err := s.addressIntentsHere(ctx, vmName, intents, selected)
+	if err != nil {
+		return nil, err
+	}
+	return s.resolveIntentsHere(ctx, vmName, intents, selected, local)
+}
+
+// addressIntentsHere is the device on this host that realizes each
+// concrete-address intent of intents, by intent id, each marked in selected
+// (and so is the device each mapping intent names here)
+// before any intent is realized: a device the VM names by address is realized
+// by its own intent, never as the IOMMU-group sibling of another (a GPU and
+// its audio function, each named), and no type selector takes it. An address
+// recorded on this host is that device; one recorded on another host (a
+// failover) is a device of its kind here (pci_failover.go), none taken twice.
+func (s *Server) addressIntentsHere(ctx context.Context, vmName string, intents []corrosion.PCIIntentRecord, selected map[string]bool) (map[string]string, error) {
+	local := map[string]string{}
+	var moved []corrosion.PCIIntentRecord
+	for _, in := range intents {
+		if in.SelectorKind == "mapping" {
+			// A mapping names this host's device for it: reserved likewise.
+			spec := &pb.DeviceSpec{}
+			if err := protojson.Unmarshal([]byte(in.SelectorPayload), spec); err != nil {
+				return nil, status.Errorf(codes.Internal, "decode selector payload for device %s: %v", in.DeviceID, err)
+			}
+			addr, err := corrosion.ResolveMappingAddress(ctx, s.db, spec.Mapping, s.hostName)
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "resolve resource mapping %q: %v", spec.Mapping, err)
+			}
+			if addr != "" {
+				selected[addr] = true
+			}
+			continue
+		}
+		if in.SelectorKind != "address" {
+			continue
+		}
+		if in.HostName != "" && in.HostName != s.hostName {
+			moved = append(moved, in)
+			continue
+		}
+		addr := ""
+		if in.ExclusiveKey != nil {
+			addr = *in.ExclusiveKey
+		}
+		local[in.DeviceID] = addr
+		selected[addr] = true
+	}
+	for _, in := range moved {
+		addr := ""
+		if in.ExclusiveKey != nil {
+			addr = *in.ExclusiveKey
+		}
+		here, err := s.addressOnThisHost(ctx, vmName, in.DeviceID, in.HostName, addr, selected)
+		if err != nil {
+			return nil, err
+		}
+		local[in.DeviceID] = here
+		selected[here] = true
+	}
+	return local, nil
+}
+
+// resolveIntentsHere resolves intents, each concrete address to its device in
+// local (addressIntentsHere).
+func (s *Server) resolveIntentsHere(ctx context.Context, vmName string, intents []corrosion.PCIIntentRecord, selected map[string]bool, local map[string]string) ([]ResolvedMember, error) {
+	kinds := make([]string, len(intents))
+	for i, in := range intents {
+		kinds[i] = in.SelectorKind
+	}
+	byIntent := make([][]ResolvedMember, len(intents))
+	for _, i := range pciSelectorOrder(kinds) {
+		intent := intents[i]
+		var members []ResolvedMember
 		switch intent.SelectorKind {
 		case "sriov":
 			return nil, status.Errorf(codes.Unimplemented,
 				"SR-IOV intent %s: VF realization is side-effecting and handled by the acquire path, not the pure resolver", intent.DeviceID)
 		case "address":
-			addr := ""
-			if intent.ExclusiveKey != nil {
-				addr = *intent.ExclusiveKey
+			// The address is a slot on the host it was recorded on. On any
+			// other host (a failover) it is realized by a device of its kind
+			// here, never by whatever sits at the same address
+			// (addressIntentsHere).
+			addr, ok := local[intent.DeviceID]
+			if !ok {
+				return nil, status.Errorf(codes.Internal, "PCI device %s of %s has no address on host %s", intent.DeviceID, vmName, s.hostName)
 			}
 			specMembers, err := s.resolveDeviceSpec(ctx, vmName, &pb.DeviceSpec{Address: addr}, intent.DeviceID, selected)
 			if err != nil {
@@ -475,8 +608,30 @@ func (s *Server) resolveDeviceIntents(ctx context.Context, vmName string, intent
 			}
 			members = append(members, specMembers...)
 		}
+		byIntent[i] = members
+	}
+	var members []ResolvedMember
+	for _, m := range byIntent {
+		members = append(members, m...)
 	}
 	return members, nil
+}
+
+// pciSelectorOrder is the order a request's selectors, by kind, are realized
+// in: SR-IOV and type selectors first, from the devices no address or mapping
+// names (those are reserved beforehand), then address and mapping selectors,
+// whose IOMMU-group siblings are added last, skipping what a type selector
+// took. The order does not depend on the selectors' order in the request.
+func pciSelectorOrder(kinds []string) []int {
+	var first, last []int
+	for i, k := range kinds {
+		if k == "address" || k == "mapping" {
+			last = append(last, i)
+		} else {
+			first = append(first, i)
+		}
+	}
+	return append(first, last...)
 }
 
 // claimDeviceOwnership is the ONE shared, fail-closed inventory reservation used by
@@ -674,6 +829,13 @@ func (s *Server) pciStartPreflight(ctx context.Context, vm *corrosion.VMRecord, 
 	// ── Resolve every intent to concrete members (routing SR-IOV to the allocator) ──
 	var members []ResolvedMember
 	var claimedSriov []string // VFs allocateSRIOVVFs CAS-claimed (released on a resolve failure)
+	// Every device an earlier intent of this start took: two intents of one
+	// kind take two devices.
+	selected := map[string]bool{}
+	local, lerr := s.addressIntentsHere(ctx, vm.Name, intents, selected)
+	if lerr != nil {
+		return nil, lerr
+	}
 	resolveFail := func(e error) (func(), error) {
 		if len(claimedSriov) > 0 {
 			// The VFs were CAS-claimed but never vfio-bound (allocateSRIOVVFs binds nothing),
@@ -687,7 +849,13 @@ func (s *Server) pciStartPreflight(ctx context.Context, vm *corrosion.VMRecord, 
 		}
 		return nil, e
 	}
-	for _, in := range intents {
+	kinds := make([]string, len(intents))
+	for i, in := range intents {
+		kinds[i] = in.SelectorKind
+	}
+	byIntent := make([][]ResolvedMember, len(intents))
+	for _, i := range pciSelectorOrder(kinds) {
+		in := intents[i]
 		if in.SelectorKind == "sriov" {
 			spec := &pb.DeviceSpec{}
 			if uerr := protojson.Unmarshal([]byte(in.SelectorPayload), spec); uerr != nil {
@@ -702,18 +870,22 @@ func (s *Server) pciStartPreflight(ctx context.Context, vm *corrosion.VMRecord, 
 			if aerr != nil {
 				return resolveFail(aerr)
 			}
-			for i, a := range vfAddrs {
-				members = append(members, ResolvedMember{DeviceID: in.DeviceID, MemberID: fmt.Sprintf("m%d", i), Address: a, Ordinal: i})
+			for j, a := range vfAddrs {
+				byIntent[i] = append(byIntent[i], ResolvedMember{DeviceID: in.DeviceID, MemberID: fmt.Sprintf("m%d", j), Address: a, Ordinal: j})
 				claimedSriov = append(claimedSriov, a)
+				selected[a] = true
 			}
 			continue
 		}
 		// address / mapping / type: the pure resolver.
-		specMembers, rerr := s.resolveDeviceIntents(ctx, vm.Name, []corrosion.PCIIntentRecord{in})
+		specMembers, rerr := s.resolveIntentsHere(ctx, vm.Name, []corrosion.PCIIntentRecord{in}, selected, local)
 		if rerr != nil {
 			return resolveFail(rerr)
 		}
-		members = append(members, specMembers...)
+		byIntent[i] = specMembers
+	}
+	for _, m := range byIntent {
+		members = append(members, m...)
 	}
 
 	if len(members) == 0 {
@@ -769,15 +941,36 @@ func (s *Server) pciStartPreflight(ctx context.Context, vm *corrosion.VMRecord, 
 		if rerr := s.unbindAndReleaseOwnership(ctx, vm.Name, freshlyClaimed); rerr != nil {
 			return rerr
 		}
+		// A device the VM keeps owning (it owned it before this start: not in
+		// freshlyClaimed) keeps its realization row: retiring it would leave
+		// the VM owning a device no row says realizes its intent, which a
+		// type selector's next start does not reuse.
+		fresh := make(map[string]bool, len(freshlyClaimed))
+		for _, a := range freshlyClaimed {
+			fresh[a] = true
+		}
 		for _, dev := range deviceOrder {
-			if terr := corrosion.TombstonePCIRealizations(ctx, s.db, vm.Name, dev); terr != nil {
-				slog.Warn("pci start-preflight: tombstone realizations on rollback", "vm", vm.Name, "device", dev, "error", terr)
+			var kept []ResolvedMember
+			for _, m := range byDevice[dev] {
+				if !fresh[m.Address] {
+					kept = append(kept, m)
+				}
+			}
+			var terr error
+			switch {
+			case len(kept) == 0:
+				terr = corrosion.TombstonePCIRealizations(ctx, s.db, vm.Name, dev)
+			case len(kept) < len(byDevice[dev]):
+				terr = corrosion.ReplacePCIRealizations(ctx, s.db, vm.Name, dev, true, s.realizationRows(vm.Name, dev, kept))
+			}
+			if terr != nil {
+				slog.Warn("pci start-preflight: retire realizations on rollback", "vm", vm.Name, "device", dev, "error", terr)
 			}
 		}
 		return nil
 	}
 	for _, dev := range deviceOrder {
-		if werr := s.writePCIRealizations(ctx, vm.Name, dev, byDevice[dev]); werr != nil {
+		if werr := s.replacePCIRealizations(ctx, vm.Name, dev, byDevice[dev]); werr != nil {
 			if rbErr := rollback(); rbErr != nil {
 				// The release could not confirm the unbind → leave the start recovery-required:
 				// do NOT finish() the lease (retain it), propagate so startVMLocked leaves it
@@ -1387,4 +1580,84 @@ func deviceSpecsSummary(specs []*pb.DeviceSpec) string {
 		parts = append(parts, strings.Join(f, " "))
 	}
 	return strings.Join(parts, ", ")
+}
+
+// ownedRealizationsHere is the devices on this host that realize vmName's
+// intent deviceID, by its live vm_pci_realizations rows, and that the VM
+// still owns, in member order. A row the VM no longer owns there (released,
+// or another VM's since) is not its device.
+func (s *Server) ownedRealizationsHere(ctx context.Context, vmName, deviceID string) ([]corrosion.PCIDeviceRecord, error) {
+	reals, err := corrosion.ListVMPCIRealizations(ctx, s.db, vmName)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read the PCI realizations of %s: %v", vmName, err)
+	}
+	var mine []corrosion.PCIRealizationRecord
+	for _, r := range reals {
+		if r.DeviceID == deviceID && r.HostName == s.hostName && r.ResolvedAddress != "" {
+			mine = append(mine, r)
+		}
+	}
+	if len(mine) == 0 {
+		return nil, nil
+	}
+	sort.Slice(mine, func(i, j int) bool { return mine[i].Ordinal < mine[j].Ordinal })
+	devs, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "query devices: %v", err)
+	}
+	byAddr := make(map[string]corrosion.PCIDeviceRecord, len(devs))
+	for _, d := range devs {
+		byAddr[d.Address] = d
+	}
+	var out []corrosion.PCIDeviceRecord
+	for _, r := range mine {
+		if d, ok := byAddr[r.ResolvedAddress]; ok && d.VMName == vmName {
+			out = append(out, d)
+		}
+	}
+	return out, nil
+}
+
+// replacePCIRealizations makes members the live realization set of vmName's
+// intent deviceID. When the set of member ids changed (the intent took a group
+// sibling before and does not now, or the other way round), the old rows are
+// tombstoned first: an upsert alone would leave the extra member live, and the
+// next reconcile would refuse the intent for a realized set larger than what
+// it resolves to. Tombstone and upserts are one batch
+// (corrosion.ReplacePCIRealizations), so a crash cannot leave the intent with
+// no live row while the VM still owns its device.
+func (s *Server) replacePCIRealizations(ctx context.Context, vmName, deviceID string, members []ResolvedMember) error {
+	reals, err := corrosion.ListVMPCIRealizations(ctx, s.db, vmName)
+	if err != nil {
+		return fmt.Errorf("read PCI realizations of %s: %w", vmName, err)
+	}
+	want := make(map[string]bool, len(members))
+	for _, m := range members {
+		want[m.MemberID] = true
+	}
+	have := map[string]bool{}
+	for _, r := range reals {
+		if r.DeviceID == deviceID {
+			have[r.MemberID] = true
+		}
+	}
+	changed := len(have) > 0 && len(have) != len(want)
+	for id := range have {
+		changed = changed || !want[id]
+	}
+	if err := corrosion.ReplacePCIRealizations(ctx, s.db, vmName, deviceID, changed, s.realizationRows(vmName, deviceID, members)); err != nil {
+		return fmt.Errorf("record PCI realizations of %s/%s: %w", vmName, deviceID, err)
+	}
+	return nil
+}
+
+// realizationRows is members as this host's realization rows of vmName's
+// intent deviceID.
+func (s *Server) realizationRows(vmName, deviceID string, members []ResolvedMember) []corrosion.PCIRealizationRecord {
+	rows := make([]corrosion.PCIRealizationRecord, 0, len(members))
+	for _, m := range members {
+		rows = append(rows, corrosion.PCIRealizationRecord{VMName: vmName, DeviceID: deviceID, MemberID: m.MemberID, HostName: s.hostName,
+			ResolvedAddress: m.Address, XMLAlias: pciMemberAlias(deviceID, m.MemberID), Ordinal: m.Ordinal})
+	}
+	return rows
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/litevirt/litevirt/internal/hotplugreq"
 
 	"github.com/spf13/cobra"
 
@@ -123,23 +124,21 @@ func newAttachPciCmd() *cobra.Command {
 		count   int32
 		sriov   bool
 		parent  string
+		address string
 	)
 	cmd := &cobra.Command{
 		Use:   "attach-pci <vm>",
-		Short: "Hot-attach a PCI device to a running VM",
+		Short: "Attach a PCI device to a VM (a running VM by type; a stopped one with --address)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				vm, err := c.AttachDevice(ctx, &pb.AttachDeviceRequest{
-					VmName: args[0],
-					PciDevice: &pb.DeviceSpec{
-						Type:   devType,
-						Vendor: vendor,
-						Count:  count,
-						Sriov:  sriov,
-						Parent: parent,
-					},
+				areq, err := hotplugreq.AttachPCI(args[0], hotplugreq.AttachPCIOptions{
+					Address: address, Type: devType, Vendor: vendor, Count: count, Sriov: sriov, Parent: parent,
 				})
+				if err != nil {
+					return err
+				}
+				vm, err := c.AttachDevice(ctx, areq)
 				if err != nil {
 					return fmt.Errorf("attach PCI device: %w", err)
 				}
@@ -154,6 +153,7 @@ func newAttachPciCmd() *cobra.Command {
 	cmd.Flags().Int32Var(&count, "count", 1, "Number of devices to attach")
 	cmd.Flags().BoolVar(&sriov, "sriov", false, "Request SR-IOV VF instead of PF")
 	cmd.Flags().StringVar(&parent, "parent", "", "SR-IOV: allocate the VF from this PF BDF (e.g. 0000:41:00.0)")
+	cmd.Flags().StringVar(&address, "address", "", "Attach this one device by PCI address (e.g. 0000:41:00.0); works on a stopped VM once hardware_v2 is active")
 	return cmd
 }
 

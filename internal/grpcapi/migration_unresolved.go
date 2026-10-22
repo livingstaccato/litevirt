@@ -24,17 +24,11 @@ import (
 // failover's hold of such a row); resolved by `lv doctor repair-owner` and
 // `lv stop`, which settle the row, and by any other ending that settles it
 // (ResolveSettledMigrationsOnce).
-const condMigrationUnresolved = "vm.migration_unresolved"
+const condMigrationUnresolved = corrosion.CondMigrationUnresolved
 
-// migrationUnresolvedEvidence is vm.migration_unresolved's evidence.
-type migrationUnresolvedEvidence struct {
-	Source string `json:"source"`
-	Target string `json:"target"`
-	Detail string `json:"detail"`
-	// LeaseID is the target's capacity reservation the move kept, released
-	// when the condition is resolved.
-	LeaseID string `json:"lease_id,omitempty"`
-}
+// migrationUnresolvedEvidence is vm.migration_unresolved's evidence; the
+// move's target reads it too (health, unresolved_move_hold.go).
+type migrationUnresolvedEvidence = corrosion.MigrationUnresolvedEvidence
 
 // raiseMigrationUnresolved raises vm.migration_unresolved for vm, left
 // migrating on this host by a move to target, which keeps leaseID.
@@ -130,11 +124,28 @@ func (s *Server) resolveMigrationUnresolvedIfSettled(ctx context.Context, vm str
 		if _, marked, merr := s.fwRecords().GetMarker(vm); marked || merr != nil {
 			return false
 		}
+		// A paused domain of it here, under a row that does not record it
+		// running here, is the copy the move left: the condition holds the
+		// reconciler's start off it (health, unresolved_move_hold.go) until
+		// it is resumed or discarded.
+		if row.State != "running" && s.pausedDomainHere(vm) {
+			return false
+		}
 	}
 	s.resolveMigrationUnresolved(ctx, vm)
 	slog.Info("vm.migration_unresolved: resolved, the VM's row no longer records the move",
 		"vm", vm, "source", ev.Source, "host", row.HostName, "state", row.State)
 	return true
+}
+
+// pausedDomainHere reports whether this host holds a paused domain of vm. A
+// state that cannot be read counts as paused: the condition stays open.
+func (s *Server) pausedDomainHere(vm string) bool {
+	if s.virt == nil || !s.virt.DomainExists(vm) {
+		return false
+	}
+	st, err := s.virt.DomainStateReason(vm)
+	return err != nil || st.Reason == "paused"
 }
 
 // ResolveSettledMigrationsOnce resolves each open vm.migration_unresolved

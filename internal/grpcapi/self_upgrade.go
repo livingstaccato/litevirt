@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	mrand "math/rand"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -193,6 +194,7 @@ func (s *Server) selfUpgradeTarget(ctx context.Context) (peer, version string, s
 		}
 		peers = append(peers, peerVersionInfo{host: h.Name, version: h.Version, schema: h.SchemaVersion})
 	}
+	s.noteSkippedPrereleases(s.version, mySchema, peers)
 	t, ok := chooseSelfUpgradeTarget(s.version, mySchema, peers)
 	if !ok {
 		return "", "", 0, false
@@ -212,6 +214,63 @@ func (s *Server) selfUpgradeTarget(ctx context.Context) (peer, version string, s
 		return "", "", 0, false
 	}
 	return t.host, t.version, t.schema, true
+}
+
+// skippedPrerelease returns the peers whose build the automatic self-upgrade
+// refuses only because it is a pre-release (v1.10.0-rc1) while it would
+// otherwise be ahead of this node: a higher schema, or a release core newer
+// than ours. A git-describe dev build of our own release core is not ahead.
+func skippedPrerelease(myVersion string, mySchema int, peers []peerVersionInfo) []peerVersionInfo {
+	var out []peerVersionInfo
+	for _, p := range peers {
+		if p.schema < mySchema || isCleanRelease(p.version) || !semver.IsValid(p.version) || semver.Build(p.version) != "" {
+			continue
+		}
+		ahead := p.schema > mySchema ||
+			(semver.IsValid(myVersion) && semver.Compare(releaseCore(p.version), releaseCore(myVersion)) > 0)
+		if ahead {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// noteSkippedPrereleases records, and logs ONCE per distinct version, that a
+// peer runs a pre-release build the automatic self-upgrade will not follow, so
+// an operator can tell why a node that is behind does nothing. The record is
+// shown by `lv cluster upgrade-status`.
+func (s *Server) noteSkippedPrereleases(myVersion string, mySchema int, peers []peerVersionInfo) {
+	skipped := skippedPrerelease(myVersion, mySchema, peers)
+	s.selfUpgradeSkipMu.Lock()
+	defer s.selfUpgradeSkipMu.Unlock()
+	cur := map[string]string{}
+	for _, p := range skipped {
+		if _, dup := cur[p.version]; !dup {
+			cur[p.version] = p.host
+		}
+	}
+	for v, host := range cur {
+		if _, seen := s.selfUpgradeSkipped[v]; !seen {
+			slog.Info("self-upgrade: peer runs a pre-release build; not following it",
+				"peer", host, "peerVersion", v, "myVersion", myVersion,
+				"reason", "pre-release; auto upgrade only follows clean releases; use `lv host upgrade <host>` to push it")
+		}
+	}
+	// Replacing the map forgets a version no peer runs any more, so it is
+	// logged again if it comes back.
+	s.selfUpgradeSkipped = cur
+}
+
+// selfUpgradeSkippedLines is the status text for each skipped pre-release.
+func (s *Server) selfUpgradeSkippedLines() []string {
+	s.selfUpgradeSkipMu.Lock()
+	defer s.selfUpgradeSkipMu.Unlock()
+	var out []string
+	for v, host := range s.selfUpgradeSkipped {
+		out = append(out, fmt.Sprintf("%s runs %s: pre-release, so automatic self-upgrade does not follow it; use `lv host upgrade %s` to push it", host, v, host))
+	}
+	sort.Strings(out)
+	return out
 }
 
 // candidateConfirmed reports whether a live Ping confirms the candidate chosen

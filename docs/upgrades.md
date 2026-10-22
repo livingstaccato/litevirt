@@ -302,6 +302,21 @@ the complementary "starts but doesn't function" gap. Together they do NOT cover:
   decisions — the binary is intrinsically functional). Catch these with
   metrics + alerts, not auto-rollback.
 
+## Pre-release builds are not followed automatically
+
+The `from_peer` self-upgrade only follows **clean tagged releases** (`v1.10.0`).
+A peer on a pre-release (`v1.10.0-rc1`) or a dev build (`v1.0.51-2-gabc1234`) is
+never a target, so release candidates do not spread by themselves, even to a node
+that is behind on schema. The skip is not silent: the node logs one INFO line per
+distinct skipped version (`self-upgrade: peer runs a pre-release build; not
+following it`, with the peer, its version and the reason), and
+`lv cluster upgrade-status` shows a `Self-upgrade skipped:` line for each one. To
+move a host onto a pre-release, push it yourself:
+
+```bash
+lv host upgrade <host> --binary ./litevirt
+```
+
 ## Post-upgrade health watchdog
 
 When the upgrade RPC (or the `from_peer` self-upgrade) swaps in a new binary, it
@@ -421,6 +436,17 @@ mv /usr/local/bin/litevirt.old /usr/local/bin/litevirt
 systemctl reset-failed litevirt
 systemctl restart litevirt
 ```
+
+A memory snapshot taken by a build that captures in the running QEMU (see
+[configuration](configuration.md#memory-snapshots)) has its RAM image written
+before the disks switch to their overlays. The capture then rewrites the
+image's definition to name the overlays, so any build reverts it. The
+rewrite is best effort: when it fails, the daemon logs "the image still
+names the disks as they were before the snapshot" and the snapshot is kept.
+A host rolled back to a build whose revert does not repoint the disks (one
+before the overlay repoint, 0fef47979) restores such an image onto the
+snapshot's base disk and writes into it. Before rolling a host back that
+far, delete or retake any memory snapshot that line names.
 
 A host rolled back below the release that added `lv lb create --snat` SNATs
 every load balancer made with `lv lb create` that it serves, including one set
@@ -645,6 +671,21 @@ whose failover leader clears a fenced host it has handled only once the host
 is `active`
 ([migration-failover.md](migration-failover.md#resuming-a-recovery-from-a-recorded-fence)).
 
+**`release_2026_12_v1`** is the next release's token, with the same rules. A
+rollback below it lands on a `release_2026_11_v1` build, which reads the rule, so
+it quarantines only for a feature of it that was used. Its one feature so far is
+`fence_ssh`, and it is used by default: every host publishes its managed fence
+SSH row as soon as the token latches, which pins its sshd keys for every fence
+aimed at it ([migration-failover.md](migration-failover.md#managed-fence-ssh)).
+So from the latch on, a rollback below `release_2026_12_v1` quarantines. To keep
+the ability to roll back, set `enforcement.fence_ssh: legacy` in every host's
+config before the last host upgrades. The daemon reads it at start, so restart
+the daemon of a host that already runs this build: a host in `legacy` publishes no row, so nothing uses the
+feature (and every host keeps fencing as before the upgrade, pinned toward any
+host that does publish). `lv cluster upgrade-status` lists `fence_ssh` with
+whether it is used, and its token once latched. Its rollout summary (hosts on the
+release, features waiting) counts `release_2026_11_v1` only.
+
 **What this does not change.** A binary built before `release_2026_11_v1`
 understands no rollback rule. Rolled back below any token it does not know —
 this release's token included — it quarantines, used or not. Tokens other than
@@ -656,7 +697,8 @@ applied a feature's data it cannot interpret — before the quarantine came up,
 or on a build from before this mechanism — may still run that host's workloads
 without it (a VM defined without the limits a feature set, for example). So a
 host quarantined below a release feature in use must be **drained** of the
-workloads the feature touches (`lv host drain`), then upgraded again or reseeded;
+workloads the feature touches (`lv host drain`) once it is upgraded again or
+reseeded: while the quarantine holds it moves nothing off itself (below), and
 reseeding alone does not correct a workload already running.
 
 **`lv stop` on a quarantined host.** A stop's `operator-stop` record is a
@@ -681,6 +723,24 @@ quarantine holds:
 - `lv start` is refused with `FailedPrecondition`: a start cannot be
   recorded either, and a guest started now would run while the cluster's
   record of it says otherwise.
+- `lv migrate` of a VM off the host, live or `--cold`, is refused with
+  `FailedPrecondition` naming the quarantine, before anything is done on the
+  target. The move's ownership commit is a write this host makes after
+  libvirt's cut-over: refused, it would leave the guest running on the target
+  while every row names this host, and failover of this host would start a
+  second copy. `lv region migrate` is refused the same way, before any disk
+  is copied to the target pool, and `lv host drain` of the host is refused
+  too.
+- `lv ct migrate` of a container off the host is refused with
+  `FailedPrecondition` the same way, before the target is prepared and
+  before the container is stopped.
+- The target refuses as well. A move's first call to its target asks for
+  the target's capacity, and the target then pings the source. A source that
+  reports WAL quarantine or release probation is refused with
+  `FailedPrecondition`, so the refusal also holds for a source rolled back
+  to a build without its own. A source the target cannot ping is refused
+  with `Unavailable`; retry the move once the two hosts can reach each
+  other.
 
 Release probation lifts by itself (`lv cluster upgrade-status`). Any other
 quarantine needs the host upgraded again or reseeded.
@@ -730,6 +790,65 @@ held, the host's restart policy and reconciler act on the row alone, so the
 killed guest may be started again, as before this change, and the marker is
 left on disk. Upgrading again replays it if it still applies (or removes it
 if the guest runs again).
+
+**`lv ct stop` on a quarantined host.** A container's stop is kept by the
+same `operator-stop` record, so a stop the host cannot record is undone by
+the container's restart policy. A plain `lv ct stop` there is refused with
+`FailedPrecondition` before the container is touched, naming
+`lv ct stop --force`. The forced stop works as `lv stop --force` does: it
+first writes `ct-operator-stops/<name>.json` under the `data_dir` (durably,
+naming the host, the container's `created_at` and its owner epoch), then
+stops the container; if the marker cannot be written it is refused and the
+container keeps running. While the marker is there, the container's restart
+policy does not start it. `lv ct start` is refused with `FailedPrecondition`
+on a quarantined host whether or not a marker holds the container: a start
+cannot be recorded either (its admission and its `running` state are
+replicated writes), and a container started there would run while the
+cluster's record of it says otherwise. The refusal names the quarantine and
+its remedy, and nothing is changed. Once the quarantine
+lifts, the host's next reconcile pass, or an `lv ct start` that comes first,
+records the stop on the container's row (`stopped` / `operator-stop`) and
+removes the marker, only while the row is still that incarnation at that
+owner epoch; a marker whose container was deleted, created again, moved or
+owned again under a later generation, or that runs again, is removed with
+nothing recorded. A marker that cannot be read fails closed, as a VM's does,
+and raises `operator_stop_marker_corrupt` with subject `container/<name>`.
+Out of quarantine `--force` changes nothing. A daemon older than this
+build ignores `--force` (it does not know the field): on a quarantined owner
+of that build `lv ct stop --force` stops the container, answers `Internal`
+because the stop cannot be recorded, and once the quarantine lifts the
+container's restart policy starts it again. A migrate (`lv ct migrate`)
+made after the lift and before the stop is recorded records it first, so
+the container lands on the target stopped. The same rollback limit
+applies: a build older than this one ignores the directory, so its restart
+policy may start the container again.
+
+**Deletes, rebuilds and repairs on a quarantined host.** Each of these
+removes something on the host and then records that on a replicated row,
+which the quarantine refuses. So a quarantined host refuses them with
+`FailedPrecondition` before it changes anything. The error names the
+quarantine and its remedy (upgrade the host's binary again or reseed it, or
+wait for release probation), and says nothing was changed:
+
+- `lv rm` of a VM and `lv ct rm` of a container, on the host that runs it
+  (whichever host the command entered on). A quarantined host the command
+  entered on refuses it too, whatever host runs the workload, because the
+  entry host records part of the delete (the workload's firewall tags and
+  schedules). That error also says to run the command from a host that is
+  not in write quarantine.
+- A delete whose VM has no domain on the host its row names asks every
+  other host whether it has the domain. A quarantined host that has it
+  refuses, and the asking host keeps the VM's record. Nothing is removed on
+  either host.
+- `lv rebuild`, `lv snapshot rm`, `lv ct snapshot rm`, `lv resize-disk` and
+  `lv backup restore-from --in-place` on the VM's or container's host.
+- `lv doctor repair-owner`, on the host it names.
+- `lv restart` of a VM that is not running, which is a start (as `lv start`,
+  above). `lv restart` of a running VM still restarts it: its row reads
+  `running` before and after.
+
+None of these is recorded locally to replay later, as a forced stop is. Once
+the quarantine lifts, run the command again.
 
 **Before you roll back**, ask the cluster what would block it:
 

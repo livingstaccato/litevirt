@@ -109,7 +109,7 @@ var appendOnlyLedger = []struct {
 	{"a090_hosts_incarnation", 69},
 	{"a091_security_groups_project", 70},
 	{"a092_projects_incarnation", 71},
-	{"a093_local_automation_receiver_current_established_inventory", 81},
+	{"a093_local_automation_receiver_current_established_inventory", 82},
 	{"a094_tokens_user_created_at", schemaVersionTokenUserIncarnation},
 }
 
@@ -145,7 +145,7 @@ func TestSchemaMigrations_AreAppendOnlyNeverReordered(t *testing.T) {
 func TestSchemaExecution86HasFourAdditiveLocalUnits(t *testing.T) {
 	want := map[string]bool{"local_automation_executors": false, "local_automation_execution_progress": false, "local_automation_execution_artifacts": false, "local_automation_execution_terminals": false}
 	for _, m := range schemaMigrationLedger {
-		if m.Version != 86 {
+		if m.Version != 87 {
 			continue
 		}
 		if _, ok := want[m.Target]; !ok || m.Kind != kindCreateTable {
@@ -161,7 +161,7 @@ func TestSchemaExecution86HasFourAdditiveLocalUnits(t *testing.T) {
 			t.Fatal("missing execution86 table migration", table)
 		}
 	}
-	if CurrentSchemaVersion != 86 || schemaVersionTokenUserIncarnation != 85 {
+	if CurrentSchemaVersion != 87 || schemaVersionTokenUserIncarnation != 86 {
 		t.Fatal("execution86 changed an allocated predecessor meaning")
 	}
 }

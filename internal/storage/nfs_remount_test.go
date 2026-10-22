@@ -392,3 +392,74 @@ func TestCheckNFSPoolMount_AStuckResolutionIsNotStartedAgain(t *testing.T) {
 		t.Fatalf("the stuck resolution was started %d times, want once", calls)
 	}
 }
+
+// throughTheCache serves m's table through the mount table cache, as the
+// host's is served, with a kernel change mark that never fires (a missed
+// mark, bug B1).
+func (m *rebootMounts) throughTheCache(t *testing.T) {
+	t.Helper()
+	t.Cleanup(readMountInfo.set(nil))
+	t.Cleanup(procMountInfo.set(m.info))
+	t.Cleanup(mountTableChanged.set(func() bool { return false }))
+	resetMountCache()
+	t.Cleanup(resetMountCache)
+}
+
+// litevirt's own mount is seen by the check right after it, whatever the
+// kernel's change mark says: the check before the mount cached a table
+// without it, and the age bound does not help a check made a moment later.
+// This is where B1 showed on the lab ("after the mount, … holds no NFS
+// mount").
+//
+// Mutation "no invalidation after the mount command" (nfsDriver.Prepare):
+// the mount is refused as landed elsewhere, red.
+func TestMountNFSPool_TheCheckAfterTheMountSeesItWithoutTheMark(t *testing.T) {
+	m := installRebootMounts(t)
+	m.throughTheCache(t)
+	dataDir := t.TempDir()
+	cfg := nfsCfg("")
+	dir := NFSPoolMountDir(dataDir, cfg)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := CheckNFSPoolMount(dataDir, cfg); err != nil || st.Mounted {
+		t.Fatalf("before the mount: %+v err=%v; want not mounted", st, err)
+	}
+	if err := MountNFSPool(context.Background(), dataDir, cfg); err != nil {
+		t.Fatalf("mount: %v", err)
+	}
+	if st, err := CheckNFSPoolMount(dataDir, cfg); err != nil || !st.Mounted {
+		t.Fatalf("after the mount: %+v err=%v; want mounted", st, err)
+	}
+}
+
+// litevirt's own unmount is seen by the next check, whatever the mark says.
+//
+// Mutation "no invalidation after the umount command" (nfsDriver.Teardown):
+// the export still reads as mounted, red.
+func TestNFSTeardown_TheUnmountIsSeenWithoutTheMark(t *testing.T) {
+	m := installRebootMounts(t)
+	m.throughTheCache(t)
+	dataDir := t.TempDir()
+	cfg := nfsCfg("")
+	dir := NFSPoolMountDir(dataDir, cfg)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := MountNFSPool(context.Background(), dataDir, cfg); err != nil {
+		t.Fatalf("mount: %v", err)
+	}
+	if st, err := CheckNFSPoolMount(dataDir, cfg); err != nil || !st.Mounted {
+		t.Fatalf("after the mount: %+v err=%v; want mounted", st, err)
+	}
+	drv, err := New(dataDir, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := drv.(*nfsDriver).Teardown(context.Background()); err != nil {
+		t.Fatalf("teardown: %v", err)
+	}
+	if st, err := CheckNFSPoolMount(dataDir, cfg); err != nil || st.Mounted {
+		t.Fatalf("after the unmount: %+v err=%v; want not mounted", st, err)
+	}
+}

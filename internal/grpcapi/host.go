@@ -25,6 +25,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
+	"github.com/litevirt/litevirt/internal/fencessh"
 	"github.com/litevirt/litevirt/internal/hooks"
 	"github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/pki"
@@ -1490,7 +1491,7 @@ wait:
 // by a drain that has none and by undrain.
 const (
 	condDrainMoveTimedOut = "drain_move_timed_out"
-	drainEvaluator        = "drain"
+	drainEvaluator        = corrosion.DrainEvaluator
 )
 
 // drainTimeoutEvidence is drain_move_timed_out's evidence: the VMs it names,
@@ -1830,6 +1831,19 @@ func (s *Server) fenceExecutor() func(context.Context, fence.HostConfig) fence.R
 	return fence.Execute
 }
 
+// SetFenceSSH wires this host's managed fence SSH agent (internal/fencessh).
+func (s *Server) SetFenceSSH(a *fencessh.Agent) { s.fenceSSH = a }
+
+// fenceSSHPath is how an SSH fence from this node reaches target: decided
+// by the agent from target's verified host_fence_ssh row, or the legacy path
+// when no agent is wired.
+func (s *Server) fenceSSHPath(ctx context.Context, target string) fence.SSHFence {
+	if s.fenceSSH == nil {
+		return fence.SSHFence{}
+	}
+	return s.fenceSSH.FenceConfig(ctx, target)
+}
+
 // SetFenceExecutor replaces the fence FenceHost runs. For tests: the fleet
 // harness has no machines to power off.
 func (s *Server) SetFenceExecutor(fn func(context.Context, fence.HostConfig) fence.Result) {
@@ -1927,6 +1941,7 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 		// Only a fence aimed at THIS node may use the watchdog strategy; it arms
 		// the caller's own device. Everything else is unaffected.
 		IsSelf: h.Name == s.hostName,
+		SSH:    s.fenceSSHPath(ctx, h.Name),
 	})
 
 	method := fr.Method

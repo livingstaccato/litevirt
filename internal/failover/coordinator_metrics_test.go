@@ -98,6 +98,8 @@ func TestFailoverMetrics_FenceSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	downObservers(t, db, "bad", "h1", "h2", "h3")
+	// A workload that needs the fence: what this test pins is the fence.
+	needsFence(t, db, "bad")
 
 	c := newTestCoordinator("coordinator", db) // stubFencer(true)
 	fm := newFakeMetrics()
@@ -122,6 +124,8 @@ func TestFailoverMetrics_ManualUnconfirmedRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	downObservers(t, db, "bad", "h1", "h2", "h3")
+	// A workload that needs the fence: what this test pins is the fence.
+	needsFence(t, db, "bad")
 
 	c := NewCoordinator("coordinator", db)
 	c.SetFencer(manualFencer())
@@ -150,6 +154,8 @@ func TestFailoverMetrics_NoCandidates(t *testing.T) {
 	}
 	// The other two voters are draining — they vote, but are not 'active' —
 	// so there is no healthy candidate after fencing "bad".
+	// A workload that needs the fence: what this test pins is the fence.
+	needsFence(t, db, "bad")
 	for _, o := range []string{"coordinator", "witness"} {
 		ensureVoter(t, db, o)
 		if err := corrosion.UpdateHostState(ctx, db, o, "draining"); err != nil {
@@ -188,6 +194,8 @@ func TestFailoverMetrics_FirmwareSkip(t *testing.T) {
 		t.Fatal(err)
 	}
 	downObservers(t, db, "bad", "h1", "h2", "h3") // h1-3 are healthy candidates
+	// A workload that needs the fence: what this test pins is the fence.
+	needsFence(t, db, "bad")
 	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
 		Name: "fwvm", HostName: "bad", State: "running", CPUActual: 1, MemActual: 512,
 		Spec: `{"secure_boot":true}`,
@@ -247,6 +255,8 @@ func TestFailoverMetrics_FenceLogWriteFailureProceeds(t *testing.T) {
 		t.Fatal(err)
 	}
 	downObservers(t, db, "bad", "h1", "h2", "h3")
+	// A workload that needs the fence: what this test pins is the fence.
+	needsFence(t, db, "bad")
 	// Make InsertFenceLog fail (table gone) without touching control flow.
 	if _, err := db.DB().ExecContext(ctx, `DROP TABLE fencing_log`); err != nil {
 		t.Fatalf("drop fencing_log: %v", err)

@@ -4,6 +4,7 @@ package watchdog
 
 import (
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -84,4 +85,14 @@ func watchdogOptions(fd uintptr) (options uint32, known bool) {
 		return 0, false
 	}
 	return info.Options, true
+}
+
+// bootClock reads CLOCK_BOOTTIME: monotonic, counting suspend, reset only by a
+// reboot, which also empties /run, where the boot streak it times is kept.
+func bootClock() time.Duration {
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &ts); err != nil {
+		return time.Duration(time.Now().UnixNano())
+	}
+	return time.Duration(ts.Nano())
 }

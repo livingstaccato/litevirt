@@ -385,6 +385,29 @@ func allGoFiles(t *testing.T, dir string) []string {
 	return out
 }
 
+// identCallers names the function enclosing each plain call of name (a
+// package-local function call, not X.Sel), closures included.
+func identCallers(files []*ast.File, name string) []string {
+	var out []string
+	for _, f := range files {
+		for _, d := range f.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok || fd.Body == nil {
+				continue
+			}
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				if ce, ok := n.(*ast.CallExpr); ok {
+					if id, ok := ce.Fun.(*ast.Ident); ok && id.Name == name {
+						out = append(out, fd.Name.Name)
+					}
+				}
+				return true
+			})
+		}
+	}
+	return out
+}
+
 func findCalls(calls []astCall, recv, sel string) []astCall {
 	var out []astCall
 	for _, c := range calls {
@@ -395,33 +418,41 @@ func findCalls(calls []astCall, recv, sel string) []astCall {
 	return out
 }
 
-// The daemon installs the guard through Wire, once, in New, right after
-// connecting to libvirt and before RequireStartGuard, on the store it keeps;
-// nothing in the daemon installs a guard any other way.
+// The daemon installs the guard through Wire, once, in its constructor
+// (newDaemon, which New runs under the boot watchdog keeper and which nothing
+// else calls), right after connecting to libvirt and before
+// RequireStartGuard, on the store it keeps; nothing in the daemon installs a
+// guard any other way. The libvirt client is created in that constructor, so
+// nothing can start a VM before the guard is in force.
 //
 // Mutations: move Wire after RequireStartGuard — red; Wire a second
-// NewFirmwareStore — red; call SetFirmwareMoveGuard directly — red.
+// NewFirmwareStore — red; call SetFirmwareMoveGuard directly — red; call
+// newDaemon from anywhere but New — red.
 func TestFwmigWire_DaemonWiresGuardFirst(t *testing.T) {
+	const ctor = "newDaemon"
 	calls, files := parseCalls(t, goFiles(t, "../daemon")...)
+	if got := identCallers(files, ctor); len(got) != 1 || got[0] != "New" {
+		t.Fatalf("%s is called from %v, want from New only", ctor, got)
+	}
 	wires := findCalls(calls, "fwmig", "Wire")
 	if len(wires) != 1 {
 		t.Fatalf("daemon calls fwmig.Wire %d times, want once", len(wires))
 	}
 	w := wires[0]
-	if w.fn != "New" || strings.Join(w.args, ",") != "virt,fwStore" {
-		t.Fatalf("fwmig.Wire(%s) in %s, want fwmig.Wire(virt, fwStore) in New", strings.Join(w.args, ", "), w.fn)
+	if w.fn != ctor || strings.Join(w.args, ",") != "virt,fwStore" {
+		t.Fatalf("fwmig.Wire(%s) in %s, want fwmig.Wire(virt, fwStore) in %s", strings.Join(w.args, ", "), w.fn, ctor)
 	}
 	nc := findCalls(calls, "libvirt", "NewClient")
 	rq := findCalls(calls, "virt", "RequireStartGuard")
-	if len(nc) != 1 || len(rq) != 1 || nc[0].fn != "New" || rq[0].fn != "New" {
-		t.Fatalf("NewClient %d, RequireStartGuard %d calls in New", len(nc), len(rq))
+	if len(nc) != 1 || len(rq) != 1 || nc[0].fn != ctor || rq[0].fn != ctor {
+		t.Fatalf("NewClient %d, RequireStartGuard %d calls in %s", len(nc), len(rq), ctor)
 	}
 	if !(nc[0].pos < w.pos && w.pos < rq[0].pos) {
 		t.Fatal("fwmig.Wire is not between libvirt.NewClient and RequireStartGuard")
 	}
 	stores := findCalls(calls, "libvirt", "NewFirmwareStore")
-	if len(stores) != 1 || stores[0].fn != "New" || !(stores[0].pos < w.pos) {
-		t.Fatalf("daemon builds %d firmware stores, want one, in New before Wire", len(stores))
+	if len(stores) != 1 || stores[0].fn != ctor || !(stores[0].pos < w.pos) {
+		t.Fatalf("daemon builds %d firmware stores, want one, in %s before Wire", len(stores), ctor)
 	}
 	if sg := findCalls(calls, "", "SetFirmwareMoveGuard"); len(sg) != 0 {
 		t.Fatalf("daemon installs a firmware move guard outside fwmig.Wire: %+v", sg)

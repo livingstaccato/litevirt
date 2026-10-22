@@ -22,7 +22,7 @@ import (
 func TestAggregateLocal86NonemptyExecutionSnapshot(t *testing.T) {
 	f, _ := executionReplayCompletedFixture(t)
 	ctx := context.Background()
-	if storedVersion(t, f.c) != 86 {
+	if storedVersion(t, f.c) != 87 {
 		t.Fatal("actual InitSchema86 required")
 	}
 	before := executionStorageSnapshot(t, f.c)
@@ -82,13 +82,13 @@ func TestAggregateLocal86ExecutionCorruptionBounds(t *testing.T) {
 				var err error
 				switch mode {
 				case "wrong-live85":
-					_, err = tx.Exec(ctx, `UPDATE schema_state SET version=85 WHERE id=1`)
+					_, err = tx.tx.ExecContext(ctx, `UPDATE schema_state SET version=85 WHERE id=1`)
 				case "oversized-json":
 					_, err = tx.Exec(ctx, `UPDATE local_automation_executors SET grant_json=? WHERE stage=''`, strings.Repeat("x", MaxAutomationClaimBytes+1))
 				case "blob-json":
 					_, err = tx.Exec(ctx, `UPDATE local_automation_execution_artifacts SET artifact_json=CAST(artifact_json AS BLOB) WHERE stage=''`)
 				case "missing-unique-index":
-					_, err = tx.Exec(ctx, `DROP INDEX automation_execution_artifact_key`)
+					_, err = tx.tx.ExecContext(ctx, `DROP INDEX automation_execution_artifact_key`)
 				}
 				return err
 			}); err != nil {

@@ -17,6 +17,7 @@ import (
 	"github.com/litevirt/litevirt/internal/acmedns"
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fencessh"
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/image"
@@ -25,6 +26,7 @@ import (
 	"github.com/litevirt/litevirt/internal/obs"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 	"github.com/litevirt/litevirt/internal/pressure"
+	"github.com/litevirt/litevirt/internal/watchdog"
 )
 
 const defaultConfigPath = "/etc/litevirt/config.yaml"
@@ -74,7 +76,10 @@ type Config struct {
 	DNSPort        int      `yaml:"dns_port"`     // UDP port for embedded DNS (default 5354)
 	DNSDomain      string   `yaml:"dns_domain"`   // base domain, e.g. "litevirt.local"
 	WatchdogDev    string   `yaml:"watchdog_dev"` // e.g. "/dev/watchdog"; empty = disabled
-	RESTPort       int      `yaml:"rest_port"`    // HTTP REST gateway port (default 7446; 0 = disabled)
+	// Watchdog bounds the boot keeper (watchdog.KeepBootAlive), which pets a
+	// watchdog timer a previous run left running while this daemon boots.
+	Watchdog WatchdogConfig `yaml:"watchdog"`
+	RESTPort int            `yaml:"rest_port"` // HTTP REST gateway port (default 7446; 0 = disabled)
 
 	// AntiEntropyIntervalSec is how often the anti-entropy loop compares state
 	// digests with peers and full-syncs on drift. 0 = default (60s). Lower it
@@ -130,6 +135,10 @@ type Config struct {
 
 	// Migration governs migrations this node sends.
 	Migration MigrationConfig `yaml:"migration"`
+
+	// MemorySnapshot tunes the memory snapshots (`lv snapshot create
+	// --memory`) this node captures.
+	MemorySnapshot MemorySnapshotConfig `yaml:"memory_snapshot,omitempty"`
 
 	// Capacity is the cluster-wide default for how much of a host may be handed
 	// to workloads. Per-host overrides live on the host record (`lv host config`)
@@ -258,6 +267,13 @@ type Config struct {
 	// above, not a weaker policy. Empty → "safe".
 	NoQuorumVIPPolicy string `yaml:"no_quorum_vip_policy"`
 
+	// FenceSSHProbeIntervalSec is how often this host checks the managed
+	// fence SSH path to every peer (`lv doctor fence`,
+	// litevirt_fence_ssh_probe_ok). Unset is 900 (15 minutes); 0 disables
+	// the probe. A check logs in as root on each peer and runs only the
+	// forced command's check, which never arms a fence.
+	FenceSSHProbeIntervalSec *int `yaml:"fence_ssh_probe_interval_sec,omitempty"`
+
 	// WebAuthn configures the second-factor enrolment dance. Required
 	// fields: rp_id (the bare host operators reach via the UI, e.g.
 	// "litevirt.corp") and rp_origins (full origins, e.g.
@@ -331,6 +347,43 @@ type ContainersConfig struct {
 	// paths does not start there.
 	BindMountPaths []string `yaml:"bind_mount_paths,omitempty"`
 	DevicePaths    []string `yaml:"device_paths,omitempty"`
+}
+
+// WatchdogConfig bounds how long boot may keep alive a watchdog timer that a
+// previous run left running (a crash, or a stop that held workloads). Past
+// these bounds a daemon that cannot finish booting lets the timer fire, so a
+// host whose daemon never comes back still reboots: at most
+// boot_keeper_streak_window_sec plus the watchdog timeout after the first
+// boot that never reached the heartbeat.
+type WatchdogConfig struct {
+	// BootKeeperStreakWindowSec: boots that never reach the heartbeat are a
+	// streak, timed from the first one; boot petting stops once the streak is
+	// this old. Default 300.
+	BootKeeperStreakWindowSec int `yaml:"boot_keeper_streak_window_sec"`
+	// BootKeeperMaxBoots: boot petting stops after this many boots in the
+	// streak. Default 5.
+	BootKeeperMaxBoots int `yaml:"boot_keeper_max_boots"`
+	// BootKeeperMaxSec: each boot pets for at most this long before it must
+	// reach the heartbeat (a hung boot). Default 120.
+	BootKeeperMaxSec int `yaml:"boot_keeper_max_sec"`
+	// LivenessStaleSec: on a configured, verified, armed watchdog, the
+	// heartbeat stops petting, and self-fences, once neither a state-store
+	// round trip nor the partition pauser has made progress for this long.
+	// Default 120; 0 turns the gate off; otherwise at least 120 (twice the
+	// hardware timeout).
+	LivenessStaleSec int `yaml:"liveness_stale_sec"`
+}
+
+func (w WatchdogConfig) validate() error {
+	if w.BootKeeperStreakWindowSec < 0 || w.BootKeeperMaxBoots < 0 || w.BootKeeperMaxSec < 0 {
+		return fmt.Errorf("watchdog.boot_keeper_*: values must not be negative (0 turns the boot keeper off)")
+	}
+	if min := int(watchdog.MinLivenessStale / time.Second); w.LivenessStaleSec < 0 ||
+		(w.LivenessStaleSec > 0 && w.LivenessStaleSec < min) {
+		return fmt.Errorf("watchdog.liveness_stale_sec: %d must be 0 (off) or at least %d, twice the hardware watchdog timeout",
+			w.LivenessStaleSec, min)
+	}
+	return nil
 }
 
 // validate refuses container defaults that cannot work.
@@ -738,6 +791,19 @@ type EnforcementConfig struct {
 	// DEFAULT TRUE (LoadConfig sets it before parsing; an explicit
 	// `vrrp_unicast: false` wins).
 	VRRPUnicast bool `yaml:"vrrp_unicast,omitempty"`
+	// FenceSSH is how this host's ssh and best-effort fences reach their
+	// targets (internal/fencessh): "managed" uses each target's managed
+	// fence key path only, and fails a fence toward a host whose sshd does
+	// not accept it; "auto" (the default, "" included) uses the managed path
+	// toward a host that accepts it and the legacy path with the host's
+	// published sshd keys pinned toward one that does not; "legacy" never
+	// uses the managed path (the kill switch), pinned wherever a host has
+	// published. No mode fences a host that has published a fence ssh row
+	// without its pinned host key. Not a capability: the fence is decided
+	// where it is created, and no peer relies on another's setting. `lv host
+	// init` writes managed for a new cluster; `lv host add` copies the
+	// cluster's block.
+	FenceSSH string `yaml:"fence_ssh,omitempty"`
 	// DigestV2: emit the order-invariant anti-entropy row digest (digest_v2) so
 	// column-order-only differences (fresh CREATE vs ALTER ADD COLUMN) stop showing as
 	// row-content divergence + perpetual no-op merges. Negotiated PAIRWISE by wire-field
@@ -1046,6 +1112,8 @@ func LoadConfig() (*Config, error) {
 
 		ContainerRestoreTimeoutSec: 600,
 
+		Watchdog: WatchdogConfig{BootKeeperStreakWindowSec: 300, BootKeeperMaxBoots: 5, BootKeeperMaxSec: 120, LivenessStaleSec: 120},
+
 		Containers: ContainersConfig{DefaultPidsMax: 4096, IDMapBase: 1_000_000_000, IDMapRanges: 30000, IDMappedRootfs: "auto"},
 
 		QuorumLossDemoteAfterSec: 12,
@@ -1083,6 +1151,9 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: %w", err)
 	}
 
+	if err := cfg.Watchdog.validate(); err != nil {
+		return nil, err
+	}
 	if err := cfg.Containers.validate(); err != nil {
 		return nil, err
 	}
@@ -1133,6 +1204,13 @@ func LoadConfig() (*Config, error) {
 			cfg.NoQuorumVIPPolicy)
 	}
 
+	if !fencessh.ValidMode(cfg.Enforcement.FenceSSH) {
+		return nil, fmt.Errorf("invalid enforcement.fence_ssh %q: managed, auto or legacy", cfg.Enforcement.FenceSSH)
+	}
+	if cfg.FenceSSHProbeIntervalSec != nil && *cfg.FenceSSHProbeIntervalSec < 0 {
+		return nil, fmt.Errorf("invalid fence_ssh_probe_interval_sec %d: 0 disables the probe", *cfg.FenceSSHProbeIntervalSec)
+	}
+
 	// A typo'd vm.default_cpu_mode must fail load, not silently stamp an invalid
 	// mode into every VM created on this node — those specs would then fail at
 	// libvirt define time, one create at a time, with nothing pointing back here.
@@ -1166,6 +1244,9 @@ func LoadConfig() (*Config, error) {
 		return nil, err
 	}
 	if err := cfg.Firewall.validate(); err != nil {
+		return nil, err
+	}
+	if err := cfg.MemorySnapshot.validate(); err != nil {
 		return nil, err
 	}
 
@@ -1391,6 +1472,58 @@ type VMDefaultsConfig struct {
 	// QEMU's qemu64 — no SSE4.2, no AVX, no AVX2. Per-VM, `lv run --cpu-mode`
 	// still wins over this.
 	DefaultCPUMode string `yaml:"default_cpu_mode,omitempty"`
+}
+
+// MemorySnapshotConfig tunes memory snapshot capture. A VM with firmware
+// state (UEFI NVRAM, vTPM) is always captured with its vCPUs stopped; any
+// other is captured live, its RAM written while it runs, when its measured
+// dirty rate predicts the final pause fits PauseBudget. Empty fields take
+// the built-in defaults (1s and 2m), which the P1 lab measurements may
+// change.
+type MemorySnapshotConfig struct {
+	// PauseBudget is the longest predicted guest pause a live capture is
+	// chosen for, a Go duration ("1s", "500ms").
+	PauseBudget string `yaml:"pause_budget,omitempty"`
+	// LiveDeadline is how long a live capture runs before the guest is
+	// suspended so the rest is written with it stopped, a Go duration.
+	LiveDeadline string `yaml:"live_deadline,omitempty"`
+}
+
+// Durations returns the configured pause budget and live deadline; zero for
+// one that is not set.
+func (m MemorySnapshotConfig) Durations() (budget, deadline time.Duration, err error) {
+	parse := func(key, v string) (time.Duration, error) {
+		if v == "" {
+			return 0, nil
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return 0, fmt.Errorf("config memory_snapshot.%s: %q is not a duration: %w", key, v, err)
+		}
+		if d <= 0 {
+			return 0, fmt.Errorf("config memory_snapshot.%s: %q must be positive", key, v)
+		}
+		return d, nil
+	}
+	if budget, err = parse("pause_budget", m.PauseBudget); err != nil {
+		return 0, 0, err
+	}
+	if deadline, err = parse("live_deadline", m.LiveDeadline); err != nil {
+		return 0, 0, err
+	}
+	if deadline > maxLiveDeadline {
+		// A capture holds its VM's lock for as long as it runs.
+		return 0, 0, fmt.Errorf("config memory_snapshot.live_deadline: %q is longer than %v", m.LiveDeadline, maxLiveDeadline)
+	}
+	return budget, deadline, nil
+}
+
+// maxLiveDeadline is the longest memory_snapshot.live_deadline.
+const maxLiveDeadline = time.Hour
+
+func (m MemorySnapshotConfig) validate() error {
+	_, _, err := m.Durations()
+	return err
 }
 
 // MigrationConfig governs migrations this node sends.
@@ -1720,4 +1853,13 @@ func (f FileRestoreConfig) validate(containers ContainersConfig) error {
 			f.UIDBase, r[0], r[1]-1)
 	}
 	return nil
+}
+
+// FenceSSHProbeInterval is fence_ssh_probe_interval_sec as a duration: 15
+// minutes when unset, 0 (disabled) when set to 0.
+func (c *Config) FenceSSHProbeInterval() time.Duration {
+	if c.FenceSSHProbeIntervalSec == nil {
+		return 15 * time.Minute
+	}
+	return time.Duration(*c.FenceSSHProbeIntervalSec) * time.Second
 }

@@ -226,6 +226,15 @@ func (s *Server) sourceGateRefused(ctx context.Context, vm *corrosion.VMRecord, 
 // its whole step, calls this directly for its cold moves (drainColdMove), with
 // the same lock discipline.
 func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, vm *corrosion.VMRecord, send func(pb.MigratePhase, float32, float32) error, unlock func(), adopted *bool, opts ownedMigrateOpts) error {
+	// A move out ends in an ownership commit this host writes, after a
+	// cut-over that cannot be undone, and starts with a `migrating` row this
+	// host writes. Under write quarantine both are refused: the guest would
+	// run on the target while every row names this host, and failover of
+	// this host would then start a second copy. Refused before anything is
+	// done anywhere.
+	if err := s.moveOutQuarantineRefusal(fmt.Sprintf("VM %q", vm.Name), req.TargetHost); err != nil {
+		return err
+	}
 	// A volume move left unresolved: the rows name the file holding the
 	// guest's writes before anything reads them for the migration
 	// (move_unresolved.go).
@@ -356,8 +365,13 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			return status.Errorf(codes.Internal, "check PCI intent for %q: %v", vm.Name, err)
 		}
 		if len(intents) > 0 {
+			addr := "<pci-address>"
+			if intents[0].ExclusiveKey != nil {
+				addr = *intents[0].ExclusiveKey
+			}
 			return status.Errorf(codes.FailedPrecondition,
-				"VM %q holds PCI passthrough intent; cross-host migration of PCI devices is not supported in this release", vm.Name)
+				"VM %q holds PCI passthrough intent; cross-host migration of PCI devices is not supported in this release; %s",
+				vm.Name, s.pciMoveRoute(ctx, vm.Name, addr, req.TargetHost))
 		}
 	}
 
@@ -522,8 +536,15 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			detachedVFs = append(detachedVFs, d)
 		} else if req.Strategy == pb.MigrateStrategy_MIGRATE_LIVE {
 			return status.Errorf(codes.FailedPrecondition,
-				"VM %q has PCI passthrough device %s (%s) — live migration is not possible; use --cold",
-				req.VmName, d.Address, d.Type)
+				"VM %q has PCI passthrough device %s (%s) — live migration is not possible; %s",
+				req.VmName, d.Address, d.Type, s.pciMoveRoute(ctx, req.VmName, d.Address, req.TargetHost))
+		} else if req.Strategy == pb.MigrateStrategy_MIGRATE_COLD && !coldStopped {
+			// --cold moves a STOPPED VM. A running one would still go through
+			// libvirt's migration, which cannot move a PF, and would fail only
+			// after the target had been prepared.
+			return status.Errorf(codes.FailedPrecondition,
+				"VM %q is running and has PCI passthrough device %s (%s), which cannot be moved while the guest runs; %s",
+				req.VmName, d.Address, d.Type, s.pciMoveRoute(ctx, req.VmName, d.Address, req.TargetHost))
 		}
 	}
 	// A live firmware move detaches its VFs only under a durable lease, which
@@ -2044,6 +2065,20 @@ func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vm
 	return fwTargetDefined, nil
 }
 
+// pciMoveRoute is the route that moves a VM holding a PCI passthrough device:
+// no migration, live or cold, carries the device, so it is released from the VM
+// first and a device is attached again on the target. A stopped VM's detach and
+// attach need hardware_v2, so before it is active no route is advised. Proven
+// by TestFleet_PCIMoveRouteTheRefusalsAdviseWorks and
+// TestFleet_PCIMoveRouteIsNotAdvisedBeforeHardwareV2.
+func (s *Server) pciMoveRoute(ctx context.Context, vm, addr, target string) string {
+	if !s.hardwareV2Latched(ctx) {
+		return "no migration carries a passthrough device, and releasing and re-attaching one on a stopped VM needs hardware_v2, which is not active yet, so there is no supported way to move this VM until it is"
+	}
+	return fmt.Sprintf("no migration carries a passthrough device, so stop the VM, `lv detach-pci %s %s`, `lv migrate %s %s --cold`, then `lv attach-pci %s --address <a free PCI address on %s>` (see `lv host devices %s`); the target needs its own free device, the source's address is not reused, and ROM, multifunction and vGPU settings are not carried over",
+		vm, addr, vm, target, vm, target, target)
+}
+
 // coldMoveDisks reads the VM's disk records and applies the cold path's
 // refusals that need no domain: a VM holding a PCI passthrough device, and a
 // VM with no domain defined here.
@@ -2052,7 +2087,7 @@ func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vm
 // before this path copied host-local disks at all; it now moves as any stopped
 // VM does, its disks streamed first and its firmware bundle carried with the
 // domain's define, and a failure before the handoff takes both back.
-func (s *Server) coldMoveDisks(ctx context.Context, vm *corrosion.VMRecord) ([]corrosion.DiskRecord, error) {
+func (s *Server) coldMoveDisks(ctx context.Context, vm *corrosion.VMRecord, target string) ([]corrosion.DiskRecord, error) {
 	// A volume move left unresolved here: the rows name the file the persistent
 	// config names before one is streamed (move_unresolved.go).
 	if err := s.resolveUnresolvedMoves(ctx, vm.Name); err != nil {
@@ -2069,7 +2104,8 @@ func (s *Server) coldMoveDisks(ctx context.Context, vm *corrosion.VMRecord) ([]c
 		for _, d := range assigned {
 			if d.VMName == vm.Name {
 				return nil, status.Errorf(codes.FailedPrecondition,
-					"VM %q has PCI passthrough device %s — migrating a stopped VM with hostdevs is not supported yet", vm.Name, d.Address)
+					"VM %q has PCI passthrough device %s — migrating a stopped VM with hostdevs is not supported yet; %s",
+					vm.Name, d.Address, s.pciMoveRoute(ctx, vm.Name, d.Address, target))
 			}
 		}
 	}
@@ -2105,7 +2141,7 @@ func (s *Server) coldMovePreflight(ctx context.Context, vm *corrosion.VMRecord, 
 	if err := s.refuseColdMoveOnSharedMAC(ctx, vm.Name); err != nil {
 		return err
 	}
-	disks, err := s.coldMoveDisks(ctx, vm)
+	disks, err := s.coldMoveDisks(ctx, vm, targetHost)
 	if err != nil {
 		return err
 	}
@@ -2176,7 +2212,7 @@ func (s *Server) coldMigrateStoppedVM(ctx context.Context, vm *corrosion.VMRecor
 	}
 	// Must read disks successfully — proceeding on an error would skip the
 	// host-local refusal AND the disk-ownership updates, diverging VM/disk records.
-	disks, err := s.coldMoveDisks(ctx, vm)
+	disks, err := s.coldMoveDisks(ctx, vm, targetHost.Name)
 	if err != nil {
 		return err
 	}

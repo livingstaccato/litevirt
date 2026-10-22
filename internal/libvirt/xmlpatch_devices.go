@@ -622,3 +622,31 @@ func skipWSForward(doc string, i int) int {
 	}
 	return i
 }
+
+// AddPCIHostdevs returns inactiveXML with a managed PCI <hostdev> for each of
+// addrs appended to <devices>, every other byte as it was. libvirt assigns
+// each a guest slot.
+func AddPCIHostdevs(inactiveXML string, addrs []string) (string, error) {
+	if len(addrs) == 0 {
+		return inactiveXML, nil
+	}
+	_, devicesCloseOff, err := scanDeviceElements(inactiveXML)
+	if err != nil {
+		return "", err
+	}
+	if devicesCloseOff < 0 {
+		return "", errors.New("libvirt: cannot add hostdevs — no <devices> element in inactive XML")
+	}
+	closeIndent, childIndent := devicesIndent(inactiveXML, devicesCloseOff)
+	var additions strings.Builder
+	for _, a := range addrs {
+		frag, err := marshalNewHostdev(childIndent, WantHostdev{Address: a})
+		if err != nil {
+			return "", err
+		}
+		additions.WriteString("\n")
+		additions.WriteString(frag)
+	}
+	off := insertBeforeClose(inactiveXML, devicesCloseOff, closeIndent)
+	return applyEdits(inactiveXML, []spanEdit{{off, off, additions.String()}})
+}

@@ -144,3 +144,58 @@ func TestRecoverWorkloads_OneAskDeadlinePerPoll(t *testing.T) {
 		t.Fatalf("ask deadlines %v; want one, the poll's start + %s (%s)", got, MigratingAskBudget, start.Add(MigratingAskBudget))
 	}
 }
+
+// With the split-brain gate enforced, the ask of a migrating row's target —
+// which re-points the row when the guest runs there — is taken only under
+// the decision gate and this coordinator's tenure, as the reschedule beside
+// it is: refused, SettleMigratingRows is not called and the VM is held.
+// The hold names the refusal, not the target's reachability. Before the gate
+// is enforced it is asked as before.
+//
+// Mutations: drop the decision gate in settleMigratingVMs — "gate refuses"
+// red; drop the tenure check — "tenure lost" red.
+func TestSettleMigratingVMs_TakesTheDecisionGateAndTenure(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		gate     *bool // nil: no gate (not enforced)
+		lease    bool
+		wantAsks bool
+		wantWhy  string // a refusal's hold names it
+	}{
+		{name: "not enforced", gate: nil, lease: false, wantAsks: true},
+		{name: "gate and tenure", gate: ptrBool(true), lease: true, wantAsks: true},
+		{name: "gate refuses", gate: ptrBool(false), lease: true, wantWhy: "decision gate refused"},
+		{name: "tenure lost", gate: ptrBool(true), lease: false, wantWhy: "failover lease"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := newTestDB(t)
+			ctx := context.Background()
+			c := newTestCoordinator("good", db)
+			if tc.gate != nil {
+				c.Gate = switchableGate{open: tc.gate}
+			}
+			if tc.lease && !c.acquireLease(ctx) {
+				t.Fatal("could not take the failover lease")
+			}
+			asked := 0
+			c.SettleMigratingRows = func(_ context.Context, _ string, _ []corrosion.VMRecord, _ time.Time) map[string]MigratingDecision {
+				asked++
+				return map[string]MigratingDecision{"mg1": {Verdict: MigratingSettled}}
+			}
+			c.beginMigratingAsks()
+			got := c.settleMigratingVMs(ctx, &corrosion.HostRecord{Name: "bad", State: "fenced"},
+				[]corrosion.VMRecord{{Name: "mg1", HostName: "bad", State: "migrating", StateDetail: "→ tgt"}})
+			if (asked == 1) != tc.wantAsks {
+				t.Fatalf("SettleMigratingRows asked %d times, want asked: %v", asked, tc.wantAsks)
+			}
+			if !tc.wantAsks {
+				d, ok := got["mg1"]
+				if !ok || d.Verdict != MigratingHold || !strings.Contains(d.Detail, tc.wantWhy) {
+					t.Fatalf("decision for mg1 = %+v (present %v); want a hold naming %q", d, ok, tc.wantWhy)
+				}
+			}
+		})
+	}
+}
+
+func ptrBool(b bool) *bool { return &b }

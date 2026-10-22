@@ -435,6 +435,9 @@ func (c *Coordinator) vmFitsOn(ctx context.Context, vm corrosion.VMRecord, faile
 	req := buildFailoverPlacementRequest(vm, failed, c.capacity, func(string) bool { return true })
 	c.addPlacementLabels(ctx, &req, vm.Name)
 	c.resolveUSBPlacement(ctx, &req)
+	if _, hold := c.addDevicePlacement(ctx, &req, vm); hold != "" {
+		return "fails placement: " + hold
+	}
 	req.RequireRegion = c.vmRecoveryRegion(failed, vm)
 	allVMs, err := corrosion.ListVMs(ctx, c.db, "", "")
 	if err != nil {
@@ -448,7 +451,7 @@ func (c *Coordinator) vmFitsOn(ctx context.Context, vm corrosion.VMRecord, faile
 	if err != nil {
 		observations = nil
 	}
-	res, err := placement.SelectBatch([]corrosion.HostRecord{h}, allVMs, nil, ctMem, observations, c.now(),
+	res, err := c.selectBatch(ctx, []corrosion.HostRecord{h}, allVMs, ctMem, observations, c.now(),
 		[]placement.Request{req})
 	if err != nil {
 		return "fails placement: " + err.Error()

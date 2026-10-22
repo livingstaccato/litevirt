@@ -381,7 +381,7 @@ func newCTStartCmd() *cobra.Command {
 
 func newCTStopCmd() *cobra.Command {
 	var host string
-	var useLocal bool
+	var useLocal, force bool
 	var timeout int
 	cmd := &cobra.Command{
 		Use:   "stop <name>",
@@ -393,7 +393,7 @@ func newCTStopCmd() *cobra.Command {
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				_, err := c.StopContainer(ctx, &pb.StopContainerRequest{
-					HostName: host, Name: args[0], TimeoutSec: int32(timeout),
+					HostName: host, Name: args[0], TimeoutSec: int32(timeout), Force: force,
 				})
 				return err
 			})
@@ -402,6 +402,7 @@ func newCTStopCmd() *cobra.Command {
 	cmd.Flags().IntVar(&timeout, "timeout", 30, "Seconds to wait before SIGKILL")
 	cmd.Flags().StringVar(&host, "host", "", "Target host")
 	cmd.Flags().BoolVar(&useLocal, "local", false, "Use the host-local runtime")
+	cmd.Flags().BoolVar(&force, "force", false, "On a host in write quarantine, stop it anyway: recorded on that host first, on the container once the quarantine lifts")
 	return cmd
 }
 

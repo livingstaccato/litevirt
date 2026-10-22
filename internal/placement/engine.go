@@ -174,6 +174,7 @@ type DeviceRequest struct {
 	Type     string // gpu | network | nvme | infiniband
 	Count    int
 	Vendor   string // optional vendor filter
+	DeviceID string // optional PCI device id filter (with Vendor as the vendor id)
 	Model    string // optional device model/name filter
 	Mapping  string // optional cluster-wide resource mapping
 	Address  string // optional exact PCI address
@@ -942,6 +943,9 @@ func assignDevicesMapped(devPool map[string][]corrosion.PCIDeviceRecord, mapping
 				continue
 			}
 			if req.Vendor != "" && d.VendorID != req.Vendor && d.VendorName != req.Vendor {
+				continue
+			}
+			if req.DeviceID != "" && d.DeviceID != req.DeviceID {
 				continue
 			}
 			if req.Model != "" && d.DeviceName != req.Model {

@@ -43,6 +43,9 @@ func TestISORound5_AMemoryRevertIsHandedTheJudgedFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The image was saved while the domain carried the link (a main-era save).
+	if err := os.WriteFile(vmstate, []byte("ram"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	fake.SetSavedImageXML(vmstate, fake.DefinedXML("win"))
 	if _, err := s.RestoreSnapshot(adminCtx(), &pb.RestoreSnapshotRequest{VmName: "win", SnapshotName: "snap1"}); err != nil {
 		t.Fatalf("revert to a memory snapshot: %v", err)

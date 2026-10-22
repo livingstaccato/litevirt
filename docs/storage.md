@@ -759,6 +759,16 @@ image the daemon creates are published exclusively: a file already at the name
 is refused (`FailedPrecondition` for a create or clone), never overwritten and
 never cleaned up by the failed create. Choose another VM or disk name.
 
+A failed create or clone removes the disks and cloud-init seed it made, and
+only those: each is held open from when it is made, so a file put at the same
+path since is never mistaken for it. On a btrfs pool it then removes the
+subvolume the disk was made in, only while that subvolume is empty, so a retry
+of the name can make it again. One it could not hold open (an open
+refused by the file limit or the file's mode), or could not remove, is left
+where it is, and the create's or clone's error names each such file and why
+(`the failed create left what it made: ...`). Remove it once nothing uses it,
+or a retry of the same name may be refused as above.
+
 Reading a disk's backing chain — a full clone, an image built from a VM, a
 cold migration's flatten, a move or copy with qemu-img, and every VM start
 (qemu and libvirt follow the chain too) — follows each layer's
@@ -2089,8 +2099,9 @@ disk to choose either way (see [compose.md](compose.md)).
 The **Snapshots** row describes each backend's *native* snapshot capability
 (what the driver could do). It is not the `lv snapshot create` code path: that
 command always goes through libvirt — an external qcow2 overlay for disk
-snapshots, plus `DomainSaveFlags` for the RAM state of a `--memory` snapshot —
-regardless of the underlying pool driver.
+snapshots, plus libvirt's external memory snapshot (RAM written by the running
+QEMU, see [configuration](configuration.md#memory-snapshots)) for a `--memory`
+snapshot — regardless of the underlying pool driver.
 
 For HA scenarios use NFS, Ceph RBD, or iSCSI — the disk must survive any
 single host failing.

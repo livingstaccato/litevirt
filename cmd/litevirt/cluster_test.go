@@ -326,3 +326,11 @@ func TestUpgradeStatus_TokenLatchedFromTheTokenTable(t *testing.T) {
 		t.Errorf("a post-latch output does not read as latched:\n%s", post)
 	}
 }
+
+func TestPrintUpgradeStatus_SelfUpgradeSkipped(t *testing.T) {
+	var buf bytes.Buffer
+	printUpgradeStatus(&buf, &pb.UpgradeStatus{SelfUpgradeSkipped: []string{"h2 runs v1.10.0-rc1: pre-release"}})
+	if !strings.Contains(buf.String(), "Self-upgrade skipped: h2 runs v1.10.0-rc1: pre-release") {
+		t.Fatalf("skipped pre-release not shown:\n%s", buf.String())
+	}
+}

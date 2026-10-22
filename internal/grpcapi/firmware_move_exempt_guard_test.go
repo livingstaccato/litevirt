@@ -93,7 +93,7 @@ var fwRawLibvirt = map[string][]string{
 	},
 	"DomainResume": {
 		"internal/libvirt.startDomainGuarded", "internal/libvirt.resumeDomain",
-		"internal/libvirt.Client.CreateLiveSnapshot", "internal/libvirt.restoreWithRetry",
+		"internal/libvirt.capture.settle", "internal/libvirt.restoreWithRetry",
 	},
 	"DomainDestroy": {
 		"internal/libvirt.startDomainGuarded", "internal/libvirt.destroyDomain", "internal/libvirt.discardFirmwareMoveTarget",

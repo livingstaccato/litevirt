@@ -89,10 +89,10 @@ func (o *aggregateLocalObservation) observe(out *aggregateLocalAudit, section in
 			case retainedLocalLayout85Digest():
 				valid = version == 84 || version == 85
 			case retainedLocalLayoutDigest():
-				valid = version == 86
+				valid = version == 86 || version == 87
 			}
 		} else {
-			valid = layout == retainedLocalLayoutDigest() && version == 86
+			valid = layout == retainedLocalLayoutDigest() && version == 87
 		}
 		if !valid {
 			if o.layoutDigest != "" {

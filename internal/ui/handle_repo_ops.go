@@ -27,8 +27,8 @@ func repoParam(r *http.Request) string { return strings.TrimSpace(r.URL.Query().
 func (s *Server) backupInFlight(repoName string) bool {
 	inflight := false
 	s.backupOps.Range(func(_, v any) bool {
-		st := v.(*backupOpState)
-		if st.Kind == "backup" && st.Repo == repoName && !st.Done {
+		d := v.(*backupOpState).snapshot()
+		if d.Kind == "backup" && d.Repo == repoName && !d.Done {
 			inflight = true
 			return false
 		}

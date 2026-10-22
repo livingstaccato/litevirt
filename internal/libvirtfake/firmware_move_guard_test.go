@@ -76,8 +76,8 @@ func TestFake_FirmwareMoveGuardAskedFirst(t *testing.T) {
 		{"SetBootOrder", StateDefined, libvirt.FirmwareCall{Op: libvirt.OpDefine, Name: fgVM}, func(f *Fake) error { return f.SetBootOrder(fgVM, "disk") }},
 		{"UndefineDomain", StateDefined, libvirt.FirmwareCall{Op: libvirt.OpUndefine, Name: fgVM}, func(f *Fake) error { return f.UndefineDomain(fgVM, false) }},
 		{"UndefineDomainPreservingState", StateDefined, libvirt.FirmwareCall{Op: libvirt.OpUndefine, Name: fgVM}, func(f *Fake) error { return f.UndefineDomainPreservingState(fgVM) }},
-		{"CreateLiveSnapshot", StateRunning, libvirt.FirmwareCall{Op: libvirt.OpStop, Name: fgVM}, func(f *Fake) error {
-			_, _, err := f.CreateLiveSnapshot(fgVM, "s1", "/nonexistent", nil)
+		{"CreateLiveSnapshot", StateRunning, libvirt.FirmwareCall{Op: libvirt.OpStart, Name: fgVM}, func(f *Fake) error {
+			_, _, err := f.CreateLiveSnapshot(fgVM, "s1", "/nonexistent", libvirt.CaptureOptions{})
 			return err
 		}},
 		{"CommitDiskOverlay", StateRunning, libvirt.FirmwareCall{Op: libvirt.OpDefine, Name: fgVM}, func(f *Fake) error {
@@ -237,12 +237,12 @@ func TestFake_FirmwareMoveGuardBeforeNICGuardReadiness(t *testing.T) {
 	}
 }
 
-// I-2 on the fake: the memory snapshot asks for the stop AND the start before
-// it does anything; either refusal alone refuses it.
+// I-2 on the fake: the memory snapshot asks for the start AND the resume
+// before it does anything; either refusal alone refuses it.
 //
 // Mutation: drop either op from the fake's check — red.
-func TestFake_CreateLiveSnapshotAsksStopAndStart(t *testing.T) {
-	for _, only := range []libvirt.FirmwareOp{libvirt.OpStop, libvirt.OpStart} {
+func TestFake_CreateLiveSnapshotAsksStartAndResume(t *testing.T) {
+	for _, only := range []libvirt.FirmwareOp{libvirt.OpStart, libvirt.OpResume} {
 		f := fgFake(t, StateRunning)
 		before := len(f.EventLog())
 		refused := errors.New("refused")
@@ -252,7 +252,7 @@ func TestFake_CreateLiveSnapshotAsksStopAndStart(t *testing.T) {
 			}
 			return nil
 		}})
-		if _, _, err := f.CreateLiveSnapshot(fgVM, "s1", "/nonexistent", nil); !errors.Is(err, refused) {
+		if _, _, err := f.CreateLiveSnapshot(fgVM, "s1", "/nonexistent", libvirt.CaptureOptions{}); !errors.Is(err, refused) {
 			t.Fatalf("%s refused: err = %v", only, err)
 		}
 		if ev := f.EventLog()[before:]; len(ev) != 0 {

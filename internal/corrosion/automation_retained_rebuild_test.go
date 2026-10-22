@@ -544,7 +544,7 @@ func retainedCompatibilityCurrent37Fixture(t *testing.T) (*aggregateFixture, str
 			}
 		}
 	}})
-	if CurrentSchemaVersion != 86 || storedVersion(t, f.local.c) != 86 || len(aggregateLocalTables()) != 37 {
+	if CurrentSchemaVersion != 87 || storedVersion(t, f.local.c) != 87 || len(aggregateLocalTables()) != 37 {
 		t.Fatal("current37 requires actual86 schema")
 	}
 	before := receiverActive(t, f.local.c)
@@ -735,7 +735,7 @@ func TestRetainedCurrent37NonemptyExecutionWarmCold(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	c.SetVoterConfigGate(func() bool { return true })
-	if storedVersion(t, c) != 86 || receiverActive(t, c) != active {
+	if storedVersion(t, c) != 87 || receiverActive(t, c) != active {
 		t.Fatal("cold current86 state changed")
 	}
 	view, err = pki.CaptureHostTrust(ctx, f.local.pki, f.local.name)

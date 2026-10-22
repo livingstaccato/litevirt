@@ -34,6 +34,9 @@ func TopologyScore(devices []corrosion.PCIDeviceRecord, req DeviceRequest) (scor
 		if req.Vendor != "" && d.VendorID != req.Vendor {
 			continue
 		}
+		if req.DeviceID != "" && d.DeviceID != req.DeviceID {
+			continue
+		}
 		if req.Model != "" && d.DeviceName != req.Model {
 			continue
 		}

@@ -31,6 +31,8 @@ func TestFailover_FenceRowAndStateShareOneEntry(t *testing.T) {
 		}
 	}
 	fenceQuorum(t, ctx, db, []string{"first", "good"}, "bad")
+	// A workload that needs the fence: what this test pins is the fence.
+	needsFence(t, db, "bad")
 
 	c := NewCoordinator("first", db)
 	c.Now = func() time.Time { return now }

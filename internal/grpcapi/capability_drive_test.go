@@ -138,6 +138,8 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// when it latches; a feature is opened only through WithFeature,
 		// which records the use first.
 		capabilities.Release202611V1: true,
+		// release_2026_12_v1, the next release's token, on the same terms.
+		capabilities.Release202612V1: true,
 	}
 
 	// Cross-check the hand-written list against the ONE declaration, so adding a

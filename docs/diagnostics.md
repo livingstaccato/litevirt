@@ -1495,6 +1495,38 @@ The condition resolves once the host is removed; a fenced or offline host
 once no recoverable workload is left on it; any other host once it is no
 longer held (a quorum of voters sees it answer, or its pause is over).
 
+### A fence held because nothing needs it (`ha.fence_held`)
+
+Evaluator `failover`, subject the host, severity warning, written by the
+failover lease holder. A quorum of voters fails the host, but nothing on it
+needs a fence: no workload a failover would move (every VM and container on it
+is `on_host_failure: none`, stopped on a host-local disk, or otherwise left in
+place; a VM stopped on shared storage with a policy is moved off still stopped,
+and does need the fence), no workload recorded mid-transfer, no container
+relocation marker and no pending recovery proof. Fencing it would power off what nothing restarts elsewhere, so the host
+is recorded `offline`, **not fenced**, and no `fencing_log` row is written.
+Whatever runs there keeps running. `lv status` shows the host `offline`; the
+evidence names each workload left on it with its state and policy.
+
+The decision is made again every cycle. Once something recoverable is recorded
+on the host (a VM's policy changed to `restart-any`, a workload placed there),
+the next cycle fences it as any failed host is fenced, and recovers its
+workloads. If that fence is a best-effort one that did not reach the host, it
+recovers nothing until `lv host fence-confirm <host>`: what became recoverable
+during the hold was never paused by the host's partition pause, so it may
+still run there. This holds even for a host labelled
+`litevirt.unsafe_auto_failover=true`: that label opts out of the safe-fence
+policy, not out of this. An `offline` host whose fence is held is not proven
+off: a move off it still needs `lv host fence-confirm <host>` once it is
+powered off. Bring its daemon back and it returns to `active` once a quorum
+sees it healthy. The
+condition resolves when the host leaves `offline` (back `active`, or fenced),
+when a fence of it is recorded, or when it is removed.
+
+A failover leader on an older release reads such a host as one whose fence
+already failed, and does not fence it again, even if something recoverable is
+recorded on it later. Upgrade the leader, or confirm the host off.
+
 ### A failed re-fence (`refence_failed`)
 
 Evaluator `failover`, subject the host, severity critical, written by the
@@ -2100,7 +2132,9 @@ sight of every peer) instead of waiting for its interval
 (`anti_entropy_interval_sec`), so with a peer reachable the deferral lasts
 seconds. Passes are still at least 12 s apart, so a first try that finds no
 peer yet costs up to about 12 s. A single-node cluster — no other host in the
-hosts table — is not gated. The same sync is also withheld, on a current
+hosts table — is not gated, and neither is a node with no gossip peer whose
+only other hosts are `joining` (`lv host add` admitted them and their daemons
+have not started, as on a founder adding its second host). The same sync is also withheld, on a current
 replica, while the VM has an active ownership condition (`vm_dual_run`,
 `runtime_owner_mismatch`, `owner_epoch_mismatch`), matching the self-heal
 restart.
@@ -2130,7 +2164,10 @@ Retry after the `replica caught up` journal line, or run the command on any
 other host. With a peer reachable that line follows a daemon restart within
 seconds; the refusal says how long the node has been waiting, so a count that
 keeps growing points at the peers rather than the node (see below). A
-single-node cluster is not gated.
+single-node cluster is not gated, nor is a node with no gossip peer whose only
+other hosts are still `joining` (admitted, their daemons not started yet). Once
+such a host's daemon starts it is a peer like any other, and the node waits for
+its first exchange with it.
 
 A host whose peers are all down cannot catch up, so it refuses these commands
 until one of them answers. That is deliberate: it cannot know whether another
@@ -2275,10 +2312,64 @@ holder writes.
   ```
   A record whose VM domain is undefined, or whose container has no live row on
   this host and no longer exists in LXC, is dropped with the last line.
+  A VM is resumed only while it is paused by this host's own pause: libvirt's
+  paused reason is `user`, and the domain carries the mark the pause set. One
+  that an operator suspended or QEMU paused on a disk I/O error is held, and
+  the evidence names it under `not_paused_by_this_host`:
+  ```
+  partition-pause: workload stays paused kind=vm name=<vm> reason="the domain is paused on a disk I/O error, not by this host's partition pause; …"
+  ```
+  No `lv` command resumes a paused VM (`lv stop` and `lv start` drop the
+  record but reboot the guest). On the VM's host, once it should run:
+  ```
+  virsh resume <vm>
+  ```
+  The next pass drops the record. For an I/O-error pause, free space in the
+  storage pool or repair the disk first: a resume into the same failure
+  pauses the guest again at once. A VM whose pause mark could not be set is
+  held the same way, and the reason then reads "this host's pause could not
+  mark the domain". A VM left paused on purpose keeps `partition_paused`
+  open, and memory snapshots and NIC firewall arming stay refused for it,
+  until it is resumed or stopped.
   A host the majority fenced while it was paused stays paused until
   `lv host undrain` (or until failover returns it to active, when its fence
   moved nothing). A workload that a certified claim moved is stopped by the
   settle step below, not resumed.
+
+  A resume (an Unfreeze for a container) that libvirt or LXC has not
+  answered within its 3 s step is abandoned, and the workload stays paused
+  with `reason="resume failed: did not return within …"` (`unfreeze
+  failed: …`). The call is still out, and when it lands later:
+  ```
+  partition-pause: an abandoned resume landed late with the voter majority there throughout and confirming again; it stands kind=vm name=<vm>
+  partition-pause: an abandoned resume landed late; paused again kind=vm name=<vm>
+  ```
+  It stands only when the host read the majority as present at every
+  reading since the step began, reads it present again, and a majority of
+  voters confirms the workload again. Otherwise it is paused again at once,
+  and a later pass resumes it on a fresh confirmation. A libvirtd that is
+  slow on every call therefore still resumes the VM, a few seconds late.
+
+  A call that never returns means libvirtd, or the domain's QEMU monitor, is
+  wedged. The VM stays paused, and `partition_paused` stays open, for as
+  long as it lasts. Restarting libvirtd (`systemctl restart libvirtd`) makes
+  the call fail, and the next pass resumes the VM. If the domain's QEMU is
+  wedged itself, `lv stop <vm> --force` and `lv start <vm>` restart the
+  guest.
+
+  If the majority is lost again while such a call is out, the pause pass
+  kills the VM's QEMU directly, because a call that may land cannot be
+  undone in time:
+  ```
+  partition-pause: killed the QEMU of a VM whose abandoned resume was still out under a lost majority; it cannot land now name=<vm>
+  ```
+  libvirt then reports the domain shut off, crashed. The majority recovers it
+  from its disks. If the majority never fenced this host, the VM's restart
+  policy decides, as for any crash, once this host holds a quorum. If the
+  kill cannot be done (no pid file, the pid is not that domain's QEMU, or
+  the QEMU has not exited within the call's timeout, typically stuck flushing
+  its disks to cut storage), and for a container, whose Unfreeze has no such stop, the workload is
+  reported in `partition_pause_failed`.
 - `partition_pause_failed` (host, critical): this host lost the majority and
   could not pause a workload it had to. While it is open, the majority does
   not rely on this host's pause and recovers on an `assumed` fence as before.
@@ -2306,7 +2397,14 @@ holder writes.
   holding a copy of a workload that a decided recovery claim, whose
   certificate verifies, gave to another host at the same incarnation and an
   owner epoch at least its own, on a proof its destination completed, while
-  the destination's own runtime reports the workload running. The host
+  the destination's own runtime reports the workload running. A copy this
+  host's partition pause holds paused does not wait for that: it is stopped
+  as soon as the proof is live (not failed, not taken by another host),
+  because a paused QEMU keeps a shared disk's image lock and the destination
+  cannot start the VM until it is gone. That destroy waits for no resume:
+  it runs under the pause's mark lock, only while the domain is still
+  paused with the pause's mark, and a pass that finds otherwise declines
+  with reason class `pause_changed`. The host
   stopped its copy (a VM is destroyed, which keeps its definition and disks)
   and wrote a `partition.settle` audit row. The leftover cleanup then handles the shut-off domain as usual.
   The host resolves `vm_settled` on the pass that finds no domain of that
@@ -2801,6 +2899,12 @@ read `error` and a `remedy` in the evidence. `lv start` is refused with
 To clear it, look at the file, then record the stop with `lv stop <vm>`: a
 stop recorded on the VM's row removes its marker, whatever the marker holds.
 Then `lv start <vm>` starts it.
+
+`lv ct stop --force` keeps a container's marker the same way, in
+`<data_dir>/ct-operator-stops/<name>.json`. One that cannot be read holds the
+container stopped (no restart policy, no `lv ct start`) and raises the same
+condition with subject `container/<name>`. Its remedy is `lv ct stop <name>`,
+then `lv ct start <name>`; for a deleted container, remove the file by hand.
 
 While the host is still in write quarantine, leave the file: nothing can
 start the VM there meanwhile (`lv start` is refused, and the automated starts
@@ -3374,6 +3478,20 @@ moves the record off `migrating` on its host resolves it too, within a minute,
 on the host the record then names: a re-point, a `lv doctor firmware-move`
 action (at once), or a live firmware move's own recovery. A firmware move still
 marked on that host keeps it open.
+
+While the condition is open, the move's target never replaces a paused domain
+of the VM: that copy may be the guest's only one. A lease holder on an older
+build can reschedule a VM recorded `migrating` onto its target, and the
+target's reconciler would otherwise destroy the paused guest and boot the VM
+afresh from its disks. It leaves the start pending instead, and logs why, and
+the condition stays open on the host the record names while that host holds a
+paused domain of the VM and the record does not say running there. Resume the
+guest there (`virsh resume <vm>`) and it is recorded running; or discard it
+(`virsh destroy <vm>`) and the VM is started there from its disks. `lv stop
+<vm>` and `lv rm <vm>` discard the paused copy too, without asking: it may be
+the guest's only copy. Each resolves the condition within a minute. A guest
+held paused there for its NIC guards (`firewall.nic.held`) is resumed by its
+host once its guards are in force, which is the resume above.
 
 `lv stop` and `lv rm` of a VM recorded `migrating` whose guest is not running
 on its host first ask the move's target whether it holds a domain of the VM.

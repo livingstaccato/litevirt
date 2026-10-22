@@ -92,6 +92,19 @@ func TestAutomationPublicEnrolledPrincipalRefusesUnavailableAuthority(t *testing
 		t.Fatal(err)
 	}
 	client := automationv1.NewAutomationClient(connection)
+	// Real owner methods validate intent before checking current authorization.
+	// Supply valid request fields without inventing a certified project or owner:
+	// this principal-only fixture must still refuse unavailable authority.
+	owner := &automationv1.OwnerRef{ProjectUid: "unavailable-project", OwnerId: "public-owner"}
+	ensureOwner := &automationv1.EnsureOwnerRequest{Owner: owner, RequestId: "public-ensure-owner"}
+	acquireSession := &automationv1.AcquireOwnerSessionRequest{
+		Owner: owner, ExpectedActivationGeneration: 0,
+		SessionId: "public-session", RequestId: "public-acquire-session",
+	}
+	handoffSession := &automationv1.HandoffOwnerSessionRequest{
+		Current:            &automationv1.OwnerSession{Owner: owner, ActivationGeneration: 1, SessionId: "public-session"},
+		SuccessorSessionId: "public-successor-session", RequestId: "public-handoff-session",
+	}
 	for _, call := range []struct {
 		name   string
 		invoke func() error
@@ -100,13 +113,13 @@ func TestAutomationPublicEnrolledPrincipalRefusesUnavailableAuthority(t *testing
 			_, err := client.GetAutomationCapabilities(bearer, &automationv1.GetAutomationCapabilitiesRequest{})
 			return err
 		}},
-		{"EnsureOwner", func() error { _, err := client.EnsureOwner(bearer, &automationv1.EnsureOwnerRequest{}); return err }},
+		{"EnsureOwner", func() error { _, err := client.EnsureOwner(bearer, ensureOwner); return err }},
 		{"AcquireOwnerSession", func() error {
-			_, err := client.AcquireOwnerSession(bearer, &automationv1.AcquireOwnerSessionRequest{})
+			_, err := client.AcquireOwnerSession(bearer, acquireSession)
 			return err
 		}},
 		{"HandoffOwnerSession", func() error {
-			_, err := client.HandoffOwnerSession(bearer, &automationv1.HandoffOwnerSessionRequest{})
+			_, err := client.HandoffOwnerSession(bearer, handoffSession)
 			return err
 		}},
 		{"ResolveBinding", func() error {
@@ -167,7 +180,7 @@ func TestAutomationPublicEnrolledPrincipalRefusesUnavailableAuthority(t *testing
 	if err := corrosion.RevokeSession(ctx, s.db, strings.TrimPrefix(login.GetToken(), SessionTokenPrefix)); err != nil {
 		t.Fatal(err)
 	}
-	_, err = client.EnsureOwner(bearer, &automationv1.EnsureOwnerRequest{})
+	_, err = client.EnsureOwner(bearer, ensureOwner)
 	if st := status.Convert(err); st.Code() != codes.Unauthenticated || len(st.Details()) != 1 {
 		t.Fatalf("revoked enrolled session bypassed the actual authentication interceptor: %v", err)
 	}
@@ -178,7 +191,7 @@ func TestAutomationPublicEnrolledPrincipalRefusesUnavailableAuthority(t *testing
 		t.Fatal(err)
 	}
 	freshBearer := metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+fresh.GetToken())
-	if _, err := client.EnsureOwner(freshBearer, &automationv1.EnsureOwnerRequest{}); status.Code(err) != codes.Unavailable {
+	if _, err := client.EnsureOwner(freshBearer, ensureOwner); status.Code(err) != codes.Unavailable {
 		t.Fatalf("fresh enrolled session did not reach unavailable authority: %v", err)
 	}
 	serial, err := pki.CertSerial(filepath.Join(s.pkiDir, "host.crt"))
@@ -188,7 +201,7 @@ func TestAutomationPublicEnrolledPrincipalRefusesUnavailableAuthority(t *testing
 	if err := pki.GenerateCRL(filepath.Join(s.pkiDir, "ca.crt"), filepath.Join(s.pkiDir, "ca.key"), filepath.Join(s.pkiDir, "crl.pem"), []string{serial}); err != nil {
 		t.Fatal(err)
 	}
-	_, err = client.EnsureOwner(freshBearer, &automationv1.EnsureOwnerRequest{})
+	_, err = client.EnsureOwner(freshBearer, ensureOwner)
 	if st := status.Convert(err); st.Code() != codes.Unauthenticated || len(st.Details()) != 1 {
 		t.Fatalf("revoked certificate on established TLS bypassed the connection gate: %v", err)
 	}

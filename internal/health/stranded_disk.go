@@ -786,6 +786,47 @@ func RecordHeldForHost(ctx context.Context, db *corrosion.Client, reporter, vmNa
 	ev.Detail = fmt.Sprintf("held on %s, not restarted elsewhere: on-host-failure is restart-same and its host-local disk(s) %s "+
 		"are on %s; a restart on another host would rebuild them blank from its image", host, strings.Join(paths, ", "), host)
 	ev.Fix = heldFix(vmName, host)
+	return recordHeld(ctx, db, reporter, ev, ts)
+}
+
+// RecordHeldForDevices records that vmName is held on its failed host because
+// no surviving host has a free device of the kind each of its PCI passthrough
+// devices needs (devices describes them), and returns the detail for the
+// caller's event, audit row and notification. why is the placement's verdict;
+// with no devices, why the need could not be stated.
+// The record resolves as a restart-same hold's does: once the VM runs on host
+// again, or is anywhere else, or is gone.
+func RecordHeldForDevices(ctx context.Context, db *corrosion.Client, reporter, vmName, host string, devices []string, why string, now time.Time) (string, error) {
+	ts := now.UTC().Format(time.RFC3339)
+	ev := HeldForHost{VM: vmName, Host: host}
+	if len(devices) == 0 {
+		// What its devices need could not be stated at all.
+		ev.Detail = fmt.Sprintf("held on %s, not restarted elsewhere: %s", host, why)
+	} else {
+		ev.Detail = fmt.Sprintf("held on %s, not restarted elsewhere: no surviving host has a free PCI device of the kind its "+
+			"passthrough needs (%s), and it is not started without them", host, strings.Join(devices, "; "))
+		if why != "" {
+			ev.Detail += " (" + why + ")"
+		}
+	}
+	ev.Fix = heldDevicesFix(vmName, host)
+	return recordHeld(ctx, db, reporter, ev, ts)
+}
+
+// heldDevicesFix is what an operator can do about a VM held for its PCI
+// passthrough devices.
+func heldDevicesFix(vm, host string) string {
+	return fmt.Sprintf("free a device of that kind on a surviving host, or add a host with one: the next failover pass "+
+		"recovers %[1]s there with it (`lv host devices <host>` lists a host's devices and who owns them). Or bring %[2]s "+
+		"back: once it is active it starts %[1]s there with its own devices. To recover %[1]s without its passthrough "+
+		"devices instead, give it the label `%[3]s=true` in its spec's `labels`: the next failover pass recovers it, and "+
+		"its new host starts it without them unless it has all of them, and says so in its state detail",
+		vm, host, corrosion.LabelFailoverWithoutDevices)
+}
+
+// recordHeld writes ev as vmName's open vm_failover_held record on ev.Host.
+func recordHeld(ctx context.Context, db *corrosion.Client, reporter string, ev HeldForHost, ts string) (string, error) {
+	vmName, host := ev.VM, ev.Host
 	b, err := json.Marshal(ev)
 	if err != nil {
 		return "", err
@@ -829,6 +870,21 @@ func RecordHeldForHost(ctx context.Context, db *corrosion.Client, reporter, vmNa
 		return "", err
 	}
 	return ev.Detail + ". " + ev.Fix, nil
+}
+
+// ResolveHeldMoved clears vmName's open vm_failover_held record on host once
+// failover has moved the VM off it (a VM held for its PCI devices, once a
+// survivor can take it). host's own reconciler would clear it only when host
+// is back.
+func ResolveHeldMoved(ctx context.Context, db *corrosion.Client, reporter, vmName, host string, now time.Time) error {
+	row, had, err := corrosion.GetHealthCondition(ctx, db, DiskMissingEvaluator, CondVMFailoverHeld, "vm", strandedSubject(vmName, host))
+	if err != nil || !had || row.Lifecycle == corrosion.ConditionResolved {
+		return err
+	}
+	ts := now.UTC().Format(time.RFC3339)
+	row.Lifecycle, row.ResolvedAt, row.LastSeen, row.Reporter = corrosion.ConditionResolved, ts, ts, reporter
+	row.ObserveCount, row.CleanCount = 0, 1
+	return corrosion.UpsertHealthCondition(ctx, db, row)
 }
 
 // HeldForHostOf returns the open vm_failover_held record of vmName, or nil.

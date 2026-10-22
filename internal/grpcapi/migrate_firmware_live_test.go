@@ -860,6 +860,13 @@ func TestAdoptedFirmwareMigration_VerifiesBeforeCommit(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	// "cleanup" is logged as the cleanup starts. The adopter goes on after it
+	// (it removes the marker, retains the source's files, records the event)
+	// and drops the per-VM lock as its last act, so taking the lock is how this
+	// test waits for it: returning earlier let it write into the rig's
+	// t.TempDir directories while they were being removed ("directory not
+	// empty").
+	r.src.lockVM(fwlVM)()
 	want := []string{"prepare", "migrate", "verify", "commit", "release", "target-running", "cleanup"}
 	if got := r.log.get(); strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("steps %v, want %v", got, want)

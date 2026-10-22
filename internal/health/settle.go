@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -36,7 +37,11 @@ import (
 //     destination and carries a certificate that verifies here
 //     (corrosion.VerifyClaimCertificate), at an incarnation-scoped key of the
 //     local copy's incarnation (or a legacy key), at an owner epoch at least
-//     the local copy's.
+//     the local copy's;
+//   - that proof completed on its destination, whose own runtime reports the
+//     VM running — or, for a copy this host's partition pause holds paused,
+//     merely is live (settleDecide): a paused QEMU keeps a shared disk's image
+//     lock, so the replacement cannot run until the paused copy is gone.
 //
 // It writes an audit row and the vm_settled condition, retried until both are
 // written (settle_pending.go), and leaves the shut-off domain to the existing
@@ -45,6 +50,21 @@ import (
 // SettleVerifier verifies a proof's recovery-claim certificate
 // (grpcapi.Server.VerifySettleProof).
 type SettleVerifier func(ctx context.Context, p corrosion.ActionProof) (corrosion.ClaimCertificate, error)
+
+// PauseSettleGuard runs destroy for the VM rec describes only while the
+// pauser cannot resume it: under its mark lock, with the domain still paused
+// by rec (PartitionPauser.SettleDestroy). It returns errPauseChanged when it
+// declined.
+type PauseSettleGuard func(rec PauseRecord, destroy func() error) error
+
+// SetPauseGuard wires the pauser's guard for the destroy of a paused copy.
+// Without one, the paused state settle decided on is not re-checked at the
+// destroy.
+func (r *Reconciler) SetPauseGuard(fn PauseSettleGuard) { r.pauseGuard = fn }
+
+// errPauseChanged: the paused copy settle decided on changed before the
+// destroy (resumed, or a mark write or resume in flight); this pass declines.
+var errPauseChanged = errors.New("the paused copy changed before the destroy")
 
 // SetSettleVerifier wires Layer 3. nil (the default) settles nothing: without
 // a verifier there is no proof, and the guard stands as before.
@@ -56,6 +76,12 @@ type localCopyID struct {
 	Epoch       int64
 	EpochKnown  bool
 	Source      string
+	// SelfPaused: this host's partition pause record still describes the
+	// domain, which is paused now (recordStillDescribes). Such a copy runs
+	// nothing, so stopping it cannot take away a running copy (settleDecide).
+	SelfPaused bool
+	// Record is the pause record SelfPaused rests on.
+	Record PauseRecord
 }
 
 // localVMIdentity reads the local copy's identity from host-local evidence.
@@ -69,7 +95,7 @@ func (r *Reconciler) localVMIdentity(name string) localCopyID {
 	var id localCopyID
 	var sources []string
 	if rec, ok, err := ReadPauseRecord(r.dataDir, PauseKindVM, name); err == nil && ok && rec.Incarnation != "" && r.recordStillDescribes(rec) {
-		id.Incarnation, id.Epoch, id.EpochKnown = rec.Incarnation, rec.OwnerEpoch, true
+		id.Incarnation, id.Epoch, id.EpochKnown, id.SelfPaused, id.Record = rec.Incarnation, rec.OwnerEpoch, true, true, rec
 		sources = append(sources, "partition-pause record")
 	}
 	if inc, ok, err := r.virt.GetDomainManagedIncarnation(name); err == nil && ok && inc != "" {
@@ -163,7 +189,17 @@ func settleDecide(self string, row *corrosion.VMRecord, local localCopyID, proof
 		// A decided claim is not yet a running replacement: the proof must
 		// have been EXECUTED, by its destination. A prepared or failed one
 		// leaves the local copy the only one running.
-		if why2, ok := proofExecutedByDest(p); !ok {
+		//
+		// Unless the local copy runs nothing: one this host's partition pause
+		// holds paused. Stopping it cannot leave zero running copies, and
+		// waiting for the replacement to run first can wait forever, because
+		// a paused QEMU keeps its image locks on shared storage and the
+		// replacement cannot start until they are released (lab 2, B4). Its
+		// RAM belongs to the copy the decided claim superseded either way: the
+		// pauser never resumes a workload a decided claim moved. So a live
+		// proof the destination may still execute is enough; a failed one, or
+		// one another host took, is not.
+		if why2, ok := proofExecutedByDest(p); !ok && (!local.SelfPaused || !proofLiveForDest(p)) {
 			why = why2
 			continue
 		}
@@ -186,7 +222,11 @@ func settleDecide(self string, row *corrosion.VMRecord, local localCopyID, proof
 		}
 		// And the replacement must be running there NOW, by the destination's
 		// own runtime, not by any row: the last line before stopping what may
-		// otherwise be the only copy.
+		// otherwise be the only copy. A copy this host holds paused is not
+		// one, and the replacement may be waiting for it to go (above).
+		if local.SelfPaused {
+			return p, cert, ""
+		}
 		if ok, rwhy := destRuns(p.DestHost); !ok {
 			why = "proof " + p.ID + ": " + rwhy
 			continue
@@ -211,6 +251,20 @@ func proofExecutedByDest(p corrosion.ProofRecord) (string, bool) {
 		return fmt.Sprintf("proof %s was executed by %q, not its destination %s", p.ID, p.ExecutorHost, p.DestHost), false
 	}
 	return "", true
+}
+
+// proofLiveForDest reports whether p can still be, or has been, executed by
+// its own destination: prepared and unclaimed, in progress on its destination,
+// or completed by it. A failed proof, or one another host claimed, is not.
+func proofLiveForDest(p corrosion.ProofRecord) bool {
+	switch p.Status {
+	case corrosion.ProofPrepared:
+		return p.ExecutorHost == "" || p.ExecutorHost == p.DestHost
+	case corrosion.ProofInProgress, corrosion.ProofCompleted:
+		return p.ExecutorHost == p.DestHost
+	default:
+		return false
+	}
 }
 
 // destRunsVia asks dest's own runtime whether it runs name, through check
@@ -265,7 +319,17 @@ func (r *Reconciler) settleCertifiedMove(ctx context.Context, domName string, vm
 		"certified at voter generation %d for owner epoch %d; definition and disks kept",
 		local.Source, local.Incarnation, local.Epoch, p.ID, p.DestHost, cert.ConfigGeneration, cert.Key.OwnerEpoch)
 	rec := w.newPending(PauseKindVM, domName, detail, p, cert, local.Incarnation, local.Epoch, local.Source)
-	if err := w.stopRecorded(ctx, rec, func() error { return r.virt.DestroyDomain(domName) }); err != nil {
+	destroy := func() error { return r.virt.DestroyDomain(domName) }
+	if local.SelfPaused && r.pauseGuard != nil {
+		// Decided on a copy that is paused: destroyed only while it still is,
+		// under the pauser's mark lock, so no resume lands between the two.
+		guarded := destroy
+		destroy = func() error { return r.pauseGuard(local.Record, guarded) }
+	}
+	if err := w.stopRecorded(ctx, rec, destroy); err != nil {
+		if errors.Is(err, errPauseChanged) {
+			return false, err.Error(), local
+		}
 		return false, "destroy failed: " + err.Error(), local
 	}
 	slog.Warn("partition-settle: stopped a local copy that a certified recovery claim gave to another host",
@@ -337,25 +401,29 @@ func (r *Reconciler) resolveSettled(ctx context.Context, localDomains []string) 
 // the frozen local copy is stopped (its rootfs kept), with a partition.settle
 // audit row and ct_settled, retried until written (settle_pending.go). It
 // reports whether it settled, and if not, why.
-func (p *PartitionPauser) settleContainer(ctx context.Context, rec PauseRecord) (bool, string) {
+//
+// Everything it does ends by deadline, the end of its step in the resume
+// pass: the stop is abandoned there, and is not started at all with less
+// than settleStopMin left (short), so the next pass starts with it.
+func (p *PartitionPauser) settleContainer(ctx context.Context, rec PauseRecord, deadline time.Time) (settled bool, why string, short bool) {
 	if p.settle == nil || p.cts == nil {
-		return false, ""
+		return false, "", false
 	}
 	rows, err := p.db.Query(ctx, `SELECT host_name FROM containers WHERE name = ? AND deleted_at IS NULL AND host_name != ?`,
 		rec.Name, p.host)
 	if err != nil {
-		return false, "container rows unreadable: " + err.Error()
+		return false, "container rows unreadable: " + err.Error(), false
 	}
 	if len(rows) != 1 {
-		return false, fmt.Sprintf("%d live rows for the container on other hosts, not one", len(rows))
+		return false, fmt.Sprintf("%d live rows for the container on other hosts, not one", len(rows)), false
 	}
 	dest := rows[0].String("host_name")
 	row, err := corrosion.GetContainer(ctx, p.db, dest, rec.Name)
 	if err != nil || row == nil {
-		return false, "the destination row is unreadable"
+		return false, "the destination row is unreadable", false
 	}
 	if corrosion.IncarnationOf(row.CreatedAt) != rec.Incarnation {
-		return false, "the live row is another incarnation"
+		return false, "the live row is another incarnation", false
 	}
 	lister := p.settleProofs
 	if lister == nil {
@@ -363,30 +431,40 @@ func (p *PartitionPauser) settleContainer(ctx context.Context, rec PauseRecord) 
 	}
 	proofs, err := lister(ctx, p.db, corrosion.ClaimKindContainer, rec.Name)
 	if err != nil {
-		return false, "proofs unreadable: " + err.Error()
+		return false, "proofs unreadable: " + err.Error(), false
 	}
 	pr, cert, why := settleDecideContainer(p.host, dest, rec, proofs, func(ap corrosion.ActionProof) (corrosion.ClaimCertificate, error) {
 		return p.settle(ctx, ap)
 	}, destRunsVia(ctx, p.peerRuntime, rec.Name))
 	if why != "" {
-		return false, why
+		return false, why, false
 	}
 	detail := fmt.Sprintf("stopped the frozen local copy (incarnation %s, owner epoch %d): superseded by proof %s for %s, "+
 		"certified at voter generation %d for owner epoch %d; rootfs kept", rec.Incarnation, rec.OwnerEpoch, pr.ID, dest,
 		cert.ConfigGeneration, cert.Key.OwnerEpoch)
+	left := time.Until(deadline)
+	if left < settleStopMin {
+		return false, fmt.Sprintf("%v of this pass left, too little to stop it; a later pass does", left.Round(time.Millisecond)), true
+	}
+	// lxc-stop waits this long for the container to act on its SIGPWR before
+	// it kills it; a frozen one never acts on it, so no more than the step has.
+	grace := min(10, max(1, int((left-500*time.Millisecond)/time.Second)))
 	w := p.settleRec()
 	pending := w.newPending(PauseKindContainer, rec.Name, detail, pr, cert, rec.Incarnation, rec.OwnerEpoch, "partition-pause record")
 	if err := w.stopRecorded(ctx, pending, func() error {
-		sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		return p.cts.Stop(sctx, rec.Name, 10)
+		name := rec.Name
+		return p.callWithin(rec.Key(), time.Until(deadline), false, func() error {
+			sctx, cancel := context.WithDeadline(ctx, deadline)
+			defer cancel()
+			return p.cts.Stop(sctx, name, grace)
+		}, nil)
 	}); err != nil {
-		return false, "stop failed: " + err.Error()
+		return false, "stop failed: " + err.Error(), false
 	}
 	slog.Warn("partition-settle: stopped a local copy that a certified recovery claim gave to another host",
 		"ct", rec.Name, "host", p.host, "dest", dest, "proof", pr.ID, "claim_epoch", cert.Key.OwnerEpoch, "local_epoch", rec.OwnerEpoch)
 	w.dropMatchingPause(pending)
-	return true, ""
+	return true, "", false
 }
 
 // settleDecideContainer is settleDecide for a container: the record is the
@@ -450,4 +528,45 @@ func auditSystem(ctx context.Context, db *corrosion.Client, host, action, target
 		ID: randid.New(), Username: "system", HostName: host,
 		Action: action, Target: target, Detail: detail, Result: result,
 	})
+}
+
+// SettleDestroy is the reconciler's PauseSettleGuard: it runs destroy for
+// rec's VM under the VM's mark lock, the lock every resume takes (resume)
+// before it clears the mark, and only while no abandoned resume of it is out,
+// the domain is still paused, and it still carries rec's mark. A resume can
+// then begin only after the destroy, and finds no domain to resume. Never
+// waiting on the lock: a mark write or a resume holding it declines this
+// pass, and settle decides again on the next.
+//
+// Lock order as everywhere else: the mark lock, then p.mu briefly
+// (resumeInFlight); the capture registry is not touched here.
+func (p *PartitionPauser) SettleDestroy(rec PauseRecord, destroy func() error) error {
+	if p.vms == nil {
+		return fmt.Errorf("%w: no libvirt backend on the pauser", errPauseChanged)
+	}
+	l := p.markLock(rec.Name)
+	if !l.TryLock() {
+		return fmt.Errorf("%w: a write of its partition-pause mark, or its resume, is in flight", errPauseChanged)
+	}
+	defer l.Unlock()
+	if p.resumeInFlight(rec.Key()) {
+		return fmt.Errorf("%w: an abandoned resume of it has not returned", errPauseChanged)
+	}
+	st, err := p.vms.DomainStateReason(rec.Name)
+	if err != nil {
+		return fmt.Errorf("%w: its state is unreadable: %v", errPauseChanged, err)
+	}
+	if st.Reason != "paused" {
+		return fmt.Errorf("%w: it is %s now", errPauseChanged, st.Reason)
+	}
+	if rec.Token != "" {
+		tok, ok, err := p.vms.PartitionPauseMark(rec.Name)
+		switch {
+		case err != nil:
+			return fmt.Errorf("%w: its partition-pause mark is unreadable: %v", errPauseChanged, err)
+		case !ok || tok != rec.Token:
+			return fmt.Errorf("%w: it no longer carries this pause's mark", errPauseChanged)
+		}
+	}
+	return destroy()
 }

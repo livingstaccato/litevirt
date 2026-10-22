@@ -45,14 +45,14 @@ func TestAutomationCustodyLifetimeMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if storedVersion(t, c) != 82 {
+	if storedVersion(t, c) != 83 {
 		t.Fatal("SETUP composed82 stamp missing")
 	}
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
 	}
 	c = custodyLifetimeFileClient(t, dir)
-	if storedVersion(t, c) != 82 {
+	if storedVersion(t, c) != 83 {
 		t.Fatal("SETUP composed82 did not persist")
 	}
 	// First InitSchema call for this fresh composed82 prerequisite fixture.
@@ -83,7 +83,7 @@ func TestAutomationCustodyLifetimeMigration(t *testing.T) {
 	if err := custodyLifetimeInsertRecipient(t, c, "audit-a", "new-host-zero", 0); err != nil {
 		t.Fatalf("COMPOSED82_UPGRADE_N0_REFUSED: %v", err)
 	}
-	if storedVersion(t, c) != 86 || appliedCount(t, c) != len(ledger)+8 || countAppliedID(t, c, automationCustodyMigrationID) != 1 {
+	if storedVersion(t, c) != 87 || appliedCount(t, c) != len(ledger)+8 || countAppliedID(t, c, automationCustodyMigrationID) != 1 {
 		t.Fatal("composed82 upgrade did not append schema83 recipient unit, two schema84 target units, schema85 token stamp and four schema86 execution units")
 	}
 	if err := c.ExecuteLocal(ctx, func(tx *LocalTx) error { return automationVerifySemanticSchemaTx(ctx, tx) }); err != nil {
@@ -104,8 +104,8 @@ func TestAutomationCustodyLifetimeMigration(t *testing.T) {
 	}
 }
 
-// Fresh composed SQL82, using the frozen old recipient constraint before the
-// owned SQL83 rebuild. No historical database or archived ledger is relabeled.
+// Fresh composed SQL83, using the frozen old recipient constraint before the
+// relocated SQL84 rebuild. The helper keeps its historical name. No historical database or archived ledger is relabeled.
 // This synthetic predecessor is not the archived descriptor82 namespace; it
 // must be upgraded before any new cut is frozen.
 func custodyLifetimeBuildComposed82(t *testing.T, c *Client) {
@@ -129,15 +129,15 @@ func custodyLifetimeBuildComposed82DDL(t *testing.T, c *Client, originalDDL stri
 		t.Fatal(err)
 	}
 	for _, m := range schemaMigrationLedger {
-		if m.Version <= 82 {
-			// Fresh composed prerequisite only: published SG70/project71 and relocated SQL72..82.
+		if m.Version <= 83 {
+			// Fresh composed prerequisite only: published SG70/project71/fence72 and relocated SQL73..83.
 			// This is not the immutable original80 ledger from tree6edc84a7.
 			if err := c.execLocal(ctx, `INSERT INTO applied_migrations(id,applied_at,checksum) VALUES(?,?,?)`, m.ID, "composed82-fixture", sha256hex(m.SQL)); err != nil {
 				t.Fatal(err)
 			}
 		}
 	}
-	if err := c.execLocal(ctx, `INSERT OR REPLACE INTO schema_state(id,version,updated_at) VALUES(1,82,'composed82-fixture')`); err != nil {
+	if err := c.execLocal(ctx, `INSERT OR REPLACE INTO schema_state(id,version,updated_at) VALUES(1,83,'composed82-fixture')`); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -266,7 +266,7 @@ func TestAutomationCustodyLifetimeSchema83(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if storedVersion(t, c) != 86 || countAppliedID(t, c, automationCustodyMigrationID) != 1 || !reflect.DeepEqual(before, custodyLifetimeSnapshot(t, c)) {
+		if storedVersion(t, c) != 87 || countAppliedID(t, c, automationCustodyMigrationID) != 1 || !reflect.DeepEqual(before, custodyLifetimeSnapshot(t, c)) {
 			t.Fatal("fresh86 reopen/init changed schema, rows or ledger")
 		}
 	})
@@ -375,17 +375,17 @@ func custodyLifetimePrimeUnrelatedTargetLedger(t *testing.T, c *Client) {
 		}
 		if m.ID == "a094_tokens_user_created_at" {
 			stampUnits++
-			if m.Version != 85 || m.Kind != kindAddColumn || m.Target != "tokens.user_created_at" || m.SQL != "ALTER TABLE tokens ADD COLUMN user_created_at TEXT NOT NULL DEFAULT ''" {
+			if m.Version != 86 || m.Kind != kindAddColumn || m.Target != "tokens.user_created_at" || m.SQL != "ALTER TABLE tokens ADD COLUMN user_created_at TEXT NOT NULL DEFAULT ''" {
 				t.Fatal("unexpected token stamp prerequisite unit", m)
 			}
 		} else if execution {
 			executionUnits++
-			if m.Version != 86 || m.Kind != kindCreateTable || m.Target != executionTarget || m.SQL != "" {
+			if m.Version != 87 || m.Kind != kindCreateTable || m.Target != executionTarget || m.SQL != "" {
 				t.Fatal("unexpected execution prerequisite unit", m)
 			}
 		} else {
 			target := map[string]string{"t_local_automation_target_operations": "local_automation_target_operations", "t_local_automation_target_reservations": "local_automation_target_reservations"}[m.ID]
-			if m.Version != 84 || m.Kind != kindCreateTable || m.Target != target || m.SQL != "" {
+			if m.Version != 85 || m.Kind != kindCreateTable || m.Target != target || m.SQL != "" {
 				t.Fatal("unexpected target prerequisite unit", m)
 			}
 		}
@@ -419,7 +419,7 @@ func custodyLifetimeSnapshot(t *testing.T, c *Client) map[string][]Row {
 
 func custodyLifetimeAssertRollback(t *testing.T, c *Client, before map[string][]Row) {
 	t.Helper()
-	if storedVersion(t, c) != 82 || countAppliedID(t, c, automationCustodyMigrationID) != 0 || !reflect.DeepEqual(before, custodyLifetimeSnapshot(t, c)) {
+	if storedVersion(t, c) != 83 || countAppliedID(t, c, automationCustodyMigrationID) != 0 || !reflect.DeepEqual(before, custodyLifetimeSnapshot(t, c)) {
 		t.Fatal("failed recipient migration changed old schema/data/ledger")
 	}
 }

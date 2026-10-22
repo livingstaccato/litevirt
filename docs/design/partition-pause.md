@@ -196,7 +196,7 @@ Before it pauses a workload, the pauser writes a record to a host-local file:
 
 ```
 <data_dir>/partition-pause/<kind>-<name>.json
-  {kind, name, owner_epoch, incarnation, domain_uuid, host, paused_at, reason}
+  {kind, name, owner_epoch, incarnation, domain_uuid, token, host, paused_at, reason}
 ```
 
 The file is written through a temp file, `fsync`, `rename` and a directory
@@ -275,6 +275,33 @@ suspend`, or `lxc-freeze` by hand) has no record, so the pauser never resumes
 it. A container someone else froze is told apart with `lxc-info`'s raw state
 (`IsFrozen`), since `lxc.Runtime.State` folds frozen into running.
 
+**Resume only a pause this host made.** A record alone does not prove that
+its VM is paused by this host's pause: a crash between a resume and the
+record's removal leaves the record beside a VM that runs again, and an
+operator's `virsh suspend` or QEMU's pause on a disk I/O error can pause it
+later. So, once it has suspended a VM, the pauser puts a live-only
+metadata mark on the domain (namespace
+`https://litevirt.dev/xmlns/partition-pause/1`) carrying a random token, which
+the record holds as `token`. It resumes a paused VM only when libvirt's
+paused reason is `user` (a suspend: never `io-error`, `migration` or any
+other) and the domain carries the record's token. It takes the mark off
+before the resume, and puts it back if the resume fails, is never issued,
+or lands late and is undone; it also takes it off any recorded VM it sees
+running. In a healed pass the mark's read and its removal are calls of the
+resume step, bounded by `R` like the rest (§4.1): a removal abandoned at the
+deadline holds the VM, and puts the mark back once it returns. A VM paused
+again because the majority went away mid-pass (§4.1) gets a fresh token, and,
+as in a pause pass, its suspend comes after the memory snapshot registry's
+hold. The mark is set outside the suspend's
+timed window (a metadata write can wait behind a libvirt job), so a mark
+that is slow or fails never makes the pause late or failed. A VM that fails
+either check is held: it stays paused, its record stays, and
+`partition_paused` names it under `not_paused_by_this_host` with the reason.
+The record is dropped once the VM is no longer paused (an operator resumed
+or stopped it). A mark that cannot be set does not stop the pause; that VM is
+held after the heal. A record without a token, written by an older build, is
+resumed on the paused reason alone.
+
 **A record is true only while it describes the domain.** It carries the paused
 domain's UUID. When the majority is back, a VM record whose domain is gone, is
 no longer paused, or is another domain of the name is dropped: it would
@@ -284,6 +311,51 @@ and no longer exists here: `lxc-ls` does not list it and its directory is
 gone. A container still present keeps its record and stays frozen.
 A memory snapshot, which resumes the guest when it finishes, is refused for a VM
 a record holds, and `CreateLiveSnapshot` refuses any paused domain.
+
+**The pause wins over a memory snapshot in flight.** A capture registers its
+VM in the host's capture registry (`libvirt.CaptureRegistry`, shared by the
+gRPC server and the pauser) for as long as it runs. At the start of each
+pass, before it reads any VM's state, the pauser preempts every capture in
+flight on a VM its rows say it will pause (this host's, not a migration
+source, recoverable): the capture is told not to start its libvirt job, and
+its job is aborted in the background while the pass reads the other VMs. A
+VM's place in the pass therefore does not decide whether its capture's job
+has ended by the time its hold comes. No capture starts while a pass runs,
+or while this host reads the voter majority as lost with
+`enforcement.partition_pause` on: it is refused before it takes anything, so
+every capture a pass can meet is one its start saw. A VM whose capture the
+pass saw in flight at its start is the pass's to pause even if it reads
+paused and the capture has ended (and resumed it) by the time the pass looks
+again. Before the pauser pauses a VM it takes
+a hold on it there:
+
+1. When a capture of the VM is in flight, the hold aborts the capture's
+   libvirt job (`virDomainAbortJob`) and waits for libvirt's job cleanup to
+   end. The wait is at most one pause call's timeout, cut to what the pass
+   has left before its suspend (so the suspend still ends within E), and
+   nothing in it blocks past it: the aborts run in the background, one
+   outstanding per capture however many passes ask (an abort libvirt does
+   not answer is never stacked), the
+   capture's settle lock is per VM and the hold gives up on it at the
+   deadline, and the registry's own lock is never held across a libvirt
+   call. That cleanup resumes a guest
+   that was running when the snapshot began, so the pauser's suspend lands
+   after it. The abort is repeated until the job has ended: a capture checks
+   for a hold under the registry's lock just before it starts its job, and
+   refuses to start one once held, but a hold taken just after that check
+   finds no job yet. A VM a capture holds paused reads paused, and is still
+   the pauser's to record and suspend.
+2. When the wait runs out (QEMU did not act on the abort, libvirt did not
+   answer it, or the capture was still deciding a resume), the pauser
+   suspends anyway. libvirt's cleanup may then resume the guest when the job
+   ends, and the capture re-suspends it: for that moment the pause does not
+   hold. The pauser therefore counts the pause as failed (§3.4): it raises
+   `partition_pause_failed`, and self-fences when the watchdog is verified.
+3. A capture decides its last step under the registry's lock: with a hold or
+   a pause record it never resumes the guest, and re-suspends one it finds
+   running. Otherwise it resumes only a guest it suspended itself.
+
+The pauser drops the hold with the record.
 
 ### 3.4 Pause failure
 
@@ -302,6 +374,10 @@ instead, §3.3):
   self-fences, exactly as the VIP demoter does when a demotion cannot be
   confirmed. The host reboots, the VMs stop, and the disks are untouched.
 
+A VM whose resume a healed pass abandoned, and which is still out in
+libvirt, is not suspended: its QEMU is killed (§4.1). Only a kill that
+fails, or a container's Unfreeze still out, is a pause failure.
+
 **The majority does not count a host as paused when it holds an open
 `partition_pause_failed` for that host** (§4.3). The majority sees this only
 for a failure it has heard about: one from before the partition (a fleet-wide
@@ -315,9 +391,11 @@ The pauser resumes a paused workload only when **all** of these hold, checked
 in this order:
 
 1. **QuorumYes.** The execution quorum is back, from this host's own probes.
-2. **The local row still names this host** at the recorded `owner_epoch` and
+2. **The pause is this host's** (§3.3): a VM is paused with libvirt's reason
+   `user` and carries the record's token.
+3. **The local row still names this host** at the recorded `owner_epoch` and
    incarnation (`created_at`).
-3. **A majority of the voter set confirms it.** The pauser asks every other
+4. **A majority of the voter set confirms it.** The pauser asks every other
    voter it can reach, with one peer-only, read-only RPC,
    `ConfirmPartitionResume`, answered from that voter's OWN replica and claim
    tables. It needs answers from enough of them that, counting itself, they
@@ -386,7 +464,7 @@ checks, so a paused workload stays paused across a daemon restart.
 While this host holds any self-paused workload, it holds a
 `partition_paused` condition (evaluator `partition_pause`, subject
 `host/<name>`, severity warning). It lists the paused workloads and the reason,
-and it is resolved when the last record goes, by this process or, after a
+and names any it holds because something else paused them (§3.3), and it is resolved when the last record goes, by this process or, after a
 restart, by the first pass that finds no record. A fleet-wide blip therefore
 leaves one resolved condition per host in the history.
 
@@ -420,6 +498,7 @@ partition-pause: workload stays paused kind=vm name=d1a reason="voter node-4 has
 | `F` | 5 | consecutive failures for a fence vote (`FailuresToFence`) |
 | `Δ` | 1 s | pauser tick |
 | `E` | 5 s | bound on executing the pauses (per-call timeout, all workloads) |
+| `R` | 3 s | bound on one step of a healed pass (`health.PartitionResumeStepBound`), the longest the pass goes without a quorum reading. A step is one pending-settle retry, one record's checks and settle, the majority confirmation, or one resume; everything it does ends by its deadline, and a call still running then is abandoned and its workload stays paused for a later pass. The pass reads the quorum before every step after its first and once more after its last resume, stops at once if the majority is gone, and pauses again what it resumed. It takes on steps only while within `E` of its start (the first of each phase always, with the whole of `R`), and the next pass starts where it stopped |
 
 **Minority detection, `D_M`.** Let `b` be the moment the link from the
 minority host M to a majority voter V breaks. M's first probe of V that starts
@@ -460,10 +539,71 @@ same arithmetic over the region's voters.
 **So M pauses by:**
 
 ```
-max_V b_V + D_M + Δ + T_pause + Δ + E
-  ≤ t_d − 8 + 12 + 1 + T_pause + 1 + 5
-  = t_d + T_pause + 11 s
+max_V b_V + D_M + Δ + R + T_pause + Δ + E
+  ≤ t_d − 8 + 12 + 1 + 3 + T_pause + 1 + 5
+  = t_d + T_pause + 14 s
 ```
+
+The `R` term is a healed M that is inside a resume pass when the link breaks:
+it takes its first not-Yes reading at most one step later than a quiet M
+would. That reading counts toward the loss like any other, and the
+workloads that pass resumed are paused again at once; the ones earlier passes
+resumed are paused on the ordinary path, by the bound above.
+
+**The re-pause adds nothing to the bound.** It runs on the pauser's own loop,
+which takes no reading and pauses nothing else meanwhile, so it must not hold
+the loop long: its pauses run at once, each under the per-call timeout, and
+the whole re-pause returns within `E` however many there are and however they
+hang. It starts at M's first not-Yes reading `x`. The ordinary pause of what
+earlier passes resumed cannot come before `x + T_pause`, when that loss has
+covered `T_pause`, and the loop is free again by `x + E ≤ x + T_pause − Δ`.
+Run one after another, eight suspends hung on a dead storage fabric held the
+loop 16 s, and those workloads paused that much past the bound.
+`TestPartitionPauseWaitCoversTheMinority` pins `E + Δ ≤ T_pause`.
+
+**A resume abandoned at its step's deadline** keeps its record, and the call
+is still out. It may land at any moment, and no suspend issued meanwhile is
+sure to come after it. The pauser handles it three ways:
+
+- **It lands while the majority stays.** If every reading since its step
+  began was Yes, a fresh reading is Yes, and a majority of voters confirms
+  the workload again, the resume stands. That is as safe as a resume that
+  landed on time: a loss is read no later than for that one, and pauses the
+  workload on the ordinary path. Otherwise it is paused again at once, and a later pass
+  resumes it on a fresh confirmation.
+- **A pause pass runs while it is still out.** The pass kills the domain's
+  QEMU directly, by libvirt's pid file and the process's own `-uuid`, without
+  a libvirt call, which may hang too. Every vCPU thread leaves `KVM_RUN` on
+  the fatal signal and never enters it again, so the call cannot land after
+  the pass. The pass is the moment `W` counts on, so no copy of that VM runs
+  here past `t_d + W`. The kill counts as a stop only once the QEMU has
+  **exited**, within the call's timeout, not once the signal is queued. A
+  killed QEMU skips the flush a suspend does, and its disks' writeback pages
+  are written as its files close on exit. When the storage is cut along with
+  the voters (NFS, iSCSI), that close waits in an uninterruptible sleep with
+  the pages still in this host's page cache, and they would land on the
+  replacement's disk when the storage returns. So a QEMU that has not exited
+  in time is a failed kill (next item), as a suspend whose flush hangs is a
+  failed pause. When it has exited, its writes are on the disk or failed,
+  and the majority recovers the VM from its disks. What a crash-consistent
+  disk does not hold, the guest's RAM and unflushed guest caches, is lost, as
+  in a crash. One residual remains: a userspace network block client (librbd)
+  may have requests already queued in the dead process's socket buffers,
+  which can still be delivered after the exit. The self-fence has the same
+  residual until the reboot. Only blocklisting the client at the storage
+  closes it.
+- **The kill cannot be done**, or the QEMU has not exited in time, or the
+  workload is a container. A container's
+  Unfreeze has no such stop. The pass reports the workload in
+  `partition_pause_failed`, and self-fences when a verified watchdog is
+  armed. It cannot tell this call from one about to land, and with the
+  majority lost for `T_pause` the host is being fenced either way. The cost is
+  the host's non-recoverable workloads. If the call then lands after `W`, the
+  workload runs beside its replacement until the undo takes effect, one call
+  later, or until the next pause pass (`Δ + E`) if the undo fails. The
+  watchdog does not shorten that: the reboot comes one hardware timeout
+  (60 s by default) after the fence. This is the F2 residual (§7) applied to
+  one workload.
 
 **Choices.**
 
@@ -471,10 +611,10 @@ max_V b_V + D_M + Δ + T_pause + Δ + E
   own verdict. A loss shorter than that would never have been fenced, so
   pausing for it buys nothing. A blip that is shorter than `D_M + T_pause`
   (12–22 s, depending on where the probe cycles fall) pauses nothing.
-- **Margin** = `max(0, D_M − (F−1)·P) + 2Δ + E + slack`, which is
-  `4 + 2 + 5 + 2 = 13 s`. The 2 s of slack covers scheduling and the monotonic
+- **Margin** = `max(0, D_M − (F−1)·P) + 2Δ + R + E + slack`, which is
+  `4 + 2 + 3 + 5 + 2 = 16 s`. The 2 s of slack covers scheduling and the monotonic
   clocks' rate error (well under 0.1% over 30 s).
-- **`W` = `T_pause` + margin = 23 s**, measured from `t_d`.
+- **`W` = `T_pause` + margin = 26 s**, measured from `t_d`.
 
 **Accumulated loss changes nothing here** (§3.1). From the moment M's links to
 the quorum observers are continuously broken, M's readings are continuously
@@ -514,12 +654,12 @@ means: from the latest instant the majority can prove M was still in contact.
 
 **What it costs.** On the lab, quorum came 23 s after the partition
 (`t_d` ≈ +23 s) and d1a started 10 s after that, at about +33 s. With Layer 2
-latched it starts no earlier than `t_d + W` = `t_d + 23 s`, so at about +46 s
+latched it starts no earlier than `t_d + W` = `t_d + 26 s`, so at about +49 s
 after the partition instead of +33 s.
 
 All of these values are constants in `internal/health/partition_pause.go`.
 `TestPartitionPauseWaitCoversTheMinority` pins the inequality
-`W(n) ≥ max(0, D_M(n) − (F−1)·P) + 2Δ + E + T_pause + slack` against the live
+`W(n) ≥ max(0, D_M(n) − (F−1)·P) + 2Δ + R + E + T_pause + slack` against the live
 constants, for 5, 17, 18 and 40 hosts, so retuning a probe constant cannot
 silently break it. None of them is a config key. The majority computes `W` from
 the same constants the minority runs on, and a per-node knob would break that
@@ -821,15 +961,15 @@ fixed size (`health.PartitionPauseWaitFor(n)`):
 ```
 C(n)   = max(P, ⌈n/16⌉·τ)
 D_M(n) = (k+1)·C(n)
-W(n)   = T_pause + max(0, D_M(n) − (F−1)·P) + 2Δ + E + slack
+W(n)   = T_pause + max(0, D_M(n) − (F−1)·P) + 2Δ + R + E + slack
 ```
 
 | Hosts | Probe targets `n` | `C(n)` | `D_M(n)` | `W(n)` |
 |---|---|---|---|---|
-| 5 | 4 | 3 s | 12 s | 23 s |
-| 17 | 16 | 3 s | 12 s | 23 s |
-| 18 | 17 | 6 s | 24 s | 35 s |
-| 40 | 39 | 9 s | 36 s | 47 s |
+| 5 | 4 | 3 s | 12 s | 26 s |
+| 17 | 16 | 3 s | 12 s | 26 s |
+| 18 | 17 | 6 s | 24 s | 38 s |
+| 40 | 39 | 9 s | 36 s | 50 s |
 
 **Which `n`.** The minority's probe count is what matters, and the coordinator
 cannot read it. It takes the largest count either side could be running with,
@@ -958,6 +1098,22 @@ with the heal) for which all of these hold:
    runtime inventory, `CheckPeerVMRuntime`). An unreachable destination, or no
    runtime check wired, is no proof.
 
+Clauses 1a and 4 protect a copy that RUNS. A copy this host's partition pause
+holds paused (its record still describes the domain: paused, with the
+recorded UUID) runs nothing, so stopping it cannot leave zero running copies,
+and the pauser never resumes a workload a decided claim moved (§3.5). For it,
+a live proof is enough in place of 1a and 4: prepared and not claimed by
+another host, or in progress or completed on its own destination. A failed
+proof, or one another host executes, is not. Waiting for the replacement to
+run first can wait forever: a paused QEMU keeps its image locks, so on shared
+storage the destination's start fails with `Failed to get "write" lock`
+until the paused copy is gone (lab 2, B4). Clauses 2 and 3 still hold in
+full, so a move with no certificate (F9) still leaves the copy paused.
+The destroy of such a copy runs under the VM's mark lock, the lock a resume
+takes before it clears the mark, and only while no abandoned resume is out and
+the domain is still paused with the record's mark; otherwise that pass
+declines (`pause_changed`) and the next decides again.
+
 Proofs `ReapSpentProofs` has tombstoned are still read: a host that comes back
 more than a day later still needs the certificate.
 
@@ -1057,7 +1213,7 @@ container (`split_brain`), so a certified relocation can only lead to a stop.
 
 | # | Case | What happens | Residual |
 |---|---|---|---|
-| F1 | The minority's daemon is dead (crash, OOM, hung) | Nothing pauses. The majority still waits `W` and then recovers. | A dual run, as today. A hardware watchdog closes it, because daemon death trips it. Layer 3 settles it when the daemon returns. |
+| F1 | The minority's daemon is dead (crash, OOM, hung) | Nothing pauses. The majority still waits `W` and then recovers. | A dual run, as today. A hardware watchdog closes it, because daemon death trips it: a dead daemon pets nothing, a successor that cannot finish booting pets it for at most `watchdog.boot_keeper_streak_window_sec` (300 s), so the host reboots within that plus the watchdog timeout (about 6 min), and, on a configured and verified watchdog, a live daemon whose DB round trips or pauser make no progress for `watchdog.liveness_stale_sec` (120 s) stops petting and self-fences. Layer 3 settles it when the daemon returns. |
 | F2 | A suspend fails inside a full partition | The minority raises `partition_pause_failed`, retries every tick, and self-fences if a verified watchdog is armed. | Without a watchdog, the majority cannot learn of the failure until the heal, so it counts a pause that did not happen. Layer 3 settles it on return. |
 | F2a | The record cannot be written, or its write hangs (a full or dying `data_dir`) | `pause` (the default) pauses with the record in the reserve or in memory. `reserve` and `self_fence` fail the pause and self-fence when a verified watchdog is armed; without one they pause with the record in memory (`fallback=no_verified_watchdog`). A write that has not returned within `min(2 s, pass budget)` counts as failed (§3.3). | A daemon that dies holding a record in memory only comes back to a paused domain with no record, which it never resumes itself: held, with no `lv` path to resume it yet. |
 | F3 | The daemon restarts during the partition | Its loss clock starts at its own start, so it pauses at most `T_pause` + warmup after the restart. | If the restart lands after the majority's decision, the pause can miss the deadline by up to the restart's length. Layer 3 settles it. |
@@ -1161,7 +1317,8 @@ nodes at once, then heals. Grep for `partition-pause: paused` and
    remains open.
 7. **Safety review, applied.** Settle requires a completed proof executed by
    its destination and the destination's runtime reporting the workload
-   running (H2); the resume check reads the voters' own rows over
+   running (H2), for a copy that runs; a copy this host holds paused needs
+   only a live proof (§6, lab 2 B4); the resume check reads the voters' own rows over
    `ConfirmPartitionResume` (M1); records carry the domain UUID and the local
    epoch is the highest evidence (M2); a relied-on fence keeps method
    `best-effort-ssh` (M3); the target must have advertised the token (M4);

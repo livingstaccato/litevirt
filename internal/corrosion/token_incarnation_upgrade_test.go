@@ -5,22 +5,22 @@ import (
 	"testing"
 )
 
-// Review I1, the upgrade: a schema-84 database (no tokens.user_created_at, no
+// Review I1, the upgrade: a schema-85 database (no tokens.user_created_at, no
 // stamp trigger) reopened by this build gains the column and the trigger that
 // invalidates an automation token's issuance on any write of it.
-func TestTokenIncarnation_The84To85UpgradeInstallsTheStampTrigger(t *testing.T) {
+func TestTokenIncarnation_The85To86UpgradeInstallsTheStampTrigger(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	c := openFileClient(t, dir)
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	// Put the database back to schema 84.
+	// Put the database back to schema 85.
 	for _, q := range []string{
 		`DROP TRIGGER automation_issuance_tokens_stamp_update`,
 		`ALTER TABLE tokens DROP COLUMN user_created_at`,
 		`DELETE FROM applied_migrations WHERE id = 'a094_tokens_user_created_at'`,
-		`UPDATE schema_state SET version = 84 WHERE id = 1`,
+		`UPDATE schema_state SET version = 85 WHERE id = 1`,
 	} {
 		if _, err := c.db.Exec(q); err != nil {
 			t.Fatalf("%s: %v", q, err)
@@ -31,13 +31,13 @@ func TestTokenIncarnation_The84To85UpgradeInstallsTheStampTrigger(t *testing.T) 
 	c = openFileClient(t, dir)
 	t.Cleanup(func() { c.db.Close() })
 	if err := InitSchema(ctx, c); err != nil {
-		t.Fatalf("InitSchema on the schema-84 database: %v", err)
+		t.Fatalf("InitSchema on the schema-85 database: %v", err)
 	}
 	if got := oneString(t, c, `SELECT CAST(COUNT(*) AS TEXT) AS n FROM sqlite_master WHERE type = 'trigger' AND name = 'automation_issuance_tokens_stamp_update'`, "n"); got != "1" {
 		t.Fatalf("the stamp trigger is missing after the upgrade")
 	}
-	if got := oneString(t, c, `SELECT CAST(version AS TEXT) AS v FROM schema_state WHERE id = 1`, "v"); got != "85" {
-		t.Errorf("schema_state.version = %s after the upgrade, want 85", got)
+	if got := oneString(t, c, `SELECT CAST(version AS TEXT) AS v FROM schema_state WHERE id = 1`, "v"); got != "87" {
+		t.Errorf("schema_state.version = %s after the upgrade, want 87", got)
 	}
 	// It fires.
 	for _, q := range []string{

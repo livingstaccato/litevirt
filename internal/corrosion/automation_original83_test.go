@@ -151,7 +151,7 @@ func TestAutomationOriginal83ArchiveAndCurrent85(t *testing.T) {
 		if err := InitSchema(ctx, c); err != nil {
 			t.Fatal("genuine old83 upgrade to current86 refused", err)
 		}
-		if CurrentSchemaVersion != 86 || storedVersion(t, c) != 86 {
+		if CurrentSchemaVersion != 87 || storedVersion(t, c) != 87 {
 			t.Fatal("current migration did not reach86")
 		}
 		if exists, err := columnExists(ctx, c.db, "projects", "incarnation"); err != nil || !exists {
@@ -170,7 +170,7 @@ func TestAutomationOriginal83ArchiveAndCurrent85(t *testing.T) {
 		for _, r := range beforeLedger {
 			oldIDs[r.String("id")] = true
 		}
-		newIDs := map[string]bool{"t_local_automation_executors": false, "t_local_automation_execution_progress": false, "t_local_automation_execution_artifacts": false, "t_local_automation_execution_terminals": false, "a094_tokens_user_created_at": false, "t_local_automation_target_operations": false, "t_local_automation_target_reservations": false}
+		newIDs := map[string]bool{"t_host_fence_ssh": false, "t_local_automation_executors": false, "t_local_automation_execution_progress": false, "t_local_automation_execution_artifacts": false, "t_local_automation_execution_terminals": false, "a094_tokens_user_created_at": false, "t_local_automation_target_operations": false, "t_local_automation_target_reservations": false}
 		var preserved []Row
 		for _, r := range upgraded {
 			id := r.String("id")
@@ -195,7 +195,7 @@ func TestAutomationOriginal83ArchiveAndCurrent85(t *testing.T) {
 				t.Fatal("new ledger ID missing from actual current migration registry", id)
 			}
 		}
-		if len(upgraded) != 206 || !reflect.DeepEqual(beforeLedger, preserved) {
+		if len(upgraded) != 207 || !reflect.DeepEqual(beforeLedger, preserved) {
 			t.Fatal("upgrade rewrote original199 ledger rows or added wrong count")
 		}
 		for id, found := range newIDs {
@@ -207,7 +207,7 @@ func TestAutomationOriginal83ArchiveAndCurrent85(t *testing.T) {
 			t.Fatal(err)
 		}
 		c = custodyLifetimeFileClient(t, dir, "a")
-		if storedVersion(t, c) != 86 {
+		if storedVersion(t, c) != 87 {
 			t.Fatal("cold reopened current86 stamp changed")
 		}
 		original83AssertArchive(t, c, e)
@@ -228,7 +228,7 @@ func TestAutomationOriginal83ArchiveAndCurrent85(t *testing.T) {
 		_, e := original83Fixture(t)
 		voters := custodyLifetimeHistoricalVoters(t, 0)
 		a := voters[0]
-		if CurrentSchemaVersion != 86 || automationCutSourceSchema != 86 || storedVersion(t, a.c) != 86 {
+		if CurrentSchemaVersion != 87 || automationCutSourceSchema != 87 || storedVersion(t, a.c) != 87 {
 			t.Fatal("new source is not actual current86")
 		}
 		genesis := sharedAutomationRecord(t, 1, "", "initialize", "current85-initialize", voters...)
@@ -243,7 +243,7 @@ func TestAutomationOriginal83ArchiveAndCurrent85(t *testing.T) {
 			t.Fatal("new current86 cut refused", err)
 		}
 		m, _ := cutFixtureRead(t, a.c, id)
-		if m.SourceSchema != 86 || m.Codec != 1 || m.Head.Sequence != 1 || m.Head.Digest != genesis.Value.MustDigest() || len(m.Inventory) != 9 {
+		if m.SourceSchema != 87 || m.Codec != 1 || m.Head.Sequence != 1 || m.Head.Digest != genesis.Value.MustDigest() || len(m.Inventory) != 9 {
 			t.Fatal("new current cut did not declare truthful86")
 		}
 		if id == e.CutID {

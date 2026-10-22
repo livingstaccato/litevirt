@@ -513,7 +513,9 @@ func seedTS(mode string) string {
 // mode, once, from the cluster's founding host. It writes only when no mode is
 // recorded, the cluster_policies gate is open, and this replica can be trusted
 // to know: it has caught up with a peer since it started, or no host other
-// than hostName is known (a cluster of one). A replica that has not caught up
+// than hostName is known (a cluster of one), or none but hosts still joining
+// while it has no gossip member (ClusterOfOneBut: a founder's own half-added
+// second host, which has written nothing). A replica that has not caught up
 // may simply not have seen the mode yet — a joiner would flip a cluster to
 // enforce, a rejoiner back to observe. It returns the mode written, or "".
 func SeedFirewallEnforcement(ctx context.Context, c *Client, mode, hostName string) (string, error) {
@@ -525,11 +527,11 @@ func SeedFirewallEnforcement(ctx context.Context, c *Client, mode, hostName stri
 		return "", err
 	}
 	if caught, _ := c.ReplicaCaughtUp(); !caught {
-		rows, err := c.Query(ctx, `SELECT COUNT(*) AS n FROM hosts WHERE name != ?`, hostName)
+		alone, err := soleOrOnlyJoiners(ctx, c, hostName)
 		if err != nil {
 			return "", err
 		}
-		if len(rows) != 1 || rows[0].Int("n") != 0 {
+		if !alone {
 			return "", nil
 		}
 	}

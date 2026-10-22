@@ -302,10 +302,12 @@ func (r *Replicator) cleanupDepartedWatermark(name string) {
 		return
 	}
 
-	r.client.mu.Lock()
-	r.client.db.ExecContext(context.Background(),
-		`DELETE FROM replication_watermarks WHERE peer_name = ?`, name)
-	r.client.mu.Unlock()
+	func() {
+		r.client.mu.Lock()
+		defer r.client.mu.Unlock()
+		r.client.db.ExecContext(context.Background(),
+			`DELETE FROM replication_watermarks WHERE peer_name = ?`, name)
+	}()
 	slog.Info("replicator: cleaned watermark for departed peer", "peer", name)
 }
 

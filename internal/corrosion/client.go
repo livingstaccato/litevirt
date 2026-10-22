@@ -1609,27 +1609,32 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 		return false, errQuarantined(reason)
 	}
 	c.mu.Lock()
+	held := &heldLock{unlock: c.mu.Unlock}
+	defer held.release()
 	// Again under mu: an apply holding mu may have tripped the quarantine
 	// (a release-feature use this binary cannot honour) while this writer
 	// waited, and the feature's data may be the next thing it applies.
 	if reason := c.quarantineReason(); reason != "" {
-		c.mu.Unlock()
+		held.release()
 		return false, errQuarantined(reason)
 	}
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
-		c.mu.Unlock()
+		held.release()
 		return false, fmt.Errorf("begin tx: %w", err)
 	}
+	// A no-op once the tx commits or rolls back; on a panic it runs before
+	// held.release, so the lock is never freed over an open transaction.
+	defer tx.Rollback() //nolint:errcheck
 	ok, gerr := guard(tx)
 	if gerr != nil {
 		tx.Rollback()
-		c.mu.Unlock()
+		held.release()
 		return false, fmt.Errorf("guard: %w", gerr)
 	}
 	if !ok {
 		tx.Rollback()
-		c.mu.Unlock()
+		held.release()
 		return false, nil
 	}
 	if life != nil {
@@ -1639,7 +1644,7 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 		}
 		if err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return false, err
 		}
 	}
@@ -1657,7 +1662,7 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 		credHosts, err := readEntryHostRows(ctx, tx, stmts)
 		if err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return false, err
 		}
 		allCredHosts = allCredHosts.addMissing(credHosts)
@@ -1665,7 +1670,7 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 		stampUsers, err := c.userStampPlan(stmts)
 		if err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return false, err
 		}
 		for _, s := range stmts {
@@ -1676,7 +1681,7 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 			}
 			if err != nil {
 				tx.Rollback()
-				c.mu.Unlock()
+				held.release()
 				return false, err
 			} else if credPlan.skip {
 				continue
@@ -1684,14 +1689,14 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 			if stampUsers {
 				if err := stampUserIncarnation(ctx, tx, &s); err != nil {
 					tx.Rollback()
-					c.mu.Unlock()
+					held.release()
 					return false, fmt.Errorf("stamp user incarnation: %w", err)
 				}
 			}
 			if c.UserIncarnationOn() {
 				if err := tagUserLifecycle(ctx, tx, &s); err != nil {
 					tx.Rollback()
-					c.mu.Unlock()
+					held.release()
 					return false, fmt.Errorf("tag user lifecycle: %w", err)
 				}
 			}
@@ -1699,12 +1704,12 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 				matches, err := c.mutationGuardMatches(ctx, tx, s.Guard)
 				if err != nil {
 					tx.Rollback()
-					c.mu.Unlock()
+					held.release()
 					return false, fmt.Errorf("statement guard: %w", err)
 				}
 				if !matches {
 					tx.Rollback()
-					c.mu.Unlock()
+					held.release()
 					return false, nil
 				}
 			}
@@ -1712,14 +1717,14 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 			// runs (host_incarnation.go).
 			if err := stampHostIncarnation(ctx, tx, &s); err != nil {
 				tx.Rollback()
-				c.mu.Unlock()
+				held.release()
 				return false, fmt.Errorf("stamp host incarnation: %w", err)
 			}
 			// This host's own row is not written while its own-row hold holds
 			// (own_row_hold.go).
 			if err := c.ownRowStatementRefused(ctx, tx, s); err != nil {
 				tx.Rollback()
-				c.mu.Unlock()
+				held.release()
 				return false, err
 			}
 			if name := usersStatementName(s); name != "" {
@@ -1727,7 +1732,7 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 					before, err := userIncarnationHeld(ctx, tx, name)
 					if err != nil {
 						tx.Rollback()
-						c.mu.Unlock()
+						held.release()
 						return false, err
 					}
 					guardedUserNames[name] = before
@@ -1738,7 +1743,7 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 					before, err := projectIncarnationHeld(ctx, tx, name)
 					if err != nil {
 						tx.Rollback()
-						c.mu.Unlock()
+						held.release()
 						return false, err
 					}
 					guardedProjectNames[name] = before
@@ -1749,17 +1754,17 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 			res, err := tx.ExecContext(ctx, appliedForm(s).SQL, s.Params...)
 			if err != nil {
 				tx.Rollback()
-				c.mu.Unlock()
+				held.release()
 				return false, fmt.Errorf("exec guarded batch: %w", err)
 			}
 			if isGuardedTransitionSQL(s.SQL) && !rowsChanged(res) {
 				tx.Rollback()
-				c.mu.Unlock()
+				held.release()
 				return false, invalidf("guarded workload transition matched authority but changed no row")
 			}
 			if err := credPlan.apply(ctx, tx); err != nil {
 				tx.Rollback()
-				c.mu.Unlock()
+				held.release()
 				return false, err
 			}
 			c.recordUserWrite(ctx, tx, s, s.Guard, guardedOnCommit)
@@ -1782,14 +1787,14 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 	for name, before := range guardedUserNames {
 		if err := c.settleUserName(ctx, tx, name, before, guardedOnCommit); err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return false, err
 		}
 	}
 	for name, before := range guardedProjectNames {
 		if err := settleProjectName(ctx, tx, name, before); err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return false, err
 		}
 	}
@@ -1802,28 +1807,28 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 	// closed) also refreshes the credential row it holds (credentials_absorb.go).
 	if err := absorbUnlatchedSecretWrite(ctx, tx, mutated, c.MayWriteCredentialTables(), true, allCredHosts); err != nil {
 		tx.Rollback()
-		c.mu.Unlock()
+		held.release()
 		return false, err
 	}
 	// Likewise a state or isolation write this node makes to hosts alone
 	// updates the membership row it holds (host_membership.go).
 	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership(), c.hostsCopyFrozen()); err != nil {
 		tx.Rollback()
-		c.mu.Unlock()
+		held.release()
 		return false, err
 	}
 	// And a runtime report this node makes to hosts alone updates the
 	// host_runtime row it holds (host_runtime.go).
 	if err := absorbUnlatchedRuntimeWrite(ctx, tx, mutated); err != nil {
 		tx.Rollback()
-		c.mu.Unlock()
+		held.release()
 		return false, err
 	}
 	// A host this node re-admits takes no fence credential from the machine
 	// removed under its name; every receiver retires it too (host_readmit.go).
 	if err := retireReadmittedCredentials(ctx, tx, mutated); err != nil {
 		tx.Rollback()
-		c.mu.Unlock()
+		held.release()
 		return false, err
 	}
 	for _, relay := range relays {
@@ -1833,12 +1838,12 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 		stmtsJSON, err := json.Marshal(relay)
 		if err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return false, fmt.Errorf("marshal stmts: %w", err)
 		}
 		if err := refuseUnapplicableEntry(relay, stmtsJSON); err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return false, err
 		}
 		now := time.Now().UTC().Format(time.RFC3339)
@@ -1847,22 +1852,22 @@ func (c *Client) executeEntriesGuardedWithLifecycle(ctx context.Context, guard f
 			c.clock.Now().String(), c.hostName, string(stmtsJSON), now,
 		); err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return false, fmt.Errorf("write mutation_log: %w", err)
 		}
 	}
 	if life != nil {
 		if err := life.after(ctx, tx); err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return false, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		c.mu.Unlock()
+		held.release()
 		return false, fmt.Errorf("commit: %w", err)
 	}
-	c.mu.Unlock()
+	held.release()
 	for _, park := range parks {
 		park()
 	}
@@ -1933,6 +1938,24 @@ func isGuardedTransitionSQL(sql string) bool {
 		fp == mustStatementFingerprint(containerDeleteSQL)
 }
 
+// heldLock releases a lock exactly once. A function that unlocks on several
+// return paths, and must unlock before work that follows (effects after
+// commit), calls release on each of them and defers it as well: should
+// anything under the lock panic, and gRPC's recovery answer the call, the
+// deferred release frees the lock instead of leaving every later Query
+// blocked behind it.
+type heldLock struct {
+	unlock func()
+	done   bool
+}
+
+func (h *heldLock) release() {
+	if !h.done {
+		h.done = true
+		h.unlock()
+	}
+}
+
 // executeBatchInternal commits stmts in one transaction and logs what peers
 // must replay. strict makes a statement that changed no row a refusal: it is
 // neither relayed nor parked (see ExecuteRowsStrict).
@@ -1947,21 +1970,24 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 		return 0, errQuarantined(reason)
 	}
 	c.mu.Lock()
+	held := &heldLock{unlock: c.mu.Unlock}
+	defer held.release()
 	// Again under mu, for the ExecuteEntriesGuarded reason.
 	if reason := c.quarantineReason(); reason != "" {
-		c.mu.Unlock()
+		held.release()
 		return 0, errQuarantined(reason)
 	}
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
-		c.mu.Unlock()
+		held.release()
 		return 0, fmt.Errorf("begin tx: %w", err)
 	}
+	defer tx.Rollback() //nolint:errcheck // a no-op after Commit; see ExecuteEntriesGuarded
 
 	if life != nil {
 		if err := life.before(ctx, tx); err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return 0, err
 		}
 	}
@@ -1975,7 +2001,7 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 	credHosts, err := readEntryHostRows(ctx, tx, stmts)
 	if err != nil {
 		tx.Rollback()
-		c.mu.Unlock()
+		held.release()
 		return 0, err
 	}
 	// The account a user-keyed statement names is bound to its incarnation
@@ -1983,7 +2009,7 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 	stampUsers, err := c.userStampPlan(stmts)
 	if err != nil {
 		tx.Rollback()
-		c.mu.Unlock()
+		held.release()
 		return 0, err
 	}
 	var userEffects []func() // user_holds.go, run once tx commits
@@ -2001,7 +2027,7 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 		}
 		if err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return 0, err
 		} else if credPlan.skip {
 			continue
@@ -2010,7 +2036,7 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 		// (host_incarnation.go).
 		if err := stampHostIncarnation(ctx, tx, &s); err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return 0, fmt.Errorf("stamp host incarnation: %w", err)
 		}
 		// The account's incarnation, as its users row stands just before this
@@ -2018,20 +2044,20 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 		if stampUsers {
 			if err := stampUserIncarnation(ctx, tx, &s); err != nil {
 				tx.Rollback()
-				c.mu.Unlock()
+				held.release()
 				return 0, fmt.Errorf("stamp user incarnation: %w", err)
 			}
 		}
 		if c.UserIncarnationOn() {
 			if err := tagUserLifecycle(ctx, tx, &s); err != nil {
 				tx.Rollback()
-				c.mu.Unlock()
+				held.release()
 				return 0, fmt.Errorf("tag user lifecycle: %w", err)
 			}
 		}
 		if err := c.checkOwnUserGuard(ctx, tx, s); err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return 0, err
 		}
 		if name := usersStatementName(s); name != "" {
@@ -2039,7 +2065,7 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 				before, err := userIncarnationHeld(ctx, tx, name)
 				if err != nil {
 					tx.Rollback()
-					c.mu.Unlock()
+					held.release()
 					return 0, err
 				}
 				userNames[name] = before
@@ -2050,7 +2076,7 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 				before, err := projectIncarnationHeld(ctx, tx, name)
 				if err != nil {
 					tx.Rollback()
-					c.mu.Unlock()
+					held.release()
 					return 0, err
 				}
 				projectNames[name] = before
@@ -2060,7 +2086,7 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 		// (own_row_hold.go).
 		if err := c.ownRowStatementRefused(ctx, tx, s); err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return 0, err
 		}
 		// A live-row update runs here through the same guarded form every
@@ -2068,12 +2094,12 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 		res, err := tx.ExecContext(ctx, appliedForm(s).SQL, s.Params...)
 		if err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return 0, fmt.Errorf("exec batch: %w", err)
 		}
 		if err := credPlan.apply(ctx, tx); err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return 0, err
 		}
 		c.recordUserWrite(ctx, tx, s, s.Guard, onCommit)
@@ -2103,7 +2129,7 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 	for name, before := range userNames {
 		if err := c.settleUserName(ctx, tx, name, before, onCommit); err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return 0, err
 		}
 	}
@@ -2112,7 +2138,7 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 	for name, before := range projectNames {
 		if err := settleProjectName(ctx, tx, name, before); err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return 0, err
 		}
 	}
@@ -2125,28 +2151,28 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 	// closed) also refreshes the credential row it holds (credentials_absorb.go).
 	if err := absorbUnlatchedSecretWrite(ctx, tx, mutated, c.MayWriteCredentialTables(), true, credHosts); err != nil {
 		tx.Rollback()
-		c.mu.Unlock()
+		held.release()
 		return 0, err
 	}
 	// Likewise a state or isolation write this node makes to hosts alone
 	// updates the membership row it holds (host_membership.go).
 	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership(), c.hostsCopyFrozen()); err != nil {
 		tx.Rollback()
-		c.mu.Unlock()
+		held.release()
 		return 0, err
 	}
 	// And a runtime report this node makes to hosts alone updates the
 	// host_runtime row it holds (host_runtime.go).
 	if err := absorbUnlatchedRuntimeWrite(ctx, tx, mutated); err != nil {
 		tx.Rollback()
-		c.mu.Unlock()
+		held.release()
 		return 0, err
 	}
 	// A host this node re-admits takes no fence credential from the machine
 	// removed under its name; every receiver retires it too (host_readmit.go).
 	if err := retireReadmittedCredentials(ctx, tx, mutated); err != nil {
 		tx.Rollback()
-		c.mu.Unlock()
+		held.release()
 		return 0, err
 	}
 	if c.clock != nil && len(relay) > 0 {
@@ -2154,12 +2180,12 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 		stmtsJSON, err := json.Marshal(relay)
 		if err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return 0, fmt.Errorf("marshal stmts: %w", err)
 		}
 		if err := refuseUnapplicableEntry(relay, stmtsJSON); err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return 0, err
 		}
 		now := time.Now().UTC().Format(time.RFC3339)
@@ -2168,7 +2194,7 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 			hlcTS.String(), c.hostName, string(stmtsJSON), now,
 		); err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return 0, fmt.Errorf("write mutation_log: %w", err)
 		}
 	}
@@ -2176,16 +2202,16 @@ func (c *Client) executeBatchWithLifecycle(ctx context.Context, stmts []Statemen
 	if life != nil {
 		if err := life.after(ctx, tx); err != nil {
 			tx.Rollback()
-			c.mu.Unlock()
+			held.release()
 			return 0, err
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		c.mu.Unlock()
+		held.release()
 		return 0, fmt.Errorf("commit: %w", err)
 	}
-	c.mu.Unlock()
+	held.release()
 	for _, park := range parks {
 		park()
 	}

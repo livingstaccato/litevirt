@@ -1019,6 +1019,19 @@ const (
 	// rewrite, so the latch is confirmed against every host this node
 	// replicates to, a maintenance host on the previous build included.
 	Release202611V1 = "release_2026_11_v1"
+
+	// Release202612V1 is the RELEASE TOKEN of the release train after
+	// 2026-11: the token a feature declared after release_2026_11_v1's set
+	// was frozen gates on (release_features.go). Its claim, its machinery
+	// and its rules are Release202611V1's — mandatory, ReplicationGated,
+	// advertised unconditionally, opened only through WithFeature, a
+	// per-feature used bit — made for this release's features. Nothing may
+	// gate on Latched/Enforced(Release202612V1) directly.
+	//
+	// The build directly below it is a release-token build, which reads a
+	// marker's rollback rule (ruleAwareBelow), so a rollback below it
+	// quarantines only when one of its features was used.
+	Release202612V1 = "release_2026_12_v1"
 )
 
 // ReleaseToken is the release token of THIS build's release train: the token a
@@ -1461,12 +1474,15 @@ var supported = []string{
 	// decodes, keeps and honours every field and shape of its release", a fact
 	// about the binary. What opens a feature is WithFeature, not a flag.
 	Release202611V1,
+	// Release202612V1 is advertised UNCONDITIONALLY, for Release202611V1's
+	// reason. See Release202612V1.
+	Release202612V1,
 }
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{VMSnapshotClaimV1, SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, LeaseTermClaimV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, VRRPUnicastV1, Release202611V1, SpecConflictV1, NetBoxIPRepointV1, UserIncarnationV1, ProjectIncarnationV1}
+var all = []string{VMSnapshotClaimV1, SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, LeaseTermClaimV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, VRRPUnicastV1, Release202611V1, SpecConflictV1, NetBoxIPRepointV1, UserIncarnationV1, ProjectIncarnationV1, Release202612V1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -1589,6 +1605,9 @@ var replicationGated = map[string]bool{
 	// may write what a previous-release peer cannot decode or would drop on a
 	// rewrite. See Release202611V1.
 	Release202611V1: true,
+	// Confirmed against every replication recipient, for Release202611V1's
+	// reason. See Release202612V1.
+	Release202612V1: true,
 }
 
 // ReplicationGated reports whether token's latch must be confirmed by every
@@ -1678,6 +1697,8 @@ var mandatory = map[string]bool{
 	// fields and shapes). Nothing changes until a feature is used, and every
 	// use is recorded first. See Release202611V1.
 	Release202611V1: true,
+	// A fact about the binary, as Release202611V1. See Release202612V1.
+	Release202612V1: true,
 }
 
 // Mandatory reports whether token is enforced with no config kill switch.

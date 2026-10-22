@@ -47,6 +47,11 @@ func (s *Server) ReserveHostCapacity(ctx context.Context, req *pb.ReserveHostCap
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"host capacity reservation addressed to %q, but this daemon is %q — the destination decides for itself", req.Host, s.hostName)
 	}
+	// A move in from a source that cannot record its ownership commit is
+	// refused here, at its first contact with this host.
+	if err := s.incomingMoveSourceRefusal(ctx, req.Method, callerMTLSCommonName(ctx)); err != nil {
+		return nil, err
+	}
 	intent := admissionIntent{newResidency: req.NewResidency, vmOverhead: req.VmOverhead}
 	lease, err := s.admitReserved(ctx, reservedPrincipal(req.Principal), "", req.Method, s.hostName, req.Project, req.ResourceId,
 		subjectForCreate(req.ResourceId, s.hostName, corrosion.QuotaAmount{VCPU: int(req.CpuDelta), MemMiB: int(req.MemMibDelta)}),

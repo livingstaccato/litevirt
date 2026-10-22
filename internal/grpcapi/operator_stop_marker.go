@@ -180,7 +180,8 @@ func operatorStopReplayLogDue(key string) bool {
 }
 
 // ReplayOperatorStopMarkers records every forced stop this host made under
-// write quarantine on its VM's row, once the quarantine has lifted, and
+// write quarantine on its VM's (or container's: replayContainerOperatorStops)
+// row, once the quarantine has lifted, and
 // removes each marker it has recorded (or that no longer applies). Run at the
 // start of every reconciler pass, so it lands before the walk reads the
 // rows. A marker that cannot be read is alerted on, never replayed. It
@@ -192,6 +193,8 @@ func (s *Server) ReplayOperatorStopMarkers(ctx context.Context) bool {
 	if s.dataDir == "" {
 		return false
 	}
+	reason := s.stopQuarantineReason()
+	ctPending, ctCorrupt, ctWait := s.replayContainerOperatorStops(ctx, reason)
 	names, err := health.ListOperatorStopMarkers(s.dataDir)
 	if err != nil {
 		if operatorStopReplayLogDue("\x00list") {
@@ -200,8 +203,7 @@ func (s *Server) ReplayOperatorStopMarkers(ctx context.Context) bool {
 		}
 		return true
 	}
-	reason := s.stopQuarantineReason()
-	pending, pendingEpoch0 := 0, false
+	pending, pendingEpoch0 := ctPending, ctWait
 	corrupt := map[string]string{}
 	for _, name := range names {
 		m, ok, rerr := health.ReadOperatorStopMarker(s.dataDir, name)
@@ -239,7 +241,7 @@ func (s *Server) ReplayOperatorStopMarkers(ctx context.Context) bool {
 		}
 	}
 	if s.operatorStopMarkerObs != nil {
-		s.operatorStopMarkerObs(pending, len(corrupt))
+		s.operatorStopMarkerObs(pending, len(corrupt)+ctCorrupt)
 	}
 	if reason == "" && s.db != nil {
 		if err := health.ReportCorruptOperatorStopMarkers(ctx, s.db, s.dataDir, s.hostName, corrupt); err != nil && operatorStopReplayLogDue("\x00report") {

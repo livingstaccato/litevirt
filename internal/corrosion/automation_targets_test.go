@@ -1083,12 +1083,12 @@ func TestAutomationTargetSchema84(t *testing.T) {
 			if err := InitSchema(ctx, c); err != nil {
 				t.Fatal("SETUP current schema86", err)
 			}
-			if CurrentSchemaVersion != 86 || automationCutSourceSchema != 86 || storedVersion(t, c) != 86 {
+			if CurrentSchemaVersion != 87 || automationCutSourceSchema != 87 || storedVersion(t, c) != 87 {
 				t.Fatal("TARGET84_CURRENT_PROVENANCE")
 			}
 			units := map[string]bool{"local_automation_target_operations": false, "local_automation_target_reservations": false}
 			for _, m := range schemaMigrationLedger {
-				if m.Version == 84 {
+				if m.Version == 85 {
 					_, ok := units[m.Target]
 					if !ok || units[m.Target] || m.Kind != kindCreateTable || m.ID != "t_"+m.Target {
 						t.Fatal("TARGET84_LEDGER", m)
@@ -1101,7 +1101,7 @@ func TestAutomationTargetSchema84(t *testing.T) {
 					t.Fatal("TARGET84_LOCAL", table)
 				}
 			}
-			if !supportedAutomationCutDescriptor(83, 1) || !supportedAutomationCutDescriptor(84, 1) || !supportedAutomationCutDescriptor(85, 1) || !supportedAutomationCutDescriptor(86, 1) || supportedAutomationCutDescriptor(87, 1) {
+			if !supportedAutomationCutDescriptor(83, 1) || !supportedAutomationCutDescriptor(84, 1) || !supportedAutomationCutDescriptor(85, 1) || !supportedAutomationCutDescriptor(86, 1) || !supportedAutomationCutDescriptor(87, 1) || supportedAutomationCutDescriptor(88, 1) {
 				t.Fatal("TARGET84_DESCRIPTOR_BOUNDARY")
 			}
 			before, err := c.Query(ctx, `SELECT id,applied_at,checksum FROM applied_migrations ORDER BY id`)

@@ -459,6 +459,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// so the owner's log shows both and not only "creating VM" (lab 2, O5).
 	var undone []string
 	noteUndo := func(what string) { undone = append(undone, what) }
+	// left is what the cleanup leaves of what this create made: a disk or
+	// seed it could not hold open (so cannot tell from another file at the
+	// path) or could not remove. The failed create's error names each, so
+	// the operator who meets the name taken on a retry knows why and what
+	// to remove.
+	var left []string
+	noteLeft := func(what string) { noteUndo(what); left = append(left, what) }
 	rowCommitted, keepHeld := false, false
 	// leftDefined: the abort stopped this create's domain but could not
 	// undefine it, so a domain of the name still names the disk paths.
@@ -477,6 +484,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			}
 			slog.Warn("vm create: cleanup after the failed create", "name", spec.Name, "host", s.hostName,
 				"result", result, "left_held", keepHeld)
+			retErr = withLeftovers(retErr, "create", left)
 		}
 	}()
 	// The NVRAM is keyed by name: a live firmware move's record of this name
@@ -609,16 +617,45 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	var diskConfigs []lv.DiskConfig
 	var diskRecords []corrosion.DiskRecord
 	var createdDiskPaths []string
-	// createdDiskFile is the file each host-local disk this create made is
-	// (its identity, read right after it was made; madeFileID): a failed
-	// create removes a path only while that file is still there, never
-	// another create's or domain's file that took the path since.
-	createdDiskFile := map[string]madeFileID{}
+	// createdDiskFile is the file each host-local disk this create made is,
+	// held open from right after it was made until the create returns
+	// (pinnedFile): a failed create removes a path only while that file is
+	// still there, never another create's or domain's file that took the
+	// path since. Only a held file's inode cannot be given to that other
+	// file, which would then read as this create's own.
+	createdDiskFile := map[string]*pinnedFile{}
+	// createdDiskPinErr is why a disk this create made could not be held
+	// open. Such a disk is left by a failed create (it cannot be told from
+	// another file at the path), and named in its error. A disk that is
+	// not a file (rbd, a volume) is removed by its driver whatever this says.
+	createdDiskPinErr := map[string]error{}
+	// createdSubvol is the btrfs subvolume a pool disk was made in (its
+	// driver makes one per disk), held from right after: once the disk is
+	// removed, a failed create removes the subvolume too, only while it is
+	// still that directory and empty, so a retry of the name can make it
+	// again and nothing put in it since is ever deleted with it.
+	createdSubvol := map[string]*pinnedFile{}
+	// createdSubvolPinErr is why a disk's subvolume could not be held: it
+	// is left once the disk is removed, and named in the create's error.
+	createdSubvolPinErr := map[string]error{}
+	defer func() {
+		for _, pf := range createdDiskFile {
+			pf.release()
+		}
+		for _, pf := range createdSubvol {
+			pf.release()
+		}
+	}()
 	recordDisk := func(p string) {
 		createdDiskPaths = append(createdDiskPaths, p)
-		if id, ok := madeFileIdentity(p); ok {
-			createdDiskFile[p] = id
+		pf, perr := s.pinMade(p)
+		if perr != nil {
+			createdDiskPinErr[p] = perr
+			return
 		}
+		delete(createdDiskPinErr, p)
+		createdDiskFile[p].release()
+		createdDiskFile[p] = pf
 	}
 	// A disk that is not a file (an rbd image) is removed by the driver that
 	// created it: os.Remove of "rbd:pool/image" removes nothing, which is how a
@@ -637,17 +674,24 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// that other seed, which would then read as this create's own.
 	var createdSeed string
 	var createdSeedFile *pinnedFile
+	var createdSeedPinErr error // why it could not be held: it is left
 	defer func() { createdSeedFile.release() }()
 	recordSeed := func(path string) {
-		if pf, ok := pinFile(path); ok {
-			createdSeedFile.release()
-			createdSeed, createdSeedFile = path, pf
-		}
+		pf, perr := s.pinMade(path)
+		createdSeedFile.release()
+		createdSeed, createdSeedFile, createdSeedPinErr = path, pf, perr
 	}
 	// removeSeed removes the seed this create placed, if it is still the
 	// file at that name.
 	removeSeed := func() {
 		if createdSeed == "" {
+			return
+		}
+		if createdSeedPinErr != nil {
+			slog.Warn("cleanup: cloud-init seed left, it could not be held open when it was placed",
+				"path", createdSeed, "error", createdSeedPinErr)
+			noteLeft(fmt.Sprintf("seed %s (it could not be held open to tell it from another file there: %v)",
+				createdSeed, createdSeedPinErr))
 			return
 		}
 		if !createdSeedFile.stillAt(createdSeed) {
@@ -656,10 +700,34 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		if rmErr := cloudinit.RemoveSeed(createdSeed); rmErr != nil {
 			slog.Warn("cleanup: failed to remove cloud-init seed", "path", createdSeed, "error", rmErr)
-			noteUndo(fmt.Sprintf("seed %s not removed (%v)", createdSeed, rmErr))
+			noteLeft(fmt.Sprintf("seed %s (not removed: %v)", createdSeed, rmErr))
 			return
 		}
 		noteUndo("removed seed " + createdSeed)
+		createdSeedFile.release()
+		createdSeed, createdSeedFile = "", nil
+	}
+	// removeSubvol removes the subvolume the pool disk p (just removed) was
+	// made in, while it is still the directory made then. rmdir, never a
+	// recursive delete: it removes the subvolume only while it is empty
+	// (btrfs deletes an empty subvolume on rmdir), so a file someone put in
+	// it is never lost with it.
+	removeSubvol := func(p string, sv *pinnedFile) {
+		dir := filepath.Dir(p)
+		delete(createdSubvol, p)
+		// Released after the rmdir, not before: until then no directory
+		// put at the name can be the one this create made.
+		defer sv.release()
+		if !sv.stillAt(dir) {
+			noteUndo("subvolume " + dir + " left: it is no longer the one this create made")
+			return
+		}
+		if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
+			slog.Warn("cleanup: failed to remove the disk's btrfs subvolume", "path", dir, "error", err)
+			noteLeft(fmt.Sprintf("subvolume %s (not removed: %v)", dir, err))
+			return
+		}
+		noteUndo("removed subvolume " + dir)
 	}
 	cleanupDisks := func() {
 		removeSeed()
@@ -679,26 +747,41 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				cancel()
 				if rmErr != nil {
 					slog.Warn("cleanup: failed to remove disk", "path", p, "error", rmErr)
-					noteUndo(fmt.Sprintf("disk %s not removed (%v)", p, rmErr))
+					noteLeft(fmt.Sprintf("disk %s (not removed: %v)", p, rmErr))
 					continue
 				}
 				noteUndo("removed disk " + p)
 				continue
 			}
-			made, ok := createdDiskFile[p]
 			if _, serr := os.Lstat(p); serr != nil && os.IsNotExist(serr) {
 				continue
 			}
-			if !ok || !made.stillAt(p) {
+			if perr := createdDiskPinErr[p]; perr != nil {
+				slog.Warn("cleanup: disk left, it could not be held open when it was made", "path", p, "error", perr)
+				noteLeft(fmt.Sprintf("disk %s (it could not be held open to tell it from another file there: %v)", p, perr))
+				continue
+			}
+			if !createdDiskFile[p].stillAt(p) {
 				noteUndo("disk " + p + " left: it is no longer the file this create made")
 				continue
 			}
 			if rmErr := os.Remove(p); rmErr != nil && !os.IsNotExist(rmErr) {
 				slog.Warn("cleanup: failed to remove disk", "path", p, "error", rmErr)
-				noteUndo(fmt.Sprintf("disk %s not removed (%v)", p, rmErr))
+				noteLeft(fmt.Sprintf("disk %s (not removed: %v)", p, rmErr))
 				continue
 			}
+			createdDiskFile[p].release()
+			delete(createdDiskFile, p)
 			noteUndo("removed disk " + p)
+			if sv := createdSubvol[p]; sv != nil {
+				removeSubvol(p, sv)
+			} else if perr := createdSubvolPinErr[p]; perr != nil {
+				noteLeft(fmt.Sprintf("subvolume %s (it could not be held open to tell it from another directory there: %v)",
+					filepath.Dir(p), perr))
+			}
+		}
+		if s.cleanedUpHook != nil {
+			s.cleanedUpHook()
 		}
 	}
 
@@ -850,6 +933,17 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			// removes nothing, or only the /dev symlink.
 			if err == nil && !isFileBasedDriver(volCfg.Driver) {
 				createdBy[diskPath] = drv
+			}
+			if err == nil {
+				if sub, ok := storage.BtrfsDiskSubvolume(volCfg, spec.Name, d.Name, diskPath); ok {
+					if sv, perr := s.pinMadeDir(sub); perr == nil {
+						createdSubvol[diskPath] = sv
+					} else {
+						createdSubvolPinErr[diskPath] = perr
+						slog.Warn("a failed create will leave this disk's btrfs subvolume: it could not be held open",
+							"path", sub, "error", perr)
+					}
+				}
 			}
 			// A clone of an image bigger than the size asked for IS that size:
 			// the row records what exists, so accounting does not under-count.
@@ -2591,7 +2685,10 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	// the start and releases whatever was claimed. GATED on hardwareV2Latched AND the
 	// VM actually having intents, so a non-PCI or pre-latch VM's start path is
 	// byte-for-behavior unchanged (no preflight, no bind attempt).
-	if s.hardwareV2Latched(ctx) {
+	//
+	// Not for a start the reconciler makes without the devices, by the VM's
+	// own opt-in, on a host that has none for it (health.WithPassthroughDropped).
+	if !health.PassthroughDropped(ctx) && s.hardwareV2Latched(ctx) {
 		intents, ierr := corrosion.ListVMPCIIntents(ctx, s.db, vm.Name)
 		if ierr != nil {
 			return releasePreflight, status.Errorf(codes.Internal, "read PCI intents for %q: %v", vm.Name, ierr)
@@ -2674,10 +2771,21 @@ func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord
 	// Adoption gate + PCI start-preflight (shared with the automated restart paths).
 	// No-op pre-latch, so every start behaves byte-for-behavior as before until
 	// hardware_v2 latches.
-	releasePreflight, err := s.PrepareHardwareForStart(ctx, vm)
+	//
+	// Before the latch, a VM whose definition lacks the PCI devices its spec
+	// declares (moved here stopped by a failover) gets them here first, or
+	// is refused (pci_failover.go).
+	ptDone, ptDropped, err := s.passthroughForStart(ctx, vm)
 	if err != nil {
 		return nil, err
 	}
+	releasePreflight, err := s.PrepareHardwareForStart(ctx, vm)
+	if err != nil {
+		ptDone(false)
+		return nil, err
+	}
+	prepared := releasePreflight
+	releasePreflight = func() { prepared(); ptDone(false) }
 
 	hspec := vmHooks(vm)
 	pbVM := &pb.VM{Name: vm.Name, HostName: vm.HostName, State: pb.VMState_VM_STARTING}
@@ -2704,7 +2812,16 @@ func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord
 	}
 	finish := func(ctx context.Context, startErr error) (*pb.VM, error) {
 		releaseGuard()
-		return s.finishStartLocked(ctx, vm, startErr, releasePreflight, pbVM, hspec)
+		out, err := s.finishStartLocked(ctx, vm, startErr, releasePreflight, pbVM, hspec)
+		// Started: libvirt said so, or the domain was found running. A
+		// read-back of the VM that fails after that does not undo it.
+		if startErr == nil || err == nil {
+			ptDone(true)
+			if ptDropped != "" {
+				s.notePassthroughDropped(ctx, vm.Name, ptDropped)
+			}
+		}
+		return out, err
 	}
 	if wait <= 0 {
 		return finish(ctx, s.StartDomainOnNetwork(ctx, vm.Name))
@@ -3200,6 +3317,14 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 	if err := s.inFlightMoveRefusal(ctx, "restart", vm); err != nil {
 		return nil, err
 	}
+	// A restart of a VM that is not running is a start, which a host in
+	// write quarantine cannot record (quarantinedStartRefusal). A running
+	// VM's row says running before and after, and it is restarted.
+	if vm.State != "running" {
+		if err := s.quarantinedStartRefusal(vm.Name); err != nil {
+			return nil, err
+		}
+	}
 
 	// Split-brain gate (Phase 1): a restart (destroy+start) is a runtime action on a
 	// possibly-stale-owned VM; require local quorum on the SOURCE (we forwarded here)
@@ -3677,6 +3802,19 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest, owner *d
 	// deletes locally if the domain is here, else reports NotFound.
 	localOnly := deleteLocalOnly(ctx)
 
+	// A host in write quarantine cannot record the delete, so it does not
+	// start one: as the owner it would free the disks under a row that stays
+	// live, and as the entry of a forward it records the firewall tags and
+	// schedules part (quarantine_lifecycle.go). A peer-search probe is
+	// refused below, once it is known the domain is here.
+	if !localOnly {
+		if err := s.quarantinedLifecycleRefusal("delete", fmt.Sprintf("VM %q", req.Name),
+			"its domain and disks would be removed while the cluster still records the VM",
+			"lv rm "+req.Name, vm.HostName != s.hostName); err != nil {
+			return nil, err
+		}
+	}
+
 	// Mutation barrier: an operator delete must not race an in-flight operation
 	// (ordinary --force does NOT bypass it — abort the stuck operation first). A
 	// peer-search probe is part of an already-in-flight delete, not a new mutation,
@@ -3769,6 +3907,17 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest, owner *d
 				return nil, status.Errorf(codes.Aborted,
 					"%q, recorded migrating, no longer runs here; retry, which asks the move's target", req.Name)
 			}
+		}
+	}
+
+	// A probe that found the domain here, on a host in write quarantine,
+	// is refused before it acts: the probing host passes the refusal on and
+	// keeps the record, and the domain and disks stay here.
+	if localOnly {
+		if err := s.quarantinedLifecycleRefusal("delete", fmt.Sprintf("VM %q", req.Name),
+			"its domain and disks would be removed while the cluster still records the VM",
+			"lv rm "+req.Name, false); err != nil {
+			return nil, err
 		}
 	}
 
@@ -3984,6 +4133,9 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest, owner *d
 			return nil, status.Errorf(codes.Internal, "clean up stale VM record: %v", err)
 		}
 		s.reportDeletedVM(ctx, deleted)
+		if !req.KeepDisks {
+			s.removeVMFirmwareBundles(ctx, req.Name)
+		}
 		s.retireNICGuards(ctx, req.Name)
 		s.clearDeviceLease(req.Name)
 		// The domain is gone everywhere: a volume move it left unresolved
@@ -4361,6 +4513,11 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest, owner *d
 	// The row as this delete tombstoned it, for a re-create that follows
 	// (vm_recreate_replaces.go).
 	s.reportDeletedVM(ctx, deleted)
+	// Its snapshots' firmware bundles (nvram, vTPM state) go with it, only now
+	// that the delete has committed; --keep-disks keeps firmware state.
+	if !req.KeepDisks {
+		s.removeVMFirmwareBundles(ctx, req.Name)
+	}
 	// The VM is gone: a volume move it left unresolved describes nothing.
 	// Only now: a delete that fails before its tombstone keeps the row, and
 	// with it the record and condition that guard its next start.
@@ -5198,6 +5355,13 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		return nil, err
 	}
 
+	// The rebuild deletes the disks before it tombstones the row, which a
+	// host in write quarantine cannot record (quarantine_lifecycle.go).
+	if err := s.quarantinedLifecycleRefusal("rebuild", fmt.Sprintf("VM %q", req.Name),
+		"its disks would be deleted while the cluster still records the VM on them",
+		"lv rebuild "+req.Name, false); err != nil {
+		return nil, err
+	}
 	// Required, not only the guard (spec §6.9): rebuild deletes the disks
 	// after an undefine whose refusal it ignores.
 	if err := s.firmwareMoveRefusal("rebuild", vm); err != nil {
@@ -6055,6 +6219,13 @@ func (s *Server) ResizeDisk(ctx context.Context, req *pb.ResizeDiskRequest) (*pb
 	if err := s.firmwareMoveRefusal("disk resize", vm); err != nil {
 		return nil, err
 	}
+	// The disk grows before its row records the new size, and the row is
+	// what refuses a later shrink (quarantine_lifecycle.go).
+	if err := s.quarantinedLifecycleRefusal("resize", fmt.Sprintf("disk %q of VM %q", req.DiskName, req.VmName),
+		"the disk would grow while the cluster records its old size, which a later resize could then shrink it below",
+		"lv resize-disk "+req.VmName+" --disk "+req.DiskName+" --size "+req.Size, false); err != nil {
+		return nil, err
+	}
 
 	// Find the disk record.
 	disks, err := corrosion.GetVMDisks(ctx, s.db, req.VmName)
@@ -6118,8 +6289,13 @@ func (s *Server) ResizeDisk(ctx context.Context, req *pb.ResizeDiskRequest) (*pb
 	}
 
 	// Update DB.
+	// The recorded size is what refuses a later shrink: a grow it does not
+	// record is an error, never an OK.
 	if err := corrosion.UpdateDiskSize(ctx, s.db, req.VmName, req.DiskName, newSizeBytes); err != nil {
-		slog.Warn("failed to update disk size in DB", "vm", req.VmName, "disk", req.DiskName, "error", err)
+		slog.Error("disk resized but its new size was not recorded", "vm", req.VmName, "disk", req.DiskName, "bytes", newSizeBytes, "error", err)
+		return nil, status.Errorf(codes.Internal,
+			"disk %q of VM %q was resized to %d bytes, but its new size was not recorded (%v); retry `lv resize-disk %s --disk %s --size %s` to record it",
+			req.DiskName, req.VmName, newSizeBytes, err, req.VmName, req.DiskName, req.Size)
 	}
 
 	slog.Info("disk resized", "vm", req.VmName, "disk", req.DiskName, "new_size", req.Size, "bytes", newSizeBytes)

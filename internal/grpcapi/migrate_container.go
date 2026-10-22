@@ -57,6 +57,12 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 			"container %q lives on host %q; run migrate against that daemon (set LV_HOST)",
 			req.Name, source)
 	}
+	// Under write quarantine the move's stop intent and its re-key cannot be
+	// recorded: refused before the target is prepared or the container
+	// stopped.
+	if err := s.moveOutQuarantineRefusal(fmt.Sprintf("container %q", req.Name), req.TargetHost); err != nil {
+		return err
+	}
 	op := s.startContainerOp("migrate", req.Name, "target", req.TargetHost, "repo", req.RepoPath)
 	defer func() { op.done(retErr) }()
 	// The container leaves this host: the next admission here reads the
@@ -119,6 +125,22 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 
 	unlock := s.lockVMAs("ct/"+req.Name, "container migration")
 	defer unlock()
+	// A forced stop made under write quarantine and not yet recorded holds
+	// the container, and the row may still read running: the migrate would
+	// then start it on the target and the operator's stop would be lost.
+	// Refused while the quarantine holds; out of it the stop is recorded
+	// first and the row read again, so the move carries it stopped
+	// (container_operator_stop_marker.go).
+	if replayed, gerr := s.containerOperatorStopStartRefusal(ctx, rec); gerr != nil {
+		s.audit(ctx, "ct.migrate", req.Name, "project="+project+" held by an operator-stop marker", "denied")
+		return gerr
+	} else if replayed {
+		fresh, ferr := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name)
+		if ferr != nil || fresh == nil {
+			return status.Errorf(codes.Unavailable, "migrate: read the container row again after recording its stop: %v; retry", ferr)
+		}
+		rec = fresh
+	}
 
 	// Resolve+authorize the repo on the source; forward the ORIGINAL req.RepoPath
 	// to the target so a registered name resolves in the target's own config.

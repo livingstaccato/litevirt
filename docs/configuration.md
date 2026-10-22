@@ -124,6 +124,28 @@ dns_domain: "litevirt.local"
 # (split-brain risk). Override with LITEVIRT_UNSAFE_SKIP_WATCHDOG_CHECK=1.
 watchdog_dev: ""
 
+# Bounds on petting, during startup, a watchdog timer that a previous daemon
+# left running (a crash, or a stop while it owned workloads). Each startup
+# pets for at most boot_keeper_max_sec; startups that never reach the
+# heartbeat stop being petted after boot_keeper_max_boots, or once the first
+# of them is boot_keeper_streak_window_sec old. A host whose daemon cannot
+# come back then reboots at the watchdog timeout. 0 in any turns startup
+# petting off (the timer is then first petted when the heartbeat starts).
+#
+# liveness_stale_sec: with watchdog_dev set and the device verified as a
+# counting hardware watchdog, the daemon stops petting it, and self-fences,
+# once neither a state-store round trip nor the partition pauser has made any
+# progress for this long, so a wedged daemon cannot keep its workloads behind
+# a petted watchdog. Progress is timed on the monotonic clock, so a wall-clock
+# step is not a wedge. 0 turns this off; otherwise it must be at least 120
+# (twice the hardware watchdog timeout). It does nothing in auto mode
+# (watchdog_dev empty) or on an unverified device.
+watchdog:
+  boot_keeper_streak_window_sec: 300
+  boot_keeper_max_boots: 5
+  boot_keeper_max_sec: 120
+  liveness_stale_sec: 120
+
 # Load-balancer VIP split-brain safety (see migration-failover.md).
 # quorum_loss_demote_after_sec: sustained local quorum loss before an isolated
 #   LB host stands its own VIPs down (must be > 0). Default 12.
@@ -137,6 +159,12 @@ watchdog_dev: ""
 quorum_loss_demote_after_sec: 12
 keepalived_stop_timeout_sec: 3
 no_quorum_vip_policy: safe
+
+# How often this host checks the managed fence SSH path to every peer: the
+# pin, the key, the source address and the forced command, without arming a
+# fence (`lv doctor fence`, litevirt_fence_ssh_probe_ok). Default 900 (15
+# minutes); 0 disables the probe. See migration-failover.md "Managed fence SSH".
+fence_ssh_probe_interval_sec: 900
 
 # Peers to join on startup. At least one existing host.
 join_peers:
@@ -436,7 +464,7 @@ enforcement:
                               # confirms nothing moved it. Advertises partition_pause_v1
                               # only while on; once that latches, a coordinator whose
                               # best-effort fence cannot reach a host waits out that host's
-                              # pause (23 s after its decision on up to 17 hosts, longer on
+                              # pause (26 s after its decision on up to 17 hosts, longer on
                               # larger clusters) before recovering, and records the fence as
                               # self_paused. Runs whether or not a hardware watchdog is armed
                               # (the watchdog fires only when the daemon dies); a verified
@@ -508,6 +536,16 @@ enforcement:
                               # value but false refuses to start without a usable gossip.key.
                               # `lv host init` writes true for a new cluster. No capability
                               # token. See auth.md "Gossip encryption".
+  fence_ssh: auto             # how this host's ssh and best-effort fences reach their
+                              # target (migration-failover.md "Managed fence SSH").
+                              # auto (the default, also when unset): the managed fence key
+                              # toward a host whose sshd accepts it, else the legacy command
+                              # with the host's published sshd keys pinned. managed: the
+                              # managed key only; a fence toward a host that does not accept
+                              # it fails. legacy: never the managed key (the kill switch),
+                              # still pinned. No mode fences a host that has published a
+                              # fence ssh row without its pinned host key. `lv host init`
+                              # writes managed for a new cluster. No capability token.
 
 # External NetBox IPAM integration. Disabled by default; when disabled no
 # NetBox client is constructed and no behaviour changes (no HTTP, no goroutine).
@@ -1138,6 +1176,54 @@ condition is checked again when a move starts. A live move of a vTPM or Secure
 Boot VM does not use `network`: its data goes to the target's cluster address
 (its memory in libvirt's tunnel), with a `vm.migrate.network_fallback` event
 on the VM when `network` is set.
+
+## Memory snapshots
+
+```yaml
+memory_snapshot:
+  pause_budget: 1s      # default 1s [measure]
+  live_deadline: 2m     # default 2m [measure]
+```
+
+A memory snapshot (`lv snapshot create --memory`) is captured inside the VM's
+running QEMU process with libvirt's external memory snapshot. QEMU is not
+restarted: the guest keeps its process, its disk locks and its devices, and is
+not paused for a read of its RAM back. Earlier releases saved the guest and
+restored it, pausing it for a full write and a full read of its RAM.
+
+A VM with Secure Boot or a vTPM (and any VM whose definition carries UEFI
+NVRAM or a TPM) is captured with its vCPUs stopped: litevirt pauses it,
+libvirt writes its RAM and switches its disks to their overlays, the firmware
+state is captured at that instant, and the guest resumes. The pause is one
+write of its RAM.
+
+Any other VM is captured live when it can be. litevirt first measures the
+guest's dirty rate, then predicts the precopy QEMU would run: RAM is written
+while the guest runs, then what it dirtied meanwhile, until the remainder fits
+QEMU's downtime limit. If the predicted final pause is longer than
+`pause_budget`, the VM is captured stopped instead, because a precopy that
+cannot converge only adds work before the same pause. A live capture that
+runs longer than `live_deadline` (the guest got busier than measured) is
+finished with the guest suspended, and it resumes when the capture ends.
+A guest whose predicted final set fits `pause_budget` but never shrinks below
+QEMU's downtime limit is captured live and runs the whole `live_deadline`
+before that suspend. When the dirty rate cannot be measured, the daemon logs a
+warning and captures live with the deadline capped at twice the predicted
+write of the guest's RAM, and at least a second.
+
+A partition pause wins over a capture in flight: the capture is aborted, the
+guest is paused, and litevirt never resumes it. If libvirt's job outlives the
+pauser's wait, libvirt can resume the guest when the job ends; the capture
+re-suspends it and the pause counts as failed (see
+[partition pause](design/partition-pause.md#33-the-durable-record)). A pause
+made outside litevirt during a capture (`virsh suspend`) is not protected: the
+capture, or libvirt, resumes the guest.
+
+Both values are Go durations and must be positive, and `live_deadline` is at
+most an hour. The daemon refuses to start with one that is not. They are read
+on the host that captures the snapshot, at daemon start, so set them the same
+on every host. The defaults are design
+targets until they are measured on hardware [measure].
 
 ## Capacity and overcommit
 

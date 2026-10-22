@@ -71,6 +71,9 @@ func newRestartFleet(t *testing.T, seed int64, tune ...func(*failover.Coordinato
 		splitMembership(t, n)
 	}
 	settleByAntiEntropy(t, c, true)
+	// What these scenarios pin is when d is fenced: give it a workload that
+	// needs the fence (a host with nothing to recover is not fenced).
+	needsFenceOn(t, f.a, f.d.Name)
 	for _, n := range f.observers {
 		ch := health.NewChecker(n.Name, n.PKIDir, n.DB)
 		// The daemon's readiness prober, reduced to the one fact this

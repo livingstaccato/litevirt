@@ -22,6 +22,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
+	"github.com/litevirt/litevirt/internal/fencessh"
 	"github.com/litevirt/litevirt/internal/firewall"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hostnet"
@@ -69,6 +70,10 @@ type Server struct {
 	// operatorStopMarkerObs is the litevirt_operator_stop_markers gauge
 	// (operator_stop_marker.go); nil records nothing.
 	operatorStopMarkerObs func(pending, corrupt int)
+	// fenceSSH is this host's managed fence SSH agent: how FenceHost's ssh
+	// fence reaches its target, and the probe `lv doctor fence` reports. Nil
+	// leaves every SSH fence on the legacy path (tests that wire none).
+	fenceSSH *fencessh.Agent
 	// fenceExec, when set, replaces fence.Execute for FenceHost (tests only;
 	// SetFenceExecutor).
 	fenceExec fenceExecutorFunc
@@ -84,6 +89,15 @@ type Server struct {
 	// hostUpdates is host_updates: the read-only pending-OS-update check
 	// (host_updates.go).
 	hostUpdates HostUpdatesConfig
+
+	// memorySnapshot is this node's memory snapshot tuning
+	// (memory_snapshot.*, SetMemorySnapshotTuning); zero values are the
+	// libvirt package defaults.
+	memorySnapshot MemorySnapshotTuning
+	// captureReg coordinates memory snapshot captures with the partition
+	// pauser (CaptureRegistry).
+	captureReg     *lv.CaptureRegistry
+	captureRegOnce sync.Once
 
 	// replRuns is each replication schedule's reporting state
 	// (replication_outcome.go).
@@ -409,6 +423,13 @@ type Server struct {
 	coldDiskSyncHook  func(final bool)
 	// coldDiskPlacedHook runs after a receive places its disk (tests).
 	coldDiskPlacedHook func()
+	// pinFault fails pinning a file a create or clone made (pinMade), as an
+	// open refused by the fd limit or the file's mode would (tests).
+	pinFault func(path string) error
+	// cleanedUpHook runs once a failed create's or clone's cleanup, or a
+	// cold-copy receive's take-back, has removed what it made, before the
+	// call returns (tests).
+	cleanedUpHook func()
 	// drainMoves cancels each VM's drain move in flight (drainOneVM), for
 	// `lv operation abort <vm> --force` (AbortVMOperation). Guarded by
 	// drainMovesMu.
@@ -1342,6 +1363,10 @@ type Server struct {
 	// releaseRollout: the HA monitor's cached rollout answers
 	// (releaseRolloutLagging). Guarded by releasePeerMu.
 	releaseRollout map[string]*rolloutAnswer
+	// selfUpgradeSkipMu guards selfUpgradeSkipped: the pre-release peer versions
+	// the self-upgrade watcher declined to follow, keyed by version (self_upgrade.go).
+	selfUpgradeSkipMu  sync.Mutex
+	selfUpgradeSkipped map[string]string
 	// schemaRefusedMu guards schemaRefused: each sender whose push this node
 	// refused because its schema is ahead (schema_refusal_health.go).
 	schemaRefusedMu sync.Mutex
@@ -1401,6 +1426,8 @@ type Server struct {
 	watchdogFenced atomic.Pointer[func() bool]
 	// walQuarantined reports a rollback below an already-latched capability token.
 	walQuarantined atomic.Pointer[func() bool]
+	// sourceMoveGuardOffForTest: see SetSourceMoveGuardOffForTest.
+	sourceMoveGuardOffForTest atomic.Bool
 
 	// hwV2Ready is the CONTRACT h advertise-readiness flag: set at the END of a
 	// successful BackfillHardwareTables, once the audit pass has classified every

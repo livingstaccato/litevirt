@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/litevirt/litevirt/internal/safename"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -184,7 +185,25 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		if mkErr := diskmode.MkdirAll(filepath.Dir(vmstatePath)); mkErr != nil {
 			return nil, status.Errorf(codes.Internal, "prepare vmstate dir: %v", mkErr)
 		}
-		sizeBytes, vmstateBytes, err = s.virt.CreateLiveSnapshot(req.VmName, req.Name, vmstatePath, captureFW)
+		// A VM with firmware state is captured with its vCPUs stopped, the
+		// firmware tar taken at that instant; any other is captured live
+		// when its dirty rate lets it converge (internal/libvirt
+		// CaptureMemorySnapshot).
+		// The partition pause wins over the capture: the pauser takes its
+		// hold through the registry, and a guest with a pause record is
+		// never resumed by the capture (partition-pause.md §3.3).
+		vmName := req.VmName
+		opts := lv.CaptureOptions{Firmware: hasFW,
+			PauseBudget: s.memorySnapshot.PauseBudget, Deadline: s.memorySnapshot.LiveDeadline,
+			Registry: s.CaptureRegistry(),
+			Held: func() bool {
+				_, held, perr := health.ReadPauseRecord(s.dataDir, health.PauseKindVM, vmName)
+				return perr != nil || held
+			}}
+		if hasFW {
+			opts.CaptureSuspended = captureFW
+		}
+		sizeBytes, vmstateBytes, err = s.virt.CreateLiveSnapshot(req.VmName, req.Name, vmstatePath, opts)
 		// A passthrough device is refused before the freeze: nothing was cut
 		// over, so there is no overlay or row to account for.
 		var pe *lv.PassthroughSnapshotError
@@ -192,9 +211,22 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"%v: a memory snapshot is not possible; take a disk-only snapshot instead (omit --memory; a Secure Boot or vTPM VM must be stopped for one), or detach the devices first", pe)
 		}
+		// A capture that failed before libvirt switched any disk took
+		// nothing: no overlay, no libvirt snapshot, no image. It is a
+		// refusal, recorded as an event, with no snapshot row (an "error"
+		// row would claim a partial snapshot and block a retry by name).
+		var nt *lv.CaptureNotTakenError
+		if errors.As(err, &nt) {
+			slog.Warn("memory snapshot not taken: nothing was switched over", "vm", req.VmName, "snapshot", req.Name, "error", err)
+			s.recordVMEventSeverity(ctx, req.VmName, "snapshot.created", "refused", "warn",
+				req.Name+" (memory): not taken, no disk was switched: "+err.Error())
+			return nil, status.Errorf(codes.Aborted,
+				"memory snapshot %q not taken (no disk was switched; nothing to clean up): %v", req.Name, err)
+		}
 		snapType = "memory"
-		// CreateLiveSnapshot cuts the disk overlay over before capturing/saving, so
-		// on failure the overlay may already exist — treat as created for cleanup.
+		// A failure after libvirt took the snapshot (the firmware capture,
+		// the resume) leaves the disks on their overlays — treat as created
+		// for cleanup.
 		snapCreated = true
 	} else {
 		if sizeBytes, err = s.virt.CreateSnapshot(req.VmName, req.Name); err == nil {
@@ -205,9 +237,9 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		}
 	}
 	if err != nil {
-		// The disk overlay may already have cut over (a live snapshot always cuts
-		// the overlay before the RAM save; a disk snapshot cuts on success) while
-		// capture/RAM-save failed. A bare metadata delete would strand the VM on an
+		// The disk overlay may already have cut over (a memory snapshot's
+		// firmware capture runs after it; a disk snapshot cuts on success)
+		// while the capture failed. A bare metadata delete would strand the VM on an
 		// untracked overlay, so reconcile the active disk path and record the
 		// snapshot ERRORED — visible + deletable, and DeleteSnapshot flattens an
 		// error record even when it's memory-typed. Drop any partial firmware
@@ -663,6 +695,14 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 		return out, err
 	}
 
+	// libvirt merges the snapshot before its row is tombstoned and the disk
+	// paths reconciled, which a host in write quarantine cannot record
+	// (quarantine_lifecycle.go).
+	if err := s.quarantinedLifecycleRefusal("delete", fmt.Sprintf("snapshot %q of VM %q", req.SnapshotName, req.VmName),
+		"it would be merged into the VM's disks while the cluster still lists it and records the disk paths it had",
+		"lv snapshot rm "+req.VmName+" "+req.SnapshotName, false); err != nil {
+		return nil, err
+	}
 	// Fetch the record first so we know whether to clean up a vmstate file.
 	snap, _ := corrosion.GetSnapshot(ctx, s.db, req.VmName, req.SnapshotName)
 
@@ -857,4 +897,25 @@ func removeFirmwareBundle(dataDir, vmName, snapName string) error {
 	}
 	_ = os.Remove(filepath.Dir(bundle)) // only when empty
 	return nil
+}
+
+// removeVMFirmwareBundles removes every snapshot firmware bundle of a VM whose
+// delete has committed: the snapfw/<vm> directory with its nvram and swtpm
+// (vTPM) captures, which `lv rm` left on the host (lab 2, B2). The caller holds
+// the VM's lock, which snapshot create, restore and delete take too, so no
+// capture or restore of it runs. It does nothing while the VM's row is live
+// again or unreadable, so a bundle is never taken from a VM that exists; and
+// it is never called for --keep-disks, which keeps the VM's firmware state.
+func (s *Server) removeVMFirmwareBundles(ctx context.Context, vmName string) {
+	if err := safename.ValidateVMName(vmName); err != nil {
+		return
+	}
+	if cur, err := corrosion.GetVM(ctx, s.db, vmName); err != nil || cur != nil {
+		slog.Warn("delete: the VM's snapshot firmware bundles are kept: its row is not known to be gone", "vm", vmName, "error", err)
+		return
+	}
+	dir := filepath.Dir(lv.SnapshotFirmwareBundlePath(s.dataDir, vmName, "x"))
+	if err := os.RemoveAll(dir); err != nil {
+		slog.Warn("delete: remove snapshot firmware bundles", "vm", vmName, "dir", dir, "error", err)
+	}
 }

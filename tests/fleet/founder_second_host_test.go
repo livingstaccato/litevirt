@@ -31,13 +31,13 @@ import (
 )
 
 // newFounder is a one-node cluster founded the real way: its replica is not
-// caught up, and its daemon's write-currency check and anti-entropy are wired.
+// caught up, its daemon's write-currency check is on, and its anti-entropy
+// loop runs (RealCatchUp).
 func newFounder(t *testing.T, seed int64) (*Cluster, *Node) {
 	t.Helper()
 	c := New(t, Options{Nodes: 1, IndependentReplicas: true, RealCatchUp: true, FaultSeed: seed})
 	f := c.Nodes[0]
 	f.Server.SetHostWriteCurrencyCheck(true)
-	f.Server.SetAntiEntropy(corrosion.NewAntiEntropy(f.DB, f.PKIDir, 0))
 	if ok, _ := f.DB.ReplicaCaughtUp(); ok {
 		t.Fatal("fixture: the founder's replica starts caught up; nothing a real founder does marks it so")
 	}
@@ -165,6 +165,20 @@ func TestFleet_FounderAddsItsSecondHost(t *testing.T) {
 			h, err := corrosion.GetHost(ctx, n.DB, m.Name)
 			return err == nil && h != nil && h.State == "active" && strings.EqualFold(h.CertSerial, serial)
 		})
+	}
+	// Each replica catches up by its own anti-entropy loop, which the
+	// harness runs as the daemon does (Options.RealCatchUp), and with it the
+	// founder's lease mint, which held while node-1 was joining, may ask.
+	for _, n := range []*Node{founder, m} {
+		eventually(t, convergeTimeout, n.Name+"'s replica to catch up with its peer", func() bool {
+			ok, _ := n.DB.ReplicaCaughtUp()
+			return ok
+		})
+	}
+	if ok, why := founder.Server.LeaseMintClearance(ctx, corrosion.LeaseMintRequest{
+		Key: "failover", Term: 1 << 40, Holder: founder.Name, Takeover: true}); !ok &&
+		strings.Contains(why, "not caught up") {
+		t.Errorf("the founder's lease mint still waits for a catch-up once %s has booted: %s", m.Name, why)
 	}
 }
 

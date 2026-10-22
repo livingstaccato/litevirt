@@ -83,6 +83,8 @@ func TestFenceQuorum_CountsVotersOnly(t *testing.T) {
 	t.Run("honest majority fences", func(t *testing.T) {
 		db := newTestDB(t)
 		voterFixture(t, db, target, "active")
+		// A workload that needs the fence: what this test pins is the fence.
+		needsFence(t, db, target)
 		for _, o := range []string{"h1", "h2", "h3"} {
 			writeHealthRow(t, db, o, target, "suspect", offlineThreshold)
 		}

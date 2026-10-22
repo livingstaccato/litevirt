@@ -930,7 +930,7 @@ When a host goes offline, the failover coordinator:
 
 1. **Detects failure** — quorum of observers must agree the host is unreachable (floor(n/2) + 1). Only fresh observations count: a `host_health` row older than 30s, or dated more than 30s ahead of the coordinator's own clock (a skewed observer), is not evidence. Both halves of that count come from one **voter set**. Until the cluster has a voter generation it is derived: every host not removed from the cluster whose state is not `offline`, `maintenance` or `fenced` (witnesses, `draining` and `upgrading` hosts vote). Once automatic genesis has run it is the adopted generation's members, whatever their state — a fenced member keeps counting until `lv cluster voter rm` removes it (see [Operating model](operating-model.md) → "The voter set is explicit once genesis has run"). n is the size of that set, and an observation counts only if its observer is in it and is not the host being judged — a fenced host that is still running, a removed host whose daemon was never stopped, or a name no host carries cannot supply a vote. Bringing a host back to `active` counts the same way. It is the same set `DecisionGate` counts its locally-probed quorum over, and if the coordinator cannot read it, it does not fence
 2. **Acquires leader lease** — suppresses concurrent coordinators (45s TTL lease; a fence needs 30s of it still to run before it may begin). Best-effort, not exclusive: a CRDT lease can be held on both sides of a partition, so the decide site also requires a locally-probed quorum (`DecisionGate`) and the minority side fails closed there. See [Operating model](operating-model.md) → "Leader-gated recovery". A node taking over the lease first confirms with a quorum of peers that none of them has already recorded the term it is about to claim, so a node that has just restarted or reconnected waits until replication catches it up (one health-probe cycle after a start, then until any newer term row arrives) instead of claiming from its stale view. See [Operating model](operating-model.md) → "A node that was away does not claim a term from a stale ledger".
-3. **Fences the failed host** — prevents split-brain by ensuring the failed host cannot access shared resources
+3. **Fences the failed host** — prevents split-brain by ensuring the failed host cannot access shared resources. A host with nothing on it to recover (every workload `on_host_failure: none`, stopped on a host-local disk, or otherwise left in place, and nothing mid-transfer) is not fenced: it is recorded `offline`, its workloads keep running, and the `ha.fence_held` health condition says so. Every cycle checks again, and the host is fenced as soon as something recoverable is recorded on it (see [Diagnostics](diagnostics.md))
 4. **Claims the recovery** — with `enforcement.recovery_claim` on every host (the default; see *Recovery claims* below), a majority of the voter set certifies one destination per workload before any proof is minted, so two coordinators that both believe they lead cannot both recover it
 5. **Reschedules VMs** — based on each VM's `on-host-failure` policy. A VM
    stopped on purpose is never started; see *Stopped workloads* below
@@ -941,8 +941,8 @@ When a host goes offline, the failover coordinator:
 |--------|-------------|
 | `ipmi` | Power cycle via IPMI/BMC (requires `ipmi_address`, `ipmi_user`, `ipmi_pass` on host). Verified post-fence by polling `chassis power status`. |
 | `redfish` | Power-off through the BMC's Redfish service over HTTPS: a `ComputerSystem.Reset` with `ForceOff`, then `PowerState` polled until it reads `Off`. Same weight as `ipmi`: the fence succeeds, and is verified, only once `Off` is observed. Requires `redfish_endpoint`, `redfish_user` and `redfish_pass` on the host. See [Redfish](#redfish) below. |
-| `ssh` | Forced, immediate power-off over SSH: `systemctl poweroff --force --force`, falling back to `echo o > /proc/sysrq-trigger`. Not a graceful shutdown — no units are stopped, so `libvirt-guests` does not get to shut guests down cleanly first; the host stops now, as if its power were pulled. The session dies with the host, and that is reported as success only when the remote shell had already confirmed it was issuing the power-off. Reports failure if the host is unreachable or both power-off commands fail. |
-| `watchdog` | Local watchdog self-fence (the host writes its own watchdog timer dead). Requires `watchdog_dev` in config. When `watchdog_dev` is set the daemon validates the device at startup and refuses to start if it's absent, so a broken watchdog is caught before it's needed rather than at fence time (override: `LITEVIRT_UNSAFE_SKIP_WATCHDOG_CHECK=1`). On a graceful daemon shutdown the watchdog is disarmed only when this host owns no running VMs or containers; while it owns any, the device stays armed — a restarting daemon resumes petting well inside the timeout, and a daemon stopped for good with workloads left behind lets the watchdog reboot the host into a safely fenced state. Drain (or `lv host shutdown-workloads`) before planned maintenance. |
+| `ssh` | Forced, immediate power-off over SSH: `systemctl poweroff --force --force`, falling back to `echo o > /proc/sysrq-trigger`. Not a graceful shutdown — no units are stopped, so `libvirt-guests` does not get to shut guests down cleanly first; the host stops now, as if its power were pulled. The session dies with the host, and that is reported as success only when the remote shell had already confirmed it was issuing the power-off. Reports failure if the host is unreachable or both power-off commands fail. How the session reaches the host — the managed fence key, root's own ssh setup, and whether the host's sshd key is pinned — is [Managed fence SSH](#managed-fence-ssh). |
+| `watchdog` | Local watchdog self-fence (the host writes its own watchdog timer dead). Requires `watchdog_dev` in config. When `watchdog_dev` is set the daemon validates the device at startup and refuses to start if it's absent, so a broken watchdog is caught before it's needed rather than at fence time (override: `LITEVIRT_UNSAFE_SKIP_WATCHDOG_CHECK=1`). On a graceful daemon shutdown the watchdog is disarmed only when this host owns no running VMs or containers; while it owns any, the device stays armed — a restarting daemon resumes petting well inside the timeout, and a daemon stopped for good with workloads left behind lets the watchdog reboot the host into a safely fenced state. A timer left running this way, or by a crash, is petted by the next daemon before it opens its state and through the rest of its startup, so a slow or failing startup that systemd keeps restarting does not reboot the host; one the previous daemon disarmed is not opened until the usual point of startup. That petting is bounded: each startup pets for at most `watchdog.boot_keeper_max_sec` (default 120 s), and startups that never reach the heartbeat stop being petted after `watchdog.boot_keeper_max_boots` (default 5) or once the first of them is `watchdog.boot_keeper_streak_window_sec` (default 300 s) old, so a host whose daemon cannot come back reboots within about 6 minutes. With `watchdog_dev` set and the device verified as a counting hardware watchdog, a running daemon stops petting, and self-fences, when neither a state-store round trip nor the partition pauser has made progress for `watchdog.liveness_stale_sec` (default 120 s; 0 turns it off): a wedged daemon must not keep its workloads behind a petted watchdog. Progress is timed on the monotonic clock, so a wall-clock step is not a wedge, and a long pass that keeps moving (settling many containers after a heal) is not one either. In auto mode (`watchdog_dev` empty), or on a device that is not verified, the daemon never stops petting for this. A self-fence writes `/run/litevirt/self-fenced`; while it exists no later daemon pets the watchdog, and each one starts fenced (it refuses ownership work), so restarting the daemon cannot cancel the reboot. Only the reboot clears it (there is no operator command to do so). On a host whose watchdog did not reboot it (a watchdog that never fires), the marker keeps the host fenced in software until it is rebooted: its workloads keep running, but it takes on no ownership work. Reboot the host; do not remove the file. Drain (or `lv host shutdown-workloads`) before planned maintenance. |
 | `manual` | Coordinator does NOT auto-reschedule; operator must run `lv host fence-confirm <host>` after physically powering it off. Required when shared storage would corrupt under split-brain. |
 | `best-effort` | Tries the same forced SSH power-off as `ssh`; succeeds regardless. Used in homelabs / single-tenant clusters that explicitly opt out of split-brain protection. |
 
@@ -1088,6 +1088,173 @@ below the release quarantines itself rather than fence a Redfish host over SSH
 a host with no Redfish settings, is accepted throughout. A server that predates
 the flags ignores them; the CLI reports an error when the host it gets back has
 no Redfish endpoint.
+
+### Managed fence SSH
+
+An `ssh` or `best-effort` fence logs in to the target as root. litevirt
+provisions that login itself, per host, so a fence key can do one thing — power
+its target off — and a machine answering at the wrong address cannot be powered
+off in the target's place.
+
+**What each host holds.** Once the cluster runs `release_2026_12_v1`, each
+host's daemon generates a fence key of its own (`/etc/litevirt/ssh/fence_ed25519`,
+0600, never leaving the host) and publishes, in the replicated `host_fence_ssh`
+row, its public half and the host's sshd host keys, signed with the host's
+cluster certificate. Every daemon verifies every peer's row against the cluster
+CA and the CRL (the certificate must name the row's host and not be revoked) and
+renders the verified ones every 30 seconds, leaving out a peer whose certificate
+has expired:
+
+| File | Contents |
+|---|---|
+| `/etc/litevirt/ssh/authorized_keys` | one line per peer: `restrict,from="<the peer's certificate address>",command="/etc/litevirt/ssh/fence-command"` and its key |
+| `/etc/litevirt/ssh/known_hosts` | each peer's sshd host keys, pinned under `litevirt-fence.<hex of its name>`; an expired peer is not listed, though a fence of it still carries its pin |
+| `/etc/litevirt/ssh/fence-command` | the forced command: powers this host off only for a request naming it (`litevirt-fence v1 poweroff <hex name>`), answers a probe's `check` without arming, refuses anything else with exit 3 |
+
+The address a key is accepted from is the one IPv4 address the peer's
+certificate names besides 127.0.0.1 — what `lv host init` and `lv host add`
+put in it — never a field of the row. A host whose certificate names no such
+address, or more than one, or is not valid now, publishes no row: it cannot
+fence over the managed key, and its peers fence it the legacy way, unpinned,
+which `lv doctor fence` warns of. Every file sshd
+reads at fence time is static, so a frozen or dead daemon does not stop its host
+being fenced. A host whose own certificate is revoked, or whose host row is
+removed, renders no peer at all.
+
+**sshd.** `lv host init` and `lv host add` add
+`/etc/ssh/sshd_config.d/60-litevirt-fence.conf`:
+
+```
+Match User root
+    AuthorizedKeysCommand /usr/bin/cat /etc/litevirt/ssh/authorized_keys
+    AuthorizedKeysCommandUser nobody
+```
+
+sshd reads an `AuthorizedKeysCommand`'s keys in addition to its
+`AuthorizedKeysFile`, so every file sshd read for root, from every address and
+under every `Match` rule of yours, is still read, and a host added later is
+accepted from like any other. Where your configuration already sets an
+`AuthorizedKeysCommand` anywhere, no drop-in is written (sshd keeps the first one
+it reads, so it would replace yours): have yours also print
+`/etc/litevirt/ssh/authorized_keys`. The drop-in is validated with `sshd -t` and
+rolled back on a refusal, never overrides `PermitRootLogin no` — such a host
+reports that it does not accept the managed key. sshd is then reloaded: a
+running `ssh.service` or `sshd.service` is reloaded, also when `ssh.socket`
+starts it (Ubuntu 22.10 and later, 24.04 LTS, where the socket starts one persistent
+listener that reads its configuration only on a reload); with no service running
+and only a socket listening, the next connection starts sshd with the new
+configuration. sshd is never reloaded on a configuration `sshd -t` refuses, and
+with neither unit, or a reload that fails, it is not reloaded and that is
+reported loudly. `--no-fence-ssh` skips the drop-in, for an sshd configured
+elsewhere: have it read `/etc/litevirt/ssh/authorized_keys` for root (an
+`AuthorizedKeysFile` entry or a command like the one above).
+
+Each daemon evaluates its sshd every minute: `sshd -T` for a connection from
+each peer's address, then a login of its own over the managed key to its own
+sshd (its own key, rendered for its own address, and a `check` request). It
+publishes that it accepts the managed key only when both pass, so the claim is
+about the running sshd, not its files. An `sshd -T` that cannot run changes
+nothing it published. A host that accepted the managed key before and does not
+now raises the `fence_ssh_not_accepting` health condition (warning) for itself:
+its peers still fence it over the managed key, which its sshd may refuse.
+
+**How a fence reaches its target** (`enforcement.fence_ssh`, per host; the
+fencing node's setting decides, so no host relies on another's):
+
+| The target's row | `auto` (default) | `managed` | `legacy` |
+|---|---|---|---|
+| none (it has not published) | today's command, unpinned, with a warning | refused | today's command, unpinned |
+| does not verify (forged, revoked, retired) | refused | refused | refused |
+| verified, sshd accepts the managed key | managed | managed | legacy, pinned |
+| verified, accepted it before and does not now | managed | managed | legacy, pinned |
+| verified, never accepted it | legacy, pinned | refused | legacy, pinned |
+
+- **managed**: `ssh -F /dev/null` with the host's own fence key, no agent, no
+  configuration of root's, `StrictHostKeyChecking=yes` against the target's
+  pinned sshd keys, `BindAddress` = the fencing host's certificate address, and
+  the request naming the target.
+- **legacy, pinned**: the command fences always ran — root's own identity and ssh
+  configuration, so a hand-made fence key keeps working — with the target's
+  published sshd keys pinned.
+- A target's `accepting` is its own evaluation, for every peer at once, so one
+  false answer (an address it was not evaluated for, a failed evaluation) never
+  makes it unfenceable: trying the managed key is never less safe than refusing,
+  since the pin, the restricted key, `from=` and the forced command all still
+  apply.
+- A host that cannot use the managed key itself (no fence key yet, or a
+  certificate with no fence address) fences a host that accepts it pinned in
+  `auto`, and refuses in `managed`.
+- The pinned path is refused toward a host whose sshd host keys another host
+  also publishes (a cloned image): the pin cannot tell the two apart. Regenerate
+  the sshd host keys on one of them. The managed path is not affected; its
+  forced command checks the name. (Host keys are public, so a compromised member
+  can publish another host's in its own row and hold the pinned path toward that
+  host off in the same way; it cannot make a fence reach the wrong machine.)
+- A row whose certificate has expired still pins its host's keys (`lv doctor
+  fence` says it expired): renew the certificate with `lv host renew-cert`.
+- A host that has published is never fenced without its pin, in any mode, and a
+  managed fence that fails is never retried down another path. A refused fence
+  fails. A `best-effort` fence keeps its contract and reports a refused or failed
+  fence as an assumed success: it gains no pin guarantee. `fencing_log`'s detail records the path: `[path=managed]`,
+  `[path=legacy-pinned]` or `[path=legacy-unpinned]`.
+- A new cluster's `lv host init` writes `fence_ssh: managed`, and `lv host add`
+  copies it with the enforcement block. An upgraded cluster stays `auto`.
+- A host in `legacy` publishes no row of its own. It still fences every host that
+  has published pinned, and every other host unpinned, as before.
+
+**Every member fences.** Any host can hold the failover lease and any host
+answers `lv host fence`, so every admitted host's key is rendered on every
+other host.
+
+**The probe.** Every `fence_ssh_probe_interval_sec` (default 900; 0 disables)
+each host runs the managed path's `check` against every peer whose fence strategy
+is `ssh` or `best-effort` (an `ipmi`, `redfish`, `manual` or `watchdog` host is
+never logged in to): pin, key, source address and forced command, without arming
+anything. The result is `litevirt_fence_ssh_probe_ok{peer}`, and a warning in the
+log when a managed path fails its check. A check does not prove the power-off
+itself works. The probe runs apart from rendering and publishing, so a peer that
+does not answer does not hold them back. It is a root login on every such peer
+each interval, and shows in their auth logs.
+
+**`lv doctor fence`** prints the pair matrix — how a fence from each host reaches
+each other host, and its last probe — and each row as the queried host holds it.
+It warns of every pair fenced without a pinned key and every host that does not
+accept the managed key. Its exit code is unchanged.
+
+**Migrating an existing cluster.**
+
+1. Upgrade with a normal rolling upgrade. `release_2026_12_v1` latches once every
+   host the cluster replicates to runs this build; until then nothing is published
+   and fences run exactly as before. Every host then publishes its row, which pins
+   its sshd keys for every fence toward it, the legacy path included.
+2. Run `lv host install-fence-ssh` (from the machine `lv` runs on, as root on each
+   host, or `--ssh-user`). It writes the drop-in on every host and waits until each
+   reports accepting the managed key; from then on, fences toward it take the
+   managed path.
+3. Check `lv doctor fence`: every pair `managed`, every probe `ok`. A probe
+   result can predate the install for up to `fence_ssh_probe_interval_sec`
+   (default 15 minutes); a stale `FAILED` clears at the next probe.
+4. Set `enforcement.fence_ssh: managed` on each host.
+5. Remove any hand-made fence keys and `Host` stanzas from `/root/.ssh` yourself;
+   litevirt never edits it.
+
+**Removal and renewal.** `lv host rm` and `lv host rm --dead` retire the host's
+row on every node, so its key leaves every authorized_keys and its pin every
+known_hosts; its revoked certificate would refuse the row anyway. A partitioned
+node keeps the stale line until it heals; that line still only powers the host
+off, and only from the removed host's address. `lv host renew-cert` does not
+revoke the replaced certificate until the host's daemon has re-signed its row
+with the renewed one (see [auth.md](auth.md)). `lv uninstall` removes the
+drop-in and `/etc/litevirt/ssh`; `lv host install-fence-ssh --remove` removes
+only the drop-in.
+
+**Rolling back.** Every host not in `legacy` publishes as soon as
+`release_2026_12_v1` latches, so the feature `fence_ssh` is used from then on, and
+a host rolled back below the release quarantines (see [upgrades.md](upgrades.md)).
+To keep that rollback possible, set `enforcement.fence_ssh: legacy` on every host
+before the last one upgrades. A rolled-back binary
+leaves the drop-in and the rendered files in place: they keep accepting peers'
+fences, and are not updated when a host is removed until it is upgraded again.
 
 ### Manual fence confirmation flow
 
@@ -1849,6 +2016,13 @@ command that moves it elsewhere onto a blank disk. It counts in the failover met
 release a `restart-same` VM was restarted on any healthy host whatever its
 disks, because the original host is never available while it is fenced.
 
+A VM with PCI passthrough devices is held the same way, with the same
+condition, when no surviving host has a free device of the kind it needs.
+Unlike a `restart-same` hold, it is placed again on every failover pass. See
+[Failover with PCI devices](pci-passthrough.md#failover-with-pci-devices),
+which also covers the `litevirt.failover_without_devices` label that recovers
+it without them.
+
 A VM with a local disk that is restarted on another host does not get its disk
 back, because the disk stayed on the failed host. The new host rebuilds the disk
 from the VM's image at the disk's recorded size. That is the cost
@@ -2219,6 +2393,7 @@ Scrape `http://<host>:7444/metrics` for:
   `result` (`ok`/`skipped`/`success`/`partial`/`refused`/`error`/`recovered`), and a bounded
   `error_class` (e.g. `no_quorum`, `upgrading`, `already_fenced`, `no_candidates`, `manual_unconfirmed`,
   `db_error`, `fence_log_write_failed`, `recovery_resumed`, `refence_failed`, `confirmation_resumed`,
+  `nothing_recoverable` (a failed host with nothing on it to recover, recorded offline and not fenced),
   `confirmation_fence` (a host confirmed off during this outage, fenced afresh), `local_stall`,
   `joining` (a host `lv host add` admitted whose daemon has not started, never fenced),
   `partition_pause_wait` (recovery waiting out a partitioned host's pause, design/partition-pause.md),

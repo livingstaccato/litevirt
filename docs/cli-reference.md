@@ -83,7 +83,8 @@ lv cluster ha arm [--fence-down-hosts] [--reason "..."]  # Resume them; refused 
                                    #   down unless --fence-down-hosts
 lv cluster upgrade-status          # Latched capability tokens on the connected host, whether each blocks a
                                    #   rollback, and which release features are in use (see upgrades.md →
-                                   #   Rolling back after a release token latched)
+                                   #   Rolling back after a release token latched; also lists pre-release peers the
+                                   #   automatic self-upgrade skipped)
 lv cluster acknowledge-lease-term --key <k> --term <n>   # Acknowledge a contested lease term on the connected host
 lv cluster voter ls                # Adopted voter generation; per member: host state, reachable, abstaining
 lv cluster voter init [--members a,b,c] [--yes]   # Start a voter generation by hand (unanimous); for a
@@ -123,6 +124,10 @@ lv host init --local --name <name>        # Bootstrap on localhost (standalone)
                                           #   which also makes the node look like a
                                           #   founder — use `lv host add` instead
 lv host add <user@host> --name <name>     # Add host to cluster
+  [--no-fence-ssh]                        # (init, add) do not add the managed fence SSH drop-in to
+                                          #   sshd; add /etc/litevirt/ssh/authorized_keys to root's
+                                          #   AuthorizedKeysFile in your own sshd configuration.
+                                          #   See migration-failover.md "Managed fence SSH"
                                           # new <name> (init, add): letters, digits, '_', '.', '-';
                                           #   not starting with '-' or '.', not ending in -migration,
                                           #   and not ca, client, host, gossip, migration-ca, ui,
@@ -152,12 +157,17 @@ lv host publish-crl                       # Re-publish this machine's crl.pem if
 lv host renew-cert <host>                 # Renew a host's cluster certificate in place: key made on
   [--ssh root@<addr>] [--keep-old]        #   the host, one atomic switch, served without a restart,
   [--revoke-old] [--force]                #   confirmed, then the old one revoked (owed while the
-  [--grpc-port 7443] [--wait 90s]         #   voter chain needs it). See auth.md
+  [--grpc-port 7443] [--wait 90s]         #   voter chain needs it, or the host's fence ssh row is
+                                          #   still signed by it). See auth.md
 lv host revoke-cert <host> --serial <hex> # Revoke a certificate a renewal replaced; --force for the
   [--force] [--grpc-port 7443]            #   live/presented one (fences the host)
 lv host install-gossip-key                # Put the cluster gossip key on every host (mints it if
   [--ssh-user root]                       #   none); never replaces one. Re-run to see each host's
                                           #   gossip stage. See auth.md "Gossip encryption"
+lv host install-fence-ssh                 # Give every host's sshd the managed fence SSH drop-in (an
+  [--host <name>]... [--ssh-user root]    #   existing cluster; init and add do it for a new host), then
+  [--remove] [--wait 3m]                  #   wait until each reports accepting the managed fence key.
+                                          #   See migration-failover.md "Managed fence SSH"
 lv host install-migration-tls             # Issue every host the migration-TLS credentials that
   [--reissue] [--ssh-user root]           #   encrypt storage migrations (mints the migration CA if
                                           #   none). See migration-failover.md "Migration with local disks"
@@ -521,6 +531,7 @@ lv ct create <name> --restart on-failure [--restart-max-attempts 5 --restart-del
 lv ct create <name> --on-host-failure image-recreate   # rebuild on a surviving host if this one is fenced
 lv ct start <name>
 lv ct stop <name>                                     # a container already stopped succeeds, recording the stop
+lv ct stop <name> --force                             # on a host in write quarantine: stopped, recorded once the quarantine lifts
 lv ct rm <name>                                       # a stopped container; a running one is refused
 lv ct rm <name> --force                               # a running container: stopped, then deleted
 lv ct ls
@@ -1044,6 +1055,14 @@ lv snapshot restore <vm> <name>           # repeatable; memory snapshots are hos
 lv snapshot rm <vm> <name>
 ```
 
+A memory snapshot that fails before libvirt switched any disk (refused, for
+example while the VM's host has lost the voter majority, or its memory image
+could not be written) took nothing: it leaves no snapshot
+row, `lv snapshot create` fails with `Aborted`, the VM gets the event
+`snapshot.created` with result `refused`, and the same name can be used
+again. One that fails after the switch is recorded with state `error`, so it
+stays visible and `lv snapshot rm` can remove it.
+
 `lv snapshot rm` lets libvirt merge the snapshot's overlay into the disk it
 was taken of and remove the overlay; deleting the last disk-only snapshot of a
 running VM does the same with a block commit of its own. A restore leaves the
@@ -1381,6 +1400,7 @@ lv detach-disk <vm> <disk>
 lv attach-nic <vm> <network> [--model virtio] [--mac ...] [--spoof-guard on|off] [--allow-address <ip>]
 lv detach-nic <vm> <mac>
 lv attach-pci <vm> --type gpu [--vendor 10de] [--count 1] [--sriov]
+lv attach-pci <vm> --address <pci-address>   # one device; also a stopped VM once hardware_v2 is active
 lv detach-pci <vm> <pci-address>
 ```
 

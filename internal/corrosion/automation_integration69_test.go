@@ -16,8 +16,8 @@ func TestAutomationIntegration69MigrationAndDescriptor(t *testing.T) {
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	if CurrentSchemaVersion != 86 || automationCutSourceSchema != 86 {
-		t.Fatalf("current SQL/source descriptor = %d/%d, want86/86", CurrentSchemaVersion, automationCutSourceSchema)
+	if CurrentSchemaVersion != 87 || automationCutSourceSchema != 87 {
+		t.Fatalf("current SQL/source descriptor = %d/%d, want87/87", CurrentSchemaVersion, automationCutSourceSchema)
 	}
 	units := 0
 	for _, m := range schemaMigrationLedger {
@@ -52,7 +52,19 @@ func TestAutomationIntegration69MigrationAndDescriptor(t *testing.T) {
 			}
 		}
 	}
-	if projectUnits != 1 || !supportedAutomationCutDescriptor(82, 1) || !supportedAutomationCutDescriptor(83, 1) || !supportedAutomationCutDescriptor(84, 1) || !supportedAutomationCutDescriptor(85, 1) || !supportedAutomationCutDescriptor(86, 1) || supportedAutomationCutDescriptor(87, 1) {
+	fenceUnits := 0
+	for _, m := range schemaMigrationLedger {
+		if m.Version == 72 {
+			fenceUnits++
+			if m.ID != "t_host_fence_ssh" || m.Target != "host_fence_ssh" || m.Kind != kindCreateTable || m.SQL != "" {
+				t.Fatalf("published72 changed: %+v", m)
+			}
+		}
+	}
+	if fenceUnits != 1 {
+		t.Fatalf("schema72 units=%d", fenceUnits)
+	}
+	if projectUnits != 1 || !supportedAutomationCutDescriptor(82, 1) || !supportedAutomationCutDescriptor(83, 1) || !supportedAutomationCutDescriptor(84, 1) || !supportedAutomationCutDescriptor(85, 1) || !supportedAutomationCutDescriptor(86, 1) || !supportedAutomationCutDescriptor(87, 1) || supportedAutomationCutDescriptor(88, 1) {
 		t.Fatalf("project71 or archived82/83/84/current86 descriptor boundary changed: units=%d", projectUnits)
 	}
 }
@@ -101,15 +113,15 @@ func TestAutomationIntegration80LocalSchemaProvenance(t *testing.T) {
 		{"retained33", retainedLocalLayoutDigestFor(automationExecutionArchived85PrivateLayoutForTest()), true},
 		{"retained37", retainedLocalLayoutDigest(), true},
 	} {
-		for _, version := range []int64{77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87} {
+		for _, version := range []int64{77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88} {
 			t.Run(fmt.Sprintf("%s_schema%d", layout.name, version), func(t *testing.T) {
 				observation := aggregateLocalObservation{retained: layout.retained, layoutDigest: layout.digest}
 				row := Row{Columns: []string{"id", "version"}, Values: []interface{}{int64(1), version}}
 				err := observation.observe(&aggregateLocalAudit{}, 15, 1, row)
-				want := (layout.name == "live" && version == 86) ||
+				want := (layout.name == "live" && version == 87) ||
 					(layout.name == "retained31" && version >= 78 && version <= 83) ||
 					(layout.name == "retained33" && (version == 84 || version == 85)) ||
-					(layout.name == "retained37" && version == 86)
+					(layout.name == "retained37" && (version == 86 || version == 87))
 				if (err == nil) != want {
 					t.Fatalf("schema=%d layout=%s retained=%t: %v", version, layout.name, layout.retained, err)
 				}
@@ -126,12 +138,12 @@ func TestAutomationIntegration85TokenStampInventory(t *testing.T) {
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	if storedVersion(t, c) != 86 || len(schemaMigrationLedger) != 206 {
+	if storedVersion(t, c) != 87 || len(schemaMigrationLedger) != 207 {
 		t.Fatal("SQL85 migration boundary")
 	}
 	units := 0
 	for _, m := range schemaMigrationLedger {
-		if m.Version == 85 {
+		if m.Version == 86 {
 			units++
 			if m.ID != "a094_tokens_user_created_at" || m.Target != "tokens.user_created_at" || m.Kind != kindAddColumn || m.SQL != "ALTER TABLE tokens ADD COLUMN user_created_at TEXT NOT NULL DEFAULT ''" {
 				t.Fatal("SQL85 migration changed", m)
@@ -177,7 +189,7 @@ func TestAutomationIntegration85TokenStampInventory(t *testing.T) {
 			t.Fatal("SQL85 local issuance trigger inventory differs", trigger.name, err)
 		}
 	}
-	for schema := 69; schema <= 86; schema++ {
+	for schema := 69; schema <= 87; schema++ {
 		if !supportedAutomationCutDescriptor(schema, 1) {
 			t.Fatal("retained descriptor refused", schema)
 		}
@@ -187,7 +199,7 @@ func TestAutomationIntegration85TokenStampInventory(t *testing.T) {
 			}
 		}
 	}
-	if supportedAutomationCutDescriptor(68, 1) || supportedAutomationCutDescriptor(87, 1) {
+	if supportedAutomationCutDescriptor(68, 1) || !supportedAutomationCutDescriptor(87, 1) || supportedAutomationCutDescriptor(88, 1) {
 		t.Fatal("unsupported source accepted")
 	}
 	wantSections := []string{"claims", "incarnation_claims", "history", "anchors", "requests", "authority", "adoptions", "seals", "membership"}

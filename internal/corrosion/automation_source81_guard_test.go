@@ -20,7 +20,7 @@ func TestAutomationSource82NewCutRequiresSemanticSchema(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			_, a, _, _ := threeVoters(t)
-			if storedVersion(t, a.c) != 86 {
+			if storedVersion(t, a.c) != 87 {
 				t.Fatal("SETUP actual schema86 required")
 			}
 			if err := a.c.SealVoterGeneration(ctx, 1, "new82-shape-regression"); err != nil {
@@ -51,7 +51,7 @@ func TestAutomationSource82NewCutRequiresSemanticSchema(t *testing.T) {
 					t.Fatal("SETUP clean NEW82 cut creation failed", err)
 				}
 				metadata, _ := cutFixtureRead(t, a.c, id)
-				if metadata.SourceSchema != 86 || len(metadata.Inventory) != 9 {
+				if metadata.SourceSchema != 87 || len(metadata.Inventory) != 9 {
 					t.Fatal("SETUP clean NEW82 cut has wrong provenance/inventory")
 				}
 				return
@@ -61,7 +61,7 @@ func TestAutomationSource82NewCutRequiresSemanticSchema(t *testing.T) {
 					t.Fatal("SETUP cut returned empty ID without refusal")
 				}
 				metadata, _ := cutFixtureRead(t, a.c, id)
-				if metadata.SourceSchema != 86 || len(metadata.Inventory) != 9 {
+				if metadata.SourceSchema != 87 || len(metadata.Inventory) != 9 {
 					t.Fatal("SETUP accepted cut is not actual NEW82 provenance")
 				}
 				t.Fatalf("RED_NEW82_MALFORMED_CUT_ACCEPTED: mode=%s cut=%s", tc.name, id)

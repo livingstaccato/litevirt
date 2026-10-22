@@ -79,8 +79,15 @@ var sshG = func(timeout time.Duration, args ...string) ([]byte, error) {
 // way it does for ssh. With no config file the old defaults apply even without
 // an ssh binary; a config that ssh -G cannot read is an error.
 func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.Duration) (*resolved, error) {
-	if host == "" || strings.HasPrefix(host, "-") || strings.ContainsAny(host, " \t\r\n\x00") {
+	// Only hostname, IP-literal and user-name characters reach ssh -G. The
+	// host can come from a replicated, peer-writable column (hosts.address),
+	// and a config's `Match exec "... %h"` hands it to a shell; OpenSSH before
+	// 9.6 did not refuse shell metacharacters there.
+	if !validSSHName(host) || strings.HasPrefix(host, "-") {
 		return nil, fmt.Errorf("invalid SSH host %q", host)
+	}
+	if userSet && (!validSSHName(usr) || strings.HasPrefix(usr, "-")) {
+		return nil, fmt.Errorf("invalid SSH user %q", usr)
 	}
 	if timeout <= 0 || timeout > configTimeout {
 		timeout = configTimeout
@@ -322,6 +329,23 @@ func expandIdentity(p, orig, hostname, usr, port string) (string, bool) {
 		}
 	}
 	return expandHome(b.String()), true
+}
+
+// validSSHName reports whether s holds only hostname, IP-literal and
+// user-name characters: letters, digits and . _ - :
+func validSSHName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '.', c == '-', c == '_', c == ':':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 type sshGOut map[string][]string

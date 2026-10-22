@@ -667,3 +667,43 @@ func TestResolveConfig_BadPermissionsHint(t *testing.T) {
 		t.Fatalf("err = %v, want the permissions refusal to say what to do", err)
 	}
 }
+
+// Only hostname, IP-literal and user-name characters reach ssh -G (reviewer
+// probe sshcfg M2): the host can come from a replicated, peer-writable column,
+// and a `Match exec "... %h"` line hands it to a shell, which OpenSSH before
+// 9.6 did not prevent.
+func TestResolveConfig_RejectsShellMetacharacters(t *testing.T) {
+	home, _ := sshHome(t, "id_ed25519")
+	marker := filepath.Join(home, "pwned")
+	writeSSHConfig(t, home, "Match exec \"echo %h %r >/dev/null\"\n  Port 2200\n")
+	called := 0
+	old := sshG
+	sshG = func(d time.Duration, a ...string) ([]byte, error) { called++; return old(d, a...) }
+	t.Cleanup(func() { sshG = old })
+	for _, tc := range []struct{ host, user string }{
+		{"a$(touch${IFS}" + marker + ")b", ""},
+		{"a;touch " + marker, ""},
+		{"a`id`", ""},
+		{"a|b", ""},
+		{"a'b", ""},
+		{"*", ""},
+		{"10.0.0.1", "x$(touch${IFS}" + marker + ")"},
+		{"10.0.0.1", "x;y"},
+	} {
+		_, err := resolveConfig(tc.host, tc.user, "22", tc.user != "", false, 0)
+		if err == nil || !strings.Contains(err.Error(), "invalid SSH") {
+			t.Errorf("host %q user %q: err = %v, want an invalid-SSH refusal", tc.host, tc.user, err)
+		}
+	}
+	if called != 0 {
+		t.Fatalf("ssh -G ran %d time(s) for a host or user with shell metacharacters", called)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("a shell metacharacter in the host ran through Match exec")
+	}
+	for _, ok := range []string{"node-3.dc_1.example", "10.0.0.1", "labnode"} {
+		if _, err := resolveConfig(ok, "deploy.user-1", "22", true, false, 0); err != nil {
+			t.Errorf("host %q: %v", ok, err)
+		}
+	}
+}

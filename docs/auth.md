@@ -1289,7 +1289,9 @@ could read as a failure:
    peer refuses to fence a host whose row does not verify, so it waits until the
    host's daemon re-signs the row with the renewed certificate, which it does
    within a minute, and is then published by itself. `lv host revoke-cert`
-   revokes at once regardless.
+   revokes at once regardless, and so does `--revoke-old`: for up to about a
+   minute after either, until the host re-signs its row, its peers refuse to
+   fence it.
 
    An owed revocation is published only by a node that can trust its own view:
    its replica has caught up, it has adopted the newest voter generation it

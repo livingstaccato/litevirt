@@ -1112,25 +1112,44 @@ renders the verified ones every 30 seconds:
 
 The address a key is accepted from is the one IPv4 address the peer's
 certificate names besides 127.0.0.1 — what `lv host init` and `lv host add`
-put in it — never a field of the row. A host whose certificate names only
-127.0.0.1 can neither fence nor be fenced over the managed key. Every file sshd
+put in it — never a field of the row. A host whose certificate names no such
+address, or more than one, or is not valid now, publishes no row: it cannot
+fence over the managed key, and its peers fence it the legacy way, unpinned,
+which `lv doctor fence` warns of. Every file sshd
 reads at fence time is static, so a frozen or dead daemon does not stop its host
 being fenced. A host whose own certificate is revoked, or whose host row is
 removed, renders no peer at all.
 
 **sshd.** `lv host init` and `lv host add` add
-`/etc/ssh/sshd_config.d/60-litevirt-fence.conf`, which has root also read
-`/etc/litevirt/ssh/authorized_keys`, keeping the list sshd had for root. The list
-is evaluated with `sshd -T` for a connection from each peer's address, so a
-`Match Address` block that gives root another list for one peer keeps it there
-(one `Match User root Address <peer>` block each). The drop-in freezes root's
-list as it was: after editing the global `AuthorizedKeysFile`, run `lv host
-install-fence-ssh --host <host>` again. It is validated with `sshd -t` and
-rolled back on a refusal, and never overrides `PermitRootLogin no` — such a host
-reports that it does not accept the managed key. `--no-fence-ssh` skips the
-drop-in, for an sshd configured elsewhere: add `/etc/litevirt/ssh/authorized_keys`
-to root's `AuthorizedKeysFile` there. Each daemon evaluates its sshd the same way
-every minute and publishes whether it accepts the managed key.
+`/etc/ssh/sshd_config.d/60-litevirt-fence.conf`:
+
+```
+Match User root
+    AuthorizedKeysCommand /usr/bin/cat /etc/litevirt/ssh/authorized_keys
+    AuthorizedKeysCommandUser nobody
+```
+
+sshd reads an `AuthorizedKeysCommand`'s keys in addition to its
+`AuthorizedKeysFile`, so every file sshd read for root, from every address and
+under every `Match` rule of yours, is still read, and a host added later is
+accepted from like any other. Where your configuration already sets an
+`AuthorizedKeysCommand` anywhere, no drop-in is written (sshd keeps the first one
+it reads, so it would replace yours): have yours also print
+`/etc/litevirt/ssh/authorized_keys`. The drop-in is validated with `sshd -t` and
+rolled back on a refusal, never overrides `PermitRootLogin no` — such a host
+reports that it does not accept the managed key — and a failed sshd reload is
+reported loudly. `--no-fence-ssh` skips the drop-in, for an sshd configured
+elsewhere: have it read `/etc/litevirt/ssh/authorized_keys` for root (an
+`AuthorizedKeysFile` entry or a command like the one above).
+
+Each daemon evaluates its sshd every minute: `sshd -T` for a connection from
+each peer's address, then a login of its own over the managed key to its own
+sshd (its own key, rendered for its own address, and a `check` request). It
+publishes that it accepts the managed key only when both pass, so the claim is
+about the running sshd, not its files. An `sshd -T` that cannot run changes
+nothing it published. A host that accepted the managed key before and does not
+now raises the `fence_ssh_not_accepting` health condition (warning) for itself:
+its peers still fence it over the managed key, which its sshd may refuse.
 
 **How a fence reaches its target** (`enforcement.fence_ssh`, per host; the
 fencing node's setting decides, so no host relies on another's):
@@ -1140,8 +1159,8 @@ fencing node's setting decides, so no host relies on another's):
 | none (it has not published) | today's command, unpinned, with a warning | refused | today's command, unpinned |
 | does not verify (forged, revoked, retired) | refused | refused | refused |
 | verified, sshd accepts the managed key | managed | managed | legacy, pinned |
-| verified, does not accept it | legacy, pinned | refused | legacy, pinned |
-| verified, accepted it before and no longer does | refused | refused | legacy, pinned |
+| verified, accepted it before and does not now | managed | managed | legacy, pinned |
+| verified, never accepted it | legacy, pinned | refused | legacy, pinned |
 
 - **managed**: `ssh -F /dev/null` with the host's own fence key, no agent, no
   configuration of root's, `StrictHostKeyChecking=yes` against the target's
@@ -1150,27 +1169,41 @@ fencing node's setting decides, so no host relies on another's):
 - **legacy, pinned**: the command fences always ran — root's own identity and ssh
   configuration, so a hand-made fence key keeps working — with the target's
   published sshd keys pinned.
+- A target's `accepting` is its own evaluation, for every peer at once, so one
+  false answer (an address it was not evaluated for, a failed evaluation) never
+  makes it unfenceable: trying the managed key is never less safe than refusing,
+  since the pin, the restricted key, `from=` and the forced command all still
+  apply.
 - A host that cannot use the managed key itself (no fence key yet, or a
-  certificate with no address) refuses a fence toward a host that accepts it,
-  rather than take a lesser path.
+  certificate with no fence address) fences a host that accepts it pinned in
+  `auto`, and refuses in `managed`.
+- The pinned path is refused toward a host whose sshd host keys another host
+  also publishes (a cloned image): the pin cannot tell the two apart. Regenerate
+  the sshd host keys on one of them. The managed path is not affected; its
+  forced command checks the name.
 - A host that has published is never fenced without its pin, in any mode, and a
   managed fence that fails is never retried down another path. A refused fence
-  fails (a `best-effort` fence keeps its contract and reports an assumed
-  success). `fencing_log`'s detail records the path: `[path=managed]`,
+  fails. A `best-effort` fence keeps its contract and reports a refused or failed
+  fence as an assumed success: it gains no pin guarantee. `fencing_log`'s detail records the path: `[path=managed]`,
   `[path=legacy-pinned]` or `[path=legacy-unpinned]`.
 - A new cluster's `lv host init` writes `fence_ssh: managed`, and `lv host add`
   copies it with the enforcement block. An upgraded cluster stays `auto`.
+- A host in `legacy` publishes no row of its own. It still fences every host that
+  has published pinned, and every other host unpinned, as before.
 
 **Every member fences.** Any host can hold the failover lease and any host
 answers `lv host fence`, so every admitted host's key is rendered on every
 other host.
 
 **The probe.** Every `fence_ssh_probe_interval_sec` (default 900; 0 disables)
-each host runs the managed path's `check` against every peer: pin, key, source
-address and forced command, without arming anything. The result is
-`litevirt_fence_ssh_probe_ok{peer}` and a warning in the log when it fails. A
-check does not prove the power-off itself works. The probe is a root login on
-every peer each interval, and shows in their auth logs.
+each host runs the managed path's `check` against every peer whose fence strategy
+is `ssh` or `best-effort` (an `ipmi`, `redfish`, `manual` or `watchdog` host is
+never logged in to): pin, key, source address and forced command, without arming
+anything. The result is `litevirt_fence_ssh_probe_ok{peer}`, and a warning in the
+log when a managed path fails its check. A check does not prove the power-off
+itself works. The probe runs apart from rendering and publishing, so a peer that
+does not answer does not hold them back. It is a root login on every such peer
+each interval, and shows in their auth logs.
 
 **`lv doctor fence`** prints the pair matrix — how a fence from each host reaches
 each other host, and its last probe — and each row as the queried host holds it.
@@ -1202,9 +1235,11 @@ with the renewed one (see [auth.md](auth.md)). `lv uninstall` removes the
 drop-in and `/etc/litevirt/ssh`; `lv host install-fence-ssh --remove` removes
 only the drop-in.
 
-**Rolling back.** Every host publishes as soon as `release_2026_12_v1` latches,
-so the feature `fence_ssh` is used from then on, and a host rolled back below
-the release quarantines (see [upgrades.md](upgrades.md)). A rolled-back binary
+**Rolling back.** Every host not in `legacy` publishes as soon as
+`release_2026_12_v1` latches, so the feature `fence_ssh` is used from then on, and
+a host rolled back below the release quarantines (see [upgrades.md](upgrades.md)).
+To keep that rollback possible, set `enforcement.fence_ssh: legacy` on every host
+before the last one upgrades. A rolled-back binary
 leaves the drop-in and the rendered files in place: they keep accepting peers'
 fences, and are not updated when a host is removed until it is upgraded again.
 

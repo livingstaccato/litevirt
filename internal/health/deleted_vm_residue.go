@@ -368,10 +368,10 @@ func SetAsideBeforeCreate(ctx context.Context, db *corrosion.Client, dataDir, ho
 		for _, p := range present {
 			if filepath.Clean(p) == u {
 				f, _ := keptDisksFile(dataDir, name)
-				return BeforeCreate{}, fmt.Errorf("the create clears %s, which a disk the deleted VM %s was kept with backs on (%s): "+
+				return BeforeCreate{}, &KeptBackingFileError{msg: fmt.Sprintf("the create clears %s, which a disk the deleted VM %s was kept with backs on (%s): "+
 					"moving it would break that disk's backing chain, and the sweep would remove it; nothing was moved. "+
 					"Move the kept disk and the files under it off that path yourself (then `qemu-img rebase -u -b <new path>` "+
-					"the overlay above it), or place the VM on another host", p, name, f)
+					"the overlay above it), or place the VM on another host", p, name, f)}
 			}
 		}
 	}

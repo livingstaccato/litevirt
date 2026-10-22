@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -477,7 +478,8 @@ func TestSetAsideBeforeCreate_RefusesOverAFileAKeptDiskBacksOn(t *testing.T) {
 		t.Fatal(err)
 	}
 	done, err := SetAsideBeforeCreate(ctx, db, dataDir, "node-a", "web", []string{path}, samePath, trustedReplica, time.Now())
-	if err == nil || !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), "backs on") || len(done.Moved) != 0 {
+	var kb *KeptBackingFileError
+	if !errors.As(err, &kb) || !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), "backs on") || len(done.Moved) != 0 {
 		t.Fatalf("SetAsideBeforeCreate = %+v, %v; want a refusal naming %s, nothing moved", done, err, path)
 	}
 	if b, err := os.ReadFile(path); err != nil || string(b) != "the real disk" {

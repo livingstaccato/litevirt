@@ -608,6 +608,9 @@ func referenceKind(d *corrosion.DiskRecord, path string) string {
 // cleanup — both must never os.Remove a file that backs a linked clone or
 // another VM (the bug-sweep found migrate deleting a clone's backing chain).
 func (s *Server) pathStillReferenced(ctx context.Context, path, excludeVM, excludeDisk string) (bool, string, error) {
+	if held, why := s.keptNoteHolds(path); held {
+		return true, why, nil
+	}
 	refs, err := corrosion.DisksReferencingPath(ctx, s.db, path)
 	if err != nil {
 		return true, "usage check failed: " + err.Error(), err
@@ -779,6 +782,12 @@ func (s *Server) deleteRecordedVMDiskVolumeRecordsKept(
 // matter for ceph); otherwise we fall back to the recorded StorageType, and to
 // "local" when even that is blank (legacy rows).
 func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.DiskRecord) error {
+	if !strings.HasPrefix(d.Path, "rbd:") {
+		if held, why := s.keptNoteHolds(d.Path); held {
+			s.reportKeptNoteHold(ctx, d.VMName, "the delete of disk "+d.DiskName, d.Path, why)
+			return nil
+		}
+	}
 	drv, err := s.diskDriver(ctx, d)
 	if err != nil {
 		return err
@@ -1443,7 +1452,19 @@ func (s *Server) sweepVMDiskDebrisIn(ctx context.Context, vmName string, candida
 	// listing and deleting against a third left the guarantee resting on all
 	// three agreeing: a file appearing after the keep set was built is in no
 	// keep set and would be swept with no reference check ever run against it.
-	if err := s.images.DeleteVMDisksIn(vmName, candidates, s.protectedDiskPathsFrom(ctx, vmName, candidates)); err != nil {
+	keep := s.protectedDiskPathsFrom(ctx, vmName, candidates)
+	// A file a kept-disk note holds is a disk an earlier VM of the name was
+	// deleted with and kept, or one it backs on: never this VM's debris.
+	for _, c := range candidates {
+		if keep[c] {
+			continue
+		}
+		if held, why := s.keptNoteHolds(c); held {
+			keep[c] = true
+			s.reportKeptNoteHold(ctx, vmName, "the disk debris sweep", c, why)
+		}
+	}
+	if err := s.images.DeleteVMDisksIn(vmName, candidates, keep); err != nil {
 		slog.Warn("delete: disk debris sweep failed", "vm", vmName, "error", err)
 	}
 }

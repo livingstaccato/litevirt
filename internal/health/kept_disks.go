@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/litevirt/litevirt/internal/safename"
@@ -183,3 +184,51 @@ func writeKeptDisks(dataDir, name string, n keptDisksNote) error {
 	}
 	return syncDir(dir)
 }
+
+// KeptNotedFiles is every file this host's kept-disk notes name, as a kept
+// disk or as a file one backs on, cleaned, mapped to the deleted VM whose
+// note names it. A note that cannot be read, or a directory of notes that
+// cannot be listed, is an error: a caller about to remove a disk file then
+// keeps it.
+func KeptNotedFiles(dataDir string) (map[string]string, error) {
+	out := map[string]string{}
+	if dataDir == "" {
+		return out, nil
+	}
+	dir := filepath.Join(dataDir, "kept-disks")
+	ents, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return out, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list %s: %w", dir, err)
+	}
+	keptDisksMu.Lock()
+	defer keptDisksMu.Unlock()
+	for _, e := range ents {
+		name, ok := strings.CutSuffix(e.Name(), ".json")
+		if !ok || e.IsDir() {
+			continue
+		}
+		if safename.ValidateVMName(name) != nil {
+			continue
+		}
+		n, err := keptNoteOf(dataDir, name)
+		if err != nil {
+			return nil, err
+		}
+		for _, l := range [][]string{n.Paths, n.Under} {
+			for _, p := range l {
+				out[p] = name
+			}
+		}
+	}
+	return out, nil
+}
+
+// KeptBackingFileError is a create refused because a file a kept disk backs
+// on is at a path it clears (SetAsideBeforeCreate). It stands until an
+// operator moves the kept chain away: a retry on the host does not help.
+type KeptBackingFileError struct{ msg string }
+
+func (e *KeptBackingFileError) Error() string { return e.msg }

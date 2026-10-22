@@ -102,14 +102,17 @@ func (s *Server) keptHere(d corrosion.DiskRecord, keepDisks bool) bool {
 
 // keptChainLayers is file and each file of its backing chain, top first. It
 // ends at a file without the qcow2 magic (raw, or a block device), which
-// names no file under it, and at a backing reference that is a protocol URI.
+// names no file under it, unless the overlay above it declares it qcow2
+// (backing_fmt): that one has lost its header, and may have hidden a file
+// under it. A raw backing file, declared raw or with no format declared,
+// ends the chain. It also ends at a backing reference that is a protocol URI.
 // A file that cannot be stated (the top only when it is missing, which keeps
-// nothing), a file with the qcow2 magic whose header cannot be read (it may
-// name a file under it), and a chain deeper than maxBackingDepth are errors
-// naming the file.
+// nothing), a file with the qcow2 magic whose header cannot be read, a
+// declared qcow2 backing file without the magic, and a chain deeper than
+// maxBackingDepth are errors naming the file.
 func keptChainLayers(file string) ([]string, error) {
 	var out []string
-	path := file
+	path, declaredQcow2 := file, false
 	for depth := 0; depth <= maxBackingDepth; depth++ {
 		fi, err := os.Stat(path)
 		if err != nil {
@@ -127,6 +130,9 @@ func keptChainLayers(file string) ([]string, error) {
 			return nil, fmt.Errorf("%s: %w", path, err)
 		}
 		if !isQ {
+			if declaredQcow2 {
+				return nil, fmt.Errorf("%s: the overlay above it declares it qcow2, and it has no qcow2 header", path)
+			}
 			return out, nil
 		}
 		info, err := qcow2.Info(path)
@@ -140,7 +146,7 @@ func keptChainLayers(file string) ([]string, error) {
 		if !filepath.IsAbs(b) {
 			b = filepath.Join(filepath.Dir(path), b)
 		}
-		path = filepath.Clean(b)
+		path, declaredQcow2 = filepath.Clean(b), info.BackingFormat == "qcow2"
 	}
 	return nil, fmt.Errorf("%s: backing chain deeper than %d", file, maxBackingDepth)
 }

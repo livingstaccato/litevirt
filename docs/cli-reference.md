@@ -270,7 +270,9 @@ disk backs on: when the kept disk is a qcow2 overlay on another
 the overlay's backing reference, so the create is refused, naming that file,
 with nothing moved. Move the kept disk and the files under it elsewhere
 yourself (then `qemu-img rebase -u -b <new path> <overlay>`), or place the VM
-on another host. The create renames
+on another host. No other delete, rebuild, migration or cleanup on that host
+removes a file its note `<data_dir>/kept-disks/<vm>.json` names, whatever VM
+it runs for: each leaves the file and records a `vm.disk.kept` event. The create renames
 nothing until the refusals it can judge up front have passed (Secure Boot or
 vTPM over kept UEFI vars, a USB device the host does not have, the image not
 available), and a create that fails
@@ -306,10 +308,19 @@ there.
 
 Any delete that keeps a disk (`--keep-disks`, or a disk recorded
 `delete_with_vm=false`) reads the disk's whole qcow2 backing chain first. A
-file in the chain that cannot be read (a missing backing file, or a header
-that is not valid qcow2) refuses the delete before anything is done, naming
-the file. Snapshot records that cannot be read refuse a `--keep-disks` delete
-the same way. Fix the file or the storage, then retry.
+missing backing file, a qcow2 file whose header cannot be read, or a backing
+file its overlay declares qcow2 that has no qcow2 header refuses the delete
+before anything is done, naming the file. A raw file (declared raw, or with
+no format declared) ends the chain and refuses nothing. Snapshot records that
+cannot be read refuse a `--keep-disks` delete the same way. Fix the file or
+the storage, then retry. When a backing file is gone for good, move the kept
+disk's own file (the top of its chain) away by hand: a disk file that is
+missing keeps nothing, and the delete then goes ahead.
+
+A plain `lv rm` removes the VM's snapshot records too, once their memory
+images and firmware bundles on its host are gone, so a later VM of the same
+name lists none of them. A record whose memory image could not be removed, or
+that another host holds, stays.
 
 With `--keep-disks`, libvirt refuses the undefine of a domain that still holds
 snapshots litevirt has no record of (taken with `virsh`, "cannot delete inactive domain with N

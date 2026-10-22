@@ -27,12 +27,10 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
-var (
-	osMkdirAll = os.MkdirAll
-	osCreate   = os.Create
-)
+var osMkdirAll = os.MkdirAll
 
 const composeBackup = `name: e2e-stack
 
@@ -227,9 +225,8 @@ func writeEmptyImageFile(path string) error {
 	if err := osMkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	f, err := osCreate(path)
-	if err != nil {
-		return err
-	}
-	return f.Close()
+	// A real (empty) qcow2, as the image is registered: a VM's root disk is
+	// an overlay that declares it qcow2, and a delete that keeps the disk
+	// reads the chain through it.
+	return qcow2.Create(path, 64<<20, nil)
 }

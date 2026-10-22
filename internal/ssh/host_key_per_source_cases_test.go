@@ -167,3 +167,19 @@ func TestPerSource_Cases(t *testing.T) {
 		})
 	}
 }
+
+// A plain-only file that records a different key of the same type as the
+// certificate's inner key reports CHANGED, naming itself -- not the
+// type-mismatch wording, which would describe the certificate's type.
+func TestPerSource_CertInnerKeyChangedMessage(t *testing.T) {
+	ca, ed := ed25519Signer(t), ed25519Signer(t)
+	home, addr := configServer(t, "  GlobalKnownHostsFile %H/global_kh\n", hostCert(t, ca, ed, "127.0.0.1"), ed)
+	def := filepath.Join(home, ".ssh", "known_hosts")
+	writeFile(t, def, plainLine(addr, ed25519Signer(t).PublicKey()))
+	writeFile(t, filepath.Join(home, "global_kh"), caLine(addr, ca.PublicKey()))
+	err := dialLabnode(t)
+	if err == nil || !strings.Contains(err.Error(), "CHANGED") || !strings.Contains(err.Error(), def) ||
+		strings.Contains(err.Error(), "cannot be verified") {
+		t.Fatalf("err = %v, want CHANGED naming %s", err, def)
+	}
+}

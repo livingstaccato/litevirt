@@ -1195,7 +1195,7 @@ func hostKeyPolicyFor(cfg *resolved, addr string) (ssh.HostKeyCallback, []string
 				checked = cert.Key
 			}
 			if serr := src.cb(name, remote, checked); serr != nil {
-				if v := hostKeyVerdictFor(label, key, serr); v != nil {
+				if v := hostKeyVerdictFor(label, checked, serr); v != nil {
 					return fmt.Errorf("%w (known_hosts sources disagree: each file that records the "+
 						"host must hold the presented key; %s does not)", v, src.file)
 				}

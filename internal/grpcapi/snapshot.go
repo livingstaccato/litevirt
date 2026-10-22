@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/litevirt/litevirt/internal/safename"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -896,4 +897,25 @@ func removeFirmwareBundle(dataDir, vmName, snapName string) error {
 	}
 	_ = os.Remove(filepath.Dir(bundle)) // only when empty
 	return nil
+}
+
+// removeVMFirmwareBundles removes every snapshot firmware bundle of a VM whose
+// delete has committed: the snapfw/<vm> directory with its nvram and swtpm
+// (vTPM) captures, which `lv rm` left on the host (lab 2, B2). The caller holds
+// the VM's lock, which snapshot create, restore and delete take too, so no
+// capture or restore of it runs. It does nothing while the VM's row is live
+// again or unreadable, so a bundle is never taken from a VM that exists; and
+// it is never called for --keep-disks, which keeps the VM's firmware state.
+func (s *Server) removeVMFirmwareBundles(ctx context.Context, vmName string) {
+	if err := safename.ValidateVMName(vmName); err != nil {
+		return
+	}
+	if cur, err := corrosion.GetVM(ctx, s.db, vmName); err != nil || cur != nil {
+		slog.Warn("delete: the VM's snapshot firmware bundles are kept: its row is not known to be gone", "vm", vmName, "error", err)
+		return
+	}
+	dir := filepath.Dir(lv.SnapshotFirmwareBundlePath(s.dataDir, vmName, "x"))
+	if err := os.RemoveAll(dir); err != nil {
+		slog.Warn("delete: remove snapshot firmware bundles", "vm", vmName, "dir", dir, "error", err)
+	}
 }

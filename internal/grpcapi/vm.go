@@ -4128,6 +4128,9 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			return nil, status.Errorf(codes.Internal, "clean up stale VM record: %v", err)
 		}
 		s.reportDeletedVM(ctx, deleted)
+		if !req.KeepDisks {
+			s.removeVMFirmwareBundles(ctx, req.Name)
+		}
 		s.retireNICGuards(ctx, req.Name)
 		s.clearDeviceLease(req.Name)
 		// The domain is gone everywhere: a volume move it left unresolved
@@ -4505,6 +4508,11 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// The row as this delete tombstoned it, for a re-create that follows
 	// (vm_recreate_replaces.go).
 	s.reportDeletedVM(ctx, deleted)
+	// Its snapshots' firmware bundles (nvram, vTPM state) go with it, only now
+	// that the delete has committed; --keep-disks keeps firmware state.
+	if !req.KeepDisks {
+		s.removeVMFirmwareBundles(ctx, req.Name)
+	}
 	// The VM is gone: a volume move it left unresolved describes nothing.
 	// Only now: a delete that fails before its tombstone keeps the row, and
 	// with it the record and condition that guard its next start.

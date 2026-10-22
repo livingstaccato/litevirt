@@ -122,16 +122,12 @@ var _ LiveCaptureAPI = (*golibvirt.Libvirt)(nil)
 // holds or that has a pause record (o.Held), and re-suspends one it finds
 // running then. Otherwise it resumes only a guest it suspended itself.
 func CaptureMemorySnapshot(v LiveCaptureAPI, domainName, snapshotName, vmstatePath string, o CaptureOptions) (diskBytes, vmstateBytes int64, err error) {
-	dom, err := v.DomainLookupByName(domainName)
+	// Running, not paused, and no device whose state cannot be saved: a
+	// passthrough device is refused here, before the registry, the probe
+	// or any suspend (*PassthroughSnapshotError).
+	dom, err := liveSnapshotPreflight(v, domainName)
 	if err != nil {
-		return 0, 0, fmt.Errorf("lookup domain %q: %w", domainName, err)
-	}
-	state, _, _ := v.DomainGetState(dom, 0)
-	if state == int32(golibvirt.DomainPaused) {
-		return 0, 0, fmt.Errorf("domain %q is paused — a memory snapshot would resume it; resume it first", domainName)
-	}
-	if state != int32(golibvirt.DomainRunning) {
-		return 0, 0, fmt.Errorf("domain %q is not running — memory snapshot requires a running VM", domainName)
+		return 0, 0, err
 	}
 	reg := o.Registry
 	if reg == nil {

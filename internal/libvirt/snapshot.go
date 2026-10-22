@@ -687,6 +687,10 @@ func leafNotCurrent(v snapshotAPI, dom golibvirt.Domain, snap golibvirt.DomainSn
 // disk and RAM to this exact point. Returns (disk allocation bytes, vmstate
 // file bytes). See CaptureMemorySnapshot for the variants.
 //
+// A domain holding a passthrough device, whose state cannot be saved, is
+// refused before anything is done with a *PassthroughSnapshotError
+// (liveSnapshotPreflight).
+//
 // The capture pauses and resumes the guest, and records a point a revert
 // later starts it from, so the firmware move guard is asked for a resume and
 // a start before anything is done: a refusal of either refuses it, which is
@@ -698,6 +702,116 @@ func (c *Client) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string
 		}
 	}
 	return CaptureMemorySnapshot(c.virt, domainName, snapshotName, vmstatePath, o)
+}
+
+// snapshotPreflightAPI is what liveSnapshotPreflight reads.
+type snapshotPreflightAPI interface {
+	DomainLookupByName(name string) (golibvirt.Domain, error)
+	DomainGetState(dom golibvirt.Domain, flags uint32) (int32, int32, error)
+	DomainGetXMLDesc(dom golibvirt.Domain, flags golibvirt.DomainXMLFlags) (string, error)
+}
+
+// liveSnapshotPreflight is everything a memory snapshot checks before it
+// freezes the guest: the domain is running, not paused, and holds no device
+// whose state cannot be saved. Nothing here suspends, snapshots or saves.
+func liveSnapshotPreflight(v snapshotPreflightAPI, domainName string) (golibvirt.Domain, error) {
+	dom, err := v.DomainLookupByName(domainName)
+	if err != nil {
+		return dom, fmt.Errorf("lookup domain %q: %w", domainName, err)
+	}
+	state, _, _ := v.DomainGetState(dom, 0)
+	if state == int32(golibvirt.DomainPaused) {
+		// The capture ends by resuming the guest. A paused domain is paused by
+		// someone — an operator, or this host's partition pause, which must
+		// keep it stopped — so a memory snapshot of it is refused rather than
+		// resuming it behind their back (docs/design/partition-pause.md §3.3).
+		return dom, fmt.Errorf("domain %q is paused — a memory snapshot would resume it; resume it first", domainName)
+	}
+	if state != int32(golibvirt.DomainRunning) {
+		return dom, fmt.Errorf("domain %q is not running — memory snapshot requires a running VM", domainName)
+	}
+	// libvirt refuses to save a domain holding a passthrough device, but only
+	// when the save starts: after the suspend and the overlay cutover, which
+	// would leave the guest on an overlay no snapshot completed. Judged on the
+	// live definition, which holds hot-attached devices too; one that cannot
+	// be read or parsed refuses the snapshot.
+	x, err := v.DomainGetXMLDesc(dom, 0)
+	if err != nil {
+		return dom, fmt.Errorf("memory snapshot of %q: read its definition to check for passthrough devices: %w", domainName, err)
+	}
+	blockers, err := MemorySnapshotBlockers(x)
+	if err != nil {
+		return dom, fmt.Errorf("memory snapshot of %q: parse its definition to check for passthrough devices: %w", domainName, err)
+	}
+	if len(blockers) > 0 {
+		return dom, &PassthroughSnapshotError{Domain: domainName, Devices: blockers}
+	}
+	return dom, nil
+}
+
+// PassthroughSnapshotError refuses a memory snapshot of a domain holding
+// devices whose state cannot be saved with its RAM.
+type PassthroughSnapshotError struct {
+	Domain  string
+	Devices []string // as MemorySnapshotBlockers names them
+}
+
+func (e *PassthroughSnapshotError) Error() string {
+	return fmt.Sprintf("domain %q has passthrough devices whose state cannot be saved with its memory (%s)",
+		e.Domain, strings.Join(e.Devices, ", "))
+}
+
+// MemorySnapshotBlockers names each device in domXML that keeps libvirt from
+// saving the domain's state (qemuMigrationSrcIsAllowedHostdev): every
+// <hostdev> but a USB one ("pci <bdf>", or its type), and every
+// <interface type='hostdev'> or 'vdpa' ("interface <type> <mac>"). An unparseable
+// document is an error, never a domain without such devices.
+func MemorySnapshotBlockers(domXML string) ([]string, error) {
+	var d struct {
+		Hostdevs []struct {
+			Type   string `xml:"type,attr"`
+			Source struct {
+				Address struct {
+					Domain   string `xml:"domain,attr"`
+					Bus      string `xml:"bus,attr"`
+					Slot     string `xml:"slot,attr"`
+					Function string `xml:"function,attr"`
+				} `xml:"address"`
+			} `xml:"source"`
+		} `xml:"devices>hostdev"`
+		Interfaces []struct {
+			Type string `xml:"type,attr"`
+			MAC  struct {
+				Address string `xml:"address,attr"`
+			} `xml:"mac"`
+		} `xml:"devices>interface"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, h := range d.Hostdevs {
+		switch a := h.Source.Address; {
+		case h.Type == "usb":
+		case h.Type == "pci" && a.Bus != "":
+			strip := func(v string) string { return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(v)), "0x") }
+			out = append(out, "pci "+strip(a.Domain)+":"+strip(a.Bus)+":"+strip(a.Slot)+"."+strip(a.Function))
+		case h.Type == "":
+			out = append(out, "hostdev")
+		default:
+			out = append(out, h.Type)
+		}
+	}
+	for _, i := range d.Interfaces {
+		// hostdev: a VF attached directly; vdpa: "vDPA devices cannot be
+		// migrated". Not caught: a VF from a <forward mode='hostdev'> network
+		// pool, which the live definition shows as type 'network'; litevirt
+		// renders none, so only an imported or adopted domain could have one.
+		if i.Type == "hostdev" || i.Type == "vdpa" {
+			out = append(out, strings.TrimSpace("interface "+i.Type+" "+i.MAC.Address))
+		}
+	}
+	return out, nil
 }
 
 // RevertToLiveSnapshot reverts disk AND RAM to a memory snapshot taken by

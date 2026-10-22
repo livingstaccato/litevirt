@@ -166,7 +166,9 @@ type Client struct {
 	// fallback in ResolvePeerTarget is what lets a node dial a peer whose hosts row
 	// has not replicated yet — the bootstrap case — and it had no test at all,
 	// because a harness without a real memberlist can never reach that branch.
-	membersForTests func() []PeerInfo
+	// Atomic: a test may swap it while the replicator and anti-entropy loops
+	// read it.
+	membersForTests atomic.Pointer[func() []PeerInfo]
 	// gossipForTests overrides the RAW memberlist view that Members() filters
 	// through admission. See SetGossipForTests.
 	gossipForTests func() []PeerInfo
@@ -1096,12 +1098,14 @@ func (c *Client) initClockPersistence() error {
 		// DELIBERATE fail-closed decision: when the monotonic ceiling can't be
 		// persisted AND the in-memory headroom is exhausted, exit rather than emit an
 		// LWW key below the last durable ceiling (which would silently lose updates
-		// after a restart). Sustained failure (e.g. a full dataDir disk) therefore
-		// crash-loops the daemon — an accepted trade-off: the SQLite state DB lives on
-		// the SAME filesystem, so a full disk already fails authoritative writes; a loud
-		// crash surfaces it instead of silently corrupting LWW ordering. Recovery = free
-		// space (or, as a last resort, delete <dataDir>/nowts.hwm to reset the ceiling,
-		// re-opening the regression window until wall time passes the old ceiling).
+		// after a restart). A full disk does not get here: a save overwrites
+		// nowts.hwm in place and needs no new space (hwm.go). What does is an error
+		// the store cannot write around (EIO, a read-only remount, or a file that a
+		// full disk kept from being created or converted to the in-place layout), and
+		// a loud crash surfaces it instead of silently corrupting LWW ordering.
+		// Recovery = fix the filesystem (or, as a last resort, delete
+		// <dataDir>/nowts.hwm to reset the ceiling, re-opening the regression window
+		// until wall time passes the old ceiling).
 		c.onPersistFatal = func(err error) {
 			slog.Error("nowts: monotonic clock persistence failing and headroom exhausted — exiting to avoid a silent lost update", "error", err)
 			os.Exit(1)
@@ -1117,6 +1121,13 @@ func (c *Client) initClockPersistence() error {
 	}
 	if found {
 		c.lastTS, c.durableTS, c.durableHLCMS = lww, lww, hlcMS
+	}
+	// Convert or create the file now, so later saves overwrite it in place and a full
+	// disk cannot fail them. Failing here changes nothing: the file keeps its ceilings
+	// and the next save retries the conversion.
+	if err := c.hwm.prepare(); err != nil {
+		slog.Warn("nowts: could not convert the clock high-water file to its in-place layout; saves keep needing new disk space until it converts",
+			"path", c.hwm.path, "error", err)
 	}
 	if c.clock != nil {
 		// The HLC clock shares nowts.hwm; a sustained persist failure there is the same
@@ -2173,8 +2184,8 @@ func (c *Client) MembershipChanged() <-chan struct{} {
 // changed — bootstrap-trusted before this node learned the cluster, tombstoned
 // by a removal, or re-addressed by a re-admission.
 func (c *Client) Members() []PeerInfo {
-	if fn := c.membersForTests; fn != nil {
-		return fn()
+	if fn := c.membersForTests.Load(); fn != nil && *fn != nil {
+		return (*fn)()
 	}
 	var raw []PeerInfo
 	if fn := c.gossipForTests; fn != nil {
@@ -2208,7 +2219,14 @@ func (c *Client) Members() []PeerInfo {
 // SetMembersForTests injects the ADMITTED membership view directly, bypassing
 // admission — for tests that model what a node has already let in. Test-only;
 // production membership comes from memberlist.
-func (c *Client) SetMembersForTests(fn func() []PeerInfo) { c.membersForTests = fn }
+// It may be called while the client is in use.
+func (c *Client) SetMembersForTests(fn func() []PeerInfo) {
+	if fn == nil {
+		c.membersForTests.Store(nil)
+		return
+	}
+	c.membersForTests.Store(&fn)
+}
 
 // SetWallClockForTests makes now this node's wall clock, for its row stamps
 // and its HLC alike: a node whose clock runs ahead or behind. It takes no lock

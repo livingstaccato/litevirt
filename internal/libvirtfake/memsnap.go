@@ -246,6 +246,10 @@ func (c captureAPI) DomainGetXMLDesc(dom golibvirt.Domain, _ golibvirt.DomainXML
 	c.f.mu.Lock()
 	defer c.f.mu.Unlock()
 	x := c.f.liveXMLLocked(dom.Name)
+	if strings.TrimSpace(x) == "" {
+		// libvirt always has a definition for a domain it knows.
+		x = "<domain><name>" + dom.Name + "</name></domain>"
+	}
 	m := c.f.memLocked(dom.Name)
 	if !memoryElemRe.MatchString(x) && m.model.RAMBytes > 0 {
 		// The model's RAM, where the definition does not give it.
@@ -291,6 +295,12 @@ func (c captureAPI) DomainSnapshotCreateXML(dom golibvirt.Domain, x string, flag
 	if !active || len(mm) < 2 || flags&uint32(golibvirt.DomainSnapshotCreateDiskOnly) != 0 {
 		f.mu.Unlock()
 		return golibvirt.DomainSnapshot{}, fmt.Errorf("libvirtfake: a capture takes an external memory snapshot of an active domain (flags %#x)", flags)
+	}
+	// libvirt's own refusal (qemuMigrationSrcIsAllowed), reached only when the
+	// capture's preflight is bypassed: before any state changes.
+	if b, berr := libvirt.MemorySnapshotBlockers(f.liveXMLLocked(name)); berr == nil && len(b) > 0 {
+		f.mu.Unlock()
+		return golibvirt.DomainSnapshot{}, errors.New("Requested operation is not valid: cannot migrate a domain with <hostdev mode='subsystem' type='pci'>")
 	}
 	file := mm[1]
 	snapName := ""

@@ -148,6 +148,38 @@ func liveLeaseElsewhere(rows []peerLeaseRow, self, now string) (peerLeaseRow, bo
 	return found, ok
 }
 
+// clusterOfOneBut is clusterOfOne for a decision about subject, a host whose
+// admission this node may itself have just written: subject's row does not
+// make this node "not alone" while it is still 'joining' — admitted by `lv
+// host add`, its daemon never booted — and, when serial is set, while it holds
+// that certificate (the admission being asked about again). A joining host has
+// written nothing: a daemon that had booted would have recorded it active and
+// would be a gossip member. Without this, a founder that has never had a peer
+// (whose replica therefore never completes a catch-up) wedged on its first
+// `lv host add`: the add's first AdmitHost wrote the joining row, and its re-ask
+// before the install, and `lv host rm` of the half-admitted host, both found it
+// no longer alone. Any gossip member, any other host, or another admission of
+// subject still means it is not.
+func (s *Server) clusterOfOneBut(ctx context.Context, subject, serial string) (bool, error) {
+	if len(s.db.Members()) > 0 {
+		return false, nil
+	}
+	hosts, err := corrosion.ListHosts(ctx, s.db)
+	if err != nil {
+		return false, err
+	}
+	for _, h := range hosts {
+		if h.Name == s.hostName {
+			continue
+		}
+		if h.Name == subject && h.State == corrosion.HostStateJoining && (serial == "" || sameSerial(h.CertSerial, serial)) {
+			continue
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
 // clusterOfOne reports whether this node has no peer at all: no other host in
 // its hosts table AND no gossip member. Both, because each alone can be empty
 // on a node that does have peers — the hosts table on a node that has joined

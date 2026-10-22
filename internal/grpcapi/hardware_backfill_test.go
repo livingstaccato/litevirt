@@ -30,7 +30,7 @@ func backfillServer(t *testing.T) (*Server, *libvirtfake.Fake) {
 // hostdevXML renders one <hostdev> whose source address is bdf, in the exact
 // 0x-attribute form libvirt emits (see xmlgen's marshalNewHostdev).
 func hostdevXML(bdf string) string {
-	p := libvirt.ParsePCIAddress(bdf)
+	p, _ := libvirt.ParsePCIAddress(bdf)
 	return fmt.Sprintf(
 		`<hostdev mode='subsystem' type='pci' managed='yes'><source><address domain='%s' bus='%s' slot='%s' function='%s'/></source></hostdev>`,
 		p.Domain, p.Bus, p.Slot, p.Function)

@@ -351,7 +351,7 @@ VM's record names for --disk, which is restored as --in-place restores it.`,
 // stops and the overlay is fully self-contained.
 func newBackupRestoreLiveCmd() *cobra.Command {
 	var repo, vm, disk, ts, target, bind, newName string
-	var autoStart, blockpull, fromExisting bool
+	var autoStart, blockpull, fromExisting, withoutDevices bool
 	cmd := &cobra.Command{
 		Use:   "restore-live",
 		Short: "Serve a backup manifest as a live NBD source + qcow2 overlay",
@@ -362,7 +362,9 @@ server when the operator has finished pulling data locally.
 
 With --auto-start the daemon also defines and starts the VM against
 the overlay (from the manifest's embedded spec, or --name for a
-collision-avoiding rename). --blockpull then localizes the disk and
+collision-avoiding rename). The backup's PCI passthrough devices are
+attached from this host's inventory, and the restore is refused if one
+is not available; --without-devices starts the VM without them instead. --blockpull then localizes the disk and
 tears the NBD server down automatically when it completes.
 
 The overlay is a new file the daemon names under <data_dir>/disks; the
@@ -376,12 +378,16 @@ existing file there is refused, never replaced.`,
 					return fmt.Errorf("%s is required", name)
 				}
 			}
+			if withoutDevices && !autoStart {
+				return fmt.Errorf("--without-devices starts the restored VM without its PCI devices; it needs --auto-start")
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				stream, err := c.RestoreLive(ctx, &pb.RestoreLiveRequest{
 					RepoPath: repo, VmName: vm, DiskName: disk, Timestamp: ts,
 					TargetPath: target, BindAddr: bind,
 					AutoStart: autoStart, NewName: newName,
 					Blockpull: blockpull, FromExisting: fromExisting,
+					WithoutDevices: withoutDevices,
 				})
 				if err != nil {
 					return err
@@ -419,5 +425,6 @@ existing file there is refused, never replaced.`,
 	cmd.Flags().StringVar(&newName, "name", "", "Rename the restored VM (avoids collision with the original)")
 	cmd.Flags().BoolVar(&blockpull, "blockpull", false, "After start, localize the disk via blockpull then stop NBD")
 	cmd.Flags().BoolVar(&fromExisting, "from-existing", false, "Fall back to an existing vms record for the spec")
+	cmd.Flags().BoolVar(&withoutDevices, "without-devices", false, "With --auto-start: start the VM without the backup's PCI passthrough devices (removed from its spec, audited)")
 	return cmd
 }

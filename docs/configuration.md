@@ -446,6 +446,32 @@ enforcement:
                               # is the kill switch: that host pauses nothing and recovers an
                               # assumed fence at once, as before. See
                               # design/partition-pause.md.
+  partition_pause_record_failure: pause
+                              # What a partition pause does when its record under
+                              # <data_dir>/partition-pause cannot be written (a full or
+                              # failing disk). The majority relies on the pause, never on
+                              # the record, which only decides what this host resumes.
+                              # pause (default): pause anyway, keeping the record in the
+                              # reserve (<data_dir>/partition-pause/reserve, 1 MiB made at
+                              # the pauser's first pass while there is room) or, failing
+                              # that, in memory, and write it to the directory once a write
+                              # succeeds. A daemon that dies holding a record in memory only
+                              # comes back to a paused VM with no record, which it never
+                              # resumes itself. reserve: the record must be in the directory
+                              # or the reserve before the pause; with neither writable the
+                              # pause fails. self_fence: the directory only, and a write that
+                              # fails is a failed pause (partition_pause_failed, and a
+                              # self-fence), the behaviour before this key. reserve and
+                              # self_fence need a verified watchdog: without one armed they
+                              # pause as pause does, with the record in memory, and log
+                              # fallback=no_verified_watchdog. A write that has not returned
+                              # within 2 s (less when the pass is short of time) counts as
+                              # failed. The reserve holds 1024 records; more at once are
+                              # held in memory (warned once). It works where blocks are
+                              # overwritten in place: ext4, xfs, and btrfs (made no-COW).
+                              # On zfs it is best effort: give data_dir its own dataset with
+                              # a refreservation, or rely on pause. Any other value fails the
+                              # config load.
   console_password: true      # DEFAULT ON. Give the VNC and SPICE consoles of every domain
                               # this host defines a fresh per-VM password, so a local process
                               # or user on the host can no longer open a console on its

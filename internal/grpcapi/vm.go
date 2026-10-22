@@ -1379,6 +1379,11 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	// PCI device passthrough.
 	var pciIntents []corrosion.PCIIntentRecord
+	// pciHeld: the domain may be running with the devices. Until its start is
+	// tried, and again once abortDefined has proven it stopped or gone, a
+	// failed create gives its devices back at once (owner-scoped); a domain
+	// that could not be stopped keeps them.
+	pciHeld := false
 	if len(spec.Devices) > 0 {
 		pciAddrs, devFinish, devErr := s.allocateDevices(ctx, spec.Name, spec.Devices, deviceLeaseStageBound)
 		if devErr != nil {
@@ -1388,10 +1393,16 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		// Clear the durable device lease once create returns; a crash before the
 		// VM row is finalized leaves it for startup recovery to roll back.
-		// Cleared on every return, a failed create's too: the device stays
-		// owned and bound under the name, and a lease left behind would have
-		// startup recovery unbind it from a guest that could not be stopped.
+		// Cleared on every return, a failed create's too: a lease left behind
+		// would have startup recovery unbind the device from a guest that
+		// could not be stopped. The release below is the one that runs only
+		// off a guest that is not running.
 		defer devFinish()
+		defer func() {
+			if !pciHeld {
+				s.releaseAllocatedDevices(ctx, "create", spec.Name, pciAddrs)
+			}
+		}()
 		for _, addr := range pciAddrs {
 			vmCfg.Hostdevs = append(vmCfg.Hostdevs, lv.HostdevConfig{Address: addr})
 		}
@@ -1521,10 +1532,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			return fmt.Errorf("%w; %s, so the disks at this create's paths were not touched", cause, why)
 		}
 		if !s.virt.DomainExists(spec.Name) {
+			pciHeld = false
 			return gone(fmt.Sprintf("domain %s no longer exists on %s", spec.Name, s.hostName))
 		}
 		x, xerr := s.virt.DumpXMLInactive(spec.Name)
 		if xerr != nil && lv.IsNotFound(xerr) && !s.virt.DomainExists(spec.Name) {
+			pciHeld = false
 			return gone(fmt.Sprintf("domain %s no longer exists on %s", spec.Name, s.hostName))
 		}
 		u := domainUUIDFromXML(x)
@@ -1554,6 +1567,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			}
 		}
 		noteUndo("domain stopped")
+		pciHeld = false // stopped: its devices go back
 		// While the stopped domain is still defined: the disks and seed
 		// this create made, and the vars its start made, at the domain's
 		// path and at the name-keyed path a Secure Boot or vTPM domain uses.
@@ -1612,6 +1626,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// create's guards, not records an earlier one of the name left.
 	defer s.noteCreatingIncarnation(spec.Name, spec.Uuid)()
 
+	pciHeld = true
 	if err := s.virt.StartDomain(spec.Name); err != nil {
 		// A failed first boot must not strand the domain, disks or TPM/NVRAM (G1).
 		return nil, status.Errorf(codes.Internal, "%v", abortDefined(fmt.Errorf("start domain: %w", err)))
@@ -2766,6 +2781,9 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 		defer conn.Close()
 		return client.StopVM(ctx, req)
 	}
+	if err := s.quarantinedForceStopRefusal(req.Name, req.Force); err != nil {
+		return nil, err
+	}
 	// A row that says migrating: a guest running here is stopped as before.
 	// Otherwise it may run on the move's target, which is asked first, before
 	// the lock (a peer RPC): a stop recorded here while it runs there would
@@ -2840,6 +2858,46 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 		s.resolveMigrationUnresolved(context.WithoutCancel(ctx), vm.Name)
 	}
 	return out, err
+}
+
+// stopQuarantineReason is why this host refuses replicated writes, or "".
+// While it is non-empty a stop's "operator-stop" record cannot land: the row
+// keeps "running", and once the quarantine lifts the reconciler records the
+// stopped domain by libvirt's reason. A clean guest shutdown is recorded as
+// one and sticks; a destroyed domain is recorded as an out-of-band destroy,
+// which the restart policy starts again.
+func (s *Server) stopQuarantineReason() string {
+	if s.db == nil {
+		return ""
+	}
+	return s.db.WriteQuarantineReason()
+}
+
+// quarantineRemedy is how the write quarantine behind reason lifts: release
+// probation lifts by itself once a voter majority has confirmed it; any
+// other quarantine needs this host upgraded again or reseeded.
+func (s *Server) quarantineRemedy() string {
+	if s.db != nil && s.db.InReleaseProbation() && !s.db.WALQuarantined() {
+		return "wait for its release probation, which lifts by itself once a voter majority has been asked (`lv cluster upgrade-status`)"
+	}
+	return "upgrade this host's binary again or reseed the host (docs/upgrades.md)"
+}
+
+// quarantinedForceStopRefusal refuses `lv stop --force` on a host in write
+// quarantine, before anything reaches libvirt: the destroy could not be
+// recorded as the operator's, and the restart policy would undo it (above).
+// A graceful stop still runs (stopLocked never force-kills it while the
+// quarantine holds).
+func (s *Server) quarantinedForceStopRefusal(name string, force bool) error {
+	reason := s.stopQuarantineReason()
+	if !force || reason == "" {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"VM %q was not stopped: this host is in write quarantine (%s) and cannot record a forced stop, "+
+			"which its restart policy would then undo; the guest is left running. A graceful `lv stop %s` "+
+			"still shuts the guest down; or %s, then retry `lv stop --force %s`",
+		name, reason, name, s.quarantineRemedy(), name)
 }
 
 // stopVMLocked stops a LOCAL VM (force ⇒ destroy, else graceful shutdown with a
@@ -2919,6 +2977,15 @@ func (s *Server) stopLocked(ctx context.Context, vm *corrosion.VMRecord, force b
 		timeout := resolveStopTimeout(timeoutSec, vm.Spec)
 		if timeout > 0 {
 			if !s.virt.WaitForShutdown(vm.Name, time.Duration(timeout)*time.Second) {
+				// Under write quarantine the kill could not be recorded as
+				// the operator's, and the restart policy would undo it.
+				if reason := s.stopQuarantineReason(); reason != "" {
+					return nil, status.Errorf(codes.FailedPrecondition,
+						"VM %q did not shut down within %ds and was not force-killed: this host is in write quarantine (%s), "+
+							"so a kill could not be recorded and its restart policy would undo it; the guest is left running. "+
+							"Shut it down from inside the guest, or %s",
+						vm.Name, timeout, reason, s.quarantineRemedy())
+				}
 				slog.Info("ACPI shutdown timed out, force-killing", "vm", vm.Name, "timeout_sec", timeout)
 				_ = s.virt.DestroyDomain(vm.Name)
 			}
@@ -2994,6 +3061,13 @@ func (s *Server) stopLocked(ctx context.Context, vm *corrosion.VMRecord, force b
 	// the VM (#29), so this one is fail-closed: retry, then surface an error if it
 	// still can't land, rather than signal a clean stop.
 	if err := s.persistVMState(ctx, vm.Name, "stopped", "operator-stop", corrosion.OpVMState); err != nil {
+		if reason := s.stopQuarantineReason(); reason != "" {
+			return nil, status.Errorf(codes.Internal,
+				"stopped but recording operator-stop failed: this host is in write quarantine (%s). The guest is shut down "+
+					"and stays down: once the quarantine lifts it is recorded stopped by the reconciler, not as an operator stop, "+
+					"so an onboot VM starts at the next host boot. To record stops again, %s: %v",
+				reason, s.quarantineRemedy(), err)
+		}
 		return nil, status.Errorf(codes.Internal, "stopped but recording operator-stop failed: %v", err)
 	}
 	evDetail := note

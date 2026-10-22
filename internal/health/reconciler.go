@@ -91,6 +91,9 @@ type Reconciler struct {
 	// captures is the host's memory snapshot capture registry
 	// (SetCaptureRegistry).
 	captures *lv.CaptureRegistry
+	// ioPausedWarn rate-limits the io-paused sweep's write-failure
+	// warnings (io_paused.go).
+	ioPausedWarn ioPausedWarnings
 	// stopSyncHook, test-only, runs between the out-of-band stop sync's
 	// decision and its write, where a concurrent `lv stop` can land.
 	stopSyncHook func(ctx context.Context, vmName string)
@@ -577,6 +580,7 @@ func (r *Reconciler) reconcilePass(ctx context.Context) {
 	// the ones litevirt created that have none. Neither touches the runtime.
 	r.adoptManagedDomains(ctx)
 	r.reportOrphanRuntimes(ctx)
+	r.reportIOPausedVMs(ctx)
 	r.resolveGoneSubjects(ctx)
 }
 

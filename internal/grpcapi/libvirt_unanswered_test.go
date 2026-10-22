@@ -96,7 +96,10 @@ func unansweredPanicRuns(t *testing.T, test, mode string) {
 	t.Helper()
 	for i := 0; i < 20; i++ {
 		cmd := exec.Command(os.Args[0], "-test.run=^"+test+"$", "-test.count=1")
-		cmd.Env = append(os.Environ(), unansweredPanicChild+"="+mode)
+		// The child crashes, so its own t.TempDir cleanup never runs. Point
+		// its TMPDIR into this test's temp dir so the parent removes what the
+		// crash leaves behind.
+		cmd.Env = append(os.Environ(), unansweredPanicChild+"="+mode, "TMPDIR="+t.TempDir())
 		out, err := cmd.CombinedOutput()
 		if err == nil {
 			t.Fatalf("run %d: the child did not crash:\n%s", i, out)

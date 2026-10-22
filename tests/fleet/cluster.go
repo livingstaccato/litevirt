@@ -189,6 +189,14 @@ type Options struct {
 	// a joiner by anti-entropy and by nothing else. New does not wait for the
 	// gossip mesh to form; whether it does is the scenario's question.
 	Joiners int
+	// RealCatchUp starts every replica the way a real daemon's starts: not
+	// caught up (corrosion.Client.ReplicaCaughtUp), until a completed
+	// anti-entropy exchange says it is. Off (the default), the fleet
+	// bootstraps as a cluster that has already converged. A founder alone in
+	// its cluster never completes an exchange, so every gate that waits for
+	// one meets it as it does on a real first host. A founder, lone-node or
+	// first-add scenario sets it; rebuildWithEmptyDB honours it too.
+	RealCatchUp bool
 }
 
 // isJoiner reports whether n is one of Options.Joiners.
@@ -799,7 +807,9 @@ func (c *Cluster) openDB(n *Node, shared bool) {
 	// replica starts caught up; without this every workload mutation would be
 	// refused by the stale-replica gate (grpcapi/replica_gate.go). A scenario
 	// modelling a rejoin calls n.DB.MarkReplicaStale itself.
-	db.MarkReplicaCaughtUpForTests("fleet-bootstrap")
+	if !c.opts.RealCatchUp {
+		db.MarkReplicaCaughtUpForTests("fleet-bootstrap")
+	}
 	// Bootstrapped together as members holding the cluster's history, which a
 	// real daemon is by genesis or by its first start on this build.
 	db.MarkAuditSeededForTests()

@@ -203,6 +203,13 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 			opts.CaptureSuspended = captureFW
 		}
 		sizeBytes, vmstateBytes, err = s.virt.CreateLiveSnapshot(req.VmName, req.Name, vmstatePath, opts)
+		// A passthrough device is refused before the freeze: nothing was cut
+		// over, so there is no overlay or row to account for.
+		var pe *lv.PassthroughSnapshotError
+		if errors.As(err, &pe) {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"%v: a memory snapshot is not possible; take a disk-only snapshot instead (omit --memory; a Secure Boot or vTPM VM must be stopped for one), or detach the devices first", pe)
+		}
 		snapType = "memory"
 		// A failure after libvirt took the snapshot (the firmware capture,
 		// the resume) leaves the disks on their overlays — treat as created

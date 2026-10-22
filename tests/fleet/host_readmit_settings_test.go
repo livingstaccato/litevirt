@@ -66,7 +66,9 @@ func rebuildWithEmptyDBLinks(t *testing.T, c *Cluster, n, peer *Node, heal bool)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema for rebuilt %s: %v", n.Name, err)
 	}
-	db.MarkReplicaCaughtUpForTests("fleet-rebuild")
+	if !c.opts.RealCatchUp {
+		db.MarkReplicaCaughtUpForTests("fleet-rebuild")
+	}
 	db.SetCredentialsSplitGate(func() bool { return true })
 	n.DB = db
 

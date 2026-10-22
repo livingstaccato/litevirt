@@ -124,7 +124,9 @@ func TestLBStandIns_KilledTestLeavesNoneBehind(t *testing.T) {
 	}
 	dirFile := filepath.Join(t.TempDir(), "dir")
 	cmd := exec.Command(os.Args[0], "-test.run", "^TestLBStandIns_KilledTestLeavesNoneBehind$")
-	cmd.Env = append(os.Environ(), "LB_STANDIN_HELPER=1", "LB_STANDIN_DIRFILE="+dirFile)
+	// The helper is killed before its t.TempDir cleanup runs: give it a TMPDIR
+	// under this test's temp dir so the parent removes what it leaves.
+	cmd.Env = append(os.Environ(), "LB_STANDIN_HELPER=1", "LB_STANDIN_DIRFILE="+dirFile, "TMPDIR="+t.TempDir())
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}

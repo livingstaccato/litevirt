@@ -183,27 +183,21 @@ func TestPatchBootDev_MissingCloseOS(t *testing.T) {
 // ── ParsePCIAddress additional edge cases ──
 
 func TestParsePCIAddress_EmptyString(t *testing.T) {
-	got := ParsePCIAddress("")
-	want := ParsedPCIAddr{Domain: "0x0000", Bus: "0x00", Slot: "0x00", Function: "0x0"}
-	if got != want {
-		t.Errorf("ParsePCIAddress(\"\") = %+v, want %+v", got, want)
+	if got, ok := ParsePCIAddress(""); ok {
+		t.Errorf("ParsePCIAddress(\"\") = %+v, want refused", got)
 	}
 }
 
 func TestParsePCIAddress_SingleColon(t *testing.T) {
-	got := ParsePCIAddress("0000:41")
-	want := ParsedPCIAddr{Domain: "0x0000", Bus: "0x00", Slot: "0x00", Function: "0x0"}
-	if got != want {
-		t.Errorf("ParsePCIAddress(\"0000:41\") = %+v, want %+v", got, want)
+	if got, ok := ParsePCIAddress("0000:41"); ok {
+		t.Errorf("ParsePCIAddress(\"0000:41\") = %+v, want refused", got)
 	}
 }
 
 func TestParsePCIAddress_NoFunction(t *testing.T) {
-	// Slot without dot-function suffix.
-	got := ParsePCIAddress("0000:03:1a")
-	want := ParsedPCIAddr{Domain: "0x0000", Bus: "0x03", Slot: "0x1a", Function: "0x0"}
-	if got != want {
-		t.Errorf("got %+v, want %+v", got, want)
+	// Slot without dot-function suffix: not a BDF.
+	if got, ok := ParsePCIAddress("0000:03:1a"); ok {
+		t.Errorf("ParsePCIAddress(\"0000:03:1a\") = %+v, want refused", got)
 	}
 }
 

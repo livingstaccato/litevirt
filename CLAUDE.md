@@ -128,7 +128,7 @@ finally failed.
 Hardening features are gated on cluster-wide capability tokens
 (`internal/capabilities`). The pattern is uniform:
 
-- each has an `enforcement.*` config flag, default **false**. There are five
+- each has an `enforcement.*` config flag, default **false**. There are six
   exceptions, which default **true** (the preset in `LoadConfig`,
   `internal/daemon/config.go`), and an explicit `false` is the kill switch of
   each:
@@ -158,6 +158,15 @@ Hardening features are gated on cluster-wide capability tokens
     anti-entropy row digest is negotiated pairwise by wire-field presence, so a
     non-uniform rollout is safe; with it off, replicas founded at different
     schema versions disagree about identical rows forever.
+  - `enforcement.project_adoption`: not a capability token's flag. It gates
+    this host's own adoption pass, which gives each project created before
+    `project_incarnation_v1` latched its stable incarnation (the release
+    feature `project_adoption` of `release_2027_01_v1`). An explicit `false`
+    holds the local pass off; it keeps a rollback below `release_2027_01_v1`
+    open only while it is false on every host. `release_2027_01_v1` is not
+    withheld while the flag is off: no host relies on a peer adopting
+    (docs/upgrades.md, "Projects created before the upgrade get a stable
+    identity").
 - **advertising is not enforcing.** Most tokens are advertised on the strength
   of the BUILD, whatever the local flag says, so the cluster can latch them —
   the node's own flag then decides whether it acts. A latched token therefore

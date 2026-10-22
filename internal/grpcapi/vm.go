@@ -609,15 +609,23 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	var diskConfigs []lv.DiskConfig
 	var diskRecords []corrosion.DiskRecord
 	var createdDiskPaths []string
-	// createdDiskFile is the file each host-local disk this create made is
-	// (its identity, read right after it was made; madeFileID): a failed
-	// create removes a path only while that file is still there, never
-	// another create's or domain's file that took the path since.
-	createdDiskFile := map[string]madeFileID{}
+	// createdDiskFile is the file each host-local disk this create made is,
+	// held open from right after it was made until the create returns
+	// (pinnedFile): a failed create removes a path only while that file is
+	// still there, never another create's or domain's file that took the
+	// path since. Only a held file's inode cannot be given to that other
+	// file, which would then read as this create's own.
+	createdDiskFile := map[string]*pinnedFile{}
+	defer func() {
+		for _, pf := range createdDiskFile {
+			pf.release()
+		}
+	}()
 	recordDisk := func(p string) {
 		createdDiskPaths = append(createdDiskPaths, p)
-		if id, ok := madeFileIdentity(p); ok {
-			createdDiskFile[p] = id
+		if pf, ok := pinFile(p); ok {
+			createdDiskFile[p].release()
+			createdDiskFile[p] = pf
 		}
 	}
 	// A disk that is not a file (an rbd image) is removed by the driver that
@@ -685,11 +693,10 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				noteUndo("removed disk " + p)
 				continue
 			}
-			made, ok := createdDiskFile[p]
 			if _, serr := os.Lstat(p); serr != nil && os.IsNotExist(serr) {
 				continue
 			}
-			if !ok || !made.stillAt(p) {
+			if !createdDiskFile[p].stillAt(p) {
 				noteUndo("disk " + p + " left: it is no longer the file this create made")
 				continue
 			}

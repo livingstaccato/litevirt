@@ -586,7 +586,19 @@ func (f *Fake) DefineDomain(xmlConfig string) error {
 	if f.FillDefine != nil {
 		xmlConfig = f.FillDefine(xmlConfig)
 	}
-	f.domains[name] = StateDefined
+	// virDomainDefineXML on an ACTIVE domain updates only its persistent
+	// config (qemuDomainDefineXMLFlags stores it as vm->newDef, applied at the
+	// next boot): the domain keeps running or paused, and its live XML stays
+	// the one it booted with. Only an inactive (or new) domain becomes defined.
+	if st := f.domains[name]; st == StateRunning || st == StatePaused {
+		if _, ok := f.activeXML[name]; !ok {
+			if prev, had := f.xml[name]; had {
+				f.activeXML[name] = prev
+			}
+		}
+	} else {
+		f.domains[name] = StateDefined
+	}
 	f.xml[name] = xmlConfig
 	f.record("define", name, "")
 	return nil

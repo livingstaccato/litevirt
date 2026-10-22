@@ -204,3 +204,53 @@ func TestFake_DefineRefusesWhatLibvirtRefuses(t *testing.T) {
 		t.Errorf("a definition with no uuid was stored with none: %s", x)
 	}
 }
+
+// A redefine of an ACTIVE domain updates its persistent definition only: it
+// keeps its runtime state and its live XML (virDomainDefineXML applies the new
+// config at the next boot).
+func TestFake_RedefineKeepsActiveRuntimeState(t *testing.T) {
+	const (
+		v1 = `<domain><name>vm1</name><uuid>uuid-one</uuid><memory>1</memory></domain>`
+		v2 = `<domain><name>vm1</name><uuid>uuid-one</uuid><memory>2</memory></domain>`
+	)
+	for _, tc := range []struct {
+		name  string
+		setup func(f *Fake)
+	}{
+		{"running", func(f *Fake) {}},
+		{"paused", func(f *Fake) { f.SetPaused("vm1") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := New()
+			if err := f.DefineDomain(v1); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.StartDomain("vm1"); err != nil {
+				t.Fatal(err)
+			}
+			tc.setup(f)
+			if err := f.DefineDomain(v2); err != nil {
+				t.Fatal(err)
+			}
+			if active, err := f.DomainIsActive("vm1"); err != nil || !active {
+				t.Fatalf("a redefined %s domain must stay active: active=%v err=%v", tc.name, active, err)
+			}
+			st, err := f.DomainStateReason("vm1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.name == "paused" && st.Reason != "paused" {
+				t.Errorf("redefined paused domain reason = %q, want paused", st.Reason)
+			}
+			if tc.name == "running" && st.State != "running" {
+				t.Errorf("redefined running domain state = %q, want running", st.State)
+			}
+			if got := f.DefinedXML("vm1"); got != v2 {
+				t.Errorf("persistent definition not updated: %s", got)
+			}
+			if live := f.liveXMLLocked("vm1"); live != v1 {
+				t.Errorf("live XML must stay the booted one, got %s", live)
+			}
+		})
+	}
+}

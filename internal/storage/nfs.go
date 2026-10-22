@@ -67,7 +67,9 @@ func (d *nfsDriver) Teardown(ctx context.Context) error {
 		}
 		return nfsCommandError("check nfs mountpoint", mountDir, err, out)
 	}
-	if out, err := run(commandCtx, "umount", "--", mountDir); err != nil {
+	out, err := run(commandCtx, "umount", "--", mountDir)
+	invalidateMountCache()
+	if err != nil {
 		if commandCtx.Err() != nil {
 			return nfsCommandError("umount nfs", mountDir, commandCtx.Err(), out)
 		}
@@ -131,7 +133,9 @@ func (d *nfsDriver) Prepare(ctx context.Context) error {
 		warnNoNosymfollow(d.mountDir)
 	}
 	try := func(opts string) ([]byte, error) {
-		return run(commandCtx, "mount", "-t", "nfs", "-o", opts, "--", d.source, d.mountDir)
+		out, err := run(commandCtx, "mount", "-t", "nfs", "-o", opts, "--", d.source, d.mountDir)
+		invalidateMountCache()
+		return out, err
 	}
 	opts := mountOpts
 	if withSymfollow {
@@ -375,6 +379,7 @@ func (d *nfsDriver) remountWith(ctx context.Context, run cmdRunner, have, want [
 		}
 	}
 	out, err := run(ctx, "mount", "-o", "remount,bind,"+strings.Join(opts, ","), "--", d.mountDir)
+	invalidateMountCache()
 	if err != nil {
 		return nil, out, err
 	}

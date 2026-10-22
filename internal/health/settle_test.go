@@ -82,6 +82,31 @@ func newSettleFixture(t *testing.T) *settleFixture {
 	return f
 }
 
+// runningCopy turns the local copy into a RUNNING one on a host that never
+// paused: no pause record, identified by its managed stamp and owner-epoch
+// metadata (TestSettle_DomainMetadataIsEvidenceToo).
+func (f *settleFixture) runningCopy() {
+	f.t.Helper()
+	if err := RemovePauseRecord(f.dataDir, PauseKindVM, "vm-a"); err != nil {
+		f.t.Fatal(err)
+	}
+	f.virt.SetState("vm-a", libvirtfake.StateRunning)
+	if err := f.virt.SetDomainManagedIncarnation("vm-a", corrosion.IncarnationOf(f.row.CreatedAt), true); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := f.virt.SetDomainOwnerEpoch("vm-a", 3, true); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// onRunning is edit applied to a RUNNING local copy (runningCopy).
+func onRunning(edit func(f *settleFixture)) func(f *settleFixture) {
+	return func(f *settleFixture) {
+		f.runningCopy()
+		edit(f)
+	}
+}
+
 func (f *settleFixture) run() libvirtfake.State {
 	f.t.Helper()
 	f.r.selfFence(context.Background())
@@ -192,6 +217,11 @@ func TestSettle_TheLocalEpochIsTheHighestEvidence(t *testing.T) {
 // incarnation"; skip the epoch check — "older epoch"; skip the row-incarnation
 // check — "row is another incarnation"; accept an unknown identity — the two
 // "unknown" cases; skip the destination check — "proof for a third host".
+//
+// The cases wrapped in onRunning hold a RUNNING local copy (a host that never
+// paused, identified by its domain metadata): the replacement-runs clauses
+// (H2) protect a copy that runs, and a copy this host holds paused yields to
+// a live decided claim without them (TestSettle_APausedCopyYieldsToALiveDecidedClaim).
 func TestSettle_NeverWithoutPositiveProof(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -237,22 +267,87 @@ func TestSettle_NeverWithoutPositiveProof(t *testing.T) {
 		// prepared (the destination has not started it), have failed, or have
 		// been executed by someone other than its destination. Settling then
 		// would stop the ONLY running copy.
-		{"proof prepared, not executed", func(f *settleFixture) { f.proof.Status = corrosion.ProofPrepared; f.proof.ExecutorHost = "" }},
-		{"proof failed", func(f *settleFixture) { f.proof.Status = corrosion.ProofFailed }},
-		{"proof executed by another host", func(f *settleFixture) { f.proof.ExecutorHost = "node-c" }},
-		{"destination does not run it", func(f *settleFixture) { f.destState = RuntimeDefinedStopped }},
-		{"destination unreachable", func(f *settleFixture) {
+		{"proof prepared, not executed", onRunning(func(f *settleFixture) { f.proof.Status = corrosion.ProofPrepared; f.proof.ExecutorHost = "" })},
+		{"proof in progress, not executed", onRunning(func(f *settleFixture) { f.proof.Status = corrosion.ProofInProgress })},
+		{"proof failed", onRunning(func(f *settleFixture) { f.proof.Status = corrosion.ProofFailed })},
+		{"proof executed by another host", onRunning(func(f *settleFixture) { f.proof.ExecutorHost = "node-c" })},
+		{"destination does not run it", onRunning(func(f *settleFixture) { f.destState = RuntimeDefinedStopped })},
+		{"destination unreachable", onRunning(func(f *settleFixture) {
 			f.r.SetPeerRuntimeChecker(func(context.Context, string, string) (string, error) {
 				return "", errors.New("unreachable")
 			})
+		})},
+		{"no destination runtime check wired", onRunning(func(f *settleFixture) { f.r.SetPeerRuntimeChecker(nil) })},
+		// A copy this host holds paused does not wait for the replacement to
+		// run, but it still yields only to a proof its destination may
+		// execute: never to a failed one, nor to one another host took.
+		{"paused: proof failed", func(f *settleFixture) {
+			f.proof.Status = corrosion.ProofFailed
+			f.destState = RuntimeDefinedStopped
 		}},
-		{"no destination runtime check wired", func(f *settleFixture) { f.r.SetPeerRuntimeChecker(nil) }},
+		{"paused: proof completed by another host", func(f *settleFixture) { f.proof.ExecutorHost = "node-c" }},
+		{"paused: proof in progress on another host", func(f *settleFixture) {
+			f.proof.Status, f.proof.ExecutorHost = corrosion.ProofInProgress, "node-c"
+			f.destState = RuntimeDefinedStopped
+		}},
+		{"paused: proof prepared, claimed by another host", func(f *settleFixture) {
+			f.proof.Status, f.proof.ExecutorHost = corrosion.ProofPrepared, "node-c"
+			f.destState = RuntimeDefinedStopped
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newSettleFixture(t)
 			tc.edit(f)
 			if st := f.run(); st == libvirtfake.StateShutdown {
 				t.Fatalf("vm-a is %s; without positive proof the non-destruction guard must stand", st)
+			}
+		})
+	}
+}
+
+// Lab 2, B4: a copy this host's partition pause holds paused still holds its
+// image locks on shared storage, so the replacement the decided claim sent to
+// node-b cannot start until it is gone, and waiting for the replacement to run
+// first left zero copies running until an operator destroyed it. A paused
+// copy runs nothing, and a decided claim moved it, so it yields to the live
+// proof: prepared, or in progress on its destination, before the destination
+// runs it, and even with the destination unreachable.
+//
+// Mutations: require an executed proof for a paused copy too — the first
+// three cases go red; require the destination to run it — every case goes
+// red; take a running copy for a paused one (SelfPaused without the record) —
+// TestSettle_NeverWithoutPositiveProof's running cases go red.
+func TestSettle_APausedCopyYieldsToALiveDecidedClaim(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(f *settleFixture)
+	}{
+		{"in progress on the destination, which cannot start it", func(f *settleFixture) {
+			f.proof.Status = corrosion.ProofInProgress
+			f.destState = RuntimeDefinedStopped
+		}},
+		{"prepared, not yet claimed", func(f *settleFixture) {
+			f.proof.Status, f.proof.ExecutorHost = corrosion.ProofPrepared, ""
+			f.destState = RuntimeAbsent
+		}},
+		{"in progress, destination unreachable", func(f *settleFixture) {
+			f.proof.Status = corrosion.ProofInProgress
+			f.r.SetPeerRuntimeChecker(func(context.Context, string, string) (string, error) {
+				return "", errors.New("unreachable")
+			})
+		}},
+		{"completed, destination not running it", func(f *settleFixture) { f.destState = RuntimeDefinedStopped }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSettleFixture(t)
+			tc.edit(f)
+			if st := f.run(); st != libvirtfake.StateShutdown {
+				t.Fatalf("vm-a is %s; a copy this host holds paused must yield to the decided claim, "+
+					"or the replacement waits forever on its image lock", st)
+			}
+			rows, err := f.db.Query(context.Background(), `SELECT detail FROM audit_log WHERE action = 'partition.settle' AND target = 'vm-a'`)
+			if err != nil || len(rows) != 1 {
+				t.Fatalf("partition.settle audit rows = %d (%v), want 1", len(rows), err)
 			}
 		})
 	}

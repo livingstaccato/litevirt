@@ -36,7 +36,11 @@ import (
 //     destination and carries a certificate that verifies here
 //     (corrosion.VerifyClaimCertificate), at an incarnation-scoped key of the
 //     local copy's incarnation (or a legacy key), at an owner epoch at least
-//     the local copy's.
+//     the local copy's;
+//   - that proof completed on its destination, whose own runtime reports the
+//     VM running — or, for a copy this host's partition pause holds paused,
+//     merely is live (settleDecide): a paused QEMU keeps a shared disk's image
+//     lock, so the replacement cannot run until the paused copy is gone.
 //
 // It writes an audit row and the vm_settled condition, retried until both are
 // written (settle_pending.go), and leaves the shut-off domain to the existing
@@ -56,6 +60,10 @@ type localCopyID struct {
 	Epoch       int64
 	EpochKnown  bool
 	Source      string
+	// SelfPaused: this host's partition pause record still describes the
+	// domain, which is paused now (recordStillDescribes). Such a copy runs
+	// nothing, so stopping it cannot take away a running copy (settleDecide).
+	SelfPaused bool
 }
 
 // localVMIdentity reads the local copy's identity from host-local evidence.
@@ -69,7 +77,7 @@ func (r *Reconciler) localVMIdentity(name string) localCopyID {
 	var id localCopyID
 	var sources []string
 	if rec, ok, err := ReadPauseRecord(r.dataDir, PauseKindVM, name); err == nil && ok && rec.Incarnation != "" && r.recordStillDescribes(rec) {
-		id.Incarnation, id.Epoch, id.EpochKnown = rec.Incarnation, rec.OwnerEpoch, true
+		id.Incarnation, id.Epoch, id.EpochKnown, id.SelfPaused = rec.Incarnation, rec.OwnerEpoch, true, true
 		sources = append(sources, "partition-pause record")
 	}
 	if inc, ok, err := r.virt.GetDomainManagedIncarnation(name); err == nil && ok && inc != "" {
@@ -163,7 +171,17 @@ func settleDecide(self string, row *corrosion.VMRecord, local localCopyID, proof
 		// A decided claim is not yet a running replacement: the proof must
 		// have been EXECUTED, by its destination. A prepared or failed one
 		// leaves the local copy the only one running.
-		if why2, ok := proofExecutedByDest(p); !ok {
+		//
+		// Unless the local copy runs nothing: one this host's partition pause
+		// holds paused. Stopping it cannot leave zero running copies, and
+		// waiting for the replacement to run first can wait forever, because
+		// a paused QEMU keeps its image locks on shared storage and the
+		// replacement cannot start until they are released (lab 2, B4). Its
+		// RAM belongs to the copy the decided claim superseded either way: the
+		// pauser never resumes a workload a decided claim moved. So a live
+		// proof the destination may still execute is enough; a failed one, or
+		// one another host took, is not.
+		if why2, ok := proofExecutedByDest(p); !ok && (!local.SelfPaused || !proofLiveForDest(p)) {
 			why = why2
 			continue
 		}
@@ -186,7 +204,11 @@ func settleDecide(self string, row *corrosion.VMRecord, local localCopyID, proof
 		}
 		// And the replacement must be running there NOW, by the destination's
 		// own runtime, not by any row: the last line before stopping what may
-		// otherwise be the only copy.
+		// otherwise be the only copy. A copy this host holds paused is not
+		// one, and the replacement may be waiting for it to go (above).
+		if local.SelfPaused {
+			return p, cert, ""
+		}
 		if ok, rwhy := destRuns(p.DestHost); !ok {
 			why = "proof " + p.ID + ": " + rwhy
 			continue
@@ -211,6 +233,20 @@ func proofExecutedByDest(p corrosion.ProofRecord) (string, bool) {
 		return fmt.Sprintf("proof %s was executed by %q, not its destination %s", p.ID, p.ExecutorHost, p.DestHost), false
 	}
 	return "", true
+}
+
+// proofLiveForDest reports whether p can still be, or has been, executed by
+// its own destination: prepared and unclaimed, in progress on its destination,
+// or completed by it. A failed proof, or one another host claimed, is not.
+func proofLiveForDest(p corrosion.ProofRecord) bool {
+	switch p.Status {
+	case corrosion.ProofPrepared:
+		return p.ExecutorHost == "" || p.ExecutorHost == p.DestHost
+	case corrosion.ProofInProgress, corrosion.ProofCompleted:
+		return p.ExecutorHost == p.DestHost
+	default:
+		return false
+	}
 }
 
 // destRunsVia asks dest's own runtime whether it runs name, through check

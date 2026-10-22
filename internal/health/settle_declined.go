@@ -84,8 +84,10 @@ func settleRemedy(d settleDecline, self string) string {
 			"which incarnation of the name it is. Its UUID is not proof: a live restore or a renamed promote gives a " +
 			"new incarnation an earlier one's UUID. ")
 	}
-	fmt.Fprintf(&b, "Settle stops a copy only on a completed recovery-claim proof for %[2]s whose certificate verifies "+
-		"here for this incarnation, while %[2]s's own runtime reports the VM running. The row naming %[2]s is NOT "+
+	fmt.Fprintf(&b, "Settle stops a copy only on a recovery-claim proof for %[2]s whose certificate verifies "+
+		"here for this incarnation: a running copy once the proof completed and %[2]s's own runtime reports the VM "+
+		"running, a copy this host's partition pause holds paused once the proof is live, because a paused QEMU "+
+		"keeps a shared disk's image lock and %[2]s cannot start the VM until it is gone. The row naming %[2]s is NOT "+
 		"proof by itself: a converged-wrong host_name looks exactly like this. Before stopping anything, confirm "+
 		"which copy is current: `lv cluster claim vm/%[1]s` shows the decided claim and its destination, and "+
 		"`virsh domstate %[1]s` on %[2]s shows whether it runs there. Only if the claim gave %[1]s to %[2]s and %[2]s "+

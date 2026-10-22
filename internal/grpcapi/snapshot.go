@@ -210,6 +210,18 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"%v: a memory snapshot is not possible; take a disk-only snapshot instead (omit --memory; a Secure Boot or vTPM VM must be stopped for one), or detach the devices first", pe)
 		}
+		// A capture that failed before libvirt switched any disk took
+		// nothing: no overlay, no libvirt snapshot, no image. It is a
+		// refusal, recorded as an event, with no snapshot row (an "error"
+		// row would claim a partial snapshot and block a retry by name).
+		var nt *lv.CaptureNotTakenError
+		if errors.As(err, &nt) {
+			slog.Warn("memory snapshot not taken: nothing was switched over", "vm", req.VmName, "snapshot", req.Name, "error", err)
+			s.recordVMEventSeverity(ctx, req.VmName, "snapshot.created", "refused", "warn",
+				req.Name+" (memory): not taken, no disk was switched: "+err.Error())
+			return nil, status.Errorf(codes.Aborted,
+				"memory snapshot %q not taken (no disk was switched; nothing to clean up): %v", req.Name, err)
+		}
 		snapType = "memory"
 		// A failure after libvirt took the snapshot (the firmware capture,
 		// the resume) leaves the disks on their overlays — treat as created

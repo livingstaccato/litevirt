@@ -2642,7 +2642,7 @@ func (f *Fake) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, 
 	defer f.daemon()()
 	for _, op := range []libvirt.FirmwareOp{libvirt.OpStart, libvirt.OpResume} {
 		if err := f.fwCheck(libvirt.FirmwareCall{Op: op, Name: domainName}); err != nil {
-			return 0, 0, fmt.Errorf("memory snapshot of %q: %w", domainName, err)
+			return 0, 0, libvirt.NotTakenCapture(fmt.Errorf("memory snapshot of %q: %w", domainName, err))
 		}
 	}
 	return libvirt.CaptureMemorySnapshot(captureAPI{f}, domainName, snapshotName, vmstatePath, o)

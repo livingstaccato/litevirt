@@ -598,6 +598,15 @@ func (p *PartitionPauser) Evaluate(ctx context.Context) {
 	covered := lossCovered(p.samples)
 	p.mu.Unlock()
 
+	// No memory snapshot starts on a host that lost the voter majority: a
+	// capture begun there could meet a pause pass after the pass's
+	// start-of-pass preemption (CaptureRegistry.RefuseCaptures).
+	if state == QuorumNo && p.enabled != nil && p.enabled() {
+		p.captures.RefuseCaptures("this host lost the voter majority; its partition pause may pause the VM")
+	} else {
+		p.captures.RefuseCaptures("")
+	}
+
 	if regained {
 		p.resolveFailed(ctx, "the voter majority is back")
 		p.tryResume(ctx, now)
@@ -731,6 +740,9 @@ func (p *PartitionPauser) noteExempt(why string) {
 func (p *PartitionPauser) pauseAll(ctx context.Context, now time.Time, reason string) {
 	deadline := now.Add(PartitionPauseExecBudget)
 	budget := newPassBudget()
+	// No capture starts while the pass runs, so the captures it can meet are
+	// the ones its start-of-pass preemption sees (§3.3).
+	defer p.captures.PausePass()()
 	// VMs and containers at once, each under the same read budget, so the
 	// pass as a whole ends within E rather than each half of it.
 	vmFail, ctFail := map[string]string{}, map[string]string{}
@@ -778,6 +790,40 @@ func (p *PartitionPauser) pauseAll(ctx context.Context, now time.Time, reason st
 // pmsuspended, shutting down) is skipped.
 func domainPaused(st lv.DomainStatus) bool { return st.Reason == "paused" }
 
+// preemptCaptures is the pass's first act: every memory snapshot capture in
+// flight on a VM the pass is about to pause is told not to start its libvirt
+// job, and its job is aborted in the background (CaptureRegistry.Preempt).
+// libvirt's cleanup then runs while the pass reads the other VMs, so the
+// VM's Hold, however late it comes in the pass and however little of the
+// budget is left for it, finds the job ended and settles; a capture alone
+// never fails a pause a plain suspend would have made. Only the registry and
+// this host's own rows are read here, no libvirt: a VM whose row says the
+// pass will not pause it (another host's, a migration source, not
+// recoverable) keeps its capture.
+func (p *PartitionPauser) preemptCaptures(ctx context.Context, names []string, enrolled *map[string]bool) {
+	if p.captures == nil {
+		return
+	}
+	for _, name := range names {
+		if !p.captures.InFlight(name) {
+			continue
+		}
+		vm, err := corrosion.GetVM(ctx, p.db, name)
+		if err != nil || vm == nil || vm.HostName != p.host || vm.State == "migrating" {
+			continue
+		}
+		if *enrolled == nil {
+			if *enrolled, err = corrosion.AutoPromoteEnrolled(ctx, p.db); err != nil {
+				*enrolled = map[string]bool{}
+			}
+		}
+		if !corrosion.VMRecoverableOnHostFailure(*vm, (*enrolled)[vm.Name]) {
+			continue
+		}
+		p.captures.Preempt(name)
+	}
+}
+
 func (p *PartitionPauser) pauseVMs(ctx context.Context, budget passBudget, reason string, failures map[string]string) {
 	names, err := guardedCall(&p.reads, readListDomains, budget.timeout(), p.vms.ListDomains)
 	if err != nil {
@@ -786,6 +832,11 @@ func (p *PartitionPauser) pauseVMs(ctx context.Context, budget passBudget, reaso
 	}
 	sort.Strings(names)
 	var enrolled map[string]bool
+	// Read before any state: a capture that ends between a VM's state read
+	// (paused, by the capture) and the check below has resumed it, and is
+	// still the pass's to pause.
+	sawCapture := p.captures.InFlightNow()
+	p.preemptCaptures(ctx, names, &enrolled)
 	var mu sync.Mutex
 	fail := func(key, why string) { mu.Lock(); failures[key] = why; mu.Unlock() }
 	var wg sync.WaitGroup
@@ -800,7 +851,7 @@ func (p *PartitionPauser) pauseVMs(ctx context.Context, budget passBudget, reaso
 		// A memory snapshot in flight holds its guest paused, and resumes it
 		// when it ends: that guest is this pauser's to pause (the registry
 		// hold below stops the resume). Any other paused domain is not ours.
-		if st.State != RuntimeRunning && !(domainPaused(st) && p.captures.InFlight(name)) {
+		if st.State != RuntimeRunning && !(domainPaused(st) && (sawCapture[name] || p.captures.InFlight(name))) {
 			continue // not executing: nothing to stop, and a paused one is not ours
 		}
 		vm, err := corrosion.GetVM(ctx, p.db, name)

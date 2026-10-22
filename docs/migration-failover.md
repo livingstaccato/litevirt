@@ -1180,7 +1180,11 @@ fencing node's setting decides, so no host relies on another's):
 - The pinned path is refused toward a host whose sshd host keys another host
   also publishes (a cloned image): the pin cannot tell the two apart. Regenerate
   the sshd host keys on one of them. The managed path is not affected; its
-  forced command checks the name.
+  forced command checks the name. (Host keys are public, so a compromised member
+  can publish another host's in its own row and hold the pinned path toward that
+  host off in the same way; it cannot make a fence reach the wrong machine.)
+- A row whose certificate has expired still pins its host's keys (`lv doctor
+  fence` says it expired): renew the certificate with `lv host renew-cert`.
 - A host that has published is never fenced without its pin, in any mode, and a
   managed fence that fails is never retried down another path. A refused fence
   fails. A `best-effort` fence keeps its contract and reports a refused or failed

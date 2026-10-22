@@ -2,7 +2,11 @@ package fencessh
 
 import (
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
 	"net"
@@ -10,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
@@ -204,5 +209,48 @@ func TestNewFenceKey_ParsesAsAnOpenSSHPrivateKey(t *testing.T) {
 	}
 	if KeyLine(s.PublicKey()) != KeyLine(pub) || pub.Type() != ssh.KeyAlgoED25519 {
 		t.Fatalf("public key %q / %q", KeyLine(s.PublicKey()), KeyLine(pub))
+	}
+}
+
+// TestVerify_AnExpiredCertificateStillPins: a host's certificate expiring is
+// no evidence its keys are not its own, so its row still verifies (marked
+// Expired, for `lv doctor fence`) and its peers keep fencing it pinned rather
+// than refuse it in every mode.
+func TestVerify_AnExpiredCertificateStillPins(t *testing.T) {
+	ca := newTestCA(t)
+	caPEM, _ := os.ReadFile(filepath.Join(ca.dir, "ca.crt"))
+	caCert, err := pki.ParseCertPEM(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, _ := os.ReadFile(filepath.Join(ca.dir, "ca.key"))
+	blk, _ := pem.Decode(keyPEM)
+	caKey, err := x509.ParseECPrivateKey(blk.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(4242), Subject: pkix.Name{CommonName: "node-2"}, DNSNames: []string{"node-2"},
+		// Valid for one second just after the CA's own start, and long expired.
+		NotBefore: caCert.NotBefore, NotAfter: caCert.NotBefore.Add(time.Second),
+		KeyUsage:    x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		IPAddresses: []net.IP{net.ParseIP("10.77.0.2"), net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, &hostKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	v, err := Verify(signedRow(t, "node-2", certPEM, hostKey), ca.trust())
+	if err != nil || !v.Expired || v.Addr.String() != "10.77.0.2" {
+		t.Fatalf("Verify of a row under an expired certificate = %+v, %v; want verified, marked expired", v, err)
+	}
+	if _, err := Verify(signedRow(t, "node-2", certPEM, hostKey), ca.trust("1092")); err == nil {
+		t.Fatal("a revoked expired certificate verified")
 	}
 }

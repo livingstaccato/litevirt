@@ -70,10 +70,14 @@ func (a *Agent) Status(ctx context.Context) ([]PeerStatus, error) {
 			}
 			if trErr != nil {
 				ps.Row, ps.RowDetail = RowUnverified, trErr.Error()
-			} else if _, verr := Verify(row, tr); verr != nil {
+			} else if v, verr := Verify(row, tr); verr != nil {
 				ps.Row, ps.RowDetail = RowUnverified, verr.Error()
 			} else {
 				ps.Row = RowVerified
+				if v.Expired {
+					ps.RowDetail = strings.TrimSpace("its certificate expired " + v.NotAfter.UTC().Format(time.RFC3339) +
+						"; renew it with `lv host renew-cert " + h.Name + "`. " + ps.RowDetail)
+				}
 			}
 		}
 		if h.Name == a.cfg.Self {

@@ -33,6 +33,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
@@ -143,6 +144,10 @@ type Verified struct {
 	// one a fence from it binds to.
 	Addr   net.IP
 	Serial string
+	// Expired: the certificate that signed the row has expired (it is still
+	// trusted for the keys it signed; renew it).
+	Expired  bool
+	NotAfter time.Time
 }
 
 // ErrNotPublished is a host that has no row.
@@ -170,7 +175,18 @@ func Verify(row corrosion.HostFenceSSHRow, tr Trust) (*Verified, error) {
 	if err != nil {
 		return nil, fmt.Errorf("certificate: %w", err)
 	}
-	if _, err := cert.Verify(x509.VerifyOptions{Roots: tr.Roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err != nil {
+	// A certificate that has merely expired still binds the keys it signed:
+	// expiry is no evidence of compromise (revocation is), and refusing the
+	// row would leave its host unfenceable in every mode, while a host whose
+	// row disappeared would be fenced unpinned. So the chain is checked as of
+	// the moment the certificate expired, and the row is marked Expired for
+	// `lv doctor fence`.
+	opts := x509.VerifyOptions{Roots: tr.Roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}
+	expired := time.Now().After(cert.NotAfter)
+	if expired {
+		opts.CurrentTime = cert.NotAfter
+	}
+	if _, err := cert.Verify(opts); err != nil {
 		return nil, fmt.Errorf("certificate does not chain to the cluster CA: %w", err)
 	}
 	if pki.IsClientOnlyCert(cert) {
@@ -210,7 +226,7 @@ func Verify(row corrosion.HostFenceSSHRow, tr Trust) (*Verified, error) {
 	return &Verified{
 		Host: row.HostName, Generation: row.Generation, FenceKeys: fk, HostKeys: hk,
 		Accepting: row.Accepting, EverAccepting: row.EverAccepting, Detail: row.Detail,
-		Addr: addr, Serial: strings.ToLower(cert.SerialNumber.Text(16)),
+		Addr: addr, Serial: strings.ToLower(cert.SerialNumber.Text(16)), Expired: expired, NotAfter: cert.NotAfter,
 	}, nil
 }
 

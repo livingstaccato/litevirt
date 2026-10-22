@@ -188,3 +188,35 @@ func TestPublish_AFailedEvaluationKeepsWhatWasPublished(t *testing.T) {
 		t.Fatalf("after a failed evaluation the row = %+v, want still accepting", r)
 	}
 }
+
+// TestPublish_LegacyKeepsAnExistingRowSigned: a host that published, then
+// was switched to enforcement.fence_ssh: legacy (an incident stand-down), and
+// then renewed its certificate, re-signs its row with the renewed one —
+// otherwise the replaced certificate's revocation stays owed for good, and
+// once it is revoked every peer refuses to fence the host.
+func TestPublish_LegacyKeepsAnExistingRowSigned(t *testing.T) {
+	ctx := context.Background()
+	w := newWorld(t)
+	x := w.node("node-x", "127.0.0.3")
+	x.hostRow("127.0.0.3", 22)
+	if err := x.publisher(true, false).Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, next, err := pki.RenewLocal(filepath.Join(w.ca, "ca.crt"), filepath.Join(w.ca, "ca.key"), x.pkiDir, "node-x"); err != nil {
+		t.Fatal(err)
+	} else {
+		legacy := fencessh.New(fencessh.Config{
+			Self: x.name, PKIDir: x.pkiDir, DB: w.db, Gate: openGate{t}, Dir: x.dir, HostKeyGlob: x.hkPath + ".pub",
+			Mode:      func() string { return fencessh.ModeLegacy },
+			Accepting: func(context.Context, []string) (bool, string, error) { return true, "", nil },
+		})
+		if err := legacy.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+		r, _ := x.row()
+		cert, err := pki.ParseCertPEM([]byte(r.CertPEM))
+		if err != nil || !strings.EqualFold(cert.SerialNumber.Text(16), next) {
+			t.Fatalf("the legacy host's row is signed by %v (%v), want the renewed %s", cert.SerialNumber, err, next)
+		}
+	}
+}

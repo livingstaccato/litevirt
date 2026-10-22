@@ -251,9 +251,16 @@ func (a *Agent) sync(ctx context.Context) error {
 	if err := a.render(peers, a.selfEntry(self)); err != nil {
 		return err
 	}
-	// enforcement.fence_ssh: legacy publishes nothing, so the release feature
-	// stays unused and a rollback below release_2026_12_v1 stays possible.
-	if a.Mode() == ModeLegacy || a.cfg.Gate == nil || !a.cfg.Gate.ReleaseFeatureAvailable(capabilities.FeatureFenceSSH) {
+	if a.cfg.Gate == nil || !a.cfg.Gate.ReleaseFeatureAvailable(capabilities.FeatureFenceSSH) {
+		return nil
+	}
+	// enforcement.fence_ssh: legacy never makes the FIRST publication, so the
+	// release feature stays unused and a rollback below release_2026_12_v1
+	// stays possible. A row this host already published is still maintained
+	// (the feature is used anyway): left frozen, a renewal's revocation would
+	// stay owed, a revoked or expired certificate would leave the host
+	// unfenceable, and a new sshd host key would fail every fence of it.
+	if a.Mode() == ModeLegacy && !a.hasOwnRow(ctx, self, tr) {
 		return nil
 	}
 	return a.publish(ctx, self, selfSigner, peers, tr)
@@ -559,6 +566,13 @@ func (a *Agent) publish(ctx context.Context, self *x509.Certificate, signer cryp
 	slog.Info("fence ssh: published this host's row", "generation", p.Generation, "accepting", accepting,
 		"detail", why, "serial", strings.ToLower(self.SerialNumber.Text(16)))
 	return nil
+}
+
+// hasOwnRow reports whether this host holds a live row it published itself
+// (ownLineage).
+func (a *Agent) hasOwnRow(ctx context.Context, self *x509.Certificate, tr Trust) bool {
+	prev, ok, err := corrosion.GetHostFenceSSH(ctx, a.cfg.DB, a.cfg.Self)
+	return err == nil && ok && !prev.Deleted && a.ownLineage(prev, self, tr)
 }
 
 // ownLineage reports whether prev was signed by this host under its current

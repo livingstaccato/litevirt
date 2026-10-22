@@ -35,6 +35,7 @@ func TestStartPressure_RunsAndWires(t *testing.T) {
 	d.startPressure(ctx, &sink, func() func(pressure.Report) {
 		return func(pressure.Report) { observed.Add(1) }
 	})
+	t.Cleanup(d.pressure.Stop)
 	p := sink.src.Load()
 	if p == nil {
 		t.Fatal("no pressure source was wired into the server")
@@ -114,10 +115,8 @@ func TestDaemonWiresPressure(t *testing.T) {
 // here, as it does on re-exec and uninstall, so cancelling it is not what ends
 // the read.
 func TestCloseDatabase_JoinsThePressurePoolsRead(t *testing.T) {
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatal(err)
-	}
+	// closeDatabase closes it here; the cleanup's second Close is harmless.
+	db := corrosion.NewTestClientT(t)
 	cfg := &Config{HostName: "n", DataDir: t.TempDir(), Pressure: pressure.DefaultConfig()}
 	d := &Daemon{cfg: cfg, db: db}
 	entered, readDone, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
@@ -202,5 +201,24 @@ func TestDaemonClosesDatabaseThroughCloseDatabase(t *testing.T) {
 	}
 	if !viaHelper {
 		t.Error("daemon.go never calls d.closeDatabase(): the shutdown does not close the database through the join")
+	}
+}
+
+// A pool-list read whose context has ended (the sampler is stopping, and the
+// database may be closing) returns the last list without touching the
+// database.
+func TestPressurePools_EndedContextDoesNotReadTheDatabase(t *testing.T) {
+	cfg := &Config{HostName: "n", DataDir: t.TempDir(), Pressure: pressure.DefaultConfig()}
+	d := &Daemon{cfg: cfg, db: corrosion.NewTestClientT(t)}
+	var reads atomic.Int32
+	d.listHostPools = func(context.Context, *corrosion.Client, string) ([]corrosion.StoragePoolRecord, error) {
+		reads.Add(1)
+		return nil, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	d.pressurePools()(ctx)
+	if n := reads.Load(); n != 0 {
+		t.Fatalf("a pool-list read with an ended context queried the database %d time(s)", n)
 	}
 }

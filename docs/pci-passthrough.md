@@ -268,13 +268,30 @@ When a VM requests PCI devices, the placement engine considers:
 
 ## Migration with PCI devices
 
-PCI passthrough devices cannot be live-migrated. Options:
+No migration, live or cold, carries a passthrough device, and a stopped VM
+cannot be cold-migrated while it holds one either, whatever its disks. Once
+`hardware_v2` is active, the route that works is to release the device from the
+VM, move the VM, and attach a device on the target:
 
-1. Hot-detach the device, migrate, hot-attach on the new host
-2. Cold migrate (stops the VM)
-3. Use SR-IOV VFs which can be detached/reattached more gracefully
+1. Stop the VM.
+2. `lv detach-pci <vm> <pci-address>`
+3. `lv migrate <vm> <host> --cold`
+4. `lv attach-pci <vm> --address <pci-address on the target>`; find a free one
+   with `lv host devices <host>`.
 
-The migration command will fail with an error if the VM has PCI devices attached and `--cold` is not specified.
+The target needs its own free device: the source's address is not reused, and
+the device's ROM, multifunction and vGPU settings are not carried over, so
+re-attach them as you did the first time. `lv attach-pci <vm> --address` is the
+form that works on a stopped VM; the `--type` form attaches to a running VM only.
+
+Before `hardware_v2` is active, detaching and attaching on a stopped VM are
+refused, so there is no supported way to move a VM that holds a device.
+
+A migration of a VM that still holds a device is refused up front, naming the
+device and (once `hardware_v2` is active) this route, before anything is done on
+the target. This covers `--cold` of a running VM with a PF, a live migration,
+and `--cold` of a stopped VM. Once the cluster has latched `hardware_v2`, any VM
+holding PCI intent is refused this way.
 
 SR-IOV VFs are hot-detached from the guest just before the copy starts. The VM
 keeps owning them on the source until the cutover commits, so no other VM can

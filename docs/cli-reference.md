@@ -1382,6 +1382,7 @@ lv detach-disk <vm> <disk>
 lv attach-nic <vm> <network> [--model virtio] [--mac ...] [--spoof-guard on|off] [--allow-address <ip>]
 lv detach-nic <vm> <mac>
 lv attach-pci <vm> --type gpu [--vendor 10de] [--count 1] [--sriov]
+lv attach-pci <vm> --address <pci-address>   # one device; also a stopped VM once hardware_v2 is active
 lv detach-pci <vm> <pci-address>
 ```
 

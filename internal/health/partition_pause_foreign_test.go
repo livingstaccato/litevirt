@@ -391,3 +391,157 @@ func TestPartitionPause_ARunningRecordedVMLosesItsMark(t *testing.T) {
 		t.Fatalf("vm-ha is %s: an operator's suspend matched a mark left on a running VM", st)
 	}
 }
+
+// healWithAResumeAtTheFirstSustainedPass regains the majority, and has an
+// operator resume vm-ha by hand just before the first sustained pass: no
+// not-yet-sustained pass sees it running, so the record is dropped by the
+// resume checks themselves.
+func (f *pauseFixture) healWithAResumeAtTheFirstSustainedPass() {
+	f.t.Helper()
+	f.set(QuorumYes)
+	for i := 0; i <= int(PartitionPauseAfter/time.Second)+1; i++ {
+		if i == int(PartitionPauseAfter/time.Second) {
+			if err := f.virt.ResumeDomain("vm-ha"); err != nil { // virsh resume
+				f.t.Fatal(err)
+			}
+		}
+		f.tick()
+		f.advance(time.Second)
+	}
+	if recs := f.records(); len(recs) != 0 {
+		f.t.Fatalf("setup: records %+v after vm-ha ran again at the heal", recs)
+	}
+}
+
+// ppio re-review r1, F1: a background clear is ordered against a later
+// pause's mark, and clears only the mark it was meant for. Here an operator
+// resumes vm-ha as the partition heals, the clear of its mark is slow (a
+// libvirt job), and the partition comes back: this host pauses vm-ha again
+// under a new token. The old clear must not erase the new mark, or this
+// host's own pause is held for good as someone else's after the heal.
+//
+// Mutation: clear unconditionally and outside the mark lock (the first cut)
+// — the new mark is erased and vm-ha stays paused, red.
+func TestPartitionPause_ASlowClearNeverErasesANewerPausesMark(t *testing.T) {
+	f := newPauseFixture(t)
+	f.loseFor(QuorumNo, PartitionPauseAfter+2*time.Second)
+	first := f.waitMark("vm-ha")
+	var calls atomic.Int32
+	f.virt.FailClearPartitionPauseMark = func(string) error {
+		if calls.Add(1) == 1 {
+			time.Sleep(2 * time.Second) // waits behind a libvirt job
+		}
+		return nil
+	}
+	f.set(QuorumYes)
+	if err := f.virt.ResumeDomain("vm-ha"); err != nil { // virsh resume
+		t.Fatal(err)
+	}
+	f.tick() // a Yes, not yet sustained: the clear starts, and is slow
+	f.advance(time.Second)
+	f.loseFor(QuorumNo, PartitionPauseAfter+2*time.Second)
+	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+		t.Fatalf("setup: vm-ha is %s after the partition came back", st)
+	}
+	recs := f.records()
+	if len(recs) != 1 || recs[0].Token == first {
+		t.Fatalf("setup: records %+v, want a new pause of vm-ha", recs)
+	}
+	time.Sleep(2500 * time.Millisecond) // the slow clear returns
+	f.regain()
+	for i := 0; i <= int(2*partitionResumeRecheck/time.Second); i++ {
+		f.tick()
+		f.advance(time.Second)
+	}
+	if st := f.raw("vm-ha"); st != libvirtfake.StateRunning {
+		t.Fatalf("vm-ha is %s: a slow clear erased this host's newer pause mark, and its own pause is held", st)
+	}
+}
+
+// ppio re-review r1, N1: a mark that is only late is not someone else's
+// pause. While it is being written vm-ha is held, saying so, and it is not
+// named as paused by someone else; once it lands, vm-ha resumes.
+//
+// Mutation: no pending state (a late mark reads as an operator's pause) —
+// the hold names vm-ha as not paused by this host, red.
+func TestPartitionPause_ALateMarkIsHeldAsPendingNotForeign(t *testing.T) {
+	f := newPauseFixture(t)
+	release := make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	f.virt.FailMarkPartitionPaused = func(string) error { <-release; return nil }
+	f.loseFor(QuorumNo, PartitionPauseAfter+2*time.Second)
+	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+		t.Fatalf("setup: vm-ha is %s", st)
+	}
+	f.regain()
+	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+		t.Fatalf("vm-ha is %s before its mark landed", st)
+	}
+	f.p.mu.Lock()
+	why, foreign := f.p.heldWhy["vm/vm-ha"], f.p.notOurs["vm/vm-ha"]
+	f.p.mu.Unlock()
+	if !strings.Contains(why, "still being written") || foreign != "" {
+		t.Fatalf("held as %q, not ours %q; want a pending mark, not someone else's pause", why, foreign)
+	}
+	once.Do(func() { close(release) })
+	f.waitMark("vm-ha")
+	for i := 0; i <= int(2*partitionResumeRecheck/time.Second); i++ {
+		f.tick()
+		f.advance(time.Second)
+	}
+	if st := f.raw("vm-ha"); st != libvirtfake.StateRunning {
+		t.Fatalf("vm-ha is %s after its late mark landed", st)
+	}
+}
+
+// ppio re-review r1, N2: a record dropped by the resume checks (its VM runs
+// again) takes the VM's mark with it, and what this process remembers about
+// the mark.
+//
+// Mutations: no clear on the drop path — the mark stays on the running VM,
+// red; keep markFailed entries past the drop — the "mark failed" subtest goes
+// red.
+func TestPartitionPause_ADroppedRecordTakesItsMarkWithIt(t *testing.T) {
+	t.Run("mark set", func(t *testing.T) {
+		f := newPauseFixture(t)
+		f.loseFor(QuorumNo, PartitionPauseAfter+2*time.Second)
+		f.waitMark("vm-ha")
+		f.healWithAResumeAtTheFirstSustainedPass()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, ok, _ := f.virt.PartitionPauseMark("vm-ha"); !ok {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("vm-ha runs with its record dropped and still carries this host's pause mark")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	})
+	t.Run("mark failed", func(t *testing.T) {
+		f := newPauseFixture(t)
+		f.virt.FailMarkPartitionPaused = func(string) error { return errors.New("libvirtd: metadata write failed") }
+		f.loseFor(QuorumNo, PartitionPauseAfter+2*time.Second)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			f.p.mu.Lock()
+			n := len(f.p.markFailed)
+			f.p.mu.Unlock()
+			if n == 1 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("setup: the failed mark was not remembered")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		f.healWithAResumeAtTheFirstSustainedPass()
+		f.p.mu.Lock()
+		left := len(f.p.markFailed)
+		f.p.mu.Unlock()
+		if left != 0 {
+			t.Fatalf("%d markFailed entries outlive the dropped record", left)
+		}
+	})
+}

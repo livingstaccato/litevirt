@@ -49,7 +49,15 @@ func TestMsr2_PauserAtAnyInstantIsNeverResumed(t *testing.T) {
 				go func() {
 					defer close(done)
 					time.Sleep(delay)
-					_, settled := reg.Hold("vm", 500*time.Millisecond) // well under the 1s deadline scenario, with room for a loaded host
+					// The hold's wait: well under the 1s-deadline scenario's job,
+					// which only an abort ends; elsewhere nothing but
+					// scheduling stands between the hold and the job's end,
+					// so a loaded -race host gets a full second.
+					wait := time.Second
+					if sc.deadline == time.Second {
+						wait = 500 * time.Millisecond
+					}
+					_, settled := reg.Hold("vm", wait)
 					err := m.DomainSuspend(golibvirt.Domain{Name: "vm"})
 					m.mu.Lock()
 					n := len(m.qemu.pauses)

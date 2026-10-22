@@ -659,11 +659,18 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 		s.migrationStubs.forget(hdr.Path)
 	}
 	// The file this receive places: what a re-check below may take back, and
-	// nothing else.
-	ours, err := os.Lstat(tmp.Name())
-	if err != nil {
-		return status.Errorf(codes.Internal, "stat %s: %v", tmp.Name(), err)
+	// nothing else. It is held open until the receive returns (pinnedFile):
+	// while the directory sync below stalls, the placed copy may be removed
+	// and a retried receive place its own at the path, and only a held
+	// file's inode cannot be given to that copy, which would then read as
+	// this receive's own. After the retry commits it is the VM's only copy.
+	ours, ok := pinFile(tmp.Name())
+	if !ok {
+		return status.Errorf(codes.Internal,
+			"could not hold the copy of %s open (%s) to tell it apart from another file at its path; it is not placed",
+			hdr.Path, tmp.Name())
 	}
+	defer ours.release()
 	if err := placeColdDisk(tmp.Name(), dst); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return status.Errorf(codes.FailedPrecondition,
@@ -688,7 +695,7 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	// move back and keeps the VM's disk: the file this receive just placed is
 	// taken back, and only that file (the same inode at the same path).
 	if err := stream.Context().Err(); err != nil {
-		if fi, lerr := os.Lstat(dst); lerr == nil && os.SameFile(fi, ours) {
+		if ours.stillAt(dst) {
 			if rerr := os.Remove(dst); rerr != nil {
 				slog.Warn("cold migration: could not take back a disk placed after the source gave up",
 					"vm", vm.Name, "path", hdr.Path, "error", rerr)

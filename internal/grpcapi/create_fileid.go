@@ -5,9 +5,9 @@ import (
 	"syscall"
 )
 
-// pinnedFile is a file a create (or clone) made, held open from right after
-// it was made until the create returns: its seed, and each host-local disk or
-// copy it wrote. Its device and inode then name that file and no other for as
+// pinnedFile is a file a create (or a clone, or a cold-copy receive) made,
+// held open from right after it was made until the create returns: its seed,
+// each host-local disk or copy it wrote, and the copy a receive placed. Its device and inode then name that file and no other for as
 // long as the create could compare them: the kernel does not free an inode
 // while a descriptor holds it, even once its last name is removed, so no file
 // made at the path since can be given its number (on ext4, xfs and btrfs, and

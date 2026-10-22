@@ -2100,7 +2100,9 @@ sight of every peer) instead of waiting for its interval
 (`anti_entropy_interval_sec`), so with a peer reachable the deferral lasts
 seconds. Passes are still at least 12 s apart, so a first try that finds no
 peer yet costs up to about 12 s. A single-node cluster — no other host in the
-hosts table — is not gated. The same sync is also withheld, on a current
+hosts table — is not gated, and neither is a node with no gossip peer whose
+only other hosts are `joining` (`lv host add` admitted them and their daemons
+have not started, as on a founder adding its second host). The same sync is also withheld, on a current
 replica, while the VM has an active ownership condition (`vm_dual_run`,
 `runtime_owner_mismatch`, `owner_epoch_mismatch`), matching the self-heal
 restart.
@@ -2130,7 +2132,10 @@ Retry after the `replica caught up` journal line, or run the command on any
 other host. With a peer reachable that line follows a daemon restart within
 seconds; the refusal says how long the node has been waiting, so a count that
 keeps growing points at the peers rather than the node (see below). A
-single-node cluster is not gated.
+single-node cluster is not gated, nor is a node with no gossip peer whose only
+other hosts are still `joining` (admitted, their daemons not started yet). Once
+such a host's daemon starts it is a peer like any other, and the node waits for
+its first exchange with it.
 
 A host whose peers are all down cannot catch up, so it refuses these commands
 until one of them answers. That is deliberate: it cannot know whether another

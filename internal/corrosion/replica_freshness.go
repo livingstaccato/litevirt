@@ -175,7 +175,12 @@ func (c *Client) MarkReplicaCaughtUpForTests(peer string) {
 // the cluster is a cluster of one. A single node is trusted without a catch-up
 // — there is no peer to catch up with and no other host that could own the
 // workload. "Of one" is read from the local hosts table: any other admitted
-// host, reachable or not, means another owner is possible and the gate holds.
+// host, reachable or not, means another owner is possible and the gate holds —
+// except a host still joining, while this node has no gossip member
+// (ClusterOfOneBut): its daemon has never booted on this admission, so it has
+// written nothing this node lacks (see ClusterOfOneBut for a re-admitted
+// name's recorded workloads), and a
+// founder holding its own half-added second host stays a cluster of one.
 // An unreadable hosts table fails closed. A nil caughtUp is unwired and
 // trusted, for tests that do not exercise the gate.
 //
@@ -190,14 +195,12 @@ func ReplicaTrusted(ctx context.Context, c *Client, self string, caughtUp func()
 	if ok {
 		return true, ""
 	}
-	hosts, err := ListHosts(ctx, c)
+	alone, err := soleOrOnlyJoiners(ctx, c, self)
 	if err != nil {
 		return false, why + " (and the hosts table could not be read to rule out a single-node cluster: " + err.Error() + ")"
 	}
-	for _, h := range hosts {
-		if h.Name != self {
-			return false, why
-		}
+	if !alone {
+		return false, why
 	}
 	return true, ""
 }

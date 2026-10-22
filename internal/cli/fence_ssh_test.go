@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 
@@ -33,8 +34,8 @@ func (h *localFenceSSHHost) RunScript(_ context.Context, env []string, script st
 	return cmd.CombinedOutput()
 }
 
-// statusClient answers GetFenceSSHStatus from rows, the second call onward
-// with every host accepting.
+// statusClient answers a fanned-out GetFenceSSHStatus with each host's own
+// view, every host accepting.
 type statusClient struct {
 	pb.LiteVirtClient
 	calls int
@@ -43,11 +44,12 @@ type statusClient struct {
 
 func (c *statusClient) GetFenceSSHStatus(context.Context, *pb.FenceSSHStatusRequest, ...grpc.CallOption) (*pb.FenceSSHStatus, error) {
 	c.calls++
-	n := &pb.FenceSSHNode{Host: c.hosts[0], Reachable: true}
+	st := &pb.FenceSSHStatus{}
 	for _, h := range c.hosts {
-		n.Peers = append(n.Peers, &pb.FenceSSHPeer{Host: h, Row: fencessh.RowVerified, Accepting: true, Address: "10.77.0.9"})
+		st.Nodes = append(st.Nodes, &pb.FenceSSHNode{Host: h, Reachable: true, Peers: []*pb.FenceSSHPeer{
+			{Host: h, Row: fencessh.RowVerified, Accepting: true, Address: "10.77.0.9"}}})
 	}
-	return &pb.FenceSSHStatus{Nodes: []*pb.FenceSSHNode{n}}, nil
+	return st, nil
 }
 
 // TestInstallFenceSSH_ProvisionsEveryHostForEveryPeer: each host's drop-in is
@@ -83,7 +85,7 @@ func TestInstallFenceSSH_ProvisionsEveryHostForEveryPeer(t *testing.T) {
 	}
 	var out bytes.Buffer
 	c := &statusClient{hosts: []string{"node-0", "node-1", "node-2"}}
-	if err := InstallFenceSSH(context.Background(), c, hosts, all, FenceSSHOptions{Out: &out}); err != nil {
+	if err := InstallFenceSSH(context.Background(), c, hosts, all, FenceSSHOptions{Out: &out, FreshAfter: time.Nanosecond}); err != nil {
 		t.Fatalf("InstallFenceSSH: %v\n%s", err, out.String())
 	}
 	for _, h := range locals {

@@ -191,11 +191,35 @@ func TestPublish_AFailedEvaluationKeepsWhatWasPublished(t *testing.T) {
 			return false, "", errors.New("fork/exec /usr/sbin/sshd: cannot allocate memory")
 		},
 	})
-	if err := failing.Sync(ctx); err != nil {
-		t.Fatal(err)
+	// The sync still reports it, so the agent's last_error shows it: `lv
+	// doctor fence` warns, and `lv host install-fence-ssh` does not confirm
+	// a row carried over from before as a fresh answer.
+	err := failing.Sync(ctx)
+	if err == nil || !strings.Contains(err.Error(), "could not be evaluated") || !strings.Contains(err.Error(), "cannot allocate memory") {
+		t.Fatalf("Sync after a failed evaluation: %v, want it reported", err)
+	}
+	if !strings.Contains(failing.LastError(), "could not be evaluated") {
+		t.Fatalf("last_error %q does not show the failed evaluation", failing.LastError())
 	}
 	if r, _ := x.row(); !r.Accepting || !r.EverAccepting {
 		t.Fatalf("after a failed evaluation the row = %+v, want still accepting", r)
+	}
+
+	// A first row, published while sshd cannot be evaluated, is published
+	// (not accepting) and the sync reports it too.
+	y := w.node("node-y", "127.0.0.4")
+	y.hostRow("127.0.0.4", 22)
+	first := fencessh.New(fencessh.Config{
+		Self: y.name, PKIDir: y.pkiDir, DB: w.db, Gate: openGate{t}, Dir: y.dir, HostKeyGlob: y.hkPath + ".pub",
+		Accepting: func(context.Context, []string) (bool, string, error) {
+			return false, "", errors.New("fork/exec /usr/sbin/sshd: cannot allocate memory")
+		},
+	})
+	if err := first.Sync(ctx); err == nil || !strings.Contains(err.Error(), "could not be evaluated") {
+		t.Fatalf("first Sync with a failed evaluation: %v, want it reported", err)
+	}
+	if r, ok := y.row(); !ok || r.Accepting || !strings.Contains(r.Detail, "could not be evaluated") {
+		t.Fatalf("first row with a failed evaluation = %+v (published %v)", r, ok)
 	}
 }
 

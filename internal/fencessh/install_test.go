@@ -304,3 +304,66 @@ func TestInstallScript_ABlindScanInstallsNothing(t *testing.T) {
 		t.Fatalf("an Include path with a space: drop-in %q, output %q", w.dropIn(t), out)
 	}
 }
+
+// result runs the install with env and returns what it set
+// LV_FENCE_SSH_RESULT to, the outcome `lv host install-fence-ssh` reads.
+func (w *installWorld) result(t *testing.T, env ...string) string {
+	t.Helper()
+	cmd := exec.Command("bash", "-c", InstallScript+"\nlv_fence_ssh_install >/dev/null\necho \"${LV_FENCE_SSH_RESULT-unset}\"")
+	cmd.Env = append(os.Environ(), append([]string{
+		"FENCE_SSH_SSHD_CONFIG=" + w.cfg, "FENCE_SSH_DROPIN_DIR=" + w.ddir, "FENCE_SSH_DIR=" + w.dir,
+		"FENCE_SSH_SSHD=" + SSHDPath(), "FENCE_SSH_RELOAD=true",
+	}, env...)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install script: %v\n%s", err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// TestInstallScript_ReportsItsOutcome: the script still returns 0 on every
+// path, so it names its outcome in LV_FENCE_SSH_RESULT: installed only when
+// the drop-in is in place and sshd was reloaded, removed only when it is gone
+// and sshd was reloaded; every refusal says refused, and a failed reload says
+// unreloaded.
+func TestInstallScript_ReportsItsOutcome(t *testing.T) {
+	w := newInstallWorld(t, "")
+	if got := w.result(t, "FENCE_SSH_PEERS=10.77.0.3"); got != ResultInstalled || w.dropIn(t) == "" {
+		t.Fatalf("install: result %q, drop-in %q", got, w.dropIn(t))
+	}
+	if got := w.result(t, "FENCE_SSH_PEERS=10.77.0.3", "FENCE_SSH_RELOAD=false"); got != ResultUnreloaded {
+		t.Fatalf("install with a failed reload: result %q", got)
+	}
+	if got := w.result(t, "FENCE_SSH_REMOVE=1", "FENCE_SSH_RELOAD=false"); got != ResultUnreloaded {
+		t.Fatalf("remove with a failed reload: result %q", got)
+	}
+	if got := w.result(t, "FENCE_SSH_REMOVE=1"); got != ResultRemoved || w.dropIn(t) != "" {
+		t.Fatalf("remove: result %q, drop-in %q", got, w.dropIn(t))
+	}
+	refusing := filepath.Join(t.TempDir(), "sshd")
+	if err := os.WriteFile(refusing, []byte("#!/bin/sh\nfor a; do [ \"$a\" = -t ] && { echo 'refused for the test' >&2; exit 1; }; done\nexec "+
+		SSHDPath()+" \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.result(t, "FENCE_SSH_PEERS=10.77.0.3", "FENCE_SSH_SSHD="+refusing); got != ResultRefused || w.dropIn(t) != "" {
+		t.Fatalf("install sshd -t refuses: result %q, drop-in %q", got, w.dropIn(t))
+	}
+	if got := w.result(t, "FENCE_SSH_SSHD=/nonexistent/sshd"); got != ResultRefused {
+		t.Fatalf("no sshd: result %q", got)
+	}
+	noInclude := &installWorld{cfg: sshdConfig(t, ""), ddir: w.ddir, dir: w.dir}
+	if got := noInclude.result(t, "FENCE_SSH_PEERS=10.77.0.3"); got != ResultRefused {
+		t.Fatalf("no Include: result %q", got)
+	}
+	blind := filepath.Join(t.TempDir(), "sshd")
+	if err := os.WriteFile(blind, []byte("#!/bin/sh\nfor a; do [ \"$a\" = -ddd ] && { echo 'Bad configuration option: Nope' >&2; exit 255; }; done\nexec "+
+		SSHDPath()+" \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.result(t, "FENCE_SSH_PEERS=10.77.0.3", "FENCE_SSH_SSHD="+blind); got != ResultRefused {
+		t.Fatalf("sshd -ddd -T fails: result %q", got)
+	}
+	if out := w.run(t, "FENCE_SSH_PEERS=10.77.0.3", "FENCE_SSH_SSHD="+blind); !strings.Contains(out, "Bad configuration option: Nope") {
+		t.Fatalf("a failed sshd -ddd -T does not quote sshd: %q", out)
+	}
+}

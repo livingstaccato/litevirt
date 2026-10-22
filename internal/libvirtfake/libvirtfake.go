@@ -222,6 +222,9 @@ type Fake struct {
 	// (partition pause, docs/design/partition-pause.md §3.4).
 	FailSuspendDomain func(name string) error
 	FailResumeDomain  func(name string) error
+	// FailKillPartitionPaused fails KillPartitionPaused (a missing or
+	// foreign pid file).
+	FailKillPartitionPaused func(name string) error
 	// FailListDomains makes domain enumeration fail — the shape of a libvirtd
 	// outage, which marks the host's runtime inventory INCOMPLETE and must
 	// refuse new residency at admission time.
@@ -698,6 +701,45 @@ func (f *Fake) ResumeFirmwareMoveSourceForOperator(name, uuid, attempt string) e
 func (f *Fake) ResumePartitionPaused(name, uuid string) error {
 	defer f.daemon()()
 	return f.fwExemptResume(libvirt.FirmwareCall{Op: libvirt.OpResume, Name: name, UUID: uuid, Via: libvirt.ViaResumePartitionPaused})
+}
+
+// KillPartitionPaused mirrors libvirt.Client.KillPartitionPaused: the
+// domain's QEMU is killed without libvirt (so the firmware move guard is not
+// asked; the daemon gate is, since a dead daemon kills nothing), and the
+// domain is shut off, crashed. A
+// domain that is not running or paused has no QEMU, which is success; one
+// that is not defined, or whose uuid is not uuid, has no pid file to prove
+// it, which is an error. FailKillPartitionPaused fails it.
+func (f *Fake) KillPartitionPaused(name, uuid string) error {
+	defer f.daemon()()
+	if f.FailKillPartitionPaused != nil {
+		if err := f.FailKillPartitionPaused(name); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.domains[name]
+	if !ok {
+		return fmt.Errorf("libvirtfake: kill qemu of %s: no pid file", name)
+	}
+	if uuid != "" {
+		if got := domainUUIDFromXML(f.liveXMLLocked(name)); !strings.EqualFold(got, uuid) {
+			return fmt.Errorf("libvirtfake: kill qemu of %s: its QEMU has uuid %q, not %q", name, got, uuid)
+		}
+	}
+	if st != StateRunning && st != StatePaused {
+		return nil
+	}
+	f.leftStateLocked(name)
+	f.domains[name] = StateShutdown
+	delete(f.liveConsolePw, name)
+	if f.offReason == nil {
+		f.offReason = map[string]string{}
+	}
+	f.offReason[name] = "crashed"
+	f.record("kill", name, "")
+	return nil
 }
 
 // ResumeFirmwareMoveTarget mirrors libvirt.Client.ResumeFirmwareMoveTarget.

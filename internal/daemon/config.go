@@ -25,6 +25,7 @@ import (
 	"github.com/litevirt/litevirt/internal/obs"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 	"github.com/litevirt/litevirt/internal/pressure"
+	"github.com/litevirt/litevirt/internal/watchdog"
 )
 
 const defaultConfigPath = "/etc/litevirt/config.yaml"
@@ -74,7 +75,10 @@ type Config struct {
 	DNSPort        int      `yaml:"dns_port"`     // UDP port for embedded DNS (default 5354)
 	DNSDomain      string   `yaml:"dns_domain"`   // base domain, e.g. "litevirt.local"
 	WatchdogDev    string   `yaml:"watchdog_dev"` // e.g. "/dev/watchdog"; empty = disabled
-	RESTPort       int      `yaml:"rest_port"`    // HTTP REST gateway port (default 7446; 0 = disabled)
+	// Watchdog bounds the boot keeper (watchdog.KeepBootAlive), which pets a
+	// watchdog timer a previous run left running while this daemon boots.
+	Watchdog WatchdogConfig `yaml:"watchdog"`
+	RESTPort int            `yaml:"rest_port"` // HTTP REST gateway port (default 7446; 0 = disabled)
 
 	// AntiEntropyIntervalSec is how often the anti-entropy loop compares state
 	// digests with peers and full-syncs on drift. 0 = default (60s). Lower it
@@ -335,6 +339,43 @@ type ContainersConfig struct {
 	// paths does not start there.
 	BindMountPaths []string `yaml:"bind_mount_paths,omitempty"`
 	DevicePaths    []string `yaml:"device_paths,omitempty"`
+}
+
+// WatchdogConfig bounds how long boot may keep alive a watchdog timer that a
+// previous run left running (a crash, or a stop that held workloads). Past
+// these bounds a daemon that cannot finish booting lets the timer fire, so a
+// host whose daemon never comes back still reboots: at most
+// boot_keeper_streak_window_sec plus the watchdog timeout after the first
+// boot that never reached the heartbeat.
+type WatchdogConfig struct {
+	// BootKeeperStreakWindowSec: boots that never reach the heartbeat are a
+	// streak, timed from the first one; boot petting stops once the streak is
+	// this old. Default 300.
+	BootKeeperStreakWindowSec int `yaml:"boot_keeper_streak_window_sec"`
+	// BootKeeperMaxBoots: boot petting stops after this many boots in the
+	// streak. Default 5.
+	BootKeeperMaxBoots int `yaml:"boot_keeper_max_boots"`
+	// BootKeeperMaxSec: each boot pets for at most this long before it must
+	// reach the heartbeat (a hung boot). Default 120.
+	BootKeeperMaxSec int `yaml:"boot_keeper_max_sec"`
+	// LivenessStaleSec: on a configured, verified, armed watchdog, the
+	// heartbeat stops petting, and self-fences, once neither a state-store
+	// round trip nor the partition pauser has made progress for this long.
+	// Default 120; 0 turns the gate off; otherwise at least 120 (twice the
+	// hardware timeout).
+	LivenessStaleSec int `yaml:"liveness_stale_sec"`
+}
+
+func (w WatchdogConfig) validate() error {
+	if w.BootKeeperStreakWindowSec < 0 || w.BootKeeperMaxBoots < 0 || w.BootKeeperMaxSec < 0 {
+		return fmt.Errorf("watchdog.boot_keeper_*: values must not be negative (0 turns the boot keeper off)")
+	}
+	if min := int(watchdog.MinLivenessStale / time.Second); w.LivenessStaleSec < 0 ||
+		(w.LivenessStaleSec > 0 && w.LivenessStaleSec < min) {
+		return fmt.Errorf("watchdog.liveness_stale_sec: %d must be 0 (off) or at least %d, twice the hardware watchdog timeout",
+			w.LivenessStaleSec, min)
+	}
+	return nil
 }
 
 // validate refuses container defaults that cannot work.
@@ -1050,6 +1091,8 @@ func LoadConfig() (*Config, error) {
 
 		ContainerRestoreTimeoutSec: 600,
 
+		Watchdog: WatchdogConfig{BootKeeperStreakWindowSec: 300, BootKeeperMaxBoots: 5, BootKeeperMaxSec: 120, LivenessStaleSec: 120},
+
 		Containers: ContainersConfig{DefaultPidsMax: 4096, IDMapBase: 1_000_000_000, IDMapRanges: 30000, IDMappedRootfs: "auto"},
 
 		QuorumLossDemoteAfterSec: 12,
@@ -1087,6 +1130,9 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: %w", err)
 	}
 
+	if err := cfg.Watchdog.validate(); err != nil {
+		return nil, err
+	}
 	if err := cfg.Containers.validate(); err != nil {
 		return nil, err
 	}

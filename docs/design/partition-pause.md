@@ -347,6 +347,10 @@ instead, §3.3):
   self-fences, exactly as the VIP demoter does when a demotion cannot be
   confirmed. The host reboots, the VMs stop, and the disks are untouched.
 
+A VM whose resume a healed pass abandoned, and which is still out in
+libvirt, is not suspended: its QEMU is killed (§4.1). Only a kill that
+fails, or a container's Unfreeze still out, is a pause failure.
+
 **The majority does not count a host as paused when it holds an open
 `partition_pause_failed` for that host** (§4.3). The majority sees this only
 for a failure it has heard about: one from before the partition (a fleet-wide
@@ -465,6 +469,7 @@ partition-pause: workload stays paused kind=vm name=d1a reason="voter node-4 has
 | `F` | 5 | consecutive failures for a fence vote (`FailuresToFence`) |
 | `Δ` | 1 s | pauser tick |
 | `E` | 5 s | bound on executing the pauses (per-call timeout, all workloads) |
+| `R` | 3 s | bound on one step of a healed pass (`health.PartitionResumeStepBound`), the longest the pass goes without a quorum reading. A step is one pending-settle retry, one record's checks and settle, the majority confirmation, or one resume; everything it does ends by its deadline, and a call still running then is abandoned and its workload stays paused for a later pass. The pass reads the quorum before every step after its first and once more after its last resume, stops at once if the majority is gone, and pauses again what it resumed. It takes on steps only while within `E` of its start (the first of each phase always, with the whole of `R`), and the next pass starts where it stopped |
 
 **Minority detection, `D_M`.** Let `b` be the moment the link from the
 minority host M to a majority voter V breaks. M's first probe of V that starts
@@ -505,10 +510,71 @@ same arithmetic over the region's voters.
 **So M pauses by:**
 
 ```
-max_V b_V + D_M + Δ + T_pause + Δ + E
-  ≤ t_d − 8 + 12 + 1 + T_pause + 1 + 5
-  = t_d + T_pause + 11 s
+max_V b_V + D_M + Δ + R + T_pause + Δ + E
+  ≤ t_d − 8 + 12 + 1 + 3 + T_pause + 1 + 5
+  = t_d + T_pause + 14 s
 ```
+
+The `R` term is a healed M that is inside a resume pass when the link breaks:
+it takes its first not-Yes reading at most one step later than a quiet M
+would. That reading counts toward the loss like any other, and the
+workloads that pass resumed are paused again at once; the ones earlier passes
+resumed are paused on the ordinary path, by the bound above.
+
+**The re-pause adds nothing to the bound.** It runs on the pauser's own loop,
+which takes no reading and pauses nothing else meanwhile, so it must not hold
+the loop long: its pauses run at once, each under the per-call timeout, and
+the whole re-pause returns within `E` however many there are and however they
+hang. It starts at M's first not-Yes reading `x`. The ordinary pause of what
+earlier passes resumed cannot come before `x + T_pause`, when that loss has
+covered `T_pause`, and the loop is free again by `x + E ≤ x + T_pause − Δ`.
+Run one after another, eight suspends hung on a dead storage fabric held the
+loop 16 s, and those workloads paused that much past the bound.
+`TestPartitionPauseWaitCoversTheMinority` pins `E + Δ ≤ T_pause`.
+
+**A resume abandoned at its step's deadline** keeps its record, and the call
+is still out. It may land at any moment, and no suspend issued meanwhile is
+sure to come after it. The pauser handles it three ways:
+
+- **It lands while the majority stays.** If every reading since its step
+  began was Yes, a fresh reading is Yes, and a majority of voters confirms
+  the workload again, the resume stands. That is as safe as a resume that
+  landed on time: a loss is read no later than for that one, and pauses the
+  workload on the ordinary path. Otherwise it is paused again at once, and a later pass
+  resumes it on a fresh confirmation.
+- **A pause pass runs while it is still out.** The pass kills the domain's
+  QEMU directly, by libvirt's pid file and the process's own `-uuid`, without
+  a libvirt call, which may hang too. Every vCPU thread leaves `KVM_RUN` on
+  the fatal signal and never enters it again, so the call cannot land after
+  the pass. The pass is the moment `W` counts on, so no copy of that VM runs
+  here past `t_d + W`. The kill counts as a stop only once the QEMU has
+  **exited**, within the call's timeout, not once the signal is queued. A
+  killed QEMU skips the flush a suspend does, and its disks' writeback pages
+  are written as its files close on exit. When the storage is cut along with
+  the voters (NFS, iSCSI), that close waits in an uninterruptible sleep with
+  the pages still in this host's page cache, and they would land on the
+  replacement's disk when the storage returns. So a QEMU that has not exited
+  in time is a failed kill (next item), as a suspend whose flush hangs is a
+  failed pause. When it has exited, its writes are on the disk or failed,
+  and the majority recovers the VM from its disks. What a crash-consistent
+  disk does not hold, the guest's RAM and unflushed guest caches, is lost, as
+  in a crash. One residual remains: a userspace network block client (librbd)
+  may have requests already queued in the dead process's socket buffers,
+  which can still be delivered after the exit. The self-fence has the same
+  residual until the reboot. Only blocklisting the client at the storage
+  closes it.
+- **The kill cannot be done**, or the QEMU has not exited in time, or the
+  workload is a container. A container's
+  Unfreeze has no such stop. The pass reports the workload in
+  `partition_pause_failed`, and self-fences when a verified watchdog is
+  armed. It cannot tell this call from one about to land, and with the
+  majority lost for `T_pause` the host is being fenced either way. The cost is
+  the host's non-recoverable workloads. If the call then lands after `W`, the
+  workload runs beside its replacement until the undo takes effect, one call
+  later, or until the next pause pass (`Δ + E`) if the undo fails. The
+  watchdog does not shorten that: the reboot comes one hardware timeout
+  (60 s by default) after the fence. This is the F2 residual (§7) applied to
+  one workload.
 
 **Choices.**
 
@@ -516,10 +582,10 @@ max_V b_V + D_M + Δ + T_pause + Δ + E
   own verdict. A loss shorter than that would never have been fenced, so
   pausing for it buys nothing. A blip that is shorter than `D_M + T_pause`
   (12–22 s, depending on where the probe cycles fall) pauses nothing.
-- **Margin** = `max(0, D_M − (F−1)·P) + 2Δ + E + slack`, which is
-  `4 + 2 + 5 + 2 = 13 s`. The 2 s of slack covers scheduling and the monotonic
+- **Margin** = `max(0, D_M − (F−1)·P) + 2Δ + R + E + slack`, which is
+  `4 + 2 + 3 + 5 + 2 = 16 s`. The 2 s of slack covers scheduling and the monotonic
   clocks' rate error (well under 0.1% over 30 s).
-- **`W` = `T_pause` + margin = 23 s**, measured from `t_d`.
+- **`W` = `T_pause` + margin = 26 s**, measured from `t_d`.
 
 **Accumulated loss changes nothing here** (§3.1). From the moment M's links to
 the quorum observers are continuously broken, M's readings are continuously
@@ -559,12 +625,12 @@ means: from the latest instant the majority can prove M was still in contact.
 
 **What it costs.** On the lab, quorum came 23 s after the partition
 (`t_d` ≈ +23 s) and d1a started 10 s after that, at about +33 s. With Layer 2
-latched it starts no earlier than `t_d + W` = `t_d + 23 s`, so at about +46 s
+latched it starts no earlier than `t_d + W` = `t_d + 26 s`, so at about +49 s
 after the partition instead of +33 s.
 
 All of these values are constants in `internal/health/partition_pause.go`.
 `TestPartitionPauseWaitCoversTheMinority` pins the inequality
-`W(n) ≥ max(0, D_M(n) − (F−1)·P) + 2Δ + E + T_pause + slack` against the live
+`W(n) ≥ max(0, D_M(n) − (F−1)·P) + 2Δ + R + E + T_pause + slack` against the live
 constants, for 5, 17, 18 and 40 hosts, so retuning a probe constant cannot
 silently break it. None of them is a config key. The majority computes `W` from
 the same constants the minority runs on, and a per-node knob would break that
@@ -866,15 +932,15 @@ fixed size (`health.PartitionPauseWaitFor(n)`):
 ```
 C(n)   = max(P, ⌈n/16⌉·τ)
 D_M(n) = (k+1)·C(n)
-W(n)   = T_pause + max(0, D_M(n) − (F−1)·P) + 2Δ + E + slack
+W(n)   = T_pause + max(0, D_M(n) − (F−1)·P) + 2Δ + R + E + slack
 ```
 
 | Hosts | Probe targets `n` | `C(n)` | `D_M(n)` | `W(n)` |
 |---|---|---|---|---|
-| 5 | 4 | 3 s | 12 s | 23 s |
-| 17 | 16 | 3 s | 12 s | 23 s |
-| 18 | 17 | 6 s | 24 s | 35 s |
-| 40 | 39 | 9 s | 36 s | 47 s |
+| 5 | 4 | 3 s | 12 s | 26 s |
+| 17 | 16 | 3 s | 12 s | 26 s |
+| 18 | 17 | 6 s | 24 s | 38 s |
+| 40 | 39 | 9 s | 36 s | 50 s |
 
 **Which `n`.** The minority's probe count is what matters, and the coordinator
 cannot read it. It takes the largest count either side could be running with,
@@ -1102,7 +1168,7 @@ container (`split_brain`), so a certified relocation can only lead to a stop.
 
 | # | Case | What happens | Residual |
 |---|---|---|---|
-| F1 | The minority's daemon is dead (crash, OOM, hung) | Nothing pauses. The majority still waits `W` and then recovers. | A dual run, as today. A hardware watchdog closes it, because daemon death trips it. Layer 3 settles it when the daemon returns. |
+| F1 | The minority's daemon is dead (crash, OOM, hung) | Nothing pauses. The majority still waits `W` and then recovers. | A dual run, as today. A hardware watchdog closes it, because daemon death trips it: a dead daemon pets nothing, a successor that cannot finish booting pets it for at most `watchdog.boot_keeper_streak_window_sec` (300 s), so the host reboots within that plus the watchdog timeout (about 6 min), and, on a configured and verified watchdog, a live daemon whose DB round trips or pauser make no progress for `watchdog.liveness_stale_sec` (120 s) stops petting and self-fences. Layer 3 settles it when the daemon returns. |
 | F2 | A suspend fails inside a full partition | The minority raises `partition_pause_failed`, retries every tick, and self-fences if a verified watchdog is armed. | Without a watchdog, the majority cannot learn of the failure until the heal, so it counts a pause that did not happen. Layer 3 settles it on return. |
 | F2a | The record cannot be written, or its write hangs (a full or dying `data_dir`) | `pause` (the default) pauses with the record in the reserve or in memory. `reserve` and `self_fence` fail the pause and self-fence when a verified watchdog is armed; without one they pause with the record in memory (`fallback=no_verified_watchdog`). A write that has not returned within `min(2 s, pass budget)` counts as failed (§3.3). | A daemon that dies holding a record in memory only comes back to a paused domain with no record, which it never resumes itself: held, with no `lv` path to resume it yet. |
 | F3 | The daemon restarts during the partition | Its loss clock starts at its own start, so it pauses at most `T_pause` + warmup after the restart. | If the restart lands after the majority's decision, the pause can miss the deadline by up to the restart's length. Layer 3 settles it. |

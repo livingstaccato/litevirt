@@ -124,6 +124,28 @@ dns_domain: "litevirt.local"
 # (split-brain risk). Override with LITEVIRT_UNSAFE_SKIP_WATCHDOG_CHECK=1.
 watchdog_dev: ""
 
+# Bounds on petting, during startup, a watchdog timer that a previous daemon
+# left running (a crash, or a stop while it owned workloads). Each startup
+# pets for at most boot_keeper_max_sec; startups that never reach the
+# heartbeat stop being petted after boot_keeper_max_boots, or once the first
+# of them is boot_keeper_streak_window_sec old. A host whose daemon cannot
+# come back then reboots at the watchdog timeout. 0 in any turns startup
+# petting off (the timer is then first petted when the heartbeat starts).
+#
+# liveness_stale_sec: with watchdog_dev set and the device verified as a
+# counting hardware watchdog, the daemon stops petting it, and self-fences,
+# once neither a state-store round trip nor the partition pauser has made any
+# progress for this long, so a wedged daemon cannot keep its workloads behind
+# a petted watchdog. Progress is timed on the monotonic clock, so a wall-clock
+# step is not a wedge. 0 turns this off; otherwise it must be at least 120
+# (twice the hardware watchdog timeout). It does nothing in auto mode
+# (watchdog_dev empty) or on an unverified device.
+watchdog:
+  boot_keeper_streak_window_sec: 300
+  boot_keeper_max_boots: 5
+  boot_keeper_max_sec: 120
+  liveness_stale_sec: 120
+
 # Load-balancer VIP split-brain safety (see migration-failover.md).
 # quorum_loss_demote_after_sec: sustained local quorum loss before an isolated
 #   LB host stands its own VIPs down (must be > 0). Default 12.
@@ -436,7 +458,7 @@ enforcement:
                               # confirms nothing moved it. Advertises partition_pause_v1
                               # only while on; once that latches, a coordinator whose
                               # best-effort fence cannot reach a host waits out that host's
-                              # pause (23 s after its decision on up to 17 hosts, longer on
+                              # pause (26 s after its decision on up to 17 hosts, longer on
                               # larger clusters) before recovering, and records the fence as
                               # self_paused. Runs whether or not a hardware watchdog is armed
                               # (the watchdog fires only when the daemon dies); a verified

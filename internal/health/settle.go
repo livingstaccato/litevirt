@@ -337,25 +337,29 @@ func (r *Reconciler) resolveSettled(ctx context.Context, localDomains []string) 
 // the frozen local copy is stopped (its rootfs kept), with a partition.settle
 // audit row and ct_settled, retried until written (settle_pending.go). It
 // reports whether it settled, and if not, why.
-func (p *PartitionPauser) settleContainer(ctx context.Context, rec PauseRecord) (bool, string) {
+//
+// Everything it does ends by deadline, the end of its step in the resume
+// pass: the stop is abandoned there, and is not started at all with less
+// than settleStopMin left (short), so the next pass starts with it.
+func (p *PartitionPauser) settleContainer(ctx context.Context, rec PauseRecord, deadline time.Time) (settled bool, why string, short bool) {
 	if p.settle == nil || p.cts == nil {
-		return false, ""
+		return false, "", false
 	}
 	rows, err := p.db.Query(ctx, `SELECT host_name FROM containers WHERE name = ? AND deleted_at IS NULL AND host_name != ?`,
 		rec.Name, p.host)
 	if err != nil {
-		return false, "container rows unreadable: " + err.Error()
+		return false, "container rows unreadable: " + err.Error(), false
 	}
 	if len(rows) != 1 {
-		return false, fmt.Sprintf("%d live rows for the container on other hosts, not one", len(rows))
+		return false, fmt.Sprintf("%d live rows for the container on other hosts, not one", len(rows)), false
 	}
 	dest := rows[0].String("host_name")
 	row, err := corrosion.GetContainer(ctx, p.db, dest, rec.Name)
 	if err != nil || row == nil {
-		return false, "the destination row is unreadable"
+		return false, "the destination row is unreadable", false
 	}
 	if corrosion.IncarnationOf(row.CreatedAt) != rec.Incarnation {
-		return false, "the live row is another incarnation"
+		return false, "the live row is another incarnation", false
 	}
 	lister := p.settleProofs
 	if lister == nil {
@@ -363,30 +367,40 @@ func (p *PartitionPauser) settleContainer(ctx context.Context, rec PauseRecord) 
 	}
 	proofs, err := lister(ctx, p.db, corrosion.ClaimKindContainer, rec.Name)
 	if err != nil {
-		return false, "proofs unreadable: " + err.Error()
+		return false, "proofs unreadable: " + err.Error(), false
 	}
 	pr, cert, why := settleDecideContainer(p.host, dest, rec, proofs, func(ap corrosion.ActionProof) (corrosion.ClaimCertificate, error) {
 		return p.settle(ctx, ap)
 	}, destRunsVia(ctx, p.peerRuntime, rec.Name))
 	if why != "" {
-		return false, why
+		return false, why, false
 	}
 	detail := fmt.Sprintf("stopped the frozen local copy (incarnation %s, owner epoch %d): superseded by proof %s for %s, "+
 		"certified at voter generation %d for owner epoch %d; rootfs kept", rec.Incarnation, rec.OwnerEpoch, pr.ID, dest,
 		cert.ConfigGeneration, cert.Key.OwnerEpoch)
+	left := time.Until(deadline)
+	if left < settleStopMin {
+		return false, fmt.Sprintf("%v of this pass left, too little to stop it; a later pass does", left.Round(time.Millisecond)), true
+	}
+	// lxc-stop waits this long for the container to act on its SIGPWR before
+	// it kills it; a frozen one never acts on it, so no more than the step has.
+	grace := min(10, max(1, int((left-500*time.Millisecond)/time.Second)))
 	w := p.settleRec()
 	pending := w.newPending(PauseKindContainer, rec.Name, detail, pr, cert, rec.Incarnation, rec.OwnerEpoch, "partition-pause record")
 	if err := w.stopRecorded(ctx, pending, func() error {
-		sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		return p.cts.Stop(sctx, rec.Name, 10)
+		name := rec.Name
+		return p.callWithin(rec.Key(), time.Until(deadline), false, func() error {
+			sctx, cancel := context.WithDeadline(ctx, deadline)
+			defer cancel()
+			return p.cts.Stop(sctx, name, grace)
+		}, nil)
 	}); err != nil {
-		return false, "stop failed: " + err.Error()
+		return false, "stop failed: " + err.Error(), false
 	}
 	slog.Warn("partition-settle: stopped a local copy that a certified recovery claim gave to another host",
 		"ct", rec.Name, "host", p.host, "dest", dest, "proof", pr.ID, "claim_epoch", cert.Key.OwnerEpoch, "local_epoch", rec.OwnerEpoch)
 	w.dropMatchingPause(pending)
-	return true, ""
+	return true, "", false
 }
 
 // settleDecideContainer is settleDecide for a container: the record is the

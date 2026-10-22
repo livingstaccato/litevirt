@@ -731,6 +731,27 @@ killed guest may be started again, as before this change, and the marker is
 left on disk. Upgrading again replays it if it still applies (or removes it
 if the guest runs again).
 
+**`lv ct stop` on a quarantined host.** A container's stop is kept by the
+same `operator-stop` record, so a stop the host cannot record is undone by
+the container's restart policy. A plain `lv ct stop` there is refused with
+`FailedPrecondition` before the container is touched, naming
+`lv ct stop --force`. The forced stop works as `lv stop --force` does: it
+first writes `ct-operator-stops/<name>.json` under the `data_dir` (durably,
+naming the host, the container's `created_at` and its owner epoch), then
+stops the container; if the marker cannot be written it is refused and the
+container keeps running. While the marker is there, the container's restart
+policy does not start it and `lv ct start` is refused. Once the quarantine
+lifts, the host's next reconcile pass, or an `lv ct start` that comes first,
+records the stop on the container's row (`stopped` / `operator-stop`) and
+removes the marker, only while the row is still that incarnation at that
+owner epoch; a marker whose container was deleted, created again, moved or
+owned again under a later generation, or that runs again, is removed with
+nothing recorded. A marker that cannot be read fails closed, as a VM's does,
+and raises `operator_stop_marker_corrupt` with subject `container/<name>`.
+Out of quarantine `--force` changes nothing. The same rollback limit
+applies: a build older than this one ignores the directory, so its restart
+policy may start the container again.
+
 **Before you roll back**, ask the cluster what would block it:
 
 ```bash

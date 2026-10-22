@@ -521,6 +521,7 @@ lv ct create <name> --restart on-failure [--restart-max-attempts 5 --restart-del
 lv ct create <name> --on-host-failure image-recreate   # rebuild on a surviving host if this one is fenced
 lv ct start <name>
 lv ct stop <name>                                     # a container already stopped succeeds, recording the stop
+lv ct stop <name> --force                             # on a host in write quarantine: stopped, recorded once the quarantine lifts
 lv ct rm <name>                                       # a stopped container; a running one is refused
 lv ct rm <name> --force                               # a running container: stopped, then deleted
 lv ct ls

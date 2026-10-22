@@ -1752,7 +1752,18 @@ message ConvertContainerRequest {
 }
 
 message StartContainerRequest  { string host_name = 1; string name = 2; }
-message StopContainerRequest   { string host_name = 1; string name = 2; int32 timeout_sec = 3; }
+message StopContainerRequest {
+    string host_name = 1;
+    string name = 2;
+    int32 timeout_sec = 3;
+    // force lets the stop go ahead on a host in write quarantine, which cannot
+    // record it on the container's row: the stop is first recorded in a local
+    // marker on that host, then the container is stopped, and the host records
+    // it on the row once the quarantine lifts. Without it such a stop is refused
+    // (FailedPrecondition). Out of quarantine it changes nothing. A server older
+    // than the field ignores it.
+    bool force = 4;
+}
 message DeleteContainerRequest {
     string host_name = 1;
     string name = 2;

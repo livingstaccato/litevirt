@@ -15912,10 +15912,17 @@ func (x *StartContainerRequest) GetName() string {
 }
 
 type StopContainerRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	HostName      string                 `protobuf:"bytes,1,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"`
-	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	TimeoutSec    int32                  `protobuf:"varint,3,opt,name=timeout_sec,json=timeoutSec,proto3" json:"timeout_sec,omitempty"`
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	HostName   string                 `protobuf:"bytes,1,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"`
+	Name       string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	TimeoutSec int32                  `protobuf:"varint,3,opt,name=timeout_sec,json=timeoutSec,proto3" json:"timeout_sec,omitempty"`
+	// force lets the stop go ahead on a host in write quarantine, which cannot
+	// record it on the container's row: the stop is first recorded in a local
+	// marker on that host, then the container is stopped, and the host records
+	// it on the row once the quarantine lifts. Without it such a stop is refused
+	// (FailedPrecondition). Out of quarantine it changes nothing. A server older
+	// than the field ignores it.
+	Force         bool `protobuf:"varint,4,opt,name=force,proto3" json:"force,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -15969,6 +15976,13 @@ func (x *StopContainerRequest) GetTimeoutSec() int32 {
 		return x.TimeoutSec
 	}
 	return 0
+}
+
+func (x *StopContainerRequest) GetForce() bool {
+	if x != nil {
+		return x.Force
+	}
+	return false
 }
 
 type DeleteContainerRequest struct {
@@ -47005,12 +47019,13 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\adevices\x18\a \x03(\v2\x1c.litevirt.v1.ContainerDeviceR\adevices\"H\n" +
 	"\x15StartContainerRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x12\n" +
-	"\x04name\x18\x02 \x01(\tR\x04name\"h\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\"~\n" +
 	"\x14StopContainerRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x1f\n" +
 	"\vtimeout_sec\x18\x03 \x01(\x05R\n" +
-	"timeoutSec\"_\n" +
+	"timeoutSec\x12\x14\n" +
+	"\x05force\x18\x04 \x01(\bR\x05force\"_\n" +
 	"\x16DeleteContainerRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x14\n" +

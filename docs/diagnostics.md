@@ -2802,6 +2802,12 @@ To clear it, look at the file, then record the stop with `lv stop <vm>`: a
 stop recorded on the VM's row removes its marker, whatever the marker holds.
 Then `lv start <vm>` starts it.
 
+`lv ct stop --force` keeps a container's marker the same way, in
+`<data_dir>/ct-operator-stops/<name>.json`. One that cannot be read holds the
+container stopped (no restart policy, no `lv ct start`) and raises the same
+condition with subject `container/<name>`. Its remedy is `lv ct stop <name>`,
+then `lv ct start <name>`; for a deleted container, remove the file by hand.
+
 While the host is still in write quarantine, leave the file: nothing can
 start the VM there meanwhile (`lv start` is refused, and the automated starts
 cannot take their lease), and removing it loses the operator's stop — the row

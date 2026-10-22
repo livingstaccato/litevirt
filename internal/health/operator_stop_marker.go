@@ -102,6 +102,12 @@ func WriteOperatorStopMarker(dataDir string, m OperatorStopMarker) error {
 	if m.Version == 0 {
 		m.Version = operatorStopMarkerVersion
 	}
+	return writeStopMarkerFile(dataDir, p, m.VM, m)
+}
+
+// writeStopMarkerFile writes v as JSON to p (a marker of name in a directory
+// directly under dataDir) durably, as WriteOperatorStopMarker describes.
+func writeStopMarkerFile(dataDir, p, name string, v any) error {
 	dir := filepath.Dir(p)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
@@ -111,11 +117,11 @@ func WriteOperatorStopMarker(dataDir string, m OperatorStopMarker) error {
 	if err := syncDir(dataDir); err != nil {
 		return fmt.Errorf("fsync %s: %w", dataDir, err)
 	}
-	b, err := json.Marshal(m)
+	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, "."+m.VM+".tmp-*")
+	tmp, err := os.CreateTemp(dir, "."+name+".tmp-*")
 	if err != nil {
 		return err
 	}
@@ -140,39 +146,24 @@ func WriteOperatorStopMarker(dataDir string, m OperatorStopMarker) error {
 	return nil
 }
 
-// ReadOperatorStopMarker reads vm's marker. ok is false when there is none.
-// A marker that exists and cannot be read, parsed or understood returns an
-// error wrapping ErrOperatorStopMarkerCorrupt.
-func ReadOperatorStopMarker(dataDir, vm string) (m OperatorStopMarker, ok bool, err error) {
-	p, err := OperatorStopMarkerPath(dataDir, vm)
-	if err != nil {
-		return m, false, err
-	}
+// readStopMarkerFile reads p into v. ok is false when there is none; a file
+// that cannot be read or parsed wraps ErrOperatorStopMarkerCorrupt.
+func readStopMarkerFile(p string, v any) (ok bool, err error) {
 	b, err := os.ReadFile(p)
 	if errors.Is(err, fs.ErrNotExist) {
-		return m, false, nil
+		return false, nil
 	}
 	if err != nil {
-		return m, false, fmt.Errorf("%w: read %s: %v", ErrOperatorStopMarkerCorrupt, p, err)
+		return false, fmt.Errorf("%w: read %s: %v", ErrOperatorStopMarkerCorrupt, p, err)
 	}
-	if err := json.Unmarshal(b, &m); err != nil {
-		return m, false, fmt.Errorf("%w: %s: %v", ErrOperatorStopMarkerCorrupt, p, err)
+	if err := json.Unmarshal(b, v); err != nil {
+		return false, fmt.Errorf("%w: %s: %v", ErrOperatorStopMarkerCorrupt, p, err)
 	}
-	switch {
-	case m.Version != operatorStopMarkerVersion:
-		return m, false, fmt.Errorf("%w: %s: version %d, this build reads %d", ErrOperatorStopMarkerCorrupt, p, m.Version, operatorStopMarkerVersion)
-	case m.VM != vm || m.Host == "" || m.Incarnation == "":
-		return m, false, fmt.Errorf("%w: %s: names VM %q host %q incarnation %q", ErrOperatorStopMarkerCorrupt, p, m.VM, m.Host, m.Incarnation)
-	}
-	return m, true, nil
+	return true, nil
 }
 
-// RemoveOperatorStopMarker removes vm's marker durably. Absent is success.
-func RemoveOperatorStopMarker(dataDir, vm string) error {
-	p, err := OperatorStopMarkerPath(dataDir, vm)
-	if err != nil {
-		return err
-	}
+// removeStopMarkerFile removes p durably. Absent is success.
+func removeStopMarkerFile(p string) error {
 	if err := os.Remove(p); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
@@ -182,13 +173,10 @@ func RemoveOperatorStopMarker(dataDir, vm string) error {
 	return syncDir(filepath.Dir(p))
 }
 
-// ListOperatorStopMarkers returns the VM names that have a marker file,
+// listStopMarkerFiles returns the names that have a marker file in dir,
 // sorted. No directory is none.
-func ListOperatorStopMarkers(dataDir string) ([]string, error) {
-	if dataDir == "" {
-		return nil, nil
-	}
-	ents, err := os.ReadDir(OperatorStopMarkerDir(dataDir))
+func listStopMarkerFiles(dir string) ([]string, error) {
+	ents, err := os.ReadDir(dir)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
@@ -205,6 +193,44 @@ func ListOperatorStopMarkers(dataDir string) ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// ReadOperatorStopMarker reads vm's marker. ok is false when there is none.
+// A marker that exists and cannot be read, parsed or understood returns an
+// error wrapping ErrOperatorStopMarkerCorrupt.
+func ReadOperatorStopMarker(dataDir, vm string) (m OperatorStopMarker, ok bool, err error) {
+	p, err := OperatorStopMarkerPath(dataDir, vm)
+	if err != nil {
+		return m, false, err
+	}
+	if ok, err := readStopMarkerFile(p, &m); !ok || err != nil {
+		return m, false, err
+	}
+	switch {
+	case m.Version != operatorStopMarkerVersion:
+		return m, false, fmt.Errorf("%w: %s: version %d, this build reads %d", ErrOperatorStopMarkerCorrupt, p, m.Version, operatorStopMarkerVersion)
+	case m.VM != vm || m.Host == "" || m.Incarnation == "":
+		return m, false, fmt.Errorf("%w: %s: names VM %q host %q incarnation %q", ErrOperatorStopMarkerCorrupt, p, m.VM, m.Host, m.Incarnation)
+	}
+	return m, true, nil
+}
+
+// RemoveOperatorStopMarker removes vm's marker durably. Absent is success.
+func RemoveOperatorStopMarker(dataDir, vm string) error {
+	p, err := OperatorStopMarkerPath(dataDir, vm)
+	if err != nil {
+		return err
+	}
+	return removeStopMarkerFile(p)
+}
+
+// ListOperatorStopMarkers returns the VM names that have a marker file,
+// sorted. No directory is none.
+func ListOperatorStopMarkers(dataDir string) ([]string, error) {
+	if dataDir == "" {
+		return nil, nil
+	}
+	return listStopMarkerFiles(OperatorStopMarkerDir(dataDir))
 }
 
 // OperatorStopHold says why vm must not be started on host because of its
@@ -302,13 +328,23 @@ func OperatorStopMarkerCorruptRemedy(vm string) string {
 // corrupt. A host in write quarantine cannot write it; its log and the
 // litevirt_operator_stop_markers gauge carry the alert meanwhile.
 func ReportCorruptOperatorStopMarkers(ctx context.Context, db *corrosion.Client, dataDir, host string, corrupt map[string]string) error {
+	return reportCorruptStopMarkers(ctx, db, host, "vm", corrupt, func(name string) (string, string) {
+		p, _ := OperatorStopMarkerPath(dataDir, name)
+		return p, OperatorStopMarkerCorruptRemedy(name)
+	})
+}
+
+// reportCorruptStopMarkers is ReportCorruptOperatorStopMarkers for the
+// workloads of subjectKind ("vm" or "container"); about gives a marker's
+// path and remedy.
+func reportCorruptStopMarkers(ctx context.Context, db *corrosion.Client, host, subjectKind string, corrupt map[string]string, about func(name string) (path, remedy string)) error {
 	open, err := corrosion.ListOpenHealthConditionsByCode(ctx, db, OperatorStopMarkerEvaluator, CondOperatorStopMarkerCorrupt)
 	if err != nil {
 		return err
 	}
 	openHere := map[string]corrosion.HealthCondition{}
 	for _, row := range open {
-		if row.SubjectKind == "vm" && row.Reporter == host {
+		if row.SubjectKind == subjectKind && row.Reporter == host {
 			openHere[row.SubjectID] = row
 		}
 	}
@@ -318,11 +354,11 @@ func ReportCorruptOperatorStopMarkers(ctx context.Context, db *corrosion.Client,
 		if _, ok := openHere[name]; ok {
 			continue
 		}
-		p, _ := OperatorStopMarkerPath(dataDir, name)
-		ev, _ := json.Marshal(operatorStopMarkerEvidence{Host: host, Path: p, Error: why, Remedy: OperatorStopMarkerCorruptRemedy(name)})
+		p, remedy := about(name)
+		ev, _ := json.Marshal(operatorStopMarkerEvidence{Host: host, Path: p, Error: why, Remedy: remedy})
 		row := corrosion.HealthCondition{
 			Evaluator: OperatorStopMarkerEvaluator, Code: CondOperatorStopMarkerCorrupt,
-			SubjectKind: "vm", SubjectID: name,
+			SubjectKind: subjectKind, SubjectID: name,
 			Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityCritical,
 			Hosts: []string{host}, Evidence: string(ev), ObserveCount: 1,
 			FirstSeen: now, LastSeen: now, ConfirmedAt: now, Reporter: host,

@@ -590,6 +590,46 @@ func SetContainerStateDetailStrictAtEpoch(ctx context.Context, c *Client, hostNa
 	return nil
 }
 
+// containerStateDetailAtEpochSQL is SetContainerStateDetailStrictAtEpoch's
+// statement, spelled the same, so its shape is the same.
+const containerStateDetailAtEpochSQL = `UPDATE containers SET state = ?, state_detail = ?, updated_at = ?
+		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL AND owner_epoch = ?`
+
+// SetContainerStateDetailIfOwner is SetContainerStateDetailStrictAtEpoch
+// only while (hostName, name)'s live row is still the one a caller recorded:
+// of incarnation createdAt (IncarnationOf) and at owner epoch expectedEpoch,
+// checked inside the write's transaction. A row deleted, re-created or owned
+// again under a later generation since is not written: ErrNoRowsAffected.
+// The statement carries the epoch, so on a peer whose row moved to a newer
+// generation it matches nothing; the incarnation guard is local. For the
+// replay of a container stop recorded on a host while it could not write
+// (health/container_operator_stop_marker.go).
+func SetContainerStateDetailIfOwner(ctx context.Context, c *Client, hostName, name, createdAt string, expectedEpoch int64, state, detail string) error {
+	now := c.NowTS()
+	stmt := Statement{SQL: containerStateDetailAtEpochSQL, Params: []interface{}{state, detail, now, hostName, name, expectedEpoch}}
+	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var curCreated string
+		var epoch int64
+		err := tx.QueryRowContext(ctx,
+			`SELECT created_at, owner_epoch FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+			hostName, name).Scan(&curCreated, &epoch)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return IncarnationOf(curCreated) == IncarnationOf(createdAt) && epoch == expectedEpoch, nil
+	}, []Statement{stmt})
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return ErrNoRowsAffected
+	}
+	return nil
+}
+
 // SetContainerStateDetail updates state + state_detail together (leaving
 // restart_policy untouched). Used by StopContainer to record operator intent
 // ('operator-stop') and by the container reconciler to sync the cluster row to

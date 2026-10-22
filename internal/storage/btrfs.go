@@ -68,8 +68,34 @@ func (d *btrfsDriver) Prepare(ctx context.Context) error {
 // btrfsSuperMagic is BTRFS_SUPER_MAGIC, the statfs type of a btrfs filesystem.
 const btrfsSuperMagic = 0x9123683E
 
+// btrfsDiskSubvolume is the subvolume CreateDisk makes under root to hold
+// one disk.
+func btrfsDiskSubvolume(root, vm, disk string) string {
+	return filepath.Join(root, fmt.Sprintf("%s-%s", vm, disk))
+}
+
+// BtrfsDiskSubvolume returns the subvolume a btrfs pool's CreateDisk made to
+// hold disk `disk` of VM `vm`, given the path it returned. ok is false when
+// cfg is not a btrfs pool or path is not directly inside that subvolume.
+func BtrfsDiskSubvolume(cfg Config, vm, disk, path string) (string, bool) {
+	if !strings.EqualFold(cfg.Driver, "btrfs") || cfg.Source == "" {
+		return "", false
+	}
+	sub := btrfsDiskSubvolume(filepath.Clean(cfg.Source), vm, disk)
+	if filepath.Dir(filepath.Clean(sub)) != filepath.Clean(cfg.Source) || filepath.Dir(filepath.Clean(path)) != sub {
+		return "", false
+	}
+	return sub, true
+}
+
+// OverrideBtrfsFilesystemForTest makes every path read as on a btrfs
+// filesystem (statfs), so a btrfs pool on a test directory prepares.
+func OverrideBtrfsFilesystemForTest() (restore func()) {
+	return statfsInfo.set(func(string) (uint32, string, error) { return btrfsSuperMagic, "0000000100000002", nil })
+}
+
 func (d *btrfsDriver) CreateDisk(ctx context.Context, opts DiskOptions) (string, error) {
-	subvol := filepath.Join(d.subvolRoot, fmt.Sprintf("%s-%s", opts.VMName, opts.DiskName))
+	subvol := btrfsDiskSubvolume(d.subvolRoot, opts.VMName, opts.DiskName)
 	if out, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "btrfs", "subvolume", "create", "--", subvol)); err != nil {
 		return "", fmt.Errorf("btrfs subvolume create %s: %w: %s", subvol, err, out)
 	}

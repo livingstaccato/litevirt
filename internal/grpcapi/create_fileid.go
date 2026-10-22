@@ -42,6 +42,20 @@ func pinFile(p string) (*pinnedFile, error) {
 	return &pinnedFile{f: f, fi: fi}, nil
 }
 
+// pinDir opens the directory p and holds it, as pinFile does a file.
+func pinDir(p string) (*pinnedFile, error) {
+	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return &pinnedFile{f: f, fi: fi}, nil
+}
+
 // pinMade pins a file a create or clone just made (pinFile), failing as
 // s.pinFault says first where a test set it.
 func (s *Server) pinMade(p string) (*pinnedFile, error) {

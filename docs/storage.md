@@ -761,7 +761,9 @@ never cleaned up by the failed create. Choose another VM or disk name.
 
 A failed create or clone removes the disks and cloud-init seed it made, and
 only those: each is held open from when it is made, so a file put at the same
-path since is never mistaken for it. One it could not hold open (an open
+path since is never mistaken for it. On a btrfs pool it then removes the
+subvolume the disk was made in, only while that subvolume is empty, so a retry
+of the name can make it again. One it could not hold open (an open
 refused by the file limit or the file's mode), or could not remove, is left
 where it is, and the create's or clone's error names each such file and why
 (`the failed create left what it made: ...`). Remove it once nothing uses it,

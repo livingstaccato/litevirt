@@ -629,8 +629,17 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// another file at the path), and named in its error. A disk that is
 	// not a file (rbd, a volume) is removed by its driver whatever this says.
 	createdDiskPinErr := map[string]error{}
+	// createdSubvol is the btrfs subvolume a pool disk was made in (its
+	// driver makes one per disk), held from right after: once the disk is
+	// removed, a failed create removes the subvolume too, only while it is
+	// still that directory and empty, so a retry of the name can make it
+	// again and nothing put in it since is ever deleted with it.
+	createdSubvol := map[string]*pinnedFile{}
 	defer func() {
 		for _, pf := range createdDiskFile {
+			pf.release()
+		}
+		for _, pf := range createdSubvol {
 			pf.release()
 		}
 	}()
@@ -695,6 +704,27 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		createdSeedFile.release()
 		createdSeed, createdSeedFile = "", nil
 	}
+	// removeSubvol removes the subvolume the pool disk p (just removed) was
+	// made in, while it is still the directory made then. rmdir, never a
+	// recursive delete: it removes the subvolume only while it is empty
+	// (btrfs deletes an empty subvolume on rmdir), so a file someone put in
+	// it is never lost with it.
+	removeSubvol := func(p string, sv *pinnedFile) {
+		dir := filepath.Dir(p)
+		delete(createdSubvol, p)
+		if !sv.stillAt(dir) {
+			sv.release()
+			noteUndo("subvolume " + dir + " left: it is no longer the one this create made")
+			return
+		}
+		sv.release()
+		if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
+			slog.Warn("cleanup: failed to remove the disk's btrfs subvolume", "path", dir, "error", err)
+			noteLeft(fmt.Sprintf("subvolume %s (not removed: %v)", dir, err))
+			return
+		}
+		noteUndo("removed subvolume " + dir)
+	}
 	cleanupDisks := func() {
 		removeSeed()
 		// A domain of the name that is not this create's names paths a
@@ -739,6 +769,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			createdDiskFile[p].release()
 			delete(createdDiskFile, p)
 			noteUndo("removed disk " + p)
+			if sv := createdSubvol[p]; sv != nil {
+				removeSubvol(p, sv)
+			}
 		}
 		if s.cleanedUpHook != nil {
 			s.cleanedUpHook()
@@ -893,6 +926,16 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			// removes nothing, or only the /dev symlink.
 			if err == nil && !isFileBasedDriver(volCfg.Driver) {
 				createdBy[diskPath] = drv
+			}
+			if err == nil {
+				if sub, ok := storage.BtrfsDiskSubvolume(volCfg, spec.Name, d.Name, diskPath); ok {
+					if sv, perr := pinDir(sub); perr == nil {
+						createdSubvol[diskPath] = sv
+					} else {
+						slog.Warn("a failed create will leave this disk's btrfs subvolume: it could not be held open",
+							"path", sub, "error", perr)
+					}
+				}
 			}
 			// A clone of an image bigger than the size asked for IS that size:
 			// the row records what exists, so accounting does not under-count.

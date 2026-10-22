@@ -639,12 +639,36 @@ type PCIRealizationRecord struct {
 // tombstoned member resurrects it.
 func UpsertPCIRealization(ctx context.Context, c *Client, r PCIRealizationRecord) error {
 	now := c.NowTS()
-	return c.Execute(ctx,
-		`INSERT OR REPLACE INTO vm_pci_realizations
-		 (vm_name, device_id, member_id, host_name, resolved_address, xml_alias, ordinal, updated_at, deleted_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+	return c.Execute(ctx, upsertPCIRealizationSQL,
 		r.VMName, r.DeviceID, r.MemberID, r.HostName,
 		nullIfEmpty(r.ResolvedAddress), nullIfEmpty(r.XMLAlias), r.Ordinal, now)
+}
+
+const upsertPCIRealizationSQL = `INSERT OR REPLACE INTO vm_pci_realizations
+		 (vm_name, device_id, member_id, host_name, resolved_address, xml_alias, ordinal, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+
+const tombstonePCIRealizationsSQL = `UPDATE vm_pci_realizations SET deleted_at = ?, updated_at = ? WHERE vm_name = ? AND device_id = ?`
+
+// ReplacePCIRealizations makes rows the live realization set of vmName's
+// intent deviceID in ONE replicated batch: with retire, every existing row of
+// the intent is tombstoned first, then each of rows is upserted with a later
+// timestamp (NowTS is strictly monotonic), so the rows kept are live again.
+// No crash can leave the intent's old rows retired and its new ones unwritten.
+// Without retire it is the upserts alone.
+func ReplacePCIRealizations(ctx context.Context, c *Client, vmName, deviceID string, retire bool, rows []PCIRealizationRecord) error {
+	var stmts []Statement
+	if retire {
+		stmts = append(stmts, Statement{SQL: tombstonePCIRealizationsSQL, Params: []interface{}{nowRFC3339(), c.NowTS(), vmName, deviceID}})
+	}
+	for _, r := range rows {
+		stmts = append(stmts, Statement{SQL: upsertPCIRealizationSQL, Params: []interface{}{r.VMName, r.DeviceID, r.MemberID, r.HostName,
+			nullIfEmpty(r.ResolvedAddress), nullIfEmpty(r.XMLAlias), r.Ordinal, c.NowTS()}})
+	}
+	if len(stmts) == 0 {
+		return nil
+	}
+	return c.ExecuteBatch(ctx, stmts)
 }
 
 // TombstonePCIRealizations soft-deletes EVERY vm_pci_realizations row for
@@ -654,9 +678,7 @@ func UpsertPCIRealization(ctx context.Context, c *Client, r PCIRealizationRecord
 // realization set, not leave stale members mixed in alongside the new ones.
 func TombstonePCIRealizations(ctx context.Context, c *Client, vmName, deviceID string) error {
 	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE vm_pci_realizations SET deleted_at = ?, updated_at = ? WHERE vm_name = ? AND device_id = ?`,
-		nowRFC3339(), now, vmName, deviceID)
+	return c.Execute(ctx, tombstonePCIRealizationsSQL, nowRFC3339(), now, vmName, deviceID)
 }
 
 // ListVMPCIRealizations returns every LIVE (deleted_at IS NULL)

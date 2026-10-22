@@ -935,9 +935,30 @@ func (s *Server) pciStartPreflight(ctx context.Context, vm *corrosion.VMRecord, 
 		if rerr := s.unbindAndReleaseOwnership(ctx, vm.Name, freshlyClaimed); rerr != nil {
 			return rerr
 		}
+		// A device the VM keeps owning (it owned it before this start: not in
+		// freshlyClaimed) keeps its realization row: retiring it would leave
+		// the VM owning a device no row says realizes its intent, which a
+		// type selector's next start does not reuse.
+		fresh := make(map[string]bool, len(freshlyClaimed))
+		for _, a := range freshlyClaimed {
+			fresh[a] = true
+		}
 		for _, dev := range deviceOrder {
-			if terr := corrosion.TombstonePCIRealizations(ctx, s.db, vm.Name, dev); terr != nil {
-				slog.Warn("pci start-preflight: tombstone realizations on rollback", "vm", vm.Name, "device", dev, "error", terr)
+			var kept []ResolvedMember
+			for _, m := range byDevice[dev] {
+				if !fresh[m.Address] {
+					kept = append(kept, m)
+				}
+			}
+			var terr error
+			switch {
+			case len(kept) == 0:
+				terr = corrosion.TombstonePCIRealizations(ctx, s.db, vm.Name, dev)
+			case len(kept) < len(byDevice[dev]):
+				terr = corrosion.ReplacePCIRealizations(ctx, s.db, vm.Name, dev, true, s.realizationRows(vm.Name, dev, kept))
+			}
+			if terr != nil {
+				slog.Warn("pci start-preflight: retire realizations on rollback", "vm", vm.Name, "device", dev, "error", terr)
 			}
 		}
 		return nil
@@ -1537,8 +1558,9 @@ func (s *Server) ownedRealizationsHere(ctx context.Context, vmName, deviceID str
 // sibling before and does not now, or the other way round), the old rows are
 // tombstoned first: an upsert alone would leave the extra member live, and the
 // next reconcile would refuse the intent for a realized set larger than what
-// it resolves to. The upsert that follows writes a later timestamp, so the
-// members kept are live again.
+// it resolves to. Tombstone and upserts are one batch
+// (corrosion.ReplacePCIRealizations), so a crash cannot leave the intent with
+// no live row while the VM still owns its device.
 func (s *Server) replacePCIRealizations(ctx context.Context, vmName, deviceID string, members []ResolvedMember) error {
 	reals, err := corrosion.ListVMPCIRealizations(ctx, s.db, vmName)
 	if err != nil {
@@ -1558,10 +1580,19 @@ func (s *Server) replacePCIRealizations(ctx context.Context, vmName, deviceID st
 	for id := range have {
 		changed = changed || !want[id]
 	}
-	if changed {
-		if err := corrosion.TombstonePCIRealizations(ctx, s.db, vmName, deviceID); err != nil {
-			return fmt.Errorf("retire the PCI realizations of %s/%s: %w", vmName, deviceID, err)
-		}
+	if err := corrosion.ReplacePCIRealizations(ctx, s.db, vmName, deviceID, changed, s.realizationRows(vmName, deviceID, members)); err != nil {
+		return fmt.Errorf("record PCI realizations of %s/%s: %w", vmName, deviceID, err)
 	}
-	return s.writePCIRealizations(ctx, vmName, deviceID, members)
+	return nil
+}
+
+// realizationRows is members as this host's realization rows of vmName's
+// intent deviceID.
+func (s *Server) realizationRows(vmName, deviceID string, members []ResolvedMember) []corrosion.PCIRealizationRecord {
+	rows := make([]corrosion.PCIRealizationRecord, 0, len(members))
+	for _, m := range members {
+		rows = append(rows, corrosion.PCIRealizationRecord{VMName: vmName, DeviceID: deviceID, MemberID: m.MemberID, HostName: s.hostName,
+			ResolvedAddress: m.Address, XMLAlias: pciMemberAlias(deviceID, m.MemberID), Ordinal: m.Ordinal})
+	}
+	return rows
 }

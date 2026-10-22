@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -308,6 +309,89 @@ func TestAllocateDevices_MixedSelectorsOneGroupEachOrder(t *testing.T) {
 			}
 			if len(seen) != 2 || seen["0000:81:00.0"] != 1 || seen["0000:81:00.1"] != 1 {
 				t.Errorf("addresses %v; want each of the pair once", addrs)
+			}
+		})
+	}
+}
+
+// The start preflight over one IOMMU group {GPU 81:00.0, audio 81:00.1}, with
+// an address, a type or a mapping for each, in each intent order: it starts,
+// realizes each device once, and gives each intent its own device (the GPU
+// selector the GPU, the audio selector the audio function).
+func TestPCIStartPreflight_MixedSelectorsOneGroupEachOrder(t *testing.T) {
+	defer vfio.SetFS(newPCIBindFakeFS())()
+	gpuAddr := &pb.DeviceSpec{Address: "0000:81:00.0"}
+	audAddr := &pb.DeviceSpec{Address: "0000:81:00.1"}
+	gpuType := &pb.DeviceSpec{Type: "gpu"}
+	audMap := &pb.DeviceSpec{Mapping: "aud"}
+	for _, tc := range []struct {
+		name     string
+		a, b     *pb.DeviceSpec
+		aIsAudio bool
+	}{
+		{"addr gpu, addr audio", gpuAddr, audAddr, false},
+		{"addr audio, addr gpu", audAddr, gpuAddr, true},
+		{"type gpu, addr audio", gpuType, audAddr, false},
+		{"addr audio, type gpu", audAddr, gpuType, true},
+		{"addr gpu, map audio", gpuAddr, audMap, false},
+		{"map audio, addr gpu", audMap, gpuAddr, true},
+		{"type gpu, map audio", gpuType, audMap, false},
+		{"map audio, type gpu", audMap, gpuType, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, fake := provableCreateServer(t)
+			ctx := adminCtx()
+			for _, d := range []struct{ addr, typ string }{{"0000:81:00.0", "gpu"}, {"0000:81:00.1", "audio"}} {
+				if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{HostName: "test-host", Address: d.addr, Type: d.typ, VendorID: "10de", IOMMUGroup: 20}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := corrosion.CreateResourceMapping(ctx, s.db, "aud", ""); err != nil {
+				t.Fatal(err)
+			}
+			if err := corrosion.AddMappingDevice(ctx, s.db, "aud", "test-host", "0000:81:00.1", "10de", "22a3"); err != nil {
+				t.Fatal(err)
+			}
+			spec, err := json.Marshal(&pb.VMSpec{Name: "vm-x", Cpu: 1, MemoryMib: 256, Devices: []*pb.DeviceSpec{tc.a, tc.b}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			vm := corrosion.VMRecord{Name: "vm-x", HostName: "test-host", State: "pending", CPUActual: 1, MemActual: 256, Spec: string(spec)}
+			if err := corrosion.InsertVM(ctx, s.db, vm, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := fake.DefineDomain(`<domain type='kvm'><name>vm-x</name><devices></devices></domain>`); err != nil {
+				t.Fatal(err)
+			}
+			var intents []corrosion.PCIIntentRecord
+			for i, d := range []*pb.DeviceSpec{tc.a, tc.b} {
+				kind, key := corrosion.ClassifyPCISelector(d)
+				p, err := protojson.Marshal(d)
+				if err != nil {
+					t.Fatal(err)
+				}
+				intents = append(intents, corrosion.PCIIntentRecord{VMName: "vm-x", DeviceID: []string{"d1", "d2"}[i], HostName: "test-host",
+					SelectorKind: kind, SelectorPayload: string(p), ExclusiveKey: key})
+			}
+			release, err := s.pciStartPreflight(ctx, &vm, intents)
+			if err != nil {
+				t.Fatalf("refused: %v", err)
+			}
+			_ = release
+			reals, err := corrosion.ListVMPCIRealizations(ctx, s.db, "vm-x")
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := map[string][]string{}
+			for _, r := range reals {
+				got[r.DeviceID] = append(got[r.DeviceID], r.ResolvedAddress)
+			}
+			gpuID, audID := "d1", "d2"
+			if tc.aIsAudio {
+				gpuID, audID = "d2", "d1"
+			}
+			if len(reals) != 2 || len(got[gpuID]) != 1 || got[gpuID][0] != "0000:81:00.0" || len(got[audID]) != 1 || got[audID][0] != "0000:81:00.1" {
+				t.Errorf("realizations %v; want %s=[0000:81:00.0] and %s=[0000:81:00.1]", got, gpuID, audID)
 			}
 		})
 	}

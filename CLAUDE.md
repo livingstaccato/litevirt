@@ -128,7 +128,7 @@ finally failed.
 Hardening features are gated on cluster-wide capability tokens
 (`internal/capabilities`). The pattern is uniform:
 
-- each has an `enforcement.*` config flag, default **false**. There are six
+- each has an `enforcement.*` config flag, default **false**. There are seven
   exceptions, which default **true** (the preset in `LoadConfig`,
   `internal/daemon/config.go`), and an explicit `false` is the kill switch of
   each:
@@ -158,6 +158,15 @@ Hardening features are gated on cluster-wide capability tokens
     anti-entropy row digest is negotiated pairwise by wire-field presence, so a
     non-uniform rollout is safe; with it off, replicas founded at different
     schema versions disagree about identical rows forever.
+  - `enforcement.vrrp_unicast`: moves the load balancers' VRRP adverts off
+    the VIP's bridge, where any guest can read and answer them, to unicast
+    between the LB hosts' recorded addresses, once `vrrp_unicast_v1` has
+    latched. Peers rely on every host rendering the same transport, so the
+    token is withheld while the flag is off, until it has latched; a `false`
+    on any host holds the switch off cluster-wide. After the latch the flag
+    decides nothing: the transport is one cluster-wide value, and its
+    stand-down is `lv cluster vrrp-transport multicast` (docs/upgrades.md,
+    docs/configuration.md).
   - `enforcement.project_adoption`: not a capability token's flag. It gates
     this host's own adoption pass, which gives each project created before
     `project_incarnation_v1` latched its stable incarnation (the release

@@ -1335,6 +1335,14 @@ The overlay's backing is the NBD export, declared as a **raw** backing
 self-contained; without it the NBD server stays up until you Ctrl+C (after
 running `virsh blockpull <vm> <dev> --wait` yourself).
 
+With `--auto-start`, the backed-up VM's PCI passthrough devices are attached
+from this host's inventory, as `lv run` attaches them. A device the host cannot
+provide refuses the restore. `--without-devices` starts the VM without them
+instead: they are removed from the restored VM's spec, the progress names them,
+and the audit log records a `vm.devices_dropped` entry (degraded). If the
+restore fails after the devices were attached and before the VM runs, they are
+released at once.
+
 If you prefer to drive it manually, omit `--auto-start`/`--blockpull` and
 `virsh define && virsh start` against the overlay, then blockpull. Use
 `--from-existing` to source the domain spec from the existing `vms` record

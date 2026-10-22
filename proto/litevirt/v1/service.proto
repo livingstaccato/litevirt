@@ -2493,6 +2493,11 @@ message RestoreLiveRequest {
     // tear the NBD server down (self-terminating). Without it the stream
     // stays open until the operator closes it (operator-driven localize).
     bool   blockpull  = 11;
+    // without_devices: auto_start only. Start the restored VM without the
+    // backed-up VM's PCI passthrough devices; they are removed from its
+    // stored spec, and the drop is audited. Without it, a device this host
+    // cannot provide refuses the restore.
+    bool   without_devices = 12;
 }
 message RestoreLiveProgress {
     enum Phase {

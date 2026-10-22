@@ -28,6 +28,10 @@
         <label><input type="checkbox" name="auto_start" checked> Define &amp; start the VM off the overlay</label>
       </div>
       <div class="form-row">
+        <label><input type="checkbox" name="without_devices"> Start it without the backup's PCI passthrough devices</label>
+        <small class="muted">With auto-start only. Otherwise a device this host cannot provide refuses the restore.</small>
+      </div>
+      <div class="form-row">
         <label><input type="checkbox" name="blockpull" checked> Block-pull to localize the disk, then tear down NBD (recommended)</label>
       </div>
       <div id="backup-progress"></div>

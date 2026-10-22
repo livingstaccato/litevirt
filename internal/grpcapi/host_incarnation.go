@@ -60,7 +60,9 @@ func (s *Server) hostOperatorWriteAllowed(ctx context.Context, action, name stri
 		return nil
 	}
 	if ok, why := s.db.ReplicaCaughtUp(); !ok {
-		alone, err := s.clusterOfOne(ctx)
+		// name itself, while still joining, does not count against being
+		// alone: a founder can remove a host it half-admitted.
+		alone, err := s.clusterOfOneBut(ctx, name, "")
 		if err != nil {
 			return status.Errorf(codes.Unavailable, "read this node's peers: %v", err)
 		}

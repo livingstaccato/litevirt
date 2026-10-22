@@ -295,9 +295,14 @@ func (s *Server) ArmNICFirewall(ctx context.Context, req *pb.ArmNICFirewallReque
 		if st, serr := s.virt.DomainStateReason(req.GetVmName()); serr == nil && st.State == "running" {
 			return &emptypb.Empty{}, nil // let run already (this host's resumer, or a retry)
 		}
-		if _, paused, _ := health.ReadPauseRecord(s.dataDir, health.PauseKindVM, req.GetVmName()); paused {
+		if _, paused, perr := health.ReadPauseRecord(s.dataDir, health.PauseKindVM, req.GetVmName()); paused || perr != nil {
 			// Partition pause holds it: that is its pauser's to resume
-			// (re-review m2), never a late hand-over retry's.
+			// (re-review m2), never a late hand-over retry's. A pause state
+			// this host cannot read is held the same way.
+			if perr != nil {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"%s: its partition-pause state is unreadable (%v), so it is held paused", req.GetVmName(), perr)
+			}
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"%s is paused for a partition (partition pause); it resumes when the partition does", req.GetVmName())
 		}

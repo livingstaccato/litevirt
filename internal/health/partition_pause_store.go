@@ -52,15 +52,20 @@ type PauseRecord struct {
 // Key identifies a record: kind/name.
 func (r PauseRecord) Key() string { return r.Kind + "/" + r.Name }
 
-// pauseStore reads and writes the record directory. The zero value (no dir)
-// stores nothing and lists nothing.
-type pauseStore struct{ dir string }
+// pauseStore reads and writes the record directory, the reserve beside it and
+// the records this process holds in memory only (partition_pause_reserve.go).
+// The zero value (no dir) stores nothing and lists nothing.
+type pauseStore struct {
+	dir string
+	st  *pauseDirState
+}
 
 func newPauseStore(dataDir string) pauseStore {
 	if dataDir == "" {
 		return pauseStore{}
 	}
-	return pauseStore{dir: filepath.Join(dataDir, partitionPauseDir)}
+	dir := filepath.Join(dataDir, partitionPauseDir)
+	return pauseStore{dir: dir, st: pauseStateFor(dir)}
 }
 
 func pauseFileName(kind, name string) (string, error) {
@@ -79,13 +84,18 @@ func pauseFileName(kind, name string) (string, error) {
 	return kind + "-" + name + ".json", nil
 }
 
-// put writes rec durably: temp file, fsync, rename, directory fsync.
+// put writes rec durably to the record directory: temp file, fsync, rename,
+// directory fsync. It is the disk layer alone; the pauser records through
+// record, which falls back as its mode allows.
 func (s pauseStore) put(rec PauseRecord) error {
 	if s.dir == "" {
 		return errors.New("partition pause: no data directory to record the pause in")
 	}
 	fn, err := pauseFileName(rec.Kind, rec.Name)
 	if err != nil {
+		return err
+	}
+	if err := s.st.injected(PauseRecordLayerDisk, rec); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(s.dir, 0o700); err != nil {
@@ -117,8 +127,8 @@ func (s pauseStore) put(rec PauseRecord) error {
 	return syncDir(s.dir)
 }
 
-// remove deletes kind/name's record. Absent is success.
-func (s pauseStore) remove(kind, name string) error {
+// removeDisk deletes kind/name's record file. Absent is success.
+func (s pauseStore) removeDisk(kind, name string) error {
 	if s.dir == "" {
 		return nil
 	}
@@ -135,8 +145,8 @@ func (s pauseStore) remove(kind, name string) error {
 	return syncDir(s.dir)
 }
 
-// get reads kind/name's record; ok=false when absent.
-func (s pauseStore) get(kind, name string) (PauseRecord, bool, error) {
+// getDisk reads kind/name's record file; ok=false when absent.
+func (s pauseStore) getDisk(kind, name string) (PauseRecord, bool, error) {
 	if s.dir == "" {
 		return PauseRecord{}, false, nil
 	}
@@ -147,10 +157,10 @@ func (s pauseStore) get(kind, name string) (PauseRecord, bool, error) {
 	return readPauseRecord(filepath.Join(s.dir, fn))
 }
 
-// list returns every record, sorted by key. A record that does not parse is
-// an error, never a skip: a skipped record is a paused workload nothing will
-// ever resume.
-func (s pauseStore) list() ([]PauseRecord, error) {
+// listDisk returns every record file, sorted by key. A record that does not
+// parse is an error, never a skip: a skipped record is a paused workload
+// nothing will ever resume.
+func (s pauseStore) listDisk() ([]PauseRecord, error) {
 	if s.dir == "" {
 		return nil, nil
 	}

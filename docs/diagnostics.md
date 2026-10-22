@@ -952,10 +952,19 @@ Operational notes:
 - **Re-image / dataDir wipe.** A node whose `dataDir` is wiped loses its high-water and
   regains the regression window until its wall clock passes the pre-wipe ceiling. Ensure
   NTP is healthy before rejoining.
+- **A full disk does not stop the clock** on ext4 and xfs. `nowts.hwm` has a fixed size
+  and is overwritten in place, so saving the ceiling needs no new disk space there. On
+  btrfs and ZFS an in-place write still needs new space (copy-on-write). The daemon marks
+  the file no-copy-on-write when it creates it, which avoids that on btrfs except for the
+  first save after each snapshot of the subvolume; ZFS has no equivalent, so a full ZFS
+  data directory still stops the daemon as described below. The daemon writes
+  it in that layout at start; a node upgraded from an earlier build converts the file
+  then, and a node rolled back to an earlier build still reads it.
 - **Persistence failure is fail-closed.** If the daemon cannot persist a higher ceiling
   and its in-memory headroom is exhausted, it **exits** rather than emit a key below the
-  last durable ceiling. Because the state DB shares the `dataDir` filesystem, a full disk
-  already fails writes; the crash surfaces it loudly. Recovery = free space.
+  last durable ceiling. That takes an error the in-place save cannot write around: an
+  I/O error, a read-only filesystem, or a disk that was already full when the file
+  needed creating or converting. The crash surfaces it loudly. Recovery = fix the filesystem.
 
 ## Equal-timestamp tie resolution
 
@@ -2252,7 +2261,15 @@ holder writes.
   could not pause a workload it had to. While it is open, the majority does
   not rely on this host's pause and recovers on an `assumed` fence as before.
   With a verified hardware watchdog armed the host also self-fences. It
-  resolves once every pause succeeds or the majority returns.
+  resolves once every pause succeeds or the majority returns. A record that
+  cannot be written (a full `data_dir`), or whose write does not return within
+  2 s, raises it only under `enforcement.partition_pause_record_failure:
+  self_fence`, or `reserve` with the reserve unwritable too, and only with a
+  verified watchdog armed; otherwise the host pauses anyway and logs
+  `partition-pause: cannot write the pause record to the record directory;
+  pausing with it held in reserve` (or `memory`), with
+  `fallback=no_verified_watchdog` when `reserve` or `self_fence` fell back for
+  want of a watchdog.
 - `partition_one_way` (host, critical): a quorum of voters cannot reach the
   host while the host's own rows, written after those failures began, still
   mark a majority healthy. That is a one-way partition, in which the host may
@@ -2720,6 +2737,27 @@ pass, and so does any verdict while the owner host is `offline`, `fenced` or in
 `maintenance`. `lv inspect <vm>` shows the verdict as it is read that way
 (`health` / `healthDetail`), which is the quickest way to see why a
 `vm_healthy` wait is still waiting.
+
+### VM paused on an I/O error (`vm_io_paused`)
+
+When a guest's disk write fails with ENOSPC — the storage pool its disks
+live on is full, or a thin volume has run out of backing space — QEMU pauses
+the guest rather than fail the write inside it. That is QEMU's default
+write-error policy (`werror=enospc`), and litevirt sets no other: any other
+write error (EIO) and every read error are reported to the guest, which is
+not paused. The VM's owner host raises `vm_io_paused` about it
+(evaluator `vm_io_pause`, subject `vm/<name>`, **warning** severity), with
+the pause reason (`paused_reason`, `io-error`), the `host` and a `remedy` in
+the evidence. The guest is frozen, not stopped: its row stays `running`, it
+is not recorded as an out-of-band stop, and the restart policy does not
+restart it. A pause an operator asked for raises nothing.
+
+litevirt does not resume the guest by itself. A resume into a pool that is
+still full pauses it again.
+
+| Raised when | Clears when |
+|---|---|
+| The owner's reconcile pass finds the VM's domain paused by libvirt for an I/O error. | The owner sees the domain in any other state: resumed (`virsh resume <vm>` on its host, once space is freed), stopped, or gone. A pass that cannot read the domain's state leaves it as it was. |
 
 ### Runtime owner mismatch (`runtime_owner_mismatch`)
 

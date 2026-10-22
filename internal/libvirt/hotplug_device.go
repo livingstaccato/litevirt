@@ -116,19 +116,15 @@ func interfaceForDetach(mac string, copies ...func() (string, error)) interfaceD
 
 // AttachHostdev hot-attaches a PCI device to a running domain.
 func (c *Client) AttachHostdev(domainName, pciAddress string) error {
-	parsed := ParsePCIAddress(pciAddress)
+	addr, err := pciHostdevAddress(pciAddress)
+	if err != nil {
+		return err
+	}
 	hd := hostdevDevice{
 		Mode:    "subsystem",
 		Type:    "pci",
 		Managed: "yes",
-		Source: hostdevSource{
-			Address: &hostdevAddress{
-				Domain:   parsed.Domain,
-				Bus:      parsed.Bus,
-				Slot:     parsed.Slot,
-				Function: parsed.Function,
-			},
-		},
+		Source:  hostdevSource{Address: addr},
 	}
 	return c.attachDeviceXML(domainName, hd)
 }
@@ -138,19 +134,15 @@ func (c *Client) AttachHostdev(domainName, pciAddress string) error {
 // alias in the persistent definition (the topology-preserving reconcile keys
 // hostdevs by their <alias>). An empty alias behaves exactly like AttachHostdev.
 func (c *Client) AttachHostdevWithAlias(domainName, pciAddress, alias string) error {
-	parsed := ParsePCIAddress(pciAddress)
+	addr, err := pciHostdevAddress(pciAddress)
+	if err != nil {
+		return err
+	}
 	hd := hostdevDevice{
 		Mode:    "subsystem",
 		Type:    "pci",
 		Managed: "yes",
-		Source: hostdevSource{
-			Address: &hostdevAddress{
-				Domain:   parsed.Domain,
-				Bus:      parsed.Bus,
-				Slot:     parsed.Slot,
-				Function: parsed.Function,
-			},
-		},
+		Source:  hostdevSource{Address: addr},
 	}
 	if alias != "" {
 		hd.Alias = &hostdevAlias{Name: alias}
@@ -160,19 +152,15 @@ func (c *Client) AttachHostdevWithAlias(domainName, pciAddress, alias string) er
 
 // DetachHostdev hot-detaches a PCI device from a running domain.
 func (c *Client) DetachHostdev(domainName, pciAddress string) error {
-	parsed := ParsePCIAddress(pciAddress)
+	addr, err := pciHostdevAddress(pciAddress)
+	if err != nil {
+		return err
+	}
 	hd := hostdevDevice{
 		Mode:    "subsystem",
 		Type:    "pci",
 		Managed: "yes",
-		Source: hostdevSource{
-			Address: &hostdevAddress{
-				Domain:   parsed.Domain,
-				Bus:      parsed.Bus,
-				Slot:     parsed.Slot,
-				Function: parsed.Function,
-			},
-		},
+		Source:  hostdevSource{Address: addr},
 	}
 	return c.detachDeviceXML(domainName, hd)
 }
@@ -183,19 +171,15 @@ func (c *Client) DetachHostdev(domainName, pciAddress string) error {
 // this detaches the hostdev from the config a cold boot loads without touching a live
 // domain. Same device XML as DetachHostdev — only the modify flags differ.
 func (c *Client) DetachHostdevConfig(domainName, pciAddress string) error {
-	parsed := ParsePCIAddress(pciAddress)
+	addr, err := pciHostdevAddress(pciAddress)
+	if err != nil {
+		return err
+	}
 	hd := hostdevDevice{
 		Mode:    "subsystem",
 		Type:    "pci",
 		Managed: "yes",
-		Source: hostdevSource{
-			Address: &hostdevAddress{
-				Domain:   parsed.Domain,
-				Bus:      parsed.Bus,
-				Slot:     parsed.Slot,
-				Function: parsed.Function,
-			},
-		},
+		Source:  hostdevSource{Address: addr},
 	}
 	return c.detachDeviceXMLConfig(domainName, hd)
 }

@@ -1037,6 +1037,8 @@ lv snapshot create <vm> <name>            # disk-only (external qcow2 overlay)
 lv snapshot create <vm> <name> --memory   # also capture guest RAM (live snapshot);
                                           # revert resumes the running VM at that instant.
                                           # Falls back to disk-only if the VM is stopped.
+                                          # Refused for a VM holding a PCI passthrough
+                                          # device (docs/pci-passthrough.md).
 lv snapshot ls <vm>                       # TYPE column shows disk | memory
 lv snapshot restore <vm> <name>           # repeatable; memory snapshots are host-local
 lv snapshot rm <vm> <name>
@@ -1224,6 +1226,7 @@ lv backup restore-live --repo <p> --vm <v> --disk <d> \
   [--name <new>]      # rename the restored VM (avoids collision with the original)
   [--blockpull]       # after start, localize the disk then tear down the NBD server
   [--from-existing]   # fall back to an existing vms record for the VM spec
+  [--without-devices] # with --auto-start: start without the backup's PCI devices (dropped from the spec, audited)
 
 # Aliases: `lv backup create` is `lv backup snapshot`, `lv backup restore` is `lv backup restore-from`
 lv backup create <vm> --repo <path> [flags as snapshot]

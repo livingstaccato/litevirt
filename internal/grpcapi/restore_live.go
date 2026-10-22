@@ -38,6 +38,10 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 		return status.Error(codes.InvalidArgument,
 			"repo_path, vm_name, disk_name, timestamp all required")
 	}
+	if req.WithoutDevices && !req.AutoStart {
+		return status.Error(codes.InvalidArgument,
+			"without_devices starts the restored VM without its PCI devices; it needs auto_start")
+	}
 	// The overlay becomes a VM's disk. It is a fresh file the daemon names, or
 	// one an admin names that does not exist yet — never a file already there
 	// (restore_dest.go).

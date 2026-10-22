@@ -21483,9 +21483,14 @@ type RestoreLiveRequest struct {
 	// blockpull: after start, drive blockpull to localize the disk, then
 	// tear the NBD server down (self-terminating). Without it the stream
 	// stays open until the operator closes it (operator-driven localize).
-	Blockpull     bool `protobuf:"varint,11,opt,name=blockpull,proto3" json:"blockpull,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Blockpull bool `protobuf:"varint,11,opt,name=blockpull,proto3" json:"blockpull,omitempty"`
+	// without_devices: auto_start only. Start the restored VM without the
+	// backed-up VM's PCI passthrough devices; they are removed from its
+	// stored spec, and the drop is audited. Without it, a device this host
+	// cannot provide refuses the restore.
+	WithoutDevices bool `protobuf:"varint,12,opt,name=without_devices,json=withoutDevices,proto3" json:"without_devices,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *RestoreLiveRequest) Reset() {
@@ -21591,6 +21596,13 @@ func (x *RestoreLiveRequest) GetFromExisting() bool {
 func (x *RestoreLiveRequest) GetBlockpull() bool {
 	if x != nil {
 		return x.Blockpull
+	}
+	return false
+}
+
+func (x *RestoreLiveRequest) GetWithoutDevices() bool {
+	if x != nil {
+		return x.WithoutDevices
 	}
 	return false
 }
@@ -48002,7 +48014,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04vcpu\x18\x04 \x01(\x05R\x04vcpu\x12\x1d\n" +
 	"\n" +
 	"memory_mib\x18\x05 \x01(\x05R\tmemoryMib\x12\x16\n" +
-	"\x06detail\x18\x06 \x01(\tR\x06detail\"\xe9\x02\n" +
+	"\x06detail\x18\x06 \x01(\tR\x06detail\"\x92\x03\n" +
 	"\x12RestoreLiveRequest\x12\x1b\n" +
 	"\trepo_path\x18\x01 \x01(\tR\brepoPath\x12\x17\n" +
 	"\avm_name\x18\x02 \x01(\tR\x06vmName\x12\x1b\n" +
@@ -48017,7 +48029,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04spec\x18\t \x01(\v2\x13.litevirt.v1.VMSpecR\x04spec\x12#\n" +
 	"\rfrom_existing\x18\n" +
 	" \x01(\bR\ffromExisting\x12\x1c\n" +
-	"\tblockpull\x18\v \x01(\bR\tblockpull\"\xba\x02\n" +
+	"\tblockpull\x18\v \x01(\bR\tblockpull\x12'\n" +
+	"\x0fwithout_devices\x18\f \x01(\bR\x0ewithoutDevices\"\xba\x02\n" +
 	"\x13RestoreLiveProgress\x12<\n" +
 	"\x05phase\x18\x01 \x01(\x0e2&.litevirt.v1.RestoreLiveProgress.PhaseR\x05phase\x12\x17\n" +
 	"\anbd_url\x18\x02 \x01(\tR\x06nbdUrl\x12\x1f\n" +

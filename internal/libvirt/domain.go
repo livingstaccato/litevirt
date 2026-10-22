@@ -234,7 +234,21 @@ type DomainStatus struct {
 	// Reason: guest-shutdown | crashed | failed | destroyed | saved | migrated |
 	// from-snapshot | daemon | paused | pmsuspended | running | shutting-down | unknown
 	Reason string
+	// PausedReason is why a paused domain (Reason "paused") is paused, from
+	// libvirt's VIR_DOMAIN_PAUSED_* reason: PausedReasonIOError for a guest
+	// QEMU paused on a disk I/O error (under QEMU's default werror=enospc,
+	// only an ENOSPC write pauses: a full storage pool), "user" for an operator's or litevirt's own suspend,
+	// and so on. "" for any other state. Reason stays "paused" whatever
+	// this says: every caller that reads "paused" as "active, not
+	// executing" keeps reading it so.
+	PausedReason string
 }
+
+// PausedReasonIOError is DomainStatus.PausedReason for a guest QEMU paused on
+// a disk I/O error. Under QEMU's default error policy (werror=enospc,
+// rerror=report; litevirt sets no error_policy) only a write failing with
+// ENOSPC pauses the guest; any other error is reported to the guest.
+const PausedReasonIOError = "io-error"
 
 // DomainStateReason returns the domain's coarse State together with the
 // normalized Reason from libvirt's virDomainGetState — the reason int that
@@ -253,7 +267,8 @@ func domainStateReason(virt *golibvirt.Libvirt, name string) (DomainStatus, erro
 		return DomainStatus{State: "unknown", Reason: "unknown"}, fmt.Errorf("get domain state %s: %w", name, err)
 	}
 	s := golibvirt.DomainState(state)
-	return DomainStatus{State: coarseDomainState(s), Reason: normalizeDomainReason(s, reason)}, nil
+	return DomainStatus{State: coarseDomainState(s), Reason: normalizeDomainReason(s, reason),
+		PausedReason: normalizePausedReason(s, reason)}, nil
 }
 
 // HasManagedSaveImage reports whether a (shut-off) domain has a managed-save /
@@ -322,6 +337,46 @@ func normalizeDomainReason(s golibvirt.DomainState, reason int32) string {
 		default:
 			return "unknown"
 		}
+	default:
+		return "unknown"
+	}
+}
+
+// normalizePausedReason maps a paused domain's VIR_DOMAIN_PAUSED_* reason to
+// DomainStatus.PausedReason; "" for a domain that is not paused.
+func normalizePausedReason(s golibvirt.DomainState, reason int32) string {
+	if s != golibvirt.DomainPaused {
+		return ""
+	}
+	switch golibvirt.DomainPausedReason(reason) {
+	case golibvirt.DomainPausedUser:
+		return "user"
+	case golibvirt.DomainPausedMigration:
+		return "migration"
+	case golibvirt.DomainPausedSave:
+		return "save"
+	case golibvirt.DomainPausedDump:
+		return "dump"
+	case golibvirt.DomainPausedIoerror:
+		return PausedReasonIOError
+	case golibvirt.DomainPausedWatchdog:
+		return "watchdog"
+	case golibvirt.DomainPausedFromSnapshot:
+		return "from-snapshot"
+	case golibvirt.DomainPausedShuttingDown:
+		return "shutting-down"
+	case golibvirt.DomainPausedSnapshot:
+		return "snapshot"
+	case golibvirt.DomainPausedCrashed:
+		return "crashed"
+	case golibvirt.DomainPausedStartingUp:
+		return "starting-up"
+	case golibvirt.DomainPausedPostcopy:
+		return "postcopy"
+	case golibvirt.DomainPausedPostcopyFailed:
+		return "postcopy-failed"
+	case golibvirt.DomainPausedAPIError:
+		return "api-error"
 	default:
 		return "unknown"
 	}

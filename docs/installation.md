@@ -325,6 +325,11 @@ by OpenSSH itself. Only the per-user `~/.ssh/config` is read; `/etc/ssh/ssh_conf
 - The config is read once per command, and its `HostName` is the one address used everywhere:
   the DNS step, the certificate SAN, the address recorded for the host, and the SSH dial.
   It must still be IPv4.
+- A host, and a user written on the command line, may contain only letters, digits and
+  `.` `_` `-` `:`, and may not start with `-`; anything else (`ops+ci@host`, `DOMAIN\user`, an
+  IDN name, `[10.0.0.1]` without a port) is refused with `invalid SSH host` or `invalid SSH user`
+  before `ssh -G` runs. This applies even with no `~/.ssh/config`: the host can come from the
+  cluster's replicated host records, and a `Match exec` line would hand it to a shell.
 - A user or port written on the command line (`admin@alias`, `alias:2222`) beats the
   config; the config beats the defaults (user `root`, port 22).
 - Keys are offered in one publickey attempt, as OpenSSH orders them: the configured
@@ -360,7 +365,11 @@ by OpenSSH itself. Only the per-user `~/.ssh/config` is read; `/etc/ssh/ssh_conf
   not seen, since that file is not read; set it in `~/.ssh/config`. lv only reads these files;
   it never records a key in any of them. A configured file that does not exist is skipped, as
   `ssh` skips it, with a warning naming it. A file that exists but cannot be read or parsed (a
-  default, configured or global one) refuses the connection and names the file. With no
+  default, configured or global one) refuses the connection and names the file and line.
+  lv's parser is stricter than OpenSSH's: a line `ssh` skips, such as one with a key type lv
+  does not support (`ssh-xmss@openssh.com`) or one over 64 KiB, fails the whole file. One such
+  line in any of these files, including a global one config management writes, stops every lv
+  SSH dial until it is fixed or removed, even though `ssh` itself accepts the file. With no
   known_hosts file at all there is nothing to compare, and first contact is accepted with a
   warning.
 - `HostKeyAlias` is honoured as `ssh` honours it: the host's key (and a host certificate's

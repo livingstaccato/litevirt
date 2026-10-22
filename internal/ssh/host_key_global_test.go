@@ -116,3 +116,23 @@ func TestNewClient_KnownHosts2PinEnforced(t *testing.T) {
 		t.Fatalf("err = %v, want the known_hosts2 pin enforced", err)
 	}
 }
+
+// x/crypto parses known_hosts more strictly than OpenSSH: a line ssh skips
+// (an unsupported key type, say) fails the whole file. lv keeps failing
+// closed on it -- in a global file too -- and names the file and line.
+func TestNewClient_MalformedKnownHostsLineNamesFileAndLine(t *testing.T) {
+	for _, kind := range []string{"UserKnownHostsFile", "GlobalKnownHostsFile"} {
+		t.Run(kind, func(t *testing.T) {
+			ed := ed25519Signer(t)
+			home, addr := configServer(t, "  "+kind+" %H/kh\n", ed)
+			kh := filepath.Join(home, "kh")
+			writeFile(t, kh,
+				knownhosts.Line([]string{knownhosts.Normalize(addr)}, ed.PublicKey()),
+				"other.example ssh-xmss@openssh.com AAAAFHNzaC14bXNzQG9wZW5zc2guY29t")
+			err := dialLabnode(t)
+			if err == nil || !strings.Contains(err.Error(), kh+":2") {
+				t.Fatalf("err = %v, want a refusal naming %s:2", err, kh)
+			}
+		})
+	}
+}

@@ -68,6 +68,7 @@ func newHostInitCmd() *cobra.Command {
 	var local bool
 	var address string
 	var force bool
+	var noFenceSSH bool
 	cmd := &cobra.Command{
 		Use:   "init [user@host]",
 		Short: "Bootstrap first cluster host",
@@ -89,6 +90,7 @@ own join_peers is empty, so init also asks the cluster this CLI is configured fo
 and refuses an address that cluster lists beside other hosts.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			cli.SetFenceSSHDropIn(!noFenceSSH)
 			if local {
 				return cli.HostInitLocal(cmd.Context(), name, address, force)
 			}
@@ -112,12 +114,19 @@ and refuses an address that cluster lists beside other hosts.`,
 	cmd.Flags().BoolVar(&force, "force", false,
 		"re-initialize a host that is already a cluster member, overwriting its "+
 			"config.yaml and resetting join_peers to []")
+	cmd.Flags().BoolVar(&noFenceSSH, "no-fence-ssh", false, noFenceSSHUsage)
 	cmd.MarkFlagRequired("name")
 	return cmd
 }
 
+// noFenceSSHUsage is --no-fence-ssh on `lv host init` and `lv host add`.
+const noFenceSSHUsage = "do not add the managed fence SSH drop-in to sshd (" +
+	"/etc/ssh/sshd_config.d/60-litevirt-fence.conf), for a site whose sshd configuration is managed " +
+	"elsewhere; add /etc/litevirt/ssh/authorized_keys to root's AuthorizedKeysFile there instead"
+
 func newHostAddCmd() *cobra.Command {
 	var name string
+	var noFenceSSH bool
 	cmd := &cobra.Command{
 		Use:   "add <user@host>",
 		Short: "Add host to existing cluster",
@@ -159,10 +168,12 @@ func newHostAddCmd() *cobra.Command {
 				peerAddrs = append(peerAddrs, net.JoinHostPort(h.Address, "7946"))
 			}
 			defer closer()
+			cli.SetFenceSSHDropIn(!noFenceSSH)
 			return cli.HostAdd(cmd.Context(), c, args[0], name, peerAddrs)
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "Host name (required)")
+	cmd.Flags().BoolVar(&noFenceSSH, "no-fence-ssh", false, noFenceSSHUsage)
 	cmd.MarkFlagRequired("name")
 	return cmd
 }

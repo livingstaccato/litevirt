@@ -161,6 +161,15 @@ func (s *Server) RevokeReplacedCertificate(ctx context.Context, req *pb.RevokeRe
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"%s is the certificate the cluster records for %s; revoking it would cut that host off", serial, owner)
 	}
+	// The host's fence ssh row still signed by the serial: revoked now, every
+	// peer refuses to fence the host until its daemon re-signs the row. Owed
+	// instead, and published by ProcessOwedRevocations once it has.
+	if why := s.fenceSSHHold(ctx, req.Host, serial); why != "" {
+		if err := s.recordRevocationOwed(ctx, req.Host, serial, why, req.CrlPem); err != nil {
+			return nil, status.Errorf(codes.Internal, "record the owed revocation: %v", err)
+		}
+		return &pb.RevokeReplacedCertificateResponse{Held: true, Reason: why, Version: version}, nil
+	}
 	hold, err := s.revocationHoldReason(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "check the cluster's builds: %v", err)
@@ -309,6 +318,27 @@ func (s *Server) revocationHoldReason(ctx context.Context) (string, error) {
 		return "auth.trust_rotated_peer_certs is on at " + strings.Join(on, ",") + ", which turns their serial pins off", nil
 	}
 	return "", nil
+}
+
+// fenceSSHHold says why the revocation of host's replaced certificate serial
+// must wait for host's fence ssh row: the row is still signed by that serial
+// (internal/fencessh). Every peer verifies a row against the CRL and refuses
+// to fence a host whose row does not verify — it never falls back to an
+// unpinned fence — so revoking first would leave the host unfenceable until
+// its daemon re-signed the row, which it does within a minute of adopting the
+// renewal. "" when the host has no live row, or it is signed by another
+// certificate.
+func (s *Server) fenceSSHHold(ctx context.Context, host, serial string) string {
+	row, ok, err := corrosion.GetHostFenceSSH(ctx, s.db, host)
+	if err != nil || !ok || row.Deleted {
+		return ""
+	}
+	cert, err := pki.ParseCertPEM([]byte(row.CertPEM))
+	if err != nil || !strings.EqualFold(cert.SerialNumber.Text(16), serial) {
+		return ""
+	}
+	return fmt.Sprintf("%s's fence ssh row is still signed by %s, and every peer refuses to fence a host whose row "+
+		"does not verify; it is revoked once %s's daemon re-signs the row with its renewed certificate", host, serial, host)
 }
 
 // revocationSafeForVoters reports whether revoking serial keeps the newest
@@ -672,6 +702,10 @@ func (s *Server) ProcessOwedRevocations(ctx context.Context) {
 		s.reportRegressed(ctx, host, serial)
 		ok, why := trust()
 		if !ok {
+			s.remindOwed(ctx, cnd.SubjectID, host, serial, why)
+			continue
+		}
+		if why := s.fenceSSHHold(ctx, host, serial); why != "" {
 			s.remindOwed(ctx, cnd.SubjectID, host, serial, why)
 			continue
 		}

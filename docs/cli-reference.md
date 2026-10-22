@@ -123,6 +123,10 @@ lv host init --local --name <name>        # Bootstrap on localhost (standalone)
                                           #   which also makes the node look like a
                                           #   founder — use `lv host add` instead
 lv host add <user@host> --name <name>     # Add host to cluster
+  [--no-fence-ssh]                        # (init, add) do not add the managed fence SSH drop-in to
+                                          #   sshd; add /etc/litevirt/ssh/authorized_keys to root's
+                                          #   AuthorizedKeysFile in your own sshd configuration.
+                                          #   See migration-failover.md "Managed fence SSH"
                                           # new <name> (init, add): letters, digits, '_', '.', '-';
                                           #   not starting with '-' or '.', not ending in -migration,
                                           #   and not ca, client, host, gossip, migration-ca, ui,

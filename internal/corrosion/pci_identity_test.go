@@ -106,3 +106,49 @@ func TestPCIAddressIdentity_RealizationFirst(t *testing.T) {
 		t.Fatalf("origin row another VM's: got %+v on %q, %v; want ErrPCIIdentityUnknown", got, host, err)
 	}
 }
+
+// A realized device that is free counts on the host the VM lives on (a stop
+// before the latch releases it, and a start does not claim it again), never
+// on a host it left, and never when another VM owns it.
+func TestPCIAddressIdentity_FreeRealizationOnTheCurrentHost(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	for _, h := range []string{"a", "b"} {
+		if err := InsertHost(ctx, c, HostRecord{Name: h, Address: "10.0.0.1", State: "active", CertSerial: "s-" + h}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := InsertVM(ctx, c, VMRecord{Name: "vm", HostName: "b", State: "running"}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	put := func(d PCIDeviceRecord) {
+		t.Helper()
+		if err := UpsertPCIDevice(ctx, c, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	realize := func(dev, host, addr string) {
+		t.Helper()
+		if err := UpsertPCIRealization(ctx, c, PCIRealizationRecord{VMName: "vm", DeviceID: dev, MemberID: "m0",
+			HostName: host, ResolvedAddress: addr, Ordinal: 0}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put(PCIDeviceRecord{HostName: "a", Address: "0000:41:00.0", VendorID: "10de", DeviceID: "26b9", VMName: "vm"})
+	put(PCIDeviceRecord{HostName: "b", Address: "0000:81:00.0", VendorID: "10de", DeviceID: "2330"})
+	put(PCIDeviceRecord{HostName: "b", Address: "0000:82:00.0", VendorID: "10de", DeviceID: "2330", VMName: "other"})
+	put(PCIDeviceRecord{HostName: "a", Address: "0000:42:00.0", VendorID: "10de", DeviceID: "2330"})
+
+	realize("free-here", "b", "0000:81:00.0")
+	if got, host, err := PCIAddressIdentity(ctx, c, "vm", "free-here", "a", "0000:41:00.0"); err != nil || got.DeviceID != "2330" || host != "b" {
+		t.Errorf("free on the VM's host: got %+v on %q, %v; want the H100 on b", got, host, err)
+	}
+	realize("other-vm", "b", "0000:82:00.0")
+	if got, host, err := PCIAddressIdentity(ctx, c, "vm", "other-vm", "a", "0000:41:00.0"); !errors.Is(err, ErrPCIIdentityUnknown) {
+		t.Errorf("another VM's: got %+v on %q, %v; want ErrPCIIdentityUnknown", got, host, err)
+	}
+	realize("left", "a", "0000:42:00.0")
+	if got, host, err := PCIAddressIdentity(ctx, c, "vm", "left", "c", "0000:41:00.0"); !errors.Is(err, ErrPCIIdentityUnknown) {
+		t.Errorf("free on a host it left: got %+v on %q, %v; want ErrPCIIdentityUnknown", got, host, err)
+	}
+}

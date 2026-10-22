@@ -50,8 +50,9 @@ var ErrPCIIdentityUnknown = errors.New("the identity of the PCI device is not kn
 //
 //  1. the device that realizes the intent (its primary member's
 //     vm_pci_realizations row), read where it was realized, when vmName owns
-//     it there: a VM recovered onto another host keeps the kind of device it
-//     has there, whatever becomes of the row it was first recorded on;
+//     it there, or it is free there and that is the host the VM lives on: a
+//     VM recovered onto another host keeps the kind of device it has there,
+//     whatever becomes of the row it was first recorded on;
 //  2. unless the intent was realized on a host other than origin (the hosts
 //     a VM left keep their rows, and a rescan rewrites them: another card
 //     may sit there since), origin's device at bdf, when vmName owns it or
@@ -92,6 +93,15 @@ func PCIAddressIdentity(ctx context.Context, c *Client, vmName, deviceID, origin
 		if err != nil {
 			return PCIIdentity{}, "", err
 		}
+		// The host the VM lives on now: there a realized device may be free,
+		// released by a stop before the latch (a start then does not claim
+		// it again), and is still the VM's. Only another VM's is not.
+		current := ""
+		if vm, err := GetVM(ctx, c, vmName); err != nil {
+			return PCIIdentity{}, "", err
+		} else if vm != nil {
+			current = vm.HostName
+		}
 		for _, r := range reals {
 			if r.DeviceID != deviceID || r.Ordinal != 0 || r.ResolvedAddress == "" {
 				continue
@@ -99,11 +109,11 @@ func PCIAddressIdentity(ctx context.Context, c *Client, vmName, deviceID, origin
 			if r.HostName != origin {
 				realizedElsewhere = true
 			}
-			id, ok, err := at(r.HostName, r.ResolvedAddress, true)
+			id, ok, err := at(r.HostName, r.ResolvedAddress, false)
 			if err != nil {
 				return PCIIdentity{}, "", err
 			}
-			if ok {
+			if ok && (id.owner == vmName || (id.owner == "" && r.HostName == current)) {
 				return id.PCIIdentity, r.HostName, nil
 			}
 		}

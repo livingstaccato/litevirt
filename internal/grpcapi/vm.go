@@ -2692,7 +2692,9 @@ func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord
 	finish := func(ctx context.Context, startErr error) (*pb.VM, error) {
 		releaseGuard()
 		out, err := s.finishStartLocked(ctx, vm, startErr, releasePreflight, pbVM, hspec)
-		if err == nil {
+		// Started: libvirt said so, or the domain was found running. A
+		// read-back of the VM that fails after that does not undo it.
+		if startErr == nil || err == nil {
 			ptDone(true)
 			if ptDropped != "" {
 				s.notePassthroughDropped(ctx, vm.Name, ptDropped)

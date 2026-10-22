@@ -581,16 +581,21 @@ func TestFleet_PCIFailover_VanishedOwnedDeviceRefusesTheRestart(t *testing.T) {
 // never boots the VM silently without its GPU.
 func TestFleet_PCIFailover_StartOfAMovedStoppedVMGivesItItsDevice(t *testing.T) {
 	defer vfio.SetFS(vfioBoundSysfs{})()
+	optOut := `,"labels":{"` + corrosion.LabelFailoverWithoutDevices + `":"true"}`
 	for _, tc := range []struct {
-		name      string
-		intent    bool
-		labels    string
-		failStart bool
+		name         string
+		intent       bool
+		labels       string
+		failStart    bool
+		failReadBack bool
 	}{
-		{"with its intent", true, "", false},
-		{"with its intent, start fails", true, "", true},
-		{"spec device only", false, "", false},
-		{"opted out", false, `,"labels":{"` + corrosion.LabelFailoverWithoutDevices + `":"true"}`, false},
+		{"with its intent", true, "", false, false},
+		{"with its intent, start fails", true, "", true, false},
+		{"spec device only", false, "", false, false},
+		{"opted out", false, optOut, false, false},
+		// The domain starts and the read of the VM after it fails: the
+		// start still counts, and the drop is still recorded.
+		{"opted out, read-back fails", false, optOut, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := New(t, Options{Nodes: 3, SharedCRDT: true})
@@ -640,6 +645,10 @@ func TestFleet_PCIFailover_StartOfAMovedStoppedVMGivesItItsDevice(t *testing.T) 
 			if tc.failStart {
 				dest.Virt.FailStartDomain = func(string) error { return errors.New("qemu: injected start failure") }
 			}
+			if tc.failReadBack {
+				dest.Server.FailVMReadBackForTests(func(string) error { return errors.New("corrosion: injected read failure") })
+				defer dest.Server.FailVMReadBackForTests(nil)
+			}
 			_, err := c.SelfClient(dest).StartVM(ctx, &pb.StartVMRequest{Name: "sg"})
 			st, _ := dest.Virt.DomainState("sg")
 			buses := pciFoHostdevBuses(dest.Virt.DefinedXML("sg"))
@@ -671,6 +680,9 @@ func TestFleet_PCIFailover_StartOfAMovedStoppedVMGivesItItsDevice(t *testing.T) 
 				}
 			default:
 				v, _ := corrosion.GetVM(ctx, dest.DB, "sg")
+				if tc.failReadBack && err != nil {
+					err = nil // the read-back's, not the start's
+				}
 				if err != nil || st != "running" || len(buses) != 0 || v == nil ||
 					!strings.Contains(v.StateDetail, "running without its PCI passthrough devices") {
 					t.Errorf("lv start on %s: err=%v state=%s buses=%v vm=%+v; want it running without devices, saying so", dest.Name, err, st, buses, v)
@@ -708,5 +720,80 @@ func TestFleet_PCIFailover_RestartKeepsTheDeviceItOwns(t *testing.T) {
 		if buses := pciFoHostdevBuses(b.Virt.DefinedXML(pciFoVM)); len(buses) != 1 || buses[0] != "0x81" {
 			t.Errorf("%s restarted on %s with buses %v, want its H100 at %s", pciFoVM, b.Name, buses, pciFoThere)
 		}
+	}
+}
+
+// Before the latch, a VM that failed over onto b is stopped and started there
+// by an operator: the stop releases its device, and the start does not claim
+// it again. A crash restart on b still runs it with b's H100, and a further
+// failover off b can still say it needs an H100.
+func TestFleet_PCIFailover_StopStartOnTheNewHostKeepsItRecoverable(t *testing.T) {
+	defer vfio.SetFS(vfioBoundSysfs{})()
+	ctx := context.Background()
+	c, a, b, _ := pciFoLanded(t, ctx, false)
+	if _, err := c.SelfClient(b).StopVM(ctx, &pb.StopVMRequest{Name: pciFoVM}); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if _, err := c.SelfClient(b).StartVM(ctx, &pb.StartVMRequest{Name: pciFoVM}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if o := pciFoOwner(t, ctx, b, b.Name, pciFoThere); o != "" {
+		t.Fatalf("setup: after the stop and start the H100 on %s reads owned by %q; this scenario needs it free", b.Name, o)
+	}
+	c.WaitConverged(t, convergeTimeout, a, b)
+	vm := vmOn(t, a, pciFoVM)
+	reqs, descs, err := placement.FailoverDeviceRequests(ctx, a.DB, *vm)
+	if err != nil || len(reqs) != 1 || reqs[0].DeviceID != h100.device {
+		t.Errorf("a further failover of %s off %s would need %+v (%v, %v); want an H100", pciFoVM, b.Name, reqs, descs, err)
+	}
+	v := pciFoRestart(t, ctx, c, a, b)
+	if v == nil || v.State != "running" {
+		t.Fatalf("crash restart on %s refused: %+v", b.Name, v)
+	}
+	if buses := pciFoHostdevBuses(b.Virt.DefinedXML(pciFoVM)); len(buses) != 1 || buses[0] != "0x81" {
+		t.Errorf("%s restarted on %s with buses %v, want the H100 at %s", pciFoVM, b.Name, buses, pciFoThere)
+	}
+}
+
+// Before the latch, lv start of a stopped passthrough VM on its own host,
+// whose definition passes its device through, starts it as it is: the
+// device is not added a second time.
+func TestFleet_PCIFailover_StartOnItsOwnHostKeepsOneHostdev(t *testing.T) {
+	defer vfio.SetFS(vfioBoundSysfs{})()
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 2})
+	n := c.Nodes[0]
+	if err := corrosion.UpsertPCIDevice(ctx, n.DB, corrosion.PCIDeviceRecord{HostName: n.Name, Address: pciFoThere,
+		VendorID: h100.vendor, DeviceID: h100.device, DeviceName: h100.name, Type: "gpu", Driver: "vfio-pci", IOMMUGroup: 50}); err != nil {
+		t.Fatal(err)
+	}
+	disk := filepath.Join(t.TempDir(), "ovm-root.qcow2")
+	if err := os.WriteFile(disk, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dev := &pb.DeviceSpec{Address: pciFoThere}
+	if err := corrosion.InsertVM(ctx, n.DB, corrosion.VMRecord{Name: "ovm", HostName: n.Name, State: "stopped", StateDetail: "operator-stop",
+		CPUActual: 1, MemActual: 256, Spec: vmSpecJSON(t, &pb.VMSpec{Name: "ovm", Cpu: 1, MemoryMib: 256, Devices: []*pb.DeviceSpec{dev}})},
+		nil, []corrosion.DiskRecord{{VMName: "ovm", DiskName: "root", HostName: n.Name, Path: disk, StorageType: "nfs"}}); err != nil {
+		t.Fatal(err)
+	}
+	kind, key := corrosion.ClassifyPCISelector(dev)
+	payload, err := protojson.Marshal(dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertPCIIntent(ctx, n.DB, corrosion.PCIIntentRecord{VMName: "ovm",
+		DeviceID: corrosion.DeterministicPCIIntentID(corrosion.CanonicalPCISelector(dev), 0), HostName: n.Name,
+		SelectorKind: kind, SelectorPayload: string(payload), ExclusiveKey: key}); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Virt.DefineDomain(`<domain type='kvm'><name>ovm</name><devices>` +
+		`<hostdev mode='subsystem' type='pci' managed='yes'><source><address domain='0x0000' bus='0x81' slot='0x00' function='0x0'/></source></hostdev>` +
+		`</devices></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.SelfClient(n).StartVM(ctx, &pb.StartVMRequest{Name: "ovm"})
+	if buses := pciFoHostdevBuses(n.Virt.DefinedXML("ovm")); err != nil || len(buses) != 1 {
+		t.Errorf("lv start of ovm on its own host: err=%v buses=%v; want it started with its one hostdev", err, buses)
 	}
 }

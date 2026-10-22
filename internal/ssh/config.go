@@ -49,7 +49,7 @@ type resolved struct {
 	// HostKeyAlias is the name host keys are looked up under instead of the
 	// dialled address ("" when unset).
 	HostKeyAlias string
-	// KnownHostsCommand is the configured command ("" when none). lv does
+	// KnownHostsCommand is the configured command ("" when none). litevirt does
 	// not run it, so a set one refuses the connection.
 	KnownHostsCommand string
 	// RevokedHostKeys is the configured revocation file ("" when none).

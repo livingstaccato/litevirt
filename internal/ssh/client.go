@@ -108,8 +108,8 @@ func dialTarget(t *Target, start time.Time, timeout time.Duration, keepDeadline 
 // config: a config could re-add SHA-1 ssh-rsa, or ask for a type known_hosts
 // does not record and so turn a known host into a refused one.
 func clientConfig(sshUser string, auth []ssh.AuthMethod, cfg *resolved, addr string) (*ssh.ClientConfig, error) {
-	// Options with which ssh would refuse keys lv cannot otherwise see: a
-	// pin source lv does not run refuses outright; a revocation list lv
+	// Options with which ssh would refuse keys litevirt cannot otherwise see: a
+	// pin source litevirt does not run refuses outright; a revocation list litevirt
 	// cannot read refuses too. Neither is ever skipped.
 	if cfg != nil && cfg.KnownHostsCommand != "" {
 		return nil, fmt.Errorf("your ssh config sets KnownHostsCommand (%s); litevirt does not run it, "+

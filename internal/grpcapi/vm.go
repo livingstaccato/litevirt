@@ -4153,7 +4153,9 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		if !req.KeepDisks {
 			// The record is gone: the snapshots' RAM images and firmware
 			// bundles here go, and then the records of those whose files did.
-			done := s.removeVMSnapshotRAMImages(ctx, req.Name)
+			// While a peer did not answer whether the VM runs there, the RAM
+			// images are kept, as its disks are above.
+			done := s.removeVMSnapshotRAMImages(ctx, req.Name, len(unknown) == 0)
 			if s.removeVMFirmwareBundles(ctx, req.Name) {
 				s.tombstoneVMSnapshotRecords(ctx, req.Name, done)
 			}
@@ -4388,7 +4390,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		setKeptHeader(ctx, cephKept)
 		s.sweepVMDiskDebris(ctx, req.Name)
 		s.removeOwnDiskLayers(ctx, req.Name, layers)
-		snapsDone = s.removeVMSnapshotRAMImages(ctx, req.Name)
+		snapsDone = s.removeVMSnapshotRAMImages(ctx, req.Name, true)
 		// Remove cloud-init ISO
 		_ = cloudinit.RemoveSeed(lv.CloudInitISOPath(s.dataDir, req.Name))
 		// Firmware state (G1): wipe nvram (name-keyed) + swtpm (uuid-keyed). With

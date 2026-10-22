@@ -864,8 +864,11 @@ func keptSize(n int64) string {
 //
 // It returns the snapshots of this host that name no RAM image here any more
 // (none, or the one just removed): once the VM's firmware bundles are gone
-// too, their records describe nothing (tombstoneVMSnapshotRecords).
-func (s *Server) removeVMSnapshotRAMImages(ctx context.Context, vmName string) []string {
+// too, their records describe nothing (tombstoneVMSnapshotRecords). A record
+// with no host (written before records named one) whose image is not here
+// is not among them: the image may be on another host. With remove false it
+// removes nothing and returns only the snapshots that never had a RAM image.
+func (s *Server) removeVMSnapshotRAMImages(ctx context.Context, vmName string, remove bool) []string {
 	snaps, err := corrosion.ListSnapshots(ctx, s.db, vmName)
 	if err != nil {
 		slog.Warn("delete: cannot list the VM's snapshots; their RAM images are kept", "vm", vmName, "error", err)
@@ -880,13 +883,22 @@ func (s *Server) removeVMSnapshotRAMImages(ctx context.Context, vmName string) [
 			done = append(done, sn.Name)
 			continue
 		}
+		if !remove {
+			continue
+		}
 		own, err := lv.SafeVMStatePath(s.dataDir, vmName, sn.Name)
 		if err != nil || filepath.Clean(sn.VMStatePath) != own {
 			slog.Warn("delete: a snapshot record names a RAM image that is not this VM's; kept",
 				"vm", vmName, "snapshot", sn.Name, "path", sn.VMStatePath)
 			continue
 		}
-		if err := os.Remove(own); err != nil && !os.IsNotExist(err) {
+		err = os.Remove(own)
+		switch {
+		case err == nil:
+		case os.IsNotExist(err) && sn.HostName == s.hostName:
+		case os.IsNotExist(err):
+			continue // no host recorded: the image may be on another
+		default:
 			slog.Warn("delete: remove snapshot RAM image", "vm", vmName, "snapshot", sn.Name, "path", own, "error", err)
 			continue
 		}

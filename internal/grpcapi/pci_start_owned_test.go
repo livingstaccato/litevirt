@@ -27,7 +27,7 @@ func TestResolveDeviceIntents_TypeReusesOnlyAnOwnedRealization(t *testing.T) {
 		{"0000:82:00.0", ""},      // free
 	} {
 		if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
-			HostName: "test-host", Address: d.addr, Type: "gpu", VendorID: "10de", IOMMUGroup: -1, VMName: d.owner,
+			HostName: "test-host", Address: d.addr, Type: "gpu", VendorID: "10de", IOMMUGroup: soloIOMMUGroup(d.addr), VMName: d.owner,
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -53,7 +53,7 @@ func TestResolveDeviceIntents_TypeReusesOnlyAnOwnedRealization(t *testing.T) {
 
 	// Owned by vm-t again: the realization is reused and the free device is not taken.
 	if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
-		HostName: "test-host", Address: "0000:81:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1, VMName: "vm-t",
+		HostName: "test-host", Address: "0000:81:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: soloIOMMUGroup("0000:81:00.0"), VMName: "vm-t",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestResolveDeviceIntents_TypeReuseIgnoresAnotherHostsRow(t *testing.T) {
 	defer vfio.SetFS(newPCIBindFakeFS())()
 	for _, d := range []struct{ addr, owner string }{{"0000:81:00.0", ""}, {"0000:82:00.0", "vm-t"}} {
 		if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
-			HostName: "test-host", Address: d.addr, Type: "gpu", VendorID: "10de", IOMMUGroup: -1, VMName: d.owner}); err != nil {
+			HostName: "test-host", Address: d.addr, Type: "gpu", VendorID: "10de", IOMMUGroup: soloIOMMUGroup(d.addr), VMName: d.owner}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -177,7 +177,7 @@ func TestResolveDeviceIntents_TypeReuseSkipsADeviceNamedByAddress(t *testing.T) 
 	defer vfio.SetFS(newPCIBindFakeFS())()
 	for _, d := range []struct{ addr, owner string }{{"0000:81:00.0", "vm-t"}, {"0000:82:00.0", ""}} {
 		if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
-			HostName: "test-host", Address: d.addr, Type: "gpu", VendorID: "10de", IOMMUGroup: -1, VMName: d.owner}); err != nil {
+			HostName: "test-host", Address: d.addr, Type: "gpu", VendorID: "10de", IOMMUGroup: soloIOMMUGroup(d.addr), VMName: d.owner}); err != nil {
 			t.Fatal(err)
 		}
 	}

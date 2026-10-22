@@ -343,6 +343,14 @@ func (a *Agent) verifiedPeers(ctx context.Context, tr Trust) ([]*Verified, map[s
 			rejected[r.HostName] = err.Error()
 			continue
 		}
+		// An expired certificate still pins its host's sshd keys for a fence
+		// of it (Verify), but grants no inbound authority: its fence key is
+		// not accepted here until the host is renewed.
+		if v.Expired {
+			rejected[r.HostName] = "its certificate expired " + v.NotAfter.UTC().Format(time.RFC3339) +
+				"; its fence key is not accepted until it is renewed"
+			continue
+		}
 		out = append(out, v)
 	}
 	return out, rejected, nil

@@ -2,15 +2,25 @@ package fencessh_test
 
 import (
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/fencessh"
 	"github.com/litevirt/litevirt/internal/pki"
 )
@@ -219,4 +229,74 @@ func TestPublish_LegacyKeepsAnExistingRowSigned(t *testing.T) {
 			t.Fatalf("the legacy host's row is signed by %v (%v), want the renewed %s", cert.SerialNumber, err, next)
 		}
 	}
+}
+
+// TestRender_AnExpiredPeerIsPinnedButNotTrusted: a peer whose certificate has
+// expired is still fenced pinned to its sshd keys, but its fence key is not
+// rendered into this host's authorized_keys: expiry keeps the pin, never the
+// authority to power this host off.
+func TestRender_AnExpiredPeerIsPinnedButNotTrusted(t *testing.T) {
+	ctx := context.Background()
+	w := newWorld(t)
+	x := w.node("node-x", "127.0.0.3")
+	y := w.node("node-y", "127.0.0.4")
+	x.hostRow("127.0.0.3", 22)
+	y.hostRow("127.0.0.4", 22)
+	certPEM, key := expiredHostCert(t, w, "node-y", "127.0.0.4")
+	row, err := fencessh.Sign(fencessh.Publication{HostName: "node-y", Generation: 1,
+		FencePubkeys: fencessh.KeyLine(y.fenceKy), SSHDHostkeys: fencessh.KeyLine(y.hostKey), CertPEM: certPEM}, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.PutHostFenceSSH(ctx, w.db, capabilities.GrantForTest(t, capabilities.FeatureFenceSSH), row); err != nil {
+		t.Fatal(err)
+	}
+	ag := x.publisher(true, false)
+	if err := ag.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ak, err := os.ReadFile(filepath.Join(x.dir, fencessh.AuthorizedKeysName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(ak), fencessh.KeyLine(y.fenceKy)) {
+		t.Fatalf("an expired peer's fence key is trusted:\n%s", ak)
+	}
+	if sf := ag.FenceConfig(ctx, "node-y"); sf.Refusal != "" || sf.Path != fence.SSHPathPinned ||
+		!strings.Contains(string(sf.KnownHosts), fencessh.KeyLine(y.hostKey)) {
+		t.Fatalf("fence of the expired peer = %+v, want pinned to its sshd key", sf)
+	}
+}
+
+// expiredHostCert mints name's host certificate, already expired, from the
+// world's CA.
+func expiredHostCert(t *testing.T, w *world, name, ip string) (string, crypto.Signer) {
+	t.Helper()
+	caPEM, _ := os.ReadFile(filepath.Join(w.ca, "ca.crt"))
+	caCert, err := pki.ParseCertPEM(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, _ := os.ReadFile(filepath.Join(w.ca, "ca.key"))
+	blk, _ := pem.Decode(keyPEM)
+	caKey, err := x509.ParseECPrivateKey(blk.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(77001), Subject: pkix.Name{CommonName: name}, DNSNames: []string{name},
+		NotBefore: caCert.NotBefore, NotAfter: caCert.NotBefore.Add(time.Second),
+		KeyUsage:    x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		IPAddresses: []net.IP{net.ParseIP(ip), net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, &k.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})), k
 }

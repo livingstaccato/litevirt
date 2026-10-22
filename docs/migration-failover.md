@@ -1249,7 +1249,9 @@ off, and only from the removed host's address. `lv host renew-cert` does not
 revoke the replaced certificate until the host's daemon has re-signed its row
 with the renewed one (see [auth.md](auth.md)). `lv uninstall` removes the
 drop-in and `/etc/litevirt/ssh`; `lv host install-fence-ssh --remove` removes
-only the drop-in.
+only the drop-in. A host that ever accepted the managed key is still fenced over
+it afterwards, so its sshd refuses those fences until the drop-in is installed
+again.
 
 **Rolling back.** Every host not in `legacy` publishes as soon as
 `release_2026_12_v1` latches, so the feature `fence_ssh` is used from then on, and

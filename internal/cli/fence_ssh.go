@@ -143,7 +143,18 @@ func InstallFenceSSH(ctx context.Context, c pb.LiteVirtClient, hosts []FenceSSHH
 		return fmt.Errorf("the drop-in could not be %s %d host(s): %s; fix that and re-run",
 			what, len(failed), strings.Join(failed, "; "))
 	}
-	if opt.Remove || opt.Wait < 0 {
+	if opt.Remove {
+		// A host whose row ever said accepting stays on the managed path
+		// (ever_accepting is sticky), so its sshd now refuses every fence of
+		// it: there is no fallback to the legacy path.
+		for _, h := range hosts {
+			fmt.Fprintf(opt.Out, "  %-20s WARNING: if it ever accepted the managed fence key, peers still fence it over that key,\n"+
+				"  %-20s which is now refused by its sshd: fences of it fail until `lv host install-fence-ssh --host %s`\n",
+				h.Name(), "", h.Name())
+		}
+		return nil
+	}
+	if opt.Wait < 0 {
 		return nil
 	}
 	fmt.Fprintf(opt.Out, "Waiting up to %s for every host to report that its sshd accepts the managed fence key\n"+
@@ -151,13 +162,19 @@ func InstallFenceSSH(ctx context.Context, c pb.LiteVirtClient, hosts []FenceSSHH
 	deadline := opt.now().Add(opt.Wait)
 	var why map[string]string
 	for {
+		// The installs already happened: a read that fails is retried until
+		// the wait ends, and fails the run only then.
 		st, err := c.GetFenceSSHStatus(ctx, &pb.FenceSSHStatusRequest{FanOut: true})
 		if err != nil {
-			return fmt.Errorf("read the hosts' fence ssh rows: %w", err)
-		}
-		why = fenceSSHUnconfirmed(st, hosts, doneAt, opt.now(), opt.FreshAfter)
-		if len(why) == 0 || !opt.now().Before(deadline) {
-			break
+			if ctx.Err() != nil || !opt.now().Before(deadline) {
+				return fmt.Errorf("read the hosts' fence ssh rows: %w", err)
+			}
+			fmt.Fprintf(opt.Out, "  (reading the hosts' fence ssh rows failed, retrying: %v)\n", err)
+		} else {
+			why = fenceSSHUnconfirmed(st, hosts, doneAt, opt.now(), opt.FreshAfter)
+			if len(why) == 0 || !opt.now().Before(deadline) {
+				break
+			}
 		}
 		if err := opt.pause(ctx, fenceSSHPoll); err != nil {
 			return err

@@ -95,7 +95,8 @@ lv host ls
 
 Decentralized by design: every host is equal, state replicates via the **Crescent** protocol
 (relay-quorum topology, wall-clock last-writer-wins on each row's `updated_at`, anti-entropy drift
-detection) — scaling to hundreds of nodes with no master to lose.
+detection) — no master to lose. Three to five hosts is the recommended and tested size today;
+larger clusters are not yet load-tested (see [Cluster size](docs/operating-model.md#cluster-size)).
 
 <details>
 <summary><b>More screenshots</b></summary>

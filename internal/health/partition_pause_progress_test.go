@@ -154,9 +154,16 @@ func TestPartitionPause_ASlowSettlePassKeepsMakingProgress(t *testing.T) {
 	if took < n*delay {
 		t.Fatalf("setup: the pass took %s, shorter than its %d settles", took, n)
 	}
-	if still > 3*delay {
-		t.Fatalf("progress stood still for %s during a %s pass of %d settles of %s each: "+
-			"the liveness gate would read a healthy pass as a wedge", still, took, n, delay)
+	// Each settle sleeps delay in its stop, and the counter moves between
+	// steps, so the longest still stretch holds at most one of the n sleeps:
+	// the other n-1 lie outside it. That is structural, not a timing guess,
+	// so a loaded machine (or -race) that stretches the steps' own work
+	// cannot fail it. A fixed 3×delay ceiling did, 2 runs in 5 under -race at
+	// load 36 (365 ms): the stretch after the last step, the pass's closing
+	// condition write, is not a settle and is not bounded by delay.
+	if still > took-(n-1)*delay {
+		t.Fatalf("progress stood still for %s during a %s pass of %d settles of %s each, so the stretch held "+
+			"more than one settle: the liveness gate would read a healthy pass as a wedge", still, took, n, delay)
 	}
 }
 
@@ -258,14 +265,20 @@ func TestPartitionPause_AStuckRecordDoesNotStarveTheRest(t *testing.T) {
 	}
 }
 
-// quorumFlipVMs loses the majority (via flip) right after the first resume.
+// quorumFlipVMs loses the majority (via flip) right after the first resume,
+// and counts the resumes issued.
 type quorumFlipVMs struct {
 	PauseVMBackend
-	once sync.Once
-	flip func()
+	once    sync.Once
+	flip    func()
+	mu      sync.Mutex
+	resumes []string
 }
 
 func (q *quorumFlipVMs) ResumePartitionPaused(name, uuid string) error {
+	q.mu.Lock()
+	q.resumes = append(q.resumes, name)
+	q.mu.Unlock()
 	err := q.PauseVMBackend.ResumePartitionPaused(name, uuid)
 	q.once.Do(q.flip)
 	return err
@@ -279,9 +292,15 @@ func (q *quorumFlipVMs) ResumePartitionPaused(name, uuid string) error {
 // A container resumed in the same pass (ct-ha: "ct/" sorts first, so it is
 // resumed before any VM) is frozen again too.
 //
-// Mutations: drop the quorum re-check between resumes — the other VMs resume
-// too; drop the re-pause — the first stays running; skip containers in the
-// re-pause — ct-ha stays running.
+// No resume is ISSUED after the loss: the pass reads the quorum before each
+// step (resumePass.step), and that reading is the one §4.1's R term counts —
+// the longest a healed host goes without one. Asserting only that every VM
+// ends paused could not tell it from the read after the last resume, which
+// re-pauses what the pass resumed either way (re-review 4, finding 2).
+//
+// Mutations: drop the quorum read between steps (resumePass.step) — three
+// more resumes are issued after the loss; drop the re-pause — the first
+// stays running; skip containers in the re-pause — ct-ha stays running.
 func TestPartitionPause_MajorityLostMidPassStopsAndRepauses(t *testing.T) {
 	f := newPauseFixture(t)
 	ctx := context.Background()
@@ -308,9 +327,16 @@ func TestPartitionPause_MajorityLostMidPassStopsAndRepauses(t *testing.T) {
 	if st := rt.get("ct-ha"); st != "frozen" {
 		t.Fatalf("setup: ct-ha is %s, want frozen", st)
 	}
-	f.p.SetVMBackend(&quorumFlipVMs{PauseVMBackend: f.virt, flip: func() { f.set(QuorumNo) }})
+	flip := &quorumFlipVMs{PauseVMBackend: f.virt, flip: func() { f.set(QuorumNo) }}
+	f.p.SetVMBackend(flip)
 	f.healedPass()
 	f.tick()
+	flip.mu.Lock()
+	issued := append([]string(nil), flip.resumes...)
+	flip.mu.Unlock()
+	if len(issued) != 1 {
+		t.Errorf("resumes issued = %v, want only the one during which the majority was lost", issued)
+	}
 	for _, name := range names {
 		if st := f.raw(name); st != libvirtfake.StatePaused {
 			t.Errorf("%s is %s after the majority was lost mid-pass, want paused", name, st)

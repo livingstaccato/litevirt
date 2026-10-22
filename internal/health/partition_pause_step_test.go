@@ -36,17 +36,22 @@ func (h *hungResumeVMs) ResumePartitionPaused(name, uuid string) error {
 }
 
 // A VM resume that hangs no longer holds the pauser: the pass abandons it at
-// its step bound, the VM keeps its record and stays paused, and while the
-// abandoned call is out a lost majority reports the pause as failed (the
-// call may yet land), and when it does land the VM is paused again at once.
-// Before, the pass waited for the call, taking no quorum sample, and every
-// workload resumed earlier ran on unwatched (re-review 3, finding 1).
+// its step bound, the VM keeps its record and stays paused. While the
+// abandoned call is out, a lost majority's pause pass kills the VM's QEMU
+// (AnAbandonedResumeIsKilledUnderALostMajority); here that kill fails (no
+// pid file), so the pass reports the pause as failed, since the call may yet
+// land, and self-fences with a verified watchdog; and when the call does
+// land the VM is paused again at once. Before, the pass waited for the
+// call, taking no quorum sample, and every workload resumed earlier ran on
+// unwatched (re-review 3, finding 1).
 //
 // Mutations: wait for the call (no step bound) — the pass takes as long as
-// the hang; drop the undo of a late landing — vm-ha runs after release; drop
-// the in-flight check in pauseVMs — no failure is reported.
+// the hang; drop the undo of a late landing — vm-ha runs after release; count
+// a failed kill as a stop — no failure is reported and no self-fence.
 func TestPartitionPause_AHungResumeIsAbandonedAtItsBound(t *testing.T) {
 	f := newPauseFixture(t)
+	f.virt.FailKillPartitionPaused = func(string) error { return errors.New("no pid file") }
+	f.p.SetSelfFence(func() bool { return true }, func() { f.mu.Lock(); f.fenced++; f.mu.Unlock() })
 	f.loseFor(QuorumNo, PartitionPauseAfter+time.Second)
 	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
 		t.Fatalf("setup: vm-ha is %s, want paused", st)
@@ -78,6 +83,12 @@ func TestPartitionPause_AHungResumeIsAbandonedAtItsBound(t *testing.T) {
 	row, ok := f.condition(corrosion.CondPartitionPauseFailed)
 	if !ok || row.Lifecycle != corrosion.ConditionConfirmed || !strings.Contains(row.Evidence, "vm/vm-ha") {
 		t.Fatalf("partition_pause_failed = %+v (found %v), want it open for vm/vm-ha while its resume is out", row, ok)
+	}
+	f.mu.Lock()
+	fenced := f.fenced
+	f.mu.Unlock()
+	if fenced == 0 {
+		t.Fatal("no self-fence for a VM whose abandoned resume may still land and whose QEMU could not be killed")
 	}
 
 	// The call lands: the VM is paused again at once, with no pass to do it.

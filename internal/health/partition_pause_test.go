@@ -532,8 +532,9 @@ func TestDecideResume(t *testing.T) {
 // functions under test.
 //
 // Mutations: shorten partitionPauseSlack, compute C(n) for one batch
-// regardless of n, drop R from the margin, or run the resume steps on a
-// bound other than R — this goes red.
+// regardless of n, drop R from the margin, run the resume steps on a bound
+// other than R, or bound the re-pause past T_pause less a tick or past E —
+// this goes red.
 func TestPartitionPauseWaitCoversTheMinority(t *testing.T) {
 	for _, tc := range []struct {
 		hosts int
@@ -570,6 +571,14 @@ func TestPartitionPauseWaitCoversTheMinority(t *testing.T) {
 	// The bound the resume pass runs on is the one W counts.
 	if partitionResumeStepBound != PartitionResumeStepBound {
 		t.Fatalf("a resume step is bounded by %v, but W counts %v", partitionResumeStepBound, PartitionResumeStepBound)
+	}
+	// The re-pause after a mid-pass loss holds the pauser's loop from the
+	// first lost reading. §4.1 adds nothing for it because the loop is free
+	// again, with a tick to spare, before T_pause of loss can have built up:
+	// the ordinary pause of what earlier passes resumed is not delayed.
+	if partitionRepauseBound+partitionPauseTick > PartitionPauseAfter || partitionRepauseBound > PartitionPauseExecBudget {
+		t.Fatalf("the re-pause is bounded by %v: with a tick (%v) it must fit in T_pause %v, and in E %v",
+			partitionRepauseBound, partitionPauseTick, PartitionPauseAfter, PartitionPauseExecBudget)
 	}
 	// A loss the majority could not fence must not pause: T_pause is the
 	// majority's own verdict-building time.

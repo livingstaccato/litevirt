@@ -248,6 +248,10 @@ If a suspend or a freeze fails, the pauser does three things:
   self-fences, exactly as the VIP demoter does when a demotion cannot be
   confirmed. The host reboots, the VMs stop, and the disks are untouched.
 
+A VM whose resume a healed pass abandoned, and which is still out in
+libvirt, is not suspended: its QEMU is killed (§4.1). Only a kill that
+fails, or a container's Unfreeze still out, is a pause failure.
+
 **The majority does not count a host as paused when it holds an open
 `partition_pause_failed` for that host** (§4.3). The majority sees this only
 for a failure it has heard about: one from before the partition (a fleet-wide
@@ -416,11 +420,47 @@ The `R` term is a healed M that is inside a resume pass when the link breaks:
 it takes its first not-Yes reading at most one step later than a quiet M
 would. That reading counts toward the loss like any other, and the
 workloads that pass resumed are paused again at once; the ones earlier passes
-resumed are paused on the ordinary path, by the bound above. A resume
-abandoned at its step's deadline keeps its record, and if it lands later it is
-paused again at once. Until it returns, a pause pass reports that workload as
-a failed pause (`partition_pause_failed`, and the self-fence when a verified
-watchdog is armed), since it cannot promise the call will not land.
+resumed are paused on the ordinary path, by the bound above.
+
+**The re-pause adds nothing to the bound.** It runs on the pauser's own loop,
+which takes no reading and pauses nothing else meanwhile, so it must not hold
+the loop long: its pauses run at once, each under the per-call timeout, and
+the whole re-pause returns within `E` however many there are and however they
+hang. It starts at M's first not-Yes reading `x`. The ordinary pause of what
+earlier passes resumed cannot come before `x + T_pause`, when that loss has
+covered `T_pause`, and the loop is free again by `x + E ≤ x + T_pause − Δ`.
+Run one after another, eight suspends hung on a dead storage fabric held the
+loop 16 s, and those workloads paused that much past the bound.
+`TestPartitionPauseWaitCoversTheMinority` pins `E + Δ ≤ T_pause`.
+
+**A resume abandoned at its step's deadline** keeps its record, and the call
+is still out. It may land at any moment, and no suspend issued meanwhile is
+sure to come after it. The pauser handles it three ways:
+
+- **It lands while the majority stays.** If every reading since its step
+  began was Yes, a fresh reading is Yes, and a majority of voters confirms
+  the workload again, the resume stands. That is as safe as a resume that
+  landed on time: a loss is read no later than for that one, and pauses the
+  workload on the ordinary path. Otherwise it is paused again at once, and a later pass
+  resumes it on a fresh confirmation.
+- **A pause pass runs while it is still out.** The pass kills the domain's
+  QEMU directly, by libvirt's pid file and the process's own `-uuid`, without
+  a libvirt call, which may hang too. Every vCPU thread leaves `KVM_RUN` on
+  the fatal signal and never enters it again, so the call cannot land after
+  the pass. The pass is the moment `W` counts on, so no copy of that VM runs
+  here past `t_d + W`. Nothing the design promised is lost: the majority
+  recovers the VM from its disks, as it would after this host's own crash.
+- **The kill cannot be done**, or the workload is a container. A container's
+  Unfreeze has no such stop. The pass reports the workload in
+  `partition_pause_failed`, and self-fences when a verified watchdog is
+  armed. It cannot tell this call from one about to land, and with the
+  majority lost for `T_pause` the host is being fenced either way. The cost is
+  the host's non-recoverable workloads. If the call then lands after `W`, the
+  workload runs beside its replacement until the undo takes effect, one call
+  later, or until the next pause pass (`Δ + E`) if the undo fails. The
+  watchdog does not shorten that: the reboot comes one hardware timeout
+  (60 s by default) after the fence. This is the F2 residual (§7) applied to
+  one workload.
 
 **Choices.**
 

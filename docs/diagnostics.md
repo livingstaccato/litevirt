@@ -2248,6 +2248,40 @@ holder writes.
   `lv host undrain` (or until failover returns it to active, when its fence
   moved nothing). A workload that a certified claim moved is stopped by the
   settle step below, not resumed.
+
+  A resume (an Unfreeze for a container) that libvirt or LXC has not
+  answered within its 3 s step is abandoned, and the workload stays paused
+  with `reason="resume failed: did not return within …"` (`unfreeze
+  failed: …`). The call is still out, and when it lands later:
+  ```
+  partition-pause: an abandoned resume landed late with the voter majority there throughout and confirming again; it stands kind=vm name=<vm>
+  partition-pause: an abandoned resume landed late; paused again kind=vm name=<vm>
+  ```
+  It stands only when the host read the majority as present at every
+  reading since the step began, reads it present again, and a majority of
+  voters confirms the workload again. Otherwise it is paused again at once,
+  and a later pass resumes it on a fresh confirmation. A libvirtd that is
+  slow on every call therefore still resumes the VM, a few seconds late.
+
+  A call that never returns means libvirtd, or the domain's QEMU monitor, is
+  wedged. The VM stays paused, and `partition_paused` stays open, for as
+  long as it lasts. Restarting libvirtd (`systemctl restart libvirtd`) makes
+  the call fail, and the next pass resumes the VM. If the domain's QEMU is
+  wedged itself, `lv stop <vm> --force` and `lv start <vm>` restart the
+  guest.
+
+  If the majority is lost again while such a call is out, the pause pass
+  kills the VM's QEMU directly, because a call that may land cannot be
+  undone in time:
+  ```
+  partition-pause: killed the QEMU of a VM whose abandoned resume was still out under a lost majority; it cannot land now name=<vm>
+  ```
+  libvirt then reports the domain shut off, crashed. The majority recovers it
+  from its disks. If the majority never fenced this host, the VM's restart
+  policy decides, as for any crash, once this host holds a quorum. If the
+  kill cannot be done (no pid file, or the pid is not that domain's QEMU),
+  and for a container, whose Unfreeze has no such stop, the workload is
+  reported in `partition_pause_failed`.
 - `partition_pause_failed` (host, critical): this host lost the majority and
   could not pause a workload it had to. While it is open, the majority does
   not rely on this host's pause and recovers on an `assumed` fence as before.

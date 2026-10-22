@@ -91,3 +91,42 @@ func TestNewClient_SystemConfigSSHGFailureFailsClosed(t *testing.T) {
 		t.Fatalf("err = %v, want a refusal naming ssh -G and %s", err, sys)
 	}
 }
+
+// Under -F every file is read as user config, so a relative Include in the
+// system file would resolve against ~/.ssh instead of /etc/ssh and could be
+// skipped silently. Any Include argument in the system file, or in a file it
+// includes, that is not an absolute path refuses, naming the file and line.
+func TestResolveConfig_SystemConfigRelativeIncludeRefused(t *testing.T) {
+	sshHome(t, "id_ed25519")
+	dir := t.TempDir()
+	abs := filepath.Join(dir, "abs.conf")
+	writeFile(t, abs, "Host *", "  Port 2203")
+	nested := filepath.Join(dir, "nested.conf")
+	writeFile(t, nested, "# a comment: Include ignored.conf", "Host x", `  Include "with space.conf"`)
+	for name, tc := range map[string]struct{ body, file, line string }{
+		"bare":            {"Include fleet.conf\n", "", ":1"},
+		"equals":          {"Host *\n  include=fleet.conf\n", "", ":2"},
+		"second argument": {`Include "` + abs + `" fleet.conf` + "\n", "", ":1"},
+		"tilde":           {"Include ~/fleet.conf\n", "", ":1"},
+		"nested":          {"Include " + filepath.Join(dir, "nest*.conf") + "\n", nested, ":3"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			sys := writeSystemSSHConfig(t, tc.body)
+			want := tc.file
+			if want == "" {
+				want = sys
+			}
+			_, err := resolveConfig("h", "", "22", false, false, 0)
+			if err == nil || !strings.Contains(err.Error(), want+tc.line) || !strings.Contains(err.Error(), "Include") {
+				t.Fatalf("err = %v, want a refusal naming %s%s", err, want, tc.line)
+			}
+		})
+	}
+
+	// Absolute Includes (the distro default) work and apply.
+	writeSystemSSHConfig(t, "# Include relative.conf\nInclude = "+abs+" "+filepath.Join(dir, "none-such-*.conf")+"\n")
+	r, err := resolveConfig("h", "", "22", false, false, 0)
+	if err != nil || r.Port != "2203" {
+		t.Fatalf("absolute Include: r=%+v err=%v, want Port 2203 from it", r, err)
+	}
+}

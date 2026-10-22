@@ -127,6 +127,9 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 		defaultKH = filepath.Join(home, ".ssh", "known_hosts")
 		defaultKH2 = defaultKH + "2"
 	}
+	if err := checkSystemIncludes(systemSSHConfig, 0); err != nil {
+		return nil, err
+	}
 	include(systemSSHConfig)
 	haveConfig := len(configs) > 0
 	names := strings.Join(configs, " and ")
@@ -450,6 +453,94 @@ func warnIfAbsent(kind, path, host string) {
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		warnf("%s %s for %s does not exist; host keys it would pin are not checked", kind, path, host)
 	}
+}
+
+// maxIncludeDepth is ssh's own limit on nested Include.
+const maxIncludeDepth = 16
+
+// checkSystemIncludes refuses a relative Include in the system config or in
+// any file it includes. litevirt reads the system file through -F, which
+// makes ssh treat it as user config: a relative path would resolve against
+// ~/.ssh instead of /etc/ssh, and a file that is not there is skipped
+// silently -- dropping whatever the fleet set in it. Only absolute paths are
+// unambiguous ("~" also differs, and ssh refuses it in a system file), so any
+// other argument refuses, naming the file and line. Absent files are fine.
+func checkSystemIncludes(path string, depth int) error {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("cannot read the system ssh config %s: %w", path, err)
+	}
+	if depth > maxIncludeDepth {
+		return fmt.Errorf("system ssh config %s: Include nested more than %d deep", path, maxIncludeDepth)
+	}
+	for i, line := range strings.Split(string(data), "\n") {
+		args := splitConfigLine(line)
+		if len(args) == 0 || !strings.EqualFold(args[0], "include") {
+			continue
+		}
+		for _, a := range args[1:] {
+			if !filepath.IsAbs(a) || strings.ContainsAny(a, "$%") {
+				return fmt.Errorf("system ssh config %s:%d: Include %q is not an absolute path; litevirt "+
+					"reads the system config as ssh -F does, which would resolve it against ~/.ssh "+
+					"instead of /etc/ssh -- refusing. Write it as an absolute path", path, i+1, a)
+			}
+			matches, err := filepath.Glob(a)
+			if err != nil {
+				return fmt.Errorf("system ssh config %s:%d: Include %q: %w", path, i+1, a, err)
+			}
+			for _, m := range matches {
+				if err := checkSystemIncludes(m, depth+1); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// splitConfigLine splits an ssh_config line as ssh does: a keyword, an
+// optional "=", then arguments separated by whitespace, each optionally in
+// double or single quotes. A comment line yields nothing.
+func splitConfigLine(line string) []string {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasPrefix(line, "#") {
+		return nil
+	}
+	kw, rest := line, ""
+	if i := strings.IndexAny(line, " \t="); i >= 0 {
+		kw, rest = line[:i], strings.TrimLeft(line[i:], " \t")
+		rest = strings.TrimLeft(strings.TrimPrefix(rest, "="), " \t")
+	}
+	out := []string{kw}
+	var cur strings.Builder
+	in, quote := false, byte(0)
+	for i := 0; i < len(rest); i++ {
+		c := rest[i]
+		switch {
+		case quote != 0 && c == quote:
+			quote = 0
+		case quote != 0:
+			cur.WriteByte(c)
+		case c == '"' || c == '\'':
+			quote, in = c, true
+		case c == ' ' || c == '\t':
+			if in {
+				out = append(out, cur.String())
+				cur.Reset()
+				in = false
+			}
+		default:
+			cur.WriteByte(c)
+			in = true
+		}
+	}
+	if in {
+		out = append(out, cur.String())
+	}
+	return out
 }
 
 // validSSHName reports whether s holds only hostname, IP-literal and

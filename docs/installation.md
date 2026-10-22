@@ -317,7 +317,10 @@ by OpenSSH itself. Two files are read, in the order `ssh` reads them: `~/.ssh/co
 `/etc/ssh/ssh_config.d/*.conf`). The first value obtained wins, so your own config beats the
 system one, and a setting made only in the system file (a fleet's `RevokedHostKeys`,
 `KnownHostsCommand` or `GlobalKnownHostsFile`) is enforced or refused exactly as if you had set
-it.
+it. Every `Include` in the system file, and in the files it includes, must be an absolute
+path: lv refuses a relative one (or one starting with `~`), naming the file and line, because it
+reads the system file the way `ssh -F` does, which would look for it under `~/.ssh` instead of
+`/etc/ssh`. Distribution defaults (`Include /etc/ssh/ssh_config.d/*.conf`) are absolute.
 
 - The `--ssh-user` commands (gossip and migration key rotation) and `lv host rm` dial
   `user@<recorded address>`, so a config `User` never applies to them, but a `Host` block that

@@ -3375,6 +3375,20 @@ on the host the record then names: a re-point, a `lv doctor firmware-move`
 action (at once), or a live firmware move's own recovery. A firmware move still
 marked on that host keeps it open.
 
+While the condition is open, the move's target never replaces a paused domain
+of the VM: that copy may be the guest's only one. A lease holder on an older
+build can reschedule a VM recorded `migrating` onto its target, and the
+target's reconciler would otherwise destroy the paused guest and boot the VM
+afresh from its disks. It leaves the start pending instead, and logs why, and
+the condition stays open on the host the record names while that host holds a
+paused domain of the VM and the record does not say running there. Resume the
+guest there (`virsh resume <vm>`) and it is recorded running; or discard it
+(`virsh destroy <vm>`) and the VM is started there from its disks. `lv stop
+<vm>` and `lv rm <vm>` discard the paused copy too, without asking: it may be
+the guest's only copy. Each resolves the condition within a minute. A guest
+held paused there for its NIC guards (`firewall.nic.held`) is resumed by its
+host once its guards are in force, which is the resume above.
+
 `lv stop` and `lv rm` of a VM recorded `migrating` whose guest is not running
 on its host first ask the move's target whether it holds a domain of the VM.
 They are refused when it does (pointing at `lv doctor repair-owner`), and when

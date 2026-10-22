@@ -106,6 +106,10 @@ type Reconciler struct {
 	rekeyMu      sync.Mutex
 	rekeyDefined map[string]string
 	rekeyLogged  map[string]string
+	// moveHoldLogged logs, once per VM and cause, a start held for its
+	// unresolved move (unresolved_move_hold.go).
+	moveHoldMu     sync.Mutex
+	moveHoldLogged map[string]string
 	// fwSkips logs, once per record, a VM this reconciler leaves alone
 	// because a live firmware move's record names it here.
 	fwSkips firmwareMoveSkips
@@ -1814,6 +1818,12 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// here: self-heal, onboot, a re-driven start. Asked again of the fresh
 	// row under the lease below.
 	if operatorStopHeld("reconciler", r.dataDir, r.hostName, &vm) {
+		return
+	}
+	// A paused domain a live move left here while that move is unresolved
+	// is never replaced: it may be the guest's only copy
+	// (unresolved_move_hold.go). Nothing is claimed or written for it.
+	if r.holdForUnresolvedMove(ctx, vm.Name) {
 		return
 	}
 	// Take a per-VM startup lease before doing anything destructive.

@@ -875,6 +875,57 @@ message Host {
     // reserved_cpu and reserved_mem_mib cover only the listed reservations:
     // true whenever reservations_error is set.
     bool                           reservations_partial = 33;
+    // Set by InspectHost: the host's resource pressure, from the answering
+    // daemon's own sampler for itself, and for another host from that host's
+    // latest answer to this daemon's readiness probe. level "unknown" when it
+    // never answered with one (an older build, pressure.enabled false).
+    HostPressure                   pressure             = 34;
+    // When the probe that carried `pressure` was sent (RFC 3339); "" for the
+    // answering daemon itself and when unknown.
+    string                         pressure_observed_at = 35;
+}
+
+// HostPressure is a host's resource pressure (docs/configuration.md,
+// "Resource pressure"). Diagnostic and placement-advisory only: nothing reads
+// it as a reason to fence, recover or release anything.
+message HostPressure {
+  // ok | warn | degrade | critical, the worst over the resources; "unknown"
+  // only where a reader fills it in for a host that did not say.
+  string level = 1;
+  // Each resource above ok, e.g. "data_dir.space", "pool.default.inodes".
+  repeated string resources = 2;
+  // RFC 3339: when the host entered its current level.
+  string since = 3;
+  // 4 and 5 are left for a later phase (exiting, workloads_live).
+  // detail is every resource's state. DIAGNOSTIC ONLY: on the readiness
+  // probe it is served to a caller holding a host certificate only, as
+  // not_ready_reason is, because it carries paths and sizes.
+  repeated PressureResource detail = 6;
+  // The shortest projected time until a filesystem resource has nothing
+  // free at its fill rate over the trend window; 0 when none is filling.
+  int64 time_to_full_sec = 7;
+  // When the host's sampler last completed a sample (RFC 3339, as
+  // Host.pressure_observed_at); "" before the first.
+  string sampled_at = 8;
+  // The levels are the last ones known, not current: the sampler has not
+  // completed a sample for more than three sample intervals, or its latest
+  // read of the host's pool list did not return in time.
+  bool stale = 9;
+}
+
+// PressureResource is one graded resource of a host.
+message PressureResource {
+  string name  = 1; // e.g. "data_dir.space", "pool.default.space", "fds.daemon", "memory.daemon"
+  string level = 2; // ok | warn | degrade | critical
+  string since = 3; // RFC 3339, start of the current level
+  // free and total in unit ("bytes", "inodes" or "fds"); for the daemon's
+  // memory and fds, free is the limit less what is in use.
+  uint64 free  = 4;
+  uint64 total = 5;
+  string unit  = 6;
+  double free_pct = 7;
+  int64  time_to_full_sec = 8; // 0 when not filling
+  string error = 9;            // why the latest sample failed; the level is the last known
 }
 
 // One in-flight capacity claim counted against a host.

@@ -55,6 +55,10 @@ func (s *Server) Ready(ctx context.Context, _ *pb.ReadyRequest) (*pb.ReadyRespon
 	// never from a read here: the probe must not depend on the database to say
 	// what the database holds (haPolicyCache).
 	resp.HaKnown, resp.HaDisarmed, resp.HaPolicyAt = s.haCache.snapshot()
+	// Resource pressure is reported beside the verdict, never folded into it:
+	// an unready host loses its quorum weight, and a fill common to every host
+	// would then cost the fleet its majority. It is in memory: no disk read.
+	resp.Pressure = s.localPressure(disclose)
 	reason := ""
 	rows, finished, err := s.boundedReadyQuery(rctx)
 	switch {
@@ -109,8 +113,12 @@ func (s *Server) PeerReady(ctx context.Context, host, addr string) (bool, string
 		if err == nil && resp.GetHostName() == host {
 			s.peerHA.record(host, peerHAAnswer{asked: asked, known: resp.GetHaKnown(),
 				disarmed: resp.GetHaDisarmed(), policyAt: resp.GetHaPolicyAt()})
+			s.peerPressure.record(host, asked, resp.GetPressure())
 		} else {
 			s.peerHA.record(host, peerHAAnswer{asked: asked})
+			// An older build, or another host answering: it said nothing
+			// about this host's pressure, which is unknown, not ok.
+			s.peerPressure.record(host, asked, nil)
 		}
 	}
 	if err != nil {

@@ -2184,6 +2184,28 @@ then keeps the fence: its daemon runs and serves, and the host stays `fenced` or
 Fix what the cause names, confirm the host should run workloads again, then
 run `lv host undrain <host>`.
 
+### Resource pressure (`host.pressure`)
+
+A host's own sampler grades its data directory, its pools, and the daemon's
+descriptors and memory ([configuration](configuration.md#resource-pressure)).
+The host reports the grade on the readiness probe. Evaluator `pressure`,
+subject the host. The failover lease holder writes it from each host's latest
+probe answer, so a host whose disk is full is still described by a peer.
+
+| Raised when | Clears when |
+|---|---|
+| The host reports `warn` or `degrade` (**warning**) or `critical` (**critical**). The evidence names the level, the pressured resources, `since`, `time_to_full_sec`, `sampled_at` and `stale`. | The host reports `ok`, answers without pressure (`pressure.enabled: false`, or an older build), or is removed. |
+
+The lease holder acts only on an answer at most 10 minutes old. A host it has
+no such answer from (down, cut off, or in maintenance) keeps its condition as
+it was, `last_seen` included. With no lease holder, no condition is written,
+while `lv host inspect` and the metrics still show each host's level.
+
+`lv host inspect <host>` shows every resource's free and total. Free space on
+the named filesystem, or move workloads off with `lv host drain <host>`. The
+condition clears on its own once the level does. Nothing is refused because of
+it in this release, and a pressured host stays ready and keeps its vote.
+
 ### Two hosts admitted at one address (`host.address_shared`)
 
 `lv host add` admits one name per machine: the admission write is refused, in

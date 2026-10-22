@@ -521,6 +521,13 @@ type Server struct {
 	// cluster HA policy (ReadyResponse.ha_*), which the coordinator's
 	// decide-time veto reads.
 	peerHA peerHAAnswers
+	// pressureSrc is this host's resource-pressure sampler (SetPressureSource);
+	// nil while pressure.enabled is false. peerPressure holds each peer's
+	// latest answer to the health probe about its own (ReadyResponse.pressure),
+	// and pressureCond the lease holder's last host.pressure write per host.
+	pressureSrc  atomic.Pointer[pressureSourceBox]
+	peerPressure peerPressureAnswers
+	pressureCond pressureCondMemo
 	// haCache is this node's in-memory copy of the cluster HA policy, which
 	// Ready answers from without a database read.
 	haCache haPolicyCache

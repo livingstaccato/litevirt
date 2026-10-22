@@ -4322,7 +4322,11 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		}
 	}()
 	if req.KeepDisks {
-		undefErr = s.virt.UndefineDomainPreservingState(req.Name)
+		// libvirt's snapshot metadata goes with the domain (libvirt refuses
+		// the undefine of a shut-off domain with snapshots otherwise); the
+		// snapshots' files, memory images, firmware bundles and records stay
+		// with the kept disks.
+		undefErr = s.virt.UndefineDeletedDomainKeepingState(req.Name)
 	} else if err := s.virt.UndefineDomain(req.Name, true); err != nil {
 		slog.Warn("failed to undefine domain", "vm", req.Name, "error", err)
 		// Retry without flags in case the domain has no managed save/snapshots.

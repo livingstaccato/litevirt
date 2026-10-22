@@ -88,7 +88,7 @@ var fwExemptOwners = map[string][]string{
 var fwRawLibvirt = map[string][]string{
 	"DomainUndefineFlags": {
 		"internal/libvirt.discardFirmwareMoveTarget", "internal/libvirt.undefineDomain",
-		"internal/libvirt.undefineDomainPreservingState", "internal/libvirt.undefineKeepingState",
+		"internal/libvirt.undefineDomainPreservingState", "internal/libvirt.undefineDeletedDomainKeepingState", "internal/libvirt.undefineKeepingState",
 		"internal/libvirt.forceRemoveDomain", "internal/libvirt.revertToLiveSnapshot", "internal/libvirt.revertToSnapshot",
 	},
 	"DomainResume": {

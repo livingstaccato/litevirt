@@ -1,6 +1,7 @@
 package libvirtfake
 
 import (
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -253,4 +254,66 @@ func TestFake_RedefineKeepsActiveRuntimeState(t *testing.T) {
 			}
 		})
 	}
+}
+
+// libvirt refuses to undefine a SHUT-OFF domain that holds snapshot metadata
+// unless SNAPSHOTS_METADATA is passed ("cannot delete inactive domain with N
+// snapshots"), and the fake refuses it the same way: the keep-state undefine
+// and the plain undefine without removeStorage are refused, the --keep-disks
+// undefine and the plain undefine with removeStorage are not. An ACTIVE domain
+// is not refused: it survives as a transient one.
+//
+// Mutation: drop hasSnapshotsRefusalLocked from undefineKeepingState: red.
+func TestFake_UndefineRefusedWhileSnapshotsExist(t *testing.T) {
+	setup := func(t *testing.T, name string) *Fake {
+		t.Helper()
+		f := New()
+		if err := f.DefineDomain(`<domain><name>` + name + `</name><uuid>uuid-` + name + `</uuid></domain>`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.CreateSnapshot(name, "s1"); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	refused := func(t *testing.T, f *Fake, name string, err error) {
+		t.Helper()
+		if err == nil || !strings.Contains(err.Error(), "cannot delete inactive domain with 1 snapshots") {
+			t.Fatalf("undefine of a shut-off domain with a snapshot = %v; want libvirt's refusal", err)
+		}
+		if !f.DomainExists(name) {
+			t.Fatal("a refused undefine removed the domain")
+		}
+	}
+	t.Run("preserving state", func(t *testing.T) {
+		f := setup(t, "vm1")
+		refused(t, f, "vm1", f.UndefineDomainPreservingState("vm1"))
+	})
+	t.Run("plain without storage", func(t *testing.T) {
+		f := setup(t, "vm1")
+		refused(t, f, "vm1", f.UndefineDomain("vm1", false))
+	})
+	for name, undef := range map[string]func(*Fake) error{
+		"keep disks":         func(f *Fake) error { return f.UndefineDeletedDomainKeepingState("vm1") },
+		"plain with storage": func(f *Fake) error { return f.UndefineDomain("vm1", true) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := setup(t, "vm1")
+			if err := undef(f); err != nil {
+				t.Fatalf("undefine: %v", err)
+			}
+			if f.DomainExists("vm1") {
+				t.Fatal("the domain is still defined")
+			}
+		})
+	}
+	t.Run("active", func(t *testing.T) {
+		f := setup(t, "vm1")
+		if err := f.StartDomain("vm1"); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.UndefineDomainPreservingState("vm1"); err != nil {
+			t.Fatalf("keep-state undefine of an active domain with a snapshot: %v", err)
+		}
+	})
 }

@@ -282,6 +282,16 @@ A seed whose owner stamp is empty or unreadable is listed as kept. A `--keep-dis
 `<data_dir>/kept-disks/<vm>.json` cannot be read is refused, naming the file,
 with nothing deleted: repair or remove that file, then retry.
 
+**A kept VM's snapshots.** `lv rm --keep-disks` of a VM with snapshots
+removes libvirt's metadata of those snapshots (and of any checkpoints) with
+the domain: libvirt refuses to undefine a stopped domain that still holds it.
+Nothing else of a snapshot is removed. Its overlay files stay with the kept
+disks, in the backing chain they were in, and so do its memory image, its
+firmware bundle and its snapshot record. The NVRAM and vTPM state are kept as
+for any `--keep-disks` delete. A snapshot restore, a VM update and the other
+operations that undefine a domain only to define it again keep libvirt's
+snapshot metadata.
+
 **Delete keeps its handle on failure.** `lv rm` removes the VM's record only once
 its libvirt domain is gone. If the running (or paused) domain cannot be stopped,
 nothing is removed; if it is stopped but cannot be undefined — or its PCI

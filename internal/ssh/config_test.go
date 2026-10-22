@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -395,7 +396,7 @@ func TestResolveConfig_IdentityTokensAndIdentitiesOnly(t *testing.T) {
 	old := warnf
 	warnf = func(f string, a ...any) { warned = append(warned, fmt.Sprintf(f, a...)) }
 	t.Cleanup(func() { warnf = old })
-	writeSSHConfig(t, home, "Host h\n  HostName real.example\n  IdentitiesOnly yes\n  IdentityFile %d/.ssh/k_%h\n  IdentityFile ~/.ssh/odd_%L\n")
+	writeSSHConfig(t, home, "Host h\n  HostName real.example\n  IdentitiesOnly yes\n  IdentityFile %d/.ssh/k_%h\n  IdentityFile ~/.ssh/odd_%C\n")
 	r, err := resolveConfig("h", "", "22", false, false, 0)
 	if err != nil || r == nil {
 		t.Fatalf("r=%v err=%v", r, err)
@@ -404,7 +405,7 @@ func TestResolveConfig_IdentityTokensAndIdentitiesOnly(t *testing.T) {
 	if len(r.IdentityFiles) != 1 || r.IdentityFiles[0] != want {
 		t.Fatalf("IdentityFiles = %v, want [%s]", r.IdentityFiles, want)
 	}
-	if len(warned) != 1 || !strings.Contains(warned[0], "odd_%L") {
+	if len(warned) != 1 || !strings.Contains(warned[0], "odd_%C") {
 		t.Fatalf("warnings %v, want one naming the unexpanded IdentityFile", warned)
 	}
 	if !r.IdentitiesOnly {
@@ -705,5 +706,45 @@ func TestResolveConfig_RejectsShellMetacharacters(t *testing.T) {
 		if _, err := resolveConfig(ok, "deploy.user-1", "22", true, false, 0); err != nil {
 			t.Errorf("host %q: %v", ok, err)
 		}
+	}
+}
+
+// %i %k %l %L are expanded in IdentityFile as ssh expands them.
+func TestResolveConfig_MoreIdentityTokens(t *testing.T) {
+	home, _ := sshHome(t, "unused_key")
+	writeSSHConfig(t, home, "Host h\n  HostKeyAlias ka\n  IdentityFile ~/.ssh/a_%i_%k\n  IdentityFile ~/.ssh/b_%l_%L\n")
+	old := localHostname
+	localHostname = func() (string, error) { return "ws1.lab.example", nil }
+	t.Cleanup(func() { localHostname = old })
+	fqdn, short := "ws1.lab.example", "ws1"
+	r, err := resolveConfig("h", "", "22", false, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		filepath.Join(home, ".ssh", fmt.Sprintf("a_%d_ka", os.Getuid())),
+		filepath.Join(home, ".ssh", "b_"+fqdn+"_"+short),
+	}
+	if !slices.Equal(r.IdentityFiles, want) {
+		t.Fatalf("IdentityFiles = %v, want %v", r.IdentityFiles, want)
+	}
+}
+
+// IdentitiesOnly yes whose only IdentityFile had to be skipped offers nothing
+// in its place (sshcfg M6): ssh would offer that key, never the defaults.
+func TestNewClient_IdentitiesOnlySkippedIdentityDoesNotWiden(t *testing.T) {
+	home, pub := sshHome(t, "id_ed25519") // authorised, but not the configured identity
+	srv := startFakeSSHD(t, pub)
+	var warned []string
+	old := warnf
+	warnf = func(f string, a ...any) { warned = append(warned, fmt.Sprintf(f, a...)) }
+	t.Cleanup(func() { warnf = old })
+	writeSSHConfig(t, home, "Host 127.0.0.1\n  IdentitiesOnly yes\n  IdentityFile ~/.ssh/k_%C\n")
+	if c, err := NewClient("deploy@127.0.0.1:" + srv.port()); err == nil {
+		c.Close()
+		t.Fatal("IdentitiesOnly with a skipped IdentityFile fell back to the default key files")
+	}
+	if len(warned) == 0 {
+		t.Fatal("the skipped IdentityFile was not warned about")
 	}
 }

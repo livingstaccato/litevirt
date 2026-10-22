@@ -506,10 +506,14 @@ func authMethodsFor(cfg *resolved) ([]ssh.AuthMethod, error) {
 	var (
 		extraKeys      []string
 		identitiesOnly bool
+		onlyConfigured bool
 	)
 	sock, sockFrom := os.Getenv("SSH_AUTH_SOCK"), "SSH_AUTH_SOCK not set"
 	if cfg != nil {
 		extraKeys, identitiesOnly = cfg.IdentityFiles, cfg.IdentitiesOnly
+		// IdentitiesOnly with an IdentityFile litevirt had to skip offers
+		// nothing in its place: ssh would offer that key, never the defaults.
+		onlyConfigured = identitiesOnly && (len(extraKeys) > 0 || cfg.IdentitySkipped)
 		if cfg.AgentSet {
 			sock, sockFrom = cfg.AgentSock, "disabled by IdentityAgent in the ssh config"
 		}
@@ -526,7 +530,7 @@ func authMethodsFor(cfg *resolved) ([]ssh.AuthMethod, error) {
 		filepath.Join(home, ".ssh", "id_rsa"),
 	}
 	identities := append(append([]string(nil), extraKeys...), defaults...)
-	if identitiesOnly && len(extraKeys) > 0 {
+	if onlyConfigured {
 		identities = extraKeys // ssh offers only the configured identities
 	}
 	if sock == "" {

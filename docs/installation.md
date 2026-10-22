@@ -323,9 +323,9 @@ by OpenSSH itself. Only the per-user `~/.ssh/config` is read; `/etc/ssh/ssh_conf
   a passphrase-protected key or a `.pub`-only hardware-token key held by the agent still goes
   first), then the agent's other
   keys, then `~/.ssh/id_ed25519`, `id_ecdsa` and `id_rsa`. A key is never offered twice, and a
-  busy agent cannot use up the server's attempts before the configured key. `%d %h %n %p %r %u %%` are expanded; an
-  `IdentityFile` with any other `%` token is skipped with a warning. `IdentitiesOnly yes`
-  limits the ssh agent (which is still used) and the key files to the configured identities,
+  busy agent cannot use up the server's attempts before the configured key. `%d %h %i %k %l %L %n %p %r %u %%` are
+  expanded; an `IdentityFile` with any other `%` token is skipped with a warning, and under
+  `IdentitiesOnly yes` nothing is offered in its place. `IdentitiesOnly yes` limits the ssh agent (which is still used) and the key files to the configured identities,
   matched by public key, so an `IdentityFile` that is a `.pub` file whose private key is in the agent works.
 - `IdentityAgent` is honoured: `none` uses no agent, a socket path (or `$VAR`) uses that agent,
   and `SSH_AUTH_SOCK` or no setting uses `$SSH_AUTH_SOCK`.

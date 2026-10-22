@@ -10,6 +10,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -32,13 +33,16 @@ var warnf = func(format string, args ...any) {
 // resolved is what the operator's OpenSSH configuration says about a target,
 // reduced to the fields the pure-Go client can act on.
 type resolved struct {
-	Hostname       string
-	User           string // "" when neither the command line nor the config chose one
-	Port           string
-	IdentityFiles  []string // configured IdentityFile entries, defaults excluded
-	IdentitiesOnly bool
-	StrictYes      bool     // StrictHostKeyChecking yes/true/on
-	KnownHosts     []string // configured UserKnownHostsFile entries, ~/.ssh/known_hosts{,2} excluded
+	Hostname      string
+	User          string // "" when neither the command line nor the config chose one
+	Port          string
+	IdentityFiles []string // configured IdentityFile entries, defaults excluded
+	// IdentitySkipped: a configured IdentityFile was dropped (a % token
+	// litevirt cannot expand), so IdentitiesOnly must not widen to the defaults.
+	IdentitySkipped bool
+	IdentitiesOnly  bool
+	StrictYes       bool     // StrictHostKeyChecking yes/true/on
+	KnownHosts      []string // configured UserKnownHostsFile entries, ~/.ssh/known_hosts{,2} excluded
 	// GlobalKnownHosts is GlobalKnownHostsFile: OpenSSH's default
 	// /etc/ssh/ssh_known_hosts{,2} unless the config names others.
 	GlobalKnownHosts []string
@@ -176,6 +180,7 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 	if a := got.one("hostkeyalias"); a != "" && a != "none" {
 		r.HostKeyAlias = a
 	}
+	tk := tokens{orig: host, hostname: r.Hostname, user: eff, port: r.Port, alias: r.HostKeyAlias}
 
 	// ProxyJump and ProxyCommand are not supported by this client. They are
 	// not refused: every caller dialled the address directly before, and a
@@ -191,9 +196,10 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 		if id == "none" || isDefaultIdentity(id) {
 			continue
 		}
-		p, ok := expandIdentity(id, host, r.Hostname, eff, r.Port)
+		p, ok := tk.expand(id)
 		if !ok {
 			warnf("ignoring IdentityFile %q for %s: it uses a %% token litevirt does not expand", id, host)
+			r.IdentitySkipped = true
 			continue
 		}
 		r.IdentityFiles = append(r.IdentityFiles, p)
@@ -204,7 +210,7 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 		r.StrictYes = true
 	}
 	ukh, err := knownHostsPaths(got["userknownhostsfile"], func(p string) (string, bool) {
-		return expandIdentity(p, host, r.Hostname, eff, r.Port)
+		return tk.expand(p)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("UserKnownHostsFile for %s: %w", host, err)
@@ -224,7 +230,7 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 	case strings.HasPrefix(ia, "$"):
 		r.AgentSet, r.AgentSock = true, os.Getenv(strings.TrimPrefix(ia, "$"))
 	default:
-		p, ok := expandIdentity(ia, host, r.Hostname, eff, r.Port)
+		p, ok := tk.expand(ia)
 		if !ok {
 			warnf("IdentityAgent %q for %s uses a %% token litevirt does not expand; using no agent", ia, host)
 		}
@@ -298,9 +304,18 @@ func isDefaultIdentity(p string) bool {
 	return false
 }
 
-// expandIdentity expands ~ and the tokens ssh accepts in these paths that are
-// knowable here (%% %d %h %n %p %r %u); any other token reports ok=false.
-func expandIdentity(p, orig, hostname, usr, port string) (string, bool) {
+// localHostname is os.Hostname, a variable so a test can give it a domain.
+var localHostname = os.Hostname
+
+// tokens are the values ssh's %-tokens take for one target.
+type tokens struct {
+	orig, hostname, user, port, alias string
+}
+
+// expand expands ~ and the tokens ssh accepts in these paths that are
+// knowable here (%% %d %h %i %k %l %L %n %p %r %u); any other token reports
+// ok=false.
+func (tk tokens) expand(p string) (string, bool) {
 	home, _ := os.UserHomeDir()
 	local := ""
 	if u, err := user.Current(); err == nil {
@@ -322,13 +337,30 @@ func expandIdentity(p, orig, hostname, usr, port string) (string, bool) {
 		case 'd':
 			b.WriteString(home)
 		case 'h':
-			b.WriteString(hostname)
+			b.WriteString(tk.hostname)
+		case 'i':
+			b.WriteString(strconv.Itoa(os.Getuid()))
+		case 'k':
+			if tk.alias != "" {
+				b.WriteString(tk.alias)
+			} else {
+				b.WriteString(tk.orig)
+			}
+		case 'l', 'L':
+			h, err := localHostname()
+			if err != nil {
+				return "", false
+			}
+			if p[i] == 'L' {
+				h, _, _ = strings.Cut(h, ".")
+			}
+			b.WriteString(h)
 		case 'n':
-			b.WriteString(orig)
+			b.WriteString(tk.orig)
 		case 'p':
-			b.WriteString(port)
+			b.WriteString(tk.port)
 		case 'r':
-			b.WriteString(usr)
+			b.WriteString(tk.user)
 		case 'u':
 			b.WriteString(local)
 		default:

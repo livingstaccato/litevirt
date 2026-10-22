@@ -305,6 +305,97 @@ lv host ls
 
 Repeat for each additional host.
 
+## SSH targets and `~/.ssh/config`
+
+Every command that reaches a host over SSH (`lv host init`, `lv host add`, `lv host rotate-audit-key`
+and the `--ssh-user` commands) reads the ssh config through the system `ssh -G`, so a `Host`
+alias that works with `ssh <alias>` works here, even when the alias is not in DNS.
+`HostName`, `User`, `Port`, `IdentityFile`, `IdentitiesOnly`, `IdentityAgent` and the host-key
+options below are used, and `Include` and `Match` are resolved
+by OpenSSH itself. Two files are read, in the order `ssh` reads them: `~/.ssh/config` (under
+`$HOME`), then `/etc/ssh/ssh_config` (with whatever it `Include`s, such as
+`/etc/ssh/ssh_config.d/*.conf`). The first value obtained wins, so your own config beats the
+system one, and a setting made only in the system file (a fleet's `RevokedHostKeys`,
+`KnownHostsCommand` or `GlobalKnownHostsFile`) is enforced or refused exactly as if you had set
+it. Every `Include` in the system file, and in the files it includes, must be an absolute
+path: lv refuses a relative one (or one starting with `~`), naming the file and line, because it
+reads the system file the way `ssh -F` does, which would look for it under `~/.ssh` instead of
+`/etc/ssh`. Distribution defaults (`Include /etc/ssh/ssh_config.d/*.conf`) are absolute.
+
+- The `--ssh-user` commands (gossip and migration key rotation) and `lv host rm` dial
+  `user@<recorded address>`, so a config `User` never applies to them, but a `Host` block that
+  matches the recorded address (`Host 10.0.0.*`) does: its `HostName`, `Port` and `IdentityFile`
+  redirect those dials as they would `ssh`.
+- `lv host renew-cert` and `lv host ui-cert set` default to `root@<host name>`. When your ssh
+  config turns that name into a `HostName` that does not resolve to the address the cluster
+  records for the host, they refuse rather than carry the host's credentials elsewhere; fix the
+  config or name the target with `--ssh`.
+- The config is read once per command, and its `HostName` is the one address used everywhere:
+  the DNS step, the certificate SAN, the address recorded for the host, and the SSH dial.
+  It must still be IPv4.
+- A host, and a user written on the command line, may contain only letters, digits and
+  `.` `_` `-` `:`, and may not start with `-`; anything else (`ops+ci@host`, `DOMAIN\user`, an
+  IDN name, `[10.0.0.1]` without a port) is refused with `invalid SSH host` or `invalid SSH user`
+  before `ssh -G` runs. This applies even with no `~/.ssh/config`: the host can come from the
+  cluster's replicated host records, and a `Match exec` line would hand it to a shell.
+- A user or port written on the command line (`admin@alias`, `alias:2222`) beats the
+  config; the config beats the defaults (user `root`, port 22).
+- Keys are offered in one publickey attempt, as OpenSSH orders them: the configured
+  `IdentityFile` keys first (the agent's copy of one when it holds it, matched by public key, so
+  a passphrase-protected key or a `.pub`-only hardware-token key held by the agent still goes
+  first), then the agent's other keys, then `~/.ssh/id_ed25519`, `id_ecdsa` and `id_rsa`. A key
+  is never offered twice, and a busy agent cannot use up the server's attempts before the
+  configured key. `%d %h %i %k %l %L %n %p %r %u %%` are expanded; an `IdentityFile` with any
+  other `%` token is skipped with a warning, and under `IdentitiesOnly yes` nothing is offered
+  in its place. `IdentitiesOnly yes` limits the ssh agent (which is still used) and the key
+  files to the configured identities, matched by public key, so an `IdentityFile` that is a
+  `.pub` file whose private key is in the agent works.
+- `IdentityAgent` is honoured: `none` uses no agent, a socket path (or `$VAR`) uses that agent,
+  and `SSH_AUTH_SOCK` or no setting uses `$SSH_AUTH_SOCK`.
+- `ProxyJump` and `ProxyCommand` are not supported. lv warns, naming the directive, and
+  dials the address directly, as it always did.
+- Nothing in the config makes lv accept a host key that `ssh <alias>` would refuse. lv refuses:
+  a changed key for a known host (always; `StrictHostKeyChecking no` or `accept-new` change
+  nothing); a host with no known_hosts entry under `StrictHostKeyChecking yes` (otherwise it is
+  accepted on first contact, accept-new); a key, or a certificate over a key or from a CA, listed
+  in `RevokedHostKeys`; a host certificate its CA signed with SHA-1 `ssh-rsa`, as OpenSSH's
+  default `CASignatureAlgorithms` does; and any key whose check depends on something lv cannot
+  read:
+  - `KnownHostsCommand` (anything but `none`): lv does not run it, so every dial refuses, naming
+    it. Put the keys it serves in a known_hosts file instead.
+  - `RevokedHostKeys` must be a plain list of public keys (`#` comments allowed). A binary KRL,
+    a line that is not a public key, or a missing or unreadable file refuses every dial, naming
+    the file.
+- The known_hosts files checked: `~/.ssh/known_hosts` and `~/.ssh/known_hosts2` always;
+  `UserKnownHostsFile` adds files on top of them, so `/dev/null` or `none` drops no entry; and
+  `GlobalKnownHostsFile`, by default `/etc/ssh/ssh_known_hosts` and `ssh_known_hosts2`, so a host
+  key distributed there is enforced. lv only reads these files;
+  it never records a key in any of them. A configured file that does not exist is skipped, as
+  `ssh` skips it, with a warning naming it. A file that exists but cannot be read or parsed (a
+  default, configured or global one) refuses the connection and names the file and line.
+  lv's parser is stricter than OpenSSH's: a line `ssh` skips, such as one with a key type lv
+  does not support (`ssh-xmss@openssh.com`) or one over 64 KiB, fails the whole file. One such
+  line in any of these files, including a global one config management writes, stops every lv
+  SSH dial until it is fixed or removed, even though `ssh` itself accepts the file. With no
+  known_hosts file at all there is nothing to compare, and first contact is accepted with a
+  warning.
+- `HostKeyAlias` is honoured as `ssh` honours it: the host's key (and a host certificate's
+  principal) is looked up under the alias, so a key pinned there is enforced. When known_hosts
+  has nothing under the alias, lv checks the dialled address instead rather than treating the
+  host as new, except under `StrictHostKeyChecking yes`, which refuses an unknown alias as `ssh`
+  does.
+- lv asks a known host only for the key types its known_hosts entries record (and for a host
+  certificate when a `@cert-authority` line covers it), so a host that also holds keys of other
+  types is not refused as changed; a host known_hosts does not know is asked for any plain key
+  type. RSA keys are asked for with SHA-2 signatures only: an sshd that can sign only SHA-1
+  `ssh-rsa` is refused. `HostKeyAlgorithms` in the config is not used.
+- `Match exec` lines in your config run with lv's privileges, as they do for `ssh`: as root
+  under `sudo lv host init`. OpenSSH refuses a config file not owned by that user.
+- With neither config file present the defaults apply even without an `ssh` binary. If either
+  exists but `ssh -G` fails or takes longer than 10 seconds, the command refuses with an error
+  naming `ssh -G` and the config files, rather than dropping what they pin.
+  `ssh` also refuses a config it does not own: under `sudo -E`, run lv as the config's owner or without `-E`.
+
 ## CLI setup
 
 The `lv` binary connects to litevirtd over gRPC/mTLS. On a node with

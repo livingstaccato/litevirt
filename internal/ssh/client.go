@@ -1,6 +1,12 @@
 package ssh
 
 import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -44,16 +51,92 @@ func NewClientDeadline(target string, timeout time.Duration) (*Client, error) {
 }
 
 func newClient(target string, timeout time.Duration, keepDeadline bool) (*Client, error) {
-	sshUser, host, port := parseTarget(target)
+	start := time.Now()
+	// The ssh -G run counts against the caller's bound, not before it.
+	t, err := resolveTarget(target, timeout)
+	if err != nil {
+		return nil, err
+	}
+	return dialTarget(t, start, timeout, keepDeadline)
+}
 
-	auth, err := authMethods()
+// NewClientResolved connects to a target already resolved with Resolve.
+func NewClientResolved(t *Target) (*Client, error) {
+	return dialTarget(t, time.Now(), 0, false)
+}
+
+func dialTarget(t *Target, start time.Time, timeout time.Duration, keepDeadline bool) (*Client, error) {
+	cfg, sshUser, host, port := t.cfg, t.user, t.host, t.port
+	dialHost := cfg.Hostname
+
+	auth, err := authMethodsFor(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("SSH auth: %w", err)
 	}
 
-	hostKeyCallback, err := defaultHostKeyCallback()
+	// The host-key policy is for the address actually dialled -- the config's
+	// HostName and Port, never the alias the operator typed -- because that is
+	// the string ssh.Dial hands the callback.
+	addr := net.JoinHostPort(dialHost, port)
+	config, err := clientConfig(sshUser, auth, cfg, addr)
 	if err != nil {
-		// No usable known_hosts (no HOME, unreadable file). Accept-new still
+		return nil, fmt.Errorf("host key check for %s: %w", host, err)
+	}
+	var conn *ssh.Client
+	if timeout > 0 {
+		remaining := timeout - time.Since(start)
+		if remaining <= 0 {
+			return nil, fmt.Errorf("SSH dial %s: %w", addr, context.DeadlineExceeded)
+		}
+		conn, err = dialTimeout(addr, config, remaining, keepDeadline)
+	} else {
+		conn, err = ssh.Dial("tcp", addr, config)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("SSH dial %s: %w", addr, err)
+	}
+
+	return &Client{conn: conn, addr: addr}, nil
+}
+
+// clientConfig is the ClientConfig every litevirt SSH dial uses: the given
+// auth, and the host-key policy cfg sets for addr (host:port as dialled).
+//
+// The verifying callback and the HostKeyAlgorithms offer come from one read of
+// the same known_hosts files, so the key types asked for are exactly the ones
+// the verification will accept. HostKeyAlgorithms is never taken from the ssh
+// config: a config could re-add SHA-1 ssh-rsa, or ask for a type known_hosts
+// does not record and so turn a known host into a refused one.
+func clientConfig(sshUser string, auth []ssh.AuthMethod, cfg *resolved, addr string) (*ssh.ClientConfig, error) {
+	// Options with which ssh would refuse keys litevirt cannot otherwise see: a
+	// pin source litevirt does not run refuses outright; a revocation list litevirt
+	// cannot read refuses too. Neither is ever skipped.
+	if cfg != nil && cfg.KnownHostsCommand != "" {
+		return nil, fmt.Errorf("your ssh config sets KnownHostsCommand (%s); litevirt does not run it, "+
+			"so the host keys it would supply cannot be checked -- refusing. Put the host's key in a "+
+			"known_hosts file (UserKnownHostsFile or GlobalKnownHostsFile) instead", cfg.KnownHostsCommand)
+	}
+	var revoked map[string]bool
+	if cfg != nil && cfg.RevokedHostKeys != "" {
+		var err error
+		if revoked, err = loadRevokedHostKeys(cfg.RevokedHostKeys); err != nil {
+			return nil, err
+		}
+	}
+	hostKeyCallback, hostKeyAlgos, err := hostKeyPolicyFor(cfg, addr)
+	if err != nil {
+		// Only the ABSENCE of any known_hosts reaches the first-contact
+		// fallback. A store that exists but cannot be read or parsed fails
+		// closed: accepting any key there would let a corrupt file (or one
+		// named by the config) switch off the check for a changed key.
+		if !errors.Is(err, errNoKnownHosts) || (cfg != nil && cfg.StrictYes) {
+			return nil, err
+		}
+		host, _, serr := net.SplitHostPort(addr)
+		if serr != nil {
+			host = addr
+		}
+		// No known_hosts at all (no HOME, no file). Accept-new still
 		// applies -- there is nothing to compare against, and refusing here
 		// would make provisioning impossible on a fresh workstation -- but say
 		// so, because this connection carries the cluster CA-signed host key
@@ -63,26 +146,215 @@ func newClient(target string, timeout time.Duration, keepDeadline bool) (*Client
 				"against a previous one. This connection carries the cluster CA-signed "+
 				"host key.\n", err, host)
 		hostKeyCallback = firstContactOnlyCallback(host)
+		hostKeyAlgos = slices.Clone(firstContactHostKeyAlgorithms)
 	}
 
-	config := &ssh.ClientConfig{
-		User:            sshUser,
-		Auth:            auth,
-		HostKeyCallback: hostKeyCallback,
-	}
+	return &ssh.ClientConfig{
+		User:              sshUser,
+		Auth:              auth,
+		HostKeyCallback:   refuseRevokedAndSHA1CA(hostKeyCallback, revoked, revokedFile(cfg)),
+		HostKeyAlgorithms: hostKeyAlgos,
+	}, nil
+}
 
-	addr := net.JoinHostPort(host, port)
-	var conn *ssh.Client
-	if timeout > 0 {
-		conn, err = dialTimeout(addr, config, timeout, keepDeadline)
-	} else {
-		conn, err = ssh.Dial("tcp", addr, config)
+func revokedFile(cfg *resolved) string {
+	if cfg == nil {
+		return ""
 	}
+	return cfg.RevokedHostKeys
+}
+
+// refuseRevokedAndSHA1CA runs before next, on every path including first
+// contact: a key RevokedHostKeys lists -- presented plainly, as the key inside
+// a certificate, or as the CA that signed one -- is refused, and so is a host
+// certificate whose CA signed it with SHA-1 ssh-rsa (or DSA), which OpenSSH's
+// default CASignatureAlgorithms refuses.
+func refuseRevokedAndSHA1CA(next ssh.HostKeyCallback, revoked map[string]bool, file string) ssh.HostKeyCallback {
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		isRevoked := func(k ssh.PublicKey) bool { return k != nil && revoked[string(k.Marshal())] }
+		cert, isCert := key.(*ssh.Certificate)
+		if isRevoked(key) || (isCert && (isRevoked(cert.Key) || isRevoked(cert.SignatureKey))) {
+			return fmt.Errorf("host key for %s is revoked (RevokedHostKeys %s) -- refusing", hostname, file)
+		}
+		if isCert && cert.Signature != nil {
+			switch cert.Signature.Format {
+			case ssh.KeyAlgoRSA, ssh.KeyAlgoDSA: //nolint:staticcheck // naming them to refuse them
+				return fmt.Errorf("host certificate for %s is signed by its CA with SHA-1 (%s) -- refusing, "+
+					"as OpenSSH does by default; re-sign it with rsa-sha2-512", hostname, cert.Signature.Format)
+			}
+		}
+		return next(hostname, remote, key)
+	}
+}
+
+// loadRevokedHostKeys reads a RevokedHostKeys file that is a plain list of
+// public keys (blank lines and # comments allowed). ssh also accepts a binary
+// KRL, which x/crypto cannot parse; that, a line that is not a public key, or
+// a file that cannot be read (absent included -- ssh refuses then too) is an
+// error, never an empty list.
+func loadRevokedHostKeys(path string) (map[string]bool, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("SSH dial %s: %w", addr, err)
+		return nil, fmt.Errorf("RevokedHostKeys %s cannot be read: %w", path, err)
 	}
+	if bytes.HasPrefix(data, []byte("SSHKRL\n\x00")) {
+		return nil, fmt.Errorf("RevokedHostKeys %s is a binary KRL, which litevirt cannot read -- "+
+			"refusing rather than skip the revocations; list the revoked public keys instead", path)
+	}
+	out := map[string]bool{}
+	for i, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, _, _, _, err := ssh.ParseAuthorizedKey([]byte(line))
+		if err != nil {
+			return nil, fmt.Errorf("RevokedHostKeys %s:%d is not a public key: %w", path, i+1, err)
+		}
+		out[string(k.Marshal())] = true
+	}
+	return out, nil
+}
 
-	return &Client{conn: conn, addr: addr}, nil
+// hostKeyAlgorithmPreference is the order known host-key types are asked for
+// in, strongest first. An RSA key is asked for with SHA-2 signatures only.
+var hostKeyAlgorithmPreference = []struct {
+	keyType string
+	algos   []string
+}{
+	{ssh.KeyAlgoED25519, []string{ssh.KeyAlgoED25519}},
+	{ssh.KeyAlgoECDSA256, []string{ssh.KeyAlgoECDSA256}},
+	{ssh.KeyAlgoECDSA384, []string{ssh.KeyAlgoECDSA384}},
+	{ssh.KeyAlgoECDSA521, []string{ssh.KeyAlgoECDSA521}},
+	{ssh.KeyAlgoRSA, []string{ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256}},
+}
+
+// sha2CertAlgorithms are the host-certificate algorithms asked for when a
+// @cert-authority line covers the host. They follow the HOST key's type, which
+// need not be the CA's (an ed25519 CA can sign an ecdsa host key), so every
+// supported type is listed. No SHA-1 ssh-rsa or DSA certificates.
+var sha2CertAlgorithms = []string{
+	ssh.CertAlgoED25519v01,
+	ssh.CertAlgoECDSA256v01,
+	ssh.CertAlgoECDSA384v01,
+	ssh.CertAlgoECDSA521v01,
+	ssh.CertAlgoRSASHA512v01,
+	ssh.CertAlgoRSASHA256v01,
+}
+
+// firstContactHostKeyAlgorithms is the offer to a host known_hosts does not
+// know: every plain type, SHA-2 only, and no certificates. A certificate from
+// a CA nothing trusts would be refused outright, so asking for one would turn
+// first contact with a cert-bearing host into a refusal; its plain key is
+// taken under accept-new like any other new host's.
+var firstContactHostKeyAlgorithms = func() []string {
+	var algos []string
+	for _, p := range hostKeyAlgorithmPreference {
+		algos = append(algos, p.algos...)
+	}
+	return algos
+}()
+
+// knownHostKeyAlgorithms returns the host-key algorithms to ask addr for:
+// certificates first when a @cert-authority line covers it, then the plain key
+// types its plain known_hosts entries record; for a host known_hosts does not
+// know, firstContactHostKeyAlgorithms.
+//
+// Without this the server presents whichever of its keys x/crypto prefers --
+// ECDSA before ED25519 -- while OpenSSH records the ED25519 one. knownhosts
+// then finds an entry for the host holding a different key, and a node whose
+// key never changed is refused as CHANGED. OpenSSH avoids the same trap the
+// same way (it orders HostKeyAlgorithms by what known_hosts holds).
+//
+// Narrowing the offer is not a weakening: the presented key must still match a
+// recorded one exactly (or be a certificate the recorded CA signed), and a
+// server that holds no key of a recorded type fails the negotiation instead of
+// being treated as unknown.
+//
+// raw is the unwrapped knownhosts callback; addr is host:port as dialled. The
+// probe key is fresh, so it can match no entry, and the KeyError lists every
+// entry -- plain AND @cert-authority, which KnownKey does not tell apart --
+// recorded for addr. isHostAuthority sorts them. The same in-memory database
+// then verifies the real key, so the two answers cannot disagree about the file.
+func knownHostKeyAlgorithms(raw ssh.HostKeyCallback, addr string) []string {
+	probe, want := knownHostEntries(raw, addr)
+	if len(want) == 0 {
+		return slices.Clone(firstContactHostKeyAlgorithms)
+	}
+	keyErr := &knownhosts.KeyError{Want: want}
+	authority := false
+	recorded := map[string]bool{}
+	for _, k := range keyErr.Want {
+		if isHostAuthority(raw, addr, probe, k.Key) {
+			authority = true
+		} else {
+			recorded[k.Key.Type()] = true
+		}
+	}
+	var algos []string
+	if authority {
+		algos = append(algos, sha2CertAlgorithms...)
+	}
+	for _, p := range hostKeyAlgorithmPreference {
+		if recorded[p.keyType] {
+			algos = append(algos, p.algos...)
+		}
+	}
+	if len(algos) == 0 {
+		// Recorded only under types this client cannot negotiate (sk-*, dss):
+		// whatever the host presents fails hostKeyVerdictFor, which says so.
+		return slices.Clone(firstContactHostKeyAlgorithms)
+	}
+	return algos
+}
+
+// knownHostEntries asks raw for addr with a fresh key, which can match no
+// entry, and returns that key and every entry recorded for addr (none for a
+// host known_hosts does not know).
+func knownHostEntries(raw ssh.HostKeyCallback, addr string) (ssh.PublicKey, []knownhosts.KnownKey) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, nil
+	}
+	probe, err := ssh.NewPublicKey(priv.Public())
+	if err != nil {
+		return nil, nil
+	}
+	var keyErr *knownhosts.KeyError
+	if !errors.As(raw(addr, &net.TCPAddr{IP: net.IPv4zero}, probe), &keyErr) {
+		return probe, nil
+	}
+	return probe, keyErr.Want
+}
+
+// hostIsKnown reports whether known_hosts holds any entry -- plain or
+// @cert-authority -- for addr.
+func hostIsKnown(raw ssh.HostKeyCallback, addr string) bool {
+	_, want := knownHostEntries(raw, addr)
+	return len(want) > 0
+}
+
+// isHostAuthority reports whether key is a @cert-authority entry for addr
+// rather than a plain one. knownhosts does not export that, so it asks the
+// callback with an unsigned, expired host certificate "signed" by key: the
+// callback refuses it either way, but only with "no authorities for hostname"
+// when key is not a CA for addr. Misreading the string fails closed (a CA host
+// is asked for plain keys and refused; TestHostKeyCA_CAOnlyHostWithCert).
+func isHostAuthority(raw ssh.HostKeyCallback, addr string, probe, key ssh.PublicKey) (authority bool) {
+	defer func() {
+		if recover() != nil {
+			authority = false
+		}
+	}()
+	cert := &ssh.Certificate{
+		Key:          probe,
+		CertType:     ssh.HostCert,
+		SignatureKey: key,
+		Signature:    &ssh.Signature{Format: key.Type()},
+		// ValidBefore 0: expired, so no path reaches signature verification.
+	}
+	err := raw(addr, &net.TCPAddr{IP: net.IPv4zero}, cert)
+	return err != nil && !strings.Contains(err.Error(), "no authorities for hostname")
 }
 
 // Close closes the SSH connection.
@@ -270,6 +542,13 @@ func (c *Client) Conn() *ssh.Client {
 }
 
 func parseTarget(target string) (user, host, port string) {
+	user, host, port, _, _ = parseTargetExplicit(target)
+	return
+}
+
+// parseTargetExplicit is parseTarget that also says whether the target named
+// the user and the port, so a config value is used only where it did not.
+func parseTargetExplicit(target string) (user, host, port string, userSet, portSet bool) {
 	user = "root"
 	host = target
 	port = "22"
@@ -278,6 +557,7 @@ func parseTarget(target string) (user, host, port string) {
 		if c == '@' {
 			user = target[:i]
 			host = target[i+1:]
+			userSet = true
 			break
 		}
 	}
@@ -285,19 +565,50 @@ func parseTarget(target string) (user, host, port string) {
 	if h, p, err := net.SplitHostPort(host); err == nil {
 		host = h
 		port = p
+		portSet = true
 	}
 
 	return
 }
 
-func authMethods() ([]ssh.AuthMethod, error) {
-	var methods []ssh.AuthMethod
+func authMethods() ([]ssh.AuthMethod, error) { return authMethodsFor(nil) }
+
+// authMethodsFor is authMethods under cfg: its IdentityFile entries tried
+// before the default key files, IdentitiesOnly, and IdentityAgent. A nil cfg
+// is the defaults (SSH_AUTH_SOCK, the default key files).
+func authMethodsFor(cfg *resolved) ([]ssh.AuthMethod, error) {
+	var (
+		extraKeys      []string
+		identitiesOnly bool
+		onlyConfigured bool
+	)
+	sock, sockFrom := os.Getenv("SSH_AUTH_SOCK"), "SSH_AUTH_SOCK not set"
+	if cfg != nil {
+		extraKeys, identitiesOnly = cfg.IdentityFiles, cfg.IdentitiesOnly
+		// IdentitiesOnly with an IdentityFile litevirt had to skip offers
+		// nothing in its place: ssh would offer that key, never the defaults.
+		onlyConfigured = identitiesOnly && (len(extraKeys) > 0 || cfg.IdentitySkipped)
+		if cfg.AgentSet {
+			sock, sockFrom = cfg.AgentSock, "disabled by IdentityAgent in the ssh config"
+		}
+	}
 	var tried []string
+	// agentSigners is nil without a usable agent.
+	var agentSigners func() ([]ssh.Signer, error)
 
 	// Try SSH agent first
-	sock := os.Getenv("SSH_AUTH_SOCK")
+	home, _ := os.UserHomeDir()
+	defaults := []string{
+		filepath.Join(home, ".ssh", "id_ed25519"),
+		filepath.Join(home, ".ssh", "id_ecdsa"),
+		filepath.Join(home, ".ssh", "id_rsa"),
+	}
+	identities := append(append([]string(nil), extraKeys...), defaults...)
+	if onlyConfigured {
+		identities = extraKeys // ssh offers only the configured identities
+	}
 	if sock == "" {
-		tried = append(tried, "agent: SSH_AUTH_SOCK not set")
+		tried = append(tried, "agent: "+sockFrom)
 	} else {
 		conn, err := net.Dial("unix", sock)
 		if err != nil {
@@ -314,35 +625,190 @@ func authMethods() ([]ssh.AuthMethod, error) {
 				tried = append(tried, "agent: connected but no keys loaded")
 			} else {
 				tried = append(tried, fmt.Sprintf("agent: %d key(s) available", len(keys)))
-				methods = append(methods, ssh.PublicKeysCallback(ac.Signers))
+				if identitiesOnly {
+					// As OpenSSH does: keep the agent, offer only its keys
+					// that match the identities (by public key, so a .pub
+					// IdentityFile whose private half lives in the agent works).
+					want := identityPublicKeys(identities)
+					tried = append(tried, fmt.Sprintf("agent: IdentitiesOnly yes, %d identity public key(s) to match", len(want)))
+					agentSigners = func() ([]ssh.Signer, error) {
+						all, err := ac.Signers()
+						if err != nil {
+							return nil, err
+						}
+						var keep []ssh.Signer
+						for _, sg := range all {
+							if want[string(sg.PublicKey().Marshal())] {
+								keep = append(keep, sg)
+							}
+						}
+						return keep, nil
+					}
+				} else {
+					agentSigners = ac.Signers
+				}
 			}
 		}
 	}
 
 	// Try default key files
-	home, _ := os.UserHomeDir()
-	keyFiles := []string{
-		filepath.Join(home, ".ssh", "id_ed25519"),
-		filepath.Join(home, ".ssh", "id_ecdsa"),
-		filepath.Join(home, ".ssh", "id_rsa"),
+	keyFiles := identities
+	if !identitiesOnly {
+		keyFiles = append(append([]string(nil), extraKeys...), defaults...)
 	}
+	var fileSigners []ssh.Signer
 	for _, kf := range keyFiles {
 		key, err := loadPrivateKey(kf)
 		if err != nil {
-			if !os.IsNotExist(err) {
-				tried = append(tried, fmt.Sprintf("key %s: %v", filepath.Base(kf), err))
+			if os.IsNotExist(err) {
+				tried = append(tried, fmt.Sprintf("key %s: not found", kf))
+			} else {
+				tried = append(tried, fmt.Sprintf("key %s: %v", kf, err))
 			}
 			continue
 		}
-		tried = append(tried, fmt.Sprintf("key %s: loaded", filepath.Base(kf)))
-		methods = append(methods, ssh.PublicKeys(key))
+		tried = append(tried, fmt.Sprintf("key %s: loaded", kf))
+		fileSigners = append(fileSigners, key)
 	}
 
-	if len(methods) == 0 {
+	// The configured identities' public keys, in config order. They come from
+	// the key files' public halves (a .pub sibling, a public-key file, the
+	// clear half of an OpenSSH private key) as well as from loading the
+	// private key: a passphrase-protected key, or one whose private half lives
+	// only in the agent or on a hardware token, is still the key the operator
+	// named, and its agent copy must still be offered first.
+	var configuredPubs []string
+	seenPub := map[string]bool{}
+	addPub := func(k string) {
+		if !seenPub[k] {
+			seenPub[k] = true
+			configuredPubs = append(configuredPubs, k)
+		}
+	}
+	for _, kf := range extraKeys {
+		if sg, err := loadPrivateKey(kf); err == nil {
+			addPub(string(sg.PublicKey().Marshal()))
+			continue
+		}
+		for k := range identityPublicKeys([]string{kf}) {
+			addPub(k)
+		}
+	}
+
+	if agentSigners == nil && len(fileSigners) == 0 {
 		return nil, fmt.Errorf("no SSH auth methods available:\n  %s", joinLines(tried))
 	}
 
-	return methods, nil
+	// ONE publickey method: the client tries each method name once, so an
+	// agent whose keys all fail would otherwise use up "publickey" and the key
+	// files after it would never be offered. Order, as OpenSSH does: the
+	// configured IdentityFile keys first (the agent's copy of one when it has
+	// it), then the agent's other keys, then the remaining key files, never
+	// repeating a key -- so unrelated agent keys cannot use up MaxAuthTries
+	// before the key the operator named.
+	return []ssh.AuthMethod{ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
+		var agentAll []ssh.Signer
+		if agentSigners != nil {
+			as, err := agentSigners()
+			if err != nil && len(fileSigners) == 0 {
+				return nil, err
+			}
+			agentAll = as
+		}
+		byPub := map[string]ssh.Signer{}
+		for _, sg := range fileSigners {
+			byPub[string(sg.PublicKey().Marshal())] = sg
+		}
+		for _, sg := range agentAll { // the agent's copy wins
+			byPub[string(sg.PublicKey().Marshal())] = sg
+		}
+		var all []ssh.Signer
+		seen := map[string]bool{}
+		add := func(sg ssh.Signer) {
+			if k := string(sg.PublicKey().Marshal()); !seen[k] {
+				seen[k] = true
+				all = append(all, sg)
+			}
+		}
+		for _, k := range configuredPubs {
+			if sg, ok := byPub[k]; ok {
+				add(sg)
+			}
+		}
+		for _, sg := range agentAll {
+			add(sg)
+		}
+		for _, sg := range fileSigners {
+			add(sg)
+		}
+		return all, nil
+	})}, nil
+}
+
+// identityPublicKeys returns the marshalled public keys of the identity files,
+// read from <file>.pub, from the file itself when it holds a public key, or
+// from the cleartext public half of an OpenSSH private key (so a passphrase
+// protected key held by the agent still matches).
+func identityPublicKeys(paths []string) map[string]bool {
+	out := map[string]bool{}
+	for _, p := range paths {
+		for _, f := range []string{p + ".pub", p} {
+			data, err := os.ReadFile(f)
+			if err != nil {
+				continue
+			}
+			if k, _, _, _, err := ssh.ParseAuthorizedKey(data); err == nil {
+				out[string(k.Marshal())] = true
+				break
+			}
+			if k := openSSHPrivatePublic(data); k != nil {
+				out[string(k.Marshal())] = true
+				break
+			}
+		}
+	}
+	return out
+}
+
+// openSSHPrivatePublic extracts the public key stored in the clear in an
+// "openssh-key-v1" private key file, or nil.
+func openSSHPrivatePublic(data []byte) ssh.PublicKey {
+	blk, _ := pem.Decode(data)
+	if blk == nil || blk.Type != "OPENSSH PRIVATE KEY" {
+		return nil
+	}
+	b := blk.Bytes
+	const magic = "openssh-key-v1\x00"
+	if !bytes.HasPrefix(b, []byte(magic)) {
+		return nil
+	}
+	b = b[len(magic):]
+	readString := func() []byte {
+		if len(b) < 4 {
+			return nil
+		}
+		n := binary.BigEndian.Uint32(b)
+		if uint64(n) > uint64(len(b)-4) {
+			return nil
+		}
+		v := b[4 : 4+n]
+		b = b[4+n:]
+		return v
+	}
+	for i := 0; i < 3; i++ { // cipher, kdf, kdf options
+		if readString() == nil && len(b) < 4 {
+			return nil
+		}
+	}
+	if len(b) < 4 || binary.BigEndian.Uint32(b) < 1 {
+		return nil
+	}
+	b = b[4:]
+	k, err := ssh.ParsePublicKey(readString())
+	if err != nil {
+		return nil
+	}
+	return k
 }
 
 func joinLines(ss []string) string {
@@ -382,9 +848,28 @@ func loadPrivateKey(path string) (ssh.Signer, error) {
 //   - non-empty -- the host is KNOWN and the key CHANGED. Refused. Nothing
 //     about provisioning requires this, and it is the whole MITM.
 func hostKeyVerdict(hostname string, err error) error {
+	return hostKeyVerdictFor(hostname, nil, err)
+}
+
+// hostKeyVerdictFor is hostKeyVerdict knowing the presented key, so a refusal
+// can say when the key is of a type known_hosts holds no entry of. That is
+// still refused -- it cannot be verified, and taking it as first contact would
+// let an impostor dodge the pin by presenting another type -- but it is not
+// evidence the recorded key changed.
+func hostKeyVerdictFor(hostname string, key ssh.PublicKey, err error) error {
 	if keyErr := (*knownhosts.KeyError)(nil); errors.As(err, &keyErr) {
 		if len(keyErr.Want) == 0 {
 			return nil // unknown host: accept-new
+		}
+		if key != nil && !recordsType(keyErr.Want, key.Type()) {
+			var types []string
+			for _, w := range keyErr.Want {
+				types = append(types, w.Key.Type())
+			}
+			return fmt.Errorf("host key for %s cannot be verified -- refusing: it presented a %s "+
+				"key, and known_hosts records only %s for it (%s:%d). This connection would "+
+				"carry the cluster CA-signed host key",
+				hostname, key.Type(), strings.Join(types, ", "), keyErr.Want[0].Filename, keyErr.Want[0].Line)
 		}
 		return fmt.Errorf("host key for %s CHANGED (known key at %s:%d) -- refusing: "+
 			"this connection would carry the cluster CA-signed host key, and a changed "+
@@ -393,6 +878,15 @@ func hostKeyVerdict(hostname string, err error) error {
 			hostname, keyErr.Want[0].Filename, keyErr.Want[0].Line)
 	}
 	return err
+}
+
+func recordsType(want []knownhosts.KnownKey, keyType string) bool {
+	for _, w := range want {
+		if w.Key != nil && w.Key.Type() == keyType {
+			return true
+		}
+	}
+	return false
 }
 
 // firstContactOnlyCallback is used when no known_hosts is usable at all.
@@ -411,21 +905,141 @@ func firstContactOnlyCallback(host string) ssh.HostKeyCallback {
 	}
 }
 
+// errNoKnownHosts marks the one condition under which first contact may be
+// accepted unchecked: there is no known_hosts store at all.
+var errNoKnownHosts = errors.New("no known_hosts")
+
 func defaultHostKeyCallback() (ssh.HostKeyCallback, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, err
+	cb, _, err := hostKeyPolicyFor(nil, "")
+	return cb, err
+}
+
+// openSSHGlobalKnownHosts is OpenSSH's built-in GlobalKnownHostsFile.
+var openSSHGlobalKnownHosts = []string{"/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh_known_hosts2"}
+
+// defaultGlobalKnownHosts is the global known_hosts files used when the
+// config names OpenSSH's default (or ssh -G gives no answer). Always
+// openSSHGlobalKnownHosts outside tests, which point it at files of their own
+// so they never read this machine's /etc/ssh.
+var defaultGlobalKnownHosts = slices.Clone(openSSHGlobalKnownHosts)
+
+// knownHostsFiles lists the known_hosts files that verify a host under cfg
+// (nil: the defaults): ~/.ssh/known_hosts{,2} always -- a configured
+// UserKnownHostsFile adds to them and never replaces them, so a key they hold
+// cannot be bypassed with /dev/null -- then the configured UserKnownHostsFile
+// entries, then the GlobalKnownHostsFile ones (by default
+// /etc/ssh/ssh_known_hosts{,2}, where config management often distributes a
+// fleet's host keys). All are only ever read.
+//
+// An absent file is skipped, as ssh skips it. One that exists but cannot be
+// read or parsed is an error naming it, never skipped: it could hold the key
+// that contradicts the others. errNoKnownHosts means there is no file at all.
+func knownHostsFiles(cfg *resolved) ([]string, error) {
+	var files []string
+	use := func(kind, f string) error {
+		if _, err := os.Stat(f); errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if _, err := knownhosts.New(f); err != nil {
+			return fmt.Errorf("%s %s is unusable: %w", kind, f, err)
+		}
+		files = append(files, f)
+		return nil
 	}
-	knownHostsFile := filepath.Join(home, ".ssh", "known_hosts")
-	cb, err := knownhosts.New(knownHostsFile)
+	def := "~/.ssh/known_hosts"
+	if home, err := os.UserHomeDir(); err == nil {
+		def = filepath.Join(home, ".ssh", "known_hosts")
+		for _, f := range []string{def, def + "2"} {
+			if err := use("known_hosts", f); err != nil {
+				return nil, err
+			}
+		}
+	}
+	global := defaultGlobalKnownHosts
+	if cfg != nil {
+		for _, f := range cfg.KnownHosts {
+			if err := use("UserKnownHostsFile", f); err != nil {
+				return nil, err
+			}
+		}
+		global = cfg.GlobalKnownHosts
+	}
+	for _, f := range global {
+		if err := use("GlobalKnownHostsFile", f); err != nil {
+			return nil, err
+		}
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("%w: %s does not exist", errNoKnownHosts, def)
+	}
+	return files, nil
+}
+
+// hostKeyPolicyFor reads the known_hosts files cfg names once and returns the
+// verifying callback and, for a non-empty addr (host:port as dialled), the
+// host-key algorithms to ask it for. The two come from the same in-memory
+// database, so they cannot disagree.
+//
+// Nothing in the ssh config makes it accept more than the defaults do:
+//   - UserKnownHostsFile and GlobalKnownHostsFile only add files to check;
+//   - StrictHostKeyChecking yes refuses an unknown host too, and no or
+//     accept-new are not read at all -- a CHANGED key is always refused;
+//   - HostKeyAlias makes the alias the name a key is looked up under, as ssh
+//     does (certificate principals included), so a key pinned under it is
+//     enforced. When known_hosts has no entry for the alias, the dialled
+//     address is checked instead of taking the host as new, so a key pinned
+//     under the address is not bypassed either -- except under
+//     StrictHostKeyChecking yes, where an unknown alias is refused as ssh
+//     refuses it;
+//   - HostKeyAlgorithms is not read (see clientConfig).
+func hostKeyPolicyFor(cfg *resolved, addr string) (ssh.HostKeyCallback, []string, error) {
+	files, err := knownHostsFiles(cfg)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	raw, err := knownhosts.New(files...)
+	if err != nil {
+		return nil, nil, err
+	}
+	var alias string
+	var strict bool
+	if cfg != nil {
+		alias, strict = cfg.HostKeyAlias, cfg.StrictYes
+	}
+	// lookup is the name hostname's key is looked up under. The offer and
+	// the verification both use it, so they agree on which entries apply.
+	lookup := func(hostname string) string {
+		if alias == "" {
+			return hostname
+		}
+		// ssh looks the alias up with no port; for knownhosts that is 22,
+		// which a bare "alias" line matches.
+		a := net.JoinHostPort(alias, "22")
+		if strict || hostIsKnown(raw, a) {
+			return a
+		}
+		return hostname
+	}
+	var algos []string
+	if addr != "" {
+		algos = knownHostKeyAlgorithms(raw, lookup(addr))
 	}
 	// accept-new, not accept-anything: see hostKeyVerdict for why a CHANGED
-	// key is refused even though an unknown one is not.
+	// key is refused even though an unknown one is not. Strict wraps the raw
+	// answer, so the verdict's refusals stay reachable under it.
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-		return hostKeyVerdict(hostname, cb(hostname, remote, key))
-	}, nil
+		name, label := lookup(hostname), hostname
+		if name != hostname {
+			label = fmt.Sprintf("%s (HostKeyAlias %s)", hostname, alias)
+		}
+		err := raw(name, remote, key)
+		if strict && err != nil {
+			if keyErr := (*knownhosts.KeyError)(nil); errors.As(err, &keyErr) && len(keyErr.Want) == 0 {
+				return fmt.Errorf("host key for %s is not in known_hosts and StrictHostKeyChecking is yes: %w", label, err)
+			}
+		}
+		return hostKeyVerdictFor(label, key, err)
+	}, algos, nil
 }
 
 type bytesReaderWrapper struct {

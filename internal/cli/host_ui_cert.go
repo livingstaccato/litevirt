@@ -40,14 +40,15 @@ type UICertOptions struct {
 // switches the listener to HTTPS within seconds. `lv host ui-cert clear` is the
 // way back to ACME or the cluster certificate.
 func HostUICertSet(ctx context.Context, c pb.LiteVirtClient, hostName string, opts UICertOptions) error {
-	if opts.SSHTarget == "" {
-		opts.SSHTarget = "root@" + hostName
-	}
 	addr, err := hostAddress(ctx, c, hostName)
 	if err != nil {
 		return err
 	}
-	sc, err := ssh.NewClient(opts.SSHTarget)
+	rt, err := sshTargetForHost(hostName, opts.SSHTarget, addr)
+	if err != nil {
+		return err
+	}
+	sc, err := ssh.NewClientResolved(rt)
 	if err != nil {
 		return fmt.Errorf("SSH connect: %w", err)
 	}

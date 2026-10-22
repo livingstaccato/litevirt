@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -218,5 +219,128 @@ func TestHostKeyRSA_UnknownHostNoSHA1(t *testing.T) {
 	writeKnownHosts(t, knownhosts.Line([]string{"10.9.9.9"}, ed25519Signer(t).PublicKey()))
 	if err := dialTest(t, addr); err == nil {
 		t.Fatal("negotiated SHA-1 ssh-rsa with an unknown host")
+	}
+}
+
+// signedHostCert is a host certificate for host from ca valid for 127.0.0.1,
+// changed by mod before signing; tamper changes it after, so the signature no
+// longer verifies.
+func signedHostCert(t *testing.T, ca, host ssh.Signer, mod func(*ssh.Certificate), tamper bool) ssh.Signer {
+	t.Helper()
+	c := &ssh.Certificate{Key: host.PublicKey(), CertType: ssh.HostCert,
+		ValidPrincipals: []string{"127.0.0.1"}, ValidBefore: ssh.CertTimeInfinity}
+	if mod != nil {
+		mod(c)
+	}
+	if err := c.SignCert(rand.Reader, ca); err != nil {
+		t.Fatal(err)
+	}
+	if tamper {
+		c.Serial++
+	}
+	cs, err := ssh.NewCertSigner(c, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cs
+}
+
+// Every invalid certificate from the trusted CA is refused, whether the
+// server also offers plain keys or not, and none of the refusals can reach
+// the accept-new path (reviewer probes, hostkey re-review r1-m1). A valid one
+// is accepted by the same harness.
+func TestHostKeyCA_InvalidCertificatesRefused(t *testing.T) {
+	now := uint64(time.Now().Unix())
+	cases := []struct {
+		name   string
+		mod    func(*ssh.Certificate)
+		tamper bool
+	}{
+		{"expired", func(c *ssh.Certificate) { c.ValidAfter = now - 7200; c.ValidBefore = now - 3600 }, false},
+		{"not-yet-valid", func(c *ssh.Certificate) { c.ValidAfter = now + 3600 }, false},
+		{"wrong-principal", func(c *ssh.Certificate) { c.ValidPrincipals = []string{"10.0.0.99"} }, false},
+		{"user-cert", func(c *ssh.Certificate) { c.CertType = ssh.UserCert }, false},
+		{"bad-signature", nil, true},
+		{"unknown-critical-option", func(c *ssh.Certificate) { c.CriticalOptions = map[string]string{"force-command": "x"} }, false},
+	}
+	for _, tc := range cases {
+		for _, withPlain := range []bool{false, true} {
+			name := tc.name + map[bool]string{false: "/cert-only", true: "/cert+plain"}[withPlain]
+			t.Run(name, func(t *testing.T) {
+				ca, ed := ed25519Signer(t), ed25519Signer(t)
+				keys := []ssh.Signer{signedHostCert(t, ca, ed, tc.mod, tc.tamper)}
+				if withPlain {
+					keys = append(keys, ed, ecdsaSigner(t))
+				}
+				addr := testServer(t, keys...)
+				writeKnownHosts(t, caLine(addr, ca.PublicKey()))
+				if err := dialTest(t, addr); err == nil {
+					t.Fatal("an invalid host certificate was accepted for a CA-only host")
+				}
+			})
+		}
+	}
+	t.Run("valid", func(t *testing.T) {
+		ca, ed := ed25519Signer(t), ed25519Signer(t)
+		addr := testServer(t, signedHostCert(t, ca, ed, nil, false), ed)
+		writeKnownHosts(t, caLine(addr, ca.PublicKey()))
+		if err := dialTest(t, addr); err != nil {
+			t.Fatalf("a valid certificate was refused: %v", err)
+		}
+	})
+}
+
+// A host key listed @revoked is refused even inside a valid certificate.
+func TestHostKeyCA_RevokedKeyInValidCert(t *testing.T) {
+	ca, ed := ed25519Signer(t), ed25519Signer(t)
+	addr := testServer(t, signedHostCert(t, ca, ed, nil, false), ed)
+	writeKnownHosts(t, caLine(addr, ca.PublicKey()), "@revoked "+knownhosts.Line([]string{"*"}, ed.PublicKey()))
+	if err := dialTest(t, addr); err == nil {
+		t.Fatal("a revoked host key inside a valid certificate was accepted")
+	}
+}
+
+// A certificate from a CA whose line covers a different host is refused for
+// this one.
+func TestHostKeyCA_CAForAnotherHostOnly(t *testing.T) {
+	ca, ed, rec := ed25519Signer(t), ed25519Signer(t), ed25519Signer(t)
+	addr := testServer(t, signedHostCert(t, ca, ed, nil, false))
+	writeKnownHosts(t, "@cert-authority "+knownhosts.Line([]string{"10.1.1.1"}, ca.PublicKey()),
+		knownhosts.Line([]string{knownhosts.Normalize(addr)}, rec.PublicKey()))
+	if err := dialTest(t, addr); err == nil {
+		t.Fatal("a certificate from a CA scoped to another host was accepted")
+	}
+}
+
+// isHostAuthority classifies each kind of entry: ed25519, ecdsa (hashed line)
+// and RSA (wildcard) CA keys as authorities, plain ed25519 and RSA entries as
+// not, and a CA as no authority for an address its line does not cover.
+func TestIsHostAuthority_Classification(t *testing.T) {
+	edCA, ecCA, rsCA := ed25519Signer(t), ecdsaSigner(t), rsaSigner(t)
+	plainEd, plainRS := ed25519Signer(t), rsaSigner(t)
+	hashed := knownhosts.HashHostname("10.0.0.9")
+	writeKnownHosts(t,
+		"@cert-authority "+knownhosts.Line([]string{"10.0.0.9"}, edCA.PublicKey()),
+		"@cert-authority "+hashed+" "+strings.TrimPrefix(knownhosts.Line([]string{"x"}, ecCA.PublicKey()), "x "),
+		"@cert-authority "+knownhosts.Line([]string{"10.0.0.*"}, rsCA.PublicKey()),
+		knownhosts.Line([]string{"10.0.0.9"}, plainEd.PublicKey()),
+		knownhosts.Line([]string{"10.0.0.9"}, plainRS.PublicKey()))
+	raw, err := knownhosts.New(filepath.Join(os.Getenv("HOME"), ".ssh", "known_hosts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := ed25519Signer(t).PublicKey()
+	for _, c := range []struct {
+		k    ssh.PublicKey
+		want bool
+		n    string
+	}{{edCA.PublicKey(), true, "edCA"}, {ecCA.PublicKey(), true, "ecCA hashed"}, {rsCA.PublicKey(), true, "rsaCA wildcard"},
+		{plainEd.PublicKey(), false, "plain ed"}, {plainRS.PublicKey(), false, "plain rsa"}} {
+		if got := isHostAuthority(raw, "10.0.0.9:22", probe, c.k); got != c.want {
+			t.Errorf("%s: isHostAuthority = %v, want %v", c.n, got, c.want)
+		}
+	}
+	if isHostAuthority(raw, "10.0.1.9:22", probe, edCA.PublicKey()) {
+		t.Error("edCA classified as an authority for an address its line does not cover")
 	}
 }

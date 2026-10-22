@@ -157,6 +157,14 @@ const RenderInterval = 30 * time.Second
 // `lv host install-fence-ssh` waits for the next one.
 const acceptTTL = time.Minute
 
+// RowFreshAfter is how long after a change to a host's sshd its own row is
+// sure to reflect an sshd evaluation that began after the change, while its
+// agent syncs: an evaluation in flight at the change (its self-check bounded
+// by probeTimeout) stands for acceptTTL, the next sync starts within
+// RenderInterval, and its own evaluation and publish take up to probeTimeout.
+// `lv host install-fence-ssh` counts no row it read sooner.
+const RowFreshAfter = probeTimeout + acceptTTL + RenderInterval + probeTimeout
+
 // Run syncs at once, then every RenderInterval, and probes every
 // ProbeInterval, until ctx ends.
 func (a *Agent) Run(ctx context.Context) {

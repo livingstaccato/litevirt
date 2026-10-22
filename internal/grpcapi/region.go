@@ -100,6 +100,10 @@ func (s *Server) CrossRegionMigrate(req *pb.CrossRegionMigrateRequest, stream gr
 			"vm %q lives on %q; call CrossRegionMigrate on that host (set LV_HOST)",
 			req.VmName, vm.HostName)
 	}
+	// Refused before any disk is replicated to the target pool.
+	if err := s.moveOutQuarantineRefusal(fmt.Sprintf("VM %q", vm.Name), req.TargetHost); err != nil {
+		return err
+	}
 	if _, _, vErr := region.ValidateCrossRegion(ctx, s.db, vm.HostName, req.TargetHost); vErr != nil {
 		return status.Error(codes.FailedPrecondition, vErr.Error())
 	}

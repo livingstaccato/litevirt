@@ -57,6 +57,12 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 			"container %q lives on host %q; run migrate against that daemon (set LV_HOST)",
 			req.Name, source)
 	}
+	// Under write quarantine the move's stop intent and its re-key cannot be
+	// recorded: refused before the target is prepared or the container
+	// stopped.
+	if err := s.moveOutQuarantineRefusal(fmt.Sprintf("container %q", req.Name), req.TargetHost); err != nil {
+		return err
+	}
 	op := s.startContainerOp("migrate", req.Name, "target", req.TargetHost, "repo", req.RepoPath)
 	defer func() { op.done(retErr) }()
 	// The container leaves this host: the next admission here reads the

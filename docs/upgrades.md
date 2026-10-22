@@ -687,7 +687,19 @@ quarantine holds:
   target. The move's ownership commit is a write this host makes after
   libvirt's cut-over: refused, it would leave the guest running on the target
   while every row names this host, and failover of this host would start a
-  second copy. `lv host drain` of the host is refused too.
+  second copy. `lv region migrate` is refused the same way, before any disk
+  is copied to the target pool, and `lv host drain` of the host is refused
+  too.
+- `lv ct migrate` of a container off the host is refused with
+  `FailedPrecondition` the same way, before the target is prepared and
+  before the container is stopped.
+- The target refuses as well. A move's first call to its target asks for
+  the target's capacity, and the target then pings the source. A source that
+  reports WAL quarantine or release probation is refused with
+  `FailedPrecondition`, so the refusal also holds for a source rolled back
+  to a build without its own. A source the target cannot ping is refused
+  with `Unavailable`; retry the move once the two hosts can reach each
+  other.
 
 Release probation lifts by itself (`lv cluster upgrade-status`). Any other
 quarantine needs the host upgraded again or reseeded.

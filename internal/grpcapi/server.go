@@ -1370,6 +1370,8 @@ type Server struct {
 	watchdogFenced atomic.Pointer[func() bool]
 	// walQuarantined reports a rollback below an already-latched capability token.
 	walQuarantined atomic.Pointer[func() bool]
+	// sourceMoveGuardOffForTest: see SetSourceMoveGuardOffForTest.
+	sourceMoveGuardOffForTest atomic.Bool
 
 	// hwV2Ready is the CONTRACT h advertise-readiness flag: set at the END of a
 	// successful BackfillHardwareTables, once the audit pass has classified every

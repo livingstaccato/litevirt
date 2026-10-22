@@ -228,10 +228,8 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// run on the target while every row names this host, and failover of
 	// this host would then start a second copy. Refused before anything is
 	// done anywhere.
-	if reason := s.stopQuarantineReason(); reason != "" {
-		return status.Errorf(codes.FailedPrecondition,
-			"%s cannot move VM %q to %s: it is under write quarantine (%s), so the move's ownership commit cannot be recorded; %s, then retry",
-			s.hostName, vm.Name, req.TargetHost, reason, s.quarantineRemedy())
+	if err := s.moveOutQuarantineRefusal(fmt.Sprintf("VM %q", vm.Name), req.TargetHost); err != nil {
+		return err
 	}
 	// A volume move left unresolved: the rows name the file holding the
 	// guest's writes before anything reads them for the migration

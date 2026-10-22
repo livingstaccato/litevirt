@@ -373,10 +373,20 @@ reads the system file the way `ssh -F` does, which would look for it under `~/.s
   when at least one file matches it and every file that has an entry for the host (under the
   `HostKeyAlias`, or the dialled address) agrees. One file with a different key for the host, a
   key only of another type, or no `@cert-authority` for a presented certificate refuses the
-  connection as changed and names that file. This is stricter than `ssh`, which reads a
+  connection as changed and names that file. A file with only plain entries vouches for a host
+  certificate by the key inside it, so a `@cert-authority` line in one file and the same host's
+  plain key in another accept; a different plain key refuses. lv asks the host for the key types
+  every such file records, so files that all hold the host's RSA key agree even when one of them
+  also holds an ed25519 key; files with no type in common refuse. This is stricter than `ssh`, which reads a
   configured `UserKnownHostsFile` instead of `~/.ssh/known_hosts` and accepts any match: a stale
   entry in `~/.ssh/known_hosts` for a host you pinned elsewhere must be removed
-  (`ssh-keygen -R <host>`) before lv connects. Several keys for the host in one file still
+  (`ssh-keygen -R <host>`) before lv connects. Two certificate cases are also stricter: a host
+  that presents no certificate while a `@cert-authority` line in one file covers it refuses
+  (give the host a certificate, or remove the CA line's coverage of it); and a CA rotation split
+  across files, the old CA in one and the new in another, refuses (put both CA lines in the same
+  file for the rotation). A known_hosts pattern with a wildcard port (`[10.0.0.*]:*`), which
+  OpenSSH matches but lv cannot evaluate, refuses any host its address part could match, naming
+  the file and line; write the port explicitly. Several keys for the host in one file still
   accept on any match. A host no file has an entry for is first contact. lv only reads these files;
   it never records a key in any of them. A configured file that does not exist is skipped, as
   `ssh` skips it, with a warning naming it. A file that exists but cannot be read or parsed (a

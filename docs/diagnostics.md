@@ -907,17 +907,20 @@ the report.
 
 Read-only. Lists project names that are live under more than one spelling
 (`acme` beside `/acme`): two rows of one canonical name, which a create on a
-much older release could leave.
+much older release could leave. It checks the spellings only: the project
+listing carries no incarnation, so it cannot tell whether a listed project
+still holds the pre-upgrade identity.
 
 ```
 lv doctor project-spellings
 ```
 
-Such a project is never given a stable identity by the adoption pass
+A listed project is never given a stable identity by the adoption pass
 ([upgrades.md](upgrades.md#projects-created-before-the-upgrade-get-a-stable-identity))
-while one of its spellings still holds the pre-upgrade identity, and its
-parent references stay in conflict for automation. The pass counts them in
-`litevirt_project_adoption_blocked{reason="spellings"}`.
+while one of its spellings still holds the pre-upgrade identity; the pass
+counts those, and only those, in
+`litevirt_project_adoption_blocked{reason="spellings"}`. Either way its parent
+references stay in conflict for automation.
 
 There is no repair command yet. Do **not** delete one spelling to merge them:
 both spellings share one RBAC root, and a delete retires the grants under it,

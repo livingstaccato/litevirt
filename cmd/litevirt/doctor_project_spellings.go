@@ -48,9 +48,10 @@ func newDoctorProjectSpellingsCmd() *cobra.Command {
 		Long: `List project names that are live under more than one spelling ("acme" beside
 "/acme"), which a create on a much older release could leave.
 
-Such a project is not given a stable identity by the project adoption pass
-while one spelling still holds the pre-upgrade identity, and
-litevirt_project_adoption_blocked{reason="spellings"} counts it.
+It checks the spellings only: the project listing carries no incarnation. A
+listed project that still holds its pre-upgrade identity is not given a stable
+one by the project adoption pass, and
+litevirt_project_adoption_blocked{reason="spellings"} counts those.
 
 Read-only. There is no repair command: deleting one spelling retires the grants
 under the RBAC root both share. See ` + projectSpellingsDocs + `.`,
@@ -74,7 +75,8 @@ under the RBAC root both share. See ` + projectSpellingsDocs + `.`,
 				for _, canon := range canons {
 					fmt.Printf("%s: live as %s\n", canon, strings.Join(found[canon], ", "))
 				}
-				fmt.Printf("\n%d project(s) are live under more than one spelling and are not adopted.\n", len(found))
+				fmt.Printf("\n%d project(s) are live under more than one spelling. One that still holds its pre-upgrade\n", len(found))
+				fmt.Println("identity is not adopted (litevirt_project_adoption_blocked counts those).")
 				fmt.Printf("Do not delete a spelling to merge them; see %s.\n", projectSpellingsDocs)
 				return nil
 			})

@@ -62,7 +62,9 @@ delete, or one granted before the upgrade on a project re-created after it.
 `lv role revoke <binding-id>` removes it. A project created before that token
 latched is given a stable identity of its own by the adoption pass once
 `release_2027_01_v1` has latched ([upgrades.md](upgrades.md#projects-created-before-the-upgrade-get-a-stable-identity));
-its grants and quota keep working through it. A grant made before its project
+its grants and quota keep working through it. A grant made after the adoption
+on a host that has it is held, failing closed, on a host that has not yet
+received the adoption, until it does. A grant made before its project
 first exists carries over to the project when the host that creates it holds
 the grant, under a new binding id; one that reaches the project later from
 another host is held. A quota set with `lv project quota` belongs to the

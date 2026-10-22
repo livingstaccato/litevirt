@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // cachedMountTable serves table through the mount table cache, as the host's
@@ -107,6 +108,46 @@ func TestMountCache_AnExportRemountedWithoutNosymfollowIsJudgedAfresh(t *testing
 	}
 	if got := reads.Load(); got != 2 {
 		t.Errorf("read the table %d times, want 2 (once, and once after the change)", got)
+	}
+}
+
+// A missed change mark leaves the table stale for at most mountTableMaxAge:
+// an export mounted after the read, with no mark, is seen once the table is
+// that old, and not before (the cache still saves the reads in between).
+//
+// Mutation "no age bound" (cachedMounts ignores readAt): the mount is never
+// seen, red.
+func TestMountCache_AMissedMarkIsBoundedByTheTablesAge(t *testing.T) {
+	var table atomic.Value
+	table.Store("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n")
+	var changed atomic.Bool // never set: the kernel's mark was missed
+	reads := cachedMountTable(t, &table, &changed)
+	now := time.Unix(1_000_000, 0)
+	var clock atomic.Int64
+	clock.Store(now.UnixNano())
+	t.Cleanup(mountTableNow.set(func() time.Time { return time.Unix(0, clock.Load()) }))
+
+	if _, err := ReadMountTable(); err != nil {
+		t.Fatal(err)
+	}
+	table.Store("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n40 1 0:60 / /mnt/x rw - nfs4 nas:/lv rw\n")
+	clock.Store(now.Add(mountTableMaxAge - time.Second).UnixNano())
+	if _, err := ReadMountTable(); err != nil {
+		t.Fatal(err)
+	}
+	if got := reads.Load(); got != 1 {
+		t.Errorf("a table younger than mountTableMaxAge was read again (%d reads, want 1)", got)
+	}
+	clock.Store(now.Add(mountTableMaxAge).UnixNano())
+	all, err := ReadMountTable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reads.Load(); got != 2 {
+		t.Errorf("a table mountTableMaxAge old was not read again (%d reads, want 2)", got)
+	}
+	if len(all.all) != 2 {
+		t.Errorf("after mountTableMaxAge the table holds %d mounts, want 2 (the export mounted with no mark)", len(all.all))
 	}
 }
 

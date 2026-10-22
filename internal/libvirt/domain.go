@@ -143,18 +143,6 @@ func (c *Client) UndefineDomainPreservingState(name string) error {
 	return undefineDomainPreservingState(c.virt, c.firmwareGuard(), name)
 }
 
-// UndefineDeletedDomainKeepingState undefines the domain of a VM deleted with
-// --keep-disks: NVRAM and vTPM state are kept, as
-// UndefineDomainPreservingState keeps them, and libvirt's snapshot and
-// checkpoint metadata goes with the domain (libvirt refuses the undefine of a
-// shut-off domain with snapshots otherwise). Only metadata: the snapshot
-// files stay with the kept disks. Never for a redefine-class teardown, whose
-// domain keeps its snapshots. The firmware move guard is asked first
-// (OpUndefine).
-func (c *Client) UndefineDeletedDomainKeepingState(name string) error {
-	return undefineDeletedDomainKeepingState(c.virt, c.firmwareGuard(), name)
-}
-
 // DomainState returns the current coarse lifecycle state of a domain
 // (running | stopping | stopped | error | unknown). Paused, shut-off and
 // pm-suspended all collapse to "stopped" here — callers that need to tell those

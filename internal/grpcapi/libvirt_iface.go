@@ -29,10 +29,6 @@ type LibvirtBackend interface {
 	DestroyDomain(name string) error
 	UndefineDomain(name string, removeStorage bool) error
 	UndefineDomainPreservingState(name string) error // undefine keeping NVRAM/vTPM (redefine-class, G1)
-	// UndefineDeletedDomainKeepingState is the undefine of `lv rm
-	// --keep-disks`: NVRAM/vTPM kept, libvirt's snapshot and checkpoint
-	// metadata dropped with the domain (the snapshot files stay).
-	UndefineDeletedDomainKeepingState(name string) error
 	// DiscardFirmwareMoveTarget is the one way a held live firmware move's
 	// target domain goes (spec §6.8): destroy if paused, then undefine keeping
 	// its state for the quarantine. Never a running domain.

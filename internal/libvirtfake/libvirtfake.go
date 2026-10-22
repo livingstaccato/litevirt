@@ -1239,12 +1239,19 @@ func notRunning(op, name string) error {
 		Message: "Requested operation is not valid: domain is not running"})
 }
 
-// hasSnapshotsRefusalLocked is libvirt's refusal to undefine an INACTIVE domain
-// that still holds snapshot metadata without
-// VIR_DOMAIN_UNDEFINE_SNAPSHOTS_METADATA (qemuDomainUndefineFlags:
-// "cannot delete inactive domain with %d snapshots"). An active domain is
-// not refused: it survives as a transient one. Called with f.mu held.
-func (f *Fake) hasSnapshotsRefusalLocked(op, name string) error {
+// undefineRefusalLocked is libvirt's refusal of an undefine without
+// MANAGED_SAVE and SNAPSHOTS_METADATA (qemuDomainUndefineFlags), which only
+// the client's UndefineDomain(removeStorage=true) passes: a domain with a
+// managed-save image is refused ("Refusing to undefine while domain managed
+// save image exists"), and so is an INACTIVE domain that still holds snapshot
+// metadata ("cannot delete inactive domain with %d snapshots"). An active
+// domain with snapshots is not refused: it survives as a transient one.
+// Called with f.mu held.
+func (f *Fake) undefineRefusalLocked(op, name string) error {
+	if f.managedSave[name] {
+		return fmt.Errorf("%s domain %s: %w", op, name, golibvirt.Error{Code: uint32(golibvirt.ErrOperationInvalid),
+			Message: "Requested operation is not valid: Refusing to undefine while domain managed save image exists"})
+	}
 	n := len(f.snapshots[name])
 	if n == 0 {
 		return nil
@@ -1279,9 +1286,10 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	if !ok {
 		return noDomain(name)
 	}
-	// libvirt.Client passes SNAPSHOTS_METADATA only with removeStorage.
+	// libvirt.Client passes MANAGED_SAVE and SNAPSHOTS_METADATA only with
+	// removeStorage.
 	if !removeStorage {
-		if err := f.hasSnapshotsRefusalLocked("undefine", name); err != nil {
+		if err := f.undefineRefusalLocked("undefine", name); err != nil {
 			return err
 		}
 	}
@@ -1333,23 +1341,7 @@ func (f *Fake) UndefineDomainPreservingState(name string) error {
 	return f.undefinePreservingState(name)
 }
 
-// UndefineDeletedDomainKeepingState mirrors
-// libvirt.Client.UndefineDeletedDomainKeepingState: as
-// UndefineDomainPreservingState, with SNAPSHOTS_METADATA, so a shut-off
-// domain with snapshots is not refused; the snapshots' metadata goes with it.
-func (f *Fake) UndefineDeletedDomainKeepingState(name string) error {
-	defer f.daemon()()
-	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpUndefine, Name: name}); err != nil {
-		return fmt.Errorf("undefine (keep disks) domain %s: %w", name, err)
-	}
-	return f.undefineKeepingState(name, true)
-}
-
 func (f *Fake) undefinePreservingState(name string) error {
-	return f.undefineKeepingState(name, false)
-}
-
-func (f *Fake) undefineKeepingState(name string, dropSnapshotMetadata bool) error {
 	if f.FailUndefinePreserv != nil {
 		if err := f.FailUndefinePreserv(name); err != nil {
 			return err
@@ -1357,12 +1349,10 @@ func (f *Fake) undefineKeepingState(name string, dropSnapshotMetadata bool) erro
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	// KEEP_NVRAM|KEEP_TPM carries no SNAPSHOTS_METADATA: a shut-off domain
-	// with snapshots is refused, as libvirt refuses it.
-	if !dropSnapshotMetadata {
-		if err := f.hasSnapshotsRefusalLocked("undefine (keep state)", name); err != nil {
-			return err
-		}
+	// KEEP_NVRAM|KEEP_TPM carries neither MANAGED_SAVE nor
+	// SNAPSHOTS_METADATA: refused as libvirt refuses it.
+	if err := f.undefineRefusalLocked("undefine (keep state)", name); err != nil {
+		return err
 	}
 	// An ACTIVE domain survives an undefine as a TRANSIENT one: it keeps running,
 	// keeps its UUID, and loses only its persistent definition. Deleting it

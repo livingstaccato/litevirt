@@ -282,15 +282,28 @@ A seed whose owner stamp is empty or unreadable is listed as kept. A `--keep-dis
 `<data_dir>/kept-disks/<vm>.json` cannot be read is refused, naming the file,
 with nothing deleted: repair or remove that file, then retry.
 
-**A kept VM's snapshots.** `lv rm --keep-disks` of a VM with snapshots
-removes libvirt's metadata of those snapshots (and of any checkpoints) with
-the domain: libvirt refuses to undefine a stopped domain that still holds it.
-Nothing else of a snapshot is removed. Its overlay files stay with the kept
-disks, in the backing chain they were in, and so do its memory image, its
-firmware bundle and its snapshot record. The NVRAM and vTPM state are kept as
-for any `--keep-disks` delete. A snapshot restore, a VM update and the other
-operations that undefine a domain only to define it again keep libvirt's
-snapshot metadata.
+**`--keep-disks` and snapshots.** `lv rm --keep-disks` of a VM that has
+snapshots is refused (`FailedPrecondition`, naming them) before anything is
+done. Kept, such a disk is a backing chain whose base sits at the path a later
+VM of the same name creates its disk at, and the snapshots' records, memory
+images and firmware bundles are kept under the VM's name, where that later VM
+would list them and remove them. Remove the snapshots first
+(`lv snapshot rm <vm> <name>`, which merges each into its disk), or delete
+without `--keep-disks`. A disk that is still an overlay on another of the VM's
+own disk files (`<vm>-<disk>.qcow2`) with no snapshot left, as a snapshot
+restore or a metadata-only `lv snapshot rm` can leave it, is refused the same way: copy it
+out to a standalone image first, or delete without `--keep-disks`. A disk
+whose backing chain cannot be read, or snapshot records that cannot be read,
+refuse the delete too, and a retry is safe.
+
+With `--keep-disks`, libvirt refuses the undefine of a domain that still holds
+snapshots litevirt has no record of (taken with `virsh`, "cannot delete inactive domain with N
+snapshots"), or that has a managed-save image (as `libvirt-guests` leaves with
+`ON_SHUTDOWN=suspend`, "Refusing to undefine while domain managed save image
+exists"). Those deletes fail after the stop, with the record and disks kept
+(below). `virsh snapshot-delete --metadata <vm> <name>` or
+`virsh managedsave-remove <vm>` (which discards the saved RAM state) clears
+the way; then retry.
 
 **Delete keeps its handle on failure.** `lv rm` removes the VM's record only once
 its libvirt domain is gone. If the running (or paused) domain cannot be stopped,

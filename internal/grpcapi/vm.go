@@ -3819,6 +3819,12 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			"cannot delete %q: an operation is in progress (abort it first with `lv operation abort %s`)", req.Name, req.Name)
 	}
 
+	// Before the delete is forwarded or acts anywhere; asked again below
+	// under this host's lock, where the delete acts.
+	if err := s.keepDisksSnapshotRefusal(ctx, req); err != nil {
+		return nil, err
+	}
+
 	if !localOnly && vm.HostName != s.hostName {
 		// A removed host is not dialled: its rows are deleted here
 		// (removed_host_delete.go).
@@ -3921,6 +3927,14 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// ends (spec §6.9). A peer's probe is refused the same, and passes the
 	// refusal on.
 	if err := s.firmwareMoveRefusal("delete", vm); err != nil {
+		return nil, err
+	}
+	// Under the VM's lock, which a snapshot create of it takes too, on the
+	// host that holds its disks.
+	if err := s.keepDisksSnapshotRefusal(ctx, req); err != nil {
+		return nil, err
+	}
+	if err := s.keepDisksChainRefusal(ctx, req); err != nil {
 		return nil, err
 	}
 
@@ -4322,11 +4336,10 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		}
 	}()
 	if req.KeepDisks {
-		// libvirt's snapshot metadata goes with the domain (libvirt refuses
-		// the undefine of a shut-off domain with snapshots otherwise); the
-		// snapshots' files, memory images, firmware bundles and records stay
-		// with the kept disks.
-		undefErr = s.virt.UndefineDeletedDomainKeepingState(req.Name)
+		// No SNAPSHOTS_METADATA: a VM with snapshots is refused before
+		// anything is done (keepDisksSnapshotRefusal), and libvirt refuses
+		// this undefine of one it holds that litevirt has no record of.
+		undefErr = s.virt.UndefineDomainPreservingState(req.Name)
 	} else if err := s.virt.UndefineDomain(req.Name, true); err != nil {
 		slog.Warn("failed to undefine domain", "vm", req.Name, "error", err)
 		// Retry without flags in case the domain has no managed save/snapshots.

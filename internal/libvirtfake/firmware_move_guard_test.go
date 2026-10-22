@@ -76,7 +76,6 @@ func TestFake_FirmwareMoveGuardAskedFirst(t *testing.T) {
 		{"SetBootOrder", StateDefined, libvirt.FirmwareCall{Op: libvirt.OpDefine, Name: fgVM}, func(f *Fake) error { return f.SetBootOrder(fgVM, "disk") }},
 		{"UndefineDomain", StateDefined, libvirt.FirmwareCall{Op: libvirt.OpUndefine, Name: fgVM}, func(f *Fake) error { return f.UndefineDomain(fgVM, false) }},
 		{"UndefineDomainPreservingState", StateDefined, libvirt.FirmwareCall{Op: libvirt.OpUndefine, Name: fgVM}, func(f *Fake) error { return f.UndefineDomainPreservingState(fgVM) }},
-		{"UndefineDeletedDomainKeepingState", StateDefined, libvirt.FirmwareCall{Op: libvirt.OpUndefine, Name: fgVM}, func(f *Fake) error { return f.UndefineDeletedDomainKeepingState(fgVM) }},
 		{"CreateLiveSnapshot", StateRunning, libvirt.FirmwareCall{Op: libvirt.OpStart, Name: fgVM}, func(f *Fake) error {
 			_, _, err := f.CreateLiveSnapshot(fgVM, "s1", "/nonexistent", libvirt.CaptureOptions{})
 			return err

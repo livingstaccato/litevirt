@@ -473,33 +473,6 @@ func undefineDomainPreservingState(v snapshotAPI, fg FirmwareMoveGuard, name str
 	return nil
 }
 
-// keptDiskDeleteUndefineFlags undefines the domain of a VM deleted with
-// --keep-disks: NVRAM and swtpm state are kept as keepStateUndefineFlags
-// keeps them, and libvirt's snapshot and checkpoint METADATA goes with the
-// domain. libvirt refuses to undefine a shut-off domain that still holds
-// either without these ("cannot delete inactive domain with N snapshots").
-// The flags remove metadata only: no overlay file, qcow2 internal snapshot,
-// memory image or firmware bundle is touched. Never for a domain that is
-// about to be defined again (undefineDomainPreservingState): that one keeps
-// its snapshots.
-const keptDiskDeleteUndefineFlags = keepStateUndefineFlags |
-	golibvirt.DomainUndefineSnapshotsMetadata |
-	golibvirt.DomainUndefineCheckpointsMetadata
-
-func undefineDeletedDomainKeepingState(v snapshotAPI, fg FirmwareMoveGuard, name string) error {
-	if err := fg.check(FirmwareCall{Op: OpUndefine, Name: name}); err != nil {
-		return fmt.Errorf("undefine (keep disks) domain %s: %w", name, err)
-	}
-	dom, err := v.DomainLookupByName(name)
-	if err != nil {
-		return fmt.Errorf("lookup domain %s: %w", name, err)
-	}
-	if err := v.DomainUndefineFlags(dom, golibvirt.DomainUndefineFlagsValues(keptDiskDeleteUndefineFlags)); err != nil {
-		return fmt.Errorf("undefine (keep disks) domain %s: %w", name, err)
-	}
-	return nil
-}
-
 // defineDomain defines xmlConfig after the guard allows a define of the
 // domain it names; policy is the console password policy (DefineDomain).
 func defineDomain(v snapshotAPI, fg FirmwareMoveGuard, xmlConfig string, policy func(string) (string, error)) error {

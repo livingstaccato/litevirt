@@ -27,45 +27,12 @@ func (f *snapRefusingAPI) DomainUndefineFlags(dom golibvirt.Domain, flags golibv
 	return f.fwFakeAPI.DomainUndefineFlags(dom, flags)
 }
 
-// The undefine of `lv rm --keep-disks` takes libvirt's snapshot and
-// checkpoint metadata with the domain, and keeps NVRAM and swtpm state: it
-// passes KEEP_NVRAM|KEEP_TPM, never NVRAM, TPM or MANAGED_SAVE.
-//
-// Mutation: drop SNAPSHOTS_METADATA from keptDiskDeleteUndefineFlags: red.
-func TestUndefineDeletedDomainKeepingState_DropsSnapshotMetadataOnly(t *testing.T) {
-	api := &snapRefusingAPI{fwFakeAPI: newFWFakeAPI(golibvirt.DomainShutoff), snapshots: 1}
-	g := NewFirmwareMoveGuard(fwLookup(fwState{name: "none"}))
-	if err := undefineDeletedDomainKeepingState(api, g, fwTestVM); err != nil {
-		t.Fatalf("undefine of a deleted VM's domain with a snapshot: %v", err)
-	}
-	if _, ok := api.doms[fwTestVM]; ok {
-		t.Fatal("the domain is still defined")
-	}
-	if len(api.undefFlags) != 1 {
-		t.Fatalf("undefine calls = %v, want one", api.undefFlags)
-	}
-	f := api.undefFlags[0]
-	for _, want := range []golibvirt.DomainUndefineFlagsValues{
-		golibvirt.DomainUndefineKeepNvram, golibvirt.DomainUndefineKeepTpm,
-		golibvirt.DomainUndefineSnapshotsMetadata, golibvirt.DomainUndefineCheckpointsMetadata,
-	} {
-		if f&want == 0 {
-			t.Errorf("flags %#x lack %#x", f, want)
-		}
-	}
-	for _, never := range []golibvirt.DomainUndefineFlagsValues{
-		golibvirt.DomainUndefineNvram, golibvirt.DomainUndefineTpm, golibvirt.DomainUndefineManagedSave,
-	} {
-		if f&never != 0 {
-			t.Errorf("flags %#x carry %#x, which removes state a kept disk needs", f, never)
-		}
-	}
-}
-
-// The redefine-class keep-state undefine (snapshot revert, UpdateVM, cutover
-// rename, the reconciler's redefines) never drops snapshot metadata: a
-// domain it is about to define again keeps its snapshots. On a shut-off
-// domain with a snapshot libvirt therefore refuses it.
+// The keep-state undefine never drops snapshot metadata. Its redefine-class
+// callers (snapshot revert, UpdateVM, cutover rename, the reconciler's
+// redefines) define the domain again, which keeps its snapshots; for `lv rm
+// --keep-disks` libvirt's refusal is the backstop behind the refusal of a VM
+// with snapshot records (keepDisksSnapshotRefusal). On a shut-off domain
+// with a snapshot libvirt therefore refuses it.
 //
 // Mutation: add SNAPSHOTS_METADATA to keepStateUndefineFlags: red.
 func TestUndefineDomainPreservingState_KeepsSnapshotMetadata(t *testing.T) {

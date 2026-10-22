@@ -914,10 +914,14 @@ func defaultHostKeyCallback() (ssh.HostKeyCallback, error) {
 	return cb, err
 }
 
-// defaultGlobalKnownHosts is OpenSSH's GlobalKnownHostsFile default, used
-// when no ssh -G answer is available. A variable so a test can point it into
-// its own directory.
-var defaultGlobalKnownHosts = []string{"/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh_known_hosts2"}
+// openSSHGlobalKnownHosts is OpenSSH's built-in GlobalKnownHostsFile.
+var openSSHGlobalKnownHosts = []string{"/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh_known_hosts2"}
+
+// defaultGlobalKnownHosts is the global known_hosts files used when the
+// config names OpenSSH's default (or ssh -G gives no answer). Always
+// openSSHGlobalKnownHosts outside tests, which point it at files of their own
+// so they never read this machine's /etc/ssh.
+var defaultGlobalKnownHosts = slices.Clone(openSSHGlobalKnownHosts)
 
 // knownHostsFiles lists the known_hosts files that verify a host under cfg
 // (nil: the defaults): ~/.ssh/known_hosts{,2} always -- a configured

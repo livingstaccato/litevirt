@@ -256,6 +256,11 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 		if err != nil {
 			return nil, fmt.Errorf("GlobalKnownHostsFile for %s: %w", host, err)
 		}
+		if slices.Equal(gkh, openSSHGlobalKnownHosts) {
+			// OpenSSH's built-in default: the files defaultGlobalKnownHosts
+			// names (the same ones, except under test).
+			gkh = slices.Clone(defaultGlobalKnownHosts)
+		}
 		for _, kh := range gkh {
 			if !slices.Contains(defaultGlobalKnownHosts, kh) {
 				warnIfAbsent("GlobalKnownHostsFile", kh, host)

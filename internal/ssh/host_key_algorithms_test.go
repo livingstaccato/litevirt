@@ -167,6 +167,11 @@ func TestHostKeyAlgorithms_PresentedKeyMatchesKnownHosts(t *testing.T) {
 // is not an opening: a server that cannot present a key of a recorded type
 // (an impostor holding only some other key) is refused, never treated as an
 // unknown host.
+//
+// This pins the NARROWING layer: the impostor fails at negotiation, before the
+// verdict runs. The verdict layer (a key of an unrecorded type is refused, not
+// taken as first contact) is pinned separately by
+// TestHostKeyVerdict_DifferentTypeSaysSo; neither makes the other redundant.
 func TestHostKeyAlgorithms_NoTypeDowngrade(t *testing.T) {
 	ed := ed25519Signer(t)
 	addr := testServer(t, ecdsaSigner(t)) // impostor: ecdsa only
@@ -220,8 +225,10 @@ func TestKnownHostKeyAlgorithms(t *testing.T) {
 	if got := knownHostKeyAlgorithms(raw, "10.0.0.7:22"); strings.Join(got, ",") != "rsa-sha2-512,rsa-sha2-256" {
 		t.Fatalf("10.0.0.7:22 algorithms = %v", got)
 	}
-	if got := knownHostKeyAlgorithms(raw, "10.0.0.6:22"); got != nil {
-		t.Fatalf("10.0.0.6:22 is unknown, want default algorithms (nil), got %v", got)
+	// Unknown: every plain type, SHA-2 only, no certificates.
+	if got := strings.Join(knownHostKeyAlgorithms(raw, "10.0.0.6:22"), ","); got !=
+		"ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256" {
+		t.Fatalf("10.0.0.6:22 is unknown, want the first-contact list, got %v", got)
 	}
 }
 

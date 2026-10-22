@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -82,7 +83,8 @@ func clientConfig(sshUser string, auth []ssh.AuthMethod, host, addr string) *ssh
 			"warning: no usable known_hosts (%v); %s's host key cannot be checked "+
 				"against a previous one. This connection carries the cluster CA-signed "+
 				"host key.\n", err, host)
-		hostKeyCallback, hostKeyAlgos = firstContactOnlyCallback(host), nil
+		hostKeyCallback = firstContactOnlyCallback(host)
+		hostKeyAlgos = slices.Clone(firstContactHostKeyAlgorithms)
 	}
 
 	return &ssh.ClientConfig{
@@ -106,9 +108,36 @@ var hostKeyAlgorithmPreference = []struct {
 	{ssh.KeyAlgoRSA, []string{ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256}},
 }
 
-// knownHostKeyAlgorithms returns the host-key algorithms to ask addr for: those
-// of the key types known_hosts records for it, or nil (the library default)
-// for a host it does not know.
+// sha2CertAlgorithms are the host-certificate algorithms asked for when a
+// @cert-authority line covers the host. They follow the HOST key's type, which
+// need not be the CA's (an ed25519 CA can sign an ecdsa host key), so every
+// supported type is listed. No SHA-1 ssh-rsa or DSA certificates.
+var sha2CertAlgorithms = []string{
+	ssh.CertAlgoED25519v01,
+	ssh.CertAlgoECDSA256v01,
+	ssh.CertAlgoECDSA384v01,
+	ssh.CertAlgoECDSA521v01,
+	ssh.CertAlgoRSASHA512v01,
+	ssh.CertAlgoRSASHA256v01,
+}
+
+// firstContactHostKeyAlgorithms is the offer to a host known_hosts does not
+// know: every plain type, SHA-2 only, and no certificates. A certificate from
+// a CA nothing trusts would be refused outright, so asking for one would turn
+// first contact with a cert-bearing host into a refusal; its plain key is
+// taken under accept-new like any other new host's.
+var firstContactHostKeyAlgorithms = func() []string {
+	var algos []string
+	for _, p := range hostKeyAlgorithmPreference {
+		algos = append(algos, p.algos...)
+	}
+	return algos
+}()
+
+// knownHostKeyAlgorithms returns the host-key algorithms to ask addr for:
+// certificates first when a @cert-authority line covers it, then the plain key
+// types its plain known_hosts entries record; for a host known_hosts does not
+// know, firstContactHostKeyAlgorithms.
 //
 // Without this the server presents whichever of its keys x/crypto prefers --
 // ECDSA before ED25519 -- while OpenSSH records the ED25519 one. knownhosts
@@ -117,13 +146,15 @@ var hostKeyAlgorithmPreference = []struct {
 // same way (it orders HostKeyAlgorithms by what known_hosts holds).
 //
 // Narrowing the offer is not a weakening: the presented key must still match a
-// recorded one exactly, and a server that holds no key of a recorded type
-// fails the negotiation instead of being treated as unknown.
+// recorded one exactly (or be a certificate the recorded CA signed), and a
+// server that holds no key of a recorded type fails the negotiation instead of
+// being treated as unknown.
 //
 // raw is the unwrapped knownhosts callback; addr is host:port as dialled. The
 // probe key is fresh, so it can match no entry, and the KeyError lists every
-// entry recorded for addr. The same in-memory database then verifies the real
-// key, so the two answers cannot disagree about the file.
+// entry -- plain AND @cert-authority, which KnownKey does not tell apart --
+// recorded for addr. isHostAuthority sorts them. The same in-memory database
+// then verifies the real key, so the two answers cannot disagree about the file.
 func knownHostKeyAlgorithms(raw ssh.HostKeyCallback, addr string) []string {
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -135,21 +166,55 @@ func knownHostKeyAlgorithms(raw ssh.HostKeyCallback, addr string) []string {
 	}
 	var keyErr *knownhosts.KeyError
 	if !errors.As(raw(addr, &net.TCPAddr{IP: net.IPv4zero}, probe), &keyErr) || len(keyErr.Want) == 0 {
-		return nil
+		return slices.Clone(firstContactHostKeyAlgorithms)
 	}
+	authority := false
 	recorded := map[string]bool{}
 	for _, k := range keyErr.Want {
-		recorded[k.Key.Type()] = true
+		if isHostAuthority(raw, addr, probe, k.Key) {
+			authority = true
+		} else {
+			recorded[k.Key.Type()] = true
+		}
 	}
 	var algos []string
+	if authority {
+		algos = append(algos, sha2CertAlgorithms...)
+	}
 	for _, p := range hostKeyAlgorithmPreference {
 		if recorded[p.keyType] {
 			algos = append(algos, p.algos...)
 		}
 	}
-	// A host recorded only under types this client cannot negotiate keeps the
-	// default offer; whatever it presents then fails hostKeyVerdictFor.
+	if len(algos) == 0 {
+		// Recorded only under types this client cannot negotiate (sk-*, dss):
+		// whatever the host presents fails hostKeyVerdictFor, which says so.
+		return slices.Clone(firstContactHostKeyAlgorithms)
+	}
 	return algos
+}
+
+// isHostAuthority reports whether key is a @cert-authority entry for addr
+// rather than a plain one. knownhosts does not export that, so it asks the
+// callback with an unsigned, expired host certificate "signed" by key: the
+// callback refuses it either way, but only with "no authorities for hostname"
+// when key is not a CA for addr. Misreading the string fails closed (a CA host
+// is asked for plain keys and refused; TestHostKeyCA_CAOnlyHostWithCert).
+func isHostAuthority(raw ssh.HostKeyCallback, addr string, probe, key ssh.PublicKey) (authority bool) {
+	defer func() {
+		if recover() != nil {
+			authority = false
+		}
+	}()
+	cert := &ssh.Certificate{
+		Key:          probe,
+		CertType:     ssh.HostCert,
+		SignatureKey: key,
+		Signature:    &ssh.Signature{Format: key.Type()},
+		// ValidBefore 0: expired, so no path reaches signature verification.
+	}
+	err := raw(addr, &net.TCPAddr{IP: net.IPv4zero}, cert)
+	return err != nil && !strings.Contains(err.Error(), "no authorities for hostname")
 }
 
 // Close closes the SSH connection.
@@ -399,11 +464,11 @@ func authMethods() ([]ssh.AuthMethod, error) {
 			if os.IsNotExist(err) {
 				tried = append(tried, fmt.Sprintf("key %s: not found", kf))
 			} else {
-				tried = append(tried, fmt.Sprintf("key %s: %v", filepath.Base(kf), err))
+				tried = append(tried, fmt.Sprintf("key %s: %v", kf, err))
 			}
 			continue
 		}
-		tried = append(tried, fmt.Sprintf("key %s: loaded", filepath.Base(kf)))
+		tried = append(tried, fmt.Sprintf("key %s: loaded", kf))
 		methods = append(methods, ssh.PublicKeys(key))
 	}
 

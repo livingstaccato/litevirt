@@ -2781,6 +2781,42 @@ still full pauses it again.
 |---|---|
 | The owner's reconcile pass finds the VM's domain paused by libvirt for an I/O error. | The owner sees the domain in any other state: resumed (`virsh resume <vm>` on its host, once space is freed), stopped, or gone. A pass that cannot read the domain's state leaves it as it was. |
 
+### Corrupt operator-stop marker (`operator_stop_marker_corrupt`)
+
+`lv stop --force` on a host in write quarantine records the stop in a local
+marker, `<data_dir>/operator-stops/<vm>.json`, before it kills the guest, and
+the host records the stop on the VM once the quarantine lifts
+([upgrades.md](upgrades.md#rolling-back-after-a-release-token-latched)). A marker that cannot be read or
+parsed — truncated, another format version, naming another VM — **fails
+closed**: the VM is held stopped on that host (no restart policy, `onboot`,
+self-heal or `lv start`), and the stop is not replayed, so the VM's row can
+still read `running` with its domain shut off. The host logs an error every
+10 minutes, `litevirt_operator_stop_markers{state="corrupt"}` counts the
+marker, and once the host can write again it raises
+`operator_stop_marker_corrupt` (evaluator `operator_stop_marker`, subject
+`vm/<name>`, **critical** severity) with the `host`, the marker's `path`, the
+read `error` and a `remedy` in the evidence. `lv start` is refused with
+`FailedPrecondition`, naming the file.
+
+To clear it, look at the file, then record the stop with `lv stop <vm>`: a
+stop recorded on the VM's row removes its marker, whatever the marker holds.
+Then `lv start <vm>` starts it.
+
+While the host is still in write quarantine, leave the file: nothing can
+start the VM there meanwhile (`lv start` is refused, and the automated starts
+cannot take their lease), and removing it loses the operator's stop — the row
+still reads `running`, so once the quarantine lifts the reconciler would
+start the guest again. Wait for the lift, then `lv stop <vm>`.
+
+Only when the VM was deleted (`lv stop` answers `NotFound`) is there no stop
+to record: remove the file by hand on the host the condition names
+(`rm <data_dir>/operator-stops/<vm>.json`). The condition resolves on that
+host's next reconcile pass.
+
+| Raised when | Clears when |
+|---|---|
+| A reconcile pass on a host out of write quarantine finds a marker it cannot read. | The marker is gone: removed by a recorded `lv stop`, or by hand. |
+
 ### Runtime owner mismatch (`runtime_owner_mismatch`)
 
 The dual-run detector raises `runtime_owner_mismatch` about a **VM** when the

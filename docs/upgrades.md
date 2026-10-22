@@ -673,12 +673,63 @@ quarantine holds:
 - If the guest does not shut down within its timeout, it is **not**
   force-killed. The stop answers `FailedPrecondition` and the guest keeps
   running.
-- `lv stop --force` is refused with `FailedPrecondition` before it touches
-  the guest.
+- `lv stop --force` kills the guest, as elsewhere, but first records the
+  stop on the host itself (below). It answers the VM `stopped`, with a
+  detail saying the stop is recorded on this host only. Until the
+  quarantine lifts the VM's row still reads `running`, so `lv ls` shows it
+  running while `lv inspect` shows the live, stopped domain.
+- `lv start` is refused with `FailedPrecondition`: a start cannot be
+  recorded either, and a guest started now would run while the cluster's
+  record of it says otherwise.
 
 Release probation lifts by itself (`lv cluster upgrade-status`). Any other
-quarantine needs the host upgraded again or reseeded before a forced stop
-can be recorded.
+quarantine needs the host upgraded again or reseeded.
+
+**`lv stop --force` on a quarantined host.** Before it kills the guest, the
+forced stop writes a marker under the daemon's `data_dir`,
+`operator-stops/<vm>.json`: written to a temp file, fsynced, renamed, and
+the directory fsynced. The marker names the host, the VM's incarnation
+(its row's `created_at`) and its owner epoch, so it never holds a VM deleted
+and created again under the same name, nor one that left the host and came
+back under a later ownership. If the marker cannot be written (a full `data_dir`,
+EIO), the stop is refused with `FailedPrecondition`, says why, and the guest
+keeps running: a guest is never killed without its marker.
+
+While the marker is there, nothing on that host starts the VM: not its
+restart policy, not a health-check restart, not a replace cutover's handoff
+(which finishes with the VM down), not the reconciler's self-heal
+or `onboot` start (also after a daemon restart or a host reboot: the marker
+is on disk), and not `lv start`. `lv start` is refused with
+`FailedPrecondition` while the quarantine holds, because neither the stop
+nor the start could be recorded; the marker leaves only through the recorded
+stop. Other hosts are not involved: the host is alive, so failover does not
+act, and the VM's row still names it.
+
+Once the quarantine lifts, the host's next reconcile pass records the stop
+on the VM's row as the operator's (`stopped` / `operator-stop`, through the
+same write an ordinary `lv stop` makes), adds a `vm.stopped` event, and
+then removes the marker. An `lv start` that comes first records the stop the
+same way, then starts the VM. The record is written only while the row is
+still on this host, of that incarnation and at that owner epoch. A marker
+whose VM was deleted meanwhile, or created again, or moved to another host,
+or owned again under a later generation, is removed with nothing recorded;
+so is one whose guest is running again (started by something that does not
+read the marker), since a stop is never recorded over a running guest.
+
+A marker that cannot be read or parsed **fails closed**: its VM is held
+stopped on that host, the stop is not replayed, the daemon logs an error,
+`litevirt_operator_stop_markers{state="corrupt"}` counts it, and once the
+host can write it raises `operator_stop_marker_corrupt`
+([diagnostics.md](diagnostics.md#corrupt-operator-stop-marker-operator_stop_marker_corrupt)).
+`litevirt_operator_stop_markers{state="pending"}` counts markers still
+waiting for their replay.
+
+**Limit: a rolled-back binary ignores the marker.** A build older than this
+one does not know the file. Rolled back onto such a build while a marker is
+held, the host's restart policy and reconciler act on the row alone, so the
+killed guest may be started again, as before this change, and the marker is
+left on disk. Upgrading again replays it if it still applies (or removes it
+if the guest runs again).
 
 **Before you roll back**, ask the cluster what would block it:
 

@@ -1274,6 +1274,9 @@ func (n *Node) LandMigrationsOn(dst *Node) {
 func (n *Node) Reconciler() *health.Reconciler {
 	r := health.NewReconciler(n.Name, n.FW.DataDir, n.DB, n.Virt)
 	r.SetFirmwareStore(n.FW)
+	if n.Server != nil {
+		r.SetOperatorStopReplay(n.Server.ReplayOperatorStopMarkers) // as the daemon wires it
+	}
 	return r
 }
 

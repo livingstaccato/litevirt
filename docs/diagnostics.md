@@ -2279,8 +2279,9 @@ holder writes.
   libvirt then reports the domain shut off, crashed. The majority recovers it
   from its disks. If the majority never fenced this host, the VM's restart
   policy decides, as for any crash, once this host holds a quorum. If the
-  kill cannot be done (no pid file, or the pid is not that domain's QEMU),
-  and for a container, whose Unfreeze has no such stop, the workload is
+  kill cannot be done (no pid file, the pid is not that domain's QEMU, or
+  the QEMU has not exited within the call's timeout, typically stuck flushing
+  its disks to cut storage), and for a container, whose Unfreeze has no such stop, the workload is
   reported in `partition_pause_failed`.
 - `partition_pause_failed` (host, critical): this host lost the majority and
   could not pause a workload it had to. While it is open, the majority does

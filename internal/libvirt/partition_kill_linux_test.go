@@ -92,3 +92,53 @@ func TestKillQEMU_RefusesAnyOtherProcess(t *testing.T) {
 		t.Fatalf("vm-b's process was hit: %v", err)
 	}
 }
+
+// A QEMU killed while its disks' writeback pages cannot be flushed (its
+// storage cut along with the voters) does not exit: it sits in an
+// uninterruptible wait with those pages in this host's page cache, and they
+// land on the replacement's disk once the storage returns. A queued SIGKILL
+// is therefore not a stop: the kill succeeds only once the process has
+// exited, and is an error otherwise, so the pauser falls back to reporting
+// the pause failed and self-fencing (re-review 5, finding 1). A process
+// that will not exit cannot be made in a test, so the wait stands in for
+// one that never sees the exit.
+//
+// Red on 9850aa45a (success once the signal was queued). Mutation: return
+// nil once the signal is queued — red.
+func TestKillQEMU_FailsUntilTheQEMUHasExited(t *testing.T) {
+	old := waitPidfdExit
+	var waited time.Duration
+	waitPidfdExit = func(_ int, d time.Duration) (bool, error) { waited = d; return false, nil }
+	t.Cleanup(func() { waitPidfdExit = old })
+
+	runDir := t.TempDir()
+	cmd := fakeQEMU(t, runDir, "vm-a", killTestUUID)
+	err := killQEMU(runDir, "/proc", "vm-a", killTestUUID)
+	if err == nil || !strings.Contains(err.Error(), "has not exited") {
+		t.Fatalf("kill of a QEMU that has not exited: err = %v, want an error", err)
+	}
+	if waited <= 0 || waited >= 2*time.Second {
+		t.Fatalf("waited %s for the exit, want inside the pauser's 2s call timeout", waited)
+	}
+	// The signal was still sent: the process dies when it can.
+	if !exitedBySIGKILL(t, cmd) {
+		t.Fatal("the domain's QEMU was not sent SIGKILL")
+	}
+}
+
+// The real wait sees a real exit: once the kill returns, the process has
+// exited (a zombie, since this test is its unreaped parent).
+func TestKillQEMU_ReturnsOnceTheQEMUHasExited(t *testing.T) {
+	runDir := t.TempDir()
+	cmd := fakeQEMU(t, runDir, "vm-a", killTestUUID)
+	if err := killQEMU(runDir, "/proc", "vm-a", killTestUUID); err != nil {
+		t.Fatalf("killQEMU: %v", err)
+	}
+	stat, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(cmd.Process.Pid), "stat"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if i := strings.LastIndexByte(string(stat), ')'); i < 0 || i+2 >= len(stat) || stat[i+2] != 'Z' {
+		t.Fatalf("the QEMU has not exited when the kill returned: stat %q", stat)
+	}
+}

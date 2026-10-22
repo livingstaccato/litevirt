@@ -448,9 +448,24 @@ sure to come after it. The pauser handles it three ways:
   a libvirt call, which may hang too. Every vCPU thread leaves `KVM_RUN` on
   the fatal signal and never enters it again, so the call cannot land after
   the pass. The pass is the moment `W` counts on, so no copy of that VM runs
-  here past `t_d + W`. Nothing the design promised is lost: the majority
-  recovers the VM from its disks, as it would after this host's own crash.
-- **The kill cannot be done**, or the workload is a container. A container's
+  here past `t_d + W`. The kill counts as a stop only once the QEMU has
+  **exited**, within the call's timeout, not once the signal is queued. A
+  killed QEMU skips the flush a suspend does, and its disks' writeback pages
+  are written as its files close on exit. When the storage is cut along with
+  the voters (NFS, iSCSI), that close waits in an uninterruptible sleep with
+  the pages still in this host's page cache, and they would land on the
+  replacement's disk when the storage returns. So a QEMU that has not exited
+  in time is a failed kill (next item), as a suspend whose flush hangs is a
+  failed pause. When it has exited, its writes are on the disk or failed,
+  and the majority recovers the VM from its disks. What a crash-consistent
+  disk does not hold, the guest's RAM and unflushed guest caches, is lost, as
+  in a crash. One residual remains: a userspace network block client (librbd)
+  may have requests already queued in the dead process's socket buffers,
+  which can still be delivered after the exit. The self-fence has the same
+  residual until the reboot. Only blocklisting the client at the storage
+  closes it.
+- **The kill cannot be done**, or the QEMU has not exited in time, or the
+  workload is a container. A container's
   Unfreeze has no such stop. The pass reports the workload in
   `partition_pause_failed`, and self-fences when a verified watchdog is
   armed. It cannot tell this call from one about to land, and with the

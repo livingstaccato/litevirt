@@ -131,6 +131,34 @@ func TestPartitionPause_AnAbandonedResumeIsKilledUnderALostMajority(t *testing.T
 	}
 }
 
+// The kill does not wait on libvirt: a wedged libvirtd is what hangs the
+// resume in the first place, and it fails or hangs the pass's ListDomains
+// too. A pass whose ListDomains fails still kills the abandoned resume's
+// QEMU (re-review 5, finding 2); the listing's failure is reported as
+// before.
+//
+// Mutation: start the kills only after a successful ListDomains — vm-ha is
+// left paused, its late call free to land beside the replacement.
+func TestPartitionPause_AnAbandonedResumeIsKilledWithoutListDomains(t *testing.T) {
+	shortStepBound(t)
+	f := newPauseFixture(t)
+	release := abandonResume(f)
+	defer release()
+
+	f.virt.FailListDomains = func() error { return fmt.Errorf("libvirtd wedged") }
+	f.loseFor(QuorumNo, PartitionPauseAfter+time.Second)
+	if st := f.raw("vm-ha"); st != libvirtfake.StateShutdown {
+		t.Fatalf("vm-ha is %s after a pause pass whose ListDomains failed, with its resume still out; want its QEMU killed", st)
+	}
+	row, ok := f.condition(corrosion.CondPartitionPauseFailed)
+	if !ok || row.Lifecycle != corrosion.ConditionConfirmed || !strings.Contains(row.Evidence, "vm/*") {
+		t.Fatalf("partition_pause_failed = %+v (found %v), want it open for vm/* with the listing failed", row, ok)
+	}
+	if strings.Contains(row.Evidence, "vm/vm-ha") {
+		t.Fatalf("partition_pause_failed names vm/vm-ha after its QEMU was killed: %s", row.Evidence)
+	}
+}
+
 // A resume abandoned at its step bound that lands later, with the majority
 // there throughout and confirming again at the landing, stands: it is as
 // safe as a resume that landed on time, and undoing it would keep a guest

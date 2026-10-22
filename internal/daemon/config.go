@@ -17,6 +17,7 @@ import (
 	"github.com/litevirt/litevirt/internal/acmedns"
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fencessh"
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/image"
@@ -261,6 +262,13 @@ type Config struct {
 	// dual-master risk. The supported availability-first recovery is the manual-fence-confirm
 	// above, not a weaker policy. Empty → "safe".
 	NoQuorumVIPPolicy string `yaml:"no_quorum_vip_policy"`
+
+	// FenceSSHProbeIntervalSec is how often this host checks the managed
+	// fence SSH path to every peer (`lv doctor fence`,
+	// litevirt_fence_ssh_probe_ok). Unset is 900 (15 minutes); 0 disables
+	// the probe. A check logs in as root on each peer and runs only the
+	// forced command's check, which never arms a fence.
+	FenceSSHProbeIntervalSec *int `yaml:"fence_ssh_probe_interval_sec,omitempty"`
 
 	// WebAuthn configures the second-factor enrolment dance. Required
 	// fields: rp_id (the bare host operators reach via the UI, e.g.
@@ -742,6 +750,19 @@ type EnforcementConfig struct {
 	// DEFAULT TRUE (LoadConfig sets it before parsing; an explicit
 	// `vrrp_unicast: false` wins).
 	VRRPUnicast bool `yaml:"vrrp_unicast,omitempty"`
+	// FenceSSH is how this host's ssh and best-effort fences reach their
+	// targets (internal/fencessh): "managed" uses each target's managed
+	// fence key path only, and fails a fence toward a host whose sshd does
+	// not accept it; "auto" (the default, "" included) uses the managed path
+	// toward a host that accepts it and the legacy path with the host's
+	// published sshd keys pinned toward one that does not; "legacy" never
+	// uses the managed path (the kill switch), pinned wherever a host has
+	// published. No mode fences a host that has published a fence ssh row
+	// without its pinned host key. Not a capability: the fence is decided
+	// where it is created, and no peer relies on another's setting. `lv host
+	// init` writes managed for a new cluster; `lv host add` copies the
+	// cluster's block.
+	FenceSSH string `yaml:"fence_ssh,omitempty"`
 	// DigestV2: emit the order-invariant anti-entropy row digest (digest_v2) so
 	// column-order-only differences (fresh CREATE vs ALTER ADD COLUMN) stop showing as
 	// row-content divergence + perpetual no-op merges. Negotiated PAIRWISE by wire-field
@@ -1135,6 +1156,13 @@ func LoadConfig() (*Config, error) {
 			"(a takeover-without-proof tier is intentionally not implemented; to recover an "+
 			"unreachable VIP holder, verify it is down and run `lv host fence-confirm <host>`)",
 			cfg.NoQuorumVIPPolicy)
+	}
+
+	if !fencessh.ValidMode(cfg.Enforcement.FenceSSH) {
+		return nil, fmt.Errorf("invalid enforcement.fence_ssh %q: managed, auto or legacy", cfg.Enforcement.FenceSSH)
+	}
+	if cfg.FenceSSHProbeIntervalSec != nil && *cfg.FenceSSHProbeIntervalSec < 0 {
+		return nil, fmt.Errorf("invalid fence_ssh_probe_interval_sec %d: 0 disables the probe", *cfg.FenceSSHProbeIntervalSec)
 	}
 
 	// A typo'd vm.default_cpu_mode must fail load, not silently stamp an invalid
@@ -1779,4 +1807,13 @@ func (f FileRestoreConfig) validate(containers ContainersConfig) error {
 			f.UIDBase, r[0], r[1]-1)
 	}
 	return nil
+}
+
+// FenceSSHProbeInterval is fence_ssh_probe_interval_sec as a duration: 15
+// minutes when unset, 0 (disabled) when set to 0.
+func (c *Config) FenceSSHProbeInterval() time.Duration {
+	if c.FenceSSHProbeIntervalSec == nil {
+		return 15 * time.Minute
+	}
+	return time.Duration(*c.FenceSSHProbeIntervalSec) * time.Second
 }

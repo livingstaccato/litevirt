@@ -656,6 +656,21 @@ whose failover leader clears a fenced host it has handled only once the host
 is `active`
 ([migration-failover.md](migration-failover.md#resuming-a-recovery-from-a-recorded-fence)).
 
+**`release_2026_12_v1`** is the next release's token, with the same rules. A
+rollback below it lands on a `release_2026_11_v1` build, which reads the rule, so
+it quarantines only for a feature of it that was used. Its one feature so far is
+`fence_ssh`, and it is used by default: every host publishes its managed fence
+SSH row as soon as the token latches, which pins its sshd keys for every fence
+aimed at it ([migration-failover.md](migration-failover.md#managed-fence-ssh)).
+So from the latch on, a rollback below `release_2026_12_v1` quarantines. To keep
+the ability to roll back, set `enforcement.fence_ssh: legacy` in every host's
+config before the last host upgrades. The daemon reads it at start, so restart
+the daemon of a host that already runs this build: a host in `legacy` publishes no row, so nothing uses the
+feature (and every host keeps fencing as before the upgrade, pinned toward any
+host that does publish). `lv cluster upgrade-status` lists `fence_ssh` with
+whether it is used, and its token once latched. Its rollout summary (hosts on the
+release, features waiting) counts `release_2026_11_v1` only.
+
 **What this does not change.** A binary built before `release_2026_11_v1`
 understands no rollback rule. Rolled back below any token it does not know —
 this release's token included — it quarantines, used or not. Tokens other than

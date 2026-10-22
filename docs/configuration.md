@@ -138,6 +138,12 @@ quorum_loss_demote_after_sec: 12
 keepalived_stop_timeout_sec: 3
 no_quorum_vip_policy: safe
 
+# How often this host checks the managed fence SSH path to every peer: the
+# pin, the key, the source address and the forced command, without arming a
+# fence (`lv doctor fence`, litevirt_fence_ssh_probe_ok). Default 900 (15
+# minutes); 0 disables the probe. See migration-failover.md "Managed fence SSH".
+fence_ssh_probe_interval_sec: 900
+
 # Peers to join on startup. At least one existing host.
 join_peers:
   - "10.0.50.10:7946"
@@ -508,6 +514,16 @@ enforcement:
                               # value but false refuses to start without a usable gossip.key.
                               # `lv host init` writes true for a new cluster. No capability
                               # token. See auth.md "Gossip encryption".
+  fence_ssh: auto             # how this host's ssh and best-effort fences reach their
+                              # target (migration-failover.md "Managed fence SSH").
+                              # auto (the default, also when unset): the managed fence key
+                              # toward a host whose sshd accepts it, else the legacy command
+                              # with the host's published sshd keys pinned. managed: the
+                              # managed key only; a fence toward a host that does not accept
+                              # it fails. legacy: never the managed key (the kill switch),
+                              # still pinned. No mode fences a host that has published a
+                              # fence ssh row without its pinned host key. `lv host init`
+                              # writes managed for a new cluster. No capability token.
 
 # External NetBox IPAM integration. Disabled by default; when disabled no
 # NetBox client is constructed and no behaviour changes (no HTTP, no goroutine).

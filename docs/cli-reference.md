@@ -123,6 +123,10 @@ lv host init --local --name <name>        # Bootstrap on localhost (standalone)
                                           #   which also makes the node look like a
                                           #   founder — use `lv host add` instead
 lv host add <user@host> --name <name>     # Add host to cluster
+  [--no-fence-ssh]                        # (init, add) do not add the managed fence SSH drop-in to
+                                          #   sshd; add /etc/litevirt/ssh/authorized_keys to root's
+                                          #   AuthorizedKeysFile in your own sshd configuration.
+                                          #   See migration-failover.md "Managed fence SSH"
                                           # new <name> (init, add): letters, digits, '_', '.', '-';
                                           #   not starting with '-' or '.', not ending in -migration,
                                           #   and not ca, client, host, gossip, migration-ca, ui,
@@ -152,12 +156,17 @@ lv host publish-crl                       # Re-publish this machine's crl.pem if
 lv host renew-cert <host>                 # Renew a host's cluster certificate in place: key made on
   [--ssh root@<addr>] [--keep-old]        #   the host, one atomic switch, served without a restart,
   [--revoke-old] [--force]                #   confirmed, then the old one revoked (owed while the
-  [--grpc-port 7443] [--wait 90s]         #   voter chain needs it). See auth.md
+  [--grpc-port 7443] [--wait 90s]         #   voter chain needs it, or the host's fence ssh row is
+                                          #   still signed by it). See auth.md
 lv host revoke-cert <host> --serial <hex> # Revoke a certificate a renewal replaced; --force for the
   [--force] [--grpc-port 7443]            #   live/presented one (fences the host)
 lv host install-gossip-key                # Put the cluster gossip key on every host (mints it if
   [--ssh-user root]                       #   none); never replaces one. Re-run to see each host's
                                           #   gossip stage. See auth.md "Gossip encryption"
+lv host install-fence-ssh                 # Give every host's sshd the managed fence SSH drop-in (an
+  [--host <name>]... [--ssh-user root]    #   existing cluster; init and add do it for a new host), then
+  [--remove] [--wait 3m]                  #   wait until each reports accepting the managed fence key.
+                                          #   See migration-failover.md "Managed fence SSH"
 lv host install-migration-tls             # Issue every host the migration-TLS credentials that
   [--reissue] [--ssh-user root]           #   encrypt storage migrations (mints the migration CA if
                                           #   none). See migration-failover.md "Migration with local disks"

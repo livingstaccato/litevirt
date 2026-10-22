@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -45,6 +47,14 @@ missing key as false. That warning does not change the exit code.
 
 Exit code: 0 when no shared-disk VM is exposed · 1 when one or more are.
 
+It also prints the managed fence SSH matrix: for every pair of hosts, how an
+ssh fence from one would reach the other (managed, legacy-pinned,
+legacy-unpinned, refused) and the last probe of that path, plus each host's
+published row as the queried host holds it. A host fenced legacy-unpinned has
+published no row, and a machine answering at its address would be powered off in
+its place; one that does not accept the managed key says why. That section does
+not change the exit code either.
+
 Two things this check cannot establish, reported on every run: each host's own
 capability latch is per-node state with no wire representation, and the
 shared-disk count comes from the queried node's replicated rows.`,
@@ -56,6 +66,15 @@ shared-disk count comes from the queried node's replicated rows.`,
 					return fmt.Errorf("get fence readiness: %w", err)
 				}
 				printFenceReadiness(r)
+				// Best-effort, like the stall section below: the managed fence
+				// SSH matrix explains how each host's ssh fence would run, and
+				// does not change the exit code. A daemon that predates it
+				// answers Unimplemented and the section is left out.
+				if st, serr := c.GetFenceSSHStatus(ctx, &pb.FenceSSHStatusRequest{FanOut: true}); serr == nil {
+					printFenceSSHStatus(os.Stdout, st)
+				} else if status.Code(serr) != codes.Unimplemented {
+					fmt.Printf("\nManaged fence SSH: could not read it (%v)\n", serr)
+				}
 				// Best-effort: the stall section is an explanation, not part of
 				// the verdict, so a failed read does not fail the command.
 				if h, herr := c.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{}); herr == nil {
@@ -327,4 +346,71 @@ func printStalledObservers(w io.Writer, conds []*pb.HealthCondition) {
 	fmt.Fprintln(w, "\nThese nodes were not running (suspended, swapped out or starved of CPU).")
 	fmt.Fprintln(w, "Until the time shown they count no failed probe against a peer and decide")
 	fmt.Fprintln(w, "no fence, so a fence can be up to that much later than usual.")
+}
+
+// printFenceSSHStatus prints the managed fence SSH matrix: one line per
+// ordered pair (from, to) with the path a fence would take and its last probe,
+// then the queried host's view of every row, then warnings.
+func printFenceSSHStatus(w io.Writer, st *pb.FenceSSHStatus) {
+	if len(st.GetNodes()) == 0 {
+		return
+	}
+	fmt.Fprintln(w, "\nManaged fence SSH (how an ssh fence from each host reaches each other host):")
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "  FROM\tMODE\tTO\tPATH\tPROBE")
+	var warnings []string
+	for _, n := range st.GetNodes() {
+		if !n.GetReachable() || n.GetError() != "" {
+			fmt.Fprintf(tw, "  %s\t-\t-\tunknown\t%s\n", n.GetHost(), orDash(n.GetError()))
+			continue
+		}
+		if n.GetLastError() != "" {
+			warnings = append(warnings, fmt.Sprintf("%s: its fence ssh agent's last sync failed: %s", n.GetHost(), n.GetLastError()))
+		}
+		for _, p := range n.GetPeers() {
+			if p.GetPath() == "self" {
+				continue
+			}
+			probe := "-"
+			if p.GetProbed() {
+				probe = "ok"
+				if !p.GetProbeOk() {
+					probe = "FAILED: " + p.GetProbeDetail()
+				}
+			}
+			fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\n", n.GetHost(), n.GetMode(), p.GetHost(), p.GetPath(), probe)
+			switch p.GetPath() {
+			case "legacy-unpinned":
+				warnings = append(warnings, fmt.Sprintf("%s fences %s WITHOUT a pinned host key: %s has published no fence ssh "+
+					"row, so a machine answering at its address would be powered off in its place", n.GetHost(), p.GetHost(), p.GetHost()))
+			case "refused":
+				warnings = append(warnings, fmt.Sprintf("%s cannot fence %s over ssh: %s", n.GetHost(), p.GetHost(), p.GetPathDetail()))
+			}
+		}
+	}
+	tw.Flush()
+
+	first := st.GetNodes()[0]
+	if first.GetReachable() && first.GetError() == "" {
+		fmt.Fprintf(w, "\nFence ssh rows, as %s holds them:\n", first.GetHost())
+		tw = tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "  HOST\tROW\tACCEPTS\tFROM\tGEN\tDETAIL")
+		for _, p := range first.GetPeers() {
+			acc := "no"
+			if p.GetAccepting() {
+				acc = "yes"
+			}
+			fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%d\t%s\n", p.GetHost(), p.GetRow(), acc, orDash(p.GetAddress()),
+				p.GetGeneration(), orDash(p.GetRowDetail()))
+			if p.GetRow() == "verified" && !p.GetAccepting() {
+				warnings = append(warnings, fmt.Sprintf("%s does not accept the managed fence key (%s): run `lv host install-fence-ssh "+
+					"--host %s`, or add /etc/litevirt/ssh/authorized_keys to root's AuthorizedKeysFile in its sshd configuration",
+					p.GetHost(), orDash(p.GetRowDetail()), p.GetHost()))
+			}
+		}
+		tw.Flush()
+	}
+	for _, msg := range warnings {
+		fmt.Fprintf(w, "  WARNING: %s\n", msg)
+	}
 }

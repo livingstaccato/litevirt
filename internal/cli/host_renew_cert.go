@@ -21,6 +21,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fencessh"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/secretfile"
 	"github.com/litevirt/litevirt/internal/ssh"
@@ -369,15 +370,33 @@ func revokeReplaced(ctx context.Context, c pb.LiteVirtClient, hostName, serial s
 		return nil
 	}
 	logRenewal(pkiDir, renewalEntry{Host: hostName, Serial: serial, State: "owed"})
-	fmt.Printf("  the replaced certificate %s is OWED revocation, not revoked yet: %s.\n", serial, resp.Reason)
-	fmt.Println("  A hold applies only while some node does not pin accepts to unreplaced certificates (an")
-	fmt.Println("  older build, or auth.trust_rotated_peer_certs on). The cluster holds the signed CRL as a")
-	fmt.Println("  degraded condition (certificate/revocation_owed), publishes it by itself once that is no")
-	fmt.Println("  longer so, and notifies certificate.revocation_owed daily meanwhile. Every node on this")
-	fmt.Println("  build already refuses the replaced certificate: as a voter, as a claim signer, and on")
-	fmt.Println("  every RPC.")
-	fmt.Printf("  To revoke it now regardless: `lv host revoke-cert %s --serial %s`\n", hostName, serial)
+	for _, l := range owedRevocationNote(hostName, serial, resp.Reason) {
+		fmt.Println(l)
+	}
 	return nil
+}
+
+// owedRevocationNote is what `lv host renew-cert` prints for a revocation the
+// cluster holds as owed, by why it is held.
+func owedRevocationNote(hostName, serial, reason string) []string {
+	out := []string{fmt.Sprintf("  the replaced certificate %s is OWED revocation, not revoked yet: %s.", serial, reason)}
+	if strings.HasPrefix(reason, fencessh.RevocationHoldPrefix) {
+		out = append(out,
+			"  It is held until "+hostName+"'s daemon re-signs its fence ssh row with the renewed certificate,",
+			"  which it does within a minute of adopting it; revoked first, every peer would refuse to fence",
+			"  "+hostName+" meanwhile. The cluster holds the signed CRL as a degraded condition",
+			"  (certificate/revocation_owed) and publishes it by itself once the row is re-signed. Every node",
+			"  on this build already refuses the replaced certificate on every RPC.")
+	} else {
+		out = append(out,
+			"  A hold applies only while some node does not pin accepts to unreplaced certificates (an",
+			"  older build, or auth.trust_rotated_peer_certs on). The cluster holds the signed CRL as a",
+			"  degraded condition (certificate/revocation_owed), publishes it by itself once that is no",
+			"  longer so, and notifies certificate.revocation_owed daily meanwhile. Every node on this",
+			"  build already refuses the replaced certificate: as a voter, as a claim signer, and on",
+			"  every RPC.")
+	}
+	return append(out, fmt.Sprintf("  To revoke it now regardless: `lv host revoke-cert %s --serial %s`", hostName, serial))
 }
 
 // abandonIssued revokes a successor that was signed but will never be

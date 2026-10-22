@@ -584,7 +584,18 @@ import (
 //	     that write it are emitted only after the latch, or for a row that
 //	     already carries an incarnation. Appended LAST for the v53 digest
 //	     reason. Additive.
-const CurrentSchemaVersion = 71
+//	v72: managed fence SSH — host_fence_ssh (host_name PK; generation,
+//	     fence_pubkeys, sshd_hostkeys, accepting, ever_accepting, detail,
+//	     cert_pem, signature): a host's own publication of its fence key's
+//	     public half and its sshd host keys, signed with its CA-issued host
+//	     key (internal/fencessh). Every daemon verifies each row against the
+//	     cluster CA and the CRL and renders the verified ones into its
+//	     restricted authorized_keys and its pinned known_hosts. Written only
+//	     with the release feature fence_ssh (release_2026_12_v1,
+//	     ReplicationGated), so a previous-release peer never sees a statement
+//	     of it. Retired locally on a host's removal or re-admission. One new
+//	     table.
+const CurrentSchemaVersion = 72
 
 // schemaVersionProjectIncarnation is the version projects.incarnation was
 // added in.
@@ -3109,6 +3120,22 @@ var schemaDDL = []string{
 		updated_at TEXT NOT NULL,
 		deleted_at TEXT
 	)`,
+	// v72 a host's managed fence SSH publication, signed with its host key;
+	// see host_fence_ssh.go. One row per host, written whole by that host,
+	// only with the release feature fence_ssh.
+	`CREATE TABLE IF NOT EXISTS host_fence_ssh (
+		host_name      TEXT PRIMARY KEY,
+		generation     INTEGER NOT NULL DEFAULT 0,
+		fence_pubkeys  TEXT NOT NULL DEFAULT '',
+		sshd_hostkeys  TEXT NOT NULL DEFAULT '',
+		accepting      INTEGER NOT NULL DEFAULT 0,
+		ever_accepting INTEGER NOT NULL DEFAULT 0,
+		detail         TEXT NOT NULL DEFAULT '',
+		cert_pem       TEXT NOT NULL DEFAULT '',
+		signature      TEXT NOT NULL DEFAULT '',
+		updated_at     TEXT NOT NULL,
+		deleted_at     TEXT
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -3310,6 +3337,7 @@ var tablePrimaryKeys = map[string][]string{
 	"host_runtime":            {"host_name"},
 	"session_groups":          {"session_id"},
 	"host_fence_redfish":      {"host_name"},
+	"host_fence_ssh":          {"host_name"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -3703,6 +3731,7 @@ var createTableUnits = []struct {
 	{65, "host_runtime"},
 	{66, "session_groups"},
 	{67, "host_fence_redfish"},
+	{72, "host_fence_ssh"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

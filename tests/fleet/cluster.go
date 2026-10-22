@@ -198,6 +198,12 @@ type Options struct {
 	// one meets it as it does on a real first host. A founder, lone-node or
 	// first-add scenario sets it; rebuildWithEmptyDB honours it too.
 	RealCatchUp bool
+	// HostCertIPs, by node index, is the address each node's host
+	// certificate names besides 127.0.0.1, as `lv host init`/`add` mint it
+	// from the SSH target's address. A managed fence SSH scenario takes its
+	// from= and BindAddress from it (internal/fencessh). Unset, a node's
+	// certificate names its listen address only.
+	HostCertIPs []string
 }
 
 // isJoiner reports whether n is one of Options.Joiners.
@@ -762,8 +768,18 @@ func (c *Cluster) mintHostCert(n *Node) {
 	}
 	certPath := filepath.Join(n.PKIDir, "host.crt")
 	keyPath := filepath.Join(n.PKIDir, "host.key")
+	certIP := net.ParseIP(n.Address)
+	idx := len(c.Nodes) // a node New is building is appended after its certificate
+	for i, o := range c.Nodes {
+		if o == n {
+			idx = i
+		}
+	}
+	if idx < len(c.opts.HostCertIPs) && c.opts.HostCertIPs[idx] != "" {
+		certIP = net.ParseIP(c.opts.HostCertIPs[idx])
+	}
 	if err := pki.GenerateHostCert(
-		c.caCert, c.caKey, certPath, keyPath, n.Name, net.ParseIP(n.Address),
+		c.caCert, c.caKey, certPath, keyPath, n.Name, certIP,
 	); err != nil {
 		c.t.Fatalf("GenerateHostCert %s: %v", n.Name, err)
 	}

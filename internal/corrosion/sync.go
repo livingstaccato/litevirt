@@ -439,6 +439,12 @@ var tableNames = []string{
 	// other cluster fact. Nothing secret. Written only once
 	// host_runtime_split_v1 has latched (host_runtime.go).
 	"host_runtime",
+	// v72 managed fence SSH — each host's signed publication of its fence
+	// key's public half and its sshd host keys. A node that missed one would
+	// fence that peer unpinned, so it is repaired here like any cluster fact.
+	// Nothing secret: public keys and a host certificate. Written only with
+	// the release feature fence_ssh (host_fence_ssh.go).
+	"host_fence_ssh",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS

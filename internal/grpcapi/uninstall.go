@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/fencessh"
 )
 
 // UninstallHost removes litevirt from a host.
@@ -32,6 +33,8 @@ func (s *Server) UninstallHost(ctx context.Context, req *pb.UninstallHostRequest
 		{"disable litevirt", "systemctl disable litevirt.service 2>/dev/null || true"},
 		{"remove systemd units", "rm -f /etc/systemd/system/litevirt.service /etc/systemd/system/litevirt-rollback.service && systemctl daemon-reload"},
 		{"remove daemon binary", "rm -f /usr/local/bin/litevirt /usr/local/bin/litevirt.old /usr/local/bin/litevirt.new /usr/local/bin/lv"},
+		{"remove the managed fence SSH sshd drop-in", "rm -f " + fencessh.DropInPath +
+			" && (systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true)"},
 		{"remove config and PKI", "rm -rf /etc/litevirt"},
 		{"remove udev rule", "rm -f /etc/udev/rules.d/99-litevirt-pci.rules && udevadm control --reload-rules 2>/dev/null || true"},
 		{"remove haproxy/keepalived drop-ins", "rm -rf /etc/systemd/system/haproxy@*.service.d /etc/systemd/system/keepalived@*.service.d"},

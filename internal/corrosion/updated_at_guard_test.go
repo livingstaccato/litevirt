@@ -139,6 +139,13 @@ func TestReplicatedUpdatedAtUsesNowTS(t *testing.T) {
 			if fn.Name.Name == "retireOlderProjectGrants" {
 				continue
 			}
+			// AdoptProjectIncarnation stamps the adoption just after the row's
+			// OWN updated_at (justAfterTS(U), re-read in its guard), so every
+			// adopter of a name writes the identical statement and any write
+			// made after U was observed still wins over it (project_adoption.go).
+			if fn.Name.Name == "AdoptProjectIncarnation" {
+				continue
+			}
 			body := string(src[fset.Position(fn.Pos()).Offset:fset.Position(fn.End()).Offset])
 			if strings.Contains(body, "NowTS(") {
 				continue

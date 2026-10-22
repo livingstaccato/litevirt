@@ -30,6 +30,11 @@ var frozenLatchGatedShapes = map[string][]string{
 	capabilities.Release202612V1: {
 		"stmtshape/v1:82fe2007c26d71d40ae839297bea613768791ec4a0ec0b681d352570dda9c59b", // HostFenceSSHUpsertSQL (fence_ssh)
 	},
+	// Not shipped yet (the rc2 train): corrected only by one reviewed change
+	// here and in latchGatedShapes together.
+	capabilities.Release202701V1: {
+		"stmtshape/v1:6f039aff36330ccd98dff94968e61f991c6c11c1a6ea34e3687e68763b509c1b", // projectsAdoptIncarnationSQL (project_adoption)
+	},
 }
 
 // TestLatchGatedShapesAreFrozen (review round 1, m-3): each token's latch-gated

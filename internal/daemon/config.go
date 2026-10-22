@@ -715,8 +715,9 @@ type AuthConfig struct {
 // capability tokens. Each is `flag && capability` (the strict-mTLS pattern): the
 // flag is authoritative for enforcement AND recovery, so false disables the
 // behavior regardless of the durable latch. All default false except
-// AuditSignature, PartitionPause, RecoveryClaim, ConsolePassword and VRRPUnicast, which LoadConfig
-// defaults to true. DigestV2 (not a capability token) also defaults to true.
+// AuditSignature, PartitionPause, RecoveryClaim, ConsolePassword, VRRPUnicast and
+// ProjectAdoption, which LoadConfig defaults to true. DigestV2 (not a capability
+// token) also defaults to true.
 type EnforcementConfig struct {
 	// SafeFenceDefault: a best-effort (unconfirmable) fence must carry an operator
 	// proof-of-power-off before the coordinator reschedules/promotes off the host
@@ -791,6 +792,21 @@ type EnforcementConfig struct {
 	// DEFAULT TRUE (LoadConfig sets it before parsing; an explicit
 	// `vrrp_unicast: false` wins).
 	VRRPUnicast bool `yaml:"vrrp_unicast,omitempty"`
+	// ProjectAdoption: run this host's project adoption pass
+	// (corrosion/project_adoption.go): once release_2027_01_v1 has latched,
+	// give each project created before project_incarnation_v1 latched its
+	// stable adopted incarnation, through the release feature
+	// project_adoption. The pass decides it has work, and reads this flag,
+	// before it asks the release gate, so a host with it off records no use.
+	//
+	// DEFAULT TRUE (LoadConfig sets it before parsing; an explicit
+	// `project_adoption: false` wins). The token is advertised on the build,
+	// not this flag: a host with it off still applies and reads its peers'
+	// adoptions, and no host relies on a peer adopting. An explicit false
+	// holds this host's pass off; it keeps a rollback below
+	// release_2027_01_v1 open only while it is false on EVERY host, a host
+	// added later included (docs/upgrades.md).
+	ProjectAdoption bool `yaml:"project_adoption,omitempty"`
 	// FenceSSH is how this host's ssh and best-effort fences reach their
 	// targets (internal/fencessh): "managed" uses each target's managed
 	// fence key path only, and fails a fence toward a host whose sshd does
@@ -1128,10 +1144,10 @@ func LoadConfig() (*Config, error) {
 		Firewall: FirewallConfig{LogGroup: 27, LogMaxRate: 200, LogRetainMiB: 64, LogRetainDays: 7},
 
 		// The enforcement flags that default ON — see EnforcementConfig.
-		// AuditSignature, PartitionPause, RecoveryClaim, ConsolePassword, VRRPUnicast
-		// and DigestV2. An explicit false still wins
+		// AuditSignature, PartitionPause, RecoveryClaim, ConsolePassword, VRRPUnicast,
+		// ProjectAdoption and DigestV2. An explicit false still wins
 		// (TestLoadConfig_RecoveryClaimDefaultsOn and its siblings pin both halves).
-		Enforcement: EnforcementConfig{AuditSignature: true, PartitionPause: true, RecoveryClaim: true, DigestV2: true, ConsolePassword: true, VRRPUnicast: true},
+		Enforcement: EnforcementConfig{AuditSignature: true, PartitionPause: true, RecoveryClaim: true, DigestV2: true, ConsolePassword: true, VRRPUnicast: true, ProjectAdoption: true},
 	}
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {

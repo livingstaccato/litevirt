@@ -411,7 +411,7 @@ var capabilityMap = map[string]tableResolver{
 	"role_bindings":          {category: "policy", chain: policyChain()},
 	"users":                  {category: "policy", chain: policyChain()},
 	"tokens":                 {category: "policy", chain: policyChain()},
-	"projects":               {category: "policy", chain: policyChain()},
+	"projects":               {category: "policy", chain: projectsTieChain()}, // project_adoption.go
 	"project_quotas":         {category: "policy", chain: policyChain()},
 	"security_groups":        {category: "policy", chain: policyChain()},
 	"sg_rules":               {category: "policy", chain: policyChain()},

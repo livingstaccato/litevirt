@@ -551,12 +551,13 @@ const (
 	//     that incarnation; one granted before the latch grants only while the
 	//     project still holds the incarnation it had then (none). Any other is
 	//     kept, listed as held, and grants nothing;
-	//   - a grant or quota write under a project carries a
-	//     project_incarnation_v1 mutation guard, and applies only to that
-	//     incarnation;
-	//   - the orphan reaper's authority retirement names the tombstone it
-	//     retires, so a node that never saw a re-create cannot retire the new
-	//     project's authority.
+	//   - a grant or quota write under a project carries NO project guard: its
+	//     writer checks the incarnation in its own transaction, and a receiver
+	//     applies it whatever its project holds. The binding's tag, and the
+	//     quota's key ("<name>~p:<incarnation>"), decide whether it counts;
+	//   - the orphan reaper's authority retirement carries the one project
+	//     guard (project_deleted), naming the tombstone it retires, so a node
+	//     that never saw a re-create cannot retire the new project's authority.
 	//
 	// Before, a role binding a lagging node granted on a project that was
 	// then deleted and re-created elsewhere reached the new project by the WAL
@@ -1030,6 +1031,27 @@ const (
 	// marker's rollback rule (ruleAwareBelow), so a rollback below it
 	// quarantines only when one of its features was used.
 	Release202612V1 = "release_2026_12_v1"
+
+	// Release202701V1 is the RELEASE TOKEN of the release train after
+	// 2026-12 (the rc2 train): the token a feature declared after
+	// release_2026_12_v1's set was frozen gates on (release_features.go).
+	// release_2026_12_v1 shipped in v1.10.0-rc1 and is latched on running
+	// clusters, so a feature added to it would have every rc1 host
+	// acknowledge a first use and then WAL-quarantine itself. Its claim,
+	// its machinery and its rules are Release202611V1's — mandatory,
+	// ReplicationGated, advertised unconditionally, opened only through
+	// WithFeature, a per-feature used bit — made for this release's
+	// features. Nothing may gate on Latched/Enforced(Release202701V1)
+	// directly.
+	//
+	// Its feature set is frozen once the rc2 train is tagged and running on
+	// a cluster, exactly as release_2026_12_v1's was: a feature added later
+	// goes on the next release token.
+	//
+	// The build directly below it is a release-token build, which reads a
+	// marker's rollback rule (ruleAwareBelow), so a rollback below it
+	// quarantines only when one of its features was used.
+	Release202701V1 = "release_2027_01_v1"
 )
 
 // ReleaseToken is the release token of THIS build's release train: the token a
@@ -1474,12 +1496,16 @@ var supported = []string{
 	// Release202612V1 is advertised UNCONDITIONALLY, for Release202611V1's
 	// reason. See Release202612V1.
 	Release202612V1,
+	// Release202701V1 is advertised UNCONDITIONALLY, for Release202611V1's
+	// reason; enforcement.project_adoption gates only this node's own
+	// adoption pass, never the token. See Release202701V1.
+	Release202701V1,
 }
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, LeaseTermClaimV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, VRRPUnicastV1, Release202611V1, SpecConflictV1, NetBoxIPRepointV1, UserIncarnationV1, ProjectIncarnationV1, Release202612V1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, LeaseTermClaimV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, VRRPUnicastV1, Release202611V1, SpecConflictV1, NetBoxIPRepointV1, UserIncarnationV1, ProjectIncarnationV1, Release202612V1, Release202701V1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -1604,6 +1630,9 @@ var replicationGated = map[string]bool{
 	// Confirmed against every replication recipient, for Release202611V1's
 	// reason. See Release202612V1.
 	Release202612V1: true,
+	// Confirmed against every replication recipient, for Release202611V1's
+	// reason. See Release202701V1.
+	Release202701V1: true,
 }
 
 // ReplicationGated reports whether token's latch must be confirmed by every
@@ -1694,6 +1723,8 @@ var mandatory = map[string]bool{
 	Release202611V1: true,
 	// A fact about the binary, as Release202611V1. See Release202612V1.
 	Release202612V1: true,
+	// A fact about the binary, as Release202611V1. See Release202701V1.
+	Release202701V1: true,
 }
 
 // Mandatory reports whether token is enforced with no config kill switch.

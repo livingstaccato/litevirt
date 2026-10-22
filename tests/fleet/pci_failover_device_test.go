@@ -697,13 +697,10 @@ func TestFleet_PCIFailover_StartOfAMovedStoppedVMGivesItItsDevice(t *testing.T) 
 
 // A VM with a type selector, recovered onto b, restarts there with the GPU it
 // already owns there: owned, that GPU is not free, and a fresh pick would
-// find none. Before the latch only: after it, the start preflight's type
-// resolution picks free devices alone, and refuses this restart whether or
-// not a failover came first (a separate finding).
+// find none.
 func TestFleet_PCIFailover_RestartKeepsTheDeviceItOwns(t *testing.T) {
 	defer vfio.SetFS(vfioBoundSysfs{})()
-	const latched = false
-	{
+	pciFoRegimes(t, func(t *testing.T, latched bool) {
 		ctx := context.Background()
 		clock := NewVirtualClock(time.Now().UTC())
 		c, a, b, _ := pciFoFleetWith(t, clock, pciFoSetup{latched: latched,
@@ -720,7 +717,7 @@ func TestFleet_PCIFailover_RestartKeepsTheDeviceItOwns(t *testing.T) {
 		if buses := pciFoHostdevBuses(b.Virt.DefinedXML(pciFoVM)); len(buses) != 1 || buses[0] != "0x81" {
 			t.Errorf("%s restarted on %s with buses %v, want its H100 at %s", pciFoVM, b.Name, buses, pciFoThere)
 		}
-	}
+	})
 }
 
 // Before the latch, a VM that failed over onto b is stopped and started there

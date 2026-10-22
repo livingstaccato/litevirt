@@ -90,6 +90,14 @@ vms:
 
 The placement engine selects a host with enough free devices matching the criteria. It prefers devices in the same NUMA node as the VM's CPU allocation and in the same NVLink clique for multi-GPU workloads.
 
+Once a start has given the VM its devices on a host, a restart there
+(`lv start`, or the restart after a guest crash) runs it with the same devices.
+It does not need a free device of the kind, and it does not take one beside
+those it has. This holds for the devices a start recorded for the VM on that host.
+A device the VM holds that no start there recorded, such as one claimed before
+the hardware_v2 latch and never adopted, is not kept this way: the restart
+looks for a free device of the kind instead.
+
 ### By exact PCI address
 
 ```yaml
@@ -102,6 +110,10 @@ Name the address alone. The VM is placed on the host that has that device free
 that device. Add a `placement.host` when more than one host has a device at
 that address. After a failover the address is not carried over: see
 [Failover with PCI devices](#failover-with-pci-devices).
+
+The other devices in that device's IOMMU group are passed through with it. You
+can also name them, as a GPU and its audio function are often named, each by
+its address: each device is then passed through once.
 
 A device's selector is read in a fixed order: `mapping`, then `sriov`, then
 `type` / `vendor`, then `address`. The first one set decides, and the fields

@@ -228,6 +228,12 @@ func retireReadmittedCredentials(ctx context.Context, tx *sql.Tx, stmts []Statem
 		if err := retireFenceRedfish(ctx, tx, host, ts); err != nil {
 			return fmt.Errorf("retire %s's Redfish settings: %w", host, err)
 		}
+		// The removed or re-admitted machine's fence key and host keys: its
+		// key leaves every peer's authorized_keys, and a re-admitted machine
+		// publishes its own (host_fence_ssh.go).
+		if err := retireFenceSSH(ctx, tx, host, ts); err != nil {
+			return fmt.Errorf("retire %s's fence SSH keys: %w", host, err)
+		}
 	}
 	return nil
 }

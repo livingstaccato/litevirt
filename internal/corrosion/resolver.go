@@ -591,6 +591,11 @@ var capabilityMap = map[string]tableResolver{
 	// the mirror on a value the owning node is the only writer of, which is a
 	// worse answer than picking one of two values that node itself produced.
 	"netbox_host_config": {category: "content", chain: contentDefaultChain()},
+	// v72 a host's signed fence SSH publication: written only by that host,
+	// whole, so a tie is two copies of its own row; a tombstone (its removal)
+	// wins. Every reader verifies the signature, so content-max picks a row
+	// that is then checked, never trusted.
+	"host_fence_ssh": {category: "content", chain: contentDefaultChain()},
 	// leader_lease_terms is NOT here: it is in customMergeTables. It was in this
 	// map first, on the theory that this chain would only ever be reached on an
 	// exact updated_at tie between two nodes racing one term. That was wrong —

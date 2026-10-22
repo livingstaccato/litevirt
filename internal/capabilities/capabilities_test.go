@@ -375,6 +375,11 @@ var frozenReleaseFeatures = map[string][]Feature{
 		"vm_disk_nic_io",
 		"vm_limits",
 	},
+	// Not shipped yet: corrected only by one reviewed change here and in
+	// releaseFeatures together.
+	Release202612V1: {
+		"fence_ssh",
+	},
 }
 
 // TestReleaseFeatureSetIsFrozen (m6): every release token's declared features
@@ -455,5 +460,28 @@ func TestNetBoxIPRepointV1Registered(t *testing.T) {
 	}
 	if !ReplicationGated(NetBoxIPRepointV1) {
 		t.Fatal("netbox_ip_repoint_v1 must be replication-gated: every recipient must decode the re-point")
+	}
+}
+
+// TestNextReleaseTokenRegistered pins release_2026_12_v1's registration, as
+// TestReleaseTokenRegistered pins release_2026_11_v1's, and that a rollback
+// below it lands on a build that reads its marker's rule.
+func TestNextReleaseTokenRegistered(t *testing.T) {
+	const tok = "release_2026_12_v1"
+	if Release202612V1 != tok {
+		t.Fatalf("Release202612V1 = %q, want %q: the marker name is frozen", Release202612V1, tok)
+	}
+	if !slices.Contains(Supported(), tok) || !slices.Contains(All(), tok) || !Mandatory(tok) || !ReplicationGated(tok) {
+		t.Fatalf("%s: supported=%v all=%v mandatory=%v replicationGated=%v; want all true", tok,
+			slices.Contains(Supported(), tok), slices.Contains(All(), tok), Mandatory(tok), ReplicationGated(tok))
+	}
+	if RollbackRule(tok) != RollbackSafeIfUnused || !slices.Contains(ReleaseTokens(), tok) {
+		t.Fatalf("%s: rollback rule %q, release tokens %v", tok, RollbackRule(tok), ReleaseTokens())
+	}
+	if !RuleHonouredBelow(tok) {
+		t.Errorf("RuleHonouredBelow(%s) = false; the build below it is a release-token build", tok)
+	}
+	if info, ok := LookupFeature(FeatureFenceSSH); !ok || info.Token != tok {
+		t.Errorf("fence_ssh is declared under %q, want %s", info.Token, tok)
 	}
 }

@@ -280,9 +280,8 @@ on another host. Nothing else on that host removes a file its note
 `<data_dir>/kept-disks/<vm>.json` names, whatever VM it runs for. A delete's
 or rebuild's disk cleanup leaves it and records a `vm.disk.kept` event; a
 migration, a volume move and the cleanup of a deleted VM's detached disks
-leave it as a file still in use; a delete of it as pool content (`lv iso rm
-<pool>/<file>`, or a storage-content delete from the UI or the API) is
-refused, naming the note. The create renames
+leave it as a file still in use; a delete of it as pool content through the
+gRPC API (`lv iso rm <pool>/<file>`) is refused, naming the note. The create renames
 nothing until the refusals it can judge up front have passed (Secure Boot or
 vTPM over kept UEFI vars, a USB device the host does not have, the image not
 available), and a create that fails
@@ -331,8 +330,9 @@ A plain `lv rm` removes the VM's snapshot records too, once their memory
 images and firmware bundles on its host are gone, so a later VM of the same
 name lists none of them. A record whose memory image could not be removed,
 that another host holds, or that names no host and whose memory image is not
-on this one, stays; so does every record with a memory image when the VM had
-no domain and a host did not answer whether it runs there, as its disks do.
+on this one, stays. When the VM had no domain and a host did not answer
+whether it runs there, every record stays, with the snapshots' memory images
+and firmware bundles, as its disks do.
 A disk-only snapshot's record goes even when its overlay files stay (kept
 with a disk recorded `delete_with_vm=false`, or because another VM backs on
 them): those files are then named by no snapshot.

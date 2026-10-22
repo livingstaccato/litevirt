@@ -302,10 +302,10 @@ For zero-downtime moves between litevirt hosts:
 lv migrate <vm> <target-host>
 ```
 
-For zero-downtime disk pool moves (e.g. local → Ceph):
+For disk pool moves between file-based pools (local, nfs, dir, btrfs):
 
 ```bash
-lv move-volume <vm> root <ceph-pool-name>
+lv move-volume <vm> root <target-pool-name>
 ```
 
 ## Rollback

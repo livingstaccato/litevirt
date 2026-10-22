@@ -360,7 +360,7 @@ enforcement:
                               # single decider entirely. Enable fleet-uniformly; the flag is the
                               # reversible kill switch.
   audit_signature: true       # DEFAULT ON — unset means on, as for digest_v2 above and
-                              # recovery_claim, partition_pause and console_password below. Sign every audit row this host writes with its cluster key
+                              # recovery_claim, partition_pause, console_password and vrrp_unicast below. Sign every audit row this host writes with its cluster key
                               # (the same host.key that identifies it on the wire, under a
                               # separate signing domain). An unsigned chain is an UNKEYED
                               # hash: anyone who can write the database can edit a row,
@@ -391,6 +391,14 @@ enforcement:
                               # retirement keeps its contract — that is the case it exists
                               # for — and `lv host retire-audit-key` closes it out from the
                               # machine holding the cluster CA.
+  lease_term: false           # enforce leader-lease terms on this host (lease_term_v1).
+                              # Enforcement is this flag AND the fleet-wide lease_term_v1
+                              # latch, so clearing the flag stops enforcement on this host
+                              # even after the latch has closed; the latch itself is
+                              # one-way and durable. Config is read once at startup, so
+                              # clearing it means editing the file and restarting the
+                              # daemon on each affected node. See operating-model.md,
+                              # "Leader-lease terms".
   owner_epoch: false          # activate the ownership-generation regime on this host
                               # (owner_epoch_v1). With the flag on, the health sweeps
                               # backfill every workload this host owns from the pre-epoch 0

@@ -308,11 +308,16 @@ Repeat for each additional host.
 ## SSH targets and `~/.ssh/config`
 
 Every command that reaches a host over SSH (`lv host init`, `lv host add`, `lv host rotate-audit-key`
-and the `--ssh-user` commands) reads `~/.ssh/config` through the system `ssh -G`, so a `Host`
+and the `--ssh-user` commands) reads the ssh config through the system `ssh -G`, so a `Host`
 alias that works with `ssh <alias>` works here, even when the alias is not in DNS.
 `HostName`, `User`, `Port`, `IdentityFile`, `IdentitiesOnly`, `IdentityAgent` and the host-key
 options below are used, and `Include` and `Match` are resolved
-by OpenSSH itself. Only the per-user `~/.ssh/config` is read; `/etc/ssh/ssh_config` is not.
+by OpenSSH itself. Two files are read, in the order `ssh` reads them: `~/.ssh/config` (under
+`$HOME`), then `/etc/ssh/ssh_config` (with whatever it `Include`s, such as
+`/etc/ssh/ssh_config.d/*.conf`). The first value obtained wins, so your own config beats the
+system one, and a setting made only in the system file (a fleet's `RevokedHostKeys`,
+`KnownHostsCommand` or `GlobalKnownHostsFile`) is enforced or refused exactly as if you had set
+it.
 
 - The `--ssh-user` commands (gossip and migration key rotation) and `lv host rm` dial
   `user@<recorded address>`, so a config `User` never applies to them, but a `Host` block that
@@ -361,8 +366,7 @@ by OpenSSH itself. Only the per-user `~/.ssh/config` is read; `/etc/ssh/ssh_conf
 - The known_hosts files checked: `~/.ssh/known_hosts` and `~/.ssh/known_hosts2` always;
   `UserKnownHostsFile` adds files on top of them, so `/dev/null` or `none` drops no entry; and
   `GlobalKnownHostsFile`, by default `/etc/ssh/ssh_known_hosts` and `ssh_known_hosts2`, so a host
-  key distributed there is enforced. A `GlobalKnownHostsFile` set in `/etc/ssh/ssh_config` is
-  not seen, since that file is not read; set it in `~/.ssh/config`. lv only reads these files;
+  key distributed there is enforced. lv only reads these files;
   it never records a key in any of them. A configured file that does not exist is skipped, as
   `ssh` skips it, with a warning naming it. A file that exists but cannot be read or parsed (a
   default, configured or global one) refuses the connection and names the file and line.
@@ -384,9 +388,9 @@ by OpenSSH itself. Only the per-user `~/.ssh/config` is read; `/etc/ssh/ssh_conf
   `ssh-rsa` is refused. `HostKeyAlgorithms` in the config is not used.
 - `Match exec` lines in your config run with lv's privileges, as they do for `ssh`: as root
   under `sudo lv host init`. OpenSSH refuses a config file not owned by that user.
-- With no `~/.ssh/config` the defaults apply even without an `ssh` binary. If a config exists
-  but `ssh -G` fails or takes longer than 10 seconds, the command refuses with an error naming
-  `ssh -G`, rather than dropping what the config pins; move the config aside to use the defaults.
+- With neither config file present the defaults apply even without an `ssh` binary. If either
+  exists but `ssh -G` fails or takes longer than 10 seconds, the command refuses with an error
+  naming `ssh -G` and the config files, rather than dropping what they pin.
   `ssh` also refuses a config it does not own: under `sudo -E`, run lv as the config's owner or without `-E`.
 
 ## CLI setup

@@ -79,11 +79,17 @@ var sshG = func(timeout time.Duration, args ...string) ([]byte, error) {
 	return stdout.Bytes(), nil
 }
 
+// systemSSHConfig is ssh's system-wide config. A variable so tests can point
+// it at a file of their own and never read this machine's.
+var systemSSHConfig = "/etc/ssh/ssh_config"
+
 // resolveConfig asks the system ssh what ~/.ssh/config (the one under $HOME)
-// makes of host. OpenSSH is the parser because it already implements Host
-// patterns, Match, Include and token expansion exactly as the operator's own
-// `ssh <alias>` does. Only the per-user file is read: -F replaces it and also
-// makes ssh skip /etc/ssh/ssh_config.
+// and then /etc/ssh/ssh_config make of host, in the order ssh reads them, so
+// the first value obtained wins as it does for `ssh <alias>`. OpenSSH is the
+// parser because it already implements Host patterns, Match, Include and
+// token expansion exactly. -F would make ssh skip the system file, so the
+// wrapper includes it explicitly: a fleet's RevokedHostKeys, KnownHostsCommand
+// or GlobalKnownHostsFile usually lives there.
 //
 // A command-line user or port is passed as -l/-p, so it beats the config the
 // way it does for ssh. With no config file the old defaults apply even without
@@ -106,19 +112,24 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 	// Wrapper: the operator's config first (ssh keeps the first value it
 	// obtains), then a sentinel User for any host that config left without one.
 	var wrapper strings.Builder
-	haveConfig := false
+	var configs []string // the config files present, in the order ssh reads them
 	defaultKH, defaultKH2 := "", ""
-	if home, err := os.UserHomeDir(); err == nil {
-		p := filepath.Join(home, ".ssh", "config")
+	include := func(p string) {
 		if st, err := os.Stat(p); err == nil && st.Mode().IsRegular() {
 			fmt.Fprintf(&wrapper, "Include %q\n", p)
-			haveConfig = true
+			configs = append(configs, p)
 		}
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		include(filepath.Join(home, ".ssh", "config"))
 		// ssh would default this to the passwd home; pin it to $HOME so the
 		// file litevirt checks is the one the rest of litevirt uses.
 		defaultKH = filepath.Join(home, ".ssh", "known_hosts")
 		defaultKH2 = defaultKH + "2"
 	}
+	include(systemSSHConfig)
+	haveConfig := len(configs) > 0
+	names := strings.Join(configs, " and ")
 	wrapper.WriteString("Host *\n  User " + userSentinel + "\n")
 	if defaultKH != "" {
 		fmt.Fprintf(&wrapper, "  UserKnownHostsFile %q %q\n", defaultKH, defaultKH2)
@@ -128,13 +139,13 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 	// refuses. With none, there is nothing to honour and the old defaults hold.
 	fail := func(err error) (*resolved, error) {
 		if haveConfig && strings.Contains(err.Error(), "Bad owner or permissions") {
-			return nil, fmt.Errorf("cannot read ~/.ssh/config for %s: %w "+
+			return nil, fmt.Errorf("cannot read the ssh config (%s) for %s: %w "+
 				"(ssh refuses a config not owned by the current user or writable by others; "+
-				"under sudo, run litevirt as the config's owner or without `sudo -E`)", host, err)
+				"under sudo, run litevirt as the config's owner or without `sudo -E`)", names, host, err)
 		}
 		if haveConfig {
-			return nil, fmt.Errorf("cannot read ~/.ssh/config for %s: %w "+
-				"(litevirt reads it with `ssh -G`; fix the config, or move it aside to use lv's defaults)", host, err)
+			return nil, fmt.Errorf("cannot read the ssh config (%s) for %s: %w "+
+				"(litevirt reads it with `ssh -G`; fix the config, or move it aside to use litevirt's defaults)", names, host, err)
 		}
 		return nil, nil
 	}

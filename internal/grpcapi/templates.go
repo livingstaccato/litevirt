@@ -369,10 +369,16 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	var diskRecords []corrosion.DiskRecord
 	var created []string
 	createdBy := map[string]storage.Driver{} // an rbd copy is removed by its driver
-	// createdFile is the file each copy this clone wrote is (its identity,
-	// right after it was written): a failed clone removes a path only while
-	// that file is still there, never another's that took the path since.
-	createdFile := map[string]madeFileID{}
+	// createdFile is the file each copy this clone wrote is, held open from
+	// right after it was written until the clone returns (pinnedFile): a
+	// failed clone removes a path only while that file is still there, never
+	// another's that took the path since, even one given the copy's inode.
+	createdFile := map[string]*pinnedFile{}
+	defer func() {
+		for _, pf := range createdFile {
+			pf.release()
+		}
+	}()
 	cleanup := func() {
 		for _, p := range created {
 			if drv := createdBy[p]; drv != nil {
@@ -383,7 +389,7 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 				cancel()
 				continue
 			}
-			if id, ok := createdFile[p]; !ok || !id.stillAt(p) {
+			if !createdFile[p].stillAt(p) {
 				slog.Warn("clone cleanup: disk left, it is no longer the file this clone wrote", "path", p)
 				continue
 			}
@@ -485,8 +491,9 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 			}
 		}
 		created = append(created, hostFile)
-		if id, ok := madeFileIdentity(hostFile); ok {
-			createdFile[hostFile] = id
+		if pf, ok := pinFile(hostFile); ok {
+			createdFile[hostFile].release()
+			createdFile[hostFile] = pf
 		}
 		bus, controller := "virtio", ""
 		if ds := diskSpecByName[d.DiskName]; ds != nil {

@@ -5,45 +5,16 @@ import (
 	"syscall"
 )
 
-// madeFileID is a file a create (or clone) made, as it was right after it was
-// made: its device and inode, and where the filesystem records one its birth
-// time. A failed create removes a path only while the file there is still
-// this one. The inode alone is not enough: ext4 and xfs often give a file
-// unlinked and recreated at the same path the same inode number, so a file
-// another made there since would read as this create's own. The birth time
-// tells them apart; where the filesystem keeps none (fileBirth is zero) the
-// inode is all there is, and the comparison is that weak.
-type madeFileID struct {
-	fi    os.FileInfo
-	birth int64
-}
-
-// madeFileIdentity reads p's identity now.
-func madeFileIdentity(p string) (madeFileID, bool) {
-	fi, err := os.Stat(p)
-	if err != nil {
-		return madeFileID{}, false
-	}
-	return madeFileID{fi: fi, birth: fileBirth(p)}, true
-}
-
-// stillAt reports whether the file at p is still id's.
-func (id madeFileID) stillAt(p string) bool {
-	now, ok := madeFileIdentity(p)
-	if !ok || id.fi == nil || !os.SameFile(now.fi, id.fi) {
-		return false
-	}
-	return id.birth == 0 || now.birth == 0 || id.birth == now.birth
-}
-
-// pinnedFile is a file a create made, held open from right after it was made
-// until the create returns. Its device and inode then name that file and no
-// other for as long as the create could compare them: the kernel does not
-// free an inode while a descriptor holds it, even once its last name is
-// removed, so no file made at the path since can be given its number (on
-// ext4, xfs and btrfs, and on NFS, where the client keeps an open file it
-// unlinks under a silly-rename name). A device and inode merely read and kept
-// (madeFileID) can be reused once the file goes, and then name the new one.
+// pinnedFile is a file a create (or clone) made, held open from right after
+// it was made until the create returns: its seed, and each host-local disk or
+// copy it wrote. Its device and inode then name that file and no other for as
+// long as the create could compare them: the kernel does not free an inode
+// while a descriptor holds it, even once its last name is removed, so no file
+// made at the path since can be given its number (on ext4, xfs and btrfs, and
+// on NFS, where the client keeps an open file it unlinks under a silly-rename
+// name). A device and inode merely read and kept can be reused once the file
+// goes, and then name the new one; a birth time beside them does not tell the
+// two apart where the filesystem keeps none (NFS) or stamps both in one tick.
 type pinnedFile struct {
 	f  *os.File
 	fi os.FileInfo

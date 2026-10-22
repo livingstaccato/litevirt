@@ -1138,7 +1138,13 @@ accepted from like any other. Where your configuration already sets an
 it reads, so it would replace yours): have yours also print
 `/etc/litevirt/ssh/authorized_keys`. The drop-in is validated with `sshd -t` and
 rolled back on a refusal, never overrides `PermitRootLogin no` — such a host
-reports that it does not accept the managed key — and a failed sshd reload is
+reports that it does not accept the managed key. sshd is then reloaded: a
+running `ssh.service` or `sshd.service` is reloaded, also when `ssh.socket`
+starts it (Ubuntu 22.10 and later, 24.04 LTS, where the socket starts one persistent
+listener that reads its configuration only on a reload); with no service running
+and only a socket listening, the next connection starts sshd with the new
+configuration. sshd is never reloaded on a configuration `sshd -t` refuses, and
+with neither unit, or a reload that fails, it is not reloaded and that is
 reported loudly. `--no-fence-ssh` skips the drop-in, for an sshd configured
 elsewhere: have it read `/etc/litevirt/ssh/authorized_keys` for root (an
 `AuthorizedKeysFile` entry or a command like the one above).
@@ -1225,7 +1231,9 @@ accept the managed key. Its exit code is unchanged.
    host, or `--ssh-user`). It writes the drop-in on every host and waits until each
    reports accepting the managed key; from then on, fences toward it take the
    managed path.
-3. Check `lv doctor fence`: every pair `managed`, every probe `ok`.
+3. Check `lv doctor fence`: every pair `managed`, every probe `ok`. A probe
+   result can predate the install for up to `fence_ssh_probe_interval_sec`
+   (default 15 minutes); a stale `FAILED` clears at the next probe.
 4. Set `enforcement.fence_ssh: managed` on each host.
 5. Remove any hand-made fence keys and `Host` stanzas from `/root/.ssh` yourself;
    litevirt never edits it.

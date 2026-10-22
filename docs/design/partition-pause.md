@@ -287,14 +287,22 @@ a record holds, and `CreateLiveSnapshot` refuses any paused domain.
 
 **The pause wins over a memory snapshot in flight.** A capture registers its
 VM in the host's capture registry (`libvirt.CaptureRegistry`, shared by the
-gRPC server and the pauser) for as long as it runs. Before the pauser pauses
-a VM it takes a hold on it there:
+gRPC server and the pauser) for as long as it runs. At the start of each
+pass, before it reads any VM's state, the pauser preempts every capture in
+flight on a VM its rows say it will pause (this host's, not a migration
+source, recoverable): the capture is told not to start its libvirt job, and
+its job is aborted in the background while the pass reads the other VMs. A
+VM's place in the pass therefore does not decide whether its capture's job
+has ended by the time its hold comes. Before the pauser pauses a VM it takes
+a hold on it there:
 
 1. When a capture of the VM is in flight, the hold aborts the capture's
    libvirt job (`virDomainAbortJob`) and waits for libvirt's job cleanup to
    end. The wait is at most one pause call's timeout, cut to what the pass
    has left before its suspend (so the suspend still ends within E), and
-   nothing in it blocks past it: the aborts run in the background, the
+   nothing in it blocks past it: the aborts run in the background, one
+   outstanding per capture however many passes ask (an abort libvirt does
+   not answer is never stacked), the
    capture's settle lock is per VM and the hold gives up on it at the
    deadline, and the registry's own lock is never held across a libvirt
    call. That cleanup resumes a guest

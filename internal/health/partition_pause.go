@@ -778,6 +778,40 @@ func (p *PartitionPauser) pauseAll(ctx context.Context, now time.Time, reason st
 // pmsuspended, shutting down) is skipped.
 func domainPaused(st lv.DomainStatus) bool { return st.Reason == "paused" }
 
+// preemptCaptures is the pass's first act: every memory snapshot capture in
+// flight on a VM the pass is about to pause is told not to start its libvirt
+// job, and its job is aborted in the background (CaptureRegistry.Preempt).
+// libvirt's cleanup then runs while the pass reads the other VMs, so the
+// VM's Hold, however late it comes in the pass and however little of the
+// budget is left for it, finds the job ended and settles; a capture alone
+// never fails a pause a plain suspend would have made. Only the registry and
+// this host's own rows are read here, no libvirt: a VM whose row says the
+// pass will not pause it (another host's, a migration source, not
+// recoverable) keeps its capture.
+func (p *PartitionPauser) preemptCaptures(ctx context.Context, names []string, enrolled *map[string]bool) {
+	if p.captures == nil {
+		return
+	}
+	for _, name := range names {
+		if !p.captures.InFlight(name) {
+			continue
+		}
+		vm, err := corrosion.GetVM(ctx, p.db, name)
+		if err != nil || vm == nil || vm.HostName != p.host || vm.State == "migrating" {
+			continue
+		}
+		if *enrolled == nil {
+			if *enrolled, err = corrosion.AutoPromoteEnrolled(ctx, p.db); err != nil {
+				*enrolled = map[string]bool{}
+			}
+		}
+		if !corrosion.VMRecoverableOnHostFailure(*vm, (*enrolled)[vm.Name]) {
+			continue
+		}
+		p.captures.Preempt(name)
+	}
+}
+
 func (p *PartitionPauser) pauseVMs(ctx context.Context, budget passBudget, reason string, failures map[string]string) {
 	names, err := guardedCall(&p.reads, readListDomains, budget.timeout(), p.vms.ListDomains)
 	if err != nil {
@@ -786,6 +820,7 @@ func (p *PartitionPauser) pauseVMs(ctx context.Context, budget passBudget, reaso
 	}
 	sort.Strings(names)
 	var enrolled map[string]bool
+	p.preemptCaptures(ctx, names, &enrolled)
 	var mu sync.Mutex
 	fail := func(key, why string) { mu.Lock(); failures[key] = why; mu.Unlock() }
 	var wg sync.WaitGroup

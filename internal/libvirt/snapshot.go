@@ -698,7 +698,7 @@ func leafNotCurrent(v snapshotAPI, dom golibvirt.Domain, snap golibvirt.DomainSn
 func (c *Client) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, o CaptureOptions) (diskBytes, vmstateBytes int64, err error) {
 	for _, op := range []FirmwareOp{OpStart, OpResume} {
 		if err := c.firmwareGuard().check(FirmwareCall{Op: op, Name: domainName}); err != nil {
-			return 0, 0, fmt.Errorf("memory snapshot of %q: %w", domainName, err)
+			return 0, 0, notTaken(fmt.Errorf("memory snapshot of %q: %w", domainName, err))
 		}
 	}
 	return CaptureMemorySnapshot(c.virt, domainName, snapshotName, vmstatePath, o)

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,7 +28,10 @@ import (
 // mutex guards only its maps and is never held across a libvirt call; the
 // settle lock is per VM, so one VM's stuck settle cannot delay another's
 // Hold, and Hold gives up on it at its deadline; the aborts run in the
-// background, one at a time.
+// background, one at a time per capture, shared by every Hold and Preempt
+// of it. The pass preempts (Preempt) every capture it is about to pause at
+// its start, so a VM's place in the pass does not decide whether its job
+// has ended by the time its Hold comes.
 //
 // One registry per host, shared by the gRPC server (captures), the pauser
 // and the reconciler's settle. The hold outlives the capture: it is dropped
@@ -40,9 +44,17 @@ type CaptureRegistry struct {
 }
 
 type captureEntry struct {
+	vm       string
 	abort    func() error
 	done     chan struct{} // closed when libvirt's create call has returned
 	doneOnce sync.Once
+	// aborting starts the capture's one abort loop (abortUntilDone), shared
+	// by every Hold and Preempt of it: at most one abort RPC is outstanding
+	// per capture, however many passes ask.
+	aborting sync.Once
+	// stop is set by Preempt or Hold: the capture never starts its libvirt
+	// job (preJob refuses).
+	stop atomic.Bool
 }
 
 // NewCaptureRegistry returns an empty registry.
@@ -114,41 +126,86 @@ func (r *CaptureRegistry) Hold(vm string, wait time.Duration) (captured, settled
 	if e == nil {
 		return false, true
 	}
-	// The abort is repeated until the create call has returned: a capture
-	// that checked for a hold just before the hold was taken may start its
-	// job after the first abort found none ("no job is active"), and the
-	// job admits an abort for its whole length. Each abort runs in the
-	// background, one at a time, so an abort libvirt does not answer cannot
-	// hold Hold past its wait.
-	idle := make(chan struct{}, 1)
-	idle <- struct{}{}
-	retry := time.NewTicker(abortRetry)
-	defer retry.Stop()
-	for {
-		select {
-		case <-idle:
-			go func() {
-				if err := e.abort(); err != nil {
-					slog.Debug("partition-pause: abort of an in-flight memory snapshot", "vm", vm, "error", err)
-				}
-				idle <- struct{}{}
-			}()
-		default:
-		}
-		select {
-		case <-e.done:
-			return true, true
-		case <-deadline.C:
-			slog.Warn("partition-pause: a memory snapshot's libvirt job did not end within the wait; suspending anyway, "+
-				"and libvirt may resume the guest when the job ends",
-				"vm", vm, "wait", wait)
-			return true, false
-		case <-retry.C:
-		}
+	e.abortUntilDone()
+	// A job that already ended settles the hold whatever wait is left: a
+	// pass that preempted the capture at its start finds it so here, however
+	// late the VM comes in the pass (select alone would pick at random
+	// between an ended job and a spent deadline).
+	select {
+	case <-e.done:
+		return true, true
+	default:
+	}
+	select {
+	case <-e.done:
+		return true, true
+	case <-deadline.C:
+		slog.Warn("partition-pause: a memory snapshot's libvirt job did not end within the wait; suspending anyway, "+
+			"and libvirt may resume the guest when the job ends",
+			"vm", vm, "wait", wait)
+		return true, false
 	}
 }
 
-// abortRetry is how often Hold repeats its abort while the capture's create
+// Preempt is the pause pass's first act on a VM it is about to pause: when a
+// capture of vm is in flight it is told never to start its libvirt job, and
+// its job is aborted in the background, so libvirt's cleanup runs while the
+// pass reads the other VMs. The later Hold then finds the job ended,
+// whatever the VM's place in the pass. It sets no hold (a VM the pass then
+// does not pause is not left held) and never blocks.
+func (r *CaptureRegistry) Preempt(vm string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	e := r.caps[vm]
+	r.mu.Unlock()
+	if e == nil {
+		return
+	}
+	e.abortUntilDone()
+}
+
+// abortUntilDone marks the capture stopped and starts, once per capture, the
+// loop that aborts its libvirt job until the create call has returned. The
+// abort is repeated: a capture that checked just before it was stopped may
+// start its job after an abort found none ("no job is active"), and the job
+// admits an abort for its whole length. Each abort runs in the background
+// and the next is issued only once it has returned, so an abort libvirt does
+// not answer blocks no caller and is never stacked by later passes.
+func (e *captureEntry) abortUntilDone() {
+	e.stop.Store(true)
+	e.aborting.Do(func() {
+		go func() {
+			idle := make(chan struct{}, 1)
+			idle <- struct{}{}
+			retry := time.NewTicker(abortRetry)
+			defer retry.Stop()
+			for {
+				select {
+				case <-idle:
+					go func() {
+						if err := e.abort(); err != nil {
+							slog.Debug("partition-pause: abort of an in-flight memory snapshot", "vm", e.vm, "error", err)
+						}
+						idle <- struct{}{}
+					}()
+				default:
+				}
+				select {
+				case <-e.done:
+					return
+				case <-retry.C:
+				}
+			}
+		}()
+	})
+}
+
+// preempted reports whether the pauser has stopped this capture.
+func (e *captureEntry) preempted() bool { return e.stop.Load() }
+
+// abortRetry is how often a capture's abort is repeated while its create
 // call has not returned.
 const abortRetry = 10 * time.Millisecond
 
@@ -179,7 +236,7 @@ func (r *CaptureRegistry) begin(vm string, abort func() error) (*captureEntry, e
 	if r.caps[vm] != nil {
 		return nil, fmt.Errorf("a memory snapshot of %q is already in flight", vm)
 	}
-	e := &captureEntry{abort: abort, done: make(chan struct{})}
+	e := &captureEntry{vm: vm, abort: abort, done: make(chan struct{})}
 	r.caps[vm] = e
 	return e, nil
 }

@@ -294,6 +294,45 @@ func TestSettle_NeverWithoutPositiveProof(t *testing.T) {
 			f.proof.Status, f.proof.ExecutorHost = corrosion.ProofPrepared, "node-c"
 			f.destState = RuntimeDefinedStopped
 		}},
+		// The paused path is taken on the domain being paused NOW, never on a
+		// pause record alone: a record left beside a copy that runs again (a
+		// resume that landed before the record was dropped, an operator's
+		// resume) says nothing about what runs.
+		{"running beside a stale pause record: proof prepared", func(f *settleFixture) {
+			rec, ok, err := ReadPauseRecord(f.dataDir, PauseKindVM, "vm-a")
+			if err != nil || !ok {
+				f.t.Fatalf("setup: record %v %v", ok, err)
+			}
+			f.runningCopy()
+			if err := newPauseStore(f.dataDir).put(rec); err != nil {
+				f.t.Fatal(err)
+			}
+			f.proof.Status, f.proof.ExecutorHost = corrosion.ProofPrepared, ""
+			f.destState = RuntimeAbsent
+		}},
+		// On a proof not yet executed the certificate's epoch and incarnation
+		// are the last line before the destroy of a paused copy: no
+		// destination check follows them.
+		{"paused: in progress, certificate at an older epoch", func(f *settleFixture) {
+			f.proof.Status = corrosion.ProofInProgress
+			f.cert.Key.OwnerEpoch = 2
+			f.destState = RuntimeAbsent
+		}},
+		{"paused: prepared, certificate for another incarnation", func(f *settleFixture) {
+			f.proof.Status, f.proof.ExecutorHost = corrosion.ProofPrepared, ""
+			f.cert.Key.Incarnation = "2001-01-01T00:00:00Z"
+			f.destState = RuntimeAbsent
+		}},
+		{"paused: in progress, certificate for another incarnation", func(f *settleFixture) {
+			f.proof.Status = corrosion.ProofInProgress
+			f.cert.Key.Incarnation = "2001-01-01T00:00:00Z"
+			f.destState = RuntimeAbsent
+		}},
+		{"paused: prepared, certificate at an older epoch", func(f *settleFixture) {
+			f.proof.Status, f.proof.ExecutorHost = corrosion.ProofPrepared, ""
+			f.cert.Key.OwnerEpoch = 2
+			f.destState = RuntimeAbsent
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newSettleFixture(t)

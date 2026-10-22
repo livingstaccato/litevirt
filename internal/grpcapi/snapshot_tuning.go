@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"log/slog"
 	"time"
 
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -27,6 +28,11 @@ func (s *Server) SetMemorySnapshotTuning(t MemorySnapshotTuning) { s.memorySnaps
 // server serves. Without it the server keeps one of its own.
 func (s *Server) SetCaptureRegistry(r *lv.CaptureRegistry) {
 	s.captureRegOnce.Do(func() { s.captureReg = r })
+	if s.captureReg != r {
+		// Two registries split the host: the pauser would hold one while
+		// captures run under the other, and the pause would not win.
+		slog.Error("memory snapshot: the gRPC server already has a different capture registry; the partition pause will not see its captures")
+	}
 }
 
 // CaptureRegistry is this host's memory snapshot capture registry, which the

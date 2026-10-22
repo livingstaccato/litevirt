@@ -145,3 +145,55 @@ func TestPartitionPause_ACaptureOutlivingTheWaitIsAFailedPause(t *testing.T) {
 		t.Fatalf("vm-ha is %s, want paused (the capture re-suspends it)", st)
 	}
 }
+
+// A captured VM that shut off is nothing to pause: the pauser takes a VM a
+// capture holds only while it reads paused (any paused reason), and skips
+// one that is not executing at all.
+//
+// Mutation: take every non-running VM with a capture in flight — the suspend
+// of the shut-off VM fails and counts as a failed pause; red.
+func TestPartitionPause_ACapturedVMThatShutOffIsSkipped(t *testing.T) {
+	f := newPauseFixture(t)
+	reg := lv.NewCaptureRegistry()
+	f.p.SetCaptureRegistry(reg)
+	inWindow, release := make(chan struct{}), make(chan struct{})
+	o := f.captureOpts(reg, "vm-ha")
+	o.Firmware = true
+	o.CaptureSuspended = func() error {
+		close(inWindow)
+		<-release
+		return nil
+	}
+	errc := make(chan error, 1)
+	go func() {
+		_, _, err := f.virt.CreateLiveSnapshot("vm-ha", "s1", filepath.Join(t.TempDir(), "s1.vmstate"), o)
+		errc <- err
+	}()
+	<-inWindow
+	f.virt.SetState("vm-ha", libvirtfake.StateShutdown) // the guest went down mid-capture
+	fenced := 0
+	f.p.SetSelfFence(func() bool { return true }, func() { fenced++ })
+	f.loseFor(QuorumNo, PartitionPauseAfter+time.Second)
+	close(release)
+	<-errc
+	if fenced != 0 {
+		t.Fatalf("a shut-off captured VM made the pause fail (%d self-fences)", fenced)
+	}
+	if _, held, _ := ReadPauseRecord(f.dataDir, PauseKindVM, "vm-ha"); held {
+		t.Fatal("a shut-off VM was recorded as paused")
+	}
+}
+
+// domainPaused is "paused, any reason", and nothing else.
+func TestDomainPaused_AnyPausedReason(t *testing.T) {
+	for _, st := range []lv.DomainStatus{{State: "stopped", Reason: "paused"}} {
+		if !domainPaused(st) {
+			t.Errorf("%+v is not paused", st)
+		}
+	}
+	for _, r := range []string{"running", "pmsuspended", "shutting-down", "crashed", "destroyed", "guest-shutdown", "unknown"} {
+		if domainPaused(lv.DomainStatus{State: "stopped", Reason: r}) {
+			t.Errorf("reason %q counted as paused", r)
+		}
+	}
+}

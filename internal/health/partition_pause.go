@@ -207,6 +207,16 @@ func (b passBudget) timeout() time.Duration {
 	return min(partitionPauseCallTimeout, time.Until(b.readsBy))
 }
 
+// holdWait is how long a pause may wait on a memory snapshot capture
+// (CaptureRegistry.Hold) before its suspend: captureWait, cut so that the
+// suspend after it (bounded by partitionPauseCallTimeout) still ends within
+// E. It is taken from the time left for reads, not added to the pass: a wait
+// the budget cannot hold makes the pause count as failed instead of landing
+// late and unreported.
+func (b passBudget) holdWait() time.Duration {
+	return max(0, min(captureWait, time.Until(b.readsBy)))
+}
+
 // frozenStater is the optional container-runtime capability to tell a FROZEN
 // container from a running one (lxc.Runtime.State folds frozen into running).
 // Without it a container an operator froze is indistinguishable from one
@@ -419,7 +429,8 @@ func (p *PartitionPauser) SetVMBackend(b PauseVMBackend) { p.vms = b }
 func (p *PartitionPauser) SetCaptureRegistry(r *lv.CaptureRegistry) { p.captures = r }
 
 // captureWait bounds how long a pause waits for an aborted memory snapshot's
-// libvirt job to end before it suspends anyway: one pause call's budget.
+// libvirt job to end before it suspends anyway: one pause call's budget, cut
+// to what the pass has left (passBudget.holdWait).
 const captureWait = partitionPauseCallTimeout
 
 // removeRecord drops kind/name's pause record and, for a VM, the capture
@@ -663,6 +674,16 @@ func (p *PartitionPauser) pauseAll(ctx context.Context, now time.Time, reason st
 	p.syncPausedCondition(ctx, reason)
 }
 
+// domainPaused reports a paused domain, whatever its paused reason. It is
+// deliberately "paused, any reason": a memory snapshot holds its guest paused
+// with reason user (the paused variant's suspend) or snapshot (libvirt's own,
+// or a suspend during the job), and a guest QEMU paused on an I/O error during
+// a capture is as much the pauser's as a running one. A finer paused reason
+// (DomainStatus.PausedReason, fix/pause-never-resumes-ioerror) must not
+// narrow it; only a domain that is not paused at all (shut off, crashed,
+// pmsuspended, shutting down) is skipped.
+func domainPaused(st lv.DomainStatus) bool { return st.Reason == "paused" }
+
 func (p *PartitionPauser) pauseVMs(ctx context.Context, budget passBudget, reason string, failures map[string]string) {
 	names, err := guardedCall(&p.reads, readListDomains, budget.timeout(), p.vms.ListDomains)
 	if err != nil {
@@ -685,7 +706,7 @@ func (p *PartitionPauser) pauseVMs(ctx context.Context, budget passBudget, reaso
 		// A memory snapshot in flight holds its guest paused, and resumes it
 		// when it ends: that guest is this pauser's to pause (the registry
 		// hold below stops the resume). Any other paused domain is not ours.
-		if st.State != RuntimeRunning && (st.Reason != "paused" || !p.captures.InFlight(name)) {
+		if st.State != RuntimeRunning && !(domainPaused(st) && p.captures.InFlight(name)) {
 			continue // not executing: nothing to stop, and a paused one is not ours
 		}
 		vm, err := corrosion.GetVM(ctx, p.db, name)
@@ -722,7 +743,7 @@ func (p *PartitionPauser) pauseVMs(ctx context.Context, budget passBudget, reaso
 			// one in flight and waits out libvirt's cleanup (which resumes a
 			// guest that was running) before the suspend, and keeps any
 			// capture from resuming the guest after it.
-			_, settled := p.captures.Hold(name, captureWait)
+			_, settled := p.captures.Hold(name, budget.holdWait())
 			if err := p.pauseOne(rec, func() error { return p.vms.SuspendDomain(name) }); err != nil {
 				fail(rec.Key(), err.Error())
 			} else if !settled {
@@ -730,8 +751,8 @@ func (p *PartitionPauser) pauseVMs(ctx context.Context, budget passBudget, reaso
 				// that was running when the job began, at the job's end. The
 				// capture re-suspends it, but this pause cannot be guaranteed,
 				// so it counts as failed (§3.4: self-fence when armed).
-				fail(rec.Key(), "a memory snapshot's libvirt job did not end within "+captureWait.String()+
-					"; libvirt may resume the guest when it ends")
+				fail(rec.Key(), "a memory snapshot of the guest did not let go within the pass's budget"+
+					"; libvirt or the capture may resume the guest after this pause")
 			}
 		}()
 	}

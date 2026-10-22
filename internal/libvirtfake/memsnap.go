@@ -48,6 +48,10 @@ type MemoryModel struct {
 	// IgnoreAbort: an abort of a LIVE capture succeeds but the job runs on
 	// (a QEMU that does not act on migrate_cancel in time).
 	IgnoreAbort bool
+	// AbortBlock, when set, holds every DomainAbortJob until it is closed:
+	// libvirt does not answer the abort (its job lock held by a stuck call,
+	// or the connection wedged).
+	AbortBlock chan struct{}
 }
 
 // PauseWindow is one stretch of fake time the guest's vCPUs were stopped.
@@ -388,6 +392,12 @@ func (c captureAPI) DomainSnapshotCreateXML(dom golibvirt.Domain, x string, flag
 // DomainAbortJob cancels a LIVE capture's memory write; with no job it is
 // refused, as libvirt does.
 func (c captureAPI) DomainAbortJob(dom golibvirt.Domain) error {
+	c.f.mu.Lock()
+	block := c.f.memLocked(dom.Name).model.AbortBlock
+	c.f.mu.Unlock()
+	if block != nil {
+		<-block
+	}
 	c.f.mu.Lock()
 	defer c.f.mu.Unlock()
 	m := c.f.memLocked(dom.Name)

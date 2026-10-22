@@ -241,15 +241,21 @@ gRPC server and the pauser) for as long as it runs. Before the pauser pauses
 a VM it takes a hold on it there:
 
 1. When a capture of the VM is in flight, the hold aborts the capture's
-   libvirt job (`virDomainAbortJob`) and waits, at most one pause call's
-   budget, for libvirt's job cleanup to end. That cleanup resumes a guest
+   libvirt job (`virDomainAbortJob`) and waits for libvirt's job cleanup to
+   end. The wait is at most one pause call's timeout, cut to what the pass
+   has left before its suspend (so the suspend still ends within E), and
+   nothing in it blocks past it: the aborts run in the background, the
+   capture's settle lock is per VM and the hold gives up on it at the
+   deadline, and the registry's own lock is never held across a libvirt
+   call. That cleanup resumes a guest
    that was running when the snapshot began, so the pauser's suspend lands
    after it. The abort is repeated until the job has ended: a capture checks
    for a hold under the registry's lock just before it starts its job, and
    refuses to start one once held, but a hold taken just after that check
    finds no job yet. A VM a capture holds paused reads paused, and is still
    the pauser's to record and suspend.
-2. When the wait runs out (QEMU did not act on the abort), the pauser
+2. When the wait runs out (QEMU did not act on the abort, libvirt did not
+   answer it, or the capture was still deciding a resume), the pauser
    suspends anyway. libvirt's cleanup may then resume the guest when the job
    ends, and the capture re-suspends it: for that moment the pause does not
    hold. The pauser therefore counts the pause as failed (§3.4): it raises

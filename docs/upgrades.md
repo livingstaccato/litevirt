@@ -753,7 +753,13 @@ owner epoch; a marker whose container was deleted, created again, moved or
 owned again under a later generation, or that runs again, is removed with
 nothing recorded. A marker that cannot be read fails closed, as a VM's does,
 and raises `operator_stop_marker_corrupt` with subject `container/<name>`.
-Out of quarantine `--force` changes nothing. The same rollback limit
+Out of quarantine `--force` changes nothing. A daemon older than this
+build ignores `--force` (it does not know the field): on a quarantined owner
+of that build `lv ct stop --force` stops the container, answers `Internal`
+because the stop cannot be recorded, and once the quarantine lifts the
+container's restart policy starts it again. A migrate (`lv ct migrate`)
+made after the lift and before the stop is recorded records it first, so
+the container lands on the target stopped. The same rollback limit
 applies: a build older than this one ignores the directory, so its restart
 policy may start the container again.
 

@@ -406,3 +406,39 @@ func TestFleet_QuarantinedContainerStart_RefusedBeforeAnythingChanges(t *testing
 		t.Fatalf("StartContainer after the lift: %v", err)
 	}
 }
+
+// A migrate made after the quarantine lifts, before any reconcile pass
+// recorded the forced stop (the row still reads running): the stop is
+// recorded first and the container lands on the target stopped, not
+// started there.
+//
+// Red on 65b0ad404: the migrate decides from the row (running) and starts
+// the container on the target, losing the operator's stop.
+//
+// Mutation, the migrate's marker gate removed: started on the target: red.
+func TestFleet_QuarantinedContainerForceStop_MigrateAfterLiftKeepsItStopped(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	src, dst := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+	qcsContainer(t, c, src, "web")
+	src.DB.SetWriteQuarantine(func() string { return qfsQuarantine })
+	if _, err := c.SelfClient(src).StopContainer(ctx, qcsStopReq(t, src.Name, "web", true)); err != nil {
+		t.Fatalf("forced StopContainer under write quarantine: %v", err)
+	}
+	src.DB.SetWriteQuarantine(nil)
+	if row := qcsRow(t, src, "web"); row.State != "running" {
+		t.Fatalf("source row %s before the migrate; the test needs it unrecorded (running)", row.State)
+	}
+	if err := runMigrate(t, c, src, dst, "web", stagingRepo(t)); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if st := dst.CT.State("web"); st == "running" {
+		t.Errorf("web runs on the target after the migrate: the forced stop was lost")
+	}
+	if k := qcsCount(dst.CT.StartCalls(), "web"); k != 0 {
+		t.Errorf("web was started %d time(s) on the target", k)
+	}
+	if _, err := os.Stat(qcsMarker(src, "web")); !os.IsNotExist(err) {
+		t.Errorf("the source's marker outlived the migrate: %v", err)
+	}
+}

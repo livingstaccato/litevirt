@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -36,7 +37,10 @@ type resolved struct {
 	IdentityFiles  []string // configured IdentityFile entries, defaults excluded
 	IdentitiesOnly bool
 	StrictYes      bool     // StrictHostKeyChecking yes/true/on
-	KnownHosts     []string // configured UserKnownHostsFile entries, defaults excluded
+	KnownHosts     []string // configured UserKnownHostsFile entries, ~/.ssh/known_hosts{,2} excluded
+	// GlobalKnownHosts is GlobalKnownHostsFile: OpenSSH's default
+	// /etc/ssh/ssh_known_hosts{,2} unless the config names others.
+	GlobalKnownHosts []string
 	// HostKeyAlias is the name host keys are looked up under instead of the
 	// dialled address ("" when unset).
 	HostKeyAlias string
@@ -82,7 +86,7 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 	// obtains), then a sentinel User for any host that config left without one.
 	var wrapper strings.Builder
 	haveConfig := false
-	defaultKH := ""
+	defaultKH, defaultKH2 := "", ""
 	if home, err := os.UserHomeDir(); err == nil {
 		p := filepath.Join(home, ".ssh", "config")
 		if st, err := os.Stat(p); err == nil && st.Mode().IsRegular() {
@@ -92,10 +96,11 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 		// ssh would default this to the passwd home; pin it to $HOME so the
 		// file litevirt checks is the one the rest of litevirt uses.
 		defaultKH = filepath.Join(home, ".ssh", "known_hosts")
+		defaultKH2 = defaultKH + "2"
 	}
 	wrapper.WriteString("Host *\n  User " + userSentinel + "\n")
 	if defaultKH != "" {
-		fmt.Fprintf(&wrapper, "  UserKnownHostsFile %q\n", defaultKH)
+		fmt.Fprintf(&wrapper, "  UserKnownHostsFile %q %q\n", defaultKH, defaultKH2)
 	}
 	// An unreadable config must not silently drop what it pins (host-key
 	// files, StrictHostKeyChecking): with a config present, failing to read it
@@ -187,8 +192,8 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 		r.StrictYes = true
 	}
 	for _, kh := range strings.Fields(strings.Join(got["userknownhostsfile"], " ")) {
-		if kh == "none" || kh == defaultKH {
-			continue
+		if kh == "none" || kh == defaultKH || kh == defaultKH2 {
+			continue // ~/.ssh/known_hosts{,2} are always checked (knownHostsFiles)
 		}
 		p, ok := expandIdentity(kh, host, r.Hostname, eff, r.Port)
 		if !ok {
@@ -197,6 +202,15 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 			return nil, fmt.Errorf("UserKnownHostsFile %q for %s uses a %% token litevirt does not expand", kh, host)
 		}
 		r.KnownHosts = append(r.KnownHosts, p)
+	}
+	if v := got["globalknownhostsfile"]; len(v) > 0 {
+		for _, kh := range strings.Fields(strings.Join(v, " ")) {
+			if kh != "none" {
+				r.GlobalKnownHosts = append(r.GlobalKnownHosts, expandHome(kh))
+			}
+		}
+	} else {
+		r.GlobalKnownHosts = slices.Clone(defaultGlobalKnownHosts)
 	}
 	return r, nil
 }
@@ -219,7 +233,7 @@ func resolveTarget(target string, timeout time.Duration) (*Target, error) {
 		return nil, err
 	}
 	if cfg == nil {
-		cfg = &resolved{Hostname: host, Port: port}
+		cfg = &resolved{Hostname: host, Port: port, GlobalKnownHosts: slices.Clone(defaultGlobalKnownHosts)}
 	}
 	if cfg.User != "" {
 		u = cfg.User

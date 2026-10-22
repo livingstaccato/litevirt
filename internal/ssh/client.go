@@ -811,11 +811,18 @@ func defaultHostKeyCallback() (ssh.HostKeyCallback, error) {
 	return cb, err
 }
 
+// defaultGlobalKnownHosts is OpenSSH's GlobalKnownHostsFile default, used
+// when no ssh -G answer is available. A variable so a test can point it into
+// its own directory.
+var defaultGlobalKnownHosts = []string{"/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh_known_hosts2"}
+
 // knownHostsFiles lists the known_hosts files that verify a host under cfg
-// (nil: the default): ~/.ssh/known_hosts always -- a configured
-// UserKnownHostsFile adds to it and never replaces it, so a key it holds
+// (nil: the defaults): ~/.ssh/known_hosts{,2} always -- a configured
+// UserKnownHostsFile adds to them and never replaces them, so a key they hold
 // cannot be bypassed with /dev/null -- then the configured UserKnownHostsFile
-// entries.
+// entries, then the GlobalKnownHostsFile ones (by default
+// /etc/ssh/ssh_known_hosts{,2}, where config management often distributes a
+// fleet's host keys). All are only ever read.
 //
 // An absent file is skipped, as ssh skips it. One that exists but cannot be
 // read or parsed is an error naming it, never skipped: it could hold the key
@@ -832,19 +839,27 @@ func knownHostsFiles(cfg *resolved) ([]string, error) {
 		files = append(files, f)
 		return nil
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", errNoKnownHosts, err)
+	def := "~/.ssh/known_hosts"
+	if home, err := os.UserHomeDir(); err == nil {
+		def = filepath.Join(home, ".ssh", "known_hosts")
+		for _, f := range []string{def, def + "2"} {
+			if err := use("known_hosts", f); err != nil {
+				return nil, err
+			}
+		}
 	}
-	def := filepath.Join(home, ".ssh", "known_hosts")
-	if err := use("known_hosts", def); err != nil {
-		return nil, err
-	}
+	global := defaultGlobalKnownHosts
 	if cfg != nil {
 		for _, f := range cfg.KnownHosts {
 			if err := use("UserKnownHostsFile", f); err != nil {
 				return nil, err
 			}
+		}
+		global = cfg.GlobalKnownHosts
+	}
+	for _, f := range global {
+		if err := use("GlobalKnownHostsFile", f); err != nil {
+			return nil, err
 		}
 	}
 	if len(files) == 0 {
@@ -859,7 +874,7 @@ func knownHostsFiles(cfg *resolved) ([]string, error) {
 // database, so they cannot disagree.
 //
 // Nothing in the ssh config makes it accept more than the defaults do:
-//   - UserKnownHostsFile only adds files to check;
+//   - UserKnownHostsFile and GlobalKnownHostsFile only add files to check;
 //   - StrictHostKeyChecking yes refuses an unknown host too, and no or
 //     accept-new are not read at all -- a CHANGED key is always refused;
 //   - HostKeyAlias makes the alias the name a key is looked up under, as ssh

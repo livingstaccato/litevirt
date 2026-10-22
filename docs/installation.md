@@ -330,14 +330,17 @@ by OpenSSH itself. Only the per-user `~/.ssh/config` is read; `/etc/ssh/ssh_conf
 - Host-key checking is never loosened by the config. A changed key for a known host is
   always refused. A host with no entry in the known_hosts files is accepted on first contact
   (accept-new), unless `StrictHostKeyChecking yes`, which refuses it. `StrictHostKeyChecking no`
-  or `accept-new` change nothing. `UserKnownHostsFile` adds files to check on top of
-  `~/.ssh/known_hosts`, so `/dev/null` or `none` drops no entry. `HostKeyAlias` is honoured as
+  or `accept-new` change nothing. `~/.ssh/known_hosts` and `~/.ssh/known_hosts2` are always
+  checked; `UserKnownHostsFile` adds files to check on top of them, so `/dev/null` or `none`
+  drops no entry. `GlobalKnownHostsFile` is checked as `ssh` checks it, by default
+  `/etc/ssh/ssh_known_hosts` and `ssh_known_hosts2`, so a host key distributed there is
+  enforced. lv only reads these files; it never records a key in any of them. `HostKeyAlias` is honoured as
   `ssh` honours it: the host's key (and a host certificate's principal) is looked up under the
   alias, so a key pinned there is enforced. When known_hosts has nothing under the alias, lv
   checks the dialled address instead rather than treating the host as new, except under
   `StrictHostKeyChecking yes`, which refuses an unknown alias as `ssh` does. A known_hosts file that exists but cannot be
-  read or parsed (the default one or a configured one) refuses the connection and names the
-  file; with no known_hosts file at all there is nothing to compare and first contact is accepted
+  read or parsed (a default one, a configured one or a global one) refuses the connection and
+  names the file; with no known_hosts file at all there is nothing to compare and first contact is accepted
   with a warning.
 - `Match exec` lines in your config run with lv's privileges, as they do for `ssh`: as root
   under `sudo lv host init`. OpenSSH refuses a config file not owned by that user.

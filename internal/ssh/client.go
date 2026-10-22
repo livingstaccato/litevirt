@@ -1,6 +1,8 @@
 package ssh
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -51,27 +53,8 @@ func newClient(target string, timeout time.Duration, keepDeadline bool) (*Client
 		return nil, fmt.Errorf("SSH auth: %w", err)
 	}
 
-	hostKeyCallback, err := defaultHostKeyCallback()
-	if err != nil {
-		// No usable known_hosts (no HOME, unreadable file). Accept-new still
-		// applies -- there is nothing to compare against, and refusing here
-		// would make provisioning impossible on a fresh workstation -- but say
-		// so, because this connection carries the cluster CA-signed host key
-		// and nothing is pinning the far end.
-		fmt.Fprintf(os.Stderr,
-			"warning: no usable known_hosts (%v); %s's host key cannot be checked "+
-				"against a previous one. This connection carries the cluster CA-signed "+
-				"host key.\n", err, host)
-		hostKeyCallback = firstContactOnlyCallback(host)
-	}
-
-	config := &ssh.ClientConfig{
-		User:            sshUser,
-		Auth:            auth,
-		HostKeyCallback: hostKeyCallback,
-	}
-
 	addr := net.JoinHostPort(host, port)
+	config := clientConfig(sshUser, auth, host, addr)
 	var conn *ssh.Client
 	if timeout > 0 {
 		conn, err = dialTimeout(addr, config, timeout, keepDeadline)
@@ -83,6 +66,90 @@ func newClient(target string, timeout time.Duration, keepDeadline bool) (*Client
 	}
 
 	return &Client{conn: conn, addr: addr}, nil
+}
+
+// clientConfig is the ClientConfig every litevirt SSH dial uses: the given
+// auth, and the host-key policy for addr.
+func clientConfig(sshUser string, auth []ssh.AuthMethod, host, addr string) *ssh.ClientConfig {
+	hostKeyCallback, hostKeyAlgos, err := defaultHostKeyPolicy(addr)
+	if err != nil {
+		// No usable known_hosts (no HOME, unreadable file). Accept-new still
+		// applies -- there is nothing to compare against, and refusing here
+		// would make provisioning impossible on a fresh workstation -- but say
+		// so, because this connection carries the cluster CA-signed host key
+		// and nothing is pinning the far end.
+		fmt.Fprintf(os.Stderr,
+			"warning: no usable known_hosts (%v); %s's host key cannot be checked "+
+				"against a previous one. This connection carries the cluster CA-signed "+
+				"host key.\n", err, host)
+		hostKeyCallback, hostKeyAlgos = firstContactOnlyCallback(host), nil
+	}
+
+	return &ssh.ClientConfig{
+		User:              sshUser,
+		Auth:              auth,
+		HostKeyCallback:   hostKeyCallback,
+		HostKeyAlgorithms: hostKeyAlgos,
+	}
+}
+
+// hostKeyAlgorithmPreference is the order known host-key types are asked for
+// in, strongest first. An RSA key is asked for with SHA-2 signatures only.
+var hostKeyAlgorithmPreference = []struct {
+	keyType string
+	algos   []string
+}{
+	{ssh.KeyAlgoED25519, []string{ssh.KeyAlgoED25519}},
+	{ssh.KeyAlgoECDSA256, []string{ssh.KeyAlgoECDSA256}},
+	{ssh.KeyAlgoECDSA384, []string{ssh.KeyAlgoECDSA384}},
+	{ssh.KeyAlgoECDSA521, []string{ssh.KeyAlgoECDSA521}},
+	{ssh.KeyAlgoRSA, []string{ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256}},
+}
+
+// knownHostKeyAlgorithms returns the host-key algorithms to ask addr for: those
+// of the key types known_hosts records for it, or nil (the library default)
+// for a host it does not know.
+//
+// Without this the server presents whichever of its keys x/crypto prefers --
+// ECDSA before ED25519 -- while OpenSSH records the ED25519 one. knownhosts
+// then finds an entry for the host holding a different key, and a node whose
+// key never changed is refused as CHANGED. OpenSSH avoids the same trap the
+// same way (it orders HostKeyAlgorithms by what known_hosts holds).
+//
+// Narrowing the offer is not a weakening: the presented key must still match a
+// recorded one exactly, and a server that holds no key of a recorded type
+// fails the negotiation instead of being treated as unknown.
+//
+// raw is the unwrapped knownhosts callback; addr is host:port as dialled. The
+// probe key is fresh, so it can match no entry, and the KeyError lists every
+// entry recorded for addr. The same in-memory database then verifies the real
+// key, so the two answers cannot disagree about the file.
+func knownHostKeyAlgorithms(raw ssh.HostKeyCallback, addr string) []string {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil
+	}
+	probe, err := ssh.NewPublicKey(priv.Public())
+	if err != nil {
+		return nil
+	}
+	var keyErr *knownhosts.KeyError
+	if !errors.As(raw(addr, &net.TCPAddr{IP: net.IPv4zero}, probe), &keyErr) || len(keyErr.Want) == 0 {
+		return nil
+	}
+	recorded := map[string]bool{}
+	for _, k := range keyErr.Want {
+		recorded[k.Key.Type()] = true
+	}
+	var algos []string
+	for _, p := range hostKeyAlgorithmPreference {
+		if recorded[p.keyType] {
+			algos = append(algos, p.algos...)
+		}
+	}
+	// A host recorded only under types this client cannot negotiate keeps the
+	// default offer; whatever it presents then fails hostKeyVerdictFor.
+	return algos
 }
 
 // Close closes the SSH connection.
@@ -329,7 +396,9 @@ func authMethods() ([]ssh.AuthMethod, error) {
 	for _, kf := range keyFiles {
 		key, err := loadPrivateKey(kf)
 		if err != nil {
-			if !os.IsNotExist(err) {
+			if os.IsNotExist(err) {
+				tried = append(tried, fmt.Sprintf("key %s: not found", kf))
+			} else {
 				tried = append(tried, fmt.Sprintf("key %s: %v", filepath.Base(kf), err))
 			}
 			continue
@@ -382,9 +451,28 @@ func loadPrivateKey(path string) (ssh.Signer, error) {
 //   - non-empty -- the host is KNOWN and the key CHANGED. Refused. Nothing
 //     about provisioning requires this, and it is the whole MITM.
 func hostKeyVerdict(hostname string, err error) error {
+	return hostKeyVerdictFor(hostname, nil, err)
+}
+
+// hostKeyVerdictFor is hostKeyVerdict knowing the presented key, so a refusal
+// can say when the key is of a type known_hosts holds no entry of. That is
+// still refused -- it cannot be verified, and taking it as first contact would
+// let an impostor dodge the pin by presenting another type -- but it is not
+// evidence the recorded key changed.
+func hostKeyVerdictFor(hostname string, key ssh.PublicKey, err error) error {
 	if keyErr := (*knownhosts.KeyError)(nil); errors.As(err, &keyErr) {
 		if len(keyErr.Want) == 0 {
 			return nil // unknown host: accept-new
+		}
+		if key != nil && !recordsType(keyErr.Want, key.Type()) {
+			var types []string
+			for _, w := range keyErr.Want {
+				types = append(types, w.Key.Type())
+			}
+			return fmt.Errorf("host key for %s cannot be verified -- refusing: it presented a %s "+
+				"key, and known_hosts records only %s for it (%s:%d). This connection would "+
+				"carry the cluster CA-signed host key",
+				hostname, key.Type(), strings.Join(types, ", "), keyErr.Want[0].Filename, keyErr.Want[0].Line)
 		}
 		return fmt.Errorf("host key for %s CHANGED (known key at %s:%d) -- refusing: "+
 			"this connection would carry the cluster CA-signed host key, and a changed "+
@@ -393,6 +481,15 @@ func hostKeyVerdict(hostname string, err error) error {
 			hostname, keyErr.Want[0].Filename, keyErr.Want[0].Line)
 	}
 	return err
+}
+
+func recordsType(want []knownhosts.KnownKey, keyType string) bool {
+	for _, w := range want {
+		if w.Key != nil && w.Key.Type() == keyType {
+			return true
+		}
+	}
+	return false
 }
 
 // firstContactOnlyCallback is used when no known_hosts is usable at all.
@@ -412,20 +509,31 @@ func firstContactOnlyCallback(host string) ssh.HostKeyCallback {
 }
 
 func defaultHostKeyCallback() (ssh.HostKeyCallback, error) {
+	cb, _, err := defaultHostKeyPolicy("")
+	return cb, err
+}
+
+// defaultHostKeyPolicy reads ~/.ssh/known_hosts once and returns the verifying
+// callback and, for a non-empty addr, the host-key algorithms to ask it for.
+func defaultHostKeyPolicy(addr string) (ssh.HostKeyCallback, []string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	knownHostsFile := filepath.Join(home, ".ssh", "known_hosts")
-	cb, err := knownhosts.New(knownHostsFile)
+	raw, err := knownhosts.New(knownHostsFile)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	var algos []string
+	if addr != "" {
+		algos = knownHostKeyAlgorithms(raw, addr)
 	}
 	// accept-new, not accept-anything: see hostKeyVerdict for why a CHANGED
 	// key is refused even though an unknown one is not.
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-		return hostKeyVerdict(hostname, cb(hostname, remote, key))
-	}, nil
+		return hostKeyVerdictFor(hostname, key, raw(hostname, remote, key))
+	}, algos, nil
 }
 
 type bytesReaderWrapper struct {

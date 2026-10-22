@@ -65,7 +65,7 @@ func cachedMounts() ([]mountEntry, error) {
 	// consumed even when the table is read for its age.
 	now := mountTableNow.get()()
 	changed := mountTableChanged.get()()
-	if changed || !mountCache.valid || now.Sub(mountCache.readAt) >= mountTableMaxAge || now.Before(mountCache.readAt) {
+	if changed || !mountCache.valid || now.Sub(mountCache.readAt) >= mountTableMaxAge {
 		data, err := procMountInfo.get()()
 		if err != nil {
 			mountCache.all, mountCache.valid = nil, false
@@ -76,12 +76,18 @@ func cachedMounts() ([]mountEntry, error) {
 	return mountCache.all, nil
 }
 
-// resetMountCache drops the cached table (tests).
-func resetMountCache() {
+// invalidateMountCache drops the cached table, so the next use reads it.
+// litevirt calls it right after each of its own mount and umount commands:
+// the check that follows one must see it whatever the kernel's mark says
+// (bug B1 showed there, and a table that young is inside the age bound).
+func invalidateMountCache() {
 	mountCache.mu.Lock()
 	mountCache.all, mountCache.valid, mountCache.readAt = nil, false, time.Time{}
 	mountCache.mu.Unlock()
 }
+
+// resetMountCache drops the cached table (tests).
+func resetMountCache() { invalidateMountCache() }
 
 // procMountWatch holds /proc/self/mountinfo open for its change mark. Used
 // under mountCache.mu only.
@@ -113,7 +119,14 @@ func (w *procMountWatch) changed() bool {
 	if err != nil {
 		return true
 	}
-	return n > 0 && fds[0].Revents&(unix.POLLPRI|unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0
+	if n > 0 && fds[0].Revents&unix.POLLNVAL != 0 {
+		// The descriptor is no longer open (closed under us): forget it,
+		// without closing a number that may now be someone else's, and
+		// open a new one at the next use.
+		w.valid = false
+		return true
+	}
+	return n > 0 && fds[0].Revents&(unix.POLLPRI|unix.POLLERR|unix.POLLHUP) != 0
 }
 
 func (w *procMountWatch) close() {

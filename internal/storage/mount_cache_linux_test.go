@@ -170,3 +170,35 @@ func TestProcMountWatch_Child(t *testing.T) {
 	}
 	fmt.Println("MOUNTWATCH-OK")
 }
+
+// A watch whose descriptor was closed under it (POLLNVAL) says changed, and
+// opens a new descriptor at the next use, so the cache goes back to reading
+// only on a change instead of reading on every use from then on.
+//
+// Mutation "keep the dead descriptor" (no valid=false on POLLNVAL): the
+// watch never reopens, red.
+func TestProcMountWatch_ReopensAfterItsDescriptorWasClosed(t *testing.T) {
+	w := &procMountWatch{}
+	defer w.close()
+	w.changed()
+	if !w.valid {
+		t.Fatal("the watch could not open mountinfo")
+	}
+	dead := w.fd
+	if err := unix.Close(dead); err != nil {
+		t.Fatal(err)
+	}
+	if !w.changed() {
+		t.Fatal("a watch with a closed descriptor said unchanged")
+	}
+	w.changed() // reopens
+	if !w.valid {
+		t.Fatal("the watch did not reopen after its descriptor was closed")
+	}
+	for range 5 {
+		if !w.changed() {
+			return
+		}
+	}
+	t.Fatal("after the reopen the watch never said unchanged: every use would read the table")
+}

@@ -241,6 +241,7 @@ func MountNFSPool(ctx context.Context, dataDir string, cfg Config) error {
 		// A fresh bound: the caller's context may be spent by the mount.
 		uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultNFSCommandTimeout)
 		out, uerr := nfsRunner()(uctx, "umount", "--", dir)
+		invalidateMountCache()
 		cancel()
 		if uerr != nil {
 			return fmt.Errorf("%w; it could not be unmounted again (%v: %s), so the export now hides them: umount %s",

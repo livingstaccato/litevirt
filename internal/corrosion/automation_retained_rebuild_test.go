@@ -544,8 +544,9 @@ func retainedCompatibilityCurrent37Fixture(t *testing.T) (*aggregateFixture, str
 			}
 		}
 	}})
-	if CurrentSchemaVersion != 87 || storedVersion(t, f.local.c) != 87 || len(aggregateLocalTables()) != 37 {
-		t.Fatal("current37 requires actual86 schema")
+	// Historical helper name retained; this factory always constructs CURRENT data.
+	if CurrentSchemaVersion != 88 || storedVersion(t, f.local.c) != 88 || len(aggregateLocalTables()) != 38 {
+		t.Fatal("current factory requires actual88 schema/private38")
 	}
 	before := receiverActive(t, f.local.c)
 	for i := range f.producers {
@@ -699,7 +700,7 @@ func TestRetainedCurrent37NonemptyExecutionWarmCold(t *testing.T) {
 			t.Fatal("current37 original header", err)
 		}
 		descriptor, _, err := directory.find(ctx, tx, "local", header.LocalID)
-		if err != nil || len(descriptor.ComponentInventories) != 37 {
+		if err != nil || len(descriptor.ComponentInventories) != 38 {
 			t.Fatal("current37 descriptor", err)
 		}
 		got, err := rebuildRetainedAggregate(ctx, tx, decoded, f.attempt.binding, directory, view)
@@ -735,8 +736,8 @@ func TestRetainedCurrent37NonemptyExecutionWarmCold(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	c.SetVoterConfigGate(func() bool { return true })
-	if storedVersion(t, c) != 87 || receiverActive(t, c) != active {
-		t.Fatal("cold current86 state changed")
+	if storedVersion(t, c) != 88 || receiverActive(t, c) != active {
+		t.Fatal("cold current88 state changed")
 	}
 	view, err = pki.CaptureHostTrust(ctx, f.local.pki, f.local.name)
 	if err != nil {
@@ -809,7 +810,7 @@ func TestRetainedCurrent37RejectsOriginalCorruption(t *testing.T) {
 			case "missing-history":
 				_, err = tx.Exec(ctx, `DELETE FROM local_automation_local_rows WHERE local_id=? AND section=2 AND ordinal=1`, address.localID)
 			case "extra-component":
-				_, err = tx.Exec(ctx, `INSERT INTO local_automation_local_rows(local_id,section,ordinal,record) VALUES(?,?,1,?)`, address.localID, 37, []byte("extra"))
+				_, err = tx.Exec(ctx, `INSERT INTO local_automation_local_rows(local_id,section,ordinal,record) VALUES(?,?,1,?)`, address.localID, 38, []byte("extra"))
 			case "malformed-frame":
 				_, err = tx.Exec(ctx, `UPDATE local_automation_local_rows SET record=? WHERE local_id=? AND section=2 AND ordinal=1`, []byte("malformed"), address.localID)
 			case "oversized-frame":

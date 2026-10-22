@@ -3,6 +3,7 @@ package contract
 import (
 	"bytes"
 	"encoding/json"
+	"strconv"
 )
 
 // Prefix is certified AND transactionally applied progress.
@@ -17,6 +18,7 @@ type Request struct {
 	Receipt  Receipt
 }
 type Projection struct {
+	Continuity    *ContinuityProjection
 	Execution     *ExecutionProjection
 	Target        *TargetProjection
 	KeyTransition *KeyTransitionProjection
@@ -32,6 +34,7 @@ type Projection struct {
 	ReplayOriginal bool
 }
 type Reduction struct {
+	ContinuityEffect   *IdentityContinuity
 	ExecutorEffect     *ExecutorGrant
 	ProgressEffect     *ExecutionProgress
 	TerminalEffect     *ExecutionTerminal
@@ -57,6 +60,10 @@ type Reduction struct {
 }
 
 func Scope(d Decision) string {
+	if d.Command.Kind == IdentityContinuityCommand {
+		b, _ := json.Marshal([]string{d.Command.ClusterUID, d.Command.ProjectUID, "identity-continuity", d.Command.ResourceUID, strconv.FormatUint(d.Command.Generation, 10)})
+		return string(b)
+	}
 	if targetCommand(d.Command.Kind) {
 		b, _ := json.Marshal([]string{d.Command.ClusterUID, d.Command.ProjectUID, "ordinary-target", d.Command.PrincipalID})
 		return string(b)
@@ -113,6 +120,10 @@ func Reduce(p Projection, d Decision) (Reduction, error) {
 		out.Receipt.State = "rejected"
 	} else {
 		switch d.Command.Kind {
+		case IdentityContinuityCommand:
+			if err := reduceContinuity(&out, p, d, a); err != nil {
+				return out, err
+			}
 		case "claim_executor", "record_progress", "complete_operation", "retire_artifact":
 			if err := reduceExecution(&out, p, d, a); err != nil {
 				return out, err

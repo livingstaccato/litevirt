@@ -11,6 +11,7 @@ import (
 // implemented control handlers. New semantic handlers add their own typed
 // schema here and extend the one reducer; they never inherit generic success.
 type Assignment struct {
+	Continuity    *IdentityContinuity      `json:"continuity,omitempty"`
 	Execution     *ExecutionAssignment     `json:"execution,omitempty"`
 	KeyTransition *KeyTransitionAssignment `json:"key_transition,omitempty"`
 	Ownership     *OwnershipAssignment     `json:"ownership,omitempty"`
@@ -59,6 +60,13 @@ func decodeFieldsObject(b []byte, out any, fields ...string) error {
 // ValidateSupportedCommand is shared by pre-slot admission and the direct
 // acceptor gate. It is structural capability validation, not a second reducer.
 func ValidateSupportedCommand(c Command) error {
+	if c.Kind == IdentityContinuityCommand {
+		if _, err := DecodeIdentityContinuityBody(c); err != nil {
+			return err
+		}
+		_, err := CanonicalCommand(c)
+		return err
+	}
 	if executionKind(c.Kind) {
 		if _, err := DecodeExecutionBody(c); err != nil {
 			return err
@@ -138,8 +146,17 @@ func DecodeAssignment(d Decision) (Assignment, error) {
 	if d.Command.Kind == "assign_identity" {
 		fields = append(fields, "identity")
 	}
+	if d.Command.Kind == IdentityContinuityCommand {
+		fields = append(fields, "continuity")
+	}
 	if err := decodeFields(d.Assignment, &a, fields...); err != nil {
 		return a, err
+	}
+	if d.Command.Kind == IdentityContinuityCommand {
+		var raw map[string]json.RawMessage
+		if json.Unmarshal(d.Assignment, &raw) != nil || a.Continuity == nil || decodeFieldsObject(raw["continuity"], a.Continuity, "cluster_uid", "uid", "original_witness", "generation", "parent") != nil || !continuityFields(raw["continuity"], false) || !validContinuity(*a.Continuity) {
+			return a, codedError(CodeValidation)
+		}
 	}
 	if a.Version != 1 || a.ClusterUID == "" || a.OperationID == "" || len(a.ClusterUID) > MaxStringBytes || len(a.OperationID) > MaxStringBytes {
 		return a, codedError(CodeValidation)
@@ -158,6 +175,9 @@ func ValidateSupportedDecision(d Decision) error {
 	a, err := DecodeAssignment(d)
 	if err != nil {
 		return err
+	}
+	if d.Command.Kind == IdentityContinuityCommand {
+		return validateContinuityAssignment(d, a)
 	}
 	if executionKind(d.Command.Kind) {
 		return validateExecutionAssignment(d, a)

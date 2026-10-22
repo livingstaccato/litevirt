@@ -70,6 +70,38 @@ func (c *Checker) noteAdvertised(peer string, caps []string) {
 // can claim it after this one has.
 var mintGrant = capabilities.ClaimGrantMinter()
 
+// RestoreAutomationContinuityReleaseUse restores a completed historical first
+// use barrier from a verified continuity lineage. It does not assert a current
+// peer list or sweep time, and never mints a grant. Ordinary WithFeature follows.
+func (c *Checker) RestoreAutomationContinuityReleaseUse(ctx context.Context, proof *corrosion.AutomationContinuityReleaseEvidence) error {
+	feature := capabilities.FeatureAutomationIdentityContinuity
+	info, ok := capabilities.LookupFeature(feature)
+	if !ok || info.Token != capabilities.Release202702V1 || c.db == nil {
+		return status.Error(codes.FailedPrecondition, "continuity release restoration unavailable")
+	}
+	if err := c.db.ValidateAutomationContinuityReleaseEvidence(ctx, proof); err != nil {
+		return err
+	}
+	// Validation has completed its local transaction. Marker ownership and the
+	// replicated use write must never run while holding the Client mutex.
+	c.mu.Lock()
+	base := c.activationMarkerBase
+	if base != "" {
+		c.activated[info.Token] = true
+	}
+	c.mu.Unlock()
+	if base == "" {
+		return status.Error(codes.Unavailable, "continuity activation marker unavailable")
+	}
+	if !c.DurablyLatched(info.Token) {
+		c.persistActivationMarker(base, info.Token)
+	}
+	if !c.DurablyLatched(info.Token) {
+		return status.Error(codes.Unavailable, "continuity activation marker not durable")
+	}
+	return corrosion.RecordReleaseFeatureUse(ctx, c.db, info.Token, string(feature), c.hostName, true)
+}
+
 // releaseAckTimeout bounds how long a first use waits for every recipient to
 // acknowledge its record. A var so tests can shrink it.
 var releaseAckTimeout = 30 * time.Second

@@ -21,6 +21,7 @@ var antiEntropyExcluded = map[string]string{
 	"local_automation_retained_deliveries":  "v82 node-local immutable retained delivery receipt/binding; never replicated or anti-entropy repaired",
 	"local_automation_retained_objects":     "v82 node-local retained object descriptors/addresses; never replicated or anti-entropy repaired",
 	"local_automation_retained_completions": "v82 node-local completion receipt after retained graph/candidate verification; never replicated or anti-entropy repaired",
+	"local_automation_identity_continuity":  "v88 local certified-history-derived continuity; never replicated or native authority",
 	"local_automation_executors":            "v86 local certified-history-derived execution projection; exact stage reset; never replicated or native authority",
 	"local_automation_execution_progress":   "v86 local certified-history-derived execution projection; exact stage reset; never replicated or native authority",
 	"local_automation_execution_artifacts":  "v86 local certified-history-derived execution projection; exact stage reset; never replicated or native authority",

@@ -62,6 +62,9 @@ type ownerPhase2Transport interface {
 }
 
 func (e *Engine) decideOwner(ctx context.Context, cfg *corrosion.VoterConfig, seq uint64, proposal *corrosion.ClaimValue, owner *corrosion.AutomationOwnerSubmission) (claims.Outcome, error) {
+	return e.decidePrepared(ctx, cfg, seq, proposal, owner, nil)
+}
+func (e *Engine) decidePrepared(ctx context.Context, cfg *corrosion.VoterConfig, seq uint64, proposal *corrosion.ClaimValue, owner *corrosion.AutomationOwnerSubmission, continuity *corrosion.AutomationIdentityContinuity) (claims.Outcome, error) {
 	key, err := corrosion.AutomationClaimKey(seq)
 	if err != nil {
 		return claims.Outcome{}, err
@@ -76,6 +79,17 @@ func (e *Engine) decideOwner(ctx context.Context, cfg *corrosion.VoterConfig, se
 		d, err := contractDecode(selected)
 		if err != nil {
 			return corrosion.Ballot{}, err
+		}
+		if d.Command.Kind == contract.IdentityContinuityCommand {
+			t, ok := e.transport.(continuityPhase2Transport)
+			if !ok {
+				return corrosion.Ballot{}, fail(CodeUnavailable)
+			}
+			native := continuity
+			if proposal == nil || selected.MustDigest() != proposal.MustDigest() {
+				native = nil
+			}
+			return t.PrepareContinuityPhase2(ctx, key, b, selected, cfg, native)
 		}
 		if !corrosion.IsAutomationOwnerKind(d.Command.Kind) {
 			return corrosion.Ballot{}, nil
@@ -126,6 +140,9 @@ func (e *Engine) submit(ctx context.Context, c Command) (Receipt, error) {
 	return e.submitOwner(ctx, c, nil)
 }
 func (e *Engine) submitOwner(ctx context.Context, c Command, owner *corrosion.AutomationOwnerSubmission) (Receipt, error) {
+	return e.submitPrepared(ctx, c, owner, nil)
+}
+func (e *Engine) submitPrepared(ctx context.Context, c Command, owner *corrosion.AutomationOwnerSubmission, continuity *corrosion.AutomationIdentityContinuity) (Receipt, error) {
 	if err := e.recover(ctx); err != nil && !(c.Kind == "initialize_cluster" && errors.Is(err, claims.ErrNoValue)) {
 		return Receipt{}, fmt.Errorf("recover automation: %w", fail(CodeUnavailable))
 	}
@@ -141,6 +158,10 @@ func (e *Engine) submitOwner(ctx context.Context, c Command, owner *corrosion.Au
 	}
 	if owner != nil && owner.TargetSessionID() != "" {
 		a.Owner = &contract.OwnerAssignment{SessionID: owner.TargetSessionID()}
+	}
+	if continuity != nil {
+		facts := continuity.Facts()
+		a.Continuity = &facts
 	}
 	assigned, _ := json.Marshal(a)
 	// Bounded work per call; a retry resumes from durable applied progress.
@@ -164,6 +185,11 @@ func (e *Engine) submitOwner(ctx context.Context, c Command, owner *corrosion.Au
 			}
 			if owner != nil {
 				if _, err := owner.Original(ctx, existing.Receipt); err != nil {
+					return Receipt{}, err
+				}
+			}
+			if continuity != nil {
+				if err := e.confirmContinuityOriginal(ctx, continuity, existing.Receipt); err != nil {
 					return Receipt{}, err
 				}
 			}
@@ -192,7 +218,7 @@ func (e *Engine) submitOwner(ctx context.Context, c Command, owner *corrosion.Au
 			return Receipt{}, err
 		}
 		value := corrosion.ClaimValue{Automation: &corrosion.AutomationClaimValue{Envelope: encoded}}
-		out, err := e.decideOwner(ctx, cfg, d.Sequence, &value, owner)
+		out, err := e.decidePrepared(ctx, cfg, d.Sequence, &value, owner, continuity)
 		if err != nil {
 			if owner != nil {
 				return Receipt{}, err

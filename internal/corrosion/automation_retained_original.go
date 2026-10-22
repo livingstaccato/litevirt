@@ -43,10 +43,16 @@ func retainedLocalLayout85Digest() string {
 	return retainedLocalLayoutDigestFor(aggregateLocalTables85())
 }
 
+func retainedLocalLayout87Digest() string {
+	return retainedLocalLayoutDigestFor(aggregateLocalTables87())
+}
+
 func retainedLocalTablesForDigest(digest string) ([]aggregateLocalTable, error) {
 	switch digest {
 	case retainedLocalLayoutDigest():
 		return aggregateLocalTables(), nil
+	case retainedLocalLayout87Digest():
+		return aggregateLocalTables87(), nil
 	case retainedLocalLayout83Digest():
 		return aggregateLocalTables83(), nil
 	case retainedLocalLayout85Digest():

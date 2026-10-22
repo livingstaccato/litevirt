@@ -559,3 +559,69 @@ func TestWithFeature_UnackedRefusalCarriesItsMarker(t *testing.T) {
 		t.Fatalf("unacknowledged first use = %v; want Unavailable carrying \"not yet acknowledged by\"", err)
 	}
 }
+
+func TestContinuityReleaseFirstUseClosed(t *testing.T) {
+	for _, mode := range []string{"supported", "old-decoder", "missing-ack", "delayed-ack", "maintenance-voter", "missing-marker"} {
+		t.Run(mode, func(t *testing.T) {
+			db := testCheckHostDB(t)
+			gateHost(t, db, "host-a", "active", "worker")
+			state := "active"
+			if mode == "maintenance-voter" {
+				state = "maintenance"
+			}
+			gateHost(t, db, "host-b", state, "worker")
+			db.SetMembersForTests(func() []corrosion.PeerInfo { return []corrosion.PeerInfo{{Name: "host-b"}} })
+			db.SetClusterPolicyGate(func() bool { return true })
+			c := NewChecker("host-a", "/unused", db)
+			c.SetActivationMarker(ActivationMarkerBase(t.TempDir()))
+			c.SetPeerPinger(func(context.Context, string) ([]string, time.Time, error) {
+				caps := capabilities.Supported()
+				if mode == "old-decoder" {
+					caps = withoutToken(caps, capabilities.Release202702V1)
+				}
+				return caps, time.Time{}, nil
+			})
+			var confirmations atomic.Int32
+			c.SetReleaseUseConfirmer(func(_ context.Context, host, token, feature string) (bool, error) {
+				if token != capabilities.Release202702V1 || feature != string(capabilities.FeatureAutomationIdentityContinuity) {
+					t.Error("wrong release boundary")
+				}
+				calls := confirmations.Add(1)
+				if mode == "missing-ack" || mode == "maintenance-voter" {
+					return false, nil
+				}
+				return mode != "delayed-ack" || calls > 1, nil
+			})
+			if mode == "maintenance-voter" {
+				db.SetMembersForTests(func() []corrosion.PeerInfo { return nil })
+				c.SetVoterSetForTest(func(context.Context) (map[string]bool, error) {
+					return map[string]bool{"host-a": true, "host-b": true}, nil
+				})
+			}
+			if mode == "missing-marker" {
+				c.SetActivationMarker("")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+			defer cancel()
+			wrote := false
+			err := c.WithFeature(ctx, capabilities.FeatureAutomationIdentityContinuity, func(_ context.Context, g capabilities.FeatureGrant) error {
+				if err := g.Check(capabilities.FeatureAutomationIdentityContinuity); err != nil {
+					return err
+				}
+				wrote = true
+				return nil
+			})
+			positive := mode == "supported" || mode == "delayed-ack"
+			if positive {
+				if err != nil || !wrote {
+					t.Fatal("complete first use refused", err)
+				}
+			} else if err == nil || wrote {
+				t.Fatal("incomplete first use admitted")
+			}
+			if mode == "maintenance-voter" && confirmations.Load() == 0 {
+				t.Fatal("maintenance voter omitted from ACK set")
+			}
+		})
+	}
+}

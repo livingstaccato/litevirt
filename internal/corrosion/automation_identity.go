@@ -24,8 +24,11 @@ func automationApplySemanticEffectsTx(ctx context.Context, tx *LocalTx, stage st
 	if actual != head {
 		return fmt.Errorf("semantic projection predecessor unavailable")
 	}
-	if r.Receipt.Code != "" && (r.ExecutorEffect != nil || r.ProgressEffect != nil || r.TerminalEffect != nil || len(r.ArtifactEffects) != 0 || r.TargetEffect != nil || len(r.TargetReservations) != 0 || r.EpochEffect != nil || len(r.RecipientEffects) > 0 || r.WrappingEffect != nil || r.WrappingPrevious != nil || r.IdentityEffect != nil || r.OwnerEffect != nil || r.ResourcePrevious != nil || r.ResourceEffect != nil || r.NameEffect != nil || len(r.BindingEffects) != 0 || r.AdmissionEffect != nil) {
+	if r.Receipt.Code != "" && (r.ExecutorEffect != nil || r.ProgressEffect != nil || r.TerminalEffect != nil || len(r.ArtifactEffects) != 0 || r.TargetEffect != nil || len(r.TargetReservations) != 0 || r.EpochEffect != nil || len(r.RecipientEffects) > 0 || r.WrappingEffect != nil || r.WrappingPrevious != nil || r.ContinuityEffect != nil || r.IdentityEffect != nil || r.OwnerEffect != nil || r.ResourcePrevious != nil || r.ResourceEffect != nil || r.NameEffect != nil || len(r.BindingEffects) != 0 || r.AdmissionEffect != nil) {
 		return fmt.Errorf("rejected decision has semantic effects")
+	}
+	if err := automationApplyContinuityEffectTx(ctx, tx, stage, next.ClusterUID, r); err != nil {
+		return err
 	}
 	if v := r.IdentityEffect; v != nil {
 		if v.ClusterUID != next.ClusterUID || v.UID == "" || v.Kind == "" || v.Alias == "" || v.Witness == "" || v.Generation == 0 || v.Generation > math.MaxInt64 {
@@ -90,6 +93,9 @@ func automationApplySemanticEffectsTx(ctx context.Context, tx *LocalTx, stage st
 // history remain intact. Call before replaying the first historical decision.
 func automationResetSemanticProjectionTx(ctx context.Context, tx *LocalTx, stage string) error {
 	if err := requireAutomationFull(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM local_automation_identity_continuity WHERE stage=?`, stage); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM local_automation_execution_terminals WHERE stage=?`, stage); err != nil {
@@ -223,6 +229,22 @@ func automationSemanticProjectionSourceTx(ctx context.Context, tx *LocalTx, stag
 	}
 	c := d.Command
 	switch c.Kind {
+	case contract.IdentityContinuityCommand:
+		body, err := contract.DecodeIdentityContinuityBody(c)
+		if err != nil {
+			return err
+		}
+		facts := &contract.ContinuityProjection{}
+		facts.Identity, err = automationIdentityRecordTx(ctx, tx, stage, body.UID)
+		if err != nil {
+			return err
+		}
+		facts.Existing, err = automationContinuityRecordTx(ctx, tx, stage, body.ClusterUID, body.UID, body.Generation)
+		if err != nil {
+			return err
+		}
+		p.Continuity = facts
+
 	case "rewrap_payload", "activate_key_epoch":
 		if p.KeyTransition == nil {
 			return fmt.Errorf("key transition causal projection was not prepared")

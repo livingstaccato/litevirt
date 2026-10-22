@@ -10,6 +10,7 @@ import (
 // fresh head certificate; every predecessor must hash to the next linked digest.
 // No peer-selected clock, CA, membership, or trust flag is accepted.
 func (c *Client) AutomationBeginRecovery(ctx context.Context, r AutomationRecord, v *ClaimVerifier) error {
+	r = copyContinuityRecord(r)
 	if err := validateAutomationRecordSize(r); err != nil {
 		return err
 	}
@@ -36,7 +37,7 @@ func (c *Client) AutomationBeginRecovery(ctx context.Context, r AutomationRecord
 	if request != nil && request.configDigest != cfg.MembersHash {
 		return fmt.Errorf("key transition differs from original certified config")
 	}
-	return c.ExecuteLocal(ctx, func(tx *LocalTx) error {
+	return c.executeContinuityMaterialization(ctx, r, continuityCertificate, func(tx *LocalTx) error {
 		if err := requireAutomationFull(ctx, tx); err != nil {
 			return err
 		}
@@ -96,6 +97,7 @@ func (c *Client) AutomationRecoveryNext(ctx context.Context) (next uint64, e err
 	return
 }
 func (c *Client) AutomationStagePredecessor(ctx context.Context, r AutomationRecord) error {
+	r = copyContinuityRecord(r)
 	if err := validateAutomationRecordSize(r); err != nil {
 		return err
 	}
@@ -115,7 +117,7 @@ func (c *Client) AutomationStagePredecessor(ctx context.Context, r AutomationRec
 	if err != nil {
 		return err
 	}
-	return c.ExecuteLocal(ctx, func(tx *LocalTx) error {
+	return c.executeContinuityMaterialization(ctx, r, continuityPredecessor, func(tx *LocalTx) error {
 		if err := requireAutomationFull(ctx, tx); err != nil {
 			return err
 		}

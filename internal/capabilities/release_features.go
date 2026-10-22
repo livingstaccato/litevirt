@@ -86,6 +86,7 @@ type FeatureInfo struct {
 // after the latch marks it used. Its other data, the cluster failback policy,
 // is nothing failback can act on without those records, so it shares the bit.
 var releaseFeatures = map[Feature]FeatureInfo{
+	FeatureAutomationIdentityContinuity: {Token: Release202702V1, Description: "Certified continuity of an existing automation identity and its current parent lifetime", Writers: []string{"internal/corrosion.Client.claimAcceptContinuityWithGrant", "internal/corrosion.Client.materializeAutomationContinuity", "internal/corrosion.Client.importAutomationContinuity"}},
 	FeatureVMLimits: {Token: Release202611V1, Description: "Per-VM CPU limit and shares, and NIC bandwidth limits",
 		Writers: []string{"internal/grpcapi.admitLimitedSpec", "internal/grpcapi.admitLimitUpdate",
 			"internal/corrosion.InsertVMWithReleaseFeatures", "internal/corrosion.MutateDesiredSpecWithReleaseFeatures"}},
@@ -233,7 +234,8 @@ const (
 // The features of release_2026_12_v1. Each name is written into a replicated
 // key once used, so it never changes.
 const (
-	FeatureFenceSSH Feature = "fence_ssh"
+	FeatureFenceSSH                     Feature = "fence_ssh"
+	FeatureAutomationIdentityContinuity Feature = "automation_identity_continuity"
 )
 
 // LookupFeature returns a declared feature's token and description.
@@ -277,6 +279,7 @@ const MarkerRollbackKey = "rollback"
 var rollbackRules = map[string]string{
 	Release202611V1: RollbackSafeIfUnused,
 	Release202612V1: RollbackSafeIfUnused,
+	Release202702V1: RollbackSafeIfUnused,
 }
 
 // RollbackRule returns the rollback rule token's marker carries, or "".
@@ -309,6 +312,7 @@ func Honoured(token string, feature Feature) bool {
 var ruleAwareBelow = map[string]bool{
 	Release202611V1: false,
 	Release202612V1: true,
+	Release202702V1: true,
 }
 
 // RuleHonouredBelow reports whether a rollback below token lands on a build

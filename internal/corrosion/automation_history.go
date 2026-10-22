@@ -163,7 +163,7 @@ func (c *Client) AutomationApplyOwned(ctx context.Context, owned *AutomationReco
 	if owned == nil {
 		return contract.Receipt{}, fmt.Errorf("missing owned automation record")
 	}
-	r := *owned
+	r := copyContinuityRecord(*owned)
 	if err := validateAutomationRecordSize(r); err != nil {
 		return contract.Receipt{}, err
 	}
@@ -265,7 +265,11 @@ type automationApplicationProvenance struct {
 }
 
 func (c *Client) automationApply(ctx context.Context, r AutomationRecord, d contract.Decision, digest string, cfg *VoterConfig, reduce AutomationReducer, replay bool) (out contract.Receipt, e error) {
-	e = c.ExecuteLocal(ctx, func(tx *LocalTx) error {
+	kind := continuityCertificate
+	if replay {
+		kind = continuityLocal
+	}
+	e = c.executeContinuityMaterialization(ctx, r, kind, func(tx *LocalTx) error {
 		source := automationApplicationProvenance{kind: automationAnchoredReplay}
 		if !replay {
 			current, err := automationAuthorityTx(ctx, tx, c.hostName, cfg.Generation)
@@ -705,6 +709,18 @@ func validateAutomationRecordSize(r AutomationRecord) error {
 
 func cloneAutomationProjection(projection AutomationProjection) AutomationProjection {
 	callbackProjection := projection
+	if projection.Continuity != nil {
+		facts := *projection.Continuity
+		if facts.Identity != nil {
+			v := *facts.Identity
+			facts.Identity = &v
+		}
+		if facts.Existing != nil {
+			v := *facts.Existing
+			facts.Existing = &v
+		}
+		callbackProjection.Continuity = &facts
+	}
 	if projection.Execution != nil {
 		// All nested requirements, dispositions, snapshots and exclusion
 		// predecessor requirements belong exclusively to the callback copy.

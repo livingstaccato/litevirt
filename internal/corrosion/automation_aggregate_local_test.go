@@ -22,7 +22,7 @@ import (
 func TestAggregateLocal86NonemptyExecutionSnapshot(t *testing.T) {
 	f, _ := executionReplayCompletedFixture(t)
 	ctx := context.Background()
-	if storedVersion(t, f.c) != 87 {
+	if storedVersion(t, f.c) != 88 {
 		t.Fatal("actual InitSchema86 required")
 	}
 	before := executionStorageSnapshot(t, f.c)
@@ -55,7 +55,7 @@ func TestAggregateLocal86NonemptyExecutionSnapshot(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if len(observation.counts) != 37 || observation.cursor != observation.prefix || observation.cursor != out.head {
+		if len(observation.counts) != 38 || observation.cursor != observation.prefix || observation.cursor != out.head {
 			return fmt.Errorf("current execution37 observation lost certified cursors")
 		}
 		return nil

@@ -308,7 +308,7 @@ func automationExecutionOriginalGrantTx(ctx context.Context, tx *LocalTx, source
 // by the actual composite PK in groups of at most64. No invented lower bound
 // can hide NULL, negative, foreign or malformed keys at the start of a scan.
 func automationExecutionRowsTx(ctx context.Context, tx *LocalTx, stage, table string, visit func(Row) error) error {
-	for _, d := range automationSemanticTables[automationExecutionTableStart:] {
+	for _, d := range automationSemanticTables[automationExecutionTableStart : automationExecutionTableStart+4] {
 		if d.table != table {
 			continue
 		}
@@ -401,7 +401,7 @@ func automationExecutionReference(g *contract.ExecutorGrant) contract.ExecutorRe
 
 func automationVerifyExecutionIndexesTx(ctx context.Context, tx *LocalTx) error {
 	type executionIndex struct{ name, columns string }
-	for _, d := range automationSemanticTables[automationExecutionTableStart:] {
+	for _, d := range automationSemanticTables[automationExecutionTableStart : automationExecutionTableStart+4] {
 		indexes := []executionIndex{{"sqlite_autoindex_" + d.table + "_1", d.primaryKey}}
 		if d.table == "local_automation_execution_artifacts" {
 			indexes = append(indexes, executionIndex{"automation_execution_artifact_key", "stage,cluster_uid,operation_id,artifact_kind,artifact_key"}, executionIndex{"automation_execution_artifact_object", "stage,cluster_uid,operation_id,backend,object_id"})
@@ -458,7 +458,7 @@ func automationExecutionCommandMatches(g *contract.ExecutorGrant, h automationEx
 // Both directions of original-history closure are checked. Row authenticity
 // alone cannot detect a deleted grant, deleted progress or a deleted terminal.
 func automationVerifyExecutionStageTx(ctx context.Context, tx *LocalTx, stage string, head contract.Prefix, source automationKeyHistorySource) error {
-	for _, descriptor := range automationSemanticTables[automationExecutionTableStart:] {
+	for _, descriptor := range automationSemanticTables[automationExecutionTableStart : automationExecutionTableStart+4] {
 		err := automationExecutionRowsTx(ctx, tx, stage, descriptor.table, func(row Row) error {
 			cluster, operation := row.String("cluster_uid"), row.String("operation_id")
 			if cluster != head.ClusterUID || head.Sequence == 0 {

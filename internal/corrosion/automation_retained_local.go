@@ -76,6 +76,9 @@ func (s receiverAuditStore) compareLocalSemantic(ctx context.Context, stage stri
 			// at the authenticated original cursor in its isolated stage.
 			missing := false
 			switch d.table {
+			case "local_automation_identity_continuity":
+				missing = s.localLayoutDigest == retainedLocalLayout83Digest() || s.localLayoutDigest == retainedLocalLayout85Digest() || s.localLayoutDigest == retainedLocalLayout87Digest()
+
 			case "local_automation_target_operations", "local_automation_target_reservations":
 				missing = s.localLayoutDigest == retainedLocalLayout83Digest()
 			case "local_automation_executors", "local_automation_execution_progress", "local_automation_execution_artifacts", "local_automation_execution_terminals":

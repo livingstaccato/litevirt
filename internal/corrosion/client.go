@@ -545,7 +545,8 @@ type Client struct {
 	repointReady atomic.Pointer[func(context.Context) bool]
 	// releaseFeatureGate runs a release feature's write through this node's
 	// release-feature gate (SetReleaseFeatureGate). Unset, it refuses.
-	releaseFeatureGate atomic.Pointer[ReleaseFeatureGate]
+	releaseFeatureGate        atomic.Pointer[ReleaseFeatureGate]
+	continuityReleaseRestorer atomic.Pointer[func(context.Context, *AutomationContinuityReleaseEvidence) error]
 	// claimCertVerifier supplies the verifier a proof's claim certificate is
 	// judged with before it may REPLACE another (SetProofClaimCertificate and
 	// the anti-entropy merge). Unset, or returning nil, nothing verifies and

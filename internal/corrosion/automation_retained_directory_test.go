@@ -125,7 +125,7 @@ func TestRetainedOriginal83LayoutDispatch(t *testing.T) {
 	if retainedLocalLayout83Digest() != "dad4d14693e2ba5b6637571a8a80f6ba3c37bf55094ff2be92dfae26bbb36b1a" {
 		t.Fatal("RETAINED83_ARCHIVED_LAYOUT_BYTES_CHANGED")
 	}
-	if len(old) != 31 || len(current) != 37 || old[29].table != "local_automation_lifetimes" || old[30].table != "local_automation_credential_issuance" || current[29].table != "local_automation_target_operations" || current[30].table != "local_automation_target_reservations" {
+	if len(old) != 31 || len(current) != 38 || old[29].table != "local_automation_lifetimes" || old[30].table != "local_automation_credential_issuance" || current[29].table != "local_automation_target_operations" || current[30].table != "local_automation_target_reservations" {
 		t.Fatal("RETAINED83_SECTION_SHIFT")
 	}
 	if retainedLocalLayout83Digest() == retainedLocalLayoutDigest() {

@@ -200,7 +200,7 @@ func TestRetainedOriginal84And85SharedLayout(t *testing.T) {
 
 func TestRetainedOriginal85Private33CannotUseExecution37Offsets(t *testing.T) {
 	prior := automationExecutionArchived85PrivateLayoutForTest()
-	if len(prior) != 33 || len(aggregateLocalTables()) != 37 {
+	if len(prior) != 33 || len(aggregateLocalTables()) != 38 {
 		t.Fatal("private layout inventory changed unexpectedly")
 	}
 	digest := retainedLocalLayoutDigestFor(prior)

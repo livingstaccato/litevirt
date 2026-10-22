@@ -10,7 +10,7 @@ import (
 func TestAutomationCut86NonemptyExecutionOriginalReplay(t *testing.T) {
 	f, _ := executionReplayCompletedFixture(t)
 	ctx := context.Background()
-	if storedVersion(t, f.c) != 87 {
+	if storedVersion(t, f.c) != 88 {
 		t.Fatal("actual InitSchema execution86 required")
 	}
 	before := executionStorageSnapshot(t, f.c)
@@ -22,7 +22,7 @@ func TestAutomationCut86NonemptyExecutionOriginalReplay(t *testing.T) {
 		t.Fatal("actual nonempty execution86 cut", err)
 	}
 	m, records := cutFixtureRead(t, f.c, id)
-	if m.SourceSchema != 87 || m.Codec != 1 || len(m.Inventory) != 9 {
+	if m.SourceSchema != 88 || m.Codec != 1 || len(m.Inventory) != 9 {
 		t.Fatal("execution86 cut changed certified inventory", m)
 	}
 	after := executionStorageSnapshot(t, f.c)

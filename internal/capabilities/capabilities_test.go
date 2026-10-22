@@ -380,6 +380,7 @@ var frozenReleaseFeatures = map[string][]Feature{
 	Release202612V1: {
 		"fence_ssh",
 	},
+	Release202702V1: {"automation_identity_continuity"},
 }
 
 // TestReleaseFeatureSetIsFrozen (m6): every release token's declared features

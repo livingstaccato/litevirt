@@ -93,7 +93,7 @@ func validateAutomationBallot(b Ballot, zeroOK bool) error {
 	return nil
 }
 
-func (c *Client) admitAutomationTx(ctx context.Context, tx *LocalTx, key ClaimKey, b Ballot, gen int64, v *ClaimValue, owner *ownerAcceptPreparation) (string, error) {
+func (c *Client) admitAutomationTx(ctx context.Context, tx *LocalTx, key ClaimKey, b Ballot, gen int64, v *ClaimValue, owner *ownerAcceptPreparation, continuity *continuityAcceptPreparation) (string, error) {
 	if !key.IsAutomation() {
 		return "", nil
 	}
@@ -107,6 +107,16 @@ func (c *Client) admitAutomationTx(ctx context.Context, tx *LocalTx, key ClaimKe
 		d, err := automationDecision(*v)
 		if err != nil || contract.ValidateSupportedDecision(d) != nil {
 			return RefusalInvalidValue, nil
+		}
+		// Includes own-row and anchored historical re-signing. No continuity
+		// signature bypasses local release protection through a history shortcut.
+		if d.Command.Kind == contract.IdentityContinuityCommand {
+			if continuity == nil {
+				return RefusalAutomationUnavailable, nil
+			}
+			if err := c.admitAutomationContinuityTx(ctx, tx, key, gen, *v, d, continuity); err != nil {
+				return "", err
+			}
 		}
 	}
 
@@ -179,6 +189,7 @@ func (c *Client) admitAutomationTx(ctx context.Context, tx *LocalTx, key ClaimKe
 			// branch can admit business work. Promise-only Prepare has no class.
 			switch d.Command.Kind {
 			case "initialize_cluster", "read_barrier":
+			case contract.IdentityContinuityCommand:
 			case "ensure_owner", "acquire_session", "handoff_session":
 				if refusal, err := c.admitAutomationOwnerTx(ctx, tx, key, gen, *v, cfg, d, owner); err != nil || refusal != "" {
 					return refusal, err

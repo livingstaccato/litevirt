@@ -158,7 +158,7 @@ func (c *Client) FreezeAutomationCut(ctx context.Context, generation int64, redu
 			return fmt.Errorf("unsupported automation cut source schema")
 		}
 		switch rows[0].Int("version") {
-		case 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87:
+		case 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88:
 			if err := automationVerifySemanticSchemaTx(ctx, tx); err != nil {
 				return err
 			}

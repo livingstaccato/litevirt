@@ -3450,6 +3450,11 @@ func (d *Daemon) wireServer(svc *grpcapi.Server) {
 	// Release features (capabilities.Feature) open through the checker's
 	// WithFeature: the release token's latch plus the replicated used bit.
 	svc.SetReleaseFeatureGate(d.checker)
+	if d.checker != nil {
+		d.db.SetAutomationContinuityReleaseRestorer(d.checker.RestoreAutomationContinuityReleaseUse)
+	} else {
+		d.db.SetAutomationContinuityReleaseRestorer(nil)
+	}
 }
 
 // runPCIScan performs the initial PCI device scan and stores results in the DB.

@@ -484,7 +484,7 @@ func (c *Client) ClaimPrepare(ctx context.Context, key ClaimKey, b Ballot, gen i
 		return res, nil
 	}
 	err := c.ExecuteLocal(ctx, func(tx *LocalTx) error {
-		if r, err := c.admitAutomationTx(ctx, tx, key, b, gen, nil, nil); err != nil {
+		if r, err := c.admitAutomationTx(ctx, tx, key, b, gen, nil, nil, nil); err != nil {
 			return err
 		} else if r != "" {
 			res.Refusal = r
@@ -562,11 +562,14 @@ var errClaimNeedsSourceCheck = errors.New("claim value needs the source cross-ch
 // transaction: it is network I/O and must not hold the database lock.
 func (c *Client) ClaimAccept(ctx context.Context, key ClaimKey, b Ballot, v ClaimValue, gen int64,
 	signer *ClaimSigner, probe OwnerProbe) (AcceptResult, error) {
-	return c.claimAccept(ctx, key, b, v, gen, signer, probe, nil)
+	if key.IsAutomation() && isAutomationContinuityValue(v) {
+		return c.claimAcceptContinuityRecovery(ctx, key, b, v, gen, signer, continuityLocal, ClaimCertificate{})
+	}
+	return c.claimAccept(ctx, key, b, v, gen, signer, probe, nil, nil)
 }
 
 func (c *Client) claimAccept(ctx context.Context, key ClaimKey, b Ballot, v ClaimValue, gen int64,
-	signer *ClaimSigner, probe OwnerProbe, owner *ownerAcceptPreparation) (AcceptResult, error) {
+	signer *ClaimSigner, probe OwnerProbe, owner *ownerAcceptPreparation, continuity *continuityAcceptPreparation) (AcceptResult, error) {
 	res := AcceptResult{Voter: c.hostName}
 	digest, err := v.Digest()
 	if err != nil {
@@ -591,7 +594,7 @@ func (c *Client) claimAccept(ctx context.Context, key ClaimKey, b Ballot, v Clai
 	for {
 		res = AcceptResult{Voter: c.hostName}
 		err := c.executeLocal(ctx, func(tx *LocalTx) error {
-			if r, err := c.admitAutomationTx(ctx, tx, key, b, gen, &v, owner); err != nil {
+			if r, err := c.admitAutomationTx(ctx, tx, key, b, gen, &v, owner, continuity); err != nil {
 				return err
 			} else if r != "" {
 				res.Refusal = r
@@ -666,6 +669,16 @@ func (c *Client) claimAccept(ctx context.Context, key ClaimKey, b Ballot, v Clai
 			a, err := signer.Sign(key, gen, b, digest, st.incarnation)
 			if err != nil {
 				return err
+			}
+			if continuity != nil {
+				cfg, err := automationEstablishedAuthorityTx(ctx, tx, c.hostName, gen)
+				if err != nil {
+					return err
+				}
+				cert := ClaimCertificate{Key: key, ConfigGeneration: gen, Ballot: b, ValueDigest: digest, Accepts: []ClaimAccept{a}}
+				if err := continuity.proof.verifier.Verify(cert, CertExpectation{Key: key, ConfigGeneration: gen, ValueDigest: digest, Electorate: cfg.Members, Quorum: 1}); err != nil {
+					return err
+				}
 			}
 			row.Promised, row.Accepted = b, b
 			row.Value, row.ValueDigest, row.Accept = &v, digest, &a
@@ -873,7 +886,14 @@ func (c *Client) ClaimStatesForImport(ctx context.Context, gen int64) (ClaimImpo
 // relative to the generation it replaces.
 func (c *Client) ImportClaimsAndAdopt(ctx context.Context, newGen int64, from []string, states []ClaimVoterState) (int, error) {
 	imported := 0
-	err := c.ExecuteLocal(ctx, func(tx *LocalTx) error {
+	// Copy before any release gate or network owner can run. Import remains
+	// inert accepted state: it never creates this voter's signed lineage.
+	copied, err := copyContinuityImportStates(states)
+	if err != nil {
+		return 0, err
+	}
+	states = copied
+	err = c.executeContinuityImport(ctx, states, func(tx *LocalTx) error {
 		st, err := readStandingTx(ctx, tx, c.hostName)
 		if err != nil {
 			return err

@@ -29,6 +29,7 @@ var automationSemanticTables = []struct{ table, columns, integers, primaryKey, n
 	{"local_automation_execution_progress", "stage,cluster_uid,operation_id,resource_uid,applied_sequence,progress_json", "applied_sequence", "stage,cluster_uid,operation_id", ""},
 	{"local_automation_execution_artifacts", "stage,cluster_uid,operation_id,artifact_id,resource_uid,artifact_key,artifact_kind,backend,object_id,applied_sequence,artifact_json", "applied_sequence", "stage,cluster_uid,operation_id,artifact_id", ""},
 	{"local_automation_execution_terminals", "stage,cluster_uid,operation_id,resource_uid,applied_sequence,terminal_json", "applied_sequence", "stage,cluster_uid,operation_id", ""},
+	{"local_automation_identity_continuity", "stage,cluster_uid,uid,generation,original_witness,parent_kind,parent_alias,parent_realm,parent_birth", "generation", "stage,uid,generation", ""},
 }
 
 func automationVerifySemanticSchemaTx(ctx context.Context, tx *LocalTx) error {
@@ -67,7 +68,10 @@ func automationVerifySemanticSchemaTx(ctx context.Context, tx *LocalTx) error {
 	if err := automationVerifyKeyIndexesTx(ctx, tx); err != nil {
 		return err
 	}
-	return automationVerifyExecutionIndexesTx(ctx, tx)
+	if err := automationVerifyExecutionIndexesTx(ctx, tx); err != nil {
+		return err
+	}
+	return automationVerifyContinuityIndexesTx(ctx, tx)
 }
 
 func automationVerifySemanticStageTx(ctx context.Context, tx *LocalTx, stage string) error {

@@ -125,7 +125,50 @@ func aggregateLocalTables85() []aggregateLocalTable {
 	}
 }
 
-// Current86 preserves the old semantic prefix and adds target projections
+// Frozen signed87 private37 literals; independent of the growing semantic list.
+func aggregateLocalTables87() []aggregateLocalTable {
+	return []aggregateLocalTable{
+		{"local_recovery_claims", "target_kind,target_name,owner_epoch,attempt,promised_round, promised_coord, promised_nonce, accepted_round, accepted_coord,\n\taccepted_nonce, value_json, value_digest, accept_json, config_generation,updated_at", "target_kind,target_name,owner_epoch,attempt", "ttiiitbitbtttit", false},
+		{"local_incarnation_claims", "target_kind,target_name,incarnation,owner_epoch,attempt,promised_round, promised_coord, promised_nonce, accepted_round, accepted_coord,\n\taccepted_nonce, value_json, value_digest, accept_json, config_generation,updated_at", "target_kind,target_name,incarnation,owner_epoch,attempt", "tttiiitbitbtttit", false},
+		{"local_automation_history", "sequence,digest,value_json,certificate,receipt_json,anchor_sequence", "sequence", "itttti", false},
+		{"local_automation_anchors", "sequence,digest,generation,members_hash,certificate", "sequence", "ititt", false},
+		{"local_automation_requests", "scope,request_id,identity,receipt_json,operation_id", "scope,request_id", "ttbtt", false},
+		{"local_automation_authority", "id,generation,members_hash,incarnation,bootstrap_principal,bootstrap_request,provenance", "id", "iittttt", false},
+		{"local_voter_adoption", "generation,imported_from,adopted_at", "generation", "itt", false},
+		{"local_voter_seals", "generation,reason,sealed_at", "generation", "itt", false},
+		{"voter_configs", "generation,members_json,members_hash,change,certificate,created_by,created_at,deleted_at,updated_at", "generation", "ittttttTt", false},
+		{"local_automation_prefix", "id,cluster_uid,sequence,digest", "id", "itit", false},
+		{"local_voter_incarnation", "id,incarnation,created_at", "id", "itt", false},
+		{"local_automation_recovery", "id,sequence,digest,next_sequence,next_digest,base_sequence,base_digest,generation,members_hash,certificate", "id", "iititititt", false},
+		{"local_automation_staging", "sequence,digest,value_json,certificate", "sequence", "ittt", false},
+		{"reseed_in_progress", "id,started_at,source", "id", "itt", false},
+		{"reseed_generation", "id,generation", "id", "ii", false},
+		{"schema_state", "id,version,updated_at", "id", "iit", false},
+		{"local_automation_cuts", "id,generation,incarnation,metadata,root", "id", "titbt", false},
+		{"local_automation_cut_records", "cut_id,section,ordinal,record", "cut_id,section,ordinal", "tiib", false},
+		{"local_automation_identities", "stage,uid,cluster_uid,project_uid,kind,alias,witness,generation,retired", "stage,uid", "tttttttii", true},
+		{"local_automation_aliases", "stage,cluster_uid,project_scope,kind,alias,uid,generation", "stage,cluster_uid,project_scope,kind,alias", "tttttti", true},
+		{"local_automation_owners", "stage,cluster_uid,project_uid,owner_id,founder_principal_uid,session_id,session_principal_uid,activation", "stage,cluster_uid,project_uid,owner_id", "ttttttti", true},
+		{"local_automation_semantic_heads", "stage,cluster_uid,sequence,digest", "stage", "ttit", true},
+		{"local_automation_resources", "stage,uid,cluster_uid,project_uid,name,domain_uuid,incarnation,owner_id,management_key,binding_generation,revision,retired,last_operation_id,original_operation_id,applied_sequence", "stage,uid", "tttttttttititti", true},
+		{"local_automation_names", "stage,cluster_uid,name,resource_uid,generation,disposition,retirement_operation_id", "stage,cluster_uid,name", "ttttitt", true},
+		{"local_automation_bindings", "stage,cluster_uid,project_uid,owner_id,management_key,creation_generation,resource_uid,operation_id,revision,retired", "stage,cluster_uid,project_uid,owner_id,management_key,creation_generation", "tttttittti", true},
+		{"local_automation_admissions", "stage,operation_id,cluster_uid,project_uid,owner_id,management_key,resource_uid,request_id,principal_uid,method,payload_id,binding_generation,admitted_generation,sequence,configuration_json", "stage,operation_id", "tttttttttttiiit", true},
+		{"local_automation_key_epochs", "stage,cluster_uid,recipient_epoch,membership_generation,config_digest,equality_epoch,predecessor_activation_sequence,activation_sequence", "stage,cluster_uid,recipient_epoch", "tttittii", true},
+		{"local_automation_key_recipients", "stage,cluster_uid,recipient_epoch,membership_generation,config_digest,host,host_incarnation,admitted_at,admission_serial,voter_incarnation,key_id,recipient,enrollment_ref,recipient_ack_ref,equality_ack_ref,first_sequence", "stage,cluster_uid,recipient_epoch,host", "tttittitttttttti", true},
+		{"local_automation_payload_wrappings", "stage,cluster_uid,operation_id,payload_id,admission_sequence,wrapping_sequence,wrapping_digest,recipient_epoch,membership_generation,config_digest", "stage,cluster_uid,operation_id,wrapping_sequence", "ttttiittit", true},
+		{"local_automation_target_operations", "stage,cluster_uid,operation_id,kind,project_uid,principal_uid,request_id,resource_uid,target_name,sequence,decision_digest,body_json,assignment_json", "stage,cluster_uid,operation_id", "tttttttttittt", true},
+		{"local_automation_target_reservations", "stage,cluster_uid,target_key,operation_id,sequence", "stage,cluster_uid,target_key", "tttti", true},
+		{"local_automation_executors", "stage,cluster_uid,operation_id,resource_uid,executor_generation,grant_sequence,grant_digest,admission_sequence,admission_digest,grant_json", "stage,cluster_uid,operation_id", "ttttiititt", true},
+		{"local_automation_execution_progress", "stage,cluster_uid,operation_id,resource_uid,applied_sequence,progress_json", "stage,cluster_uid,operation_id", "ttttit", true},
+		{"local_automation_execution_artifacts", "stage,cluster_uid,operation_id,artifact_id,resource_uid,artifact_key,artifact_kind,backend,object_id,applied_sequence,artifact_json", "stage,cluster_uid,operation_id,artifact_id", "tttttttttit", true},
+		{"local_automation_execution_terminals", "stage,cluster_uid,operation_id,resource_uid,applied_sequence,terminal_json", "stage,cluster_uid,operation_id", "ttttit", true},
+		{"local_automation_lifetimes", "kind,name,witness,origin,retired,valid", "kind,name,witness", "ttttii", false},
+		{"local_automation_credential_issuance", "kind,credential_id,username,witness,principal_uid,cluster_uid,valid", "kind,credential_id", "tttttti", false},
+	}
+}
+
+// Current88 preserves the old semantic prefix and adds derived projections
 // before the two private observation suffixes. Old frames use their own layout.
 func aggregateLocalTables() []aggregateLocalTable {
 	old := aggregateLocalTables83()

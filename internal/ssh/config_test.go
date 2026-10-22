@@ -3,6 +3,8 @@ package ssh
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/pem"
 	"fmt"
 	"net"
@@ -494,7 +496,7 @@ func TestResolveConfig_DefaultKnownHostsIsHOME(t *testing.T) {
 }
 
 // startAgent serves keys over a unix socket and exports it as SSH_AUTH_SOCK.
-func startAgent(t *testing.T, keys ...ed25519.PrivateKey) {
+func startAgent(t *testing.T, keys ...any) {
 	t.Helper()
 	kr := agent.NewKeyring()
 	for _, k := range keys {
@@ -571,4 +573,97 @@ func TestNewClient_IdentitiesOnlyKeepsTheAgent(t *testing.T) {
 			t.Fatal("an agent key that is not a configured identity was offered under IdentitiesOnly")
 		}
 	})
+}
+
+// A configured private IdentityFile is offered even when the agent holds only
+// unrelated keys: the client tries "publickey" once, so the agent's keys and
+// the files must go in one method.
+func TestNewClient_IdentityFileWithBusyAgent(t *testing.T) {
+	for _, io := range []bool{true, false} {
+		name := "IdentitiesOnly-no"
+		if io {
+			name = "IdentitiesOnly-yes"
+		}
+		t.Run(name, func(t *testing.T) {
+			home, pub := sshHome(t, "deploy")
+			_, other, _ := ed25519.GenerateKey(rand.Reader)
+			startAgent(t, other)
+			srv := startFakeSSHD(t, pub)
+			cfg := "Host 127.0.0.1\n  IdentityFile ~/.ssh/deploy\n"
+			if io {
+				cfg += "  IdentitiesOnly yes\n"
+			}
+			writeSSHConfig(t, home, cfg)
+			c, err := NewClient("deploy@127.0.0.1:" + srv.port())
+			if err != nil {
+				t.Fatalf("the IdentityFile was never offered: %v", err)
+			}
+			c.Close()
+		})
+	}
+}
+
+// No config: a default key file is still offered when the agent holds only
+// unrelated keys.
+func TestNewClient_DefaultKeyFileWithBusyAgent(t *testing.T) {
+	_, pub := sshHome(t, "id_ed25519")
+	_, other, _ := ed25519.GenerateKey(rand.Reader)
+	startAgent(t, other)
+	srv := startFakeSSHD(t, pub)
+	c, err := NewClient("deploy@127.0.0.1:" + srv.port())
+	if err != nil {
+		t.Fatalf("default key file shadowed by the agent: %v", err)
+	}
+	c.Close()
+}
+
+// IdentityFile k with only k.pub on disk and the private key in the agent
+// (hardware token): the .pub sibling is what identifies the key.
+func TestNewClient_PubSiblingNoPrivateFile(t *testing.T) {
+	home, _ := sshHome(t, "unused")
+	pk, sk, _ := ed25519.GenerateKey(rand.Reader)
+	pub, _ := ssh.NewPublicKey(pk)
+	os.WriteFile(filepath.Join(home, ".ssh", "k.pub"), ssh.MarshalAuthorizedKey(pub), 0o644)
+	startAgent(t, sk)
+	srv := startFakeSSHD(t, pub)
+	writeSSHConfig(t, home, "Host 127.0.0.1\n  IdentitiesOnly yes\n  IdentityFile ~/.ssh/k\n")
+	c, err := NewClient("deploy@127.0.0.1:" + srv.port())
+	if err != nil {
+		t.Fatalf("IdentityFile k + k.pub with the key in the agent: %v", err)
+	}
+	c.Close()
+}
+
+// A passphrase-protected legacy PEM key has no clear public half: only its
+// .pub sibling says which agent key it is.
+func TestNewClient_PubSiblingLegacyEncryptedPEM(t *testing.T) {
+	home, _ := sshHome(t, "unused")
+	rk, _ := rsa.GenerateKey(rand.Reader, 2048)
+	//nolint:staticcheck
+	blk, err := x509.EncryptPEMBlock(rand.Reader, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(rk), []byte("pw"), x509.PEMCipherAES256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(home, ".ssh", "id_rsa"), pem.EncodeToMemory(blk), 0o600)
+	pub, _ := ssh.NewPublicKey(&rk.PublicKey)
+	os.WriteFile(filepath.Join(home, ".ssh", "id_rsa.pub"), ssh.MarshalAuthorizedKey(pub), 0o644)
+	startAgent(t, rk)
+	srv := startFakeSSHD(t, pub)
+	writeSSHConfig(t, home, "Host *\n  IdentitiesOnly yes\n")
+	c, err := NewClient("deploy@127.0.0.1:" + srv.port())
+	if err != nil {
+		t.Fatalf("Host * IdentitiesOnly, encrypted PEM id_rsa + .pub, key in the agent: %v", err)
+	}
+	c.Close()
+}
+
+// A config ssh refuses for its permissions says so and what to do.
+func TestResolveConfig_BadPermissionsHint(t *testing.T) {
+	home, _ := sshHome(t, "id_ed25519")
+	writeSSHConfig(t, home, "Host h\n  Port 2200\n")
+	os.Chmod(filepath.Join(home, ".ssh", "config"), 0o666)
+	_, err := resolveConfig("h", "", "22", false, false, 0)
+	if err == nil || !strings.Contains(err.Error(), "sudo -E") {
+		t.Fatalf("err = %v, want the permissions refusal to say what to do", err)
+	}
 }

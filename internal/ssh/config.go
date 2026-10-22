@@ -65,9 +65,8 @@ var sshG = func(timeout time.Duration, args ...string) ([]byte, error) {
 // makes ssh skip /etc/ssh/ssh_config.
 //
 // A command-line user or port is passed as -l/-p, so it beats the config the
-// way it does for ssh. A missing ssh binary or an unreadable config falls back
-// to the old defaults with a warning, because provisioning from a workstation
-// without OpenSSH worked before and must keep working.
+// way it does for ssh. With no config file the old defaults apply even without
+// an ssh binary; a config that ssh -G cannot read is an error.
 func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.Duration) (*resolved, error) {
 	if host == "" || strings.HasPrefix(host, "-") || strings.ContainsAny(host, " \t\r\n\x00") {
 		return nil, fmt.Errorf("invalid SSH host %q", host)
@@ -88,7 +87,7 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 			haveConfig = true
 		}
 		// ssh would default this to the passwd home; pin it to $HOME so the
-		// file lv checks is the one the rest of lv uses.
+		// file litevirt checks is the one the rest of litevirt uses.
 		defaultKH = filepath.Join(home, ".ssh", "known_hosts")
 	}
 	wrapper.WriteString("Host *\n  User " + userSentinel + "\n")
@@ -99,9 +98,14 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 	// files, StrictHostKeyChecking): with a config present, failing to read it
 	// refuses. With none, there is nothing to honour and the old defaults hold.
 	fail := func(err error) (*resolved, error) {
+		if haveConfig && strings.Contains(err.Error(), "Bad owner or permissions") {
+			return nil, fmt.Errorf("cannot read ~/.ssh/config for %s: %w "+
+				"(ssh refuses a config not owned by the current user or writable by others; "+
+				"under sudo, run litevirt as the config's owner or without `sudo -E`)", host, err)
+		}
 		if haveConfig {
 			return nil, fmt.Errorf("cannot read ~/.ssh/config for %s: %w "+
-				"(lv reads it with `ssh -G`; fix the config, or move it aside to use lv's defaults)", host, err)
+				"(litevirt reads it with `ssh -G`; fix the config, or move it aside to use lv's defaults)", host, err)
 		}
 		return nil, nil
 	}
@@ -154,10 +158,10 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 	// not refused: every caller dialled the address directly before, and a
 	// host reachable both ways must keep working.
 	if pj := got.one("proxyjump"); pj != "" && pj != "none" {
-		warnf("%s sets ProxyJump %s in your ssh config; lv does not support it and dials %s:%s directly", host, pj, r.Hostname, r.Port)
+		warnf("%s sets ProxyJump %s in your ssh config; litevirt does not support it and dials %s:%s directly", host, pj, r.Hostname, r.Port)
 	}
 	if pc := got.one("proxycommand"); pc != "" && pc != "none" {
-		warnf("%s sets ProxyCommand in your ssh config; lv does not support it and dials %s:%s directly", host, r.Hostname, r.Port)
+		warnf("%s sets ProxyCommand in your ssh config; litevirt does not support it and dials %s:%s directly", host, r.Hostname, r.Port)
 	}
 
 	for _, id := range got["identityfile"] {
@@ -166,7 +170,7 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 		}
 		p, ok := expandIdentity(id, host, r.Hostname, eff, r.Port)
 		if !ok {
-			warnf("ignoring IdentityFile %q for %s: it uses a %% token lv does not expand", id, host)
+			warnf("ignoring IdentityFile %q for %s: it uses a %% token litevirt does not expand", id, host)
 			continue
 		}
 		r.IdentityFiles = append(r.IdentityFiles, p)
@@ -184,7 +188,7 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 		if !ok {
 			// A known_hosts file we cannot name is never silently dropped:
 			// it could hold the key that contradicts the default store.
-			return nil, fmt.Errorf("UserKnownHostsFile %q for %s uses a %% token lv does not expand", kh, host)
+			return nil, fmt.Errorf("UserKnownHostsFile %q for %s uses a %% token litevirt does not expand", kh, host)
 		}
 		r.KnownHosts = append(r.KnownHosts, p)
 	}
@@ -221,7 +225,7 @@ func resolveTarget(target string, timeout time.Duration) (*Target, error) {
 // alias, the given host otherwise.
 func (t *Target) Host() string { return t.cfg.Hostname }
 
-// ResolveHostName returns the address lv would dial for target once
+// ResolveHostName returns the address litevirt would dial for target once
 // ~/.ssh/config is applied: HostName for an alias, the given host otherwise.
 // Provisioning commands use it for the DNS step, the certificate SAN and the
 // recorded cluster address, so those and the dial name the same machine.

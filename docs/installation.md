@@ -319,7 +319,7 @@ by OpenSSH itself. Only the per-user `~/.ssh/config` is read; `/etc/ssh/ssh_conf
 - A user or port written on the command line (`admin@alias`, `alias:2222`) beats the
   config; the config beats the defaults (user `root`, port 22).
 - Configured `IdentityFile` entries are tried before `~/.ssh/id_ed25519`, `id_ecdsa`
-  and `id_rsa`, after the ssh agent. `%d %h %n %p %r %u %%` are expanded; an
+  and `id_rsa`, after the agent's keys, in the same publickey attempt, so a busy agent does not hide them. `%d %h %n %p %r %u %%` are expanded; an
   `IdentityFile` with any other `%` token is skipped with a warning. `IdentitiesOnly yes`
   limits the ssh agent (which is still used) and the key files to the configured identities,
   matched by public key, so an `IdentityFile` that is a `.pub` file whose private key is in the agent works.
@@ -337,6 +337,7 @@ by OpenSSH itself. Only the per-user `~/.ssh/config` is read; `/etc/ssh/ssh_conf
 - With no `~/.ssh/config` the defaults apply even without an `ssh` binary. If a config exists
   but `ssh -G` fails or takes longer than 10 seconds, the command refuses with an error naming
   `ssh -G`, rather than dropping what the config pins; move the config aside to use the defaults.
+  `ssh` also refuses a config it does not own: under `sudo -E`, run lv as the config's owner or without `-E`.
 
 ## CLI setup
 

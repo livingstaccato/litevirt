@@ -43,15 +43,23 @@ func RefuseInitOfAClusterMember(ctx context.Context, sshTarget string, force boo
 	if force {
 		return nil
 	}
-	host, _, err := parseSSHTarget(sshTarget)
+	rt, err := ssh.Resolve(sshTarget)
 	if err != nil {
 		return nil // HostInit reports a bad target itself
 	}
-	host, err = ssh.ResolveHostName(sshTarget)
-	if err != nil {
+	return RefuseInitOfAClusterMemberResolved(ctx, sshTarget, rt, force)
+}
+
+// RefuseInitOfAClusterMemberResolved is the check for a target already
+// resolved through the ssh config.
+func RefuseInitOfAClusterMemberResolved(ctx context.Context, sshTarget string, rt *ssh.Target, force bool) error {
+	if force {
 		return nil
 	}
-	addr, err := resolveHost(host)
+	if _, _, err := parseSSHTarget(sshTarget); err != nil {
+		return nil // HostInit reports a bad target itself
+	}
+	addr, err := resolveHost(rt.Host())
 	if err != nil {
 		return nil
 	}

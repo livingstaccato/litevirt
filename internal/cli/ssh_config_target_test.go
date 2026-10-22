@@ -9,6 +9,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/pki"
+	"github.com/litevirt/litevirt/internal/ssh"
 	"google.golang.org/grpc"
 )
 
@@ -105,5 +106,28 @@ func TestRefuseInitOfAClusterMember_UsesHostName(t *testing.T) {
 	_ = RefuseInitOfAClusterMember(context.Background(), "labnode", false)
 	if len(*asked) == 0 || (*asked)[0] != "node.lab.test" {
 		t.Fatalf("asked %v, want the ssh config HostName first", *asked)
+	}
+}
+
+// `lv host init` looks at the ssh config once: the cluster-member check and
+// the init both take the already-resolved target, so a config that answers
+// differently on a second run cannot split the SAN from the dial.
+func TestHostInit_ResolvesTheSSHConfigOnce(t *testing.T) {
+	_ = sshAliasEnv(t, "127.0.0.1")
+	counter := filepath.Join(t.TempDir(), "runs")
+	home := os.Getenv("HOME")
+	cfg := "Match exec \"echo x >> " + counter + "\"\n  Port 1\nHost labnode\n  HostName 127.0.0.1\n  User deploy\n  Port 1\n"
+	if err := os.WriteFile(filepath.Join(home, ".ssh", "config"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := ssh.Resolve("labnode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = RefuseInitOfAClusterMemberResolved(context.Background(), "labnode", rt, false)
+	_ = HostInitResolved(context.Background(), "labnode", rt, "node-9", false)
+	b, _ := os.ReadFile(counter)
+	if n := strings.Count(string(b), "x"); n != 1 {
+		t.Fatalf("ssh -G ran %d times for one init, want 1", n)
 	}
 }

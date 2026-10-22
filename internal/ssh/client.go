@@ -335,8 +335,9 @@ func authMethods() ([]ssh.AuthMethod, error) { return authMethodsFor(nil, false)
 // authMethodsFor is authMethods with the config's IdentityFile entries tried
 // before the default key files.
 func authMethodsFor(extraKeys []string, identitiesOnly bool) ([]ssh.AuthMethod, error) {
-	var methods []ssh.AuthMethod
 	var tried []string
+	// agentSigners is nil without a usable agent.
+	var agentSigners func() ([]ssh.Signer, error)
 
 	// Try SSH agent first
 	sock := os.Getenv("SSH_AUTH_SOCK")
@@ -374,7 +375,7 @@ func authMethodsFor(extraKeys []string, identitiesOnly bool) ([]ssh.AuthMethod, 
 					// IdentityFile whose private half lives in the agent works).
 					want := identityPublicKeys(identities)
 					tried = append(tried, fmt.Sprintf("agent: IdentitiesOnly yes, %d identity public key(s) to match", len(want)))
-					methods = append(methods, ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
+					agentSigners = func() ([]ssh.Signer, error) {
 						all, err := ac.Signers()
 						if err != nil {
 							return nil, err
@@ -386,9 +387,9 @@ func authMethodsFor(extraKeys []string, identitiesOnly bool) ([]ssh.AuthMethod, 
 							}
 						}
 						return keep, nil
-					}))
+					}
 				} else {
-					methods = append(methods, ssh.PublicKeysCallback(ac.Signers))
+					agentSigners = ac.Signers
 				}
 			}
 		}
@@ -399,6 +400,7 @@ func authMethodsFor(extraKeys []string, identitiesOnly bool) ([]ssh.AuthMethod, 
 	if !identitiesOnly {
 		keyFiles = append(append([]string(nil), extraKeys...), defaults...)
 	}
+	var fileSigners []ssh.Signer
 	for _, kf := range keyFiles {
 		key, err := loadPrivateKey(kf)
 		if err != nil {
@@ -408,14 +410,40 @@ func authMethodsFor(extraKeys []string, identitiesOnly bool) ([]ssh.AuthMethod, 
 			continue
 		}
 		tried = append(tried, fmt.Sprintf("key %s: loaded", filepath.Base(kf)))
-		methods = append(methods, ssh.PublicKeys(key))
+		fileSigners = append(fileSigners, key)
 	}
 
-	if len(methods) == 0 {
+	if agentSigners == nil && len(fileSigners) == 0 {
 		return nil, fmt.Errorf("no SSH auth methods available:\n  %s", joinLines(tried))
 	}
 
-	return methods, nil
+	// ONE publickey method: the client tries each method name once, so an
+	// agent whose keys all fail would otherwise use up "publickey" and the key
+	// files after it would never be offered. Agent keys first, then the files,
+	// without repeating a key.
+	return []ssh.AuthMethod{ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
+		var all []ssh.Signer
+		seen := map[string]bool{}
+		if agentSigners != nil {
+			if as, err := agentSigners(); err == nil {
+				for _, sg := range as {
+					if k := string(sg.PublicKey().Marshal()); !seen[k] {
+						seen[k] = true
+						all = append(all, sg)
+					}
+				}
+			} else if len(fileSigners) == 0 {
+				return nil, err
+			}
+		}
+		for _, sg := range fileSigners {
+			if k := string(sg.PublicKey().Marshal()); !seen[k] {
+				seen[k] = true
+				all = append(all, sg)
+			}
+		}
+		return all, nil
+	})}, nil
 }
 
 // identityPublicKeys returns the marshalled public keys of the identity files,

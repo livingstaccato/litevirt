@@ -113,3 +113,105 @@ func TestCreateVM_AFailedCreateLeavesASeedItDidNotPlace(t *testing.T) {
 		t.Errorf("the failed create removed a seed it did not place: %q %v", b, err)
 	}
 }
+
+// takeFreedInode makes files in p's directory until one is given the inode
+// of old, a file just removed, and renames that one to p: a new file at p
+// that reads, by device and inode, as the removed one. It holds each file the
+// filesystem numbered otherwise, so the next takes a different free inode.
+// It reports false when no file took the inode in tries attempts: the
+// filesystem does not reuse it, or something still holds it open.
+func takeFreedInode(t *testing.T, p string, old os.FileInfo, content string, tries int) bool {
+	t.Helper()
+	var held []string
+	defer func() {
+		for _, h := range held {
+			os.Remove(h)
+		}
+	}()
+	for i := 0; i < tries; i++ {
+		f, err := os.CreateTemp(filepath.Dir(p), ".reuse-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, werr := f.WriteString(content)
+		fi, serr := f.Stat()
+		if cerr := f.Close(); werr != nil || serr != nil || cerr != nil {
+			t.Fatal(werr, serr, cerr)
+		}
+		if os.SameFile(fi, old) {
+			if err := os.Rename(f.Name(), p); err != nil {
+				t.Fatal(err)
+			}
+			return true
+		}
+		held = append(held, f.Name())
+	}
+	return false
+}
+
+// The same as TestCreateVM_AFailedCreateLeavesASeedItDidNotPlace, with the
+// inode reuse that test meets by chance forced: the other create's seed is
+// given the very inode of the seed this create placed, so it reads the same by
+// device and inode. A device and inode read when the seed was placed tells
+// the two apart only while that inode cannot be reused, so the create holds
+// its seed open until it returns; the inode stays its file's, and the other
+// seed can never take it.
+//
+// Mutation: close the seed right after it is pinned — the other seed takes
+// the inode, and the failed create removes it, red.
+func TestCreateVM_AFailedCreateLeavesASeedOnTheReusedInode(t *testing.T) {
+	stageGenisoimage(t)
+	s, fake, _ := isoServer(t)
+	seed := lv.CloudInitISOPath(s.dataDir, "w")
+	if err := os.MkdirAll(filepath.Dir(seed), 0o711); err != nil {
+		t.Fatal(err)
+	}
+
+	// Control: a file nothing holds open has its inode taken here.
+	ctl := filepath.Join(filepath.Dir(seed), "control")
+	if err := os.WriteFile(ctl, []byte("control"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctlFi, err := os.Stat(ctl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(ctl); err != nil {
+		t.Fatal(err)
+	}
+	if !takeFreedInode(t, ctl, ctlFi, "control", 1024) {
+		t.Skip("this filesystem does not reuse a freed inode, so it cannot fool an inode comparison")
+	}
+	if err := os.Remove(ctl); err != nil {
+		t.Fatal(err)
+	}
+
+	var reused, replaced bool
+	fake.FailStartDomain = func(string) error {
+		old, err := os.Stat(seed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		replaced = true
+		if err := os.Remove(seed); err != nil {
+			t.Fatal(err)
+		}
+		reused = takeFreedInode(t, seed, old, "another create's seed", 1024)
+		if !reused {
+			if err := os.WriteFile(seed, []byte("another create's seed"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return errors.New("start failed")
+	}
+	if _, err := s.CreateVM(adminCtx(), seedCreateRequest(t, s, "w", "#cloud-config\n")); err == nil {
+		t.Fatal("the create was meant to fail")
+	}
+	if !replaced {
+		t.Fatal("setup: the create never reached its start, so no seed was replaced")
+	}
+	t.Logf("the other seed took the placed seed's inode: %v", reused)
+	if b, err := os.ReadFile(seed); err != nil || string(b) != "another create's seed" {
+		t.Errorf("the failed create removed a seed it did not place (it had the placed seed's inode: %v): %q %v", reused, b, err)
+	}
+}

@@ -630,14 +630,18 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// user-data). It is set only once GenerateISO has placed it, after the
 	// orphan sweep below removed whatever an earlier incomplete delete left at
 	// that name, so the file there is this create's own.
-	// createdSeedFile is the file it placed (its identity, from the Stat right
-	// after): a concurrent create of the same name may have placed its own
-	// seed at that name since, and that one is not this create's to remove.
+	// createdSeedFile is the file it placed, held open from right after until
+	// the create returns (pinnedFile): a concurrent create of the same name
+	// may have placed its own seed at that name since, and that one is not
+	// this create's to remove. Only a held file's inode cannot be reused by
+	// that other seed, which would then read as this create's own.
 	var createdSeed string
-	var createdSeedFile os.FileInfo
+	var createdSeedFile *pinnedFile
+	defer func() { createdSeedFile.release() }()
 	recordSeed := func(path string) {
-		if fi, err := os.Stat(path); err == nil {
-			createdSeed, createdSeedFile = path, fi
+		if pf, ok := pinFile(path); ok {
+			createdSeedFile.release()
+			createdSeed, createdSeedFile = path, pf
 		}
 	}
 	// removeSeed removes the seed this create placed, if it is still the
@@ -646,8 +650,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		if createdSeed == "" {
 			return
 		}
-		fi, err := os.Stat(createdSeed)
-		if err != nil || !os.SameFile(fi, createdSeedFile) {
+		if !createdSeedFile.stillAt(createdSeed) {
 			noteUndo("seed " + createdSeed + " left: it is no longer the file this create placed")
 			return
 		}

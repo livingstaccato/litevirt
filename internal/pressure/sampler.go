@@ -110,6 +110,11 @@ const staleIntervals = 3
 // and later samples do not wait on that read again.
 const defaultPoolsWait = 2 * time.Second
 
+// defaultStopWait bounds how long a stopping sampler waits for its pool-list
+// read to return. The read honours its context, but the daemon's waits on the
+// client lock before it does; past this the read is abandoned, and logged.
+const defaultStopWait = 5 * time.Second
+
 // Pressured names every resource above ok, sorted.
 func (r Report) Pressured() []string {
 	var out []string
@@ -244,6 +249,7 @@ type Sampler struct {
 	memLim  uint64
 
 	poolsWait  time.Duration
+	stopWait   time.Duration
 	poolMu     sync.Mutex
 	poolFlight *poolFlight // the outstanding pool-list read, nil when none
 	lastPools  []Pool
@@ -255,6 +261,11 @@ type Sampler struct {
 	sampledAt  time.Time
 	poolsStale bool
 	observer   func(Report)
+
+	// life is the run Start began: Stop cancels it and joins it.
+	lifeMu sync.Mutex
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 // poolFlight is one pool-list read. pools is written before done is closed.
@@ -266,7 +277,7 @@ type poolFlight struct {
 
 // NewSampler builds a sampler over dataDir. cfg must have been validated.
 func NewSampler(cfg Config, dataDir string, o Options) *Sampler {
-	s := &Sampler{cfg: cfg, dataDir: dataDir, fs: o.FS, now: o.Now, pools: o.Pools, fds: o.FDs, mem: o.Mem, res: map[string]*resource{}, poolsWait: defaultPoolsWait}
+	s := &Sampler{cfg: cfg, dataDir: dataDir, fs: o.FS, now: o.Now, pools: o.Pools, fds: o.FDs, mem: o.Mem, res: map[string]*resource{}, poolsWait: defaultPoolsWait, stopWait: defaultStopWait}
 	if s.fs == nil {
 		s.fs = OSFS{}
 	}
@@ -312,10 +323,42 @@ func (s *Sampler) SetObserver(fn func(Report)) {
 	s.mu.Unlock()
 }
 
-// Run samples every interval until ctx ends. The first sample is at once.
+// Start runs the sampler on its own goroutine until Stop, or until ctx ends.
+// The run owns its lifetime: Stop ends it whatever ctx does.
+func (s *Sampler) Start(ctx context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	s.lifeMu.Lock()
+	s.cancel, s.done = cancel, done
+	s.lifeMu.Unlock()
+	go func() {
+		defer close(done)
+		s.Run(ctx)
+	}()
+}
+
+// Stop ends the run Start began and returns once it has returned, its pool
+// read included (Run): nothing the sampler reads through is used after Stop,
+// unless that read ignored its context for stopWait, which is logged. Stop
+// without Start does nothing.
+func (s *Sampler) Stop() {
+	s.lifeMu.Lock()
+	cancel, done := s.cancel, s.done
+	s.lifeMu.Unlock()
+	if cancel == nil {
+		return
+	}
+	cancel()
+	<-done
+}
+
+// Run samples every interval until ctx ends. The first sample is at once. The
+// pool-list read runs under ctx, and Run returns only once an outstanding one
+// has returned, or after stopWait.
 func (s *Sampler) Run(ctx context.Context) {
 	tk := time.NewTicker(time.Duration(s.cfg.SampleIntervalSec) * time.Second)
 	defer tk.Stop()
+	defer s.joinPoolRead()
 	for {
 		s.Sample(ctx)
 		select {
@@ -323,6 +366,23 @@ func (s *Sampler) Run(ctx context.Context) {
 			return
 		case <-tk.C:
 		}
+	}
+}
+
+// joinPoolRead waits, at most stopWait, for the outstanding pool-list read.
+func (s *Sampler) joinPoolRead() {
+	s.poolMu.Lock()
+	f := s.poolFlight
+	s.poolMu.Unlock()
+	if f == nil {
+		return
+	}
+	t := time.NewTimer(s.stopWait)
+	defer t.Stop()
+	select {
+	case <-f.done:
+	case <-t.C:
+		slog.Warn("resource pressure: the pool-list read did not return on stop; abandoning it", "wait", s.stopWait)
 	}
 }
 
@@ -347,8 +407,10 @@ func (s *Sampler) currentPools(ctx context.Context) ([]Pool, bool) {
 		f = &poolFlight{started: time.Now(), done: make(chan struct{})}
 		s.poolFlight = f
 		read := s.pools
+		// The read is detached from this sample's wait, not from the
+		// sampler's lifetime: it runs under ctx, which ends with the run.
 		go func() {
-			f.pools = read(context.Background())
+			f.pools = read(ctx)
 			s.poolMu.Lock()
 			s.lastPools = f.pools
 			if s.poolFlight == f {

@@ -705,3 +705,39 @@ func TestAutoDaemonLimit(t *testing.T) {
 		}
 	}
 }
+
+// Stop joins the run it ends, its pool-list read included: the read is
+// cancelled with the sampler, and Stop returns only once it has returned, so
+// nothing the read uses (the daemon's database) is used after Stop.
+func TestSampler_StopJoinsAnInFlightPoolsRead(t *testing.T) {
+	r := newRig(t, nil)
+	r.s.poolsWait = 20 * time.Millisecond
+	entered := make(chan struct{})
+	var once sync.Once
+	var sawCancel, returned atomic.Bool
+	r.s.pools = func(ctx context.Context) []Pool {
+		once.Do(func() { close(entered) })
+		select {
+		case <-ctx.Done():
+			sawCancel.Store(true)
+		case <-time.After(3 * time.Second):
+		}
+		// The read's tail still runs after it sees the cancel.
+		time.Sleep(50 * time.Millisecond)
+		returned.Store(true)
+		return nil
+	}
+	r.s.Start(context.Background())
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the sampler never read its pool list")
+	}
+	r.s.Stop()
+	if !returned.Load() {
+		t.Fatal("Stop returned while the pool-list read was still running")
+	}
+	if !sawCancel.Load() {
+		t.Fatal("the pool-list read never saw its context cancelled: it is not bound to the sampler's lifetime")
+	}
+}

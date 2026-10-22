@@ -87,9 +87,15 @@ type Daemon struct {
 	auditWired     chan struct{}
 	auditWiredDone sync.Once
 
-	cfg  *Config
-	db   *corrosion.Client
-	virt *libvirt.Client
+	cfg *Config
+	db  *corrosion.Client
+	// pressure is the host-pressure sampler startPressure started, nil when
+	// pressure is off; closeDatabase stops it before the database closes.
+	pressure *pressure.Sampler
+	// listHostPools is the sampler's pool-list read; nil is
+	// corrosion.ListStoragePoolsForHost (a test seam).
+	listHostPools func(context.Context, *corrosion.Client, string) ([]corrosion.StoragePoolRecord, error)
+	virt          *libvirt.Client
 	// fwStore is the host's one firmware store, guarded by the firmware move
 	// guard from the moment libvirt is connected, and shared by the server and
 	// the reconciler.
@@ -2389,7 +2395,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// waiting on it, and their error paths would otherwise write what
 		// that failure is not (a held start recorded failed over a domain
 		// libvirtd goes on to start).
-		d.db.Close()
+		d.closeDatabase()
 		d.virt.Close()
 		close(shutdownDone)
 	}()
@@ -3091,7 +3097,19 @@ func (d *Daemon) startPressure(ctx context.Context, sink pressureSink, newObserv
 	ps := pressure.NewSampler(d.cfg.Pressure, d.cfg.DataDir, pressure.Options{Pools: d.pressurePools()})
 	ps.SetObserver(newObserver())
 	sink.SetPressureSource(ps)
-	go ps.Run(ctx)
+	d.pressure = ps
+	ps.Start(ctx)
+}
+
+// closeDatabase closes the database once the workers that read it outside
+// the replicator are stopped and joined: the pressure sampler, whose pool
+// read uses d.db. Their contexts are not enough: on re-exec and uninstall the
+// daemon's own context is still live here.
+func (d *Daemon) closeDatabase() {
+	if d.pressure != nil {
+		d.pressure.Stop()
+	}
+	d.db.Close()
 }
 
 // pressurePoolsRefresh is how often the pressure sampler re-reads which pools
@@ -3105,6 +3123,8 @@ const pressurePoolsRefresh = time.Minute
 // not bound it (Query takes the client lock first), so the sampler runs it off
 // its sampling path and abandons a read that does not return
 // (Sampler.currentPools); one at a time, so this closure's state is not shared.
+// A stopped sampler waits for the read (Sampler.Stop), and a read whose context
+// has ended does not touch the database.
 func (d *Daemon) pressurePools() func(context.Context) []pressure.Pool {
 	var (
 		last []pressure.Pool
@@ -3128,9 +3148,17 @@ func (d *Daemon) pressurePools() func(context.Context) []pressure.Pool {
 				add(p.Name, p.Target)
 			}
 		}
+		if ctx.Err() != nil {
+			// The sampler is stopping and the database may be closing.
+			return last
+		}
 		if d.db != nil {
+			list := d.listHostPools
+			if list == nil {
+				list = corrosion.ListStoragePoolsForHost
+			}
 			rctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			rows, err := corrosion.ListStoragePoolsForHost(rctx, d.db, d.cfg.HostName)
+			rows, err := list(rctx, d.db, d.cfg.HostName)
 			cancel()
 			if err != nil {
 				slog.Warn("resource pressure: list storage pools; grading the last list", "error", err)

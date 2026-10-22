@@ -175,7 +175,9 @@ func TestRunStopsServingBeforeTheDatabaseCloses(t *testing.T) {
 		t.Fatal("Run never calls stopServing")
 	}
 	// Top-level statements of that goroutine, in order: stopServing must be
-	// a direct statement (not in a branch) before repl.Stop and db.Close.
+	// a direct statement (not in a branch) before repl.Stop and the database
+	// close, d.closeDatabase (which closes it once the pressure sampler is
+	// joined: TestDaemonClosesDatabaseThroughCloseDatabase).
 	idx := map[string]int{}
 	for i, st := range shutdown.Body.List {
 		es, ok := st.(*ast.ExprStmt)
@@ -200,19 +202,19 @@ func TestRunStopsServingBeforeTheDatabaseCloses(t *testing.T) {
 			idx[name] = i
 		}
 	}
-	for _, name := range []string{"stopServing", "repl.Stop", "db.Close"} {
+	for _, name := range []string{"stopServing", "repl.Stop", "d.closeDatabase"} {
 		if _, ok := idx[name]; !ok {
 			t.Fatalf("%s is not a direct statement of Run's shutdown goroutine", name)
 		}
 	}
-	if !(idx["stopServing"] < idx["repl.Stop"] && idx["repl.Stop"] < idx["db.Close"]) {
-		t.Fatalf("shutdown order: stopServing %d, repl.Stop %d, db.Close %d", idx["stopServing"], idx["repl.Stop"], idx["db.Close"])
+	if !(idx["stopServing"] < idx["repl.Stop"] && idx["repl.Stop"] < idx["d.closeDatabase"]) {
+		t.Fatalf("shutdown order: stopServing %d, repl.Stop %d, closeDatabase %d", idx["stopServing"], idx["repl.Stop"], idx["d.closeDatabase"])
 	}
 	// The database closes before libvirt (mainconn review I-2): closing
 	// libvirt fails the calls waiting on it, and their error paths must not
 	// write what that failure is not.
-	if v, ok := idx["virt.Close"]; !ok || v < idx["db.Close"] {
-		t.Fatalf("shutdown order: db.Close %d, virt.Close %d (present %v), want the database closed first", idx["db.Close"], v, ok)
+	if v, ok := idx["virt.Close"]; !ok || v < idx["d.closeDatabase"] {
+		t.Fatalf("shutdown order: closeDatabase %d, virt.Close %d (present %v), want the database closed first", idx["d.closeDatabase"], v, ok)
 	}
 }
 

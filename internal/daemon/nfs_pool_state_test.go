@@ -9,6 +9,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/grpcapi"
+	"github.com/litevirt/litevirt/internal/pooltrust"
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
@@ -78,6 +79,11 @@ func TestRunNFSMountReconcile_FirstPassAtOnce(t *testing.T) {
 	}))
 	dir := t.TempDir()
 	d := &Daemon{db: db, cfg: &Config{HostName: "host-a", DataDir: dir}, svc: grpcapi.NewServer("host-a", dir, dir, db, nil, nil)}
+	// The pool was created on this host: an nfs pool, target or not, is
+	// acted on only when its host stands behind it (pooltrust).
+	if err := d.svc.PoolTrust().Record("shared", pooltrust.BindingOf("nfs", "10.0.0.21:/srv/lv", "", nil), pooltrust.HowCreate); err != nil {
+		t.Fatal(err)
+	}
 	go d.runNFSMountReconcile(ctx)
 	select {
 	case got := <-mounts:

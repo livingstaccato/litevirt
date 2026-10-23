@@ -62,6 +62,7 @@ func oldTargetSource(t *testing.T, storageType string) (*Server, *libvirtfake.Fa
 	s := testServerWithLocks(t)
 	s.hostName = "src-host"
 	s.SetHostDiskRootForTest(t.TempDir())
+	s.dataDir = "/var/lib/litevirt" // the disk's recorded path is under its disks dir
 	fake := libvirtfake.New()
 	s.virt = fake
 	p := "/var/lib/litevirt/disks/os1-root.qcow2"

@@ -93,16 +93,16 @@ func (s *Server) copyColdDisksToTarget(ctx context.Context, targetHost, vmName s
 	// holds guest data, and a guest can write a qcow2 header into it that names
 	// any host file as its backing.
 	for _, d := range toCopy {
+		if formats[d.Path] == "" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"disk %q of VM %q (%s) is not in its domain definition on %s, so its format is unknown; "+
+					"repair the VM's disks before migrating it", d.DiskName, vmName, d.Path, s.hostName)
+		}
 		// The file is read here and removed after the commit: its recorded
 		// path must be one of this host's own disk places (coldSourcePathCheck).
 		if err := s.coldSourcePathCheck(d.Path); err != nil {
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"disk %q of VM %q: %v; nothing was copied or changed", d.DiskName, vmName, err)
-		}
-		if formats[d.Path] == "" {
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"disk %q of VM %q (%s) is not in its domain definition on %s, so its format is unknown; "+
-					"repair the VM's disks before migrating it", d.DiskName, vmName, d.Path, s.hostName)
 		}
 	}
 	for i, d := range toCopy {

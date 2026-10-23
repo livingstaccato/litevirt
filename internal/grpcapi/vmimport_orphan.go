@@ -448,7 +448,7 @@ func (s *Server) clearImportDiskName(ctx context.Context, pool, importName, impo
 	if errors.Is(err, fs.ErrNotExist) {
 		// Nothing there, but a kept overlay may name dst as its missing base:
 		// the imported disk would become it.
-		if kerr := s.keptMissingBaseRefusal(ctx, func(p string) bool { return filepath.Clean(p) == filepath.Clean(dst) }); kerr != nil {
+		if kerr := s.keptMissingBaseRefusal(ctx, keptWritesOf(true, dst)); kerr != nil {
 			return "", fmt.Errorf("disk %q would be written to %s: %v%s", disk, dst, kerr, keptImportWayOut(kerr, ""))
 		}
 		return "", nil
@@ -463,7 +463,7 @@ func (s *Server) clearImportDiskName(ctx context.Context, pool, importName, impo
 	// A file a delete kept, or one a kept disk beside it backs on, is no
 	// orphan, whatever the database records: moved aside, a kept overlay
 	// would back on the imported disk.
-	if kerr := s.keptFileCreateRefusal(ctx, importName, []string{dst}, func(p string) bool { return filepath.Clean(p) == filepath.Clean(dst) }, false); kerr != nil {
+	if kerr := s.keptFileCreateRefusal(ctx, importName, []string{dst}, keptWritesOf(true, dst), false); kerr != nil {
 		return "", fmt.Errorf("disk %q would be written to %s, which already exists in the pool: %v%s", disk, dst, kerr,
 			keptImportWayOut(kerr, "; an import never replaces a file there"))
 	}

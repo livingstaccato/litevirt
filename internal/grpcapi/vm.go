@@ -839,7 +839,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// the kept VM's seed (setAsideKeptSeed). A create that fails puts them
 	// back (create_kept.go).
 	setAt := time.Now()
-	moved, debrisErr := s.clearDiskDebrisBeforeCreate(ctx, spec.Name, setAt, s.createWritesHostDisk(spec, lunHold.cfgs))
+	moved, debrisErr := s.clearDiskDebrisBeforeCreate(ctx, spec.Name, setAt, s.createKeptWrites(spec, lunHold.cfgs))
 	var seedKept keptSeed
 	defer func() {
 		switch {

@@ -40,7 +40,7 @@ func TestKeptNoteRefusals_NameTheNotesPath(t *testing.T) {
 			t.Fatal(err)
 		}
 		note := filepath.Join(s.dataDir, "kept-disks", "imp-kn.json")
-		err := s.keptFileCreateRefusal(context.Background(), "other", []string{dst}, func(string) bool { return false }, false)
+		err := s.keptFileCreateRefusal(context.Background(), "other", []string{dst}, nil, false)
 		if err == nil || !strings.Contains(err.Error(), "kept-disk note "+note) {
 			t.Fatalf("keptFileCreateRefusal = %v; want a refusal naming the kept-disk note %s", err, note)
 		}

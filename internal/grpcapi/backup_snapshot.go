@@ -663,7 +663,7 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 		// it. (A derived target is a fresh name nothing can name; the VM's own
 		// disk exists, and is no missing base.)
 		if !ownDisk {
-			if err := s.keptPathRefusal(ctx, "restore to "+named, named); err != nil {
+			if err := s.keptPathRefusal(ctx, "restore to "+named, keptWritesOf(true, named)); err != nil {
 				return err
 			}
 		}

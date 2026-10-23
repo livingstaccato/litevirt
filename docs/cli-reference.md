@@ -314,7 +314,11 @@ wherever they now are; a revert to one restores the deleted VM's guest. A
 file, as does a kept disk's backing chain that cannot be read (a backing file
 that does not exist ends the chain and holds nothing, but a create or import
 that would write a disk at that path is refused, naming the overlay that
-names it: the new disk would become its base); the refusal names the
+names it: the new disk would become its base. The path is where the disk is
+written: the disk directory, or for a disk on a pool where its driver puts it,
+`<pool dir>/<vm>-<disk>.qcow2` on nfs too; both are compared with their
+directories resolved through symlinks, so a pool whose directory is a symlink
+to the disk directory writes the same files); the refusal names the
 entry, and the way out is to fix that file, or, once nothing needs the disk,
 move it away or remove its entry from `<data_dir>/kept-disks.json`. An
 unreadable `kept-disks.json` or kept chain does not depend on the name: until
@@ -324,8 +328,9 @@ a disk file on the host's own storage (one with no disk file, or with every
 disk on shared nfs, ceph or iscsi storage outside the disk directory, goes
 ahead); every disk attach that creates a new disk; and every `lv backup
 restore-from` or `lv backup restore-live` with `--target-path`. With the record
-readable, a clone, a disk attach or a `--target-path` restore that would write
-a kept overlay's missing base is refused as a create is. A
+readable, a clone (into any pool, nfs included), a disk attach or a
+`--target-path` restore that would write a kept overlay's missing base is
+refused as a create is. A
 restore to the file the daemon names, or `--in-place` over the VM's own disk,
 is not checked: the first is a fresh name no overlay can name, the second a
 file that exists. A migration's target (cold or live) and the reconciler's

@@ -54,7 +54,7 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 		}
 		// A named target can be the path a kept overlay names as its missing
 		// base (a derived one is a fresh name nothing can name).
-		if err := s.keptPathRefusal(ctx, "live restore to "+target, target); err != nil {
+		if err := s.keptPathRefusal(ctx, "live restore to "+target, keptWritesOf(true, target)); err != nil {
 			return err
 		}
 	} else {

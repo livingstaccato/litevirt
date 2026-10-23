@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
@@ -128,7 +127,7 @@ func (s *Server) SweepStaleStaging(ctx context.Context) {
 	// Replicas land only in file-based pool directories (replicateLocalWith),
 	// so the legacy replica-temp sweep is confined to those.
 	replicaDirs := map[string]struct{}{}
-	if pools, err := corrosion.ListStoragePoolsForHost(ctx, s.db, s.hostName); err == nil {
+	if pools, err := s.ownPools(ctx); err == nil {
 		for _, p := range pools {
 			if !isFileBasedDriver(p.Driver) {
 				continue

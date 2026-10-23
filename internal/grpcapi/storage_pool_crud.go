@@ -19,6 +19,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/pooltrust"
 	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/storage"
 )
@@ -272,9 +273,20 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 			rec.UsedBytes = int64((st.Blocks - st.Bavail) * uint64(st.Bsize))
 		}
 	}
+	// This host stands behind the row it is about to write: recorded in its
+	// local ledger first (pool_trust.go), so neither the row nor a forged one
+	// of another target is ever taken for it, and a pool this host did not
+	// create is never trusted because a row says so. Fail closed.
+	if pt := s.PoolTrust(); pt != nil {
+		if err := pt.Record(req.Name, pooltrust.BindingOf(req.Driver, req.Source, req.Target), pooltrust.HowCreate); err != nil {
+			return nil, status.Errorf(codes.Internal, "record the pool in this host's trust ledger: %v", err)
+		}
+	}
 	if err := corrosion.UpsertStoragePool(ctx, s.db, rec); err != nil {
 		return nil, status.Errorf(codes.Internal, "persist: %v", err)
 	}
+	s.audit(ctx, "storage.pool.create", req.Name,
+		fmt.Sprintf("host=%s driver=%s source=%s target=%s project=%s", host, req.Driver, req.Source, req.Target, project), "ok")
 	// Make the pool resolvable for move/replicate/compose on this host right
 	// away — the daemon's periodic refresh would otherwise be the only thing
 	// that loads runtime-created pools into the in-memory map.
@@ -363,6 +375,24 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 		return nil, err
 	}
 
+	// A row this host does not trust was never this host's pool
+	// (pool_trust.go): only the row goes. Nothing on the host is touched for
+	// it — no unmount, logout or directory removal at a place the row names.
+	if !s.poolRowTrusted(rec) {
+		if err := corrosion.MarkStoragePoolDeleted(ctx, s.db, host, req.Name); err != nil {
+			return nil, status.Errorf(codes.Internal, "delete: %v", err)
+		}
+		s.removeStoragePoolRef(req.Name)
+		if pt := s.PoolTrust(); pt != nil {
+			if err := pt.Forget(req.Name); err != nil {
+				slog.Warn("untrusted storage pool row deleted, but not removed from this host's trust ledger", "pool", req.Name, "error", err)
+			}
+		}
+		s.audit(ctx, "storage.pool.delete", req.Name, fmt.Sprintf("force=%t untrusted_row=true driver=%s target=%s", req.Force, rec.Driver, rec.Target), "ok")
+		slog.Info("untrusted storage pool row deleted; nothing on the host was touched", "host", host, "name", req.Name, "target", rec.Target)
+		return &pb.DeleteStoragePoolResponse{}, nil
+	}
+
 	// A pool's own <data_dir>/pools/<name> goes with it — but never with files
 	// in it: the next pool of this name, in any project, would inherit them.
 	// The daemon's own directories in it — the replica area, the upload
@@ -423,6 +453,13 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 		return nil, status.Errorf(codes.Internal, "delete: %v", err)
 	}
 	s.removeStoragePoolRef(req.Name)
+	// A pool deleted here is not trusted again if a row of its name comes
+	// back without a create on this host.
+	if pt := s.PoolTrust(); pt != nil {
+		if err := pt.Forget(req.Name); err != nil {
+			slog.Warn("storage pool deleted, but not removed from this host's trust ledger", "pool", req.Name, "error", err)
+		}
+	}
 	// The pool's ceph secret goes with it unless another pool, or a disk on
 	// this host, still uses it.
 	if strings.EqualFold(rec.Driver, "ceph") {

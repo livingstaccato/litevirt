@@ -64,6 +64,72 @@ log in to it again at its next start) on a best-effort basis but failure does no
 who hit "rm" likely want the pool gone regardless. The underlying
 mount, if any, stays until manually cleaned up.
 
+### Which pool rows a host acts on
+
+Pool rows are cluster state: every host holds every host's rows, and a row
+reaches a host by replication whichever member wrote it. A host therefore acts
+on a row naming it only when it stands behind that row. A row naming a place on
+the host's filesystem (a `local` or `dir` target, an `nfs` mount point, a
+`btrfs` source) is used only when it is one of these, with the same driver,
+source and target:
+
+- **in the host's `config.yaml`** (`storage_pools:`);
+- **created on that host**: `lv pool create` (also with `--host`, through the
+  UI, the REST API or another node) runs on the pool's host, which records the
+  pool in its local ledger `<data_dir>/pool-trust.json` (mode 0600, never
+  replicated) before it writes the row;
+- **confirmed on that host** with `lv pool trust`, recorded in the same ledger;
+- **in the daemon's own pool areas**: a `local` or `dir` pool whose directory,
+  as written and with symlinks resolved, is `<data_dir>/disks` or a directory
+  inside `<data_dir>/pools/` or `<data_dir>/mounts/`.
+
+Rows naming no host path (`ceph`, `iscsi`, `zfs`, `lvm-thin`) are not affected.
+
+Any other row is **untrusted**. The host does not use it for anything: it is
+not a disk root for a migration receive or a disk create, it is not mounted,
+nothing is uploaded to, deleted from or listed in it, the staging and replica
+sweeps skip it, and the capacity refresh does not rewrite it. The host raises
+`pool_row_untrusted` naming it (see
+[diagnostics.md](diagnostics.md#a-host-has-pool-rows-it-does-not-trust-pool_row_untrusted)).
+A content call or write that names it is refused with the command that
+confirms it; a disk placed by pool name finds no such pool on the host.
+
+```bash
+lv pool inspect vmstore --host host-b          # check the driver, source and target
+lv pool trust vmstore --host host-b            # confirm it on host-b
+lv pool delete vmstore --host host-b           # or remove a row you did not make
+```
+
+`lv pool trust` sends the row as you saw it; the pool's host refuses if its row
+has changed since. Once confirmed, the daemon writes in that directory as root,
+so trusting needs what naming the path in a create needs: `storage.hostpath` at
+`/` (the Admin role), and the system and litevirt-internal directories are
+refused to everyone. It is audited as `storage.pool.trust`.
+
+Deleting an untrusted row removes the row only: nothing at the place it names
+is unmounted, logged out of or removed. Deleting a pool also takes it out of
+the host's ledger, so a row of that name that comes back is not trusted on
+the strength of the old one.
+
+**Upgrading.** The first time a build with the ledger starts on a host, it
+adopts the host's existing pools into the ledger (logged as `storage pool
+trust: first start with the ledger`). A row is adopted when the host's own
+disk shows it in use: a disk of this host recorded on the pool is a qcow2
+image (a regular file, not a symlink) inside the pool's directory, or, for an
+`nfs` pool mounted under `<data_dir>/mounts/`, its export is mounted there. A
+directory that merely exists, or a disk row naming a file that is not a qcow2
+image in it, is not enough, so a forged row written before the upgrade is not
+adopted. Pools that are not adopted (an empty pool outside the pool areas, a
+pool of raw images or ISOs only) are held untrusted until confirmed with
+`lv pool trust`. The adoption runs once; a row arriving later is trusted only
+through a create or a confirmation on its host. A ledger that cannot be read
+trusts none of its entries, and its pools are named by `pool_row_untrusted`
+until confirmed again.
+
+The ledger is local, so a rolling upgrade needs no coordination: a host on an
+older build acts on every row naming it, as before, and `lv pool trust`
+against it is refused as having nothing to confirm.
+
 ## Host paths
 
 ### Who may name one

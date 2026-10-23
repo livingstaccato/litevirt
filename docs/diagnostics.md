@@ -3082,6 +3082,27 @@ During a rolling upgrade, only hosts on this build look: two colliding NICs
 whose hosts both still run an earlier build raise nothing until one of the
 hosts is upgraded.
 
+### A host has pool rows it does not trust (`pool_row_untrusted`)
+
+A host acts on a storage pool row naming it only when its config defines the
+pool, it created the pool, an operator confirmed it there with `lv pool trust`,
+or the pool's directory is in the daemon's own pool areas (see
+[storage.md](storage.md#which-pool-rows-a-host-acts-on)). While it has any other
+row naming a host path, the host raises `pool_row_untrusted` (evaluator
+`pool_trust`, subject `host/<host>`, warning) on its pool refresh (60 s). The
+evidence lists each pool with its driver, source, target and why it is not
+trusted, and the daemon logs each one at WARN with the command that confirms
+it. Nothing is written, mounted or listed in such a pool; a content call or
+write that names it is refused naming `lv pool trust`.
+
+A row you did not make is a row another member, or anything able to inject a
+replicated write, made for this host: delete it with
+`lv pool delete <pool> --host <host>`, which removes only the row. A pool of
+yours that the host holds untrusted — after an upgrade it could not adopt, or
+after its ledger was lost — check with `lv pool inspect <pool> --host <host>`,
+then confirm with `lv pool trust <pool> --host <host>`. The condition resolves
+on the next pool refresh once the host trusts every row naming it.
+
 ### An iSCSI pool has no session (`iscsi_session_missing`)
 
 Each host checks, at start and every 30 s, that it has a session to the target

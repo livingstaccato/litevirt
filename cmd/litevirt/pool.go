@@ -26,7 +26,53 @@ func newPoolCmd() *cobra.Command {
 		newPoolListCmd(),
 		newPoolInspectCmd(),
 		newPoolDeleteCmd(),
+		newPoolTrustCmd(),
 	)
+	return cmd
+}
+
+func newPoolTrustCmd() *cobra.Command {
+	var host string
+	cmd := &cobra.Command{
+		Use:   "trust <name>",
+		Short: "Confirm that a pool row naming a host is that host's pool",
+		Long: `A host acts on a storage pool row naming it only when it created the
+pool itself, its config.yaml defines it, or the pool's directory is in its own
+pool areas (<data_dir>/disks, pools/, mounts/). Any other row is held untrusted
+and named by the pool_row_untrusted condition: nothing is written, mounted or
+listed there.
+
+trust shows the row as the host's cluster state has it and, on the pool's
+host, records it in that host's local trust ledger, bound to the driver, source
+and target shown; the host refuses if its row has changed since. Check the
+target first: once trusted, the daemon writes there as root. It needs
+storage.hostpath at the cluster root, as naming the path in a create does, and
+is audited (storage.pool.trust).`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				got, err := c.GetStoragePool(ctx, &pb.GetStoragePoolRequest{Name: args[0], Host: host})
+				if err != nil {
+					return fmt.Errorf("get pool: %w", err)
+				}
+				p := got.Pool
+				resp, err := c.TrustStoragePool(ctx, &pb.TrustStoragePoolRequest{
+					Name: p.Name, Host: p.Host, Driver: p.Driver, Source: p.Source, Target: p.Target,
+				})
+				if err != nil {
+					return fmt.Errorf("trust pool: %w", err)
+				}
+				what := fmt.Sprintf("driver=%s source=%q target=%q", p.Driver, p.Source, p.Target)
+				if resp.AlreadyTrusted {
+					fmt.Printf("pool %s on %s (%s) was already trusted (%s)\n", p.Name, p.Host, what, resp.TrustedAs)
+					return nil
+				}
+				fmt.Printf("pool %s on %s (%s) is now trusted (%s)\n", p.Name, p.Host, what, resp.TrustedAs)
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&host, "host", "", "the pool's host (default: caller's local host)")
 	return cmd
 }
 

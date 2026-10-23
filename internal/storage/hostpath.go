@@ -196,6 +196,7 @@ var dataDirOwned = []string{
 	"nvram-flush-failures.json",  // libvirt/nvramflush.go NvramFlushStateFile: this host's failed UEFI vars flushes (its temp is a dot-name)
 	"image-delete-skew.json",     // grpcapi/image_delete_skew.go imageSkewHistoryFile (its temp is a dot-name; an earlier build of it left a .tmp, dataDirOwnedPrefixes)
 	"audit-hold",                 // corrosion/audit_hold.go AuditHoldDirName
+	"pool-trust.json",            // pooltrust/ledger.go LedgerFile: the pools this host created or confirmed (its temp is a dot-name)
 	"audit-seeded.json",          // corrosion/audit_seeded.go AuditSeededFileName
 	"audit-seeded-assert",        // corrosion/audit_seeded.go AuditSeededAssertFileName
 	"credentials_unhydrated",     // corrosion/isolation.go credentialsUnhydratedFile
@@ -557,6 +558,37 @@ func inPoolArea(dataDir, p string) bool {
 		}
 	}
 	return false
+}
+
+// InDataDirPoolArea reports whether p is one of the daemon's own pool
+// directories: <data_dir>/disks itself, or a directory strictly inside
+// <data_dir>/pools or <data_dir>/mounts. Every form of p — as written, and
+// resolved through symlinks — must be one, so a link in pools/ to a directory
+// elsewhere is not. The resolutions are bounded (resolveBounded): one that
+// does not answer is an error, and the answer false.
+func InDataDirPoolArea(p, dataDir string) (bool, error) {
+	if p == "" || dataDir == "" || !filepath.IsAbs(p) {
+		return false, nil
+	}
+	var t MountTable
+	dataForms, errD := pathFormsBounded(&t, dataDir)
+	forms, errP := pathFormsBounded(&t, p)
+	if err := errors.Join(errD, errP); err != nil {
+		return false, err
+	}
+	for _, c := range forms {
+		ok := false
+		for _, d := range dataForms {
+			if c == filepath.Join(d, dataDirDisks) || inPoolArea(d, c) {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // DirsOverlap reports whether two directories are the same, or one is inside

@@ -172,7 +172,7 @@ func (s *Server) ReconcileNFSMounts(ctx context.Context) {
 	if s.db == nil {
 		return
 	}
-	rows, err := corrosion.ListStoragePoolsForHost(ctx, s.db, s.hostName)
+	rows, err := s.ownPools(ctx)
 	if err != nil {
 		slog.Warn("NFS mounts: list this host's pools", "error", err)
 		return
@@ -229,7 +229,7 @@ func (s *Server) reconcileNFSPool(ctx context.Context, listed corrosion.StorageP
 // currentNFSPoolRow re-reads this host's row of nfs pool name, and reports
 // whether it is still the pool with that source and target.
 func (s *Server) currentNFSPoolRow(ctx context.Context, name, source, target string) (corrosion.StoragePoolRecord, bool) {
-	rec, found, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, name)
+	rec, found, err := s.ownPool(ctx, name)
 	if err != nil || !found || !strings.EqualFold(rec.Driver, "nfs") || rec.Source != source || rec.Target != target {
 		return rec, false
 	}
@@ -465,7 +465,7 @@ func (s *Server) ensureNFSMountsForVM(ctx context.Context, vm *corrosion.VMRecor
 		// volume of the same name.
 		pool := ""
 		if cfg.Name == d.StorageVolume {
-			if r, ok, gerr := corrosion.GetStoragePool(ctx, s.db, s.hostName, d.StorageVolume); gerr == nil && ok && strings.EqualFold(r.Driver, "nfs") {
+			if r, ok, gerr := s.ownPool(ctx, d.StorageVolume); gerr == nil && ok && strings.EqualFold(r.Driver, "nfs") {
 				cfg, pool = s.nfsPoolConfig(r), r.Name
 			}
 		}
@@ -526,7 +526,7 @@ func (s *Server) ensureNFSMountForStart(ctx context.Context, pool string, cfg st
 		return err
 	}
 	if pool != "" {
-		if r, ok, gerr := corrosion.GetStoragePool(ctx, s.db, s.hostName, pool); gerr == nil && (!ok || !strings.EqualFold(r.Driver, "nfs") || r.Source != cfg.Source || r.Target != cfg.Target) {
+		if r, ok, gerr := s.ownPool(ctx, pool); gerr == nil && (!ok || !strings.EqualFold(r.Driver, "nfs") || r.Source != cfg.Source || r.Target != cfg.Target) {
 			return fmt.Errorf("pool %q was deleted or replaced on this host while the start waited", pool)
 		}
 	}

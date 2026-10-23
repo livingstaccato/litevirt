@@ -52,6 +52,7 @@ import (
 	"github.com/litevirt/litevirt/internal/opjournal"
 	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/pki"
+	"github.com/litevirt/litevirt/internal/pooltrust"
 	"github.com/litevirt/litevirt/internal/pressure"
 	"github.com/litevirt/litevirt/internal/restapi"
 	"github.com/litevirt/litevirt/internal/scheduler"
@@ -104,8 +105,12 @@ type Daemon struct {
 	images  *image.Store
 	grpcSrv *grpc.Server
 	svc     *grpcapi.Server // gRPC service handler; held so background loops can refresh it
-	checker *health.Checker
-	metrics *metrics.Server
+	// poolTrust decides which of this host's storage_pools rows it acts on
+	// (internal/pooltrust): opened, given the config pools and adopted into
+	// before the pools are registered (openPoolTrust), and handed to svc.
+	poolTrust *pooltrust.Store
+	checker   *health.Checker
+	metrics   *metrics.Server
 
 	// startWaitSvc is svc for the libvirt start-guard wait, which is wired
 	// before svc exists and asks it which incarnation a create is starting.
@@ -841,7 +846,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Their statfs and path resolutions are bounded (poolStatfs,
 	// storage.Bounded). The in-place hardening of an NFS mount runs a remount
 	// command, and is waited for only up to startupStepBound
-	// (startup_bound.go).
+	// (startup_bound.go). The pool trust store comes first: what follows acts
+	// only on the rows of this host it trusts.
+	d.openPoolTrust(ctx)
 	d.registerStoragePools(ctx)
 	awaitStartupStep("harden NFS pool mounts", startupStepBound, func() { d.hardenNFSPoolMounts(ctx) })
 	d.refreshDBPoolCapacity(ctx)
@@ -2723,7 +2730,7 @@ func (d *Daemon) sumPoolDiskTotalGiB(ctx context.Context) int {
 		}
 	}
 	if d.db != nil {
-		rows, err := corrosion.ListStoragePoolsForHost(ctx, d.db, d.cfg.HostName)
+		rows, err := d.trustedOwnPools(ctx)
 		if err != nil {
 			slog.Warn("host disk total: list storage pools; counting config pools only", "error", err)
 		}
@@ -2929,7 +2936,7 @@ func (d *Daemon) runISOLibrarySync(ctx context.Context, svc *grpcapi.Server) {
 // compared on other hosts by what it is today. Only rows whose record
 // differs are written.
 func (d *Daemon) refreshDirPoolExports(ctx context.Context, configured map[string]bool) {
-	rows, err := corrosion.ListStoragePoolsForHost(ctx, d.db, d.cfg.HostName)
+	rows, err := d.trustedOwnPools(ctx)
 	if err != nil {
 		slog.Warn("storage pools: cannot refresh recorded NFS exports", "error", err)
 		return
@@ -3033,7 +3040,7 @@ func (d *Daemon) hardenNFSPoolMounts(ctx context.Context) {
 	for _, p := range d.cfg.StoragePools {
 		cfgs = append(cfgs, storage.Config{Driver: p.Driver, Source: p.Source, Target: p.Target, Options: p.Options})
 	}
-	if rows, err := corrosion.ListStoragePoolsForHost(ctx, d.db, d.cfg.HostName); err == nil {
+	if rows, err := d.trustedOwnPools(ctx); err == nil {
 		for _, p := range rows {
 			cfgs = append(cfgs, storage.Config{Driver: p.Driver, Source: p.Source, Target: p.Target, Options: p.Options})
 		}
@@ -3162,7 +3169,7 @@ func (d *Daemon) runNFSMountReconcile(ctx context.Context) {
 // via `lv pool create`. registerStoragePools only scans cfg.StoragePools, so
 // runtime-created pools (not in config) were never statfs'd and showed 0B/0B.
 func (d *Daemon) refreshDBPoolCapacity(ctx context.Context) {
-	pools, err := corrosion.ListStoragePoolsForHost(ctx, d.db, d.cfg.HostName)
+	pools, err := d.trustedOwnPools(ctx)
 	if err != nil {
 		slog.Warn("refresh pool capacity: list pools", "error", err)
 		return
@@ -3210,6 +3217,8 @@ func (d *Daemon) refreshDBPoolCapacity(ctx context.Context) {
 			}
 		}
 		d.svc.SetStoragePoolsByName(refs)
+		// The rows left out above are named by pool_row_untrusted.
+		d.svc.JudgePoolTrust(ctx)
 	}
 }
 
@@ -3358,6 +3367,12 @@ func (d *Daemon) newServer() *grpcapi.Server {
 // wireServer is newServer's wiring, on a server already built.
 func (d *Daemon) wireServer(svc *grpcapi.Server) {
 	svc.SetHostAddress(d.hostAddress())
+	// The store the daemon adopted existing pools into and gave the config
+	// pools; NewServer's own (the same ledger, no config pools) stays when
+	// the daemon has none yet.
+	if d.poolTrust != nil {
+		svc.SetPoolTrust(d.poolTrust)
+	}
 	svc.SetNetworkDeviceStatePath(grpcapi.DefaultNetworkDeviceStatePath)
 	// Release features (capabilities.Feature) open through the checker's
 	// WithFeature: the release token's latch plus the replicated used bit.

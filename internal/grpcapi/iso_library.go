@@ -378,7 +378,7 @@ func (s *Server) isoPoolUpload(ctx context.Context, project, pool, dir, file str
 // project the VM's may use: an upload into that pool, recorded as its
 // project's (a global pool's, as everyone's), that still describes the file.
 func (s *Server) isoFileOwnedByPool(ctx context.Context, project, pool, path string) bool {
-	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, pool)
+	rec, ok, err := s.ownPool(ctx, pool)
 	if err != nil || !ok {
 		return false
 	}
@@ -716,7 +716,9 @@ func (s *Server) ListISOs(ctx context.Context, req *pb.ListISOsRequest) (*pb.Lis
 		out = resp.GetIsos()
 	} else {
 		for _, p := range pools {
-			if allowed[p.Name] {
+			// A row this host does not trust is not one of its libraries
+			// (pool_trust.go): its directory is not read.
+			if allowed[p.Name] && s.poolRowTrusted(p) {
 				out = append(out, s.listLibrary(ctx, p)...)
 			}
 		}
@@ -910,6 +912,11 @@ func (s *Server) PullISO(ctx context.Context, req *pb.PullISORequest) (*pb.PullI
 		}
 		defer closePeer()
 		return client.PullISO(ctx, req)
+	}
+	// A row this host does not trust is not one of its libraries
+	// (pool_trust.go): nothing is fetched into the directory it names.
+	if err := s.checkPoolTrusted(rec); err != nil {
+		return nil, err
 	}
 	if err := s.globalLibraryWritable(ctx, rec); err != nil {
 		return nil, err
@@ -1106,7 +1113,7 @@ func (s *Server) FetchISOLibraryFile(req *pb.FetchISOLibraryFileRequest, stream 
 	if safename.ValidateName(name) != nil || !isISOName(name) {
 		return status.Errorf(codes.InvalidArgument, "invalid library file name %q", name)
 	}
-	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, globalISOLibrary)
+	rec, ok, err := s.ownPool(ctx, globalISOLibrary)
 	if err != nil || !ok || !s.isGlobalISOLibrary(ctx, rec) {
 		return status.Errorf(codes.NotFound, "no global ISO library on %s", s.hostName)
 	}
@@ -1187,7 +1194,7 @@ func (s *Server) SyncISOLibrary(ctx context.Context) error {
 	if err != nil || mode.Value != corrosion.ISOLibrarySync {
 		return err
 	}
-	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, globalISOLibrary)
+	rec, ok, err := s.ownPool(ctx, globalISOLibrary)
 	if err != nil || !ok || !s.isGlobalISOLibrary(ctx, rec) {
 		return err
 	}

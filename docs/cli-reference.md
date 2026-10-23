@@ -834,10 +834,15 @@ lv pool create <name> --driver <d> [--source <s>] [--target <t>] [--option k=v]
 lv pool ls
 lv pool inspect <name>
 lv pool delete <name>
+lv pool trust <name> [--host <h>]                 # confirm a pool row the host does not trust (pool_row_untrusted)
 ```
 
 `lv pool create` runs the driver's Prepare() hook (mount NFS, log into
 iSCSI, …) before persisting. See `docs/storage.md` for driver details.
+A host acts only on the pool rows it created, its config defines, or whose
+directory is in its own pool areas; `lv pool trust` confirms any other row on
+that host, with the same authority as naming its path in a create. See
+`docs/storage.md#which-pool-rows-a-host-acts-on`.
 A pool that names a host path (`dir`, `--target`, a btrfs `--source`, NFS
 mount options, a Ceph conf or keyring), attaches network storage (`nfs`,
 `ceph`, `iscsi`) or allocates from host block storage (`zfs`, `lvm-thin`) needs `storage.hostpath` at `/` (the Admin role), and system and litevirt-internal directories are refused to

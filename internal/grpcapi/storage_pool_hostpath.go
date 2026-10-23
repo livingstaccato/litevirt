@@ -396,8 +396,14 @@ func publishNoClobber(tmp, dest, filename string) error {
 
 // localPoolDir is where a new target-less local pool keeps its files: a
 // directory of its own, never the shared <data_dir>/disks that holds every
-// VM's local disks on the host, across projects.
+// VM's local disks on the host, across projects. A pool name can come from
+// a replicated row, which nothing validated: one that is not a valid pool
+// name (safename.ValidatePoolName: no "/", no "..", no NUL, at most
+// MaxNameLen) names no directory, "", so it can never reach outside pools/.
 func localPoolDir(dataDir, name string) string {
+	if safename.ValidatePoolName(name) != nil {
+		return ""
+	}
 	return filepath.Join(dataDir, "pools", name)
 }
 

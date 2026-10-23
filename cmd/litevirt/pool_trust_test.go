@@ -32,7 +32,8 @@ func (h *trustHost) TrustStoragePool(_ context.Context, req *pb.TrustStoragePool
 		return out, nil
 	}
 	h.confirmed = append(h.confirmed, req)
-	if req.GetDriver() != h.row.Driver || req.GetSource() != h.row.Source || req.GetTarget() != h.row.Target {
+	// Compared as the host compares (pooltrust.BindingOf cleans the target).
+	if req.GetDriver() != h.row.Driver || req.GetSource() != h.row.Source || cleanOrEmpty(req.GetTarget()) != cleanOrEmpty(h.row.Target) {
 		return nil, status.Error(codes.FailedPrecondition, "the row differs")
 	}
 	return &pb.TrustStoragePoolResponse{TrustedAs: "created or confirmed on this host"}, nil

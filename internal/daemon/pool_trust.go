@@ -24,6 +24,12 @@ import (
 // code that writes their rows (ensureOwnPoolTrusted), so they never depend
 // on where <data_dir>/pools or <data_dir>/disks resolve.
 func (d *Daemon) openPoolTrust(ctx context.Context) {
+	// An earlier test build mounted untrusted pools' exports at staging
+	// points in mounts/ to judge them; no build does now. Unmount and remove
+	// any it left.
+	for _, err := range storage.SweepAdoptionStages(ctx, d.cfg.DataDir) {
+		slog.Warn("storage pool trust: a leftover adoption staging mount was not cleaned; unmount and remove it by hand", "error", err)
+	}
 	pt, err := pooltrust.Open(d.cfg.DataDir, d.cfg.PKIDir)
 	if err != nil {
 		slog.Error("storage pool trust ledger unreadable; it was kept aside, and the pools it held are untrusted until confirmed with `lv pool trust`", "error", err)

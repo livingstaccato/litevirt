@@ -50,10 +50,18 @@ those values in its local trust ledger only when its row is exactly them, and
 refuses otherwise. Check the target first: once trusted, the daemon writes
 there as root.
 
-On a terminal it asks y/N. Otherwise it needs the values you checked:
---expect-driver and --expect-target, --expect-source when the row has a
-source, and --expect-mount-options when it has mount options. Any difference
-from the row is refused.
+On a terminal it asks y/N, but only for a row a terminal shows exactly:
+every value plain printable text (no control, format or separator character,
+non-ASCII space, combining mark, default-ignorable, variation selector or
+blank filler, no run of spaces or space at an end), at most 1024 bytes, and a
+target in clean form. Such a row — including legitimate paths with decomposed
+accents, Indic or Thai vowel signs, an ideographic space or an emoji variation
+selector — is confirmed with the exact values instead.
+
+Without a terminal, or for a row the terminal does not confirm, it needs the
+values you checked: --expect-driver and --expect-target, --expect-source when
+the row has a source, and --expect-mount-options when it has mount options.
+Any difference from the row is refused.
 
 It needs storage.hostpath at the cluster root, as naming the path in a create
 does, and is audited as storage.pool.trust, refusals included.`,
@@ -113,7 +121,8 @@ func runPoolTrust(ctx context.Context, c pb.LiteVirtClient, name, host string, e
 	case interactive:
 		if why := shown.notConfirmable(); why != "" {
 			return fmt.Errorf("%s, so what a terminal shows is not exactly what would be recorded; "+
-				"it is not confirmed interactively — check it and pass the exact values with --expect-driver, --expect-target, --expect-source and --expect-mount-options", why)
+				"it is not confirmed interactively. Confirm it with the exact values instead: --expect-driver and --expect-target, plus --expect-source and --expect-mount-options when the row has them "+
+				"(the way to confirm any path a terminal confirmation refuses: separators and non-ASCII spaces, combining marks, decomposed accents, emoji variation selectors, runs of spaces, over-long or non-clean paths)", why)
 		}
 		fmt.Fprintf(out, "Once trusted, the daemon on %s writes in %s as root. Trust this row? [y/N] ", show(shown.Host), show(orNone(shown.Target)))
 		line, _ := bufio.NewReader(in).ReadString('\n')

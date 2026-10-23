@@ -145,7 +145,7 @@ func TestRR2Probe_RC6HostUpgrade(t *testing.T) {
 				}
 			}
 			want := map[string]bool{"default": true, "isos": true, "vmpool": true, "scratch": true, "empty": false,
-				"nfspool": mounted, "nfsext": mounted}
+				"nfspool": true, "nfsext": false} // round 4: nfs adopted only in mounts/, nothing mounted to judge
 			for k, w := range want {
 				if got[k] != w {
 					t.Errorf("%s trusted=%t, expected %t", k, got[k], w)

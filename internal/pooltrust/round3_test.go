@@ -74,35 +74,77 @@ func TestJudge_TargetlessNFS(t *testing.T) {
 	}
 }
 
-// (re-review rr2 2) An nfs pool whose export is not mounted at the adoption
-// is held and recorded as pending (judged again on its first mount), and the
-// pending entry survives a restart; a dir pool held for lack of evidence is
-// not pending.
+// (re-review rr3 3) At the upgrade an nfs pool is adopted only when its
+// mount point is in <data_dir>/mounts — a target-less one, or one whose
+// target is there. One whose target is outside is held for `lv pool trust`,
+// even with this host's VM rows naming a qcow2 disk "in" it and that disk
+// present (as if the export were mounted): for nfs the header is served by
+// the export being judged and the rows are replicated, so neither is
+// evidence. Nothing is mounted to judge either.
 //
-// Mutation: do not record the pending nfs pools — red.
-func TestAdoptOnUpgrade_AnUnmountedNFSPoolIsPending(t *testing.T) {
+// Mutations: accept the qcow2 evidence for an nfs pool outside mounts/ —
+// red; drop the mounts/ adoption — the target-less pool is held, red.
+func TestAdoptOnUpgrade_NFSIsAdoptedOnlyInTheMountsArea(t *testing.T) {
 	f, db := adoptFixture(t)
 	ctx := context.Background()
-	tgt := filepath.Join(f.root, "nfsext")
-	if err := os.MkdirAll(tgt, 0o755); err != nil {
+	ext := filepath.Join(f.root, "etc-like", "50-local.d")
+	if err := os.MkdirAll(ext, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	poolWithDisk(t, db, "h1", "empty", filepath.Join(f.root, "empty"), "vm0", filepath.Join(f.root, "empty", "vm0.qcow2"))
-	if err := upsertNFS(ctx, db, "h1", "nfsext", "nas:/ext", tgt); err != nil {
+	if err := upsertNFS(ctx, db, "h1", "nfsext", "attacker:/ext", ext); err != nil {
+		t.Fatal(err)
+	}
+	writeQcow2(t, filepath.Join(ext, "vm-nfsext-root.qcow2"))
+	inArea := filepath.Join(f.data, "mounts", "nas_vols")
+	if err := upsertNFS(ctx, db, "h1", "nfsin", "nas:/vols", inArea); err != nil {
+		t.Fatal(err)
+	}
+	if err := upsertNFS(ctx, db, "h1", "nfsbare", "nas:/bare", ""); err != nil {
 		t.Fatal(err)
 	}
 	s := f.open(t)
-	if _, err := s.AdoptOnUpgrade(ctx, db, "h1"); err != nil {
+	a, err := s.AdoptOnUpgrade(ctx, db, "h1")
+	if err != nil {
 		t.Fatal(err)
 	}
-	p := f.open(t).PendingNFS()
-	if _, ok := p["nfsext"]; !ok || len(p) != 1 {
-		t.Fatalf("pending = %v, want only nfsext", p)
+	t.Logf("adopted=%v held=%v", a.Adopted, a.Held)
+	if s.Judge("nfsext", BindingOf("nfs", "attacker:/ext", ext, nil)).Trusted {
+		t.Error("an nfs pool mounted outside mounts/ was adopted on a qcow2 header and replicated rows")
 	}
-	if err := s.ResolvePending("nfsext", p["nfsext"], false); err != nil {
+	for name, b := range map[string]Binding{
+		"nfsin":   BindingOf("nfs", "nas:/vols", inArea, nil),
+		"nfsbare": BindingOf("nfs", "nas:/bare", "", nil),
+	} {
+		if e, ok := s.Entry(name); !ok || e.How != HowUpgrade || !s.Judge(name, b).Trusted {
+			t.Errorf("an nfs pool mounted in mounts/ (%s) was not adopted: %+v %t", name, e, ok)
+		}
+	}
+}
+
+// (re-review rr3 1) A ledger written by the round-3 build may hold
+// "pending_nfs": it is not read, nothing acts on it, and the next write
+// drops it.
+//
+// Mutation: carry unknown ledger fields through a write — red.
+func TestLedger_ARound3PendingEntryIsDropped(t *testing.T) {
+	f := newFixture(t)
+	path := filepath.Join(f.data, LedgerFile)
+	old := `{"version":1,"pools":{},"adopted":true,"pending_nfs":{"x/../../../etc/polkit-1/rules.d":{"driver":"nfs","source":"attacker:/x"}}}`
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if len(f.open(t).PendingNFS()) != 0 {
-		t.Fatal("a resolved pending entry came back after a restart")
+	s := f.open(t)
+	if !s.Initialised() {
+		t.Fatal("a round-3 ledger lost its adopted flag")
+	}
+	if err := s.Record("p", Binding{Driver: "dir", Target: filepath.Join(f.root, "p")}, HowTrust); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "pending_nfs") || strings.Contains(string(b), "polkit") {
+		t.Fatalf("the round-3 pending entry survived a write: %s", b)
 	}
 }

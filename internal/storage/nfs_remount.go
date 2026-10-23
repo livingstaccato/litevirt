@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -252,15 +253,62 @@ func MountNFSPool(ctx context.Context, dataDir string, cfg Config) error {
 	return nil
 }
 
-// UnmountNFSDir unmounts what is mounted at dir (umount -- dir), within the
-// NFS command timeout.
-func UnmountNFSDir(ctx context.Context, dir string) error {
+// AdoptionStagePrefix names the staging mount points an earlier test build
+// made in <data_dir>/mounts to judge a pool it did not trust. No build
+// mounts there now; SweepAdoptionStages removes what one left.
+const AdoptionStagePrefix = ".adopt-"
+
+// SweepAdoptionStages unmounts and removes the staging mount points an
+// earlier test build left in <data_dir>/mounts (AdoptionStagePrefix): only
+// entries directly in mounts/ with that name prefix that are real
+// directories — a symlink is never followed, nor anything below mounts/
+// touched. A mounted one is unmounted (umount --no-canonicalize, lazily when
+// busy), then the directory is removed if empty. It returns what it could
+// not clean, for the caller to log.
+func SweepAdoptionStages(ctx context.Context, dataDir string) []error {
+	mounts := filepath.Join(dataDir, "mounts")
+	ents, err := os.ReadDir(mounts)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return []error{fmt.Errorf("list %s: %w", mounts, err)}
+	}
+	var errs []error
+	for _, e := range ents {
+		if !strings.HasPrefix(e.Name(), AdoptionStagePrefix) || e.Type()&fs.ModeSymlink != 0 || !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(mounts, e.Name())
+		if fi, err := os.Lstat(dir); err != nil || !fi.IsDir() {
+			continue
+		}
+		if IsMountPoint(dir) {
+			if err := umountStage(ctx, dir, false); err != nil {
+				if lerr := umountStage(ctx, dir, true); lerr != nil {
+					errs = append(errs, fmt.Errorf("unmount %s: %v; lazily: %v", dir, err, lerr))
+					continue
+				}
+			}
+		}
+		if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("remove %s: %w", dir, err))
+		}
+	}
+	return errs
+}
+
+func umountStage(ctx context.Context, dir string, lazy bool) error {
 	uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultNFSCommandTimeout)
 	defer cancel()
-	out, err := nfsRunner()(uctx, "umount", "--", dir)
+	args := []string{"--no-canonicalize", "--", dir}
+	if lazy {
+		args = append([]string{"-l"}, args...)
+	}
+	out, err := nfsRunner()(uctx, "umount", args...)
 	invalidateMountCache()
 	if err != nil {
-		return fmt.Errorf("umount %s: %v: %s", dir, err, trimmedNFSCommandOutput(out))
+		return fmt.Errorf("%v: %s", err, trimmedNFSCommandOutput(out))
 	}
 	return nil
 }

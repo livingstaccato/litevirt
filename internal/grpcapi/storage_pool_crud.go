@@ -341,6 +341,11 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name is required")
 	}
+	// The name reaches a path (localPoolDir) and the row it names may be a
+	// forged one: only a valid pool name is deleted by name.
+	if err := safename.ValidatePoolName(req.Name); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 	host := req.Host
 	if host == "" {
 		host = s.hostName
@@ -417,7 +422,7 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 	// then kept (and a new pool of this name is refused it while it holds
 	// them).
 	ownDir := ""
-	if (rec.Driver == "local" || rec.Driver == "") && rec.Target == localPoolDir(s.dataDir, rec.Name) {
+	if own := localPoolDir(s.dataDir, rec.Name); own != "" && (rec.Driver == "local" || rec.Driver == "") && rec.Target == own {
 		ownDir = rec.Target
 		kept := s.cleanDaemonPoolDirs(ownDir)
 		if left := dirEntriesSample(ownDir, 5); len(left) > 0 {

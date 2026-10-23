@@ -1923,34 +1923,35 @@ there (its local ledger, `<data_dir>/pool-trust.json`), or it is a `local` or
 [storage.md](storage.md#which-pool-rows-a-host-acts-on)). The first start of a
 build with the ledger adopts the host's existing pools into it, once. It needs
 no coordination: each host judges only its own rows, and a host still on the
-older build acts on every row naming it, as before.
+older build acts on every row naming it, as before. The host never mounts an
+export a row names before it stands behind that row, to judge it or for any
+other reason.
 
 **Adopted automatically:**
 
 - pools in `config.yaml`, and the implicit default pool when it names none;
 - the daemon's own default pool and global ISO library;
 - `local` and `dir` pools in the daemon's own areas, used or empty;
-- a pool outside the areas whose directory directly holds a qcow2 disk of one
-  of this host's VMs recorded on it;
-- an `nfs` pool whose export is mounted at that first start and directly holds
-  such a disk, or, for one mounted in `<data_dir>/mounts/`, is mounted there.
-  An `nfs` pool whose export is not mounted then — upgraded together with a
-  reboot, before litevirt mounted it — is judged once more, by the same rule,
-  the first time its export mounts: the daemon mounts it hardened at a staging
-  point in `<data_dir>/mounts/`, reads the disk, and unmounts it.
+- a `local` or `dir` pool outside the areas whose directory directly holds a
+  qcow2 disk of one of this host's VMs recorded on it;
+- an `nfs` pool whose mount point is in `<data_dir>/mounts/`: one with no
+  target, or with a target there.
 
 **Held untrusted** — nothing on the host shows the pool is its own, and a row
 with nothing behind it is indistinguishable from one another member forged:
 
-- an empty pool outside the areas;
+- an empty `local` or `dir` pool outside the areas;
 - a pool of raw images or ISOs only, or whose disks are in subdirectories;
-- an `nfs` pool whose export, once mounted, holds none of this host's disks;
+- every `nfs` pool mounted outside `<data_dir>/mounts/` (an explicit target
+  elsewhere): its export, and the rows naming disks on it, can be anyone's;
 - a pool created while the host was rolled back to a build without the ledger:
-  the adoption has already run, and that build recorded nothing.
+  the adoption has already run, and that build recorded nothing;
+- a row whose name is not a valid pool name.
 
 A held pool is not used for anything: VMs with disks on it are refused at
-start, and it is not mounted, written, listed or swept. After rolling each
-host, look for `pool_row_untrusted`:
+start, and it is not mounted, written, listed or swept. Plan the roll so its
+VMs can wait, or confirm such pools right after each host is upgraded. After
+rolling each host, look for `pool_row_untrusted`:
 
 ```bash
 lv health                                       # pool_row_untrusted, per host
@@ -1962,13 +1963,20 @@ each one that is yours, confirm it on its host:
 ```bash
 lv pool trust vmstore --host host-b             # shows host-b's row, asks y/N
 lv pool trust vmstore --host host-b \
-    --expect-driver dir --expect-target /srv/vmstore   # from a script
+    --expect-driver nfs --expect-source nas:/vols \
+    --expect-target /srv/vmstore               # from a script, or a path the terminal refuses
 ```
 
 Without a terminal, give every value the row has — `--expect-source` and
 `--expect-mount-options` too when it has them — exactly as the pool's host
-shows them. One you did not make, delete with
+shows them. A path a terminal confirmation refuses (non-ASCII spaces,
+combining marks, emoji variation selectors, runs of spaces, over-long or
+non-clean paths) is confirmed the same way. One you did not make, delete with
 `lv pool delete <pool> --host <host>`, which removes only the row.
+
+A host upgraded from a build that judged held `nfs` pools by mounting their
+export at `<data_dir>/mounts/.adopt-<name>` unmounts and removes any such
+directory it finds at its next start (lazily when busy).
 
 ### Console passwords start after the roll
 

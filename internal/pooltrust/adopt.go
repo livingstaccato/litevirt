@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
@@ -31,9 +32,8 @@ type Adoption struct {
 // not a ledger file was already written, by the daemon's own pools or a
 // create — or after the ledger and every kept copy of it were removed. Every
 // row naming host that needs trust and is not already trusted (config, area)
-// is recorded in the ledger only when the host's own disk shows it in use
-// (upgradeEvidence); an nfs pool whose export is not mounted then is judged
-// once more when it first mounts (PendingNFS); any other is left untrusted,
+// is recorded in the ledger only on the evidence upgradeEvidence takes; it
+// mounts nothing to look; any other row is left untrusted,
 // for pool_row_untrusted to name and `lv pool trust` to confirm. The ledger
 // is then written with adopted set, so this does not run again: a row
 // arriving later is trusted only through a create on this host or a
@@ -51,22 +51,18 @@ func (s *Store) AdoptOnUpgrade(ctx context.Context, db *corrosion.Client, host s
 	}
 	out := Adoption{Ran: true}
 	add := map[string]Entry{}
-	pend := map[string]Binding{}
 	now := time.Now().UTC().Format(time.RFC3339)
 	for _, r := range rows {
 		b := BindingOf(r.Driver, r.Source, r.Target, r.Options)
 		if v := s.Judge(r.Name, b); v.Trusted {
 			continue
 		}
+		if err := safename.ValidatePoolName(r.Name); err != nil {
+			out.Held = append(out.Held, fmt.Sprintf("%q (%v)", r.Name, err))
+			continue
+		}
 		ok, why := s.upgradeEvidence(ctx, db, host, r.Name, b)
 		if !ok {
-			// An nfs export not mounted now (an upgrade together with a
-			// reboot) shows nothing either way: judged once more when it
-			// first mounts (ResolvePending).
-			if b.Driver == "nfs" && !nfsMountedNow(s.dataDir, b) {
-				pend[r.Name] = b
-				why += "; judged again when its export first mounts"
-			}
 			out.Held = append(out.Held, fmt.Sprintf("%s (%s)", r.Name, why))
 			continue
 		}
@@ -82,77 +78,13 @@ func (s *Store) AdoptOnUpgrade(ctx context.Context, db *corrosion.Client, host s
 	for k, v := range add {
 		next[k] = v
 	}
-	prevPending := s.pending
-	if len(pend) > 0 {
-		s.pending = map[string]Binding{}
-		for k, v := range prevPending {
-			s.pending[k] = v
-		}
-		for k, v := range pend {
-			s.pending[k] = v
-		}
-	}
 	s.initialised = true
 	if err := s.writeLocked(next); err != nil {
 		s.initialised = false
-		s.pending = prevPending
 		return out, err
 	}
 	s.entries = next
 	return out, nil
-}
-
-// nfsMountedNow reports whether an nfs pool's export is mounted at its mount
-// point now.
-func nfsMountedNow(dataDir string, b Binding) bool {
-	st, err := storage.CheckNFSPoolMount(dataDir, storage.Config{Driver: b.Driver, Source: b.Source, Target: b.Target})
-	return err == nil && st.Mounted
-}
-
-// PendingEvidence judges a pending nfs pool (PendingNFS) once its export is
-// mounted at mountedAt — its own mount point, or a staging one the daemon
-// mounted it at for this: the evidence rules of upgradeEvidence, with the
-// files read under mountedAt. A disk of this host's recorded on the pool
-// whose directory, resolved, is the pool's mount point, resolved, must be a
-// regular qcow2 file (opened without following a link) at that name in the
-// mounted export.
-func (s *Store) PendingEvidence(ctx context.Context, db *corrosion.Client, host, name string, b Binding, mountedAt string) (bool, string) {
-	b = b.normalized()
-	dir := s.poolDir(b)
-	if dir == "" || !filepath.IsAbs(dir) {
-		return false, "it names no directory"
-	}
-	if err := storage.CheckWriteRoot(dir, s.dataDir, s.pkiDir); err != nil {
-		return false, err.Error()
-	}
-	paths, why := ownDiskPaths(ctx, db, host, name)
-	if len(paths) == 0 {
-		return false, why
-	}
-	found, err := storage.Bounded("judge a pool for upgrade adoption at", mountedAt, func() (string, error) {
-		rdir, err := filepath.EvalSymlinks(dir)
-		if err != nil {
-			return "", nil
-		}
-		for _, p := range paths {
-			p = filepath.Clean(p)
-			rparent, err := filepath.EvalSymlinks(filepath.Dir(p))
-			if err != nil || rparent != rdir {
-				continue
-			}
-			if hasQcow2Magic(filepath.Join(mountedAt, filepath.Base(p))) {
-				return p, nil
-			}
-		}
-		return "", nil
-	})
-	if err != nil {
-		return false, "its export did not answer: " + err.Error()
-	}
-	if found == "" {
-		return false, "no disk recorded on it is a qcow2 image directly in its export"
-	}
-	return true, "its mounted export holds this host's disk " + found
 }
 
 // ownDiskPaths are the paths of the live disks of this host's live VMs
@@ -207,8 +139,13 @@ func (s *Store) poolDir(b Binding) string {
 //     vms row of this host) are replicated, so a forger can write them too:
 //     they only say which files to look at. Every file-based disk litevirt
 //     creates is qcow2; or
-//   - for an nfs pool whose mount point is in <data_dir>/mounts, its export
-//     is mounted there now.
+//   - an nfs pool is adopted only when its mount point (its target, or
+//     <data_dir>/mounts/<source> without one) is in <data_dir>/mounts: the
+//     daemon's own area, where a mount cannot reach anything else. For nfs
+//     nothing else counts: a qcow2 header on the export is served by the
+//     export being judged, and the rows naming it are replicated, so both are
+//     the forger's. Every other nfs pool waits for `lv pool trust`. Nothing
+//     is mounted to judge it.
 //
 // The directory must also pass CheckWriteRoot.
 func (s *Store) upgradeEvidence(ctx context.Context, db *corrosion.Client, host, name string, b Binding) (bool, string) {
@@ -221,11 +158,9 @@ func (s *Store) upgradeEvidence(ctx context.Context, db *corrosion.Client, host,
 	}
 	if b.Driver == "nfs" {
 		if in, err := storage.InDataDirPoolArea(dir, s.dataDir, s.pkiDir); err == nil && in {
-			st, err := storage.CheckNFSPoolMount(s.dataDir, storage.Config{Driver: b.Driver, Source: b.Source, Target: b.Target})
-			if err == nil && st.Mounted {
-				return true, "its export is mounted at " + dir
-			}
+			return true, "its mount point " + dir + " is in the daemon's mounts/ area"
 		}
+		return false, "an nfs pool mounted outside <data_dir>/mounts is confirmed with `lv pool trust`"
 	}
 	paths, why := ownDiskPaths(ctx, db, host, name)
 	if len(paths) == 0 {

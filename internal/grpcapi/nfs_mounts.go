@@ -202,7 +202,6 @@ func (s *Server) ReconcileNFSMounts(ctx context.Context) {
 		s.reconcileNFSPool(ctx, r, tried)
 	}
 	s.resolveGoneNFSPoolConditions(ctx, live)
-	s.retryPendingNFSAdoptions(ctx)
 }
 
 // reconcileNFSPool checks one pool's mount (once per mount point in a pass:

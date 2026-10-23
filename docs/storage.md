@@ -72,7 +72,9 @@ on a row naming it only when it stands behind that row. A row naming a place on
 the host's filesystem (a `local` or `dir` target, a `btrfs` source) or an `nfs`
 export (with or without a target: its mount point is the target, or
 `<data_dir>/mounts/<source>`) is used only when it is one of these, with the
-same driver, source, target and, for `nfs`, mount options:
+same driver, source, target and, for `nfs`, mount options (a row whose name is
+not a valid pool name — a `/`, `..`, NUL, a leading `-`, too long — is never
+any of them):
 
 - **in the host's `config.yaml`** (`storage_pools:`; with none configured, the
   implicit default pool);
@@ -123,8 +125,11 @@ then asks y/N — unless a value is not plain printable text (a control, format,
 separator, invisible or filler character), is longer than 1024 bytes, or the
 target is not in clean form (it names the clean form it would be used as):
 such a row is shown escaped and cut, and is not confirmed interactively, since
-what a terminal shows would not be exactly the row; without a terminal it needs
-the values you checked, `--expect-driver`
+what a terminal shows would not be exactly the row. Such a row — which can be
+a legitimate path with decomposed accents, Indic or Thai vowel signs, an
+ideographic space, an emoji variation selector or a run of spaces — is
+confirmed with the exact values instead, and the refusal says so. Without a
+terminal it needs the values you checked, `--expect-driver`
 and `--expect-target`, plus `--expect-source` and `--expect-mount-options` when
 the row has them, and refuses on any difference. What is sent is what you
 confirmed, never a fresh read of the row: the host records it only when its row
@@ -159,18 +164,18 @@ in use, and the guard is the disk itself: a file recorded on the pool is a
 qcow2 image (a regular file, not a symlink) whose directory, with symlinks
 resolved, IS the pool's directory, resolved — a parent of a real pool's
 directory, or a directory with the disk deeper down, is not that. The disk and
-VM rows that name the file are replicated, so they only point at candidates. An
-`nfs` pool mounted under `<data_dir>/mounts/` is also adopted when its export is
-mounted there. An `nfs` pool whose export is not mounted at that start (an
-upgrade together with a reboot) is judged once more, by the same rule, the
-first time its export mounts: the daemon mounts it hardened at a staging point
-in `<data_dir>/mounts/` — never at the target the untrusted row names — reads
-the disk there, and unmounts it. A directory that merely exists, or a row naming a file that is
-not a qcow2 image directly in it, is not enough, so a forged row written before
-the upgrade is not adopted. Pools that are not adopted (an empty pool
-outside the pool areas, a pool of raw images or ISOs only, a pool whose disks
-are in subdirectories, a pool created while the host was rolled back to a build
-without the ledger) are held untrusted until confirmed with `lv pool trust`. The adoption runs once; a row arriving later is trusted only
+VM rows that name the file are replicated, so they only point at candidates. A
+directory that merely exists, or a row naming a file that is not a qcow2 image
+directly in it, is not enough, so a forged row written before the upgrade is
+not adopted. An `nfs` pool is adopted only when its mount point is in
+`<data_dir>/mounts/` (no target, or a target there): for `nfs` a disk header is
+served by the export itself and the rows are replicated, so neither counts, and
+nothing is mounted to look. Pools that are not adopted (an empty pool outside
+the pool areas, a pool of raw images or ISOs only, a pool whose disks are in
+subdirectories, any `nfs` pool mounted outside `<data_dir>/mounts/`, a pool
+created while the host was rolled back to a build without the ledger) are held
+untrusted until confirmed with `lv pool trust`. The host never mounts an export
+a row names before it stands behind that row. The adoption runs once; a row arriving later is trusted only
 through a create or a confirmation on its host.
 
 A ledger that cannot be read is kept as `pool-trust.json.corrupt-<time>` before

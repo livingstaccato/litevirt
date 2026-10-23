@@ -7,7 +7,7 @@
 // and nothing else. A reader that finds it malformed does not trust any of it.
 //
 // It is a trust anchor all the same: its pki_dir names the CA a local lv
-// verifies the daemon against, and lv then sends its bearer token. So the
+// verifies the daemon against, and the CLI then sends its bearer token. So the
 // reader accepts only a regular file owned by root and writable by root
 // alone, in a directory owned by root and writable by root alone, and the
 // writer refuses to write into a directory that fails the same check.
@@ -101,7 +101,7 @@ func Write(path string, e Endpoint) error {
 	dir := filepath.Dir(path)
 	if err := os.Mkdir(dir, 0o755); err == nil {
 		// Not left to the umask: under a restrictive one (077) it would be
-		// 0700, and no non-root lv could reach the file.
+		// 0700, and no non-root CLI could reach the file.
 		if err := os.Chmod(dir, 0o755); err != nil {
 			return err
 		}

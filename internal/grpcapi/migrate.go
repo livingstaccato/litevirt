@@ -1960,8 +1960,9 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 				"firmware path layout differs between source and target (dataDir/OVMF paths); cold firmware migration requires an identical layout on both hosts")
 		}
 		// Validate the XML identity matches the request — never define a mismatched
-		// or unrelated domain via this RPC.
-		if xn, xu := domainIdentity(req.DomainXml); xn != req.VmName || (req.Uuid != "" && xu != req.Uuid) {
+		// or unrelated domain via this RPC. A uuid compares without case: libvirt
+		// reports lower case, and a stored spec uuid is never overwritten.
+		if xn, xu := domainIdentity(req.DomainXml); xn != req.VmName || (req.Uuid != "" && !strings.EqualFold(xu, req.Uuid)) {
 			wipe()
 			return nil, status.Errorf(codes.InvalidArgument,
 				"domain XML identity (name=%q uuid=%q) does not match request (name=%q uuid=%q)", xn, xu, req.VmName, req.Uuid)

@@ -143,9 +143,12 @@ the host identity the daemon loads from the config's `pki_dir`
 cluster's CA and is a host certificate (ServerAuth usage, not the lv-cli
 client or an audit certificate), and a `host.key` beside it that is its key.
 Certificates are public, so a certificate alone proves nothing. The machine
-proves it holds the key by signing a random challenge with `openssl` there;
-where it has no `openssl`, the key is read over the same root SSH session,
-compared in memory, and never written or logged. The add refuses:
+proves it holds the key by signing a random, domain-separated challenge
+with `openssl` there, bounded by a 30-second timeout; where it has no
+`openssl`, or that run fails or times out, the key is read over the same
+root SSH session, compared in memory, and never written or logged. A
+`host.key` that is not a regular file (a device, a FIFO, or a link to one)
+is refused before `openssl` runs. The add refuses:
 
 - a `ca.crt` in `/etc/litevirt/pki` or the config's `pki_dir` holding any CA
   but this cluster's (a bundle with another CA in it included), or a CA key

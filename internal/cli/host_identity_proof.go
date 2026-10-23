@@ -90,7 +90,7 @@ func signedChallenge(m stateProbe, keyPath string, cert *x509.Certificate) (prov
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return false, err
 	}
-	challenge := hex.EncodeToString(nonce[:])
+	challenge := keyProofDomain + hex.EncodeToString(nonce[:])
 	out, err := m.Shell(keyProofKind, keyProofCmd(m.Path(keyPath), challenge))
 	if err != nil {
 		return false, fmt.Errorf("the challenge did not run: %w", err)
@@ -99,6 +99,10 @@ func signedChallenge(m stateProbe, keyPath string, cert *x509.Certificate) (prov
 	switch {
 	case line == "NOKEY":
 		return false, fmt.Errorf("there is no key")
+	case line == "NOTFILE":
+		// A device, FIFO or directory (or a link to one): openssl would
+		// block on it, and no host key is one.
+		return false, fmt.Errorf("it is not a regular file")
 	case line == "NOSIGN":
 		return false, nil
 	case !strings.HasPrefix(line, "SIG "):
@@ -124,17 +128,29 @@ func signedChallenge(m stateProbe, keyPath string, cert *x509.Certificate) (prov
 	return true, nil
 }
 
+// keyProofDomain prefixes every challenge, so a signature made for this
+// proof can never stand for one another signer of the host key asks for.
+const keyProofDomain = "litevirt-host-add-proof-v1:"
+
+// keyProofTimeout bounds the openssl run on the machine, in seconds (where
+// it has `timeout`); a run it ends is NOSIGN, and the key is compared in
+// memory. A var so a test can shorten it.
+var keyProofTimeout = 30
+
 // keyProofCmd signs challenge with keyPath (as the shell names it) and
-// prints "SIG <base64>", "NOKEY" when there is no key, or "NOSIGN" when the
-// machine cannot sign (no openssl, or a key it cannot sign with). The key
-// never leaves openssl.
+// prints "SIG <base64>", "NOKEY" when there is no key, "NOTFILE" when the
+// key path (followed through links) is not a regular file, or "NOSIGN" when
+// the machine cannot sign (no openssl, a key it cannot sign with, or a run
+// past keyProofTimeout). The key never leaves openssl.
 func keyProofCmd(keyPath, challenge string) string {
 	k := ssh.ShellQuote(keyPath)
 	o := ssh.ShellQuote(openSSLBin)
 	return fmt.Sprintf(`if [ ! -e %s ]; then echo NOKEY; `+
+		`elif [ ! -f %s ]; then echo NOTFILE; `+
 		`elif ! command -v %s >/dev/null 2>&1; then echo NOSIGN; `+
-		`elif s=$(printf '%%s' %s | %s dgst -sha256 -sign %s 2>/dev/null | base64 | tr -d '\n') && [ -n "$s" ]; then echo "SIG $s"; `+
-		`else echo NOSIGN; fi`, k, o, ssh.ShellQuote(challenge), o, k)
+		`else t=; if command -v timeout >/dev/null 2>&1; then t="timeout %d"; fi; `+
+		`if s=$(printf '%%s' %s | $t %s dgst -sha256 -sign %s 2>/dev/null | base64 | tr -d '\n') && [ -n "$s" ]; then echo "SIG $s"; `+
+		`else echo NOSIGN; fi; fi`, k, k, o, keyProofTimeout, ssh.ShellQuote(challenge), o, k)
 }
 
 // keyMatchesCert reports whether the PEM private key keyPEM is cert's: the

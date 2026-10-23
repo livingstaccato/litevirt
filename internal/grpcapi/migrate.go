@@ -2074,7 +2074,6 @@ func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vm
 			return fwTargetUntouched, "", status.Errorf(codes.FailedPrecondition,
 				"firmware state for %q is not present on this host; cannot migrate it consistently", vmName)
 		}
-		req.Uuid = fs.UUID
 		req.Bundle = buf.Bytes()
 		req.SourceFirmwareFingerprint = s.firmwareLayoutFingerprint()
 	}

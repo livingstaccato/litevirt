@@ -209,7 +209,9 @@ lv host label rm <host> <key> ...         # Remove labels from a host
 lv host label ls <host>                   # List labels on a host
 lv host config <host>                     # Configure host settings
   [--fence-strategy ssh|ipmi|redfish|watchdog|manual|best-effort]
-  [--ipmi-address <addr>] [--ipmi-user <u>] [--ipmi-pass <p>]
+  [--ipmi-address <addr>] [--ipmi-user <u>]
+  [--ipmi-pass-file <path>|-]             # password from a file or stdin (preferred)
+  [--ipmi-pass <p>]                       # password on the command line (visible in ps; warns)
   [--clear-ipmi]                          # Remove the IPMI address, user and password
   [--redfish-endpoint https://<bmc>[:port]] [--redfish-user <u>]
   [--redfish-pass-file <path>|-]          # password from a file or stdin (preferred)

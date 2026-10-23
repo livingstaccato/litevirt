@@ -980,8 +980,14 @@ lv host config host-b \
   --fence-strategy ipmi \
   --ipmi-address 10.0.50.111 \
   --ipmi-user admin \
-  --ipmi-pass <secret>
+  --ipmi-pass-file /root/bmc-pass
 ```
+
+`--ipmi-pass-file` takes a path, or `-` to read the password from stdin, and
+drops one trailing newline; an empty password is refused. `--ipmi-pass <secret>`
+still works, but the password is then visible to every user in `ps` on the
+machine running `lv`, and stays in the shell history, so `lv` prints a warning
+when it is used. The two flags are mutually exclusive.
 
 An empty `--ipmi-*` flag leaves the setting alone. To remove a host's IPMI
 address, user and password, use `--clear-ipmi`; a host that fences by `ipmi`
@@ -1000,7 +1006,7 @@ back still has an IPMI address.
 
 `lv host rm` and a re-admission by `lv host add` retire the host's IPMI
 password, and it never falls back to a password from before the removal.
-Until it is set again with `lv host config <host> --ipmi-pass`, an `ipmi`
+Until it is set again with `lv host config <host> --ipmi-pass-file`, an `ipmi`
 fence of that host fails at once with `no IPMI password` and sends nothing to
 the BMC. A password that was never set is sent empty, for a BMC user with no
 password, and the fence result says so.

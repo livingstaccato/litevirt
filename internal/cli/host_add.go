@@ -1685,7 +1685,8 @@ func topLevelKeySpan(lines []string, key string) (start, end int, found bool) {
 
 // hostConfig is the host's config.yaml with the add's keys edited in, as a
 // file to install at the path it resolves to (a symlinked config stays a
-// symlink) and at its own mode; nil when the host has none.
+// symlink) and at its own mode less any group or other bits; nil when the
+// host has none.
 func hostConfig(r addRemote, p hostAddPlan) (*addFile, error) {
 	q := ssh.ShellQuote(r.Path(remoteConfig))
 	out, err := r.Shell("config", fmt.Sprintf("if [ -e %s ]; then readlink -f -- %s; stat -L -c %%a -- %s; fi", q, q, q))
@@ -1719,7 +1720,9 @@ func hostConfig(r addRemote, p hostAddPlan) (*addFile, error) {
 	if err != nil {
 		return nil, refuse(err)
 	}
-	return &addFile{path, merged, os.FileMode(mode)}, nil
+	// At its own mode, but never wider than 0600: the config can hold an auth
+	// realm's inline secret, and /etc/litevirt is searchable by every user.
+	return &addFile{path, merged, os.FileMode(mode) & 0o600}, nil
 }
 
 // Where admittedPairOnMachine found the admitted pair.

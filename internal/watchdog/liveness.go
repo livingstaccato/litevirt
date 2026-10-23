@@ -16,11 +16,11 @@ import (
 // workloads: the gate stops petting and self-fences instead.
 //
 // Progress, not timestamps: each side reports a counter that moves on every
-// unit of work (a DB round trip; a pauser pass and every record it handles),
-// and the gate times how long a counter has stood still on the monotonic
-// clock. A step of the wall clock (an NTP step at boot, a bad RTC, date -s)
-// therefore cannot look like a wedge, and a long but moving pass (a dozen
-// container settles after a heal) is not one either.
+// unit of work (a completed DB round trip; a pauser pass and every record it
+// handles), and the gate times how long a counter has stood still on the
+// monotonic clock. A step of the wall clock (an NTP step at boot, a bad RTC,
+// date -s) therefore cannot look like a wedge, and a long but moving pass (a
+// dozen container settles after a heal) is not one either.
 //
 // The gate runs only on a configured, verified, armed hardware watchdog: the
 // same condition under which the pauser and the VIP demoter may self-fence.
@@ -56,9 +56,10 @@ type livenessWiring struct {
 // The gate runs it every pet interval. The timeout bounds the round trip, not
 // the wait for the state store's lock: a writer holding that lock past the
 // threshold is a lock left held, the wedge the gate exists to catch, so the
-// probe waits behind it and the counter stands still. A round trip that
-// returns an error, its own timeout's included, still counts as progress: a
-// disk error is not a wedge, and has its own handling.
+// probe waits behind it and the counter stands still. Only a probe that
+// returns nil counts as progress: one that returns an error (its timeout, an
+// interrupted query, SQLITE_BUSY or SQLITE_LOCKED) leaves the counter where
+// it was.
 func (c *Controller) SetDBProbe(fn func(context.Context) error) {
 	if c == nil {
 		return
@@ -174,8 +175,8 @@ func (c *Controller) startLivenessGate(ctx context.Context, interval time.Durati
 
 func (g *livenessGate) stop() { g.cancel() }
 
-// runDB runs probe every interval, synchronously: a probe that never returns
-// is exactly what a standing counter reports.
+// runDB runs probe every interval, synchronously: a probe that never returns,
+// or returns only errors, is exactly what a standing counter reports.
 func (g *livenessGate) runDB(ctx context.Context, probe func(context.Context) error, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -187,8 +188,11 @@ func (g *livenessGate) runDB(ctx context.Context, probe func(context.Context) er
 			pctx, cancel := context.WithTimeout(ctx, interval/3)
 			err := probe(pctx)
 			cancel()
-			if err != nil && ctx.Err() == nil {
-				slog.Warn("watchdog: liveness DB round trip returned an error (counted as progress)", "error", err)
+			if err != nil {
+				if ctx.Err() == nil {
+					slog.Warn("watchdog: liveness DB round trip returned an error (not counted as progress)", "error", err)
+				}
+				continue
 			}
 			g.dbDone.Add(1)
 		}

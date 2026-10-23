@@ -234,7 +234,9 @@ func (d *Daemon) wireWatchdog(ctrl *watchdog.Controller) {
 	ctrl.SetRunDir(d.watchdogRunDir)
 	ctrl.SetLivenessStale(time.Duration(d.cfg.Watchdog.LivenessStaleSec) * time.Second)
 	// Query waits for the client's lock without ctx: a writer holding it past
-	// the threshold is the wedge the gate catches (SetDBProbe).
+	// the threshold is the wedge the gate catches. Only a nil return counts as
+	// progress; a timeout, an interrupt or SQLITE_BUSY/LOCKED does not
+	// (SetDBProbe).
 	ctrl.SetDBProbe(func(ctx context.Context) error {
 		_, err := d.db.Query(ctx, "SELECT 1")
 		return err

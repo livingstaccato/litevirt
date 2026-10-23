@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -180,7 +181,8 @@ func TestRun_WiresTheWatchdogController(t *testing.T) {
 // threshold self-fences.
 //
 // Mutations: make the probe a no-op, or have it stop waiting for the lock at
-// its timeout, and the held-lock check goes red.
+// its timeout, and the held-lock check goes red; have it drop Query's error
+// and the deadline check goes red.
 func TestWireWatchdog_DBProbeWaitsBehindAHeldWriteLock(t *testing.T) {
 	d := &Daemon{cfg: &Config{Watchdog: WatchdogConfig{LivenessStaleSec: 120}},
 		db: corrosion.NewTestClientT(t), watchdogRunDir: t.TempDir()}
@@ -219,7 +221,12 @@ func TestWireWatchdog_DBProbeWaitsBehindAHeldWriteLock(t *testing.T) {
 	mu.Unlock()
 	locked = false
 	select {
-	case <-done:
+	case err := <-done:
+		// It got the lock past its timeout: an error, which the gate does not
+		// count as progress (watchdog.SetDBProbe).
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("the probe that waited past its timeout returned %v, want a deadline error", err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the probe did not return once the writer released the lock")
 	}

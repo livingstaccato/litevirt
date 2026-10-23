@@ -134,10 +134,11 @@ watchdog_dev: ""
 #
 # liveness_stale_sec: with watchdog_dev set and the device verified as a
 # counting hardware watchdog, the daemon stops petting it, and self-fences,
-# once either the state-store round trip or the partition pauser has made no
-# progress for this long, so a wedged daemon cannot keep its workloads behind
-# a petted watchdog. Progress is timed on the monotonic clock, so a wall-clock
-# step is not a wedge. 0 turns this off; otherwise it must be at least 120
+# once either no state-store round trip has completed or the partition pauser
+# has made no progress for this long, so a wedged daemon cannot keep its
+# workloads behind a petted watchdog. A round trip that fails (a timeout, an
+# interrupted query, SQLITE_BUSY or SQLITE_LOCKED) is not progress. Progress
+# is timed on the monotonic clock, so a wall-clock step is not a wedge. 0 turns this off; otherwise it must be at least 120
 # (twice the hardware watchdog timeout). It does nothing in auto mode
 # (watchdog_dev empty) or on an unverified device.
 watchdog:

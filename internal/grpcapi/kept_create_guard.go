@@ -136,7 +136,7 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 			// A missing backing file ends it, as nothing under it is reached.
 			stat := chainStat // read here: the walk may outlive this call
 			layers, err := storage.Bounded("read the backing chain of", p, func() ([]string, error) {
-				l, _, err := walkKeptChain(stat, p, true)
+				l, _, _, err := walkKeptChain(stat, p, true)
 				return l, err
 			})
 			if err != nil {
@@ -311,7 +311,7 @@ func (s *Server) keptCollisionScan(writes func(string) bool) (string, error) {
 			missing string
 		}
 		w, err := storage.Bounded("read the backing chain of", p, func() (walked, error) {
-			l, m, err := walkKeptChain(stat, p, true)
+			l, m, _, err := walkKeptChain(stat, p, true)
 			return walked{l, m}, err
 		})
 		if err != nil {

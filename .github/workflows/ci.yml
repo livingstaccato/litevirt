@@ -32,10 +32,20 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # internal/fencessh runs a real OpenSSH sshd, unprivileged on loopback,
+      # and skips without one. LITEVIRT_REQUIRE_SSHD=1 below turns that skip
+      # into a failure, so these packages must be here.
+      - name: Install OpenSSH
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssh-server openssh-client systemd
+
       # Unit tests. The tests/e2e and tests/cluster suites are intentionally
       # excluded: they require a live multi-host cluster with PKI under
       # /etc/litevirt and root privileges.
       - name: Test
+        env:
+          LITEVIRT_REQUIRE_SSHD: "1"
         run: go test ./internal/... ./cmd/...
 
       # The in-process fleet integration suite, in its own step with its own

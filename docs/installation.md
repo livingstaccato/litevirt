@@ -41,10 +41,9 @@ The fastest way to get started — run everything on one machine:
 sudo cp bin/litevirt /usr/local/bin/
 sudo ln -sf /usr/local/bin/litevirt /usr/local/bin/lv
 sudo litevirt host init --local --name node-1
-sudo systemctl enable --now litevirt.service
 ```
 
-This generates the PKI, installs dependencies (libvirt, QEMU), writes the config, and sets up the systemd unit — all locally, no SSH needed.
+This generates the PKI, installs dependencies (libvirt, QEMU), writes the config, and sets up the systemd unit — all locally, no SSH needed. It also enables and starts `litevirt.service`, and says so; there is nothing more to start.
 
 ```bash
 export LV_HOST=root@127.0.0.1
@@ -66,7 +65,7 @@ export LV_HOST=root@10.0.50.10
 lv host init root@10.0.50.10 --name host-a
 ```
 
-This generates the cluster PKI (CA + host certificate), creates `/etc/litevirt/config.yaml`, and installs a systemd unit.
+This generates the cluster PKI (CA + host certificate), creates `/etc/litevirt/config.yaml`, and installs, enables and starts the systemd unit.
 
 `lv host init` is for the first host only. It refuses a target that is already a
 member: one whose `join_peers` lists peers, or one whose address the cluster this
@@ -77,14 +76,7 @@ added back with `lv host add`. It also refuses a target holding another
 cluster's state, as `lv host add` does (see [Add hosts to the cluster](#add-hosts-to-the-cluster)),
 and `--force` does not override that check.
 
-3. SSH into the host and start the daemon:
-
-```bash
-ssh root@10.0.50.10
-systemctl enable --now litevirt
-```
-
-4. Verify the cluster is running:
+3. Verify the cluster is running:
 
 ```bash
 lv status

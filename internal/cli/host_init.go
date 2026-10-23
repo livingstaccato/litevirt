@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -517,10 +518,16 @@ func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bo
 		return fmt.Errorf("setup script failed: %w", err)
 	}
 
-	fmt.Printf("Host %s initialized locally\n", hostName)
-	fmt.Println("  Start the daemon: systemctl enable --now litevirt.service")
-	fmt.Println("  Or run directly:  litevirt daemon")
+	printLocalInitDone(os.Stdout, hostName)
 	return nil
+}
+
+// printLocalInitDone is what `lv host init --local` prints once setup has
+// run. Setup has already enabled and (re)started litevirt.service, so it
+// says so rather than telling the operator to start it.
+func printLocalInitDone(w io.Writer, hostName string) {
+	fmt.Fprintf(w, "Host %s initialized locally\n", hostName)
+	fmt.Fprintln(w, "  The daemon is enabled and running: systemctl status litevirt.service")
 }
 
 type cliPKITarget struct {
@@ -1285,10 +1292,15 @@ CONF
 # Propagate the adding node's enforcement block: capability latches require
 # config uniformity, and a host that boots without the flags silently weakens
 # the cluster (a re-admitted signer without enforcement.audit_signature writes
-# unsigned audit rows that every node reports as tampering).
+# unsigned audit rows that every node reports as tampering). An init has no
+# adding node: its block is the new cluster's (or the host's own, kept).
 if [ -n "${ENFORCEMENT_B64:-}" ]; then
     echo "${ENFORCEMENT_B64}" | base64 -d >> /etc/litevirt/config.yaml
-    echo "enforcement config propagated from the adding node"
+    if [ "${LITEVIRT_GENESIS:-}" = "1" ]; then
+        echo "enforcement config written for the cluster this host founds"
+    else
+        echo "enforcement config propagated from the adding node"
+    fi
 fi
 fi
 

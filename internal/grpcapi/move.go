@@ -823,6 +823,16 @@ func (s *Server) diskDriver(ctx context.Context, d *corrosion.DiskRecord) (stora
 		}
 	} else if pool, ok := s.lookupStoragePool(d.StorageVolume); ok {
 		cfg = storage.Config{Driver: pool.Driver, Source: pool.Source, Target: pool.Target, Options: pool.Options}
+	} else if strings.EqualFold(cfg.Driver, "dir") {
+		// A `dir` disk whose pool is not on this host: it was moved here from
+		// the host that has the pool (a cold move keeps the disk record's
+		// pool name), or its pool was removed here. The dir driver's Target
+		// only roots creates; removing a file is by its recorded path, as
+		// the local driver does, so the delete frees the file where it is
+		// rather than failing with "dir driver requires Target" and leaving
+		// the VM half deleted. The file is still checked afterwards
+		// (freeRecordedVMDisks), so one that is not removed is named.
+		cfg.Driver = "local"
 	}
 	if cfg.Driver == "" {
 		cfg.Driver = "local"

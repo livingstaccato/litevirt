@@ -485,7 +485,10 @@ and in the file-based pool directories the cluster records for the source host.
 A VM promoted onto a witness is the usual case: the witness's `default` pool is
 `<data_dir>/pools/default`, while the workers of an older cluster keep theirs at
 `<data_dir>/disks`, and the move is not refused for it. The disk stays in the
-source's pool directory on the target, and its record keeps the pool name.
+source's pool directory on the target, and its record keeps the pool name. A
+later `lv rm` frees a `dir` disk by its recorded path even when that pool exists
+on no other host than the one it left, and a disk that cannot be removed still
+fails the delete and is named, as for any disk.
 Nothing wider is accepted: a path outside those directories, one that climbs out
 of them with `..`, or a pool row that names the target's own data directory
 (or a place in it outside `disks/`, `pools/` and `mounts/`) is refused with

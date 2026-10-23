@@ -182,19 +182,14 @@ func openPinnedDirAnchored(anchorFS, anchorRel, rel string, create, mkAnchor boo
 // directory, following no link.
 func openBeneath(dirfd int, name string) (int, error) {
 	if !openat2Disabled {
-		fd, err := unix.Openat2(dirfd, name, &unix.OpenHow{
-			Flags:   unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC,
-			Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS,
-		})
-		switch {
-		case err == nil:
+		if fd, used, err := openat2Beneath(dirfd, name); used {
+			if err != nil {
+				return -1, beneathErr(name, err)
+			}
 			return fd, nil
-		case errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EPERM):
-			// No openat2 here (kernel before 5.6) or a sandbox that refuses
-			// it: the component walk below is the same rule.
-		default:
-			return -1, beneathErr(name, err)
 		}
+		// No openat2 here (kernel before 5.6, a sandbox that refuses it, or not
+		// Linux): the component walk below is the same rule.
 	}
 	fd, err := unix.Openat(dirfd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {

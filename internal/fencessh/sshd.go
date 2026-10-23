@@ -27,12 +27,19 @@ func SSHDPath() string {
 // AuthorizedKeysFile lists it (an operator's own), public-key authentication
 // is on, and PermitRootLogin is not no. An `sshd -T` that cannot run is an
 // evaluation failure (err), not an answer: the caller keeps what it last
-// published. configFile "" is sshd's own.
+// published. configFile "" is sshd's own. Run as root, it first creates
+// sshd's privilege separation directory if it is missing (PrivsepDir), and
+// refuses, as an evaluation failure, one that is not held as sshd needs.
 func SSHDAccepting(sshd, configFile, dir string) AcceptingFunc {
 	want := filepath.Join(dir, AuthorizedKeysName)
 	return func(ctx context.Context, peers []string) (bool, string, error) {
 		if len(peers) == 0 {
 			return false, "", fmt.Errorf("no peer address to evaluate sshd for")
+		}
+		// A root sshd -T needs its privilege separation directory, which
+		// socket-activated sshd leaves uncreated until ssh.service starts.
+		if err := ensurePrivsep(); err != nil {
+			return false, "", err
 		}
 		for _, addr := range peers {
 			args := []string{"-T", "-C", "user=root,host=,addr=" + addr}

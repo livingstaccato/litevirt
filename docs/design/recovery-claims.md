@@ -1228,8 +1228,9 @@ verifying before they execute.
 
 - **Flag:** `enforcement.recovery_claim`, default **true**: `LoadConfig` sets
   it before parsing, so a config without the key has it on, and an explicit
-  `false` wins. It is the third enforcement flag that defaults on, beside
-  `audit_signature` and `partition_pause`. Partition pause's settle-back stops
+  `false` wins. It is one of six enforcement flags that default on:
+  `audit_signature`, `partition_pause`, `recovery_claim`, `digest_v2`,
+  `console_password` and `vrrp_unicast`. Partition pause's settle-back stops
   a returning host's copy only on a certified claim, so the two defaults go
   together.
 - **Advertised conditionally** in `Server.advertisedCapabilities` when the flag

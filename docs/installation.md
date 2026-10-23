@@ -7,7 +7,7 @@ Each host needs:
 - Linux (x86_64) with KVM support (`/dev/kvm` must exist)
 - QEMU/KVM and libvirt installed (`apt install qemu-system-x86 libvirt-daemon-system`)
 - `genisoimage` for cloud-init ISO generation
-- SSH access (the CLI connects via SSH tunnel)
+- SSH access (`lv host init root@<ip>` uses it to install the host)
 
 Optional:
 

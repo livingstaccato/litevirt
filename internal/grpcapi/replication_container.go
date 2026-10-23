@@ -222,14 +222,6 @@ func sameReplicaStream(m, other *pbsstore.Manifest) bool {
 	return corrosion.DecodeCreateSpec(sa.CreateSpec).OwnerID == corrosion.DecodeCreateSpec(sb.CreateSpec).OwnerID
 }
 
-func manifestTime(m *pbsstore.Manifest) time.Time {
-	t, err := time.Parse(time.RFC3339Nano, m.Timestamp)
-	if err != nil {
-		return time.Time{}
-	}
-	return t
-}
-
 // sameSegment reports whether two marks were taken in one segment of the
 // container's history: one host, one placement. A mark with no placement id (a
 // row an earlier build wrote) is in no known segment.

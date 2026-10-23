@@ -2994,12 +2994,6 @@ func migrationCAsAgree(a, b string) bool {
 	return a == "" || b == "" || a == b
 }
 
-// memoryTLSReady is whether a memory-only move to the target that answered
-// ens may use QEMU's own TLS stream: memoryTLSGap has nothing to say.
-func (s *Server) memoryTLSReady(srcTLS bool, ens ensureOutcome) bool {
-	return s.memoryTLSGap(srcTLS, ens, "the target") == ""
-}
-
 // memoryTLSGap says why a memory-only move to target, which answered ens,
 // may not use QEMU's own TLS stream, or "" when it may: both hosts ready
 // (srcTLS, ens.tlsReady) and their migration CAs agreeing. A mismatch is not

@@ -457,26 +457,6 @@ func (s *Server) SetUserAccount(ctx context.Context, req *pb.SetUserAccountReque
 	return out, nil
 }
 
-// revokeUserTokens revokes every live API token of username and returns how
-// many. Best effort: a deleted account's tokens are refused at authentication
-// anyway (ValidateToken and TokenLive join the live users row).
-func (s *Server) revokeUserTokens(ctx context.Context, username string) int {
-	rows, err := s.db.Query(ctx, `SELECT id FROM tokens WHERE username = ? AND deleted_at IS NULL`, username)
-	if err != nil {
-		slog.Warn("could not list API tokens to revoke them", "username", username, "error", err)
-		return 0
-	}
-	n := 0
-	for _, r := range rows {
-		if err := corrosion.RevokeToken(ctx, s.db, r.String("id")); err != nil {
-			slog.Warn("could not revoke an API token", "username", username, "error", err)
-			continue
-		}
-		n++
-	}
-	return n
-}
-
 // accountStatus is User.status: "active", "disabled" or "expired", judged by
 // this daemon's clock (m1) — the clock every refusal on this node uses.
 func accountStatus(l corrosion.UserLifecycle, now time.Time) string {

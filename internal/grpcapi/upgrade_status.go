@@ -297,13 +297,6 @@ func (s *Server) usedReleaseTokens(ctx context.Context) []string {
 	return out
 }
 
-// resetReleasePeerCache drops the cached used-token list (tests).
-func (s *Server) resetReleasePeerCache() {
-	s.releasePeerMu.Lock()
-	s.releaseUsedAt = time.Time{}
-	s.releasePeerMu.Unlock()
-}
-
 // peerCapsEntry is what this node knows of one peer's capability list: the
 // last one it declared (a push) or answered (a Ping), when, and the state of
 // the background refresh.
@@ -609,10 +602,6 @@ func (s *Server) releasePeerRefusedDetail() string {
 	return "refusing replication from " + strings.Join(peers, ", ") +
 		": a release feature is in use and they do not advertise its token"
 }
-
-// AdvertisedCapabilities is the capability list this node's Ping returns, which
-// its pushes also declare (corrosion.Replicator.SetAdvertisedCapabilities).
-func (s *Server) AdvertisedCapabilities() []string { return s.advertisedCapabilities() }
 
 // Release rollout health condition (UX 3): informational, never degraded.
 const (

@@ -1444,24 +1444,3 @@ func (s *Server) handleCompatibleHosts(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `<span style="color:#888;font-size:13px">No other hosts available</span>`)
 	}
 }
-
-func (s *Server) handleAvailableDevicesJSON(w http.ResponseWriter, r *http.Request) {
-	hostName := r.PathValue("name")
-	typeFilter := r.URL.Query().Get("type")
-	resp, err := s.grpc.ListHostDevices(s.uiBearerCtx(r), &pb.ListHostDevicesRequest{
-		Name:       hostName,
-		TypeFilter: typeFilter,
-	})
-	if err != nil {
-		http.Error(w, err.Error(), httpStatusFor(err))
-		return
-	}
-	var free []*pb.PCIDevice
-	for _, d := range resp.GetDevices() {
-		if d.VmName == "" {
-			free = append(free, d)
-		}
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(free)
-}

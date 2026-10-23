@@ -142,7 +142,7 @@ func HostInitResolved(ctx context.Context, sshTarget string, rt *ssh.Target, hos
 	// The host KEY is 0600. It is the node's entire cluster identity: peer mTLS
 	// authenticates with it and audit rows are signed with it, so a local user
 	// who can read it can both impersonate the host to every peer and forge its
-	// audit history. It shipped 0644 because CopyFile's default mode was
+	// audit history. It shipped 0644 because the copy's default mode was
 	// invisible at the call site.
 	for _, f := range []struct {
 		local, remote string

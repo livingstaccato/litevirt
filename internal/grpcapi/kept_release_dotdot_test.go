@@ -322,3 +322,259 @@ func TestKeptRelease_AMissingDirectoryBeforeDotDotReadsAsMissing(t *testing.T) {
 		})
 	}
 }
+
+// twoChainFixture is VM web as a plain `lv rm` (keep false) or `lv rm
+// --keep-disks` (keep true) leaves it, both disks recorded
+// delete_with_vm=false and noted by the real noteKeptDisks: web-root.qcow2
+// backs on "sub/../web-data.qcow2", which is <disks>/web/web-data.qcow2, and
+// web-snap.qcow2 backs on that same file, by its real path or (viaDotDot)
+// through the same "..". It returns the server, the two tops, the base and
+// the base's bytes. (rr4's probe fixture.)
+func twoChainFixture(t *testing.T, viaDotDot, keep bool) (*Server, string, string, string, []byte) {
+	t.Helper()
+	s, _ := provableCreateServer(t)
+	top := s.images.DiskPath("web", "root")
+	disks := filepath.Dir(top)
+	sub := filepath.Join(disks, "web", "inner")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(sub, filepath.Join(disks, "sub")); err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(disks, "web", "web-data.qcow2")
+	if err := qcow2.Create(real, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(real, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("THE ONLY COPY OF THE GUEST'S DATA"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	was, err := os.ReadFile(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := qcow2.CreateWithBackingFormat(top, "sub/../web-data.qcow2", "qcow2", 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	snap := s.images.DiskPath("web", "snap")
+	ref := real
+	if viaDotDot {
+		ref = "sub/../web-data.qcow2"
+	}
+	if err := qcow2.CreateWithBackingFormat(snap, ref, "qcow2", 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(adminCtx(), s.db, corrosion.VMRecord{Name: "web", HostName: s.hostName, State: "stopped"}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []corrosion.DiskRecord{
+		{VMName: "web", DiskName: "root", HostName: s.hostName, Path: top, StorageType: "local"},
+		{VMName: "web", DiskName: "snap", HostName: s.hostName, Path: snap, StorageType: "local"},
+	} {
+		if err := corrosion.InsertDisk(adminCtx(), s.db, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.noteKeptDisks(adminCtx(), "web", keep); err != nil {
+		t.Fatalf("noteKeptDisks: %v", err)
+	}
+	if err := corrosion.DeleteVM(adminCtx(), s.db, "web"); err != nil {
+		t.Fatal(err)
+	}
+	return s, top, snap, real, was
+}
+
+// rr4 finding 1: a release forgets a note's entry for a file its chain
+// reached through ".." only when no other kept chain still reaches that
+// file. Here web-snap.qcow2 backs on the base directly, so the plain delete
+// noted the base for it; on 243c1198f releasing web-root.qcow2 (which
+// reaches the base through "..") forgot that entry, and the debris sweep and
+// a create of the name then removed the base under the kept web-snap.qcow2.
+// 7b8f27bf1 kept it.
+//
+// Red on 243c1198f (both deletes). Mutation: forget without the check: red.
+func TestKeptRelease_KeepsTheEntryAnotherKeptChainStillNeeds(t *testing.T) {
+	for _, keep := range []bool{false, true} {
+		name := "plain delete"
+		if keep {
+			name = "--keep-disks note"
+		}
+		t.Run(name, func(t *testing.T) {
+			s, top, snap, real, was := twoChainFixture(t, false, keep)
+			if _, err := keptRelease(s, top); err != nil {
+				t.Fatalf("release %s: %v", top, err)
+			}
+			if noted, _ := health.KeptNotedFiles(s.dataDir); noted[real] != "web" {
+				t.Errorf("the note's entry for %s, which the kept %s backs on, was forgotten: %v", real, snap, noted)
+			}
+			if held, why := s.keptHolds(adminCtx(), real); !held {
+				t.Errorf("keptHolds(%s) = false (%q); the kept %s backs on it", real, why, snap)
+			}
+			s.sweepVMDiskDebris(adminCtx(), "web")
+			baseUntouched(t, real, was, "the debris sweep after the release")
+			if _, err := s.CreateVM(adminCtx(), disklessCreateRequest("web")); err == nil {
+				t.Error("create web succeeded over a base a kept overlay backs on")
+			}
+			baseUntouched(t, real, was, "a create of the name after the release")
+		})
+	}
+}
+
+// Two kept overlays both reach the base through "..", and an earlier
+// build's note names the base. Releasing one keeps the entry (the other
+// still reaches it) and the base stays held and listed only; releasing both
+// at once forgets it, and the base is never a top of its own.
+//
+// Mutation: judge the entry per unit inside the loop, before the later
+// units of the same release are gone: "both at once, the other directly"
+// red.
+func TestKeptRelease_ForgetsADotDotEntryOnlyWhenNothingReachesIt(t *testing.T) {
+	t.Run("one of two", func(t *testing.T) {
+		s, top, _, real, was := twoChainFixture(t, true, true)
+		if err := health.NoteKeptBackingFiles(s.dataDir, "web", []string{real}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := keptRelease(s, top); err != nil {
+			t.Fatalf("release %s: %v", top, err)
+		}
+		if held, _ := s.keptHolds(adminCtx(), real); !held {
+			t.Errorf("keptHolds(%s) = false while a kept overlay still reaches it", real)
+		}
+		if _, err := s.CreateVM(adminCtx(), disklessCreateRequest("web")); err == nil {
+			t.Error("create web succeeded over a base a kept overlay backs on")
+		}
+		baseUntouched(t, real, was, "a create of the name")
+		releaseNeverTakes(t, s, real, was)
+	})
+	for _, direct := range []bool{false, true} {
+		name := "both at once"
+		if direct {
+			// The other overlay reaches it directly, so only the first
+			// unit carries the entry: it is judged once both are gone.
+			name = "both at once, the other directly"
+		}
+		t.Run(name, func(t *testing.T) { bothAtOnce(t, direct) })
+	}
+}
+
+func bothAtOnce(t *testing.T, direct bool) {
+	{
+		s, top, snap, real, was := twoChainFixture(t, !direct, true)
+		if err := health.NoteKeptBackingFiles(s.dataDir, "web", []string{real}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := keptRelease(s, "web"); err != nil {
+			t.Fatalf("release web: %v", err)
+		}
+		if exists(top) || exists(snap) {
+			t.Error("a kept overlay of web is still there")
+		}
+		baseUntouched(t, real, was, "release web")
+		if noted, _ := health.KeptNotedFiles(s.dataDir); noted[real] != "" {
+			t.Errorf("%s is still noted with nothing kept over it", real)
+		}
+		releaseNeverTakes(t, s, real, was)
+	}
+}
+
+// A note an earlier build wrote can name the ".." base by a path behind a
+// symlinked prefix, while the chain walk returns its physical path: the two
+// are matched by their resolved forms, so the base is still never a top.
+//
+// Mutation: match by the cleaned path only in keptUnits: red.
+func TestKeptRelease_MatchesADotDotFileByItsResolvedPath(t *testing.T) {
+	s, top, real, was := dotdotDeleteFixture(t)
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(filepath.Dir(top), alias); err != nil {
+		t.Fatal(err)
+	}
+	aliased := filepath.Join(alias, "web", "web-data.qcow2")
+	if err := health.NoteKeptBackingFiles(s.dataDir, "web", []string{aliased}); err != nil {
+		t.Fatal(err)
+	}
+	list, err := s.KeptDisks(viewerCtx(), &pb.KeptDisksRequest{})
+	if err != nil || len(list.Chains) != 1 {
+		t.Fatalf("list = %+v, %v; want web's one chain, the aliased base not a top of its own", list, err)
+	}
+	if _, err := keptRelease(s, "web"); err != nil {
+		t.Fatalf("release web: %v", err)
+	}
+	baseUntouched(t, real, was, "release web")
+	if _, err := keptRelease(s, aliased); err == nil {
+		t.Errorf("release %s succeeded", aliased)
+	}
+	baseUntouched(t, real, was, "release of the aliased base")
+}
+
+// A release that stops part way (here: the top was replaced before its
+// removal) forgets nothing for a file reached through "..": the chain over
+// it is not gone.
+//
+// Mutation: forget the ".." entries whether or not the unit is gone: red.
+func TestKeptRelease_AFailedReleaseKeepsTheDotDotEntry(t *testing.T) {
+	s, top, real, was := dotdotDeleteFixture(t)
+	if err := health.NoteKeptBackingFiles(s.dataDir, "web", []string{real}); err != nil {
+		t.Fatal(err)
+	}
+	prev := keptReleaseBeforeRemove
+	keptReleaseBeforeRemove = func(p string) {
+		if p == top {
+			_ = os.Rename(top, top+".aside")
+			_ = os.WriteFile(top, []byte("A NEW VM'S DISK"), 0o600)
+		}
+	}
+	t.Cleanup(func() { keptReleaseBeforeRemove = prev })
+	if _, err := keptRelease(s, "web"); err == nil {
+		t.Fatal("release web with the top replaced succeeded")
+	}
+	baseUntouched(t, real, was, "a failed release")
+	if noted, _ := health.KeptNotedFiles(s.dataDir); noted[real] != "web" {
+		t.Errorf("a release that stopped part way forgot the entry for %s: %v", real, noted)
+	}
+}
+
+// rr4: a noted chain that cannot be read holds every path that removes disk
+// files on the host, and a release refuses, each naming the way out; moving
+// the noted top away lifts the hold.
+func TestKeptRelease_AnUnreadableNotedChainHoldsAndNamesTheWayOut(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	top := s.images.DiskPath("web", "root")
+	disks := filepath.Dir(top)
+	if err := os.MkdirAll(disks, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(disks, "plainfile"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := qcow2.CreateWithBackingFormat(top, "plainfile/../web-data.qcow2", "qcow2", 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := health.NoteKeptDisks(s.dataDir, "web", []string{top}); err != nil {
+		t.Fatal(err)
+	}
+	note := filepath.Join(s.dataDir, "kept-disks", "web.json")
+	other := filepath.Join(disks, "unrelated-x.qcow2")
+	if err := os.WriteFile(other, []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	held, why := s.keptHolds(adminCtx(), other)
+	if !held || !strings.Contains(why, note) || !strings.Contains(why, "move "+top+" away") ||
+		!strings.Contains(why, "remove its entry from "+note) || !strings.Contains(why, "lv host kept-disks --release refuses") {
+		t.Errorf("keptHolds(unrelated) = %v %q; want it held, naming %s, %s and the way out", held, why, top, note)
+	}
+	if _, err := keptRelease(s, "web"); err == nil || !strings.Contains(err.Error(), "move "+top+" away") ||
+		!strings.Contains(err.Error(), "remove its entry from "+note) {
+		t.Errorf("release web = %v; want it refused, naming %s", err, note)
+	}
+	if err := os.Rename(top, top+".moved"); err != nil {
+		t.Fatal(err)
+	}
+	if held, why := s.keptHolds(adminCtx(), other); held {
+		t.Errorf("keptHolds(unrelated) after moving the noted top away = true (%q)", why)
+	}
+}

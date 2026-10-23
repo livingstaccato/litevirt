@@ -97,7 +97,7 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 			return fmt.Errorf("the create clears a file left by an earlier VM %s, and %v; nothing was moved or removed", name, err)
 		}
 		return health.NewKeptBackingFileError(fmt.Sprintf("the create clears a file left by an earlier VM %s, and %v; "+
-			"fix that file or its storage, or move the kept disk away; nothing was moved or removed", name, err))
+			"nothing was moved or removed", name, err))
 	}
 	for f := range present {
 		if notesGovern && noted[f] != "" {

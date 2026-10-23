@@ -349,10 +349,18 @@ only the deleted VM's own files: those its note or record names, and the
 points at. A file a chain reaches through a `..` in a backing reference
 (where it is depends on symlinked directories) is listed only, under what the
 chain stands on, even when a note names it: a delete notes nothing from that
-layer down, a release never removes it, and a release of the chain over it
-forgets a note entry an earlier build wrote for it, leaving the file. While
-the kept file above it is there, a create and every other path that removes
-disk files leave it, as they leave a file a note names. Every file below them (an image, another VM's disk, a file in a
+layer down, a release never removes it, and once no kept chain reaches it any
+more (any note's, `kept-disks.json`'s) a release forgets a note entry naming
+it, leaving the file. While a kept file above it is there, a create and every
+other path that removes disk files leave it, as they leave a file a note
+names. To tell, every noted file's backing chain is read: while one cannot be
+read (a bad header, a `..` after a regular file), every path on that host
+that removes disk files (a create's clearing, a delete's or rebuild's disk
+cleanup, `lv iso rm <pool>/<file>`, a migration's or volume move's source
+cleanup, replica pruning) leaves every file, and `lv host kept-disks --release`
+refuses, each naming the noted file and its note. The way out is to fix that
+file, move it away (a noted file that is not there reaches nothing), or, once
+nothing needs it, remove its entry from `<data_dir>/kept-disks/<vm>.json`. Every file below them (an image, another VM's disk, a file in a
 directory named like the VM) stays, listed under what the chain stands on. It
 removes regular files on this host's own storage only: a record naming a
 device node, a link (an LVM or zvol volume) or a file on shared storage is

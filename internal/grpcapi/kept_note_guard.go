@@ -184,7 +184,9 @@ func (s *Server) keptNoteDotDotHolds() (map[string]keptDotDotHold, error) {
 			})
 			if err != nil {
 				return nil, fmt.Errorf("the backing chain of %s, a disk the deleted VM %s was kept with (%s), cannot be read (%w), "+
-					"so what it backs on is unknown", p, n.VM, n.File, err)
+					"so what it backs on is unknown: until it can, every path that removes disk files on this host leaves them, "+
+					"and lv host kept-disks --release refuses; fix that file or its storage, move %s away, or, once nothing "+
+					"needs it, remove its entry from %s", p, n.VM, n.File, err, p, n.File)
 			}
 			if w.dotdot < 0 {
 				continue
@@ -238,4 +240,65 @@ func (s *Server) keptNoteDotDotHeld(path string) (bool, string) {
 		}
 	}
 	return false, ""
+}
+
+// keptStillReached reports whether a kept chain on this host still reaches
+// file, by any route: the backing chain of a file any VM's note names
+// (other than file itself), or a kept-disks.json entry's chain, walked as
+// the holds walk them, matched by cleaned and resolved path. Anything that
+// cannot be read answers true: a note entry is forgotten only when nothing
+// can still need it.
+func (s *Server) keptStillReached(ctx context.Context, file string) bool {
+	file = filepath.Clean(file)
+	want := map[string]bool{file: true}
+	r, err := resolvedStrict(file)
+	if err != nil {
+		return true
+	}
+	want[r] = true
+	hit := func(l string) (bool, error) {
+		if want[filepath.Clean(l)] {
+			return true, nil
+		}
+		r, err := resolvedStrict(l)
+		return err == nil && want[r], err
+	}
+	notes, err := health.KeptNotes(s.dataDir)
+	if err != nil {
+		return true
+	}
+	for _, n := range notes {
+		for _, p := range n.Paths {
+			if self, err := hit(p); err != nil || self {
+				if err != nil {
+					return true
+				}
+				continue
+			}
+			w, err := storage.Bounded("read the backing chain of", p, func() (keptWalked, error) {
+				l, m, dd, err := keptChainWalk(p)
+				return keptWalked{layers: l, missing: m, dotdot: dd}, err
+			})
+			if err != nil {
+				return true
+			}
+			for _, l := range w.layers {
+				if h, err := hit(l); err != nil || h {
+					return true
+				}
+			}
+		}
+	}
+	chains, err := s.keptRegistryChains(ctx)
+	if err != nil {
+		return true
+	}
+	for _, c := range chains {
+		for _, l := range c.layers {
+			if h, err := hit(l); err != nil || h {
+				return true
+			}
+		}
+	}
+	return false
 }

@@ -3473,7 +3473,12 @@ nor a file that disk's backing chain reaches: the create is refused, naming
 the file (docs/cli-reference.md, `lv rm`). A disk the delete of a VM with no
 domain kept is also in `<data_dir>/kept-disks/<vm>.json`, with the files its
 chain backs on. While `kept-disks.json` cannot be read, a create that would
-clear a file left by an earlier VM of its name is refused.
+clear a file left by an earlier VM of its name is refused. While the backing
+chain of a file a note `<data_dir>/kept-disks/<vm>.json` names cannot be read,
+every path on that host that removes disk files leaves every file, and
+`lv host kept-disks --release` refuses, naming the file and the note: fix that
+file, move it away, or, once nothing needs it, remove its entry from the note
+(docs/cli-reference.md, "Releasing kept disks").
 
 ### A drain's live move timed out (`drain_move_timed_out`)
 

@@ -246,7 +246,9 @@ func (s *Server) keptUnits(ctx context.Context) ([]*keptUnit, error) {
 			})
 			if err != nil {
 				return nil, fmt.Errorf("the backing chain of %s, a disk the delete of VM %s kept, cannot be read (%v), so what a release "+
-					"would leave without its base is unknown; fix that file or its storage, then retry", c, vm, err)
+					"would leave without its base is unknown; fix that file or its storage, then retry, or move %s away, or, once "+
+					"nothing needs it, remove its entry from %s or %s", c, vm, err, c,
+					filepath.Join(s.dataDir, "kept-disks", vm+".json"), filepath.Join(s.dataDir, diskKeptFile))
 			}
 			walked[c] = w
 		}
@@ -1078,6 +1080,7 @@ func (s *Server) releaseKept(ctx context.Context, req *pb.KeptDisksRequest, acto
 	var removed []string
 	var bytes int64
 	var failed error
+	var released []*keptUnit
 	resp.Chains = nil
 	for _, u := range targets {
 		var gone []string
@@ -1123,11 +1126,10 @@ func (s *Server) releaseKept(ctx context.Context, req *pb.KeptDisksRequest, acto
 		var nerr error
 		forget := slices.DeleteFunc(slices.Clone(u.notePath), func(p string) bool { return !slices.Contains(gone, p) })
 		if failed == nil {
-			// Every file of the unit is gone: an entry an earlier build
-			// noted for a file it reached through ".." goes with the top,
-			// or it would read as a kept disk of its own (and hold a create
-			// of the name) with nothing kept over it. The file stays.
-			forget = append(forget, u.dotdotNoted...)
+			// Every file of the unit is gone: its entries for files it
+			// reached through ".." are judged once the whole release is
+			// done (below).
+			released = append(released, u)
 		}
 		if len(forget) > 0 {
 			nerr = health.ForgetKeptNoted(s.dataDir, u.vm, forget)
@@ -1141,6 +1143,28 @@ func (s *Server) releaseKept(ctx context.Context, req *pb.KeptDisksRequest, acto
 		resp.Chains = append(resp.Chains, u.toPB(s, "", nil, failed == nil))
 		if failed != nil {
 			break
+		}
+	}
+	// An entry an earlier build noted for a file a released chain reached
+	// through ".." goes once nothing kept reaches that file any more: it
+	// would otherwise read as a kept disk of its own (and hold a create of
+	// the name) with nothing kept over it. While another kept chain reaches
+	// it (any note's, kept-disks.json's), the entry stays and keeps holding
+	// it. The file stays either way.
+	for _, u := range released {
+		var forget []string
+		for _, p := range u.dotdotNoted {
+			if s.keptStillReached(ctx, p) {
+				continue
+			}
+			forget = append(forget, p)
+		}
+		if len(forget) == 0 {
+			continue
+		}
+		if err := health.ForgetKeptNoted(s.dataDir, u.vm, forget); err != nil {
+			slog.Warn("kept-disk release: could not forget a note entry for a file a released chain reached through \"..\"; it stays listed only",
+				"vm", u.vm, "files", forget, "error", err)
 		}
 	}
 	// The snapshot records go once every file they are taken over is gone,

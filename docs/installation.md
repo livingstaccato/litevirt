@@ -494,6 +494,12 @@ single-node install does not require copying daemon certificates out of
 /run/litevirt/file-restore/     # file restore: per-session export sockets and pidfiles
 ```
 
+`lv` run on a host as a user other than root uses that user's CLI client
+bundle in `~/.config/litevirt/pki/`, never the host's own identity in
+`/etc/litevirt/pki/`. A user without a bundle is told to run the command with
+sudo; `sudo lv host init --local` installs a bundle for `SUDO_USER` when it
+founds a cluster.
+
 ### What file restore changes on the host
 
 Single-file restore (`lv backup file-ls` / `file-restore`,

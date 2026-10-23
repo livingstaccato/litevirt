@@ -167,3 +167,68 @@ func TestImportVM_AnUnreadableKeptRecordDoesNotSuggestAnotherName(t *testing.T) 
 		t.Fatalf("the refusal does not say a name does not help: %v", err)
 	}
 }
+
+// The two ways a create the exemption could wrongly let through writes a
+// local disk after all: an nfs pool whose target is this host's disk
+// directory (as written, or through a symlink to it), and a create with an
+// image and no disks, whose default root disk is local. Each is still
+// refused while what kept overlays back on is unknown.
+//
+// Mutations: the nfs target clause never matches: the direct and symlink
+// subtests red. Compare targets by filepath.Clean alone: the symlink
+// subtest red. An image create with no disks counts as diskless: the image
+// subtest red.
+func TestCreateVM_AnUnknownKeptChainStillHoldsCreatesThatOnlyLookShared(t *testing.T) {
+	nfsAt := func(t *testing.T, s *Server, target string) {
+		t.Helper()
+		ref := StoragePoolRef{Driver: "nfs", Source: "10.0.0.9:/export", Target: target}
+		if err := corrosion.UpsertStoragePool(context.Background(), s.db, corrosion.StoragePoolRecord{
+			HostName: "test-host", Name: "share", Driver: ref.Driver, Source: ref.Source, Target: ref.Target, State: "active",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		s.addStoragePoolRef("share", ref)
+	}
+	refused := func(t *testing.T, s *Server, req *pb.CreateVMRequest, named string) {
+		t.Helper()
+		_, err := s.CreateVM(adminCtx(), req)
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), named) {
+			t.Fatalf("create = %v; want FailedPrecondition naming %s", err, named)
+		}
+	}
+	for _, how := range []string{"registry", "chain"} {
+		t.Run(how+"/nfs mounted at the disk directory", func(t *testing.T) {
+			s, _ := provableCreateServer(t)
+			named := keptUnknown(t, s, how)
+			nfsAt(t, s, s.images.DiskDir("web"))
+			refused(t, s, cephCreateRequest("web", &pb.DiskSpec{Name: "root", Size: "1M", Storage: "share"}), named)
+		})
+		t.Run(how+"/nfs mounted at a symlink to the disk directory", func(t *testing.T) {
+			s, _ := provableCreateServer(t)
+			named := keptUnknown(t, s, how)
+			link := filepath.Join(t.TempDir(), "share")
+			if err := os.Symlink(s.images.DiskDir("web"), link); err != nil {
+				t.Fatal(err)
+			}
+			nfsAt(t, s, link)
+			refused(t, s, cephCreateRequest("web", &pb.DiskSpec{Name: "root", Size: "1M", Storage: "share"}), named)
+		})
+		t.Run(how+"/an image and no disks", func(t *testing.T) {
+			s, _ := provableCreateServer(t)
+			named := keptUnknown(t, s, how)
+			img := s.images.ImagePath("base")
+			if err := os.MkdirAll(filepath.Dir(img), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(img, []byte("not read: the create is refused first"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			req := disklessCreateRequest("web")
+			req.Spec.Image = "base"
+			refused(t, s, req, named)
+			if exists(s.images.DiskPath("web", "root")) {
+				t.Fatal("a refused create wrote its default root disk")
+			}
+		})
+	}
+}

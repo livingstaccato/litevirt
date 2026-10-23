@@ -157,7 +157,7 @@ naming the overlap — move `file_restore.uid_base`.
 - A daemon whose config is group- or other-readable while it holds an inline
   secret logs a warning naming the realm, and starts.
 
-A non-root `lv` on a node no longer reads the file: it finds the daemon
+A non-root `lv` on a node does not need the file: it finds the daemon
 through `/run/litevirt/endpoint`, which the daemon writes at start, or falls
 back to the defaults with the user's CLI bundle
 ([installation.md](installation.md#cli-setup)). Until a node's daemon has

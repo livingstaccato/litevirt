@@ -3470,12 +3470,13 @@ nor a file that disk's backing chain reaches: the create is refused, naming
 the file (docs/cli-reference.md, `lv rm`). A disk the delete of a VM with no
 domain kept is also in `<data_dir>/kept-disks/<vm>.json`, with the files its
 chain backs on. While `kept-disks.json`, or the backing chain of a disk it
-names, cannot be read, what a kept overlay backs on is unknown: every import
-on that host, and every create there that writes a disk on the host's own
-storage, is refused whatever its name, and the evidence names the file under
-`creates_refused` (the condition is raised for it alone, and resolves once it
-reads). A create with no disk, or with every disk on shared storage (nfs, ceph,
-iscsi), goes ahead.
+names, cannot be read, what a kept overlay backs on is unknown, and these are
+refused on that host whatever their names: every import; every create or
+clone that writes a disk file on the host's own storage (one with no disk
+file, or with every disk on shared nfs, ceph or iscsi storage outside the disk
+directory, goes ahead); and every backup restore to a `--target-path`. The
+evidence names the file under `creates_refused` (the condition is raised for
+it alone, and resolves once it reads).
 
 ### A drain's live move timed out (`drain_move_timed_out`)
 

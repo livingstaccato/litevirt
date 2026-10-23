@@ -318,11 +318,17 @@ names it: the new disk would become its base); the refusal names the
 entry, and the way out is to fix that file, or, once nothing needs the disk,
 move it away or remove its entry from `<data_dir>/kept-disks.json`. An
 unreadable `kept-disks.json` or kept chain does not depend on the name: until
-it reads, every `lv import` on that host, and every create there that writes a
-disk on the host's own storage, is refused, and `disk_leftover` names the file
-(`creates_refused`). A create with no disk, or with every disk on shared
-storage (nfs, ceph, iscsi), goes ahead. A create whose `<vm>-*` files in the
-disk directory cannot be listed is refused too, naming the directory. A disk only
+it reads, these are refused on that host, and `disk_leftover` names the file
+(`creates_refused`): every `lv import`; every create or `lv clone` that writes
+a disk file on the host's own storage (one with no disk file, or with every
+disk on shared nfs, ceph or iscsi storage outside the disk directory, goes
+ahead); and every `lv backup restore-from` or `lv backup restore-live` with
+`--target-path`. With the record readable, a clone or a `--target-path` restore
+that would write a kept overlay's missing base is refused as a create is. A
+restore to the file the daemon names, or `--in-place` over the VM's own disk,
+is not checked: the first is a fresh name no overlay can name, the second a
+file that exists. A create whose `<vm>-*` files in the disk directory cannot be
+listed is refused too, naming the directory. A disk only
 `kept-disks.json` names, at the path the create writes, is refused rather than
 renamed. `lv import` refuses the same files at its disk's name, rather than
 moving them aside as an orphan. Every other path that removes disk files on

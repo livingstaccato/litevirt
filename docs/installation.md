@@ -423,9 +423,12 @@ the local daemon automatically. It looks, in order, at:
 
 1. `/run/litevirt/endpoint`, which the daemon writes at every start (0644,
    replaced atomically). It holds only `grpc_port` and `pki_dir`, nothing
-   secret, so any user on the node can read it. A file that does not parse,
-   has another key, or holds an invalid port or a relative path is ignored as
-   a whole, with a warning.
+   secret, so any user on the node can read it. Its `pki_dir` is the CA lv
+   trusts, so it is read only as a regular file owned by root that only root
+   can write, in a root-owned directory only root can write (the daemon
+   refuses to write into any other `/run/litevirt`). A file that fails that,
+   does not parse, has another key, or holds an invalid port or a relative
+   path is ignored as a whole, with a warning.
 2. `/etc/litevirt/config.yaml`, which is root's and 0600 because it can hold
    inline secrets: readable under `sudo`.
 3. If that file cannot be read by the user, the defaults: the daemon on

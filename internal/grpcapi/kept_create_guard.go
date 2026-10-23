@@ -9,6 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/storage"
@@ -159,8 +162,8 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 // keptChainsUnknownError is a refusal because kept-disks.json or a kept
 // disk's backing chain cannot be read (keptRegistryChains). Unlike the other
 // kept-file refusals it does not depend on the name being created: until the
-// file it names reads, every create or import that writes a disk here meets
-// it. It wraps the error the caller maps to a code (KeptBackingFileError, or
+// file it names reads, every import, every create or clone that writes a disk
+// file here, and every restore to a named target meets it. It wraps the error the caller maps to a code (KeptBackingFileError, or
 // a plain retryable one).
 type keptChainsUnknownError struct{ err error }
 
@@ -217,27 +220,77 @@ func (s *Server) keptMissingBaseRefusal(ctx context.Context, writes func(string)
 // this host's own storage, where a kept overlay's missing base can be: a disk
 // with no storage named (the host's disk directory), the default root disk of
 // a create with an image and no disks, or one on a pool that is not shared
-// (nfs, ceph, iscsi) or whose resolution is not known (cfgs: the storage the
-// LUN claim resolved, by disk index). An nfs pool mounted at this host's disk
-// directory counts as local. Anything it cannot tell counts as local.
+// storage elsewhere (sharedPoolElsewhere) or whose resolution is not known
+// (cfgs: the storage the LUN claim resolved, by disk index). Anything it
+// cannot tell counts as local.
 func (s *Server) createWritesHostDisk(spec *pb.VMSpec, cfgs map[int]storage.Config) bool {
 	if len(spec.Disks) == 0 {
 		return spec.Image != ""
-	}
-	diskDir := ""
-	if s.images != nil {
-		diskDir = filepath.Clean(s.images.DiskDir(spec.Name))
 	}
 	for i, d := range spec.Disks {
 		if d.Storage == "" {
 			return true
 		}
 		cfg, ok := cfgs[i]
-		if !ok || !isSharedDriver(cfg.Driver) || (cfg.Target != "" && filepath.Clean(cfg.Target) == diskDir) {
+		if !ok || !s.sharedPoolElsewhere(cfg.Driver, cfg.Target) {
 			return true
 		}
 	}
 	return false
+}
+
+// sharedPoolElsewhere reports whether a pool of driver, mounted at target
+// ("" for the driver's own place), keeps its disks off this host's disk
+// directory: shared storage (nfs, ceph, iscsi) whose target is not that
+// directory, as written or through a symlink (storage.IsDataDirDisksErr; a
+// target it cannot resolve counts as that directory).
+//
+// The driver and target come from the pool's replicated row (or a stack's
+// volume). Until pool-row trust lands (fix/pool-row-trust), a forged row
+// naming a local pool nfs, ceph or iscsi passes here: re-check this
+// exemption once that branch is merged.
+func (s *Server) sharedPoolElsewhere(driver, target string) bool {
+	if !isSharedDriver(driver) {
+		return false
+	}
+	if target == "" {
+		return true
+	}
+	if s.images != nil && filepath.Clean(target) == filepath.Clean(s.images.DiskDir("")) {
+		return false
+	}
+	is, err := storage.IsDataDirDisksErr(target, s.dataDir)
+	return !is && err == nil
+}
+
+// keptPathRefusal is keptMissingBaseRefusal for a write of exactly the files
+// in paths (a clone's disks, a restore's named target), as a gRPC status
+// naming what is refused: a kept overlay whose missing base is one of them
+// refuses it, and so does a kept-disks.json or kept chain that cannot be read.
+func (s *Server) keptPathRefusal(ctx context.Context, what string, paths ...string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		set[filepath.Clean(p)] = true
+	}
+	return keptRefusalStatus(what, s.hostName, s.keptMissingBaseRefusal(ctx, func(p string) bool { return set[filepath.Clean(p)] }))
+}
+
+// keptRefusalStatus maps a kept-create refusal to a status: a file that
+// stands until an operator moves it, or a record that cannot be read, is
+// FailedPrecondition; storage that does not answer is Unavailable.
+func keptRefusalStatus(what, host string, err error) error {
+	if err == nil {
+		return nil
+	}
+	code := codes.Unavailable
+	var kb *health.KeptBackingFileError
+	if errors.As(err, &kb) {
+		code = codes.FailedPrecondition
+	}
+	return status.Errorf(code, "%s refused on %s: %v", what, host, err)
 }
 
 // createDiskPathOf reports whether a create of name writes a disk at p in

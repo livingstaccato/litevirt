@@ -289,8 +289,9 @@ func (s *Server) judgeKeptDisks(ctx context.Context) {
 	var left []diskKeptRecord
 	records, unreadable := s.diskKeptRecords()
 	// What a kept overlay backs on, unknown while the record or a kept chain
-	// cannot be read, holds every create here that writes a local disk
-	// (keptMissingBaseRefusal): named here, not only in each create's error.
+	// cannot be read, holds every import, every create or clone here that
+	// writes a local disk file, and every restore to a named target
+	// (keptMissingBaseRefusal): named here, not only in each refusal.
 	// Storage that does not answer is left to the conditions about it.
 	createsRefused := ""
 	if _, err := s.keptRegistryChains(ctx); err != nil {
@@ -382,9 +383,11 @@ func (s *Server) judgeKeptDisks(ctx context.Context) {
 			"fix the file, or remove it (the disks recorded while it cannot be read are kept and saved)", filepath.Join(s.dataDir, diskKeptFile), unreadable)
 	}
 	if createsRefused != "" {
-		evidence["creates_refused"] = fmt.Sprintf("%s. Until it reads, every import on %s, and every create there that writes a disk on the host's own storage, "+
-			"is refused, whatever its name (a create with no disk, or with every disk on shared storage, goes ahead): "+
-			"what a kept overlay backs on is unknown, and a new disk could become its base", createsRefused, s.hostName)
+		evidence["creates_refused"] = fmt.Sprintf("%s. Until it reads, these are refused on %s, whatever their names: every import; "+
+			"every VM create or clone that writes a disk file on the host's own storage (one with no disk file, or with every disk "+
+			"on shared nfs, ceph or iscsi storage outside the disk directory, goes ahead); and every backup restore-from or "+
+			"restore-live to a --target-path. What a kept overlay backs on is unknown, and a new disk there could become its base",
+			createsRefused, s.hostName)
 	}
 	ev, _ := json.Marshal(evidence)
 	row.Evidence = string(ev)

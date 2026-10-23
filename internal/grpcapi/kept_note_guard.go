@@ -57,7 +57,7 @@ func (s *Server) keptHolds(ctx context.Context, path string) (bool, string) {
 	for _, p := range []string{filepath.Clean(path), filepath.Clean(s.hostDiskFile(path))} {
 		for _, c := range chains {
 			for i, l := range c.layers {
-				if l != p {
+				if l != p || (i == 0 && c.topNamed) {
 					continue
 				}
 				what := "it is the disk " + c.rec.Disk
@@ -78,6 +78,13 @@ type keptRegistryChain struct {
 	rec    diskKeptRecord
 	top    string
 	layers []string
+	// topNamed: a live disk row of this host names the top, so that record,
+	// not this entry, holds it (layers[0]); the files under it are still
+	// this entry's.
+	topNamed bool
+	// missing is the backing file the last layer names that does not exist
+	// ("" when the chain is whole): a file written there becomes its base.
+	missing string
 }
 
 // keptRegistryError is kept-disks.json, an entry's chain, or the records an
@@ -90,12 +97,13 @@ type keptRegistryError struct {
 
 func (e *keptRegistryError) Error() string { return e.msg }
 
-// keptRegistryChains is every kept-disks.json entry of this host that still
-// holds what it names, each with its backing chain. An entry whose file a
-// live disk row names is left out: that record is the handle on the file (a
-// delete that failed and keeps its record, whose retry frees it; a VM using
-// the file again, whose own delete decides). A chain ends at a backing file
-// that does not exist: nothing is there to keep, and nothing under it is
+// keptRegistryChains is every kept-disks.json entry of this host, each with
+// its backing chain. When a live disk row of this host names an entry's own
+// file, that file is left to the record (topNamed: a delete that failed and
+// keeps its record, whose retry frees it; a VM using the file again, whose
+// own delete decides); the files under it stay held. A row of another host
+// at the same path is another file. A chain ends at a backing file that does
+// not exist (missing): nothing is there to keep, and nothing under it is
 // reached; a chain that cannot be read otherwise is an error naming the entry
 // and the way out, as is a registry that cannot be read.
 func (s *Server) keptRegistryChains(ctx context.Context) ([]keptRegistryChain, error) {
@@ -119,11 +127,16 @@ func (s *Server) keptRegistryChains(ctx context.Context) ([]keptRegistryChain, e
 			return nil, &keptRegistryError{transient: true, msg: fmt.Sprintf(
 				"whether a VM's record still names %s, a disk the delete of VM %s kept (%s), cannot be read (%v); retry", top, r.VM, file, err)}
 		}
-		if slices.ContainsFunc(rows, func(d corrosion.DiskRecord) bool { return d.Path == r.Path }) {
-			continue
+		topNamed := slices.ContainsFunc(rows, func(d corrosion.DiskRecord) bool {
+			return d.Path == r.Path && d.HostName == s.hostName
+		})
+		type walked struct {
+			layers  []string
+			missing string
 		}
-		layers, err := storage.Bounded("read the backing chain of", top, func() ([]string, error) {
-			return keptChainLayersToMissing(top)
+		w, err := storage.Bounded("read the backing chain of", top, func() (walked, error) {
+			l, m, err := keptChainLayersToMissing(top)
+			return walked{l, m}, err
 		})
 		if err != nil {
 			return nil, &keptRegistryError{transient: storage.IsFSNoAnswer(err), msg: fmt.Sprintf(
@@ -131,7 +144,7 @@ func (s *Server) keptRegistryChains(ctx context.Context) ([]keptRegistryChain, e
 					"fix that file or its storage, or, once you have checked that nothing needs that disk, move %s away or remove its entry "+
 					"from %s on %s (the file is re-read within 30 s)", top, r.Disk, r.VM, err, top, file, s.hostName)}
 		}
-		out = append(out, keptRegistryChain{rec: r, top: top, layers: layers})
+		out = append(out, keptRegistryChain{rec: r, top: top, layers: w.layers, topNamed: topNamed, missing: w.missing})
 	}
 	return out, nil
 }

@@ -45,10 +45,12 @@ const (
 // `admin`), its own audit genesis and its own capability latches, and its
 // gossip key stays in force.
 //
-// What proves the state is this cluster's is the host certificate the
-// daemon loads (host.crt in the config's pki_dir, /etc/litevirt/pki when it
-// names none) chaining to this cluster's CA: ca.crt is public, so holding it
-// proves nothing. A removed host (`lv host rm` leaves its files in place,
+// What proves the state is this cluster's is the host identity the daemon
+// loads (the config's pki_dir, /etc/litevirt/pki when it names none): a
+// host certificate of this cluster's CA and the key that pairs with it
+// (proveHostIdentity). Certificates are public, ca.crt and host.crt alike,
+// so holding one proves nothing; a ca.crt with any other CA in it is
+// refused outright. A removed host (`lv host rm` leaves its files in place,
 // its revoked certificate included) and an older build of this cluster's
 // hold one. So does an add that failed after its admission and is being
 // finished: admitted is the certificate of that admission's pair on the
@@ -121,8 +123,9 @@ func refuseForeignState(m stateProbe, ourCA, admitted []byte, target, verb strin
 		switch {
 		case len(theirs) == 0:
 			found = append(found, fmt.Sprintf("%s, which holds no certificate this command can read", caPath))
-		case !sameCA(ours, theirs):
-			found = append(found, fmt.Sprintf("%s, a CA that is not this cluster's (%s)", caPath, theirs[0].Subject.String()))
+		case !onlyOurCA(ours, b):
+			// A daemon loading a bundle trusts every CA in it.
+			found = append(found, fmt.Sprintf("%s, which holds a CA that is not this cluster's (or more than this cluster's)", caPath))
 		}
 	}
 
@@ -151,13 +154,15 @@ func refuseForeignState(m stateProbe, ourCA, admitted []byte, target, verb strin
 		}
 		var why string
 		switch {
-		case ok && issuedBy(b, ours):
+		case ok:
+			// A certificate is public: the machine must hold its key too.
+			why = proveHostIdentity(m, hostDir, b, ours)
 		case admitted != nil && issuedBy(admitted, ours):
-			// Finishing this cluster's admission of the machine.
-		case !ok:
-			why = fmt.Sprintf("no host certificate at %s, so nothing proves whose cluster it is", crt)
+			// No host.crt: finishing this cluster's admission of the machine,
+			// whose staged pair admittedPairOnMachine checked is a pair. A
+			// host.crt that is present is never overridden by it.
 		default:
-			why = fmt.Sprintf("%s, a host certificate this cluster's CA did not issue", crt)
+			why = fmt.Sprintf("no host certificate at %s, so nothing proves whose cluster it is", crt)
 		}
 		if why != "" {
 			for _, s := range state {
@@ -216,15 +221,33 @@ func parseCerts(b []byte) []*x509.Certificate {
 	}
 }
 
-func sameCA(ours, theirs []*x509.Certificate) bool {
-	for _, a := range ours {
-		for _, b := range theirs {
-			if bytes.Equal(a.Raw, b.Raw) {
-				return true
+// onlyOurCA reports whether every PEM block in theirsPEM is a certificate of
+// ours, and there is at least one: a bundle with any other CA in it (or a
+// block this command cannot read) is not this cluster's trust.
+func onlyOurCA(ours []*x509.Certificate, theirsPEM []byte) bool {
+	n := 0
+	for rest := theirsPEM; ; {
+		var blk *pem.Block
+		blk, rest = pem.Decode(rest)
+		if blk == nil {
+			break
+		}
+		if blk.Type != "CERTIFICATE" {
+			return false
+		}
+		mine := false
+		for _, a := range ours {
+			if bytes.Equal(a.Raw, blk.Bytes) {
+				mine = true
+				break
 			}
 		}
+		if !mine {
+			return false
+		}
+		n++
 	}
-	return false
+	return n > 0
 }
 
 func issuedBy(certPEM []byte, cas []*x509.Certificate) bool {

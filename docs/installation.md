@@ -138,21 +138,30 @@ before anything is admitted or pushed. A machine that founded its own cluster
 with `lv host init --local` is the usual case: adding it would merge that
 cluster's users (a second `admin`), audit history, capability latches and
 gossip key into this one. The proof that state belongs to this cluster is
-the host certificate the daemon loads, `host.crt` in the config's `pki_dir`
-(`/etc/litevirt/pki` when it names none), chaining to this cluster's CA. A CA
-certificate alone proves nothing: it is public. The add refuses:
+the host identity the daemon loads from the config's `pki_dir`
+(`/etc/litevirt/pki` when it names none): a `host.crt` that chains to this
+cluster's CA and is a host certificate (ServerAuth usage, not the lv-cli
+client or an audit certificate), and a `host.key` beside it that is its key.
+Certificates are public, so a certificate alone proves nothing. The machine
+proves it holds the key by signing a random challenge with `openssl` there;
+where it has no `openssl`, the key is read over the same root SSH session,
+compared in memory, and never written or logged. The add refuses:
 
-- a CA certificate that is not this cluster's, in `/etc/litevirt/pki` or the
-  config's `pki_dir`, or a CA key with no certificate beside it;
+- a `ca.crt` in `/etc/litevirt/pki` or the config's `pki_dir` holding any CA
+  but this cluster's (a bundle with another CA in it included), or a CA key
+  with no certificate beside it;
 - a `state.db` or capability latches (`split_brain_activated.*`) in the data
   dir (`data_dir`, `/var/lib/litevirt` by default), or a running
-  `litevirt.service`, when that `host.crt` is missing or another CA issued it;
+  `litevirt.service`, without that proof: no `host.crt`, one another CA
+  issued, one that is not a host certificate, or no `host.key`, an
+  unreadable one or one that is not its key;
 - a `config.yaml` it cannot read or parse, since then it cannot tell where the
-  state or the host certificate lives.
+  state or the host identity lives.
 
 An add that failed after the cluster admitted the host, whose daemon may
-already have started, is finished by running it again: the admitted pair it
-left staged on the machine is the proof, as `host.crt` is for any other.
+already have started, and whose rollback left no `host.crt`, is finished by
+running it again: the admitted pair it left staged on the machine is the
+proof. A `host.crt` that is present always has to prove itself.
 
 There is no override. The refusal names what it found and the two ways
 forward: stop and disable `litevirt.service` on the machine and move

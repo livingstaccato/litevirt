@@ -365,7 +365,7 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 			slog.Warn("could not remove the files staged on the host", "error", err)
 		}
 	}
-	if err := r.Run("mkdir -p " + ssh.ShellQuote(remotePKIDir) + " && mkdir -p -m 0700 " + ssh.ShellQuote(remoteMigrationDir)); err != nil {
+	if _, err := r.Shell("mkdir", remotePKIDirsCmd(r.Path(etcLitevirtRemote), r.Path(remotePKIDir), r.Path(remoteMigrationDir))); err != nil {
 		return fmt.Errorf("create remote PKI dir: %w", err)
 	}
 	// The attempt's record of what the machine served before the admission,

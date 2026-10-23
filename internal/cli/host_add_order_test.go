@@ -129,7 +129,7 @@ func installedLive(events []string) []string {
 	for _, e := range events {
 		switch {
 		case isStagedWrite(e):
-		case strings.HasPrefix(e, "run mkdir -p"), e == "sh unstage", e == "sh config", e == "sh records",
+		case e == "sh mkdir", e == "sh unstage", e == "sh config", e == "sh records",
 			e == "sh "+stateProbeKind, e == "sh "+daemonProbeKind:
 		default:
 			live = append(live, e)

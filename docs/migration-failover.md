@@ -1157,6 +1157,11 @@ Match User root
     AuthorizedKeysCommandUser nobody
 ```
 
+`nobody` must traverse `/etc/litevirt` to read that file. `lv host init`
+(remote and `--local`) and `lv host add` create the directory `0711`, so it can
+be traversed but not listed; a directory that already exists keeps its mode and
+gains only the search bit (`o+x`).
+
 sshd reads an `AuthorizedKeysCommand`'s keys in addition to its
 `AuthorizedKeysFile`, so every file sshd read for root, from every address and
 under every `Match` rule of yours, is still read, and a host added later is

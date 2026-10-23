@@ -134,8 +134,7 @@ func HostInitResolved(ctx context.Context, sshTarget string, rt *ssh.Target, hos
 
 	// 4. Push files to host
 	slog.Info("pushing files to host", "target", sshTarget)
-	remotePKIDir := "/etc/litevirt/pki"
-	if err := sc.Run(fmt.Sprintf("mkdir -p %s", remotePKIDir)); err != nil {
+	if err := sc.Run(remotePKIDirsCmd(etcLitevirtRemote, remotePKIDir)); err != nil {
 		return fmt.Errorf("create remote PKI dir: %w", err)
 	}
 
@@ -203,6 +202,26 @@ func HostInitResolved(ctx context.Context, sshTarget string, rt *ssh.Target, hos
 	fmt.Printf("Host %s initialized successfully at %s\n", hostName, hostAddr)
 	fmt.Printf("  gRPC endpoint: %s:7443 (mTLS)\n", hostAddr)
 	return nil
+}
+
+// etcLitevirtRemote is /etc/litevirt on a host init or add sets up.
+const etcLitevirtRemote = "/etc/litevirt"
+
+// remotePKIDirsCmd creates etc (/etc/litevirt), pki (its pki/) and each of
+// private (0700) before anything is pushed, as the shell names them.
+//
+// etc is created 0711 like `lv host init --local` makes it
+// (ensureEtcLitevirtDir): the fence ssh AuthorizedKeysCommand user must
+// traverse it, and nobody needs to list it. A plain `mkdir -p` of pki/ made
+// it 0755 under umask 022 before the setup script's `mkdir -p -m 0711` ran,
+// which then changed nothing. An existing etc keeps the mode it has: the
+// setup script adds only the search bit.
+func remotePKIDirsCmd(etc, pki string, private ...string) string {
+	cmd := "mkdir -p -m 0711 " + ssh.ShellQuote(etc) + " && mkdir -p " + ssh.ShellQuote(pki)
+	for _, d := range private {
+		cmd += " && mkdir -p -m 0700 " + ssh.ShellQuote(d)
+	}
+	return cmd
 }
 
 // initPreflight is what `lv host init root@...` checks on the target before

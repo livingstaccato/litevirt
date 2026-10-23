@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -111,5 +112,85 @@ func TestSetupScript_EtcLitevirtIsSearchable(t *testing.T) {
 		if !strings.Contains(s, want) {
 			t.Fatalf("setup script lacks %q", want)
 		}
+	}
+}
+
+// setupEtcLines is what the setup script runs on /etc/litevirt, with the
+// directory renamed to etc.
+func setupEtcLines(t *testing.T, etc string) string {
+	t.Helper()
+	const lines = "mkdir -p -m 0711 /etc/litevirt\nchmod o+x /etc/litevirt\n"
+	s, err := getSetupScript()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(s, lines) {
+		t.Fatalf("setup script lacks %q", lines)
+	}
+	return strings.ReplaceAll(lines, "/etc/litevirt", etc)
+}
+
+// Lab 4 finding 3: a remote-added host's /etc/litevirt came out 0755, so any
+// user could list it, where `lv host init --local` gives 0711. The add (and
+// the remote init) ran a plain `mkdir -p /etc/litevirt/pki` under umask 022
+// first, and the setup script's `mkdir -p -m 0711 /etc/litevirt` then
+// changed nothing. Run as the host runs them, under umask 022: the add's own
+// command, then the setup script's lines. A directory they create is 0711;
+// one the operator made keeps its mode, gaining only the search bit.
+//
+// Mutation: back to `mkdir -p <pki>` alone — "created by the add" is 0755.
+func TestHostAdd_EtcLitevirtIsCreated0711(t *testing.T) {
+	old := syscall.Umask(0o022)
+	defer syscall.Umask(old)
+	for _, tc := range []struct {
+		name        string
+		start, want os.FileMode // start 0: the machine has no /etc/litevirt
+	}{
+		{"created by the add", 0, 0o711},
+		{"the operator's 0750", 0o750, 0o751},
+		{"the operator's 0755", 0o755, 0o755},
+		{"the operator's 0700", 0o700, 0o701},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAddFixture(t)
+			etc := filepath.Join(f.target.Root, "etc", "litevirt")
+			if err := os.RemoveAll(etc); err != nil {
+				t.Fatal(err)
+			}
+			if tc.start != 0 {
+				if err := os.Mkdir(etc, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(etc, tc.start); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := f.add(t); err != nil {
+				t.Fatal(err)
+			}
+			if tc.start != 0 && modeOf(t, etc) != tc.start {
+				t.Fatalf("the add changed the operator's %o to %o", tc.start, modeOf(t, etc))
+			}
+			if out, err := exec.Command("sh", "-c", setupEtcLines(t, etc)).CombinedOutput(); err != nil {
+				t.Fatalf("setup lines: %v: %s", err, out)
+			}
+			if got := modeOf(t, etc); got != tc.want {
+				t.Fatalf("/etc/litevirt is %o after add and setup, want %o", got, tc.want)
+			}
+		})
+	}
+}
+
+// The remote init runs the same command before it pushes anything.
+func TestRemotePKIDirsCmd_Init(t *testing.T) {
+	old := syscall.Umask(0o022)
+	defer syscall.Umask(old)
+	etc := filepath.Join(t.TempDir(), "litevirt")
+	cmd := remotePKIDirsCmd(etc, filepath.Join(etc, "pki")) + "\n" + setupEtcLines(t, etc)
+	if out, err := exec.Command("sh", "-c", cmd).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if got := modeOf(t, etc); got != 0o711 {
+		t.Fatalf("/etc/litevirt is %o after init, want 711", got)
 	}
 }

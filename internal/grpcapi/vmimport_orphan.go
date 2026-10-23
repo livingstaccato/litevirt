@@ -422,8 +422,9 @@ func namedForAnotherVM(vms []corrosion.VMRecord, ln, lb string) bool {
 
 // keptImportWayOut is what an import refused by kerr can do about it. Another
 // --name writes another path, which helps when kerr is about this path; not
-// when what kept overlays back on cannot be read (keptChainsUnknownError),
-// which holds every import and local create on the host whatever its name.
+// when what kept overlays back on cannot be read, nor every disk file on this
+// host (keptChainsUnknownError), which holds every import and local create on
+// the host whatever its name.
 func keptImportWayOut(kerr error, lead string) string {
 	var unknown *keptChainsUnknownError
 	if errors.As(kerr, &unknown) {

@@ -417,12 +417,21 @@ func (d *Daemon) writeBootState(ctx context.Context, cpus, memMiB, diskGiB int, 
 // made only when it is taken from that state (Boot.From, which the write is
 // guarded on in its own transaction), so a fence, drain or maintenance
 // recorded after the reconcile's evaluation read the row is never returned
-// to service.
+// to service. A refused decision leaves no trace on disk (hostboot.BootFiles).
 func (d *Daemon) writeBootStateWith(ctx context.Context, cpus, memMiB, diskGiB int, hasResources, upgradePending bool, expectFrom string) {
+	var files hostboot.BootFiles
+	if expectFrom != "" {
+		files = hostboot.SnapshotBootFiles(d.cfg.DataDir)
+	}
 	boot := hostboot.BootState(ctx, d.db, d.cfg.HostName, d.cfg.DataDir, upgradePending, time.Now())
 	if expectFrom != "" && boot.From != expectFrom && (!boot.Deferred || boot.State != expectFrom) {
 		slog.Info("boot report: this host's recorded state is not the one the own-row reconcile acts over; "+
 			"writing nothing", "expected", expectFrom, "state", boot.State, "from", boot.From, "reason", boot.Reason)
+		// No boot was written: the decision's marker, awaiting-serving note
+		// and unclean-boot entry are undone, so nothing reads it as one.
+		if err := files.Undo(); err != nil {
+			slog.Warn("boot report: could not undo the refused decision's boot files", "error", err)
+		}
 		return
 	}
 	slog.Info("boot state", "state", boot.State, "await_serving", boot.AwaitServing, "deferred", boot.Deferred, "from", boot.From, "reason", boot.Reason)

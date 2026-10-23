@@ -108,14 +108,18 @@ type ownRowLoop struct {
 }
 
 // ownRowState is this host's own recorded state, resolved as every reader
-// resolves it (the membership row when it exists); "" when it cannot be read.
-func (d *Daemon) ownRowState(ctx context.Context) string {
+// resolves it (the membership row when it exists); ok=false when it cannot be
+// read or there is no live row.
+func (d *Daemon) ownRowState(ctx context.Context) (string, bool) {
 	h, err := corrosion.GetHost(ctx, d.db, d.cfg.HostName)
 	if err != nil || h == nil {
-		return ""
+		return "", false
 	}
-	return h.State
+	return h.State, true
 }
+
+// readOwnState is (*Daemon).ownRowState; a var so tests can fail it.
+var readOwnState = (*Daemon).ownRowState
 
 // runOwnRowHold re-evaluates the hold on every own-row change and poll, and
 // runs ownRowStep.
@@ -126,7 +130,9 @@ func (d *Daemon) runOwnRowHold(ctx context.Context) {
 	l := &ownRowLoop{}
 	l.prev, _ = d.readOwnKey(ctx)
 	l.wasHeld = d.db.OwnRowHold().Held
-	l.wasJoining = d.ownRowState(ctx) == corrosion.HostStateJoining
+	if state, ok := readOwnState(d, ctx); ok {
+		l.wasJoining = state == corrosion.HostStateJoining
+	}
 	tick := time.NewTicker(ownRowPoll)
 	defer tick.Stop()
 	for {
@@ -163,8 +169,17 @@ func (d *Daemon) ownRowStep(ctx context.Context, l *ownRowLoop) {
 	}
 	cur, _ := d.readOwnKey(ctx)
 	// The state this evaluation read: a reconcile it runs writes the boot
-	// report only over this state (reconcileBootReport).
-	state := d.ownRowState(ctx)
+	// report only over this state (reconcileBootReport). An evaluation that
+	// cannot read it runs no reconcile and leaves the loop's state as it was,
+	// so the next evaluation that reads it sees the same transition and runs
+	// it then: never a boot write with nothing to check it against.
+	state, stateOK := readOwnState(d, ctx)
+	if !stateOK {
+		slog.Warn("own-row evaluation: this host's recorded state cannot be read; no own-row reconcile until it can",
+			"host", d.cfg.HostName)
+		d.reportOwnRowHeld(ctx, l, st)
+		return
+	}
 	joining := state == corrosion.HostStateJoining
 	switch {
 	case st.Held && !l.wasHeld:
@@ -185,20 +200,27 @@ func (d *Daemon) ownRowStep(ctx context.Context, l *ownRowLoop) {
 		d.runOwnRowReconcile(ctx, state)
 	}
 	l.wasJoining = joining
-	if st.Held && time.Since(l.lastReport) >= ownRowReport {
-		l.lastReport = time.Now()
-		d.writeSelfConditionAs(ctx, auditHoldEvaluator, CondOwnRowHeld, true, corrosion.SeverityWarning,
-			map[string]any{
-				"reason": st.Reason, "arm": st.Arm, "held_for": time.Since(st.Since).Round(time.Second).String(),
-				"timed_out": st.TimedOut, "installed_serial": st.InstalledSerial, "recorded_serial": st.RecordedSerial,
-			})
-	}
+	d.reportOwnRowHeld(ctx, l, st)
 	if st.Held && st.TimedOut && !l.wasTimedOut {
 		slog.Error("this host's own-row hold timed out; falling back to the writes the previous release makes",
 			"host", d.cfg.HostName, "reason", st.Reason, "after", corrosion.OwnRowHoldTimeout)
 		d.runOwnRowReconcile(ctx, state)
 	}
 	l.wasHeld, l.wasTimedOut, l.prev = st.Held, st.TimedOut, cur
+}
+
+// reportOwnRowHeld raises own_row_held, once every ownRowReport, while the
+// hold is engaged.
+func (d *Daemon) reportOwnRowHeld(ctx context.Context, l *ownRowLoop, st corrosion.OwnRowHoldStatus) {
+	if !st.Held || time.Since(l.lastReport) < ownRowReport {
+		return
+	}
+	l.lastReport = time.Now()
+	d.writeSelfConditionAs(ctx, auditHoldEvaluator, CondOwnRowHeld, true, corrosion.SeverityWarning,
+		map[string]any{
+			"reason": st.Reason, "arm": st.Arm, "held_for": time.Since(st.Since).Round(time.Second).String(),
+			"timed_out": st.TimedOut, "installed_serial": st.InstalledSerial, "recorded_serial": st.RecordedSerial,
+		})
 }
 
 // runOwnRowReconcile runs the reconcile once at a time: a re-run while one is
@@ -253,6 +275,12 @@ func (d *Daemon) reconcileBootReport(ctx context.Context, from string) {
 	d.bootRes.mu.Lock()
 	cpus, mem, disk, has := d.bootRes.cpus, d.bootRes.memMiB, d.bootRes.diskGiB, d.bootRes.hasResources
 	d.bootRes.mu.Unlock()
+	if from == "" {
+		// No state was read to check the write against; "" is a boot's
+		// "no expectation", which would leave the write unguarded.
+		slog.Warn("own-row reconcile: no recorded state to write the boot report over; writing none", "host", d.cfg.HostName)
+		return
+	}
 	h, err := corrosion.GetHost(ctx, d.db, d.cfg.HostName)
 	if err != nil || h == nil {
 		slog.Warn("own-row reconcile: read this host's row for its boot report", "error", err)

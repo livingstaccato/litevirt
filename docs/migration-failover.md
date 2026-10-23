@@ -1200,7 +1200,9 @@ as `ssh.service` does when it starts: with socket-activated sshd nothing
 creates it after a reboot until a connection starts `ssh.service`, and `sshd
 -T` refuses to run without it. One that exists is never changed; if it is not
 a root-owned directory writable only by root, the evaluation fails and says
-so. A host that accepted the managed key before and does not
+so. The install that writes the drop-in (`lv host init`, `lv host add`, `lv
+host install-fence-ssh`) does the same before its own `sshd -T` and `sshd -t`,
+and installs nothing while it refuses the directory. A host that accepted the managed key before and does not
 now raises the `fence_ssh_not_accepting` health condition (warning) for itself:
 its peers still fence it over the managed key, which its sshd may refuse.
 

@@ -140,8 +140,9 @@ func keptChainWalk(file string) (layers []string, missing string, dotdot int, er
 // directory, and a ".." element is taken physically, after the symlinked
 // directories before it, not by cleaning the text (qemu passes the joined
 // path to open(2) as it is). dotdot reports a ".." element. A directory on
-// the way that does not exist leaves the textual path, which then reads as
-// missing.
+// the way that does not exist (or a dangling link) leaves the joined path as
+// it is, uncleaned: a stat of it then fails as the kernel's open does, even
+// when a file sits at the path its text cleans to.
 func keptBackingPath(overlay, b string) (path string, dotdot bool, err error) {
 	raw := b
 	if !filepath.IsAbs(b) {
@@ -157,7 +158,7 @@ func keptBackingPath(overlay, b string) (path string, dotdot bool, err error) {
 	}
 	real, err := filepath.EvalSymlinks(dir)
 	if errors.Is(err, fs.ErrNotExist) {
-		return filepath.Clean(raw), true, nil
+		return raw, true, nil
 	}
 	if err != nil {
 		return "", true, fmt.Errorf("%s: resolve its backing file %s: %w", overlay, b, err)

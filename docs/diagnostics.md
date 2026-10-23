@@ -2512,6 +2512,12 @@ server run.
 |---|---|
 | At start or at runtime, the host's own row is live and names a serial other than the installed certificate's (evidence `arm` `a`), or is removed (`arm` `b`). Re-raised once a minute while held. **Warning**. The evidence carries `reason` (`at_start`; `superseded`: another admission replaced the row; `removed`), `held_for`, `timed_out`, `installed_serial` and `recorded_serial`. | The host's own row is live and names the installed certificate's serial. |
 
+When the hold opens, the daemon writes its boot report, and a re-added host
+records itself active once it serves, without a restart. Anti-entropy can
+bring the re-admission's `hosts` row before its membership row, so the hold
+can open while the host still reads the removed machine's state; the daemon
+writes the boot report again when the admission's `joining` reaches it.
+
 A host whose installed certificate renewed the recorded one (`lv host
 renew-cert`, live or while the host was down) is not held: it records the new
 serial at once. Neither is a host whose certificate was reissued outside

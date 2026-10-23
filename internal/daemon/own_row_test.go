@@ -345,3 +345,116 @@ func TestReconcileBootReport_APostUpgradeProcessStaysActive(t *testing.T) {
 		t.Errorf("after the reconcile the host is (%s, %s), want (active, v2)", h.State, h.Version)
 	}
 }
+
+// ownRowMembership records host's state on its host_membership row, as a
+// re-admission's or a fence's membership statement does, without touching
+// the hosts row: anti-entropy carries the two tables separately.
+func ownRowMembership(t *testing.T, d *Daemon, state string) {
+	t.Helper()
+	if _, err := d.db.DB().Exec(`INSERT INTO host_membership (host_name, state, isolation_epoch, isolation_reason, updated_at, deleted_at)
+		VALUES (?, ?, 0, '', ?, NULL)
+		ON CONFLICT(host_name) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at, deleted_at = NULL`,
+		d.cfg.HostName, state, d.db.NowTS()); err != nil {
+		t.Fatal(err)
+	}
+	if h, err := corrosion.GetHost(context.Background(), d.db, d.cfg.HostName); err != nil || h == nil || h.State != state {
+		t.Fatalf("own row reads %+v (%v), want state %s", h, err, state)
+	}
+}
+
+// Lab 2 drill F1: a re-added host restarted during its own-row hold. The
+// re-admission's hosts row reached it by anti-entropy before its
+// host_membership row: the hold opened, and the reconcile read the removed
+// machine's 'upgrading' and left the boot report to the serving check. Then
+// 'joining' arrived, the serving check found the state moved on, and the host
+// stayed joining until its next restart. The admission's 'joining' arriving
+// after the hold opened runs the reconcile again.
+func TestOwnRow_JoiningAfterTheHoldOpenedReconciles(t *testing.T) {
+	ctx := context.Background()
+	cert := [2]string{"02new", ""}
+	d, reconciles := ownRowDaemon(t, "01old", &cert)
+	ownRowMembership(t, d, "upgrading") // the removed machine's graceful stop
+	l := &ownRowLoop{wasHeld: d.db.OwnRowHold().Held}
+	if !l.wasHeld {
+		t.Fatal("not held at start")
+	}
+	// The re-admission's hosts row arrives alone.
+	if _, err := d.db.DB().Exec(`UPDATE hosts SET cert_serial = '02new', incarnation = 1 WHERE name = ?`, d.cfg.HostName); err != nil {
+		t.Fatal(err)
+	}
+	d.ownRowStep(ctx, l)
+	if reconciles.Load() != 1 {
+		t.Fatalf("reconciles = %d after the hold opened, want 1", reconciles.Load())
+	}
+	// Its membership row follows.
+	ownRowMembership(t, d, "joining")
+	d.ownRowStep(ctx, l)
+	if reconciles.Load() != 2 {
+		t.Fatalf("reconciles = %d after the admission's 'joining' arrived, want 2", reconciles.Load())
+	}
+	// Once: a host that stays joining (its address is another's) is not
+	// re-run on every evaluation.
+	d.ownRowStep(ctx, l)
+	d.ownRowStep(ctx, l)
+	if reconciles.Load() != 2 {
+		t.Errorf("reconciles = %d while it stays joining, want 2", reconciles.Load())
+	}
+}
+
+// F1's trigger is 'joining' alone. The reconcile's boot report returns a
+// fenced, drained or offline host to service, which is right once, at the
+// hold's opening, and never at runtime: a fence or a drain recorded while
+// the daemon runs is kept.
+func TestOwnRow_AFenceOrDrainAtRuntimeDoesNotReconcile(t *testing.T) {
+	ctx := context.Background()
+	cert := [2]string{"02new", ""}
+	d, reconciles := ownRowDaemon(t, "02new", &cert)
+	l := &ownRowLoop{}
+	l.prev, _ = d.readOwnKey(ctx)
+	d.ownRowStep(ctx, l)
+	for _, state := range []string{"draining", "maintenance", "fenced", "offline", "upgrading", "active"} {
+		ownRowMembership(t, d, state)
+		d.ownRowStep(ctx, l)
+	}
+	if reconciles.Load() != 0 {
+		t.Errorf("reconciles = %d over runtime state changes, want 0", reconciles.Load())
+	}
+}
+
+// The trigger never runs while the hold is engaged: a 'joining' on a row that
+// names another certificate is another machine's admission.
+func TestOwnRow_JoiningWhileHeldDoesNotReconcile(t *testing.T) {
+	ctx := context.Background()
+	cert := [2]string{"02new", ""}
+	d, reconciles := ownRowDaemon(t, "01old", &cert)
+	l := &ownRowLoop{wasHeld: d.db.OwnRowHold().Held}
+	ownRowMembership(t, d, "joining")
+	d.ownRowStep(ctx, l)
+	d.ownRowStep(ctx, l)
+	if reconciles.Load() != 0 {
+		t.Errorf("reconciles = %d while held, want 0", reconciles.Load())
+	}
+}
+
+// A 'joining' whose reconcile was dropped, because another was in flight
+// (and may have read the row before 'joining' reached it), is acted on at
+// the next evaluation.
+func TestOwnRow_JoiningWhoseReconcileWasDroppedIsRetried(t *testing.T) {
+	ctx := context.Background()
+	cert := [2]string{"02new", ""}
+	d, reconciles := ownRowDaemon(t, "02new", &cert)
+	l := &ownRowLoop{}
+	l.prev, _ = d.readOwnKey(ctx)
+	d.ownRowStep(ctx, l)
+	ownRowMembership(t, d, "joining")
+	d.ownRowReconciling.Store(true) // one in flight
+	d.ownRowStep(ctx, l)
+	d.ownRowReconciling.Store(false)
+	if reconciles.Load() != 0 {
+		t.Fatalf("reconciles = %d with one in flight, want 0", reconciles.Load())
+	}
+	d.ownRowStep(ctx, l)
+	if reconciles.Load() != 1 {
+		t.Errorf("reconciles = %d after the in-flight one ended, want 1", reconciles.Load())
+	}
+}

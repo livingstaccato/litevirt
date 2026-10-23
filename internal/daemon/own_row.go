@@ -102,7 +102,18 @@ type ownRowLoop struct {
 	prev        ownKey
 	wasHeld     bool
 	wasTimedOut bool
-	lastReport  time.Time
+	// wasJoining: the own row read 'joining' at the last evaluation, and a
+	// reconcile has run since it did (ownRowStep).
+	wasJoining bool
+	lastReport time.Time
+}
+
+// ownRowJoining reports whether this host's own row is recorded 'joining'
+// (corrosion.HostStateJoining), the state an admission records, resolved as
+// every reader resolves it (the membership row when it exists).
+func (d *Daemon) ownRowJoining(ctx context.Context) bool {
+	h, err := corrosion.GetHost(ctx, d.db, d.cfg.HostName)
+	return err == nil && h != nil && h.State == corrosion.HostStateJoining
 }
 
 // runOwnRowHold re-evaluates the hold on every own-row change and poll, and
@@ -114,6 +125,7 @@ func (d *Daemon) runOwnRowHold(ctx context.Context) {
 	l := &ownRowLoop{}
 	l.prev, _ = d.readOwnKey(ctx)
 	l.wasHeld = d.db.OwnRowHold().Held
+	l.wasJoining = d.ownRowJoining(ctx)
 	tick := time.NewTicker(ownRowPoll)
 	defer tick.Stop()
 	for {
@@ -129,8 +141,19 @@ func (d *Daemon) runOwnRowHold(ctx context.Context) {
 
 // ownRowStep is one evaluation: keep own_row_held in step with the hold, and
 // run the own-row reconcile when the hold opens, times out (only a hold raised
-// at start over a row at incarnation 0 can), or the own row moves to another
-// incarnation or serial while no hold is engaged.
+// at start over a row at incarnation 0 can), the own row moves to another
+// incarnation or serial while no hold is engaged, or it comes to read
+// 'joining' while no hold is engaged.
+//
+// 'joining' is the state an admission records, and the boot report is what
+// ends it. Anti-entropy carries the hosts row and its host_membership row
+// separately, so a re-admission's hosts row can open the hold while the
+// membership row still holds the removed machine's state: the reconcile then
+// reads that, and leaves the boot report to a serving check that finds the
+// admission's 'joining' when it arrives, and leaves it (lab 2 drill F1). The
+// trigger is 'joining' alone: the reconcile's boot report also returns a
+// fenced, drained or offline host to service, which a fence or drain recorded
+// while this daemon runs must never be.
 func (d *Daemon) ownRowStep(ctx context.Context, l *ownRowLoop) {
 	st, err := d.db.EvaluateOwnRowHold(ctx, corrosion.OwnRowHeldSuperseded)
 	if err != nil {
@@ -138,6 +161,8 @@ func (d *Daemon) ownRowStep(ctx context.Context, l *ownRowLoop) {
 		return
 	}
 	cur, _ := d.readOwnKey(ctx)
+	joining := d.ownRowJoining(ctx)
+	reconciled := true
 	switch {
 	case st.Held && !l.wasHeld:
 		slog.Error("this host's own row no longer names its certificate; its own-row writes are held",
@@ -148,10 +173,17 @@ func (d *Daemon) ownRowStep(ctx context.Context, l *ownRowLoop) {
 		slog.Info("this host's own row is the cluster's admission for its certificate; the own-row hold is open",
 			"host", d.cfg.HostName, "incarnation", cur.n)
 		d.writeSelfConditionAs(ctx, auditHoldEvaluator, CondOwnRowHeld, false, "", nil)
-		d.runOwnRowReconcile(ctx)
+		reconciled = d.runOwnRowReconcile(ctx)
 	case !st.Held && cur != l.prev && !cur.deleted:
-		d.runOwnRowReconcile(ctx)
+		reconciled = d.runOwnRowReconcile(ctx)
+	case !st.Held && joining && !l.wasJoining:
+		slog.Info("this host's own row is recorded joining; writing its boot report", "host", d.cfg.HostName,
+			"incarnation", cur.n)
+		reconciled = d.runOwnRowReconcile(ctx)
 	}
+	// A reconcile dropped because another was in flight may have read the
+	// row before 'joining' reached it: the next evaluation asks again.
+	l.wasJoining = joining && reconciled
 	if st.Held && time.Since(l.lastReport) >= ownRowReport {
 		l.lastReport = time.Now()
 		d.writeSelfConditionAs(ctx, auditHoldEvaluator, CondOwnRowHeld, true, corrosion.SeverityWarning,
@@ -169,17 +201,19 @@ func (d *Daemon) ownRowStep(ctx context.Context, l *ownRowLoop) {
 }
 
 // runOwnRowReconcile runs the reconcile once at a time: a re-run while one is
-// in flight is dropped (the in-flight one reads the row as it is by then).
-func (d *Daemon) runOwnRowReconcile(ctx context.Context) {
+// in flight is dropped (the in-flight one reads the row as it is by then), and
+// reports false.
+func (d *Daemon) runOwnRowReconcile(ctx context.Context) bool {
 	if !d.ownRowReconciling.CompareAndSwap(false, true) {
-		return
+		return false
 	}
 	defer d.ownRowReconciling.Store(false)
 	if d.ownRowReconciler != nil {
 		d.ownRowReconciler(ctx)
-		return
+		return true
 	}
 	d.reconcileOwnRow(ctx)
+	return true
 }
 
 // reconcileOwnRow re-runs this host's own writes on the row the cluster holds:

@@ -124,12 +124,21 @@ func TestEnsureLocalPeer_AnUnwritableConfigIsAFailedUpdate(t *testing.T) {
 		t.Skip("root ignores the file mode this test relies on")
 	}
 	// Readable, so the config still parses and the update gets as far as
-	// writing — which is the failure this test is about.
-	if err := os.Chmod(cfgPath, 0400); err != nil {
-		t.Fatalf("chmod config: %v", err)
+	// writing — which is the failure this test is about. The rewrite renames a
+	// new file into place, so what stops it is the directory, not the file's
+	// mode. The lock file exists already, so taking the lock still succeeds.
+	unlock, err := configLock(cfgPath)
+	if err != nil {
+		t.Fatalf("seed the config lock: %v", err)
 	}
+	unlock()
+	dir := filepath.Dir(cfgPath)
+	if err := os.Chmod(dir, 0500); err != nil {
+		t.Fatalf("chmod config dir: %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0700) })
 
-	err := ensureLocalPeer(cfgPath, "10.0.50.11", 7946)
+	err = ensureLocalPeer(cfgPath, "10.0.50.11", 7946)
 	if err == nil {
 		t.Fatal("a config that could not be written reported a successful update")
 	}

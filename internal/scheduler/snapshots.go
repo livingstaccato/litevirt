@@ -406,7 +406,14 @@ func (s *SnapshotScheduler) runAndRecord(ctx context.Context, sched corrosion.Ba
 		err = s.Runner.RunBackup(ctx, sched, runAt)
 	}
 	runErr := ""
-	if err != nil {
+	if errors.Is(err, ErrRunPaused) {
+		// Not a success: the reason stays as the last error, so the schedule
+		// does not read as healthy and the next host to run it reports its
+		// recovery. Not an error either: the transition is audited by the
+		// runner, and each tick logs at info only.
+		runErr = err.Error()
+		slog.Info("snapshot scheduler: schedule run paused", "type", sched.Type, "vm", sched.VMName, "repo", sched.Repo, "reason", err)
+	} else if err != nil {
 		runErr = err.Error()
 		slog.Error("snapshot scheduler: schedule run failed", "type", sched.Type, "vm", sched.VMName, "repo", sched.Repo, "error", err)
 	} else {
@@ -429,6 +436,11 @@ func alreadyRanThisMinute(lastRunAt string, now time.Time) bool {
 	}
 	return t.UTC().Truncate(time.Minute).Equal(now.UTC().Truncate(time.Minute))
 }
+
+// ErrRunPaused is the answer of a runner that did not run a schedule because
+// the host cannot act for its workload (a witness). It is neither a success nor
+// a failure: the run is recorded with the reason as its last error.
+var ErrRunPaused = errors.New("schedule paused")
 
 // ErrNoRepoConfigured is returned by RunnerWithRepoResolver when a
 // schedule references a logical repo name not present in the daemon

@@ -13,12 +13,14 @@ package fleet
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/scheduler"
 )
 
 // Red on ba91f3c21: every run returns the gate refusal.
@@ -55,8 +57,8 @@ func TestFleet_AScheduleOnAWitnessIsPausedOnceNotFailedEveryRun(t *testing.T) {
 	}
 
 	for i := 0; i < 4; i++ {
-		if err := wr.w.Server.RunReplication(ctx, *sched, time.Now().Add(time.Duration(i)*time.Minute)); err != nil {
-			t.Fatalf("run %d of the schedule from the witness returned %v, want it paused without an error", i, err)
+		if err := wr.w.Server.RunReplication(ctx, *sched, time.Now().Add(time.Duration(i)*time.Minute)); !errors.Is(err, scheduler.ErrRunPaused) {
+			t.Fatalf("run %d of the schedule from the witness returned %v, want it paused (scheduler.ErrRunPaused), not failed", i, err)
 		}
 	}
 	rows, err := wr.w.DB.Query(ctx, `SELECT detail, result FROM audit_log WHERE action = 'vm.replicate' AND target = 'db'`)

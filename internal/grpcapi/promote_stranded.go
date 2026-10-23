@@ -55,7 +55,7 @@ func (s *Server) noteDisksLeftByPromote(ctx context.Context, vm *corrosion.VMRec
 		" keeps them once it is back (lv host superseded-disks " + host + ")"
 	slog.Warn("promote: a promoted VM left its host-local disks on the host it left; recorded and kept",
 		"vm", vm.Name, "host", host, "target", s.hostName)
-	s.audit(ctx, "replica.disk-stranded", vm.Name, detail, "ok")
+	s.audit(ctx, "failover.disk-stranded", vm.Name, detail, "ok")
 	s.recordVMEventSeverity(ctx, vm.Name, "vm.promote.disk_stranded", "ok", "warn", detail)
 	s.NotifyVMDiskStranded(vm.Name, host, detail)
 }

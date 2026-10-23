@@ -47,6 +47,10 @@ func TestFleet_AnOperatorPromoteRecordsAndKeepsWhatItLeavesOnTheOldHost(t *testi
 		len(recs[0].Disks) != 1 || recs[0].Disks[0].Path != wr.root {
 		t.Fatalf("stranded records after the promote = %+v, want db's disk %s on %s, moved to %s", recs, wr.root, wr.a.Name, wr.w.Name)
 	}
+	// Under the coordinator's audit action, so one query finds both.
+	if rows, qerr := wr.w.DB.Query(ctx, `SELECT 1 AS n FROM audit_log WHERE action = 'failover.disk-stranded' AND target = 'db'`); qerr != nil || len(rows) != 1 {
+		t.Errorf("failover.disk-stranded audit rows for db = %d (%v), want one", len(rows), qerr)
+	}
 	// Recorded and kept: the promote itself removed nothing from the old host.
 	if _, err := os.Stat(filepath.Join(wr.c.tmpRoot, "fs-"+wr.a.Name, wr.root)); err != nil {
 		t.Errorf("the old host's disk is gone after the promote: %v", err)

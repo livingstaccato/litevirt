@@ -1272,9 +1272,11 @@ switches its schedule to replicate from the witness back to the host it left. A
 witness runs no workloads and refuses to act for the VM, so the schedule is
 paused: the first run reports it once, as one audit entry (`vm.replicate`, with
 the reason and the command) and one `replication.suspended` notification, and
-later runs do nothing and record no error (the notification is repeated hourly,
-as above). The schedule resumes by itself once the VM is on a worker, whose
-scheduler then runs it.
+later runs do nothing and are not logged as errors. The schedule keeps the reason
+as its `LAST ERR` (`schedule paused: ...`), so it never reads as healthy, and the
+notification is repeated hourly, as above. The schedule resumes by itself once
+the VM is on a worker, whose scheduler then runs it and reports
+`replication.recovered` on its first good run.
 
 The switch changes only the target host: once the release token has latched,
 as a compare-and-set of that one column, so an operator's concurrent edit of the

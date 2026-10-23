@@ -201,3 +201,38 @@ func DeleteSnapshot(ctx context.Context, c *Client, vmName, snapshotName string)
 	now := c.NowTS()
 	return c.Execute(ctx, deleteSnapshotSQL, nowRFC3339(), now, vmName, snapshotName)
 }
+
+// DeleteSnapshotIfStill tombstones the live snapshot record of r's VM and
+// name only while it is still r (the same id on the same host) and no VM of
+// that name exists, both read inside the write's own transaction, so nothing
+// this node applies between a caller's check and the write is tombstoned in
+// r's place. applied is false, with no error, when either no longer holds.
+// A record taken again under a tombstoned name gets that row's id back
+// (InsertSnapshot), so the id alone does not tell them apart: the host does.
+//
+// The write is deleteSnapshotSQL, the shape InsertSnapshot already ships
+// from its own guarded batch, so peers on any build apply it. Each receiver
+// evaluates only its (vm_name, name) WHERE: a re-create on another host that
+// has not reached this node yet when the guard reads is not seen, and the
+// tombstone then wins over it cluster-wide (at most that one record; no file).
+func DeleteSnapshotIfStill(ctx context.Context, c *Client, r SnapshotRecord) (applied bool, err error) {
+	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var id, host string
+		err := tx.QueryRowContext(ctx, `SELECT id, host_name FROM snapshots WHERE vm_name = ? AND name = ? AND deleted_at IS NULL`,
+			r.VMName, r.Name).Scan(&id, &host)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if id != r.ID || host != r.HostName {
+			return false, nil
+		}
+		var n int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM vms WHERE name = ? AND deleted_at IS NULL`, r.VMName).Scan(&n); err != nil {
+			return false, err
+		}
+		return n == 0, nil
+	}, []Statement{{SQL: deleteSnapshotSQL, Params: []interface{}{nowRFC3339(), c.NowTS(), r.VMName, r.Name}}})
+}

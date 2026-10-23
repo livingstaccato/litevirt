@@ -364,9 +364,13 @@ the file. The deleted VM's snapshot records on that host are taken over these
 files, and `lv snapshot rm` cannot reach them once the VM is gone: a release
 of every chain of the VM drops them with the files when no VM of the name
 exists on any host and each memory image is unrecorded, gone, or a file the
-release removes. Once the files are gone it checks again: a VM of the name that
-now exists, or a record that is no longer the one the plan saw, keeps the
-records. The plan names them; otherwise they refuse it. It shows
+release removes. Once the files are gone it checks again, and the drop reads both
+again inside its own write: a VM of the name that now exists, or a record
+that is no longer the one the plan saw (another host's under the same name),
+keeps the records. Known limit: a same-name VM's snapshot taken on another
+host that has not replicated to this host yet is not seen, and the drop wins
+over it on every host. That costs at most that one record per name dropped,
+never a file; take the snapshot again. The plan names them; otherwise they refuse it. It shows
 exactly what it removes and drops and asks to confirm (`--yes` skips the
 question; without a terminal it is required); the files and records confirmed
 are sent with the release (the files are required), and a release that would

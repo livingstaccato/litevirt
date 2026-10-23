@@ -625,18 +625,21 @@ func TestKeptRelease_NeverTakesASymlinksTarget(t *testing.T) {
 
 // Rule N2: the snapshot records a release drops are checked again once the
 // files are gone. A VM of the name that now exists keeps them all; a record
-// that is no longer the one the plan saw (dropped and taken again under the
-// same name, which reuses the id) is kept, with the records after it.
+// that is no longer the one the plan saw is kept, with the records after it.
+// Here s1 is dropped and taken again on node-x under the same name:
+// InsertSnapshot gives it the dropped row's id back and stamps its own
+// created_at (to the second, so the same one here), so the two records
+// differ by host alone, which is what the identity check compares.
 //
 // Mutations: drop the re-check for a VM: red; drop the record identity
-// check: red.
+// check, or its host compare: red.
 func TestKeptRelease_RechecksTheSnapshotRecordsBeforeDropping(t *testing.T) {
 	setup := func(t *testing.T) (*Server, string, string) {
 		t.Helper()
 		s, _ := provableCreateServer(t)
 		top, base := keptChainFixture(t, s)
 		if err := corrosion.InsertSnapshot(adminCtx(), s.db, corrosion.SnapshotRecord{ID: "snap-1", VMName: "old", HostName: s.hostName,
-			Name: "s1", State: "ok", CreatedAt: "2026-10-01T00:00:00Z"}); err != nil {
+			Name: "s1", State: "ok"}); err != nil {
 			t.Fatal(err)
 		}
 		return s, top, base
@@ -654,7 +657,7 @@ func TestKeptRelease_RechecksTheSnapshotRecordsBeforeDropping(t *testing.T) {
 			}
 		})
 		_, err := keptRelease(s, "old")
-		if err == nil || !strings.Contains(err.Error(), "a VM old now exists") {
+		if err == nil || !strings.Contains(err.Error(), "a VM old now exists (on node-x)") {
 			t.Fatalf("release while a VM old appears = %v; want it to keep the records, naming the VM", err)
 		}
 		if sn, _ := corrosion.GetSnapshot(adminCtx(), s.db, "old", "s1"); sn == nil {
@@ -668,7 +671,7 @@ func TestKeptRelease_RechecksTheSnapshotRecordsBeforeDropping(t *testing.T) {
 				t.Error(err)
 			}
 			if err := corrosion.InsertSnapshot(adminCtx(), s.db, corrosion.SnapshotRecord{ID: "snap-2", VMName: "old", HostName: "node-x",
-				Name: "s1", State: "ok", CreatedAt: "2026-10-23T12:00:00Z"}); err != nil {
+				Name: "s1", State: "ok"}); err != nil {
 				t.Error(err)
 			}
 		})
@@ -679,6 +682,142 @@ func TestKeptRelease_RechecksTheSnapshotRecordsBeforeDropping(t *testing.T) {
 		sn, _ := corrosion.GetSnapshot(adminCtx(), s.db, "old", "s1")
 		if sn == nil || sn.HostName != "node-x" {
 			t.Errorf("the new record s1 = %+v; want it live, on node-x", sn)
+		}
+	})
+}
+
+// Rule F1 (re-review of a04011ad8): a record taken again in the gap between a
+// release's check of it and its drop (applied on this node from a same-name
+// VM's snapshot on another host) is kept: the drop re-reads the record and
+// the absence of a VM of the name inside its own transaction.
+//
+// Red on a04011ad8 (with this seam ported): node-x's s1 is dropped.
+// Mutations: drop the guard's host compare, or its VM check: red.
+func TestKeptRelease_KeepsARecordTakenAgainBetweenItsCheckAndItsDrop(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		gap  func(t *testing.T, s *Server)
+		want string
+	}{
+		{"taken again on another host", func(t *testing.T, s *Server) {
+			if err := corrosion.InsertSnapshot(adminCtx(), s.db, corrosion.SnapshotRecord{VMName: "old", HostName: "node-x", Name: "s1", State: "ok"}); err != nil {
+				t.Error(err)
+			}
+		}, "is no longer the one the release checked"},
+		{"a VM of the name is created", func(t *testing.T, s *Server) {
+			if err := corrosion.InsertVM(adminCtx(), s.db, corrosion.VMRecord{Name: "old", HostName: "node-x", State: "stopped"}, nil, nil); err != nil {
+				t.Error(err)
+			}
+		}, "a VM old now exists"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := provableCreateServer(t)
+			keptChainFixture(t, s)
+			if err := corrosion.InsertSnapshot(adminCtx(), s.db, corrosion.SnapshotRecord{ID: "snap-1", VMName: "old", HostName: s.hostName,
+				Name: "s1", State: "ok"}); err != nil {
+				t.Fatal(err)
+			}
+			prev := keptReleaseBeforeSnapshotWrite
+			keptReleaseBeforeSnapshotWrite = func(string) { tc.gap(t, s) }
+			t.Cleanup(func() { keptReleaseBeforeSnapshotWrite = prev })
+			_, err := keptRelease(s, "old")
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("release with %s in the gap = %v; want it to keep the record, saying %q", tc.name, err, tc.want)
+			}
+			if sn, _ := corrosion.GetSnapshot(adminCtx(), s.db, "old", "s1"); sn == nil {
+				t.Errorf("s1 was dropped although %s in the gap before its drop", tc.name)
+			}
+		})
+	}
+}
+
+// Rule F3: a backing reference with a ".." element is followed as the kernel
+// opens it, through the symlinked directory before the "..", not by cleaning
+// the text, so what a chain stands on and its missing base are reported as
+// they are. Such a layer is listed only: a release never removes it.
+//
+// Mutations: clean the reference as text again: red; let a layer reached
+// through ".." count as the VM's own: red ("a candidate").
+func TestKeptRelease_FollowsDotDotThroughASymlinkedDirectory(t *testing.T) {
+	// <disks>/sub -> <t>/a/b; web-root.qcow2 backs on "sub/../web-data.qcow2",
+	// which is <t>/a/web-data.qcow2, not <disks>/web-data.qcow2.
+	layout := func(t *testing.T, s *Server, subTarget string) (top, real, lexical string) {
+		t.Helper()
+		top = s.images.DiskPath("web", "root")
+		disks := filepath.Dir(top)
+		if err := os.MkdirAll(disks, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(subTarget, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(subTarget, filepath.Join(disks, "sub")); err != nil {
+			t.Fatal(err)
+		}
+		real = filepath.Join(filepath.Dir(subTarget), "web-data.qcow2")
+		if err := qcow2.Create(real, 1<<20, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := qcow2.CreateWithBackingFormat(top, "sub/../web-data.qcow2", "qcow2", 1<<20, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := health.NoteKeptDisks(s.dataDir, "web", []string{top}); err != nil {
+			t.Fatal(err)
+		}
+		return top, real, filepath.Join(disks, "web-data.qcow2")
+	}
+	t.Run("the real base is listed, not a missing textual one", func(t *testing.T) {
+		s, _ := provableCreateServer(t)
+		_, real, lexical := layout(t, s, filepath.Join(t.TempDir(), "a", "b"))
+		list, err := s.KeptDisks(viewerCtx(), &pb.KeptDisksRequest{})
+		if err != nil || len(list.Chains) != 1 {
+			t.Fatalf("list = %+v, %v", list, err)
+		}
+		ch := list.Chains[0]
+		if ch.MissingBase != "" || !slices.Contains(ch.StandsOn, real) || slices.Contains(ch.StandsOn, lexical) {
+			t.Fatalf("chain = %+v; want it to stand on %s, with no missing base (not %s)", ch, real, lexical)
+		}
+	})
+	t.Run("a textual namesake in the disk directory is not the base", func(t *testing.T) {
+		s, _ := provableCreateServer(t)
+		top, real, lexical := layout(t, s, filepath.Join(t.TempDir(), "a", "b"))
+		if err := qcow2.Create(lexical, 1<<20, nil); err != nil {
+			t.Fatal(err)
+		}
+		resp, err := keptRelease(s, "web")
+		if err != nil {
+			t.Fatalf("release web: %v", err)
+		}
+		for _, p := range []string{real, lexical} {
+			if _, err := os.Stat(p); err != nil {
+				t.Errorf("%s went with web's kept disk: %v", p, err)
+			}
+		}
+		if _, err := os.Stat(top); !os.IsNotExist(err) {
+			t.Errorf("web's kept disk is still there (%v)", err)
+		}
+		if len(resp.Chains) != 1 || !slices.Contains(resp.Chains[0].StandsOn, real) {
+			t.Errorf("release answer = %+v; want %s under stands_on", resp.Chains, real)
+		}
+	})
+	t.Run("a candidate reached through it stays listed only", func(t *testing.T) {
+		s, _ := provableCreateServer(t)
+		// sub -> <disks>/web/inner, so sub/.. is the legacy directory
+		// <disks>/web, whose files are web's candidates.
+		disks := filepath.Dir(s.images.DiskPath("web", "root"))
+		top, real, _ := layout(t, s, filepath.Join(disks, "web", "inner"))
+		resp, err := keptRelease(s, "web")
+		if err != nil {
+			t.Fatalf("release web: %v", err)
+		}
+		if _, err := os.Stat(real); err != nil {
+			t.Fatalf("%s, reached through \"..\", was removed: %v", real, err)
+		}
+		if _, err := os.Stat(top); !os.IsNotExist(err) {
+			t.Errorf("web's kept disk is still there (%v)", err)
+		}
+		if len(resp.Chains) != 1 || !slices.Contains(resp.Chains[0].StandsOn, real) {
+			t.Errorf("release answer = %+v; want %s under stands_on", resp.Chains, real)
 		}
 	})
 }

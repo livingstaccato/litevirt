@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -111,7 +112,7 @@ func (s *Server) keptHere(d corrosion.DiskRecord, keepDisks bool) bool {
 // declared qcow2 backing file without the magic, and a chain deeper than
 // maxBackingDepth are errors naming the file.
 func keptChainLayers(file string) ([]string, error) {
-	layers, _, err := walkKeptChain(file, false)
+	layers, _, _, err := walkKeptChain(file, false)
 	return layers, err
 }
 
@@ -121,51 +122,95 @@ func keptChainLayers(file string) ([]string, error) {
 // below it is reached, but the last layer still names it, so a file written
 // there becomes that layer's base. Any other error is still one.
 func keptChainLayersToMissing(file string) (layers []string, missing string, err error) {
+	layers, missing, _, err = walkKeptChain(file, true)
+	return layers, missing, err
+}
+
+// keptChainWalk is keptChainLayersToMissing, and also the index of the first
+// layer reached through a backing reference with a ".." element (-1 when
+// none): that layer's path depends on where symlinked directories lead, so a
+// caller that removes files treats it, and everything below it, as listed
+// only (keptBackingPath).
+func keptChainWalk(file string) (layers []string, missing string, dotdot int, err error) {
 	return walkKeptChain(file, true)
 }
 
-func walkKeptChain(file string, stopAtMissing bool) ([]string, string, error) {
+// keptBackingPath is the file an overlay at overlay names as its backing
+// file b, as the kernel finds it: a relative b is joined to the overlay's
+// directory, and a ".." element is taken physically, after the symlinked
+// directories before it, not by cleaning the text (qemu passes the joined
+// path to open(2) as it is). dotdot reports a ".." element. A directory on
+// the way that does not exist leaves the textual path, which then reads as
+// missing.
+func keptBackingPath(overlay, b string) (path string, dotdot bool, err error) {
+	raw := b
+	if !filepath.IsAbs(b) {
+		raw = filepath.Dir(overlay) + string(filepath.Separator) + b
+	}
+	if !slices.Contains(strings.Split(raw, string(filepath.Separator)), "..") {
+		return filepath.Clean(raw), false, nil
+	}
+	i := strings.LastIndex(raw, string(filepath.Separator))
+	dir, base := raw[:i], raw[i+1:]
+	if base == ".." || base == "." || base == "" {
+		dir, base = raw, ""
+	}
+	real, err := filepath.EvalSymlinks(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return filepath.Clean(raw), true, nil
+	}
+	if err != nil {
+		return "", true, fmt.Errorf("%s: resolve its backing file %s: %w", overlay, b, err)
+	}
+	return filepath.Join(real, base), true, nil
+}
+
+func walkKeptChain(file string, stopAtMissing bool) ([]string, string, int, error) {
 	var out []string
 	path, declaredQcow2 := file, false
+	dotdot := -1
 	for depth := 0; depth <= maxBackingDepth; depth++ {
 		fi, err := os.Stat(path)
 		if err != nil {
 			if depth == 0 && errors.Is(err, fs.ErrNotExist) {
-				return nil, "", nil
+				return nil, "", -1, nil
 			}
 			if stopAtMissing && errors.Is(err, fs.ErrNotExist) {
-				return out, path, nil
+				return out, path, dotdot, nil
 			}
-			return nil, "", fmt.Errorf("%s: %w", path, err)
+			return nil, "", -1, fmt.Errorf("%s: %w", path, err)
 		}
 		out = append(out, path)
 		if !fi.Mode().IsRegular() {
-			return out, "", nil
+			return out, "", dotdot, nil
 		}
 		isQ, err := hasQcow2Magic(path)
 		if err != nil {
-			return nil, "", fmt.Errorf("%s: %w", path, err)
+			return nil, "", -1, fmt.Errorf("%s: %w", path, err)
 		}
 		if !isQ {
 			if declaredQcow2 {
-				return nil, "", fmt.Errorf("%s: the overlay above it declares it qcow2, and it has no qcow2 header", path)
+				return nil, "", -1, fmt.Errorf("%s: the overlay above it declares it qcow2, and it has no qcow2 header", path)
 			}
-			return out, "", nil
+			return out, "", dotdot, nil
 		}
 		info, err := qcow2.Info(path)
 		if err != nil {
-			return nil, "", fmt.Errorf("%s: %w", path, err)
+			return nil, "", -1, fmt.Errorf("%s: %w", path, err)
 		}
 		if info.BackingFile == "" || looksLikeProtocol(info.BackingFile) {
-			return out, "", nil
+			return out, "", dotdot, nil
 		}
-		b := info.BackingFile
-		if !filepath.IsAbs(b) {
-			b = filepath.Join(filepath.Dir(path), b)
+		next, dd, err := keptBackingPath(path, info.BackingFile)
+		if err != nil {
+			return nil, "", -1, err
 		}
-		path, declaredQcow2 = filepath.Clean(b), info.BackingFormat == "qcow2"
+		if dd && dotdot < 0 {
+			dotdot = len(out)
+		}
+		path, declaredQcow2 = next, info.BackingFormat == "qcow2"
 	}
-	return nil, "", fmt.Errorf("%s: backing chain deeper than %d", file, maxBackingDepth)
+	return nil, "", -1, fmt.Errorf("%s: backing chain deeper than %d", file, maxBackingDepth)
 }
 
 // hasQcow2Magic reports whether path starts with the qcow2 magic.

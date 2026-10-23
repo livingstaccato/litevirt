@@ -154,6 +154,10 @@ var keptReleaseBeforeRemove = func(string) {}
 // release checks the snapshot records it drops again; a test replaces it.
 var keptReleaseBeforeSnapshotDrop = func() {}
 
+// keptReleaseBeforeSnapshotWrite runs after a record's check and before its
+// guarded drop; a test replaces it.
+var keptReleaseBeforeSnapshotWrite = func(string) {}
+
 // keptUnits is every kept chain on this host, by VM, then by top. A note,
 // kept-disks.json, or a chain that cannot be read is an error: what a release
 // would remove, and what it would leave without its base, is then unknown.
@@ -233,10 +237,11 @@ func (s *Server) keptUnits(ctx context.Context) ([]*keptUnit, error) {
 			type walked struct {
 				layers  []string
 				missing string
+				dotdot  int
 			}
 			w, err := storage.Bounded("read the backing chain of", c, func() (walked, error) {
-				l, m, err := keptChainLayersToMissing(c)
-				return walked{l, m}, err
+				l, m, dd, err := keptChainWalk(c)
+				return walked{l, m, dd}, err
 			})
 			if err != nil {
 				return nil, fmt.Errorf("the backing chain of %s, a disk the delete of VM %s kept, cannot be read (%v), so what a release "+
@@ -244,6 +249,12 @@ func (s *Server) keptUnits(ctx context.Context) ([]*keptUnit, error) {
 			}
 			own := 0
 			for own < len(w.layers) {
+				// A layer reached through a ".." reference is listed only:
+				// where it is depends on symlinked directories, and a
+				// release removes nothing it found that way.
+				if own > 0 && w.dotdot >= 0 && own >= w.dotdot {
+					break
+				}
 				if own > 0 {
 					r, err := resolvedStrict(w.layers[own])
 					if err != nil {
@@ -1047,6 +1058,13 @@ func (s *Server) releaseKept(ctx context.Context, req *pb.KeptDisksRequest, acto
 	// and only while no VM of the name exists and each is still the record
 	// the plan saw: a same-name VM on another host does not wait on this
 	// host's lock, and may have taken a snapshot of the same name meanwhile.
+	// The checks below explain a refusal; the drop itself re-reads both
+	// inside its own transaction (corrosion.DeleteSnapshotIfStill), so a
+	// record this node applies in between is never tombstoned in its place.
+	// Known limit: a re-create on another host that has not replicated here
+	// yet is not seen by any local check, and the drop, applied by (VM, name)
+	// on every peer, wins over it: at most one record per planned name, and
+	// never a file.
 	var dropped []string
 	if failed == nil && len(planSnaps) > 0 {
 		keptReleaseBeforeSnapshotDrop()
@@ -1067,8 +1085,18 @@ func (s *Server) releaseKept(ctx context.Context, req *pb.KeptDisksRequest, acto
 				failed = fmt.Errorf("the files are removed; %s, so it and the records after it were kept", why)
 				break
 			}
-			if err := corrosion.DeleteSnapshot(ctx, s.db, vm, r.Name); err != nil {
+			keptReleaseBeforeSnapshotWrite(r.Name)
+			applied, err := corrosion.DeleteSnapshotIfStill(ctx, s.db, r)
+			if err != nil {
 				failed = fmt.Errorf("the files are removed, and the snapshot record %s could not be dropped (%w)", r.Name, err)
+				break
+			}
+			if !applied {
+				why := s.keptSnapshotStill(ctx, r)
+				if why == "" {
+					why = fmt.Sprintf("a VM %s now exists", vm)
+				}
+				failed = fmt.Errorf("the files are removed; %s, so it and the records after it were kept", why)
 				break
 			}
 			dropped = append(dropped, r.Name)
@@ -1099,9 +1127,10 @@ func (s *Server) releaseKept(ctx context.Context, req *pb.KeptDisksRequest, acto
 // longer r: gone, or another record. "" when it is r. A record re-created
 // under a dropped name takes the dropped row's id back
 // (corrosion.InsertSnapshot), so the id alone does not tell them apart: the
-// host and the time it was taken do. The drop that follows is by (VM, name),
-// the one replicated shape older peers apply; this check is what binds it to
-// the record the plan saw.
+// host does. (Its created_at is no help: InsertSnapshot stamps it to the
+// second, and a re-create on the same host needs a VM of the name, which
+// refuses the drop anyway.) corrosion.DeleteSnapshotIfStill makes the same
+// comparison inside the drop's transaction; this one names what changed.
 func (s *Server) keptSnapshotStill(ctx context.Context, r corrosion.SnapshotRecord) string {
 	cur, err := corrosion.GetSnapshot(ctx, s.db, r.VMName, r.Name)
 	switch {
@@ -1109,9 +1138,9 @@ func (s *Server) keptSnapshotStill(ctx context.Context, r corrosion.SnapshotReco
 		return fmt.Sprintf("the snapshot record %s of VM %s cannot be read again (%v)", r.Name, r.VMName, err)
 	case cur == nil:
 		return fmt.Sprintf("the snapshot record %s of VM %s is gone", r.Name, r.VMName)
-	case cur.ID != r.ID || cur.HostName != r.HostName || cur.CreatedAt != r.CreatedAt:
-		return fmt.Sprintf("the snapshot record %s of VM %s is no longer the one the release checked (id %s on %s, taken %s; now id %s on %s, taken %s)",
-			r.Name, r.VMName, r.ID, r.HostName, r.CreatedAt, cur.ID, cur.HostName, cur.CreatedAt)
+	case cur.ID != r.ID || cur.HostName != r.HostName:
+		return fmt.Sprintf("the snapshot record %s of VM %s is no longer the one the release checked (id %s on %s; now id %s on %s)",
+			r.Name, r.VMName, r.ID, r.HostName, cur.ID, cur.HostName)
 	}
 	return ""
 }

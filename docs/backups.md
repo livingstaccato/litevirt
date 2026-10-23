@@ -1266,6 +1266,16 @@ schedule's `LAST ERR`. A pool, project or cluster schedule is never switched for
 one of its VMs, so a VM that moves onto such a schedule's explicit target keeps
 replicating into the pool there, as it always has.
 
+**Never from a witness.** A VM promoted onto a witness is stopped there until it
+is moved to a worker (`lv migrate <vm> <worker> --cold`), and the promote
+switches its schedule to replicate from the witness back to the host it left. A
+witness runs no workloads and refuses to act for the VM, so the schedule is
+paused: the first run reports it once, as one audit entry (`vm.replicate`, with
+the reason and the command) and one `replication.suspended` notification, and
+later runs do nothing and record no error (the notification is repeated hourly,
+as above). The schedule resumes by itself once the VM is on a worker, whose
+scheduler then runs it.
+
 The switch changes only the target host: once the release token has latched,
 as a compare-and-set of that one column, so an operator's concurrent edit of the
 schedule on another node survives it; before that (a VM's switch only), by

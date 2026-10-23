@@ -2047,6 +2047,20 @@ is not recovered: it holds the VM down (`failover.skip`, a
 `replication.promote_held` notification and a held event on the VM naming the
 steps), and the operator runs the promote by hand, then the migration.
 
+What a promote leaves behind is not removed by it. On the host the VM left, its
+disk is recorded as stranded when the operator promotes, as when the coordinator
+does (a `replica.disk-stranded` audit entry, a `vm.promote.disk_stranded` event,
+a `vm.disk.stranded` notification, and `strandedDisks` in `lv inspect`): the
+host may be down, and its disk may hold what the guest wrote after the replica.
+Once it is back, it sets the disk aside as `<disk path>.superseded-<time>`, kept
+while the VM exists (see below). Its cloud-init seed stays until the VM is
+deleted. The replicas on the witness stay too: they are the fallback copies
+until the VM is protected again, and are removed with the VM or its schedule.
+The schedule the promote switched to replicate from the witness back to the host
+it left is paused while the VM is on the witness (one audit entry and one
+`replication.suspended` notification, see [Backups](backups.md)) and runs again
+from the worker it is moved to.
+
 `lv host drain <witness>` is no longer refused by the execution gate: a
 witness may move workloads away, which is all a drain does. Draining an empty
 witness only marks it `draining` (it still votes and runs nothing); one that

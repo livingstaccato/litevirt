@@ -57,6 +57,19 @@ func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupSched
 	if vm.HostName != s.hostName {
 		return nil // not ours; the owning host's scheduler handles it
 	}
+	// A VM stranded on a witness (a promote's landing, awaiting its move to a
+	// worker) is stopped and cannot act: the execution gate refuses every run
+	// with local_not_active_worker. The schedule is paused, not failed: one
+	// audit entry and one replication.suspended notification say why and how it
+	// resumes (replicationOutcome reports a change of condition, not a repeat),
+	// and no run is made or recorded as an error each tick. It resumes by
+	// itself when the VM is moved to a worker, whose scheduler then owns it.
+	if h, herr := corrosion.GetHost(ctx, s.db, s.hostName); herr == nil && h != nil && h.IsWitness() {
+		s.replicationOutcome(ctx, sched, "vm", vm.Name, tenancy.NormalizeProject(vm.Project), sched.TargetHost, sched.TargetPool, "",
+			fmt.Errorf("%w: vm %s is on %s, a witness (role: %s) that runs no workloads, so its replication is paused until it is moved to a worker: `lv migrate %s %s --cold`",
+				errReplicationSuspended, vm.Name, s.hostName, h.Role, vm.Name, s.exampleWorker(ctx, s.hostName)))
+		return nil
+	}
 	// The schedule's bandwidth limit, read once per run, paces every leg
 	// that sends this run's data to a peer.
 	ctx = withReplicationLimiter(ctx, s.scheduleLimiter(ctx, sched))

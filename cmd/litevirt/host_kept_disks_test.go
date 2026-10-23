@@ -122,7 +122,8 @@ func TestHostKeptDisks_SnapshotsConfirmedAndOlderBuildNamed(t *testing.T) {
 		t.Errorf("an old entry node = %v; want it named as the node reached", err)
 	}
 	c = &keptDisksClient{err: status.Error(codes.Unimplemented, "host node-2 runs a build without lv host kept-disks; nothing was removed there")}
-	if _, err := runKeptDisks(t, c, true, "node-2"); err == nil || !strings.Contains(err.Error(), "host node-2 runs a build without") {
+	if _, err := runKeptDisks(t, c, true, "node-2"); err == nil || !strings.Contains(err.Error(), "host node-2 runs a build without") ||
+		strings.Contains(err.Error(), "the node this command reached") {
 		t.Errorf("an old target = %v; want the forwarder's wording", err)
 	}
 }

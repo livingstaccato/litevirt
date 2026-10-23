@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/ssh"
@@ -91,7 +92,7 @@ func signedChallenge(m stateProbe, keyPath string, cert *x509.Certificate) (prov
 		return false, err
 	}
 	challenge := keyProofDomain + hex.EncodeToString(nonce[:])
-	out, err := m.Shell(keyProofKind, keyProofCmd(m.Path(keyPath), challenge))
+	out, err := shellWithin(m, keyProofKind, keyProofCmd(m.Path(keyPath), challenge), keyProofDeadline)
 	if err != nil {
 		return false, fmt.Errorf("the challenge did not run: %w", err)
 	}
@@ -128,6 +129,30 @@ func signedChallenge(m stateProbe, keyPath string, cert *x509.Certificate) (prov
 	return true, nil
 }
 
+// shellWithin runs m.Shell and gives up after d, whatever the machine has.
+// A deadline is an error, not NOSIGN: a connection that does not answer is
+// not trusted to answer the key read the in-memory fallback would make. The
+// abandoned run ends when its connection is closed.
+func shellWithin(m stateProbe, kind, cmd string, d time.Duration) ([]byte, error) {
+	type result struct {
+		out []byte
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		out, err := m.Shell(kind, cmd)
+		ch <- result{out, err}
+	}()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r.out, r.err
+	case <-timer.C:
+		return nil, fmt.Errorf("no answer before the %v deadline", d)
+	}
+}
+
 // keyProofDomain prefixes every challenge, so a signature made for this
 // proof can never stand for one another signer of the host key asks for.
 const keyProofDomain = "litevirt-host-add-proof-v1:"
@@ -136,6 +161,13 @@ const keyProofDomain = "litevirt-host-add-proof-v1:"
 // it has `timeout`); a run it ends is NOSIGN, and the key is compared in
 // memory. A var so a test can shorten it.
 var keyProofTimeout = 30
+
+// keyProofDeadline bounds the whole challenge on the client, whatever the
+// machine has: with no `timeout` binary the remote bound is dropped, and a
+// hung openssl (or a hostile machine) would block the add forever. It
+// outlasts keyProofTimeout, so a machine that does have `timeout` still
+// answers NOSIGN first. A var so a test can shorten it.
+var keyProofDeadline = 45 * time.Second
 
 // keyProofCmd signs challenge with keyPath (as the shell names it) and
 // prints "SIG <base64>", "NOKEY" when there is no key, "NOTFILE" when the

@@ -367,8 +367,8 @@ type WatchdogConfig struct {
 	// reach the heartbeat (a hung boot). Default 120.
 	BootKeeperMaxSec int `yaml:"boot_keeper_max_sec"`
 	// LivenessStaleSec: on a configured, verified, armed watchdog, the
-	// heartbeat stops petting, and self-fences, once neither a state-store
-	// round trip nor the partition pauser has made progress for this long.
+	// heartbeat stops petting, and self-fences, once either the state-store
+	// round trip or the partition pauser has made no progress for this long.
 	// Default 120; 0 turns the gate off; otherwise at least 120 (twice the
 	// hardware timeout).
 	LivenessStaleSec int `yaml:"liveness_stale_sec"`

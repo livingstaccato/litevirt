@@ -134,7 +134,7 @@ watchdog_dev: ""
 #
 # liveness_stale_sec: with watchdog_dev set and the device verified as a
 # counting hardware watchdog, the daemon stops petting it, and self-fences,
-# once neither a state-store round trip nor the partition pauser has made any
+# once either the state-store round trip or the partition pauser has made no
 # progress for this long, so a wedged daemon cannot keep its workloads behind
 # a petted watchdog. Progress is timed on the monotonic clock, so a wall-clock
 # step is not a wedge. 0 turns this off; otherwise it must be at least 120

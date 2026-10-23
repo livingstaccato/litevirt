@@ -107,6 +107,45 @@ func TestCreateVM_NeverWritesTheMissingBaseOfAKeptOverlay(t *testing.T) {
 	})
 }
 
+// A create that clears nothing is refused while kept-disks.json, or a kept
+// disk's chain, cannot be read: whether a kept overlay names a path it
+// writes as its missing base is then unknown. keptMissingBaseRefusal let it
+// go ahead, and the new disk could become a kept overlay's base.
+//
+// Mutation: return nil on a keptRegistryChains error in
+// keptMissingBaseRefusal again: both subtests red (the base is written).
+func TestCreateVM_RefusesWhileWhatAKeptOverlayBacksOnCannotBeRead(t *testing.T) {
+	create := func(t *testing.T, s *Server, base, want string) {
+		t.Helper()
+		req := disklessCreateRequest("web")
+		req.Spec.Disks = []*pb.DiskSpec{{Name: "root", Size: "1M"}} // an empty disk at web-root.qcow2
+		_, err := s.CreateVM(adminCtx(), req)
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), want) {
+			t.Fatalf("create web = %v; want FailedPrecondition naming %q", err, want)
+		}
+		if exists(base) {
+			t.Fatal("a refused create wrote a disk at the base path")
+		}
+	}
+	t.Run("kept-disks.json unreadable", func(t *testing.T) {
+		s, _ := provableCreateServer(t)
+		base := s.images.DiskPath("web", "root")
+		if err := os.WriteFile(filepath.Join(s.dataDir, diskKeptFile), []byte("[not json"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		create(t, s, base, diskKeptFile)
+	})
+	t.Run("a kept chain unreadable", func(t *testing.T) {
+		s, _ := provableCreateServer(t)
+		base := s.images.DiskPath("web", "root")
+		top := registryKeep(t, s, "web", base)       // base missing
+		if err := os.Truncate(top, 16); err != nil { // the magic, and no header to read
+			t.Fatal(err)
+		}
+		create(t, s, base, "the backing chain of "+top)
+	})
+}
+
 // Re-review 1, m3: replica pruning keeps a replica a kept-disks.json entry
 // holds (a kept disk, or a file one backs on), as every other removal does.
 //

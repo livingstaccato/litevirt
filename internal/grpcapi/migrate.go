@@ -1970,15 +1970,44 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 		// weight that was (a cleared weight arrives as the default); this host
 		// defines the domain at its own scale. No weight sent: unchanged.
 		domXML = lv.RetargetCPUShares(domXML, int(req.SharesWeight), lv.CgroupMode() == "v2")
+		// A plain UEFI VM's libvirt-managed vars: the source's bytes, hashed
+		// after the write, or none and a file of an earlier VM of the name set
+		// aside, so the VM never boots from vars that are not its own.
+		varsWritten := false
+		switch {
+		case usesFirmwareState(vm.Spec):
+			if len(req.LibvirtVars) > 0 {
+				wipe()
+				return nil, status.Errorf(codes.InvalidArgument, "VM %q uses Secure Boot / vTPM; its UEFI vars are the firmware bundle's", req.VmName)
+			}
+		case len(req.LibvirtVars) > 0:
+			sum, werr := s.writeTargetLibvirtVars(req.VmName, domXML, req.LibvirtVars, req.LibvirtVarsSha256)
+			if werr != nil {
+				wipe()
+				return nil, werr
+			}
+			resp.LibvirtVarsSha256, varsWritten = sum, true
+		default:
+			if serr := s.setAsideStaleLibvirtVars(req.VmName); serr != nil {
+				wipe()
+				return nil, status.Errorf(codes.Internal, "%v", serr)
+			}
+		}
 		if err := s.virt.DefineDomain(domXML); err != nil {
 			// Roll back the firmware we just materialized so a retry is clean.
 			wipe()
+			if varsWritten {
+				_ = os.Remove(s.libvirtVarsPath(req.VmName))
+			}
 			return nil, status.Errorf(codes.Internal, "define migrated domain %q: %v", req.VmName, err)
 		}
 		// This call materialized the firmware and defined the domain: record
 		// them as the attempt's, the only thing its rollback may remove, and
 		// say so to the source.
 		s.firmwareTargets.add(req.VmName, req.AttemptId, req.Uuid)
+		if varsWritten {
+			s.firmwareTargets.markVars(req.VmName)
+		}
 		resp.DomainDefined = true
 	}
 	slog.Info("firmware state received for migration", "vm", req.VmName, "bytes", len(req.Bundle),
@@ -1999,9 +2028,14 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 // It reports what the call left on the target, for the rollback of a failure
 // before the handoff commits (abandonFirmwareTarget). attempt names this
 // migration attempt to the target, which records the domain it defines under it.
-func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vmName string, fs firmwareSpec, domainXML, attempt string) (firmwareTargetOutcome, error) {
+func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vmName string, fs firmwareSpec, domainXML, attempt string, vars []byte) (firmwareTargetOutcome, error) {
 	req := &pb.EnsureFirmwareStateRequest{VmName: vmName, DomainXml: domainXML, AttemptId: attempt,
 		SharesWeight: int32(s.vmSharesWeight(ctx, vmName))}
+	// A plain UEFI VM's libvirt vars: the target holds them, verified by hash,
+	// or the move does not go on (the source's copy is removed only after).
+	if len(vars) > 0 {
+		req.LibvirtVars, req.LibvirtVarsSha256 = vars, varsSHA256(vars)
+	}
 	if fs.SecureBoot || fs.Tpm {
 		// Per-component preflight: never push a PARTIAL bundle (WriteFirmwareBundle
 		// alone would accept NVRAM-only or swtpm-only) — that restores a fresh TPM.
@@ -2036,6 +2070,18 @@ func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vm
 		// The target may have defined the domain before the call failed: a
 		// cancelled request loses the answer, not the define.
 		return fwTargetUnknown, status.Errorf(codes.Internal, "define VM %q on %s: %v", vmName, targetHost, err)
+	}
+	if len(vars) > 0 && resp.GetLibvirtVarsSha256() != varsSHA256(vars) {
+		// An older target ignores the field and answers none: the VM would
+		// boot there from a fresh template. Nothing was committed; the
+		// caller rolls back what the call defined.
+		out := fwTargetUnreported
+		if resp.GetDomainDefined() {
+			out = fwTargetDefined
+		}
+		return out, status.Errorf(codes.FailedPrecondition,
+			"%s did not confirm it holds the UEFI vars of VM %q (it answered %q; an older build ignores them); nothing was changed. "+
+				"Upgrade %s, or start the VM and migrate it live", targetHost, vmName, resp.GetLibvirtVarsSha256(), targetHost)
 	}
 	if !resp.GetDomainDefined() {
 		return fwTargetUnreported, nil
@@ -2255,7 +2301,20 @@ func (s *Server) coldMigrateStoppedVM(ctx context.Context, vm *corrosion.VMRecor
 	// that: the target records the domain it defines under attempt, and
 	// leaves a domain it found there (abandonFirmwareTarget).
 	attempt := uuid.NewString()
-	outcome, err := s.ensureFirmwareStateOnTarget(ctx, targetHost.Name, vm.Name, fwSpec, domXML, attempt)
+	// A plain UEFI VM's libvirt-managed vars ride with the definition: libvirt
+	// keeps them outside the firmware store, and the source's file is the only
+	// copy until the target has confirmed its own by hash.
+	var sentVars []byte
+	if !fwSpec.SecureBoot && !fwSpec.Tpm {
+		if sentVars, err = s.readSourceLibvirtVars(vm.Name, domXML); err != nil {
+			return err
+		}
+	}
+	sentVarsSHA := ""
+	if len(sentVars) > 0 {
+		sentVarsSHA = varsSHA256(sentVars)
+	}
+	outcome, err := s.ensureFirmwareStateOnTarget(ctx, targetHost.Name, vm.Name, fwSpec, domXML, attempt, sentVars)
 	if err != nil {
 		return s.abandonFirmwareTarget(ctx, targetHost.Name, vm.Name, fwSpec.UUID, attempt, outcome, err)
 	}
@@ -2311,7 +2370,9 @@ func (s *Server) coldMigrateStoppedVM(ctx context.Context, vm *corrosion.VMRecor
 	// The copies on the target are the VM's disks now; the source's are orphans.
 	s.removeColdMigratedSourceDisks(ctx, vm.Name, copied)
 	s.cleanupPostMigration(vm.Name)
-	s.removeMigratedSourceVars(ctx, vm.Name)
+	if sentVarsSHA != "" {
+		s.removeMigratedSourceVars(ctx, vm.Name, sentVarsSHA)
+	}
 
 	_ = send(pb.MigratePhase_MIGRATE_CUTOVER, 100, 0)
 	_ = send(pb.MigratePhase_MIGRATE_COMPLETING, 100, 0)
@@ -3525,7 +3586,7 @@ func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRe
 	// A plain UEFI VM's vars file, which libvirt's undefine leaves behind. A
 	// live firmware move's source state is wiped by its own cleanup.
 	if f.fwLive == nil {
-		s.removeMigratedSourceVars(ctx, vm.Name)
+		s.removeMigratedSourceVars(ctx, vm.Name, "")
 	}
 
 	// A live firmware move's guest runs only through Release, which puts its

@@ -1733,17 +1733,17 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// UEFI vars already at the domain's path are a previous VM's of this name
 	// (a migration's source, a delete that kept them): libvirt would hand them
 	// to this VM's first boot, with the old boot entries and keys. They are set
-	// aside, not removed, and `lv host superseded-disks` lists them.
+	// aside, not removed (`lv host superseded-disks` lists them). The name-keyed
+	// Secure Boot / vTPM path is never touched here (setAsideStaleVars).
 	if domainVars != "" && domainVarsBefore {
-		to := health.SupersededName(domainVars, time.Now())
-		if rerr := os.Rename(domainVars, to); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+		if _, rerr := s.setAsideStaleVars(spec.Name, domainVars); rerr != nil {
 			return nil, status.Errorf(codes.Internal, "%v", abortDefined(fmt.Errorf(
 				"UEFI vars of an earlier VM %s at %s could not be set aside: %w", spec.Name, domainVars, rerr)))
-		} else if rerr == nil {
-			slog.Warn("vm create: set aside the UEFI vars an earlier VM of the name left", "vm", spec.Name, "path", domainVars, "to", to)
-			noteUndo("set aside stale vars " + domainVars)
 		}
-		domainVarsBefore = false
+		if filepath.Clean(domainVars) != filepath.Clean(s.fw().NvramPath(spec.Name)) {
+			noteUndo("set aside stale vars " + domainVars)
+			domainVarsBefore = false
+		}
 	}
 
 	pciHeld = true

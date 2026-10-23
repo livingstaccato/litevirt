@@ -598,7 +598,7 @@ than silently breaking BitLocker. The explicit refusals:
 | host drain | a stopped VM is moved as cold migration moves it, host-local disks included; a running one is refused — stop it (`lv stop <vm>`), then drain again or `lv migrate <vm> <target-host> --cold` |
 | automatic failover (host died) | skipped — firmware is host-local and died with the host; recover via restore from a firmware-carrying backup |
 | replica promotion | refused — a disk replica carries no firmware |
-| `lv rm --keep-disks` then `lv run --name <same>` | refused — the retained NVRAM isn't inherited; restore the VM instead of recreating it |
+| `lv rm --keep-disks` then `lv run --name <same>` | refused — the retained NVRAM isn't inherited; restore the VM instead of recreating it; for a plain UEFI VM (no Secure Boot, no vTPM) the kept vars are set aside as `<file>.superseded-<time>` and the new VM starts from a fresh template |
 
 **UEFI variable writes and a host power cut.** qemu writes a guest's UEFI
 variables (any UEFI VM, not only Secure Boot) to its vars file without

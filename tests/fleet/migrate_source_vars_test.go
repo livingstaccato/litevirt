@@ -87,12 +87,16 @@ func TestFleet_LiveMigrationRemovesThePlainUEFIVarsFromTheSource(t *testing.T) {
 	}
 }
 
-// The cold move of a stopped plain UEFI VM keeps the domain's vars through its
-// keep-state undefine (KEEP_NVRAM); once the VM is on the target the source's
-// file goes, the target's own stays.
+// The cold move of a stopped plain UEFI VM has no migration stream: its
+// libvirt-managed vars ride with the definition, the target writes and hashes
+// them, and only then does the source remove its own copy. Without that the
+// source's file was the only copy and the VM booted on the target from a fresh
+// template. A file of the name already on the target is set aside, not adopted.
 //
-// Mutation: drop removeMigratedSourceVars from coldMigrateStoppedVM.
-func TestFleet_ColdMigrationRemovesThePlainUEFIVarsFromTheSource(t *testing.T) {
+// Mutations: drop the vars from the request (the bytes never arrive; the source
+// keeps its file, the move is refused); drop removeMigratedSourceVars from
+// coldMigrateStoppedVM (the source still holds the file).
+func TestFleet_ColdMigrationCarriesThePlainUEFIVarsAndRemovesTheSourceCopy(t *testing.T) {
 	sc := newColdStoppedScenario(t)
 	vars := map[string]string{}
 	for _, n := range sc.c.Nodes {
@@ -109,10 +113,47 @@ func TestFleet_ColdMigrationRemovesThePlainUEFIVarsFromTheSource(t *testing.T) {
 	if err := sc.migrateCold(t); err != nil {
 		t.Fatalf("migrate --cold: %v", err)
 	}
+	if got, err := os.ReadFile(vars[sc.dst.Name]); err != nil || string(got) != "vars of "+sc.src.Name {
+		t.Fatalf("the target's vars = %q (%v), want the source's bytes", got, err)
+	}
+	aside, _ := filepath.Glob(vars[sc.dst.Name] + ".superseded-*")
+	if len(aside) != 1 {
+		t.Fatalf("the target's earlier file: set-aside copies = %v, want one", aside)
+	}
+	if b, _ := os.ReadFile(aside[0]); string(b) != "vars of "+sc.dst.Name {
+		t.Errorf("the set-aside copy holds %q", b)
+	}
 	if _, err := os.Stat(vars[sc.src.Name]); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the source still holds the moved VM's UEFI vars (stat: %v)", err)
 	}
-	if got, err := os.ReadFile(vars[sc.dst.Name]); err != nil || string(got) != "vars of "+sc.dst.Name {
-		t.Errorf("the target's own vars were touched: %q, %v", got, err)
+}
+
+// A cold move that fails after the vars reached the target (here, the target's
+// define) keeps the source's file and leaves nothing of the attempt on the target.
+//
+// Mutation: remove the source's file before the handoff; the source's bytes go.
+func TestFleet_FailedColdMigrationKeepsThePlainUEFIVarsOnTheSource(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	vars := map[string]string{}
+	for _, n := range sc.c.Nodes {
+		dir := filepath.Join(sc.c.tmpRoot, n.Name, "libvirt-nvram")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		n.Server.SetLibvirtNvramDir(dir)
+		vars[n.Name] = filepath.Join(dir, "os1_VARS.fd")
+	}
+	if err := os.WriteFile(vars[sc.src.Name], []byte("vars of the VM"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sc.dst.Virt.FailDefineDomain = func(string) error { return errors.New("define refused") }
+	if err := sc.migrateCold(t); err == nil {
+		t.Fatal("the migration succeeded; the scenario needs the target's define to fail")
+	}
+	if got, err := os.ReadFile(vars[sc.src.Name]); err != nil || string(got) != "vars of the VM" {
+		t.Errorf("the source's vars after a failed move = %q (%v), want them intact", got, err)
+	}
+	if _, err := os.Stat(vars[sc.dst.Name]); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the failed attempt left vars on the target (stat: %v)", err)
 	}
 }

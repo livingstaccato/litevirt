@@ -331,14 +331,29 @@ reachable from the source) fails; the fallback is decided before the move.
 ### Plain UEFI VMs
 
 A UEFI VM with neither Secure Boot nor a vTPM keeps its variables in libvirt's
-own file, `/var/lib/libvirt/qemu/nvram/<vm>_VARS.fd`. They travel in the
-migration stream, and libvirt leaves the source's file behind when it undefines
-the domain. Once the move has committed on the target (live or cold), the
-source removes that file, unless a domain of the name is still defined there; a
-failed or rolled-back move keeps it. A create of a name whose file is still
-there (left by an earlier build or a delete) sets it aside as
-`<file>.superseded-<time>` before the first boot, so the new VM never starts
-from another VM's variables; `lv host superseded-disks` lists it.
+own file, `/var/lib/libvirt/qemu/nvram/<vm>_VARS.fd`.
+
+- **Live move.** The variables travel in the migration stream. libvirt leaves
+  the source's file behind when it undefines the domain, so once the move has
+  committed on the target the source removes it, unless a domain of the name is
+  still defined there. A failed or rolled-back move keeps it.
+- **Cold move** (`--cold`, and a drain's move of a stopped VM). There is no
+  stream, so the file is sent with the domain definition. The target writes it
+  durably, reads it back and answers with its sha256; the source removes its own
+  copy only after the move has committed and only while the file still hashes to
+  what the target confirmed. A target that does not confirm (a build from before
+  this) refuses the move, nothing changed; a failed move keeps the source's file
+  and takes back what it wrote on the target.
+- **A same-name file.** A create, clone, import, restore or promote of a name
+  whose file is already on the host (left by an earlier build, or by a delete
+  `--keep-disks`), and a cold move's target, set it aside as
+  `<file>.superseded-<time>` before the domain is defined, so the VM never
+  starts from another VM's boot entries or keys. `lv host superseded-disks`
+  lists it. A `--keep-disks` delete of a plain UEFI VM therefore no longer lets
+  a re-create of the name adopt its vars; use restore for that.
+
+Secure Boot and vTPM VMs' variables are name-keyed under `<data_dir>/nvram` and
+are never touched by any of this; see below.
 
 ### Secure Boot / vTPM VMs
 

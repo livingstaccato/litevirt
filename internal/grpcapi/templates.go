@@ -838,6 +838,12 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 		}
 		cloneNeeds.Passthrough = true
 	}
+	// A new domain starts from a fresh template, never from vars an earlier VM
+	// of the name left in libvirt's directory.
+	if err := s.setAsideStaleLibvirtVars(req.Target); err != nil {
+		cleanup()
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		cleanup()
 		return nil, status.Errorf(codes.Internal, "define clone domain: %v", err)

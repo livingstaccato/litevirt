@@ -36,7 +36,7 @@ func ownRowDaemon(t *testing.T, recorded string, cert *[2]string) (*Daemon, *ato
 	var reconciles atomic.Int32
 	d := &Daemon{cfg: &Config{HostName: host}, db: db}
 	d.ownRowCertSource = func() (string, string) { return cert[0], cert[1] }
-	d.ownRowReconciler = func(context.Context) { reconciles.Add(1) }
+	d.ownRowReconciler = func(context.Context, string) { reconciles.Add(1) }
 	d.configureOwnRowHold(ctx)
 	return d, &reconciles
 }
@@ -268,7 +268,7 @@ func TestOwnRow_TheDaemonInstallsItsAdmissionRecord(t *testing.T) {
 	cert := [2]string{"01cur", ""}
 	d := &Daemon{cfg: &Config{HostName: host, PKIDir: pkiDir}, db: db}
 	d.ownRowCertSource = func() (string, string) { return cert[0], cert[1] }
-	d.ownRowReconciler = func(context.Context) {}
+	d.ownRowReconciler = func(context.Context, string) {}
 	d.configureOwnRowHold(ctx)
 
 	rec := &admissionFile{path: filepath.Join(pkiDir, OwnAdmissionFileName), host: host}
@@ -336,7 +336,7 @@ func TestReconcileBootReport_APostUpgradeProcessStaysActive(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := &Daemon{cfg: &Config{HostName: "h", DataDir: t.TempDir(), Version: "v2"}, db: db, upgradePending: true}
-	d.reconcileBootReport(ctx)
+	d.reconcileBootReport(ctx, "active")
 	h, err := corrosion.GetHost(ctx, db, "h")
 	if err != nil || h == nil {
 		t.Fatalf("GetHost: %v", err)
@@ -436,25 +436,96 @@ func TestOwnRow_JoiningWhileHeldDoesNotReconcile(t *testing.T) {
 	}
 }
 
-// A 'joining' whose reconcile was dropped, because another was in flight
-// (and may have read the row before 'joining' reached it), is acted on at
-// the next evaluation.
-func TestOwnRow_JoiningWhoseReconcileWasDroppedIsRetried(t *testing.T) {
+// bootReportDaemon is a daemon whose own row ("h") is recorded state on its
+// membership row, for the reconcile's boot report.
+func bootReportDaemon(t *testing.T, state string) (*Daemon, context.Context) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel) // ends the serving check a boot write starts
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "h", Address: "127.0.0.1", SSHUser: "root", CertSerial: "s", State: "active", Version: "v1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	d := &Daemon{cfg: &Config{HostName: "h", DataDir: t.TempDir(), Version: "v2"}, db: db}
+	ownRowMembership(t, d, state)
+	return d, ctx
+}
+
+func ownState(t *testing.T, d *Daemon) string {
+	t.Helper()
+	h, err := corrosion.GetHost(context.Background(), d.db, d.cfg.HostName)
+	if err != nil || h == nil {
+		t.Fatalf("GetHost: %+v %v", h, err)
+	}
+	return h.State
+}
+
+// Round 1, finding 3: a reconcile writes the boot report only over the state
+// the evaluation that ran it read. A fence, drain or maintenance recorded
+// after that read (registerHost and the endpoint reconcile run in between,
+// and the latter can wait on peers) is kept, never returned to service.
+func TestReconcileBootReport_AStateRecordedAfterTheTriggerIsKept(t *testing.T) {
+	for _, now := range []string{"draining", "fenced", "maintenance", "offline"} {
+		d, ctx := bootReportDaemon(t, now)
+		d.reconcileBootReport(ctx, corrosion.HostStateJoining)
+		if got := ownState(t, d); got != now {
+			t.Errorf("read joining, %s recorded since: the reconcile wrote %s over it", now, got)
+		}
+	}
+	// The state the trigger read is acted on.
+	d, ctx := bootReportDaemon(t, corrosion.HostStateJoining)
+	d.reconcileBootReport(ctx, corrosion.HostStateJoining)
+	if got := ownState(t, d); got == corrosion.HostStateJoining {
+		t.Error("read joining and still joining: the boot report was not written")
+	}
+}
+
+// The boot write itself checks it: the decision is taken from the state it
+// reads in the same read that guards its write, and is made only when that is
+// the state the caller expects.
+func TestWriteBootStateWith_AnotherStateThanExpectedWritesNothing(t *testing.T) {
+	for _, now := range []string{"draining", "fenced", "maintenance", "offline"} {
+		d, ctx := bootReportDaemon(t, now)
+		d.writeBootStateWith(ctx, 1, 2, 3, true, false, corrosion.HostStateJoining)
+		if got := ownState(t, d); got != now {
+			t.Errorf("expected joining, read %s: the boot write recorded %s", now, got)
+		}
+	}
+	// A boot (no expectation) decides from what it reads, as before.
+	d, ctx := bootReportDaemon(t, "draining")
+	d.writeBootStateWith(ctx, 1, 2, 3, true, false, "")
+	if got := ownState(t, d); got == "draining" {
+		t.Error("a boot over draining wrote nothing")
+	}
+}
+
+// Each trigger hands the reconcile the state its evaluation read.
+func TestOwnRow_EachTriggerPassesTheStateItRead(t *testing.T) {
 	ctx := context.Background()
 	cert := [2]string{"02new", ""}
-	d, reconciles := ownRowDaemon(t, "02new", &cert)
-	l := &ownRowLoop{}
-	l.prev, _ = d.readOwnKey(ctx)
-	d.ownRowStep(ctx, l)
-	ownRowMembership(t, d, "joining")
-	d.ownRowReconciling.Store(true) // one in flight
-	d.ownRowStep(ctx, l)
-	d.ownRowReconciling.Store(false)
-	if reconciles.Load() != 0 {
-		t.Fatalf("reconciles = %d with one in flight, want 0", reconciles.Load())
+	d, _ := ownRowDaemon(t, "01old", &cert)
+	var froms []string
+	d.ownRowReconciler = func(_ context.Context, from string) { froms = append(froms, from) }
+	ownRowMembership(t, d, "upgrading")
+	l := &ownRowLoop{wasHeld: d.db.OwnRowHold().Held}
+	if _, err := d.db.DB().Exec(`UPDATE hosts SET cert_serial = '02new', incarnation = 1 WHERE name = ?`, d.cfg.HostName); err != nil {
+		t.Fatal(err)
 	}
-	d.ownRowStep(ctx, l)
-	if reconciles.Load() != 1 {
-		t.Errorf("reconciles = %d after the in-flight one ended, want 1", reconciles.Load())
+	d.ownRowStep(ctx, l) // the hold opens
+	ownRowMembership(t, d, corrosion.HostStateJoining)
+	d.ownRowStep(ctx, l) // joining
+	ownRowMembership(t, d, "fenced")
+	if _, err := d.db.DB().Exec(`UPDATE hosts SET incarnation = 2 WHERE name = ?`, d.cfg.HostName); err != nil {
+		t.Fatal(err)
+	}
+	d.ownRowStep(ctx, l) // the incarnation moved
+	want := []string{"upgrading", corrosion.HostStateJoining, "fenced"}
+	if strings.Join(froms, ",") != strings.Join(want, ",") {
+		t.Errorf("reconciles ran over %v, want %v", froms, want)
 	}
 }

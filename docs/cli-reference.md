@@ -312,17 +312,20 @@ its `lv snapshot rm` or `lv rm` removes their overlays and memory images
 wherever they now are; a revert to one restores the deleted VM's guest. A
 `kept-disks.json` or a note that cannot be read refuses it too, naming the
 file, as does a kept disk's backing chain that cannot be read (a backing file
-that does not exist ends the chain and holds nothing); the refusal names the
+that does not exist ends the chain and holds nothing, but a create or import
+that would write a disk at that path is refused, naming the overlay that
+names it: the new disk would become its base); the refusal names the
 entry, and the way out is to fix that file, or, once nothing needs the disk,
 move it away or remove its entry from `<data_dir>/kept-disks.json`. A disk only
 `kept-disks.json` names, at the path the create writes, is refused rather than
 renamed. `lv import` refuses the same files at its disk's name, rather than
 moving them aside as an orphan. Every other path that removes disk files on
 the host (a delete's or rebuild's disk cleanup, `lv iso rm <pool>/<file>`, a
-migration's or volume move's source cleanup) leaves a file a
+migration's or volume move's source cleanup, replica pruning) leaves a file a
 `kept-disks.json` entry names or reaches through its backing chain, as it
-leaves a file a note names, unless a VM's disk record still names that entry's
-file (a delete that failed keeps its record, and its retry frees it).
+leaves a file a note names, unless a VM's disk record on that host still names
+that entry's own file (a delete that failed keeps its record, and its retry
+frees it); the files under it stay held.
 
 **`--keep-disks` and snapshots.** `lv rm --keep-disks` of a VM that has
 snapshots is refused (`FailedPrecondition`, naming them) before anything is

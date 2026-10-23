@@ -986,6 +986,10 @@ func (s *Server) pruneTopLevelReplicas(ctx context.Context, dir string, k replic
 		if owners, err := s.replicaUsers(ctx, p); err != nil || len(owners) > 0 {
 			continue
 		}
+		if held, why := s.keptHolds(ctx, p); held {
+			slog.Warn("replication: a replica a kept disk holds is not pruned", "replica", p, "why", why)
+			continue
+		}
 		if os.Remove(p) == nil {
 			deleted++
 			if err := s.forgetPoolUpload(ctx, p); err != nil {

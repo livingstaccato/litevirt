@@ -193,7 +193,7 @@ func (s *Server) clearDiskDebrisBeforeCreate(ctx context.Context, name string, n
 	// Nothing a delete kept, and nothing a file beside it backs on, is
 	// cleared: the kept-disk notes govern what they name (below), and this
 	// covers what they do not.
-	if err := s.keptFileCreateRefusal(ctx, name, unlink, true); err != nil {
+	if err := s.keptFileCreateRefusal(ctx, name, unlink, s.createDiskPathOf(name), true); err != nil {
 		return nil, err
 	}
 	trusted := func() (bool, string) {

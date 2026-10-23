@@ -34,12 +34,16 @@ import (
 //     reaches it, as a kept snapshot overlay's reaches the disk it was taken
 //     of, whatever records exist.
 //
+// It also refuses while a kept disk's chain ends at a backing file that does
+// not exist at a path the create writes (writes): the kept overlay names that
+// path, and the new disk would become its base.
+//
 // A note, kept-disks.json or a kept disk's chain that cannot be read refuses
 // too: what it would keep is then unknown (keptRegistryChains; a backing
 // file that does not exist ends a chain, and holds nothing). Only storage or
 // the database not answering is retryable; anything else is
 // KeptBackingFileError, naming the entry and the way out.
-func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files []string, notesGovern bool) error {
+func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files []string, writes func(string) bool, notesGovern bool) error {
 	present := map[string]bool{}
 	var dirs []string
 	seenDir := map[string]bool{}
@@ -63,7 +67,7 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 		}
 	}
 	if len(present) == 0 {
-		return nil
+		return s.keptMissingBaseRefusal(ctx, writes)
 	}
 	refuse := func(file, why string) error {
 		return health.NewKeptBackingFileError(fmt.Sprintf("the create clears %s, which %s: clearing it would lose what a deleted VM "+
@@ -98,13 +102,16 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 	for _, c := range chains {
 		r := c.rec
 		for i, l := range c.layers {
-			if !present[l] || (notesGovern && noted[l] != "") {
+			if !present[l] || (i == 0 && c.topNamed) || (notesGovern && noted[l] != "") {
 				continue
 			}
 			if i == 0 {
 				return refuse(l, fmt.Sprintf("is the disk %s the delete of VM %s kept (%s), as %s records", r.Disk, r.VM, r.Reason, registry))
 			}
 			return refuse(l, fmt.Sprintf("%s backs on, the disk %s the delete of VM %s kept (%s), as %s records", c.top, r.Disk, r.VM, r.Reason, registry))
+		}
+		if c.missing != "" && writes(c.missing) {
+			return missingBaseRefusal(c, registry)
 		}
 	}
 
@@ -140,4 +147,55 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 		}
 	}
 	return nil
+}
+
+// missingBaseRefusal refuses a create that would write the missing backing
+// file of c's chain.
+func missingBaseRefusal(c keptRegistryChain, registry string) error {
+	overlay := c.layers[len(c.layers)-1]
+	return health.NewKeptBackingFileError(fmt.Sprintf("the create writes %s, which %s backs on although it is missing: "+
+		"%s is in the backing chain of the disk %s the delete of VM %s kept (%s), as %s records, and a new disk there would "+
+		"become its base; nothing was created. Move %s away, or remove that entry from %s once nothing needs the disk, "+
+		"or place the VM on another host", c.missing, overlay, overlay, c.rec.Disk, c.rec.VM, c.rec.Reason, registry, overlay, registry))
+}
+
+// keptMissingBaseRefusal is keptFileCreateRefusal's check of a create that
+// clears nothing: one that writes the missing backing file of a kept disk's
+// chain is refused. With nothing to clear, a registry that cannot be read is
+// not a reason to refuse: only a write at a missing base could follow, and
+// the refusals for clearing a file stay fail-closed.
+func (s *Server) keptMissingBaseRefusal(ctx context.Context, writes func(string) bool) error {
+	chains, err := s.keptRegistryChains(ctx)
+	if err != nil {
+		return nil
+	}
+	registry := filepath.Join(s.dataDir, diskKeptFile)
+	for _, c := range chains {
+		if c.missing != "" && writes(c.missing) {
+			return missingBaseRefusal(c, registry)
+		}
+	}
+	return nil
+}
+
+// createDiskPathOf reports whether a create of name writes a disk at p in
+// this host's disk directory: <vm>-<disk>.qcow2, a disk name without a dash
+// (image.Store.VMDiskCandidates' shape).
+func (s *Server) createDiskPathOf(name string) func(string) bool {
+	dir := ""
+	if s.images != nil {
+		dir = filepath.Clean(s.images.DiskDir(name))
+	}
+	return func(p string) bool {
+		p = filepath.Clean(p)
+		if dir == "" || filepath.Dir(p) != dir {
+			return false
+		}
+		rest, ok := strings.CutPrefix(filepath.Base(p), name+"-")
+		if !ok {
+			return false
+		}
+		disk, ok := strings.CutSuffix(rest, ".qcow2")
+		return ok && disk != "" && !strings.Contains(disk, "-")
+	}
 }

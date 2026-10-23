@@ -328,6 +328,18 @@ live moves. A live migration that was sent over the network and then cannot
 connect (the migration ports 49152-49215 on the migration address must be
 reachable from the source) fails; the fallback is decided before the move.
 
+### Plain UEFI VMs
+
+A UEFI VM with neither Secure Boot nor a vTPM keeps its variables in libvirt's
+own file, `/var/lib/libvirt/qemu/nvram/<vm>_VARS.fd`. They travel in the
+migration stream, and libvirt leaves the source's file behind when it undefines
+the domain. Once the move has committed on the target (live or cold), the
+source removes that file, unless a domain of the name is still defined there; a
+failed or rolled-back move keeps it. A create of a name whose file is still
+there (left by an earlier build or a delete) sets it aside as
+`<file>.superseded-<time>` before the first boot, so the new VM never starts
+from another VM's variables; `lv host superseded-disks` lists it.
+
 ### Secure Boot / vTPM VMs
 
 `lv migrate <vm> <host>` moves a running Secure Boot or vTPM VM live. Its UEFI

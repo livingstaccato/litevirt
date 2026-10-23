@@ -160,7 +160,7 @@ func TestCreateVM_AbortOfADomainThatVanishedOrIsUnreadable(t *testing.T) {
 // TestCreateVM_AFailedPlainUEFICreateRemovesOnlyItsOwnLibvirtVars
 // (re-review N7): the libvirt-managed vars a failed plain UEFI create made at
 // its first start are removed; vars that were at that path before it (kept by
-// a delete --keep-disks) are kept. The domain is undefined keeping its
+// a delete --keep-disks) are set aside before the start, not removed. The domain is undefined keeping its
 // firmware state, so libvirt never removes them itself.
 func TestCreateVM_AFailedPlainUEFICreateRemovesOnlyItsOwnLibvirtVars(t *testing.T) {
 	for _, keptBefore := range []bool{false, true} {
@@ -186,10 +186,18 @@ func TestCreateVM_AFailedPlainUEFICreateRemovesOnlyItsOwnLibvirtVars(t *testing.
 				t.Fatal("the create succeeded with the failure injected")
 			}
 			_, serr := os.Stat(vars)
-			if keptBefore && serr != nil {
-				t.Errorf("vars that were there before the create were removed: %v", serr)
+			if keptBefore {
+				// Set aside before the start, so the new VM never boots from
+				// them; the bytes stay beside the path.
+				kept, _ := filepath.Glob(vars + ".superseded-*")
+				if len(kept) != 1 {
+					t.Fatalf("vars that were there before the create: set-aside copies = %v, want one", kept)
+				}
+				if b, _ := os.ReadFile(kept[0]); string(b) != "kept" {
+					t.Errorf("the set-aside copy holds %q, want the kept vars", b)
+				}
 			}
-			if !keptBefore && serr == nil {
+			if serr == nil {
 				t.Error("the vars this failed create made were left behind")
 			}
 			preserved := false

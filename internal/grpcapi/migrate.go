@@ -2311,6 +2311,7 @@ func (s *Server) coldMigrateStoppedVM(ctx context.Context, vm *corrosion.VMRecor
 	// The copies on the target are the VM's disks now; the source's are orphans.
 	s.removeColdMigratedSourceDisks(ctx, vm.Name, copied)
 	s.cleanupPostMigration(vm.Name)
+	s.removeMigratedSourceVars(ctx, vm.Name)
 
 	_ = send(pb.MigratePhase_MIGRATE_CUTOVER, 100, 0)
 	_ = send(pb.MigratePhase_MIGRATE_COMPLETING, 100, 0)
@@ -3521,6 +3522,11 @@ func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRe
 	// Clean up orphaned files on the source host (cloud-init ISO, and disk
 	// files for --with-storage migrations where copies now live on target).
 	go s.cleanupPostMigration(vm.Name)
+	// A plain UEFI VM's vars file, which libvirt's undefine leaves behind. A
+	// live firmware move's source state is wiped by its own cleanup.
+	if f.fwLive == nil {
+		s.removeMigratedSourceVars(ctx, vm.Name)
+	}
 
 	// A live firmware move's guest runs only through Release, which puts its
 	// NIC firewall in force first; then its NVRAM is confirmed and the source

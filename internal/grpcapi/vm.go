@@ -1730,6 +1730,22 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// create's guards, not records an earlier one of the name left.
 	defer s.noteCreatingIncarnation(spec.Name, spec.Uuid)()
 
+	// UEFI vars already at the domain's path are a previous VM's of this name
+	// (a migration's source, a delete that kept them): libvirt would hand them
+	// to this VM's first boot, with the old boot entries and keys. They are set
+	// aside, not removed, and `lv host superseded-disks` lists them.
+	if domainVars != "" && domainVarsBefore {
+		to := health.SupersededName(domainVars, time.Now())
+		if rerr := os.Rename(domainVars, to); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+			return nil, status.Errorf(codes.Internal, "%v", abortDefined(fmt.Errorf(
+				"UEFI vars of an earlier VM %s at %s could not be set aside: %w", spec.Name, domainVars, rerr)))
+		} else if rerr == nil {
+			slog.Warn("vm create: set aside the UEFI vars an earlier VM of the name left", "vm", spec.Name, "path", domainVars, "to", to)
+			noteUndo("set aside stale vars " + domainVars)
+		}
+		domainVarsBefore = false
+	}
+
 	pciHeld = true
 	if err := s.virt.StartDomain(spec.Name); err != nil {
 		// A failed first boot must not strand the domain, disks or TPM/NVRAM (G1).

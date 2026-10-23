@@ -2792,18 +2792,23 @@ message GetStoragePoolResponse { StoragePool pool = 1; }
 // TrustStoragePoolRequest confirms, on the pool's host, that a storage_pools
 // row naming that host is its pool (`lv pool trust`). driver, source and
 // target are the row as the operator checked it: the host refuses when its
-// row differs, so what is confirmed is what was shown.
+// row differs, so what is confirmed is what was shown. With preview, the host
+// records nothing and answers its row's binding for the operator to check.
 message TrustStoragePoolRequest {
     string name   = 1;
     string host   = 2; // optional — defaults to caller's host
     string driver = 3;
     string source = 4;
     string target = 5;
+    string mount_options = 6; // an nfs pool's normalized mount options, as confirmed
+    bool preview = 7;         // answer the host's row; record nothing
 }
 message TrustStoragePoolResponse {
     StoragePool pool = 1;
     bool already_trusted = 2; // the host already trusted the row (config, ledger or its own pool area)
     string trusted_as = 3;    // how the host trusts it now
+    string mount_options = 4; // the row's normalized nfs mount options
+    string why = 5;           // preview of an untrusted row: why the host does not trust it
 }
 
 // A file in a (file-based) storage pool — used by the content browser.

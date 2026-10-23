@@ -26040,7 +26040,8 @@ func (x *GetStoragePoolResponse) GetPool() *StoragePool {
 // TrustStoragePoolRequest confirms, on the pool's host, that a storage_pools
 // row naming that host is its pool (`lv pool trust`). driver, source and
 // target are the row as the operator checked it: the host refuses when its
-// row differs, so what is confirmed is what was shown.
+// row differs, so what is confirmed is what was shown. With preview, the host
+// records nothing and answers its row's binding for the operator to check.
 type TrustStoragePoolRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
@@ -26048,6 +26049,8 @@ type TrustStoragePoolRequest struct {
 	Driver        string                 `protobuf:"bytes,3,opt,name=driver,proto3" json:"driver,omitempty"`
 	Source        string                 `protobuf:"bytes,4,opt,name=source,proto3" json:"source,omitempty"`
 	Target        string                 `protobuf:"bytes,5,opt,name=target,proto3" json:"target,omitempty"`
+	MountOptions  string                 `protobuf:"bytes,6,opt,name=mount_options,json=mountOptions,proto3" json:"mount_options,omitempty"` // an nfs pool's normalized mount options, as confirmed
+	Preview       bool                   `protobuf:"varint,7,opt,name=preview,proto3" json:"preview,omitempty"`                              // answer the host's row; record nothing
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -26117,11 +26120,27 @@ func (x *TrustStoragePoolRequest) GetTarget() string {
 	return ""
 }
 
+func (x *TrustStoragePoolRequest) GetMountOptions() string {
+	if x != nil {
+		return x.MountOptions
+	}
+	return ""
+}
+
+func (x *TrustStoragePoolRequest) GetPreview() bool {
+	if x != nil {
+		return x.Preview
+	}
+	return false
+}
+
 type TrustStoragePoolResponse struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Pool           *StoragePool           `protobuf:"bytes,1,opt,name=pool,proto3" json:"pool,omitempty"`
 	AlreadyTrusted bool                   `protobuf:"varint,2,opt,name=already_trusted,json=alreadyTrusted,proto3" json:"already_trusted,omitempty"` // the host already trusted the row (config, ledger or its own pool area)
 	TrustedAs      string                 `protobuf:"bytes,3,opt,name=trusted_as,json=trustedAs,proto3" json:"trusted_as,omitempty"`                 // how the host trusts it now
+	MountOptions   string                 `protobuf:"bytes,4,opt,name=mount_options,json=mountOptions,proto3" json:"mount_options,omitempty"`        // the row's normalized nfs mount options
+	Why            string                 `protobuf:"bytes,5,opt,name=why,proto3" json:"why,omitempty"`                                              // preview of an untrusted row: why the host does not trust it
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -26173,6 +26192,20 @@ func (x *TrustStoragePoolResponse) GetAlreadyTrusted() bool {
 func (x *TrustStoragePoolResponse) GetTrustedAs() string {
 	if x != nil {
 		return x.TrustedAs
+	}
+	return ""
+}
+
+func (x *TrustStoragePoolResponse) GetMountOptions() string {
+	if x != nil {
+		return x.MountOptions
+	}
+	return ""
+}
+
+func (x *TrustStoragePoolResponse) GetWhy() string {
+	if x != nil {
+		return x.Why
 	}
 	return ""
 }
@@ -48374,18 +48407,22 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\tR\x04host\"F\n" +
 	"\x16GetStoragePoolResponse\x12,\n" +
-	"\x04pool\x18\x01 \x01(\v2\x18.litevirt.v1.StoragePoolR\x04pool\"\x89\x01\n" +
+	"\x04pool\x18\x01 \x01(\v2\x18.litevirt.v1.StoragePoolR\x04pool\"\xc8\x01\n" +
 	"\x17TrustStoragePoolRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\tR\x04host\x12\x16\n" +
 	"\x06driver\x18\x03 \x01(\tR\x06driver\x12\x16\n" +
 	"\x06source\x18\x04 \x01(\tR\x06source\x12\x16\n" +
-	"\x06target\x18\x05 \x01(\tR\x06target\"\x90\x01\n" +
+	"\x06target\x18\x05 \x01(\tR\x06target\x12#\n" +
+	"\rmount_options\x18\x06 \x01(\tR\fmountOptions\x12\x18\n" +
+	"\apreview\x18\a \x01(\bR\apreview\"\xc7\x01\n" +
 	"\x18TrustStoragePoolResponse\x12,\n" +
 	"\x04pool\x18\x01 \x01(\v2\x18.litevirt.v1.StoragePoolR\x04pool\x12'\n" +
 	"\x0falready_trusted\x18\x02 \x01(\bR\x0ealreadyTrusted\x12\x1d\n" +
 	"\n" +
-	"trusted_as\x18\x03 \x01(\tR\ttrustedAs\"\xfa\x01\n" +
+	"trusted_as\x18\x03 \x01(\tR\ttrustedAs\x12#\n" +
+	"\rmount_options\x18\x04 \x01(\tR\fmountOptions\x12\x10\n" +
+	"\x03why\x18\x05 \x01(\tR\x03why\"\xfa\x01\n" +
 	"\x12StoragePoolContent\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x1d\n" +

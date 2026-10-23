@@ -1,6 +1,6 @@
 # Configuration
 
-The daemon reads its config from `/etc/litevirt/config.yaml` (override with `LITEVIRT_CONFIG` env var).
+The daemon reads its config from `/etc/litevirt/config.yaml` (override with `LITEVIRT_CONFIG` env var). At every start it makes that file owner-only if group or other users can read it, removing only those bits ([upgrades.md](upgrades.md#the-daemon-makes-its-config-file-owner-only)).
 
 ## Full reference
 

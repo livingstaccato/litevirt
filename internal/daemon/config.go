@@ -321,6 +321,8 @@ type Config struct {
 
 	// Version is set at startup from build-time ldflags (not from config file).
 	Version string `yaml:"-"`
+	// ConfigPath is the file LoadConfig read (not a config key).
+	ConfigPath string `yaml:"-"`
 }
 
 // ContainersConfig is the container security and limit defaults.
@@ -1154,6 +1156,7 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	warnRetiredConfigKeys(data)
+	cfg.ConfigPath = path
 
 	if cfg.HostName == "" {
 		return nil, fmt.Errorf("host_name is required in config")

@@ -141,6 +141,24 @@ reserved uids, an explicit `file_restore.uid_base` inside it refuses to load
 the config; with the default, the daemon starts and file restore is refused,
 naming the overlap — move `file_restore.uid_base`.
 
+## The daemon makes its config file owner-only
+
+Every start of the daemon makes its config file (`/etc/litevirt/config.yaml`,
+or the file `LITEVIRT_CONFIG` names) owner-only, because it can hold inline
+auth secrets: a node upgraded in place keeps the 0644 an earlier build wrote
+until this start. It only removes the group and other bits of a root-owned
+file and keeps the owner's own bits; it never widens a mode. A symlinked
+config is changed at its target, and the link is kept. A file root does not
+own is left as it is, with a warning. The change is logged once, at the
+start that makes it: `config: tightened the config file to owner-only`.
+
+After that, `lv` run on the node by a user other than root cannot read the
+config file. A later build publishes the daemon's endpoint in
+`/run/litevirt/endpoint`, from which such a user's `lv` finds the local
+daemon without the config file; until every node runs it, that user runs
+the command with sudo, or sets `LV_HOST=127.0.0.1`, which dials the local
+daemon with the user's CLI client bundle.
+
 ## How a normal upgrade flows
 
 ```

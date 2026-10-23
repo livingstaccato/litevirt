@@ -740,6 +740,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Error("a private key in the PKI directory is readable by other local users and "+
 			"could not be tightened", "error", err)
 	}
+	// And the config file, which can hold inline auth secrets: owner-only, as
+	// `lv host add` writes it, on a node upgraded in place too.
+	d.tightenOwnConfig()
 
 	// Set up libvirt TLS symlinks so qemu+tls:// migration works
 	// using our existing PKI certs. Best-effort — log warning if it fails.

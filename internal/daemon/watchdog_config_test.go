@@ -172,3 +172,55 @@ func TestRun_WiresTheWatchdogController(t *testing.T) {
 		}
 	}
 }
+
+// The DB probe the daemon wires is a real round trip through the state
+// store's client: it completes on an idle client, and while a writer holds
+// the client's lock it waits behind it past its own timeout, so the gate's
+// counter stands still (watchdog.SetDBProbe) and a lock left held past the
+// threshold self-fences.
+//
+// Mutations: make the probe a no-op, or have it stop waiting for the lock at
+// its timeout, and the held-lock check goes red.
+func TestWireWatchdog_DBProbeWaitsBehindAHeldWriteLock(t *testing.T) {
+	d := &Daemon{cfg: &Config{Watchdog: WatchdogConfig{LivenessStaleSec: 120}},
+		db: corrosion.NewTestClientT(t), watchdogRunDir: t.TempDir()}
+	ctrl := watchdog.NewController()
+	d.wireWatchdog(ctrl)
+	probe := ctrl.LivenessDBProbe()
+	if probe == nil {
+		t.Fatal("wireWatchdog wired no DB probe")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := probe(ctx); err != nil {
+		t.Fatalf("the probe failed on an idle client: %v", err)
+	}
+
+	mu := d.db.Mu()
+	mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			mu.Unlock()
+		}
+	}()
+	const timeout = 50 * time.Millisecond
+	done := make(chan error, 1)
+	go func() {
+		pctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		done <- probe(pctx)
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("the probe returned (%v) while a writer held the client's lock: the gate would count a held lock as progress", err)
+	case <-time.After(10 * timeout):
+	}
+	mu.Unlock()
+	locked = false
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the probe did not return once the writer released the lock")
+	}
+}

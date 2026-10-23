@@ -52,10 +52,13 @@ type livenessWiring struct {
 	stale          time.Duration // 0: the default; <0: off
 }
 
-// SetDBProbe wires a bounded database round trip (a Query under a short
-// timeout). The gate runs it every pet interval. A round trip that returns an
-// error still counts as progress: a disk error is not a wedge, and has its own
-// handling.
+// SetDBProbe wires a database round trip (a Query under a short timeout).
+// The gate runs it every pet interval. The timeout bounds the round trip, not
+// the wait for the state store's lock: a writer holding that lock past the
+// threshold is a lock left held, the wedge the gate exists to catch, so the
+// probe waits behind it and the counter stands still. A round trip that
+// returns an error, its own timeout's included, still counts as progress: a
+// disk error is not a wedge, and has its own handling.
 func (c *Controller) SetDBProbe(fn func(context.Context) error) {
 	if c == nil {
 		return
@@ -213,6 +216,13 @@ func (g *livenessGate) check() string {
 		}
 	}
 	return ""
+}
+
+// LivenessDBProbe returns the wired DB probe (nil for none), so a caller's
+// wiring can be tested against the probe the gate actually runs.
+func (c *Controller) LivenessDBProbe() func(context.Context) error {
+	probe, _, _ := c.liveness()
+	return probe
 }
 
 // LivenessWiring reports what the gate is wired with, for tests and

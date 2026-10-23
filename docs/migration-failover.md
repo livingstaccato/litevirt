@@ -987,7 +987,9 @@ lv host config host-b \
 drops one trailing newline; an empty password is refused. `--ipmi-pass <secret>`
 still works, but the password is then visible to every user in `ps` on the
 machine running `lv`, and stays in the shell history, so `lv` prints a warning
-when it is used. The two flags are mutually exclusive.
+when it is used. The two flags are mutually exclusive. `lv` also warns,
+and still reads the file, when `--ipmi-pass-file` or `--redfish-pass-file`
+names a file its group or other users can read; `chmod 600` it.
 
 An empty `--ipmi-*` flag leaves the setting alone. To remove a host's IPMI
 address, user and password, use `--clear-ipmi`; a host that fences by `ipmi`

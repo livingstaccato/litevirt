@@ -255,6 +255,7 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 	// certificate it was admitted with, which the machine holds installed
 	// or staged, or say that it already finished.
 	serial, pairOnMachine, legacyPair := "", false, false
+	var admittedCrt []byte // the staged certificate of the admission this add finishes
 	if row := liveHost(hosts, p.hostName); row != nil && row.GetAddress() == p.hostAddr {
 		admittedSerial := canonSerial(row.GetCertSerial())
 		joining := row.GetState() == pb.HostState_HOST_JOINING
@@ -295,16 +296,19 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 				// the earlier attempt's files to it.
 				files = append(files, addFile{hostCrt, pair[0], 0o644}, addFile{hostKey, pair[1], 0o600})
 				legacyPair = where == pairStagedLegacy
+				admittedCrt = pair[0]
 			}
 		}
 	}
 	// Another cluster's state on the machine (one that founded its own with
-	// `lv host init --local`) is never merged into this one.
+	// `lv host init --local`) is never merged into this one. A staged pair of
+	// this cluster's joining admission proves an add that failed after it
+	// (its daemon may have started) is this cluster's to finish.
 	ca, err := localCA(p.pkiDir)
 	if err != nil {
 		return fmt.Errorf("read the cluster CA: %w", err)
 	}
-	if err := refuseForeignState(r, ca, p.hostName+" at "+p.hostAddr, "add"); err != nil {
+	if err := refuseForeignState(r, ca, admittedCrt, p.hostName+" at "+p.hostAddr, "add"); err != nil {
 		return err
 	}
 	// Checked again right before the install (refuseSecondInstall); here,

@@ -87,6 +87,28 @@ func TestHostConfig_IPMIPassKeptOutOfArgv(t *testing.T) {
 			t.Fatalf("an empty password was sent: %v, %v", req, err)
 		}
 	})
+	// Review minor: a password file its group or other users can read is
+	// warned of (it is still used); a 0600 file and stdin are not.
+	t.Run("group- or world-readable file", func(t *testing.T) {
+		for _, flag := range []string{"--ipmi-pass-file", "--redfish-pass-file"} {
+			for mode, warns := range map[os.FileMode]bool{0o600: false, 0o640: true, 0o644: true, 0o400: false} {
+				p := filepath.Join(t.TempDir(), "pw")
+				if err := os.WriteFile(p, []byte("pw\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(p, mode); err != nil {
+					t.Fatal(err)
+				}
+				_, stderr, _ := runHostConfig(t, "", "node-1", flag, p)
+				if got := strings.Contains(stderr, "readable by its group or other users"); got != warns {
+					t.Errorf("%s at %04o: warned %v, want %v (%q)", flag, mode, got, warns, stderr)
+				}
+			}
+		}
+		if _, stderr, _ := runHostConfig(t, "pw\n", "node-1", "--ipmi-pass-file", "-"); strings.Contains(stderr, "readable") {
+			t.Errorf("stdin warned of a file mode: %q", stderr)
+		}
+	})
 	for _, pair := range [][]string{{"--ipmi-pass", "x", "--ipmi-pass-file", f}, {"--clear-ipmi", "--ipmi-pass-file", f}} {
 		if req, _, err := runHostConfig(t, "", append([]string{"node-1"}, pair...)...); err == nil || req != nil {
 			t.Errorf("%v: err = %v, want a flag conflict and nothing sent", pair, err)

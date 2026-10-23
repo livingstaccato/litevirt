@@ -756,6 +756,7 @@ func newHostConfigCmd() *cobra.Command {
 			// The password from a file, or stdin for "-", keeps it out of
 			// argv (ps, shell history). One trailing newline is dropped.
 			if ipmiPassFile != "" {
+				warnSecretFileMode(cmd.ErrOrStderr(), "--ipmi-pass-file", ipmiPassFile)
 				p, err := readSecretFile(cmd.InOrStdin(), ipmiPassFile)
 				if err != nil {
 					return fmt.Errorf("--ipmi-pass-file: %w", err)
@@ -767,6 +768,7 @@ func newHostConfigCmd() *cobra.Command {
 					"to read it from stdin")
 			}
 			if rfPassFile != "" {
+				warnSecretFileMode(cmd.ErrOrStderr(), "--redfish-pass-file", rfPassFile)
 				p, err := readSecretFile(cmd.InOrStdin(), rfPassFile)
 				if err != nil {
 					return fmt.Errorf("--redfish-pass-file: %w", err)
@@ -896,6 +898,23 @@ func checkIPMICleared(h *pb.Host) error {
 			"--clear-ipmi; retry once every host is upgraded)", h.GetName(), h.GetIpmiAddress())
 	}
 	return nil
+}
+
+// warnSecretFileMode warns, on w, when the password file path (not "-",
+// stdin) can be read by its group or by other users. It does not refuse:
+// the file is the operator's, and the password is still kept out of argv.
+func warnSecretFileMode(w io.Writer, flag, path string) {
+	if path == "-" {
+		return
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return // the read reports it
+	}
+	if m := fi.Mode().Perm(); m&0o044 != 0 {
+		fmt.Fprintf(w, "warning: %s %s is mode %04o, readable by its group or other users; "+
+			"chmod 600 it to keep the password private\n", flag, path, m)
+	}
 }
 
 // readSecretFile reads a secret from path, or from in for "-", dropping one

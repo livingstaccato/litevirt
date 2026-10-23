@@ -45,16 +45,25 @@ const (
 // `admin`), its own audit genesis and its own capability latches, and its
 // gossip key stays in force.
 //
-// What proves the state is this cluster's is the machine holding this
-// cluster's CA certificate. A removed host (`lv host rm` leaves its files
-// in place) does, and is re-added. A machine that holds another CA, or a
-// database, latches or a running daemon with no CA certificate at all, is
-// refused: nothing tells whose cluster the state is, and there is no
-// override. The way forward is to move the state aside, or to join in the
-// other direction.
+// What proves the state is this cluster's is the host certificate the
+// daemon loads (host.crt in the config's pki_dir, /etc/litevirt/pki when it
+// names none) chaining to this cluster's CA: ca.crt is public, so holding it
+// proves nothing. A removed host (`lv host rm` leaves its files in place,
+// its revoked certificate included) and an older build of this cluster's
+// hold one. So does an add that failed after its admission and is being
+// finished: admitted is the certificate of that admission's pair on the
+// machine (nil for any other add, and for init). Database, latches or a
+// running daemon with no such certificate, or any CA that is not this
+// cluster's, is refused: nothing tells whose cluster the state is, and there
+// is no override. The way forward is to move the state aside, or to join in
+// the other direction.
+//
+// No cluster identity is recorded outside state.db, which the command cannot
+// read on the machine without a sqlite binary there, so the certificate
+// chain is the proof.
 //
 // verb names the command in the refusal ("add", "init").
-func refuseForeignState(m stateProbe, ourCA []byte, target, verb string) error {
+func refuseForeignState(m stateProbe, ourCA, admitted []byte, target, verb string) error {
 	refuse := func(found []string) error {
 		return fmt.Errorf("refusing to %s %s: it holds litevirt state that is not this cluster's:\n  - %s\n"+
 			"It looks like a machine that founded or joined another cluster (for instance with `lv host init --local`). "+
@@ -69,6 +78,7 @@ func refuseForeignState(m stateProbe, ourCA []byte, target, verb string) error {
 
 	cfgPath := daemonConfigPathOnTarget
 	pkiDirs := []string{remotePKIDir}
+	hostDir := remotePKIDir // where the daemon loads host.crt from
 	dataDir := defaultRemoteDataDir
 	raw, ok, err := m.ReadFile(cfgPath)
 	if err != nil {
@@ -85,14 +95,16 @@ func refuseForeignState(m stateProbe, ourCA []byte, target, verb string) error {
 		if cfg.DataDir != "" {
 			dataDir = path.Clean(cfg.DataDir)
 		}
-		if p := path.Clean(cfg.PKIDir); cfg.PKIDir != "" && p != remotePKIDir {
-			pkiDirs = append(pkiDirs, p)
+		if cfg.PKIDir != "" {
+			hostDir = path.Clean(cfg.PKIDir)
+			if hostDir != remotePKIDir {
+				pkiDirs = append(pkiDirs, hostDir)
+			}
 		}
 	}
 
 	ours := parseCerts(ourCA)
 	var found []string
-	proven := false
 	for _, dir := range pkiDirs {
 		caPath := path.Join(dir, "ca.crt")
 		b, ok, err := m.ReadFile(caPath)
@@ -111,14 +123,9 @@ func refuseForeignState(m stateProbe, ourCA []byte, target, verb string) error {
 			found = append(found, fmt.Sprintf("%s, which holds no certificate this command can read", caPath))
 		case !sameCA(ours, theirs):
 			found = append(found, fmt.Sprintf("%s, a CA that is not this cluster's (%s)", caPath, theirs[0].Subject.String()))
-		default:
-			proven = true
 		}
 	}
 
-	// A database or latch, or a running daemon, is fine under this
-	// cluster's CA (a removed host being re-added), and is someone else's
-	// under any other, or none.
 	var state []string
 	out, err := m.Shell(stateProbeKind, stateFilesCmd(m.Path(dataDir)))
 	if err != nil {
@@ -133,23 +140,30 @@ func refuseForeignState(m stateProbe, ourCA []byte, target, verb string) error {
 	if err != nil {
 		return refuse([]string{fmt.Sprintf("whether litevirt.service runs could not be told (%v)", err)})
 	}
-	running := daemonRunning(string(out))
-	if proven {
-		// The host certificate, too, must be this cluster's when state is kept.
-		if len(state) > 0 || running {
-			crt := path.Join(remotePKIDir, "host.crt")
-			if b, ok, err := m.ReadFile(crt); err != nil {
-				return refuse([]string{fmt.Sprintf("%s could not be read (%v)", crt, err)})
-			} else if ok && !issuedBy(b, ours) {
-				found = append(found, fmt.Sprintf("%s, a host certificate this cluster's CA did not issue", crt))
+	if running := daemonRunning(string(out)); running {
+		state = append(state, "a running litevirt.service")
+	}
+	if len(state) > 0 {
+		crt := path.Join(hostDir, "host.crt")
+		b, ok, err := m.ReadFile(crt)
+		if err != nil {
+			return refuse([]string{fmt.Sprintf("%s could not be read (%v)", crt, err)})
+		}
+		var why string
+		switch {
+		case ok && issuedBy(b, ours):
+		case admitted != nil && issuedBy(admitted, ours):
+			// Finishing this cluster's admission of the machine.
+		case !ok:
+			why = fmt.Sprintf("no host certificate at %s, so nothing proves whose cluster it is", crt)
+		default:
+			why = fmt.Sprintf("%s, a host certificate this cluster's CA did not issue", crt)
+		}
+		if why != "" {
+			for _, s := range state {
+				found = append(found, s)
 			}
-		}
-	} else {
-		for _, s := range state {
-			found = append(found, fmt.Sprintf("%s, with no CA certificate of this cluster's beside it", s))
-		}
-		if running {
-			found = append(found, "a running litevirt.service, with no CA certificate of this cluster's on the machine")
+			found = append(found, why)
 		}
 	}
 	if len(found) > 0 {

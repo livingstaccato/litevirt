@@ -241,7 +241,7 @@ func initPreflight(m stateProbe, sshTarget, existingCfg string, absent, force bo
 	if err != nil {
 		return fmt.Errorf("read this machine's cluster CA: %w", err)
 	}
-	return refuseForeignState(m, ca, sshTarget, "init")
+	return refuseForeignState(m, ca, nil, sshTarget, "init")
 }
 
 // AuditRejoinFile is the CA-signed admission record `lv host add` writes into a

@@ -138,26 +138,30 @@ before anything is admitted or pushed. A machine that founded its own cluster
 with `lv host init --local` is the usual case: adding it would merge that
 cluster's users (a second `admin`), audit history, capability latches and
 gossip key into this one. The proof that state belongs to this cluster is
-this cluster's CA certificate in `/etc/litevirt/pki/ca.crt` (and in the
-config's `pki_dir`, when it names another). The add refuses:
+the host certificate the daemon loads, `host.crt` in the config's `pki_dir`
+(`/etc/litevirt/pki` when it names none), chaining to this cluster's CA. A CA
+certificate alone proves nothing: it is public. The add refuses:
 
-- a CA certificate that is not this cluster's, or a CA key with no
-  certificate beside it;
+- a CA certificate that is not this cluster's, in `/etc/litevirt/pki` or the
+  config's `pki_dir`, or a CA key with no certificate beside it;
 - a `state.db` or capability latches (`split_brain_activated.*`) in the data
   dir (`data_dir`, `/var/lib/litevirt` by default), or a running
-  `litevirt.service`, with no CA certificate of this cluster's;
-- with this cluster's CA, a host certificate that another CA issued while
-  that state is there;
+  `litevirt.service`, when that `host.crt` is missing or another CA issued it;
 - a `config.yaml` it cannot read or parse, since then it cannot tell where the
-  state lives.
+  state or the host certificate lives.
+
+An add that failed after the cluster admitted the host, whose daemon may
+already have started, is finished by running it again: the admitted pair it
+left staged on the machine is the proof, as `host.crt` is for any other.
 
 There is no override. The refusal names what it found and the two ways
 forward: stop and disable `litevirt.service` on the machine and move
 `/etc/litevirt`, the data dir, `/root/.config/litevirt` and `/etc/pki/qemu`
 aside, then add it again as a new machine; or join in the other direction,
 adding this cluster's machines to the one it founded. A host removed with
-`lv host rm` keeps this cluster's CA certificate and its files, so it is
-added back as before, with its database and even a daemon still running.
+`lv host rm` keeps its host certificate, revoked but issued by this cluster's
+CA, and its files, so it is added back as before, with its database and even
+a daemon still running.
 
 `lv host add` uploads the binary and the host's credentials to staged paths
 on the machine, and moves them into place only once the cluster has admitted

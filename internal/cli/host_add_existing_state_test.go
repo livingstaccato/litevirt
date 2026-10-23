@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,6 +38,28 @@ func foundOwnCluster(t *testing.T, f *addFixture) {
 	}
 	writeOnTarget(t, f.target, "/var/lib/litevirt/state.db", "SQLite format 3\x00")
 	f.target.DaemonState = "active"
+}
+
+// noIdentity removes the fixture's host pair: the machine holds no host
+// certificate.
+func noIdentity(t *testing.T, f *addFixture) {
+	t.Helper()
+	for _, n := range []string{"host.crt", "host.key"} {
+		if err := os.Remove(filepath.Join(f.targetPKI, n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.before = map[string][]byte{}
+}
+
+// mkdirOnTarget creates the machine directory p and returns where it is.
+func mkdirOnTarget(t *testing.T, m *LocalAddTarget, p string) string {
+	t.Helper()
+	full := m.Path(p)
+	if err := os.MkdirAll(full, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return full
 }
 
 // ourCAOnTarget puts this cluster's CA certificate on the target, as every
@@ -89,18 +112,21 @@ func TestHostAdd_RefusesAMachineWithAnotherClustersState(t *testing.T) {
 		f.before["host.key"] = mustRead(t, filepath.Join(f.targetPKI, "host.key"))
 		refusedUntouched(t, f, f.add(t), "/etc/litevirt/pki/ca.crt", "a CA that is not this cluster's")
 	})
-	t.Run("a database with no CA", func(t *testing.T) {
+	t.Run("a database with no host certificate", func(t *testing.T) {
 		f := newAddFixture(t)
+		noIdentity(t, f)
 		writeOnTarget(t, f.target, "/var/lib/litevirt/state.db", "x")
 		refusedUntouched(t, f, f.add(t), "/var/lib/litevirt/state.db")
 	})
-	t.Run("a capability latch with no CA", func(t *testing.T) {
+	t.Run("a capability latch with no host certificate", func(t *testing.T) {
 		f := newAddFixture(t)
+		noIdentity(t, f)
 		writeOnTarget(t, f.target, "/var/lib/litevirt/split_brain_activated.voter_config_v1", "")
 		refusedUntouched(t, f, f.add(t), "split_brain_activated.voter_config_v1")
 	})
 	t.Run("a database in the config's own data dir", func(t *testing.T) {
 		f := newAddFixture(t)
+		noIdentity(t, f)
 		writeTargetConfig(t, f, "host_name: node-5\ndata_dir: /srv/lv\n", 0o644)
 		writeOnTarget(t, f.target, "/srv/lv/state.db", "x")
 		refusedUntouched(t, f, f.add(t), "/srv/lv/state.db")
@@ -118,8 +144,9 @@ func TestHostAdd_RefusesAMachineWithAnotherClustersState(t *testing.T) {
 		}
 		refusedUntouched(t, f, f.add(t), "/srv/pki/ca.crt")
 	})
-	t.Run("a running daemon with no CA", func(t *testing.T) {
+	t.Run("a running daemon with no host certificate", func(t *testing.T) {
 		f := newAddFixture(t)
+		noIdentity(t, f)
 		f.target.DaemonState = "active"
 		refusedUntouched(t, f, f.add(t), "running litevirt.service")
 	})
@@ -136,6 +163,27 @@ func TestHostAdd_RefusesAMachineWithAnotherClustersState(t *testing.T) {
 		f.before["host.key"] = mustRead(t, filepath.Join(f.targetPKI, "host.key"))
 		writeOnTarget(t, f.target, "/var/lib/litevirt/state.db", "x")
 		refusedUntouched(t, f, f.add(t), "a host certificate this cluster's CA did not issue")
+	})
+	// Review I1: ca.crt is public, so this cluster's CA beside another
+	// cluster's database and daemon, with no host certificate, proves nothing.
+	t.Run("this CA, no host certificate, another cluster's database and daemon", func(t *testing.T) {
+		f := newAddFixture(t)
+		noIdentity(t, f)
+		ourCAOnTarget(t, f)
+		writeOnTarget(t, f.target, "/var/lib/litevirt/state.db", "SQLite format 3\x00")
+		f.target.DaemonState = "active"
+		refusedUntouched(t, f, f.add(t), "no host certificate at /etc/litevirt/pki/host.crt", "running litevirt.service")
+	})
+	// Review I2: the daemon loads host.crt from the config's pki_dir. This
+	// cluster's pair at /etc/litevirt/pki proves nothing when the config
+	// points the daemon at another directory holding another cluster's.
+	t.Run("this cluster's pair in /etc/litevirt/pki, another's in the config's pki_dir", func(t *testing.T) {
+		f := newAddFixture(t)
+		ourCAOnTarget(t, f)
+		writeTargetConfig(t, f, "host_name: node-5\npki_dir: /srv/pki\n", 0o644)
+		installPair(t, &addFixture{targetPKI: mkdirOnTarget(t, f.target, "/srv/pki")}, "", "node-5")
+		writeOnTarget(t, f.target, "/var/lib/litevirt/state.db", "x")
+		refusedUntouched(t, f, f.add(t), "/srv/pki/host.crt, a host certificate this cluster's CA did not issue")
 	})
 	t.Run("a config that does not parse", func(t *testing.T) {
 		f := newAddFixture(t)
@@ -171,6 +219,27 @@ func TestHostAdd_ReAddsAHostThisClusterRemoved(t *testing.T) {
 		if err := f.add(t); err != nil {
 			t.Fatalf("add of a machine with no state: %v", err)
 		}
+	})
+	// An add that failed after its admission, on a fresh machine whose daemon
+	// had already started: its rollback removed the host pair it installed
+	// (there was none before), and left the admitted pair staged. The rerun
+	// finishes it: the staged pair of this cluster's joining admission is the
+	// proof, not a host.crt.
+	//
+	// Mutation: drop the admitted case in refuseForeignState — refused.
+	t.Run("an add that failed after its daemon started", func(t *testing.T) {
+		f := newAddFixture(t)
+		noIdentity(t, f)
+		serial := strandedAdd(t, f)
+		if _, err := os.Stat(filepath.Join(f.targetPKI, "host.crt")); !os.IsNotExist(err) {
+			t.Fatalf("the rollback left a host.crt (%v): the case is not reached", err)
+		}
+		writeOnTarget(t, f.target, "/var/lib/litevirt/state.db", "x")
+		f.target.DaemonState = "active"
+		if err := f.add(t); err != nil {
+			t.Fatalf("finishing this cluster's admission: %v", err)
+		}
+		servesItsAdmittedPair(t, f.targetPKI, serial)
 	})
 }
 
@@ -222,8 +291,20 @@ func TestHostInitPreflight_RefusesAnotherClustersState(t *testing.T) {
 		writeOnTarget(t, m, "/etc/litevirt/pki/ca.crt", string(mustRead(t, filepath.Join(op, "ca.crt"))))
 		writeOnTarget(t, m, "/var/lib/litevirt/state.db", "x")
 		m.DaemonState = "active"
+		// Init pushes this CA's host pair before setup, so it is there.
+		if err := pki.GenerateHostCert(filepath.Join(op, "ca.crt"), filepath.Join(op, "ca.key"),
+			filepath.Join(m.PKIDir, "host.crt"), filepath.Join(m.PKIDir, "host.key"), "node-1", net.IPv4(10, 0, 0, 5)); err != nil {
+			t.Fatal(err)
+		}
 		if err := initPreflight(m, "root@10.0.0.5", "host_name: node-1\n", false, false); err != nil {
 			t.Fatalf("re-init of this CA's founder: %v", err)
+		}
+		// Without it, the database and daemon are not proven this CA's.
+		if err := os.Remove(filepath.Join(m.PKIDir, "host.crt")); err != nil {
+			t.Fatal(err)
+		}
+		if err := initPreflight(m, "root@10.0.0.5", "host_name: node-1\n", false, false); err == nil {
+			t.Fatal("init over a database and daemon with no host certificate went ahead")
 		}
 	})
 	t.Run("fresh machine", func(t *testing.T) {

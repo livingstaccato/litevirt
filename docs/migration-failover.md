@@ -480,6 +480,17 @@ guest running for it to migrate:
 4. After that commit, the source undefines its domain and removes its copy of
    each disk it sent.
 
+The path is the source's, and the target accepts it in its own disk directories
+and in the file-based pool directories the cluster records for the source host.
+A VM promoted onto a witness is the usual case: the witness's `default` pool is
+`<data_dir>/pools/default`, while the workers of an older cluster keep theirs at
+`<data_dir>/disks`, and the move is not refused for it. The disk stays in the
+source's pool directory on the target, and its record keeps the pool name.
+Nothing wider is accepted: a path outside those directories, one that climbs out
+of them with `..`, or a pool row that names the target's own data directory
+(or a place in it outside `disks/`, `pools/` and `mounts/`) is refused with
+`is not in a disk-artifact root`.
+
 Until the commit in step 3 the source keeps its disks, its domain and
 ownership of the VM. If any step before it fails, or the client goes away,
 the VM stays on the source, stopped. The target removes the disk copies and

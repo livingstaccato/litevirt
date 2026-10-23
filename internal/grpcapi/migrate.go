@@ -99,6 +99,79 @@ func (s *Server) withinDiskArtifactRoot(p string) bool {
 	return false
 }
 
+// withinMigrationDiskRoot is withinDiskArtifactRoot for a path a migration
+// brings onto this host from sourceHost. A host-local disk keeps its recorded
+// path across a cold move (the record, the domain and every later operation
+// name it), so the path is the SOURCE's pool directory, not necessarily one of
+// this host's: a witness founded by a current build keeps its default pool at
+// <data_dir>/pools/default, while the workers of an older cluster keep theirs
+// at <data_dir>/disks. Judging the path by this host's roots alone refused the
+// documented recovery of a VM promoted onto a witness (lv migrate <vm>
+// <worker> --cold). So a path also passes when it lies inside a file-based pool
+// directory the replicated storage_pools table records for sourceHost.
+//
+// The bound stays: the path must be inside such a directory (no traversal;
+// safename.Contains cleans both), the directory must not be, or contain, this
+// host's data directory, nor sit in it outside its disks/, pools/ and mounts/
+// areas, so a pool row can never name state.db or the PKI.
+func (s *Server) withinMigrationDiskRoot(ctx context.Context, p, sourceHost string) bool {
+	if s.withinDiskArtifactRoot(p) {
+		return true
+	}
+	if sourceHost == "" || sourceHost == s.hostName || !filepath.IsAbs(p) || s.db == nil {
+		return false
+	}
+	pools, err := corrosion.ListStoragePoolsForHost(ctx, s.db, sourceHost)
+	if err != nil {
+		return false
+	}
+	for _, rec := range pools {
+		ref := StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target, Options: rec.Options}
+		if !isFileBasedDriver(ref.Driver) || (strings.EqualFold(ref.Driver, "nfs") && ref.Target == "") {
+			continue
+		}
+		dir, derr := fileBasedPoolDir(s.dataDir, ref)
+		if derr != nil || !filepath.IsAbs(dir) {
+			continue
+		}
+		if !safename.Contains(dir, p) || s.poolDirTouchesState(dir) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// migrationSourceHost is the host a migration of vm brings its disks from: the
+// host its row names, which does not change until the move is done.
+func migrationSourceHost(vm *corrosion.VMRecord) string {
+	if vm == nil {
+		return ""
+	}
+	return vm.HostName
+}
+
+// poolDirTouchesState reports whether dir, a pool directory another host
+// records, is or contains this host's data directory, or is inside it outside
+// the three areas a pool may use (disks/, pools/, mounts/).
+func (s *Server) poolDirTouchesState(dir string) bool {
+	if s.dataDir == "" {
+		return true // cannot tell what is state: refuse
+	}
+	if safename.Contains(dir, s.dataDir) {
+		return true
+	}
+	if !safename.Contains(s.dataDir, dir) {
+		return false
+	}
+	for _, area := range []string{"disks", "pools", "mounts"} {
+		if safename.Contains(filepath.Join(s.dataDir, area), dir) {
+			return false
+		}
+	}
+	return true
+}
+
 // errLibvirtCallUnanswered is the answer of a libvirt call whose goroutine
 // ended without one: what waits on the call's result is never left waiting.
 var errLibvirtCallUnanswered = errors.New("the libvirt call ended without an answer")
@@ -2554,7 +2627,7 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 		// Only ever remove paths in a real disk-artifact root (disks dir or a
 		// file-backed pool dir) — never an arbitrary file under the data dir such
 		// as state.db.
-		if !s.withinDiskArtifactRoot(p) {
+		if !s.withinMigrationDiskRoot(ctx, p, migrationSourceHost(vm)) {
 			slog.Warn("cleanup migration artifacts: refusing to remove path outside a disk-artifact root", "vm", req.VmName, "path", p)
 			continue
 		}

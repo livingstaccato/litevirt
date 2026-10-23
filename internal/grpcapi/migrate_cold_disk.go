@@ -521,7 +521,7 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 				"make the disk and its record agree, then migrate again",
 			hdr.Path, vm.Name, hdr.SizeBytes, rec.SizeBytes, coldDiskSizeLimit(rec.SizeBytes))
 	}
-	if !s.withinDiskArtifactRoot(hdr.Path) {
+	if !s.withinMigrationDiskRoot(ctx, hdr.Path, vm.HostName) {
 		return status.Errorf(codes.InvalidArgument, "disk path %q is not in a disk-artifact root", hdr.Path)
 	}
 	dst := s.hostDiskFile(hdr.Path)

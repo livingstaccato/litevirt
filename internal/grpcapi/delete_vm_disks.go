@@ -73,6 +73,10 @@ func (s *Server) freeRecordedVMDisks(ctx context.Context, vmName string, decide 
 	var cephKeptHere []KeptCephImage
 	var leftovers []diskLeftover
 	errs := make([]error, len(disks))
+	// heldWhy is why a disk's file was left without a removal: a kept-disk
+	// note or kept-disks.json holds it, or kept-disks.json cannot be read,
+	// which holds every path (keptHolds).
+	heldWhy := make([]string, len(disks))
 	tried := make([]bool, len(disks))
 	var wg sync.WaitGroup
 	for i := range disks {
@@ -107,7 +111,7 @@ func (s *Server) freeRecordedVMDisks(ctx context.Context, vmName string, decide 
 			continue
 		}
 		tried[i] = true
-		del := func() { errs[i] = s.deleteDiskAtRecordedLocation(ctx, d) }
+		del := func() { heldWhy[i], errs[i] = s.deleteDiskAtRecordedLocationHeld(ctx, d) }
 		// The rbd disks are deleted together (deleteRecordedVMDiskVolumeRecords).
 		if strings.HasPrefix(d.Path, "rbd:") {
 			wg.Add(1)
@@ -144,7 +148,13 @@ func (s *Server) freeRecordedVMDisks(ctx context.Context, vmName string, decide 
 			continue
 		}
 		if there, err := diskFileThere(file); err != nil || there {
-			if err == nil {
+			switch {
+			case err != nil:
+			case heldWhy[i] != "":
+				// No removal ran: named for its hold, which a retry
+				// finds again until the hold is gone (lab 2 drill F5).
+				err = fmt.Errorf("its file was left, not removed: %s", heldWhy[i])
+			default:
 				err = errors.New("its file is still there after its removal")
 			}
 			leftovers = append(leftovers, diskLeftover{disk: d.DiskName, path: d.Path, target: file, named: d.Path, err: err})

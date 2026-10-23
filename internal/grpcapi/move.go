@@ -782,12 +782,29 @@ func (s *Server) deleteRecordedVMDiskVolumeRecordsKept(
 // matter for ceph); otherwise we fall back to the recorded StorageType, and to
 // "local" when even that is blank (legacy rows).
 func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.DiskRecord) error {
+	_, err := s.deleteDiskAtRecordedLocationHeld(ctx, d)
+	return err
+}
+
+// afterRecordedDiskDelete, when set, runs after a recorded-location delete
+// removed a disk file. Tests only.
+var afterRecordedDiskDelete func(path string)
+
+// deleteDiskAtRecordedLocationHeld is deleteDiskAtRecordedLocation, and why
+// the file was left without a removal when a kept-disk note or kept-disks.json
+// holds it ("" when the removal ran): a caller that verifies the file is gone
+// names it for its hold, not as a removal that failed (lab 2 drill F5).
+func (s *Server) deleteDiskAtRecordedLocationHeld(ctx context.Context, d *corrosion.DiskRecord) (string, error) {
 	if !strings.HasPrefix(d.Path, "rbd:") {
 		if held, why := s.keptHolds(ctx, d.Path); held {
 			s.reportKeptNoteHold(ctx, d.VMName, "the delete of disk "+d.DiskName, d.Path, why)
-			return nil
+			return why, nil
 		}
 	}
+	return "", s.deleteDiskAtRecordedLocationUnheld(ctx, d)
+}
+
+func (s *Server) deleteDiskAtRecordedLocationUnheld(ctx context.Context, d *corrosion.DiskRecord) error {
 	drv, err := s.diskDriver(ctx, d)
 	if err != nil {
 		return err
@@ -796,6 +813,9 @@ func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.
 	// root a multi-node test gives each node.
 	if err := drv.DeleteDisk(ctx, s.hostDiskFile(d.Path)); err != nil {
 		return err
+	}
+	if afterRecordedDiskDelete != nil {
+		afterRecordedDiskDelete(s.hostDiskFile(d.Path))
 	}
 	// The disk's data is destroyed by intent: a point-in-time overlay of it
 	// (and its binding) goes with it, so a disk re-created at this path never

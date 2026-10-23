@@ -347,6 +347,45 @@ func mintLocalHostCert(pkiDir, hostName, addr string) error {
 		hostName, ip)
 }
 
+// etcLitevirtDir is the system config directory. A var so a test can point it
+// at a temp dir.
+var etcLitevirtDir = "/etc/litevirt"
+
+// ensureEtcLitevirtDir makes the system config directory searchable by others
+// without making it readable. `lv host init --local` used to create it as a
+// side effect of MkdirAll(".../pki", 0700), so it came out 0700, while the
+// remote form's setup script leaves it 0755. The fence ssh AuthorizedKeysCommand
+// runs as nobody and cannot reach /etc/litevirt/ssh/authorized_keys through a
+// 0700 parent, so sshd never accepted the managed key. A new directory is made
+// 0711 (the disk-dir mode); an existing one only has the other-search bit ORed
+// in: never a read bit, never a narrowing, never a child. The secrets beneath
+// (pki 0700, key files 0600, admin-password) are guarded by their own modes.
+func ensureEtcLitevirtDir(dir string) error {
+	fi, err := os.Stat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.MkdirAll(dir, 0o711); err != nil {
+			return fmt.Errorf("create %s: %w", dir, err)
+		}
+		// MkdirAll's mode is masked by the umask.
+		if err := os.Chmod(dir, 0o711); err != nil {
+			return fmt.Errorf("chmod %s: %w", dir, err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", dir, err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%s is not a directory", dir)
+	}
+	if m := fi.Mode().Perm(); m&0o001 == 0 {
+		if err := os.Chmod(dir, m|0o001); err != nil {
+			return fmt.Errorf("chmod %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
 func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bool) error {
 	if err := pki.ValidateHostName(hostName); err != nil {
 		return err
@@ -362,6 +401,10 @@ func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bo
 		return err
 	}
 
+	// Before any MkdirAll below makes it as a 0700 side effect.
+	if err := ensureEtcLitevirtDir(etcLitevirtDir); err != nil {
+		return err
+	}
 	pkiDir := PKIDir()
 	if err := os.MkdirAll(pkiDir, 0700); err != nil {
 		return fmt.Errorf("create PKI dir: %w", err)
@@ -1185,7 +1228,12 @@ echo "Enabled libvirtd TLS (port 16514)"
 # keeps its mode. qemu reaches its files through them (internal/diskmode).
 mkdir -p /var/lib/litevirt
 mkdir -p -m 0711 /var/lib/litevirt/{images,disks,cloudinit}
-mkdir -p /etc/litevirt
+# Searchable but not listable (0711), as the disk dirs above: the fence ssh
+# AuthorizedKeysCommand runs unprivileged and must reach /etc/litevirt/ssh. The
+# secrets below it keep their own 0700/0600. An existing directory only gains the
+# search bit, whatever else its mode is.
+mkdir -p -m 0711 /etc/litevirt
+chmod o+x /etc/litevirt
 ` + genesisMarkerScript + `
 # Libvirt storage pools are auto-created by litevirtd on startup
 # (from storage_pools config or a default local pool).
@@ -1265,6 +1313,7 @@ if [ "${FENCE_SSH_DROPIN:-1}" != 0 ]; then
     lv_fence_ssh_install || echo "fence ssh: the drop-in was not installed"
 else
     install -d -m 0755 /etc/litevirt/ssh
+    chmod o+x /etc/litevirt
     echo "fence ssh: --no-fence-ssh; add /etc/litevirt/ssh/authorized_keys to root's AuthorizedKeysFile by hand"
 fi
 

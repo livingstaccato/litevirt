@@ -14,8 +14,11 @@ import (
 // below the target's own pool, or as the pool directory itself, makes it refuse
 // instead of creating a stub where the link points.
 //
-// Red on d0fb47b0a (the create was by path). Mutation: qcow2.Create(stub.Path)
-// again - the stub appears outside the pool and this is red.
+// Red on d0fb47b0a (the create was by path). Mutation: open the stub's directory
+// by path (openPinnedDir(filepath.Dir(stub.Path), ...)) instead of openDiskDir -
+// the stub appears outside the pool and this is red. (Creating through the held
+// directory rather than by name only matters against a swap after the open, which
+// this static test does not reach.)
 func TestFleet_EnsureDisksCreateRefusesAStaticLink(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -80,11 +83,7 @@ func TestFleet_EnsureDisksUndoDoesNotFollowASwappedDirectory(t *testing.T) {
 	if err := os.WriteFile(victim, []byte("victim"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// A regular file where the second stub's directory has to be: its create fails.
-	blocker := filepath.Join(o.nfs, "blocker")
-	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	// The second stub fails on its size (1<<62), after the first was made.
 	swapped := false
 	o.dst.Server.SetEnsureStubCreatedHookForTest(func() {
 		swapped = true

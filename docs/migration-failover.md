@@ -502,7 +502,14 @@ through it. The root itself is judged for what it leads to: a data-dir area
 areas may be a link to another volume, if it leads somewhere a pool may live; a
 pool directory below an area that has been replaced by a link out of the area is
 refused. Without `/proc/self/fd` nothing is opened, so a removal fails rather
-than reporting the file gone.
+than reporting the file gone. A qcow2 overlay's backing files are opened without
+following a link too, and must still be where they were judged.
+
+Known limitation: a pool directory below an area that is a link to another place
+in the same area (`mounts/nfs1/x` linking to `mounts/nfs2/q`) can be read but is
+refused when a receive or an EnsureDisks has to create something there, because
+the directories are made from the area one level at a time with no link followed.
+Point the pool at the final directory instead of at a link to it.
 
 A VM promoted onto a witness is the usual case: the witness's `default` pool is
 `<data_dir>/pools/default`, which is inside the worker's `pools/` area, while the

@@ -27,7 +27,7 @@ func endpointFilePath(dataDir string) string {
 func (d *Daemon) publishEndpoint() {
 	path := endpointFilePath(d.cfg.DataDir)
 	if err := endpointfile.Write(path, endpointfile.Endpoint{GRPCPort: d.cfg.GRPCPort, PKIDir: d.cfg.PKIDir}); err != nil {
-		slog.Warn("could not publish the endpoint file a local lv reads; a non-root lv falls back to the default port",
+		slog.Warn("could not publish the endpoint file; a non-root CLI on this node falls back to the default port",
 			"path", path, "error", err)
 	}
 }

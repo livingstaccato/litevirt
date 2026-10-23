@@ -141,11 +141,11 @@ func localModeWithoutDaemonConfig(readErr error) (*ClusterConfig, error) {
 	if dir := PKIDir(); cliPKIBundleExists(dir) {
 		fmt.Fprintf(cliNotice, "lv: %s cannot be read by this user, and no usable endpoint file is at %s; "+
 			"using the defaults: the daemon on 127.0.0.1:7443, with the CLI client bundle in %s "+
-			"(set LV_HOST for another node, or run lv with sudo)\n", daemonConfigPath, endpointPath, dir)
+			"(set LV_HOST for another node, or run the command with sudo)\n", daemonConfigPath, endpointPath, dir)
 		return &ClusterConfig{GRPCPort: 7443, PKIDir: dir, Local: true}, nil
 	}
 	return nil, fmt.Errorf("daemon config %s cannot be read by this user (%w), and there is no CLI client bundle in %s: "+
-		"set LV_HOST to host[:port] of a cluster node, or run lv with sudo",
+		"set LV_HOST to host[:port] of a cluster node, or run the command with sudo",
 		daemonConfigPath, readErr, PKIDir())
 }
 

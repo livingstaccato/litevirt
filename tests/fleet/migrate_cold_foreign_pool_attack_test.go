@@ -18,7 +18,6 @@ import (
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // probeReceive sends the header of a check-only ReceiveMigrationDisk of fp1's
@@ -39,8 +38,10 @@ func (fp *foreignPoolScenario) targetFile(p string) string {
 	return filepath.Join(fp.c.tmpRoot, "fs-"+fp.dst.Name, p)
 }
 
-// Every row is red on 2bc0443c6 (the target wrote into the system directory, or
-// the pool row's directory was taken as it was named) and must be refused.
+// Every row must be refused. The system-directory, /proc and outside-the-areas
+// rows are red on 2bc0443c6 (the target wrote there); the symlink rows and the
+// pools-area-root row pin rules the F1 design added. Under 2bc0443c6 the rows
+// that sit inside the data dir were already refused.
 //
 // Mutations: drop the CheckWriteRoot of the pool directory or of the parent in
 // foreignPoolDirAcceptable - the system rows (and /proc) go red; drop the
@@ -114,11 +115,11 @@ func TestFleet_ColdMigrationRefusesASourcePoolRowThatReachesOutsideTheTargetsPoo
 			fp := newForeignPoolScenario(t,
 				func(pool, _ string) string {
 					def = pool
-					outside = filepath.Join(filepath.Dir(filepath.Dir(pool)), "outside-"+tc.name)
+					outside = filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(pool))), "outside-"+tc.name)
 					return tc.disk(pool, outside)
 				},
 				func(pool, _ string) string {
-					return tc.pool(pool, filepath.Join(filepath.Dir(filepath.Dir(pool)), "outside-"+tc.name))
+					return tc.pool(pool, filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(pool))), "outside-"+tc.name))
 				})
 			if tc.setup != nil {
 				tc.setup(t, fp, def, outside)
@@ -138,33 +139,5 @@ func TestFleet_ColdMigrationRefusesASourcePoolRowThatReachesOutsideTheTargetsPoo
 				t.Errorf("a cold move put %s on the target", fp.disk)
 			}
 		})
-	}
-}
-
-// The residual a bare CheckWriteRoot would leave: an ordinary directory outside
-// the target's pool areas is accepted only when the target has a usable pool of
-// its own on that same directory.
-//
-// Mutation: drop the own-pool branch in foreignPoolDirAcceptable - red.
-func TestFleet_ColdMigrationAcceptsAForeignPoolDirectoryTheTargetHasAPoolOn(t *testing.T) {
-	var outside string
-	fp := newForeignPoolScenario(t,
-		func(pool, _ string) string {
-			outside = filepath.Join(filepath.Dir(filepath.Dir(pool)), "srv-pool")
-			return filepath.Join(outside, "x.qcow2")
-		},
-		func(pool, _ string) string { return filepath.Join(filepath.Dir(filepath.Dir(pool)), "srv-pool") })
-	if err := fp.probeReceive(t); err == nil || !strings.Contains(err.Error(), "not in a disk-artifact root") {
-		t.Fatalf("with no pool of its own on %s the target answered %v, want the refusal", outside, err)
-	}
-	if err := corrosion.UpsertStoragePool(context.Background(), fp.dst.DB, corrosion.StoragePoolRecord{
-		HostName: fp.dst.Name, Name: "srv", Driver: "dir", Target: outside, State: "active"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(fp.targetFile(outside), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := fp.probeReceive(t); err != nil {
-		t.Fatalf("with its own pool on %s the target answered %v, want the receive accepted", outside, err)
 	}
 }

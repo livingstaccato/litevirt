@@ -566,8 +566,9 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	} else if err := diskmode.MkdirAll(dir); err != nil {
 		return status.Errorf(codes.Internal, "create disk dir %s: %v", filepath.Dir(hdr.Path), err)
 	} else if foreign {
-		// Made, and still where it was judged: nothing swapped a link in.
-		if again, rerr := resolveDeepest(dir); rerr != nil || again != dir {
+		// Made, still where it was resolved, and judged again against what is on
+		// disk now: nothing swapped a link in between the check and the write.
+		if again, rerr := resolveDeepest(dir); rerr != nil || again != dir || !s.withinMigrationDiskRoot(ctx, hdr.Path, vm.HostName) {
 			return status.Errorf(codes.FailedPrecondition, "disk dir %s changed while it was made; nothing was written", filepath.Dir(hdr.Path))
 		}
 	}

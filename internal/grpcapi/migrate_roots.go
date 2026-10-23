@@ -54,8 +54,9 @@ func resolveDeepest(p string) (string, error) {
 // BOTH
 //
 //	(a) inside this host's own disks/, pools/ or mounts/ areas under its data
-//	    directory, or inside the directory of a usable pool row of this host's
-//	    own (the same resolved directory); and
+//	    directory. No pool row is consulted for this, the target's own rows
+//	    included: a replicated row has no origin check, so any member could
+//	    write one naming this host; and
 //	(b) acceptable to storage.CheckWriteRoot, as this host's own pools are: no
 //	    system directory, PKI directory, litevirt state or data directory.
 //
@@ -107,23 +108,6 @@ func (s *Server) foreignPoolDirAcceptable(ctx context.Context, dir, parent strin
 	for _, area := range []string{"disks", "pools", "mounts"} {
 		ra, err := resolveDeepest(s.hostDiskFile(filepath.Join(s.dataDir, area)))
 		if err == nil && safename.Contains(ra, rd) {
-			return true
-		}
-	}
-	own, err := corrosion.ListStoragePoolsForHost(ctx, s.db, s.hostName)
-	if err != nil {
-		return false
-	}
-	for _, rec := range own {
-		ref := StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target, Options: rec.Options}
-		if !isFileBasedDriver(ref.Driver) || (strings.EqualFold(ref.Driver, "nfs") && ref.Target == "") {
-			continue
-		}
-		odir, derr := fileBasedPoolDir(s.dataDir, ref)
-		if derr != nil || !filepath.IsAbs(odir) || !s.poolUsableForWrite(ctx, rec.Name, ref) {
-			continue
-		}
-		if ro, err := resolveDeepest(s.hostDiskFile(odir)); err == nil && safename.Contains(ro, rd) {
 			return true
 		}
 	}

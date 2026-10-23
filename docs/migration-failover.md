@@ -483,11 +483,12 @@ guest running for it to migrate:
 The path is the source's, and the target accepts it in its own disk directories
 and in a file-based pool directory the cluster records for the source host, but
 only when that directory, with symlinks resolved on the target, is inside the
-target's own `disks/`, `pools/` or `mounts/` areas under its data directory (or
-is the directory of a usable pool of the target's own), and passes the check the
-target applies to its own pools: no system directory, PKI directory, litevirt
-state or data directory. A storage-pool row is replicated state, so it never
-makes the target write somewhere a pool of its own could not be. The file's
+target's own `disks/`, `pools/` or `mounts/` areas under its data directory (a
+pool row of the target's own does not widen this: rows replicate without an
+origin check), and passes the check the target applies to its own pools: no
+storage-pool row is replicated state, so it never widens this rule beyond those
+areas. The file's
+those areas. The file's
 parent directory is held to the same rules once its links are resolved, and
 must stay inside that pool directory.
 

@@ -129,7 +129,8 @@ func installedLive(events []string) []string {
 	for _, e := range events {
 		switch {
 		case isStagedWrite(e):
-		case strings.HasPrefix(e, "run mkdir -p"), e == "sh unstage", e == "sh config", e == "sh records":
+		case e == "sh mkdir", e == "sh unstage", e == "sh config", e == "sh records",
+			e == "sh "+stateProbeKind, e == "sh "+daemonProbeKind:
 		default:
 			live = append(live, e)
 		}
@@ -624,8 +625,14 @@ func TestHostAdd_KeepsTheMachinesConfig(t *testing.T) {
 			if tc.name == "quoted key" && strings.Contains(err.Error(), "alias") {
 				t.Errorf("a refusal not caused by an alias blames one: %v", err)
 			}
-			// Only the reads of the add records and the config reached the host.
-			if len(f.client.admitted) != 0 || strings.Join(f.target.Events, ",") != "sh records,sh config" {
+			// Only the reads of the existing state, the add records and the
+			// config reached the host. A config that does not parse is refused
+			// by the state check, which cannot tell where its data dir is.
+			want := "sh existing-state,sh existing-daemon,sh records,sh config"
+			if tc.name == "unparsable" {
+				want = ""
+			}
+			if len(f.client.admitted) != 0 || strings.Join(f.target.Events, ",") != want {
 				t.Errorf("the add went ahead: admitted %v, events %v", f.client.admitted, f.target.Events)
 			}
 		})

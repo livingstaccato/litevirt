@@ -72,7 +72,6 @@ sudo ln -sf /usr/local/bin/litevirt /usr/local/bin/lv   # `lv` is a symlink to t
 
 # Initialise cluster state on this host (port 7443):
 sudo litevirt host init --local --name pilot-1
-sudo systemctl enable --now litevirt.service
 ```
 
 `litevirt` listens on its own ports (7443 gRPC, 7445 UI, 7446 REST,

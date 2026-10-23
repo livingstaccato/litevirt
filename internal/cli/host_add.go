@@ -255,6 +255,7 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 	// certificate it was admitted with, which the machine holds installed
 	// or staged, or say that it already finished.
 	serial, pairOnMachine, legacyPair := "", false, false
+	var admittedCrt []byte // the staged certificate of the admission this add finishes
 	if row := liveHost(hosts, p.hostName); row != nil && row.GetAddress() == p.hostAddr {
 		admittedSerial := canonSerial(row.GetCertSerial())
 		joining := row.GetState() == pb.HostState_HOST_JOINING
@@ -295,8 +296,20 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 				// the earlier attempt's files to it.
 				files = append(files, addFile{hostCrt, pair[0], 0o644}, addFile{hostKey, pair[1], 0o600})
 				legacyPair = where == pairStagedLegacy
+				admittedCrt = pair[0]
 			}
 		}
+	}
+	// Another cluster's state on the machine (one that founded its own with
+	// `lv host init --local`) is never merged into this one. A staged pair of
+	// this cluster's joining admission proves an add that failed after it
+	// (its daemon may have started) is this cluster's to finish.
+	ca, err := localCA(p.pkiDir)
+	if err != nil {
+		return fmt.Errorf("read the cluster CA: %w", err)
+	}
+	if err := refuseForeignState(r, ca, admittedCrt, p.hostName+" at "+p.hostAddr, "add"); err != nil {
+		return err
 	}
 	// Checked again right before the install (refuseSecondInstall); here,
 	// so that a machine this add may not install on gets no admission and
@@ -356,7 +369,7 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 			slog.Warn("could not remove the files staged on the host", "error", err)
 		}
 	}
-	if err := r.Run("mkdir -p " + ssh.ShellQuote(remotePKIDir) + " && mkdir -p -m 0700 " + ssh.ShellQuote(remoteMigrationDir)); err != nil {
+	if _, err := r.Shell("mkdir", remotePKIDirsCmd(r.Path(etcLitevirtRemote), r.Path(remotePKIDir), r.Path(remoteMigrationDir))); err != nil {
 		return fmt.Errorf("create remote PKI dir: %w", err)
 	}
 	// The attempt's record of what the machine served before the admission,
@@ -1377,6 +1390,9 @@ type LocalAddTarget struct {
 	// Events are what reached the host, in order: "write <path>",
 	// "run <cmd>" and "sh <kind>".
 	Events []string
+	// DaemonState is what `systemctl is-active litevirt.service` answers on
+	// the machine ("" is inactive).
+	DaemonState string
 }
 
 func (d *LocalAddTarget) Path(path string) string {
@@ -1438,6 +1454,13 @@ func (d *LocalAddTarget) WriteFile(path string, data []byte, mode os.FileMode) e
 
 func (d *LocalAddTarget) Shell(kind, cmd string) ([]byte, error) {
 	d.Events = append(d.Events, "sh "+kind)
+	if kind == daemonProbeKind {
+		// Not the unit of the machine running the test.
+		if d.DaemonState == "" {
+			return []byte("inactive\n"), nil
+		}
+		return []byte(d.DaemonState + "\n"), nil
+	}
 	out, err := exec.Command("sh", "-c", cmd).Output()
 	if err != nil {
 		return out, fmt.Errorf("%s: %w", kind, err)

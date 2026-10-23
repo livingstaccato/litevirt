@@ -76,7 +76,6 @@ make build
 # Single-node setup
 sudo cp bin/litevirt /usr/local/bin/
 sudo lv host init --local --name node-1
-sudo systemctl enable --now litevirt
 
 # Run a VM
 export LV_HOST=root@127.0.0.1

@@ -41,10 +41,9 @@ The fastest way to get started — run everything on one machine:
 sudo cp bin/litevirt /usr/local/bin/
 sudo ln -sf /usr/local/bin/litevirt /usr/local/bin/lv
 sudo litevirt host init --local --name node-1
-sudo systemctl enable --now litevirt.service
 ```
 
-This generates the PKI, installs dependencies (libvirt, QEMU), writes the config, and sets up the systemd unit — all locally, no SSH needed.
+This generates the PKI, installs dependencies (libvirt, QEMU), writes the config, and sets up the systemd unit — all locally, no SSH needed. It also enables and starts `litevirt.service`, and says so; there is nothing more to start.
 
 ```bash
 export LV_HOST=root@127.0.0.1
@@ -66,23 +65,18 @@ export LV_HOST=root@10.0.50.10
 lv host init root@10.0.50.10 --name host-a
 ```
 
-This generates the cluster PKI (CA + host certificate), creates `/etc/litevirt/config.yaml`, and installs a systemd unit.
+This generates the cluster PKI (CA + host certificate), creates `/etc/litevirt/config.yaml`, and installs, enables and starts the systemd unit.
 
 `lv host init` is for the first host only. It refuses a target that is already a
 member: one whose `join_peers` lists peers, or one whose address the cluster this
 CLI is configured for lists beside other hosts. The second check is what catches
 the first host itself, whose `join_peers` stays empty when later hosts are added
 from a workstation. A member that lost its disk is removed with `lv host rm` and
-added back with `lv host add`.
+added back with `lv host add`. It also refuses a target holding another
+cluster's state, as `lv host add` does (see [Add hosts to the cluster](#add-hosts-to-the-cluster)),
+and `--force` does not override that check.
 
-3. SSH into the host and start the daemon:
-
-```bash
-ssh root@10.0.50.10
-systemctl enable --now litevirt
-```
-
-4. Verify the cluster is running:
+3. Verify the cluster is running:
 
 ```bash
 lv status
@@ -138,6 +132,48 @@ it is down to every peer by construction, and runs nothing. A host removed
 with `lv host rm` and added back under the same name starts with no failure
 history; every peer forgets the old machine's failed probes when it leaves the
 host table.
+
+`lv host add` refuses a machine that holds another cluster's litevirt state,
+before anything is admitted or pushed. A machine that founded its own cluster
+with `lv host init --local` is the usual case: adding it would merge that
+cluster's users (a second `admin`), audit history, capability latches and
+gossip key into this one. The proof that state belongs to this cluster is
+the host identity the daemon loads from the config's `pki_dir`
+(`/etc/litevirt/pki` when it names none): a `host.crt` that chains to this
+cluster's CA and is a host certificate (ServerAuth usage, not the lv-cli
+client or an audit certificate), and a `host.key` beside it that is its key.
+Certificates are public, so a certificate alone proves nothing. The machine
+proves it holds the key by signing a random, domain-separated challenge
+with `openssl` there, bounded by a 30-second timeout; where it has no
+`openssl`, or that run fails or times out, the key is read over the same
+root SSH session, compared in memory, and never written or logged. A
+`host.key` that is not a regular file (a device, a FIFO, or a link to one)
+is refused before `openssl` runs. The add refuses:
+
+- a `ca.crt` in `/etc/litevirt/pki` or the config's `pki_dir` holding any CA
+  but this cluster's (a bundle with another CA in it included), or a CA key
+  with no certificate beside it;
+- a `state.db` or capability latches (`split_brain_activated.*`) in the data
+  dir (`data_dir`, `/var/lib/litevirt` by default), or a running
+  `litevirt.service`, without that proof: no `host.crt`, one another CA
+  issued, one that is not a host certificate, or no `host.key`, an
+  unreadable one or one that is not its key;
+- a `config.yaml` it cannot read or parse, since then it cannot tell where the
+  state or the host identity lives.
+
+An add that failed after the cluster admitted the host, whose daemon may
+already have started, and whose rollback left no `host.crt`, is finished by
+running it again: the admitted pair it left staged on the machine is the
+proof. A `host.crt` that is present always has to prove itself.
+
+There is no override. The refusal names what it found and the two ways
+forward: stop and disable `litevirt.service` on the machine and move
+`/etc/litevirt`, the data dir, `/root/.config/litevirt` and `/etc/pki/qemu`
+aside, then add it again as a new machine; or join in the other direction,
+adding this cluster's machines to the one it founded. A host removed with
+`lv host rm` keeps its host certificate, revoked but issued by this cluster's
+CA, and its files, so it is added back as before, with its database and even
+a daemon still running.
 
 `lv host add` uploads the binary and the host's credentials to staged paths
 on the machine, and moves them into place only once the cluster has admitted

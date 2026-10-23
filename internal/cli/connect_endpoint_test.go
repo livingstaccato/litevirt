@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/litevirt/litevirt/internal/endpointfile"
 )
 
 // TestMain keeps every test off this machine's real /run/litevirt/endpoint
@@ -15,13 +17,26 @@ import (
 func TestMain(m *testing.M) {
 	endpointPath = filepath.Join(os.TempDir(), "litevirt-cli-test-no-endpoint", "endpoint")
 	cliNotice = io.Discard
+	// A test cannot create root's files: the endpoint files these tests
+	// write are this user's (endpointfile tests the owner check itself).
+	endpointfile.SetReaderOwnerForTest(os.Getuid())
 	os.Exit(m.Run())
 }
 
 func useEndpointFile(t *testing.T, body string) string {
 	t.Helper()
-	p := filepath.Join(t.TempDir(), "endpoint")
+	dir := filepath.Join(t.TempDir(), "run")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil { // not the umask's: a group-writable dir is refused
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "endpoint")
 	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	old := endpointPath
@@ -128,5 +143,28 @@ func writeUserBundle(t *testing.T, dir string) {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// An endpoint file someone other than its owner could have written is a
+// trust anchor nobody vouches for: lv ignores it, says so, and goes on.
+//
+// Mutation: drop the mode check in endpointfile.Read: red.
+func TestLoadClusterConfig_AnEndpointFileOthersCanWriteIsIgnored(t *testing.T) {
+	readableDaemonConfig(t, "grpc_port: 9443\npki_dir: /cfg/pki\n")
+	p := useEndpointFile(t, "grpc_port: 9555\npki_dir: /attacker/pki\n")
+	if err := os.Chmod(p, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	notices := captureNotices(t)
+	cfg, err := LoadClusterConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PKIDir != "/cfg/pki" || cfg.GRPCPort != 9443 {
+		t.Fatalf("cfg = %+v: an endpoint file others can write was trusted", cfg)
+	}
+	if !strings.Contains(notices.String(), "ignoring") || !strings.Contains(notices.String(), "writable") {
+		t.Errorf("notice = %q, want it to say the file is ignored as writable by others", notices)
 	}
 }

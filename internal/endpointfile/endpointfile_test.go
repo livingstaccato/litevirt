@@ -6,11 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
 func TestRead_RoundTrip(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "endpoint")
+	p := filepath.Join(privDir(t), "endpoint")
 	if err := Write(p, Endpoint{GRPCPort: 9443, PKIDir: "/etc/litevirt/pki"}); err != nil {
 		t.Fatal(err)
 	}
@@ -21,7 +22,7 @@ func TestRead_RoundTrip(t *testing.T) {
 }
 
 func TestRead_MissingIsNotExist(t *testing.T) {
-	if _, err := Read(filepath.Join(t.TempDir(), "endpoint")); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := Read(filepath.Join(privDir(t), "endpoint")); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("Read of a missing file = %v, want fs.ErrNotExist", err)
 	}
 }
@@ -42,7 +43,7 @@ func TestRead_RefusesAMalformedFile(t *testing.T) {
 		"too large":      "grpc_port: 7443\npki_dir: /etc/litevirt/pki\n#" + strings.Repeat("x", maxSize),
 	} {
 		t.Run(name, func(t *testing.T) {
-			p := filepath.Join(t.TempDir(), "endpoint")
+			p := filepath.Join(privDir(t), "endpoint")
 			if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -54,11 +55,149 @@ func TestRead_RefusesAMalformedFile(t *testing.T) {
 }
 
 func TestWrite_RefusesWhatReadWouldRefuse(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "endpoint")
+	p := filepath.Join(privDir(t), "endpoint")
 	if err := Write(p, Endpoint{GRPCPort: 0, PKIDir: "/x"}); err == nil {
 		t.Fatal("wrote port 0")
 	}
 	if _, err := os.Stat(p); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("a refused write left a file: %v", err)
 	}
+}
+
+// TestMain lets Read accept this test user's files: a test cannot create
+// root's. TestRead_RefusesAFileNotOwnedByTheRequiredUser checks the owner.
+func TestMain(m *testing.M) {
+	SetReaderOwnerForTest(os.Getuid())
+	os.Exit(m.Run())
+}
+
+// goodEndpoint writes a valid file the way the daemon does, in a fresh
+// directory, and returns its path.
+func goodEndpoint(t *testing.T) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "run", "endpoint")
+	if err := Write(p, Endpoint{GRPCPort: 7443, PKIDir: "/etc/litevirt/pki"}); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// The file is a trust anchor (its pki_dir is the CA lv verifies against,
+// before it sends a token): only a regular file owned by root and writable
+// by root alone, in such a directory, is read.
+//
+// Mutations: skip the owner check, the mode check, the directory check, or
+// follow a symlink: the matching case red.
+func TestRead_RefusesAFileSomeoneElseCouldHaveWritten(t *testing.T) {
+	cases := map[string]func(t *testing.T, p string){
+		"owned by another user": func(t *testing.T, p string) {
+			t.Cleanup(SetReaderOwnerForTest(os.Getuid() + 1))
+		},
+		"group-writable file": func(t *testing.T, p string) {
+			if err := os.Chmod(p, 0o664); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"other-writable file": func(t *testing.T, p string) {
+			if err := os.Chmod(p, 0o646); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"group-writable directory": func(t *testing.T, p string) {
+			if err := os.Chmod(filepath.Dir(p), 0o775); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"other-writable directory": func(t *testing.T, p string) {
+			if err := os.Chmod(filepath.Dir(p), 0o757); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"a symlink to a good file": func(t *testing.T, p string) {
+			real := filepath.Join(filepath.Dir(p), "real")
+			if err := os.Rename(p, real); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(real, p); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"a directory that is a symlink": func(t *testing.T, p string) {
+			dir := filepath.Dir(p)
+			real := dir + ".real"
+			if err := os.Rename(dir, real); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(real, dir); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	for name, spoil := range cases {
+		t.Run(name, func(t *testing.T) {
+			p := goodEndpoint(t)
+			if _, err := Read(p); err != nil {
+				t.Fatalf("fixture: %v", err)
+			}
+			spoil(t, p)
+			if e, err := Read(p); err == nil || errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("Read = %+v, %v; want a refusal", e, err)
+			}
+		})
+	}
+}
+
+// The writer refuses a directory the reader would refuse, and writes
+// nothing there. A directory it creates is 0755 whatever the umask: under
+// 077 it would be 0700, and no non-root lv could reach the file.
+//
+// Mutations: skip the writer's directory check: the first case red. Leave
+// a new directory to the umask: the second red.
+func TestWrite_RefusesADirectoryOthersCanWrite(t *testing.T) {
+	t.Run("group-writable", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "run")
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, 0o775); err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(dir, "endpoint")
+		if err := Write(p, Endpoint{GRPCPort: 7443, PKIDir: "/etc/litevirt/pki"}); err == nil {
+			t.Fatal("wrote into a group-writable directory")
+		}
+		if ents, _ := os.ReadDir(dir); len(ents) != 0 {
+			t.Fatalf("a refused write left %v", ents)
+		}
+	})
+	t.Run("created under umask 077", func(t *testing.T) {
+		// 0700 would keep every non-root lv out of it.
+		old := syscall.Umask(0o077)
+		defer syscall.Umask(old)
+		p := filepath.Join(t.TempDir(), "run", "endpoint")
+		if err := Write(p, Endpoint{GRPCPort: 7443, PKIDir: "/etc/litevirt/pki"}); err != nil {
+			t.Fatal(err)
+		}
+		fi, err := os.Stat(filepath.Dir(p))
+		if err != nil || fi.Mode().Perm() != 0o755 {
+			t.Fatalf("directory = %v, %v; want 0755", fi.Mode(), err)
+		}
+		if _, err := Read(p); err != nil {
+			t.Fatalf("Read of what Write made: %v", err)
+		}
+	})
+}
+
+// privDir is a fresh directory only its owner can write, as /run/litevirt
+// is: t.TempDir follows the umask, and a group-writable one is refused.
+func privDir(t *testing.T) string {
+	t.Helper()
+	d := filepath.Join(t.TempDir(), "run")
+	if err := os.Mkdir(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return d
 }

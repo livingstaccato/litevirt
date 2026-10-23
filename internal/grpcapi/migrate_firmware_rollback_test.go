@@ -46,6 +46,11 @@ type firmwareTargetPeer struct {
 	// it ignores attempt_id, replies with what decodes as an empty response,
 	// and does not implement RollbackFirmwareState.
 	oldBuild bool
+	// ignoreVars makes the target a build from before libvirt_vars: it does
+	// not see the field and so never echoes its hash.
+	ignoreVars bool
+	// sawVars is the size of the libvirt_vars each EnsureFirmwareState carried.
+	sawVars []int
 
 	mu sync.Mutex
 	// srcCtx is the source daemon calling the target: a trusted peer.
@@ -70,12 +75,21 @@ func (p *firmwareTargetPeer) EnsureFirmwareState(_ context.Context, req *pb.Ensu
 		r.AttemptId = "" // an unknown field to an older build
 	}
 	p.mu.Lock()
+	p.sawVars = append(p.sawVars, len(req.LibvirtVars))
+	if p.ignoreVars {
+		r.LibvirtVars, r.LibvirtVarsSha256 = nil, ""
+	}
+	p.mu.Unlock()
+	p.mu.Lock()
 	p.ensureAttempts = append(p.ensureAttempts, req.AttemptId)
 	hook := p.afterEnsure
 	p.mu.Unlock()
 	resp, err := p.dst.EnsureFirmwareState(p.srcCtx, r)
 	if p.oldBuild && err == nil {
 		resp = &pb.EnsureFirmwareStateResponse{} // google.protobuf.Empty on the wire
+	}
+	if p.ignoreVars && err == nil && resp != nil {
+		resp = &pb.EnsureFirmwareStateResponse{DomainDefined: resp.DomainDefined}
 	}
 	if hook != nil {
 		return hook(resp, err)

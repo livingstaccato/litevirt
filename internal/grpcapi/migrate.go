@@ -2028,9 +2028,13 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 // It reports what the call left on the target, for the rollback of a failure
 // before the handoff commits (abandonFirmwareTarget). attempt names this
 // migration attempt to the target, which records the domain it defines under it.
-func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vmName string, fs firmwareSpec, domainXML, attempt string, vars []byte) (firmwareTargetOutcome, error) {
+func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vmName string, fs firmwareSpec, domainXML, attempt string, vars []byte) (firmwareTargetOutcome, string, error) {
 	req := &pb.EnsureFirmwareStateRequest{VmName: vmName, DomainXml: domainXML, AttemptId: attempt,
 		SharesWeight: int32(s.vmSharesWeight(ctx, vmName))}
+	// The VM's uuid names the attempt's record on the target whatever the
+	// firmware: its rollback is addressed by it, and a plain VM's (no uuid sent)
+	// never matched, leaving the domain and the vars it wrote behind.
+	req.Uuid = fs.UUID
 	// A plain UEFI VM's libvirt vars: the target holds them, verified by hash,
 	// or the move does not go on (the source's copy is removed only after).
 	if len(vars) > 0 {
@@ -2040,15 +2044,15 @@ func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vm
 		// Per-component preflight: never push a PARTIAL bundle (WriteFirmwareBundle
 		// alone would accept NVRAM-only or swtpm-only) — that restores a fresh TPM.
 		if err := s.firmwarePresent(vmName, fs); err != nil {
-			return fwTargetUntouched, err
+			return fwTargetUntouched, "", err
 		}
 		var buf bytes.Buffer
 		has, err := s.fw().WriteFirmwareBundle(vmName, fs.UUID, &buf)
 		if err != nil {
-			return fwTargetUntouched, status.Errorf(codes.Internal, "capture firmware state for %q: %v", vmName, err)
+			return fwTargetUntouched, "", status.Errorf(codes.Internal, "capture firmware state for %q: %v", vmName, err)
 		}
 		if !has {
-			return fwTargetUntouched, status.Errorf(codes.FailedPrecondition,
+			return fwTargetUntouched, "", status.Errorf(codes.FailedPrecondition,
 				"firmware state for %q is not present on this host; cannot migrate it consistently", vmName)
 		}
 		req.Uuid = fs.UUID
@@ -2057,19 +2061,19 @@ func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vm
 	}
 	client, closeConn, err := s.dialPeer(ctx, targetHost)
 	if err != nil {
-		return fwTargetUntouched, status.Errorf(codes.Unavailable, "cannot reach target host %s to define the VM: %v", targetHost, err)
+		return fwTargetUntouched, "", status.Errorf(codes.Unavailable, "cannot reach target host %s to define the VM: %v", targetHost, err)
 	}
 	defer closeConn()
 	resp, err := client.EnsureFirmwareState(ctx, req)
 	if err != nil && len(req.Bundle) == 0 && status.Code(err) == codes.InvalidArgument &&
 		strings.Contains(status.Convert(err).Message(), oldTargetBundleRequired) {
 		// An older target's first check: it refused before defining anything.
-		return fwTargetUntouched, targetTooOldForColdMigration(targetHost, vmName)
+		return fwTargetUntouched, "", targetTooOldForColdMigration(targetHost, vmName)
 	}
 	if err != nil {
 		// The target may have defined the domain before the call failed: a
 		// cancelled request loses the answer, not the define.
-		return fwTargetUnknown, status.Errorf(codes.Internal, "define VM %q on %s: %v", vmName, targetHost, err)
+		return fwTargetUnknown, "", status.Errorf(codes.Internal, "define VM %q on %s: %v", vmName, targetHost, err)
 	}
 	if len(vars) > 0 && resp.GetLibvirtVarsSha256() != varsSHA256(vars) {
 		// An older target ignores the field and answers none: the VM would
@@ -2079,14 +2083,14 @@ func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vm
 		if resp.GetDomainDefined() {
 			out = fwTargetDefined
 		}
-		return out, status.Errorf(codes.FailedPrecondition,
+		return out, "", status.Errorf(codes.FailedPrecondition,
 			"%s did not confirm it holds the UEFI vars of VM %q (it answered %q; an older build ignores them); nothing was changed. "+
 				"Upgrade %s, or start the VM and migrate it live", targetHost, vmName, resp.GetLibvirtVarsSha256(), targetHost)
 	}
 	if !resp.GetDomainDefined() {
-		return fwTargetUnreported, nil
+		return fwTargetUnreported, resp.GetLibvirtVarsSha256(), nil
 	}
-	return fwTargetDefined, nil
+	return fwTargetDefined, resp.GetLibvirtVarsSha256(), nil
 }
 
 // pciMoveRoute is the route that moves a VM holding a PCI passthrough device:
@@ -2305,16 +2309,15 @@ func (s *Server) coldMigrateStoppedVM(ctx context.Context, vm *corrosion.VMRecor
 	// keeps them outside the firmware store, and the source's file is the only
 	// copy until the target has confirmed its own by hash.
 	var sentVars []byte
-	if !fwSpec.SecureBoot && !fwSpec.Tpm {
+	// Only a VM whose current definition is plain UEFI has libvirt-managed
+	// vars: a BIOS VM's stale file is not its state and is neither sent nor
+	// a reason for an older target to refuse.
+	if !fwSpec.SecureBoot && !fwSpec.Tpm && fwSpec.hasNvram() {
 		if sentVars, err = s.readSourceLibvirtVars(vm.Name, domXML); err != nil {
 			return err
 		}
 	}
-	sentVarsSHA := ""
-	if len(sentVars) > 0 {
-		sentVarsSHA = varsSHA256(sentVars)
-	}
-	outcome, err := s.ensureFirmwareStateOnTarget(ctx, targetHost.Name, vm.Name, fwSpec, domXML, attempt, sentVars)
+	outcome, confirmedVarsSHA, err := s.ensureFirmwareStateOnTarget(ctx, targetHost.Name, vm.Name, fwSpec, domXML, attempt, sentVars)
 	if err != nil {
 		return s.abandonFirmwareTarget(ctx, targetHost.Name, vm.Name, fwSpec.UUID, attempt, outcome, err)
 	}
@@ -2370,8 +2373,10 @@ func (s *Server) coldMigrateStoppedVM(ctx context.Context, vm *corrosion.VMRecor
 	// The copies on the target are the VM's disks now; the source's are orphans.
 	s.removeColdMigratedSourceDisks(ctx, vm.Name, copied)
 	s.cleanupPostMigration(vm.Name)
-	if sentVarsSHA != "" {
-		s.removeMigratedSourceVars(ctx, vm.Name, sentVarsSHA)
+	// The hash the target answered, not the one sent: the file goes only while
+	// it is still what the target confirmed it holds.
+	if len(sentVars) > 0 && confirmedVarsSHA != "" {
+		s.removeMigratedSourceVars(ctx, vm.Name, confirmedVarsSHA)
 	}
 
 	_ = send(pb.MigratePhase_MIGRATE_CUTOVER, 100, 0)

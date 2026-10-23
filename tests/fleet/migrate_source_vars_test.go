@@ -131,7 +131,10 @@ func TestFleet_ColdMigrationCarriesThePlainUEFIVarsAndRemovesTheSourceCopy(t *te
 // A cold move that fails after the vars reached the target (here, the target's
 // define) keeps the source's file and leaves nothing of the attempt on the target.
 //
-// Mutation: remove the source's file before the handoff; the source's bytes go.
+// This is a guard test, not a regression test: the base commit also keeps the
+// source's file on a failed move. It pins that the carry-and-confirm protocol
+// never moves the removal ahead of the commit. Mutation: remove the source's
+// file before the handoff; the source's bytes go.
 func TestFleet_FailedColdMigrationKeepsThePlainUEFIVarsOnTheSource(t *testing.T) {
 	sc := newColdStoppedScenario(t)
 	vars := map[string]string{}

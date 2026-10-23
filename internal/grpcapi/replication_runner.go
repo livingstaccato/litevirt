@@ -66,6 +66,14 @@ func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupSched
 		// line, and reported as neither a success nor a failure (spec §6.9).
 		return nil
 	}
+	var notOwner *notOwnerNowError
+	if errors.As(err, &notOwner) {
+		// A host back from a fence or partition still sees the VM's row on
+		// itself until it catches up, and the VM may have moved: skipped,
+		// neither a failure nor an outcome, and the schedule row is the
+		// owner's to record.
+		return fmt.Errorf("%w: %v", scheduler.ErrRunSkipped, err)
+	}
 	s.replicationOutcome(ctx, sched, "vm", vm.Name, tenancy.NormalizeProject(vm.Project), sched.TargetHost, sched.TargetPool, "", err)
 	return err
 }

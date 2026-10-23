@@ -73,7 +73,9 @@ member: one whose `join_peers` lists peers, or one whose address the cluster thi
 CLI is configured for lists beside other hosts. The second check is what catches
 the first host itself, whose `join_peers` stays empty when later hosts are added
 from a workstation. A member that lost its disk is removed with `lv host rm` and
-added back with `lv host add`.
+added back with `lv host add`. It also refuses a target holding another
+cluster's state, as `lv host add` does (see [Add hosts to the cluster](#add-hosts-to-the-cluster)),
+and `--force` does not override that check.
 
 3. SSH into the host and start the daemon:
 
@@ -138,6 +140,32 @@ it is down to every peer by construction, and runs nothing. A host removed
 with `lv host rm` and added back under the same name starts with no failure
 history; every peer forgets the old machine's failed probes when it leaves the
 host table.
+
+`lv host add` refuses a machine that holds another cluster's litevirt state,
+before anything is admitted or pushed. A machine that founded its own cluster
+with `lv host init --local` is the usual case: adding it would merge that
+cluster's users (a second `admin`), audit history, capability latches and
+gossip key into this one. The proof that state belongs to this cluster is
+this cluster's CA certificate in `/etc/litevirt/pki/ca.crt` (and in the
+config's `pki_dir`, when it names another). The add refuses:
+
+- a CA certificate that is not this cluster's, or a CA key with no
+  certificate beside it;
+- a `state.db` or capability latches (`split_brain_activated.*`) in the data
+  dir (`data_dir`, `/var/lib/litevirt` by default), or a running
+  `litevirt.service`, with no CA certificate of this cluster's;
+- with this cluster's CA, a host certificate that another CA issued while
+  that state is there;
+- a `config.yaml` it cannot read or parse, since then it cannot tell where the
+  state lives.
+
+There is no override. The refusal names what it found and the two ways
+forward: stop and disable `litevirt.service` on the machine and move
+`/etc/litevirt`, the data dir, `/root/.config/litevirt` and `/etc/pki/qemu`
+aside, then add it again as a new machine; or join in the other direction,
+adding this cluster's machines to the one it founded. A host removed with
+`lv host rm` keeps this cluster's CA certificate and its files, so it is
+added back as before, with its database and even a daemon still running.
 
 `lv host add` uploads the binary and the host's credentials to staged paths
 on the machine, and moves them into place only once the cluster has admitted

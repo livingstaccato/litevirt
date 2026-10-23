@@ -86,10 +86,8 @@ func HostInitResolved(ctx context.Context, sshTarget string, rt *ssh.Target, hos
 	if err != nil && !force {
 		return err
 	}
-	if !absent {
-		if err := refuseIfAlreadyAMember(sshTarget, []byte(existingCfg), force); err != nil {
-			return err
-		}
+	if err := initPreflight(&sshAddRemote{sshRemotePKI{sc: sc}}, sshTarget, existingCfg, absent, force); err != nil {
+		return err
 	}
 
 	pkiDir := PKIDir()
@@ -205,6 +203,25 @@ func HostInitResolved(ctx context.Context, sshTarget string, rt *ssh.Target, hos
 	fmt.Printf("Host %s initialized successfully at %s\n", hostName, hostAddr)
 	fmt.Printf("  gRPC endpoint: %s:7443 (mTLS)\n", hostAddr)
 	return nil
+}
+
+// initPreflight is what `lv host init root@...` checks on the target before
+// anything is minted or pushed: that it is no other cluster's member
+// (refuseIfAlreadyAMember, which --force overrides), and that it holds no
+// state of a cluster this machine's CA did not found (refuseForeignState,
+// which nothing overrides: init would push this CA over it and keep its
+// database).
+func initPreflight(m stateProbe, sshTarget, existingCfg string, absent, force bool) error {
+	if !absent {
+		if err := refuseIfAlreadyAMember(sshTarget, []byte(existingCfg), force); err != nil {
+			return err
+		}
+	}
+	ca, err := localCA(PKIDir())
+	if err != nil {
+		return fmt.Errorf("read this machine's cluster CA: %w", err)
+	}
+	return refuseForeignState(m, ca, sshTarget, "init")
 }
 
 // AuditRejoinFile is the CA-signed admission record `lv host add` writes into a

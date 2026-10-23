@@ -298,6 +298,15 @@ func hostAddTo(ctx context.Context, c pb.LiteVirtClient, r addRemote, p hostAddP
 			}
 		}
 	}
+	// Another cluster's state on the machine (one that founded its own with
+	// `lv host init --local`) is never merged into this one.
+	ca, err := localCA(p.pkiDir)
+	if err != nil {
+		return fmt.Errorf("read the cluster CA: %w", err)
+	}
+	if err := refuseForeignState(r, ca, p.hostName+" at "+p.hostAddr, "add"); err != nil {
+		return err
+	}
 	// Checked again right before the install (refuseSecondInstall); here,
 	// so that a machine this add may not install on gets no admission and
 	// no staged file of it.
@@ -1377,6 +1386,9 @@ type LocalAddTarget struct {
 	// Events are what reached the host, in order: "write <path>",
 	// "run <cmd>" and "sh <kind>".
 	Events []string
+	// DaemonState is what `systemctl is-active litevirt.service` answers on
+	// the machine ("" is inactive).
+	DaemonState string
 }
 
 func (d *LocalAddTarget) Path(path string) string {
@@ -1438,6 +1450,13 @@ func (d *LocalAddTarget) WriteFile(path string, data []byte, mode os.FileMode) e
 
 func (d *LocalAddTarget) Shell(kind, cmd string) ([]byte, error) {
 	d.Events = append(d.Events, "sh "+kind)
+	if kind == daemonProbeKind {
+		// Not the unit of the machine running the test.
+		if d.DaemonState == "" {
+			return []byte("inactive\n"), nil
+		}
+		return []byte(d.DaemonState + "\n"), nil
+	}
 	out, err := exec.Command("sh", "-c", cmd).Output()
 	if err != nil {
 		return out, fmt.Errorf("%s: %w", kind, err)

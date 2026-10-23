@@ -1914,6 +1914,62 @@ adoptions, and the token is advertised regardless. It keeps the rollback below
 `release_2027_01_v1` open only while it is false on every host (see the release
 token above).
 
+### Pool trust after upgrade
+
+A host acts on a storage pool row naming it only when it stands behind the row:
+`config.yaml` defines the pool, the host created it or an operator confirmed it
+there (its local ledger, `<data_dir>/pool-trust.json`), or it is a `local` or
+`dir` pool in the daemon's own `disks/`, `pools/` or `mounts/` areas (see
+[storage.md](storage.md#which-pool-rows-a-host-acts-on)). The first start of a
+build with the ledger adopts the host's existing pools into it, once. It needs
+no coordination: each host judges only its own rows, and a host still on the
+older build acts on every row naming it, as before.
+
+**Adopted automatically:**
+
+- pools in `config.yaml`, and the implicit default pool when it names none;
+- the daemon's own default pool and global ISO library;
+- `local` and `dir` pools in the daemon's own areas, used or empty;
+- a pool outside the areas whose directory directly holds a qcow2 disk of one
+  of this host's VMs recorded on it;
+- an `nfs` pool whose export is mounted at that first start and directly holds
+  such a disk, or, for one mounted in `<data_dir>/mounts/`, is mounted there.
+  An `nfs` pool whose export is not mounted then — upgraded together with a
+  reboot, before litevirt mounted it — is judged once more, by the same rule,
+  the first time its export mounts: the daemon mounts it hardened at a staging
+  point in `<data_dir>/mounts/`, reads the disk, and unmounts it.
+
+**Held untrusted** — nothing on the host shows the pool is its own, and a row
+with nothing behind it is indistinguishable from one another member forged:
+
+- an empty pool outside the areas;
+- a pool of raw images or ISOs only, or whose disks are in subdirectories;
+- an `nfs` pool whose export, once mounted, holds none of this host's disks;
+- a pool created while the host was rolled back to a build without the ledger:
+  the adoption has already run, and that build recorded nothing.
+
+A held pool is not used for anything: VMs with disks on it are refused at
+start, and it is not mounted, written, listed or swept. After rolling each
+host, look for `pool_row_untrusted`:
+
+```bash
+lv health                                       # pool_row_untrusted, per host
+```
+
+Its evidence names each held pool with its driver, source, target and why. For
+each one that is yours, confirm it on its host:
+
+```bash
+lv pool trust vmstore --host host-b             # shows host-b's row, asks y/N
+lv pool trust vmstore --host host-b \
+    --expect-driver dir --expect-target /srv/vmstore   # from a script
+```
+
+Without a terminal, give every value the row has — `--expect-source` and
+`--expect-mount-options` too when it has them — exactly as the pool's host
+shows them. One you did not make, delete with
+`lv pool delete <pool> --host <host>`, which removes only the row.
+
 ### Console passwords start after the roll
 
 This release gives each VM's VNC and SPICE consoles a per-VM password

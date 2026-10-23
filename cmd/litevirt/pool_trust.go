@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -86,7 +87,7 @@ does, and is audited as storage.pool.trust, refusals included.`,
 func runPoolTrust(ctx context.Context, c pb.LiteVirtClient, name, host string, exp poolTrustExpect, interactive bool, in io.Reader, out io.Writer) error {
 	prev, err := c.TrustStoragePool(ctx, &pb.TrustStoragePoolRequest{Name: name, Host: host, Preview: true})
 	if err != nil {
-		return fmt.Errorf("read the pool's row on its host: %s", termSafe(err.Error()))
+		return fmt.Errorf("read the pool's row on its host: %s", show(err.Error()))
 	}
 	p := prev.GetPool()
 	shown := trustValues{
@@ -94,13 +95,13 @@ func runPoolTrust(ctx context.Context, c pb.LiteVirtClient, name, host string, e
 		Driver: p.GetDriver(), Source: p.GetSource(), Target: p.GetTarget(), MountOptions: prev.GetMountOptions(),
 	}
 	fmt.Fprintf(out, "pool %s on %s:\n  driver:        %s\n  source:        %s\n  target:        %s\n  mount options: %s\n",
-		termSafe(shown.Name), termSafe(shown.Host), termSafe(shown.Driver), termSafe(orNone(shown.Source)),
-		termSafe(orNone(shown.Target)), termSafe(orNone(shown.MountOptions)))
+		show(shown.Name), show(shown.Host), show(shown.Driver), show(orNone(shown.Source)),
+		show(orNone(shown.Target)), show(orNone(shown.MountOptions)))
 	if prev.GetAlreadyTrusted() {
-		fmt.Fprintf(out, "already trusted by %s (%s); nothing to confirm\n", termSafe(shown.Host), termSafe(prev.GetTrustedAs()))
+		fmt.Fprintf(out, "already trusted by %s (%s); nothing to confirm\n", show(shown.Host), show(prev.GetTrustedAs()))
 		return nil
 	}
-	fmt.Fprintf(out, "not trusted by %s: %s\n", termSafe(shown.Host), termSafe(prev.GetWhy()))
+	fmt.Fprintf(out, "not trusted by %s: %s\n", show(shown.Host), show(prev.GetWhy()))
 
 	var confirmed trustValues
 	switch {
@@ -110,11 +111,11 @@ func runPoolTrust(ctx context.Context, c pb.LiteVirtClient, name, host string, e
 			return err
 		}
 	case interactive:
-		if f := shown.unprintable(); f != "" {
-			return fmt.Errorf("the row's %s holds a control or format character (shown escaped above), so what a terminal shows is not exactly the row; "+
-				"it is not confirmed interactively — check it and pass the exact values with --expect-driver, --expect-target, --expect-source and --expect-mount-options", f)
+		if why := shown.notConfirmable(); why != "" {
+			return fmt.Errorf("%s, so what a terminal shows is not exactly what would be recorded; "+
+				"it is not confirmed interactively — check it and pass the exact values with --expect-driver, --expect-target, --expect-source and --expect-mount-options", why)
 		}
-		fmt.Fprintf(out, "Once trusted, the daemon on %s writes in %s as root. Trust this row? [y/N] ", termSafe(shown.Host), termSafe(orNone(shown.Target)))
+		fmt.Fprintf(out, "Once trusted, the daemon on %s writes in %s as root. Trust this row? [y/N] ", show(shown.Host), show(orNone(shown.Target)))
 		line, _ := bufio.NewReader(in).ReadString('\n')
 		if a := strings.ToLower(strings.TrimSpace(line)); a != "y" && a != "yes" {
 			return errors.New("not confirmed; nothing was recorded")
@@ -128,23 +129,67 @@ func runPoolTrust(ctx context.Context, c pb.LiteVirtClient, name, host string, e
 		Driver: confirmed.Driver, Source: confirmed.Source, Target: confirmed.Target, MountOptions: confirmed.MountOptions,
 	})
 	if err != nil {
-		return fmt.Errorf("trust pool: %s", termSafe(err.Error()))
+		return fmt.Errorf("trust pool: %s", show(err.Error()))
 	}
-	fmt.Fprintf(out, "pool %s on %s is now trusted (%s)\n", termSafe(confirmed.Name), termSafe(confirmed.Host), termSafe(resp.GetTrustedAs()))
+	fmt.Fprintf(out, "pool %s on %s is now trusted (%s)\n", show(confirmed.Name), show(confirmed.Host), show(resp.GetTrustedAs()))
 	return nil
 }
 
-// unprintable names the first field of v holding a control or format
-// character, "" when none does.
-func (v trustValues) unprintable() string {
-	unsafe := func(r rune) bool { return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) }
+// trustFieldMax is the most of one field a terminal confirmation shows (and
+// accepts).
+const trustFieldMax = 1024
+
+// show is a field as the preview prints it: cut at trustFieldMax bytes, and
+// with every character that could drive or disguise the terminal escaped.
+func show(v string) string {
+	if len(v) > trustFieldMax {
+		v = fmt.Sprintf("%s…(%d more bytes)", strings.ToValidUTF8(v[:trustFieldMax], ""), len(v)-trustFieldMax)
+	}
+	return termSafe(v)
+}
+
+// plainRune reports whether r is plain printable text: printable ASCII, or a
+// visible graphic character — not a control, format, line or paragraph
+// separator, non-ASCII space, combining mark, default-ignorable or variation
+// selector, or blank filler. What a terminal shows of a field made of these
+// is exactly the field.
+func plainRune(r rune) bool {
+	switch {
+	case r >= 0x20 && r < 0x7f:
+		return true
+	case r < 0x80, !unicode.IsGraphic(r):
+		return false
+	case unicode.In(r, unicode.Zs, unicode.Mn, unicode.Me, unicode.Other_Default_Ignorable_Code_Point, unicode.Variation_Selector):
+		return false
+	case r == 0x2800, r == 0x3164, r == 0xFFA0, r == 0x115F, r == 0x1160:
+		return false
+	}
+	return true
+}
+
+// notConfirmable says why v cannot be confirmed by a y/N on a terminal, ""
+// when it can: a field that is not plain printable text, a field longer than
+// what is shown, or a target not in clean form (what is recorded and acted
+// on is the clean form).
+func (v trustValues) notConfirmable() string {
 	for _, f := range []struct{ name, val string }{
 		{"name", v.Name}, {"host", v.Host}, {"driver", v.Driver}, {"source", v.Source},
 		{"target", v.Target}, {"mount options", v.MountOptions},
 	} {
-		if strings.ContainsFunc(f.val, unsafe) {
-			return f.name
+		if strings.ContainsFunc(f.val, func(r rune) bool { return !plainRune(r) }) || !utf8.ValidString(f.val) {
+			return fmt.Sprintf("the row's %s holds a character that is not plain printable text (shown escaped above)", f.name)
 		}
+		if len(f.val) > trustFieldMax {
+			return fmt.Sprintf("the row's %s is %d bytes, more than the %d a confirmation shows", f.name, len(f.val), trustFieldMax)
+		}
+		// Runs of spaces, or spaces at an end, can pad a field into a
+		// look-alike line, or hide where it ends.
+		if strings.Contains(f.val, "  ") || strings.TrimSpace(f.val) != f.val {
+			return fmt.Sprintf("the row's %s has spaces at an end or in a run", f.name)
+		}
+	}
+	if v.Target != "" && filepath.Clean(v.Target) != v.Target {
+		return fmt.Sprintf("the row's target is not in clean form: it would be used as %q", show(filepath.Clean(v.Target)))
 	}
 	return ""
 }

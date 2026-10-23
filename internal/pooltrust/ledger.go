@@ -157,6 +157,11 @@ type ledgerFile struct {
 	// ledger written before it ran (the daemon recording its own pools, a
 	// create) does not stop it from running.
 	Adopted bool `json:"adopted"`
+	// PendingNFS are the nfs pools the adoption could not judge because
+	// their export was not mounted then (an upgrade together with a reboot):
+	// each is judged once more, on the first time its export mounts
+	// (PendingNFS, ResolvePending), by the same evidence.
+	PendingNFS map[string]Binding `json:"pending_nfs,omitempty"`
 }
 
 // Store is this host's pool trust: the config pools and the ledger.
@@ -169,6 +174,7 @@ type Store struct {
 	config      map[string]Binding
 	initialised bool   // the upgrade adoption ran on this host (or a ledger was lost: it never runs again)
 	corrupt     string // why the ledger could not be read, and where it was kept
+	pending     map[string]Binding
 }
 
 // Open reads the ledger in dataDir. A ledger that cannot be read or parsed
@@ -207,6 +213,12 @@ func Open(dataDir, pkiDir string) (*Store, error) {
 	for name, e := range lf.Pools {
 		e.Binding = e.Binding.normalized()
 		s.entries[name] = e
+	}
+	for name, b := range lf.PendingNFS {
+		if s.pending == nil {
+			s.pending = map[string]Binding{}
+		}
+		s.pending[name] = b.normalized()
 	}
 	if aside := s.asides(); len(aside) > 0 {
 		s.initialised = true
@@ -340,7 +352,7 @@ func (s *Store) Forget(name string) error {
 // writeLocked replaces the ledger file atomically: a 0600 dot-named temp in
 // the data directory, synced, renamed over it, and the directory synced.
 func (s *Store) writeLocked(entries map[string]Entry) error {
-	b, err := json.MarshalIndent(ledgerFile{Version: 1, Pools: entries, Adopted: s.initialised}, "", "  ")
+	b, err := json.MarshalIndent(ledgerFile{Version: 1, Pools: entries, Adopted: s.initialised, PendingNFS: s.pending}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -397,8 +409,80 @@ type Verdict struct {
 // own filesystem the daemon writes in or mounts over. A pool that names none
 // (ceph, iscsi, zfs, lvm-thin, a local pool on <data_dir>/disks) is not a
 // disk root a forged row could aim, and needs no trust.
+//
+// An nfs pool always needs it, with or without a target: it is a mount of an
+// export, which a forged row would choose, at the host's own mount point.
 func NeedsTrust(b Binding) bool {
+	if b.Driver == "nfs" {
+		return true
+	}
 	return len(storage.HostPathsOf(storage.Config{Driver: b.Driver, Source: b.Source, Target: b.Target}).WriteRoots) > 0
+}
+
+// IsConfigPool reports whether config.yaml defines pool name at the place
+// binding b names (driver, source, target): such a pool takes everything
+// else — an nfs pool's mount options above all — from config, never from
+// its row.
+func (s *Store) IsConfigPool(name string, b Binding) bool {
+	if s == nil {
+		return false
+	}
+	b = b.normalized()
+	s.mu.Lock()
+	cfg, ok := s.config[name]
+	s.mu.Unlock()
+	return ok && cfg.samePlace(b)
+}
+
+// PendingNFS is a copy of the nfs pools whose adoption waits for their
+// export to mount.
+func (s *Store) PendingNFS() map[string]Binding {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]Binding, len(s.pending))
+	for k, v := range s.pending {
+		out[k] = v
+	}
+	return out
+}
+
+// ResolvePending ends the wait of pending nfs pool name with binding b:
+// recorded in the ledger (how=upgrade) when adopt, and either way never
+// judged again. A pending entry for another binding is dropped too: the row
+// changed, and the change is no evidence.
+func (s *Store) ResolvePending(name string, b Binding, adopt bool) error {
+	b = b.normalized()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.pending[name]
+	if !ok {
+		return nil
+	}
+	nextPending := make(map[string]Binding, len(s.pending))
+	for k, v := range s.pending {
+		if k != name {
+			nextPending[k] = v
+		}
+	}
+	next := s.entries
+	if adopt && cur == b {
+		next = make(map[string]Entry, len(s.entries)+1)
+		for k, v := range s.entries {
+			next[k] = v
+		}
+		next[name] = Entry{Binding: b, How: HowUpgrade, At: time.Now().UTC().Format(time.RFC3339)}
+	}
+	prev := s.pending
+	s.pending = nextPending
+	if err := s.writeLocked(next); err != nil {
+		s.pending = prev
+		return err
+	}
+	s.entries = next
+	return nil
 }
 
 // Judge decides whether this host acts on its row of pool name with binding

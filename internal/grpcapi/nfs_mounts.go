@@ -117,7 +117,7 @@ func (s *Server) nfsPoolConfig(r corrosion.StoragePoolRecord) storage.Config {
 	// row is trusted on driver, source and target alone (pool_trust.go), so
 	// options a forger wrote into it must not reach the mount. None in
 	// config means none (the mount adds its hardening).
-	if s.poolTrustVerdict(r.Name, StoragePoolRef{Driver: r.Driver, Source: r.Source, Target: r.Target, Options: r.Options}).Why == pooltrust.TrustConfig {
+	if s.PoolTrust().IsConfigPool(r.Name, pooltrust.BindingOf(r.Driver, r.Source, r.Target, r.Options)) {
 		cfg.Options = nil
 		if ref, ok := s.lookupStoragePool(r.Name); ok && strings.EqualFold(ref.Driver, "nfs") && ref.Source == r.Source && ref.Target == r.Target {
 			cfg.Options = ref.Options
@@ -202,6 +202,7 @@ func (s *Server) ReconcileNFSMounts(ctx context.Context) {
 		s.reconcileNFSPool(ctx, r, tried)
 	}
 	s.resolveGoneNFSPoolConditions(ctx, live)
+	s.retryPendingNFSAdoptions(ctx)
 }
 
 // reconcileNFSPool checks one pool's mount (once per mount point in a pass:

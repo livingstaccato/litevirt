@@ -13,8 +13,9 @@ import (
 )
 
 // openPoolTrust opens this host's pool trust ledger, gives it the pools
-// config.yaml defines, and when there is no ledger file adopts the existing
-// pools this host's disk shows in use (pooltrust.AdoptOnUpgrade). A ledger
+// config.yaml defines, and until the ledger records that the adoption ran
+// adopts the existing pools this host's disk shows in use
+// (pooltrust.AdoptOnUpgrade). A ledger
 // that cannot be read is kept aside and trusts none of its entries; the
 // pools it held are named by pool_row_untrusted.
 //
@@ -43,16 +44,16 @@ func (d *Daemon) openPoolTrust(ctx context.Context) {
 	pt.SetConfig(cfg)
 	d.poolTrust = pt
 	if d.db != nil {
-		// The adoption first: it runs only while there is no ledger file, and
-		// recording the daemon's own pools writes one. Then the daemon's own
-		// rows, whatever the adoption made of them.
+		// The adoption first, then the daemon's own rows, whatever the
+		// adoption made of them. (The adoption runs until the ledger records
+		// that it ran, so the order is a second guard, not the only one.)
 		a, err := pt.AdoptOnUpgrade(ctx, d.db, d.cfg.HostName)
 		d.ensureOwnPoolsTrusted(ctx)
 		switch {
 		case err != nil:
 			slog.Error("storage pool trust: existing pools not adopted; retried at the next start", "error", err)
 		case a.Ran:
-			slog.Info("storage pool trust: no ledger file (first start with the ledger, or it was removed); existing pools adopted",
+			slog.Info("storage pool trust: upgrade adoption ran (the ledger did not record one: first start with the ledger, or it was removed); existing pools adopted",
 				"ledger", pt.Path(), "adopted", a.Adopted, "held_untrusted", a.Held)
 			for _, h := range a.Held {
 				slog.Warn("storage pool trust: an existing pool row is held untrusted; check it and confirm with `lv pool trust <pool>` if it is this host's", "pool", h)

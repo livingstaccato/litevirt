@@ -252,6 +252,19 @@ func MountNFSPool(ctx context.Context, dataDir string, cfg Config) error {
 	return nil
 }
 
+// UnmountNFSDir unmounts what is mounted at dir (umount -- dir), within the
+// NFS command timeout.
+func UnmountNFSDir(ctx context.Context, dir string) error {
+	uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultNFSCommandTimeout)
+	defer cancel()
+	out, err := nfsRunner()(uctx, "umount", "--", dir)
+	invalidateMountCache()
+	if err != nil {
+		return fmt.Errorf("umount %s: %v: %s", dir, err, trimmedNFSCommandOutput(out))
+	}
+	return nil
+}
+
 // openMountPoint opens dir as a directory, following no symlink at its last
 // component.
 func openMountPoint(dir string) (*os.File, error) {

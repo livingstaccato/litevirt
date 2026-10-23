@@ -26,12 +26,13 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/grpcapi"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // enforceGateWithWitness is enforceGate for a cluster that has a witness: the
 // witness's own ExecutionGate is not asked to pass (it never does, which is
 // the point), every other node's must.
-func enforceGateWithWitness(t *testing.T, c *Cluster, witness *Node) {
+func enforceGateWithWitness(t *testing.T, c *Cluster, witness *Node) map[string]*health.Checker {
 	t.Helper()
 	ctx := context.Background()
 	gates := gateAll(t, c)
@@ -58,6 +59,7 @@ func enforceGateWithWitness(t *testing.T, c *Cluster, witness *Node) {
 			t.Fatalf("%s: ExecutionGate refused an active worker with quorum: %s", n.Name, g.Reason)
 		}
 	}
+	return gates
 }
 
 func (sc *coldStoppedScenario) makeWitness(t *testing.T, n *Node) {

@@ -292,7 +292,7 @@ func (s *Server) promoteResolvedIn(ctx context.Context, req *pb.PromoteReplicaRe
 		}
 		if req.NewName != "" && req.NewName != vm.Name {
 			return status.Errorf(codes.FailedPrecondition,
-				"vm %q's replica is on host %q, a witness (role: %s) that runs no workloads: it can only be promoted there under the VM's own name (no --new-name), left stopped, and then moved to a worker with `lv migrate %s <worker-host> --cold`",
+				"vm %q's replica is on host %q, a witness (role: %s) that runs no workloads: it can only be promoted there under the VM's own name (no --new-name), which takes over the VM and is for a VM whose host is down; it is left stopped, and then moved to a worker with `lv migrate %s <worker-host> --cold`",
 				req.VmName, host, hr.Role, req.VmName)
 		}
 	}
@@ -689,7 +689,7 @@ func (s *Server) holdReplicaOnWitness(ctx context.Context, vm *corrosion.VMRecor
 
 // errReplicaOnWitness marks an automatic promotion held because its replica is
 // on a witness.
-var errReplicaOnWitness = fmt.Errorf("the replica is on a witness; %w", corrosion.ErrPromoteHeld)
+var errReplicaOnWitness = corrosion.ErrReplicaOnWitness
 
 // exampleWorker is the name of an active worker host other than skip, for the
 // command an operator is told to run; a placeholder when none can be read.
@@ -934,6 +934,12 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			return status.Errorf(codes.FailedPrecondition,
 				"promote refused: host %q is a witness and runs no workloads; an automatic promotion is never executed here", s.hostName)
 		}
+		// Active only: a promote lands a VM, which a witness being drained or
+		// in maintenance is not taking on.
+		if self.State != "active" {
+			return status.Errorf(codes.FailedPrecondition,
+				"promote refused: witness %q is %s, not active, and takes on no VM", s.hostName, self.State)
+		}
 		witnessPromote = true
 	}
 	var gateReason string
@@ -949,7 +955,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	}
 	if witnessPromote && req.NewName != "" && req.NewName != vm.Name {
 		return status.Errorf(codes.FailedPrecondition,
-			"promote of %s refused: host %q is a witness; it is promoted there only under its own name", vm.Name, s.hostName)
+			"promote of %s refused: host %q is a witness; it is promoted there only under its own name, which takes over the VM and is for a VM whose host is down", vm.Name, s.hostName)
 	}
 	// Under active enforcement an AUTOMATED (coordinator/relayed) promote MUST carry a
 	// proof — a proofless automated promote is refused. This keys off `automated`, NOT

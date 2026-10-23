@@ -88,7 +88,7 @@ func newWitnessReplica(t *testing.T) *witnessReplica {
 	}
 	a.Virt.SetState("db", libvirtfake.StateRunning)
 	sched := corrosion.BackupScheduleRecord{VMName: "db", Scope: "vm", Repo: "dr", Cron: "0 * * * *", Enabled: true,
-		Type: "replication", TargetPool: "dr", TargetHost: w.Name, KeepReplicas: 1}
+		Type: "replication", TargetPool: "dr", TargetHost: w.Name, KeepReplicas: 1, AutoPromote: true}
 	if err := corrosion.UpsertBackupSchedule(ctx, a.DB, sched); err != nil {
 		t.Fatal(err)
 	}
@@ -110,8 +110,15 @@ func (wr *witnessReplica) loseOwner(t *testing.T) {
 
 func (wr *witnessReplica) promote(t *testing.T) (string, error) {
 	t.Helper()
-	st, err := wr.c.SelfClient(wr.w).PromoteReplica(context.Background(), &pb.PromoteReplicaRequest{
-		VmName: "db", TargetHost: wr.w.Name, TargetPool: "dr", Force: true, AcceptNotPointInTime: true,
+	return wr.promoteVia(t, wr.w, "")
+}
+
+// promoteVia sends the operator's promote to entry, which relays it to the
+// witness when entry is not the witness.
+func (wr *witnessReplica) promoteVia(t *testing.T, entry *Node, newName string) (string, error) {
+	t.Helper()
+	st, err := wr.c.SelfClient(entry).PromoteReplica(context.Background(), &pb.PromoteReplicaRequest{
+		VmName: "db", TargetHost: wr.w.Name, TargetPool: "dr", Force: true, AcceptNotPointInTime: true, NewName: newName,
 	})
 	if err != nil {
 		return "", err

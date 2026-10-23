@@ -342,21 +342,36 @@ record naming it, and why a release is refused now. `--release <vm|path>`
 removes every kept chain of the deleted VM of that name, or the one chain a
 file is in, with their note and record entries, then judges `disk_leftover`
 again, which clears for them. It removes whole chains, each overlay before the
-file it backs on, never a file under a chain it leaves. It is refused
-(`FailedPrecondition`), removing nothing, while anything references a file it
-would remove: a VM's disk row on that host (any host's, on shared storage),
-another VM's disk or another kept chain backing on it, a snapshot record of
-the deleted VM on that host or one naming it as its memory image, a recorded
-replica, a set-aside copy layered on it, or a domain on that host that uses
-it or has the deleted VM's name. A note, `kept-disks.json` or a chain that
-cannot be read refuses it too, naming the file. It shows exactly what it
-removes and asks to confirm (`--yes` skips the question; without a terminal
-it is required); the files confirmed are sent with the release, and a release
-that would now remove any others is refused (`Aborted`). `--dry-run` shows the
+file it backs on, never a file under a chain it leaves. Of a chain it removes
+only the deleted VM's own files: those its note or record names, and the
+`<vm>-<disk>.qcow2` files a create of exactly that name would clear (never VM
+`<vm>-1`'s). Every file below them (an image, another VM's disk, a file in a
+directory named like the VM) stays, listed under what the chain stands on. It
+removes regular files on this host's own storage only: a record naming a
+device node, a link (an LVM or zvol volume) or a file on shared storage is
+listed and refused, since unlinking a link leaves its volume unnamed, and
+what other hosts hold on a shared file cannot be checked or locked from one
+host; remove those by hand. Each file is checked to be the one the plan saw
+(device and inode) just before it is removed: one replaced meanwhile is left,
+and the release stops. It is refused (`FailedPrecondition`), removing nothing,
+while anything references a file it would remove: a VM's disk row on that
+host, another VM's disk or another kept chain backing on it, a snapshot record
+naming it as its memory image, a recorded replica, a set-aside copy layered
+on it, or a domain on that host that uses it or has the deleted VM's name. A
+note, `kept-disks.json` or a chain that cannot be read refuses it too, naming
+the file. The deleted VM's snapshot records on that host are taken over these
+files, and `lv snapshot rm` cannot reach them once the VM is gone: a release
+of every chain of the VM drops them with the files when no VM of the name
+exists on any host and each memory image is unrecorded, gone, or a file the
+release removes. The plan names them; otherwise they refuse it. It shows
+exactly what it removes and drops and asks to confirm (`--yes` skips the
+question; without a terminal it is required); the files and records confirmed
+are sent with the release (the files are required), and a release that would
+now remove or drop any others is refused (`Aborted`). `--dry-run` shows the
 plan and the refusal, removing nothing. The release needs admin, is refused
 while that host's replica has not caught up, and writes an audit entry
 `host.kept_disks.release` on that host naming each file removed and its size,
-and a `vm.disk.released` event of the VM. A host on an older build answers
+and each snapshot record dropped, and a `vm.disk.released` event of the VM. A host on an older build answers
 that it does not know the command, and removes nothing. A record of a disk on
 another host is listed and not released: check it there, then remove its
 entry by hand. The `.kept-` copies a create moved aside are not kept chains:

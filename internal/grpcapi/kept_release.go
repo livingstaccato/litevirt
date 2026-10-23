@@ -47,10 +47,12 @@ const keptReleaseAudit = "host.kept_disks.release"
 
 // keptUnitFile is a file of a kept chain.
 type keptUnitFile struct {
-	path  string
-	size  int64
-	under bool // a file of the unit backs on it
-	gone  bool // named, and not there
+	path     string
+	size     int64
+	under    bool   // a file of the unit backs on it
+	gone     bool   // named, and not there
+	named    bool   // a note or record of the VM names it
+	dev, ino uint64 // the file the plan saw: a removal finding another refuses
 }
 
 // keptUnit is one releasable kept chain: the files of a deleted VM's kept
@@ -68,6 +70,7 @@ type keptUnit struct {
 	notePath []string         // the files of the note this unit releases
 	regs     []diskKeptRecord // the kept-disks.json entries this unit releases
 	layers   [][]string       // every chain walked, top first, for the reference checks
+	notFile  string           // why a file of it is no regular file a release may remove
 }
 
 func (u *keptUnit) has(p string) bool {
@@ -83,20 +86,50 @@ type keptChainOf struct {
 	missing string
 }
 
-// ofKeptVM reports whether file is a file of the deleted VM vm's own: one
-// its note or record names, or one named as its disk files are
-// (<vm>-<disk>..., or in the legacy <disks>/<vm>/ directory), outside the
-// image store. A file below the first that is not stays: an image, or another
-// VM's disk a kept linked clone backs on.
-func (s *Server) ofKeptVM(vm, file string, named map[string]bool) bool {
-	if named[file] {
-		return true
+// keptOwnSet is what makes a layer below a kept top the deleted VM's own,
+// resolved through symlinks: a file its note or record names, or one of the
+// files a create of exactly that name clears (image.Store.VMDiskCandidates:
+// <vm>-<disk>.qcow2 with no dash in the disk part, so never VM <vm>-1's, and
+// the legacy <disks>/<vm>/ directory). Nothing else is: not a file named like
+// the VM elsewhere, not an image, not another VM's disk a kept clone backs
+// on. Those stay, as what the chain stands on. A path whose resolution does
+// not answer is an error: what it is cannot be told.
+func (s *Server) keptOwnSet(vm string, named map[string]bool) (map[string]bool, error) {
+	own := map[string]bool{}
+	add := func(p string) error {
+		r, err := resolvedStrict(p)
+		if err != nil {
+			return fmt.Errorf("%s cannot be resolved (%w)", p, err)
+		}
+		own[filepath.Clean(p)], own[r] = true, true
+		return nil
 	}
-	if s.images != nil && filepath.Dir(file) == filepath.Clean(s.images.ImageDir()) {
-		return false
+	for p := range named {
+		if err := add(p); err != nil {
+			return nil, err
+		}
 	}
-	return strings.HasPrefix(filepath.Base(file), vm+"-") || filepath.Base(filepath.Dir(file)) == vm
+	if s.images != nil {
+		cands, err := s.images.VMDiskCandidates(vm)
+		if err != nil {
+			return nil, fmt.Errorf("the disk files of VM %s cannot be listed (%w)", vm, err)
+		}
+		for _, c := range cands {
+			if err := add(c); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return own, nil
 }
+
+// keptSharedStoreOf tells whether a directory is on shared storage; a test
+// replaces it.
+var keptSharedStoreOf = sharedStoreOfErr
+
+// keptReleaseBeforeRemove runs just before a release looks at a file it is
+// about to remove; a test replaces it.
+var keptReleaseBeforeRemove = func(string) {}
 
 // keptUnits is every kept chain on this host, by VM, then by top. A note,
 // kept-disks.json, or a chain that cannot be read is an error: what a release
@@ -168,6 +201,10 @@ func (s *Server) keptUnits(ctx context.Context) ([]*keptUnit, error) {
 			add(top)
 			regOf[top] = append(regOf[top], r)
 		}
+		ownSet, err := s.keptOwnSet(vm, named)
+		if err != nil {
+			return nil, fmt.Errorf("what the delete of VM %s kept cannot be told apart from what it stands on: %v; retry once that storage answers", vm, err)
+		}
 		walks := map[string]keptChainOf{}
 		for _, c := range cands {
 			type walked struct {
@@ -183,7 +220,17 @@ func (s *Server) keptUnits(ctx context.Context) ([]*keptUnit, error) {
 					"would leave without its base is unknown; fix that file or its storage, then retry", c, vm, err)
 			}
 			own := 0
-			for own < len(w.layers) && (own == 0 || s.ofKeptVM(vm, w.layers[own], named)) {
+			for own < len(w.layers) {
+				if own > 0 {
+					r, err := resolvedStrict(w.layers[own])
+					if err != nil {
+						return nil, fmt.Errorf("%s, under a disk the delete of VM %s kept, cannot be resolved (%v); retry once that storage answers",
+							w.layers[own], vm, err)
+					}
+					if !ownSet[filepath.Clean(w.layers[own])] && !ownSet[r] {
+						break
+					}
+				}
 				own++
 			}
 			walks[c] = keptChainOf{top: c, layers: w.layers, own: own, missing: w.missing}
@@ -251,6 +298,7 @@ func (s *Server) keptUnits(ctx context.Context) ([]*keptUnit, error) {
 			u.files = orderOverlaysFirst(u.files, u.layers)
 			for i := range u.files {
 				f := &u.files[i]
+				f.named = named[f.path]
 				if f.gone {
 					continue
 				}
@@ -262,7 +310,15 @@ func (s *Server) keptUnits(ctx context.Context) ([]*keptUnit, error) {
 				if err != nil {
 					return nil, fmt.Errorf("%s, a disk the delete of VM %s kept, cannot be read (%v); retry once its storage answers", f.path, vm, err)
 				}
+				if !fi.Mode().IsRegular() || strings.HasPrefix(f.path, "/dev/") {
+					u.notFile = fmt.Sprintf("%s is no regular file (%v): a volume of a storage driver, or a link to one, which a release "+
+						"does not remove, since unlinking it would leave the volume and its data unnamed; remove it with its storage "+
+						"driver, then its entry from %s", f.path, fi.Mode().Type(), filepath.Join(s.dataDir, diskKeptFile))
+					continue
+				}
 				f.size = fi.Size()
+				f.dev, _ = fileDevice(fi)
+				f.ino, _ = fileInode(fi)
 			}
 			if k.note != nil {
 				for _, p := range k.note.Paths {
@@ -346,14 +402,36 @@ func orderOverlaysFirst(files []keptUnitFile, chains [][]string) []keptUnitFile 
 	return out
 }
 
+// keptResolver resolves paths through symlinks for one check, bounded
+// (resolvedStrict) and remembered: a path whose resolution does not answer
+// is an error, never the path as given.
+type keptResolver map[string]string
+
+func (r keptResolver) of(p string) (string, error) {
+	p = filepath.Clean(p)
+	if v, ok := r[p]; ok {
+		return v, nil
+	}
+	v, err := resolvedStrict(p)
+	if err != nil {
+		return "", err
+	}
+	r[p] = v
+	return v, nil
+}
+
 // keptUnitHeld is why u may not be released now: something other than u
 // references a file it would remove. "" when nothing does. A check that
 // cannot be made refuses too (it is the answer: what it would have found is
-// unknown).
-func (s *Server) keptUnitHeld(ctx context.Context, u *keptUnit, all []*keptUnit) string {
+// unknown). snaps is the deleted VM's snapshot records on this host that a
+// release of the VM drops with its files (keptSnapshotsDroppable).
+func (s *Server) keptUnitHeld(ctx context.Context, u *keptUnit, all []*keptUnit) (held string, snaps []string) {
 	if u.host != s.hostName {
 		return fmt.Sprintf("the file is on %s, not on %s, where this record was written; check it there, then remove its entry from %s on %s",
-			u.host, s.hostName, filepath.Join(s.dataDir, diskKeptFile), s.hostName)
+			u.host, s.hostName, filepath.Join(s.dataDir, diskKeptFile), s.hostName), nil
+	}
+	if u.notFile != "" {
+		return u.notFile, nil
 	}
 	var files []string
 	for _, f := range u.files {
@@ -361,25 +439,57 @@ func (s *Server) keptUnitHeld(ctx context.Context, u *keptUnit, all []*keptUnit)
 			files = append(files, f.path)
 		}
 	}
-	if len(files) == 0 {
-		return ""
+	snaps, held = s.keptSnapshotsDroppable(ctx, u, all)
+	if held != "" || len(files) == 0 {
+		return held, snaps
 	}
+	// Shared storage: what other hosts hold on the file (a domain, a copy, a
+	// replica, a note) cannot be checked from here, nor a create there locked
+	// out between this check and the removal. Listed only.
+	for _, f := range files {
+		st, err := keptSharedStoreOf(filepath.Dir(f))
+		if err != nil {
+			return fmt.Sprintf("cannot tell whether %s is on shared storage (%v); retry", f, err), snaps
+		}
+		if st.Shared {
+			return fmt.Sprintf("%s is on shared storage: what other hosts hold on it cannot be checked, nor a create there locked out, "+
+				"from %s, so a release does not remove it; check on every host that nothing uses it, then remove the file and its "+
+				"entries (%s, %s) by hand", f, s.hostName, filepath.Join(s.dataDir, "kept-disks", u.vm+".json"),
+				filepath.Join(s.dataDir, diskKeptFile)), snaps
+		}
+	}
+	res := keptResolver{}
 	mine := map[string]bool{}
 	for _, f := range files {
-		mine[f] = true
-		if r, err := filepath.EvalSymlinks(f); err == nil {
-			mine[r] = true
+		r, err := res.of(f)
+		if err != nil {
+			return fmt.Sprintf("cannot tell what %s is (%v); retry once its storage answers", f, err), snaps
 		}
+		mine[filepath.Clean(f)], mine[r] = true, true
+	}
+	isMine := func(p string) (bool, error) {
+		if mine[filepath.Clean(p)] {
+			return true, nil
+		}
+		r, err := res.of(p)
+		return err == nil && mine[r], err
 	}
 
 	// Another deleted VM's note, or another kept chain, holds or backs on it.
 	noted, err := health.KeptNotedFiles(s.dataDir)
 	if err != nil {
-		return fmt.Sprintf("cannot tell: this host's notes of the disks deletes kept cannot be read (%v)", err)
+		return fmt.Sprintf("cannot tell: this host's notes of the disks deletes kept cannot be read (%v)", err), snaps
 	}
-	for _, f := range files {
-		if vm, ok := noted[f]; ok && vm != u.vm {
-			return fmt.Sprintf("%s is also kept for the deleted VM %s (%s)", f, vm, filepath.Join(s.dataDir, "kept-disks", vm+".json"))
+	for p, vm := range noted {
+		if vm == u.vm {
+			continue
+		}
+		hit, err := isMine(p)
+		if err != nil {
+			return fmt.Sprintf("cannot tell what %s, kept for the deleted VM %s, is (%v); retry", p, vm, err), snaps
+		}
+		if hit {
+			return fmt.Sprintf("%s is also kept for the deleted VM %s (%s)", p, vm, filepath.Join(s.dataDir, "kept-disks", vm+".json")), snaps
 		}
 	}
 	for _, o := range all {
@@ -388,29 +498,27 @@ func (s *Server) keptUnitHeld(ctx context.Context, u *keptUnit, all []*keptUnit)
 		}
 		for _, c := range o.layers {
 			for _, l := range c {
-				if mine[l] {
-					return fmt.Sprintf("%s backs on %s: it is a disk the delete of VM %s kept; release that first", c[0], l, o.vm)
+				hit, err := isMine(l)
+				if err != nil {
+					return fmt.Sprintf("cannot tell what %s, under a disk the delete of VM %s kept, is (%v); retry", l, o.vm, err), snaps
+				}
+				if hit {
+					return fmt.Sprintf("%s backs on %s: it is a disk the delete of VM %s kept; release that first", c[0], l, o.vm), snaps
 				}
 			}
 		}
 	}
 
-	// A live disk row: this host's, or any host's on shared storage.
+	// A live disk row of this host (the file is not on shared storage).
 	for _, f := range files {
 		for _, p := range uniq(f, s.recordPath(f)) {
-			var rows []corrosion.DiskRecord
-			var err error
-			if sharedStoreOf(filepath.Dir(f)).Shared {
-				rows, err = s.diskReferencesAnyHost(ctx, p)
-			} else {
-				rows, err = s.liveDiskOwners(ctx, s.hostName, p)
-			}
+			rows, err := s.liveDiskOwners(ctx, s.hostName, p)
 			if err != nil {
-				return fmt.Sprintf("cannot tell whether a VM's disk uses %s (%v); retry", f, err)
+				return fmt.Sprintf("cannot tell whether a VM's disk uses %s (%v); retry", f, err), snaps
 			}
 			if len(rows) > 0 {
 				d := rows[0]
-				return fmt.Sprintf("%s is in use by VM %s disk %s (as %s)", f, d.VMName, d.DiskName, referenceKind(&d, p))
+				return fmt.Sprintf("%s is in use by VM %s disk %s (as %s)", f, d.VMName, d.DiskName, referenceKind(&d, p)), snaps
 			}
 		}
 	}
@@ -418,35 +526,23 @@ func (s *Server) keptUnitHeld(ctx context.Context, u *keptUnit, all []*keptUnit)
 	// Another VM's disk whose backing chain reaches it.
 	users, err := s.snapshotFileUsers(ctx, "", files)
 	if err != nil {
-		return fmt.Sprintf("cannot tell whether another VM's disk backs on it (%v); retry", err)
+		return fmt.Sprintf("cannot tell whether another VM's disk backs on it (%v); retry", err), snaps
 	}
 	if len(users) > 0 {
-		return fmt.Sprintf("the disk of VM %s backs on a file of it", strings.Join(users, ", "))
+		return fmt.Sprintf("the disk of VM %s backs on a file of it", strings.Join(users, ", ")), snaps
 	}
 
-	// A snapshot record: the deleted VM's on this host (its files are this
-	// chain), or any whose memory image is one of them.
-	snaps, err := corrosion.ListSnapshots(ctx, s.db, u.vm)
-	if err != nil {
-		return fmt.Sprintf("cannot tell whether a snapshot record names it (%v); retry", err)
-	}
-	var names []string
-	for _, sn := range snaps {
-		if sn.HostName == "" || sn.HostName == s.hostName {
-			names = append(names, sn.Name)
-		}
-	}
-	if len(names) > 0 {
-		return fmt.Sprintf("the snapshot records %s of VM %s on %s are taken over these files", strings.Join(names, ", "), u.vm, s.hostName)
-	}
+	// Any snapshot record whose memory image is one of them.
 	for _, f := range files {
 		for _, p := range uniq(f, s.recordPath(f)) {
 			rows, err := s.db.Query(ctx, `SELECT vm_name, name FROM snapshots WHERE vmstate_path = ? AND deleted_at IS NULL`, p)
 			if err != nil {
-				return fmt.Sprintf("cannot tell whether a snapshot record names %s (%v); retry", f, err)
+				return fmt.Sprintf("cannot tell whether a snapshot record names %s (%v); retry", f, err), snaps
 			}
-			if len(rows) > 0 {
-				return fmt.Sprintf("%s is the memory image of snapshot %s of VM %s", f, rows[0].String("name"), rows[0].String("vm_name"))
+			for _, r := range rows {
+				if r.String("vm_name") != u.vm || !slices.Contains(snaps, r.String("name")) {
+					return fmt.Sprintf("%s is the memory image of snapshot %s of VM %s", f, r.String("name"), r.String("vm_name")), snaps
+				}
 			}
 		}
 	}
@@ -454,30 +550,42 @@ func (s *Server) keptUnitHeld(ctx context.Context, u *keptUnit, all []*keptUnit)
 	// A replica, or a set-aside copy layered on it.
 	for _, f := range files {
 		if r, ok := replicaRecordFor(f); ok {
-			return fmt.Sprintf("%s is a recorded replica of VM %s disk %s", f, r.VM, r.Disk)
+			return fmt.Sprintf("%s is a recorded replica of VM %s disk %s", f, r.VM, r.Disk), snaps
 		}
 	}
 	backing, err := s.supersededBacking(ctx)
 	if err != nil {
-		return fmt.Sprintf("cannot tell whether a superseded disk copy backs on it (%v); retry", err)
+		return fmt.Sprintf("cannot tell whether a superseded disk copy backs on it (%v); retry", err), snaps
 	}
 	for _, f := range files {
 		if backing.has(f) {
-			return fmt.Sprintf("a superseded disk copy backs on %s (lv host superseded-disks %s)", f, s.hostName)
+			return fmt.Sprintf("a superseded disk copy backs on %s (lv host superseded-disks %s)", f, s.hostName), snaps
 		}
 	}
 	keptCopies, err := health.ListKeptDisks(ctx, s.db, s.dataDir)
 	if err != nil {
-		return fmt.Sprintf("cannot tell whether a .kept- copy backs on it (%v); retry", err)
+		return fmt.Sprintf("cannot tell whether a .kept- copy backs on it (%v); retry", err), snaps
 	}
 	for _, k := range keptCopies {
 		if k.Seed {
 			continue
 		}
-		if reached, err := chainReaches(k.Path, "", func(p string) bool { return mine[filepath.Clean(p)] }); err != nil {
-			return fmt.Sprintf("cannot tell whether %s backs on it (%v); retry", k.Path, err)
-		} else if reached {
-			return fmt.Sprintf("%s, a disk a deleted VM was kept with that a create moved aside, backs on it", k.Path)
+		var nerr error
+		reached, err := chainReaches(k.Path, "", func(p string) bool {
+			hit, herr := isMine(p)
+			if herr != nil && nerr == nil {
+				nerr = herr
+			}
+			return hit || herr != nil
+		})
+		if err == nil {
+			err = nerr
+		}
+		if err != nil {
+			return fmt.Sprintf("cannot tell whether %s backs on it (%v); retry", k.Path, err), snaps
+		}
+		if reached {
+			return fmt.Sprintf("%s, a disk a deleted VM was kept with that a create moved aside, backs on it", k.Path), snaps
 		}
 	}
 
@@ -486,7 +594,7 @@ func (s *Server) keptUnitHeld(ctx context.Context, u *keptUnit, all []*keptUnit)
 	if s.virt != nil {
 		doms, err := s.virt.ListDomains()
 		if err != nil {
-			return fmt.Sprintf("cannot tell whether a domain on %s uses it: libvirt does not answer (%v); retry", s.hostName, err)
+			return fmt.Sprintf("cannot tell whether a domain on %s uses it: libvirt does not answer (%v); retry", s.hostName, err), snaps
 		}
 		for _, d := range doms {
 			if d == u.vm {
@@ -494,34 +602,115 @@ func (s *Server) keptUnitHeld(ctx context.Context, u *keptUnit, all []*keptUnit)
 				if active, err := s.virt.DomainIsActive(d); err != nil || active {
 					what = "running"
 				}
-				return fmt.Sprintf("a domain %s is %s on %s; a domain of the deleted VM's name may use these files", d, what, s.hostName)
+				return fmt.Sprintf("a domain %s is %s on %s; a domain of the deleted VM's name may use these files", d, what, s.hostName), snaps
 			}
 			srcs, err := s.virt.DomainDiskFormats(d)
 			if err != nil {
 				if lv.IsNoDomain(err) {
 					continue
 				}
-				return fmt.Sprintf("cannot tell whether the domain %s uses it (%v); retry", d, err)
+				return fmt.Sprintf("cannot tell whether the domain %s uses it (%v); retry", d, err), snaps
 			}
 			for src, format := range srcs {
+				var nerr error
 				hit := func(p string) bool {
-					return mine[filepath.Clean(p)] || mine[filepath.Clean(s.hostDiskFile(p))]
+					h, herr := isMine(s.hostDiskFile(p))
+					if !h && herr == nil {
+						h, herr = isMine(p)
+					}
+					if herr != nil && nerr == nil {
+						nerr = herr
+					}
+					return h || herr != nil
 				}
 				reached := hit(src)
 				if !reached {
 					var rerr error
 					reached, rerr = chainReaches(s.hostDiskFile(src), format, hit)
 					if rerr != nil {
-						return fmt.Sprintf("cannot tell whether the domain %s uses it (%v); retry", d, rerr)
+						return fmt.Sprintf("cannot tell whether the domain %s uses it (%v); retry", d, rerr), snaps
 					}
 				}
+				if nerr != nil {
+					return fmt.Sprintf("cannot tell whether the domain %s uses it (%v); retry", d, nerr), snaps
+				}
 				if reached {
-					return fmt.Sprintf("the domain %s on %s uses it (its disk %s)", d, s.hostName, src)
+					return fmt.Sprintf("the domain %s on %s uses it (its disk %s)", d, s.hostName, src), snaps
 				}
 			}
 		}
 	}
-	return ""
+	return "", snaps
+}
+
+// keptSnapshotsDroppable is the deleted VM's snapshot records on this host,
+// which a release of the VM drops with its files, or why they hold it.
+// They are taken over the kept files (a disk snapshot's overlays are layers
+// of the chain; an internal one lives in the qcow2 removed), and once the VM
+// is gone `lv snapshot rm` cannot reach them, so without this nothing could
+// release the chain. They are dropped only when:
+//
+//   - no VM of the name exists on any host (one that does may own them);
+//   - each memory image is unrecorded, gone, or a file of the deleted VM's
+//     chains on this host, which the release removes too;
+//   - the release takes every chain of the VM (a release of one chain leaves
+//     files the records are taken over);
+//   - the caller confirmed them (expect_snapshots), as the dry run lists them.
+func (s *Server) keptSnapshotsDroppable(ctx context.Context, u *keptUnit, all []*keptUnit) ([]string, string) {
+	recs, err := corrosion.ListSnapshots(ctx, s.db, u.vm)
+	if err != nil {
+		return nil, fmt.Sprintf("cannot tell whether a snapshot record names it (%v); retry", err)
+	}
+	var mine []corrosion.SnapshotRecord
+	for _, sn := range recs {
+		if sn.HostName == "" || sn.HostName == s.hostName {
+			mine = append(mine, sn)
+		}
+	}
+	if len(mine) == 0 {
+		return nil, ""
+	}
+	names := make([]string, 0, len(mine))
+	for _, sn := range mine {
+		names = append(names, sn.Name)
+	}
+	list := strings.Join(names, ", ")
+	vm, err := corrosion.GetVM(ctx, s.db, u.vm)
+	if err != nil {
+		return nil, fmt.Sprintf("the snapshot records %s of VM %s on %s are taken over these files, and whether a VM of that name exists cannot be read (%v); retry",
+			list, u.vm, s.hostName, err)
+	}
+	if vm != nil {
+		return nil, fmt.Sprintf("the snapshot records %s of VM %s on %s are taken over these files, and a VM %s exists (on %s), whose records they may be; "+
+			"remove them with `lv snapshot rm %s <snapshot>` if they are not its own", list, u.vm, s.hostName, u.vm, vm.HostName, u.vm)
+	}
+	released := map[string]bool{}
+	for _, o := range all {
+		if o.vm != u.vm || o.host != s.hostName {
+			continue
+		}
+		for _, f := range o.files {
+			released[f.path] = true
+			released[s.recordPath(f.path)] = true
+		}
+	}
+	for _, sn := range mine {
+		p := sn.VMStatePath
+		if p == "" || released[filepath.Clean(p)] {
+			continue
+		}
+		_, err := storage.Bounded("stat", p, func() (os.FileInfo, error) { return os.Lstat(s.hostDiskFile(p)) })
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Sprintf("the snapshot record %s of the deleted VM %s keeps its memory image %s, which cannot be read (%v); retry",
+				sn.Name, u.vm, p, err)
+		}
+		return nil, fmt.Sprintf("the snapshot records %s of VM %s on %s are taken over these files, and the memory image %s of %s is no file a release "+
+			"removes; remove that image by hand once nothing needs it, then release again", list, u.vm, s.hostName, p, sn.Name)
+	}
+	return names, ""
 }
 
 func uniq(a, b string) []string {
@@ -566,9 +755,9 @@ func (s *Server) keptUnitsFor(units []*keptUnit, release string) ([]*keptUnit, e
 	return out, nil
 }
 
-func (u *keptUnit) toPB(s *Server, held string, released bool) *pb.KeptDiskChain {
+func (u *keptUnit) toPB(s *Server, held string, snaps []string, released bool) *pb.KeptDiskChain {
 	c := &pb.KeptDiskChain{VmName: u.vm, StandsOn: u.standsOn, MissingBase: u.missing, Held: held, Released: released,
-		Reason: strings.Join(u.reasons, "; ")}
+		Reason: strings.Join(u.reasons, "; "), Snapshots: snaps}
 	if !u.keptAt.IsZero() {
 		c.KeptAt = u.keptAt.UTC().Format(time.RFC3339)
 	}
@@ -613,8 +802,8 @@ func (s *Server) KeptDisks(ctx context.Context, req *pb.KeptDisksRequest) (*pb.K
 		return resp, err
 	}
 	if req.Release == "" {
-		if req.DryRun || len(req.ExpectPaths) > 0 {
-			return nil, status.Error(codes.InvalidArgument, "dry_run and expect_paths go with release")
+		if req.DryRun || len(req.ExpectPaths) > 0 || len(req.ExpectSnapshots) > 0 {
+			return nil, status.Error(codes.InvalidArgument, "dry_run, expect_paths and expect_snapshots go with release")
 		}
 		units, err := s.keptUnits(ctx)
 		if err != nil {
@@ -622,25 +811,49 @@ func (s *Server) KeptDisks(ctx context.Context, req *pb.KeptDisksRequest) (*pb.K
 		}
 		resp := &pb.KeptDisksResponse{Host: s.hostName}
 		for _, u := range units {
-			resp.Chains = append(resp.Chains, u.toPB(s, s.keptUnitHeld(ctx, u, units), false))
+			held, snaps := s.keptUnitHeld(ctx, u, units)
+			resp.Chains = append(resp.Chains, u.toPB(s, held, snaps, false))
 		}
 		return resp, nil
 	}
 	return s.releaseKept(ctx, req, actor)
 }
 
+// sameStrings reports whether a and b hold the same strings, cleaned as
+// paths when paths is set, in any order.
+func sameStrings(a, b []string, paths bool) bool {
+	norm := func(l []string) []string {
+		out := slices.Clone(l)
+		for i := range out {
+			if paths {
+				out[i] = filepath.Clean(out[i])
+			}
+		}
+		slices.Sort(out)
+		return slices.Compact(out)
+	}
+	return slices.Equal(norm(a), norm(b))
+}
+
 // releaseKept is the release half of KeptDisks, on the host the files are
-// on, under the deleted VM's lock (a create or delete of the name, which
-// reads and writes the same notes and records, waits).
+// on. A release (not a dry run) runs under the deleted VM's lock: a create
+// or delete of the name, which reads and writes the same notes and records,
+// waits.
 func (s *Server) releaseKept(ctx context.Context, req *pb.KeptDisksRequest, actor string) (*pb.KeptDisksResponse, error) {
-	refuse := func(code codes.Code, format string, a ...any) error {
-		err := status.Errorf(code, "release %s on %s: "+format, append([]any{req.Release, s.hostName}, a...)...)
+	audit := func(err error) error {
 		if !req.DryRun {
-			s.auditAs(ctx, actor, keptReleaseAudit, s.hostName, status.Convert(err).Message()+"; nothing was removed", "error")
+			s.auditAs(ctx, actor, keptReleaseAudit, s.hostName, fmt.Sprintf("release %s on %s: %s; nothing was removed",
+				req.Release, s.hostName, status.Convert(err).Message()), "error")
 		}
 		return err
 	}
+	refuse := func(code codes.Code, format string, a ...any) error {
+		return audit(status.Errorf(code, "release %s on %s: "+format, append([]any{req.Release, s.hostName}, a...)...))
+	}
 	if !req.DryRun {
+		if len(req.ExpectPaths) == 0 {
+			return nil, refuse(codes.InvalidArgument, "expect_paths is required: name the files you confirmed (a dry run lists them)")
+		}
 		// What references a file is read from the replica: one that has not
 		// caught up may not hold the disk row that does.
 		if err := s.requireReplicaCaughtUp(ctx, "KeptDisks release"); err != nil {
@@ -653,26 +866,45 @@ func (s *Server) releaseKept(ctx context.Context, req *pb.KeptDisksRequest, acto
 	}
 	targets, err := s.keptUnitsFor(units, req.Release)
 	if err != nil {
-		return nil, err
+		return nil, audit(err)
 	}
 	vm := targets[0].vm
-	defer s.lockVMAs(vm, "kept-disk release")()
-	// Read again under the lock: a create or delete of the name may have
-	// changed the notes and records meanwhile.
-	if units, err = s.keptUnits(ctx); err != nil {
-		return nil, refuse(codes.FailedPrecondition, "%v; nothing was removed", err)
-	}
-	if targets, err = s.keptUnitsFor(units, req.Release); err != nil {
-		return nil, err
+	if !req.DryRun {
+		defer s.lockVMAs(vm, "kept-disk release")()
+		// Read again under the lock: a create or delete of the name may have
+		// changed the notes and records meanwhile.
+		if units, err = s.keptUnits(ctx); err != nil {
+			return nil, refuse(codes.FailedPrecondition, "%v; nothing was removed", err)
+		}
+		if targets, err = s.keptUnitsFor(units, req.Release); err != nil {
+			return nil, audit(err)
+		}
+		if targets[0].vm != vm {
+			return nil, refuse(codes.Aborted, "it now names the disks of VM %s, not of VM %s; run it again to see what it removes", targets[0].vm, vm)
+		}
 	}
 	resp := &pb.KeptDisksResponse{Host: s.hostName, DryRun: req.DryRun}
-	var helds []string
-	var paths []string
+	var helds, paths, snaps []string
+	whole := true
+	for _, o := range units {
+		if o.vm == vm && o.host == s.hostName && !slices.Contains(targets, o) {
+			whole = false
+		}
+	}
 	for _, u := range targets {
-		held := s.keptUnitHeld(ctx, u, units)
-		resp.Chains = append(resp.Chains, u.toPB(s, held, held == "" && req.DryRun))
+		held, us := s.keptUnitHeld(ctx, u, units)
+		if held == "" && len(us) > 0 && !whole {
+			held = fmt.Sprintf("the snapshot records %s of the deleted VM %s are taken over all its kept chains; release them together "+
+				"(--release %s)", strings.Join(us, ", "), vm, vm)
+		}
+		resp.Chains = append(resp.Chains, u.toPB(s, held, us, held == "" && req.DryRun))
 		if held != "" {
 			helds = append(helds, held)
+		}
+		for _, n := range us {
+			if !slices.Contains(snaps, n) {
+				snaps = append(snaps, n)
+			}
 		}
 		for _, f := range u.files {
 			paths = append(paths, f.path)
@@ -684,17 +916,30 @@ func (s *Server) releaseKept(ctx context.Context, req *pb.KeptDisksRequest, acto
 	if len(helds) > 0 {
 		return nil, refuse(codes.FailedPrecondition, "%s; nothing was removed", strings.Join(helds, "; "))
 	}
-	if len(req.ExpectPaths) > 0 {
-		want := slices.Clone(req.ExpectPaths)
-		for i := range want {
-			want[i] = filepath.Clean(want[i])
+	if !sameStrings(req.ExpectPaths, paths, true) {
+		return nil, refuse(codes.Aborted, "it would now remove %s, not the files confirmed (%s); run it again to see what it removes",
+			strings.Join(paths, ", "), strings.Join(req.ExpectPaths, ", "))
+	}
+	if !sameStrings(req.ExpectSnapshots, snaps, false) {
+		return nil, refuse(codes.Aborted, "it would now drop the snapshot records [%s] of VM %s, not the ones confirmed [%s]; run it again to see what it drops",
+			strings.Join(snaps, ", "), vm, strings.Join(req.ExpectSnapshots, ", "))
+	}
+	// Every file a release removes is named in the note first, so a failure
+	// part way leaves the rest named (a base the VM owned only by its name,
+	// under an overlay now gone, would otherwise be named nowhere).
+	for _, u := range targets {
+		var unnamed []string
+		for _, f := range u.files {
+			if !f.named && !f.gone {
+				unnamed = append(unnamed, f.path)
+			}
 		}
-		got := slices.Clone(paths)
-		slices.Sort(want)
-		slices.Sort(got)
-		if !slices.Equal(slices.Compact(want), slices.Compact(got)) {
-			return nil, refuse(codes.Aborted, "it would now remove %s, not the files confirmed (%s); run it again to see what it removes",
-				strings.Join(got, ", "), strings.Join(want, ", "))
+		if len(unnamed) > 0 {
+			if err := health.NoteKeptBackingFiles(s.dataDir, u.vm, unnamed); err != nil {
+				return nil, refuse(codes.FailedPrecondition, "the files it removes could not be noted first (%v); nothing was removed", err)
+			}
+			u.note = filepath.Join(s.dataDir, "kept-disks", u.vm+".json")
+			u.notePath = append(u.notePath, unnamed...)
 		}
 	}
 
@@ -709,13 +954,35 @@ func (s *Server) releaseKept(ctx context.Context, req *pb.KeptDisksRequest, acto
 				break
 			}
 			if !f.gone {
-				_, err := storage.Bounded("remove", f.path, func() (struct{}, error) { return struct{}{}, os.Remove(f.path) })
-				if err != nil && !errors.Is(err, fs.ErrNotExist) {
-					failed = fmt.Errorf("remove %s: %w", f.path, err)
+				// The file the plan saw, still: a create elsewhere in the
+				// path's life (a set-aside, a new disk written there) is
+				// never removed in its place.
+				keptReleaseBeforeRemove(f.path)
+				fi, err := storage.Bounded("stat", f.path, func() (os.FileInfo, error) { return os.Lstat(f.path) })
+				switch {
+				case errors.Is(err, fs.ErrNotExist):
+				case err != nil:
+					failed = fmt.Errorf("stat %s: %w", f.path, err)
+				default:
+					dev, _ := fileDevice(fi)
+					ino, _ := fileInode(fi)
+					if !fi.Mode().IsRegular() || dev != f.dev || ino != f.ino {
+						failed = fmt.Errorf("%s is no longer the file the release checked (device %d inode %d, now %d %d); it was left", f.path, f.dev, f.ino, dev, ino)
+						break
+					}
+					_, rerr := storage.Bounded("remove", f.path, func() (struct{}, error) { return struct{}{}, os.Remove(f.path) })
+					switch {
+					case errors.Is(rerr, fs.ErrNotExist):
+					case rerr != nil:
+						failed = fmt.Errorf("remove %s: %w", f.path, rerr)
+					default:
+						removed = append(removed, fmt.Sprintf("%s (%d bytes)", f.path, f.size))
+						bytes += f.size
+					}
+				}
+				if failed != nil {
 					break
 				}
-				removed = append(removed, fmt.Sprintf("%s (%d bytes)", f.path, f.size))
-				bytes += f.size
 			}
 			gone = append(gone, f.path)
 		}
@@ -731,14 +998,32 @@ func (s *Server) releaseKept(ctx context.Context, req *pb.KeptDisksRequest, acto
 		if nerr != nil && failed == nil {
 			failed = fmt.Errorf("the files are removed, and their records could not be updated (%w); a file that is gone is forgotten on its own", nerr)
 		}
-		resp.Chains = append(resp.Chains, u.toPB(s, "", failed == nil))
+		resp.Chains = append(resp.Chains, u.toPB(s, "", nil, failed == nil))
 		if failed != nil {
 			break
 		}
 	}
+	// The snapshot records go once every file they are taken over is gone.
+	var dropped []string
+	if failed == nil {
+		for _, n := range snaps {
+			if err := corrosion.DeleteSnapshot(ctx, s.db, vm, n); err != nil {
+				failed = fmt.Errorf("the files are removed, and the snapshot record %s could not be dropped (%w)", n, err)
+				break
+			}
+			dropped = append(dropped, n)
+		}
+		if len(resp.Chains) > 0 {
+			resp.Chains[0].Snapshots = dropped
+		}
+	}
 	detail := fmt.Sprintf("released the disks the delete of VM %s kept on %s (%s): removed %d file(s), %d bytes: %s",
 		vm, s.hostName, req.Release, len(removed), bytes, strings.Join(removed, ", "))
-	slog.Warn("kept disks released by an operator", "vm", vm, "release", req.Release, "removed", removed, "bytes", bytes, "actor", actor, "error", failed)
+	if len(dropped) > 0 {
+		detail += fmt.Sprintf("; dropped the snapshot records %s of the deleted VM %s on %s", strings.Join(dropped, ", "), vm, s.hostName)
+	}
+	slog.Warn("kept disks released by an operator", "vm", vm, "release", req.Release, "removed", removed, "bytes", bytes,
+		"snapshots", dropped, "actor", actor, "error", failed)
 	s.judgeKeptDisks(ctx)
 	if failed != nil {
 		s.auditAs(ctx, actor, keptReleaseAudit, s.hostName, detail+"; then failed: "+failed.Error(), "error")

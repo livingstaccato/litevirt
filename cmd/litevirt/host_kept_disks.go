@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"text/tabwriter"
 
@@ -43,12 +44,19 @@ record naming it, and why it may not be released now.
 --release <vm|path> removes, on that host, every kept chain of the deleted VM
 of that name, or the one chain a file (its full path) is in, with their note
 and record entries; disk_leftover then clears for them. It removes whole
-chains only. It is refused, and removes nothing, while anything references a
-file it would remove: a VM's disk row, another VM's disk or another kept chain
-backing on it, a snapshot record (of the deleted VM on that host, or naming it
-as a memory image), a recorded replica, a set-aside copy layered on it, or a
-domain on that host using it or named as the deleted VM. It is refused too
-while a note, the record or a chain cannot be read. It names exactly what it
+chains only, and of a chain only the deleted VM's own files: those its note or
+record names, and the <vm>-<disk>.qcow2 files a create of exactly that name
+would clear. Everything below them stays. It removes regular files on local
+storage only: a device, a link or a file on shared storage is listed, and
+removed by hand. It is refused, and removes nothing, while anything references
+a file it would remove: a VM's disk row, another VM's disk or another kept
+chain backing on it, a snapshot record naming it as a memory image, a recorded
+replica, a set-aside copy layered on it, or a domain on that host using it or
+named as the deleted VM. It is refused too while a note, the record or a chain
+cannot be read. The deleted VM's snapshot records on that host, taken over
+these files, are dropped with them when no VM of the name exists, each memory
+image is gone or released too, and the release takes every chain of the VM;
+the plan names them, and otherwise they refuse it. It names exactly what it
 removes and asks to confirm; --yes skips the question. --dry-run shows what it
 would remove, and why it is refused, removing nothing. A release needs admin,
 and writes an audit entry (host.kept_disks.release) naming each file and its
@@ -64,7 +72,12 @@ nothing.`,
 				call := func(req *pb.KeptDisksRequest) (*pb.KeptDisksResponse, error) {
 					resp, err := c.KeptDisks(ctx, req)
 					if status.Code(err) == codes.Unimplemented {
-						return nil, fmt.Errorf("kept disks: %s runs a build without lv host kept-disks; nothing was removed: %w", args[0], err)
+						// The entry node names the target it forwarded to; an
+						// Unimplemented without that is the entry node's own.
+						if strings.Contains(status.Convert(err).Message(), "runs a build without lv host kept-disks") {
+							return nil, fmt.Errorf("kept disks: %s", status.Convert(err).Message())
+						}
+						return nil, fmt.Errorf("kept disks: the node this command reached runs a build without lv host kept-disks; nothing was removed: %w", err)
 					}
 					if err != nil {
 						return nil, fmt.Errorf("kept disks: %w", err)
@@ -83,13 +96,18 @@ nothing.`,
 				if err != nil {
 					return err
 				}
-				var paths, held []string
+				var paths, held, snaps []string
 				for _, ch := range plan.Chains {
 					for _, f := range ch.Files {
 						paths = append(paths, f.Path)
 					}
 					if ch.Held != "" {
 						held = append(held, ch.Held)
+					}
+					for _, n := range ch.Snapshots {
+						if !slices.Contains(snaps, n) {
+							snaps = append(snaps, n)
+						}
 					}
 				}
 				printKeptRelease(out, plan, true)
@@ -103,7 +121,11 @@ nothing.`,
 					if !stdinIsTerminal() {
 						return errNoTTYReleaseConfirm
 					}
-					ok, err := cli.Confirm(ctx, os.Stdin, out, fmt.Sprintf("Remove these %d file(s) on %s, and their note and record entries?", len(paths), plan.Host))
+					what := fmt.Sprintf("Remove these %d file(s) on %s, and their note and record entries", len(paths), plan.Host)
+					if len(snaps) > 0 {
+						what += fmt.Sprintf(", and drop the snapshot records %s", strings.Join(snaps, ", "))
+					}
+					ok, err := cli.Confirm(ctx, os.Stdin, out, what+"?")
 					if err != nil {
 						return err
 					}
@@ -112,7 +134,7 @@ nothing.`,
 						return nil
 					}
 				}
-				resp, err := call(&pb.KeptDisksRequest{Host: args[0], Release: release, ExpectPaths: paths})
+				resp, err := call(&pb.KeptDisksRequest{Host: args[0], Release: release, ExpectPaths: paths, ExpectSnapshots: snaps})
 				if err != nil {
 					return err
 				}
@@ -193,6 +215,9 @@ func printKeptRelease(out io.Writer, resp *pb.KeptDisksResponse, plan bool) {
 		}
 		for _, r := range ch.Records {
 			fmt.Fprintf(out, "  and its entries in %s\n", r)
+		}
+		if len(ch.Snapshots) > 0 {
+			fmt.Fprintf(out, "  and the snapshot records %s of the deleted VM %s on %s\n", strings.Join(ch.Snapshots, ", "), ch.VmName, resp.Host)
 		}
 		if len(ch.StandsOn) > 0 {
 			fmt.Fprintf(out, "  leaving what it stands on: %s\n", strings.Join(ch.StandsOn, ", "))

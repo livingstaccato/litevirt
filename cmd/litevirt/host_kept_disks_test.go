@@ -98,3 +98,31 @@ func TestHostKeptDisks_RefusedDryRunAndOlderHost(t *testing.T) {
 		t.Fatalf("an older host = %v; want it named as a build without the command", err)
 	}
 }
+
+// The deleted VM's snapshot records a release drops are named in the plan
+// and sent as confirmed; an Unimplemented from the node reached says that
+// node, not the target, is old, while the forwarder's own wording is kept.
+//
+// Mutations: send the release without expect_snapshots: red; name the target
+// on every Unimplemented again: red.
+func TestHostKeptDisks_SnapshotsConfirmedAndOlderBuildNamed(t *testing.T) {
+	plan := keptPlan()
+	plan.Chains[0].Snapshots = []string{"s1"}
+	c := &keptDisksClient{plan: plan}
+	out, err := runKeptDisks(t, c, false, "node-2", "--release", "old", "--yes")
+	if err != nil {
+		t.Fatalf("release --yes: %v", err)
+	}
+	if !strings.Contains(out, "the snapshot records s1 of the deleted VM old") ||
+		len(c.reqs) != 2 || !slices.Equal(c.reqs[1].ExpectSnapshots, []string{"s1"}) {
+		t.Fatalf("release sent %+v, printed:\n%s\nwant s1 named and confirmed", c.reqs, out)
+	}
+	c = &keptDisksClient{err: status.Error(codes.Unimplemented, "unknown method KeptDisks")}
+	if _, err := runKeptDisks(t, c, true, "node-2"); err == nil || !strings.Contains(err.Error(), "the node this command reached runs a build without") {
+		t.Errorf("an old entry node = %v; want it named as the node reached", err)
+	}
+	c = &keptDisksClient{err: status.Error(codes.Unimplemented, "host node-2 runs a build without lv host kept-disks; nothing was removed there")}
+	if _, err := runKeptDisks(t, c, true, "node-2"); err == nil || !strings.Contains(err.Error(), "host node-2 runs a build without") {
+		t.Errorf("an old target = %v; want the forwarder's wording", err)
+	}
+}

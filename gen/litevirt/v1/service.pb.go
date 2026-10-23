@@ -3244,13 +3244,14 @@ func (x *SupersededDisksResponse) GetSetAside() string {
 // while anything still references a file it would remove. An older host does
 // not know the RPC and answers Unimplemented: nothing is removed there.
 type KeptDisksRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Host          string                 `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`                                  // "" = the host answering
-	Release       string                 `protobuf:"bytes,2,opt,name=release,proto3" json:"release,omitempty"`                            // a deleted VM's name, or a file of a kept chain (absolute path); "" lists only
-	DryRun        bool                   `protobuf:"varint,3,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`               // with release: answer what it would remove, and why it is refused, removing nothing
-	ExpectPaths   []string               `protobuf:"bytes,4,rep,name=expect_paths,json=expectPaths,proto3" json:"expect_paths,omitempty"` // with release: the files the caller confirmed; refused, removing nothing, when the release would remove any other set
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Host            string                 `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`                                              // "" = the host answering
+	Release         string                 `protobuf:"bytes,2,opt,name=release,proto3" json:"release,omitempty"`                                        // a deleted VM's name, or a file of a kept chain (absolute path); "" lists only
+	DryRun          bool                   `protobuf:"varint,3,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`                           // with release: answer what it would remove, and why it is refused, removing nothing
+	ExpectPaths     []string               `protobuf:"bytes,4,rep,name=expect_paths,json=expectPaths,proto3" json:"expect_paths,omitempty"`             // with release (required unless dry_run): the files the caller confirmed; refused, removing nothing, when the release would remove any other set
+	ExpectSnapshots []string               `protobuf:"bytes,5,rep,name=expect_snapshots,json=expectSnapshots,proto3" json:"expect_snapshots,omitempty"` // with release: the deleted VM's snapshot records the caller confirmed it drops (KeptDiskChain.snapshots); refused when they differ
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *KeptDisksRequest) Reset() {
@@ -3307,6 +3308,13 @@ func (x *KeptDisksRequest) GetDryRun() bool {
 func (x *KeptDisksRequest) GetExpectPaths() []string {
 	if x != nil {
 		return x.ExpectPaths
+	}
+	return nil
+}
+
+func (x *KeptDisksRequest) GetExpectSnapshots() []string {
+	if x != nil {
+		return x.ExpectSnapshots
 	}
 	return nil
 }
@@ -3387,10 +3395,11 @@ type KeptDiskChain struct {
 	MissingBase   string                 `protobuf:"bytes,4,opt,name=missing_base,json=missingBase,proto3" json:"missing_base,omitempty"` // the backing file the chain names that does not exist; "" when whole
 	KeptAt        string                 `protobuf:"bytes,5,opt,name=kept_at,json=keptAt,proto3" json:"kept_at,omitempty"`                // RFC3339: when the delete recorded it, or when its note was last written
 	Reason        string                 `protobuf:"bytes,6,opt,name=reason,proto3" json:"reason,omitempty"`
-	Records       []string               `protobuf:"bytes,7,rep,name=records,proto3" json:"records,omitempty"`    // the note and the record file naming it
-	Held          string                 `protobuf:"bytes,8,opt,name=held,proto3" json:"held,omitempty"`          // why a release is refused now; "" when it may be released
-	Released      bool                   `protobuf:"varint,9,opt,name=released,proto3" json:"released,omitempty"` // removed by this request
-	Host          string                 `protobuf:"bytes,10,opt,name=host,proto3" json:"host,omitempty"`         // the host its files are on, when not the host answering (a record of another host's disk): listed only
+	Records       []string               `protobuf:"bytes,7,rep,name=records,proto3" json:"records,omitempty"`      // the note and the record file naming it
+	Held          string                 `protobuf:"bytes,8,opt,name=held,proto3" json:"held,omitempty"`            // why a release is refused now; "" when it may be released
+	Released      bool                   `protobuf:"varint,9,opt,name=released,proto3" json:"released,omitempty"`   // removed by this request
+	Host          string                 `protobuf:"bytes,10,opt,name=host,proto3" json:"host,omitempty"`           // the host its files are on, when not the host answering (a record of another host's disk): listed only
+	Snapshots     []string               `protobuf:"bytes,11,rep,name=snapshots,proto3" json:"snapshots,omitempty"` // the deleted VM's snapshot records on this host a release of the VM drops with its files (no VM of the name exists, and each memory image is gone or released too)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3493,6 +3502,13 @@ func (x *KeptDiskChain) GetHost() string {
 		return x.Host
 	}
 	return ""
+}
+
+func (x *KeptDiskChain) GetSnapshots() []string {
+	if x != nil {
+		return x.Snapshots
+	}
+	return nil
 }
 
 type KeptDisksResponse struct {
@@ -46690,18 +46706,19 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\brestored\x18\x04 \x01(\tR\brestored\x12\x1f\n" +
 	"\vrestored_to\x18\x05 \x01(\tR\n" +
 	"restoredTo\x12\x1b\n" +
-	"\tset_aside\x18\x06 \x01(\tR\bsetAside\"|\n" +
+	"\tset_aside\x18\x06 \x01(\tR\bsetAside\"\xa7\x01\n" +
 	"\x10KeptDisksRequest\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x18\n" +
 	"\arelease\x18\x02 \x01(\tR\arelease\x12\x17\n" +
 	"\adry_run\x18\x03 \x01(\bR\x06dryRun\x12!\n" +
-	"\fexpect_paths\x18\x04 \x03(\tR\vexpectPaths\"k\n" +
+	"\fexpect_paths\x18\x04 \x03(\tR\vexpectPaths\x12)\n" +
+	"\x10expect_snapshots\x18\x05 \x03(\tR\x0fexpectSnapshots\"k\n" +
 	"\fKeptDiskFile\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x1d\n" +
 	"\n" +
 	"size_bytes\x18\x02 \x01(\x03R\tsizeBytes\x12\x14\n" +
 	"\x05under\x18\x03 \x01(\bR\x05under\x12\x12\n" +
-	"\x04gone\x18\x04 \x01(\bR\x04gone\"\xa8\x02\n" +
+	"\x04gone\x18\x04 \x01(\bR\x04gone\"\xc6\x02\n" +
 	"\rKeptDiskChain\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12/\n" +
 	"\x05files\x18\x02 \x03(\v2\x19.litevirt.v1.KeptDiskFileR\x05files\x12\x1b\n" +
@@ -46713,7 +46730,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04held\x18\b \x01(\tR\x04held\x12\x1a\n" +
 	"\breleased\x18\t \x01(\bR\breleased\x12\x12\n" +
 	"\x04host\x18\n" +
-	" \x01(\tR\x04host\"t\n" +
+	" \x01(\tR\x04host\x12\x1c\n" +
+	"\tsnapshots\x18\v \x03(\tR\tsnapshots\"t\n" +
 	"\x11KeptDisksResponse\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x122\n" +
 	"\x06chains\x18\x02 \x03(\v2\x1a.litevirt.v1.KeptDiskChainR\x06chains\x12\x17\n" +

@@ -255,7 +255,8 @@ message KeptDisksRequest {
     string host         = 1;  // "" = the host answering
     string release      = 2;  // a deleted VM's name, or a file of a kept chain (absolute path); "" lists only
     bool   dry_run      = 3;  // with release: answer what it would remove, and why it is refused, removing nothing
-    repeated string expect_paths = 4;  // with release: the files the caller confirmed; refused, removing nothing, when the release would remove any other set
+    repeated string expect_paths = 4;  // with release (required unless dry_run): the files the caller confirmed; refused, removing nothing, when the release would remove any other set
+    repeated string expect_snapshots = 5;  // with release: the deleted VM's snapshot records the caller confirmed it drops (KeptDiskChain.snapshots); refused when they differ
 }
 message KeptDiskFile {
     string path       = 1;
@@ -274,6 +275,7 @@ message KeptDiskChain {
     string held      = 8;  // why a release is refused now; "" when it may be released
     bool   released  = 9;  // removed by this request
     string host      = 10; // the host its files are on, when not the host answering (a record of another host's disk): listed only
+    repeated string snapshots = 11; // the deleted VM's snapshot records on this host a release of the VM drops with its files (no VM of the name exists, and each memory image is gone or released too)
 }
 message KeptDisksResponse {
     string host    = 1;

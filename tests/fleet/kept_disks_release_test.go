@@ -19,15 +19,17 @@ import (
 // rc4 lab 2, drill 5: the disks a stale-record delete kept while a peer was
 // silent stayed, with disk_leftover, until someone deleted the files and the
 // records by hand. `lv host kept-disks <host> --release <vm>`, asked on
-// another node, is answered on the host that holds them: refused while the
-// deleted VM's snapshot record is still taken over the chain, removing
-// nothing; once that record is gone, it removes the whole chain (the overlay,
-// the base under it, never the image they stand on), its kept-disk note and
-// its kept-disks.json entry, writes an audit row there, and disk_leftover
-// clears.
+// another node, is answered on the host that holds them. Its dry run names
+// the deleted VM's snapshot record s1, taken over the chain, which `lv
+// snapshot rm` can no longer reach; a release that did not confirm it is
+// refused, removing nothing. Confirmed, it removes the whole chain (the
+// overlay, the base under it, never the image they stand on), its kept-disk
+// note and kept-disks.json entry, and the record, writes an audit row there,
+// and disk_leftover clears.
 //
 // Red without the release (the RPC does not exist). Mutations: drop the
-// snapshot record refusal: red at the refusal; drop the note removal: red.
+// expect_snapshots compare: red at the refusal; drop the note removal: red;
+// drop the record's removal: red.
 func TestFleet_KeptDisksReleaseRemovesTheChainAndClearsDiskLeftover(t *testing.T) {
 	ctx := context.Background()
 	stageFakeGenisoimage(t)
@@ -94,10 +96,15 @@ func TestFleet_KeptDisksReleaseRemovesTheChainAndClearsDiskLeftover(t *testing.T
 		t.Fatalf("kept-disks on %s = %+v; want sv's chain, %s then %s under it", n.Name, list, ov, base)
 	}
 
-	// Refused while the deleted VM's snapshot record is taken over it.
-	_, err = ask.KeptDisks(ctx, &pb.KeptDisksRequest{Host: n.Name, Release: "sv"})
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "snapshot records s1 of VM sv") {
-		t.Fatalf("release sv with its snapshot record = %v; want FailedPrecondition naming it", err)
+	// The dry run names the record; a release that did not confirm it is
+	// refused.
+	plan, err := ask.KeptDisks(ctx, &pb.KeptDisksRequest{Host: n.Name, Release: "sv", DryRun: true})
+	if err != nil || len(plan.Chains) != 1 || plan.Chains[0].Held != "" || len(plan.Chains[0].Snapshots) != 1 || plan.Chains[0].Snapshots[0] != "s1" {
+		t.Fatalf("dry run of release sv = %+v, %v; want it releasable, naming snapshot record s1", plan, err)
+	}
+	_, err = ask.KeptDisks(ctx, &pb.KeptDisksRequest{Host: n.Name, Release: "sv", ExpectPaths: []string{ov, base}})
+	if status.Code(err) != codes.Aborted || !strings.Contains(err.Error(), "snapshot records [s1]") {
+		t.Fatalf("release sv without confirming its snapshot record = %v; want Aborted naming it", err)
 	}
 	for _, p := range []string{ov, base, note} {
 		if _, err := os.Stat(p); err != nil {
@@ -105,10 +112,7 @@ func TestFleet_KeptDisksReleaseRemovesTheChainAndClearsDiskLeftover(t *testing.T
 		}
 	}
 
-	if err := corrosion.DeleteSnapshot(ctx, n.DB, "sv", "s1"); err != nil {
-		t.Fatalf("drop sv's snapshot record: %v", err)
-	}
-	resp, err := ask.KeptDisks(ctx, &pb.KeptDisksRequest{Host: n.Name, Release: "sv", ExpectPaths: []string{ov, base}})
+	resp, err := ask.KeptDisks(ctx, &pb.KeptDisksRequest{Host: n.Name, Release: "sv", ExpectPaths: []string{ov, base}, ExpectSnapshots: []string{"s1"}})
 	if err != nil {
 		t.Fatalf("release sv: %v", err)
 	}
@@ -124,6 +128,9 @@ func TestFleet_KeptDisksReleaseRemovesTheChainAndClearsDiskLeftover(t *testing.T
 		if _, err := os.Stat(image); err != nil {
 			t.Errorf("the image the chain stood on, %s, went with it: %v", image, err)
 		}
+	}
+	if sn, _ := corrosion.GetSnapshot(ctx, n.DB, "sv", "s1"); sn != nil {
+		t.Errorf("sv's snapshot record s1 survived the release: %+v", sn)
 	}
 	if b, _ := os.ReadFile(registry); strings.Contains(string(b), ov) {
 		t.Errorf("kept-disks.json still names %s after the release: %s", ov, b)

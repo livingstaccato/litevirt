@@ -322,9 +322,10 @@ it reads, these are refused on that host, and `disk_leftover` names the file
 (`creates_refused`): every `lv import`; every create or `lv clone` that writes
 a disk file on the host's own storage (one with no disk file, or with every
 disk on shared nfs, ceph or iscsi storage outside the disk directory, goes
-ahead); and every `lv backup restore-from` or `lv backup restore-live` with
-`--target-path`. With the record readable, a clone or a `--target-path` restore
-that would write a kept overlay's missing base is refused as a create is. A
+ahead); every disk attach that creates a new disk; and every `lv backup
+restore-from` or `lv backup restore-live` with `--target-path`. With the record
+readable, a clone, a disk attach or a `--target-path` restore that would write
+a kept overlay's missing base is refused as a create is. A
 restore to the file the daemon names, or `--in-place` over the VM's own disk,
 is not checked: the first is a fresh name no overlay can name, the second a
 file that exists. A create whose `<vm>-*` files in the disk directory cannot be

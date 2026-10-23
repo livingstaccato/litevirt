@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
 // A clone writes a new disk file at <disks>/<target>-<disk>.qcow2, as a
@@ -115,4 +116,43 @@ func TestRestore_ToANamedTargetGetsTheKeptCreateChecks(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A disk attach writes a new file at <disks>/<vm>-<disk>.qcow2, as a create
+// does, and gets the same check.
+//
+// Mutation: drop the keptPathRefusal call from AttachDevice: both subtests
+// red.
+func TestAttachDevice_GetsTheKeptCreateChecks(t *testing.T) {
+	attach := func(s *Server) error {
+		_, err := s.AttachDevice(adminCtx(), &pb.AttachDeviceRequest{
+			VmName: "vm1", Disk: &pb.DiskSpec{Name: "data1", Size: "1G", Bus: "virtio"},
+		})
+		return err
+	}
+	t.Run("a kept overlay names the new disk as its missing base", func(t *testing.T) {
+		s := hotplugDiskServer(t)
+		enableHardwareV2(t, s)
+		seedDiskVM(t, s, "vm1", "stopped")
+		base, err := lv.SafeDiskPath(s.dataDir, "vm1", "data1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		top := registryKeep(t, s, "old", base)
+		if err := attach(s); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), top) {
+			t.Fatalf("attach = %v; want FailedPrecondition naming the overlay %s", err, top)
+		}
+		if exists(base) {
+			t.Fatal("a refused attach wrote the kept overlay's missing base")
+		}
+	})
+	t.Run("kept state unreadable", func(t *testing.T) {
+		s := hotplugDiskServer(t)
+		enableHardwareV2(t, s)
+		seedDiskVM(t, s, "vm1", "stopped")
+		named := keptUnknown(t, s, "registry")
+		if err := attach(s); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), named) {
+			t.Fatalf("attach = %v; want FailedPrecondition naming %s", err, named)
+		}
+	})
 }

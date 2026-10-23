@@ -3474,7 +3474,8 @@ names, cannot be read, what a kept overlay backs on is unknown, and these are
 refused on that host whatever their names: every import; every create or
 clone that writes a disk file on the host's own storage (one with no disk
 file, or with every disk on shared nfs, ceph or iscsi storage outside the disk
-directory, goes ahead); and every backup restore to a `--target-path`. The
+directory, goes ahead); every disk attach that creates a new disk; and every
+backup restore to a `--target-path`. The
 evidence names the file under `creates_refused` (the condition is raised for
 it alone, and resolves once it reads).
 

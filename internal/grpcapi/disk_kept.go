@@ -290,7 +290,8 @@ func (s *Server) judgeKeptDisks(ctx context.Context) {
 	records, unreadable := s.diskKeptRecords()
 	// What a kept overlay backs on, unknown while the record or a kept chain
 	// cannot be read, holds every import, every create or clone here that
-	// writes a local disk file, and every restore to a named target
+	// writes a local disk file, every disk attach, and every restore to a
+	// named target
 	// (keptMissingBaseRefusal): named here, not only in each refusal.
 	// Storage that does not answer is left to the conditions about it.
 	createsRefused := ""
@@ -385,8 +386,8 @@ func (s *Server) judgeKeptDisks(ctx context.Context) {
 	if createsRefused != "" {
 		evidence["creates_refused"] = fmt.Sprintf("%s. Until it reads, these are refused on %s, whatever their names: every import; "+
 			"every VM create or clone that writes a disk file on the host's own storage (one with no disk file, or with every disk "+
-			"on shared nfs, ceph or iscsi storage outside the disk directory, goes ahead); and every backup restore-from or "+
-			"restore-live to a --target-path. What a kept overlay backs on is unknown, and a new disk there could become its base",
+			"on shared nfs, ceph or iscsi storage outside the disk directory, goes ahead); every disk attach that creates a disk; "+
+			"and every backup restore-from or restore-live to a --target-path. What a kept overlay backs on is unknown, and a new disk there could become its base",
 			createsRefused, s.hostName)
 	}
 	ev, _ := json.Marshal(evidence)

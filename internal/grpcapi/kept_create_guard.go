@@ -163,7 +163,7 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 // disk's backing chain cannot be read (keptRegistryChains). Unlike the other
 // kept-file refusals it does not depend on the name being created: until the
 // file it names reads, every import, every create or clone that writes a disk
-// file here, and every restore to a named target meets it. It wraps the error the caller maps to a code (KeptBackingFileError, or
+// file here, every disk attach, and every restore to a named target meets it. It wraps the error the caller maps to a code (KeptBackingFileError, or
 // a plain retryable one).
 type keptChainsUnknownError struct{ err error }
 

@@ -345,7 +345,8 @@ again, which clears for them. It removes whole chains, each overlay before the
 file it backs on, never a file under a chain it leaves. Of a chain it removes
 only the deleted VM's own files: those its note or record names, and the
 `<vm>-<disk>.qcow2` files a create of exactly that name would clear (never VM
-`<vm>-1`'s). Every file below them (an image, another VM's disk, a file in a
+`<vm>-1`'s). A link among them counts as the link only, never as the file it
+points at. Every file below them (an image, another VM's disk, a file in a
 directory named like the VM) stays, listed under what the chain stands on. It
 removes regular files on this host's own storage only: a record naming a
 device node, a link (an LVM or zvol volume) or a file on shared storage is
@@ -363,7 +364,9 @@ the file. The deleted VM's snapshot records on that host are taken over these
 files, and `lv snapshot rm` cannot reach them once the VM is gone: a release
 of every chain of the VM drops them with the files when no VM of the name
 exists on any host and each memory image is unrecorded, gone, or a file the
-release removes. The plan names them; otherwise they refuse it. It shows
+release removes. Once the files are gone it checks again: a VM of the name that
+now exists, or a record that is no longer the one the plan saw, keeps the
+records. The plan names them; otherwise they refuse it. It shows
 exactly what it removes and drops and asks to confirm (`--yes` skips the
 question; without a terminal it is required); the files and records confirmed
 are sent with the release (the files are required), and a release that would

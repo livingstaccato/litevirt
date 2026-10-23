@@ -94,14 +94,33 @@ type keptChainOf struct {
 // the VM elsewhere, not an image, not another VM's disk a kept clone backs
 // on. Those stay, as what the chain stands on. A path whose resolution does
 // not answer is an error: what it is cannot be told.
+//
+// A path that is a symlink counts as itself only, never as its target: a
+// create's sweep of a <vm>-<disk>.qcow2 link unlinks the link and never
+// touches what it points at, so the target is no file of the VM's own (the
+// link itself, as a layer, is held as no regular file). Only a regular file
+// counts by its resolved form too, so a disk directory reached through a
+// symlinked prefix still matches.
 func (s *Server) keptOwnSet(vm string, named map[string]bool) (map[string]bool, error) {
 	own := map[string]bool{}
 	add := func(p string) error {
+		p = filepath.Clean(p)
+		own[p] = true
+		fi, err := storage.Bounded("stat", p, func() (os.FileInfo, error) { return os.Lstat(p) })
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("%s cannot be read (%w)", p, err)
+		}
+		if !fi.Mode().IsRegular() {
+			return nil
+		}
 		r, err := resolvedStrict(p)
 		if err != nil {
 			return fmt.Errorf("%s cannot be resolved (%w)", p, err)
 		}
-		own[filepath.Clean(p)], own[r] = true, true
+		own[r] = true
 		return nil
 	}
 	for p := range named {
@@ -130,6 +149,10 @@ var keptSharedStoreOf = sharedStoreOfErr
 // keptReleaseBeforeRemove runs just before a release looks at a file it is
 // about to remove; a test replaces it.
 var keptReleaseBeforeRemove = func(string) {}
+
+// keptReleaseBeforeSnapshotDrop runs once the files are gone, just before a
+// release checks the snapshot records it drops again; a test replaces it.
+var keptReleaseBeforeSnapshotDrop = func() {}
 
 // keptUnits is every kept chain on this host, by VM, then by top. A note,
 // kept-disks.json, or a chain that cannot be read is an error: what a release
@@ -439,7 +462,10 @@ func (s *Server) keptUnitHeld(ctx context.Context, u *keptUnit, all []*keptUnit)
 			files = append(files, f.path)
 		}
 	}
-	snaps, held = s.keptSnapshotsDroppable(ctx, u, all)
+	recs, held := s.keptSnapshotsDroppable(ctx, u, all)
+	for _, r := range recs {
+		snaps = append(snaps, r.Name)
+	}
 	if held != "" || len(files) == 0 {
 		return held, snaps
 	}
@@ -656,7 +682,7 @@ func (s *Server) keptUnitHeld(ctx context.Context, u *keptUnit, all []*keptUnit)
 //   - the release takes every chain of the VM (a release of one chain leaves
 //     files the records are taken over);
 //   - the caller confirmed them (expect_snapshots), as the dry run lists them.
-func (s *Server) keptSnapshotsDroppable(ctx context.Context, u *keptUnit, all []*keptUnit) ([]string, string) {
+func (s *Server) keptSnapshotsDroppable(ctx context.Context, u *keptUnit, all []*keptUnit) ([]corrosion.SnapshotRecord, string) {
 	recs, err := corrosion.ListSnapshots(ctx, s.db, u.vm)
 	if err != nil {
 		return nil, fmt.Sprintf("cannot tell whether a snapshot record names it (%v); retry", err)
@@ -710,7 +736,7 @@ func (s *Server) keptSnapshotsDroppable(ctx context.Context, u *keptUnit, all []
 		return nil, fmt.Sprintf("the snapshot records %s of VM %s on %s are taken over these files, and the memory image %s of %s is no file a release "+
 			"removes; remove that image by hand once nothing needs it, then release again", list, u.vm, s.hostName, p, sn.Name)
 	}
-	return names, ""
+	return mine, ""
 }
 
 func uniq(a, b string) []string {
@@ -924,6 +950,20 @@ func (s *Server) releaseKept(ctx context.Context, req *pb.KeptDisksRequest, acto
 		return nil, refuse(codes.Aborted, "it would now drop the snapshot records [%s] of VM %s, not the ones confirmed [%s]; run it again to see what it drops",
 			strings.Join(snaps, ", "), vm, strings.Join(req.ExpectSnapshots, ", "))
 	}
+	// The records themselves, as this plan sees them: each is dropped only
+	// while it is still that record (keptSnapshotStill).
+	var planSnaps []corrosion.SnapshotRecord
+	if len(snaps) > 0 {
+		recs, h := s.keptSnapshotsDroppable(ctx, targets[0], units)
+		var names []string
+		for _, r := range recs {
+			names = append(names, r.Name)
+		}
+		if h != "" || !sameStrings(names, snaps, false) {
+			return nil, refuse(codes.Aborted, "the snapshot records of VM %s changed while the release was planned; run it again to see what it drops", vm)
+		}
+		planSnaps = recs
+	}
 	// Every file a release removes is named in the note first, so a failure
 	// part way leaves the rest named (a base the VM owned only by its name,
 	// under an overlay now gone, would otherwise be named nowhere).
@@ -1003,15 +1043,35 @@ func (s *Server) releaseKept(ctx context.Context, req *pb.KeptDisksRequest, acto
 			break
 		}
 	}
-	// The snapshot records go once every file they are taken over is gone.
+	// The snapshot records go once every file they are taken over is gone,
+	// and only while no VM of the name exists and each is still the record
+	// the plan saw: a same-name VM on another host does not wait on this
+	// host's lock, and may have taken a snapshot of the same name meanwhile.
 	var dropped []string
-	if failed == nil {
-		for _, n := range snaps {
-			if err := corrosion.DeleteSnapshot(ctx, s.db, vm, n); err != nil {
-				failed = fmt.Errorf("the files are removed, and the snapshot record %s could not be dropped (%w)", n, err)
+	if failed == nil && len(planSnaps) > 0 {
+		keptReleaseBeforeSnapshotDrop()
+		cur, err := corrosion.GetVM(ctx, s.db, vm)
+		switch {
+		case err != nil:
+			failed = fmt.Errorf("the files are removed; whether a VM %s exists cannot be read now (%w), so its snapshot records %s were kept",
+				vm, err, strings.Join(snaps, ", "))
+		case cur != nil:
+			failed = fmt.Errorf("the files are removed; a VM %s now exists (on %s), so the snapshot records %s were kept: they may be its own",
+				vm, cur.HostName, strings.Join(snaps, ", "))
+		}
+		for _, r := range planSnaps {
+			if failed != nil {
 				break
 			}
-			dropped = append(dropped, n)
+			if why := s.keptSnapshotStill(ctx, r); why != "" {
+				failed = fmt.Errorf("the files are removed; %s, so it and the records after it were kept", why)
+				break
+			}
+			if err := corrosion.DeleteSnapshot(ctx, s.db, vm, r.Name); err != nil {
+				failed = fmt.Errorf("the files are removed, and the snapshot record %s could not be dropped (%w)", r.Name, err)
+				break
+			}
+			dropped = append(dropped, r.Name)
 		}
 		if len(resp.Chains) > 0 {
 			resp.Chains[0].Snapshots = dropped
@@ -1033,6 +1093,27 @@ func (s *Server) releaseKept(ctx context.Context, req *pb.KeptDisksRequest, acto
 	s.auditAs(ctx, actor, keptReleaseAudit, s.hostName, detail, "ok")
 	s.recordVMEvent(ctx, vm, "vm.disk.released", "ok", detail)
 	return resp, nil
+}
+
+// keptSnapshotStill is why the live snapshot record of r's VM and name is no
+// longer r: gone, or another record. "" when it is r. A record re-created
+// under a dropped name takes the dropped row's id back
+// (corrosion.InsertSnapshot), so the id alone does not tell them apart: the
+// host and the time it was taken do. The drop that follows is by (VM, name),
+// the one replicated shape older peers apply; this check is what binds it to
+// the record the plan saw.
+func (s *Server) keptSnapshotStill(ctx context.Context, r corrosion.SnapshotRecord) string {
+	cur, err := corrosion.GetSnapshot(ctx, s.db, r.VMName, r.Name)
+	switch {
+	case err != nil:
+		return fmt.Sprintf("the snapshot record %s of VM %s cannot be read again (%v)", r.Name, r.VMName, err)
+	case cur == nil:
+		return fmt.Sprintf("the snapshot record %s of VM %s is gone", r.Name, r.VMName)
+	case cur.ID != r.ID || cur.HostName != r.HostName || cur.CreatedAt != r.CreatedAt:
+		return fmt.Sprintf("the snapshot record %s of VM %s is no longer the one the release checked (id %s on %s, taken %s; now id %s on %s, taken %s)",
+			r.Name, r.VMName, r.ID, r.HostName, r.CreatedAt, cur.ID, cur.HostName, cur.CreatedAt)
+	}
+	return ""
 }
 
 // forgetKeptRecords drops from kept-disks.json each of regs whose file is in

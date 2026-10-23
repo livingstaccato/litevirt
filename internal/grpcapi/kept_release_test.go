@@ -545,3 +545,140 @@ func TestKeptRelease_DropsTheDeletedVMsSnapshotRecords(t *testing.T) {
 		keptIntact(t, s, top, base, img)
 	})
 }
+
+// Rule N1 (re-review of 6e0e84971): a <vm>-<disk>.qcow2 in the disk directory
+// that is a symlink to a file elsewhere, or a noted path that is one, counts
+// as the link only. Its target is never the VM's own: a kept chain backing on
+// the target leaves it, listed as what the chain stands on, and a link the
+// release would itself remove refuses the release.
+//
+// Red on 6e0e84971 (the reviewer's probe TestProbe_SymlinkedCandidateTargetCountsAsOwn:
+// the target is removed). Mutation: count a symlink's resolved target as own
+// again: red.
+func TestKeptRelease_NeverTakesASymlinksTarget(t *testing.T) {
+	t.Run("a candidate named like the VM's disk", func(t *testing.T) {
+		s, _ := provableCreateServer(t)
+		elsewhere := filepath.Join(t.TempDir(), "golden.qcow2")
+		if err := qcow2.Create(elsewhere, 1<<20, nil); err != nil {
+			t.Fatal(err)
+		}
+		top := s.images.DiskPath("web", "root")
+		if err := os.MkdirAll(filepath.Dir(top), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := qcow2.CreateWithBackingFormat(top, elsewhere, "qcow2", 0, nil); err != nil {
+			t.Fatal(err)
+		}
+		link := s.images.DiskPath("web", "data")
+		if err := os.Symlink(elsewhere, link); err != nil {
+			t.Fatal(err)
+		}
+		if err := health.NoteKeptDisks(s.dataDir, "web", []string{top}); err != nil {
+			t.Fatal(err)
+		}
+		resp, err := keptRelease(s, "web")
+		if err != nil {
+			t.Fatalf("release web: %v", err)
+		}
+		if _, err := os.Stat(elsewhere); err != nil {
+			t.Fatalf("%s, reached only through a symlink named like web's disk, was removed: %v", elsewhere, err)
+		}
+		if _, err := os.Lstat(link); err != nil {
+			t.Errorf("the link %s went: %v", link, err)
+		}
+		if len(resp.Chains) != 1 || !slices.Contains(resp.Chains[0].StandsOn, elsewhere) {
+			t.Errorf("release answer = %+v; want %s under stands_on", resp.Chains, elsewhere)
+		}
+	})
+	t.Run("a noted path", func(t *testing.T) {
+		s, _ := provableCreateServer(t)
+		elsewhere := filepath.Join(t.TempDir(), "golden.qcow2")
+		if err := qcow2.Create(elsewhere, 1<<20, nil); err != nil {
+			t.Fatal(err)
+		}
+		top := s.images.DiskPath("web", "root")
+		if err := os.MkdirAll(filepath.Dir(top), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := qcow2.CreateWithBackingFormat(top, elsewhere, "qcow2", 0, nil); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(filepath.Dir(top), "web-base.link")
+		if err := os.Symlink(elsewhere, link); err != nil {
+			t.Fatal(err)
+		}
+		if err := health.NoteKeptDisks(s.dataDir, "web", []string{top}); err != nil {
+			t.Fatal(err)
+		}
+		if err := health.NoteKeptBackingFiles(s.dataDir, "web", []string{link}); err != nil {
+			t.Fatal(err)
+		}
+		_, err := keptRelease(s, "web")
+		keptRefusedNaming(t, err, codes.FailedPrecondition, "is no regular file")
+		for _, p := range []string{elsewhere, top} {
+			if _, err := os.Stat(p); err != nil {
+				t.Errorf("%s went in a refused release: %v", p, err)
+			}
+		}
+	})
+}
+
+// Rule N2: the snapshot records a release drops are checked again once the
+// files are gone. A VM of the name that now exists keeps them all; a record
+// that is no longer the one the plan saw (dropped and taken again under the
+// same name, which reuses the id) is kept, with the records after it.
+//
+// Mutations: drop the re-check for a VM: red; drop the record identity
+// check: red.
+func TestKeptRelease_RechecksTheSnapshotRecordsBeforeDropping(t *testing.T) {
+	setup := func(t *testing.T) (*Server, string, string) {
+		t.Helper()
+		s, _ := provableCreateServer(t)
+		top, base := keptChainFixture(t, s)
+		if err := corrosion.InsertSnapshot(adminCtx(), s.db, corrosion.SnapshotRecord{ID: "snap-1", VMName: "old", HostName: s.hostName,
+			Name: "s1", State: "ok", CreatedAt: "2026-10-01T00:00:00Z"}); err != nil {
+			t.Fatal(err)
+		}
+		return s, top, base
+	}
+	hook := func(t *testing.T, fn func()) {
+		prev := keptReleaseBeforeSnapshotDrop
+		keptReleaseBeforeSnapshotDrop = fn
+		t.Cleanup(func() { keptReleaseBeforeSnapshotDrop = prev })
+	}
+	t.Run("a VM of the name appears", func(t *testing.T) {
+		s, _, _ := setup(t)
+		hook(t, func() {
+			if err := corrosion.InsertVM(adminCtx(), s.db, corrosion.VMRecord{Name: "old", HostName: "node-x", State: "stopped"}, nil, nil); err != nil {
+				t.Error(err)
+			}
+		})
+		_, err := keptRelease(s, "old")
+		if err == nil || !strings.Contains(err.Error(), "a VM old now exists") {
+			t.Fatalf("release while a VM old appears = %v; want it to keep the records, naming the VM", err)
+		}
+		if sn, _ := corrosion.GetSnapshot(adminCtx(), s.db, "old", "s1"); sn == nil {
+			t.Error("snapshot record s1 was dropped although a VM old now exists")
+		}
+	})
+	t.Run("the record is taken again under the same name", func(t *testing.T) {
+		s, _, _ := setup(t)
+		hook(t, func() {
+			if err := corrosion.DeleteSnapshot(adminCtx(), s.db, "old", "s1"); err != nil {
+				t.Error(err)
+			}
+			if err := corrosion.InsertSnapshot(adminCtx(), s.db, corrosion.SnapshotRecord{ID: "snap-2", VMName: "old", HostName: "node-x",
+				Name: "s1", State: "ok", CreatedAt: "2026-10-23T12:00:00Z"}); err != nil {
+				t.Error(err)
+			}
+		})
+		_, err := keptRelease(s, "old")
+		if err == nil || !strings.Contains(err.Error(), "is no longer the one the release checked") {
+			t.Fatalf("release while s1 is taken again = %v; want it kept, naming the record", err)
+		}
+		sn, _ := corrosion.GetSnapshot(adminCtx(), s.db, "old", "s1")
+		if sn == nil || sn.HostName != "node-x" {
+			t.Errorf("the new record s1 = %+v; want it live, on node-x", sn)
+		}
+	})
+}

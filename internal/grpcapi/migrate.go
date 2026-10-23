@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -82,6 +83,13 @@ func (s *Server) withinDiskArtifactRoot(p string) bool {
 	if safename.Contains(filepath.Join(s.dataDir, "disks"), p) {
 		return true
 	}
+	return slices.ContainsFunc(s.filePoolRoots(), func(root string) bool { return safename.Contains(root, p) })
+}
+
+// filePoolRoots is the directory of each usable file-based pool: with
+// <data_dir>/disks, where withinDiskArtifactRoot lets VM disk artifacts live.
+func (s *Server) filePoolRoots() []string {
+	var roots []string
 	s.storagePoolsMu.RLock()
 	pools := make(map[string]StoragePoolRef, len(s.storagePools))
 	for n, pr := range s.storagePools {
@@ -92,11 +100,11 @@ func (s *Server) withinDiskArtifactRoot(p string) bool {
 		if !isFileBasedDriver(pr.Driver) || !s.poolUsableForWrite(context.Background(), n, pr) {
 			continue
 		}
-		if dir, derr := fileBasedPoolDir(s.dataDir, pr); derr == nil && safename.Contains(dir, p) {
-			return true
+		if dir, derr := fileBasedPoolDir(s.dataDir, pr); derr == nil {
+			roots = append(roots, dir)
 		}
 	}
-	return false
+	return roots
 }
 
 // errLibvirtCallUnanswered is the answer of a libvirt call whose goroutine

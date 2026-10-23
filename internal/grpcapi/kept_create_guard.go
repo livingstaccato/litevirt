@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,11 +40,13 @@ import (
 // path, and the new disk would become its base.
 //
 // A note, kept-disks.json, a kept disk's chain or the chain of a file beside
-// it that cannot be read refuses too, whether or not the create clears
-// anything: what it would keep is then unknown (keptRegistryChains,
-// walkKeptChain; a backing file that does not exist ends a chain, and holds
-// nothing). Only storage or the database not answering is retryable;
-// anything else is KeptBackingFileError, naming the entry and the way out.
+// it that cannot be read refuses a create that clears a file: what it would
+// keep is then unknown (keptRegistryChains, walkKeptChain; a backing file
+// that does not exist ends a chain, and holds nothing). A create that clears
+// nothing is judged by the disk files on this host instead while
+// kept-disks.json or a kept chain cannot be read (keptCollisionOnDisk). Only
+// storage or the database not answering is retryable; anything else is
+// KeptBackingFileError, naming the entry and the way out.
 func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files []string, writes func(string) bool, notesGovern bool) error {
 	present := map[string]bool{}
 	var dirs []string
@@ -171,26 +174,135 @@ func missingBaseRefusal(c keptRegistryChain, registry string) error {
 
 // keptMissingBaseRefusal is keptFileCreateRefusal's check of a create that
 // clears nothing: one that writes the missing backing file of a kept disk's
-// chain is refused. A registry or a chain that cannot be read refuses too:
-// whether a kept overlay names a path the create writes as its missing base
-// is then unknown.
+// chain is refused. While the registry or a chain in it cannot be read, the
+// disk files on this host are judged instead (keptCollisionOnDisk).
 func (s *Server) keptMissingBaseRefusal(ctx context.Context, writes func(string) bool) error {
+	registry := filepath.Join(s.dataDir, diskKeptFile)
 	chains, err := s.keptRegistryChains(ctx)
 	if err != nil {
-		var re *keptRegistryError
-		if errors.As(err, &re) && re.transient {
-			return fmt.Errorf("whether a disk a delete kept backs on a path the create writes cannot be told: %v; nothing was created", err)
-		}
-		return health.NewKeptBackingFileError(fmt.Sprintf("whether a disk a delete kept backs on a path the create writes cannot be told: "+
-			"%v; nothing was created", err))
+		return s.keptCollisionOnDisk(err, writes, registry)
 	}
-	registry := filepath.Join(s.dataDir, diskKeptFile)
 	for _, c := range chains {
 		if c.missing != "" && writes(c.missing) {
 			return missingBaseRefusal(c, registry)
 		}
 	}
 	return nil
+}
+
+// keptCollisionOnDisk judges a create that clears nothing while the registry
+// or a chain in it cannot be read (rerr), from the disk files on this host
+// (keptCollisionScan): one that writes a path a file there backs on, or one
+// already there, is refused, as what a delete kept cannot be told apart. Any
+// other create goes ahead, with a warning naming the registry. A scan that
+// cannot complete refuses: what is safe is then unknown. Retryable only when
+// storage or the database did not answer.
+func (s *Server) keptCollisionOnDisk(rerr error, writes func(string) bool, registry string) error {
+	var re *keptRegistryError
+	transient := errors.As(rerr, &re) && re.transient
+	hit, err := s.keptCollisionScan(writes)
+	if err != nil {
+		msg := fmt.Sprintf("whether a disk a delete kept backs on a path the create writes cannot be told: %v, and %v; nothing was created", rerr, err)
+		if transient || storage.IsFSNoAnswer(err) {
+			return errors.New(msg)
+		}
+		return health.NewKeptBackingFileError(msg)
+	}
+	if hit != "" {
+		return health.NewKeptBackingFileError(fmt.Sprintf("%s, and %v; whether that is a disk a delete kept cannot be told, "+
+			"so nothing was created (or place the VM on another host)", hit, rerr))
+	}
+	slog.Warn("create: the record of kept disks cannot be read; the create goes ahead, as no disk file on this host backs on a path it writes. "+
+		"Fix the record so that what deletes kept is judged by it again", "file", registry, "error", rerr)
+	return nil
+}
+
+// keptCollisionScan reads, without kept-disks.json, every file on this host
+// a kept overlay can be: each regular file at any depth under <data_dir>/disks,
+// the disk store's directory and each usable file pool's directory
+// (filePoolRoots), each file a kept-disk note names, and each kept-disks.json
+// entry of this host still held in memory. Each one's backing chain is read
+// in full (walkKeptChain). It returns how the first file that is, or backs
+// on, a path the create writes collides, or "" when none does; a directory or
+// a chain that cannot be read is an error.
+func (s *Server) keptCollisionScan(writes func(string) bool) (string, error) {
+	var files []string
+	seen := map[string]bool{}
+	add := func(p string) {
+		if p = filepath.Clean(p); filepath.IsAbs(p) && !seen[p] {
+			seen[p] = true
+			files = append(files, p)
+		}
+	}
+	dirs := []string{filepath.Join(s.dataDir, "disks")}
+	if s.images != nil {
+		dirs = append(dirs, s.images.DiskDir(""))
+	}
+	dirs = append(dirs, s.filePoolRoots()...)
+	listed := map[string]bool{}
+	for len(dirs) > 0 {
+		dir := filepath.Clean(dirs[len(dirs)-1])
+		dirs = dirs[:len(dirs)-1]
+		if listed[dir] {
+			continue
+		}
+		listed[dir] = true
+		ents, err := storage.Bounded("list", dir, func() ([]os.DirEntry, error) { return os.ReadDir(dir) })
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return "", fmt.Errorf("the disk directory %s on this host cannot be listed (%w)", dir, err)
+		}
+		for _, e := range ents {
+			switch p := filepath.Join(dir, e.Name()); {
+			case e.IsDir():
+				dirs = append(dirs, p)
+			case e.Type().IsRegular():
+				add(p)
+			}
+		}
+	}
+	noted, err := health.KeptNotedFiles(s.dataDir)
+	if err != nil {
+		return "", fmt.Errorf("this host's notes of the disks deletes kept cannot be read (%w)", err)
+	}
+	for f := range noted {
+		add(f)
+	}
+	records, _ := s.diskKeptRecords()
+	for _, r := range records {
+		if r.Host == s.hostName && r.Path != "" {
+			add(s.hostDiskFile(r.Path))
+		}
+	}
+	stat := chainStat // read here: the walk may outlive this call
+	for _, p := range files {
+		type walked struct {
+			layers  []string
+			missing string
+		}
+		w, err := storage.Bounded("read the backing chain of", p, func() (walked, error) {
+			l, m, err := walkKeptChain(stat, p, true)
+			return walked{l, m}, err
+		})
+		if err != nil {
+			return "", fmt.Errorf("the backing chain of %s on this host cannot be read (%w)", p, err)
+		}
+		for i, l := range w.layers {
+			switch {
+			case !writes(l):
+			case i == 0:
+				return fmt.Sprintf("the create writes %s, which is on this host already", l), nil
+			default:
+				return fmt.Sprintf("the create writes %s, which %s on this host backs on", l, p), nil
+			}
+		}
+		if w.missing != "" && writes(w.missing) {
+			return fmt.Sprintf("the create writes %s, which %s on this host backs on although it is missing", w.missing, p), nil
+		}
+	}
+	return "", nil
 }
 
 // createDiskPathOf reports whether a create of name writes a disk at p in

@@ -12,6 +12,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
 // Re-review 1, m1: a live disk row lifts a kept-disks.json entry's hold only
@@ -108,42 +109,136 @@ func TestCreateVM_NeverWritesTheMissingBaseOfAKeptOverlay(t *testing.T) {
 }
 
 // A create that clears nothing is refused while kept-disks.json, or a kept
-// disk's chain, cannot be read: whether a kept overlay names a path it
-// writes as its missing base is then unknown. keptMissingBaseRefusal let it
-// go ahead, and the new disk could become a kept overlay's base.
+// disk's chain, cannot be read, when what it writes may be what a kept
+// overlay backs on: keptMissingBaseRefusal let it go ahead, and the new disk
+// could become a kept overlay's base. With kept-disks.json unreadable the
+// disk files on this host decide (keptCollisionScan): an overlay there of
+// another name, at any depth, that names the path refuses, as does a file
+// there whose header cannot be read. A kept chain that cannot be read is
+// read by the scan too, from the entry held in memory, and still refuses.
 //
-// Mutation: return nil on a keptRegistryChains error in
-// keptMissingBaseRefusal again: both subtests red (the base is written).
+// Mutations: return nil on a keptRegistryChains error in
+// keptMissingBaseRefusal again: every subtest red (the base is written);
+// skip the subdirectories in keptCollisionScan: "an overlay in a
+// subdirectory" red; skip the walk's error: "a header on disk unreadable"
+// red; skip the in-memory entries: "a kept chain unreadable" red.
 func TestCreateVM_RefusesWhileWhatAKeptOverlayBacksOnCannotBeRead(t *testing.T) {
-	create := func(t *testing.T, s *Server, base, want string) {
+	create := func(t *testing.T, s *Server, base string, want ...string) {
 		t.Helper()
 		req := disklessCreateRequest("web")
 		req.Spec.Disks = []*pb.DiskSpec{{Name: "root", Size: "1M"}} // an empty disk at web-root.qcow2
 		_, err := s.CreateVM(adminCtx(), req)
-		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), want) {
-			t.Fatalf("create web = %v; want FailedPrecondition naming %q", err, want)
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("create web = %v; want FailedPrecondition", err)
+		}
+		for _, w := range want {
+			if !strings.Contains(err.Error(), w) {
+				t.Fatalf("create web = %v; want it naming %q", err, w)
+			}
 		}
 		if exists(base) {
 			t.Fatal("a refused create wrote a disk at the base path")
 		}
 	}
-	t.Run("kept-disks.json unreadable", func(t *testing.T) {
-		s, _ := provableCreateServer(t)
-		base := s.images.DiskPath("web", "root")
+	unreadableRegistry := func(t *testing.T, s *Server) {
+		t.Helper()
 		if err := os.WriteFile(filepath.Join(s.dataDir, diskKeptFile), []byte("[not json"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		create(t, s, base, diskKeptFile)
+	}
+	overlay := func(t *testing.T, ov, base string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(ov), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := qcow2.CreateWithBackingFormat(ov, base, "raw", 1<<20, nil); err != nil { // base missing
+			t.Fatal(err)
+		}
+	}
+	t.Run("kept-disks.json unreadable, an overlay of another name backs on the base", func(t *testing.T) {
+		s, _ := provableCreateServer(t)
+		base := s.images.DiskPath("web", "root")
+		ov := s.images.DiskPath("db", "snap1")
+		overlay(t, ov, base)
+		unreadableRegistry(t, s)
+		create(t, s, base, base, ov, diskKeptFile)
+		if !exists(ov) {
+			t.Fatal("the overlay went")
+		}
+	})
+	t.Run("kept-disks.json unreadable, an overlay in a subdirectory backs on the base", func(t *testing.T) {
+		s, _ := provableCreateServer(t)
+		base := s.images.DiskPath("web", "root")
+		ov := filepath.Join(s.dataDir, "disks", "db", "root.qcow2.kept-20261023")
+		overlay(t, ov, base)
+		unreadableRegistry(t, s)
+		create(t, s, base, base, ov)
+	})
+	t.Run("kept-disks.json unreadable, a header on disk unreadable", func(t *testing.T) {
+		s, _ := provableCreateServer(t)
+		base := s.images.DiskPath("web", "root")
+		bad := s.images.DiskPath("db", "root")
+		overlay(t, bad, filepath.Join(t.TempDir(), "elsewhere.qcow2"))
+		if err := os.Truncate(bad, 16); err != nil { // the magic, and no header to read
+			t.Fatal(err)
+		}
+		unreadableRegistry(t, s)
+		create(t, s, base, "the backing chain of "+bad, diskKeptFile)
 	})
 	t.Run("a kept chain unreadable", func(t *testing.T) {
 		s, _ := provableCreateServer(t)
 		base := s.images.DiskPath("web", "root")
-		top := registryKeep(t, s, "web", base)       // base missing
+		top := registryKeep(t, s, "web", base)       // base missing; top outside the disk roots
 		if err := os.Truncate(top, 16); err != nil { // the magic, and no header to read
 			t.Fatal(err)
 		}
 		create(t, s, base, "the backing chain of "+top)
 	})
+}
+
+// A create that clears nothing, while kept-disks.json cannot be read, goes
+// ahead when no disk file on this host is, or backs on, a path it writes:
+// whether a delete kept a file elsewhere does not bear on it. It is not
+// silent: the warning names the record and why it cannot be read.
+//
+// Mutations: refuse on every keptRegistryChains error in
+// keptMissingBaseRefusal (6eb32b40e): red; log the warning at Debug: red.
+func TestCreateVM_GoesAheadWhileKeptDisksJSONUnreadableWhenNothingCollides(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	base := s.images.DiskPath("web", "root")
+	other := s.images.DiskPath("db", "root")
+	if err := os.MkdirAll(filepath.Dir(other), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := qcow2.Create(other, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	ov := s.images.DiskPath("db", "snap1")
+	if err := qcow2.CreateWithBackingFormat(ov, other, "qcow2", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	registry := filepath.Join(s.dataDir, diskKeptFile)
+	if err := os.WriteFile(registry, []byte("[not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	log := captureSlog(t)
+	req := disklessCreateRequest("web")
+	req.Spec.Disks = []*pb.DiskSpec{{Name: "root", Size: "1M"}}
+	if _, err := s.CreateVM(adminCtx(), req); err != nil {
+		t.Fatalf("create web, with nothing on this host backing on its disk, while kept-disks.json cannot be read: %v", err)
+	}
+	if !exists(base) {
+		t.Fatal("the create wrote no disk: it did nothing, so this proves nothing")
+	}
+	var line string
+	for _, l := range strings.Split(log.String(), "\n") {
+		if strings.Contains(l, "the record of kept disks cannot be read; the create goes ahead") {
+			line = l
+		}
+	}
+	if !strings.Contains(line, "level=WARN") || !strings.Contains(line, registry) || !strings.Contains(line, "invalid character") {
+		t.Fatalf("no warning naming %s and why it cannot be read; log:\n%s", registry, log.String())
+	}
 }
 
 // Re-review 1, m3: replica pruning keeps a replica a kept-disks.json entry

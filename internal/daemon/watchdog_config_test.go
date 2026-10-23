@@ -13,6 +13,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/watchdog"
 )
 
@@ -229,5 +230,48 @@ func TestWireWatchdog_DBProbeWaitsBehindAHeldWriteLock(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the probe did not return once the writer released the lock")
+	}
+}
+
+// watchdogNotes records the notifications wireWatchdogAlerts sends.
+type watchdogNotes struct{ ch chan [4]string }
+
+func (n watchdogNotes) NotifyWatchdog(kind string, sev notify.Severity, subject, detail string) {
+	n.ch <- [4]string{kind, string(sev), subject, detail}
+}
+
+// The gate's failing-probe alert reaches the notifier as
+// watchdog.db_probe_failing (warn) and its recovery as
+// watchdog.db_probe_recovered (info), naming this host and carrying the
+// alert's detail.
+//
+// Mutation: drop the SetDBProbeAlert call, or swap the kinds, and it goes red.
+func TestWireWatchdogAlerts_PublishesFailingAndRecovered(t *testing.T) {
+	d := &Daemon{cfg: &Config{HostName: "h1"}}
+	ctrl := watchdog.NewController()
+	n := watchdogNotes{ch: make(chan [4]string, 4)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.wireWatchdogAlerts(ctx, ctrl, n)
+	fn := ctrl.LivenessDBAlert()
+	if fn == nil {
+		t.Fatal("wireWatchdogAlerts wired no alert callback")
+	}
+	failing := watchdog.DBProbeAlert{Err: "database is locked", Failing: 45 * time.Second, FenceIn: time.Minute}
+	recovered := watchdog.DBProbeAlert{Recovered: true, Failing: 90 * time.Second}
+	fn(failing)
+	fn(recovered)
+	for _, want := range [][4]string{
+		{"watchdog.db_probe_failing", "warn", "h1", failing.Detail()},
+		{"watchdog.db_probe_recovered", "info", "h1", recovered.Detail()},
+	} {
+		select {
+		case got := <-n.ch:
+			if got != want {
+				t.Fatalf("notification = %q, want %q", got, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("no %s notification", want[0])
+		}
 	}
 }

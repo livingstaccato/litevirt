@@ -137,7 +137,9 @@ watchdog_dev: ""
 # once either no state-store round trip has completed or the partition pauser
 # has made no progress for this long, so a wedged daemon cannot keep its
 # workloads behind a petted watchdog. A round trip that fails (a timeout, an
-# interrupted query, SQLITE_BUSY or SQLITE_LOCKED) is not progress. Progress
+# interrupted query, SQLITE_BUSY or SQLITE_LOCKED) is not progress. Once
+# round trips have failed for a third of this, the daemon logs a warning and
+# sends watchdog.db_probe_failing (docs/notifications.md). Progress
 # is timed on the monotonic clock, so a wall-clock step is not a wedge. 0 turns this off; otherwise it must be at least 120
 # (twice the hardware watchdog timeout). It does nothing in auto mode
 # (watchdog_dev empty) or on an unverified device.

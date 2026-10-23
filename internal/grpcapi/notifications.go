@@ -283,3 +283,12 @@ func (s *Server) NotifyCertificate(kind string, sev notify.Severity, subject, de
 		Kind: kind, Severity: sev, Subject: subject, Detail: detail,
 	})
 }
+
+// NotifyWatchdog emits a watchdog liveness notification
+// (watchdog.db_probe_failing / watchdog.db_probe_recovered) for this node.
+// The heartbeat's liveness gate decides when; this only delivers.
+func (s *Server) NotifyWatchdog(kind string, sev notify.Severity, subject, detail string) {
+	s.notify(context.Background(), notify.Notification{
+		Kind: kind, Severity: sev, Subject: subject, Detail: detail,
+	})
+}

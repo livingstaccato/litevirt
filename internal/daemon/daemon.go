@@ -48,6 +48,7 @@ import (
 	"github.com/litevirt/litevirt/internal/metrics"
 	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/obs"
 	"github.com/litevirt/litevirt/internal/opjournal"
 	"github.com/litevirt/litevirt/internal/pci"
@@ -240,6 +241,41 @@ func (d *Daemon) wireWatchdog(ctrl *watchdog.Controller) {
 	ctrl.SetDBProbe(func(ctx context.Context) error {
 		_, err := d.db.Query(ctx, "SELECT 1")
 		return err
+	})
+}
+
+// watchdogNotifier delivers a watchdog notification. *grpcapi.Server
+// satisfies it.
+type watchdogNotifier interface {
+	NotifyWatchdog(kind string, sev notify.Severity, subject, detail string)
+}
+
+// wireWatchdogAlerts publishes the liveness gate's failing-probe alert
+// (watchdog.db_probe_failing, watchdog.db_probe_recovered). Delivery reads
+// the notification routes from the state store the failing probe runs on,
+// so it runs on its own goroutine, one at a time, and drops an alert while
+// earlier ones wait: the gate's log line is the record that always lands.
+func (d *Daemon) wireWatchdogAlerts(ctx context.Context, ctrl *watchdog.Controller, n watchdogNotifier) {
+	q := make(chan watchdog.DBProbeAlert, 4)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case a := <-q:
+				kind, sev := "watchdog.db_probe_failing", notify.SevWarn
+				if a.Recovered {
+					kind, sev = "watchdog.db_probe_recovered", notify.SevInfo
+				}
+				n.NotifyWatchdog(kind, sev, d.cfg.HostName, a.Detail())
+			}
+		}
+	}()
+	ctrl.SetDBProbeAlert(func(a watchdog.DBProbeAlert) {
+		select {
+		case q <- a:
+		default:
+		}
 	})
 }
 
@@ -1216,6 +1252,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// every host does (re-review m8).
 	fc.SetNICGuardPlacement(svc.GuardHostNeeded)
 	d.svc = svc
+	d.wireWatchdogAlerts(ctx, watchdogCtrl, svc)
 	// Managed fence SSH (internal/fencessh): this host's signed row, every
 	// verified peer rendered into /etc/litevirt/ssh, and how each ssh fence
 	// from here — the coordinator's and FenceHost's — reaches its target.

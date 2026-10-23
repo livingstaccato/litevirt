@@ -20,7 +20,11 @@ import (
 // rules to a chosen host (placement.restrictToPinnedHost); an explicit
 // migrate target never went through placement.
 //
-// "is not active" is the wording failback matches on: keep it.
+// "is not active" is the wording failback matches on: keep it. The witness
+// refusal deliberately lacks it: failback retries because a host that is
+// returning to service becomes active in a moment, and a role is replicated
+// configuration that does not change under a retry, so retrying a witness
+// would only wait out the budget for the same answer.
 func nonWorkloadTargetError(h *corrosion.HostRecord) error {
 	if h.IsWitness() {
 		return status.Errorf(codes.FailedPrecondition,

@@ -2010,8 +2010,7 @@ rebalancer's moves too) is refused `FailedPrecondition: target host "<host>"
 is a witness (role: witness) and runs no workloads`, and a host that is not
 `active` (draining, maintenance, fenced) is refused `is not active`. The
 target host checks its own role again when the source asks it to stage the
-move, so an older source that never checks cannot land a VM on a witness. A
-promote of a replica held on a witness is refused for the same reason.
+move, so an older source that never checks cannot land a VM on a witness.
 
 A VM already stranded on a witness (accepted by an older build, or left there
 by a role change) can neither start (`start refused: local_not_active_worker`,
@@ -2023,6 +2022,22 @@ the VM there:
 lv migrate <vm> <worker-host> --cold
 lv start <vm>
 ```
+
+A replication schedule accepts a witness as its target, so a witness can hold
+the only copy of a VM's disk. An operator's `lv replication promote` onto it
+takes the VM over under its own name and leaves it **defined and stopped** on
+the witness (a promote that renames it is refused there); its final status
+and a `vm.promoted_on_witness` event give the two steps above. The failover
+coordinator never promotes onto a witness, since a VM that is not started
+is not recovered: it holds the VM down (`failover.skip`, a
+`replication.promote_held` notification and a held event on the VM naming the
+steps), and the operator runs the promote by hand, then the migration.
+
+`lv host drain <witness>` is no longer refused by the execution gate: a
+witness may move workloads away, which is all a drain does. Draining an empty
+witness only marks it `draining` (it still votes and runs nothing); one that
+holds a stranded VM moves it to a worker. `lv host undrain` returns it to
+`active`.
 
 Without a witness, a cluster left with exactly two voting-eligible workers
 refuses every failover decision with `missing_witness`, **unless a voter

@@ -205,7 +205,9 @@ func TestFleet_AVMStrandedOnAWitnessCanBeMovedOff(t *testing.T) {
 }
 
 // A host that is draining is no target either: it is `not active`, and the
-// request says so (the same helper that refuses a witness).
+// request says so (the same helper that refuses a witness). A guard test: it
+// also passes on f04bc6725, whose state check already refused this; it pins the
+// state branch of the shared helper (mutation: drop it - red).
 func TestFleet_AColdMigrationToADrainingHostIsRefused(t *testing.T) {
 	sc := newColdStoppedScenario(t)
 	if err := corrosion.UpdateHostState(context.Background(), sc.src.DB, sc.dst.Name, "draining"); err != nil {

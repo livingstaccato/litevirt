@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/randid"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // tombstoneDeletedVM writes a delete's tombstone. Before it, the disks this
@@ -98,6 +100,70 @@ func (s *Server) noteKeptBackingFiles(ctx context.Context, name string, keepDisk
 	return health.NoteKeptBackingFiles(s.dataDir, name, under)
 }
 
+// noteDeleteKeptDisks notes, on this host, the disk files a delete of name
+// kept here because it could not prove them unused (KeptDisk, disk_kept.go):
+// the stale-record delete keeps every disk while a host did not answer
+// whether the VM runs there. Each kept file is noted as a kept disk, and
+// every file of its backing chain below it, other than an image in the
+// store, as a file a kept disk backs on, as `lv rm --keep-disks` notes them
+// (noteKeptDisks). With kept-disks.json alone naming the top of the chain, a
+// create of the name cleared the base under it and wrote its own disk there
+// (rc3 lab 2, F1). The tops are noted even when a chain cannot be read, and
+// that is the error returned: the caller then keeps the record, so the name
+// stays taken. Only a disk on this host's own storage is noted: a note is
+// this host's, and a shared disk is no file a create here clears.
+func (s *Server) noteDeleteKeptDisks(ctx context.Context, name string, kept []KeptDisk) error {
+	if len(kept) == 0 {
+		return nil
+	}
+	disks, err := corrosion.GetVMDisks(ctx, s.db, name)
+	if err != nil {
+		return &diskRecordsReadError{err}
+	}
+	keptPath := map[string]bool{}
+	for _, k := range kept {
+		if k.Host == s.hostName {
+			keptPath[k.Path] = true
+		}
+	}
+	var tops []string
+	for _, d := range disks {
+		if !keptPath[d.Path] || d.HostName != s.hostName || corrosion.DiskIsShared(d) || strings.HasPrefix(d.Path, "rbd:") ||
+			(d.StorageType != "" && !isHostLocalDiskDriver(d.StorageType)) {
+			continue
+		}
+		if top := filepath.Clean(s.hostDiskFile(d.Path)); filepath.IsAbs(top) {
+			tops = append(tops, top)
+		}
+	}
+	if len(tops) == 0 {
+		return nil
+	}
+	if err := health.NoteKeptDisks(s.dataDir, name, tops); err != nil {
+		return err
+	}
+	imageDir := ""
+	if s.images != nil {
+		imageDir = filepath.Clean(s.images.ImageDir())
+	}
+	var under []string
+	for _, top := range tops {
+		layers, err := storage.Bounded("read the backing chain of", top, func() ([]string, error) {
+			return keptChainLayers(top)
+		})
+		if err != nil {
+			return fmt.Errorf("the backing chain of the disk %s it keeps cannot be read, so the files under it cannot be noted (%w)", top, err)
+		}
+		for _, l := range layers[min(1, len(layers)):] {
+			if imageDir != "" && filepath.Dir(l) == imageDir {
+				continue // an image in the store: the store's, not the VM's
+			}
+			under = append(under, l)
+		}
+	}
+	return health.NoteKeptBackingFiles(s.dataDir, name, under)
+}
+
 // clearDiskDebrisBeforeCreate is createVM's debris sweep: it removes the
 // <vm>-*.qcow2 files an earlier VM of the name left, as sweepVMDiskDebris
 // does, from one candidate list and one keep set. Before that, a file the
@@ -122,6 +188,12 @@ func (s *Server) clearDiskDebrisBeforeCreate(ctx context.Context, name string, n
 		if !keep[c] {
 			unlink = append(unlink, c)
 		}
+	}
+	// Nothing a delete kept, and nothing a file beside it backs on, is
+	// cleared: the kept-disk notes govern what they name (below), and this
+	// covers what they do not.
+	if err := s.keptFileCreateRefusal(name, unlink, true); err != nil {
+		return nil, err
 	}
 	trusted := func() (bool, string) {
 		return corrosion.ReplicaTrusted(ctx, s.db, s.hostName, s.db.ReplicaCaughtUp)

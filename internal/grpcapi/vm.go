@@ -4131,6 +4131,24 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 				return nil, err
 			}
 			s.recordKeptDisks(ctx, req.Name, keptDisks)
+			// Noted as `lv rm --keep-disks` notes them, each with the files
+			// its chain backs on, before the tombstone frees the name: a
+			// create of the name then moves a kept disk aside and refuses
+			// to clear a file one backs on (rc3 lab 2, F1). A note that
+			// cannot be written keeps the record, and so the name.
+			if nerr := s.noteDeleteKeptDisks(ctx, req.Name, keptDisks); nerr != nil {
+				slog.Error("DeleteVM: the disks a delete of a VM with no domain kept could not be noted; keeping its record", "vm", req.Name, "error", nerr)
+				s.audit(ctx, "vm.delete", req.Name, "kept disks not noted: "+nerr.Error(), "error")
+				var ne *health.KeptDisksNoteError
+				if errors.As(nerr, &ne) {
+					return nil, status.Errorf(codes.FailedPrecondition,
+						"cannot delete VM %q: it keeps its disks on %s, and this host's note of the disks deletes kept, %s, cannot be read (%v); "+
+							"repair or remove that file, then retry; the record was kept", req.Name, s.hostName, ne.File, ne.Err)
+				}
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"cannot delete VM %q: it keeps its disks on %s, and noting them so that a later VM of the name leaves them failed: %v; "+
+						"the record was kept (retry once that is fixed)", req.Name, s.hostName, nerr)
+			}
 			setKeptDiskHeader(ctx, keptDisks)
 		}
 		// Give the addresses back BEFORE the row goes. The lease outlives the VM

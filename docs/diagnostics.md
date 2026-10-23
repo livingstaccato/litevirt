@@ -3470,15 +3470,20 @@ nor a file that disk's backing chain reaches: the create is refused, naming
 the file (docs/cli-reference.md, `lv rm`). A disk the delete of a VM with no
 domain kept is also in `<data_dir>/kept-disks/<vm>.json`, with the files its
 chain backs on. While `kept-disks.json`, or the backing chain of a disk it
-names, cannot be read, what a kept overlay backs on is unknown, and these are
-refused on that host whatever their names: every import; every create or
-clone that writes a disk file on the host's own storage (one with no disk
-file, or with every disk on shared nfs, ceph or iscsi storage outside the disk
-directory, goes ahead); every disk attach that creates a new disk; and every
-backup restore to a `--target-path`. The
-evidence names the file under `creates_refused` (the condition is raised for
-it alone, and resolves once it reads). A migration's target and the
-reconciler's rebuild of a missing overlay disk are not checked yet.
+names, cannot be read, the evidence names the file under `creates_refused`
+(the condition is raised for it alone, and resolves once it reads), and each
+import, create or clone that writes a disk file on the host's own storage,
+disk attach that creates a new disk, and backup restore to a `--target-path`
+on that host is judged by the disk files there (every file under
+`<data_dir>/disks`, the disk store's directory, `<data_dir>/pools`,
+`<data_dir>/mounts` and the directory of every file-based pool of the host,
+usable or not): it is refused when one of them is, or backs on, a path it
+writes, and refused whatever its name when one of them, or a directory of
+them, cannot be read either, which `creates_refused` then names too. A create
+that clears a file an earlier VM of its name left is refused. Any other goes
+ahead, as does a create or clone with no disk file, or with every disk on
+shared nfs, ceph or iscsi storage outside the disk directory. A migration's target and
+the reconciler's rebuild of a missing overlay disk are not checked yet.
 
 ### A drain's live move timed out (`drain_move_timed_out`)
 

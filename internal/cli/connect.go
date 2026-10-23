@@ -178,7 +178,7 @@ func nonRootLocalIdentity(pkiDir string) error {
 	if uid == 0 || filepath.Clean(pkiDir) == filepath.Clean(PKIDir()) {
 		return nil
 	}
-	return fmt.Errorf("lv runs as uid %d, and this user has no CLI client bundle in %s; it never uses the node's "+
+	return fmt.Errorf("this user (uid %d) has no CLI client bundle in %s; it never uses the node's "+
 		"own identity in %s, which is root's. Run the command with sudo, or give this user a CLI client bundle "+
 		"(ca.crt, client.crt and client.key in %s; `sudo lv host init --local` installs one for SUDO_USER when "+
 		"it founds a cluster)",
@@ -222,7 +222,7 @@ func connectLocal(cfg *ClusterConfig) (pb.LiteVirtClient, func(), error) {
 func ConnectLocalRoot(pkiDir string, grpcPort int) (pb.LiteVirtClient, func(), error) {
 	if uid := geteuid(); uid != 0 {
 		return nil, nil, fmt.Errorf("this command uses the node's local root channel, which only root may use "+
-			"(lv runs as uid %d): run it with sudo", uid)
+			"(this process runs as uid %d): run it with sudo", uid)
 	}
 	tlsCfg, err := pki.PeerTLSConfig(pkiDir)
 	if err != nil {

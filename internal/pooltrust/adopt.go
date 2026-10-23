@@ -61,6 +61,12 @@ func (s *Store) AdoptOnUpgrade(ctx context.Context, db *corrosion.Client, host s
 			out.Held = append(out.Held, fmt.Sprintf("%q (%v)", r.Name, err))
 			continue
 		}
+		// What a create would refuse (a malformed or option-like source, a
+		// NUL, an over-long value, a refused directory) is never adopted.
+		if err := storage.CheckConfig(storage.Config{Driver: r.Driver, Source: r.Source, Target: r.Target, Options: r.Options}, s.dataDir, s.pkiDir); err != nil {
+			out.Held = append(out.Held, fmt.Sprintf("%s (%v)", r.Name, err))
+			continue
+		}
 		ok, why := s.upgradeEvidence(ctx, db, host, r.Name, b)
 		if !ok {
 			out.Held = append(out.Held, fmt.Sprintf("%s (%s)", r.Name, why))

@@ -341,11 +341,6 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name is required")
 	}
-	// The name reaches a path (localPoolDir) and the row it names may be a
-	// forged one: only a valid pool name is deleted by name.
-	if err := safename.ValidatePoolName(req.Name); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
-	}
 	host := req.Host
 	if host == "" {
 		host = s.hostName
@@ -396,7 +391,10 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 	// A row this host does not trust was never this host's pool
 	// (pool_trust.go): only the row goes. Nothing on the host is touched for
 	// it — no unmount, logout or directory removal at a place the row names.
-	if !s.poolRowTrusted(rec) {
+	// That includes a row whose name is not a valid pool name (forged: no
+	// create makes one), whatever trust store this server has: it can be
+	// deleted, and its name reaches no path.
+	if safename.ValidatePoolName(rec.Name) != nil || !s.poolRowTrusted(rec) {
 		if err := corrosion.MarkStoragePoolDeleted(ctx, s.db, host, req.Name); err != nil {
 			return nil, status.Errorf(codes.Internal, "delete: %v", err)
 		}

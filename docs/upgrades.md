@@ -1974,10 +1974,6 @@ combining marks, emoji variation selectors, runs of spaces, over-long or
 non-clean paths) is confirmed the same way. One you did not make, delete with
 `lv pool delete <pool> --host <host>`, which removes only the row.
 
-A host upgraded from a build that judged held `nfs` pools by mounting their
-export at `<data_dir>/mounts/.adopt-<name>` unmounts and removes any such
-directory it finds at its next start (lazily when busy).
-
 ### Console passwords start after the roll
 
 This release gives each VM's VNC and SPICE consoles a per-VM password

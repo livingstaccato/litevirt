@@ -7,11 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
 var badPoolNames = []string{"x/../../../etc", "..", "a/b", "evil\x00name", "-opt", strings.Repeat("a", 300)}
@@ -34,17 +32,24 @@ func TestLocalPoolDir_RefusesInvalidNames(t *testing.T) {
 	}
 }
 
-// (re-review rr3 3) DeleteStoragePool takes only a valid pool name: a forged
-// row named to traverse out of pools/ (its target that path) is not deleted
-// by name, and nothing on the host is touched.
+// (re-review rr4 1) A row whose name is not a valid pool name — forged: no
+// create makes one — can be deleted, so pool_row_untrusted stops naming it,
+// and its delete touches nothing on the host: no teardown, no libvirt pool
+// destroy, no directory removal at the place its name or target points. This
+// holds whatever trust store the server has (none here).
 //
-// Mutation: drop the name validation in DeleteStoragePool (and in
-// localPoolDir) — the forged row is deleted and the directory removed, red.
-func TestDeleteStoragePool_RefusesAnInvalidName(t *testing.T) {
-	s := trustServer(t)
+// Mutation: drop the name check from the untrusted-row branch — with no
+// trust store the row takes the host-side path and the libvirt pool destroy
+// runs for it, red.
+func TestDeleteStoragePool_AnInvalidNamedRowIsDeletedTouchingNothing(t *testing.T) {
+	s := newPoolTestServer(t)
+	fake := libvirtfake.New()
+	destroyed := 0
+	fake.FailPoolDestroy = func(string) error { destroyed++; return nil }
+	s.virt = fake
 	ctx := context.Background()
 	victim := filepath.Join(filepath.Dir(s.dataDir), "victim")
-	if err := os.MkdirAll(victim, 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(victim, "keep"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	name := "x/../../../victim"
@@ -53,12 +58,17 @@ func TestDeleteStoragePool_RefusesAnInvalidName(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	_, err := s.DeleteStoragePool(adminCtx(), &pb.DeleteStoragePoolRequest{Name: name, Force: true})
-	if status.Code(err) != codes.InvalidArgument {
-		t.Fatalf("delete of a traversal name: %v, want InvalidArgument", err)
+	if _, err := s.DeleteStoragePool(adminCtx(), &pb.DeleteStoragePoolRequest{Name: name, Force: true}); err != nil {
+		t.Fatalf("delete of a forged invalid-named row: %v", err)
 	}
-	if _, err := os.Stat(victim); err != nil {
-		t.Fatalf("the directory a traversal name points at was removed: %v", err)
+	if _, ok, _ := corrosion.GetStoragePool(ctx, s.db, s.hostName, name); ok {
+		t.Fatal("the row is still there")
+	}
+	if destroyed != 0 {
+		t.Fatal("the delete acted on the host for an invalid-named row")
+	}
+	if _, err := os.Stat(filepath.Join(victim, "keep")); err != nil {
+		t.Fatalf("the place the name points at was touched: %v", err)
 	}
 }
 

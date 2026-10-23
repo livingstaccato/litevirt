@@ -52,6 +52,10 @@ type diskLeftover struct {
 	// records name it (target is it under hostDiskFile).
 	target, named string
 	err           error
+	// held: no removal ran, because a kept-disk note or kept-disks.json
+	// holds the file (err says why). It is named as held, never as a
+	// removal that failed.
+	held bool
 }
 
 // diskDecision is whether a caller lets freeRecordedVMDisks free d, and if
@@ -148,16 +152,18 @@ func (s *Server) freeRecordedVMDisks(ctx context.Context, vmName string, decide 
 			continue
 		}
 		if there, err := diskFileThere(file); err != nil || there {
+			held := false
 			switch {
 			case err != nil:
 			case heldWhy[i] != "":
 				// No removal ran: named for its hold, which a retry
 				// finds again until the hold is gone (lab 2 drill F5).
 				err = fmt.Errorf("its file was left, not removed: %s", heldWhy[i])
+				held = true
 			default:
 				err = errors.New("its file is still there after its removal")
 			}
-			leftovers = append(leftovers, diskLeftover{disk: d.DiskName, path: d.Path, target: file, named: d.Path, err: err})
+			leftovers = append(leftovers, diskLeftover{disk: d.DiskName, path: d.Path, target: file, named: d.Path, err: err, held: held})
 		}
 	}
 	return cephKept, kept, leftovers
@@ -281,7 +287,11 @@ func (s *Server) leftoversKept(leftovers []diskLeftover) []KeptDisk {
 		if path == "" {
 			path = l.path
 		}
-		out = append(out, KeptDisk{Path: path, Disk: l.disk, Host: s.hostName, Reason: "its removal failed: " + l.err.Error()})
+		reason := "its removal failed: " + l.err.Error()
+		if l.held {
+			reason = l.err.Error()
+		}
+		out = append(out, KeptDisk{Path: path, Disk: l.disk, Host: s.hostName, Reason: reason})
 	}
 	return out
 }

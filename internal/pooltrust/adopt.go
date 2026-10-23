@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -27,13 +26,14 @@ type Adoption struct {
 	Held    []string // pools left untrusted, with why
 }
 
-// AdoptOnUpgrade runs once, on the first start of a build that keeps the
-// ledger (no ledger file yet). Every row naming host that needs trust and is
-// not already trusted (config, area) is recorded in the ledger only when the
-// host's own disk shows it in use (upgradeEvidence); any other is left
-// untrusted, for pool_row_untrusted to name and `lv pool trust` to confirm.
-// The ledger file is then written, so this never runs again: a row arriving
-// later is trusted only through a create on this host or a confirmation.
+// AdoptOnUpgrade runs when there is no ledger file: on the first start of a
+// build that keeps the ledger, or after the ledger was removed. Every row
+// naming host that needs trust and is not already trusted (config, area) is
+// recorded in the ledger only when the host's own disk shows it in use
+// (upgradeEvidence); any other is left untrusted, for pool_row_untrusted to
+// name and `lv pool trust` to confirm. The ledger file is then written, so
+// this does not run again: a row arriving later is trusted only through a
+// create on this host or a confirmation.
 //
 // A row that cannot be listed leaves the ledger unwritten, and the adoption
 // runs at the next start.
@@ -49,7 +49,7 @@ func (s *Store) AdoptOnUpgrade(ctx context.Context, db *corrosion.Client, host s
 	add := map[string]Entry{}
 	now := time.Now().UTC().Format(time.RFC3339)
 	for _, r := range rows {
-		b := BindingOf(r.Driver, r.Source, r.Target)
+		b := BindingOf(r.Driver, r.Source, r.Target, r.Options)
 		if v := s.Judge(r.Name, b); v.Trusted {
 			continue
 		}
@@ -96,19 +96,20 @@ func (s *Store) poolDir(b Binding) string {
 // upgradeEvidence decides whether an existing row is adopted on upgrade. A
 // replicated row is evidence of nothing, and neither is a directory merely
 // existing: a forged row made before the upgrade can name one that does
-// (/var/lib/polkit-1/localauthority/50-local.d, say). What the old build's
-// pools leave on THIS host's disk is evidence, and a forged row alone did not
-// put it there:
+// (/var/lib/polkit-1/localauthority/50-local.d, say), or an ancestor of a
+// real pool (/srv above /srv/vmpool). What the old build's pools leave on
+// THIS host's disk is evidence, and a forged row alone did not put it there:
 //
-//   - a disk of this host's, recorded on the pool, is a regular file (not a
-//     link) directly or deeper inside the pool's directory, and starts as a
-//     qcow2 image does — every file-based disk litevirt creates is qcow2; or
+//   - a disk of one of this host's own VMs (its vm_disks row AND its vms row
+//     name this host), recorded on the pool, is a regular qcow2 file (not a
+//     link) DIRECTLY in the pool's directory: the file's resolved parent is
+//     the directory resolved, so an ancestor of the disk's directory, or a
+//     link inside the directory pointing elsewhere, is not evidence. Every
+//     file-based disk litevirt creates is qcow2; or
 //   - for an nfs pool whose mount point is in <data_dir>/mounts, its export
 //     is mounted there now.
 //
-// Disk rows are replicated too, so a forged disk row can name a file; it
-// still has to be a qcow2 image already in that directory, which a system
-// directory does not hold. The directory must also pass CheckWriteRoot.
+// The directory must also pass CheckWriteRoot.
 func (s *Store) upgradeEvidence(ctx context.Context, db *corrosion.Client, host, name string, b Binding) (bool, string) {
 	dir := s.poolDir(b)
 	if dir == "" || !filepath.IsAbs(dir) {
@@ -126,9 +127,10 @@ func (s *Store) upgradeEvidence(ctx context.Context, db *corrosion.Client, host,
 		}
 	}
 	rows, err := db.Query(ctx,
-		`SELECT path FROM vm_disks
-		 WHERE host_name = ? AND storage_volume = ? AND deleted_at IS NULL AND path != ''
-		 LIMIT ?`, host, name, adoptDiskRowsLimit)
+		`SELECT d.path FROM vm_disks d JOIN vms v ON v.name = d.vm_name
+		 WHERE d.host_name = ? AND v.host_name = ? AND d.storage_volume = ?
+		   AND d.deleted_at IS NULL AND v.deleted_at IS NULL AND d.path != ''
+		 LIMIT ?`, host, host, name, adoptDiskRowsLimit)
 	if err != nil {
 		return false, "its disks cannot be read: " + err.Error()
 	}
@@ -137,47 +139,44 @@ func (s *Store) upgradeEvidence(ctx context.Context, db *corrosion.Client, host,
 		paths = append(paths, r.String("path"))
 	}
 	if len(paths) == 0 {
-		return false, "no disk of this host is recorded on it"
+		return false, "no disk of this host's VMs is recorded on it"
 	}
 	found, err := storage.Bounded("judge a pool for upgrade adoption at", dir, func() (string, error) {
-		return qcow2DiskIn(dir, paths), nil
+		return qcow2DiskDirectlyIn(dir, paths), nil
 	})
 	if err != nil {
 		return false, "its directory did not answer: " + err.Error()
 	}
 	if found == "" {
-		return false, "no disk recorded on it is a qcow2 image in its directory"
+		return false, "no disk recorded on it is a qcow2 image directly in its directory"
 	}
 	return true, "it holds this host's disk " + found
 }
 
-// qcow2DiskIn returns the first of paths that is a regular file inside dir,
-// as written and resolved, and starts with the qcow2 magic; "" when none is.
-func qcow2DiskIn(dir string, paths []string) string {
+// qcow2DiskDirectlyIn returns the first of paths whose resolved parent
+// directory is dir resolved, that is a regular file (opened without following
+// a link) and starts with the qcow2 magic; "" when none is.
+func qcow2DiskDirectlyIn(dir string, paths []string) string {
 	rdir, err := filepath.EvalSymlinks(dir)
 	if err != nil {
 		return ""
 	}
 	for _, p := range paths {
 		p = filepath.Clean(p)
-		if !strictlyWithin(filepath.Clean(dir), p) {
-			continue
-		}
 		rparent, err := filepath.EvalSymlinks(filepath.Dir(p))
-		if err != nil || !(rparent == rdir || strictlyWithin(rdir, rparent)) {
+		if err != nil || rparent != rdir {
 			continue
 		}
-		fi, err := os.Lstat(p)
-		if err != nil || !fi.Mode().IsRegular() {
-			continue
-		}
-		if hasQcow2Magic(p) {
+		if hasQcow2Magic(filepath.Join(rparent, filepath.Base(p))) {
 			return p
 		}
 	}
 	return ""
 }
 
+// hasQcow2Magic opens p without following a link at its last component and
+// without blocking (a FIFO), and reports whether it is a regular file that
+// starts with the qcow2 magic.
 func hasQcow2Magic(p string) bool {
 	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
@@ -192,9 +191,4 @@ func hasQcow2Magic(p string) bool {
 		return false
 	}
 	return bytes.Equal(buf, qcow2Magic)
-}
-
-func strictlyWithin(dir, p string) bool {
-	rel, err := filepath.Rel(dir, p)
-	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }

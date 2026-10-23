@@ -2853,6 +2853,11 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 				slog.Warn("storage pool statfs failed", "pool", p.Name, "target", p.Target, "error", err)
 			}
 		}
+		// The implicit default pool is the daemon's own: recorded in the
+		// trust ledger as it writes it (config pools are trusted by config).
+		if len(d.cfg.StoragePools) == 0 {
+			d.ensureOwnPoolTrusted(rec.Name, rec.Driver, rec.Source, rec.Target, nil)
+		}
 		if err := corrosion.UpsertStoragePool(ctx, d.db, rec); err != nil {
 			slog.Warn("failed to register storage pool", "pool", p.Name, "error", err)
 		}
@@ -2878,6 +2883,10 @@ func (d *Daemon) ensureGlobalISOLibrary(ctx context.Context) {
 			slog.Info("global ISO library: this host's isos pool is not the daemon's (shared storage, say); it is the global library only in shared mode",
 				"host", d.cfg.HostName, "target", rec.Target)
 		}
+		// The row the daemon made: kept in the trust ledger.
+		if ok && d.isDaemonISOLibraryRow(rec) {
+			d.ensureOwnPoolTrusted(rec.Name, rec.Driver, rec.Source, rec.Target, rec.Options)
+		}
 		return
 	}
 	dir := filepath.Join(d.cfg.DataDir, storage.ISOLibraryDir)
@@ -2885,6 +2894,8 @@ func (d *Daemon) ensureGlobalISOLibrary(ctx context.Context) {
 		slog.Warn("global ISO library: create directory", "dir", dir, "error", err)
 		return
 	}
+	// Recorded in the trust ledger before the row is written.
+	d.ensureOwnPoolTrusted(grpcapi.GlobalISOLibraryName, "dir", "", dir, grpcapi.GlobalISOLibraryOptions())
 	if err := corrosion.UpsertStoragePool(ctx, d.db, corrosion.StoragePoolRecord{
 		HostName: d.cfg.HostName,
 		Name:     grpcapi.GlobalISOLibraryName,

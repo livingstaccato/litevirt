@@ -245,7 +245,7 @@ var dataDirOwned = []string{
 // every dot-name, which is how the daemon names its temp files there
 // (secretfile.Write's .<name>.tmp, storage_pool_confine.go's
 // .pool-uploads.json-*).
-var dataDirOwnedPrefixes = []string{"state.db-", "split_brain_activated.", "nowts.hwm.", "ct-idmap-ledger.", "onboot-boot-id.", "ceph-trash-purges.json.", "firewall-would-drop.json.", "image-delete-skew.json.", "."}
+var dataDirOwnedPrefixes = []string{"state.db-", "split_brain_activated.", "nowts.hwm.", "ct-idmap-ledger.", "onboot-boot-id.", "ceph-trash-purges.json.", "firewall-would-drop.json.", "image-delete-skew.json.", "pool-trust.json.", "."}
 
 // DataDirOwned returns the exact names of dataDirOwned.
 func DataDirOwned() []string { return slices.Clone(dataDirOwned) }
@@ -562,26 +562,50 @@ func inPoolArea(dataDir, p string) bool {
 
 // InDataDirPoolArea reports whether p is one of the daemon's own pool
 // directories: <data_dir>/disks itself, or a directory strictly inside
-// <data_dir>/pools or <data_dir>/mounts. Every form of p — as written, and
-// resolved through symlinks — must be one, so a link in pools/ to a directory
-// elsewhere is not. The resolutions are bounded (resolveBounded): one that
-// does not answer is an error, and the answer false.
+// <data_dir>/pools or <data_dir>/mounts. The area roots are taken as written
+// and as they resolve on this host — a pools/ or disks/ that is itself a
+// symlink to a bigger volume is still the daemon's area — and every form of
+// p, as written and resolved, must be one of them, so a link INSIDE pools/ to
+// a directory elsewhere is not. The resolutions are bounded
+// (resolveBounded): one that does not answer is an error, and the answer
+// false.
 func InDataDirPoolArea(p, dataDir string) (bool, error) {
 	if p == "" || dataDir == "" || !filepath.IsAbs(p) {
 		return false, nil
 	}
 	var t MountTable
-	dataForms, errD := pathFormsBounded(&t, dataDir)
-	forms, errP := pathFormsBounded(&t, p)
-	if err := errors.Join(errD, errP); err != nil {
+	var errs []error
+	rootForms := func(name string) []string {
+		var out []string
+		dataForms, err := pathFormsBounded(&t, dataDir)
+		errs = append(errs, err)
+		for _, d := range dataForms {
+			f, err := pathFormsBounded(&t, filepath.Join(d, name))
+			errs = append(errs, err)
+			out = append(out, f...)
+		}
+		return out
+	}
+	disks := rootForms(dataDirDisks)
+	var areas []string
+	for _, a := range dataDirPoolAreas {
+		areas = append(areas, rootForms(a)...)
+	}
+	forms, err := pathFormsBounded(&t, p)
+	errs = append(errs, err)
+	if err := errors.Join(errs...); err != nil {
 		return false, err
 	}
 	for _, c := range forms {
 		ok := false
-		for _, d := range dataForms {
-			if c == filepath.Join(d, dataDirDisks) || inPoolArea(d, c) {
+		for _, d := range disks {
+			if c == d {
 				ok = true
-				break
+			}
+		}
+		for _, a := range areas {
+			if within(a, c) && c != filepath.Clean(a) {
+				ok = true
 			}
 		}
 		if !ok {

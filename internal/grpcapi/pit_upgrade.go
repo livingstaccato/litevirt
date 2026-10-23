@@ -87,6 +87,12 @@ func (s *Server) pitOverlayScan(ctx context.Context) (files, unanswered []string
 	if s.db != nil {
 		if pools, err := corrosion.ListStoragePoolsForHost(ctx, s.db, s.hostName); err == nil {
 			for _, p := range pools {
+				// A row this host does not trust is not walked: a forged row
+				// naming / would hold every upgrade at the scan's bound.
+				if !s.poolRowTrusted(p) {
+					slog.Warn("point-in-time overlay scan: an untrusted pool row is not walked", "pool", p.Name, "target", p.Target)
+					continue
+				}
 				if filepath.IsAbs(p.Target) {
 					dirs[p.Target] = true
 				}

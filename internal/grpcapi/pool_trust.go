@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -20,14 +21,44 @@ import (
 )
 
 // TrustStoragePool confirms, on the pool's host, that a row naming that host
-// is its pool (`lv pool trust`): the row is recorded in the host's local
-// ledger, bound to its driver, source and target, and audited. The request
-// carries the row as the operator checked it, and the host refuses when its
-// row differs. Confirming a row that names a host path is naming that path
-// for root to write in, so it takes what naming it in a create takes:
-// storage.hostpath at the cluster root, and the protected directories are
-// refused to everyone.
-func (s *Server) TrustStoragePool(ctx context.Context, req *pb.TrustStoragePoolRequest) (*pb.TrustStoragePoolResponse, error) {
+// is its pool (`lv pool trust`).
+//
+// With preview, the pool's host answers its own row — driver, source,
+// target, normalized nfs mount options, and why it does not trust it — and
+// records nothing: that is what the operator is shown and confirms.
+//
+// Without it, the request carries the values the operator confirmed, and
+// only those: the host records them in its local ledger when its row is
+// exactly them, and refuses otherwise. Confirming a row that names a host
+// path is naming that path for root to write in, so it takes what naming it
+// in a create takes — storage.hostpath at the cluster root, the protected
+// directories refused to everyone — judged on the exact values forwarded and
+// on the entry node's own row alike.
+//
+// Every confirmation is audited as the operator who made it, refusals
+// included: on the entry node, and on the pool's host, which takes the
+// operator from the forward (repairActor).
+func (s *Server) TrustStoragePool(ctx context.Context, req *pb.TrustStoragePoolRequest) (resp *pb.TrustStoragePoolResponse, err error) {
+	actor := s.repairActor(ctx)
+	host := req.GetHost()
+	if host == "" {
+		host = s.hostName
+	}
+	if !req.GetPreview() {
+		defer func() {
+			where := "on this host"
+			if host != s.hostName {
+				where = "forwarded to " + host
+			}
+			result := "ok"
+			if err != nil {
+				result = fmt.Sprintf("error: %s: %s", status.Code(err), status.Convert(err).Message())
+			}
+			s.auditAs(ctx, actor, "storage.pool.trust", req.GetName(),
+				fmt.Sprintf("host=%s %s driver=%s source=%s target=%s mount_options=%s", host, where,
+					req.GetDriver(), req.GetSource(), req.GetTarget(), req.GetMountOptions()), result)
+		}()
+	}
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
@@ -37,12 +68,8 @@ func (s *Server) TrustStoragePool(ctx context.Context, req *pb.TrustStoragePoolR
 	if err := safename.ValidatePoolName(req.GetName()); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	if req.GetDriver() == "" {
-		return nil, status.Error(codes.InvalidArgument, "driver is required: the row as you checked it")
-	}
-	host := req.GetHost()
-	if host == "" {
-		host = s.hostName
+	if !req.GetPreview() && req.GetDriver() == "" {
+		return nil, status.Error(codes.InvalidArgument, "driver is required: the row as you confirmed it")
 	}
 	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, host, req.GetName())
 	if err != nil {
@@ -54,10 +81,22 @@ func (s *Server) TrustStoragePool(ctx context.Context, req *pb.TrustStoragePoolR
 	if err := s.RequirePerm(ctx, poolRBACPathFor(rec.Project, rec.Name), "storage.pool.write", "operator"); err != nil {
 		return nil, err
 	}
-	if err := s.authorizePoolHostPaths(ctx, fmt.Sprintf("pool %q", rec.Name), storage.Config{
-		Driver: rec.Driver, Source: rec.Source, Target: rec.Target, Options: rec.Options,
-	}); err != nil {
-		return nil, err
+	want := pooltrust.BindingOf(req.GetDriver(), req.GetSource(), req.GetTarget(), map[string]string{"options": req.GetMountOptions()})
+	if req.GetPreview() {
+		// The host's row, paths and all, is shown only to who could confirm it.
+		if err := s.RequirePerm(ctx, "/", verbStorageHostPath, "admin"); err != nil {
+			return nil, err
+		}
+	} else {
+		// The exact values forwarded, and the row this node holds.
+		for _, cfg := range []storage.Config{
+			{Driver: want.Driver, Source: want.Source, Target: want.Target, Options: map[string]string{"options": want.MountOptions}},
+			{Driver: rec.Driver, Source: rec.Source, Target: rec.Target, Options: rec.Options},
+		} {
+			if err := s.authorizePoolHostPaths(ctx, fmt.Sprintf("pool %q", rec.Name), cfg); err != nil {
+				return nil, err
+			}
+		}
 	}
 	if host != s.hostName {
 		client, conn, err := s.peerClient(ctx, host)
@@ -66,7 +105,7 @@ func (s *Server) TrustStoragePool(ctx context.Context, req *pb.TrustStoragePoolR
 		}
 		defer conn.Close()
 		req.Host = host
-		resp, err := client.TrustStoragePool(ctx, req)
+		resp, err := client.TrustStoragePool(metadata.AppendToOutgoingContext(ctx, repairActorMDKey, actor), req)
 		if status.Code(err) == codes.Unimplemented {
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"host %q runs a build without pool trust: it acts on every row naming it, so there is nothing to confirm there until it is upgraded", host)
@@ -74,29 +113,39 @@ func (s *Server) TrustStoragePool(ctx context.Context, req *pb.TrustStoragePoolR
 		return resp, err
 	}
 
-	got := pooltrust.BindingOf(rec.Driver, rec.Source, rec.Target)
-	if want := pooltrust.BindingOf(req.GetDriver(), req.GetSource(), req.GetTarget()); want != got {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"this host's row of pool %q is driver %q, source %q, target %q, not the driver %q, source %q, target %q confirmed; check it again (`lv pool inspect %s --host %s`)",
-			rec.Name, got.Driver, got.Source, got.Target, want.Driver, want.Source, want.Target, rec.Name, s.hostName)
-	}
 	pt := s.PoolTrust()
 	if pt == nil {
 		return nil, status.Error(codes.FailedPrecondition, "this host keeps no pool trust ledger")
 	}
-	resp := &pb.TrustStoragePoolResponse{Pool: storagePoolRecordToPB(rec)}
-	if v := pt.Judge(rec.Name, got); v.Trusted {
+	got := pooltrust.BindingOf(rec.Driver, rec.Source, rec.Target, rec.Options)
+	v := pt.Judge(rec.Name, got)
+	if req.GetPreview() {
+		out := &pb.TrustStoragePoolResponse{Pool: storagePoolRecordToPB(rec), MountOptions: got.MountOptions, AlreadyTrusted: v.Trusted}
+		if v.Trusted {
+			out.TrustedAs = v.Why
+		} else {
+			out.Why = v.Why
+		}
+		return out, nil
+	}
+	if want != got {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"this host's row of pool %q is driver %q, source %q, target %q, mount options %q, not the driver %q, source %q, target %q, mount options %q confirmed; check it again (`lv pool trust %s --host %s` shows it)",
+			rec.Name, got.Driver, got.Source, got.Target, got.MountOptions, want.Driver, want.Source, want.Target, want.MountOptions, rec.Name, s.hostName)
+	}
+	resp = &pb.TrustStoragePoolResponse{Pool: storagePoolRecordToPB(rec), MountOptions: got.MountOptions}
+	if v.Trusted {
 		resp.AlreadyTrusted, resp.TrustedAs = true, v.Why
 	} else {
-		if err := pt.Record(rec.Name, got, pooltrust.HowTrust); err != nil {
+		// The confirmed values, which are the row's: want == got.
+		if err := pt.Record(rec.Name, want, pooltrust.HowTrust); err != nil {
 			return nil, status.Errorf(codes.Internal, "record the pool in this host's trust ledger: %v", err)
 		}
 		resp.TrustedAs = pooltrust.TrustLedger
 	}
 	s.addStoragePoolRef(rec.Name, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target, Options: rec.Options})
-	s.audit(ctx, "storage.pool.trust", rec.Name,
-		fmt.Sprintf("host=%s driver=%s source=%s target=%s already_trusted=%t", s.hostName, rec.Driver, rec.Source, rec.Target, resp.AlreadyTrusted), "ok")
-	slog.Info("storage pool row confirmed on this host", "pool", rec.Name, "driver", rec.Driver, "target", rec.Target, "already_trusted", resp.AlreadyTrusted)
+	slog.Info("storage pool row confirmed on this host", "pool", rec.Name, "driver", rec.Driver, "target", rec.Target,
+		"already_trusted", resp.AlreadyTrusted, "by", actor)
 	s.JudgePoolTrust(ctx)
 	return resp, nil
 }
@@ -141,12 +190,12 @@ func (s *Server) PoolTrust() *pooltrust.Store { return s.poolTrust.Load() }
 
 // poolTrustVerdict judges this host's pool name with ref.
 func (s *Server) poolTrustVerdict(name string, ref StoragePoolRef) pooltrust.Verdict {
-	return s.PoolTrust().Judge(name, pooltrust.BindingOf(ref.Driver, ref.Source, ref.Target))
+	return s.PoolTrust().Judge(name, pooltrust.BindingOf(ref.Driver, ref.Source, ref.Target, ref.Options))
 }
 
 // poolRowTrusted judges one of this host's rows.
 func (s *Server) poolRowTrusted(r corrosion.StoragePoolRecord) bool {
-	return s.PoolTrust().Judge(r.Name, pooltrust.BindingOf(r.Driver, r.Source, r.Target)).Trusted
+	return s.PoolTrust().Judge(r.Name, pooltrust.BindingOf(r.Driver, r.Source, r.Target, r.Options)).Trusted
 }
 
 // errPoolUntrusted is a pool this host does not stand behind.
@@ -224,7 +273,7 @@ func (s *Server) UntrustedPools(ctx context.Context) ([]untrustedPool, error) {
 	}
 	var out []untrustedPool
 	for _, r := range rows {
-		v := t.Judge(r.Name, pooltrust.BindingOf(r.Driver, r.Source, r.Target))
+		v := t.Judge(r.Name, pooltrust.BindingOf(r.Driver, r.Source, r.Target, r.Options))
 		if v.Trusted {
 			continue
 		}
@@ -252,7 +301,8 @@ func (s *Server) JudgePoolTrust(ctx context.Context) {
 		return
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
-	if len(pools) == 0 {
+	ledgerNote := s.PoolTrust().CorruptNote()
+	if len(pools) == 0 && ledgerNote == "" {
 		if !found || row.Lifecycle == corrosion.ConditionResolved {
 			return
 		}
@@ -278,9 +328,14 @@ func (s *Server) JudgePoolTrust(ctx context.Context) {
 	row.CleanCount = 0
 	row.Severity = corrosion.SeverityWarning
 	row.Hosts = []string{s.hostName}
+	if ledgerNote != "" {
+		slog.Warn("storage pool trust ledger was unreadable: the pools it held are untrusted until confirmed; review the kept copy, then remove it",
+			"ledger", ledgerNote)
+	}
 	ev, _ := json.Marshal(map[string]any{
-		"host":  s.hostName,
-		"pools": pools,
+		"host":              s.hostName,
+		"pools":             pools,
+		"ledger_unreadable": ledgerNote,
 		"detail": fmt.Sprintf("host %s has storage pool rows it did not create and no operator confirmed here; it writes, mounts and lists nothing in them. "+
 			"Check each one's driver and target: one you made, confirm with `lv pool trust <pool> --host %s`; one you did not, delete with `lv pool delete <pool> --host %s`",
 			s.hostName, s.hostName, s.hostName),

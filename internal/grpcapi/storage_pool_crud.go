@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -39,7 +40,7 @@ import (
 // Idempotency: re-registering an existing (host,name) returns OK and
 // re-runs Prepare — operators expect `lv pool create` to be safe to
 // retry after a transient mount failure.
-func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoolRequest) (*pb.CreateStoragePoolResponse, error) {
+func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoolRequest) (_ *pb.CreateStoragePoolResponse, err error) {
 	// A pool is GLOBAL (req.Project == "" → admin-managed, RBAC-anchored at root) or
 	// OWNED by a project (RBAC at /projects/<p>/...). Empty project is NOT normalized
 	// to "_default" — that would make it owned, not global.
@@ -78,6 +79,20 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 	host := req.Host
 	if host == "" {
 		host = s.hostName
+	}
+	// The operator, carried across a forward so the pool's host audits them
+	// (repairActor), and audited here too for a create this node forwards,
+	// refusals included.
+	actor := s.repairActor(ctx)
+	if host != s.hostName {
+		defer func() {
+			result := "ok"
+			if err != nil {
+				result = fmt.Sprintf("error: %s: %s", status.Code(err), status.Convert(err).Message())
+			}
+			s.auditAs(ctx, actor, "storage.pool.create", req.Name,
+				fmt.Sprintf("host=%s forwarded to %s driver=%s source=%s target=%s project=%s", host, host, req.Driver, req.Source, req.Target, project), result)
+		}()
 	}
 	// Authorize the project the request CLAIMS — this is where the pool is going.
 	if err := s.RequirePerm(ctx, poolRBACPathFor(project, req.Name), "storage.pool.write", "operator"); err != nil {
@@ -128,7 +143,7 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 		}
 		defer conn.Close()
 		req.Host = host
-		return client.CreateStoragePool(ctx, req)
+		return client.CreateStoragePool(metadata.AppendToOutgoingContext(ctx, repairActorMDKey, actor), req)
 	}
 
 	// A target-less local pool gets a directory of its own, never the shared
@@ -278,14 +293,14 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 	// of another target is ever taken for it, and a pool this host did not
 	// create is never trusted because a row says so. Fail closed.
 	if pt := s.PoolTrust(); pt != nil {
-		if err := pt.Record(req.Name, pooltrust.BindingOf(req.Driver, req.Source, req.Target), pooltrust.HowCreate); err != nil {
+		if err := pt.Record(req.Name, pooltrust.BindingOf(req.Driver, req.Source, req.Target, req.Options), pooltrust.HowCreate); err != nil {
 			return nil, status.Errorf(codes.Internal, "record the pool in this host's trust ledger: %v", err)
 		}
 	}
 	if err := corrosion.UpsertStoragePool(ctx, s.db, rec); err != nil {
 		return nil, status.Errorf(codes.Internal, "persist: %v", err)
 	}
-	s.audit(ctx, "storage.pool.create", req.Name,
+	s.auditAs(ctx, actor, "storage.pool.create", req.Name,
 		fmt.Sprintf("host=%s driver=%s source=%s target=%s project=%s", host, req.Driver, req.Source, req.Target, project), "ok")
 	// Make the pool resolvable for move/replicate/compose on this host right
 	// away — the daemon's periodic refresh would otherwise be the only thing

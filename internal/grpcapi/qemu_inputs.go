@@ -205,7 +205,7 @@ func (s *Server) newDiskChain(ctx context.Context, d corrosion.DiskRecord) *disk
 		c.images = append(c.images, c.resolve(s.hostDiskFile(filepath.Join(s.dataDir, "images"))))
 	}
 	c.pools, c.poolsNoAnswer = s.chainPoolDirs(ctx, d, c.project)
-	if pools, err := corrosion.ListStoragePoolsForHost(ctx, s.db, s.hostName); err == nil {
+	if pools, err := s.ownPools(ctx); err == nil {
 		for _, p := range pools {
 			if strings.EqualFold(p.Driver, "nfs") {
 				if dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: p.Driver, Source: p.Source, Target: p.Target}); err == nil {

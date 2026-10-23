@@ -3095,13 +3095,19 @@ trusted, and the daemon logs each one at WARN with the command that confirms
 it. Nothing is written, mounted or listed in such a pool; a content call or
 write that names it is refused naming `lv pool trust`.
 
+The condition is also raised while the host's trust ledger could not be read:
+the evidence's `ledger_unreadable` names the copy kept as
+`<data_dir>/pool-trust.json.corrupt-<time>`. None of its entries is trusted
+until each pool is confirmed again; review the kept copy, then remove it.
+
 A row you did not make is a row another member, or anything able to inject a
 replicated write, made for this host: delete it with
 `lv pool delete <pool> --host <host>`, which removes only the row. A pool of
 yours that the host holds untrusted — after an upgrade it could not adopt, or
-after its ledger was lost — check with `lv pool inspect <pool> --host <host>`,
-then confirm with `lv pool trust <pool> --host <host>`. The condition resolves
-on the next pool refresh once the host trusts every row naming it.
+after its ledger was lost — confirm with `lv pool trust <pool> --host <host>`,
+which shows the host's row and asks before it records it. The condition
+resolves on the next pool refresh once the host trusts every row naming it and
+no unreadable ledger is kept.
 
 ### An iSCSI pool has no session (`iscsi_session_missing`)
 

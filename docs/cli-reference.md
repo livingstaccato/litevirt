@@ -834,7 +834,9 @@ lv pool create <name> --driver <d> [--source <s>] [--target <t>] [--option k=v]
 lv pool ls
 lv pool inspect <name>
 lv pool delete <name>
-lv pool trust <name> [--host <h>]                 # confirm a pool row the host does not trust (pool_row_untrusted)
+lv pool trust <name> [--host <h>]                 # show the host's row, confirm it y/N (pool_row_untrusted)
+  [--expect-driver <d> --expect-target <t>]       # without a terminal: the values you checked
+  [--expect-source <s>] [--expect-mount-options <o>]  # required when the row has them
 ```
 
 `lv pool create` runs the driver's Prepare() hook (mount NFS, log into

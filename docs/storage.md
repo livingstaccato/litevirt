@@ -71,60 +71,88 @@ reaches a host by replication whichever member wrote it. A host therefore acts
 on a row naming it only when it stands behind that row. A row naming a place on
 the host's filesystem (a `local` or `dir` target, an `nfs` mount point, a
 `btrfs` source) is used only when it is one of these, with the same driver,
-source and target:
+source, target and, for `nfs`, mount options:
 
-- **in the host's `config.yaml`** (`storage_pools:`);
+- **in the host's `config.yaml`** (`storage_pools:`; with none configured, the
+  implicit default pool);
 - **created on that host**: `lv pool create` (also with `--host`, through the
   UI, the REST API or another node) runs on the pool's host, which records the
   pool in its local ledger `<data_dir>/pool-trust.json` (mode 0600, never
-  replicated) before it writes the row;
+  replicated) before it writes the row. The daemon's own default pool and
+  global ISO library are recorded there as the daemon writes them;
 - **confirmed on that host** with `lv pool trust`, recorded in the same ledger;
-- **in the daemon's own pool areas**: a `local` or `dir` pool whose directory,
-  as written and with symlinks resolved, is `<data_dir>/disks` or a directory
-  inside `<data_dir>/pools/` or `<data_dir>/mounts/`.
+- **in the daemon's own pool areas**: a `local` or `dir` pool whose directory is
+  `<data_dir>/disks` or a directory inside `<data_dir>/pools/` or
+  `<data_dir>/mounts/`, as written and with symlinks resolved. The areas are
+  taken as this host resolves them, so a `pools/` or `disks/` that is itself a
+  symlink to a bigger volume is still the daemon's; a symlink inside `pools/`
+  pointing elsewhere is not.
 
+An `nfs` pool's mount options are compared as a set (order, spacing and the
+`nosuid,nodev,noexec,nosymfollow,nosharecache` every mount sets do not count).
 Rows naming no host path (`ceph`, `iscsi`, `zfs`, `lvm-thin`) are not affected.
 
 Any other row is **untrusted**. The host does not use it for anything: it is
 not a disk root for a migration receive or a disk create, it is not mounted,
 nothing is uploaded to, deleted from or listed in it, the staging and replica
-sweeps skip it, and the capacity refresh does not rewrite it. The host raises
-`pool_row_untrusted` naming it (see
+sweeps and the upgrade preflight's overlay scan skip it, and the capacity
+refresh does not rewrite it. The host raises `pool_row_untrusted` naming it
+(see
 [diagnostics.md](diagnostics.md#a-host-has-pool-rows-it-does-not-trust-pool_row_untrusted)).
 A content call or write that names it is refused with the command that
 confirms it; a disk placed by pool name finds no such pool on the host.
 
 ```bash
-lv pool inspect vmstore --host host-b          # check the driver, source and target
-lv pool trust vmstore --host host-b            # confirm it on host-b
+lv pool trust vmstore --host host-b            # shows host-b's row, asks y/N
+lv pool trust vmstore --host host-b \
+    --expect-driver dir --expect-target /srv/vmstore   # without a terminal
 lv pool delete vmstore --host host-b           # or remove a row you did not make
 ```
 
-`lv pool trust` sends the row as you saw it; the pool's host refuses if its row
-has changed since. Once confirmed, the daemon writes in that directory as root,
-so trusting needs what naming the path in a create needs: `storage.hostpath` at
-`/` (the Admin role), and the system and litevirt-internal directories are
-refused to everyone. It is audited as `storage.pool.trust`.
+`lv pool trust` asks the pool's host for its row and prints its driver, source,
+target and mount options, and why the host does not trust it. On a terminal it
+then asks y/N; without one it needs the values you checked, `--expect-driver`
+and `--expect-target`, plus `--expect-source` and `--expect-mount-options` when
+the row has them, and refuses on any difference. What is sent is what you
+confirmed, never a fresh read of the row: the host records it only when its row
+is exactly that, and refuses if the row changed after it was shown.
+
+Once confirmed, the daemon writes in that directory as root, so trusting needs
+what naming the path in a create needs: `storage.hostpath` at `/` (the Admin
+role), judged on the exact values sent, and the system and litevirt-internal
+directories are refused to everyone. Each confirmation is audited as
+`storage.pool.trust` under the operator who made it, refusals included, on the
+node it entered and on the pool's host. A create forwarded to another host is
+audited the same way as `storage.pool.create`.
 
 Deleting an untrusted row removes the row only: nothing at the place it names
 is unmounted, logged out of or removed. Deleting a pool also takes it out of
 the host's ledger, so a row of that name that comes back is not trusted on
 the strength of the old one.
 
-**Upgrading.** The first time a build with the ledger starts on a host, it
-adopts the host's existing pools into the ledger (logged as `storage pool
-trust: first start with the ledger`). A row is adopted when the host's own
-disk shows it in use: a disk of this host recorded on the pool is a qcow2
-image (a regular file, not a symlink) inside the pool's directory, or, for an
-`nfs` pool mounted under `<data_dir>/mounts/`, its export is mounted there. A
-directory that merely exists, or a disk row naming a file that is not a qcow2
-image in it, is not enough, so a forged row written before the upgrade is not
-adopted. Pools that are not adopted (an empty pool outside the pool areas, a
-pool of raw images or ISOs only) are held untrusted until confirmed with
+This guards against rows that arrive by replication. A cluster member's own
+host certificate can still call a pool create or confirmation on another host
+directly, as every forwarded call between hosts can.
+
+**Upgrading.** When a host starts with no ledger file (the first start of a
+build with the ledger), it adopts its existing pools into the ledger, logged as
+`storage pool trust: no ledger file`. A row is adopted when the host's own disk
+shows it in use: a disk of one of this host's VMs, recorded on the pool, is a
+qcow2 image (a regular file, not a symlink) directly in the pool's directory —
+its directory, with symlinks resolved, is the pool's — or, for an `nfs` pool
+mounted under `<data_dir>/mounts/`, its export is mounted there. A directory
+that merely exists, a parent of a real pool's directory, or a disk row naming
+a file that is not a qcow2 image in it, is not enough, so a forged row written
+before the upgrade is not adopted. Pools that are not adopted (an empty pool
+outside the pool areas, a pool of raw images or ISOs only, a pool whose disks
+are in subdirectories) are held untrusted until confirmed with
 `lv pool trust`. The adoption runs once; a row arriving later is trusted only
-through a create or a confirmation on its host. A ledger that cannot be read
-trusts none of its entries, and its pools are named by `pool_row_untrusted`
-until confirmed again.
+through a create or a confirmation on its host.
+
+A ledger that cannot be read is kept as `pool-trust.json.corrupt-<time>` before
+anything is written, none of its entries is trusted, no adoption runs over it,
+and `pool_row_untrusted` names the kept copy until it is removed. Its pools are
+held until confirmed again.
 
 The ledger is local, so a rolling upgrade needs no coordination: a host on an
 older build acts on every row naming it, as before, and `lv pool trust`

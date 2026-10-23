@@ -11,12 +11,13 @@
 //
 //   - the pool is defined in this host's config.yaml, with the same driver,
 //     source and target;
-//   - this host created it (CreateStoragePool executed here) or an operator
-//     confirmed it here, recorded in the LOCAL ledger <data_dir>/pool-trust.json,
-//     which is never replicated; or
-//   - it is a local or dir pool whose directory, as written and resolved, is
-//     <data_dir>/disks or inside <data_dir>/pools or <data_dir>/mounts, and
-//     which passes storage.CheckWriteRoot.
+//   - this host created it (CreateStoragePool executed here, or the daemon's
+//     own default pool and ISO library) or an operator confirmed it here,
+//     recorded in the LOCAL ledger <data_dir>/pool-trust.json, which is never
+//     replicated; or
+//   - it is a local or dir pool whose directory is <data_dir>/disks or inside
+//     <data_dir>/pools or <data_dir>/mounts — as written, or as those area
+//     roots resolve on this host — and which passes storage.CheckWriteRoot.
 //
 // Any other such row is untrusted: it is not a disk root, it is not mounted,
 // written, swept or listed, and the pool_row_untrusted condition names it.
@@ -40,25 +41,33 @@ import (
 // LedgerFile is the ledger's name in the data directory.
 const LedgerFile = "pool-trust.json"
 
+// CorruptSuffix starts the name an unreadable ledger is kept under
+// (pool-trust.json.corrupt-<unix seconds>) before anything is written.
+const CorruptSuffix = ".corrupt-"
+
 // How a ledger entry came to be.
 const (
 	HowCreate  = "create"  // CreateStoragePool executed on this host
 	HowUpgrade = "upgrade" // adopted on the first start of a build that keeps the ledger
 	HowTrust   = "trust"   // an operator confirmed it on this host (`lv pool trust`)
+	HowDaemon  = "daemon"  // the daemon's own default pool or ISO library
 )
 
 // Binding is what trust in a pool row is bound to: a row of the same name
-// that names another driver, source or target is another pool, and is not
-// trusted on the strength of this one.
+// that names another driver, source, target or (nfs) mount options is
+// another pool, and is not trusted on the strength of this one.
 type Binding struct {
-	Driver string `json:"driver"`
-	Source string `json:"source,omitempty"`
-	Target string `json:"target,omitempty"`
+	Driver       string `json:"driver"`
+	Source       string `json:"source,omitempty"`
+	Target       string `json:"target,omitempty"`
+	MountOptions string `json:"mount_options,omitempty"`
 }
 
 // BindingOf normalises a pool's identity: the driver lower-cased ("" is
-// "local"), the target cleaned.
-func BindingOf(driver, source, target string) Binding {
+// "local"), the target cleaned, and for an nfs pool its options["options"]
+// mount options normalised (NormalizeMountOptions). No other option is bound:
+// the daemon itself rewrites the export keys it records on a row.
+func BindingOf(driver, source, target string, opts map[string]string) Binding {
 	d := strings.ToLower(strings.TrimSpace(driver))
 	if d == "" {
 		d = "local"
@@ -66,7 +75,52 @@ func BindingOf(driver, source, target string) Binding {
 	if target != "" {
 		target = filepath.Clean(target)
 	}
-	return Binding{Driver: d, Source: source, Target: target}
+	b := Binding{Driver: d, Source: source, Target: target}
+	if d == "nfs" {
+		b.MountOptions = NormalizeMountOptions(opts["options"])
+	}
+	return b
+}
+
+// normalized re-applies BindingOf's normalisation to a binding as stored.
+func (b Binding) normalized() Binding {
+	n := BindingOf(b.Driver, b.Source, b.Target, nil)
+	if n.Driver == "nfs" {
+		n.MountOptions = NormalizeMountOptions(b.MountOptions)
+	}
+	return n
+}
+
+// hardeningOptions are added or removed by every mount whatever a row says
+// (storage hardenNFSOptions), so they are not part of what a row chooses.
+var hardeningOptions = map[string]bool{
+	"nosuid": true, "suid": true, "nodev": true, "dev": true, "noexec": true, "exec": true,
+	"nosymfollow": true, "symfollow": true, "nosharecache": true, "sharecache": true,
+}
+
+// NormalizeMountOptions is an nfs pool's mount options as a set: split on
+// commas, trimmed, the hardening options every mount sets dropped, sorted
+// and de-duplicated.
+func NormalizeMountOptions(s string) string {
+	seen := map[string]bool{}
+	var out []string
+	for _, o := range strings.Split(s, ",") {
+		o = strings.TrimSpace(o)
+		if o == "" || hardeningOptions[strings.ToLower(o)] || seen[o] {
+			continue
+		}
+		seen[o] = true
+		out = append(out, o)
+	}
+	sort.Strings(out)
+	return strings.Join(out, ",")
+}
+
+// samePlace compares what a config definition fixes: driver, source and
+// target. A config pool's mount options come from config itself (its row is
+// registered without them), so the row's are not compared.
+func (b Binding) samePlace(o Binding) bool {
+	return b.Driver == o.Driver && b.Source == o.Source && b.Target == o.Target
 }
 
 // Entry is one ledger record.
@@ -89,13 +143,15 @@ type Store struct {
 	mu          sync.Mutex
 	entries     map[string]Entry
 	config      map[string]Binding
-	initialised bool // the ledger file existed when opened, or has been written since
+	initialised bool   // the ledger file existed when opened, or has been written since
+	corrupt     string // why the ledger could not be read, and where it was kept
 }
 
 // Open reads the ledger in dataDir. A ledger that cannot be read or parsed
-// is reported, and the store trusts none of its entries (fail closed): the
-// pools it held are named by pool_row_untrusted until confirmed again. Open
-// always returns a usable store.
+// is kept as pool-trust.json.corrupt-<time> before anything else is written,
+// reported (CorruptNote, and pool_row_untrusted), and none of its entries is
+// trusted (fail closed): the pools it held are named until confirmed again.
+// No upgrade adoption runs over it. Open always returns a usable store.
 func Open(dataDir, pkiDir string) (*Store, error) {
 	s := &Store{
 		dataDir: dataDir,
@@ -107,21 +163,64 @@ func Open(dataDir, pkiDir string) (*Store, error) {
 	b, err := os.ReadFile(s.path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
+		// A ledger kept aside as corrupt means a ledger existed: not a
+		// first start, and no adoption.
+		if aside := s.asides(); len(aside) > 0 {
+			s.initialised = true
+			s.corrupt = fmt.Sprintf("an unreadable ledger was kept as %s", strings.Join(aside, ", "))
+		}
 		return s, nil
 	case err != nil:
 		s.initialised = true
-		return s, fmt.Errorf("read pool trust ledger %s: %w", s.path, err)
+		return s, s.setAside(fmt.Errorf("read pool trust ledger %s: %w", s.path, err))
 	}
 	s.initialised = true
 	var lf ledgerFile
 	if err := json.Unmarshal(b, &lf); err != nil {
-		return s, fmt.Errorf("parse pool trust ledger %s: %w", s.path, err)
+		return s, s.setAside(fmt.Errorf("parse pool trust ledger %s: %w", s.path, err))
 	}
 	for name, e := range lf.Pools {
-		e.Binding = BindingOf(e.Driver, e.Source, e.Target)
+		e.Binding = e.Binding.normalized()
 		s.entries[name] = e
 	}
+	if aside := s.asides(); len(aside) > 0 {
+		s.corrupt = fmt.Sprintf("an unreadable ledger was kept as %s", strings.Join(aside, ", "))
+	}
 	return s, nil
+}
+
+// setAside keeps the unreadable ledger under a name of its own, so a later
+// write does not destroy what it held, and returns cause naming it.
+func (s *Store) setAside(cause error) error {
+	aside := fmt.Sprintf("%s%s%d", s.path, CorruptSuffix, time.Now().Unix())
+	if err := os.Rename(s.path, aside); err != nil {
+		s.corrupt = fmt.Sprintf("%v; it could not be kept aside: %v", cause, err)
+		return fmt.Errorf("%w; keep it aside: %v", cause, err)
+	}
+	s.corrupt = fmt.Sprintf("%v; kept as %s", cause, aside)
+	return fmt.Errorf("%w; kept as %s", cause, aside)
+}
+
+// asides lists the ledgers kept aside as unreadable that are still there.
+func (s *Store) asides() []string {
+	m, _ := filepath.Glob(s.path + CorruptSuffix + "*")
+	sort.Strings(m)
+	return m
+}
+
+// CorruptNote is why the ledger could not be read and where it was kept, ""
+// once no kept ledger remains (an operator reviewed and removed it).
+func (s *Store) CorruptNote() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	note := s.corrupt
+	s.mu.Unlock()
+	if note == "" || (len(s.asides()) == 0 && !strings.Contains(note, "could not be kept aside")) {
+		return ""
+	}
+	return note
 }
 
 // Path is the ledger file.
@@ -139,7 +238,7 @@ func (s *Store) Initialised() bool {
 func (s *Store) SetConfig(pools map[string]Binding) {
 	m := make(map[string]Binding, len(pools))
 	for n, b := range pools {
-		m[n] = BindingOf(b.Driver, b.Source, b.Target)
+		m[n] = b.normalized()
 	}
 	s.mu.Lock()
 	s.config = m
@@ -158,7 +257,7 @@ func (s *Store) Entry(name string) (Entry, bool) {
 // returns. A pool create calls it before the pool's row is written, so the
 // row is never seen here untrusted.
 func (s *Store) Record(name string, b Binding, how string) error {
-	b = BindingOf(b.Driver, b.Source, b.Target)
+	b = b.normalized()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	next := make(map[string]Entry, len(s.entries)+1)
@@ -171,6 +270,23 @@ func (s *Store) Record(name string, b Binding, how string) error {
 	}
 	s.entries = next
 	return nil
+}
+
+// Ensure is Record when the ledger does not already hold name with binding
+// b: the daemon's own pools are ensured on every registration without
+// rewriting the file each time.
+func (s *Store) Ensure(name string, b Binding, how string) error {
+	if s == nil {
+		return nil
+	}
+	b = b.normalized()
+	s.mu.Lock()
+	e, ok := s.entries[name]
+	s.mu.Unlock()
+	if ok && e.Binding == b {
+		return nil
+	}
+	return s.Record(name, b, how)
 }
 
 // Forget removes name from the ledger: a pool deleted on this host is not
@@ -266,7 +382,7 @@ func (s *Store) Judge(name string, b Binding) Verdict {
 	if s == nil {
 		return Verdict{Trusted: true, Why: "no trust store"}
 	}
-	b = BindingOf(b.Driver, b.Source, b.Target)
+	b = b.normalized()
 	if !NeedsTrust(b) {
 		return Verdict{Trusted: true, Why: TrustNoHostPath}
 	}
@@ -274,7 +390,7 @@ func (s *Store) Judge(name string, b Binding) Verdict {
 	cfg, inCfg := s.config[name]
 	led, inLedger := s.entries[name]
 	s.mu.Unlock()
-	if inCfg && cfg == b {
+	if inCfg && cfg.samePlace(b) {
 		return Verdict{Trusted: true, Why: TrustConfig}
 	}
 	if inLedger && led.Binding == b {
@@ -293,8 +409,9 @@ func (s *Store) Judge(name string, b Binding) Verdict {
 }
 
 // inOwnArea is the area rule: a local or dir pool whose directory is
-// <data_dir>/disks or inside <data_dir>/pools or <data_dir>/mounts, as
-// written and resolved, and which passes CheckWriteRoot.
+// <data_dir>/disks or inside <data_dir>/pools or <data_dir>/mounts, judged
+// against those area roots as written and as they resolve on this host
+// (storage.InDataDirPoolArea), and which passes CheckWriteRoot.
 func (s *Store) inOwnArea(b Binding) (bool, error) {
 	var dir string
 	switch b.Driver {
@@ -328,6 +445,9 @@ func describe(b Binding) string {
 	}
 	if b.Target != "" {
 		parts = append(parts, "target "+b.Target)
+	}
+	if b.MountOptions != "" {
+		parts = append(parts, "mount options "+b.MountOptions)
 	}
 	return strings.Join(parts, ", ")
 }

@@ -481,18 +481,32 @@ guest running for it to migrate:
    each disk it sent.
 
 The path is the source's, and the target accepts it in its own disk directories
-and in the file-based pool directories the cluster records for the source host.
+and in a file-based pool directory the cluster records for the source host, but
+only when that directory, with symlinks resolved on the target, is inside the
+target's own `disks/`, `pools/` or `mounts/` areas under its data directory (or
+is the directory of a usable pool of the target's own), and passes the check the
+target applies to its own pools: no system directory, PKI directory, litevirt
+state or data directory. A storage-pool row is replicated state, so it never
+makes the target write somewhere a pool of its own could not be. The file's
+parent directory is held to the same rules once its links are resolved, and
+must stay inside that pool directory.
+
 A VM promoted onto a witness is the usual case: the witness's `default` pool is
-`<data_dir>/pools/default`, while the workers of an older cluster keep theirs at
-`<data_dir>/disks`, and the move is not refused for it. The disk stays in the
-source's pool directory on the target, and its record keeps the pool name. A
-later `lv rm` frees a `dir` disk by its recorded path even when that pool exists
-on no other host than the one it left, and a disk that cannot be removed still
-fails the delete and is named, as for any disk.
-Nothing wider is accepted: a path outside those directories, one that climbs out
-of them with `..`, or a pool row that names the target's own data directory
-(or a place in it outside `disks/`, `pools/` and `mounts/`) is refused with
-`is not in a disk-artifact root`.
+`<data_dir>/pools/default`, which is inside the worker's `pools/` area, while the
+workers of an older cluster keep theirs at `<data_dir>/disks`; the move is not
+refused for it. The disk stays in the source's pool directory on the target, and
+its record keeps the pool name. A later `lv rm` frees a `dir` disk by its
+recorded path even when that pool exists on no other host than the one it left
+(a path in the PKI directory or a system directory is not freed this way), and a
+disk that cannot be removed still fails the delete and is named, as for any disk.
+
+Anything else is refused with `is not in a disk-artifact root`: a path outside
+those directories, one that climbs out of them with `..` or through a symlink,
+or a pool row naming a system directory, the PKI directory, the target's data
+directory or the root of its `pools/` area. The source holds the path to its own
+rules as well: it reads the file, and removes it after the commit, only when it
+is in one of the source's own disk directories or pools (not a system directory,
+the PKI directory or litevirt state, links resolved).
 
 Until the commit in step 3 the source keeps its disks, its domain and
 ownership of the VM. If any step before it fails, or the client goes away,
@@ -2049,7 +2063,7 @@ steps), and the operator runs the promote by hand, then the migration.
 
 What a promote leaves behind is not removed by it. On the host the VM left, its
 disk is recorded as stranded when the operator promotes, as when the coordinator
-does (a `replica.disk-stranded` audit entry, a `vm.promote.disk_stranded` event,
+does (a `failover.disk-stranded` audit entry, a `vm.promote.disk_stranded` event,
 a `vm.disk.stranded` notification, and `strandedDisks` in `lv inspect`): the
 host may be down, and its disk may hold what the guest wrote after the replica.
 Once it is back, it sets the disk aside as `<disk path>.superseded-<time>`, kept

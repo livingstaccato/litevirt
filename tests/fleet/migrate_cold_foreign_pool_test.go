@@ -25,6 +25,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/grpcapi"
 )
 
 type foreignPoolScenario struct {
@@ -40,15 +41,15 @@ type foreignPoolScenario struct {
 // default pool at pool and node 1's default pool at its own disks dir.
 func newForeignPoolScenario(t *testing.T, diskPath func(pool, dstData string) string, srcPoolTarget func(pool, dstData string) string) *foreignPoolScenario {
 	t.Helper()
-	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	c := New(t, Options{Nodes: 2, SharedCRDT: true, SharedDataDir: true})
 	c.openClusterPolicyGate()
 	t.Cleanup(c.Stop)
 	src, dst := c.Nodes[0], c.Nodes[1]
 	for _, n := range c.Nodes {
 		n.Server.SetHostDiskRootForTest(filepath.Join(c.tmpRoot, "fs-"+n.Name))
 	}
-	srcData := filepath.Join(c.tmpRoot, src.Name, "data")
-	dstData := filepath.Join(c.tmpRoot, dst.Name, "data")
+	srcData := filepath.Join(c.tmpRoot, "shared-data")
+	dstData := srcData // one data_dir string on every host, as in production
 	fp := &foreignPoolScenario{c: c, src: src, dst: dst, pool: filepath.Join(srcData, "pools", "default")}
 	fp.disk = diskPath(fp.pool, dstData)
 	ctx := context.Background()
@@ -60,6 +61,8 @@ func newForeignPoolScenario(t *testing.T, diskPath func(pool, dstData string) st
 			t.Fatal(err)
 		}
 	}
+	// The source has its default pool where its row says (the daemon loads it).
+	src.Server.SetStoragePoolsByName(map[string]grpcapi.StoragePoolRef{"default": {Driver: "local", Target: srcPoolTarget(fp.pool, dstData)}})
 	fp.payload = make([]byte, 1<<20+77)
 	for i := range fp.payload {
 		fp.payload[i] = byte(i*13 + 5)

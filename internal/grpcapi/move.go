@@ -831,7 +831,14 @@ func (s *Server) diskDriver(ctx context.Context, d *corrosion.DiskRecord) (stora
 		// the local driver does, so the delete frees the file where it is
 		// rather than failing with "dir driver requires Target" and leaving
 		// the VM half deleted. The file is still checked afterwards
-		// (freeRecordedVMDisks), so one that is not removed is named.
+		// (freeRecordedVMDisks), so one that is not removed is named. With no
+		// pool to anchor it, the path itself must be one of this host's disk
+		// places, or in a directory a pool may write into (not a system
+		// directory, the PKI directory or litevirt state).
+		if !s.withinDiskArtifactRoot(d.Path) && storage.CheckWriteRoot(filepath.Dir(filepath.Clean(d.Path)), s.dataDir, s.pkiDir) != nil {
+			return nil, fmt.Errorf("disk %s: its pool %q is not on this host and its path %s is not in a disk place of this host; it is not removed",
+				d.DiskName, d.StorageVolume, d.Path)
+		}
 		cfg.Driver = "local"
 	}
 	if cfg.Driver == "" {

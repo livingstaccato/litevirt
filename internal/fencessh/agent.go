@@ -244,6 +244,12 @@ func (a *Agent) sync(ctx context.Context) error {
 	if err := os.Chmod(a.cfg.Dir, 0o755); err != nil {
 		return err
 	}
+	// The AuthorizedKeysCommand runs as nobody, so the parent (/etc/litevirt)
+	// must be searchable too; a host init'd with --local before the fix has it
+	// 0700. Search bit only: nothing narrowed, no read bit, no children.
+	if err := EnsureSearchableDir(filepath.Dir(a.cfg.Dir)); err != nil {
+		return err
+	}
 	if _, err := writeIfChanged(filepath.Join(a.cfg.Dir, CommandName), ForcedCommand(a.cfg.Self), 0o755); err != nil {
 		return fmt.Errorf("write the forced command: %w", err)
 	}

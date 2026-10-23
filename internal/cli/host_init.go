@@ -351,40 +351,12 @@ func mintLocalHostCert(pkiDir, hostName, addr string) error {
 // at a temp dir.
 var etcLitevirtDir = "/etc/litevirt"
 
-// ensureEtcLitevirtDir makes the system config directory searchable by others
-// without making it readable. `lv host init --local` used to create it as a
-// side effect of MkdirAll(".../pki", 0700), so it came out 0700, while the
-// remote form's setup script leaves it 0755. The fence ssh AuthorizedKeysCommand
-// runs as nobody and cannot reach /etc/litevirt/ssh/authorized_keys through a
-// 0700 parent, so sshd never accepted the managed key. A new directory is made
-// 0711 (the disk-dir mode); an existing one only has the other-search bit ORed
-// in: never a read bit, never a narrowing, never a child. The secrets beneath
-// (pki 0700, key files 0600, admin-password) are guarded by their own modes.
-func ensureEtcLitevirtDir(dir string) error {
-	fi, err := os.Stat(dir)
-	if errors.Is(err, os.ErrNotExist) {
-		if err := os.MkdirAll(dir, 0o711); err != nil {
-			return fmt.Errorf("create %s: %w", dir, err)
-		}
-		// MkdirAll's mode is masked by the umask.
-		if err := os.Chmod(dir, 0o711); err != nil {
-			return fmt.Errorf("chmod %s: %w", dir, err)
-		}
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("stat %s: %w", dir, err)
-	}
-	if !fi.IsDir() {
-		return fmt.Errorf("%s is not a directory", dir)
-	}
-	if m := fi.Mode().Perm(); m&0o001 == 0 {
-		if err := os.Chmod(dir, m|0o001); err != nil {
-			return fmt.Errorf("chmod %s: %w", dir, err)
-		}
-	}
-	return nil
-}
+// ensureEtcLitevirtDir opens the system config directory for search only.
+// `lv host init --local` used to create it as a side effect of
+// MkdirAll(".../pki", 0700), so it came out 0700 and the fence ssh
+// AuthorizedKeysCommand (nobody) could not traverse it. The rule lives in
+// fencessh.EnsureSearchableDir, which the daemon applies too.
+func ensureEtcLitevirtDir(dir string) error { return fencessh.EnsureSearchableDir(dir) }
 
 func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bool) error {
 	if err := pki.ValidateHostName(hostName); err != nil {

@@ -38,11 +38,12 @@ import (
 // not exist at a path the create writes (writes): the kept overlay names that
 // path, and the new disk would become its base.
 //
-// A note, kept-disks.json or a kept disk's chain that cannot be read refuses
-// too: what it would keep is then unknown (keptRegistryChains; a backing
-// file that does not exist ends a chain, and holds nothing). Only storage or
-// the database not answering is retryable; anything else is
-// KeptBackingFileError, naming the entry and the way out.
+// A note, kept-disks.json, a kept disk's chain or the chain of a file beside
+// it that cannot be read refuses too, whether or not the create clears
+// anything: what it would keep is then unknown (keptRegistryChains,
+// walkKeptChain; a backing file that does not exist ends a chain, and holds
+// nothing). Only storage or the database not answering is retryable;
+// anything else is KeptBackingFileError, naming the entry and the way out.
 func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files []string, writes func(string) bool, notesGovern bool) error {
 	present := map[string]bool{}
 	var dirs []string
@@ -131,12 +132,21 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 			if present[p] {
 				continue
 			}
+			// Strict: a chain that cannot be read in full may reach the file.
+			// A missing backing file ends it, as nothing under it is reached.
+			stat := chainStat // read here: the walk may outlive this call
 			layers, err := storage.Bounded("read the backing chain of", p, func() ([]string, error) {
-				return chainLayers(os.Stat, p, ""), nil
+				l, _, err := walkKeptChain(stat, p, true)
+				return l, err
 			})
 			if err != nil {
-				return fmt.Errorf("the create clears a file left by an earlier VM %s, and the backing chain of %s beside it cannot be read (%v), "+
-					"so whether it backs on that file cannot be told; retry once it answers, or place the VM on another host", name, p, err)
+				if storage.IsFSNoAnswer(err) {
+					return fmt.Errorf("the create clears a file left by an earlier VM %s, and the backing chain of %s beside it cannot be read (%v), "+
+						"so whether it backs on that file cannot be told; retry once it answers, or place the VM on another host", name, p, err)
+				}
+				return health.NewKeptBackingFileError(fmt.Sprintf("the create clears a file left by an earlier VM %s, and the backing chain of %s "+
+					"beside it cannot be read (%v), so whether it backs on that file cannot be told; nothing was moved or removed. Fix that "+
+					"file or its storage, or move it away once nothing needs it, or place the VM on another host", name, p, err))
 			}
 			for _, l := range layers[min(1, len(layers)):] {
 				if present[filepath.Clean(l)] {
@@ -161,13 +171,18 @@ func missingBaseRefusal(c keptRegistryChain, registry string) error {
 
 // keptMissingBaseRefusal is keptFileCreateRefusal's check of a create that
 // clears nothing: one that writes the missing backing file of a kept disk's
-// chain is refused. With nothing to clear, a registry that cannot be read is
-// not a reason to refuse: only a write at a missing base could follow, and
-// the refusals for clearing a file stay fail-closed.
+// chain is refused. A registry or a chain that cannot be read refuses too:
+// whether a kept overlay names a path the create writes as its missing base
+// is then unknown.
 func (s *Server) keptMissingBaseRefusal(ctx context.Context, writes func(string) bool) error {
 	chains, err := s.keptRegistryChains(ctx)
 	if err != nil {
-		return nil
+		var re *keptRegistryError
+		if errors.As(err, &re) && re.transient {
+			return fmt.Errorf("whether a disk a delete kept backs on a path the create writes cannot be told: %v; nothing was created", err)
+		}
+		return health.NewKeptBackingFileError(fmt.Sprintf("whether a disk a delete kept backs on a path the create writes cannot be told: "+
+			"%v; nothing was created", err))
 	}
 	registry := filepath.Join(s.dataDir, diskKeptFile)
 	for _, c := range chains {

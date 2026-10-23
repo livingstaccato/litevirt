@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -240,6 +241,48 @@ func TestCreateVM_NeverClearsAFileAKeptChainBacksOn(t *testing.T) {
 		if got, _ := os.ReadFile(base); !bytes.Equal(got, was) {
 			t.Fatal("the base was cleared while kept-disks.json could not be read")
 		}
+	})
+}
+
+// A file beside it of the name whose backing chain cannot be read in full
+// refuses the create, as a directory that cannot be listed does: the part
+// that cannot be read may back on the file the sweep clears. The scan read
+// the chain leniently, so an overlay whose qcow2 header cannot be read, or
+// whose stat fails, looked like a file backing on nothing, and the sweep
+// cleared the base under it.
+//
+// Mutation: read the sibling's chain with chainLayers(os.Stat, p, "") again:
+// both subtests red.
+func TestCreateVM_RefusesWhileAChainBesideItCannotBeRead(t *testing.T) {
+	t.Run("qcow2 header unreadable", func(t *testing.T) {
+		s, base, was := debrisFixture(t)
+		ov := strings.TrimSuffix(base, ".qcow2") + ".s1"
+		if err := qcow2.CreateWithBackingFormat(ov, base, "qcow2", 0, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Truncate(ov, 16); err != nil { // the magic, and no header to read
+			t.Fatal(err)
+		}
+		createRefused(t, s, base, was, "backing chain of "+ov+" beside it cannot be read")
+		if !exists(ov) {
+			t.Fatal("the overlay went")
+		}
+	})
+	t.Run("stat fails", func(t *testing.T) {
+		s, base, was := debrisFixture(t)
+		ov := strings.TrimSuffix(base, ".qcow2") + ".s1"
+		if err := qcow2.CreateWithBackingFormat(ov, base, "qcow2", 0, nil); err != nil {
+			t.Fatal(err)
+		}
+		prev := chainStat
+		chainStat = func(p string) (os.FileInfo, error) {
+			if p == ov {
+				return nil, &os.PathError{Op: "stat", Path: p, Err: syscall.EIO}
+			}
+			return prev(p)
+		}
+		t.Cleanup(func() { chainStat = prev })
+		createRefused(t, s, base, was, "backing chain of "+ov+" beside it cannot be read")
 	})
 }
 

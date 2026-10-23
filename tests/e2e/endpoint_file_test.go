@@ -29,8 +29,8 @@ func TestLab_EndpointFileServesANonRootLv(t *testing.T) {
 	if len(dir) == 2 {
 		mode, merr = strconv.ParseUint(dir[1], 8, 32)
 	}
-	if len(dir) != 2 || merr != nil || dir[0] != "0" || mode&0o022 != 0 {
-		t.Fatalf("/run/litevirt on %s: %v, want root-owned and writable by root alone", h, dir)
+	if len(dir) != 2 || merr != nil || dir[0] != "0" || mode&0o022 != 0 || mode&0o005 != 0o005 {
+		t.Fatalf("/run/litevirt on %s: %v, want root-owned, writable by root alone, and searchable by every user", h, dir)
 	}
 
 	// Its values are the node's: grpc_port and pki_dir from config.yaml, or
@@ -49,9 +49,7 @@ func TestLab_EndpointFileServesANonRootLv(t *testing.T) {
 	}
 
 	// A non-root user with a CLI bundle and no LV_HOST: lv connects to the
-	// local daemon through the file, with no fallback notice. The lv-cli
-	// certificate carries no role, so an authenticated command may be refused
-	// by the daemon: that refusal is itself the daemon answering over mTLS.
+	// local daemon through the file, with no fallback notice.
 	const user = "lv-e2e-endpoint"
 	setup := fmt.Sprintf(`set -e
 id -u %[1]s >/dev/null 2>&1 || useradd --system --create-home --shell /usr/sbin/nologin %[1]s
@@ -73,9 +71,18 @@ echo "$home"`, user)
 			t.Fatalf("non-root lv on %s fell back (%q):\n%s", h, bad, out)
 		}
 	}
+	// Reached the daemon: the command ran (a bearerless lv-cli certificate is
+	// served while strict mTLS identity is off), or the daemon's own refusal
+	// of that certificate once it is on. Anything about the TLS handshake
+	// itself, or no listener, is a failure.
 	answered := strings.Contains(out, "rc=0") ||
-		strings.Contains(out, "Unauthenticated") || strings.Contains(out, "PermissionDenied") || strings.Contains(out, "lv login")
-	if !answered || strings.Contains(out, "connection refused") || strings.Contains(out, "certificate") {
+		strings.Contains(out, "client certificate without a session: run `lv login`")
+	for _, bad := range []string{"x509:", "tls:", "connection refused"} {
+		if strings.Contains(out, bad) {
+			answered = false
+		}
+	}
+	if !answered {
 		t.Fatalf("non-root lv on %s did not reach the daemon over mTLS:\n%s", h, out)
 	}
 }

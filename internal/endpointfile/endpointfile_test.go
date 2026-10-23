@@ -201,3 +201,36 @@ func privDir(t *testing.T) string {
 	}
 	return d
 }
+
+// A /run/litevirt another component created first, 0700 (lxc's hook-policy
+// MkdirAll of its private subdirectory gives the missing parent the same
+// mode), is opened up to 0755 by the writer: left 0700, no non-root lv could
+// reach the file, and on a non-default grpc_port it would fall back to 7443.
+// The subdirectory keeps its own mode. (Made permanent from re-review 2's
+// TestProbe_Writer0700Dir.)
+//
+// Mutation: drop the chmod of an existing directory others cannot search:
+// red.
+func TestWrite_OpensUpA0700DirectoryItOwns(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "run")
+	sub := filepath.Join(dir, "lxc-hook-policy")
+	if err := os.MkdirAll(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "endpoint")
+	if err := Write(p, Endpoint{GRPCPort: 9443, PKIDir: "/etc/litevirt/pki"}); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != 0o755 {
+		t.Fatalf("directory = %v, %v; want 0755", fi.Mode(), err)
+	}
+	if fi, err := os.Stat(sub); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("the private subdirectory = %v, %v; want it left 0700", fi.Mode(), err)
+	}
+	if e, err := Read(p); err != nil || e.GRPCPort != 9443 {
+		t.Fatalf("Read = %+v, %v", e, err)
+	}
+}

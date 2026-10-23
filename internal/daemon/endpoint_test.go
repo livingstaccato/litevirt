@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/endpointfile"
@@ -102,6 +103,8 @@ func TestListenGRPC_PublishesTheBoundPort(t *testing.T) {
 // leaves a non-root lv on the default port with nothing red.
 //
 // Mutations: Run calls net.Listen itself again: red. Run drops the call: red.
+// Run uses tls.Listen or net.ListenTCP: red. The receiver is renamed: still
+// green (it is read from the declaration).
 func TestRun_ListensThroughListenGRPC(t *testing.T) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "daemon.go", nil, 0)
@@ -117,24 +120,52 @@ func TestRun_ListensThroughListenGRPC(t *testing.T) {
 	if run == nil {
 		t.Fatal("no (*Daemon).Run in daemon.go")
 	}
+	recv := ""
+	if names := run.Recv.List[0].Names; len(names) == 1 {
+		recv = names[0].Name
+	}
+	if recv == "" || recv == "_" {
+		t.Fatal("(*Daemon).Run has no named receiver: listenGRPC cannot be called on it")
+	}
 	calls := 0
 	ast.Inspect(run.Body, func(n ast.Node) bool {
 		sel, ok := n.(*ast.SelectorExpr)
 		if !ok {
 			return true
 		}
+		if x, ok := sel.X.(*ast.Ident); ok && x.Name == recv && sel.Sel.Name == "listenGRPC" {
+			calls++
+			return true
+		}
+		// Every other way to a listener: net.Listen, net.ListenTCP,
+		// net.ListenUnix, tls.Listen, net.ListenConfig and its Listen. Run has
+		// none; one added must go through listenGRPC, or change this test
+		// knowingly. (An http.Server's ListenAndServe serves its own address,
+		// not the gRPC one, and is not flagged.)
+		pkg := ""
 		if x, ok := sel.X.(*ast.Ident); ok {
-			if x.Name == "d" && sel.Sel.Name == "listenGRPC" {
-				calls++
-			}
-			if x.Name == "net" && sel.Sel.Name == "Listen" {
-				t.Errorf("Run calls net.Listen at %v: the gRPC listener must come from listenGRPC, which publishes the endpoint file",
-					fset.Position(sel.Pos()))
-			}
+			pkg = x.Name
+		}
+		if ((pkg == "net" || pkg == "tls") && strings.HasPrefix(sel.Sel.Name, "Listen")) || sel.Sel.Name == "Listen" {
+			t.Errorf("Run reaches a listener through %s.%s at %v: the gRPC listener must come from %s.listenGRPC, which publishes the endpoint file",
+				exprName(sel.X), sel.Sel.Name, fset.Position(sel.Pos()), recv)
 		}
 		return true
 	})
 	if calls != 1 {
 		t.Fatalf("Run calls d.listenGRPC %d times, want once", calls)
 	}
+}
+
+// exprName is a short form of x for a message.
+func exprName(x ast.Expr) string {
+	switch v := x.(type) {
+	case *ast.Ident:
+		return v.Name
+	case *ast.SelectorExpr:
+		return exprName(v.X) + "." + v.Sel.Name
+	case *ast.CompositeLit:
+		return exprName(v.Type) + "{}"
+	}
+	return "…"
 }

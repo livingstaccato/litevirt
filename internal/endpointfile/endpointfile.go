@@ -24,6 +24,7 @@ import (
 	"strings"
 	"syscall"
 
+	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 )
 
@@ -86,10 +87,28 @@ func ownedSafely(path string, fi os.FileInfo, wantDir bool, uid int) error {
 	return nil
 }
 
+// openDir opens dir itself, never what a symlink there points at.
+func openDir(dir string) (*os.File, error) {
+	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, unix.ELOOP) {
+			return nil, fmt.Errorf("%s is a symlink", dir)
+		}
+		if errors.Is(err, unix.ENOTDIR) {
+			return nil, fmt.Errorf("%s is not a directory (or is a symlink)", dir)
+		}
+		return nil, &fs.PathError{Op: "open", Path: dir, Err: err}
+	}
+	return os.NewFile(uintptr(fd), dir), nil
+}
+
 // Write writes e to path atomically (a temp file beside it, renamed over
 // it), mode 0644. A missing directory is created 0755; an existing one must
 // be owned by this process's user and writable by it alone, or nothing is
-// written.
+// written. One that is, but that others cannot search or list (0700, as
+// another component's MkdirAll of a private subdirectory leaves it), is
+// opened up to 0755: the file in it is for every user on the node. A
+// directory someone else owns is refused, never widened.
 func Write(path string, e Endpoint) error {
 	if err := e.validate(); err != nil {
 		return err
@@ -108,12 +127,22 @@ func Write(path string, e Endpoint) error {
 	} else if !errors.Is(err, fs.ErrExist) {
 		return err
 	}
-	dfi, err := os.Lstat(dir)
+	d, err := openDir(dir)
+	if err != nil {
+		return fmt.Errorf("refusing to write the endpoint file: %w", err)
+	}
+	defer d.Close()
+	dfi, err := d.Stat()
 	if err != nil {
 		return err
 	}
 	if err := ownedSafely(dir, dfi, true, os.Geteuid()); err != nil {
 		return fmt.Errorf("refusing to write the endpoint file: %w", err)
+	}
+	if dfi.Mode().Perm()&0o005 != 0o005 {
+		if err := d.Chmod(0o755); err != nil {
+			return fmt.Errorf("open %s to every user: %w", dir, err)
+		}
 	}
 	f, err := os.CreateTemp(dir, ".endpoint-*")
 	if err != nil {
@@ -143,22 +172,33 @@ func Write(path string, e Endpoint) error {
 // directory, is an error satisfying errors.Is(err, fs.ErrNotExist); any other
 // error means the file is there and must not be used: not root's, writable by
 // someone else, a symlink, in such a directory, or malformed.
+//
+// The directory judged is the directory read through: it is opened
+// (O_DIRECTORY|O_NOFOLLOW) and judged by fstat, and the file is opened
+// relative to that descriptor (openat, O_NOFOLLOW) and judged by fstat too.
+// A directory swapped for another after the check is not the one read.
 func Read(path string) (Endpoint, error) {
 	dir := filepath.Dir(path)
-	dfi, err := os.Lstat(dir)
+	d, err := openDir(dir)
+	if err != nil {
+		return Endpoint{}, err
+	}
+	defer d.Close()
+	dfi, err := d.Stat()
 	if err != nil {
 		return Endpoint{}, err
 	}
 	if err := ownedSafely(dir, dfi, true, readerOwner); err != nil {
 		return Endpoint{}, err
 	}
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	fd, err := unix.Openat(int(d.Fd()), filepath.Base(path), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
-		if errors.Is(err, syscall.ELOOP) {
+		if errors.Is(err, unix.ELOOP) {
 			return Endpoint{}, fmt.Errorf("%s is a symlink", path)
 		}
-		return Endpoint{}, err
+		return Endpoint{}, &fs.PathError{Op: "open", Path: path, Err: err}
 	}
+	f := os.NewFile(uintptr(fd), path)
 	defer f.Close()
 	fi, err := f.Stat()
 	if err != nil {

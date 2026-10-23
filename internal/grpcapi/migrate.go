@@ -23,7 +23,6 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/fwmig"
 	"github.com/litevirt/litevirt/internal/health"
@@ -79,8 +78,15 @@ func (s *Server) authorizeMigrationTarget(ctx context.Context, vmName string) (*
 // roots so they can never touch e.g. {dataDir}/state.db just because it's under
 // the data dir.
 func (s *Server) withinDiskArtifactRoot(p string) bool {
-	if safename.Contains(filepath.Join(s.dataDir, "disks"), p) {
-		return true
+	_, ok := s.diskArtifactRootOf(p)
+	return ok
+}
+
+// diskArtifactRootOf is withinDiskArtifactRoot that also returns the root
+// directory p was found in.
+func (s *Server) diskArtifactRootOf(p string) (string, bool) {
+	if root := filepath.Join(s.dataDir, "disks"); safename.Contains(root, p) {
+		return root, true
 	}
 	s.storagePoolsMu.RLock()
 	pools := make(map[string]StoragePoolRef, len(s.storagePools))
@@ -93,10 +99,19 @@ func (s *Server) withinDiskArtifactRoot(p string) bool {
 			continue
 		}
 		if dir, derr := fileBasedPoolDir(s.dataDir, pr); derr == nil && safename.Contains(dir, p) {
-			return true
+			return dir, true
 		}
 	}
-	return false
+	return "", false
+}
+
+// migrationSourceHost is the host a migration of vm brings its disks from: the
+// host its row names, which does not change until the move is done.
+func migrationSourceHost(vm *corrosion.VMRecord) string {
+	if vm == nil {
+		return ""
+	}
+	return vm.HostName
 }
 
 // errLibvirtCallUnanswered is the answer of a libvirt call whose goroutine
@@ -1797,7 +1812,7 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 	var made []string // created by this call: removed again if a later one fails
 	undo := func() {
 		for _, p := range made {
-			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			if err := s.removeDiskFileBeneath(p, false); err != nil {
 				slog.Warn("disk stub: remove after a failed EnsureDisks", "vm", req.VmName, "path", p, "error", err)
 			}
 			s.migrationStubs.forget(p)
@@ -1810,31 +1825,55 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 		if stub.SizeBytes > 0 {
 			sizeBytes = uint64(stub.SizeBytes)
 		}
-		if _, err := os.Lstat(stub.Path); err == nil {
-			// This host's own stub from an earlier attempt for this VM (checked
-			// above). Reuse it at the size asked for now: the mirror needs the
-			// sizes to agree, and a stub holds nothing worth keeping.
-			if info, ierr := qcow2.Info(stub.Path); ierr == nil && info.VirtualSize == sizeBytes {
-				resp.CreatedPaths = append(resp.CreatedPaths, stub.Path)
-				slog.Info("disk stub reused for migration", "vm", req.VmName, "path", stub.Path)
-				continue
-			}
-			if err := os.Remove(stub.Path); err != nil {
-				undo()
-				return nil, status.Errorf(codes.Internal, "replace stub %s: %v", stub.Path, err)
-			}
-			s.migrationStubs.forget(stub.Path)
-		}
-		dir := filepath.Dir(stub.Path)
-		if err := diskmode.MkdirAll(dir); err != nil {
+		// The stub's directory is opened once, by descriptor, beneath its disk
+		// root with no link followed (the root judged, missing directories made
+		// through it), and the exists check, the replace and the create all go
+		// through that held directory: a link planted on the way is refused,
+		// never followed to create a stub somewhere else.
+		root, rootOK := s.diskArtifactRootOf(stub.Path)
+		if !rootOK {
 			undo()
-			return nil, status.Errorf(codes.Internal, "create disk dir %s: %v", dir, err)
+			return nil, status.Errorf(codes.InvalidArgument, "disk stub path %q is not in a disk-artifact root", stub.Path)
 		}
-		if err := qcow2.Create(stub.Path, sizeBytes, nil); err != nil {
+		pd, derr := s.openDiskDir(root, relUnder(root, filepath.Dir(stub.Path)), true, false)
+		if derr != nil {
 			undo()
-			return nil, status.Errorf(codes.Internal, "create stub %s: %v", stub.Path, err)
+			return nil, status.Errorf(codes.Internal, "create disk dir %s: %v", filepath.Dir(stub.Path), derr)
+		}
+		base := filepath.Base(stub.Path)
+		file := pd.path(base)
+		reused, stubErr := func() (bool, error) {
+			defer pd.close()
+			if _, err := os.Lstat(file); err == nil {
+				// This host's own stub from an earlier attempt for this VM (checked
+				// above). Reuse it at the size asked for now: the mirror needs the
+				// sizes to agree, and a stub holds nothing worth keeping.
+				if info, ierr := qcow2.Info(file); ierr == nil && info.VirtualSize == sizeBytes {
+					return true, nil
+				}
+				if err := pd.unlink(base); err != nil {
+					return false, status.Errorf(codes.Internal, "replace stub %s: %v", stub.Path, err)
+				}
+				s.migrationStubs.forget(stub.Path)
+			}
+			if err := qcow2.Create(file, sizeBytes, nil); err != nil {
+				return false, status.Errorf(codes.Internal, "create stub %s: %v", stub.Path, err)
+			}
+			return false, nil
+		}()
+		if stubErr != nil {
+			undo()
+			return nil, stubErr
+		}
+		if reused {
+			resp.CreatedPaths = append(resp.CreatedPaths, stub.Path)
+			slog.Info("disk stub reused for migration", "vm", req.VmName, "path", stub.Path)
+			continue
 		}
 		made = append(made, stub.Path)
+		if s.ensureStubCreatedHook != nil {
+			s.ensureStubCreatedHook()
+		}
 		s.recordMade(ctx, &s.migrationStubs, req.VmName, stub.Path)
 		resp.CreatedPaths = append(resp.CreatedPaths, stub.Path)
 		slog.Info("disk stub created for migration", "vm", req.VmName, "path", stub.Path, "size_bytes", stub.SizeBytes)
@@ -2554,7 +2593,8 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 		// Only ever remove paths in a real disk-artifact root (disks dir or a
 		// file-backed pool dir) — never an arbitrary file under the data dir such
 		// as state.db.
-		if !s.withinDiskArtifactRoot(p) {
+		root, rootOK := s.migrationRootOf(ctx, p, migrationSourceHost(vm))
+		if !rootOK {
 			slog.Warn("cleanup migration artifacts: refusing to remove path outside a disk-artifact root", "vm", req.VmName, "path", p)
 			continue
 		}
@@ -2567,7 +2607,8 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 				"vm", req.VmName, "path", p, "vm_lives_here", vmLivesHere)
 			continue
 		}
-		if err := os.Remove(s.hostDiskFile(p)); err != nil && !os.IsNotExist(err) {
+		// Through the directory held open beneath its root, never a link
+		if err := s.removeUnderRoot(root, p, true); err != nil {
 			slog.Warn("cleanup migration artifacts: remove disk stub", "vm", req.VmName, "path", p, "error", err)
 			continue
 		}

@@ -480,6 +480,47 @@ guest running for it to migrate:
 4. After that commit, the source undefines its domain and removes its copy of
    each disk it sent.
 
+The path is the source's, and the target accepts it in its own disk directories
+and in a file-based pool directory the cluster records for the source host, but
+only when that directory is inside the target's own `disks/`, `pools/` or
+`mounts/` areas under its data directory and passes the check the target applies
+to its own pools: no system directory, PKI directory, litevirt state or data
+directory. A pool row of the target's own does not widen this, because rows
+replicate without an origin check, and a storage-pool row of the source is
+replicated state too, so it never widens the rule beyond those areas. The disk's
+directory is opened once, beneath the root it was judged in, with no symlink
+followed, and the copy, its placement, the take-back and the cleanup all go
+through that open directory: a link planted below the root is refused, and one
+swapped in later is never followed. The source reads the disk the same way (a
+qcow2 overlay is flattened from the open file, which is opened without following
+a link) and removes its copy the same way, and the EnsureDisks stub create,
+replace and undo and the firmware discard act through the open directory too. A
+directory a pool needs below a data-dir area is made from the area's descriptor,
+level by level, so a link on the way is refused before anything is created
+through it. The root itself is judged for what it leads to: a data-dir area
+(`disks/`, `pools/`, `mounts/`) or an operator's own pool directory outside the
+areas may be a link to another volume, if it leads somewhere a pool may live; a
+pool directory below an area that has been replaced by a link out of the area is
+refused. Without `/proc/self/fd` nothing is opened, so a removal fails rather
+than reporting the file gone.
+
+A VM promoted onto a witness is the usual case: the witness's `default` pool is
+`<data_dir>/pools/default`, which is inside the worker's `pools/` area, while the
+workers of an older cluster keep theirs at `<data_dir>/disks`; the move is not
+refused for it. The disk stays in the source's pool directory on the target, and
+its record keeps the pool name. A later `lv rm` frees a `dir` disk by its
+recorded path even when that pool exists on no other host than the one it left
+(a path in the PKI directory or a system directory is not freed this way), and a
+disk that cannot be removed still fails the delete and is named, as for any disk.
+
+Anything else is refused with `is not in a disk-artifact root`: a path outside
+those directories, one that climbs out of them with `..` or through a symlink,
+or a pool row naming a system directory, the PKI directory, the target's data
+directory or the root of its `pools/` area. The source holds the path to its own
+rules as well: it reads the file, and removes it after the commit, only when it
+is in one of the source's own disk directories or pools (not a system directory,
+the PKI directory or litevirt state, links resolved).
+
 Until the commit in step 3 the source keeps its disks, its domain and
 ownership of the VM. If any step before it fails, or the client goes away,
 the VM stays on the source, stopped. The target removes the disk copies and
@@ -2045,6 +2086,20 @@ coordinator never promotes onto a witness, since a VM that is not started
 is not recovered: it holds the VM down (`failover.skip`, a
 `replication.promote_held` notification and a held event on the VM naming the
 steps), and the operator runs the promote by hand, then the migration.
+
+What a promote leaves behind is not removed by it. On the host the VM left, its
+disk is recorded as stranded when the operator promotes, as when the coordinator
+does (a `failover.disk-stranded` audit entry, a `vm.promote.disk_stranded` event,
+a `vm.disk.stranded` notification, and `strandedDisks` in `lv inspect`): the
+host may be down, and its disk may hold what the guest wrote after the replica.
+Once it is back, it sets the disk aside as `<disk path>.superseded-<time>`, kept
+while the VM exists (see below). Its cloud-init seed stays until the VM is
+deleted. The replicas on the witness stay too: they are the fallback copies
+until the VM is protected again, and are removed with the VM or its schedule.
+The schedule the promote switched to replicate from the witness back to the host
+it left is paused while the VM is on the witness (one audit entry and one
+`replication.suspended` notification, see [Backups](backups.md)) and runs again
+from the worker it is moved to.
 
 `lv host drain <witness>` is no longer refused by the execution gate: a
 witness may move workloads away, which is all a drain does. Draining an empty

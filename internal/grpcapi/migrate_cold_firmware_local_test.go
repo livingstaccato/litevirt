@@ -94,6 +94,9 @@ func newFWLocalMove(t *testing.T) *fwLocalMove {
 	f.dst.SetFirmwareLayoutDirForTest(layout)
 
 	f.p = filepath.Join(f.dst.dataDir, "disks", "os1-root.raw")
+	// The recorded path names the same file on both hosts, so it is a disk place
+	// of the source as well as of the target (the source checks its own).
+	f.src.SetStoragePoolsByName(map[string]StoragePoolRef{"dst-disks": {Driver: "dir", Target: filepath.Join(f.dst.dataDir, "disks")}})
 	for _, s := range []*Server{f.src, f.dst} {
 		if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
 			Name: "os1", HostName: f.src.hostName, State: "stopped", Spec: spec,

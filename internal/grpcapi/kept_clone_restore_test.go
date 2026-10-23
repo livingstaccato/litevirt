@@ -1,6 +1,8 @@
 package grpcapi
 
 import (
+	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,7 +12,9 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // A clone writes a new disk file at <disks>/<target>-<disk>.qcow2, as a
@@ -155,4 +159,53 @@ func TestAttachDevice_GetsTheKeptCreateChecks(t *testing.T) {
 			t.Fatalf("attach = %v; want FailedPrecondition naming %s", err, named)
 		}
 	})
+}
+
+// While what kept overlays back on cannot be read, a clone that writes no
+// disk file on this host's own storage goes ahead, as such a create does: a
+// ceph-only clone (copied inside its pool), and a clone into an nfs pool
+// mounted outside the disk directory.
+//
+// Mutation: drop the clone exemption (check every clone, `if true`): the
+// nfs subtests red. A ceph-only clone has no file to check either way.
+func TestCloneVM_AnUnknownKeptChainHoldsOnlyClonesThatWriteHere(t *testing.T) {
+	for _, how := range []string{"registry", "chain"} {
+		t.Run(how+"/into an nfs pool elsewhere", func(t *testing.T) {
+			s := cloneTargetServer(t)
+			named := keptUnknown(t, s, how)
+			mnt := t.TempDir()
+			if err := os.Chmod(mnt, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			overrideMounts(t, "22 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw", nfsMountLine(mnt, "nas:/vm"))
+			// The export is "mounted" already (the mount table above); no
+			// mount command runs.
+			t.Cleanup(storage.OverrideNFSMountCommandForTest(func(_ context.Context, name string, args ...string) ([]byte, error) {
+				return nil, nil
+			}))
+			ref := StoragePoolRef{Driver: "nfs", Source: "nas:/vm", Target: mnt}
+			upsertPool(t, s, corrosion.StoragePoolRecord{HostName: s.hostName, Name: "share", Driver: ref.Driver, Source: ref.Source, Target: ref.Target})
+			s.addStoragePoolRef("share", ref)
+			if _, err := s.CloneVM(adminCtx(), &pb.CloneVMRequest{Source: "tpl", Target: "c1", TargetPool: "share"}); err != nil {
+				t.Fatalf("clone into an nfs pool elsewhere while %s cannot be read: %v", named, err)
+			}
+			if !exists(filepath.Join(mnt, "c1-root.qcow2")) {
+				t.Fatal("the clone's disk is not in the nfs pool")
+			}
+		})
+		t.Run(how+"/ceph only", func(t *testing.T) {
+			f := newCephPoolFixture(t)
+			named := keptUnknown(t, f.s, how)
+			src := "rbd:lv/tpl-root:id=litevirt:keyring=" + f.keyring + ":lvpool=ceph"
+			f.world.images["lv/tpl-root"] = map[string]bool{}
+			spec, _ := json.Marshal(&pb.VMSpec{Name: "tpl", Cpu: 1, MemoryMib: 256})
+			if err := corrosion.InsertVM(adminCtx(), f.s.db, corrosion.VMRecord{Name: "tpl", HostName: "test-host", State: "stopped", Spec: string(spec)},
+				nil, []corrosion.DiskRecord{{VMName: "tpl", DiskName: "root", HostName: "test-host", Path: src, SizeBytes: 1 << 30, StorageType: "ceph", StorageVolume: "ceph"}}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.s.CloneVM(adminCtx(), &pb.CloneVMRequest{Source: "tpl", Target: "copy"}); err != nil {
+				t.Fatalf("a ceph-only clone while %s cannot be read: %v", named, err)
+			}
+		})
+	}
 }

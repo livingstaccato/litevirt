@@ -3477,7 +3477,8 @@ file, or with every disk on shared nfs, ceph or iscsi storage outside the disk
 directory, goes ahead); every disk attach that creates a new disk; and every
 backup restore to a `--target-path`. The
 evidence names the file under `creates_refused` (the condition is raised for
-it alone, and resolves once it reads).
+it alone, and resolves once it reads). A migration's target and the
+reconciler's rebuild of a missing overlay disk are not checked yet.
 
 ### A drain's live move timed out (`drain_move_timed_out`)
 

@@ -259,9 +259,13 @@ func (s *Server) sharedPoolElsewhere(driver, target string) bool {
 	if s.images != nil && filepath.Clean(target) == filepath.Clean(s.images.DiskDir("")) {
 		return false
 	}
-	is, err := storage.IsDataDirDisksErr(target, s.dataDir)
+	is, err := isDataDirDisksErr(target, s.dataDir)
 	return !is && err == nil
 }
+
+// isDataDirDisksErr is storage.IsDataDirDisksErr. A var so a test can make a
+// target's resolution not answer.
+var isDataDirDisksErr = storage.IsDataDirDisksErr
 
 // keptPathRefusal is keptMissingBaseRefusal for a write of exactly the files
 // in paths (a clone's disks, a restore's named target), as a gRPC status

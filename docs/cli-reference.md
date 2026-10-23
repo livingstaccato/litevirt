@@ -328,7 +328,8 @@ readable, a clone, a disk attach or a `--target-path` restore that would write
 a kept overlay's missing base is refused as a create is. A
 restore to the file the daemon names, or `--in-place` over the VM's own disk,
 is not checked: the first is a fresh name no overlay can name, the second a
-file that exists. A create whose `<vm>-*` files in the disk directory cannot be
+file that exists. A migration's target (cold or live) and the reconciler's
+rebuild of a missing overlay disk are not checked yet either. A create whose `<vm>-*` files in the disk directory cannot be
 listed is refused too, naming the directory. A disk only
 `kept-disks.json` names, at the path the create writes, is refused rather than
 renamed. `lv import` refuses the same files at its disk's name, rather than

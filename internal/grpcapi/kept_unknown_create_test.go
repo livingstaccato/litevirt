@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -230,5 +231,31 @@ func TestCreateVM_AnUnknownKeptChainStillHoldsCreatesThatOnlyLookShared(t *testi
 				t.Fatal("a refused create wrote its default root disk")
 			}
 		})
+	}
+}
+
+// A shared pool whose target cannot be resolved (a network filesystem that
+// does not answer, on the way to telling whether it is the disk directory
+// through a symlink) counts as local: the create is still held.
+//
+// Mutation: treat an unresolved target as elsewhere (`return !is`): red.
+func TestCreateVM_AnUnknownKeptChainHoldsACreateOnATargetItCannotResolve(t *testing.T) {
+	prev := isDataDirDisksErr
+	isDataDirDisksErr = func(p, dataDir string) (bool, error) {
+		return false, errors.New("injected: the resolution of " + p + " did not answer")
+	}
+	t.Cleanup(func() { isDataDirDisksErr = prev })
+	s, _ := provableCreateServer(t)
+	named := keptUnknown(t, s, "registry")
+	ref := StoragePoolRef{Driver: "nfs", Source: "10.0.0.9:/export", Target: filepath.Join(t.TempDir(), "share")}
+	if err := corrosion.UpsertStoragePool(context.Background(), s.db, corrosion.StoragePoolRecord{
+		HostName: "test-host", Name: "share", Driver: ref.Driver, Source: ref.Source, Target: ref.Target, State: "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.addStoragePoolRef("share", ref)
+	_, err := s.CreateVM(adminCtx(), cephCreateRequest("web", &pb.DiskSpec{Name: "root", Size: "1M", Storage: "share"}))
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), named) {
+		t.Fatalf("create = %v; want FailedPrecondition naming %s", err, named)
 	}
 }

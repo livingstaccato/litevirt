@@ -1813,7 +1813,7 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 	var made []string // created by this call: removed again if a later one fails
 	undo := func() {
 		for _, p := range made {
-			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			if err := s.removeDiskFileBeneath(p, false); err != nil {
 				slog.Warn("disk stub: remove after a failed EnsureDisks", "vm", req.VmName, "path", p, "error", err)
 			}
 			s.migrationStubs.forget(p)
@@ -1835,7 +1835,7 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 				slog.Info("disk stub reused for migration", "vm", req.VmName, "path", stub.Path)
 				continue
 			}
-			if err := os.Remove(stub.Path); err != nil {
+			if err := s.removeDiskFileBeneath(stub.Path, false); err != nil {
 				undo()
 				return nil, status.Errorf(codes.Internal, "replace stub %s: %v", stub.Path, err)
 			}

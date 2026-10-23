@@ -145,14 +145,31 @@ func (s *Server) copyColdDisksToTarget(ctx context.Context, targetHost, vmName s
 // all. The target then gets a standalone image of the same content, which is
 // what libvirt's storage copy of a running VM leaves there too.
 func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, vmName string, d corrosion.DiskRecord, format string) error {
-	src := s.hostDiskFile(d.Path)
+	// The disk's directory is held open beneath its root with no link
+	// followed, and the bytes are read through that descriptor (the flatten's
+	// source and scratch file too), so a component swapped for a link after
+	// the checks below cannot make this host send another file. The checks
+	// themselves only judge; what is read is what the held directory holds.
+	root, rootOK := s.diskArtifactRootOf(d.Path)
+	if !rootOK {
+		return status.Errorf(codes.FailedPrecondition, "disk path %q is not in a disk-artifact root of %s; nothing was read", d.Path, s.hostName)
+	}
+	pd, perr := openPinnedDir(s.hostDiskFile(root), relUnder(root, filepath.Dir(d.Path)), false)
+	if perr != nil {
+		return status.Errorf(codes.FailedPrecondition, "disk %s: its directory cannot be opened without following a link (%v); nothing was read", d.Path, perr)
+	}
+	defer pd.close()
 	info, err := s.coldDiskSourceCheck(d, format)
 	if err != nil {
 		return err
 	}
+	if s.coldSourceReadHook != nil {
+		s.coldSourceReadHook()
+	}
+	src := pd.path(filepath.Base(d.Path))
 	readPath := src
 	if info != nil {
-		flat := filepath.Join(filepath.Dir(src), "."+filepath.Base(src)+coldMigScratch+uuid.NewString())
+		flat := pd.path("." + filepath.Base(d.Path) + coldMigScratch + uuid.NewString())
 		defer os.Remove(flat)
 		defer os.Remove(flat + ".tmp")
 		if err := s.flattenColdDisk(ctx, d, src, flat); err != nil {
@@ -160,14 +177,18 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 		}
 		readPath = flat
 	}
-	f, err := os.Open(readPath)
+	// No link at the final component either, and only a regular file is read.
+	f, err := os.OpenFile(readPath, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return status.Errorf(codes.Internal, "open disk %s: %v", d.Path, err)
+		return status.Errorf(codes.FailedPrecondition, "open disk %s: %v; it is not read through a link", d.Path, err)
 	}
 	defer f.Close()
 	st, err := f.Stat()
 	if err != nil {
 		return status.Errorf(codes.Internal, "stat disk %s: %v", d.Path, err)
+	}
+	if !st.Mode().IsRegular() {
+		return status.Errorf(codes.FailedPrecondition, "disk file %s is not a regular file; nothing was read", d.Path)
 	}
 	size := st.Size()
 	allocated := size
@@ -307,6 +328,11 @@ func (s *Server) SetColdDiskPlacedHookForTest(fn func()) { s.coldDiskPlacedHook 
 // SetColdDirOpenedHookForTest runs fn after a receive has opened its disk
 // directory and before it writes (tests: swap a component for a link there).
 func (s *Server) SetColdDirOpenedHookForTest(fn func()) { s.coldDirOpenedHook = fn }
+
+// SetColdSourceReadHookForTest runs fn on the source after a disk's directory
+// is held open and its checks passed, before the bytes are read (tests: swap
+// the file or its directory for a link there).
+func (s *Server) SetColdSourceReadHookForTest(fn func()) { s.coldSourceReadHook = fn }
 
 // SetOpenat2DisabledForTest makes the receive walk with O_NOFOLLOW openat, as
 // on a kernel without openat2 (tests; process-wide).

@@ -243,6 +243,43 @@ message SupersededDisksResponse {
     string                  restored_to    = 5;  // the disk path it is now
     string                  set_aside      = 6;  // where the file it replaced was set aside; "" when there was none
 }
+
+// KeptDisksRequest is `lv host kept-disks <host>`: the disk chains VM deletes
+// kept on that host (its kept-disk notes, <data_dir>/kept-disks/<vm>.json, and
+// its record <data_dir>/kept-disks.json), and, with release (admin), the
+// removal of one deleted VM's chains or of the one chain a file is in, with
+// their note and record entries. A release is refused, removing nothing,
+// while anything still references a file it would remove. An older host does
+// not know the RPC and answers Unimplemented: nothing is removed there.
+message KeptDisksRequest {
+    string host         = 1;  // "" = the host answering
+    string release      = 2;  // a deleted VM's name, or a file of a kept chain (absolute path); "" lists only
+    bool   dry_run      = 3;  // with release: answer what it would remove, and why it is refused, removing nothing
+    repeated string expect_paths = 4;  // with release: the files the caller confirmed; refused, removing nothing, when the release would remove any other set
+}
+message KeptDiskFile {
+    string path       = 1;
+    int64  size_bytes = 2;
+    bool   under      = 3;  // a file a kept layer above it backs on
+    bool   gone       = 4;  // named by a note or record, and no longer there: a release only forgets it
+}
+message KeptDiskChain {
+    string vm_name   = 1;  // the deleted VM it was kept with
+    repeated KeptDiskFile files = 2;  // what a release removes, every overlay before what it backs on
+    repeated string stands_on   = 3;  // the files below it that are not the VM's own (an image): a release leaves them
+    string missing_base = 4;  // the backing file the chain names that does not exist; "" when whole
+    string kept_at   = 5;  // RFC3339: when the delete recorded it, or when its note was last written
+    string reason    = 6;
+    repeated string records = 7;  // the note and the record file naming it
+    string held      = 8;  // why a release is refused now; "" when it may be released
+    bool   released  = 9;  // removed by this request
+    string host      = 10; // the host its files are on, when not the host answering (a record of another host's disk): listed only
+}
+message KeptDisksResponse {
+    string host    = 1;
+    repeated KeptDiskChain chains = 2;
+    bool   dry_run = 3;  // the chains marked released were not removed: a dry run
+}
 message ConfigureHostRequest {
     string name = 1;
     string fence_strategy = 2;  // ssh | ipmi | redfish | watchdog | manual | best-effort
@@ -4748,6 +4785,9 @@ service LiteVirt {
     // SupersededDisks lists the disk copies a failover start set aside on a
     // host, and with purge (admin) removes the ones not held.
     rpc SupersededDisks(SupersededDisksRequest) returns (SupersededDisksResponse);
+    // KeptDisks lists the disk chains VM deletes kept on a host, and with
+    // release (admin) removes one VM's, or one chain, nothing referencing it.
+    rpc KeptDisks(KeptDisksRequest) returns (KeptDisksResponse);
     rpc UpgradeHost(stream UpgradeHostRequest) returns (UpgradeHostResponse);
     // PreStageUpgrade stages the new binary and forward-migrates the local
     // state.db schema WITHOUT swapping/re-execing. Run on every node before the

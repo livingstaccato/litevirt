@@ -195,6 +195,11 @@ lv host superseded-disks <host>           # List the disk copies a failover set 
   [--purge] [--older-than 72h]            #   remove the ones neither retained nor held (admin)
   [--remove <copy>]...                    #   remove exactly these copies, even retained (admin)
   [--restore <copy>]                      #   put a copy back as its stopped VM's disk (admin)
+lv host kept-disks <host>                 # List the disk chains VM deletes kept on a host (notes and
+                                          #   kept-disks.json): VM, files, under layers, size, when, why
+  [--release <vm|path>]                   #   remove one deleted VM's chains, or the chain a file is in,
+                                          #   with their note and record entries (admin, audited)
+  [--dry-run] [--yes]                     #   show what it removes and why it is refused / skip the prompt
 lv host lun-holds [host]                  # List the holds kept on iSCSI LUNs a rebuild or recreate moved
 lv host lun-hold discard <lun> --yes      # Move a hold aside so the LUN can be taken again (admin, audited)
   [--host <host>]                         #   on that host (default: the one host holding it)
@@ -326,6 +331,36 @@ migration's or volume move's source cleanup, replica pruning) leaves a file a
 leaves a file a note names, unless a VM's disk record on that host still names
 that entry's own file (a delete that failed keeps its record, and its retry
 frees it); the files under it stay held.
+
+**Releasing kept disks.** `lv host kept-disks <host>` lists every disk chain
+the deletes kept on that host, from its notes (`<data_dir>/kept-disks/<vm>.json`)
+and its `<data_dir>/kept-disks.json`: the deleted VM, the files a release
+removes (an overlay before the file it backs on; `under` marks a file a kept
+layer above backs on), the files below the chain that are not the VM's own
+(an image, left in place), the size, when it was kept and why, the note and
+record naming it, and why a release is refused now. `--release <vm|path>`
+removes every kept chain of the deleted VM of that name, or the one chain a
+file is in, with their note and record entries, then judges `disk_leftover`
+again, which clears for them. It removes whole chains, each overlay before the
+file it backs on, never a file under a chain it leaves. It is refused
+(`FailedPrecondition`), removing nothing, while anything references a file it
+would remove: a VM's disk row on that host (any host's, on shared storage),
+another VM's disk or another kept chain backing on it, a snapshot record of
+the deleted VM on that host or one naming it as its memory image, a recorded
+replica, a set-aside copy layered on it, or a domain on that host that uses
+it or has the deleted VM's name. A note, `kept-disks.json` or a chain that
+cannot be read refuses it too, naming the file. It shows exactly what it
+removes and asks to confirm (`--yes` skips the question; without a terminal
+it is required); the files confirmed are sent with the release, and a release
+that would now remove any others is refused (`Aborted`). `--dry-run` shows the
+plan and the refusal, removing nothing. The release needs admin, is refused
+while that host's replica has not caught up, and writes an audit entry
+`host.kept_disks.release` on that host naming each file removed and its size,
+and a `vm.disk.released` event of the VM. A host on an older build answers
+that it does not know the command, and removes nothing. A record of a disk on
+another host is listed and not released: check it there, then remove its
+entry by hand. The `.kept-` copies a create moved aside are not kept chains:
+`lv host superseded-disks` lists them.
 
 **`--keep-disks` and snapshots.** `lv rm --keep-disks` of a VM that has
 snapshots is refused (`FailedPrecondition`, naming them) before anything is

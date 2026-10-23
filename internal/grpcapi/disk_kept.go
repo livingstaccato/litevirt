@@ -361,8 +361,9 @@ func (s *Server) judgeKeptDisks(ctx context.Context) {
 	evidence := map[string]any{
 		"host": s.hostName, "disks": list,
 		"detail": fmt.Sprintf("%d disk file(s) VM deletes on %s kept, each with its reason; check that nothing uses each one (another VM's disk, "+
-			"a process holding it open) and remove it by hand — litevirt removes none of them. A file on this host is forgotten once it is gone",
-			len(list), s.hostName),
+			"a process holding it open), then release it with `lv host kept-disks %s --release <vm|path>`, which refuses while anything still "+
+			"references it, or remove it by hand — litevirt removes none of them on its own. A file on this host is forgotten once it is gone",
+			len(list), s.hostName, s.hostName),
 		"forget": fmt.Sprintf("to stop naming a disk you keep on purpose, or one on another host, remove its entry from %s on %s; the file is re-read within 30 s",
 			filepath.Join(s.dataDir, diskKeptFile), s.hostName),
 	}

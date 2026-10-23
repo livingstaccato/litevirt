@@ -2585,7 +2585,7 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 			continue
 		}
 		// Through the directory held open beneath its root, never a link
-		if err := removeBeneath(s.hostDiskFile(root), root, p); err != nil {
+		if err := s.removeUnderRoot(root, p, true); err != nil {
 			slog.Warn("cleanup migration artifacts: remove disk stub", "vm", req.VmName, "path", p, "error", err)
 			continue
 		}

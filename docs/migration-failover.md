@@ -491,8 +491,15 @@ replicated state too, so it never widens the rule beyond those areas. The disk's
 directory is opened once, beneath the root it was judged in, with no symlink
 followed, and the copy, its placement, the take-back and the cleanup all go
 through that open directory: a link planted below the root is refused, and one
-swapped in later is never followed. This holds for the target's own pools as
-well as for the source's.
+swapped in later is never followed. The source reads the disk the same way and
+removes its copy the same way, and the EnsureDisks stub replace and undo and the
+firmware discard remove through the open directory too (the stub create is still
+by path). The root itself is judged for what it leads to: a data-dir area
+(`disks/`, `pools/`, `mounts/`) or an operator's own pool directory outside the
+areas may be a link to another volume, if it leads somewhere a pool may live; a
+pool directory below an area that has been replaced by a link out of the area is
+refused. Without `/proc/self/fd` nothing is opened, so a removal fails rather
+than reporting the file gone.
 
 A VM promoted onto a witness is the usual case: the witness's `default` pool is
 `<data_dir>/pools/default`, which is inside the worker's `pools/` area, while the

@@ -131,8 +131,8 @@ func TestFleet_ColdMigrationWritesThroughTheDirectoryItJudged(t *testing.T) {
 //
 // Mutation: as above - an attempt escapes (the old code did, in about twenty).
 func TestFleet_ColdMigrationRaceBetweenJudgingAndWritingTheParent(t *testing.T) {
-	deadline := time.Now().Add(20 * time.Second)
-	for attempt := 1; attempt <= 40 && time.Now().Before(deadline); attempt++ {
+	deadline := time.Now().Add(45 * time.Second)
+	for attempt := 1; time.Now().Before(deadline); attempt++ {
 		var def, outside string
 		fp := newForeignPoolScenario(t,
 			func(pool, _ string) string {

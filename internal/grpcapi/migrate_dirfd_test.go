@@ -76,7 +76,7 @@ func TestOpenPinnedDir(t *testing.T) {
 			if fi, err := os.Stat(filepath.Join(root, "new", "deep")); err != nil || !fi.IsDir() {
 				t.Errorf("the created directory is not there: %v", err)
 			}
-			if err := removeBeneath(root, root, filepath.Join(root, "new", "deep", "nothing")); err != nil {
+			if err := (&Server{dataDir: t.TempDir()}).removeUnderRoot(root, filepath.Join(root, "new", "deep", "nothing"), false); err != nil {
 				t.Errorf("removing an absent file: %v", err)
 			}
 		})

@@ -154,7 +154,7 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 	if !rootOK {
 		return status.Errorf(codes.FailedPrecondition, "disk path %q is not in a disk-artifact root of %s; nothing was read", d.Path, s.hostName)
 	}
-	pd, perr := openPinnedDir(s.hostDiskFile(root), relUnder(root, filepath.Dir(d.Path)), false)
+	pd, perr := s.openDiskDir(root, relUnder(root, filepath.Dir(d.Path)), false, true)
 	if perr != nil {
 		return status.Errorf(codes.FailedPrecondition, "disk %s: its directory cannot be opened without following a link (%v); nothing was read", d.Path, perr)
 	}
@@ -572,7 +572,7 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	// swapped for a link after this point changes nothing: the descriptor
 	// names the directory that was judged. A link on the way is refused as a
 	// path outside the disk-artifact roots.
-	pd, perr := openPinnedDir(s.hostDiskFile(root), relUnder(root, filepath.Dir(hdr.Path)), !hdr.CheckOnly)
+	pd, perr := s.openDiskDir(root, relUnder(root, filepath.Dir(hdr.Path)), !hdr.CheckOnly, true)
 	switch {
 	case perr == nil:
 		defer pd.close()
@@ -797,7 +797,7 @@ func (s *Server) removeColdMigratedSourceDisks(ctx context.Context, vmName strin
 			continue
 		}
 		root, _ := s.diskArtifactRootOf(d.Path) // coldSourcePathCheck found one
-		if err := removeBeneath(s.hostDiskFile(root), root, d.Path); err != nil {
+		if err := s.removeUnderRoot(root, d.Path, true); err != nil {
 			slog.Warn("cold migration: could not remove the source copy of a migrated disk",
 				"vm", vmName, "path", d.Path, "error", err)
 			s.recordVMEvent(ctx, vmName, "vm.migrated", "warn",

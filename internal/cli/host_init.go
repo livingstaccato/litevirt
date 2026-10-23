@@ -347,6 +347,17 @@ func mintLocalHostCert(pkiDir, hostName, addr string) error {
 		hostName, ip)
 }
 
+// etcLitevirtDir is the system config directory. A var so a test can point it
+// at a temp dir.
+var etcLitevirtDir = "/etc/litevirt"
+
+// ensureEtcLitevirtDir opens the system config directory for search only.
+// `lv host init --local` used to create it as a side effect of
+// MkdirAll(".../pki", 0700), so it came out 0700 and the fence ssh
+// AuthorizedKeysCommand (nobody) could not traverse it. The rule lives in
+// fencessh.EnsureSearchableDir, which the daemon applies too.
+func ensureEtcLitevirtDir(dir string) error { return fencessh.EnsureSearchableDir(dir) }
+
 func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bool) error {
 	if err := pki.ValidateHostName(hostName); err != nil {
 		return err
@@ -362,6 +373,10 @@ func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bo
 		return err
 	}
 
+	// Before any MkdirAll below makes it as a 0700 side effect.
+	if err := ensureEtcLitevirtDir(etcLitevirtDir); err != nil {
+		return err
+	}
 	pkiDir := PKIDir()
 	if err := os.MkdirAll(pkiDir, 0700); err != nil {
 		return fmt.Errorf("create PKI dir: %w", err)
@@ -1185,7 +1200,12 @@ echo "Enabled libvirtd TLS (port 16514)"
 # keeps its mode. qemu reaches its files through them (internal/diskmode).
 mkdir -p /var/lib/litevirt
 mkdir -p -m 0711 /var/lib/litevirt/{images,disks,cloudinit}
-mkdir -p /etc/litevirt
+# Searchable but not listable (0711), as the disk dirs above: the fence ssh
+# AuthorizedKeysCommand runs unprivileged and must reach /etc/litevirt/ssh. The
+# secrets below it keep their own 0700/0600. An existing directory only gains the
+# search bit, whatever else its mode is.
+mkdir -p -m 0711 /etc/litevirt
+chmod o+x /etc/litevirt
 ` + genesisMarkerScript + `
 # Libvirt storage pools are auto-created by litevirtd on startup
 # (from storage_pools config or a default local pool).
@@ -1265,6 +1285,7 @@ if [ "${FENCE_SSH_DROPIN:-1}" != 0 ]; then
     lv_fence_ssh_install || echo "fence ssh: the drop-in was not installed"
 else
     install -d -m 0755 /etc/litevirt/ssh
+    chmod o+x /etc/litevirt
     echo "fence ssh: --no-fence-ssh; add /etc/litevirt/ssh/authorized_keys to root's AuthorizedKeysFile by hand"
 fi
 

@@ -3464,6 +3464,12 @@ another host, check it and remove its entry from `<data_dir>/kept-disks.json`
 on the host that raised the condition; the file is re-read within 30 s. A file
 that cannot be read is never written over: the condition says so, the disks
 stay named from memory, and fixing or removing the file recovers.
+While an entry is there, a create on that host never clears the file it names,
+nor a file that disk's backing chain reaches: the create is refused, naming
+the file (docs/cli-reference.md, `lv rm`). A disk the delete of a VM with no
+domain kept is also in `<data_dir>/kept-disks/<vm>.json`, with the files its
+chain backs on. While `kept-disks.json` cannot be read, a create that would
+clear a file left by an earlier VM of its name is refused.
 
 ### A drain's live move timed out (`drain_move_timed_out`)
 

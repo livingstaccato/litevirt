@@ -442,6 +442,13 @@ func (s *Server) clearImportDiskName(ctx context.Context, pool, importName, impo
 	if err != nil {
 		return "", refuse(fmt.Sprintf("cannot be read (%v)", err))
 	}
+	// A file a delete kept, or one a kept disk beside it backs on, is no
+	// orphan, whatever the database records: moved aside, a kept overlay
+	// would back on the imported disk.
+	if kerr := s.keptFileCreateRefusal(ctx, importName, []string{dst}, false); kerr != nil {
+		return "", fmt.Errorf("disk %q would be written to %s, which already exists in the pool: %v; "+
+			"an import never replaces a file there — import under another --name", disk, dst, kerr)
+	}
 	refs, err := s.importPathReferences(ctx, dst, fi)
 	if err != nil {
 		return "", refuse(fmt.Sprintf("what records it could not be read (%v); retry", err))

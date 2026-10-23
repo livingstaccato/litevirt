@@ -223,6 +223,7 @@ const (
 	LiteVirt_CreateStoragePool_FullMethodName           = "/litevirt.v1.LiteVirt/CreateStoragePool"
 	LiteVirt_DeleteStoragePool_FullMethodName           = "/litevirt.v1.LiteVirt/DeleteStoragePool"
 	LiteVirt_GetStoragePool_FullMethodName              = "/litevirt.v1.LiteVirt/GetStoragePool"
+	LiteVirt_TrustStoragePool_FullMethodName            = "/litevirt.v1.LiteVirt/TrustStoragePool"
 	LiteVirt_ListStoragePoolContents_FullMethodName     = "/litevirt.v1.LiteVirt/ListStoragePoolContents"
 	LiteVirt_UploadStoragePoolContent_FullMethodName    = "/litevirt.v1.LiteVirt/UploadStoragePoolContent"
 	LiteVirt_CreateResourceMapping_FullMethodName       = "/litevirt.v1.LiteVirt/CreateResourceMapping"
@@ -752,6 +753,7 @@ type LiteVirtClient interface {
 	CreateStoragePool(ctx context.Context, in *CreateStoragePoolRequest, opts ...grpc.CallOption) (*CreateStoragePoolResponse, error)
 	DeleteStoragePool(ctx context.Context, in *DeleteStoragePoolRequest, opts ...grpc.CallOption) (*DeleteStoragePoolResponse, error)
 	GetStoragePool(ctx context.Context, in *GetStoragePoolRequest, opts ...grpc.CallOption) (*GetStoragePoolResponse, error)
+	TrustStoragePool(ctx context.Context, in *TrustStoragePoolRequest, opts ...grpc.CallOption) (*TrustStoragePoolResponse, error)
 	ListStoragePoolContents(ctx context.Context, in *ListStoragePoolContentsRequest, opts ...grpc.CallOption) (*ListStoragePoolContentsResponse, error)
 	UploadStoragePoolContent(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UploadStoragePoolContentRequest, UploadStoragePoolContentResponse], error)
 	// ── Resource Mappings (#14) ──
@@ -3444,6 +3446,16 @@ func (c *liteVirtClient) GetStoragePool(ctx context.Context, in *GetStoragePoolR
 	return out, nil
 }
 
+func (c *liteVirtClient) TrustStoragePool(ctx context.Context, in *TrustStoragePoolRequest, opts ...grpc.CallOption) (*TrustStoragePoolResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TrustStoragePoolResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_TrustStoragePool_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) ListStoragePoolContents(ctx context.Context, in *ListStoragePoolContentsRequest, opts ...grpc.CallOption) (*ListStoragePoolContentsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListStoragePoolContentsResponse)
@@ -5489,6 +5501,7 @@ type LiteVirtServer interface {
 	CreateStoragePool(context.Context, *CreateStoragePoolRequest) (*CreateStoragePoolResponse, error)
 	DeleteStoragePool(context.Context, *DeleteStoragePoolRequest) (*DeleteStoragePoolResponse, error)
 	GetStoragePool(context.Context, *GetStoragePoolRequest) (*GetStoragePoolResponse, error)
+	TrustStoragePool(context.Context, *TrustStoragePoolRequest) (*TrustStoragePoolResponse, error)
 	ListStoragePoolContents(context.Context, *ListStoragePoolContentsRequest) (*ListStoragePoolContentsResponse, error)
 	UploadStoragePoolContent(grpc.ClientStreamingServer[UploadStoragePoolContentRequest, UploadStoragePoolContentResponse]) error
 	// ── Resource Mappings (#14) ──
@@ -6537,6 +6550,9 @@ func (UnimplementedLiteVirtServer) DeleteStoragePool(context.Context, *DeleteSto
 }
 func (UnimplementedLiteVirtServer) GetStoragePool(context.Context, *GetStoragePoolRequest) (*GetStoragePoolResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetStoragePool not implemented")
+}
+func (UnimplementedLiteVirtServer) TrustStoragePool(context.Context, *TrustStoragePoolRequest) (*TrustStoragePoolResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method TrustStoragePool not implemented")
 }
 func (UnimplementedLiteVirtServer) ListStoragePoolContents(context.Context, *ListStoragePoolContentsRequest) (*ListStoragePoolContentsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListStoragePoolContents not implemented")
@@ -10445,6 +10461,24 @@ func _LiteVirt_GetStoragePool_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_TrustStoragePool_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TrustStoragePoolRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).TrustStoragePool(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_TrustStoragePool_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).TrustStoragePool(ctx, req.(*TrustStoragePoolRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_ListStoragePoolContents_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListStoragePoolContentsRequest)
 	if err := dec(in); err != nil {
@@ -13869,6 +13903,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetStoragePool",
 			Handler:    _LiteVirt_GetStoragePool_Handler,
+		},
+		{
+			MethodName: "TrustStoragePool",
+			Handler:    _LiteVirt_TrustStoragePool_Handler,
 		},
 		{
 			MethodName: "ListStoragePoolContents",

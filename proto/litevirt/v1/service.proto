@@ -2789,6 +2789,23 @@ message GetStoragePoolRequest {
 }
 message GetStoragePoolResponse { StoragePool pool = 1; }
 
+// TrustStoragePoolRequest confirms, on the pool's host, that a storage_pools
+// row naming that host is its pool (`lv pool trust`). driver, source and
+// target are the row as the operator checked it: the host refuses when its
+// row differs, so what is confirmed is what was shown.
+message TrustStoragePoolRequest {
+    string name   = 1;
+    string host   = 2; // optional — defaults to caller's host
+    string driver = 3;
+    string source = 4;
+    string target = 5;
+}
+message TrustStoragePoolResponse {
+    StoragePool pool = 1;
+    bool already_trusted = 2; // the host already trusted the row (config, ledger or its own pool area)
+    string trusted_as = 3;    // how the host trusts it now
+}
+
 // A file in a (file-based) storage pool — used by the content browser.
 message StoragePoolContent {
     string name        = 1; // file name
@@ -5064,6 +5081,7 @@ service LiteVirt {
     rpc CreateStoragePool(CreateStoragePoolRequest) returns (CreateStoragePoolResponse);
     rpc DeleteStoragePool(DeleteStoragePoolRequest) returns (DeleteStoragePoolResponse);
     rpc GetStoragePool(GetStoragePoolRequest)       returns (GetStoragePoolResponse);
+    rpc TrustStoragePool(TrustStoragePoolRequest)   returns (TrustStoragePoolResponse);
     rpc ListStoragePoolContents(ListStoragePoolContentsRequest) returns (ListStoragePoolContentsResponse);
     rpc UploadStoragePoolContent(stream UploadStoragePoolContentRequest) returns (UploadStoragePoolContentResponse);
 

@@ -17,8 +17,12 @@ import (
 // defined. An active witness is not refused for its state (the control, so the
 // refusal below is the state check and not a fixture failure).
 //
+// The refusal says how to go on: return the witness to active with
+// `lv host undrain <host>`.
+//
 // Mutation: remove the `self.State != "active"` check in doPromoteLocal — the
-// draining and maintenance rows go red.
+// draining and maintenance rows go red; drop the hint from the message — the
+// same rows go red.
 func TestPromoteReplica_WitnessNotActiveRefused(t *testing.T) {
 	for _, tc := range []struct {
 		state   string
@@ -42,6 +46,11 @@ func TestPromoteReplica_WitnessNotActiveRefused(t *testing.T) {
 			if tc.refused {
 				if status.Code(err) != codes.FailedPrecondition || !stateRefusal || !strings.Contains(err.Error(), tc.state) {
 					t.Fatalf("promote on a %s witness = %v, want FailedPrecondition naming the state", tc.state, err)
+				}
+				// The way forward: undrain returns a draining host or one in
+				// maintenance to active (cmd/litevirt/host.go, `undrain <host>`).
+				if want := "`lv host undrain " + s.hostName + "`"; !strings.Contains(err.Error(), want) {
+					t.Errorf("refusal %q does not give the way forward %s", err, want)
 				}
 				assertNoPromotedArtifacts(t, s, poolDir, "vm1")
 				return

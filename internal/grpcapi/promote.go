@@ -938,7 +938,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		// in maintenance is not taking on.
 		if self.State != "active" {
 			return status.Errorf(codes.FailedPrecondition,
-				"promote refused: witness %q is %s, not active, and takes on no VM", s.hostName, self.State)
+				"promote refused: witness %q is %s, not active, and takes on no VM: %s",
+				s.hostName, self.State, returnToServiceHint(s.hostName, self.State))
 		}
 		witnessPromote = true
 	}

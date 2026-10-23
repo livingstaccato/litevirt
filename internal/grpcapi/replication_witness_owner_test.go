@@ -25,15 +25,27 @@ func TestRunReplication_AWitnessSkipsBeforeItPauses(t *testing.T) {
 	for _, tc := range []struct {
 		name, state, gate string
 		skipped           bool
+		epochBehind       bool
 	}{
-		{"fenced witness", "fenced", health.ReasonLocalNotActiveWorker, true},
-		{"joining witness", "joining", health.ReasonLocalNotActiveWorker, true},
-		{"warming-up witness", "active", health.ReasonWarmup, true},
-		{"active witness, role only", "active", health.ReasonLocalNotActiveWorker, false},
+		{"fenced witness", "fenced", health.ReasonLocalNotActiveWorker, true, false},
+		{"joining witness", "joining", health.ReasonLocalNotActiveWorker, true, false},
+		// A draining witness is skipped (its State is not active or maintenance),
+		// not paused: harmless, and asserted so it stays so.
+		{"draining witness", "draining", health.ReasonLocalNotActiveWorker, true, false},
+		{"warming-up witness", "active", health.ReasonWarmup, true, false},
+		{"self-fenced witness", "active", health.ReasonSelfFenced, true, false},
+		{"witness without quorum", "active", health.ReasonNoQuorum, true, false},
+		{"witness behind on the owner epoch", "active", health.ReasonLocalNotActiveWorker, true, true},
+		{"active witness, role only", "active", health.ReasonLocalNotActiveWorker, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := testServer(t)
 			ctx := context.Background()
+			if tc.epochBehind {
+				if err := health.WriteVMOwnerEpochMarker(s.dataDir, "ipmi-f", 5); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: s.hostName, Address: "10.0.0.13", State: tc.state, Role: "witness"}); err != nil {
 				t.Fatal(err)
 			}

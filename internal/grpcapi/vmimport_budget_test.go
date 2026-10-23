@@ -1,6 +1,8 @@
 package grpcapi
 
 import (
+	"bytes"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,6 +53,63 @@ func writeAllocated(t *testing.T, dir string, n int) {
 	}
 	if err := f.Sync(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// writeFragmented writes n bytes (a multiple of 8 KiB) to one file in dir by
+// interleaving synced 4 KiB writes with a second file, so the filesystem has
+// to give the first many extents. On ext4 that costs the file an extent-tree
+// block beyond its data, which st_blocks counts: the file occupies more than n.
+func writeFragmented(t *testing.T, dir string, n int) {
+	t.Helper()
+	fa, err := os.Create(filepath.Join(dir, "frag-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fa.Close()
+	fb, err := os.Create(filepath.Join(dir, "frag-b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fb.Close()
+	buf := bytes.Repeat([]byte{0xa5}, 4096)
+	for i := 0; i < n/8192; i++ {
+		for _, f := range []*os.File{fa, fb} {
+			if _, err := f.Write(buf); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Sync(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+// shownAsFree makes the fake free space cover the blocks the files under dirs
+// occupy beyond their bytes. A file's st_blocks include filesystem metadata
+// (ext4 spends a block on the extent tree of a file with more than four
+// extents, and a busy filesystem hands out fragmented extents), which the
+// code counts as written, as it is: those blocks come out of the free space
+// too. The fake's free space is a figure the test sets, so it must be told.
+func shownAsFree(t *testing.T, used *int64, dirs ...string) {
+	t.Helper()
+	for _, d := range dirs {
+		err := filepath.WalkDir(d, func(p string, e fs.DirEntry, err error) error {
+			if err != nil || !e.Type().IsRegular() {
+				return err
+			}
+			fi, err := e.Info()
+			if err != nil {
+				return err
+			}
+			if extra := int64(lstatAllocated(p)) - fi.Size(); extra > 0 {
+				*used -= extra
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

@@ -464,6 +464,29 @@ func TestImportSpace_BeginKeepsUnshownWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeAllocated(t, a, 4<<20) // not shown yet
+	shownAsFree(t, &used, a)
+	ra.begin()
+	rb := s.reserveImportSpace(b)
+	defer rb.release()
+	refusedForReservation(t, rb.reserve(b, 17<<20, "b"))
+	if err := rb.reserve(b, 16<<20, "b"); err != nil {
+		t.Fatalf("beside 4 MiB written and not shown, of 20 free: %v", err)
+	}
+}
+
+// The same, with a file that occupies more blocks than it holds bytes: the
+// import's extra metadata blocks are written and not shown too.
+func TestImportSpace_BeginKeepsUnshownWritesOfAFragmentedFile(t *testing.T) {
+	var used int64
+	s := sharedSpaceServer(20<<20, &used)
+	a, b := t.TempDir(), t.TempDir()
+	ra := s.reserveImportSpace(a)
+	defer ra.release()
+	if err := ra.reserve(a, 8<<20, "a"); err != nil {
+		t.Fatal(err)
+	}
+	writeFragmented(t, a, 4<<20) // two files of 2 MiB, not shown yet
+	shownAsFree(t, &used, a)
 	ra.begin()
 	rb := s.reserveImportSpace(b)
 	defer rb.release()
@@ -525,6 +548,7 @@ func TestImportSpace_APlacedDiskStaysItsImports(t *testing.T) {
 	}
 	writeAllocated(t, b, 4<<20) // not shown yet
 	rb.refresh()
+	shownAsFree(t, &used, pool, b)
 	// 16 MiB free: a's 4 written and shown, b's 8 not shown written.
 	rc := s.reserveImportSpace(c)
 	defer rc.release()

@@ -500,7 +500,12 @@ func TestDrainExecutionGate_OnlyDrainingIsAdded(t *testing.T) {
 		{"upgrading", "worker", ReasonLocalNotActiveWorker, ReasonLocalNotActiveWorker},
 		{"maintenance", "worker", ReasonLocalNotActiveWorker, ReasonLocalNotActiveWorker},
 		{"fenced", "worker", ReasonLocalNotActiveWorker, ReasonLocalNotActiveWorker},
-		{"draining", "witness", ReasonLocalNotActiveWorker, ReasonLocalNotActiveWorker},
+		// A witness never starts work (ExecutionGate), but the drain gate, which
+		// only moves a workload AWAY, admits it: a VM stranded on a witness has
+		// no other way off (grpcapi/migrate_target_role.go).
+		{"active", "witness", ReasonLocalNotActiveWorker, ""},
+		{"draining", "witness", ReasonLocalNotActiveWorker, ""},
+		{"maintenance", "witness", ReasonLocalNotActiveWorker, ReasonLocalNotActiveWorker},
 	} {
 		t.Run(tc.state+"/"+tc.role, func(t *testing.T) {
 			db := testCheckHostDB(t)

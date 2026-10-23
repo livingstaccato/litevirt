@@ -2003,6 +2003,27 @@ Witnesses participate in failover quorum but never run workloads. The
 placement engine refuses to schedule any VM onto them. See
 [operating-model.md](operating-model.md) for sizing guidance.
 
+A migration names its target, so it never goes through placement; the
+request itself refuses a target that cannot run workloads, before anything
+moves. `lv migrate <vm> <host>` (cold or live; a drain's and the
+rebalancer's moves too) is refused `FailedPrecondition: target host "<host>"
+is a witness (role: witness) and runs no workloads`, and a host that is not
+`active` (draining, maintenance, fenced) is refused `is not active`. The
+target host checks its own role again when the source asks it to stage the
+move, so an older source that never checks cannot land a VM on a witness. A
+promote of a replica held on a witness is refused for the same reason.
+
+A VM already stranded on a witness (accepted by an older build, or left there
+by a role change) can neither start (`start refused: local_not_active_worker`,
+which on a witness now says so) nor be placed, but it can be moved off: a
+witness admits a migration away from it. Run it naming a worker, then start
+the VM there:
+
+```bash
+lv migrate <vm> <worker-host> --cold
+lv start <vm>
+```
+
 Without a witness, a cluster left with exactly two voting-eligible workers
 refuses every failover decision with `missing_witness`, **unless a voter
 generation is adopted** (`lv cluster voter ls`). Without one, the voter set is

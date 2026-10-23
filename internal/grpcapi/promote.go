@@ -276,6 +276,14 @@ func (s *Server) promoteResolvedIn(ctx context.Context, req *pb.PromoteReplicaRe
 				errReplicaOutOfRegion, req.VmName, host, got, requireRegion)
 		}
 	}
+	// A replica on a witness is never promoted there: a witness runs no
+	// workloads, so the VM could neither start nor be moved off by the ordinary
+	// route (migrate_target_role.go).
+	if hr, herr := corrosion.GetHost(ctx, s.db, host); herr == nil && hr != nil && hr.IsWitness() {
+		return status.Errorf(codes.FailedPrecondition,
+			"vm %q's replica is on host %q, a witness (role: %s) that runs no workloads; it is not promoted there",
+			req.VmName, host, hr.Role)
+	}
 	// Before any proof is persisted or any request relayed: a stale replica is
 	// refused at the point it is chosen, not after the destination has been
 	// told to expect it.

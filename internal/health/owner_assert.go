@@ -77,7 +77,17 @@ func localHostIsActiveWorker(hosts []corrosion.HostRecord, self string) bool {
 
 // localHostIsEvacuatingWorker is localHostIsActiveWorker for a host moving its
 // own workloads away: it may also be draining (DrainExecutionGate).
+//
+// A witness qualifies too, though it is never a worker: a workload stranded on
+// one (a cold migration that an older source accepted, a role change) has no
+// other way off, and leaving is the one thing a witness may do with it. Every
+// other gate (start, create, move in) still refuses a witness.
 func localHostIsEvacuatingWorker(hosts []corrosion.HostRecord, self string) bool {
+	for i := range hosts {
+		if hosts[i].Name == self && hosts[i].IsWitness() {
+			return hosts[i].State == "active" || hosts[i].State == "draining"
+		}
+	}
 	return localWorkerIn(hosts, self, "active", "draining")
 }
 

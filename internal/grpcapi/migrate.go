@@ -58,6 +58,21 @@ func (s *Server) authorizeMigrationHelper(ctx context.Context, vmName string) (*
 	return vm, nil
 }
 
+// authorizeMigrationTarget is authorizeMigrationHelper for the helper RPCs
+// that STAGE a migration on this host (disks, cloud-init, domain, firmware): it
+// also refuses when this host is a witness, whatever the source checked. Cleanup
+// and rollback keep authorizeMigrationHelper.
+func (s *Server) authorizeMigrationTarget(ctx context.Context, vmName string) (*corrosion.VMRecord, error) {
+	vm, err := s.authorizeMigrationHelper(ctx, vmName)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.refuseSelfWitnessTarget(ctx, fmt.Sprintf("migration of VM %q to this host", vmName)); err != nil {
+		return nil, err
+	}
+	return vm, nil
+}
+
 // withinDiskArtifactRoot reports whether p is inside a directory where VM disk
 // artifacts legitimately live — the default disks dir or a file-backed storage
 // pool's directory. The migration helpers bound their create/remove to these
@@ -311,8 +326,11 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	if err != nil || targetHost == nil {
 		return status.Errorf(codes.NotFound, "target host %q not found", req.TargetHost)
 	}
-	if targetHost.State != "active" {
-		return status.Errorf(codes.FailedPrecondition, "target host %q is not active", req.TargetHost)
+	// A witness runs no workloads and a host that is not active takes none:
+	// refused before anything moves, naming the host and why
+	// (migrate_target_role.go).
+	if err := nonWorkloadTargetError(targetHost); err != nil {
+		return err
 	}
 
 	// CPU compatibility, SOURCE-side, before ANY target-side provisioning: a guest
@@ -1602,7 +1620,7 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 	if err := s.requirePeerCert(ctx); err != nil {
 		return nil, err
 	}
-	vm, err := s.authorizeMigrationHelper(ctx, req.VmName)
+	vm, err := s.authorizeMigrationTarget(ctx, req.VmName)
 	if err != nil {
 		return nil, err
 	}
@@ -1700,7 +1718,7 @@ func writeVMSeed(vm *corrosion.VMRecord, req *pb.EnsureCloudInitRequest, isoPath
 // Every path is checked before any is created, and a failure part-way removes
 // the stubs this call created, so a refused or failed call leaves nothing.
 func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*pb.EnsureDisksResponse, error) {
-	if _, err := s.authorizeMigrationHelper(ctx, req.VmName); err != nil {
+	if _, err := s.authorizeMigrationTarget(ctx, req.VmName); err != nil {
 		return nil, err
 	}
 	// Whether this host's QEMU can take an encrypted copy, settled once.
@@ -1868,7 +1886,7 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 	if err := s.requirePeerCert(ctx); err != nil {
 		return nil, err
 	}
-	vm, err := s.authorizeMigrationHelper(ctx, req.VmName)
+	vm, err := s.authorizeMigrationTarget(ctx, req.VmName)
 	if err != nil {
 		return nil, err
 	}

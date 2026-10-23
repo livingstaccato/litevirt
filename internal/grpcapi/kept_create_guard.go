@@ -83,7 +83,7 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 	if !notesGovern {
 		for f := range present {
 			if vm, ok := noted[f]; ok {
-				return refuse(f, fmt.Sprintf("the deleted VM %s was kept with (%s)", vm,
+				return refuse(f, fmt.Sprintf("the deleted VM %s was kept with, as its kept-disk note %s lists it", vm,
 					filepath.Join(s.dataDir, "kept-disks", vm+".json")))
 			}
 		}

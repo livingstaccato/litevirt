@@ -27,7 +27,7 @@ func regionGateFleet(t *testing.T, self, scope string) (*Checker, *corrosion.Cli
 	return NewChecker(self, "/etc/litevirt/pki", db), db
 }
 
-// sitePartition is what w1 sees in a west/east partition: its own region up,
+// westSideOfPartition is what w1 sees in a west/east partition: its own region up,
 // every east host down.
 var westSideOfPartition = map[string]bool{"w2": true, "e1": false, "e2": false, "e3": false}
 

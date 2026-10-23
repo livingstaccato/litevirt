@@ -1032,7 +1032,7 @@ type WebAuthnConfig struct {
 // PCIConfig holds PCI device management settings.
 type PCIConfig struct {
 	RescanInterval string      `yaml:"rescan_interval"` // "0" = off, "5m" = every 5 min
-	UdevHook       bool        `yaml:"udev_hook"`       // install udev rule for real-time events
+	UdevHook       bool        `yaml:"udev_hook"`       // deprecated: installs no udev rule; true only logs a startup warning
 	SRIOV          SRIOVConfig `yaml:"sriov"`
 	// SparePCIeRootPorts is the number of pcie-root-port controllers a NEW q35
 	// domain is left with that none of its own devices sit on. q35 hot-plug

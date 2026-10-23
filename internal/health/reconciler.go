@@ -1397,7 +1397,7 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 			// says. A converged-wrong host_name — the equal-`updated_at` LWW tie this
 			// repair targets — must not be able to drive selfFence into destroying a
 			// live VM. Destroying is permitted ONLY on positive proof the domain is a
-			// clearly-dead leftover (see cleanableDomainReason); everything else —
+			// clearly-dead leftover (see cleanableLeftover); everything else —
 			// running, PAUSED, PM-SUSPENDED, SAVED (managed-save memory image),
 			// shutting-down, crashed, migrated, from-snapshot, and any unknown or
 			// unreadable state — is skipped and deferred to the Phase-3 runtime/

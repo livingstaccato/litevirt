@@ -470,7 +470,7 @@ func RemoveBridgeVLAN(bridge string, vlanID int, underlay string) {
 // network. This allows external hosts (outside the cluster) to reach VMs on
 // bridge subnets that differ from the hypervisor's own subnet.
 func EnsureProxyARP(bridge string) error {
-	// Enable IP forwarding (may already be set by EnsureNAT).
+	// Enable IP forwarding (may already be set by EnableIPForwarding).
 	if out, err := execCommand("sysctl", "-w", "net.ipv4.ip_forward=1"); err != nil {
 		return fmt.Errorf("enable ip_forward: %w: %s", err, out)
 	}

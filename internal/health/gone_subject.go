@@ -26,8 +26,8 @@ import (
 //     "<host>/<detail>") whose hosts row is tombstoned and not live again.
 //
 // A name with no row at all is not proof: the row may not have replicated
-// here yet, or this replica was reseeded without the tombstone. The codes in
-// goneSubjectKeep outlive their subject by design and are never resolved
+// here yet, or this replica was reseeded without the tombstone. The evaluators
+// and codes in goneSubjectKeepEvaluators and goneSubjectKeepCodes outlive their subject by design and are never resolved
 // here. The write is the evaluators' own full-row upsert of an open row, so
 // a resolved row is never rewritten, and one an older node raises again is
 // resolved again, once, on the next pass.

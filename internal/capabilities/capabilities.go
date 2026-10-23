@@ -133,7 +133,7 @@ const (
 	// statement; a latch computed over voting members alone would stall its
 	// stream on the first credential-table write.
 	//
-	// A flag would be worse than useless: driveCapabilityLatches skips an
+	// A flag would be worse than useless: driveCapabilityActivation skips an
 	// unlatched token whose flag is off, so a flag-gated split would never latch,
 	// the later release's clear (which needs the credential tables populated)
 	// could never follow, and the secrets would stay in the public dump forever.
@@ -156,7 +156,7 @@ const (
 	// Its readers take the credential row whenever one exists, and so does the
 	// build before it (credentials_split_v1), which is the build a rollback
 	// lands on. A flag would only stop the latch forming
-	// (driveCapabilityLatches skips a flag-off token that has not latched), and
+	// (driveCapabilityActivation skips a flag-off token that has not latched), and
 	// the secrets would stay in the public dump.
 	//
 	// The claim must hold of every host still RECEIVING replication, not
@@ -199,7 +199,7 @@ const (
 	// stream.
 	//
 	// A flag would be worse than useless, for the credentials_split_v1 reason:
-	// driveCapabilityLatches skips an unlatched token whose flag is off, so a
+	// driveCapabilityActivation skips an unlatched token whose flag is off, so a
 	// flag-gated split would never latch and the lost updates would stay. The
 	// split changes where a fact is stored, not a policy.
 	HostMembershipSplitV1 = "host_membership_split_v1"
@@ -683,7 +683,7 @@ const (
 	// mixed-version cluster must not flip mid-roll.
 	SafeFenceDefaultV1 = "safe_fence_default_v1"
 	// LWWSkewGuardV1 gates FUTURE-SKEW QUARANTINE for LWW merges (partial): once
-	// enforced cluster-wide, an incoming row whose updated_at is beyond MaxSkew into
+	// enforced cluster-wide, an incoming row whose updated_at is beyond hlc.MaxSkewMS into
 	// the future is quarantined (kept-local) rather than allowed to win, so a
 	// fast-clock peer can't dominate last-writer-wins. Gated because a mixed-version
 	// cluster must not start quarantining before every node enforces it.

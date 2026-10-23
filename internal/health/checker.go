@@ -87,7 +87,7 @@ var HeartbeatInterval = 10 * time.Second
 // lastHealthyAt/lastFailureAt are LOCAL MONOTONIC anchors (time.Now, so they
 // carry a monotonic reading): split-brain timing (Phase 2 self-demotion, Phase 5
 // watchdog) must measure elapsed time by the local clock, never by comparing
-// cross-node RFC3339 timestamps (which can be ±MaxSkew apart). They live only in
+// cross-node RFC3339 timestamps (which can be ±hlc.MaxSkewMS apart). They live only in
 // memory, so a daemon restart deliberately resets them — a restart must re-earn
 // its timing, not credit a pre-restart reading.
 type peerState struct {

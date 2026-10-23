@@ -436,7 +436,7 @@ func handoffFixture(t *testing.T) (*corrosion.Client, *Coordinator, *Coordinator
 //
 // Abandoning the recovery used to leave c.fenced[host] set, which run()'s cached
 // "already handled this down-episode" check reads BEFORE it can ever reach
-// resumableFence. With the host now sitting in 'fenced' state,
+// recordedFence. With the host now sitting in 'fenced' state,
 // clearRecoveredFromFenced (which clears only hosts back to 'active') could not
 // clear it either — so the coordinator that knew most about the fence was the
 // one permanently unable to finish it, for the life of the process.

@@ -443,7 +443,7 @@ func TestFenceHeld_AFenceThatDidNotRunLeavesTheHostRechecked(t *testing.T) {
 // order), so it caches bad as terminal. Once the condition arrives the cache
 // is dropped, and a VM made recoverable since is fenced for.
 //
-// Mutation: drop the fenceHeldOpen case from the handled branch — the
+// Mutation: drop the fenceHeldStands case from the handled branch — the
 // successor never fences bad.
 func TestFenceHeld_ASuccessorThatSawTheStateFirstRechecks(t *testing.T) {
 	db, c, _, _ := heldFixture(t, "none")
@@ -483,7 +483,7 @@ func TestFenceHeld_ASuccessorThatSawTheStateFirstRechecks(t *testing.T) {
 // TestFenceHeld_AnUnchangedHoldIsNotRewritten: a hold that lasts does not
 // rewrite its replicated row every cycle.
 //
-// Mutation: drop the unchanged early return in raiseFenceHeld — the row is
+// Mutation: drop the unchanged early return in fenceHeldCondition — the row is
 // rewritten each cycle.
 func TestFenceHeld_AnUnchangedHoldIsNotRewritten(t *testing.T) {
 	db, c, _, _ := heldFixture(t, "none")

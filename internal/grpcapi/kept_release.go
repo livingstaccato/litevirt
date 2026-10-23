@@ -71,6 +71,11 @@ type keptUnit struct {
 	regs     []diskKeptRecord // the kept-disks.json entries this unit releases
 	layers   [][]string       // every chain walked, top first, for the reference checks
 	notFile  string           // why a file of it is no regular file a release may remove
+	// dotdotNoted: files the note names as ones a kept disk backs on that
+	// this unit's chains reach through a ".." reference, as a build before
+	// the delete stopped noting them wrote it. Listed only; a release of
+	// the unit forgets them with its top, so none is ever a top of its own.
+	dotdotNoted []string
 }
 
 func (u *keptUnit) has(p string) bool {
@@ -84,6 +89,7 @@ type keptChainOf struct {
 	layers  []string
 	own     int // layers[:own] are the VM's own
 	missing string
+	dotdot  int // the first layer reached through "..", -1 when none
 }
 
 // keptOwnSet is what makes a layer below a kept top the deleted VM's own,
@@ -232,21 +238,49 @@ func (s *Server) keptUnits(ctx context.Context) ([]*keptUnit, error) {
 		if err != nil {
 			return nil, fmt.Errorf("what the delete of VM %s kept cannot be told apart from what it stands on: %v; retry once that storage answers", vm, err)
 		}
-		walks := map[string]keptChainOf{}
+		walked := map[string]keptWalked{}
 		for _, c := range cands {
-			type walked struct {
-				layers  []string
-				missing string
-				dotdot  int
-			}
-			w, err := storage.Bounded("read the backing chain of", c, func() (walked, error) {
+			w, err := storage.Bounded("read the backing chain of", c, func() (keptWalked, error) {
 				l, m, dd, err := keptChainWalk(c)
-				return walked{l, m, dd}, err
+				return keptWalked{layers: l, missing: m, dotdot: dd}, err
 			})
 			if err != nil {
 				return nil, fmt.Errorf("the backing chain of %s, a disk the delete of VM %s kept, cannot be read (%v), so what a release "+
 					"would leave without its base is unknown; fix that file or its storage, then retry", c, vm, err)
 			}
+			walked[c] = w
+		}
+		// Every file a chain reaches through a ".." reference, by its
+		// cleaned and its resolved path: listed only, even when the note
+		// names it (a build before this one noted such a base at delete).
+		viaDotDot := map[string]bool{}
+		for _, c := range cands {
+			w := walked[c]
+			if w.dotdot < 0 {
+				continue
+			}
+			for _, l := range w.layers[min(w.dotdot, len(w.layers)):] {
+				r, err := resolvedStrict(l)
+				if err != nil {
+					return nil, fmt.Errorf("%s, under a disk the delete of VM %s kept, cannot be resolved (%v); retry once that storage answers",
+						l, vm, err)
+				}
+				viaDotDot[filepath.Clean(l)], viaDotDot[r] = true, true
+			}
+		}
+		reachedViaDotDot := func(p string) (bool, error) {
+			if len(viaDotDot) == 0 {
+				return false, nil
+			}
+			if viaDotDot[filepath.Clean(p)] {
+				return true, nil
+			}
+			r, err := resolvedStrict(p)
+			return err == nil && viaDotDot[r], err
+		}
+		walks := map[string]keptChainOf{}
+		for _, c := range cands {
+			w := walked[c]
 			own := 0
 			for own < len(w.layers) {
 				// A layer reached through a ".." reference is listed only:
@@ -254,6 +288,16 @@ func (s *Server) keptUnits(ctx context.Context) ([]*keptUnit, error) {
 				// release removes nothing it found that way.
 				if own > 0 && w.dotdot >= 0 && own >= w.dotdot {
 					break
+				}
+				if own > 0 {
+					dd, err := reachedViaDotDot(w.layers[own])
+					if err != nil {
+						return nil, fmt.Errorf("%s, under a disk the delete of VM %s kept, cannot be resolved (%v); retry once that storage answers",
+							w.layers[own], vm, err)
+					}
+					if dd {
+						break
+					}
 				}
 				if own > 0 {
 					r, err := resolvedStrict(w.layers[own])
@@ -267,7 +311,21 @@ func (s *Server) keptUnits(ctx context.Context) ([]*keptUnit, error) {
 				}
 				own++
 			}
-			walks[c] = keptChainOf{top: c, layers: w.layers, own: own, missing: w.missing}
+			walks[c] = keptChainOf{top: c, layers: w.layers, own: own, missing: w.missing, dotdot: w.dotdot}
+		}
+		// The files the note names as ones a kept disk backs on, to match a
+		// layer reached through "..".
+		noteUnder := map[string]string{}
+		if k.note != nil {
+			for _, p := range k.note.Under {
+				p = filepath.Clean(p)
+				noteUnder[p] = p
+				r, err := resolvedStrict(p)
+				if err != nil {
+					return nil, fmt.Errorf("%s, noted for the deleted VM %s, cannot be resolved (%v); retry once that storage answers", p, vm, err)
+				}
+				noteUnder[r] = p
+			}
 		}
 		// A candidate another candidate's own layers reach is not a top.
 		below := map[string]bool{}
@@ -282,6 +340,13 @@ func (s *Server) keptUnits(ctx context.Context) ([]*keptUnit, error) {
 		for _, c := range cands {
 			w := walks[c]
 			if below[c] {
+				continue
+			}
+			// A file a chain reaches through "..", even one the note names,
+			// is never a top: it is listed under what that chain stands on.
+			if dd, err := reachedViaDotDot(c); err != nil {
+				return nil, fmt.Errorf("%s, a disk the delete of VM %s kept, cannot be resolved (%v); retry once that storage answers", c, vm, err)
+			} else if dd {
 				continue
 			}
 			files := []string{c}
@@ -326,6 +391,22 @@ func (s *Server) keptUnits(ctx context.Context) ([]*keptUnit, error) {
 			}
 			if w.missing != "" && w.own == len(w.layers) {
 				u.missing = w.missing
+			}
+			if w.dotdot >= 0 && len(noteUnder) > 0 {
+				for _, l := range w.layers[min(w.dotdot, len(w.layers)):] {
+					p, ok := noteUnder[filepath.Clean(l)]
+					if !ok {
+						r, err := resolvedStrict(l)
+						if err != nil {
+							return nil, fmt.Errorf("%s, under a disk the delete of VM %s kept, cannot be resolved (%v); retry once that storage answers",
+								l, vm, err)
+						}
+						p, ok = noteUnder[r]
+					}
+					if ok && !slices.Contains(u.dotdotNoted, p) {
+						u.dotdotNoted = append(u.dotdotNoted, p)
+					}
+				}
 			}
 		}
 		for _, u := range units {
@@ -1040,8 +1121,16 @@ func (s *Server) releaseKept(ctx context.Context, req *pb.KeptDisksRequest, acto
 		// The records of what is gone go with it; a file a failure left
 		// stays named, with the files under it.
 		var nerr error
-		if u.note != "" {
-			nerr = health.ForgetKeptNoted(s.dataDir, u.vm, slices.DeleteFunc(slices.Clone(u.notePath), func(p string) bool { return !slices.Contains(gone, p) }))
+		forget := slices.DeleteFunc(slices.Clone(u.notePath), func(p string) bool { return !slices.Contains(gone, p) })
+		if failed == nil {
+			// Every file of the unit is gone: an entry an earlier build
+			// noted for a file it reached through ".." goes with the top,
+			// or it would read as a kept disk of its own (and hold a create
+			// of the name) with nothing kept over it. The file stays.
+			forget = append(forget, u.dotdotNoted...)
+		}
+		if len(forget) > 0 {
+			nerr = health.ForgetKeptNoted(s.dataDir, u.vm, forget)
 		}
 		if rerr := s.forgetKeptRecords(u.regs, gone); nerr == nil {
 			nerr = rerr

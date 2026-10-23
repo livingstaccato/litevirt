@@ -50,6 +50,9 @@ func (s *Server) keptHolds(ctx context.Context, path string) (bool, string) {
 	if held, why := s.keptNoteHolds(path); held {
 		return held, why
 	}
+	if held, why := s.keptNoteDotDotHeld(path); held {
+		return held, why
+	}
 	chains, err := s.keptRegistryChains(ctx)
 	if err != nil {
 		return true, err.Error()
@@ -147,4 +150,92 @@ func (s *Server) keptRegistryChains(ctx context.Context) ([]keptRegistryChain, e
 		out = append(out, keptRegistryChain{rec: r, top: top, layers: w.layers, topNamed: topNamed, missing: w.missing})
 	}
 	return out, nil
+}
+
+// keptDotDotHold is a file a noted file's backing chain reaches through a
+// ".." reference: top is the noted file, vm the deleted VM whose note names
+// it.
+type keptDotDotHold struct{ vm, top string }
+
+// what names what holds the file, for a refusal: "the disk ... backs on".
+func (h keptDotDotHold) what(s *Server) string {
+	return fmt.Sprintf("the disk %s the deleted VM %s was kept with (its kept-disk note %s lists it) backs on through a \"..\" reference",
+		h.top, h.vm, filepath.Join(s.dataDir, "kept-disks", h.vm+".json"))
+}
+
+// keptNoteDotDotHolds is every file at or below the first layer the backing
+// chain of a file this host's kept-disk notes name reaches through a ".."
+// reference (keptChainWalk), by its cleaned and its resolved path. A delete
+// notes nothing from that layer down (noteKeptBackingFiles): where a ".."
+// leads depends on symlinked directories, so it is never the VM's own to
+// release. This is what holds those files while the noted file above them is
+// there. A note or a chain that cannot be read is an error.
+func (s *Server) keptNoteDotDotHolds() (map[string]keptDotDotHold, error) {
+	notes, err := health.KeptNotes(s.dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("this host's notes of the disks deletes kept cannot be read (%v)", err)
+	}
+	out := map[string]keptDotDotHold{}
+	for _, n := range notes {
+		for _, p := range n.Paths {
+			w, err := storage.Bounded("read the backing chain of", p, func() (keptWalked, error) {
+				l, m, dd, err := keptChainWalk(p)
+				return keptWalked{layers: l, missing: m, dotdot: dd}, err
+			})
+			if err != nil {
+				return nil, fmt.Errorf("the backing chain of %s, a disk the deleted VM %s was kept with (%s), cannot be read (%w), "+
+					"so what it backs on is unknown", p, n.VM, n.File, err)
+			}
+			if w.dotdot < 0 {
+				continue
+			}
+			h := keptDotDotHold{vm: n.VM, top: p}
+			for _, l := range w.layers[min(w.dotdot, len(w.layers)):] {
+				out[filepath.Clean(l)] = h
+				r, err := resolvedStrict(l)
+				if err != nil {
+					return nil, fmt.Errorf("%s, under %s, a disk the deleted VM %s was kept with, cannot be resolved (%w)", l, p, n.VM, err)
+				}
+				out[r] = h
+			}
+		}
+	}
+	return out, nil
+}
+
+// keptDotDotHeldIn reports which hold of holds, if any, path is, by its
+// cleaned or its resolved form.
+func keptDotDotHeldIn(holds map[string]keptDotDotHold, path string) (keptDotDotHold, bool, error) {
+	if len(holds) == 0 {
+		return keptDotDotHold{}, false, nil
+	}
+	if h, ok := holds[filepath.Clean(path)]; ok {
+		return h, true, nil
+	}
+	r, err := resolvedStrict(path)
+	if err != nil {
+		return keptDotDotHold{}, false, err
+	}
+	h, ok := holds[r]
+	return h, ok, nil
+}
+
+// keptNoteDotDotHeld reports whether path is a file a noted file's chain
+// reaches through ".." (keptNoteDotDotHolds). Anything that cannot be read
+// holds every path; why says which.
+func (s *Server) keptNoteDotDotHeld(path string) (bool, string) {
+	holds, err := s.keptNoteDotDotHolds()
+	if err != nil {
+		return true, err.Error()
+	}
+	for _, p := range uniq(path, s.hostDiskFile(path)) {
+		h, ok, err := keptDotDotHeldIn(holds, p)
+		if err != nil {
+			return true, fmt.Sprintf("what %s is cannot be told (%v)", p, err)
+		}
+		if ok {
+			return true, "it is the file " + h.what(s)
+		}
+	}
+	return false, ""
 }

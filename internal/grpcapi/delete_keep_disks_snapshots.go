@@ -58,29 +58,49 @@ func (s *Server) keepDisksSnapshotRefusal(ctx context.Context, req *pb.DeleteVMR
 // delete_with_vm=false), its file and the files of its backing chain below
 // it, top first. A chain that cannot be read in full is an error naming the
 // file: what the kept disk is built on is then unknown, and a file under it
-// would be left unprotected.
-func (s *Server) keptDiskChains(ctx context.Context, name string, keepDisks bool) ([]corrosion.DiskRecord, [][]string, error) {
+// would be left unprotected. dotdots[i] is the index in chains[i] of the
+// first layer reached through a ".." reference, -1 when none
+// (keptChainWalk).
+func (s *Server) keptDiskChains(ctx context.Context, name string, keepDisks bool) (kept []corrosion.DiskRecord, chains [][]string, dotdots []int, err error) {
 	disks, err := corrosion.GetVMDisks(ctx, s.db, name)
 	if err != nil {
-		return nil, nil, &diskRecordsReadError{err}
+		return nil, nil, nil, &diskRecordsReadError{err}
 	}
-	var kept []corrosion.DiskRecord
-	var chains [][]string
 	for _, d := range disks {
 		if !s.keptHere(d, keepDisks) {
 			continue
 		}
 		top := filepath.Clean(s.hostDiskFile(d.Path))
-		layers, err := storage.Bounded("read the backing chain of", top, func() ([]string, error) {
-			return keptChainLayers(top)
+		w, err := storage.Bounded("read the backing chain of", top, func() (keptWalked, error) {
+			l, _, dd, err := walkKeptChain(top, false)
+			return keptWalked{layers: l, dotdot: dd}, err
 		})
 		if err != nil {
-			return nil, nil, fmt.Errorf("the backing chain of its disk %s cannot be read (%w)", d.DiskName, err)
+			return nil, nil, nil, fmt.Errorf("the backing chain of its disk %s cannot be read (%w)", d.DiskName, err)
 		}
 		kept = append(kept, d)
-		chains = append(chains, layers)
+		chains = append(chains, w.layers)
+		dotdots = append(dotdots, w.dotdot)
 	}
-	return kept, chains, nil
+	return kept, chains, dotdots, nil
+}
+
+// keptWalked is one walk of a kept file's backing chain (walkKeptChain).
+type keptWalked struct {
+	layers  []string
+	missing string
+	dotdot  int
+}
+
+// aboveDotDot is layers down to, and not including, the first one reached
+// through a ".." reference (dotdot, -1 when none): what a note may name as
+// the VM's own. Where a ".." leads depends on symlinked directories, so that
+// layer and everything below it are listed only, never noted.
+func aboveDotDot(layers []string, dotdot int) []string {
+	if dotdot >= 0 && dotdot < len(layers) {
+		return layers[:dotdot]
+	}
+	return layers
 }
 
 // diskRecordsReadError is a VM's disk records that cannot be read.
@@ -239,7 +259,7 @@ func hasQcow2Magic(path string) (bool, error) {
 // file as one a kept disk backs on (noteKeptDisks), and a create of the name
 // refuses while it is there.
 func (s *Server) keptChainRefusal(ctx context.Context, req *pb.DeleteVMRequest) error {
-	_, chains, err := s.keptDiskChains(ctx, req.Name, req.KeepDisks)
+	_, chains, _, err := s.keptDiskChains(ctx, req.Name, req.KeepDisks)
 	var rerr *diskRecordsReadError
 	if errors.As(err, &rerr) {
 		return status.Errorf(codes.Internal,

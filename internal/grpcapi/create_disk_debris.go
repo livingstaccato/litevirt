@@ -55,8 +55,10 @@ func (s *Server) tombstoneDeletedVM(ctx context.Context, name string, keepDisks 
 // recorded delete_with_vm=false. The files of such a disk's backing chain
 // that a create of the name clears (<vm>-<disk>.qcow2) are noted as files a
 // kept disk backs on, which a create refuses to move or clear
-// (health.SetAsideBeforeCreate). The tops are noted even when a chain cannot
-// be read, and that is the error returned.
+// (health.SetAsideBeforeCreate), down to the first layer reached through a
+// ".." reference: that layer and those below it are listed only, never the
+// VM's own (keptNoteDotDotHolds holds them while the top is there). The tops
+// are noted even when a chain cannot be read, and that is the error returned.
 func (s *Server) noteKeptDisks(ctx context.Context, name string, keepDisks bool) error {
 	disks, err := corrosion.GetVMDisks(ctx, s.db, name)
 	if err != nil {
@@ -81,7 +83,7 @@ func (s *Server) noteKeptBackingFiles(ctx context.Context, name string, keepDisk
 	if s.images == nil {
 		return nil
 	}
-	_, chains, err := s.keptDiskChains(ctx, name, keepDisks)
+	_, chains, dotdots, err := s.keptDiskChains(ctx, name, keepDisks)
 	if err != nil {
 		return fmt.Errorf("the files a disk it keeps backs on cannot be noted: %w", err)
 	}
@@ -90,7 +92,11 @@ func (s *Server) noteKeptBackingFiles(ctx context.Context, name string, keepDisk
 		return fmt.Errorf("the files a disk it keeps backs on cannot be noted: %w", err)
 	}
 	var under []string
-	for _, layers := range chains {
+	for i, layers := range chains {
+		// Nothing at or below a layer reached through "..": that is listed
+		// only, and a note would make it the VM's own to release. While the
+		// noted top is there, keptNoteDotDotHolds holds it instead.
+		layers = aboveDotDot(layers, dotdots[i])
 		for _, l := range layers[min(1, len(layers)):] {
 			if taken[l] {
 				under = append(under, l)
@@ -106,7 +112,7 @@ func (s *Server) noteKeptBackingFiles(ctx context.Context, name string, keepDisk
 // whether the VM runs there. Each kept file is noted as a kept disk, and
 // every file of its backing chain below it, other than an image in the
 // store, as a file a kept disk backs on, as `lv rm --keep-disks` notes them
-// (noteKeptDisks). With kept-disks.json alone naming the top of the chain, a
+// (noteKeptDisks), down to the first layer reached through "..". With kept-disks.json alone naming the top of the chain, a
 // create of the name cleared the base under it and wrote its own disk there
 // (rc3 lab 2, F1). Every chain is read before anything is noted: one that
 // cannot be read is the error returned, with nothing noted, and the caller
@@ -146,12 +152,16 @@ func (s *Server) noteDeleteKeptDisks(ctx context.Context, name string, kept []Ke
 	}
 	var under []string
 	for _, top := range tops {
-		layers, err := storage.Bounded("read the backing chain of", top, func() ([]string, error) {
-			return keptChainLayers(top)
+		w, err := storage.Bounded("read the backing chain of", top, func() (keptWalked, error) {
+			l, _, dd, err := walkKeptChain(top, false)
+			return keptWalked{layers: l, dotdot: dd}, err
 		})
 		if err != nil {
 			return fmt.Errorf("the backing chain of the disk %s it keeps cannot be read, so the files under it cannot be noted (%w)", top, err)
 		}
+		// As noteKeptBackingFiles: nothing at or below a ".." layer (the
+		// registry's chain walk holds those while the top is there).
+		layers := aboveDotDot(w.layers, w.dotdot)
 		for _, l := range layers[min(1, len(layers)):] {
 			if imageDir != "" && filepath.Dir(l) == imageDir {
 				continue // an image in the store: the store's, not the VM's

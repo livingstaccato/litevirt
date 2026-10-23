@@ -346,7 +346,13 @@ file it backs on, never a file under a chain it leaves. Of a chain it removes
 only the deleted VM's own files: those its note or record names, and the
 `<vm>-<disk>.qcow2` files a create of exactly that name would clear (never VM
 `<vm>-1`'s). A link among them counts as the link only, never as the file it
-points at. Every file below them (an image, another VM's disk, a file in a
+points at. A file a chain reaches through a `..` in a backing reference
+(where it is depends on symlinked directories) is listed only, under what the
+chain stands on, even when a note names it: a delete notes nothing from that
+layer down, a release never removes it, and a release of the chain over it
+forgets a note entry an earlier build wrote for it, leaving the file. While
+the kept file above it is there, a create and every other path that removes
+disk files leave it, as they leave a file a note names. Every file below them (an image, another VM's disk, a file in a
 directory named like the VM) stays, listed under what the chain stands on. It
 removes regular files on this host's own storage only: a record naming a
 device node, a link (an LVM or zvol volume) or a file on shared storage is

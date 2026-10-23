@@ -303,6 +303,15 @@ func openChainFollow(src string, allow func(string) error, noFollowTop bool) ([]
 				f.Close()
 				return fail("%s is not a regular file", path)
 			}
+		} else if len(chain) > 0 {
+			// A backing: already resolved through links and judged by the caller's
+			// allow, so it is opened without following any, and what was opened must
+			// still be named by that path (no directory on the way was swapped).
+			var oerr error
+			f, oerr = openResolvedNoFollow(path)
+			if oerr != nil {
+				return fail("%w", oerr)
+			}
 		} else {
 			if err := regularFile(path); err != nil {
 				return fail("%w", err)
@@ -313,10 +322,14 @@ func openChainFollow(src string, allow func(string) error, noFollowTop bool) ([]
 				return fail("open %s: %w", path, oerr)
 			}
 		}
-		// What the header judgements below read: the name, or for the top
-		// layer opened without following, the open file itself.
+		// What the header judgements below read: the name, or for a layer
+		// opened without following (the top one on request, every backing), the
+		// open file itself.
+		if layerOpenedHook != nil {
+			layerOpenedHook(path)
+		}
 		judge := path
-		if top {
+		if top || len(chain) > 0 {
 			judge = fmt.Sprintf("/proc/self/fd/%d", f.Fd())
 		}
 		h, err := readHeader(f)
@@ -385,12 +398,9 @@ func openChainFollow(src string, allow func(string) error, noFollowTop bool) ([]
 			}
 		}
 		if format == "raw" {
-			if err := regularFile(resolved); err != nil {
-				return fail("raw backing: %w", err)
-			}
-			rf, err := os.Open(resolved)
+			rf, err := openResolvedNoFollow(resolved)
 			if err != nil {
-				return fail("open %s: %w", resolved, err)
+				return fail("raw backing: %w", err)
 			}
 			rst, err := rf.Stat()
 			if err != nil || !rst.Mode().IsRegular() {

@@ -1844,11 +1844,13 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 		file := pd.path(base)
 		reused, stubErr := func() (bool, error) {
 			defer pd.close()
-			if _, err := os.Lstat(file); err == nil {
+			if fi, err := os.Lstat(file); err == nil {
 				// This host's own stub from an earlier attempt for this VM (checked
 				// above). Reuse it at the size asked for now: the mirror needs the
-				// sizes to agree, and a stub holds nothing worth keeping.
-				if info, ierr := qcow2.Info(file); ierr == nil && info.VirtualSize == sizeBytes {
+				// sizes to agree, and a stub holds nothing worth keeping. Only a
+				// regular file is reused: a link (or anything else) at the name is
+				// replaced, never taken for the stub.
+				if info, ierr := qcow2.Info(file); fi.Mode().IsRegular() && ierr == nil && info.VirtualSize == sizeBytes {
 					return true, nil
 				}
 				if err := pd.unlink(base); err != nil {

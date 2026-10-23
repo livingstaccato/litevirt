@@ -46,6 +46,12 @@ lv pool inspect warm
 lv pool delete warm
 ```
 
+A pool of a host that `lv host rm` removed is listed with the state
+`departed`. The removal leaves the pool and its data on the machine alone, and
+`lv pool ls` keeps listing the pool so you can see what may still be there.
+If the host is added back, its daemon reports its pools again and they show
+their own state.
+
 `--option k=v` is repeatable for driver-specific flags (Ceph keyring
 paths, ZFS volblocksize, iSCSI portal addresses, …). The full
 schema lives in `internal/storage/storage.go`'s `Config.Options` —

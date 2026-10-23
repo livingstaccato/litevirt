@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -61,7 +63,11 @@ func LoadClusterConfig() (*ClusterConfig, error) {
 	}
 
 	// Check for local daemon config.
-	if data, err := os.ReadFile(daemonConfigPath); err == nil {
+	data, err := os.ReadFile(daemonConfigPath)
+	if errors.Is(err, fs.ErrPermission) {
+		return localModeWithoutDaemonConfig(err)
+	}
+	if err == nil {
 		var dc localDaemonConfig
 		// A config that is PRESENT but unparseable is its own answer, and used to
 		// fall through to "LV_HOST not set" — which says the file is absent. A
@@ -91,6 +97,28 @@ func LoadClusterConfig() (*ClusterConfig, error) {
 	}
 
 	return nil, fmt.Errorf("LV_HOST not set (set to host[:port] of any cluster node, or run on a litevirtd node)")
+}
+
+// localModeWithoutDaemonConfig is LoadClusterConfig's answer on a node whose
+// config.yaml this user cannot read: it is root's, 0600, because it can hold
+// inline secrets.
+//
+// A user `sudo lv host init --local` gave a CLI bundle (ca.crt, client.crt,
+// client.key under ~/.config/litevirt/pki) needs nothing else from that file:
+// local mode dials loopback, and reads the file only for grpc_port and
+// pki_dir, which the bundle replaces. The bundle carries no address or port,
+// so the port is the one init writes (7443). TLS is verified against the
+// bundle's CA as on any local-mode connection; nothing here dials without it.
+//
+// Without a bundle there is nothing to connect with, and the error names the
+// file and the ways out rather than claiming there is no config at all.
+func localModeWithoutDaemonConfig(readErr error) (*ClusterConfig, error) {
+	if dir := PKIDir(); cliPKIBundleExists(dir) {
+		return &ClusterConfig{GRPCPort: 7443, PKIDir: dir, Local: true}, nil
+	}
+	return nil, fmt.Errorf("daemon config %s cannot be read by this user (%w), and there is no CLI client bundle in %s: "+
+		"set LV_HOST to host[:port] of a cluster node, or run lv with sudo",
+		daemonConfigPath, readErr, PKIDir())
 }
 
 // Connect establishes a gRPC connection to a litevirtd instance.

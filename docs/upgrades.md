@@ -992,6 +992,11 @@ A typical rolling upgrade across, say, 5 hosts:
    journalctl -t litevirt-rollback   # should be empty
    ```
 
+   A cluster set up on v1.9 or earlier has no migration-TLS credentials, so
+   `lv migrate --with-storage` is refused after the upgrade until you run
+   `lv host install-migration-tls` once from the machine that holds the
+   cluster CA (docs/migration-failover.md).
+
 4. **Post-check.** Spot-check a VM lifecycle:
    ```bash
    lv restart <one-vm>

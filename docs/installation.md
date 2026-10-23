@@ -239,7 +239,9 @@ edits in place only `host_name`, `advertise_address`, `join_peers`, `pki_dir`
 (set to `/etc/litevirt/pki`, where it installs the credentials) and
 `enforcement`, which becomes the cluster's block, or is removed when the
 cluster has none. Every other line (a `migration.network`, say) is kept as it
-was, as are the file's mode and a symlink to it. The file as it was is kept
+was, as is a symlink to it. The file is replaced by an atomic rename, written
+as root: its mode is kept but capped at 0600 (a group- or other-readable
+config becomes owner-only), and its owner and group become root's. The file as it was is kept
 beside it as `config.yaml.pre-add-<time>` (0600). The add refuses a config it
 cannot parse, one with more than one document, one of 1 MiB or more, and a
 `grpc_port` other than 7443 or a `gossip_port` other than 7946, on which
@@ -416,9 +418,23 @@ reads the system file the way `ssh -F` does, which would look for it under `~/.s
 
 ## CLI setup
 
-The `lv` binary connects to litevirtd over gRPC/mTLS. On a node with
-`/etc/litevirt/config.yaml`, it connects to the local daemon automatically. For a
-remote entry point, set the target host:
+The `lv` binary connects to litevirtd over gRPC/mTLS. On a node it connects to
+the local daemon automatically. It looks, in order, at:
+
+1. `/run/litevirt/endpoint`, which the daemon writes at every start (0644,
+   replaced atomically). It holds only `grpc_port` and `pki_dir`, nothing
+   secret, so any user on the node can read it. A file that does not parse,
+   has another key, or holds an invalid port or a relative path is ignored as
+   a whole, with a warning.
+2. `/etc/litevirt/config.yaml`, which is root's and 0600 because it can hold
+   inline secrets: readable under `sudo`.
+3. If that file cannot be read by the user, the defaults: the daemon on
+   `127.0.0.1:7443`, with the user's CLI client bundle. lv says so on stderr.
+   With no bundle either, it refuses, naming the file: set `LV_HOST` or run
+   with `sudo`.
+
+In local mode the user's CLI client bundle (below), when there is one, takes
+the place of `pki_dir`. For a remote entry point, set the target host:
 
 ```bash
 export LV_HOST=10.0.50.10
@@ -456,6 +472,7 @@ single-node install does not require copying daemon certificates out of
   state.db                      # local SQLite state store (0600: it holds the credentials)
 /var/cache/litevirt-restore/    # file restore: restore-VM kernel copy + initramfs (root:litevirt-restore 0750)
 /run/litevirt/file-restore/     # file restore: per-session export sockets and pidfiles
+/run/litevirt/endpoint          # grpc_port and pki_dir for a local lv (0644, nothing secret)
 ```
 
 ### What file restore changes on the host

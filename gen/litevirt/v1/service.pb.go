@@ -33715,9 +33715,16 @@ type EnsureFirmwareStateRequest struct {
 	// <shares> for its own cgroup version from this, never from its own replica
 	// of the VM row, which may not hold a just-set weight yet. An older source
 	// never sets it: the target then defines the XML unchanged, as before.
-	SharesWeight  int32 `protobuf:"varint,7,opt,name=shares_weight,json=sharesWeight,proto3" json:"shares_weight,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	SharesWeight int32 `protobuf:"varint,7,opt,name=shares_weight,json=sharesWeight,proto3" json:"shares_weight,omitempty"`
+	// libvirt_vars is the stopped VM's libvirt-managed UEFI vars file (a plain
+	// UEFI VM: no Secure Boot, no vTPM), with its sha256 in libvirt_vars_sha256.
+	// The target writes it durably where libvirt looks for the domain's vars,
+	// setting aside any file of the name already there, and answers with the
+	// hash it read back. An older target ignores both and answers none.
+	LibvirtVars       []byte `protobuf:"bytes,8,opt,name=libvirt_vars,json=libvirtVars,proto3" json:"libvirt_vars,omitempty"`
+	LibvirtVarsSha256 string `protobuf:"bytes,9,opt,name=libvirt_vars_sha256,json=libvirtVarsSha256,proto3" json:"libvirt_vars_sha256,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *EnsureFirmwareStateRequest) Reset() {
@@ -33799,6 +33806,20 @@ func (x *EnsureFirmwareStateRequest) GetSharesWeight() int32 {
 	return 0
 }
 
+func (x *EnsureFirmwareStateRequest) GetLibvirtVars() []byte {
+	if x != nil {
+		return x.LibvirtVars
+	}
+	return nil
+}
+
+func (x *EnsureFirmwareStateRequest) GetLibvirtVarsSha256() string {
+	if x != nil {
+		return x.LibvirtVarsSha256
+	}
+	return ""
+}
+
 // EnsureFirmwareStateResponse says what the call created on the target. It
 // replaced google.protobuf.Empty, which has no fields: an older target's reply
 // decodes as "defined nothing", and the source then leaves the target alone
@@ -33808,8 +33829,12 @@ type EnsureFirmwareStateResponse struct {
 	// domain_defined: this call materialized the firmware state AND defined
 	// the domain, and recorded both under the request's attempt_id.
 	DomainDefined bool `protobuf:"varint,1,opt,name=domain_defined,json=domainDefined,proto3" json:"domain_defined,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// libvirt_vars_sha256 is the hash of the libvirt_vars file the target wrote
+	// and read back; empty when none was sent or the target predates the field.
+	// The source removes its own copy only when this equals what it sent.
+	LibvirtVarsSha256 string `protobuf:"bytes,2,opt,name=libvirt_vars_sha256,json=libvirtVarsSha256,proto3" json:"libvirt_vars_sha256,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *EnsureFirmwareStateResponse) Reset() {
@@ -33847,6 +33872,13 @@ func (x *EnsureFirmwareStateResponse) GetDomainDefined() bool {
 		return x.DomainDefined
 	}
 	return false
+}
+
+func (x *EnsureFirmwareStateResponse) GetLibvirtVarsSha256() string {
+	if x != nil {
+		return x.LibvirtVarsSha256
+	}
+	return ""
 }
 
 // RollbackFirmwareStateRequest asks a cold firmware migration's target to
@@ -48863,7 +48895,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1aA\n" +
 	"\x13NetworkDevicesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x84\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xd7\x02\n" +
 	"\x1aEnsureFirmwareStateRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x12\n" +
 	"\x04uuid\x18\x02 \x01(\tR\x04uuid\x12\x16\n" +
@@ -48873,9 +48905,12 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x1bsource_firmware_fingerprint\x18\x05 \x01(\tR\x19sourceFirmwareFingerprint\x12\x1d\n" +
 	"\n" +
 	"attempt_id\x18\x06 \x01(\tR\tattemptId\x12#\n" +
-	"\rshares_weight\x18\a \x01(\x05R\fsharesWeight\"D\n" +
+	"\rshares_weight\x18\a \x01(\x05R\fsharesWeight\x12!\n" +
+	"\flibvirt_vars\x18\b \x01(\fR\vlibvirtVars\x12.\n" +
+	"\x13libvirt_vars_sha256\x18\t \x01(\tR\x11libvirtVarsSha256\"t\n" +
 	"\x1bEnsureFirmwareStateResponse\x12%\n" +
-	"\x0edomain_defined\x18\x01 \x01(\bR\rdomainDefined\"j\n" +
+	"\x0edomain_defined\x18\x01 \x01(\bR\rdomainDefined\x12.\n" +
+	"\x13libvirt_vars_sha256\x18\x02 \x01(\tR\x11libvirtVarsSha256\"j\n" +
 	"\x1cRollbackFirmwareStateRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x12\n" +
 	"\x04uuid\x18\x02 \x01(\tR\x04uuid\x12\x1d\n" +

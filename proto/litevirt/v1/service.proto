@@ -3898,6 +3898,13 @@ message EnsureFirmwareStateRequest {
     // of the VM row, which may not hold a just-set weight yet. An older source
     // never sets it: the target then defines the XML unchanged, as before.
     int32 shares_weight = 7;
+    // libvirt_vars is the stopped VM's libvirt-managed UEFI vars file (a plain
+    // UEFI VM: no Secure Boot, no vTPM), with its sha256 in libvirt_vars_sha256.
+    // The target writes it durably where libvirt looks for the domain's vars,
+    // setting aside any file of the name already there, and answers with the
+    // hash it read back. An older target ignores both and answers none.
+    bytes  libvirt_vars        = 8;
+    string libvirt_vars_sha256 = 9;
 }
 
 // EnsureFirmwareStateResponse says what the call created on the target. It
@@ -3908,6 +3915,10 @@ message EnsureFirmwareStateResponse {
     // domain_defined: this call materialized the firmware state AND defined
     // the domain, and recorded both under the request's attempt_id.
     bool domain_defined = 1;
+    // libvirt_vars_sha256 is the hash of the libvirt_vars file the target wrote
+    // and read back; empty when none was sent or the target predates the field.
+    // The source removes its own copy only when this equals what it sent.
+    string libvirt_vars_sha256 = 2;
 }
 
 // RollbackFirmwareStateRequest asks a cold firmware migration's target to

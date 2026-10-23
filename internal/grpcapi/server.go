@@ -51,6 +51,8 @@ type Server struct {
 
 	hostName string
 	dataDir  string
+	// libvirtNvramDir overrides health.LibvirtNvramDir (SetLibvirtNvramDir).
+	libvirtNvramDir string
 	// operatorStopMarkerObs is the litevirt_operator_stop_markers gauge
 	// (operator_stop_marker.go); nil records nothing.
 	operatorStopMarkerObs func(pending, corrupt int)

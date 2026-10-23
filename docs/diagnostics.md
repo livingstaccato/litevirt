@@ -2726,7 +2726,8 @@ again. The ways out:
   taken before the failure replaces its vars file. A plain UEFI VM's snapshot
   carries no firmware state, so this does not apply to it.
 - Any VM: `lv rm <vm>` removes its vars file. `lv rm --keep-disks` keeps it,
-  and the condition with it.
+  and the condition with it. A later create of the name sets a plain UEFI VM's kept file aside
+  (`<file>.superseded-<time>`) rather than adopting it.
 - A VM kept as it is: an admin accepts that its vars store may be stale with
   `lv health resolve nvram_flush_failed host/<host> --accept-stale-uefi-vars
   --reason <why>`, which prints the files accepted. It is audited, naming every

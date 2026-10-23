@@ -1787,6 +1787,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			})
 			s.forgetMoveRecords(ctx, targetName) // the promoted domain takes the name
 			setFlightUUID(spec.Uuid)
+			if err := s.setAsideStaleLibvirtVars(targetName); err != nil {
+				return "set aside stale UEFI vars", err
+			}
 			if err := s.virt.DefineDomain(domXML); err != nil {
 				return "define domain", err
 			}

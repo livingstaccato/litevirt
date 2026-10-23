@@ -447,6 +447,13 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		_ = s.virt.UndefineDomain(name, false)
 	}
 	s.forgetMoveRecords(ctx, name) // a new domain takes the name
+	if err := s.setAsideStaleLibvirtVars(name); err != nil {
+		cleanupDisks()
+		if fwImport {
+			s.fw().WipeFirmwareState(name, spec.Uuid)
+		}
+		return status.Errorf(codes.Internal, "%v", err)
+	}
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		cleanupDisks()
 		if fwImport {

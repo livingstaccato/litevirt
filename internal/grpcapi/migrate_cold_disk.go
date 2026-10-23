@@ -359,7 +359,7 @@ func (s *Server) flattenColdDisk(ctx context.Context, d corrosion.DiskRecord, sr
 	if err != nil {
 		return status.Errorf(codes.FailedPrecondition, "disk %s cannot be flattened for the copy: %v", d.Path, err)
 	}
-	if err := qcow2.ConvertConfined(ctx, src, flat, &qcow2.Options{Uncompressed: true}, onlyAccepted(accepted)); err != nil {
+	if err := qcow2.ConvertConfined(ctx, src, flat, &qcow2.Options{Uncompressed: true, NoFollowSource: true}, onlyAccepted(accepted)); err != nil {
 		return status.Errorf(codes.Internal, "flatten disk %s for the copy: %v", d.Path, err)
 	}
 	return nil

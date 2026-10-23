@@ -23,7 +23,6 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/fwmig"
 	"github.com/litevirt/litevirt/internal/health"
@@ -1826,31 +1825,55 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 		if stub.SizeBytes > 0 {
 			sizeBytes = uint64(stub.SizeBytes)
 		}
-		if _, err := os.Lstat(stub.Path); err == nil {
-			// This host's own stub from an earlier attempt for this VM (checked
-			// above). Reuse it at the size asked for now: the mirror needs the
-			// sizes to agree, and a stub holds nothing worth keeping.
-			if info, ierr := qcow2.Info(stub.Path); ierr == nil && info.VirtualSize == sizeBytes {
-				resp.CreatedPaths = append(resp.CreatedPaths, stub.Path)
-				slog.Info("disk stub reused for migration", "vm", req.VmName, "path", stub.Path)
-				continue
-			}
-			if err := s.removeDiskFileBeneath(stub.Path, false); err != nil {
-				undo()
-				return nil, status.Errorf(codes.Internal, "replace stub %s: %v", stub.Path, err)
-			}
-			s.migrationStubs.forget(stub.Path)
-		}
-		dir := filepath.Dir(stub.Path)
-		if err := diskmode.MkdirAll(dir); err != nil {
+		// The stub's directory is opened once, by descriptor, beneath its disk
+		// root with no link followed (the root judged, missing directories made
+		// through it), and the exists check, the replace and the create all go
+		// through that held directory: a link planted on the way is refused,
+		// never followed to create a stub somewhere else.
+		root, rootOK := s.diskArtifactRootOf(stub.Path)
+		if !rootOK {
 			undo()
-			return nil, status.Errorf(codes.Internal, "create disk dir %s: %v", dir, err)
+			return nil, status.Errorf(codes.InvalidArgument, "disk stub path %q is not in a disk-artifact root", stub.Path)
 		}
-		if err := qcow2.Create(stub.Path, sizeBytes, nil); err != nil {
+		pd, derr := s.openDiskDir(root, relUnder(root, filepath.Dir(stub.Path)), true, false)
+		if derr != nil {
 			undo()
-			return nil, status.Errorf(codes.Internal, "create stub %s: %v", stub.Path, err)
+			return nil, status.Errorf(codes.Internal, "create disk dir %s: %v", filepath.Dir(stub.Path), derr)
+		}
+		base := filepath.Base(stub.Path)
+		file := pd.path(base)
+		reused, stubErr := func() (bool, error) {
+			defer pd.close()
+			if _, err := os.Lstat(file); err == nil {
+				// This host's own stub from an earlier attempt for this VM (checked
+				// above). Reuse it at the size asked for now: the mirror needs the
+				// sizes to agree, and a stub holds nothing worth keeping.
+				if info, ierr := qcow2.Info(file); ierr == nil && info.VirtualSize == sizeBytes {
+					return true, nil
+				}
+				if err := pd.unlink(base); err != nil {
+					return false, status.Errorf(codes.Internal, "replace stub %s: %v", stub.Path, err)
+				}
+				s.migrationStubs.forget(stub.Path)
+			}
+			if err := qcow2.Create(file, sizeBytes, nil); err != nil {
+				return false, status.Errorf(codes.Internal, "create stub %s: %v", stub.Path, err)
+			}
+			return false, nil
+		}()
+		if stubErr != nil {
+			undo()
+			return nil, stubErr
+		}
+		if reused {
+			resp.CreatedPaths = append(resp.CreatedPaths, stub.Path)
+			slog.Info("disk stub reused for migration", "vm", req.VmName, "path", stub.Path)
+			continue
 		}
 		made = append(made, stub.Path)
+		if s.ensureStubCreatedHook != nil {
+			s.ensureStubCreatedHook()
+		}
 		s.recordMade(ctx, &s.migrationStubs, req.VmName, stub.Path)
 		resp.CreatedPaths = append(resp.CreatedPaths, stub.Path)
 		slog.Info("disk stub created for migration", "vm", req.VmName, "path", stub.Path, "size_bytes", stub.SizeBytes)

@@ -28,6 +28,10 @@ var errNoProcFD = errors.New("/proc/self/fd is not usable, so a held directory c
 // kernel older than 5.6 (no openat2) takes. Tests only.
 var openat2Disabled bool
 
+// SetEnsureStubCreatedHookForTest runs fn after EnsureDisks creates a stub and
+// before it creates the next (tests: swap a directory for a link there).
+func (s *Server) SetEnsureStubCreatedHookForTest(fn func()) { s.ensureStubCreatedHook = fn }
+
 // procFDPrefix is where the held directory's /proc form lives; a test points it
 // somewhere that does not exist to stand in for a host without /proc.
 var procFDPrefix = "/proc/self/fd/"
@@ -92,17 +96,61 @@ func openPinnedDir(rootFS, rel string, create bool) (*pinnedDir, error) {
 // root is errBeneath; a root the check refuses is errBeneath too. When
 // /proc/self/fd cannot name the held directory, nothing is opened (errNoProcFD).
 func openPinnedDirChecked(rootFS, rel string, create bool, check func(realFS string) error) (*pinnedDir, error) {
-	if create {
-		if err := diskmode.MkdirAll(rootFS); err != nil {
+	return openPinnedDirAnchored(rootFS, "", rel, create, create, check)
+}
+
+// rootOpenHook runs between resolving the anchor and opening it (tests).
+var rootOpenHook func()
+
+// openPinnedDirAnchored is openPinnedDirChecked for a root that lies below an
+// anchor the operator owns (a data-dir area): the anchor is opened (made first
+// when mkAnchor), anchorRel is walked from it to the root with each missing
+// component made by mkdirat on its parent's descriptor and no link followed,
+// and only then is the root judged and rel walked. A root that is a link, or
+// has a link on the way from the anchor, is refused before anything is created
+// through it. With no anchorRel the anchor is the root itself.
+func openPinnedDirAnchored(anchorFS, anchorRel, rel string, create, mkAnchor bool, check func(realFS string) error) (*pinnedDir, error) {
+	if create && mkAnchor {
+		if err := diskmode.MkdirAll(anchorFS); err != nil {
 			return nil, err
 		}
 	}
-	real, err := filepath.EvalSymlinks(rootFS)
+	real, err := filepath.EvalSymlinks(anchorFS)
 	if err != nil {
 		return nil, err
 	}
+	if rootOpenHook != nil {
+		rootOpenHook()
+	}
 	fd, err := unix.Open(real, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
+		return nil, err
+	}
+	walk := func(rel string) error {
+		for _, c := range strings.Split(filepath.ToSlash(rel), "/") {
+			if c == "" || c == "." {
+				continue
+			}
+			if c == ".." || strings.ContainsRune(c, 0) {
+				unix.Close(fd)
+				return errBeneath
+			}
+			if create {
+				if err := unix.Mkdirat(fd, c, uint32(diskmode.Dir)); err != nil && !errors.Is(err, unix.EEXIST) {
+					unix.Close(fd)
+					return err
+				}
+			}
+			next, err := openBeneath(fd, c)
+			unix.Close(fd)
+			if err != nil {
+				return err
+			}
+			fd = next
+		}
+		return nil
+	}
+	if err := walk(anchorRel); err != nil {
 		return nil, err
 	}
 	if check != nil {
@@ -116,26 +164,8 @@ func openPinnedDirChecked(rootFS, rel string, create bool, check func(realFS str
 			return nil, fmt.Errorf("%w: %v", errBeneath, cerr)
 		}
 	}
-	for _, c := range strings.Split(filepath.ToSlash(rel), "/") {
-		if c == "" || c == "." {
-			continue
-		}
-		if c == ".." || strings.ContainsRune(c, 0) {
-			unix.Close(fd)
-			return nil, errBeneath
-		}
-		if create {
-			if err := unix.Mkdirat(fd, c, uint32(diskmode.Dir)); err != nil && !errors.Is(err, unix.EEXIST) {
-				unix.Close(fd)
-				return nil, err
-			}
-		}
-		next, err := openBeneath(fd, c)
-		unix.Close(fd)
-		if err != nil {
-			return nil, err
-		}
-		fd = next
+	if err := walk(rel); err != nil {
+		return nil, err
 	}
 	pd := &pinnedDir{f: os.NewFile(uintptr(fd), real)}
 	// Every path-shaped use of the held directory goes through its /proc form;
@@ -232,6 +262,17 @@ func (s *Server) rootFS(p string, mapped bool) string {
 // openDiskDir holds open the directory rel below the disk root root, judging
 // the root (diskRootCheck).
 func (s *Server) openDiskDir(root, rel string, create, mapped bool) (*pinnedDir, error) {
+	if create {
+		// A root below a data-dir area is made from the area's own descriptor,
+		// level by level with no link followed, so a link on the way is refused
+		// before anything is created through it.
+		for _, area := range []string{"disks", "pools", "mounts"} {
+			ar := filepath.Join(s.dataDir, area)
+			if safename.Contains(ar, root) {
+				return openPinnedDirAnchored(s.rootFS(ar, mapped), relUnder(ar, root), rel, true, true, s.diskRootCheck(root, mapped))
+			}
+		}
+	}
 	return openPinnedDirChecked(s.rootFS(root, mapped), rel, create, s.diskRootCheck(root, mapped))
 }
 

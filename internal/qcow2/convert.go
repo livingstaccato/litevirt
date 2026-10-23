@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
 // Convert reads through the backing chain of src, flattens all layers, applies
@@ -46,7 +47,7 @@ func ConvertConfined(ctx context.Context, src, dst string, opts *Options, allow 
 
 func doConvert(ctx context.Context, src, dst string, opts *Options, allow func(string) error) error {
 	// Open the source chain.
-	chain, err := openChain(src, allow)
+	chain, err := openChainFollow(src, allow, opts != nil && opts.NoFollowSource)
 	if err != nil {
 		return fmt.Errorf("open backing chain: %w", err)
 	}
@@ -256,6 +257,15 @@ func (img *chainImage) l2Table(offset, clusterSize uint64) ([]byte, error) {
 // format — and passes every backing path, resolved through symlinks, to allow
 // (nil: anything) before opening it.
 func openChain(src string, allow func(string) error) ([]*chainImage, error) {
+	return openChainFollow(src, allow, false)
+}
+
+// openChainFollow is openChain; with noFollowTop the TOP layer (src itself) is
+// opened O_NOFOLLOW and judged as the open file (a regular file by fstat; its
+// external-data and backing-format headers by /proc/self/fd, not by name), so a
+// link swapped in for src after the caller's checks is refused rather than read.
+// Backings are resolved as before.
+func openChainFollow(src string, allow func(string) error, noFollowTop bool) ([]*chainImage, error) {
 	var chain []*chainImage
 	path := src
 	seen := make(map[string]struct{})
@@ -281,12 +291,33 @@ func openChain(src string, allow func(string) error) ([]*chainImage, error) {
 
 		// A regular file only, judged before it is opened: opening a FIFO
 		// would block, and a device is not an image this reader may read.
-		if err := regularFile(path); err != nil {
-			return fail("%w", err)
+		top := noFollowTop && len(chain) == 0
+		var f *os.File
+		if top {
+			var oerr error
+			f, oerr = os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+			if oerr != nil {
+				return fail("open %s: %w", path, oerr)
+			}
+			if fi, serr := f.Stat(); serr != nil || !fi.Mode().IsRegular() {
+				f.Close()
+				return fail("%s is not a regular file", path)
+			}
+		} else {
+			if err := regularFile(path); err != nil {
+				return fail("%w", err)
+			}
+			var oerr error
+			f, oerr = os.Open(path)
+			if oerr != nil {
+				return fail("open %s: %w", path, oerr)
+			}
 		}
-		f, err := os.Open(path)
-		if err != nil {
-			return fail("open %s: %w", path, err)
+		// What the header judgements below read: the name, or for the top
+		// layer opened without following, the open file itself.
+		judge := path
+		if top {
+			judge = fmt.Sprintf("/proc/self/fd/%d", f.Fd())
 		}
 		h, err := readHeader(f)
 		if err != nil {
@@ -302,7 +333,7 @@ func openChain(src string, allow func(string) error) ([]*chainImage, error) {
 			f.Close()
 			return fail("validate header %s: %w", path, err)
 		}
-		if err := AssertNoExternalData(path); err != nil {
+		if err := AssertNoExternalData(judge); err != nil {
 			f.Close()
 			return fail("%s: %w", path, err)
 		}
@@ -333,7 +364,7 @@ func openChain(src string, allow func(string) error) ([]*chainImage, error) {
 		}
 
 		// The backing's format is what this layer DECLARES — never a guess.
-		n, err := BackingFormatExtensionCount(path)
+		n, err := BackingFormatExtensionCount(judge)
 		if err != nil {
 			return fail("%s: %w", path, err)
 		}

@@ -414,6 +414,8 @@ type Server struct {
 	coldDirOpenedHook func()
 	// coldSourceReadHook runs on the source before a cold move reads a disk (tests).
 	coldSourceReadHook func()
+	// ensureStubCreatedHook runs after EnsureDisks creates a stub, before the next one (tests).
+	ensureStubCreatedHook func()
 	// pinFault fails pinning a file a create or clone made (pinMade), as an
 	// open refused by the fd limit or the file's mode would (tests).
 	pinFault func(path string) error

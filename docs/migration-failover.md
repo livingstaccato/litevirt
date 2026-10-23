@@ -491,10 +491,13 @@ replicated state too, so it never widens the rule beyond those areas. The disk's
 directory is opened once, beneath the root it was judged in, with no symlink
 followed, and the copy, its placement, the take-back and the cleanup all go
 through that open directory: a link planted below the root is refused, and one
-swapped in later is never followed. The source reads the disk the same way and
-removes its copy the same way, and the EnsureDisks stub replace and undo and the
-firmware discard remove through the open directory too (the stub create is still
-by path). The root itself is judged for what it leads to: a data-dir area
+swapped in later is never followed. The source reads the disk the same way (a
+qcow2 overlay is flattened from the open file, which is opened without following
+a link) and removes its copy the same way, and the EnsureDisks stub create,
+replace and undo and the firmware discard act through the open directory too. A
+directory a pool needs below a data-dir area is made from the area's descriptor,
+level by level, so a link on the way is refused before anything is created
+through it. The root itself is judged for what it leads to: a data-dir area
 (`disks/`, `pools/`, `mounts/`) or an operator's own pool directory outside the
 areas may be a link to another volume, if it leads somewhere a pool may live; a
 pool directory below an area that has been replaced by a link out of the area is

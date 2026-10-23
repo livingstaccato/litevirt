@@ -366,7 +366,7 @@ type Coordinator struct {
 	// last declined to fence it, so the explanation is logged once per change
 	// rather than once per poll. See noteRegionDeclined.
 	regionDeclined map[string]string
-	// resumeDeclined records, per host, the fence ID resumableFence last found
+	// resumeDeclined records, per host, the fence ID resumeActionFor last found
 	// no longer standing, so the explanation is logged once per fence rather
 	// than once per poll. See noteResumeDeclined.
 	resumeDeclined map[string]string
@@ -837,7 +837,7 @@ func (c *Coordinator) run(ctx context.Context) {
 		// store problem is fleet-wide -- the case where workloads are most
 		// likely to be stranded -- every node takes this path, max() across
 		// instances reads 0, and the alert clears exactly when it should fire.
-		// Same rule the strandedWorkloads branch below already follows. It
+		// Same rule the strandedByHost branch below already follows. It
 		// covers a node standing down for want of the voter majority too
 		// (errLeaseNoQuorum): with none anywhere, nobody holds the lease.
 		if leaseErr == nil {
@@ -1441,7 +1441,7 @@ func (c *Coordinator) run(ctx context.Context) {
 	c.syncHAVeto(ctx)
 
 	// Report workloads left on a host the cluster considers down. Read-only: see
-	// strandedWorkloads for what the number does and does not mean, and for why
+	// strandedByHost for what the number does and does not mean, and for why
 	// this reports rather than recovers. Runs after recoverHosts and
 	// resolvePendingRelocations so a host or marker settled THIS cycle is already
 	// out of the count.
@@ -1488,7 +1488,7 @@ func (c *Coordinator) run(ctx context.Context) {
 // permanent 0 that hides a real one. Same contract as stepDownDualRun: the
 // leader's view is the fleet's view, and the rest keep their series clear.
 //
-// Nothing durable is lost by clearing. strandedWorkloads holds no state between
+// Nothing durable is lost by clearing. strandedByHost holds no state between
 // cycles — it re-derives the count from hosts/vms/containers — so the new
 // leader's first pass republishes the true value within one poll interval.
 func (c *Coordinator) stepDownGauges() {
@@ -1978,8 +1978,8 @@ var errLeaseNoQuorum = errors.New("this node has lost the voter majority")
 // answer the regional question counts no region.
 //
 // Under region scope it stands down too when it has lost its own region's
-// majority (health.LostOwnRegionQuorum), whatever it reaches elsewhere: that
-// majority may need the lease to fence this node.
+// majority (health.LostOwnRegionQuorumUnder), whatever it reaches elsewhere:
+// that majority may need the lease to fence this node.
 //
 // The failover lease asks more of a reading than the other leases do: a
 // scope holds only on a Yes outside its quorum-regain grace (QuorumRegain).
@@ -2259,7 +2259,7 @@ func (c *Coordinator) leaseTermStampAllowed(ctx context.Context) bool {
 // abandonment branch in these loops records one: a log line and a failover.skip
 // audit row naming the workload.
 //
-// It is not deferred work. strandedWorkloads' own doc says a fenced host is
+// It is not deferred work. strandedByHost's own doc says a fenced host is
 // processed only once, and run() short-circuits the host on every later cycle,
 // so a refusal here is a permanent per-workload outage. It used to leave only
 // two counters — and it fires immediately after "failover: rescheduling VM", so
@@ -3564,7 +3564,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 	// while fencing. Seeding them up front left a coordinator that had abdicated
 	// still asserting "I handled this host" and "nothing moved off it": the
 	// first suppressed its own resume (the cached-state skip in run runs before
-	// resumableFence can look), and the second let it auto-undrain a host whose
+	// recordedFence can look), and the second let it auto-undrain a host whose
 	// VMs the SUCCESSOR had since relocated. They are seeded at the point of
 	// commitment instead, just before recoverFenced.
 
@@ -4060,7 +4060,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 // It is a separate function because the fence and the recovery answer different
 // questions, and because every refusal inside it happens AFTER the fence: the
 // host is already marked down, so a decline here leaves work assigned to a
-// machine that will not run it. strandedWorkloads reports that condition.
+// machine that will not run it. strandedByHost reports that condition.
 //
 // One consequence of taking fenceEpoch from fencing_log is deliberate:
 // proofGradeFenceRef only counts a fence inside recentFenceWindow, so a VM with
@@ -5253,8 +5253,9 @@ func containerNeedsFailover(ct corrosion.ContainerRecord) bool {
 	return corrosion.ContainerRecoverableOnHostFailure(ct)
 }
 
-// strandedWorkloads counts workloads still assigned to a host in state 'fenced'
-// or 'offline' that the coordinator would move off a dead host.
+// strandedByHost counts, per host in state 'fenced' or 'offline', the workloads
+// still assigned to it that the coordinator would move off a dead host; a host
+// with none is absent.
 //
 // It measures exactly that and claims nothing more. It is NOT a count of
 // post-fence refusals, and the difference matters because the two sets are not
@@ -5303,20 +5304,6 @@ func containerNeedsFailover(ct corrosion.ContainerRecord) bool {
 // a gauge must be measured, not guessed. A read failure leaves the previous
 // value in place and reports through the error metric instead, because "0"
 // during a store outage is the all-clear on the one signal an operator alerts on.
-func (c *Coordinator) strandedWorkloads(ctx context.Context) (int, error) {
-	byHost, err := c.strandedByHost(ctx)
-	if err != nil {
-		return 0, err
-	}
-	total := 0
-	for _, n := range byHost {
-		total += n
-	}
-	return total, nil
-}
-
-// strandedByHost is strandedWorkloads per fenced or offline host; a host with
-// none is absent.
 func (c *Coordinator) strandedByHost(ctx context.Context) (map[string]int, error) {
 	hosts, err := corrosion.ListHosts(ctx, c.db)
 	if err != nil {

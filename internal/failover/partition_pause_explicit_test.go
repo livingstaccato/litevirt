@@ -145,7 +145,7 @@ func TestSelfPauseExplicit_ABridgeWithTheHostsPauseIsRecovered(t *testing.T) {
 // A bridge sees down answer, and down has reported no pause: it may never
 // have paused (a voter set this node does not know, or a one-way cut).
 //
-// Mutation: skip hostReportsItsPause in selfPauseStillStands — the VM moves.
+// Mutation: skip hostReportsItsPauseIn in selfPauseStillStands — the VM moves.
 func TestSelfPauseExplicit_ABridgeWithoutTheHostsPauseIsRefused(t *testing.T) {
 	c, db, ctx, mono := explicitPause(t)
 	if got := atDeadline(t, c, ctx, mono, db, func() { bridgeAnswer(t, db) }); got != "down" {
@@ -156,7 +156,7 @@ func TestSelfPauseExplicit_ABridgeWithoutTheHostsPauseIsRefused(t *testing.T) {
 // A partition_paused condition raised before this outage does not speak for
 // it.
 //
-// Mutation: drop the outage-start check in hostReportsItsPause — the VM moves.
+// Mutation: drop the outage-start check in hostReportsItsPauseIn — the VM moves.
 func TestSelfPauseExplicit_AStalePauseConditionIsRefused(t *testing.T) {
 	c, db, ctx, mono := explicitPause(t)
 	got := atDeadline(t, c, ctx, mono, db, func() {
@@ -177,7 +177,7 @@ func TestSelfPauseExplicit_AStalePauseConditionIsRefused(t *testing.T) {
 // therefore called directly, as a coordinator that still listed the host
 // would.
 //
-// Mutation: never refuse in answeredByAVoterMajority — the VM moves.
+// Mutation: never refuse in answeredByAVoterMajorityIn — the VM moves.
 func TestSelfPauseExplicit_AVoterMajorityAnsweringIsRefused(t *testing.T) {
 	c, db, ctx, mono := explicitPause(t)
 	c.run(ctx)
@@ -344,7 +344,7 @@ func TestSelfPauseExplicit_AConditionAfterTheVotersAnchorIsRecovered(t *testing.
 // deadline check is called directly, as a coordinator that still listed it
 // would.
 //
-// Mutation: drop the too-few-runs refusal in outageStart — it indexes past
+// Mutation: drop the too-few-runs refusal in outageStartIn — it indexes past
 // the runs it has and the test goes red.
 func TestSelfPauseExplicit_TooFewVoterRunsToDateTheOutageAreRefused(t *testing.T) {
 	c, db, ctx, mono := explicitPause(t)

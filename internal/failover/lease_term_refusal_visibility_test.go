@@ -9,7 +9,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// A lease-term stamp refusal ABANDONS the workload. strandedWorkloads' own doc
+// A lease-term stamp refusal ABANDONS the workload. strandedByHost's own doc
 // says so: "a fenced host is processed only once, so refusing here does not
 // defer the work — it abandons it", and run() short-circuits the host on every
 // later cycle. So the refusal is a permanent, per-workload outage.

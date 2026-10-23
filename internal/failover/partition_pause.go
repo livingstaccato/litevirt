@@ -288,7 +288,7 @@ func refused(why string) pauseVerdict { return pauseVerdict{why: why, key: why} 
 
 // keyAnswered is the key of a refusal on observers having seen the host
 // answer since the fence (whyAnswered), and keyVoterMajority of one on a
-// voter majority having seen it answer (answeredByAVoterMajority).
+// voter majority having seen it answer (answeredByAVoterMajorityIn).
 // keyRestarted is the key of a refusal on observers whose failing run began
 // after the fence (whyRestarted), and keyContacted of one on this node having
 // probed the host healthy since its wait began (whyContacted). Neither is a
@@ -953,7 +953,7 @@ func (c *Coordinator) observerSkews(ctx context.Context, host string) (func(stri
 
 // pausedThisOutage is the limit for a deadline at which no observer has seen
 // host answer since the fence. When host's own partition_paused condition
-// from this outage is readable (hostReportsItsPause), only the workloads it
+// from this outage is readable (hostReportsItsPauseIn), only the workloads it
 // lists move: the host may still run the rest, as when it judged one not
 // recoverable. With no such condition, a limit this coordinator already
 // holds for the host in this down-episode still stands, and with none held
@@ -976,24 +976,19 @@ func (c *Coordinator) pausedThisOutageIn(ctx context.Context, hr healthRead, hos
 	}
 }
 
-// whyPausedUnreadable is hostReportsItsPause's reason when the condition, or
+// whyPausedUnreadable is hostReportsItsPauseIn's reason when the condition, or
 // the voters' runs that date its outage, cannot be read.
 const whyPausedUnreadable = "its partition_paused condition is unreadable"
 
-// hostReportsItsPause reads host's own replicated partition_paused
+// hostReportsItsPauseIn reads host's own replicated partition_paused
 // condition. It holds when the condition is open, lists the workloads the
 // host paused (returned as "kind/name" keys, which alone may then be
 // recovered: the host's word covers what it paused, nothing more), and was
-// raised during the outage the fence at `at` rests on (outageStart). Not
+// raised during the outage the fence at `at` rests on (outageStartIn). Not
 // "after the fence": a minority host pauses T_pause after it loses the
 // majority, which can be well before a coordinator decides, as when the lease
-// first had to move. It fails closed.
-func (c *Coordinator) hostReportsItsPause(ctx context.Context, host string, at time.Time, sets []map[string]bool) (map[string]bool, string, bool) {
-	return c.hostReportsItsPauseIn(ctx, c.readHostHealth(ctx, host), host, at, sets)
-}
-
-// hostReportsItsPauseIn is hostReportsItsPause, dating the outage over
-// host_health rows already read.
+// first had to move. It fails closed, and dates the outage over host_health
+// rows already read.
 func (c *Coordinator) hostReportsItsPauseIn(ctx context.Context, hr healthRead, host string, at time.Time, sets []map[string]bool) (map[string]bool, string, bool) {
 	cond, ok, err := corrosion.GetHealthCondition(ctx, c.db, corrosion.PartitionPauseEvaluator,
 		corrosion.CondPartitionPaused, "host", host)
@@ -1031,7 +1026,7 @@ func (c *Coordinator) hostReportsItsPauseIn(ctx context.Context, hr healthRead, 
 	return paused, "", true
 }
 
-// outageStart dates the outage a fence of host at `at` rests on: the moment
+// outageStartIn dates the outage a fence of host at `at` rests on: the moment
 // the host can first have lost its majority. Over each voter set in sets, of
 // n members with a majority of q, it takes the failing runs of the set's
 // voters (not host) that span the fence (observerStreakSpans' rows) and
@@ -1040,12 +1035,8 @@ func (c *Coordinator) hostReportsItsPauseIn(ctx context.Context, hr healthRead, 
 // and not observed only make the true moment earlier, and one observer that
 // has been failing the host for long, or a non-voter, cannot pull it back.
 // With several sets it is the latest of their answers. ok is false when any
-// set has fewer such runs than that; a read error is returned as err.
-func (c *Coordinator) outageStart(ctx context.Context, host string, at time.Time, sets []map[string]bool) (time.Time, bool, error) {
-	return c.outageStartIn(c.readHostHealth(ctx, host), host, at, sets)
-}
-
-// outageStartIn is outageStart over host_health rows already read.
+// set has fewer such runs than that; a read error is returned as err. It
+// reads host_health rows already read.
 func (c *Coordinator) outageStartIn(hr healthRead, host string, at time.Time, sets []map[string]bool) (time.Time, bool, error) {
 	if hr.err != nil {
 		return time.Time{}, false, hr.err
@@ -1090,17 +1081,11 @@ func (c *Coordinator) outageStartIn(hr healthRead, host string, at time.Time, se
 	return latest, !latest.IsZero(), nil
 }
 
-// answeredByAVoterMajority reports false, and why, when the voters whose
+// answeredByAVoterMajorityIn reports false, and why, when the voters whose
 // latest verdict about host is an answer (healthy or unready, the verdicts
 // answeredSince reads as one), counting host itself when it is a voter, are
 // a majority of any of sets. An empty set, or none, refuses. It fails closed
-// on a read error.
-func (c *Coordinator) answeredByAVoterMajority(ctx context.Context, host string, sets []map[string]bool) (string, bool) {
-	return c.answeredByAVoterMajorityIn(c.readHostHealth(ctx, host), host, sets)
-}
-
-// answeredByAVoterMajorityIn is answeredByAVoterMajority over host_health
-// rows already read.
+// on a read error. It reads host_health rows already read.
 func (c *Coordinator) answeredByAVoterMajorityIn(hr healthRead, host string, sets []map[string]bool) (string, bool) {
 	if hr.err != nil {
 		slog.Warn("failover: host_health read for a partition-pause deadline failed", "host", host, "error", hr.err)

@@ -36,8 +36,8 @@ func (g regionReadingGate) DecisionGateForRegion(ctx context.Context, r string) 
 // another region's. Its own region's majority may need the lease to fence it,
 // and hosts that reach both sides would keep its renewals live there.
 //
-// Mutation: drop health.LostOwnRegionQuorum from lostEveryDecisionQuorum — the
-// lease is taken on the cluster-wide reading and this goes red.
+// Mutation: drop health.LostOwnRegionQuorumUnder from lostEveryDecisionQuorum —
+// the lease is taken on the cluster-wide reading and this goes red.
 func TestLease_RegionScope_OwnRegionLostStandsDown(t *testing.T) {
 	ctx := context.Background()
 	db := regionFixture(t, corrosion.FailoverScopeRegion)
@@ -62,7 +62,7 @@ func TestLease_RegionScope_OwnRegionLostStandsDown(t *testing.T) {
 // no recovery there waits on the lease, and a holder that lost it keeps the
 // lease for the regions it still reaches.
 //
-// Mutation: drop the three-voter bound in health.LostOwnRegionQuorum — the
+// Mutation: drop the three-voter bound in health.LostOwnRegionQuorumUnder — the
 // coordinator stands down and this goes red.
 func TestLease_RegionScope_SmallOwnRegionKeepsTheLease(t *testing.T) {
 	ctx := context.Background()
@@ -80,7 +80,7 @@ func TestLease_RegionScope_SmallOwnRegionKeepsTheLease(t *testing.T) {
 // TestLease_ClusterScope_IgnoresTheOwnRegion: under the cluster scope a
 // region decides nothing, so its reading does not move the lease.
 //
-// Mutation: drop the scope check in health.LostOwnRegionQuorum — the
+// Mutation: drop the scope check in health.LostOwnRegionQuorumUnder — the
 // coordinator stands down on its region's reading and this goes red.
 func TestLease_ClusterScope_IgnoresTheOwnRegion(t *testing.T) {
 	ctx := context.Background()
@@ -98,7 +98,7 @@ func TestLease_ClusterScope_IgnoresTheOwnRegion(t *testing.T) {
 // cluster's.
 //
 // Mutation: key the own-region reading's grace to the cluster scope in
-// health.LostOwnRegionQuorum — the grace is not seen and the lease is taken.
+// health.LostOwnRegionQuorumUnder — the grace is not seen and the lease is taken.
 func TestLease_RegionScope_OwnRegionInItsRegainGraceStandsDown(t *testing.T) {
 	ctx := context.Background()
 	db := regionFixture(t, corrosion.FailoverScopeRegion)

@@ -66,6 +66,14 @@ func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupSched
 	// as its last error, never a success). It resumes by
 	// itself when the VM is moved to a worker, whose scheduler then owns it.
 	if h, herr := corrosion.GetHost(ctx, s.db, s.hostName); herr == nil && h != nil && h.IsWitness() {
+		// The owner-now checks come first, as for any host: a witness that is
+		// fenced, warming up, not an active member or behind on the VM's owner
+		// epoch may not be the VM's owner at all (it may have moved), so its run
+		// is skipped, quietly and owner-side, and records and raises nothing.
+		if oerr := s.mayReplicateVMAsOwnerWith(ctx, vm, true); oerr != nil {
+			s.notOwnerSkip(ctx, sched, vm.Name, oerr)
+			return fmt.Errorf("%w: %v", scheduler.ErrRunSkipped, oerr)
+		}
 		why := fmt.Sprintf("vm %s is on %s, a witness (role: %s) that runs no workloads, so its replication is paused until it is moved to a worker: `lv migrate %s %s --cold`",
 			vm.Name, s.hostName, h.Role, vm.Name, s.exampleWorker(ctx, s.hostName))
 		s.replicationOutcome(ctx, sched, "vm", vm.Name, tenancy.NormalizeProject(vm.Project), sched.TargetHost, sched.TargetPool, "",

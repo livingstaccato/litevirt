@@ -81,19 +81,19 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 		host = s.hostName
 	}
 	// The operator, carried across a forward so the pool's host audits them
-	// (repairActor), and audited here too for a create this node forwards,
-	// refusals included.
+	// (repairActor). Every create that got past validation is audited as the
+	// operator, refusals included: here when it runs here, and on both
+	// nodes when this one forwards it.
 	actor := s.repairActor(ctx)
-	if host != s.hostName {
-		defer func() {
-			result := "ok"
-			if err != nil {
-				result = fmt.Sprintf("error: %s: %s", status.Code(err), status.Convert(err).Message())
-			}
-			s.auditAs(ctx, actor, "storage.pool.create", req.Name,
-				fmt.Sprintf("host=%s forwarded to %s driver=%s source=%s target=%s project=%s", host, host, req.Driver, req.Source, req.Target, project), result)
-		}()
-	}
+	defer func() {
+		where := "on this host"
+		if host != s.hostName {
+			where = "forwarded to " + auditQuote(host)
+		}
+		s.auditAs(ctx, actor, "storage.pool.create", req.Name,
+			fmt.Sprintf("host=%s %s driver=%s source=%s target=%s project=%s", auditQuote(host), where,
+				auditQuote(req.Driver), auditQuote(req.Source), auditQuote(req.Target), auditQuote(project)), auditResult(err))
+	}()
 	// Authorize the project the request CLAIMS — this is where the pool is going.
 	if err := s.RequirePerm(ctx, poolRBACPathFor(project, req.Name), "storage.pool.write", "operator"); err != nil {
 		return nil, err
@@ -300,8 +300,6 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 	if err := corrosion.UpsertStoragePool(ctx, s.db, rec); err != nil {
 		return nil, status.Errorf(codes.Internal, "persist: %v", err)
 	}
-	s.auditAs(ctx, actor, "storage.pool.create", req.Name,
-		fmt.Sprintf("host=%s driver=%s source=%s target=%s project=%s", host, req.Driver, req.Source, req.Target, project), "ok")
 	// Make the pool resolvable for move/replicate/compose on this host right
 	// away — the daemon's periodic refresh would otherwise be the only thing
 	// that loads runtime-created pools into the in-memory map.

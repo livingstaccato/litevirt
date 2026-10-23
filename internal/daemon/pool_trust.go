@@ -43,9 +43,11 @@ func (d *Daemon) openPoolTrust(ctx context.Context) {
 	pt.SetConfig(cfg)
 	d.poolTrust = pt
 	if d.db != nil {
-		// The daemon's own rows first: an adoption never has to judge them.
-		d.ensureOwnPoolsTrusted(ctx)
+		// The adoption first: it runs only while there is no ledger file, and
+		// recording the daemon's own pools writes one. Then the daemon's own
+		// rows, whatever the adoption made of them.
 		a, err := pt.AdoptOnUpgrade(ctx, d.db, d.cfg.HostName)
+		d.ensureOwnPoolsTrusted(ctx)
 		switch {
 		case err != nil:
 			slog.Error("storage pool trust: existing pools not adopted; retried at the next start", "error", err)

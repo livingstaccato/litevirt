@@ -230,7 +230,7 @@ func TestBinding_NFSMountOptionsAreBound(t *testing.T) {
 		opts map[string]string
 		want bool
 	}{
-		{map[string]string{"options": " hard , vers=4.2,nosuid,noexec", "nfs_export": "x"}, true},
+		{map[string]string{"options": " vers=4.2 , hard,nosuid,NOEXEC,hard", "nfs_export": "x"}, true},
 		{map[string]string{"options": "vers=4.2,soft"}, false},
 		{map[string]string{"options": "vers=4.2,hard,nolock"}, false},
 		{nil, false},

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -75,10 +76,17 @@ does, and is audited as storage.pool.trust, refusals included.`,
 // runPoolTrust is `lv pool trust`: preview the host's row, have the operator
 // confirm it (a y/N on a terminal, the --expect-* values otherwise), and send
 // exactly the confirmed values.
+//
+// The row is what a forger may have written, so nothing from it, nor from the
+// host's answers, reaches the terminal unescaped (termSafe): a control or
+// format character could redraw or hide what the operator is confirming. A
+// row holding one is not confirmed interactively at all — what the operator
+// sees would not be exactly the row — only with --expect-*, which compares
+// exact strings.
 func runPoolTrust(ctx context.Context, c pb.LiteVirtClient, name, host string, exp poolTrustExpect, interactive bool, in io.Reader, out io.Writer) error {
 	prev, err := c.TrustStoragePool(ctx, &pb.TrustStoragePoolRequest{Name: name, Host: host, Preview: true})
 	if err != nil {
-		return fmt.Errorf("read the pool's row on its host: %w", err)
+		return fmt.Errorf("read the pool's row on its host: %s", termSafe(err.Error()))
 	}
 	p := prev.GetPool()
 	shown := trustValues{
@@ -86,12 +94,13 @@ func runPoolTrust(ctx context.Context, c pb.LiteVirtClient, name, host string, e
 		Driver: p.GetDriver(), Source: p.GetSource(), Target: p.GetTarget(), MountOptions: prev.GetMountOptions(),
 	}
 	fmt.Fprintf(out, "pool %s on %s:\n  driver:        %s\n  source:        %s\n  target:        %s\n  mount options: %s\n",
-		shown.Name, shown.Host, shown.Driver, orNone(shown.Source), orNone(shown.Target), orNone(shown.MountOptions))
+		termSafe(shown.Name), termSafe(shown.Host), termSafe(shown.Driver), termSafe(orNone(shown.Source)),
+		termSafe(orNone(shown.Target)), termSafe(orNone(shown.MountOptions)))
 	if prev.GetAlreadyTrusted() {
-		fmt.Fprintf(out, "already trusted by %s (%s); nothing to confirm\n", shown.Host, prev.GetTrustedAs())
+		fmt.Fprintf(out, "already trusted by %s (%s); nothing to confirm\n", termSafe(shown.Host), termSafe(prev.GetTrustedAs()))
 		return nil
 	}
-	fmt.Fprintf(out, "not trusted by %s: %s\n", shown.Host, prev.GetWhy())
+	fmt.Fprintf(out, "not trusted by %s: %s\n", termSafe(shown.Host), termSafe(prev.GetWhy()))
 
 	var confirmed trustValues
 	switch {
@@ -101,7 +110,11 @@ func runPoolTrust(ctx context.Context, c pb.LiteVirtClient, name, host string, e
 			return err
 		}
 	case interactive:
-		fmt.Fprintf(out, "Once trusted, the daemon on %s writes in %s as root. Trust this row? [y/N] ", shown.Host, orNone(shown.Target))
+		if f := shown.unprintable(); f != "" {
+			return fmt.Errorf("the row's %s holds a control or format character (shown escaped above), so what a terminal shows is not exactly the row; "+
+				"it is not confirmed interactively — check it and pass the exact values with --expect-driver, --expect-target, --expect-source and --expect-mount-options", f)
+		}
+		fmt.Fprintf(out, "Once trusted, the daemon on %s writes in %s as root. Trust this row? [y/N] ", termSafe(shown.Host), termSafe(orNone(shown.Target)))
 		line, _ := bufio.NewReader(in).ReadString('\n')
 		if a := strings.ToLower(strings.TrimSpace(line)); a != "y" && a != "yes" {
 			return errors.New("not confirmed; nothing was recorded")
@@ -115,10 +128,25 @@ func runPoolTrust(ctx context.Context, c pb.LiteVirtClient, name, host string, e
 		Driver: confirmed.Driver, Source: confirmed.Source, Target: confirmed.Target, MountOptions: confirmed.MountOptions,
 	})
 	if err != nil {
-		return fmt.Errorf("trust pool: %w", err)
+		return fmt.Errorf("trust pool: %s", termSafe(err.Error()))
 	}
-	fmt.Fprintf(out, "pool %s on %s is now trusted (%s)\n", confirmed.Name, confirmed.Host, resp.GetTrustedAs())
+	fmt.Fprintf(out, "pool %s on %s is now trusted (%s)\n", termSafe(confirmed.Name), termSafe(confirmed.Host), termSafe(resp.GetTrustedAs()))
 	return nil
+}
+
+// unprintable names the first field of v holding a control or format
+// character, "" when none does.
+func (v trustValues) unprintable() string {
+	unsafe := func(r rune) bool { return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) }
+	for _, f := range []struct{ name, val string }{
+		{"name", v.Name}, {"host", v.Host}, {"driver", v.Driver}, {"source", v.Source},
+		{"target", v.Target}, {"mount options", v.MountOptions},
+	} {
+		if strings.ContainsFunc(f.val, unsafe) {
+			return f.name
+		}
+	}
+	return ""
 }
 
 // expectedBinding is the confirmation from --expect-*: every value the row

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -44,21 +46,6 @@ func (s *Server) TrustStoragePool(ctx context.Context, req *pb.TrustStoragePoolR
 	if host == "" {
 		host = s.hostName
 	}
-	if !req.GetPreview() {
-		defer func() {
-			where := "on this host"
-			if host != s.hostName {
-				where = "forwarded to " + host
-			}
-			result := "ok"
-			if err != nil {
-				result = fmt.Sprintf("error: %s: %s", status.Code(err), status.Convert(err).Message())
-			}
-			s.auditAs(ctx, actor, "storage.pool.trust", req.GetName(),
-				fmt.Sprintf("host=%s %s driver=%s source=%s target=%s mount_options=%s", host, where,
-					req.GetDriver(), req.GetSource(), req.GetTarget(), req.GetMountOptions()), result)
-		}()
-	}
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
@@ -67,6 +54,21 @@ func (s *Server) TrustStoragePool(ctx context.Context, req *pb.TrustStoragePoolR
 	}
 	if err := safename.ValidatePoolName(req.GetName()); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	// Audited from here, once the name is a valid pool name: every
+	// confirmation, refusals included, as the operator. The strings the
+	// request carries are quoted and capped.
+	if !req.GetPreview() {
+		defer func() {
+			where := "on this host"
+			if host != s.hostName {
+				where = "forwarded to " + auditQuote(host)
+			}
+			s.auditAs(ctx, actor, "storage.pool.trust", req.GetName(),
+				fmt.Sprintf("host=%s %s driver=%s source=%s target=%s mount_options=%s", auditQuote(host), where,
+					auditQuote(req.GetDriver()), auditQuote(req.GetSource()), auditQuote(req.GetTarget()), auditQuote(req.GetMountOptions())),
+				auditResult(err))
+		}()
 	}
 	if !req.GetPreview() && req.GetDriver() == "" {
 		return nil, status.Error(codes.InvalidArgument, "driver is required: the row as you confirmed it")
@@ -148,6 +150,31 @@ func (s *Server) TrustStoragePool(ctx context.Context, req *pb.TrustStoragePoolR
 		"already_trusted", resp.AlreadyTrusted, "by", actor)
 	s.JudgePoolTrust(ctx)
 	return resp, nil
+}
+
+// auditFieldMax caps one request string written into an audit row.
+const auditFieldMax = 256
+
+// auditQuote is a request string as an audit row records it: quoted (Go
+// syntax, so a control character is escaped) and capped at auditFieldMax
+// bytes before quoting.
+func auditQuote(v string) string {
+	if len(v) > auditFieldMax {
+		v = strings.ToValidUTF8(v[:auditFieldMax], "") + "…"
+	}
+	return strconv.Quote(v)
+}
+
+// auditResult is an RPC's outcome as an audit row records it.
+func auditResult(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	msg := status.Convert(err).Message()
+	if len(msg) > 4*auditFieldMax {
+		msg = strings.ToValidUTF8(msg[:4*auditFieldMax], "") + "…"
+	}
+	return fmt.Sprintf("error: %s: %s", status.Code(err), msg)
 }
 
 // Pool row trust (internal/pooltrust): storage_pools is replicated with no

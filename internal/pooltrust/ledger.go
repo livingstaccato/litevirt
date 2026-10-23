@@ -98,21 +98,41 @@ var hardeningOptions = map[string]bool{
 	"nosymfollow": true, "symfollow": true, "nosharecache": true, "sharecache": true,
 }
 
-// NormalizeMountOptions is an nfs pool's mount options as a set: split on
-// commas, trimmed, the hardening options every mount sets dropped, sorted
-// and de-duplicated.
+// NormalizeMountOptions is an nfs pool's mount options as mount(8) takes
+// them, in the operator's order — of two conflicting options the last wins,
+// so "soft,hard" and "hard,soft" are different — split on commas outside
+// double quotes (context="a,b" is one option), each trimmed, the hardening
+// options every mount sets dropped whatever their case, and an exact repeat
+// kept only at its last place, where it takes effect.
 func NormalizeMountOptions(s string) string {
-	seen := map[string]bool{}
+	var opts []string
+	var cur strings.Builder
+	quoted := false
+	for _, r := range s {
+		switch {
+		case r == '"':
+			quoted = !quoted
+			cur.WriteRune(r)
+		case r == ',' && !quoted:
+			opts = append(opts, cur.String())
+			cur.Reset()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	opts = append(opts, cur.String())
+	last := map[string]int{}
+	for i, o := range opts {
+		opts[i] = strings.TrimSpace(o)
+		last[opts[i]] = i
+	}
 	var out []string
-	for _, o := range strings.Split(s, ",") {
-		o = strings.TrimSpace(o)
-		if o == "" || hardeningOptions[strings.ToLower(o)] || seen[o] {
+	for i, o := range opts {
+		if o == "" || hardeningOptions[strings.ToLower(o)] || last[o] != i {
 			continue
 		}
-		seen[o] = true
 		out = append(out, o)
 	}
-	sort.Strings(out)
 	return strings.Join(out, ",")
 }
 
@@ -133,6 +153,10 @@ type Entry struct {
 type ledgerFile struct {
 	Version int              `json:"version"`
 	Pools   map[string]Entry `json:"pools"`
+	// Adopted records that the upgrade adoption has run on this host. A
+	// ledger written before it ran (the daemon recording its own pools, a
+	// create) does not stop it from running.
+	Adopted bool `json:"adopted"`
 }
 
 // Store is this host's pool trust: the config pools and the ledger.
@@ -143,7 +167,7 @@ type Store struct {
 	mu          sync.Mutex
 	entries     map[string]Entry
 	config      map[string]Binding
-	initialised bool   // the ledger file existed when opened, or has been written since
+	initialised bool   // the upgrade adoption ran on this host (or a ledger was lost: it never runs again)
 	corrupt     string // why the ledger could not be read, and where it was kept
 }
 
@@ -174,16 +198,18 @@ func Open(dataDir, pkiDir string) (*Store, error) {
 		s.initialised = true
 		return s, s.setAside(fmt.Errorf("read pool trust ledger %s: %w", s.path, err))
 	}
-	s.initialised = true
 	var lf ledgerFile
 	if err := json.Unmarshal(b, &lf); err != nil {
+		s.initialised = true
 		return s, s.setAside(fmt.Errorf("parse pool trust ledger %s: %w", s.path, err))
 	}
+	s.initialised = lf.Adopted
 	for name, e := range lf.Pools {
 		e.Binding = e.Binding.normalized()
 		s.entries[name] = e
 	}
 	if aside := s.asides(); len(aside) > 0 {
+		s.initialised = true
 		s.corrupt = fmt.Sprintf("an unreadable ledger was kept as %s", strings.Join(aside, ", "))
 	}
 	return s, nil
@@ -226,8 +252,9 @@ func (s *Store) CorruptNote() string {
 // Path is the ledger file.
 func (s *Store) Path() string { return s.path }
 
-// Initialised reports whether the ledger file exists: a build that keeps it
-// has started on this host before, so no upgrade adoption is due.
+// Initialised reports whether the upgrade adoption has run on this host (or
+// a ledger was found unreadable, after which it never runs): no adoption is
+// due. A ledger written before the adoption ran does not count.
 func (s *Store) Initialised() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -313,7 +340,7 @@ func (s *Store) Forget(name string) error {
 // writeLocked replaces the ledger file atomically: a 0600 dot-named temp in
 // the data directory, synced, renamed over it, and the directory synced.
 func (s *Store) writeLocked(entries map[string]Entry) error {
-	b, err := json.MarshalIndent(ledgerFile{Version: 1, Pools: entries}, "", "  ")
+	b, err := json.MarshalIndent(ledgerFile{Version: 1, Pools: entries, Adopted: s.initialised}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -348,7 +375,6 @@ func (s *Store) writeLocked(entries map[string]Entry) error {
 		_ = d.Sync()
 		d.Close()
 	}
-	s.initialised = true
 	return nil
 }
 
@@ -428,7 +454,7 @@ func (s *Store) inOwnArea(b Binding) (bool, error) {
 	if dir == "" {
 		return false, nil
 	}
-	in, err := storage.InDataDirPoolArea(dir, s.dataDir)
+	in, err := storage.InDataDirPoolArea(dir, s.dataDir, s.pkiDir)
 	if err != nil || !in {
 		return false, err
 	}

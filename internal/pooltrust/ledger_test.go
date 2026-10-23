@@ -109,8 +109,8 @@ func TestLedger_PersistsPrivatelyAndForgets(t *testing.T) {
 		t.Errorf("ledger mode %v, want 0600", fi.Mode().Perm())
 	}
 	s2 := f.open(t)
-	if !s2.Initialised() || !s2.Judge("p", b).Trusted {
-		t.Fatalf("reopened ledger lost the entry: initialised=%t judge=%+v", s2.Initialised(), s2.Judge("p", b))
+	if !s2.Judge("p", b).Trusted {
+		t.Fatalf("reopened ledger lost the entry: judge=%+v", s2.Judge("p", b))
 	}
 	if e, _ := s2.Entry("p"); e.How != HowTrust {
 		t.Errorf("entry how = %q, want %q", e.How, HowTrust)

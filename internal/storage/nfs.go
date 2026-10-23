@@ -697,12 +697,12 @@ func (d *nfsDriver) DeleteDisk(_ context.Context, path string) error {
 var nfsHardening = []string{"nosuid", "nodev", "noexec", "nosharecache"}
 
 // hardenNFSOptions appends nfsHardening to opts, and drops any option that
-// would undo it (suid, dev, exec, sharecache).
+// would undo it (suid, dev, exec, sharecache), in any case.
 func hardenNFSOptions(opts string) string {
 	var out []string
 	for _, o := range strings.Split(opts, ",") {
 		o = strings.TrimSpace(o)
-		switch o {
+		switch strings.ToLower(o) {
 		case "", "suid", "dev", "exec", "symfollow", "nosymfollow", "sharecache":
 			continue
 		}

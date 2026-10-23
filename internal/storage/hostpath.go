@@ -566,23 +566,49 @@ func inPoolArea(dataDir, p string) bool {
 // and as they resolve on this host — a pools/ or disks/ that is itself a
 // symlink to a bigger volume is still the daemon's area — and every form of
 // p, as written and resolved, must be one of them, so a link INSIDE pools/ to
-// a directory elsewhere is not. The resolutions are bounded
-// (resolveBounded): one that does not answer is an error, and the answer
-// false.
-func InDataDirPoolArea(p, dataDir string) (bool, error) {
+// a directory elsewhere is not.
+//
+// A resolved root outside the data directory counts only when it is a
+// directory a pool could be (CheckWriteRoot: no system directory, not the
+// filesystem root, no parent of the data directory, not the PKI directory):
+// a pools/ linked to /var/lib, say, does not make every directory under
+// /var/lib the daemon's. The resolutions are bounded (resolveBounded): one
+// that does not answer is an error, and the answer false.
+func InDataDirPoolArea(p, dataDir, pkiDir string) (bool, error) {
 	if p == "" || dataDir == "" || !filepath.IsAbs(p) {
 		return false, nil
 	}
 	var t MountTable
 	var errs []error
+	dataForms, err := pathFormsBounded(&t, dataDir)
+	errs = append(errs, err)
+	// rootOK judges one form of an area root.
+	rootOK := func(r string) bool {
+		for _, d := range dataForms {
+			if within(d, r) && filepath.Clean(r) != filepath.Clean(d) {
+				return true // inside the data directory: the root as written
+			}
+		}
+		if filepath.Clean(r) == "/" {
+			return false
+		}
+		for _, d := range dataForms {
+			if within(r, d) {
+				return false // the data directory itself, or a parent of it
+			}
+		}
+		return t.CheckWriteRoot(r, dataDir, pkiDir) == nil
+	}
 	rootForms := func(name string) []string {
 		var out []string
-		dataForms, err := pathFormsBounded(&t, dataDir)
-		errs = append(errs, err)
 		for _, d := range dataForms {
 			f, err := pathFormsBounded(&t, filepath.Join(d, name))
 			errs = append(errs, err)
-			out = append(out, f...)
+			for _, r := range f {
+				if rootOK(r) {
+					out = append(out, r)
+				}
+			}
 		}
 		return out
 	}

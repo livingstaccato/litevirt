@@ -70,7 +70,9 @@ func (s *Store) AdoptOnUpgrade(ctx context.Context, db *corrosion.Client, host s
 	for k, v := range add {
 		next[k] = v
 	}
+	s.initialised = true
 	if err := s.writeLocked(next); err != nil {
+		s.initialised = false
 		return out, err
 	}
 	s.entries = next
@@ -100,12 +102,14 @@ func (s *Store) poolDir(b Binding) string {
 // real pool (/srv above /srv/vmpool). What the old build's pools leave on
 // THIS host's disk is evidence, and a forged row alone did not put it there:
 //
-//   - a disk of one of this host's own VMs (its vm_disks row AND its vms row
-//     name this host), recorded on the pool, is a regular qcow2 file (not a
-//     link) DIRECTLY in the pool's directory: the file's resolved parent is
-//     the directory resolved, so an ancestor of the disk's directory, or a
-//     link inside the directory pointing elsewhere, is not evidence. Every
-//     file-based disk litevirt creates is qcow2; or
+//   - a file recorded on the pool is a regular qcow2 file (not a link)
+//     DIRECTLY in the pool's directory: the file's resolved parent is the
+//     directory resolved. That equality is the guard: an ancestor of the
+//     disk's directory, or a link inside the directory pointing elsewhere, is
+//     not evidence. The rows naming the file (a live vm_disks row and a live
+//     vms row of this host) are replicated, so a forger can write them too:
+//     they only say which files to look at. Every file-based disk litevirt
+//     creates is qcow2; or
 //   - for an nfs pool whose mount point is in <data_dir>/mounts, its export
 //     is mounted there now.
 //
@@ -119,7 +123,7 @@ func (s *Store) upgradeEvidence(ctx context.Context, db *corrosion.Client, host,
 		return false, err.Error()
 	}
 	if b.Driver == "nfs" {
-		if in, err := storage.InDataDirPoolArea(dir, s.dataDir); err == nil && in {
+		if in, err := storage.InDataDirPoolArea(dir, s.dataDir, s.pkiDir); err == nil && in {
 			st, err := storage.CheckNFSPoolMount(s.dataDir, storage.Config{Driver: b.Driver, Source: b.Source, Target: b.Target})
 			if err == nil && st.Mounted {
 				return true, "its export is mounted at " + dir

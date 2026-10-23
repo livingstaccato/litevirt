@@ -14,6 +14,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/pooltrust"
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
@@ -112,6 +113,17 @@ func (m *nfsMountMemory) failedWithin(dir string, d time.Duration) (error, bool)
 // row is registered without its mount options) from the config definition.
 func (s *Server) nfsPoolConfig(r corrosion.StoragePoolRecord) storage.Config {
 	cfg := storage.Config{Name: r.Name, Driver: r.Driver, Source: r.Source, Target: r.Target, Options: r.Options}
+	// A config pool mounts with config's options only, never the row's: its
+	// row is trusted on driver, source and target alone (pool_trust.go), so
+	// options a forger wrote into it must not reach the mount. None in
+	// config means none (the mount adds its hardening).
+	if s.poolTrustVerdict(r.Name, StoragePoolRef{Driver: r.Driver, Source: r.Source, Target: r.Target, Options: r.Options}).Why == pooltrust.TrustConfig {
+		cfg.Options = nil
+		if ref, ok := s.lookupStoragePool(r.Name); ok && strings.EqualFold(ref.Driver, "nfs") && ref.Source == r.Source && ref.Target == r.Target {
+			cfg.Options = ref.Options
+		}
+		return cfg
+	}
 	if ref, ok := s.lookupStoragePool(r.Name); ok && strings.EqualFold(ref.Driver, "nfs") && ref.Source == r.Source && ref.Target == r.Target && len(ref.Options) > 0 {
 		cfg.Options = ref.Options
 	}

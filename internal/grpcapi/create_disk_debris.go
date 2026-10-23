@@ -176,12 +176,21 @@ func (s *Server) noteDeleteKeptDisks(ctx context.Context, name string, kept []Ke
 // create: nothing was removed. The files it moved are returned, with an error
 // too, so a create that fails puts the kept ones back
 // (restoreKeptAfterFailedCreate).
-func (s *Server) clearDiskDebrisBeforeCreate(ctx context.Context, name string, now time.Time) ([]health.MovedBeforeCreate, error) {
+//
+// writesLocal is whether the create writes a disk on this host's own storage
+// (createWritesHostDisk); one that does not cannot become the base a kept
+// overlay is missing, and is not held while what kept overlays back on cannot
+// be read.
+//
+// A candidate list that cannot be read refuses the create: without it
+// neither the sweep nor the kept-disk checks on it can run, and a create
+// that went ahead could write the base a kept overlay is missing.
+func (s *Server) clearDiskDebrisBeforeCreate(ctx context.Context, name string, now time.Time, writesLocal bool) ([]health.MovedBeforeCreate, error) {
 	candidates, err := s.images.VMDiskCandidates(name)
 	if err != nil {
-		slog.Error("create: skipping the disk debris sweep; its candidate list is unreadable",
-			"vm", name, "error", err)
-		return nil, nil
+		return nil, fmt.Errorf("the files an earlier VM %s left in %s cannot be listed (%v), so what the create would clear, and "+
+			"whether a disk a delete kept backs on them, cannot be told; nothing was created. Fix that directory or its storage, "+
+			"or place the VM on another host", name, s.images.DiskDir(name), err)
 	}
 	keep := s.protectedDiskPathsFrom(ctx, name, candidates)
 	var unlink []string
@@ -193,7 +202,11 @@ func (s *Server) clearDiskDebrisBeforeCreate(ctx context.Context, name string, n
 	// Nothing a delete kept, and nothing a file beside it backs on, is
 	// cleared: the kept-disk notes govern what they name (below), and this
 	// covers what they do not.
-	if err := s.keptFileCreateRefusal(ctx, name, unlink, s.createDiskPathOf(name), true); err != nil {
+	var writes func(string) bool
+	if writesLocal {
+		writes = s.createDiskPathOf(name)
+	}
+	if err := s.keptFileCreateRefusal(ctx, name, unlink, writes, true); err != nil {
 		return nil, err
 	}
 	trusted := func() (bool, string) {

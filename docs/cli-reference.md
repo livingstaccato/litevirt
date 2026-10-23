@@ -316,7 +316,13 @@ that does not exist ends the chain and holds nothing, but a create or import
 that would write a disk at that path is refused, naming the overlay that
 names it: the new disk would become its base); the refusal names the
 entry, and the way out is to fix that file, or, once nothing needs the disk,
-move it away or remove its entry from `<data_dir>/kept-disks.json`. A disk only
+move it away or remove its entry from `<data_dir>/kept-disks.json`. An
+unreadable `kept-disks.json` or kept chain does not depend on the name: until
+it reads, every `lv import` on that host, and every create there that writes a
+disk on the host's own storage, is refused, and `disk_leftover` names the file
+(`creates_refused`). A create with no disk, or with every disk on shared
+storage (nfs, ceph, iscsi), goes ahead. A create whose `<vm>-*` files in the
+disk directory cannot be listed is refused too, naming the directory. A disk only
 `kept-disks.json` names, at the path the create writes, is refused rather than
 renamed. `lv import` refuses the same files at its disk's name, rather than
 moving them aside as an orphan. Every other path that removes disk files on

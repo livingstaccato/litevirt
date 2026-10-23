@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/storage"
 )
@@ -92,12 +93,8 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 
 	chains, err := s.keptRegistryChains(ctx)
 	if err != nil {
-		var re *keptRegistryError
-		if errors.As(err, &re) && re.transient {
-			return fmt.Errorf("the create clears a file left by an earlier VM %s, and %v; nothing was moved or removed", name, err)
-		}
-		return health.NewKeptBackingFileError(fmt.Sprintf("the create clears a file left by an earlier VM %s, and %v; "+
-			"nothing was moved or removed", name, err))
+		return keptChainsRefusal(fmt.Sprintf("the create clears a file left by an earlier VM %s, and", name), err,
+			"nothing was moved or removed")
 	}
 	registry := filepath.Join(s.dataDir, diskKeptFile)
 	for _, c := range chains {
@@ -111,7 +108,7 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 			}
 			return refuse(l, fmt.Sprintf("%s backs on, the disk %s the delete of VM %s kept (%s), as %s records", c.top, r.Disk, r.VM, r.Reason, registry))
 		}
-		if c.missing != "" && writes(c.missing) {
+		if c.missing != "" && writes != nil && writes(c.missing) {
 			return missingBaseRefusal(c, registry)
 		}
 	}
@@ -159,6 +156,29 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 	return nil
 }
 
+// keptChainsUnknownError is a refusal because kept-disks.json or a kept
+// disk's backing chain cannot be read (keptRegistryChains). Unlike the other
+// kept-file refusals it does not depend on the name being created: until the
+// file it names reads, every create or import that writes a disk here meets
+// it. It wraps the error the caller maps to a code (KeptBackingFileError, or
+// a plain retryable one).
+type keptChainsUnknownError struct{ err error }
+
+func (e *keptChainsUnknownError) Error() string { return e.err.Error() }
+func (e *keptChainsUnknownError) Unwrap() error { return e.err }
+
+// keptChainsRefusal is the refusal for err, a keptRegistryChains error:
+// "<lead> <err>; <tail>". Storage that does not answer is retryable;
+// anything else is a KeptBackingFileError.
+func keptChainsRefusal(lead string, err error, tail string) error {
+	msg := fmt.Sprintf("%s %v; %s", lead, err, tail)
+	var re *keptRegistryError
+	if errors.As(err, &re) && re.transient {
+		return &keptChainsUnknownError{errors.New(msg)}
+	}
+	return &keptChainsUnknownError{health.NewKeptBackingFileError(msg)}
+}
+
 // missingBaseRefusal refuses a create that would write the missing backing
 // file of c's chain.
 func missingBaseRefusal(c keptRegistryChain, registry string) error {
@@ -173,16 +193,16 @@ func missingBaseRefusal(c keptRegistryChain, registry string) error {
 // clears nothing: one that writes the missing backing file of a kept disk's
 // chain is refused. A registry or a chain that cannot be read refuses too:
 // whether a kept overlay names a path the create writes as its missing base
-// is then unknown.
+// is then unknown. A nil writes is a create that writes no disk where the
+// check looks (no disk, or every disk on shared storage): no kept overlay
+// can back on what it makes, and it is not held.
 func (s *Server) keptMissingBaseRefusal(ctx context.Context, writes func(string) bool) error {
+	if writes == nil {
+		return nil
+	}
 	chains, err := s.keptRegistryChains(ctx)
 	if err != nil {
-		var re *keptRegistryError
-		if errors.As(err, &re) && re.transient {
-			return fmt.Errorf("whether a disk a delete kept backs on a path the create writes cannot be told: %v; nothing was created", err)
-		}
-		return health.NewKeptBackingFileError(fmt.Sprintf("whether a disk a delete kept backs on a path the create writes cannot be told: "+
-			"%v; nothing was created", err))
+		return keptChainsRefusal("whether a disk a delete kept backs on a path the create writes cannot be told:", err, "nothing was created")
 	}
 	registry := filepath.Join(s.dataDir, diskKeptFile)
 	for _, c := range chains {
@@ -191,6 +211,33 @@ func (s *Server) keptMissingBaseRefusal(ctx context.Context, writes func(string)
 		}
 	}
 	return nil
+}
+
+// createWritesHostDisk reports whether a create of spec writes a disk on
+// this host's own storage, where a kept overlay's missing base can be: a disk
+// with no storage named (the host's disk directory), the default root disk of
+// a create with an image and no disks, or one on a pool that is not shared
+// (nfs, ceph, iscsi) or whose resolution is not known (cfgs: the storage the
+// LUN claim resolved, by disk index). An nfs pool mounted at this host's disk
+// directory counts as local. Anything it cannot tell counts as local.
+func (s *Server) createWritesHostDisk(spec *pb.VMSpec, cfgs map[int]storage.Config) bool {
+	if len(spec.Disks) == 0 {
+		return spec.Image != ""
+	}
+	diskDir := ""
+	if s.images != nil {
+		diskDir = filepath.Clean(s.images.DiskDir(spec.Name))
+	}
+	for i, d := range spec.Disks {
+		if d.Storage == "" {
+			return true
+		}
+		cfg, ok := cfgs[i]
+		if !ok || !isSharedDriver(cfg.Driver) || (cfg.Target != "" && filepath.Clean(cfg.Target) == diskDir) {
+			return true
+		}
+	}
+	return false
 }
 
 // createDiskPathOf reports whether a create of name writes a disk at p in

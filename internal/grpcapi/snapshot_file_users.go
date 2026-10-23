@@ -340,7 +340,7 @@ func (s *Server) removeOwnDiskLayers(ctx context.Context, vmName string, files [
 		if kept == nil || kept[filepath.Clean(f)] {
 			continue
 		}
-		if held, why := s.keptNoteHolds(f); held {
+		if held, why := s.keptHolds(ctx, f); held {
 			s.reportKeptNoteHold(ctx, vmName, "the delete's snapshot-layer cleanup", f, why)
 			continue
 		}

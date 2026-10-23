@@ -269,3 +269,37 @@ func TestImportVM_AFileAKeptDiskHoldsIsNotAnOrphan(t *testing.T) {
 		refusedAndUntouched(t, s, "imp-kn", dst, "kept base")
 	})
 }
+
+// Fix round 1, M2: a kept chain the stale-record delete cannot read refuses
+// it with the record kept, and with nothing noted: a retry that frees the
+// disks (the silent host answers) then leaves no note holding their paths.
+//
+// Red on a8c7a7a50 (the tops were noted first). Mutation: note the tops
+// before reading the chains: red.
+func TestDeleteVM_StaleRecordNotesNothingWhenAChainCannotBeRead(t *testing.T) {
+	dir := t.TempDir()
+	bad := filepath.Join(dir, "a-root.qcow2")
+	if err := os.WriteFile(bad, []byte("not a qcow2 header"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	top := filepath.Join(dir, "a-root.s1")
+	if err := qcow2.CreateWithBackingFormat(top, bad, "qcow2", 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := deleteDiskServerWith(t, false,
+		corrosion.DiskRecord{VMName: "a", DiskName: "root", Path: top, StorageType: "local", DeleteWithVM: true})
+	if err := corrosion.InsertHost(context.Background(), s.db, corrosion.HostRecord{
+		Name: "peer-x", Address: "203.0.113.9", State: "active", CPUTotal: 4, MemTotal: 4096,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deleteNamed(t, s); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("DeleteVM with an unreadable kept chain = %v; want FailedPrecondition", err)
+	}
+	if vm, _ := corrosion.GetVM(adminCtx(), s.db, "a"); vm == nil {
+		t.Fatal("the record went")
+	}
+	if _, err := os.Stat(filepath.Join(s.dataDir, "kept-disks", "a.json")); !os.IsNotExist(err) {
+		t.Errorf("a note was written for a refused delete (%v)", err)
+	}
+}

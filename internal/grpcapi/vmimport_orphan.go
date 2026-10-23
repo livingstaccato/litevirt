@@ -445,7 +445,7 @@ func (s *Server) clearImportDiskName(ctx context.Context, pool, importName, impo
 	// A file a delete kept, or one a kept disk beside it backs on, is no
 	// orphan, whatever the database records: moved aside, a kept overlay
 	// would back on the imported disk.
-	if kerr := s.keptFileCreateRefusal(importName, []string{dst}, false); kerr != nil {
+	if kerr := s.keptFileCreateRefusal(ctx, importName, []string{dst}, false); kerr != nil {
 		return "", fmt.Errorf("disk %q would be written to %s, which already exists in the pool: %v; "+
 			"an import never replaces a file there — import under another --name", disk, dst, kerr)
 	}

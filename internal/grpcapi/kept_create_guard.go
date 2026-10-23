@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -34,8 +35,11 @@ import (
 //     of, whatever records exist.
 //
 // A note, kept-disks.json or a kept disk's chain that cannot be read refuses
-// too: what it would keep is then unknown.
-func (s *Server) keptFileCreateRefusal(name string, files []string, notesGovern bool) error {
+// too: what it would keep is then unknown (keptRegistryChains; a backing
+// file that does not exist ends a chain, and holds nothing). Only storage or
+// the database not answering is retryable; anything else is
+// KeptBackingFileError, naming the entry and the way out.
+func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files []string, notesGovern bool) error {
 	present := map[string]bool{}
 	var dirs []string
 	seenDir := map[string]bool{}
@@ -81,36 +85,26 @@ func (s *Server) keptFileCreateRefusal(name string, files []string, notesGovern 
 		}
 	}
 
-	records, unreadable := s.diskKeptRecords()
-	registry := filepath.Join(s.dataDir, diskKeptFile)
-	if unreadable != "" {
-		return fmt.Errorf("the create clears a file left by an earlier VM %s, and this host's record of the disks deletes kept, %s, "+
-			"cannot be read (%s); repair or remove that file, then retry, or place the VM on another host", name, registry, unreadable)
+	chains, err := s.keptRegistryChains(ctx)
+	if err != nil {
+		var re *keptRegistryError
+		if errors.As(err, &re) && re.transient {
+			return fmt.Errorf("the create clears a file left by an earlier VM %s, and %v; nothing was moved or removed", name, err)
+		}
+		return health.NewKeptBackingFileError(fmt.Sprintf("the create clears a file left by an earlier VM %s, and %v; "+
+			"nothing was moved or removed", name, err))
 	}
-	for _, r := range records {
-		if r.Host != s.hostName || r.Path == "" {
-			continue
-		}
-		top := filepath.Clean(s.hostDiskFile(r.Path))
-		if !filepath.IsAbs(top) {
-			continue
-		}
-		layers, err := storage.Bounded("read the backing chain of", top, func() ([]string, error) {
-			return keptChainLayers(top)
-		})
-		if err != nil {
-			return fmt.Errorf("the create clears a file left by an earlier VM %s, and the backing chain of %s, a disk the delete of VM %s "+
-				"kept (%s), cannot be read (%v), so whether it backs on that file cannot be told; retry once it can be read, "+
-				"or place the VM on another host", name, top, r.VM, registry, err)
-		}
-		for i, l := range layers {
+	registry := filepath.Join(s.dataDir, diskKeptFile)
+	for _, c := range chains {
+		r := c.rec
+		for i, l := range c.layers {
 			if !present[l] || (notesGovern && noted[l] != "") {
 				continue
 			}
 			if i == 0 {
 				return refuse(l, fmt.Sprintf("is the disk %s the delete of VM %s kept (%s), as %s records", r.Disk, r.VM, r.Reason, registry))
 			}
-			return refuse(l, fmt.Sprintf("%s backs on, the disk %s the delete of VM %s kept (%s), as %s records", top, r.Disk, r.VM, r.Reason, registry))
+			return refuse(l, fmt.Sprintf("%s backs on, the disk %s the delete of VM %s kept (%s), as %s records", c.top, r.Disk, r.VM, r.Reason, registry))
 		}
 	}
 

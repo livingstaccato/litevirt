@@ -108,9 +108,10 @@ func (s *Server) noteKeptBackingFiles(ctx context.Context, name string, keepDisk
 // store, as a file a kept disk backs on, as `lv rm --keep-disks` notes them
 // (noteKeptDisks). With kept-disks.json alone naming the top of the chain, a
 // create of the name cleared the base under it and wrote its own disk there
-// (rc3 lab 2, F1). The tops are noted even when a chain cannot be read, and
-// that is the error returned: the caller then keeps the record, so the name
-// stays taken. Only a disk on this host's own storage is noted: a note is
+// (rc3 lab 2, F1). Every chain is read before anything is noted: one that
+// cannot be read is the error returned, with nothing noted, and the caller
+// then keeps the record, so the name stays taken and a retry that frees the
+// disks leaves no note behind. Only a disk on this host's own storage is noted: a note is
 // this host's, and a shared disk is no file a create here clears.
 func (s *Server) noteDeleteKeptDisks(ctx context.Context, name string, kept []KeptDisk) error {
 	if len(kept) == 0 {
@@ -139,9 +140,6 @@ func (s *Server) noteDeleteKeptDisks(ctx context.Context, name string, kept []Ke
 	if len(tops) == 0 {
 		return nil
 	}
-	if err := health.NoteKeptDisks(s.dataDir, name, tops); err != nil {
-		return err
-	}
 	imageDir := ""
 	if s.images != nil {
 		imageDir = filepath.Clean(s.images.ImageDir())
@@ -160,6 +158,9 @@ func (s *Server) noteDeleteKeptDisks(ctx context.Context, name string, kept []Ke
 			}
 			under = append(under, l)
 		}
+	}
+	if err := health.NoteKeptDisks(s.dataDir, name, tops); err != nil {
+		return err
 	}
 	return health.NoteKeptBackingFiles(s.dataDir, name, under)
 }
@@ -192,7 +193,7 @@ func (s *Server) clearDiskDebrisBeforeCreate(ctx context.Context, name string, n
 	// Nothing a delete kept, and nothing a file beside it backs on, is
 	// cleared: the kept-disk notes govern what they name (below), and this
 	// covers what they do not.
-	if err := s.keptFileCreateRefusal(name, unlink, true); err != nil {
+	if err := s.keptFileCreateRefusal(ctx, name, unlink, true); err != nil {
 		return nil, err
 	}
 	trusted := func() (bool, string) {

@@ -306,11 +306,23 @@ its whole backing chain, entries an earlier build recorded with no note among
 them) and the qcow2 headers of the `<vm>-*` files beside the path. Such a
 create is refused (`FailedPrecondition`), naming the file and why, with nothing
 moved or removed: move the kept files away yourself (then `qemu-img rebase -u
--b <new path> <overlay>`), or place the VM on another host. A `kept-disks.json`
-or a note that cannot be read refuses it too, naming the file. A disk only
+-b <new path> <overlay>`), or place the VM on another host. A VM created of the
+name afterwards lists the deleted VM's kept snapshot records as its own, and
+its `lv snapshot rm` or `lv rm` removes their overlays and memory images
+wherever they now are; a revert to one restores the deleted VM's guest. A
+`kept-disks.json` or a note that cannot be read refuses it too, naming the
+file, as does a kept disk's backing chain that cannot be read (a backing file
+that does not exist ends the chain and holds nothing); the refusal names the
+entry, and the way out is to fix that file, or, once nothing needs the disk,
+move it away or remove its entry from `<data_dir>/kept-disks.json`. A disk only
 `kept-disks.json` names, at the path the create writes, is refused rather than
 renamed. `lv import` refuses the same files at its disk's name, rather than
-moving them aside as an orphan.
+moving them aside as an orphan. Every other path that removes disk files on
+the host (a delete's or rebuild's disk cleanup, `lv iso rm <pool>/<file>`, a
+migration's or volume move's source cleanup) leaves a file a
+`kept-disks.json` entry names or reaches through its backing chain, as it
+leaves a file a note names, unless a VM's disk record still names that entry's
+file (a delete that failed keeps its record, and its retry frees it).
 
 **`--keep-disks` and snapshots.** `lv rm --keep-disks` of a VM that has
 snapshots is refused (`FailedPrecondition`, naming them) before anything is
@@ -351,7 +363,11 @@ kept disk, and every file its backing chain reaches (a snapshot's overlays and
 the base under them; not an image in the store) as a file it backs on, so a
 create of the name is refused while one is at the path it writes (above). A
 note it cannot read or write, or a chain it cannot read, refuses the delete
-with the record kept.
+with the record kept, and nothing noted. The way out: repair or remove the
+note the refusal names; fix the file or storage the chain cannot be read from,
+or, when a backing file is gone for good, move the kept disk's own file away
+by hand (a disk file that is missing keeps nothing); or wait until the host
+that did not answer does, and the delete then frees the disks.
 A disk-only snapshot's record goes even when its overlay files stay (kept
 with a disk recorded `delete_with_vm=false`, or because another VM backs on
 them): those files are then named by no snapshot.

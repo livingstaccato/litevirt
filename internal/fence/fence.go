@@ -228,36 +228,78 @@ func OverrideSSHBinaryForTest(path string) (restore func()) {
 	return func() { sshBinary = prev }
 }
 
-// knownHostsOption caches, per ssh binary, whether it accepts
-// KnownHostsCommand. Only a definite answer is cached.
-var knownHostsOption sync.Map
+// knownHostsProbeTimeout bounds the KnownHostsCommand probe. A var so a test
+// can shorten it.
+var knownHostsProbeTimeout = 5 * time.Second
+
+// knownHostsOption caches, per ssh binary path, whether the client there
+// accepts KnownHostsCommand, together with the identity of the file it was
+// asked of (sshClientID). Only a definite answer is cached, and only for that
+// file: an openssh-client upgraded in place is asked again, so a fence leaves
+// the option out no longer than the old client is there.
+var knownHostsOption sync.Map // path → knownHostsAnswer
+
+type knownHostsAnswer struct {
+	id        sshClientID
+	supported bool
+}
+
+// sshClientID identifies the file at an ssh binary's path. A package manager
+// renames a new file over the old one (a new inode); a hand copy rewrites it
+// (size and mtime).
+type sshClientID struct {
+	ino         uint64
+	size, mtime int64
+}
+
+func sshClientIdentity(path string) (sshClientID, bool) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return sshClientID{}, false
+	}
+	id := sshClientID{size: fi.Size(), mtime: fi.ModTime().UnixNano()}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		id.ino = uint64(st.Ino)
+	}
+	return id, true
+}
 
 // knownHostsCommandSupported reports whether bin accepts KnownHostsCommand,
 // which OpenSSH added in 8.5. It asks ssh itself (`ssh -G` parses the options
 // and connects nowhere) rather than reading a version string a vendor may
-// have patched. A client that rejects the option says so with "Bad
-// configuration option"; anything else, including a probe that could not run,
-// answers true, so the pin is never loosened on a guess — a client that cannot
-// run cannot fence either way.
+// have patched. A client that predates the option rejects it as a "Bad
+// configuration option" and exits 255; anything else, including a probe that
+// could not run or did not answer in time, answers true, so the pin is never
+// loosened on a guess — a client that cannot run cannot fence either way.
+// (OpenSSH's "Unsupported option" is a warning on an option it knows and was
+// built without, and exits 0: it never reaches the failure branch.)
 func knownHostsCommandSupported(ctx context.Context, bin string) bool {
 	if p, err := exec.LookPath(bin); err == nil {
 		bin = p
 	}
-	if v, ok := knownHostsOption.Load(bin); ok {
-		return v.(bool)
+	id, known := sshClientIdentity(bin)
+	if v, ok := knownHostsOption.Load(bin); ok && known && v.(knownHostsAnswer).id == id {
+		return v.(knownHostsAnswer).supported
 	}
-	pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	pctx, cancel := context.WithTimeout(ctx, knownHostsProbeTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(pctx, bin, "-G", "-F", "/dev/null",
-		"-o", "KnownHostsCommand=none", "litevirt-fence-probe").CombinedOutput()
-	if err == nil {
-		knownHostsOption.Store(bin, true)
-		return true
+	cmd := exec.CommandContext(pctx, bin, "-G", "-F", "/dev/null",
+		"-o", "KnownHostsCommand=none", "litevirt-fence-probe")
+	// Killed at the deadline, ssh may leave a child holding its output open
+	// (a wrapper script): stop waiting for that output soon after.
+	cmd.WaitDelay = time.Second
+	out, err := cmd.CombinedOutput()
+	answer := func(supported bool) bool {
+		if known {
+			knownHostsOption.Store(bin, knownHostsAnswer{id: id, supported: supported})
+		}
+		return supported
 	}
-	if l := strings.ToLower(string(out)); strings.Contains(l, "knownhostscommand") &&
-		(strings.Contains(l, "bad configuration option") || strings.Contains(l, "unsupported option")) {
-		knownHostsOption.Store(bin, false)
-		return false
+	if err == nil {
+		return answer(true)
+	}
+	if l := strings.ToLower(string(out)); strings.Contains(l, "knownhostscommand") && strings.Contains(l, "bad configuration option") {
+		return answer(false)
 	}
 	return true
 }

@@ -79,8 +79,15 @@ func (s *Server) authorizeMigrationTarget(ctx context.Context, vmName string) (*
 // roots so they can never touch e.g. {dataDir}/state.db just because it's under
 // the data dir.
 func (s *Server) withinDiskArtifactRoot(p string) bool {
-	if safename.Contains(filepath.Join(s.dataDir, "disks"), p) {
-		return true
+	_, ok := s.diskArtifactRootOf(p)
+	return ok
+}
+
+// diskArtifactRootOf is withinDiskArtifactRoot that also returns the root
+// directory p was found in.
+func (s *Server) diskArtifactRootOf(p string) (string, bool) {
+	if root := filepath.Join(s.dataDir, "disks"); safename.Contains(root, p) {
+		return root, true
 	}
 	s.storagePoolsMu.RLock()
 	pools := make(map[string]StoragePoolRef, len(s.storagePools))
@@ -93,10 +100,10 @@ func (s *Server) withinDiskArtifactRoot(p string) bool {
 			continue
 		}
 		if dir, derr := fileBasedPoolDir(s.dataDir, pr); derr == nil && safename.Contains(dir, p) {
-			return true
+			return dir, true
 		}
 	}
-	return false
+	return "", false
 }
 
 // migrationSourceHost is the host a migration of vm brings its disks from: the
@@ -2563,7 +2570,8 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 		// Only ever remove paths in a real disk-artifact root (disks dir or a
 		// file-backed pool dir) — never an arbitrary file under the data dir such
 		// as state.db.
-		if !s.withinMigrationDiskRoot(ctx, p, migrationSourceHost(vm)) {
+		root, rootOK := s.migrationRootOf(ctx, p, migrationSourceHost(vm))
+		if !rootOK {
 			slog.Warn("cleanup migration artifacts: refusing to remove path outside a disk-artifact root", "vm", req.VmName, "path", p)
 			continue
 		}
@@ -2576,7 +2584,8 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 				"vm", req.VmName, "path", p, "vm_lives_here", vmLivesHere)
 			continue
 		}
-		if err := os.Remove(s.hostDiskFile(p)); err != nil && !os.IsNotExist(err) {
+		// Through the directory held open beneath its root, never a link
+		if err := removeBeneath(s.hostDiskFile(root), root, p); err != nil {
 			slog.Warn("cleanup migration artifacts: remove disk stub", "vm", req.VmName, "path", p, "error", err)
 			continue
 		}

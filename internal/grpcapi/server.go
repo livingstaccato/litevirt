@@ -409,6 +409,9 @@ type Server struct {
 	coldDiskSyncHook  func(final bool)
 	// coldDiskPlacedHook runs after a receive places its disk (tests).
 	coldDiskPlacedHook func()
+	// coldDirOpenedHook runs after a receive holds its disk directory open and
+	// before it writes into it (tests).
+	coldDirOpenedHook func()
 	// pinFault fails pinning a file a create or clone made (pinMade), as an
 	// open refused by the fd limit or the file's mode would (tests).
 	pinFault func(path string) error

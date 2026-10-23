@@ -482,15 +482,17 @@ guest running for it to migrate:
 
 The path is the source's, and the target accepts it in its own disk directories
 and in a file-based pool directory the cluster records for the source host, but
-only when that directory, with symlinks resolved on the target, is inside the
-target's own `disks/`, `pools/` or `mounts/` areas under its data directory (a
-pool row of the target's own does not widen this: rows replicate without an
-origin check), and passes the check the target applies to its own pools: no
-storage-pool row is replicated state, so it never widens this rule beyond those
-areas. The file's
-those areas. The file's
-parent directory is held to the same rules once its links are resolved, and
-must stay inside that pool directory.
+only when that directory is inside the target's own `disks/`, `pools/` or
+`mounts/` areas under its data directory and passes the check the target applies
+to its own pools: no system directory, PKI directory, litevirt state or data
+directory. A pool row of the target's own does not widen this, because rows
+replicate without an origin check, and a storage-pool row of the source is
+replicated state too, so it never widens the rule beyond those areas. The disk's
+directory is opened once, beneath the root it was judged in, with no symlink
+followed, and the copy, its placement, the take-back and the cleanup all go
+through that open directory: a link planted below the root is refused, and one
+swapped in later is never followed. This holds for the target's own pools as
+well as for the source's.
 
 A VM promoted onto a witness is the usual case: the witness's `default` pool is
 `<data_dir>/pools/default`, which is inside the worker's `pools/` area, while the

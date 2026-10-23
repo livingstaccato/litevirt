@@ -2,11 +2,12 @@
 // make a cold-move target write into a place the target would never let a pool
 // use (the security review of the F1 fix, round 1).
 //
-// The target accepts a foreign pool directory only when it, with symlinks
-// resolved on the target, is inside the target's own disks/, pools/ or mounts/
-// areas (or the directory of a usable pool row of the target's own) AND passes
-// the check the target applies to its own pools (storage.CheckWriteRoot). The
-// file's parent is held to the same rules.
+// The target accepts a foreign pool directory only when it is inside the
+// target's own disks/, pools/ or mounts/ areas (no pool row of the target's is
+// consulted: a replicated row has no origin check) AND passes the check the
+// target applies to its own pools (storage.CheckWriteRoot). The disk's
+// directory is then opened beneath that area root with no link followed
+// (openPinnedDir), and everything is written through that descriptor.
 
 package fleet
 
@@ -43,11 +44,18 @@ func (fp *foreignPoolScenario) targetFile(p string) string {
 // pools-area-root row pin rules the F1 design added. Under 2bc0443c6 the rows
 // that sit inside the data dir were already refused.
 //
-// Mutations: drop the CheckWriteRoot of the pool directory or of the parent in
-// foreignPoolDirAcceptable - the system rows (and /proc) go red; drop the
-// resolved containment in the target's areas - the symlinked-pool-dir row and
-// the outside-the-areas row go red; drop the parent's containment in the
-// resolved pool directory - the symlinked-parent row goes red.
+// Mutations, as run:
+//   - drop the area containment in foreignPoolDirRoot (accept any directory
+//     that passes CheckWriteRoot, rooted at disks/): symlinked-pool-dir,
+//     symlinked-parent and outside-the-areas go red, as do the lab case and
+//     the forged-row tests (the system rows are refused by CheckWriteRoot too,
+//     so they stay green);
+//   - drop the CheckWriteRoot in foreignPoolDirRoot: only the-pools-area-root
+//     and the-mounts-area-root go red - the system, /proc and outside rows are
+//     refused by the area rule alone, so CheckWriteRoot is defence in depth for
+//     them;
+//   - make openBeneath follow links (no NOFOLLOW, no NO_SYMLINKS, no BENEATH):
+//     the symlinked-pool-dir and symlinked-parent rows go red.
 func TestFleet_ColdMigrationRefusesASourcePoolRowThatReachesOutsideTheTargetsPoolAreas(t *testing.T) {
 	type row struct {
 		name  string
@@ -103,6 +111,11 @@ func TestFleet_ColdMigrationRefusesASourcePoolRowThatReachesOutsideTheTargetsPoo
 		row{name: "the-pools-area-root",
 			pool: func(def, _ string) string { return filepath.Dir(def) },
 			disk: func(def, _ string) string { return filepath.Join(filepath.Dir(def), "x.qcow2") }},
+		row{name: "the-mounts-area-root",
+			pool: func(def, _ string) string { return filepath.Join(filepath.Dir(filepath.Dir(def)), "mounts") },
+			disk: func(def, _ string) string {
+				return filepath.Join(filepath.Dir(filepath.Dir(def)), "mounts", "x.qcow2")
+			}},
 		// An ordinary directory, not a system one, that the target has no pool
 		// of its own on.
 		row{name: "outside-the-areas-no-pool-of-its-own",

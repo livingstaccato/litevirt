@@ -63,6 +63,30 @@ func TestLoadClusterConfig_UnreadableConfigUsesTheUsersCLIBundle(t *testing.T) {
 	}
 }
 
+// With no endpoint file either, the defaults are taken and the output says
+// so, naming the file it could not read and what it used.
+//
+// Mutation: take the defaults without the notice: red.
+func TestLoadClusterConfig_UnreadableConfigSaysItTookTheDefaults(t *testing.T) {
+	p := unreadableDaemonConfig(t)
+	userConfig := filepath.Join(t.TempDir(), "user-config")
+	t.Setenv("LV_CONFIG_DIR", userConfig)
+	writeUserBundle(t, filepath.Join(userConfig, "pki"))
+	notices := captureNotices(t)
+
+	if _, err := LoadClusterConfig(); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{p, "defaults", "127.0.0.1:7443", filepath.Join(userConfig, "pki")} {
+		if !strings.Contains(notices.String(), want) {
+			t.Errorf("notice %q does not name %q", notices, want)
+		}
+	}
+	if strings.Contains(notices.String(), "LV_HOST not set") {
+		t.Errorf("notice still says LV_HOST not set: %q", notices)
+	}
+}
+
 // With no bundle, the error names the file that cannot be read and both ways
 // out, instead of claiming there is no config at all.
 //

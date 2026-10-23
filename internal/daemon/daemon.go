@@ -2404,6 +2404,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
+	d.publishEndpoint()
 
 	slog.Info("litevirtd starting",
 		"host", d.cfg.HostName,

@@ -2062,6 +2062,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			s.reconcileLocal(ctx)
 		}
 	} else {
+		// The disks as they are before the commit re-homes them: what the
+		// promotion leaves on the host the VM left (noteDisksLeftByPromote).
+		disksBefore, disksBeforeErr := corrosion.GetVMDisks(ctx, s.db, targetName)
 		// Phase 4: promotion commit is an ownership transition (fresh-read CAS + increment).
 		if witnessPromote {
 			// Stopped, so nothing publishes it running.
@@ -2088,6 +2091,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 		// The VM now runs on its replica target: replicate back to the host it left.
 		s.reverseReplicationAfterMove(ctx, "vm", targetName, "", vm.HostName, s.hostName)
+		if !automated { // the failover coordinator records its own promotions
+			s.noteDisksLeftByPromote(ctx, vm, disksBefore, disksBeforeErr)
+		}
 	}
 	// Row persisted (the durable record now exists) → drop the host-local promote marker;
 	// a future retry would see the re-homed row and not re-promote.

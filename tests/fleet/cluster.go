@@ -584,6 +584,18 @@ func New(t *testing.T, opts Options) *Cluster {
 	for _, n := range c.Nodes {
 		c.buildServer(n)
 	}
+	// A disk's recorded path names the same file on every host, and the fleet
+	// gives each node its own data directory, so a scenario that records a
+	// disk under one node's disks directory needs every node to count them
+	// all as disk places: the source of a cold move checks its own roots
+	// before it reads a file, as the target does before it writes one.
+	for _, n := range c.Nodes {
+		peerDisks := map[string]grpcapi.StoragePoolRef{}
+		for _, m := range c.Nodes {
+			peerDisks["fleet-disks-"+m.Name] = grpcapi.StoragePoolRef{Driver: "dir", Target: filepath.Join(c.tmpRoot, m.Name, "data", "disks")}
+		}
+		n.Server.SetStoragePoolsByName(peerDisks)
+	}
 
 	// Step 5 — independent replicas run the production push loop.
 	if opts.Joiners > 0 {

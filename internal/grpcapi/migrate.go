@@ -99,6 +99,15 @@ func (s *Server) withinDiskArtifactRoot(p string) bool {
 	return false
 }
 
+// migrationSourceHost is the host a migration of vm brings its disks from: the
+// host its row names, which does not change until the move is done.
+func migrationSourceHost(vm *corrosion.VMRecord) string {
+	if vm == nil {
+		return ""
+	}
+	return vm.HostName
+}
+
 // errLibvirtCallUnanswered is the answer of a libvirt call whose goroutine
 // ended without one: what waits on the call's result is never left waiting.
 var errLibvirtCallUnanswered = errors.New("the libvirt call ended without an answer")
@@ -2554,7 +2563,7 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 		// Only ever remove paths in a real disk-artifact root (disks dir or a
 		// file-backed pool dir) — never an arbitrary file under the data dir such
 		// as state.db.
-		if !s.withinDiskArtifactRoot(p) {
+		if !s.withinMigrationDiskRoot(ctx, p, migrationSourceHost(vm)) {
 			slog.Warn("cleanup migration artifacts: refusing to remove path outside a disk-artifact root", "vm", req.VmName, "path", p)
 			continue
 		}

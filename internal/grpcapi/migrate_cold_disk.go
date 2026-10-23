@@ -98,6 +98,12 @@ func (s *Server) copyColdDisksToTarget(ctx context.Context, targetHost, vmName s
 				"disk %q of VM %q (%s) is not in its domain definition on %s, so its format is unknown; "+
 					"repair the VM's disks before migrating it", d.DiskName, vmName, d.Path, s.hostName)
 		}
+		// The file is read here and removed after the commit: its recorded
+		// path must be one of this host's own disk places (coldSourcePathCheck).
+		if err := s.coldSourcePathCheck(d.Path); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"disk %q of VM %q: %v; nothing was copied or changed", d.DiskName, vmName, err)
+		}
 	}
 	for i, d := range toCopy {
 		// One connection per disk: each disk's stream is the only RPC on its
@@ -521,10 +527,21 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 				"make the disk and its record agree, then migrate again",
 			hdr.Path, vm.Name, hdr.SizeBytes, rec.SizeBytes, coldDiskSizeLimit(rec.SizeBytes))
 	}
-	if !s.withinDiskArtifactRoot(hdr.Path) {
+	if !s.withinMigrationDiskRoot(ctx, hdr.Path, vm.HostName) {
 		return status.Errorf(codes.InvalidArgument, "disk path %q is not in a disk-artifact root", hdr.Path)
 	}
 	dst := s.hostDiskFile(hdr.Path)
+	// A path accepted only as the source's own pool directory is written
+	// through its resolved parent, so a symlink below the pool directory is
+	// never followed to somewhere the check did not judge.
+	foreign := !s.withinDiskArtifactRoot(hdr.Path)
+	if foreign {
+		rd, rerr := resolveDeepest(filepath.Dir(dst))
+		if rerr != nil {
+			return status.Errorf(codes.Internal, "resolve the directory of %s: %v", hdr.Path, rerr)
+		}
+		dst = filepath.Join(rd, filepath.Base(dst))
+	}
 	if _, err := os.Lstat(dst); err == nil {
 		if !s.madeHere(ctx, &s.migrationStubs, vm.Name, hdr.Path) {
 			return status.Errorf(codes.FailedPrecondition,
@@ -548,6 +565,12 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 		spaceDir = nearestExistingDir(dir)
 	} else if err := diskmode.MkdirAll(dir); err != nil {
 		return status.Errorf(codes.Internal, "create disk dir %s: %v", filepath.Dir(hdr.Path), err)
+	} else if foreign {
+		// Made, still where it was resolved, and judged again against what is on
+		// disk now: nothing swapped a link in between the check and the write.
+		if again, rerr := resolveDeepest(dir); rerr != nil || again != dir || !s.withinMigrationDiskRoot(ctx, hdr.Path, vm.HostName) {
+			return status.Errorf(codes.FailedPrecondition, "disk dir %s changed while it was made; nothing was written", filepath.Dir(hdr.Path))
+		}
 	}
 	// The data the copy writes, not the file's apparent size: the receive
 	// writes only non-zero pages, so a sparse disk stays sparse. The figure is
@@ -727,6 +750,11 @@ func (s *Server) removeColdMigratedSourceDisks(ctx context.Context, vmName strin
 		if referenced, reason, _ := s.pathStillReferenced(ctx, d.Path, vmName, d.DiskName); referenced {
 			slog.Warn("cold migration: source disk still referenced — NOT deleting",
 				"vm", vmName, "path", d.Path, "referenced_by", reason)
+			continue
+		}
+		if err := s.coldSourcePathCheck(d.Path); err != nil {
+			slog.Warn("cold migration: the source copy of a migrated disk is outside this host's disk places — NOT deleting",
+				"vm", vmName, "path", d.Path, "error", err)
 			continue
 		}
 		if err := os.Remove(s.hostDiskFile(d.Path)); err != nil && !os.IsNotExist(err) {

@@ -46,7 +46,15 @@ func localNodeConfig(t *testing.T, pkiDir string) {
 }
 
 func TestConnect_ANonRootUserIsNeverGivenTheNodeIdentity(t *testing.T) {
-	nodePKI := setupTestPKI(t) // readable here: the test owns it
+	nodePKI := setupTestPKI(t)
+	// As on a node: the user cannot read host.key. The refusal must come
+	// before anything is read from the daemon's PKI directory, or this
+	// user is back to a load error and the chown advice.
+	hostKey := filepath.Join(nodePKI, "host.key")
+	if err := os.Chmod(hostKey, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(hostKey, 0o600) })
 	localNodeConfig(t, nodePKI)
 	t.Setenv("LV_CONFIG_DIR", t.TempDir()) // no CLI bundle
 	asUID(t, 1001)
@@ -62,6 +70,12 @@ func TestConnect_ANonRootUserIsNeverGivenTheNodeIdentity(t *testing.T) {
 		t.Fatalf("a non-root lv connected with the node identity in %s", nodePKI)
 	}
 	msg := err.Error()
+	if strings.Contains(msg, "load local TLS config") || strings.Contains(msg, "permission denied") {
+		t.Errorf("the daemon's PKI directory was read before the refusal: %s", msg)
+	}
+	if fi, serr := os.Stat(hostKey); serr != nil || fi.Mode().Perm() != 0 {
+		t.Errorf("host.key was changed: %v %v", fi, serr)
+	}
 	for _, want := range []string{"sudo", PKIDir(), "lv host init", "SUDO_USER"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("the refusal does not say %q: %s", want, msg)
@@ -130,6 +144,11 @@ func TestConnect_RootUsesTheDaemonPKI(t *testing.T) {
 // use: a non-root caller is refused before host.key is read.
 func TestConnectLocalRoot_RefusesANonRootUser(t *testing.T) {
 	nodePKI := setupTestPKI(t)
+	hostKey := filepath.Join(nodePKI, "host.key")
+	if err := os.Chmod(hostKey, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(hostKey, 0o600) })
 	asUID(t, 1001)
 	logs := captureSlog(t)
 	_, closer, err := ConnectLocalRoot(nodePKI, 7443)
@@ -137,7 +156,8 @@ func TestConnectLocalRoot_RefusesANonRootUser(t *testing.T) {
 		closer()
 		t.Fatal("a non-root caller got the local root channel")
 	}
-	if !strings.Contains(err.Error(), "sudo") || strings.Contains(err.Error(), "chown") {
+	if !strings.Contains(err.Error(), "sudo") || strings.Contains(err.Error(), "chown") ||
+		strings.Contains(err.Error(), "load this host's certificate") {
 		t.Errorf("refusal = %v, want it to say sudo and never chown", err)
 	}
 	if strings.Contains(logs.String(), "host.key") {

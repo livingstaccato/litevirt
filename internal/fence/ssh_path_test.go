@@ -126,3 +126,41 @@ func TestFenceSSH_RefusalDialsNothing(t *testing.T) {
 		t.Fatal("a refused fence ran ssh")
 	}
 }
+
+// TestFenceSSH_PinnedOnAClientWithoutKnownHostsCommand: OpenSSH before 8.5
+// (EL8's 8.0, Debian 11's 8.4) rejects KnownHostsCommand as an unknown option
+// and exits 255 before it dials. Passing it there failed every pinned fence:
+// a strict fence never fenced, a best-effort one reported success with the
+// host still running. Such a client has no KnownHostsCommand for root's config
+// to set, so the option is left out and the fence powers the host off.
+func TestFenceSSH_PinnedOnAClientWithoutKnownHostsCommand(t *testing.T) {
+	h := fakeSSH(t, fakeRemote{forceWorks: true, sysrqWritable: true, preKnownHostsCommand: true})
+	cfg := sshHost()
+	cfg.SSH = SSHFence{Path: SSHPathPinned, KnownHosts: []byte("a ssh-ed25519 AAAA\n"), HostKeyAlias: "a"}
+
+	r := Execute(fenceCtx(t), cfg)
+
+	if got := h.state(t); got != "off" {
+		t.Errorf("host state = %q after a pinned fence on a pre-8.5 client, want off; detail=%q", got, r.Detail)
+	}
+	if !r.Success {
+		t.Errorf("Success=false for a host that was powered off; detail=%q", r.Detail)
+	}
+}
+
+// TestSSHArgs_PinnedKeepsKnownHostsCommandWhereSupported: a client that
+// accepts the option still gets it, so root's config cannot add keys to the
+// pin.
+func TestSSHArgs_PinnedKeepsKnownHostsCommandWhereSupported(t *testing.T) {
+	fakeSSH(t, fakeRemote{forceWorks: true, sysrqWritable: true})
+	h := HostConfig{Name: "node-x", Address: "10.77.0.3", SSH: SSHFence{Path: SSHPathPinned,
+		KnownHosts: []byte("a ssh-ed25519 AAAA\n"), HostKeyAlias: "a"}}
+	_, args, cleanup, err := sshArgs(context.Background(), h, sshPowerOffCommand)
+	defer cleanup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o := opts(args); o["KnownHostsCommand"] != "none" || o["StrictHostKeyChecking"] != "yes" {
+		t.Fatalf("pinned args = %q", args)
+	}
+}

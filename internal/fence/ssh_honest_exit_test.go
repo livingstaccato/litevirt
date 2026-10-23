@@ -22,6 +22,9 @@ type fakeRemote struct {
 	// forcedCommand: the key is pinned to an authorized_keys command="..."
 	// that ignores what was asked for and exits 0.
 	forcedCommand bool
+	// preKnownHostsCommand: the client predates OpenSSH 8.5 and rejects
+	// KnownHostsCommand as an unknown option, before it dials anything.
+	preKnownHostsCommand bool
 }
 
 // remoteHost is a running fake host; its state file reads "running",
@@ -115,6 +118,14 @@ echo "poweroff: unexpected args: $*" >&2; exit 1
 	}
 	if r.forcedCommand {
 		preamble = `echo "backup-only key"; exit 0`
+	}
+	if r.preKnownHostsCommand {
+		preamble = `case "$*" in *KnownHostsCommand*)
+  echo "command-line line 0: Bad configuration option: knownhostscommand" >&2; exit 255 ;;
+esac
+case "$1" in -G) exit 0 ;; esac`
+	} else {
+		preamble += "\ncase \"$1\" in -G) exit 0 ;; esac"
 	}
 	sshScript := fmt.Sprintf(`#!/bin/sh
 %s

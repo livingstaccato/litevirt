@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -227,6 +228,40 @@ func OverrideSSHBinaryForTest(path string) (restore func()) {
 	return func() { sshBinary = prev }
 }
 
+// knownHostsOption caches, per ssh binary, whether it accepts
+// KnownHostsCommand. Only a definite answer is cached.
+var knownHostsOption sync.Map
+
+// knownHostsCommandSupported reports whether bin accepts KnownHostsCommand,
+// which OpenSSH added in 8.5. It asks ssh itself (`ssh -G` parses the options
+// and connects nowhere) rather than reading a version string a vendor may
+// have patched. A client that rejects the option says so with "Bad
+// configuration option"; anything else, including a probe that could not run,
+// answers true, so the pin is never loosened on a guess — a client that cannot
+// run cannot fence either way.
+func knownHostsCommandSupported(ctx context.Context, bin string) bool {
+	if p, err := exec.LookPath(bin); err == nil {
+		bin = p
+	}
+	if v, ok := knownHostsOption.Load(bin); ok {
+		return v.(bool)
+	}
+	pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(pctx, bin, "-G", "-F", "/dev/null",
+		"-o", "KnownHostsCommand=none", "litevirt-fence-probe").CombinedOutput()
+	if err == nil {
+		knownHostsOption.Store(bin, true)
+		return true
+	}
+	if l := strings.ToLower(string(out)); strings.Contains(l, "knownhostscommand") &&
+		(strings.Contains(l, "bad configuration option") || strings.Contains(l, "unsupported option")) {
+		knownHostsOption.Store(bin, false)
+		return false
+	}
+	return true
+}
+
 // sshArgs is the ssh argument list for h's path, ending with the target and
 // remote command, and a cleanup for the pinned known_hosts file it writes.
 func sshArgs(ctx context.Context, h HostConfig, remote string) (target string, args []string, cleanup func(), err error) {
@@ -305,19 +340,25 @@ func sshArgs(ctx context.Context, h HostConfig, remote string) (target string, a
 			"-o", "StrictHostKeyChecking=yes",
 			"-o", "UserKnownHostsFile=" + kh,
 			"-o", "GlobalKnownHostsFile=/dev/null",
-			// A KnownHostsCommand or an SSHFP lookup in root's config would add
-			// keys to the pin.
-			"-o", "KnownHostsCommand=none",
+		}
+		// A KnownHostsCommand or an SSHFP lookup in root's config would add
+		// keys to the pin. A client older than OpenSSH 8.5 has no
+		// KnownHostsCommand, so root's config cannot set one, and it rejects
+		// the option outright: passing it there fails every pinned fence.
+		if knownHostsCommandSupported(ctx, sshBinary) {
+			args = append(args, "-o", "KnownHostsCommand=none")
+		}
+		args = append(args,
 			"-o", "VerifyHostKeyDNS=no",
 			// A multiplexed session never checks a host key: a master
 			// connection root's config left open to the address (one that
 			// reached the wrong machine) would carry the fence past the pin.
 			"-o", "ControlMaster=no",
 			"-o", "ControlPath=none",
-			"-o", "HostKeyAlias=" + h.SSH.HostKeyAlias,
+			"-o", "HostKeyAlias="+h.SSH.HostKeyAlias,
 			"-o", "CheckHostIP=no",
 			"-o", "UpdateHostKeys=no",
-		}
+		)
 	default:
 		args = []string{"-o", "StrictHostKeyChecking=no"}
 	}

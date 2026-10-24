@@ -92,6 +92,12 @@ func AssertNoExternalData(path string) error {
 		return err
 	}
 	defer f.Close()
+	return AssertNoExternalDataFile(f)
+}
+
+// AssertNoExternalDataFile is AssertNoExternalData of the image read through
+// f, an open file the caller has judged.
+func AssertNoExternalDataFile(f io.ReaderAt) error {
 	head := make([]byte, 4096)
 	n, err := f.ReadAt(head, 0)
 	if err != nil && err != io.EOF {

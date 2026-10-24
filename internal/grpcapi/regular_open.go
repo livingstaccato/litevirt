@@ -40,3 +40,14 @@ func infoNoFollow(path string) (*qcow2.ImageInfo, error) {
 	defer f.Close()
 	return qcow2.InfoFile(f)
 }
+
+// byNameReadHook runs after a judgement before a flatten (precheckChain,
+// coldDiskSourceCheck, chainAllocated) has found a layer a regular file and
+// before its image is read (tests: swap a FIFO in at the name there).
+var byNameReadHook func(path string)
+
+func runByNameReadHook(path string) {
+	if byNameReadHook != nil {
+		byNameReadHook(path)
+	}
+}

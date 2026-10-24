@@ -385,7 +385,18 @@ func (s *Server) coldDiskSourceCheck(d corrosion.DiskRecord, format string) (*qc
 		// Copied as it is, whatever its bytes look like (see copyColdDisksToTarget).
 		return nil, nil
 	}
-	info, ierr := qcow2.Info(src)
+	// Read through a descriptor opened non-blocking with no link followed
+	// and found regular by fstat: a FIFO swapped in since the Lstat can
+	// neither block this nor be read.
+	info, ierr := func() (*qcow2.ImageInfo, error) {
+		f, _, err := openRegularNoFollow(src)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		runByNameReadHook(src)
+		return qcow2.InfoFile(f)
+	}()
 	if ierr != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "disk %s is qcow2 in its domain definition, but its image cannot be read: %v", d.Path, ierr)
 	}
@@ -871,7 +882,24 @@ func chainAllocated(path string) (uint64, error) {
 			return 0, err
 		}
 		total += a
-		info, err := qcow2.Info(path)
+		// The layer, resolved through symlinks, is read through a descriptor
+		// opened non-blocking with no link followed and found regular by
+		// fstat: a FIFO at the name, or swapped in since the stat, can neither
+		// block this nor be read. What is not a regular qcow2 ends the chain,
+		// as an unreadable image does.
+		info, err := func() (*qcow2.ImageInfo, error) {
+			r, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				return nil, err
+			}
+			f, _, err := openRegularNoFollow(r)
+			if err != nil {
+				return nil, err
+			}
+			defer f.Close()
+			runByNameReadHook(r)
+			return qcow2.InfoFile(f)
+		}()
 		if err != nil || info.BackingFile == "" {
 			return total, nil
 		}

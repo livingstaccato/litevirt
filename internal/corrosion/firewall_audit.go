@@ -215,15 +215,5 @@ func SecurityGroupAuditState(ctx context.Context, c *Client, id string) string {
 	if err != nil {
 		return AuditUnknown(err)
 	}
-	// Rules stored under the group's name go with it on delete (see
-	// DeleteSecurityGroupWithLegacyRules), so the record of what it allowed includes them.
-	// A project's group adopts none, and its delete leaves them.
-	if sg.Name != "" && sg.Name != id && sg.Project == "" {
-		legacy, lerr := ListSGRules(ctx, c, sg.Name)
-		if lerr != nil {
-			return AuditUnknown(lerr)
-		}
-		rules = append(rules, legacy...)
-	}
 	return sg.AuditText(rules)
 }

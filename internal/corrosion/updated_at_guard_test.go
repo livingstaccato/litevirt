@@ -100,13 +100,6 @@ func TestReplicatedUpdatedAtUsesNowTS(t *testing.T) {
 			if !writesReplicatedUpdatedAt(lits, replicated) {
 				continue
 			}
-			// applyV32DataFixes is a one-time legacy backfill that DELIBERATELY
-			// stamps updated_at from the row's historical created_at (not a fresh
-			// NowTS) so a migrated row doesn't spuriously win LWW against a later
-			// real write. Exempt by name.
-			if fn.Name.Name == "applyV32DataFixes" {
-				continue
-			}
 			// HistoricalShapes GENERATES prior-release SQL strings for the compatibility
 			// ledger — it never writes to the DB, so its embedded `updated_at = ?` is a bound
 			// placeholder the apply path fills, not a value this function stamps.

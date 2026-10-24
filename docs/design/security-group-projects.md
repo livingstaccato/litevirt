@@ -18,9 +18,7 @@ only; nothing is rewritten or dropped).
 - `project = 'P'` is owned by project P, which must exist; the group is stored
   under the project's own name. It is set at create and never changed.
 - A project that still owns a group is not deleted (`lv project rm` refuses).
-- A project's group has no stack (create refuses both together), and it never
-  adopts rules an older client stored under its name: it starts empty, and
-  deleting it leaves such rules alone.
+- A project's group has no stack (create refuses both together).
 - Group names stay unique cluster-wide, across projects. A NIC binds a group
   by name, so a name two groups hold is still held at drop (unchanged).
 

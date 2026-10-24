@@ -33,7 +33,7 @@ func TestValidateUserIncarnationEntry(t *testing.T) {
 			Guard: &MutationGuard{Protocol: workloadDeleteGuardV1, ResourceID: "carol"}}}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateReceivedMutationEntry(tc.stmts)
+			err := validateGuardedMutationEntry(tc.stmts)
 			if tc.ok && err != nil {
 				t.Fatalf("refused a well-formed entry: %v", err)
 			}

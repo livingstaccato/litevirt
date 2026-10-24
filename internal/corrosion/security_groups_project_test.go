@@ -140,22 +140,3 @@ func TestSecurityGroupsProjectColumn_ExistingRowsAreGlobal(t *testing.T) {
 		t.Fatalf("pre-existing group = %+v (%v), want global (project '')", got, err)
 	}
 }
-
-// The audit record of a project group's removal lists the rules it removes:
-// its own, never rules an older client stored under its name, which its
-// delete leaves alone.
-func TestSecurityGroupAuditState_AProjectGroupLeavesNameKeyedRulesOut(t *testing.T) {
-	ctx := context.Background()
-	db := sgProjectsDB(t)
-	if err := InsertSGRule(ctx, db, SGRule{ID: "legacy-r", SGID: "stranded",
-		Direction: "ingress", Proto: "tcp", PortRange: "23", Action: "accept"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := InsertProjectSecurityGroup(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureSGProjects),
-		SecurityGroup{ID: "sg-p", Name: "stranded", Project: "acme"}); err != nil {
-		t.Fatal(err)
-	}
-	if got := SecurityGroupAuditState(ctx, db, "sg-p"); strings.Contains(got, "23") {
-		t.Fatalf("the project group's audit state names a rule it does not own: %s", got)
-	}
-}

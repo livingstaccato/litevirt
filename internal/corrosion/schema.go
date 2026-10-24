@@ -184,9 +184,7 @@ import (
 //	         A code is valid only when its set_id == active_set_id.
 //	     Both pointers converge by ordinary updated_at LWW (no numeric/MAX
 //	     generation ordering, which per-node-monotonic NowTS would make unsafe).
-//	     Five ADD COLUMNs + two CREATE TABLEs; gap-1 from v31. InitSchema runs
-//	     idempotent post-migration data fixes (user_2fa NULL→'' label; legacy
-//	     2FA/recovery pointer backfill) via raw SQL, not replicated mutations.
+//	     Five ADD COLUMNs + two CREATE TABLEs; gap-1 from v31.
 //	v33: host_runtime_usage(host_name PK, disk_iops, net_mbps, updated_at,
 //	     deleted_at) — a per-host runtime-telemetry row the placement engine reads
 //	     to score the DiskIOPS/NetBW dimensions. Kept OUT of the full-state
@@ -358,11 +356,7 @@ import (
 //	     so every premise in this subsystem is machine-verified again. The
 //	     recovery lifecycle is specified in
 //	     docs/reviews/2026-09-08-trust-lifecycle-followup-scope.md and will
-//	     arrive under its own schema version. A database that ran those
-//	     prerelease commits is an UNSUPPORTED UPGRADE: this build refuses to
-//	     start on one rather than guessing at a migration, preserving the
-//	     evidence for a deliberate offline recovery — see
-//	     refusePrereleaseTrustDatabase in netbox_prerelease_boundary.go.
+//	     arrive under its own schema version.
 //	v52: leader-lease term ledger — leader_lease_terms, append-only with term in
 //	     the primary key, giving each lease acquisition a durable incarnation
 //	     number. leader_election is unchanged. Registered like audit_chain_heads
@@ -698,88 +692,6 @@ const acknowledgedTieVersionsDDL = `CREATE TABLE IF NOT EXISTS acknowledged_tie_
 	PRIMARY KEY (table_name, pk, version)
 )`
 
-// migrateAcknowledgedTiesPK widens an existing table's primary key to include
-// content_pair. SQLite cannot ALTER a primary key, so the table is rebuilt.
-//
-// This sits outside the migration ledger on purpose: acknowledged_ties is
-// local-only and is created before the ledger loads, so there is no replicated
-// statement shape and no schema version to carry. Every node fixes its own copy
-// on the next start.
-//
-// Copying cannot conflict. The old key admitted one row per (table_name, pk),
-// which is a strict subset of what the new key admits.
-//
-// The rebuild is ONE local transaction. It used to be four separate statements,
-// and a crash between them left a state the next start could not handle: after
-// the CREATE, the rerun's CREATE failed "already exists" and the daemon would
-// not start; after the DROP, InitSchema's CREATE IF NOT EXISTS made an empty
-// acknowledged_ties on the wide key, this function saw the wide key and
-// returned, and every acknowledgement stranded in acknowledged_ties_new was
-// lost. A database a previous build left in either state is recovered here:
-//
-//   - narrow key, leftover _new: the rebuild reuses _new (CREATE IF NOT EXISTS)
-//     and copies with INSERT OR IGNORE, since _new may already hold the rows;
-//   - wide key, leftover _new: the old table was dropped and recreated empty,
-//     so _new's rows are merged into it and _new is dropped.
-func (c *Client) migrateAcknowledgedTiesPK(ctx context.Context) error {
-	info, err := c.Query(ctx, `PRAGMA table_info(acknowledged_ties)`)
-	if err != nil {
-		return fmt.Errorf("inspect acknowledged_ties: %w", err)
-	}
-	if len(info) == 0 {
-		return nil // no such table; the DDL above will have created it
-	}
-	wide := false
-	for _, r := range info {
-		// A non-zero pk ordinal means the column is part of the primary key.
-		if r.String("name") == "content_pair" && r.Int("pk") > 0 {
-			wide = true
-		}
-	}
-	leftover, err := c.Query(ctx,
-		`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'acknowledged_ties_new'`)
-	if err != nil {
-		return fmt.Errorf("inspect acknowledged_ties_new: %w", err)
-	}
-	const cols = `table_name, pk, content_pair, acknowledged_at, acknowledged_by`
-	var stmts []Statement
-	switch {
-	case wide && len(leftover) == 0:
-		return nil
-	case wide:
-		stmts = []Statement{
-			{SQL: `INSERT OR IGNORE INTO acknowledged_ties (` + cols + `)
-			 SELECT ` + cols + ` FROM acknowledged_ties_new`},
-			{SQL: `DROP TABLE acknowledged_ties_new`},
-		}
-	default:
-		stmts = []Statement{
-			{SQL: `CREATE TABLE IF NOT EXISTS acknowledged_ties_new (
-				table_name      TEXT NOT NULL,
-				pk              TEXT NOT NULL,
-				content_pair    TEXT NOT NULL,
-				acknowledged_at TEXT NOT NULL,
-				acknowledged_by TEXT NOT NULL DEFAULT '',
-				PRIMARY KEY (table_name, pk, content_pair)
-			)`},
-			{SQL: `INSERT OR IGNORE INTO acknowledged_ties_new (` + cols + `)
-			 SELECT ` + cols + ` FROM acknowledged_ties`},
-			{SQL: `DROP TABLE acknowledged_ties`},
-			{SQL: `ALTER TABLE acknowledged_ties_new RENAME TO acknowledged_ties`},
-		}
-	}
-	if err := c.execBatchLocal(ctx, stmts); err != nil {
-		return fmt.Errorf("rebuild acknowledged_ties: %w", err)
-	}
-	if wide {
-		slog.Warn("acknowledged_ties: recovered acknowledgements stranded by an interrupted rebuild")
-		return nil
-	}
-	slog.Info("acknowledged_ties: primary key widened to include content_pair; " +
-		"several live divergences on one row can now each be acknowledged")
-	return nil
-}
-
 // InitSchema brings the local SQLite DB up to this binary's schema. DDL is not
 // broadcast — each node migrates its own DB on startup.
 //
@@ -800,16 +712,6 @@ func (c *Client) migrateAcknowledgedTiesPK(ctx context.Context) error {
 // gap from the old swallow-benign loop is healed rather than falsely claimed.
 func InitSchema(ctx context.Context, c *Client) error {
 	slog.Info("initializing schema")
-
-	// THE UNSUPPORTED-UPGRADE BOUNDARY, FIRST AND BEFORE ANY WRITE. A database
-	// that carries the prerelease permanent-loss trust schema cannot be migrated
-	// by this build — see netbox_prerelease_boundary.go for why an automatic
-	// answer is a guess. It refuses here, ahead of the DDL, the ledger and the
-	// data fixes, so the refusal is reached with the database untouched and its
-	// evidence intact for a deliberate offline recovery.
-	if err := refusePrereleaseTrustDatabase(ctx, c); err != nil {
-		return err
-	}
 
 	// Tables first (CREATE TABLE IF NOT EXISTS — genuinely idempotent, and it
 	// guarantees every table exists before the ledger's presence checks run).
@@ -845,9 +747,6 @@ func InitSchema(ctx context.Context, c *Client) error {
 	}
 	if err := c.execLocal(ctx, reseedGenerationDDL); err != nil {
 		return fmt.Errorf("create reseed_generation: %w", err)
-	}
-	if err := c.migrateAcknowledgedTiesPK(ctx); err != nil {
-		return err
 	}
 	if err := c.loadAcknowledgedTies(ctx); err != nil {
 		return fmt.Errorf("load acknowledged_ties: %w", err)
@@ -924,13 +823,6 @@ func InitSchema(ctx context.Context, c *Client) error {
 		healed++
 	}
 
-	// v32 post-migration data fixes (idempotent, LOCAL-only — schema-init data
-	// repair must not emit replication mutations). Runs after the ledger loop so
-	// the v32 columns + recovery_code_sets are guaranteed present.
-	if err := applyV32DataFixes(ctx, c, now); err != nil {
-		return fmt.Errorf("schema init: v32 data fixes: %w", err)
-	}
-
 	for _, idx := range schemaIndexes {
 		if err := c.execLocal(ctx, idx); err != nil {
 			slog.Warn("index creation failed (non-fatal)", "error", err)
@@ -945,60 +837,6 @@ func InitSchema(ctx context.Context, c *Client) error {
 	eff := c.RefreshDBSchemaVersion(ctx)
 	slog.Info("schema initialized",
 		"schema_version", eff, "ledger", len(schemaMigrationLedger), "upgraded", upgraded, "healed", healed)
-	return nil
-}
-
-// applyV32DataFixes runs the idempotent, LOCAL-only data repairs the v32
-// migration needs but that schemaMigrations (ADD COLUMN only) can't express:
-//
-//   - Normalize user_2fa.label NULL → ” so the composite PK never carries a NULL
-//     component — a NULL-label row and an ”-label row are distinct, which would
-//     let the sensitive merge duplicate a factor or skip a tombstone.
-//   - Backfill recovery-code sets: give every pre-v32 user an active-set pointer
-//     (active_set_id=”) and stamp legacy codes' LWW key (updated_at=created_at),
-//     so existing unused codes (set_id=”) keep validating until the next
-//     re-enroll mints a real set and supersedes them.
-//
-// Every statement is a no-op on a fresh or already-fixed DB, and the pointer
-// insert is INSERT-ONLY so a re-run never resets a user who has since re-enrolled
-// (their pointer already holds a real active_set_id). The column stays physically
-// nullable (additive-only — no ALTER COLUMN); normalized write paths keep it ”
-// going forward.
-func applyV32DataFixes(ctx context.Context, c *Client, now string) error {
-	type stmt struct {
-		sql    string
-		params []interface{}
-	}
-	for _, s := range []stmt{
-		{`UPDATE user_2fa SET label = '' WHERE label IS NULL`, nil},
-		// Pointer backfill. The pointer is born TOMBSTONED for a user whose account
-		// is already deleted (deleted_at inherited from the users row): a pre-v32
-		// DeleteUser did NOT cascade auth rows, so a deleted user can still hold
-		// live orphan factors/codes that a LIVE pointer would revive on reactivation.
-		// A user with no users row (external realm) inherits NULL -> a live pointer.
-		{`INSERT INTO user_2fa_sets (username, active_epoch, updated_at, deleted_at)
-		  SELECT f.username, '', COALESCE(MAX(f.updated_at), ?),
-		         (SELECT u.deleted_at FROM users u WHERE u.username = f.username)
-		  FROM user_2fa f GROUP BY f.username
-		  ON CONFLICT(username) DO NOTHING`, []interface{}{now}},
-		{`INSERT INTO recovery_code_sets (username, active_set_id, updated_at, deleted_at)
-		  SELECT r.username, '', COALESCE(MAX(r.created_at), ?),
-		         (SELECT u.deleted_at FROM users u WHERE u.username = r.username)
-		  FROM recovery_codes r GROUP BY r.username
-		  ON CONFLICT(username) DO NOTHING`, []interface{}{now}},
-		{`UPDATE recovery_codes SET updated_at = created_at WHERE updated_at = ''`, nil},
-		// Tombstone the orphan factor/code rows of already-deleted users (pre-v32
-		// delete left them live) so no live secret rows linger behind the tombstoned
-		// pointer. Idempotent: only touches still-live rows.
-		{`UPDATE user_2fa SET deleted_at = ?, updated_at = ?
-		  WHERE deleted_at IS NULL AND username IN (SELECT username FROM users WHERE deleted_at IS NOT NULL)`, []interface{}{now, now}},
-		{`UPDATE recovery_codes SET deleted_at = ?, updated_at = ?
-		  WHERE deleted_at IS NULL AND username IN (SELECT username FROM users WHERE deleted_at IS NOT NULL)`, []interface{}{now, now}},
-	} {
-		if err := c.execLocal(ctx, s.sql, s.params...); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -2808,9 +2646,8 @@ var schemaDDL = []string{
 		--
 		-- LAST, where its heal ALTER appends it. That ALTER exists precisely to
 		-- run on a real database — one created by an earlier v51 build, whose
-		-- table already exists so CREATE TABLE IF NOT EXISTS is a no-op — and
-		-- refusePrereleaseTrustDatabase does not refuse such a database, so it
-		-- boots and gets the column appended after deleted_at. netbox_bindings is
+		-- table already exists so CREATE TABLE IF NOT EXISTS is a no-op — so it
+		-- gets the column appended after deleted_at. netbox_bindings is
 		-- in sync.go's tableNames, so it is digested every anti-entropy tick, and
 		-- the v1 digest hashes SELECT * positionally: declaring this column 6th
 		-- while the ALTER appends it 12th made a freshly-created node and a healed

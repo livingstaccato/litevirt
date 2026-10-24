@@ -1766,11 +1766,6 @@ lv sg bind <vm> --network <name> --sg <name> [--sg <name>...]   # Bind SGs to a 
   # rule-add takes a group id or name. A name no group has is NotFound; a name
   # two groups hold is refused (use the id). rule-ls takes either too; for a
   # name two groups hold it lists every group's rules, labelled by group id.
-  # Rules an older client stored under a group's NAME are read as that group's
-  # own while the name is unique, and are removed with the group. While two
-  # groups share the name those rules apply to neither: `lv sg ls` and
-  # `lv sg rule-ls` warn, and the firewall reconciler logs it once per rule.
-  # Deleting either group removes them (the sg.rm audit row records them).
 
 lv firewall macros            # List the rule macros and their rows
 lv firewall show              # Render the live nft ruleset for this host

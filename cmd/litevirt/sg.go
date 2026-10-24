@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -184,7 +183,6 @@ func newSGListCmd() *cobra.Command {
 			for _, sg := range resp.GetGroups() {
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", sg.GetId(), sg.GetName(), sg.GetProject(), sg.GetStackName(), sg.GetCreatedAt())
 			}
-			warnUnattributedRules(cmd, resp)
 			return w.Flush()
 		},
 	}
@@ -261,39 +259,12 @@ func listSecurityGroupsLocal(ctx context.Context, req *pb.ListSecurityGroupsRequ
 	if err != nil {
 		return nil, err
 	}
-	all, err := corrosion.ListSecurityGroups(ctx, db, "")
-	if err != nil {
-		return nil, err
-	}
-	counts := map[string]int{}
-	for _, g := range all {
-		counts[g.Name]++
-	}
 	resp := &pb.ListSecurityGroupsResponse{}
-	var unattributed []corrosion.SGRule
 	toPb := func(r corrosion.SGRule) *pb.SecurityGroupRule {
 		action, logged := corrosion.SplitLoggedAction(r.Action)
 		return &pb.SecurityGroupRule{
 			Id: r.ID, SgId: r.SGID, Direction: r.Direction, Proto: r.Proto,
 			Port: r.PortRange, Cidr: r.CIDR, Action: action, Priority: int32(r.Priority), Log: logged,
-		}
-	}
-	if req.GetIncludeRules() {
-		// Rules stored under a name two groups share belong to neither (the
-		// daemon reports them the same way, with sg_id left as the bare name).
-		var shared []string
-		for name, n := range counts {
-			if n > 1 {
-				shared = append(shared, name)
-			}
-		}
-		sort.Strings(shared)
-		for _, name := range shared {
-			orphans, err := corrosion.ListSGRules(ctx, db, name)
-			if err != nil {
-				return nil, err
-			}
-			unattributed = append(unattributed, orphans...)
 		}
 	}
 	for _, g := range groups {
@@ -304,9 +275,7 @@ func listSecurityGroupsLocal(ctx context.Context, req *pb.ListSecurityGroupsRequ
 		if !req.GetIncludeRules() {
 			continue
 		}
-		// The same reader the daemon uses, so a rule an older client stored
-		// under the group's name shows here too.
-		rules, err := corrosion.ListSGRulesFor(ctx, db, g, counts[g.Name] == 1)
+		rules, err := corrosion.ListSGRules(ctx, db, g.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -314,26 +283,7 @@ func listSecurityGroupsLocal(ctx context.Context, req *pb.ListSecurityGroupsRequ
 			resp.Rules = append(resp.Rules, toPb(r))
 		}
 	}
-	for _, r := range unattributed {
-		resp.Rules = append(resp.Rules, toPb(r))
-	}
 	return resp, nil
-}
-
-// warnUnattributedRules says so when a listing carries rules whose sg_id names
-// no group: rules an older client stored under a group NAME that two groups
-// share. They are applied to neither.
-func warnUnattributedRules(cmd *cobra.Command, resp *pb.ListSecurityGroupsResponse) {
-	ids := map[string]bool{}
-	for _, g := range resp.GetGroups() {
-		ids[g.GetId()] = true
-	}
-	for _, r := range resp.GetRules() {
-		if !ids[r.GetSgId()] {
-			fmt.Fprintf(cmd.ErrOrStderr(), "warning: rule %s is keyed by %q, a name more than one security group holds; it is applied to none. "+
-				"Remove it with `lv sg rule-rm %s` and re-add it by group id (the groups holding the name are listed by `lv sg ls`).\n", r.GetId(), r.GetSgId(), r.GetId())
-		}
-	}
 }
 
 func newSGDeleteCmd() *cobra.Command {
@@ -458,7 +408,6 @@ func newSGRuleListCmd() *cobra.Command {
 						strconv.Itoa(int(r.GetPriority())))
 				}
 			}
-			warnUnattributedRules(cmd, resp)
 			return w.Flush()
 		},
 	}

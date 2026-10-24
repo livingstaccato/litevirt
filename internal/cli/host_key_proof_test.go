@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -197,10 +198,14 @@ func TestKeyProof_SignsADomainSeparatedChallenge(t *testing.T) {
 // A target with no `timeout` binary drops the remote bound, so a hung
 // openssl must still be ended by the client's own deadline. The proof
 // refuses (the connection is not trusted to answer a key read either); it
-// never waits forever.
+// never waits forever, and it leaves nothing running: the shell, the
+// command substitution's subshell, the hung openssl, base64 and tr are all
+// killed before it returns.
 //
-// Mutation: run the command with no client-side deadline — the challenge
-// blocks on the 30s sleep past the test's limit, red.
+// Mutations: run the command with no client-side deadline — the challenge
+// blocks on the 30s sleep past the test's limit, red. Give up at the
+// deadline without stopping the command (7f288a4bf) — the command runs in
+// the test's own process group and the hung openssl outlives the proof, red.
 func TestKeyProof_NoTimeoutBinaryStillBoundedByClientDeadline(t *testing.T) {
 	f := newAddFixture(t)
 	crt := parseCerts(f.before["host.crt"])[0]
@@ -218,9 +223,11 @@ func TestKeyProof_NoTimeoutBinaryStillBoundedByClientDeadline(t *testing.T) {
 	if _, err := exec.LookPath("timeout"); err == nil {
 		t.Fatal("the fake target must have no timeout")
 	}
-	stubOpenSSL(t, `exec sleep 30`)
+	marker := filepath.Join(t.TempDir(), "openssl.pid")
+	stubOpenSSL(t, `echo $$ > '`+marker+`'; exec sleep 30`)
 	old := keyProofDeadline
-	keyProofDeadline = 500 * time.Millisecond
+	// Headroom for a saturated host to start the stub before the deadline.
+	keyProofDeadline = 3 * time.Second
 	t.Cleanup(func() { keyProofDeadline = old })
 
 	start := time.Now()
@@ -231,15 +238,77 @@ func TestKeyProof_NoTimeoutBinaryStillBoundedByClientDeadline(t *testing.T) {
 		defer close(done)
 		proved, err = signedChallenge(f.target, "/etc/litevirt/pki/host.key", crt)
 	}()
+	// The hung openssl's pid and process group, read while it runs.
+	pid, pgid := 0, 0
+	for pid == 0 && time.Since(start) < 10*time.Second {
+		if b, rerr := os.ReadFile(marker); rerr == nil && strings.HasSuffix(string(b), "\n") {
+			if pid, rerr = strconv.Atoi(strings.TrimSpace(string(b))); rerr != nil {
+				t.Fatal(rerr)
+			}
+			if pgid, rerr = syscall.Getpgid(pid); rerr != nil {
+				t.Fatalf("the stub (pid %d) is already gone: %v", pid, rerr)
+			}
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	select {
 	case <-done:
-	case <-time.After(10 * time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatal("the proof was not bounded without a remote timeout")
 	}
 	if proved || err == nil || !strings.Contains(err.Error(), "deadline") {
 		t.Fatalf("proved %v, %v; want a refusal naming the deadline", proved, err)
 	}
-	if d := time.Since(start); d > 5*time.Second {
+	if d := time.Since(start); d > 12*time.Second {
 		t.Errorf("took %v", d)
+	}
+	if pid == 0 {
+		t.Fatal("the stub openssl never ran")
+	}
+	if pgid == syscall.Getpgrp() {
+		t.Fatalf("the challenge ran in the test's own process group (%d): it cannot be killed whole", pgid)
+	}
+	if live := liveProcesses(t, pgid, pid); len(live) > 0 {
+		t.Fatalf("after the proof returned, still running: %v", live)
+	}
+}
+
+// liveProcesses lists the processes, other than zombies, that are in process
+// group pgid or are pid, a moment after a kill (a killed process may need a
+// few milliseconds to exit). It reads /proc.
+func liveProcesses(t *testing.T, pgid, pid int) []string {
+	t.Helper()
+	if _, err := os.Stat("/proc/self/stat"); err != nil {
+		t.Skip("no /proc to read process groups from")
+	}
+	var live []string
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		live = live[:0]
+		dirs, _ := filepath.Glob("/proc/[0-9]*/stat")
+		for _, statPath := range dirs {
+			b, err := os.ReadFile(statPath)
+			if err != nil {
+				continue // exited meanwhile
+			}
+			s := string(b)
+			k := strings.LastIndexByte(s, ')')
+			if k < 0 {
+				continue
+			}
+			// After "pid (comm)": state, ppid, pgrp.
+			fs := strings.Fields(s[k+1:])
+			if len(fs) < 3 || fs[0] == "Z" {
+				continue
+			}
+			p, _ := strconv.Atoi(strings.Fields(s)[0])
+			g, _ := strconv.Atoi(fs[2])
+			if g == pgid || p == pid {
+				live = append(live, s[:k+1])
+			}
+		}
+		if len(live) == 0 || time.Now().After(deadline) {
+			return live
+		}
 	}
 }

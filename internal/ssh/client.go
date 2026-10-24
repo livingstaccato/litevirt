@@ -489,6 +489,77 @@ func (c *Client) RunOutput(cmd string) ([]byte, error) {
 	return session.Output(cmd)
 }
 
+// RunOutputContext is RunOutput, bounded by ctx: when ctx ends before the
+// command does, the command and every process it started on the remote are
+// killed, and ctx's error is returned with no output.
+//
+// Closing the session alone would not stop them: a command run without a PTY
+// is not signalled when its channel closes, so a hung child would run on
+// until it ended by itself. The command therefore runs in a session (and
+// process group) of its own under killOnStdinEOF, and the end of ctx is sent
+// as EOF on its stdin, which kills that group. The command reads /dev/null,
+// not the session's stdin.
+func (c *Client) RunOutputContext(ctx context.Context, cmd string) ([]byte, error) {
+	session, err := c.conn.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("SSH session: %w", err)
+	}
+	defer session.Close()
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("SSH session: %w", err)
+	}
+	var out bytes.Buffer
+	session.Stdout = &out
+	if err := session.Start(killOnStdinEOF(cmd)); err != nil {
+		return nil, err
+	}
+	done := make(chan error, 1)
+	go func() { done <- session.Wait() }()
+	select {
+	case err := <-done:
+		return out.Bytes(), err
+	case <-ctx.Done():
+	}
+	// EOF on stdin: the remote kills the command's group. Wait a little for
+	// it to report, so a machine that answers has stopped it before this
+	// returns; one that does not answer is not waited for.
+	_ = stdin.Close()
+	t := time.NewTimer(remoteKillGrace)
+	defer t.Stop()
+	select {
+	case <-done:
+	case <-t.C:
+	}
+	return nil, ctx.Err()
+}
+
+// remoteKillGrace is how long RunOutputContext waits, once its context has
+// ended, for the remote to report the killed command's exit.
+var remoteKillGrace = 2 * time.Second
+
+// killOnStdinEOF wraps cmd for RunOutputContext. A watcher reading the
+// session's stdin kills cmd's process group when stdin reaches EOF:
+//
+//   - with setsid, cmd runs in a session of its own, so its group's id is its
+//     pid, and that group is killed;
+//   - without it, cmd stays in the wrapper's group, and that whole group is
+//     killed (wrapper, watcher and cmd's tree): sshd makes the command it
+//     runs a session leader, so $$ names it. Where $$ leads no group (an
+//     unusual launcher), the kill finds none, and only cmd's shell is killed.
+//
+// The wrapper exits with cmd's status and stops the watcher first, so a
+// command that ended by itself is never followed by a kill. A background job
+// reads /dev/null unless told otherwise, so stdin reaches the watcher as fd 3.
+func killOnStdinEOF(cmd string) string {
+	q := ShellQuote(cmd)
+	return `exec 3<&0; ` +
+		`if command -v setsid >/dev/null 2>&1; then setsid sh -c ` + q + ` 3<&- </dev/null & p=$!; g=-$p; f=; ` +
+		`else sh -c ` + q + ` 3<&- </dev/null & p=$!; g=-$$; f=$p; fi; ` +
+		`{ cat <&3 >/dev/null; kill -s KILL -- $g 2>/dev/null || { [ -n "$f" ] && kill -s KILL $f; }; } >/dev/null 2>&1 & w=$!; ` +
+		`exec 3<&-; wait $p; rc=$?; kill $w 2>/dev/null; exit $rc`
+}
+
 // CopyFileMode copies a local file to the remote host with an explicit mode.
 //
 // The mode is explicit because a 0644 default was wrong for private keys, and

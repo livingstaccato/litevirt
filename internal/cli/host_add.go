@@ -16,7 +16,6 @@ import (
 	"math/big"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -30,6 +29,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/apimeta"
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/cmdbound"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -1372,6 +1372,12 @@ func (r *sshAddRemote) Unpath(path string) string { return path }
 
 func (r *sshAddRemote) Shell(_, cmd string) ([]byte, error) { return r.sc.RunOutput(cmd) }
 
+// ShellContext is Shell, with the command and every process it started on
+// the machine killed when ctx ends.
+func (r *sshAddRemote) ShellContext(ctx context.Context, _, cmd string) ([]byte, error) {
+	return r.sc.RunOutputContext(ctx, cmd)
+}
+
 // LocalAddTarget is addRemote over a directory tree this process can reach (a
 // test's): /etc/litevirt/pki maps to PKIDir and every other absolute path
 // under Root. The file commands run here under sh; the others are recorded,
@@ -1453,6 +1459,13 @@ func (d *LocalAddTarget) WriteFile(path string, data []byte, mode os.FileMode) e
 }
 
 func (d *LocalAddTarget) Shell(kind, cmd string) ([]byte, error) {
+	return d.ShellContext(context.Background(), kind, cmd)
+}
+
+// ShellContext is Shell, with the command run in a process group of its own
+// that is killed, whole, when ctx ends. A type embedding *LocalAddTarget
+// inherits it, so shellWithin calls it and not the embedder's Shell override.
+func (d *LocalAddTarget) ShellContext(ctx context.Context, kind, cmd string) ([]byte, error) {
 	d.Events = append(d.Events, "sh "+kind)
 	if kind == daemonProbeKind {
 		// Not the unit of the machine running the test.
@@ -1461,7 +1474,7 @@ func (d *LocalAddTarget) Shell(kind, cmd string) ([]byte, error) {
 		}
 		return []byte(d.DaemonState + "\n"), nil
 	}
-	out, err := exec.Command("sh", "-c", cmd).Output()
+	out, err := cmdbound.Output(ctx, cmdbound.Command(ctx, "sh", "-c", cmd))
 	if err != nil {
 		return out, fmt.Errorf("%s: %w", kind, err)
 	}

@@ -342,9 +342,7 @@ iptables):
 These decisions are made by network provisioning and the LB apply path and
 recorded per host in `host_fw_intent`; the reconciler reads that table and
 renders the chains. Because rules are per-host local state, the table is not
-replicated. On upgrade, once a bridge's rules are live in `litevirt-fw` the
-reconciler clears the pre-consolidation rules a prior binary left behind, so
-there is never a window without NAT or isolation.
+replicated.
 
 ## Stateful conntrack baked in
 

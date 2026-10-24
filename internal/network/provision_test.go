@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"net"
+	"strings"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/compose"
@@ -49,8 +50,7 @@ func TestProvision_Bridge(t *testing.T) {
 	if bridge != "lv-test-br99" {
 		t.Errorf("expected lv-test-br99, got %s", bridge)
 	}
-	// EnsureBridge creates and brings up the bridge (2 calls), then
-	// RemoveHostIsolation runs as convergent cleanup (2 calls: flush + delete).
+	// EnsureBridge creates and brings up the bridge (2 calls).
 	if len(calls) < 2 {
 		t.Fatalf("expected at least 2 exec commands, got %d: %v", len(calls), calls)
 	}
@@ -509,5 +509,32 @@ func TestProvision_IsolatedDHCPOffersNoRouter(t *testing.T) {
 				t.Errorf("Provision started DHCP with noRouter=%v, want %v", got[0], tc.want)
 			}
 		})
+	}
+}
+
+// TestRetireDevice_RunsNoPreConsolidationTeardown: NAT, SNAT and isolation live
+// only in `inet litevirt-fw` (rendered from host_fw_intent), so a teardown runs
+// no iptables command and touches no `inet litevirt` chain.
+func TestRetireDevice_RunsNoPreConsolidationTeardown(t *testing.T) {
+	var calls [][]string
+	execCommand = func(name string, args ...string) ([]byte, error) {
+		calls = append(calls, append([]string{name}, args...))
+		return nil, nil
+	}
+	defer func() { execCommand = defaultExec }()
+
+	for _, def := range []compose.NetworkDef{
+		{Type: "bridge", Interface: "lv-test-br98", Subnet: "10.98.0.0/24"},
+		{Type: "isolated", Subnet: "10.97.0.0/24"},
+	} {
+		if err := RetireDevice(context.Background(), nil, "test-net", def, "host1"); err != nil {
+			t.Fatalf("RetireDevice(%s): %v", def.Type, err)
+		}
+	}
+	for _, c := range calls {
+		joined := strings.Join(c, " ")
+		if c[0] == "iptables" || strings.Contains(joined, "inet litevirt ") {
+			t.Errorf("teardown ran a pre-consolidation rule removal: %s", joined)
+		}
 	}
 }

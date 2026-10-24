@@ -1858,10 +1858,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// kernel refuses the table or whose pass failed or ran out of time. Until
 	// every host enforces them, a guarded VM is placed only on such a host.
 	d.fwReconciler.SetPassHook(nicGuardLabelHook(d.db, d.cfg.HostName, d.cfg.Version))
-	// Upgrade migration: once the reconciler renders a bridge's NAT/isolation into
-	// litevirt-fw, clear the pre-consolidation out-of-band rules (old iptables
-	// masquerade + `inet litevirt` chains) a prior binary left for it.
-	d.fwReconciler.SetLegacyCleanup(network.RemoveLegacyBridgeFirewall)
 	svc.SetFirewallReconciler(d.fwReconciler)
 	// This build's units, before the first per-NIC table is loaded: the main
 	// unit's ExecStartPre removes that table when a build that does not own it

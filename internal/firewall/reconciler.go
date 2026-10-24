@@ -45,14 +45,6 @@ type Reconciler struct {
 	lastErr  error
 	lastTick time.Time
 
-	// legacyCleanup removes a bridge's pre-consolidation out-of-band rules (old
-	// iptables masquerade + the separate `inet litevirt` iso/snat chains) once the
-	// equivalent rules are live in litevirt-fw. Run per bridge exactly once
-	// (tracked in cleaned) AFTER a successful apply, so there is never a window
-	// without NAT/isolation during the upgrade migration. nil in tests.
-	legacyCleanup func(bridge, masqueradeSubnet string) error
-	cleaned       map[string]bool
-
 	state     AppliedState
 	stateHook func(context.Context, AppliedState)
 	passHook  func(context.Context, bool)
@@ -80,16 +72,7 @@ func NewReconciler(loader PlanLoader, applier *Applier, interval time.Duration) 
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}
-	return &Reconciler{loader: loader, applier: applier, interval: interval, cleaned: map[string]bool{}}
-}
-
-// SetLegacyCleanup registers the per-bridge migration hook that clears
-// pre-consolidation NAT/isolation rules a prior binary left behind. The daemon
-// wires network.RemoveLegacyBridgeFirewall; tests leave it unset.
-func (r *Reconciler) SetLegacyCleanup(fn func(bridge, masqueradeSubnet string) error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.legacyCleanup = fn
+	return &Reconciler{loader: loader, applier: applier, interval: interval}
 }
 
 // Start launches the reconciler in a goroutine. Calling Start while
@@ -170,9 +153,6 @@ func (r *Reconciler) Reconcile(ctx context.Context) (err error) {
 		slog.Info("firewall ruleset applied",
 			"rules", countRules(plan), "nics", len(plan.NICs))
 	}
-	// New NAT/isolation rules are now live in litevirt-fw (this apply, or an earlier
-	// one if unchanged) — safe to clear the old out-of-band rules for these bridges.
-	r.migrateLegacy(plan)
 	return err
 }
 
@@ -338,51 +318,6 @@ func (r *Reconciler) recordState(ctx context.Context, p Plan, applyErr error) {
 func (r *Reconciler) ReconcileForce(ctx context.Context) error {
 	r.applier.Reset()
 	return r.Reconcile(ctx)
-}
-
-// migrateLegacy removes, once per bridge, the pre-consolidation rules a prior
-// binary applied out-of-band. Keyed on bridges the just-applied plan now covers,
-// so a bridge's old rules are only removed after its new rules exist.
-func (r *Reconciler) migrateLegacy(p Plan) {
-	r.mu.Lock()
-	fn := r.legacyCleanup
-	r.mu.Unlock()
-	if fn == nil {
-		return
-	}
-	// bridge → masquerade subnet ("" when the bridge is isolation/SNAT-only).
-	masq := map[string]string{}
-	bridges := map[string]bool{}
-	for _, n := range p.NAT {
-		if n.SNATTo == "" && n.Bridge != "" { // masquerade rule
-			masq[n.Bridge] = n.Subnet
-			bridges[n.Bridge] = true
-		}
-	}
-	for _, iso := range p.HostIsolation {
-		if iso.Bridge != "" {
-			bridges[iso.Bridge] = true
-		}
-	}
-	for b := range bridges {
-		r.mu.Lock()
-		done := r.cleaned[b]
-		r.mu.Unlock()
-		if done {
-			continue
-		}
-		// Mark cleaned ONLY after the hook confirms the old rules are gone. A
-		// transient nft/iptables failure must not permanently strand old
-		// `inet litevirt` chains (which would lack the new LB exceptions) — leave
-		// the bridge unmarked so the next tick retries.
-		if err := fn(b, masq[b]); err != nil {
-			slog.Warn("firewall: legacy rule cleanup failed; will retry next tick", "bridge", b, "error", err)
-			continue
-		}
-		r.mu.Lock()
-		r.cleaned[b] = true
-		r.mu.Unlock()
-	}
 }
 
 func (r *Reconciler) loop(ctx context.Context) {

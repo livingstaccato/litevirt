@@ -417,10 +417,8 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 // It is the inverse of Provision: stops DHCP, removes bridges/VXLAN/IRB.
 // networkName is the logical network name (used for isolated bridge naming).
 //
-// It deletes this network's firewall intent (so the canonical reconciler drops
-// its litevirt-fw NAT/isolation chains on the next pass) AND directly removes the
-// legacy out-of-band rules — safe and immediate on teardown, where we want the
-// rules gone rather than kept in lockstep.
+// It deletes this network's firewall intent, so the canonical reconciler drops
+// its litevirt-fw NAT/isolation chains on the next pass.
 func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, def compose.NetworkDef, hostName string) error {
 	if db != nil {
 		_ = corrosion.DeleteHostFWIntent(ctx, db, hostName, fwScopeNet(networkName))
@@ -429,8 +427,7 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 }
 
 // RetireDevice tears down what def's device carries for networkName on this
-// host — its dnsmasq, gateway address, the legacy NAT, SNAT, isolation and
-// proxy-ARP rules of that device, its VLAN sub-interface, and the bridge when
+// host — its dnsmasq, gateway address, the proxy-ARP rules of that device, its VLAN sub-interface, and the bridge when
 // litevirt created it and nothing uses it — and nothing keyed by the network
 // itself: the network's firewall intent stays. It is the teardown of a device
 // a network has moved off, whose intent now describes the new device.
@@ -441,10 +438,8 @@ func RetireDevice(ctx context.Context, db *corrosion.Client, networkName string,
 		if bridge == "" {
 			return nil
 		}
-		RemoveHostIsolation(bridge) //nolint:errcheck
-		RemoveSNAT(bridge)          //nolint:errcheck
 		RemoveProxyARP(bridge)
-		// Stop DHCP and remove gateway IP + NAT if subnet was configured.
+		// Stop DHCP and remove the gateway IP if subnet was configured.
 		if def.Subnet != "" {
 			pidFile := dnsmasqPidFile(bridge)
 			stopDHCPAndForgetLeases(pidFile, bridge)
@@ -459,7 +454,6 @@ func RetireDevice(ctx context.Context, db *corrosion.Client, networkName string,
 			if gw, _, _, _, err := SubnetRange(def.Subnet); err == nil && gw != "" {
 				execCommand("ip", "addr", "del", gw, "dev", bridge) //nolint:errcheck
 			}
-			RemoveNAT(def.Subnet, bridge) //nolint:errcheck
 		}
 		// Remove VLAN sub-interface if we created one.
 		if def.VLAN > 0 {
@@ -477,12 +471,9 @@ func RetireDevice(ctx context.Context, db *corrosion.Client, networkName string,
 			return nil
 		}
 		bridge := vxlanBridgeName(vni)
-		RemoveHostIsolation(bridge) //nolint:errcheck
-		RemoveSNAT(bridge)          //nolint:errcheck
-		// Remove IRB gateway and NAT if subnet was set.
+		// Remove the IRB gateway if subnet was set.
 		if def.Subnet != "" {
-			RemoveIRB(vni, def.Subnet)    //nolint:errcheck
-			RemoveNAT(def.Subnet, bridge) //nolint:errcheck
+			RemoveIRB(vni, def.Subnet) //nolint:errcheck
 			pidFile := dnsmasqPidFileVNI(vni)
 			stopDHCPAndForgetLeases(pidFile, bridge)
 		}
@@ -490,8 +481,6 @@ func RetireDevice(ctx context.Context, db *corrosion.Client, networkName string,
 
 	case "isolated":
 		bridge := IsolatedBridgeName(networkName)
-		RemoveHostIsolation(bridge) //nolint:errcheck
-		RemoveSNAT(bridge)          //nolint:errcheck
 		// Stop DHCP if subnet was configured.
 		if def.Subnet != "" {
 			pidFile := dnsmasqPidFile(bridge)

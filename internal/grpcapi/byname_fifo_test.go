@@ -160,3 +160,36 @@ func TestChainAllocated_AFIFOAtABackingDoesNotHang(t *testing.T) {
 		t.Errorf("chainAllocated: %v", err)
 	}
 }
+
+// precheckQcow2Header (a start's protocol-backed overlay, a restore's output)
+// opens what it judges the way the flatten's judgements do: no link followed
+// at the file once resolved, non-blocking, regular by fstat. A FIFO at the
+// name is refused at once instead of hanging the call.
+// (Re-review of fix/migrate-followups, item 9.)
+// Mutation: open with os.Open again - red: the call blocks in the open.
+func TestPrecheckQcow2Header_AFIFODoesNotHang(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "restored.qcow2")
+	if err := syscall.Mkfifo(p, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := notHung(t, p, "precheckQcow2Header", func() error { return precheckQcow2Header(p) }); err == nil {
+		t.Fatal("precheckQcow2Header accepted a FIFO")
+	}
+}
+
+// A link to a regular image is still judged, as before: the name is resolved
+// first, and only the resolved file is opened without following.
+func TestPrecheckQcow2Header_ALinkToAnImageIsStillJudged(t *testing.T) {
+	dir := t.TempDir()
+	img := filepath.Join(dir, "real.qcow2")
+	if err := qcow2.Create(img, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.qcow2")
+	if err := os.Symlink(img, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := precheckQcow2Header(link); err != nil {
+		t.Fatalf("precheckQcow2Header of a link to an image: %v", err)
+	}
+}

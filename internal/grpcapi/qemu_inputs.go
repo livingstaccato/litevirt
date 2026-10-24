@@ -869,8 +869,17 @@ func withinAny(resolved string, roots []string) bool {
 // precheckQcow2Header judges one qcow2 header without following its backing
 // file: it parses as qcow2, keeps no data in an external file, and declares
 // its backing format at most once.
+//
+// The file is opened as precheckChain opens a layer: path resolved through
+// symlinks, then opened with no link followed, non-blocking, and kept only
+// when fstat shows a regular file (openRegularNoFollow). A FIFO at the name,
+// or swapped in after a caller's stat, is refused rather than waited on.
 func precheckQcow2Header(path string) error {
-	f, err := os.Open(path)
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return fmt.Errorf("%s is not a qcow2 image: %w", path, err)
+	}
+	f, _, err := openRegularNoFollow(resolved)
 	if err != nil {
 		return fmt.Errorf("%s is not a qcow2 image: %w", path, err)
 	}

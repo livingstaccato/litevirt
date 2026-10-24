@@ -71,6 +71,13 @@ func TestFleet_PoolTrust_AForgedRowIsNoDiskRootAcrossTheCluster(t *testing.T) {
 	if err := os.WriteFile(onHost(attacker, disk), payload, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// On node-0 the directory is a pool node-0 created: the source of a cold
+	// move reads a disk only from its own trusted disk roots
+	// (coldSourcePathCheck), so the refusal below is node-1's, not node-0's.
+	if err := attacker.Server.PoolTrust().Record("srv", pooltrust.BindingOf("dir", "", pwn, nil), pooltrust.HowCreate); err != nil {
+		t.Fatal(err)
+	}
+	attacker.Server.SetStoragePoolsByName(map[string]grpcapi.StoragePoolRef{"srv": {Driver: "dir", Target: pwn}})
 	spec, _ := json.Marshal(&pb.VMSpec{Name: "os1", Cpu: 1, MemoryMib: 256})
 	if err := corrosion.InsertVM(ctx, attacker.DB, corrosion.VMRecord{
 		Name: "os1", HostName: attacker.Name, State: "stopped", Spec: string(spec), CPUActual: 1, MemActual: 256,

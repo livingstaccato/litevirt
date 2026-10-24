@@ -244,7 +244,7 @@ func (s *Server) deleteVMSchedules(ctx context.Context, name string) {
 		return
 	}
 	for _, r := range rows {
-		if r.Scope != "vm" || r.VMName != name || r.PoolName != "" {
+		if r.Scope != "vm" || r.VMName != name {
 			continue
 		}
 		if err := s.deleteScheduleRow(ctx, r.VMName, r.Repo); err != nil {

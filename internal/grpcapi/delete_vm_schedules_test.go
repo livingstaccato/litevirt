@@ -31,6 +31,8 @@ func scheduledDeleteServer(t *testing.T) *Server {
 	for _, r := range []corrosion.BackupScheduleRecord{
 		{VMName: "vm1", Repo: "main", Cron: "0 4 * * *", Enabled: true},
 		{VMName: "vm1", Repo: "pool-b", Cron: "0 5 * * *", Enabled: true, Type: "replication", TargetPool: "pool-b"},
+		// CreateBackupSchedule stores a vm-scoped request's pool_name too.
+		{VMName: "vm1", Scope: "vm", PoolName: "fast", Repo: "nightly", Cron: "0 6 * * *", Enabled: true},
 		{VMName: "vm2", Repo: "main", Cron: "0 4 * * *", Enabled: true},
 		{VMName: "@cluster", Scope: "cluster", Repo: "main", Cron: "0 3 * * *", Enabled: true},
 	} {
@@ -61,7 +63,8 @@ func liveSchedules(t *testing.T, s *Server) string {
 // is left firing for a VM that is gone, nor holding a stack's backup repo
 // registered (lab 2, e2e-brepo-59201-1).
 //
-// Mutation: drop the schedule drop from DeleteVM — red.
+// Mutations: drop the schedule drop from DeleteVM — red; skip a vm-scoped
+// row that carries a pool_name — red (vm1/nightly is left).
 func TestDeleteVM_APlainDeleteTombstonesTheVMsSchedules(t *testing.T) {
 	s := scheduledDeleteServer(t)
 	if _, err := s.DeleteVM(adminCtx(), &pb.DeleteVMRequest{Name: "vm1", Force: true}); err != nil {
@@ -113,7 +116,7 @@ func TestDeleteVM_ARecreatesOrAForwardedDeleteKeepsTheSchedules(t *testing.T) {
 			if vm, _ := corrosion.GetVM(adminCtx(), s.db, "vm1"); vm != nil {
 				t.Fatal("premise: the delete did not happen")
 			}
-			if got, want := liveSchedules(t, s), "@cluster/main,vm1/main,vm1/pool-b,vm2/main"; got != want {
+			if got, want := liveSchedules(t, s), "@cluster/main,vm1/main,vm1/nightly,vm1/pool-b,vm2/main"; got != want {
 				t.Fatalf("the %s delete changed the schedules: %q, want %q", what, got, want)
 			}
 		})
@@ -127,7 +130,8 @@ func TestDeleteVM_ARecreatesOrAForwardedDeleteKeepsTheSchedules(t *testing.T) {
 // dormant, as does one of a VM with no row.
 //
 // Mutations: sweep without the grace — red; sweep on a non-holder — red;
-// drop the torn-down-stack clause — red ("plain" swept).
+// drop the torn-down-stack clause — red ("plain" swept); skip a vm-scoped
+// schedule that carries a pool_name — red (gone/nightly is left).
 func TestSweepScheduleOrphans(t *testing.T) {
 	setup := func(t *testing.T, holder string) *Server {
 		s, _, _, _ := sweepServer(t, holder)
@@ -145,6 +149,10 @@ func TestSweepScheduleOrphans(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
+		// A vm-scoped schedule with a pool_name is still gone's.
+		if err := corrosion.UpsertBackupSchedule(ctx, s.db, corrosion.BackupScheduleRecord{VMName: "gone", Scope: "vm", PoolName: "fast", Repo: "nightly", Cron: "0 4 * * *", Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
 		if err := corrosion.DeleteVM(ctx, s.db, "gone"); err != nil {
 			t.Fatal(err)
 		}
@@ -157,7 +165,7 @@ func TestSweepScheduleOrphans(t *testing.T) {
 		return s
 	}
 	ctx := context.Background()
-	all := "gone/main,plain/main,unborn/main"
+	all := "gone/main,gone/nightly,plain/main,unborn/main"
 
 	s := setup(t, "")
 	s.sweepScheduleOrphans(ctx, time.Now().Add(time.Hour))

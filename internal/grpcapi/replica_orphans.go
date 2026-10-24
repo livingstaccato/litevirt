@@ -74,13 +74,12 @@ func (s *Server) SweepReplicaOrphansForTest(ctx context.Context, now time.Time) 
 }
 
 // isFanOutSchedule reports whether a schedule row replicates every VM of a
-// pool, project or the cluster (a legacy pool row has scope vm and a pool).
+// pool, project or the cluster. Only the scope decides: a vm-scoped row's
+// pool_name is not a fan-out target.
 func isFanOutSchedule(r corrosion.BackupScheduleRecord) bool {
 	switch r.Scope {
 	case "pool", "project", "cluster":
 		return true
-	case "", "vm":
-		return r.PoolName != ""
 	}
 	return false
 }

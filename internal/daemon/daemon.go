@@ -2268,7 +2268,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// pool directory, and one on an NFS mount whose server does not answer
 	// blocked this start for good (lab 2 F-1; startup_bound.go).
 	startStorageSweeps(ctx, svc)
-	startLegacyImageProvenance(ctx, svc)
 
 	// Now that the gRPC server exists, wire it as the failover coordinator's
 	// replica promoter (auto_promote recovery) and start the coordinator.

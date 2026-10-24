@@ -338,23 +338,3 @@ func (s *Server) recordImageProvenance(ctx context.Context, name string) {
 		}
 	}
 }
-
-// RecordLegacyImageProvenance records, at daemon start, the provenance of
-// every image-store file an earlier build left without one.
-func (s *Server) RecordLegacyImageProvenance(ctx context.Context) {
-	// Listed under a bound: a store on a network filesystem whose server
-	// does not answer is left for the next start, not waited on.
-	files, err := s.storeFiles(s.imageStore())
-	if err != nil {
-		slog.Warn("image: provenance of the store's files not recorded: the store cannot be listed", "error", err)
-		return
-	}
-	for f, name := range files {
-		if _, ok := image.RecordedProvenance(f); ok {
-			continue
-		}
-		if _, err := s.imageFileProvenance(ctx, name, f); err != nil {
-			slog.Warn("image: recording a file's provenance failed", "image", name, "file", f, "error", err)
-		}
-	}
-}

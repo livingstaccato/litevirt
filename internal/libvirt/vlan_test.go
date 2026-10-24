@@ -90,41 +90,61 @@ func TestNegotiateTrunkVLANs_ConvergesAStaleTap(t *testing.T) {
 	}
 }
 
-func TestConfigureVLANTap_pvid_untagged(t *testing.T) {
-	const tapDev = "vnet1"
-
-	var recorded [][]string
-	orig := execVLAN
-	defer func() { execVLAN = orig }()
-	execVLAN = func(name string, args ...string) ([]byte, error) {
-		recorded = append(recorded, append([]string{name}, args...))
-		return nil, nil
-	}
-
-	if err := configureAccessBridgeVLAN(tapDev, 100); err != nil {
+// An access port on a VLAN-filtering bridge ends carrying only its VLAN, as
+// pvid, egress untagged. Lab 2 drill 6 found a fresh tap (the bridge gave it
+// VLAN 1 as pvid, untagged) left with "1 Egress Untagged" beside
+// "30 PVID Egress Untagged": the bridge's VLAN-1 floods reached the guest.
+// The VLAN is added before VLAN 1 is removed, so the port always has a pvid.
+//
+// Mutations: skip the removal — red; remove before adding — red.
+func TestConfigureAccessBridgeVLAN_TapCarriesOnlyItsVLAN(t *testing.T) {
+	// `bridge vlan show` as it reads after the add, on the drill's tap.
+	calls := fakeBridgeVLAN(t, "vnet1", "1 Egress Untagged", "30 PVID Egress Untagged")
+	if err := configureAccessBridgeVLAN("vnet1", 30); err != nil {
 		t.Fatalf("configureAccessBridgeVLAN: %v", err)
 	}
+	want := []string{
+		"bridge vlan add dev vnet1 vid 30 pvid untagged",
+		"bridge vlan del dev vnet1 vid 1",
+	}
+	if strings.Join(*calls, "|") != strings.Join(want, "|") {
+		t.Fatalf("calls = %q, want %q", *calls, want)
+	}
+}
 
-	if len(recorded) != 1 {
-		t.Fatalf("expected 1 bridge call, got %d", len(recorded))
+// Re-applying (a start, a live migration's target) converges a tap that still
+// has VLAN 1 or another VLAN, and leaves a converged one as it is.
+func TestConfigureAccessBridgeVLAN_ReapplyConverges(t *testing.T) {
+	calls := fakeBridgeVLAN(t, "vnet1", "1 Egress Untagged", "30 PVID Egress Untagged", "40")
+	if err := configureAccessBridgeVLAN("vnet1", 30); err != nil {
+		t.Fatalf("configureAccessBridgeVLAN: %v", err)
+	}
+	want := []string{
+		"bridge vlan add dev vnet1 vid 30 pvid untagged",
+		"bridge vlan del dev vnet1 vid 1",
+		"bridge vlan del dev vnet1 vid 40",
+	}
+	if strings.Join(*calls, "|") != strings.Join(want, "|") {
+		t.Fatalf("calls = %q, want %q", *calls, want)
 	}
 
-	call := recorded[0]
-	hasPVID := false
-	hasUntagged := false
-	for _, arg := range call {
-		if arg == "pvid" {
-			hasPVID = true
-		}
-		if arg == "untagged" {
-			hasUntagged = true
-		}
+	calls = fakeBridgeVLAN(t, "vnet1", "30 PVID Egress Untagged")
+	if err := configureAccessBridgeVLAN("vnet1", 30); err != nil {
+		t.Fatalf("configureAccessBridgeVLAN on a converged tap: %v", err)
 	}
-	if !hasPVID {
-		t.Errorf("access mode should have pvid flag; args: %v", call)
+	if want := []string{"bridge vlan add dev vnet1 vid 30 pvid untagged"}; strings.Join(*calls, "|") != strings.Join(want, "|") {
+		t.Fatalf("a converged tap: calls = %q, want %q", *calls, want)
 	}
-	if !hasUntagged {
-		t.Errorf("access mode should have untagged flag; args: %v", call)
+}
+
+// An access port on VLAN 1 keeps VLAN 1.
+func TestConfigureAccessBridgeVLAN_VLAN1KeepsIt(t *testing.T) {
+	calls := fakeBridgeVLAN(t, "vnet1", "1 PVID Egress Untagged")
+	if err := configureAccessBridgeVLAN("vnet1", 1); err != nil {
+		t.Fatalf("configureAccessBridgeVLAN: %v", err)
+	}
+	if want := []string{"bridge vlan add dev vnet1 vid 1 pvid untagged"}; strings.Join(*calls, "|") != strings.Join(want, "|") {
+		t.Fatalf("calls = %q, want %q", *calls, want)
 	}
 }
 

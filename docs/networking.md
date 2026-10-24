@@ -422,8 +422,11 @@ For VMs that need to handle multiple VLANs (e.g., virtual routers):
 ```
 
 A `trunk:` with a single VLAN makes the NIC an access port on that VLAN: its
-host tap gets the VLAN as pvid, untagged, and the guest sends and receives
-untagged frames. That needs a Linux bridge with VLAN filtering on (`ip link set
+host tap gets the VLAN as pvid, untagged, and carries no other VLAN (VLAN 1,
+which a new bridge port has as pvid, is removed from it), so the guest sends
+and receives untagged frames of that VLAN only. A trunk of two or more VLANs
+gets them tagged and keeps VLAN 1 as pvid, untagged: the guest's untagged
+frames are VLAN 1's. That needs a Linux bridge with VLAN filtering on (`ip link set
 dev <bridge> type bridge vlan_filtering 1`, and the VLAN on the bridge's
 uplink); a bridge with it off ignores the pvid and puts the NIC on its untagged
 segment. So a create, and every start of the VM (`lv start`, `lv restart`, a

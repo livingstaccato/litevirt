@@ -13,9 +13,9 @@ var execVLAN = func(name string, args ...string) ([]byte, error) {
 	return exec.Command(name, args...).CombinedOutput()
 }
 
-// ConfigureVLANTap finds the tap interface for a domain's network interface
-// and sets the VLAN tag using `bridge vlan add`.
-// bridge: Linux bridge name, mac: MAC of the VM interface, vlanID: VLAN tag (1–4094).
+// ConfigureVLANTap makes the tap of a domain's NIC (matched by MAC) an access
+// port on vlanID (1-4094): vlanID is its pvid, egress untagged, and the only
+// VLAN it carries (configureAccessBridgeVLAN).
 //
 // Method form so the call site can go through grpcapi.LibvirtBackend
 // (and the fleet's fake libvirt can stub it). The package-level alias
@@ -25,10 +25,6 @@ func (c *Client) ConfigureVLANTap(domainName, bridge, mac string, vlanID int) er
 	if err != nil {
 		return fmt.Errorf("find tap for %s/%s: %w", domainName, mac, err)
 	}
-
-	// bridge vlan add dev <tap> vid <vlan> pvid untagged
-	// pvid: ingress untagged frames get this VLAN
-	// untagged: egress frames are stripped of the tag (VM sees untagged traffic)
 	return configureAccessBridgeVLAN(tapDev, vlanID)
 }
 
@@ -48,13 +44,38 @@ func ConfigureVLANTap(c *Client, domainName, bridge, mac string, vlanID int) err
 	return c.ConfigureVLANTap(domainName, bridge, mac, vlanID)
 }
 
-// configureAccessBridgeVLAN applies a single access-mode VLAN (pvid+untagged) to a tap device.
-// This is the inner logic of ConfigureVLANTap, extracted so tests can call it without libvirt.
+// configureAccessBridgeVLAN converges tapDev to an access port on vlanID: it
+// adds vlanID as pvid, untagged (ingress untagged frames join it, egress
+// frames leave untagged), then removes every other VLAN the tap carries.
+//
+// The removal matters for VLAN 1. A new port of a VLAN-filtering bridge
+// carries VLAN 1 as pvid, untagged (the bridge's default_pvid); adding vlanID
+// as pvid moves only the pvid flag, so VLAN 1 stayed on the tap egress
+// untagged, and the bridge's VLAN-1 broadcasts and unknown unicast reached
+// the guest beside its own VLAN's. vlanID is added before anything is
+// removed, so the port is never without a pvid. Idempotent: a tap already
+// converged gets the add again (a no-op) and no removal, so it is re-applied
+// at every start and on a live migration's target.
+//
+// Extracted from ConfigureVLANTap so tests can call it without libvirt.
 func configureAccessBridgeVLAN(tapDev string, vlanID int) error {
 	out, err := execVLAN("bridge", "vlan", "add", "dev", tapDev,
 		"vid", fmt.Sprintf("%d", vlanID), "pvid", "untagged")
 	if err != nil {
 		return fmt.Errorf("bridge vlan add %s vid %d: %w: %s", tapDev, vlanID, err, out)
+	}
+	current, err := readTapVLANs(tapDev)
+	if err != nil {
+		return err
+	}
+	for _, v := range current {
+		if v == vlanID {
+			continue
+		}
+		out, err := execVLAN("bridge", "vlan", "del", "dev", tapDev, "vid", fmt.Sprintf("%d", v))
+		if err != nil {
+			return fmt.Errorf("bridge vlan del %s vid %d (access port on VLAN %d): %w: %s", tapDev, v, vlanID, err, out)
+		}
 	}
 	return nil
 }

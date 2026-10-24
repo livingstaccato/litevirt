@@ -621,7 +621,9 @@ func TestConfigureAccessBridgeVLAN_ExactArgs(t *testing.T) {
 
 	var capturedArgs []string
 	execVLAN = func(name string, args ...string) ([]byte, error) {
-		capturedArgs = append([]string{name}, args...)
+		if capturedArgs == nil {
+			capturedArgs = append([]string{name}, args...)
+		}
 		return nil, nil
 	}
 

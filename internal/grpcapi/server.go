@@ -717,6 +717,10 @@ type Server struct {
 	// network.EnsureBridge validation path.
 	bridgeEnsure func(name string) error
 
+	// netPreflight checks a VM's NICs' host wiring before it is defined or
+	// started (SetNetPreflight); nil = network.RunPreFlight.
+	netPreflight func([]network.PreFlightCheck) error
+
 	// bridgeExists is a test seam for "does this bridge already exist on this
 	// host". Production leaves it nil, preserving network.BridgeExists.
 	bridgeExists func(name string) bool
@@ -1829,6 +1833,9 @@ func (s *Server) SetNetBoxMirrorInventory(on bool) { s.enfNetBoxMirror.Store(on)
 // SetBridgeEnsure injects the host-bridge test seam (see bridgeEnsure): a
 // rootless harness cannot create a real bridge, so it substitutes a no-op.
 func (s *Server) SetBridgeEnsure(fn func(name string) error) { s.bridgeEnsure = fn }
+
+// SetNetPreflight replaces the NIC host-wiring preflight (see netPreflight).
+func (s *Server) SetNetPreflight(fn func([]network.PreFlightCheck) error) { s.netPreflight = fn }
 
 // SetDHCPReservationBackend injects the host-local DHCP facts an exact
 // reservation depends on (nic_identity.go): whether this host's dnsmasq

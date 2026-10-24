@@ -1216,6 +1216,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				return nil, status.Errorf(codes.FailedPrecondition,
 					"network bridge %q not found on host %s and auto-create failed: %v", bridge, s.hostName, err)
 			}
+			// An access-port NIC needs a bridge that filters VLANs, or it
+			// joins the bridge's untagged segment instead of its VLAN.
+			if err := s.nicPreflight([]network.PreFlightCheck{{Bridge: bridge, AccessVLAN: accessVLAN(n.Trunk)}}); err != nil {
+				claims.releaseAll(ctx)
+				cleanupDisks()
+				return nil, status.Errorf(codes.FailedPrecondition, "NIC %d of VM %q on %s: %v", i, spec.Name, s.hostName, err)
+			}
 			netConfigs = append(netConfigs, lv.NetworkConfig{
 				Bridge:   bridge,
 				Model:    n.Model,
@@ -2646,6 +2653,12 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 			return releasePreflight, status.Errorf(codes.Unavailable,
 				"start %q: a cutover of this VM is still being finished on this host (its runtime handoff is owed); retry once it completes", vm.Name)
 		}
+	}
+	// An access-port NIC (trunk: with one VLAN) needs a bridge here that
+	// filters VLANs, on every start path: the bridge may have changed since
+	// the create, or the VM may start on another host.
+	if err := s.accessVLANStartPreflight(ctx, vm); err != nil {
+		return releasePreflight, err
 	}
 
 	// qemu reopens the installer ISO at every start, so it is judged again
@@ -5157,6 +5170,35 @@ func (s *Server) reapplyVLANTaps(ctx context.Context, vm *corrosion.VMRecord) {
 			slog.Warn("VLAN tap reapply failed", "vm", vm.Name, "vlan", n.Trunk[0], "error", err)
 		}
 	}
+}
+
+// accessVLANStartPreflight refuses the start of a VM with an access-port NIC
+// (network[].trunk with one VLAN) whose bridge on this host does not filter
+// VLANs (network.RunPreFlight). A spec that cannot be read is not judged here.
+func (s *Server) accessVLANStartPreflight(ctx context.Context, vm *corrosion.VMRecord) error {
+	if vm.Spec == "" {
+		return nil
+	}
+	spec := &pb.VMSpec{}
+	if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
+		return nil
+	}
+	var checks []network.PreFlightCheck
+	for _, n := range spec.Network {
+		v := accessVLAN(n.GetTrunk())
+		if v == 0 {
+			continue
+		}
+		bridge := resolveBridge(ctx, s.db, n.GetName())
+		if bridge == "" || strings.HasPrefix(bridge, "direct:") {
+			continue
+		}
+		checks = append(checks, network.PreFlightCheck{Bridge: bridge, AccessVLAN: v})
+	}
+	if err := s.nicPreflight(checks); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "start %q on %s: %v", vm.Name, s.hostName, err)
+	}
+	return nil
 }
 
 // hooksDefined reports whether any lifecycle hook command is set. Defining one

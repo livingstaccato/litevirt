@@ -194,14 +194,11 @@ func SetAsideEvidence(disk string) bool { return setAsideEvidenceWith(glob, disk
 // vmUUID, or a binding that records none, is judged as SetAsideEvidence does.
 func SetAsideEvidenceFor(disk, vmUUID string) bool { return setAsideEvidenceWith(glob, disk, vmUUID) }
 
-// SetAsideEvidenceBounded is SetAsideEvidence under storage.Bounded: a disk
-// on a network filesystem whose server does not answer gets the
+// SetAsideEvidenceBoundedFor is SetAsideEvidenceFor under storage.Bounded: a
+// disk on a network filesystem whose server does not answer gets the
 // *storage.FSNoAnswerError (storage.IsFSNoAnswer), never false. The look
 // lists the disk's directory, which a hard NFS mount answers only from its
 // server, even where a stat of the disk is answered from the attribute cache.
-func SetAsideEvidenceBounded(disk string) (bool, error) { return SetAsideEvidenceBoundedFor(disk, "") }
-
-// SetAsideEvidenceBoundedFor is SetAsideEvidenceFor under storage.Bounded.
 func SetAsideEvidenceBoundedFor(disk, vmUUID string) (bool, error) {
 	g := glob // read here: the call below may outlive its caller
 	// The uuid is in the op: the bound merges concurrent calls on one op and

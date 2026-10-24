@@ -30,7 +30,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -288,17 +287,6 @@ func parseKeys(text, what string) ([]ssh.PublicKey, error) {
 // KeyLine is pub as "type base64", with no comment.
 func KeyLine(pub ssh.PublicKey) string {
 	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(pub)))
-}
-
-// KeyLines is pubs as sorted "type base64" lines joined by "\n": the canonical
-// text of a row's key columns.
-func KeyLines(pubs []ssh.PublicKey) string {
-	lines := make([]string, 0, len(pubs))
-	for _, p := range pubs {
-		lines = append(lines, KeyLine(p))
-	}
-	sort.Strings(lines)
-	return strings.Join(lines, "\n")
 }
 
 // HexName is a host name as the forced command and the pin alias carry it.

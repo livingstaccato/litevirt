@@ -306,3 +306,29 @@ func protoregistryFiles(t *testing.T, fd protoreflect.FileDescriptor) *protoregi
 	add(fd)
 	return files
 }
+
+// NB-R3: the target's access-VLAN judgement of a move reads the same row its
+// authorization does, so a move is never let through for want of one: an
+// unreadable row refuses, and a readable one with an access NIC on a bridge
+// here that does not filter VLANs is refused naming the VLAN.
+//
+// Mutation: skip accessVLANMoveRefusal in EnsureDisks — red.
+func TestEnsureDisks_JudgesTheAccessVLANOfTheRowItAuthorized(t *testing.T) {
+	s, _ := unfilteredNets(t)
+	ctx := adminCtx()
+	s.SetBridgeVLANFiltering(func(string) (bool, bool, error) { return true, false, nil })
+	s.SetBridgeExists(func(string) bool { return true })
+	insertTestVMWithSpec(t, ctx, s.db, "acc", "other-host", "running", seedSpecJSON(t, &pb.VMSpec{
+		Name: "acc", Network: []*pb.NetworkAttachment{{Name: "lan", Mac: "52:54:00:aa:07:01", Trunk: []int32{30}}}}))
+	if _, err := s.EnsureDisks(ctx, &pb.EnsureDisksRequest{VmName: "acc"}); status.Code(err) != codes.FailedPrecondition ||
+		!strings.Contains(err.Error(), "VLAN 30") {
+		t.Fatalf("EnsureDisks onto a non-filtering bridge: %v, want FailedPrecondition naming VLAN 30", err)
+	}
+	if _, err := s.db.DB().ExecContext(context.Background(), `ALTER TABLE vms RENAME TO vms_nbr3`); err != nil {
+		t.Fatal(err)
+	}
+	defer s.db.DB().ExecContext(context.Background(), `ALTER TABLE vms_nbr3 RENAME TO vms`) //nolint:errcheck
+	if _, err := s.EnsureDisks(ctx, &pb.EnsureDisksRequest{VmName: "acc"}); err == nil {
+		t.Fatal("EnsureDisks with the VM's row unreadable let the move through")
+	}
+}

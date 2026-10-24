@@ -518,8 +518,10 @@ var errKeptScanPoolsUnread = errors.New("this host's storage pools cannot be rea
 // host keeps VM disks in (keptScanDirs), each file a kept-disk note names,
 // each set-aside .kept- and .superseded- copy (health.ListKeptDisks,
 // health.ListSupersededDisks: also beside a disk at a path of its own), and
-// each kept-disks.json entry of this host still held in memory. The walk
-// follows no symlink below a directory it lists. It returns how the first
+// each kept-disks.json entry of this host still held in memory. A symlink
+// below a directory it lists is followed (keptScanFollow): a directory it
+// names is listed once, by its resolved path, and a file it names is read;
+// one that cannot be followed is an error. It returns how the first
 // file that is, or backs on, a path in writes (compared as
 // the missing-base check compares: each side with its directory resolved
 // through symlinks) collides, or "" when none does; a directory, a pool row
@@ -572,6 +574,22 @@ func (s *Server) keptCollisionScan(ctx context.Context, writes *keptWrites) (str
 				dirs = append(dirs, p)
 			case e.Type().IsRegular():
 				add(p)
+			case e.Type()&fs.ModeSymlink != 0:
+				// Followed to what it names, listed by that: a kept overlay
+				// below a symlinked directory is still on this host, and a
+				// link back to a directory listed already ends there. One
+				// naming nothing holds nothing; one that cannot be followed
+				// is an error, as a directory that cannot be listed is.
+				r, isDir, err := keptScanFollow(p)
+				switch {
+				case errors.Is(err, fs.ErrNotExist):
+				case err != nil:
+					return "", fmt.Errorf("the symlink %s on this host cannot be followed (%w)", p, err)
+				case isDir:
+					dirs = append(dirs, r)
+				case r != "":
+					add(r)
+				}
 			}
 		}
 	}
@@ -664,6 +682,35 @@ func (s *Server) keptCollisionScan(ctx context.Context, writes *keptWrites) (str
 		}
 	}
 	return "", nil
+}
+
+// keptScanFollow resolves the symlink p for keptCollisionScan, bounded: the
+// path it names with every symlink resolved, and whether that is a
+// directory; "" for something that is neither a directory nor a regular
+// file. A link naming nothing is fs.ErrNotExist.
+func keptScanFollow(p string) (string, bool, error) {
+	type followed struct {
+		path  string
+		isDir bool
+	}
+	f, err := storage.Bounded("follow the symlink", p, func() (followed, error) {
+		r, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			return followed{}, err
+		}
+		fi, err := os.Stat(r)
+		if err != nil {
+			return followed{}, err
+		}
+		switch {
+		case fi.IsDir():
+			return followed{r, true}, nil
+		case fi.Mode().IsRegular():
+			return followed{r, false}, nil
+		}
+		return followed{}, nil
+	})
+	return f.path, f.isDir, err
 }
 
 // keptScanDirs is every directory this host keeps VM disks in, for

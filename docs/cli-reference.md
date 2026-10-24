@@ -349,8 +349,9 @@ and failover rebuild of a missing overlay disk on that host is judged by the
 disk files there instead: it is
 refused when one of them (any file under `<data_dir>/disks`, the disk store's
 directory, `<data_dir>/pools`, `<data_dir>/mounts` or the directory of any
-file-based pool of the host, usable or not, a file a note or a held entry
-names, or a set-aside `.kept-` or `.superseded-` copy beside any local disk a disk row names) is, or backs on, a path it writes, compared as above with directories
+file-based pool of the host, usable or not, following any symlink below
+them, a file a note or a held entry names, or a set-aside `.kept-` or
+`.superseded-` copy beside any local disk a disk row names) is, or backs on, a path it writes, compared as above with directories
 resolved through symlinks, and refused whatever its name when
 one of them, or a directory of them, cannot be read. Any other goes ahead,
 with a warning in the daemon log naming the file. A create or clone with no

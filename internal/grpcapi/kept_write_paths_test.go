@@ -262,6 +262,9 @@ func TestMoveVolume_AKeptOverlayMissingItsBaseRefusesIt(t *testing.T) {
 	})
 	t.Run("an unreadable kept-disks.json holds a move into a local pool", func(t *testing.T) {
 		s, srcFile, dir := moveVolumeFixture(t)
+		// With kept-disks.json unreadable the disk files on this host decide
+		// (keptCollisionOnDisk): an overlay there backs on the move's copy.
+		overlayOn(t, filepath.Join(s.dataDir, "disks", "db-snap1.qcow2"), filepath.Join(dir, "vm1-root.qcow2"))
 		named := keptUnknown(t, s, "registry")
 		err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm1", DiskName: "root", TargetPool: "ssd"},
 			&streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()})
@@ -270,6 +273,17 @@ func TestMoveVolume_AKeptOverlayMissingItsBaseRefusesIt(t *testing.T) {
 		}
 		if ents, _ := os.ReadDir(dir); len(ents) != 0 || !exists(srcFile) {
 			t.Fatalf("a refused move wrote into the pool (%v) or lost its source", ents)
+		}
+	})
+	t.Run("an unreadable kept-disks.json with nothing on this host naming the copy goes ahead", func(t *testing.T) {
+		s, _, dir := moveVolumeFixture(t)
+		keptUnknown(t, s, "registry")
+		if err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm1", DiskName: "root", TargetPool: "ssd"},
+			&streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}); err != nil {
+			t.Fatalf("move while kept-disks.json cannot be read, with no file on this host naming the copy: %v", err)
+		}
+		if !exists(filepath.Join(dir, "vm1-root.qcow2")) {
+			t.Fatal("the move did not write its copy in the pool: this proves nothing")
 		}
 	})
 	t.Run("a destination no kept overlay names goes ahead", func(t *testing.T) {

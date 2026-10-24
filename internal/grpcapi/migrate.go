@@ -88,6 +88,18 @@ func (s *Server) diskArtifactRootOf(p string) (string, bool) {
 	if root := filepath.Join(s.dataDir, "disks"); safename.Contains(root, p) {
 		return root, true
 	}
+	for _, root := range s.filePoolRoots() {
+		if safename.Contains(root, p) {
+			return root, true
+		}
+	}
+	return "", false
+}
+
+// filePoolRoots is the directory of each usable file-based pool: with
+// <data_dir>/disks, where withinDiskArtifactRoot lets VM disk artifacts live.
+func (s *Server) filePoolRoots() []string {
+	var roots []string
 	s.storagePoolsMu.RLock()
 	pools := make(map[string]StoragePoolRef, len(s.storagePools))
 	for n, pr := range s.storagePools {
@@ -98,11 +110,11 @@ func (s *Server) diskArtifactRootOf(p string) (string, bool) {
 		if !isFileBasedDriver(pr.Driver) || !s.poolUsableForWrite(context.Background(), n, pr) {
 			continue
 		}
-		if dir, derr := fileBasedPoolDir(s.dataDir, pr); derr == nil && safename.Contains(dir, p) {
-			return dir, true
+		if dir, derr := fileBasedPoolDir(s.dataDir, pr); derr == nil {
+			roots = append(roots, dir)
 		}
 	}
-	return "", false
+	return roots
 }
 
 // migrationSourceHost is the host a migration of vm brings its disks from: the
@@ -1801,8 +1813,8 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 	}
 	// The stubs, which the mirror fills with the VM's disks, land at paths a
 	// delete's kept overlay on this host may name as its missing base: the
-	// kept-create check, before any is made. Kept state this host cannot
-	// read refuses too.
+	// kept-create check, before any is made. While kept state cannot be read,
+	// the disk files on this host decide, as for a create (keptCollisionOnDisk).
 	if len(req.Disks) > 0 {
 		paths := make([]string, 0, len(req.Disks))
 		for _, stub := range req.Disks {

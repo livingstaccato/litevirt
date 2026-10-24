@@ -20,7 +20,8 @@ import (
 // of an earlier VM of the name whose missing backing file is that very path;
 // the rebuilt disk would become its base, and the kept overlay a mix of two
 // VMs' data. The rebuild gets the kept-create check (grpcapi's
-// keptMissingBaseRefusal, kept state that cannot be read refusing too), and a
+// keptMissingBaseRefusal; while kept state cannot be read, the disk files on
+// the host decide, as for a create), and a
 // refusal fails the pending start as any failed rebuild does: a start with a
 // transfer proof is re-armed pending and retried (the coordinator may place
 // the VM elsewhere), and one without goes to error. It raises

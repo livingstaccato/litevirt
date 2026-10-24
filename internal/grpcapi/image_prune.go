@@ -1095,7 +1095,8 @@ func (s *Server) holdImage(name string) (release func()) {
 func (s *Server) RecreateOverlayDisk(vmName, diskName, imageName, size string) (string, error) {
 	// The rebuild writes <disks>/<vm>-<disk>.qcow2, which a delete's kept
 	// overlay on this host may name as its missing base: the kept-create
-	// check, kept state that cannot be read refusing too. The reconciler
+	// check (while kept state cannot be read, the disk files on this host
+	// decide, as for a create: keptCollisionOnDisk). The reconciler
 	// fails the start retryably and raises vm_disk_kept_base
 	// (health/kept_rebuild.go).
 	path := s.imageStore().DiskPath(vmName, diskName)

@@ -619,7 +619,8 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	// as its missing base, and would become that base: the kept-create check,
 	// in the check_only preflight (the move fails on the source before
 	// anything is copied) and again before a real receive writes anything.
-	// Kept state this host cannot read refuses too.
+	// While kept state cannot be read, the disk files on this host decide, as
+	// for a create (keptCollisionOnDisk).
 	if err := s.keptPathRefusal(ctx, fmt.Sprintf("the migration of VM %q onto this host", vm.Name),
 		keptWritesOf(true, shown)); err != nil {
 		return err

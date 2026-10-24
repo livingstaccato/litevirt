@@ -473,10 +473,11 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	// A clone's disk file is a new disk, as a create's is: one at the path a
 	// kept overlay names as its missing base would become that base. The
 	// same check as a create's, before a byte is written: refused when a
-	// kept overlay names one of these paths, or, unless every disk goes into
-	// a shared pool elsewhere, while kept-disks.json or a kept chain cannot
-	// be read. A clone with no file disk (ceph only) writes nothing a kept
-	// overlay can back on.
+	// kept overlay names one of these paths, and, unless every disk goes
+	// into a shared pool elsewhere, judged as a create is while
+	// kept-disks.json or a kept chain cannot be read (keptCollisionOnDisk).
+	// A clone with no file disk (ceph only) writes nothing a kept overlay
+	// can back on.
 	{
 		var planned []string
 		for _, d := range srcDisks {

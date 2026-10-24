@@ -14,6 +14,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
 // keptUnknown makes what kept overlays on s's host back on unknown: how is
@@ -41,8 +42,11 @@ func keptUnknown(t *testing.T, s *Server, how string) string {
 
 // While what a kept overlay backs on cannot be read, only a create that
 // writes a disk on this host's own storage can become its base: one with no
-// disk, or with every disk on shared storage, goes ahead. A create of a local
-// disk is still refused.
+// disk, or with every disk on shared storage, goes ahead, before the disk
+// files on this host are judged (keptCollisionOnDisk): with "chain" that
+// judgement could not complete, and would refuse. A create of a local disk
+// is still refused: with "chain" as the kept chain cannot be read by the scan
+// either, with "registry" as an overlay of another VM backs on its path.
 //
 // Mutation: treat every create as writing a local disk
 // (createWritesHostDisk returns true): the diskless and ceph subtests red.
@@ -65,6 +69,15 @@ func TestCreateVM_AnUnknownKeptChainHoldsOnlyCreatesThatWriteHere(t *testing.T) 
 		t.Run(how+"/a local disk", func(t *testing.T) {
 			f := newCephPoolFixture(t)
 			named := keptUnknown(t, f.s, how)
+			if how == "registry" {
+				ov := f.s.images.DiskPath("db", "snap1")
+				if err := os.MkdirAll(filepath.Dir(ov), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := qcow2.CreateWithBackingFormat(ov, f.s.images.DiskPath("web", "root"), "raw", 1<<20, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
 			req := cephCreateRequest("web", &pb.DiskSpec{Name: "data", Size: "1G", Storage: "ceph"}, &pb.DiskSpec{Name: "root", Size: "1M"})
 			_, err := f.s.CreateVM(adminCtx(), req)
 			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), named) {
@@ -79,7 +92,8 @@ func TestCreateVM_AnUnknownKeptChainHoldsOnlyCreatesThatWriteHere(t *testing.T) 
 //
 // Mutation: drop the keptRegistryChains check from judgeKeptDisks: the
 // chain subtest red (the registry one is named by record_unreadable too,
-// but not as refusing creates: red as well).
+// but not as refusing creates: red as well); drop the keptCollisionScan
+// error from it: the chain subtest red.
 func TestKeptDisks_AnUnknownKeptChainIsNamedInHealth(t *testing.T) {
 	for _, how := range []string{"registry", "chain"} {
 		t.Run(how, func(t *testing.T) {
@@ -97,6 +111,12 @@ func TestKeptDisks_AnUnknownKeptChainIsNamedInHealth(t *testing.T) {
 			refused, _ := e["creates_refused"].(string)
 			if !strings.Contains(refused, named) {
 				t.Fatalf("creates_refused = %q; want it to name %s", refused, named)
+			}
+			// With "chain" the disk files on this host cannot all be read
+			// either, and every local create is held; with "registry" they
+			// can, and only one that collides is.
+			if all := strings.Contains(refused, "whatever their names"); all != (how == "chain") {
+				t.Fatalf("creates_refused = %q; holds every local create: %v, want %v", refused, all, how == "chain")
 			}
 		})
 	}
@@ -149,14 +169,25 @@ func TestCreateVM_RefusesWhenItsDebrisCannotBeListed(t *testing.T) {
 	}
 }
 
-// Minor 6: an import refused because kept-disks.json cannot be read does not
-// suggest another --name, which meets the same refusal.
+// Minor 6: an import refused because kept-disks.json cannot be read, nor a
+// disk file on this host, does not suggest another --name, which meets the
+// same refusal.
 //
 // Mutation: append "import under another --name" again: red.
 func TestImportVM_AnUnreadableKeptRecordDoesNotSuggestAnotherName(t *testing.T) {
 	s := concurrentImportServer(t, 10*oneDiskNeed())
 	stubQemuImg(t)
 	named := keptUnknown(t, s, "registry")
+	bad := filepath.Join(s.dataDir, "disks", "db-root.qcow2")
+	if err := os.MkdirAll(filepath.Dir(bad), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := qcow2.Create(bad, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(bad, 16); err != nil { // the magic, and no header to read
+		t.Fatal(err)
+	}
 	err := s.ImportVM(&fakeImportStream{ctx: adminCtx(), frames: []*pb.ImportVMRequest{smallImportFrame(t, "imp", false)}})
 	if err == nil || !strings.Contains(err.Error(), named) {
 		t.Fatalf("import = %v; want a refusal naming %s", err, named)
@@ -173,7 +204,9 @@ func TestImportVM_AnUnreadableKeptRecordDoesNotSuggestAnotherName(t *testing.T) 
 // local disk after all: an nfs pool whose target is this host's disk
 // directory (as written, or through a symlink to it), and a create with an
 // image and no disks, whose default root disk is local. Each is still
-// refused while what kept overlays back on is unknown.
+// judged while what kept overlays back on is unknown: refused with "chain"
+// (the scan cannot read that chain either), and with "registry" when an
+// overlay on this host backs on its disk.
 //
 // Mutations: the nfs target clause never matches: the direct and symlink
 // subtests red. Compare targets by filepath.Clean alone: the symlink
@@ -190,6 +223,14 @@ func TestCreateVM_AnUnknownKeptChainStillHoldsCreatesThatOnlyLookShared(t *testi
 		}
 		s.addStoragePoolRef("share", ref)
 	}
+	// With kept-disks.json unreadable the disk files on this host decide: an
+	// overlay of another VM there backs on the create's root disk.
+	collide := func(t *testing.T, s *Server, how string) {
+		t.Helper()
+		if how == "registry" {
+			overlayOn(t, s.images.DiskPath("db", "snap1"), s.images.DiskPath("web", "root"))
+		}
+	}
 	refused := func(t *testing.T, s *Server, req *pb.CreateVMRequest, named string) {
 		t.Helper()
 		_, err := s.CreateVM(adminCtx(), req)
@@ -201,12 +242,14 @@ func TestCreateVM_AnUnknownKeptChainStillHoldsCreatesThatOnlyLookShared(t *testi
 		t.Run(how+"/nfs mounted at the disk directory", func(t *testing.T) {
 			s, _ := provableCreateServer(t)
 			named := keptUnknown(t, s, how)
+			collide(t, s, how)
 			nfsAt(t, s, s.images.DiskDir("web"))
 			refused(t, s, cephCreateRequest("web", &pb.DiskSpec{Name: "root", Size: "1M", Storage: "share"}), named)
 		})
 		t.Run(how+"/nfs mounted at a symlink to the disk directory", func(t *testing.T) {
 			s, _ := provableCreateServer(t)
 			named := keptUnknown(t, s, how)
+			collide(t, s, how)
 			link := filepath.Join(t.TempDir(), "share")
 			if err := os.Symlink(s.images.DiskDir("web"), link); err != nil {
 				t.Fatal(err)
@@ -217,6 +260,7 @@ func TestCreateVM_AnUnknownKeptChainStillHoldsCreatesThatOnlyLookShared(t *testi
 		t.Run(how+"/an image and no disks", func(t *testing.T) {
 			s, _ := provableCreateServer(t)
 			named := keptUnknown(t, s, how)
+			collide(t, s, how)
 			img := s.images.ImagePath("base")
 			if err := os.MkdirAll(filepath.Dir(img), 0o755); err != nil {
 				t.Fatal(err)

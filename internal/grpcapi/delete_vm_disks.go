@@ -63,7 +63,7 @@ type diskDecision func(d *corrosion.DiskRecord) (free bool, why, host string)
 // pool (in use: named, as before), the disks it kept on purpose for the
 // caller to name (decide said no, or whether another VM uses one cannot be
 // told), and every disk it set out to free that it did not (a failed
-// removal, or a file still there afterwards).
+// removal, a file still there afterwards, or one a kept disk holds).
 func (s *Server) freeRecordedVMDisks(ctx context.Context, vmName string, decide diskDecision) ([]KeptCephImage, []KeptDisk, []diskLeftover) {
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vmName)
 	if err != nil {
@@ -131,7 +131,11 @@ func (s *Server) freeRecordedVMDisks(ctx context.Context, vmName string, decide 
 			continue
 		}
 		file := s.hostDiskFile(d.Path)
-		if err := errs[i]; err != nil {
+		if err := errs[i]; isDiskHeld(err) {
+			// Never removed: the hold, not a removal, is why it is there.
+			leftovers = append(leftovers, diskLeftover{disk: d.DiskName, path: d.Path, target: file, named: d.Path, err: err})
+			continue
+		} else if err != nil {
 			if !cephNamed[d.DiskName] {
 				named := d.Path
 				if s.diskDriverName(d) == "btrfs" {
@@ -271,7 +275,11 @@ func (s *Server) leftoversKept(leftovers []diskLeftover) []KeptDisk {
 		if path == "" {
 			path = l.path
 		}
-		out = append(out, KeptDisk{Path: path, Disk: l.disk, Host: s.hostName, Reason: "its removal failed: " + l.err.Error()})
+		why := "its removal failed: " + l.err.Error()
+		if isDiskHeld(l.err) {
+			why = "it is " + l.err.Error()
+		}
+		out = append(out, KeptDisk{Path: path, Disk: l.disk, Host: s.hostName, Reason: why})
 	}
 	return out
 }

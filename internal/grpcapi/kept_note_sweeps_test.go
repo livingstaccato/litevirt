@@ -90,8 +90,8 @@ func TestKeptNote_OtherRemovalsKeepItsFiles(t *testing.T) {
 	t.Run("recorded location", func(t *testing.T) {
 		s, root, _, _ := keptNoteFixture(t)
 		d := &corrosion.DiskRecord{VMName: "web", DiskName: "root", HostName: s.hostName, Path: root, StorageType: "local"}
-		if err := s.deleteDiskAtRecordedLocation(adminCtx(), d); err != nil {
-			t.Fatalf("deleteDiskAtRecordedLocation: %v", err)
+		if err := s.deleteDiskAtRecordedLocation(adminCtx(), d); !isDiskHeld(err) {
+			t.Fatalf("deleteDiskAtRecordedLocation = %v, want the hold", err)
 		}
 		mustExist(t, "the noted kept disk", root)
 	})

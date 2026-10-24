@@ -118,8 +118,8 @@ func TestKeptRegistry_RemovalsKeepWhatItHolds(t *testing.T) {
 		s, base, was := debrisFixture(t)
 		top := registryKeep(t, s, "web", base)
 		d := &corrosion.DiskRecord{VMName: "web2", DiskName: "root", HostName: s.hostName, Path: base, StorageType: "local"}
-		if err := s.deleteDiskAtRecordedLocation(adminCtx(), d); err != nil {
-			t.Fatalf("deleteDiskAtRecordedLocation: %v", err)
+		if err := s.deleteDiskAtRecordedLocation(adminCtx(), d); !isDiskHeld(err) {
+			t.Fatalf("deleteDiskAtRecordedLocation = %v, want the hold", err)
 		}
 		sameBytes(t, "the base a kept disk backs on", base, was)
 		if !exists(top) {

@@ -747,7 +747,8 @@ func (s *Server) deleteRecordedVMDiskVolumeRecordsKept(
 			continue
 		}
 		del := func() {
-			if err := s.deleteDiskAtRecordedLocation(ctx, d); err != nil {
+			// A disk a kept disk holds is left, and reported, not a failure.
+			if err := s.deleteDiskAtRecordedLocation(ctx, d); err != nil && !isDiskHeld(err) {
 				slog.Warn("delete: free disk volume",
 					"vm", vmName, "disk", d.DiskName, "path", d.Path,
 					"storage_type", d.StorageType, "pool", poolLabel(d.StorageVolume), "error", err)
@@ -785,7 +786,7 @@ func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.
 	if !strings.HasPrefix(d.Path, "rbd:") {
 		if held, why := s.keptHolds(ctx, d.Path); held {
 			s.reportKeptNoteHold(ctx, d.VMName, "the delete of disk "+d.DiskName, d.Path, why)
-			return nil
+			return diskHeldError{why: why}
 		}
 	}
 	drv, err := s.diskDriver(ctx, d)
@@ -808,6 +809,20 @@ func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.
 		s.ClearPITOverlayHold(ctx, d.VMName, d.DiskName)
 	}
 	return nil
+}
+
+// diskHeldError is deleteDiskAtRecordedLocation's answer for a disk file it
+// left because a kept disk holds it (keptHolds): nothing was removed, and why
+// says what holds it.
+type diskHeldError struct{ why string }
+
+func (e diskHeldError) Error() string { return "held and not removed: " + e.why }
+
+// isDiskHeld reports whether err is a diskHeldError: a disk left on purpose,
+// not a removal that failed.
+func isDiskHeld(err error) bool {
+	var h diskHeldError
+	return errors.As(err, &h)
 }
 
 // diskDriver is the storage driver that serves a disk at its recorded
@@ -1060,7 +1075,8 @@ func (s *Server) deleteCapturedVMDiskVolumes(ctx context.Context, disks []corros
 		if s.diskPathReferencedByAnyLiveVM(ctx, d) {
 			continue
 		}
-		if err := s.deleteDiskAtRecordedLocation(ctx, d); err != nil {
+		// A disk a kept disk holds is left, and reported, not a failure.
+		if err := s.deleteDiskAtRecordedLocation(ctx, d); err != nil && !isDiskHeld(err) {
 			slog.Warn("cutover cleanup: free volume",
 				"disk", d.DiskName, "path", d.Path, "storage_type", d.StorageType,
 				"pool", poolLabel(d.StorageVolume), "error", err)

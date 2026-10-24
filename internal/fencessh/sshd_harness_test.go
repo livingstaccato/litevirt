@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -33,9 +34,10 @@ import (
 // instead of performing one. Every assertion about what sshd accepts or
 // refuses is made against real OpenSSH semantics.
 //
-// It needs sshd on the machine. Without one it skips, saying why, unless
-// LITEVIRT_REQUIRE_SSHD=1, under which it fails: a run that must prove these
-// properties cannot pass by skipping them.
+// It needs sshd and ssh on the machine. Without them it skips, saying why,
+// unless LITEVIRT_REQUIRE_SSHD=1, under which it fails: a run that must prove
+// these properties cannot pass by skipping them. With them, an sshd that
+// exits or does not listen always fails.
 
 type world struct {
 	t    *testing.T
@@ -68,6 +70,8 @@ type node struct {
 	skipRendered bool
 	fenceKy      ssh.PublicKey
 	sshdLog      string
+	// extraConfig is appended to n's sshd_config.
+	extraConfig string
 }
 
 func requireOrSkip(t *testing.T, format string, args ...any) {
@@ -270,15 +274,50 @@ func (n *node) verifiedPeers() []*fencessh.Verified {
 
 // start runs n's sshd with an AuthorizedKeysFile list of the rendered
 // authorized_keys (its verified peers) and, when legacy, a root
-// authorized_keys holding the hand-made unrestricted legacy key.
+// authorized_keys holding the hand-made unrestricted legacy key. It skips
+// only for a missing prerequisite (launch's prereqError); an sshd that is
+// there but exits or never listens fails the test.
 func (n *node) start(legacy bool) {
 	t := n.w.t
 	t.Helper()
+	if err := n.launch(legacy); err != nil {
+		var p *prereqError
+		if errors.As(err, &p) {
+			requireOrSkip(t, "%s", p.msg)
+		}
+		t.Fatal(err)
+	}
+}
+
+// prereqError is a prerequisite of the real-sshd tests this machine lacks:
+// the one kind of failure to start that start skips on.
+type prereqError struct{ msg string }
+
+func (e *prereqError) Error() string { return e.msg }
+
+func prereq(format string, args ...any) error {
+	return &prereqError{msg: fmt.Sprintf(format, args...)}
+}
+
+// sshdPrereqs reports a missing sshd or ssh client.
+func sshdPrereqs() error {
 	if _, err := os.Stat(fencessh.SSHDPath()); err != nil {
-		requireOrSkip(t, "no sshd at %s: the real-sshd fence tests need OpenSSH's server", fencessh.SSHDPath())
+		return prereq("no sshd at %s: the real-sshd fence tests need OpenSSH's server", fencessh.SSHDPath())
 	}
 	if _, err := exec.LookPath("ssh"); err != nil {
-		requireOrSkip(t, "no ssh client on PATH")
+		return prereq("no ssh client on PATH")
+	}
+	return nil
+}
+
+// launch is start, returning why n's sshd is not listening: a prereqError
+// for a missing prerequisite, any other error (carrying sshd's log) for an
+// sshd that exited or did not listen.
+func (n *node) launch(legacy bool) error {
+	t := n.w.t
+	t.Helper()
+	if err := sshdPrereqs(); err != nil {
+		return err
 	}
 	ak := filepath.Join(n.dir, fencessh.AuthorizedKeysName)
 	writeFile(t, ak, string(fencessh.AuthorizedKeys(n.dir, n.verifiedPeers())), 0o644)
@@ -291,7 +330,7 @@ func (n *node) start(legacy bool) {
 
 	l, err := net.Listen("tcp", net.JoinHostPort(n.ip, "0"))
 	if err != nil {
-		requireOrSkip(t, "cannot bind %s, which this test gives %s: %v", n.ip, n.name, err)
+		return prereq("cannot bind %s, which this test gives %s: %v", n.ip, n.name, err)
 	}
 	n.port = l.Addr().(*net.TCPAddr).Port
 	l.Close()
@@ -313,35 +352,47 @@ PubkeyAuthentication yes
 AllowTcpForwarding yes
 SetEnv PATH=%s:/usr/bin:/bin
 LogLevel VERBOSE
-`, n.port, n.ip, n.hkPath, rootAK, readAK, filepath.Join(filepath.Dir(n.dir), "bin")), 0o600)
+`, n.port, n.ip, n.hkPath, rootAK, readAK, filepath.Join(filepath.Dir(n.dir), "bin"))+n.extraConfig, 0o600)
 	logf, err := os.Create(n.sshdLog)
 	if err != nil {
 		t.Fatal(err)
 	}
+	sshdLog := func() []byte {
+		raw, _ := os.ReadFile(n.sshdLog)
+		return bytes.TrimSpace(raw)
+	}
 	cmd := exec.Command(fencessh.SSHDPath(), "-D", "-e", "-f", cfg)
 	cmd.Stdout, cmd.Stderr = logf, logf
 	if err := cmd.Start(); err != nil {
-		requireOrSkip(t, "sshd will not start unprivileged here: %v", err)
+		logf.Close()
+		return prereq("cannot run %s as this user: %v", fencessh.SSHDPath(), err)
 	}
+	exited := make(chan struct{})
+	var waitErr error
+	go func() { waitErr = cmd.Wait(); close(exited) }()
 	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		<-exited
 		logf.Close()
 		if t.Failed() {
 			raw, _ := os.ReadFile(n.sshdLog)
 			t.Logf("%s sshd log:\n%s", n.name, raw)
 		}
 	})
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		c, err := net.DialTimeout("tcp", net.JoinHostPort(n.ip, fmt.Sprint(n.port)), 200*time.Millisecond)
 		if err == nil {
 			c.Close()
-			return
+			return nil
+		}
+		select {
+		case <-exited:
+			return fmt.Errorf("sshd for %s exited before listening on %s:%d (%v): %s", n.name, n.ip, n.port, waitErr, sshdLog())
+		default:
 		}
 		if time.Now().After(deadline) {
-			raw, _ := os.ReadFile(n.sshdLog)
-			requireOrSkip(t, "sshd for %s did not listen on %s:%d unprivileged: %s", n.name, n.ip, n.port, bytes.TrimSpace(raw))
+			return fmt.Errorf("sshd for %s did not listen on %s:%d within 30s: %s", n.name, n.ip, n.port, sshdLog())
 		}
 		time.Sleep(50 * time.Millisecond)
 	}

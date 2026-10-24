@@ -315,8 +315,8 @@ file, as does a kept disk's backing chain that cannot be read (a backing file
 that does not exist ends the chain and holds nothing, but a create or import
 that would write a disk at that path is refused, naming the overlay that
 names it: the new disk would become its base. The path is where the disk is
-written: the disk directory, or for a disk on a pool where its driver puts it,
-`<pool dir>/<vm>-<disk>.qcow2` on nfs too; both are compared with their
+written: the disk directory, or for a disk on a pool where its driver puts it
+(nfs included); both are compared with their
 directories resolved through symlinks, so a pool whose directory is a symlink
 to the disk directory writes the same files); the refusal names the
 entry, and the way out is to fix that file, or, once nothing needs the disk,

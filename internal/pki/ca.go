@@ -383,7 +383,7 @@ func AuditSigningGeneration(cert *x509.Certificate) int64 {
 // The push path is fixed, but existing clusters are never re-provisioned, so
 // only a repair reaches them. It was previously reached only through
 // LoadAuditKeyring, which runs solely when enforcement.audit_signature is on — a
-// flag that defaults to false. An operator who upgraded specifically to pick up
+// flag that then defaulted to false. An operator who upgraded specifically to pick up
 // the fix, and left the flag at its default, got no repair and no warning.
 //
 // Tightening does not undo a copy already taken; that is what

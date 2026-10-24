@@ -155,19 +155,16 @@ func maxProjectAuthorityEpoch(ctx context.Context, c *Client, project string) (i
 	return rows[0].Int64("max_epoch"), nil
 }
 
-// RetireProjectAuthority tombstones every authority row for a project, so nothing
-// holds authority for a name that no longer exists. Called when a project is
-// deleted: an orphaned live row would otherwise let a later incarnation of the name
-// inherit a holder nobody chose for it — possibly one the cluster had actively
-// disagreed about. The rows themselves are kept, both because the table is
-// append-only and because ClaimInitialProjectAuthority mints above them.
-func RetireProjectAuthority(ctx context.Context, c *Client, project string) error {
-	return c.Execute(ctx, retireProjectAuthoritySQL,
-		nowRFC3339(), c.NowTS(), projectOrDefault(project))
-}
-
-// retireProjectAuthoritySQL is the retirement statement. Its params are
-// (deleted_at, updated_at, project); updated_at is the retirement's own HLC.
+// retireProjectAuthoritySQL tombstones every authority row for a project, so
+// nothing holds authority for a name that no longer exists: an orphaned live row
+// would otherwise let a later incarnation of the name inherit a holder nobody
+// chose for it. The rows themselves are kept, both because the table is
+// append-only and because ClaimInitialProjectAuthority mints above them. Project
+// delete runs it inside commitProjectLifecycle's guarded batch, never on its own:
+// outside that transaction it is name-wide and unguarded, so it could retire a
+// re-created incarnation's epoch or strand a project whose delete then failed.
+// Its params are (deleted_at, updated_at, project); updated_at is the
+// retirement's own HLC.
 const retireProjectAuthoritySQL = `UPDATE project_authority_epochs SET deleted_at = ?, updated_at = ?
 		 WHERE project = ? AND deleted_at IS NULL`
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/user"
@@ -12,6 +13,9 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+
+	"golang.org/x/sys/unix"
 	"syscall"
 	"time"
 )
@@ -64,19 +68,285 @@ type resolved struct {
 // even when a Match exec grandchild holds the pipes open: the whole process
 // group is killed and WaitDelay stops Wait from blocking on the pipes. A
 // variable so a test can stand in for a machine with no ssh binary.
+const resolverStdoutLimit = 1 << 20
+const resolverStderrLimit = 64 << 10
+
+var errResolverOutput = errors.New("SSH configuration output exceeds bound")
+
+type resolverCapture struct {
+	buffer   bytes.Buffer
+	limit    int
+	overflow bool
+	cancel   context.CancelFunc
+}
+
+func (w *resolverCapture) Write(p []byte) (int, error) {
+	remaining := w.limit - w.buffer.Len()
+	if len(p) > remaining {
+		w.overflow = true
+		w.cancel()
+		_, _ = w.buffer.Write(p[:remaining])
+		return remaining, errResolverOutput
+	}
+	return w.buffer.Write(p)
+}
+
 var sshG = func(timeout time.Duration, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	return runSSHGContext(context.Background(), timeout, args...)
+}
+
+type resolverProcessIdentity struct {
+	pid, group, session int
+	start               uint64
+	state               string
+}
+
+func resolverIdentity(pid int) (resolverProcessIdentity, error) {
+	file, err := os.Open("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return resolverProcessIdentity{}, err
+	}
+	defer file.Close()
+	body, err := io.ReadAll(io.LimitReader(file, 4097))
+	if err != nil {
+		return resolverProcessIdentity{}, err
+	}
+	if len(body) > 4096 {
+		return resolverProcessIdentity{}, errors.New("oversize resolver process identity")
+	}
+	end := strings.LastIndex(string(body), ") ")
+	if end < 0 {
+		return resolverProcessIdentity{}, errors.New("invalid resolver process identity")
+	}
+	fields := strings.Fields(string(body)[end+2:])
+	if len(fields) < 20 {
+		return resolverProcessIdentity{}, errors.New("short resolver process identity")
+	}
+	group, err := strconv.Atoi(fields[2])
+	if err != nil {
+		return resolverProcessIdentity{}, err
+	}
+	session, err := strconv.Atoi(fields[3])
+	if err != nil {
+		return resolverProcessIdentity{}, err
+	}
+	start, err := strconv.ParseUint(fields[19], 10, 64)
+	if err != nil {
+		return resolverProcessIdentity{}, err
+	}
+	return resolverProcessIdentity{pid: pid, group: group, session: session, start: start, state: fields[0]}, nil
+}
+
+// The original direct child has not been reaped while this observation runs.
+// Its retained PID pins the group number against reuse by an unrelated leader.
+func resolverGroupTerminal(original resolverProcessIdentity, deadline time.Time) (bool, error) {
+	leader, err := resolverIdentity(original.pid)
+	if err != nil {
+		return false, err
+	}
+	if leader.start != original.start || leader.group != original.group || leader.session != original.session {
+		return false, errors.New("resolver leader identity changed")
+	}
+	directory, err := os.Open("/proc")
+	if err != nil {
+		return false, err
+	}
+	defer directory.Close()
+	for {
+		if !time.Now().Before(deadline) {
+			return false, errors.New("resolver cleanup observation deadline")
+		}
+		entries, readErr := directory.ReadDir(128)
+		for _, entry := range entries {
+			if !time.Now().Before(deadline) {
+				return false, errors.New("resolver cleanup observation deadline")
+			}
+			pid, err := strconv.Atoi(entry.Name())
+			if err != nil || pid <= 0 {
+				continue
+			}
+			group, err := syscall.Getpgid(pid)
+			if errors.Is(err, syscall.ESRCH) {
+				continue
+			}
+			if err != nil {
+				return false, err
+			}
+			if group != original.group {
+				continue
+			}
+			member, err := resolverIdentity(pid)
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+				continue
+			}
+			if err != nil {
+				return false, err
+			}
+			if member.group != original.group {
+				continue
+			}
+			if member.session != original.session {
+				return false, errors.New("resolver group session changed")
+			}
+			if member.state != "Z" && member.state != "X" {
+				return false, nil
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			return true, nil
+		}
+		if readErr != nil {
+			return false, readErr
+		}
+	}
+}
+
+func runSSHGContext(parent context.Context, timeout time.Duration, args ...string) ([]byte, error) {
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
+	if timeout <= 0 || timeout > configTimeout {
+		timeout = configTimeout
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "ssh", append([]string{"-G"}, args...)...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
-	cmd.WaitDelay = time.Second
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("ssh -G: %w: %s", err, strings.TrimSpace(stderr.String()))
+	// Cancellation may signal the group only while the original child is
+	// retained unreaped. Disable this numeric-group action before final Wait.
+	var ownership sync.Mutex
+	retained := true
+	cmd.Cancel = func() error {
+		ownership.Lock()
+		defer ownership.Unlock()
+		if !retained || cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
-	return stdout.Bytes(), nil
+	cmd.WaitDelay = time.Second
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		stdoutPipe.Close()
+		return nil, err
+	}
+	defer stdoutPipe.Close()
+	defer stderrPipe.Close()
+	stdout := resolverCapture{limit: resolverStdoutLimit, cancel: cancel}
+	stderr := resolverCapture{limit: resolverStderrLimit, cancel: cancel}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("ssh -G: %w", err)
+	}
+	outDone, errDone := make(chan error, 1), make(chan error, 1)
+	go func() { _, err := io.Copy(&stdout, stdoutPipe); outDone <- err }()
+	go func() { _, err := io.Copy(&stderr, stderrPipe); errDone <- err }()
+	original, identityErr := resolverIdentity(cmd.Process.Pid)
+	if identityErr == nil && original.group != cmd.Process.Pid {
+		identityErr = errors.New("resolver did not retain its original process group")
+	}
+	var cleanupDeadline time.Time
+	var cleanupErr error
+	for {
+		var info unix.Siginfo
+		err := unix.Waitid(unix.P_PID, cmd.Process.Pid, &info, unix.WEXITED|unix.WNOWAIT|unix.WNOHANG, nil)
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if err != nil {
+			cleanupErr = err
+			break
+		}
+		if info.Signo != 0 {
+			break
+		}
+		if ctx.Err() != nil {
+			if cleanupDeadline.IsZero() {
+				cleanupDeadline = time.Now().Add(time.Second)
+			}
+			if !time.Now().Before(cleanupDeadline) {
+				cleanupErr = errors.New("resolver leader did not become terminal during cleanup")
+				break
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if cleanupDeadline.IsZero() {
+		cleanupDeadline = time.Now().Add(time.Second)
+	}
+	if killErr := cmd.Cancel(); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
+		cleanupErr = errors.Join(cleanupErr, killErr)
+	}
+	cleanupErr = errors.Join(cleanupErr, identityErr)
+	if cleanupErr == nil {
+		for {
+			terminal, err := resolverGroupTerminal(original, cleanupDeadline)
+			if err != nil {
+				cleanupErr = err
+				break
+			}
+			if terminal {
+				break
+			}
+			if !time.Now().Before(cleanupDeadline) {
+				cleanupErr = errors.New("resolver group remained nonterminal")
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	// Drain already-produced output only after all owned group members are
+	// non-running. A failed/expired cleanup closes readers and cannot parse a
+	// truncated prefix or claim a successful terminal result.
+	var outErr, diagnosticErr error
+	outJoined, errJoined := false, false
+	for cleanupErr == nil && (!outJoined || !errJoined) {
+		select {
+		case outErr = <-outDone:
+			outJoined = true
+		case diagnosticErr = <-errDone:
+			errJoined = true
+		default:
+		}
+		if outJoined && errJoined {
+			break
+		}
+		if !time.Now().Before(cleanupDeadline) {
+			cleanupErr = errors.New("resolver output drain exceeded cleanup deadline")
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if cleanupErr != nil {
+		stdoutPipe.Close()
+		stderrPipe.Close()
+	}
+	if !outJoined {
+		outErr = <-outDone
+	}
+	if !errJoined {
+		diagnosticErr = <-errDone
+	}
+	ownership.Lock()
+	retained = false
+	ownership.Unlock()
+	waitErr := cmd.Wait()
+	if cleanupErr != nil {
+		return nil, fmt.Errorf("ssh -G cleanup incomplete for original pid=%d group=%d session=%d start=%d: %w", cmd.Process.Pid, original.group, original.session, original.start, errors.Join(cleanupErr, waitErr, outErr, diagnosticErr))
+	}
+	if stdout.overflow || stderr.overflow {
+		return nil, errResolverOutput
+	}
+	if parent.Err() != nil {
+		return nil, parent.Err()
+	}
+	if err := errors.Join(waitErr, outErr, diagnosticErr); err != nil {
+		return nil, fmt.Errorf("ssh -G: %w: %s", err, strings.TrimSpace(stderr.buffer.String()))
+	}
+	return stdout.buffer.Bytes(), nil
 }
 
 // systemSSHConfig is ssh's system-wide config. A variable so tests can point
@@ -95,6 +365,10 @@ var systemSSHConfig = "/etc/ssh/ssh_config"
 // way it does for ssh. With no config file the old defaults apply even without
 // an ssh binary; a config that ssh -G cannot read is an error.
 func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.Duration) (*resolved, error) {
+	return resolveConfigUsing(host, usr, port, userSet, portSet, timeout, sshG, func(format string, args ...any) error { warnf(format, args...); return nil }, false)
+}
+
+func resolveConfigUsing(host, usr, port string, userSet, portSet bool, timeout time.Duration, run func(time.Duration, ...string) ([]byte, error), warning func(string, ...any) error, strict bool) (*resolved, error) {
 	// Only hostname, IP-literal and user-name characters reach ssh -G. The
 	// host can come from a replicated, peer-writable column (hosts.address),
 	// and a config's `Match exec "... %h"` hands it to a shell; OpenSSH before
@@ -141,6 +415,9 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 	// files, StrictHostKeyChecking): with a config present, failing to read it
 	// refuses. With none, there is nothing to honour and the old defaults hold.
 	fail := func(err error) (*resolved, error) {
+		if strict && !haveConfig {
+			return nil, err
+		}
 		if haveConfig && strings.Contains(err.Error(), "Bad owner or permissions") {
 			return nil, fmt.Errorf("cannot read the ssh config (%s) for %s: %w "+
 				"(ssh refuses a config not owned by the current user or writable by others; "+
@@ -171,7 +448,7 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 		args = append(args, "-p", port)
 	}
 	args = append(args, "--", host)
-	out, err := sshG(timeout, args...)
+	out, err := run(timeout, args...)
 	if err != nil {
 		return fail(err)
 	}
@@ -205,10 +482,14 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 	// not refused: every caller dialled the address directly before, and a
 	// host reachable both ways must keep working.
 	if pj := got.one("proxyjump"); pj != "" && pj != "none" {
-		warnf("%s sets ProxyJump %s in your ssh config; litevirt does not support it and dials %s:%s directly", host, pj, r.Hostname, r.Port)
+		if err := warning("%s sets ProxyJump %s in your ssh config; litevirt does not support it and dials %s:%s directly", host, pj, r.Hostname, r.Port); err != nil {
+			return nil, err
+		}
 	}
 	if pc := got.one("proxycommand"); pc != "" && pc != "none" {
-		warnf("%s sets ProxyCommand in your ssh config; litevirt does not support it and dials %s:%s directly", host, r.Hostname, r.Port)
+		if err := warning("%s sets ProxyCommand in your ssh config; litevirt does not support it and dials %s:%s directly", host, r.Hostname, r.Port); err != nil {
+			return nil, err
+		}
 	}
 
 	for _, id := range got["identityfile"] {
@@ -217,7 +498,9 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 		}
 		p, ok := tk.expand(id)
 		if !ok {
-			warnf("ignoring IdentityFile %q for %s: it uses a %% token litevirt does not expand", id, host)
+			if err := warning("ignoring IdentityFile %q for %s: it uses a %% token litevirt does not expand", id, host); err != nil {
+				return nil, err
+			}
 			r.IdentitySkipped = true
 			continue
 		}
@@ -238,7 +521,9 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 		if kh == defaultKH || kh == defaultKH2 {
 			continue // ~/.ssh/known_hosts{,2} are always checked (knownHostsFiles)
 		}
-		warnIfAbsent("UserKnownHostsFile", kh, host)
+		if err := warnIfAbsentUsing("UserKnownHostsFile", kh, host, warning); err != nil {
+			return nil, err
+		}
 		r.KnownHosts = append(r.KnownHosts, kh)
 	}
 	if c := strings.Join(got["knownhostscommand"], " "); c != "" && c != "none" {
@@ -261,7 +546,9 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 	default:
 		p, ok := tk.expand(ia)
 		if !ok {
-			warnf("IdentityAgent %q for %s uses a %% token litevirt does not expand; using no agent", ia, host)
+			if err := warning("IdentityAgent %q for %s uses a %% token litevirt does not expand; using no agent", ia, host); err != nil {
+				return nil, err
+			}
 		}
 		r.AgentSet, r.AgentSock = true, p
 	}
@@ -277,7 +564,9 @@ func resolveConfig(host, usr, port string, userSet, portSet bool, timeout time.D
 		}
 		for _, kh := range gkh {
 			if !slices.Contains(defaultGlobalKnownHosts, kh) {
-				warnIfAbsent("GlobalKnownHostsFile", kh, host)
+				if err := warnIfAbsentUsing("GlobalKnownHostsFile", kh, host, warning); err != nil {
+					return nil, err
+				}
 			}
 			r.GlobalKnownHosts = append(r.GlobalKnownHosts, kh)
 		}
@@ -299,8 +588,50 @@ type Target struct {
 func Resolve(target string) (*Target, error) { return resolveTarget(target, 0) }
 
 func resolveTarget(target string, timeout time.Duration) (*Target, error) {
+	return resolveTargetUsing(target, timeout, resolveConfig)
+}
+
+func ResolveContext(ctx context.Context, target string, diagnostics *EnrollmentDiagnostics) (*Target, error) {
+	if ctx == nil {
+		return nil, errors.New("nil SSH resolution context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := diagnostics.admitted(); err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(configTimeout)
+	if diagnostics.deadline.Before(deadline) {
+		deadline = diagnostics.deadline
+	}
+	bounded, cancel := context.WithDeadline(ctx, deadline)
+	stop := interruptOnCancellation(bounded, diagnostics.interrupt)
+	defer func() { stop(); cancel() }()
+	deadline, _ = bounded.Deadline()
+	if err := diagnostics.conn.SetWriteDeadline(deadline); err != nil {
+		return nil, err
+	}
+	run := func(timeout time.Duration, args ...string) ([]byte, error) {
+		return runSSHGContext(bounded, timeout, args...)
+	}
+	warning := func(format string, args ...any) error {
+		_, err := fmt.Fprintf(diagnostics, "warning: "+format+"\n", args...)
+		return err
+	}
+	resolve := func(host, usr, port string, userSet, portSet bool, timeout time.Duration) (*resolved, error) {
+		return resolveConfigUsing(host, usr, port, userSet, portSet, timeout, run, warning, true)
+	}
+	t, err := resolveTargetUsing(target, configTimeout, resolve)
+	if bounded.Err() != nil {
+		return nil, bounded.Err()
+	}
+	return t, err
+}
+
+func resolveTargetUsing(target string, timeout time.Duration, resolve func(string, string, string, bool, bool, time.Duration) (*resolved, error)) (*Target, error) {
 	u, host, port, userSet, portSet := parseTargetExplicit(target)
-	cfg, err := resolveConfig(host, u, port, userSet, portSet, timeout)
+	cfg, err := resolve(host, u, port, userSet, portSet, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -450,9 +781,14 @@ func knownHostsPaths(values []string, expand func(string) (string, bool)) ([]str
 // skips it, and so does litevirt, but a pin the operator believes is there
 // is not.
 func warnIfAbsent(kind, path, host string) {
+	_ = warnIfAbsentUsing(kind, path, host, func(format string, args ...any) error { warnf(format, args...); return nil })
+}
+
+func warnIfAbsentUsing(kind, path, host string, warning func(string, ...any) error) error {
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		warnf("%s %s for %s does not exist; host keys it would pin are not checked", kind, path, host)
+		return warning("%s %s for %s does not exist; host keys it would pin are not checked", kind, path, host)
 	}
+	return nil
 }
 
 // maxIncludeDepth is ssh's own limit on nested Include.

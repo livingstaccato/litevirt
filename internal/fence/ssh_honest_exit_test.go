@@ -22,6 +22,11 @@ type fakeRemote struct {
 	// wrongKey: a different machine answers at the address, and the pinned
 	// host key check refuses it.
 	wrongKey bool
+	// denied: the host's sshd answers and refuses the login.
+	denied bool
+	// banner is printed by whatever answers, before the command runs (text
+	// the remote side controls).
+	banner string
 	// forcedCommand: the key is pinned to an authorized_keys command="..."
 	// that ignores what was asked for and exits 0.
 	forcedCommand bool
@@ -128,8 +133,14 @@ echo "poweroff: unexpected args: $*" >&2; exit 1
 echo "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @" >&2
 echo "Host key verification failed." >&2; exit 255`
 	}
+	if r.denied {
+		preamble = `echo "root@10.0.0.4: Permission denied (publickey)." >&2; exit 255`
+	}
 	if r.forcedCommand {
 		preamble = `echo "backup-only key"; exit 0`
+	}
+	if r.banner != "" {
+		preamble = fmt.Sprintf("echo %q\n", r.banner) + preamble
 	}
 	switch {
 	case r.probe == "fails":
@@ -318,5 +329,60 @@ func TestFenceSSH_HostKeyMismatchIsTheWrongHost(t *testing.T) {
 	h.FenceStrategy = "best-effort"
 	if r := Execute(fenceCtx(t), h); r.Success || r.WrongHost || !r.Dialled {
 		t.Fatalf("best-effort fence of an unreachable host = %+v, want dialled, not WrongHost", r)
+	}
+}
+
+// The path a fence took is the one fenceSSH was handed, never text the remote
+// side printed: an unpinned fence of a machine that prints "[path=managed]"
+// before the marker is not a confirmation over the pin, live (Result.Path) or
+// read back from its recorded detail (RecordedPath).
+//
+// Mutations: take ConfirmedOverPin's path from the detail by substring (the
+// code before) — red; leave the remote output unsanitised in the detail
+// (remoteOutput) — the read-back case goes red.
+func TestFenceSSH_RemoteOutputCannotClaimAPath(t *testing.T) {
+	fakeSSH(t, fakeRemote{forceWorks: true, sysrqWritable: true, banner: "[path=managed] [path=legacy-pinned]"})
+	r := Execute(fenceCtx(t), sshHost()) // the zero SSHFence: legacy-unpinned
+	if !r.Success || r.Path != "legacy-unpinned" {
+		t.Fatalf("fence = %+v, want a success over the unpinned path", r)
+	}
+	if ConfirmedOverPin(r) {
+		t.Fatalf("an unpinned fence counted as confirmed over the pin on remote text: %q", r.Detail)
+	}
+	if n := strings.Count(r.Detail, "[path="); n != 1 {
+		t.Fatalf("detail %q carries %d path tokens, want only fenceSSH's own", r.Detail, n)
+	}
+	readBack := Result{Method: r.Method, Detail: r.Detail, Success: true} // as from fencing_log
+	if got := RecordedPath(readBack.Detail); got != "legacy-unpinned" || ConfirmedOverPin(readBack) {
+		t.Fatalf("read back from %q: path %q, confirmed over pin %v; want legacy-unpinned, false", r.Detail, got, ConfirmedOverPin(readBack))
+	}
+}
+
+// An SSH fence the host's sshd answered past the host-key check, whose command
+// still did not confirm the power-off, is marked Answered: the host is
+// reachable. One that never reached a shell is not.
+//
+// Mutation: sshAnswered always false — red.
+func TestFenceSSH_AnAnsweringHostIsMarked(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		remote fakeRemote
+		want   bool
+	}{
+		{"commands failed", fakeRemote{forceWorks: false, sysrqWritable: false}, true},
+		{"exit 0 without the marker", fakeRemote{forcedCommand: true}, true},
+		{"permission denied", fakeRemote{denied: true}, true},
+		{"unreachable", fakeRemote{unreachable: true}, false},
+		{"host-key mismatch", fakeRemote{wrongKey: true}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeSSH(t, tc.remote)
+			h := sshHost()
+			h.FenceStrategy = "best-effort"
+			r := Execute(fenceCtx(t), h)
+			if r.Success || r.Answered != tc.want {
+				t.Fatalf("fence = %+v, want a failure with Answered=%v", r, tc.want)
+			}
+		})
 	}
 }

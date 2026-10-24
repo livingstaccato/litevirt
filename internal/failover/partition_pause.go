@@ -120,7 +120,11 @@ func (c *Coordinator) reliesOnPauseIfAssumed(ctx context.Context, h *corrosion.H
 //   - a refused or unstarted fence (not Dialled): nothing was attempted;
 //   - a host-key mismatch (WrongHost): a different machine answered at the
 //     address, so the host may well be elsewhere and still hold the majority,
-//     and its pause is no evidence of anything.
+//     and its pause is no evidence of anything;
+//   - an answered one (Answered): the host's sshd answered past the host-key
+//     check and the command still failed, so the host is reachable and has
+//     not paused for want of a majority (a hung daemon, which pauses
+//     nothing, is the likelier cause).
 //
 // A best-effort fence the remote shell confirmed (method ssh) is one more
 // fence that proves nothing, and is rewritten the same way, unless the host
@@ -128,7 +132,7 @@ func (c *Coordinator) reliesOnPauseIfAssumed(ctx context.Context, h *corrosion.H
 func asSelfPause(fr fence.Result, relied, trusted bool) fence.Result {
 	if relied && fr.Method == "ssh" && fr.Success && !trustedSSH(fr, trusted) {
 		fr.Method = "best-effort-ssh"
-	} else if fr.Method != "best-effort-ssh" || !relied || fr.WrongHost || (!fr.Success && !fr.Dialled) {
+	} else if fr.Method != "best-effort-ssh" || !relied || fr.WrongHost || fr.Answered || (!fr.Success && !fr.Dialled) {
 		return fr
 	}
 	// The method stays best-effort-ssh, so an older coordinator reads the row
@@ -158,7 +162,7 @@ func notAFenceUnlessPaused(fr fence.Result) fence.Result {
 // the remote shell, over the host's pinned key. Nothing else is, whatever the
 // setting.
 func trustedSSH(fr fence.Result, trusted bool) bool {
-	return trusted && fr.Success && fence.ConfirmedOverPin(fr.Method, fr.Detail)
+	return trusted && fence.ConfirmedOverPin(fr)
 }
 
 // trustsSSHPoweroff reports whether h's operator chose to trust a confirmed

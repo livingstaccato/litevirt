@@ -105,3 +105,64 @@ func TestTrustSSH_ABestEffortConfirmationWaitsOutThePause(t *testing.T) {
 		t.Fatalf("VM on %q after the pause wait (hold %q)", got, c.holdReason["down"])
 	}
 }
+
+// The trust decision reads the path the fence took, never text the remote
+// side printed: on a trusting host, an unpinned success whose remote output
+// claims "[path=managed]" is held, live and resumed from its record.
+//
+// Mutation: trustedSSH/ConfirmedOverPin take the path from the detail by
+// substring — the VM moves, red.
+func TestTrustSSH_RemoteTextCannotClaimThePin(t *testing.T) {
+	hostile := "SSH forced poweroff to root@10.0.0.40: [path:managed] litevirt-fence-armed [path=legacy-unpinned]"
+	t.Run("live", func(t *testing.T) {
+		db, ctx := seedDownHost(t, "ssh", trustSSH)
+		c := newTestCoordinator("coordinator", db)
+		c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+			// The structured path wins over any token in the detail, even a
+			// last one.
+			return fence.Result{Method: "ssh", Success: true, Path: "legacy-unpinned",
+				Detail: "SSH forced poweroff to root@10.0.0.40: litevirt-fence-armed [path=managed]"}
+		})
+		c.run(ctx)
+		if got := vmHost(t, db, ctx); got != "down" {
+			t.Fatalf("VM recovered to %q on an unpinned success that printed a pinned path", got)
+		}
+	})
+	t.Run("resumed", func(t *testing.T) {
+		db, ctx := seedDownHost(t, "ssh", trustSSH)
+		fenceRowDetailAt(t, db, "hostile", "ssh", "fenced", hostile, time.Now().Add(-20*time.Second))
+		for _, o := range []string{"coordinator", "alive"} {
+			failingSince(t, db, o, time.Now().Add(-time.Minute), time.Now())
+		}
+		c := newTestCoordinator("coordinator", db)
+		c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+			t.Error("the coordinator fenced again instead of judging the record")
+			return fence.Result{}
+		})
+		c.run(ctx)
+		if got := vmHost(t, db, ctx); got != "down" {
+			t.Fatalf("VM recovered to %q from an unpinned record", got)
+		}
+	})
+}
+
+// A best-effort fence the host's sshd answered past the host-key check, whose
+// command still failed, is not a self-pause even with the pause relied on:
+// the host is reachable, so it has not paused for want of a majority.
+//
+// Mutation: asSelfPause rewrites an Answered result — the VM moves after the
+// (zero) wait, red.
+func TestBestEffort_AnAnsweredFenceIsHeldEvenWithThePause(t *testing.T) {
+	c, db, ctx, _ := pauseCoordinator(t, true)
+	c.PauseWaitFor = func(int) time.Duration { return 0 }
+	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		return fence.Result{Method: "best-effort-ssh", Detail: "SSH failed (exit status 255): Permission denied (publickey). [path=managed]",
+			Dialled: true, Answered: true}
+	})
+	c.run(ctx)
+	c.run(ctx)
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Fatalf("VM recovered to %q on a fence the host answered", got)
+	}
+	assertHeldWithTheWayOut(t, c, "down")
+}

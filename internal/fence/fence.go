@@ -32,18 +32,61 @@ type Result struct {
 	// host itself is known, not even that it lost the majority, so not even
 	// its partition pause is relied on.
 	WrongHost bool
+	// Answered marks an SSH fence the host's sshd answered past the host-key
+	// check, whose command still did not confirm the power-off (permission
+	// denied, commands failed, exit 0 without the marker). The host is
+	// reachable, so it has not lost the majority and paused: the likelier
+	// cause is a hung daemon, which pauses nothing. Like WrongHost, not even
+	// the host's partition pause is relied on.
+	Answered bool
+	// Path is the path an SSH fence took (managed, legacy-pinned,
+	// legacy-unpinned, refused), set by fenceSSH from the path it was
+	// handed, never from anything the remote machine printed.
+	Path string
 	// Unproven marks a result the failover coordinator stopped counting as a
 	// fence: it reported success, but nothing proves the host is off.
 	Unproven bool
 }
 
-// ConfirmedOverPin reports whether a fence recorded as (method, detail) is an
-// SSH power-off the remote shell confirmed, reached over the host's pinned
-// sshd key: method ssh (a success: the marker was seen) by the managed or the
-// legacy-pinned path. An unpinned success, or a row that names no path (an
-// earlier build's), is not one.
-func ConfirmedOverPin(method, detail string) bool {
-	return method == "ssh" && (strings.Contains(detail, "[path=managed]") || strings.Contains(detail, "[path=legacy-pinned]"))
+// ConfirmedOverPin reports whether r is an SSH power-off the remote shell
+// confirmed (method ssh, a success: the marker was seen), reached over the
+// host's pinned sshd key: the managed or the legacy-pinned path. The path is
+// r.Path, set by fenceSSH; a result read back from fencing_log, which has
+// none, takes it from its recorded detail (RecordedPath). An unpinned
+// success, or a row that names no path (an earlier build's), is not one.
+func ConfirmedOverPin(r Result) bool {
+	if r.Method != "ssh" || !r.Success {
+		return false
+	}
+	path := r.Path
+	if path == "" {
+		path = RecordedPath(r.Detail)
+	}
+	return path == "managed" || path == "legacy-pinned"
+}
+
+// RecordedPath is the path label an SSH fence's detail records: its last
+// "[path=<label>]" token. The remote machine's output in a detail cannot
+// carry one (remoteOutput rewrites it), so the token fenceSSH appends is the
+// only one a detail it wrote holds. "" when there is none.
+func RecordedPath(detail string) string {
+	i := strings.LastIndex(detail, "[path=")
+	if i < 0 {
+		return ""
+	}
+	rest := detail[i+len("[path="):]
+	j := strings.IndexByte(rest, ']')
+	if j < 0 {
+		return ""
+	}
+	return rest[:j]
+}
+
+// remoteOutput is what the machine that answered an SSH fence printed, as a
+// fence detail records it: trimmed, with any "[path=" rewritten so that it
+// cannot pass for the path token fenceSSH appends (RecordedPath).
+func remoteOutput(out []byte) string {
+	return strings.ReplaceAll(strings.TrimSpace(string(out)), "[path=", "[path:")
 }
 
 // HostConfig is the subset of corrosion.HostRecord fields needed for fencing.
@@ -492,7 +535,7 @@ func fenceSSH(ctx context.Context, h HostConfig, lenient bool) Result {
 	cmd := exec.CommandContext(ctx, sshBinary, args...)
 	out, runErr := cmd.CombinedOutput()
 	armed := sawFenceArmed(out)
-	detail := fmt.Sprintf("SSH forced poweroff to %s: %s%s", target, strings.TrimSpace(string(out)), path)
+	detail := fmt.Sprintf("SSH forced poweroff to %s: %s%s", target, remoteOutput(out), path)
 
 	// Classification. A success requires the marker, always: it is the only
 	// evidence that OUR command ran on the target. An exit 0 without it means
@@ -524,18 +567,20 @@ func fenceSSH(ctx context.Context, h HostConfig, lenient bool) Result {
 	//     call is not evidence the host went down.
 	switch {
 	case runErr == nil && armed:
-		return Result{Method: "ssh", Detail: detail, Success: true}
+		return Result{Method: "ssh", Detail: detail, Success: true, Path: h.SSH.pathLabel()}
 	case armed && sshExitCode(runErr) == 255:
 		return Result{
 			Method:  "ssh",
 			Detail:  detail + " (connection lost after the forced power-off was issued)",
 			Success: true,
+			Path:    h.SSH.pathLabel(),
 		}
 	}
+	answered := sshAnswered(runErr, out)
 	if runErr == nil {
 		runErr = errors.New("remote command exited 0 without confirming it ran")
 	}
-	return sshFailure(h, lenient, runErr, detail, out)
+	return sshFailure(h, lenient, runErr, answered, detail, out)
 }
 
 // sshNotAttempted is an SSH fence that was never sent: its path was refused,
@@ -555,7 +600,7 @@ func sshNotAttempted(h HostConfig, lenient bool, why error, detail string) Resul
 	if way := NotFencedWayOut(h.Name); !strings.Contains(detail, way) {
 		detail += ". " + way
 	}
-	return Result{Method: method, Detail: detail}
+	return Result{Method: method, Detail: detail, Path: h.SSH.pathLabel()}
 }
 
 // NotFencedWayOut is what an operator does about a host no fence reached:
@@ -569,21 +614,47 @@ func NotFencedWayOut(host string) string {
 // under every strategy: nothing confirms the host went down. A lenient
 // (best-effort) one is marked Dialled, which the failover coordinator counts
 // only on the host's own partition pause (Result.Dialled). A host-key mismatch
-// is marked WrongHost: another machine answered at the address.
-func sshFailure(h HostConfig, lenient bool, runErr error, detail string, out []byte) Result {
+// is marked WrongHost: another machine answered at the address. One where the
+// host's sshd answered (sshAnswered) is marked Answered: the host is
+// reachable, so it is not paused for want of a majority.
+func sshFailure(h HostConfig, lenient bool, runErr error, answered bool, detail string, out []byte) Result {
 	wrong := hostKeyMismatch(out)
+	answered = answered && !wrong
+	note := wrongHostNote(wrong)
+	if answered {
+		note = " (the host's sshd answered: it is reachable, so it has not paused for want of a majority)"
+	}
 	if lenient {
 		slog.Warn("best-effort SSH fence did not confirm the power-off; it is not a fence", "host", h.Name,
-			"error", runErr, "wrong_host", wrong)
+			"error", runErr, "wrong_host", wrong, "answered", answered)
 		return Result{
 			Method: "best-effort-ssh",
-			Detail: fmt.Sprintf("SSH failed (%v): %s [path=%s]", runErr, strings.TrimSpace(string(out)),
-				h.SSH.pathLabel()) + wrongHostNote(wrong),
+			Detail: fmt.Sprintf("SSH failed (%v): %s [path=%s]", runErr, remoteOutput(out),
+				h.SSH.pathLabel()) + note,
 			Dialled:   true,
 			WrongHost: wrong,
+			Answered:  answered,
+			Path:      h.SSH.pathLabel(),
 		}
 	}
-	return Result{Method: "ssh", Detail: fmt.Sprintf("%s (%v)", detail, runErr) + wrongHostNote(wrong), WrongHost: wrong}
+	return Result{Method: "ssh", Detail: fmt.Sprintf("%s (%v)", detail, runErr) + note, WrongHost: wrong,
+		Answered: answered, Path: h.SSH.pathLabel()}
+}
+
+// sshAnswered reports whether an SSH fence that did not land was answered by
+// the host's sshd past the host-key check: the remote shell ran (any exit
+// other than ssh's own 255, exit 0 without the marker included), or the
+// login was refused (Permission denied). A connection that never got that
+// far (exit 255 otherwise), or a call the context killed, is not.
+func sshAnswered(runErr error, out []byte) bool {
+	if runErr == nil {
+		return true
+	}
+	if strings.Contains(string(out), "Permission denied") {
+		return true
+	}
+	code := sshExitCode(runErr)
+	return code != 255 && code != -1
 }
 
 func wrongHostNote(wrong bool) string {

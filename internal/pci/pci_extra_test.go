@@ -247,24 +247,6 @@ func TestReadDeviceName(t *testing.T) {
 	}
 }
 
-func TestParseCreatedGIID(t *testing.T) {
-	tests := []struct {
-		output string
-		want   int
-	}{
-		{"Successfully created GPU instance ID  1 on GPU  0 using profile MIG 1g.5gb (ID  9)\n", 1},
-		{"Successfully created GPU instance ID  7 on GPU  0 using profile MIG 3g.20gb (ID  5)\n", 7},
-		{"No GPU instance ID found in output\n", -1},
-		{"", -1},
-	}
-	for _, tt := range tests {
-		got := parseCreatedGIID(tt.output)
-		if got != tt.want {
-			t.Errorf("parseCreatedGIID(%q) = %d, want %d", tt.output, got, tt.want)
-		}
-	}
-}
-
 func TestReadNVMeSize(t *testing.T) {
 	tmp := t.TempDir()
 

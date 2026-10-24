@@ -1259,8 +1259,10 @@ func (s *Server) keptSnapshotStill(ctx context.Context, r corrosion.SnapshotReco
 }
 
 // forgetKeptRecords drops from kept-disks.json each of regs whose file is in
-// gone. An entry rewritten meanwhile (a VM of the name kept the path again)
-// is left.
+// gone, and its file from the note's recorded list (health.ForgetKeptRecorded),
+// as judgeKeptDisks does for a file that is gone: a note left naming it would
+// outlive the entry. An entry rewritten meanwhile (a VM of the name kept the
+// path again) is left.
 func (s *Server) forgetKeptRecords(regs []diskKeptRecord, gone []string) error {
 	if len(regs) == 0 {
 		return nil
@@ -1271,7 +1273,7 @@ func (s *Server) forgetKeptRecords(regs []diskKeptRecord, gone []string) error {
 	if s.diskKept.unreadable != nil {
 		return fmt.Errorf("%s cannot be read: %w", filepath.Join(s.dataDir, diskKeptFile), s.diskKept.unreadable)
 	}
-	changed := false
+	var dropped []diskKeptRecord
 	for _, r := range regs {
 		if !slices.Contains(gone, filepath.Clean(s.hostDiskFile(r.Path))) {
 			continue
@@ -1280,15 +1282,20 @@ func (s *Server) forgetKeptRecords(regs []diskKeptRecord, gone []string) error {
 		if cur, ok := m[key]; ok && cur == r {
 			delete(m, key)
 			delete(s.diskKept.unsavedKey, key)
-			changed = true
+			dropped = append(dropped, r)
 		}
 	}
-	if !changed {
+	if len(dropped) == 0 {
 		return nil
 	}
 	s.saveDiskKeptLocked()
 	if s.diskKept.unsaved {
 		return fmt.Errorf("%s was not saved", filepath.Join(s.dataDir, diskKeptFile))
+	}
+	for _, r := range dropped {
+		if err := health.ForgetKeptRecorded(s.dataDir, r.VM, s.keptRecordedFiles([]KeptDisk{r.KeptDisk})); err != nil {
+			return fmt.Errorf("the note %s still names %s (%w)", filepath.Join(s.dataDir, "kept-disks", r.VM+".json"), r.Path, err)
+		}
 	}
 	return nil
 }

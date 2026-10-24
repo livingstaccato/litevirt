@@ -14,6 +14,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
 // While kept-disks.json cannot be read, a symlink below a directory the scan
@@ -275,4 +276,51 @@ func TestKeptRegistry_TheNoteOfAnEntryHoldsNothing(t *testing.T) {
 			t.Fatalf("scan files = %v (err=%v); want none for a disk on another host", files, err)
 		}
 	})
+}
+
+// A release (`lv host kept-disks --release`) of a kept-disks.json entry no
+// note names as a kept disk drops the entry's recorded file from the note
+// with the entry, and the note with it: judgeKeptDisks, which forgets a
+// recorded file whose entry it drops, never sees an entry the release has
+// already dropped, so a note left behind would name a released file for
+// good.
+//
+// Mutation: drop the ForgetKeptRecorded call from forgetKeptRecords: red
+// (the note still names the released file).
+func TestKeptRelease_DropsTheRecordedNoteOfTheEntry(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	file := s.images.DiskPath("old", "root")
+	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := qcow2.Create(file, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	s.recordKeptDisks(adminCtx(), "old", []KeptDisk{{Path: file, Disk: "root", Host: s.hostName,
+		Reason: "whether another VM uses it cannot be told"}})
+	if files, err := health.KeptScanFiles(s.dataDir); err != nil || files[file] != "old" {
+		t.Fatalf("scan files = %v (err=%v); want %s recorded for old: this proves nothing", files, err, file)
+	}
+	if files, err := health.KeptNotedFiles(s.dataDir); err != nil || len(files) != 0 {
+		t.Fatalf("noted files = %v (err=%v); want none: the entry is in kept-disks.json alone", files, err)
+	}
+	resp, err := keptRelease(s, "old")
+	if err != nil {
+		t.Fatalf("release old: %v", err)
+	}
+	if len(resp.Chains) != 1 || !resp.Chains[0].Released {
+		t.Fatalf("release answer = %+v; want the chain released", resp.Chains)
+	}
+	if _, err := os.Stat(file); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("%s is still there after the release (%v)", file, err)
+	}
+	if records, _ := s.diskKeptRecords(); len(records) != 0 {
+		t.Fatalf("kept-disks.json still records %+v after the release", records)
+	}
+	if files, err := health.KeptScanFiles(s.dataDir); err != nil || len(files) != 0 {
+		t.Fatalf("scan files = %v (err=%v); want none once the entry is released", files, err)
+	}
+	if _, err := os.Stat(filepath.Join(s.dataDir, "kept-disks", "old.json")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the note of the released entry is left (stat err=%v)", err)
+	}
 }

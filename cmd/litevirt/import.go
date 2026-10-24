@@ -214,15 +214,25 @@ func uploadDirAsTar(stream pb.LiteVirt_ImportVMClient, dir string) error {
 		}
 		pw.CloseWithError(tw.Close())
 	}()
+	// The server may stop reading early (an --inspect has what it needs at
+	// the OVA's descriptor): closing the pipe ends the tar writer too.
+	defer pr.Close()
 	return streamChunks(stream, pr)
 }
 
+// streamChunks sends r in 256 KiB chunks. A Send that returns io.EOF means
+// the server has stopped reading: an --inspect of an OVA ends at its
+// descriptor, and a refused import ends at once. The upload stops there and
+// the caller reads the server's answer.
 func streamChunks(stream pb.LiteVirt_ImportVMClient, r io.Reader) error {
 	buf := make([]byte, 256*1024)
 	for {
 		n, rerr := r.Read(buf)
 		if n > 0 {
 			if err := stream.Send(&pb.ImportVMRequest{Chunk: buf[:n]}); err != nil {
+				if err == io.EOF {
+					return nil
+				}
 				return fmt.Errorf("send chunk: %w", err)
 			}
 		}
@@ -241,8 +251,15 @@ func printImportResult(prog *pb.ImportVMProgress, inspect bool, name string) {
 		if prog.MappedSpecJson != "" {
 			var spec pb.VMSpec
 			if json.Unmarshal([]byte(prog.MappedSpecJson), &spec) == nil {
-				fmt.Printf("  cpu=%d memory=%dMiB machine=%s firmware=%s\n",
-					spec.Cpu, spec.MemoryMib, spec.Machine, spec.Firmware)
+				extra := ""
+				if spec.SecureBoot {
+					extra += " secure-boot"
+				}
+				if spec.Tpm {
+					extra += " tpm"
+				}
+				fmt.Printf("  cpu=%d memory=%dMiB machine=%s firmware=%s%s\n",
+					spec.Cpu, spec.MemoryMib, spec.Machine, spec.Firmware, extra)
 				for _, d := range spec.Disks {
 					ctrl := ""
 					if d.ControllerModel != "" {

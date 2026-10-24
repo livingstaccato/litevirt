@@ -151,10 +151,14 @@ func (c *cappedReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// InspectOVA reads the tar only until the .ovf member and returns its bytes
-// (does not extract the multi-GB disks) — for the --inspect dry run.
+// InspectOVA reads the tar only until the .ovf member and returns its bytes,
+// for lv import --inspect: the disk members are neither extracted nor, when
+// the descriptor comes first (as the OVF specification has it), read at all.
+// It refuses what UnpackOVA would refuse among the members it reads, so a
+// preview does not describe an archive the import would reject at its head.
 func InspectOVA(r io.Reader) ([]byte, error) {
 	tr := tar.NewReader(r)
+	members := 0
 	for {
 		hdr, e := tr.Next()
 		if e == io.EOF {
@@ -163,15 +167,29 @@ func InspectOVA(r io.Reader) ([]byte, error) {
 		if e != nil {
 			return nil, fmt.Errorf("read ova tar: %w", e)
 		}
-		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+		switch hdr.Typeflag {
+		case tar.TypeDir:
 			continue
+		case tar.TypeReg, tar.TypeRegA:
+		default:
+			return nil, fmt.Errorf("ova member %q has disallowed type %d (symlink/hardlink/device not permitted)", hdr.Name, hdr.Typeflag)
+		}
+		members++
+		if members > maxArchiveMembers {
+			return nil, fmt.Errorf("ova exceeds member cap (%d)", maxArchiveMembers)
+		}
+		if _, e := safeJoin("/", hdr.Name); e != nil {
+			return nil, e
 		}
 		if strings.EqualFold(filepath.Ext(hdr.Name), ".ovf") {
-			if hdr.Size > 64<<20 {
+			if hdr.Size > maxDescriptorSize {
 				return nil, fmt.Errorf("ovf descriptor implausibly large (%d bytes)", hdr.Size)
 			}
-			return io.ReadAll(io.LimitReader(tr, 64<<20))
+			return io.ReadAll(io.LimitReader(tr, maxDescriptorSize))
 		}
 	}
 	return nil, fmt.Errorf("no .ovf descriptor found in OVA")
 }
+
+// maxDescriptorSize bounds the .ovf InspectOVA reads into memory.
+const maxDescriptorSize = 64 << 20

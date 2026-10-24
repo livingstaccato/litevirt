@@ -431,15 +431,38 @@ dev <bridge> type bridge vlan_filtering 1`, and the VLAN on the bridge's
 uplink); a bridge with it off ignores the pvid and puts the NIC on its untagged
 segment. So a create, and every start of the VM (`lv start`, `lv restart`, a
 failover or health restart), is refused with `FailedPrecondition` when the
-NIC's bridge on that host has VLAN filtering off, naming the bridge. A bridge
-that does not exist on the host yet, and a device that is not a Linux bridge,
-are not judged. A migration does not check its target's bridge before the
-move: a live-migrated guest keeps running on a target whose bridge has VLAN
-filtering off, on that bridge's untagged segment, and its next start there is
-refused; a cold-moved VM is refused when it is started on the target. A trunk
+NIC's bridge on that host has VLAN filtering off, naming the bridge. A
+failover, reschedule or onboot start refused that way is not parked in
+`error`: the VM waits on that host (`pending` or `starting`, the detail naming
+the bridge), is tried again on every reconcile pass, and starts by itself once
+the bridge filters VLANs. A refused `lv start` or health restart is started
+again with `lv start <vm>`. A device that is not a Linux bridge is not judged.
+
+`lv migrate` and `lv host drain` do not move such a VM onto a host whose bridge
+for it has VLAN filtering off, or does not exist there yet (litevirt would
+create it without filtering): the target refuses the move before anything is
+copied or created there, a live and a cold move alike, naming the bridge and
+the VLAN, and the VM stays where it is. A drain does not choose such a host as
+a target (it is listed in the drain's "no eligible target" reasons), and takes
+another that qualifies. A trunk
 of two or more VLANs is not refused: its tagged frames
 pass a bridge with filtering off, and the firewall confines them to the VLANs
 its network allows (docs/firewall.md, "VLAN tags").
+
+The VLANs go on the tap before the guest runs, on every path. libvirt makes a
+fresh tap at every start, and a new port of a VLAN-filtering bridge carries
+only VLAN 1, so a VM with a `trunk:` NIC is started paused, its VLANs put on
+its taps, and only then resumed: whichever path starts it (create, `lv start`,
+a failover, reschedule or onboot start, a health restart, promote, clone,
+replace, restore, import, a snapshot revert). An access VLAN that cannot be put
+on its tap refuses the start, since the guest would run on VLAN 1. A live
+migration hands such a guest over paused, and the target puts the VLANs on
+the taps it made before it lets the guest run; a live firmware move does the
+same before its release. Every host also re-applies the VLANs of each running
+guest's NICs every 30 s, so a tap changed by hand, or re-created, is put back
+within one interval (a tap already right is only read). A hot-attached NIC
+(`lv attach-nic`, the AttachDevice API) cannot carry a `trunk:`: give the VM
+the NIC in its spec instead.
 
 ### Access-VLAN NICs need a VLAN-filtering bridge
 
@@ -448,12 +471,15 @@ NIC: a Linux bridge with VLAN filtering off (or unreadable) that some VM of the
 cluster has a `trunk:` NIC of one VLAN on, through its network. For each, it
 raises `bridge_vlan_filtering_off` (evaluator `access_vlan`, subject
 `host/<bridge>@<host>`, warning) naming the host, the bridge, how many VMs it
-affects and which, and the fix; `lv health` shows it. That is before a
-failover needs the host: none of those VMs can start there. Failover places
-such a VM on a host whose bridge is not reported while one qualifies, and on
-a reported one only when no other host qualifies, where its start is refused
-as above. The condition resolves on the first check that finds the bridge
-filtering VLANs, gone, or used by no such VM; see
+affects and which, and the fix; `lv health` shows it. A host on which the
+bridge does not exist yet is reported too: litevirt would create the bridge
+for a start there, without VLAN filtering. That is before a failover needs
+the host: none of those VMs can start there. Failover places such a VM on a
+host whose bridge is not reported while one qualifies, and on a reported one
+only when no other host qualifies, where its start waits as above; a drain or
+`lv migrate` never moves one onto a reported host. The condition resolves on
+the first check that finds the bridge filtering VLANs, or used by no such VM;
+see
 [diagnostics.md](diagnostics.md#a-bridge-cannot-carry-an-access-vlan-nic-bridge_vlan_filtering_off).
 
 The fix, on the host it names:

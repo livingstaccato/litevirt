@@ -20,14 +20,21 @@ litevirt uses QEMU's pre-copy memory migration:
 Progress is streamed to the CLI in real-time.
 
 A NIC's `trunk:` VLANs live on its host tap, not in the domain definition, so
-libvirt does not carry them. Once a live migration completes, the target host
-puts them on the taps it created, before announcing the gateways: a trunk's
-tap is set to exactly its VLANs, tagged, and an access port's (`trunk:` with
-one VLAN) gets its VLAN as pvid, untagged. Until then (the time between the
-cutover and the source's call to the target) those NICs are on the bridge's
-default VLAN only. A live firmware move puts them on while the target
-guest is still paused, before its release. A failure is logged on the target
-and does not fail the migration.
+libvirt does not carry them. A VM with a `trunk:` NIC is therefore handed over
+paused: libvirt lands the guest on the target paused, the target puts the
+VLANs on the taps it created (a trunk's tap set to exactly its VLANs, tagged;
+an access port's, `trunk:` with one VLAN, given its VLAN alone, as pvid,
+untagged), and only then lets the guest run. An access VLAN that cannot be put
+on its tap keeps the guest paused there, reported in `firewall.nic.held` as a
+guest held for its NIC guards is, and the target lets it run once it can. A
+live firmware move puts them on the same way before its release. A target on
+a build without NIC guards cannot hold a guest for this: the guest runs on
+arrival there, and gets its VLANs once the move completes. Every host also
+re-applies every running guest's tap VLANs every 30 s.
+
+An access-VLAN VM is not moved onto a host whose bridge for it does not
+filter VLANs, or does not exist there yet: the target refuses the move before
+anything is copied ([networking.md](networking.md#vlan-trunk-mode)).
 
 Once a live migration completes, the target host sends gratuitous ARPs for the
 gateway of each network the VM has a NIC on (the first address of the

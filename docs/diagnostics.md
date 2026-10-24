@@ -3171,18 +3171,26 @@ using it, and raises `bridge_vlan_filtering_off` (evaluator `access_vlan`,
 subject `host/<bridge>@<host>`, warning; observed on the first such check,
 confirmed on the next) for each. The evidence names the bridge and the host,
 counts the VMs that cannot start there and lists up to ten of them, and says
-the fix. A bridge that does not exist on the host is not judged.
+the fix. A bridge that does not exist on the host is reported too: litevirt
+would create it for a start there, without VLAN filtering. A device that is
+not a Linux bridge is not judged.
 
 While it is open, failover recovers such a VM onto a host whose bridge is not
 reported, when one qualifies; only when none does is it placed on a reported
-host, where its start is refused and the VM waits for the fix.
+host, where its start is refused and the VM waits for the fix: it stays
+`pending` (or `starting`, for an onboot start), its detail naming the bridge,
+is tried again on every reconcile pass, and starts by itself once the bridge
+filters VLANs. A refused `lv start` or health restart is not retried: start
+the VM again with `lv start <vm>` after the fix. `lv migrate` and `lv host
+drain` never move such a VM onto a reported host: the target refuses the move
+before anything is copied, and a drain does not choose it.
 
 Fix it on the host the subject names: `ip link set dev <bridge> type bridge
 vlan_filtering 1`, with the VLAN on the bridge's uplink, and keep it across a
 reboot in what creates the bridge
 ([networking.md](networking.md#access-vlan-nics-need-a-vlan-filtering-bridge)).
 The condition resolves on the first check that finds the bridge filtering
-VLANs, the bridge gone, or no VM with an access-port NIC on it.
+VLANs, or no VM with an access-port NIC on it.
 
 ### Orphaned runtimes (`vm_orphan_runtime`, `ct_orphan_runtime`)
 

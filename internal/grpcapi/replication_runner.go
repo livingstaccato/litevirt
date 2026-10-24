@@ -57,6 +57,32 @@ func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupSched
 	if vm.HostName != s.hostName {
 		return nil // not ours; the owning host's scheduler handles it
 	}
+	// A VM stranded on a witness (a promote's landing, awaiting its move to a
+	// worker) is stopped and cannot act: the execution gate refuses every run
+	// with local_not_active_worker. The schedule is paused, not failed: one
+	// audit entry and one replication.suspended notification say why and how it
+	// resumes (replicationOutcome reports a change of condition, not a repeat),
+	// and no run is made or logged as an error each tick (the schedule keeps the reason
+	// as its last error, never a success). It resumes by
+	// itself when the VM is moved to a worker, whose scheduler then owns it.
+	if h, herr := corrosion.GetHost(ctx, s.db, s.hostName); herr == nil && h != nil && h.IsWitness() {
+		// The owner-now checks come first, as for any host: a witness that is
+		// fenced, warming up, not an active member or behind on the VM's owner
+		// epoch may not be the VM's owner at all (it may have moved), so its run
+		// is skipped, quietly and owner-side, and records and raises nothing.
+		if oerr := s.mayReplicateVMAsOwnerWith(ctx, vm, true); oerr != nil {
+			s.notOwnerSkip(ctx, sched, vm.Name, oerr)
+			return fmt.Errorf("%w: %v", scheduler.ErrRunSkipped, oerr)
+		}
+		why := fmt.Sprintf("vm %s is on %s, a witness (role: %s) that runs no workloads, so its replication is paused until it is moved to a worker: `lv migrate %s %s --cold`",
+			vm.Name, s.hostName, h.Role, vm.Name, s.exampleWorker(ctx, s.hostName))
+		s.replicationOutcome(ctx, sched, "vm", vm.Name, tenancy.NormalizeProject(vm.Project), sched.TargetHost, sched.TargetPool, "",
+			fmt.Errorf("%w: %s", errReplicationSuspended, why))
+		// Recorded on the schedule as its last error, never as a successful run:
+		// the worker that takes the VM over then starts from a failing state and
+		// reports replication.recovered on its first good run.
+		return fmt.Errorf("%w: %s", scheduler.ErrRunPaused, why)
+	}
 	// The schedule's bandwidth limit, read once per run, paces every leg
 	// that sends this run's data to a peer.
 	ctx = withReplicationLimiter(ctx, s.scheduleLimiter(ctx, sched))

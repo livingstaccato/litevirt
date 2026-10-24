@@ -52,6 +52,11 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 		if target, err = s.resolveAdminTarget(ctx, req.TargetPath, disksDir); err != nil {
 			return err
 		}
+		// A named target can be the path a kept overlay names as its missing
+		// base (a derived one is a fresh name nothing can name).
+		if err := s.keptPathRefusal(ctx, "live restore to "+target, keptWritesOf(true, target)); err != nil {
+			return err
+		}
 	} else {
 		name := req.NewName
 		if name == "" {

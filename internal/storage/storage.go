@@ -148,6 +148,40 @@ func New(dataDir string, cfg Config) (Driver, error) {
 	}
 }
 
+// CreateDiskPath is where the CreateDisk of New(dataDir, cfg)'s driver puts
+// disk `disk` of VM `vm`: <vm>-<disk>.qcow2 in a file pool's directory (on
+// btrfs, in the disk's own subvolume), or the device of a zvol or thin LV.
+// ok is false for storage whose disk is no new path on this host: a ceph rbd
+// image, an iscsi LUN (a device that is there already). An error is a
+// config New refuses.
+func CreateDiskPath(dataDir string, cfg Config, vm, disk string) (path string, ok bool, err error) {
+	name := fmt.Sprintf("%s-%s", vm, disk)
+	switch strings.ToLower(cfg.Driver) {
+	case "", "local":
+		dir := filepath.Join(dataDir, "disks")
+		if cfg.Target != "" {
+			dir = cfg.Target
+		}
+		return filepath.Join(dir, name+".qcow2"), true, nil
+	case "dir":
+		if cfg.Target == "" {
+			return "", false, fmt.Errorf("dir driver requires Target")
+		}
+		return filepath.Join(cfg.Target, name+".qcow2"), true, nil
+	case "nfs":
+		return filepath.Join(NFSPoolMountDir(dataDir, cfg), name+".qcow2"), true, nil
+	case "btrfs":
+		return filepath.Join(btrfsDiskSubvolume(cfg.Source, vm, disk), name+".qcow2"), true, nil
+	case "zfs":
+		return "/dev/zvol/" + cfg.Source + "/" + name, true, nil
+	case "lvm-thin", "lvmthin":
+		return fmt.Sprintf("/dev/%s/%s", cfg.Source, name), true, nil
+	case "ceph", "iscsi":
+		return "", false, nil
+	}
+	return "", false, fmt.Errorf("unknown storage driver %q (supported: %v)", cfg.Driver, SupportedDrivers)
+}
+
 // qcow2Opts builds a *qcow2.Options from DiskOptions, falling back to
 // volume-level options when per-disk values are not set. Returns nil
 // when no overrides are present so the qcow2 package uses its defaults.

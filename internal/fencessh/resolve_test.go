@@ -2,6 +2,7 @@ package fencessh_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -122,5 +123,27 @@ func TestFenceConfig_ClonedHostKeysRefuseThePinnedPath(t *testing.T) {
 	}
 	if sf := a.agent(fencessh.ModeAuto).FenceConfig(ctx, "node-y"); sf.Refusal != "" || sf.Path != fence.SSHPathManaged {
 		t.Fatalf("managed path toward a cloned host = %+v, want managed", sf)
+	}
+}
+
+// TestFenceConfig_UncheckableClonedKeysRefuseThePinnedPath: when the rows the
+// cloned-key check reads cannot be listed, the check cannot tell "no clone"
+// from "could not look", so the pinned path is refused rather than taken.
+func TestFenceConfig_UncheckableClonedKeysRefuseThePinnedPath(t *testing.T) {
+	w := newWorld(t)
+	a := w.node("node-a", "127.0.0.2")
+	x := w.node("node-x", "127.0.0.3")
+	a.publish(true, false, "127.0.0.2", 22)
+	x.publish(false, false, "127.0.0.3", 22)
+	ctx := context.Background()
+	if sf := a.agent(fencessh.ModeAuto).FenceConfig(ctx, "node-x"); sf.Refusal != "" || sf.Path != fence.SSHPathPinned {
+		t.Fatalf("FenceConfig with the listing working = %+v, want pinned", sf)
+	}
+	defer fencessh.FailHostFenceSSHListForTest(errors.New("database is locked"))()
+	for _, mode := range []string{fencessh.ModeAuto, fencessh.ModeLegacy} {
+		if sf := a.agent(mode).FenceConfig(ctx, "node-x"); sf.Refusal == "" ||
+			!strings.Contains(sf.Refusal, "cannot check whether another host publishes node-x's sshd host keys") {
+			t.Fatalf("%s: FenceConfig with the listing failing = %+v, want refused", mode, sf)
+		}
 	}
 }

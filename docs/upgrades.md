@@ -141,6 +141,28 @@ reserved uids, an explicit `file_restore.uid_base` inside it refuses to load
 the config; with the default, the daemon starts and file restore is refused,
 naming the overlap — move `file_restore.uid_base`.
 
+## config.yaml becomes owner-only
+
+`/etc/litevirt/config.yaml` can hold an auth realm's inline secret
+(`bind_password`, `client_secret`), so this release keeps it 0600:
+
+- `lv host init` and the setup it runs write it 0600.
+- `lv host add` rewrites the ADDING node's config (its `join_peers`) by an
+  atomic rename. A re-added host's config is installed the same way, at its
+  own mode capped at 0600. Either way a config that was group- or
+  other-readable becomes owner-only, and the rename resets its owner and group
+  to root: a deliberate `root:<group> 0640` for a monitoring or
+  configuration-management reader loses both; grant that reader access another
+  way, such as running it as root.
+- A daemon whose config is group- or other-readable while it holds an inline
+  secret logs a warning naming the realm, and starts.
+
+A non-root `lv` on a node does not need the file: it finds the daemon
+through `/run/litevirt/endpoint`, which the daemon writes at start, or falls
+back to the defaults with the user's CLI bundle
+([installation.md](installation.md#cli-setup)). Until a node's daemon has
+restarted on this release there is no endpoint file, and the defaults apply.
+
 ## How a normal upgrade flows
 
 ```

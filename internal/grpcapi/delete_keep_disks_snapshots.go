@@ -111,7 +111,7 @@ func (s *Server) keptHere(d corrosion.DiskRecord, keepDisks bool) bool {
 // declared qcow2 backing file without the magic, and a chain deeper than
 // maxBackingDepth are errors naming the file.
 func keptChainLayers(file string) ([]string, error) {
-	layers, _, err := walkKeptChain(file, false)
+	layers, _, err := walkKeptChain(os.Stat, file, false)
 	return layers, err
 }
 
@@ -121,14 +121,16 @@ func keptChainLayers(file string) ([]string, error) {
 // below it is reached, but the last layer still names it, so a file written
 // there becomes that layer's base. Any other error is still one.
 func keptChainLayersToMissing(file string) (layers []string, missing string, err error) {
-	return walkKeptChain(file, true)
+	return walkKeptChain(os.Stat, file, true)
 }
 
-func walkKeptChain(file string, stopAtMissing bool) ([]string, string, error) {
+// walkKeptChain reads file's chain for keptChainLayers and
+// keptChainLayersToMissing, statting each layer with stat.
+func walkKeptChain(stat func(string) (os.FileInfo, error), file string, stopAtMissing bool) ([]string, string, error) {
 	var out []string
 	path, declaredQcow2 := file, false
 	for depth := 0; depth <= maxBackingDepth; depth++ {
-		fi, err := os.Stat(path)
+		fi, err := stat(path)
 		if err != nil {
 			if depth == 0 && errors.Is(err, fs.ErrNotExist) {
 				return nil, "", nil

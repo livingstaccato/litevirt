@@ -124,7 +124,17 @@ func (e *notOwnerNowError) Error() string { return e.msg }
 // member in its own view, or whose host-local owner-epoch marker is ahead of the
 // row it reads (its view is behind the runtime it holds).
 func (s *Server) mayReplicateVMAsOwner(ctx context.Context, vm *corrosion.VMRecord) error {
-	if reason, refused := s.execGateForAction(ctx, false); refused {
+	return s.mayReplicateVMAsOwnerWith(ctx, vm, false)
+}
+
+// mayReplicateVMAsOwnerWith is mayReplicateVMAsOwner; with witnessRoleOK the
+// execution gate's refusal for this host's ROLE (local_not_active_worker: a
+// witness runs no workloads) is not a refusal here, so the rest of the owner
+// checks (self-fence, quorum, warmup, an inactive host, an owner epoch behind)
+// still decide first for a witness holding a promoted VM. The pause of a
+// witness's schedule is the caller's, once these pass.
+func (s *Server) mayReplicateVMAsOwnerWith(ctx context.Context, vm *corrosion.VMRecord, witnessRoleOK bool) error {
+	if reason, refused := s.execGateForAction(ctx, false); refused && !(witnessRoleOK && reason == health.ReasonLocalNotActiveWorker) {
 		return &notOwnerNowError{fmt.Sprintf("this host may not act as the VM's owner now (%s)", reason)}
 	}
 	if h, err := corrosion.GetHost(ctx, s.db, s.hostName); err == nil && h != nil && h.State != "active" && h.State != "maintenance" {

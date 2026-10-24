@@ -526,7 +526,7 @@ func writeTargetConfig(t *testing.T, f *addFixture, body string, mode os.FileMod
 // (fd re-review N-m2). The machine's own enforcement block goes when the
 // cluster has none (N-I1: a re-added host must not keep its old kill
 // switches), and pki_dir is the directory the add installs to (N-I2). The
-// file keeps its mode, and a symlinked config stays a symlink. The copy of
+// file keeps its mode capped at 0600, and a symlinked config stays a symlink. The copy of
 // the original is kept, 0600, after a successful add, and put back on a
 // failure.
 //
@@ -545,8 +545,10 @@ func TestHostAdd_KeepsTheMachinesConfig(t *testing.T) {
 		if got := string(mustRead(t, cfg)); got != mergedOperatorConfig {
 			t.Errorf("merged config:\n%s\nwant:\n%s", got, mergedOperatorConfig)
 		}
-		if st, _ := os.Stat(cfg); st.Mode().Perm() != 0o640 {
-			t.Errorf("the config is %o, want its own 0640", st.Mode().Perm())
+		// Its own mode less the group bit: the config can hold an inline
+		// auth secret, so the add never installs it wider than 0600.
+		if st, _ := os.Stat(cfg); st.Mode().Perm() != 0o600 {
+			t.Errorf("the config is %o, want its own 0640 capped at 0600", st.Mode().Perm())
 		}
 		setup := ""
 		for _, e := range f.target.Events {

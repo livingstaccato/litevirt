@@ -2,7 +2,10 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -10,6 +13,7 @@ import (
 	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/endpointfile"
 	"github.com/litevirt/litevirt/internal/pki"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -47,9 +51,20 @@ type localDaemonConfig struct {
 // daemonConfigPath is the path to the daemon config file. Variable for testing.
 var daemonConfigPath = "/etc/litevirt/config.yaml"
 
+// endpointPath is the daemon's endpoint file (internal/endpointfile).
+// Variable for testing.
+var endpointPath = endpointfile.Path
+
+// cliNotice is where LoadClusterConfig says which source it fell back to.
+// Variable for testing.
+var cliNotice io.Writer = os.Stderr
+
 // LoadClusterConfig reads the cluster config.
 // Priority: 1) LV_HOST env var → remote gRPC/mTLS mode
-//  2. local daemon config at /etc/litevirt/config.yaml → local mode
+//  2. the daemon's endpoint file, /run/litevirt/endpoint → local mode
+//  3. local daemon config at /etc/litevirt/config.yaml → local mode
+//  4. that config unreadable by this user (0600, root's) → local mode on the
+//     defaults with this user's CLI bundle, saying so
 func LoadClusterConfig() (*ClusterConfig, error) {
 	// Explicit remote target always wins.
 	if host := os.Getenv("LV_HOST"); host != "" {
@@ -60,8 +75,22 @@ func LoadClusterConfig() (*ClusterConfig, error) {
 		}, nil
 	}
 
+	// The endpoint file the daemon publishes, 0644, with only the two values
+	// local mode needs. A malformed one is not trusted in any part.
+	ep, err := endpointfile.Read(endpointPath)
+	if err == nil {
+		return localClusterConfig(ep.GRPCPort, ep.PKIDir), nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		fmt.Fprintf(cliNotice, "lv: ignoring the daemon's endpoint file %s: %v\n", endpointPath, err)
+	}
+
 	// Check for local daemon config.
-	if data, err := os.ReadFile(daemonConfigPath); err == nil {
+	data, err := os.ReadFile(daemonConfigPath)
+	if errors.Is(err, fs.ErrPermission) {
+		return localModeWithoutDaemonConfig(err)
+	}
+	if err == nil {
 		var dc localDaemonConfig
 		// A config that is PRESENT but unparseable is its own answer, and used to
 		// fall through to "LV_HOST not set" — which says the file is absent. A
@@ -72,25 +101,52 @@ func LoadClusterConfig() (*ClusterConfig, error) {
 			return nil, fmt.Errorf("daemon config %s is present but could not be parsed: %w",
 				daemonConfigPath, err)
 		}
-		port := dc.GRPCPort
-		if port == 0 {
-			port = 7443
-		}
-		pkiDir := dc.PKIDir
-		if pkiDir == "" {
-			pkiDir = "/etc/litevirt/pki"
-		}
-		if cliPKIBundleExists(PKIDir()) {
-			pkiDir = PKIDir()
-		}
-		return &ClusterConfig{
-			GRPCPort: port,
-			PKIDir:   pkiDir,
-			Local:    true,
-		}, nil
+		return localClusterConfig(dc.GRPCPort, dc.PKIDir), nil
 	}
 
 	return nil, fmt.Errorf("LV_HOST not set (set to host[:port] of any cluster node, or run on a litevirtd node)")
+}
+
+// localClusterConfig is local mode on port and pkiDir (a zero or empty one
+// takes the default), with this user's CLI bundle in place of pkiDir when
+// there is one.
+func localClusterConfig(port int, pkiDir string) *ClusterConfig {
+	if port == 0 {
+		port = 7443
+	}
+	if pkiDir == "" {
+		pkiDir = "/etc/litevirt/pki"
+	}
+	if cliPKIBundleExists(PKIDir()) {
+		pkiDir = PKIDir()
+	}
+	return &ClusterConfig{GRPCPort: port, PKIDir: pkiDir, Local: true}
+}
+
+// localModeWithoutDaemonConfig is LoadClusterConfig's answer on a node whose
+// config.yaml this user cannot read (it is root's, 0600, because it can hold
+// inline secrets) and whose daemon has published no usable endpoint file.
+//
+// A user `sudo lv host init --local` gave a CLI bundle (ca.crt, client.crt,
+// client.key under ~/.config/litevirt/pki) needs nothing else from that file:
+// local mode dials loopback, and reads the file only for grpc_port and
+// pki_dir, which the bundle replaces. The bundle carries no address or port,
+// so the port is the one init writes (7443), and the output says the
+// defaults were taken. TLS is verified against the bundle's CA as on any
+// local-mode connection; nothing here dials without it.
+//
+// Without a bundle there is nothing to connect with, and the error names the
+// file and the ways out rather than claiming there is no config at all.
+func localModeWithoutDaemonConfig(readErr error) (*ClusterConfig, error) {
+	if dir := PKIDir(); cliPKIBundleExists(dir) {
+		fmt.Fprintf(cliNotice, "lv: %s cannot be read by this user, and no usable endpoint file is at %s; "+
+			"using the defaults: the daemon on 127.0.0.1:7443, with the CLI client bundle in %s "+
+			"(set LV_HOST for another node, or run the command with sudo)\n", daemonConfigPath, endpointPath, dir)
+		return &ClusterConfig{GRPCPort: 7443, PKIDir: dir, Local: true}, nil
+	}
+	return nil, fmt.Errorf("daemon config %s cannot be read by this user (%w), and there is no CLI client bundle in %s: "+
+		"set LV_HOST to host[:port] of a cluster node, or run the command with sudo",
+		daemonConfigPath, readErr, PKIDir())
 }
 
 // Connect establishes a gRPC connection to a litevirtd instance.

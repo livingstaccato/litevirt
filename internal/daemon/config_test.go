@@ -716,3 +716,59 @@ func TestLoadConfig_SessionHardExpiryCapped(t *testing.T) {
 		}
 	}
 }
+
+// An inline bind_password / client_secret in a config.yaml other users can read
+// is readable by anyone with a shell (/etc/litevirt is searchable for the fence
+// agent). The daemon warns, naming the realms but never the values, and still
+// starts. No warning for a 0600 file or a config with no inline secret.
+//
+// Mutation: drop the warnReadableInlineSecrets call, or its mode check — the
+// "0644 inline" or "0600 inline" case fails.
+func TestLoadConfig_WarnsOnReadableInlineAuthSecrets(t *testing.T) {
+	dir := t.TempDir()
+	cp := filepath.Join(dir, "config.yaml")
+	t.Setenv("LITEVIRT_CONFIG", cp)
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	const inline = "host_name: h\nauth:\n  realms:\n" +
+		"    - name: corp\n      kind: ldap\n      ldap:\n        url: ldaps://dc\n        bind_password: hunter2\n" +
+		"    - name: sso\n      kind: oidc\n      oidc:\n        issuer_url: https://idp\n        client_id: lv\n        client_secret: s3cr3t\n"
+	const fileOnly = "host_name: h\nauth:\n  realms:\n" +
+		"    - name: corp\n      kind: ldap\n      ldap:\n        url: ldaps://dc\n        bind_password_file: /etc/litevirt/ldap.pw\n"
+	for _, tc := range []struct {
+		name string
+		body string
+		mode os.FileMode
+		warn bool
+	}{
+		{"0644 inline", inline, 0o644, true},
+		{"0640 inline", inline, 0o640, true},
+		{"0600 inline", inline, 0o600, false},
+		{"0644 file only", fileOnly, 0o644, false},
+	} {
+		logs.Reset()
+		if err := os.WriteFile(cp, []byte(tc.body), tc.mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(cp, tc.mode); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadConfig(); err != nil {
+			t.Fatalf("%s: LoadConfig refused (%v); it must warn, never refuse", tc.name, err)
+		}
+		out := logs.String()
+		warned := strings.Contains(out, "holds inline auth secrets and is readable by other users")
+		if warned != tc.warn {
+			t.Errorf("%s: warned %v, want %v (log %q)", tc.name, warned, tc.warn, out)
+		}
+		if warned && (!strings.Contains(out, "corp.ldap.bind_password") || !strings.Contains(out, "sso.oidc.client_secret")) {
+			t.Errorf("%s: the warning does not name both realms' secrets: %q", tc.name, out)
+		}
+		if strings.Contains(out, "hunter2") || strings.Contains(out, "s3cr3t") {
+			t.Errorf("%s: the warning logged a secret value: %q", tc.name, out)
+		}
+	}
+}

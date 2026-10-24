@@ -41,6 +41,10 @@ type Options struct {
 	// inflate on the running guest. Uncompressed is far faster both ways — the
 	// right choice for VM clones. Zero value preserves the legacy behavior.
 	Uncompressed bool
+	// NoFollowSource makes ConvertConfined open the source image itself (not its
+	// backings) O_NOFOLLOW and judge it as the open file, so a link swapped in
+	// for it after the caller's own checks is refused.
+	NoFollowSource bool
 }
 
 func (o *Options) clusterBits() uint32 {

@@ -638,7 +638,7 @@ func (s *Server) removeDiscardedStubs(ctx context.Context, vmName string, stubs 
 				"vm", vmName, "path", p)
 			continue
 		}
-		if err := os.Remove(s.hostDiskFile(p)); err != nil && !os.IsNotExist(err) {
+		if err := s.removeDiskFileBeneath(p, true); err != nil {
 			slog.Warn("live firmware move: discard could not remove a disk stub", "vm", vmName, "path", p, "error", err)
 			continue
 		}

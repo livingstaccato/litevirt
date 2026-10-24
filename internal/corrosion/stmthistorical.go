@@ -438,5 +438,20 @@ func HistoricalShapes() []HistoricalShape {
 		Removal:      "after v1.9.0 unsupported, and once no node runs a build before the placement move",
 	})
 
+	// The no-holder LB claim (ClaimLBHolderIfUnowned), which backfilled a
+	// holder onto an explicit LB persisted with hosts=[]. CreateLoadBalancer
+	// records a holder since v1.0.50, so the repair had nothing left to repair
+	// and was removed after v1.10.0-rc7. Every rc through rc7 still emits it
+	// during a rolling upgrade; it applies as the LWW-gated full-PK update it
+	// always was.
+	out = append(out, HistoricalShape{
+		SQL: `UPDATE lb_configs SET hosts = ?, updated_at = ?
+		 WHERE name = ? AND deleted_at IS NULL AND (hosts IS NULL OR hosts IN ('', '[]', 'null'))`,
+		Family:       "lb_claim_holder_if_unowned",
+		FirstEmitter: emitterV130,
+		LastEmitter:  "v1.10.0-rc7",
+		Removal:      "after v1.10.0-rc7 unsupported",
+	})
+
 	return out
 }

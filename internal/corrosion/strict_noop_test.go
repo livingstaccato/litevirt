@@ -80,9 +80,6 @@ func TestStrictHelpers_AZeroRowRefusalIsNeitherRelayedNorParked(t *testing.T) {
 		{"ClaimPCIDevice", func(c *Client) error {
 			return wantFalse(ClaimPCIDevice(ctx, c, "h", "0000:00:01.0", "vm"))
 		}},
-		{"ClaimLBHolderIfUnowned", func(c *Client) error {
-			return wantFalse(ClaimLBHolderIfUnowned(ctx, c, "no-lb", `["h"]`))
-		}},
 		{"CompleteActionProof", func(c *Client) error {
 			return wantErr(CompleteActionProof(ctx, c, "no-proof", "h"), ErrNoRowsAffected)
 		}},

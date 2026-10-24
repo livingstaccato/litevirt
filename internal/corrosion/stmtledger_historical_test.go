@@ -144,7 +144,7 @@ import (
 // updated_at = ?` moved from the current ledger to the vm_spec_rescope_v130
 // family, receive-only, with the full-PK update disposition it already had. An
 // ADDITION; no previously accepted historical identity was removed or changed.
-const compatibilityDigest = "7ca7d5be21fff4328f71e195e58835208638387c30b39484fca5ea56d0c5d03f"
+const compatibilityDigest = "ecd216080a3b30dbca5d987b60cc1c2e4a89ca200ee0c812ae953f12ef3fe958"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -217,6 +217,7 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"rebalance_reap_stale_bulk_v130":        1,   // executor's bulk stale reap with a lexical updated_at cutoff, before updated_at became the LWW key
 	"vm_disk_host_move_v130":                1,   // a disk row's host-only move (migration commit, failover), before moves carried the placement
 	"vm_spec_rescope_v130":                  1,   // the legacy network-name pass's bare VM spec rewrite, before it became a desired-spec edit
+	"lb_claim_holder_if_unowned":            1,   // the no-holder LB claim, removed with its repair after v1.10.0-rc7
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.

@@ -3478,7 +3478,10 @@ While an entry is there, a create on that host never clears the file it names,
 nor a file that disk's backing chain reaches: the create is refused, naming
 the file (docs/cli-reference.md, `lv rm`). A disk the delete of a VM with no
 domain kept is also in `<data_dir>/kept-disks/<vm>.json`, with the files its
-chain backs on. While `kept-disks.json`, a note `<data_dir>/kept-disks/<vm>.json`,
+chain backs on. Every entry's file is also noted there (`recorded`), for the
+scan below alone: that holds no file, so a retry of a delete whose removal
+failed still frees it, and the note goes with the entry once the file is
+gone or released. While `kept-disks.json`, a note `<data_dir>/kept-disks/<vm>.json`,
 the listing of the set-aside `.kept-` and `.superseded-` copies, or the
 backing chain of a disk one of them names, cannot be read, the evidence names
 the file under `creates_refused`

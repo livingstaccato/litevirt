@@ -342,7 +342,9 @@ func TestDeleteVM_StaleRecordNotesNothingWhenAChainCannotBeRead(t *testing.T) {
 	if vm, _ := corrosion.GetVM(adminCtx(), s.db, "a"); vm == nil {
 		t.Fatal("the record went")
 	}
-	if _, err := os.Stat(filepath.Join(s.dataDir, "kept-disks", "a.json")); !os.IsNotExist(err) {
-		t.Errorf("a note was written for a refused delete (%v)", err)
+	// The entry kept-disks.json records is noted for the scan alone
+	// (recorded), which holds nothing: no note may hold a path.
+	if files, err := health.KeptNotedFiles(s.dataDir); err != nil || len(files) != 0 {
+		t.Errorf("a note holding %v was written for a refused delete (%v)", files, err)
 	}
 }

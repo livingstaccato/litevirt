@@ -959,10 +959,20 @@ incomplete the VM is marked **partial**:
   `vm.promoted_partial`.
 
 A disk not recovered is not attached; attach or restore it once its host is
-back. A file already where a disk's live disk would go (a crashed earlier
-attempt's, say) is left alone, and the live disk is built beside it. A
-crash-recovered promotion counts another disk only when the domain it adopts
-has that disk.
+back. Each live disk a promotion builds is a new file in the target pool,
+`<vm>-promoted-<replica stem>-<random>.qcow2`, under a name no file has had:
+the name an earlier build used, without the random part, can be the missing
+base of a disk kept by `lv rm --keep-disks` after an earlier promotion from
+the same replica, and a file built there would become that kept disk's base.
+A promotion never refuses for a kept disk, so failover does not wait on
+`kept-disks.json`, and a file already at any name is never replaced. The
+name is recorded on the host before the file is created
+(`<data_dir>/promote-disks/<vm>.json`, removed once the promoted VM's disk
+rows name the files), so a promotion retried after a crash or a failure, with
+the same proof, a new one or none, reuses the live disk the earlier attempt
+built from the same replica instead of building another beside it. One built
+from another replica is left alone. A crash-recovered promotion counts
+another disk only when the domain it adopts has that disk.
 
 After a successful automatic promotion the failover coordinator records the
 disks the VM ran on, on the failed host — the real, newer data of every disk —

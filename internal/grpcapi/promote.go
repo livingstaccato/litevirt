@@ -1421,25 +1421,49 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 	}
 
-	// Build the live disk from the replica.
-	ts := strings.TrimSuffix(strings.TrimSuffix(replica, ".qcow2"), ".raw")
-	livePath := filepath.Join(poolDir, fmt.Sprintf("%s-promoted-%s.qcow2", targetName, ts))
-	// Honor the disk_built checkpoint only if the artifact actually EXISTS at livePath:
-	// step_state is forward-only, but every error path after the build does
-	// os.Remove(livePath), so a same-proof retry would otherwise see disk_built, skip the
-	// rebuild, define a domain whose disk is gone, fail StartDomain, remove again, and
-	// loop forever. livePath also embeds the replica timestamp, so if the chosen replica
-	// changed between attempts the recorded step doesn't correspond to this path either.
-	// Verify the file before trusting the checkpoint (artifact observation).
-	_, livePathStatErr := os.Stat(livePath)
-	diskBuilt := promoteDiskBuilt(stepDone("disk_built"), livePathStatErr == nil)
-	// Skip the (re)build if a prior attempt already built the live disk (and definitely if
-	// it already STARTED the domain off it — rebuilding would overwrite a running VM's disk).
-	if !diskBuilt && !started {
-		if err := s.buildPromotedDisk(ctx, req, targetName, poolDir, replica, replicaPath, replicaRec.Format, livePath, send); err != nil {
-			return err
+	// Build the live disk from the replica, under a name no file has had,
+	// recorded before the file is created (promote_disk_names.go): a kept
+	// disk can name the path an earlier promotion from this replica used as
+	// its missing base, and a file built there would become that base.
+	journal := s.readPromoteDisks(targetName)
+	// A crash-recovery adoption attaches only what the running domain has.
+	adoptedXML := ""
+	if started {
+		adoptedXML, _ = s.virt.DumpXML(targetName)
+	}
+	// An earlier attempt of this proof names the file it built in a step:
+	// this build's as disk_built:<disk>=<file>,<replica>, an earlier build's
+	// (rolling upgrade) as a bare disk_built for the file at that build's
+	// name, which this build never writes. Honored only while the file
+	// exists: step_state is forward-only, but error paths remove the disk.
+	stepFile := ""
+	if built, from, ok := builtStepPath(steps, src.DiskName); ok && from == replica {
+		stepFile = filepath.Join(poolDir, built)
+	} else if old := legacyPromotedPath(poolDir, targetName, replica); promoteDiskBuilt(stepDone("disk_built"), isRegularFile(old)) {
+		stepFile = old
+	}
+	var livePath string
+	if started {
+		// It already STARTED the domain off its live disk: never rebuilt
+		// (that would overwrite a running VM's disk); the one it runs from.
+		livePath = adoptedPromotedDisk(journal, targetName, poolDir, src.DiskName, replica, adoptedXML,
+			stepFile, legacyPromotedPath(poolDir, targetName, replica))
+		if livePath == "" {
+			livePath = legacyPromotedPath(poolDir, targetName, replica)
 		}
-		recordStep("disk_built")
+	} else {
+		p, diskBuilt, err := s.planPromotedDisk(ctx, journal, targetName, poolDir, src.DiskName, replica, stepFile)
+		if err != nil {
+			return status.Errorf(codes.Internal, "promote of %s: record the name of its live disk before building it: %v", vm.Name, err)
+		}
+		livePath = p
+		// Skip the (re)build if a prior attempt already built the live disk.
+		if !diskBuilt {
+			if err := s.buildPromotedDisk(ctx, req, targetName, poolDir, replica, replicaPath, replicaRec.Format, livePath, send); err != nil {
+				return err
+			}
+			recordStep(builtStep(src.DiskName, filepath.Base(livePath), replica))
+		}
 	}
 
 	// Every other disk of the VM that has a replica here is recovered too
@@ -1474,11 +1498,6 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	}
 	others := chooseSetReplicas(poolDir, vm.Project, vm.Name, rootTaken, replicaSetOthers(vmDisks, src),
 		func(d corrosion.DiskRecord) bool { return s.diskOnSharedStorage(ctx, d) }, acceptNotPIT, otherAgeLimit, time.Now())
-	// A crash-recovery adoption attaches only what the running domain has.
-	adoptedXML := ""
-	if started {
-		adoptedXML, _ = s.virt.DumpXML(targetName)
-	}
 	inAdopted := func(path string) bool {
 		return adoptedXML != "" && (strings.Contains(adoptedXML, "'"+path+"'") || strings.Contains(adoptedXML, `"`+path+`"`))
 	}
@@ -1565,41 +1584,39 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		if !d.recovered() {
 			continue
 		}
-		d.livePath = filepath.Join(poolDir, fmt.Sprintf("%s-promoted-%s.qcow2", targetName,
-			strings.TrimSuffix(strings.TrimSuffix(d.replica.File, ".qcow2"), ".raw")))
-		// The step names the file this proof built and the replica it built
-		// it from (reviews N4, R2-m2): a retry reuses that file only when it
-		// was built from the replica chosen now, and never any other file —
-		// one at the canonical name this proof did not build is never reused
-		// nor removed, and one built from another replica is left and a new
-		// one built beside it.
+		// An earlier build's attempt of this proof names the file it built
+		// and the replica it built it from in a step (reviews N4, R2-m2;
+		// rolling upgrade): honored only when built from the replica chosen
+		// now. This build names each live disk freshly and records it first
+		// (promote_disk_names.go); an earlier attempt's file built from
+		// another replica is left and a new one built beside it.
+		legacy := ""
 		if built, from, ok := builtStepPath(steps, d.row.DiskName); ok && from == d.replica.File {
-			d.livePath = filepath.Join(poolDir, built)
+			legacy = filepath.Join(poolDir, built)
 		}
-		step := builtStep(d.row.DiskName, filepath.Base(d.livePath), d.replica.File)
-		_, statErr := os.Stat(d.livePath)
 		if started {
 			// Adopting a domain an earlier attempt started: the disk counts
 			// only if its built file is there and the domain has it.
-			if statErr != nil || !inAdopted(d.livePath) {
+			d.livePath = adoptedPromotedDisk(journal, targetName, poolDir, d.row.DiskName, d.replica.File, adoptedXML,
+				legacy, legacyPromotedPath(poolDir, targetName, d.replica.File))
+			if d.livePath == "" || !inAdopted(d.livePath) {
 				d.missing = "not built or not attached by the attempt that started the domain"
 				d.livePath = ""
 			}
 			continue
 		}
-		if promoteDiskBuilt(stepDone(step), statErr == nil) {
+		p, built, perr := s.planPromotedDisk(ctx, journal, targetName, poolDir, d.row.DiskName, d.replica.File, legacy)
+		if perr != nil {
+			slog.Error("promote: the name of a live disk of the replica set could not be recorded; promoting without it",
+				"vm", vm.Name, "disk", d.row.DiskName, "replica", d.replica.File, "error", perr)
+			d.missing = fmt.Sprintf("the name of the live disk to build from its replica %s could not be recorded: %v", d.replica.File, perr)
 			continue
 		}
-		if statErr == nil {
-			// Something is at the name — a crashed earlier attempt's file, or
-			// anyone's. Never removed and never reused: the live disk is
-			// built beside it under a fresh name.
-			alt := strings.TrimSuffix(d.livePath, ".qcow2") + "-" + randid.New() + ".qcow2"
-			slog.Warn("promote: a file is already where the live disk would go; left alone, building beside it",
-				"vm", vm.Name, "disk", d.row.DiskName, "path", d.livePath, "instead", alt)
-			d.livePath = alt
-			step = builtStep(d.row.DiskName, filepath.Base(alt), d.replica.File)
+		d.livePath = p
+		if built {
+			continue
 		}
+		step := builtStep(d.row.DiskName, filepath.Base(d.livePath), d.replica.File)
 		if err := s.buildPromotedDisk(ctx, req, targetName, poolDir, d.replica.File, d.replicaPath, d.replica.Format, d.livePath, send); err != nil {
 			slog.Error("promote: a disk of the replica set could not be built; promoting without it",
 				"vm", vm.Name, "disk", d.row.DiskName, "replica", d.replica.File, "error", err)
@@ -2098,6 +2115,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// Row persisted (the durable record now exists) → drop the host-local promote marker;
 	// a future retry would see the re-homed row and not re-promote.
 	s.removePromoteMarker(targetName)
+	// The rows name the live disks now: their journal is done with.
+	s.clearPromoteDisks(targetName)
 
 	// The manifest: every disk and the replica it came from, or why not.
 	s.recordVMEvent(ctx, targetName, "vm.promoted", "ok", manifest)

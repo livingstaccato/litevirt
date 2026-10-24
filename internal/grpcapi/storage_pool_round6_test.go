@@ -205,8 +205,8 @@ func TestPoolRound6_PromoteFallsBackToAnOlderReplica(t *testing.T) {
 		if !s.virt.DomainExists(vm) {
 			t.Errorf("%s was not promoted from its older replica", vm)
 		}
-		if _, err := os.Stat(filepath.Join(disks, vm+"-promoted-"+good[vm]+".qcow2")); err != nil {
-			t.Errorf("%s was not promoted from its oldest, good replica: %v", vm, err)
+		if !promotedFrom(disks, vm, good[vm]+".qcow2") {
+			t.Errorf("%s was not promoted from its oldest, good replica", vm)
 		}
 	}
 }
@@ -267,8 +267,8 @@ func TestPoolRound6_PromoteAndPruneNeverTakeAnotherProjectsReplica(t *testing.T)
 	if err := promote(pat, s, &pb.PromoteReplicaRequest{VmName: "bvm-root", TargetPool: "default", NoLocalize: true}); err != nil {
 		t.Fatalf("promoting acme's own replica: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(disks, "bvm-root-promoted-bvm-root-20261006-20261007-000000.qcow2")); err != nil {
-		t.Errorf("acme's bvm-root was not promoted from its own replica: %v", err)
+	if !promotedFrom(disks, "bvm-root", "bvm-root-20261006-20261007-000000.qcow2") {
+		t.Errorf("acme's bvm-root was not promoted from its own replica")
 	}
 }
 

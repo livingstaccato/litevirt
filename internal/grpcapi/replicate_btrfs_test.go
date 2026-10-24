@@ -565,8 +565,7 @@ func TestReplicateVolume_NativeBtrfsCopyIsPromotedAndBooted(t *testing.T) {
 	if !promotedFrom(dst, "vm1", filepath.Base(copyFile)) {
 		t.Fatalf("vm1 was not promoted from %s (pool holds %q)", copyFile, entries(t, dst))
 	}
-	stem := strings.TrimSuffix(filepath.Base(copyFile), ".qcow2")
-	overlay := filepath.Join(dst, "vm1-promoted-"+stem+".qcow2")
+	overlay := promotedPathIn(dst, "vm1", filepath.Base(copyFile))
 	if info, err := qcow2.Info(overlay); err != nil || info.BackingFile != copyFile {
 		t.Errorf("the promoted disk's backing = %+v (%v), want the copy %s", info, err, copyFile)
 	}

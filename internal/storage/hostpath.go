@@ -179,6 +179,7 @@ var dataDirOwned = []string{
 	"ct-restore-markers",         // backup_container.go
 	"ct-provenance",              // grpcapi/replication_container.go: container replica provenance
 	"promote-markers",            // promote.go
+	"promote-disks",              // grpcapi/promote_disk_names.go: the live-disk names a promote recorded before building
 	"restore-staging",            // peer_backup.go
 	"backup-staging",             // peer_backup.go
 	"backup-scratch",             // libvirt/backup_session.go sessScratchDir (hardcoded /var/lib/litevirt)

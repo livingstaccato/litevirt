@@ -233,12 +233,13 @@ func TestPromote_ADiskThatCannotBeBuiltIsNamedNotFatal(t *testing.T) {
 	}
 }
 
-// M7: a file already where a disk's live disk would go — a crashed earlier
-// attempt's, or anyone's — is neither removed nor reused nor fatal: the live
-// disk is built beside it and the disk is recovered.
+// M7: a file already at the name an earlier build gave a disk's live disk —
+// a crashed earlier attempt's, or anyone's — is neither removed nor reused
+// nor fatal: the live disk is built under a fresh name beside it and the
+// disk is recovered.
 //
-// Mutation "debris refuses": the fresh-name fallback is removed — red (data1
-// is not recovered).
+// Mutation "old name" (freshPromotedPath without its random part) — red
+// (data1 is not recovered).
 func TestPromote_DebrisWhereALiveDiskGoesIsLeftAndBuiltBeside(t *testing.T) {
 	s := testServer(t)
 	poolDir := setPromoteVM(t, s, "db", map[string]string{"data1": "local"})

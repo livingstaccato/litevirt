@@ -1011,6 +1011,9 @@ type Server struct {
 	// migration copies (hostDiskFile, SetHostDiskRootForTest). Empty in
 	// production.
 	hostDiskRoot string
+	// promotedDiskSuffix is a TEST SEAM for the random part of a promoted
+	// live disk's name (freshPromotedPath). nil in production: randid.New.
+	promotedDiskSuffix func() string
 	// startedAt is when this daemon's Server was made. A start lease this
 	// host holds that was taken before it was left by a run that is gone
 	// (holdStartLease). Zero in tests that build a Server directly: every

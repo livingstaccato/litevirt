@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,9 +29,26 @@ import (
 // promotedFrom reports whether vm was promoted from replica in dir: the
 // promoted live disk is named after the replica it was built from.
 func promotedFrom(dir, vm, replica string) bool {
+	return promotedPathIn(dir, vm, replica) != ""
+}
+
+// promotedPathIn is the live disk in dir a promotion of vm built from
+// replica — <vm>-promoted-<replica stem>-<16 hex>.qcow2 (freshPromotedPath)
+// — or "" when there is none.
+func promotedPathIn(dir, vm, replica string) string {
 	stem := replica[:len(replica)-len(filepath.Ext(replica))]
-	_, err := os.Stat(filepath.Join(dir, vm+"-promoted-"+stem+".qcow2"))
-	return err == nil
+	prefix := vm + "-promoted-" + stem + "-"
+	ents, _ := os.ReadDir(dir)
+	for _, e := range ents {
+		rest, ok := strings.CutPrefix(e.Name(), prefix)
+		if !ok {
+			continue
+		}
+		if r, ok := strings.CutSuffix(rest, ".qcow2"); ok && len(r) == 16 && strings.Trim(r, "0123456789abcdef") == "" {
+			return filepath.Join(dir, e.Name())
+		}
+	}
+	return ""
 }
 
 func setPast(t *testing.T, path string, when time.Time) {

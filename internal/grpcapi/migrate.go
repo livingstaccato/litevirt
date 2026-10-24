@@ -1799,6 +1799,20 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 			return nil, status.Errorf(codes.Internal, "stat disk stub %s: %v", stub.Path, err)
 		}
 	}
+	// The stubs, which the mirror fills with the VM's disks, land at paths a
+	// delete's kept overlay on this host may name as its missing base: the
+	// kept-create check, before any is made. Kept state this host cannot
+	// read refuses too.
+	if len(req.Disks) > 0 {
+		paths := make([]string, 0, len(req.Disks))
+		for _, stub := range req.Disks {
+			paths = append(paths, stub.Path)
+		}
+		if err := s.keptPathRefusal(ctx, "the migration of VM "+strconv.Quote(req.VmName)+" onto this host",
+			keptWritesOf(true, paths...)); err != nil {
+			return nil, err
+		}
+	}
 	if s.isoResolvedWithheld {
 		isoResolved = nil
 	}

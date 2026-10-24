@@ -23,6 +23,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hlc"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/notify"
@@ -1092,6 +1093,15 @@ func (s *Server) holdImage(name string) (release func()) {
 // does not answer must not stall the reconciler's whole pass. Not taken in
 // time, the rebuild fails transiently, and a later pass retries it.
 func (s *Server) RecreateOverlayDisk(vmName, diskName, imageName, size string) (string, error) {
+	// The rebuild writes <disks>/<vm>-<disk>.qcow2, which a delete's kept
+	// overlay on this host may name as its missing base: the kept-create
+	// check, kept state that cannot be read refusing too. The reconciler
+	// fails the start retryably and raises vm_disk_kept_base
+	// (health/kept_rebuild.go).
+	path := s.imageStore().DiskPath(vmName, diskName)
+	if err := s.keptMissingBaseRefusal(context.Background(), keptWritesOf(true, path)); err != nil {
+		return "", &health.KeptRebuildRefusedError{Path: path, Err: err}
+	}
 	release, ok := s.imagePrune.holdWithinShared(imageName, recreateHoldWait)
 	if !ok {
 		return "", fmt.Errorf("image %q: an image prune on this host has held the image lock for %s (its image store may not be answering); the rebuild is retried",

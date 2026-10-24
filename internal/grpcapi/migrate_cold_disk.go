@@ -615,6 +615,15 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	} else if !os.IsNotExist(err) {
 		return status.Errorf(codes.Internal, "stat %s: %v", hdr.Path, err)
 	}
+	// The disk lands at a path a delete's kept overlay on this host may name
+	// as its missing base, and would become that base: the kept-create check,
+	// in the check_only preflight (the move fails on the source before
+	// anything is copied) and again before a real receive writes anything.
+	// Kept state this host cannot read refuses too.
+	if err := s.keptPathRefusal(ctx, fmt.Sprintf("the migration of VM %q onto this host", vm.Name),
+		keptWritesOf(true, shown)); err != nil {
+		return err
+	}
 	// A check-only call writes nothing, not even the directory: its free space
 	// is that of the nearest directory that exists, which is the filesystem
 	// the copy's directory is made on.

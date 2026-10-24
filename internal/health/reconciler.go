@@ -913,6 +913,7 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 	r.virtWait.prune(live)
 
 	r.resolveDiskMissing(ctx)
+	r.resolveKeptRebuildRefused(ctx)
 	r.tendStrandedDisks(ctx)
 	r.cleanupRekeyLeftovers(ctx)
 
@@ -2357,6 +2358,10 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 				}
 				newPath, createErr := recreate(vm.Name, d.DiskName, d.BackingImage, size)
 				if createErr != nil {
+					// A rebuild at a kept overlay's missing base is refused
+					// (kept_rebuild.go): retryable, as below, and named by
+					// vm_disk_kept_base.
+					r.keptRebuildRefused(ctx, vm.Name, d.DiskName, createErr)
 					slog.Error("reconciler: recreate overlay failed", "vm", vm.Name, "error", createErr)
 					// Transient — retry the overlay build — unless the base
 					// image is one qemu refuses as corrupt: no retry mends it.

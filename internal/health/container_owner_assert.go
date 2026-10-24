@@ -11,7 +11,8 @@ import (
 	"github.com/litevirt/litevirt/internal/randid"
 )
 
-// SetPeerContainerRuntimeChecker injects the peer CheckContainerRuntime client.
+// SetPeerContainerRuntimeChecker injects the peer runtime check (the daemon
+// wires grpcapi CheckPeerContainerRuntime, answered by GetRuntimeInventory).
 // Without it, runtime re-key is disabled.
 func (c *ContainerChecker) SetPeerContainerRuntimeChecker(fn func(ctx context.Context, host, name string) (string, error)) {
 	c.checkPeerRuntime = fn

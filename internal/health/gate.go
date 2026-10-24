@@ -153,8 +153,9 @@ func VotingEligible(state string) bool { return corrosion.VotingEligible(state) 
 
 // QuorumProof computes whether this daemon currently sees a live voting majority,
 // using its OWN probe results. Returns the tri-state plus the live/needed counts
-// for observability. `needed = liveVotingHosts/2 + 1`; `live` counts self (if
-// voting-eligible) plus each voting-eligible peer this daemon has probed healthy.
+// for observability. `needed = len(voters)/2 + 1` over the voter set
+// (corrosion.VoterSet); `live` counts self (if a voter) plus each voter this
+// daemon has probed healthy.
 //
 // It is CLUSTER-WIDE whatever the failover scope says. Its consumers outside
 // the failover path — VIP self-demotion, the lease-term barrier, dual-run
@@ -361,9 +362,9 @@ func LostEveryDecisionQuorumUnder(ctx context.Context, pol *DecisionPolicy,
 	return true
 }
 
-// LostOwnRegionQuorum reports whether, under region-scoped failover, self's
-// own region has at least three voters and region's reading of that region's
-// quorum does not hold it (held, as for LostEveryDecisionQuorum; nil holds
+// LostOwnRegionQuorumUnder reports whether, under region-scoped failover,
+// self's own region has at least three voters and region's reading of that
+// region's quorum does not hold it (held, as for LostEveryDecisionQuorum; nil holds
 // every reading but a definite No).
 //
 // It is the failover lease's second stand-down, on top of
@@ -376,15 +377,8 @@ func LostEveryDecisionQuorumUnder(ctx context.Context, pol *DecisionPolicy,
 // voters cannot fence its own hosts (§3), so nothing there waits on the lease.
 //
 // Cluster scope, a nil region reading, and a scope or voter set that cannot
-// be read are not lost: LostEveryDecisionQuorum still applies to them.
-func LostOwnRegionQuorum(ctx context.Context, db *corrosion.Client, self string,
-	region func(context.Context, string) (QuorumState, int, int),
-	held func(ctx context.Context, st QuorumState, scope string) bool) bool {
-	return LostOwnRegionQuorumUnder(ctx, NewDecisionPolicy(db), self, region, held)
-}
-
-// LostOwnRegionQuorumUnder is LostOwnRegionQuorum reading the failover scope
-// and voter regions through pol.
+// be read are not lost: LostEveryDecisionQuorum still applies to them. It
+// reads the failover scope and voter regions through pol.
 func LostOwnRegionQuorumUnder(ctx context.Context, pol *DecisionPolicy, self string,
 	region func(context.Context, string) (QuorumState, int, int),
 	held func(ctx context.Context, st QuorumState, scope string) bool) bool {

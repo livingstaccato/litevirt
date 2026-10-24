@@ -197,7 +197,7 @@ func TestOwnerAssert_SkipsInFlightOps(t *testing.T) {
 }
 
 // An ACTIVE WITNESS is excluded from corroboration — it never hosts VMs and may
-// have no libvirt (its CheckVMRuntime answers "unknown"), so it must not block a
+// have no libvirt (its GetRuntimeInventory answers "unknown"), so it must not block a
 // reclaim when all worker peers are absent.
 func TestOwnerAssert_WitnessExcluded(t *testing.T) {
 	ctx := context.Background()

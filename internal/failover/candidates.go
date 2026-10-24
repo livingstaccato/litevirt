@@ -31,7 +31,7 @@ type CandidateInputs struct {
 	RegionScope bool
 	Voters      corrosion.VoterRegionSets
 	Now         time.Time
-	// Observations are the failing verdicts (LoadCandidateInputs).
+	// Observations are the failing verdicts (candidateObservations).
 	Observations []HealthObservation
 	// ActiveSince is when each host last turned active, nil when it could not
 	// be read (then observations are judged as before activation was known).
@@ -40,7 +40,7 @@ type CandidateInputs struct {
 	// inherited-run grace needs them for (fenceTimesNeeded).
 	FenceTimes map[string][]time.Time
 	// UpgradingTimeout is the allowance a host fenced inside a failing run it
-	// has since come back from gets (inheritedRunGrace), and the restart
+	// has since come back from gets (inheritedRunGraceFrom), and the restart
 	// allowance UpgradingLives extends.
 	UpgradingTimeout time.Duration
 	// UpgradingLives is, per host, the last span the deciding node saw it
@@ -161,7 +161,8 @@ func freshVoterCounts(in CandidateInputs) map[string]int {
 	return out
 }
 
-// inheritedRunGraceFrom is inheritedRunGrace over fence times already read.
+// inheritedRunGraceFrom is the inherited-run grace (see fence_incarnation.go)
+// over fence times already read.
 func inheritedRunGraceFrom(times []time.Time, since time.Time, upgrading time.Duration) func(time.Time) time.Duration {
 	return func(runStart time.Time) time.Duration {
 		from := runStart.Add(-fenceSkewMargin)

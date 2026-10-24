@@ -932,14 +932,6 @@ func (p *PartitionPauser) killInFlightResumes() map[string]string {
 	return failures
 }
 
-// resumeKilled reports whether key's abandoned resume is still out and its
-// QEMU was killed under it.
-func (p *PartitionPauser) resumeKilled(key string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.killed[key]
-}
-
 // rotateAfter is recs (sorted by Key) starting at the first record after
 // cursor, wrapping around: where the last pass stopped.
 func rotateAfter(recs []PauseRecord, cursor string) []PauseRecord {

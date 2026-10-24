@@ -23,7 +23,7 @@ type Metrics interface {
 	// litevirt_failover_leader: with no node holding the voter majority nobody
 	// leads, the join is empty, and the last leader's value is the only one. Zero is the normal value; a sustained non-zero needs
 	// a human, and what they should do depends on WHY the host is down — see
-	// strandedWorkloads.
+	// strandedByHost.
 	StrandedWorkloads(n int)
 	// RegionsWithoutQuorum reports how many regions hold at least one worker
 	// but have fewer than corrosion.MinRegionVoters voters, so cannot fence

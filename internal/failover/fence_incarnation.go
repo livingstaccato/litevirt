@@ -52,8 +52,8 @@ func countedSinceActiveWithin(n int, lastSeen string, at, since time.Time, grace
 	return at.Sub(since) >= grace(start)
 }
 
-// inheritedRunGrace (inheritedRunGraceFrom, over the times fenceTimesNeeded
-// reads) is how long a host, recorded active since `since`, must have failed
+// The inherited-run grace (inheritedRunGraceFrom, over the times
+// fenceTimesNeeded reads) is how long a host, recorded active since `since`, must have failed
 // since the activation before an observer's run that began at runStart, before
 // the activation, counts toward its fence.
 //

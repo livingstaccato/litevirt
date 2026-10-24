@@ -317,7 +317,7 @@ func TestRun_StrandedGaugeClearsWhenNotTheLeader(t *testing.T) {
 // literal.
 //
 // This is the wiring TestVMNeedsFailover cannot reach: the schedules read, the
-// c.Promoter guard, and the map key all sit in strandedWorkloads. A `lv run` VM
+// c.Promoter guard, and the map key all sit in strandedByHost. A `lv run` VM
 // defaults to on_host_failure "none", so if any of that is wrong the VM the
 // reschedule loop WOULD have promoted is silently uncounted — an under-report,
 // which is the direction that hides real outages.
@@ -448,7 +448,7 @@ func TestRun_StrandedGaugeUntouchedOnReadError(t *testing.T) {
 	}
 
 	// Break the container read specifically, so the failure lands INSIDE
-	// strandedWorkloads rather than in one of run()'s earlier reads.
+	// strandedByHost rather than in one of run()'s earlier reads.
 	if err := db.Execute(ctx, `DROP TABLE containers`); err != nil {
 		t.Fatalf("drop containers: %v", err)
 	}
@@ -563,7 +563,7 @@ func TestRun_StrandedGaugeClearsOnMidCycleLeaseLoss(t *testing.T) {
 // stranded, every node takes that path, no node holds the lease, max() across
 // instances reads 0, and the alert clears during the incident it exists for.
 //
-// The strandedWorkloads branch further down already follows this rule: on a
+// The strandedByHost branch further down already follows this rule: on a
 // read error it leaves the gauge untouched rather than publishing a number it
 // failed to read.
 func TestRun_UnreadableLeaseLeavesTheStrandedGaugeAlone(t *testing.T) {

@@ -8,7 +8,7 @@
 // (draining), was fenced about 10 s after its boot write, before a daemon that
 // takes longer than that to listen (lab 1 measured 16-23 s) served. A fenced
 // host's inherited run already gets the upgrading timeout
-// (failover.inheritedRunGrace); for it the change is what the cluster
+// (failover.inheritedRunGraceFrom); for it the change is what the cluster
 // records: 'upgrading', not an 'active' host that does not answer.
 package fleet
 
@@ -158,7 +158,7 @@ func TestFleet_FencedHostReturningIsUpgradingUntilItServes(t *testing.T) {
 //
 // Mutation: have the coordinator skip an 'upgrading' host whatever its age —
 // d is never fenced again. (Recorded 'active' instead, d is also fenced at the
-// timeout, by failover.inheritedRunGrace, so skipping returningBoot does not
+// timeout, by failover.inheritedRunGraceFrom, so skipping returningBoot does not
 // turn this red; TestFleet_FencedHostReturningIsUpgradingUntilItServes pins
 // that.)
 func TestFleet_FencedHostReturningThatNeverServesIsFencedAgain(t *testing.T) {

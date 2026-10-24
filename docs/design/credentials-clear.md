@@ -37,7 +37,7 @@ A second token, `credentials_clear_v1`, with the same class as the first:
 
 - **Mandatory.** It states a fact about the binary: *this build never needs the
   old column to find a secret*. That is not a policy an operator can decline,
-  and a flag would stop it latching (`driveCapabilityLatches` skips a flag-off
+  and a flag would stop it latching (`driveCapabilityActivation` skips a flag-off
   token that has not latched).
 - **Replication-gated** (`capabilities.replicationGated`). The claim is about
   every host still receiving replication, including one parked in

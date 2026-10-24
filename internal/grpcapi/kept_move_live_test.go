@@ -90,6 +90,9 @@ func TestMoveVolume_Live_AKeptOverlayMissingItsBaseRefusesIt(t *testing.T) {
 		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), named) || !strings.Contains(err.Error(), ov) {
 			t.Fatalf("live move while %s cannot be read = %v; want FailedPrecondition naming it and %s", named, err, ov)
 		}
+		if strings.Contains(err.Error(), "create") {
+			t.Fatalf("live move refusal = %v; it names a create, not the move", err)
+		}
 		if exists(destPath) || mover.startCalls != 0 || !exists(src) {
 			t.Fatalf("a refused live move wrote its copy (%v), started its block copy (%d) or lost its source", exists(destPath), mover.startCalls)
 		}

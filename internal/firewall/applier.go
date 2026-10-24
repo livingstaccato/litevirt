@@ -128,13 +128,6 @@ func (a *Applier) SetTally(t *WouldDropTally) {
 	a.tally = t
 }
 
-// NICOwners is who owns each tap of the per-NIC table last loaded.
-func (a *Applier) NICOwners() map[string]NICOwner {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.ownersLocked()
-}
-
 // harvestLocked hands the counters of the table about to go to the tally. A
 // table this process did not load (one left by the previous daemon, whose
 // taps the running VMs still hold) is attributed by p's owners. Caller holds

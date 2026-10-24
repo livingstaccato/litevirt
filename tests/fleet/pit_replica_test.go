@@ -382,8 +382,9 @@ func heldPromotionCommandsWork(t *testing.T, fenceMethod string, wantConfirm boo
 // nothing of overlays restarted the VM on the base mid-roll — and the VM is
 // not started on the bare disk either: the target's define holds it.
 //
-// Mutations: "binding ignored" (pitoverlay.Check accepts any sidecar) and
-// "define ignores a hold" (the reconciler defines past a Held settle) — red.
+// Mutations: "binding ignored" (CommitOffline's verdict check accepts any
+// sidecar) and "define ignores a hold" (the reconciler defines past a Held
+// settle) — red.
 func TestFleet_AnOverlayIsNeverCommittedOverABaseWrittenSince(t *testing.T) {
 	c := New(t, Options{Nodes: 3, SharedCRDT: true})
 	latchPITOverlay(t, c)

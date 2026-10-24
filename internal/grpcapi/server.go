@@ -35,6 +35,7 @@ import (
 	"github.com/litevirt/litevirt/internal/opjournal"
 	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/pki"
+	"github.com/litevirt/litevirt/internal/pooltrust"
 	"github.com/litevirt/litevirt/internal/smart"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
@@ -950,6 +951,9 @@ type Server struct {
 	// Guarded by storagePoolsMu because the daemon rewrites it while RPCs read.
 	storagePoolsMu sync.RWMutex
 	storagePools   map[string]StoragePoolRef
+	// poolTrust decides which of this host's pool rows it acts on
+	// (pool_trust.go). nil: every row (a server built by hand in a test).
+	poolTrust atomic.Pointer[pooltrust.Store]
 
 	// cephSecrets remembers the ceph secrets this daemon defined (ceph_secrets.go).
 	cephSecrets cephSecretMarks
@@ -2854,6 +2858,13 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 		fetchBinarySem: make(chan struct{}, fetchBinaryMaxConcurrent),
 		pushBackupSem:  make(chan struct{}, pushBackupMaxConcurrent),
 	}
+	// A real server always judges its pool rows (pool_trust.go). A ledger
+	// that cannot be read trusts none of its entries.
+	pt, err := pooltrust.Open(dataDir, pkiDir)
+	if err != nil {
+		slog.Error("storage pool trust ledger unreadable; pools it held are untrusted until confirmed", "error", err)
+	}
+	s.poolTrust.Store(pt)
 	s.wireCertificateVerifier()
 	s.wireReplicationReleaseGates()
 	s.wireConsolePasswordPolicy()
@@ -3243,8 +3254,13 @@ func (s *Server) SetStoragePoolsByName(pools map[string]StoragePoolRef) {
 // lookupStoragePool resolves a pool ref by name under the read lock.
 func (s *Server) lookupStoragePool(name string) (StoragePoolRef, bool) {
 	s.storagePoolsMu.RLock()
-	defer s.storagePoolsMu.RUnlock()
 	p, ok := s.storagePools[name]
+	s.storagePoolsMu.RUnlock()
+	// A pool this host does not stand behind is not one of its pools
+	// (pool_trust.go), whatever put it in the map.
+	if ok && !s.poolTrustVerdict(name, p).Trusted {
+		return StoragePoolRef{}, false
+	}
 	return p, ok
 }
 
@@ -3277,6 +3293,9 @@ func (s *Server) resolvePoolErr(ctx context.Context, name string) (StoragePoolRe
 		return StoragePoolRef{}, false, nil
 	}
 	ref := StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target, Options: rec.Options}
+	if !s.poolTrustVerdict(name, ref).Trusted {
+		return StoragePoolRef{}, false, nil
+	}
 	s.addStoragePoolRef(name, ref)
 	return ref, true, nil
 }

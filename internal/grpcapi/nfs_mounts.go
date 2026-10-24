@@ -14,6 +14,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/pooltrust"
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
@@ -112,6 +113,17 @@ func (m *nfsMountMemory) failedWithin(dir string, d time.Duration) (error, bool)
 // row is registered without its mount options) from the config definition.
 func (s *Server) nfsPoolConfig(r corrosion.StoragePoolRecord) storage.Config {
 	cfg := storage.Config{Name: r.Name, Driver: r.Driver, Source: r.Source, Target: r.Target, Options: r.Options}
+	// A config pool mounts with config's options only, never the row's: its
+	// row is trusted on driver, source and target alone (pool_trust.go), so
+	// options a forger wrote into it must not reach the mount. None in
+	// config means none (the mount adds its hardening).
+	if s.PoolTrust().IsConfigPool(r.Name, pooltrust.BindingOf(r.Driver, r.Source, r.Target, r.Options)) {
+		cfg.Options = nil
+		if ref, ok := s.lookupStoragePool(r.Name); ok && strings.EqualFold(ref.Driver, "nfs") && ref.Source == r.Source && ref.Target == r.Target {
+			cfg.Options = ref.Options
+		}
+		return cfg
+	}
 	if ref, ok := s.lookupStoragePool(r.Name); ok && strings.EqualFold(ref.Driver, "nfs") && ref.Source == r.Source && ref.Target == r.Target && len(ref.Options) > 0 {
 		cfg.Options = ref.Options
 	}
@@ -172,7 +184,7 @@ func (s *Server) ReconcileNFSMounts(ctx context.Context) {
 	if s.db == nil {
 		return
 	}
-	rows, err := corrosion.ListStoragePoolsForHost(ctx, s.db, s.hostName)
+	rows, err := s.ownPools(ctx)
 	if err != nil {
 		slog.Warn("NFS mounts: list this host's pools", "error", err)
 		return
@@ -229,7 +241,7 @@ func (s *Server) reconcileNFSPool(ctx context.Context, listed corrosion.StorageP
 // currentNFSPoolRow re-reads this host's row of nfs pool name, and reports
 // whether it is still the pool with that source and target.
 func (s *Server) currentNFSPoolRow(ctx context.Context, name, source, target string) (corrosion.StoragePoolRecord, bool) {
-	rec, found, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, name)
+	rec, found, err := s.ownPool(ctx, name)
 	if err != nil || !found || !strings.EqualFold(rec.Driver, "nfs") || rec.Source != source || rec.Target != target {
 		return rec, false
 	}
@@ -465,7 +477,7 @@ func (s *Server) ensureNFSMountsForVM(ctx context.Context, vm *corrosion.VMRecor
 		// volume of the same name.
 		pool := ""
 		if cfg.Name == d.StorageVolume {
-			if r, ok, gerr := corrosion.GetStoragePool(ctx, s.db, s.hostName, d.StorageVolume); gerr == nil && ok && strings.EqualFold(r.Driver, "nfs") {
+			if r, ok, gerr := s.ownPool(ctx, d.StorageVolume); gerr == nil && ok && strings.EqualFold(r.Driver, "nfs") {
 				cfg, pool = s.nfsPoolConfig(r), r.Name
 			}
 		}
@@ -526,7 +538,7 @@ func (s *Server) ensureNFSMountForStart(ctx context.Context, pool string, cfg st
 		return err
 	}
 	if pool != "" {
-		if r, ok, gerr := corrosion.GetStoragePool(ctx, s.db, s.hostName, pool); gerr == nil && (!ok || !strings.EqualFold(r.Driver, "nfs") || r.Source != cfg.Source || r.Target != cfg.Target) {
+		if r, ok, gerr := s.ownPool(ctx, pool); gerr == nil && (!ok || !strings.EqualFold(r.Driver, "nfs") || r.Source != cfg.Source || r.Target != cfg.Target) {
 			return fmt.Errorf("pool %q was deleted or replaced on this host while the start waited", pool)
 		}
 	}

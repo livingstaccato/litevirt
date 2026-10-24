@@ -197,6 +197,7 @@ var dataDirOwned = []string{
 	"nvram-flush-failures.json",  // libvirt/nvramflush.go NvramFlushStateFile: this host's failed UEFI vars flushes (its temp is a dot-name)
 	"image-delete-skew.json",     // grpcapi/image_delete_skew.go imageSkewHistoryFile (its temp is a dot-name; an earlier build of it left a .tmp, dataDirOwnedPrefixes)
 	"audit-hold",                 // corrosion/audit_hold.go AuditHoldDirName
+	"pool-trust.json",            // pooltrust/ledger.go LedgerFile: the pools this host created or confirmed (its temp is a dot-name)
 	"audit-seeded.json",          // corrosion/audit_seeded.go AuditSeededFileName
 	"audit-seeded-assert",        // corrosion/audit_seeded.go AuditSeededAssertFileName
 	"credentials_unhydrated",     // corrosion/isolation.go credentialsUnhydratedFile
@@ -246,7 +247,7 @@ var dataDirOwned = []string{
 // every dot-name, which is how the daemon names its temp files there
 // (secretfile.Write's .<name>.tmp, storage_pool_confine.go's
 // .pool-uploads.json-*).
-var dataDirOwnedPrefixes = []string{"state.db-", "split_brain_activated.", "nowts.hwm.", "ct-idmap-ledger.", "onboot-boot-id.", "ceph-trash-purges.json.", "firewall-would-drop.json.", "image-delete-skew.json.", "."}
+var dataDirOwnedPrefixes = []string{"state.db-", "split_brain_activated.", "nowts.hwm.", "ct-idmap-ledger.", "onboot-boot-id.", "ceph-trash-purges.json.", "firewall-would-drop.json.", "image-delete-skew.json.", "pool-trust.json.", "."}
 
 // DataDirOwned returns the exact names of dataDirOwned.
 func DataDirOwned() []string { return slices.Clone(dataDirOwned) }
@@ -559,6 +560,87 @@ func inPoolArea(dataDir, p string) bool {
 		}
 	}
 	return false
+}
+
+// InDataDirPoolArea reports whether p is one of the daemon's own pool
+// directories: <data_dir>/disks itself, or a directory strictly inside
+// <data_dir>/pools or <data_dir>/mounts. The area roots are taken as written
+// and as they resolve on this host — a pools/ or disks/ that is itself a
+// symlink to a bigger volume is still the daemon's area — and every form of
+// p, as written and resolved, must be one of them, so a link INSIDE pools/ to
+// a directory elsewhere is not.
+//
+// A resolved root outside the data directory counts only when it is a
+// directory a pool could be (CheckWriteRoot: no system directory, not the
+// filesystem root, no parent of the data directory, not the PKI directory):
+// a pools/ linked to /var/lib, say, does not make every directory under
+// /var/lib the daemon's. The resolutions are bounded (resolveBounded): one
+// that does not answer is an error, and the answer false.
+func InDataDirPoolArea(p, dataDir, pkiDir string) (bool, error) {
+	if p == "" || dataDir == "" || !filepath.IsAbs(p) {
+		return false, nil
+	}
+	var t MountTable
+	var errs []error
+	dataForms, err := pathFormsBounded(&t, dataDir)
+	errs = append(errs, err)
+	// rootOK judges one form of an area root.
+	rootOK := func(r string) bool {
+		for _, d := range dataForms {
+			if within(d, r) && filepath.Clean(r) != filepath.Clean(d) {
+				return true // inside the data directory: the root as written
+			}
+		}
+		if filepath.Clean(r) == "/" {
+			return false
+		}
+		for _, d := range dataForms {
+			if within(r, d) {
+				return false // the data directory itself, or a parent of it
+			}
+		}
+		return t.CheckWriteRoot(r, dataDir, pkiDir) == nil
+	}
+	rootForms := func(name string) []string {
+		var out []string
+		for _, d := range dataForms {
+			f, err := pathFormsBounded(&t, filepath.Join(d, name))
+			errs = append(errs, err)
+			for _, r := range f {
+				if rootOK(r) {
+					out = append(out, r)
+				}
+			}
+		}
+		return out
+	}
+	disks := rootForms(dataDirDisks)
+	var areas []string
+	for _, a := range dataDirPoolAreas {
+		areas = append(areas, rootForms(a)...)
+	}
+	forms, err := pathFormsBounded(&t, p)
+	errs = append(errs, err)
+	if err := errors.Join(errs...); err != nil {
+		return false, err
+	}
+	for _, c := range forms {
+		ok := false
+		for _, d := range disks {
+			if c == d {
+				ok = true
+			}
+		}
+		for _, a := range areas {
+			if within(a, c) && c != filepath.Clean(a) {
+				ok = true
+			}
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // DirsOverlap reports whether two directories are the same, or one is inside

@@ -14,11 +14,13 @@ import (
 	"syscall"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/pooltrust"
 	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/storage"
 )
@@ -38,7 +40,7 @@ import (
 // Idempotency: re-registering an existing (host,name) returns OK and
 // re-runs Prepare — operators expect `lv pool create` to be safe to
 // retry after a transient mount failure.
-func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoolRequest) (*pb.CreateStoragePoolResponse, error) {
+func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoolRequest) (_ *pb.CreateStoragePoolResponse, err error) {
 	// A pool is GLOBAL (req.Project == "" → admin-managed, RBAC-anchored at root) or
 	// OWNED by a project (RBAC at /projects/<p>/...). Empty project is NOT normalized
 	// to "_default" — that would make it owned, not global.
@@ -78,6 +80,20 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 	if host == "" {
 		host = s.hostName
 	}
+	// The operator, carried across a forward so the pool's host audits them
+	// (repairActor). Every create that got past validation is audited as the
+	// operator, refusals included: here when it runs here, and on both
+	// nodes when this one forwards it.
+	actor := s.repairActor(ctx)
+	defer func() {
+		where := "on this host"
+		if host != s.hostName {
+			where = "forwarded to " + auditQuote(host)
+		}
+		s.auditAs(ctx, actor, "storage.pool.create", req.Name,
+			fmt.Sprintf("host=%s %s driver=%s source=%s target=%s project=%s", auditQuote(host), where,
+				auditQuote(req.Driver), auditQuote(req.Source), auditQuote(req.Target), auditQuote(project)), auditResult(err))
+	}()
 	// Authorize the project the request CLAIMS — this is where the pool is going.
 	if err := s.RequirePerm(ctx, poolRBACPathFor(project, req.Name), "storage.pool.write", "operator"); err != nil {
 		return nil, err
@@ -127,7 +143,7 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 		}
 		defer conn.Close()
 		req.Host = host
-		return client.CreateStoragePool(ctx, req)
+		return client.CreateStoragePool(metadata.AppendToOutgoingContext(ctx, repairActorMDKey, actor), req)
 	}
 
 	// A target-less local pool gets a directory of its own, never the shared
@@ -272,6 +288,15 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 			rec.UsedBytes = int64((st.Blocks - st.Bavail) * uint64(st.Bsize))
 		}
 	}
+	// This host stands behind the row it is about to write: recorded in its
+	// local ledger first (pool_trust.go), so neither the row nor a forged one
+	// of another target is ever taken for it, and a pool this host did not
+	// create is never trusted because a row says so. Fail closed.
+	if pt := s.PoolTrust(); pt != nil {
+		if err := pt.Record(req.Name, pooltrust.BindingOf(req.Driver, req.Source, req.Target, req.Options), pooltrust.HowCreate); err != nil {
+			return nil, status.Errorf(codes.Internal, "record the pool in this host's trust ledger: %v", err)
+		}
+	}
 	if err := corrosion.UpsertStoragePool(ctx, s.db, rec); err != nil {
 		return nil, status.Errorf(codes.Internal, "persist: %v", err)
 	}
@@ -363,6 +388,27 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 		return nil, err
 	}
 
+	// A row this host does not trust was never this host's pool
+	// (pool_trust.go): only the row goes. Nothing on the host is touched for
+	// it — no unmount, logout or directory removal at a place the row names.
+	// That includes a row whose name is not a valid pool name (forged: no
+	// create makes one), whatever trust store this server has: it can be
+	// deleted, and its name reaches no path.
+	if safename.ValidatePoolName(rec.Name) != nil || !s.poolRowTrusted(rec) {
+		if err := corrosion.MarkStoragePoolDeleted(ctx, s.db, host, req.Name); err != nil {
+			return nil, status.Errorf(codes.Internal, "delete: %v", err)
+		}
+		s.removeStoragePoolRef(req.Name)
+		if pt := s.PoolTrust(); pt != nil {
+			if err := pt.Forget(req.Name); err != nil {
+				slog.Warn("untrusted storage pool row deleted, but not removed from this host's trust ledger", "pool", req.Name, "error", err)
+			}
+		}
+		s.audit(ctx, "storage.pool.delete", req.Name, fmt.Sprintf("force=%t untrusted_row=true driver=%s target=%s", req.Force, rec.Driver, rec.Target), "ok")
+		slog.Info("untrusted storage pool row deleted; nothing on the host was touched", "host", host, "name", req.Name, "target", rec.Target)
+		return &pb.DeleteStoragePoolResponse{}, nil
+	}
+
 	// A pool's own <data_dir>/pools/<name> goes with it — but never with files
 	// in it: the next pool of this name, in any project, would inherit them.
 	// The daemon's own directories in it — the replica area, the upload
@@ -374,7 +420,7 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 	// then kept (and a new pool of this name is refused it while it holds
 	// them).
 	ownDir := ""
-	if (rec.Driver == "local" || rec.Driver == "") && rec.Target == localPoolDir(s.dataDir, rec.Name) {
+	if own := localPoolDir(s.dataDir, rec.Name); own != "" && (rec.Driver == "local" || rec.Driver == "") && rec.Target == own {
 		ownDir = rec.Target
 		kept := s.cleanDaemonPoolDirs(ownDir)
 		if left := dirEntriesSample(ownDir, 5); len(left) > 0 {
@@ -423,6 +469,13 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 		return nil, status.Errorf(codes.Internal, "delete: %v", err)
 	}
 	s.removeStoragePoolRef(req.Name)
+	// A pool deleted here is not trusted again if a row of its name comes
+	// back without a create on this host.
+	if pt := s.PoolTrust(); pt != nil {
+		if err := pt.Forget(req.Name); err != nil {
+			slog.Warn("storage pool deleted, but not removed from this host's trust ledger", "pool", req.Name, "error", err)
+		}
+	}
 	// The pool's ceph secret goes with it unless another pool, or a disk on
 	// this host, still uses it.
 	if strings.EqualFold(rec.Driver, "ceph") {

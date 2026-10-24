@@ -26,6 +26,7 @@ func newPoolCmd() *cobra.Command {
 		newPoolListCmd(),
 		newPoolInspectCmd(),
 		newPoolDeleteCmd(),
+		newPoolTrustCmd(),
 	)
 	return cmd
 }

@@ -169,6 +169,8 @@ func (s *Server) poolDiskDirs(p corrosion.StoragePoolRecord) []string {
 	}
 	switch strings.ToLower(p.Driver) {
 	case "", "local":
+		// localPoolDir is "" for a row whose name is not a valid pool name;
+		// the caller skips "".
 		return []string{localPoolDir(s.dataDir, p.Name), filepath.Join(s.dataDir, "disks")}
 	case "nfs":
 		return []string{filepath.Join(s.dataDir, "mounts", storage.NFSMountName(p.Source))}

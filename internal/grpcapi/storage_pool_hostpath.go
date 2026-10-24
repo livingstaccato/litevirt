@@ -129,6 +129,13 @@ func (s *Server) checkPoolForWrite(ctx context.Context, name string, ref Storage
 	if cerr == nil {
 		return nil
 	}
+	if isPoolUntrusted(cerr) {
+		slog.Error("storage pool refused: this host does not trust its row",
+			"pool", name, "host", s.hostName, "driver", ref.Driver, "target", ref.Target, "reason", cerr)
+		return status.Errorf(codes.FailedPrecondition,
+			"pool %q is refused (%v): nothing lists, reads or writes it — if this host's pool is meant to be %s at %q, confirm it with `lv pool trust %s --host %s`",
+			name, cerr, ref.Driver, ref.Target, name, s.hostName)
+	}
 	slog.Error("storage pool refused: recreate the pool",
 		"pool", name, "host", s.hostName, "driver", ref.Driver, "reason", cerr, "detail", detail)
 	return status.Errorf(codes.FailedPrecondition,
@@ -140,6 +147,12 @@ func (s *Server) checkPoolForWrite(ctx context.Context, name string, ref Storage
 // to show any caller of the pool; detail (another pool's name, its directory)
 // is for the log only — the other pool may be another project's.
 func (s *Server) poolRefusal(ctx context.Context, name string, ref StoragePoolRef) (error, string) {
+	// A row this host did not create, no operator confirmed here and config
+	// does not define is not this host's pool, whatever it names
+	// (pool_trust.go). First: nothing below is worth judging for it.
+	if v := s.poolTrustVerdict(name, ref); !v.Trusted {
+		return &errPoolUntrusted{name: name, why: v.Why}, ""
+	}
 	if isFileBasedDriver(ref.Driver) {
 		ctx = storage.WithMountTable(ctx)
 	}
@@ -383,8 +396,14 @@ func publishNoClobber(tmp, dest, filename string) error {
 
 // localPoolDir is where a new target-less local pool keeps its files: a
 // directory of its own, never the shared <data_dir>/disks that holds every
-// VM's local disks on the host, across projects.
+// VM's local disks on the host, across projects. A pool name can come from
+// a replicated row, which nothing validated: one that is not a valid pool
+// name (safename.ValidatePoolName: no "/", no "..", no NUL, at most
+// MaxNameLen) names no directory, "", so it can never reach outside pools/.
 func localPoolDir(dataDir, name string) string {
+	if safename.ValidatePoolName(name) != nil {
+		return ""
+	}
 	return filepath.Join(dataDir, "pools", name)
 }
 

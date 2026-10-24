@@ -56,13 +56,6 @@ func isLegacyReplicaPartial(name string) bool {
 	return stem != ""
 }
 
-// sweepLegacyReplicaPartials removes leftover ".<replica>.partial" files older
-// than maxAge from a replica pool directory. Same age guard as the staging
-// sweep: a copy still being written keeps a fresh mtime.
-func sweepLegacyReplicaPartials(dir string, maxAge time.Duration, now time.Time) int {
-	return sweepStale(dir, maxAge, now, isLegacyReplicaPartial)
-}
-
 // stagingReadDir lists a directory SweepStaleStaging looks into; tests
 // replace it.
 var stagingReadDir = os.ReadDir

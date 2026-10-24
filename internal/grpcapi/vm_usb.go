@@ -467,7 +467,7 @@ func mappingRBACPath(name string) string { return "/mappings/" + name }
 // and the strip is audited.
 //
 // When they are kept, the grant is the feature's, taken on this node (the one
-// that writes the row): the row must be written with it (insertVMForPassthrough).
+// that writes the row): the row must be written with it (insertVMWithGrants).
 func (s *Server) admitRestoredUSBAndHotplug(ctx context.Context, spec *pb.VMSpec, name string, fromExisting bool) (capabilities.FeatureGrant, error) {
 	var none capabilities.FeatureGrant
 	if len(spec.UsbDevices) == 0 && spec.MemoryHotplugMaxMib == 0 && spec.MemoryHotplugBaseMib == 0 {
@@ -497,17 +497,4 @@ func (s *Server) admitRestoredUSBAndHotplug(ctx context.Context, spec *pb.VMSpec
 		return none, err
 	}
 	return s.passthroughGrant(ctx)
-}
-
-// insertVMForPassthrough writes a new VM row. A spec that carries USB devices
-// or memory hot-add goes through the feature's writer with its grant; any other
-// spec is written exactly as before, so nothing main allows waits on the
-// release token.
-func (s *Server) insertVMForPassthrough(ctx context.Context, spec *pb.VMSpec, g capabilities.FeatureGrant, vm corrosion.VMRecord,
-	ifaces []corrosion.InterfaceRecord, disks []corrosion.DiskRecord, nics []corrosion.NICRecord,
-	pciIntents []corrosion.PCIIntentRecord, adopt bool) error {
-	if vmSpecSetsPassthrough(spec) {
-		return corrosion.InsertVMWithPassthrough(ctx, s.db, g, vm, ifaces, disks, nics, pciIntents, adopt)
-	}
-	return corrosion.InsertVMWithHardware(ctx, s.db, vm, ifaces, disks, nics, pciIntents, adopt)
 }

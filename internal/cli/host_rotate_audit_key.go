@@ -80,10 +80,10 @@ func HostRotateAuditKey(ctx context.Context, hostName, sshTarget string) error {
 		return fmt.Errorf("create remote PKI dir: %w", err)
 	}
 
-	// 0600 on the KEY, via CopyFileMode. CopyFile defaults to 0644, and that
-	// default is exactly how host.key shipped world-readable — a signing key any
-	// local user can read makes the tamper-evidence this command exists to
-	// restore forgeable again on the spot.
+	// 0600 on the KEY, via CopyFileMode. A 0644 default mode is exactly how
+	// host.key shipped world-readable — a signing key any local user can read
+	// makes the tamper-evidence this command exists to restore forgeable again
+	// on the spot.
 	for _, f := range []struct {
 		local, remote string
 		mode          os.FileMode

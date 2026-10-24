@@ -330,14 +330,3 @@ func (s *Server) checkRealizationCardinality(ctx context.Context, vmName string,
 	}
 	return nil
 }
-
-// liveVMInterfaces is vmName's live NICs (MergedVMNICs, in ordinal order) as
-// interface records, for a caller written against vm_interfaces rows. Their
-// security groups are not carried.
-func liveVMInterfaces(ctx context.Context, db *corrosion.Client, vmName string) ([]corrosion.InterfaceRecord, error) {
-	nics, err := corrosion.MergedVMNICs(ctx, db, vmName)
-	if err != nil {
-		return nil, err
-	}
-	return nicInterfaceRecords(nics), nil
-}

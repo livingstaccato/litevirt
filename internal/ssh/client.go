@@ -13,18 +13,15 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"os/signal"
 	"path"
 	"path/filepath"
 	"slices"
 	"strings"
-	"syscall"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
-	"golang.org/x/term"
 )
 
 // Client wraps an SSH connection for remote operations.
@@ -492,14 +489,9 @@ func (c *Client) RunOutput(cmd string) ([]byte, error) {
 	return session.Output(cmd)
 }
 
-// CopyFile copies a local file to a remote path using SCP-like semantics.
-func (c *Client) CopyFile(localPath, remotePath string) error {
-	return c.CopyFileMode(localPath, remotePath, 0644)
-}
-
 // CopyFileMode copies a local file to the remote host with an explicit mode.
 //
-// It exists because CopyFile's 0644 default is wrong for private keys, and
+// The mode is explicit because a 0644 default was wrong for private keys, and
 // nothing about the call site made that visible: `lv host init root@<host>` —
 // the form the docs tell you to use for anything multi-node — pushed
 // /etc/litevirt/pki/host.key world-readable on every node it provisioned. That
@@ -570,55 +562,6 @@ func (c *Client) WriteFile(remotePath string, data []byte, mode os.FileMode) err
 
 	session.Stdin = bytesReader(data)
 	return session.Run(writeFileCmd(remotePath, mode))
-}
-
-// Interactive runs a command on the remote host with a PTY attached,
-// connecting local stdin/stdout/stderr. Used for lv console.
-func (c *Client) Interactive(cmd string) error {
-	session, err := c.conn.NewSession()
-	if err != nil {
-		return fmt.Errorf("SSH session: %w", err)
-	}
-	defer session.Close()
-
-	fd := int(os.Stdin.Fd())
-	oldState, err := term.MakeRaw(fd)
-	if err != nil {
-		return fmt.Errorf("make raw terminal: %w", err)
-	}
-	defer term.Restore(fd, oldState)
-
-	w, h, _ := term.GetSize(fd)
-	if err := session.RequestPty("xterm-256color", h, w, ssh.TerminalModes{
-		ssh.ECHO:          1,
-		ssh.TTY_OP_ISPEED: 14400,
-		ssh.TTY_OP_OSPEED: 14400,
-	}); err != nil {
-		return fmt.Errorf("request PTY: %w", err)
-	}
-
-	session.Stdin = os.Stdin
-	session.Stdout = os.Stdout
-	session.Stderr = os.Stderr
-
-	// Forward SIGWINCH (terminal resize) to remote session.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGWINCH)
-	go func() {
-		for range sigCh {
-			w, h, _ := term.GetSize(fd)
-			session.WindowChange(h, w)
-		}
-	}()
-	defer func() {
-		signal.Stop(sigCh)
-		close(sigCh)
-	}()
-
-	if err := session.Start(cmd); err != nil {
-		return fmt.Errorf("start command: %w", err)
-	}
-	return session.Wait()
 }
 
 // Conn returns the underlying SSH client connection (used for tunneling).

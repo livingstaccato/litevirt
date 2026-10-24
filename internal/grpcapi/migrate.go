@@ -825,7 +825,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeCold, "")
 		case fwl != nil:
 			// QEMU's TLS stream only with both hosts ready and their
-			// migration CAs agreeing (memoryTLSReady).
+			// migration CAs agreeing (memoryTLSGap).
 			gap := s.memoryTLSGap(srcTLS, ens, req.TargetHost)
 			useTLS = gap == ""
 			route = s.chooseLiveFirmwareRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeMemory, gap)
@@ -3066,12 +3066,6 @@ func migrationCAsShown(source, sourceCA string, sourceCAs []string, target, targ
 // or either one unknown (an older build), which compares nothing.
 func migrationCAsAgree(a, b string) bool {
 	return a == "" || b == "" || a == b
-}
-
-// memoryTLSReady is whether a memory-only move to the target that answered
-// ens may use QEMU's own TLS stream: memoryTLSGap has nothing to say.
-func (s *Server) memoryTLSReady(srcTLS bool, ens ensureOutcome) bool {
-	return s.memoryTLSGap(srcTLS, ens, "the target") == ""
 }
 
 // memoryTLSGap says why a memory-only move to target, which answered ens,

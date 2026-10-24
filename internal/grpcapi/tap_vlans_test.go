@@ -198,7 +198,8 @@ func TestArmNICFirewallResume_PutsTheTapVLANsOnBeforeTheResume(t *testing.T) {
 // timer: a guest a path missed, or whose tap was changed behind litevirt's
 // back, is put right; a stopped one, and a VM with no VLAN NIC, are left.
 //
-// Mutation: ConvergeTapVLANs a no-op — red.
+// Mutations: ConvergeTapVLANs a no-op — red; walking every VM row instead of
+// the domains running here — red.
 func TestConvergeTapVLANs_ReappliesEveryRunningGuest(t *testing.T) {
 	s, fake := vlanStartServer(t)
 	ctx := adminCtx()
@@ -214,6 +215,15 @@ func TestConvergeTapVLANs_ReappliesEveryRunningGuest(t *testing.T) {
 	}
 	if ops := vlanDomainOps(fake, "off"); opIndex(ops, "vlan-tap") >= 0 {
 		t.Fatalf("off ops = %q: a stopped guest was touched", ops)
+	}
+
+	// It works from the domains libvirt runs here (NB-R4): with that list
+	// unreadable, it converges nothing this pass.
+	before := len(vlanDomainOps(fake, "vm1"))
+	fake.FailRunningDomainTaps = func() error { return errors.New("libvirt is restarting") }
+	s.ConvergeTapVLANs(ctx)
+	if after := len(vlanDomainOps(fake, "vm1")); after != before {
+		t.Fatalf("converged without the list of domains running here (%d ops, then %d)", before, after)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -315,36 +316,48 @@ func (s *Server) ConvergeTapVLANs(ctx context.Context) {
 	if s.virt == nil || s.db == nil {
 		return
 	}
-	// Every VM row with a trunk NIC, whichever host it names: a guest held
-	// paused here by a move it is still finishing has another host's row.
-	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
-	if err != nil {
-		slog.Warn("tap VLANs: cannot list the VMs; not converging this pass", "error", err)
+	// The domains running here first, from libvirt (one list, one XML per
+	// running domain), and only those VMs' rows: a host does not read every
+	// VM of the cluster each pass (review NB-R4). A guest held paused here by
+	// a move it is still finishing is active, and is among them.
+	lister, ok := s.virt.(interface {
+		RunningDomainTaps() (map[string]map[string]string, error)
+	})
+	if !ok {
 		return
 	}
-	for i := range vms {
+	running, err := lister.RunningDomainTaps()
+	if err != nil {
+		slog.Warn("tap VLANs: cannot list the domains running here; not converging this pass", "error", err)
+		return
+	}
+	names := make([]string, 0, len(running))
+	for name := range running {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
 		if ctx.Err() != nil {
 			return
 		}
-		vm := &vms[i]
-		if vm.IsTemplate {
+		rec, err := corrosion.GetVM(ctx, s.db, name)
+		if err != nil {
+			slog.Warn("tap VLANs: cannot read a running VM's row; not converging it this pass", "vm", name, "error", err)
 			continue
 		}
-		// The spec first, which is local: libvirt is asked only about a VM
-		// with a trunk NIC, not about every VM of the cluster.
-		nics, err := s.tapVLANsOfRecord(ctx, vm)
+		if rec == nil || rec.IsTemplate {
+			continue
+		}
+		nics, err := s.tapVLANsOfRecord(ctx, rec)
 		if err != nil {
-			slog.Warn("tap VLANs: cannot read a VM's NICs; not converging it this pass", "vm", vm.Name, "error", err)
+			slog.Error("tap VLANs: a running VM's NIC VLANs cannot be resolved; not converging it this pass", "vm", name, "error", err)
 			continue
 		}
 		if len(nics) == 0 {
 			continue
 		}
-		if active, err := s.virt.DomainIsActive(vm.Name); err != nil || !active {
-			continue // not defined here, or not running
-		}
-		if err := s.applyTapVLANNICs(ctx, vm.Name, nics, arrivedHere); err != nil {
-			slog.Error("tap VLANs: a running guest's access-VLAN NIC is not on its VLAN; retrying next pass", "vm", vm.Name, "error", err)
+		if err := s.applyTapVLANNICs(ctx, name, nics, arrivedHere); err != nil {
+			slog.Error("tap VLANs: a running guest's access-VLAN NIC is not on its VLAN; retrying next pass", "vm", name, "error", err)
 		}
 	}
 }

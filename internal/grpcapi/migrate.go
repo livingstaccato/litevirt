@@ -1799,6 +1799,20 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 			return nil, status.Errorf(codes.Internal, "stat disk stub %s: %v", stub.Path, err)
 		}
 	}
+	// The stubs, which the mirror fills with the VM's disks, land at paths a
+	// delete's kept overlay on this host may name as its missing base: the
+	// kept-create check, before any is made. Kept state this host cannot
+	// read refuses too.
+	if len(req.Disks) > 0 {
+		paths := make([]string, 0, len(req.Disks))
+		for _, stub := range req.Disks {
+			paths = append(paths, stub.Path)
+		}
+		if err := s.keptPathRefusal(ctx, "the migration of VM "+strconv.Quote(req.VmName)+" onto this host",
+			keptWritesOf(true, paths...)); err != nil {
+			return nil, err
+		}
+	}
 	if s.isoResolvedWithheld {
 		isoResolved = nil
 	}
@@ -1849,9 +1863,14 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 				// above). Reuse it at the size asked for now: the mirror needs the
 				// sizes to agree, and a stub holds nothing worth keeping. Only a
 				// regular file is reused: a link (or anything else) at the name is
-				// replaced, never taken for the stub.
-				if info, ierr := qcow2.Info(file); fi.Mode().IsRegular() && ierr == nil && info.VirtualSize == sizeBytes {
-					return true, nil
+				// replaced, never taken for the stub. Regular is judged by the
+				// Lstat before anything opens it, and the image is read through
+				// a descriptor opened non-blocking with no link followed: a FIFO
+				// at the name (or swapped in since) cannot hang this RPC.
+				if fi.Mode().IsRegular() {
+					if info, ierr := infoNoFollow(file); ierr == nil && info.VirtualSize == sizeBytes {
+						return true, nil
+					}
 				}
 				if err := pd.unlink(base); err != nil {
 					return false, status.Errorf(codes.Internal, "replace stub %s: %v", stub.Path, err)

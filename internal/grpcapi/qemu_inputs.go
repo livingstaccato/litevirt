@@ -76,17 +76,14 @@ func precheckChain(path string, rule chainRule) ([]string, error) {
 		if depth > maxBackingDepth {
 			return nil, fmt.Errorf("backing chain deeper than %d", maxBackingDepth)
 		}
-		// A regular file only, judged by stat before anything opens it (a
-		// FIFO would block the open, a device is no image).
-		if fi, err := os.Stat(path); err != nil || !fi.Mode().IsRegular() {
-			return nil, fmt.Errorf("%s is not a regular file", path)
-		}
-		if err := precheckQcow2Header(path); err != nil {
-			return nil, err
-		}
-		info, err := qcow2.Info(path)
+		// A regular file only: the layer (resolved through symlinks) is
+		// opened non-blocking with no link followed and judged by fstat, and
+		// its header is read through that descriptor. A FIFO at the name, or
+		// swapped in since it was resolved, can neither block the open nor be
+		// read; a device is no image.
+		info, err := precheckLayer(path, layer)
 		if err != nil {
-			return nil, fmt.Errorf("%s is not a qcow2 image: %w", path, err)
+			return nil, err
 		}
 		if info.BackingFile == "" {
 			return accepted, nil
@@ -872,21 +869,56 @@ func withinAny(resolved string, roots []string) bool {
 // precheckQcow2Header judges one qcow2 header without following its backing
 // file: it parses as qcow2, keeps no data in an external file, and declares
 // its backing format at most once.
+//
+// The file is opened as precheckChain opens a layer: path resolved through
+// symlinks, then opened with no link followed, non-blocking, and kept only
+// when fstat shows a regular file (openRegularNoFollow). A FIFO at the name,
+// or swapped in after a caller's stat, is refused rather than waited on.
 func precheckQcow2Header(path string) error {
-	if _, err := qcow2.Info(path); err != nil {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
 		return fmt.Errorf("%s is not a qcow2 image: %w", path, err)
 	}
-	if err := qcow2.AssertNoExternalData(path); err != nil {
-		return fmt.Errorf("%s: %w", path, err)
-	}
-	n, err := qcow2.BackingFormatExtensionCount(path)
+	f, _, err := openRegularNoFollow(resolved)
 	if err != nil {
-		return fmt.Errorf("%s: %w", path, err)
+		return fmt.Errorf("%s is not a qcow2 image: %w", path, err)
+	}
+	defer f.Close()
+	_, err = precheckQcow2HeaderFile(path, f)
+	return err
+}
+
+// precheckQcow2HeaderFile is precheckQcow2Header of the image read through
+// f (path names it in errors only), returning its image info.
+func precheckQcow2HeaderFile(path string, f *os.File) (*qcow2.ImageInfo, error) {
+	info, err := qcow2.InfoFile(f)
+	if err != nil {
+		return nil, fmt.Errorf("%s is not a qcow2 image: %w", path, err)
+	}
+	if err := qcow2.AssertNoExternalDataFile(f); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	n, err := qcow2.BackingFormatExtensionCountFile(f)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	if n > 1 {
-		return fmt.Errorf("%s declares its backing format %d times", path, n)
+		return nil, fmt.Errorf("%s declares its backing format %d times", path, n)
 	}
-	return nil
+	return info, nil
+}
+
+// precheckLayer is precheckChain's judgement of one layer's own header: the
+// layer at open (path resolved through symlinks; path names it in errors) is
+// opened by openRegularNoFollow, and everything judged is read through it.
+func precheckLayer(path, open string) (*qcow2.ImageInfo, error) {
+	f, _, err := openRegularNoFollow(open)
+	if err != nil {
+		return nil, fmt.Errorf("%s is not a regular file", path)
+	}
+	defer f.Close()
+	runByNameReadHook(open)
+	return precheckQcow2HeaderFile(path, f)
 }
 
 // imageStoreBaseOnly accepts a backing file only inside dataDir's image store

@@ -1260,39 +1260,57 @@ func convertImageForceShare(ctx context.Context, src, srcFormat string, rule cha
 // the argv.
 var qemuImgCommand = cmdbound.Command
 
-func convertImageWith(ctx context.Context, src, srcFormat string, rule chainRule, dst string, emit func(*pb.MoveVolumeProgress) error, forceShare bool) error {
-	// qemu-img follows symlinks; on an NFS export mounted without
-	// nosymfollow (a kernel before 5.10) none is handed to it.
+func convertImageWith(ctx context.Context, src, srcFormat string, rule chainRule, dst string, emit func(*pb.MoveVolumeProgress) error, forceShare bool) (retErr error) {
+	if srcFormat != "qcow2" && srcFormat != "raw" {
+		return status.Errorf(codes.InvalidArgument, "source format %q: only raw or qcow2 is converted", srcFormat)
+	}
+	// The source's top layer and the destination are held open first, and
+	// qemu-img gets those descriptors (and one per backing), never a name:
+	// the checks below judge by name, and what they judged is re-checked to
+	// be what is held (heldConvert, move_convert_fd.go).
+	held, err := openConvertTop(src, srcFormat, dst)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition, "%v", err)
+	}
+	defer held.close()
+	defer func() {
+		if retErr != nil {
+			held.removeCreated() // a refused or failed copy leaves nothing it made
+		}
+	}()
+	// No symlink on the way either; on an NFS export mounted without
+	// nosymfollow (a kernel before 5.10) the kernel would follow one.
 	for _, p := range []string{src, dst} {
 		if err := storage.CheckPoolPathNoSymlinks(p); err != nil {
 			return status.Errorf(codes.FailedPrecondition, "%v", err)
 		}
 	}
-	switch srcFormat {
-	case "qcow2":
-		if _, err := precheckChain(src, rule); err != nil {
+	if srcFormat == "qcow2" {
+		accepted, err := precheckChain(src, rule)
+		if err != nil {
 			return status.Errorf(codes.FailedPrecondition, "%s: %v", filepath.Base(src), err)
 		}
-	case "raw":
-	default:
-		return status.Errorf(codes.InvalidArgument, "source format %q: only raw or qcow2 is converted", srcFormat)
+		if err := held.openBackings(src, accepted); err != nil {
+			return status.Errorf(codes.FailedPrecondition, "%s: %v", filepath.Base(src), err)
+		}
+	}
+	if err := held.verifyNamed(src, dst); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "%v", err)
 	}
 	if !qemuImgAvailable() {
 		if srcFormat != "qcow2" {
 			return status.Error(codes.FailedPrecondition, "converting a raw image needs qemu-img")
 		}
-		return copyFileWithProgress(ctx, src, dst, emit)
+		return copyOpenFileWithProgress(ctx, held.layers[0], held.dst, emit)
 	}
-	args := []string{"convert"}
-	if forceShare {
-		args = append(args, "-U")
-	}
-	args = append(args, "-p", "-f", srcFormat, "-O", "qcow2", src, dst)
+	args, files := held.qemuImgArgs(forceShare)
 	cmd := qemuImgCommand(ctx, "qemu-img", args...)
+	cmd.ExtraFiles = files
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
 	}
+	runQemuImgRunHook()
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -1315,12 +1333,14 @@ func convertImageWith(ctx context.Context, src, srcFormat string, rule chainRule
 	if err := cmd.Wait(); err != nil {
 		return err
 	}
-	// Every caller hands qemu-img a 0600 file it made, whose mode qemu-img
-	// keeps; a dst qemu-img had to create itself is 0644 less the umask, and
-	// is narrowed to its owner before anything uses it (internal/diskmode),
-	// best effort: a filesystem that refuses chmod never fails the copy.
-	diskmode.NarrowBestEffort(dst)
-	if err := qcow2.AssertStandalone(dst); err != nil {
+	// qemu-img writes into a file made before it ran (by the caller, or by
+	// openConvertTop, 0600), whose mode it keeps; one that is wider anyway is
+	// narrowed to its owner through its descriptor (internal/diskmode), best
+	// effort: a filesystem that refuses chmod never fails the copy.
+	if fi, err := held.dst.Stat(); err == nil && fi.Mode().Perm()&0o077 != 0 {
+		diskmode.Restrict(held.dst, fi.Mode().Perm()&^0o077)
+	}
+	if err := held.assertStandalone(); err != nil {
 		return status.Errorf(codes.FailedPrecondition, "converted image is not standalone: %v", err)
 	}
 	return nil
@@ -1399,18 +1419,32 @@ func copyFileWithProgress(ctx context.Context, src, dst string, emit func(*pb.Mo
 		return err
 	}
 	defer in.Close()
-	st, err := in.Stat()
-	if err != nil {
-		return err
-	}
-	total := st.Size()
-
 	// Never through a symlink at dst: the pool may be somewhere others write.
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, diskmode.File)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
+	return copyOpenFileWithProgress(ctx, in, out, emit)
+}
+
+// copyOpenFileWithProgress is copyFileWithProgress between files already
+// open: in from its start, into out truncated first.
+func copyOpenFileWithProgress(ctx context.Context, in, out *os.File, emit func(*pb.MoveVolumeProgress) error) error {
+	st, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	total := st.Size()
+	if _, err := in.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if err := out.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := out.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
 
 	buf := make([]byte, 1<<20)
 	var copied int64

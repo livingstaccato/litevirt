@@ -3480,11 +3480,15 @@ names, cannot be read, what a kept overlay backs on is unknown, and these are
 refused on that host whatever their names: every import; every create or
 clone that writes a disk file on the host's own storage (one with no disk
 file, or with every disk on shared nfs, ceph or iscsi storage outside the disk
-directory, goes ahead); every disk attach that creates a new disk; and every
-backup restore to a `--target-path`. The
+directory, goes ahead); every disk attach that creates a new disk; every
+backup restore to a `--target-path`; every migration onto the host that copies
+a host-local disk; and every failover rebuild of a missing overlay disk. The
 evidence names the file under `creates_refused` (the condition is raised for
-it alone, and resolves once it reads). A migration's target and the
-reconciler's rebuild of a missing overlay disk are not checked yet.
+it alone, and resolves once it reads). A migration's target (the cold copy's
+check-only preflight and its write, the live copy's disk stubs) and the
+reconciler's rebuild of a missing overlay disk get the same check as a create
+at a kept overlay's missing base; a refused rebuild raises
+[`vm_disk_kept_base`](#a-failover-rebuild-is-refused-at-a-kept-overlays-missing-base-vm_disk_kept_base).
 
 ### A drain's live move timed out (`drain_move_timed_out`)
 
@@ -3693,6 +3697,38 @@ To recover, do one of these:
   path in the evidence and run `lv start <vm>`.
 - If its data is lost for good, run `lv rebuild <vm>`. It recreates the VM from
   its spec with blank disks and keeps its IP and MAC addresses.
+
+### A failover rebuild is refused at a kept overlay's missing base (`vm_disk_kept_base`)
+
+An ownership transfer onto a host rebuilds a disk missing there as a fresh
+overlay of its image, at `<disks>/<vm>-<disk>.qcow2`. A delete on that host may
+have kept an overlay of an earlier VM of the same name whose missing backing
+file is that very path: the rebuilt disk would become its base. The rebuild is
+refused, as a create is, and so is one while `kept-disks.json` or a kept chain
+cannot be read, or while storage or the database does not answer. The start
+fails as any failed rebuild does: one that carries a transfer proof is retried
+on each reconciler pass (and the coordinator may place the VM on another
+host); one without a proof goes to `error`, as before. The reconciler raises
+`vm_disk_kept_base` (evaluator `vm_disk`, subject `vm/<name>@<host>`,
+warning), written again only when what it says changes. The evidence names the
+disk, its path, the `cause` (`kept_overlay`, `kept_state_unreadable` or
+`no_answer`), the error naming the kept overlay or the file that cannot be
+read, and the fix for that cause.
+
+| Raised when | Clears when |
+|---|---|
+| The rebuild of a missing overlay disk is refused by the kept-create check. | The VM has left `pending`, `starting` and `error` on this host: it was started or stopped, moved to another host, or deleted. |
+
+To let the VM start on that host:
+
+- `kept_overlay`: move the kept overlay off it (or `qemu-img rebase -u -b <new
+  path>` it onto a copy of its base), or, once nothing needs the kept disk,
+  remove its entry from `<data_dir>/kept-disks.json`. Kept disks are listed
+  under `disk_leftover` in `lv health`.
+- `kept_state_unreadable`: repair the file named (`kept-disks.json`, or a kept
+  disk's chain), or move it away or remove its entry once nothing needs it.
+- `no_answer`: nothing to do once the storage or database answers; the next
+  attempt checks again.
 
 ### A VM's real disk is on another host (`vm_disk_stranded`)
 

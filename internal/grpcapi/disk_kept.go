@@ -278,6 +278,13 @@ func (s *Server) diskKeptRecords() ([]diskKeptRecord, string) {
 	return out, unreadable
 }
 
+// RecordKeptDiskForTest records path as disk diskName of vmName, kept on
+// this host by a delete, as such a delete records it in kept-disks.json.
+func (s *Server) RecordKeptDiskForTest(ctx context.Context, vmName, diskName, path string) {
+	s.recordKeptDisks(ctx, vmName, []KeptDisk{{Path: path, Disk: diskName, Host: s.hostName,
+		Reason: "whether the VM runs elsewhere could not be told (test)"}})
+}
+
 // JudgeKeptDisksForTest runs one judgeKeptDisks pass.
 func (s *Server) JudgeKeptDisksForTest(ctx context.Context) { s.judgeKeptDisks(ctx) }
 

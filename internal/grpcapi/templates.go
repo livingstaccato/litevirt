@@ -572,7 +572,18 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 				cleanup()
 				return nil, status.Errorf(codes.FailedPrecondition, "full-clone disk %s: %v", d.DiskName, err)
 			}
-			if err := qcow2.ConvertConfined(ctx, s.hostDiskFile(d.Path), hostFile, &qcow2.Options{Uncompressed: true}, onlyAccepted(accepted)); err != nil {
+			// The top layer is read beneath its directory held open by
+			// descriptor, with no link followed at the file (heldConvertSource,
+			// NoFollowSource), as a cold migration's flatten reads it.
+			src, release, err := s.heldConvertSource(d.Path, true)
+			if err != nil {
+				cleanup()
+				return nil, status.Errorf(codes.FailedPrecondition, "full-clone disk %s: %v", d.DiskName, err)
+			}
+			runConvertSourceHook(d.Path)
+			err = qcow2.ConvertConfined(ctx, src, hostFile, &qcow2.Options{Uncompressed: true, NoFollowSource: true}, onlyAccepted(accepted))
+			release()
+			if err != nil {
 				cleanup()
 				return nil, cloneDiskErr("full-clone disk", d.DiskName, err)
 			}

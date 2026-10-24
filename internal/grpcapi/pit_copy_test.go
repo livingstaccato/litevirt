@@ -26,6 +26,7 @@ import (
 type qemuArgvRecorder struct {
 	mu   sync.Mutex
 	argv [][]string
+	cmds []*exec.Cmd
 }
 
 func recordQemuImg(t *testing.T) *qemuArgvRecorder {
@@ -36,10 +37,12 @@ func recordQemuImg(t *testing.T) *qemuArgvRecorder {
 	r := &qemuArgvRecorder{}
 	prev := qemuImgCommand
 	qemuImgCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, name, args...)
 		r.mu.Lock()
 		r.argv = append(r.argv, append([]string{name}, args...))
+		r.cmds = append(r.cmds, cmd)
 		r.mu.Unlock()
-		return exec.CommandContext(ctx, name, args...)
+		return cmd
 	}
 	t.Cleanup(func() { qemuImgCommand = prev })
 	return r
@@ -56,13 +59,23 @@ func (r *qemuArgvRecorder) forceShared() bool {
 	return false
 }
 
-// read reports whether any qemu-img run read path.
+// read reports whether any qemu-img run read path: named as its source in
+// the argv, or handed to it as a source descriptor (convertImageWith passes
+// the source chain, then the destination, as ExtraFiles; a file's Name is
+// the path it was opened by).
 func (r *qemuArgvRecorder) read(path string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, a := range r.argv {
+	for i, a := range r.argv {
 		if len(a) >= 2 && a[len(a)-2] == path {
 			return true
+		}
+		if files := r.cmds[i].ExtraFiles; len(files) > 1 {
+			for _, f := range files[:len(files)-1] {
+				if f.Name() == path {
+					return true
+				}
+			}
 		}
 	}
 	return false

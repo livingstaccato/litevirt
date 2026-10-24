@@ -328,15 +328,22 @@ it reads, these are refused on that host, and `disk_leftover` names the file
 (`creates_refused`): every `lv import`; every create or `lv clone` that writes
 a disk file on the host's own storage (one with no disk file, or with every
 disk on shared nfs, ceph or iscsi storage outside the disk directory, goes
-ahead); every disk attach that creates a new disk; and every `lv backup
-restore-from` or `lv backup restore-live` with `--target-path`. With the record
+ahead); every disk attach that creates a new disk; every `lv backup
+restore-from` or `lv backup restore-live` with `--target-path`; every
+migration onto the host that copies a host-local disk; and every failover
+rebuild of a missing overlay disk there. With the record
 readable, a clone (into any pool, nfs included), a disk attach or a
 `--target-path` restore that would write a kept overlay's missing base is
 refused as a create is. A
 restore to the file the daemon names, or `--in-place` over the VM's own disk,
 is not checked: the first is a fresh name no overlay can name, the second a
-file that exists. A migration's target (cold or live) and the reconciler's
-rebuild of a missing overlay disk are not checked yet either. A create whose `<vm>-*` files in the disk directory cannot be
+file that exists. A migration's target is checked as a create is: a cold
+copy's check-only preflight and its write, and a live copy's disk stubs, are
+refused at a kept overlay's missing base, so the move fails on the source
+before anything is copied. So is the reconciler's rebuild of a missing overlay
+disk, which fails the start as any failed rebuild does (retried when it carries
+a transfer proof, in `error` otherwise) and raises `vm_disk_kept_base`
+(docs/diagnostics.md). A create whose `<vm>-*` files in the disk directory cannot be
 listed is refused too, naming the directory. A disk only
 `kept-disks.json` names, at the path the create writes, is refused rather than
 renamed. `lv import` refuses the same files at its disk's name, rather than

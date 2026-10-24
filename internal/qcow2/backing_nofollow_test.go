@@ -19,9 +19,10 @@ import (
 // O_NOFOLLOW with its path re-checked (openResolvedNoFollow).
 //
 // Mutations: open backings with os.Open again - the first, third and race tests
-// go red. (The readlink comparison in openResolvedNoFollow, which catches a
+// go red. The readlink comparison in openResolvedNoFollow, which catches a
 // directory on the way swapped for a link, is a path-level guard these file
-// swaps do not exercise.)
+// swaps do not exercise: TestFlattenBackingDirectorySwappedForALinkAfterAllowIsRefused
+// is the one that goes red without it.
 func backingFixture(t *testing.T) (dir, overlay, legit, secret string) {
 	t.Helper()
 	dir = t.TempDir()
@@ -187,5 +188,59 @@ func TestFlattenTopLayerHeaderChecksReadTheOpenFile(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "external") {
 		t.Errorf("refused for another reason: %v", err)
+	}
+}
+
+// A DIRECTORY on the backing's path swapped for a link after the backing is
+// judged. O_NOFOLLOW guards only the final component, so only the readlink
+// comparison in openResolvedNoFollow (the open file must still be named by the
+// path allow judged) refuses this. Red with that comparison removed: the
+// flatten ships the other directory's file. (Re-review 5b, R5b-1.)
+func TestFlattenBackingDirectorySwappedForALinkAfterAllowIsRefused(t *testing.T) {
+	const size = 1 << 20
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "sub")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legit := filepath.Join(sub, "base.raw")
+	if err := os.WriteFile(legit, bytes.Repeat([]byte("LEGITIMATE-BASE-"), size/16), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	other := t.TempDir()
+	if err := os.WriteFile(filepath.Join(other, "base.raw"), bytes.Repeat([]byte("OTHER-TENANT-SEC"), size/16), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	overlay := filepath.Join(dir, "vm.qcow2")
+	if err := CreateWithBackingFormat(overlay, "sub/base.raw", "raw", size, nil); err != nil {
+		t.Fatal(err)
+	}
+	realLegit, err := filepath.EvalSymlinks(legit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allow := func(resolved string) error {
+		if resolved != realLegit {
+			return os.ErrPermission
+		}
+		if err := os.Rename(sub, sub+".saved"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(other, sub); err != nil {
+			t.Fatal(err)
+		}
+		return nil
+	}
+	flat := filepath.Join(dir, ".flat")
+	err = ConvertConfined(context.Background(), overlay, flat, &Options{Uncompressed: true, NoFollowSource: true}, allow)
+	if err == nil {
+		b, _ := os.ReadFile(flat)
+		if bytes.Contains(b, []byte("OTHER-TENANT-SEC")) {
+			t.Fatalf("the flatten shipped another directory's file through a directory swapped for a link after the judgement")
+		}
+		t.Fatalf("the flatten succeeded through a directory swapped for a link")
+	}
+	if !strings.Contains(err.Error(), "changed while it was opened") {
+		t.Fatalf("refused, but not by the path re-check of the open backing: %v", err)
 	}
 }

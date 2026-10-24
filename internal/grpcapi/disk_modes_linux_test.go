@@ -36,12 +36,12 @@ func TestPlaceNoReplace_ACopiedImportIsOwnerOnly(t *testing.T) {
 
 // qemu-img writes into the file a caller made for it and keeps that file's
 // mode: every convert in the daemon (move, copy, replicate, restore, import,
-// promote) writes into a 0600 temp, so its output is 0600 — and if qemu-img
-// ever made its own file, convertImage narrows it before it is used. Needs a
-// real qemu-img.
+// promote) writes into a 0600 temp, so its output is 0600 — and a destination
+// not there yet is made 0600 by convertImage itself before qemu-img runs
+// (qemu-img writes through its descriptor). Needs a real qemu-img.
 //
-// Mutation: drop the narrowing after qemu-img in convertImageWith and convert
-// to a path that does not exist yet — this goes red.
+// Mutation: create a missing destination with a wider mode in openConvertTop
+// — this goes red.
 func TestConvertImage_OutputIsOwnerOnly(t *testing.T) {
 	if _, err := exec.LookPath("qemu-img"); err != nil {
 		t.Skip("qemu-img not installed")
@@ -63,7 +63,7 @@ func TestConvertImage_OutputIsOwnerOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantMode(t, f.Name(), 0o600)
-	// Onto a name nothing holds: qemu-img creates it (0644 less the umask).
+	// Onto a name nothing holds: convertImage creates it, owner-only.
 	fresh := filepath.Join(dir, "fresh.qcow2")
 	if err := convertImage(context.Background(), src, "qcow2", nil, fresh, noop); err != nil {
 		t.Fatal(err)

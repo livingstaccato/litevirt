@@ -23,6 +23,12 @@ func BackingFormatExtensionCount(path string) (int, error) {
 		return 0, err
 	}
 	defer f.Close()
+	return BackingFormatExtensionCountFile(f)
+}
+
+// BackingFormatExtensionCountFile is BackingFormatExtensionCount of the image
+// read through f, an open file the caller has judged.
+func BackingFormatExtensionCountFile(f io.ReaderAt) (int, error) {
 	head := make([]byte, 4096)
 	n, err := f.ReadAt(head, 0)
 	if err != nil && err != io.EOF {

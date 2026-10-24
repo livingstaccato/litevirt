@@ -23,7 +23,14 @@ func Info(path string) (*ImageInfo, error) {
 		return nil, err
 	}
 	defer f.Close()
+	return InfoFile(f)
+}
 
+// InfoFile is Info of the image read through f, an open file the caller has
+// judged (opened with no link followed and found regular, say): nothing is
+// opened by name, so a FIFO or a link swapped in at the name since cannot
+// hang the read or redirect it.
+func InfoFile(f *os.File) (*ImageInfo, error) {
 	h, err := readHeader(f)
 	if err != nil {
 		return nil, err

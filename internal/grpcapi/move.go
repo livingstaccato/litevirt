@@ -608,7 +608,7 @@ func referenceKind(d *corrosion.DiskRecord, path string) string {
 // cleanup — both must never os.Remove a file that backs a linked clone or
 // another VM (the bug-sweep found migrate deleting a clone's backing chain).
 func (s *Server) pathStillReferenced(ctx context.Context, path, excludeVM, excludeDisk string) (bool, string, error) {
-	if held, why := s.keptNoteHolds(path); held {
+	if held, why := s.keptHolds(ctx, path); held {
 		return true, why, nil
 	}
 	refs, err := corrosion.DisksReferencingPath(ctx, s.db, path)
@@ -783,7 +783,7 @@ func (s *Server) deleteRecordedVMDiskVolumeRecordsKept(
 // "local" when even that is blank (legacy rows).
 func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.DiskRecord) error {
 	if !strings.HasPrefix(d.Path, "rbd:") {
-		if held, why := s.keptNoteHolds(d.Path); held {
+		if held, why := s.keptHolds(ctx, d.Path); held {
 			s.reportKeptNoteHold(ctx, d.VMName, "the delete of disk "+d.DiskName, d.Path, why)
 			return nil
 		}
@@ -823,6 +823,23 @@ func (s *Server) diskDriver(ctx context.Context, d *corrosion.DiskRecord) (stora
 		}
 	} else if pool, ok := s.lookupStoragePool(d.StorageVolume); ok {
 		cfg = storage.Config{Driver: pool.Driver, Source: pool.Source, Target: pool.Target, Options: pool.Options}
+	} else if strings.EqualFold(cfg.Driver, "dir") {
+		// A `dir` disk whose pool is not on this host: it was moved here from
+		// the host that has the pool (a cold move keeps the disk record's
+		// pool name), or its pool was removed here. The dir driver's Target
+		// only roots creates; removing a file is by its recorded path, as
+		// the local driver does, so the delete frees the file where it is
+		// rather than failing with "dir driver requires Target" and leaving
+		// the VM half deleted. The file is still checked afterwards
+		// (freeRecordedVMDisks), so one that is not removed is named. With no
+		// pool to anchor it, the path itself must be one of this host's disk
+		// places, or in a directory a pool may write into (not a system
+		// directory, the PKI directory or litevirt state).
+		if !s.withinDiskArtifactRoot(d.Path) && storage.CheckWriteRoot(filepath.Dir(filepath.Clean(d.Path)), s.dataDir, s.pkiDir) != nil {
+			return nil, fmt.Errorf("disk %s: its pool %q is not on this host and its path %s is not in a disk place of this host; it is not removed",
+				d.DiskName, d.StorageVolume, d.Path)
+		}
+		cfg.Driver = "local"
 	}
 	if cfg.Driver == "" {
 		cfg.Driver = "local"
@@ -1459,7 +1476,7 @@ func (s *Server) sweepVMDiskDebrisIn(ctx context.Context, vmName string, candida
 		if keep[c] {
 			continue
 		}
-		if held, why := s.keptNoteHolds(c); held {
+		if held, why := s.keptHolds(ctx, c); held {
 			keep[c] = true
 			s.reportKeptNoteHold(ctx, vmName, "the disk debris sweep", c, why)
 		}

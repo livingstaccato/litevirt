@@ -235,6 +235,7 @@ var dataDirOwned = []string{
 	"fwmig-retained",             // fwmig.RetainedDir: retained firmware bundles
 	"fwmig-quarantine",           // fwmig.QuarantineDir: quarantined firmware state
 	"fwmig-leftover",             // fwmig.LeftoverDir: leftovers an owed DISCARD names
+	"endpoint",                   // daemon/endpoint.go endpointFilePath: a non-root daemon's endpoint file (a root one's is /run/litevirt/endpoint; its temp is a dot-name)
 }
 
 // dataDirOwnedPrefixes are owned by name prefix, each judged within one path

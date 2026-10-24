@@ -7,19 +7,41 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
+// poolStateDeparted is the state ListStoragePools reports for a pool whose
+// host is no longer a member: `lv host rm` removed it.
+const poolStateDeparted = "departed"
+
 // ListStoragePools returns the pools the caller may view: global pools (any
 // viewer) + those owned by a project the caller can read. A legacy cluster viewer
 // (no project binding) still sees all via the role fallback.
+//
+// A pool of a host that has no live hosts row is listed as departed,
+// whatever state its host last wrote. `lv host rm` leaves the pool rows,
+// and the data in them on the machine, alone: the host wrote them, a
+// re-added host writes them again at start, and the operator may still have
+// data there. Showing them as the active pools they were reported as, after
+// the host has gone, is what it must not do.
 func (s *Server) ListStoragePools(ctx context.Context, _ *pb.ListStoragePoolsRequest) (*pb.ListStoragePoolsResponse, error) {
 	pools, err := corrosion.ListAllStoragePools(ctx, s.db)
 	if err != nil {
 		return nil, err
+	}
+	hosts, err := corrosion.ListHosts(ctx, s.db)
+	if err != nil {
+		return nil, err
+	}
+	member := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		member[h.Name] = true
 	}
 
 	resp := &pb.ListStoragePoolsResponse{}
 	for _, p := range pools {
 		if s.authorizeResourceRead(ctx, p.Project, poolRBACPathFor(p.Project, p.Name), "storage.pool.read") != nil {
 			continue
+		}
+		if !member[p.HostName] {
+			p.State = poolStateDeparted
 		}
 		resp.Pools = append(resp.Pools, storagePoolRecordToPB(p))
 	}

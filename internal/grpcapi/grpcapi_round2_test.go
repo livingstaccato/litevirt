@@ -80,6 +80,7 @@ func testServerR2(t *testing.T) *Server {
 	return &Server{
 		hostName: "test-host",
 		dataDir:  dataDir,
+		pkiDir:   t.TempDir(),
 		db:       db,
 		images:   store,
 		events:   events.NewBus(),

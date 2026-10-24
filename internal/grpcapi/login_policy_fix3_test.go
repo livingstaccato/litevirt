@@ -427,14 +427,21 @@ func TestM1_OneFailedRecheckIsRetried(t *testing.T) {
 // m-2: every streaming RPC of the service is in the reviewed audit of what it
 // holds open, so a new one cannot be added without saying how a cut releases it.
 func TestM2_EveryStreamingRPCIsAudited(t *testing.T) {
+	for _, problem := range streamAuditProblems(streamHandlerAudit) {
+		t.Error(problem)
+	}
+}
+
+func streamAuditProblems(audit map[string]string) []string {
 	desc := pb.LiteVirt_ServiceDesc
+	var problems []string
 	for _, sd := range desc.Streams {
 		full := "/" + desc.ServiceName + "/" + sd.StreamName
-		if strings.TrimSpace(streamHandlerAudit[full]) == "" {
-			t.Errorf("streaming RPC %s is not in streamHandlerAudit", sd.StreamName)
+		if strings.TrimSpace(audit[full]) == "" {
+			problems = append(problems, "streaming RPC "+sd.StreamName+" is not in streamHandlerAudit")
 		}
 	}
-	for name := range streamHandlerAudit {
+	for name := range audit {
 		found := false
 		for _, sd := range desc.Streams {
 			if "/"+desc.ServiceName+"/"+sd.StreamName == name {
@@ -442,8 +449,35 @@ func TestM2_EveryStreamingRPCIsAudited(t *testing.T) {
 			}
 		}
 		if !found {
-			t.Errorf("streamHandlerAudit lists %s, which is not a streaming RPC", name)
+			problems = append(problems, "streamHandlerAudit lists "+name+", which is not a streaming RPC")
 		}
+	}
+	return problems
+}
+
+func TestM2_StreamAuditRejectsMissingAndUnknownMethods(t *testing.T) {
+	const export = "/litevirt.v1.LiteVirt/ExportAutomationSource"
+	for _, mode := range []string{"missing-export", "blank-export", "unknown-stream"} {
+		t.Run(mode, func(t *testing.T) {
+			audit := make(map[string]string, len(streamHandlerAudit))
+			for k, v := range streamHandlerAudit {
+				audit[k] = v
+			}
+			want := "streaming RPC ExportAutomationSource is not in streamHandlerAudit"
+			switch mode {
+			case "missing-export":
+				delete(audit, export)
+			case "blank-export":
+				audit[export] = " \t"
+			case "unknown-stream":
+				audit["/litevirt.v1.LiteVirt/UnreviewedStream"] = "not a real descriptor"
+				want = "streamHandlerAudit lists /litevirt.v1.LiteVirt/UnreviewedStream, which is not a streaming RPC"
+			}
+			got := streamAuditProblems(audit)
+			if len(got) != 1 || got[0] != want {
+				t.Fatalf("audit failed to classify %s: %v, want %q", mode, got, want)
+			}
+		})
 	}
 }
 

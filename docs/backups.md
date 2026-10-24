@@ -632,6 +632,18 @@ temp sibling and is renamed into its final name only once it has completed
 and is non-empty — never over a file already there — so an interrupted run
 cannot leave a truncated file promotion would select.
 
+A run on a host that may not act as the VM's owner now is **skipped, not
+failed**. A host coming back from a fence or a partition still sees the VM's
+row on itself until it has caught up, though the VM may have been promoted on
+another host meanwhile. While it warms up, has lost its execution gate, is not
+an active member in its own view, or holds an owner-epoch marker ahead of the
+row, its scheduler logs `schedule run skipped` at info, raises no failure,
+and writes nothing to the schedule row: `LAST RUN` and `LAST ERR` stay the
+owner's. Skips that go on for 15 minutes (the host is still fenced, or its
+view never catches up) raise `replication.skipped` (warn), at most hourly
+while they continue: if the VM still runs there, no replica is being taken.
+A run that is not skipped ends that episode.
+
 ### Where replicas live, and how they are selected
 
 A target pool is often a global pool every project uses, so replicas are not
@@ -1265,6 +1277,18 @@ as `replication.suspended` (warn), once and then hourly, with the reason in the
 schedule's `LAST ERR`. A pool, project or cluster schedule is never switched for
 one of its VMs, so a VM that moves onto such a schedule's explicit target keeps
 replicating into the pool there, as it always has.
+
+**Never from a witness.** A VM promoted onto a witness is stopped there until it
+is moved to a worker (`lv migrate <vm> <worker> --cold`), and the promote
+switches its schedule to replicate from the witness back to the host it left. A
+witness runs no workloads and refuses to act for the VM, so the schedule is
+paused: the first run reports it once, as one audit entry (`vm.replicate`, with
+the reason and the command) and one `replication.suspended` notification, and
+later runs do nothing and are not logged as errors. The schedule keeps the reason
+as its `LAST ERR` (`schedule paused: ...`), so it never reads as healthy, and the
+notification is repeated hourly, as above. The schedule resumes by itself once
+the VM is on a worker, whose scheduler then runs it and reports
+`replication.recovered` on its first good run.
 
 The switch changes only the target host: once the release token has latched,
 as a compare-and-set of that one column, so an operator's concurrent edit of the

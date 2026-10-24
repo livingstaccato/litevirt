@@ -2,9 +2,9 @@
 
 ## Introduction
 
-litevirt is a lightweight KVM/QEMU orchestrator built for teams that want the simplicity of a single binary with the power of a full virtualization platform. There are no external databases, no container runtimes, no sidecars — just one static Go binary (`litevirt`) that you `scp` onto a Linux host and start.
+litevirt is a lightweight KVM/QEMU orchestrator built for teams that want the simplicity of a single binary with the power of a full virtualization platform. There are no external databases, no sidecars — just one static Go binary (`litevirt`) that you `scp` onto a Linux host and start.
 
-Every host in a litevirt cluster is equal. There is no master node, no leader election, and no single point of failure. State is stored in an embedded SQLite database on each host and replicated across the cluster using the Crescent protocol — a relay-quorum replication topology. Conflicts resolve last-writer-wins by each row's wall-clock `updated_at` (so all hosts must run NTP); Hybrid Logical Clocks order the replication log and de-duplicate mutations, but do not arbitrate conflicts. If a host goes down, the others continue operating with a consistent view of the cluster.
+Every host in a litevirt cluster is equal. There is no master node and no single point of failure; no host is an elected master, though a few subsystems (failover, the rebalancer) take short leader leases. State is stored in an embedded SQLite database on each host and replicated across the cluster using the Crescent protocol — a relay-quorum replication topology. Conflicts resolve last-writer-wins by each row's wall-clock `updated_at` (so all hosts must run NTP); Hybrid Logical Clocks order the replication log and de-duplicate mutations, but do not arbitrate conflicts. If a host goes down, the others continue operating with a consistent view of the cluster.
 
 ### Why litevirt?
 
@@ -14,14 +14,14 @@ It gives you:
 
 - **Multi-VM stacks** defined in Docker Compose-style YAML — networks, disks, placement constraints, service inheritance, load balancers, all in one file.
 - **Live migration** with pre-copy memory transfer and automatic convergence. Move running VMs between hosts with near-zero downtime.
-- **Automatic failover** with quorum-based failure detection and IPMI/watchdog fencing. VMs are rescheduled to healthy hosts without manual intervention.
+- **Automatic failover** with quorum-based failure detection and IPMI/Redfish/SSH/watchdog fencing. VMs are rescheduled to healthy hosts without manual intervention.
 - **Networking** that works — bridges, VXLAN overlays, SR-IOV, isolated networks with host isolation, built-in DHCP/DNS via dnsmasq, and NAT for outbound connectivity.
 - **Storage pools** across local disks, NFS, Ceph, and iSCSI, with snapshots and backup/restore.
-- **GPU and PCI passthrough** including SR-IOV virtual functions, NVIDIA MIG, and NVMe devices, with hot-plug support.
+- **GPU and PCI passthrough** including SR-IOV virtual functions and NVMe devices, with hot-plug support.
 - **mTLS everywhere** with auto-generated ECDSA P-256 PKI. Zero-trust between hosts, no manual certificate management.
 - **A web UI, REST API, and CLI** — pick the interface that fits your workflow.
 
-The entire platform compiles to a single binary, `litevirt` (~30 MB): `litevirt daemon` runs the server and `litevirt <cmd>` is the CLI (also installed as the `lv` symlink). No CGO, no runtime dependencies beyond QEMU and libvirt on the host.
+The entire platform compiles to a single binary, `litevirt` (~68 MB): `litevirt daemon` runs the server and `litevirt <cmd>` is the CLI (also installed as the `lv` symlink). No CGO. The host needs QEMU and libvirt, plus the other packages listed in [Installation](installation.md).
 
 ### Architecture overview
 
@@ -31,7 +31,7 @@ The entire platform compiles to a single binary, `litevirt` (~30 MB): `litevirt 
 │  ┌───────┐                                              │
 │  │  lv   │ CLI binary                                   │
 │  └───┬───┘                                              │
-│      │ SSH tunnel                                       │
+│      │ gRPC/mTLS                                        │
 └──────┼──────────────────────────────────────────────────┘
        │
 ┌──────▼──────────────────────────────────────────────────┐
@@ -63,7 +63,7 @@ The entire platform compiles to a single binary, `litevirt` (~30 MB): `litevirt 
    └─────────┘   └─────────┘   └─────────┘
 ```
 
-The CLI (`lv`) connects to any host in the cluster over an SSH tunnel. Since every host has the full cluster state, any host can serve as the entry point. The daemon exposes three interfaces: gRPC (primary API, used by the CLI and inter-host communication), a REST gateway (for curl and CI scripts), and a web UI (HTMX-based, no JavaScript build step).
+The CLI (`lv`) connects to any host in the cluster over gRPC with mutual TLS. Since every host has the full cluster state, any host can serve as the entry point. The daemon exposes three interfaces: gRPC (primary API, used by the CLI and inter-host communication), a REST gateway (for curl and CI scripts), and a web UI (HTMX-based, no JavaScript build step).
 
 ### Getting started
 
@@ -76,7 +76,6 @@ make build
 # Single-node setup
 sudo cp bin/litevirt /usr/local/bin/
 sudo lv host init --local --name node-1
-sudo systemctl enable --now litevirt
 
 # Run a VM
 export LV_HOST=root@127.0.0.1
@@ -103,7 +102,7 @@ See the [Installation](installation.md) guide for multi-host cluster setup, addi
 | [Placement & Rebalancer](placement.md) | Per-VM policies, named modes (`balance`, `bin-pack`, `spread-strict`, `cost-aware`), rebalancer modes, scope chain, troubleshooting |
 | [Upgrades](upgrades.md) | Pre-flight gates, `upgrading` host state, auto-rollback, operator playbook |
 | [Operating Model](operating-model.md) | What the cluster guarantees and does NOT guarantee; recovery playbook; even-N witness sizing |
-| [GPU & PCI Passthrough](pci-passthrough.md) | Device assignment, SR-IOV VFs, MIG, hot-plug |
+| [GPU & PCI Passthrough](pci-passthrough.md) | Device assignment, SR-IOV VFs, hot-plug |
 | [REST API](rest-api.md) | HTTP/JSON gateway with SSE for streaming RPCs |
 | [Web UI](ui.md) | Browser-based dashboard |
 | [Tenancy](tenancy.md) | Projects, quotas (6 dimensions), billing webhook, RBAC integration |

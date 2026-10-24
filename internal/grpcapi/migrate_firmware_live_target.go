@@ -129,7 +129,7 @@ func (s *Server) PrepareLiveFirmwareTarget(ctx context.Context, req *pb.PrepareL
 	if err := s.requirePeerCert(ctx); err != nil {
 		return nil, err
 	}
-	vm, err := s.authorizeMigrationHelper(ctx, req.VmName)
+	vm, err := s.authorizeMigrationTarget(ctx, req.VmName)
 	if err != nil {
 		return nil, err
 	}
@@ -638,7 +638,7 @@ func (s *Server) removeDiscardedStubs(ctx context.Context, vmName string, stubs 
 				"vm", vmName, "path", p)
 			continue
 		}
-		if err := os.Remove(s.hostDiskFile(p)); err != nil && !os.IsNotExist(err) {
+		if err := s.removeDiskFileBeneath(p, true); err != nil {
 			slog.Warn("live firmware move: discard could not remove a disk stub", "vm", vmName, "path", p, "error", err)
 			continue
 		}

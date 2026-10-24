@@ -3,6 +3,8 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -690,6 +692,14 @@ func TestR3_GetHostHealth_WithEntries(t *testing.T) {
 func TestR3_Ping(t *testing.T) {
 	s := testServerR2(t)
 	ctx := adminCtx()
+	for _, dir := range []string{s.dataDir, s.pkiDir} {
+		if !filepath.IsAbs(dir) {
+			t.Fatalf("Ping fixture must own an absolute private root, got %q", dir)
+		}
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+			t.Fatalf("Ping fixture root %q is unavailable: %v", dir, err)
+		}
+	}
 
 	resp, err := s.Ping(ctx, &pb.PingRequest{})
 	if err != nil {
@@ -697,6 +707,12 @@ func TestR3_Ping(t *testing.T) {
 	}
 	if resp.HostName != "test-host" {
 		t.Errorf("HostName = %q, want test-host", resp.HostName)
+	}
+	if fi, err := os.Stat(filepath.Join(s.pkiDir, ".trust.lock")); err != nil || !fi.Mode().IsRegular() {
+		t.Fatalf("real signing-readiness probe did not use the private PKI lock: %v", err)
+	}
+	if _, err := os.Stat(".trust.lock"); !os.IsNotExist(err) {
+		t.Fatalf("Ping wrote a package-directory trust lock: %v", err)
 	}
 }
 

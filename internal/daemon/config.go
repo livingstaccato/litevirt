@@ -1154,6 +1154,7 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	warnRetiredConfigKeys(data)
+	warnReadableInlineSecrets(path, cfg.Auth.Realms)
 
 	if cfg.HostName == "" {
 		return nil, fmt.Errorf("host_name is required in config")
@@ -1337,6 +1338,34 @@ func warnRetiredConfigKeys(data []byte) {
 				"config_key", strings.Join(k.path, "."), "value", fmt.Sprint(node), "why", k.why)
 		}
 	}
+}
+
+// warnReadableInlineSecrets warns when config.yaml is group- or other-readable
+// and holds an auth realm's inline secret. /etc/litevirt is searchable by every
+// local user (the fence agent's forced command needs it), so such a secret is
+// readable by anyone with a shell on the host. Only a warning: refusing would
+// stop hosts that run today, and the *_file forms are the fix. It reports the
+// realms, never the values.
+func warnReadableInlineSecrets(path string, realms []auth.RealmConfig) {
+	var inline []string
+	for _, r := range realms {
+		if r.LDAP != nil && r.LDAP.BindPassword != "" {
+			inline = append(inline, r.Name+".ldap.bind_password")
+		}
+		if r.OIDC != nil && r.OIDC.ClientSecret != "" {
+			inline = append(inline, r.Name+".oidc.client_secret")
+		}
+	}
+	if len(inline) == 0 {
+		return
+	}
+	fi, err := os.Stat(path)
+	if err != nil || fi.Mode().Perm()&0o077 == 0 {
+		return
+	}
+	slog.Warn("config: "+path+" holds inline auth secrets and is readable by other users; "+
+		"chmod 0600 it, or move the secrets to bind_password_file / client_secret_file",
+		"config", path, "mode", fmt.Sprintf("%04o", fi.Mode().Perm()), "inline_secrets", strings.Join(inline, ","))
 }
 
 // normalizeAdvertiseAddress validates and canonicalizes advertise_address.

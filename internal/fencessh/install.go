@@ -128,6 +128,12 @@ lv_fence_ssh_install() {
         done
     fi
     install -d -m 0755 "$dir"
+    # The AuthorizedKeysCommand runs as an unprivileged user, so it must also
+    # traverse the PARENT of $dir (/etc/litevirt). One that a local host init
+    # made 0700 breaks every sshd read. Add the search bit for others and nothing
+    # else: no read, no listing, no change to a mode that already has it.
+    c="$(dirname "$dir")"
+    if [ -d "$c" ]; then chmod o+x "$c" || true; fi
     if [ ! -x "$sshd" ]; then
         echo "fence ssh: no sshd at $sshd; nothing installed"
         return 0

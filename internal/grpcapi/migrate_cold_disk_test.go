@@ -108,6 +108,9 @@ func newColdDiskFixture(t *testing.T) *coldDiskFixture {
 	dst.db.SetClusterPolicyGate(func() bool { return true }) // failover_scope_v1 latched: stub records are kept
 	dst.dataDir = t.TempDir()
 	p := filepath.Join(dst.dataDir, "disks", "os1-root.qcow2")
+	// The recorded path names the same file on both hosts: a disk place of the
+	// source as well (the source reads only from its own).
+	src.SetStoragePoolsByName(map[string]StoragePoolRef{"dst-disks": {Driver: "dir", Target: filepath.Join(dst.dataDir, "disks")}})
 	disk := corrosion.DiskRecord{VMName: "os1", DiskName: "root", HostName: src.hostName, Path: p, StorageType: "local"}
 	for _, s := range []*Server{src, dst} {
 		if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{

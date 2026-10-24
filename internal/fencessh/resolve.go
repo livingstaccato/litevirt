@@ -68,7 +68,12 @@ func (a *Agent) fenceConfig(ctx context.Context, target, request string) (fence.
 	}
 	pinned := fence.SSHFence{Path: fence.SSHPathPinned, KnownHosts: KnownHostsLines(v), HostKeyAlias: Alias(target)}
 	pinnedOr := func(why string) fence.SSHFence {
-		if other := a.sharedHostKey(ctx, target, v, tr); other != "" {
+		other, err := a.sharedHostKey(ctx, target, v, tr)
+		if err != nil {
+			return refuse("%s; and this host cannot check whether another host publishes %s's sshd host keys (%v), "+
+				"so the pinned legacy path cannot rule out a cloned image", why, target, err)
+		}
+		if other != "" {
 			return refuse("%s; and %s publishes one of %s's sshd host keys (a cloned image?), so the pinned legacy "+
 				"path cannot tell the two apart: regenerate the sshd host keys on one of them", why, other, target)
 		}
@@ -96,15 +101,16 @@ func (a *Agent) fenceConfig(ctx context.Context, target, request string) (fence.
 }
 
 // sharedHostKey is another live host whose verified row publishes one of v's
-// sshd host keys, "" for none.
-func (a *Agent) sharedHostKey(ctx context.Context, target string, v *Verified, tr Trust) string {
+// sshd host keys, "" for none. An error means it could not tell: the caller
+// refuses rather than read that as "none".
+func (a *Agent) sharedHostKey(ctx context.Context, target string, v *Verified, tr Trust) (string, error) {
 	mine := map[string]bool{}
 	for _, k := range v.HostKeys {
 		mine[KeyLine(k)] = true
 	}
-	rows, err := corrosion.ListHostFenceSSH(ctx, a.cfg.DB)
+	rows, err := listHostFenceSSH(ctx, a.cfg.DB)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	for _, r := range rows {
 		if r.HostName == target || r.Deleted {
@@ -116,12 +122,16 @@ func (a *Agent) sharedHostKey(ctx context.Context, target string, v *Verified, t
 		}
 		for _, k := range o.HostKeys {
 			if mine[KeyLine(k)] {
-				return r.HostName
+				return r.HostName, nil
 			}
 		}
 	}
-	return ""
+	return "", nil
 }
+
+// listHostFenceSSH reads every row for sharedHostKey. A var only so a test
+// can fail it.
+var listHostFenceSSH = corrosion.ListHostFenceSSH
 
 func orUnknown(s string) string {
 	if s == "" {

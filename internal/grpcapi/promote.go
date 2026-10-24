@@ -276,6 +276,26 @@ func (s *Server) promoteResolvedIn(ctx context.Context, req *pb.PromoteReplicaRe
 				errReplicaOutOfRegion, req.VmName, host, got, requireRegion)
 		}
 	}
+	// A replica held on a witness. A witness runs no workloads, so the VM cannot
+	// be started there: an OPERATOR's promote still takes the VM over, as the
+	// only copy may be there, but leaves it defined and stopped
+	// (witnessPromote) for `lv migrate <vm> <worker> --cold`. The failover
+	// coordinator never does: a promote that does not start the VM recovers
+	// nothing, and a silent stranded copy is worse than a loud hold.
+	if hr, herr := corrosion.GetHost(ctx, s.db, host); herr == nil && hr != nil && hr.IsWitness() {
+		if automated || req.Automated {
+			held := s.holdReplicaOnWitness(ctx, vm, pool, host, replica)
+			if automated {
+				return held // unwrapped: the coordinator matches ErrPromoteHeld
+			}
+			return status.Errorf(codes.FailedPrecondition, "%v", held)
+		}
+		if req.NewName != "" && req.NewName != vm.Name {
+			return status.Errorf(codes.FailedPrecondition,
+				"vm %q's replica is on host %q, a witness (role: %s) that runs no workloads: it can only be promoted there under the VM's own name (no --new-name), which takes over the VM and is for a VM whose host is down; it is left stopped, and then moved to a worker with `lv migrate %s <worker-host> --cold`",
+				req.VmName, host, hr.Role, req.VmName)
+		}
+	}
 	// Before any proof is persisted or any request relayed: a stale replica is
 	// refused at the point it is chosen, not after the destination has been
 	// told to expect it.
@@ -649,6 +669,42 @@ func vmAllowsAutoPromoteNotPIT(vm *corrosion.VMRecord) bool {
 	return spec.Labels[corrosion.LabelAutoPromoteNotPointInTime] == "true"
 }
 
+// holdReplicaOnWitness refuses an automatic promotion whose replica is held by
+// a witness, loudly and without touching anything: an event (which InspectVM
+// shows), a notification, and the steps that recover the VM by hand. It wraps
+// corrosion.ErrPromoteHeld, so the coordinator holds the VM down (and audits
+// the skip) instead of rescheduling it onto a host that does not have its disk.
+func (s *Server) holdReplicaOnWitness(ctx context.Context, vm *corrosion.VMRecord, pool, host, replica string) error {
+	worker := s.exampleWorker(ctx, host)
+	cmd := fmt.Sprintf("lv replication promote %s --pool %s --host %s --replica %s", vm.Name, pool, host, replica)
+	detail := fmt.Sprintf("automatic promotion held: the replica (%s in pool %s) is on %s, a witness that runs no workloads, so the VM cannot be started there. The VM stays down and the replica is untouched. %s (it is left defined and stopped on %s); then `lv migrate %s %s --cold` and `lv start %s`",
+		replica, pool, host, s.promoteByHandSteps(ctx, vm, cmd), host, vm.Name, worker, vm.Name)
+	slog.Error("failover: automatic promotion held; the replica is on a witness", "vm", vm.Name, "replica", replica, "host", host)
+	s.recordVMEventSeverity(ctx, vm.Name, vmEventFailoverHeld, "error", "error", detail)
+	s.notify(ctx, notify.Notification{
+		Kind: "replication.promote_held", Severity: notify.SevError, Subject: vm.Name, Detail: detail,
+	})
+	return fmt.Errorf("%w: %s", errReplicaOnWitness, detail)
+}
+
+// errReplicaOnWitness marks an automatic promotion held because its replica is
+// on a witness.
+var errReplicaOnWitness = corrosion.ErrReplicaOnWitness
+
+// exampleWorker is the name of an active worker host other than skip, for the
+// command an operator is told to run; a placeholder when none can be read.
+func (s *Server) exampleWorker(ctx context.Context, skip string) string {
+	hosts, err := corrosion.ListHosts(ctx, s.db)
+	if err == nil {
+		for _, h := range hosts {
+			if h.Name != skip && !h.IsWitness() && h.State == "active" {
+				return h.Name
+			}
+		}
+	}
+	return "<worker-host>"
+}
+
 // holdNotPointInTime refuses an automatic promotion whose only replica is
 // not point-in-time, loudly: an event (which InspectVM shows), a
 // notification, and the commands that promote it by hand, which work as
@@ -869,9 +925,38 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// forces the gate even if THIS host hasn't latched enforcement — an asymmetric
 	// partition can deliver a valid proof to a target that locally lacks quorum, and
 	// it must not promote. Fail-open only for a proofless promote before activation.
-	if reason, refused := s.execGateForAction(ctx, req.Proof != nil); refused {
-		s.noteGateRefused(corrosion.ActionPromote, reason)
-		return status.Error(codes.FailedPrecondition, s.gateRefusal(ctx, "promote", reason, returnToServiceHint))
+	// A witness takes an operator's promote as a takeover that starts nothing
+	// (witnessPromote): the gate it answers is the one for a host holding a
+	// workload without running it - quorum and fence, not the worker role.
+	witnessPromote := false
+	if self, herr := corrosion.GetHost(ctx, s.db, s.hostName); herr == nil && self != nil && self.IsWitness() {
+		if automated || req.Automated || req.Proof != nil {
+			return status.Errorf(codes.FailedPrecondition,
+				"promote refused: host %q is a witness and runs no workloads; an automatic promotion is never executed here", s.hostName)
+		}
+		// Active only: a promote lands a VM, which a witness being drained or
+		// in maintenance is not taking on.
+		if self.State != "active" {
+			return status.Errorf(codes.FailedPrecondition,
+				"promote refused: witness %q is %s, not active, and takes on no VM: %s",
+				s.hostName, self.State, returnToServiceHint(s.hostName, self.State))
+		}
+		witnessPromote = true
+	}
+	var gateReason string
+	var gateRefused bool
+	if witnessPromote {
+		gateReason, gateRefused = s.drainGateRefused(ctx)
+	} else {
+		gateReason, gateRefused = s.execGateForAction(ctx, req.Proof != nil)
+	}
+	if gateRefused {
+		s.noteGateRefused(corrosion.ActionPromote, gateReason)
+		return status.Error(codes.FailedPrecondition, s.gateRefusal(ctx, "promote", gateReason, returnToServiceHint))
+	}
+	if witnessPromote && req.NewName != "" && req.NewName != vm.Name {
+		return status.Errorf(codes.FailedPrecondition,
+			"promote of %s refused: host %q is a witness; it is promoted there only under its own name, which takes over the VM and is for a VM whose host is down", vm.Name, s.hostName)
 	}
 	// Under active enforcement an AUTOMATED (coordinator/relayed) promote MUST carry a
 	// proof — a proofless automated promote is refused. This keys off `automated`, NOT
@@ -1787,6 +1872,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			})
 			s.forgetMoveRecords(ctx, targetName) // the promoted domain takes the name
 			setFlightUUID(spec.Uuid)
+			if err := s.setAsideStaleLibvirtVars(targetName); err != nil {
+				return "set aside stale UEFI vars", err
+			}
 			if err := s.virt.DefineDomain(domXML); err != nil {
 				return "define domain", err
 			}
@@ -1817,6 +1905,11 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 					s.removePromoteMarker(targetName)
 					return "operator claim", err
 				}
+			}
+			if witnessPromote {
+				// Defined, never started: a witness runs no workloads. The
+				// ownership commit below records it stopped.
+				return "", nil
 			}
 			releaseGuard, gerr := s.guardSharedDiskStart(ctx, targetName, domXML)
 			if gerr != nil {
@@ -1901,11 +1994,18 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				return status.Errorf(codes.Internal, "%s: %v", stage, err)
 			}
 		}
-		recordStep("started") // checkpoint: never destroy/rebuild this domain on a retry
-		_ = send(&pb.PromoteReplicaProgress{
-			Phase: pb.PromoteReplicaProgress_STARTED, VmName: targetName, Host: s.hostName,
-			Replica: replica, DiskPath: livePath, Status: "VM started off the promoted replica",
-		})
+		if witnessPromote {
+			_ = send(&pb.PromoteReplicaProgress{
+				Phase: pb.PromoteReplicaProgress_LOCALIZING, VmName: targetName, Host: s.hostName,
+				Replica: replica, DiskPath: livePath, Status: "VM defined, not started: this host is a witness",
+			})
+		} else {
+			recordStep("started") // checkpoint: never destroy/rebuild this domain on a retry
+			_ = send(&pb.PromoteReplicaProgress{
+				Phase: pb.PromoteReplicaProgress_STARTED, VmName: targetName, Host: s.hostName,
+				Replica: replica, DiskPath: livePath, Status: "VM started off the promoted replica",
+			})
+		}
 	}
 	manifest, partial := promotionManifest(src.DiskName, replica, rootTaken, s.hostName, vm.Name, targetName, others)
 	multiDiskNote = ""
@@ -1962,8 +2062,16 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			s.reconcileLocal(ctx)
 		}
 	} else {
+		// The disks as they are before the commit re-homes them: what the
+		// promotion leaves on the host the VM left (noteDisksLeftByPromote).
+		disksBefore, disksBeforeErr := corrosion.GetVMDisks(ctx, s.db, targetName)
 		// Phase 4: promotion commit is an ownership transition (fresh-read CAS + increment).
-		if err := s.publishRunningMinted(ctx, targetName, func(ctx context.Context) error {
+		if witnessPromote {
+			// Stopped, so nothing publishes it running.
+			if err := corrosion.TransferVMOwnerFresh(ctx, s.db, targetName, s.hostName, "stopped"); err != nil {
+				return status.Errorf(codes.Internal, "re-home vm record: %v", err)
+			}
+		} else if err := s.publishRunningMinted(ctx, targetName, func(ctx context.Context) error {
 			return corrosion.TransferVMOwnerFresh(ctx, s.db, targetName, s.hostName, "running")
 		}); err != nil {
 			return status.Errorf(codes.Internal, "re-home vm record: %v", err)
@@ -1983,6 +2091,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 		// The VM now runs on its replica target: replicate back to the host it left.
 		s.reverseReplicationAfterMove(ctx, "vm", targetName, "", vm.HostName, s.hostName)
+		if !automated { // the failover coordinator records its own promotions
+			s.noteDisksLeftByPromote(ctx, vm, disksBefore, disksBeforeErr)
+		}
 	}
 	// Row persisted (the durable record now exists) → drop the host-local promote marker;
 	// a future retry would see the re-homed row and not re-promote.
@@ -2003,9 +2114,15 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	s.auditTuningDropped(ctx, ioR, targetName, op)
 	relR.audit(ctx, s, targetName, op)
 	s.recordForeignNetworks(ctx, "vm.promote", targetName, foreignNets)
+	done := "promotion complete" + multiDiskNote
+	if witnessPromote {
+		done = fmt.Sprintf("promotion complete%s: %s is defined but NOT started on %s, a witness that runs no workloads. Move it to a worker and start it there: `lv migrate %s %s --cold`, then `lv start %s`",
+			multiDiskNote, targetName, s.hostName, targetName, s.exampleWorker(ctx, s.hostName), targetName)
+		s.recordVMEventSeverity(ctx, targetName, "vm.promoted_on_witness", "warning", "error", done)
+	}
 	_ = send(&pb.PromoteReplicaProgress{
 		Phase: pb.PromoteReplicaProgress_DONE, VmName: targetName, Host: s.hostName,
-		Replica: replica, DiskPath: livePath, Status: "promotion complete" + multiDiskNote,
+		Replica: replica, DiskPath: livePath, Status: done,
 	})
 	return nil
 }

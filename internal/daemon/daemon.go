@@ -2475,9 +2475,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 		svc.RegisterServices(d.grpcSrv)
 
-		lis, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", d.cfg.GRPCPort))
+		lis, err := d.listenGRPC()
 		if err != nil {
-			return fmt.Errorf("listen: %w", err)
+			return err
 		}
 
 		slog.Info("litevirtd starting",

@@ -17,8 +17,9 @@ import (
 // A host's note of the disks it holds of a deleted VM that its delete kept:
 // <data_dir>/kept-disks/<vm>.json, a list of paths on this host.
 //
-// The delete writes it on the host that holds them (`lv rm --keep-disks`, and
-// a disk recorded delete_with_vm=false), and a failover's old host writes it
+// The delete writes it on the host that holds them (`lv rm --keep-disks`, a
+// disk recorded delete_with_vm=false, and a disk the delete of a VM with no
+// domain kept because a host did not answer), and a failover's old host writes it
 // when its pass leaves such a disk at its path (deleted_vm_residue.go). A
 // later create of the name on the host reads it before its debris sweep
 // clears <vm>-*.qcow2, and moves a noted disk to <path>.kept-<time>
@@ -232,3 +233,10 @@ func KeptNotedFiles(dataDir string) (map[string]string, error) {
 type KeptBackingFileError struct{ msg string }
 
 func (e *KeptBackingFileError) Error() string { return e.msg }
+
+// NewKeptBackingFileError is a KeptBackingFileError saying msg: a create
+// refused because a file it would clear is one a kept disk is, or backs on,
+// by a record other than the note (grpcapi's create guard).
+func NewKeptBackingFileError(msg string) *KeptBackingFileError {
+	return &KeptBackingFileError{msg: msg}
+}

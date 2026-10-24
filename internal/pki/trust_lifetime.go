@@ -52,6 +52,7 @@ func RegisterDaemonHostDomain(ctx context.Context, dir string) error {
 type HostDomainLease struct {
 	mu        sync.Mutex
 	self      *HostDomainLease
+	directory os.FileInfo
 	dir       string
 	file      *os.File
 	exclusive bool
@@ -78,6 +79,10 @@ func acquireHostDomain(ctx context.Context, dir string, exclusive bool) (*HostDo
 		return nil, err
 	}
 	canonical, err = filepath.Abs(canonical)
+	if err != nil {
+		return nil, err
+	}
+	directory, err := os.Stat(canonical)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +133,11 @@ func acquireHostDomain(ctx context.Context, dir string, exclusive bool) (*HostDo
 	if err := syncTrustDirectory(canonical); err != nil {
 		return fail(err)
 	}
-	l := &HostDomainLease{dir: canonical, file: f, exclusive: exclusive}
+	actualDirectory, err := os.Stat(canonical)
+	if err != nil || !os.SameFile(directory, actualDirectory) {
+		return fail(errors.New("active domain directory changed"))
+	}
+	l := &HostDomainLease{dir: canonical, directory: directory, file: f, exclusive: exclusive}
 	l.self = l
 	return l, nil
 }
@@ -142,7 +151,7 @@ func (l *HostDomainLease) Release() {
 	if l.self != l || l.file == nil {
 		return
 	}
-	_ = syscall.Flock(int(l.file.Fd()), syscall.LOCK_UN)
+	// Closing this reference must not unlock any surviving duplicate OFD.
 	_ = l.file.Close()
 	l.file = nil
 }
@@ -164,6 +173,10 @@ func (l *HostDomainLease) checkLocked(dir string) error {
 	if canonical != l.dir {
 		return errors.New("host domain admission belongs to another directory")
 	}
+	actualDirectory, err := os.Stat(canonical)
+	if err != nil || l.directory == nil || !os.SameFile(l.directory, actualDirectory) {
+		return errors.New("host domain admission directory changed")
+	}
 	info, err := l.file.Stat()
 	if err != nil {
 		return err
@@ -173,4 +186,22 @@ func (l *HostDomainLease) checkLocked(dir string) error {
 		return fmt.Errorf("host domain admission inode changed")
 	}
 	return nil
+}
+
+// duplicateForProcess retains the actual admission OFD. The parent copy is
+// CLOEXEC; an explicit ExtraFiles transfer is required to give it to a child.
+func (l *HostDomainLease) duplicateForProcess() (*os.File, error) {
+	if l == nil {
+		return nil, errors.New("exclusive host domain admission required")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := l.checkLocked(l.dir); err != nil {
+		return nil, err
+	}
+	fd, _, errno := syscall.Syscall(syscall.SYS_FCNTL, l.file.Fd(), syscall.F_DUPFD_CLOEXEC, 0)
+	if errno != 0 {
+		return nil, errno
+	}
+	return os.NewFile(fd, l.file.Name()), nil
 }

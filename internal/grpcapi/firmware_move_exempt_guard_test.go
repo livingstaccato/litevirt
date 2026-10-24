@@ -1,10 +1,14 @@
 package grpcapi
 
 import (
+	"bytes"
+	"fmt"
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -27,6 +31,11 @@ import (
 // fwExemptOwners: the exempt entry point (or the owner helper that calls one)
 // → the functions allowed to call it, as "pkgdir.Recv.Func" or "pkgdir.Func".
 var fwExemptOwners = map[string][]string{
+	// Bound starts retain one looked-up UUID handle and the entry's firmware/NIC
+	// guard. The semantic boundary is checked by fwBoundStartProblems below.
+	"startDomainBound":              {"internal/libvirt.Client.StartDomainBound"},
+	"startBoundWithConsoleBackstop": {"internal/libvirt.startDomainBound"},
+	"startBoundHandle":              {"internal/libvirt.startBoundWithConsoleBackstop"},
 	// §7 M1p, and its recovery retry, which goes through the same handler.
 	"ResumeFirmwareMoveSource":  {"internal/grpcapi.Server.liveFirmwareSourcePaused"},
 	"liveFirmwareSourcePaused":  {"internal/grpcapi.Server.liveFirmwareMigrateFailed"},
@@ -92,17 +101,17 @@ var fwRawLibvirt = map[string][]string{
 		"internal/libvirt.forceRemoveDomain", "internal/libvirt.revertToLiveSnapshot", "internal/libvirt.revertToSnapshot",
 	},
 	"DomainResume": {
-		"internal/libvirt.startDomainGuarded", "internal/libvirt.resumeDomain",
+		"internal/libvirt.startDomainGuarded", "internal/libvirt.startBoundHandle", "internal/libvirt.resumeDomain",
 		"internal/libvirt.capture.settle", "internal/libvirt.restoreWithRetry",
 	},
 	"DomainDestroy": {
-		"internal/libvirt.startDomainGuarded", "internal/libvirt.destroyDomain", "internal/libvirt.discardFirmwareMoveTarget",
+		"internal/libvirt.startDomainGuarded", "internal/libvirt.startBoundHandle", "internal/libvirt.destroyDomain", "internal/libvirt.discardFirmwareMoveTarget",
 		"internal/libvirt.stopForOperator", "internal/libvirt.forceRemoveDomain",
 		"internal/libvirt.restoreWithRetry", "internal/libvirt.revertToLiveSnapshot", "internal/libvirt.revertToSnapshot",
 	},
 	"DomainDefineXML": {
 		"internal/libvirt.keepConsolePITAPI.DomainDefineXML", "internal/libvirt.keepConsoleSnapshotAPI.DomainDefineXML",
-		"internal/libvirt.startWithConsoleBackstop", "internal/libvirt.Client.SetBootOrder", "internal/libvirt.defineDomain",
+		"internal/libvirt.startWithConsoleBackstop", "internal/libvirt.startBoundWithConsoleBackstop", "internal/libvirt.Client.SetBootOrder", "internal/libvirt.defineDomain",
 		"internal/libvirt.repairPersistentDisk", "internal/libvirt.revertToLiveSnapshot", "internal/libvirt.revertToSnapshot",
 	},
 }
@@ -136,32 +145,7 @@ func fwCallSites(t *testing.T, names map[string]bool) []fwCallSite {
 				return err
 			}
 			rel, _ := filepath.Rel(root, filepath.Dir(p))
-			for _, decl := range f.Decls {
-				fd, ok := decl.(*ast.FuncDecl)
-				if !ok || fd.Body == nil {
-					continue
-				}
-				caller := filepath.ToSlash(rel) + "." + fd.Name.Name
-				if fd.Recv != nil && len(fd.Recv.List) == 1 {
-					rt := fd.Recv.List[0].Type
-					if st, ok := rt.(*ast.StarExpr); ok {
-						rt = st.X
-					}
-					if id, ok := rt.(*ast.Ident); ok {
-						caller = filepath.ToSlash(rel) + "." + id.Name + "." + fd.Name.Name
-					}
-				}
-				ast.Inspect(fd.Body, func(n ast.Node) bool {
-					call, ok := n.(*ast.CallExpr)
-					if !ok {
-						return true
-					}
-					if se, ok := call.Fun.(*ast.SelectorExpr); ok && names[se.Sel.Name] {
-						out = append(out, fwCallSite{sel: se.Sel.Name, caller: caller, pos: fset.Position(call.Pos())})
-					}
-					return true
-				})
-			}
+			out = append(out, fwCallsInSyntax(fset, f, filepath.ToSlash(rel), names)...)
 			return nil
 		})
 		if err != nil {
@@ -172,6 +156,9 @@ func fwCallSites(t *testing.T, names map[string]bool) []fwCallSite {
 }
 
 func TestFirmwareMoveExemptCallers(t *testing.T) {
+	for _, problem := range fwBoundStartProblems(fwBoundStartSources(t)) {
+		t.Error(problem)
+	}
 	names := map[string]bool{}
 	for n := range fwExemptOwners {
 		names[n] = true
@@ -182,16 +169,7 @@ func TestFirmwareMoveExemptCallers(t *testing.T) {
 	seen := map[string]bool{}
 	var bad []string
 	for _, c := range fwCallSites(t, names) {
-		allowed, exempt := fwExemptOwners[c.sel]
-		if !exempt {
-			allowed = fwRawLibvirt[c.sel]
-		}
-		ok := false
-		for _, a := range allowed {
-			if a == c.caller {
-				ok = true
-			}
-		}
+		ok := fwAllowedCall(c)
 		if !ok {
 			bad = append(bad, c.sel+" called from "+c.caller+" at "+c.pos.String())
 			continue
@@ -268,5 +246,260 @@ func TestDrainMove_EnteredOnlyByDrainsMoves(t *testing.T) {
 	}
 	if n != len(allowed) {
 		t.Fatalf("%d calls of drainMove, want one from each of %v", n, allowed)
+	}
+}
+
+// Bound owners earn their narrow raw-call entries only while their current
+// firmware gate, exact UUID identity, and guarded same-handle effects remain.
+func fwBoundStartSources(t *testing.T) map[string][]byte {
+	t.Helper()
+	out := map[string][]byte{}
+	for _, file := range []string{"domain.go", "console_password.go", "start_guard.go"} {
+		raw, err := os.ReadFile(filepath.Join("..", "libvirt", file))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[file] = raw
+	}
+	return out
+}
+func fwBoundStartProblems(sources map[string][]byte) []string {
+	funcs := map[string]*ast.FuncDecl{}
+	for file, raw := range sources {
+		f, err := parser.ParseFile(token.NewFileSet(), file, raw, parser.SkipObjectResolution)
+		if err != nil {
+			return []string{fmt.Sprintf("parse %s: %v", file, err)}
+		}
+		for _, d := range f.Decls {
+			if f, ok := d.(*ast.FuncDecl); ok {
+				funcs[f.Name.Name] = f
+			}
+		}
+	}
+	text := func(n ast.Node) string {
+		var b bytes.Buffer
+		_ = printer.Fprint(&b, token.NewFileSet(), n)
+		return b.String()
+	}
+	var problems []string
+	check := func(ok bool, boundary string) {
+		if !ok {
+			problems = append(problems, boundary)
+		}
+	}
+	callInAssignment := func(s ast.Stmt) string {
+		if a, ok := s.(*ast.AssignStmt); ok && len(a.Rhs) == 1 {
+			return text(a.Rhs[0])
+		}
+		return ""
+	}
+	tail := func(f *ast.FuncDecl) string {
+		if f == nil || f.Body == nil || len(f.Body.List) == 0 {
+			return ""
+		}
+		if r, ok := f.Body.List[len(f.Body.List)-1].(*ast.ReturnStmt); ok && len(r.Results) == 1 {
+			return text(r.Results[0])
+		}
+		return ""
+	}
+	returningIf := func(f *ast.FuncDecl, cond string) token.Pos {
+		if f == nil || f.Body == nil {
+			return token.NoPos
+		}
+		for _, statement := range f.Body.List {
+			if branch, ok := statement.(*ast.IfStmt); ok && text(branch.Cond) == cond && len(branch.Body.List) == 1 {
+				if _, ok := branch.Body.List[0].(*ast.ReturnStmt); ok {
+					return branch.Pos()
+				}
+			}
+		}
+		return token.NoPos
+	}
+	entry := funcs["StartDomainBound"]
+	entryOK := entry != nil && entry.Body != nil && len(entry.Body.List) == 3
+	if entryOK {
+		entryOK = callInAssignment(entry.Body.List[0]) == "c.guard(name)" && returningIf(entry, "err != nil") != token.NoPos && tail(entry) == "startDomainBound(c.virt, g, name, expectedUUID, c.consoleDecision(), c.SetVNCPasswordUnavailable)"
+	}
+	check(entryOK, "bound entry lost its firmware/start guard")
+	guard := funcs["guard"]
+	guardOK := false
+	if guard != nil && guard.Body != nil && len(guard.Body.List) > 0 {
+		if branch, ok := guard.Body.List[0].(*ast.IfStmt); ok && branch.Init != nil {
+			guardOK = callInAssignment(branch.Init) == "c.firmwareGuard().check(FirmwareCall{Op: OpStart, Name: name})" && text(branch.Cond) == "err != nil" && len(branch.Body.List) == 1
+			if guardOK {
+				_, guardOK = branch.Body.List[0].(*ast.ReturnStmt)
+			}
+		}
+	}
+	check(guardOK, "bound entry lost firmware OpStart refusal before readiness")
+	bound := funcs["startDomainBound"]
+	boundOK := bound != nil && bound.Body != nil && len(bound.Body.List) == 6
+	if boundOK {
+		boundOK = callInAssignment(bound.Body.List[0]) == "boundDomainUUID(expectedUUID)" && callInAssignment(bound.Body.List[2]) == "v.DomainLookupByName(name)" && returningIf(bound, "dom.Name != name || dom.UUID != uuid") != token.NoPos && tail(bound) == "startBoundWithConsoleBackstop(v, g, dom, policy, unavailable)"
+	}
+	check(boundOK, "bound helper lost UUID/name gate or guard forwarding")
+	handle := funcs["startBoundHandle"]
+	handleOK := handle != nil && handle.Body != nil && len(handle.Body.List) == 1
+	if handleOK {
+		ret, ok := handle.Body.List[0].(*ast.ReturnStmt)
+		handleOK = ok && len(ret.Results) == 1
+		if handleOK {
+			call, ok := ret.Results[0].(*ast.CallExpr)
+			handleOK = ok && text(call.Fun) == "guardedStart" && len(call.Args) == 5 && text(call.Args[0]) == "g" && text(call.Args[1]) == "dom.Name"
+			if handleOK {
+				seen := map[string]int{}
+				ast.Inspect(call, func(n ast.Node) bool {
+					if c, ok := n.(*ast.CallExpr); ok {
+						if sel, ok := c.Fun.(*ast.SelectorExpr); ok && (sel.Sel.Name == "DomainResume" || sel.Sel.Name == "DomainDestroy") {
+							seen[sel.Sel.Name]++
+							if len(c.Args) != 1 || text(c.Args[0]) != "dom" {
+								handleOK = false
+							}
+						}
+					}
+					return true
+				})
+				handleOK = handleOK && seen["DomainResume"] == 1 && seen["DomainDestroy"] == 1
+			}
+		}
+	}
+	check(handleOK, "bound effects lost guarded same-handle resume/destroy ownership")
+	console := funcs["startBoundWithConsoleBackstop"]
+	consoleOK := console != nil && console.Body != nil && len(console.Body.List) > 0
+	if consoleOK {
+		consoleOK = callInAssignment(console.Body.List[0]) == "startBoundHandle(v, g, dom)" && tail(console) == "startBoundHandle(v, g, dom)"
+		before := returningIf(console, "xerr != nil || !boundConsoleXML(x, dom) || !HasConsolePassword(x)")
+		after := returningIf(console, "redefined.Name != dom.Name || redefined.UUID != dom.UUID")
+		defines := 0
+		ast.Inspect(console.Body, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok && text(call.Fun) == "v.DomainDefineXML" {
+				defines++
+				if before == token.NoPos || after == token.NoPos || before >= call.Pos() || after <= call.End() || len(call.Args) != 1 || text(call.Args[0]) != "stripped" {
+					consoleOK = false
+				}
+			}
+			return true
+		})
+		consoleOK = consoleOK && defines == 1
+	}
+	check(consoleOK, "bound console redefine lost exact identity or guarded retry boundary")
+	return problems
+}
+
+func TestFirmwareMoveBoundOwnersRejectUnsafeCurrentPaths(t *testing.T) {
+	sources := fwBoundStartSources(t)
+	for _, tc := range []struct{ name, file, before, after, want string }{
+		{"entry-guard", "domain.go", "g, err := c.guard(name)", "g, err := c.uncheckedGuard(name)", "bound entry lost its firmware/start guard"},
+		{"firmware-gate", "start_guard.go", "c.firmwareGuard().check(FirmwareCall{Op: OpStart, Name: name})", "c.firmwareGuard().check(FirmwareCall{Op: OpResume, Name: name})", "lost firmware OpStart refusal"},
+		{"uuid-gate", "domain.go", "dom.Name != name || dom.UUID != uuid", "dom.Name != name", "lost UUID/name gate"},
+		{"guard-forwarding", "domain.go", "return guardedStart(g, dom.Name", "return guardedStart(StartGuard{}, dom.Name", "lost guarded same-handle"},
+		{"foreign-cleanup", "domain.go", "return v.DomainResume(dom)", "return v.DomainResume(golibvirt.Domain{Name: dom.Name})", "lost guarded same-handle"},
+		{"console-original", "console_password.go", "!boundConsoleXML(x, dom)", "false", "lost exact identity"},
+		{"console-successor", "console_password.go", "redefined.Name != dom.Name || redefined.UUID != dom.UUID", "redefined.Name != dom.Name", "lost exact identity"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			changed := map[string][]byte{}
+			for name, raw := range sources {
+				changed[name] = raw
+			}
+			// The entry guard spelling also exists in ordinary StartDomain. Select
+			// the bound method's actual AST span, never an unrelated first match.
+			raw := string(sources[tc.file])
+			start := 0
+			if tc.name == "entry-guard" {
+				start = strings.Index(raw, "func (c *Client) StartDomainBound(")
+			}
+			if start < 0 {
+				t.Fatal("bound entry disappeared")
+			}
+			at := strings.Index(raw[start:], tc.before)
+			if at < 0 {
+				t.Fatal("mutation did not reach bound owner")
+			}
+			at += start
+			changed[tc.file] = []byte(raw[:at] + tc.after + raw[at+len(tc.before):])
+			got := strings.Join(fwBoundStartProblems(changed), "\n")
+			if strings.Contains(got, "parse ") || !strings.Contains(got, tc.want) {
+				t.Fatalf("wrong boundary refusal: %s, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func fwCallsInSyntax(fset *token.FileSet, f *ast.File, pkg string, names map[string]bool) []fwCallSite {
+	var out []fwCallSite
+	for _, decl := range f.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || fd.Body == nil {
+			continue
+		}
+		caller := pkg + "." + fd.Name.Name
+		if fd.Recv != nil && len(fd.Recv.List) == 1 {
+			rt := fd.Recv.List[0].Type
+			if st, ok := rt.(*ast.StarExpr); ok {
+				rt = st.X
+			}
+			if id, ok := rt.(*ast.Ident); ok {
+				caller = pkg + "." + id.Name + "." + fd.Name.Name
+			}
+		}
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			name := ""
+			switch fn := call.Fun.(type) {
+			case *ast.SelectorExpr:
+				name = fn.Sel.Name
+			case *ast.Ident:
+				name = fn.Name
+			}
+			if names[name] {
+				out = append(out, fwCallSite{sel: name, caller: caller, pos: fset.Position(call.Pos())})
+			}
+			return true
+		})
+	}
+	return out
+}
+
+func fwAllowedCall(c fwCallSite) bool {
+	allowed, exempt := fwExemptOwners[c.sel]
+	if !exempt {
+		allowed = fwRawLibvirt[c.sel]
+	}
+	for _, owner := range allowed {
+		if owner == c.caller {
+			return true
+		}
+	}
+	return false
+}
+func TestFirmwareMoveGuardRejectsUnownedRawAndBoundCalls(t *testing.T) {
+	raw := string(fwBoundStartSources(t)["domain.go"])
+	raw += `
+func unsafeBoundStart(v snapshotAPI, dom golibvirt.Domain) {
+ _ = v.DomainDestroy(dom)
+ _ = startBoundHandle(v, StartGuard{}, dom)
+}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "domain.go", raw, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{"DomainDestroy": true, "startBoundHandle": true}
+	found := map[string]bool{}
+	for _, call := range fwCallsInSyntax(fset, f, "internal/libvirt", names) {
+		if call.caller == "internal/libvirt.unsafeBoundStart" {
+			if fwAllowedCall(call) {
+				t.Fatalf("unowned current call accepted: %s", call.sel)
+			}
+			found[call.sel] = true
+		}
+	}
+	if !found["DomainDestroy"] || !found["startBoundHandle"] {
+		t.Fatalf("bad current paths were not inspected: %v", found)
 	}
 }

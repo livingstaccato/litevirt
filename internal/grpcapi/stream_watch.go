@@ -475,7 +475,9 @@ var streamHandlerAudit = map[string]string{
 
 	// Peer-to-peer: authenticated by a host certificate, never by a user
 	// credential, so never watched.
-	"/litevirt.v1.LiteVirt/FetchBinary":              "peer mTLS only (requirePeerCert); not a user stream",
+	"/litevirt.v1.LiteVirt/FetchBinary": "peer mTLS only (requirePeerCert); not a user stream",
+	"/litevirt.v1.LiteVirt/ExportAutomationSource": "custom direct-peer mTLS (no bearer or forwarded user); bounded context-aware export, " +
+		"connection identity rechecked before one Send, whose error is returned; deferred per-server semaphore release; holds no device",
 	"/litevirt.v1.LiteVirt/FetchISOLibraryFile":      "peer mTLS only (requirePeerCert); not a user stream",
 	"/litevirt.v1.LiteVirt/PushBackup":               "peer-to-peer backup push; not a user stream",
 	"/litevirt.v1.LiteVirt/PushReplicaIncrement":     "peer-to-peer replica push; not a user stream",

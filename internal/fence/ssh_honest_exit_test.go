@@ -22,6 +22,13 @@ type fakeRemote struct {
 	// forcedCommand: the key is pinned to an authorized_keys command="..."
 	// that ignores what was asked for and exits 0.
 	forcedCommand bool
+	// preKnownHostsCommand: the client predates OpenSSH 8.5 and rejects
+	// KnownHostsCommand as an unknown option, before it dials anything.
+	preKnownHostsCommand bool
+	// probe is how `ssh -G` (the KnownHostsCommand probe) answers: "" exits
+	// 0; "fails" exits 255 with output that is not about the option;
+	// "hangs" never answers, and a child it leaves holds its output open.
+	probe string
 }
 
 // remoteHost is a running fake host; its state file reads "running",
@@ -115,6 +122,25 @@ echo "poweroff: unexpected args: $*" >&2; exit 1
 	}
 	if r.forcedCommand {
 		preamble = `echo "backup-only key"; exit 0`
+	}
+	switch {
+	case r.probe == "fails":
+		preamble += "\n" + `case "$1" in -G)
+  echo "command-line: line 0: Bad configuration option: identityfilex" >&2
+  echo "ssh: Could not resolve hostname litevirt-fence-probe: Temporary failure in name resolution" >&2
+  exit 255 ;;
+esac`
+	case r.probe == "hangs":
+		// Not exec: the sleep is a child that outlives a killed shell and
+		// keeps the output pipe open.
+		preamble += "\n" + `case "$1" in -G) sleep 30; exit 0 ;; esac`
+	case r.preKnownHostsCommand:
+		preamble = `case "$*" in *KnownHostsCommand*)
+  echo "command-line line 0: Bad configuration option: knownhostscommand" >&2; exit 255 ;;
+esac
+case "$1" in -G) exit 0 ;; esac`
+	default:
+		preamble += "\ncase \"$1\" in -G) exit 0 ;; esac"
 	}
 	sshScript := fmt.Sprintf(`#!/bin/sh
 %s

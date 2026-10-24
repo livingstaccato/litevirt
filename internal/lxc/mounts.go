@@ -1568,6 +1568,18 @@ func (r *LxcRunner) writeHookPolicy(name string, rm []resolvedMount, rd []resolv
 	if err != nil {
 		return err
 	}
+	// The parent (/run/litevirt) is shared: the daemon's endpoint file, which
+	// every user on the node reads, is in it. Made here first, it is made
+	// 0755, not the 0700 MkdirAll would give it along with the policy dir.
+	if parent := filepath.Dir(hookPolicyDir); parent != hookPolicyDir {
+		if err := os.Mkdir(parent, 0o755); err == nil {
+			if err := os.Chmod(parent, 0o755); err != nil {
+				return err
+			}
+		} else if !errors.Is(err, fs.ErrExist) && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
 	if err := os.MkdirAll(hookPolicyDir, 0o700); err != nil {
 		return err
 	}

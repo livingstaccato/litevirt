@@ -67,6 +67,16 @@ func captureNativeFirstMemberInit(t *testing.T, mode string) nativeFirstMemberIn
 	t.Setenv("LV_CONFIG_DIR", t.TempDir())
 	t.Setenv("SUDO_USER", "")
 	useConfig(t, "")
+	etc := filepath.Join(t.TempDir(), "litevirt")
+	if err := os.Mkdir(etc, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(etc, 0700); err != nil {
+		t.Fatal(err)
+	}
+	oldEtc := etcLitevirtDir
+	etcLitevirtDir = etc
+	t.Cleanup(func() { etcLitevirtDir = oldEtc })
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	t.Cleanup(cancel)
 	dir := PKIDir()
@@ -121,6 +131,9 @@ func captureNativeFirstMemberInit(t *testing.T, mode string) nativeFirstMemberIn
 		if mode != "local" {
 			return errors.New("unexpected native init local enrollment")
 		}
+		if etcLitevirtDir != etc || modeOf(t, etc) != 0701 {
+			t.Fatal("native local init did not repair its owned config parent before capture")
+		}
 		localCalls++
 		capture.request = request
 		return stop
@@ -130,7 +143,10 @@ func captureNativeFirstMemberInit(t *testing.T, mode string) nativeFirstMemberIn
 	case "remote":
 		err = HostInit(ctx, "root@127.0.0.1", "native-first", false)
 		capture.request = remote.request
-		if strings.Join(remote.events, ",") != "probe,stage,copy,capture,cleanup,close" || localCalls != 0 {
+		if modeOf(t, etc) != 0700 {
+			t.Fatal("native remote init changed the local config parent")
+		}
+		if strings.Join(remote.events, ",") != "probe,read /etc/litevirt/config.yaml,read /etc/litevirt/pki/ca.crt,read /etc/litevirt/pki/ca.key,existing-state,existing-daemon,stage,copy,capture,cleanup,close" || localCalls != 0 {
 			t.Fatal("actual remote init did not reach only the bounded capture boundary")
 		}
 	case "local":
@@ -197,7 +213,20 @@ func (r *nativeInitCaptureRemote) Close() error {
 }
 
 func (r *nativeInitCaptureRemote) RunOutput(command string) ([]byte, error) {
+	for _, path := range []string{daemonConfigPathOnTarget, remotePKIDir + "/ca.crt", remotePKIDir + "/ca.key"} {
+		q := ssh.ShellQuote(path)
+		if command == "if [ -e "+q+" ]; then head -c 1048576 -- "+q+"; else printf '"+absentMarker+"'; fi" {
+			r.events = append(r.events, "read "+path)
+			return []byte(absentMarker), nil
+		}
+	}
 	switch command {
+	case stateFilesCmd(defaultRemoteDataDir):
+		r.events = append(r.events, stateProbeKind)
+		return nil, nil
+	case daemonActiveCmd:
+		r.events = append(r.events, daemonProbeKind)
+		return []byte("inactive\n"), nil
 	case r.probe:
 		r.events = append(r.events, "probe")
 		return []byte(noConfigSentinel), nil

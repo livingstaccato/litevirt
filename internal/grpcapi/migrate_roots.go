@@ -1,0 +1,106 @@
+package grpcapi
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"strings"
+
+	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/safename"
+	"github.com/litevirt/litevirt/internal/storage"
+)
+
+// migrationRootOf is the disk root a path a migration brings onto this host
+// from sourceHost lies in, and whether it lies in one at all. The root is the
+// directory the disk's own directory is opened beneath, link-free
+// (openPinnedDir): every write, placement and removal of the disk goes through
+// that descriptor, so a link planted below the root is refused and one swapped
+// in later is never followed.
+//
+// A host-local disk keeps its recorded path across a cold move (the record,
+// the domain and every later operation name it), so the path is the SOURCE's
+// pool directory, not necessarily one of this host's: a witness founded by a
+// current build keeps its default pool at <data_dir>/pools/default, while the
+// workers of an older cluster keep theirs at <data_dir>/disks. Judging the
+// path by this host's roots alone refused the documented recovery of a VM
+// promoted onto a witness (lv migrate <vm> <worker> --cold).
+//
+// A storage_pools row of sourceHost is replicated state, so it is not trusted
+// to name a place this host writes to. A path inside such a pool's directory
+// passes only when the directory is
+//
+//	(a) inside this host's own disks/, pools/ or mounts/ areas under its data
+//	    directory (that area is the root). No pool row is consulted for this,
+//	    the target's own rows included: a replicated row has no origin check,
+//	    so any member could write one naming this host; and
+//	(b) acceptable to storage.CheckWriteRoot, as this host's own pools are: no
+//	    system directory, PKI directory, litevirt state or data directory.
+//
+// A path in one of this host's own disk roots (withinDiskArtifactRoot) is
+// accepted as before, with its root; what those roots are is the daemon's
+// pool refresh and is not judged here.
+func (s *Server) migrationRootOf(ctx context.Context, p, sourceHost string) (string, bool) {
+	if root, ok := s.diskArtifactRootOf(p); ok {
+		return root, true
+	}
+	if sourceHost == "" || sourceHost == s.hostName || !filepath.IsAbs(p) || s.db == nil || s.dataDir == "" {
+		return "", false
+	}
+	pools, err := corrosion.ListStoragePoolsForHost(ctx, s.db, sourceHost)
+	if err != nil {
+		return "", false
+	}
+	for _, rec := range pools {
+		ref := StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target, Options: rec.Options}
+		if !isFileBasedDriver(ref.Driver) || (strings.EqualFold(ref.Driver, "nfs") && ref.Target == "") {
+			continue
+		}
+		dir, derr := fileBasedPoolDir(s.dataDir, ref)
+		if derr != nil || !filepath.IsAbs(dir) || !safename.Contains(dir, p) {
+			continue
+		}
+		if root, ok := s.foreignPoolDirRoot(dir); ok {
+			return root, true
+		}
+	}
+	return "", false
+}
+
+// withinMigrationDiskRoot is whether migrationRootOf finds a root for p.
+func (s *Server) withinMigrationDiskRoot(ctx context.Context, p, sourceHost string) bool {
+	_, ok := s.migrationRootOf(ctx, p, sourceHost)
+	return ok
+}
+
+// foreignPoolDirRoot is rules (a) and (b) of migrationRootOf for the source's
+// pool directory dir: the area of this host's data directory that holds it.
+func (s *Server) foreignPoolDirRoot(dir string) (string, bool) {
+	if storage.CheckWriteRoot(dir, s.dataDir, s.pkiDir) != nil {
+		return "", false
+	}
+	for _, area := range []string{"disks", "pools", "mounts"} {
+		root := filepath.Join(s.dataDir, area)
+		if safename.Contains(root, dir) {
+			return root, true
+		}
+	}
+	return "", false
+}
+
+// coldSourcePathCheck is what the SOURCE of a cold move requires of a disk's
+// recorded path before it reads the file to send it, or removes it once the
+// move has committed: the path lies in this host's own disk roots or pool
+// directories, and its directory, with symlinks resolved, is not a system
+// directory, the PKI directory or litevirt state. The target's own checks
+// guard what it writes; nothing else stops a crafted disk record from naming a
+// file here.
+func (s *Server) coldSourcePathCheck(p string) error {
+	if !s.withinDiskArtifactRoot(p) {
+		return fmt.Errorf("disk path %q is not in a disk-artifact root of %s", p, s.hostName)
+	}
+	if err := storage.CheckWriteRoot(filepath.Dir(filepath.Clean(p)), s.dataDir, s.pkiDir); err != nil {
+		return fmt.Errorf("disk path %q is refused: %w", p, err)
+	}
+	return nil
+}

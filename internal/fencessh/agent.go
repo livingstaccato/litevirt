@@ -244,6 +244,12 @@ func (a *Agent) sync(ctx context.Context) error {
 	if err := os.Chmod(a.cfg.Dir, 0o755); err != nil {
 		return err
 	}
+	// The AuthorizedKeysCommand runs as nobody, so the parent (/etc/litevirt)
+	// must be searchable too; a host init'd with --local before the fix has it
+	// 0700. Search bit only: nothing narrowed, no read bit, no children.
+	if err := EnsureSearchableDir(filepath.Dir(a.cfg.Dir)); err != nil {
+		return err
+	}
 	if _, err := writeIfChanged(filepath.Join(a.cfg.Dir, CommandName), ForcedCommand(a.cfg.Self), 0o755); err != nil {
 		return fmt.Errorf("write the forced command: %w", err)
 	}
@@ -279,8 +285,11 @@ func (a *Agent) sync(ctx context.Context) error {
 	// stays possible. A row this host already published is still maintained
 	// (the feature is used anyway): left frozen, a renewal's revocation would
 	// stay owed, a revoked or expired certificate would leave the host
-	// unfenceable, and a new sshd host key would fail every fence of it.
-	if a.Mode() == ModeLegacy && !a.hasOwnRow(ctx, self, tr) {
+	// unfenceable, and a new sshd host key would fail every fence of it. A
+	// row re-admission retired is replaced too: the feature was used for this
+	// name already, and every peer refuses to fence through a tombstone, so
+	// leaving it would make the re-admitted host unfenceable for good.
+	if a.Mode() == ModeLegacy && !a.hasOwnRow(ctx, self, tr) && !a.hasRetiredRow(ctx) {
 		return nil
 	}
 	return a.publish(ctx, self, selfSigner, peers, tr)
@@ -617,6 +626,13 @@ func (a *Agent) publish(ctx context.Context, self *x509.Certificate, signer cryp
 func (a *Agent) hasOwnRow(ctx context.Context, self *x509.Certificate, tr Trust) bool {
 	prev, ok, err := corrosion.GetHostFenceSSH(ctx, a.cfg.DB, a.cfg.Self)
 	return err == nil && ok && !prev.Deleted && a.ownLineage(prev, self, tr)
+}
+
+// hasRetiredRow reports whether this host's name holds a tombstone (a row
+// re-admission retired).
+func (a *Agent) hasRetiredRow(ctx context.Context) bool {
+	prev, ok, err := corrosion.GetHostFenceSSH(ctx, a.cfg.DB, a.cfg.Self)
+	return err == nil && ok && prev.Deleted
 }
 
 // ownLineage reports whether prev was signed by this host under its current

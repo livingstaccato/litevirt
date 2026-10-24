@@ -340,9 +340,9 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 	}
 	// A disk a delete kept on this host, or a file one backs on, is not pool
 	// content either, whoever asks.
-	if held, why := s.keptNoteHolds(target); held {
+	if held, why := s.keptHolds(ctx, target); held {
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"%q is held by this host's note of the disks deletes kept: %s; it is not pool content to delete", req.Filename, why)
+			"%q is held as a disk a delete kept on this host: %s; it is not pool content to delete", req.Filename, why)
 	}
 	// Only the caller's own upload or replica; library content no record
 	// refers to is shared by everyone who reads the pool, and only an admin
@@ -422,9 +422,9 @@ func (s *Server) deleteAreaReplica(ctx context.Context, dir string, caller poolC
 		return true, status.Errorf(codes.FailedPrecondition,
 			"%q is in use by VM %q disk %q; it is not pool content to delete", file, owners[0].VMName, owners[0].DiskName)
 	}
-	if held, why := s.keptNoteHolds(path); held {
+	if held, why := s.keptHolds(ctx, path); held {
 		return true, status.Errorf(codes.FailedPrecondition,
-			"%q is held by this host's note of the disks deletes kept: %s; it is not pool content to delete", file, why)
+			"%q is held as a disk a delete kept on this host: %s; it is not pool content to delete", file, why)
 	}
 	if err := os.Remove(path + ".json"); err != nil && !os.IsNotExist(err) {
 		return true, status.Errorf(codes.Internal, "delete the replica's record: %v", err)

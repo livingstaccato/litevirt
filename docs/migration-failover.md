@@ -328,6 +328,33 @@ live moves. A live migration that was sent over the network and then cannot
 connect (the migration ports 49152-49215 on the migration address must be
 reachable from the source) fails; the fallback is decided before the move.
 
+### Plain UEFI VMs
+
+A UEFI VM with neither Secure Boot nor a vTPM keeps its variables in libvirt's
+own file, `/var/lib/libvirt/qemu/nvram/<vm>_VARS.fd`.
+
+- **Live move.** The variables travel in the migration stream. libvirt leaves
+  the source's file behind when it undefines the domain, so once the move has
+  committed on the target the source removes it, unless a domain of the name is
+  still defined there. A failed or rolled-back move keeps it.
+- **Cold move** (`--cold`, and a drain's move of a stopped VM). There is no
+  stream, so the file is sent with the domain definition. The target writes it
+  durably, reads it back and answers with its sha256; the source removes its own
+  copy only after the move has committed and only while the file still hashes to
+  what the target confirmed. A target that does not confirm (a build from before
+  this) refuses the move, nothing changed; a failed move keeps the source's file
+  and takes back what it wrote on the target.
+- **A same-name file.** A create, clone, import, restore or promote of a name
+  whose file is already on the host (left by an earlier build, or by a delete
+  `--keep-disks`), and a cold move's target, set it aside as
+  `<file>.superseded-<time>` before the domain is defined, so the VM never
+  starts from another VM's boot entries or keys. `lv host superseded-disks`
+  lists it. A `--keep-disks` delete of a plain UEFI VM therefore no longer lets
+  a re-create of the name adopt its vars; use restore for that.
+
+Secure Boot and vTPM VMs' variables are name-keyed under `<data_dir>/nvram` and
+are never touched by any of this; see below.
+
 ### Secure Boot / vTPM VMs
 
 `lv migrate <vm> <host>` moves a running Secure Boot or vTPM VM live. Its UEFI
@@ -452,6 +479,54 @@ guest running for it to migrate:
    The VM's state stays `stopped`. Start it there with `lv start my-vm`.
 4. After that commit, the source undefines its domain and removes its copy of
    each disk it sent.
+
+The path is the source's, and the target accepts it in its own disk directories
+and in a file-based pool directory the cluster records for the source host, but
+only when that directory is inside the target's own `disks/`, `pools/` or
+`mounts/` areas under its data directory and passes the check the target applies
+to its own pools: no system directory, PKI directory, litevirt state or data
+directory. A pool row of the target's own does not widen this, because rows
+replicate without an origin check, and a storage-pool row of the source is
+replicated state too, so it never widens the rule beyond those areas. The disk's
+directory is opened once, beneath the root it was judged in, with no symlink
+followed, and the copy, its placement, the take-back and the cleanup all go
+through that open directory: a link planted below the root is refused, and one
+swapped in later is never followed. The source reads the disk the same way (a
+qcow2 overlay is flattened from the open file, which is opened without following
+a link) and removes its copy the same way, and the EnsureDisks stub create,
+replace and undo and the firmware discard act through the open directory too. A
+directory a pool needs below a data-dir area is made from the area's descriptor,
+level by level, so a link on the way is refused before anything is created
+through it. The root itself is judged for what it leads to: a data-dir area
+(`disks/`, `pools/`, `mounts/`) or an operator's own pool directory outside the
+areas may be a link to another volume, if it leads somewhere a pool may live; a
+pool directory below an area that has been replaced by a link out of the area is
+refused. Without `/proc/self/fd` nothing is opened, so a removal fails rather
+than reporting the file gone. A qcow2 overlay's backing files are opened without
+following a link too, and must still be where they were judged.
+
+Known limitation: a pool directory below an area that is a link to another place
+in the same area (`mounts/nfs1/x` linking to `mounts/nfs2/q`) can be read but is
+refused when a receive or an EnsureDisks has to create something there, because
+the directories are made from the area one level at a time with no link followed.
+Point the pool at the final directory instead of at a link to it.
+
+A VM promoted onto a witness is the usual case: the witness's `default` pool is
+`<data_dir>/pools/default`, which is inside the worker's `pools/` area, while the
+workers of an older cluster keep theirs at `<data_dir>/disks`; the move is not
+refused for it. The disk stays in the source's pool directory on the target, and
+its record keeps the pool name. A later `lv rm` frees a `dir` disk by its
+recorded path even when that pool exists on no other host than the one it left
+(a path in the PKI directory or a system directory is not freed this way), and a
+disk that cannot be removed still fails the delete and is named, as for any disk.
+
+Anything else is refused with `is not in a disk-artifact root`: a path outside
+those directories, one that climbs out of them with `..` or through a symlink,
+or a pool row naming a system directory, the PKI directory, the target's data
+directory or the root of its `pools/` area. The source holds the path to its own
+rules as well: it reads the file, and removes it after the commit, only when it
+is in one of the source's own disk directories or pools (not a system directory,
+the PKI directory or litevirt state, links resolved).
 
 Until the commit in step 3 the source keeps its disks, its domain and
 ownership of the VM. If any step before it fails, or the client goes away,
@@ -953,8 +1028,16 @@ lv host config host-b \
   --fence-strategy ipmi \
   --ipmi-address 10.0.50.111 \
   --ipmi-user admin \
-  --ipmi-pass <secret>
+  --ipmi-pass-file /root/bmc-pass
 ```
+
+`--ipmi-pass-file` takes a path, or `-` to read the password from stdin, and
+drops one trailing newline; an empty password is refused. `--ipmi-pass <secret>`
+still works, but the password is then visible to every user in `ps` on the
+machine running `lv`, and stays in the shell history, so `lv` prints a warning
+when it is used. The two flags are mutually exclusive. `lv` also warns,
+and still reads the file, when `--ipmi-pass-file` or `--redfish-pass-file`
+names a file its group or other users can read; `chmod 600` it.
 
 An empty `--ipmi-*` flag leaves the setting alone. To remove a host's IPMI
 address, user and password, use `--clear-ipmi`; a host that fences by `ipmi`
@@ -973,7 +1056,7 @@ back still has an IPMI address.
 
 `lv host rm` and a re-admission by `lv host add` retire the host's IPMI
 password, and it never falls back to a password from before the removal.
-Until it is set again with `lv host config <host> --ipmi-pass`, an `ipmi`
+Until it is set again with `lv host config <host> --ipmi-pass-file`, an `ipmi`
 fence of that host fails at once with `no IPMI password` and sends nothing to
 the BMC. A password that was never set is sent empty, for a BMC user with no
 password, and the fence result says so.
@@ -1129,6 +1212,11 @@ Match User root
     AuthorizedKeysCommand /usr/bin/cat /etc/litevirt/ssh/authorized_keys
     AuthorizedKeysCommandUser nobody
 ```
+
+`nobody` must traverse `/etc/litevirt` to read that file. `lv host init`
+(remote and `--local`) and `lv host add` create the directory `0711`, so it can
+be traversed but not listed; a directory that already exists keeps its mode and
+gains only the search bit (`o+x`).
 
 sshd reads an `AuthorizedKeysCommand`'s keys in addition to its
 `AuthorizedKeysFile`, so every file sshd read for root, from every address and
@@ -1975,6 +2063,56 @@ lv host config witness-1 --role witness
 Witnesses participate in failover quorum but never run workloads. The
 placement engine refuses to schedule any VM onto them. See
 [operating-model.md](operating-model.md) for sizing guidance.
+
+A migration names its target, so it never goes through placement; the
+request itself refuses a target that cannot run workloads, before anything
+moves. `lv migrate <vm> <host>` (cold or live; a drain's and the
+rebalancer's moves too) is refused `FailedPrecondition: target host "<host>"
+is a witness (role: witness) and runs no workloads`, and a host that is not
+`active` (draining, maintenance, fenced) is refused `is not active`. The
+target host checks its own role again when the source asks it to stage the
+move, so an older source that never checks cannot land a VM on a witness.
+
+A VM already stranded on a witness (accepted by an older build, or left there
+by a role change) can neither start (`start refused: local_not_active_worker`,
+which on a witness now says so) nor be placed, but it can be moved off: a
+witness admits a migration away from it. Run it naming a worker, then start
+the VM there:
+
+```bash
+lv migrate <vm> <worker-host> --cold
+lv start <vm>
+```
+
+A replication schedule accepts a witness as its target, so a witness can hold
+the only copy of a VM's disk. An operator's `lv replication promote` onto it
+takes the VM over under its own name and leaves it **defined and stopped** on
+the witness (a promote that renames it is refused there); its final status
+and a `vm.promoted_on_witness` event give the two steps above. The failover
+coordinator never promotes onto a witness, since a VM that is not started
+is not recovered: it holds the VM down (`failover.skip`, a
+`replication.promote_held` notification and a held event on the VM naming the
+steps), and the operator runs the promote by hand, then the migration.
+
+What a promote leaves behind is not removed by it. On the host the VM left, its
+disk is recorded as stranded when the operator promotes, as when the coordinator
+does (a `failover.disk-stranded` audit entry, a `vm.promote.disk_stranded` event,
+a `vm.disk.stranded` notification, and `strandedDisks` in `lv inspect`): the
+host may be down, and its disk may hold what the guest wrote after the replica.
+Once it is back, it sets the disk aside as `<disk path>.superseded-<time>`, kept
+while the VM exists (see below). Its cloud-init seed stays until the VM is
+deleted. The replicas on the witness stay too: they are the fallback copies
+until the VM is protected again, and are removed with the VM or its schedule.
+The schedule the promote switched to replicate from the witness back to the host
+it left is paused while the VM is on the witness (one audit entry and one
+`replication.suspended` notification, see [Backups](backups.md)) and runs again
+from the worker it is moved to.
+
+`lv host drain <witness>` is no longer refused by the execution gate: a
+witness may move workloads away, which is all a drain does. Draining an empty
+witness only marks it `draining` (it still votes and runs nothing); one that
+holds a stranded VM moves it to a worker. `lv host undrain` returns it to
+`active`.
 
 Without a witness, a cluster left with exactly two voting-eligible workers
 refuses every failover decision with `missing_witness`, **unless a voter

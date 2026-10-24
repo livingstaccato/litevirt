@@ -866,9 +866,8 @@ func keptSize(n int64) string {
 // (none, or the one just removed): once the VM's firmware bundles are gone
 // too, their records describe nothing (tombstoneVMSnapshotRecords). A record
 // with no host (written before records named one) whose image is not here
-// is not among them: the image may be on another host. With remove false it
-// removes nothing and returns only the snapshots that never had a RAM image.
-func (s *Server) removeVMSnapshotRAMImages(ctx context.Context, vmName string, remove bool) []string {
+// is not among them: the image may be on another host.
+func (s *Server) removeVMSnapshotRAMImages(ctx context.Context, vmName string) []string {
 	snaps, err := corrosion.ListSnapshots(ctx, s.db, vmName)
 	if err != nil {
 		slog.Warn("delete: cannot list the VM's snapshots; their RAM images are kept", "vm", vmName, "error", err)
@@ -881,9 +880,6 @@ func (s *Server) removeVMSnapshotRAMImages(ctx context.Context, vmName string, r
 		}
 		if sn.VMStatePath == "" {
 			done = append(done, sn.Name)
-			continue
-		}
-		if !remove {
 			continue
 		}
 		own, err := lv.SafeVMStatePath(s.dataDir, vmName, sn.Name)

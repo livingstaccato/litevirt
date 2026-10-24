@@ -7,7 +7,7 @@ Each host needs:
 - Linux (x86_64) with KVM support (`/dev/kvm` must exist)
 - QEMU/KVM and libvirt installed (`apt install qemu-system-x86 libvirt-daemon-system`)
 - `genisoimage` for cloud-init ISO generation
-- SSH access (the CLI connects via SSH tunnel)
+- SSH access (`lv host init root@<ip>` uses it to install the host)
 
 Optional:
 
@@ -41,10 +41,9 @@ The fastest way to get started — run everything on one machine:
 sudo cp bin/litevirt /usr/local/bin/
 sudo ln -sf /usr/local/bin/litevirt /usr/local/bin/lv
 sudo litevirt host init --local --name node-1
-sudo systemctl enable --now litevirt.service
 ```
 
-This generates the PKI, installs dependencies (libvirt, QEMU), writes the config, and sets up the systemd unit — all locally, no SSH needed.
+This generates the PKI, installs dependencies (libvirt, QEMU), writes the config, and sets up the systemd unit — all locally, no SSH needed. It also enables and starts `litevirt.service`, and says so; there is nothing more to start.
 
 ```bash
 export LV_HOST=root@127.0.0.1
@@ -66,23 +65,18 @@ export LV_HOST=root@10.0.50.10
 lv host init root@10.0.50.10 --name host-a
 ```
 
-This generates the cluster PKI (CA + host certificate), creates `/etc/litevirt/config.yaml`, and installs a systemd unit.
+This generates the cluster PKI (CA + host certificate), creates `/etc/litevirt/config.yaml`, and installs, enables and starts the systemd unit.
 
 `lv host init` is for the first host only. It refuses a target that is already a
 member: one whose `join_peers` lists peers, or one whose address the cluster this
 CLI is configured for lists beside other hosts. The second check is what catches
 the first host itself, whose `join_peers` stays empty when later hosts are added
 from a workstation. A member that lost its disk is removed with `lv host rm` and
-added back with `lv host add`.
+added back with `lv host add`. It also refuses a target holding another
+cluster's state, as `lv host add` does (see [Add hosts to the cluster](#add-hosts-to-the-cluster)),
+and `--force` does not override that check.
 
-3. SSH into the host and start the daemon:
-
-```bash
-ssh root@10.0.50.10
-systemctl enable --now litevirt
-```
-
-4. Verify the cluster is running:
+3. Verify the cluster is running:
 
 ```bash
 lv status
@@ -138,6 +132,48 @@ it is down to every peer by construction, and runs nothing. A host removed
 with `lv host rm` and added back under the same name starts with no failure
 history; every peer forgets the old machine's failed probes when it leaves the
 host table.
+
+`lv host add` refuses a machine that holds another cluster's litevirt state,
+before anything is admitted or pushed. A machine that founded its own cluster
+with `lv host init --local` is the usual case: adding it would merge that
+cluster's users (a second `admin`), audit history, capability latches and
+gossip key into this one. The proof that state belongs to this cluster is
+the host identity the daemon loads from the config's `pki_dir`
+(`/etc/litevirt/pki` when it names none): a `host.crt` that chains to this
+cluster's CA and is a host certificate (ServerAuth usage, not the lv-cli
+client or an audit certificate), and a `host.key` beside it that is its key.
+Certificates are public, so a certificate alone proves nothing. The machine
+proves it holds the key by signing a random, domain-separated challenge
+with `openssl` there, bounded by a 30-second timeout; where it has no
+`openssl`, or that run fails or times out, the key is read over the same
+root SSH session, compared in memory, and never written or logged. A
+`host.key` that is not a regular file (a device, a FIFO, or a link to one)
+is refused before `openssl` runs. The add refuses:
+
+- a `ca.crt` in `/etc/litevirt/pki` or the config's `pki_dir` holding any CA
+  but this cluster's (a bundle with another CA in it included), or a CA key
+  with no certificate beside it;
+- a `state.db` or capability latches (`split_brain_activated.*`) in the data
+  dir (`data_dir`, `/var/lib/litevirt` by default), or a running
+  `litevirt.service`, without that proof: no `host.crt`, one another CA
+  issued, one that is not a host certificate, or no `host.key`, an
+  unreadable one or one that is not its key;
+- a `config.yaml` it cannot read or parse, since then it cannot tell where the
+  state or the host identity lives.
+
+An add that failed after the cluster admitted the host, whose daemon may
+already have started, and whose rollback left no `host.crt`, is finished by
+running it again: the admitted pair it left staged on the machine is the
+proof. A `host.crt` that is present always has to prove itself.
+
+There is no override. The refusal names what it found and the two ways
+forward: stop and disable `litevirt.service` on the machine and move
+`/etc/litevirt`, the data dir, `/root/.config/litevirt` and `/etc/pki/qemu`
+aside, then add it again as a new machine; or join in the other direction,
+adding this cluster's machines to the one it founded. A host removed with
+`lv host rm` keeps its host certificate, revoked but issued by this cluster's
+CA, and its files, so it is added back as before, with its database and even
+a daemon still running.
 
 `lv host add` uploads the binary and the host's credentials to staged paths
 on the machine, and moves them into place only once the cluster has admitted
@@ -239,7 +275,9 @@ edits in place only `host_name`, `advertise_address`, `join_peers`, `pki_dir`
 (set to `/etc/litevirt/pki`, where it installs the credentials) and
 `enforcement`, which becomes the cluster's block, or is removed when the
 cluster has none. Every other line (a `migration.network`, say) is kept as it
-was, as are the file's mode and a symlink to it. The file as it was is kept
+was, as is a symlink to it. The file is replaced by an atomic rename, written
+as root: its mode is kept but capped at 0600 (a group- or other-readable
+config becomes owner-only), and its owner and group become root's. The file as it was is kept
 beside it as `config.yaml.pre-add-<time>` (0600). The add refuses a config it
 cannot parse, one with more than one document, one of 1 MiB or more, and a
 `grpc_port` other than 7443 or a `gossip_port` other than 7946, on which
@@ -416,9 +454,27 @@ reads the system file the way `ssh -F` does, which would look for it under `~/.s
 
 ## CLI setup
 
-The `lv` binary connects to litevirtd over gRPC/mTLS. On a node with
-`/etc/litevirt/config.yaml`, it connects to the local daemon automatically. For a
-remote entry point, set the target host:
+The `lv` binary connects to litevirtd over gRPC/mTLS. On a node it connects to
+the local daemon automatically. It looks, in order, at:
+
+1. `/run/litevirt/endpoint`, which the daemon writes at every start (0644,
+   replaced atomically). It holds only `grpc_port` and `pki_dir`, nothing
+   secret, so any user on the node can read it. Its `pki_dir` is the CA lv
+   trusts, so it is read only as a regular file owned by root that only root
+   can write, in a root-owned directory only root can write (the daemon
+   refuses to write into any other `/run/litevirt`, and opens a 0700 one it
+   owns up to 0755). A file that fails that,
+   does not parse, has another key, or holds an invalid port or a relative
+   path is ignored as a whole, with a warning.
+2. `/etc/litevirt/config.yaml`, which is root's and 0600 because it can hold
+   inline secrets: readable under `sudo`.
+3. If that file cannot be read by the user, the defaults: the daemon on
+   `127.0.0.1:7443`, with the user's CLI client bundle. lv says so on stderr.
+   With no bundle either, it refuses, naming the file: set `LV_HOST` or run
+   with `sudo`.
+
+In local mode the user's CLI client bundle (below), when there is one, takes
+the place of `pki_dir`. For a remote entry point, set the target host:
 
 ```bash
 export LV_HOST=10.0.50.10
@@ -456,6 +512,7 @@ single-node install does not require copying daemon certificates out of
   state.db                      # local SQLite state store (0600: it holds the credentials)
 /var/cache/litevirt-restore/    # file restore: restore-VM kernel copy + initramfs (root:litevirt-restore 0750)
 /run/litevirt/file-restore/     # file restore: per-session export sockets and pidfiles
+/run/litevirt/endpoint          # grpc_port and pki_dir for a local lv (0644, nothing secret)
 ```
 
 ### What file restore changes on the host

@@ -483,6 +483,9 @@ func (s *Server) autoDefineRestoredVM(
 	}
 	s.forgetMoveRecords(ctx, targetName) // the restored domain takes the name
 	setFlightUUID(spec.Uuid)
+	if err := s.setAsideStaleLibvirtVars(targetName); err != nil {
+		return "", "", status.Errorf(codes.Internal, "%v", err)
+	}
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		return "", "", status.Errorf(codes.Internal, "define domain: %v", err)
 	}

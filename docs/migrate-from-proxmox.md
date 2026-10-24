@@ -72,7 +72,6 @@ sudo ln -sf /usr/local/bin/litevirt /usr/local/bin/lv   # `lv` is a symlink to t
 
 # Initialise cluster state on this host (port 7443):
 sudo litevirt host init --local --name pilot-1
-sudo systemctl enable --now litevirt.service
 ```
 
 `litevirt` listens on its own ports (7443 gRPC, 7445 UI, 7446 REST,
@@ -302,10 +301,10 @@ For zero-downtime moves between litevirt hosts:
 lv migrate <vm> <target-host>
 ```
 
-For zero-downtime disk pool moves (e.g. local → Ceph):
+For disk pool moves between file-based pools (local, nfs, dir, btrfs):
 
 ```bash
-lv move-volume <vm> root <ceph-pool-name>
+lv move-volume <vm> root <target-pool-name>
 ```
 
 ## Rollback

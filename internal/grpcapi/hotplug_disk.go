@@ -401,6 +401,12 @@ func (s *Server) attachDiskOwner(ctx context.Context, req *pb.AttachDeviceReques
 		}
 		occupied[d.TargetDev] = true
 	}
+	// The new disk file is a new disk, as a create's is: at the path a kept
+	// overlay names as its missing base it would become that base. Refused
+	// then, and while kept-disks.json or a kept chain cannot be read.
+	if err := s.keptPathRefusal(ctx, fmt.Sprintf("attach of disk %s to %s", spec.Name, vmName), keptWritesOf(true, diskPath)); err != nil {
+		return nil, err
+	}
 	// The domain's own targets too: the seed and installer CD-ROMs are in no table.
 	inDomain, err := s.domainDiskTargets(vmName)
 	if err != nil {

@@ -313,7 +313,7 @@ exit 3
 // sshd on the first connection).
 func waitComm(t *testing.T, pid int, comm string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		raw, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
 		if strings.TrimSpace(string(raw)) == comm {

@@ -261,6 +261,13 @@ func FailoverWithoutDevices(spec *pb.VMSpec) bool {
 // it, would re-home its record, and would hide the hold.
 var ErrPromoteHeld = errors.New("automatic promotion held")
 
+// ErrReplicaOnWitness is wrapped by an automatic promotion held because the
+// replica it would promote is on a witness, which runs no workloads: the VM
+// cannot be started there, and promoting without starting recovers nothing.
+// It is an ErrPromoteHeld, so the coordinator holds the VM down; it tells the
+// two causes apart for the audit.
+var ErrReplicaOnWitness = fmt.Errorf("the replica is on a witness; %w", ErrPromoteHeld)
+
 // RegionQuorum is one region's voting strength, as `lv cluster failover-scope`
 // prints it and the coordinator's regions-without-quorum gauge counts it.
 type RegionQuorum struct {

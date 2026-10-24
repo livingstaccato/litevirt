@@ -122,8 +122,9 @@ func TestFenceConfig_Decisions(t *testing.T) {
 
 // TestFenceConfig_LatchedAutoRefusesUntilFirstSync: once release_2026_12_v1
 // has latched, a host admitted after it is refused in auto until its agent's
-// first sync publishes its row, with a refusal that says so and names `lv
-// doctor fence`; that sync's row makes it fenceable with its pin.
+// first sync publishes its row, with a refusal that says so and names the
+// ways out (`lv host fence-confirm` after a power-off, ipmi or redfish) and
+// `lv doctor fence`; that sync's row makes it fenceable with its pin.
 func TestFenceConfig_LatchedAutoRefusesUntilFirstSync(t *testing.T) {
 	w := newWorld(t)
 	a := w.node("node-a", "127.0.0.2")
@@ -134,7 +135,8 @@ func TestFenceConfig_LatchedAutoRefusesUntilFirstSync(t *testing.T) {
 	agent := a.gatedAgent(fencessh.ModeAuto, openGate{t})
 	sf := agent.FenceConfig(ctx, "node-x")
 	for _, want := range []string{"release_2026_12_v1 has latched", "node-x has published no fence ssh row",
-		"first sync", "`lv doctor fence`", "enforcement.fence_ssh: legacy"} {
+		"first sync", "`lv doctor fence`", "enforcement.fence_ssh: legacy",
+		"run `lv host fence-confirm node-x`", "ipmi or redfish fence strategy"} {
 		if sf.Refusal == "" || !strings.Contains(sf.Refusal, want) {
 			t.Fatalf("FenceConfig before node-x's first sync = %+v, want a refusal containing %q", sf, want)
 		}

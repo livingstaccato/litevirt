@@ -63,10 +63,12 @@ func (a *Agent) fenceConfig(ctx context.Context, target, request string) (fence.
 		}
 		if mode == ModeAuto && a.fenceSSHLatched() {
 			return refuse("enforcement.fence_ssh is auto and release_2026_12_v1 has latched, but %s has published no "+
-				"fence ssh row, so it is not fenced without a pinned host key. A host just admitted publishes one on "+
-				"its daemon's first sync and is refused until then; one in enforcement.fence_ssh: legacy, "+
-				"or whose certificate names no single fence address, never does. Check `lv doctor fence`; "+
-				"enforcement.fence_ssh: legacy on this host fences it unpinned", target), nil
+				"fence ssh row, so it is not fenced without a pinned host key, and its workloads are not recovered "+
+				"on this fence. A host just admitted publishes one on its daemon's first sync, within about 30s of "+
+				"its daemon starting, and is refused until then; one in enforcement.fence_ssh: legacy, or whose "+
+				"certificate names no single fence address, never does. %s. `lv doctor fence` lists every host "+
+				"refused this way; enforcement.fence_ssh: legacy on this host fences it unpinned",
+				target, fence.NotFencedWayOut(target)), nil
 		}
 		return fence.SSHFence{Path: fence.SSHPathLegacy}, nil
 	}

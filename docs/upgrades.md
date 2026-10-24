@@ -704,7 +704,9 @@ the ability to roll back, set `enforcement.fence_ssh: legacy` in every host's
 config before the last host upgrades. The daemon reads it at start, so restart
 the daemon of a host that already runs this build: a host in `legacy` publishes no row, so nothing uses the
 feature (and every host keeps fencing as before the upgrade, pinned toward any
-host that does publish). `lv cluster upgrade-status` lists `fence_ssh` with
+host that does publish). Once the token latches, a host in `auto` refuses to
+fence a host that has published no row, so a host left in `legacy` beside one in
+`auto` is unfenceable from it. `lv cluster upgrade-status` lists `fence_ssh` with
 whether it is used, and its token once latched. Its rollout summary (hosts on the
 release, features waiting) counts `release_2026_11_v1` only.
 

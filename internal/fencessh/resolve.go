@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
 )
@@ -19,7 +20,12 @@ const installHint = "run `lv host install-fence-ssh` and check `lv doctor fence`
 //   - no row: the legacy path, unpinned — today's fence, for a host that has
 //     not published (the release has not latched, enforcement.fence_ssh:
 //     legacy on it, or a certificate with no fence address).
-//     enforcement.fence_ssh: managed refuses it.
+//     enforcement.fence_ssh: managed refuses it, and so does auto once
+//     release_2026_12_v1 has latched here: from then on every host not in
+//     legacy publishes, so a row-less target has not synced yet or never
+//     will, and an unpinned fence of it would power off whatever answers at
+//     its address and count that a success. legacy still takes it (the
+//     stand-down).
 //   - a row that does not verify (forged, revoked, retired): refused. A host
 //     that has published is never fenced without its pin, whatever the mode,
 //     so breaking a row never earns an unchecked fence.
@@ -54,6 +60,13 @@ func (a *Agent) fenceConfig(ctx context.Context, target, request string) (fence.
 		if mode == ModeManaged {
 			return refuse("enforcement.fence_ssh is managed and %s has published no fence ssh row (it does once the "+
 				"cluster runs release_2026_12_v1 and its daemon is up); %s", target, installHint), nil
+		}
+		if mode == ModeAuto && a.fenceSSHLatched() {
+			return refuse("enforcement.fence_ssh is auto and release_2026_12_v1 has latched, but %s has published no "+
+				"fence ssh row, so it is not fenced without a pinned host key. A host just admitted publishes one on "+
+				"its daemon's first sync and is refused until then; one in enforcement.fence_ssh: legacy, "+
+				"or whose certificate names no single fence address, never does. Check `lv doctor fence`; "+
+				"enforcement.fence_ssh: legacy on this host fences it unpinned", target), nil
 		}
 		return fence.SSHFence{Path: fence.SSHPathLegacy}, nil
 	}
@@ -98,6 +111,14 @@ func (a *Agent) fenceConfig(ctx context.Context, target, request string) (fence.
 	}
 	own.KnownHosts, own.HostKeyAlias, own.Request = pinned.KnownHosts, pinned.HostKeyAlias, request
 	return own, v
+}
+
+// fenceSSHLatched reports whether release_2026_12_v1 has durably latched
+// here, from the local latch alone. No gate reads as not latched: the latch is
+// monotone and local, so false means a cluster still rolling, where no host
+// has published and refusing would strand every fence.
+func (a *Agent) fenceSSHLatched() bool {
+	return a.cfg.Gate != nil && a.cfg.Gate.ReleaseFeatureAvailable(capabilities.FeatureFenceSSH)
 }
 
 // sharedHostKey is another live host whose verified row publishes one of v's

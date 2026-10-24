@@ -1142,8 +1142,9 @@ The address a key is accepted from is the one IPv4 address the peer's
 certificate names besides 127.0.0.1 — what `lv host init` and `lv host add`
 put in it — never a field of the row. A host whose certificate names no such
 address, or more than one, or is not valid now, publishes no row: it cannot
-fence over the managed key, and its peers fence it the legacy way, unpinned,
-which `lv doctor fence` warns of. Every file sshd
+fence over the managed key, its peers in `legacy` fence it the legacy way,
+unpinned, which `lv doctor fence` warns of, and every other peer refuses to fence
+it. Every file sshd
 reads at fence time is static, so a frozen or dead daemon does not stop its host
 being fenced. A host whose own certificate is revoked, or whose host row is
 removed, renders no peer at all.
@@ -1190,7 +1191,7 @@ fencing node's setting decides, so no host relies on another's):
 
 | The target's row | `auto` (default) | `managed` | `legacy` |
 |---|---|---|---|
-| none (it has not published) | today's command, unpinned, with a warning | refused | today's command, unpinned |
+| none (it has not published) | before `release_2026_12_v1` latches: today's command, unpinned, with a warning; once it has latched: refused | refused | today's command, unpinned |
 | does not verify (forged, revoked, retired) | refused | refused | refused |
 | verified, sshd accepts the managed key | managed | managed | legacy, pinned |
 | verified, accepted it before and does not now | managed | managed | legacy, pinned |
@@ -1208,6 +1209,16 @@ fencing node's setting decides, so no host relies on another's):
   makes it unfenceable: trying the managed key is never less safe than refusing,
   since the pin, the restricted key, `from=` and the forced command all still
   apply.
+- Once `release_2026_12_v1` has latched on the fencing host, every host not in
+  `legacy` publishes, so `auto` no longer fences a host with no row: without a
+  pin, whatever answers at its address would be powered off and the fence counted
+  a success. A host admitted after the latch is refused until its daemon's first
+  sync publishes its row; a host in `legacy`, or whose certificate names no single
+  fence address, is refused for good. `lv doctor fence` shows each as `refused`
+  with the reason. A host that cannot read the latch (no release gate) counts it
+  as not latched: before the latch no host has published, so refusing would
+  strand every fence. `legacy` on the fencing host is the stand-down: it fences
+  such a host unpinned, as before.
 - A host that cannot use the managed key itself (no fence key yet, or a
   certificate with no fence address) fences a host that accepts it pinned in
   `auto`, and refuses in `managed`.
@@ -1227,7 +1238,9 @@ fencing node's setting decides, so no host relies on another's):
 - A new cluster's `lv host init` writes `fence_ssh: managed`, and `lv host add`
   copies it with the enforcement block. An upgraded cluster stays `auto`.
 - A host in `legacy` publishes no row of its own. It still fences every host that
-  has published pinned, and every other host unpinned, as before.
+  has published pinned, and every other host unpinned, as before. Once the
+  release has latched, a peer in `auto` or `managed` refuses to fence it, so put
+  every host in `legacy` or none.
 
 **Every member fences.** Any host can hold the failover lease and any host
 answers `lv host fence`, so every admitted host's key is rendered on every
@@ -1253,7 +1266,8 @@ accept the managed key. Its exit code is unchanged.
 1. Upgrade with a normal rolling upgrade. `release_2026_12_v1` latches once every
    host the cluster replicates to runs this build; until then nothing is published
    and fences run exactly as before. Every host then publishes its row, which pins
-   its sshd keys for every fence toward it, the legacy path included.
+   its sshd keys for every fence toward it, the legacy path included, and a host
+   in `auto` stops fencing any host that has not (see the table above).
 2. Run `lv host install-fence-ssh` (from the machine `lv` runs on, as root on each
    host, or `--ssh-user`). It writes the drop-in on every host (or exactly the
    `--host` ones; an unknown name changes nothing) and waits until each reports

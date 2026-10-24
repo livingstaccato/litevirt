@@ -557,9 +557,11 @@ enforcement:
                               # target (migration-failover.md "Managed fence SSH").
                               # auto (the default, also when unset): the managed fence key
                               # toward a host whose sshd accepts it, else the legacy command
-                              # with the host's published sshd keys pinned. managed: the
-                              # managed key only; a fence toward a host that does not accept
-                              # it fails. legacy: never the managed key (the kill switch),
+                              # with the host's published sshd keys pinned; toward a host
+                              # that has published no row, the legacy command unpinned
+                              # until release_2026_12_v1 latches, refused once it has.
+                              # managed: the managed key only; a fence toward a host that
+                              # does not accept it fails. legacy: never the managed key (the kill switch),
                               # still pinned. No mode fences a host that has published a
                               # fence ssh row without its pinned host key. `lv host init`
                               # writes managed for a new cluster. No capability token.

@@ -128,3 +128,29 @@ func TestPauseLapse_RecoverFencedStartsNoWaitWithoutReliance(t *testing.T) {
 		t.Fatalf("hold %q does not say the pause is not relied on", hold)
 	}
 }
+
+// The pause wait runs from the later of the fence decision and this node's
+// last contact with the host (LastContact): a host last heard from after the
+// decision began losing the majority no earlier than that, so its pause comes
+// no earlier either (review NB-5).
+//
+// Mutation: ignore LastContact in pauseDeadlinePassed (anchor at the decision)
+// — the VM moves a contact-gap early, red.
+func TestPartitionPause_TheWaitRunsFromTheLastContact(t *testing.T) {
+	c, db, ctx, mono := pauseCoordinator(t, true)
+	gap := 20 * time.Second
+	contact := mono.Now().Add(gap)
+	c.LastContact = func(string) (time.Time, bool) { return contact, true }
+	c.run(ctx)
+	wait, _ := c.partitionPauseWait(ctx)
+	mono.Advance(wait + time.Second)
+	c.run(ctx)
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Fatalf("VM moved to %q %v after the decision, before the wait from the last contact had passed", got, wait+time.Second)
+	}
+	mono.Advance(gap)
+	c.run(ctx)
+	if got := vmHost(t, db, ctx); got != "alive" {
+		t.Fatalf("VM on %q after the wait from the last contact passed (hold %q)", got, c.holdReason["down"])
+	}
+}

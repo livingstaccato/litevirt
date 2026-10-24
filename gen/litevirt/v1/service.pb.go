@@ -46005,7 +46005,7 @@ type FenceSSHNode struct {
 	// reachable=false: the host did not answer, and its view is unknown.
 	Reachable bool            `protobuf:"varint,2,opt,name=reachable,proto3" json:"reachable,omitempty"`
 	Error     string          `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
-	Mode      string          `protobuf:"bytes,4,opt,name=mode,proto3" json:"mode,omitempty"`                            // its enforcement.fence_ssh: managed | auto | legacy
+	Mode      string          `protobuf:"bytes,4,opt,name=mode,proto3" json:"mode,omitempty"`                            // its enforcement.fence_ssh: managed | auto
 	LastError string          `protobuf:"bytes,5,opt,name=last_error,json=lastError,proto3" json:"last_error,omitempty"` // its agent's last sync failure
 	Peers     []*FenceSSHPeer `protobuf:"bytes,6,rep,name=peers,proto3" json:"peers,omitempty"`
 	// evaluated_for_request: with reevaluate, this host's agent ran a sync

@@ -223,12 +223,11 @@ func TestPublish_AFailedEvaluationKeepsWhatWasPublished(t *testing.T) {
 	}
 }
 
-// TestPublish_LegacyKeepsAnExistingRowSigned: a host that published, then
-// was switched to enforcement.fence_ssh: legacy (an incident stand-down), and
-// then renewed its certificate, re-signs its row with the renewed one —
-// otherwise the replaced certificate's revocation stays owed for good, and
-// once it is revoked every peer refuses to fence the host.
-func TestPublish_LegacyKeepsAnExistingRowSigned(t *testing.T) {
+// TestPublish_ARenewalReSignsTheRow: a host that published and then renewed
+// its certificate re-signs its row with the renewed one — otherwise the
+// replaced certificate's revocation stays owed for good, and once it is
+// revoked every peer refuses to fence the host.
+func TestPublish_ARenewalReSignsTheRow(t *testing.T) {
 	ctx := context.Background()
 	w := newWorld(t)
 	x := w.node("node-x", "127.0.0.3")
@@ -239,27 +238,26 @@ func TestPublish_LegacyKeepsAnExistingRowSigned(t *testing.T) {
 	if _, next, err := pki.RenewLocal(filepath.Join(w.ca, "ca.crt"), filepath.Join(w.ca, "ca.key"), x.pkiDir, "node-x"); err != nil {
 		t.Fatal(err)
 	} else {
-		legacy := fencessh.New(fencessh.Config{
+		renewed := fencessh.New(fencessh.Config{
 			Self: x.name, PKIDir: x.pkiDir, DB: w.db, Gate: openGate{t}, Dir: x.dir, HostKeyGlob: x.hkPath + ".pub",
-			Mode:      func() string { return fencessh.ModeLegacy },
+			Mode:      func() string { return fencessh.ModeAuto },
 			Accepting: func(context.Context, []string) (bool, string, error) { return true, "", nil },
 		})
-		if err := legacy.Sync(ctx); err != nil {
+		if err := renewed.Sync(ctx); err != nil {
 			t.Fatal(err)
 		}
 		r, _ := x.row()
 		cert, err := pki.ParseCertPEM([]byte(r.CertPEM))
 		if err != nil || !strings.EqualFold(cert.SerialNumber.Text(16), next) {
-			t.Fatalf("the legacy host's row is signed by %v (%v), want the renewed %s", cert.SerialNumber, err, next)
+			t.Fatalf("the renewed host's row is signed by %v (%v), want the renewed %s", cert.SerialNumber, err, next)
 		}
 	}
 }
 
-// TestPublish_LegacyReplacesARetiredRow: re-admission retires a host's row
-// on every node, and peers refuse to fence through a tombstone. A host on
-// enforcement.fence_ssh: legacy publishes no FIRST row, but it must replace
-// its own tombstone, or the re-admitted host is never fenceable again.
-func TestPublish_LegacyReplacesARetiredRow(t *testing.T) {
+// TestPublish_ReplacesARetiredRow: re-admission retires a host's row on every
+// node, and peers refuse to fence through a tombstone. The re-admitted host
+// must replace its own tombstone, or it is never fenceable again.
+func TestPublish_ReplacesARetiredRow(t *testing.T) {
 	ctx := context.Background()
 	w := newWorld(t)
 	a := w.node("node-a", "127.0.0.2")
@@ -273,43 +271,22 @@ func TestPublish_LegacyReplacesARetiredRow(t *testing.T) {
 		ever_accepting = 0, signature = '', deleted_at = updated_at WHERE host_name = 'node-x'`); err != nil {
 		t.Fatal(err)
 	}
-	if sf := a.agent(fencessh.ModeLegacy).FenceConfig(ctx, "node-x"); sf.Refusal == "" {
+	if sf := a.agent(fencessh.ModeAuto).FenceConfig(ctx, "node-x"); sf.Refusal == "" {
 		t.Fatalf("fence through the tombstone = %+v, want refused", sf)
 	}
-	legacy := fencessh.New(fencessh.Config{
+	readmitted := fencessh.New(fencessh.Config{
 		Self: x.name, PKIDir: x.pkiDir, DB: w.db, Gate: openGate{t}, Dir: x.dir, HostKeyGlob: x.hkPath + ".pub",
-		Mode:      func() string { return fencessh.ModeLegacy },
-		Accepting: func(context.Context, []string) (bool, string, error) { return true, "", nil },
+		Mode:      func() string { return fencessh.ModeAuto },
+		Accepting: func(context.Context, []string) (bool, string, error) { return false, "not installed", nil },
 	})
-	if err := legacy.Sync(ctx); err != nil {
+	if err := readmitted.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if r, ok := x.row(); !ok || r.Deleted || r.SSHDHostkeys == "" {
-		t.Fatalf("after a legacy sync over its tombstone the row = %+v (present %v), want republished", r, ok)
+		t.Fatalf("after a sync over its tombstone the row = %+v (present %v), want republished", r, ok)
 	}
-	if sf := a.agent(fencessh.ModeLegacy).FenceConfig(ctx, "node-x"); sf.Refusal != "" || sf.Path != fence.SSHPathPinned {
+	if sf := a.agent(fencessh.ModeAuto).FenceConfig(ctx, "node-x"); sf.Refusal != "" || sf.Path != fence.SSHPathPinned {
 		t.Fatalf("fence of the re-admitted host = %+v, want pinned", sf)
-	}
-}
-
-// TestPublish_LegacyNeverMakesTheFirstRow: enforcement.fence_ssh: legacy
-// publishes nothing for a host that has no row, so the release feature stays
-// unused and a rollback below release_2026_12_v1 stays possible.
-func TestPublish_LegacyNeverMakesTheFirstRow(t *testing.T) {
-	ctx := context.Background()
-	w := newWorld(t)
-	x := w.node("node-x", "127.0.0.3")
-	x.hostRow("127.0.0.3", 22)
-	legacy := fencessh.New(fencessh.Config{
-		Self: x.name, PKIDir: x.pkiDir, DB: w.db, Gate: openGate{t}, Dir: x.dir, HostKeyGlob: x.hkPath + ".pub",
-		Mode:      func() string { return fencessh.ModeLegacy },
-		Accepting: func(context.Context, []string) (bool, string, error) { return true, "", nil },
-	})
-	if err := legacy.Sync(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if r, ok := x.row(); ok {
-		t.Fatalf("a legacy host with no row published %+v", r)
 	}
 }
 

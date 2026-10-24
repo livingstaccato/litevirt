@@ -1142,9 +1142,9 @@ The address a key is accepted from is the one IPv4 address the peer's
 certificate names besides 127.0.0.1 — what `lv host init` and `lv host add`
 put in it — never a field of the row. A host whose certificate names no such
 address, or more than one, or is not valid now, publishes no row: it cannot
-fence over the managed key, its peers in `legacy` fence it the legacy way,
-unpinned, which `lv doctor fence` warns of, and every other peer refuses to fence
-it. Every file sshd
+fence over the managed key, and its peers fence it the legacy way, unpinned,
+until `release_2026_12_v1` latches (which `lv doctor fence` warns of), and refuse
+to fence it once it has. Every file sshd
 reads at fence time is static, so a frozen or dead daemon does not stop its host
 being fenced. A host whose own certificate is revoked, or whose host row is
 removed, renders no peer at all.
@@ -1189,13 +1189,15 @@ its peers still fence it over the managed key, which its sshd may refuse.
 **How a fence reaches its target** (`enforcement.fence_ssh`, per host; the
 fencing node's setting decides, so no host relies on another's):
 
-| The target's row | `auto` (default) | `managed` | `legacy` |
-|---|---|---|---|
-| none (it has not published) | before `release_2026_12_v1` latches: today's command, unpinned, with a warning; once it has latched: refused | refused | today's command, unpinned |
-| does not verify (forged, revoked, retired) | refused | refused | refused |
-| verified, sshd accepts the managed key | managed | managed | legacy, pinned |
-| verified, accepted it before and does not now | managed | managed | legacy, pinned |
-| verified, never accepted it | legacy, pinned | refused | legacy, pinned |
+| The target's row | `auto` (default) | `managed` |
+|---|---|---|
+| none (it has not published) | before `release_2026_12_v1` latches: today's command, unpinned, with a warning; once it has latched: refused | refused |
+| does not verify (forged, revoked, retired) | refused | refused |
+| verified, sshd accepts the managed key | managed | managed |
+| verified, accepted it before and does not now | managed | managed |
+| verified, never accepted it | legacy, pinned | refused |
+
+Any other value of `enforcement.fence_ssh` fails the daemon's start.
 
 - **managed**: `ssh -F /dev/null` with the host's own fence key, no agent, no
   configuration of root's, `StrictHostKeyChecking=yes` against the target's
@@ -1209,16 +1211,14 @@ fencing node's setting decides, so no host relies on another's):
   makes it unfenceable: trying the managed key is never less safe than refusing,
   since the pin, the restricted key, `from=` and the forced command all still
   apply.
-- Once `release_2026_12_v1` has latched on the fencing host, every host not in
-  `legacy` publishes, so `auto` no longer fences a host with no row: without a
-  pin, whatever answers at its address would be powered off and the fence counted
-  a success. A host admitted after the latch is refused until its daemon's first
-  sync publishes its row; a host in `legacy`, or whose certificate names no single
-  fence address, is refused for good. `lv doctor fence` shows each as `refused`
-  with the reason. A host that cannot read the latch (no release gate) counts it
-  as not latched: before the latch no host has published, so refusing would
-  strand every fence. `legacy` on the fencing host is the stand-down: it fences
-  such a host unpinned, as before.
+- Once `release_2026_12_v1` has latched on the fencing host, every host
+  publishes, so `auto` no longer fences a host with no row: without a pin,
+  whatever answers at its address would be powered off and the fence counted a
+  success. A host admitted after the latch is refused until its daemon's first
+  sync publishes its row; a host whose certificate names no single fence address
+  is refused for good. `lv doctor fence` shows each as `refused` with the reason.
+  A host that cannot read the latch (no release gate) counts it as not latched:
+  before the latch no host has published, so refusing would strand every fence.
 - A host that cannot use the managed key itself (no fence key yet, or a
   certificate with no fence address) fences a host that accepts it pinned in
   `auto`, and refuses in `managed`.
@@ -1237,10 +1237,6 @@ fencing node's setting decides, so no host relies on another's):
   `[path=legacy-pinned]` or `[path=legacy-unpinned]`.
 - A new cluster's `lv host init` writes `fence_ssh: managed`, and `lv host add`
   copies it with the enforcement block. An upgraded cluster stays `auto`.
-- A host in `legacy` publishes no row of its own. It still fences every host that
-  has published pinned, and every other host unpinned, as before. Once the
-  release has latched, a peer in `auto` or `managed` refuses to fence it, so put
-  every host in `legacy` or none.
 
 **Every member fences.** Any host can hold the failover lease and any host
 answers `lv host fence`, so every admitted host's key is rendered on every
@@ -1305,11 +1301,9 @@ only the drop-in. A host that ever accepted the managed key is still fenced over
 it afterwards, so its sshd refuses those fences until the drop-in is installed
 again.
 
-**Rolling back.** Every host not in `legacy` publishes as soon as
-`release_2026_12_v1` latches, so the feature `fence_ssh` is used from then on, and
-a host rolled back below the release quarantines (see [upgrades.md](upgrades.md)).
-To keep that rollback possible, set `enforcement.fence_ssh: legacy` on every host
-before the last one upgrades. A rolled-back binary
+**Rolling back.** Every host publishes as soon as `release_2026_12_v1` latches,
+so the feature `fence_ssh` is used from then on, and a host rolled back below the
+release quarantines (see [upgrades.md](upgrades.md)). A rolled-back binary
 leaves the drop-in and the rendered files in place: they keep accepting peers'
 fences, and are not updated when a host is removed until it is upgraded again.
 

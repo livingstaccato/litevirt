@@ -472,38 +472,6 @@ func TestSGProjects_AProjectGroupHasNoStack(t *testing.T) {
 	wantSGCode(t, "a project group with a stack", err, codes.InvalidArgument)
 }
 
-// A project's group starts empty: rules an older client stored under the name
-// it takes are neither listed as its own nor removed with it.
-func TestSGProjects_AProjectGroupDoesNotAdoptNameKeyedRules(t *testing.T) {
-	f := newSGProjectsFixture(t)
-	ctx := context.Background()
-	if err := corrosion.InsertSGRule(ctx, f.s.db, corrosion.SGRule{ID: "legacy-r", SGID: "stranded",
-		Direction: "ingress", Proto: "tcp", PortRange: "23", Action: "accept"}); err != nil {
-		t.Fatal(err)
-	}
-	g, err := f.s.CreateSecurityGroup(f.alice, &pb.CreateSecurityGroupRequest{Name: "stranded", Project: "acme"})
-	if err != nil {
-		t.Fatalf("alice creates stranded: %v", err)
-	}
-	for who, c := range map[string]context.Context{"alice": f.alice, "root": f.root} {
-		resp, err := f.s.ListSecurityGroups(c, &pb.ListSecurityGroupsRequest{Project: "acme", IncludeRules: true})
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, r := range resp.GetRules() {
-			if r.GetId() == "legacy-r" && r.GetSgId() == g.Id {
-				t.Fatalf("%s sees the stranded rule as acme's group's own", who)
-			}
-		}
-	}
-	if _, err := f.s.DeleteSecurityGroup(f.alice, &pb.DeleteSecurityGroupRequest{Id: g.Id}); err != nil {
-		t.Fatal(err)
-	}
-	if r, _ := corrosion.GetSGRule(ctx, f.s.db, "legacy-r"); r == nil {
-		t.Fatal("deleting acme's group removed a rule it never owned")
-	}
-}
-
 // A malformed project is refused before any authorization, for root and for
 // a project-scoped caller alike. The CLI relies on it to tell a daemon that
 // implements project groups from one that drops the field: only this answer

@@ -2,7 +2,6 @@ package grpcapi
 
 import (
 	"context"
-	"sort"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -201,15 +200,6 @@ func (s *Server) resolveSecurityGroup(ctx context.Context, ref string) (*corrosi
 		"%d security groups are named %q; use the group id (lv sg ls shows ids)", len(byName), ref)
 }
 
-// sgNameCounts counts live groups per name, for ListSGRulesFor's legacyByName.
-func sgNameCounts(sgs []corrosion.SecurityGroup) map[string]int {
-	m := make(map[string]int, len(sgs))
-	for _, g := range sgs {
-		m[g.Name]++
-	}
-	return m
-}
-
 // DeleteSecurityGroup tombstones a security group and every rule in it.
 // `lv sg rm`.
 func (s *Server) DeleteSecurityGroup(ctx context.Context, req *pb.DeleteSecurityGroupRequest) (*emptypb.Empty, error) {
@@ -243,17 +233,7 @@ func (s *Server) DeleteSecurityGroup(ctx context.Context, req *pb.DeleteSecurity
 	if err := corrosion.DeleteSGRules(ctx, s.db, req.Id); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete security group rules: %v", err)
 	}
-	// The group and the rules an older client stored under its name are
-	// tombstoned in one transaction (see DeleteSecurityGroupWithLegacyRules for
-	// why they are always removed, and why together).
-	group, _ := corrosion.GetSecurityGroup(ctx, s.db, req.Id)
-	var derr error
-	if group != nil {
-		derr = corrosion.DeleteSecurityGroupWithLegacyRules(ctx, s.db, *group)
-	} else {
-		derr = corrosion.DeleteSecurityGroup(ctx, s.db, req.Id)
-	}
-	if derr != nil {
+	if derr := corrosion.DeleteSecurityGroup(ctx, s.db, req.Id); derr != nil {
 		// The id-keyed rules are already gone, so the change is recorded even
 		// though the group row itself was not tombstoned.
 		s.audit(ctx, "sg.rm", req.Id, corrosion.AuditChange(before, corrosion.AuditUnknown(derr)), "error")
@@ -347,9 +327,7 @@ func (s *Server) RemoveSecurityGroupRule(ctx context.Context, req *pb.RemoveSecu
 }
 
 // requireSGRuleWrite checks sg.write for a rule on the path of the group that
-// owns it. A rule no live group owns by id — one an older client stored under
-// a group's name, or an orphan — is judged on the group of that name, else at
-// the root.
+// owns it. A rule no live group owns (an orphan) is judged at the root.
 func (s *Server) requireSGRuleWrite(ctx context.Context, rule *corrosion.SGRule, rerr error) error {
 	if rerr != nil || rule == nil {
 		return s.requireSGWrite(ctx)
@@ -357,11 +335,6 @@ func (s *Server) requireSGRuleWrite(ctx context.Context, rule *corrosion.SGRule,
 	g, err := corrosion.GetSecurityGroup(ctx, s.db, rule.SGID)
 	if err != nil {
 		return status.Errorf(codes.Unavailable, "look up the group of rule %q: %v", rule.ID, err)
-	}
-	if g == nil {
-		if held, herr := liveSGNamed(ctx, s.db, rule.SGID, ""); herr == nil && held != nil {
-			g = held
-		}
 	}
 	if g == nil {
 		return s.requireSGWrite(ctx)
@@ -423,18 +396,13 @@ func (s *Server) ListSecurityGroups(ctx context.Context, req *pb.ListSecurityGro
 		}
 		groups = append(groups, g)
 	}
-	all, err := corrosion.ListSecurityGroups(ctx, s.db, "")
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "list security groups: %v", err)
-	}
-	counts := sgNameCounts(all)
 	resp := &pb.ListSecurityGroupsResponse{Groups: make([]*pb.SecurityGroup, 0, len(groups))}
 	for _, g := range groups {
 		resp.Groups = append(resp.Groups, toPbSecurityGroup(g))
 		if !req.GetIncludeRules() || !rulesOf[g.ID] {
 			continue
 		}
-		rules, err := corrosion.ListSGRulesFor(ctx, s.db, g, counts[g.Name] == 1)
+		rules, err := corrosion.ListSGRules(ctx, s.db, g.ID)
 		if err != nil {
 			// A page that showed the group with no rules would read as "this
 			// group allows nothing", which is not what the host enforces.
@@ -442,28 +410,6 @@ func (s *Server) ListSecurityGroups(ctx context.Context, req *pb.ListSecurityGro
 		}
 		for _, r := range rules {
 			resp.Rules = append(resp.Rules, toPbSGRule(r))
-		}
-	}
-	// Legacy rules stored under a name two live groups share belong to neither,
-	// and are not applied. Report them with sg_id left as the bare name (it
-	// matches no group id) so `lv sg` can say so. Root only: such a name may
-	// be any project's.
-	if req.GetIncludeRules() && root {
-		var shared []string
-		for name, n := range counts {
-			if n > 1 {
-				shared = append(shared, name)
-			}
-		}
-		sort.Strings(shared)
-		for _, name := range shared {
-			orphans, err := corrosion.ListSGRules(ctx, s.db, name)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "list rules keyed by %q: %v", name, err)
-			}
-			for _, r := range orphans {
-				resp.Rules = append(resp.Rules, toPbSGRule(r))
-			}
 		}
 	}
 	return resp, nil

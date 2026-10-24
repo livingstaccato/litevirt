@@ -79,30 +79,3 @@ func TestCorrosionPlanLoader_SkipsAnotherProjectsGroup(t *testing.T) {
 		t.Fatalf("rendered %d of the two NICs: %+v", seen, plan.NICs)
 	}
 }
-
-// A project's group renders its own rules only: a rule an older client stored
-// under the name it took is not rendered onto the project's NICs.
-func TestCorrosionPlanLoader_AProjectGroupDoesNotAdoptNameKeyedRules(t *testing.T) {
-	ctx := context.Background()
-	db := corrosion.NewTestClientT(t)
-	if err := corrosion.InitSchema(ctx, db); err != nil {
-		t.Fatal(err)
-	}
-	if err := corrosion.InsertSGRule(ctx, db, corrosion.SGRule{ID: "legacy-r", SGID: "stranded",
-		Direction: "ingress", Proto: "tcp", PortRange: "23", Action: "accept"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := corrosion.InsertProjectSecurityGroup(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureSGProjects),
-		corrosion.SecurityGroup{ID: "sg-p", Name: "stranded", Project: "acme"}); err != nil {
-		t.Fatal(err)
-	}
-	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, liveTaps(nil))(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, g := range plan.SecurityGroups {
-		if g.Name == "stranded" && len(g.Rules) != 0 {
-			t.Fatalf("acme's group renders %d adopted rule(s)", len(g.Rules))
-		}
-	}
-}

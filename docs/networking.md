@@ -421,6 +421,23 @@ For VMs that need to handle multiple VLANs (e.g., virtual routers):
         trunk: [100, 101, 200]
 ```
 
+A `trunk:` with a single VLAN makes the NIC an access port on that VLAN: its
+host tap gets the VLAN as pvid, untagged, and the guest sends and receives
+untagged frames. That needs a Linux bridge with VLAN filtering on (`ip link set
+dev <bridge> type bridge vlan_filtering 1`, and the VLAN on the bridge's
+uplink); a bridge with it off ignores the pvid and puts the NIC on its untagged
+segment. So a create, and every start of the VM (`lv start`, `lv restart`, a
+failover or health restart), is refused with `FailedPrecondition` when the
+NIC's bridge on that host has VLAN filtering off, naming the bridge. A bridge
+that does not exist on the host yet, and a device that is not a Linux bridge,
+are not judged. A migration does not check its target's bridge before the
+move: a live-migrated guest keeps running on a target whose bridge has VLAN
+filtering off, on that bridge's untagged segment, and its next start there is
+refused; a cold-moved VM is refused when it is started on the target. A trunk
+of two or more VLANs is not refused: its tagged frames
+pass a bridge with filtering off, and the firewall confines them to the VLANs
+its network allows (docs/firewall.md, "VLAN tags").
+
 ## VM IP addressing
 
 How a VM gets its address depends on when and how you set it:

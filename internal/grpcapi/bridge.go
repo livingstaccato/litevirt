@@ -16,6 +16,23 @@ func (s *Server) ensureBridge(name string) error {
 	return nil
 }
 
+// nicPreflight runs the NIC host-wiring preflight (network.RunPreFlight).
+func (s *Server) nicPreflight(checks []network.PreFlightCheck) error {
+	if s.netPreflight != nil {
+		return s.netPreflight(checks)
+	}
+	return network.RunPreFlight(checks)
+}
+
+// accessVLAN is the VLAN of an access-port NIC (trunk: with exactly one
+// VLAN), 0 for any other.
+func accessVLAN(trunk []int32) int {
+	if len(trunk) == 1 {
+		return int(trunk[0])
+	}
+	return 0
+}
+
 // bridgeExistsHere answers, for THIS host, the one host-local fact the NetBox
 // bind-time DHCP refusal needs: whether the bridge already exists.
 //

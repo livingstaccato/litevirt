@@ -63,6 +63,23 @@ func newStuckStartDetail(t *testing.T, detail string) *stuckStart {
 		default:
 			close(st.release)
 		}
+		// A held start answers on its own goroutine once released, and
+		// records the outcome (the cancelled-starts file, the row, the
+		// lease) under the server's data dir. Wait for it to settle and let
+		// the VM lock go, or it writes into the test's TempDir while that is
+		// being removed ("directory not empty"). Registered after the
+		// TempDir, so it runs first.
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, flying := s.startFlightOf("web"); !flying {
+				if unlock, ok := s.tryLockVM("web"); ok {
+					unlock()
+					return
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Errorf("a start of web had not settled 10s after its release")
 	})
 	return st
 }

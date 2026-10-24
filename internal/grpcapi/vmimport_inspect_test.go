@@ -178,7 +178,7 @@ func TestImportVM_InspectOVAServerPathWritesNothing(t *testing.T) {
 // node (judged by the bearer it relays), and nothing of it is described. The
 // admin control shows the file is an OVA the preview would describe.
 //
-// Mutation: resolve the path in inspectOVASource with a bare
+// Mutation: resolve the --server-path in ImportVM with a bare
 // filepath.EvalSymlinks (no containment) and the operator gets the plan.
 func TestImportVM_InspectOVAServerPathOutsideStagingRefused(t *testing.T) {
 	s := testServer(t)

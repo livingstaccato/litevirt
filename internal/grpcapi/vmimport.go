@@ -119,11 +119,21 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return err
 	}
 	chunks := newImportChunks(stream, first.Chunk)
+	// A --server-path is resolved and judged once, before the preview or the
+	// import reads it.
+	var serverPath string
+	if first.SourcePath != "" {
+		p, perr := s.resolveStagedPath(ctx, first.SourcePath)
+		if perr != nil {
+			return perr
+		}
+		serverPath = p
+	}
 	// An OVA is inspected from its descriptor alone, read from where the
 	// import would read it, and nothing is written: no staging directory, no
 	// upload, no extracted disk.
 	if first.Inspect {
-		fv, ok, err := s.inspectOVASource(ctx, first, chunks)
+		fv, ok, err := s.inspectOVASource(first, serverPath, chunks)
 		if err != nil {
 			return err
 		}
@@ -154,7 +164,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	defer space.release()
 	defer os.RemoveAll(importDir)
 
-	srcPath, err := s.stageImportSource(ctx, chunks, first, importDir, space)
+	srcPath, err := s.stageImportSource(chunks, serverPath, importDir, space)
 	if err != nil {
 		return err
 	}
@@ -675,15 +685,16 @@ func (s *Server) proxyImportVM(ctx context.Context, stream pb.LiteVirt_ImportVMS
 }
 
 // stageImportSource lands the source artifact under importDir and returns its
-// path. source_path (a file/dir already on THIS host) skips the upload; otherwise
+// path. serverPath (source_path, a file/dir already on THIS host, resolved and
+// judged by resolveStagedPath) skips the upload; otherwise
 // the streamed chunks (the first frame's included) are written to
 // importDir/source.
 //
 // Each chunk is reserved before it is written, so an upload larger than the
 // room left is refused as it arrives.
-func (s *Server) stageImportSource(ctx context.Context, chunks *importChunks, first *pb.ImportVMRequest, importDir string, space *importReservation) (string, error) {
-	if first.SourcePath != "" {
-		return s.resolveStagedPath(ctx, first.SourcePath)
+func (s *Server) stageImportSource(chunks *importChunks, serverPath, importDir string, space *importReservation) (string, error) {
+	if serverPath != "" {
+		return serverPath, nil
 	}
 
 	path := filepath.Join(importDir, "source")

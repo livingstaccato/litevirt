@@ -1,7 +1,6 @@
 package grpcapi
 
 import (
-	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -102,20 +101,18 @@ func (c *importChunks) Read(p []byte) (int, error) {
 
 // inspectOVASource describes an OVA for --inspect from its .ovf descriptor
 // alone. It reads the archive from where the import would — the upload, or
-// the --server-path file under the same path check — only up to the
+// the --server-path file (serverPath, resolved and judged by
+// resolveStagedPath before either reads it) — only up to the
 // descriptor, and writes nothing. ok is false for a source that is not an OVA
 // tar (a directory, a bare .ovf, a Proxmox or VMA source): the caller inspects
 // it the way it imports it, having consumed nothing.
-func (s *Server) inspectOVASource(ctx context.Context, first *pb.ImportVMRequest, chunks *importChunks) (fv *vmimport.ForeignVM, ok bool, err error) {
+func (s *Server) inspectOVASource(first *pb.ImportVMRequest, serverPath string, chunks *importChunks) (fv *vmimport.ForeignVM, ok bool, err error) {
 	var (
 		head []byte
 		r    io.Reader
 	)
-	if first.SourcePath != "" {
-		p, err := s.resolveStagedPath(ctx, first.SourcePath)
-		if err != nil {
-			return nil, false, err
-		}
+	if serverPath != "" {
+		p := serverPath
 		fi, err := os.Stat(p)
 		if err != nil || !fi.Mode().IsRegular() || strings.EqualFold(filepath.Ext(p), ".ovf") {
 			return nil, false, nil

@@ -129,7 +129,7 @@ func TestFleet_ImportInspectOVA_ForwardedUploadWritesNothing(t *testing.T) {
 // node (judged there by the bearer the entry relays), and no plan comes back.
 // The admin control gets the plan, so the file is one the preview reads.
 //
-// Mutation: resolve the path in inspectOVASource with a bare
+// Mutation: resolve the --server-path in ImportVM with a bare
 // filepath.EvalSymlinks (no containment) and the operator gets the plan.
 func TestFleet_ImportInspectOVA_ServerPathOutsideStagingRefused(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})

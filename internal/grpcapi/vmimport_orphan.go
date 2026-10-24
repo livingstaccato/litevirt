@@ -420,6 +420,19 @@ func namedForAnotherVM(vms []corrosion.VMRecord, ln, lb string) bool {
 	return false
 }
 
+// keptImportWayOut is what an import refused by kerr can do about it. Another
+// --name writes another path, which helps when kerr is about this path; not
+// when what kept overlays back on cannot be read (keptChainsUnknownError),
+// which holds every import and local create on the host whatever its name.
+func keptImportWayOut(kerr error, lead string) string {
+	var unknown *keptChainsUnknownError
+	if errors.As(kerr, &unknown) {
+		return " — no import here goes ahead, whatever its name, until that file reads; fix it as it says, " +
+			"or import into a pool on another host"
+	}
+	return lead + " — import under another --name"
+}
+
 // clearImportDiskName makes way for a converted disk at dst in pool. A file
 // there is an orphan — a crashed import's output, moved aside and kept — only
 // when nothing records it, nothing in flight may be creating it, nothing
@@ -435,8 +448,8 @@ func (s *Server) clearImportDiskName(ctx context.Context, pool, importName, impo
 	if errors.Is(err, fs.ErrNotExist) {
 		// Nothing there, but a kept overlay may name dst as its missing base:
 		// the imported disk would become it.
-		if kerr := s.keptMissingBaseRefusal(ctx, func(p string) bool { return filepath.Clean(p) == filepath.Clean(dst) }); kerr != nil {
-			return "", fmt.Errorf("disk %q would be written to %s: %v — import under another --name", disk, dst, kerr)
+		if kerr := s.keptMissingBaseRefusal(ctx, keptWritesOf(true, dst)); kerr != nil {
+			return "", fmt.Errorf("disk %q would be written to %s: %v%s", disk, dst, kerr, keptImportWayOut(kerr, ""))
 		}
 		return "", nil
 	}
@@ -450,9 +463,9 @@ func (s *Server) clearImportDiskName(ctx context.Context, pool, importName, impo
 	// A file a delete kept, or one a kept disk beside it backs on, is no
 	// orphan, whatever the database records: moved aside, a kept overlay
 	// would back on the imported disk.
-	if kerr := s.keptFileCreateRefusal(ctx, importName, []string{dst}, func(p string) bool { return filepath.Clean(p) == filepath.Clean(dst) }, false); kerr != nil {
-		return "", fmt.Errorf("disk %q would be written to %s, which already exists in the pool: %v; "+
-			"an import never replaces a file there — import under another --name", disk, dst, kerr)
+	if kerr := s.keptFileCreateRefusal(ctx, importName, []string{dst}, keptWritesOf(true, dst), false); kerr != nil {
+		return "", fmt.Errorf("disk %q would be written to %s, which already exists in the pool: %v%s", disk, dst, kerr,
+			keptImportWayOut(kerr, "; an import never replaces a file there"))
 	}
 	refs, err := s.importPathReferences(ctx, dst, fi)
 	if err != nil {

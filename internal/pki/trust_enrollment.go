@@ -113,6 +113,10 @@ func installHostEnrollment(ctx context.Context, dir string, m *HostEnrollment, r
 		return err
 	}
 	defer lock.release()
+	return installHostEnrollmentLocked(ctx, o, m, reinitialize, nil)
+}
+
+func installHostEnrollmentLocked(ctx context.Context, o *trustOwner, m *HostEnrollment, reinitialize bool, undo *HostEnrollmentUndo) (err error) {
 	if _, err := ValidateHostEnrollment(m.host, m.ca, m.cert, m.key); err != nil {
 		return err
 	}
@@ -184,6 +188,16 @@ func installHostEnrollment(ctx context.Context, dir string, m *HostEnrollment, r
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if previous != nil && !reinitialize {
+		if err := checkEnrollmentPrevious(o.dir, previous.SerialNumber.Text(16), oldCert, oldKey); err != nil {
+			return err
+		}
+	}
+	if undo != nil {
+		if err := undo.prepare(m, previous); err != nil {
+			return err
+		}
+	}
 	o.invalidateLocked()
 	if reinitialize {
 		o.retired = true
@@ -200,7 +214,10 @@ func installHostEnrollment(ctx context.Context, dir string, m *HostEnrollment, r
 	}
 	serial := m.leaf.SerialNumber.Text(16)
 	final := filepath.Join(hostDir(o.dir), serial)
-	if _, e := os.Stat(final); e == nil {
+	if fi, e := os.Lstat(final); e == nil {
+		if !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
+			return errors.New("retained enrollment candidate is not canonical")
+		}
 		cert, e := readBounded(filepath.Join(final, "host.crt"))
 		if e != nil {
 			return e
@@ -226,23 +243,31 @@ func installHostEnrollment(ctx context.Context, dir string, m *HostEnrollment, r
 		if err := writeTrustFile(filepath.Join(staging, "host.crt"), m.cert, 0644); err != nil {
 			return err
 		}
-		if err := os.Rename(staging, final); err != nil {
-			return err
-		}
-		if err := syncTrustDirectory(hostDir(o.dir)); err != nil {
+		if err := enrollmentStep(undo, enrollmentPlaceNew, func() error {
+			if err := os.Rename(staging, final); err != nil {
+				return err
+			}
+			return syncTrustDirectory(hostDir(o.dir))
+		}); err != nil {
 			return err
 		}
 	}
 	if previous != nil && !reinitialize {
-		if err := ensureLinkedLayout(o.dir, previous.SerialNumber.Text(16)); err != nil {
+		if err := ensureEnrollmentLinkedLayout(o.dir, previous.SerialNumber.Text(16), undo); err != nil {
 			return err
 		}
 	}
-	if err := switchCurrent(o.dir, serial); err != nil {
+	if err := enrollmentStep(undo, enrollmentSwitchNew, func() error { return switchCurrent(o.dir, serial) }); err != nil {
 		return err
 	}
 	for _, name := range []string{"host.key", "host.crt"} {
-		if err := atomicSymlink(filepath.Join(hostDirName, currentLinkName, name), filepath.Join(o.dir, name)); err != nil {
+		step := enrollmentLinkKey
+		if name == "host.crt" {
+			step = enrollmentLinkCert
+		}
+		if err := enrollmentStep(undo, step, func() error {
+			return atomicSymlink(filepath.Join(hostDirName, currentLinkName, name), filepath.Join(o.dir, name))
+		}); err != nil {
 			return err
 		}
 	}
@@ -258,7 +283,7 @@ func installHostEnrollment(ctx context.Context, dir string, m *HostEnrollment, r
 			return err
 		}
 	}
-	if err := writeTrustFile(filepath.Join(o.dir, "ca.crt"), m.ca, 0644); err != nil {
+	if err := enrollmentStep(undo, enrollmentWriteCA, func() error { return writeTrustFile(filepath.Join(o.dir, "ca.crt"), m.ca, 0644) }); err != nil {
 		return err
 	}
 	for _, item := range []struct {

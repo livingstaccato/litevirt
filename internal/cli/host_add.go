@@ -2083,3 +2083,32 @@ func moreFollows(lines []string) bool {
 	}
 	return false
 }
+
+// enrollmentExecCmd is deliberately uncalled by the public workflow. Unlike
+// cmd, this replaces the very shell owning fd9; no parent retains the claim
+// after the helper explicitly closes it. Only the existing staged helper route
+// is accepted, never an arbitrary command or argument string.
+func (m machineClaim) enrollmentExecCmd(helperPath string) (string, error) {
+	const prefix = "/var/tmp/litevirt-enrollment."
+	const tail = "/litevirt"
+	if m.r == nil || m.mine == "" || !strings.HasPrefix(helperPath, prefix) || !strings.HasSuffix(helperPath, tail) {
+		return "", fmt.Errorf("staged enrollment helper required")
+	}
+	suffix := strings.TrimSuffix(strings.TrimPrefix(helperPath, prefix), tail)
+	if len(suffix) != 10 {
+		return "", fmt.Errorf("invalid staged enrollment helper suffix")
+	}
+	for _, c := range suffix {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9') {
+			return "", fmt.Errorf("invalid staged enrollment helper suffix")
+		}
+	}
+	lock := ssh.ShellQuote(m.r.Path(addLock))
+	return fmt.Sprintf("command -v flock >/dev/null 2>&1 || { echo 'flock(1) is not installed on the host; "+
+		"lv host add does not change the machine without its lock' >&2; exit 98; }; "+
+		"mkdir -p -- %s || exit 1; exec 9>>%s || exit 1; "+
+		"flock -w %d 9 || { echo 'another command holds the add lock %s' >&2; exit 96; }; "+
+		"if %s; then exec %s host-enroll; else echo 'this add no longer holds the machine: %s records another' >&2; exit %d; fi",
+		ssh.ShellQuote(filepath.Dir(m.r.Path(addLock))), lock, addLockWait, addLock,
+		m.holds(markerIs(m.r, m.mine)), ssh.ShellQuote(m.r.Path(helperPath)), addInstalledMarker, notOurMachine), nil
+}

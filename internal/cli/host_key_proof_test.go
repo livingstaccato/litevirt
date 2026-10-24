@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -190,5 +191,55 @@ func TestKeyProof_SignsADomainSeparatedChallenge(t *testing.T) {
 	got := string(mustRead(t, in))
 	if !strings.HasPrefix(got, "litevirt-host-add-proof-v1:") || len(got) != len("litevirt-host-add-proof-v1:")+64 {
 		t.Fatalf("signed %q, want the domain prefix and a 32-byte hex nonce", got)
+	}
+}
+
+// A target with no `timeout` binary drops the remote bound, so a hung
+// openssl must still be ended by the client's own deadline. The proof
+// refuses (the connection is not trusted to answer a key read either); it
+// never waits forever.
+//
+// Mutation: run the command with no client-side deadline — the challenge
+// blocks on the 30s sleep past the test's limit, red.
+func TestKeyProof_NoTimeoutBinaryStillBoundedByClientDeadline(t *testing.T) {
+	f := newAddFixture(t)
+	crt := parseCerts(f.before["host.crt"])[0]
+	bin := t.TempDir()
+	for _, tool := range []string{"sh", "base64", "tr", "printf", "sleep"} {
+		p, err := exec.LookPath(tool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(p, filepath.Join(bin, tool)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin)
+	if _, err := exec.LookPath("timeout"); err == nil {
+		t.Fatal("the fake target must have no timeout")
+	}
+	stubOpenSSL(t, `exec sleep 30`)
+	old := keyProofDeadline
+	keyProofDeadline = 500 * time.Millisecond
+	t.Cleanup(func() { keyProofDeadline = old })
+
+	start := time.Now()
+	done := make(chan struct{})
+	var proved bool
+	var err error
+	go func() {
+		defer close(done)
+		proved, err = signedChallenge(f.target, "/etc/litevirt/pki/host.key", crt)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the proof was not bounded without a remote timeout")
+	}
+	if proved || err == nil || !strings.Contains(err.Error(), "deadline") {
+		t.Fatalf("proved %v, %v; want a refusal naming the deadline", proved, err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("took %v", d)
 	}
 }

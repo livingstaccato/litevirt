@@ -24,7 +24,24 @@ import (
 // row says. So every delete or prune of a replica asks this as well as the
 // rows. A row or a header that cannot be read is an error, and the caller
 // keeps the file.
+//
+// A removal it holds because a header or a row cannot be read is named by
+// replica_removal_held (replicaHoldState): an unreadable disk in the pool
+// holds every replica removal there, and the replicas pile up.
 func (s *Server) replicaChainUser(ctx context.Context, path, poolDir string, vms ...string) (string, error) {
+	user, hold, err := s.replicaChainWalk(ctx, path, poolDir, vms...)
+	switch {
+	case err != nil:
+		s.replicaHolds.held(ctx, s, poolDir, path, firstNonEmpty(vms...), hold, err)
+	case user == "":
+		s.replicaHolds.cleared(ctx, s, poolDir, vms)
+	}
+	return user, err
+}
+
+// replicaChainWalk is replicaChainUser's judgement. On an error, hold is the
+// disk whose header could not be read ("" when the rows could not be).
+func (s *Server) replicaChainWalk(ctx context.Context, path, poolDir string, vms ...string) (user string, hold corrosion.DiskRecord, err error) {
 	target := filepath.Clean(path)
 	resolved, rerr := filepath.EvalSymlinks(target)
 	if rerr != nil {
@@ -58,7 +75,7 @@ func (s *Server) replicaChainUser(ctx context.Context, path, poolDir string, vms
 		}
 		ds, err := corrosion.GetVMDisks(ctx, s.db, vm)
 		if err != nil {
-			return "", fmt.Errorf("read the disks of VM %s: %w", vm, err)
+			return "", hold, fmt.Errorf("read the disks of VM %s: %w", vm, err)
 		}
 		add(ds)
 	}
@@ -67,7 +84,7 @@ func (s *Server) replicaChainUser(ctx context.Context, path, poolDir string, vms
 		for prefix := range prefixes {
 			ds, err := corrosion.LiveVMDisksWithPathPrefix(ctx, s.db, prefix+string(filepath.Separator))
 			if err != nil {
-				return "", fmt.Errorf("read the disks in %s: %w", poolDir, err)
+				return "", hold, fmt.Errorf("read the disks in %s: %w", poolDir, err)
 			}
 			add(ds)
 		}
@@ -78,13 +95,23 @@ func (s *Server) replicaChainUser(ctx context.Context, path, poolDir string, vms
 			return qcow2ChainReaches(file, target, true, same)
 		})
 		if err != nil {
-			return "", fmt.Errorf("read the backing chain of VM %s disk %s: %w", d.VMName, d.DiskName, err)
+			d.Path = file
+			return "", d, fmt.Errorf("read the backing chain of VM %s disk %s: %w", d.VMName, d.DiskName, err)
 		}
 		if reached {
-			return fmt.Sprintf("VM %q disk %q", d.VMName, d.DiskName), nil
+			return fmt.Sprintf("VM %q disk %q", d.VMName, d.DiskName), hold, nil
 		}
 	}
-	return "", nil
+	return "", hold, nil
+}
+
+func firstNonEmpty(vs ...string) string {
+	for _, v := range vs {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // refuseReplicaAChainReads is a pool content delete's refusal of the file at

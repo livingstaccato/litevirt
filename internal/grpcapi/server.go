@@ -43,6 +43,8 @@ import (
 type Server struct {
 	// reseeding admits one local reseed at a time; see reseed_singleflight.go.
 	reseeding reseedInFlight
+	// replicaHolds is what replica_removal_held names (replica_hold.go).
+	replicaHolds replicaHoldState
 	pb.UnimplementedLiteVirtServer
 
 	// consoleSessions groups a SPICE client's channels into one audited

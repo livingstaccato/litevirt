@@ -283,11 +283,12 @@ fallback.
 
 ## Traps
 
-- **`lv host init --local` bakes a `127.0.0.1`-only certificate SAN.** Peers can
-  never dial that node. For anything multi-node use the remote form
-  (`lv host init root@<ip>`), which puts the real address in the SAN. A node
-  cannot init *itself* remotely — the binary push becomes a same-file copy and
-  fails; run it from another node.
+- **`lv host init --local` puts the default-route source IP in the certificate
+  SAN** (plus loopback) unless `--address <ip>` says otherwise. On a multi-homed
+  host that guess is wrong and peers fail TLS verification, so pass `--address`
+  with the same IP you set as `advertise_address`. A node cannot init *itself*
+  remotely — the binary push becomes a same-file copy and fails; use `--local`
+  on it, or run the remote form (`lv host init root@<ip>`) from another node.
 - **Set `advertise_address` on any multi-homed host.** Auto-detection uses two
   different heuristics — default-route source IP for the host record, first
   private IP by interface enumeration order for gossip — which can disagree with

@@ -23,6 +23,11 @@ func Info(path string) (*ImageInfo, error) {
 		return nil, err
 	}
 	defer f.Close()
+	return InfoFile(f)
+}
+
+// InfoFile observes the caller-held original descriptor; it never reopens its path.
+func InfoFile(f *os.File) (*ImageInfo, error) {
 
 	h, err := readHeader(f)
 	if err != nil {

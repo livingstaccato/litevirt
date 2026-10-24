@@ -208,16 +208,25 @@ func createImage(path, backingPath, backingFormat string, sizeBytes uint64, opts
 	// of one path never share it and nothing can be planted there; it is
 	// still created exclusively without following a final symlink.
 	tmpPath := tempSibling(path)
-	// Owner-only from its first byte: a disk is a guest's data, and qemu opens
-	// it as its owner once libvirt has labelled it (internal/diskmode).
-	f, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, diskmode.File)
-	if err != nil {
-		return fmt.Errorf("create file: %w", err)
+	var owned *artifactCreation
+	var f *os.File
+	if opts != nil && opts.Artifact != nil {
+		owned, err = openArtifactCreation(path, *opts.Artifact)
+		if err != nil {
+			return err
+		}
+		f, tmpPath = owned.file, owned.file.Name()
+		defer owned.closeResult(&err)
+	} else {
+		f, err = os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, diskmode.File)
+		if err != nil {
+			return fmt.Errorf("create file: %w", err)
+		}
 	}
 	committed := false
 	defer func() {
-		if !committed {
-			f.Close() // may double-close after the explicit Close below — harmless
+		if owned == nil && !committed {
+			f.Close()
 			os.Remove(tmpPath)
 		}
 	}()
@@ -297,6 +306,10 @@ func createImage(path, backingPath, backingFormat string, sizeBytes uint64, opts
 	l1Table := make([]byte, l1Clusters*clusterSize)
 	if _, err = f.WriteAt(l1Table, int64(l1Offset)); err != nil {
 		return fmt.Errorf("write L1 table: %w", err)
+	}
+
+	if owned != nil {
+		return owned.publish()
 	}
 
 	if err = f.Sync(); err != nil {

@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,6 +16,20 @@ import (
 	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/vfio"
 )
+
+// nvidiaDriverFS is pciBindFakeFS in which a device not yet bound to
+// vfio-pci is on the nvidia driver, where MIG workloads run.
+type nvidiaDriverFS struct{ *pciBindFakeFS }
+
+func newNvidiaDriverFS() *nvidiaDriverFS { return &nvidiaDriverFS{newPCIBindFakeFS()} }
+
+func (f *nvidiaDriverFS) Readlink(path string) (string, error) {
+	link, err := f.pciBindFakeFS.Readlink(path)
+	if errors.Is(err, os.ErrNotExist) && strings.HasSuffix(path, "/driver") {
+		return "/sys/bus/pci/drivers/nvidia", nil
+	}
+	return link, err
+}
 
 // migFakeSMI installs a fake nvidia-smi that answers --query-gpu with gpus
 // (CSV rows) and `mig -lgi` with lgi, exiting lgiRC; any other call fails.
@@ -90,7 +105,7 @@ func TestAcquireDeviceLeases_NeverBindsAGPUThatMIGHolds(t *testing.T) {
 		t.Run(sc.name, func(t *testing.T) {
 			s := hotplugDiskServer(t)
 			enableHardwareV2(t, s)
-			fs := newPCIBindFakeFS()
+			fs := newNvidiaDriverFS()
 			defer vfio.SetFS(fs)()
 			ctx := adminCtx()
 			seedPCIGPU(t, s, "0000:41:00.0", -1)
@@ -133,7 +148,7 @@ func TestAcquireDeviceLeases_NeverBindsAGPUThatMIGHolds(t *testing.T) {
 func TestAcquireDeviceLeases_MIGRefusalNamesTheReclaim(t *testing.T) {
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
-	defer vfio.SetFS(newPCIBindFakeFS())()
+	defer vfio.SetFS(newNvidiaDriverFS())()
 	seedPCIGPU(t, s, "0000:41:00.0", -1)
 	migFakeSMI(t, "3, 00000000:41:00.0, Enabled, Enabled, NVIDIA A100\n", strings.ReplaceAll(lgiTwoOnGPU0, "|   0  MIG", "|   3  MIG"), 0)
 	_, _, err := s.acquireDeviceLeases(adminCtx(), "vm1", []ResolvedMember{{Address: "0000:41:00.0"}}, deviceLeaseStageBound, nil)
@@ -149,7 +164,7 @@ func TestAcquireDeviceLeases_MIGRefusalNamesTheReclaim(t *testing.T) {
 func TestAcquireDeviceLeases_NonNVIDIADeviceIsNotChecked(t *testing.T) {
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
-	fs := newPCIBindFakeFS()
+	fs := newNvidiaDriverFS()
 	defer vfio.SetFS(fs)()
 	ctx := adminCtx()
 	if err := corrosion.UpsertPCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
@@ -176,7 +191,7 @@ func TestAcquireDeviceLeases_NonNVIDIADeviceIsNotChecked(t *testing.T) {
 func TestAttachDevice_RunningPCIRefusesAGPUThatMIGHolds(t *testing.T) {
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
-	fs := newPCIBindFakeFS()
+	fs := newNvidiaDriverFS()
 	defer vfio.SetFS(fs)()
 	ctx := adminCtx()
 	seedNICVM(t, s, "vm1", "running")
@@ -206,7 +221,7 @@ func TestAttachDevice_RunningPCIRefusesAGPUThatMIGHolds(t *testing.T) {
 func TestAttachDevice_TypeSelectorSkipsAGPUThatMIGHolds(t *testing.T) {
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
-	fs := newPCIBindFakeFS()
+	fs := newNvidiaDriverFS()
 	defer vfio.SetFS(fs)()
 	ctx := adminCtx()
 	seedNICVM(t, s, "vm1", "running")
@@ -227,5 +242,28 @@ func TestAttachDevice_TypeSelectorSkipsAGPUThatMIGHolds(t *testing.T) {
 	}
 	if o := pciOwnerOf(t, ctx, s, "0000:42:00.0"); o != "vm1" {
 		t.Fatalf("the free GPU is owned by %q, want vm1", o)
+	}
+}
+
+// A GPU on no driver runs no MIG workload: it is bound even when nvidia-smi
+// is installed and fails because the NVIDIA driver is not loaded.
+func TestAcquireDeviceLeases_GPUOnNoDriverIsBoundWhateverNvidiaSMISays(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	fs := newPCIBindFakeFS() // unbound devices are on no driver
+	defer vfio.SetFS(fs)()
+	ctx := adminCtx()
+	seedPCIGPU(t, s, "0000:41:00.0", -1)
+	log := migFakeSMIScript(t, "echo 'NVIDIA-SMI has failed because it could not communicate with the NVIDIA driver.'\nexit 9\n")
+	finish, _, err := s.acquireDeviceLeases(ctx, "vm1", []ResolvedMember{{Address: "0000:41:00.0"}}, deviceLeaseStageBound, nil)
+	if err != nil {
+		t.Fatalf("acquire of a GPU on no driver: %v", err)
+	}
+	finish()
+	if fs.binds != 1 || pciOwnerOf(t, ctx, s, "0000:41:00.0") != "vm1" {
+		t.Fatalf("binds = %d, owner = %q; want it bound and owned by vm1", fs.binds, pciOwnerOf(t, ctx, s, "0000:41:00.0"))
+	}
+	if _, err := os.Stat(log); err == nil {
+		t.Fatal("nvidia-smi ran for a GPU on no driver")
 	}
 }

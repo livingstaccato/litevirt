@@ -102,7 +102,7 @@ func TestMIGHold_NoNvidiaSMIIsAllowed(t *testing.T) {
 		t.Fatalf("Hold = %v, want nil with no nvidia-smi", err)
 	}
 	defer SetNvidiaSMI("litevirt-no-such-nvidia-smi")()
-	if err := hold(t, "10de", ""); err != nil {
+	if err := hold(t, "10de", "nvidia"); err != nil {
 		t.Fatalf("Hold = %v, want nil with no nvidia-smi on PATH", err)
 	}
 }
@@ -128,8 +128,26 @@ func TestMIGHold_UnlistedGPUOnNvidiaDriverIsRefused(t *testing.T) {
 	if err := hold(t, "10de", "nvidia"); err == nil {
 		t.Fatal("a GPU the nvidia driver holds but nvidia-smi does not list must be refused")
 	}
-	if err := hold(t, "10de", ""); err != nil {
-		t.Fatalf("a GPU on no driver cannot be in MIG use, Hold = %v", err)
+}
+
+// A GPU on no driver, or on a driver other than NVIDIA's, runs no MIG
+// workload: it is not refused even when nvidia-smi is installed and fails
+// (the NVIDIA driver is not loaded), and nvidia-smi is not run for it.
+func TestMIGHold_GPUOffTheNvidiaDriverIsNotJudged(t *testing.T) {
+	log := fakeSMI(t, "echo 'NVIDIA-SMI has failed because it could not communicate with the NVIDIA driver.'\nexit 9\n")
+	for _, drv := range []string{"", "nouveau"} {
+		if err := hold(t, "10de", drv); err != nil {
+			t.Fatalf("driver %q: Hold = %v, want nil", drv, err)
+		}
+	}
+	if c := calls(t, log); len(c) != 0 {
+		t.Fatalf("nvidia-smi ran for a GPU off the nvidia driver: %v", c)
+	}
+	// The same nvidia-smi refuses a GPU on the nvidia driver or a variant of it.
+	for _, drv := range []string{"nvidia", "nvidia_vgpu_vfio"} {
+		if err := hold(t, "10de", drv); err == nil {
+			t.Fatalf("driver %q with a failing nvidia-smi: Hold = nil, want a refusal", drv)
+		}
 	}
 }
 

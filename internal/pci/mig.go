@@ -281,12 +281,13 @@ func (st *MIGState) load() {
 
 // Hold returns why the device at address (vendor as the PCI scan records
 // it, driver the one it is bound to now) must not be rebound to vfio-pci for
-// passthrough, or nil when it may be. Only an NVIDIA GPU on a driver other
-// than vfio-pci is checked: one already on vfio-pci is not rebound, and
-// nvidia-smi does not see it. A *MIGBusyError means MIG holds it; any other
-// error means its MIG state could not be read, and the caller refuses too.
+// passthrough, or nil when it may be. Only an NVIDIA GPU on the NVIDIA driver
+// is checked: MIG workloads run only there, so a GPU on vfio-pci, on no
+// driver or on any other driver has none to lose (and nvidia-smi does not see
+// it). A *MIGBusyError means MIG holds it; any other error means its MIG
+// state could not be read, and the caller refuses too.
 func (st *MIGState) Hold(address, vendor, driver string) error {
-	if strings.TrimPrefix(strings.ToLower(vendor), "0x") != nvidiaVendorID || driver == "vfio-pci" {
+	if strings.TrimPrefix(strings.ToLower(vendor), "0x") != nvidiaVendorID || !isNvidiaDriver(driver) {
 		return nil
 	}
 	st.load()
@@ -317,13 +318,15 @@ func (st *MIGState) Hold(address, vendor, driver string) error {
 		}
 		return nil
 	}
-	// nvidia-smi lists every GPU the NVIDIA driver holds. One it holds that
-	// nvidia-smi does not list has an unknown MIG state; one on any other
-	// driver (or none) cannot be in MIG mode.
-	if driver == "nvidia" {
-		return fmt.Errorf("cannot read the MIG state of GPU %s: it is on the nvidia driver but nvidia-smi does not list it", address)
-	}
-	return nil
+	// nvidia-smi lists every GPU the NVIDIA driver holds, so this one's MIG
+	// state is unknown.
+	return fmt.Errorf("cannot read the MIG state of GPU %s: it is on the %s driver but nvidia-smi does not list it", address, driver)
+}
+
+// isNvidiaDriver reports whether driver is NVIDIA's kernel driver ("nvidia",
+// or one of its "nvidia_*" variants).
+func isNvidiaDriver(driver string) bool {
+	return driver == "nvidia" || strings.HasPrefix(driver, "nvidia_")
 }
 
 // normalizeBusID maps nvidia-smi's "00000000:36:00.0" and sysfs's

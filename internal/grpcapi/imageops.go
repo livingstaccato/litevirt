@@ -542,7 +542,18 @@ func (s *Server) BuildImage(ctx context.Context, req *pb.BuildImageRequest) (*pb
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "image from VM %q: %v", req.VmName, err)
 	}
-	if err := qcow2.ConvertConfined(ctx, srcDisk.Path, destPath, nil, onlyAccepted(accepted)); err != nil {
+	// The top layer is read beneath its directory held open by descriptor,
+	// with no link followed at the file (heldConvertSource, NoFollowSource):
+	// a link put at the disk, or a directory on the way swapped for one after
+	// the checks above, is refused, never followed to another file.
+	src, release, err := s.heldConvertSource(srcDisk.Path, false)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "image from VM %q: %v", req.VmName, err)
+	}
+	runConvertSourceHook(srcDisk.Path)
+	err = qcow2.ConvertConfined(ctx, src, destPath, &qcow2.Options{NoFollowSource: true}, onlyAccepted(accepted))
+	release()
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "convert image: %v", err)
 	}
 

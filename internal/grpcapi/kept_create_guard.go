@@ -449,9 +449,9 @@ var errKeptScanPoolsUnread = errors.New("this host's storage pools cannot be rea
 // and each kept-disks.json entry of this host still held in memory. A
 // symlink below a directory it lists is followed (keptScanFollow): a
 // directory it names is listed once, by its resolved path, and a file it
-// names is read; one that cannot be followed is an error. It returns how the first
-// file that is, or backs on, a path in writes (compared as
-// the missing-base check compares: each side with its directory resolved
+// names is read; one that cannot be followed is an error. It returns how
+// the first file that is, or backs on, a path in writes (compared as the
+// missing-base check compares: each side with its directory resolved
 // through symlinks) collides, or "" when none does; a directory, a pool row
 // or a chain that cannot be read, or a path whose comparison cannot be told,
 // is an error, naming it. A nil writes writes nothing, and the scan only
@@ -462,10 +462,11 @@ var errKeptScanPoolsUnread = errors.New("this host's storage pools cannot be rea
 // directory, the disk store's, a pool's directory (named by the pool's row
 // or config, usable for writes or not, or the default places under
 // <data_dir>/pools and <data_dir>/mounts), or at a path the note or the
-// registry entry of its keep names. What is not covered is a kept overlay
-// outside every one of those directories that only the unreadable registry
-// names (a restore to an admin's --target-path elsewhere, kept by a later
-// delete, with its note gone).
+// registry entry of its keep names; every registry entry of this host is
+// noted too (keptDisksNote.Recorded), so a restart while the registry cannot
+// be read loses none of them. What is not covered is a kept overlay outside
+// every one of those directories whose note is gone, or that an older build
+// recorded in the registry alone.
 func (s *Server) keptCollisionScan(ctx context.Context, writes *keptWrites) (string, error) {
 	var files []string
 	seen := map[string]bool{}
@@ -519,7 +520,7 @@ func (s *Server) keptCollisionScan(ctx context.Context, writes *keptWrites) (str
 			}
 		}
 	}
-	noted, err := health.KeptNotedFiles(s.dataDir)
+	noted, err := health.KeptScanFiles(s.dataDir)
 	if err != nil {
 		return "", fmt.Errorf("this host's notes of the disks deletes kept cannot be read (%w)", err)
 	}

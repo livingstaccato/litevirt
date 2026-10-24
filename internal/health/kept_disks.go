@@ -25,7 +25,8 @@ import (
 // clears <vm>-*.qcow2, and moves a noted disk to <path>.kept-<time>
 // (SetAsideBeforeCreate). It is the host's own and never replicated, so it
 // outlasts the tombstone and the record a create elsewhere or the condition
-// retention removes.
+// retention removes. Every file a kept-disks.json entry of the host names is
+// in it too, apart (Recorded), for the scan of the host's disk files alone.
 
 var keptDisksMu sync.Mutex
 
@@ -44,6 +45,13 @@ type keptDisksNote struct {
 	// name rather than removing it. A create of the name refuses while one
 	// is at its path (SetAsideBeforeCreate): moving it breaks the chain.
 	Under []string `json:"under,omitempty"`
+	// Recorded: the files a kept-disks.json entry of this host names
+	// (grpcapi's recordKeptDisks: every disk a delete kept, a removal that
+	// failed included), noted so that while kept-disks.json cannot be read,
+	// even after a restart, the scan of the disk files on this host still
+	// reads each one wherever it is (KeptScanFiles). Nothing holds or moves
+	// a file for being here alone: a failed removal's retry still frees it.
+	Recorded []string `json:"recorded,omitempty"`
 }
 
 // KeptDisksNoteError is a note of the disks deletes kept on this host that
@@ -84,7 +92,7 @@ func keptNoteOf(dataDir, name string) (keptDisksNote, error) {
 	if err := json.Unmarshal(b, &n); err != nil {
 		return keptDisksNote{}, &KeptDisksNoteError{File: f, Err: err}
 	}
-	for _, l := range [][]string{n.Paths, n.Under} {
+	for _, l := range [][]string{n.Paths, n.Under, n.Recorded} {
 		for i, p := range l {
 			l[i] = filepath.Clean(p)
 		}
@@ -125,6 +133,44 @@ func noteKept(dataDir, name string, paths []string, under bool) error {
 	return writeKeptDisks(dataDir, name, n)
 }
 
+// NoteKeptRecorded adds paths to name's note here as files a kept-disks.json
+// entry names (keptDisksNote.Recorded).
+func NoteKeptRecorded(dataDir, name string, paths []string) error {
+	if dataDir == "" || len(paths) == 0 {
+		return nil
+	}
+	keptDisksMu.Lock()
+	defer keptDisksMu.Unlock()
+	n, err := keptNoteOf(dataDir, name)
+	if err != nil {
+		return err
+	}
+	for _, p := range paths {
+		if p = filepath.Clean(p); !slices.Contains(n.Recorded, p) {
+			n.Recorded = append(n.Recorded, p)
+		}
+	}
+	return writeKeptDisks(dataDir, name, n)
+}
+
+// ForgetKeptRecorded drops paths from name's note here as files a
+// kept-disks.json entry names, and the note once it is empty.
+func ForgetKeptRecorded(dataDir, name string, paths []string) error {
+	if dataDir == "" || len(paths) == 0 {
+		return nil
+	}
+	keptDisksMu.Lock()
+	defer keptDisksMu.Unlock()
+	n, err := keptNoteOf(dataDir, name)
+	if err != nil || len(n.Recorded) == 0 {
+		return err
+	}
+	n.Recorded = slices.DeleteFunc(n.Recorded, func(p string) bool {
+		return slices.ContainsFunc(paths, func(q string) bool { return filepath.Clean(q) == p })
+	})
+	return writeKeptDisks(dataDir, name, n)
+}
+
 // forgetKeptDisks drops paths from name's note here, and the note once it is
 // empty.
 func forgetKeptDisks(dataDir, name string, paths []string) error {
@@ -134,7 +180,7 @@ func forgetKeptDisks(dataDir, name string, paths []string) error {
 	keptDisksMu.Lock()
 	defer keptDisksMu.Unlock()
 	n, err := keptNoteOf(dataDir, name)
-	if err != nil || len(n.Paths) == 0 {
+	if err != nil || len(n.Paths) == 0 && len(n.Recorded) == 0 {
 		return err
 	}
 	gone := func(p string) bool {
@@ -142,6 +188,7 @@ func forgetKeptDisks(dataDir, name string, paths []string) error {
 	}
 	n.Paths = slices.DeleteFunc(n.Paths, gone)
 	n.Under = slices.DeleteFunc(n.Under, gone)
+	n.Recorded = slices.DeleteFunc(n.Recorded, gone)
 	return writeKeptDisks(dataDir, name, n)
 }
 
@@ -150,7 +197,7 @@ func writeKeptDisks(dataDir, name string, n keptDisksNote) error {
 	if err != nil {
 		return err
 	}
-	if len(n.Paths) == 0 {
+	if len(n.Paths) == 0 && len(n.Recorded) == 0 {
 		if err := os.Remove(f); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
@@ -192,6 +239,17 @@ func writeKeptDisks(dataDir, name string, n keptDisksNote) error {
 // cannot be listed, is an error: a caller about to remove a disk file then
 // keeps it.
 func KeptNotedFiles(dataDir string) (map[string]string, error) {
+	return keptNoteFiles(dataDir, false)
+}
+
+// KeptScanFiles is KeptNotedFiles and every file a kept-disks.json entry of
+// this host names (keptDisksNote.Recorded): every file a delete on this
+// host kept, for a scan that cannot read kept-disks.json.
+func KeptScanFiles(dataDir string) (map[string]string, error) {
+	return keptNoteFiles(dataDir, true)
+}
+
+func keptNoteFiles(dataDir string, recorded bool) (map[string]string, error) {
 	out := map[string]string{}
 	if dataDir == "" {
 		return out, nil
@@ -218,7 +276,11 @@ func KeptNotedFiles(dataDir string) (map[string]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		for _, l := range [][]string{n.Paths, n.Under} {
+		lists := [][]string{n.Paths, n.Under}
+		if recorded {
+			lists = append(lists, n.Recorded)
+		}
+		for _, l := range lists {
 			for _, p := range l {
 				out[p] = name
 			}

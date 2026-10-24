@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"google.golang.org/grpc/metadata"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // Disk files a VM delete kept (lab 2 F-5). A delete never removes a disk it
@@ -27,7 +29,10 @@ import (
 //   - in the delete's response (KeptDiskMD), which `lv rm` prints;
 //   - by an audit entry and a vm.disk_kept event of the VM;
 //   - on this host, in <data_dir>/kept-disks.json (a restart keeps it), and by
-//     disk_leftover, with the reason and what to check — never a removal.
+//     disk_leftover, with the reason and what to check — never a removal;
+//     and its file in <data_dir>/kept-disks/<vm>.json as one recorded here
+//     (health.NoteKeptRecorded), which the scan of this host's disk files
+//     reads while kept-disks.json cannot be (keptCollisionScan).
 //
 // A kept file is forgotten once it is gone (an operator removed it, or a
 // retried delete did), and is not named while a VM's disk names its path.
@@ -234,6 +239,14 @@ func (s *Server) recordKeptDisks(ctx context.Context, vmName string, kept []Kept
 		s.diskKept.unsavedKey[key] = true
 	}
 	s.saveDiskKeptLocked()
+	// Noted too, under the same lock as judgeKeptDisks forgets one: while
+	// kept-disks.json cannot be read after a restart, the notes are what the
+	// scan of this host's disk files still reads (keptCollisionScan), and a
+	// kept disk outside every directory it lists is found by them alone.
+	if err := health.NoteKeptRecorded(s.dataDir, vmName, s.keptRecordedFiles(kept)); err != nil {
+		slog.Warn("delete: the disks a delete kept were not noted; while kept-disks.json cannot be read after a restart, "+
+			"the scan of this host's disk files does not see one outside the directories it lists", "vm", vmName, "error", err)
+	}
 	s.diskKept.mu.Unlock()
 	for _, k := range kept {
 		detail := fmt.Sprintf("kept disk %s (%s on %s): %s; named by %s", k.Disk, k.Path, k.Host, k.Reason, condDiskLeftover)
@@ -242,6 +255,21 @@ func (s *Server) recordKeptDisks(ctx context.Context, vmName string, kept []Kept
 		s.audit(ctx, "vm.delete", vmName, detail, "ok")
 		s.recordVMEventSeverity(ctx, vmName, "vm.disk_kept", "ok", "warn", detail)
 	}
+}
+
+// keptRecordedFiles is this host's files of kept, as the scan of its disk
+// files reads them: not one on another host, nor a ceph image.
+func (s *Server) keptRecordedFiles(kept []KeptDisk) []string {
+	var out []string
+	for _, k := range kept {
+		if k.Host != s.hostName || k.Path == "" || strings.HasPrefix(k.Path, "rbd:") {
+			continue
+		}
+		if p := filepath.Clean(s.hostDiskFile(k.Path)); filepath.IsAbs(p) {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // setKeptDiskHeader names the kept disks in the delete's response header.
@@ -317,6 +345,9 @@ func (s *Server) judgeKeptDisks(ctx context.Context) {
 				if cur, ok := m[diskKeptKey(r.Host, r.Path)]; ok && cur == r {
 					delete(m, diskKeptKey(r.Host, r.Path))
 					s.saveDiskKeptLocked()
+					if err := health.ForgetKeptRecorded(s.dataDir, r.VM, s.keptRecordedFiles([]KeptDisk{r.KeptDisk})); err != nil {
+						slog.Warn("delete: a gone kept disk's note was not dropped", "path", r.Path, "error", err)
+					}
 				}
 				s.diskKept.mu.Unlock()
 				slog.Info("delete: a disk a VM delete kept is gone", "path", r.Path)

@@ -19,7 +19,7 @@ import (
 // history (the durable, replicated vm_events table) seeded server-side, with a
 // live SSE tail that prepends new events as they happen. This is the single
 // global event view — the VM detail page shows the same events filtered to one
-// VM. (/activity redirects here for back-compat.)
+// VM.
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	limit := 200
 	if v, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && v > 0 {

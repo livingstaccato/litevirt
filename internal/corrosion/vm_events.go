@@ -82,7 +82,7 @@ func ListVMEventsWindow(ctx context.Context, c *Client, vmName string, limit int
 	if limit > 1000 {
 		limit = 1000
 	}
-	// Empty vmName = cluster-wide (the /activity log); a name filters to one VM.
+	// Empty vmName = cluster-wide (the /events page); a name filters to one VM.
 	sql := `SELECT id, vm_name, host_name, type, result, severity, detail, username, ts
 		FROM vm_events`
 	var args []interface{}

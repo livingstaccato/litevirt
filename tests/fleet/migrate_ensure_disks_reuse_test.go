@@ -4,7 +4,9 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/grpcapi"
@@ -53,5 +55,51 @@ func TestFleet_EnsureDisksDoesNotReuseALinkAsItsStub(t *testing.T) {
 	}
 	if after, _ := os.Stat(other); after == nil || before == nil || !os.SameFile(before, after) {
 		t.Errorf("the other tenant's image was replaced")
+	}
+}
+
+// An earlier stub of this VM replaced by a FIFO does not hang EnsureDisks:
+// the reuse check is a regular file by Lstat before anything reads the image,
+// and the read goes through a descriptor opened non-blocking with no link
+// followed. The FIFO is replaced by a stub of its own. (Re-review 5b, R5b-2.)
+//
+// Mutation: call qcow2.Info by name before the IsRegular check again - the
+// RPC blocks in the FIFO's open and this is red.
+func TestFleet_EnsureDisksDoesNotHangOnAFIFOAtItsStub(t *testing.T) {
+	o := newOwnPoolScenario(t, "sub")
+	o.dst.Server.SetStoragePoolsByName(map[string]grpcapi.StoragePoolRef{"nfs1": {Driver: "dir", Target: o.nfs}})
+	sub := filepath.Join(o.nfs, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stub := filepath.Join(sub, "stub")
+	peer := o.c.PeerClient(o.src, o.dst)
+	req := &pb.EnsureDisksRequest{VmName: "fp1", Disks: []*pb.DiskStub{{Path: stub, SizeBytes: 1 << 20}}}
+	if _, err := peer.EnsureDisks(context.Background(), req); err != nil {
+		t.Fatalf("EnsureDisks 1: %v", err)
+	}
+	if err := os.Remove(stub); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(stub, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Whatever happens, release a reader blocked in the FIFO's open, so a red
+	// run fails rather than hanging the harness's teardown.
+	defer func() {
+		if w, err := os.OpenFile(stub, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+			w.Close()
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := peer.EnsureDisks(ctx, req); err != nil {
+		if ctx.Err() != nil {
+			t.Fatalf("EnsureDisks blocked on a FIFO at its stub's name: %v", err)
+		}
+		t.Fatalf("EnsureDisks 2: %v", err)
+	}
+	if fi, err := os.Lstat(stub); err != nil || !fi.Mode().IsRegular() {
+		t.Errorf("the stub is not a regular file after EnsureDisks (%v, %v)", fi, err)
 	}
 }

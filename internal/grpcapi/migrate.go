@@ -1849,9 +1849,14 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 				// above). Reuse it at the size asked for now: the mirror needs the
 				// sizes to agree, and a stub holds nothing worth keeping. Only a
 				// regular file is reused: a link (or anything else) at the name is
-				// replaced, never taken for the stub.
-				if info, ierr := qcow2.Info(file); fi.Mode().IsRegular() && ierr == nil && info.VirtualSize == sizeBytes {
-					return true, nil
+				// replaced, never taken for the stub. Regular is judged by the
+				// Lstat before anything opens it, and the image is read through
+				// a descriptor opened non-blocking with no link followed: a FIFO
+				// at the name (or swapped in since) cannot hang this RPC.
+				if fi.Mode().IsRegular() {
+					if info, ierr := infoNoFollow(file); ierr == nil && info.VirtualSize == sizeBytes {
+						return true, nil
+					}
 				}
 				if err := pd.unlink(base); err != nil {
 					return false, status.Errorf(codes.Internal, "replace stub %s: %v", stub.Path, err)

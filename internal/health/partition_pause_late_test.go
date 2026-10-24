@@ -361,10 +361,9 @@ func TestPartitionPause_AHungUnfreezeIsAbandonedAtItsBound(t *testing.T) {
 	release := releaser(t, hung.release)
 	f.p.SetContainerRuntime(hung)
 	f.healedPass()
-	start := time.Now()
 	f.tick()
-	if took := time.Since(start); took > stepBoundCeiling {
-		t.Fatalf("a hung Unfreeze held the pauser for %s", took.Round(time.Millisecond))
+	if !f.callOut("ct/ct-ha") {
+		t.Fatal("the pass returned only once the hung Unfreeze had")
 	}
 	if st := rt.get("ct-ha"); st != "frozen" {
 		t.Fatalf("ct-ha is %s with its Unfreeze hung, want frozen", st)

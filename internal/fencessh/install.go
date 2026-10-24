@@ -67,7 +67,44 @@ const InstallScript = `
 #     and FENCE_SSH_REMOVE, go through it.
 # Either way the daemon publishes the host as accepting only once its own
 # login over the managed key works against the running sshd.
+# lv_fence_ssh_privsep makes sure sshd's privilege separation directory
+# (/run/sshd) exists before this script runs sshd -T or sshd -t, which refuse
+# to run as root without it. Socket-activated sshd leaves it uncreated after a
+# reboot until a connection starts ssh.service. Run as root, it creates a
+# missing one root:root 0755, as ssh.service's RuntimeDirectory does; one that
+# exists is never changed, and is refused, returning non-zero and saying why,
+# unless it is a directory (not a symlink) owned by root and writable by no
+# one else, which sshd itself requires. Run as anyone else it does nothing.
+# FENCE_SSH_PRIVSEP_DIR and FENCE_SSH_PRIVSEP_OWNER override the directory and
+# the uid (0) it acts as (tests); fencessh.ensurePrivsepDirAs is the daemon's.
+lv_fence_ssh_privsep() {
+    local p="${FENCE_SSH_PRIVSEP_DIR:-/run/sshd}" owner="${FENCE_SSH_PRIVSEP_OWNER:-0}" o m
+    local fix="litevirt does not change it; make it a directory owned by root and writable only by root"
+    [ "$(id -u)" = "$owner" ] || return 0
+    if [ ! -e "$p" ] && [ ! -L "$p" ]; then
+        if mkdir "$p" 2>/dev/null && chmod 0755 "$p"; then return 0; fi
+    fi
+    if [ -L "$p" ] || [ ! -d "$p" ]; then
+        echo "fence ssh: sshd's privilege separation directory $p is not a directory; $fix"
+        return 1
+    fi
+    o="$(stat -c %u "$p")" && m="$(stat -c %a "$p")" || {
+        echo "fence ssh: sshd's privilege separation directory $p cannot be read"
+        return 1
+    }
+    if [ "$o" != "$owner" ]; then
+        echo "fence ssh: sshd's privilege separation directory $p is owned by uid $o, not $owner; $fix"
+        return 1
+    fi
+    if [ $(( 0$m & 022 )) -ne 0 ]; then
+        echo "fence ssh: sshd's privilege separation directory $p is group- or world-writable ($m); $fix"
+        return 1
+    fi
+    return 0
+}
 lv_fence_ssh_reload() {
+    # Before any sshd run, the test override's included.
+    lv_fence_ssh_privsep || return 1
     if [ -n "${FENCE_SSH_RELOAD:-}" ]; then sh -c "$FENCE_SSH_RELOAD"; return $?; fi
     local u st out
     local sd="${sshd:-${FENCE_SSH_SSHD:-/usr/sbin/sshd}}" sc="${cfg:-${FENCE_SSH_SSHD_CONFIG:-/etc/ssh/sshd_config}}"
@@ -136,6 +173,10 @@ lv_fence_ssh_install() {
     if [ -d "$c" ]; then chmod o+x "$c" || true; fi
     if [ ! -x "$sshd" ]; then
         echo "fence ssh: no sshd at $sshd; nothing installed"
+        return 0
+    fi
+    if ! lv_fence_ssh_privsep; then
+        echo "fence ssh: sshd cannot be evaluated; nothing changed"
         return 0
     fi
     if [ "${FENCE_SSH_REMOVE:-}" = 1 ]; then

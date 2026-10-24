@@ -154,6 +154,14 @@ naming the overlap — move `file_restore.uid_base`.
   to root: a deliberate `root:<group> 0640` for a monitoring or
   configuration-management reader loses both; grant that reader access another
   way, such as running it as root.
+- Every start of the daemon makes its config file (`/etc/litevirt/config.yaml`,
+  or the file `LITEVIRT_CONFIG` names) owner-only, so a node upgraded in place
+  loses the 0644 an earlier build wrote. It only removes the group and other
+  bits of a root-owned file and keeps the owner's own bits; it never widens a
+  mode. A symlinked config is changed at its target, and the link is kept. A
+  file root does not own is left as it is, with a warning. The change is
+  logged once, at the start that makes it: `config: tightened the config file
+  to owner-only`.
 - A daemon whose config is group- or other-readable while it holds an inline
   secret logs a warning naming the realm, and starts.
 

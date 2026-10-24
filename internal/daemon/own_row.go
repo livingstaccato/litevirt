@@ -102,8 +102,24 @@ type ownRowLoop struct {
 	prev        ownKey
 	wasHeld     bool
 	wasTimedOut bool
-	lastReport  time.Time
+	// wasJoining: the own row read 'joining' at the last evaluation.
+	wasJoining bool
+	lastReport time.Time
 }
+
+// ownRowState is this host's own recorded state, resolved as every reader
+// resolves it (the membership row when it exists); ok=false when it cannot be
+// read or there is no live row.
+func (d *Daemon) ownRowState(ctx context.Context) (string, bool) {
+	h, err := corrosion.GetHost(ctx, d.db, d.cfg.HostName)
+	if err != nil || h == nil {
+		return "", false
+	}
+	return h.State, true
+}
+
+// readOwnState is (*Daemon).ownRowState; a var so tests can fail it.
+var readOwnState = (*Daemon).ownRowState
 
 // runOwnRowHold re-evaluates the hold on every own-row change and poll, and
 // runs ownRowStep.
@@ -114,6 +130,9 @@ func (d *Daemon) runOwnRowHold(ctx context.Context) {
 	l := &ownRowLoop{}
 	l.prev, _ = d.readOwnKey(ctx)
 	l.wasHeld = d.db.OwnRowHold().Held
+	if state, ok := readOwnState(d, ctx); ok {
+		l.wasJoining = state == corrosion.HostStateJoining
+	}
 	tick := time.NewTicker(ownRowPoll)
 	defer tick.Stop()
 	for {
@@ -129,8 +148,19 @@ func (d *Daemon) runOwnRowHold(ctx context.Context) {
 
 // ownRowStep is one evaluation: keep own_row_held in step with the hold, and
 // run the own-row reconcile when the hold opens, times out (only a hold raised
-// at start over a row at incarnation 0 can), or the own row moves to another
-// incarnation or serial while no hold is engaged.
+// at start over a row at incarnation 0 can), the own row moves to another
+// incarnation or serial while no hold is engaged, or it comes to read
+// 'joining' while no hold is engaged.
+//
+// 'joining' is the state an admission records, and the boot report is what
+// ends it. Anti-entropy carries the hosts row and its host_membership row
+// separately, so a re-admission's hosts row can open the hold while the
+// membership row still holds the removed machine's state: the reconcile then
+// reads that, and leaves the boot report to a serving check that finds the
+// admission's 'joining' when it arrives, and leaves it (lab 2 drill F1). The
+// trigger is 'joining' alone: the reconcile's boot report also returns a
+// fenced, drained or offline host to service, which a fence or drain recorded
+// while this daemon runs must never be.
 func (d *Daemon) ownRowStep(ctx context.Context, l *ownRowLoop) {
 	st, err := d.db.EvaluateOwnRowHold(ctx, corrosion.OwnRowHeldSuperseded)
 	if err != nil {
@@ -138,6 +168,19 @@ func (d *Daemon) ownRowStep(ctx context.Context, l *ownRowLoop) {
 		return
 	}
 	cur, _ := d.readOwnKey(ctx)
+	// The state this evaluation read: a reconcile it runs writes the boot
+	// report only over this state (reconcileBootReport). An evaluation that
+	// cannot read it runs no reconcile and leaves the loop's state as it was,
+	// so the next evaluation that reads it sees the same transition and runs
+	// it then: never a boot write with nothing to check it against.
+	state, stateOK := readOwnState(d, ctx)
+	if !stateOK {
+		slog.Warn("own-row evaluation: this host's recorded state cannot be read; no own-row reconcile until it can",
+			"host", d.cfg.HostName)
+		d.reportOwnRowHeld(ctx, l, st)
+		return
+	}
+	joining := state == corrosion.HostStateJoining
 	switch {
 	case st.Held && !l.wasHeld:
 		slog.Error("this host's own row no longer names its certificate; its own-row writes are held",
@@ -148,50 +191,64 @@ func (d *Daemon) ownRowStep(ctx context.Context, l *ownRowLoop) {
 		slog.Info("this host's own row is the cluster's admission for its certificate; the own-row hold is open",
 			"host", d.cfg.HostName, "incarnation", cur.n)
 		d.writeSelfConditionAs(ctx, auditHoldEvaluator, CondOwnRowHeld, false, "", nil)
-		d.runOwnRowReconcile(ctx)
+		d.runOwnRowReconcile(ctx, state)
 	case !st.Held && cur != l.prev && !cur.deleted:
-		d.runOwnRowReconcile(ctx)
+		d.runOwnRowReconcile(ctx, state)
+	case !st.Held && joining && !l.wasJoining:
+		slog.Info("this host's own row is recorded joining; writing its boot report", "host", d.cfg.HostName,
+			"incarnation", cur.n)
+		d.runOwnRowReconcile(ctx, state)
 	}
-	if st.Held && time.Since(l.lastReport) >= ownRowReport {
-		l.lastReport = time.Now()
-		d.writeSelfConditionAs(ctx, auditHoldEvaluator, CondOwnRowHeld, true, corrosion.SeverityWarning,
-			map[string]any{
-				"reason": st.Reason, "arm": st.Arm, "held_for": time.Since(st.Since).Round(time.Second).String(),
-				"timed_out": st.TimedOut, "installed_serial": st.InstalledSerial, "recorded_serial": st.RecordedSerial,
-			})
-	}
+	l.wasJoining = joining
+	d.reportOwnRowHeld(ctx, l, st)
 	if st.Held && st.TimedOut && !l.wasTimedOut {
 		slog.Error("this host's own-row hold timed out; falling back to the writes the previous release makes",
 			"host", d.cfg.HostName, "reason", st.Reason, "after", corrosion.OwnRowHoldTimeout)
-		d.runOwnRowReconcile(ctx)
+		d.runOwnRowReconcile(ctx, state)
 	}
 	l.wasHeld, l.wasTimedOut, l.prev = st.Held, st.TimedOut, cur
 }
 
+// reportOwnRowHeld raises own_row_held, once every ownRowReport, while the
+// hold is engaged.
+func (d *Daemon) reportOwnRowHeld(ctx context.Context, l *ownRowLoop, st corrosion.OwnRowHoldStatus) {
+	if !st.Held || time.Since(l.lastReport) < ownRowReport {
+		return
+	}
+	l.lastReport = time.Now()
+	d.writeSelfConditionAs(ctx, auditHoldEvaluator, CondOwnRowHeld, true, corrosion.SeverityWarning,
+		map[string]any{
+			"reason": st.Reason, "arm": st.Arm, "held_for": time.Since(st.Since).Round(time.Second).String(),
+			"timed_out": st.TimedOut, "installed_serial": st.InstalledSerial, "recorded_serial": st.RecordedSerial,
+		})
+}
+
 // runOwnRowReconcile runs the reconcile once at a time: a re-run while one is
 // in flight is dropped (the in-flight one reads the row as it is by then).
-func (d *Daemon) runOwnRowReconcile(ctx context.Context) {
+// from is the state the evaluation that ran it read.
+func (d *Daemon) runOwnRowReconcile(ctx context.Context, from string) {
 	if !d.ownRowReconciling.CompareAndSwap(false, true) {
 		return
 	}
 	defer d.ownRowReconciling.Store(false)
 	if d.ownRowReconciler != nil {
-		d.ownRowReconciler(ctx)
+		d.ownRowReconciler(ctx, from)
 		return
 	}
-	d.reconcileOwnRow(ctx)
+	d.reconcileOwnRow(ctx, from)
 }
 
 // reconcileOwnRow re-runs this host's own writes on the row the cluster holds:
-// registration, the address and gRPC port, and the boot report.
-func (d *Daemon) reconcileOwnRow(ctx context.Context) {
+// registration, the address and gRPC port, and the boot report over from, the
+// state the evaluation that ran it read.
+func (d *Daemon) reconcileOwnRow(ctx context.Context, from string) {
 	if err := d.registerHost(ctx); err != nil {
 		slog.Warn("own-row reconcile: registration", "error", err)
 	}
 	if err := d.reconcileOwnEndpoint(ctx); err != nil {
 		slog.Warn("own-row reconcile: address and port", "error", err)
 	}
-	d.reconcileBootReport(ctx)
+	d.reconcileBootReport(ctx, from)
 }
 
 // reconcileBootReport writes this running daemon's boot report on its row
@@ -207,10 +264,23 @@ func (d *Daemon) reconcileOwnRow(ctx context.Context) {
 //   - recorded anything else (joining after a re-admission, fenced, offline,
 //     draining, maintenance): it returns to service as a boot's would
 //     (writeBootState), without the post-upgrade sentinel.
-func (d *Daemon) reconcileBootReport(ctx context.Context) {
+//
+// from is the state the evaluation that ran the reconcile read. The boot
+// write returns the host to service only over that state, checked on the
+// read its own decision and write guard use (writeBootStateWith's
+// expectFrom): a fence, drain or maintenance recorded since (registerHost and
+// the endpoint reconcile run in between, and the latter can wait on peers)
+// is kept.
+func (d *Daemon) reconcileBootReport(ctx context.Context, from string) {
 	d.bootRes.mu.Lock()
 	cpus, mem, disk, has := d.bootRes.cpus, d.bootRes.memMiB, d.bootRes.diskGiB, d.bootRes.hasResources
 	d.bootRes.mu.Unlock()
+	if from == "" {
+		// No state was read to check the write against; "" is a boot's
+		// "no expectation", which would leave the write unguarded.
+		slog.Warn("own-row reconcile: no recorded state to write the boot report over; writing none", "host", d.cfg.HostName)
+		return
+	}
 	h, err := corrosion.GetHost(ctx, d.db, d.cfg.HostName)
 	if err != nil || h == nil {
 		slog.Warn("own-row reconcile: read this host's row for its boot report", "error", err)
@@ -230,7 +300,7 @@ func (d *Daemon) reconcileBootReport(ctx context.Context) {
 			}
 		}
 	default:
-		d.writeBootStateWith(ctx, cpus, mem, disk, has, false)
+		d.writeBootStateWith(ctx, cpus, mem, disk, has, false, from)
 	}
 }
 

@@ -59,6 +59,9 @@ var endpointPath = endpointfile.Path
 // Variable for testing.
 var cliNotice io.Writer = os.Stderr
 
+// geteuid is os.Geteuid. Variable for testing.
+var geteuid = os.Geteuid
+
 // LoadClusterConfig reads the cluster config.
 // Priority: 1) LV_HOST env var → remote gRPC/mTLS mode
 //  2. the daemon's endpoint file, /run/litevirt/endpoint → local mode
@@ -220,7 +223,28 @@ func withTokenOption(opts []grpc.DialOption) []grpc.DialOption {
 	return append(opts, grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(cliMaxRecvMsgSize)))
 }
 
+// nonRootLocalIdentity refuses a local-mode connection of a non-root user
+// with any identity but its own CLI client bundle (PKIDir). The daemon's PKI
+// directory holds the node's own identity, host.key, which is root's: a user
+// who could read it would act as the node, and loading it only told the user
+// to chown the node's private key to themselves (lab 2 drill F3). Nothing is
+// read from pkiDir before this check.
+func nonRootLocalIdentity(pkiDir string) error {
+	uid := geteuid()
+	if uid == 0 || filepath.Clean(pkiDir) == filepath.Clean(PKIDir()) {
+		return nil
+	}
+	return fmt.Errorf("this user (uid %d) has no CLI client bundle in %s; it never uses the node's "+
+		"own identity in %s, which is root's. Run the command with sudo, or give this user a CLI client bundle "+
+		"(ca.crt, client.crt and client.key in %s; `sudo lv host init --local` installs one for SUDO_USER when "+
+		"it founds a cluster)",
+		uid, PKIDir(), pkiDir, PKIDir())
+}
+
 func connectLocal(cfg *ClusterConfig) (pb.LiteVirtClient, func(), error) {
+	if err := nonRootLocalIdentity(cfg.PKIDir); err != nil {
+		return nil, nil, err
+	}
 	tlsCfg, err := pki.ClientTLSConfig(cfg.PKIDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load local TLS config from %s: %w (expected a CLI client cert bundle in %s, or a readable daemon PKI dir)", cfg.PKIDir, err, PKIDir())
@@ -249,7 +273,13 @@ func connectLocal(cfg *ClusterConfig) (pb.LiteVirtClient, func(), error) {
 // CLI client bundle, all of which Connect honours. Any of them would make the
 // call arrive as someone other than local root — a remote node, a user, the
 // distributable lv-cli certificate — and a local-root-only RPC would refuse it.
+//
+// A non-root caller is refused before host.key is read.
 func ConnectLocalRoot(pkiDir string, grpcPort int) (pb.LiteVirtClient, func(), error) {
+	if uid := geteuid(); uid != 0 {
+		return nil, nil, fmt.Errorf("this command uses the node's local root channel, which only root may use "+
+			"(this process runs as uid %d): run it with sudo", uid)
+	}
 	tlsCfg, err := pki.PeerTLSConfig(pkiDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load this host's certificate from %s: %w", pkiDir, err)

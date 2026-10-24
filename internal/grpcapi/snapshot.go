@@ -463,6 +463,12 @@ func (s *Server) restoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 				"`lv clone <source> <name> --mode full`, first",
 			req.VmName, req.SnapshotName, strings.Join(users, ", "), strings.Join(liveFiles, ", "))
 	}
+	// Nor while a kept disk backs on one: a linked clone deleted with
+	// --keep-disks has no disk row, so snapshotFileUsers no longer sees it
+	// (security review R1).
+	if err := s.keptFilesRefusal(ctx, "restore a snapshot of", req.VmName, liveFiles, "", true); err != nil {
+		return nil, err
+	}
 
 	// The revert destroys and undefines the domain, resets its overlays and
 	// brings it back. The VM lock holds off this host's RPCs only; the
@@ -742,6 +748,10 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 					"into or remove. Delete those VMs, or re-create them as independent copies with "+
 					"`lv clone <source> <name> --mode full`, first",
 				req.SnapshotName, req.VmName, strings.Join(users, ", "), strings.Join(files, ", "))
+		}
+		// Nor while a kept disk backs on one (keptFilesRefusal).
+		if err := s.keptFilesRefusal(ctx, "delete a snapshot of", req.VmName, files, "", true); err != nil {
+			return nil, err
 		}
 	}
 

@@ -2507,6 +2507,13 @@ func (s *Server) startGatesLocked(ctx context.Context, method string, vm *corros
 				"--mode full`, first",
 			vm.Name, len(clones), strings.Join(clones, ", "))
 	}
+	// Nor while a kept disk backs on its disk: a linked clone deleted with
+	// --keep-disks is no longer in linkedClonesOf, and its kept overlay (noted,
+	// recorded, or moved aside as a .kept- copy) still names this VM's disk as
+	// its base. Fails closed, as the clone check does (security review R1).
+	if err := s.keptBaseRefusal(ctx, vm.Name, "start", "", false, true); err != nil {
+		return nil, err
+	}
 
 	// Host capacity admission. Starting is where memory is actually CONSUMED —
 	// usage counts running and starting VMs only (corrosion.SumVMResourcesByHost),
@@ -2628,6 +2635,16 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	// on the move's target (movingVMStartRefusal reads the row again).
 	if err := s.movingVMStartRefusal(ctx, vm); err != nil {
 		return releasePreflight, err
+	}
+	// Nor one whose disk a kept disk backs on (keptBaseRefusal), by any path:
+	// the operator start (which also refuses while that cannot be told, in
+	// startGatesLocked), and the failover, reconciler and health restarts that
+	// reach the domain start only through here. Those refuse only a positive
+	// finding: an unreadable note does not hold every restart on the host.
+	if s.db != nil {
+		if err := s.keptBaseRefusal(ctx, vm.Name, "start", "", false, false); err != nil {
+			return releasePreflight, err
+		}
 	}
 	// A cutover that a crash interrupted after its commit owes this name its
 	// runtime handoff: until the resume (which runs in the background, and

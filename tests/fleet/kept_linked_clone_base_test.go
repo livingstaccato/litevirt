@@ -153,3 +153,131 @@ func TestFleet_KeptLinkedClone_RunOverAMissingBaseIsRefused(t *testing.T) {
 		t.Fatalf("a file was written at the kept overlay's missing base %s (lstat %v)", base, err)
 	}
 }
+
+// Security review R1: starting the source of a kept linked clone lets qemu
+// write into the base under the kept overlay, and so do the paths that write
+// its disks in place: a snapshot delete merges into it, a snapshot restore
+// empties the live overlay a kept disk backs on, and an in-place backup
+// restore replaces it (grpcapi tests). linkedClonesOf no longer sees a clone
+// deleted with --keep-disks; keptBaseRefusal and keptFilesRefusal do.
+//
+// Red on d4c11ecc1 (start: nil; the snapshot delete goes through).
+// Mutations: drop keptBaseRefusal from startGatesLocked and from
+// PrepareHardwareForStart: "start" red (either alone: the other still
+// refuses, so each is pinned by its own grpcapi test too); drop the
+// keptFilesRefusal of the snapshot delete or restore: the matching subtest
+// red.
+func TestFleet_KeptLinkedClone_SourceIsNotRunOrWrittenInPlace(t *testing.T) {
+	ctx := context.Background()
+	t.Run("start", func(t *testing.T) {
+		n, cl, base, overlay, was := klcFixture(t)
+		_, err := cl.StartVM(ctx, &pb.StartVMRequest{Name: "sv"})
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), overlay) {
+			t.Fatalf("lv start sv = %v; want FailedPrecondition naming the kept overlay %s", err, overlay)
+		}
+		if active, _ := n.Virt.DomainIsActive("sv"); active {
+			t.Fatal("sv's domain runs after the refused start")
+		}
+		klcIntact(t, base, overlay, was, "lv start sv")
+	})
+	t.Run("snapshot delete", func(t *testing.T) {
+		n, cl, base, overlay, was := klcFixture(t)
+		n.Virt.SetDiskSource("sv", "vda", base)
+		if _, err := cl.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VmName: "sv", Name: "s1"}); err != nil {
+			t.Fatalf("snapshot s1: %v", err)
+		}
+		_, err := cl.DeleteSnapshot(ctx, &pb.DeleteSnapshotRequest{VmName: "sv", SnapshotName: "s1"})
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), overlay) {
+			t.Fatalf("lv snapshot rm sv s1 = %v; want FailedPrecondition naming the kept overlay %s", err, overlay)
+		}
+		klcIntact(t, base, overlay, was, "lv snapshot rm sv s1")
+	})
+	t.Run("snapshot restore", func(t *testing.T) {
+		n, cl, base, _, _ := klcFixture(t)
+		n.Virt.SetDiskSource("sv", "vda", base)
+		if _, err := cl.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VmName: "sv", Name: "s1"}); err != nil {
+			t.Fatalf("snapshot s1: %v", err)
+		}
+		live := strings.TrimSuffix(base, ".qcow2") + ".s1"
+		if err := qcow2.CreateWithBackingFormat(live, base, "qcow2", 0, nil); err != nil {
+			t.Fatal(err)
+		}
+		// A kept linked clone of sv taken over its live overlay, as `lv clone
+		// sv x --mode linked` then `lv rm --keep-disks x` leaves it.
+		top := filepath.Join(filepath.Dir(base), "x-root.qcow2")
+		if err := qcow2.CreateWithBackingFormat(top, live, "qcow2", 0, nil); err != nil {
+			t.Fatal(err)
+		}
+		note := filepath.Join(n.Server.DataDir(), "kept-disks", "x.json")
+		if err := os.WriteFile(note, []byte(`{"paths":["`+top+`"]}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := cl.RestoreSnapshot(ctx, &pb.RestoreSnapshotRequest{VmName: "sv", SnapshotName: "s1"})
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), top) {
+			t.Fatalf("lv snapshot restore sv s1 = %v; want FailedPrecondition naming the kept overlay %s", err, top)
+		}
+	})
+}
+
+// Security review R2: a same-name `lv run` of the kept clone moves its
+// overlay to a .kept- name and drops it from the note. The base under that
+// copy is still held: a plain `lv rm` of the source is refused, naming the
+// copy, and the base stays.
+//
+// Red on d4c11ecc1 (the plain lv rm removes the base). Mutation: leave the
+// set-aside copies out of keptNoteChains: red.
+func TestFleet_KeptLinkedClone_ACopyMovedAsideKeepsItsBase(t *testing.T) {
+	ctx := context.Background()
+	n, cl, base, overlay, was := klcFixture(t)
+	if _, err := cl.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "svc", Image: "ubuntu", Cpu: 1, MemoryMib: 256, Placement: &pb.PlacementSpec{Host: n.Name}}}); err != nil {
+		t.Fatalf("lv run svc: %v", err)
+	}
+	moved, _ := filepath.Glob(overlay + ".kept-*")
+	if len(moved) != 1 {
+		t.Fatalf("the kept overlay was not moved aside to one .kept- copy: %v", moved)
+	}
+	_, err := cl.DeleteVM(ctx, &pb.DeleteVMRequest{Name: "sv"})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), moved[0]) {
+		t.Fatalf("plain lv rm sv = %v; want FailedPrecondition naming the .kept- copy %s", err, moved[0])
+	}
+	if got, err := os.ReadFile(base); err != nil || !bytes.Equal(got, was) {
+		t.Fatalf("the base under the .kept- copy was removed or changed (err=%v)", err)
+	}
+	if info, err := qcow2.Info(moved[0]); err != nil || info.BackingFile != base {
+		t.Fatalf("the .kept- copy no longer backs on %s: %+v, %v", base, info, err)
+	}
+}
+
+// Review N1 (X3): a rebuild refuses, with nothing done, while a kept-disk
+// note cannot be read: there is no variant of a rebuild that spares the
+// disks, so "cannot tell" is not "nothing backs on them".
+//
+// Mutation: RebuildVM calls keptBaseRefusal with failClosed=false: red (the
+// rebuild tears the VM down).
+func TestFleet_KeptLinkedClone_RebuildFailsClosedOnAnUnreadableNote(t *testing.T) {
+	ctx := context.Background()
+	n, cl := rkdCluster(t)
+	base := rkdRootPath(t, n)
+	was := readFileT(t, base)
+	note := filepath.Join(n.Server.DataDir(), "kept-disks", "other.json")
+	if err := os.MkdirAll(filepath.Dir(note), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(note, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	from := len(n.Virt.EventLog())
+	_, err := cl.RebuildVM(ctx, &pb.RebuildVMRequest{Name: "sv"})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), note) {
+		t.Fatalf("lv rebuild sv with an unreadable note = %v; want FailedPrecondition naming %s", err, note)
+	}
+	if got, err := os.ReadFile(base); err != nil || !bytes.Equal(got, was) {
+		t.Fatalf("sv's disk changed or went in a refused rebuild (err=%v)", err)
+	}
+	for op := range qfsOps(n, "sv", from) {
+		if op == "destroy" || op == "undefine" {
+			t.Errorf("libvirt %s of sv during a refused rebuild", op)
+		}
+	}
+}

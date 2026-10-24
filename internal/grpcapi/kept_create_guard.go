@@ -108,7 +108,7 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 	// lists is left to SetAsideBeforeCreate, which refuses it (note.Under);
 	// moving the base of another VM's kept disk aside, as it would a noted
 	// disk of name, breaks that disk's chain (rc7 lab 1 F1).
-	holds, err := s.keptNoteChainHolds()
+	holds, err := s.keptNoteChainHolds(ctx)
 	if err != nil {
 		if storage.IsFSNoAnswer(err) {
 			return fmt.Errorf("the create clears a file left by an earlier VM %s, and %v; nothing was moved or removed", name, err)
@@ -129,7 +129,7 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 			return refuse(f, h.what(s))
 		}
 	}
-	if refusal, _ := s.keptNoteMissingBase(writes); refusal != nil {
+	if refusal, _ := s.keptNoteMissingBase(ctx, writes); refusal != nil {
 		return refusal
 	}
 
@@ -246,7 +246,7 @@ func (s *Server) keptMissingBaseRefusal(ctx context.Context, writes *keptWrites)
 	// A noted file's chain first (keptNoteMissingBase): a note is what `lv rm
 	// --keep-disks` writes, and kept-disks.json then has no entry at all (rc7
 	// lab 1 F1).
-	if refusal, unknown := s.keptNoteMissingBase(writes); refusal != nil {
+	if refusal, unknown := s.keptNoteMissingBase(ctx, writes); refusal != nil {
 		return refusal
 	} else if unknown != nil && writes.local {
 		return keptChainsRefusal("whether a disk a delete kept backs on a path the create writes cannot be told:",

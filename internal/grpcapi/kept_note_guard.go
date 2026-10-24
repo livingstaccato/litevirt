@@ -45,8 +45,9 @@ func (s *Server) reportKeptNoteHold(ctx context.Context, vmName, op, path, why s
 
 // keptHolds reports whether path is a file no path that removes disk files on
 // this host may remove: one this host's kept-disk notes name (keptNoteHolds)
-// or one a noted file's backing chain reaches (keptNoteChainHolds: the base
-// of a kept linked clone, which no note names), or one a kept-disks.json
+// or one a noted file's or a set-aside copy's backing chain reaches
+// (keptNoteChainHolds: the base of a kept linked clone, which no note names,
+// also once a create moved its overlay to a .kept- name), or one a kept-disks.json
 // entry of this host names or reaches through its backing chain
 // (keptRegistryChains). The registry is read too because a
 // delete that kept a disk without a note (an older build's stale-record
@@ -57,7 +58,7 @@ func (s *Server) keptHolds(ctx context.Context, path string) (bool, string) {
 	if held, why := s.keptNoteHolds(path); held {
 		return held, why
 	}
-	if held, why := s.keptNoteChainHeld(path); held {
+	if held, why := s.keptNoteChainHeld(ctx, path); held {
 		return held, why
 	}
 	chains, err := s.keptRegistryChains(ctx)
@@ -168,6 +169,18 @@ type keptNoteChain struct {
 	layers        []string
 	missing       string
 	dotdot        int
+	// copy: top is a set-aside copy (a .kept- or .superseded- file a create
+	// or a failover's old host moved a disk to), not a noted file; vm and
+	// note are "".
+	copy bool
+}
+
+// desc names the kept disk at the top of c, for a refusal.
+func (c keptNoteChain) desc(s *Server) string {
+	if c.copy {
+		return fmt.Sprintf("the set-aside disk copy %s on %s (lv host superseded-disks %s lists it)", c.top, s.hostName, s.hostName)
+	}
+	return fmt.Sprintf("the disk %s the deleted VM %s was kept with on %s (its kept-disk note %s lists it)", c.top, c.vm, s.hostName, c.note)
 }
 
 // keptNoteChainsError is a kept-disk note, or the chain of a file one names,
@@ -178,24 +191,31 @@ func (e *keptNoteChainsError) Error() string { return e.err.Error() }
 func (e *keptNoteChainsError) Unwrap() error { return e.err }
 
 // keptNoteChains is the backing chain of every file this host's kept-disk
-// notes name. A note names the deleted VM's own files only (noteKeptDisks,
+// notes name, and of every set-aside disk copy on this host (.kept- and
+// .superseded- files: health.ListKeptDisks, health.ListSupersededDisks). A
+// note names the deleted VM's own files only (noteKeptDisks,
 // noteKeptBackingFiles): a kept linked clone's note names its overlay and
-// not the base under it, which is another VM's disk. The chain is what
-// reaches that base, so it is what holds it (keptNoteChainHolds) and what a
-// create must not write under the overlay (keptNoteMissingBase). A note or a
-// chain that cannot be read is a *keptNoteChainsError.
-func (s *Server) keptNoteChains() ([]keptNoteChain, error) {
+// not the base under it, which is another VM's disk, and a create of the
+// clone's name moves that overlay to a .kept- name and drops it from the
+// note. The chain is what reaches that base, so it is what holds it
+// (keptNoteChainHolds) and what a create must not write under the overlay
+// (keptNoteMissingBase). A note, a listing or a chain that cannot be read
+// is a *keptNoteChainsError.
+func (s *Server) keptNoteChains(ctx context.Context) ([]keptNoteChain, error) {
 	notes, err := health.KeptNotes(s.dataDir)
 	if err != nil {
 		return nil, &keptNoteChainsError{fmt.Errorf("this host's notes of the disks deletes kept cannot be read (%w)", err)}
 	}
+	walk := func(p string) (keptWalked, error) {
+		return storage.Bounded("read the backing chain of", p, func() (keptWalked, error) {
+			l, m, dd, err := keptChainWalk(p)
+			return keptWalked{layers: l, missing: m, dotdot: dd}, err
+		})
+	}
 	var out []keptNoteChain
 	for _, n := range notes {
 		for _, p := range n.Paths {
-			w, err := storage.Bounded("read the backing chain of", p, func() (keptWalked, error) {
-				l, m, dd, err := keptChainWalk(p)
-				return keptWalked{layers: l, missing: m, dotdot: dd}, err
-			})
+			w, err := walk(p)
 			if err != nil {
 				return nil, &keptNoteChainsError{fmt.Errorf("the backing chain of %s, a disk the deleted VM %s was kept with (%s), cannot be read (%w), "+
 					"so what it backs on is unknown: until it can, every path that removes disk files on this host leaves them, "+
@@ -204,6 +224,36 @@ func (s *Server) keptNoteChains() ([]keptNoteChain, error) {
 			}
 			out = append(out, keptNoteChain{vm: n.VM, note: n.File, top: filepath.Clean(p), layers: w.layers, missing: w.missing, dotdot: w.dotdot})
 		}
+	}
+	if s.db == nil { // a unit test's bare Server: no pools to list
+		return out, nil
+	}
+	var copies []string
+	kept, err := health.ListKeptDisks(ctx, s.db, s.dataDir)
+	if err != nil {
+		return nil, &keptNoteChainsError{fmt.Errorf("this host's set-aside .kept- disk copies cannot be listed (%w)", err)}
+	}
+	for _, k := range kept {
+		if !k.Seed {
+			copies = append(copies, k.Path)
+		}
+	}
+	superseded, err := health.ListSupersededDisks(ctx, s.db, s.dataDir)
+	if err != nil {
+		return nil, &keptNoteChainsError{fmt.Errorf("this host's set-aside .superseded- disk copies cannot be listed (%w)", err)}
+	}
+	for _, c := range superseded {
+		copies = append(copies, c.Path)
+	}
+	for _, p := range copies {
+		w, err := walk(p)
+		if err != nil {
+			return nil, &keptNoteChainsError{fmt.Errorf("the backing chain of %s, a set-aside disk copy, cannot be read (%w), so what it backs on "+
+				"is unknown: until it can, every path that removes disk files on this host leaves them, and a create that would write a "+
+				"disk here is refused; fix that file or its storage, or, once nothing needs it, move it away (lv host superseded-disks %s "+
+				"lists it)", p, err, s.hostName)}
+		}
+		out = append(out, keptNoteChain{top: filepath.Clean(p), layers: w.layers, missing: w.missing, dotdot: w.dotdot, copy: true})
 	}
 	return out, nil
 }
@@ -214,6 +264,8 @@ func (s *Server) keptNoteChains() ([]keptNoteChain, error) {
 type keptChainHold struct {
 	vm, top string
 	dotdot  bool
+	// chain is the chain that reaches the file.
+	chain keptNoteChain
 }
 
 // what names what holds the file, for a refusal: "the disk ... backs on".
@@ -221,6 +273,9 @@ func (h keptChainHold) what(s *Server) string {
 	how := ""
 	if h.dotdot {
 		how = " through a \"..\" reference"
+	}
+	if h.chain.copy {
+		return fmt.Sprintf("the set-aside disk copy %s (lv host superseded-disks %s lists it) backs on%s", h.top, s.hostName, how)
 	}
 	return fmt.Sprintf("the disk %s the deleted VM %s was kept with (its kept-disk note %s lists it) backs on%s",
 		h.top, h.vm, filepath.Join(s.dataDir, "kept-disks", h.vm+".json"), how)
@@ -236,8 +291,8 @@ func (h keptChainHold) what(s *Server) string {
 // them is there (rc7 lab 1 F1: a plain lv rm of the clone's source removed
 // the base under the kept overlay). A note or a chain that cannot be read is
 // an error.
-func (s *Server) keptNoteChainHolds() (map[string][]keptChainHold, error) {
-	chains, err := s.keptNoteChains()
+func (s *Server) keptNoteChainHolds(ctx context.Context) (map[string][]keptChainHold, error) {
+	chains, err := s.keptNoteChains(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -247,13 +302,13 @@ func (s *Server) keptNoteChainHolds() (map[string][]keptChainHold, error) {
 			if i == 0 {
 				continue
 			}
-			h := keptChainHold{vm: c.vm, top: c.top, dotdot: c.dotdot >= 0 && i >= c.dotdot}
+			h := keptChainHold{vm: c.vm, top: c.top, dotdot: c.dotdot >= 0 && i >= c.dotdot, chain: c}
 			r, err := resolvedStrict(l)
 			if err != nil {
 				return nil, fmt.Errorf("%s, under %s, a disk the deleted VM %s was kept with, cannot be resolved (%w)", l, c.top, c.vm, err)
 			}
 			for _, k := range uniq(filepath.Clean(l), r) {
-				if !slices.Contains(out[k], h) {
+				if !slices.ContainsFunc(out[k], func(o keptChainHold) bool { return o.top == h.top && o.vm == h.vm && o.dotdot == h.dotdot }) {
 					out[k] = append(out[k], h)
 				}
 			}
@@ -281,8 +336,8 @@ func keptChainHeldIn(holds map[string][]keptChainHold, path string) ([]keptChain
 // keptNoteChainHeld reports whether path is a file a noted file's chain
 // reaches below its top (keptNoteChainHolds). Anything that cannot be read
 // holds every path; why says which.
-func (s *Server) keptNoteChainHeld(path string) (bool, string) {
-	holds, err := s.keptNoteChainHolds()
+func (s *Server) keptNoteChainHeld(ctx context.Context, path string) (bool, string) {
+	holds, err := s.keptNoteChainHolds(ctx)
 	if err != nil {
 		return true, err.Error()
 	}
@@ -304,11 +359,11 @@ func (s *Server) keptNoteChainHeld(path string) (bool, string) {
 // is one that cannot tell whether it writes there. unknown is set instead
 // when a note or a chain cannot be read (keptNoteChains): whether the write
 // is such a path cannot be told. A nil writes writes nothing.
-func (s *Server) keptNoteMissingBase(writes *keptWrites) (refuse, unknown error) {
+func (s *Server) keptNoteMissingBase(ctx context.Context, writes *keptWrites) (refuse, unknown error) {
 	if writes == nil {
 		return nil, nil
 	}
-	chains, err := s.keptNoteChains()
+	chains, err := s.keptNoteChains(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -319,8 +374,8 @@ func (s *Server) keptNoteMissingBase(writes *keptWrites) (refuse, unknown error)
 		overlay := c.layers[len(c.layers)-1]
 		hit, werr := writes.writes(c.missing)
 		if werr != nil {
-			msg := fmt.Sprintf("whether the create writes %s, which %s backs on although it is missing (the disk %s the deleted VM %s "+
-				"was kept with, as its kept-disk note %s lists it), cannot be told: %v; nothing was created", c.missing, overlay, c.top, c.vm, c.note, werr)
+			msg := fmt.Sprintf("whether the create writes %s, which %s backs on although it is missing (it is in the backing chain of %s), "+
+				"cannot be told: %v; nothing was created", c.missing, overlay, c.desc(s), werr)
 			if storage.IsFSNoAnswer(werr) {
 				return errors.New(msg + "; retry once that storage answers, or place the VM on another host"), nil
 			}
@@ -329,11 +384,14 @@ func (s *Server) keptNoteMissingBase(writes *keptWrites) (refuse, unknown error)
 		if !hit {
 			continue
 		}
+		release := fmt.Sprintf("release the kept disk once nothing needs it (lv host kept-disks %s --release %s)", s.hostName, c.vm)
+		if c.copy {
+			release = fmt.Sprintf("remove the copy once nothing needs it (lv host superseded-disks %s)", s.hostName)
+		}
 		return health.NewKeptBackingFileError(fmt.Sprintf("the create writes %s, which %s backs on although it is missing: "+
-			"%s is in the backing chain of the disk %s the deleted VM %s was kept with (its kept-disk note %s lists it), and a new "+
-			"disk there would become its base; nothing was created. Put the original file back at %s, or move %s away, or release "+
-			"the kept disk once nothing needs it (lv host kept-disks %s --release %s), or place the VM on another host",
-			c.missing, overlay, overlay, c.top, c.vm, c.note, c.missing, overlay, s.hostName, c.vm)), nil
+			"%s is in the backing chain of %s, and a new disk there would become its base; nothing was created. Put the original "+
+			"file back at %s, or move %s away, or %s, or place the VM on another host",
+			c.missing, overlay, overlay, c.desc(s), c.missing, overlay, release)), nil
 	}
 	return nil, nil
 }
@@ -399,28 +457,24 @@ func (s *Server) keptStillReached(ctx context.Context, file string) bool {
 	return false
 }
 
-// keptBaseRefusal refuses op of vmName (a delete without --keep-disks, a
-// rebuild) before anything is done while a disk file of it on this host is
-// one a kept disk's backing chain reaches below its top: the base of a kept
-// linked clone, noted (keptNoteChainHolds) or recorded in kept-disks.json
-// (keptRegistryChains). The delete of the clone dropped its disk row, so the
-// linked-clone guard (linkedClonesOf) no longer sees it, and without this the
-// removal leaves the file (keptHolds) only after the domain is gone. With
-// freedOnly, only a disk recorded delete_with_vm counts: the delete keeps the
-// others anyway. What cannot be read refuses only with failClosed; otherwise
-// the removal's own holds keep every file then.
+// keptBaseRefusal refuses op of vmName (a start, a delete without
+// --keep-disks, a rebuild, a revert from a template) before anything is done
+// while a disk file of it on this host is one a kept disk's backing chain
+// reaches below its top (keptFilesRefusal): the base of a kept linked clone.
+// The delete of the clone dropped its disk row, so the linked-clone guard
+// (linkedClonesOf) no longer sees it. With freedOnly, only a disk recorded
+// delete_with_vm counts: the delete keeps the others anyway. What cannot be
+// read refuses only with failClosed; otherwise the removal's own holds keep
+// every file then.
 func (s *Server) keptBaseRefusal(ctx context.Context, vmName, op, wayOut string, freedOnly, failClosed bool) error {
-	unknown := func(err error) error {
+	disks, err := corrosion.GetVMDisks(ctx, s.db, vmName)
+	if err != nil {
 		if !failClosed {
 			return nil
 		}
 		return status.Errorf(codes.FailedPrecondition,
-			"cannot %s %q: whether a disk a delete kept on %s backs on its disks cannot be told (%v); nothing was done (retry once it can be read)",
-			op, vmName, s.hostName, err)
-	}
-	disks, err := corrosion.GetVMDisks(ctx, s.db, vmName)
-	if err != nil {
-		return unknown(err)
+			"cannot %s %q: its disk records cannot be read (%v), so whether a disk a delete kept on %s backs on them cannot be told; "+
+				"nothing was done (retry)", op, vmName, err, s.hostName)
 	}
 	var files []string
 	for _, d := range disks {
@@ -430,29 +484,54 @@ func (s *Server) keptBaseRefusal(ctx context.Context, vmName, op, wayOut string,
 		}
 		files = append(files, filepath.Clean(s.hostDiskFile(d.Path)))
 	}
+	return s.keptFilesRefusal(ctx, op, vmName, files, wayOut, failClosed)
+}
+
+// keptFilesRefusal refuses op of vmName while one of files (this host's) is
+// a file a kept disk's backing chain reaches below its top: a noted disk or
+// a set-aside copy (keptNoteChainHolds), or a kept-disks.json entry
+// (keptRegistryChains). Starting, reverting, resizing or removing it writes
+// or removes the base under that kept disk. wayOut, when not "", is offered
+// first ("delete it with --keep-disks, or "). What cannot be read refuses
+// only with failClosed.
+func (s *Server) keptFilesRefusal(ctx context.Context, op, vmName string, files []string, wayOut string, failClosed bool) error {
 	if len(files) == 0 {
 		return nil
 	}
-	refuse := func(file, top, vm, record string) error {
+	unknown := func(err error) error {
+		if !failClosed {
+			return nil
+		}
 		return status.Errorf(codes.FailedPrecondition,
-			"cannot %s %q: its disk file %s is the backing file of %s, a disk the delete of VM %s kept on %s (%s), and removing it "+
-				"would leave that kept disk without its base; %srelease the kept disk first (lv host kept-disks %s --release %s), or flatten it onto a "+
-				"standalone file at its path; nothing was done",
-			op, vmName, file, top, vm, s.hostName, record, wayOut, s.hostName, top)
+			"cannot %s %q: whether a disk a delete kept on %s backs on its disks cannot be told (%v); nothing was done (retry once it can be read)",
+			op, vmName, s.hostName, err)
 	}
-	holds, err := s.keptNoteChainHolds()
+	refuse := func(file, top, what, release string) error {
+		return status.Errorf(codes.FailedPrecondition,
+			"cannot %s %q: its disk file %s is the backing file of %s, and that would write or remove the base under it; "+
+				"%s%s, or flatten the kept disk onto no backing file with `qemu-img rebase -f qcow2 -b '' %s` (it copies what the "+
+				"kept disk reads from the base into it, so nothing may use it meanwhile); nothing was done",
+			op, vmName, file, what, wayOut, release, top)
+	}
+	holds, err := s.keptNoteChainHolds(ctx)
 	if err != nil {
 		return unknown(err)
 	}
 	for _, f := range files {
+		f = filepath.Clean(f)
 		hs, err := keptChainHeldIn(holds, f)
 		if err != nil {
 			return unknown(err)
 		}
 		for _, h := range hs {
-			if h.top != f {
-				return refuse(f, h.top, h.vm, "its kept-disk note "+filepath.Join(s.dataDir, "kept-disks", h.vm+".json")+" lists it")
+			if h.top == f {
+				continue
 			}
+			release := fmt.Sprintf("release the kept disk first (lv host kept-disks %s --release %s)", s.hostName, h.top)
+			if h.chain.copy {
+				release = fmt.Sprintf("remove the set-aside copy first, once nothing needs it (lv host superseded-disks %s)", s.hostName)
+			}
+			return refuse(f, h.top, h.chain.desc(s), release)
 		}
 	}
 	chains, err := s.keptRegistryChains(ctx)
@@ -462,7 +541,8 @@ func (s *Server) keptBaseRefusal(ctx context.Context, vmName, op, wayOut string,
 	for _, c := range chains {
 		for _, l := range c.layers[min(1, len(c.layers)):] {
 			if slices.Contains(files, l) {
-				return refuse(l, c.top, c.rec.VM, filepath.Join(s.dataDir, diskKeptFile)+" records it")
+				return refuse(l, c.top, fmt.Sprintf("%s, a disk the delete of VM %s kept on %s (%s records it)", c.top, c.rec.VM, s.hostName,
+					filepath.Join(s.dataDir, diskKeptFile)), fmt.Sprintf("release the kept disk first (lv host kept-disks %s --release %s)", s.hostName, c.top))
 			}
 		}
 	}

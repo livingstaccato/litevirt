@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc/metadata"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // Disk files a VM delete kept (lab 2 F-5). A delete never removes a disk it
@@ -298,6 +299,13 @@ func (s *Server) judgeKeptDisks(ctx context.Context) {
 	if _, err := s.keptRegistryChains(ctx); err != nil {
 		var re *keptRegistryError
 		if !errors.As(err, &re) || !re.transient {
+			createsRefused = err.Error()
+		}
+	}
+	// So does a kept-disk note, a set-aside copy listing or a noted chain that
+	// cannot be read (keptNoteMissingBase), which no record names.
+	if createsRefused == "" {
+		if _, err := s.keptNoteChains(ctx); err != nil && !storage.IsFSNoAnswer(err) {
 			createsRefused = err.Error()
 		}
 	}

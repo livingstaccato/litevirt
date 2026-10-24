@@ -3472,8 +3472,10 @@ While an entry is there, a create on that host never clears the file it names,
 nor a file that disk's backing chain reaches: the create is refused, naming
 the file (docs/cli-reference.md, `lv rm`). A disk the delete of a VM with no
 domain kept is also in `<data_dir>/kept-disks/<vm>.json`, with the files its
-chain backs on. While `kept-disks.json`, or the backing chain of a disk it
-names, cannot be read, what a kept overlay backs on is unknown, and these are
+chain backs on. While `kept-disks.json`, a note `<data_dir>/kept-disks/<vm>.json`,
+the listing of the set-aside `.kept-` and `.superseded-` copies, or the
+backing chain of a disk one of them names, cannot be read, what a kept
+overlay backs on is unknown, and these are
 refused on that host whatever their names: every import; every create or
 clone that writes a disk file on the host's own storage (one with no disk
 file, or with every disk on shared nfs, ceph or iscsi storage outside the disk
@@ -3484,9 +3486,10 @@ it alone, and resolves once it reads). A migration's target and the
 reconciler's rebuild of a missing overlay disk are not checked yet.
 While the backing chain of a file a note `<data_dir>/kept-disks/<vm>.json`
 names cannot be read, every path on that host that removes disk files leaves
-every file, and `lv host kept-disks --release` refuses, naming the file and the
-note: fix that file, move it away, or, once nothing needs it, remove its entry
-from the note (docs/cli-reference.md, "Releasing kept disks").
+every file, `lv start` and `lv rebuild` are refused on that host, and
+`lv host kept-disks --release` refuses, naming the file and the note: fix that
+file, move it away, or, once nothing needs it, remove its entry from the note
+(docs/cli-reference.md, "Releasing kept disks").
 
 ### A drain's live move timed out (`drain_move_timed_out`)
 

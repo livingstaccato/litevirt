@@ -335,9 +335,8 @@ to the disk directory writes the same files); the refusal names the
 entry, and the way out is to fix that file, or, once nothing needs the disk,
 move it away or remove its entry from `<data_dir>/kept-disks.json`. An
 unreadable `kept-disks.json`, kept-disk note or kept chain does not depend on
-the name: until it reads, these are refused on that host, and for
-`kept-disks.json` and its chains `disk_leftover` names the file
-(`creates_refused`): every `lv import`; every create or `lv clone` that writes
+the name: until it reads, these are refused on that host, and
+`disk_leftover` names the file (`creates_refused`): every `lv import`; every create or `lv clone` that writes
 a disk file on the host's own storage (one with no disk file, or with every
 disk on shared nfs, ceph or iscsi storage outside the disk directory, goes
 ahead); every disk attach that creates a new disk; and every `lv backup
@@ -356,14 +355,28 @@ moving them aside as an orphan. Every other path that removes disk files on
 the host (a delete's or rebuild's disk cleanup, `lv iso rm <pool>/<file>`, a
 migration's or volume move's source cleanup, replica pruning) leaves a file a
 `kept-disks.json` entry names or reaches through its backing chain, as it
-leaves a file a note names or a noted file's backing chain reaches, unless a
+leaves a file a note names or a noted file's backing chain reaches, or the
+backing chain of a set-aside `.kept-` or `.superseded-` copy reaches, unless a
 VM's disk record on that host still names that entry's own file (a delete that
 failed keeps its record, and its retry frees it); the files under it stay
-held. A plain `lv rm` or an `lv rebuild` of a VM whose disk such a chain
-reaches below its top (the source of a linked clone deleted with
-`--keep-disks`) is refused (`FailedPrecondition`) before anything is done,
-naming the kept disk: delete it with `--keep-disks`, or release the kept disk
-first (`lv host kept-disks <host> --release <path>`).
+held. A VM whose disk such a chain reaches below its top (the source of a
+linked clone deleted with `--keep-disks`, also once a create of the clone's
+name moved its overlay to a `.kept-` name) is not run or written in place:
+`lv start` (and the failover, reconciler and health restarts), a plain `lv rm`,
+`lv rebuild`, `lv snapshot rm` and `lv snapshot restore` of a snapshot whose
+files the kept disk backs on, and an in-place backup restore over that disk are
+refused (`FailedPrecondition`) before anything is done, naming the kept disk.
+The way out: delete the VM with `--keep-disks`; release the kept disk first
+(`lv host kept-disks <host> --release <path>`; for a set-aside copy,
+`lv host superseded-disks <host>`); or make the kept disk standalone with
+nothing using it, `qemu-img rebase -f qcow2 -b '' <kept disk>`, which copies
+what it reads from the base into it. While a note cannot be read, the
+operator's `lv start` and `lv rebuild` are refused too; the automated restarts
+refuse only a VM a readable chain reaches. A note is this host's own: a VM
+whose disk is on shared storage (an nfs pool) and that later runs on another
+host is not held there by a kept disk this host noted, and a plain `lv rm` on
+that host can free the base; keep such a VM on the host that noted the kept
+disk until the kept disk is released or made standalone.
 
 **Releasing kept disks.** `lv host kept-disks <host>` lists every disk chain
 the deletes kept on that host, from its notes (`<data_dir>/kept-disks/<vm>.json`)
@@ -428,8 +441,9 @@ while that host's replica has not caught up, and writes an audit entry
 and each snapshot record dropped, and a `vm.disk.released` event of the VM. A host on an older build answers
 that it does not know the command, and removes nothing. A record of a disk on
 another host is listed and not released: check it there, then remove its
-entry by hand. The `.kept-` copies a create moved aside are not kept chains:
-`lv host superseded-disks` lists them.
+entry by hand. The `.kept-` copies a create moved aside are not released
+here: `lv host superseded-disks` lists them. The files their backing chains
+reach are held all the same (above).
 
 **`--keep-disks` and snapshots.** `lv rm --keep-disks` of a VM that has
 snapshots is refused (`FailedPrecondition`, naming them) before anything is

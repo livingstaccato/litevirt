@@ -70,6 +70,10 @@ func TestTrustSSH_TheOptInTrustsOnlyAPinnedConfirmation(t *testing.T) {
 		{"dial failure", "best-effort", func(context.Context, fence.HostConfig) fence.Result {
 			return fence.Result{Method: "best-effort-ssh", Dialled: true, Detail: "SSH failed (exit status 255) [path=managed]"}
 		}, "down"},
+		{"armed then killed", "best-effort", func(context.Context, fence.HostConfig) fence.Result {
+			return fence.Result{Method: "best-effort-ssh", Dialled: true, Answered: true, Path: "managed",
+				Detail: "SSH failed (signal: killed): litevirt-fence-armed [path=managed]"}
+		}, "down"},
 		{"unconfirmed", "ssh", func(context.Context, fence.HostConfig) fence.Result {
 			return fence.Result{Method: "ssh", Detail: "remote command exited 0 without confirming it ran [path=managed]"}
 		}, "down"},

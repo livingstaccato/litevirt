@@ -581,7 +581,10 @@ func fenceSSH(ctx context.Context, h HostConfig, lenient bool) Result {
 			Path:    h.SSH.pathLabel(),
 		}
 	}
-	answered := sshAnswered(runErr, out)
+	// A marker the host printed is the host's shell running: it answered,
+	// whatever became of the session after (a power-off hung in
+	// device_shutdown with the NIC still up, killed by the context).
+	answered := armed || sshAnswered(runErr, out)
 	if runErr == nil {
 		runErr = errors.New("remote command exited 0 without confirming it ran")
 	}

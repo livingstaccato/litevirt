@@ -386,3 +386,30 @@ func TestFenceSSH_AnAnsweringHostIsMarked(t *testing.T) {
 		})
 	}
 }
+
+// The remote shell printed the marker and then the session hung (a power-off
+// stuck in device_shutdown while sshd still answers), so the fence's context
+// kills ssh. The host's shell ran: the fence is Answered, a failure that is
+// never a self-pause, and not a confirmed power-off that a host trusting one
+// could recover on (review B-3, the reviewer's probe).
+//
+// Mutation: answered without the marker term (sshAnswered alone) — red.
+func TestFenceSSH_ArmedThenKilledIsAnsweredNotConfirmed(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "ssh")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\ncase \"$1\" in -G) exit 0 ;; esac\nprintf 'litevirt-fence-armed\\n'\nexec sleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	defer OverrideSSHBinaryForTest(bin)()
+	for _, strategy := range []string{"best-effort", "ssh"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		h := sshHost()
+		h.FenceStrategy = strategy
+		h.SSH = SSHFence{Path: SSHPathPinned, KnownHosts: []byte("a ssh-ed25519 AAAA\n"), HostKeyAlias: "a"}
+		r := Execute(ctx, h)
+		cancel()
+		if r.Success || !r.Answered || ConfirmedOverPin(r) {
+			t.Fatalf("%s: armed-then-killed fence = %+v, want an Answered failure, not a confirmed power-off", strategy, r)
+		}
+	}
+}

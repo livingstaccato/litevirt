@@ -308,9 +308,14 @@ with nothing deleted: repair or remove that file, then retry.
 
 A create never clears a file at the path it writes that a delete kept on that
 host, or that another file of the VM's name there backs on. Besides the note,
-it reads `<data_dir>/kept-disks.json` (each disk a delete kept on that host and
-its whole backing chain, entries an earlier build recorded with no note among
-them) and the qcow2 headers of the `<vm>-*` files beside the path. Such a
+it reads the whole backing chain of every file a note names (a note names the
+deleted VM's own files only, so the base of a kept linked clone, another VM's
+disk, is reached through the chain), `<data_dir>/kept-disks.json` (each disk a
+delete kept on that host and its whole backing chain, entries an earlier build
+recorded with no note among them) and the qcow2 headers of the `<vm>-*` files
+beside the path. A file only another deleted VM's note lists, or one another
+kept disk's chain reaches, is refused rather than moved to a `.kept-` name:
+moving it breaks that chain. Such a
 create is refused (`FailedPrecondition`), naming the file and why, with nothing
 moved or removed: move the kept files away yourself (then `qemu-img rebase -u
 -b <new path> <overlay>`), or place the VM on another host. A VM created of the
@@ -321,15 +326,17 @@ wherever they now are; a revert to one restores the deleted VM's guest. A
 file, as does a kept disk's backing chain that cannot be read (a backing file
 that does not exist ends the chain and holds nothing, but a create or import
 that would write a disk at that path is refused, naming the overlay that
-names it: the new disk would become its base. The path is where the disk is
+names it, whether a note or `kept-disks.json` records it: the new disk would
+become its base. The path is where the disk is
 written: the disk directory, or for a disk on a pool where its driver puts it
 (nfs included); both are compared with their
 directories resolved through symlinks, so a pool whose directory is a symlink
 to the disk directory writes the same files); the refusal names the
 entry, and the way out is to fix that file, or, once nothing needs the disk,
 move it away or remove its entry from `<data_dir>/kept-disks.json`. An
-unreadable `kept-disks.json` or kept chain does not depend on the name: until
-it reads, these are refused on that host, and `disk_leftover` names the file
+unreadable `kept-disks.json`, kept-disk note or kept chain does not depend on
+the name: until it reads, these are refused on that host, and for
+`kept-disks.json` and its chains `disk_leftover` names the file
 (`creates_refused`): every `lv import`; every create or `lv clone` that writes
 a disk file on the host's own storage (one with no disk file, or with every
 disk on shared nfs, ceph or iscsi storage outside the disk directory, goes
@@ -349,9 +356,14 @@ moving them aside as an orphan. Every other path that removes disk files on
 the host (a delete's or rebuild's disk cleanup, `lv iso rm <pool>/<file>`, a
 migration's or volume move's source cleanup, replica pruning) leaves a file a
 `kept-disks.json` entry names or reaches through its backing chain, as it
-leaves a file a note names, unless a VM's disk record on that host still names
-that entry's own file (a delete that failed keeps its record, and its retry
-frees it); the files under it stay held.
+leaves a file a note names or a noted file's backing chain reaches, unless a
+VM's disk record on that host still names that entry's own file (a delete that
+failed keeps its record, and its retry frees it); the files under it stay
+held. A plain `lv rm` or an `lv rebuild` of a VM whose disk such a chain
+reaches below its top (the source of a linked clone deleted with
+`--keep-disks`) is refused (`FailedPrecondition`) before anything is done,
+naming the kept disk: delete it with `--keep-disks`, or release the kept disk
+first (`lv host kept-disks <host> --release <path>`).
 
 **Releasing kept disks.** `lv host kept-disks <host>` lists every disk chain
 the deletes kept on that host, from its notes (`<data_dir>/kept-disks/<vm>.json`)

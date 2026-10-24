@@ -285,7 +285,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /lb/{name}/drain", s.requireAuthFunc(s.handleLBDrain))
 	mux.HandleFunc("GET /images", s.requireAuthFunc(s.handleImages))
 	mux.HandleFunc("GET /events", s.requireAuthFunc(s.handleEvents))
-	mux.HandleFunc("GET /activity", s.requireAuthFunc(s.handleActivity))
 	mux.HandleFunc("GET /audit", s.requireAuthFunc(s.handleAudit))
 	mux.HandleFunc("GET /storage", s.requireAuthFunc(s.handleStorage))
 	mux.HandleFunc("GET /storage/ceph", s.requireAuthFunc(s.handleCephDashboard))

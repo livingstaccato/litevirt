@@ -563,8 +563,7 @@ run as **root** for it (a non-root daemon refuses it). At start, the daemon:
   (`landlock` in `/sys/kernel/security/lsm`); nothing is installed for it. A
   host with neither AppArmor nor Landlock refuses file restore;
 - **creates `/var/cache/litevirt-restore`** for the restore VM's boot files and
-  `/run/litevirt/file-restore` for its sessions, and removes an older build's
-  `/var/lib/litevirt/file-restore/cache`.
+  `/run/litevirt/file-restore` for its sessions.
 
 None of this happens with `file_restore: {enabled: false}` in the daemon
 config (the start-up sweep of leftover restore VMs still runs).

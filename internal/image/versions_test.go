@@ -182,3 +182,22 @@ func TestPublish_ReuseRecordsTheRepublish(t *testing.T) {
 	}
 	check("publishing an earlier version again", before)
 }
+
+// Only the forms a tagged build writes are read: a 16-hex version name and a
+// JSON provenance record. The 12-hex name and the bare-digest record lived only
+// between two pre-rc1 commits and are no longer recognised.
+func TestVersionForms_OnlyTheShippedOnesAreRead(t *testing.T) {
+	if !isVersionFile("ubuntu", "ubuntu@0123456789abcdef.qcow2") {
+		t.Fatal("a 16-hex version name is not recognised")
+	}
+	if isVersionFile("ubuntu", "ubuntu@0123456789ab.qcow2") {
+		t.Fatal("a 12-hex version name is still recognised")
+	}
+	p := filepath.Join(t.TempDir(), "ubuntu.qcow2")
+	if err := os.WriteFile(identityPath(p), []byte(digestOf([]byte("x"))+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := RecordedProvenance(p); ok {
+		t.Fatal("a bare-digest record still reads as provenance")
+	}
+}

@@ -547,14 +547,3 @@ func resolveUpstreamDNS() []string {
 	}
 	return servers
 }
-
-// RemoveNAT tears down the legacy iptables MASQUERADE + FORWARD rules a prior
-// binary added for a managed subnet. Masquerade is now rendered as nft in the
-// canonical litevirt-fw table; this remains for deprovision teardown and the
-// one-time upgrade migration (RemoveLegacyBridgeFirewall). Idempotent.
-func RemoveNAT(subnet, bridge string) error {
-	execCommand("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", subnet, "!", "-o", bridge, "-j", "MASQUERADE") //nolint:errcheck
-	execCommand("iptables", "-D", "FORWARD", "-i", bridge, "-j", "ACCEPT")                                         //nolint:errcheck
-	execCommand("iptables", "-D", "FORWARD", "-o", bridge, "-j", "ACCEPT")                                         //nolint:errcheck
-	return nil
-}

@@ -41,8 +41,7 @@ import (
 // '@' is not in the image-name charset (safename), so a version file never
 // collides with another image's file.
 
-// versionHexLen is how much of the sha256 a version file is named by; a
-// 12-hex name from an earlier build of this branch is still read.
+// versionHexLen is how much of the sha256 a version file is named by.
 const versionHexLen = 16
 
 // pointerPath is the symlink naming an image's current version.
@@ -82,7 +81,7 @@ func isVersionFile(name, base string) bool {
 		return false
 	}
 	h, ok := strings.CutSuffix(rest, ".qcow2")
-	if !ok || (len(h) != versionHexLen && len(h) != 12) {
+	if !ok || (len(h) != versionHexLen) {
 		return false
 	}
 	for _, c := range h {
@@ -168,9 +167,7 @@ type Provenance struct {
 }
 
 // RecordedProvenance is path's provenance record; ok is false when it has
-// none (a file an earlier build published and nothing has seen since). A
-// record from an earlier build of this branch (the bare digest) reads with a
-// zero PublishedAt.
+// none (a file an earlier build published and nothing has seen since).
 func RecordedProvenance(path string) (Provenance, bool) {
 	b, err := os.ReadFile(identityPath(path))
 	if err != nil {
@@ -178,7 +175,7 @@ func RecordedProvenance(path string) (Provenance, bool) {
 	}
 	var p Provenance
 	if json.Unmarshal(b, &p) != nil {
-		p = Provenance{SHA256: strings.TrimSpace(string(b))}
+		return Provenance{}, false
 	}
 	if !validDigest(p.SHA256) {
 		return Provenance{}, false

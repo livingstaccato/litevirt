@@ -121,11 +121,10 @@ later. Turning the flag on was a permanent commitment to an unfinished design.
 **Removed** in `c6d990d1` (*chore(capabilities): retire the canonical_registry
 opt-in until its writer ships*, 2026-10-04):
 
-- the `enforcement.canonical_registry` config field and its docs. A config that
-  still sets it keeps loading: the key is ignored, and `LoadConfig` logs a WARN
-  that names it as retired (`retiredConfigKeys`, internal/daemon/config.go;
-  `TestLoadConfig_RetiredCanonicalRegistryFlagLoadsAndWarns`). Refusing to start
-  over it would strand every node that ever opted in;
+- the `enforcement.canonical_registry` config field and its docs. No config
+  written since v1.10.0-rc1 sets it, and v1.9 does not upgrade in place to
+  1.10, so the key is not on the retired-key list (`retiredConfigKeys`); the
+  typed decode ignores it like any unknown key;
 - `Server.SetCanonicalRegistryEnforce` / `enfCanonicalRegistry`, the advertisement
   filter and the `tokenEnabled` case;
 - `canonical_registry_v1` from `capabilities.Supported()` and `capabilities.All()`;
@@ -163,8 +162,7 @@ capabilities package now has a **retired** set (`capabilities.Retired`,
 - the preflight treats a retired marker as known: it logs the marker and does not
   quarantine;
 - the marker is left in place. It is still evidence that the node ran as a member
-  (the founder-marker check relies on that), and a binary rolled back to v1.9.0
-  reads it as it always did;
+  (the founder-marker check relies on that);
 - names in the set are never removed and never reused.
 
 `TestPreflightCapabilityRollback_RetiredTokenIsNotARollback`
@@ -181,23 +179,15 @@ any live row, revoke removes it, and a replicated legacy login converges over it
 `TestRegistryCanonicalRows_StayValidForTheLegacyPaths` covers all of this. Nothing
 has to be migrated. In practice no production path ever wrote such a row.
 
-**Upgrading a cluster that latched it.** During the roll, an old-build node with
-`enforcement.canonical_registry: true` and the latch will see upgraded peers stop
-advertising the token, and will raise `ha_degraded` (`unsupported_member`) until it
-is upgraded too. Set the flag to `false` on the old nodes before rolling. That
-turns off their `tokenEnabled` and silences the alarm. Nothing else changes,
-because nothing emits the canonical shape. The lab never enabled it (no config
-key, no marker).
-
 ## 3. Which token ships the feature
 
 **A fresh token, `canonical_registry_v2`.** Do not reuse `canonical_registry_v1`:
 
 - clusters may already hold its marker. Reusing the name would make them come up
   pre-latched for the new contract without having gone through it;
-- v1.4.0–v1.9.0 binaries advertise the v1 name (flag on) with accept-only
-  semantics. In a mixed-version cluster the reused name could latch across nodes
-  that do not implement the freeze, the barrier or legacy rejection;
+- v1.4.0–v1.9.0 binaries advertised the v1 name (flag on) with accept-only
+  semantics, so a marker under that name means something other than the new
+  contract: the freeze, the barrier and legacy rejection;
 - the retired set's rule is that a retired name is never reused.
 
 v2 should be **advertised on the strength of the build** and **replication-gated**
@@ -411,7 +401,7 @@ Each one mutation-verified (break the property, watch it fail, restore):
   upsert shape is frozen again.
 - Should the new writer reuse `registryCanonicalUpsertSQL` exactly, so the existing
   `DispReject` entry turns into the gated entry, or use a fresh shape? Reusing it
-  means a v1.9.0 receiver still refuses it, which is the fail-closed answer, but
+  means a receiver on an older 1.10 build still refuses it, which is the fail-closed answer, but
   ties the new design to the old full-image SET.
 - Is step 7 worth a schema bump at all, given step 5 already makes duplicates
   impossible by construction?

@@ -1872,10 +1872,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// kernel refuses the table or whose pass failed or ran out of time. Until
 	// every host enforces them, a guarded VM is placed only on such a host.
 	d.fwReconciler.SetPassHook(nicGuardLabelHook(d.db, d.cfg.HostName, d.cfg.Version))
-	// Upgrade migration: once the reconciler renders a bridge's NAT/isolation into
-	// litevirt-fw, clear the pre-consolidation out-of-band rules (old iptables
-	// masquerade + `inet litevirt` chains) a prior binary left for it.
-	d.fwReconciler.SetLegacyCleanup(network.RemoveLegacyBridgeFirewall)
 	svc.SetFirewallReconciler(d.fwReconciler)
 	// This build's units, before the first per-NIC table is loaded: the main
 	// unit's ExecStartPre removes that table when a build that does not own it
@@ -2237,9 +2233,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// File restore then refuses, naming the missing user.
 			slog.Warn("file restore: no restore VM user", "error", err)
 		}
-		// Round-1 builds kept the boot files in data_dir, owned by qemu's
-		// user; they are never read again.
-		_ = os.RemoveAll(filepath.Join(d.cfg.DataDir, "file-restore", "cache"))
 		idle := time.Duration(fr.IdleTimeoutSec) * time.Second
 		if idle <= 0 {
 			idle = 5 * time.Minute
@@ -2286,7 +2279,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// pool directory, and one on an NFS mount whose server does not answer
 	// blocked this start for good (lab 2 F-1; startup_bound.go).
 	startStorageSweeps(ctx, svc)
-	startLegacyImageProvenance(ctx, svc)
 
 	// Now that the gRPC server exists, wire it as the failover coordinator's
 	// replica promoter (auto_promote recovery) and start the coordinator.

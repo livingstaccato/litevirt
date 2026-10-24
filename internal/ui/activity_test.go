@@ -29,15 +29,13 @@ func TestEventsPage(t *testing.T) {
 	}
 }
 
-// TestActivityRedirect asserts the former /activity page redirects to the
-// unified /events page (back-compat for old bookmarks / cross-links).
-func TestActivityRedirect(t *testing.T) {
+// TestActivityDoesNotRedirect: the former /activity page and its redirect to
+// /events are gone. The path now falls through to the GET / catch-all, which
+// renders the dashboard; the test asserts only that nothing redirects.
+func TestActivityDoesNotRedirect(t *testing.T) {
 	s := newTestUIServer(t, newDefaultMock())
-	w := serveRequest(s, withAuth(mustReq(t, "GET", "/activity?limit=50")))
-	if w.Code != http.StatusFound {
-		t.Fatalf("status = %d, want %d", w.Code, http.StatusFound)
-	}
-	if loc := w.Header().Get("Location"); loc != "/events?limit=50" {
-		t.Errorf("redirect Location = %q, want /events?limit=50", loc)
+	w := serveRequest(s, withAuth(mustReq(t, "GET", "/activity")))
+	if w.Code == http.StatusFound || w.Header().Get("Location") != "" {
+		t.Fatalf("/activity still redirects: %d %q", w.Code, w.Header().Get("Location"))
 	}
 }

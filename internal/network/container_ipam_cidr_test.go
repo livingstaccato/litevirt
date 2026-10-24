@@ -113,39 +113,25 @@ func insertLegacyLease(t *testing.T, db *corrosion.Client, netName, ip, owner st
 	}
 }
 
-// M1: two containers that already shared one address on main (rows
-// "172.16.77.50/24" and "172.16.77.50") must each keep it when rebuilt —
-// restore or relocation — after the upgrade, with a WARN about the duplicate.
-// Only a NEW allocation of the address is refused.
-func TestReserveContainerNICs_LegacyAliasSurvivesRebuild(t *testing.T) {
+// Two containers holding one address under two spellings ("x/24" and "x")
+// is not kept: a rebuild of one is refused like any other reserve over a live
+// lease on the same host address, and its NIC is blanked.
+func TestReserveContainerNICs_SharedAddressNotKeptOnRebuild(t *testing.T) {
 	ctx := context.Background()
 	db := cidrTestDB(t)
 	insertLegacyLease(t, db, "lxtnet", "172.16.77.50/24", "lxt3")
 	insertLegacyLease(t, db, "lxtnet", "172.16.77.50", "lxt4")
-
-	// lxt3 is removed and restored: its lease is released, lxt4's stays.
 	if err := ReleaseContainerLeases(ctx, db, "node-3", "lxt3"); err != nil {
 		t.Fatal(err)
 	}
-	logs := captureWarn(t)
-	unreserved, err := ReserveContainerNICs(ctx, db, "node-3", "lxt3", hereProof(""), []corrosion.ContainerInterfaceRecord{
+	unreserved, err := ReserveContainerNICs(ctx, db, "node-3", "lxt3", []corrosion.ContainerInterfaceRecord{
 		{NetworkName: "lxtnet", IP: "172.16.77.50/24", MAC: "mac-3"},
 	})
-	if err != nil || unreserved != 0 {
-		t.Fatalf("rebuild of a container in a pre-existing alias lost its address: unreserved=%d err=%v", unreserved, err)
+	if err != nil || unreserved != 1 {
+		t.Fatalf("rebuild over another holder's address: unreserved=%d err=%v, want 1", unreserved, err)
 	}
-	if ok, _ := ipLeaseHeldBy(ctx, db, "lxtnet", "172.16.77.50", "ct", "node-3", "lxt3"); !ok {
-		t.Fatal("lxt3 does not hold its lease after the rebuild")
-	}
-	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "lxt4") {
-		t.Fatalf("no WARN naming the other holder: %q", logs.String())
-	}
-
-	// A new container asking for the address is still refused, in either spelling.
-	for _, ip := range []string{"172.16.77.50", "172.16.77.50/24"} {
-		if ok, err := ReserveContainerIP(ctx, db, "lxtnet", ip, "mac-9", "node-3", "lxt9"); err != nil || ok {
-			t.Fatalf("new allocation of %s over the alias: ok=%v err=%v", ip, ok, err)
-		}
+	if ok, _ := ipLeaseHeldBy(ctx, db, "lxtnet", "172.16.77.50", "ct", "node-3", "lxt3"); ok {
+		t.Fatal("lxt3 holds a lease on lxt4's address after the rebuild")
 	}
 }
 
@@ -156,7 +142,7 @@ func TestReserveContainerNICs_SameSpellingConflictStillRefused(t *testing.T) {
 	db := cidrTestDB(t)
 	insertLegacyLease(t, db, "lxtnet", "172.16.77.50", "lxt4")
 	logs := captureWarn(t)
-	unreserved, _ := ReserveContainerNICs(ctx, db, "node-3", "lxt3", hereProof(""), []corrosion.ContainerInterfaceRecord{
+	unreserved, _ := ReserveContainerNICs(ctx, db, "node-3", "lxt3", []corrosion.ContainerInterfaceRecord{
 		{NetworkName: "lxtnet", IP: "172.16.77.50", MAC: "mac-3"},
 	})
 	if unreserved != 1 {
@@ -197,7 +183,7 @@ func TestReserveContainerNICs_CopyOnAnotherHostRefused(t *testing.T) {
 	if ok, err := ReserveContainerIP(ctx, db, "net", "10.0.0.5/24", "mac-a", "host-a", "web"); err != nil || !ok {
 		t.Fatalf("original reserve: %v %v", ok, err)
 	}
-	unreserved, _ := ReserveContainerNICs(ctx, db, "host-b", "web", hereProof(""), []corrosion.ContainerInterfaceRecord{
+	unreserved, _ := ReserveContainerNICs(ctx, db, "host-b", "web", []corrosion.ContainerInterfaceRecord{
 		{NetworkName: "net", IP: "10.0.0.5/24", MAC: "mac-b"},
 	})
 	if unreserved != 1 {
@@ -222,7 +208,7 @@ func TestReserveContainerNICs_ReallocatedAddressRefused(t *testing.T) {
 	if ok, err := ReserveContainerIP(ctx, db, "net", "10.0.0.5", "mac-y", "host-c", "y"); err != nil || !ok {
 		t.Fatalf("y reserve: %v %v", ok, err)
 	}
-	unreserved, _ := ReserveContainerNICs(ctx, db, "host-a", "x", hereProof(""), []corrosion.ContainerInterfaceRecord{
+	unreserved, _ := ReserveContainerNICs(ctx, db, "host-a", "x", []corrosion.ContainerInterfaceRecord{
 		{NetworkName: "net", IP: "10.0.0.5/24", MAC: "mac-x"},
 	})
 	if unreserved != 1 {
@@ -247,31 +233,11 @@ func TestReserveContainerNICs_ReallocatedAfterReleaseRefusedEvenWithPriorRow(t *
 	if ok, err := ReserveContainerIP(ctx, db, "lxtnet", "172.16.77.50", "mac-9", "node-9", "lxt9"); err != nil || !ok {
 		t.Fatalf("lxt9 takes the released address: %v %v", ok, err)
 	}
-	unreserved, _ := ReserveContainerNICs(ctx, db, "node-3", "lxt3", hereProof(""), []corrosion.ContainerInterfaceRecord{
+	unreserved, _ := ReserveContainerNICs(ctx, db, "node-3", "lxt3", []corrosion.ContainerInterfaceRecord{
 		{NetworkName: "lxtnet", IP: "172.16.77.50/24", MAC: "mac-3"},
 	})
 	if unreserved != 1 {
 		t.Fatalf("lxt3 took back an address lxt9 acquired after lxt3 released it: unreserved=%d", unreserved)
-	}
-}
-
-// m5: when the canonical key is free, the kept alias is written under it.
-func TestReserveContainerNICs_LegacyAliasUsesCanonicalKeyWhenFree(t *testing.T) {
-	ctx := context.Background()
-	db := cidrTestDB(t)
-	insertLegacyLease(t, db, "lxtnet", "172.16.77.50/24", "lxt3")
-	insertLegacyLease(t, db, "lxtnet", "172.16.77.50/16", "lxt4")
-	if err := ReleaseContainerLeases(ctx, db, "node-3", "lxt3"); err != nil {
-		t.Fatal(err)
-	}
-	if u, _ := ReserveContainerNICs(ctx, db, "node-3", "lxt3", hereProof(""), []corrosion.ContainerInterfaceRecord{
-		{NetworkName: "lxtnet", IP: "172.16.77.50/24", MAC: "mac-3"},
-	}); u != 0 {
-		t.Fatalf("legacy alias not kept: unreserved=%d", u)
-	}
-	al, _ := GetAllocationFor(ctx, db, "lxtnet", "ct", "node-3", "lxt3")
-	if al == nil || al.IP != "172.16.77.50" {
-		t.Fatalf("kept alias lease = %+v, want the canonical key 172.16.77.50", al)
 	}
 }
 
@@ -291,70 +257,10 @@ func TestReserveContainerNICs_CopyRefusedDespiteOriginalsOldRow(t *testing.T) {
 	      VALUES ('net', '10.0.0.5', 'mac-a', 'web', 'ct', 'host-a', '2026-10-01T00:00:00Z', ?)`, db.NowTS())
 	exec(`INSERT INTO ip_allocations (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at, deleted_at)
 	      VALUES ('net', '10.0.0.5/24', 'mac-a', 'web', 'ct', 'host-a', '2026-09-01T00:00:00Z', ?, '2026-10-02T00:00:00Z')`, db.NowTS())
-	unreserved, _ := ReserveContainerNICs(ctx, db, "host-b", "web", hereProof(""), []corrosion.ContainerInterfaceRecord{
+	unreserved, _ := ReserveContainerNICs(ctx, db, "host-b", "web", []corrosion.ContainerInterfaceRecord{
 		{NetworkName: "net", IP: "10.0.0.5/24", MAC: "mac-b"},
 	})
 	if unreserved != 1 {
 		t.Fatalf("copy on host-b took the original's live address: unreserved=%d", unreserved)
-	}
-}
-
-// hereProof is the lease proof of a container in project whose row on the
-// rebuilding host belonged (before the rebuild) to the same project.
-func hereProof(project string) LeaseProof {
-	return LeaseProof{Project: project, HereProject: project, HereKnown: true}
-}
-
-func insertCTRow(t *testing.T, db *corrosion.Client, host, name, project string, deleted bool) {
-	t.Helper()
-	if err := corrosion.UpsertContainer(context.Background(), db, corrosion.ContainerRecord{
-		HostName: host, Name: name, State: "stopped", Project: project,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if deleted {
-		if err := corrosion.DeleteContainer(context.Background(), db, host, name); err != nil {
-			t.Fatal(err)
-		}
-	}
-}
-
-// n1: the lease proof is bound to the container's project. alpha's web held
-// "x/24" beside Z's "x" before the upgrade; alpha's web is deleted. A beta
-// container also named web, restored with a spec naming x/24, is not alpha's
-// web: it must not take Z's address — on alpha's old host or another one.
-// alpha's own restore keeps it.
-func TestReserveContainerNICs_LeaseProofBoundToProject(t *testing.T) {
-	ctx := context.Background()
-	nic := []corrosion.ContainerInterfaceRecord{{NetworkName: "lxtnet", IP: "172.16.77.50/24", MAC: "mac-w"}}
-	setup := func(t *testing.T) *corrosion.Client {
-		db := cidrTestDB(t)
-		insertLegacyLease(t, db, "lxtnet", "172.16.77.50/24", "web")
-		insertLegacyLease(t, db, "lxtnet", "172.16.77.50", "z")
-		insertCTRow(t, db, "node-3", "web", "alpha", true)
-		if err := ReleaseContainerLeases(ctx, db, "node-3", "web"); err != nil {
-			t.Fatal(err)
-		}
-		return db
-	}
-
-	db := setup(t)
-	if u, _ := ReserveContainerNICs(ctx, db, "node-3", "web",
-		LeaseProof{Project: "beta", HereProject: "alpha", HereKnown: true}, nic); u != 1 {
-		t.Fatalf("beta's web on alpha's old host took Z's address: unreserved=%d", u)
-	}
-	db = setup(t)
-	if u, _ := ReserveContainerNICs(ctx, db, "node-4", "web", LeaseProof{Project: "beta"}, nic); u != 1 {
-		t.Fatalf("beta's web on another host took Z's address: unreserved=%d", u)
-	}
-	// beta's web restored on node-4, where a beta web also lived once: the
-	// proof is the prior lease's host (node-3, alpha's), not this host.
-	db = setup(t)
-	if u, _ := ReserveContainerNICs(ctx, db, "node-4", "web", hereProof("beta"), nic); u != 1 {
-		t.Fatalf("beta's web with a beta history on node-4 took Z's address: unreserved=%d", u)
-	}
-	db = setup(t)
-	if u, _ := ReserveContainerNICs(ctx, db, "node-3", "web", hereProof("alpha"), nic); u != 0 {
-		t.Fatalf("alpha's own restore lost its legacy alias: unreserved=%d", u)
 	}
 }

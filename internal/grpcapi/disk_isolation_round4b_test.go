@@ -459,7 +459,7 @@ func TestRestoreInPlace_LegacyBackupOnAnImageWhoseBytesChangedIsRefused(t *testi
 	f := newRestoreFixture(t)
 	f.s.virt = libvirtfake.New()
 	_, img, _ := legacyImageBackup(t, f, true, legacyPulled, legacyBackup)
-	f.s.RecordLegacyImageProvenance(context.Background())
+	f.s.recordImageProvenance(context.Background(), "ubuntu")
 	fh, err := os.OpenFile(img, os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatal(err)

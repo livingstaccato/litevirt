@@ -22,6 +22,11 @@ If the new binary panics on startup, systemd's `OnFailure` hook restores
 the previous binary automatically. If pre-flight blocks the upgrade, the
 output tells you why; pass `--force` only after addressing the cause.
 
+**v1.9 does not upgrade in place to 1.10.** A 1.10 cluster is either founded
+fresh on 1.10 or upgraded from a 1.10 release candidate (`v1.10.0-rc1` or
+later). To move workloads off a v1.9 cluster, found a new 1.10 cluster and
+recreate them there.
+
 ---
 
 ## Why upgrades are safe by default
@@ -126,8 +131,7 @@ Use this only when you understand the risk — for example, you've
 The first start of a build with single-file restore (and file restore not
 disabled) creates the `litevirt-restore` system account, loads the
 `litevirt-restore-qemu` AppArmor profile where AppArmor is enabled, creates
-`/var/cache/litevirt-restore` and `/run/litevirt/file-restore`, and removes
-`/var/lib/litevirt/file-restore/cache` left by an earlier build. To avoid the
+`/var/cache/litevirt-restore` and `/run/litevirt/file-restore`. To avoid the
 account being created by the daemon, create it beforehand
 ([installation.md](installation.md#what-file-restore-changes-on-the-host)); to
 avoid all of it, set `file_restore: {enabled: false}` before upgrading.
@@ -734,9 +738,9 @@ so it quarantines only for a feature of it that was used. Its one feature is
 ([below](#projects-created-before-the-upgrade-get-a-stable-identity)), and it
 is used by default on any cluster that holds a project created before
 `project_incarnation_v1` latched: the first adoption pass after the latch
-gives each such project its stable identity. So on every cluster upgraded from
-v1.9 with a project of its own, a rollback below `release_2027_01_v1`
-quarantines from that pass on. A cluster none of whose projects was created
+gives each such project its stable identity. So on every cluster with a
+project created before `project_incarnation_v1` latched, a rollback below
+`release_2027_01_v1` quarantines from that pass on. A cluster none of whose projects was created
 before `project_incarnation_v1` latched never uses it. That includes most
 clusters founded on v1.10, but not a project created on one in the moments
 before that token latched. To keep the ability to roll back, set
@@ -1032,11 +1036,6 @@ A typical rolling upgrade across, say, 5 hosts:
    lv host ls                  # all VERSION columns match
    journalctl -t litevirt-rollback   # should be empty
    ```
-
-   A cluster set up on v1.9 or earlier has no migration-TLS credentials, so
-   `lv migrate --with-storage` is refused after the upgrade until you run
-   `lv host install-migration-tls` once from the machine that holds the
-   cluster CA (docs/migration-failover.md).
 
 4. **Post-check.** Spot-check a VM lifecycle:
    ```bash
@@ -1532,10 +1531,9 @@ with the re-admission reset but without this change settles a tie between a
 stamped and an unstamped row on the stamped one only where the two rows
 otherwise agree; one that pulled the stale row whole (it has no such guard)
 differs in control-plane columns too, and leaves the tie unresolved until it
-is upgraded. A host on a build without the reset (v1.9.0 and earlier) leaves
-the tie unresolved, as before. An older-build host can also erase the stamp by
-pulling a newer, unstamped row from another older-build host. Where no host
-stamped, the tie stays as it was.
+is upgraded. An older-build host can also erase the stamp by pulling a newer,
+unstamped row from another older-build host. Where no host stamped, the tie
+stays as it was.
 
 The two `created_at` values come from two hosts' clocks. If the host's
 original `created_at` is later than the re-admission's — a clock skew larger

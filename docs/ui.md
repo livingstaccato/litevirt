@@ -508,7 +508,7 @@ The full set of routes mounted by `internal/ui/server.go`:
 | `/networks` | Network list |
 | `/lb`, `/lb/{name}` | Load-balancer list + detail |
 | `/images` | Image inventory |
-| `/events` | Cluster Events — recent operation history (vm_events) seeded server-side + a live SSE tail prepending new events. (`/activity` redirects here.) |
+| `/events` | Cluster Events — recent operation history (vm_events) seeded server-side + a live SSE tail prepending new events. |
 | `/audit` | Audit log (filterable by `?target=…&action=…`) |
 | `/users` | User and token management |
 | `/account/2fa` | Per-user TOTP + WebAuthn enrolment |

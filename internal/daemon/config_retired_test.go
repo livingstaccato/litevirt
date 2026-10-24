@@ -29,33 +29,6 @@ func loadConfigYAML(t *testing.T, yaml string) (*Config, error) {
 	return LoadConfig()
 }
 
-// TestLoadConfig_RetiredCanonicalRegistryFlagLoadsAndWarns: enforcement.canonical_registry
-// was retired with its token (canonical_registry_v1). A node whose config still sets it —
-// every node that ever opted in — must keep starting, so the key is accepted and ignored,
-// and the operator is told, by name, that it no longer does anything.
-//
-// Mutation: drop the retired-key check — the load still succeeds (yaml ignores the key)
-// but nothing is logged, and the WARN assertion goes red.
-func TestLoadConfig_RetiredCanonicalRegistryFlagLoadsAndWarns(t *testing.T) {
-	for _, val := range []string{"true", "false"} {
-		t.Run(val, func(t *testing.T) {
-			logs := captureSlog(t)
-			cfg, err := loadConfigYAML(t, "host_name: h\nenforcement:\n  canonical_registry: "+val+"\n  vm_replace: true\n")
-			if err != nil {
-				t.Fatalf("a config that still sets enforcement.canonical_registry refused to load: %v", err)
-			}
-			if !cfg.Enforcement.VMReplace {
-				t.Error("a sibling enforcement flag was lost beside the retired key")
-			}
-			out := logs.String()
-			if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "enforcement.canonical_registry") ||
-				!strings.Contains(out, "retired") {
-				t.Errorf("no WARN naming the retired enforcement.canonical_registry; log:\n%s", out)
-			}
-		})
-	}
-}
-
 // TestLoadConfig_RetiredPCIUdevHookLoadsAndWarns: pci.udev_hook was retired. Host
 // init wrote it into every config it produced, so a node whose config still sets it
 // must keep starting, with the sibling PCI settings intact, and the operator is told
@@ -91,5 +64,18 @@ func TestLoadConfig_NoRetiredKeyNoWarn(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), "retired") {
 		t.Errorf("a retired-key WARN without the key; log:\n%s", logs.String())
+	}
+}
+
+// enforcement.canonical_registry was readable only up to v1.9.0, which does not
+// upgrade in place to 1.10, so it is not on the retired-key list: a config that
+// sets it loads like one with any unknown key, and its sibling flags survive.
+func TestLoadConfig_CanonicalRegistryKeyStillLoads(t *testing.T) {
+	cfg, err := loadConfigYAML(t, "host_name: h\nenforcement:\n  canonical_registry: true\n  vm_replace: true\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Enforcement.VMReplace {
+		t.Error("a sibling enforcement flag was lost beside the unknown key")
 	}
 }

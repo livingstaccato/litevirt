@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"strings"
@@ -90,6 +91,14 @@ func (r *Reconciler) setAsideSupersededDisk(ctx context.Context, vmName, proofID
 	}
 	if r.transferDisks.builtFor(d.Path, proofID) {
 		return "", nil
+	}
+	// A file a kept disk is, or backs on, is never renamed: the kept
+	// overlay names it by its path (re-review P5). The start fails, and is
+	// retried, until an operator releases or flattens the kept disk.
+	if r.keptHold != nil {
+		if held, why := r.keptHold(ctx, d.Path); held {
+			return "", fmt.Errorf("the old copy of the VM's disk at %s is not set aside, so the VM is not started on it: %s", d.Path, why)
+		}
 	}
 	aside := supersededName(d.Path, time.Now())
 	if err := renameSetAside(d.Path, aside); err != nil {

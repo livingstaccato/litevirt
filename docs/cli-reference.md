@@ -194,6 +194,11 @@ lv host superseded-disks <host>           # List the disk copies a failover set 
   [--purge] [--older-than 72h]            #   remove the ones neither retained nor held (admin)
   [--remove <copy>]...                    #   remove exactly these copies, even retained (admin)
   [--restore <copy>]                      #   put a copy back as its stopped VM's disk (admin)
+lv host kept-disks <host>                 # List the disk chains VM deletes kept on a host (notes and
+                                          #   kept-disks.json): VM, files, under layers, size, when, why
+  [--release <vm|path>]                   #   remove one deleted VM's chains, or the chain a file is in,
+                                          #   with their note and record entries (admin, audited)
+  [--dry-run] [--yes]                     #   show what it removes and why it is refused / skip the prompt
 lv host lun-holds [host]                  # List the holds kept on iSCSI LUNs a rebuild or recreate moved
 lv host lun-hold discard <lun> --yes      # Move a hold aside so the LUN can be taken again (admin, audited)
   [--host <host>]                         #   on that host (default: the one host holding it)
@@ -302,9 +307,14 @@ with nothing deleted: repair or remove that file, then retry.
 
 A create never clears a file at the path it writes that a delete kept on that
 host, or that another file of the VM's name there backs on. Besides the note,
-it reads `<data_dir>/kept-disks.json` (each disk a delete kept on that host and
-its whole backing chain, entries an earlier build recorded with no note among
-them) and the qcow2 headers of the `<vm>-*` files beside the path. Such a
+it reads the whole backing chain of every file a note names (a note names the
+deleted VM's own files only, so the base of a kept linked clone, another VM's
+disk, is reached through the chain), `<data_dir>/kept-disks.json` (each disk a
+delete kept on that host and its whole backing chain, entries an earlier build
+recorded with no note among them) and the qcow2 headers of the `<vm>-*` files
+beside the path. A file only another deleted VM's note lists, or one another
+kept disk's chain reaches, is refused rather than moved to a `.kept-` name:
+moving it breaks that chain. Such a
 create is refused (`FailedPrecondition`), naming the file and why, with nothing
 moved or removed: move the kept files away yourself (then `qemu-img rebase -u
 -b <new path> <overlay>`), or place the VM on another host. A VM created of the
@@ -315,7 +325,8 @@ wherever they now are; a revert to one restores the deleted VM's guest. A
 file, as does a kept disk's backing chain that cannot be read (a backing file
 that does not exist ends the chain and holds nothing, but a create or import
 that would write a disk at that path is refused, naming the overlay that
-names it: the new disk would become its base. The path is where the disk is
+names it, whether a note or `kept-disks.json` records it: the new disk would
+become its base. The path is where the disk is
 written: the disk directory, or for a disk on a pool where its driver puts it
 (nfs included); both are compared with their
 directories resolved through symlinks, so a pool whose directory is a symlink
@@ -326,8 +337,9 @@ record readable, a clone (into any pool, nfs included), a disk attach, a
 volume move (its copy at `<pool dir>/<vm>-<disk>.qcow2`, checked before
 anything is copied) or a
 `--target-path` restore that would write a kept overlay's missing base is
-refused as a create is. Until an
-unreadable `kept-disks.json` or kept chain reads, `disk_leftover` names the
+refused as a create is. A kept chain that reads refuses even while another
+does not. Until an unreadable `kept-disks.json`, kept-disk note or kept chain
+reads, `disk_leftover` names the
 file (`creates_refused`), and each `lv import`, create or `lv clone` that
 writes a disk file on the host's own storage, disk attach that creates a new
 disk, `lv move-volume` (and `lv stack migrate-volumes` move) into a pool on
@@ -360,9 +372,107 @@ moving them aside as an orphan. Every other path that removes disk files on
 the host (a delete's or rebuild's disk cleanup, `lv iso rm <pool>/<file>`, a
 migration's or volume move's source cleanup, replica pruning) leaves a file a
 `kept-disks.json` entry names or reaches through its backing chain, as it
-leaves a file a note names, unless a VM's disk record on that host still names
-that entry's own file (a delete that failed keeps its record, and its retry
-frees it); the files under it stay held.
+leaves a file a note names or a noted file's backing chain reaches, or the
+backing chain of a set-aside `.kept-` or `.superseded-` copy reaches, unless a
+VM's disk record on that host still names that entry's own file (a delete that
+failed keeps its record, and its retry frees it); the files under it stay
+held. A VM whose disk such a chain reaches below its top (the source of a
+linked clone deleted with `--keep-disks`, also once a create of the clone's
+name moved its overlay to a `.kept-` name) is not run, moved or written in
+place: `lv start` (and the failover, reconciler, onboot and health restarts,
+and a cutover's restart), `lv migrate` (cold or live, and a drain's moves), a
+plain `lv rm`, `lv rebuild`, `lv snapshot rm` and `lv snapshot restore` of a
+snapshot whose files the kept disk backs on, and an in-place backup restore
+over that disk are refused (`FailedPrecondition`) before anything is done,
+naming the kept disk. A failover's set-aside of a disk it left on the host,
+and the purge of set-aside copies, leave such a file where it is. The way out:
+delete the VM with `--keep-disks`; release the kept disk first
+(`lv host kept-disks <host> --release <path>`; for a set-aside copy,
+`lv host superseded-disks <host>`); or make the kept disk standalone with
+nothing using it, `qemu-img rebase -f qcow2 -b '' <kept disk>`, which copies
+what it reads from the base into it, so it needs free space up to about the
+size of the base. Never add `-u`: that only rewrites the header and loses the
+data the kept disk read from the base.
+
+A finding from any note, copy or record that can be read always refuses. While
+one cannot be read, a rebuild, a snapshot rm or restore and an in-place
+restore are refused on that host; a start or a migrate is refused only for a VM
+that could be a base: a template, or one whose disk a disk row (live or
+deleted, on any host) records as its backing disk. Every other VM starts.
+
+A note is this host's own. The source of a kept clone is not migrated off the
+host that noted it (above), but a VM on shared storage (an nfs pool) that runs
+on another host for any other reason (a failover, a promotion) is not held
+there by a kept disk this host noted, and a plain `lv rm` on that host can free
+the base; keep such a VM on the host that noted the kept disk until the kept
+disk is released or made standalone.
+
+**Releasing kept disks.** `lv host kept-disks <host>` lists every disk chain
+the deletes kept on that host, from its notes (`<data_dir>/kept-disks/<vm>.json`)
+and its `<data_dir>/kept-disks.json`: the deleted VM, the files a release
+removes (an overlay before the file it backs on; `under` marks a file a kept
+layer above backs on), the files below the chain that are not the VM's own
+(an image, left in place), the size, when it was kept and why, the note and
+record naming it, and why a release is refused now. `--release <vm|path>`
+removes every kept chain of the deleted VM of that name, or the one chain a
+file is in, with their note and record entries, then judges `disk_leftover`
+again, which clears for them. It removes whole chains, each overlay before the
+file it backs on, never a file under a chain it leaves. Of a chain it removes
+only the deleted VM's own files: those its note or record names, and the
+`<vm>-<disk>.qcow2` files a create of exactly that name would clear (never VM
+`<vm>-1`'s). A link among them counts as the link only, never as the file it
+points at. A file a chain reaches through a `..` in a backing reference
+(where it is depends on symlinked directories) is listed only, under what the
+chain stands on, even when a note names it: a delete notes nothing from that
+layer down, a release never removes it, and once no kept chain reaches it any
+more (any note's, `kept-disks.json`'s) a release forgets a note entry naming
+it, leaving the file. While a kept file above it is there, a create and every
+other path that removes disk files leave it, as they leave a file a note
+names. To tell, every noted file's backing chain is read: while one cannot be
+read (a bad header, a `..` after a regular file), every path on that host
+that removes disk files (a create's clearing, a delete's or rebuild's disk
+cleanup, `lv iso rm <pool>/<file>`, a migration's or volume move's source
+cleanup, replica pruning) leaves every file, and `lv host kept-disks --release`
+refuses, each naming the noted file and its note. The way out is to fix that
+file, move it away (a noted file that is not there reaches nothing), or, once
+nothing needs it, remove its entry from `<data_dir>/kept-disks/<vm>.json`. Every file below them (an image, another VM's disk, a file in a
+directory named like the VM) stays, listed under what the chain stands on. It
+removes regular files on this host's own storage only: a record naming a
+device node, a link (an LVM or zvol volume) or a file on shared storage is
+listed and refused, since unlinking a link leaves its volume unnamed, and
+what other hosts hold on a shared file cannot be checked or locked from one
+host; remove those by hand. Each file is checked to be the one the plan saw
+(device and inode) just before it is removed: one replaced meanwhile is left,
+and the release stops. It is refused (`FailedPrecondition`), removing nothing,
+while anything references a file it would remove: a VM's disk row on that
+host, another VM's disk or another kept chain backing on it, a snapshot record
+naming it as its memory image, a recorded replica, a set-aside copy layered
+on it, or a domain on that host that uses it or has the deleted VM's name. A
+note, `kept-disks.json` or a chain that cannot be read refuses it too, naming
+the file. The deleted VM's snapshot records on that host are taken over these
+files, and `lv snapshot rm` cannot reach them once the VM is gone: a release
+of every chain of the VM drops them with the files when no VM of the name
+exists on any host and each memory image is unrecorded, gone, or a file the
+release removes. Once the files are gone it checks again, and the drop reads both
+again inside its own write: a VM of the name that now exists, or a record
+that is no longer the one the plan saw (another host's under the same name),
+keeps the records. Known limit: a same-name VM's snapshot taken on another
+host that has not replicated to this host yet is not seen, and the drop wins
+over it on every host. That costs at most that one record per name dropped,
+never a file; take the snapshot again. The plan names them; otherwise they refuse it. It shows
+exactly what it removes and drops and asks to confirm (`--yes` skips the
+question; without a terminal it is required); the files and records confirmed
+are sent with the release (the files are required), and a release that would
+now remove or drop any others is refused (`Aborted`). `--dry-run` shows the
+plan and the refusal, removing nothing. The release needs admin, is refused
+while that host's replica has not caught up, and writes an audit entry
+`host.kept_disks.release` on that host naming each file removed and its size,
+and each snapshot record dropped, and a `vm.disk.released` event of the VM. A host on an older build answers
+that it does not know the command, and removes nothing. A record of a disk on
+another host is listed and not released: check it there, then remove its
+entry by hand. The `.kept-` copies a create moved aside are not released
+here: `lv host superseded-disks` lists them. The files their backing chains
+reach are held all the same (above).
 
 **`--keep-disks` and snapshots.** `lv rm --keep-disks` of a VM that has
 snapshots is refused (`FailedPrecondition`, naming them) before anything is

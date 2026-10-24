@@ -139,7 +139,7 @@ func TestTendStrandedDisks_SetsTheRealDiskAsideWhenItsHostReturns(t *testing.T) 
 		t.Fatalf("notifications = %q, want one naming the copy", notified)
 	}
 	// A month later the VM still exists: the sweep keeps the copy.
-	if _, err := PurgeSupersededDisks(ctx, db, dataDir, 7*24*time.Hour, time.Now().Add(30*24*time.Hour)); err != nil {
+	if _, err := PurgeSupersededDisks(ctx, db, dataDir, 7*24*time.Hour, time.Now().Add(30*24*time.Hour), nil); err != nil {
 		t.Fatal(err)
 	}
 	if !exists(ev.Disks[0].Copy) {
@@ -150,7 +150,7 @@ func TestTendStrandedDisks_SetsTheRealDiskAsideWhenItsHostReturns(t *testing.T) 
 	if err := db.Execute(ctx, `UPDATE vm_disks SET path = '/elsewhere/web-root.qcow2', updated_at = ? WHERE vm_name = 'web' AND disk_name = 'root'`, db.NowTS()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := PurgeSupersededDisks(ctx, db, dataDir, 7*24*time.Hour, time.Now().Add(30*24*time.Hour)); err != nil {
+	if _, err := PurgeSupersededDisks(ctx, db, dataDir, 7*24*time.Hour, time.Now().Add(30*24*time.Hour), nil); err != nil {
 		t.Fatal(err)
 	}
 	if !exists(ev.Disks[0].Copy) {

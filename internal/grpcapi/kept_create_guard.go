@@ -29,9 +29,14 @@ import (
 // refuses:
 //
 //   - this host's kept-disk notes (health.KeptNotedFiles). With notesGovern
-//     a noted file is left to health.SetAsideBeforeCreate, which moves a kept
-//     disk to a .kept- name, with an event, and refuses a file one backs on;
-//     without, every noted file refuses;
+//     a file the note of name lists is left to health.SetAsideBeforeCreate,
+//     which moves a kept disk to a .kept- name, with an event, and refuses a
+//     file one backs on; a file another VM's note lists, and every noted
+//     file without notesGovern, refuses;
+//   - the backing chain of every noted file (keptNoteChainHolds): each file
+//     below its top, which the note need not name (the base of a kept linked
+//     clone is another VM's disk). Only name's own chain over a file its own
+//     note lists is left to SetAsideBeforeCreate;
 //   - this host's kept-disks.json (disk_kept.go): each disk a delete kept on
 //     this host, and every file of its backing chain. A stale-record delete
 //     recorded its kept disks there only, with no note, before rc3 lab 2 F1,
@@ -41,9 +46,10 @@ import (
 //     reaches it, as a kept snapshot overlay's reaches the disk it was taken
 //     of, whatever records exist.
 //
-// It also refuses while a kept disk's chain ends at a backing file that does
-// not exist at a path the create writes (writes, keptWrites): the kept
-// overlay names that path, and the new disk would become its base.
+// It also refuses while a kept disk's chain, noted or recorded, ends at a
+// backing file that does not exist at a path the create writes (writes,
+// keptWrites): the kept overlay names that path, and the new disk would
+// become its base.
 //
 // A note, kept-disks.json, a kept disk's chain or the chain of a file beside
 // it that cannot be read refuses a create that clears a file: what it would
@@ -90,13 +96,45 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 		return fmt.Errorf("the create clears a file left by an earlier VM %s, and this host's notes of the disks deletes kept "+
 			"cannot be read (%v); repair or remove that file, then retry, or place the VM on another host", name, err)
 	}
-	if !notesGovern {
-		for f := range present {
-			if vm, ok := noted[f]; ok {
-				return refuse(f, fmt.Sprintf("the deleted VM %s was kept with, as its kept-disk note %s lists it", vm,
-					filepath.Join(s.dataDir, "kept-disks", vm+".json")))
-			}
+	// With notesGovern, only a file the note of name itself lists is left to
+	// SetAsideBeforeCreate, which reads that note alone: one another deleted
+	// VM's note lists would be swept.
+	for f := range present {
+		if vm, ok := noted[f]; ok && (!notesGovern || vm != name) {
+			return refuse(f, fmt.Sprintf("the deleted VM %s was kept with, as its kept-disk note %s lists it", vm,
+				filepath.Join(s.dataDir, "kept-disks", vm+".json")))
 		}
+	}
+
+	// A file a noted file's chain reaches below it, which that note need not
+	// name (keptNoteChainHolds): the base of a kept linked clone, or a file
+	// reached through "..". Only name's own chain over a file name's note
+	// lists is left to SetAsideBeforeCreate, which refuses it (note.Under);
+	// moving the base of another VM's kept disk aside, as it would a noted
+	// disk of name, breaks that disk's chain (rc7 lab 1 F1).
+	holds, err := s.keptNoteChainHolds(ctx)
+	if err != nil {
+		if storage.IsFSNoAnswer(err) {
+			return fmt.Errorf("the create clears a file left by an earlier VM %s, and %v; nothing was moved or removed", name, err)
+		}
+		return health.NewKeptBackingFileError(fmt.Sprintf("the create clears a file left by an earlier VM %s, and %v; "+
+			"nothing was moved or removed", name, err))
+	}
+	for f := range present {
+		hs, err := keptChainHeldIn(holds, f)
+		if err != nil {
+			return fmt.Errorf("the create clears %s, and what it is cannot be told (%v); retry once that storage answers, "+
+				"or place the VM on another host", f, err)
+		}
+		for _, h := range hs {
+			if notesGovern && h.vm == name && noted[f] == name {
+				continue
+			}
+			return refuse(f, h.what(s))
+		}
+	}
+	if refusal, _ := s.keptNoteMissingBase(ctx, writes); refusal != nil {
+		return refusal
 	}
 
 	chains, err := s.keptRegistryChains(ctx)
@@ -141,7 +179,7 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 			// A missing backing file ends it, as nothing under it is reached.
 			stat := chainStat // read here: the walk may outlive this call
 			layers, err := storage.Bounded("read the backing chain of", p, func() ([]string, error) {
-				l, _, err := walkKeptChain(stat, p, true)
+				l, _, _, err := walkKeptChain(stat, p, true)
 				return l, err
 			})
 			if err != nil {
@@ -207,29 +245,47 @@ func missingBaseRefusal(c keptRegistryChain, registry string) error {
 
 // keptMissingBaseRefusal is keptFileCreateRefusal's check of a create that
 // clears nothing: one that writes the missing backing file of a kept disk's
-// chain is refused. A nil writes is a create that writes no disk file (no
-// disk, or every disk on ceph or iscsi): no kept overlay can back on what it
-// makes. While the registry or a chain in it cannot be read, one that writes
-// on this host's own storage (keptWrites.local) is judged by the disk files
-// on this host instead (keptCollisionOnDisk); one that does not is not held.
+// chain is refused, whether a kept-disk note or kept-disks.json records the
+// disk; a chain that can be read refuses even while another cannot. A nil
+// writes is a create that writes no disk file (no disk, or every disk on ceph
+// or iscsi): no kept overlay can back on what it makes. While a note, the
+// registry or a chain cannot be read, one that writes on this host's own
+// storage (keptWrites.local) is judged by the disk files on this host instead
+// (keptCollisionOnDisk); one that does not is not held.
 func (s *Server) keptMissingBaseRefusal(ctx context.Context, writes *keptWrites) error {
 	if writes == nil {
 		return nil
 	}
 	registry := filepath.Join(s.dataDir, diskKeptFile)
-	chains, err := s.keptRegistryChains(ctx)
-	if err != nil {
-		if !writes.local {
-			return nil
-		}
-		return s.keptCollisionOnDisk(ctx, err, writes, registry)
+	// A noted file's chain first (keptNoteMissingBase): a note is what `lv rm
+	// --keep-disks` writes, and kept-disks.json then has no entry at all (rc7
+	// lab 1 F1). The chains that read refuse here; a note or chain that does
+	// not is decided below, once the registry has had its say.
+	refusal, noteErr := s.keptNoteMissingBase(ctx, writes)
+	if refusal != nil {
+		return refusal
 	}
+	chains, err := s.keptRegistryChains(ctx)
 	for _, c := range chains {
 		if err := writes.missingBaseRefusal(c, registry); err != nil {
 			return err
 		}
 	}
-	return nil
+	var unknown error
+	switch {
+	case err != nil && noteErr != nil:
+		unknown = &keptRegistryError{msg: fmt.Sprintf("%v, and %v", err, noteErr),
+			transient: keptRegistryTransient(err) || storage.IsFSNoAnswer(noteErr)}
+	case err != nil:
+		unknown = err
+	case noteErr != nil:
+		unknown = &keptRegistryError{msg: noteErr.Error(), transient: storage.IsFSNoAnswer(noteErr)}
+		registry = filepath.Join(s.dataDir, "kept-disks")
+	}
+	if unknown == nil || !writes.local {
+		return nil
+	}
+	return s.keptCollisionOnDisk(ctx, unknown, writes, registry)
 }
 
 // keptWrites is the files an operation writes, for the check of a kept
@@ -536,7 +592,7 @@ func (s *Server) keptCollisionScan(ctx context.Context, writes *keptWrites) (str
 			missing string
 		}
 		w, err := storage.Bounded("read the backing chain of", p, func() (walked, error) {
-			l, m, err := walkKeptChain(stat, p, true)
+			l, m, _, err := walkKeptChain(stat, p, true)
 			return walked{l, m}, err
 		})
 		if err != nil {

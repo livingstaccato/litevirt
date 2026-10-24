@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -57,29 +58,49 @@ func (s *Server) keepDisksSnapshotRefusal(ctx context.Context, req *pb.DeleteVMR
 // delete_with_vm=false), its file and the files of its backing chain below
 // it, top first. A chain that cannot be read in full is an error naming the
 // file: what the kept disk is built on is then unknown, and a file under it
-// would be left unprotected.
-func (s *Server) keptDiskChains(ctx context.Context, name string, keepDisks bool) ([]corrosion.DiskRecord, [][]string, error) {
+// would be left unprotected. dotdots[i] is the index in chains[i] of the
+// first layer reached through a ".." reference, -1 when none
+// (keptChainWalk).
+func (s *Server) keptDiskChains(ctx context.Context, name string, keepDisks bool) (kept []corrosion.DiskRecord, chains [][]string, dotdots []int, err error) {
 	disks, err := corrosion.GetVMDisks(ctx, s.db, name)
 	if err != nil {
-		return nil, nil, &diskRecordsReadError{err}
+		return nil, nil, nil, &diskRecordsReadError{err}
 	}
-	var kept []corrosion.DiskRecord
-	var chains [][]string
 	for _, d := range disks {
 		if !s.keptHere(d, keepDisks) {
 			continue
 		}
 		top := filepath.Clean(s.hostDiskFile(d.Path))
-		layers, err := storage.Bounded("read the backing chain of", top, func() ([]string, error) {
-			return keptChainLayers(top)
+		w, err := storage.Bounded("read the backing chain of", top, func() (keptWalked, error) {
+			l, _, dd, err := walkKeptChain(os.Stat, top, false)
+			return keptWalked{layers: l, dotdot: dd}, err
 		})
 		if err != nil {
-			return nil, nil, fmt.Errorf("the backing chain of its disk %s cannot be read (%w)", d.DiskName, err)
+			return nil, nil, nil, fmt.Errorf("the backing chain of its disk %s cannot be read (%w)", d.DiskName, err)
 		}
 		kept = append(kept, d)
-		chains = append(chains, layers)
+		chains = append(chains, w.layers)
+		dotdots = append(dotdots, w.dotdot)
 	}
-	return kept, chains, nil
+	return kept, chains, dotdots, nil
+}
+
+// keptWalked is one walk of a kept file's backing chain (walkKeptChain).
+type keptWalked struct {
+	layers  []string
+	missing string
+	dotdot  int
+}
+
+// aboveDotDot is layers down to, and not including, the first one reached
+// through a ".." reference (dotdot, -1 when none): what a note may name as
+// the VM's own. Where a ".." leads depends on symlinked directories, so that
+// layer and everything below it are listed only, never noted.
+func aboveDotDot(layers []string, dotdot int) []string {
+	if dotdot >= 0 && dotdot < len(layers) {
+		return layers[:dotdot]
+	}
+	return layers
 }
 
 // diskRecordsReadError is a VM's disk records that cannot be read.
@@ -111,7 +132,7 @@ func (s *Server) keptHere(d corrosion.DiskRecord, keepDisks bool) bool {
 // declared qcow2 backing file without the magic, and a chain deeper than
 // maxBackingDepth are errors naming the file.
 func keptChainLayers(file string) ([]string, error) {
-	layers, _, err := walkKeptChain(os.Stat, file, false)
+	layers, _, _, err := walkKeptChain(os.Stat, file, false)
 	return layers, err
 }
 
@@ -121,53 +142,98 @@ func keptChainLayers(file string) ([]string, error) {
 // below it is reached, but the last layer still names it, so a file written
 // there becomes that layer's base. Any other error is still one.
 func keptChainLayersToMissing(file string) (layers []string, missing string, err error) {
+	layers, missing, _, err = walkKeptChain(os.Stat, file, true)
+	return layers, missing, err
+}
+
+// keptChainWalk is keptChainLayersToMissing, and also the index of the first
+// layer reached through a backing reference with a ".." element (-1 when
+// none): that layer's path depends on where symlinked directories lead, so a
+// caller that removes files treats it, and everything below it, as listed
+// only (keptBackingPath).
+func keptChainWalk(file string) (layers []string, missing string, dotdot int, err error) {
 	return walkKeptChain(os.Stat, file, true)
 }
 
-// walkKeptChain reads file's chain for keptChainLayers and
-// keptChainLayersToMissing, statting each layer with stat.
-func walkKeptChain(stat func(string) (os.FileInfo, error), file string, stopAtMissing bool) ([]string, string, error) {
+// keptBackingPath is the file an overlay at overlay names as its backing
+// file b, as the kernel finds it: a relative b is joined to the overlay's
+// directory, and a ".." element is taken physically, after the symlinked
+// directories before it, not by cleaning the text (qemu passes the joined
+// path to open(2) as it is). dotdot reports a ".." element. A directory on
+// the way that does not exist (or a dangling link) leaves the joined path as
+// it is, uncleaned: a stat of it then fails as the kernel's open does, even
+// when a file sits at the path its text cleans to.
+func keptBackingPath(overlay, b string) (path string, dotdot bool, err error) {
+	raw := b
+	if !filepath.IsAbs(b) {
+		raw = filepath.Dir(overlay) + string(filepath.Separator) + b
+	}
+	if !slices.Contains(strings.Split(raw, string(filepath.Separator)), "..") {
+		return filepath.Clean(raw), false, nil
+	}
+	i := strings.LastIndex(raw, string(filepath.Separator))
+	dir, base := raw[:i], raw[i+1:]
+	if base == ".." || base == "." || base == "" {
+		dir, base = raw, ""
+	}
+	real, err := filepath.EvalSymlinks(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return raw, true, nil
+	}
+	if err != nil {
+		return "", true, fmt.Errorf("%s: resolve its backing file %s: %w", overlay, b, err)
+	}
+	return filepath.Join(real, base), true, nil
+}
+
+// walkKeptChain reads file's chain for keptChainLayers,
+// keptChainLayersToMissing and keptChainWalk, statting each layer with stat.
+func walkKeptChain(stat func(string) (os.FileInfo, error), file string, stopAtMissing bool) ([]string, string, int, error) {
 	var out []string
 	path, declaredQcow2 := file, false
+	dotdot := -1
 	for depth := 0; depth <= maxBackingDepth; depth++ {
 		fi, err := stat(path)
 		if err != nil {
 			if depth == 0 && errors.Is(err, fs.ErrNotExist) {
-				return nil, "", nil
+				return nil, "", -1, nil
 			}
 			if stopAtMissing && errors.Is(err, fs.ErrNotExist) {
-				return out, path, nil
+				return out, path, dotdot, nil
 			}
-			return nil, "", fmt.Errorf("%s: %w", path, err)
+			return nil, "", -1, fmt.Errorf("%s: %w", path, err)
 		}
 		out = append(out, path)
 		if !fi.Mode().IsRegular() {
-			return out, "", nil
+			return out, "", dotdot, nil
 		}
 		isQ, err := hasQcow2Magic(path)
 		if err != nil {
-			return nil, "", fmt.Errorf("%s: %w", path, err)
+			return nil, "", -1, fmt.Errorf("%s: %w", path, err)
 		}
 		if !isQ {
 			if declaredQcow2 {
-				return nil, "", fmt.Errorf("%s: the overlay above it declares it qcow2, and it has no qcow2 header", path)
+				return nil, "", -1, fmt.Errorf("%s: the overlay above it declares it qcow2, and it has no qcow2 header", path)
 			}
-			return out, "", nil
+			return out, "", dotdot, nil
 		}
 		info, err := qcow2.Info(path)
 		if err != nil {
-			return nil, "", fmt.Errorf("%s: %w", path, err)
+			return nil, "", -1, fmt.Errorf("%s: %w", path, err)
 		}
 		if info.BackingFile == "" || looksLikeProtocol(info.BackingFile) {
-			return out, "", nil
+			return out, "", dotdot, nil
 		}
-		b := info.BackingFile
-		if !filepath.IsAbs(b) {
-			b = filepath.Join(filepath.Dir(path), b)
+		next, dd, err := keptBackingPath(path, info.BackingFile)
+		if err != nil {
+			return nil, "", -1, err
 		}
-		path, declaredQcow2 = filepath.Clean(b), info.BackingFormat == "qcow2"
+		if dd && dotdot < 0 {
+			dotdot = len(out)
+		}
+		path, declaredQcow2 = next, info.BackingFormat == "qcow2"
 	}
-	return nil, "", fmt.Errorf("%s: backing chain deeper than %d", file, maxBackingDepth)
+	return nil, "", -1, fmt.Errorf("%s: backing chain deeper than %d", file, maxBackingDepth)
 }
 
 // hasQcow2Magic reports whether path starts with the qcow2 magic.
@@ -195,7 +261,7 @@ func hasQcow2Magic(path string) (bool, error) {
 // file as one a kept disk backs on (noteKeptDisks), and a create of the name
 // refuses while it is there.
 func (s *Server) keptChainRefusal(ctx context.Context, req *pb.DeleteVMRequest) error {
-	_, chains, err := s.keptDiskChains(ctx, req.Name, req.KeepDisks)
+	_, chains, _, err := s.keptDiskChains(ctx, req.Name, req.KeepDisks)
 	var rerr *diskRecordsReadError
 	if errors.As(err, &rerr) {
 		return status.Errorf(codes.Internal,

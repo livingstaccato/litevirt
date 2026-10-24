@@ -2507,6 +2507,15 @@ func (s *Server) startGatesLocked(ctx context.Context, method string, vm *corros
 				"--mode full`, first",
 			vm.Name, len(clones), strings.Join(clones, ", "))
 	}
+	// Nor while a kept disk backs on its disk: a linked clone deleted with
+	// --keep-disks is no longer in linkedClonesOf, and its kept overlay (noted,
+	// recorded, or moved aside as a .kept- copy) still names this VM's disk as
+	// its base (security review R1). A readable finding always refuses; while
+	// kept state cannot be read, only a VM that could be a base is refused
+	// (keptOnUnknownIfBase, re-review P2).
+	if err := s.keptBaseRefusal(ctx, vm.Name, "start", "", false, keptOnUnknownIfBase); err != nil {
+		return nil, err
+	}
 
 	// Host capacity admission. Starting is where memory is actually CONSUMED —
 	// usage counts running and starting VMs only (corrosion.SumVMResourcesByHost),
@@ -2628,6 +2637,17 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	// on the move's target (movingVMStartRefusal reads the row again).
 	if err := s.movingVMStartRefusal(ctx, vm); err != nil {
 		return releasePreflight, err
+	}
+	// Nor one whose disk a kept disk backs on (keptBaseRefusal), by any path:
+	// the operator start (checked in startGatesLocked too), and the failover,
+	// reconciler, onboot and health restarts that reach the domain start only
+	// through here. A finding from any chain that could be read refuses,
+	// whatever else could not be read (re-review P1); while kept state cannot
+	// be read, only a VM that could be a base is refused (P2).
+	if s.db != nil {
+		if err := s.keptBaseRefusal(ctx, vm.Name, "start", "", false, keptOnUnknownIfBase); err != nil {
+			return releasePreflight, err
+		}
 	}
 	// A cutover that a crash interrupted after its commit owes this name its
 	// runtime handoff: until the resume (which runs in the background, and
@@ -3960,6 +3980,11 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	}
 	if err := s.keptChainRefusal(ctx, req); err != nil {
 		return nil, err
+	}
+	if !req.KeepDisks {
+		if err := s.keptBaseRefusal(ctx, req.Name, "delete VM", "delete it with --keep-disks, or ", true, keptOnUnknownAllow); err != nil {
+			return nil, err
+		}
 	}
 
 	// Verify the domain actually exists in libvirt on this host. If the
@@ -5451,6 +5476,12 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"%q still backs %d linked clone(s) (%s); delete or full-clone them first",
 			req.Name, len(clones), strings.Join(clones, ", "))
+	}
+	// Nor a disk a kept chain backs on: a linked clone deleted with
+	// --keep-disks is no longer in linkedClonesOf, and its kept overlay still
+	// names this VM's disk as its base. Fails closed, as the clone check does.
+	if err := s.keptBaseRefusal(ctx, req.Name, "rebuild", "", false, keptOnUnknownRefuse); err != nil {
+		return nil, err
 	}
 
 	// BEFORE anything destructive: a VM holding an address on a NetBox-bound

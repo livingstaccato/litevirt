@@ -5,11 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/qcow2"
@@ -30,13 +31,18 @@ import (
 // layer explicitly ("backing": {"driver": …, "file": {"filename":
 // "/proc/self/fd/M"}}, and so on down the chain, the last qcow2 layer
 // "backing": null): qemu-img then opens no file by any name a header holds,
-// even one written into it in place after the checks. Which file each descriptor is was judged here: its backing name,
-// read from the open file above it and resolved as precheckChain resolves
-// it, must be exactly the backing precheckChain accepted.
+// even one written into it in place after the checks. Which file each
+// descriptor is was judged here: its backing name, read from the open file
+// above it and resolved as precheckChain resolves it, must be exactly the
+// backing precheckChain accepted.
 type heldConvert struct {
 	layers  []*os.File
 	formats []string
 	dst     *os.File
+	// dstDir is the destination's directory, held open; dstCreated: the
+	// destination was made by this call (removeCreated takes it back).
+	dstDir     *os.File
+	dstCreated bool
 }
 
 func (h *heldConvert) close() {
@@ -46,30 +52,74 @@ func (h *heldConvert) close() {
 	if h.dst != nil {
 		h.dst.Close()
 	}
+	if h.dstDir != nil {
+		h.dstDir.Close()
+	}
+}
+
+// removeCreated removes the destination when this call made it, through its
+// held directory (unlinkat), and only while that name is still the file it
+// made: a refused copy leaves nothing it created. A destination its caller
+// made is the caller's.
+func (h *heldConvert) removeCreated() {
+	if !h.dstCreated || h.dst == nil || h.dstDir == nil {
+		return
+	}
+	name := filepath.Base(h.dst.Name())
+	fi, err := h.dst.Stat()
+	if err != nil {
+		return
+	}
+	var st unix.Stat_t
+	if err := unix.Fstatat(int(h.dstDir.Fd()), name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return
+	}
+	sys, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || uint64(sys.Dev) != uint64(st.Dev) || uint64(sys.Ino) != uint64(st.Ino) {
+		return
+	}
+	_ = unix.Unlinkat(int(h.dstDir.Fd()), name, 0)
 }
 
 // openConvertTop opens the source's top layer and the destination before
 // anything judges them by name: the source no-follow and regular; the
-// destination, a file the caller made, no-follow and regular, or made here
-// (O_EXCL, owner-only) when it is not there yet.
+// destination, beneath its directory held open, a file the caller made,
+// no-follow, regular and with no other name (a hard link planted at it
+// would let the copy write another file), or made here (O_EXCL, owner-only)
+// when it is not there yet.
 func openConvertTop(src, srcFormat, dst string) (*heldConvert, error) {
 	top, _, err := openRegularNoFollow(src)
 	if err != nil {
 		return nil, fmt.Errorf("source %s: %w", src, err)
 	}
 	h := &heldConvert{layers: []*os.File{top}, formats: []string{srcFormat}}
-	out, err := os.OpenFile(dst, os.O_RDWR|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if errors.Is(err, fs.ErrNotExist) {
-		out, err = os.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, diskmode.File)
+	fail := func(err error) (*heldConvert, error) {
+		h.removeCreated()
+		h.close()
+		return nil, err
+	}
+	dir := filepath.Dir(dst)
+	dfd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fail(fmt.Errorf("destination directory %s: %w", dir, err))
+	}
+	h.dstDir = os.NewFile(uintptr(dfd), dir)
+	name := filepath.Base(dst)
+	fd, err := unix.Openat(dfd, name, unix.O_RDWR|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ENOENT) {
+		fd, err = unix.Openat(dfd, name, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(diskmode.File))
+		h.dstCreated = err == nil
 	}
 	if err != nil {
-		h.close()
-		return nil, fmt.Errorf("destination %s: %w", dst, err)
+		return fail(fmt.Errorf("destination %s: %w", dst, err))
 	}
-	h.dst = out
-	if fi, err := out.Stat(); err != nil || !fi.Mode().IsRegular() {
-		h.close()
-		return nil, fmt.Errorf("destination %s is not a regular file", dst)
+	h.dst = os.NewFile(uintptr(fd), dst)
+	fi, err := h.dst.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
+		return fail(fmt.Errorf("destination %s is not a regular file", dst))
+	}
+	if sys, ok := fi.Sys().(*syscall.Stat_t); !ok || sys.Nlink != 1 {
+		return fail(fmt.Errorf("destination %s has another name (a hard link); it is not written", dst))
 	}
 	return h, nil
 }

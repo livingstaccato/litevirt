@@ -1240,7 +1240,7 @@ func convertImageForceShare(ctx context.Context, src, srcFormat string, rule cha
 // the argv.
 var qemuImgCommand = cmdbound.Command
 
-func convertImageWith(ctx context.Context, src, srcFormat string, rule chainRule, dst string, emit func(*pb.MoveVolumeProgress) error, forceShare bool) error {
+func convertImageWith(ctx context.Context, src, srcFormat string, rule chainRule, dst string, emit func(*pb.MoveVolumeProgress) error, forceShare bool) (retErr error) {
 	if srcFormat != "qcow2" && srcFormat != "raw" {
 		return status.Errorf(codes.InvalidArgument, "source format %q: only raw or qcow2 is converted", srcFormat)
 	}
@@ -1253,6 +1253,11 @@ func convertImageWith(ctx context.Context, src, srcFormat string, rule chainRule
 		return status.Errorf(codes.FailedPrecondition, "%v", err)
 	}
 	defer held.close()
+	defer func() {
+		if retErr != nil {
+			held.removeCreated() // a refused or failed copy leaves nothing it made
+		}
+	}()
 	// No symlink on the way either; on an NFS export mounted without
 	// nosymfollow (a kernel before 5.10) the kernel would follow one.
 	for _, p := range []string{src, dst} {

@@ -331,3 +331,71 @@ func TestConvertImage_AnExternalDataFileIsRefused(t *testing.T) {
 		t.Fatalf("convertImage of an image with an external data file = %v (qemu-img ran: %v); want FailedPrecondition before qemu-img", err, ran)
 	}
 }
+
+// A hard link planted at the destination (a pool-directory writer can link a
+// file it cannot write under the temp's name) is refused: the destination
+// must have exactly one name. (Re-review of fix/migrate-followups, item 4.)
+// Mutation: drop the link-count check in openConvertTop - the copy writes
+// through the link into the other file: red.
+func TestConvertImage_AHardLinkAtTheDestinationIsRefused(t *testing.T) {
+	needQemuImg(t)
+	src := filepath.Join(t.TempDir(), "vm-root.qcow2")
+	qcow2WithData(t, src, "LEGITIMATE-DISK-")
+	out := t.TempDir()
+	victim := filepath.Join(out, "victim")
+	if err := os.WriteFile(victim, []byte("VICTIM"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(out, ".repl-x.tmp")
+	if err := os.Link(victim, dst); err != nil {
+		t.Fatal(err)
+	}
+	err := convertImage(context.Background(), src, "qcow2", nil, dst, noProgress)
+	if b, _ := os.ReadFile(victim); string(b) != "VICTIM" {
+		t.Fatal("the copy wrote through a hard link at the destination")
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("convertImage onto a hard link = %v; want FailedPrecondition", err)
+	}
+}
+
+// A refused copy removes the destination it created itself, and only that:
+// a destination its caller made is the caller's to remove.
+// Mutation: drop the removal in convertImageWith - "made here" red.
+func TestConvertImage_ARefusedCopyRemovesTheDestinationItMade(t *testing.T) {
+	needQemuImg(t)
+	refused := func(t *testing.T) string {
+		dir := t.TempDir()
+		base := filepath.Join(dir, "base.qcow2")
+		qcow2WithData(t, base, "LEGITIMATE-BASE-")
+		top := filepath.Join(dir, "vm-root.qcow2")
+		if err := qcow2.CreateWithBackingFormat(top, "base.qcow2", "qcow2", convertFDSize, nil); err != nil {
+			t.Fatal(err)
+		}
+		return top
+	}
+	t.Run("made here", func(t *testing.T) {
+		top := refused(t)
+		dst := filepath.Join(t.TempDir(), "new.qcow2")
+		if err := convertImage(context.Background(), top, "qcow2", nil, dst, noProgress); err == nil {
+			t.Fatal("fixture: the copy was not refused")
+		}
+		if _, err := os.Lstat(dst); err == nil {
+			t.Fatal("a refused copy left the destination it created")
+		}
+	})
+	t.Run("made by the caller", func(t *testing.T) {
+		top := refused(t)
+		f, err := os.CreateTemp(t.TempDir(), ".repl-*.tmp")
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+		if err := convertImage(context.Background(), top, "qcow2", nil, f.Name(), noProgress); err == nil {
+			t.Fatal("fixture: the copy was not refused")
+		}
+		if _, err := os.Lstat(f.Name()); err != nil {
+			t.Fatalf("a refused copy removed its caller's destination: %v", err)
+		}
+	})
+}

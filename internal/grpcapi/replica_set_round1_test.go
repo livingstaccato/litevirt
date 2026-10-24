@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,12 +22,18 @@ import (
 
 // setPromoteVMRows is setPromoteVM with the VM's other disk rows given (root
 // is added, at vda on a dead host).
+// testVMUUID is a uuid for a test VM of name, the same for every call.
+func testVMUUID(name string) string {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("litevirt-test-vm/"+name)).String()
+}
+
 func setPromoteVMRows(t *testing.T, s *Server, vm string, others []corrosion.DiskRecord) string {
 	t.Helper()
 	s.virt = libvirtfake.New()
 	poolDir := t.TempDir()
 	s.SetStoragePoolsByName(map[string]StoragePoolRef{"dr": {Driver: "local", Target: poolDir}})
-	spec, _ := json.Marshal(&pb.VMSpec{Name: vm, Cpu: 1, MemoryMib: 256})
+	// A VM has a uuid: a promotion's records are bound to it.
+	spec, _ := json.Marshal(&pb.VMSpec{Name: vm, Uuid: testVMUUID(vm), Cpu: 1, MemoryMib: 256})
 	disks := append([]corrosion.DiskRecord{{
 		VMName: vm, DiskName: "root", HostName: "dead-host", Path: "/dead/" + vm + "-root.qcow2",
 		SizeBytes: 1 << 20, StorageType: "local", TargetDev: "vda", Bus: "virtio",
@@ -249,7 +256,7 @@ func TestPromote_AdoptionCountsOnlyTheDisksTheDomainHas(t *testing.T) {
 	if err := f.StartDomain("db"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.writePromoteMarker("db", ""); err != nil {
+	if err := s.writePromoteMarkerFor("db", "", testVMUUID("db")); err != nil {
 		t.Fatal(err)
 	}
 

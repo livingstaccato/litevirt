@@ -107,14 +107,6 @@ func (s *Server) beginPromote(target string) (end func(), err error) {
 	}, nil
 }
 
-// promoteInFlight reports a promotion of target running on this host.
-func (s *Server) promoteInFlight(target string) bool {
-	s.promoteFlightsMu.Lock()
-	defer s.promoteFlightsMu.Unlock()
-	_, ok := s.promoteFlights[target]
-	return ok
-}
-
 // promoteDisksForAttempt is the journal a promotion of target, for the VM
 // whose uuid is uuid, starting now may reuse: the entries of an earlier
 // attempt of this promotion still in progress (the doc at the top of this
@@ -131,6 +123,11 @@ func (s *Server) promoteDisksForAttempt(ctx context.Context, target, uuid string
 	case err != nil:
 		slog.Warn("promote: whether an earlier attempt is in progress cannot be told; building its live disks under fresh names",
 			"vm", target, "marker", s.promoteMarkerPath(target), "error", err)
+		return out
+	case uuid == "" || markerUUID == "":
+		// Without a uuid on both sides nothing binds the journal to this
+		// VM: a uuid-less VM (a plain import) builds fresh.
+		s.dropPromoteDisks(ctx, target, "which VM the promotion it was built for was of cannot be told (no uuid)")
 		return out
 	case markerUUID != uuid:
 		s.dropPromoteDisks(ctx, target, fmt.Sprintf("the promotion it was built for was of another VM of the name (uuid %q, this VM's %q)", markerUUID, uuid))
@@ -200,12 +197,15 @@ func (s *Server) reportLeftPromotedDisk(ctx context.Context, target string, e pr
 
 // forgetPromoteRecords drops the promote marker and journal of name on this
 // host once a delete of the VM has committed here, reporting a live disk the
-// journal names that nothing else accounts for. A promotion of name running
-// here keeps its own.
+// journal names that nothing else accounts for. It holds the name's
+// promotion flight while it does: a promotion of name running here keeps its
+// own, and none begins until both are gone.
 func (s *Server) forgetPromoteRecords(ctx context.Context, name string) {
-	if s.promoteInFlight(name) {
+	end, err := s.beginPromote(name)
+	if err != nil {
 		return
 	}
+	defer end()
 	s.dropPromoteDisks(ctx, name, "the VM was deleted")
 	s.removePromoteMarker(name)
 }

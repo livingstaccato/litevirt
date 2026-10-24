@@ -907,6 +907,48 @@ func (s *Server) promoteMarkerUUID(name string) (string, error) {
 }
 func (s *Server) removePromoteMarker(name string) { _ = os.Remove(s.promoteMarkerPath(name)) }
 
+// promoteMarkerIsOurs reports whether target's promote marker says the
+// domain of that name running here is an earlier attempt of this promotion,
+// when the marker is the only evidence (decide; otherwise its answer is not
+// used): the marker names the uuid of the VM promoted in place, or, for a
+// renamed promotion, which mints its uuid on every attempt, the uuid of the
+// running domain. A marker of another uuid is not ours. One that names no
+// uuid (an earlier build's), a VM with none (a plain import), or a marker or
+// domain that cannot be read cannot be told either way: the promotion is
+// refused and nothing is changed, never a stranger adopted nor our own
+// running promotion replaced.
+func (s *Server) promoteMarkerIsOurs(target, vmUUID string, renamed, decide bool) (bool, error) {
+	if !decide {
+		return s.promoteMarkerPresent(target), nil
+	}
+	mu, err := s.promoteMarkerUUID(target)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, status.Errorf(codes.Unavailable,
+			"promote of %s: a domain of the name runs on %s and this host's promote marker of it cannot be read (%v), so whether it is an earlier attempt of this promotion cannot be told; nothing was changed, retry",
+			target, s.hostName, err)
+	}
+	want := vmUUID
+	if renamed {
+		x, xerr := s.virt.DumpXML(target)
+		if xerr != nil {
+			return false, status.Errorf(codes.Unavailable,
+				"promote of %s: a domain of the name runs on %s and its definition cannot be read (%v), so whether it is an earlier attempt of this promotion cannot be told; nothing was changed, retry",
+				target, s.hostName, xerr)
+		}
+		want = domainUUIDFromXML(x)
+	}
+	if mu == "" || want == "" {
+		return false, status.Errorf(codes.FailedPrecondition,
+			"promote of %s: a domain of the name runs on %s and this host's promote marker says an earlier promotion started it, but which VM it was promoted for cannot be told (no uuid); nothing was changed. "+
+				"If it is this VM, stop it (`virsh destroy %s` on %s) and retry; otherwise stop it before promoting",
+			target, s.hostName, target, s.hostName)
+	}
+	return mu == want, nil
+}
+
 // promoteDomainAlreadyStarted decides whether a prior promotion of this domain is already
 // running and must be ADOPTED (never destroyed+rebuilt). A domain counts as started only
 // if it actually EXISTS and is RUNNING, and either this proof's own start_attempted
@@ -1261,7 +1303,11 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			domRunning = true
 		}
 	}
-	started := promoteDomainAlreadyStarted(stepDone("started"), stepDone("start_attempted"), s.promoteMarkerPresent(targetName), domExists, domRunning)
+	markerOurs, merr := s.promoteMarkerIsOurs(targetName, spec.Uuid, renamed, domExists && domRunning && !stepDone("started") && !stepDone("start_attempted"))
+	if merr != nil {
+		return merr
+	}
+	started := promoteDomainAlreadyStarted(stepDone("started"), stepDone("start_attempted"), markerOurs, domExists, domRunning)
 	// A renamed promotion mints its uuid and MACs on every attempt, so a
 	// retry that adopts the domain an earlier attempt started takes that
 	// domain's uuid, and its MACs by position (the spec's NICs, in order, are

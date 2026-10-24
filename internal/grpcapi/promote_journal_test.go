@@ -231,6 +231,7 @@ const journalUUID = "aaaaaaaa-0000-0000-0000-00000000db01"
 //   - "no marker gate" (a missing marker trusts the journal): no marker;
 //   - "no uuid" (drop both uuid checks): marker of another VM, entry of
 //     another VM;
+//   - B-1 "empty matches empty" (no check that both uuids are set): no uuid;
 //   - "no definition check" (skip DomainExists and the sources check):
 //     domain gone, domain names another file;
 //   - r3 "unknown marker trusts the journal": marker unreadable;
@@ -242,6 +243,7 @@ func TestPromoteJournal_OnlyThisVMsPromotionInProgressReadsIt(t *testing.T) {
 		reused  bool
 		dropped bool // the journal file is gone
 		left    bool // a vm.disk.left event names the file
+		noUUID  bool // the VM, its marker and its entry name no uuid
 	}
 	marker := func(uuid string) func(t *testing.T, s *Server) {
 		return func(t *testing.T, s *Server) {
@@ -278,6 +280,12 @@ func TestPromoteJournal_OnlyThisVMsPromotionInProgressReadsIt(t *testing.T) {
 			defineDomainNaming(t, s, "db", journalUUID, file+"-other.qcow2")
 			marker(journalUUID)(t, s)
 		}},
+		{name: "no uuid", noUUID: true, dropped: true, left: true, arrange: func(t *testing.T, s *Server, file string) {
+			// A uuid-less VM (a plain `lv import`): nothing binds the
+			// journal to it, whatever else matches.
+			defineDomainNaming(t, s, "db", journalUUID, file)
+			marker("")(t, s)
+		}},
 		{name: "marker unreadable", arrange: func(t *testing.T, s *Server, file string) {
 			defineDomainNaming(t, s, "db", journalUUID, file)
 			marker(journalUUID)(t, s)
@@ -293,11 +301,15 @@ func TestPromoteJournal_OnlyThisVMsPromotionInProgressReadsIt(t *testing.T) {
 			s, _, replicaPath, file, journal := promoteJournalSetup(t)
 			e := journal["root"]
 			e.UUID = journalUUID
+			vmUUID := journalUUID
+			if c.noUUID {
+				e.UUID, vmUUID = "", ""
+			}
 			if err := s.recordPromoteDisk("db", map[string]promotedDiskEntry{}, e); err != nil {
 				t.Fatal(err)
 			}
 			c.arrange(t, s, file)
-			got := s.promoteDisksForAttempt(adminCtx(), "db", journalUUID)
+			got := s.promoteDisksForAttempt(adminCtx(), "db", vmUUID)
 			_ = os.Chmod(filepath.Dir(s.promoteMarkerPath("db")), 0o700)
 			if reused := got["root"].Path == file && got["root"].Replica == replicaPath; reused != c.reused {
 				t.Errorf("journal read = %+v, want the entry for %s read: %v", got, file, c.reused)

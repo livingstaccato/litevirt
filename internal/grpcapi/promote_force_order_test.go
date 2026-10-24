@@ -37,7 +37,7 @@ func TestPromote_ForceRefusesBeforeItDestroysTheDomain(t *testing.T) {
 	run := stamp(10 * time.Minute)
 	replica := seedReplica(t, poolDir, "", "db", "root", run, "raw", 1<<20)
 	fake := s.virt.(*libvirtfake.Fake)
-	if err := fake.DefineDomain("<domain><name>db</name></domain>"); err != nil {
+	if err := fake.DefineDomain("<domain><name>db</name><uuid>" + testVMUUID("db") + "</uuid></domain>"); err != nil {
 		t.Fatal(err)
 	}
 	if err := fake.StartDomain("db"); err != nil {

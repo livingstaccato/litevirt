@@ -974,8 +974,17 @@ beside it. The record belongs to one promotion of one VM in progress: it is read
 only while no other promotion of the name runs on the host (a second one is
 refused), the promotion's promote marker (written just before the domain
 starts) is there and names the VM's uuid, and the domain that promotion
-defined is still defined there and names the file. It is removed, before the
-marker, once the attempt ends, and both go when the VM is deleted. A record
+defined is still defined there and names the file. A VM without a uuid (a
+plain `lv import` makes one) never reuses one: a retry builds fresh. It is
+removed, before the marker, once the attempt ends. A delete of the VM clears
+both only on the host the VM's record names, which is the promotion host
+once a promotion has committed; a record left on another host (a promotion
+that failed at its commit) stays until a promotion of the name there drops
+it, and is never reused without the uuid match and the definition naming the
+file. A promote marker counts as evidence that a domain running under the
+name is an earlier attempt of the promotion only when it names that VM's
+uuid (for a renamed promotion, the running domain's); when either side
+names none, the promotion is refused and nothing is changed. A record
 of no promotion in progress, or of another VM of the name, is dropped; a file
 it named that no VM uses and no delete kept is left alone, never reused nor
 removed, and a `vm.disk.left` event of the VM names it, as one built from

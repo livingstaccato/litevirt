@@ -38,7 +38,7 @@ func seedPromotableVM(t *testing.T, s *Server, ownerHost, ownerState, project st
 	poolDir := t.TempDir()
 	s.SetStoragePoolsByName(map[string]StoragePoolRef{"replica-pool": {Driver: "local", Target: poolDir}})
 
-	specJSON, _ := json.Marshal(&pb.VMSpec{Name: "vm1", Cpu: int32(cpu), MemoryMib: int32(memMiB)})
+	specJSON, _ := json.Marshal(&pb.VMSpec{Name: "vm1", Uuid: testVMUUID("vm1"), Cpu: int32(cpu), MemoryMib: int32(memMiB)})
 	if err := corrosion.InsertVM(ctx, s.db,
 		corrosion.VMRecord{
 			Name: "vm1", HostName: ownerHost, State: "running", Spec: string(specJSON),
@@ -253,7 +253,7 @@ func TestPromoteReplica_MarkedRunningRetry_AdoptedWithoutDoubleReserve(t *testin
 		t.Fatal(err)
 	}
 	fake.SetState("vm1", "running")
-	if err := s.writePromoteMarker("vm1", "prior-proof"); err != nil {
+	if err := s.writePromoteMarkerFor("vm1", "prior-proof", testVMUUID("vm1")); err != nil {
 		t.Fatalf("write marker: %v", err)
 	}
 	s.invalidateInventoryCache()

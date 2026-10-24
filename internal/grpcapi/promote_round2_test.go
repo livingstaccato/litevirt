@@ -274,3 +274,177 @@ func TestPromote_AnUnreadAdoptionNeverTakesAnEntryOfAnotherReplica(t *testing.T)
 		t.Errorf("root row = %+v after a refused adoption, want it unchanged", root)
 	}
 }
+
+// strayDefinedRetry is B-R2 with the stray domain only destroyed (stopped,
+// still defined), as `virsh destroy` or a crash leaves it: a promotion of db
+// (uuid u1) fails at its commit and leaves its marker and journal, db is
+// deleted, and a new db (uuid u2) is promoted from the same replica. It
+// returns the stray run's disk and the new VM's root path.
+func strayDefinedRetry(t *testing.T, u1, u2 string) (stray, root string) {
+	t.Helper()
+	s := testServer(t)
+	poolDir := setPromoteVMRows(t, s, "db", nil)
+	seedReplica(t, poolDir, "", "db", "root", stamp(10*time.Minute), "raw", 1<<20)
+	incarnateDB(t, s, u1)
+	req := &pb.PromoteReplicaRequest{VmName: "db", TargetPool: "dr", Force: true, NoLocalize: true}
+	f := s.virt.(*libvirtfake.Fake)
+	f.FailStartDomain = func(string) error {
+		_ = corrosion.DeleteVM(context.Background(), s.db, "db")
+		return nil
+	}
+	if err := s.PromoteReplica(req, &streamRecorder[pb.PromoteReplicaProgress]{ctx: adminCtx()}); err == nil {
+		t.Fatal("the first promotion did not fail at its commit; the setup is not the one this test needs")
+	}
+	f.FailStartDomain = nil
+	built := promotedFiles(t, poolDir, "db")
+	if len(built) != 1 || !s.promoteMarkerPresent("db") {
+		t.Fatalf("setup: built=%v marker=%v", built, s.promoteMarkerPresent("db"))
+	}
+	stray = built[0]
+	if err := os.WriteFile(stray, []byte("the deleted VM's stray run wrote this"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.DestroyDomain("db") // stopped, still defined
+	incarnateDB(t, s, u2)
+	promoteSet(t, s, req)
+	if b, err := os.ReadFile(stray); err != nil || string(b) != "the deleted VM's stray run wrote this" {
+		t.Errorf("the stray run's disk was touched: %q, %v", b, err)
+	}
+	return stray, diskRowsOf(t, s, "db")["root"].Path
+}
+
+// B-1: a VM without a uuid (a plain `lv import` makes one) gets no journal
+// reuse at all: a stray run's disk whose stopped domain is still defined and
+// names it is never the new VM's root. With uuids the uuid check refuses it.
+//
+// Red on bb1b709a0 ("no uuid"): the new VM's root row is the stray disk.
+// Mutation "empty matches empty" (no check that both uuids are set) — red.
+func TestPromote_AStrayDefinedDomainsDiskIsNeverReused(t *testing.T) {
+	t.Run("no uuid", func(t *testing.T) {
+		if stray, root := strayDefinedRetry(t, "", ""); root == stray {
+			t.Fatalf("the new VM's root row names the stray run's disk %s", stray)
+		}
+	})
+	t.Run("uuids", func(t *testing.T) {
+		if stray, root := strayDefinedRetry(t, "aaaaaaaa-0000-0000-0000-0000000000a1", "aaaaaaaa-0000-0000-0000-0000000000a2"); root == stray {
+			t.Fatalf("the new VM's root row names the stray run's disk %s", stray)
+		}
+	})
+}
+
+// NB-1: a delete's clear of the promote records holds the name's promotion
+// flight: while a promotion of the name runs it leaves that promotion's
+// marker and journal, and once none runs it removes them.
+//
+// Mutation "no flight" (forgetPromoteRecords acts without beginPromote) — red.
+func TestDeleteVM_TheClearLeavesARunningPromotionsRecords(t *testing.T) {
+	s := testServer(t)
+	s.virt = libvirtfake.New()
+	if err := s.writePromoteMarkerFor("db", "", testVMUUID("db")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.recordPromoteDisk("db", map[string]promotedDiskEntry{},
+		promotedDiskEntry{Disk: "root", Path: "/nowhere/db-promoted-x.qcow2", UUID: testVMUUID("db")}); err != nil {
+		t.Fatal(err)
+	}
+	end, err := s.beginPromote("db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.forgetPromoteRecords(adminCtx(), "db")
+	if !s.promoteMarkerPresent("db") {
+		t.Error("a delete removed the marker of a promotion running here")
+	}
+	if _, err := os.Stat(s.promoteDiskJournalPath("db")); err != nil {
+		t.Errorf("a delete removed the journal of a promotion running here: %v", err)
+	}
+	end()
+	s.forgetPromoteRecords(adminCtx(), "db")
+	if s.promoteMarkerPresent("db") {
+		t.Error("the marker is left once no promotion runs")
+	}
+	if _, err := s.beginPromote("db"); err != nil {
+		t.Errorf("the clear left the name's flight held: %v", err)
+	}
+}
+
+// NB-3: when the marker is the only evidence that a domain running under the
+// name is an earlier attempt of this promotion, it counts only when it names
+// the VM's uuid (in place) or the running domain's (renamed). A marker of
+// another uuid is not ours; one where either side names no uuid refuses.
+//
+// Mutation "presence is enough" (promoteMarkerIsOurs returns the marker's
+// presence) — red.
+func TestPromote_TheMarkerCountsOnlyForItsUUID(t *testing.T) {
+	const vmU, otherU = "aaaaaaaa-0000-0000-0000-0000000000c1", "aaaaaaaa-0000-0000-0000-0000000000c2"
+	cases := []struct {
+		name              string
+		markerU, vmUUID   string
+		renamed, noMarker bool
+		want              bool
+		wantCode          codes.Code
+	}{
+		{name: "in place, its uuid", markerU: vmU, vmUUID: vmU, want: true},
+		{name: "in place, another uuid", markerU: otherU, vmUUID: vmU},
+		{name: "in place, marker names none", markerU: "", vmUUID: vmU, wantCode: codes.FailedPrecondition},
+		{name: "in place, VM has none", markerU: vmU, vmUUID: "", wantCode: codes.FailedPrecondition},
+		{name: "renamed, the domain's uuid", markerU: vmU, vmUUID: "minted-now", renamed: true, want: true},
+		{name: "renamed, another uuid", markerU: otherU, vmUUID: "minted-now", renamed: true},
+		{name: "no marker", noMarker: true, vmUUID: vmU},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := testServer(t)
+			s.virt = libvirtfake.New()
+			defineDomainNaming(t, s, "db", vmU)
+			if !c.noMarker {
+				if err := s.writePromoteMarkerFor("db", "", c.markerU); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := s.promoteMarkerIsOurs("db", c.vmUUID, c.renamed, true)
+			if status.Code(err) != c.wantCode {
+				t.Fatalf("err = %v, want code %v", err, c.wantCode)
+			}
+			if err == nil && got != c.want {
+				t.Errorf("ours = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// NB-3, end to end: a stale marker of another VM of the name does not make a
+// running stranger domain, one that even runs from a promoted live disk of
+// this replica, this promotion's to adopt: --force refuses to replace a
+// running domain that is not the VM's own, and nothing is changed.
+//
+// Red on bb1b709a0: the stranger is adopted and the VM's root row names its
+// disk.
+func TestPromote_AStaleMarkerOfAnotherVMAdoptsNoRunningDomain(t *testing.T) {
+	s := testServer(t)
+	poolDir := setPromoteVMRows(t, s, "db", nil)
+	seedReplica(t, poolDir, "", "db", "root", "20260101-000000", "raw", 1<<20)
+	const stranger = "aaaaaaaa-0000-0000-0000-0000000000d9"
+	f := s.virt.(*libvirtfake.Fake)
+	if err := f.DefineDomain("<domain type='kvm'><name>db</name><uuid>" + stranger + "</uuid><devices>" +
+		adoptablePromotedDisk(t, s, "dr", "db") + "</devices></domain>"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.StartDomain("db"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.writePromoteMarkerFor("db", "", stranger); err != nil {
+		t.Fatal(err)
+	}
+	err := s.PromoteReplica(&pb.PromoteReplicaRequest{VmName: "db", TargetPool: "dr", Force: true, NoLocalize: true},
+		&streamRecorder[pb.PromoteReplicaProgress]{ctx: adminCtx()})
+	if err == nil {
+		t.Fatalf("the promotion adopted a running domain of another VM; root row = %+v", diskRowsOf(t, s, "db")["root"])
+	}
+	if root := diskRowsOf(t, s, "db")["root"]; root.HostName == s.hostName {
+		t.Errorf("root row = %+v after the refusal, want it unchanged", root)
+	}
+	if running, _ := f.DomainIsActive("db"); !running {
+		t.Error("the refusal stopped the running domain")
+	}
+}

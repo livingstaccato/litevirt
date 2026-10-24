@@ -182,7 +182,7 @@ func TestPromoteReplica_ARenamedRetryAdoptsTheRunningDomainsUUID(t *testing.T) {
 	}
 	// The first attempt crashed after its start, before its "started"
 	// checkpoint: its marker is there.
-	if err := s.writePromoteMarker("vm1-p", ""); err != nil {
+	if err := s.writePromoteMarkerFor("vm1-p", "", first); err != nil {
 		t.Fatal(err)
 	}
 	err := s.PromoteReplica(&pb.PromoteReplicaRequest{

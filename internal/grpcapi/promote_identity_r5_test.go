@@ -35,7 +35,8 @@ func renamedRetry(t *testing.T, domXML string) (*Server, error) {
 	if err := fake.StartDomain("vm1-p"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.writePromoteMarker("vm1-p", ""); err != nil {
+	// The marker names the uuid of the domain the attempt defined.
+	if err := s.writePromoteMarkerFor("vm1-p", "", domainUUIDFromXML(domXML)); err != nil {
 		t.Fatal(err)
 	}
 	return s, s.PromoteReplica(&pb.PromoteReplicaRequest{

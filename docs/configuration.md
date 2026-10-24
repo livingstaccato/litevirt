@@ -322,10 +322,6 @@ enforcement:
                               # activates only when the flag is set AND the token has latched
                               # fleet-wide. Enable fleet-uniformly; the flag is the reversible kill
                               # switch.
-                              # (canonical_registry was removed on 2026-10-04: it only advertised a
-                              # token for a writer that never shipped. A config that still sets it
-                              # loads; the key is ignored and the daemon logs a WARN naming it at
-                              # startup. See docs/design/canonical-registry-credentials.md.)
   vm_replace: false           # allow `lv cutover` to give a replacement VM the name a replaced VM
                               # still holds. The replaced VM is soft-deleted, so its tombstone still
                               # occupies that PRIMARY KEY, and no pre-existing replicated statement

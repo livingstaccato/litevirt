@@ -1298,19 +1298,13 @@ func LoadConfig() (*Config, error) {
 // retiredConfigKeys are config keys a later build stopped reading. A config that
 // still sets one loads — refusing to start over a key that used to be valid would
 // strand every node that ever set it — and the key is ignored, with a WARN that
-// names it and says why. A key is never removed from this list: the configs that
-// set it outlive the build that retired it.
+// names it and says why. A key stays on this list while a config written by a
+// build that can upgrade in place to this one may still set it: those configs
+// outlive the build that retired the key.
 var retiredConfigKeys = []struct {
 	path []string
 	why  string
 }{
-	{
-		path: []string{"enforcement", "canonical_registry"},
-		why: "retired with its capability token canonical_registry_v1 (it only advertised the token " +
-			"for a registry-credential writer that never shipped); the value is ignored and can be " +
-			"removed. The writer will ship under a new token, canonical_registry_v2 — see " +
-			"docs/design/canonical-registry-credentials.md",
-	},
 	{
 		path: []string{"pci", "udev_hook"},
 		why: "it installed no udev rule for several releases; real-time PCI events are covered by " +

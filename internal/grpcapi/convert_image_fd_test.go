@@ -207,3 +207,71 @@ func TestConvertImage_ASourceSwappedDuringItsChecksIsRefused(t *testing.T) {
 		t.Fatal("a copy whose source was swapped for a link during its checks went ahead")
 	}
 }
+
+// A DIRECTORY on a backing's path swapped for a link after the backing's name
+// was resolved and judged, just before it is opened: O_NOFOLLOW guards only
+// the final component, and a name resolved again at check time agrees with
+// the swap. The open file must be named by exactly the path the checks
+// accepted. (Re-review of fix/migrate-followups, finding 1; the reviewer's
+// probe.)
+// Mutation: drop the readlink == resolved comparison in openBackings - the
+// copy ships the other directory's file: red.
+func TestConvertImage_ABackingDirectorySwappedAtTheOpenIsRefused(t *testing.T) {
+	needQemuImg(t)
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "sub")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "base.raw"), bytes.Repeat([]byte("LEGITIMATE-BASE-"), convertFDSize/16), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	other := t.TempDir()
+	if err := os.WriteFile(filepath.Join(other, "base.raw"), bytes.Repeat([]byte("OTHER-TENANT-SEC"), convertFDSize/16), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	top := filepath.Join(dir, "vm-root.qcow2")
+	if err := qcow2.CreateWithBackingFormat(top, "sub/base.raw", "raw", convertFDSize, nil); err != nil {
+		t.Fatal(err)
+	}
+	legit, err := filepath.EvalSymlinks(filepath.Join(sub, "base.raw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule := func(layer, resolved, format string) error {
+		if resolved != legit {
+			return os.ErrPermission
+		}
+		return nil
+	}
+	swapped := false
+	backingOpenHook = func(string) {
+		if swapped {
+			return
+		}
+		swapped = true
+		if err := os.Rename(sub, sub+".saved"); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.Symlink(other, sub); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { backingOpenHook = nil })
+	f, err := os.CreateTemp(t.TempDir(), ".repl-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	err = convertImage(context.Background(), top, "qcow2", rule, f.Name(), noProgress)
+	if !swapped {
+		t.Fatal("fixture: the backing was never opened")
+	}
+	if err == nil {
+		if bytes.Contains(guestView(t, f.Name()), []byte("OTHER-TENANT-SEC")) {
+			t.Fatal("the copy read another directory's file through a directory swapped for a link at the backing's open")
+		}
+		t.Fatal("a copy whose backing's directory was swapped for a link at its open went ahead")
+	}
+}

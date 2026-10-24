@@ -77,8 +77,9 @@ func openConvertTop(src, srcFormat, dst string) (*heldConvert, error) {
 // layer already held: each layer's header is judged through its descriptor
 // (precheckQcow2HeaderFile), its backing name resolved as precheckChain
 // resolves it, and that must be accepted[i]; the backing is then opened
-// no-follow, regular, and still named by that path (no directory on the way
-// swapped since). A raw backing ends the chain.
+// no-follow, regular, and the kernel's name for the open file must be
+// exactly that accepted path (no directory on the way swapped since). A raw
+// backing ends the chain.
 func (h *heldConvert) openBackings(src string, accepted []string) error {
 	path := src
 	for i := 0; ; i++ {
@@ -107,12 +108,22 @@ func (h *heldConvert) openBackings(src string, accepted []string) error {
 		if info.BackingFormat != "qcow2" && info.BackingFormat != "raw" {
 			return fmt.Errorf("%s names backing file %q with format %q", path, info.BackingFile, info.BackingFormat)
 		}
+		if backingOpenHook != nil {
+			backingOpenHook(resolved)
+		}
 		bf, _, err := openRegularNoFollow(resolved)
 		if err != nil {
 			return fmt.Errorf("backing %s: %w", resolved, err)
 		}
 		h.layers = append(h.layers, bf)
 		h.formats = append(h.formats, info.BackingFormat)
+		// Named by exactly the path the checks accepted: resolved is fully
+		// resolved, so a directory on the way swapped for a link since then
+		// gives the open file another name (namedBy alone resolves the path
+		// again, now, and would agree with the swap).
+		if named, err := os.Readlink(procFDPrefix + strconv.Itoa(int(bf.Fd()))); err != nil || named != resolved {
+			return fmt.Errorf("backing %s changed while it was opened (now %q)", resolved, named)
+		}
 		if err := namedBy(bf, resolved); err != nil {
 			return err
 		}
@@ -191,6 +202,11 @@ func (h *heldConvert) assertStandalone() error {
 	}
 	return qcow2.AssertStandaloneHeader(head[:n])
 }
+
+// backingOpenHook runs in openBackings after a backing's name is resolved
+// and judged, just before it is opened (tests: swap a directory on its path
+// there).
+var backingOpenHook func(resolved string)
 
 // qemuImgRunHook runs after convertImageWith's checks and just before
 // qemu-img starts (tests: swap a name it was judged by there).

@@ -2,13 +2,10 @@ package grpcapi
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
@@ -138,103 +135,9 @@ func (x nicIndex) noEntry(code codes.Code, vm string, spec *pb.VMSpec, i int, ni
 		i, nic.MAC, what, why, vm, i, what)
 }
 
-// listMatchesSpec reports whether every NIC's position in the list is its
-// spec entry's index (or it has no entry and stands past the spec's end) and
-// its ordinal: then a number means the same NIC read either way, and the same
-// one to a build that indexes the spec by ordinal.
-func listMatchesSpec(spec *pb.VMSpec, nics []corrosion.NICRecord) bool {
-	for i, n := range nics {
-		if n.Ordinal != i {
-			return false
-		}
-		e := compose.SpecEntryIndexForNIC(spec, n.MAC, n.Ordinal)
-		if e != i && (e >= 0 || i < len(spec.GetNetwork())) {
-			return false
-		}
-	}
-	return true
-}
-
-// nicPositionsForOlderOwner is the request an entry node forwards to an owner
-// whose build reads every NIC number as a spec index (its Ping does not
-// advertise nic_list_position). A VM whose NIC list matches its spec
-// (listMatchesSpec) goes unchanged: there the two readings agree. Otherwise
-// each position is translated to its NIC's spec index, from this node's
-// replica; one that has no exact spec index for that build is refused, naming
-// the owner to upgrade.
-func nicPositionsForOlderOwner(vm *corrosion.VMRecord, nics []corrosion.NICRecord, req *pb.UpdateVMRequest) (*pb.UpdateVMRequest, error) {
-	spec := &pb.VMSpec{}
-	if vm.Spec != "" {
-		if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
-			return nil, status.Errorf(codes.Internal, "parse stored spec of %q: %v", vm.Name, err)
-		}
-	}
-	if listMatchesSpec(spec, nics) {
-		return req, nil
-	}
-	ix := nicIndex{nics: nics, byListPosition: true}
-	refuse := func(i int, why string) error {
-		return status.Errorf(codes.FailedPrecondition,
-			"VM %q's owner %s runs an older build, which numbers NICs by spec entry, and NIC %d %s. "+
-				"Upgrade %s first, or retry once the VM is on an upgraded host",
-			vm.Name, vm.HostName, i, why, vm.HostName)
-	}
-	// translate maps position i to the spec index e the older owner reads.
-	// That build applies an MTU (its in-place patch) and a rate (live, and
-	// its bandwidth patch) to the live NIC whose ordinal is e; queues it
-	// patches by the entry's MAC. So for an MTU or a rate, e must not be the
-	// ordinal of another live NIC (review I-new-1), and a rate needs its own
-	// NIC at ordinal e. Where no live NIC holds e, the older owner's MTU patch
-	// fails and it regenerates the definition, by MAC.
-	atOrdinal := make(map[int]*corrosion.NICRecord, len(nics))
-	for k := range nics {
-		atOrdinal[nics[k].Ordinal] = &nics[k]
-	}
-	translate := func(i int32, byOrdinal, rate bool) (int32, error) {
-		e, nic, ok := ix.resolve(spec, int(i))
-		switch {
-		case !ok:
-			return 0, status.Errorf(codes.NotFound, "VM %q has no NIC %d", vm.Name, i)
-		case e < 0:
-			return 0, refuse(int(i), fmt.Sprintf("(MAC %s) has no spec entry there", nic.MAC))
-		}
-		if other := atOrdinal[e]; byOrdinal && other != nil && (nic == nil || !strings.EqualFold(other.MAC, nic.MAC)) {
-			return 0, refuse(int(i), fmt.Sprintf("is spec entry %d there, and that build applies it to the NIC at ordinal %d, which is another NIC (MAC %s)", e, e, other.MAC))
-		}
-		if rate && nic != nil && nic.Ordinal != e {
-			return 0, refuse(int(i), fmt.Sprintf("(MAC %s) is at ordinal %d, where that build looks for spec entry %d's NIC", nic.MAC, nic.Ordinal, e))
-		}
-		return int32(e), nil
-	}
-	out := proto.Clone(req).(*pb.UpdateVMRequest)
-	out.NicByListPosition = false
-	for _, u := range out.NicMtu {
-		e, err := translate(u.Ordinal, true, false)
-		if err != nil {
-			return nil, err
-		}
-		u.Ordinal = e
-	}
-	for _, u := range out.NicQueues {
-		e, err := translate(u.Ordinal, false, false)
-		if err != nil {
-			return nil, err
-		}
-		u.Ordinal = e
-	}
-	for _, u := range out.NicRate {
-		e, err := translate(u.Ordinal, true, true)
-		if err != nil {
-			return nil, err
-		}
-		u.Ordinal = e
-	}
-	return out, nil
-}
-
 // peerReadsNICListPosition asks a peer whether its build reads
 // UpdateVMRequest.nic_by_list_position. A peer that cannot be asked is
-// treated as one that does not: the translation is right for either.
+// treated as one that does not.
 func (s *Server) peerReadsNICListPosition(ctx context.Context, client pb.LiteVirtClient) bool {
 	resp, err := client.Ping(ctx, &pb.PingRequest{})
 	return err == nil && resp.GetNicListPosition()

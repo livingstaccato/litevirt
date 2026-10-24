@@ -521,10 +521,8 @@ lv update <vm> --nic-mtu 0=9000 [--nic-mtu 1=bridge] # per-NIC MTU, NIC numbered
 # under spec.network. A NIC detached and attached again goes to the end of it.
 # --nic-rate needs the NIC's spec entry: give a NIC attached after the create
 # one with --nic-mtu <nic>=0. A host on an older build reads the numbers as
-# spec entries: an update reaching it through an upgraded node is translated,
-# or refused naming the host to upgrade; the CLI talking to it directly
-# refuses a number at or past the first gap in the VM's NIC numbering (a NIC
-# was detached) and sends the others.
+# spec entries: an update naming NICs is refused for it, naming the host to
+# upgrade.
 lv update <vm> [--cpu N] [--memory N]        # resources — VM must be STOPPED
   [--cpu-mode host-passthrough|host-model|custom] [--cpu-model <model>]
   [--disable-vnc]

@@ -290,30 +290,22 @@ func TestFleet_NICNumbersWithoutListPositionAreSpecIndices(t *testing.T) {
 	}
 }
 
-// Review I-2: an owner whose Ping lacks nic_list_position reads NIC numbers
-// as spec indices. The entry node translates lv update's positions for it:
-// position 1 (A) reaches A. A position it cannot translate (C, which has no
-// spec entry) is refused, naming the owner, and nothing changes.
+// An owner whose Ping lacks nic_list_position reads NIC numbers as spec
+// indices, which can name another NIC: lv update's positions are refused for
+// it, naming the owner, and nothing changes.
 //
 // Mutation: forward positions unchanged to the older owner — B takes the
 // MTU, red.
-func TestFleet_NICPositionsToAnOlderOwnerAreTranslatedOrRefused(t *testing.T) {
+func TestFleet_NICPositionsToAnOlderOwnerAreRefused(t *testing.T) {
 	ctx := context.Background()
 	c, own, entry := riReattachedFleet(t)
 	own.Server.SetPingWithoutNICListPositionForTest(true)
-	if _, err := c.SelfClient(entry).UpdateVM(ctx, &pb.UpdateVMRequest{Name: "rx", NicByListPosition: true,
-		NicMtu: []*pb.NICMTUUpdate{{Ordinal: 1, Mtu: 9000}}}); err != nil {
-		t.Fatalf("--nic-mtu 1=9000: %v", err)
-	}
-	if a, b := riEntry(riSpec(t, own, "rx"), riMACA), riEntry(riSpec(t, own, "rx"), riMACB); a.GetMtu() != 9000 || b.GetMtu() != 0 {
-		t.Errorf("A %+v, B %+v; want the MTU on A (position 1)", a, b)
-	}
 	_, err := c.SelfClient(entry).UpdateVM(ctx, &pb.UpdateVMRequest{Name: "rx", NicByListPosition: true,
-		NicMtu: []*pb.NICMTUUpdate{{Ordinal: 2, Mtu: 9000}}})
+		NicMtu: []*pb.NICMTUUpdate{{Ordinal: 1, Mtu: 9000}}})
 	if err == nil || !strings.Contains(err.Error(), "runs an older build") {
-		t.Fatalf("--nic-mtu 2=9000 (C) to the older owner: %v, want a refusal naming it", err)
+		t.Fatalf("--nic-mtu 1=9000 to the older owner: %v, want a refusal naming it", err)
 	}
-	if e := riEntry(riSpec(t, own, "rx"), riMACC); e != nil {
-		t.Errorf("C got an entry %+v from a refused update", e)
+	if a, b := riEntry(riSpec(t, own, "rx"), riMACA), riEntry(riSpec(t, own, "rx"), riMACB); a.GetMtu() != 0 || b.GetMtu() != 0 {
+		t.Errorf("A %+v, B %+v; want no MTU from a refused update", a, b)
 	}
 }

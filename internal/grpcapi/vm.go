@@ -6489,16 +6489,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		}
 		defer closePeer()
 		// An owner that predates nic_by_list_position reads every NIC number
-		// as a spec index: translate the positions for it, or refuse
-		// (nic_index.go).
+		// as a spec index, which can name another NIC: refused.
 		if req.GetNicByListPosition() && requestNamesNICs(req) && !s.peerReadsNICListPosition(ctx, client) {
-			nics, nerr := corrosion.MergedVMNICs(ctx, s.db, req.Name)
-			if nerr != nil {
-				return nil, status.Errorf(codes.Internal, "list NICs of %q: %v", req.Name, nerr)
-			}
-			if req, err = nicPositionsForOlderOwner(vm, nics, req); err != nil {
-				return nil, err
-			}
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"VM %q's owner %s runs an older build, which reads NIC numbers as spec entries; upgrade %s first",
+				vm.Name, vm.HostName, vm.HostName)
 		}
 		return client.UpdateVM(ctx, req)
 	}

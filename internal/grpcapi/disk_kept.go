@@ -288,18 +288,16 @@ func (s *Server) JudgeKeptDisksForTest(ctx context.Context) { s.judgeKeptDisks(c
 func (s *Server) judgeKeptDisks(ctx context.Context) {
 	var left []diskKeptRecord
 	records, unreadable := s.diskKeptRecords()
-	// What a kept overlay backs on, unknown while the record or a kept chain
-	// cannot be read, holds every import, every create or clone here that
-	// writes a local disk file, every disk attach, and every restore to a
-	// named target
-	// (keptMissingBaseRefusal): named here, not only in each refusal.
-	// Storage that does not answer is left to the conditions about it.
-	createsRefused := ""
-	if _, err := s.keptRegistryChains(ctx); err != nil {
-		var re *keptRegistryError
-		if !errors.As(err, &re) || !re.transient {
-			createsRefused = err.Error()
-		}
+	// While the record or a kept chain cannot be read, each import, create,
+	// clone, disk attach or restore to a named target that writes a local
+	// disk file is judged by the disk files on this host
+	// (keptCollisionOnDisk), and every one is held when those cannot all be
+	// read either: named here, not only in each refusal. Storage that does
+	// not answer is left to the conditions about it.
+	createsRefused, scanErr := "", error(nil)
+	if _, err := s.keptRegistryChains(ctx); err != nil && !keptRegistryTransient(err) {
+		createsRefused = err.Error()
+		_, scanErr = s.keptCollisionScan(ctx, nil)
 	}
 	for _, r := range records {
 		if r.Host == s.hostName {
@@ -383,11 +381,18 @@ func (s *Server) judgeKeptDisks(ctx context.Context) {
 		evidence["record_unreadable"] = fmt.Sprintf("%s cannot be read (%s): it is not written over, and the disks named here are kept from memory; "+
 			"fix the file, or remove it (the disks recorded while it cannot be read are kept and saved)", filepath.Join(s.dataDir, diskKeptFile), unreadable)
 	}
-	if createsRefused != "" {
-		evidence["creates_refused"] = fmt.Sprintf("%s. Until it reads, these are refused on %s, whatever their names: every import; "+
+	switch {
+	case createsRefused != "" && scanErr != nil:
+		evidence["creates_refused"] = fmt.Sprintf("%s, and %v. Until both read, these are refused on %s, whatever their names: every import; "+
 			"every VM create or clone that writes a disk file on the host's own storage (one with no disk file, or with every disk "+
 			"on shared nfs, ceph or iscsi storage outside the disk directory, goes ahead); every disk attach that creates a disk; "+
 			"and every backup restore-from or restore-live to a --target-path. What a kept overlay backs on is unknown, and a new disk there could become its base",
+			createsRefused, scanErr, s.hostName)
+	case createsRefused != "":
+		evidence["creates_refused"] = fmt.Sprintf("%s. Until it reads, an import, a VM create or clone, a disk attach that creates a disk, or a "+
+			"backup restore-from or restore-live to a --target-path on %s that writes a disk file on the host's own storage is refused when a "+
+			"disk file there is, or backs on, a path it writes, and so is a create that clears a file an earlier VM of its name left, or an "+
+			"import onto a file already in its pool: either may be a disk a delete kept. Any other goes ahead, with a warning",
 			createsRefused, s.hostName)
 	}
 	ev, _ := json.Marshal(evidence)

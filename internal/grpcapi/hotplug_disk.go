@@ -403,7 +403,8 @@ func (s *Server) attachDiskOwner(ctx context.Context, req *pb.AttachDeviceReques
 	}
 	// The new disk file is a new disk, as a create's is: at the path a kept
 	// overlay names as its missing base it would become that base. Refused
-	// then, and while kept-disks.json or a kept chain cannot be read.
+	// then, and judged as a create is while kept-disks.json or a kept chain
+	// cannot be read (keptCollisionOnDisk).
 	if err := s.keptPathRefusal(ctx, fmt.Sprintf("attach of disk %s to %s", spec.Name, vmName), keptWritesOf(true, diskPath)); err != nil {
 		return nil, err
 	}

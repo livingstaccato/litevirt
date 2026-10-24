@@ -299,9 +299,10 @@ func (s *Server) firmwareMoveHeld(vm string) error {
 		errFirmwareMoveHeld, h.Attempt, h.Source, h.State)
 }
 
-// resumeHeld lets vm, held paused here for its guards, run: it puts its NIC
-// firewall in force (ArmNICsFor, which refuses while a guard is not), then
-// resumes the domain, then drops the record. A guest already running is
+// resumeHeld lets vm, held paused here for its guards or its tap VLANs, run:
+// it puts its NIC firewall in force and its NICs' VLANs on its taps
+// (readyGuestHere, which refuses while either is not), then resumes the
+// domain, then drops the record. A guest already running is
 // done. It returns errNotHeld when this host holds no record for vm, or the
 // domain is not paused here.
 func (s *Server) resumeHeld(ctx context.Context, vm string) error {
@@ -339,10 +340,7 @@ func (s *Server) resumeHeld(ctx context.Context, vm string) error {
 		}
 		return fmt.Errorf("%s is also paused for a partition (partition pause); it resumes when the partition does", vm)
 	}
-	actx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	err = s.ArmNICsFor(actx, vm)
-	cancel()
-	if err != nil {
+	if err := s.readyGuestHere(ctx, vm); err != nil {
 		return err
 	}
 	r, ok := s.virt.(interface{ ResumeDomain(string) error })

@@ -352,16 +352,14 @@ func rowHost(row *corrosion.VMRecord) string {
 	return row.HostName
 }
 
-// resumeReleased is §6.6 step 5 then step 6: the NIC firewall in force, the
+// resumeReleased is §6.6 step 5 then step 6: the NIC firewall in force and
+// the NICs' VLANs on the taps libvirt made here (readyGuestHere), the
 // hold set to resuming and fsynced BEFORE the resume (so a crash after it is
 // recognised as the hand-over it was), the guest resumed through the one
 // exempt entry point, and any NIC hand-over record dropped.
 func (s *Server) resumeReleased(ctx context.Context, resp *pb.ReleaseLiveFirmwareTargetResponse, h fwmig.Hold, uefi bool, srcNvram string) (*pb.ReleaseLiveFirmwareTargetResponse, error) {
-	actx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	err := s.ArmNICsFor(actx, h.VM)
-	cancel()
-	if err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "VM %q: its NIC firewall is not in force here, so it is not resumed: %v", h.VM, err)
+	if err := s.readyGuestHere(ctx, h.VM); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "VM %q: its NIC firewall or NIC VLANs are not in force here, so it is not resumed: %v", h.VM, err)
 	}
 	if h.State != fwmig.HoldResuming {
 		if err := s.putHoldState(h, fwmig.HoldResuming, ""); err != nil {
@@ -372,9 +370,6 @@ func (s *Server) resumeReleased(ctx context.Context, resp *pb.ReleaseLiveFirmwar
 	if s.virt == nil {
 		return nil, status.Errorf(codes.Unavailable, "VM %q: no libvirt connection", h.VM)
 	}
-	// Its NICs' VLANs live on the taps libvirt made here, not in the domain
-	// XML: put them on while the guest is still paused.
-	s.reapplyVLANTapsOf(ctx, h.VM)
 	if err := s.virt.ResumeFirmwareMoveTarget(h.VM, h.UUID, h.Attempt); err != nil {
 		return nil, status.Errorf(codes.Internal, "VM %q: resume the held guest (the hold stays resuming, and a retry resumes it): %v", h.VM, err)
 	}

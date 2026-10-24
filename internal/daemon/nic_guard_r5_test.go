@@ -75,7 +75,7 @@ func TestStartWaitPredicate(t *testing.T) {
 		Mode: corrosion.NICGuardOn, VMUUID: "u-guarded"}, "t"); err != nil {
 		t.Fatal(err)
 	}
-	wait := startWaitNeeded(db, func(string) string { return "" })
+	wait := startWaitNeeded(db, func(string) string { return "" }, func(context.Context, string) bool { return false })
 	if wait("plain") {
 		t.Error("an unguarded VM's start waits for the start guard")
 	}
@@ -139,7 +139,7 @@ func TestStartWaitPredicate_CreatingIncarnation(t *testing.T) {
 		t.Fatal(err)
 	}
 	creating := ""
-	wait := startWaitNeeded(db, func(string) string { return creating })
+	wait := startWaitNeeded(db, func(string) string { return creating }, func(context.Context, string) bool { return false })
 	if !wait("fc") {
 		t.Error("with no create in flight, a stale record of the name is not waited for")
 	}

@@ -210,27 +210,30 @@ func (s *Server) needsPausedStart(ctx context.Context, vm string, live bool) boo
 }
 
 // NICStartGuard is the libvirt start guard the daemon wires
-// (libvirt.Client.SetStartGuard): every start of a VM first puts its NIC
-// firewall in force — before the start under the tap name its MACs fix, or,
-// for a guarded NIC that names no tap, while the domain is paused under the
-// tap it got.
+// (libvirt.Client.SetStartGuard), which every start of a domain goes through:
+// before the guest runs, its NIC firewall is in force and its NICs' VLANs are
+// on its taps (readyGuestHere). The firewall goes in before the start under
+// the tap names its MACs fix; a guarded NIC that names no tap, or any NIC
+// whose VLANs live on its tap (tap_vlans.go), needs the tap libvirt makes at
+// the start, so that domain is started paused, readied, and only then run.
 func (s *Server) NICStartGuard(ctx context.Context) lv.StartGuard {
-	arm := func(name string) error {
-		actx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		return s.ArmNICsFor(actx, name)
-	}
 	return lv.StartGuard{
 		Before: func(name string) (bool, error) {
 			// A start here is not a hand-over: a record an earlier move left
 			// must not resume this run's guest (re-review m3).
 			s.endHeld(name, "it is started here")
-			if s.needsPausedStart(ctx, name, false) {
+			vlans, err := s.tapVLANsOf(ctx, name)
+			if err != nil {
+				return false, fmt.Errorf("whether %s's NICs have VLANs could not be read, so it is not run here: %w", name, err)
+			}
+			if len(vlans) > 0 || s.needsPausedStart(ctx, name, false) {
 				return true, nil
 			}
-			return false, arm(name)
+			actx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			return false, s.ArmNICsFor(actx, name)
 		},
-		AfterPaused: arm,
+		AfterPaused: func(name string) error { return s.readyGuestHere(ctx, name) },
 	}
 }
 
@@ -306,7 +309,7 @@ func (s *Server) ArmNICFirewall(ctx context.Context, req *pb.ArmNICFirewallReque
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"%s is paused for a partition (partition pause); it resumes when the partition does", req.GetVmName())
 		}
-		if err := s.ArmNICsFor(ctx, req.GetVmName()); err != nil {
+		if err := s.readyGuestHere(ctx, req.GetVmName()); err != nil {
 			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
 		}
 		r, ok := s.virt.(interface{ ResumeDomain(string) error })
@@ -358,7 +361,11 @@ func (s *Server) armMigrationTarget(ctx context.Context, target *corrosion.HostR
 	if err := s.refuseUnguardedTarget(ctx, vm, *target); err != nil {
 		return nil, err
 	}
-	am := &armedMigration{s: s, target: *target, vm: vm, paused: s.needsPausedStart(ctx, vm, true)}
+	// A guest whose NICs have VLANs on their taps is handed over paused too:
+	// the target puts them on the taps libvirt made there before the guest
+	// runs (resumeHeld), instead of after libvirt resumed it on arrival.
+	am := &armedMigration{s: s, target: *target, vm: vm,
+		paused: s.needsPausedStart(ctx, vm, true) || s.HasTapVLANs(ctx, vm)}
 	if err := am.call(ctx, false); err != nil {
 		return nil, err
 	}
@@ -464,7 +471,10 @@ func (am *armedMigration) call(ctx context.Context, resume bool) error {
 	case codes.Unimplemented:
 		// A target on a build without guards: refuseUnguardedTarget let it
 		// through only for a VM with no guard, which needs nothing there.
+		// Nor can it hold a guest paused for its tap VLANs, so the guest is
+		// not handed over paused: it runs on arrival, as it did before.
 		if g, gerr := s.vmGuarded(ctx, am.vm); gerr == nil && !g {
+			am.paused = false
 			return nil
 		}
 	}

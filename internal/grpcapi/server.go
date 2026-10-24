@@ -1431,6 +1431,9 @@ type Server struct {
 	// creatingIncarnations names the VMs a create on this host is bringing
 	// up, with the uuid of the incarnation it creates (noteCreatingIncarnation).
 	creatingIncarnations sync.Map // vm name -> uuid
+	// pendingTapVLANs holds the tap VLANs of a guest a start on this host
+	// is bringing up before its row is written (notePendingTapVLANs).
+	pendingTapVLANs sync.Map // vm name -> *[]tapVLANNIC
 
 	// readyRead is Ready's one local read; nil means the real hosts-table
 	// query. A seam so a test can stand in for a read blocked on the client

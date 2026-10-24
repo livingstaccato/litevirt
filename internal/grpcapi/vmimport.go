@@ -572,10 +572,9 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		}
 		// Graduates, marks, and only then publishes running. A failure leaves the
 		// row "creating" for the reconciler to finish, never running at epoch 0.
+		// Its NICs' VLANs went on its taps before the guest ran
+		// (NICStartGuard → readyGuestHere).
 		s.assignOwnerEpochAtCreate(ctx, name, true)
-		if vm, _ := corrosion.GetVM(ctx, s.db, name); vm != nil {
-			s.reapplyVLANTaps(ctx, vm) // best-effort
-		}
 		stateMsg = "imported + started"
 	} else {
 		// A stopped import is graduated too, or it starts later at epoch 0.

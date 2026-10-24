@@ -293,6 +293,10 @@ type Fake struct {
 	// and its error is returned — a dead or restarting libvirt connection. It
 	// may also block, to model a hung libvirtd.
 	FailRunningDomainTaps func() error
+	// FailConfigureVLANTap, when set, runs at the start of ConfigureVLANTap
+	// and fails it with what it returns: a tap the host cannot put on its
+	// access VLAN.
+	FailConfigureVLANTap func(domain, mac string, vlan int) error
 	// FailCreateLiveSnapshot fires AFTER the disk overlay has cut over, modeling a
 	// RAM-save/capture failure that leaves the VM on an overlay.
 	FailCreateLiveSnapshot func(domain, snap string) error
@@ -3261,17 +3265,34 @@ func (f *Fake) PoolDestroyIfDefined(name string) error {
 	return nil
 }
 
+// ConfigureVLANTap mirrors libvirt.Client.ConfigureVLANTap: it needs the
+// domain active (only then has its NIC a tap), and FailConfigureVLANTap can
+// refuse it.
 func (f *Fake) ConfigureVLANTap(domainName, bridge, mac string, vlanID int) error {
 	defer f.daemon()()
+	if hook := f.FailConfigureVLANTap; hook != nil {
+		if err := hook(domainName, mac, vlanID); err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if st := f.domains[domainName]; st != StateRunning && st != StatePaused {
+		return fmt.Errorf("find tap for %s/%s: libvirtfake: domain is not active, so its NIC has no tap", domainName, mac)
+	}
 	f.record("vlan-tap", domainName, fmt.Sprintf("bridge=%s mac=%s vlan=%d", bridge, mac, vlanID))
 	return nil
 }
+
+// NegotiateTrunkVLANs mirrors libvirt.Client.NegotiateTrunkVLANs, the domain
+// active as ConfigureVLANTap needs it.
 func (f *Fake) NegotiateTrunkVLANs(domainName, bridge, mac string, vlanIDs []int) error {
 	defer f.daemon()()
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if st := f.domains[domainName]; st != StateRunning && st != StatePaused {
+		return fmt.Errorf("find tap for %s/%s: libvirtfake: domain is not active, so its NIC has no tap", domainName, mac)
+	}
 	f.record("trunk-tap", domainName, fmt.Sprintf("bridge=%s mac=%s vlans=%v", bridge, mac, vlanIDs))
 	return nil
 }

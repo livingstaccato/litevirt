@@ -8,17 +8,18 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
-	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
 // A NIC's VLANs live on its host tap, not in the domain XML, so libvirt's live
-// migration does not carry them: once the move commits, the TARGET puts them
-// on the taps it made (AnnounceMigratedGuest) — the trunk converged to its two
-// VLANs, the access port given its VLAN — and the source configures nothing
-// for a guest that has left it.
+// migration does not carry them. A guest with tap VLANs is handed over PAUSED
+// (B-2): the target puts them on the taps it made — the trunk converged to its
+// two VLANs, the access port given its VLAN — before the guest runs there
+// (resumeHeld → readyGuestHere), not after libvirt resumed it on arrival. The
+// source configures nothing for a guest that has left it.
 //
-// Mutation: drop reapplyVLANTapsOf from AnnounceMigratedGuest — red (the
-// target's taps never get the VLANs).
+// Mutations: armMigrationTarget not pausing for tap VLANs — red (the guest
+// runs on the target before its VLANs are on); resumeHeld not applying them —
+// red.
 func TestFleet_LiveMigrationPutsTheNICsVLANsOnTheTargetTaps(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
 	ctx := context.Background()
@@ -39,10 +40,7 @@ func TestFleet_LiveMigrationPutsTheNICsVLANsOnTheTargetTaps(t *testing.T) {
 		t.Fatalf("seed vmover: %v", err)
 	}
 	src.Virt.SetState("vmover", "running")
-	src.Virt.OnMigrateToTarget = func(name, _ string, _ lv.MigrateParams) error {
-		dst.Virt.SetState(name, "running")
-		return nil
-	}
+	src.LandMigrationsOn(dst)
 
 	taps := func(n *Node) string {
 		var out []string
@@ -61,6 +59,16 @@ func TestFleet_LiveMigrationPutsTheNICsVLANsOnTheTargetTaps(t *testing.T) {
 	eventually(t, 10*time.Second, dst.Name+" to put vmover's VLANs on its taps", func() bool {
 		return strings.Contains(taps(dst), "vlan-tap")
 	})
+	var migrateNote string
+	for _, e := range src.Virt.EventLog() {
+		if e.Domain == "vmover" && e.Op == "migrate" {
+			migrateNote = e.Note
+		}
+	}
+	if !strings.Contains(migrateNote, "paused=true") {
+		t.Errorf("the guest was not handed over paused: migrate %q", migrateNote)
+	}
+	assertVLANBeforeRun(t, dst, "vmover", "bridge=vt_acc mac=52:54:00:47:01:03 vlan=30")
 	got := taps(dst)
 	for _, want := range []string{
 		"trunk-tap bridge=vt_trk mac=52:54:00:47:01:02 vlans=[100 101]",

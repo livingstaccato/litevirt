@@ -254,6 +254,15 @@ func (s *Server) retargetLocalVMNICs(ctx context.Context, vm corrosion.VMRecord)
 		if err := s.rewriteNICNetwork(ctx, nic, legacy, rt); err != nil {
 			return err
 		}
+		// The re-plugged tap joined its new bridge with that bridge's
+		// default VLAN only: the NIC's VLANs go back on it.
+		if s.virt != nil {
+			if active, aerr := s.virt.DomainIsActive(vm.Name); aerr == nil && active {
+				if err := s.applyTapVLANs(ctx, vm.Name); err != nil {
+					slog.Error("NIC move: the re-plugged NIC's VLANs are not on its tap; ConvergeTapVLANs retries", "vm", vm.Name, "error", err)
+				}
+			}
+		}
 		s.removeStackBridgeIfUnused(ctx, rt.From)
 		slog.Info("moved a legacy stack NIC onto its cluster network in place",
 			"vm", vm.Name, "nic", rt.Ordinal, "from", rt.From, "to", rt.To, "bridge", bridge, "mac", nic.MAC)

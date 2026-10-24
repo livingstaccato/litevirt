@@ -17,7 +17,7 @@ import (
 // (NegotiateTrunkVLANs), an access port's as its pvid — and a NIC with no
 // trunk gets none.
 //
-// Mutation: drop reapplyVLANTapsOf from AnnounceMigratedGuest — red (no tap
+// Mutation: drop applyTapVLANs from AnnounceMigratedGuest — red (no tap
 // is configured on the target).
 func TestAnnounceMigratedGuest_PutsTheNICsVLANsOnTheTargetTaps(t *testing.T) {
 	s := testServer(t)

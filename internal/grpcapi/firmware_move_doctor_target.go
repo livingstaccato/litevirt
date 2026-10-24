@@ -531,11 +531,8 @@ func (s *Server) releaseAdoptedHold(ctx context.Context, h fwmig.Hold, resume bo
 		want, _ = s.fw().NvramSHA256(h.VM)
 	}
 	if resume {
-		actx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		err := s.ArmNICsFor(actx, h.VM)
-		cancel()
-		if err != nil {
-			return false, status.Errorf(codes.FailedPrecondition, "VM %q: its NIC firewall is not in force here, so it is not resumed: %v", h.VM, err)
+		if err := s.readyGuestHere(ctx, h.VM); err != nil {
+			return false, status.Errorf(codes.FailedPrecondition, "VM %q: its NIC firewall or NIC VLANs are not in force here, so it is not resumed: %v", h.VM, err)
 		}
 		if h.State != fwmig.HoldResuming {
 			if err := s.putHoldState(h, fwmig.HoldResuming, ""); err != nil {

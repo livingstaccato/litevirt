@@ -137,3 +137,56 @@ func TestFleet_AccessVLANFailoverWithNoFilteringHostIsRefusedAtStart(t *testing.
 		t.Fatalf("%s on %s after the refused start: %+v; want error naming the bridge", accVLANVM, target.Name, got)
 	}
 }
+
+// assertVLANBeforeRun fails unless vm came to n paused (a start, or a
+// migration's arrival), had the VLAN (a vlan-tap note containing want) put on
+// its tap, and only then was resumed.
+func assertVLANBeforeRun(t *testing.T, n *Node, vm, want string) {
+	t.Helper()
+	var ops []string
+	for _, e := range n.Virt.EventLog() {
+		if e.Domain == vm {
+			ops = append(ops, e.Op+" "+e.Note)
+		}
+	}
+	at := func(prefix string) int {
+		for i := len(ops) - 1; i >= 0; i-- { // the last run
+			if strings.HasPrefix(ops[i], prefix) {
+				return i
+			}
+		}
+		return -1
+	}
+	// The guest comes to be here by a start, or by a migration's arrival.
+	start, resume := at("start"), at("resume")
+	if in := at("migrate-in"); in > start {
+		start = in
+	}
+	tap := -1
+	for i := start + 1; start >= 0 && i < len(ops); i++ {
+		if strings.HasPrefix(ops[i], "vlan-tap") && strings.Contains(ops[i], want) {
+			tap = i
+			break
+		}
+	}
+	if start < 0 || tap < 0 || resume < tap {
+		t.Fatalf("%s on %s: ops %q; want a paused start, its VLAN (%s) on its tap, then the resume", vm, n.Name, ops, want)
+	}
+	if st, _ := n.Virt.DomainState(vm); st != "running" {
+		t.Fatalf("%s on %s is %q, want running", vm, n.Name, st)
+	}
+}
+
+// A failover start — the reconciler's, not `lv start` — puts the access VLAN
+// on the tap before the guest runs (B-1: before, it booted on VLAN 1 and
+// stayed there until someone restarted it).
+//
+// Mutation: NICStartGuard not pausing for tap VLANs — red.
+func TestFleet_AccessVLANFailoverStartPutsTheVLANOnBeforeTheGuestRuns(t *testing.T) {
+	ctx := context.Background()
+	clock := NewVirtualClock(time.Now().UTC())
+	c, a, b, _ := accVLANFleet(t, clock, false, true)
+	pciFoFailOver(t, ctx, c, clock, a, b)
+	accVLANStart(t, ctx, b)
+	assertVLANBeforeRun(t, b, accVLANVM, "bridge="+network.FlatBridgeName("accnet")+" mac=52:54:00:ac:00:01 vlan=30")
+}

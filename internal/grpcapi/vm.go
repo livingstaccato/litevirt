@@ -1733,6 +1733,21 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 	}
 	defer s.pendingNICs(spec.Name, spec.Uuid, ifaceRecords, trunks)()
+	// Its NICs' VLANs go on the taps the start makes, before the guest runs
+	// (NICStartGuard); the rows they are otherwise read from are not written yet.
+	var vlanNICs []tapVLANNIC
+	for i, n := range spec.Network {
+		nc := netConfigs[i]
+		if len(n.Trunk) == 0 || nc.MAC == "" || nc.Bridge == "" || strings.HasPrefix(nc.Bridge, "direct:") {
+			continue
+		}
+		vlans := make([]int, len(n.Trunk))
+		for j, v := range n.Trunk {
+			vlans[j] = int(v)
+		}
+		vlanNICs = append(vlanNICs, tapVLANNIC{Bridge: nc.Bridge, MAC: nc.MAC, VLANs: vlans})
+	}
+	defer s.notePendingTapVLANs(spec.Name, vlanNICs)()
 	// Its start is this incarnation's: the before-start hook demands this
 	// create's guards, not records an earlier one of the name left.
 	defer s.noteCreatingIncarnation(spec.Name, spec.Uuid)()
@@ -1759,28 +1774,8 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return nil, status.Errorf(codes.Internal, "%v", abortDefined(fmt.Errorf("start domain: %w", err)))
 	}
 
-	// Configure VLAN tags on tap interfaces for any networks that need it.
-	for i, n := range spec.Network {
-		nc := netConfigs[i]
-		switch {
-		case len(n.Trunk) > 1:
-			// Trunk mode: multiple VLANs — VM handles its own VLAN demux.
-			vlanIDs := make([]int, len(n.Trunk))
-			for j, v := range n.Trunk {
-				vlanIDs[j] = int(v)
-			}
-			if err := s.virt.NegotiateTrunkVLANs(spec.Name, nc.Bridge, nc.MAC, vlanIDs); err != nil {
-				slog.Warn("VLAN trunk tap config failed", "vm", spec.Name, "vlans", vlanIDs, "error", err)
-			}
-		case len(n.Trunk) == 1:
-			// Single VLAN: access mode (pvid + untagged).
-			if err := s.virt.ConfigureVLANTap(spec.Name, nc.Bridge, nc.MAC, int(n.Trunk[0])); err != nil {
-				slog.Warn("VLAN tap config failed", "vm", spec.Name, "vlan", n.Trunk[0], "error", err)
-			}
-		default:
-			// Flat mode: no VLAN tagging needed.
-		}
-	}
+	// Its NICs' VLANs went on its taps before the guest ran: the start guard
+	// (NICStartGuard → readyGuestHere) read them from pendingTapVLANs above.
 
 	// Record the host tap device for each NIC now that the domain is running
 	// (libvirt assigns vnetN at start). The distributed firewall's per-NIC tier
@@ -2903,19 +2898,15 @@ func (s *Server) finishStartLocked(ctx context.Context, vm *corrosion.VMRecord, 
 
 	// The domain is up. A lost "running" write is low-harm (the reconciler heals
 	// it from libvirt), so record it best-effort with retry and still run the
-	// follow-up (VLAN taps, PostStart hook) — skipping those would leave a running
+	// follow-up (the PostStart hook) — skipping it would leave a running
 	// but unreachable VM that nothing re-heals.
 	if err := s.persistVMState(ctx, vm.Name, "running", "", corrosion.OpVMState); err != nil {
 		slog.Error("StartVM: recording running state failed — reconciler will heal", "vm", vm.Name, "error", err)
 	}
 	s.recordVMEvent(ctx, vm.Name, "vm.started", "ok", "")
 
-	// Reapply VLAN tap config: VLAN tagging lives on the host tap (libvirt assigns
-	// a fresh vnetN at each start), not the domain XML — so a VM defined-then-
-	// started later (an import) or any stopped→started VM would otherwise lose its
-	// VLAN. Best-effort, mirroring CreateVM (vm.go ~579): a tap failure warns,
-	// never fails an already-running domain.
-	s.reapplyVLANTaps(ctx, vm)
+	// Its NICs' VLANs went on its taps before the guest ran: the start guard
+	// (NICStartGuard → readyGuestHere), which every start passes.
 
 	pbVM.State = pb.VMState_VM_RUNNING
 	hooks.Run(ctx, hooks.PostStart, pbVM, hspec)
@@ -5127,56 +5118,10 @@ func vmHooks(vm *corrosion.VMRecord) *pb.HooksSpec {
 	return spec.Hooks
 }
 
-// reapplyVLANTaps re-applies host-tap VLAN config for a VM that has just been
-// started here, or has just arrived here by a live migration, from its stored
-// spec's network[].trunk; a trunk's tap is converged to exactly its VLANs
-// (NegotiateTrunkVLANs). VLAN tagging is a property of
-// the host tap device (libvirt re-creates vnetN on every start), not the domain
-// XML, so it must be re-driven at start — otherwise a VM that was defined while
-// stopped (e.g. an import) and started later loses its VLAN. Best-effort: a tap
-// failure is logged, never fatal (the domain is already running).
-func (s *Server) reapplyVLANTaps(ctx context.Context, vm *corrosion.VMRecord) {
-	if vm == nil || vm.Spec == "" || s.virt == nil {
-		return
-	}
-	spec := &pb.VMSpec{}
-	if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
-		return
-	}
-	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
-	macByOrdinal := make(map[int]string, len(ifaces))
-	for _, ir := range ifaces {
-		macByOrdinal[ir.Ordinal] = ir.MAC
-	}
-	for i, n := range spec.Network {
-		if len(n.Trunk) == 0 {
-			continue
-		}
-		mac := n.Mac
-		if mac == "" {
-			mac = macByOrdinal[i]
-		}
-		bridge := resolveBridge(ctx, s.db, n.Name)
-		if mac == "" || bridge == "" {
-			continue
-		}
-		if len(n.Trunk) > 1 {
-			vlanIDs := make([]int, len(n.Trunk))
-			for j, v := range n.Trunk {
-				vlanIDs[j] = int(v)
-			}
-			if err := s.virt.NegotiateTrunkVLANs(vm.Name, bridge, mac, vlanIDs); err != nil {
-				slog.Warn("VLAN trunk tap reapply failed", "vm", vm.Name, "vlans", vlanIDs, "error", err)
-			}
-		} else if err := s.virt.ConfigureVLANTap(vm.Name, bridge, mac, int(n.Trunk[0])); err != nil {
-			slog.Warn("VLAN tap reapply failed", "vm", vm.Name, "vlan", n.Trunk[0], "error", err)
-		}
-	}
-}
-
 // accessVLANStartPreflight refuses the start of a VM with an access-port NIC
 // (network[].trunk with one VLAN) whose bridge on this host does not filter
 // VLANs (network.RunPreFlight). A spec that cannot be read is not judged here.
+
 func (s *Server) accessVLANStartPreflight(ctx context.Context, vm *corrosion.VMRecord) error {
 	if vm.Spec == "" {
 		return nil

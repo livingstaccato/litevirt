@@ -33,8 +33,8 @@ func (s *Server) announceGateway(bridge string, gw netip.Addr) (bool, error) {
 
 // AnnounceMigratedGuest runs on the TARGET of a completed live migration.
 // First it puts the VLANs of the guest's NICs on the taps libvirt created
-// here (reapplyVLANTaps): they live on the host tap, not in the domain XML,
-// so the migration does not carry them. Then, for each network the guest has
+// here (applyTapVLANs), if they are not there yet: they live on the host tap,
+// not in the domain XML, so the migration does not carry them. Then, for each network the guest has
 // a NIC on, it announces the network's gateway out of this host's bridge,
 // from this host's bridge MAC. The guest's ARP cache still holds the gateway
 // at the source host's bridge, and a guest that is not otherwise talking to
@@ -55,20 +55,14 @@ func (s *Server) AnnounceMigratedGuest(ctx context.Context, req *pb.AnnounceMigr
 	if active, err := s.virt.DomainIsActive(req.GetVmName()); err != nil || !active {
 		return nil, status.Errorf(codes.FailedPrecondition, "VM %q is not running on %s", req.GetVmName(), s.hostName)
 	}
-	s.reapplyVLANTapsOf(ctx, req.GetVmName())
+	// A guest with tap VLANs arrives paused and has them before it runs
+	// (resumeHeld); this is the backstop for a source that did not hand it
+	// over paused (an older build's), as ConvergeTapVLANs is.
+	if err := s.applyTapVLANs(ctx, req.GetVmName()); err != nil {
+		slog.Error("migrate: the arrived guest's NIC VLANs are not on its taps here; ConvergeTapVLANs retries", "vm", req.GetVmName(), "error", err)
+	}
 	s.announceGatewaysOf(ctx, req.GetVmName())
 	return &emptypb.Empty{}, nil
-}
-
-// reapplyVLANTapsOf is reapplyVLANTaps for a guest a move has just landed on
-// this host, read by name. Best effort, as reapplyVLANTaps is.
-func (s *Server) reapplyVLANTapsOf(ctx context.Context, vm string) {
-	rec, err := corrosion.GetVM(ctx, s.db, vm)
-	if err != nil || rec == nil {
-		slog.Warn("migrate: cannot read the VM to put its NICs' VLANs on its taps here", "vm", vm, "error", err)
-		return
-	}
-	s.reapplyVLANTaps(ctx, rec)
 }
 
 // announceGatewaysOf announces, on this host, the gateway of each network vm

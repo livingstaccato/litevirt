@@ -385,6 +385,11 @@ func newDaemon(cfg *Config, bootWatchdog *watchdog.BootKeeper) (*Daemon, error) 
 			return svc.CreatingIncarnation(name)
 		}
 		return ""
+	}, func(ctx context.Context, name string) bool {
+		if svc := startWaitSvc.Load(); svc != nil {
+			return svc.HasTapVLANs(ctx, name)
+		}
+		return grpcapi.VMHasTapVLANs(ctx, db, name)
 	}))
 
 	// An earlier build left the backup session directories 0777; narrow them
@@ -1623,7 +1628,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// not answer must not hold the daemon's start.
 	go d.runNFSMountReconcile(ctx)
 	// This host's bridges that cannot carry an access-VLAN NIC
-	// (grpcapi.ReconcileAccessVLANBridges): bridge_vlan_filtering_off.
+	// (grpcapi.ReconcileAccessVLANBridges): bridge_vlan_filtering_off; and
+	// the VLANs of every running guest's NICs back on its taps
+	// (grpcapi.ConvergeTapVLANs).
 	go d.runAccessVLANBridgeReconcile(ctx)
 	// Before this daemon serves: no cold-migration copy can be in flight yet.
 	svc.SweepColdMigrationScratch()
@@ -3219,21 +3226,26 @@ func (d *Daemon) runNFSMountReconcile(ctx context.Context) {
 }
 
 // runAccessVLANBridgeReconcile judges this host's bridges for access-VLAN
-// NICs at once, then every grpcapi.AccessVLANBridgeReconcileInterval, until
-// ctx is cancelled.
+// NICs and converges its running guests' tap VLANs at once, then every
+// grpcapi.AccessVLANBridgeReconcileInterval (= TapVLANConvergeInterval),
+// until ctx is cancelled.
 func (d *Daemon) runAccessVLANBridgeReconcile(ctx context.Context) {
 	if d.svc == nil {
 		return
 	}
-	d.svc.ReconcileAccessVLANBridges(ctx)
-	ticker := time.NewTicker(grpcapi.AccessVLANBridgeReconcileInterval)
+	pass := func() {
+		d.svc.ReconcileAccessVLANBridges(ctx)
+		d.svc.ConvergeTapVLANs(ctx)
+	}
+	pass()
+	ticker := time.NewTicker(grpcapi.TapVLANConvergeInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			d.svc.ReconcileAccessVLANBridges(ctx)
+			pass()
 		}
 	}
 }
@@ -4487,16 +4499,17 @@ func (d *Daemon) wireLeaseTermLedgerGate() {
 
 // startWaitNeeded is the predicate RequireStartGuard waits on (re-review
 // m3): a start waits for the start guard only when its VM has a NIC guard
-// on, or whether it has one cannot be read. A VM with none starts as it did
-// before guards. creating names the incarnation a create on this host is
-// starting (grpcapi.Server.CreatingIncarnation): such a start waits only for
-// that incarnation's guards.
-func startWaitNeeded(db *corrosion.Client, creating func(name string) string) func(name string) bool {
+// on, or a NIC whose VLANs the guard puts on its tap (vlans: an access NIC
+// started unguarded would run on VLAN 1), or either cannot be read. A VM with
+// neither starts as it did before guards. creating names the incarnation a
+// create on this host is starting (grpcapi.Server.CreatingIncarnation): such
+// a start waits only for that incarnation's guards.
+func startWaitNeeded(db *corrosion.Client, creating func(name string) string, vlans func(ctx context.Context, name string) bool) func(name string) bool {
 	return func(name string) bool {
 		gctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		macs, err := corrosion.GuardedMACsOfIncarnation(gctx, db, name, creating(name))
-		return err != nil || len(macs) > 0
+		return err != nil || len(macs) > 0 || vlans(gctx, name)
 	}
 }
 

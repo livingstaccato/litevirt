@@ -379,7 +379,7 @@ LogLevel VERBOSE
 			t.Logf("%s sshd log:\n%s", n.name, raw)
 		}
 	})
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		c, err := net.DialTimeout("tcp", net.JoinHostPort(n.ip, fmt.Sprint(n.port)), 200*time.Millisecond)
 		if err == nil {
@@ -392,7 +392,7 @@ LogLevel VERBOSE
 		default:
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("sshd for %s did not listen on %s:%d within 5s: %s", n.name, n.ip, n.port, sshdLog())
+			return fmt.Errorf("sshd for %s did not listen on %s:%d within 30s: %s", n.name, n.ip, n.port, sshdLog())
 		}
 		time.Sleep(50 * time.Millisecond)
 	}

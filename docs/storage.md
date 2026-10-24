@@ -126,6 +126,11 @@ every open litevirt itself makes of the pool's content (records, uploads,
 replicas, temps) follows no symlink on the export — `openat2`
 `RESOLVE_NO_SYMLINKS`, or a component-by-component `O_NOFOLLOW` walk on a
 kernel without it — and a pool path is not handed to `qemu-img` through one.
+`qemu-img` (a volume move, a replica or point-in-time copy) gets no path at
+all: each file of the source's backing chain and the destination are opened
+by the daemon with no symlink followed at the file, judged through those
+descriptors, and handed over as `/proc/self/fd/N`, every backing named
+explicitly, so a name swapped after the checks is never followed.
 An export that is already mounted without these flags — mounted by an earlier
 build (`vers=4,hard,intr`), or by hand — is hardened in place, at daemon start
 and at the pool's first use: `mount -o remount,bind,<its flags plus

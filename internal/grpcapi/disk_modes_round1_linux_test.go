@@ -69,7 +69,12 @@ func TestConvertImage_ARefusedChmodNeverFailsTheCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 	log := refuseChmod(t)
+	// A destination its caller made wider than its owner: convertImage makes
+	// one it creates itself owner-only, so only such a file is narrowed.
 	fresh := filepath.Join(dir, "fresh.qcow2")
+	if err := os.WriteFile(fresh, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := convertImage(context.Background(), src, "qcow2", nil, fresh, func(*pb.MoveVolumeProgress) error { return nil }); err != nil {
 		t.Fatalf("the convert failed on a refused chmod: %v", err)
 	}

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"github.com/litevirt/litevirt/internal/automation/contract"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/pki"
 	"os"
 	"path/filepath"
@@ -18,6 +19,12 @@ import (
 // These genuinely signed historical prerequisites exercise storage and replay;
 // they are not fresh enrollment or a native continuity acceptance producer.
 func continuityStorageHistory(t *testing.T) (*claimTestVoter, *claimTestVoter, *claimTestVoter, *ClaimVerifier) {
+	t.Helper()
+	a, b, c, verifier, _ := continuityStorageHistoryWithOwner(t)
+	return a, b, c, verifier
+}
+
+func continuityStorageHistoryWithOwner(t *testing.T) (*claimTestVoter, *claimTestVoter, *claimTestVoter, *ClaimVerifier, ContinuityStorageOwner) {
 	t.Helper()
 	ca, a, b, c := threeVoters(t)
 	verifier, err := LoadClaimVerifier(ca.pkiDir(t, "continuity-storage-verifier"))
@@ -34,7 +41,8 @@ func continuityStorageHistory(t *testing.T) (*claimTestVoter, *claimTestVoter, *
 	if _, err = a.c.db.Exec(`UPDATE local_automation_authority SET bootstrap_request='initialize' WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	return a, b, c, verifier
+	owner := configureContinuityStorageOwner(t, a.c, a.pki, verifier)
+	return a, b, c, verifier, owner
 }
 func continuityStorageFact() contract.IdentityContinuity {
 	return contract.IdentityContinuity{ClusterUID: "established-cluster", UID: "principal-uid", OriginalWitness: "principal-source-lifetime", Generation: 1, Parent: contract.ParentLifetime{Kind: "principal", Alias: "principal-alias", Realm: "local", Birth: "parent-birth"}}
@@ -62,7 +70,8 @@ func continuityStorageRecord(t *testing.T, a, b *claimTestVoter, head contract.P
 	return r
 }
 func TestAutomationContinuityCertifiedStorageReplay(t *testing.T) {
-	a, b, _, verifier := continuityStorageHistory(t)
+	a, b, _, verifier, owner := continuityStorageHistoryWithOwner(t)
+	assertContinuityStorageOwnerUnused(t, a.c, owner)
 	ctx := context.Background()
 	head, err := a.c.AutomationHead(ctx)
 	if err != nil {
@@ -73,6 +82,7 @@ func TestAutomationContinuityCertifiedStorageReplay(t *testing.T) {
 	if err != nil || receipt.Code != "" {
 		t.Fatalf("certified continuity must apply and persist original identity: %+v %v", receipt, err)
 	}
+	assertContinuityStorageOwnerUsed(t, a.c, owner)
 	rows, err := a.c.Query(ctx, `SELECT uid,generation,original_witness FROM local_automation_identity_continuity WHERE stage=''`)
 	if err != nil || len(rows) != 1 || rows[0].String("uid") != "principal-uid" || rows[0].Int64("generation") != 1 || rows[0].String("original_witness") != "principal-source-lifetime" {
 		t.Fatalf("continuity projection absent: %+v %v", rows, err)
@@ -83,6 +93,119 @@ func TestAutomationContinuityCertifiedStorageReplay(t *testing.T) {
 	replay, err := a.c.AutomationApplyOwned(ctx, &r, verifier, contract.Reduce)
 	if err != nil || replay != receipt {
 		t.Fatalf("original result changed: %+v %+v %v", receipt, replay, err)
+	}
+}
+
+func assertContinuityStorageOwnerUnused(t *testing.T, c *Client, owner ContinuityStorageOwner) {
+	t.Helper()
+	if owner.DurablyLatched() {
+		t.Fatal("fixture preinstalled a durable continuity activation latch")
+	}
+	if _, err := os.Stat(owner.MarkerPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("fixture preinstalled continuity activation marker", err)
+	}
+	present, _, err := ReleaseFeatureState(context.Background(), c, capabilities.Release202702V1, string(capabilities.FeatureAutomationIdentityContinuity))
+	if err != nil || present {
+		t.Fatal("fixture preinstalled continuity release use", present, err)
+	}
+}
+
+func assertContinuityStorageOwnerUsed(t *testing.T, c *Client, owner ContinuityStorageOwner) {
+	t.Helper()
+	marker, err := os.ReadFile(owner.MarkerPath)
+	if err != nil || !bytes.Equal(marker, capabilities.MarkerContent(capabilities.Release202702V1)) || !owner.DurablyLatched() {
+		t.Fatal("real continuity owner did not persist its durable activation marker", err)
+	}
+	uses, err := ListReleaseFeatureUses(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, use := range uses {
+		if use.Token == capabilities.Release202702V1 && use.Feature == string(capabilities.FeatureAutomationIdentityContinuity) {
+			if !use.Acked || use.Tombstoned || use.RecordedBy != "a" {
+				t.Fatal("continuity materialized without acknowledged own release use", use)
+			}
+			return
+		}
+	}
+	t.Fatal("continuity materialized without real release use record")
+}
+
+func continuityStorageEffectRows(t *testing.T, c *Client) map[string][]Row {
+	t.Helper()
+	state := map[string][]Row{}
+	for _, table := range []string{"local_recovery_claims", "local_automation_prefix", "local_automation_anchors", "local_automation_history", "local_automation_requests", "local_automation_identity_continuity"} {
+		rows, err := c.Query(context.Background(), `SELECT * FROM `+table+` ORDER BY rowid`)
+		if err != nil {
+			t.Fatal(table, err)
+		}
+		state[table] = rows
+	}
+	return state
+}
+
+func TestAutomationContinuityStorageOwnerPrerequisites(t *testing.T) {
+	for _, missing := range []string{"verifier", "restorer", "gate", "marker", "policy"} {
+		t.Run(missing, func(t *testing.T) {
+			a, b, _, verifier, owner := continuityStorageHistoryWithOwner(t)
+			ctx := context.Background()
+			assertContinuityStorageOwnerUnused(t, a.c, owner)
+			head, err := a.c.AutomationHead(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			record := continuityStorageRecord(t, a, b, head, "owner-prerequisite", continuityStorageFact())
+			original := copyContinuityRecord(record)
+			var restore func()
+			switch missing {
+			case "verifier":
+				a.c.SetClaimCertificateVerifier(nil)
+				restore = func() { a.c.SetClaimCertificateVerifier(func() *ClaimVerifier { return verifier }) }
+			case "restorer":
+				a.c.SetAutomationContinuityReleaseRestorer(nil)
+				restore = func() { a.c.SetAutomationContinuityReleaseRestorer(owner.Restore) }
+			case "gate":
+				a.c.SetReleaseFeatureGate(nil)
+				restore = func() { a.c.SetReleaseFeatureGate(owner.Gate) }
+			case "marker":
+				// An existing regular file cannot be the marker's parent directory.
+				// This exercises an actual persistence error, including as root.
+				blocker := filepath.Join(t.TempDir(), "not-a-directory")
+				if err := os.WriteFile(blocker, []byte("marker parent blocker"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				owner.SetActivationMarker(filepath.Join(blocker, "activation"))
+				restore = func() { owner.SetActivationMarker(owner.MarkerBase) }
+			case "policy":
+				a.c.SetClusterPolicyGate(func() bool { return false })
+				restore = func() { a.c.SetClusterPolicyGate(func() bool { return true }) }
+			}
+			before := continuityStorageEffectRows(t, a.c)
+			receipt, err := a.c.AutomationApplyOwned(ctx, &record, verifier, contract.Reduce)
+			if err == nil || receipt != (contract.Receipt{}) {
+				t.Fatal("missing real owner prerequisite materialized continuity", receipt, err)
+			}
+			if !reflect.DeepEqual(before, continuityStorageEffectRows(t, a.c)) || !reflect.DeepEqual(record, original) {
+				t.Fatal("refused owner prerequisite changed claim/head/history/request/continuity or signed input")
+			}
+			if missing != "gate" {
+				present, _, err := ReleaseFeatureState(ctx, a.c, capabilities.Release202702V1, string(capabilities.FeatureAutomationIdentityContinuity))
+				if err != nil || present {
+					t.Fatal("refusal before restoration acknowledgement wrote release use", err)
+				}
+			}
+			// Restore only the missing prerequisite, retaining identical signed bytes.
+			restore()
+			receipt, err = a.c.AutomationApplyOwned(ctx, &record, verifier, contract.Reduce)
+			if err != nil || receipt.Code != "" || receipt.Sequence != head.Sequence+1 {
+				t.Fatal("restored real owner prerequisite did not permit same signed input", receipt, err)
+			}
+			assertContinuityStorageOwnerUsed(t, a.c, owner)
+			stored, found, err := a.c.AutomationRecord(ctx, receipt.Sequence)
+			if err != nil || !found || !reflect.DeepEqual(stored, original) {
+				t.Fatal("real owner changed original historical record", err)
+			}
+		})
 	}
 }
 
@@ -381,16 +504,21 @@ func TestAutomationContinuityRollbackAndLostReply(t *testing.T) {
 }
 
 func TestAutomationContinuityFreshGenericAcceptanceStaysClosed(t *testing.T) {
-	a, b, _, _ := continuityStorageHistory(t)
+	a, b, _, _, owner := continuityStorageHistoryWithOwner(t)
 	ctx := context.Background()
 	head, _ := a.c.AutomationHead(ctx)
 	r := continuityStorageRecord(t, a, b, head, "generic-continuity", continuityStorageFact())
 	key, _ := AutomationClaimKey(head.Sequence + 1)
 	before := localTestMutationLogCount(t, a.c)
+	localBefore := continuityStorageEffectRows(t, a.c)
 	refused, err := a.c.ClaimAccept(ctx, key, testBallot(8, "a"), r.Value, 1, a.signer, nil)
 	if err != nil || refused.Accepted || refused.Accept != nil || refused.Refusal != RefusalAutomationUnavailable {
 		t.Fatal("fresh continuity native class opened", refused, err)
 	}
+	if !reflect.DeepEqual(localBefore, continuityStorageEffectRows(t, a.c)) {
+		t.Fatal("fresh generic refusal changed local claim/history/request/continuity state")
+	}
+	assertContinuityStorageOwnerUnused(t, a.c, owner)
 	// Same current authority/config/head/FULL and signer reach the permitted class.
 	_, control := automationFixture(t, head.Sequence+1, head.Digest)
 	accepted, err := a.c.ClaimAccept(ctx, key, testBallot(8, "a"), control, 1, a.signer, nil)
@@ -556,8 +684,8 @@ func TestAutomationContinuityGenuine87PublicCold88(t *testing.T) {
 	if err = InitSchema(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	if storedVersion(t, c) != 89 {
-		t.Fatal("consumer did not migrate89")
+	if storedVersion(t, c) != 90 {
+		t.Fatal("current consumer did not migrate90")
 	}
 	if len(schemaDDL) != len(evidence.DDL)+2 || !reflect.DeepEqual(schemaDDL[:len(evidence.DDL)], evidence.DDL) {
 		t.Fatal("schema88 changed prior DDL")
@@ -636,8 +764,8 @@ func TestAutomationContinuityGenuine87PrivateCold88(t *testing.T) {
 	if err = InitSchema(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	if storedVersion(t, c) != 89 {
-		t.Fatal("consumer89 not active")
+	if storedVersion(t, c) != 90 {
+		t.Fatal("current consumer90 not active")
 	}
 	header, err := decodeRetainedHeader(e.Header)
 	if err != nil || header.LayoutDigest != retainedLocalLayout87Digest() || header.Head.Sequence != 14 {
@@ -827,7 +955,7 @@ func TestAutomationContinuityCurrent89RetainedWarmCold(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if storedVersion(t, cold) != 89 {
+	if storedVersion(t, cold) != 90 {
 		t.Fatal("cold continuity38 source schema")
 	}
 	coldtx, err := cold.db.BeginTx(ctx, nil)
@@ -851,7 +979,9 @@ func TestAutomationContinuityOwnedCallbackCannotEraseOrForge(t *testing.T) {
 			ctx := context.Background()
 			head, _ := a.c.AutomationHead(ctx)
 			record := continuityStorageRecord(t, a, b, head, "callback", continuityStorageFact())
+			called := false
 			callback := func(p contract.Projection, d contract.Decision) (contract.Reduction, error) {
+				called = true
 				if mode == "mutate-predecessor" {
 					p.Continuity.Identity.Witness = "forged"
 					return contract.Reduce(p, d)
@@ -871,6 +1001,9 @@ func TestAutomationContinuityOwnedCallbackCannotEraseOrForge(t *testing.T) {
 			}
 			if _, err := a.c.AutomationApplyOwned(ctx, &record, verifier, callback); err == nil {
 				t.Fatal("owned callback changed successful continuity semantics")
+			}
+			if !called {
+				t.Fatal("earlier prerequisite masked owned callback rejection")
 			}
 			got, err := a.c.AutomationHead(ctx)
 			if err != nil || got != head {

@@ -70,6 +70,36 @@ func TestDecisionCiphertextCanonicalPositives(t *testing.T) {
 			if kind == "initialize_cluster" {
 				d = ciphertextDecision()
 			}
+			if kind == "admit_update" {
+				// The frozen codec recognized the vocabulary before there
+				// was an update handler. Keep that old positive assertion;
+				// its generic v1 seed is invalid in the new strict v3 domain.
+				legacy, err := legacyEncodeDecision(d)
+				if err != nil || !bytes.Equal(legacy, rawDecision(t, d)) {
+					t.Fatal("frozen v1 update vocabulary bytes changed", err)
+				}
+				if err := ValidateSupportedDecision(d); Code(err) != CodeValidation {
+					t.Fatal("generic v1 seed became valid update authority", err)
+				}
+				if raw, err := EncodeDecision(d); Code(err) != CodeValidation || raw != nil {
+					t.Fatal("invalid update seed published bytes", err)
+				}
+				if decoded, err := DecodeDecision(legacy); Code(err) != CodeValidation || !reflect.DeepEqual(decoded, Decision{}) {
+					t.Fatal("invalid update seed lost refusal/zero output", err)
+				}
+				_, valid := updateContractFixture(t)
+				if err := ValidateSupportedDecision(valid); err != nil {
+					t.Fatal("actual update3 positive invalid", err)
+				}
+				raw, err := EncodeDecision(valid)
+				if err != nil {
+					t.Fatal("actual update3 positive could not encode", err)
+				}
+				if decoded, err := DecodeDecision(raw); err != nil || !reflect.DeepEqual(decoded, valid) {
+					t.Fatal("actual update3 positive lost exact round trip", err)
+				}
+				return
+			}
 			checkDecisionEncoding(t, d, "")
 		})
 	}

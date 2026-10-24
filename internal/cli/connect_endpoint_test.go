@@ -15,6 +15,7 @@ import (
 // (a test run on a node would otherwise dial its daemon's values) and out of
 // the fallback notices; a test that needs either sets its own.
 func TestMain(m *testing.M) {
+	dispatchEnrollmentC1Role()
 	endpointPath = filepath.Join(os.TempDir(), "litevirt-cli-test-no-endpoint", "endpoint")
 	cliNotice = io.Discard
 	// A test cannot create root's files: the endpoint files these tests

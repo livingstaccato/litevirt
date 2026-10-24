@@ -466,7 +466,7 @@ func TestRetainedOriginal83ReplayRequiresEmptyTargets(t *testing.T) {
 
 // All semantic decisions are the existing retained certified-history premise,
 // signed by this aggregate's own electorate and applied by the real FULL owner.
-func retainedCompatibilityCurrent37Fixture(t *testing.T) (*aggregateFixture, string) {
+func retainedCompatibilityCurrent37Fixture(t *testing.T, continuations ...func(*executionStorageFixture)) (*aggregateFixture, string) {
 	t.Helper()
 	ctx := context.Background()
 	f := newAggregateFixture(t, aggregateFixtureOptions{Old: 3, Sources: 2, Continuing: true, BeforeFreeze: func(t *testing.T, voters []*claimTestVoter, local *claimTestVoter) {
@@ -537,6 +537,15 @@ func retainedCompatibilityCurrent37Fixture(t *testing.T) (*aggregateFixture, str
 			if err != nil || head.Sequence != 14 {
 				t.Fatal("current37 original head", head, err)
 			}
+			for _, continueHistory := range continuations {
+				continueHistory(execution)
+			}
+			if len(continuations) > 0 {
+				head, err = c.AutomationHead(ctx)
+				if err != nil || head.Sequence <= 14 {
+					t.Fatal("retained continuation did not advance actual certified history", head, err)
+				}
+			}
 			if common.Sequence == 0 {
 				common = head
 			} else if head != common {
@@ -545,8 +554,8 @@ func retainedCompatibilityCurrent37Fixture(t *testing.T) (*aggregateFixture, str
 		}
 	}})
 	// Historical helper name retained; this factory always constructs CURRENT data.
-	if CurrentSchemaVersion != 89 || storedVersion(t, f.local.c) != 89 || len(aggregateLocalTables()) != 38 {
-		t.Fatal("current factory requires actual89 schema/private38")
+	if CurrentSchemaVersion != 90 || storedVersion(t, f.local.c) != 90 || len(aggregateLocalTables()) != 38 {
+		t.Fatal("current factory requires actual90 schema/private38")
 	}
 	before := receiverActive(t, f.local.c)
 	for i := range f.producers {
@@ -736,8 +745,8 @@ func TestRetainedCurrent37NonemptyExecutionWarmCold(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	c.SetVoterConfigGate(func() bool { return true })
-	if storedVersion(t, c) != 89 || receiverActive(t, c) != active {
-		t.Fatal("cold current89 state changed")
+	if storedVersion(t, c) != 90 || receiverActive(t, c) != active {
+		t.Fatal("cold current90 state changed")
 	}
 	view, err = pki.CaptureHostTrust(ctx, f.local.pki, f.local.name)
 	if err != nil {

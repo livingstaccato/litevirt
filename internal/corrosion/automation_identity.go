@@ -250,6 +250,8 @@ func automationSemanticProjectionSourceTx(ctx context.Context, tx *LocalTx, stag
 			return fmt.Errorf("key transition causal projection was not prepared")
 		}
 		return nil
+	case "admit_update":
+		return automationUpdateProjectionTx(ctx, tx, stage, p, d, source)
 	case "adopt_resource", "transfer_owner":
 		return automationOwnershipProjectionTx(ctx, tx, stage, p, d)
 	case "claim_executor", "record_progress", "retire_artifact", "complete_operation":

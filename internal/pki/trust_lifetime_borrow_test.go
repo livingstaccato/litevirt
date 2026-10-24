@@ -14,6 +14,39 @@ import (
 	"time"
 )
 
+func TestHostDomainEnrollmentWorkerBorrowUsesActualAdmission(t *testing.T) {
+	dir := t.TempDir()
+	lease, err := AcquireHostReinitialization(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	borrowed, err := lease.BorrowForEnrollmentWorker()
+	if err != nil {
+		t.Fatalf("RED_ENROLLMENT_WORKER_BORROW: actual exclusive admission refused: %v", err)
+	}
+	defer borrowed.Close()
+	flags, _, errno := syscall.Syscall(syscall.SYS_FCNTL, borrowed.Fd(), syscall.F_GETFD, 0)
+	if errno != 0 || flags&syscall.FD_CLOEXEC == 0 {
+		t.Fatal("actual borrow is not CLOEXEC")
+	}
+	lease.Release()
+	if got := borrowContender(t, dir); !strings.HasPrefix(got, "BLOCKED\n") {
+		t.Fatalf("live borrowed OFD did not retain exclusion: %s", got)
+	}
+	_ = borrowed.Close()
+	if got := borrowContender(t, dir); !strings.HasPrefix(got, "ACQUIRED\n") {
+		t.Fatalf("last borrow close did not release exclusion: %s", got)
+	}
+	if _, err := lease.BorrowForEnrollmentWorker(); err == nil {
+		t.Fatal("released lease borrowed again")
+	}
+	var zero HostDomainLease
+	if _, err := zero.BorrowForEnrollmentWorker(); err == nil {
+		t.Fatal("zero lease borrowed")
+	}
+}
+
 // This subprocess uses the actual inherited OFD, not a reopened lock pathname.
 func TestHostDomainBorrowProcess(t *testing.T) {
 	mode := os.Getenv("LITEVIRT_BORROW_CHILD")

@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/litevirt/litevirt/internal/cli"
 	"github.com/litevirt/litevirt/internal/filerestore"
 	"github.com/litevirt/litevirt/internal/filerestore/agent"
 	"github.com/litevirt/litevirt/internal/grpcapi"
@@ -20,6 +21,12 @@ var (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == cli.EnrollmentDiagnosticsRelayArg {
+		if len(os.Args) != 2 {
+			os.Exit(2)
+		}
+		os.Exit(cli.RunEnrollmentDiagnosticsRelay())
+	}
 	// Inside a restore VM this binary is /init, the file-restore agent
 	// (internal/filerestore). Nothing else of the CLI applies there.
 	if agent.IsAgent() {
@@ -95,6 +102,7 @@ func newRootCmd() *cobra.Command {
 		newHostCmd(),
 		newHostPKICmd(),
 		newHostEnrollCmd(),
+		newHostEnrollmentControlCmd(),
 		newNetworkCmd(),
 		newNetboxCmd(),
 		newComposeCmd(),

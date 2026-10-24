@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strings"
 
 	"github.com/litevirt/litevirt/internal/automation/contract"
 )
@@ -23,6 +24,9 @@ func automationApplyBindingEffectsTx(ctx context.Context, tx *LocalTx, stage str
 	}
 	if r.AdmissionEffect == nil {
 		return automationApplyVMEnrollmentEffectsTx(ctx, tx, stage, next, r)
+	}
+	if r.AdmissionEffect.Method == "admit_update" {
+		return automationApplyUpdateEffectsTx(ctx, tx, stage, next, r)
 	}
 	if r.AdmissionEffect.Method == "adopt_resource" || r.AdmissionEffect.Method == "transfer_owner" {
 		return automationApplyOwnershipEffectsTx(ctx, tx, stage, next, r)
@@ -209,6 +213,23 @@ func automationAdmissionRecordTx(ctx context.Context, tx *LocalTx, stage, operat
 	if operation == "" {
 		return nil, nil
 	}
+	var bad []string
+	for _, column := range []string{"operation_id", "cluster_uid", "project_uid", "owner_id", "management_key", "resource_uid", "request_id", "principal_uid", "method", "payload_id", "configuration_json"} {
+		bad = append(bad, "typeof("+column+")<>'text'")
+	}
+	for _, column := range []string{"binding_generation", "admitted_generation", "sequence"} {
+		bad = append(bad, "typeof("+column+")<>'integer' OR "+column+"<=0")
+	}
+	types, err := tx.Query(ctx, "SELECT CASE WHEN "+strings.Join(bad, " OR ")+" THEN 1 ELSE 0 END AS bad FROM local_automation_admissions WHERE stage=? AND operation_id=? LIMIT 1", stage, operation)
+	if err != nil {
+		return nil, err
+	}
+	if len(types) == 0 {
+		return nil, nil
+	}
+	if len(types) != 1 || types[0].Int64("bad") != 0 {
+		return nil, fmt.Errorf("invalid typed admission columns")
+	}
 	sizes, err := tx.Query(ctx, `SELECT length(CAST(configuration_json AS BLOB)) AS config_bytes,length(CAST(cluster_uid AS BLOB))+length(CAST(project_uid AS BLOB))+length(CAST(owner_id AS BLOB))+length(CAST(management_key AS BLOB))+length(CAST(resource_uid AS BLOB))+length(CAST(request_id AS BLOB))+length(CAST(principal_uid AS BLOB))+length(CAST(method AS BLOB))+length(CAST(payload_id AS BLOB)) AS bytes FROM local_automation_admissions WHERE stage=? AND operation_id=? LIMIT 1`, stage, operation)
 	if err != nil || len(sizes) == 0 {
 		return nil, err
@@ -236,7 +257,7 @@ func automationAdmissionRecordTx(ctx context.Context, tx *LocalTx, stage, operat
 	if err != nil || !bytes.Equal(encoded, canonical) {
 		return nil, fmt.Errorf("noncanonical admitted configuration")
 	}
-	if (r.Method == "admit_create") != (r.PinnedConfiguration != nil) || (r.Method != "admit_create" && r.Method != "adopt_resource" && r.Method != "transfer_owner") {
+	if (r.Method == "admit_create" || r.Method == "admit_update") != (r.PinnedConfiguration != nil) || (r.Method != "admit_create" && r.Method != "admit_update" && r.Method != "adopt_resource" && r.Method != "transfer_owner") {
 		return nil, fmt.Errorf("invalid admission method/configuration")
 	}
 	return r, nil

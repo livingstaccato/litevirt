@@ -71,6 +71,9 @@ func automationVerifySemanticSchemaTx(ctx context.Context, tx *LocalTx) error {
 	if err := automationVerifyExecutionIndexesTx(ctx, tx); err != nil {
 		return err
 	}
+	if err := automationVerifyUpdateIndexesTx(ctx, tx); err != nil {
+		return err
+	}
 	return automationVerifyContinuityIndexesTx(ctx, tx)
 }
 

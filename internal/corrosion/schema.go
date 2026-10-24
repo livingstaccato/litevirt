@@ -633,7 +633,8 @@ import (
 // v87: four local certified-history-derived execution projections; no native authority.
 // v88: local certified-history-derived identity continuity; no native authority.
 // v89: local session issuance pins origin or continuity proof and exact attachment.
-const CurrentSchemaVersion = 89
+// v90: required local desired-admission index for certified conditional updates.
+const CurrentSchemaVersion = 90
 
 // schemaVersionTokenUserIncarnation is the version tokens.user_created_at was
 // added in.
@@ -915,6 +916,12 @@ func InitSchema(ctx context.Context, c *Client) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	healed, upgraded := 0, 0
 	for _, m := range schemaMigrationLedger {
+		if m.Kind == kindRequiredAutomationIndex {
+			if err := applyRequiredAutomationIndex(ctx, c, m, now); err != nil {
+				return fmt.Errorf("required schema index %q: %w", m.ID, err)
+			}
+			continue
+		}
 		sum := sha256hex(m.SQL)
 		if stored, ok := applied[m.ID]; ok {
 			// Already applied — a changed checksum means the migration's SQL was
@@ -3591,6 +3598,7 @@ var schemaDDL = []string{
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
 // These accelerate the most common query patterns (ListVMs by host, interfaces by VM, etc.).
 var schemaIndexes = []string{
+	`CREATE INDEX IF NOT EXISTS automation_admission_resource_desired ON local_automation_admissions(stage,cluster_uid,resource_uid,sequence DESC,operation_id) WHERE method IN ('admit_create','admit_update')`,
 	// identity bindings by entry id: one id is never bound to two accounts.
 	`CREATE INDEX IF NOT EXISTS idx_user_identity_bindings_id ON user_identity_bindings(realm, external_id)`,
 	// users by normalized name (corrosion.NormalizeUsername / GetUser): every
@@ -4070,6 +4078,8 @@ const (
 )
 
 const kindRebuildAutomationCustody migKind = 3 // v84 exact recipient shape and nonnegative host counter
+const kindRequiredAutomationIndex migKind = 4  // v90 physical index, verified even after its receipt exists
+const automationRequiredIndexMigrationID = "i_automation_admission_resource_desired"
 
 // migration is one ledgered schema unit.
 type migration struct {
@@ -4096,6 +4106,14 @@ func (m migration) present(ctx context.Context, c *Client) (bool, error) {
 		return err == nil && slices.Equal(cols, []string{"id", "crl_pem"}), err
 	case kindRebuildAutomationCustody:
 		return automationCustodyRecipientShape(ctx, c)
+	case kindRequiredAutomationIndex:
+		var present bool
+		err := c.ExecuteLocal(ctx, func(tx *LocalTx) error {
+			var err error
+			present, err = automationUpdateIndexPresentTx(ctx, tx)
+			return err
+		})
+		return present, err
 	default:
 		return false, fmt.Errorf("migration %q: unknown kind %d", m.ID, m.Kind)
 	}
@@ -4284,4 +4302,55 @@ func init() {
 		Target:  "local_automation_key_recipients",
 		SQL:     automationCustodyRebuildSQL,
 	})
+	schemaMigrationLedger = append(schemaMigrationLedger, migration{
+		ID:      automationRequiredIndexMigrationID,
+		Version: 90,
+		Kind:    kindRequiredAutomationIndex,
+		Target:  "automation_admission_resource_desired",
+		SQL:     automationUpdateIndexSQL,
+	})
+}
+
+// This is the same trusted schema owner as execBatchLocal, with an intervening
+// read of the actual physical index before its durable migration receipt. DDL
+// and receipt commit together, without mutation-log or replication effects.
+// Already-applied receipts never substitute for the current physical reality.
+func applyRequiredAutomationIndex(ctx context.Context, c *Client, m migration, now string) error {
+	if m.ID != automationRequiredIndexMigrationID || m.Version != 90 || m.Kind != kindRequiredAutomationIndex || m.Target != "automation_admission_resource_desired" || m.SQL != automationUpdateIndexSQL {
+		return fmt.Errorf("unknown required automation index migration")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var stored string
+	err = tx.QueryRowContext(ctx, `SELECT checksum FROM applied_migrations WHERE id=?`, m.ID).Scan(&stored)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	if err == nil && stored != sha256hex(m.SQL) {
+		return fmt.Errorf("schema ledger: migration %q checksum drift", m.ID)
+	}
+	local := &LocalTx{tx: tx}
+	present, err := automationUpdateIndexPresentTx(ctx, local)
+	if err != nil {
+		return err
+	}
+	if !present {
+		// No IF NOT EXISTS: a conflicting identity cannot silently replace
+		// the exact missing-index observation. Never DROP a wrong index.
+		if _, err := tx.ExecContext(ctx, m.SQL); err != nil {
+			return err
+		}
+	}
+	if err := automationVerifyUpdateIndexShapeTx(ctx, local); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO applied_migrations (id, applied_at, checksum) VALUES (?, ?, ?)`, m.ID, now, sha256hex(m.SQL)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

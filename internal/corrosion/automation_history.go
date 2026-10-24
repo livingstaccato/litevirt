@@ -709,6 +709,11 @@ func validateAutomationRecordSize(r AutomationRecord) error {
 
 func cloneAutomationProjection(projection AutomationProjection) AutomationProjection {
 	callbackProjection := projection
+	if projection.Update != nil {
+		raw, _ := json.Marshal(projection.Update)
+		callbackProjection.Update = new(contract.UpdateProjection)
+		_ = json.Unmarshal(raw, callbackProjection.Update)
+	}
 	if projection.Continuity != nil {
 		facts := *projection.Continuity
 		if facts.Identity != nil {

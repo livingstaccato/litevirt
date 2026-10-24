@@ -338,7 +338,7 @@ func automationResolveKeyProjectionTx(ctx context.Context, tx *LocalTx, stage st
 	// Validate key scalars before paging. There is no cap on unrelated historical
 	// admissions: the certified prefix bounds traversal, while only retained
 	// payload entries count toward the canonical transition inventory capacity.
-	probes, e := tx.Query(ctx, `SELECT count(*) AS n,coalesce(max(sequence),0) AS last,coalesce(max(CASE WHEN typeof(sequence)<>'integer' OR sequence<=0 OR typeof(operation_id)<>'text' OR length(CAST(operation_id AS BLOB))=0 OR length(CAST(operation_id AS BLOB))>4096 OR typeof(method)<>'text' OR method NOT IN ('admit_create','adopt_resource','transfer_owner') OR typeof(payload_id)<>'text' OR length(CAST(payload_id AS BLOB))>4096 OR (method<>'admit_create' AND payload_id<>'') THEN 1 ELSE 0 END),0) AS bad FROM local_automation_admissions INDEXED BY automation_admission_inventory WHERE stage=? AND cluster_uid=?`, stage, p.Head.ClusterUID)
+	probes, e := tx.Query(ctx, `SELECT count(*) AS n,coalesce(max(sequence),0) AS last,coalesce(max(CASE WHEN typeof(sequence)<>'integer' OR sequence<=0 OR typeof(operation_id)<>'text' OR length(CAST(operation_id AS BLOB))=0 OR length(CAST(operation_id AS BLOB))>4096 OR typeof(method)<>'text' OR method NOT IN ('admit_create','admit_update','adopt_resource','transfer_owner') OR typeof(payload_id)<>'text' OR length(CAST(payload_id AS BLOB))>4096 OR (method NOT IN ('admit_create','admit_update') AND payload_id<>'') THEN 1 ELSE 0 END),0) AS bad FROM local_automation_admissions INDEXED BY automation_admission_inventory WHERE stage=? AND cluster_uid=?`, stage, p.Head.ClusterUID)
 	if e != nil {
 		return e
 	}
@@ -496,11 +496,18 @@ func automationVerifyKeyIndexesTx(ctx context.Context, tx *LocalTx) error {
 		"local_automation_admissions":          {{"sqlite_autoindex_local_automation_admissions_1", "stage,operation_id", 1}, {"automation_admission_inventory", "stage,cluster_uid,sequence,operation_id", 0}},
 	}
 	for table, list := range indexes {
+		expectedCount := len(list)
+		if table == "local_automation_admissions" {
+			if e := automationVerifyUpdateIndexesTx(ctx, tx); e != nil {
+				return e
+			}
+			expectedCount++
+		}
 		rows, e := tx.Query(ctx, `SELECT count(*) AS n FROM pragma_index_list(?)`, table)
 		if e != nil {
 			return e
 		}
-		if len(rows) != 1 || rows[0].Int64("n") != int64(len(list)) {
+		if len(rows) != 1 || rows[0].Int64("n") != int64(expectedCount) {
 			return fmt.Errorf("key projection index inventory differs")
 		}
 		for _, index := range list {

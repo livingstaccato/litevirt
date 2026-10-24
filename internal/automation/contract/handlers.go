@@ -13,6 +13,7 @@ import (
 // schema here and extend the one reducer; they never inherit generic success.
 type Assignment struct {
 	CustodyImport *CustodyImportRecord     `json:"custody_import,omitempty"`
+	Update        *UpdateAssignment        `json:"update,omitempty"`
 	Continuity    *IdentityContinuity      `json:"continuity,omitempty"`
 	Execution     *ExecutionAssignment     `json:"execution,omitempty"`
 	KeyTransition *KeyTransitionAssignment `json:"key_transition,omitempty"`
@@ -89,6 +90,13 @@ func ValidateSupportedCommand(c Command) error {
 	}
 	if c.Kind == "adopt_resource" || c.Kind == "transfer_owner" {
 		if _, err := DecodeOwnershipBody(c); err != nil {
+			return err
+		}
+		_, err := CanonicalCommand(c)
+		return err
+	}
+	if c.Kind == "admit_update" {
+		if _, err := DecodeUpdateBindingBody(c); err != nil {
 			return err
 		}
 		_, err := CanonicalCommand(c)
@@ -200,6 +208,9 @@ func DecodeAssignment(d Decision) (Assignment, error) {
 	if d.Command.Kind == "adopt_resource" || d.Command.Kind == "transfer_owner" {
 		fields = append(fields, "ownership")
 	}
+	if d.Command.Kind == "admit_update" {
+		fields = append(fields, "update")
+	}
 	if d.Command.Kind == "admit_create" {
 		fields = append(fields, "binding")
 	}
@@ -214,6 +225,13 @@ func DecodeAssignment(d Decision) (Assignment, error) {
 	}
 	if canonical, ok := canonicalCustodyAssignment(d); ok {
 		a = canonical
+	} else if d.Command.Kind == "admit_update" {
+		if err := validateAssignmentBody(d); err != nil {
+			return a, err
+		}
+		if err := decodeFieldsObject(d.Assignment, &a, fields...); err != nil {
+			return a, err
+		}
 	} else if err := decodeAssignmentFields(d.Assignment, &a, fields...); err != nil {
 		return a, err
 	}
@@ -223,7 +241,11 @@ func DecodeAssignment(d Decision) (Assignment, error) {
 			return a, codedError(CodeValidation)
 		}
 	}
-	if a.Version != 1 && (a.Version != CustodyAssignmentVersion || d.Command.Kind != CustodyImportCommand && d.Command.Kind != "activate_key_epoch") || a.ClusterUID == "" || a.OperationID == "" || len(a.ClusterUID) > MaxStringBytes || len(a.OperationID) > MaxStringBytes {
+	expectedVersion := 1
+	if d.Command.Kind == "admit_update" {
+		expectedVersion = 3
+	}
+	if a.Version != expectedVersion && (a.Version != CustodyAssignmentVersion || d.Command.Kind != CustodyImportCommand && d.Command.Kind != "activate_key_epoch") || a.ClusterUID == "" || a.OperationID == "" || len(a.ClusterUID) > MaxStringBytes || len(a.OperationID) > MaxStringBytes {
 		return a, codedError(CodeValidation)
 	}
 	if _, err := time.Parse(time.RFC3339Nano, a.RecordedAt); err != nil {
@@ -264,6 +286,9 @@ func validateSupportedAssignment(d Decision, a Assignment) error {
 	}
 	if d.Command.Kind == "adopt_resource" || d.Command.Kind == "transfer_owner" {
 		return validateOwnershipAssignment(d, a)
+	}
+	if d.Command.Kind == "admit_update" {
+		return validateUpdateAssignment(d, a)
 	}
 	if d.Command.Kind == "admit_create" {
 		return validateBindingAssignment(d, a)

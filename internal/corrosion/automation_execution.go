@@ -146,6 +146,11 @@ func automationExecutionAcceptedReceipt(h automationExecutionHistory) error {
 	c, a := h.decision.Command, h.assignment
 	expected := contract.Receipt{RequestID: c.RequestID, OperationID: a.OperationID, Sequence: h.decision.Sequence, Revision: 0, Code: "", State: "accepted"}
 	switch c.Kind {
+	case "admit_update":
+		if a.Update == nil {
+			return fmt.Errorf("execution original update assignment missing")
+		}
+		expected.ResourceUID, expected.Generation, expected.ResourceRevision = c.ResourceUID, c.Generation, a.Update.Revision
 	case "admit_create":
 		if a.Binding == nil {
 			return fmt.Errorf("execution original admission assignment missing")

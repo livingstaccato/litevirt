@@ -286,6 +286,9 @@ func automationTargetKeyProjectionTx(ctx context.Context, tx *LocalTx, stage, cl
 	return out, nil
 }
 func automationTargetProjectionTx(ctx context.Context, tx *LocalTx, stage string, p *contract.Projection, d contract.Decision, source automationKeyHistorySource) error {
+	if d.Command.Kind == "admit_update" && p.Existing != nil && !p.ReplayOriginal {
+		return nil
+	}
 	var keys []contract.TargetKey
 	var intent *contract.VMIntent
 	switch d.Command.Kind {
@@ -319,7 +322,7 @@ func automationTargetProjectionTx(ctx context.Context, tx *LocalTx, stage string
 			return fmt.Errorf("missing binding target")
 		}
 		keys = []contract.TargetKey{{Kind: "vm_name", Name: a.Binding.Configuration.Name}}
-	case "adopt_resource", "transfer_owner":
+	case "admit_update", "adopt_resource", "transfer_owner":
 		if p.Binding == nil || p.Binding.Resource == nil {
 			return fmt.Errorf("missing ownership target")
 		}

@@ -326,9 +326,9 @@ func TestHostUpgrade_NamedHostNotSkippedOnVersionMatch(t *testing.T) {
 // TestHostUpgrade_RefusesALegacyFenceSSHTarget: a target whose daemon still
 // reports enforcement.fence_ssh: legacy would not start on this binary, which
 // refuses the value, so the upgrade is refused with the fix before anything is
-// pre-staged or swapped, --force included. A member left on its binary is not
-// refused (it is not swapped), and a read that fails refuses nothing: the
-// daemon checks its config at start.
+// pre-staged or swapped, --force included. A read that fails refuses nothing:
+// the daemon checks its config at start. (A member left on its binary in
+// legacy is TestHostUpgrade_RefusesWhileAnotherMemberIsLegacy.)
 func TestHostUpgrade_RefusesALegacyFenceSSHTarget(t *testing.T) {
 	dir := t.TempDir()
 	binaryPath := filepath.Join(dir, "litevirtd")
@@ -354,17 +354,46 @@ func TestHostUpgrade_RefusesALegacyFenceSSHTarget(t *testing.T) {
 	}
 
 	stream := &mockUpgradeStream{response: &pb.UpgradeHostResponse{Status: "ok", NewVersion: "v1.0.1"}}
-	client := &mockUpgradeClient{stream: stream, hosts: hosts, fenceModes: map[string]string{"node2": "legacy"}}
-	if err := HostUpgrade(context.Background(), client, UpgradeOpts{BinaryPath: binaryPath,
-		HostNames: []string{"node1"}, Yes: true}); err != nil || len(stream.sent) == 0 {
-		t.Fatalf("upgrade of node1 alone, node2 on legacy left on its binary = %v (%d chunks), want it upgraded", err, len(stream.sent))
-	}
-
-	stream = &mockUpgradeStream{response: &pb.UpgradeHostResponse{Status: "ok", NewVersion: "v1.0.1"}}
-	client = &mockUpgradeClient{stream: stream, hosts: hosts, fenceErr: status.Error(codes.Unimplemented, "unknown method")}
+	client := &mockUpgradeClient{stream: stream, hosts: hosts, fenceErr: status.Error(codes.Unimplemented, "unknown method")}
 	if err := HostUpgrade(context.Background(), client, UpgradeOpts{BinaryPath: binaryPath,
 		HostNames: []string{"node1"}, Yes: true}); err != nil || len(stream.sent) == 0 {
 		t.Fatalf("upgrade with the fence ssh read failing = %v (%d chunks), want it upgraded", err, len(stream.sent))
+	}
+}
+
+// TestHostUpgrade_RefusesWhileAnotherMemberIsLegacy: upgrading node1 while
+// node2, which stays on its binary, still reports enforcement.fence_ssh:
+// legacy is refused, --force included, before anything is pre-staged or
+// swapped: node2 publishes no fence ssh row, and once release_2026_12_v1 has
+// latched node1 on this binary would refuse to fence it. The refusal names
+// node2, not node1, and the fix. With node2 on auto the same upgrade runs.
+func TestHostUpgrade_RefusesWhileAnotherMemberIsLegacy(t *testing.T) {
+	dir := t.TempDir()
+	binaryPath := filepath.Join(dir, "litevirtd")
+	os.WriteFile(binaryPath, []byte("binary"), 0755)
+	hosts := []*pb.Host{{Name: "node1", Address: "10.0.0.1", Version: "v1.0.0"},
+		{Name: "node2", Address: "10.0.0.2", Version: "v1.0.0"}}
+
+	for _, force := range []bool{false, true} {
+		stream := &mockUpgradeStream{response: &pb.UpgradeHostResponse{Status: "ok", NewVersion: "v1.0.1"}}
+		client := &mockUpgradeClient{stream: stream, hosts: hosts, fenceModes: map[string]string{"node2": "Legacy"}}
+		err := HostUpgrade(context.Background(), client, UpgradeOpts{BinaryPath: binaryPath,
+			HostNames: []string{"node1"}, Yes: true, Force: force})
+		if err == nil || !strings.Contains(err.Error(), "node2") || strings.Contains(err.Error(), "node1") ||
+			!strings.Contains(err.Error(), "refuses to fence it") ||
+			!strings.Contains(err.Error(), "set enforcement.fence_ssh to auto or managed") {
+			t.Fatalf("force=%v: upgrade of node1 with node2 on legacy = %v, want refused naming node2 and the fix", force, err)
+		}
+		if client.preStageCalls != 0 || len(stream.sent) != 0 {
+			t.Fatalf("force=%v: %d pre-stage(s) and %d chunk(s) sent before the refusal", force, client.preStageCalls, len(stream.sent))
+		}
+	}
+
+	stream := &mockUpgradeStream{response: &pb.UpgradeHostResponse{Status: "ok", NewVersion: "v1.0.1"}}
+	client := &mockUpgradeClient{stream: stream, hosts: hosts}
+	if err := HostUpgrade(context.Background(), client, UpgradeOpts{BinaryPath: binaryPath,
+		HostNames: []string{"node1"}, Yes: true}); err != nil || len(stream.sent) == 0 {
+		t.Fatalf("upgrade of node1 with node2 on auto = %v (%d chunks), want it upgraded", err, len(stream.sent))
 	}
 }
 

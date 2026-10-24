@@ -330,50 +330,19 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 	return nil
 }
 
-// fenceSSHModeTimeout bounds the fanned-out read checkFenceSSHModes makes.
-const fenceSSHModeTimeout = 30 * time.Second
-
-// checkFenceSSHModes refuses an upgrade one of whose targets' daemon reports
-// an enforcement.fence_ssh value this binary refuses at start
-// (fencessh.RemovedMode): swapped, that host's daemon would not come back. It
-// runs before anything is pre-staged or swapped, and --force does not skip
-// it. A target the read does not reach (a build without it, or a host that
-// does not answer) is not refused here, with a warning: its daemon checks its
-// config at start.
+// checkFenceSSHModes is fencessh.CheckUpgradeModes for this upgrade's
+// targets: it refuses while any member, target or not, still reports
+// enforcement.fence_ssh: legacy, and prints what it could not read.
 func checkFenceSSHModes(ctx context.Context, client pb.LiteVirtClient, targets []*pb.Host) error {
-	cctx, cancel := context.WithTimeout(ctx, fenceSSHModeTimeout)
-	defer cancel()
-	st, err := client.GetFenceSSHStatus(cctx, &pb.FenceSSHStatusRequest{FanOut: true})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not read the targets' enforcement.fence_ssh (%v); a host whose config "+
-			"still says legacy will not start on this binary: %s first\n", err, fencessh.ModeFix)
-		return nil
-	}
-	modes := map[string]string{}
-	answered := map[string]bool{}
-	for _, n := range st.GetNodes() {
-		modes[n.GetHost()] = n.GetMode()
-		answered[n.GetHost()] = n.GetReachable() && n.GetMode() != ""
-	}
-	var removed, unknown []string
+	names := make([]string, 0, len(targets))
 	for _, h := range targets {
-		switch {
-		case fencessh.RemovedMode(modes[h.Name]):
-			removed = append(removed, h.Name)
-		case !answered[h.Name]:
-			unknown = append(unknown, h.Name)
-		}
+		names = append(names, h.Name)
 	}
-	if len(removed) > 0 {
-		return fmt.Errorf("%s: enforcement.fence_ssh is legacy, which this binary refuses at start, so the daemon "+
-			"would not come back after the swap. On each, %s in its config and restart its daemon, then upgrade "+
-			"again; nothing was pre-staged or swapped", strings.Join(removed, ", "), fencessh.ModeFix)
+	warnings, err := fencessh.CheckUpgradeModes(ctx, client, names)
+	for _, w := range warnings {
+		fmt.Fprintln(os.Stderr, "warning: "+w)
 	}
-	if len(unknown) > 0 {
-		fmt.Fprintf(os.Stderr, "warning: %s did not report its enforcement.fence_ssh; a host whose config still says "+
-			"legacy will not start on this binary: %s first\n", strings.Join(unknown, ", "), fencessh.ModeFix)
-	}
-	return nil
+	return err
 }
 
 func upgradeOneHost(ctx context.Context, client pb.LiteVirtClient, h *pb.Host, binaryPath, targetVersion string, force bool) hostResult {

@@ -703,13 +703,16 @@ So from the latch on, a rollback below `release_2026_12_v1` quarantines; no
 setting holds the feature unused. Once the token latches, a host in `auto` or
 `managed` refuses to fence a host that has published no row.
 An earlier build also took `enforcement.fence_ssh: legacy`; this one refuses it
-at start, with the fix in the error. `lv host upgrade` reads each target's
-running mode first and refuses a target still on `legacy` before it pre-stages or
-swaps anything, `--force` included: set `enforcement.fence_ssh` to `auto` or
-`managed` in that host's config and restart its daemon, then upgrade. A target
-that does not report its mode is upgraded with a warning. The mode read is the one
-the daemon started with, so a config changed to `legacy` since then is caught only
-when the new daemon starts.
+at start, with the fix in the error. `lv host upgrade`, and the web UI's
+upgrade, read every member's running mode first and refuse while any member is
+still on `legacy`, before they pre-stage or swap anything (`--force` included): a
+target would not start on this build, and a member left on its binary publishes
+no fence SSH row, so once the token latches an upgraded host refuses to fence it
+and its workloads are not recovered if it fails. Set `enforcement.fence_ssh` to
+`auto` or `managed` in that host's config and restart its daemon, then upgrade.
+A member that does not report its mode is upgraded past with a warning. The mode
+read is the one the daemon started with, so a config changed to `legacy` since
+then is caught only when the new daemon starts.
 `lv cluster upgrade-status` lists `fence_ssh` with
 whether it is used, and its token once latched. Its rollout summary (hosts on the
 release, features waiting) counts `release_2026_11_v1` only.

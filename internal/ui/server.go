@@ -447,6 +447,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /ui/hosts/{name}/drain", s.requireAuthFunc(s.handleDrainHost))
 	mux.HandleFunc("POST /ui/hosts/{name}/undrain", s.requireAuthFunc(s.handleUndrainHost))
 	mux.HandleFunc("POST /ui/hosts/{name}/fence", s.requireAuthFunc(s.handleFenceHost))
+	mux.HandleFunc("POST /ui/hosts/{name}/fence-confirm", s.requireAuthFunc(s.handleFenceConfirmHost))
 	mux.HandleFunc("DELETE /ui/hosts/{name}", s.requireAuthFunc(s.handleRemoveHost))
 	mux.HandleFunc("POST /ui/hosts/{name}/labels", s.requireAuthFunc(s.handleHostLabelsUpdate))
 	mux.HandleFunc("POST /ui/hosts/{name}/config", s.requireAuthFunc(s.handleConfigureHost))

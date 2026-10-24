@@ -84,6 +84,8 @@ var uiInternalCallPolicy = map[string]func(callee string) bool{
 	// CheckUpgradeModes reads every member's fence_ssh mode through the
 	// session's own GetFenceSSHStatus RPC (s.grpc), and changes nothing.
 	"fencessh": allowOnly("CheckUpgradeModes"),
+	// SSHOnly classifies a host's configured fence strategy; it reads nothing.
+	"fence": allowOnly("SSHOnly"),
 	// Pure helpers with no state of their own.
 	"randid":      func(string) bool { return true },
 	"auditexport": func(string) bool { return true },

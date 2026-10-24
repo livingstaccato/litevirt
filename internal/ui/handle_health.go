@@ -4,7 +4,21 @@ import (
 	"net/http"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/fence"
 )
+
+// sshOnlyFencing names the hosts (but one in maintenance) whose fence goes
+// only over SSH, which never proves a power-off: the health page flags them
+// and recommends ipmi or redfish, as `lv doctor fence` does.
+func sshOnlyFencing(hosts []*pb.Host) []string {
+	var out []string
+	for _, h := range hosts {
+		if h.GetState() != pb.HostState_HOST_MAINTENANCE && fence.SSHOnly(h.GetFenceStrategy()) {
+			out = append(out, h.GetName())
+		}
+	}
+	return out
+}
 
 // healthView derives the template inputs from the one health read: the
 // connectivity matrix (observer→target status) and the host list it spans.
@@ -40,6 +54,9 @@ func (s *Server) handleHealthTimeline(w http.ResponseWriter, r *http.Request) {
 	data["Conditions"] = health.GetConditions()
 	data["Evaluators"] = health.GetEvaluators()
 	data["Events"] = audit.GetEntries()
+	if hl, err := s.grpc.ListHosts(ctx, &pb.ListHostsRequest{}); err == nil {
+		data["SSHOnlyFencing"] = sshOnlyFencing(hl.GetHosts())
+	}
 	s.renderPage(w, "health_timeline.html", data)
 }
 

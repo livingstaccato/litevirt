@@ -9,6 +9,10 @@
     {{if eq .Host.State.String "HOST_ACTIVE"}}
     <button class="btn" hx-post="/ui/hosts/{{.Host.Name}}/drain" hx-confirm="Drain {{.Host.Name}}? Running VMs will be migrated.">Drain</button>
     {{end}}
+    {{if or (eq .Host.State.String "HOST_OFFLINE") (eq .Host.State.String "HOST_FENCED") (eq .Host.State.String "HOST_SUSPECT")}}
+    <button class="btn btn-danger" hx-post="/ui/hosts/{{.Host.Name}}/fence-confirm"
+      hx-confirm="Confirm {{.Host.Name}} is powered off? Its held workloads will be started on other hosts. Do this only once the host is physically off: if it still runs them, they run twice.">Confirm powered off</button>
+    {{end}}
     <button class="btn" hx-get="/ui/hosts/{{.Host.Name}}/upgrade-modal" hx-target="body" hx-swap="beforeend">Upgrade</button>
   </div>
 </div>

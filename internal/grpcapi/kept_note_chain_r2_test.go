@@ -315,10 +315,14 @@ func TestKeptNoteChain_AnUnreadableCopyListingHoldsEverything(t *testing.T) {
 	for _, which := range []string{".kept-", ".superseded-"} {
 		t.Run(which, func(t *testing.T) {
 			s, base, was := debrisFixture(t)
-			boom := func(context.Context, *corrosion.Client, string) error { return errors.New("injected: the disk directory does not list") }
+			boom := func(context.Context, *corrosion.Client, string) error {
+				return errors.New("injected: the disk directory does not list")
+			}
 			if which == ".kept-" {
 				old := listKeptDisks
-				listKeptDisks = func(ctx context.Context, db *corrosion.Client, dir string) ([]health.KeptCopy, error) { return nil, boom(ctx, db, dir) }
+				listKeptDisks = func(ctx context.Context, db *corrosion.Client, dir string) ([]health.KeptCopy, error) {
+					return nil, boom(ctx, db, dir)
+				}
 				t.Cleanup(func() { listKeptDisks = old })
 			} else {
 				old := listSupersededDisks

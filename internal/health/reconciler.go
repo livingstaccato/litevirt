@@ -340,7 +340,9 @@ type Reconciler struct {
 
 // SetKeptHold wires the kept-disk hold (grpcapi.Server.KeptHolds) the
 // set-aside of a failover's leftover consults.
-func (r *Reconciler) SetKeptHold(fn func(ctx context.Context, path string) (bool, string)) { r.keptHold = fn }
+func (r *Reconciler) SetKeptHold(fn func(ctx context.Context, path string) (bool, string)) {
+	r.keptHold = fn
+}
 
 // SetOperatorStopReplay wires the replay of operator-stop markers
 // (grpcapi.Server.ReplayOperatorStopMarkers), run at the start of every pass.

@@ -1316,7 +1316,7 @@ func (n *Node) Reconciler() *health.Reconciler {
 	r.SetFirmwareStore(n.FW)
 	if n.Server != nil {
 		r.SetOperatorStopReplay(n.Server.ReplayOperatorStopMarkers) // as the daemon wires it
-		r.SetKeptHold(n.Server.KeptHolds) // as the daemon wires it
+		r.SetKeptHold(n.Server.KeptHolds)                           // as the daemon wires it
 	}
 	return r
 }

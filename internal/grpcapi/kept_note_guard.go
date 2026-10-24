@@ -37,7 +37,9 @@ func (s *Server) keptNoteHolds(path string) (bool, string) {
 
 // KeptHolds is keptHolds, for the reconciler's set-aside of a failover's
 // leftover and the hourly purge of set-aside copies (daemon wiring).
-func (s *Server) KeptHolds(ctx context.Context, path string) (bool, string) { return s.keptHolds(ctx, path) }
+func (s *Server) KeptHolds(ctx context.Context, path string) (bool, string) {
+	return s.keptHolds(ctx, path)
+}
 
 // reportKeptNoteHold logs and records, as an event of vmName, a disk file a
 // removal of vmName's left because a kept-disk note holds it.

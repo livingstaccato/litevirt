@@ -8,6 +8,8 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // While kept-disks.json cannot be read, a symlink below a directory the scan
@@ -87,6 +89,49 @@ func TestCreateVM_KeptScanFollowsASymlinkBelowARoot(t *testing.T) {
 		}
 		if exists(filepath.Join(dir, "web-root.qcow2")) {
 			t.Fatal("a refused create wrote its disk")
+		}
+	})
+}
+
+// While kept-disks.json cannot be read, the scan reads every file a
+// kept-disk note names, wherever it is: the notes are what covers a kept
+// overlay outside every directory the scan lists (a restore to an admin's
+// --target-path, kept by a later delete). One that names the create's disk
+// as its missing base refuses it; one that names nothing it writes does
+// not.
+//
+// Red with the noted files dropped from the scan (review mutation m2a:
+// `for f := range noted { add(f) }` removed): "a noted overlay elsewhere"
+// red (the create goes ahead and writes the base).
+func TestCreateVM_KeptScanReadsTheNotedFiles(t *testing.T) {
+	t.Run("a noted overlay elsewhere", func(t *testing.T) {
+		s, _ := provableCreateServer(t)
+		base := s.images.DiskPath("web", "root")
+		ov := filepath.Join(t.TempDir(), "elsewhere", "db-snap1.qcow2")
+		overlayOn(t, ov, base)
+		if err := health.NoteKeptDisks(s.dataDir, "db", []string{ov}); err != nil {
+			t.Fatal(err)
+		}
+		named := unreadableKeptRegistry(t, s)
+		_, err := s.CreateVM(adminCtx(), poolCreateRequest("web", ""))
+		wantMissingBaseRefusal(t, "create with a noted overlay elsewhere naming its disk", err, ov, base)
+		if !strings.Contains(err.Error(), named) {
+			t.Fatalf("create web = %v; want it naming %s", err, named)
+		}
+	})
+	t.Run("a noted overlay elsewhere naming something else goes ahead", func(t *testing.T) {
+		s, _ := provableCreateServer(t)
+		ov := filepath.Join(t.TempDir(), "elsewhere", "db-snap1.qcow2")
+		overlayOn(t, ov, s.images.DiskPath("db", "root"))
+		if err := health.NoteKeptDisks(s.dataDir, "db", []string{ov}); err != nil {
+			t.Fatal(err)
+		}
+		unreadableKeptRegistry(t, s)
+		if _, err := s.CreateVM(adminCtx(), poolCreateRequest("web", "")); err != nil {
+			t.Fatalf("create web, no noted file naming its disk: %v", err)
+		}
+		if !exists(s.images.DiskPath("web", "root")) {
+			t.Fatal("the create did not write its disk: this proves nothing")
 		}
 	})
 }

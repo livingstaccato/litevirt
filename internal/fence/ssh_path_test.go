@@ -97,7 +97,7 @@ func TestSSHArgs_LegacyIsUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+	want := []string{"-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
 		"-o", "ServerAliveInterval=2", "-o", "ServerAliveCountMax=3", "-p", "22", "root@10.0.0.9", sshPowerOffCommand}
 	if !slices.Equal(args, want) {
 		t.Fatalf("legacy args = %q, want %q", args, want)

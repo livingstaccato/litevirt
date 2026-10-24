@@ -61,6 +61,9 @@ func TestFence_WrongAddressIsRefused(t *testing.T) {
 			if !strings.Contains(res.Detail, tc.path) || !strings.Contains(res.Detail, "Host key verification failed") {
 				t.Fatalf("detail = %q, want %s and a host-key failure", res.Detail, tc.path)
 			}
+			if !res.WrongHost || res.Answered {
+				t.Fatalf("result = %+v, want WrongHost (a real OpenSSH mismatch, at LogLevel=ERROR) and not Answered", res)
+			}
 		})
 	}
 }

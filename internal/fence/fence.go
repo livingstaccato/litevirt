@@ -488,6 +488,11 @@ func sshArgs(ctx context.Context, h HostConfig, remote string) (target string, a
 	}
 	args = append(args,
 		"-o", "BatchMode=yes",
+		// Root's ssh_config (the pinned and legacy paths read it) can set
+		// LogLevel QUIET, which hides "Host key verification failed." and
+		// would let a host-key mismatch pass for an unreachable host
+		// (hostKeyMismatch). ERROR keeps it, and nothing chattier.
+		"-o", "LogLevel=ERROR",
 		"-o", fmt.Sprintf("ConnectTimeout=%d", connectTimeout(ctx, 10)),
 		// A forced power-off takes the host down without closing the TCP
 		// connection, so no FIN or RST ever arrives. Without a keepalive the

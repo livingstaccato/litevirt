@@ -312,13 +312,9 @@ func hostPostureWord(h *pb.FenceHostPosture) string {
 	}
 }
 
-// printStalledObservers lists hosts with an open observer_stalled condition:
-// nodes that were not running recently and, until the window closes, count no
-// failed probes against peers and decide no fence. It is the usual answer to
-// "why has a dead host not been fenced yet?", so the doctor names them. Prints
-// nothing when there are none.
-// printSSHOnlyFencing names every host (but one in maintenance) whose fence strategy goes only over
-// SSH (ssh, best-effort, or unset, which is best-effort), and recommends a
+// printSSHOnlyFencing names every host (but one in maintenance) whose fence
+// strategy goes only over SSH (ssh, best-effort, or unset, which is
+// best-effort), and recommends a
 // BMC. An SSH fence never proves a power-off, so failover recovers such a
 // host's workloads only after its partition pause, or an operator's
 // `lv host fence-confirm`; a hardware fence recovers them at once.
@@ -365,6 +361,11 @@ func printTrustSSHPoweroff(w io.Writer, hosts []*pb.Host) {
 	fmt.Fprintln(w, "`lv host config <host> --trust-ssh-poweroff=false` turns it off.")
 }
 
+// printStalledObservers lists hosts with an open observer_stalled condition:
+// nodes that were not running recently and, until the window closes, count no
+// failed probes against peers and decide no fence. It is the usual answer to
+// "why has a dead host not been fenced yet?", so the doctor names them. Prints
+// nothing when there are none.
 func printStalledObservers(w io.Writer, conds []*pb.HealthCondition) {
 	type stalled struct{ host, paused, until string }
 	var rows []stalled

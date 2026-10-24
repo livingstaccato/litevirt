@@ -892,9 +892,7 @@ func UpsertVMBackup(ctx context.Context, c *Client, vmName, diskName, repo strin
 // Container names are per host and per project, so a key of the bare name was
 // shared by every same-named container: another project's backups were
 // charged to this project (and could block its creates), and inspect showed
-// them. Rows written before this release keep their bare-name key and are
-// read as before (SumProjectUsage, ListContainerBackups); nothing rewrites
-// them. Same statement as before; only the key value differs.
+// them.
 func UpsertContainerBackup(ctx context.Context, c *Client, project, ctName, repo string, totalBytes int64) error {
 	now := c.NowTS()
 	return c.Execute(ctx,
@@ -915,75 +913,18 @@ func ContainerBackupKey(project, name string) string {
 	return normalizeProject(project) + containerBackupKeySep + name
 }
 
-// splitContainerBackupKey returns (project, name, true) for a project-keyed
-// row, or ("", key, false) for a row written before project keys.
-func splitContainerBackupKey(key string) (string, string, bool) {
-	if i := strings.Index(key, containerBackupKeySep); i >= 0 {
-		return key[:i], key[i+len(containerBackupKeySep):], true
-	}
-	return "", key, false
-}
-
 // containerBackupUsage sums the container backup footprint charged to
-// project: its own project-keyed rows for containers it still has, plus
-// legacy (bare-name) rows of those names — each row once, a legacy row only
-// where the container has not written its own row for that repo, and a
-// legacy row capped at the newest write for its (name, repo), which is what
-// the old bare-name row (and so the old JOIN) would have held. It stops
-// charging one project for another's same-named container.
+// project: its own project-keyed rows (ContainerBackupKey) for containers it
+// still has.
 func containerBackupUsage(ctx context.Context, c *Client, project string) (int64, error) {
-	names, err := c.Query(ctx,
-		`SELECT DISTINCT name FROM containers WHERE project = ? AND deleted_at IS NULL`, project)
-	if err != nil {
+	rows, err := c.Query(ctx,
+		`SELECT COALESCE(SUM(total_bytes), 0) AS bytes FROM container_backups
+		 WHERE ct_name IN (SELECT ? || name FROM containers WHERE project = ? AND deleted_at IS NULL)`,
+		normalizeProject(project)+containerBackupKeySep, project)
+	if err != nil || len(rows) == 0 {
 		return 0, err
 	}
-	live := make(map[string]bool, len(names))
-	for _, r := range names {
-		live[r.String("name")] = true
-	}
-	if len(live) == 0 {
-		return 0, nil
-	}
-	rows, err := c.Query(ctx, `SELECT ct_name, repo, total_bytes, updated_at FROM container_backups`)
-	if err != nil {
-		return 0, err
-	}
-	type nameRepo struct{ name, repo string }
-	own := map[nameRepo]bool{}
-	// latest is, per (name, repo), the newest write of any row — the value the
-	// single bare-name row would hold had it kept being overwritten, as it was
-	// before project keys. A frozen bare row is charged no more than that.
-	type write struct {
-		bytes int64
-		at    string
-	}
-	latest := map[nameRepo]write{}
-	var total int64
-	want := normalizeProject(project)
-	for _, r := range rows {
-		p, n, keyed := splitContainerBackupKey(r.String("ct_name"))
-		k := nameRepo{n, r.String("repo")}
-		w := write{r.Int64("total_bytes"), r.String("updated_at")}
-		if cur, ok := latest[k]; !ok || LWWNewer(w.at, cur.at) {
-			latest[k] = w
-		}
-		if keyed && p == want && live[n] {
-			total += w.bytes
-			own[k] = true
-		}
-	}
-	for _, r := range rows {
-		_, n, keyed := splitContainerBackupKey(r.String("ct_name"))
-		k := nameRepo{n, r.String("repo")}
-		if keyed || !live[n] || own[k] {
-			continue
-		}
-		// Never above the old JOIN's charge: the old row would have been
-		// overwritten by the newest write, so charge the smaller of the
-		// frozen value and that.
-		total += min(r.Int64("total_bytes"), latest[k].bytes)
-	}
-	return total, nil
+	return rows[0].Int64("bytes"), nil
 }
 
 // QuotaCheck describes a proposed resource request. The admission

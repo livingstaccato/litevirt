@@ -15,14 +15,14 @@ import (
 	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
-// insertLegacyCTBackupRow writes a container_backups row the way every
-// release before project-qualified keys did: keyed on the bare name.
-func insertLegacyCTBackupRow(t *testing.T, s *Server, name, repo string, bytes int64, updated string) {
+// insertCTBackupRow writes acme's container_backups row for name with a
+// chosen size and time, which UpsertContainerBackup does not take.
+func insertCTBackupRow(t *testing.T, s *Server, name, repo string, bytes int64, updated string) {
 	t.Helper()
 	if err := s.db.Execute(context.Background(),
 		`INSERT INTO container_backups (ct_name, repo, total_bytes, updated_at) VALUES (?, ?, ?, ?)
 		 ON CONFLICT(ct_name, repo) DO UPDATE SET total_bytes = excluded.total_bytes, updated_at = excluded.updated_at`,
-		name, repo, bytes, updated); err != nil {
+		corrosion.ContainerBackupKey("acme", name), repo, bytes, updated); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -40,15 +40,15 @@ func manifestSize(t *testing.T, dir, name, ts string) int64 {
 	return m.TotalSize
 }
 
-// R2: one shared repo holds backups of "ct1" from acme AND beta. The index
-// row is shared and was last written by beta. acme's viewer must see acme's
-// own size and time (from acme's manifest), never beta's.
+// R2: one shared repo holds backups of "ct1" from acme AND beta, and acme's
+// index row carries beta's size and time. acme's viewer must see acme's own
+// size and time (from acme's manifest), never beta's.
 func TestInspectContainer_SharedRepoTwoProjectsShowsOwnSizeAndTime(t *testing.T) {
 	s := inspectTestServer(t, "")
 	shared := ctTestRepo(t)
 	putCTManifest(t, shared, "ct1", "acme", "2026-10-08T10:00:00Z")
 	putCTManifest(t, shared, "ct1", "beta", "2026-10-08T11:00:00Z")
-	insertLegacyCTBackupRow(t, s, "ct1", shared, 999_999, "2026-10-08T11:00:00Z")
+	insertCTBackupRow(t, s, "ct1", shared, 999_999, "2026-10-08T11:00:00Z")
 	want := manifestSize(t, shared, "ct1", "2026-10-08T10:00:00Z")
 
 	viewer := grantUser(t, s, "carol", "/projects/acme", "Viewer")
@@ -94,7 +94,7 @@ func TestInspectContainer_UnreadableRepoIsUnknown(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "2026-10-08T10:00:00Z-rootfs.manifest.json"), []byte("{not json"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	insertLegacyCTBackupRow(t, s, "ct1", repo, 10, "2026-10-08T10:00:00Z")
+	insertCTBackupRow(t, s, "ct1", repo, 10, "2026-10-08T10:00:00Z")
 	d, err := s.InspectContainer(adminCtx(), &pb.InspectContainerRequest{Name: "ct1"})
 	if err != nil {
 		t.Fatal(err)
@@ -166,7 +166,7 @@ func TestInspectContainer_NoHostPathsForViewer(t *testing.T) {
 	s := inspectTestServer(t, "")
 	repo := ctTestRepo(t)
 	putCTManifest(t, repo, "ct1", "acme", "2026-10-08T10:00:00Z")
-	insertLegacyCTBackupRow(t, s, "ct1", repo, 10, "2026-10-08T10:00:00Z")
+	insertCTBackupRow(t, s, "ct1", repo, 10, "2026-10-08T10:00:00Z")
 	viewer := grantUser(t, s, "carol", "/projects/acme", "Viewer")
 	d, err := s.InspectContainer(viewer, &pb.InspectContainerRequest{Name: "ct1"})
 	if err != nil {

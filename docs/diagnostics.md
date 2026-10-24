@@ -3491,7 +3491,7 @@ that host is judged by the disk files there (every file under
 `<data_dir>/disks`, the disk store's directory, `<data_dir>/pools`,
 `<data_dir>/mounts` and the directory of every file-based pool of the host,
 usable or not, every file a note names, and every set-aside `.kept-` or
-`.superseded-` copy wherever it is): it is refused when one of them is, or backs on, a path it
+`.superseded-` copy beside any local disk a disk row names): it is refused when one of them is, or backs on, a path it
 writes, and refused whatever its name when one of them, or a directory of
 them, cannot be read either, which `creates_refused` then names too. A create
 that clears a file an earlier VM of its name left is refused. Any other goes

@@ -246,7 +246,12 @@ func TestPromoteReplica_MarkedRunningRetry_AdoptedWithoutDoubleReserve(t *testin
 	seedPromotableVM(t, s, "dead-host", "fenced", "", 1, 1536)
 
 	// The prior attempt started the domain and wrote the marker, then crashed
-	// before persisting the row.
+	// before persisting the row. The domain runs from the live disk it built:
+	// one that runs from none is not adopted (NB-R3).
+	if err := fake.DefineDomain("<domain type='kvm'><name>vm1</name><devices>" +
+		adoptablePromotedDisk(t, s, "replica-pool", "vm1") + "</devices></domain>"); err != nil {
+		t.Fatal(err)
+	}
 	fake.SetState("vm1", "running")
 	if err := s.writePromoteMarker("vm1", "prior-proof"); err != nil {
 		t.Fatalf("write marker: %v", err)

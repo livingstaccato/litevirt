@@ -12,6 +12,10 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/randid"
@@ -36,13 +40,22 @@ import (
 // and the full path of the replica it is built from (owner directory and
 // file, so two VMs' replicas taken in the same second never match).
 //
-// The journal belongs to one promotion in progress, and is trusted only
-// while that promotion's promote marker is there:
-//   - a promotion that starts with no marker for its target drops the
-//     journal (an earlier attempt's files in it are left, not reused);
-//   - an attempt that ends, finished or failed, clears the journal before it
-//     removes the marker (endPromoteAttempt), so a journal is never left
-//     beside a marker it outlives.
+// The journal belongs to one promotion in progress, of one VM, and is
+// trusted only while all of these hold (promoteDisksForAttempt):
+//   - no other promotion of the target runs on this host (beginPromote);
+//   - the target's promote marker is there and names the VM's uuid, which
+//     each entry names too;
+//   - the target's domain is defined here and its definition names the
+//     entry's file (the marker is written after the define, so an attempt
+//     still in progress always has one).
+//
+// Anything else drops the journal, or the entry; a file it named that is
+// still there, used by no row and kept by no delete, is left alone and
+// reported as a replicated vm.disk.left event of the target: never reused,
+// never removed, never marked kept. An attempt that ends, finished or
+// failed, clears the journal before it removes the marker
+// (endPromoteAttempt), and a delete of the VM here clears both
+// (forgetPromoteRecords).
 //
 // A file a journal entry names is reused only when it is built from the
 // replica chosen now, is a regular file in the pool, no disk row names it,
@@ -58,6 +71,8 @@ type promotedDiskEntry struct {
 	Path string `json:"path"`
 	// Replica is the full path of the replica it is built from.
 	Replica string `json:"replica"`
+	// UUID is the uuid of the VM the promotion builds it for.
+	UUID string `json:"uuid"`
 }
 
 // promoteDiskJournalMu serialises the journal's read-modify-write.
@@ -67,45 +82,132 @@ func (s *Server) promoteDiskJournalPath(target string) string {
 	return filepath.Join(s.dataDir, "promote-disks", target+".json")
 }
 
-// promoteDisksForAttempt is the journal a promotion of target starting now
-// may reuse: target's journal while target's promote marker is there (an
-// earlier attempt of the promotion still in progress), else nothing. With no
-// marker the journal is dropped; with a marker that cannot be checked it is
-// left, and nothing in it is reused.
-func (s *Server) promoteDisksForAttempt(target string) map[string]promotedDiskEntry {
-	_, err := os.Stat(s.promoteMarkerPath(target))
-	switch {
-	case err == nil:
-		return s.readPromoteDisks(target)
-	case errors.Is(err, fs.ErrNotExist):
-		s.dropPromoteDisks(target)
-	default:
-		slog.Warn("promote: whether an earlier attempt is in progress cannot be told; building its live disks under fresh names",
-			"vm", target, "marker", s.promoteMarkerPath(target), "error", err)
+// beginPromote registers a promotion of target on this host until the
+// returned func is called. While it is registered, a second promotion of
+// target is refused here with Aborted, before it reads the target's marker
+// or journal: the two would otherwise take the same live disk, and the
+// first's failure would remove it under the second's VM.
+func (s *Server) beginPromote(target string) (end func(), err error) {
+	s.promoteFlightsMu.Lock()
+	defer s.promoteFlightsMu.Unlock()
+	if since, ok := s.promoteFlights[target]; ok {
+		return nil, status.Errorf(codes.Aborted,
+			"a promotion of %q is in progress on %s (since %s, %s ago); this promotion did nothing. "+
+				"Retry once that one has finished: `lv inspect %s` shows where the VM runs",
+			target, s.hostName, since.UTC().Format(time.RFC3339), time.Since(since).Round(time.Second), target)
 	}
-	return map[string]promotedDiskEntry{}
+	if s.promoteFlights == nil {
+		s.promoteFlights = map[string]time.Time{}
+	}
+	s.promoteFlights[target] = time.Now()
+	return func() {
+		s.promoteFlightsMu.Lock()
+		defer s.promoteFlightsMu.Unlock()
+		delete(s.promoteFlights, target)
+	}, nil
 }
 
-// dropPromoteDisks removes the journal a promotion of target that is no
-// longer in progress left, naming each file in it that is still there: it is
-// left for an operator, never reused.
-func (s *Server) dropPromoteDisks(target string) {
+// promoteInFlight reports a promotion of target running on this host.
+func (s *Server) promoteInFlight(target string) bool {
+	s.promoteFlightsMu.Lock()
+	defer s.promoteFlightsMu.Unlock()
+	_, ok := s.promoteFlights[target]
+	return ok
+}
+
+// promoteDisksForAttempt is the journal a promotion of target, for the VM
+// whose uuid is uuid, starting now may reuse: the entries of an earlier
+// attempt of this promotion still in progress (the doc at the top of this
+// file). A journal of no promotion in progress here, or of another VM of the
+// name, is dropped; an entry whose file the target's definition does not
+// name is left out. Anything that cannot be read reuses nothing.
+func (s *Server) promoteDisksForAttempt(ctx context.Context, target, uuid string) map[string]promotedDiskEntry {
+	out := map[string]promotedDiskEntry{}
+	markerUUID, err := s.promoteMarkerUUID(target)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		s.dropPromoteDisks(ctx, target, "no promotion of it is in progress on this host")
+		return out
+	case err != nil:
+		slog.Warn("promote: whether an earlier attempt is in progress cannot be told; building its live disks under fresh names",
+			"vm", target, "marker", s.promoteMarkerPath(target), "error", err)
+		return out
+	case markerUUID != uuid:
+		s.dropPromoteDisks(ctx, target, fmt.Sprintf("the promotion it was built for was of another VM of the name (uuid %q, this VM's %q)", markerUUID, uuid))
+		return out
+	}
+	if !s.virt.DomainExists(target) {
+		s.dropPromoteDisks(ctx, target, "the domain that promotion defined is no longer defined on this host")
+		return out
+	}
+	x, xerr := s.virt.DumpXMLInactive(target)
+	if xerr != nil {
+		slog.Warn("promote: the definition of the domain an earlier attempt defined cannot be read; building its live disks under fresh names",
+			"vm", target, "error", xerr)
+		return out
+	}
+	sources, _, _ := domainDiskSourcesFromXML(x)
+	for d, e := range s.readPromoteDisks(target) {
+		switch {
+		case e.UUID != uuid:
+			s.reportLeftPromotedDisk(ctx, target, e, "it was built for another VM of the name")
+		case !slices.Contains(sources, e.Path):
+			s.reportLeftPromotedDisk(ctx, target, e, "the domain defined on this host does not name it")
+		default:
+			out[d] = e
+		}
+	}
+	return out
+}
+
+// dropPromoteDisks removes target's journal, reporting each file in it that
+// is still there (reportLeftPromotedDisk): it is left alone, never reused.
+func (s *Server) dropPromoteDisks(ctx context.Context, target, why string) {
 	promoteDiskJournalMu.Lock()
-	defer promoteDiskJournalMu.Unlock()
 	m, err := s.readPromoteDisksLocked(target)
 	if errors.Is(err, fs.ErrNotExist) {
+		promoteDiskJournalMu.Unlock()
 		return
-	}
-	for _, e := range m {
-		if isRegularFile(e.Path) {
-			slog.Warn("promote: a live disk a promotion no longer in progress built is left alone, not reused",
-				"vm", target, "disk", e.Disk, "path", e.Path, "built_from", e.Replica)
-		}
 	}
 	if err := os.Remove(s.promoteDiskJournalPath(target)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		// Not read again by this attempt: its first record replaces it.
 		slog.Warn("promote: the record of an earlier promotion's live disks was not removed", "vm", target, "error", err)
 	}
+	promoteDiskJournalMu.Unlock()
+	for _, e := range m {
+		s.reportLeftPromotedDisk(ctx, target, e, why)
+	}
+}
+
+// reportLeftPromotedDisk records, as a replicated vm.disk.left event of
+// target, a live disk a promotion built that is left alone: e's file, while
+// it is there and no disk row or kept-disk record accounts for it (one a row
+// names is a VM's disk; one a delete kept has its own record). It is not
+// used, not marked kept and not removed: it may hold a run's writes.
+func (s *Server) reportLeftPromotedDisk(ctx context.Context, target string, e promotedDiskEntry, why string) {
+	if !isRegularFile(e.Path) || s.diskRowNames(ctx, e.Path) {
+		return
+	}
+	if held, _ := s.keptHolds(ctx, e.Path); held {
+		return
+	}
+	slog.Warn("promote: a live disk a promotion built is left alone, not reused",
+		"vm", target, "disk", e.Disk, "path", e.Path, "built_from", e.Replica, "why", why)
+	s.recordVMEventSeverity(ctx, target, "vm.disk.left", "ok", "warn", fmt.Sprintf(
+		"a promotion of %s that did not finish left %s (disk %s, built from %s) on %s: %s, so it is not used; "+
+			"it is not kept and only an operator removes it", target, e.Path, e.Disk, e.Replica, s.hostName, why))
+}
+
+// forgetPromoteRecords drops the promote marker and journal of name on this
+// host once a delete of the VM has committed here, reporting a live disk the
+// journal names that nothing else accounts for. A promotion of name running
+// here keeps its own.
+func (s *Server) forgetPromoteRecords(ctx context.Context, name string) {
+	if s.promoteInFlight(name) {
+		return
+	}
+	s.dropPromoteDisks(ctx, name, "the VM was deleted")
+	s.removePromoteMarker(name)
 }
 
 // readPromoteDisks is target's journal by disk name. One that cannot be read
@@ -252,7 +354,7 @@ func (s *Server) reusablePromotedDisk(ctx context.Context, poolDir, p string) (o
 // build's, or an earlier build's during a rolling upgrade — reused the same
 // way when the journal has no entry to reuse. An error is the record
 // failing; nothing has been created then.
-func (s *Server) planPromotedDisk(ctx context.Context, journal map[string]promotedDiskEntry, target, poolDir, disk, replicaPath, legacy string) (path string, built bool, err error) {
+func (s *Server) planPromotedDisk(ctx context.Context, journal map[string]promotedDiskEntry, target, uuid, poolDir, disk, replicaPath, legacy string) (path string, built bool, err error) {
 	if e, ok := journal[disk]; ok {
 		if e.Replica != replicaPath {
 			if isRegularFile(e.Path) {
@@ -284,7 +386,7 @@ func (s *Server) planPromotedDisk(ctx context.Context, journal map[string]promot
 		if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
-		if err := s.recordPromoteDisk(target, journal, promotedDiskEntry{Disk: disk, Path: path, Replica: replicaPath}); err != nil {
+		if err := s.recordPromoteDisk(target, journal, promotedDiskEntry{Disk: disk, Path: path, Replica: replicaPath, UUID: uuid}); err != nil {
 			return "", false, err
 		}
 		return path, false, nil

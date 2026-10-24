@@ -878,10 +878,32 @@ func (s *Server) promoteMarkerPresent(name string) bool {
 	return true
 }
 func (s *Server) writePromoteMarker(name, proofID string) error {
+	return s.writePromoteMarkerFor(name, proofID, "")
+}
+
+// writePromoteMarkerFor writes name's promote marker for the VM whose uuid is
+// uuid: the proof on its first line, "uuid=<uuid>" on its second.
+func (s *Server) writePromoteMarkerFor(name, proofID, uuid string) error {
 	if err := os.MkdirAll(filepath.Join(s.dataDir, "promote-markers"), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(s.promoteMarkerPath(name), []byte(proofID), 0o600)
+	return os.WriteFile(s.promoteMarkerPath(name), []byte(proofID+"\nuuid="+uuid+"\n"), 0o600)
+}
+
+// promoteMarkerUUID is the VM uuid name's promote marker names; "" for a
+// marker that names none (an earlier build's). fs.ErrNotExist when there is
+// no marker.
+func (s *Server) promoteMarkerUUID(name string) (string, error) {
+	raw, err := os.ReadFile(s.promoteMarkerPath(name))
+	if err != nil {
+		return "", err
+	}
+	for _, l := range strings.Split(string(raw), "\n") {
+		if u, ok := strings.CutPrefix(l, "uuid="); ok {
+			return u, nil
+		}
+	}
+	return "", nil
 }
 func (s *Server) removePromoteMarker(name string) { _ = os.Remove(s.promoteMarkerPath(name)) }
 
@@ -1113,6 +1135,14 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	if !validRestoreName(targetName) {
 		return status.Errorf(codes.InvalidArgument, "invalid promotion name %q", targetName)
 	}
+	// One promotion of a target at a time on this host: two would read the
+	// same journal and marker, the second would take the first's live disk,
+	// and the first's failure would then remove it under the second's VM.
+	endPromote, perr := s.beginPromote(targetName)
+	if perr != nil {
+		return perr
+	}
+	defer endPromote()
 	// A promotion to a new name makes a VM of that name here: no create of
 	// the name runs on this host while it does (beginCreate).
 	setFlightUUID := func(string) {}
@@ -1427,7 +1457,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// its missing base, and a file built there would become that base.
 	// Only an entry of this promotion, still in progress, is reused: with
 	// no promote marker the journal is an earlier promotion's and is dropped.
-	journal := s.promoteDisksForAttempt(targetName)
+	journal := s.promoteDisksForAttempt(ctx, targetName, spec.Uuid)
 	// A crash-recovery adoption attaches only what the running domain has.
 	adoptedXML := ""
 	if started {
@@ -1450,19 +1480,21 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		// (that would overwrite a running VM's disk); the one it runs from.
 		livePath = s.adoptedPromotedDisk(ctx, journal, targetName, poolDir, src.DiskName, replicaPath, adoptedXML,
 			stepFile, legacyPromotedPath(poolDir, targetName, replica))
+		// Never a guess: a row naming a file the domain does not run from
+		// would be the VM's root from then on, and it could be a kept disk's.
 		if livePath == "" && adoptedXML == "" {
-			// Never a guess while the definition is unread: a row naming a
-			// file the domain does not run from would be the VM's root from
-			// then on, and it could be a kept disk's.
 			return status.Errorf(codes.Unavailable,
 				"promote of %s: the definition of the domain an earlier attempt started cannot be read, so the live disk it runs from cannot be identified; nothing was changed, retry",
 				vm.Name)
 		}
 		if livePath == "" {
-			livePath = legacyPromotedPath(poolDir, targetName, replica)
+			return status.Errorf(codes.FailedPrecondition,
+				"promote of %s: the domain %s an earlier attempt started on %s runs from no live disk built from %s; nothing was changed. "+
+					"Retry with the replica it runs from (`lv replication promote %s --replica <file>`), or stop it (`virsh destroy %s` on %s) and retry",
+				vm.Name, targetName, s.hostName, replica, vm.Name, targetName, s.hostName)
 		}
 	} else {
-		p, diskBuilt, err := s.planPromotedDisk(ctx, journal, targetName, poolDir, src.DiskName, replicaPath, stepFile)
+		p, diskBuilt, err := s.planPromotedDisk(ctx, journal, targetName, spec.Uuid, poolDir, src.DiskName, replicaPath, stepFile)
 		if err != nil {
 			return status.Errorf(codes.Internal, "promote of %s: record the name of its live disk before building it: %v", vm.Name, err)
 		}
@@ -1615,7 +1647,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			}
 			continue
 		}
-		p, built, perr := s.planPromotedDisk(ctx, journal, targetName, poolDir, d.row.DiskName, d.replicaPath, legacy)
+		p, built, perr := s.planPromotedDisk(ctx, journal, targetName, spec.Uuid, poolDir, d.row.DiskName, d.replicaPath, legacy)
 		if perr != nil {
 			slog.Error("promote: the name of a live disk of the replica set could not be recorded; promoting without it",
 				"vm", vm.Name, "disk", d.row.DiskName, "replica", d.replica.File, "error", perr)
@@ -1923,7 +1955,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 					return "checkpoint", err
 				}
 			}
-			if err := s.writePromoteMarker(targetName, proofID); err != nil {
+			if err := s.writePromoteMarkerFor(targetName, proofID, spec.Uuid); err != nil {
 				return "marker", err
 			}
 			if opClaim != nil {

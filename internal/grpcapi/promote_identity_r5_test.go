@@ -26,6 +26,9 @@ func renamedRetry(t *testing.T, domXML string) (*Server, error) {
 	s, fake := promoteFixture(t)
 	s.db.SetClusterPolicyGate(func() bool { return true }) // guards are recorded
 	s.SetReleaseFeatureGate(&relGate{t: t, open: true})
+	// It runs from the live disk it built: one that runs from none is not
+	// adopted (NB-R3).
+	domXML = strings.Replace(domXML, "<devices>", "<devices>"+adoptablePromotedDisk(t, s, "replica-pool", "vm1-p"), 1)
 	if err := fake.DefineDomain(domXML); err != nil {
 		t.Fatal(err)
 	}

@@ -970,11 +970,18 @@ name is recorded on the host before the file is created
 (`<data_dir>/promote-disks/<vm>.json`), so a promotion retried after a crash
 or a failure, with the same proof, a new one or none, reuses the live disk the
 earlier attempt built from the same replica instead of building another
-beside it. The record belongs to one promotion in progress: it is read only
-while that promotion's promote marker is there (written just before the
-domain starts), and is removed, before the marker, once the attempt ends. A
-promotion that starts with no marker drops it, and a file an earlier attempt
-built is then left alone, as is one built from another replica. A recorded
+beside it. The record belongs to one promotion of one VM in progress: it is read
+only while no other promotion of the name runs on the host (a second one is
+refused), the promotion's promote marker (written just before the domain
+starts) is there and names the VM's uuid, and the domain that promotion
+defined is still defined there and names the file. It is removed, before the
+marker, once the attempt ends, and both go when the VM is deleted. A record
+of no promotion in progress, or of another VM of the name, is dropped; a file
+it named that no VM uses and no delete kept is left alone, never reused nor
+removed, and a `vm.disk.left` event of the VM names it, as one built from
+another replica is left alone. A retry that adopts a running domain takes the
+live disk the domain runs from, and is refused when it runs from none built
+from the replica chosen. A recorded
 file is never reused when a disk row, a kept-disk note or `kept-disks.json`
 names it; when the kept-disk records cannot be read, a fresh live disk is
 built instead, so failover does not wait on them. A crash-recovered promotion counts

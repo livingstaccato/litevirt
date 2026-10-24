@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/rand"
@@ -131,27 +132,60 @@ func signedChallenge(m stateProbe, keyPath string, cert *x509.Certificate) (prov
 
 // shellWithin runs m.Shell and gives up after d, whatever the machine has.
 // A deadline is an error, not NOSIGN: a connection that does not answer is
-// not trusted to answer the key read the in-memory fallback would make. The
-// abandoned run ends when its connection is closed.
+// not trusted to answer the key read the in-memory fallback would make.
+//
+// Giving up stops the command, not just the wait for it: a probe that is a
+// contextShell (both real targets are) kills the command and every process
+// it started, and shellWithin waits up to shellStopGrace for that to be done
+// before it returns. A probe that is not one (a test's) is abandoned.
 func shellWithin(m stateProbe, kind, cmd string, d time.Duration) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
 	type result struct {
 		out []byte
 		err error
 	}
 	ch := make(chan result, 1)
+	cs, stoppable := m.(contextShell)
 	go func() {
-		out, err := m.Shell(kind, cmd)
-		ch <- result{out, err}
+		var r result
+		if stoppable {
+			r.out, r.err = cs.ShellContext(ctx, kind, cmd)
+		} else {
+			r.out, r.err = m.Shell(kind, cmd)
+		}
+		ch <- r
 	}()
-	timer := time.NewTimer(d)
-	defer timer.Stop()
 	select {
 	case r := <-ch:
-		return r.out, r.err
-	case <-timer.C:
-		return nil, fmt.Errorf("no answer before the %v deadline", d)
+		if r.err == nil || ctx.Err() == nil {
+			return r.out, r.err
+		}
+	case <-ctx.Done():
+		if stoppable {
+			timer := time.NewTimer(shellStopGrace)
+			defer timer.Stop()
+			select {
+			case <-ch:
+			case <-timer.C:
+			}
+		}
 	}
+	return nil, fmt.Errorf("no answer before the %v deadline", d)
 }
+
+// contextShell is a stateProbe that can stop a command it runs:
+// ShellContext kills the command, and every process it started, when ctx
+// ends, and then returns.
+type contextShell interface {
+	ShellContext(ctx context.Context, kind, cmd string) ([]byte, error)
+}
+
+// shellStopGrace bounds how long shellWithin waits, past its deadline, for
+// the command it gave up on to be stopped. It outlasts the local bound
+// (cmdbound's WaitDelay and ReapGrace) and the SSH one (remoteKillGrace);
+// a connection that does not answer is not waited for longer.
+const shellStopGrace = 5 * time.Second
 
 // keyProofDomain prefixes every challenge, so a signature made for this
 // proof can never stand for one another signer of the host key asks for.

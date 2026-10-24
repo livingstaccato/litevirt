@@ -130,7 +130,9 @@ kernel without it — and a pool path is not handed to `qemu-img` through one.
 all: each file of the source's backing chain and the destination are opened
 by the daemon with no symlink followed at the file, judged through those
 descriptors, and handed over as `/proc/self/fd/N`, every backing named
-explicitly, so a name swapped after the checks is never followed.
+explicitly and the last one told it has none, so neither a name swapped after
+the checks nor a backing name written into an image in place is followed. An
+image that keeps its data in an external file is refused.
 An export that is already mounted without these flags — mounted by an earlier
 build (`vers=4,hard,intr`), or by hand — is hardened in place, at daemon start
 and at the pool's first use: `mount -o remount,bind,<its flags plus

@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
@@ -15,7 +18,7 @@ import (
 // qemu-img on a source whose chain was judged by name (CheckPoolPathNoSymlinks,
 // precheckChain). Each file of that chain, and the destination, is handed to
 // qemu-img as a descriptor this process opened with no link followed, judged
-// regular and re-judged through (/proc/self/fd/N, --image-opts naming every
+// regular and re-judged through (/proc/self/fd/N, a json: source naming every
 // backing explicitly), so a name swapped for a link after the judgement and
 // before qemu-img opens it is never followed. (Re-review 5b, O-2.)
 //
@@ -273,5 +276,58 @@ func TestConvertImage_ABackingDirectorySwappedAtTheOpenIsRefused(t *testing.T) {
 			t.Fatal("the copy read another directory's file through a directory swapped for a link at the backing's open")
 		}
 		t.Fatal("a copy whose backing's directory was swapped for a link at its open went ahead")
+	}
+}
+
+// The last qcow2 layer's header rewritten IN PLACE (same file, so every name
+// check passes) after the checks, to name a backing: qemu-img is told the
+// layer has none ("backing": null), so it opens nothing the header now names.
+// (Re-review of fix/migrate-followups, item 3; the reviewer's probe.)
+// Mutation: leave "backing" out for the last qcow2 layer - the copy holds the
+// newly named file's bytes: red.
+func TestConvertImage_ABackingNameWrittenIntoTheLastLayerInPlaceIsNotFollowed(t *testing.T) {
+	needQemuImg(t)
+	top := filepath.Join(t.TempDir(), "vm-root.qcow2")
+	if err := qcow2.Create(top, convertFDSize, nil); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(t.TempDir(), "secret.raw")
+	if err := os.WriteFile(secret, bytes.Repeat([]byte("OTHER-TENANT-SEC"), convertFDSize/16), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ran := false
+	qemuImgRunHook = func() {
+		ran = true
+		runQemuImg(t, "rebase", "-u", "-b", secret, "-F", "raw", top)
+	}
+	t.Cleanup(func() { qemuImgRunHook = nil })
+	f, err := os.CreateTemp(t.TempDir(), ".repl-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	err = convertImage(context.Background(), top, "qcow2", nil, f.Name(), noProgress)
+	if !ran {
+		t.Fatal("fixture: qemu-img did not run")
+	}
+	if err == nil && bytes.Contains(guestView(t, f.Name()), []byte("OTHER-TENANT-SEC")) {
+		t.Fatal("qemu-img followed a backing name written into the last layer in place after the checks")
+	}
+}
+
+// A source layer that keeps its data in an external file is refused before
+// qemu-img runs: qemu opens a data file with the image itself, by name.
+func TestConvertImage_AnExternalDataFileIsRefused(t *testing.T) {
+	needQemuImg(t)
+	dir := t.TempDir()
+	top := filepath.Join(dir, "vm-root.qcow2")
+	runQemuImg(t, "create", "-q", "-f", "qcow2", "-o", "data_file="+filepath.Join(dir, "data.raw"), top, "1M")
+	ran := false
+	qemuImgRunHook = func() { ran = true }
+	t.Cleanup(func() { qemuImgRunHook = nil })
+	dst := filepath.Join(t.TempDir(), "out.qcow2")
+	err := convertImage(context.Background(), top, "qcow2", nil, dst, noProgress)
+	if status.Code(err) != codes.FailedPrecondition || ran {
+		t.Fatalf("convertImage of an image with an external data file = %v (qemu-img ran: %v); want FailedPrecondition before qemu-img", err, ran)
 	}
 }

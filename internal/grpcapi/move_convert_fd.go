@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -8,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"syscall"
 
 	"github.com/litevirt/litevirt/internal/diskmode"
@@ -26,10 +26,11 @@ import (
 // qemu-img follows a qcow2 layer's backing file by NAME, and resolves a
 // relative one against the directory of the name it opened the layer by. A
 // /proc/self/fd/N name has no such directory, and a by-name backing is the
-// very gap closed here, so every backing is named explicitly in
-// --image-opts (backing.driver, backing.file.filename=/proc/self/fd/M, and so
-// on down the chain): qemu-img then opens no file by any name the header
-// holds. Which file each descriptor is was judged here: its backing name,
+// very gap closed here, so the source is a json: filename naming every
+// layer explicitly ("backing": {"driver": …, "file": {"filename":
+// "/proc/self/fd/M"}}, and so on down the chain, the last qcow2 layer
+// "backing": null): qemu-img then opens no file by any name a header holds,
+// even one written into it in place after the checks. Which file each descriptor is was judged here: its backing name,
 // read from the open file above it and resolved as precheckChain resolves
 // it, must be exactly the backing precheckChain accepted.
 type heldConvert struct {
@@ -171,23 +172,38 @@ func (h *heldConvert) verifyNamed(src, dst string) error {
 }
 
 // qemuImgArgs is the qemu-img convert argv for h, with the descriptors it
-// takes as ExtraFiles (the child's fd 3 onwards, in that order).
+// takes as ExtraFiles (the child's fd 3 onwards, in that order). The source
+// is a json: filename naming the whole chain, each layer's file a
+// descriptor, and the last qcow2 layer "backing": null: a backing name
+// written into its header in place after the checks is not opened either.
+// (A data file cannot be pinned this way; one is refused by the header
+// checks, precheckQcow2HeaderFile.)
 func (h *heldConvert) qemuImgArgs(forceShare bool) ([]string, []*os.File) {
 	fd := func(i int) string { return "/proc/self/fd/" + strconv.Itoa(3+i) }
-	var opts []string
-	prefix := ""
-	for i, f := range h.formats {
-		opts = append(opts,
-			prefix+"driver="+f,
-			prefix+"file.driver=file",
-			prefix+"file.filename="+fd(i))
-		prefix += "backing."
+	var src map[string]any
+	for i := len(h.formats) - 1; i >= 0; i-- {
+		layer := map[string]any{
+			"driver": h.formats[i],
+			"file":   map[string]any{"driver": "file", "filename": fd(i)},
+		}
+		if h.formats[i] == "qcow2" {
+			if src != nil {
+				layer["backing"] = src
+			} else {
+				layer["backing"] = nil
+			}
+		}
+		src = layer
+	}
+	spec, err := json.Marshal(src)
+	if err != nil {
+		panic(err) // maps of strings: cannot fail
 	}
 	args := []string{"convert"}
 	if forceShare {
 		args = append(args, "-U")
 	}
-	args = append(args, "-p", "--image-opts", strings.Join(opts, ","), "-O", "qcow2", fd(len(h.layers)))
+	args = append(args, "-p", "json:"+string(spec), "-O", "qcow2", fd(len(h.layers)))
 	files := append(append([]*os.File{}, h.layers...), h.dst)
 	return args, files
 }

@@ -95,6 +95,7 @@ func newRootCmd() *cobra.Command {
 		newHostCmd(),
 		newHostPKICmd(),
 		newHostEnrollCmd(),
+		newHostEnrollmentControlCmd(),
 		newNetworkCmd(),
 		newNetboxCmd(),
 		newComposeCmd(),

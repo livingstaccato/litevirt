@@ -205,3 +205,9 @@ func (l *HostDomainLease) duplicateForProcess() (*os.File, error) {
 	}
 	return os.NewFile(fd, l.file.Name()), nil
 }
+
+// BorrowForEnrollmentWorker retains only the actual live EX description for the
+// two fixed enrollment workers. It adds no admission or credential authority.
+func (l *HostDomainLease) BorrowForEnrollmentWorker() (*os.File, error) {
+	return l.duplicateForProcess()
+}

@@ -368,8 +368,10 @@ func TestUnbind_VerificationFails(t *testing.T) {
 	fs := newMemFS()
 	addr := "0000:01:00.0"
 	fs.addDevice(addr, "0x10de", "0x2204", "vfio-pci")
-	// Unbind and restore "succeed" but driver stays vfio-pci (kernel bug simulation).
-	restore := SetFS(fs) // no wrapper to update symlinks
+	// The unbind lands, but neither the named driver's bind nor the reprobe
+	// gives the device a driver.
+	wrapper := &unbindUpdateFS{memFS: fs, addr: addr, restoreTo: ""}
+	restore := SetFS(wrapper)
 	defer restore()
 
 	err := Unbind(addr, "nvidia")

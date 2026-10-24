@@ -130,6 +130,7 @@ func TestDeleteVM_ForceStopFailingAfterTheDestroyRecordsTheStop(t *testing.T) {
 		t.Fatal(err)
 	}
 	fs.setBound(addr)
+	recordVFIOBind(t, s, addr)
 	fs.setFailUnbind(addr)
 
 	_, err := s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: "vm1", Force: true})

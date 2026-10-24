@@ -209,30 +209,3 @@ func TestHost_AnOpenVfioFdRefusesTheUnbindUpFront(t *testing.T) {
 		t.Fatalf("driver = %q, want igbvf", k.driver())
 	}
 }
-
-// TestHost_ReleaseUnboundReprobesALegacyDeviceLeftDriverless (review M2): an
-// older build's device (legacy marker recorded) whose unbind landed late is
-// driverless with its override cleared, and that build's vfio-pci dynamic ID is
-// still in place. The retry used to drop the marker and leave the device
-// driverless, so its next probe handed an unowned device to vfio-pci. It must
-// return the device to a host driver, removing the older build's ID.
-func TestHost_ReleaseUnboundReprobesALegacyDeviceLeftDriverless(t *testing.T) {
-	addr := "0000:01:10.0"
-	k := newKernelFS(addr, "igbvf", "", "", "vfio-pci", "igbvf")
-	k.dynids["vfio-pci "+k.id] = true // the older build's new_id
-	k.files["/proc/cmdline"] = []byte("ro quiet\n")
-	defer SetFS(k)()
-	path := recordPath(t)
-	writeRecord(t, path, map[string]string{addr: legacyBind})
-	h := HostAt(path)
-
-	if err := h.ReleaseUnbound(addr); err != nil {
-		t.Fatalf("ReleaseUnbound: %v", err)
-	}
-	if k.driver() != "igbvf" || k.dynids["vfio-pci "+k.id] {
-		t.Fatalf("driver=%q dynid=%v, want igbvf and the older build's ID removed", k.driver(), k.dynids["vfio-pci "+k.id])
-	}
-	if got := readRecord(t, path); len(got) != 0 {
-		t.Fatalf("record = %v, want empty", got)
-	}
-}

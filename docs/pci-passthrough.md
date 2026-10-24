@@ -40,10 +40,7 @@ echo "vfio-pci" >> /etc/modules-load.d/vfio.conf
   - a device on vfio-pci with no `driver_override` before litevirt binds it, for example by your `vfio-pci.ids=`;
   - a device pinned to vfio-pci with driverctl (`/etc/driverctl.d/pci-<address>`).
 - **Your configuration wins over the record.** Say litevirt recorded a host driver for a device, and you have since added that device's ID to `vfio-pci.ids=` (on the kernel command line or in modprobe.d). The device then stays on vfio-pci when it is released.
-- **Hosts upgraded from an older build.**
-  - **Recognising them.** An older build's device has no record and has `driver_override=vfio-pci`. litevirt records that fact before it clears the override, so a release that fails halfway is still recognised on retry.
-  - **The leftover ID.** Older builds also added a vfio-pci ID for each device they bound. If such a device lands back on vfio-pci by that ID, the release removes the ID (`remove_id`) and returns the device to its host driver.
-  - **IDs that are left alone.** The release never removes an ID listed in your `vfio-pci.ids=`. It never removes the ID of a device that litevirt did not bind either.
+- **vfio-pci IDs.** A released device that lands back on vfio-pci by a vfio-pci ID stays there: litevirt never adds or removes a vfio-pci ID.
 - **Devices that are gone.** A released device no longer present in sysfs, such as a VF that did not come back after a reboot, is released without error.
 - **Paused guests.** A detach refuses a guest that is paused or suspended, because it cannot acknowledge the unplug. The device stays with its VM until a retry once the guest runs.
 - **Devices still open.** The kernel will not let a device leave vfio-pci while any process has it open, such as a QEMU that has not exited. The unbind would block until that process lets go.

@@ -41,6 +41,7 @@ func newHostCmd() *cobra.Command {
 		newHostRescanCmd(),
 		newHostDevicesCmd(),
 		newHostSupersededDisksCmd(),
+		newHostKeptDisksCmd(),
 		newHostLUNHoldsCmd(),
 		newHostLUNHoldCmd(),
 		newHostUpgradeCmd(),

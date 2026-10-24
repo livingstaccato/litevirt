@@ -3454,9 +3454,12 @@ member it deleted while keeping them because it could not prove the teardown
 let them go (the teardown recorded no disk choice, or another teardown's); the
 reason names the stack. Unless that stack delete asked to keep disks, they are
 leftovers.
-litevirt removes none of them: check that nothing uses each one (another VM's
-disk, a process holding it open), then remove it by hand. A file on that host
-is forgotten once it is gone; a disk is not named while another VM's disk
+litevirt removes none of them on its own: check that nothing uses each one
+(another VM's disk, a process holding it open), then release it with
+`lv host kept-disks <host> --release <vm|path>`, which removes the chain with
+its note and record entries, refuses while anything still references a file
+of it, audits each file it removes, and clears the condition for it; or remove
+it by hand. A file on that host is forgotten once it is gone; a disk is not named while another VM's disk
 names its path again. A VM of the same name does not count (a delete that
 failed keeps its record, which still names its disks), so a disk adopted by a
 VM re-created under the deleted one's name stays named until its entry is
@@ -3479,6 +3482,11 @@ backup restore to a `--target-path`. The
 evidence names the file under `creates_refused` (the condition is raised for
 it alone, and resolves once it reads). A migration's target and the
 reconciler's rebuild of a missing overlay disk are not checked yet.
+While the backing chain of a file a note `<data_dir>/kept-disks/<vm>.json`
+names cannot be read, every path on that host that removes disk files leaves
+every file, and `lv host kept-disks --release` refuses, naming the file and the
+note: fix that file, move it away, or, once nothing needs it, remove its entry
+from the note (docs/cli-reference.md, "Releasing kept disks").
 
 ### A drain's live move timed out (`drain_move_timed_out`)
 

@@ -95,6 +95,30 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 		}
 	}
 
+	// A file a noted file's chain reaches through "..", which no note names
+	// (noteKeptBackingFiles).
+	holds, err := s.keptNoteDotDotHolds()
+	if err != nil {
+		if storage.IsFSNoAnswer(err) {
+			return fmt.Errorf("the create clears a file left by an earlier VM %s, and %v; nothing was moved or removed", name, err)
+		}
+		return health.NewKeptBackingFileError(fmt.Sprintf("the create clears a file left by an earlier VM %s, and %v; "+
+			"nothing was moved or removed", name, err))
+	}
+	for f := range present {
+		if notesGovern && noted[f] != "" {
+			continue
+		}
+		h, ok, err := keptDotDotHeldIn(holds, f)
+		if err != nil {
+			return fmt.Errorf("the create clears %s, and what it is cannot be told (%v); retry once that storage answers, "+
+				"or place the VM on another host", f, err)
+		}
+		if ok {
+			return refuse(f, h.what(s))
+		}
+	}
+
 	chains, err := s.keptRegistryChains(ctx)
 	if err != nil {
 		return keptChainsRefusal(fmt.Sprintf("the create clears a file left by an earlier VM %s, and", name), err,
@@ -137,7 +161,7 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 			// A missing backing file ends it, as nothing under it is reached.
 			stat := chainStat // read here: the walk may outlive this call
 			layers, err := storage.Bounded("read the backing chain of", p, func() ([]string, error) {
-				l, _, err := walkKeptChain(stat, p, true)
+				l, _, _, err := walkKeptChain(stat, p, true)
 				return l, err
 			})
 			if err != nil {

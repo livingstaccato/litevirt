@@ -387,51 +387,6 @@ esac
 `))
 
 // ParseVIP splits "10.0.100.100/24" into IP and prefix length.
-// ParseStoredVIP reads a VIP that is ALREADY in the database, written by a
-// build whose parser accepted things this one refuses.
-//
-// Read paths need this and ingress paths must not use it. Tightening ParseVIP
-// without it turned an upgrade into a silent outage: reapplyExplicitLB bails on
-// a parse error, so an LB stored as "10.0.0.1/24/extra" — which the old
-// Sscanf-based parser accepted and persisted, and which has been serving
-// 10.0.0.1/24 ever since — simply stopped being re-applied after any daemon
-// restart or failover, with a single Warn line as the only trace.
-//
-// So a row that still NAMES a real address is repaired, and reports repaired=true
-// so the caller can tell the operator to correct it. A row that never named one
-// ("*", "", "/24", an IPv6 literal) is refused, because there is nothing to
-// recover and guessing would put an unintended address on the wire.
-func ParseStoredVIP(vip string) (ip string, prefix int, repaired bool, err error) {
-	if ip, prefix, err = ParseVIP(vip); err == nil {
-		return ip, prefix, false, nil
-	}
-
-	// Recover the address half only. Everything after the first "/" is a prefix
-	// the old parser read with Sscanf("%d"), which stopped at the first
-	// non-digit — so "24/extra" and "3.5" were taken as 24 and 3, and that is
-	// the value the cluster has actually been running with.
-	head, rest, hasPrefix := strings.Cut(vip, "/")
-	addr := net.ParseIP(head)
-	if addr == nil || addr.To4() == nil {
-		return "", 0, false, fmt.Errorf("stored VIP %q does not name an IPv4 address and cannot be repaired", vip)
-	}
-	if !hasPrefix {
-		return head, 32, true, nil
-	}
-	digits := rest
-	for i, r := range rest {
-		if r < '0' || r > '9' {
-			digits = rest[:i]
-			break
-		}
-	}
-	n, convErr := strconv.Atoi(digits)
-	if convErr != nil || n < 0 || n > 32 {
-		return "", 0, false, fmt.Errorf("stored VIP %q has no recoverable prefix", vip)
-	}
-	return head, n, true, nil
-}
-
 func ParseVIP(vip string) (ip string, prefix int, err error) {
 	// net.ParseIP, not a bare split. Without it anything lacking a "/" came back
 	// verbatim as an address, so `--vip '*'` was accepted — and that string is

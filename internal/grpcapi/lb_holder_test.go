@@ -7,6 +7,8 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // TestCreateLoadBalancer_PersistsDurableHolder: an explicit LB created with no
@@ -77,5 +79,32 @@ func TestLBHostsUnset(t *testing.T) {
 		if lbHostsUnset(s) {
 			t.Errorf("lbHostsUnset(%q) = true; want false (has holder)", s)
 		}
+	}
+}
+
+// TestStoredVIP_StrictOnEveryReadPath: a stored VIP is parsed like a new one.
+// One ParseVIP refuses ("10.0.0.1/24/extra") is not repaired and applied: the
+// update fails closed and the reapply applies nothing.
+//
+// Mutation: read the stored VIP leniently (address half only) on either path —
+// red.
+func TestStoredVIP_StrictOnEveryReadPath(t *testing.T) {
+	ctx := adminCtx()
+	s := testServerR2(t)
+	applied := 0
+	s.lbApplyOverride = func(context.Context, lb.Config) error { applied++; return nil }
+	rec := corrosion.LBConfigRecord{
+		Name: "sloppy", VIP: "10.0.0.1/24/extra", Algorithm: "roundrobin",
+		Hosts: `["test-host"]`, Ports: `[{"listen":80,"target":8080,"protocol":"tcp"}]`, Enabled: true, Generation: "g1",
+	}
+	if err := corrosion.UpsertLBConfig(ctx, s.db, rec); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := s.UpdateLoadBalancer(ctx, &pb.UpdateLBRequest{Name: "sloppy", Algorithm: "leastconn"}); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("update of an LB with an unparseable stored VIP = %v; want FailedPrecondition", err)
+	}
+	s.reapplyExplicitLB(ctx, rec)
+	if applied != 0 {
+		t.Errorf("an unparseable stored VIP was applied %d time(s)", applied)
 	}
 }

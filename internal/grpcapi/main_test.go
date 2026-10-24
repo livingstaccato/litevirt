@@ -11,6 +11,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/litevirt/litevirt/internal/auth"
+	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/pitoverlay"
 	"github.com/litevirt/litevirt/internal/storage"
 )
@@ -33,6 +34,9 @@ func TestMain(m *testing.M) {
 	// Test disks live in temporary directories, which may be a tmpfs; a
 	// layer-2 overlay is refused there in production (pitoverlay.Placement).
 	pitoverlay.AllowVolatileForTest()
+	// No test reads the machine's own NVIDIA driver: with no nvidia-smi no
+	// GPU is in MIG mode. The MIG tests install a fake one.
+	pci.SetNvidiaSMI("/nonexistent/litevirt-test/nvidia-smi")
 	// No test looks up a real NFS server name: each name gets an address of
 	// its own in the benchmarking range. Tests that need names to share an
 	// address, or to fail, override it themselves.

@@ -4,6 +4,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/pitoverlay"
 )
 
@@ -12,5 +13,8 @@ import (
 // (pitoverlay.Placement).
 func TestMain(m *testing.M) {
 	pitoverlay.AllowVolatileForTest()
+	// No node reads the machine's own NVIDIA driver; the MIG tests install a
+	// fake nvidia-smi.
+	pci.SetNvidiaSMI("/nonexistent/litevirt-test/nvidia-smi")
 	os.Exit(m.Run())
 }

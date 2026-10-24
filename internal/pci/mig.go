@@ -1,7 +1,9 @@
 package pci
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -103,8 +105,9 @@ func ListMIGInstances() ([]MIGInstance, error) {
 	out, err := runNvidiaSMI("mig", "-lgi")
 	if err != nil {
 		// No instance anywhere is an answer, not a failure: nvidia-smi
-		// prints "No GPU instances found" and exits non-zero.
-		if strings.Contains(out, "No GPU instances found") {
+		// prints "No GPU instances found" and exits non-zero, and "No
+		// MIG-enabled devices found" when no GPU is in MIG mode at all.
+		if strings.Contains(out, "No GPU instances found") || strings.Contains(out, "No MIG-enabled devices found") {
 			return nil, nil
 		}
 		return nil, err
@@ -197,4 +200,142 @@ func DisableMIG(gpu string) (string, error) {
 		return "", err
 	}
 	return runNvidiaSMI("-i", gpu, "-mig", "0")
+}
+
+// SetNvidiaSMI points the MIG functions at another nvidia-smi binary and
+// returns a restore func. Test seam: production never calls it.
+func SetNvidiaSMI(path string) func() {
+	old := nvidiaSMI
+	nvidiaSMI = path
+	return func() { nvidiaSMI = old }
+}
+
+// nvidiaVendorID is NVIDIA's PCI vendor ID, as the scan records it.
+const nvidiaVendorID = "10de"
+
+// MIGBusyError is the refusal to pass through a GPU that MIG holds: its MIG
+// mode is enabled, now or pending a reset, or it has MIG GPU instances.
+// Rebinding it to vfio-pci would pull it from under every MIG workload on it.
+type MIGBusyError struct {
+	Address   string // the GPU's PCI address
+	Index     int    // its nvidia-smi index, which `lv host mig` takes
+	Current   string
+	Pending   string
+	Instances int
+}
+
+func (e *MIGBusyError) Error() string {
+	var why []string
+	if e.Current == "Enabled" || e.Pending == "Enabled" {
+		why = append(why, fmt.Sprintf("its MIG mode is on (current %s, pending %s)", e.Current, e.Pending))
+	}
+	if e.Instances > 0 {
+		why = append(why, fmt.Sprintf("it holds %d MIG GPU instance(s)", e.Instances))
+	}
+	return fmt.Sprintf("GPU %s (nvidia-smi index %d) is not available for passthrough: %s; "+
+		"binding it to vfio-pci would take it from its MIG workloads. To reclaim it, on that host "+
+		"destroy each instance (`lv host mig destroy %d <instance-id>`, see `lv host mig ls`) "+
+		"and then run `lv host mig disable %d`",
+		e.Address, e.Index, strings.Join(why, " and "), e.Index, e.Index)
+}
+
+// MIGState is one reading of every GPU's MIG mode and MIG instances on this
+// host, taken once and asked about each device a passthrough would rebind.
+type MIGState struct {
+	read      bool
+	noDriver  bool // nvidia-smi is not installed: no GPU can be in MIG mode
+	gpus      []MIGGPU
+	gpuErr    error
+	instances []MIGInstance
+	instErr   error
+}
+
+// ReadMIGState returns a reading of this host's MIG state, taken from
+// nvidia-smi the first time Hold checks an NVIDIA GPU, so a request with no
+// NVIDIA GPU never runs it. A failure is kept, not returned: it only matters
+// to an NVIDIA GPU, which Hold then refuses. Not safe for concurrent use.
+func ReadMIGState() *MIGState { return &MIGState{} }
+
+func (st *MIGState) load() {
+	if st.read {
+		return
+	}
+	st.read = true
+	gpus, err := ListMIGGPUs()
+	if err != nil {
+		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
+			st.noDriver = true
+			return
+		}
+		st.gpuErr = err
+		return
+	}
+	st.gpus = gpus
+	for _, g := range gpus {
+		if g.MIGCapable() || g.Pending == "Enabled" {
+			st.instances, st.instErr = ListMIGInstances()
+			break
+		}
+	}
+}
+
+// Hold returns why the device at address (vendor as the PCI scan records
+// it, driver the one it is bound to now) must not be rebound to vfio-pci for
+// passthrough, or nil when it may be. Only an NVIDIA GPU on a driver other
+// than vfio-pci is checked: one already on vfio-pci is not rebound, and
+// nvidia-smi does not see it. A *MIGBusyError means MIG holds it; any other
+// error means its MIG state could not be read, and the caller refuses too.
+func (st *MIGState) Hold(address, vendor, driver string) error {
+	if strings.TrimPrefix(strings.ToLower(vendor), "0x") != nvidiaVendorID || driver == "vfio-pci" {
+		return nil
+	}
+	st.load()
+	if st.noDriver {
+		return nil
+	}
+	if st.gpuErr != nil {
+		return fmt.Errorf("cannot read the MIG state of GPU %s: %w", address, st.gpuErr)
+	}
+	want := normalizeBusID(address)
+	for _, g := range st.gpus {
+		if normalizeBusID(g.BusID) != want {
+			continue
+		}
+		busy := &MIGBusyError{Address: address, Index: g.Index, Current: g.Current, Pending: g.Pending}
+		if g.MIGCapable() || g.Pending == "Enabled" {
+			if st.instErr != nil {
+				return fmt.Errorf("cannot list the MIG instances of GPU %s: %w", address, st.instErr)
+			}
+			for _, in := range st.instances {
+				if in.GPUIndex == g.Index {
+					busy.Instances++
+				}
+			}
+		}
+		if g.Current == "Enabled" || g.Pending == "Enabled" || busy.Instances > 0 {
+			return busy
+		}
+		return nil
+	}
+	// nvidia-smi lists every GPU the NVIDIA driver holds. One it holds that
+	// nvidia-smi does not list has an unknown MIG state; one on any other
+	// driver (or none) cannot be in MIG mode.
+	if driver == "nvidia" {
+		return fmt.Errorf("cannot read the MIG state of GPU %s: it is on the nvidia driver but nvidia-smi does not list it", address)
+	}
+	return nil
+}
+
+// normalizeBusID maps nvidia-smi's "00000000:36:00.0" and sysfs's
+// "0000:36:00.0" to one form: a four-digit domain, lower case.
+func normalizeBusID(id string) string {
+	id = strings.ToLower(strings.TrimSpace(id))
+	dom, rest, ok := strings.Cut(id, ":")
+	if !ok {
+		return id
+	}
+	if len(dom) > 4 {
+		dom = dom[len(dom)-4:]
+	}
+	return dom + ":" + rest
 }

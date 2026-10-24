@@ -466,17 +466,29 @@ func (s *Server) resolveDeviceSpec(ctx context.Context, vmName string, spec *pb.
 	}
 	// Filter by vendor/model if specified, skipping any device already chosen by an
 	// earlier spec in this request (the cross-spec pool-shrinking exclusion).
+	// A GPU MIG holds is skipped, so a type selector takes another free one
+	// rather than one acquireDeviceLeases would refuse to bind.
 	var matched []corrosion.PCIDeviceRecord
+	var held []string
+	mig := pci.ReadMIGState()
 	for _, d := range available {
 		if exclude[d.Address] || !matches(d) {
+			continue
+		}
+		if herr := mig.Hold(d.Address, d.VendorID, s.currentDriver(d.Address)); herr != nil {
+			held = append(held, herr.Error())
 			continue
 		}
 		matched = append(matched, d)
 	}
 	if len(matched) < count {
+		why := ""
+		if len(held) > 0 {
+			why = "; skipped: " + strings.Join(held, "; ")
+		}
 		return nil, status.Errorf(codes.ResourceExhausted,
-			"need %d %s device(s) but only %d available on host %s",
-			count, spec.Type, len(matched), s.hostName)
+			"need %d %s device(s) but only %d available on host %s%s",
+			count, spec.Type, len(matched), s.hostName, why)
 	}
 	for i := 0; i < count; i++ {
 		if err := addPrimary(matched[i].Address); err != nil {
@@ -718,6 +730,50 @@ func (s *Server) claimDeviceOwnership(ctx context.Context, vmName string, member
 	return claimed, release, nil
 }
 
+// currentDriver is the driver the device at addr is on now, "" when none is
+// or it cannot be read (a MIG check then still runs: "" is not vfio-pci).
+func (s *Server) currentDriver(addr string) string {
+	drv, err := vfio.CurrentDriver(addr)
+	if err != nil {
+		return ""
+	}
+	return drv
+}
+
+// refuseMIGRebind refuses, with FailedPrecondition, to bind any of addrs to
+// vfio-pci when it is an NVIDIA GPU that MIG holds (MIG mode on, now or
+// pending, or MIG instances on it), or one whose MIG state nvidia-smi cannot
+// report: the rebind would pull it from under its MIG workloads. It is the
+// host-local guard at the point the rebind is made, so it holds whatever
+// selected the device (a type selector, an address, a mapping, a failover).
+// It changes nothing.
+func (s *Server) refuseMIGRebind(ctx context.Context, addrs []string) error {
+	devs, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
+	if err != nil {
+		return status.Errorf(codes.Internal, "read PCI inventory: %v", err)
+	}
+	vendor := make(map[string]string, len(devs))
+	for _, d := range devs {
+		vendor[d.Address] = d.VendorID
+	}
+	mig := pci.ReadMIGState()
+	for _, addr := range addrs {
+		v, ok := vendor[addr]
+		if !ok {
+			continue // not in inventory: the claim refuses it
+		}
+		if herr := mig.Hold(addr, v, s.currentDriver(addr)); herr != nil {
+			var busy *pci.MIGBusyError
+			if errors.As(herr, &busy) {
+				return status.Errorf(codes.FailedPrecondition, "host %s: %v", s.hostName, herr)
+			}
+			return status.Errorf(codes.FailedPrecondition,
+				"host %s: refusing to bind GPU %s to vfio-pci: %v", s.hostName, addr, herr)
+		}
+	}
+	return nil
+}
+
 // acquireDeviceLeases is the side-effecting counterpart to resolveDeviceIntents for
 // the RUNNING / start path: it composes the shared claimDeviceOwnership reservation
 // (the exclusive, fail-closed physical-double-bind guard) with the durable
@@ -743,6 +799,21 @@ func (s *Server) claimDeviceOwnership(ctx context.Context, vmName string, member
 // earlier, successful attach is in neither list.
 func (s *Server) acquireDeviceLeases(ctx context.Context, vmName string, members []ResolvedMember, stage string, preClaimed []string) (func(), []string, error) {
 	noop := func() {}
+
+	// A GPU MIG holds is never rebound: refused before anything is claimed or
+	// bound, so only the caller's pre-claims need giving back.
+	addrs := make([]string, 0, len(members))
+	for _, m := range members {
+		addrs = append(addrs, m.Address)
+	}
+	if merr := s.refuseMIGRebind(ctx, addrs); merr != nil {
+		if len(preClaimed) > 0 {
+			if rerr := s.unbindAndReleaseOwnership(ctx, vmName, preClaimed); rerr != nil {
+				slog.Error("MIG refusal; pre-claimed device rollback incomplete (owned, not yet bound)", "vm", vmName, "error", rerr)
+			}
+		}
+		return noop, nil, merr
+	}
 
 	// Claim inventory ownership (fail-closed CAS) BEFORE any bind. On failure the
 	// claim rolled back its own reservations; the caller's pre-claims are still held

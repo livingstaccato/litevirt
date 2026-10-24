@@ -92,10 +92,33 @@ On some systems MIG mode stays pending until the GPU is reset or the host
 rebooted; `lv host mig ls` shows the pending mode in its PENDING column.
 
 Only GPUs on the NVIDIA driver are listed: a GPU passed through to a VM is on
-vfio-pci and `nvidia-smi` does not see it. Likewise a GPU you have split into
-MIG instances is still one PCI device to litevirt, so do not also select it for
-passthrough. litevirt does not yet attach a MIG instance to a VM or a
-container; the instances are for workloads on the host itself.
+vfio-pci and `nvidia-smi` does not see it. litevirt does not yet attach a MIG
+instance to a VM or a container; the instances are for workloads on the host
+itself.
+
+A GPU MIG holds is never passed through. When a passthrough would bind an
+NVIDIA GPU to vfio-pci, the host first asks `nvidia-smi`, and refuses the
+attach or start with `FailedPrecondition` if the GPU's MIG mode is enabled
+(now, or pending a reset) or it has any MIG GPU instance. Binding it would take
+it from under every workload on its instances. The refusal names the GPU and
+its `nvidia-smi` index. If `nvidia-smi` is installed but cannot report the
+GPU's MIG state, the host refuses too. A host without `nvidia-smi` has no
+NVIDIA driver, so none of its GPUs can be in MIG mode, and nothing is checked.
+A type or vendor selector skips a GPU that MIG holds and takes another free
+one; if none is left, its error says why each was skipped. The inventory still
+lists such a GPU as free, so a VM can be placed on its host (a failover, say)
+and then refused at start there.
+
+To pass the GPU through again, on its host:
+
+```bash
+lv host mig ls                    # its index and its instances
+lv host mig destroy 0 1           # each instance, by GPU index and instance ID
+lv host mig disable 0             # MIG off; a reset may be needed (PENDING)
+```
+
+Once MIG mode is off, with nothing pending, and no instance is left, the GPU
+is passed through like any other.
 
 ## Assigning devices in compose
 

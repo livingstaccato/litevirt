@@ -228,6 +228,15 @@ func (s *Server) moveOneVolume(
 	if err := refuseSymlinkTarget(dstPath); err != nil {
 		return err
 	}
+	// The copy is a new file, as a create's disk is: at the path a kept
+	// overlay names as its missing base it would become that base. Refused
+	// then, and while kept-disks.json or a kept chain cannot be read when the
+	// pool is this host's own storage.
+	local := !s.sharedPoolElsewhere(dstPool.Driver, dstPool.Target)
+	if err := s.keptPathRefusal(ctx, fmt.Sprintf("move of disk %s of %s to pool %s", src.DiskName, vm.Name, targetPool),
+		keptWritesOf(local, dstPath)); err != nil {
+		return err
+	}
 
 	// Every frame carries the disk's total size for the caller's bar.
 	totalBytes := src.SizeBytes

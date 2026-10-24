@@ -3481,8 +3481,9 @@ refused on that host whatever their names: every import; every create or
 clone that writes a disk file on the host's own storage (one with no disk
 file, or with every disk on shared nfs, ceph or iscsi storage outside the disk
 directory, goes ahead); every disk attach that creates a new disk; every
-backup restore to a `--target-path`; every migration onto the host that copies
-a host-local disk; and every failover rebuild of a missing overlay disk. The
+volume move into a pool on the host's own storage; every backup restore to a
+`--target-path`; every migration onto the host that copies a host-local disk;
+and every failover rebuild of a missing overlay disk. The
 evidence names the file under `creates_refused` (the condition is raised for
 it alone, and resolves once it reads). A migration's target (the cold copy's
 check-only preflight and its write, the live copy's disk stubs) and the

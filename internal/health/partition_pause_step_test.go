@@ -14,10 +14,16 @@ import (
 	"github.com/litevirt/litevirt/internal/lxc"
 )
 
-// stepBoundCeiling is what a healed pass with one hung step may take in the
-// tests below: the step's own bound R (3 s) plus room for a loaded machine.
-// The hung calls run far longer, so a pass that waits for them fails.
-const stepBoundCeiling = 5 * time.Second
+// callOut reports whether the call on key is still out. A test whose hung
+// call is held until released asserts this once the pass has returned: the
+// pass ended without waiting for the call, whatever the machine's load. A
+// wall-clock ceiling on the pass instead failed on a loaded host (a race
+// shard took 5.96 s over a 3 s step) without anything having waited.
+func (f *pauseFixture) callOut(key string) bool {
+	f.p.mu.Lock()
+	defer f.p.mu.Unlock()
+	return f.p.inflight[key]
+}
 
 // hungResumeVMs hangs every partition-pause resume of one domain until
 // release is closed, and only then resumes it: a qemu whose monitor is wedged
@@ -57,18 +63,13 @@ func TestPartitionPause_AHungResumeIsAbandonedAtItsBound(t *testing.T) {
 		t.Fatalf("setup: vm-ha is %s, want paused", st)
 	}
 	hung := &hungResumeVMs{PauseVMBackend: f.virt, name: "vm-ha", release: make(chan struct{})}
-	var once sync.Once
-	release := func() { once.Do(func() { close(hung.release) }) }
-	t.Cleanup(release)
-	safety := time.AfterFunc(12*time.Second, release)
-	defer safety.Stop()
+	release := releaser(t, hung.release)
 	f.p.SetVMBackend(hung)
 
 	f.healedPass()
-	start := time.Now()
 	f.tick()
-	if took := time.Since(start); took > stepBoundCeiling {
-		t.Fatalf("a hung resume held the pauser for %s: no quorum sample was taken meanwhile", took.Round(time.Millisecond))
+	if !f.callOut("vm/vm-ha") {
+		t.Fatal("the pass returned only once the hung resume had: no quorum sample was taken meanwhile")
 	}
 	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
 		t.Fatalf("vm-ha is %s with its resume still hung, want paused", st)
@@ -111,37 +112,50 @@ func TestPartitionPause_AHungResumeIsAbandonedAtItsBound(t *testing.T) {
 	}
 }
 
+// hungStopCT hangs ct-0's stop until release, as lxc-stop does on a
+// container in D state, and then fails it.
+type hungStopCT struct {
+	*fakeCT
+	release chan struct{}
+}
+
+func (h hungStopCT) Stop(ctx context.Context, name string, timeout int) error {
+	if name == "ct-0" {
+		<-h.release
+		return errors.New("lxc-stop: timed out")
+	}
+	return h.fakeCT.Stop(ctx, name, timeout)
+}
+
 // A container settle whose stop hangs (lxc-stop on a container in D state)
 // is abandoned at its step bound the same way, and the pass ends.
 //
 // Mutation: no step bound on the settle stop — the pass takes the whole hang.
 func TestPartitionPause_AHungSettleStopIsAbandonedAtItsBound(t *testing.T) {
 	f, rt := relocatedContainersFixture(t, 2, 0)
-	f.p.SetContainerRuntime(stuckHeadCT{fakeCT: rt, delay: 12 * time.Second})
+	hung := hungStopCT{fakeCT: rt, release: make(chan struct{})}
+	releaser(t, hung.release)
+	f.p.SetContainerRuntime(hung)
 	f.healedPass()
-	start := time.Now()
 	f.tick()
-	if took := time.Since(start); took > stepBoundCeiling {
-		t.Fatalf("a hung settle stop held the pauser for %s: no quorum sample was taken meanwhile", took.Round(time.Millisecond))
+	if !f.callOut("ct/ct-0") {
+		t.Fatal("the pass returned only once the hung settle stop had (or never started it): no quorum sample was taken meanwhile")
 	}
 }
 
 // failSlowVMs fails one domain's resume slowly, as a resume that times out
-// on the libvirt job lock does, and counts every resume.
+// on the libvirt job lock does, and logs every resume in call order.
 type failSlowVMs struct {
 	PauseVMBackend
 	name  string
 	delay time.Duration
 	mu    sync.Mutex
-	calls map[string]int
+	calls []string
 }
 
 func (s *failSlowVMs) ResumePartitionPaused(name, uuid string) error {
 	s.mu.Lock()
-	if s.calls == nil {
-		s.calls = map[string]int{}
-	}
-	s.calls[name]++
+	s.calls = append(s.calls, name)
 	s.mu.Unlock()
 	if name == s.name {
 		time.Sleep(s.delay)
@@ -150,13 +164,26 @@ func (s *failSlowVMs) ResumePartitionPaused(name, uuid string) error {
 	return s.PauseVMBackend.ResumePartitionPaused(name, uuid)
 }
 
+func (s *failSlowVMs) log() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.calls...)
+}
+
 // A resume that fails slowly at the head of the candidates is not retried
 // first on every pass: the resume loop keeps its own place, so the next pass
-// starts after it, and every healthy VM comes back on the second pass rather
-// than one per pass (re-review 3, finding 2).
+// starts after it, and every healthy VM comes back before the failing one is
+// tried again, rather than one per pass or never (re-review 3, finding 2).
+//
+// The failing resume outlasts the pass budget, so the first pass resumes
+// nothing else. The budget is a second, far above what the record checks
+// and healthy resumes take on a loaded host, and the assertion is on the
+// order of the resume calls, not on how many passes the rest took. A 40 ms
+// budget was spent by the checks alone under load (they took up to 130 ms),
+// and healthy VMs slipped to a third pass.
 //
 // Mutation: start the resume loop at the first candidate on every pass — the
-// healthy VMs come back one per pass.
+// failing VM is tried again before any healthy one, which never comes back.
 func TestPartitionPause_AFailingResumeDoesNotHoldUpTheRest(t *testing.T) {
 	const healthy = 5
 	f := newPauseFixture(t)
@@ -175,11 +202,11 @@ func TestPartitionPause_AFailingResumeDoesNotHoldUpTheRest(t *testing.T) {
 	if n := len(f.records()); n != healthy+1 {
 		t.Fatalf("setup: %d records, want %d", n, healthy+1)
 	}
-	const delay = 80 * time.Millisecond
-	vms := &failSlowVMs{PauseVMBackend: f.virt, name: "vm-ha", delay: delay}
+	const budget = time.Second
+	vms := &failSlowVMs{PauseVMBackend: f.virt, name: "vm-ha", delay: budget + 200*time.Millisecond}
 	f.p.SetVMBackend(vms)
 	old := partitionResumePassBudget
-	partitionResumePassBudget = delay / 2
+	partitionResumePassBudget = budget
 	t.Cleanup(func() { partitionResumePassBudget = old })
 	f.healedPass()
 	running := func() int {
@@ -191,18 +218,35 @@ func TestPartitionPause_AFailingResumeDoesNotHoldUpTheRest(t *testing.T) {
 		}
 		return n
 	}
-	var got []int
-	for pass := 0; pass < 2; pass++ {
-		f.tick()
-		got = append(got, running())
-		f.advance(partitionResumeRecheck)
+	f.tick()
+	if got := vms.log(); len(got) != 1 || got[0] != "vm-ha" || running() != 0 {
+		t.Fatalf("setup: the first pass made resume calls %v and left %d healthy VMs running, want only vm-ha's, which spends the budget", got, running())
 	}
-	if got[1] != healthy {
-		vms.mu.Lock()
-		calls := fmt.Sprint(vms.calls)
-		vms.mu.Unlock()
-		t.Fatalf("healthy VMs running after passes 1 and 2: %v, want all %d after the second (resume calls %s)",
-			got, healthy, calls)
+	for pass := 2; pass <= 2*healthy && running() < healthy; pass++ {
+		f.advance(partitionResumeRecheck)
+		f.tick()
+	}
+	calls := vms.log()
+	first := map[string]int{}
+	for i, name := range calls {
+		if _, ok := first[name]; !ok {
+			first[name] = i
+		}
+	}
+	retry := len(calls)
+	for i, name := range calls[1:] {
+		if name == "vm-ha" {
+			retry = i + 1
+			break
+		}
+	}
+	for _, name := range names {
+		if i, ok := first[name]; !ok || i > retry {
+			t.Fatalf("%s was not resumed before vm-ha's failing resume was tried again (resume calls in order: %v)", name, calls)
+		}
+	}
+	if n := running(); n != healthy {
+		t.Fatalf("%d healthy VMs running, want all %d (resume calls in order: %v)", n, healthy, calls)
 	}
 }
 

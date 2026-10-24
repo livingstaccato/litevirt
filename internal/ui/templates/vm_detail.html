@@ -53,7 +53,6 @@
           <button class="btn" hx-post="/ui/vms/{{.VM.Name}}/template" hx-vals='{"revert":"on"}' hx-confirm="Revert {{.VM.Name}} to a normal (startable) VM?">Revert to VM</button>
           {{end}}
           <a class="btn" href="/vms/{{.VM.Name}}/logs">Logs</a>
-          <a class="btn" href="/ui/vms/{{.VM.Name}}/export-disk" title="Download the raw disk image">Export disk</a>
           <div class="menu-sep"></div>
           <button class="btn btn-danger" hx-delete="/ui/vms/{{.VM.Name}}" hx-confirm="Delete {{.VM.Name}}? This cannot be undone." hx-push-url="/vms">{{icon "delete"}} Delete</button>
         </div>

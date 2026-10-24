@@ -456,8 +456,6 @@ var streamHandlerAudit = map[string]string{
 	"/litevirt.v1.LiteVirt/MigrateStackVolumes":   "operation; holds no device for the caller",
 	"/litevirt.v1.LiteVirt/PullImage":             "operation; holds no device for the caller",
 	"/litevirt.v1.LiteVirt/PushImage":             "operation; holds no device for the caller",
-	"/litevirt.v1.LiteVirt/BackupVM":              "operation; holds no device for the caller",
-	"/litevirt.v1.LiteVirt/RestoreVM":             "operation; holds no device for the caller",
 	"/litevirt.v1.LiteVirt/RestoreLive":           "operation; holds no device for the caller",
 	"/litevirt.v1.LiteVirt/BackupSnapshot":        "operation; holds no device for the caller",
 	"/litevirt.v1.LiteVirt/RestoreFromBackup":     "operation; holds no device for the caller",

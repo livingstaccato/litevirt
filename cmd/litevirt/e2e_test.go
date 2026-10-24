@@ -44,11 +44,9 @@ type mockClient struct {
 	// inspectLBResp, when set, is what InspectLoadBalancer returns.
 	inspectLBResp *pb.LoadBalancer
 
-	// The backup requests the repo paths were called with, and whether the
-	// retired raw stream RPCs were.
+	// The backup requests the repo paths were called with.
 	backupSnapshotReq    *pb.BackupSnapshotRequest
 	restoreFromBackupReq *pb.RestoreFromBackupRequest
-	rawBackupCalled      bool
 
 	// Firewall tags (firewall_tag_test.go): fwTags answers ListFirewallTags
 	// (nil: Unimplemented, an older daemon), fwTagsSetReq records the last
@@ -373,17 +371,6 @@ func (m *mockClient) PushImage(_ context.Context, _ *pb.PushImageRequest, _ ...g
 }
 func (m *mockClient) BuildImage(_ context.Context, in *pb.BuildImageRequest, _ ...grpc.CallOption) (*pb.BuildImageResponse, error) {
 	return &pb.BuildImageResponse{Name: in.ImageName, SizeBytes: 1073741824}, nil
-}
-
-// ── Backup ──
-
-func (m *mockClient) BackupVM(_ context.Context, _ *pb.BackupVMRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.BackupChunk], error) {
-	m.rawBackupCalled = true
-	return &fakeStream[pb.BackupChunk]{}, nil
-}
-func (m *mockClient) RestoreVM(_ context.Context, _ ...grpc.CallOption) (grpc.ClientStreamingClient[pb.RestoreVMRequest, pb.VM], error) {
-	m.rawBackupCalled = true
-	return nil, nil
 }
 
 // ── Snapshots ──

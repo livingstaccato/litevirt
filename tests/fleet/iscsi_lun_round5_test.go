@@ -51,7 +51,7 @@ func TestFleet_ISCSI_ARecreateRefusedAtItsDeleteLeavesNoHold(t *testing.T) {
 			if err != nil || rec == nil {
 				t.Fatalf("web on node-1: %v", err)
 			}
-			op := corrosion.OperationRecord{ID: "op-backup", Method: "BackupVM", Principal: "admin@local",
+			op := corrosion.OperationRecord{ID: "op-backup", Method: "BackupSnapshot", Principal: "admin@local",
 				Project: "_default", ResourceKind: "vm", ResourceID: web,
 				OperationKind: string(corrosion.OpResourceUpdateRunning), RequestHash: "h"}
 			if ok, err := n1.DB.BeginVMOperation(ctx, op, rec.Spec, rec.OwnerEpoch, rec.SpecGeneration); err != nil || !ok {

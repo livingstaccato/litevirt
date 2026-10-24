@@ -557,9 +557,8 @@ func newClusterDigestCmd() *cobra.Command {
 func newClusterConvergeCmd() *cobra.Command {
 	var all bool
 	cmd := &cobra.Command{
-		Use:     "converge",
-		Aliases: []string{"sync"},
-		Short:   "Kick an immediate anti-entropy pass and report cross-host convergence",
+		Use:   "converge",
+		Short: "Kick an immediate anti-entropy pass and report cross-host convergence",
 		Long: `Cluster state converges automatically via anti-entropy (roughly once a minute) plus
 WAL replication. This command ACCELERATES that (kick a pass now instead of waiting) and
 VERIFIES it (report per-table digest convergence across hosts). It does not merge or repair
@@ -575,9 +574,6 @@ A table held apart only by ties that every host has acknowledged ('lv cluster
 acknowledge-lease-term'), with nothing else different, is listed as ACKNOWLEDGED and
 counts as converged. One unacknowledged tie on any host keeps it a SAFETY-FAULT.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if cmd.CalledAs() == "sync" {
-				fmt.Fprintln(os.Stderr, "note: `lv cluster sync` is deprecated — use `lv cluster converge`")
-			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				tr, err := c.TriggerAntiEntropy(ctx, &pb.TriggerAntiEntropyRequest{All: all})
 				if err != nil {

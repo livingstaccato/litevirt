@@ -64,7 +64,6 @@ lv mcp [--max-list-items N] [--allow-write]  # Run the stdio MCP server for oper
 lv version                         # Print version
 lv cluster digest                  # Per-table state digest for every host (fanned out server-side)
 lv cluster converge [--all]        # Kick an immediate anti-entropy pass + report cross-host convergence
-                                   #   (`lv cluster sync` is a deprecated alias)
 lv cluster failover-scope [cluster|region]  # Show or set whether failover quorum is cluster-wide or
                                    #   per region (see federation.md → Regions and failure)
 lv cluster vrrp-transport [unicast|multicast]  # Show or set how load balancer hosts exchange VRRP,

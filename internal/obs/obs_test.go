@@ -622,7 +622,7 @@ func TestTraceFilter_SuppressesNoisyRPCs(t *testing.T) {
 	trace := map[string]bool{ // full method -> should be instrumented
 		"/litevirt.v1.LiteVirt/MigrateVM":      true,
 		"/litevirt.v1.LiteVirt/CreateVM":       true,
-		"/litevirt.v1.LiteVirt/BackupVM":       true,
+		"/litevirt.v1.LiteVirt/BackupSnapshot": true,
 		"/litevirt.v1.LiteVirt/Ping":           false,
 		"/litevirt.v1.LiteVirt/PushMutations":  false,
 		"/litevirt.v1.LiteVirt/AckMutations":   false,

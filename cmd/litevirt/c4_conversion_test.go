@@ -10,8 +10,7 @@ import (
 // (Unimplemented since upstream 87278326). They are now the names of those
 // paths: create is `lv backup snapshot`, restore is `lv backup restore-from`.
 //
-// Mutation: either alias dropped — the command is unknown: red. The old raw
-// command restored — BackupVM is called: red.
+// Mutation: either alias dropped — the command is unknown: red.
 func TestBackupCreateAndRestoreCallTheRepoPaths(t *testing.T) {
 	mock := newMockClient()
 	if _, stderr, err := runCmd(t, mock, "backup", "create", "web-1", "--repo", "/srv/backup", "--incremental"); err != nil {
@@ -27,9 +26,6 @@ func TestBackupCreateAndRestoreCallTheRepoPaths(t *testing.T) {
 	if r := mock.restoreFromBackupReq; r == nil || r.VmName != "web-1" || r.RepoPath != "/srv/backup" || r.DiskName != "root" ||
 		r.Timestamp != "2026-01-01T00:00:00Z" {
 		t.Fatalf("backup restore sent %+v, want a restore of web-1's root from /srv/backup", r)
-	}
-	if mock.rawBackupCalled {
-		t.Fatal("a retired raw backup RPC was called")
 	}
 
 	// Review m-3: the retired form, with a file, fails and restores nothing.
@@ -98,7 +94,6 @@ func TestC4_ConvertedCommandsRun(t *testing.T) {
 		// cluster.go
 		{"cluster digest", []string{"cluster", "digest"}, ""},
 		{"cluster converge", []string{"cluster", "converge"}, "Anti-entropy pass"},
-		{"cluster sync", []string{"cluster", "sync"}, "Anti-entropy pass"}, // deprecated alias of converge
 		// firewall.go
 		{"firewall reload", []string{"firewall", "reload"}, "Reloaded"},
 		// rebuild.go

@@ -55,7 +55,7 @@ func init() {
 		"MigrateVM", "MoveVolume", "ReplicateVolume", "MigrateStackVolumes",
 		"CrossRegionMigrate", "PromoteReplica", "ResolvePITOverlay", "RemoveSetAsideOverlay",
 		// VM backup, restore and snapshots.
-		"BackupVM", "RestoreVM", "RestoreLive", "BackupSnapshot", "RestoreFromBackup",
+		"RestoreLive", "BackupSnapshot", "RestoreFromBackup",
 		"CreateSnapshot", "RestoreSnapshot", "DeleteSnapshot",
 		// Containers.
 		"StartContainer", "StopContainer", "DeleteContainer", "MigrateContainer",

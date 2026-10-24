@@ -288,9 +288,9 @@ func TestClusterHasSubcommands(t *testing.T) {
 			t.Errorf("cluster missing subcommand %q", name)
 		}
 	}
-	// `sync` is retained as a deprecated alias of `converge`.
-	if c, _, err := cmd.Find([]string{"sync"}); err != nil || c.Name() != "converge" {
-		t.Errorf("`sync` should resolve to the converge alias, got %v (err %v)", c, err)
+	// The `sync` alias of `converge` was removed.
+	if c, _, err := cmd.Find([]string{"sync"}); err == nil && c.Name() == "converge" {
+		t.Error("`sync` still resolves to converge")
 	}
 }
 

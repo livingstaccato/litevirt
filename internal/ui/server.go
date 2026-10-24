@@ -408,7 +408,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /ui/hosts/{name}/stats-history", s.requireAuthFunc(s.handleHostStatsHistory))
 	mux.HandleFunc("GET /ui/vms/{name}/stats-history", s.requireAuthFunc(s.handleVMStatsHistory))
 	mux.HandleFunc("GET /ui/vms/{name}/logs/stream", s.requireAuthFunc(s.handleVMLogsStream))
-	mux.HandleFunc("GET /ui/restore-modal", s.requireAuthFunc(s.handleRestoreModal))
 	mux.HandleFunc("GET /ui/hosts/{name}/upgrade-modal", s.requireAuthFunc(s.handleUpgradeModal))
 	// Host network configuration (v48): intent CRUD + plan-then-confirm apply.
 	mux.HandleFunc("GET /ui/hosts/{name}/network-modal", s.requireAuthFunc(s.handleHostNetworkModal))
@@ -461,7 +460,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /ui/lb/{name}/update", s.requireAuthFunc(s.handleUpdateLB))
 	mux.HandleFunc("POST /ui/lb/{name}/backend/{backend}/enable", s.requireAuthFunc(s.handleLBEnableBackend))
 	mux.HandleFunc("POST /ui/lb/{name}/backend/{backend}/disable", s.requireAuthFunc(s.handleLBDisableBackend))
-	mux.HandleFunc("GET /ui/vms/{name}/export-disk", s.requireAuthFunc(s.handleExportDisk))
 	mux.HandleFunc("GET /ui/vms/{name}/backup-modal", s.requireAuthFunc(s.handleBackupModal))
 	mux.HandleFunc("POST /ui/vms/{name}/backup-snapshot", s.requireAuthFunc(s.handleCreateBackupSnapshot))
 	mux.HandleFunc("GET /ui/vms/{name}/backup-progress", s.requireAuthFunc(s.handleBackupProgress))
@@ -476,7 +474,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /ui/backups/sync", s.requireAuthFunc(s.handleRepoSync))
 	mux.HandleFunc("GET /ui/backups/prune-modal", s.requireAuthFunc(s.handleRepoPruneModal))
 	mux.HandleFunc("POST /ui/backups/prune", s.requireAuthFunc(s.handleRepoPrune))
-	mux.HandleFunc("POST /ui/vms/restore", s.requireAuthFunc(s.handleRestoreVM))
 	mux.HandleFunc("POST /ui/vms/{name}/update-spec", s.requireAuthFunc(s.handleUpdateVMSpec))
 	mux.HandleFunc("POST /ui/vms/{name}/update-lifecycle", s.requireAuthFunc(s.handleUpdateVMLifecycle))
 	mux.HandleFunc("POST /ui/vms/{name}/boot-order", s.requireAuthFunc(s.handleSetBootOrder))

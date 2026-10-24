@@ -167,7 +167,7 @@ flood, high-frequency machine-to-machine RPCs are **not traced at all**: WAL
 replication (`PushMutations`/`AckMutations`), anti-entropy state sync
 (`GetStateDigest`/`*StateDump`), health probes (`GetHostHealth`), keepalive
 (`Ping`), and replica pushes. Real operations (`CreateVM`, `MigrateVM`,
-`BackupVM`, failover, …) are always traced.
+`BackupSnapshot`, failover, …) are always traced.
 
 If even that is too much, lower `telemetry.sample_rate` (head sampling,
 parent-based). This is a blunt instrument — it drops whole traces at random — so

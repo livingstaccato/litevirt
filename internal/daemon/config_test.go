@@ -266,7 +266,6 @@ func TestLoadConfig_PCIConfig(t *testing.T) {
 	yaml := `host_name: "pci-host"
 pci:
   rescan_interval: "5m"
-  udev_hook: true
   spare_pcie_root_ports: 6
   sriov:
     managed: true
@@ -284,9 +283,6 @@ pci:
 
 	if cfg.PCI.RescanInterval != "5m" {
 		t.Errorf("RescanInterval = %q, want 5m", cfg.PCI.RescanInterval)
-	}
-	if !cfg.PCI.UdevHook {
-		t.Error("UdevHook should be true")
 	}
 	if cfg.PCI.SparePCIeRootPorts != 6 {
 		t.Errorf("SparePCIeRootPorts = %d, want 6", cfg.PCI.SparePCIeRootPorts)

@@ -193,14 +193,6 @@ func (s *Server) handleBackupProgress(w http.ResponseWriter, r *http.Request) {
 	s.renderFragment(w, "backup_progress.html", val.(*backupOpState).snapshot())
 }
 
-// handleExportDisk is DEPRECATED. The raw full-disk stream (BackupVM) is retired
-// in favor of repo-backed snapshot backups, so this surfaces a clear message
-// rather than calling the dead RPC.
-func (s *Server) handleExportDisk(w http.ResponseWriter, r *http.Request) {
-	sendToast(w, "Raw disk export is deprecated; create a backup snapshot to a repo instead.", "error")
-	w.WriteHeader(http.StatusGone)
-}
-
 // ── C3: restore (RestoreFromBackup) and live restore (RestoreLive) ────────────
 
 // handleRestoreFromModal renders the per-manifest "Restore" modal.

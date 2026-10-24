@@ -236,19 +236,6 @@ func TestCutover_FirmwareUndefineFailureKeepsNvram(t *testing.T) {
 	}
 }
 
-// The legacy raw-stream backup can't carry firmware state, so it must refuse an
-// SB/vTPM VM (a restore would boot a fresh-TPM VM and brick BitLocker).
-func TestBackupVM_RefusesFirmwareVM(t *testing.T) {
-	s, _, ctx := firmwareTestServer(t, "fwvm", "stopped")
-	err := s.BackupVM(&pb.BackupVMRequest{VmName: "fwvm"}, &fakeBackupStream{ctx: ctx})
-	if status.Code(err) != codes.Unimplemented {
-		t.Fatalf("expected Unimplemented refusing raw-stream backup of an SB/vTPM VM, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "snapshot backup") {
-		t.Errorf("error should point at snapshot backup, got: %v", err)
-	}
-}
-
 // Backing up a firmware VM whose firmware state is absent on this host must
 // refuse rather than store an un-restorable-as-firmware backup.
 func TestCaptureFirmwareBundle_MissingStateRefused(t *testing.T) {
@@ -445,13 +432,3 @@ func TestRestore_FirmwareMaterializeRollbackOnDefineFailure(t *testing.T) {
 		t.Error("materialized NVRAM must be wiped after a failed firmware restore")
 	}
 }
-
-// fakeBackupStream is a minimal BackupVM server stream for the refusal test
-// (the refusal returns before any Send).
-type fakeBackupStream struct {
-	pb.LiteVirt_BackupVMServer
-	ctx context.Context
-}
-
-func (f *fakeBackupStream) Context() context.Context   { return f.ctx }
-func (f *fakeBackupStream) Send(*pb.BackupChunk) error { return nil }

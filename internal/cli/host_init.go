@@ -918,7 +918,6 @@ ${ADVERTISE_ADDRESS:+advertise_address: "${ADVERTISE_ADDRESS}"}
 join_peers: ${JOIN_PEERS:-[]}
 pci:
   rescan_interval: "${PCI_RESCAN_INTERVAL:-0}"
-  udev_hook: ${PCI_UDEV_HOOK:-false}
   sriov:
     managed: ${SRIOV_MANAGED:-false}
     max_vfs_per_pf: ${SRIOV_MAX_VFS:-8}
@@ -1131,7 +1130,6 @@ func setupScriptEnvWith(hostName, advertiseAddr, joinPeers, enforcement string) 
 		"ADVERTISE_ADDRESS=" + advertiseAddr,
 		"JOIN_PEERS=" + joinPeers,
 		"PCI_RESCAN_INTERVAL=0",
-		"PCI_UDEV_HOOK=false",
 		"SRIOV_MANAGED=false",
 		"SRIOV_MAX_VFS=8",
 		// The capability-latch model requires config uniformity: a token is
@@ -1357,10 +1355,6 @@ fi
 CONFIG=/etc/litevirt/config.yaml
 ` + uiTLSScript + `
 ` + configWriteScript + `
-
-# pci.udev_hook is deprecated: real-time PCI events are covered by
-# pci.rescan_interval, and the old curl-to-REST udev rule was unreliable. This
-# installer no longer writes a udev rule; the daemon warns if the flag is set.
 
 # Load vfio-pci kernel module (needed for PCI passthrough).
 modprobe vfio-pci 2>/dev/null || true

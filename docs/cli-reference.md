@@ -230,6 +230,11 @@ lv host ceph add-mgr <host>               # Add a Ceph manager
 lv host ceph add-osd <host> <device>      # Add an OSD on the named device
 lv host ceph status                       # Ceph cluster health summary
 lv host ceph osd-tree                     # Ceph CRUSH topology
+lv host mig ls                            # This host's GPUs, MIG mode and MIG instances (nvidia-smi)
+lv host mig enable <gpu>                  # Enable MIG mode on a GPU (index, PCI bus ID or UUID)
+lv host mig disable <gpu>                 # Disable MIG mode (destroy its instances first)
+lv host mig create <gpu> <profile>        # Create a MIG instance, e.g. 3g.20gb, with its compute instance
+lv host mig destroy <gpu> <instance-id>   # Destroy a MIG instance and its compute instances
 ```
 
 ## Virtual machines

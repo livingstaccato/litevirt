@@ -72,6 +72,31 @@ lv host rescan host-a
 
 litevirt tracks PCI topology including IOMMU groups, NUMA nodes, PCIe root ports, and NVLink cliques.
 
+## NVIDIA MIG partitions
+
+On a GPU that supports Multi-Instance GPU (A100, A30, H100 and later), `lv
+host mig` splits the GPU into MIG instances. These commands are host-local,
+like `lv host ceph`: they run `nvidia-smi` on the host you are logged in to and
+need root. `<gpu>` is anything `nvidia-smi -i` takes: an index, a PCI bus ID
+or a GPU UUID.
+
+```bash
+lv host mig ls                    # GPUs, their MIG mode, and their MIG instances
+lv host mig enable 0              # enable MIG mode; no process may be using the GPU
+lv host mig create 0 3g.20gb      # a GPU instance plus its default compute instance
+lv host mig destroy 0 2           # GPU instance 2 and its compute instances
+lv host mig disable 0             # once every instance on it is destroyed
+```
+
+On some systems MIG mode stays pending until the GPU is reset or the host
+rebooted; `lv host mig ls` shows the pending mode in its PENDING column.
+
+Only GPUs on the NVIDIA driver are listed: a GPU passed through to a VM is on
+vfio-pci and `nvidia-smi` does not see it. Likewise a GPU you have split into
+MIG instances is still one PCI device to litevirt, so do not also select it for
+passthrough. litevirt does not yet attach a MIG instance to a VM or a
+container; the instances are for workloads on the host itself.
+
 ## Assigning devices in compose
 
 ### By type and vendor

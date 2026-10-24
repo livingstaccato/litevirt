@@ -538,19 +538,25 @@ func (c *Client) RunOutputContext(ctx context.Context, cmd string) ([]byte, erro
 // ended, for the remote to report the killed command's exit.
 var remoteKillGrace = 2 * time.Second
 
-// killOnStdinEOF wraps cmd for RunOutputContext. cmd runs in a session of its
-// own (setsid, so its process group's id is its pid; on a machine with no
-// setsid only cmd's shell is killed), and a watcher reading the session's
-// stdin kills that group when stdin reaches EOF. The wrapper exits with cmd's
-// status and stops the watcher first, so a command that ended by itself is
-// never followed by a kill. A background job reads /dev/null unless told
-// otherwise, so stdin reaches the watcher as fd 3.
+// killOnStdinEOF wraps cmd for RunOutputContext. A watcher reading the
+// session's stdin kills cmd's process group when stdin reaches EOF:
+//
+//   - with setsid, cmd runs in a session of its own, so its group's id is its
+//     pid, and that group is killed;
+//   - without it, cmd stays in the wrapper's group, and that whole group is
+//     killed (wrapper, watcher and cmd's tree): sshd makes the command it
+//     runs a session leader, so $$ names it. Where $$ leads no group (an
+//     unusual launcher), the kill finds none, and only cmd's shell is killed.
+//
+// The wrapper exits with cmd's status and stops the watcher first, so a
+// command that ended by itself is never followed by a kill. A background job
+// reads /dev/null unless told otherwise, so stdin reaches the watcher as fd 3.
 func killOnStdinEOF(cmd string) string {
 	q := ShellQuote(cmd)
 	return `exec 3<&0; ` +
-		`if command -v setsid >/dev/null 2>&1; then setsid sh -c ` + q + ` 3<&- </dev/null & ` +
-		`else sh -c ` + q + ` 3<&- </dev/null & fi; p=$!; ` +
-		`{ cat <&3 >/dev/null; kill -s KILL -- -$p 2>/dev/null || kill -s KILL $p; } >/dev/null 2>&1 & w=$!; ` +
+		`if command -v setsid >/dev/null 2>&1; then setsid sh -c ` + q + ` 3<&- </dev/null & p=$!; g=-$p; f=; ` +
+		`else sh -c ` + q + ` 3<&- </dev/null & p=$!; g=-$$; f=$p; fi; ` +
+		`{ cat <&3 >/dev/null; kill -s KILL -- $g 2>/dev/null || { [ -n "$f" ] && kill -s KILL $f; }; } >/dev/null 2>&1 & w=$!; ` +
 		`exec 3<&-; wait $p; rc=$?; kill $w 2>/dev/null; exit $rc`
 }
 

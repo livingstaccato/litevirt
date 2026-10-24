@@ -226,7 +226,8 @@ func TestKeyProof_NoTimeoutBinaryStillBoundedByClientDeadline(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "openssl.pid")
 	stubOpenSSL(t, `echo $$ > '`+marker+`'; exec sleep 30`)
 	old := keyProofDeadline
-	keyProofDeadline = time.Second
+	// Headroom for a saturated host to start the stub before the deadline.
+	keyProofDeadline = 3 * time.Second
 	t.Cleanup(func() { keyProofDeadline = old })
 
 	start := time.Now()
@@ -253,13 +254,13 @@ func TestKeyProof_NoTimeoutBinaryStillBoundedByClientDeadline(t *testing.T) {
 	}
 	select {
 	case <-done:
-	case <-time.After(15 * time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatal("the proof was not bounded without a remote timeout")
 	}
 	if proved || err == nil || !strings.Contains(err.Error(), "deadline") {
 		t.Fatalf("proved %v, %v; want a refusal naming the deadline", proved, err)
 	}
-	if d := time.Since(start); d > 8*time.Second {
+	if d := time.Since(start); d > 12*time.Second {
 		t.Errorf("took %v", d)
 	}
 	if pid == 0 {

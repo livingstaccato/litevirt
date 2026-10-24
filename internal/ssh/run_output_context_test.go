@@ -24,7 +24,11 @@ import (
 // does without a PTY: the command leads a session of its own, its stdin is
 // the channel's (EOF when the client closes it), and nothing signals it
 // when the channel closes.
-func execSSHD(t *testing.T) *Client {
+func execSSHD(t *testing.T) *Client { t.Helper(); return execSSHDPath(t, "") }
+
+// execSSHDPath is execSSHD with each command's PATH set to path ("" keeps
+// the test's environment).
+func execSSHDPath(t *testing.T, path string) *Client {
 	t.Helper()
 	_, sk, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -63,7 +67,7 @@ func execSSHD(t *testing.T) *Client {
 					if err != nil {
 						continue
 					}
-					go serveExec(ch, creqs)
+					go serveExec(ch, creqs, path)
 				}
 			}()
 		}
@@ -78,7 +82,7 @@ func execSSHD(t *testing.T) *Client {
 	return &Client{conn: conn, addr: ln.Addr().String()}
 }
 
-func serveExec(ch ssh.Channel, reqs <-chan *ssh.Request) {
+func serveExec(ch ssh.Channel, reqs <-chan *ssh.Request, path string) {
 	defer ch.Close()
 	for req := range reqs {
 		if req.Type != "exec" || len(req.Payload) < 4 {
@@ -88,6 +92,9 @@ func serveExec(ch ssh.Channel, reqs <-chan *ssh.Request) {
 		n := binary.BigEndian.Uint32(req.Payload)
 		cmd := exec.Command("sh", "-c", string(req.Payload[4:4+n]))
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		if path != "" {
+			cmd.Env = []string{"PATH=" + path}
+		}
 		// stdin through a pipe this server does not wait on, as sshd's.
 		pr, pw, err := os.Pipe()
 		if err != nil {
@@ -150,7 +157,34 @@ func TestRunOutputContext_AnswersLikeRunOutput(t *testing.T) {
 // and the closed session leave the shell, its pipeline and the background
 // sleep running, red.
 func TestRunOutputContext_DeadlineKillsTheRemoteGroup(t *testing.T) {
-	c := execSSHD(t)
+	assertDeadlineKillsTheRemoteGroup(t, execSSHD(t))
+}
+
+// On a machine with no setsid, the command stays in the group sshd gave the
+// wrapper, and that whole group is killed, not only the command's shell.
+//
+// Mutation: kill only the command's shell on that branch (g=$p) — the
+// background sleep and the pipeline outlive it, red.
+func TestRunOutputContext_NoSetsidKillsTheWholeTree(t *testing.T) {
+	bin := t.TempDir()
+	for _, tool := range []string{"sh", "sleep", "cat"} {
+		p, err := exec.LookPath(tool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(p, filepath.Join(bin, tool)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := execSSHDPath(t, bin)
+	if out, err := c.RunOutputContext(context.Background(), `command -v setsid || echo none`); err != nil || string(out) != "none\n" {
+		t.Fatalf("the fake machine must have no setsid: %q, %v", out, err)
+	}
+	assertDeadlineKillsTheRemoteGroup(t, c)
+}
+
+func assertDeadlineKillsTheRemoteGroup(t *testing.T, c *Client) {
+	t.Helper()
 	marker := filepath.Join(t.TempDir(), "pid")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()

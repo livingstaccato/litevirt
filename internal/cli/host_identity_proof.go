@@ -181,6 +181,13 @@ type contextShell interface {
 	ShellContext(ctx context.Context, kind, cmd string) ([]byte, error)
 }
 
+// Both real targets must stay contextShells: one that silently lost
+// ShellContext would have its proof abandoned, not stopped, at the deadline.
+var (
+	_ contextShell = (*sshAddRemote)(nil)
+	_ contextShell = (*LocalAddTarget)(nil)
+)
+
 // shellStopGrace bounds how long shellWithin waits, past its deadline, for
 // the command it gave up on to be stopped. It outlasts the local bound
 // (cmdbound's WaitDelay and ReapGrace) and the SSH one (remoteKillGrace);

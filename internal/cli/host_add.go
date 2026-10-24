@@ -1463,7 +1463,8 @@ func (d *LocalAddTarget) Shell(kind, cmd string) ([]byte, error) {
 }
 
 // ShellContext is Shell, with the command run in a process group of its own
-// that is killed, whole, when ctx ends.
+// that is killed, whole, when ctx ends. A type embedding *LocalAddTarget
+// inherits it, so shellWithin calls it and not the embedder's Shell override.
 func (d *LocalAddTarget) ShellContext(ctx context.Context, kind, cmd string) ([]byte, error) {
 	d.Events = append(d.Events, "sh "+kind)
 	if kind == daemonProbeKind {

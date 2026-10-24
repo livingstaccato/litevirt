@@ -133,7 +133,7 @@ func (s *Server) judgeAccessVLANBridge(ctx context.Context, bridge string, vms [
 	ev, _ := json.Marshal(map[string]any{
 		"bridge": bridge, "host": s.hostName, "vm_count": len(vms), "vms": listed,
 		"detail": fmt.Sprintf("host %s: %v. %d VM(s) with an access-VLAN NIC on bridge %s (%s) cannot start on %s, "+
-			"by failover either. "+
+			"by failover either; failover places them on another host while one qualifies. "+
 			"Keep VLAN filtering on across a reboot in what creates the bridge "+
 			"(docs/networking.md, \"Access-VLAN NICs need a VLAN-filtering bridge\")",
 			s.hostName, problem, len(vms), bridge, strings.Join(listed, ", "), s.hostName),

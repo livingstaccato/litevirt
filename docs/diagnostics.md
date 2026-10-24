@@ -3173,8 +3173,9 @@ confirmed on the next) for each. The evidence names the bridge and the host,
 counts the VMs that cannot start there and lists up to ten of them, and says
 the fix. A bridge that does not exist on the host is not judged.
 
-While it is open, a failover that places such a VM on the host has its start
-refused there, and the VM waits for the fix.
+While it is open, failover recovers such a VM onto a host whose bridge is not
+reported, when one qualifies; only when none does is it placed on a reported
+host, where its start is refused and the VM waits for the fix.
 
 Fix it on the host the subject names: `ip link set dev <bridge> type bridge
 vlan_filtering 1`, with the VLAN on the bridge's uplink, and keep it across a

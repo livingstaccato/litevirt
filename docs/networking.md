@@ -446,8 +446,10 @@ cluster has a `trunk:` NIC of one VLAN on, through its network. For each, it
 raises `bridge_vlan_filtering_off` (evaluator `access_vlan`, subject
 `host/<bridge>@<host>`, warning) naming the host, the bridge, how many VMs it
 affects and which, and the fix; `lv health` shows it. That is before a
-failover needs the host: none of those VMs can start there, a failover's
-start included. The condition resolves on the first check that finds the bridge
+failover needs the host: none of those VMs can start there. Failover places
+such a VM on a host whose bridge is not reported while one qualifies, and on
+a reported one only when no other host qualifies, where its start is refused
+as above. The condition resolves on the first check that finds the bridge
 filtering VLANs, gone, or used by no such VM; see
 [diagnostics.md](diagnostics.md#a-bridge-cannot-carry-an-access-vlan-nic-bridge_vlan_filtering_off).
 

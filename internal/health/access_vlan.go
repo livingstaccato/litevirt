@@ -18,8 +18,9 @@ import (
 // host/<bridge>@<host>) for each of its bridges that is a Linux bridge with
 // VLAN filtering off while some VM of the cluster has an access-port NIC on a
 // network using it (grpcapi.ReconcileAccessVLANBridges), so the hosts a
-// failover could not start such a VM on are named before one needs to
-// (AccessVLANUnfitHosts reads them back).
+// failover could not start such a VM on are named before one needs to, and
+// failover placement passes them over while another host qualifies
+// (AccessVLANUnfitHosts).
 const (
 	AccessVLANEvaluator        = "access_vlan"
 	CondBridgeVLANFilteringOff = "bridge_vlan_filtering_off"

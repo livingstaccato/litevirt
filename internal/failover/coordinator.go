@@ -4138,6 +4138,9 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		st, ok := hostState[host]
 		return !ok || st != "active"
 	}
+	// Hosts whose bridge cannot carry an access-VLAN NIC are passed over
+	// for a VM with one while another host qualifies.
+	vlanView := c.readAccessVLANView(ctx)
 
 	// Step 5: Reschedule VMs using placement engine for proper resource-aware scheduling.
 	type failoverPlan struct {
@@ -4184,6 +4187,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				if c.stoppedVMRekeyable(ctx, h.Name, vm, disks, fenceEpoch) {
 					req := buildFailoverPlacementRequest(vm, h.Name, c.capacity, pinDown)
 					c.addPlacementLabels(ctx, &req, vm.Name)
+					vlanView.avoid(&req, vm)
 					c.resolveUSBPlacement(ctx, &req)
 					if _, hold := c.addDevicePlacement(ctx, &req, vm); hold != "" {
 						c.skipStoppedVM(ctx, h.Name, vm, stoppedVMDetail(h.Name)+"; not moved: "+hold)
@@ -4386,6 +4390,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		if targetName == "" {
 			req := buildFailoverPlacementRequest(vm, h.Name, c.capacity, pinDown)
 			c.addPlacementLabels(ctx, &req, vm.Name)
+			vlanView.avoid(&req, vm)
 			c.resolveUSBPlacement(ctx, &req)
 			devs, hold := c.addDevicePlacement(ctx, &req, vm)
 			if hold != "" {

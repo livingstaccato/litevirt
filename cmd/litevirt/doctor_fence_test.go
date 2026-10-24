@@ -13,6 +13,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 type fenceReadinessClient struct {
@@ -394,5 +395,26 @@ func TestDoctorFence_FlagsSSHOnlyFencing(t *testing.T) {
 		{Name: "c", FenceStrategy: "ipmi"}}})
 	if strings.Contains(out, "fence only over SSH") {
 		t.Fatalf("an all-BMC cluster is warned about SSH fencing:\n%s", out)
+	}
+}
+
+// `lv doctor fence` names the hosts that trust a confirmed SSH power-off, apart
+// from the SSH-only warning, and says what it risks. A host without the label
+// is not named.
+//
+// Mutation: drop printTrustSSHPoweroff — no note, red.
+func TestDoctorFence_FlagsTrustedSSHPoweroff(t *testing.T) {
+	out, code := runDoctorFenceWith(t, &fenceReadinessClient{resp: &pb.FenceReadiness{}, hosts: []*pb.Host{
+		{Name: "a", FenceStrategy: "ssh", Labels: map[string]string{corrosion.LabelTrustSSHPoweroff: "true"}},
+		{Name: "b", FenceStrategy: "ssh"},
+	}})
+	if code != 0 {
+		t.Fatalf("exit code %d, want 0", code)
+	}
+	for _, want := range []string{"1 host(s) trust a confirmed SSH power-off (litevirt.trust_ssh_poweroff): a\n",
+		"runs them twice", "2 host(s) fence only over SSH"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output does not contain %q:\n%s", want, out)
+		}
 	}
 }

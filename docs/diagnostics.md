@@ -778,6 +778,15 @@ the warning. The warning is diagnostic only and does not change the exit code.
 
 ### What a fence established
 
+`lv doctor fence` also warns about two fencing postures, neither of which
+changes the exit code: the hosts that fence only over SSH (`ssh`,
+`best-effort`, or unset), whose failed workloads wait for their partition pause
+or `lv host fence-confirm`, with a recommendation of `ipmi` or `redfish`; and,
+separately, the hosts that trust a confirmed SSH power-off
+(`lv host config <host> --trust-ssh-poweroff`), whose workloads are recovered
+on a confirmation without proof the host is off. The web UI's health page shows
+the same two lists.
+
 `lv doctor fence` also lists the fences of the last 7 days (newest 20), each
 with an **assurance** — what that fence actually establishes about the host.
 The stored `fencing_log.result` cannot make this distinction: it says `fenced`
@@ -798,8 +807,10 @@ Only `verified` and `operator-confirmed` are proof-grade: they satisfy the
 shared-storage fence, and only they record a host `fenced` once
 `fence_state_v1` has latched (`corrosion.FenceProofGrade` is defined in terms
 of this table, and the coordinator judges a live fence by the same one). A
-`requested` or `self_paused` fence records the host `offline`, and still lets the
-coordinator that ran it reschedule **local-disk** VMs, which is why the command
+`requested` or `self_paused` fence records the host `offline`. A `self_paused`
+one lets the coordinator that ran it reschedule **local-disk** VMs once the pause
+wait has passed, and a `requested` one does too on a host that trusts a
+confirmed SSH power-off (`litevirt.trust_ssh_poweroff`), which is why the command
 prints a note when it finds one. A later coordinator resumes a recovery from
 one while it still stands, and never fences the host again for it (see
 [Resuming a recovery from a recorded fence](migration-failover.md#resuming-a-recovery-from-a-recorded-fence)).

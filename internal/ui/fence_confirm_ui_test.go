@@ -91,3 +91,25 @@ func TestUIHealth_FlagsSSHOnlyFencing(t *testing.T) {
 		t.Fatal("an all-BMC cluster's health page flags SSH fencing")
 	}
 }
+
+// The health page flags the hosts that trust a confirmed SSH power-off, in a
+// section of their own.
+//
+// Mutation: drop the TrustSSHPoweroff data — red.
+func TestUIHealth_FlagsTrustedSSHPoweroff(t *testing.T) {
+	mock := newDefaultMock()
+	mock.listHostsResp = &pb.ListHostsResponse{Hosts: []*pb.Host{
+		{Name: "t", FenceStrategy: "ssh", Labels: map[string]string{"litevirt.trust_ssh_poweroff": "true"}},
+		{Name: "u", FenceStrategy: "ipmi"},
+	}}
+	s := newTestUIServer(t, mock)
+	body := serveRequest(s, withAuth(mustReq(t, "GET", "/health"))).Body.String()
+	i := strings.Index(body, `id="trust-ssh-poweroff"`)
+	if i < 0 || !strings.Contains(body[i:], "1 host(s) trust a confirmed SSH power-off") || !strings.Contains(body[i:], "runs them twice") {
+		t.Fatal("health page does not flag the host trusting a confirmed SSH power-off")
+	}
+	mock.listHostsResp = &pb.ListHostsResponse{Hosts: []*pb.Host{{Name: "u", FenceStrategy: "ipmi"}}}
+	if body := serveRequest(s, withAuth(mustReq(t, "GET", "/health"))).Body.String(); strings.Contains(body, `id="trust-ssh-poweroff"`) {
+		t.Fatal("health page flags trust with no host trusting")
+	}
+}

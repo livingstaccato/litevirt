@@ -333,6 +333,7 @@ func printSSHOnlyFencing(w io.Writer, hosts []*pb.Host) {
 			ssh = append(ssh, h.GetName()+" ("+fence.ResolveStrategy(h.GetFenceStrategy())+")")
 		}
 	}
+	printTrustSSHPoweroff(w, hosts)
 	if len(ssh) == 0 {
 		return
 	}
@@ -341,6 +342,27 @@ func printSSHOnlyFencing(w io.Writer, hosts []*pb.Host) {
 	fmt.Fprintln(w, "workloads are held until its partition pause has been waited out, or until you")
 	fmt.Fprintln(w, "power it off and run `lv host fence-confirm <host>`. Give each an ipmi or redfish")
 	fmt.Fprintln(w, "fence strategy (`lv host config <host> --fence-strategy ipmi|redfish`) to recover at once.")
+}
+
+// printTrustSSHPoweroff names every host whose operator chose to trust a
+// confirmed SSH power-off (corrosion.LabelTrustSSHPoweroff), separately from
+// the SSH-only warning: their workloads are recovered on a request the host
+// confirmed, not on proof it is off.
+func printTrustSSHPoweroff(w io.Writer, hosts []*pb.Host) {
+	var trusted []string
+	for _, h := range hosts {
+		if h.GetLabels()[corrosion.LabelTrustSSHPoweroff] == "true" {
+			trusted = append(trusted, h.GetName())
+		}
+	}
+	if len(trusted) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "\nNOTE: %d host(s) trust a confirmed SSH power-off (%s): %s\n", len(trusted),
+		corrosion.LabelTrustSSHPoweroff, strings.Join(trusted, ", "))
+	fmt.Fprintln(w, "Their workloads are recovered when the remote shell confirms a power-off over the pinned host")
+	fmt.Fprintln(w, "key, without proof the host is off: one that ignores it, or whose power-off hangs, runs them twice.")
+	fmt.Fprintln(w, "`lv host config <host> --trust-ssh-poweroff=false` turns it off.")
 }
 
 func printStalledObservers(w io.Writer, conds []*pb.HealthCondition) {

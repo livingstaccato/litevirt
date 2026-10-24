@@ -8,7 +8,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -115,6 +119,84 @@ func TestFleet_ImportInspectOVA_ForwardedUploadWritesNothing(t *testing.T) {
 		}
 		if vm, _ := corrosion.GetVM(context.Background(), n.DB, "app"); vm != nil {
 			t.Errorf("%s: the inspect wrote a VM row: %+v", n.Name, vm)
+		}
+	}
+}
+
+// The preview of a --server-path OVA reads the file on the host that runs
+// it, under the import's path check: an operator naming a real OVA outside
+// the staging root is refused, on the entry node and forwarded to another
+// node (judged there by the bearer the entry relays), and no plan comes back.
+// The admin control gets the plan, so the file is one the preview reads.
+//
+// Mutation: resolve the path in inspectOVASource with a bare
+// filepath.EvalSymlinks (no containment) and the operator gets the plan.
+func TestFleet_ImportInspectOVA_ServerPathOutsideStagingRefused(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	entry, target := c.Nodes[0], c.Nodes[1]
+	tok := userOn(t, c, entry, "previewer", "operator")
+
+	var ova bytes.Buffer
+	tw := tar.NewWriter(&ova)
+	for _, m := range []struct {
+		name string
+		body []byte
+	}{{"app.ovf", []byte(inspectOVADescriptor)}, {"disk-0.vmdk", make([]byte, 1<<20)}} {
+		if err := tw.WriteHeader(&tar.Header{Name: m.name, Mode: 0o644, Size: int64(len(m.body)), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(m.body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(t.TempDir(), "secret.ova")
+	if err := os.WriteFile(src, ova.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	preview := func(cl pb.LiteVirtClient, targetHost string) (*pb.ImportVMProgress, error) {
+		st, err := cl.ImportVM(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		if err := st.Send(&pb.ImportVMRequest{Name: "app", TargetHost: targetHost, SourcePath: src, Inspect: true, Final: true, NetMap: map[string]string{"*": "br0"}}); err != nil {
+			return nil, err
+		}
+		_ = st.CloseSend()
+		var done *pb.ImportVMProgress
+		for {
+			p, err := st.Recv()
+			if err == io.EOF {
+				return done, nil
+			}
+			if err != nil {
+				return done, err
+			}
+			if p.Phase == "done" {
+				done = p
+			}
+		}
+	}
+	for _, tc := range []struct {
+		name, targetHost string
+	}{{"direct", ""}, {"forwarded", target.Name}} {
+		t.Run(tc.name, func(t *testing.T) {
+			done, err := preview(c.bearerClient(entry, tok), tc.targetHost)
+			if status.Code(err) != codes.PermissionDenied || !strings.Contains(err.Error(), "outside the import staging root") {
+				t.Fatalf("an operator's --inspect --server-path outside the staging root: err = %v, want the staging-root refusal", err)
+			}
+			if done != nil {
+				t.Fatalf("the refused preview returned a plan: %s", done.MappedSpecJson)
+			}
+		})
+	}
+	for _, th := range []string{"", target.Name} {
+		done, err := preview(c.SelfClient(entry), th)
+		if err != nil || done == nil || done.MappedSpecJson == "" {
+			t.Fatalf("the admin's --inspect --server-path (target %q): plan %v, err %v", th, done, err)
 		}
 	}
 }

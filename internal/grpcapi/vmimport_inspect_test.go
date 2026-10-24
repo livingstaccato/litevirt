@@ -8,7 +8,11 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -165,4 +169,49 @@ func TestImportVM_InspectOVAServerPathWritesNothing(t *testing.T) {
 	}
 	wantInspectPlan(t, st.sent)
 	wantNothingImported(t, s, "win", before)
+}
+
+// The preview reads a --server-path OVA itself, so it takes the same path
+// check as the import: a real OVA outside the staging root is refused to an
+// operator, whether it calls this host or reaches it forwarded from an entry
+// node (judged by the bearer it relays), and nothing of it is described. The
+// admin control shows the file is an OVA the preview would describe.
+//
+// Mutation: resolve the path in inspectOVASource with a bare
+// filepath.EvalSymlinks (no containment) and the operator gets the plan.
+func TestImportVM_InspectOVAServerPathOutsideStagingRefused(t *testing.T) {
+	s := testServer(t)
+	src := filepath.Join(t.TempDir(), "secret.ova")
+	if err := os.WriteFile(src, inspectOVA(t, 1<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	inspect := func(ctx context.Context) ([]*pb.ImportVMProgress, error) {
+		st := &fakeImportStream{ctx: ctx, frames: []*pb.ImportVMRequest{{
+			Name: "win", SourcePath: src, Inspect: true, NetMap: map[string]string{"*": "br0"},
+		}}}
+		err := s.ImportVM(st)
+		return st.sent, err
+	}
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+	}{
+		{"direct", hostPathEngineCtx(t, s, "op", "Operator", "/")},
+		{"forwarded", forwardedImportFor(t, s, "fwdop", "Operator")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sent, err := inspect(tc.ctx)
+			if status.Code(err) != codes.PermissionDenied || !strings.Contains(err.Error(), "outside the import staging root") {
+				t.Fatalf("an operator's --inspect --server-path outside the staging root: err = %v, want the staging-root refusal", err)
+			}
+			if len(sent) != 0 {
+				t.Fatalf("the refused preview sent %+v", sent)
+			}
+		})
+	}
+	sent, err := inspect(adminCtx())
+	if err != nil {
+		t.Fatalf("the admin's --inspect --server-path: %v", err)
+	}
+	wantInspectPlan(t, sent)
 }

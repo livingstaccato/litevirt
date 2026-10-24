@@ -5121,7 +5121,11 @@ func vmHooks(vm *corrosion.VMRecord) *pb.HooksSpec {
 // accessVLANStartPreflight refuses the start of a VM with an access-port NIC
 // (network[].trunk with one VLAN) whose bridge on this host does not filter
 // VLANs (network.RunPreFlight). A spec that cannot be read is not judged here.
-
+//
+// To a gRPC caller (`lv start`) the refusal is FailedPrecondition; to the
+// reconciler it is a deferral (health.ErrStartHostUnfit), so a failover,
+// reschedule or onboot start placed here waits, retried every pass, and
+// starts by itself once the bridge filters VLANs.
 func (s *Server) accessVLANStartPreflight(ctx context.Context, vm *corrosion.VMRecord) error {
 	if vm.Spec == "" {
 		return nil
@@ -5143,7 +5147,11 @@ func (s *Server) accessVLANStartPreflight(ctx context.Context, vm *corrosion.VMR
 		checks = append(checks, network.PreFlightCheck{Bridge: bridge, AccessVLAN: v})
 	}
 	if err := s.nicPreflight(checks); err != nil {
-		return status.Errorf(codes.FailedPrecondition, "start %q on %s: %v", vm.Name, s.hostName, err)
+		return &startDeferredError{
+			err: status.Errorf(codes.FailedPrecondition, "start %q on %s: %v; it starts once the bridge filters VLANs "+
+				"(a failover, reschedule or onboot start waits here for that; otherwise `lv start %s`)", vm.Name, s.hostName, err, vm.Name),
+			kind: health.ErrStartHostUnfit,
+		}
 	}
 	return nil
 }

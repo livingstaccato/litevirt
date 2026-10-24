@@ -1771,6 +1771,13 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 	if p := s.nicMTUProblem(ctx, req.GetNicMtu()); p != "" {
 		return &pb.EnsureDisksResponse{NicMtuProblem: p}, nil
 	}
+	// An access-VLAN NIC whose bridge here does not filter VLANs: refused
+	// before anything is created here, for a live and a cold move alike.
+	if rec, gErr := corrosion.GetVM(ctx, s.db, req.VmName); gErr == nil && rec != nil {
+		if err := s.accessVLANMoveRefusal(ctx, rec); err != nil {
+			return nil, err
+		}
+	}
 	isoWarning := ""
 	var isoResolved map[string]string
 	// The domain lands here with its installer ISO; qemu on THIS host opens
@@ -3150,9 +3157,13 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 	// A runtime move of a VM with a NIC on a managed network asks which device
 	// the target serves each such network on. Best effort, like the cgroup ask.
 	wantNetDevs := runtime && s.vmHasManagedNIC(ctx, vmName)
+	// An access-VLAN NIC always asks, and the answer is not best effort: the
+	// target refuses a VM whose bridge there does not filter VLANs
+	// (accessVLANMoveRefusal), live or cold.
+	hasAccessVLAN := s.vmHasAccessVLANNIC(ctx, vmName)
 	shareOnly := runtime && (s.vmSharesWeight(ctx, vmName) > 0 || hasVNCPassword || wantNetDevs) && len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 &&
-		s.migrationNetwork == "" && !hasRBD && len(mtus) == 0
-	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 && s.migrationNetwork == "" && !shareOnly && !hasRBD && len(mtus) == 0 {
+		s.migrationNetwork == "" && !hasRBD && len(mtus) == 0 && !hasAccessVLAN
+	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 && s.migrationNetwork == "" && !shareOnly && !hasRBD && len(mtus) == 0 && !hasAccessVLAN {
 		return ensureOutcome{}, nil
 	}
 	client, closer, err := s.dialPeer(ctx, targetHost)

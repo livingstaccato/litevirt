@@ -23,17 +23,36 @@ import (
 
 const accVLANVM = "vlanvm"
 
-// accVLANBridge is one node's bridge for accVLANVM's NIC, as far as its VLAN
-// filtering goes.
+// accVLANBridge is one node's bridge for accVLANVM's NIC: whether it exists
+// there (absent: litevirt would create it, without VLAN filtering), and
+// whether it filters VLANs.
 type accVLANBridge struct {
-	mu sync.Mutex
-	on bool
+	mu     sync.Mutex
+	absent bool
+	on     bool
 }
 
 func (b *accVLANBridge) read(bridge string) (isBridge, on bool, err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return bridge == network.FlatBridgeName("accnet"), b.on, nil
+	return !b.absent && bridge == network.FlatBridgeName("accnet"), b.on, nil
+}
+
+func (b *accVLANBridge) exists(bridge string) bool {
+	isBridge, _, _ := b.read(bridge)
+	return isBridge
+}
+
+func (b *accVLANBridge) set(on bool) {
+	b.mu.Lock()
+	b.absent, b.on = false, on
+	b.mu.Unlock()
+}
+
+// wire makes b node n's bridge.
+func (b *accVLANBridge) wire(n *Node) {
+	n.Server.SetBridgeVLANFiltering(b.read)
+	n.Server.SetBridgeExists(b.exists)
 }
 
 // accVLANFleet seeds a three-node fleet in which the victim runs accVLANVM,
@@ -43,14 +62,20 @@ func (b *accVLANBridge) read(bridge string) (isBridge, on bool, err error) {
 // isolated.
 func accVLANFleet(t *testing.T, clock *VirtualClock, filteringA, filteringB bool) (c *Cluster, a, b, victim *Node) {
 	t.Helper()
+	return accVLANFleetWith(t, clock, &accVLANBridge{on: filteringA}, &accVLANBridge{on: filteringB})
+}
+
+// accVLANFleetWith is accVLANFleet with survivor a's and b's bridges given.
+func accVLANFleetWith(t *testing.T, clock *VirtualClock, brA, brB *accVLANBridge) (c *Cluster, a, b, victim *Node) {
+	t.Helper()
 	ctx := context.Background()
 	disk := filepath.Join(t.TempDir(), accVLANVM+"-root.qcow2")
 	if err := os.WriteFile(disk, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return victimFleet(t, clock, func(c *Cluster, a, b, victim *Node) {
-		for n, on := range map[*Node]bool{a: filteringA, b: filteringB, victim: true} {
-			n.Server.SetBridgeVLANFiltering((&accVLANBridge{on: on}).read)
+		for n, br := range map[*Node]*accVLANBridge{a: brA, b: brB, victim: {on: true}} {
+			br.wire(n)
 		}
 		if err := corrosion.InsertVM(ctx, a.DB, corrosion.VMRecord{Name: accVLANVM, HostName: victim.Name, State: "running",
 			CPUActual: 1, MemActual: 256,
@@ -110,32 +135,48 @@ func TestFleet_AccessVLANFailoverPassesOverAHostWhoseBridgeDoesNotFilter(t *test
 
 // Neither survivor's bridge filters VLANs: the VM is still placed on one, and
 // that host refuses its start, naming the bridge, and its domain is not
-// running.
+// running. The VM is not parked in error: it waits there, re-tried every
+// pass, and once the bridge filters VLANs it starts by itself, its access
+// VLAN on its tap before it runs (NB-3: "waits for the fix").
 //
-// Mutation: drop accessVLANStartPreflight from PrepareHardwareForStart — red
-// (the VM starts on the unfiltered bridge).
-func TestFleet_AccessVLANFailoverWithNoFilteringHostIsRefusedAtStart(t *testing.T) {
+// Mutations: drop accessVLANStartPreflight from PrepareHardwareForStart — red
+// (the VM starts on the unfiltered bridge); return the refusal as a plain
+// FailedPrecondition, not a deferral — red (the VM is in error and never
+// starts after the fix).
+func TestFleet_AccessVLANFailoverWithNoFilteringHostWaitsForTheFix(t *testing.T) {
 	ctx := context.Background()
 	clock := NewVirtualClock(time.Now().UTC())
-	c, a, b, victim := accVLANFleet(t, clock, false, false)
+	brA, brB := &accVLANBridge{}, &accVLANBridge{}
+	c, a, b, victim := accVLANFleetWith(t, clock, brA, brB)
 
 	pciFoFailOver(t, ctx, c, clock, a, b)
 	vm := vmOn(t, a, accVLANVM)
 	if vm == nil || vm.HostName == victim.Name {
 		t.Fatalf("%s on %+v; want it placed on a survivor, whose start then refuses it", accVLANVM, vm)
 	}
-	target := a
+	target, br := a, brA
 	if vm.HostName == b.Name {
-		target = b
+		target, br = b, brB
 	}
 	accVLANStart(t, ctx, target)
 	if st, _ := target.Virt.DomainState(accVLANVM); st == "running" {
 		t.Fatalf("%s started on %s, whose bridge does not filter VLANs", accVLANVM, target.Name)
 	}
 	got := vmOn(t, target, accVLANVM)
-	if got == nil || got.State != "error" || !strings.Contains(got.StateDetail, "does not filter VLANs") {
-		t.Fatalf("%s on %s after the refused start: %+v; want error naming the bridge", accVLANVM, target.Name, got)
+	if got == nil || (got.State != "pending" && got.State != "starting") || !strings.Contains(got.StateDetail, "does not filter VLANs") {
+		t.Fatalf("%s on %s after the refused start: %+v; want it waiting (pending or starting), naming the bridge", accVLANVM, target.Name, got)
 	}
+	accVLANStart(t, ctx, target)
+	if got := vmOn(t, target, accVLANVM); got == nil || got.State == "error" || got.State == "running" {
+		t.Fatalf("%s on %s after a second pass with the bridge unchanged: %+v; want it still waiting", accVLANVM, target.Name, got)
+	}
+
+	br.set(true)
+	accVLANStart(t, ctx, target)
+	if got := vmOn(t, target, accVLANVM); got == nil || got.State != "running" {
+		t.Fatalf("%s on %s once its bridge filters VLANs: %+v; want it started by the next pass", accVLANVM, target.Name, got)
+	}
+	assertVLANBeforeRun(t, target, accVLANVM, "vlan=30")
 }
 
 // assertVLANBeforeRun fails unless vm came to n paused (a start, or a
@@ -189,4 +230,23 @@ func TestFleet_AccessVLANFailoverStartPutsTheVLANOnBeforeTheGuestRuns(t *testing
 	pciFoFailOver(t, ctx, c, clock, a, b)
 	accVLANStart(t, ctx, b)
 	assertVLANBeforeRun(t, b, accVLANVM, "bridge="+network.FlatBridgeName("accnet")+" mac=52:54:00:ac:00:01 vlan=30")
+}
+
+// A survivor that has no bridge for the VM's network is passed over too
+// (NB-2): a start there would have litevirt create the bridge, without VLAN
+// filtering, and be refused. a (preferred, first by name) has none; b's
+// filters. The VM is recovered onto b and starts there.
+//
+// Mutation: do not name an absent bridge in ReconcileAccessVLANBridges — red
+// (the VM is recovered onto a).
+func TestFleet_AccessVLANFailoverPassesOverAHostWithoutTheBridge(t *testing.T) {
+	ctx := context.Background()
+	clock := NewVirtualClock(time.Now().UTC())
+	c, a, b, _ := accVLANFleetWith(t, clock, &accVLANBridge{absent: true}, &accVLANBridge{on: true})
+	pciFoFailOver(t, ctx, c, clock, a, b)
+	if vm := vmOn(t, a, accVLANVM); vm == nil || vm.HostName != b.Name {
+		t.Fatalf("%s on %+v; want it recovered onto %s, not %s, which has no bridge for it", accVLANVM, vm, b.Name, a.Name)
+	}
+	accVLANStart(t, ctx, b)
+	assertVLANBeforeRun(t, b, accVLANVM, "vlan=30")
 }

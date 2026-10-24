@@ -52,6 +52,12 @@ type Request struct {
 	// by failover for a VM with an access-VLAN NIC (bridge_vlan_filtering_off).
 	AvoidHosts map[string]string
 
+	// ExcludeHosts are hosts this workload must not be placed on (host →
+	// why): a hard rejection, named in NoEligibleHostError. Set by drain for
+	// a VM with an access-VLAN NIC (bridge_vlan_filtering_off): a move onto
+	// such a host is refused there, so it is no target.
+	ExcludeHosts map[string]string
+
 	// Soft preferences — violation = lower score but not excluded
 	PreferLabels map[string]string
 	Affinity     []string // VM names that should be on the same host
@@ -570,6 +576,9 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 
 		// Hard: USB passthrough. A raw device exists on one host; a mapped
 		// one on the hosts its mapping lists.
+		if why, ok := req.ExcludeHosts[h.Name]; ok {
+			failed = append(failed, why)
+		}
 		if req.USBHost != "" && h.Name != req.USBHost {
 			failed = append(failed, "usb device (a raw USB device is plugged into "+req.USBHost+")")
 		}

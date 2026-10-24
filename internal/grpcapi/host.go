@@ -480,11 +480,15 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	var drainJobs []drainJob
 	// failed names each VM whose frame was failed or error, with its reason.
 	var failed []string
+	vlanView := s.readAccessVLANMoveView(ctx)
 	for _, vm := range toMigrate {
 		placementReq := buildDrainPlacementRequest(vm, req.Name, s.capacity)
 		// A guarded VM drains only onto a host that enforces NIC guards
 		// until every host does (re-review m8).
 		s.requireGuardHost(ctx, &placementReq, vm.Name)
+		// An access-VLAN VM drains only onto a host whose bridge for it
+		// filters VLANs: the target refuses it otherwise.
+		vlanView.exclude(&placementReq, vm)
 
 		// Ensure the drained host is excluded via anti-affinity on itself.
 		// placement.Select() excludes non-active hosts, and we already set the host to "draining".

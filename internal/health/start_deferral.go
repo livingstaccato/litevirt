@@ -42,17 +42,27 @@ var (
 	ErrStartStorageDown error = &deferKind{"start deferred: its storage did not answer a probe", rankStorageDown}
 	// ErrStartProbeFailed: this VM's own probe did not get an answer.
 	ErrStartProbeFailed error = &deferKind{"start deferred: its storage did not answer its probe", rankProbeFailed}
+	// ErrStartHostUnfit: this host cannot run the VM as it is set up now —
+	// an access-VLAN NIC's bridge here does not filter VLANs — and an
+	// operator's fix of the host is what it waits for. The start is tried
+	// again every pass, after every VM that is not deferred, so it starts by
+	// itself once the host is fixed and never spends the walk's budget
+	// ahead of a VM that can start.
+	ErrStartHostUnfit error = &deferKind{"start deferred: this host cannot run it until the host is fixed", rankHostUnfit}
 )
 
 // The walk order of deferred starts: for time, then storage down, then a VM
 // whose own probe failed — last of the deferred, so a VM whose storage keeps
 // failing never holds the head of the walk and spends the budget the VMs on
-// healthy storage behind it need — and then every VM that was not deferred.
+// healthy storage behind it need — and then every VM that was not deferred,
+// and last a VM this host cannot run until it is fixed.
 const (
 	rankTime = iota
 	rankStorageDown
 	rankProbeFailed
 	rankNotDeferred
+	// rankHostUnfit goes after every VM not deferred (ErrStartHostUnfit).
+	rankHostUnfit
 )
 
 type deferKind struct {

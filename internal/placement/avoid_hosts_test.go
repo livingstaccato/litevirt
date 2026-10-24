@@ -2,6 +2,7 @@ package placement
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,5 +41,24 @@ func TestSelect_AvoidHostsIsPassedOverOnlyWhileAnotherQualifies(t *testing.T) {
 	res, err := SelectBatch(hosts, nil, nil, nil, nil, time.Time{}, []Request{{VMName: "v", CPUNeeded: 1, MemMiBNeeded: 512, AvoidHosts: avoidA}})
 	if err != nil || res["v"].Host != "node-b" {
 		t.Fatalf("SelectBatch with node-a avoided = %+v, %v; want node-b", res["v"], err)
+	}
+}
+
+// A host in ExcludeHosts is never chosen, even when it is the only one that
+// fits: the request then has no eligible host, and the rejection names why.
+//
+// Mutation: drop the ExcludeHosts check from scoreCandidates — red.
+func TestSelect_ExcludeHostsIsNeverChosen(t *testing.T) {
+	db := testDB(t)
+	insertHost(t, db, corrosion.HostRecord{Name: "node-a", Address: "10.0.0.1", State: "active", CPUTotal: 64, MemTotal: 262144})
+	insertHost(t, db, corrosion.HostRecord{Name: "node-b", Address: "10.0.0.2", State: "active", CPUTotal: 8, MemTotal: 16384})
+	ctx := context.Background()
+	exA := map[string]string{"node-a": "bridge br0 cannot carry an access-VLAN NIC"}
+	if h, err := Select(ctx, db, Request{VMName: "v", CPUNeeded: 1, MemMiBNeeded: 512, ExcludeHosts: exA}); err != nil || h != "node-b" {
+		t.Fatalf("Select with node-a excluded = %q, %v; want node-b", h, err)
+	}
+	_, err := Select(ctx, db, Request{VMName: "v", CPUNeeded: 1, MemMiBNeeded: 100000, ExcludeHosts: exA})
+	if err == nil || !strings.Contains(err.Error(), "access-VLAN") {
+		t.Fatalf("Select with the only fit excluded: %v; want no eligible host, naming the exclusion", err)
 	}
 }

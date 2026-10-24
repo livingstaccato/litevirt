@@ -53,25 +53,9 @@ func (v *accessVLANView) avoid(req *placement.Request, vm corrosion.VMRecord) {
 	req.AvoidHosts = accessVLANAvoidHosts(spec, v.nets, v.unfit)
 }
 
-// accessVLANAvoidHosts is, for a VM with spec, each host whose bridge cannot
-// carry one of its access-port NICs (unfit, from
-// health.AccessVLANUnfitHosts), with the reason: placement passes these over
-// while another host qualifies.
+// accessVLANAvoidHosts is health.AccessVLANHostsUnfitFor: the hosts whose
+// bridge cannot carry one of the VM's access-port NICs, which placement
+// passes over while another host qualifies.
 func accessVLANAvoidHosts(spec *pb.VMSpec, nets map[string]corrosion.NetworkRecord, unfit map[string]map[string]bool) map[string]string {
-	if len(unfit) == 0 {
-		return nil
-	}
-	var out map[string]string
-	for br := range health.AccessVLANBridges(spec, nets) {
-		for host, bridges := range unfit {
-			if !bridges[br] {
-				continue
-			}
-			if out == nil {
-				out = map[string]string{}
-			}
-			out[host] = "bridge " + br + " does not filter VLANs (" + health.CondBridgeVLANFilteringOff + ")"
-		}
-	}
-	return out
+	return health.AccessVLANHostsUnfitFor(spec, nets, unfit)
 }

@@ -27,6 +27,9 @@ func TestFleet_LiveMigrationPutsTheNICsVLANsOnTheTargetTaps(t *testing.T) {
 	for _, n := range c.Nodes {
 		setHostCapacity(t, c, n.Name, 64, 65536)
 		n.Server.SetGatewayAnnouncer(func(string, netip.Addr) (bool, error) { return false, nil })
+		// Both hosts' bridges filter VLANs: the target takes the access NIC.
+		n.Server.SetBridgeVLANFiltering(func(b string) (bool, bool, error) { return b == "vt_acc" || b == "vt_trk", true, nil })
+		n.Server.SetBridgeExists(func(b string) bool { return b == "vt_acc" || b == "vt_trk" })
 	}
 	spec := `{"name":"vmover","cpu":1,"memory_mib":512,"network":[` +
 		`{"name":"vt_trk","mac":"52:54:00:47:01:02","trunk":[100,101]},` +

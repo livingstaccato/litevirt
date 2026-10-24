@@ -110,3 +110,26 @@ func AccessVLANUnfitHosts(ctx context.Context, db *corrosion.Client) (map[string
 	}
 	return out, nil
 }
+
+// AccessVLANHostsUnfitFor is, for a VM with spec, each host whose bridge cannot
+// carry one of its access-port NICs (unfit, from AccessVLANUnfitHosts), with
+// the reason: failover passes these over while another host qualifies, and a
+// migration or drain does not move the VM onto one.
+func AccessVLANHostsUnfitFor(spec *pb.VMSpec, nets map[string]corrosion.NetworkRecord, unfit map[string]map[string]bool) map[string]string {
+	if len(unfit) == 0 {
+		return nil
+	}
+	var out map[string]string
+	for br := range AccessVLANBridges(spec, nets) {
+		for host, bridges := range unfit {
+			if !bridges[br] {
+				continue
+			}
+			if out == nil {
+				out = map[string]string{}
+			}
+			out[host] = "bridge " + br + " cannot carry an access-VLAN NIC (" + CondBridgeVLANFilteringOff + ")"
+		}
+	}
+	return out
+}

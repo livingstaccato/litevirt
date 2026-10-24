@@ -36,18 +36,26 @@ func (f *fakeBridges) set(bridge string, on bool) {
 // filter VLANs while a VM of the cluster (on any host) has an access-port NIC
 // on it — observed, then confirmed — naming the host, the bridge, the VM
 // count and the fix; it resolves once the bridge filters, and again when no
-// such VM is left. A bridge only a trunk NIC uses, and an access NIC's bridge
-// that does not exist here, raise nothing.
+// such VM is left. An access NIC's bridge that does not exist here is raised
+// too (NB-2): a start here would create it, without VLAN filtering. A bridge
+// only a trunk NIC uses, and a device that exists and is not a Linux bridge,
+// raise nothing.
 //
 // Mutations: raise for any trunk NIC (len(trunk) >= 1) — red (the trunk
-// bridge is raised); judge a bridge that does not exist here — red; drop the
-// resolve of a condition whose bridge is fine — red.
+// bridge is raised); do not judge a bridge that does not exist here — red;
+// judge a device that is not a Linux bridge — red; drop the resolve of a
+// condition whose bridge is fine — red.
 func TestReconcileAccessVLANBridges_RaisesAndResolves(t *testing.T) {
 	s := testServer(t)
 	ctx := context.Background()
 	acc, trk, absent := network.FlatBridgeName("accnet"), network.FlatBridgeName("trknet"), network.FlatBridgeName("elsewhere")
+	ovs := network.FlatBridgeName("ovsnet") // exists here, not a Linux bridge
 	br := &fakeBridges{on: map[string]bool{acc: false, trk: false}}
 	s.SetBridgeVLANFiltering(br.read)
+	s.SetBridgeExists(func(name string) bool {
+		isBridge, _, _ := br.read(name)
+		return isBridge || name == ovs
+	})
 	insertTestVMWithSpec(t, ctx, s.db, "vm-acc", "other-host", "running", seedSpecJSON(t, &pb.VMSpec{
 		Name: "vm-acc", Network: []*pb.NetworkAttachment{{Name: "accnet", Trunk: []int32{30}}},
 	}))
@@ -56,6 +64,9 @@ func TestReconcileAccessVLANBridges_RaisesAndResolves(t *testing.T) {
 	}))
 	insertTestVMWithSpec(t, ctx, s.db, "vm-absent", "other-host", "running", seedSpecJSON(t, &pb.VMSpec{
 		Name: "vm-absent", Network: []*pb.NetworkAttachment{{Name: "elsewhere", Trunk: []int32{40}}},
+	}))
+	insertTestVMWithSpec(t, ctx, s.db, "vm-ovs", "other-host", "running", seedSpecJSON(t, &pb.VMSpec{
+		Name: "vm-ovs", Network: []*pb.NetworkAttachment{{Name: "ovsnet", Trunk: []int32{50}}},
 	}))
 	cond := func(bridge string) (corrosion.HealthCondition, bool) {
 		t.Helper()
@@ -78,18 +89,25 @@ func TestReconcileAccessVLANBridges_RaisesAndResolves(t *testing.T) {
 			t.Errorf("evidence lacks %q:\n%s", want, c.Evidence)
 		}
 	}
-	for _, b := range []string{trk, absent} {
+	for _, b := range []string{trk, ovs} {
 		if c, ok := cond(b); ok {
 			t.Errorf("a condition was raised for %s: %+v", b, c)
 		}
+	}
+	if c, ok := cond(absent); !ok || c.Lifecycle != corrosion.ConditionObserved || !strings.Contains(c.Evidence, "does not exist here") ||
+		!strings.Contains(c.Evidence, "vm-absent") {
+		t.Errorf("the absent bridge %s: %+v (found %v), want observed, saying it does not exist here", absent, c, ok)
 	}
 	s.ReconcileAccessVLANBridges(ctx)
 	if c, _ := cond(acc); c.Lifecycle != corrosion.ConditionConfirmed {
 		t.Fatalf("after two passes the condition is %s, want confirmed", c.Lifecycle)
 	}
 	unfit, err := health.AccessVLANUnfitHosts(ctx, s.db)
-	if err != nil || !unfit[s.hostName][acc] || len(unfit) != 1 || len(unfit[s.hostName]) != 1 {
-		t.Fatalf("AccessVLANUnfitHosts = %v (%v), want only %s on %s", unfit, err, acc, s.hostName)
+	if err != nil || !unfit[s.hostName][acc] || !unfit[s.hostName][absent] || len(unfit) != 1 || len(unfit[s.hostName]) != 2 {
+		t.Fatalf("AccessVLANUnfitHosts = %v (%v), want %s and %s on %s", unfit, err, acc, absent, s.hostName)
+	}
+	if err := corrosion.DeleteVM(ctx, s.db, "vm-absent"); err != nil {
+		t.Fatal(err)
 	}
 
 	br.set(acc, true)

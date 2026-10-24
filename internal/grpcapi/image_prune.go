@@ -1100,7 +1100,7 @@ func (s *Server) RecreateOverlayDisk(vmName, diskName, imageName, size string) (
 	// (health/kept_rebuild.go).
 	path := s.imageStore().DiskPath(vmName, diskName)
 	if err := s.keptMissingBaseRefusal(context.Background(), keptWritesOf(true, path)); err != nil {
-		return "", &health.KeptRebuildRefusedError{Path: path, Err: err}
+		return "", &health.KeptRebuildRefusedError{Path: path, Cause: keptRefusalCause(err), Err: err}
 	}
 	release, ok := s.imagePrune.holdWithinShared(imageName, recreateHoldWait)
 	if !ok {

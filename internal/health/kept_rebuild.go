@@ -21,29 +21,66 @@ import (
 // the rebuilt disk would become its base, and the kept overlay a mix of two
 // VMs' data. The rebuild gets the kept-create check (grpcapi's
 // keptMissingBaseRefusal, kept state that cannot be read refusing too), and a
-// refusal fails the pending start retryably, so the coordinator can place the
-// VM elsewhere, and raises vm_disk_kept_base (evaluator vm_disk, subject
-// vm/<name>@<host>, warning) naming the file. It resolves once the VM has
-// left a pending, starting or error state on this host: started, stopped,
-// moved, or gone.
+// refusal fails the pending start as any failed rebuild does: a start with a
+// transfer proof is re-armed pending and retried (the coordinator may place
+// the VM elsewhere), and one without goes to error. It raises
+// vm_disk_kept_base (evaluator vm_disk, subject vm/<name>@<host>, warning)
+// naming the file and the cause, and resolves once the VM has left a
+// pending, starting or error state on this host: started, stopped, moved,
+// or gone.
 
 // CondVMDiskKeptBase is filed under DiskMissingEvaluator.
 const CondVMDiskKeptBase = "vm_disk_kept_base"
 
+// Why a rebuild was refused (KeptRebuildRefusedError.Cause).
+const (
+	// KeptRebuildOverlay: a kept overlay names the disk's path as its
+	// missing base (or whether one does cannot be told for a reason that
+	// stands, such as a directory that does not resolve).
+	KeptRebuildOverlay = "kept_overlay"
+	// KeptRebuildUnreadable: kept-disks.json, or the backing chain of a
+	// disk it names, cannot be read.
+	KeptRebuildUnreadable = "kept_state_unreadable"
+	// KeptRebuildNoAnswer: storage or the database did not answer in time.
+	KeptRebuildNoAnswer = "no_answer"
+)
+
 // KeptRebuildRefusedError is a rebuild of the disk at Path refused by the
-// kept-create check: Err says why and names the kept overlay or the kept
-// state that cannot be read.
+// kept-create check: Err says why and names the kept overlay or the file
+// that cannot be read; Cause is which (KeptRebuild*).
 type KeptRebuildRefusedError struct {
-	Path string
-	Err  error
+	Path  string
+	Cause string
+	Err   error
 }
 
 func (e *KeptRebuildRefusedError) Error() string { return e.Err.Error() }
 func (e *KeptRebuildRefusedError) Unwrap() error { return e.Err }
 
+// keptRebuildFix is what an operator can do about a rebuild refused for
+// cause on host.
+func keptRebuildFix(cause, host string) string {
+	retry := "A start with a transfer proof is retried each pass (and the VM may be placed on another host); one without " +
+		"is left in error, as any failed rebuild is. "
+	switch cause {
+	case KeptRebuildUnreadable:
+		return retry + fmt.Sprintf("The record of disks deletes kept, or a kept disk's backing chain, cannot be read on %s "+
+			"(named above): repair that file, or, once nothing needs that disk, move it away or remove its entry from "+
+			"kept-disks.json (`lv health` names it under disk_leftover)", host)
+	case KeptRebuildNoAnswer:
+		return retry + fmt.Sprintf("Storage or the database on %s did not answer while the kept disks were checked: once it "+
+			"answers, the next attempt checks again", host)
+	default:
+		return retry + fmt.Sprintf("A disk a delete kept on %s backs on this path although it is missing (the overlay is named "+
+			"above): move that overlay off this host (or `qemu-img rebase -u -b <new path>` it onto a copy of its base), or "+
+			"remove its entry from kept-disks.json once nothing needs it; kept disks are listed under disk_leftover in `lv health`", host)
+	}
+}
+
 type keptBaseEvidence struct {
 	Disk   string `json:"disk"`
 	Path   string `json:"path"`
+	Cause  string `json:"cause"`
 	Detail string `json:"detail"`
 	Fix    string `json:"fix"`
 }
@@ -56,14 +93,12 @@ func (r *Reconciler) keptRebuildRefused(ctx context.Context, vmName, diskName st
 		return false
 	}
 	ev := keptBaseEvidence{
-		Disk: diskName, Path: kr.Path,
+		Disk: diskName, Path: kr.Path, Cause: kr.Cause,
 		Detail: fmt.Sprintf("disk %s of %s was not rebuilt at %s on %s: %v", diskName, vmName, kr.Path, r.hostName, kr.Err),
-		Fix: fmt.Sprintf("the start is retried, and the VM may be placed on another host. To let it start on %s, move the kept "+
-			"overlay named above off this host (or `qemu-img rebase -u -b <new path>` it onto a copy of its base), or remove its "+
-			"entry from kept-disks.json once nothing needs it; kept disks are listed under disk_leftover in `lv health`", r.hostName),
+		Fix:    keptRebuildFix(kr.Cause, r.hostName),
 	}
-	slog.Warn("reconciler: the rebuild of a missing disk is refused at a kept overlay's missing base",
-		"vm", vmName, "disk", diskName, "path", kr.Path, "error", kr.Err)
+	slog.Warn("reconciler: the rebuild of a missing disk is refused by the kept-disk check",
+		"vm", vmName, "disk", diskName, "path", kr.Path, "cause", kr.Cause, "error", kr.Err)
 	b, merr := json.Marshal(ev)
 	if merr != nil {
 		return true
@@ -74,7 +109,13 @@ func (r *Reconciler) keptRebuildRefused(ctx context.Context, vmName, diskName st
 	if gerr != nil {
 		slog.Warn("reconciler: cannot read vm_disk_kept_base; raising it afresh", "vm", vmName, "error", gerr)
 	}
-	if !had || row.Lifecycle == corrosion.ConditionResolved {
+	open := gerr == nil && had && row.Lifecycle != corrosion.ConditionResolved
+	if open && row.Evidence == string(b) {
+		// Unchanged: a retried start refused the same way is not written
+		// again (every pass would otherwise replicate a new row).
+		return true
+	}
+	if !open {
 		row = corrosion.HealthCondition{
 			Evaluator: DiskMissingEvaluator, Code: CondVMDiskKeptBase, SubjectKind: "vm", SubjectID: subject,
 			FirstSeen: ts, ConfirmedAt: ts,

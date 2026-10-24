@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/image"
@@ -20,7 +21,7 @@ import (
 //
 // Mutation: drop the keptRebuildRefused call - no condition: red. Drop the
 // resolveKeptRebuildRefused call - the condition stays open after the start:
-// red.
+// red. Resolve whatever the VM's state - resolved while still refused: red.
 func TestStartPendingVM_AKeptRefusedRebuildRaisesVMDiskKeptBase(t *testing.T) {
 	db := testReconcilerDB(t)
 	ctx := context.Background()
@@ -72,6 +73,14 @@ func TestStartPendingVM_AKeptRefusedRebuildRaisesVMDiskKeptBase(t *testing.T) {
 		t.Fatalf("vm_disk_kept_base does not name the file and the kept overlay: %s", row.Evidence)
 	}
 
+	// A pass while the start stays refused (the VM is in error: this start
+	// carries no transfer proof) does not resolve it.
+	r.reconcile(ctx)
+	row, _, _ = corrosion.GetHealthCondition(ctx, db, DiskMissingEvaluator, CondVMDiskKeptBase, "vm", "web@host-a")
+	if row.Lifecycle == corrosion.ConditionResolved {
+		t.Fatal("vm_disk_kept_base resolved while the VM is still refused on this host")
+	}
+
 	refuse = false
 	if err := corrosion.UpdateVMState(ctx, db, "web", "pending", ""); err != nil {
 		t.Fatal(err)
@@ -86,4 +95,53 @@ func TestStartPendingVM_AKeptRefusedRebuildRaisesVMDiskKeptBase(t *testing.T) {
 	if row.Lifecycle != corrosion.ConditionResolved {
 		t.Fatalf("vm_disk_kept_base still %s after the VM started", row.Lifecycle)
 	}
+}
+
+// vm_disk_kept_base's fix names the real cause, and a refusal repeated the
+// same way is not written again (each retried pass would replicate a row).
+// Mutations: one fix text for every cause - "unreadable" or "no answer" red;
+// write on every call - "repeated" red.
+func TestKeptRebuildRefused_FixNamesTheCauseAndRepeatsAreNotWritten(t *testing.T) {
+	ctx := context.Background()
+	markers := map[string]string{
+		KeptRebuildOverlay:    "move that overlay off this host",
+		KeptRebuildUnreadable: "cannot be read on host-a",
+		KeptRebuildNoAnswer:   "did not answer while the kept disks were checked",
+	}
+	for cause, want := range markers {
+		t.Run(cause, func(t *testing.T) {
+			db := testReconcilerDB(t)
+			r := NewReconciler("host-a", t.TempDir(), db, libvirtfake.New())
+			r.keptRebuildRefused(ctx, "web", "root", &KeptRebuildRefusedError{Path: "/d/web-root.qcow2", Cause: cause, Err: errors.New("why")})
+			row, _, _ := corrosion.GetHealthCondition(ctx, db, DiskMissingEvaluator, CondVMDiskKeptBase, "vm", "web@host-a")
+			if !strings.Contains(row.Evidence, want) {
+				t.Fatalf("fix for %s does not say %q: %s", cause, want, row.Evidence)
+			}
+			for other, m := range markers {
+				if other != cause && strings.Contains(row.Evidence, m) {
+					t.Fatalf("fix for %s gives %s's advice: %s", cause, other, row.Evidence)
+				}
+			}
+		})
+	}
+	t.Run("repeated", func(t *testing.T) {
+		db := testReconcilerDB(t)
+		r := NewReconciler("host-a", t.TempDir(), db, libvirtfake.New())
+		now := time.Date(2026, 10, 24, 1, 0, 0, 0, time.UTC)
+		r.Now = func() time.Time { return now }
+		refusal := &KeptRebuildRefusedError{Path: "/d/web-root.qcow2", Cause: KeptRebuildOverlay, Err: errors.New("why")}
+		r.keptRebuildRefused(ctx, "web", "root", refusal)
+		first, _, _ := corrosion.GetHealthCondition(ctx, db, DiskMissingEvaluator, CondVMDiskKeptBase, "vm", "web@host-a")
+		now = now.Add(time.Minute)
+		r.keptRebuildRefused(ctx, "web", "root", refusal)
+		again, _, _ := corrosion.GetHealthCondition(ctx, db, DiskMissingEvaluator, CondVMDiskKeptBase, "vm", "web@host-a")
+		if again.LastSeen != first.LastSeen || again.ObserveCount != first.ObserveCount {
+			t.Fatalf("an unchanged refusal was written again: %+v then %+v", first, again)
+		}
+		r.keptRebuildRefused(ctx, "web", "root", &KeptRebuildRefusedError{Path: "/d/web-root.qcow2", Cause: KeptRebuildNoAnswer, Err: errors.New("other")})
+		changed, _, _ := corrosion.GetHealthCondition(ctx, db, DiskMissingEvaluator, CondVMDiskKeptBase, "vm", "web@host-a")
+		if changed.Evidence == first.Evidence || changed.FirstSeen != first.FirstSeen {
+			t.Fatalf("a changed refusal was not written, or lost when it began: %+v", changed)
+		}
+	})
 }

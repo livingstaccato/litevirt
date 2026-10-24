@@ -341,7 +341,8 @@ file that exists. A migration's target is checked as a create is: a cold
 copy's check-only preflight and its write, and a live copy's disk stubs, are
 refused at a kept overlay's missing base, so the move fails on the source
 before anything is copied. So is the reconciler's rebuild of a missing overlay
-disk, which fails the start retryably and raises `vm_disk_kept_base`
+disk, which fails the start as any failed rebuild does (retried when it carries
+a transfer proof, in `error` otherwise) and raises `vm_disk_kept_base`
 (docs/diagnostics.md). A create whose `<vm>-*` files in the disk directory cannot be
 listed is refused too, naming the directory. A disk only
 `kept-disks.json` names, at the path the create writes, is refused rather than

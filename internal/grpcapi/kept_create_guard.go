@@ -496,3 +496,20 @@ func (s *Server) createDiskPathOf(name string) (func(string) bool, error) {
 		return ok && disk != "" && !strings.Contains(disk, "-")
 	}, rerr
 }
+
+// keptRefusalCause is which health.KeptRebuild* cause a
+// keptMissingBaseRefusal error is: kept-disks.json or a kept chain that
+// cannot be read (keptChainsUnknownError over a KeptBackingFileError), storage
+// or the database that did not answer (anything that is not a
+// KeptBackingFileError), or a kept overlay naming the path (the rest).
+func keptRefusalCause(err error) string {
+	var kb *health.KeptBackingFileError
+	if !errors.As(err, &kb) {
+		return health.KeptRebuildNoAnswer
+	}
+	var unknown *keptChainsUnknownError
+	if errors.As(err, &unknown) {
+		return health.KeptRebuildUnreadable
+	}
+	return health.KeptRebuildOverlay
+}

@@ -463,8 +463,7 @@ func ensureBackupRoot(root string) error {
 	// Root's own real directory with the wrong mode — an earlier build left
 	// it 0777 — is narrowed in place: no session ever adopts an entry already
 	// in it (random names, exclusive mkdir), so nothing in it needs setting
-	// aside, and the earlier build's stale <tag>.scratch is swept by the next
-	// session of its disk (sweepStaleScratch).
+	// aside.
 	if fi, err := os.Lstat(root); err == nil && fi.IsDir() && fi.Mode()&fs.ModeSymlink == 0 {
 		if uid, ok := backupOwnerOf(root, fi); ok && uid == 0 {
 			if err := os.Chmod(root, backupRootMode); err != nil {
@@ -666,9 +665,8 @@ func isSessionDirName(name string) bool {
 }
 
 // sweepStaleScratch removes what crashed sessions of tag's disk left in root:
-// an earlier build's <tag>.scratch file, and the scratch file of every
-// <tag>.<16 hex> session directory but the live one, then that directory when
-// it is empty. keep is the live session's directory: the root entry that is
+// the scratch file of every <tag>.<16 hex> session directory but the live
+// one, then that directory when it is empty. keep is the live session's directory: the root entry that is
 // keep or contains it is skipped whole. A fallback session's directory is one
 // level below its root entry (<root>/<tag>.<hex>/<hex>), so an equality test
 // alone would sweep the live session. The caller holds the domain's backup job —
@@ -679,14 +677,6 @@ func sweepStaleScratch(root, tag, keep string) {
 	ents, err := os.ReadDir(root)
 	if err != nil {
 		return
-	}
-	// The earlier build's scratch of this disk, <tag>.scratch directly in the
-	// root: its own name, which it removed at every session's start.
-	legacy := filepath.Join(root, tag+".scratch")
-	if fi, err := os.Lstat(legacy); err == nil && fi.Mode().IsRegular() {
-		if os.Remove(legacy) == nil {
-			slog.Info("backup session: removed an earlier build's scratch", "path", legacy)
-		}
 	}
 	for _, e := range ents {
 		name := e.Name()

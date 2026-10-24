@@ -125,3 +125,22 @@ func TestCheckpointSweep_RetiresWhatNoScheduleUses(t *testing.T) {
 		t.Fatalf("live rows past the grace = %+v, want only web/p1 (the cluster schedule's)", rows)
 	}
 }
+
+// A vm-scoped replication schedule uses only its own VM's checkpoint, even
+// when it carries a pool_name (CreateReplicationSchedule stores the
+// request's pool_name whatever the scope); a pool-scoped one uses every VM's.
+//
+// Mutation: treat a vm-scoped row with a pool_name as a fan-out — red.
+func TestCheckpointInUse_VMScopeIgnoresPoolName(t *testing.T) {
+	vmRow := corrosion.BackupScheduleRecord{VMName: "vm1", Scope: "vm", PoolName: "fast", Repo: "dr", Type: "replication"}
+	if !checkpointInUse([]corrosion.BackupScheduleRecord{vmRow}, "vm1", "dr") {
+		t.Fatal("a vm-scoped schedule does not use its own VM's checkpoint")
+	}
+	if checkpointInUse([]corrosion.BackupScheduleRecord{vmRow}, "vm2", "dr") {
+		t.Fatal("a vm-scoped schedule with a pool_name holds another VM's checkpoint")
+	}
+	poolRow := corrosion.BackupScheduleRecord{VMName: "@pool:fast", Scope: "pool", PoolName: "fast", Repo: "dr", Type: "replication"}
+	if !checkpointInUse([]corrosion.BackupScheduleRecord{poolRow}, "vm2", "dr") {
+		t.Fatal("a pool-scoped schedule does not hold its VMs' checkpoints")
+	}
+}

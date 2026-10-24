@@ -338,16 +338,16 @@ func TestBind_FailureRestoresPreviousDriver(t *testing.T) {
 
 // ── Round 1: the host-driver record (I1) and the minor findings ──
 
-// TestHost_RecordedDriverBeatsAnOldBuildsDynamicID is review I1 scenario B. A
-// host that ran an older build keeps that build's vfio-pci new_id for the VF's
-// vendor:device, and vfio-pci registered before igbvf. A reprobe hands the VF to
+// TestHost_RecordedDriverBeatsAnOldBuildsDynamicID is review I1 scenario B.
+// vfio-pci holds a dynamic ID for the VF's vendor:device (a new_id someone
+// wrote), and vfio-pci registered before igbvf. A reprobe hands the VF to
 // vfio-pci every time, and the inventory's restore driver is "vfio-pci" (a rescan
 // saw it bound). The driver Bind recorded must be bound explicitly, which matches
 // on igbvf's own ID table whatever the probe order or dynamic IDs say.
 func TestHost_RecordedDriverBeatsAnOldBuildsDynamicID(t *testing.T) {
 	addr := "0000:01:10.0"
 	k := newKernelFS(addr, "igbvf", "igbvf", "", "vfio-pci", "igbvf")
-	k.dynids["vfio-pci "+k.id] = true // an older build's new_id
+	k.dynids["vfio-pci "+k.id] = true // a new_id someone wrote
 	defer SetFS(k)()
 	h := HostAt(recordPath(t))
 
@@ -452,8 +452,8 @@ func TestHost_OperatorVfioIDsDeviceIsLeftOnVfio(t *testing.T) {
 }
 
 // TestHost_PreBoundWithOverrideIsNotRecordedAsTheOperators: a device already on
-// vfio-pci WITH driver_override=vfio-pci was put there by an override-setter (an
-// older litevirt build), not by the operator's ids=, so Bind must not record it
+// vfio-pci WITH driver_override=vfio-pci was put there by an override-setter,
+// not by the operator's ids=, so Bind must not record it
 // as "was on vfio-pci" — that would leave it on vfio-pci forever.
 func TestHost_PreBoundWithOverrideIsNotRecordedAsTheOperators(t *testing.T) {
 	addr := "0000:01:10.0"
@@ -476,13 +476,16 @@ func TestHost_PreBoundWithOverrideIsNotRecordedAsTheOperators(t *testing.T) {
 	}
 }
 
-// TestHost_MissingRecordRemovesAnOldBuildsDynamicID is the upgrade case: the
-// device was bound by an older build, so there is no record, and that build's
-// new_id is still in vfio-pci, registered first. The reprobe lands on vfio-pci
-// with the override already cleared. The ID is not the operator's (no ids= on the
-// command line or in modprobe.d), so Unbind removes it with remove_id and
-// reprobes, and the VF reaches igbvf.
-func TestHost_MissingRecordRemovesAnOldBuildsDynamicID(t *testing.T) {
+// TestHost_MissingRecordNeverRemovesADynamicID: a device on vfio-pci with
+// driver_override=vfio-pci and no record (a record lost, or a host with no
+// data directory) whose release lands back on vfio-pci by a dynamic ID that
+// is in no config file. litevirt never adds a vfio-pci ID, so the ID is
+// someone else's choice: the release leaves the device there and never
+// writes remove_id.
+//
+// Mutation: remove the dynamic ID and reprobe when a device with no record
+// lands back on vfio-pci — red.
+func TestHost_MissingRecordNeverRemovesADynamicID(t *testing.T) {
 	addr := "0000:01:10.0"
 	k := newKernelFS(addr, "igbvf", "vfio-pci", "vfio-pci", "vfio-pci", "igbvf")
 	k.dynids["vfio-pci "+k.id] = true
@@ -492,11 +495,11 @@ func TestHost_MissingRecordRemovesAnOldBuildsDynamicID(t *testing.T) {
 	if err := HostAt(recordPath(t)).Unbind(addr, "vfio-pci"); err != nil {
 		t.Fatalf("Unbind: %v", err)
 	}
-	if k.driver() != "igbvf" {
-		t.Fatalf("driver = %q, want igbvf", k.driver())
+	if k.wrote("remove_id") || !k.dynids["vfio-pci "+k.id] {
+		t.Fatal("the release removed a vfio-pci dynamic ID litevirt never added")
 	}
-	if k.dynids["vfio-pci "+k.id] {
-		t.Fatal("the old build's vfio-pci dynamic ID is still there")
+	if k.driver() != "vfio-pci" || k.override != "" {
+		t.Fatalf("driver=%q override=%q, want vfio-pci with the override cleared", k.driver(), k.override)
 	}
 }
 
@@ -576,8 +579,8 @@ func TestBind_RollbackReportsWhereTheDeviceEnded(t *testing.T) {
 }
 
 // TestHost_ReleaseUnboundClearsAStaleOverride (review M2): an owned device that
-// is not bound but still carries driver_override=vfio-pci (an older build's
-// failed Bind) is released by the callers without an Unbind. Its override must be
+// is not bound but still carries driver_override=vfio-pci (a failed Bind) is
+// released by the callers without an Unbind. Its override must be
 // cleared and the device reprobed, or the next probe gives it to vfio-pci while
 // it is unowned.
 func TestHost_ReleaseUnboundClearsAStaleOverride(t *testing.T) {
@@ -632,8 +635,8 @@ func TestHost_ReleaseUnboundOfAVanishedDeviceReleasesIt(t *testing.T) {
 }
 
 // TestHost_NoRecordAndNoOverrideIsLeftOnVfio (re-review R1-M1): a device on
-// vfio-pci with no record and NO override was bound by ID, not by litevirt (every
-// older litevirt bind set the override). Whoever bound it — the operator's ids=
+// vfio-pci with no record and NO override was bound by ID, not by litevirt (its
+// Bind always sets the override). Whoever bound it — the operator's ids=
 // in an initramfs, or a hand-written new_id — owns that choice: the release
 // leaves it on vfio-pci and never removes the ID.
 func TestHost_NoRecordAndNoOverrideIsLeftOnVfio(t *testing.T) {
@@ -657,8 +660,7 @@ func TestHost_NoRecordAndNoOverrideIsLeftOnVfio(t *testing.T) {
 // TestHost_ARecordedDeviceNeverRemovesADynamicID (re-review R1-M1): this build
 // recorded the device (it had no driver before), so it never wrote a new_id for
 // it. A reprobe that lands on vfio-pci by a dynamic ID found someone else's
-// choice, and remove_id is reserved for an older build's device: the device
-// stays on vfio-pci.
+// choice: the device stays on vfio-pci.
 func TestHost_ARecordedDeviceNeverRemovesADynamicID(t *testing.T) {
 	addr := "0000:01:10.0"
 	k := newKernelFS(addr, "igbvf", "vfio-pci", "vfio-pci", "vfio-pci", "igbvf")
@@ -679,49 +681,11 @@ func TestHost_ARecordedDeviceNeverRemovesADynamicID(t *testing.T) {
 	}
 }
 
-// TestHost_AnOldBuildsFingerprintSurvivesAFailedUnbind (re-review R1-M1b): an
-// older build's device (no record, override vfio-pci) whose release clears the
-// override and then fails at the unbind is left on vfio-pci with no override. The
-// fingerprint must already be on disk by then: a later Bind must not take the
-// device for the operator's, and the retried release must still return it, the
-// older build's dynamic ID removed.
-func TestHost_AnOldBuildsFingerprintSurvivesAFailedUnbind(t *testing.T) {
-	addr := "0000:01:10.0"
-	k := newKernelFS(addr, "igbvf", "vfio-pci", "vfio-pci", "vfio-pci", "igbvf")
-	k.dynids["vfio-pci "+k.id] = true // the older build's new_id
-	k.files["/proc/cmdline"] = []byte("ro quiet\n")
-	k.writeErr["driver/unbind"] = syscall.EBUSY
-	defer SetFS(k)()
-	path := recordPath(t)
-	h := HostAt(path)
-
-	if err := h.Unbind(addr, ""); err == nil {
-		t.Fatal("Unbind succeeded through a failing unbind")
-	}
-	if k.override != "" || k.driver() != "vfio-pci" {
-		t.Fatalf("precondition: driver=%q override=%q, want vfio-pci with the override cleared", k.driver(), k.override)
-	}
-	if _, err := h.Bind(addr); err != nil {
-		t.Fatalf("Bind: %v", err)
-	}
-	if got := readRecord(t, path); got[addr] == "vfio-pci" {
-		t.Fatalf("record = %v: the older build's device was recorded as the operator's", got)
-	}
-
-	delete(k.writeErr, "driver/unbind")
-	if err := h.Unbind(addr, ""); err != nil {
-		t.Fatalf("retried Unbind: %v", err)
-	}
-	if k.driver() != "igbvf" || k.dynids["vfio-pci "+k.id] {
-		t.Fatalf("driver=%q dynid=%v, want igbvf and the older build's ID removed", k.driver(), k.dynids["vfio-pci "+k.id])
-	}
-}
-
 // TestHost_DriverctlPinnedDeviceIsLeftOnVfio (re-review R1-M3): driverctl pins a
 // device to vfio-pci with an override it re-applies at boot, recorded in
 // /etc/driverctl.d/pci-<addr>. That is the operator's choice: Bind records it as
 // such, and the release leaves the device on vfio-pci with driverctl's override
-// in place — with or without a record (an older build may have bound it).
+// in place — with or without a record.
 func TestHost_DriverctlPinnedDeviceIsLeftOnVfio(t *testing.T) {
 	for _, viaBind := range []bool{true, false} {
 		t.Run(map[bool]string{true: "recorded-at-bind", false: "no-record"}[viaBind], func(t *testing.T) {

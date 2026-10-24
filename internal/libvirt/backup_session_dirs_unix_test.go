@@ -518,8 +518,7 @@ func TestPrepareBackupRoots_NarrowsAnEarlierBuildsRootsAtStart(t *testing.T) {
 // Fix round 2: an earlier build's root — root's own real directory, left 0777
 // — is narrowed to 0711 in place: no aside copy, and what is in it stays. That
 // is safe because a session never adopts an existing entry (random names,
-// exclusive mkdir). The earlier build's own stale <tag>.scratch in it is then
-// swept by the next session of that disk.
+// exclusive mkdir).
 //
 // Mutations: set it aside instead — an aside copy appears, red; leave the mode
 // — red.
@@ -583,43 +582,6 @@ func TestPrepareBackupRoots_SetsAsideOnlyAnotherOwnerOrASymlink(t *testing.T) {
 		if fi, err := os.Lstat(d); err != nil || !fi.IsDir() || modeOf(t, d) != 0o711 {
 			t.Errorf("%s is not a 0711 directory afterwards: %v %v", d, fi, err)
 		}
-	}
-}
-
-// The earlier build's stale scratch of this disk, <tag>.scratch directly in the
-// root (a regular file), is swept with the crashed sessions; another disk's,
-// and a symlink at the name, are not.
-//
-// Mutation: drop the legacy-name sweep — red.
-func TestSweepStaleScratch_TakesTheEarlierBuildsScratchOfThisDisk(t *testing.T) {
-	base := t.TempDir()
-	mine, other := filepath.Join(base, "v-vda.scratch"), filepath.Join(base, "w-vda.scratch")
-	for _, p := range []string{mine, other} {
-		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	sweepStaleScratch(base, "v-vda", "")
-	if _, err := os.Lstat(mine); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("the earlier build's scratch of this disk is left: %v", err)
-	}
-	if _, err := os.Stat(other); err != nil {
-		t.Errorf("another disk's scratch was removed: %v", err)
-	}
-	base2 := t.TempDir()
-	target := filepath.Join(t.TempDir(), "t")
-	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(target, filepath.Join(base2, "v-vda.scratch")); err != nil {
-		t.Fatal(err)
-	}
-	sweepStaleScratch(base2, "v-vda", "")
-	if _, err := os.Lstat(filepath.Join(base2, "v-vda.scratch")); err != nil {
-		t.Errorf("a symlink at the legacy name was removed: %v", err)
-	}
-	if _, err := os.Stat(target); err != nil {
-		t.Errorf("a symlink's target was removed: %v", err)
 	}
 }
 

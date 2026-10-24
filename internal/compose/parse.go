@@ -3,7 +3,6 @@ package compose
 import (
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/netip"
 	"os"
@@ -588,13 +587,8 @@ func (v *validator) validate(f *File) {
 		}
 
 		// Rebalance mode: the rebalancer treats any unrecognized string as
-		// propose-only, so a typo would silently do the wrong thing. The
-		// on-demand alias is accepted and stored as dry-run, with a WARN.
+		// propose-only, so a typo would silently do the wrong thing.
 		if vm.Placement != nil && vm.Placement.Rebalance != nil {
-			if vm.Placement.Rebalance.Mode == rebalanceModeOnDemandAlias {
-				slog.Warn("compose: "+onDemandAliasWarning, "field", p+".placement.rebalance.mode")
-				vm.Placement.Rebalance.Mode = "dry-run"
-			}
 			if msg := rebalanceModeProblem(vm.Placement.Rebalance.Mode); msg != "" {
 				v.ps.add(p+".placement.rebalance.mode", msg, "")
 			}

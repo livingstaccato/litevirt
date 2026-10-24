@@ -477,7 +477,7 @@ func orphanedStackVMSchedules(ctx context.Context, c *Client, now time.Time, gra
 		`SELECT s.vm_name, s.repo, s.updated_at AS schedule_at, v.updated_at AS vm_at, v.deleted_at AS vm_deleted
 		 FROM backup_schedules s JOIN vms v ON v.name = s.vm_name
 		 WHERE s.deleted_at IS NULL AND v.deleted_at IS NOT NULL
-		   AND COALESCE(s.scope, 'vm') IN ('vm', '') AND COALESCE(s.pool_name, '') = ''
+		   AND COALESCE(s.scope, 'vm') IN ('vm', '')
 		   AND COALESCE(v.stack_name, '') != ''
 		   AND EXISTS (SELECT 1 FROM stacks st WHERE st.name = v.stack_name AND st.deleted_at IS NOT NULL)`)
 	if err != nil {

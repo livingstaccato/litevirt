@@ -1,6 +1,9 @@
 package grpcapi
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -92,6 +95,7 @@ func TestDeleteVM_PCIReleaseSucceedsOnRetry_Completes(t *testing.T) {
 		t.Fatalf("seed ownership: %v", err)
 	}
 	fs.setBound(addr)
+	recordVFIOBind(t, s, addr)
 	fs.setFailUnbind(addr)
 
 	// First delete fails on the stuck unbind (row retained, device still owned + bound).
@@ -153,5 +157,20 @@ func TestDeleteVM_PCIReleasable_Completes(t *testing.T) {
 	}
 	if fs.isBound(addr) {
 		t.Fatal("delete must vfio-unbind the released device")
+	}
+}
+
+// recordVFIOBind writes the host-driver record this build's Bind leaves for
+// addr (it had no host driver), so a device set up with setBound is released
+// as one litevirt bound: a release that fails after clearing the override
+// still knows the device is litevirt's on retry.
+func recordVFIOBind(t *testing.T, s *Server, addr string) {
+	t.Helper()
+	b, err := json.Marshal(map[string]string{addr: ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.dataDir, vfio.HostDriversFileName), b, 0o600); err != nil {
+		t.Fatal(err)
 	}
 }

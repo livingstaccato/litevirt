@@ -779,11 +779,6 @@ For the 80% case, named modes expand at parse time:
 
 Explicit `policy:` or `rebalance:` fields on the same `placement` block override the alias defaults.
 
-`rebalance.mode: on-demand` is an alias of `dry-run`: it always behaved exactly
-like it, and the two were folded into one mode. A compose file that still names
-it deploys, the VM's mode is stored as `dry-run`, and a WARN says so. Write
-`dry-run` in new files.
-
 ### Hard constraints
 
 `max-per-node` is a hard constraint: the placement engine will not place more than this many replicas of the same VM group on a single host. Use `max-per-node: 1` to ensure each replica runs on a separate host.

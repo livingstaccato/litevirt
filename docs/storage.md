@@ -373,7 +373,7 @@ or not a directory is renamed aside to `.backup-scratch.aside-<time>-<id>` (or
 `.backup-sock…`) beside it, kept with everything in it, and made afresh, with a
 warning naming both; remove the set-aside copy once you have looked at it. A
 session's directories are removed when it ends, and a crashed session's
-scratch, or an earlier release's `<vm>-<disk>.scratch`, is removed by the next
+scratch is removed by the next
 backup of the same disk; that backup's own live session is never touched.
 
 ### NFS pools after a reboot

@@ -323,8 +323,8 @@ func (s *SnapshotScheduler) dispatchPointInTimeRetries(ctx context.Context, sche
 
 // expandScope resolves a fan-out schedule to the VMs on this host it should
 // back up. It returns (vmNames, true) for pool/cluster/project scopes and
-// (nil, false) for the per-VM scope. A legacy pool row (pool_name set with no
-// explicit scope) is still treated as a pool fan-out.
+// (nil, false) for the per-VM scope. Only the scope decides: a vm-scoped
+// row's pool_name is not a fan-out target.
 func (s *SnapshotScheduler) expandScope(ctx context.Context, sched corrosion.BackupScheduleRecord) ([]string, bool) {
 	switch {
 	case sched.Scope == "cluster":
@@ -341,7 +341,7 @@ func (s *SnapshotScheduler) expandScope(ctx context.Context, sched corrosion.Bac
 			return nil, true
 		}
 		return vms, true
-	case sched.Scope == "pool" || sched.PoolName != "":
+	case sched.Scope == "pool":
 		vms, err := corrosion.VMsOnPool(ctx, s.DB, s.HostName, sched.PoolName)
 		if err != nil {
 			slog.Warn("snapshot scheduler: list pool vms", "pool", sched.PoolName, "error", err)

@@ -233,7 +233,7 @@ func (s *Server) NICStartGuard(ctx context.Context) lv.StartGuard {
 			defer cancel()
 			return false, s.ArmNICsFor(actx, name)
 		},
-		AfterPaused: func(name string) error { return s.readyGuestHere(ctx, name) },
+		AfterPaused: func(name string) error { return s.readyGuestHere(ctx, name, startingHere) },
 	}
 }
 
@@ -309,7 +309,7 @@ func (s *Server) ArmNICFirewall(ctx context.Context, req *pb.ArmNICFirewallReque
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"%s is paused for a partition (partition pause); it resumes when the partition does", req.GetVmName())
 		}
-		if err := s.readyGuestHere(ctx, req.GetVmName()); err != nil {
+		if err := s.readyGuestHere(ctx, req.GetVmName(), arrivedHere); err != nil {
 			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
 		}
 		r, ok := s.virt.(interface{ ResumeDomain(string) error })

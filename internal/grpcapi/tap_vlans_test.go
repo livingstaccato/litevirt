@@ -443,3 +443,94 @@ func TestConvergeMovedGuest_PutsTheVLANsOnARunningGuestsTaps(t *testing.T) {
 		t.Fatalf("ops = %q: want the access VLAN and the trunk on the running guest's taps", ops)
 	}
 }
+
+// R-B2: clone --start, which (like promote, replace and import) does not run
+// the start preflight, is refused at the guard when the clone's access NIC is
+// on a bridge here that does not filter VLANs.
+//
+// Mutation: drop the bridge check from applyTapVLANNICs — red.
+func TestCloneVM_AStartedCloneOnANonFilteringBridgeIsRefused(t *testing.T) {
+	s, fake := provableCreateServer(t)
+	ctx := adminCtx()
+	fake.SetStartGuard(s.NICStartGuard(context.Background()))
+	s.SetBridgeVLANFiltering(func(string) (bool, bool, error) { return true, false, nil })
+	srcDisk := s.images.DiskPath("src", "root")
+	if err := os.MkdirAll(filepath.Dir(srcDisk), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := qcow2.Create(srcDisk, 64*1024*1024, nil); err != nil {
+		t.Fatal(err)
+	}
+	specJSON, _ := json.Marshal(&pb.VMSpec{Name: "src", Cpu: 1, MemoryMib: 512,
+		Network: []*pb.NetworkAttachment{{Name: "accnet", Mac: "52:54:00:aa:06:01", Trunk: []int32{30}}}})
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "src", HostName: "test-host", State: "stopped", Spec: string(specJSON)},
+		[]corrosion.InterfaceRecord{{VMName: "src", NetworkName: "accnet", Ordinal: 0, MAC: "52:54:00:aa:06:01"}},
+		[]corrosion.DiskRecord{{VMName: "src", DiskName: "root", HostName: "test-host",
+			Path: srcDisk, SizeBytes: 64 * 1024 * 1024, StorageType: "local"}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.CloneVM(ctx, &pb.CloneVMRequest{Source: "src", Target: "clone1", Mode: "full", Start: true})
+	if err == nil || !strings.Contains(err.Error(), "does not filter VLANs") {
+		t.Fatalf("clone --start onto a non-filtering bridge: %v, want a refusal naming it", err)
+	}
+	if st, _ := fake.DomainState("clone1"); st == "running" {
+		t.Fatal("the clone runs on a bridge that does not filter VLANs")
+	}
+}
+
+// A guest that arrived here (a hand-over resumed by ArmNICFirewall) on a
+// bridge that does not filter VLANs is held unless its network allows
+// unfiltered moves; with the opt-in it runs. A start there is refused either
+// way.
+//
+// Mutation: honour the opt-in for starts too (ignore how) — red.
+func TestReadyGuestHere_TheOptInCoversArrivalsNotStarts(t *testing.T) {
+	s, fake := vlanStartServer(t)
+	ctx := adminCtx()
+	s.SetBridgeVLANFiltering(func(string) (bool, bool, error) { return true, false, nil })
+	if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{Name: "accnet", Type: "bridge",
+		Config: `{"Type":"bridge","Interface":"accnet","AllowUnfilteredAccessVLANMoves":true}`}); err != nil {
+		t.Fatal(err)
+	}
+	// Straight at the guard, as promote, clone, replace and import start a
+	// domain (they do not run the start preflight).
+	if err := fake.StartDomain("vm1"); err == nil {
+		t.Fatal("a start on a non-filtering bridge ran, the network's opt-in notwithstanding")
+	}
+	fake.SetState("vm1", libvirtfake.StatePaused)
+	fake.SetStateReason("vm1", "paused")
+	if _, err := s.ArmNICFirewall(peerCtxFor(t, s, "node-src"), &pb.ArmNICFirewallRequest{VmName: "vm1", Resume: true}); err != nil {
+		t.Fatalf("an arrival on a network that allows unfiltered moves: %v", err)
+	}
+	if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{Name: "accnet", Type: "bridge",
+		Config: `{"Type":"bridge","Interface":"accnet"}`}); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetState("vm1", libvirtfake.StatePaused)
+	if _, err := s.ArmNICFirewall(peerCtxFor(t, s, "node-src2"), &pb.ArmNICFirewallRequest{VmName: "vm1", Resume: true}); err == nil {
+		t.Fatal("an arrival on a non-filtering bridge without the opt-in was resumed")
+	}
+}
+
+// NB-R2: an access NIC whose MAC cannot be resolved refuses the start instead
+// of running unpaused on VLAN 1.
+//
+// Mutation: skip such a NIC in tapVLANNICs — red.
+func TestNICStartGuard_AnAccessNICWithNoMACRefusesTheStart(t *testing.T) {
+	s := hotplugDiskServer(t)
+	ctx := adminCtx()
+	insertTestVMWithSpec(t, ctx, s.db, "nomac", "test-host", "stopped", seedSpecJSON(t, &pb.VMSpec{
+		Name: "nomac", Cpu: 1, MemoryMib: 512, Network: []*pb.NetworkAttachment{{Name: "accnet", Trunk: []int32{30}}},
+	}))
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("nomac", libvirtfake.StateDefined)
+	fake.SetStartGuard(s.NICStartGuard(context.Background()))
+	if _, err := s.StartVM(ctx, &pb.StartVMRequest{Name: "nomac"}); err == nil || !strings.Contains(err.Error(), "MAC or bridge") {
+		t.Fatalf("StartVM with an unresolvable access NIC: %v, want a refusal", err)
+	}
+	if st, _ := fake.DomainState("nomac"); st == "running" {
+		t.Fatal("it runs")
+	}
+}

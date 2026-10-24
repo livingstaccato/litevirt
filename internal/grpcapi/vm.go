@@ -1745,7 +1745,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		for j, v := range n.Trunk {
 			vlans[j] = int(v)
 		}
-		vlanNICs = append(vlanNICs, tapVLANNIC{Bridge: nc.Bridge, MAC: nc.MAC, VLANs: vlans})
+		vlanNICs = append(vlanNICs, tapVLANNIC{Network: n.Name, Bridge: nc.Bridge, MAC: nc.MAC, VLANs: vlans})
 	}
 	defer s.notePendingTapVLANs(spec.Name, vlanNICs)()
 	// Its start is this incarnation's: the before-start hook demands this

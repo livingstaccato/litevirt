@@ -340,7 +340,7 @@ func (s *Server) resumeHeld(ctx context.Context, vm string) error {
 		}
 		return fmt.Errorf("%s is also paused for a partition (partition pause); it resumes when the partition does", vm)
 	}
-	if err := s.readyGuestHere(ctx, vm); err != nil {
+	if err := s.readyGuestHere(ctx, vm, arrivedHere); err != nil {
 		return err
 	}
 	r, ok := s.virt.(interface{ ResumeDomain(string) error })

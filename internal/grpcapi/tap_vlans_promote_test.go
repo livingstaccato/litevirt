@@ -115,3 +115,19 @@ func TestEveryPendingNICsStartAlsoRegistersItsTapVLANs(t *testing.T) {
 		t.Fatalf("found %d functions registering pending NICs, want at least createVM, clone, promote, restore and the hot attach", found)
 	}
 }
+
+// R-B2: the promoted guest's bridge here does not filter VLANs: its start is
+// refused at the guard (readyGuestHere), whatever path asked for it.
+//
+// Mutation: drop the bridge check from applyTapVLANNICs — red.
+func TestPromoteReplica_AnAccessVLANOnANonFilteringBridgeIsRefused(t *testing.T) {
+	s := testServer(t)
+	s.SetBridgeVLANFiltering(func(string) (bool, bool, error) { return true, false, nil })
+	fake, err := promoteAccessVLAN(t, s)
+	if err == nil || !strings.Contains(err.Error(), "does not filter VLANs") {
+		t.Fatalf("PromoteReplica onto a non-filtering bridge: %v, want a refusal naming it", err)
+	}
+	if st, _ := fake.DomainState("vm1-p"); st == "running" {
+		t.Fatal("the promoted guest runs on a bridge that does not filter VLANs")
+	}
+}

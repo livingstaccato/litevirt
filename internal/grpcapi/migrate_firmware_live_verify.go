@@ -358,7 +358,7 @@ func rowHost(row *corrosion.VMRecord) string {
 // recognised as the hand-over it was), the guest resumed through the one
 // exempt entry point, and any NIC hand-over record dropped.
 func (s *Server) resumeReleased(ctx context.Context, resp *pb.ReleaseLiveFirmwareTargetResponse, h fwmig.Hold, uefi bool, srcNvram string) (*pb.ReleaseLiveFirmwareTargetResponse, error) {
-	if err := s.readyGuestHere(ctx, h.VM); err != nil {
+	if err := s.readyGuestHere(ctx, h.VM, arrivedHere); err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "VM %q: its NIC firewall or NIC VLANs are not in force here, so it is not resumed: %v", h.VM, err)
 	}
 	if h.State != fwmig.HoldResuming {

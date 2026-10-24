@@ -232,7 +232,7 @@ func TestCreateVM_GoesAheadWhileKeptDisksJSONUnreadableWhenNothingCollides(t *te
 	}
 	var line string
 	for _, l := range strings.Split(log.String(), "\n") {
-		if strings.Contains(l, "the record of kept disks cannot be read; the create goes ahead") {
+		if strings.Contains(l, "goes ahead, as no disk file on this host backs on a path it writes") {
 			line = l
 		}
 	}

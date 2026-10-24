@@ -411,27 +411,29 @@ func (s *Server) createKeptWrites(spec *pb.VMSpec, cfgs map[int]storage.Config) 
 	return w
 }
 
-// keptCollisionOnDisk judges a create, clone, disk attach or restore to a
-// named target that clears nothing while the registry or a chain in it
-// cannot be read (rerr), from the disk files on this host
-// (keptCollisionScan): one that writes a path a file there backs on, or one
-// already there, is refused, as what a delete kept cannot be told apart. Any
-// other goes ahead, with a warning naming the registry. A scan that cannot
-// complete refuses whatever it writes (keptChainsUnknownError): what is safe
-// is then unknown. Retryable only when storage or the database did not
-// answer.
+// keptCollisionOnDisk judges a write of new disk files on this host's own
+// storage that clears nothing (an import, a create, a clone, a disk attach, a
+// volume move, a restore to a named target, a migration onto this host or a
+// failover rebuild) while the registry or a chain in it cannot be read
+// (rerr), from the disk files on this host (keptCollisionScan): one that
+// writes a path a file there backs on, or one already there, is refused, as
+// what a delete kept cannot be told apart. Any other goes ahead, with a
+// warning naming the registry. A scan that cannot complete refuses whatever
+// it writes (keptChainsUnknownError): what is safe is then unknown.
+// Retryable only when storage or the database did not answer.
 func (s *Server) keptCollisionOnDisk(ctx context.Context, rerr error, writes *keptWrites, registry string) error {
 	hit, err := s.keptCollisionScan(ctx, writes)
 	if err != nil {
 		transient := keptRegistryTransient(rerr) || storage.IsFSNoAnswer(err) || errors.Is(err, errKeptScanPoolsUnread)
-		return &keptChainsUnknownError{keptChainsRefusal(fmt.Sprintf("whether a disk a delete kept backs on a path the create writes "+
-			"cannot be told: %v, and %v; nothing was created", rerr, err), transient)}
+		return &keptChainsUnknownError{keptChainsRefusal(fmt.Sprintf("whether a disk a delete kept backs on a path it writes "+
+			"cannot be told: %v, and %v; nothing was written", rerr, err), transient)}
 	}
 	if hit != "" {
 		return health.NewKeptBackingFileError(fmt.Sprintf("%s, and %v; whether that is a disk a delete kept cannot be told, "+
-			"so nothing was created (or place the VM on another host)", hit, rerr))
+			"so nothing was written (or place the disk on another host)", hit, rerr))
 	}
-	slog.Warn("create: the record of kept disks cannot be read; the create goes ahead, as no disk file on this host backs on a path it writes. "+
+	slog.Warn("kept-disk check: the record of kept disks cannot be read; a write of a new disk file (a create, clone, disk attach, volume move, "+
+		"restore, migration or rebuild) goes ahead, as no disk file on this host backs on a path it writes. "+
 		"Fix the record so that what deletes kept is judged by it again", "file", registry, "error", rerr)
 	return nil
 }
@@ -446,7 +448,7 @@ var errKeptScanPoolsUnread = errors.New("this host's storage pools cannot be rea
 // host keeps VM disks in (keptScanDirs), each file a kept-disk note names,
 // and each kept-disks.json entry of this host still held in memory. The walk
 // follows no symlink below a directory it lists. It returns how the first
-// file that is, or backs on, a path the create writes (writes, compared as
+// file that is, or backs on, a path in writes (compared as
 // the missing-base check compares: each side with its directory resolved
 // through symlinks) collides, or "" when none does; a directory, a pool row
 // or a chain that cannot be read, or a path whose comparison cannot be told,
@@ -546,22 +548,22 @@ func (s *Server) keptCollisionScan(ctx context.Context, writes *keptWrites) (str
 			hit, err := hits(l)
 			switch {
 			case err != nil:
-				return "", fmt.Errorf("whether the create writes %s, which %s on this host is or backs on, cannot be told (%w)", l, p, err)
+				return "", fmt.Errorf("whether it writes %s, which %s on this host is or backs on, cannot be told (%w)", l, p, err)
 			case !hit:
 			case i == 0:
-				return fmt.Sprintf("the create writes %s, which is on this host already", l), nil
+				return fmt.Sprintf("it writes %s, which is on this host already", l), nil
 			default:
-				return fmt.Sprintf("the create writes %s, which %s on this host backs on", l, p), nil
+				return fmt.Sprintf("it writes %s, which %s on this host backs on", l, p), nil
 			}
 		}
 		if w.missing != "" {
 			hit, err := hits(w.missing)
 			if err != nil {
-				return "", fmt.Errorf("whether the create writes %s, which %s on this host backs on although it is missing, cannot be told (%w)",
+				return "", fmt.Errorf("whether it writes %s, which %s on this host backs on although it is missing, cannot be told (%w)",
 					w.missing, p, err)
 			}
 			if hit {
-				return fmt.Sprintf("the create writes %s, which %s on this host backs on although it is missing", w.missing, p), nil
+				return fmt.Sprintf("it writes %s, which %s on this host backs on although it is missing", w.missing, p), nil
 			}
 		}
 	}

@@ -296,8 +296,9 @@ func (s *Server) judgeKeptDisks(ctx context.Context) {
 	var left []diskKeptRecord
 	records, unreadable := s.diskKeptRecords()
 	// While the record or a kept chain cannot be read, each import, create,
-	// clone, disk attach or restore to a named target that writes a local
-	// disk file is judged by the disk files on this host
+	// clone, disk attach, volume move, restore to a named target, migration
+	// onto this host or failover rebuild that writes a local disk file is
+	// judged by the disk files on this host
 	// (keptCollisionOnDisk), and every one is held when those cannot all be
 	// read either: named here, not only in each refusal. Storage that does
 	// not answer is left to the conditions about it.
@@ -393,11 +394,14 @@ func (s *Server) judgeKeptDisks(ctx context.Context) {
 		evidence["creates_refused"] = fmt.Sprintf("%s, and %v. Until both read, these are refused on %s, whatever their names: every import; "+
 			"every VM create or clone that writes a disk file on the host's own storage (one with no disk file, or with every disk "+
 			"on shared nfs, ceph or iscsi storage outside the disk directory, goes ahead); every disk attach that creates a disk; "+
-			"and every backup restore-from or restore-live to a --target-path. What a kept overlay backs on is unknown, and a new disk there could become its base",
+			"every volume move (move-volume, stack migrate-volumes) into a pool on the host's own storage; every backup restore-from or "+
+			"restore-live to a --target-path; every migration onto the host that copies a host-local disk; and every failover rebuild "+
+			"of a missing overlay disk there. What a kept overlay backs on is unknown, and a new disk there could become its base",
 			createsRefused, scanErr, s.hostName)
 	case createsRefused != "":
-		evidence["creates_refused"] = fmt.Sprintf("%s. Until it reads, an import, a VM create or clone, a disk attach that creates a disk, or a "+
-			"backup restore-from or restore-live to a --target-path on %s that writes a disk file on the host's own storage is refused when a "+
+		evidence["creates_refused"] = fmt.Sprintf("%s. Until it reads, an import, a VM create or clone, a disk attach that creates a disk, a volume move "+
+			"(move-volume, stack migrate-volumes), a backup restore-from or restore-live to a --target-path, a migration onto the host "+
+			"or a failover rebuild of a missing overlay disk on %s that writes a disk file on the host's own storage is refused when a "+
 			"disk file there is, or backs on, a path it writes, and so is a create that clears a file an earlier VM of its name left, or an "+
 			"import onto a file already in its pool: either may be a disk a delete kept. Any other goes ahead, with a warning",
 			createsRefused, s.hostName)

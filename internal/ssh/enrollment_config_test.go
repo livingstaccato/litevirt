@@ -63,12 +63,16 @@ func enrollmentResolverDescendantBoundary(t *testing.T, closedPipes bool) {
 	t.Helper()
 	dir := t.TempDir()
 	pidPath := filepath.Join(dir, "child")
+	readyPath := filepath.Join(dir, "child-ready")
 	allow := filepath.Join(dir, "parent-exit")
 	child := "/bin/sleep 30 &"
 	if closedPipes {
 		child = "/bin/sleep 30 </dev/null >/dev/null 2>&1 &"
 	}
-	script := "#!/bin/sh\n" + child + "\nprintf '%s' $! > " + ShellQuote(pidPath) + "\nwhile [ ! -f " + ShellQuote(allow) + " ]; do /bin/sleep .01; done\nprintf configuration\nexit 0\n"
+	// Publish readiness only after printf has completed successfully. Opening
+	// pidPath itself exposes an empty file before its bytes are written; that
+	// is not a complete PID, nor may a valid-looking prefix pin a wrong child.
+	script := "#!/bin/sh\n" + child + "\nprintf '%s' $! > " + ShellQuote(pidPath) + " && : > " + ShellQuote(readyPath) + "\nwhile [ ! -f " + ShellQuote(allow) + " ]; do /bin/sleep .01; done\nprintf configuration\nexit 0\n"
 	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -133,8 +137,14 @@ func enrollmentResolverDescendantBoundary(t *testing.T, closedPipes bool) {
 	}()
 	deadline := time.Now().Add(time.Second)
 	for {
-		body, err := os.ReadFile(pidPath)
+		_, err := os.Stat(readyPath)
 		if err == nil {
+			body, err := os.ReadFile(pidPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// A published malformed PID still fails immediately; only the
+			// causal readiness marker is polled, never incomplete PID bytes.
 			pid, err := strconv.Atoi(string(body))
 			if err != nil || pid <= 1 {
 				t.Fatalf("invalid original child PID %q", body)

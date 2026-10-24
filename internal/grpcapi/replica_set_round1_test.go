@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/google/uuid"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,11 +21,6 @@ import (
 
 // setPromoteVMRows is setPromoteVM with the VM's other disk rows given (root
 // is added, at vda on a dead host).
-// testVMUUID is a uuid for a test VM of name, the same for every call.
-func testVMUUID(name string) string {
-	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("litevirt-test-vm/"+name)).String()
-}
-
 func setPromoteVMRows(t *testing.T, s *Server, vm string, others []corrosion.DiskRecord) string {
 	t.Helper()
 	s.virt = libvirtfake.New()

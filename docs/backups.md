@@ -983,8 +983,12 @@ that failed at its commit) stays until a promotion of the name there drops
 it, and is never reused without the uuid match and the definition naming the
 file. A promote marker counts as evidence that a domain running under the
 name is an earlier attempt of the promotion only when it names that VM's
-uuid (for a renamed promotion, the running domain's); when either side
-names none, the promotion is refused and nothing is changed. A record
+uuid (for a renamed promotion, the running domain's). A marker an earlier
+build wrote names no uuid; for a promotion in place it counts when the
+running domain's uuid is the VM's. Otherwise, when either side names none,
+the promotion is refused and nothing is changed; stopping the domain and
+retrying rebuilds it from the replica and discards everything its guest
+wrote since the promotion started. A record
 of no promotion in progress, or of another VM of the name, is dropped; a file
 it named that no VM uses and no delete kept is left alone, never reused nor
 removed, and a `vm.disk.left` event of the VM names it, as one built from

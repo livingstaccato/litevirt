@@ -912,9 +912,12 @@ func (s *Server) removePromoteMarker(name string) { _ = os.Remove(s.promoteMarke
 // when the marker is the only evidence (decide; otherwise its answer is not
 // used): the marker names the uuid of the VM promoted in place, or, for a
 // renamed promotion, which mints its uuid on every attempt, the uuid of the
-// running domain. A marker of another uuid is not ours. One that names no
-// uuid (an earlier build's), a VM with none (a plain import), or a marker or
-// domain that cannot be read cannot be told either way: the promotion is
+// running domain. A marker of another uuid is not ours. A marker that names
+// no uuid (an earlier build's, left by a daemon restarted for an upgrade
+// mid-promotion) is ours for a promotion in place when the running domain's
+// uuid is the VM's (the promotion's define stamps it there), both set. Any
+// other marker naming no uuid, a VM with none (a plain import), or a marker
+// or domain that cannot be read cannot be told either way: the promotion is
 // refused and nothing is changed, never a stranger adopted nor our own
 // running promotion replaced.
 func (s *Server) promoteMarkerIsOurs(target, vmUUID string, renamed, decide bool) (bool, error) {
@@ -930,20 +933,37 @@ func (s *Server) promoteMarkerIsOurs(target, vmUUID string, renamed, decide bool
 			"promote of %s: a domain of the name runs on %s and this host's promote marker of it cannot be read (%v), so whether it is an earlier attempt of this promotion cannot be told; nothing was changed, retry",
 			target, s.hostName, err)
 	}
-	want := vmUUID
-	if renamed {
+	domainUUID := func() (string, error) {
 		x, xerr := s.virt.DumpXML(target)
 		if xerr != nil {
-			return false, status.Errorf(codes.Unavailable,
+			return "", status.Errorf(codes.Unavailable,
 				"promote of %s: a domain of the name runs on %s and its definition cannot be read (%v), so whether it is an earlier attempt of this promotion cannot be told; nothing was changed, retry",
 				target, s.hostName, xerr)
 		}
-		want = domainUUIDFromXML(x)
+		return domainUUIDFromXML(x), nil
+	}
+	want := vmUUID
+	if renamed {
+		du, derr := domainUUID()
+		if derr != nil {
+			return false, derr
+		}
+		want = du
+	} else if mu == "" && vmUUID != "" {
+		// An earlier build's marker: the running domain's own uuid tells.
+		du, derr := domainUUID()
+		if derr != nil {
+			return false, derr
+		}
+		if du != "" && du == vmUUID {
+			return true, nil
+		}
 	}
 	if mu == "" || want == "" {
 		return false, status.Errorf(codes.FailedPrecondition,
 			"promote of %s: a domain of the name runs on %s and this host's promote marker says an earlier promotion started it, but which VM it was promoted for cannot be told (no uuid); nothing was changed. "+
-				"If it is this VM, stop it (`virsh destroy %s` on %s) and retry; otherwise stop it before promoting",
+				"If it is this VM, stopping it (`virsh destroy %s` on %s) and retrying rebuilds it from the replica and DISCARDS everything the guest wrote since the promotion started; "+
+				"otherwise stop it before promoting",
 			target, s.hostName, target, s.hostName)
 	}
 	return mu == want, nil
@@ -1347,7 +1367,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		if why != "" {
 			return status.Errorf(codes.FailedPrecondition,
 				"promote of %s to %s: the domain an earlier attempt started %s, so it is not this promotion's to adopt; "+
-					"stop and remove it on %s (`virsh destroy %s`, then `virsh undefine %s`), or retry with another --new-name; nothing was changed",
+					"stop and remove it on %s (`virsh destroy %s`, then `virsh undefine %s`, which DISCARDS everything its guest wrote since the promotion started), or retry with another --new-name; nothing was changed",
 				vm.Name, targetName, why, s.hostName, targetName, targetName)
 		}
 		spec.Uuid = du
@@ -1536,7 +1556,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		if livePath == "" {
 			return status.Errorf(codes.FailedPrecondition,
 				"promote of %s: the domain %s an earlier attempt started on %s runs from no live disk built from %s; nothing was changed. "+
-					"Retry with the replica it runs from (`lv replication promote %s --replica <file>`), or stop it (`virsh destroy %s` on %s) and retry",
+					"Retry with the replica it runs from (`lv replication promote %s --replica <file>`), or stop it (`virsh destroy %s` on %s) and retry, which rebuilds it from the replica and DISCARDS everything the guest wrote since the promotion started",
 				vm.Name, targetName, s.hostName, replica, vm.Name, targetName, s.hostName)
 		}
 	} else {

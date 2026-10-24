@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -19,6 +20,11 @@ import (
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
+
+// testVMUUID is a uuid for a test VM of name, the same for every call.
+func testVMUUID(name string) string {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("litevirt-test-vm/"+name)).String()
+}
 
 // incarnateDB replaces db's rows with a VM db of uuid on dead-host.
 func incarnateDB(t *testing.T, s *Server, uuid string) {
@@ -375,6 +381,9 @@ func TestDeleteVM_TheClearLeavesARunningPromotionsRecords(t *testing.T) {
 //
 // Mutation "presence is enough" (promoteMarkerIsOurs returns the marker's
 // presence) — red.
+// Mutation NB-5a (no domain-uuid fallback for a marker naming none) — red:
+// "the domain is the VM's". Mutation NB-5b (the fallback takes any domain:
+// no uuid comparison) — red: "the domain is another's".
 func TestPromote_TheMarkerCountsOnlyForItsUUID(t *testing.T) {
 	const vmU, otherU = "aaaaaaaa-0000-0000-0000-0000000000c1", "aaaaaaaa-0000-0000-0000-0000000000c2"
 	cases := []struct {
@@ -386,7 +395,12 @@ func TestPromote_TheMarkerCountsOnlyForItsUUID(t *testing.T) {
 	}{
 		{name: "in place, its uuid", markerU: vmU, vmUUID: vmU, want: true},
 		{name: "in place, another uuid", markerU: otherU, vmUUID: vmU},
-		{name: "in place, marker names none", markerU: "", vmUUID: vmU, wantCode: codes.FailedPrecondition},
+		// NB-5: an earlier build's marker names no uuid; in place, the
+		// running domain's own uuid tells.
+		{name: "in place, marker names none, the domain is the VM's", markerU: "", vmUUID: vmU, want: true},
+		{name: "in place, marker names none, the domain is another's", markerU: "", vmUUID: otherU, wantCode: codes.FailedPrecondition},
+		{name: "in place, marker names none, VM has none", markerU: "", vmUUID: "", wantCode: codes.FailedPrecondition},
+		{name: "renamed, marker names none", markerU: "", vmUUID: "minted-now", renamed: true, wantCode: codes.FailedPrecondition},
 		{name: "in place, VM has none", markerU: vmU, vmUUID: "", wantCode: codes.FailedPrecondition},
 		{name: "renamed, the domain's uuid", markerU: vmU, vmUUID: "minted-now", renamed: true, want: true},
 		{name: "renamed, another uuid", markerU: otherU, vmUUID: "minted-now", renamed: true},
@@ -447,4 +461,73 @@ func TestPromote_AStaleMarkerOfAnotherVMAdoptsNoRunningDomain(t *testing.T) {
 	if running, _ := f.DomainIsActive("db"); !running {
 		t.Error("the refusal stopped the running domain")
 	}
+}
+
+// NB-5: a daemon restarted for an upgrade between a promotion's start and
+// its commit leaves an earlier build's marker, which names no uuid. The new
+// build's retry adopts the running domain when the domain's uuid is the
+// VM's: the guest keeps running, nothing is rebuilt, and the row names the
+// disk it runs from. A running domain of another uuid is still refused, and
+// the refusal says that destroying it discards what its guest wrote.
+//
+// Mutation NB-5a (no domain-uuid fallback) — red ("the VM's domain").
+// Mutation NB-5b (no uuid comparison in the fallback) — red ("another's").
+func TestPromote_AnEarlierBuildsMarkerAdoptsOnlyTheVMsOwnDomain(t *testing.T) {
+	run := func(t *testing.T, domainUUID string) (*Server, *libvirtfake.Fake, string, error) {
+		t.Helper()
+		s := testServer(t)
+		poolDir := setPromoteVMRows(t, s, "db", nil)
+		seedReplica(t, poolDir, "", "db", "root", "20260101-000000", "raw", 1<<20)
+		f := s.virt.(*libvirtfake.Fake)
+		disk := adoptablePromotedDisk(t, s, "dr", "db")
+		if err := f.DefineDomain("<domain type='kvm'><name>db</name><uuid>" + domainUUID + "</uuid><devices>" +
+			disk + "</devices></domain>"); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.StartDomain("db"); err != nil {
+			t.Fatal(err)
+		}
+		// An earlier build's marker: the proof alone.
+		if err := os.MkdirAll(filepath.Dir(s.promoteMarkerPath("db")), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(s.promoteMarkerPath("db"), []byte("proof-of-the-earlier-build"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		err := s.PromoteReplica(&pb.PromoteReplicaRequest{VmName: "db", TargetPool: "dr", Force: true, NoLocalize: true},
+			&streamRecorder[pb.PromoteReplicaProgress]{ctx: adminCtx()})
+		return s, f, poolDir, err
+	}
+	t.Run("the VM's domain", func(t *testing.T) {
+		s, f, poolDir, err := run(t, testVMUUID("db"))
+		if err != nil {
+			t.Fatalf("the retry across the upgrade: %v", err)
+		}
+		files := promotedFiles(t, poolDir, "db")
+		root := diskRowsOf(t, s, "db")["root"]
+		if len(files) != 1 || root.Path != files[0] || root.HostName != s.hostName {
+			t.Errorf("root row = %+v, pool holds %v: want the disk the running domain runs from, nothing rebuilt", root, files)
+		}
+		if b, _ := os.ReadFile(files[0]); string(b) != "the live disk the adopted domain runs from" {
+			t.Errorf("the running domain's disk was rebuilt: %q", b)
+		}
+		if running, _ := f.DomainIsActive("db"); !running {
+			t.Error("the adopted domain does not run")
+		}
+	})
+	t.Run("another's domain", func(t *testing.T) {
+		s, f, _, err := run(t, "aaaaaaaa-0000-0000-0000-0000000000e7")
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("promotion = %v, want FailedPrecondition", err)
+		}
+		if !strings.Contains(err.Error(), "DISCARDS everything the guest wrote") {
+			t.Errorf("the refusal does not say destroying discards the guest's writes: %v", err)
+		}
+		if root := diskRowsOf(t, s, "db")["root"]; root.HostName == s.hostName {
+			t.Errorf("root row = %+v after the refusal, want it unchanged", root)
+		}
+		if running, _ := f.DomainIsActive("db"); !running {
+			t.Error("the refusal stopped the running domain")
+		}
+	})
 }

@@ -227,25 +227,125 @@ func TestConvergeTapVLANs_ReappliesEveryRunningGuest(t *testing.T) {
 	}
 }
 
-// The start paths and the resumes of a guest that came here from elsewhere
-// cannot miss the tap VLANs, by construction:
+// libvirtResumers is every exported libvirt.Client method that can let a paused
+// guest run (its body reaches DomainResume), other than through the start
+// guard (a method that asks c.guard: StartDomain, a snapshot revert or
+// restore). Derived from internal/libvirt's source, so a new one appears here
+// by itself.
+func libvirtResumers(t *testing.T) map[string]bool {
+	t.Helper()
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, filepath.Join("..", "libvirt"), func(fi os.FileInfo) bool { return !strings.HasSuffix(fi.Name(), "_test.go") }, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := map[string]map[string]bool{}
+	methods := map[string]bool{}
+	for _, pkg := range pkgs {
+		for _, f := range pkg.Files {
+			for _, d := range f.Decls {
+				fd, ok := d.(*ast.FuncDecl)
+				if !ok || fd.Body == nil {
+					continue
+				}
+				name := fd.Name.Name
+				if fd.Recv != nil {
+					st, ok := fd.Recv.List[0].Type.(*ast.StarExpr)
+					if id, ok2 := func() (*ast.Ident, bool) {
+						if !ok {
+							return nil, false
+						}
+						id, ok := st.X.(*ast.Ident)
+						return id, ok
+					}(); ok2 && id.Name == "Client" {
+						name = "Client." + name
+						if fd.Name.IsExported() {
+							methods[name] = true
+						}
+					}
+				}
+				m := calls[name]
+				if m == nil {
+					m = map[string]bool{}
+					calls[name] = m
+				}
+				ast.Inspect(fd.Body, func(n ast.Node) bool {
+					if c, ok := n.(*ast.CallExpr); ok {
+						switch fn := c.Fun.(type) {
+						case *ast.SelectorExpr:
+							m[fn.Sel.Name] = true
+						case *ast.Ident:
+							m[fn.Name] = true
+						}
+					}
+					return true
+				})
+			}
+		}
+	}
+	var reaches func(fn string, seen map[string]bool) bool
+	reaches = func(fn string, seen map[string]bool) bool {
+		if seen[fn] {
+			return false
+		}
+		seen[fn] = true
+		for c := range calls[fn] {
+			if c == "DomainResume" || reaches(c, seen) || reaches("Client."+c, seen) {
+				return true
+			}
+		}
+		return false
+	}
+	out := map[string]bool{}
+	for m := range methods {
+		if calls[m]["guard"] {
+			continue // through the start guard
+		}
+		if reaches(m, map[string]bool{}) {
+			out[strings.TrimPrefix(m, "Client.")] = true
+		}
+	}
+	return out
+}
+
+// The resumes of a guest cannot miss its tap VLANs, by construction:
 //
-//   - in this package, every function that resumes a domain (ResumeDomain,
-//     ResumeFirmwareMoveTarget) calls readyGuestHere before it;
-//   - nothing outside internal/libvirt, its fake and this package resumes a
-//     domain at all, so a resume elsewhere has to come through here.
+//   - every libvirt.Client method that can let a paused guest run outside the
+//     start guard (libvirtResumers, derived from the source) is classified
+//     here, as a resume of a guest that may have new taps (moved) or one of
+//     a guest that never left its taps (sameTaps, with the reason). A new
+//     such method fails here until it is classified;
+//   - in this package, every function calling a moved-guest resumer calls
+//     readyGuestHere before it;
+//   - nothing outside internal/libvirt, its fake and this package calls one.
 //
 // Starts need no list: libvirt.Client starts a domain only through its start
 // guard (TestEveryDomainStartGoesThroughTheStartGuard in internal/libvirt),
-// which is NICStartGuard. A new resume path that skips readyGuestHere fails
-// here; one that is a resume of a guest that never left this host (its taps
-// unchanged) goes in sameTapResumes with the reason.
+// which is NICStartGuard.
 //
-// Mutation: delete the readyGuestHere call from resumeHeld — red.
+// Mutations: delete the readyGuestHere call from resumeHeld — red; a new
+// resuming Client method — red until classified.
 func TestResumesOfAMovedGuestGoThroughReadyGuestHere(t *testing.T) {
-	resumes := map[string]bool{"ResumeDomain": true, "ResumeFirmwareMoveTarget": true}
-	// A resume of a guest whose taps did not change: none in this package.
-	sameTapResumes := map[string]string{}
+	moved := map[string]bool{"ResumeDomain": true, "ResumeFirmwareMoveTarget": true}
+	sameTaps := map[string]string{
+		"CreateLiveSnapshot":                  "pauses and resumes the guest it snapshots, on its own taps",
+		"MigrateToTarget":                     "resumes only the source guest after a failed move; the target's arrival is the paused hand-over's (armMigrationTarget)",
+		"ResumeFirmwareMoveSource":            "the source's own guest, which never left",
+		"ResumeFirmwareMoveSourceForOperator": "the source's own guest, which never left",
+		"ResumePartitionPaused":               "the guest partition pause paused here, which never left",
+	}
+	for m := range libvirtResumers(t) {
+		if !moved[m] && sameTaps[m] == "" {
+			t.Errorf("libvirt.Client.%s can let a paused guest run and is not classified: a moved guest's resume "+
+				"(add it to moved, and call readyGuestHere before it) or a same-taps one (sameTaps, with why)", m)
+		}
+	}
+	for m := range moved {
+		if !libvirtResumers(t)[m] {
+			t.Errorf("libvirt.Client.%s no longer resumes a guest: the classification is out of date", m)
+		}
+	}
+
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool { return !strings.HasSuffix(fi.Name(), "_test.go") }, 0)
 	if err != nil {
@@ -273,7 +373,7 @@ func TestResumesOfAMovedGuestGoThroughReadyGuestHere(t *testing.T) {
 					switch {
 					case sel.Sel.Name == "readyGuestHere" && readyAt == token.NoPos:
 						readyAt = call.Pos()
-					case resumes[sel.Sel.Name]:
+					case moved[sel.Sel.Name]:
 						resumeAt = append(resumeAt, call.Pos())
 					}
 					return true
@@ -282,9 +382,6 @@ func TestResumesOfAMovedGuestGoThroughReadyGuestHere(t *testing.T) {
 					continue
 				}
 				found++
-				if _, ok := sameTapResumes[fd.Name.Name]; ok {
-					continue
-				}
 				for _, at := range resumeAt {
 					if readyAt == token.NoPos || readyAt > at {
 						t.Errorf("%s: %s resumes a domain at %s without readyGuestHere before it: its NICs' VLANs "+
@@ -298,7 +395,7 @@ func TestResumesOfAMovedGuestGoThroughReadyGuestHere(t *testing.T) {
 		t.Fatalf("found %d resuming functions, want at least resumeHeld, ArmNICFirewall, resumeReleased and releaseAdoptedHold: the scan is broken", found)
 	}
 
-	// No resume outside the packages that own it.
+	// No moved-guest resume outside the packages that own it.
 	root := filepath.Join("..", "..")
 	allowed := []string{
 		filepath.Join("internal", "libvirt") + string(filepath.Separator),
@@ -320,16 +417,71 @@ func TestResumesOfAMovedGuestGoThroughReadyGuestHere(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			for _, m := range []string{".ResumeDomain(", ".ResumeFirmwareMoveTarget(", ".DomainResume("} {
-				if strings.Contains(string(src), m) {
-					t.Errorf("%s calls %s: a resume outside internal/grpcapi skips readyGuestHere (the guest's tap VLANs)", rel, strings.Trim(m, ".("))
+			for m := range moved {
+				if strings.Contains(string(src), "."+m+"(") {
+					t.Errorf("%s calls %s: a resume outside internal/grpcapi skips readyGuestHere (the guest's tap VLANs)", rel, m)
 				}
+			}
+			if strings.Contains(string(src), ".DomainResume(") {
+				t.Errorf("%s calls DomainResume: a resume outside internal/libvirt skips the guard and readyGuestHere", rel)
 			}
 			return nil
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// A live migration lands a guest on new taps: every call of MigrateToTarget in
+// this package is preceded by armMigrationTarget, whose paused hand-over is
+// what puts a VLAN guest's VLANs on before it runs there. drainLiveMigrate
+// takes its parameters from a caller that armed; each of its callers must.
+// Outside this package, only the health check's fallback migrates, and it
+// refuses a VM with a trunk NIC (TestVMChecker_MigrateFallbackRefusesATrunkVM).
+//
+// Mutation: drop armMigrationTarget from drainOneVM — red.
+func TestEveryLiveMigrationIsArmed(t *testing.T) {
+	wrappers := map[string]bool{"drainLiveMigrate": true}
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool { return !strings.HasSuffix(fi.Name(), "_test.go") }, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := 0
+	for _, pkg := range pkgs {
+		for _, f := range pkg.Files {
+			for _, d := range f.Decls {
+				fd, ok := d.(*ast.FuncDecl)
+				if !ok || fd.Body == nil {
+					continue
+				}
+				calls := map[string]bool{}
+				ast.Inspect(fd.Body, func(n ast.Node) bool {
+					if c, ok := n.(*ast.CallExpr); ok {
+						if sel, ok := c.Fun.(*ast.SelectorExpr); ok {
+							calls[sel.Sel.Name] = true
+						}
+					}
+					return true
+				})
+				migrates := calls["MigrateToTarget"]
+				for w := range wrappers {
+					migrates = migrates || calls[w]
+				}
+				if !migrates || wrappers[fd.Name.Name] {
+					continue
+				}
+				found++
+				if !calls["armMigrationTarget"] {
+					t.Errorf("%s live-migrates without armMigrationTarget: a VLAN guest would run on the target before its VLANs are on",
+						fd.Name.Name)
+				}
+			}
+		}
+	}
+	if found < 2 {
+		t.Fatalf("found %d migrating functions, want at least migrateOwnedVM and drainOneVM: the scan is broken", found)
 	}
 }
 

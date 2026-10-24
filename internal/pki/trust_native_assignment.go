@@ -259,7 +259,11 @@ func NativeOperatorCAOperation(ctx context.Context, dir string) ([]byte, []byte,
 // It is inert reservation, not signed permission or a DB constructor. Callers
 // release this lease before invoking AssignNativeFirstMember on a local root.
 func PrepareNativeEnrollmentDestination(ctx context.Context, cfg NativeDestinationConfig, ca, operation []byte, admission *HostDomainLease) ([]byte, error) {
-	return nativeEnrollmentDestination(ctx, cfg, ca, operation, nil, admission, true)
+	root, err := nativeRootPEM(ca)
+	if err != nil {
+		return nil, err
+	}
+	return nativeEnrollmentDestination(ctx, cfg, sha256.Sum256(root.Raw), operation, nil, admission, true)
 }
 
 // Assigned retry/apply must use this arm. Missing evidence cannot be repaired
@@ -268,11 +272,35 @@ func RequireNativeEnrollmentDestination(ctx context.Context, cfg NativeDestinati
 	if len(expected) == 0 {
 		return errors.New("expected destination reservation required")
 	}
-	_, err := nativeEnrollmentDestination(ctx, cfg, ca, operation, expected, admission, false)
+	root, err := nativeRootPEM(ca)
+	if err != nil {
+		return err
+	}
+	_, err = nativeEnrollmentDestination(ctx, cfg, sha256.Sum256(root.Raw), operation, expected, admission, false)
 	return err
 }
 
-func nativeEnrollmentDestination(ctx context.Context, cfg NativeDestinationConfig, ca, operation, expected []byte, admission *HostDomainLease, create bool) ([]byte, error) {
+// PrepareNativeEnrollmentDestinationDigest accepts the root correlation carried
+// by native preparation. It reserves only the same inert destination tuple;
+// assignment still requires the actual operator's retained root and private key.
+func PrepareNativeEnrollmentDestinationDigest(ctx context.Context, cfg NativeDestinationConfig, rootDigest [sha256.Size]byte, operation []byte, admission *HostDomainLease) ([]byte, error) {
+	return nativeEnrollmentDestination(ctx, cfg, rootDigest, operation, nil, admission, true)
+}
+
+// RequireNativeEnrollmentDestinationDigest never creates a missing reservation.
+// The supplied digest and expected bytes are correlations, not use authority.
+func RequireNativeEnrollmentDestinationDigest(ctx context.Context, cfg NativeDestinationConfig, rootDigest [sha256.Size]byte, operation, expected []byte, admission *HostDomainLease) error {
+	if len(expected) == 0 {
+		return errors.New("expected destination reservation required")
+	}
+	_, err := nativeEnrollmentDestination(ctx, cfg, rootDigest, operation, expected, admission, false)
+	return err
+}
+
+func nativeEnrollmentDestination(ctx context.Context, cfg NativeDestinationConfig, rootDigest [sha256.Size]byte, operation, expected []byte, admission *HostDomainLease, create bool) ([]byte, error) {
+	if rootDigest == [sha256.Size]byte{} {
+		return nil, errors.New("invalid native root digest")
+	}
 	if admission == nil {
 		return nil, errors.New("exclusive host domain admission required")
 	}
@@ -282,10 +310,6 @@ func nativeEnrollmentDestination(ctx context.Context, cfg NativeDestinationConfi
 		return nil, err
 	}
 	canonical, err := canonicalNativeConfig(cfg)
-	if err != nil {
-		return nil, err
-	}
-	root, err := nativeRootPEM(ca)
 	if err != nil {
 		return nil, err
 	}
@@ -308,7 +332,7 @@ func nativeEnrollmentDestination(ctx context.Context, cfg NativeDestinationConfi
 		return nil, errors.New("native destination paths changed")
 	}
 	if create {
-		if err := o.nativeReservationEligibleLocked(canonical, root, operation); err != nil {
+		if err := o.nativeReservationEligibleLocked(canonical, rootDigest, operation); err != nil {
 			return nil, err
 		}
 	}
@@ -326,7 +350,7 @@ func nativeEnrollmentDestination(ctx context.Context, cfg NativeDestinationConfi
 		active, err := readNativeCAFile(filepath.Join(o.dir, "ca.crt"), nativePEMLimit)
 		if err == nil {
 			actual, err := nativeRootPEM(active)
-			if err != nil || !bytes.Equal(actual.Raw, root.Raw) {
+			if err != nil || sha256.Sum256(actual.Raw) != rootDigest {
 				return nil, errors.New("destination active root differs")
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
@@ -355,7 +379,7 @@ func nativeEnrollmentDestination(ctx context.Context, cfg NativeDestinationConfi
 				return nil, err
 			}
 		}
-		binding, err := asn1.Marshal(nativeDestinationBinding{1, "litevirt/native-enrollment-destination", nativeDigest(root.Raw), id, canonical.HostName, canonical.PKIDir, canonical.DataDir, canonical.ConfigPath})
+		binding, err := asn1.Marshal(nativeDestinationBinding{1, "litevirt/native-enrollment-destination", rootDigest[:], id, canonical.HostName, canonical.PKIDir, canonical.DataDir, canonical.ConfigPath})
 		if err != nil {
 			return nil, err
 		}
@@ -382,7 +406,7 @@ func nativeEnrollmentDestination(ctx context.Context, cfg NativeDestinationConfi
 	if err != nil {
 		return nil, err
 	}
-	if !bytes.Equal(r.Operation, operation) || !bytes.Equal(b.Root, nativeDigest(root.Raw)) || b.Host != canonical.HostName || b.PKI != canonical.PKIDir || b.Data != canonical.DataDir || b.Config != canonical.ConfigPath {
+	if !bytes.Equal(r.Operation, operation) || !bytes.Equal(b.Root, rootDigest[:]) || b.Host != canonical.HostName || b.PKI != canonical.PKIDir || b.Data != canonical.DataDir || b.Config != canonical.ConfigPath {
 		return nil, errors.New("native destination reservation conflicts with effective context")
 	}
 	if !create && !bytes.Equal(body, expected) {
@@ -398,7 +422,7 @@ func nativeEnrollmentDestination(ctx context.Context, cfg NativeDestinationConfi
 	return bytes.Clone(body), nil
 }
 
-func (o *trustOwner) nativeReservationEligibleLocked(cfg NativeDestinationConfig, root *x509.Certificate, operation []byte) error {
+func (o *trustOwner) nativeReservationEligibleLocked(cfg NativeDestinationConfig, rootDigest [sha256.Size]byte, operation []byte) error {
 	if len(o.root) != 0 || o.servedFingerprint != [32]byte{} || o.retired {
 		return errors.New("established destination cannot create native reservation")
 	}
@@ -411,7 +435,7 @@ func (o *trustOwner) nativeReservationEligibleLocked(cfg NativeDestinationConfig
 			return errors.New("operator operation is already assigned or different")
 		}
 		stagedRoot, err := nativeRootPEM(n.cert)
-		if err != nil || !bytes.Equal(stagedRoot.Raw, root.Raw) {
+		if err != nil || sha256.Sum256(stagedRoot.Raw) != rootDigest {
 			return errors.New("destination root differs from operator operation")
 		}
 		if pending, err := o.nativeOperatorCAPendingLocked(n); err != nil || pending {

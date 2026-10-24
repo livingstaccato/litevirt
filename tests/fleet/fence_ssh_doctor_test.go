@@ -10,9 +10,9 @@ import (
 
 // TestFleet_FenceSSH_DoctorMatrix: `lv doctor fence`'s matrix is every
 // host's own view, collected over real RPCs by the host it asked: node-0 and
-// node-1 have published, node-2 has not, so every fence toward node-2 is the
-// unpinned legacy path (the warning doctor prints), and node-0 and node-1
-// reach each other over the managed path.
+// node-1 have published, node-2 has not, so with release_2026_12_v1 latched
+// every fence toward node-2 is refused (the warning doctor prints), and node-0
+// and node-1 reach each other over the managed path.
 //
 // Mutation: answer fan_out with this node's view only — node-1's and
 // node-2's rows of the matrix are missing, red.
@@ -42,8 +42,8 @@ func TestFleet_FenceSSH_DoctorMatrix(t *testing.T) {
 	for pair, want := range map[string]string{
 		"node-0>node-1": "managed/verified",
 		"node-1>node-0": "managed/verified",
-		"node-0>node-2": "legacy-unpinned/missing",
-		"node-1>node-2": "legacy-unpinned/missing",
+		"node-0>node-2": fencessh.PathRefused + "/missing",
+		"node-1>node-2": fencessh.PathRefused + "/missing",
 		"node-2>node-2": fencessh.PathSelf + "/missing",
 	} {
 		if path[pair] != want {

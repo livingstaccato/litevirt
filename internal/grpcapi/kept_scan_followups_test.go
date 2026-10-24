@@ -98,16 +98,20 @@ func TestCreateVM_KeptScanFollowsASymlinkBelowARoot(t *testing.T) {
 	})
 }
 
-// While kept-disks.json cannot be read, the scan reads every file a
-// kept-disk note names, wherever it is: the notes are what covers a kept
+// While kept-disks.json cannot be read, a file a kept-disk note names,
+// wherever it is, still judges a create: the notes are what covers a kept
 // overlay outside every directory the scan lists (a restore to an admin's
 // --target-path, kept by a later delete). One that names the create's disk
 // as its missing base refuses it; one that names nothing it writes does
 // not.
 //
-// Red with the noted files dropped from the scan (review mutation m2a:
-// `for f := range noted { add(f) }` removed): "a noted overlay elsewhere"
-// red (the create goes ahead and writes the base).
+// A noted overlay's chain is judged by keptNoteMissingBase before the
+// registry is read, so the refusal names the note, not kept-disks.json; the
+// scan's read of the noted files (review mutation m2a: `for f := range
+// noted { add(f) }` removed) is what still covers an entry noted only as
+// recorded, and TestCreateVM_KeptScanReadsEveryRegistryEntryAfterARestart
+// is red under it. Here: drop the keptNoteMissingBase call from
+// keptMissingBaseRefusal and also m2a: "a noted overlay elsewhere" red.
 func TestCreateVM_KeptScanReadsTheNotedFiles(t *testing.T) {
 	t.Run("a noted overlay elsewhere", func(t *testing.T) {
 		s, _ := provableCreateServer(t)
@@ -117,11 +121,11 @@ func TestCreateVM_KeptScanReadsTheNotedFiles(t *testing.T) {
 		if err := health.NoteKeptDisks(s.dataDir, "db", []string{ov}); err != nil {
 			t.Fatal(err)
 		}
-		named := unreadableKeptRegistry(t, s)
+		unreadableKeptRegistry(t, s)
 		_, err := s.CreateVM(adminCtx(), poolCreateRequest("web", ""))
 		wantMissingBaseRefusal(t, "create with a noted overlay elsewhere naming its disk", err, ov, base)
-		if !strings.Contains(err.Error(), named) {
-			t.Fatalf("create web = %v; want it naming %s", err, named)
+		if note := filepath.Join(s.dataDir, "kept-disks", "db.json"); !strings.Contains(err.Error(), note) {
+			t.Fatalf("create web = %v; want it naming the note %s", err, note)
 		}
 	})
 	t.Run("a noted overlay elsewhere naming something else goes ahead", func(t *testing.T) {

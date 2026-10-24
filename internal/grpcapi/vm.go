@@ -2510,8 +2510,10 @@ func (s *Server) startGatesLocked(ctx context.Context, method string, vm *corros
 	// Nor while a kept disk backs on its disk: a linked clone deleted with
 	// --keep-disks is no longer in linkedClonesOf, and its kept overlay (noted,
 	// recorded, or moved aside as a .kept- copy) still names this VM's disk as
-	// its base. Fails closed, as the clone check does (security review R1).
-	if err := s.keptBaseRefusal(ctx, vm.Name, "start", "", false, true); err != nil {
+	// its base (security review R1). A readable finding always refuses; while
+	// kept state cannot be read, only a VM that could be a base is refused
+	// (keptOnUnknownIfBase, re-review P2).
+	if err := s.keptBaseRefusal(ctx, vm.Name, "start", "", false, keptOnUnknownIfBase); err != nil {
 		return nil, err
 	}
 
@@ -2637,12 +2639,13 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 		return releasePreflight, err
 	}
 	// Nor one whose disk a kept disk backs on (keptBaseRefusal), by any path:
-	// the operator start (which also refuses while that cannot be told, in
-	// startGatesLocked), and the failover, reconciler and health restarts that
-	// reach the domain start only through here. Those refuse only a positive
-	// finding: an unreadable note does not hold every restart on the host.
+	// the operator start (checked in startGatesLocked too), and the failover,
+	// reconciler, onboot and health restarts that reach the domain start only
+	// through here. A finding from any chain that could be read refuses,
+	// whatever else could not be read (re-review P1); while kept state cannot
+	// be read, only a VM that could be a base is refused (P2).
 	if s.db != nil {
-		if err := s.keptBaseRefusal(ctx, vm.Name, "start", "", false, false); err != nil {
+		if err := s.keptBaseRefusal(ctx, vm.Name, "start", "", false, keptOnUnknownIfBase); err != nil {
 			return releasePreflight, err
 		}
 	}
@@ -3979,7 +3982,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		return nil, err
 	}
 	if !req.KeepDisks {
-		if err := s.keptBaseRefusal(ctx, req.Name, "delete VM", "delete it with --keep-disks, or ", true, false); err != nil {
+		if err := s.keptBaseRefusal(ctx, req.Name, "delete VM", "delete it with --keep-disks, or ", true, keptOnUnknownAllow); err != nil {
 			return nil, err
 		}
 	}
@@ -5477,7 +5480,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// Nor a disk a kept chain backs on: a linked clone deleted with
 	// --keep-disks is no longer in linkedClonesOf, and its kept overlay still
 	// names this VM's disk as its base. Fails closed, as the clone check does.
-	if err := s.keptBaseRefusal(ctx, req.Name, "rebuild", "", false, true); err != nil {
+	if err := s.keptBaseRefusal(ctx, req.Name, "rebuild", "", false, keptOnUnknownRefuse); err != nil {
 		return nil, err
 	}
 

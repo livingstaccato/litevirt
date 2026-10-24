@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -46,69 +48,108 @@ func badNote(t *testing.T, s *Server, vm string) string {
 	return note
 }
 
-// Security review R1: every start of the source of a kept linked clone is
-// refused. The operator start (startGatesLocked) also refuses while a note
-// cannot be read; the shared start preflight (PrepareHardwareForStart, the
-// only gate of the failover, reconciler and health restarts) refuses a
-// positive finding only, so an unreadable note does not hold every restart
-// on the host.
+// Security review R1, re-review P1 and P2: every start of the source of a
+// kept linked clone is refused, the operator start (startGatesLocked) and
+// the shared start preflight (PrepareHardwareForStart, the only gate of the
+// failover, reconciler, onboot and health restarts) alike:
 //
-// Red on d4c11ecc1. Mutations: drop keptBaseRefusal from startGatesLocked:
-// "operator start" red; from PrepareHardwareForStart: "automated start"
-// red; make the preflight's failClosed true: "automated start, unreadable
-// note" red.
+//   - a finding from a readable note refuses, whatever else cannot be read
+//     (P1: an unrelated corrupt note made the preflight drop it, and an
+//     onboot start after a reboot wrote the base);
+//   - while kept state cannot be read, a VM that could be a base (a disk row,
+//     live or deleted, names its disk as its backing_disk) is refused;
+//   - and every other VM starts (P2: one bad note held every start on the
+//     host).
+//
+// Red on d4c11ecc1 ("positive" subtests) and on 087ac16aa ("automated,
+// positive with another note unreadable"; "operator, unknown, not a base").
+// Mutations: drop keptBaseRefusal from startGatesLocked: "operator,
+// positive" red; from PrepareHardwareForStart: the "automated" positive
+// subtests red; return keptNoteChains' error without what it read
+// (all-or-nothing again): "automated, positive with another note unreadable"
+// red; keptOnUnknownIfBase treated as Allow: the "base candidate" subtests
+// red; as Refuse: the "not a base" subtests red.
 func TestKeptBaseRefusal_EveryStartOfTheSource(t *testing.T) {
-	vmOf := func(t *testing.T, s *Server) *corrosion.VMRecord {
-		vm, err := corrosion.GetVM(adminCtx(), s.db, "sv")
+	vmOf := func(t *testing.T, s *Server, name string) *corrosion.VMRecord {
+		vm, err := corrosion.GetVM(adminCtx(), s.db, name)
 		if err != nil || vm == nil {
 			t.Fatal(err)
 		}
 		return vm
 	}
-	t.Run("operator start", func(t *testing.T) {
-		s, base := keptSourceFixture(t)
-		top := noteKeep(t, s, "svc", base)
-		lease, err := s.startGatesLocked(adminCtx(), "StartVM", vmOf(t, s), 1, 256, true)
+	operator := func(t *testing.T, s *Server, name string) error {
+		lease, err := s.startGatesLocked(adminCtx(), "StartVM", vmOf(t, s, name), 1, 256, true)
 		if lease != nil {
 			lease.release(context.Background())
 		}
-		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), top) {
-			t.Fatalf("startGatesLocked = %v; want FailedPrecondition naming %s", err, top)
-		}
-	})
-	t.Run("operator start, unreadable note", func(t *testing.T) {
-		s, _ := keptSourceFixture(t)
-		note := badNote(t, s, "svc")
-		lease, err := s.startGatesLocked(adminCtx(), "StartVM", vmOf(t, s), 1, 256, true)
-		if lease != nil {
-			lease.release(context.Background())
-		}
-		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), note) {
-			t.Fatalf("startGatesLocked with an unreadable note = %v; want FailedPrecondition naming %s", err, note)
-		}
-	})
-	t.Run("automated start", func(t *testing.T) {
-		s, base := keptSourceFixture(t)
-		top := noteKeep(t, s, "svc", base)
-		release, err := s.PrepareHardwareForStart(adminCtx(), vmOf(t, s))
+		return err
+	}
+	automated := func(t *testing.T, s *Server, name string) error {
+		release, err := s.PrepareHardwareForStart(adminCtx(), vmOf(t, s, name))
 		if release != nil {
 			release()
 		}
-		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), top) {
-			t.Fatalf("PrepareHardwareForStart = %v; want FailedPrecondition naming %s", err, top)
+		return err
+	}
+	// deletedClone records a clone of sv's disk deleted with --keep-disks:
+	// its disk row soft-deleted, its overlay's note unreadable.
+	deletedClone := func(t *testing.T, s *Server, base string) string {
+		top := filepath.Join(t.TempDir(), "svc-root.qcow2")
+		if err := corrosion.InsertVM(adminCtx(), s.db, corrosion.VMRecord{Name: "svc", HostName: s.hostName, State: "stopped"}, nil,
+			[]corrosion.DiskRecord{{VMName: "svc", DiskName: "root", HostName: s.hostName, Path: top, BackingDisk: base, StorageType: "local"}}); err != nil {
+			t.Fatal(err)
 		}
-	})
-	t.Run("automated start, unreadable note", func(t *testing.T) {
-		s, _ := keptSourceFixture(t)
-		badNote(t, s, "svc")
-		release, err := s.PrepareHardwareForStart(adminCtx(), vmOf(t, s))
-		if release != nil {
-			release()
+		if err := corrosion.DeleteVM(adminCtx(), s.db, "svc"); err != nil {
+			t.Fatal(err)
 		}
-		if err != nil {
-			t.Fatalf("PrepareHardwareForStart with an unreadable note = %v; want it left to the operator start's gate", err)
+		return badNote(t, s, "svc")
+	}
+	plainVM := func(t *testing.T, s *Server) {
+		other := s.images.DiskPath("plain", "root")
+		if err := qcow2.Create(other, 1<<20, nil); err != nil {
+			t.Fatal(err)
 		}
-	})
+		if err := corrosion.InsertVM(adminCtx(), s.db, corrosion.VMRecord{Name: "plain", HostName: s.hostName, State: "stopped"}, nil,
+			[]corrosion.DiskRecord{{VMName: "plain", DiskName: "root", HostName: s.hostName, Path: other, StorageType: "local", DeleteWithVM: true}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, start := range []struct {
+		name string
+		do   func(*testing.T, *Server, string) error
+	}{{"operator", operator}, {"automated", automated}} {
+		t.Run(start.name+", positive", func(t *testing.T) {
+			s, base := keptSourceFixture(t)
+			top := noteKeep(t, s, "svc", base)
+			if err := start.do(t, s, "sv"); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), top) {
+				t.Fatalf("start of sv = %v; want FailedPrecondition naming %s", err, top)
+			}
+		})
+		t.Run(start.name+", positive with another note unreadable", func(t *testing.T) {
+			s, base := keptSourceFixture(t)
+			top := noteKeep(t, s, "svc", base)
+			badNote(t, s, "other")
+			if err := start.do(t, s, "sv"); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), top) {
+				t.Fatalf("start of sv = %v; want FailedPrecondition naming %s, though another note cannot be read", err, top)
+			}
+		})
+		t.Run(start.name+", unknown, base candidate", func(t *testing.T) {
+			s, base := keptSourceFixture(t)
+			note := deletedClone(t, s, base)
+			err := start.do(t, s, "sv")
+			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), note) || !strings.Contains(err.Error(), "svc") {
+				t.Fatalf("start of sv while %s cannot be read = %v; want FailedPrecondition naming it and the clone svc", note, err)
+			}
+		})
+		t.Run(start.name+", unknown, not a base", func(t *testing.T) {
+			s, base := keptSourceFixture(t)
+			deletedClone(t, s, base)
+			plainVM(t, s)
+			if err := start.do(t, s, "plain"); err != nil {
+				t.Fatalf("start of plain, which nothing was cloned from, while a note cannot be read = %v; want it to go on", err)
+			}
+		})
+	}
 }
 
 // Security review R1: an in-place backup restore over the source's disk
@@ -189,5 +230,127 @@ func TestKeptDisks_AnUnreadableNoteIsNamedInHealth(t *testing.T) {
 	}
 	if refused, _ := e["creates_refused"].(string); !strings.Contains(refused, note) {
 		t.Fatalf("creates_refused = %q; want it to name %s", refused, note)
+	}
+}
+
+// Re-review P4: a cutover's runtime handoff starts the VM with StartDomain,
+// outside startGatesLocked and PrepareHardwareForStart. It refuses, and
+// leaves the domain down, while the VM backs a linked clone, live or kept.
+//
+// Red on 087ac16aa (the handoff starts it). Mutations: drop the kept check
+// from finishVMReplaceRuntime: "kept clone" red; drop the linkedClonesOf
+// check: "live clone" red.
+func TestFinishVMReplaceRuntime_NeverStartsALinkedCloneBase(t *testing.T) {
+	handoff := func(t *testing.T, s *Server) (corrosion.VMReplaceCleanup, *corrosion.VMRecord) {
+		vm, err := corrosion.GetVM(adminCtx(), s.db, "sv")
+		if err != nil || vm == nil {
+			t.Fatalf("GetVM: %v", err)
+		}
+		dom := "<domain type='kvm'><name>sv-next</name><uuid>uuid-sv</uuid><memory unit='MiB'>256</memory><vcpu>1</vcpu><devices>" +
+			"</devices></domain>"
+		return corrosion.VMReplaceCleanup{OperationID: "op-sv", AcceptedState: "running",
+			Handoff: corrosion.VMReplaceHandoff{XML: dom, UUID: "uuid-sv"},
+			Manifest: corrosion.VMReplaceManifest{
+				HostName: s.hostName, ReplacedVM: "sv", Replacement: "sv-next",
+				ReplacementIncarnation: vm.CreatedAt, ReplacementUUID: "uuid-sv",
+			}}, vm
+	}
+	check := func(t *testing.T, s *Server, want string) {
+		cl, _ := handoff(t, s)
+		err := s.finishVMReplaceRuntime(adminCtx(), cl)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("finishVMReplaceRuntime = %v; want a refusal naming %s", err, want)
+		}
+		if active, _ := s.virt.DomainIsActive("sv"); active {
+			t.Fatal("the handoff started sv")
+		}
+	}
+	t.Run("kept clone", func(t *testing.T) {
+		s, base := keptSourceFixture(t)
+		check(t, s, noteKeep(t, s, "svc", base))
+	})
+	t.Run("live clone", func(t *testing.T) {
+		s, base := keptSourceFixture(t)
+		top := filepath.Join(t.TempDir(), "svc-root.qcow2")
+		if err := corrosion.InsertVM(adminCtx(), s.db, corrosion.VMRecord{Name: "svc", HostName: s.hostName, State: "stopped"}, nil,
+			[]corrosion.DiskRecord{{VMName: "svc", DiskName: "root", HostName: s.hostName, Path: top, BackingDisk: base, StorageType: "local"}}); err != nil {
+			t.Fatal(err)
+		}
+		check(t, s, "svc")
+	})
+	t.Run("control", func(t *testing.T) {
+		s, _ := keptSourceFixture(t)
+		cl, _ := handoff(t, s)
+		if err := s.finishVMReplaceRuntime(adminCtx(), cl); err != nil {
+			t.Fatalf("finishVMReplaceRuntime with no clone: %v", err)
+		}
+	})
+}
+
+// Re-review P3 (M1): a .superseded- copy's chain holds what it backs on, as
+// a .kept- copy's does: a failover's set-aside of an overlay, or a kept
+// overlay rebased onto a set-aside copy, still names that base.
+//
+// Mutation: leave the .superseded- copies out of keptNoteChains: red.
+func TestKeptNoteChain_ASupersededCopyHoldsItsBase(t *testing.T) {
+	s, base, was := debrisFixture(t)
+	copyAt := filepath.Join(filepath.Dir(base), "old-root.qcow2.superseded-20260901T000000.000000000Z")
+	if err := qcow2.CreateWithBackingFormat(copyAt, base, "qcow2", 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	held, why := s.keptHolds(adminCtx(), base)
+	if !held || !strings.Contains(why, copyAt) {
+		t.Fatalf("keptHolds(%s) = %v, %q; want it held by the set-aside copy %s", base, held, why, copyAt)
+	}
+	s.sweepVMDiskDebris(adminCtx(), "web")
+	sameBytes(t, "the base a .superseded- copy backs on", base, was)
+}
+
+// Re-review P3 (M2): a set-aside copy listing that cannot be read fails
+// closed, as an unreadable note does: every removal keeps its file, and the
+// refusal names the listing.
+//
+// Mutation: ignore a listKeptDisks error in keptNoteChains: red.
+func TestKeptNoteChain_AnUnreadableCopyListingHoldsEverything(t *testing.T) {
+	for _, which := range []string{".kept-", ".superseded-"} {
+		t.Run(which, func(t *testing.T) {
+			s, base, was := debrisFixture(t)
+			boom := func(context.Context, *corrosion.Client, string) error { return errors.New("injected: the disk directory does not list") }
+			if which == ".kept-" {
+				old := listKeptDisks
+				listKeptDisks = func(ctx context.Context, db *corrosion.Client, dir string) ([]health.KeptCopy, error) { return nil, boom(ctx, db, dir) }
+				t.Cleanup(func() { listKeptDisks = old })
+			} else {
+				old := listSupersededDisks
+				listSupersededDisks = func(ctx context.Context, db *corrosion.Client, dir string) ([]health.SupersededCopy, error) {
+					return nil, boom(ctx, db, dir)
+				}
+				t.Cleanup(func() { listSupersededDisks = old })
+			}
+			held, why := s.keptHolds(adminCtx(), base)
+			if !held || !strings.Contains(why, which) {
+				t.Fatalf("keptHolds with the %s listing unreadable = %v, %q; want held, naming it", which, held, why)
+			}
+			s.sweepVMDiskDebris(adminCtx(), "web")
+			sameBytes(t, "a candidate while a copy listing cannot be read", base, was)
+		})
+	}
+}
+
+// Re-review P2: a template is a possible base whatever its rows say (a
+// clone's rows may be purged): while kept state cannot be read, its start
+// is refused.
+//
+// Mutation: drop the template branch of keptMayBeABase: red.
+func TestKeptMayBeABase_ATemplate(t *testing.T) {
+	s, _ := keptSourceFixture(t)
+	if base, _, err := s.keptMayBeABase(adminCtx(), "sv"); err != nil || base {
+		t.Fatalf("keptMayBeABase(sv) before = %v, %v; want false", base, err)
+	}
+	if err := corrosion.SetVMTemplate(adminCtx(), s.db, "sv", true); err != nil {
+		t.Fatal(err)
+	}
+	if base, why, err := s.keptMayBeABase(adminCtx(), "sv"); err != nil || !base || !strings.Contains(why, "template") {
+		t.Fatalf("keptMayBeABase(template sv) = %v, %q, %v; want true, naming it a template", base, why, err)
 	}
 }

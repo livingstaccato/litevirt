@@ -361,22 +361,34 @@ VM's disk record on that host still names that entry's own file (a delete that
 failed keeps its record, and its retry frees it); the files under it stay
 held. A VM whose disk such a chain reaches below its top (the source of a
 linked clone deleted with `--keep-disks`, also once a create of the clone's
-name moved its overlay to a `.kept-` name) is not run or written in place:
-`lv start` (and the failover, reconciler and health restarts), a plain `lv rm`,
-`lv rebuild`, `lv snapshot rm` and `lv snapshot restore` of a snapshot whose
-files the kept disk backs on, and an in-place backup restore over that disk are
-refused (`FailedPrecondition`) before anything is done, naming the kept disk.
-The way out: delete the VM with `--keep-disks`; release the kept disk first
+name moved its overlay to a `.kept-` name) is not run, moved or written in
+place: `lv start` (and the failover, reconciler, onboot and health restarts,
+and a cutover's restart), `lv migrate` (cold or live, and a drain's moves), a
+plain `lv rm`, `lv rebuild`, `lv snapshot rm` and `lv snapshot restore` of a
+snapshot whose files the kept disk backs on, and an in-place backup restore
+over that disk are refused (`FailedPrecondition`) before anything is done,
+naming the kept disk. A failover's set-aside of a disk it left on the host,
+and the purge of set-aside copies, leave such a file where it is. The way out:
+delete the VM with `--keep-disks`; release the kept disk first
 (`lv host kept-disks <host> --release <path>`; for a set-aside copy,
 `lv host superseded-disks <host>`); or make the kept disk standalone with
 nothing using it, `qemu-img rebase -f qcow2 -b '' <kept disk>`, which copies
-what it reads from the base into it. While a note cannot be read, the
-operator's `lv start` and `lv rebuild` are refused too; the automated restarts
-refuse only a VM a readable chain reaches. A note is this host's own: a VM
-whose disk is on shared storage (an nfs pool) and that later runs on another
-host is not held there by a kept disk this host noted, and a plain `lv rm` on
-that host can free the base; keep such a VM on the host that noted the kept
-disk until the kept disk is released or made standalone.
+what it reads from the base into it, so it needs free space up to about the
+size of the base. Never add `-u`: that only rewrites the header and loses the
+data the kept disk read from the base.
+
+A finding from any note, copy or record that can be read always refuses. While
+one cannot be read, a rebuild, a snapshot rm or restore and an in-place
+restore are refused on that host; a start or a migrate is refused only for a VM
+that could be a base: a template, or one whose disk a disk row (live or
+deleted, on any host) records as its backing disk. Every other VM starts.
+
+A note is this host's own. The source of a kept clone is not migrated off the
+host that noted it (above), but a VM on shared storage (an nfs pool) that runs
+on another host for any other reason (a failover, a promotion) is not held
+there by a kept disk this host noted, and a plain `lv rm` on that host can free
+the base; keep such a VM on the host that noted the kept disk until the kept
+disk is released or made standalone.
 
 **Releasing kept disks.** `lv host kept-disks <host>` lists every disk chain
 the deletes kept on that host, from its notes (`<data_dir>/kept-disks/<vm>.json`)

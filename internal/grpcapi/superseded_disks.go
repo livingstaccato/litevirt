@@ -154,7 +154,7 @@ func (s *Server) SupersededDisks(ctx context.Context, req *pb.SupersededDisksReq
 			return nil, status.Errorf(codes.FailedPrecondition, "%s", detail)
 		}
 	case req.Purge:
-		gone, perr := health.PurgeSupersededDisks(ctx, s.db, s.dataDir, time.Duration(req.OlderThanSec)*time.Second, time.Now())
+		gone, perr := health.PurgeSupersededDisks(ctx, s.db, s.dataDir, time.Duration(req.OlderThanSec)*time.Second, time.Now(), s.keptHolds)
 		var bytes int64
 		for _, c := range gone {
 			removed[c.Path] = true

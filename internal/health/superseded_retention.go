@@ -337,11 +337,24 @@ func keptHint(p string) string {
 // them. olderThan 0 removes every such copy. It is both the hourly sweep and
 // a bare `--purge`. Storage that does not answer holds none of it: the copies
 // under it are left alone, the others are swept, and the no-answer is
-// returned once they are.
-func PurgeSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir string, olderThan time.Duration, now time.Time) ([]SupersededCopy, error) {
+// returned once they are. A copy keptHold (when not nil) reports held — a
+// disk a delete kept backs on it — is never removed (re-review P5).
+func PurgeSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir string, olderThan time.Duration, now time.Time,
+	keptHold func(context.Context, string) (bool, string)) ([]SupersededCopy, error) {
 	copies, noAnswer, err := listSupersededDisks(ctx, db, dataDir)
 	if err != nil {
 		return nil, err
+	}
+	if keptHold != nil {
+		var keep []SupersededCopy
+		for _, c := range copies {
+			if held, why := keptHold(ctx, c.Path); held {
+				slog.Info("superseded disk copy kept: a disk a delete kept backs on it", "path", c.Path, "why", why)
+				continue
+			}
+			keep = append(keep, c)
+		}
+		copies = keep
 	}
 	removed, err := purgeSuperseded(copies, olderThan, now)
 	if err == nil && noAnswer != nil {

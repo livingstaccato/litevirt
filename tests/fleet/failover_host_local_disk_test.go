@@ -141,7 +141,7 @@ func TestFleet_FailoverKeepsTheRealHostLocalDiskAndCanPutItBack(t *testing.T) {
 	if b, err := os.ReadFile(copyPath); err != nil || !bytes.Equal(b, realBytes) {
 		t.Fatalf("the copy at %s does not hold the real disk (err %v)", copyPath, err)
 	}
-	if _, err := health.PurgeSupersededDisks(ctx, home.DB, homeData, 7*24*time.Hour, time.Now().Add(30*24*time.Hour)); err != nil {
+	if _, err := health.PurgeSupersededDisks(ctx, home.DB, homeData, 7*24*time.Hour, time.Now().Add(30*24*time.Hour), nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(copyPath); err != nil {
@@ -217,7 +217,7 @@ func TestFleet_FailoverKeepsTheRealHostLocalDiskAndCanPutItBack(t *testing.T) {
 	if vm, _ := corrosion.GetVM(ctx, coord.DB, "hl"); vm == nil || vm.State != "running" {
 		t.Fatalf("hl = %+v, want running", vm)
 	}
-	if _, err := health.PurgeSupersededDisks(ctx, home.DB, homeData, 7*24*time.Hour, time.Now().Add(30*24*time.Hour)); err != nil {
+	if _, err := health.PurgeSupersededDisks(ctx, home.DB, homeData, 7*24*time.Hour, time.Now().Add(30*24*time.Hour), nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(resp.SetAside); err != nil {

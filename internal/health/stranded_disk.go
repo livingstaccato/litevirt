@@ -559,6 +559,16 @@ func (r *Reconciler) setAsideStrandedFile(ctx context.Context, vmName string, d 
 			return d, setAsideBlocked
 		}
 	}
+	// Nor a file a kept disk is, or backs on: a kept linked clone has no
+	// disk row, so the check above does not see it, and renaming its base
+	// breaks its chain (re-review P5).
+	if r.keptHold != nil {
+		if held, why := r.keptHold(ctx, d.Path); held {
+			slog.Warn("reconciler: a disk a failover left on this host is not set aside: a disk a delete kept holds it",
+				"vm", vmName, "path", d.Path, "why", why)
+			return d, setAsideBlocked
+		}
+	}
 	if stillMay != nil && !stillMay() {
 		return d, setAsideBlocked
 	}

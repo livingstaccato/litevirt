@@ -307,7 +307,7 @@ func TestKeptBaseRefusal_SourceOfAKeptLinkedClone(t *testing.T) {
 	t.Run("noted", func(t *testing.T) {
 		s, base := setup(t)
 		top := noteKeep(t, s, "svc", base)
-		err := s.keptBaseRefusal(adminCtx(), "sv", "delete VM", "", true, false)
+		err := s.keptBaseRefusal(adminCtx(), "sv", "delete VM", "", true, keptOnUnknownAllow)
 		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), top) || !strings.Contains(err.Error(), base) {
 			t.Fatalf("keptBaseRefusal = %v; want FailedPrecondition naming %s and %s", err, top, base)
 		}
@@ -315,7 +315,7 @@ func TestKeptBaseRefusal_SourceOfAKeptLinkedClone(t *testing.T) {
 	t.Run("recorded", func(t *testing.T) {
 		s, base := setup(t)
 		top := registryKeep(t, s, "svc", base)
-		err := s.keptBaseRefusal(adminCtx(), "sv", "delete VM", "", true, false)
+		err := s.keptBaseRefusal(adminCtx(), "sv", "delete VM", "", true, keptOnUnknownAllow)
 		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), top) {
 			t.Fatalf("keptBaseRefusal = %v; want FailedPrecondition naming %s", err, top)
 		}
@@ -323,7 +323,7 @@ func TestKeptBaseRefusal_SourceOfAKeptLinkedClone(t *testing.T) {
 	t.Run("nothing kept on it", func(t *testing.T) {
 		s, _ := setup(t)
 		noteKeep(t, s, "other", filepath.Join(t.TempDir(), "unrelated.qcow2"))
-		if err := s.keptBaseRefusal(adminCtx(), "sv", "delete VM", "", true, true); err != nil {
+		if err := s.keptBaseRefusal(adminCtx(), "sv", "delete VM", "", true, keptOnUnknownRefuse); err != nil {
 			t.Fatalf("keptBaseRefusal with nothing kept on sv's disk = %v", err)
 		}
 	})
@@ -336,10 +336,10 @@ func TestKeptBaseRefusal_SourceOfAKeptLinkedClone(t *testing.T) {
 		if err := os.WriteFile(note, []byte("{not json"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.keptBaseRefusal(adminCtx(), "sv", "delete VM", "", true, false); err != nil {
+		if err := s.keptBaseRefusal(adminCtx(), "sv", "delete VM", "", true, keptOnUnknownAllow); err != nil {
 			t.Fatalf("delete: keptBaseRefusal with an unreadable note = %v; want it left to the removal's holds", err)
 		}
-		if err := s.keptBaseRefusal(adminCtx(), "sv", "rebuild", "", false, true); status.Code(err) != codes.FailedPrecondition {
+		if err := s.keptBaseRefusal(adminCtx(), "sv", "rebuild", "", false, keptOnUnknownRefuse); status.Code(err) != codes.FailedPrecondition {
 			t.Fatalf("rebuild: keptBaseRefusal with an unreadable note = %v; want FailedPrecondition", err)
 		}
 	})

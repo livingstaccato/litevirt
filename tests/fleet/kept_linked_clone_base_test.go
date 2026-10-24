@@ -281,3 +281,76 @@ func TestFleet_KeptLinkedClone_RebuildFailsClosedOnAnUnreadableNote(t *testing.T
 		}
 	}
 }
+
+// Re-review N2: a note is this host's own, so the source of a kept linked
+// clone is not migrated (cold or live) off the host that noted it: there no
+// guard sees the note, and a source on shared storage would run on, or be
+// freed from, the base under the kept overlay. The migrate is refused before
+// anything moves, naming the overlay.
+//
+// Red on 087ac16aa (the cold migrate goes ahead). Mutation: drop the
+// keptMigrateRefusal call from migrateOwnedVM: red.
+func TestFleet_KeptLinkedClone_SourceIsNotMigratedAway(t *testing.T) {
+	ctx := context.Background()
+	n, cl, base, overlay, was := klcFixture(t)
+	var dst string
+	for _, h := range []string{"node-0", "node-1"} {
+		if h != n.Name {
+			dst = h
+		}
+	}
+	st, err := cl.MigrateVM(ctx, &pb.MigrateVMRequest{VmName: "sv", TargetHost: dst, Strategy: pb.MigrateStrategy_MIGRATE_COLD})
+	if err == nil {
+		for {
+			if _, err = st.Recv(); err != nil {
+				break
+			}
+		}
+	}
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), overlay) {
+		t.Fatalf("lv migrate sv %s --cold = %v; want FailedPrecondition naming the kept overlay %s", dst, err, overlay)
+	}
+	if vm, gerr := corrosion.GetVM(ctx, n.DB, "sv"); gerr != nil || vm == nil || vm.HostName != n.Name {
+		t.Fatalf("sv after the refused migrate = %+v, %v; want it still on %s", vm, gerr, n.Name)
+	}
+	klcIntact(t, base, overlay, was, "lv migrate sv")
+}
+
+// Re-review P3 (M3): a snapshot restore or delete, which writes the files a
+// kept disk could back on and has no variant that spares them, is refused
+// while a kept-disk note cannot be read, naming it.
+//
+// Mutation: the snapshot restore's keptFilesRefusal with keptOnUnknownAllow:
+// "restore" red; the delete's: "delete" red.
+func TestFleet_KeptLinkedClone_SnapshotWritesFailClosedOnAnUnreadableNote(t *testing.T) {
+	ctx := context.Background()
+	for _, op := range []string{"restore", "delete"} {
+		t.Run(op, func(t *testing.T) {
+			n, cl := rkdCluster(t)
+			base := rkdRootPath(t, n)
+			if _, err := cl.StopVM(ctx, &pb.StopVMRequest{Name: "sv", Force: true}); err != nil {
+				t.Fatalf("lv stop sv: %v", err)
+			}
+			n.Virt.SetDiskSource("sv", "vda", base)
+			if _, err := cl.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VmName: "sv", Name: "s1"}); err != nil {
+				t.Fatalf("snapshot s1: %v", err)
+			}
+			note := filepath.Join(n.Server.DataDir(), "kept-disks", "other.json")
+			if err := os.MkdirAll(filepath.Dir(note), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(note, []byte("{not json"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			if op == "restore" {
+				_, err = cl.RestoreSnapshot(ctx, &pb.RestoreSnapshotRequest{VmName: "sv", SnapshotName: "s1"})
+			} else {
+				_, err = cl.DeleteSnapshot(ctx, &pb.DeleteSnapshotRequest{VmName: "sv", SnapshotName: "s1"})
+			}
+			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), note) {
+				t.Fatalf("lv snapshot %s sv s1 with an unreadable note = %v; want FailedPrecondition naming %s", op, err, note)
+			}
+		})
+	}
+}

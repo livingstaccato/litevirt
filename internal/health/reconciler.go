@@ -331,7 +331,16 @@ type Reconciler struct {
 	// sighting counts between passes, and the metric observer (nil-safe).
 	orphans   orphanReporter
 	onOrphans func(kind string, orphans []OrphanRuntime)
+	// keptHold reports whether a file is one a disk a delete kept on this
+	// host is, or backs on (grpcapi.Server.KeptHolds); nil: none is. A
+	// failover's set-aside never renames such a file: that breaks the kept
+	// disk's chain, and the hourly purge would later remove the base.
+	keptHold func(ctx context.Context, path string) (bool, string)
 }
+
+// SetKeptHold wires the kept-disk hold (grpcapi.Server.KeptHolds) the
+// set-aside of a failover's leftover consults.
+func (r *Reconciler) SetKeptHold(fn func(ctx context.Context, path string) (bool, string)) { r.keptHold = fn }
 
 // SetOperatorStopReplay wires the replay of operator-stop markers
 // (grpcapi.Server.ReplayOperatorStopMarkers), run at the start of every pass.

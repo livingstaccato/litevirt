@@ -3486,7 +3486,9 @@ it alone, and resolves once it reads). A migration's target and the
 reconciler's rebuild of a missing overlay disk are not checked yet.
 While the backing chain of a file a note `<data_dir>/kept-disks/<vm>.json`
 names cannot be read, every path on that host that removes disk files leaves
-every file, `lv start` and `lv rebuild` are refused on that host, and
+every file, `lv rebuild` is refused on that host, `lv start` and
+`lv migrate` are refused for a VM that could be a linked clone's base (a
+template, or one whose disk a disk row records as its backing disk), and
 `lv host kept-disks --release` refuses, naming the file and the note: fix that
 file, move it away, or, once nothing needs it, remove its entry from the note
 (docs/cli-reference.md, "Releasing kept disks").

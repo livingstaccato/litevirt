@@ -229,8 +229,10 @@ func PurgeReconciledQuarantines(ctx context.Context, db *corrosion.Client, dataD
 // SweepSetAside is the hourly sweep of what a cleanup set aside on this host:
 // the superseded disk copies and the reconciler's firmware quarantines, each
 // by its retention rule, with retention as superseded_disk_retention_days.
-func SweepSetAside(ctx context.Context, db *corrosion.Client, dataDir string, retention time.Duration, now time.Time) {
-	if _, err := PurgeSupersededDisks(ctx, db, dataDir, retention, now); err != nil {
+// keptHold (nil: none) keeps a copy a disk a delete kept backs on.
+func SweepSetAside(ctx context.Context, db *corrosion.Client, dataDir string, retention time.Duration, now time.Time,
+	keptHold func(context.Context, string) (bool, string)) {
+	if _, err := PurgeSupersededDisks(ctx, db, dataDir, retention, now, keptHold); err != nil {
 		slog.Warn("superseded disk sweep", "error", err)
 	}
 	if _, err := PurgeReconciledQuarantines(ctx, db, dataDir, retention, now); err != nil {

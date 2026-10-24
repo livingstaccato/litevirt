@@ -287,6 +287,11 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	if err := s.firmwareMoveRefusal("migrate", vm); err != nil {
 		return err
 	}
+	// Nor a VM whose disk a kept disk on this host backs on: on the target
+	// this host's note does not hold it (keptMigrateRefusal, re-review N2).
+	if err := s.keptMigrateRefusal(ctx, vm); err != nil {
+		return err
+	}
 	// A failback move is conditional on the VM still being where the drain left
 	// it, judged here, by its owner under its lock (failback.go).
 	if req.GetExpectDrainRecord() {

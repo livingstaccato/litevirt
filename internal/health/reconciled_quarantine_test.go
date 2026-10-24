@@ -110,7 +110,7 @@ func TestReconciledQuarantine_Retention(t *testing.T) {
 		t.Errorf("named removal of a held quarantine: %v", err)
 	}
 
-	SweepSetAside(ctx, db, dataDir, retention, now)
+	SweepSetAside(ctx, db, dataDir, retention, now, nil)
 	for k, p := range paths {
 		want := k != "old"
 		if exists(p) != want {

@@ -196,7 +196,7 @@ func (r *recoveredVM) supersededCopies(t *testing.T) []string {
 // sweepAt runs home's retention sweep as the hourly one would, at now+after.
 func (r *recoveredVM) sweepAt(t *testing.T, after time.Duration) {
 	t.Helper()
-	if _, err := health.PurgeSupersededDisks(context.Background(), r.home.DB, r.homeData, retention, time.Now().Add(after)); err != nil {
+	if _, err := health.PurgeSupersededDisks(context.Background(), r.home.DB, r.homeData, retention, time.Now().Add(after), nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -729,7 +729,7 @@ func keepDisksThenCreate(t *testing.T, between bool) (*Cluster, *Node, string) {
 	}
 	purge := func() {
 		t.Helper()
-		if _, err := health.PurgeSupersededDisks(ctx, n.DB, dataDir, retention, time.Now().Add(retention+24*time.Hour)); err != nil {
+		if _, err := health.PurgeSupersededDisks(ctx, n.DB, dataDir, retention, time.Now().Add(retention+24*time.Hour), nil); err != nil {
 			t.Fatal(err)
 		}
 	}

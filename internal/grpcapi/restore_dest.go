@@ -370,7 +370,7 @@ func (s *Server) inPlaceRestoreLocked(ctx context.Context, vmName, diskName stri
 	}
 	// Nor a base a kept disk backs on: a linked clone deleted with
 	// --keep-disks has no disk row any more (keptFilesRefusal).
-	if err := s.keptFilesRefusal(ctx, "restore in place over a disk of", vmName, []string{s.hostDiskFile(disk.Path)}, "", true); err != nil {
+	if err := s.keptFilesRefusal(ctx, "restore in place over a disk of", vmName, []string{s.hostDiskFile(disk.Path)}, "", keptOnUnknownRefuse); err != nil {
 		return restoreDest{}, err
 	}
 	// A point-in-time overlay beside the disk is settled before the restore

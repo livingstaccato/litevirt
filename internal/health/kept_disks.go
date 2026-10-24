@@ -240,7 +240,9 @@ type KeptNote struct {
 // KeptNotes is every kept-disk note on this host, by VM name. A note that
 // cannot be read or parsed (a *KeptDisksNoteError), or a directory of notes
 // that cannot be listed, is an error: a release, which removes what a note
-// names, then removes nothing.
+// names, then removes nothing. The notes that could be read are returned with
+// it: a guard that must refuse on what any readable note names does not lose
+// that to another note it cannot read (the first such error is returned).
 func KeptNotes(dataDir string) ([]KeptNote, error) {
 	if dataDir == "" {
 		return nil, nil
@@ -256,6 +258,7 @@ func KeptNotes(dataDir string) ([]KeptNote, error) {
 	keptDisksMu.Lock()
 	defer keptDisksMu.Unlock()
 	var out []KeptNote
+	var first error
 	for _, e := range ents {
 		name, ok := strings.CutSuffix(e.Name(), ".json")
 		if !ok || e.IsDir() || safename.ValidateVMName(name) != nil {
@@ -263,7 +266,10 @@ func KeptNotes(dataDir string) ([]KeptNote, error) {
 		}
 		n, err := keptNoteOf(dataDir, name)
 		if err != nil {
-			return nil, err
+			if first == nil {
+				first = err
+			}
+			continue
 		}
 		f := filepath.Join(dir, e.Name())
 		var mod time.Time
@@ -272,7 +278,7 @@ func KeptNotes(dataDir string) ([]KeptNote, error) {
 		}
 		out = append(out, KeptNote{VM: name, File: f, Paths: n.Paths, Under: n.Under, ModTime: mod})
 	}
-	return out, nil
+	return out, first
 }
 
 // ForgetKeptNoted drops paths from name's note here, and the note once it

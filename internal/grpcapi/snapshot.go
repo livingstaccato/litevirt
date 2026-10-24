@@ -466,7 +466,7 @@ func (s *Server) restoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 	// Nor while a kept disk backs on one: a linked clone deleted with
 	// --keep-disks has no disk row, so snapshotFileUsers no longer sees it
 	// (security review R1).
-	if err := s.keptFilesRefusal(ctx, "restore a snapshot of", req.VmName, liveFiles, "", true); err != nil {
+	if err := s.keptFilesRefusal(ctx, "restore a snapshot of", req.VmName, liveFiles, "", keptOnUnknownRefuse); err != nil {
 		return nil, err
 	}
 
@@ -750,7 +750,7 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 				req.SnapshotName, req.VmName, strings.Join(users, ", "), strings.Join(files, ", "))
 		}
 		// Nor while a kept disk backs on one (keptFilesRefusal).
-		if err := s.keptFilesRefusal(ctx, "delete a snapshot of", req.VmName, files, "", true); err != nil {
+		if err := s.keptFilesRefusal(ctx, "delete a snapshot of", req.VmName, files, "", keptOnUnknownRefuse); err != nil {
 			return nil, err
 		}
 	}

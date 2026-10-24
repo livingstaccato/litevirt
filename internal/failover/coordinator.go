@@ -1238,7 +1238,7 @@ func (c *Coordinator) run(ctx context.Context) {
 				retryPlan = c.fenceRetryDue(ctx, h)
 				retry = retryPlan.Due
 				if !retry && !retryPlan.Next.IsZero() {
-					c.noteHold(target, "fence failed; retrying at "+retryPlan.Next.UTC().Format(time.RFC3339))
+					c.noteHold(target, "fence failed; retrying at "+retryPlan.Next.UTC().Format(time.RFC3339)+fenceFailedWayOut(h))
 				}
 			}
 		}
@@ -3984,19 +3984,16 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 
 	// Split-brain guard. Reschedule only if:
 	//   - fence succeeded (real fence happened), OR
-	//   - strategy is "best-effort" (operator opted out of safety — a lenient SSH
-	//     fence reports Success=true, so this switch is skipped; the safe-fence
-	//     policy above is what gates it), OR
 	//   - strategy is "manual" AND an operator confirmation row exists.
 	// Manual fence used to claim Success=true unconditionally; it now reports
 	// Success=false and the coordinator must see an explicit confirmation row
 	// in fencing_log (written by `lv host fence-confirm`) before rescheduling.
+	// A best-effort fence that failed is no exception: a lenient SSH fence
+	// reports Success=true for any attempt it made (the safe-fence policy above
+	// gates that), so a failure is one it never made — its path was refused —
+	// and nothing reached the host.
 	if !fr.Success {
 		switch h.FenceStrategy {
-		case "best-effort":
-			slog.Warn("failover: best-effort fence did not fully succeed, proceeding anyway",
-				"host", h.Name, "detail", fr.Detail)
-			c.mAttempt(PhaseSplitBrain, ResultOK, ErrBestEffort)
 		case "manual":
 			if why, ok := c.confirmedOffNow(ctx, h.Name, life, lifeKnown); !ok {
 				if why != "" {
@@ -4016,7 +4013,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 			slog.Error("failover: CRITICAL — fencing failed, NOT rescheduling VMs to prevent split-brain",
 				"host", h.Name, "strategy", h.FenceStrategy, "detail", fr.Detail)
 			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrFenceFailed)
-			c.noteHold(h.Name, "fence failed ("+fr.Method+": "+fr.Detail+"); retrying with backoff, or 'lv host fence-confirm "+h.Name+"' once it is off")
+			c.noteHold(h.Name, "fence failed ("+fr.Method+": "+fr.Detail+"); retrying with backoff"+fenceFailedWayOut(h))
 			return
 		}
 	}

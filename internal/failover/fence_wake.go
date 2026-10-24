@@ -92,13 +92,15 @@ func fenceRetryDelay(n int) time.Duration {
 }
 
 // retryableFenceMethod reports whether a retry running method is worth
-// making. A manual fence cannot succeed (the confirmation path owns it), a
-// best-effort fence already proceeded on its failure, and a watchdog fence of
-// a peer always fails: fence.Execute refuses the watchdog strategy for any
-// host but the caller itself, and the coordinator never fences itself.
+// making. A manual fence cannot succeed (the confirmation path owns it), and a
+// watchdog fence of a peer always fails: fence.Execute refuses the watchdog
+// strategy for any host but the caller itself, and the coordinator never
+// fences itself. A best-effort fence fails only when it was never attempted
+// (its path refused, say a host that has not published its fence ssh row
+// yet), so a retry once the refusal clears can still fence the host.
 func retryableFenceMethod(method string) bool {
 	switch method {
-	case "ipmi", "redfish", "ssh":
+	case "ipmi", "redfish", "ssh", "best-effort":
 		return true
 	}
 	return false
@@ -116,6 +118,10 @@ func retryStrategy(current, failed string) string {
 	switch s := fence.ResolveStrategy(current); s {
 	case "ipmi", "redfish", "ssh":
 		return s
+	}
+	if failed == "best-effort-ssh" {
+		// The method a best-effort fence records; the strategy that ran it.
+		return "best-effort"
 	}
 	return failed
 }
@@ -248,7 +254,7 @@ func (c *Coordinator) fenceAuthorityChanged(ctx context.Context, h *corrosion.Ho
 	}
 	r := c.fenceRetryDue(ctx, h)
 	if !r.Due && !r.Next.IsZero() {
-		c.noteHold(h.Name, "fence failed; retrying at "+r.Next.UTC().Format(time.RFC3339))
+		c.noteHold(h.Name, "fence failed; retrying at "+r.Next.UTC().Format(time.RFC3339)+fenceFailedWayOut(h))
 	}
 	return r.Due
 }
@@ -282,6 +288,18 @@ func (c *Coordinator) logRetryRefused(host string, failedAt time.Time, why strin
 	}
 	slog.Log(context.Background(), level, "failover: not retrying the fence of a host that answered after the attempt that failed",
 		"host", host, "failed_at", failedAt.UTC().Format(time.RFC3339), "reason", why)
+}
+
+// fenceFailedWayOut is what an operator can do about h's failed fence
+// besides waiting for a retry: confirm it off by hand, and, for a host whose
+// fence does not go through a BMC, give it one.
+func fenceFailedWayOut(h *corrosion.HostRecord) string {
+	out := "; or power it off and run 'lv host fence-confirm " + h.Name + "'"
+	switch fence.ResolveStrategy(h.FenceStrategy) {
+	case "ipmi", "redfish":
+		return out
+	}
+	return out + ", or give it an ipmi or redfish fence strategy"
 }
 
 // noteHold records why the recovery of host is not proceeding, for the stall

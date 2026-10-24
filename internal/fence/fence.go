@@ -90,6 +90,9 @@ type SSHFence struct {
 
 // pathLabel is the path as fencing_log records it.
 func (s SSHFence) pathLabel() string {
+	if s.Refusal != "" {
+		return "refused"
+	}
 	switch s.Path {
 	case SSHPathManaged:
 		return "managed"
@@ -103,7 +106,8 @@ func (s SSHFence) pathLabel() string {
 // Execute runs the fencing strategy specified by h.FenceStrategy.
 // Strategies:
 //
-//	"best-effort"  – try an SSH forced power-off; succeed regardless (never blocks failover)
+//	"best-effort"  – try an SSH forced power-off; a dialled attempt succeeds regardless.
+//	                 A refused or unstarted one is a failure (sshNotAttempted)
 //	"ssh"          – SSH forced (immediate) power-off; report failure if unreachable
 //	"ipmi"         – IPMI/BMC power off via ipmitool; must succeed
 //	"redfish"      – Redfish/BMC ComputerSystem.Reset ForceOff over HTTPS, then
@@ -430,7 +434,7 @@ func sshArgs(ctx context.Context, h HostConfig, remote string) (target string, a
 func fenceSSH(ctx context.Context, h HostConfig, lenient bool) Result {
 	path := " [path=" + h.SSH.pathLabel() + "]"
 	if h.SSH.Refusal != "" {
-		return sshFailure(h, lenient, errors.New(h.SSH.Refusal), "SSH fence refused before dialling"+path, nil)
+		return sshNotAttempted(h, lenient, errors.New(h.SSH.Refusal), "SSH fence refused before dialling"+path)
 	}
 	remote := sshPowerOffCommand
 	if h.SSH.Path == SSHPathManaged {
@@ -439,7 +443,7 @@ func fenceSSH(ctx context.Context, h HostConfig, lenient bool) Result {
 	target, args, cleanup, err := sshArgs(ctx, h, remote)
 	defer cleanup()
 	if err != nil {
-		return sshFailure(h, lenient, err, "SSH fence could not start"+path, nil)
+		return sshNotAttempted(h, lenient, err, "SSH fence could not start"+path)
 	}
 	if h.SSH.Path == SSHPathLegacy {
 		slog.Warn("fencing host via SSH WITHOUT a pinned host key: it has published no fence SSH row, so a machine "+
@@ -497,6 +501,33 @@ func fenceSSH(ctx context.Context, h HostConfig, lenient bool) Result {
 		runErr = errors.New("remote command exited 0 without confirming it ran")
 	}
 	return sshFailure(h, lenient, runErr, detail, out)
+}
+
+// sshNotAttempted is an SSH fence that was never sent: its path was refused,
+// or ssh could not be started. It is a failure under every strategy,
+// best-effort included. best-effort's assumed success stands for an attempt
+// that may have landed; one never made cannot have, and counting it fenced
+// would recover the host's workloads while they may still run there. The
+// detail names the ways out, because no retry can succeed until one is taken
+// or the refusal clears.
+func sshNotAttempted(h HostConfig, lenient bool, why error, detail string) Result {
+	method := "ssh"
+	if lenient {
+		method = "best-effort-ssh"
+	}
+	slog.Error("SSH fence not attempted, so the host is NOT fenced", "host", h.Name, "lenient", lenient, "error", why)
+	detail = fmt.Sprintf("%s (%v); not attempted, so it does not count as a fence", detail, why)
+	if way := NotFencedWayOut(h.Name); !strings.Contains(detail, way) {
+		detail += ". " + way
+	}
+	return Result{Method: method, Detail: detail}
+}
+
+// NotFencedWayOut is what an operator does about a host no fence reached:
+// confirm it off by hand, or give it a fence that does not need its sshd.
+func NotFencedWayOut(host string) string {
+	return fmt.Sprintf("Power %s off and run `lv host fence-confirm %s`, or give it an ipmi or redfish fence strategy "+
+		"(`lv host config %s --fence-strategy ipmi|redfish`)", host, host, host)
 }
 
 // sshFailure is an SSH fence that did not land: a failure, or for a lenient

@@ -31,9 +31,7 @@ import (
 	"testing"
 	"time"
 
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -309,40 +307,6 @@ func TestFleet_ARebuildOntoAHostCutOffFromTheTombstoneRetiresItsStaleCopy(t *tes
 
 	if _, err := c.SelfClient(n0).RebuildVM(context.Background(), &pb.RebuildVMRequest{Name: "web"}); err != nil {
 		t.Fatalf("rebuild onto a host cut off from the tombstone: %v; %s", err, whereIs(c, "web"))
-	}
-	assertReCreated(t, c, "web", before, n1)
-}
-
-// The host the rebuild lands on is on an older build: it ignores the identity
-// of the VM being replaced and refuses AlreadyExists until its replica has the
-// tombstone. The entry asks again until then.
-//
-// Mutation: drop the AlreadyExists retry in forwardCreateVM — red.
-func TestFleet_ARebuildOntoAnOlderHostBehindOnTheTombstoneKeepsTheVM(t *testing.T) {
-	c := newRebuildRaceFleet(t)
-	n0, n1 := c.Nodes[0], c.Nodes[1]
-	before := seedVM(t, c, n0, &pb.VMSpec{
-		Name: "web", Cpu: 1, MemoryMib: 256, Placement: &pb.PlacementSpec{Host: n1.Name},
-	})
-	// An older build never reads the replaced VM's identity: drop it from
-	// every create n1 serves.
-	older := func(ctx context.Context, req any, handler grpc.UnaryHandler) (any, error) {
-		md, _ := metadata.FromIncomingContext(ctx)
-		md = md.Copy()
-		md.Delete("x-litevirt-recreate-replaces")
-		return handler(metadata.NewIncomingContext(ctx, md), req)
-	}
-	for i := 0; i < 200; i++ {
-		n1.HookUnary("CreateVM", older)
-		n1.HookUnary("ExecuteCreateVM", older)
-	}
-	// node-0's tombstone reaches node-1 neither directly nor relayed through
-	// node-2 for a second, so only the entry's retry can carry the create.
-	c.SetLinkFault(n0, n1, LinkFault{Delay: time.Second})
-	c.SetLinkFault(c.Nodes[2], n1, LinkFault{Delay: time.Second})
-
-	if _, err := c.SelfClient(n0).RebuildVM(context.Background(), &pb.RebuildVMRequest{Name: "web"}); err != nil {
-		t.Fatalf("rebuild onto an older host behind on the tombstone: %v; %s", err, whereIs(c, "web"))
 	}
 	assertReCreated(t, c, "web", before, n1)
 }

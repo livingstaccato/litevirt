@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
-	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -189,24 +188,10 @@ func (s *Server) forwardCreateVM(ctx context.Context, req *pb.CreateVMRequest, t
 		}
 		return out, err
 	}
-	out, err := send()
-	if _, replacing := replacedRowFor(ctx, req.GetSpec().GetName()); !replacing {
-		return out, err
-	}
-	// A re-create of a VM this node has deleted. A host on an older build
-	// ignores the replaced VM's identity and refuses AlreadyExists until its
-	// replica has applied the tombstone; ask again until then, within the
-	// bound a current host waits for it itself (vm_recreate_replaces.go).
-	deadline := time.Now().Add(s.replacedTombstoneWaitBound())
-	for status.Code(err) == codes.AlreadyExists && time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
-			return nil, err
-		case <-time.After(250 * time.Millisecond):
-		}
-		out, err = send()
-	}
-	return out, err
+	// A re-create of a VM this node has deleted carries the replaced VM's
+	// identity; the target waits for its replica's tombstone itself
+	// (vm_recreate_replaces.go).
+	return send()
 }
 
 // ExecuteCreateVM is the internal owner-side create endpoint. It authenticates

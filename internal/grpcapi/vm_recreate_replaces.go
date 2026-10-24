@@ -328,9 +328,7 @@ func (s *Server) withReplacedLUNs(ctx context.Context, vm *corrosion.VMRecord) c
 const replacedVMMD = "x-litevirt-recreate-replaces"
 
 // replacedRowMD hands over a row-only replaced VM (withReplacedRow) under a
-// key of its own, so a host on an older build ignores it — and refuses
-// AlreadyExists until its replica has the tombstone, which the entry's
-// forward retries past — rather than take it for a full re-create.
+// key of its own, so it is never taken for a full re-create.
 const replacedRowMD = "x-litevirt-recreate-replaces-row"
 
 type replacedVMWire struct {

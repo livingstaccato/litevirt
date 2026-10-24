@@ -1622,6 +1622,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// (grpcapi.ReconcileNFSMounts), off the start path: a server that does
 	// not answer must not hold the daemon's start.
 	go d.runNFSMountReconcile(ctx)
+	// This host's bridges that cannot carry an access-VLAN NIC
+	// (grpcapi.ReconcileAccessVLANBridges): bridge_vlan_filtering_off.
+	go d.runAccessVLANBridgeReconcile(ctx)
 	// Before this daemon serves: no cold-migration copy can be in flight yet.
 	svc.SweepColdMigrationScratch()
 	svc.SetReplicator(repl)
@@ -3211,6 +3214,26 @@ func (d *Daemon) runNFSMountReconcile(ctx context.Context) {
 			return
 		case <-ticker.C:
 			d.svc.ReconcileNFSMounts(ctx)
+		}
+	}
+}
+
+// runAccessVLANBridgeReconcile judges this host's bridges for access-VLAN
+// NICs at once, then every grpcapi.AccessVLANBridgeReconcileInterval, until
+// ctx is cancelled.
+func (d *Daemon) runAccessVLANBridgeReconcile(ctx context.Context) {
+	if d.svc == nil {
+		return
+	}
+	d.svc.ReconcileAccessVLANBridges(ctx)
+	ticker := time.NewTicker(grpcapi.AccessVLANBridgeReconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.svc.ReconcileAccessVLANBridges(ctx)
 		}
 	}
 }

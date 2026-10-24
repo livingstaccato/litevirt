@@ -438,6 +438,36 @@ of two or more VLANs is not refused: its tagged frames
 pass a bridge with filtering off, and the firewall confines them to the VLANs
 its network allows (docs/firewall.md, "VLAN tags").
 
+### Access-VLAN NICs need a VLAN-filtering bridge
+
+Each host checks every 30 s which of its bridges cannot carry an access-port
+NIC: a Linux bridge with VLAN filtering off (or unreadable) that some VM of the
+cluster has a `trunk:` NIC of one VLAN on, through its network. For each, it
+raises `bridge_vlan_filtering_off` (evaluator `access_vlan`, subject
+`host/<bridge>@<host>`, warning) naming the host, the bridge, how many VMs it
+affects and which, and the fix; `lv health` shows it. That is before a
+failover needs the host: none of those VMs can start there, a failover's
+start included. The condition resolves on the first check that finds the bridge
+filtering VLANs, gone, or used by no such VM; see
+[diagnostics.md](diagnostics.md#a-bridge-cannot-carry-an-access-vlan-nic-bridge_vlan_filtering_off).
+
+The fix, on the host it names:
+
+```bash
+ip link set dev <bridge> type bridge vlan_filtering 1
+bridge vlan add dev <uplink> vid <vlan>      # the VLAN on the bridge's uplink
+```
+
+That lasts until the bridge is created again, after a reboot for one. Keep it
+in what creates the bridge: `VLANFiltering=yes` in the `[Bridge]` section of
+its systemd-networkd `.netdev`, `bridge-vlan-aware yes` for ifupdown2, or
+`bridge.vlan-filtering yes` for NetworkManager. Netplan, which `lv host
+network` renders, has no such setting, and litevirt does not set it on a
+bridge it creates itself (an `isolated` or `vxlan` network's, or a flat one it
+created because none existed): turn it on again after such a bridge is
+re-created (a systemd unit ordered after the network does it at boot), and
+the condition names the bridge until it is.
+
 ## VM IP addressing
 
 How a VM gets its address depends on when and how you set it:

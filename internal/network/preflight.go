@@ -28,32 +28,51 @@ type PreFlightCheck struct {
 // bridge, is not judged: creating the bridge is ensureBridge's, and a bridge
 // litevirt cannot find fails the define on its own.
 func RunPreFlight(checks []PreFlightCheck) error {
+	return RunPreFlightWith(checks, BridgeVLANFiltering)
+}
+
+// RunPreFlightWith is RunPreFlight with the read of a bridge's VLAN filtering
+// given (BridgeVLANFiltering's contract).
+func RunPreFlightWith(checks []PreFlightCheck, filtering func(bridge string) (isBridge, on bool, err error)) error {
 	for _, c := range checks {
 		if c.AccessVLAN == 0 || c.Bridge == "" {
 			continue
 		}
-		if err := checkVLANFiltering(c.Bridge, c.AccessVLAN); err != nil {
+		if err := AccessVLANBridgeProblem(c.Bridge, c.AccessVLAN, filtering); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// checkVLANFiltering refuses a Linux bridge whose vlan_filtering is off.
-func checkVLANFiltering(bridge string, vlan int) error {
+// AccessVLANBridgeProblem is why bridge on this host cannot carry a NIC on
+// access VLAN vlan (it is a Linux bridge, and its VLAN filtering is off or
+// cannot be read), or nil.
+func AccessVLANBridgeProblem(bridge string, vlan int, filtering func(bridge string) (isBridge, on bool, err error)) error {
+	isBridge, on, err := filtering(bridge)
+	switch {
+	case err != nil:
+		return fmt.Errorf("bridge %q: cannot read whether it filters VLANs, needed for a NIC on VLAN %d: %w", bridge, vlan, err)
+	case !isBridge || on:
+		return nil
+	}
+	return fmt.Errorf("bridge %q does not filter VLANs, so a NIC on VLAN %d (trunk: [%d]) would join its untagged "+
+		"segment instead of the VLAN; turn VLAN filtering on (ip link set dev %s type bridge vlan_filtering 1) "+
+		"and give its uplink the VLAN, or move the NIC to a network on the VLAN", bridge, vlan, vlan, bridge)
+}
+
+// BridgeVLANFiltering reads whether bridge, on this host, is a Linux bridge
+// (isBridge; false for a missing device or one that is not a bridge, with no
+// error) and whether its vlan_filtering is 1 (on). err: it is a bridge, and
+// its vlan_filtering could not be read.
+func BridgeVLANFiltering(bridge string) (isBridge, on bool, err error) {
 	dir := filepath.Join(sysClassNet, bridge, "bridge")
 	if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
-		return nil // no such device here, or not a Linux bridge
+		return false, false, nil
 	}
-	path := filepath.Join(dir, "vlan_filtering")
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(filepath.Join(dir, "vlan_filtering"))
 	if err != nil {
-		return fmt.Errorf("bridge %q: cannot read whether it filters VLANs, needed for a NIC on VLAN %d: %w", bridge, vlan, err)
+		return true, false, err
 	}
-	if strings.TrimSpace(string(data)) != "1" {
-		return fmt.Errorf("bridge %q does not filter VLANs, so a NIC on VLAN %d (trunk: [%d]) would join its untagged "+
-			"segment instead of the VLAN; turn VLAN filtering on (ip link set dev %s type bridge vlan_filtering 1) "+
-			"and give its uplink the VLAN, or move the NIC to a network on the VLAN", bridge, vlan, vlan, bridge)
-	}
-	return nil
+	return true, strings.TrimSpace(string(data)) == "1", nil
 }

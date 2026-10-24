@@ -721,6 +721,11 @@ type Server struct {
 	// started (SetNetPreflight); nil = network.RunPreFlight.
 	netPreflight func([]network.PreFlightCheck) error
 
+	// bridgeVLANFiltering reads a bridge's VLAN filtering on this host, for
+	// the start preflight and bridge_vlan_filtering_off
+	// (SetBridgeVLANFiltering); nil = network.BridgeVLANFiltering.
+	bridgeVLANFiltering func(bridge string) (isBridge, on bool, err error)
+
 	// bridgeExists is a test seam for "does this bridge already exist on this
 	// host". Production leaves it nil, preserving network.BridgeExists.
 	bridgeExists func(name string) bool
@@ -1836,6 +1841,12 @@ func (s *Server) SetBridgeEnsure(fn func(name string) error) { s.bridgeEnsure = 
 
 // SetNetPreflight replaces the NIC host-wiring preflight (see netPreflight).
 func (s *Server) SetNetPreflight(fn func([]network.PreFlightCheck) error) { s.netPreflight = fn }
+
+// SetBridgeVLANFiltering replaces the read of a bridge's VLAN filtering on
+// this host (see bridgeVLANFiltering).
+func (s *Server) SetBridgeVLANFiltering(fn func(bridge string) (isBridge, on bool, err error)) {
+	s.bridgeVLANFiltering = fn
+}
 
 // SetDHCPReservationBackend injects the host-local DHCP facts an exact
 // reservation depends on (nic_identity.go): whether this host's dnsmasq

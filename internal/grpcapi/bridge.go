@@ -21,7 +21,16 @@ func (s *Server) nicPreflight(checks []network.PreFlightCheck) error {
 	if s.netPreflight != nil {
 		return s.netPreflight(checks)
 	}
-	return network.RunPreFlight(checks)
+	return network.RunPreFlightWith(checks, s.bridgeVLANFilteringOf)
+}
+
+// bridgeVLANFilteringOf reads a bridge's VLAN filtering on this host
+// (network.BridgeVLANFiltering, or the SetBridgeVLANFiltering seam).
+func (s *Server) bridgeVLANFilteringOf(bridge string) (isBridge, on bool, err error) {
+	if s.bridgeVLANFiltering != nil {
+		return s.bridgeVLANFiltering(bridge)
+	}
+	return network.BridgeVLANFiltering(bridge)
 }
 
 // accessVLAN is the VLAN of an access-port NIC (trunk: with exactly one

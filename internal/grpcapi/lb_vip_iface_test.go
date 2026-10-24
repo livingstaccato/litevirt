@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/netip"
 	"strings"
 	"testing"
 
@@ -204,22 +203,22 @@ func TestApplyLB_HonoursSNAT(t *testing.T) {
 	}
 }
 
-// TestLBVIPInterface_StackBridgeUnderEitherName: a stack's bridge network is
-// provisioned on its short name by the deploy's target host and on its scoped
-// name by a peer target (which is sent the definition without an interface),
-// and the row holds whichever write replicated last. The VIP goes on whichever
-// of the two this host has.
+// TestLBVIPInterface_StackBridgeOnItsRecordedName: a stack's bridge network
+// is on one device on every host, the one its row names (network.BridgeName):
+// its scoped name when the row names no interface. A host that has only the
+// short name does not have the network's bridge, and the VIP is refused there,
+// never put on a device another stack's `hinet` may be on.
 //
-// Mutation: try only network.BridgeName — red.
-func TestLBVIPInterface_StackBridgeUnderEitherName(t *testing.T) {
+// Mutation: fall back to the short name when the scoped one is missing — red.
+func TestLBVIPInterface_StackBridgeOnItsRecordedName(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
-		iface, have string
+		iface, have, want string
 	}{
-		{"", "hinet"},          // row without the interface, this host on the short name
-		{"", "lbs_hinet"},      // row without the interface, this host on the scoped name
-		{"hinet", "lbs_hinet"}, // row with the interface, this host on the scoped name
-		{"hinet", "hinet"},
+		{"", "lbs_hinet", "lbs_hinet"}, // no interface: the scoped name
+		{"", "hinet", ""},              // no interface, only the short name here: refused
+		{"hinet", "hinet", "hinet"},    // the row names the device
+		{"hinet", "lbs_hinet", ""},     // the row names a device this host lacks: refused
 	} {
 		s := testServer(t)
 		have := tc.have
@@ -228,8 +227,15 @@ func TestLBVIPInterface_StackBridgeUnderEitherName(t *testing.T) {
 		if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{Name: "lbs_hinet", StackName: "lbs", Type: "bridge", Config: string(cfg)}); err != nil {
 			t.Fatal(err)
 		}
-		if got, err := lbIfaceOf(s, ctx, "", "lbs", "10.203.0.250"); err != nil || got != tc.have {
-			t.Errorf("row interface %q, host has %s: %q, %v", tc.iface, tc.have, got, err)
+		got, err := lbIfaceOf(s, ctx, "", "lbs", "10.203.0.250")
+		if tc.want == "" {
+			if err == nil {
+				t.Errorf("row interface %q, host has %s: placed on %q; want refused", tc.iface, tc.have, got)
+			}
+			continue
+		}
+		if err != nil || got != tc.want {
+			t.Errorf("row interface %q, host has %s: %q, %v; want %s", tc.iface, tc.have, got, err, tc.want)
 		}
 	}
 }
@@ -238,23 +244,16 @@ func TestLBVIPInterface_StackBridgeUnderEitherName(t *testing.T) {
 // host-isolated `backend` network, on different subnets. On this host b's is
 // on the short name `backend` (b was deployed here: its row names the
 // interface) and a's on the scoped `a_backend` (provisioned as a peer target).
-// Each LB's VIP and SNAT intent land on its own stack's network only; a
-// device whose stack cannot be told is refused, never borrowed.
+// Each LB's VIP and SNAT intent land on its own stack's network only, and a's
+// VIP is never put on b's device.
 //
-// Mutation: match the intent's network by device name (findIsolatedNetworkForBridge),
-// or accept a claimed short name without the address evidence — red.
+// Mutation: match the intent's network by device name (findIsolatedNetworkForBridge) — red.
 func TestLB_TwoStacksSharingAShortNameStayApart(t *testing.T) {
 	ctx := context.Background()
 	setup := func(t *testing.T, devices map[string]string) *Server {
 		t.Helper()
 		s := testServer(t)
 		s.SetBridgeExists(func(b string) bool { _, ok := devices[b]; return ok })
-		s.SetLinkAddrs(func(b string) []netip.Prefix {
-			if p, ok := devices[b]; ok && p != "" {
-				return []netip.Prefix{netip.MustParsePrefix(p)}
-			}
-			return nil
-		})
 		s.lbApplyOverride = func(context.Context, lb.Config) error { return nil }
 		for _, n := range []struct{ name, stack, iface, subnet string }{
 			{"a_backend", "a", "", "10.1.0.0/24"},
@@ -311,12 +310,6 @@ func TestLB_TwoStacksSharingAShortNameStayApart(t *testing.T) {
 		}
 		if in := intent(t, s, "a-lb"); in != nil {
 			t.Errorf("a-lb recorded %+v on b's bridge", in)
-		}
-	})
-	t.Run("a shared short name with no address to tell", func(t *testing.T) {
-		s := setup(t, map[string]string{"backend": ""})
-		if err := s.applyLBForStack(ctx, "b-lb", "10.2.0.250/24", lb.Settings{Ports: ports}, nil, []string{s.hostName}, true); err == nil {
-			t.Error("b's VIP was placed on a device either stack could own")
 		}
 	})
 }

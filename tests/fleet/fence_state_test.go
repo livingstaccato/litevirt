@@ -177,6 +177,9 @@ func TestFleet_OperatorFence_RecoveryResumesExactlyOnce(t *testing.T) {
 	c, a, b, cc, _, d := crashFleet(t, 2744, vm)
 	voters := []*Node{a, b, cc}
 	ledger := watchClaims(t, c)
+	// The operator's SSH fence recovers d's workloads only by its operator's
+	// choice to trust a confirmed SSH power-off.
+	trustSSHPoweroffOn(t, c, a, d, voters...)
 
 	clock := NewVirtualClock(time.Now().UTC())
 	cs := c.NewCoordinators(clock)

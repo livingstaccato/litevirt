@@ -1885,6 +1885,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Warn("firewall: the first pass failed; starts arm their own", "error", err)
 	}
 	d.fwReconciler.Start(ctx)
+	// A start an earlier run of this daemon left created-paused (it died
+	// between creating the domain paused and resuming it) is finished
+	// through the guard now, before any start source and the gRPC server
+	// run, or named by vm_start_stranded_paused (review NB-R1).
+	svc.ResumeStrandedStarts(ctx)
 	go svc.RecordExistingTrunkVLANsLoop(ctx, 0)
 	// A guest handed over paused for its NIC guards runs once they are in
 	// force here, even when the source's resume never arrives (re-review
@@ -3236,6 +3241,7 @@ func (d *Daemon) runAccessVLANBridgeReconcile(ctx context.Context) {
 	pass := func() {
 		d.svc.ReconcileAccessVLANBridges(ctx)
 		d.svc.ConvergeTapVLANs(ctx)
+		d.svc.JudgeStrandedStarts(ctx)
 	}
 	pass()
 	ticker := time.NewTicker(grpcapi.TapVLANConvergeInterval)

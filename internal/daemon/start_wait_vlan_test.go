@@ -1,7 +1,12 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -46,5 +51,50 @@ func TestStartWaitPredicate_TapVLANsWait(t *testing.T) {
 	}
 	if wait("absent") {
 		t.Error("a domain with no VM row waits")
+	}
+}
+
+// NB-R1: the sweep that finishes starts an earlier run left paused runs after
+// the start guard is wired and the first firewall pass, and before any start
+// source (the health checker, the reconciler, onboot) or the gRPC server: no
+// start of this run can be in its paused window while it looks.
+//
+// Mutation: move ResumeStrandedStarts after vmChecker.Start — red.
+func TestRun_StrandedStartSweepBeforeAnyStartSource(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "daemon.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := map[string]token.Pos{}
+	for _, d := range f.Decls {
+		fd, ok := d.(*ast.FuncDecl)
+		if !ok || fd.Name.Name != "Run" || fd.Recv == nil {
+			continue
+		}
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				var b bytes.Buffer
+				_ = printer.Fprint(&b, fset, call.Fun)
+				if _, seen := first[b.String()]; !seen {
+					first[b.String()] = call.Pos()
+				}
+			}
+			return true
+		})
+	}
+	sweep, ok := first["svc.ResumeStrandedStarts"]
+	if !ok {
+		t.Fatal("Run does not call svc.ResumeStrandedStarts")
+	}
+	for _, before := range []string{"d.virt.SetStartGuard", "bootFirewallPass"} {
+		if at, ok := first[before]; !ok || at > sweep {
+			t.Errorf("%s must come before the sweep", before)
+		}
+	}
+	for _, after := range []string{"vmChecker.Start", "d.grpcSrv.Serve", "svc.RunHeldGuestResumer"} {
+		if at, ok := first[after]; !ok || at < sweep {
+			t.Errorf("%s (found %v) must come after the sweep", after, ok)
+		}
 	}
 }

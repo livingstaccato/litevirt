@@ -16,11 +16,11 @@ import (
 // workloads: the gate stops petting and self-fences instead.
 //
 // Progress, not timestamps: each side reports a counter that moves on every
-// unit of work (a DB round trip; a pauser pass and every record it handles),
-// and the gate times how long a counter has stood still on the monotonic
-// clock. A step of the wall clock (an NTP step at boot, a bad RTC, date -s)
-// therefore cannot look like a wedge, and a long but moving pass (a dozen
-// container settles after a heal) is not one either.
+// unit of work (a completed DB round trip; a pauser pass and every record it
+// handles), and the gate times how long a counter has stood still on the
+// monotonic clock. A step of the wall clock (an NTP step at boot, a bad RTC,
+// date -s) therefore cannot look like a wedge, and a long but moving pass (a
+// dozen container settles after a heal) is not one either.
 //
 // The gate runs only on a configured, verified, armed hardware watchdog: the
 // same condition under which the pauser and the VIP demoter may self-fence.
@@ -49,13 +49,18 @@ type livenessWiring struct {
 	mu             sync.RWMutex
 	dbProbe        func(context.Context) error
 	pauserProgress func() uint64
+	dbAlert        func(DBProbeAlert)
 	stale          time.Duration // 0: the default; <0: off
 }
 
-// SetDBProbe wires a bounded database round trip (a Query under a short
-// timeout). The gate runs it every pet interval. A round trip that returns an
-// error still counts as progress: a disk error is not a wedge, and has its own
-// handling.
+// SetDBProbe wires a database round trip (a Query under a short timeout).
+// The gate runs it every pet interval. The timeout bounds the round trip, not
+// the wait for the state store's lock: a writer holding that lock past the
+// threshold is a lock left held, the wedge the gate exists to catch, so the
+// probe waits behind it and the counter stands still. Only a probe that
+// returns nil counts as progress: one that returns an error (its timeout, an
+// interrupted query, SQLITE_BUSY or SQLITE_LOCKED) leaves the counter where
+// it was.
 func (c *Controller) SetDBProbe(fn func(context.Context) error) {
 	if c == nil {
 		return
@@ -63,6 +68,48 @@ func (c *Controller) SetDBProbe(fn func(context.Context) error) {
 	c.live.mu.Lock()
 	c.live.dbProbe = fn
 	c.live.mu.Unlock()
+}
+
+// DBProbeAlert is what the gate raises while its DB probes keep failing,
+// before a counter standing still fences the host, and once a probe succeeds
+// again (SetDBProbeAlert).
+type DBProbeAlert struct {
+	Recovered bool          // a probe succeeded after a failing alert
+	Err       string        // the last probe's error; "" when Recovered
+	Failing   time.Duration // since the first probe of the run of failures
+	FenceIn   time.Duration // until the threshold is reached if they keep failing
+}
+
+// Detail is the alert as one line for an operator.
+func (a DBProbeAlert) Detail() string {
+	if a.Recovered {
+		return fmt.Sprintf("a liveness DB probe succeeded again after failing for %s", a.Failing.Round(time.Second))
+	}
+	return fmt.Sprintf("liveness DB probes have failed for %s (last error: %s); the host self-fences in %s if they keep failing",
+		a.Failing.Round(time.Second), a.Err, a.FenceIn.Round(time.Second))
+}
+
+// SetDBProbeAlert wires a callback for the gate's failing-probe alert. The
+// gate logs each alert itself; fn only forwards it, and must not block: the
+// probe loop calls it.
+func (c *Controller) SetDBProbeAlert(fn func(DBProbeAlert)) {
+	if c == nil {
+		return
+	}
+	c.live.mu.Lock()
+	c.live.dbAlert = fn
+	c.live.mu.Unlock()
+}
+
+// LivenessDBAlert returns the wired alert callback (nil for none), so a
+// caller's wiring can be tested.
+func (c *Controller) LivenessDBAlert() func(DBProbeAlert) {
+	if c == nil {
+		return nil
+	}
+	c.live.mu.RLock()
+	defer c.live.mu.RUnlock()
+	return c.live.dbAlert
 }
 
 // SetPauserProgress wires the partition pauser's progress counter
@@ -138,6 +185,40 @@ func (m *progressMark) stillFor(now time.Duration) time.Duration {
 	return now - m.since
 }
 
+// dbProbeAlerts decides when the failing-probe alert is raised: once probes
+// have failed without a success for a third of the threshold, then at most
+// every quarter of it while they keep failing, and once more, as recovered,
+// when a probe succeeds after one was raised. A run of failures shorter than
+// a third of the threshold raises nothing. Zero stale raises nothing.
+type dbProbeAlerts struct {
+	stale     time.Duration
+	lastOK    time.Duration // monoNow of the last nil probe, or the gate's start
+	failing   bool
+	firstFail time.Duration
+	alerted   bool
+	lastAlert time.Duration
+}
+
+func (a *dbProbeAlerts) observe(err error, now time.Duration) (DBProbeAlert, bool) {
+	if a.stale <= 0 {
+		return DBProbeAlert{}, false
+	}
+	if err == nil {
+		raised, failing := a.alerted, now-a.firstFail
+		a.lastOK, a.failing, a.alerted = now, false, false
+		return DBProbeAlert{Recovered: true, Failing: failing}, raised
+	}
+	if !a.failing {
+		a.failing, a.firstFail = true, now
+	}
+	failing := now - a.firstFail
+	if failing < a.stale/3 || (a.alerted && now-a.lastAlert < a.stale/4) {
+		return DBProbeAlert{}, false
+	}
+	a.alerted, a.lastAlert = true, now
+	return DBProbeAlert{Err: err.Error(), Failing: failing, FenceIn: max(a.stale-(now-a.lastOK), 0)}, true
+}
+
 // livenessGate is one Heartbeat's gate.
 type livenessGate struct {
 	ctrl   *Controller
@@ -146,6 +227,7 @@ type livenessGate struct {
 	dbDone atomic.Uint64
 	db     progressMark
 	pauser progressMark
+	alerts dbProbeAlerts // runDB's own
 	cancel context.CancelFunc
 }
 
@@ -161,6 +243,7 @@ func (c *Controller) startLivenessGate(ctx context.Context, interval time.Durati
 	now := monoNow()
 	if probe != nil {
 		g.db.observe(0, now)
+		g.alerts = dbProbeAlerts{stale: stale, lastOK: now}
 		lctx, cancel := context.WithCancel(ctx)
 		g.cancel = cancel
 		go g.runDB(lctx, probe, interval)
@@ -171,8 +254,9 @@ func (c *Controller) startLivenessGate(ctx context.Context, interval time.Durati
 
 func (g *livenessGate) stop() { g.cancel() }
 
-// runDB runs probe every interval, synchronously: a probe that never returns
-// is exactly what a standing counter reports.
+// runDB runs probe every interval, synchronously: a probe that never returns,
+// or returns only errors, is exactly what a standing counter reports. Probes
+// that keep returning errors raise the failing-probe alert (dbProbeAlerts).
 func (g *livenessGate) runDB(ctx context.Context, probe func(context.Context) error, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -184,11 +268,32 @@ func (g *livenessGate) runDB(ctx context.Context, probe func(context.Context) er
 			pctx, cancel := context.WithTimeout(ctx, interval/3)
 			err := probe(pctx)
 			cancel()
-			if err != nil && ctx.Err() == nil {
-				slog.Warn("watchdog: liveness DB round trip returned an error (counted as progress)", "error", err)
+			if ctx.Err() == nil {
+				if a, ok := g.alerts.observe(err, monoNow()); ok {
+					g.raise(a)
+				}
+			}
+			if err != nil {
+				if ctx.Err() == nil {
+					slog.Warn("watchdog: liveness DB round trip returned an error (not counted as progress)", "error", err)
+				}
+				continue
 			}
 			g.dbDone.Add(1)
 		}
+	}
+}
+
+// raise logs a failing-probe alert and hands it to the wired callback.
+func (g *livenessGate) raise(a DBProbeAlert) {
+	if a.Recovered {
+		slog.Info("watchdog: liveness DB probe recovered", "failed_for", a.Failing.Round(time.Second))
+	} else {
+		slog.Warn("watchdog: liveness DB probes keep failing; the host self-fences if they continue",
+			"error", a.Err, "failing_for", a.Failing.Round(time.Second), "self_fence_in", a.FenceIn.Round(time.Second))
+	}
+	if fn := g.ctrl.LivenessDBAlert(); fn != nil {
+		fn(a)
 	}
 }
 
@@ -213,6 +318,13 @@ func (g *livenessGate) check() string {
 		}
 	}
 	return ""
+}
+
+// LivenessDBProbe returns the wired DB probe (nil for none), so a caller's
+// wiring can be tested against the probe the gate actually runs.
+func (c *Controller) LivenessDBProbe() func(context.Context) error {
+	probe, _, _ := c.liveness()
+	return probe
 }
 
 // LivenessWiring reports what the gate is wired with, for tests and

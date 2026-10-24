@@ -335,6 +335,55 @@ func TestHeartbeat_LivenessGate(t *testing.T) {
 			t.Fatal("a pauser making progress stopped petting")
 		}
 	})
+	// Both counters wired, as the daemon wires them. Either one stalling must
+	// fence on its own; a "both must stall" gate keeps petting these.
+	//
+	// Mutation: make check fence only when BOTH the DB and the pauser are
+	// stalled, and the two "must self-fence" cases go red.
+	t.Run("both wired: wedged DB with a moving pauser self-fences", func(t *testing.T) {
+		verifiedDevice(t)
+		var c counter
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		go c.tick(ctx, 20*time.Millisecond)
+		block := make(chan struct{})
+		t.Cleanup(func() { close(block) })
+		ctrl := runGate(t, fakeWatchdog(t, ""), func(ctrl *Controller) {
+			ctrl.SetDBProbe(func(context.Context) error { <-block; return nil })
+			ctrl.SetPauserProgress(c.n.Load)
+		})
+		time.Sleep(300 * time.Millisecond)
+		if !ctrl.Fenced() {
+			t.Fatal("a wedged DB with a moving pauser did not self-fence")
+		}
+	})
+	t.Run("both wired: live DB with a stalled pauser self-fences", func(t *testing.T) {
+		verifiedDevice(t)
+		ctrl := runGate(t, fakeWatchdog(t, ""), func(ctrl *Controller) {
+			ctrl.SetDBProbe(func(context.Context) error { return nil })
+			ctrl.SetPauserProgress(func() uint64 { return 7 })
+		})
+		time.Sleep(300 * time.Millisecond)
+		if !ctrl.Fenced() {
+			t.Fatal("a live DB with a stalled pauser did not self-fence")
+		}
+	})
+	t.Run("both wired: both moving keeps petting", func(t *testing.T) {
+		verifiedDevice(t)
+		var c counter
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		go c.tick(ctx, 20*time.Millisecond)
+		dev := fakeWatchdog(t, "")
+		ctrl := runGate(t, dev, func(ctrl *Controller) {
+			ctrl.SetDBProbe(func(context.Context) error { return nil })
+			ctrl.SetPauserProgress(c.n.Load)
+		})
+		time.Sleep(300 * time.Millisecond)
+		if ctrl.Fenced() || !grows(t, dev, 60*time.Millisecond) {
+			t.Fatal("a live DB and a moving pauser stopped petting")
+		}
+	})
 	t.Run("pauser not started gates nothing", func(t *testing.T) {
 		verifiedDevice(t)
 		dev := fakeWatchdog(t, "")

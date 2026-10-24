@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/watchdog"
 )
 
@@ -169,6 +171,107 @@ func TestRun_WiresTheWatchdogController(t *testing.T) {
 	for _, want := range []string{"startWatchdog", "wirePauserLiveness"} {
 		if !calls[want] {
 			t.Errorf("Daemon.Run does not call d.%s", want)
+		}
+	}
+}
+
+// The DB probe the daemon wires is a real round trip through the state
+// store's client: it completes on an idle client, and while a writer holds
+// the client's lock it waits behind it past its own timeout, so the gate's
+// counter stands still (watchdog.SetDBProbe) and a lock left held past the
+// threshold self-fences.
+//
+// Mutations: make the probe a no-op, or have it stop waiting for the lock at
+// its timeout, and the held-lock check goes red; have it drop Query's error
+// and the deadline check goes red.
+func TestWireWatchdog_DBProbeWaitsBehindAHeldWriteLock(t *testing.T) {
+	d := &Daemon{cfg: &Config{Watchdog: WatchdogConfig{LivenessStaleSec: 120}},
+		db: corrosion.NewTestClientT(t), watchdogRunDir: t.TempDir()}
+	ctrl := watchdog.NewController()
+	d.wireWatchdog(ctrl)
+	probe := ctrl.LivenessDBProbe()
+	if probe == nil {
+		t.Fatal("wireWatchdog wired no DB probe")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := probe(ctx); err != nil {
+		t.Fatalf("the probe failed on an idle client: %v", err)
+	}
+
+	mu := d.db.Mu()
+	mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			mu.Unlock()
+		}
+	}()
+	const timeout = 50 * time.Millisecond
+	done := make(chan error, 1)
+	go func() {
+		pctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		done <- probe(pctx)
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("the probe returned (%v) while a writer held the client's lock: the gate would count a held lock as progress", err)
+	case <-time.After(10 * timeout):
+	}
+	mu.Unlock()
+	locked = false
+	select {
+	case err := <-done:
+		// It got the lock past its timeout: an error, which the gate does not
+		// count as progress (watchdog.SetDBProbe).
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("the probe that waited past its timeout returned %v, want a deadline error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the probe did not return once the writer released the lock")
+	}
+}
+
+// watchdogNotes records the notifications wireWatchdogAlerts sends.
+type watchdogNotes struct{ ch chan [4]string }
+
+func (n watchdogNotes) NotifyWatchdog(kind string, sev notify.Severity, subject, detail string) {
+	n.ch <- [4]string{kind, string(sev), subject, detail}
+}
+
+// The gate's failing-probe alert reaches the notifier as
+// watchdog.db_probe_failing (warn) and its recovery as
+// watchdog.db_probe_recovered (info), naming this host and carrying the
+// alert's detail.
+//
+// Mutation: drop the SetDBProbeAlert call, or swap the kinds, and it goes red.
+func TestWireWatchdogAlerts_PublishesFailingAndRecovered(t *testing.T) {
+	d := &Daemon{cfg: &Config{HostName: "h1"}}
+	ctrl := watchdog.NewController()
+	n := watchdogNotes{ch: make(chan [4]string, 4)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.wireWatchdogAlerts(ctx, ctrl, n)
+	fn := ctrl.LivenessDBAlert()
+	if fn == nil {
+		t.Fatal("wireWatchdogAlerts wired no alert callback")
+	}
+	failing := watchdog.DBProbeAlert{Err: "database is locked", Failing: 45 * time.Second, FenceIn: time.Minute}
+	recovered := watchdog.DBProbeAlert{Recovered: true, Failing: 90 * time.Second}
+	fn(failing)
+	fn(recovered)
+	for _, want := range [][4]string{
+		{"watchdog.db_probe_failing", "warn", "h1", failing.Detail()},
+		{"watchdog.db_probe_recovered", "info", "h1", recovered.Detail()},
+	} {
+		select {
+		case got := <-n.ch:
+			if got != want {
+				t.Fatalf("notification = %q, want %q", got, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("no %s notification", want[0])
 		}
 	}
 }

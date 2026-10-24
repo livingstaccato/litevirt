@@ -167,6 +167,10 @@ func TestConfirmedOffNow_AResumedGateRequiresTheConfirmationToStand(t *testing.T
 					c.Gate = gateEnforcing(capabilities.SafeFenceDefaultV1)
 					c.SafeFenceEnforce = true
 					c.PauseWaitFor = func(int) time.Duration { return 0 }
+					// The self-pause row is authority only while the pause
+					// is relied on.
+					c.PartitionPauseEnforced = func(context.Context) bool { return true }
+					c.PeerPausesOnLoss = func(string) bool { return true }
 				}
 
 				c.run(ctx)

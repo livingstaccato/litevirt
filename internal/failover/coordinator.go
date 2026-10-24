@@ -2584,14 +2584,17 @@ func (c *Coordinator) resumeActionFor(ctx context.Context, h *corrosion.HostReco
 // a caller that has checked the read decides on exactly those rows.
 func (c *Coordinator) resumeActionForIn(ctx context.Context, hr healthRead, h *corrosion.HostRecord, rec fenceRecord, at time.Time) (resumeAction, string) {
 	host := h.Name
-	if corrosion.ReliesOnPartitionPause(rec.Method, rec.Detail) && c.relyOnPartitionPause(ctx, h) {
+	if corrosion.ReliesOnPartitionPause(rec.Method, rec.Detail) && !c.relyOnPartitionPause(ctx, h) {
+		// A self-pause record is authority only while the pause is relied
+		// on: without it, nothing proves the host is off.
+		return resumeDecline, whyPauseNotRelied
+	}
+	if corrosion.ReliesOnPartitionPause(rec.Method, rec.Detail) {
 		// A fence that relied on the host's partition pause, which may still
 		// be relied on. The host is up by design, so whether anybody has seen
 		// it answer is not this point's question: recoverFenced starts a fresh
 		// wait, and the deadline asks it (selfPauseStillStands). An outage
-		// that has ended is still declined here. Once the pause may not be
-		// relied on, the record is the assumed best-effort fence it was
-		// without it, and is judged as one below.
+		// that has ended is still declined here.
 		if !c.streakSpansIn(hr, host, at) {
 			return resumeDecline, "no observer has watched the host stay down since the fence"
 		}
@@ -3899,6 +3902,11 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	// Nor does an SSH power-off the remote shell confirmed, unless the host
 	// trusts one.
 	fr = holdUntrustedSSH(notAFenceUnlessPaused(fr), trustsSSHPoweroff(h))
+	// And a self-pause counts only while the pause is still relied on.
+	if fr.Success && corrosion.ReliesOnPartitionPause(fr.Method, fr.Detail) && !c.relyOnPartitionPause(ctx, h) {
+		fr.Success = false
+		fr.Detail += "; " + whyPauseNotRelied
+	}
 
 	// Step 2b: a fence that did not record the host "fenced" leaves it
 	// "offline" — a weaker claim, and the one the split-brain guards below

@@ -76,7 +76,7 @@ func (c *Coordinator) relyOnPartitionPause(ctx context.Context, h *corrosion.Hos
 	}
 	if failed {
 		c.noteNotRelying(h.Name, "pause_failed", func() {
-			slog.Warn("failover: the host reported its partition pause FAILED; recovering on the best-effort fence alone, as without partition pause",
+			slog.Warn("failover: the host reported its partition pause FAILED; not relying on it, so a best-effort fence of it recovers nothing until it is confirmed off",
 				"host", h.Name)
 		})
 		return false
@@ -342,6 +342,12 @@ type pauseVerdict struct {
 	observers []string
 }
 
+// whyPauseNotRelied refuses a self-pause whose pause can no longer be relied
+// on, at its deadline and on resume.
+const whyPauseNotRelied = "the host's partition pause is no longer relied on (it reported the pause failed, " +
+	"or this coordinator does not rely on it), and nothing else proves the host is off; power it off and run " +
+	"'lv host fence-confirm', or give it an ipmi or redfish fence strategy"
+
 // refused is a refusal whose reason names no observer.
 func refused(why string) pauseVerdict { return pauseVerdict{why: why, key: why} }
 
@@ -430,12 +436,15 @@ const whyContacted = "this node probed the host healthy since the wait began"
 // same evidence. Answers that are still the latest verdict (a bridge that
 // still stands) are not affected.
 func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.HostRecord, at, mono time.Time) pauseVerdict {
-	hr := c.readHostHealth(ctx, h.Name)
 	if !c.relyOnPartitionPause(ctx, h) {
-		v := c.quietFallback(ctx, hr, h.Name, at, false)
-		v.bridged, v.observers = false, nil
-		return v
+		// The wait proves nothing without the pause: the host reported its
+		// pause failed, or this coordinator cannot rely on it (its own flag
+		// off, no probe answer from the host). Nothing else proves the host
+		// off, so the deadline refuses, re-checked every cycle, and the
+		// stall alert names the way out.
+		return refused(whyPauseNotRelied)
 	}
+	hr := c.readHostHealth(ctx, h.Name)
 	sets, explicit, err := c.pauseVoterSets(ctx, h.Name)
 	if errors.Is(err, errVoterSetMoved) {
 		return refused(keyVoterSetMoved)

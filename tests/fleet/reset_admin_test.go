@@ -36,7 +36,9 @@ func TestFleet_ResetAdminIsAuditedAndVerifiesEverywhere(t *testing.T) {
 		t.Fatalf("seed admin: %v", err)
 	}
 
-	// Exactly what `lv user reset-admin` dials on node-0.
+	// Exactly what `lv user reset-admin` dials on node-0, which only root
+	// may do; the test runs unprivileged.
+	t.Cleanup(cli.RunAsRootForTests())
 	client, closeConn, err := cli.ConnectLocalRoot(a.PKIDir, a.Port)
 	if err != nil {
 		t.Fatalf("ConnectLocalRoot: %v", err)

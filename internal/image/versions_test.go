@@ -4,10 +4,79 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestArtifactPinValidatesExistingMarkerAndSyncsItAgain(t *testing.T) {
+	for _, kind := range []string{"valid", "foreign-content", "symlink", "directory", "inaccessible", "file-sync-failure", "directory-sync-failure"} {
+		t.Run(kind, func(t *testing.T) {
+			s := NewStore(t.TempDir())
+			if err := s.Init(); err != nil {
+				t.Fatal(err)
+			}
+			p, err := s.Publish("base", stage(t, s, []byte("base")), digestOf([]byte("base")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			pin := pinPath(p.Path)
+			switch kind {
+			case "foreign-content":
+				err = os.WriteFile(pin, []byte("another marker"), 0644)
+			case "symlink":
+				err = os.Symlink(p.Path, pin)
+			case "directory":
+				err = os.Mkdir(pin, 0700)
+			default:
+				err = os.WriteFile(pin, nil, 0644)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldFile, oldDir := artifactPinFileSync, artifactPinDirectorySync
+			defer func() { artifactPinFileSync, artifactPinDirectorySync = oldFile, oldDir }()
+			oldOpen := artifactPinOpen
+			defer func() { artifactPinOpen = oldOpen }()
+			if kind == "inaccessible" {
+				artifactPinOpen = func(*os.File, string, bool) (*os.File, error) { return nil, os.ErrPermission }
+			}
+			var order []string
+			artifactPinFileSync = func(f *os.File) error {
+				order = append(order, "file")
+				if kind == "file-sync-failure" {
+					return errors.New("file sync failed")
+				}
+				return f.Sync()
+			}
+			artifactPinDirectorySync = func(f *os.File) error {
+				order = append(order, "directory")
+				if kind == "directory-sync-failure" {
+					return errors.New("directory sync failed")
+				}
+				return f.Sync()
+			}
+			err = s.Pin(p.Path)
+			if kind == "valid" {
+				if err != nil || len(order) != 2 || order[0] != "file" || order[1] != "directory" {
+					t.Fatalf("pre-existing pin was not durably checked: %v %v", order, err)
+				}
+			} else if err == nil {
+				t.Fatal("foreign or uncertain pin reported success")
+			}
+			if !Pinned(p.Path) {
+				t.Fatal("uncertain pin was removed")
+			}
+			if kind == "foreign-content" {
+				b, _ := os.ReadFile(pin)
+				if string(b) != "another marker" {
+					t.Fatal("foreign marker overwritten")
+				}
+			}
+		})
+	}
+}
 
 func digestOf(b []byte) string {
 	h := sha256.Sum256(b)

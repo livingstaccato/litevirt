@@ -39,7 +39,8 @@ type ExecutionRecord struct {
 	Version     int
 	Preparation Preparation
 	State       string
-	Effect      *ExecutionEffect `json:",omitempty"`
+	Effect      *ExecutionEffect   `json:",omitempty"`
+	Disk        *ExecutionDiskPlan `json:",omitempty"`
 }
 
 // LocalClosure describes participating synchronous calls only. A running VM or
@@ -117,12 +118,19 @@ func validateExecutionRecord(e Entry) error {
 	if r.State == "closed" && r.Effect != nil && r.Effect.State != "completed" {
 		return ErrCorrupt
 	}
+	if err := validateExecutionDisk(r); err != nil {
+		return err
+	}
 	return nil
 }
 func copyExecutionRecord(r ExecutionRecord) ExecutionRecord {
 	if r.Effect != nil {
 		v := *r.Effect
 		r.Effect = &v
+	}
+	if r.Disk != nil {
+		v := *r.Disk
+		r.Disk = &v
 	}
 	return r
 }
@@ -273,6 +281,10 @@ func (c *ExecutionController) execute(ctx context.Context, p Preparation, id str
 		c.mu.Unlock()
 		return ErrExecutionUngrant
 	}
+	if s.record.Disk != nil && (validateExecutionDisk(&s.record) != nil || s.record.Disk.EffectID != id || s.record.Disk.Generation != a.generation) {
+		c.mu.Unlock()
+		return ErrExecutionUngrant
+	}
 	if s.reopened || s.record.State != "prepared" || s.record.Effect != nil || s.active != nil || id == "" || call == nil {
 		c.mu.Unlock()
 		return ErrExecutionUnknown
@@ -332,6 +344,9 @@ func (c *ExecutionController) CloseTarget(ctx context.Context, p Preparation) (L
 	}
 	active := s.active
 	c.mu.Unlock()
+	if executionTargetClosingSnapshot != nil {
+		executionTargetClosingSnapshot()
+	}
 	if active != nil {
 		select {
 		case <-active:

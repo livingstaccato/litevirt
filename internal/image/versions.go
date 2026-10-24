@@ -129,18 +129,9 @@ func (s *Store) Pin(path string) error {
 	if _, ok := ImageNameOfFile(path); !ok {
 		return fmt.Errorf("%s is not an image file", path)
 	}
-	if Pinned(path) {
-		return nil
-	}
-	tmp := filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+"."+randid.New()+".tmp")
-	if err := os.WriteFile(tmp, nil, 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, pinPath(path)); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	name, _ := ImageNameOfFile(path)
+	defer s.lockName(name)()
+	return s.pinArtifactLocked(path, true)
 }
 
 // Pinned reports whether path is pinned. A pin that cannot be read counts as
@@ -564,6 +555,9 @@ func (s *Store) RemoveImageFile(name, path string) error {
 	if Pinned(path) {
 		return fmt.Errorf("%s is pinned: a backup was taken on it", path)
 	}
+	if artifactRemovalChecked != nil {
+		artifactRemovalChecked(s, "RemoveImageFile")
+	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
@@ -576,6 +570,7 @@ func (s *Store) RemoveImageFile(name, path string) error {
 // removed. When it is the file the name's pointer names, the pointer goes
 // first, so no new disk is created on it from here on.
 func (s *Store) RemoveDeletedImageFile(name, path string) error {
+	defer s.lockName(name)()
 	if !IsImageFile(s.imageDir, name, path) {
 		return fmt.Errorf("%s is not a file of image %q", path, name)
 	}
@@ -586,6 +581,9 @@ func (s *Store) RemoveDeletedImageFile(name, path string) error {
 		if err := os.Remove(s.pointerPath(name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("remove image %q's current-version pointer: %w", name, err)
 		}
+	}
+	if artifactRemovalChecked != nil {
+		artifactRemovalChecked(s, "RemoveDeletedImageFile")
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err

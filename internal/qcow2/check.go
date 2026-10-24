@@ -27,6 +27,11 @@ func Check(path string) error {
 		return err
 	}
 	defer f.Close()
+	return CheckFile(f)
+}
+
+// CheckFile observes the caller-held original descriptor; it never reopens its path.
+func CheckFile(f *os.File) error {
 
 	h, err := readHeader(f)
 	if err != nil {

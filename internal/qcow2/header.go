@@ -32,7 +32,16 @@ const (
 
 // Options allows callers to override format defaults.
 // Zero values use defaults (64 KB clusters, 16-bit refcounts).
+// ArtifactOptions fixes physical ownership and the exact pre-journaled temp.
+// It supplies no execution permission. Nil leaves ordinary creation unchanged.
+type ArtifactOptions struct {
+	Ownership     []byte
+	TemporaryPath string
+}
+
 type Options struct {
+	Artifact *ArtifactOptions
+
 	ClusterBits   uint32 // 9–21 (512 B – 2 MB), default 16 (64 KB)
 	RefcountOrder uint32 // 0–6 (1–64 bit), default 4 (16-bit)
 	// Uncompressed, when true, makes Convert write data clusters uncompressed.

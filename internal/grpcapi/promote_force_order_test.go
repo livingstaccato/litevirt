@@ -24,7 +24,8 @@ func promoteErr(s *Server, replica string) error {
 
 // A --force promotion replaces a domain already defined under the name only
 // once nothing is left to refuse. Here a file is already at the root's live
-// path: the promotion refuses it (refuseExistingFile) and the running domain
+// path (the random part of its name pinned to one a file has): the promotion
+// refuses it (refuseExistingFile) and the running domain
 // is left defined and running. It used to be destroyed and undefined first,
 // leaving the VM undefined by a promotion that then refused.
 //
@@ -36,13 +37,14 @@ func TestPromote_ForceRefusesBeforeItDestroysTheDomain(t *testing.T) {
 	run := stamp(10 * time.Minute)
 	replica := seedReplica(t, poolDir, "", "db", "root", run, "raw", 1<<20)
 	fake := s.virt.(*libvirtfake.Fake)
-	if err := fake.DefineDomain("<domain><name>db</name></domain>"); err != nil {
+	if err := fake.DefineDomain("<domain><name>db</name><uuid>" + testVMUUID("db") + "</uuid></domain>"); err != nil {
 		t.Fatal(err)
 	}
 	if err := fake.StartDomain("db"); err != nil {
 		t.Fatal(err)
 	}
-	live := filepath.Join(poolDir, "db-promoted-"+strings.TrimSuffix(replica, ".raw")+".qcow2")
+	s.promotedDiskSuffix = func() string { return "0123456789abcdef" } // a name a file already has
+	live := filepath.Join(poolDir, "db-promoted-"+strings.TrimSuffix(replica, ".raw")+"-0123456789abcdef.qcow2")
 	if err := os.WriteFile(live, []byte("someone's disk"), 0o600); err != nil {
 		t.Fatal(err)
 	}

@@ -4227,6 +4227,8 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// The domain is gone everywhere: a volume move it left unresolved
 		// describes nothing.
 		s.forgetMoveRecords(ctx, req.Name)
+		// A promotion's marker and journal of the name describe nothing either.
+		s.forgetPromoteRecords(ctx, req.Name)
 		// This path returns without reaching the main cleanup below, so the
 		// marker has to be dropped here too. A ghost row whose domain is already
 		// gone still leaves <dataDir>/vms/<name>/owner_epoch behind, and the next
@@ -4614,6 +4616,8 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// Only now: a delete that fails before its tombstone keeps the row, and
 	// with it the record and condition that guard its next start.
 	s.forgetMoveRecords(ctx, req.Name)
+	// A promotion's marker and journal of the name describe nothing either.
+	s.forgetPromoteRecords(ctx, req.Name)
 	s.retireNICGuards(ctx, req.Name)
 	s.resyncDHCPHosts()
 

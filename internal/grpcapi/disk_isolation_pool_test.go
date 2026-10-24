@@ -211,13 +211,14 @@ func TestUpload_NeverReplacesAnotherProjectsDisk(t *testing.T) {
 	f.assertBIntact(t)
 }
 
-// Promote builds the live disk at "<new-name>-promoted-<stamp>.qcow2" in the
-// pool, and the new name is the caller's. A file already there — here project
+// Promote builds the live disk at "<new-name>-promoted-<stamp>-<random>.qcow2"
+// in the pool, and the new name is the caller's (the random part pinned here
+// to the name of a file already there). A file already there — here project
 // B's disk — is refused, not replaced, and not removed by the error path.
 func TestPromoteReplica_LiveDiskNeverOverwrites(t *testing.T) {
 	f := newPoolFixture(t)
 	ownReplica := seedOwnReplica(t, f, "web", "1")
-	livePath := filepath.Join(f.dr, promotedLiveName(t, "x", ownReplica))
+	livePath := filepath.Join(f.dr, promotedLiveName(t, f.s, "x", ownReplica))
 	if err := qcow2.Create(livePath, 1<<20, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -256,10 +257,12 @@ func seedOwnReplica(t *testing.T, f *poolFixture, vm, disk string) string {
 	return rec.File
 }
 
-// promotedLiveName is the live-disk name doPromoteLocal derives.
-func promotedLiveName(t *testing.T, newName, replica string) string {
+// promotedLiveName is the live-disk name doPromoteLocal derives, with s's
+// random part pinned to a fixed one.
+func promotedLiveName(t *testing.T, s *Server, newName, replica string) string {
 	t.Helper()
-	return newName + "-promoted-" + strings.TrimSuffix(strings.TrimSuffix(replica, ".qcow2"), ".raw") + ".qcow2"
+	s.promotedDiskSuffix = func() string { return "0123456789abcdef" }
+	return newName + "-promoted-" + strings.TrimSuffix(strings.TrimSuffix(replica, ".qcow2"), ".raw") + "-0123456789abcdef.qcow2"
 }
 
 // A live move's destination is preallocated as a new qcow2; a file already at

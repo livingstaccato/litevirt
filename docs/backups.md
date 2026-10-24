@@ -961,10 +961,46 @@ incomplete the VM is marked **partial**:
   `vm.promoted_partial`.
 
 A disk not recovered is not attached; attach or restore it once its host is
-back. A file already where a disk's live disk would go (a crashed earlier
-attempt's, say) is left alone, and the live disk is built beside it. A
-crash-recovered promotion counts another disk only when the domain it adopts
-has that disk.
+back. Each live disk a promotion builds is a new file in the target pool,
+`<vm>-promoted-<replica stem>-<random>.qcow2`, under a name no file has had:
+the name an earlier build used, without the random part, can be the missing
+base of a disk kept by `lv rm --keep-disks` after an earlier promotion from
+the same replica, and a file built there would become that kept disk's base.
+A promotion never refuses for a kept disk, so failover does not wait on
+`kept-disks.json`, and a file already at any name is never replaced. The
+name is recorded on the host before the file is created
+(`<data_dir>/promote-disks/<vm>.json`), so a promotion retried after a crash
+or a failure, with the same proof, a new one or none, reuses the live disk the
+earlier attempt built from the same replica instead of building another
+beside it. The record belongs to one promotion of one VM in progress: it is read
+only while no other promotion of the name runs on the host (a second one is
+refused), the promotion's promote marker (written just before the domain
+starts) is there and names the VM's uuid, and the domain that promotion
+defined is still defined there and names the file. A VM without a uuid (a
+plain `lv import` makes one) never reuses one: a retry builds fresh. It is
+removed, before the marker, once the attempt ends. A delete of the VM clears
+both only on the host the VM's record names, which is the promotion host
+once a promotion has committed; a record left on another host (a promotion
+that failed at its commit) stays until a promotion of the name there drops
+it, and is never reused without the uuid match and the definition naming the
+file. A promote marker counts as evidence that a domain running under the
+name is an earlier attempt of the promotion only when it names that VM's
+uuid (for a renamed promotion, the running domain's). A marker an earlier
+build wrote names no uuid; for a promotion in place it counts when the
+running domain's uuid is the VM's. Otherwise, when either side names none,
+the promotion is refused and nothing is changed; stopping the domain and
+retrying rebuilds it from the replica and discards everything its guest
+wrote since the promotion started. A record
+of no promotion in progress, or of another VM of the name, is dropped; a file
+it named that no VM uses and no delete kept is left alone, never reused nor
+removed, and a `vm.disk.left` event of the VM names it, as one built from
+another replica is left alone. A retry that adopts a running domain takes the
+live disk the domain runs from, and is refused when it runs from none built
+from the replica chosen. A recorded
+file is never reused when a disk row, a kept-disk note or `kept-disks.json`
+names it; when the kept-disk records cannot be read, a fresh live disk is
+built instead, so failover does not wait on them. A crash-recovered promotion counts
+another disk only when the domain it adopts has that disk.
 
 After a successful automatic promotion the failover coordinator records the
 disks the VM ran on, on the failed host — the real, newer data of every disk —

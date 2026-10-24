@@ -1011,6 +1011,9 @@ type Server struct {
 	// migration copies (hostDiskFile, SetHostDiskRootForTest). Empty in
 	// production.
 	hostDiskRoot string
+	// promotedDiskSuffix is a TEST SEAM for the random part of a promoted
+	// live disk's name (freshPromotedPath). nil in production: randid.New.
+	promotedDiskSuffix func() string
 	// startedAt is when this daemon's Server was made. A start lease this
 	// host holds that was taken before it was left by a run that is gone
 	// (holdStartLease). Zero in tests that build a Server directly: every
@@ -1084,6 +1087,11 @@ type Server struct {
 	// flight (create_inflight.go).
 	createFlightsMu sync.Mutex
 	createFlights   map[*createFlight]struct{}
+	// promoteFlights holds each target name a promotion is running for on
+	// this host, from before it reads the target's journal of live-disk
+	// names until it returns (beginPromote).
+	promoteFlightsMu sync.Mutex
+	promoteFlights   map[string]time.Time
 	// vmLockQueues holds the callers waiting for a VM's lock through
 	// lockVMUnlessStartHeld (vm_start_bound.go).
 	vmLockQueuesMu sync.Mutex

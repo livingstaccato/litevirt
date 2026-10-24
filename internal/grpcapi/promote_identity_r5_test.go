@@ -26,13 +26,17 @@ func renamedRetry(t *testing.T, domXML string) (*Server, error) {
 	s, fake := promoteFixture(t)
 	s.db.SetClusterPolicyGate(func() bool { return true }) // guards are recorded
 	s.SetReleaseFeatureGate(&relGate{t: t, open: true})
+	// It runs from the live disk it built: one that runs from none is not
+	// adopted (NB-R3).
+	domXML = strings.Replace(domXML, "<devices>", "<devices>"+adoptablePromotedDisk(t, s, "replica-pool", "vm1-p"), 1)
 	if err := fake.DefineDomain(domXML); err != nil {
 		t.Fatal(err)
 	}
 	if err := fake.StartDomain("vm1-p"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.writePromoteMarker("vm1-p", ""); err != nil {
+	// The marker names the uuid of the domain the attempt defined.
+	if err := s.writePromoteMarkerFor("vm1-p", "", domainUUIDFromXML(domXML)); err != nil {
 		t.Fatal(err)
 	}
 	return s, s.PromoteReplica(&pb.PromoteReplicaRequest{

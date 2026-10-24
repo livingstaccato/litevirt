@@ -170,8 +170,11 @@ func TestPromoteReplica_ForceNeverStopsAForeignDomainStartedDuringTheBuild(t *te
 func TestPromoteReplica_ARenamedRetryAdoptsTheRunningDomainsUUID(t *testing.T) {
 	s, fake := promoteFixture(t)
 	const first = "eeeeeeee-0000-0000-0000-000000000015"
-	if err := fake.DefineDomain(fmt.Sprintf("<domain type='kvm'><name>vm1-p</name><uuid>%s</uuid><devices>"+
-		"<interface type='bridge'><mac address='52:54:00:aa:bb:15'/><source bridge='lo'/></interface></devices></domain>", first)); err != nil {
+	// It runs from the live disk it built: one that runs from none is not
+	// adopted (NB-R3).
+	if err := fake.DefineDomain(fmt.Sprintf("<domain type='kvm'><name>vm1-p</name><uuid>%s</uuid><devices>%s"+
+		"<interface type='bridge'><mac address='52:54:00:aa:bb:15'/><source bridge='lo'/></interface></devices></domain>",
+		first, adoptablePromotedDisk(t, s, "replica-pool", "vm1-p"))); err != nil {
 		t.Fatal(err)
 	}
 	if err := fake.StartDomain("vm1-p"); err != nil {
@@ -179,7 +182,7 @@ func TestPromoteReplica_ARenamedRetryAdoptsTheRunningDomainsUUID(t *testing.T) {
 	}
 	// The first attempt crashed after its start, before its "started"
 	// checkpoint: its marker is there.
-	if err := s.writePromoteMarker("vm1-p", ""); err != nil {
+	if err := s.writePromoteMarkerFor("vm1-p", "", first); err != nil {
 		t.Fatal(err)
 	}
 	err := s.PromoteReplica(&pb.PromoteReplicaRequest{

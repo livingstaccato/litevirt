@@ -38,7 +38,7 @@ func seedPromotableVM(t *testing.T, s *Server, ownerHost, ownerState, project st
 	poolDir := t.TempDir()
 	s.SetStoragePoolsByName(map[string]StoragePoolRef{"replica-pool": {Driver: "local", Target: poolDir}})
 
-	specJSON, _ := json.Marshal(&pb.VMSpec{Name: "vm1", Cpu: int32(cpu), MemoryMib: int32(memMiB)})
+	specJSON, _ := json.Marshal(&pb.VMSpec{Name: "vm1", Uuid: testVMUUID("vm1"), Cpu: int32(cpu), MemoryMib: int32(memMiB)})
 	if err := corrosion.InsertVM(ctx, s.db,
 		corrosion.VMRecord{
 			Name: "vm1", HostName: ownerHost, State: "running", Spec: string(specJSON),
@@ -246,9 +246,14 @@ func TestPromoteReplica_MarkedRunningRetry_AdoptedWithoutDoubleReserve(t *testin
 	seedPromotableVM(t, s, "dead-host", "fenced", "", 1, 1536)
 
 	// The prior attempt started the domain and wrote the marker, then crashed
-	// before persisting the row.
+	// before persisting the row. The domain runs from the live disk it built:
+	// one that runs from none is not adopted (NB-R3).
+	if err := fake.DefineDomain("<domain type='kvm'><name>vm1</name><devices>" +
+		adoptablePromotedDisk(t, s, "replica-pool", "vm1") + "</devices></domain>"); err != nil {
+		t.Fatal(err)
+	}
 	fake.SetState("vm1", "running")
-	if err := s.writePromoteMarker("vm1", "prior-proof"); err != nil {
+	if err := s.writePromoteMarkerFor("vm1", "prior-proof", testVMUUID("vm1")); err != nil {
 		t.Fatalf("write marker: %v", err)
 	}
 	s.invalidateInventoryCache()

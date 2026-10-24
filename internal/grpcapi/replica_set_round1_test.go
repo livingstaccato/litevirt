@@ -26,7 +26,8 @@ func setPromoteVMRows(t *testing.T, s *Server, vm string, others []corrosion.Dis
 	s.virt = libvirtfake.New()
 	poolDir := t.TempDir()
 	s.SetStoragePoolsByName(map[string]StoragePoolRef{"dr": {Driver: "local", Target: poolDir}})
-	spec, _ := json.Marshal(&pb.VMSpec{Name: vm, Cpu: 1, MemoryMib: 256})
+	// A VM has a uuid: a promotion's records are bound to it.
+	spec, _ := json.Marshal(&pb.VMSpec{Name: vm, Uuid: testVMUUID(vm), Cpu: 1, MemoryMib: 256})
 	disks := append([]corrosion.DiskRecord{{
 		VMName: vm, DiskName: "root", HostName: "dead-host", Path: "/dead/" + vm + "-root.qcow2",
 		SizeBytes: 1 << 20, StorageType: "local", TargetDev: "vda", Bus: "virtio",
@@ -249,7 +250,7 @@ func TestPromote_AdoptionCountsOnlyTheDisksTheDomainHas(t *testing.T) {
 	if err := f.StartDomain("db"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.writePromoteMarker("db", ""); err != nil {
+	if err := s.writePromoteMarkerFor("db", "", testVMUUID("db")); err != nil {
 		t.Fatal(err)
 	}
 

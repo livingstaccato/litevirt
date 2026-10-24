@@ -353,9 +353,10 @@ message UpdatePolicy {
 }
 
 message ResourceTuning {
+    reserved 3;
+    reserved "numa_topology";  // never read; numa_policy is the NUMA control
     bool           hugepages     = 1;
     repeated int32 cpu_pinning   = 2;
-    string         numa_topology = 3;  // deprecated: use numa_policy
     int32          io_threads    = 4;
     NUMAPolicy     numa_policy   = 5;
 }

@@ -7,6 +7,8 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // TestCreateLoadBalancer_PersistsDurableHolder: an explicit LB created with no
@@ -65,48 +67,8 @@ func TestLBRunsOnHost_ExplicitNeedsRecordedHolder(t *testing.T) {
 	}
 }
 
-// TestRepairLegacyLBHolder_ProbesParticipants: the migration repair backfills a
-// holder ONLY when the cluster-wide participant probe proves exactly one, and
-// never touches a stack LB or an already-owned row. Zero or multiple participants
-// are left unowned (not guessed).
-func TestRepairLegacyLBHolder_ProbesParticipants(t *testing.T) {
-	s := testServerR2(t)
-	ctx := context.Background()
-
-	// Guards: stack LB and already-owned rows are returned untouched.
-	if got := s.repairLegacyLBHolder(ctx, corrosion.LBConfigRecord{Name: "x", StackName: "s", Hosts: "[]"}); got.Hosts != "[]" {
-		t.Errorf("stack LB must not be repaired; hosts = %q", got.Hosts)
-	}
-	if got := s.repairLegacyLBHolder(ctx, corrosion.LBConfigRecord{Name: "x", Hosts: `["h"]`}); got.Hosts != `["h"]` {
-		t.Errorf("already-owned LB must not be re-claimed; hosts = %q", got.Hosts)
-	}
-
-	// Zero participants → left unowned.
-	s.lbParticipantsOverride = func(context.Context, string) ([]string, bool) { return nil, true }
-	if got := s.repairLegacyLBHolder(ctx, corrosion.LBConfigRecord{Name: "none", Hosts: "[]"}); got.Hosts != "[]" {
-		t.Errorf("no participants → must stay unowned; hosts = %q", got.Hosts)
-	}
-	// Multiple participants → ambiguous, left unowned (not guessed).
-	s.lbParticipantsOverride = func(context.Context, string) ([]string, bool) { return []string{"a", "b"}, true }
-	if got := s.repairLegacyLBHolder(ctx, corrosion.LBConfigRecord{Name: "multi", Hosts: "[]"}); got.Hosts != "[]" {
-		t.Errorf("multiple participants → must stay unowned; hosts = %q", got.Hosts)
-	}
-
-	// Exactly one proven participant → backfilled as the durable holder.
-	if err := corrosion.UpsertLBConfig(ctx, s.db, corrosion.LBConfigRecord{
-		Name: "one", VIP: "10.0.0.7/24", Hosts: "[]", Enabled: true,
-	}); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	s.lbParticipantsOverride = func(context.Context, string) ([]string, bool) { return []string{"holder-h"}, true }
-	if got := s.repairLegacyLBHolder(ctx, corrosion.LBConfigRecord{Name: "one", Hosts: "[]"}); got.Hosts != `["holder-h"]` {
-		t.Errorf("exactly one participant → must backfill it as holder; hosts = %q", got.Hosts)
-	}
-}
-
-// TestLBHostsUnset: the legacy `lv lb create` (no --host) persists hosts as the
-// JSON string "null" (a marshaled nil slice), NOT "[]" — all unowned shapes must
-// be recognized so the repair fires on real legacy rows.
+// TestLBHostsUnset: a marshaled nil slice is the JSON string "null", NOT "[]" —
+// all unowned shapes must be recognized.
 func TestLBHostsUnset(t *testing.T) {
 	for _, s := range []string{"", "[]", "null"} {
 		if !lbHostsUnset(s) {
@@ -117,5 +79,32 @@ func TestLBHostsUnset(t *testing.T) {
 		if lbHostsUnset(s) {
 			t.Errorf("lbHostsUnset(%q) = true; want false (has holder)", s)
 		}
+	}
+}
+
+// TestStoredVIP_StrictOnEveryReadPath: a stored VIP is parsed like a new one.
+// One ParseVIP refuses ("10.0.0.1/24/extra") is not repaired and applied: the
+// update fails closed and the reapply applies nothing.
+//
+// Mutation: read the stored VIP leniently (address half only) on either path —
+// red.
+func TestStoredVIP_StrictOnEveryReadPath(t *testing.T) {
+	ctx := adminCtx()
+	s := testServerR2(t)
+	applied := 0
+	s.lbApplyOverride = func(context.Context, lb.Config) error { applied++; return nil }
+	rec := corrosion.LBConfigRecord{
+		Name: "sloppy", VIP: "10.0.0.1/24/extra", Algorithm: "roundrobin",
+		Hosts: `["test-host"]`, Ports: `[{"listen":80,"target":8080,"protocol":"tcp"}]`, Enabled: true, Generation: "g1",
+	}
+	if err := corrosion.UpsertLBConfig(ctx, s.db, rec); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := s.UpdateLoadBalancer(ctx, &pb.UpdateLBRequest{Name: "sloppy", Algorithm: "leastconn"}); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("update of an LB with an unparseable stored VIP = %v; want FailedPrecondition", err)
+	}
+	s.reapplyExplicitLB(ctx, rec)
+	if applied != 0 {
+		t.Errorf("an unparseable stored VIP was applied %d time(s)", applied)
 	}
 }

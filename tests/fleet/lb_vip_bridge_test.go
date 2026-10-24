@@ -283,7 +283,6 @@ func TestFleet_TwoStacksSharingABackendNameStayApart(t *testing.T) {
 		}
 		n.Server.SetBridgeEnsure(n.Net.EnsureBridge)
 		n.Server.SetBridgeExists(n.Net.HasDevice)
-		n.Server.SetLinkAddrs(n.Net.Addrs)
 		n.Server.SetLBApply(func(_ context.Context, cfg lb.Config) error {
 			mu.Lock()
 			defer mu.Unlock()

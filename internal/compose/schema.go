@@ -671,10 +671,9 @@ type DeviceDef struct {
 
 // ResourcesDef holds advanced resource tuning.
 type ResourcesDef struct {
-	HugePages    bool   `yaml:"hugepages"`
-	CPUPinning   []int  `yaml:"cpu-pinning"`
-	NUMATopology string `yaml:"numa-topology"`
-	IOThreads    int    `yaml:"io-threads"`
+	HugePages  bool  `yaml:"hugepages"`
+	CPUPinning []int `yaml:"cpu-pinning"`
+	IOThreads  int   `yaml:"io-threads"`
 }
 
 // DependsOn maps dependency VM names to their conditions.

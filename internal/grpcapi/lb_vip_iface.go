@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/netip"
 	"sort"
 	"strings"
@@ -89,7 +88,7 @@ func (s *Server) lbVIPInterface(ctx context.Context, lbName, stack, vip string) 
 		return matches[i].n.name < matches[j].n.name
 	})
 	m := matches[0].n
-	dev, why := s.lbNetworkDevice(m, nets)
+	dev, why := s.lbNetworkDevice(m)
 	if dev == "" {
 		return lbPlacement{}, fmt.Errorf("VIP %s is in network %q, %s on %s: the VIP goes on its network's bridge and nowhere else",
 			vip, m.name, why, s.hostName)
@@ -132,93 +131,13 @@ func (s *Server) lbNetworks(ctx context.Context) ([]lbNetwork, error) {
 	return out, nil
 }
 
-// splitNamed reports whether n is a stack's `bridge` network that hosts may
-// have provisioned under either of two names: an older build's deploy put it
-// on its short name on the deploy's target host and on the scoped name on a
-// peer target, and the row holds whichever write replicated last (a deploy
-// now names the scoped device everywhere, defaultStackNetworkDevices). It
-// returns the scoped and the short name.
-func splitNamed(n lbNetwork) (scoped, short string, ok bool) {
-	if n.def.Type != "" && n.def.Type != "bridge" || n.stack == "" {
-		return "", "", false
-	}
-	short = strings.TrimPrefix(n.name, n.stack+"_")
-	if short == n.name || (n.def.Interface != "" && n.def.Interface != short) {
-		return "", "", false // an interface the file named is the same on every host
-	}
-	return network.FlatBridgeName(n.name), short, true
-}
-
 // lbNetworkDevice finds network m's bridge on this host, or "" and why not.
-//
-// A network that is on one name everywhere (network.BridgeName) is on that
-// device or nowhere. A split-named stack network (splitNamed) is on its
-// scoped name when that exists — unique to the network — else on its short
-// name, but a short name is not unique across stacks (two stacks may each
-// have a `backend`): when another live network may be on it too, the device
-// is taken only if it carries an address in m's subnet (the gateway litevirt
-// gives a host-isolated bridge it made, the dnsmasq gateway, or the VIP from
-// an earlier apply), and is refused otherwise.
-func (s *Server) lbNetworkDevice(m lbNetwork, nets []lbNetwork) (string, string) {
-	scoped, short, split := splitNamed(m)
-	if !split {
-		dev := network.BridgeName(m.name, m.def)
-		if s.bridgeExistsHere(dev) {
-			return dev, ""
-		}
-		return "", "whose bridge " + dev + " is not"
+// A network is on one name on every host (network.BridgeName): that device
+// or nowhere.
+func (s *Server) lbNetworkDevice(m lbNetwork) (string, string) {
+	dev := network.BridgeName(m.name, m.def)
+	if s.bridgeExistsHere(dev) {
+		return dev, ""
 	}
-	if s.bridgeExistsHere(scoped) {
-		return scoped, ""
-	}
-	if !s.bridgeExistsHere(short) {
-		return "", "whose bridge " + scoped + " or " + short + " is not"
-	}
-	claimed := false
-	for _, o := range nets {
-		if o.name == m.name {
-			continue
-		}
-		if network.BridgeName(o.name, o.def) == short {
-			claimed = true
-		}
-		if _, osh, ok := splitNamed(o); ok && osh == short {
-			claimed = true
-		}
-	}
-	if !claimed {
-		return short, ""
-	}
-	if m.prefix.IsValid() {
-		for _, a := range s.linkAddrsHere(short) {
-			if m.prefix.Contains(a.Addr()) {
-				return short, ""
-			}
-		}
-	}
-	return "", "whose bridge here may be " + short + ", which another network may be on too and which carries no address in " + m.def.Subnet + " to tell; it is not placed"
-}
-
-// linkAddrsHere is a device's IP addresses on this host.
-func (s *Server) linkAddrsHere(dev string) []netip.Prefix {
-	if s.linkAddrs != nil {
-		return s.linkAddrs(dev)
-	}
-	ifc, err := net.InterfaceByName(dev)
-	if err != nil {
-		return nil
-	}
-	addrs, err := ifc.Addrs()
-	if err != nil {
-		return nil
-	}
-	var out []netip.Prefix
-	for _, a := range addrs {
-		if ipn, ok := a.(*net.IPNet); ok {
-			if p, err := netip.ParsePrefix(ipn.String()); err == nil {
-				out = append(out, p)
-			}
-		}
-	}
-	return out
+	return "", "whose bridge " + dev + " is not"
 }

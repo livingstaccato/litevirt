@@ -654,17 +654,15 @@ message CloneVMRequest {
     string mode         = 3;  // "" (auto) | "linked" | "full"
     string snapshot     = 4;  // optional: clone from this snapshot of the source
     string project      = 5;  // tenancy bucket for the clone ("" → source's)
-    // target_host is not used (an older design's placement pin); see
-    // destination_host.
-    string target_host  = 6;
+    reserved 6;
+    reserved "target_host";  // never read; destination_host places the clone
     string ip           = 7;  // optional static IP for the clone's first NIC
     bool   start        = 8;  // start the clone after creation
     // target_pool: the storage pool, on the host the clone ends up on, that
     // holds the clone's disks. Empty means that host's default disk directory.
     string target_pool  = 9;
-    // destination_host is the host the clone ends up on, as target_host was
-    // meant to be: empty keeps it on the source's host. Field 6 stays
-    // ignored, as it always was, so a client that sets it is not newly refused.
+    // destination_host is the host the clone ends up on: empty keeps it on
+    // the source's host.
     string destination_host = 10;
 }
 message ConvertToTemplateRequest { string name = 1; bool revert = 2; }

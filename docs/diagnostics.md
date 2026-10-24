@@ -3206,6 +3206,21 @@ still refused. Turn it off with `--allow-unfiltered-access-vlan-moves=false`;
 the condition resolves on the next check (every 30 s), or when the network is
 removed.
 
+### A start left paused (`vm_start_stranded_paused`)
+
+A start of a VM whose NICs need their tap VLANs (or a NIC guard under a tap
+libvirt names) creates the guest paused, readies it and then resumes it. If
+the daemon stopped in between, or the libvirt connection dropped so that
+neither the resume nor the destroy landed, the guest stays paused. When the
+daemon starts again, before anything else can start a guest, it finishes each
+such start: a domain paused for a user reason, whose row names this host as
+running or starting, held by no partition pause, hand-over or firmware move.
+It puts the firewall and VLANs in force and resumes it. One it cannot finish
+stays paused and is named by `vm_start_stranded_paused` (evaluator
+`start_guard`, subject `vm/<name>@<host>`, warning), with why. Fix the cause
+and `lv restart <vm>`, or `lv stop <vm> --force`. The condition resolves on
+the next check (every 30 s) that finds the guest running, stopped or gone.
+
 ## `lv doctor access-vlan-moves`
 
 Read-only. Lists the networks that have `--allow-unfiltered-access-vlan-moves`

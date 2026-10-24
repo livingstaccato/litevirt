@@ -32,6 +32,13 @@ a build without NIC guards cannot hold a guest for this: the guest runs on
 arrival there, and gets its VLANs once the move completes. Every host also
 re-applies every running guest's tap VLANs every 30 s.
 
+During a rolling upgrade to this release, a move between hosts of different
+builds can still leave an access-VLAN NIC on VLAN 1 for a while: an older
+target puts no VLANs on the guest it receives, and an older source neither
+hands the guest over paused nor always asks the target to refuse an unfit
+bridge. Drain access-VLAN VMs off a host before upgrading it, or upgrade the
+hosts before moving them.
+
 An access-VLAN VM is not moved onto a host whose bridge for it does not
 filter VLANs, or does not exist there yet: the target refuses the move before
 anything is copied ([networking.md](networking.md#vlan-trunk-mode)).

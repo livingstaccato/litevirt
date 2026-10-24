@@ -429,9 +429,11 @@ gets them tagged and keeps VLAN 1 as pvid, untagged: the guest's untagged
 frames are VLAN 1's. That needs a Linux bridge with VLAN filtering on (`ip link set
 dev <bridge> type bridge vlan_filtering 1`, and the VLAN on the bridge's
 uplink); a bridge with it off ignores the pvid and puts the NIC on its untagged
-segment. So a create, and every start of the VM (`lv start`, `lv restart`, a
-failover or health restart), is refused with `FailedPrecondition` when the
-NIC's bridge on that host has VLAN filtering off, naming the bridge. A
+segment. So a create, and every start of the VM, by whatever path (`lv start`,
+`lv restart`, a failover, reschedule, onboot or health restart, promote, clone
+`--start`, replace, import, restore), is refused when the NIC's bridge on that
+host has VLAN filtering off, naming the bridge: the check runs where every
+start passes, before the guest runs. A
 failover, reschedule or onboot start refused that way is not parked in
 `error`: the VM waits on that host (`pending` or `starting`, the detail naming
 the bridge), is tried again on every reconcile pass, and starts by itself once
@@ -470,12 +472,19 @@ only VLAN 1, so a VM with a `trunk:` NIC is started paused, its VLANs put on
 its taps, and only then resumed: whichever path starts it (create, `lv start`,
 a failover, reschedule or onboot start, a health restart, promote, clone,
 replace, restore, import, a snapshot revert). An access VLAN that cannot be put
-on its tap refuses the start, since the guest would run on VLAN 1. A live
+on its tap refuses the start, since the guest would run on VLAN 1, and so does
+an access NIC whose MAC or bridge cannot be resolved. A start the daemon
+did not finish (it stopped between creating the guest paused and resuming it)
+is finished when the daemon starts again, its VLANs put on first, or named by
+`vm_start_stranded_paused` when it cannot be
+([diagnostics.md](diagnostics.md#a-start-left-paused-vm_start_stranded_paused)). A live
 migration hands such a guest over paused, and the target puts the VLANs on
 the taps it made before it lets the guest run; a live firmware move does the
-same before its release. Every host also re-applies the VLANs of each running
-guest's NICs every 30 s, so a tap changed by hand, or re-created, is put back
-within one interval (a tap already right is only read). A hot-attached NIC
+same before its release. The health check's own fallback migration, used
+only when the daemon's migrate path is not wired, does not move a VM with a
+`trunk:` NIC at all. Every host also re-applies the VLANs of each guest running
+on it every 30 s, so a tap changed by hand, or re-created, is put back within
+one interval (a tap already right is only read). A hot-attached NIC
 (`lv attach-nic`, the AttachDevice API) cannot carry a `trunk:`: give the VM
 the NIC in its spec instead.
 

@@ -2,6 +2,8 @@ package libvirt
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -195,5 +197,48 @@ func TestNegotiateTrunkVLANs_EmptyList(t *testing.T) {
 	}
 	if len(*calls) != 0 {
 		t.Errorf("expected no bridge changes for an empty VLAN list, got %q", *calls)
+	}
+}
+
+// tapMasterVLANFiltering follows the tap's master link and reads that
+// bridge's vlan_filtering; a tap with no master, or a master that is not a
+// bridge, is an error, never a guess.
+func TestTapMasterVLANFiltering(t *testing.T) {
+	root := t.TempDir()
+	orig := tapSysClassNet
+	tapSysClassNet = root
+	t.Cleanup(func() { tapSysClassNet = orig })
+	mk := func(p, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(root, p)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if content != "" {
+			if err := os.WriteFile(filepath.Join(root, p), []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	mk("brf/bridge/vlan_filtering", "1\n")
+	mk("bru/bridge/vlan_filtering", "0\n")
+	mk("eth0/x", "")
+	for tap, master := range map[string]string{"vnet0": "brf", "vnet1": "bru", "vnet3": "eth0"} {
+		mk(tap+"/x", "")
+		if err := os.Symlink("../"+master, filepath.Join(root, tap, "master")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("vnet2/x", "")
+	if m, on, err := tapMasterVLANFiltering("vnet0"); err != nil || m != "brf" || !on {
+		t.Errorf("vnet0: %q %v %v", m, on, err)
+	}
+	if m, on, err := tapMasterVLANFiltering("vnet1"); err != nil || m != "bru" || on {
+		t.Errorf("vnet1: %q %v %v", m, on, err)
+	}
+	if _, _, err := tapMasterVLANFiltering("vnet2"); err == nil {
+		t.Error("vnet2 has no master: no error")
+	}
+	if _, _, err := tapMasterVLANFiltering("vnet3"); err == nil {
+		t.Error("vnet3's master is not a bridge: no error")
 	}
 }

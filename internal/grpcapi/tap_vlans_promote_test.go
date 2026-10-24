@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -17,9 +18,12 @@ import (
 
 // promoteAccessVLAN promotes vm1, an access-VLAN-30 VM, as vm1-p (a renamed
 // promotion, a new row written after the start) through the start guard.
-func promoteAccessVLAN(t *testing.T, s *Server) (*libvirtfake.Fake, error) {
+func promoteAccessVLAN(t *testing.T, s *Server, setup ...func(*libvirtfake.Fake)) (*libvirtfake.Fake, error) {
 	t.Helper()
 	fake := libvirtfake.New()
+	for _, f := range setup {
+		f(fake)
+	}
 	s.virt = fake
 	fake.SetStartGuard(s.NICStartGuard(context.Background()))
 	ctx := adminCtx()
@@ -116,18 +120,33 @@ func TestEveryPendingNICsStartAlsoRegistersItsTapVLANs(t *testing.T) {
 	}
 }
 
-// R-B2: the promoted guest's bridge here does not filter VLANs: its start is
-// refused at the guard (readyGuestHere), whatever path asked for it.
+// R-B2: the promoted guest's tap is enslaved to a bridge here that does not
+// filter VLANs: its start is refused at the guard (readyGuestHere), whatever
+// path asked for it. The bridge judged is the one the tap is actually on,
+// read from the kernel — here the one its network's name resolves to filters,
+// and the tap's real master does not (a promotion attaches to the flat
+// bridge of the network's name, which can differ). A master that cannot be
+// read refuses the start too.
 //
-// Mutation: drop the bridge check from applyTapVLANNICs — red.
+// Mutations: drop the bridge check from applyTapVLANNICs — red; judge the
+// network's named bridge (n.Bridge, through the server's filtering read)
+// instead of the tap's real master — red; let an unreadable master pass — red.
 func TestPromoteReplica_AnAccessVLANOnANonFilteringBridgeIsRefused(t *testing.T) {
-	s := testServer(t)
-	s.SetBridgeVLANFiltering(func(string) (bool, bool, error) { return true, false, nil })
-	fake, err := promoteAccessVLAN(t, s)
-	if err == nil || !strings.Contains(err.Error(), "does not filter VLANs") {
-		t.Fatalf("PromoteReplica onto a non-filtering bridge: %v, want a refusal naming it", err)
-	}
-	if st, _ := fake.DomainState("vm1-p"); st == "running" {
-		t.Fatal("the promoted guest runs on a bridge that does not filter VLANs")
+	for name, master := range map[string]func(string, string) (string, bool, error){
+		"master does not filter": func(string, string) (string, bool, error) { return "realbr", false, nil },
+		"master unreadable":      func(string, string) (string, bool, error) { return "", false, errors.New("no master link") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := testServer(t)
+			// The bridge the network's name resolves to filters VLANs.
+			s.SetBridgeVLANFiltering(func(string) (bool, bool, error) { return true, true, nil })
+			fake, err := promoteAccessVLAN(t, s, func(f *libvirtfake.Fake) { f.TapMaster = master })
+			if err == nil || !strings.Contains(err.Error(), "VLAN 30") {
+				t.Fatalf("PromoteReplica with the tap on an unfit master: %v, want a refusal naming VLAN 30", err)
+			}
+			if st, _ := fake.DomainState("vm1-p"); st == "running" {
+				t.Fatal("the promoted guest runs on a bridge that does not carry its VLAN")
+			}
+		})
 	}
 }

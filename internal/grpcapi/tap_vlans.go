@@ -253,7 +253,7 @@ func (s *Server) applyTapVLANNICs(ctx context.Context, vm string, nics []tapVLAN
 	var errs []error
 	for _, n := range nics {
 		if n.access() {
-			if problem := network.AccessVLANBridgeProblem(n.Bridge, n.VLANs[0], s.bridgeVLANFilteringOf); problem != nil {
+			if problem := s.tapMasterProblem(vm, n); problem != nil {
 				if how != arrivedHere || !s.networkAllowsUnfilteredMoves(ctx, n.Network) {
 					errs = append(errs, problem)
 					continue
@@ -276,6 +276,21 @@ func (s *Server) applyTapVLANNICs(ctx context.Context, vm string, nics []tapVLAN
 			vm, s.hostName, errors.Join(errs...))
 	}
 	return nil
+}
+
+// tapMasterProblem is why access NIC n of vm cannot carry its VLAN on this
+// host, judged on the bridge its tap is ACTUALLY enslaved to, read from the
+// kernel (TapMasterVLANFiltering), not the one its network's name resolves
+// to (n.Bridge): a promotion, for one, attaches to the flat bridge of the
+// network's name whatever the network's own bridge is called. A master that
+// cannot be read is a problem too (fail closed).
+func (s *Server) tapMasterProblem(vm string, n tapVLANNIC) error {
+	master, filtering, err := s.virt.TapMasterVLANFiltering(vm, n.MAC)
+	if err != nil {
+		return fmt.Errorf("NIC %s on VLAN %d: the bridge its tap is enslaved to cannot be read, so whether it carries the VLAN is unknown: %w",
+			n.MAC, n.VLANs[0], err)
+	}
+	return network.AccessVLANBridgeProblem(master, n.VLANs[0], func(string) (bool, bool, error) { return true, filtering, nil })
 }
 
 // networkAllowsUnfilteredMoves reports whether network name allows moving its

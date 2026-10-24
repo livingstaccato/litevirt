@@ -3,7 +3,9 @@ package libvirt
 import (
 	"encoding/xml"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -27,6 +29,37 @@ func (c *Client) ConfigureVLANTap(domainName, bridge, mac string, vlanID int) er
 		return fmt.Errorf("find tap for %s/%s: %w", domainName, mac, err)
 	}
 	return configureAccessBridgeVLAN(tapDev, vlanID)
+}
+
+// TapMasterVLANFiltering reads, from the kernel, the bridge the tap of a
+// domain's NIC (matched by MAC) is actually enslaved to, and whether that
+// bridge filters VLANs. It is what an access port's VLAN depends on: a bridge
+// that does not filter ignores the tap's pvid. Any answer it cannot read is an
+// error, never a guess: the tap has no master, the master is not a Linux
+// bridge, or its vlan_filtering cannot be read.
+func (c *Client) TapMasterVLANFiltering(domainName, mac string) (master string, filtering bool, err error) {
+	tapDev, err := findTapDevice(c, domainName, mac)
+	if err != nil {
+		return "", false, fmt.Errorf("find tap for %s/%s: %w", domainName, mac, err)
+	}
+	return tapMasterVLANFiltering(tapDev)
+}
+
+// tapSysClassNet is /sys/class/net; a var so tests can point it elsewhere.
+var tapSysClassNet = "/sys/class/net"
+
+// tapMasterVLANFiltering is TapMasterVLANFiltering on a known tap.
+func tapMasterVLANFiltering(tapDev string) (string, bool, error) {
+	link, err := os.Readlink(filepath.Join(tapSysClassNet, tapDev, "master"))
+	if err != nil {
+		return "", false, fmt.Errorf("tap %s: cannot read the bridge it is enslaved to: %w", tapDev, err)
+	}
+	master := filepath.Base(link)
+	data, err := os.ReadFile(filepath.Join(tapSysClassNet, master, "bridge", "vlan_filtering"))
+	if err != nil {
+		return master, false, fmt.Errorf("tap %s: cannot read whether its master %s filters VLANs (is it a Linux bridge?): %w", tapDev, master, err)
+	}
+	return master, strings.TrimSpace(string(data)) == "1", nil
 }
 
 // TapDevice returns the host-side tap interface name for a domain's NIC

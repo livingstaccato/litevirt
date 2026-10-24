@@ -615,7 +615,7 @@ func TestCloneVM_AStartedCloneOnANonFilteringBridgeIsRefused(t *testing.T) {
 	s, fake := provableCreateServer(t)
 	ctx := adminCtx()
 	fake.SetStartGuard(s.NICStartGuard(context.Background()))
-	s.SetBridgeVLANFiltering(func(string) (bool, bool, error) { return true, false, nil })
+	fake.TapMaster = func(string, string) (string, bool, error) { return "accnet", false, nil }
 	srcDisk := s.images.DiskPath("src", "root")
 	if err := os.MkdirAll(filepath.Dir(srcDisk), 0o755); err != nil {
 		t.Fatal(err)
@@ -651,7 +651,7 @@ func TestCloneVM_AStartedCloneOnANonFilteringBridgeIsRefused(t *testing.T) {
 func TestReadyGuestHere_TheOptInCoversArrivalsNotStarts(t *testing.T) {
 	s, fake := vlanStartServer(t)
 	ctx := adminCtx()
-	s.SetBridgeVLANFiltering(func(string) (bool, bool, error) { return true, false, nil })
+	fake.TapMaster = func(string, string) (string, bool, error) { return "accnet", false, nil }
 	if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{Name: "accnet", Type: "bridge",
 		Config: `{"Type":"bridge","Interface":"accnet","AllowUnfilteredAccessVLANMoves":true}`}); err != nil {
 		t.Fatal(err)
@@ -694,5 +694,23 @@ func TestNICStartGuard_AnAccessNICWithNoMACRefusesTheStart(t *testing.T) {
 	}
 	if st, _ := fake.DomainState("nomac"); st == "running" {
 		t.Fatal("it runs")
+	}
+}
+
+// The 30 s convergence judges a running guest's access NIC on the bridge its
+// tap is actually enslaved to: on a master that does not filter VLANs (its
+// network's named bridge notwithstanding), or one that cannot be read, it
+// does not pretend the VLAN is in force — the tap is not configured, and the
+// error is logged each pass.
+//
+// Mutation: judge the network's named bridge instead of the tap's master — red.
+func TestConvergeTapVLANs_JudgesTheTapsRealMaster(t *testing.T) {
+	s, fake := vlanStartServer(t)
+	s.SetBridgeVLANFiltering(func(string) (bool, bool, error) { return true, true, nil })
+	fake.SetState("vm1", libvirtfake.StateRunning)
+	fake.TapMaster = func(string, string) (string, bool, error) { return "realbr", false, nil }
+	s.ConvergeTapVLANs(adminCtx())
+	if ops := vlanDomainOps(fake, "vm1"); opIndex(ops, "vlan-tap") >= 0 {
+		t.Fatalf("ops = %q: the access VLAN was configured on a tap whose master does not filter VLANs", ops)
 	}
 }

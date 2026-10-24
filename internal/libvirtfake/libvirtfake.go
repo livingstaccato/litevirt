@@ -297,6 +297,11 @@ type Fake struct {
 	// and fails it with what it returns: a tap the host cannot put on its
 	// access VLAN.
 	FailConfigureVLANTap func(domain, mac string, vlan int) error
+	// TapMaster, when set, answers TapMasterVLANFiltering: the bridge the
+	// NIC's tap is enslaved to and whether it filters VLANs. Unset, a tap's
+	// master is the bridge its live definition names (else "fakebr0"), and
+	// it filters.
+	TapMaster func(domain, mac string) (master string, filtering bool, err error)
 	// FailCreateLiveSnapshot fires AFTER the disk overlay has cut over, modeling a
 	// RAM-save/capture failure that leaves the VM on an overlay.
 	FailCreateLiveSnapshot func(domain, snap string) error
@@ -3283,6 +3288,46 @@ func (f *Fake) ConfigureVLANTap(domainName, bridge, mac string, vlanID int) erro
 	f.record("vlan-tap", domainName, fmt.Sprintf("bridge=%s mac=%s vlan=%d", bridge, mac, vlanID))
 	return nil
 }
+
+// TapMasterVLANFiltering mirrors libvirt.Client.TapMasterVLANFiltering: the
+// domain must be active (only then has its NIC a tap); TapMaster decides the
+// answer when set.
+func (f *Fake) TapMasterVLANFiltering(domainName, mac string) (string, bool, error) {
+	defer f.daemon()()
+	f.mu.Lock()
+	st := f.domains[domainName]
+	live := f.liveXMLLocked(domainName)
+	f.mu.Unlock()
+	if st != StateRunning && st != StatePaused {
+		return "", false, fmt.Errorf("find tap for %s/%s: libvirtfake: domain is not active, so its NIC has no tap", domainName, mac)
+	}
+	if hook := f.TapMaster; hook != nil {
+		return hook(domainName, mac)
+	}
+	if br := fakeNICBridge(live, mac); br != "" {
+		return br, true, nil
+	}
+	return "fakebr0", true, nil
+}
+
+// fakeNICBridge is the source bridge of the interface with mac in a domain
+// definition, or "".
+func fakeNICBridge(x, mac string) string {
+	for _, el := range fakeIfaceElem.FindAllString(x, -1) {
+		if !strings.Contains(strings.ToLower(el), strings.ToLower(mac)) {
+			continue
+		}
+		if m := fakeSourceBridge.FindStringSubmatch(el); m != nil {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+var (
+	fakeIfaceElem    = regexp.MustCompile(`(?s)<interface\b.*?</interface>`)
+	fakeSourceBridge = regexp.MustCompile(`<source\b[^>]*\bbridge=['"]([^'"]+)['"]`)
+)
 
 // NegotiateTrunkVLANs mirrors libvirt.Client.NegotiateTrunkVLANs, the domain
 // active as ConfigureVLANTap needs it.

@@ -19,6 +19,16 @@ litevirt uses QEMU's pre-copy memory migration:
 
 Progress is streamed to the CLI in real-time.
 
+A NIC's `trunk:` VLANs live on its host tap, not in the domain definition, so
+libvirt does not carry them. Once a live migration completes, the target host
+puts them on the taps it created, before announcing the gateways: a trunk's
+tap is set to exactly its VLANs, tagged, and an access port's (`trunk:` with
+one VLAN) gets its VLAN as pvid, untagged. Until then (the time between the
+cutover and the source's call to the target) those NICs are on the bridge's
+default VLAN only. A live firmware move puts them on while the target
+guest is still paused, before its release. A failure is logged on the target
+and does not fail the migration.
+
 Once a live migration completes, the target host sends gratuitous ARPs for the
 gateway of each network the VM has a NIC on (the first address of the
 network's IPv4 subnet), out of the bridge it serves that network on (after a

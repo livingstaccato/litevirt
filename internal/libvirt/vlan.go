@@ -41,27 +41,11 @@ func (c *Client) TapDevice(domainName, mac string) (string, error) {
 	return findTapDevice(c, domainName, mac)
 }
 
-// ConfigureTrunkTap sets up a tap interface for VLAN trunk mode.
-// All listed VLAN IDs are added without pvid/untagged — the VM sends and
-// receives tagged frames and handles its own VLAN demux.
-func (c *Client) ConfigureTrunkTap(domainName, bridge, mac string, vlanIDs []int) error {
-	tapDev, err := findTapDevice(c, domainName, mac)
-	if err != nil {
-		return fmt.Errorf("find tap for %s/%s: %w", domainName, mac, err)
-	}
-
-	return configureTrunkBridgeVLANs(tapDev, vlanIDs)
-}
-
 // ConfigureVLANTap (package func) is retained for direct callers that
 // don't want to dereference a *Client method (e.g. test fixtures that
 // call configureAccessBridgeVLAN's wrapper). Prefer the method form.
 func ConfigureVLANTap(c *Client, domainName, bridge, mac string, vlanID int) error {
 	return c.ConfigureVLANTap(domainName, bridge, mac, vlanID)
-}
-
-func ConfigureTrunkTap(c *Client, domainName, bridge, mac string, vlanIDs []int) error {
-	return c.ConfigureTrunkTap(domainName, bridge, mac, vlanIDs)
 }
 
 // configureAccessBridgeVLAN applies a single access-mode VLAN (pvid+untagged) to a tap device.
@@ -75,34 +59,29 @@ func configureAccessBridgeVLAN(tapDev string, vlanID int) error {
 	return nil
 }
 
-// configureTrunkBridgeVLANs applies trunk-mode VLANs (no pvid/untagged) to a tap device.
-// This is the inner logic of ConfigureTrunkTap, extracted so tests can call it without libvirt.
-func configureTrunkBridgeVLANs(tapDev string, vlanIDs []int) error {
-	for _, vid := range vlanIDs {
-		out, err := execVLAN("bridge", "vlan", "add", "dev", tapDev,
-			"vid", fmt.Sprintf("%d", vid))
-		if err != nil {
-			return fmt.Errorf("bridge vlan add %s vid %d (trunk): %w: %s", tapDev, vid, err, out)
-		}
-	}
-	return nil
-}
-
-// NegotiateTrunkVLANs reads the current VLANs on a tap, computes a diff against
-// desiredVLANs, and applies adds/removes to converge to the desired state.
-func NegotiateTrunkVLANs(c *Client, domainName, bridge, mac string, desiredVLANs []int) error {
+// NegotiateTrunkVLANs converges the tap of a domain's NIC (matched by MAC) to
+// trunk mode on exactly desiredVLANs: it reads the VLANs the tap carries,
+// removes those not desired, and adds the missing ones, tagged (no pvid or
+// untagged flag), so the guest sends and receives tagged frames and handles
+// its own VLAN demux. VLAN 1, the bridge's default pvid, is left as it is: it
+// carries the NIC's untagged (native) frames.
+//
+// Idempotent, so a caller re-applies it to a tap whatever it carries: a fresh
+// one at a start, or one a live migration's target created.
+//
+// Method form so the call site can go through grpcapi.LibvirtBackend (and the
+// fleet's fake libvirt can stub it).
+func (c *Client) NegotiateTrunkVLANs(domainName, bridge, mac string, desiredVLANs []int) error {
 	tapDev, err := findTapDevice(c, domainName, mac)
 	if err != nil {
 		return fmt.Errorf("find tap for %s/%s: %w", domainName, mac, err)
 	}
+	return negotiateTrunkVLANs(tapDev, desiredVLANs)
+}
 
-	// Ensure vlan_filtering is enabled on the bridge.
-	out, err := execVLAN("bridge", "vlan", "show", "dev", bridge)
-	if err != nil {
-		return fmt.Errorf("bridge vlan show %s: %w: %s", bridge, err, out)
-	}
-
-	// Read current VLANs on the tap device.
+// negotiateTrunkVLANs is NegotiateTrunkVLANs on a known tap, so tests can call
+// it without libvirt.
+func negotiateTrunkVLANs(tapDev string, desiredVLANs []int) error {
 	current, err := readTapVLANs(tapDev)
 	if err != nil {
 		return err
@@ -131,10 +110,11 @@ func NegotiateTrunkVLANs(c *Client, domainName, bridge, mac string, desiredVLANs
 	// Add VLANs not yet present.
 	for _, v := range desiredVLANs {
 		if !currentSet[v] {
+			currentSet[v] = true // a VLAN listed twice is added once
 			out, err := execVLAN("bridge", "vlan", "add", "dev", tapDev,
 				"vid", fmt.Sprintf("%d", v))
 			if err != nil {
-				return fmt.Errorf("bridge vlan add %s vid %d: %w: %s", tapDev, v, err, out)
+				return fmt.Errorf("bridge vlan add %s vid %d (trunk): %w: %s", tapDev, v, err, out)
 			}
 		}
 	}

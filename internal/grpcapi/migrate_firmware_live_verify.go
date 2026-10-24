@@ -372,6 +372,9 @@ func (s *Server) resumeReleased(ctx context.Context, resp *pb.ReleaseLiveFirmwar
 	if s.virt == nil {
 		return nil, status.Errorf(codes.Unavailable, "VM %q: no libvirt connection", h.VM)
 	}
+	// Its NICs' VLANs live on the taps libvirt made here, not in the domain
+	// XML: put them on while the guest is still paused.
+	s.reapplyVLANTapsOf(ctx, h.VM)
 	if err := s.virt.ResumeFirmwareMoveTarget(h.VM, h.UUID, h.Attempt); err != nil {
 		return nil, status.Errorf(codes.Internal, "VM %q: resume the held guest (the hold stays resuming, and a retry resumes it): %v", h.VM, err)
 	}

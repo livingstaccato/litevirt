@@ -1102,7 +1102,9 @@ once the host has the descriptor, so previewing a large OVA does not send its
 disks. The sizes shown are the capacities the descriptor declares. Past the
 descriptor the preview reads only small members (a manifest, a certificate,
 up to 1 MiB) and stops at the first disk, so an archive the import would
-refuse further in still previews. An archive with more than one `.ovf`
+refuse further in still previews. The preview applies the import's member
+and size caps to what it reads but does not check that the host has room for
+the extraction; the import does. An archive with more than one `.ovf`
 member is refused by the import, naming both; the preview refuses it too
 when the second descriptor is among the small members it reads, but cannot
 see one behind a disk without reading the disk. Other sources (an OVF

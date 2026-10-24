@@ -56,19 +56,25 @@ func Budget(b uint64) Reserve {
 // (is it a descriptor, has the name been seen) uses that name, never the raw
 // one, so "a.ovf/." is the descriptor a.ovf it would overwrite.
 type ovaMembers struct {
-	count int
-	seen  map[string]string // case-folded flattened name -> raw name
-	ovf   string            // raw name of the descriptor, once seen
+	count    int
+	declared int64             // the sizes their headers declare, in all
+	seen     map[string]string // case-folded flattened name -> raw name
+	ovf      string            // raw name of the descriptor, once seen
 }
 
 // admit counts hdr and returns its flattened name and whether it is a
-// descriptor. It refuses the member cap, a name that cleans to nothing or
-// escapes, a second descriptor, and a name an earlier member already holds
-// (case-insensitively, as some filesystems hold them).
+// descriptor. It refuses the member cap, the member and archive size caps
+// (on the sizes headers declare, so a refusal needs no body read), a name
+// that cleans to nothing or escapes, a second descriptor, and a name an
+// earlier member already holds (case-insensitively, as some filesystems
+// hold them).
 func (m *ovaMembers) admit(hdr *tar.Header) (flat string, isOVF bool, err error) {
 	m.count++
 	if m.count > maxArchiveMembers {
 		return "", false, fmt.Errorf("ova exceeds member cap (%d)", maxArchiveMembers)
+	}
+	if hdr.Size > maxMemberSize {
+		return "", false, fmt.Errorf("ova member %q exceeds size cap", hdr.Name)
 	}
 	target, err := safeJoin("/", hdr.Name)
 	if err != nil {
@@ -86,6 +92,10 @@ func (m *ovaMembers) admit(hdr *tar.Header) (flat string, isOVF bool, err error)
 	if m.seen == nil {
 		m.seen = map[string]string{}
 	}
+	if hdr.Size > maxArchiveTotalSize-m.declared {
+		return "", false, fmt.Errorf("ova exceeds total size cap")
+	}
+	m.declared += hdr.Size
 	m.seen[key] = hdr.Name
 	if isOVF {
 		m.ovf = hdr.Name
@@ -106,9 +116,8 @@ func (m *ovaMembers) admit(hdr *tar.Header) (flat string, isOVF bool, err error)
 func UnpackOVA(r io.Reader, dest string, reserve Reserve) (ovfPath string, err error) {
 	tr := tar.NewReader(r)
 	var (
-		members  ovaMembers
-		total    int64
-		reserved int64
+		members ovaMembers
+		total   int64
 	)
 	for {
 		hdr, e := tr.Next()
@@ -130,16 +139,10 @@ func UnpackOVA(r io.Reader, dest string, reserve Reserve) (ovfPath string, err e
 		if e != nil {
 			return "", e
 		}
-		if hdr.Size > maxMemberSize {
-			return "", fmt.Errorf("ova member %q exceeds size cap", hdr.Name)
-		}
 		// Flatten: keep only the base name so split-VMDK extents + descriptor sit
 		// beside each other (OVF hrefs are relative basenames).
 		target := filepath.Join(dest, flat)
-		if hdr.Size > maxArchiveTotalSize-reserved {
-			return "", fmt.Errorf("ova exceeds total size cap")
-		}
-		reserved += hdr.Size
+		reserved := members.declared
 		if e := reserve(uint64(reserved)); e != nil {
 			return "", fmt.Errorf("ova member %q: %w", hdr.Name, e)
 		}
@@ -205,8 +208,10 @@ const maxInspectTrailer = 1 << 20
 // InspectOVA reads the tar only until the .ovf member and returns its bytes,
 // for lv import --inspect: the disk members are neither extracted nor, when
 // the descriptor comes first (as the OVF specification has it), read at all.
-// It refuses what UnpackOVA would refuse among the members it reads, so a
-// preview does not describe an archive the import would reject at its head.
+// It refuses what UnpackOVA would refuse among the members it reads (their
+// types, names and declared sizes), so a preview does not describe an
+// archive the import would reject at its head. It does not reserve room:
+// whether the host can hold the extraction is the import's question.
 //
 // After the descriptor it reads on only through small members (a manifest,
 // a certificate: maxInspectTrailer bytes in all) and refuses a second .ovf

@@ -297,3 +297,118 @@ func TestInspectOVA_TrailerBudgetIsCumulative(t *testing.T) {
 		t.Fatalf("UnpackOVA err = %v, want the second-descriptor refusal", err)
 	}
 }
+
+// sparseTar is an io.ReadSeeker over a tar whose member bodies are zeros
+// unless given, so a test can declare members of terabytes: archive/tar
+// seeks past a body it skips, and nothing of it is held in memory.
+type sparseTar struct {
+	parts []sparsePart
+	size  int64
+	off   int64
+}
+
+type sparsePart struct {
+	at int64
+	b  []byte
+}
+
+func newSparseTar(t *testing.T, members ...sparseMember) *sparseTar {
+	t.Helper()
+	st := &sparseTar{}
+	for _, m := range members {
+		var hb bytes.Buffer
+		tw := tar.NewWriter(&hb)
+		if err := tw.WriteHeader(&tar.Header{Name: m.name, Mode: 0o644, Size: m.size, Typeflag: tar.TypeReg, Format: tar.FormatPAX}); err != nil {
+			t.Fatal(err)
+		}
+		st.parts = append(st.parts, sparsePart{at: st.size, b: hb.Bytes()})
+		st.size += int64(hb.Len())
+		if m.body != nil {
+			st.parts = append(st.parts, sparsePart{at: st.size, b: m.body})
+		}
+		st.size += (m.size + 511) &^ 511
+	}
+	st.size += 1024 // the two zero blocks that end an archive
+	return st
+}
+
+type sparseMember struct {
+	name string
+	size int64
+	body []byte // nil: zeros
+}
+
+func (s *sparseTar) Read(p []byte) (int, error) {
+	if s.off >= s.size {
+		return 0, io.EOF
+	}
+	if rem := s.size - s.off; int64(len(p)) > rem {
+		p = p[:rem]
+	}
+	clear(p)
+	for _, pt := range s.parts {
+		lo, hi := max(pt.at, s.off), min(pt.at+int64(len(pt.b)), s.off+int64(len(p)))
+		if lo < hi {
+			copy(p[lo-s.off:hi-s.off], pt.b[lo-pt.at:hi-pt.at])
+		}
+	}
+	s.off += int64(len(p))
+	return len(p), nil
+}
+
+func (s *sparseTar) Seek(off int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekStart:
+		s.off = off
+	case io.SeekCurrent:
+		s.off += off
+	case io.SeekEnd:
+		s.off = s.size + off
+	}
+	return s.off, nil
+}
+
+// The preview applies the import's member and archive size caps to the
+// sizes the headers it reads declare, ahead of the descriptor and after it.
+func TestInspectOVA_RefusesTheImportsSizeCaps(t *testing.T) {
+	ovf := []byte(ovfWindowsSCSI)
+	for _, tc := range []struct {
+		name    string
+		members []sparseMember
+		want    string
+	}{
+		{"member over the cap ahead of the descriptor", []sparseMember{
+			{name: "disk-0.vmdk", size: maxMemberSize + 1},
+			{name: "a.ovf", size: int64(len(ovf)), body: ovf},
+		}, "exceeds size cap"},
+		{"member over the cap after the descriptor", []sparseMember{
+			{name: "a.ovf", size: int64(len(ovf)), body: ovf},
+			{name: "disk-0.vmdk", size: maxMemberSize + 1},
+		}, "exceeds size cap"},
+		{"archive over the cap ahead of the descriptor", []sparseMember{
+			{name: "disk-0.vmdk", size: maxMemberSize},
+			{name: "disk-1.vmdk", size: maxMemberSize},
+			{name: "a.ovf", size: int64(len(ovf)), body: ovf},
+		}, "total size cap"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := InspectOVA(newSparseTar(t, tc.members...)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("InspectOVA err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+	// The import refuses an oversized member at its header, as the preview
+	// does (its archive cap is the same admit; reaching it would write 8 TiB).
+	_, err := UnpackOVA(newSparseTar(t, sparseMember{name: "disk-0.vmdk", size: maxMemberSize + 1}), t.TempDir(), Budget(1<<30))
+	if err == nil || !strings.Contains(err.Error(), "exceeds size cap") {
+		t.Fatalf("UnpackOVA err = %v, want the member size cap", err)
+	}
+	// The sparse archive itself is well formed: within the caps it previews.
+	data, err := InspectOVA(newSparseTar(t,
+		sparseMember{name: "disk-0.vmdk", size: maxMemberSize},
+		sparseMember{name: "a.ovf", size: int64(len(ovf)), body: ovf},
+	))
+	if err != nil || string(data) != ovfWindowsSCSI {
+		t.Fatalf("InspectOVA of a capped sparse archive = %d bytes, %v", len(data), err)
+	}
+}

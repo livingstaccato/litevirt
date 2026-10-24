@@ -23,10 +23,13 @@ type importChunks struct {
 	eof   bool
 	cur   []byte
 	read  int64
+	// ceiling is the most Read will deliver: maxRestoreBytes, as for
+	// staging the upload (a test lowers it).
+	ceiling int64
 }
 
 func newImportChunks(stream pb.LiteVirt_ImportVMServer, first []byte) *importChunks {
-	c := &importChunks{recv: stream.Recv}
+	c := &importChunks{recv: stream.Recv, ceiling: maxRestoreBytes}
 	if len(first) > 0 {
 		c.queue = append(c.queue, first)
 	}
@@ -91,8 +94,8 @@ func (c *importChunks) Read(p []byte) (int, error) {
 	n := copy(p, c.cur)
 	c.cur = c.cur[n:]
 	c.read += int64(n)
-	if c.read > maxRestoreBytes {
-		return n, status.Errorf(codes.ResourceExhausted, "import upload exceeded the %d-byte ceiling", maxRestoreBytes)
+	if c.read > c.ceiling {
+		return n, status.Errorf(codes.ResourceExhausted, "import upload exceeded the %d-byte ceiling", c.ceiling)
 	}
 	return n, nil
 }

@@ -16,6 +16,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/vmimport"
 )
 
 const inspectOVF = `<?xml version="1.0" encoding="UTF-8"?>
@@ -214,4 +215,47 @@ func TestImportVM_InspectOVAServerPathOutsideStagingRefused(t *testing.T) {
 		t.Fatalf("the admin's --inspect --server-path: %v", err)
 	}
 	wantInspectPlan(t, sent)
+}
+
+// A preview of an upload whose descriptor sits behind its disk reads the
+// disk to reach it, under the same ceiling as staging the upload: past it
+// the read is refused rather than carried on. The ceiling is lowered so the
+// test need not send terabytes; within it the same upload previews.
+//
+// Mutation: drop the ceiling check in importChunks.Read and the preview of
+// the over-ceiling upload succeeds.
+func TestImportChunks_ThePreviewReadsTheUploadUnderItsCeiling(t *testing.T) {
+	var b bytes.Buffer
+	tw := tar.NewWriter(&b)
+	for _, m := range []struct {
+		name string
+		body []byte
+	}{{"disk-0.vmdk", make([]byte, 2<<20)}, {"win2022.ovf", []byte(inspectOVF)}} {
+		if err := tw.WriteHeader(&tar.Header{Name: m.name, Mode: 0o644, Size: int64(len(m.body)), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(m.body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ova := b.Bytes()
+	upload := func(ceiling int64) error {
+		var frames []*pb.ImportVMRequest
+		for off := 0; off < len(ova); off += 64 << 10 {
+			frames = append(frames, &pb.ImportVMRequest{Chunk: ova[off:min(off+64<<10, len(ova))]})
+		}
+		c := newImportChunks(&fakeImportStream{ctx: adminCtx(), frames: frames}, nil)
+		c.ceiling = ceiling
+		_, err := vmimport.InspectOVA(c)
+		return err
+	}
+	if err := upload(1 << 20); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("a preview reading past the upload ceiling: err = %v, want ResourceExhausted", err)
+	}
+	if err := upload(int64(len(ova))); err != nil {
+		t.Fatalf("a preview within the upload ceiling: %v", err)
+	}
 }

@@ -45,6 +45,9 @@ func TestFleet_FenceRetry_NewOutageIsNotHeldByThePreviousOutagesFence(t *testing
 	if _, err := c.SelfClient(a).ConfigureHost(ctx, &pb.ConfigureHostRequest{Name: d.Name, FenceStrategy: "ssh"}); err != nil {
 		t.Fatalf("configure %s fence strategy ssh: %v", d.Name, err)
 	}
+	// A confirmed SSH power-off of d recovers its workloads only by its
+	// operator's choice.
+	trustSSHPoweroffOn(t, c, a, d, voters...)
 	c.WaitConverged(t, convergeTimeout, voters...)
 
 	clock := NewVirtualClock(time.Now().UTC())

@@ -64,7 +64,7 @@ func TestFailover_UnverifiedFenceRecordsOfflineOnceLatched(t *testing.T) {
 	// (TestPartitionPause_*), and an assumed success alone is held.
 	for _, method := range []string{"ssh", "watchdog"} {
 		t.Run(method, func(t *testing.T) {
-			db, ctx := seedDownHost(t, method, nil)
+			db, ctx := seedDownHost(t, method, trustSSH)
 			c := newTestCoordinator("coordinator", db)
 			c.Gate = fenceStateLatched()
 			c.SetFencer(fencerReturning(method, true))
@@ -91,7 +91,7 @@ func TestFailover_UnverifiedFenceRecordsOfflineOnceLatched(t *testing.T) {
 // Mutation: record 'offline' for an unverified fence whether or not the token
 // has latched — the host reads 'offline' and the test goes red.
 func TestFailover_UnverifiedFenceRecordsFencedUntilLatched(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	c := newTestCoordinator("coordinator", db)
 	c.Gate = fakeFailoverGate{enforced: map[string]bool{}}
 	c.SetFencer(fencerReturning("ssh", true))
@@ -139,6 +139,9 @@ func sshHandoff(t *testing.T) (*corrosion.Client, *Coordinator, *Coordinator, *t
 		}); err != nil {
 			t.Fatalf("InsertHost %s: %v", name, err)
 		}
+		if err := corrosion.SetHostLabel(ctx, db, name, corrosion.LabelTrustSSHPoweroff, "true"); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
 		Name: "vm1", HostName: "bad", Spec: `{"on_host_failure":"restart-any"}`, State: "running",
@@ -154,7 +157,7 @@ func sshHandoff(t *testing.T) (*corrosion.Client, *Coordinator, *Coordinator, *t
 	second.Now = first.Now
 	first.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
 		seedLease(t, db, "good", now.Add(leaseDuration))
-		return fence.Result{Method: "ssh", Detail: "poweroff sent", Success: true}
+		return fence.Result{Method: "ssh", Detail: "poweroff sent [path=managed]", Success: true}
 	})
 	second.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
 		t.Error("the successor fenced a host on an unverified fence; it is resumed, never re-fenced")
@@ -259,6 +262,9 @@ func TestRecoverHosts_OfflineAfterASpuriousUnverifiedFenceRecovers(t *testing.T)
 	}); err != nil {
 		t.Fatalf("InsertHost: %v", err)
 	}
+	if err := corrosion.SetHostLabel(ctx, db, "spur", corrosion.LabelTrustSSHPoweroff, "true"); err != nil {
+		t.Fatal(err)
+	}
 	// A workload that needs the fence and is never moved off: a host with
 	// nothing to recover is held, not fenced, and there would be no spurious
 	// fence to recover from.
@@ -333,13 +339,13 @@ func (g orderGate) Enforced(ctx context.Context, tok string) bool {
 // Mutation: read the latch in fenceRecordState again (after the fence) — a
 // latch read follows the fence and the test goes red.
 func TestFailover_TheLatchIsReadBeforeTheFenceNotBetweenItAndItsRecord(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	var events []string
 	c := newTestCoordinator("coordinator", db)
 	c.Gate = orderGate{fakeFailoverGate: fakeFailoverGate{enforced: map[string]bool{}}, events: &events}
 	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
 		events = append(events, "fence")
-		return fence.Result{Method: "ssh", Detail: "poweroff sent", Success: true}
+		return fence.Result{Method: "ssh", Detail: "poweroff sent [path=managed]", Success: true}
 	})
 
 	c.run(ctx)
@@ -372,7 +378,7 @@ func TestFailover_TheLatchIsReadBeforeTheFenceNotBetweenItAndItsRecord(t *testin
 // Mutation: hand recoverFenced the pre-fence host again — a second entry
 // writes 'offline' alone.
 func TestFailover_AnUnverifiedFenceWritesItsStateOnce(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	c := newTestCoordinator("coordinator", db)
 	c.Gate = fenceStateLatched()
 	c.SetFencer(fencerReturning("ssh", true))
@@ -427,7 +433,7 @@ func TestFailover_TheFenceStateLatchIsReadWithoutAPing(t *testing.T) {
 		latched bool
 		want    string
 	}{{"ipmi", false, "fenced"}, {"ssh", true, "offline"}, {"ssh", false, "fenced"}} {
-		db, ctx := seedDownHost(t, tc.method, nil)
+		db, ctx := seedDownHost(t, tc.method, trustSSH)
 		var pinged []string
 		c := newTestCoordinator("coordinator", db)
 		c.Gate = pingingGate{latched: map[string]bool{capabilities.FenceStateV1: tc.latched}, pinged: &pinged}

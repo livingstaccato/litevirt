@@ -302,6 +302,18 @@ func fenceFailedWayOut(h *corrosion.HostRecord) string {
 	return out + ", or give it an ipmi or redfish fence strategy"
 }
 
+// trustSSHChoice names, for a hold on a confirmed SSH power-off, the
+// per-host setting that would have recovered it, as the operator's choice it
+// is and never as advice: trusting a confirmed request is trusting that the
+// host did power off. "" for a host that already trusts one.
+func trustSSHChoice(h *corrosion.HostRecord) string {
+	if trustsSSHPoweroff(h) {
+		return ""
+	}
+	return " (an operator who accepts the risk that a host ignores or does not finish a confirmed SSH power-off " +
+		"may instead set `lv host config " + h.Name + " --trust-ssh-poweroff`; it is not a recommendation)"
+}
+
 // noteFenceFailure holds h's recovery on a fence that failed, naming what
 // failed and the way out, and keeps that failure for the retry holds that
 // replace this one while the next attempt waits (retryHold).

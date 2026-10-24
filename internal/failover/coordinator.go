@@ -3633,7 +3633,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 	// self-pause when this coordinator relies on the host's partition pause
 	// (docs/design/partition-pause.md §4.2): same row shape, assurance
 	// self_paused, and recoverFenced then waits out the pause.
-	fr = notAFenceUnlessPaused(asSelfPause(fr, pauseRelied))
+	fr = notAFenceUnlessPaused(asSelfPause(fr, pauseRelied, trustsSSHPoweroff(h)))
 
 	logResult := fr.LogResult()
 	if !fr.Success {
@@ -3896,7 +3896,9 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	c.markHandled(ctx, h.Name)
 	// A best-effort fence counts only as a self-pause, live or resumed: a
 	// row an older build recorded as an assumed success is not one here.
-	fr = notAFenceUnlessPaused(fr)
+	// Nor does an SSH power-off the remote shell confirmed, unless the host
+	// trusts one.
+	fr = holdUntrustedSSH(notAFenceUnlessPaused(fr), trustsSSHPoweroff(h))
 
 	// Step 2b: a fence that did not record the host "fenced" leaves it
 	// "offline" — a weaker claim, and the one the split-brain guards below
@@ -4003,10 +4005,18 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	if !fr.Success {
 		bestEffort := fr.Method == "best-effort-ssh" && fence.ResolveStrategy(h.FenceStrategy) == "best-effort"
 		switch {
-		case h.FenceStrategy == "manual" || bestEffort:
+		case h.FenceStrategy == "manual" || bestEffort || fr.Unproven:
 			if why, ok := c.confirmedOffNow(ctx, h.Name, life, lifeKnown); !ok {
 				if why != "" {
 					return // refused with its remedy (noteConfirmationStale)
+				}
+				if fr.Unproven {
+					slog.Error("failover: an SSH power-off the remote shell confirmed is not proof the host is off, NOT rescheduling",
+						"host", h.Name, "detail", fr.Detail, "hint", strings.TrimPrefix(fenceFailedWayOut(h), "; or "))
+					c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
+					c.noteHold(h.Name, "the SSH fence's remote shell confirmed the power-off, which is not proof the host is off"+
+						fenceFailedWayOut(h)+trustSSHChoice(h))
+					return
 				}
 				if bestEffort {
 					slog.Error("failover: the best-effort fence proves nothing and the host's partition pause is not relied on, NOT rescheduling",

@@ -293,7 +293,7 @@ func TestConfirmationResume_RecordsItsMomentSoARefusedClaimIsRetried(t *testing.
 		}
 	}
 	if err := corrosion.InsertFenceLog(ctx, db, corrosion.FenceLogRecord{
-		ID: "earlier-fence", HostName: "dead", Method: "ssh", Result: "fenced", Detail: "poweroff accepted",
+		ID: "earlier-fence", HostName: "dead", Method: "ssh", Result: "fenced", Detail: "poweroff accepted [path=managed]",
 	}); err != nil {
 		t.Fatal(err)
 	}

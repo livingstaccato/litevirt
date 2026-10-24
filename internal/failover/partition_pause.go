@@ -121,8 +121,14 @@ func (c *Coordinator) reliesOnPauseIfAssumed(ctx context.Context, h *corrosion.H
 //   - a host-key mismatch (WrongHost): a different machine answered at the
 //     address, so the host may well be elsewhere and still hold the majority,
 //     and its pause is no evidence of anything.
-func asSelfPause(fr fence.Result, relied bool) fence.Result {
-	if fr.Method != "best-effort-ssh" || !relied || fr.WrongHost || (!fr.Success && !fr.Dialled) {
+//
+// A best-effort fence the remote shell confirmed (method ssh) is one more
+// fence that proves nothing, and is rewritten the same way, unless the host
+// trusts a confirmed SSH power-off (trustedSSH), when it stands as it is.
+func asSelfPause(fr fence.Result, relied, trusted bool) fence.Result {
+	if relied && fr.Method == "ssh" && fr.Success && !trustedSSH(fr, trusted) {
+		fr.Method = "best-effort-ssh"
+	} else if fr.Method != "best-effort-ssh" || !relied || fr.WrongHost || (!fr.Success && !fr.Dialled) {
 		return fr
 	}
 	// The method stays best-effort-ssh, so an older coordinator reads the row
@@ -144,6 +150,34 @@ func notAFenceUnlessPaused(fr fence.Result) fence.Result {
 	}
 	fr.Success = false
 	fr.Detail += "; not counted as a fence: nothing proves the host is off, and its partition pause is not relied on"
+	return fr
+}
+
+// trustedSSH reports whether fr is an SSH power-off the host's operator has
+// chosen to trust (corrosion.LabelTrustSSHPoweroff, trusted): confirmed by
+// the remote shell, over the host's pinned key. Nothing else is, whatever the
+// setting.
+func trustedSSH(fr fence.Result, trusted bool) bool {
+	return trusted && fr.Success && fence.ConfirmedOverPin(fr.Method, fr.Detail)
+}
+
+// trustsSSHPoweroff reports whether h's operator chose to trust a confirmed
+// SSH power-off of it.
+func trustsSSHPoweroff(h *corrosion.HostRecord) bool {
+	return h != nil && h.Labels[corrosion.LabelTrustSSHPoweroff] == "true"
+}
+
+// holdUntrustedSSH stops counting an SSH power-off the remote shell confirmed
+// (method ssh) as a fence unless the host trusts one (trustedSSH): a
+// confirmed request is not an observed power-off. It is recorded as it ran;
+// recoverFenced holds the workloads on it (fr.Unproven) until a hardware
+// fence or an operator's fence-confirm.
+func holdUntrustedSSH(fr fence.Result, trusted bool) fence.Result {
+	if fr.Method != "ssh" || !fr.Success || trustedSSH(fr, trusted) {
+		return fr
+	}
+	fr.Success, fr.Unproven = false, true
+	fr.Detail += "; the remote shell confirmed the power-off, but a confirmed SSH power-off is not proof the host is off"
 	return fr
 }
 

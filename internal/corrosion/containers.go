@@ -70,6 +70,15 @@ const (
 	// LabelFenceRequiresConfirmation, when "true" on a host, makes an
 	// UNVERIFIED fence of that host insufficient to reschedule its workloads.
 	LabelFenceRequiresConfirmation = "litevirt.fence_requires_confirmation"
+	// LabelTrustSSHPoweroff, when "true" on a host, makes an SSH power-off of
+	// it that the remote shell confirmed, over the host's pinned sshd key,
+	// enough to recover its workloads. Off by default: a confirmed request is
+	// not an observed power-off (a host that ignores it, or one whose
+	// power-off hangs, keeps running), so by default only a hardware fence,
+	// the host's partition pause or an operator's fence-confirm is. It is the
+	// operator accepting that risk for this host; never trusted on a dial
+	// failure, a host-key mismatch or an unconfirmed result.
+	LabelTrustSSHPoweroff = "litevirt.trust_ssh_poweroff"
 	// LabelIP records a container's primary IPv4 so it can serve as a load
 	// balancer backend cluster-wide (containers have no vm_interfaces table).
 	// Set from a static compose NIC address at create; the LB host re-discovers

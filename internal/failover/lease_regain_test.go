@@ -106,7 +106,7 @@ func TestConfirmationResume_RecordsTheFenceSoARefusedClaimIsRetried(t *testing.T
 	// A previous leader fenced dead (an unproven fence); an operator has
 	// since confirmed it off. This coordinator never acted on that fence.
 	if err := corrosion.InsertFenceLog(ctx, db, corrosion.FenceLogRecord{
-		ID: "earlier-fence", HostName: "dead", Method: "ssh", Result: "fenced", Detail: "poweroff accepted",
+		ID: "earlier-fence", HostName: "dead", Method: "ssh", Result: "fenced", Detail: "poweroff accepted [path=managed]",
 	}); err != nil {
 		t.Fatal(err)
 	}

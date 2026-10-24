@@ -1614,10 +1614,18 @@ again.
 
 Release note. On this build failover never starts a second copy on a guess. A
 failed host's workloads are recovered automatically only on an `ipmi` or
-`redfish` power-off observed off, or on the host's own partition pause, waited
-out ([When a best-effort host is
-recovered](migration-failover.md#when-a-best-effort-host-is-recovered)). An
-SSH fence whose remote shell confirmed the power-off still counts.
+`redfish` power-off observed off, on the host's own partition pause, waited
+out, or on an operator's `lv host fence-confirm` ([When a best-effort host is
+recovered](migration-failover.md#when-a-best-effort-host-is-recovered)).
+
+**SSH-confirmed fences now hold by default.** An `ssh` (or `best-effort`)
+fence whose remote shell confirmed it was powering the host off used to
+recover the host's workloads at once. It no longer does: a confirmed request
+is not an observed power-off. An operator who accepts that risk for a host can
+turn it back on with `lv host config <host> --trust-ssh-poweroff` (the
+`litevirt.trust_ssh_poweroff` label), which trusts only a confirmation reached
+over the host's pinned sshd key. `lv doctor fence` and the health page list
+the hosts with it on.
 
 What changes on an upgraded cluster: a `best-effort` fence (the default
 strategy) that does not confirm the power-off used to be recorded `assumed`

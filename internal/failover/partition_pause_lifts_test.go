@@ -114,7 +114,7 @@ func TestRecoveryLimit_AFenceThatDoesNotProveItOffKeepsTheLimit(t *testing.T) {
 	}{
 		{"lenient best-effort", fence.Result{Method: "best-effort-ssh", Success: true, Detail: "ssh unreachable, assumed"}, "best-effort"},
 		{"failed best-effort", fence.Result{Method: "best-effort-ssh", Success: false, Detail: "ssh unreachable"}, "best-effort"},
-		{"strict ssh", fence.Result{Method: "ssh", Success: true, Detail: "poweroff accepted"}, "ssh"},
+		{"strict ssh", fence.Result{Method: "ssh", Success: true, Detail: "poweroff accepted [path=managed]"}, "ssh"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, db, ctx, _ := limitedEpisode(t)

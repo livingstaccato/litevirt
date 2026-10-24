@@ -32,6 +32,18 @@ type Result struct {
 	// host itself is known, not even that it lost the majority, so not even
 	// its partition pause is relied on.
 	WrongHost bool
+	// Unproven marks a result the failover coordinator stopped counting as a
+	// fence: it reported success, but nothing proves the host is off.
+	Unproven bool
+}
+
+// ConfirmedOverPin reports whether a fence recorded as (method, detail) is an
+// SSH power-off the remote shell confirmed, reached over the host's pinned
+// sshd key: method ssh (a success: the marker was seen) by the managed or the
+// legacy-pinned path. An unpinned success, or a row that names no path (an
+// earlier build's), is not one.
+func ConfirmedOverPin(method, detail string) bool {
+	return method == "ssh" && (strings.Contains(detail, "[path=managed]") || strings.Contains(detail, "[path=legacy-pinned]"))
 }
 
 // HostConfig is the subset of corrosion.HostRecord fields needed for fencing.

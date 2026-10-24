@@ -93,7 +93,7 @@ func TestFenceCandidates_RunBegunWhileUpgradingKeepsTheRestartAllowance(t *testi
 // activation, or past one that ended in another state; drop the clear from
 // stepDownGauges or from forgetEpisodes.
 func TestNoteUpgradingLives(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	db.SetHostMembershipGate(func() bool { return true })
 	if _, err := db.SplitHostMembership(ctx); err != nil || !db.HostMembershipLive() {
 		t.Fatalf("split host membership: live=%v err=%v", db.HostMembershipLive(), err)

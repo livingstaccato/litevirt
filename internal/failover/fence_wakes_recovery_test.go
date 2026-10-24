@@ -36,7 +36,7 @@ func ageFenceRows(t *testing.T, db *corrosion.Client, ctx context.Context, d tim
 func operatorFences(t *testing.T, db *corrosion.Client, ctx context.Context) {
 	t.Helper()
 	if err := corrosion.RecordFenceWithState(ctx, db, corrosion.FenceLogRecord{
-		ID: "operator-ssh-down", HostName: "down", Method: "ssh", Result: fence.LogFenced, Detail: "operator fence",
+		ID: "operator-ssh-down", HostName: "down", Method: "ssh", Result: fence.LogFenced, Detail: "operator fence [path=managed]",
 	}, "offline"); err != nil {
 		t.Fatalf("RecordFenceWithState: %v", err)
 	}
@@ -69,7 +69,7 @@ func countingFencer(n *int, results ...fence.Result) Fencer {
 
 var (
 	sshFailedFence = fence.Result{Method: "ssh", Success: false, Detail: "ssh: no identity"}
-	sshFence       = fence.Result{Method: "ssh", Success: true, Detail: "poweroff sent"}
+	sshFence       = fence.Result{Method: "ssh", Success: true, Detail: "poweroff sent [path=managed]"}
 )
 
 // Lab drill S5: the lease-holding coordinator's own fence of a down host
@@ -84,7 +84,7 @@ var (
 // Mutation M1 (adopt): drop the newer-recorded-fence check from the cached
 // branch of run (fenceAuthorityChanged answers false) — the VM stays on 'down'.
 func TestFenceWake_OperatorFenceAfterOwnFailedFenceRecoversNextCycle(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	lengthenStreak(t, db, ctx, 2*time.Minute)
 	c := newTestCoordinator("coordinator", db)
 	fences := 0
@@ -131,7 +131,7 @@ func TestFenceWake_OperatorFenceAfterOwnFailedFenceRecoversNextCycle(t *testing.
 // Mutation M3 (backoff): fenceRetryDue ignores the delay — the immediate
 // second cycle fences again.
 func TestFenceWake_OwnFailedFenceIsRetriedOnSchedule(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	c := newTestCoordinator("coordinator", db)
 	fences := 0
 	c.SetFencer(countingFencer(&fences, sshFailedFence, sshFence))
@@ -304,7 +304,7 @@ func TestFenceWake_StalledRecoveryAlertsOnceThenAtABoundedInterval(t *testing.T)
 //
 // Mutation M8: count every fenced/offline host as stalled — this alerts.
 func TestFenceWake_RecoveredHostDoesNotAlert(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	c := newTestCoordinator("coordinator", db)
 	c.SetFencer(fencerReturning("ssh", true))
 	now := time.Now()
@@ -352,7 +352,7 @@ func aliveAnswers(t *testing.T, db *corrosion.Client, ctx context.Context) {
 //
 // Mutation M15: retryStillDown answers true — the retry runs.
 func TestFenceWake_HostThatAnsweredSinceTheFailureIsNotRetried(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	thirdVoter(t, db, ctx)
 	c := newTestCoordinator("coordinator", db)
 	fences := 0
@@ -381,7 +381,7 @@ func TestFenceWake_HostThatAnsweredSinceTheFailureIsNotRetried(t *testing.T) {
 // Mutation M16: retryStrategy always repeats the failed method — the retry
 // runs ssh.
 func TestFenceWake_RetryHonoursAFixedStrategy(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	c := newTestCoordinator("coordinator", db)
 	var strategies []string
 	c.SetFencer(func(_ context.Context, h fence.HostConfig) fence.Result {
@@ -427,7 +427,7 @@ func TestFenceWake_FenceGatesHoldARetryBack(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			db, ctx := seedDownHost(t, "ssh", nil)
+			db, ctx := seedDownHost(t, "ssh", trustSSH)
 			c := newTestCoordinator("coordinator", db)
 			fences := 0
 			c.SetFencer(countingFencer(&fences, sshFailedFence, sshFence))
@@ -450,7 +450,7 @@ func TestFenceWake_FenceGatesHoldARetryBack(t *testing.T) {
 //
 // Mutation: count every row on a retry again (recentlyFenced) — no retry.
 func TestFenceWake_AnOlderFenceDoesNotHoldARetryBack(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	c := newTestCoordinator("coordinator", db)
 	fences := 0
 	c.SetFencer(countingFencer(&fences, sshFailedFence, sshFence))
@@ -474,7 +474,7 @@ func TestFenceWake_AnOlderFenceDoesNotHoldARetryBack(t *testing.T) {
 //
 // Mutation M11: treat a declined resume as resumeFromRecord — the VM moves.
 func TestFenceWake_AnAdoptedFenceThatDoesNotStandIsDeclined(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	thirdVoter(t, db, ctx)
 	lengthenStreak(t, db, ctx, 2*time.Minute)
 	c := newTestCoordinator("coordinator", db)
@@ -574,7 +574,7 @@ func TestFenceWake_FailedRetriesNotifySparingly(t *testing.T) {
 // Mutation M24: drop the placement hold reason — the alert does not say why
 // the recovery that ran left the VM.
 func TestFenceWake_StallReasonIsWhatHoldsTheRecoveryNow(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	lengthenStreak(t, db, ctx, 2*time.Minute)
 	c := newTestCoordinator("coordinator", db)
 	c.SetFencer(countingFencer(new(int), sshFailedFence))
@@ -609,7 +609,7 @@ func TestFenceWake_StallReasonIsWhatHoldsTheRecoveryNow(t *testing.T) {
 // Mutation M23: seed fenceRelocated false on every commit — the retry resets
 // it, and recoverHosts could return the host to service on its own.
 func TestFenceWake_ARetryKeepsVMsMoved(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	c := newTestCoordinator("coordinator", db)
 	// Both fences fail, so no recovery runs that could set it true again.
 	fences := 0

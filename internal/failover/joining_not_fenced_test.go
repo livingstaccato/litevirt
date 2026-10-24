@@ -14,7 +14,7 @@ import (
 //
 // Mutation: drop the 'joining' skip in run — the joining host is fenced.
 func TestJoiningHostIsNotFenced(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	if err := corrosion.UpdateHostState(ctx, db, "down", corrosion.HostStateJoining); err != nil {
 		t.Fatalf("UpdateHostState: %v", err)
 	}
@@ -22,7 +22,7 @@ func TestJoiningHostIsNotFenced(t *testing.T) {
 	fences := 0
 	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
 		fences++
-		return fence.Result{Method: "ssh", Success: true}
+		return fence.Result{Method: "ssh", Success: true, Detail: "stub [path=managed]"}
 	})
 
 	c.run(ctx)

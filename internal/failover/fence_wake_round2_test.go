@@ -61,7 +61,7 @@ func captureSlog(t *testing.T) *bytes.Buffer {
 //
 // Mutation M26: always Warn — one Warn line per cycle.
 func TestFenceWake_ARefusedRetryWarnsOnTheTransitionOnly(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	thirdVoter(t, db, ctx)
 	c := newTestCoordinator("coordinator", db)
 	fences := 0
@@ -154,7 +154,7 @@ func TestFenceWake_ContainerOwnershipDisputeNamesItsHold(t *testing.T) {
 //
 // Mutation M30: answeredSince reports "still down" on a read error.
 func TestFenceWake_UnreadableHealthRefusesTheRetry(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	c := newTestCoordinator("coordinator", db)
 	if err := db.Execute(ctx, `DROP TABLE host_health`); err != nil {
 		t.Fatalf("drop host_health: %v", err)

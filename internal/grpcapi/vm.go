@@ -2700,6 +2700,9 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	if aerr := s.hardwareAdoptionRefused(ctx, vm.Name); aerr != nil {
 		return releasePreflight, aerr
 	}
+	if merr := s.refuseMIGHostdevsAtStart(ctx, vm.Name); merr != nil {
+		return releasePreflight, merr
+	}
 
 	// PCI start-preflight: under the active hardware_v2 regime, a VM whose reserved
 	// vm_pci_intent rows are not yet realized must have its passthrough acquired

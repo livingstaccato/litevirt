@@ -15,6 +15,9 @@ import (
 	"testing"
 	"time"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/vfio"
 )
@@ -142,4 +145,83 @@ func TestFleet_PCIFailover_MIGGPUIsNotBoundUntilMIGIsOff(t *testing.T) {
 			t.Fatalf("the H100 on %s is on %q once MIG was off, want vfio-pci", b.Name, drv)
 		}
 	})
+}
+
+// A passthrough VM crashes; managed='yes' put its GPU back on the nvidia
+// driver, and the operator split the GPU into MIG instances meanwhile. The
+// restart policy's restart (health.VMChecker, wired with the daemon's
+// hardware pre-start) is refused: the domain stays down and the GPU stays on
+// nvidia, before the hardware_v2 latch and after it.
+func TestFleet_HealthRestartDoesNotRebindAMIGGPU(t *testing.T) {
+	const addr = "0000:81:00.0"
+	for _, latched := range []bool{false, true} {
+		t.Run(map[bool]string{false: "pre-latch", true: "post-latch"}[latched], func(t *testing.T) {
+			fs := &migSysfs{drv: map[string]string{addr: "nvidia"}}
+			defer vfio.SetFS(fs)()
+			fleetFakeSMI(t, "Disabled")
+			c := New(t, Options{Nodes: 1})
+			n := c.Nodes[0]
+			ctx := context.Background()
+			if latched {
+				latchHardwareV2(t, c, gateAll(t, c))
+			}
+			if err := corrosion.UpsertPCIDevice(ctx, n.DB, corrosion.PCIDeviceRecord{
+				HostName: n.Name, Address: addr, VendorID: h100.vendor, DeviceID: h100.device,
+				DeviceName: h100.name, Type: h100.typ, Driver: "nvidia", IOMMUGroup: 80,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.SelfClient(n).CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+				Name: "web", Cpu: 1, MemoryMib: 512,
+				Placement: &pb.PlacementSpec{Host: n.Name},
+				Restart:   &pb.RestartPolicy{Condition: "always", Delay: "1ms"},
+				Devices:   []*pb.DeviceSpec{{Address: addr}},
+			}}); err != nil {
+				t.Fatalf("CreateVM: %v", err)
+			}
+			if st, _ := n.Virt.RawState("web"); st != libvirtfake.StateRunning {
+				t.Fatalf("setup: web is %q, want running", st)
+			}
+
+			// The crash: the domain is gone, libvirt gave the GPU back to
+			// nvidia, and MIG is on now.
+			if err := n.Virt.DestroyDomain("web"); err != nil {
+				t.Fatal(err)
+			}
+			n.Virt.SetStateReason("web", "crashed")
+			if err := localExec(ctx, n.DB, `UPDATE vms SET state = 'stopped' WHERE name = 'web'`); err != nil {
+				t.Fatal(err)
+			}
+			fs.mu.Lock()
+			fs.drv[addr] = "nvidia"
+			binds := fs.binds
+			fs.mu.Unlock()
+			fleetFakeSMI(t, "Enabled")
+
+			checker := newRestartChecker(t, n)
+			checker.SetHardwareStartPreparer(n.Server.PrepareHardwareForStart)
+			before := len(n.Virt.EventLog())
+			checker.SweepOnce(ctx)
+
+			for _, e := range n.Virt.EventLog()[before:] {
+				if e.Domain == "web" && e.Op == "start" {
+					t.Fatal("the restart policy started web on a GPU MIG holds")
+				}
+			}
+			if st, _ := n.Virt.RawState("web"); st == libvirtfake.StateRunning {
+				t.Fatal("web runs on a GPU MIG holds")
+			}
+			// The restart went ahead (its attempt is counted before the
+			// destroy), so the refusal is what kept web down.
+			if rs, err := corrosion.GetRestartState(ctx, n.DB, "web"); err != nil || rs == nil || rs.AttemptCount < 1 {
+				t.Fatalf("the restart policy never tried to restart web (%+v, %v); the scenario did not run", rs, err)
+			}
+			fs.mu.Lock()
+			drv, after := fs.drv[addr], fs.binds
+			fs.mu.Unlock()
+			if drv != "nvidia" || after != binds {
+				t.Fatalf("the MIG GPU is on %q after %d more vfio binds; want it left on nvidia", drv, after-binds)
+			}
+		})
+	}
 }

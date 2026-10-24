@@ -103,6 +103,9 @@ NVIDIA GPU that is on the NVIDIA driver to vfio-pci, the host first asks
 `nvidia-smi`, and refuses the attach or start with `FailedPrecondition` if the
 GPU's MIG mode is enabled (now, or pending a reset) or it has any MIG GPU
 instance. Binding it would take it from under every workload on its instances.
+This holds for every start, including a restart of a VM whose definition
+already passes the GPU through: libvirt returns the GPU to the NVIDIA driver
+when the VM stops, and a start would take it back.
 The refusal names the GPU and its `nvidia-smi` index. If `nvidia-smi` cannot
 report that GPU's MIG state, the host refuses too. A GPU on no driver, or on
 any other driver, runs no MIG workload and is not checked, nor is any GPU on a

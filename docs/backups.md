@@ -967,11 +967,17 @@ the same replica, and a file built there would become that kept disk's base.
 A promotion never refuses for a kept disk, so failover does not wait on
 `kept-disks.json`, and a file already at any name is never replaced. The
 name is recorded on the host before the file is created
-(`<data_dir>/promote-disks/<vm>.json`, removed once the promoted VM's disk
-rows name the files), so a promotion retried after a crash or a failure, with
-the same proof, a new one or none, reuses the live disk the earlier attempt
-built from the same replica instead of building another beside it. One built
-from another replica is left alone. A crash-recovered promotion counts
+(`<data_dir>/promote-disks/<vm>.json`), so a promotion retried after a crash
+or a failure, with the same proof, a new one or none, reuses the live disk the
+earlier attempt built from the same replica instead of building another
+beside it. The record belongs to one promotion in progress: it is read only
+while that promotion's promote marker is there (written just before the
+domain starts), and is removed, before the marker, once the attempt ends. A
+promotion that starts with no marker drops it, and a file an earlier attempt
+built is then left alone, as is one built from another replica. A recorded
+file is never reused when a disk row, a kept-disk note or `kept-disks.json`
+names it; when the kept-disk records cannot be read, a fresh live disk is
+built instead, so failover does not wait on them. A crash-recovered promotion counts
 another disk only when the domain it adopts has that disk.
 
 After a successful automatic promotion the failover coordinator records the

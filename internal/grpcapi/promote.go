@@ -1425,7 +1425,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// recorded before the file is created (promote_disk_names.go): a kept
 	// disk can name the path an earlier promotion from this replica used as
 	// its missing base, and a file built there would become that base.
-	journal := s.readPromoteDisks(targetName)
+	// Only an entry of this promotion, still in progress, is reused: with
+	// no promote marker the journal is an earlier promotion's and is dropped.
+	journal := s.promoteDisksForAttempt(targetName)
 	// A crash-recovery adoption attaches only what the running domain has.
 	adoptedXML := ""
 	if started {
@@ -1446,13 +1448,21 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	if started {
 		// It already STARTED the domain off its live disk: never rebuilt
 		// (that would overwrite a running VM's disk); the one it runs from.
-		livePath = adoptedPromotedDisk(journal, targetName, poolDir, src.DiskName, replica, adoptedXML,
+		livePath = s.adoptedPromotedDisk(ctx, journal, targetName, poolDir, src.DiskName, replicaPath, adoptedXML,
 			stepFile, legacyPromotedPath(poolDir, targetName, replica))
+		if livePath == "" && adoptedXML == "" {
+			// Never a guess while the definition is unread: a row naming a
+			// file the domain does not run from would be the VM's root from
+			// then on, and it could be a kept disk's.
+			return status.Errorf(codes.Unavailable,
+				"promote of %s: the definition of the domain an earlier attempt started cannot be read, so the live disk it runs from cannot be identified; nothing was changed, retry",
+				vm.Name)
+		}
 		if livePath == "" {
 			livePath = legacyPromotedPath(poolDir, targetName, replica)
 		}
 	} else {
-		p, diskBuilt, err := s.planPromotedDisk(ctx, journal, targetName, poolDir, src.DiskName, replica, stepFile)
+		p, diskBuilt, err := s.planPromotedDisk(ctx, journal, targetName, poolDir, src.DiskName, replicaPath, stepFile)
 		if err != nil {
 			return status.Errorf(codes.Internal, "promote of %s: record the name of its live disk before building it: %v", vm.Name, err)
 		}
@@ -1597,7 +1607,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		if started {
 			// Adopting a domain an earlier attempt started: the disk counts
 			// only if its built file is there and the domain has it.
-			d.livePath = adoptedPromotedDisk(journal, targetName, poolDir, d.row.DiskName, d.replica.File, adoptedXML,
+			d.livePath = s.adoptedPromotedDisk(ctx, journal, targetName, poolDir, d.row.DiskName, d.replicaPath, adoptedXML,
 				legacy, legacyPromotedPath(poolDir, targetName, d.replica.File))
 			if d.livePath == "" || !inAdopted(d.livePath) {
 				d.missing = "not built or not attached by the attempt that started the domain"
@@ -1605,7 +1615,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			}
 			continue
 		}
-		p, built, perr := s.planPromotedDisk(ctx, journal, targetName, poolDir, d.row.DiskName, d.replica.File, legacy)
+		p, built, perr := s.planPromotedDisk(ctx, journal, targetName, poolDir, d.row.DiskName, d.replicaPath, legacy)
 		if perr != nil {
 			slog.Error("promote: the name of a live disk of the replica set could not be recorded; promoting without it",
 				"vm", vm.Name, "disk", d.row.DiskName, "replica", d.replica.File, "error", perr)
@@ -1919,7 +1929,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			if opClaim != nil {
 				if err := s.fenceOperatorStart(ctx, opClaim); err != nil {
 					_ = s.virt.UndefineDomain(targetName, false)
-					s.removePromoteMarker(targetName)
+					s.endPromoteAttempt(targetName)
 					return "operator claim", err
 				}
 			}
@@ -1931,7 +1941,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			releaseGuard, gerr := s.guardSharedDiskStart(ctx, targetName, domXML)
 			if gerr != nil {
 				_ = s.virt.UndefineDomain(targetName, false)
-				s.removePromoteMarker(targetName)
+				s.endPromoteAttempt(targetName)
 				if opClaim != nil {
 					s.unfenceOperatorStart(opClaim)
 				}
@@ -1946,7 +1956,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				_ = s.virt.UndefineDomain(targetName, false) // wipe by design: half-built promote
 				// Don't leak the marker: we tore the half-built domain down, so a later --force
 				// retry must not treat a same-name stranger as our adopted prior promotion.
-				s.removePromoteMarker(targetName)
+				s.endPromoteAttempt(targetName)
 				// Nothing runs: the claim may be released again — but only on
 				// libvirt's positive answer (review I-1). A dropped connection
 				// can fail the start after qemu was launched, and fails every
@@ -2050,7 +2060,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			_ = s.virt.DestroyDomain(targetName)
 			_ = s.virt.UndefineDomain(targetName, false)
 			removeLive()
-			s.removePromoteMarker(targetName)
+			s.endPromoteAttempt(targetName)
 			return err
 		}
 		// Inserted "creating": assignOwnerEpochAtCreate publishes it running
@@ -2113,10 +2123,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 	}
 	// Row persisted (the durable record now exists) → drop the host-local promote marker;
-	// a future retry would see the re-homed row and not re-promote.
-	s.removePromoteMarker(targetName)
-	// The rows name the live disks now: their journal is done with.
-	s.clearPromoteDisks(targetName)
+	// a future retry would see the re-homed row and not re-promote. The rows
+	// name the live disks now: their journal goes first (endPromoteAttempt).
+	s.endPromoteAttempt(targetName)
 
 	// The manifest: every disk and the replica it came from, or why not.
 	s.recordVMEvent(ctx, targetName, "vm.promoted", "ok", manifest)

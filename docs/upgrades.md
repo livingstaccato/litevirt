@@ -1625,7 +1625,10 @@ is not an observed power-off. An operator who accepts that risk for a host can
 turn it back on with `lv host config <host> --trust-ssh-poweroff` (the
 `litevirt.trust_ssh_poweroff` label), which trusts only a confirmation reached
 over the host's pinned sshd key. `lv doctor fence` and the health page list
-the hosts with it on.
+the hosts with it on. Host labels are one last-writer-wins value, so an
+unrelated label written on a node that has not yet seen a
+`--trust-ssh-poweroff=false` can bring the trust back: after turning it off,
+check that `lv doctor fence` no longer lists the host.
 
 What changes on an upgraded cluster: a `best-effort` fence (the default
 strategy) that does not confirm the power-off used to be recorded `assumed`
@@ -1642,7 +1645,10 @@ SSH. With `enforcement.partition_pause` on (the default) and
 recovered on its own after the pause wait, as before. Nothing gates this on
 a token: it is decided where the recovery is created. Until every host runs
 this build, a failover leader on an earlier build still recovers on an assumed
-fence it ran itself.
+fence it ran itself, and on any SSH power-off its remote shell confirmed,
+whatever `litevirt.trust_ssh_poweroff` says: that build does not know the
+label. Upgrade the lease holder early in the roll, or keep HA disarmed on a
+cluster whose hosts fence only over SSH until the roll is done.
 
 ### An unverified fence records `offline` after the roll
 

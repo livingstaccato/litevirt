@@ -874,8 +874,11 @@ All three of these must hold:
   coordinator's replica.
 - The fence's assurance would otherwise be `assumed`.
 
-Otherwise the coordinator does exactly what it does today, and records
-`assumed`.
+Otherwise nothing proves the host off. The coordinator records the fence
+failed and holds the host's workloads until an operator confirms the host off
+or a hardware fence proves it (§10, item 10). The predicate is asked again at
+the deadline and when a record is resumed: a pause no longer relied on then
+refuses, and never falls back to the best-effort fence alone.
 
 **Why the latest probe answer, and not a cached Ping.** The first cut read
 the host's last cached Ping (`Checker.PeerAdvertisedLast`), which had no age
@@ -1049,8 +1052,9 @@ minority stops its copy, and the majority recovers as it always has.
   The coordinator relies on the pause only when its own flag is on AND the
   token is latched (`flag && Enforced`, the family rule) AND the target host
   advertised it, so a coordinator
-  whose flag is off records `assumed` and recovers at once, exactly as today,
-  and a host whose flag is off pauses nothing.
+  whose flag is off relies on no pause, and holds a best-effort host's
+  workloads until it is confirmed off (§10, item 10); a host whose flag is off
+  pauses nothing.
 
 **The premise about watchdogs, corrected.** The brief said that a host with an
 armed hardware watchdog is "already covered by it". It is not, for a
@@ -1222,7 +1226,7 @@ container (`split_brain`), so a certified relocation can only lead to a stop.
 | F6 | A host comes back before the deadline | The deadline check sees a majority of voters answered by the host (`selfPauseStillStands` fails), and recovers nothing. The host's resume check passes once `recoverHosts` reactivates it. | If the lease moved in between, `recoverHosts` leaves the host `fenced` until `lv host undrain`, and its workloads stay paused until then, with `partition_paused` saying why. |
 | F7 | A fleet-wide blip | Everything pauses, then everything resumes. `partition_paused` is raised on every host and resolved. After the heal, every coordinator holds failure rows its peers wrote during the blip, about every host, and replication delivers them before the observers' first successful probes overwrite them. A coordinator therefore decides no new fence while the quorum its fence rests on is lost, or within `QuorumRegainGrace` (`StallGrace`, 10 s) of that quorum's own No→Yes transition (`error_class=quorum_regain`), as after a stall of its own. The scope is the quorum the decision rests on — the cluster-wide one, or under region scope the target's region's — never the cluster-wide quorum for a regional decision: a region majority cut off from the rest of the cluster lacks the cluster-wide quorum for as long as the cut lasts, and is exactly the side that must fence. "Lost" is read fresh inside the grace check, never taken from the last recorded reading: a remote region's quorum is read only by a fence decision about one of its hosts, which the grace runs ahead of, so a recorded No would otherwise defer that region's fences for as long as nothing re-read it. A fresh Yes is the No→Yes transition and opens the grace from that moment. | Workloads lose execution time for the blip plus about one probe cycle. Accepted by the user. A fence decided anyway (a grace too short for a slow re-probe) waits out the pause and is then refused by `selfPauseStillStands`, and the host stays paused until `recoverHosts` reactivates it (F6). |
 | F8 | A resume answer is missing | The workload stays paused and is retried every tick. | An unreachable minority of voters delays the resume. It never makes the pauser resume wrongly. |
-| F10 | One host's flag is turned off (a restart) while its peers keep theirs on | The first health probe that reaches the restarted daemon records that it does not pause, and from then on no coordinator relies on its pause. It is fenced `assumed` and recovered as before partition pause (§4.3). | If the partition begins before any probe reaches the new run, the coordinator still holds the old run's answer, relies, waits `W` and recovers while the host keeps running. This is F3 with the flag off: the window is at most one probe cycle after the new daemon starts serving. Layer 3 settles it on return. |
+| F10 | One host's flag is turned off (a restart) while its peers keep theirs on | The first health probe that reaches the restarted daemon records that it does not pause, and from then on no coordinator relies on its pause. Its best-effort fence proves nothing, and its workloads are held until it is confirmed off (§4.3, §10 item 10). | If the partition begins before any probe reaches the new run, the coordinator still holds the old run's answer, relies, waits `W` and recovers while the host keeps running. This is F3 with the flag off: the window is at most one probe cycle after the new daemon starts serving. Layer 3 settles it on return. |
 | F9 | Recovery claims off | Resume relies on the fence-state check alone (§3.5). | Without claims, two coordinators can still each recover (recovery-claims.md §1). Layer 3 needs a certificate, so it does nothing without claims. A copy the host paused stays paused after the heal, and settle declines it with `reason_class=proof_uncertified` (the recovery's proof completed with no certificate, as on a derived voter set) until an operator stops it. |
 
 ## 8. Testing
@@ -1244,8 +1248,9 @@ restore it.
 - **The timing inequality** (§4.1) against the live constants.
 - **Coordinator:** the reliance prefix only when latched, advertised by the target and assumed; the
   wait, scaled by cluster size; the deadline re-check; a host that came back;
-  an open `partition_pause_failed` falls back to `assumed`; unlatched
-  behaviour is unchanged; `partition_one_way` raised on both views and not
+  an open `partition_pause_failed`, at the decision or during the wait, holds
+  the workloads (§10, item 10); a successor that does not rely on the pause
+  holds them too; `partition_one_way` raised on both views and not
   on a symmetric split.
 - **Capability:** withheld while off; not mandatory; not replication-gated;
   `tokenEnabled`.
@@ -1264,7 +1269,8 @@ restore it.
   after the heal everything resumes, with the condition raised and resolved.
 - **Flag turned off.** The owner says it pauses and its Ping is cached. Its
   flag then goes off, as after a restart, the probes go on, and then it is cut
-  off. The fence is recorded `assumed`, not `self_paused` (finding P1, §4.3).
+  off. The fence is recorded failed, not `self_paused`, and the workload is held
+  (finding P1, §4.3, §10 item 10).
 
 **Lab (after merge, not in this branch).** nftables drops all traffic on all 5
 nodes at once, then heals. Grep for `partition-pause: paused` and
@@ -1343,3 +1349,18 @@ nodes at once, then heals. Grep for `partition-pause: paused` and
    majority relied on it pausing. `enforcement.partition_pause_record_failure`
    (§3.3) now defaults to pausing on a record held in the reserve or in
    memory; `self_fence` keeps the old behaviour.
+10. **A best-effort fence counts only as a self-pause.** The text above has
+    the coordinator record `assumed` and recover at once whenever it does not
+    rely on the pause. The best-effort end state removes that rule: a
+    best-effort fence that does not confirm the power-off is a failure, and
+    counts only as a self-pause, relied on (§4.3) and waited out. Reliance is
+    re-checked at the deadline, on a resumed record, and before a wait starts;
+    a pause no longer relied on (a `partition_pause_failed` that arrives
+    during the wait, a successor whose own flag is off or that holds no probe
+    answer from the host) refuses and holds. So does a fence that reached a
+    different machine (a host-key mismatch), or whose host's sshd answered
+    past the host-key check and still failed: the host is reachable, so it
+    has not paused for want of a majority. A held host's workloads wait for
+    `lv host fence-confirm` or a hardware fence; the stall alert names them
+    and the way out
+    ([migration-failover.md](../migration-failover.md#when-a-best-effort-host-is-recovered)).

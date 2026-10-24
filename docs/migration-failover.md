@@ -988,7 +988,12 @@ run:
   `enforcement.partition_pause` on, the host's latest health-probe answer saying
   it pauses, and no open `partition_pause_failed` for it. The coordinator then
   records the fence `self_paused` and starts nothing until the pause wait (26 s
-  on up to 17 hosts) has passed. This applies to the `best-effort` strategy; or
+  on up to 17 hosts) has passed. The reliance is asked again at the deadline
+  and whenever a record is resumed (by a new lease holder, or after HA is
+  re-armed): a pause no longer relied on by then (the host's
+  `partition_pause_failed` arrived, or the coordinator's own flag is off, or
+  it holds no probe answer from the host) holds the workloads. This applies to
+  the `best-effort` strategy; or
 - an operator's `lv host fence-confirm <host>` after powering the host off.
 
 Everything else holds the host's workloads:
@@ -1002,6 +1007,10 @@ Everything else holds the host's workloads:
   when the host's pause is not relied on;
 - an SSH fence whose pinned host key did not match: a different machine
   answered at the address, so not even the host's pause is relied on;
+- an SSH fence the host's sshd answered past the host-key check whose command
+  still failed (permission denied, the power-off commands failed, or it exited
+  without confirming): the host is reachable, so it has not paused for want of
+  a majority, and not even its pause is relied on;
 - a refused fence (see [Managed fence SSH](#managed-fence-ssh)), or one whose
   ssh could not start;
 - no fence at all.
@@ -1028,9 +1037,18 @@ power-off of that host that the remote shell confirmed, reached over the
 host's pinned sshd key (the `managed` or `legacy-pinned` path), recovers its
 workloads at once, as an `ssh` fence did before. Nothing else is trusted,
 whatever the setting: not a dial failure, not a host-key mismatch, not an
-unconfirmed result, and not an unpinned success. The risk is the one above: a
-host that confirms and then does not power off runs its workloads twice.
+unconfirmed result, and not an unpinned success. The path is the one the fence
+was given, never text the answering machine printed. The risk is the one above:
+a host that confirms and then does not power off runs its workloads twice.
 `lv doctor fence` and the health page list every host with it on.
+
+Turning it off is a label write, and `hosts.labels` is one value replicated
+last-writer-wins: an unrelated label set on another node that has not yet seen
+the change writes the whole map back, and can bring the trust back. After
+`--trust-ssh-poweroff=false`, check `lv doctor fence` (or the health page) a
+little later, and turn it off again if the host is still listed. A leader on an
+earlier build ignores the label altogether and trusts every confirmed SSH
+power-off (see [upgrades.md](upgrades.md)).
 
 A fence row an earlier build recorded as an assumed best-effort success is not
 authority here either: a coordinator resuming from one holds the workloads.

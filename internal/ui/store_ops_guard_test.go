@@ -81,6 +81,9 @@ var uiInternalCallPolicy = map[string]func(callee string) bool{
 	"auth": allowOnly("ClientAddress", "PeerTrusted"),
 	// FirewallTagsLine formats a ListFirewallTags answer; it reads nothing.
 	"apimeta": allowOnly("FirewallTagsLine"),
+	// CheckUpgradeModes reads every member's fence_ssh mode through the
+	// session's own GetFenceSSHStatus RPC (s.grpc), and changes nothing.
+	"fencessh": allowOnly("CheckUpgradeModes"),
 	// Pure helpers with no state of their own.
 	"randid":      func(string) bool { return true },
 	"auditexport": func(string) bool { return true },

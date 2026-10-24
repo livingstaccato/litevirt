@@ -90,7 +90,7 @@ func TestReadTapVLANs_NonNumericFields(t *testing.T) {
 	}
 }
 
-// ── configureAccessBridgeVLAN / configureTrunkBridgeVLANs error handling ──
+// ── configureAccessBridgeVLAN / negotiateTrunkVLANs error handling ──
 
 func TestConfigureAccessBridgeVLAN_Error(t *testing.T) {
 	orig := execVLAN
@@ -109,29 +109,32 @@ func TestConfigureAccessBridgeVLAN_Error(t *testing.T) {
 	}
 }
 
-func TestConfigureTrunkBridgeVLANs_PartialFailure(t *testing.T) {
+func TestNegotiateTrunkVLANs_PartialFailure(t *testing.T) {
 	orig := execVLAN
 	defer func() { execVLAN = orig }()
 
-	callCount := 0
+	adds := 0
 	execVLAN = func(name string, args ...string) ([]byte, error) {
-		callCount++
-		if callCount == 2 {
+		if len(args) >= 2 && args[1] == "show" {
+			return []byte("vnet0 1 PVID Egress Untagged\n"), nil
+		}
+		adds++
+		if adds == 2 {
 			return []byte("fail"), fmt.Errorf("mid-failure")
 		}
 		return nil, nil
 	}
 
-	err := configureTrunkBridgeVLANs("vnet0", []int{10, 20, 30})
+	err := negotiateTrunkVLANs("vnet0", []int{10, 20, 30})
 	if err == nil {
 		t.Fatal("expected error on second VLAN")
 	}
 	if !strings.Contains(err.Error(), "vid 20") {
 		t.Errorf("error should reference vid 20, got: %v", err)
 	}
-	// Should have stopped at 2 calls (first succeeded, second failed).
-	if callCount != 2 {
-		t.Errorf("expected 2 calls, got %d", callCount)
+	// Should have stopped at 2 adds (first succeeded, second failed).
+	if adds != 2 {
+		t.Errorf("expected 2 adds, got %d", adds)
 	}
 }
 

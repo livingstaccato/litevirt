@@ -237,10 +237,12 @@ type LibvirtBackend interface {
 	ListCephSecrets() ([]string, error)
 	UndefineSecret(secretUUID string) error
 
-	// VLAN tap configuration — invoked after CreateVM's StartDomain
-	// to push bridge-vlan rules onto the tap device libvirt created.
+	// VLAN tap configuration — invoked once a domain runs here (a create,
+	// a start, a live migration's arrival) to push bridge-vlan rules onto the
+	// tap device libvirt created. NegotiateTrunkVLANs converges the tap to
+	// exactly the trunk's VLANs.
 	ConfigureVLANTap(domainName, bridge, mac string, vlanID int) error
-	ConfigureTrunkTap(domainName, bridge, mac string, vlanIDs []int) error
+	NegotiateTrunkVLANs(domainName, bridge, mac string, vlanIDs []int) error
 	// TapDevice returns the host tap name for a domain NIC (by MAC), read from
 	// the live domain XML. Recorded into vm_interfaces.tap_device so the
 	// distributed firewall's per-NIC tier can target the interface.

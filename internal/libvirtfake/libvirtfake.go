@@ -3268,7 +3268,7 @@ func (f *Fake) ConfigureVLANTap(domainName, bridge, mac string, vlanID int) erro
 	f.record("vlan-tap", domainName, fmt.Sprintf("bridge=%s mac=%s vlan=%d", bridge, mac, vlanID))
 	return nil
 }
-func (f *Fake) ConfigureTrunkTap(domainName, bridge, mac string, vlanIDs []int) error {
+func (f *Fake) NegotiateTrunkVLANs(domainName, bridge, mac string, vlanIDs []int) error {
 	defer f.daemon()()
 	f.mu.Lock()
 	defer f.mu.Unlock()

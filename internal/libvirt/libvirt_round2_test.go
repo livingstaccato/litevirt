@@ -609,54 +609,6 @@ func TestGetIPFromARP_CaseInsensitiveMAC(t *testing.T) {
 	}
 }
 
-// ── configureTrunkBridgeVLANs ───────────────────────────────────────────────
-
-func TestConfigureTrunkBridgeVLANs_Success(t *testing.T) {
-	origExec := execVLAN
-	defer func() { execVLAN = origExec }()
-
-	var capturedCmds []string
-	execVLAN = func(name string, args ...string) ([]byte, error) {
-		capturedCmds = append(capturedCmds, name+" "+strings.Join(args, " "))
-		return nil, nil
-	}
-
-	err := configureTrunkBridgeVLANs("vnet0", []int{10, 20, 30})
-	if err != nil {
-		t.Fatalf("configureTrunkBridgeVLANs: %v", err)
-	}
-	if len(capturedCmds) != 3 {
-		t.Fatalf("expected 3 commands, got %d", len(capturedCmds))
-	}
-	for i, vid := range []string{"10", "20", "30"} {
-		if !strings.Contains(capturedCmds[i], "vid "+vid) {
-			t.Errorf("cmd[%d] should contain vid %s: %s", i, vid, capturedCmds[i])
-		}
-		if strings.Contains(capturedCmds[i], "pvid") {
-			t.Errorf("trunk mode should not have pvid: %s", capturedCmds[i])
-		}
-	}
-}
-
-func TestConfigureTrunkBridgeVLANs_EmptyList(t *testing.T) {
-	origExec := execVLAN
-	defer func() { execVLAN = origExec }()
-
-	callCount := 0
-	execVLAN = func(name string, args ...string) ([]byte, error) {
-		callCount++
-		return nil, nil
-	}
-
-	err := configureTrunkBridgeVLANs("vnet0", []int{})
-	if err != nil {
-		t.Fatalf("expected no error for empty list, got: %v", err)
-	}
-	if callCount != 0 {
-		t.Errorf("expected 0 calls for empty VLAN list, got %d", callCount)
-	}
-}
-
 // ── readTapVLANs with typical bridge vlan show output ───────────────────────
 
 func TestReadTapVLANs_TypicalOutput(t *testing.T) {

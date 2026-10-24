@@ -1769,7 +1769,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			for j, v := range n.Trunk {
 				vlanIDs[j] = int(v)
 			}
-			if err := s.virt.ConfigureTrunkTap(spec.Name, nc.Bridge, nc.MAC, vlanIDs); err != nil {
+			if err := s.virt.NegotiateTrunkVLANs(spec.Name, nc.Bridge, nc.MAC, vlanIDs); err != nil {
 				slog.Warn("VLAN trunk tap config failed", "vm", spec.Name, "vlans", vlanIDs, "error", err)
 			}
 		case len(n.Trunk) == 1:
@@ -5128,13 +5128,15 @@ func vmHooks(vm *corrosion.VMRecord) *pb.HooksSpec {
 }
 
 // reapplyVLANTaps re-applies host-tap VLAN config for a VM that has just been
-// started, from its stored spec's network[].trunk. VLAN tagging is a property of
+// started here, or has just arrived here by a live migration, from its stored
+// spec's network[].trunk; a trunk's tap is converged to exactly its VLANs
+// (NegotiateTrunkVLANs). VLAN tagging is a property of
 // the host tap device (libvirt re-creates vnetN on every start), not the domain
 // XML, so it must be re-driven at start — otherwise a VM that was defined while
 // stopped (e.g. an import) and started later loses its VLAN. Best-effort: a tap
 // failure is logged, never fatal (the domain is already running).
 func (s *Server) reapplyVLANTaps(ctx context.Context, vm *corrosion.VMRecord) {
-	if vm == nil || vm.Spec == "" {
+	if vm == nil || vm.Spec == "" || s.virt == nil {
 		return
 	}
 	spec := &pb.VMSpec{}
@@ -5163,7 +5165,7 @@ func (s *Server) reapplyVLANTaps(ctx context.Context, vm *corrosion.VMRecord) {
 			for j, v := range n.Trunk {
 				vlanIDs[j] = int(v)
 			}
-			if err := s.virt.ConfigureTrunkTap(vm.Name, bridge, mac, vlanIDs); err != nil {
+			if err := s.virt.NegotiateTrunkVLANs(vm.Name, bridge, mac, vlanIDs); err != nil {
 				slog.Warn("VLAN trunk tap reapply failed", "vm", vm.Name, "vlans", vlanIDs, "error", err)
 			}
 		} else if err := s.virt.ConfigureVLANTap(vm.Name, bridge, mac, int(n.Trunk[0])); err != nil {

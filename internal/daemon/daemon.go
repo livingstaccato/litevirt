@@ -71,6 +71,9 @@ const grpcMaxMsgSize = 64 << 20 // 64 MiB
 
 // Daemon is the main litevirtd process.
 type Daemon struct {
+	// keptHold is the gRPC server's kept-disk hold (Server.KeptHolds), set
+	// once it exists; the set-aside sweep waits for it.
+	keptHold func(context.Context, string) (bool, string)
 	// captureReg is the host's memory snapshot capture registry, shared by
 	// the gRPC server, the partition pauser and the settle.
 	captureReg *libvirt.CaptureRegistry
@@ -1650,6 +1653,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Wire reconciler callbacks now that gRPC server exists.
 	reconciler.SetOnVMStarted(svc.RefreshLBForStack)
 	reconciler.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
+	// A failover's set-aside and the hourly purge never take a file a kept
+	// disk is, or backs on (grpcapi kept_note_guard.go).
+	reconciler.SetKeptHold(svc.KeptHolds)
+	d.keptHold = svc.KeptHolds
 	// A rebuilt domain's PCI passthrough (health/passthrough_rebuild.go).
 	reconciler.SetPassthroughForRebuild(svc.PassthroughForRebuild)
 	reconciler.SetCancelledStartProbe(svc.HasCancelledStart) // cancelled_starts.go: an error row's late-started domain is the sweep's
@@ -3935,7 +3942,11 @@ func (d *Daemon) runSupersededDiskSweep(ctx context.Context) {
 	}
 	retention := time.Duration(days) * 24 * time.Hour
 	sweep := func() {
-		health.SweepSetAside(ctx, d.db, d.cfg.DataDir, retention, time.Now())
+		if d.keptHold == nil {
+			slog.Info("superseded disk sweep skipped: the kept-disk holds are not wired yet")
+			return
+		}
+		health.SweepSetAside(ctx, d.db, d.cfg.DataDir, retention, time.Now(), d.keptHold)
 	}
 	select {
 	case <-ctx.Done():

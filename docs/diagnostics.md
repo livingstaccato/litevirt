@@ -3460,9 +3460,12 @@ member it deleted while keeping them because it could not prove the teardown
 let them go (the teardown recorded no disk choice, or another teardown's); the
 reason names the stack. Unless that stack delete asked to keep disks, they are
 leftovers.
-litevirt removes none of them: check that nothing uses each one (another VM's
-disk, a process holding it open), then remove it by hand. A file on that host
-is forgotten once it is gone; a disk is not named while another VM's disk
+litevirt removes none of them on its own: check that nothing uses each one
+(another VM's disk, a process holding it open), then release it with
+`lv host kept-disks <host> --release <vm|path>`, which removes the chain with
+its note and record entries, refuses while anything still references a file
+of it, audits each file it removes, and clears the condition for it; or remove
+it by hand. A file on that host is forgotten once it is gone; a disk is not named while another VM's disk
 names its path again. A VM of the same name does not count (a delete that
 failed keeps its record, which still names its disks), so a disk adopted by a
 VM re-created under the deleted one's name stays named until its entry is
@@ -3475,8 +3478,10 @@ While an entry is there, a create on that host never clears the file it names,
 nor a file that disk's backing chain reaches: the create is refused, naming
 the file (docs/cli-reference.md, `lv rm`). A disk the delete of a VM with no
 domain kept is also in `<data_dir>/kept-disks/<vm>.json`, with the files its
-chain backs on. While `kept-disks.json`, or the backing chain of a disk it
-names, cannot be read, the evidence names the file under `creates_refused`
+chain backs on. While `kept-disks.json`, a note `<data_dir>/kept-disks/<vm>.json`,
+the listing of the set-aside `.kept-` and `.superseded-` copies, or the
+backing chain of a disk one of them names, cannot be read, the evidence names
+the file under `creates_refused`
 (the condition is raised for it alone, and resolves once it reads), and each
 import, create or clone that writes a disk file on the host's own storage,
 disk attach that creates a new disk, volume move into a pool on the host's
@@ -3485,7 +3490,8 @@ copies a host-local disk, and failover rebuild of a missing overlay disk on
 that host is judged by the disk files there (every file under
 `<data_dir>/disks`, the disk store's directory, `<data_dir>/pools`,
 `<data_dir>/mounts` and the directory of every file-based pool of the host,
-usable or not): it is refused when one of them is, or backs on, a path it
+usable or not, every file a note names, and every set-aside `.kept-` or
+`.superseded-` copy beside any local disk a disk row names): it is refused when one of them is, or backs on, a path it
 writes, and refused whatever its name when one of them, or a directory of
 them, cannot be read either, which `creates_refused` then names too. A create
 that clears a file an earlier VM of its name left is refused. Any other goes
@@ -3496,6 +3502,14 @@ disk stubs) and the reconciler's rebuild of a missing overlay disk get the
 same check as a create at a kept overlay's missing base; a refused rebuild
 raises
 [`vm_disk_kept_base`](#a-failover-rebuild-is-refused-at-a-kept-overlays-missing-base-vm_disk_kept_base).
+While the backing chain of a file a note `<data_dir>/kept-disks/<vm>.json`
+names cannot be read, every path on that host that removes disk files leaves
+every file, `lv rebuild` is refused on that host, `lv start` and
+`lv migrate` are refused for a VM that could be a linked clone's base (a
+template, or one whose disk a disk row records as its backing disk), and
+`lv host kept-disks --release` refuses, naming the file and the note: fix that
+file, move it away, or, once nothing needs it, remove its entry from the note
+(docs/cli-reference.md, "Releasing kept disks").
 
 ### A drain's live move timed out (`drain_move_timed_out`)
 

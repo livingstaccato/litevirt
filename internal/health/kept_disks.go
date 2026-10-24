@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/safename"
 )
@@ -225,6 +226,65 @@ func KeptNotedFiles(dataDir string) (map[string]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// KeptNote is one of this host's kept-disk notes.
+type KeptNote struct {
+	VM      string
+	File    string   // the note, <data_dir>/kept-disks/<vm>.json
+	Paths   []string // every file it names, cleaned
+	Under   []string // of Paths, the files a kept disk backs on
+	ModTime time.Time
+}
+
+// KeptNotes is every kept-disk note on this host, by VM name. A note that
+// cannot be read or parsed (a *KeptDisksNoteError), or a directory of notes
+// that cannot be listed, is an error: a release, which removes what a note
+// names, then removes nothing. The notes that could be read are returned with
+// it: a guard that must refuse on what any readable note names does not lose
+// that to another note it cannot read (the first such error is returned).
+func KeptNotes(dataDir string) ([]KeptNote, error) {
+	if dataDir == "" {
+		return nil, nil
+	}
+	dir := filepath.Join(dataDir, "kept-disks")
+	ents, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list %s: %w", dir, err)
+	}
+	keptDisksMu.Lock()
+	defer keptDisksMu.Unlock()
+	var out []KeptNote
+	var first error
+	for _, e := range ents {
+		name, ok := strings.CutSuffix(e.Name(), ".json")
+		if !ok || e.IsDir() || safename.ValidateVMName(name) != nil {
+			continue
+		}
+		n, err := keptNoteOf(dataDir, name)
+		if err != nil {
+			if first == nil {
+				first = err
+			}
+			continue
+		}
+		f := filepath.Join(dir, e.Name())
+		var mod time.Time
+		if fi, err := os.Stat(f); err == nil {
+			mod = fi.ModTime()
+		}
+		out = append(out, KeptNote{VM: name, File: f, Paths: n.Paths, Under: n.Under, ModTime: mod})
+	}
+	return out, first
+}
+
+// ForgetKeptNoted drops paths from name's note here, and the note once it
+// names nothing else: what an operator's release of a kept chain removed.
+func ForgetKeptNoted(dataDir, name string, paths []string) error {
+	return forgetKeptDisks(dataDir, name, paths)
 }
 
 // KeptBackingFileError is a create refused because a file a kept disk backs

@@ -83,7 +83,7 @@ func TestPurgeSupersededDisks_KeepsEveryCopyWhileItsVMExists(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	removed, err := PurgeSupersededDisks(ctx, db, dataDir, 7*24*time.Hour, now)
+	removed, err := PurgeSupersededDisks(ctx, db, dataDir, 7*24*time.Hour, now, nil)
 	if err != nil {
 		t.Fatalf("PurgeSupersededDisks: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestRemoveSupersededDisks_RemovesOnlyWhatIsNamed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if gone, err := PurgeSupersededDisks(ctx, db, dataDir, 0, now); err != nil || len(gone) != 0 {
+	if gone, err := PurgeSupersededDisks(ctx, db, dataDir, 0, now, nil); err != nil || len(gone) != 0 {
 		t.Fatalf("a bare purge removed %+v (err %v); a copy whose VM exists is removed only by name", gone, err)
 	}
 	removed, err := RemoveSupersededDisks(ctx, db, dataDir, []string{ran1})
@@ -228,7 +228,7 @@ func TestSupersededDisks_ACopyOfADeletedVMsPoolDiskFollowsTheRetention(t *testin
 	if removed, err := RemoveSupersededDisks(ctx, db, dataDir, []string{named}); err != nil || len(removed) != 1 || exists(named) {
 		t.Fatalf("removal by name = %+v, %v; want the copy gone", removed, err)
 	}
-	removed, err := PurgeSupersededDisks(ctx, db, dataDir, 7*24*time.Hour, now)
+	removed, err := PurgeSupersededDisks(ctx, db, dataDir, 7*24*time.Hour, now, nil)
 	if err != nil || len(removed) != 1 || exists(old) {
 		t.Fatalf("the sweep removed %+v (err %v); want the copy older than the retention gone", removed, err)
 	}

@@ -724,6 +724,21 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 	if e := s.verifyVMISOForStart(rec); e != nil {
 		return failed("start", e)
 	}
+	// Nor while its disk backs a linked clone, live or kept: starting it lets
+	// qemu write into the base under each overlay. This start runs outside
+	// startGatesLocked and PrepareHardwareForStart, so it asks both
+	// questions itself (re-review P4). The handoff is retried.
+	if clones, cErr := s.linkedClonesOf(ctx, m.ReplacedVM); cErr != nil {
+		return failed("start", status.Errorf(codes.Unavailable,
+			"start %q: whether it still backs linked clones cannot be read (%v); retry", m.ReplacedVM, cErr))
+	} else if len(clones) > 0 {
+		return failed("start", status.Errorf(codes.FailedPrecondition,
+			"start %q: it still backs %d linked clone(s) (%s); starting it would let qemu write into the backing file under each overlay",
+			m.ReplacedVM, len(clones), strings.Join(clones, ", ")))
+	}
+	if e := s.keptBaseRefusal(ctx, m.ReplacedVM, "start", "", false, keptOnUnknownIfBase); e != nil {
+		return failed("start", e)
+	}
 	// This start runs outside the start hook: a stale seed is rebuilt
 	// here as there, never refusing it.
 	s.retryStaleSeedForStart(ctx, rec)

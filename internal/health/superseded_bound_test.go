@@ -143,7 +143,7 @@ func TestSupersededSweep_StorageThatDoesNotAnswerHoldsNothingAndIsNeverEmpty(t *
 			var removed []SupersededCopy
 			var purgeErr error
 			setAsideReturnsWithin(t, 3*time.Second, "PurgeSupersededDisks", func() {
-				removed, purgeErr = PurgeSupersededDisks(ctx, db, dataDir, 7*24*time.Hour, now)
+				removed, purgeErr = PurgeSupersededDisks(ctx, db, dataDir, 7*24*time.Hour, now, nil)
 			})
 			if !storage.IsFSNoAnswer(purgeErr) {
 				t.Errorf("PurgeSupersededDisks error = %v, want the no-answer reported", purgeErr)
@@ -183,7 +183,7 @@ func TestSupersededSweep_ARemoveThatDoesNotAnswerIsNotCounted(t *testing.T) {
 	var removed []SupersededCopy
 	var err error
 	setAsideReturnsWithin(t, 3*time.Second, "PurgeSupersededDisks", func() {
-		removed, err = PurgeSupersededDisks(ctx, db, dataDir, 7*24*time.Hour, now)
+		removed, err = PurgeSupersededDisks(ctx, db, dataDir, 7*24*time.Hour, now, nil)
 	})
 	if !storage.IsFSNoAnswer(err) || len(removed) != 1 || removed[0].Path != later || exists(later) {
 		t.Errorf("PurgeSupersededDisks = %+v, %v; want only %s removed (after the one that did not answer) and the no-answer", removed, err, later)

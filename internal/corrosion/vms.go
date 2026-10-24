@@ -788,6 +788,25 @@ func LinkedCloneNames(ctx context.Context, c *Client, backingPath string) ([]str
 	return out, nil
 }
 
+// DiskBackingUsers returns the names of VMs with a disk row, live or
+// soft-deleted, whose backing_disk is backingPath: every linked clone ever
+// made of that disk whose row is not purged yet. A deleted clone may have
+// left its overlay kept (lv rm --keep-disks), so a caller that cannot read
+// the kept state treats a disk with any such row as a possible base.
+func DiskBackingUsers(ctx context.Context, c *Client, backingPath string) ([]string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT DISTINCT vm_name FROM vm_disks WHERE backing_disk = ?`,
+		backingPath)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.String("vm_name"))
+	}
+	return out, nil
+}
+
 func boolToInt(b bool) int {
 	if b {
 		return 1

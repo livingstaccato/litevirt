@@ -202,7 +202,8 @@ func TestCreateVM_RefusesWhileWhatAKeptOverlayBacksOnCannotBeRead(t *testing.T) 
 // silent: the warning names the record and why it cannot be read.
 //
 // Mutations: refuse on every keptRegistryChains error in
-// keptMissingBaseRefusal (6eb32b40e): red; log the warning at Debug: red.
+// keptMissingBaseRefusal (6eb32b40e): red; log the warning at Debug: red;
+// drop its source attribute (relkept-on70 NB-3): red.
 func TestCreateVM_GoesAheadWhileKeptDisksJSONUnreadableWhenNothingCollides(t *testing.T) {
 	s, _ := provableCreateServer(t)
 	base := s.images.DiskPath("web", "root")
@@ -232,11 +233,11 @@ func TestCreateVM_GoesAheadWhileKeptDisksJSONUnreadableWhenNothingCollides(t *te
 	}
 	var line string
 	for _, l := range strings.Split(log.String(), "\n") {
-		if strings.Contains(l, "the record of kept disks cannot be read; the create goes ahead") {
+		if strings.Contains(l, "what deletes kept on this host cannot all be read; the create goes ahead") {
 			line = l
 		}
 	}
-	if !strings.Contains(line, "level=WARN") || !strings.Contains(line, registry) || !strings.Contains(line, "invalid character") {
+	if !strings.Contains(line, "level=WARN") || !strings.Contains(line, "source="+registry) || !strings.Contains(line, "invalid character") {
 		t.Fatalf("no warning naming %s and why it cannot be read; log:\n%s", registry, log.String())
 	}
 }

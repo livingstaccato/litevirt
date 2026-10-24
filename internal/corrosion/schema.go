@@ -694,88 +694,6 @@ const acknowledgedTieVersionsDDL = `CREATE TABLE IF NOT EXISTS acknowledged_tie_
 	PRIMARY KEY (table_name, pk, version)
 )`
 
-// migrateAcknowledgedTiesPK widens an existing table's primary key to include
-// content_pair. SQLite cannot ALTER a primary key, so the table is rebuilt.
-//
-// This sits outside the migration ledger on purpose: acknowledged_ties is
-// local-only and is created before the ledger loads, so there is no replicated
-// statement shape and no schema version to carry. Every node fixes its own copy
-// on the next start.
-//
-// Copying cannot conflict. The old key admitted one row per (table_name, pk),
-// which is a strict subset of what the new key admits.
-//
-// The rebuild is ONE local transaction. It used to be four separate statements,
-// and a crash between them left a state the next start could not handle: after
-// the CREATE, the rerun's CREATE failed "already exists" and the daemon would
-// not start; after the DROP, InitSchema's CREATE IF NOT EXISTS made an empty
-// acknowledged_ties on the wide key, this function saw the wide key and
-// returned, and every acknowledgement stranded in acknowledged_ties_new was
-// lost. A database a previous build left in either state is recovered here:
-//
-//   - narrow key, leftover _new: the rebuild reuses _new (CREATE IF NOT EXISTS)
-//     and copies with INSERT OR IGNORE, since _new may already hold the rows;
-//   - wide key, leftover _new: the old table was dropped and recreated empty,
-//     so _new's rows are merged into it and _new is dropped.
-func (c *Client) migrateAcknowledgedTiesPK(ctx context.Context) error {
-	info, err := c.Query(ctx, `PRAGMA table_info(acknowledged_ties)`)
-	if err != nil {
-		return fmt.Errorf("inspect acknowledged_ties: %w", err)
-	}
-	if len(info) == 0 {
-		return nil // no such table; the DDL above will have created it
-	}
-	wide := false
-	for _, r := range info {
-		// A non-zero pk ordinal means the column is part of the primary key.
-		if r.String("name") == "content_pair" && r.Int("pk") > 0 {
-			wide = true
-		}
-	}
-	leftover, err := c.Query(ctx,
-		`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'acknowledged_ties_new'`)
-	if err != nil {
-		return fmt.Errorf("inspect acknowledged_ties_new: %w", err)
-	}
-	const cols = `table_name, pk, content_pair, acknowledged_at, acknowledged_by`
-	var stmts []Statement
-	switch {
-	case wide && len(leftover) == 0:
-		return nil
-	case wide:
-		stmts = []Statement{
-			{SQL: `INSERT OR IGNORE INTO acknowledged_ties (` + cols + `)
-			 SELECT ` + cols + ` FROM acknowledged_ties_new`},
-			{SQL: `DROP TABLE acknowledged_ties_new`},
-		}
-	default:
-		stmts = []Statement{
-			{SQL: `CREATE TABLE IF NOT EXISTS acknowledged_ties_new (
-				table_name      TEXT NOT NULL,
-				pk              TEXT NOT NULL,
-				content_pair    TEXT NOT NULL,
-				acknowledged_at TEXT NOT NULL,
-				acknowledged_by TEXT NOT NULL DEFAULT '',
-				PRIMARY KEY (table_name, pk, content_pair)
-			)`},
-			{SQL: `INSERT OR IGNORE INTO acknowledged_ties_new (` + cols + `)
-			 SELECT ` + cols + ` FROM acknowledged_ties`},
-			{SQL: `DROP TABLE acknowledged_ties`},
-			{SQL: `ALTER TABLE acknowledged_ties_new RENAME TO acknowledged_ties`},
-		}
-	}
-	if err := c.execBatchLocal(ctx, stmts); err != nil {
-		return fmt.Errorf("rebuild acknowledged_ties: %w", err)
-	}
-	if wide {
-		slog.Warn("acknowledged_ties: recovered acknowledgements stranded by an interrupted rebuild")
-		return nil
-	}
-	slog.Info("acknowledged_ties: primary key widened to include content_pair; " +
-		"several live divergences on one row can now each be acknowledged")
-	return nil
-}
-
 // InitSchema brings the local SQLite DB up to this binary's schema. DDL is not
 // broadcast — each node migrates its own DB on startup.
 //
@@ -831,9 +749,6 @@ func InitSchema(ctx context.Context, c *Client) error {
 	}
 	if err := c.execLocal(ctx, reseedGenerationDDL); err != nil {
 		return fmt.Errorf("create reseed_generation: %w", err)
-	}
-	if err := c.migrateAcknowledgedTiesPK(ctx); err != nil {
-		return err
 	}
 	if err := c.loadAcknowledgedTies(ctx); err != nil {
 		return fmt.Errorf("load acknowledged_ties: %w", err)

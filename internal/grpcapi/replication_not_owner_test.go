@@ -121,3 +121,70 @@ func TestRunReplication_ALastingNotOwnerSkipIsAlerted(t *testing.T) {
 		t.Fatalf("a new episode did not alert: %+v", seen)
 	}
 }
+
+// A schedule whose runs are further apart than replNotOwnerForget: each skip
+// came more than 25 hours after the last, so every skip began a new episode,
+// none lasted the grace, and a host skipping a 48-hour schedule forever was
+// never alerted. The gap that ends an episode scales to the schedule; a
+// short schedule's gap is unchanged, so its separate episodes stay separate.
+//
+// Mutation: compare against replNotOwnerForget alone in notOwnerSkip — the
+// 48-hour schedule never alerts.
+func TestRunReplication_LongIntervalNotOwnerSkipIsAlerted(t *testing.T) {
+	for _, tc := range []struct {
+		name, cron string
+		gap        time.Duration
+		alerted    bool
+	}{
+		{"every 48h", "0 3 */2 * *", 48 * time.Hour, true},
+		{"weekly", "0 3 * * 1", 7 * 24 * time.Hour, true},
+		{"hourly, after a day's gap", "0 * * * *", 26 * time.Hour, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := notOwnerServer(t, "fenced", "")
+			var mu sync.Mutex
+			alerts := 0
+			s.notifySeen = func(n notify.Notification) {
+				mu.Lock()
+				defer mu.Unlock()
+				if n.Kind == "replication.skipped" {
+					alerts++
+				}
+			}
+			sched := notOwnerSched
+			sched.Cron = tc.cron
+			run := func() {
+				if err := s.RunReplication(context.Background(), sched, time.Now()); !errors.Is(err, scheduler.ErrRunSkipped) {
+					t.Fatalf("run = %v, want skipped", err)
+				}
+			}
+			run() // the first skip: inside the grace
+			// The previous skip was one interval ago.
+			st := s.replState(sched)
+			s.replRuns.mu.Lock()
+			st.notOwnerSince = st.notOwnerSince.Add(-tc.gap)
+			st.notOwnerLast = st.notOwnerLast.Add(-tc.gap)
+			s.replRuns.mu.Unlock()
+			run()
+			mu.Lock()
+			defer mu.Unlock()
+			if got := alerts == 1; got != tc.alerted {
+				t.Fatalf("alerts = %d after skips %v apart, want alerted %v", alerts, tc.gap, tc.alerted)
+			}
+		})
+	}
+}
+
+func TestReplNotOwnerForgetFor(t *testing.T) {
+	for cron, want := range map[string]time.Duration{
+		"*/5 * * * *": replNotOwnerForget,
+		"0 3 * * *":   replNotOwnerForget,
+		"0 3 */2 * *": 49 * time.Hour,
+		"0 3 * * 1":   7*24*time.Hour + time.Hour,
+		"not a cron":  replNotOwnerForget,
+	} {
+		if got := replNotOwnerForgetFor(cron); got != want {
+			t.Errorf("replNotOwnerForgetFor(%q) = %v, want %v", cron, got, want)
+		}
+	}
+}

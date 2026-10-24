@@ -57,8 +57,22 @@ type replRunState struct {
 var replNotOwnerGrace = 15 * time.Minute
 
 // replNotOwnerForget is the gap after which an earlier skip no longer counts
-// toward the grace: the skips are separate episodes.
+// toward the grace: the skips are separate episodes. A schedule whose runs are
+// further apart forgets only after its longest interval and an hour
+// (replNotOwnerForgetFor).
 const replNotOwnerForget = 25 * time.Hour
+
+// replNotOwnerForgetFor is the gap after which a skip of a schedule on cron no
+// longer counts toward the grace: replNotOwnerForget, or the schedule's
+// longest interval and an hour when that is longer. With the fixed gap a
+// schedule run every 48 hours forgot each skip before the next one, so its
+// skips never lasted the grace and were never alerted.
+func replNotOwnerForgetFor(cron string) time.Duration {
+	if gap, ok := longestCronGap(cron); ok && gap+time.Hour > replNotOwnerForget {
+		return gap + time.Hour
+	}
+	return replNotOwnerForget
+}
 
 // notOwnerSkip records one run of sched skipped because this host may not act
 // as the VM's owner now (reason), and alerts `replication.skipped` (warn) once
@@ -68,7 +82,8 @@ func (s *Server) notOwnerSkip(ctx context.Context, sched corrosion.BackupSchedul
 	st := s.replState(sched)
 	now := time.Now()
 	s.replRuns.mu.Lock()
-	if st.notOwnerSince.IsZero() || now.Sub(st.notOwnerLast) > replNotOwnerForget {
+	if st.notOwnerSince.IsZero() || (now.Sub(st.notOwnerLast) > replNotOwnerForget &&
+		now.Sub(st.notOwnerLast) > replNotOwnerForgetFor(sched.Cron)) {
 		st.notOwnerSince, st.notOwnerNotified = now, time.Time{}
 	}
 	st.notOwnerLast = now

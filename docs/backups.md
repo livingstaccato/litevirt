@@ -642,7 +642,9 @@ and writes nothing to the schedule row: `LAST RUN` and `LAST ERR` stay the
 owner's. Skips that go on for 15 minutes (the host is still fenced, or its
 view never catches up) raise `replication.skipped` (warn), at most hourly
 while they continue: if the VM still runs there, no replica is being taken.
-A run that is not skipped ends that episode.
+A run that is not skipped ends that episode, as does a gap between skips
+longer than 25 hours or, for a schedule whose runs are further apart, than its
+longest interval and an hour.
 
 ### Where replicas live, and how they are selected
 

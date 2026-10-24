@@ -126,8 +126,7 @@ Use this only when you understand the risk — for example, you've
 The first start of a build with single-file restore (and file restore not
 disabled) creates the `litevirt-restore` system account, loads the
 `litevirt-restore-qemu` AppArmor profile where AppArmor is enabled, creates
-`/var/cache/litevirt-restore` and `/run/litevirt/file-restore`, and removes
-`/var/lib/litevirt/file-restore/cache` left by an earlier build. To avoid the
+`/var/cache/litevirt-restore` and `/run/litevirt/file-restore`. To avoid the
 account being created by the daemon, create it beforehand
 ([installation.md](installation.md#what-file-restore-changes-on-the-host)); to
 avoid all of it, set `file_restore: {enabled: false}` before upgrading.

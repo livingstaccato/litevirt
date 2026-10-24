@@ -2219,9 +2219,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// File restore then refuses, naming the missing user.
 			slog.Warn("file restore: no restore VM user", "error", err)
 		}
-		// Round-1 builds kept the boot files in data_dir, owned by qemu's
-		// user; they are never read again.
-		_ = os.RemoveAll(filepath.Join(d.cfg.DataDir, "file-restore", "cache"))
 		idle := time.Duration(fr.IdleTimeoutSec) * time.Second
 		if idle <= 0 {
 			idle = 5 * time.Minute

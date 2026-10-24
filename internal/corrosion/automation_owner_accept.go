@@ -26,7 +26,7 @@ func (c *Client) ClaimAcceptOwnerNative(ctx context.Context, key ClaimKey, ballo
 	if native == nil || native.session == nil || native.session.db != c {
 		return AcceptResult{Voter: c.hostName, Refusal: RefusalAutomationUnavailable}, nil
 	}
-	return c.claimAccept(ctx, key, ballot, value, generation, signer, nil, &ownerAcceptPreparation{native: native, key: key, digest: value.MustDigest(), generation: generation}, nil)
+	return c.claimAccept(ctx, key, ballot, value, generation, signer, nil, &ownerAcceptPreparation{native: native, key: key, digest: value.MustDigest(), generation: generation}, nil, nil)
 }
 
 // ClaimAcceptOwnerEvidence accepts only an actual stored, signed acceptance
@@ -89,7 +89,7 @@ func (c *Client) ClaimAcceptOwnerEvidence(ctx context.Context, key ClaimKey, bal
 		}
 	}
 	p := &ownerAcceptPreparation{key: key, digest: digest, generation: generation, membersHash: MembersHash(cfg.Members), certificate: cert, verifier: &pure, factory: factory}
-	return c.claimAccept(ctx, key, ballot, value, generation, signer, nil, p, nil)
+	return c.claimAccept(ctx, key, ballot, value, generation, signer, nil, p, nil, nil)
 }
 
 func (c *Client) admitAutomationOwnerTx(ctx context.Context, tx *LocalTx, key ClaimKey, generation int64, value ClaimValue, cfg *VoterConfig, d contract.Decision, prepared *ownerAcceptPreparation) (string, error) {

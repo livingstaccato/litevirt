@@ -312,3 +312,15 @@ func TestCheckDaemonStatePath(t *testing.T) {
 		}
 	}
 }
+
+func TestDataDirOwned_ProtectsAutomationCustody(t *testing.T) {
+	data := t.TempDir()
+	for _, path := range []string{filepath.Join(data, "automation-custody"), filepath.Join(data, "automation-custody", "provision-record")} {
+		if err := CheckWriteRoot(path, data, ""); err == nil {
+			t.Fatalf("custody may be used as pool: %s", path)
+		}
+	}
+	if err := CheckWriteRoot(filepath.Join(data, "ordinary-pool"), data, ""); err != nil {
+		t.Fatalf("ordinary pool refused: %v", err)
+	}
+}

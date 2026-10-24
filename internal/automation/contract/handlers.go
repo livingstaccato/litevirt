@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"io"
 	"time"
+	"unicode/utf8"
 )
 
 // Assignment is the complete nonsecret server-assigned schema for the two
 // implemented control handlers. New semantic handlers add their own typed
 // schema here and extend the one reducer; they never inherit generic success.
 type Assignment struct {
+	CustodyImport *CustodyImportRecord     `json:"custody_import,omitempty"`
 	Continuity    *IdentityContinuity      `json:"continuity,omitempty"`
 	Execution     *ExecutionAssignment     `json:"execution,omitempty"`
 	KeyTransition *KeyTransitionAssignment `json:"key_transition,omitempty"`
@@ -60,6 +62,10 @@ func decodeFieldsObject(b []byte, out any, fields ...string) error {
 // ValidateSupportedCommand is shared by pre-slot admission and the direct
 // acceptor gate. It is structural capability validation, not a second reducer.
 func ValidateSupportedCommand(c Command) error {
+	if c.Kind == CustodyImportCommand {
+		_, err := DecodeCustodyImportBody(c)
+		return err
+	}
 	if c.Kind == IdentityContinuityCommand {
 		if _, err := DecodeIdentityContinuityBody(c); err != nil {
 			return err
@@ -122,9 +128,66 @@ func ValidateSupportedCommand(c Command) error {
 	_, err := CanonicalCommand(c)
 	return err
 }
+func decodeAssignmentFields(raw []byte, out any, fields ...string) error {
+	if len(raw) > 1<<20 || !utf8.Valid(raw) || !validSurrogates(raw) {
+		return codedError(CodeValidation)
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	value, err := jsonValue(dec, 0)
+	if err != nil {
+		return codedError(CodeValidation)
+	}
+	if _, err = dec.Token(); err != io.EOF {
+		return codedError(CodeValidation)
+	}
+	object, ok := value.(map[string]any)
+	if !ok || object["version"] != json.Number("1") && object["version"] != json.Number("4") {
+		return codedError(CodeValidation)
+	}
+	return decodeFieldsObject(raw, out, fields...)
+}
+
+// canonicalCustodyAssignment recognizes only the typed encoding emitted by the
+// native key producer. Exact allowed-field re-encoding proves unique syntax:
+// duplicates, unknown fields, repaired strings/bytes and other representations
+// cannot match. The permitted custody types have fixed, nonrecursive JSON
+// shapes below the generic 64-container limit. This is not semantic admission;
+// every caller still validates the actual command and assignment together.
+// A miss always belongs to the original strict decoder, including valid older
+// encodings with whitespace, different field order or escaped strings.
+func canonicalCustodyAssignment(d Decision) (Assignment, bool) {
+	if d.Command.Kind != CustodyImportCommand && d.Command.Kind != "activate_key_epoch" || len(d.Assignment) == 0 || len(d.Assignment) > 1<<20 {
+		return Assignment{}, false
+	}
+	var decoded Assignment
+	if json.Unmarshal(d.Assignment, &decoded) != nil || decoded.Version != CustodyAssignmentVersion {
+		return Assignment{}, false
+	}
+	// Copy only the fields allowed for this command. Marshaling the unrestricted
+	// decoded union would incorrectly permit another class's recognized field.
+	a := Assignment{Version: decoded.Version, ClusterUID: decoded.ClusterUID, OperationID: decoded.OperationID, RecordedAt: decoded.RecordedAt}
+	if d.Command.Kind == CustodyImportCommand {
+		a.CustodyImport = decoded.CustodyImport
+	} else {
+		a.KeyTransition = decoded.KeyTransition
+	}
+	canonical, err := json.Marshal(a)
+	if err != nil || !bytes.Equal(canonical, d.Assignment) || a.ClusterUID == "" || a.OperationID == "" || len(a.ClusterUID) > MaxStringBytes || len(a.OperationID) > MaxStringBytes {
+		return Assignment{}, false
+	}
+	if _, err := time.Parse(time.RFC3339Nano, a.RecordedAt); err != nil {
+		return Assignment{}, false
+	}
+	return a, true
+}
+
 func DecodeAssignment(d Decision) (Assignment, error) {
 	var a Assignment
 	fields := []string{"version", "cluster_uid", "operation_id", "recorded_at"}
+	if d.Command.Kind == CustodyImportCommand {
+		fields = append(fields, "custody_import")
+	}
 	if d.Command.Kind == "claim_executor" {
 		fields = append(fields, "execution")
 	}
@@ -149,7 +212,9 @@ func DecodeAssignment(d Decision) (Assignment, error) {
 	if d.Command.Kind == IdentityContinuityCommand {
 		fields = append(fields, "continuity")
 	}
-	if err := decodeFields(d.Assignment, &a, fields...); err != nil {
+	if canonical, ok := canonicalCustodyAssignment(d); ok {
+		a = canonical
+	} else if err := decodeAssignmentFields(d.Assignment, &a, fields...); err != nil {
 		return a, err
 	}
 	if d.Command.Kind == IdentityContinuityCommand {
@@ -158,7 +223,7 @@ func DecodeAssignment(d Decision) (Assignment, error) {
 			return a, codedError(CodeValidation)
 		}
 	}
-	if a.Version != 1 || a.ClusterUID == "" || a.OperationID == "" || len(a.ClusterUID) > MaxStringBytes || len(a.OperationID) > MaxStringBytes {
+	if a.Version != 1 && (a.Version != CustodyAssignmentVersion || d.Command.Kind != CustodyImportCommand && d.Command.Kind != "activate_key_epoch") || a.ClusterUID == "" || a.OperationID == "" || len(a.ClusterUID) > MaxStringBytes || len(a.OperationID) > MaxStringBytes {
 		return a, codedError(CodeValidation)
 	}
 	if _, err := time.Parse(time.RFC3339Nano, a.RecordedAt); err != nil {
@@ -175,6 +240,15 @@ func ValidateSupportedDecision(d Decision) error {
 	a, err := DecodeAssignment(d)
 	if err != nil {
 		return err
+	}
+	return validateSupportedAssignment(d, a)
+}
+
+// The assignment is freshly decoded in this invocation, never a cached proof
+// attached to the caller's mutable Decision. Keep all semantic checks here.
+func validateSupportedAssignment(d Decision, a Assignment) error {
+	if d.Command.Kind == CustodyImportCommand {
+		return validateCustodyImport(d, a)
 	}
 	if d.Command.Kind == IdentityContinuityCommand {
 		return validateContinuityAssignment(d, a)

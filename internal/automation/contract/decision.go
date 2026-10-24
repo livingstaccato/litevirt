@@ -58,8 +58,22 @@ func validateDecision(d Decision) error {
 	if _, err := CanonicalCommand(c); err != nil {
 		return err
 	}
+	if a, ok := canonicalCustodyAssignment(d); ok {
+		if !keyTransitionKind(d.Command.Kind) {
+			if err := ValidateSupportedCommand(d.Command); err != nil {
+				return err
+			}
+		}
+		return validateSupportedAssignment(d, a)
+	}
 	if _, err := canonicalBody(d.Assignment); err != nil {
-		return codedError(CodeValidation)
+		// Preserve the legacy assignment byte domain. The separately allocated
+		// key-only outer version must cross the exact supported-kind validator;
+		// ordinary command body and envelope versions remain unchanged.
+		a, err := DecodeAssignment(d)
+		if err != nil || a.Version != CustodyAssignmentVersion || ValidateSupportedDecision(d) != nil {
+			return codedError(CodeValidation)
+		}
 	}
 	return nil
 }

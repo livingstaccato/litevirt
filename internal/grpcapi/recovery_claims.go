@@ -486,6 +486,9 @@ func (s *Server) localAccept(ctx context.Context, key corrosion.ClaimKey, b corr
 	if err == nil && res.Refusal == corrosion.RefusalAutomationUnavailable && key.IsAutomation() && automationOwnerValue(v) {
 		res, err = s.acceptOwnerFromStoredPeer(ctx, key, b, v, gen, signer)
 	}
+	if err == nil && res.Refusal == corrosion.RefusalAutomationUnavailable && key.IsAutomation() && automationKeyValue(v) {
+		res, err = s.acceptKeyFromStoredPeer(ctx, key, b, v, gen, signer)
+	}
 	if err == nil && res.Refusal == corrosion.RefusalAutomationUnavailable && key.IsAutomation() && automationContinuityValue(v) {
 		res, err = s.acceptContinuityFromStoredPeer(ctx, key, b, v, gen, signer)
 	}

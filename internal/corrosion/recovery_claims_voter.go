@@ -484,7 +484,7 @@ func (c *Client) ClaimPrepare(ctx context.Context, key ClaimKey, b Ballot, gen i
 		return res, nil
 	}
 	err := c.ExecuteLocal(ctx, func(tx *LocalTx) error {
-		if r, err := c.admitAutomationTx(ctx, tx, key, b, gen, nil, nil, nil); err != nil {
+		if r, err := c.admitAutomationTx(ctx, tx, key, b, gen, nil, nil, nil, nil, nil); err != nil {
 			return err
 		} else if r != "" {
 			res.Refusal = r
@@ -565,16 +565,29 @@ func (c *Client) ClaimAccept(ctx context.Context, key ClaimKey, b Ballot, v Clai
 	if key.IsAutomation() && isAutomationContinuityValue(v) {
 		return c.claimAcceptContinuityRecovery(ctx, key, b, v, gen, signer, continuityLocal, ClaimCertificate{})
 	}
-	return c.claimAccept(ctx, key, b, v, gen, signer, probe, nil, nil)
+	return c.claimAccept(ctx, key, b, v, gen, signer, probe, nil, nil, nil)
 }
 
 func (c *Client) claimAccept(ctx context.Context, key ClaimKey, b Ballot, v ClaimValue, gen int64,
-	signer *ClaimSigner, probe OwnerProbe, owner *ownerAcceptPreparation, continuity *continuityAcceptPreparation) (AcceptResult, error) {
+	signer *ClaimSigner, probe OwnerProbe, owner *ownerAcceptPreparation, continuity *continuityAcceptPreparation, keyPrepared *keyAcceptPreparation) (AcceptResult, error) {
+	return c.claimAcceptValue(ctx, key, b, v, gen, signer, probe, owner, continuity, keyPrepared, prepareKeyAcceptValue(v))
+}
+
+// Only this call's owned incoming parse may be reused. All live admission and
+// commit checks still run, and retained rows are decoded independently.
+func (c *Client) claimAcceptValue(ctx context.Context, key ClaimKey, b Ballot, v ClaimValue, gen int64,
+	signer *ClaimSigner, probe OwnerProbe, owner *ownerAcceptPreparation, continuity *continuityAcceptPreparation, keyPrepared *keyAcceptPreparation, incoming *keyAcceptValue) (AcceptResult, error) {
 	res := AcceptResult{Voter: c.hostName}
-	digest, err := v.Digest()
-	if err != nil {
-		res.Refusal, res.Detail = RefusalInvalidValue, err.Error()
-		return res, nil
+	var digest string
+	var err error
+	if incoming != nil {
+		v, digest = incoming.value, incoming.digest
+	} else {
+		digest, err = v.Digest()
+		if err != nil {
+			res.Refusal, res.Detail = RefusalInvalidValue, err.Error()
+			return res, nil
+		}
 	}
 	if b.Round == 0 || b.Coordinator == "" {
 		res.Refusal, res.Detail = RefusalInvalidValue, "a ballot has a round >= 1 and a coordinator"
@@ -594,7 +607,7 @@ func (c *Client) claimAccept(ctx context.Context, key ClaimKey, b Ballot, v Clai
 	for {
 		res = AcceptResult{Voter: c.hostName}
 		err := c.executeLocal(ctx, func(tx *LocalTx) error {
-			if r, err := c.admitAutomationTx(ctx, tx, key, b, gen, &v, owner, continuity); err != nil {
+			if r, err := c.admitAutomationTx(ctx, tx, key, b, gen, &v, owner, continuity, keyPrepared, incoming); err != nil {
 				return err
 			} else if r != "" {
 				res.Refusal = r
@@ -693,7 +706,7 @@ func (c *Client) claimAccept(ctx context.Context, key ClaimKey, b Ballot, v Clai
 			}
 			res.Accepted, res.PromisedBallot, res.Accept = true, b, &a
 			return nil
-		}, c.claimCommitSeams(key))
+		}, c.keyCommitSeams(ctx, key, keyPrepared))
 		if errors.Is(err, errClaimNeedsOwnerCheck) || errors.Is(err, errClaimNeedsSourceCheck) {
 			if r, d := c.checkClaimOwner(ctx, key, v, probe, errors.Is(err, errClaimNeedsOwnerCheck)); r != "" {
 				res.Refusal, res.Detail = r, d

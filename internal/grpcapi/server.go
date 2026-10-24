@@ -55,6 +55,7 @@ type Server struct {
 	automationSource    *corrosion.AutomationSourcePreparer
 	automationExportSem chan struct{}
 	automationEngine    *automation.Engine
+	automationCustody   *corrosion.AutomationCustodyProducer
 	networkEffects      NetworkEffects
 	// reseeding admits one local reseed at a time; see reseed_singleflight.go.
 	reseeding reseedInFlight

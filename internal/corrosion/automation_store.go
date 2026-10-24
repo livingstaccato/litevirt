@@ -93,7 +93,7 @@ func validateAutomationBallot(b Ballot, zeroOK bool) error {
 	return nil
 }
 
-func (c *Client) admitAutomationTx(ctx context.Context, tx *LocalTx, key ClaimKey, b Ballot, gen int64, v *ClaimValue, owner *ownerAcceptPreparation, continuity *continuityAcceptPreparation) (string, error) {
+func (c *Client) admitAutomationTx(ctx context.Context, tx *LocalTx, key ClaimKey, b Ballot, gen int64, v *ClaimValue, owner *ownerAcceptPreparation, continuity *continuityAcceptPreparation, keyPrepared *keyAcceptPreparation, incoming *keyAcceptValue) (string, error) {
 	if !key.IsAutomation() {
 		return "", nil
 	}
@@ -104,9 +104,15 @@ func (c *Client) admitAutomationTx(ctx context.Context, tx *LocalTx, key ClaimKe
 		return RefusalInvalidValue, nil
 	}
 	if v != nil {
-		d, err := automationDecision(*v)
-		if err != nil || contract.ValidateSupportedDecision(d) != nil {
-			return RefusalInvalidValue, nil
+		var d contract.Decision
+		if incoming != nil {
+			d = incoming.decision
+		} else {
+			var err error
+			d, err = automationDecision(*v)
+			if err != nil || contract.ValidateSupportedDecision(d) != nil {
+				return RefusalInvalidValue, nil
+			}
 		}
 		// Includes own-row and anchored historical re-signing. No continuity
 		// signature bypasses local release protection through a history shortcut.
@@ -142,8 +148,12 @@ func (c *Client) admitAutomationTx(ctx context.Context, tx *LocalTx, key ClaimKe
 		if found {
 			historical = v == nil
 			if v != nil {
-				actual, err := v.Digest()
-				historical = err == nil && actual == digest
+				if incoming != nil {
+					historical = incoming.digest == digest
+				} else {
+					actual, err := v.Digest()
+					historical = err == nil && actual == digest
+				}
 			}
 		}
 	}
@@ -168,8 +178,17 @@ func (c *Client) admitAutomationTx(ctx context.Context, tx *LocalTx, key ClaimKe
 			return RefusalAutomationUnavailable, nil
 		}
 		if v != nil {
-			d, err := automationDecision(*v)
-			if err != nil || d.ParentDigest != head.Digest {
+			var d contract.Decision
+			if incoming != nil {
+				d = incoming.decision
+			} else {
+				var err error
+				d, err = automationDecision(*v)
+				if err != nil {
+					return RefusalInvalidValue, nil
+				}
+			}
+			if d.ParentDigest != head.Digest {
 				return RefusalInvalidValue, nil
 			}
 			if sequence == 1 {
@@ -190,6 +209,10 @@ func (c *Client) admitAutomationTx(ctx context.Context, tx *LocalTx, key ClaimKe
 			switch d.Command.Kind {
 			case "initialize_cluster", "read_barrier":
 			case contract.IdentityContinuityCommand:
+			case contract.CustodyImportCommand, "activate_key_epoch":
+				if refusal, err := c.admitAutomationKeyTx(ctx, tx, key, gen, *v, keyPrepared, incoming); err != nil || refusal != "" {
+					return refusal, err
+				}
 			case "ensure_owner", "acquire_session", "handoff_session":
 				if refusal, err := c.admitAutomationOwnerTx(ctx, tx, key, gen, *v, cfg, d, owner); err != nil || refusal != "" {
 					return refusal, err

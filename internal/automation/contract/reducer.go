@@ -120,6 +120,10 @@ func Reduce(p Projection, d Decision) (Reduction, error) {
 		out.Receipt.State = "rejected"
 	} else {
 		switch d.Command.Kind {
+		case CustodyImportCommand:
+			if err := reduceCustodyImport(&out, p, d, a); err != nil {
+				return out, err
+			}
 		case IdentityContinuityCommand:
 			if err := reduceContinuity(&out, p, d, a); err != nil {
 				return out, err

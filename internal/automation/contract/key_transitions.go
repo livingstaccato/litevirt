@@ -119,6 +119,7 @@ type PayloadWrappingRecord struct {
 // ciphertext, body, configuration or database Row. Its digest belongs to the
 // original certified record from which the history adapter derives it.
 type HistoricalDecision struct {
+	CustodyImport                                                                     *CustodyImportSummary
 	Sequence, MembershipGeneration                                                    uint64
 	Digest, Kind, ClusterUID, CommandClusterUID, ProjectUID, PrincipalID, OperationID string
 	Binding                                                                           *PayloadBinding
@@ -133,6 +134,19 @@ func SummarizeKeyHistory(d Decision, digest string, generation uint64) (Historic
 		return HistoricalDecision{}, codedError(CodeValidation)
 	}
 	h := HistoricalDecision{Sequence: d.Sequence, MembershipGeneration: generation, Digest: strings.Clone(digest), Kind: strings.Clone(d.Command.Kind), ClusterUID: strings.Clone(a.ClusterUID), CommandClusterUID: strings.Clone(d.Command.ClusterUID), ProjectUID: strings.Clone(d.Command.ProjectUID), PrincipalID: strings.Clone(d.Command.PrincipalID), OperationID: strings.Clone(a.OperationID), EqualityEpoch: strings.Clone(d.Command.SecretKeyEpoch), EqualityTag: append([]byte(nil), d.Command.SecretIntentTag...), CiphertextBytes: len(d.Command.Ciphertext)}
+	if d.Command.Kind == CustodyImportCommand {
+		if err := validateCustodyImport(d, a); err != nil {
+			return HistoricalDecision{}, err
+		}
+		record, err := json.Marshal(a.CustodyImport)
+		if err != nil {
+			return HistoricalDecision{}, err
+		}
+		h.CustodyImport = &CustodyImportSummary{RecordDigest: CiphertextDigest(record), EqualityEpoch: a.CustodyImport.EqualityEpoch, Genesis: a.CustodyImport.Genesis}
+		for _, m := range a.CustodyImport.Members {
+			h.CustodyImport.Recipients = append(h.CustodyImport.Recipients, CustodyRecipientBinding(m.Recipient, HistoryReference{d.Sequence, digest}))
+		}
+	}
 	if a.Binding != nil {
 		b := a.Binding
 		h.Binding = &PayloadBinding{ClusterUID: h.ClusterUID, ProjectUID: h.ProjectUID, ResourceUID: strings.Clone(b.ResourceUID), OperationID: h.OperationID, PayloadID: strings.Clone(b.PayloadID), AdmittedGeneration: b.AdmittedGeneration}
@@ -200,6 +214,12 @@ func keyTransitionKind(kind string) bool {
 	return kind == "rewrap_payload" || kind == "activate_key_epoch"
 }
 func validateKeyTransition(d Decision, a Assignment) error {
+	if a.Version == CustodyAssignmentVersion {
+		body, err := DecodeActivateKeyEpochBody(d.Command)
+		if d.Command.Kind != "activate_key_epoch" || err != nil || body.PreviousActivation != 0 || a.KeyTransition == nil || a.KeyTransition.Class != "bootstrap" || a.KeyTransition.Bootstrap == nil || a.KeyTransition.Bootstrap.Sequence != 1 || len(a.KeyTransition.RetainedInventory) != 0 || len(a.KeyTransition.Coverage) != 0 {
+			return codedError(CodeValidation)
+		}
+	}
 	var generation uint64
 	var config, epoch string
 	if d.Command.Kind == "rewrap_payload" {
@@ -353,6 +373,22 @@ func reduceKeyTransition(out *Reduction, p Projection, d Decision, a Assignment)
 	}
 	var newRecipients []KeyRecipientRecord
 	for _, r := range target {
+		if a.Version == CustodyAssignmentVersion {
+			body, _ := DecodeActivateKeyEpochBody(d.Command)
+			h, ok := historicalKeyDecision(f, r.EqualityAck, p.Head.Sequence)
+			if !ok || h.Kind != CustodyImportCommand || h.ClusterUID != d.Command.ClusterUID || h.MembershipGeneration != gen || h.PrincipalID != d.Command.PrincipalID || h.CustodyImport == nil || h.CustodyImport.EqualityEpoch != body.EqualityEpoch || h.CustodyImport.Genesis != *a.KeyTransition.Bootstrap || len(h.CustodyImport.Recipients) != len(f.Members) || r.Enrollment != r.EqualityAck || r.RecipientAck != r.EqualityAck {
+				return codedError(CodeUnavailable)
+			}
+			matched := false
+			for _, imported := range h.CustodyImport.Recipients {
+				if imported == r {
+					matched = true
+				}
+			}
+			if !matched {
+				return codedError(CodeUnavailable)
+			}
+		}
 		for _, ref := range []HistoryReference{r.Enrollment, r.RecipientAck, r.EqualityAck} {
 			if !resolvedKeyReference(f, ref, p.Head.Sequence, d.Command.ClusterUID, gen) {
 				return codedError(CodeUnavailable)

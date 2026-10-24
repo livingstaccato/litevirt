@@ -5244,6 +5244,8 @@ service LiteVirt {
     // known host certificate, and a ballot must name its sender. A voter
     // replies only after the state its reply depends on is committed.
     rpc ExportAutomationSource(AutomationSourceExportRequest) returns (stream AutomationSourceExportResponse);
+    rpc PrepareAutomationCustodyRecipient(PrepareAutomationCustodyRecipientRequest) returns (PrepareAutomationCustodyRecipientResponse);
+    rpc ImportAutomationCustodyEquality(ImportAutomationCustodyEqualityRequest) returns (ImportAutomationCustodyEqualityResponse);
     rpc GetAutomationDecision(GetAutomationDecisionRequest) returns (GetAutomationDecisionResponse);
     rpc InstallAutomationDecision(InstallAutomationDecisionRequest) returns (InstallAutomationDecisionResponse);
     rpc PrepareRecoveryClaim(PrepareRecoveryClaimRequest) returns (PrepareRecoveryClaimResponse);
@@ -6620,4 +6622,19 @@ message FenceSSHNode {
 message FenceSSHStatus {
     repeated FenceSSHNode nodes = 1;
     string generated_at         = 2;  // RFC3339
+}
+
+// Peer-only custody intents. Native validation owns every authority predicate.
+message PrepareAutomationCustodyRecipientRequest {
+    bytes request_json = 1 [debug_redact = true];
+}
+message PrepareAutomationCustodyRecipientResponse {
+    bytes recipient_json = 1 [debug_redact = true];
+}
+message ImportAutomationCustodyEqualityRequest {
+    bytes request_json = 1 [debug_redact = true];
+    bytes capsule = 2 [debug_redact = true];
+}
+message ImportAutomationCustodyEqualityResponse {
+    bytes completion_json = 1 [debug_redact = true];
 }

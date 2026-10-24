@@ -28,14 +28,14 @@ func (s localAutomationKeySource) keyHistory(ctx context.Context, seq uint64) (c
 	if seq == 0 || seq > math.MaxInt64 {
 		return zero, fmt.Errorf("invalid original history sequence")
 	}
-	probe, e := s.tx.Query(ctx, `SELECT typeof(value_json) AS vt,length(CAST(value_json AS BLOB)) AS vn,typeof(digest) AS dt,length(CAST(digest AS BLOB)) AS dn,typeof(certificate) AS ct,length(CAST(certificate AS BLOB)) AS cn FROM local_automation_history WHERE sequence=? LIMIT 1`, seq)
+	probe, e := s.tx.Query(ctx, `SELECT typeof(value_json) AS vt,length(CAST(value_json AS BLOB)) AS vn,typeof(digest) AS dt,length(CAST(digest AS BLOB)) AS dn,typeof(certificate) AS ct,length(CAST(certificate AS BLOB)) AS cn,typeof(receipt_json) AS rt,length(CAST(receipt_json AS BLOB)) AS rn FROM local_automation_history WHERE sequence=? LIMIT 1`, seq)
 	if e != nil {
 		return zero, e
 	}
-	if len(probe) != 1 || probe[0].String("vt") != "text" || probe[0].Int64("vn") > MaxAutomationClaimBytes || probe[0].String("dt") != "text" || probe[0].Int64("dn") != 64 || probe[0].String("ct") != "text" || probe[0].Int64("cn") > maxSourceCertificateBytes {
+	if len(probe) != 1 || probe[0].String("vt") != "text" || probe[0].Int64("vn") > MaxAutomationClaimBytes || probe[0].String("dt") != "text" || probe[0].Int64("dn") != 64 || probe[0].String("ct") != "text" || probe[0].Int64("cn") > maxSourceCertificateBytes || probe[0].String("rt") != "text" || probe[0].Int64("rn") > maxRetainedReceiptBytes {
 		return zero, fmt.Errorf("original history missing or malformed")
 	}
-	rows, e := s.tx.Query(ctx, `SELECT value_json,digest,certificate FROM local_automation_history WHERE sequence=? LIMIT 1`, seq)
+	rows, e := s.tx.Query(ctx, `SELECT value_json,digest,certificate,receipt_json FROM local_automation_history WHERE sequence=? LIMIT 1`, seq)
 	if e != nil {
 		return zero, e
 	}
@@ -65,6 +65,21 @@ func keyHistoryRow(seq uint64, row Row) (contract.HistoricalDecision, error) {
 	cert, e := sourceCertificate(row.String("certificate"))
 	if e != nil || cert.ConfigGeneration <= 0 {
 		return out, fmt.Errorf("invalid referenced history certificate generation")
+	}
+	if d.Command.Kind == contract.CustodyImportCommand {
+		a, err := contract.DecodeAssignment(d)
+		if err != nil || a.CustodyImport == nil {
+			return out, errAutomationAuthority
+		}
+		var receipt contract.Receipt
+		if retainedCanonical([]byte(row.String("receipt_json")), maxRetainedReceiptBytes, &receipt) != nil || receipt.Code != "" || receipt.Sequence != seq || receipt.RequestID != d.Command.RequestID || receipt.OperationID != a.OperationID {
+			return out, errAutomationAuthority
+		}
+		for _, member := range a.CustodyImport.Members {
+			if verifyCustodyCompletion(member.Completion, member.Recipient) != nil {
+				return out, errAutomationAuthority
+			}
+		}
 	}
 	return contract.SummarizeKeyHistory(d, digest, uint64(cert.ConfigGeneration))
 }
@@ -163,7 +178,7 @@ type automationKeyLookup struct {
 }
 
 func automationPrepareKeyLookup(ctx context.Context, d contract.Decision, cert ClaimCertificate) (*automationKeyLookup, error) {
-	if d.Command.Kind != "rewrap_payload" && d.Command.Kind != "activate_key_epoch" {
+	if d.Command.Kind != "rewrap_payload" && d.Command.Kind != "activate_key_epoch" && d.Command.Kind != contract.CustodyImportCommand {
 		return nil, nil
 	}
 	automationObserveKeyBody(ctx, d.Sequence, d.Command.Ciphertext)
@@ -175,7 +190,13 @@ func automationPrepareKeyLookup(ctx context.Context, d contract.Decision, cert C
 		return nil, e
 	}
 	r := &automationKeyLookup{}
-	if d.Command.Kind == "rewrap_payload" {
+	if d.Command.Kind == contract.CustodyImportCommand {
+		b, e := contract.DecodeCustodyImportBody(d.Command)
+		if e != nil {
+			return nil, e
+		}
+		r.generation, r.configDigest, r.bootstrap = b.MembershipGeneration, b.ConfigDigest, b.Genesis.Sequence
+	} else if d.Command.Kind == "rewrap_payload" {
 		b, e := contract.DecodeRewrapPayloadBody(d.Command)
 		if e != nil {
 			return nil, e
@@ -190,6 +211,9 @@ func automationPrepareKeyLookup(ctx context.Context, d contract.Decision, cert C
 	}
 	if cert.ConfigGeneration <= 0 || uint64(cert.ConfigGeneration) != r.generation {
 		return nil, fmt.Errorf("key transition differs from original certificate electorate")
+	}
+	if d.Command.Kind == contract.CustodyImportCommand {
+		return r, nil
 	}
 	if a.KeyTransition.OriginalHistory != nil {
 		r.original = a.KeyTransition.OriginalHistory.Sequence
@@ -338,7 +362,7 @@ func automationResolveKeyProjectionTx(ctx context.Context, tx *LocalTx, stage st
 			return fmt.Errorf("referenced history cluster or sequence differs")
 		}
 		f.References = append(f.References, contract.HistoricalReference{Reference: contract.HistoryReference{Sequence: seq, Digest: h.Digest}, ClusterUID: h.ClusterUID, MembershipGeneration: h.MembershipGeneration})
-		if keep[seq] {
+		if keep[seq] || h.CustodyImport != nil {
 			f.History = append(f.History, h)
 		}
 		seen[seq] = true

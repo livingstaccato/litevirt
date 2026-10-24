@@ -108,6 +108,9 @@ func (s *LocalCustody) syncDir(f *os.File) error {
 	return f.Sync()
 }
 func custodyRead(dir *os.File, name string) ([]byte, *os.File, error) {
+	return custodyReadBounded(dir, name, custodyRecordMax)
+}
+func custodyReadBounded(dir *os.File, name string, limit int64) ([]byte, *os.File, error) {
 	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if errors.Is(err, unix.ENOENT) {
 		return nil, nil, errCustodyMissing
@@ -121,16 +124,16 @@ func custodyRead(dir *os.File, name string) ([]byte, *os.File, error) {
 		f.Close()
 		return nil, nil, ErrCustodyUnavailable
 	}
-	if info.Mode().Perm()&^0600 != 0 || info.Size() > custodyRecordMax {
+	if info.Mode().Perm()&^0600 != 0 || info.Size() > limit {
 		f.Close()
 		return nil, nil, ErrCustodyCorrupt
 	}
-	body, err := io.ReadAll(io.LimitReader(f, custodyRecordMax+1))
+	body, err := io.ReadAll(io.LimitReader(f, limit+1))
 	if err != nil {
 		f.Close()
 		return nil, nil, ErrCustodyUnavailable
 	}
-	if len(body) > custodyRecordMax {
+	if int64(len(body)) > limit {
 		f.Close()
 		return nil, nil, ErrCustodyCorrupt
 	}

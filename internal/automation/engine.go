@@ -65,17 +65,18 @@ func (e *Engine) decideOwner(ctx context.Context, cfg *corrosion.VoterConfig, se
 	return e.decidePrepared(ctx, cfg, seq, proposal, owner, nil)
 }
 func (e *Engine) decidePrepared(ctx context.Context, cfg *corrosion.VoterConfig, seq uint64, proposal *corrosion.ClaimValue, owner *corrosion.AutomationOwnerSubmission, continuity *corrosion.AutomationIdentityContinuity) (claims.Outcome, error) {
+	return e.decidePreparedUsing(ctx, cfg, seq, proposal, owner, continuity, nil)
+}
+func (e *Engine) decidePreparedUsing(ctx context.Context, cfg *corrosion.VoterConfig, seq uint64, proposal *corrosion.ClaimValue, owner *corrosion.AutomationOwnerSubmission, continuity *corrosion.AutomationIdentityContinuity, p *claims.Proposer) (claims.Outcome, error) {
 	key, err := corrosion.AutomationClaimKey(seq)
 	if err != nil {
 		return claims.Outcome{}, err
 	}
-	p := claims.NewProposer(e.self, e.transport)
-	p.CallTimeout = 750 * time.Millisecond
-	spec := claims.Spec{Key: key, Generation: cfg.Generation, Voters: cfg.Names(), PrepareQuorum: corrosion.MajorityOf(len(cfg.Members)), MaxRounds: 8}
+	var propose func(map[string]corrosion.PrepareResult) (corrosion.ClaimValue, error)
 	if proposal != nil {
-		spec.Propose = func(map[string]corrosion.PrepareResult) (corrosion.ClaimValue, error) { return *proposal, nil }
+		propose = func(map[string]corrosion.PrepareResult) (corrosion.ClaimValue, error) { return *proposal, nil }
 	}
-	spec.BeforeAccept = func(ctx context.Context, b corrosion.Ballot, selected corrosion.ClaimValue) (corrosion.Ballot, error) {
+	beforeAccept := func(ctx context.Context, b corrosion.Ballot, selected corrosion.ClaimValue) (corrosion.Ballot, error) {
 		d, err := contractDecode(selected)
 		if err != nil {
 			return corrosion.Ballot{}, err
@@ -92,7 +93,7 @@ func (e *Engine) decidePrepared(ctx context.Context, cfg *corrosion.VoterConfig,
 			return t.PrepareContinuityPhase2(ctx, key, b, selected, cfg, native)
 		}
 		if !corrosion.IsAutomationOwnerKind(d.Command.Kind) {
-			return corrosion.Ballot{}, nil
+			return e.prepareSelectedAutomationPhase2(ctx, key, b, selected, cfg)
 		}
 		t, ok := e.transport.(ownerPhase2Transport)
 		if !ok {
@@ -104,6 +105,19 @@ func (e *Engine) decidePrepared(ctx context.Context, cfg *corrosion.VoterConfig,
 		}
 		return t.PrepareOwnerPhase2(ctx, key, b, selected, cfg, native)
 	}
+
+	return e.decideAutomationUsing(ctx, cfg, seq, p, propose, beforeAccept)
+}
+func (e *Engine) decideAutomationUsing(ctx context.Context, cfg *corrosion.VoterConfig, seq uint64, p *claims.Proposer, propose func(map[string]corrosion.PrepareResult) (corrosion.ClaimValue, error), beforeAccept func(context.Context, corrosion.Ballot, corrosion.ClaimValue) (corrosion.Ballot, error)) (claims.Outcome, error) {
+	key, err := corrosion.AutomationClaimKey(seq)
+	if err != nil {
+		return claims.Outcome{}, err
+	}
+	if p == nil {
+		p = claims.NewProposer(e.self, e.transport)
+	}
+	p.CallTimeout = 750 * time.Millisecond
+	spec := claims.Spec{Key: key, Generation: cfg.Generation, Voters: cfg.Names(), PrepareQuorum: corrosion.MajorityOf(len(cfg.Members)), MaxRounds: 8, Propose: propose, BeforeAccept: beforeAccept}
 	return p.Decide(ctx, spec)
 }
 
@@ -143,6 +157,9 @@ func (e *Engine) submitOwner(ctx context.Context, c Command, owner *corrosion.Au
 	return e.submitPrepared(ctx, c, owner, nil)
 }
 func (e *Engine) submitPrepared(ctx context.Context, c Command, owner *corrosion.AutomationOwnerSubmission, continuity *corrosion.AutomationIdentityContinuity) (Receipt, error) {
+	return e.submitPreparedFresh(ctx, c, owner, continuity, nil, nil)
+}
+func (e *Engine) submitPreparedFresh(ctx context.Context, c Command, owner *corrosion.AutomationOwnerSubmission, continuity *corrosion.AutomationIdentityContinuity, fresh func(context.Context, Decision) (*automationFreshValue, error), result *Decision) (Receipt, error) {
 	if err := e.recover(ctx); err != nil && !(c.Kind == "initialize_cluster" && errors.Is(err, claims.ErrNoValue)) {
 		return Receipt{}, fmt.Errorf("recover automation: %w", fail(CodeUnavailable))
 	}
@@ -193,6 +210,18 @@ func (e *Engine) submitPrepared(ctx context.Context, c Command, owner *corrosion
 					return Receipt{}, err
 				}
 			}
+
+			if result != nil {
+				original, found, err := e.db.AutomationRecord(ctx, existing.Receipt.Sequence)
+				if err != nil || !found {
+					return Receipt{}, fail(CodeUnavailable)
+				}
+				decoded, err := contractDecode(original.Value)
+				if err != nil || decoded.Command.RequestID != c.RequestID {
+					return Receipt{}, fail(CodeUnavailable)
+				}
+				*result = decoded
+			}
 			if existing.Receipt.Code != "" {
 				return existing.Receipt, fail(existing.Receipt.Code)
 			}
@@ -213,14 +242,19 @@ func (e *Engine) submitPrepared(ctx context.Context, c Command, owner *corrosion
 		}
 		e.distribute(ctx, cfg, h.Sequence)
 		d := Decision{Sequence: h.Sequence + 1, ParentDigest: h.Digest, Command: c, Assignment: assigned}
-		encoded, err := contractEncode(d)
-		if err != nil {
-			return Receipt{}, err
+		var out claims.Outcome
+		if fresh != nil {
+			out, err = e.decideFreshAutomationUsing(ctx, cfg, d.Sequence, nil, func(call context.Context) (*automationFreshValue, error) { return fresh(call, d) })
+		} else {
+			encoded, encodeErr := contractEncode(d)
+			if encodeErr != nil {
+				return Receipt{}, encodeErr
+			}
+			value := corrosion.ClaimValue{Automation: &corrosion.AutomationClaimValue{Envelope: encoded}}
+			out, err = e.decidePrepared(ctx, cfg, d.Sequence, &value, owner, continuity)
 		}
-		value := corrosion.ClaimValue{Automation: &corrosion.AutomationClaimValue{Envelope: encoded}}
-		out, err := e.decidePrepared(ctx, cfg, d.Sequence, &value, owner, continuity)
 		if err != nil {
-			if owner != nil {
+			if owner != nil || fresh != nil {
 				return Receipt{}, err
 			}
 			return Receipt{}, fail(CodeUnavailable)
@@ -230,12 +264,30 @@ func (e *Engine) submitPrepared(ctx context.Context, c Command, owner *corrosion
 		out.Certificate = corrosion.ClaimCertificate{}
 		sequence := d.Sequence
 		d = Decision{}
-		encoded = nil
-		value = corrosion.ClaimValue{}
-		if _, err = e.db.AutomationApplyOwned(ctx, &rec, e.verifier, reduce); err != nil {
+		applied, err := e.db.AutomationApplyOwned(ctx, &rec, e.verifier, reduce)
+		if err != nil {
 			return Receipt{}, fmt.Errorf("apply automation: %w", err)
 		}
 		e.distribute(ctx, cfg, sequence)
+		// Read the actual selected result only after the owned apply. No full
+		// decoded alias survives across the durable recovery owner above.
+		if fresh != nil && result != nil && c.Kind == "activate_key_epoch" {
+			original, found, err := e.db.AutomationRecord(ctx, applied.Sequence)
+			if err != nil || !found {
+				return Receipt{}, fail(CodeUnavailable)
+			}
+			selected, err := contractDecode(original.Value)
+			if err != nil {
+				return Receipt{}, err
+			}
+			if selected.Command.Kind == "activate_key_epoch" {
+				*result = selected
+				if applied.Code != "" {
+					return applied, fail(applied.Code)
+				}
+				return applied, nil
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return Receipt{}, fail(CodeUnavailable)

@@ -156,6 +156,7 @@ var dataDirPoolAreas = []string{"mounts", "pools"}
 // newHWMStore(dir)): those were found by sweeping every function the data
 // directory is passed to, and a new one needs adding here by hand.
 var dataDirOwned = []string{
+	"automation-custody",         // grpcapi/automation_custody.go: private recipient/equality custody
 	"state.db",                   // corrosion/client.go NewClient, NewLocalClient (and -wal/-shm, dataDirOwnedPrefixes)
 	"pki",                        // the daemon's PKI when pki_dir is put in the data directory
 	"vms",                        // health/owner_marker.go: per-VM owner-epoch markers; deleted_vm_marker_sweep.go

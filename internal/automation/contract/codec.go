@@ -24,7 +24,7 @@ func CanonicalCommand(c Command) ([]byte, error) {
 	case IdentityContinuityCommand, LegacyRebuildCommand, OrdinaryCreateCommand, "initialize_cluster", "assign_identity", "ensure_owner", "acquire_session",
 		"handoff_session", "adopt_resource", "transfer_owner", "admit_create",
 		"admit_update", "admit_delete", "claim_executor", "record_progress",
-		"complete_operation", "retire_artifact", "rewrap_payload", "activate_key_epoch", "read_barrier":
+		"complete_operation", "retire_artifact", "rewrap_payload", "activate_key_epoch", CustodyImportCommand, "read_barrier":
 	default:
 		return nil, codedError(CodeUnsupported)
 	}

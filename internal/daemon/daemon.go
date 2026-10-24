@@ -1393,6 +1393,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		svc.SetStrictMTLSIdentity(d.cfg.Auth.StrictMTLSIdentity)
 		svc.SetTrustRotatedPeerCerts(d.cfg.Auth.TrustRotatedPeerCerts)
 		defer svc.StopDHCPReservations()
+		if err := svc.InitializeAutomationCustody(ctx); err != nil {
+			slog.Warn("automation custody unavailable", "error", err)
+		}
+		defer svc.CloseAutomationCustody()
 		if err := svc.InitializeAutomationSource(ctx); err != nil {
 			slog.Warn("automation source publication unavailable after completed-evidence reconciliation", "error", err)
 		}

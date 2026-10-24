@@ -597,3 +597,34 @@ func TestAutomationCustodyAbruptReservationAndMaterialSync(t *testing.T) {
 		})
 	}
 }
+
+func TestCustodyProvisionDurabilityBeforePublication(t *testing.T) {
+	for _, stage := range []string{"file", "directory"} {
+		t.Run(stage, func(t *testing.T) {
+			store, _ := custodyStore(t)
+			ref := CustodyProvisionRef{Attempt: "provision", Voter: custodyRefFixture("recipient"), Equality: custodyRefFixture("equality")}
+			injected := false
+			fail := func(*os.File) error { injected = true; return syscall.EIO }
+			if stage == "file" {
+				store.ops.syncFile = fail
+			} else {
+				store.ops.syncDir = fail
+			}
+			body := []byte(`{"durable":true}`)
+			if err := store.SaveProvisionRecord(ref, "plan", body); err == nil || !injected {
+				t.Fatal("metadata published without durable sync")
+			}
+			store.ops = custodyIO{}
+			if err := store.SaveProvisionRecord(ref, "plan", body); err != nil {
+				t.Fatalf("exact retry did not revalidate/sync: %v", err)
+			}
+			got, err := store.ReadProvisionRecord(ref, "plan")
+			if err != nil || !bytes.Equal(got, body) {
+				t.Fatal("durable reopened metadata differs")
+			}
+			if err = store.SaveProvisionRecord(ref, "plan", []byte(`{"durable":false}`)); err == nil {
+				t.Fatal("retry replaced immutable continuation")
+			}
+		})
+	}
+}

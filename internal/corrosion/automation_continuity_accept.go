@@ -280,7 +280,7 @@ func (c *Client) claimAcceptContinuityWithGrant(ctx context.Context, g capabilit
 		return AcceptResult{}, err
 	}
 	prepared.grant = g
-	return c.claimAccept(ctx, key, ballot, value, generation, signer, nil, nil, prepared)
+	return c.claimAccept(ctx, key, ballot, value, generation, signer, nil, nil, prepared, nil)
 }
 func (c *Client) admitAutomationContinuityTx(ctx context.Context, tx *LocalTx, key ClaimKey, generation int64, value ClaimValue, d contract.Decision, p *continuityAcceptPreparation) error {
 	if p == nil || p.proof == nil || p.proof.key != key || p.proof.generation != generation || p.proof.digest != value.MustDigest() {

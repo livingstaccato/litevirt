@@ -57,9 +57,10 @@ func TestPort_RefusesWhatNftCannotResolve(t *testing.T) {
 	}
 }
 
-// TestKnownService_ReadsTheFile: a name or an alias under any protocol, matched
+// TestParseServices_ReadsTheFile: the services database PortUnresolvable
+// resolves against holds a name or an alias under any protocol, matched
 // exactly; comments ignored; no file resolves nothing.
-func TestKnownService_ReadsTheFile(t *testing.T) {
+func TestParseServices_ReadsTheFile(t *testing.T) {
 	// rtmp is listed for ddp only, which getaddrinfo does not try: nft
 	// refuses `tcp dport rtmp` (review I-4). amqp is sctp only, which it does.
 	got := parseServices([]byte("# comment ssh 22/tcp\nssh\t\t22/tcp\t\t\t# SSH\nhttp 80/tcp www # web\nbootps 67/udp\nbroken\nx 99999/tcp\n" +

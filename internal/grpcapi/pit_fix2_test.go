@@ -43,7 +43,7 @@ func TestDeleteDisk_TakesItsOverlayWithIt(t *testing.T) {
 // over the newer data, nor dropped: the VM is held, named in an event.
 //
 // Mutation "binding ignored": healPITOverlay's offline branch commits without
-// pitoverlay.Check (CommitOffline's check removed) — red.
+// CommitOffline's verdict check (matches or half-written) — red.
 func TestHeal_ABaseWrittenSinceIsNeverOverwritten(t *testing.T) {
 	recordQemuImg(t)
 	s, _, live := pitServer(t)

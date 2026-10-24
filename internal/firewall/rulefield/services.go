@@ -151,12 +151,6 @@ func SetProtocolsForTest(protos map[string]uint64) (restore func()) {
 	return protocols.setForTest(protos)
 }
 
-// KnownService reports whether nft on this host resolves the port name.
-func KnownService(name string) bool {
-	_, ok := services.lookup(name)
-	return ok
-}
-
 // nftPortVal is a port word as nft reads it: 0x-hex, octal after a leading
 // zero when every digit is octal (`026` is 22, `0000022` is 18), otherwise
 // decimal (`08` is 8). ok is false for a word that is not a number.

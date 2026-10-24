@@ -1008,16 +1008,6 @@ func checkToken(disk string, b Binding) error {
 	}
 }
 
-// Check reports whether disk's overlay may be committed into disk now: the
-// verdict is matches or half-written (ErrNotOurs, with the reason, if not).
-func Check(disk string, owner Owner) error {
-	a := Assess(disk, owner, false)
-	if a.Verdict == Matches || a.Verdict == HalfWritten {
-		return nil
-	}
-	return fmt.Errorf("%s: %w (%s)", Path(disk), ErrNotOurs, a.Reason)
-}
-
 // CommitOffline commits disk's overlay, if it has one and it is bound to
 // owner and to the disk as it is (matches or half-written), into the disk
 // with qemu-img commit (no -U). It renews the committing state first, so a

@@ -12,6 +12,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -92,5 +93,45 @@ func TestPromote_ATakeoverRecordsTheBackingItBuilt(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Review NB-3: a takeover whose first attempt started the domain and died
+// before it persisted the rows is adopted by the retry, which records the
+// backing of the live disk the domain runs from — the replica under its
+// --no-localize overlay — over the source row's.
+//
+// Mutation "takeover writes no backing" (the root's SetDiskBacking removed)
+// — red.
+func TestPromote_AnAdoptedTakeoverRecordsTheBackingItBuilt(t *testing.T) {
+	s := testServer(t)
+	poolDir := setPromoteVMRows(t, s, "db", nil)
+	if err := s.db.Execute(context.Background(),
+		`UPDATE vm_disks SET backing_disk = '/dead/tmpl-root.qcow2', backing_image = 'base.qcow2' WHERE vm_name = 'db'`); err != nil {
+		t.Fatal(err)
+	}
+	replica := filepath.Join(replicaOwnerDir(poolDir, "", "db"),
+		seedReplica(t, poolDir, "", "db", "root", stamp(10*time.Minute), "raw", 1<<20))
+	req := &pb.PromoteReplicaRequest{VmName: "db", TargetPool: "dr", Force: true, NoLocalize: true}
+	f := s.virt.(*libvirtfake.Fake)
+	f.FailStartDomain = func(name string) error {
+		f.SetState(name, libvirtfake.StateRunning) // qemu is up; the daemon dies
+		panic("crash")
+	}
+	crashPromote(t, s, req)
+	f.FailStartDomain = nil
+	built := promotedFiles(t, poolDir, "db")
+	if len(built) != 1 {
+		t.Fatalf("the crashed attempt left %v, want exactly its one live disk", built)
+	}
+
+	promoteSet(t, s, req)
+
+	root := diskRowsOf(t, s, "db")["root"]
+	if root.Path != built[0] {
+		t.Fatalf("root row path = %q, want the adopted domain's disk %q", root.Path, built[0])
+	}
+	if root.BackingDisk != replica || root.BackingImage != "" {
+		t.Errorf("root row backing_disk = %q, backing_image = %q; want the replica %q and none", root.BackingDisk, root.BackingImage, replica)
 	}
 }

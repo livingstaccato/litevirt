@@ -1021,6 +1021,13 @@ func (s *Server) pruneTopLevelReplicas(ctx context.Context, dir string, k replic
 		if owners, err := s.replicaUsers(ctx, p); err != nil || len(owners) > 0 {
 			continue
 		}
+		// What a disk's header reads, whatever its row records.
+		if user, err := s.replicaChainUser(ctx, p, dir, k.VM); err != nil || user != "" {
+			if err != nil {
+				slog.Warn("replication: cannot tell whether a disk reads a replica; it is not pruned", "replica", p, "error", err)
+			}
+			continue
+		}
 		if held, why := s.keptHolds(ctx, p); held {
 			slog.Warn("replication: a replica a kept disk holds is not pruned", "replica", p, "why", why)
 			continue

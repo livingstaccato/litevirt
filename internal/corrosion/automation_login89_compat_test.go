@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/automation/contract"
 	"github.com/litevirt/litevirt/internal/pki"
@@ -36,8 +38,8 @@ func TestAutomationLogin89Frozen88Layout(t *testing.T) {
 		t.Fatal("independent88 descriptor changed")
 	}
 	old, current := aggregateLocalTables88(), aggregateLocalTables()
-	if len(old) != 38 || len(current) != 38 || CurrentSchemaVersion != 89 || automationCutSourceSchema != 89 {
-		t.Fatal("current89 boundary")
+	if len(old) != 38 || len(current) != 38 || CurrentSchemaVersion != 90 || automationCutSourceSchema != 90 {
+		t.Fatal("current90 boundary preserves archived88/89 layout")
 	}
 	for i := range old {
 		if old[i].table != "local_automation_credential_issuance" {
@@ -97,11 +99,20 @@ func TestAutomationLogin89Genuine88PublicCold(t *testing.T) {
 	if before.SourceSchema != 88 || before.Codec != 1 || len(before.Inventory) != 9 || !reflect.DeepEqual(records, e.Records) {
 		t.Fatal("archived88 cut")
 	}
+	sessionBefore, err := c.Query(ctx, `SELECT * FROM sessions WHERE id='predecessor88'`)
+	if err != nil || len(sessionBefore) != 1 {
+		t.Fatal("archived session unavailable", err)
+	}
+	const oldStampSQL = `SELECT kind,credential_id,username,witness,principal_uid,cluster_uid,credential_digest,valid FROM local_automation_credential_issuance WHERE kind='session' AND credential_id='predecessor88'`
+	stampBefore, err := c.Query(ctx, oldStampSQL)
+	if err != nil || len(stampBefore) != 1 {
+		t.Fatal("archived issuance unavailable", err)
+	}
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	if storedVersion(t, c) != 89 || !reflect.DeepEqual(schemaDDL, e.DDL) {
-		t.Fatal("schema89 changed predecessor DDL")
+	if storedVersion(t, c) != 90 || !reflect.DeepEqual(schemaDDL, e.DDL) {
+		t.Fatal("current90 changed predecessor88 DDL")
 	}
 	for _, old := range e.Ledger {
 		rows, err := c.Query(ctx, `SELECT checksum,applied_at FROM applied_migrations WHERE id=?`, old.String("id"))
@@ -118,9 +129,30 @@ func TestAutomationLogin89Genuine88PublicCold(t *testing.T) {
 			t.Fatal("migration invented attachment")
 		}
 	}
+	sessionAfter, err := c.Query(ctx, `SELECT * FROM sessions WHERE id='predecessor88'`)
+	if err != nil || !reflect.DeepEqual(sessionBefore, sessionAfter) {
+		t.Fatal("migration rewrote archived session/expiry", err)
+	}
+	stampAfter, err := c.Query(ctx, oldStampSQL)
+	if err != nil || !reflect.DeepEqual(stampBefore, stampAfter) {
+		t.Fatal("migration rewrote original credential bytes", err)
+	}
+	expires, err := time.Parse(time.RFC3339, sessionBefore[0].String("expires_at"))
+	if err != nil {
+		t.Fatal("archived expiry malformed", err)
+	}
+	// Historical bytes are immutable; they do not suspend real session
+	// expiry. Fresh current-origin acceptance is independently covered by
+	// TestAutomationCredentialCompositeIssuersAndSplitModes.
+	expired := !time.Now().Before(expires)
 	i, err := AutomationSessionPrincipal(ctx, c, "predecessor88")
-	if err != nil || i == nil || i.UID != "principal-uid" {
-		t.Fatal("genuine origin stamp compatibility", i, err)
+	if expired {
+		var refusal *AutomationCredentialError
+		if i != nil || !errors.As(err, &refusal) || refusal.Kind != AutomationCredentialProofInvalid || !errors.Is(err, ErrAutomationLifecycleUnavailable) || err.Error() != "automation credential proof unavailable" {
+			t.Fatal("expired archived session did not retain exact public refusal", i, err)
+		}
+	} else if err != nil || i == nil || i.UID != "principal-uid" {
+		t.Fatal("unexpired genuine origin stamp compatibility", i, err)
 	}
 	after, again := cutFixtureRead(t, c, e.CutID)
 	if !reflect.DeepEqual(before, after) || !reflect.DeepEqual(records, again) {

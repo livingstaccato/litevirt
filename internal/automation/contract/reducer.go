@@ -18,6 +18,7 @@ type Request struct {
 	Receipt  Receipt
 }
 type Projection struct {
+	Update        *UpdateProjection
 	Continuity    *ContinuityProjection
 	Execution     *ExecutionProjection
 	Target        *TargetProjection
@@ -142,6 +143,10 @@ func Reduce(p Projection, d Decision) (Reduction, error) {
 			}
 		case "adopt_resource", "transfer_owner":
 			if err := reduceOwnership(&out, p, d, a); err != nil {
+				return out, err
+			}
+		case "admit_update":
+			if err := reduceUpdateBinding(&out, p, d, a); err != nil {
 				return out, err
 			}
 		case "admit_create":

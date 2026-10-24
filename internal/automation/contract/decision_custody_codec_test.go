@@ -139,7 +139,41 @@ func TestCustodyCodecFrozenDifferential(t *testing.T) {
 				t.Run(name, func(t *testing.T) { d := original; d.Assignment = assignment; checkCustodyCodecOracle(t, d) })
 			}
 			for _, kind := range []string{"read_barrier", "rewrap_payload", "ensure_owner", "acquire_session", "admit_update", "unknown", "record_custody_import", "activate_key_epoch"} {
-				t.Run("kind-"+kind, func(t *testing.T) { d := original; d.Command.Kind = kind; checkCustodyCodecOracle(t, d) })
+				t.Run("kind-"+kind, func(t *testing.T) {
+					d := original
+					d.Command.Kind = kind
+					if kind != "admit_update" {
+						checkCustodyCodecOracle(t, d)
+						return
+					}
+					// Update is newly supported. The frozen oracle still
+					// refuses its old unknown command domain; current code
+					// must reject these foreign v4/v1 assignments as invalid.
+					for _, version := range []int{4, 1} {
+						var assignment Assignment
+						if err := json.Unmarshal(original.Assignment, &assignment); err != nil {
+							t.Fatal(err)
+						}
+						assignment.Version = version
+						d.Assignment, _ = json.Marshal(assignment)
+						if err := ec941ValidateSupportedDecision(d); Code(err) != CodeUnsupported {
+							t.Fatal("frozen unknown update domain changed", err)
+						}
+						if err := ValidateSupportedDecision(d); Code(err) != CodeValidation {
+							t.Fatal("foreign update assignment validated", version, err)
+						}
+						if _, err := EncodeDecision(d); Code(err) != CodeValidation {
+							t.Fatal("foreign update assignment encoded", version, err)
+						}
+						wire, err := json.Marshal(decisionEnvelope{1, d})
+						if err != nil {
+							t.Fatal(err)
+						}
+						if _, err := DecodeDecision(wire); Code(err) != CodeValidation {
+							t.Fatal("foreign update assignment decoded", version, err)
+						}
+					}
+				})
 			}
 			// Valid noncanonical assignment forms are accepted by the old API.
 			// This specifically catches treating a fast-path miss as rejection.

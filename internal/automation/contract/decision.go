@@ -66,6 +66,12 @@ func validateDecision(d Decision) error {
 		}
 		return validateSupportedAssignment(d, a)
 	}
+	if d.Command.Kind == "admit_update" {
+		if err := validateDecisionAssignment(d); err != nil {
+			return codedError(CodeValidation)
+		}
+		return nil
+	}
 	if _, err := canonicalBody(d.Assignment); err != nil {
 		// Preserve the legacy assignment byte domain. The separately allocated
 		// key-only outer version must cross the exact supported-kind validator;

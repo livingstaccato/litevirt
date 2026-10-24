@@ -556,8 +556,8 @@ func TestAutomationContinuityGenuine87PublicCold88(t *testing.T) {
 	if err = InitSchema(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	if storedVersion(t, c) != 89 {
-		t.Fatal("consumer did not migrate89")
+	if storedVersion(t, c) != 90 {
+		t.Fatal("current consumer did not migrate90")
 	}
 	if len(schemaDDL) != len(evidence.DDL)+2 || !reflect.DeepEqual(schemaDDL[:len(evidence.DDL)], evidence.DDL) {
 		t.Fatal("schema88 changed prior DDL")
@@ -636,8 +636,8 @@ func TestAutomationContinuityGenuine87PrivateCold88(t *testing.T) {
 	if err = InitSchema(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	if storedVersion(t, c) != 89 {
-		t.Fatal("consumer89 not active")
+	if storedVersion(t, c) != 90 {
+		t.Fatal("current consumer90 not active")
 	}
 	header, err := decodeRetainedHeader(e.Header)
 	if err != nil || header.LayoutDigest != retainedLocalLayout87Digest() || header.Head.Sequence != 14 {
@@ -827,7 +827,7 @@ func TestAutomationContinuityCurrent89RetainedWarmCold(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if storedVersion(t, cold) != 89 {
+	if storedVersion(t, cold) != 90 {
 		t.Fatal("cold continuity38 source schema")
 	}
 	coldtx, err := cold.db.BeginTx(ctx, nil)

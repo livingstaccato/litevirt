@@ -24,6 +24,11 @@ import (
 const (
 	AccessVLANEvaluator        = "access_vlan"
 	CondBridgeVLANFilteringOff = "bridge_vlan_filtering_off"
+	// CondUnfilteredAccessVLANMovesAllowed (subject network/<name>, warning)
+	// is open while a network allows moving its access-VLAN VMs onto bridges
+	// that do not filter VLANs (`lv network set
+	// --allow-unfiltered-access-vlan-moves`).
+	CondUnfilteredAccessVLANMovesAllowed = "access_vlan_unfiltered_moves_allowed"
 )
 
 // AccessVLANNetworks indexes nets by name, for AccessVLANBridges.
@@ -129,6 +134,35 @@ func AccessVLANHostsUnfitFor(spec *pb.VMSpec, nets map[string]corrosion.NetworkR
 				out = map[string]string{}
 			}
 			out[host] = "bridge " + br + " cannot carry an access-VLAN NIC (" + CondBridgeVLANFilteringOff + ")"
+		}
+	}
+	return out
+}
+
+// AllowsUnfilteredAccessVLANMoves reports whether network name has opted in to
+// moving access-VLAN VMs onto bridges that do not filter VLANs
+// (compose.NetworkDef.AllowUnfilteredAccessVLANMoves). A network with no row,
+// or one whose config cannot be read, has not.
+func AllowsUnfilteredAccessVLANMoves(nets map[string]corrosion.NetworkRecord, name string) bool {
+	rec, ok := nets[name]
+	if !ok {
+		return false
+	}
+	var def compose.NetworkDef
+	if json.Unmarshal([]byte(rec.Config), &def) != nil {
+		return false
+	}
+	return def.AllowUnfilteredAccessVLANMoves
+}
+
+// WithoutUnfilteredMoveNICs is spec without the NICs on networks that allow
+// unfiltered access-VLAN moves (AllowsUnfilteredAccessVLANMoves): what a move
+// still has to find a VLAN-filtering bridge for.
+func WithoutUnfilteredMoveNICs(spec *pb.VMSpec, nets map[string]corrosion.NetworkRecord) *pb.VMSpec {
+	out := &pb.VMSpec{}
+	for _, n := range spec.GetNetwork() {
+		if !AllowsUnfilteredAccessVLANMoves(nets, n.GetName()) {
+			out.Network = append(out.Network, n)
 		}
 	}
 	return out

@@ -1067,6 +1067,10 @@ message NetworkInfo {
     int32  vni        = 8;
     int32  vm_count   = 9;
     string project    = 10; // owning tenant; empty = global/shared
+    // allow_unfiltered_access_vlan_moves: the network's opt-in to moving
+    // access-VLAN VMs onto bridges that do not filter VLANs
+    // (SetNetworkGuardConfigRequest). Always false from an older server.
+    bool   allow_unfiltered_access_vlan_moves = 11;
 }
 
 // ── Load Balancers ──
@@ -2287,6 +2291,15 @@ message SetNetworkGuardConfigRequest {
     repeated string reserved_addresses     = 5;
     bool            set_allowed_vlans      = 6;
     repeated int32  allowed_vlans          = 7;
+    // allow_unfiltered_access_vlan_moves (set when set_allow_unfiltered_access_vlan_moves):
+    // whether `lv migrate` and `lv host drain` may move a VM with an access-VLAN NIC
+    // (trunk: with one VLAN) on this network onto a host whose bridge does not filter
+    // VLANs, onto that bridge's untagged segment. Off by default; admin-only and
+    // audited; a network row only (a flat bridge cannot hold it). Starts are refused
+    // on such a bridge whatever it says. An older server ignores both fields: the
+    // reply's allow_unfiltered_access_vlan_moves is how a client tells.
+    bool            set_allow_unfiltered_access_vlan_moves = 8;
+    bool            allow_unfiltered_access_vlan_moves     = 9;
 }
 
 message ListNICGuardsRequest {

@@ -3183,7 +3183,8 @@ is tried again on every reconcile pass, and starts by itself once the bridge
 filters VLANs. A refused `lv start` or health restart is not retried: start
 the VM again with `lv start <vm>` after the fix. `lv migrate` and `lv host
 drain` never move such a VM onto a reported host: the target refuses the move
-before anything is copied, and a drain does not choose it.
+before anything is copied, and a drain does not choose it, unless the VM's
+network allows it (`--allow-unfiltered-access-vlan-moves`, below).
 
 Fix it on the host the subject names: `ip link set dev <bridge> type bridge
 vlan_filtering 1`, with the VLAN on the bridge's uplink, and keep it across a
@@ -3191,6 +3192,28 @@ reboot in what creates the bridge
 ([networking.md](networking.md#access-vlan-nics-need-a-vlan-filtering-bridge)).
 The condition resolves on the first check that finds the bridge filtering
 VLANs, or no VM with an access-port NIC on it.
+
+### A network lets access-VLAN VMs move onto unfiltered bridges (`access_vlan_unfiltered_moves_allowed`)
+
+`lv network set <net> --allow-unfiltered-access-vlan-moves=true` (admin only,
+audited as `network.access_vlan_unfiltered_moves`) lets `lv migrate` and `lv
+host drain` move a VM with an access-VLAN NIC on that network onto a host whose
+bridge does not filter VLANs, or does not have the bridge yet, where the NIC
+joins the bridge's untagged segment. While it is on, `access_vlan_unfiltered_moves_allowed`
+(evaluator `access_vlan`, subject `network/<name>`, warning) is open for the
+network, and `lv doctor access-vlan-moves` lists it. Starts on such a bridge are
+still refused. Turn it off with `--allow-unfiltered-access-vlan-moves=false`;
+the condition resolves on the next check (every 30 s), or when the network is
+removed.
+
+## `lv doctor access-vlan-moves`
+
+Read-only. Lists the networks that have `--allow-unfiltered-access-vlan-moves`
+on (see above).
+
+```
+lv doctor access-vlan-moves
+```
 
 ### Orphaned runtimes (`vm_orphan_runtime`, `ct_orphan_runtime`)
 

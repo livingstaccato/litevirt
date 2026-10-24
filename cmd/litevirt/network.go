@@ -95,6 +95,9 @@ func newNetworkInspectCmd() *cobra.Command {
 					fmt.Fprintf(w, "Stack:\t%s\n", ni.StackName)
 				}
 				fmt.Fprintf(w, "VMs:\t%d\n", ni.VmCount)
+				if ni.GetAllowUnfilteredAccessVlanMoves() {
+					fmt.Fprintf(w, "Unfiltered access-VLAN moves:\tallowed (access-VLAN VMs may be moved onto bridges that do not filter VLANs)\n")
+				}
 				return w.Flush()
 			})
 		},
@@ -187,9 +190,10 @@ Examples:
 
 func newNetworkSetCmd() *cobra.Command {
 	var (
-		gateway  string
-		reserved []string
-		vlans    []int
+		gateway    string
+		reserved   []string
+		vlans      []int
+		unfiltered bool
 	)
 	cmd := &cobra.Command{
 		Use:   "set <name>",
@@ -199,6 +203,12 @@ func newNetworkSetCmd() *cobra.Command {
   --gateway            its router when it is not litevirt's own; no guest NIC may claim it
   --reserved-address   further infrastructure addresses no guest NIC may claim (repeatable; replaces the list)
   --allowed-vlans      the VLANs a NIC on the trunk: feature may carry (replaces the list)
+  --allow-unfiltered-access-vlan-moves=true|false
+                       let lv migrate and lv host drain move a VM with an access-VLAN NIC
+                       (trunk: with one VLAN) on this network onto a host whose bridge does
+                       not filter VLANs, onto that bridge's untagged segment. Off by default;
+                       needs the admin role; audited; lv health and lv doctor access-vlan-moves
+                       name the network while it is on. Starts there are refused regardless.
 
 Only the flags given change; an empty value clears that setting.
 
@@ -220,13 +230,19 @@ network.update at the cluster root: no project owns a flat bridge.`,
 					req.AllowedVlans = append(req.AllowedVlans, int32(v))
 				}
 			}
-			if !req.SetGateway && !req.SetReservedAddresses && !req.SetAllowedVlans {
-				return errors.New("nothing to set: give --gateway, --reserved-address or --allowed-vlans")
+			if cmd.Flags().Changed("allow-unfiltered-access-vlan-moves") {
+				req.SetAllowUnfilteredAccessVlanMoves, req.AllowUnfilteredAccessVlanMoves = true, unfiltered
+			}
+			if !req.SetGateway && !req.SetReservedAddresses && !req.SetAllowedVlans && !req.SetAllowUnfilteredAccessVlanMoves {
+				return errors.New("nothing to set: give --gateway, --reserved-address, --allowed-vlans or --allow-unfiltered-access-vlan-moves")
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				ni, err := c.SetNetworkGuardConfig(ctx, req)
 				if err != nil {
 					return errors.New(status.Convert(err).Message())
+				}
+				if err := unfilteredMovesTookEffect(req, ni); err != nil {
+					return err
 				}
 				fmt.Printf("Network %s updated\n", ni.Name)
 				return nil
@@ -236,7 +252,21 @@ network.update at the cluster root: no project owns a flat bridge.`,
 	cmd.Flags().StringVar(&gateway, "gateway", "", "the network's router when it is not litevirt's; empty clears it")
 	cmd.Flags().StringSliceVar(&reserved, "reserved-address", nil, "an infrastructure address no guest NIC may claim (repeatable; replaces the list)")
 	cmd.Flags().IntSliceVar(&vlans, "allowed-vlans", nil, "the VLANs a trunk NIC on this network may carry (comma-separated; replaces the list)")
+	cmd.Flags().BoolVar(&unfiltered, "allow-unfiltered-access-vlan-moves", false,
+		"let migrate and drain move this network's access-VLAN VMs onto bridges that do not filter VLANs (admin; off by default)")
 	return cmd
+}
+
+// unfilteredMovesTookEffect checks the reply of a set that asked to change
+// the unfiltered-moves opt-in: a server on a build before the field ignores
+// it and answers false, which for a request to turn it on means nothing
+// changed.
+func unfilteredMovesTookEffect(req *pb.SetNetworkGuardConfigRequest, ni *pb.NetworkInfo) error {
+	if !req.GetSetAllowUnfilteredAccessVlanMoves() || ni.GetAllowUnfilteredAccessVlanMoves() == req.GetAllowUnfilteredAccessVlanMoves() {
+		return nil
+	}
+	return fmt.Errorf("network %s: the server did not apply --allow-unfiltered-access-vlan-moves=%t (it runs a build that does not know it); "+
+		"any other setting given was applied. Retry against a node on this release", req.GetName(), req.GetAllowUnfilteredAccessVlanMoves())
 }
 
 func newNetworkRmCmd() *cobra.Command {

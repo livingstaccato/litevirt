@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/network"
@@ -105,6 +106,55 @@ func (s *Server) ReconcileAccessVLANBridges(ctx context.Context) {
 			continue
 		}
 		s.judgeAccessVLANBridge(ctx, br, nil, nil)
+	}
+	s.judgeUnfilteredMoveOptIns(ctx, netRows)
+}
+
+// judgeUnfilteredMoveOptIns keeps access_vlan_unfiltered_moves_allowed
+// (subject network/<name>, warning) open for each network that allows moving
+// its access-VLAN VMs onto bridges that do not filter VLANs, and resolves it
+// for one that no longer does, or is gone. A configuration, not a host's
+// observation: raised confirmed, by whichever host sees it first; a host
+// finding it already open writes nothing.
+func (s *Server) judgeUnfilteredMoveOptIns(ctx context.Context, netRows []corrosion.NetworkRecord) {
+	on := map[string]bool{}
+	for _, n := range netRows {
+		var def compose.NetworkDef
+		if json.Unmarshal([]byte(n.Config), &def) == nil && def.AllowUnfilteredAccessVLANMoves {
+			on[n.Name] = true
+		}
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	for name := range on {
+		row, found, err := corrosion.GetHealthCondition(ctx, s.db, health.AccessVLANEvaluator, health.CondUnfilteredAccessVLANMovesAllowed, "network", name)
+		if err != nil || (found && row.Lifecycle != corrosion.ConditionResolved) {
+			continue
+		}
+		ev, _ := json.Marshal(map[string]any{"network": name,
+			"detail": fmt.Sprintf("network %s allows `lv migrate` and `lv host drain` to move its access-VLAN VMs onto a host whose "+
+				"bridge does not filter VLANs, onto that bridge's untagged segment, where they share the segment with every "+
+				"plain NIC and the host. Turn it off with `lv network set %s --allow-unfiltered-access-vlan-moves=false` "+
+				"(docs/networking.md, \"Access-VLAN NICs need a VLAN-filtering bridge\")", name, name)})
+		row = corrosion.HealthCondition{Evaluator: health.AccessVLANEvaluator, Code: health.CondUnfilteredAccessVLANMovesAllowed,
+			SubjectKind: "network", SubjectID: name, Lifecycle: corrosion.ConditionConfirmed, FirstSeen: now, ConfirmedAt: now,
+			LastSeen: now, ObserveCount: 1, Severity: corrosion.SeverityWarning, Reporter: s.hostName, Evidence: string(ev)}
+		if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
+			slog.Warn("access-VLAN: raise the unfiltered-moves opt-in condition", "network", name, "error", err)
+		}
+	}
+	conds, deleted, err := corrosion.ListHealthConditionsByCode(ctx, s.db, health.AccessVLANEvaluator, health.CondUnfilteredAccessVLANMovesAllowed)
+	if err != nil {
+		return
+	}
+	for i, c := range conds {
+		if deleted[i] || c.Lifecycle == corrosion.ConditionResolved || c.SubjectKind != "network" || on[c.SubjectID] {
+			continue
+		}
+		c.Lifecycle, c.ResolvedAt, c.LastSeen, c.Reporter = corrosion.ConditionResolved, now, now, s.hostName
+		c.CleanCount++
+		if err := corrosion.UpsertHealthCondition(ctx, s.db, c); err != nil {
+			slog.Warn("access-VLAN: resolve the unfiltered-moves opt-in condition", "network", c.SubjectID, "error", err)
+		}
 	}
 }
 
@@ -199,6 +249,8 @@ func (v *accessVLANMoveView) exclude(req *placement.Request, vm corrosion.VMReco
 	if json.Unmarshal([]byte(vm.Spec), spec) != nil {
 		return
 	}
+	// A NIC on a network that allows unfiltered moves needs no such bridge.
+	spec = health.WithoutUnfilteredMoveNICs(spec, v.nets)
 	for host, why := range health.AccessVLANHostsUnfitFor(spec, v.nets, v.unfit) {
 		if req.ExcludeHosts == nil {
 			req.ExcludeHosts = map[string]string{}
@@ -235,6 +287,16 @@ func (s *Server) accessVLANMoveRefusal(ctx context.Context, vm *corrosion.VMReco
 		problem := network.AccessVLANBridgeProblem(bridge, v, s.bridgeVLANFilteringOf)
 		if problem == nil && !s.bridgeExistsHere(bridge) {
 			problem = fmt.Errorf("bridge %q does not exist here", bridge)
+		}
+		// The network's opt-in (admin, audited, flagged while on) lets the
+		// move go ahead onto the untagged segment.
+		if problem != nil {
+			if def, _ := lookupNetworkDef(ctx, s.db, n.GetName()); def != nil && def.AllowUnfilteredAccessVLANMoves {
+				slog.Warn("migrate: an access-VLAN NIC moves onto a bridge here that cannot carry its VLAN, onto its untagged "+
+					"segment: its network allows it (allow_unfiltered_access_vlan_moves)",
+					"vm", vm.Name, "network", n.GetName(), "vlan", v, "problem", problem)
+				continue
+			}
 		}
 		if problem != nil {
 			return status.Errorf(codes.FailedPrecondition,

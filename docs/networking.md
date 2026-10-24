@@ -444,7 +444,22 @@ create it without filtering): the target refuses the move before anything is
 copied or created there, a live and a cold move alike, naming the bridge and
 the VLAN, and the VM stays where it is. A drain does not choose such a host as
 a target (it is listed in the drain's "no eligible target" reasons), and takes
-another that qualifies. A trunk
+another that qualifies.
+
+A network can opt out of that refusal for its moves:
+`lv network set <net> --allow-unfiltered-access-vlan-moves=true`. It is off by
+default, needs the admin role, and is audited
+(`network.access_vlan_unfiltered_moves`); a network row is needed, so a flat
+bridge cannot hold it, and a re-deploy of the network keeps it (a compose file
+cannot set it). With it on, a migration or drain of a VM whose access-VLAN NIC
+is on that network may land it on a host whose bridge does not filter VLANs, on
+that bridge's untagged segment, and the target logs a warning. Starts there are
+still refused. While it is on, `lv health` shows
+`access_vlan_unfiltered_moves_allowed` for the network, `lv network inspect`
+says so, and `lv doctor access-vlan-moves` lists it
+([diagnostics.md](diagnostics.md#a-network-lets-access-vlan-vms-move-onto-unfiltered-bridges-access_vlan_unfiltered_moves_allowed)).
+A node on an older build ignores the setting; `lv network set` reports when the
+node it reached did not apply it. A trunk
 of two or more VLANs is not refused: its tagged frames
 pass a bridge with filtering off, and the firewall confines them to the VLANs
 its network allows (docs/firewall.md, "VLAN tags").

@@ -197,3 +197,49 @@ func TestFleet_VLANGuestToATargetWithoutHandOverIsNotPaused(t *testing.T) {
 		t.Fatalf("vmover on %s is %q, want running", dst.Name, st)
 	}
 }
+
+// The network's opt-in (`lv network set --allow-unfiltered-access-vlan-moves`,
+// admin) lets `lv migrate` move the access-VLAN VM onto a host whose bridge
+// does not filter VLANs: the target reads it from the replicated network row.
+// Turned off again, the next move is refused again.
+//
+// Mutation: drop the opt-in from accessVLANMoveRefusal — red.
+func TestFleet_UnfilteredMovesOptInLetsTheMigrationThrough(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	ctx := context.Background()
+	src, dst := c.Nodes[0], c.Nodes[1]
+	if err := corrosion.UpsertNetwork(ctx, src.DB, corrosion.NetworkRecord{Name: "vt_acc", Type: "bridge",
+		Config: `{"Type":"bridge","Interface":"vt_acc"}`}); err != nil {
+		t.Fatal(err)
+	}
+	vlanMover(t, c, src, map[*Node]*accVLANBridge{dst: {on: false}})
+	src.LandMigrationsOn(dst)
+	dst.LandMigrationsOn(src)
+	set := func(v bool) {
+		t.Helper()
+		ni, err := c.SelfClient(src).SetNetworkGuardConfig(ctx, &pb.SetNetworkGuardConfigRequest{Name: "vt_acc",
+			SetAllowUnfilteredAccessVlanMoves: true, AllowUnfilteredAccessVlanMoves: v})
+		if err != nil || ni.GetAllowUnfilteredAccessVlanMoves() != v {
+			t.Fatalf("set the opt-in to %v: %v, %v", v, ni, err)
+		}
+		c.WaitConverged(t, convergeTimeout)
+	}
+	if err := migrateAt(t, c, src, "vmover", dst.Name); err == nil || !strings.Contains(err.Error(), "VLAN 30") {
+		t.Fatalf("without the opt-in: %v, want the refusal", err)
+	}
+	set(true)
+	if err := migrateAt(t, c, src, "vmover", dst.Name); err != nil {
+		t.Fatalf("with the opt-in: %v", err)
+	}
+	if vm := vmOn(t, src, "vmover"); vm == nil || vm.HostName != dst.Name {
+		t.Fatalf("vmover after the allowed move: %+v", vm)
+	}
+	// Back to src, which filters; then the opt-in off refuses dst again.
+	if err := migrateAt(t, c, dst, "vmover", src.Name); err != nil {
+		t.Fatalf("move back: %v", err)
+	}
+	set(false)
+	if err := migrateAt(t, c, src, "vmover", dst.Name); err == nil || !strings.Contains(err.Error(), "VLAN 30") {
+		t.Fatalf("with the opt-in off again: %v, want the refusal", err)
+	}
+}

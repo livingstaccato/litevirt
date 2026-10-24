@@ -44,6 +44,16 @@ func (s *Server) SetNetworkGuardConfig(ctx context.Context, req *pb.SetNetworkGu
 		s.audit(ctx, "network.update", nr.Name, "guard config", "denied")
 		return nil, status.Errorf(codes.PermissionDenied, "setting %s's gateway, reserved addresses or trunk VLANs needs network.update on it", nr.Name)
 	}
+	// Moving access-VLAN VMs onto bridges that do not filter VLANs puts
+	// them on those bridges' untagged segments: a cluster-wide isolation
+	// decision, the admin's alone, whoever owns the network.
+	if req.GetSetAllowUnfilteredAccessVlanMoves() {
+		if err := RequireRole(ctx, "admin"); err != nil {
+			s.audit(ctx, auditUnfilteredAccessVLANMoves, nr.Name, onOff(req.GetAllowUnfilteredAccessVlanMoves()), "denied")
+			return nil, status.Errorf(codes.PermissionDenied,
+				"letting %s's access-VLAN VMs move onto bridges that do not filter VLANs requires the admin role", nr.Name)
+		}
+	}
 	var def compose.NetworkDef
 	if nr.Config != "" {
 		if err := json.Unmarshal([]byte(nr.Config), &def); err != nil {
@@ -69,6 +79,10 @@ func (s *Server) SetNetworkGuardConfig(ctx context.Context, req *pb.SetNetworkGu
 		}
 		def.AllowedVLANs = vids
 	}
+	wasUnfiltered := def.AllowUnfilteredAccessVLANMoves
+	if req.GetSetAllowUnfilteredAccessVlanMoves() {
+		def.AllowUnfilteredAccessVLANMoves = req.GetAllowUnfilteredAccessVlanMoves()
+	}
 	for _, a := range append([]string{def.Gateway}, def.ReservedAddresses...) {
 		if a == "" {
 			continue
@@ -87,8 +101,23 @@ func (s *Server) SetNetworkGuardConfig(ctx context.Context, req *pb.SetNetworkGu
 		return nil, status.Errorf(codes.Internal, "update network: %v", err)
 	}
 	s.audit(ctx, "network.update", nr.Name, corrosion.AuditChange(before, guardConfigText(def)), "ok")
+	if req.GetSetAllowUnfilteredAccessVlanMoves() {
+		s.audit(ctx, auditUnfilteredAccessVLANMoves, nr.Name,
+			corrosion.AuditChange(onOff(wasUnfiltered), onOff(def.AllowUnfilteredAccessVLANMoves)), "ok")
+	}
 	s.reconcileLocal(ctx)
 	return networkRecordToInfo(nr), nil
+}
+
+// auditUnfilteredAccessVLANMoves is the audit action of a change to a
+// network's allow_unfiltered_access_vlan_moves.
+const auditUnfilteredAccessVLANMoves = "network.access_vlan_unfiltered_moves"
+
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
 }
 
 func requestVIDs(in []int32) ([]int, error) {
@@ -109,6 +138,11 @@ func requestVIDs(in []int32) ([]int, error) {
 // cluster root. Audited as network.update.
 func (s *Server) setFlatBridgeVLANs(ctx context.Context, req *pb.SetNetworkGuardConfigRequest) (*pb.NetworkInfo, error) {
 	name := req.GetName()
+	if req.GetSetAllowUnfilteredAccessVlanMoves() {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"network %q has no network row (a flat bridge), which cannot hold --allow-unfiltered-access-vlan-moves: "+
+				"create the network (`lv network create`) to set it", name)
+	}
 	if req.GetSetGateway() || req.GetSetReservedAddresses() || !req.GetSetAllowedVlans() {
 		return nil, status.Errorf(codes.InvalidArgument,
 			"network %q has no network row (a flat bridge): only --allowed-vlans can be set on it", name)
@@ -433,6 +467,9 @@ func (s *Server) keepTrunkVLANs(ctx context.Context, name string, def *compose.N
 		}
 		def.AllowedVLANs = sortedVIDs(append(def.AllowedVLANs, still...))
 		def.KeptVLANs = sortedVIDs(append(def.KeptVLANs, old.KeptVLANs...))
+		// Set only by `lv network set` (admin), never from a definition:
+		// a re-deploy keeps it.
+		def.AllowUnfilteredAccessVLANMoves = old.AllowUnfilteredAccessVLANMoves
 		return nil, nil
 	}
 	carried, err = s.carryFlatBridgeVLANs(ctx, name)

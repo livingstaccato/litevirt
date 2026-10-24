@@ -10136,19 +10136,23 @@ func (x *ListNetworksResponse) GetNetworks() []*NetworkInfo {
 }
 
 type NetworkInfo struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	StackName     string                 `protobuf:"bytes,2,opt,name=stack_name,json=stackName,proto3" json:"stack_name,omitempty"`
-	Type          string                 `protobuf:"bytes,3,opt,name=type,proto3" json:"type,omitempty"`
-	Iface         string                 `protobuf:"bytes,4,opt,name=iface,proto3" json:"iface,omitempty"`
-	Subnet        string                 `protobuf:"bytes,5,opt,name=subnet,proto3" json:"subnet,omitempty"`
-	Gateway       string                 `protobuf:"bytes,6,opt,name=gateway,proto3" json:"gateway,omitempty"`
-	Dhcp          bool                   `protobuf:"varint,7,opt,name=dhcp,proto3" json:"dhcp,omitempty"`
-	Vni           int32                  `protobuf:"varint,8,opt,name=vni,proto3" json:"vni,omitempty"`
-	VmCount       int32                  `protobuf:"varint,9,opt,name=vm_count,json=vmCount,proto3" json:"vm_count,omitempty"`
-	Project       string                 `protobuf:"bytes,10,opt,name=project,proto3" json:"project,omitempty"` // owning tenant; empty = global/shared
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Name      string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	StackName string                 `protobuf:"bytes,2,opt,name=stack_name,json=stackName,proto3" json:"stack_name,omitempty"`
+	Type      string                 `protobuf:"bytes,3,opt,name=type,proto3" json:"type,omitempty"`
+	Iface     string                 `protobuf:"bytes,4,opt,name=iface,proto3" json:"iface,omitempty"`
+	Subnet    string                 `protobuf:"bytes,5,opt,name=subnet,proto3" json:"subnet,omitempty"`
+	Gateway   string                 `protobuf:"bytes,6,opt,name=gateway,proto3" json:"gateway,omitempty"`
+	Dhcp      bool                   `protobuf:"varint,7,opt,name=dhcp,proto3" json:"dhcp,omitempty"`
+	Vni       int32                  `protobuf:"varint,8,opt,name=vni,proto3" json:"vni,omitempty"`
+	VmCount   int32                  `protobuf:"varint,9,opt,name=vm_count,json=vmCount,proto3" json:"vm_count,omitempty"`
+	Project   string                 `protobuf:"bytes,10,opt,name=project,proto3" json:"project,omitempty"` // owning tenant; empty = global/shared
+	// allow_unfiltered_access_vlan_moves: the network's opt-in to moving
+	// access-VLAN VMs onto bridges that do not filter VLANs
+	// (SetNetworkGuardConfigRequest). Always false from an older server.
+	AllowUnfilteredAccessVlanMoves bool `protobuf:"varint,11,opt,name=allow_unfiltered_access_vlan_moves,json=allowUnfilteredAccessVlanMoves,proto3" json:"allow_unfiltered_access_vlan_moves,omitempty"`
+	unknownFields                  protoimpl.UnknownFields
+	sizeCache                      protoimpl.SizeCache
 }
 
 func (x *NetworkInfo) Reset() {
@@ -10249,6 +10253,13 @@ func (x *NetworkInfo) GetProject() string {
 		return x.Project
 	}
 	return ""
+}
+
+func (x *NetworkInfo) GetAllowUnfilteredAccessVlanMoves() bool {
+	if x != nil {
+		return x.AllowUnfilteredAccessVlanMoves
+	}
+	return false
 }
 
 type ListLBResponse struct {
@@ -19469,8 +19480,17 @@ type SetNetworkGuardConfigRequest struct {
 	ReservedAddresses    []string               `protobuf:"bytes,5,rep,name=reserved_addresses,json=reservedAddresses,proto3" json:"reserved_addresses,omitempty"`
 	SetAllowedVlans      bool                   `protobuf:"varint,6,opt,name=set_allowed_vlans,json=setAllowedVlans,proto3" json:"set_allowed_vlans,omitempty"`
 	AllowedVlans         []int32                `protobuf:"varint,7,rep,packed,name=allowed_vlans,json=allowedVlans,proto3" json:"allowed_vlans,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// allow_unfiltered_access_vlan_moves (set when set_allow_unfiltered_access_vlan_moves):
+	// whether `lv migrate` and `lv host drain` may move a VM with an access-VLAN NIC
+	// (trunk: with one VLAN) on this network onto a host whose bridge does not filter
+	// VLANs, onto that bridge's untagged segment. Off by default; admin-only and
+	// audited; a network row only (a flat bridge cannot hold it). Starts are refused
+	// on such a bridge whatever it says. An older server ignores both fields: the
+	// reply's allow_unfiltered_access_vlan_moves is how a client tells.
+	SetAllowUnfilteredAccessVlanMoves bool `protobuf:"varint,8,opt,name=set_allow_unfiltered_access_vlan_moves,json=setAllowUnfilteredAccessVlanMoves,proto3" json:"set_allow_unfiltered_access_vlan_moves,omitempty"`
+	AllowUnfilteredAccessVlanMoves    bool `protobuf:"varint,9,opt,name=allow_unfiltered_access_vlan_moves,json=allowUnfilteredAccessVlanMoves,proto3" json:"allow_unfiltered_access_vlan_moves,omitempty"`
+	unknownFields                     protoimpl.UnknownFields
+	sizeCache                         protoimpl.SizeCache
 }
 
 func (x *SetNetworkGuardConfigRequest) Reset() {
@@ -19550,6 +19570,20 @@ func (x *SetNetworkGuardConfigRequest) GetAllowedVlans() []int32 {
 		return x.AllowedVlans
 	}
 	return nil
+}
+
+func (x *SetNetworkGuardConfigRequest) GetSetAllowUnfilteredAccessVlanMoves() bool {
+	if x != nil {
+		return x.SetAllowUnfilteredAccessVlanMoves
+	}
+	return false
+}
+
+func (x *SetNetworkGuardConfigRequest) GetAllowUnfilteredAccessVlanMoves() bool {
+	if x != nil {
+		return x.AllowUnfilteredAccessVlanMoves
+	}
+	return false
 }
 
 type ListNICGuardsRequest struct {
@@ -46779,7 +46813,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05force\x18\x02 \x01(\bR\x05force\"L\n" +
 	"\x14ListNetworksResponse\x124\n" +
-	"\bnetworks\x18\x01 \x03(\v2\x18.litevirt.v1.NetworkInfoR\bnetworks\"\xf7\x01\n" +
+	"\bnetworks\x18\x01 \x03(\v2\x18.litevirt.v1.NetworkInfoR\bnetworks\"\xc3\x02\n" +
 	"\vNetworkInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
@@ -46792,7 +46826,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x03vni\x18\b \x01(\x05R\x03vni\x12\x19\n" +
 	"\bvm_count\x18\t \x01(\x05R\avmCount\x12\x18\n" +
 	"\aproject\x18\n" +
-	" \x01(\tR\aproject\"=\n" +
+	" \x01(\tR\aproject\x12J\n" +
+	"\"allow_unfiltered_access_vlan_moves\x18\v \x01(\bR\x1eallowUnfilteredAccessVlanMoves\"=\n" +
 	"\x0eListLBResponse\x12+\n" +
 	"\x03lbs\x18\x01 \x03(\v2\x19.litevirt.v1.LoadBalancerR\x03lbs\"&\n" +
 	"\x10InspectLBRequest\x12\x12\n" +
@@ -47595,7 +47630,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0fpaused_handover\x18\x03 \x01(\bR\x0epausedHandover\x121\n" +
 	"\x14handover_uncommitted\x18\x04 \x01(\bR\x13handoverUncommitted\".\n" +
 	"\x13ResumeHeldVMRequest\x12\x17\n" +
-	"\avm_name\x18\x01 \x01(\tR\x06vmName\"\xa3\x02\n" +
+	"\avm_name\x18\x01 \x01(\tR\x06vmName\"\xc2\x03\n" +
 	"\x1cSetNetworkGuardConfigRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1f\n" +
 	"\vset_gateway\x18\x02 \x01(\bR\n" +
@@ -47604,7 +47639,9 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x16set_reserved_addresses\x18\x04 \x01(\bR\x14setReservedAddresses\x12-\n" +
 	"\x12reserved_addresses\x18\x05 \x03(\tR\x11reservedAddresses\x12*\n" +
 	"\x11set_allowed_vlans\x18\x06 \x01(\bR\x0fsetAllowedVlans\x12#\n" +
-	"\rallowed_vlans\x18\a \x03(\x05R\fallowedVlans\"/\n" +
+	"\rallowed_vlans\x18\a \x03(\x05R\fallowedVlans\x12Q\n" +
+	"&set_allow_unfiltered_access_vlan_moves\x18\b \x01(\bR!setAllowUnfilteredAccessVlanMoves\x12J\n" +
+	"\"allow_unfiltered_access_vlan_moves\x18\t \x01(\bR\x1eallowUnfilteredAccessVlanMoves\"/\n" +
 	"\x14ListNICGuardsRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\"F\n" +
 	"\x15ListNICGuardsResponse\x12-\n" +

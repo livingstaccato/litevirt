@@ -523,8 +523,11 @@ func networkRecordToInfo(nr *corrosion.NetworkRecord) *pb.NetworkInfo {
 		Subnet    string `json:"subnet"`
 		DHCP      bool   `json:"dhcp"`
 		VNI       int    `json:"vni"`
+		// compose.NetworkDef.AllowUnfilteredAccessVLANMoves
+		AllowUnfiltered bool `json:"AllowUnfilteredAccessVLANMoves"`
 	}
 	if err := json.Unmarshal([]byte(nr.Config), &cfg); err == nil {
+		ni.AllowUnfilteredAccessVlanMoves = cfg.AllowUnfiltered
 		ni.Iface = cfg.Interface
 		ni.Subnet = cfg.Subnet
 		ni.Vni = int32(cfg.VNI)

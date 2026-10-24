@@ -328,3 +328,47 @@ func TestKeptRelease_DropsTheRecordedNoteOfTheEntry(t *testing.T) {
 		t.Fatalf("the note of the released entry is left (stat err=%v)", err)
 	}
 }
+
+// A release whose files are gone and whose kept-disks.json entry is dropped,
+// but whose drop of the entry's recorded file from the note fails, reports
+// that failure, naming the note left behind and saying the files are gone:
+// it is not reported as a success, and nothing later drops that path for it
+// (judgeKeptDisks never sees the entry again).
+//
+// Mutation: ignore forgetKeptRecords' error in the release: red (the
+// release reports success).
+func TestKeptRelease_ReportsARecordedNoteItCouldNotDrop(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	file := s.images.DiskPath("old", "root")
+	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := qcow2.Create(file, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	s.recordKeptDisks(adminCtx(), "old", []KeptDisk{{Path: file, Disk: "root", Host: s.hostName,
+		Reason: "whether another VM uses it cannot be told"}})
+	note := filepath.Join(s.dataDir, "kept-disks", "old.json")
+	prev := keptReleaseBeforeRemove
+	keptReleaseBeforeRemove = func(string) {
+		if err := os.WriteFile(note, []byte("{not json"), 0o600); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { keptReleaseBeforeRemove = prev })
+	_, err := keptRelease(s, "old")
+	if err == nil {
+		t.Fatal("release old succeeded although the note old.json could not be updated; want that failure reported")
+	}
+	for _, want := range []string{note, "removed", "recorded"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("release old = %v; want it naming %q", err, want)
+		}
+	}
+	if _, serr := os.Stat(file); !errors.Is(serr, fs.ErrNotExist) {
+		t.Fatalf("%s is still there after the release (%v)", file, serr)
+	}
+	if records, _ := s.diskKeptRecords(); len(records) != 0 {
+		t.Fatalf("kept-disks.json still records %+v after the release", records)
+	}
+}

@@ -1134,7 +1134,16 @@ func (s *Server) releaseKept(ctx context.Context, req *pb.KeptDisksRequest, acto
 		if len(forget) > 0 {
 			nerr = health.ForgetKeptNoted(s.dataDir, u.vm, forget)
 		}
-		if rerr := s.forgetKeptRecords(u.regs, gone); nerr == nil {
+		rerr := s.forgetKeptRecords(u.regs, gone)
+		var left *keptRecordedNoteLeftError
+		switch {
+		case nerr == nil && errors.As(rerr, &left) && failed == nil:
+			// The release itself is done: only the note's list of what
+			// kept-disks.json recorded is left naming a file that is gone,
+			// and nothing drops it later (judgeKeptDisks never sees the
+			// entry again). Reported as what it is.
+			failed = fmt.Errorf("the files are removed and their kept-disks.json entries dropped; %w", left)
+		case nerr == nil:
 			nerr = rerr
 		}
 		if nerr != nil && failed == nil {
@@ -1294,8 +1303,23 @@ func (s *Server) forgetKeptRecords(regs []diskKeptRecord, gone []string) error {
 	}
 	for _, r := range dropped {
 		if err := health.ForgetKeptRecorded(s.dataDir, r.VM, s.keptRecordedFiles([]KeptDisk{r.KeptDisk})); err != nil {
-			return fmt.Errorf("the note %s still names %s (%w)", filepath.Join(s.dataDir, "kept-disks", r.VM+".json"), r.Path, err)
+			return &keptRecordedNoteLeftError{note: filepath.Join(s.dataDir, "kept-disks", r.VM+".json"), path: r.Path, err: err}
 		}
 	}
 	return nil
 }
+
+// keptRecordedNoteLeftError is a forgetKeptRecords whose entries are
+// dropped and saved, and whose drop of an entry's file from its note's
+// recorded list failed: the note is left naming it.
+type keptRecordedNoteLeftError struct {
+	note, path string
+	err        error
+}
+
+func (e *keptRecordedNoteLeftError) Error() string {
+	return fmt.Sprintf("the note %s still lists %s as recorded (%v): it holds nothing, and nothing drops it later; "+
+		"remove that path from the note's \"recorded\" list, or the note if that is all it lists", e.note, e.path, e.err)
+}
+
+func (e *keptRecordedNoteLeftError) Unwrap() error { return e.err }

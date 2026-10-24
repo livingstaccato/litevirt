@@ -157,105 +157,30 @@ func TestExecuteBatchGuarded_RefusesAnEntryPeersWouldReject(t *testing.T) {
 	}
 }
 
-// legacyEntry wraps stmts as the WAL entry an old build would push.
-func legacyEntry(t *testing.T, c *Client, stmts []Statement) *pb.MutationEntry {
-	t.Helper()
-	b, err := json.Marshal(stmts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &pb.MutationEntry{Seq: 1, Hlc: c.Clock().Now().String(), Origin: "old-build", Stmts: string(b)}
-}
-
-// wireForm round-trips stmts through JSON, as a receiver decodes them.
-func wireForm(t *testing.T, stmts []Statement) []Statement {
-	t.Helper()
-	b, err := json.Marshal(stmts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var out []Statement
-	if err := json.Unmarshal(b, &out); err != nil {
-		t.Fatal(err)
-	}
-	return out
-}
-
-// An entry an old build ALREADY logged in the single-entry shape must drain on
-// an upgraded receiver, or the old node's stream stays stalled until the entry
-// ages out of its log. It applies as exactly the two entries a fixed sender
-// logs: source tombstoned, target pending.
-func TestReplicator_DrainsAlreadyLoggedSingleEntryRelocation(t *testing.T) {
-	for _, tc := range []struct {
-		name      string
-		lifecycle bool
-	}{{"pre-epoch", false}, {"lifecycle", true}} {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
-			src, dst := newTestDB(t), newTestDB(t)
-			seedRelocatableContainer(t, src, "host-a", "web", tc.lifecycle)
-			if _, err := shipWAL(t, src, dst, 0); err != nil {
-				t.Fatalf("ship seed: %v", err)
-			}
-			if tc.lifecycle {
-				if _, err := dst.db.Exec(`UPDATE containers SET owner_epoch = 3, spec_generation = 2
-					WHERE host_name = 'host-a' AND name = 'web'`); err != nil {
-					t.Fatal(err)
-				}
-			}
-			stmts, _ := legacyRelocationStmts(t, src, "host-a", "web", "host-b")
-			if _, err := NewReplicator(dst, "", RelayConfig{}).ApplyRemoteMutations(ctx,
-				[]*pb.MutationEntry{legacyEntry(t, src, stmts)}); err != nil {
-				t.Fatalf("upgraded receiver still refuses the already-logged relocation entry: %v", err)
-			}
-			if s, _ := GetContainer(ctx, dst, "host-a", "web"); s != nil {
-				t.Errorf("source still live: %+v", s)
-			}
-			d, _ := GetContainer(ctx, dst, "host-b", "web")
-			if d == nil || d.RelocateToken != "tok-legacy" || d.State != "pending" {
-				t.Fatalf("target = %+v, want pending with tok-legacy", d)
-			}
-			if tc.lifecycle && d.OwnerEpoch != 3 {
-				t.Errorf("target owner_epoch = %d, want 3", d.OwnerEpoch)
-			}
-		})
-	}
-}
-
-// The exception admits that one shape and nothing near it.
-func TestReplicator_SingleEntryRelocationExceptionIsExact(t *testing.T) {
-	src := newTestDB(t)
+// The single-entry relocation shape (e062efe1 until the split, never in a
+// release) is refused on receipt like any other malformed guarded entry: the
+// receiver applies nothing from it.
+func TestReplicator_RefusesSingleEntryRelocation(t *testing.T) {
+	ctx := context.Background()
+	src, dst := newTestDB(t), newTestDB(t)
 	seedRelocatableContainer(t, src, "host-a", "web", true)
-	vmStmt := Statement{SQL: `INSERT INTO vms (name, host_name, spec, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		Params: []interface{}{"x", "host-b", "{}", "running", nowRFC3339(), src.NowTS()}}
-	for _, tc := range []struct {
-		name   string
-		mutate func([]Statement) []Statement
-	}{
-		{"target renamed", func(s []Statement) []Statement { s[2].Params[1] = "other"; return s }},
-		{"target on the source host", func(s []Statement) []Statement { s[2].Params[0] = "host-a"; return s }},
-		// Same table, same (host, name) leading params, a registered shape —
-		// only the fingerprint says it is not a relocation target.
-		{"other containers shape", func(s []Statement) []Statement {
-			s[2] = Statement{SQL: containerRekeyInsertSQL, Params: s[2].Params}
-			return s
-		}},
-		{"unrelated trailing write", func(s []Statement) []Statement { s[2] = vmStmt; return s }},
-		{"extra trailing write", func(s []Statement) []Statement { return append(s, vmStmt) }},
-		{"target guarded", func(s []Statement) []Statement { s[2].Guard = s[1].Guard; return s }},
-		{"tombstone not second", func(s []Statement) []Statement { return []Statement{s[1], s[0], s[2]} }},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			stmts, _ := legacyRelocationStmts(t, src, "host-a", "web", "host-b")
-			if err := validateReceivedMutationEntry(wireForm(t, tc.mutate(stmts))); !errors.Is(err, ErrInvalidStmt) {
-				t.Fatalf("err = %v, want refusal", err)
-			}
-		})
+	if _, err := shipWAL(t, src, dst, 0); err != nil {
+		t.Fatalf("ship seed: %v", err)
 	}
-	// Control: the unmutated shape is admitted, so each refusal above is its
-	// mutation's doing.
 	stmts, _ := legacyRelocationStmts(t, src, "host-a", "web", "host-b")
-	if err := validateReceivedMutationEntry(wireForm(t, stmts)); err != nil {
-		t.Fatalf("control: the exact legacy shape is refused: %v", err)
+	b, err := json.Marshal(stmts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := &pb.MutationEntry{Seq: 1, Hlc: src.Clock().Now().String(), Origin: "old-build", Stmts: string(b)}
+	if _, err := NewReplicator(dst, "", RelayConfig{}).ApplyRemoteMutations(ctx,
+		[]*pb.MutationEntry{entry}); !errors.Is(err, ErrInvalidStmt) {
+		t.Fatalf("err = %v, want the entry refused", err)
+	}
+	if s, _ := GetContainer(ctx, dst, "host-a", "web"); s == nil {
+		t.Error("the refused entry tombstoned the source")
+	}
+	if d, _ := GetContainer(ctx, dst, "host-b", "web"); d != nil {
+		t.Errorf("the refused entry created the target: %+v", d)
 	}
 }

@@ -43,7 +43,6 @@ var firewallIDNonWriters = map[string]string{
 	"validateGuardedCreateBeginEntry":      "fingerprints a received create-begin envelope",
 	"validateGuardedVMReplaceEntry":        "fingerprints a received guarded-replace envelope",
 	"validateLegacyContainerRekeyEnvelope": "fingerprints a received legacy re-key envelope",
-	"legacyAtomicRelocationEntry":          "fingerprints a received single-entry relocation",
 	"HistoricalShapes":                     "enumerates retained SQL for the compatibility ledger",
 }
 

@@ -1099,11 +1099,16 @@ upload, or the `--server-path` file under the same path check below — only as
 far as its `.ovf` descriptor, and writes nothing on the host: no staging
 directory, no upload file, no extracted disk, no row. The CLI stops uploading
 once the host has the descriptor, so previewing a large OVA does not send its
-disks. The sizes shown are the capacities the descriptor declares; members
-after the descriptor are not read, so an archive the import would refuse
-further in still previews. Other sources (an OVF directory or bare `.ovf`, a
-Proxmox `.conf`, a `.vma`) are inspected the way the import reads them, and an
-upload or unpacked archive is removed once it is parsed.
+disks. The sizes shown are the capacities the descriptor declares. Past the
+descriptor the preview reads only small members (a manifest, a certificate,
+up to 1 MiB) and stops at the first disk, so an archive the import would
+refuse further in still previews. An archive with more than one `.ovf`
+member is refused by the import, naming both; the preview refuses it too
+when the second descriptor is among the small members it reads, but cannot
+see one behind a disk without reading the disk. Other sources (an OVF
+directory or bare `.ovf`, a Proxmox `.conf`, a `.vma`) are inspected the way
+the import reads them, and an upload or unpacked archive is removed once it
+is parsed.
 
 `--server-path`, `--disk-map` and any disk a Proxmox `.conf` names must be
 under the target host's import staging root (`<data_dir>/imports/staging`).

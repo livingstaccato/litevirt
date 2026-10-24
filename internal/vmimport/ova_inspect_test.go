@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -119,5 +121,76 @@ func TestInspectOVA_RefusesWhatTheImportRefuses(t *testing.T) {
 				t.Fatalf("UnpackOVA accepted what the preview refuses")
 			}
 		})
+	}
+}
+
+const ovfOther = `<?xml version="1.0"?><Envelope/>`
+
+// The import refuses an archive with two descriptors, naming both, before it
+// writes the second: the preview describes the first, so importing either
+// could import a VM nobody previewed.
+func TestUnpackOVA_RefusesASecondDescriptor(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ova  []tarMember
+	}{
+		{"behind the disk", []tarMember{
+			{name: "a.ovf", body: []byte(ovfWindowsSCSI)},
+			{name: "disk-0.vmdk", body: make([]byte, 4096)},
+			{name: "b.OVF", body: []byte(ovfOther)},
+		}},
+		{"adjacent", []tarMember{
+			{name: "a.ovf", body: []byte(ovfWindowsSCSI)},
+			{name: "b.OVF", body: []byte(ovfOther)},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dest := t.TempDir()
+			_, err := UnpackOVA(bytes.NewReader(buildTar(t, tc.ova...)), dest, Budget(1<<30))
+			if err == nil || !strings.Contains(err.Error(), `"a.ovf"`) || !strings.Contains(err.Error(), `"b.OVF"`) {
+				t.Fatalf("UnpackOVA err = %v, want a refusal naming a.ovf and b.OVF", err)
+			}
+			if _, err := os.Stat(filepath.Join(dest, "b.OVF")); !os.IsNotExist(err) {
+				t.Fatalf("second descriptor written before the refusal (stat err %v)", err)
+			}
+		})
+	}
+}
+
+// A second descriptor among the small members the preview reads after the
+// first (a manifest, a certificate) is refused, naming both.
+func TestInspectOVA_RefusesASecondDescriptorItReads(t *testing.T) {
+	ova := buildTar(t,
+		tarMember{name: "a.ovf", body: []byte(ovfWindowsSCSI)},
+		tarMember{name: "a.mf", body: []byte("SHA256(a.ovf)= 00\n")},
+		tarMember{name: "b.ovf", body: []byte(ovfOther)},
+		tarMember{name: "disk-0.vmdk", body: make([]byte, 4096)},
+	)
+	_, err := InspectOVA(bytes.NewReader(ova))
+	if err == nil || !strings.Contains(err.Error(), `"a.ovf"`) || !strings.Contains(err.Error(), `"b.ovf"`) {
+		t.Fatalf("InspectOVA err = %v, want a refusal naming a.ovf and b.ovf", err)
+	}
+}
+
+// A second descriptor behind a disk is out of the preview's sight: reading
+// to it would read the disk. The preview describes the first descriptor
+// without reading the disk, and the import refuses the archive.
+func TestInspectOVA_SecondDescriptorBehindADiskIsLeftToTheImport(t *testing.T) {
+	disk := make([]byte, 4<<20)
+	ova := buildTar(t,
+		tarMember{name: "a.ovf", body: []byte(ovfWindowsSCSI)},
+		tarMember{name: "disk-0.vmdk", body: disk},
+		tarMember{name: "b.ovf", body: []byte(ovfOther)},
+	)
+	cr := &countingReader{r: bytes.NewReader(ova)}
+	data, err := InspectOVA(cr)
+	if err != nil || string(data) != ovfWindowsSCSI {
+		t.Fatalf("InspectOVA = %d bytes, %v; want the first descriptor", len(data), err)
+	}
+	if cr.n >= len(disk) {
+		t.Fatalf("InspectOVA read %d bytes: it read the disk", cr.n)
+	}
+	if _, err := UnpackOVA(bytes.NewReader(ova), t.TempDir(), Budget(1<<30)); err == nil || !strings.Contains(err.Error(), "more than one .ovf") {
+		t.Fatalf("UnpackOVA err = %v, want the second-descriptor refusal", err)
 	}
 }

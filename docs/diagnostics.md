@@ -3495,9 +3495,12 @@ that host is judged by the disk files there (every file under
 `<data_dir>/mounts` and the directory of every file-based pool of the host,
 usable or not, following any symlink below them, every file a note names,
 and every set-aside `.kept-` or `.superseded-` copy beside any local disk a
-disk row names): it is refused when one of them is, or backs on, a path it
-writes, and refused whatever its name when one of them, or a directory of
-them, cannot be read either, which `creates_refused` then names too. A create
+disk row names; only regular files are opened, nothing on a pseudo-filesystem
+such as `/proc` or `/sys` is listed or read, and a scan past 250,000 files,
+4 GiB of headers read or 2 minutes stops): it is refused when one of them is,
+or backs on, a path it writes, and refused whatever its name when one of
+them, or a directory of them, cannot be read, or the scan stops, either,
+which `creates_refused` then names too. A create
 that clears a file an earlier VM of its name left is refused. Any other goes
 ahead, as does a create or clone with no disk file, or with every disk on
 shared nfs, ceph or iscsi storage outside the disk directory. A migration's

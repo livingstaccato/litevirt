@@ -521,7 +521,12 @@ var errKeptScanPoolsUnread = errors.New("this host's storage pools cannot be rea
 // each kept-disks.json entry of this host still held in memory. A symlink
 // below a directory it lists is followed (keptScanFollow): a directory it
 // names is listed once, by its resolved path, and a file it names is read;
-// one that cannot be followed is an error. It returns how the first file
+// one that cannot be followed is an error. Nothing on a pseudo-filesystem
+// (/proc, /sys, ...: keptScanPseudoFS) is listed or read, only a regular
+// file is ever opened, and that without blocking (keptScanBudget.open), and
+// a scan past its budget of files, bytes read or time (keptScanMaxFiles,
+// keptScanMaxBytes, keptScanMaxTime) is an error naming it: a link below a
+// root can name the whole host. It returns how the first file
 // that is, or backs on, a path in writes (compared as the missing-base
 // check compares: each side with its directory resolved
 // through symlinks) collides, or "" when none does; a directory, a pool row
@@ -554,6 +559,7 @@ func (s *Server) keptCollisionScan(ctx context.Context, writes *keptWrites) (str
 	if err != nil {
 		return "", err
 	}
+	b := newKeptScanBudget()
 	listed := map[string]bool{}
 	for len(dirs) > 0 {
 		dir := filepath.Clean(dirs[len(dirs)-1])
@@ -562,6 +568,22 @@ func (s *Server) keptCollisionScan(ctx context.Context, writes *keptWrites) (str
 			continue
 		}
 		listed[dir] = true
+		if err := b.look(); err != nil {
+			return "", err
+		}
+		// A pseudo-filesystem (/proc, /sys, ...) holds no disk, and reading
+		// one can block or consume (/proc/kmsg): not listed, by its type,
+		// whatever path reached it.
+		pseudo, err := storage.Bounded("statfs", dir, func() (bool, error) {
+			_, p, err := keptScanPseudoFS(dir)
+			return p, err
+		})
+		if errors.Is(err, fs.ErrNotExist) || pseudo {
+			continue
+		}
+		if err != nil {
+			return "", fmt.Errorf("the disk directory %s on this host cannot be listed (%w)", dir, err)
+		}
 		ents, err := storage.Bounded("list", dir, func() ([]os.DirEntry, error) { return os.ReadDir(dir) })
 		if errors.Is(err, fs.ErrNotExist) {
 			continue
@@ -570,6 +592,9 @@ func (s *Server) keptCollisionScan(ctx context.Context, writes *keptWrites) (str
 			return "", fmt.Errorf("the disk directory %s on this host cannot be listed (%w)", dir, err)
 		}
 		for _, e := range ents {
+			if err := b.look(); err != nil {
+				return "", err
+			}
 			switch p := filepath.Join(dir, e.Name()); {
 			case e.IsDir():
 				dirs = append(dirs, p)
@@ -653,9 +678,12 @@ func (s *Server) keptCollisionScan(ctx context.Context, writes *keptWrites) (str
 			missing string
 		}
 		w, err := storage.Bounded("read the backing chain of", p, func() (walked, error) {
-			l, m, _, err := walkKeptChain(stat, p, true)
+			l, m, _, err := walkKeptChainIn(b, stat, p, true)
 			return walked{l, m}, err
 		})
+		if errors.Is(err, errKeptScanBudget) {
+			return "", err
+		}
 		if err != nil {
 			return "", fmt.Errorf("the backing chain of %s on this host cannot be read (%w)", p, err)
 		}
@@ -688,7 +716,8 @@ func (s *Server) keptCollisionScan(ctx context.Context, writes *keptWrites) (str
 // keptScanFollow resolves the symlink p for keptCollisionScan, bounded: the
 // path it names with every symlink resolved, and whether that is a
 // directory; "" for something that is neither a directory nor a regular
-// file. A link naming nothing is fs.ErrNotExist.
+// file, or that is on a pseudo-filesystem (keptScanPseudoFS). A link
+// naming nothing is fs.ErrNotExist.
 func keptScanFollow(p string) (string, bool, error) {
 	type followed struct {
 		path  string
@@ -703,13 +732,15 @@ func keptScanFollow(p string) (string, bool, error) {
 		if err != nil {
 			return followed{}, err
 		}
-		switch {
-		case fi.IsDir():
-			return followed{r, true}, nil
-		case fi.Mode().IsRegular():
-			return followed{r, false}, nil
+		if !fi.IsDir() && !fi.Mode().IsRegular() {
+			return followed{}, nil
 		}
-		return followed{}, nil
+		// What a link names on a pseudo-filesystem (/proc, /sys, ...) is
+		// neither listed nor read: it holds no disk.
+		if _, pseudo, err := keptScanPseudoFS(r); err != nil || pseudo {
+			return followed{}, err
+		}
+		return followed{r, fi.IsDir()}, nil
 	})
 	return f.path, f.isDir, err
 }

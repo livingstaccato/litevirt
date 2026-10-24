@@ -189,6 +189,14 @@ func keptBackingPath(overlay, b string) (path string, dotdot bool, err error) {
 // walkKeptChain reads file's chain for keptChainLayers,
 // keptChainLayersToMissing and keptChainWalk, statting each layer with stat.
 func walkKeptChain(stat func(string) (os.FileInfo, error), file string, stopAtMissing bool) ([]string, string, int, error) {
+	return walkKeptChainIn(nil, stat, file, stopAtMissing)
+}
+
+// walkKeptChainIn is walkKeptChain, with each layer's header read within b
+// when b is not nil (keptCollisionScan): opened by b.open, which opens only
+// a regular file on no pseudo-filesystem and never blocks, read through
+// that one open file, and charged to b.
+func walkKeptChainIn(b *keptScanBudget, stat func(string) (os.FileInfo, error), file string, stopAtMissing bool) ([]string, string, int, error) {
 	var out []string
 	path, declaredQcow2 := file, false
 	dotdot := -1
@@ -207,7 +215,7 @@ func walkKeptChain(stat func(string) (os.FileInfo, error), file string, stopAtMi
 		if !fi.Mode().IsRegular() {
 			return out, "", dotdot, nil
 		}
-		isQ, err := hasQcow2Magic(path)
+		isQ, info, err := keptLayerHeader(b, path)
 		if err != nil {
 			return nil, "", -1, fmt.Errorf("%s: %w", path, err)
 		}
@@ -216,10 +224,6 @@ func walkKeptChain(stat func(string) (os.FileInfo, error), file string, stopAtMi
 				return nil, "", -1, fmt.Errorf("%s: the overlay above it declares it qcow2, and it has no qcow2 header", path)
 			}
 			return out, "", dotdot, nil
-		}
-		info, err := qcow2.Info(path)
-		if err != nil {
-			return nil, "", -1, fmt.Errorf("%s: %w", path, err)
 		}
 		if info.BackingFile == "" || looksLikeProtocol(info.BackingFile) {
 			return out, "", dotdot, nil
@@ -234,6 +238,48 @@ func walkKeptChain(stat func(string) (os.FileInfo, error), file string, stopAtMi
 		path, declaredQcow2 = next, info.BackingFormat == "qcow2"
 	}
 	return nil, "", -1, fmt.Errorf("%s: backing chain deeper than %d", file, maxBackingDepth)
+}
+
+// keptLayerHeader reads whether the layer at path is qcow2 and, when it
+// is, its image info: by name with a nil b, as before; within b otherwise.
+func keptLayerHeader(b *keptScanBudget, path string) (bool, *qcow2.ImageInfo, error) {
+	if b == nil {
+		isQ, err := hasQcow2Magic(path)
+		if err != nil || !isQ {
+			return false, nil, err
+		}
+		info, err := qcow2.Info(path)
+		return err == nil, info, err
+	}
+	f, err := b.open(path)
+	if err != nil {
+		return false, nil, err
+	}
+	defer f.Close()
+	var m [4]byte
+	_, err = f.ReadAt(m[:], 0)
+	if cerr := b.charge(int64(len(m))); cerr != nil {
+		return false, nil, cerr
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return false, nil, nil
+	}
+	if err != nil {
+		return false, nil, err
+	}
+	if binary.BigEndian.Uint32(m[:]) != qcow2.Magic {
+		return false, nil, nil
+	}
+	info, err := qcow2.InfoFile(f)
+	if err != nil {
+		return false, nil, err
+	}
+	// What InfoFile read, at most: the header and its extensions all lie in
+	// the first cluster, and the backing file's name.
+	if err := b.charge(int64(info.ClusterSize) + int64(len(info.BackingFile))); err != nil {
+		return false, nil, err
+	}
+	return true, info, nil
 }
 
 // hasQcow2Magic reports whether path starts with the qcow2 magic.

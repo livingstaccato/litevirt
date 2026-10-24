@@ -194,3 +194,70 @@ func TestInspectOVA_SecondDescriptorBehindADiskIsLeftToTheImport(t *testing.T) {
 		t.Fatalf("UnpackOVA err = %v, want the second-descriptor refusal", err)
 	}
 }
+
+// A second descriptor whose name is not canonical ("a.ovf/.", "a.ovf/x/..",
+// "a.ovf\.") is still a descriptor: the import writes it, flattened, over
+// the first. Both the preview and the import judge a member by the name the
+// import writes it under, so both refuse the archive; otherwise the preview
+// would describe one VM and the import create another.
+func TestOVA_ANonCanonicalSecondDescriptorIsRefusedByPreviewAndImport(t *testing.T) {
+	for _, second := range []string{"a.ovf/.", "a.ovf/x/..", `a.ovf\.`, "sub/./a.ovf"} {
+		t.Run(second, func(t *testing.T) {
+			ova := buildTar(t,
+				tarMember{name: "a.ovf", body: []byte(ovfWindowsSCSI)},
+				tarMember{name: second, body: []byte(ovfOther)},
+				tarMember{name: "disk-0.vmdk", body: make([]byte, 4096)},
+			)
+			if _, err := InspectOVA(bytes.NewReader(ova)); err == nil || !strings.Contains(err.Error(), "more than one .ovf") {
+				t.Fatalf("InspectOVA err = %v, want the second-descriptor refusal", err)
+			}
+			dest := t.TempDir()
+			_, err := UnpackOVA(bytes.NewReader(ova), dest, Budget(1<<30))
+			if err == nil || !strings.Contains(err.Error(), "more than one .ovf") {
+				t.Fatalf("UnpackOVA err = %v, want the second-descriptor refusal", err)
+			}
+			if got, _ := os.ReadFile(filepath.Join(dest, "a.ovf")); string(got) != ovfWindowsSCSI {
+				t.Fatalf("the first descriptor was overwritten before the refusal: %q", got)
+			}
+		})
+	}
+}
+
+// Two members that flatten to one name would have the second overwrite the
+// first. The import refuses the second before writing it, and so does the
+// preview for the members it reads.
+func TestOVA_AMemberRepeatingAnEarlierFlattenedNameIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ova  []tarMember
+	}{
+		{"disk before the descriptor", []tarMember{
+			{name: "disk-0.vmdk", body: []byte("first")},
+			{name: "x/disk-0.vmdk", body: []byte("second")},
+			{name: "a.ovf", body: []byte(ovfWindowsSCSI)},
+		}},
+		{"manifest after the descriptor", []tarMember{
+			{name: "a.ovf", body: []byte(ovfWindowsSCSI)},
+			{name: "a.mf", body: []byte("first")},
+			{name: "y/a.mf", body: []byte("second")},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ova := buildTar(t, tc.ova...)
+			if _, err := InspectOVA(bytes.NewReader(ova)); err == nil || !strings.Contains(err.Error(), "repeats") {
+				t.Fatalf("InspectOVA err = %v, want the repeated-name refusal", err)
+			}
+			dest := t.TempDir()
+			if _, err := UnpackOVA(bytes.NewReader(ova), dest, Budget(1<<30)); err == nil || !strings.Contains(err.Error(), "repeats") {
+				t.Fatalf("UnpackOVA err = %v, want the repeated-name refusal", err)
+			}
+			first := filepath.Base(tc.ova[0].name)
+			if tc.name == "manifest after the descriptor" {
+				first = "a.mf"
+			}
+			if got, _ := os.ReadFile(filepath.Join(dest, first)); string(got) != "first" {
+				t.Fatalf("%s was overwritten before the refusal: %q", first, got)
+			}
+		})
+	}
+}

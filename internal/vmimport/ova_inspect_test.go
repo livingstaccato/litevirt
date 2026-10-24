@@ -111,6 +111,10 @@ func TestInspectOVA_RefusesWhatTheImportRefuses(t *testing.T) {
 		{"symlink", []tarMember{{name: "evil.vmdk", typ: tar.TypeSymlink}, {name: "a.ovf", body: []byte(ovfWindowsSCSI)}}, "disallowed type"},
 		{"member cap", many, "member cap"},
 		{"no descriptor", []tarMember{{name: "disk.vmdk", body: []byte("x")}}, "no .ovf descriptor"},
+		{"empty name", []tarMember{{name: "", body: []byte("x")}, {name: "a.ovf", body: []byte(ovfWindowsSCSI)}}, "empty archive member name"},
+		{"root name", []tarMember{{name: "/.", body: []byte("x")}, {name: "a.ovf", body: []byte(ovfWindowsSCSI)}}, "empty archive member name"},
+		{"dot name", []tarMember{{name: ".", body: []byte("x")}, {name: "a.ovf", body: []byte(ovfWindowsSCSI)}}, "empty archive member name"},
+		{"empty name after the descriptor", []tarMember{{name: "a.ovf", body: []byte(ovfWindowsSCSI)}, {name: "x/..", body: []byte("x")}}, "empty archive member name"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ova := buildTar(t, tc.ova...)

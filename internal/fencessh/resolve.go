@@ -18,14 +18,12 @@ const installHint = "run `lv host install-fence-ssh` and check `lv doctor fence`
 // target's host_fence_ssh row as this node holds it:
 //
 //   - no row: the legacy path, unpinned — today's fence, for a host that has
-//     not published (the release has not latched, enforcement.fence_ssh:
-//     legacy on it, or a certificate with no fence address).
-//     enforcement.fence_ssh: managed refuses it, and so does auto once
-//     release_2026_12_v1 has latched here: from then on every host not in
-//     legacy publishes, so a row-less target has not synced yet or never
-//     will, and an unpinned fence of it would power off whatever answers at
-//     its address and count that a success. legacy still takes it (the
-//     stand-down).
+//     not published (the release has not latched, or a certificate with no
+//     fence address). enforcement.fence_ssh: managed refuses it, and so does
+//     auto once release_2026_12_v1 has latched here: from then on every host
+//     publishes, so a row-less target has not synced yet or never will, and an
+//     unpinned fence of it would power off whatever answers at its address and
+//     count that a success.
 //   - a row that does not verify (forged, revoked, retired): refused. A host
 //     that has published is never fenced without its pin, whatever the mode,
 //     so breaking a row never earns an unchecked fence.
@@ -35,7 +33,7 @@ const installHint = "run `lv host install-fence-ssh` and check `lv doctor fence`
 //     false one (a peer it was not provisioned for, an evaluation that
 //     failed) must not make it unfenceable, and trying the managed key is
 //     never less safe than refusing: pin, restricted key, from= and forced
-//     command all still apply. legacy mode takes the pinned path.
+//     command all still apply.
 //   - a verified row whose host never accepted it: the legacy path with its
 //     sshd keys pinned; managed mode refuses.
 //
@@ -65,9 +63,8 @@ func (a *Agent) fenceConfig(ctx context.Context, target, request string) (fence.
 			return refuse("enforcement.fence_ssh is auto and release_2026_12_v1 has latched, but %s has published no "+
 				"fence ssh row, so it is not fenced without a pinned host key, and its workloads are not recovered "+
 				"on this fence. A host just admitted publishes one on its daemon's first sync, within about 30s of "+
-				"its daemon starting, and is refused until then; one in enforcement.fence_ssh: legacy, or whose "+
-				"certificate names no single fence address, never does. %s. `lv doctor fence` lists every host "+
-				"refused this way; enforcement.fence_ssh: legacy on this host fences it unpinned",
+				"its daemon starting, and is refused until then; one whose certificate names no single fence "+
+				"address never does. %s. `lv doctor fence` lists every host refused this way",
 				target, fence.NotFencedWayOut(target)), nil
 		}
 		return fence.SSHFence{Path: fence.SSHPathLegacy}, nil
@@ -93,9 +90,6 @@ func (a *Agent) fenceConfig(ctx context.Context, target, request string) (fence.
 				"path cannot tell the two apart: regenerate the sshd host keys on one of them", why, other, target)
 		}
 		return pinned
-	}
-	if mode == ModeLegacy {
-		return pinnedOr("enforcement.fence_ssh is legacy"), v
 	}
 	if !v.Accepting && !v.EverAccepting {
 		if mode == ModeManaged {

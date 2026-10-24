@@ -812,9 +812,8 @@ type EnforcementConfig struct {
 	// fence key path only, and fails a fence toward a host whose sshd does
 	// not accept it; "auto" (the default, "" included) uses the managed path
 	// toward a host that accepts it and the legacy path with the host's
-	// published sshd keys pinned toward one that does not; "legacy" never
-	// uses the managed path (the kill switch), pinned wherever a host has
-	// published. No mode fences a host that has published a fence ssh row
+	// published sshd keys pinned toward one that does not. Any other value
+	// fails LoadConfig. No mode fences a host that has published a fence ssh row
 	// without its pinned host key. Not a capability: the fence is decided
 	// where it is created, and no peer relies on another's setting. `lv host
 	// init` writes managed for a new cluster; `lv host add` copies the
@@ -1222,7 +1221,12 @@ func LoadConfig() (*Config, error) {
 	}
 
 	if !fencessh.ValidMode(cfg.Enforcement.FenceSSH) {
-		return nil, fmt.Errorf("invalid enforcement.fence_ssh %q: managed, auto or legacy", cfg.Enforcement.FenceSSH)
+		removed := ""
+		if fencessh.RemovedMode(cfg.Enforcement.FenceSSH) {
+			removed = " (an earlier build's mode, removed in this one)"
+		}
+		return nil, fmt.Errorf("invalid enforcement.fence_ssh %q%s: the valid values are auto (the default) and managed; %s",
+			cfg.Enforcement.FenceSSH, removed, fencessh.ModeFix)
 	}
 	if cfg.FenceSSHProbeIntervalSec != nil && *cfg.FenceSSHProbeIntervalSec < 0 {
 		return nil, fmt.Errorf("invalid fence_ssh_probe_interval_sec %d: 0 disables the probe", *cfg.FenceSSHProbeIntervalSec)

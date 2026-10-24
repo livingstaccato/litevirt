@@ -45,31 +45,24 @@ func TestFenceConfig_Decisions(t *testing.T) {
 		gate gateKind
 	}{
 		{"no row, auto: legacy unpinned", noRow, fencessh.ModeAuto, fence.SSHPathLegacy, "", gateClosed},
-		{"no row, legacy: legacy unpinned", noRow, fencessh.ModeLegacy, fence.SSHPathLegacy, "", gateClosed},
 		{"no row, managed: refused", noRow, fencessh.ModeManaged, "", "published no fence ssh row", gateClosed},
 		{"forged row, auto: refused", forged, fencessh.ModeAuto, "", "does not verify", gateClosed},
-		{"forged row, legacy: refused", forged, fencessh.ModeLegacy, "", "does not verify", gateClosed},
 		{"retired row, auto: refused", retired, fencessh.ModeAuto, "", "does not verify", gateClosed},
 		{"not accepting, auto: pinned", notAccepting, fencessh.ModeAuto, fence.SSHPathPinned, "", gateClosed},
 		{"not accepting, managed: refused", notAccepting, fencessh.ModeManaged, "", "does not accept the managed fence key", gateClosed},
 		{"accepting, auto: managed", accepting, fencessh.ModeAuto, fence.SSHPathManaged, "", gateClosed},
 		{"accepting, managed: managed", accepting, fencessh.ModeManaged, fence.SSHPathManaged, "", gateClosed},
-		{"accepting, legacy: pinned", accepting, fencessh.ModeLegacy, fence.SSHPathPinned, "", gateClosed},
 		{"was accepting, auto: still the managed key", wasAccepting, fencessh.ModeAuto, fence.SSHPathManaged, "", gateClosed},
 		{"was accepting, managed: still the managed key", wasAccepting, fencessh.ModeManaged, fence.SSHPathManaged, "", gateClosed},
-		{"was accepting, legacy: pinned", wasAccepting, fencessh.ModeLegacy, fence.SSHPathPinned, "", gateClosed},
 		{"deleted host, auto: legacy unpinned", deleted, fencessh.ModeAuto, fence.SSHPathLegacy, "", gateClosed},
 
 		{"latched, no row, auto: refused", noRow, fencessh.ModeAuto, "", "published no fence ssh row", gateOpen},
-		{"latched, no row, legacy: legacy unpinned", noRow, fencessh.ModeLegacy, fence.SSHPathLegacy, "", gateOpen},
 		{"latched, no row, managed: refused", noRow, fencessh.ModeManaged, "", "published no fence ssh row", gateOpen},
 		{"latched, deleted host, auto: refused", deleted, fencessh.ModeAuto, "", "published no fence ssh row", gateOpen},
-		{"latched, deleted host, legacy: legacy unpinned", deleted, fencessh.ModeLegacy, fence.SSHPathLegacy, "", gateOpen},
 		{"latched, retired row, auto: refused", retired, fencessh.ModeAuto, "", "does not verify", gateOpen},
 		{"latched, forged row, auto: refused", forged, fencessh.ModeAuto, "", "does not verify", gateOpen},
 		{"latched, not accepting, auto: pinned", notAccepting, fencessh.ModeAuto, fence.SSHPathPinned, "", gateOpen},
 		{"latched, accepting, auto: managed", accepting, fencessh.ModeAuto, fence.SSHPathManaged, "", gateOpen},
-		{"latched, accepting, legacy: pinned", accepting, fencessh.ModeLegacy, fence.SSHPathPinned, "", gateOpen},
 
 		{"nil gate, no row, auto: legacy unpinned", noRow, fencessh.ModeAuto, fence.SSHPathLegacy, "", gateNil},
 	}
@@ -153,11 +146,14 @@ func TestFenceConfig_LatchedAutoRefusesUntilFirstSync(t *testing.T) {
 	agent := a.gatedAgent(fencessh.ModeAuto, openGate{t})
 	sf := agent.FenceConfig(ctx, "node-x")
 	for _, want := range []string{"release_2026_12_v1 has latched", "node-x has published no fence ssh row",
-		"first sync", "`lv doctor fence`", "enforcement.fence_ssh: legacy",
+		"first sync", "names no single fence address", "`lv doctor fence`",
 		"run `lv host fence-confirm node-x`", "ipmi or redfish fence strategy"} {
 		if sf.Refusal == "" || !strings.Contains(sf.Refusal, want) {
 			t.Fatalf("FenceConfig before node-x's first sync = %+v, want a refusal containing %q", sf, want)
 		}
+	}
+	if strings.Contains(sf.Refusal, "legacy") {
+		t.Fatalf("the refusal %q names a stand-down that no longer exists", sf.Refusal)
 	}
 	if err := x.publisher(false, false).Sync(ctx); err != nil {
 		t.Fatal(err)
@@ -187,9 +183,6 @@ func TestFenceConfig_ClonedHostKeysRefuseThePinnedPath(t *testing.T) {
 		!strings.Contains(sf.Refusal, "node-y publishes one of node-x's sshd host keys") {
 		t.Fatalf("pinned path toward a cloned host = %+v, want refused", sf)
 	}
-	if sf := a.agent(fencessh.ModeLegacy).FenceConfig(ctx, "node-y"); sf.Refusal == "" {
-		t.Fatalf("legacy-mode pinned path toward a cloned host = %+v, want refused", sf)
-	}
 	if sf := a.agent(fencessh.ModeAuto).FenceConfig(ctx, "node-y"); sf.Refusal != "" || sf.Path != fence.SSHPathManaged {
 		t.Fatalf("managed path toward a cloned host = %+v, want managed", sf)
 	}
@@ -209,10 +202,8 @@ func TestFenceConfig_UncheckableClonedKeysRefuseThePinnedPath(t *testing.T) {
 		t.Fatalf("FenceConfig with the listing working = %+v, want pinned", sf)
 	}
 	defer fencessh.FailHostFenceSSHListForTest(errors.New("database is locked"))()
-	for _, mode := range []string{fencessh.ModeAuto, fencessh.ModeLegacy} {
-		if sf := a.agent(mode).FenceConfig(ctx, "node-x"); sf.Refusal == "" ||
-			!strings.Contains(sf.Refusal, "cannot check whether another host publishes node-x's sshd host keys") {
-			t.Fatalf("%s: FenceConfig with the listing failing = %+v, want refused", mode, sf)
-		}
+	if sf := a.agent(fencessh.ModeAuto).FenceConfig(ctx, "node-x"); sf.Refusal == "" ||
+		!strings.Contains(sf.Refusal, "cannot check whether another host publishes node-x's sshd host keys") {
+		t.Fatalf("FenceConfig with the listing failing = %+v, want refused", sf)
 	}
 }

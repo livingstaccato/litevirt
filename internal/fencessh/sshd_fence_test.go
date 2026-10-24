@@ -34,7 +34,6 @@ func TestFence_WrongAddressIsRefused(t *testing.T) {
 	}{
 		{"managed path", fencessh.ModeAuto, true, "path=managed"},
 		{"legacy path, pinned", fencessh.ModeAuto, false, "path=legacy-pinned"},
-		{"legacy mode, pinned", fencessh.ModeLegacy, true, "path=legacy-pinned"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := newWorld(t)

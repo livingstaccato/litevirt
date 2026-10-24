@@ -7,11 +7,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -28,6 +31,27 @@ type mockUpgradeClient struct {
 	// phase assertions on `stream` aren't disturbed by the new prestage pass.
 	preStageStream *mockUpgradeStream
 	preStageErr    error
+	preStageCalls  int
+
+	// fenceModes is each host's reported enforcement.fence_ssh (auto when
+	// unset); fenceErr fails the read.
+	fenceModes map[string]string
+	fenceErr   error
+}
+
+func (m *mockUpgradeClient) GetFenceSSHStatus(_ context.Context, _ *pb.FenceSSHStatusRequest, _ ...grpc.CallOption) (*pb.FenceSSHStatus, error) {
+	if m.fenceErr != nil {
+		return nil, m.fenceErr
+	}
+	st := &pb.FenceSSHStatus{}
+	for _, h := range m.hosts {
+		mode := m.fenceModes[h.Name]
+		if mode == "" {
+			mode = "auto"
+		}
+		st.Nodes = append(st.Nodes, &pb.FenceSSHNode{Host: h.Name, Reachable: true, Mode: mode})
+	}
+	return st, nil
 }
 
 func (m *mockUpgradeClient) UpgradeHost(_ context.Context, _ ...grpc.CallOption) (grpc.ClientStreamingClient[pb.UpgradeHostRequest, pb.UpgradeHostResponse], error) {
@@ -38,6 +62,7 @@ func (m *mockUpgradeClient) UpgradeHost(_ context.Context, _ ...grpc.CallOption)
 }
 
 func (m *mockUpgradeClient) PreStageUpgrade(_ context.Context, _ ...grpc.CallOption) (grpc.ClientStreamingClient[pb.UpgradeHostRequest, pb.UpgradeHostResponse], error) {
+	m.preStageCalls++
 	if m.preStageErr != nil {
 		return nil, m.preStageErr
 	}
@@ -295,6 +320,51 @@ func TestHostUpgrade_NamedHostNotSkippedOnVersionMatch(t *testing.T) {
 	}
 	if len(stream.sent) == 0 {
 		t.Error("explicitly named same-version host was skipped (should be re-deployed)")
+	}
+}
+
+// TestHostUpgrade_RefusesALegacyFenceSSHTarget: a target whose daemon still
+// reports enforcement.fence_ssh: legacy would not start on this binary, which
+// refuses the value, so the upgrade is refused with the fix before anything is
+// pre-staged or swapped, --force included. A member left on its binary is not
+// refused (it is not swapped), and a read that fails refuses nothing: the
+// daemon checks its config at start.
+func TestHostUpgrade_RefusesALegacyFenceSSHTarget(t *testing.T) {
+	dir := t.TempDir()
+	binaryPath := filepath.Join(dir, "litevirtd")
+	os.WriteFile(binaryPath, []byte("binary"), 0755)
+	hosts := []*pb.Host{{Name: "node1", Address: "10.0.0.1", Version: "v1.0.0"},
+		{Name: "node2", Address: "10.0.0.2", Version: "v1.0.0"}}
+
+	for _, force := range []bool{false, true} {
+		stream := &mockUpgradeStream{response: &pb.UpgradeHostResponse{Status: "ok", NewVersion: "v1.0.1"}}
+		client := &mockUpgradeClient{stream: stream, hosts: hosts, fenceModes: map[string]string{"node2": "legacy"}}
+		err := HostUpgrade(context.Background(), client, UpgradeOpts{BinaryPath: binaryPath,
+			HostNames: []string{"node1", "node2"}, Yes: true, Force: force})
+		if err == nil || !strings.Contains(err.Error(), "node2") ||
+			!strings.Contains(err.Error(), "set enforcement.fence_ssh to auto or managed") {
+			t.Fatalf("force=%v: HostUpgrade with node2 on legacy = %v, want refused with the fix", force, err)
+		}
+		if strings.Contains(err.Error(), "node1") {
+			t.Fatalf("force=%v: node1 (auto) is named in the refusal: %v", force, err)
+		}
+		if client.preStageCalls != 0 || len(stream.sent) != 0 {
+			t.Fatalf("force=%v: %d pre-stage(s) and %d chunk(s) sent before the refusal", force, client.preStageCalls, len(stream.sent))
+		}
+	}
+
+	stream := &mockUpgradeStream{response: &pb.UpgradeHostResponse{Status: "ok", NewVersion: "v1.0.1"}}
+	client := &mockUpgradeClient{stream: stream, hosts: hosts, fenceModes: map[string]string{"node2": "legacy"}}
+	if err := HostUpgrade(context.Background(), client, UpgradeOpts{BinaryPath: binaryPath,
+		HostNames: []string{"node1"}, Yes: true}); err != nil || len(stream.sent) == 0 {
+		t.Fatalf("upgrade of node1 alone, node2 on legacy left on its binary = %v (%d chunks), want it upgraded", err, len(stream.sent))
+	}
+
+	stream = &mockUpgradeStream{response: &pb.UpgradeHostResponse{Status: "ok", NewVersion: "v1.0.1"}}
+	client = &mockUpgradeClient{stream: stream, hosts: hosts, fenceErr: status.Error(codes.Unimplemented, "unknown method")}
+	if err := HostUpgrade(context.Background(), client, UpgradeOpts{BinaryPath: binaryPath,
+		HostNames: []string{"node1"}, Yes: true}); err != nil || len(stream.sent) == 0 {
+		t.Fatalf("upgrade with the fence ssh read failing = %v (%d chunks), want it upgraded", err, len(stream.sent))
 	}
 }
 

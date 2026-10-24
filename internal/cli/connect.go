@@ -62,6 +62,15 @@ var cliNotice io.Writer = os.Stderr
 // geteuid is os.Geteuid. Variable for testing.
 var geteuid = os.Geteuid
 
+// RunAsRootForTests makes the root-only local channel treat this process as
+// root, for tests in other packages that dial it as an unprivileged user.
+// It returns the restore func.
+func RunAsRootForTests() (restore func()) {
+	saved := geteuid
+	geteuid = func() int { return 0 }
+	return func() { geteuid = saved }
+}
+
 // LoadClusterConfig reads the cluster config.
 // Priority: 1) LV_HOST env var → remote gRPC/mTLS mode
 //  2. the daemon's endpoint file, /run/litevirt/endpoint → local mode

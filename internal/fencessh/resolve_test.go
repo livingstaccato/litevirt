@@ -11,6 +11,15 @@ import (
 	"github.com/litevirt/litevirt/internal/fencessh"
 )
 
+// gateKind is the release gate an agent in TestFenceConfig_Decisions has.
+type gateKind int
+
+const (
+	gateClosed gateKind = iota
+	gateOpen
+	gateNil
+)
+
 // TestFenceConfig_Decisions pins how a fence from node-a reaches node-x for
 // each state of node-x's row and each enforcement.fence_ssh mode.
 func TestFenceConfig_Decisions(t *testing.T) {
@@ -30,35 +39,39 @@ func TestFenceConfig_Decisions(t *testing.T) {
 		mode  string
 		path  string // "" with refusal set means refused
 		match string // a substring of the refusal
-		// latched: release_2026_12_v1 has latched on node-a (its gate is open).
-		latched bool
+		// gate: node-a's release gate. gateOpen means release_2026_12_v1
+		// has latched on node-a; gateNil is an agent built with no gate,
+		// which counts as not latched.
+		gate gateKind
 	}{
-		{"no row, auto: legacy unpinned", noRow, fencessh.ModeAuto, fence.SSHPathLegacy, "", false},
-		{"no row, legacy: legacy unpinned", noRow, fencessh.ModeLegacy, fence.SSHPathLegacy, "", false},
-		{"no row, managed: refused", noRow, fencessh.ModeManaged, "", "published no fence ssh row", false},
-		{"forged row, auto: refused", forged, fencessh.ModeAuto, "", "does not verify", false},
-		{"forged row, legacy: refused", forged, fencessh.ModeLegacy, "", "does not verify", false},
-		{"retired row, auto: refused", retired, fencessh.ModeAuto, "", "does not verify", false},
-		{"not accepting, auto: pinned", notAccepting, fencessh.ModeAuto, fence.SSHPathPinned, "", false},
-		{"not accepting, managed: refused", notAccepting, fencessh.ModeManaged, "", "does not accept the managed fence key", false},
-		{"accepting, auto: managed", accepting, fencessh.ModeAuto, fence.SSHPathManaged, "", false},
-		{"accepting, managed: managed", accepting, fencessh.ModeManaged, fence.SSHPathManaged, "", false},
-		{"accepting, legacy: pinned", accepting, fencessh.ModeLegacy, fence.SSHPathPinned, "", false},
-		{"was accepting, auto: still the managed key", wasAccepting, fencessh.ModeAuto, fence.SSHPathManaged, "", false},
-		{"was accepting, managed: still the managed key", wasAccepting, fencessh.ModeManaged, fence.SSHPathManaged, "", false},
-		{"was accepting, legacy: pinned", wasAccepting, fencessh.ModeLegacy, fence.SSHPathPinned, "", false},
-		{"deleted host, auto: legacy unpinned", deleted, fencessh.ModeAuto, fence.SSHPathLegacy, "", false},
+		{"no row, auto: legacy unpinned", noRow, fencessh.ModeAuto, fence.SSHPathLegacy, "", gateClosed},
+		{"no row, legacy: legacy unpinned", noRow, fencessh.ModeLegacy, fence.SSHPathLegacy, "", gateClosed},
+		{"no row, managed: refused", noRow, fencessh.ModeManaged, "", "published no fence ssh row", gateClosed},
+		{"forged row, auto: refused", forged, fencessh.ModeAuto, "", "does not verify", gateClosed},
+		{"forged row, legacy: refused", forged, fencessh.ModeLegacy, "", "does not verify", gateClosed},
+		{"retired row, auto: refused", retired, fencessh.ModeAuto, "", "does not verify", gateClosed},
+		{"not accepting, auto: pinned", notAccepting, fencessh.ModeAuto, fence.SSHPathPinned, "", gateClosed},
+		{"not accepting, managed: refused", notAccepting, fencessh.ModeManaged, "", "does not accept the managed fence key", gateClosed},
+		{"accepting, auto: managed", accepting, fencessh.ModeAuto, fence.SSHPathManaged, "", gateClosed},
+		{"accepting, managed: managed", accepting, fencessh.ModeManaged, fence.SSHPathManaged, "", gateClosed},
+		{"accepting, legacy: pinned", accepting, fencessh.ModeLegacy, fence.SSHPathPinned, "", gateClosed},
+		{"was accepting, auto: still the managed key", wasAccepting, fencessh.ModeAuto, fence.SSHPathManaged, "", gateClosed},
+		{"was accepting, managed: still the managed key", wasAccepting, fencessh.ModeManaged, fence.SSHPathManaged, "", gateClosed},
+		{"was accepting, legacy: pinned", wasAccepting, fencessh.ModeLegacy, fence.SSHPathPinned, "", gateClosed},
+		{"deleted host, auto: legacy unpinned", deleted, fencessh.ModeAuto, fence.SSHPathLegacy, "", gateClosed},
 
-		{"latched, no row, auto: refused", noRow, fencessh.ModeAuto, "", "published no fence ssh row", true},
-		{"latched, no row, legacy: legacy unpinned", noRow, fencessh.ModeLegacy, fence.SSHPathLegacy, "", true},
-		{"latched, no row, managed: refused", noRow, fencessh.ModeManaged, "", "published no fence ssh row", true},
-		{"latched, deleted host, auto: refused", deleted, fencessh.ModeAuto, "", "published no fence ssh row", true},
-		{"latched, deleted host, legacy: legacy unpinned", deleted, fencessh.ModeLegacy, fence.SSHPathLegacy, "", true},
-		{"latched, retired row, auto: refused", retired, fencessh.ModeAuto, "", "does not verify", true},
-		{"latched, forged row, auto: refused", forged, fencessh.ModeAuto, "", "does not verify", true},
-		{"latched, not accepting, auto: pinned", notAccepting, fencessh.ModeAuto, fence.SSHPathPinned, "", true},
-		{"latched, accepting, auto: managed", accepting, fencessh.ModeAuto, fence.SSHPathManaged, "", true},
-		{"latched, accepting, legacy: pinned", accepting, fencessh.ModeLegacy, fence.SSHPathPinned, "", true},
+		{"latched, no row, auto: refused", noRow, fencessh.ModeAuto, "", "published no fence ssh row", gateOpen},
+		{"latched, no row, legacy: legacy unpinned", noRow, fencessh.ModeLegacy, fence.SSHPathLegacy, "", gateOpen},
+		{"latched, no row, managed: refused", noRow, fencessh.ModeManaged, "", "published no fence ssh row", gateOpen},
+		{"latched, deleted host, auto: refused", deleted, fencessh.ModeAuto, "", "published no fence ssh row", gateOpen},
+		{"latched, deleted host, legacy: legacy unpinned", deleted, fencessh.ModeLegacy, fence.SSHPathLegacy, "", gateOpen},
+		{"latched, retired row, auto: refused", retired, fencessh.ModeAuto, "", "does not verify", gateOpen},
+		{"latched, forged row, auto: refused", forged, fencessh.ModeAuto, "", "does not verify", gateOpen},
+		{"latched, not accepting, auto: pinned", notAccepting, fencessh.ModeAuto, fence.SSHPathPinned, "", gateOpen},
+		{"latched, accepting, auto: managed", accepting, fencessh.ModeAuto, fence.SSHPathManaged, "", gateOpen},
+		{"latched, accepting, legacy: pinned", accepting, fencessh.ModeLegacy, fence.SSHPathPinned, "", gateOpen},
+
+		{"nil gate, no row, auto: legacy unpinned", noRow, fencessh.ModeAuto, fence.SSHPathLegacy, "", gateNil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -94,9 +107,14 @@ func TestFenceConfig_Decisions(t *testing.T) {
 			case deleted:
 				// node-x has neither row.
 			}
-			var gate fencessh.Gate = closedGate{}
-			if tc.latched {
+			var gate fencessh.Gate
+			switch tc.gate {
+			case gateClosed:
+				gate = closedGate{}
+			case gateOpen:
 				gate = openGate{t}
+			case gateNil:
+				// No gate at all: Config.Gate stays nil.
 			}
 			sf := a.gatedAgent(tc.mode, gate).FenceConfig(context.Background(), "node-x")
 			if tc.path == "" && tc.match != "" {

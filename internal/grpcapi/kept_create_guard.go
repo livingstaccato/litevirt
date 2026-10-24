@@ -271,21 +271,32 @@ func (s *Server) keptMissingBaseRefusal(ctx context.Context, writes *keptWrites)
 			return err
 		}
 	}
+	// source names what failed, for the warning of a create that goes ahead.
+	noteSource := ""
+	if noteErr != nil {
+		noteSource = filepath.Join(s.dataDir, "kept-disks")
+		var ne *keptNoteChainsError
+		if errors.As(noteErr, &ne) && ne.source != "" {
+			noteSource = ne.source
+		}
+	}
 	var unknown error
+	source := registry
 	switch {
 	case err != nil && noteErr != nil:
 		unknown = &keptRegistryError{msg: fmt.Sprintf("%v, and %v", err, noteErr),
 			transient: keptRegistryTransient(err) || storage.IsFSNoAnswer(noteErr)}
+		source = registry + " and " + noteSource
 	case err != nil:
 		unknown = err
 	case noteErr != nil:
 		unknown = &keptRegistryError{msg: noteErr.Error(), transient: storage.IsFSNoAnswer(noteErr)}
-		registry = filepath.Join(s.dataDir, "kept-disks")
+		source = noteSource
 	}
 	if unknown == nil || !writes.local {
 		return nil
 	}
-	return s.keptCollisionOnDisk(ctx, unknown, writes, registry)
+	return s.keptCollisionOnDisk(ctx, unknown, writes, source)
 }
 
 // keptWrites is the files an operation writes, for the check of a kept
@@ -468,15 +479,17 @@ func (s *Server) createKeptWrites(spec *pb.VMSpec, cfgs map[int]storage.Config) 
 }
 
 // keptCollisionOnDisk judges a create, clone, disk attach or restore to a
-// named target that clears nothing while the registry or a chain in it
-// cannot be read (rerr), from the disk files on this host
+// named target that clears nothing while kept-disks.json, a kept-disk note,
+// a set-aside listing or a kept chain cannot be read (rerr), from the disk files on this host
 // (keptCollisionScan): one that writes a path a file there backs on, or one
 // already there, is refused, as what a delete kept cannot be told apart. Any
-// other goes ahead, with a warning naming the registry. A scan that cannot
+// other goes ahead, with a warning naming what failed. A scan that cannot
 // complete refuses whatever it writes (keptChainsUnknownError): what is safe
 // is then unknown. Retryable only when storage or the database did not
-// answer.
-func (s *Server) keptCollisionOnDisk(ctx context.Context, rerr error, writes *keptWrites, registry string) error {
+// answer. source names what could not be read (kept-disks.json, a note, the
+// notes directory, a set-aside listing, or a file whose chain did not read),
+// for the warning.
+func (s *Server) keptCollisionOnDisk(ctx context.Context, rerr error, writes *keptWrites, source string) error {
 	hit, err := s.keptCollisionScan(ctx, writes)
 	if err != nil {
 		transient := keptRegistryTransient(rerr) || storage.IsFSNoAnswer(err) || errors.Is(err, errKeptScanPoolsUnread)
@@ -487,8 +500,8 @@ func (s *Server) keptCollisionOnDisk(ctx context.Context, rerr error, writes *ke
 		return health.NewKeptBackingFileError(fmt.Sprintf("%s, and %v; whether that is a disk a delete kept cannot be told, "+
 			"so nothing was created (or place the VM on another host)", hit, rerr))
 	}
-	slog.Warn("create: the record of kept disks cannot be read; the create goes ahead, as no disk file on this host backs on a path it writes. "+
-		"Fix the record so that what deletes kept is judged by it again", "file", registry, "error", rerr)
+	slog.Warn("create: what deletes kept on this host cannot all be read; the create goes ahead, as no disk file on this host backs on a path it writes. "+
+		"Fix what cannot be read so that what deletes kept is judged by it again", "source", source, "error", rerr)
 	return nil
 }
 
@@ -500,7 +513,9 @@ var errKeptScanPoolsUnread = errors.New("this host's storage pools cannot be rea
 // a kept overlay can be, and each one's backing chain in full
 // (walkKeptChain): each regular file at any depth under every directory this
 // host keeps VM disks in (keptScanDirs), each file a kept-disk note names,
-// and each kept-disks.json entry of this host still held in memory. The walk
+// each set-aside .kept- and .superseded- copy (health.ListKeptDisks,
+// health.ListSupersededDisks: also beside a disk at a path of its own), and
+// each kept-disks.json entry of this host still held in memory. The walk
 // follows no symlink below a directory it lists. It returns how the first
 // file that is, or backs on, a path the create writes (writes, compared as
 // the missing-base check compares: each side with its directory resolved
@@ -514,7 +529,9 @@ var errKeptScanPoolsUnread = errors.New("this host's storage pools cannot be rea
 // directory, the disk store's, a pool's directory (named by the pool's row
 // or config, usable for writes or not, or the default places under
 // <data_dir>/pools and <data_dir>/mounts), or at a path the note or the
-// registry entry of its keep names. What is not covered is a kept overlay
+// registry entry of its keep names; a set-aside copy is made beside the disk
+// it was, wherever that is, and is read from the same listings
+// keptNoteChains reads. What is not covered is a kept overlay
 // outside every one of those directories that only the unreadable registry
 // names (a restore to an admin's --target-path elsewhere, kept by a later
 // delete, with its note gone).
@@ -561,6 +578,28 @@ func (s *Server) keptCollisionScan(ctx context.Context, writes *keptWrites) (str
 	}
 	for f := range noted {
 		add(f)
+	}
+	// Each set-aside .kept- and .superseded- copy, as keptNoteChains lists
+	// them: a copy beside a disk at a path no scanned directory holds (a
+	// local disk row's own directory) is a kept overlay too. A listing that
+	// cannot be read leaves the scan incomplete.
+	if s.db != nil {
+		kept, err := listKeptDisks(ctx, s.db, s.dataDir)
+		if err != nil {
+			return "", fmt.Errorf("this host's set-aside .kept- disk copies cannot be listed (%w)", err)
+		}
+		for _, k := range kept {
+			if !k.Seed {
+				add(k.Path)
+			}
+		}
+		superseded, err := listSupersededDisks(ctx, s.db, s.dataDir)
+		if err != nil {
+			return "", fmt.Errorf("this host's set-aside .superseded- disk copies cannot be listed (%w)", err)
+		}
+		for _, c := range superseded {
+			add(c.Path)
+		}
 	}
 	records, _ := s.diskKeptRecords()
 	for _, r := range records {

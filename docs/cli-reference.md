@@ -338,8 +338,8 @@ volume move (its copy at `<pool dir>/<vm>-<disk>.qcow2`, checked before
 anything is copied) or a
 `--target-path` restore that would write a kept overlay's missing base is
 refused as a create is. A kept chain that reads refuses even while another
-does not. Until an unreadable `kept-disks.json`, kept-disk note or kept chain
-reads, `disk_leftover` names the
+does not. Until an unreadable `kept-disks.json`, kept-disk note, listing of
+the set-aside `.kept-` and `.superseded-` copies or kept chain reads, `disk_leftover` names the
 file (`creates_refused`), and each `lv import`, create or `lv clone` that
 writes a disk file on the host's own storage, disk attach that creates a new
 disk, `lv move-volume` (and `lv stack migrate-volumes` move) into a pool on
@@ -349,8 +349,8 @@ and failover rebuild of a missing overlay disk on that host is judged by the
 disk files there instead: it is
 refused when one of them (any file under `<data_dir>/disks`, the disk store's
 directory, `<data_dir>/pools`, `<data_dir>/mounts` or the directory of any
-file-based pool of the host, usable or not, or a file a note or a held entry
-names) is, or backs on, a path it writes, compared as above with directories
+file-based pool of the host, usable or not, a file a note or a held entry
+names, or a set-aside `.kept-` or `.superseded-` copy wherever it is) is, or backs on, a path it writes, compared as above with directories
 resolved through symlinks, and refused whatever its name when
 one of them, or a directory of them, cannot be read. Any other goes ahead,
 with a warning in the daemon log naming the file. A create or clone with no

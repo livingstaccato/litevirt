@@ -122,7 +122,10 @@ func (e *keptRegistryError) Error() string { return e.msg }
 // at the same path is another file. A chain ends at a backing file that does
 // not exist (missing): nothing is there to keep, and nothing under it is
 // reached; a chain that cannot be read otherwise is an error naming the entry
-// and the way out, as is a registry that cannot be read.
+// and the way out, as is a registry that cannot be read. The error comes WITH
+// every entry's chain that could be read, as keptNoteChains returns them: a
+// finding from a readable chain refuses whatever else failed. A caller that
+// only looks at the chains when there is no error is unchanged.
 func (s *Server) keptRegistryChains(ctx context.Context) ([]keptRegistryChain, error) {
 	file := filepath.Join(s.dataDir, diskKeptFile)
 	records, unreadable := s.diskKeptRecords()
@@ -131,6 +134,12 @@ func (s *Server) keptRegistryChains(ctx context.Context) ([]keptRegistryChain, e
 			"repair or remove that file (`lv health` names it under %s)", file, unreadable, condDiskLeftover)}
 	}
 	var out []keptRegistryChain
+	var first error
+	fail := func(err error) {
+		if first == nil {
+			first = err
+		}
+	}
 	for _, r := range records {
 		if r.Host != s.hostName || r.Path == "" {
 			continue
@@ -141,8 +150,9 @@ func (s *Server) keptRegistryChains(ctx context.Context) ([]keptRegistryChain, e
 		}
 		rows, err := corrosion.DisksReferencingPath(ctx, s.db, r.Path)
 		if err != nil {
-			return nil, &keptRegistryError{transient: true, msg: fmt.Sprintf(
-				"whether a VM's record still names %s, a disk the delete of VM %s kept (%s), cannot be read (%v); retry", top, r.VM, file, err)}
+			fail(&keptRegistryError{transient: true, msg: fmt.Sprintf(
+				"whether a VM's record still names %s, a disk the delete of VM %s kept (%s), cannot be read (%v); retry", top, r.VM, file, err)})
+			continue
 		}
 		topNamed := slices.ContainsFunc(rows, func(d corrosion.DiskRecord) bool {
 			return d.Path == r.Path && d.HostName == s.hostName
@@ -156,14 +166,15 @@ func (s *Server) keptRegistryChains(ctx context.Context) ([]keptRegistryChain, e
 			return walked{l, m}, err
 		})
 		if err != nil {
-			return nil, &keptRegistryError{transient: storage.IsFSNoAnswer(err), msg: fmt.Sprintf(
+			fail(&keptRegistryError{transient: storage.IsFSNoAnswer(err), msg: fmt.Sprintf(
 				"the backing chain of %s, the disk %s the delete of VM %s kept, cannot be read (%v), so what it backs on is unknown; "+
 					"fix that file or its storage, or, once you have checked that nothing needs that disk, move %s away or remove its entry "+
-					"from %s on %s (the file is re-read within 30 s)", top, r.Disk, r.VM, err, top, file, s.hostName)}
+					"from %s on %s (the file is re-read within 30 s)", top, r.Disk, r.VM, err, top, file, s.hostName)})
+			continue
 		}
 		out = append(out, keptRegistryChain{rec: r, top: top, layers: w.layers, topNamed: topNamed, missing: w.missing})
 	}
-	return out, nil
+	return out, first
 }
 
 // keptNoteChain is the backing chain of a file a kept-disk note of this host
@@ -191,7 +202,12 @@ func (c keptNoteChain) desc(s *Server) string {
 
 // keptNoteChainsError is a kept-disk note, or the chain of a file one names,
 // that cannot be read: what a kept disk backs on is then unknown.
-type keptNoteChainsError struct{ err error }
+type keptNoteChainsError struct {
+	err error
+	// source names what failed, for a log line: a note file, the notes
+	// directory, a set-aside listing, or the file whose chain did not read.
+	source string
+}
 
 func (e *keptNoteChainsError) Error() string { return e.err.Error() }
 func (e *keptNoteChainsError) Unwrap() error { return e.err }
@@ -213,9 +229,9 @@ func (e *keptNoteChainsError) Unwrap() error { return e.err }
 func (s *Server) keptNoteChains(ctx context.Context) ([]keptNoteChain, error) {
 	var out []keptNoteChain
 	var first error
-	fail := func(err error) {
+	fail := func(source string, err error) {
 		if first == nil {
-			first = &keptNoteChainsError{err}
+			first = &keptNoteChainsError{err: err, source: source}
 		}
 	}
 	walk := func(p string) (keptWalked, error) {
@@ -226,13 +242,13 @@ func (s *Server) keptNoteChains(ctx context.Context) ([]keptNoteChain, error) {
 	}
 	notes, err := health.KeptNotes(s.dataDir)
 	if err != nil {
-		fail(fmt.Errorf("this host's notes of the disks deletes kept cannot be read (%w)", err))
+		fail(filepath.Join(s.dataDir, "kept-disks"), fmt.Errorf("this host's notes of the disks deletes kept cannot be read (%w)", err))
 	}
 	for _, n := range notes {
 		for _, p := range n.Paths {
 			w, err := walk(p)
 			if err != nil {
-				fail(fmt.Errorf("the backing chain of %s, a disk the deleted VM %s was kept with (%s), cannot be read (%w), "+
+				fail(p, fmt.Errorf("the backing chain of %s, a disk the deleted VM %s was kept with (%s), cannot be read (%w), "+
 					"so what it backs on is unknown: until it can, every path that removes disk files on this host leaves them, "+
 					"a create that would write a disk here is refused, and lv host kept-disks --release refuses; fix that file or its "+
 					"storage, move %s away, or, once nothing needs it, remove its entry from %s", p, n.VM, n.File, err, p, n.File))
@@ -247,7 +263,7 @@ func (s *Server) keptNoteChains(ctx context.Context) ([]keptNoteChain, error) {
 	var copies []string
 	kept, err := listKeptDisks(ctx, s.db, s.dataDir)
 	if err != nil {
-		fail(fmt.Errorf("this host's set-aside .kept- disk copies cannot be listed (%w)", err))
+		fail("the listing of this host's set-aside .kept- disk copies", fmt.Errorf("this host's set-aside .kept- disk copies cannot be listed (%w)", err))
 	}
 	for _, k := range kept {
 		if !k.Seed {
@@ -256,7 +272,7 @@ func (s *Server) keptNoteChains(ctx context.Context) ([]keptNoteChain, error) {
 	}
 	superseded, err := listSupersededDisks(ctx, s.db, s.dataDir)
 	if err != nil {
-		fail(fmt.Errorf("this host's set-aside .superseded- disk copies cannot be listed (%w)", err))
+		fail("the listing of this host's set-aside .superseded- disk copies", fmt.Errorf("this host's set-aside .superseded- disk copies cannot be listed (%w)", err))
 	}
 	for _, c := range superseded {
 		copies = append(copies, c.Path)
@@ -264,7 +280,7 @@ func (s *Server) keptNoteChains(ctx context.Context) ([]keptNoteChain, error) {
 	for _, p := range copies {
 		w, err := walk(p)
 		if err != nil {
-			fail(fmt.Errorf("the backing chain of %s, a set-aside disk copy, cannot be read (%w), so what it backs on "+
+			fail(p, fmt.Errorf("the backing chain of %s, a set-aside disk copy, cannot be read (%w), so what it backs on "+
 				"is unknown: until it can, every path that removes disk files on this host leaves them, and a create that would write a "+
 				"disk here is refused; fix that file or its storage, or, once nothing needs it, move it away (lv host superseded-disks %s "+
 				"lists it)", p, err, s.hostName))

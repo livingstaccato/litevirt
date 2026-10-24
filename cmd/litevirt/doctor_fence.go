@@ -17,6 +17,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fence"
 )
 
 func newDoctorFenceCmd() *cobra.Command {
@@ -79,6 +80,10 @@ shared-disk count comes from the queried node's replicated rows.`,
 				// the verdict, so a failed read does not fail the command.
 				if h, herr := c.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{}); herr == nil {
 					printStalledObservers(os.Stdout, h.GetConditions())
+				}
+				// Best-effort too: which hosts fence only over SSH.
+				if hl, lerr := c.ListHosts(ctx, &pb.ListHostsRequest{}); lerr == nil {
+					printSSHOnlyFencing(os.Stdout, hl.GetHosts())
 				}
 				if fenceHazard(r) {
 					return silentExitError{code: 1}
@@ -312,6 +317,32 @@ func hostPostureWord(h *pb.FenceHostPosture) string {
 // failed probes against peers and decide no fence. It is the usual answer to
 // "why has a dead host not been fenced yet?", so the doctor names them. Prints
 // nothing when there are none.
+// printSSHOnlyFencing names every host (but one in maintenance) whose fence strategy goes only over
+// SSH (ssh, best-effort, or unset, which is best-effort), and recommends a
+// BMC. An SSH fence never proves a power-off, so failover recovers such a
+// host's workloads only after its partition pause, or an operator's
+// `lv host fence-confirm`; a hardware fence recovers them at once.
+// DIAGNOSTIC ONLY: it does not change the exit code.
+func printSSHOnlyFencing(w io.Writer, hosts []*pb.Host) {
+	var ssh []string
+	for _, h := range hosts {
+		if h.GetState() == pb.HostState_HOST_MAINTENANCE {
+			continue
+		}
+		if fence.SSHOnly(h.GetFenceStrategy()) {
+			ssh = append(ssh, h.GetName()+" ("+fence.ResolveStrategy(h.GetFenceStrategy())+")")
+		}
+	}
+	if len(ssh) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "\nWARNING: %d host(s) fence only over SSH: %s\n", len(ssh), strings.Join(ssh, ", "))
+	fmt.Fprintln(w, "An SSH fence never proves the host is off. If one of these hosts fails, its")
+	fmt.Fprintln(w, "workloads are held until its partition pause has been waited out, or until you")
+	fmt.Fprintln(w, "power it off and run `lv host fence-confirm <host>`. Give each an ipmi or redfish")
+	fmt.Fprintln(w, "fence strategy (`lv host config <host> --fence-strategy ipmi|redfish`) to recover at once.")
+}
+
 func printStalledObservers(w io.Writer, conds []*pb.HealthCondition) {
 	type stalled struct{ host, paused, until string }
 	var rows []stalled

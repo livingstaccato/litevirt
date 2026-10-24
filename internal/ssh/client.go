@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -70,7 +71,13 @@ func dialTarget(t *Target, start time.Time, timeout time.Duration, keepDeadline 
 	cfg, sshUser, host, port := t.cfg, t.user, t.host, t.port
 	dialHost := cfg.Hostname
 
-	auth, err := authMethodsFor(cfg)
+	ctx := context.Background()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, start.Add(timeout))
+		defer cancel()
+	}
+	auth, err := authMethodsForContext(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("SSH auth: %w", err)
 	}
@@ -79,7 +86,8 @@ func dialTarget(t *Target, start time.Time, timeout time.Duration, keepDeadline 
 	// HostName and Port, never the alias the operator typed -- because that is
 	// the string ssh.Dial hands the callback.
 	addr := net.JoinHostPort(dialHost, port)
-	config, err := clientConfig(sshUser, auth, cfg, addr)
+	defer auth.Close()
+	config, err := clientConfig(sshUser, auth.methods, cfg, addr)
 	if err != nil {
 		return nil, fmt.Errorf("host key check for %s: %w", host, err)
 	}
@@ -109,6 +117,10 @@ func dialTarget(t *Target, start time.Time, timeout time.Duration, keepDeadline 
 // config: a config could re-add SHA-1 ssh-rsa, or ask for a type known_hosts
 // does not record and so turn a known host into a refused one.
 func clientConfig(sshUser string, auth []ssh.AuthMethod, cfg *resolved, addr string) (*ssh.ClientConfig, error) {
+	return clientConfigWithWarning(sshUser, auth, cfg, addr, nil)
+}
+
+func clientConfigWithWarning(sshUser string, auth []ssh.AuthMethod, cfg *resolved, addr string, warning func(string, ...any) error) (*ssh.ClientConfig, error) {
 	// Options with which ssh would refuse keys litevirt cannot otherwise see: a
 	// pin source litevirt does not run refuses outright; a revocation list litevirt
 	// cannot read refuses too. Neither is ever skipped.
@@ -142,11 +154,17 @@ func clientConfig(sshUser string, auth []ssh.AuthMethod, cfg *resolved, addr str
 		// would make provisioning impossible on a fresh workstation -- but say
 		// so, because this connection carries the cluster CA-signed host key
 		// and nothing is pinning the far end.
-		fmt.Fprintf(os.Stderr,
-			"warning: no usable known_hosts (%v); %s's host key cannot be checked "+
-				"against a previous one. This connection carries the cluster CA-signed "+
-				"host key.\n", err, host)
-		hostKeyCallback = firstContactOnlyCallback(host)
+		if warning == nil {
+			fmt.Fprintf(os.Stderr, "warning: no usable known_hosts (%v); %s's host key cannot be checked against a previous one. This connection carries the cluster CA-signed host key.\n", err, host)
+			hostKeyCallback = firstContactOnlyCallback(host)
+		} else {
+			if err := warning("warning: no usable known_hosts (%v); %s's host key cannot be checked against a previous one. This connection carries the cluster CA-signed host key.\n", err, host); err != nil {
+				return nil, err
+			}
+			hostKeyCallback = func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+				return warning("warning: ssh: host key not verified (no known_hosts store); host=%s remote=%s key_type=%s\n", host, remote.String(), key.Type())
+			}
+		}
 		hostKeyAlgos = slices.Clone(firstContactHostKeyAlgorithms)
 	}
 
@@ -656,12 +674,58 @@ func parseTargetExplicit(target string) (user, host, port string, userSet, portS
 	return
 }
 
-func authMethods() ([]ssh.AuthMethod, error) { return authMethodsFor(nil) }
+type authOwner struct {
+	methods       []ssh.AuthMethod
+	agentConn     net.Conn
+	stopInterrupt func()
+}
+
+func (a *authOwner) Close() error {
+	var err error
+	if a.agentConn != nil {
+		err = a.agentConn.Close()
+	}
+	if a.stopInterrupt != nil {
+		a.stopInterrupt()
+	}
+	return err
+}
+
+// interruptOnCancellation interrupts the actual resource and joins a callback
+// already in flight. Repeated stops cannot wait for a callback never started.
+func interruptOnCancellation(ctx context.Context, interrupt func()) func() {
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { defer close(done); interrupt() })
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if !stop() {
+				<-done
+			}
+		})
+	}
+}
+
+func authMethods() (*authOwner, error) { return authMethodsFor(nil) }
 
 // authMethodsFor is authMethods under cfg: its IdentityFile entries tried
 // before the default key files, IdentitiesOnly, and IdentityAgent. A nil cfg
 // is the defaults (SSH_AUTH_SOCK, the default key files).
-func authMethodsFor(cfg *resolved) ([]ssh.AuthMethod, error) {
+func authMethodsFor(cfg *resolved) (*authOwner, error) {
+	return authMethodsForContext(context.Background(), cfg)
+}
+
+func authMethodsForContext(ctx context.Context, cfg *resolved) (*authOwner, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	owner := &authOwner{}
+	ready := false
+	defer func() {
+		if !ready {
+			owner.Close()
+		}
+	}()
 	var (
 		extraKeys      []string
 		identitiesOnly bool
@@ -695,10 +759,17 @@ func authMethodsFor(cfg *resolved) ([]ssh.AuthMethod, error) {
 	if sock == "" {
 		tried = append(tried, "agent: "+sockFrom)
 	} else {
-		conn, err := net.Dial("unix", sock)
+		conn, err := (&net.Dialer{}).DialContext(ctx, "unix", sock)
 		if err != nil {
 			tried = append(tried, fmt.Sprintf("agent: dial %s: %v", sock, err))
 		} else {
+			owner.agentConn = conn
+			owner.stopInterrupt = interruptOnCancellation(ctx, func() { conn.Close() })
+			if deadline, ok := ctx.Deadline(); ok {
+				if err := conn.SetDeadline(deadline); err != nil {
+					return nil, err
+				}
+			}
 			ac := agent.NewClient(conn)
 			// Verify agent actually has keys before adding
 			keys, err := ac.List()
@@ -791,7 +862,10 @@ func authMethodsFor(cfg *resolved) ([]ssh.AuthMethod, error) {
 	// it), then the agent's other keys, then the remaining key files, never
 	// repeating a key -- so unrelated agent keys cannot use up MaxAuthTries
 	// before the key the operator named.
-	return []ssh.AuthMethod{ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	owner.methods = []ssh.AuthMethod{ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
 		var agentAll []ssh.Signer
 		if agentSigners != nil {
 			as, err := agentSigners()
@@ -827,7 +901,9 @@ func authMethodsFor(cfg *resolved) ([]ssh.AuthMethod, error) {
 			add(sg)
 		}
 		return all, nil
-	})}, nil
+	})}
+	ready = true
+	return owner, nil
 }
 
 // identityPublicKeys returns the marshalled public keys of the identity files,

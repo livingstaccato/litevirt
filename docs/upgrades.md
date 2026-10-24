@@ -22,6 +22,11 @@ If the new binary panics on startup, systemd's `OnFailure` hook restores
 the previous binary automatically. If pre-flight blocks the upgrade, the
 output tells you why; pass `--force` only after addressing the cause.
 
+**v1.9 does not upgrade in place to 1.10.** A 1.10 cluster is either founded
+fresh on 1.10 or upgraded from a 1.10 release candidate (`v1.10.0-rc1` or
+later). To move workloads off a v1.9 cluster, found a new 1.10 cluster and
+recreate them there.
+
 ---
 
 ## Why upgrades are safe by default
@@ -1020,11 +1025,6 @@ A typical rolling upgrade across, say, 5 hosts:
    lv host ls                  # all VERSION columns match
    journalctl -t litevirt-rollback   # should be empty
    ```
-
-   A cluster set up on v1.9 or earlier has no migration-TLS credentials, so
-   `lv migrate --with-storage` is refused after the upgrade until you run
-   `lv host install-migration-tls` once from the machine that holds the
-   cluster CA (docs/migration-failover.md).
 
 4. **Post-check.** Spot-check a VM lifecycle:
    ```bash

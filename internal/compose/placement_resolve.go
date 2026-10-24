@@ -119,9 +119,6 @@ func ValidatePlacement(p *PlacementDef) (warnings, errors []string) {
 	if msg := rebalanceModeProblem(mode); msg != "" {
 		errors = append(errors, msg)
 	}
-	if mode == rebalanceModeOnDemandAlias {
-		warnings = append(warnings, onDemandAliasWarning)
-	}
 	if policy == "bin-pack" && mode == "auto" {
 		warnings = append(warnings,
 			"placement.policy=bin-pack with rebalance.mode=auto: rebalancer will continually contradict bin-pack consolidation. Consider mode=off or policy=balance.")
@@ -133,24 +130,11 @@ func ValidatePlacement(p *PlacementDef) (warnings, errors []string) {
 	return warnings, errors
 }
 
-// rebalanceModeOnDemandAlias is the name of a removed rebalance mode that
-// behaved exactly like dry-run: both only record proposals that wait for
-// `lv rebalance approve`. It is accepted as an alias of dry-run, never refused,
-// so a compose file written for it keeps deploying. Compose rewrites it to
-// dry-run and logs onDemandAliasWarning; a stored spec that still carries it is
-// read as dry-run by the rebalancer (scheduler.Mode handling).
-const rebalanceModeOnDemandAlias = "on-demand"
-
-// onDemandAliasWarning is what an operator is told when a file names on-demand.
-const onDemandAliasWarning = "placement.rebalance.mode on-demand is an alias of dry-run " +
-	"(it behaved identically and was folded into it); it is read as dry-run — write dry-run instead"
-
 // rebalanceModeProblem returns the user-facing error for an invalid
-// placement.rebalance.mode, or "" when mode is valid (empty inherits, and the
-// on-demand alias is valid).
+// placement.rebalance.mode, or "" when mode is valid (empty inherits).
 func rebalanceModeProblem(mode string) string {
 	switch mode {
-	case "", "off", "dry-run", "auto", rebalanceModeOnDemandAlias:
+	case "", "off", "dry-run", "auto":
 		return ""
 	default:
 		return "placement.rebalance.mode must be one of: off, dry-run, auto"

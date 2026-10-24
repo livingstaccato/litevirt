@@ -45,13 +45,6 @@ const (
 	ModeAuto   Mode = "auto"
 )
 
-// legacyModeOnDemand is a folded mode that behaved exactly like dry-run.
-// Compose accepts it as an alias and stores dry-run, but a vms.spec written
-// before the fold, or by an older node during a rolling upgrade (its
-// ha-critical preset still expands to it), can carry it. It is read as
-// ModeDryRun.
-const legacyModeOnDemand Mode = "on-demand"
-
 // vmPolicy is the rebalancer's view of one VM's resolved placement+rebalance.
 // We extract this once per cycle (parsing JSON from vms.spec) and use it for
 // both candidate scoring and budget gating.
@@ -519,9 +512,7 @@ func resolveVMPolicyFromSpec(spec *pb.VMSpec) vmPolicy {
 		}
 		pol.NoMigrate = p.NoMigrate
 		if rb := p.Rebalance; rb != nil {
-			if m := Mode(rb.Mode); m == legacyModeOnDemand {
-				pol.Mode = ModeDryRun
-			} else if m != "" {
+			if m := Mode(rb.Mode); m != "" {
 				pol.Mode = m
 			}
 			if rb.Threshold > 0 {

@@ -124,11 +124,6 @@ The day-2 loop runs every 60 s on the leader-only coordinator (gated by the `lea
 | `dry-run` (recommended default) | Proposals written to `rebalance_proposals` table; never applied automatically. Operator reviews via `lv rebalance list` and may `approve` one to execute it. |
 | `auto` | Proposals written and immediately approved (subject to budget); the executor applies them automatically. |
 
-There was an `on-demand` mode; it behaved exactly like `dry-run` and was folded
-into it. It is kept as an alias: compose accepts it, stores `dry-run`, and logs a
-WARN naming the alias. A VM whose stored spec still carries it (written before
-the fold, or by an older node during a rolling upgrade) is treated as `dry-run`.
-
 Proposals score destinations with the **same hard-constraint pipeline as initial
 placement** — anti-affinity, required labels, max-per-node, device fit, witness
 exclusion, and the spread-strict pressure cap — so a proposed move can never land

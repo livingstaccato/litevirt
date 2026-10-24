@@ -22,9 +22,14 @@ import (
 // refuses:
 //
 //   - this host's kept-disk notes (health.KeptNotedFiles). With notesGovern
-//     a noted file is left to health.SetAsideBeforeCreate, which moves a kept
-//     disk to a .kept- name, with an event, and refuses a file one backs on;
-//     without, every noted file refuses;
+//     a file the note of name lists is left to health.SetAsideBeforeCreate,
+//     which moves a kept disk to a .kept- name, with an event, and refuses a
+//     file one backs on; a file another VM's note lists, and every noted
+//     file without notesGovern, refuses;
+//   - the backing chain of every noted file (keptNoteChainHolds): each file
+//     below its top, which the note need not name (the base of a kept linked
+//     clone is another VM's disk). Only name's own chain over a file its own
+//     note lists is left to SetAsideBeforeCreate;
 //   - this host's kept-disks.json (disk_kept.go): each disk a delete kept on
 //     this host, and every file of its backing chain. A stale-record delete
 //     recorded its kept disks there only, with no note, before rc3 lab 2 F1,
@@ -34,9 +39,9 @@ import (
 //     reaches it, as a kept snapshot overlay's reaches the disk it was taken
 //     of, whatever records exist.
 //
-// It also refuses while a kept disk's chain ends at a backing file that does
-// not exist at a path the create writes (writes): the kept overlay names that
-// path, and the new disk would become its base.
+// It also refuses while a kept disk's chain, noted or recorded, ends at a
+// backing file that does not exist at a path the create writes (writes): the
+// kept overlay names that path, and the new disk would become its base.
 //
 // A note, kept-disks.json or a kept disk's chain that cannot be read refuses
 // too: what it would keep is then unknown (keptRegistryChains; a backing
@@ -80,18 +85,23 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 		return fmt.Errorf("the create clears a file left by an earlier VM %s, and this host's notes of the disks deletes kept "+
 			"cannot be read (%v); repair or remove that file, then retry, or place the VM on another host", name, err)
 	}
-	if !notesGovern {
-		for f := range present {
-			if vm, ok := noted[f]; ok {
-				return refuse(f, fmt.Sprintf("the deleted VM %s was kept with, as its kept-disk note %s lists it", vm,
-					filepath.Join(s.dataDir, "kept-disks", vm+".json")))
-			}
+	// With notesGovern, only a file the note of name itself lists is left to
+	// SetAsideBeforeCreate, which reads that note alone: one another deleted
+	// VM's note lists would be swept.
+	for f := range present {
+		if vm, ok := noted[f]; ok && (!notesGovern || vm != name) {
+			return refuse(f, fmt.Sprintf("the deleted VM %s was kept with, as its kept-disk note %s lists it", vm,
+				filepath.Join(s.dataDir, "kept-disks", vm+".json")))
 		}
 	}
 
-	// A file a noted file's chain reaches through "..", which no note names
-	// (noteKeptBackingFiles).
-	holds, err := s.keptNoteDotDotHolds()
+	// A file a noted file's chain reaches below it, which that note need not
+	// name (keptNoteChainHolds): the base of a kept linked clone, or a file
+	// reached through "..". Only name's own chain over a file name's note
+	// lists is left to SetAsideBeforeCreate, which refuses it (note.Under);
+	// moving the base of another VM's kept disk aside, as it would a noted
+	// disk of name, breaks that disk's chain (rc7 lab 1 F1).
+	holds, err := s.keptNoteChainHolds()
 	if err != nil {
 		if storage.IsFSNoAnswer(err) {
 			return fmt.Errorf("the create clears a file left by an earlier VM %s, and %v; nothing was moved or removed", name, err)
@@ -100,17 +110,20 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 			"nothing was moved or removed", name, err))
 	}
 	for f := range present {
-		if notesGovern && noted[f] != "" {
-			continue
-		}
-		h, ok, err := keptDotDotHeldIn(holds, f)
+		hs, err := keptChainHeldIn(holds, f)
 		if err != nil {
 			return fmt.Errorf("the create clears %s, and what it is cannot be told (%v); retry once that storage answers, "+
 				"or place the VM on another host", f, err)
 		}
-		if ok {
+		for _, h := range hs {
+			if notesGovern && h.vm == name && noted[f] == name {
+				continue
+			}
 			return refuse(f, h.what(s))
 		}
+	}
+	if refusal, _ := s.keptNoteMissingBase(writes); refusal != nil {
+		return refusal
 	}
 
 	chains, err := s.keptRegistryChains(ctx)
@@ -185,10 +198,24 @@ func missingBaseRefusal(c keptRegistryChain, registry string) error {
 
 // keptMissingBaseRefusal is keptFileCreateRefusal's check of a create that
 // clears nothing: one that writes the missing backing file of a kept disk's
-// chain is refused. With nothing to clear, a registry that cannot be read is
-// not a reason to refuse: only a write at a missing base could follow, and
-// the refusals for clearing a file stay fail-closed.
+// chain is refused, whether a kept-disk note or kept-disks.json records the
+// disk. With nothing to clear, a registry that cannot be read is not a
+// reason to refuse: only a write at a missing base could follow, and the
+// refusals for clearing a file stay fail-closed. A note or a noted chain that
+// cannot be read refuses.
 func (s *Server) keptMissingBaseRefusal(ctx context.Context, writes func(string) bool) error {
+	// A noted file's chain first (keptNoteMissingBase): a note is what `lv rm
+	// --keep-disks` writes, and kept-disks.json then has no entry at all (rc7
+	// lab 1 F1). A note or a chain that cannot be read refuses: unlike the
+	// registry below, it was read fail-closed by every hold already.
+	if refusal, unknown := s.keptNoteMissingBase(writes); refusal != nil {
+		return refusal
+	} else if unknown != nil {
+		if storage.IsFSNoAnswer(unknown) {
+			return fmt.Errorf("the create writes a disk on %s, and %v; nothing was created", s.hostName, unknown)
+		}
+		return health.NewKeptBackingFileError(fmt.Sprintf("the create writes a disk on %s, and %v; nothing was created", s.hostName, unknown))
+	}
 	chains, err := s.keptRegistryChains(ctx)
 	if err != nil {
 		return nil

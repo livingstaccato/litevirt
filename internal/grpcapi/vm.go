@@ -3961,6 +3961,11 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	if err := s.keptChainRefusal(ctx, req); err != nil {
 		return nil, err
 	}
+	if !req.KeepDisks {
+		if err := s.keptBaseRefusal(ctx, req.Name, "delete VM", "delete it with --keep-disks, or ", true, false); err != nil {
+			return nil, err
+		}
+	}
 
 	// Verify the domain actually exists in libvirt on this host. If the
 	// Corrosion record says this host but the domain isn't here (stale CRDT,
@@ -5451,6 +5456,12 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"%q still backs %d linked clone(s) (%s); delete or full-clone them first",
 			req.Name, len(clones), strings.Join(clones, ", "))
+	}
+	// Nor a disk a kept chain backs on: a linked clone deleted with
+	// --keep-disks is no longer in linkedClonesOf, and its kept overlay still
+	// names this VM's disk as its base. Fails closed, as the clone check does.
+	if err := s.keptBaseRefusal(ctx, req.Name, "rebuild", "", false, true); err != nil {
+		return nil, err
 	}
 
 	// BEFORE anything destructive: a VM holding an address on a NetBox-bound

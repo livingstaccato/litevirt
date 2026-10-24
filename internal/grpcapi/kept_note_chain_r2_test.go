@@ -215,7 +215,8 @@ func TestKeptNoteChain_HeldByAnyAliasOfItsDirectory(t *testing.T) {
 // that writes a local disk, is named by disk_leftover's creates_refused, as
 // an unreadable kept-disks.json is.
 //
-// Mutation: drop the keptNoteChains check from judgeKeptDisks: red.
+// Mutations: drop the keptNoteChains check from judgeKeptDisks: red; drop
+// its keptCollisionScan (relkept-on70 merge): red.
 func TestKeptDisks_AnUnreadableNoteIsNamedInHealth(t *testing.T) {
 	s, _ := provableCreateServer(t)
 	note := badNote(t, s, "clone")
@@ -228,8 +229,14 @@ func TestKeptDisks_AnUnreadableNoteIsNamedInHealth(t *testing.T) {
 	if err := json.Unmarshal([]byte(ev), &e); err != nil {
 		t.Fatal(err)
 	}
-	if refused, _ := e["creates_refused"].(string); !strings.Contains(refused, note) {
+	refused, _ := e["creates_refused"].(string)
+	if !strings.Contains(refused, note) {
 		t.Fatalf("creates_refused = %q; want it to name %s", refused, note)
+	}
+	// The disk scan reads the notes too, so it cannot complete either, and
+	// every local create is held (keptCollisionOnDisk), as the evidence says.
+	if !strings.Contains(refused, "whatever their names") {
+		t.Fatalf("creates_refused = %q; want it to say every local create is held", refused)
 	}
 }
 

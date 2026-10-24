@@ -308,10 +308,12 @@ func (s *Server) judgeKeptDisks(ctx context.Context) {
 		_, scanErr = s.keptCollisionScan(ctx, nil)
 	}
 	// So does a kept-disk note, a set-aside copy listing or a noted chain that
-	// cannot be read (keptNoteMissingBase), which no record names.
+	// cannot be read (keptNoteMissingBase), which no record names; the disk
+	// files on this host judge those writes as they do for the record.
 	if createsRefused == "" {
 		if _, err := s.keptNoteChains(ctx); err != nil && !storage.IsFSNoAnswer(err) {
 			createsRefused = err.Error()
+			_, scanErr = s.keptCollisionScan(ctx, nil)
 		}
 	}
 	for _, r := range records {

@@ -775,20 +775,9 @@ var stagingRoot = defaultLxcpath + "/" + stagingDirName
 // stagingDirName is stagingRoot's directory in LXC's store.
 const stagingDirName = ".litevirt+staging"
 
-// legacyStagingRoot is where earlier builds staged. A config they rendered
-// still names it until a daemon-driven start renders it again, so the hook
-// stages such a config there, as before.
-const legacyStagingRoot = "/run/litevirt/ct"
-
 // stagingPath is the staging mount point of a container's i-th mount.
 func stagingPath(name string, i int) string {
-	return stagingPathUnder(stagingRoot, name, i)
-}
-
-// stagingPathUnder is the staging mount point of a container's i-th mount
-// under root.
-func stagingPathUnder(root, name string, i int) string {
-	return filepath.Join(root, name, fmt.Sprintf("m%d", i))
+	return filepath.Join(stagingRoot, name, fmt.Sprintf("m%d", i))
 }
 
 // renderHostAccessBlock is the litevirt-owned config block for a container's
@@ -1053,17 +1042,9 @@ func (r *LxcRunner) checkHostAccessForStart(name string) error {
 		// options, an extra devices.allow, a device renumbered by a reboot, a
 		// longer allowed prefix — it is rendered again from the record, and
 		// the difference said, never kept.
-		// A block an earlier build rendered names its staging root
-		// (legacyStagingRoot); moving it to this build's is no difference
-		// from the record.
-		moved := strings.ReplaceAll(have, legacyStagingRoot+"/", stagingRoot+"/")
-		switch {
-		case withoutHookLines(moved) != withoutHookLines(want):
+		if withoutHookLines(have) != withoutHookLines(want) {
 			slog.Warn("container: host-access block differed from its authorized record; rendered again from the record",
 				"container", name, "had", have, "now", want)
-		case moved != have:
-			slog.Info("container: host mounts were staged at the old path until this start; rendered again under the new staging root",
-				"container", name, "old", legacyStagingRoot, "new", stagingRoot)
 		}
 		cfg := withHostAccessBlock(string(b), want)
 		return writeFileAtomic(cfgPath, []byte(cfg), 0o644)

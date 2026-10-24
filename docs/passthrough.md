@@ -244,13 +244,7 @@ containers:
   modes say who may read them. It lies beneath LXC's store because that is the one tree
   the stock AppArmor profile of `lxc-start` lets a start hook mount on
   (Ubuntu's `abstractions/lxc/start-container`), so no host policy change is
-  needed; earlier builds staged under `/run/litevirt/ct`, which that profile
-  denies, and a config they rendered is staged there until a start by the
-  daemon renders it again (logged at Info). Rolling a host back below this
-  build reverses it: the older hook refuses a config naming the new root, so
-  an in-container reboot fails until that build's daemon starts the
-  container and renders it again, and the older post-stop does not clear the
-  new root, so mounts staged there stay until the host reboots. A host whose
+  needed. A host whose
   refresh of one container hangs (a mount source that stops answering)
   refuses that container's start and host-access changes with a retryable
   error naming the stuck refresh after 15 s, rather than waiting on it. Litevirt's start hook,

@@ -87,7 +87,7 @@ func hookMounts(cfg string) ([]hookMount, error) {
 		}
 		if k, v := configKey(line); k == "lxc.mount.entry" && pending != nil {
 			f := strings.Fields(v)
-			if len(f) < 2 || (!strings.HasPrefix(f[0], stagingRoot+"/") && !strings.HasPrefix(f[0], legacyStagingRoot+"/")) {
+			if len(f) < 2 || !strings.HasPrefix(f[0], stagingRoot+"/") {
 				return nil, fmt.Errorf("mount entry %q does not name a staging path", line)
 			}
 			pending.staging = f[0]
@@ -98,22 +98,15 @@ func hookMounts(cfg string) ([]hookMount, error) {
 	return out, nil
 }
 
-// hookStagingRoot is the staging root a container's config stages under:
-// the current one, or the root an earlier build rendered (legacyStagingRoot)
-// for a config no daemon-driven start has rendered again yet — an
-// in-container reboot right after an upgrade. Every entry must name exactly
-// its own staging path under that one root, in order.
-func hookStagingRoot(name string, mounts []hookMount) (string, error) {
-	root := stagingRoot
-	if len(mounts) > 0 && strings.HasPrefix(mounts[0].staging, legacyStagingRoot+"/") {
-		root = legacyStagingRoot
-	}
+// checkStagingPaths refuses a config any of whose entries does not name
+// exactly its own staging path under stagingRoot, in order.
+func checkStagingPaths(name string, mounts []hookMount) error {
 	for i, m := range mounts {
-		if want := stagingPathUnder(root, name, i); m.staging != want {
-			return "", fmt.Errorf("entry %d names %s, not %s", i, m.staging, want)
+		if want := stagingPath(name, i); m.staging != want {
+			return fmt.Errorf("entry %d names %s, not %s", i, m.staging, want)
 		}
 	}
-	return root, nil
+	return nil
 }
 
 // ensureStagingDir makes p a directory its owner (root, for the hook) alone
@@ -269,10 +262,7 @@ func RunHook(args []string) int {
 	}
 	switch hook {
 	case "post-stop":
-		// Wherever the start staged them: this build's root, or an earlier
-		// build's for a config not rendered again since.
 		clearStaging(filepath.Join(stagingRoot, name))
-		clearStaging(filepath.Join(legacyStagingRoot, name))
 		return 0
 	case "pre-start":
 	default:
@@ -322,13 +312,12 @@ func RunHook(args []string) int {
 			return 1
 		}
 	}
-	root, err := hookStagingRoot(name, mounts)
-	if err != nil {
+	if err := checkStagingPaths(name, mounts); err != nil {
 		hookLog("%s: %v", name, err)
 		return 1
 	}
-	dir := filepath.Join(root, name)
-	if err := ensurePrivateStagingRoot(root); err != nil {
+	dir := filepath.Join(stagingRoot, name)
+	if err := ensurePrivateStagingRoot(stagingRoot); err != nil {
 		hookLog("%v", err)
 		return 1
 	}

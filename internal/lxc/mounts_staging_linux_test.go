@@ -21,40 +21,33 @@ func stagingCfg(entries ...string) string {
 	return b.String()
 }
 
-// A config rendered by an earlier build names the old staging root: its
-// in-container reboot (no daemon in the loop to render it again) is staged
-// where it says, as before, never refused for it. A daemon-driven start
-// renders the new root. An entry under neither root, entries split between
-// them, or an entry out of order are refused.
+// Every entry must name exactly its own staging path under stagingRoot, in
+// order; an entry under any other root, out of order, or another
+// container's is refused.
 //
-// Mutation: drop the legacy root from hookMounts or hookStagingRoot — red.
-func TestHookStagingRoot(t *testing.T) {
+// Mutation: accept any path in checkStagingPaths — red.
+func TestCheckStagingPaths(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		entries []string
-		want    string
+		ok      bool
 	}{
-		{"current", []string{stagingRoot + "/c1/m0", stagingRoot + "/c1/m1"}, stagingRoot},
-		{"earlier build's", []string{"/run/litevirt/ct/c1/m0", "/run/litevirt/ct/c1/m1"}, "/run/litevirt/ct"},
-		{"split between roots", []string{stagingRoot + "/c1/m0", "/run/litevirt/ct/c1/m1"}, ""},
-		{"out of order", []string{stagingRoot + "/c1/m1"}, ""},
-		{"another container's", []string{stagingRoot + "/c2/m0"}, ""},
-		{"no root", []string{"/srv/a/data"}, ""},
+		{"current", []string{stagingRoot + "/c1/m0", stagingRoot + "/c1/m1"}, true},
+		{"another root", []string{"/run/litevirt/ct/c1/m0"}, false},
+		{"out of order", []string{stagingRoot + "/c1/m1"}, false},
+		{"another container's", []string{stagingRoot + "/c2/m0"}, false},
+		{"no root", []string{"/srv/a/data"}, false},
 	} {
 		ms, err := hookMounts(stagingCfg(tc.entries...))
 		if err == nil {
-			var root string
-			root, err = hookStagingRoot("c1", ms)
-			if err == nil && root != tc.want {
-				t.Errorf("%s: root = %s; want %s", tc.name, root, tc.want)
-			}
+			err = checkStagingPaths("c1", ms)
 		}
-		if (err == nil) != (tc.want != "") {
-			t.Errorf("%s: err = %v; want refused=%v", tc.name, err, tc.want == "")
+		if (err == nil) != tc.ok {
+			t.Errorf("%s: err = %v; want ok=%v", tc.name, err, tc.ok)
 		}
 	}
-	if root, err := hookStagingRoot("c1", nil); err != nil || root != stagingRoot {
-		t.Errorf("no mounts: %s, %v; want %s", root, err, stagingRoot)
+	if err := checkStagingPaths("c1", nil); err != nil {
+		t.Errorf("no mounts: %v", err)
 	}
 }
 

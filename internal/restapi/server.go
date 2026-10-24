@@ -16,7 +16,7 @@
 //	GET    /api/v1/hosts/{name}/devices                → ListHostDevices
 //	POST   /api/v1/hosts/{name}/rescan                 → RescanHost
 //	GET    /api/v1/hosts/{name}/stats                  → GetHostStats
-//	POST   /api/v1/hosts/{name}/config                 → ConfigureHost
+//	PUT    /api/v1/hosts/{name}/config                 → ConfigureHost
 //	GET    /api/v1/vms                                 → ListVMs (?stack=&host=&page_size=&page_token=)
 //	POST   /api/v1/vms/{name}                          → CreateVM
 //	GET    /api/v1/vms/{name}                          → InspectVM
@@ -383,8 +383,7 @@ func (s *Server) handleHost(w http.ResponseWriter, r *http.Request) {
 		}
 		jsonProto(w, resp)
 
-	case action == "config" && (r.Method == http.MethodPut || r.Method == http.MethodPost):
-		// Docs advertise PUT; POST is preserved for backward compatibility.
+	case action == "config" && r.Method == http.MethodPut:
 		var req pb.ConfigureHostRequest
 		if err := protoFromJSON(r, &req); err != nil {
 			jsonError(w, http.StatusBadRequest, err.Error())

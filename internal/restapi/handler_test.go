@@ -1703,7 +1703,7 @@ func TestHostStats(t *testing.T) {
 func TestHostConfig(t *testing.T) {
 	s, mock := newMockServer("test-token")
 	body := strings.NewReader(`{"name":"node1","fence_strategy":"ipmi"}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/hosts/node1/config", body)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/hosts/node1/config", body)
 	req.Header.Set("Authorization", "Bearer test-token")
 	rec := httptest.NewRecorder()
 	s.mux.ServeHTTP(rec, req)
@@ -1719,21 +1719,20 @@ func TestHostConfig(t *testing.T) {
 	}
 }
 
-// TestHostConfig_AcceptsPutAndPost — docs advertise PUT; POST is preserved.
-func TestHostConfig_AcceptsPutAndPost(t *testing.T) {
-	for _, method := range []string{http.MethodPut, http.MethodPost} {
-		s, mock := newMockServer("test-token")
-		req := httptest.NewRequest(method, "/api/v1/hosts/node1/config",
-			strings.NewReader(`{"fence_strategy":"ipmi"}`))
-		req.Header.Set("Authorization", "Bearer test-token")
-		rec := httptest.NewRecorder()
-		s.mux.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("%s /config: status %d, want 200", method, rec.Code)
-		}
-		if mock.lastConfigureHostReq == nil || mock.lastConfigureHostReq.Name != "node1" {
-			t.Errorf("%s /config: ConfigureHost not called with node1 (%+v)", method, mock.lastConfigureHostReq)
-		}
+// TestHostConfig_PutOnly: PUT is the documented method; POST is refused and
+// configures nothing.
+func TestHostConfig_PutOnly(t *testing.T) {
+	s, mock := newMockServer("test-token")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hosts/node1/config",
+		strings.NewReader(`{"fence_strategy":"ipmi"}`))
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("POST /config: status %d, want 404", rec.Code)
+	}
+	if mock.lastConfigureHostReq != nil {
+		t.Errorf("POST /config called ConfigureHost (%+v)", mock.lastConfigureHostReq)
 	}
 }
 

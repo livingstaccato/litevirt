@@ -168,7 +168,7 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 			ctx = withReplacedSnapshot(ctx, target, *deleted.snap)
 		} else {
 			// No report this node may accept: the owner deleted another
-			// incarnation, or is on an older build. This node's copy names
+			// incarnation, or reported nothing. This node's copy names
 			// the row for the existence check, but its firewall identity is
 			// not one this delete is known to have ended, so none is carried.
 			ctx = withoutReplacedFirewallID(withReplacedVM(ctx, cur), target)
@@ -709,7 +709,7 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 		// 2026-10-13, F1); any other row of the name is still refused. Only
 		// when this delete tore it down: NotFound deleted nothing. The row
 		// is the one the owner reports it deleted, or this node's copy when
-		// the owner (an older build) reports nothing.
+		// the owner reports nothing.
 		if deleted != nil && deleted.snap != nil {
 			createCtx = withReplacedRowSnapshot(createCtx, cur.Name, *deleted.snap)
 		} else {

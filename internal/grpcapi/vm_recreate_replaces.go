@@ -346,8 +346,8 @@ type replacedVMWire struct {
 	HoldHost       string            `json:"hold_host,omitempty"`
 	// FirewallID is the firewall identity of the row the delete tombstoned
 	// (VMDeleteSnapshot.FirewallID), which the re-create keeps
-	// (replacedFirewallCarry). An older build sends none: the re-created VM
-	// then has no identity, which fails closed.
+	// (replacedFirewallCarry). Without one the re-created VM has no
+	// identity, which fails closed.
 	FirewallID string `json:"firewall_id,omitempty"`
 }
 

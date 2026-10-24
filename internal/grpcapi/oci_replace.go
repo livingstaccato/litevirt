@@ -24,8 +24,7 @@ import (
 
 // ociReplaceMDKey marks a forwarded pull as an Admin's claim, judged on the
 // entry host where the caller is real. Honoured from an authenticated peer
-// only; an entry host that predates it never sends it, so its pulls over an
-// existing item are refused, as they were.
+// only; a pull without it over an existing item is refused.
 const ociReplaceMDKey = "x-litevirt-oci-replace-bin"
 
 // ociAdminClaim reports whether req is an Admin's claim: the Admin role and

@@ -187,8 +187,8 @@ func (s *Server) selfUpgradeTarget(ctx context.Context) (peer, version string, s
 	mySchema := corrosion.CurrentSchemaVersion
 	var peers []peerVersionInfo
 	for _, h := range hosts {
-		// Skip self, non-active peers, and rows with no reported version/schema
-		// (an old peer that hasn't written schema_version yet → 0 → never a source).
+		// Skip self, non-active peers, and rows with no reported version. A row
+		// with no schema_version (0) is never a source either.
 		if h.Name == s.hostName || h.State != "active" || h.Version == "" {
 			continue
 		}

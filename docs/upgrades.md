@@ -712,7 +712,9 @@ and its workloads are not recovered if it fails. Set `enforcement.fence_ssh` to
 `auto` or `managed` in that host's config and restart its daemon, then upgrade.
 A member that does not report its mode is upgraded past with a warning. The mode
 read is the one the daemon started with, so a config changed to `legacy` since
-then is caught only when the new daemon starts.
+then is caught only when the new daemon starts. `lv host add` refuses to copy an
+enforcement block that still says `legacy` onto a new host, naming the config it
+read it from, before anything is minted or pushed.
 `lv cluster upgrade-status` lists `fence_ssh` with
 whether it is used, and its token once latched. Its rollout summary (hosts on the
 release, features waiting) counts `release_2026_11_v1` only.

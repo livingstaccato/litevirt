@@ -1203,10 +1203,31 @@ lv import dump.vma.zst --from vma --server-path /srv/stage/dump.vma.zst --name a
 #   --preserve-mac                 keep source MACs (default: regenerate)
 #   --server-path <path>           use a file/dir already staged on the target host
 #   --inspect                      print the mapping + warnings, import nothing
+lv import win2022.ova --name win2022 --network br0 --inspect
+#   an OVA preview: CPU, memory, firmware, each disk (bus, controller, size)
+#   and each NIC (bridge, model, MAC), read from the .ovf descriptor alone
 #   Each disk lands as a NEW <vm>-<disk>.qcow2 in the target pool (or
 #   <data_dir>/disks without one); an existing file of that name is refused
 #   (AlreadyExists), never replaced.
 ```
+
+`--inspect` on an OVA reads the archive from where the import would — the
+upload, or the `--server-path` file under the same path check below — only as
+far as its `.ovf` descriptor, and writes nothing on the host: no staging
+directory, no upload file, no extracted disk, no row. The CLI stops uploading
+once the host has the descriptor, so previewing a large OVA does not send its
+disks. The sizes shown are the capacities the descriptor declares. Past the
+descriptor the preview reads only small members (a manifest, a certificate,
+up to 1 MiB) and stops at the first disk, so an archive the import would
+refuse further in still previews. The preview applies the import's member
+and size caps to what it reads but does not check that the host has room for
+the extraction; the import does. An archive with more than one `.ovf`
+member is refused by the import, naming both; the preview refuses it too
+when the second descriptor is among the small members it reads, but cannot
+see one behind a disk without reading the disk. Other sources (an OVF
+directory or bare `.ovf`, a Proxmox `.conf`, a `.vma`) are inspected the way
+the import reads them, and an upload or unpacked archive is removed once it
+is parsed.
 
 `--server-path`, `--disk-map` and any disk a Proxmox `.conf` names must be
 under the target host's import staging root (`<data_dir>/imports/staging`).

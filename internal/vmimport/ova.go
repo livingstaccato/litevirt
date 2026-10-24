@@ -51,18 +51,73 @@ func Budget(b uint64) Reserve {
 	}
 }
 
+// ovaMembers judges an archive's regular members by the name UnpackOVA
+// writes each under: the base name of its cleaned path. Every identity check
+// (is it a descriptor, has the name been seen) uses that name, never the raw
+// one, so "a.ovf/." is the descriptor a.ovf it would overwrite.
+type ovaMembers struct {
+	count    int
+	declared int64             // the sizes their headers declare, in all
+	seen     map[string]string // case-folded flattened name -> raw name
+	ovf      string            // raw name of the descriptor, once seen
+}
+
+// admit counts hdr and returns its flattened name and whether it is a
+// descriptor. It refuses the member cap, the member and archive size caps
+// (on the sizes headers declare, so a refusal needs no body read), a name
+// that cleans to nothing or escapes, a second descriptor, and a name an
+// earlier member already holds (case-insensitively, as some filesystems
+// hold them).
+func (m *ovaMembers) admit(hdr *tar.Header) (flat string, isOVF bool, err error) {
+	m.count++
+	if m.count > maxArchiveMembers {
+		return "", false, fmt.Errorf("ova exceeds member cap (%d)", maxArchiveMembers)
+	}
+	if hdr.Size > maxMemberSize {
+		return "", false, fmt.Errorf("ova member %q exceeds size cap", hdr.Name)
+	}
+	target, err := safeJoin("/", hdr.Name)
+	if err != nil {
+		return "", false, err
+	}
+	flat = filepath.Base(target)
+	isOVF = strings.EqualFold(filepath.Ext(flat), ".ovf")
+	if isOVF && m.ovf != "" {
+		return "", false, errSecondDescriptor(m.ovf, hdr.Name)
+	}
+	key := strings.ToLower(flat)
+	if prev, ok := m.seen[key]; ok {
+		return "", false, fmt.Errorf("ova member %q repeats the name of %q (both extract to %q)", hdr.Name, prev, flat)
+	}
+	if m.seen == nil {
+		m.seen = map[string]string{}
+	}
+	if hdr.Size > maxArchiveTotalSize-m.declared {
+		return "", false, fmt.Errorf("ova exceeds total size cap")
+	}
+	m.declared += hdr.Size
+	m.seen[key] = hdr.Name
+	if isOVF {
+		m.ovf = hdr.Name
+	}
+	return flat, isOVF, nil
+}
+
 // UnpackOVA extracts an OVA tar stream into dest (slip-safe, capped) and returns
-// the path to the single .ovf descriptor. Symlink/hardlink/device members are
-// rejected. Disk members and the descriptor land flat under dest. Each
+// the path to the single .ovf descriptor. An archive with a second .ovf member
+// is refused before that member is written: a preview (InspectOVA) describes
+// the first, so importing any other would import a VM nobody previewed. A
+// member whose flattened name repeats an earlier member's is refused too,
+// rather than written over it.
+// Symlink/hardlink/device members are rejected. Disk members and the descriptor land flat under dest. Each
 // member's size is reserved before it is written, below the fixed archive
 // cap: dest usually shares a filesystem with the daemon's database, and the
 // member is cut off at the size it reserved.
 func UnpackOVA(r io.Reader, dest string, reserve Reserve) (ovfPath string, err error) {
 	tr := tar.NewReader(r)
 	var (
-		members  int
-		total    int64
-		reserved int64
+		members ovaMembers
+		total   int64
 	)
 	for {
 		hdr, e := tr.Next()
@@ -80,24 +135,14 @@ func UnpackOVA(r io.Reader, dest string, reserve Reserve) (ovfPath string, err e
 		default:
 			return "", fmt.Errorf("ova member %q has disallowed type %d (symlink/hardlink/device not permitted)", hdr.Name, hdr.Typeflag)
 		}
-		members++
-		if members > maxArchiveMembers {
-			return "", fmt.Errorf("ova exceeds member cap (%d)", maxArchiveMembers)
-		}
-		if hdr.Size > maxMemberSize {
-			return "", fmt.Errorf("ova member %q exceeds size cap", hdr.Name)
-		}
-		target, e := safeJoin(dest, hdr.Name)
+		flat, isOVF, e := members.admit(hdr)
 		if e != nil {
 			return "", e
 		}
 		// Flatten: keep only the base name so split-VMDK extents + descriptor sit
 		// beside each other (OVF hrefs are relative basenames).
-		target = filepath.Join(dest, filepath.Base(target))
-		if hdr.Size > maxArchiveTotalSize-reserved {
-			return "", fmt.Errorf("ova exceeds total size cap")
-		}
-		reserved += hdr.Size
+		target := filepath.Join(dest, flat)
+		reserved := members.declared
 		if e := reserve(uint64(reserved)); e != nil {
 			return "", fmt.Errorf("ova member %q: %w", hdr.Name, e)
 		}
@@ -106,7 +151,7 @@ func UnpackOVA(r io.Reader, dest string, reserve Reserve) (ovfPath string, err e
 			return "", e
 		}
 		_ = n
-		if strings.EqualFold(filepath.Ext(target), ".ovf") {
+		if isOVF {
 			ovfPath = target
 		}
 	}
@@ -151,10 +196,31 @@ func (c *cappedReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// InspectOVA reads the tar only until the .ovf member and returns its bytes
-// (does not extract the multi-GB disks) — for the --inspect dry run.
+// errSecondDescriptor is the refusal of an archive with two .ovf members.
+func errSecondDescriptor(first, second string) error {
+	return fmt.Errorf("ova has more than one .ovf descriptor (%q and %q); refusing an archive whose VM is ambiguous", first, second)
+}
+
+// maxInspectTrailer bounds how much InspectOVA skips after the descriptor
+// looking for a second one: room for a manifest and certificate, never a disk.
+const maxInspectTrailer = 1 << 20
+
+// InspectOVA reads the tar only until the .ovf member and returns its bytes,
+// for lv import --inspect: the disk members are neither extracted nor, when
+// the descriptor comes first (as the OVF specification has it), read at all.
+// It refuses what UnpackOVA would refuse among the members it reads (their
+// types, names and declared sizes), so a preview does not describe an
+// archive the import would reject at its head. It does not reserve room:
+// whether the host can hold the extraction is the import's question.
+//
+// After the descriptor it reads on only through small members (a manifest,
+// a certificate: maxInspectTrailer bytes in all) and refuses a second .ovf
+// among them. Every member is judged by the name the import writes it
+// under (ovaMembers). A second descriptor behind a disk is out of its sight; the
+// import (UnpackOVA) refuses that archive.
 func InspectOVA(r io.Reader) ([]byte, error) {
 	tr := tar.NewReader(r)
+	var members ovaMembers
 	for {
 		hdr, e := tr.Next()
 		if e == io.EOF {
@@ -163,15 +229,64 @@ func InspectOVA(r io.Reader) ([]byte, error) {
 		if e != nil {
 			return nil, fmt.Errorf("read ova tar: %w", e)
 		}
-		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+		switch hdr.Typeflag {
+		case tar.TypeDir:
 			continue
+		case tar.TypeReg, tar.TypeRegA:
+		default:
+			return nil, fmt.Errorf("ova member %q has disallowed type %d (symlink/hardlink/device not permitted)", hdr.Name, hdr.Typeflag)
 		}
-		if strings.EqualFold(filepath.Ext(hdr.Name), ".ovf") {
-			if hdr.Size > 64<<20 {
+		_, isOVF, e := members.admit(hdr)
+		if e != nil {
+			return nil, e
+		}
+		if isOVF {
+			if hdr.Size > maxDescriptorSize {
 				return nil, fmt.Errorf("ovf descriptor implausibly large (%d bytes)", hdr.Size)
 			}
-			return io.ReadAll(io.LimitReader(tr, 64<<20))
+			data, e := io.ReadAll(io.LimitReader(tr, maxDescriptorSize))
+			if e != nil {
+				return nil, fmt.Errorf("read ovf descriptor: %w", e)
+			}
+			if e := inspectTrailer(tr, &members); e != nil {
+				return nil, e
+			}
+			return data, nil
 		}
 	}
 	return nil, fmt.Errorf("no .ovf descriptor found in OVA")
 }
+
+// inspectTrailer reads the members after the descriptor first while each
+// fits what is left of maxInspectTrailer, refusing a second .ovf or what
+// UnpackOVA refuses. It stops, without reading the member's body, at the
+// first member too large to skip (a disk) or at the end of the archive.
+func inspectTrailer(tr *tar.Reader, members *ovaMembers) error {
+	left := int64(maxInspectTrailer)
+	for {
+		hdr, e := tr.Next()
+		if e == io.EOF {
+			return nil
+		}
+		if e != nil {
+			return fmt.Errorf("read ova tar: %w", e)
+		}
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			continue
+		case tar.TypeReg, tar.TypeRegA:
+		default:
+			return fmt.Errorf("ova member %q has disallowed type %d (symlink/hardlink/device not permitted)", hdr.Name, hdr.Typeflag)
+		}
+		if _, _, e := members.admit(hdr); e != nil {
+			return e
+		}
+		if hdr.Size > left {
+			return nil
+		}
+		left -= hdr.Size
+	}
+}
+
+// maxDescriptorSize bounds the .ovf InspectOVA reads into memory.
+const maxDescriptorSize = 64 << 20

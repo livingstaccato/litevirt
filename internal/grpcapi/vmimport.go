@@ -118,6 +118,33 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	if err := s.firmwareMoveNameRefusal("import", name); err != nil {
 		return err
 	}
+	chunks := newImportChunks(stream, first.Chunk)
+	// A --server-path is resolved and judged once, before the preview or the
+	// import reads it.
+	var serverPath string
+	if first.SourcePath != "" {
+		p, perr := s.resolveStagedPath(ctx, first.SourcePath)
+		if perr != nil {
+			return perr
+		}
+		serverPath = p
+	}
+	// An OVA is inspected from its descriptor alone, read from where the
+	// import would read it, and nothing is written: no staging directory, no
+	// upload, no extracted disk.
+	if first.Inspect {
+		fv, ok, err := s.inspectOVASource(first, serverPath, chunks)
+		if err != nil {
+			return err
+		}
+		if ok {
+			fv.Name = name
+			if err := s.applyImportNetworks(ctx, fv, first); err != nil {
+				return err
+			}
+			return s.sendImportInspect(stream, fv, project)
+		}
+	}
 	// ── Stage the source into a temp import dir (always cleaned up) ──
 	if err := os.MkdirAll(filepath.Join(s.dataDir, "imports"), 0o755); err != nil {
 		return status.Errorf(codes.Internal, "prepare import dir: %v", err)
@@ -137,7 +164,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	defer space.release()
 	defer os.RemoveAll(importDir)
 
-	srcPath, err := s.stageImportSource(ctx, stream, first, importDir, space)
+	srcPath, err := s.stageImportSource(chunks, serverPath, importDir, space)
 	if err != nil {
 		return err
 	}
@@ -658,14 +685,16 @@ func (s *Server) proxyImportVM(ctx context.Context, stream pb.LiteVirt_ImportVMS
 }
 
 // stageImportSource lands the source artifact under importDir and returns its
-// path. source_path (a file/dir already on THIS host) skips the upload; otherwise
-// the streamed chunks are written to importDir/source.
+// path. serverPath (source_path, a file/dir already on THIS host, resolved and
+// judged by resolveStagedPath) skips the upload; otherwise
+// the streamed chunks (the first frame's included) are written to
+// importDir/source.
 //
 // Each chunk is reserved before it is written, so an upload larger than the
 // room left is refused as it arrives.
-func (s *Server) stageImportSource(ctx context.Context, stream pb.LiteVirt_ImportVMServer, first *pb.ImportVMRequest, importDir string, space *importReservation) (string, error) {
-	if first.SourcePath != "" {
-		return s.resolveStagedPath(ctx, first.SourcePath)
+func (s *Server) stageImportSource(chunks *importChunks, serverPath, importDir string, space *importReservation) (string, error) {
+	if serverPath != "" {
+		return serverPath, nil
 	}
 
 	path := filepath.Join(importDir, "source")
@@ -702,18 +731,15 @@ func (s *Server) stageImportSource(ctx context.Context, stream pb.LiteVirt_Impor
 		}
 		return nil
 	}
-	if err := write(first.Chunk); err != nil {
-		return "", err
-	}
 	for {
-		req, rerr := stream.Recv()
+		chunk, rerr := chunks.next()
 		if rerr == io.EOF {
 			break
 		}
 		if rerr != nil {
 			return "", rerr
 		}
-		if err := write(req.Chunk); err != nil {
+		if err := write(chunk); err != nil {
 			return "", err
 		}
 	}
@@ -1525,7 +1551,15 @@ func findByExt(dir, ext string) (string, error) {
 // sniffImportFormat guesses the source format from the file's leading bytes.
 func sniffImportFormat(path string) string {
 	head, err := readHead(path, 512)
-	if err != nil || len(head) == 0 {
+	if err != nil {
+		return ""
+	}
+	return sniffImportHead(head)
+}
+
+// sniffImportHead guesses the source format from its first 512 bytes.
+func sniffImportHead(head []byte) string {
+	if len(head) == 0 {
 		return ""
 	}
 	switch {
@@ -1535,7 +1569,7 @@ func sniffImportFormat(path string) string {
 		return "vma"
 	case len(head) >= 2 && head[0] == 0x1F && head[1] == 0x8B: // gzip
 		return "vma"
-	case len(head) >= 262 && bytes.Equal(head[257:262], []byte("ustar")): // tar
+	case isTarHead(head):
 		return "ova"
 	case bytes.Contains(head, []byte("<Envelope")) || bytes.Contains(head, []byte("<?xml")):
 		return "ovf"
@@ -1545,4 +1579,9 @@ func sniffImportFormat(path string) string {
 	default:
 		return ""
 	}
+}
+
+// isTarHead reports whether head opens a tar archive (ustar magic).
+func isTarHead(head []byte) bool {
+	return len(head) >= 262 && bytes.Equal(head[257:262], []byte("ustar"))
 }

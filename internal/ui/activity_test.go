@@ -29,9 +29,10 @@ func TestEventsPage(t *testing.T) {
 	}
 }
 
-// TestActivityIsNotARoute: the former /activity page is gone; the path no
-// longer redirects to /events.
-func TestActivityIsNotARoute(t *testing.T) {
+// TestActivityDoesNotRedirect: the former /activity page and its redirect to
+// /events are gone. The path now falls through to the GET / catch-all, which
+// renders the dashboard; the test asserts only that nothing redirects.
+func TestActivityDoesNotRedirect(t *testing.T) {
 	s := newTestUIServer(t, newDefaultMock())
 	w := serveRequest(s, withAuth(mustReq(t, "GET", "/activity")))
 	if w.Code == http.StatusFound || w.Header().Get("Location") != "" {

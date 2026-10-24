@@ -727,9 +727,9 @@ so it quarantines only for a feature of it that was used. Its one feature is
 ([below](#projects-created-before-the-upgrade-get-a-stable-identity)), and it
 is used by default on any cluster that holds a project created before
 `project_incarnation_v1` latched: the first adoption pass after the latch
-gives each such project its stable identity. So on every cluster upgraded from
-v1.9 with a project of its own, a rollback below `release_2027_01_v1`
-quarantines from that pass on. A cluster none of whose projects was created
+gives each such project its stable identity. So on every cluster with a
+project created before `project_incarnation_v1` latched, a rollback below
+`release_2027_01_v1` quarantines from that pass on. A cluster none of whose projects was created
 before `project_incarnation_v1` latched never uses it. That includes most
 clusters founded on v1.10, but not a project created on one in the moments
 before that token latched. To keep the ability to roll back, set
@@ -1520,10 +1520,9 @@ with the re-admission reset but without this change settles a tie between a
 stamped and an unstamped row on the stamped one only where the two rows
 otherwise agree; one that pulled the stale row whole (it has no such guard)
 differs in control-plane columns too, and leaves the tie unresolved until it
-is upgraded. A host on a build without the reset (v1.9.0 and earlier) leaves
-the tie unresolved, as before. An older-build host can also erase the stamp by
-pulling a newer, unstamped row from another older-build host. Where no host
-stamped, the tie stays as it was.
+is upgraded. An older-build host can also erase the stamp by pulling a newer,
+unstamped row from another older-build host. Where no host stamped, the tie
+stays as it was.
 
 The two `created_at` values come from two hosts' clocks. If the host's
 original `created_at` is later than the re-admission's — a clock skew larger

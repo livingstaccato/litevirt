@@ -162,8 +162,7 @@ capabilities package now has a **retired** set (`capabilities.Retired`,
 - the preflight treats a retired marker as known: it logs the marker and does not
   quarantine;
 - the marker is left in place. It is still evidence that the node ran as a member
-  (the founder-marker check relies on that), and a binary rolled back to v1.9.0
-  reads it as it always did;
+  (the founder-marker check relies on that);
 - names in the set are never removed and never reused.
 
 `TestPreflightCapabilityRollback_RetiredTokenIsNotARollback`
@@ -186,9 +185,9 @@ has to be migrated. In practice no production path ever wrote such a row.
 
 - clusters may already hold its marker. Reusing the name would make them come up
   pre-latched for the new contract without having gone through it;
-- v1.4.0–v1.9.0 binaries advertise the v1 name (flag on) with accept-only
-  semantics. In a mixed-version cluster the reused name could latch across nodes
-  that do not implement the freeze, the barrier or legacy rejection;
+- v1.4.0–v1.9.0 binaries advertised the v1 name (flag on) with accept-only
+  semantics, so a marker under that name means something other than the new
+  contract: the freeze, the barrier and legacy rejection;
 - the retired set's rule is that a retired name is never reused.
 
 v2 should be **advertised on the strength of the build** and **replication-gated**
@@ -402,7 +401,7 @@ Each one mutation-verified (break the property, watch it fail, restore):
   upsert shape is frozen again.
 - Should the new writer reuse `registryCanonicalUpsertSQL` exactly, so the existing
   `DispReject` entry turns into the gated entry, or use a fresh shape? Reusing it
-  means a v1.9.0 receiver still refuses it, which is the fail-closed answer, but
+  means a receiver on an older 1.10 build still refuses it, which is the fail-closed answer, but
   ties the new design to the old full-image SET.
 - Is step 7 worth a schema bump at all, given step 5 already makes duplicates
   impossible by construction?

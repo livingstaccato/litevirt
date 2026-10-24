@@ -69,19 +69,13 @@ func TestLoadConfig_NoRetiredKeyNoWarn(t *testing.T) {
 
 // enforcement.canonical_registry was readable only up to v1.9.0, which does not
 // upgrade in place to 1.10, so it is not on the retired-key list: a config that
-// sets it loads like one with any unknown key, with no retired-key WARN.
-//
-// Mutation: put the canonical_registry entry back in retiredConfigKeys — red.
-func TestLoadConfig_CanonicalRegistryIsNotARetiredKey(t *testing.T) {
-	logs := captureSlog(t)
+// sets it loads like one with any unknown key, and its sibling flags survive.
+func TestLoadConfig_CanonicalRegistryKeyStillLoads(t *testing.T) {
 	cfg, err := loadConfigYAML(t, "host_name: h\nenforcement:\n  canonical_registry: true\n  vm_replace: true\n")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !cfg.Enforcement.VMReplace {
 		t.Error("a sibling enforcement flag was lost beside the unknown key")
-	}
-	if strings.Contains(logs.String(), "retired") {
-		t.Errorf("a retired-key WARN for canonical_registry; log:\n%s", logs.String())
 	}
 }

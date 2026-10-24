@@ -94,8 +94,10 @@ func deadLeaderFenceUnder(t *testing.T, c *Cluster, voters []*Node, x, d *Node, 
 	ctx := context.Background()
 	a := voters[0]
 	if fr.Method == "ssh" {
-		// x recovers on its SSH power-off only on a host that trusts one.
-		trustSSHPoweroffOn(t, c, a, d, voters...)
+		// x recovers on its SSH power-off only on a host that trusts one,
+		// so x, the fencing node, must hold the label too, not only the
+		// voters.
+		trustSSHPoweroffOn(t, c, a, d, append(append([]*Node{}, voters...), x)...)
 	}
 	settled := &fenceSettled{voters: voters, host: d.Name, state: wantState}
 	c.SetClaimScript(dieAtFirstClaim(c, x, settled))

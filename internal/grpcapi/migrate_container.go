@@ -83,6 +83,13 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 		return status.Errorf(codes.AlreadyExists,
 			"container %q already exists on target host %q", req.Name, req.TargetHost)
 	}
+	if th, terr := corrosion.GetHost(ctx, s.db, req.TargetHost); terr != nil {
+		return status.Errorf(codes.Unavailable, "read target host %q: %v", req.TargetHost, terr)
+	} else if th != nil {
+		if err := nonWorkloadTargetError(th); err != nil {
+			return err
+		}
+	}
 	if err := s.refuseNoContainerRuntime(ctx, req.TargetHost); err != nil {
 		return err
 	}

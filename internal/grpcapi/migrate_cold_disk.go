@@ -478,7 +478,7 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	if len(hdr.Data) != 0 || hdr.Offset != 0 || hdr.Sha256 != "" {
 		return status.Error(codes.InvalidArgument, "the first frame carries only vm_name, path and size_bytes")
 	}
-	vm, err := s.authorizeMigrationHelper(ctx, hdr.VmName)
+	vm, err := s.authorizeMigrationTarget(ctx, hdr.VmName)
 	if err != nil {
 		return err
 	}

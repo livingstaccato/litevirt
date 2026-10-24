@@ -328,6 +328,33 @@ live moves. A live migration that was sent over the network and then cannot
 connect (the migration ports 49152-49215 on the migration address must be
 reachable from the source) fails; the fallback is decided before the move.
 
+### Plain UEFI VMs
+
+A UEFI VM with neither Secure Boot nor a vTPM keeps its variables in libvirt's
+own file, `/var/lib/libvirt/qemu/nvram/<vm>_VARS.fd`.
+
+- **Live move.** The variables travel in the migration stream. libvirt leaves
+  the source's file behind when it undefines the domain, so once the move has
+  committed on the target the source removes it, unless a domain of the name is
+  still defined there. A failed or rolled-back move keeps it.
+- **Cold move** (`--cold`, and a drain's move of a stopped VM). There is no
+  stream, so the file is sent with the domain definition. The target writes it
+  durably, reads it back and answers with its sha256; the source removes its own
+  copy only after the move has committed and only while the file still hashes to
+  what the target confirmed. A target that does not confirm (a build from before
+  this) refuses the move, nothing changed; a failed move keeps the source's file
+  and takes back what it wrote on the target.
+- **A same-name file.** A create, clone, import, restore or promote of a name
+  whose file is already on the host (left by an earlier build, or by a delete
+  `--keep-disks`), and a cold move's target, set it aside as
+  `<file>.superseded-<time>` before the domain is defined, so the VM never
+  starts from another VM's boot entries or keys. `lv host superseded-disks`
+  lists it. A `--keep-disks` delete of a plain UEFI VM therefore no longer lets
+  a re-create of the name adopt its vars; use restore for that.
+
+Secure Boot and vTPM VMs' variables are name-keyed under `<data_dir>/nvram` and
+are never touched by any of this; see below.
+
 ### Secure Boot / vTPM VMs
 
 `lv migrate <vm> <host>` moves a running Secure Boot or vTPM VM live. Its UEFI
@@ -953,8 +980,16 @@ lv host config host-b \
   --fence-strategy ipmi \
   --ipmi-address 10.0.50.111 \
   --ipmi-user admin \
-  --ipmi-pass <secret>
+  --ipmi-pass-file /root/bmc-pass
 ```
+
+`--ipmi-pass-file` takes a path, or `-` to read the password from stdin, and
+drops one trailing newline; an empty password is refused. `--ipmi-pass <secret>`
+still works, but the password is then visible to every user in `ps` on the
+machine running `lv`, and stays in the shell history, so `lv` prints a warning
+when it is used. The two flags are mutually exclusive. `lv` also warns,
+and still reads the file, when `--ipmi-pass-file` or `--redfish-pass-file`
+names a file its group or other users can read; `chmod 600` it.
 
 An empty `--ipmi-*` flag leaves the setting alone. To remove a host's IPMI
 address, user and password, use `--clear-ipmi`; a host that fences by `ipmi`
@@ -973,7 +1008,7 @@ back still has an IPMI address.
 
 `lv host rm` and a re-admission by `lv host add` retire the host's IPMI
 password, and it never falls back to a password from before the removal.
-Until it is set again with `lv host config <host> --ipmi-pass`, an `ipmi`
+Until it is set again with `lv host config <host> --ipmi-pass-file`, an `ipmi`
 fence of that host fails at once with `no IPMI password` and sends nothing to
 the BMC. A password that was never set is sent empty, for a BMC user with no
 password, and the fence result says so.
@@ -1129,6 +1164,11 @@ Match User root
     AuthorizedKeysCommand /usr/bin/cat /etc/litevirt/ssh/authorized_keys
     AuthorizedKeysCommandUser nobody
 ```
+
+`nobody` must traverse `/etc/litevirt` to read that file. `lv host init`
+(remote and `--local`) and `lv host add` create the directory `0711`, so it can
+be traversed but not listed; a directory that already exists keeps its mode and
+gains only the search bit (`o+x`).
 
 sshd reads an `AuthorizedKeysCommand`'s keys in addition to its
 `AuthorizedKeysFile`, so every file sshd read for root, from every address and
@@ -1975,6 +2015,42 @@ lv host config witness-1 --role witness
 Witnesses participate in failover quorum but never run workloads. The
 placement engine refuses to schedule any VM onto them. See
 [operating-model.md](operating-model.md) for sizing guidance.
+
+A migration names its target, so it never goes through placement; the
+request itself refuses a target that cannot run workloads, before anything
+moves. `lv migrate <vm> <host>` (cold or live; a drain's and the
+rebalancer's moves too) is refused `FailedPrecondition: target host "<host>"
+is a witness (role: witness) and runs no workloads`, and a host that is not
+`active` (draining, maintenance, fenced) is refused `is not active`. The
+target host checks its own role again when the source asks it to stage the
+move, so an older source that never checks cannot land a VM on a witness.
+
+A VM already stranded on a witness (accepted by an older build, or left there
+by a role change) can neither start (`start refused: local_not_active_worker`,
+which on a witness now says so) nor be placed, but it can be moved off: a
+witness admits a migration away from it. Run it naming a worker, then start
+the VM there:
+
+```bash
+lv migrate <vm> <worker-host> --cold
+lv start <vm>
+```
+
+A replication schedule accepts a witness as its target, so a witness can hold
+the only copy of a VM's disk. An operator's `lv replication promote` onto it
+takes the VM over under its own name and leaves it **defined and stopped** on
+the witness (a promote that renames it is refused there); its final status
+and a `vm.promoted_on_witness` event give the two steps above. The failover
+coordinator never promotes onto a witness, since a VM that is not started
+is not recovered: it holds the VM down (`failover.skip`, a
+`replication.promote_held` notification and a held event on the VM naming the
+steps), and the operator runs the promote by hand, then the migration.
+
+`lv host drain <witness>` is no longer refused by the execution gate: a
+witness may move workloads away, which is all a drain does. Draining an empty
+witness only marks it `draining` (it still votes and runs nothing); one that
+holds a stranded VM moves it to a worker. `lv host undrain` returns it to
+`active`.
 
 Without a witness, a cluster left with exactly two voting-eligible workers
 refuses every failover decision with `missing_witness`, **unless a voter

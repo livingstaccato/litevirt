@@ -111,36 +111,53 @@ func (s *Server) keptHere(d corrosion.DiskRecord, keepDisks bool) bool {
 // declared qcow2 backing file without the magic, and a chain deeper than
 // maxBackingDepth are errors naming the file.
 func keptChainLayers(file string) ([]string, error) {
+	layers, _, err := walkKeptChain(file, false)
+	return layers, err
+}
+
+// keptChainLayersToMissing is keptChainLayers, except that a backing file
+// below the top that does not exist ends the chain, with the layers above it,
+// and is returned as missing: nothing is at that path to keep, and nothing
+// below it is reached, but the last layer still names it, so a file written
+// there becomes that layer's base. Any other error is still one.
+func keptChainLayersToMissing(file string) (layers []string, missing string, err error) {
+	return walkKeptChain(file, true)
+}
+
+func walkKeptChain(file string, stopAtMissing bool) ([]string, string, error) {
 	var out []string
 	path, declaredQcow2 := file, false
 	for depth := 0; depth <= maxBackingDepth; depth++ {
 		fi, err := os.Stat(path)
 		if err != nil {
 			if depth == 0 && errors.Is(err, fs.ErrNotExist) {
-				return nil, nil
+				return nil, "", nil
 			}
-			return nil, fmt.Errorf("%s: %w", path, err)
+			if stopAtMissing && errors.Is(err, fs.ErrNotExist) {
+				return out, path, nil
+			}
+			return nil, "", fmt.Errorf("%s: %w", path, err)
 		}
 		out = append(out, path)
 		if !fi.Mode().IsRegular() {
-			return out, nil
+			return out, "", nil
 		}
 		isQ, err := hasQcow2Magic(path)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", path, err)
+			return nil, "", fmt.Errorf("%s: %w", path, err)
 		}
 		if !isQ {
 			if declaredQcow2 {
-				return nil, fmt.Errorf("%s: the overlay above it declares it qcow2, and it has no qcow2 header", path)
+				return nil, "", fmt.Errorf("%s: the overlay above it declares it qcow2, and it has no qcow2 header", path)
 			}
-			return out, nil
+			return out, "", nil
 		}
 		info, err := qcow2.Info(path)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", path, err)
+			return nil, "", fmt.Errorf("%s: %w", path, err)
 		}
 		if info.BackingFile == "" || looksLikeProtocol(info.BackingFile) {
-			return out, nil
+			return out, "", nil
 		}
 		b := info.BackingFile
 		if !filepath.IsAbs(b) {
@@ -148,7 +165,7 @@ func keptChainLayers(file string) ([]string, error) {
 		}
 		path, declaredQcow2 = filepath.Clean(b), info.BackingFormat == "qcow2"
 	}
-	return nil, fmt.Errorf("%s: backing chain deeper than %d", file, maxBackingDepth)
+	return nil, "", fmt.Errorf("%s: backing chain deeper than %d", file, maxBackingDepth)
 }
 
 // hasQcow2Magic reports whether path starts with the qcow2 magic.

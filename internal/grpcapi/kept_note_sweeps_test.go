@@ -225,13 +225,22 @@ func TestDeleteVM_TombstonesOnlySnapshotRecordsWhoseFilesAreGone(t *testing.T) {
 	mustExist(t, "the file another host's record names", paths["other"])
 }
 
-// The stale-record delete keeps the RAM images, and so the records naming
-// them, while a peer did not answer whether the VM runs there, as it keeps
-// the disks in that case: nothing it cannot prove unreferenced is removed.
+// The stale-record delete keeps the snapshots' RAM images and firmware
+// bundles, and so the records naming them, while a peer did not answer
+// whether the VM runs there, as it keeps the disks in that case: nothing it
+// cannot prove unreferenced is removed.
 //
-// Mutation: remove RAM images whatever the peers answered: red.
+// Red on e5871bcbe for the bundle. Mutations: remove RAM images, or the
+// firmware bundles, whatever the peers answered: red.
 func TestDeleteVM_StaleRecordKeepsRAMImagesWhileAPeerDidNotAnswer(t *testing.T) {
 	s, paths := snapRAMFixture(t)
+	bundle := lv.SnapshotFirmwareBundlePath(s.dataDir, "vmx", "ram")
+	if err := os.MkdirAll(filepath.Dir(bundle), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bundle, []byte("nvram and vTPM state"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := corrosion.InsertHost(adminCtx(), s.db, corrosion.HostRecord{Name: "node-9", Address: "10.0.0.9", State: "active"}); err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +251,33 @@ func TestDeleteVM_StaleRecordKeepsRAMImagesWhileAPeerDidNotAnswer(t *testing.T) 
 		t.Fatalf("DeleteVM: %v", err)
 	}
 	mustExist(t, "this host's RAM image", paths["ram"])
-	if got := liveSnapshotNames(t, s, "vmx"); !slices.Contains(got, "ram") {
-		t.Errorf("snapshot records after the delete = %v; want ram's kept with its image", got)
+	mustExist(t, "the snapshot's firmware bundle", bundle)
+	if got, want := liveSnapshotNames(t, s, "vmx"), []string{"legacy", "none", "other", "ram", "stuck"}; !slices.Equal(got, want) {
+		t.Errorf("snapshot records after the delete = %v; want every one kept with its files (%v)", got, want)
+	}
+}
+
+// The same refusal for a file in a pool's replica area, named with the VM
+// the listing shows beside it (ReplicaVm), which deleteAreaReplica serves
+// (re-review 4, N2). Another replica there is still deleted.
+//
+// Mutation: drop the note check from deleteAreaReplica: red.
+func TestDeleteStoragePoolContent_RefusesAReplicaAKeptNoteNames(t *testing.T) {
+	f := newPoolFixture(t)
+	kept := areaReplica(t, f.dr, "a", "web", "1", "20261007-120000")
+	other := areaReplica(t, f.dr, "a", "app", "1", "20261007-120000")
+	if err := health.NoteKeptDisks(f.s.dataDir, "web", []string{kept}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := f.s.DeleteStoragePoolContent(adminCtx(), &pb.DeleteStoragePoolContentRequest{PoolName: "dr", Filename: filepath.Base(kept), ReplicaVm: "web"})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), filepath.Join("kept-disks", "web.json")) {
+		t.Fatalf("deleting a replica a kept-disk note names = %v; want FailedPrecondition naming the note", err)
+	}
+	mustExist(t, "the noted replica", kept)
+	if _, err := f.s.DeleteStoragePoolContent(adminCtx(), &pb.DeleteStoragePoolContentRequest{PoolName: "dr", Filename: filepath.Base(other), ReplicaVm: "app"}); err != nil {
+		t.Fatalf("deleting a replica no note names: %v", err)
+	}
+	if present(other) {
+		t.Errorf("%s survived: the delete does nothing here, so this proves nothing", filepath.Base(other))
 	}
 }

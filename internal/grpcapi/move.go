@@ -608,7 +608,7 @@ func referenceKind(d *corrosion.DiskRecord, path string) string {
 // cleanup — both must never os.Remove a file that backs a linked clone or
 // another VM (the bug-sweep found migrate deleting a clone's backing chain).
 func (s *Server) pathStillReferenced(ctx context.Context, path, excludeVM, excludeDisk string) (bool, string, error) {
-	if held, why := s.keptNoteHolds(path); held {
+	if held, why := s.keptHolds(ctx, path); held {
 		return true, why, nil
 	}
 	refs, err := corrosion.DisksReferencingPath(ctx, s.db, path)
@@ -783,7 +783,7 @@ func (s *Server) deleteRecordedVMDiskVolumeRecordsKept(
 // "local" when even that is blank (legacy rows).
 func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.DiskRecord) error {
 	if !strings.HasPrefix(d.Path, "rbd:") {
-		if held, why := s.keptNoteHolds(d.Path); held {
+		if held, why := s.keptHolds(ctx, d.Path); held {
 			s.reportKeptNoteHold(ctx, d.VMName, "the delete of disk "+d.DiskName, d.Path, why)
 			return nil
 		}
@@ -1459,7 +1459,7 @@ func (s *Server) sweepVMDiskDebrisIn(ctx context.Context, vmName string, candida
 		if keep[c] {
 			continue
 		}
-		if held, why := s.keptNoteHolds(c); held {
+		if held, why := s.keptHolds(ctx, c); held {
 			keep[c] = true
 			s.reportKeptNoteHold(ctx, vmName, "the disk debris sweep", c, why)
 		}

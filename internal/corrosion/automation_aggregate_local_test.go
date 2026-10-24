@@ -16,14 +16,14 @@ import (
 	"github.com/litevirt/litevirt/internal/automation/contract"
 )
 
-// This exercises actual migrated86 snapshot creation and its live observer with
+// This exercises actual current-schema snapshot creation and its live observer with
 // nonempty certified-history execution. The attempt below supplies only the
 // private snapshot hash domain; this is not whole-roster aggregate acceptance.
 func TestAggregateLocal86NonemptyExecutionSnapshot(t *testing.T) {
 	f, _ := executionReplayCompletedFixture(t)
 	ctx := context.Background()
-	if storedVersion(t, f.c) != 88 {
-		t.Fatal("actual InitSchema86 required")
+	if got := storedVersion(t, f.c); got != CurrentSchemaVersion {
+		t.Fatalf("actual current InitSchema required: got %d, want %d", got, CurrentSchemaVersion)
 	}
 	before := executionStorageSnapshot(t, f.c)
 	attempt := &AutomationReceiverAttempt{id: "execution86-snapshot-component", binding: []byte("execution86-snapshot-component")}

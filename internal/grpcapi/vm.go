@@ -1730,6 +1730,22 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// create's guards, not records an earlier one of the name left.
 	defer s.noteCreatingIncarnation(spec.Name, spec.Uuid)()
 
+	// UEFI vars already at the domain's path are a previous VM's of this name
+	// (a migration's source, a delete that kept them): libvirt would hand them
+	// to this VM's first boot, with the old boot entries and keys. They are set
+	// aside, not removed (`lv host superseded-disks` lists them). The name-keyed
+	// Secure Boot / vTPM path is never touched here (setAsideStaleVars).
+	if domainVars != "" && domainVarsBefore {
+		if _, rerr := s.setAsideStaleVars(spec.Name, domainVars); rerr != nil {
+			return nil, status.Errorf(codes.Internal, "%v", abortDefined(fmt.Errorf(
+				"UEFI vars of an earlier VM %s at %s could not be set aside: %w", spec.Name, domainVars, rerr)))
+		}
+		if filepath.Clean(domainVars) != filepath.Clean(s.fw().NvramPath(spec.Name)) {
+			noteUndo("set aside stale vars " + domainVars)
+			domainVarsBefore = false
+		}
+	}
+
 	pciHeld = true
 	if err := s.StartDomainOnNetwork(ctx, spec.Name); err != nil {
 		// A failed first boot must not strand the domain, disks or TPM/NVRAM (G1).
@@ -4136,6 +4152,24 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest, owner *d
 				return nil, err
 			}
 			s.recordKeptDisks(ctx, req.Name, keptDisks)
+			// Noted as `lv rm --keep-disks` notes them, each with the files
+			// its chain backs on, before the tombstone frees the name: a
+			// create of the name then moves a kept disk aside and refuses
+			// to clear a file one backs on (rc3 lab 2, F1). A note that
+			// cannot be written keeps the record, and so the name.
+			if nerr := s.noteDeleteKeptDisks(ctx, req.Name, keptDisks); nerr != nil {
+				slog.Error("DeleteVM: the disks a delete of a VM with no domain kept could not be noted; keeping its record", "vm", req.Name, "error", nerr)
+				s.audit(ctx, "vm.delete", req.Name, "kept disks not noted: "+nerr.Error(), "error")
+				var ne *health.KeptDisksNoteError
+				if errors.As(nerr, &ne) {
+					return nil, status.Errorf(codes.FailedPrecondition,
+						"cannot delete VM %q: it keeps its disks on %s, and this host's note of the disks deletes kept, %s, cannot be read (%v); "+
+							"repair or remove that file, then retry; the record was kept", req.Name, s.hostName, ne.File, ne.Err)
+				}
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"cannot delete VM %q: it keeps its disks on %s, and noting them so that a later VM of the name leaves them failed: %v; "+
+						"the record was kept (retry once that is fixed)", req.Name, s.hostName, nerr)
+			}
 			setKeptDiskHeader(ctx, keptDisks)
 		}
 		// Give the addresses back BEFORE the row goes. The lease outlives the VM
@@ -4159,10 +4193,13 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest, owner *d
 			// The record is gone: the snapshots' RAM images and firmware
 			// bundles here go, and then the records of those whose files did.
 			// While a peer did not answer whether the VM runs there, the RAM
-			// images are kept, as its disks are above.
-			done := s.removeVMSnapshotRAMImages(ctx, req.Name, len(unknown) == 0)
-			if s.removeVMFirmwareBundles(ctx, req.Name) {
-				s.tombstoneVMSnapshotRecords(ctx, req.Name, done)
+			// images and bundles are kept, as its disks are above, and so are
+			// the records (a disk-only snapshot's names its bundle too).
+			if len(unknown) == 0 {
+				done := s.removeVMSnapshotRAMImages(ctx, req.Name)
+				if s.removeVMFirmwareBundles(ctx, req.Name) {
+					s.tombstoneVMSnapshotRecords(ctx, req.Name, done)
+				}
 			}
 		}
 		s.retireNICGuards(ctx, req.Name)
@@ -4395,7 +4432,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest, owner *d
 		setKeptHeader(ctx, cephKept)
 		s.sweepVMDiskDebris(ctx, req.Name)
 		s.removeOwnDiskLayers(ctx, req.Name, layers)
-		snapsDone = s.removeVMSnapshotRAMImages(ctx, req.Name, true)
+		snapsDone = s.removeVMSnapshotRAMImages(ctx, req.Name)
 		// Remove cloud-init ISO
 		_ = cloudinit.RemoveSeed(lv.CloudInitISOPath(s.dataDir, req.Name))
 		// Firmware state (G1): wipe nvram (name-keyed) + swtpm (uuid-keyed). With

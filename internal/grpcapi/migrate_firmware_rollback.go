@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -48,6 +49,24 @@ type firmwareTargetEntry struct {
 	attempt string
 	uuid    string
 	at      time.Time
+	// vars: the attempt wrote the VM's libvirt-managed UEFI vars here.
+	vars bool
+}
+
+// markVars records that the attempt for vm wrote its libvirt vars file.
+func (l *firmwareTargetLedger) markVars(vm string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if e, ok := l.m[vm]; ok {
+		e.vars = true
+		l.m[vm] = e
+	}
+}
+
+func (l *firmwareTargetLedger) wroteVars(vm string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.m[vm].vars
 }
 
 func (l *firmwareTargetLedger) add(vm, attempt, uuid string) {
@@ -137,6 +156,11 @@ func (s *Server) RollbackFirmwareState(ctx context.Context, req *pb.RollbackFirm
 	// another VM's.
 	if usesFirmwareState(vm.Spec) {
 		s.fw().WipeFirmwareState(req.VmName, req.Uuid)
+	}
+	// The libvirt-managed vars this attempt wrote, not a file that was here
+	// before it (that one was set aside, not removed).
+	if s.firmwareTargets.wroteVars(req.VmName) {
+		_ = os.Remove(s.libvirtVarsPath(req.VmName))
 	}
 	s.firmwareTargets.forget(req.VmName)
 	slog.Info("rollback firmware state: removed the domain and firmware this attempt defined",

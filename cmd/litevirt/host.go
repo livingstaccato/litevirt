@@ -731,7 +731,7 @@ answers: another host's health verdict about it is healthy or unready and under
 }
 
 func newHostConfigCmd() *cobra.Command {
-	var fenceStrategy, ipmiAddr, ipmiUser, ipmiPass, watchdogDev, role, region string
+	var fenceStrategy, ipmiAddr, ipmiUser, ipmiPass, ipmiPassFile, watchdogDev, role, region string
 	var cpuOvercommit, memOvercommit float64
 	var cpuReserve, memReserveMiB int
 	var clearIPMI bool
@@ -755,7 +755,20 @@ func newHostConfigCmd() *cobra.Command {
 			}
 			// The password from a file, or stdin for "-", keeps it out of
 			// argv (ps, shell history). One trailing newline is dropped.
+			if ipmiPassFile != "" {
+				warnSecretFileMode(cmd.ErrOrStderr(), "--ipmi-pass-file", ipmiPassFile)
+				p, err := readSecretFile(cmd.InOrStdin(), ipmiPassFile)
+				if err != nil {
+					return fmt.Errorf("--ipmi-pass-file: %w", err)
+				}
+				ipmiPass = p
+			} else if cmd.Flags().Changed("ipmi-pass") {
+				fmt.Fprintln(cmd.ErrOrStderr(), "warning: --ipmi-pass is visible to every user in the process "+
+					"list (ps) and is kept in shell history; use --ipmi-pass-file <path>, or --ipmi-pass-file - "+
+					"to read it from stdin")
+			}
 			if rfPassFile != "" {
+				warnSecretFileMode(cmd.ErrOrStderr(), "--redfish-pass-file", rfPassFile)
 				p, err := readSecretFile(cmd.InOrStdin(), rfPassFile)
 				if err != nil {
 					return fmt.Errorf("--redfish-pass-file: %w", err)
@@ -827,7 +840,11 @@ func newHostConfigCmd() *cobra.Command {
 		"Fencing strategy: ssh | ipmi | redfish | watchdog | manual | best-effort. 'manual' never powers the host off — it records the intent and waits for `lv host fence-confirm`.")
 	cmd.Flags().StringVar(&ipmiAddr, "ipmi-address", "", "IPMI BMC address")
 	cmd.Flags().StringVar(&ipmiUser, "ipmi-user", "", "IPMI username")
-	cmd.Flags().StringVar(&ipmiPass, "ipmi-pass", "", "IPMI password")
+	cmd.Flags().StringVar(&ipmiPass, "ipmi-pass", "",
+		"IPMI password (visible in ps and shell history; prefer --ipmi-pass-file)")
+	cmd.Flags().StringVar(&ipmiPassFile, "ipmi-pass-file", "",
+		"Read the IPMI password from this file, or from stdin for '-' (preferred over --ipmi-pass)")
+	cmd.MarkFlagsMutuallyExclusive("ipmi-pass", "ipmi-pass-file")
 	cmd.Flags().StringVar(&watchdogDev, "watchdog-dev", "", "Watchdog device path")
 	cmd.Flags().StringVar(&role, "role", "",
 		"Role: 'worker' (run VMs + vote) or 'witness' (vote-only tiebreaker for even-N clusters). Host must have no VMs to be promoted to witness.")
@@ -843,7 +860,7 @@ func newHostConfigCmd() *cobra.Command {
 		"MiB held back for the host itself (negative = inherit). 0 means hand guests every last MiB — the host gets no headroom.")
 	cmd.Flags().BoolVar(&clearIPMI, "clear-ipmi", false,
 		"Remove the host's IPMI address, user and password (an empty --ipmi-* flag leaves them alone). A host that fences by ipmi needs another --fence-strategy with it.")
-	for _, f := range []string{"ipmi-address", "ipmi-user", "ipmi-pass"} {
+	for _, f := range []string{"ipmi-address", "ipmi-user", "ipmi-pass", "ipmi-pass-file"} {
 		cmd.MarkFlagsMutuallyExclusive("clear-ipmi", f)
 	}
 	cmd.Flags().StringVar(&rfEndpoint, "redfish-endpoint", "", "Redfish BMC base URL, https://host[:port] (http is refused)")
@@ -881,6 +898,23 @@ func checkIPMICleared(h *pb.Host) error {
 			"--clear-ipmi; retry once every host is upgraded)", h.GetName(), h.GetIpmiAddress())
 	}
 	return nil
+}
+
+// warnSecretFileMode warns, on w, when the password file path (not "-",
+// stdin) can be read by its group or by other users. It does not refuse:
+// the file is the operator's, and the password is still kept out of argv.
+func warnSecretFileMode(w io.Writer, flag, path string) {
+	if path == "-" {
+		return
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return // the read reports it
+	}
+	if m := fi.Mode().Perm(); m&0o044 != 0 {
+		fmt.Fprintf(w, "warning: %s %s is mode %04o, readable by its group or other users; "+
+			"chmod 600 it to keep the password private\n", flag, path, m)
+	}
 }
 
 // readSecretFile reads a secret from path, or from in for "-", dropping one

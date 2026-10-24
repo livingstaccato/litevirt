@@ -4317,16 +4317,17 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			// The disks as they were before the promotion re-homes them: what
 			// it leaves on the failed host, recorded once it succeeds.
 			disksBefore, disksErr := corrosion.GetVMDisks(ctx, c.db, vm.Name)
-			if err := c.autoPromote(ctx, h, vm, fenceEpoch, promoteTerm); err != nil && errors.Is(err, corrosion.ErrPromoteHeld) && c.holdsDown(ctx, vm) {
-				// Held: the VM's only replicas are not point-in-time. A
+			if err := c.autoPromote(ctx, h, vm, fenceEpoch, promoteTerm); err != nil && errors.Is(err, corrosion.ErrPromoteHeld) && c.holdsDown(ctx, vm, heldCause(err)) {
+				// Held: the VM's only replicas are not point-in-time, or the
+				// replica is on a witness (heldCause). A
 				// host-local disk cannot be restarted elsewhere, so a
 				// reschedule would only re-home the record onto a host that
 				// cannot start it and hide the hold; the VM stays where it
 				// is, down, until an operator promotes it by hand (the
 				// promotion's event names the command).
-				slog.Warn("failover: VM held down; its only replica is not point-in-time", "vm", vm.Name, "error", err)
+				slog.Warn("failover: VM held down; "+heldCause(err), "vm", vm.Name, "error", err)
 				c.mVM(ActionPromote, ResultSkipped, ErrPromoteFailed)
-				c.auditSkip(ctx, h.Name, vm.Name, "held: the only replica is not point-in-time", "held")
+				c.auditSkip(ctx, h.Name, vm.Name, "held: "+heldCause(err)+heldSteps(err), "held")
 				continue
 			} else if err != nil {
 				// Fall through to the reschedule path on ANY promote error, including a
@@ -5191,17 +5192,37 @@ func (c *Coordinator) pitOverlaySafeTargets(ctx context.Context, candidates []co
 	return out
 }
 
+// heldCause is why an automatic promotion was held, for the log, the audit and
+// the shared-disk event: a replica on a witness is told apart from the
+// default, a replica that is not point-in-time.
+func heldCause(err error) string {
+	if errors.Is(err, corrosion.ErrReplicaOnWitness) {
+		return "the only replica is on a witness, which runs no workloads, so the VM cannot be started there"
+	}
+	return "the only replica is not point-in-time"
+}
+
+// heldSteps is the operator's way forward for a hold whose steps are two:
+// for a replica on a witness, promote it there by hand (it is left defined and
+// stopped), then move it to a worker.
+func heldSteps(err error) string {
+	if errors.Is(err, corrosion.ErrReplicaOnWitness) {
+		return "; promote it by hand with `lv replication promote <vm> --host <witness> ...`, then `lv migrate <vm> <worker> --cold` and `lv start <vm>`"
+	}
+	return ""
+}
+
 // holdsDown reports whether a VM whose automatic promotion was held stays
 // down rather than falling back to a reschedule: any disk that is not on
 // shared storage (or disks that cannot be read) holds it. A VM whose disks
 // are all shared is rescheduled as before — restarting from its own live disk
 // beats any replica — and an event says so.
-func (c *Coordinator) holdsDown(ctx context.Context, vm corrosion.VMRecord) bool {
+func (c *Coordinator) holdsDown(ctx context.Context, vm corrosion.VMRecord, cause string) bool {
 	disks, err := corrosion.GetVMDisks(ctx, c.db, vm.Name)
 	if err != nil || len(disks) == 0 || corrosion.VMHasHostLocalDisk(disks) {
 		return true
 	}
-	detail := "automatic promotion held (the only replica is not point-in-time); every disk is on shared storage, so the VM is restarted from its own disk instead"
+	detail := "automatic promotion held (" + cause + "); every disk is on shared storage, so the VM is restarted from its own disk instead"
 	if ierr := corrosion.InsertVMEvent(ctx, c.db, corrosion.VMEventRecord{
 		ID: randid.New(), VMName: vm.Name, HostName: c.hostName, Type: "vm.failover.restart_shared",
 		Result: "ok", Severity: "warn", Detail: detail, Username: "failover-coordinator",

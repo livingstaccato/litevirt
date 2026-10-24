@@ -1,9 +1,15 @@
 package grpcapi
 
 import (
+	"bytes"
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
 	"math"
 	"net"
+	"os"
 	"strings"
 	"testing"
 
@@ -127,5 +133,141 @@ func TestAutomationExportMethodPolicies(t *testing.T) {
 	}
 	if !auditHoldReadOnly(method) {
 		t.Fatal("immutable peer export blocked behind audit hold")
+	}
+}
+
+// The stream double represents only the transport boundary. It never supplies a
+// peer identity, auth context or source owner; the real handler must refuse it.
+type exportAdmissionStream struct {
+	grpc.ServerStream
+	ctx   context.Context
+	sends int
+}
+
+func (s *exportAdmissionStream) Context() context.Context                      { return s.ctx }
+func (s *exportAdmissionStream) Send(*pb.AutomationSourceExportResponse) error { s.sends++; return nil }
+func TestAutomationExportHandlerAdmissionAndRelease(t *testing.T) {
+	s := testServerR2(t)
+	stream := &exportAdmissionStream{ctx: context.Background()}
+	if got := status.Code(s.ExportAutomationSource(nil, stream)); got != codes.Unavailable {
+		t.Fatalf("missing admission: %v", got)
+	}
+	s.automationExportSem = make(chan struct{}, 2)
+	for i := 0; i < 2; i++ {
+		if got := status.Code(s.ExportAutomationSource(nil, stream)); got != codes.PermissionDenied {
+			t.Fatalf("unauthenticated export: %v", got)
+		}
+		if len(s.automationExportSem) != 0 {
+			t.Fatal("refused export retained its semaphore slot")
+		}
+	}
+	if s.automationSource != nil || stream.sends != 0 {
+		t.Fatal("unauthenticated export reached source preparation or Send")
+	}
+	s.automationExportSem <- struct{}{}
+	s.automationExportSem <- struct{}{}
+	if got := status.Code(s.ExportAutomationSource(nil, stream)); got != codes.ResourceExhausted {
+		t.Fatalf("full admission: %v", got)
+	}
+	if len(s.automationExportSem) != 2 || stream.sends != 0 {
+		t.Fatal("capacity refusal changed admitted work or sent a page")
+	}
+}
+
+// The canonical custom audit entry is backed by the current handler's direct
+// peer check, bounded owner call under its stream context, deferred admission
+// release, final identity check and returned transport error. This guard does
+// not pretend the unauthenticated admission test executes a successful export.
+func automationExportAuditProblems(raw []byte) []string {
+	f, err := parser.ParseFile(token.NewFileSet(), "automation_export.go", raw, parser.SkipObjectResolution)
+	if err != nil {
+		return []string{"parse export handler: " + err.Error()}
+	}
+	var handler *ast.FuncDecl
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "ExportAutomationSource" {
+			handler = fd
+		}
+	}
+	if handler == nil || handler.Body == nil {
+		return []string{"missing actual export handler"}
+	}
+	text := func(n ast.Node) string {
+		var b bytes.Buffer
+		_ = printer.Fprint(&b, token.NewFileSet(), n)
+		return b.String()
+	}
+	calls := map[string]token.Pos{}
+	acquired, released := false, false
+	ast.Inspect(handler.Body, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			calls[text(call)] = call.Pos()
+		}
+		if send, ok := n.(*ast.SendStmt); ok && text(send.Chan) == "s.automationExportSem" {
+			acquired = true
+		}
+		if d, ok := n.(*ast.DeferStmt); ok {
+			ast.Inspect(d, func(n ast.Node) bool {
+				if receive, ok := n.(*ast.UnaryExpr); ok && receive.Op == token.ARROW && text(receive.X) == "s.automationExportSem" {
+					released = true
+				}
+				return true
+			})
+		}
+		return true
+	})
+	var problems []string
+	if !acquired || !released {
+		problems = append(problems, "export lost owned deferred admission release")
+	}
+	for _, call := range []string{"stream.Context()", "s.requireAutomationExportPeer(ctx)", "checkedAutomationExportRequest(r)", "owner.ExportAutomationSource(ctx, request)"} {
+		if calls[call] == token.NoPos {
+			problems = append(problems, "export lost audited call: "+call)
+		}
+	}
+	last, ok := handler.Body.List[len(handler.Body.List)-1].(*ast.ReturnStmt)
+	if !ok || len(last.Results) != 1 || text(last.Results[0]) != "stream.Send(response)" {
+		problems = append(problems, "export no longer returns its actual Send error")
+	}
+	identity, send := calls["s.connIdentityGate(ctx)"], calls["stream.Send(response)"]
+	if identity == token.NoPos || send == token.NoPos || identity >= send {
+		problems = append(problems, "export lost final identity check before Send")
+	}
+	return problems
+}
+func TestAutomationExportCustomAuditBoundary(t *testing.T) {
+	original, err := os.ReadFile("automation_export.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := automationExportAuditProblems(original); len(got) != 0 {
+		t.Fatal(got)
+	}
+	for _, tc := range []struct{ name, before, after, want string }{
+		{"direct-peer", "s.requireAutomationExportPeer(ctx)", "s.requirePeerCert(ctx)", "lost audited call: s.requireAutomationExportPeer(ctx)"},
+		{"context", "owner.ExportAutomationSource(ctx, request)", "owner.ExportAutomationSource(context.Background(), request)", "lost audited call: owner.ExportAutomationSource(ctx, request)"},
+		{"release", "defer func() { <-s.automationExportSem }()", "func() { <-s.automationExportSem }()", "lost owned deferred admission release"},
+		{"send-error", "return stream.Send(response)", "_ = stream.Send(response); return nil", "no longer returns its actual Send error"},
+		{"final-identity", "if err := s.connIdentityGate(ctx); err != nil", "if err := s.requirePeerCert(ctx); err != nil", "lost final identity check before Send"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := string(original)
+			// connIdentityGate also occurs in the authentication helper. Mutate the
+			// actual handler, retaining the earlier authenticated-connection check.
+			start := strings.Index(raw, "func (s *Server) ExportAutomationSource(")
+			if start < 0 {
+				t.Fatal("actual export handler disappeared")
+			}
+			relative := strings.Index(raw[start:], tc.before)
+			if relative < 0 {
+				t.Fatal("mutation missed actual export handler")
+			}
+			at := start + relative
+			changed := []byte(raw[:at] + tc.after + raw[at+len(tc.before):])
+			got := strings.Join(automationExportAuditProblems(changed), "\n")
+			if strings.Contains(got, "parse ") || !strings.Contains(got, tc.want) {
+				t.Fatalf("wrong audit refusal: %s, want %q", got, tc.want)
+			}
+		})
 	}
 }

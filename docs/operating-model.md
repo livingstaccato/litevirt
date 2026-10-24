@@ -1396,8 +1396,8 @@ leadership churn or a partition.
 - **Even N**: only with a witness. 2-node with witness is fine for homelab.
 - **Beyond ~5 nodes**: no size is load-tested. The largest automated cluster in
   this repo that runs workload scenarios is 3 nodes (`tests/fleet/`), the only
-  larger ones measure anti-entropy and the probe mesh alone (below), and the largest by hand is
-  the 4-node lab. The relay-quorum protocol scales O(n) by design and there is no known
+  larger ones measure anti-entropy and the probe mesh alone (below), and the largest by hand are
+  the five- and six-node labs. The relay-quorum protocol scales O(n) by design and there is no known
   ceiling, but a figure like "tested and supported at ~50 nodes" is not
   backed by a sustained load test and should not be planned
   against. Larger clusters will likely need the anti-entropy interval tuned.

@@ -42,6 +42,50 @@ type replRunState struct {
 	// ownTargetSince is when runs first found the workload on its own replica
 	// target (zero when they do not).
 	ownTargetSince time.Time
+	// notOwnerSince is when runs on this host began to be skipped because it
+	// may not act as the VM's owner (zero when the last run was not), and
+	// notOwnerLast and notOwnerNotified the latest such skip and alert.
+	notOwnerSince, notOwnerLast, notOwnerNotified time.Time
+}
+
+// replNotOwnerGrace is how long runs may be skipped as not-owner before the
+// skip is alerted: a host back from a fence warms up and catches up well
+// inside it, and a VM that moved stops being dispatched here once the move
+// replicates. A skip that lasts past it means the host the schedule sees as
+// the VM's owner is still fenced or out of the cluster, and no replica is
+// being taken. A var so a test can shorten it.
+var replNotOwnerGrace = 15 * time.Minute
+
+// replNotOwnerForget is the gap after which an earlier skip no longer counts
+// toward the grace: the skips are separate episodes.
+const replNotOwnerForget = 25 * time.Hour
+
+// notOwnerSkip records one run of sched skipped because this host may not act
+// as the VM's owner now (reason), and alerts `replication.skipped` (warn) once
+// the skips have lasted replNotOwnerGrace, again at most hourly while they
+// continue. Any run that is not skipped ends the episode (replicationOutcome).
+func (s *Server) notOwnerSkip(ctx context.Context, sched corrosion.BackupScheduleRecord, name string, reason error) {
+	st := s.replState(sched)
+	now := time.Now()
+	s.replRuns.mu.Lock()
+	if st.notOwnerSince.IsZero() || now.Sub(st.notOwnerLast) > replNotOwnerForget {
+		st.notOwnerSince, st.notOwnerNotified = now, time.Time{}
+	}
+	st.notOwnerLast = now
+	since := st.notOwnerSince
+	due := now.Sub(since) >= replNotOwnerGrace &&
+		(st.notOwnerNotified.IsZero() || now.Sub(st.notOwnerNotified) >= replRenotifyEvery)
+	if due {
+		st.notOwnerNotified = now
+	}
+	s.replRuns.mu.Unlock()
+	if !due {
+		return
+	}
+	s.notify(ctx, notify.Notification{Kind: "replication.skipped", Severity: notify.SevWarn, Subject: name,
+		Detail: fmt.Sprintf("%s has skipped vm %s's replication schedule since %s: %v. If the VM still runs on this host, "+
+			"no replica of it is being taken; if it moved, this host's view has not caught up",
+			s.hostName, name, since.UTC().Format(time.RFC3339), reason)})
 }
 
 type replRuns struct {
@@ -154,6 +198,8 @@ func (s *Server) replicationOutcome(ctx context.Context, sched corrosion.BackupS
 		auditAction = "vm.replicate"
 	}
 	s.replRuns.mu.Lock()
+	// A run that was not skipped as not-owner ends any such episode.
+	st.notOwnerSince, st.notOwnerNotified = time.Time{}, time.Time{}
 	if err == nil {
 		wasFailing := st.failing
 		st.failing, st.class, st.ownTargetSince = false, "", time.Time{}

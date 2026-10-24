@@ -111,20 +111,28 @@ func (s *Server) admitVMReplicaSource(ctx context.Context, project, vmName strin
 	return nil
 }
 
+// notOwnerNowError is mayReplicateVMAsOwner's refusal: this host may not act
+// as the VM's owner now. It is not the schedule failing: the VM may have
+// moved while this host was fenced or partitioned, and its owner runs the
+// schedule (RunReplication reports it as scheduler.ErrRunSkipped).
+type notOwnerNowError struct{ msg string }
+
+func (e *notOwnerNowError) Error() string { return e.msg }
+
 // mayReplicateVMAsOwner refuses a run on a host that may no longer be the VM's
 // owner: one that has self-fenced or lost the execution gate, is not an active
 // member in its own view, or whose host-local owner-epoch marker is ahead of the
 // row it reads (its view is behind the runtime it holds).
 func (s *Server) mayReplicateVMAsOwner(ctx context.Context, vm *corrosion.VMRecord) error {
 	if reason, refused := s.execGateForAction(ctx, false); refused {
-		return fmt.Errorf("this host may not act as the VM's owner now (%s)", reason)
+		return &notOwnerNowError{fmt.Sprintf("this host may not act as the VM's owner now (%s)", reason)}
 	}
 	if h, err := corrosion.GetHost(ctx, s.db, s.hostName); err == nil && h != nil && h.State != "active" && h.State != "maintenance" {
-		return fmt.Errorf("this host is %s, not an active member, so it does not replicate", h.State)
+		return &notOwnerNowError{fmt.Sprintf("this host is %s, not an active member, so it does not replicate", h.State)}
 	}
 	if s.dataDir != "" {
 		if marker, found, err := health.ReadVMOwnerEpochMarker(s.dataDir, vm.Name); err == nil && found && marker > vm.OwnerEpoch {
-			return fmt.Errorf("the VM's owner-epoch marker here (%d) is ahead of its row (%d); this host's view is not current", marker, vm.OwnerEpoch)
+			return &notOwnerNowError{fmt.Sprintf("the VM's owner-epoch marker here (%d) is ahead of its row (%d); this host's view is not current", marker, vm.OwnerEpoch)}
 		}
 	}
 	return nil

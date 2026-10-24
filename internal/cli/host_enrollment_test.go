@@ -55,8 +55,8 @@ fi
 
 func TestEnrollmentActualSetupScriptDefersRestart(t *testing.T) {
 	// Execute the exact production script tail that enables/restarts litevirt.
-	// Earlier setup is privileged host configuration and is deliberately not run.
-	at := strings.LastIndex(setupScriptContent, "systemctl daemon-reload")
+	// Earlier setup includes the privileged fence installer and is not run.
+	at := strings.LastIndex(setupScriptContent, "systemctl enable litevirt.service")
 	if at < 0 {
 		t.Fatal("setup service tail missing")
 	}
@@ -90,9 +90,13 @@ func TestEnrollmentActualSetupScriptDefersRestart(t *testing.T) {
 }
 
 type enrollmentRemoteFixture struct {
-	events  []string
-	copied  string
-	request HostEnrollmentRequest
+	events     []string
+	copied     string
+	request    HostEnrollmentRequest
+	files      map[string][]byte
+	readErrors map[string]error
+	state      string
+	stateErr   error
 }
 
 func (f *enrollmentRemoteFixture) Close() error { f.events = append(f.events, "close"); return nil }
@@ -105,14 +109,42 @@ func (f *enrollmentRemoteFixture) Run(command string) error {
 	return nil
 }
 func (f *enrollmentRemoteFixture) RunOutput(command string) ([]byte, error) {
-	if strings.HasPrefix(command, "if [ -e ") {
+	if command == remoteConfigProbe(daemonConfigPath) {
 		f.events = append(f.events, "probe")
+		if err := f.readErrors[daemonConfigPath]; err != nil {
+			return nil, err
+		}
+		if b, ok := f.files[daemonConfigPath]; ok {
+			return b, nil
+		}
 		return []byte(noConfigSentinel), nil
 	}
-	f.events = append(f.events, "stage")
-	if !strings.HasPrefix(command, "mktemp -d /var/tmp/litevirt-enrollment.") {
-		return nil, errors.New("active remote effect before helper")
+	for _, path := range []string{daemonConfigPathOnTarget, remotePKIDir + "/ca.crt", remotePKIDir + "/ca.key", remotePKIDir + "/host.crt", remotePKIDir + "/host.key"} {
+		q := ssh.ShellQuote(path)
+		if command != fmt.Sprintf("if [ -e %s ]; then head -c 1048576 -- %s; else printf '%s'; fi", q, q, absentMarker) {
+			continue
+		}
+		f.events = append(f.events, "read "+path)
+		if err := f.readErrors[path]; err != nil {
+			return nil, err
+		}
+		if b, ok := f.files[path]; ok {
+			return b, nil
+		}
+		return []byte(absentMarker), nil
 	}
+	if command == stateFilesCmd(defaultRemoteDataDir) {
+		f.events = append(f.events, stateProbeKind)
+		return []byte(f.state), f.stateErr
+	}
+	if command == daemonActiveCmd {
+		f.events = append(f.events, daemonProbeKind)
+		return []byte("inactive\n"), nil
+	}
+	if command != "mktemp -d /var/tmp/litevirt-enrollment.XXXXXXXXXX" {
+		return nil, errors.New("unexpected remote command or active effect before helper")
+	}
+	f.events = append(f.events, "stage")
 	return []byte("/var/tmp/litevirt-enrollment.1234567890\n"), nil
 }
 
@@ -125,6 +157,16 @@ func TestHostInitEntryPathsUseStagedWorkflow(t *testing.T) {
 			source := addOperatorPKI(t)
 			useConfig(t, "")
 			t.Setenv("SUDO_USER", "")
+			etc := filepath.Join(t.TempDir(), "litevirt")
+			if err := os.Mkdir(etc, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(etc, 0700); err != nil {
+				t.Fatal(err)
+			}
+			oldEtc := etcLitevirtDir
+			etcLitevirtDir = etc
+			t.Cleanup(func() { etcLitevirtDir = oldEtc })
 			if err := pki.GenerateHostCert(filepath.Join(source, "ca.crt"), filepath.Join(source, "ca.key"), filepath.Join(source, "host.crt"), filepath.Join(source, "host.key"), "existing-host", nil); err != nil {
 				t.Fatal(err)
 			}
@@ -138,6 +180,9 @@ func TestHostInitEntryPathsUseStagedWorkflow(t *testing.T) {
 			defer func() { connectEnrollmentRemote = oldConnect }()
 			oldLocal := enrollLocalHost
 			enrollLocalHost = func(_ context.Context, r HostEnrollmentRequest) error {
+				if etcLitevirtDir != etc || modeOf(t, etc) != 0701 {
+					t.Fatal("owned config parent was not made searchable before enrollment")
+				}
 				remote.events = append(remote.events, "local-invoke")
 				remote.request = r
 				return nil
@@ -167,7 +212,10 @@ func TestHostInitEntryPathsUseStagedWorkflow(t *testing.T) {
 			events := strings.Join(remote.events, ",")
 			switch path {
 			case "remote-init":
-				if events != "probe,stage,current-helper,invoke,cleanup,close" {
+				if modeOf(t, etc) != 0700 {
+					t.Fatal("remote init changed the local config parent")
+				}
+				if events != "probe,read /etc/litevirt/config.yaml,read /etc/litevirt/pki/ca.crt,read /etc/litevirt/pki/ca.key,existing-state,existing-daemon,stage,current-helper,invoke,cleanup,close" {
 					t.Fatal(events)
 				}
 			case "local-init":
@@ -647,6 +695,16 @@ func TestHostInitDoesNotRegenerateMissingEstablishedOperatorCA(t *testing.T) {
 				dir := addOperatorPKI(t)
 				useConfig(t, "")
 				t.Setenv("SUDO_USER", "")
+				etc := filepath.Join(t.TempDir(), "litevirt")
+				if err := os.Mkdir(etc, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(etc, 0700); err != nil {
+					t.Fatal(err)
+				}
+				oldEtc := etcLitevirtDir
+				etcLitevirtDir = etc
+				t.Cleanup(func() { etcLitevirtDir = oldEtc })
 				oldKey, err := os.ReadFile(filepath.Join(dir, "ca.key"))
 				if err != nil {
 					t.Fatal(err)
@@ -686,8 +744,15 @@ func TestHostInitDoesNotRegenerateMissingEstablishedOperatorCA(t *testing.T) {
 				} else {
 					err = HostInit(context.Background(), "root@127.0.0.1", "new-host", false)
 				}
-				if err == nil {
-					t.Error("host init treated missing established CA as fresh workstation authority")
+				if err == nil || !strings.Contains(err.Error(), "initialize operator CA:") {
+					t.Fatalf("host init did not reach the missing-established-CA refusal: %v", err)
+				}
+				wantMode := os.FileMode(0700)
+				if local {
+					wantMode = 0701
+				}
+				if got := modeOf(t, etc); got != wantMode {
+					t.Fatalf("owned config parent mode=%o, want %o", got, wantMode)
 				}
 				if _, err := os.Lstat(filepath.Join(dir, "ca.crt")); !os.IsNotExist(err) {
 					t.Error("host init regenerated active or unknown operator root before quiescence")
@@ -827,5 +892,71 @@ func TestCLIClientFreshProcessPreservesRetainedDomain(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+func TestHostInitEntryPreflightRefusesBeforeStaging(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		for _, refusal := range []string{"foreign-state", "unreadable-config", "unparsable-config", "state-probe-failed"} {
+			t.Run(fmt.Sprintf("%s/force=%v", refusal, force), func(t *testing.T) {
+				t.Setenv("LV_CONFIG_DIR", filepath.Join(t.TempDir(), "operator"))
+				remote := &enrollmentRemoteFixture{files: map[string][]byte{}, readErrors: map[string]error{}}
+				switch refusal {
+				case "foreign-state":
+					remote.state = "/var/lib/litevirt/state.db\n"
+				case "unreadable-config":
+					remote.readErrors[daemonConfigPathOnTarget] = errors.New("read refused")
+				case "unparsable-config":
+					remote.files[daemonConfigPathOnTarget] = []byte("data_dir: [broken\n")
+				case "state-probe-failed":
+					remote.stateErr = errors.New("state probe refused")
+				}
+				oldConnect := connectEnrollmentRemote
+				connectEnrollmentRemote = func(*ssh.Target) (enrollmentConnection, error) { return remote, nil }
+				t.Cleanup(func() { connectEnrollmentRemote = oldConnect })
+				if err := HostInit(context.Background(), "root@127.0.0.1", "node-9", force); err == nil {
+					t.Fatal("preflight refusal was bypassed")
+				}
+				for _, event := range remote.events {
+					if event != "probe" && event != "close" && event != stateProbeKind && event != daemonProbeKind && !strings.HasPrefix(event, "read ") {
+						t.Fatalf("refused init changed the target: %v", remote.events)
+					}
+				}
+				if _, err := os.Stat(PKIDir()); !os.IsNotExist(err) {
+					t.Fatal("refused preflight created operator PKI", err)
+				}
+			})
+		}
+	}
+}
+
+func TestEnrollmentCreatesSearchableConfigParent(t *testing.T) {
+	for _, existing := range []os.FileMode{0, 0750} {
+		t.Run(fmt.Sprintf("%o", existing), func(t *testing.T) {
+			request, ops, _ := enrollmentFixture(t)
+			parent := filepath.Join(t.TempDir(), "litevirt")
+			if existing != 0 {
+				if err := os.Mkdir(parent, existing); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(parent, existing); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ops.pkiDir, ops.configPath = filepath.Join(parent, "pki"), filepath.Join(parent, "config.yaml")
+			if err := runHostEnrollment(context.Background(), request, ops); err != nil {
+				t.Fatal(err)
+			}
+			want := os.FileMode(0711)
+			if existing != 0 {
+				want = existing | 0001
+			}
+			if got := modeOf(t, parent); got != want {
+				t.Fatalf("config parent mode %o, want %o", got, want)
+			}
+			if got := modeOf(t, ops.pkiDir); got != 0700 {
+				t.Fatalf("private PKI mode %o", got)
+			}
+		})
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -85,10 +86,8 @@ func HostInitResolved(ctx context.Context, sshTarget string, rt *ssh.Target, hos
 	if err != nil && !force {
 		return err
 	}
-	if !absent {
-		if err := refuseIfAlreadyAMember(sshTarget, []byte(existingCfg), force); err != nil {
-			return err
-		}
+	if err := initPreflight(&enrollmentStateProbe{sc: sc}, sshTarget, existingCfg, absent, force); err != nil {
+		return err
 	}
 
 	pkiDir := PKIDir()
@@ -152,6 +151,67 @@ func HostInitResolved(ctx context.Context, sshTarget string, rt *ssh.Target, hos
 	fmt.Printf("Host %s initialized successfully at %s\n", hostName, hostAddr)
 	fmt.Printf("  gRPC endpoint: %s:7443 (mTLS)\n", hostAddr)
 	return nil
+}
+
+// etcLitevirtRemote is /etc/litevirt on a host init or add sets up.
+const etcLitevirtRemote = "/etc/litevirt"
+
+// remotePKIDirsCmd creates etc (/etc/litevirt), pki (its pki/) and each of
+// private (0700) before anything is pushed, as the shell names them.
+//
+// etc is created 0711 like `lv host init --local` makes it
+// (ensureEtcLitevirtDir): the fence ssh AuthorizedKeysCommand user must
+// traverse it, and nobody needs to list it. A plain `mkdir -p` of pki/ made
+// it 0755 under umask 022 before the setup script's `mkdir -p -m 0711` ran,
+// which then changed nothing. An existing etc keeps the mode it has: the
+// setup script adds only the search bit.
+func remotePKIDirsCmd(etc, pki string, private ...string) string {
+	cmd := "mkdir -p -m 0711 " + ssh.ShellQuote(etc) + " && mkdir -p " + ssh.ShellQuote(pki)
+	for _, d := range private {
+		cmd += " && mkdir -p -m 0700 " + ssh.ShellQuote(d)
+	}
+	return cmd
+}
+
+// enrollmentStateProbe reads through the same testable connection used to
+// stage the current enrollment helper; it exposes no installation operations.
+type enrollmentStateProbe struct{ sc enrollmentConnection }
+
+func (p *enrollmentStateProbe) ReadFile(path string) ([]byte, bool, error) {
+	q := ssh.ShellQuote(path)
+	out, err := p.sc.RunOutput(fmt.Sprintf("if [ -e %s ]; then head -c 1048576 -- %s; else printf '%s'; fi", q, q, absentMarker))
+	if err != nil {
+		return nil, false, err
+	}
+	if string(out) == absentMarker {
+		return nil, false, nil
+	}
+	return out, true, nil
+}
+
+func (p *enrollmentStateProbe) Shell(_, command string) ([]byte, error) {
+	return p.sc.RunOutput(command)
+}
+func (p *enrollmentStateProbe) Path(path string) string   { return path }
+func (p *enrollmentStateProbe) Unpath(path string) string { return path }
+
+// initPreflight is what `lv host init root@...` checks on the target before
+// anything is minted or pushed: that it is no other cluster's member
+// (refuseIfAlreadyAMember, which --force overrides), and that it holds no
+// state of a cluster this machine's CA did not found (refuseForeignState,
+// which nothing overrides: init would push this CA over it and keep its
+// database).
+func initPreflight(m stateProbe, sshTarget, existingCfg string, absent, force bool) error {
+	if !absent {
+		if err := refuseIfAlreadyAMember(sshTarget, []byte(existingCfg), force); err != nil {
+			return err
+		}
+	}
+	ca, err := localCA(PKIDir())
+	if err != nil {
+		return fmt.Errorf("read this machine's cluster CA: %w", err)
+	}
+	return refuseForeignState(m, ca, nil, sshTarget, "init")
 }
 
 // AuditRejoinFile is the CA-signed admission record `lv host add` writes into a
@@ -309,6 +369,17 @@ func stageHostEnrollmentIdentity(pkiDir, hostName, addr string) (stagedEnrollmen
 	return staged, nil
 }
 
+// etcLitevirtDir is the system config directory. A var so a test can point it
+// at a temp dir.
+var etcLitevirtDir = "/etc/litevirt"
+
+// ensureEtcLitevirtDir opens the system config directory for search only.
+// `lv host init --local` used to create it as a side effect of
+// MkdirAll(".../pki", 0700), so it came out 0700 and the fence ssh
+// AuthorizedKeysCommand (nobody) could not traverse it. The rule lives in
+// fencessh.EnsureSearchableDir, which the daemon applies too.
+func ensureEtcLitevirtDir(dir string) error { return fencessh.EnsureSearchableDir(dir) }
+
 func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bool) error {
 	if err := pki.ValidateHostName(hostName); err != nil {
 		return err
@@ -324,6 +395,10 @@ func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bo
 		return err
 	}
 
+	// Before any MkdirAll below makes it as a 0700 side effect.
+	if err := ensureEtcLitevirtDir(etcLitevirtDir); err != nil {
+		return err
+	}
 	pkiDir := PKIDir()
 	if err := os.MkdirAll(pkiDir, 0700); err != nil {
 		return fmt.Errorf("create PKI dir: %w", err)
@@ -375,10 +450,15 @@ func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bo
 		return fmt.Errorf("local enrollment: %w", err)
 	}
 
-	fmt.Printf("Host %s initialized locally\n", hostName)
-	fmt.Println("  Start the daemon: systemctl enable --now litevirt.service")
-	fmt.Println("  Or run directly:  litevirt daemon")
+	printLocalInitDone(os.Stdout, hostName)
 	return nil
+}
+
+// printLocalInitDone runs after owned enrollment has configured the service
+// and its explicit start has succeeded. Setup itself defers the restart.
+func printLocalInitDone(w io.Writer, hostName string) {
+	fmt.Fprintf(w, "Host %s initialized locally\n", hostName)
+	fmt.Fprintln(w, "  The daemon is enabled and running: systemctl status litevirt.service")
 }
 
 type cliPKITarget struct {
@@ -1083,7 +1163,12 @@ echo "Enabled libvirtd TLS (port 16514)"
 # keeps its mode. qemu reaches its files through them (internal/diskmode).
 mkdir -p /var/lib/litevirt
 mkdir -p -m 0711 /var/lib/litevirt/{images,disks,cloudinit}
-mkdir -p /etc/litevirt
+# Searchable but not listable (0711), as the disk dirs above: the fence ssh
+# AuthorizedKeysCommand runs unprivileged and must reach /etc/litevirt/ssh. The
+# secrets below it keep their own 0700/0600. An existing directory only gains the
+# search bit, whatever else its mode is.
+mkdir -p -m 0711 /etc/litevirt
+chmod o+x /etc/litevirt
 ` + genesisMarkerScript + `
 # Libvirt storage pools are auto-created by litevirtd on startup
 # (from storage_pools config or a default local pool).
@@ -1127,10 +1212,15 @@ CONF
 # Propagate the adding node's enforcement block: capability latches require
 # config uniformity, and a host that boots without the flags silently weakens
 # the cluster (a re-admitted signer without enforcement.audit_signature writes
-# unsigned audit rows that every node reports as tampering).
+# unsigned audit rows that every node reports as tampering). An init has no
+# adding node: its block is the new cluster's (or the host's own, kept).
 if [ -n "${ENFORCEMENT_B64:-}" ]; then
     echo "${ENFORCEMENT_B64}" | base64 -d >> /etc/litevirt/config.yaml
-    echo "enforcement config propagated from the adding node"
+    if [ "${LITEVIRT_GENESIS:-}" = "1" ]; then
+        echo "enforcement config written for the cluster this host founds"
+    else
+        echo "enforcement config propagated from the adding node"
+    fi
 fi
 fi
 
@@ -1163,6 +1253,7 @@ if [ "${FENCE_SSH_DROPIN:-1}" != 0 ]; then
     lv_fence_ssh_install || echo "fence ssh: the drop-in was not installed"
 else
     install -d -m 0755 /etc/litevirt/ssh
+    chmod o+x /etc/litevirt
     echo "fence ssh: --no-fence-ssh; add /etc/litevirt/ssh/authorized_keys to root's AuthorizedKeysFile by hand"
 fi
 

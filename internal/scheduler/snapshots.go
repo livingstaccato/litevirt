@@ -302,7 +302,9 @@ func (s *SnapshotScheduler) dispatchPointInTimeRetries(ctx context.Context, sche
 			fanout.ProjectName = ""
 			if r.PointInTimeRetryDue(fanout) {
 				s.runHeld(fanout, now, func() {
-					if err := s.ReplRunner.RunReplication(ctx, fanout, now); err != nil {
+					if err := s.ReplRunner.RunReplication(ctx, fanout, now); errors.Is(err, ErrRunSkipped) {
+						slog.Info("snapshot scheduler: point-in-time retry skipped", "vm", vmName, "repo", sched.Repo, "reason", err)
+					} else if err != nil {
 						slog.Warn("snapshot scheduler: point-in-time retry failed", "vm", vmName, "repo", sched.Repo, "error", err)
 					}
 				})
@@ -405,6 +407,12 @@ func (s *SnapshotScheduler) runAndRecord(ctx context.Context, sched corrosion.Ba
 		}
 		err = s.Runner.RunBackup(ctx, sched, runAt)
 	}
+	if errors.Is(err, ErrRunSkipped) {
+		// Not this host's run: nothing is recorded on the schedule row,
+		// which the owner's runs keep.
+		slog.Info("snapshot scheduler: schedule run skipped", "type", sched.Type, "vm", sched.VMName, "repo", sched.Repo, "reason", err)
+		return
+	}
 	runErr := ""
 	if err != nil {
 		runErr = err.Error()
@@ -429,6 +437,13 @@ func alreadyRanThisMinute(lastRunAt string, now time.Time) bool {
 	}
 	return t.UTC().Truncate(time.Minute).Equal(now.UTC().Truncate(time.Minute))
 }
+
+// ErrRunSkipped is wrapped by a runner's error for a run this host does not
+// make because it may not act as the workload's owner now: it is coming back
+// from a fence or a partition (warmup), or its view of the workload is behind,
+// and the workload may have moved. The scheduler logs it at info and records
+// nothing on the schedule row; it is not a failure of the schedule.
+var ErrRunSkipped = errors.New("schedule run skipped")
 
 // ErrNoRepoConfigured is returned by RunnerWithRepoResolver when a
 // schedule references a logical repo name not present in the daemon

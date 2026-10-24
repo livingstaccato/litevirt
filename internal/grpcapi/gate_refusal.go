@@ -24,6 +24,9 @@ func (s *Server) gateRefusal(ctx context.Context, what, reason string, remedy fu
 	if reason != health.ReasonLocalNotActiveWorker {
 		return msg
 	}
+	if hint, isWitness := s.witnessLocalHint(ctx); isWitness {
+		return msg + " — " + hint
+	}
 	is, ok := s.localOutOfServiceState(ctx)
 	if !ok {
 		return msg

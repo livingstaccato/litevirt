@@ -51,8 +51,17 @@ func TestReconcilePass_ABackingImagePullOutlivesTheWalkBudget(t *testing.T) {
 		t.Fatalf("InsertDisk: %v", err)
 	}
 
+	// The budget starts running when the pass starts, and the walk spends it on
+	// database round trips (the start marker, the disk list) before it reaches
+	// the pull. Under -race on a loaded host those alone have outlasted 200ms
+	// (about 1 run in 500): the walk then expired with "begin tx: context
+	// deadline exceeded", never reached the pull, and the test failed as
+	// "fixture inert". The budget therefore has to be generous enough that the
+	// walk reaches the VM on a starved host, yet still short enough to be the
+	// thing that ends the pass; the bound below is asserted relative to it.
+	const walkBudget = 1500 * time.Millisecond
 	origBudget := reconcileWalkBudget
-	reconcileWalkBudget = 200 * time.Millisecond
+	reconcileWalkBudget = walkBudget
 	t.Cleanup(func() { reconcileWalkBudget = origBudget })
 
 	fake := libvirtfake.New()
@@ -80,14 +89,22 @@ func TestReconcilePass_ABackingImagePullOutlivesTheWalkBudget(t *testing.T) {
 
 	start := time.Now()
 	r.ReconcileOnce(ctx)
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Fatalf("one reconcile pass took %v with a transfer in flight; the walk is no longer "+
-			"bounded and the safety sweeps behind it are delayed", elapsed)
+	if elapsed := time.Since(start); elapsed > walkBudget+2*time.Second {
+		t.Fatalf("one reconcile pass took %v with a transfer in flight (walk budget %v); the walk is "+
+			"no longer bounded and the safety sweeps behind it are delayed", elapsed, walkBudget)
+	}
+	// The pull runs on its own goroutine: wait for it to have started rather
+	// than reading a counter the moment the pass returns.
+	var pctx context.Context
+	select {
+	case pctx = <-pullCtxs:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("fixture inert: autoPullImage ran %d times, want 1 (the walk did not reach the VM "+
+			"within its %v budget)", pulls.Load(), walkBudget)
 	}
 	if pulls.Load() != 1 {
 		t.Fatalf("fixture inert: autoPullImage ran %d times, want 1", pulls.Load())
 	}
-	pctx := <-pullCtxs
 	if err := pctx.Err(); err != nil {
 		t.Fatalf("the transfer's context is %v after the walk budget expired.\n"+
 			"A backing image that needs longer than the budget is cancelled on every "+

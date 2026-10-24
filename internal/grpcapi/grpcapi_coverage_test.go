@@ -3848,9 +3848,8 @@ func TestMigrateVM_VMNotFound(t *testing.T) {
 	}
 }
 
-// reconcileDeadLBs (the periodic LB self-heal) re-applies only LBs whose keepalived is DEAD,
-// never churning a healthy holder — recovering keepalived after a restart/upgrade or a
-// self-demote heal once quorum lets the gated apply through.
+// A running holder with the intended rendered transport is left alone. A dead
+// child or unknown rendered state still needs the periodic self-heal.
 func TestReconcileDeadLBs_OnlyReappliesDead(t *testing.T) {
 	s := testServerCov(t)
 	s.db.SetClusterPolicyGate(func() bool { return true }) // failover_scope_v1 latched: the LB's snat is recordable
@@ -3868,11 +3867,14 @@ func TestReconcileDeadLBs_OnlyReappliesDead(t *testing.T) {
 	}
 	applies = 0
 
-	// keepalived RUNNING → no re-apply.
+	// This ungated fixture wants multicast. A count-only apply does not write
+	// keepalived's config: supply the actual matching rendered observation.
+	s.lbRenderedTransportOverride = func(string) (lb.Transport, bool) { return lb.Transport{}, true }
+	// keepalived RUNNING with current rendered state → no re-apply.
 	s.lbKeepalivedOverride = func(string) bool { return true }
 	s.reconcileDeadLBs(ctx)
 	if applies != 0 {
-		t.Fatalf("a running LB must not be re-applied; got %d applies", applies)
+		t.Fatalf("a running LB with current rendered state must not be re-applied; got %d applies", applies)
 	}
 
 	// keepalived DEAD → re-applied once.
@@ -3880,6 +3882,15 @@ func TestReconcileDeadLBs_OnlyReappliesDead(t *testing.T) {
 	s.reconcileDeadLBs(ctx)
 	if applies != 1 {
 		t.Fatalf("a dead LB must be re-applied exactly once; got %d applies", applies)
+	}
+
+	// A live child is insufficient when the rendered state cannot be observed.
+	applies = 0
+	s.lbKeepalivedOverride = func(string) bool { return true }
+	s.lbRenderedTransportOverride = func(string) (lb.Transport, bool) { return lb.Transport{}, false }
+	s.reconcileDeadLBs(ctx)
+	if applies != 1 {
+		t.Fatalf("a running LB with unknown rendered state must be re-applied; got %d applies", applies)
 	}
 }
 

@@ -120,6 +120,11 @@ func runHostEnrollment(ctx context.Context, r HostEnrollmentRequest, ops hostEnr
 	if err := ops.stop(ctx, r); err != nil {
 		return fmt.Errorf("quiesce enrollment service: %w", err)
 	}
+	// The staged helper, rather than remote-init copying active PKI, creates
+	// the config parent with the same searchable mode as host add/local init.
+	if err := ensureEtcLitevirtDir(filepath.Dir(ops.pkiDir)); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(ops.pkiDir, 0700); err != nil {
 		return err
 	}

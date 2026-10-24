@@ -632,6 +632,18 @@ temp sibling and is renamed into its final name only once it has completed
 and is non-empty — never over a file already there — so an interrupted run
 cannot leave a truncated file promotion would select.
 
+A run on a host that may not act as the VM's owner now is **skipped, not
+failed**. A host coming back from a fence or a partition still sees the VM's
+row on itself until it has caught up, though the VM may have been promoted on
+another host meanwhile. While it warms up, has lost its execution gate, is not
+an active member in its own view, or holds an owner-epoch marker ahead of the
+row, its scheduler logs `schedule run skipped` at info, raises no failure,
+and writes nothing to the schedule row: `LAST RUN` and `LAST ERR` stay the
+owner's. Skips that go on for 15 minutes (the host is still fenced, or its
+view never catches up) raise `replication.skipped` (warn), at most hourly
+while they continue: if the VM still runs there, no replica is being taken.
+A run that is not skipped ends that episode.
+
 ### Where replicas live, and how they are selected
 
 A target pool is often a global pool every project uses, so replicas are not

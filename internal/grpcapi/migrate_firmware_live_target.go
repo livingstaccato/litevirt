@@ -129,7 +129,7 @@ func (s *Server) PrepareLiveFirmwareTarget(ctx context.Context, req *pb.PrepareL
 	if err := s.requirePeerCert(ctx); err != nil {
 		return nil, err
 	}
-	vm, err := s.authorizeMigrationHelper(ctx, req.VmName)
+	vm, err := s.authorizeMigrationTarget(ctx, req.VmName)
 	if err != nil {
 		return nil, err
 	}

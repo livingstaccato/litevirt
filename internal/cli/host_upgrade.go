@@ -12,6 +12,7 @@ import (
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/fencessh"
 )
 
 // binaryVersion runs `<path> --version` and returns the stamped version (the
@@ -229,6 +230,10 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 		return nil
 	}
 
+	if err := checkFenceSSHModes(ctx, client, targets); err != nil {
+		return err
+	}
+
 	// Print upgrade plan.
 	fmt.Printf("Upgrade plan: %d host(s) → %s\n\n", len(targets), versionLabel(targetVersion))
 	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
@@ -323,6 +328,21 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 		return fmt.Errorf("%d host(s) failed to upgrade", failures)
 	}
 	return nil
+}
+
+// checkFenceSSHModes is fencessh.CheckUpgradeModes for this upgrade's
+// targets: it refuses while any member, target or not, still reports
+// enforcement.fence_ssh: legacy, and prints what it could not read.
+func checkFenceSSHModes(ctx context.Context, client pb.LiteVirtClient, targets []*pb.Host) error {
+	names := make([]string, 0, len(targets))
+	for _, h := range targets {
+		names = append(names, h.Name)
+	}
+	warnings, err := fencessh.CheckUpgradeModes(ctx, client, names)
+	for _, w := range warnings {
+		fmt.Fprintln(os.Stderr, "warning: "+w)
+	}
+	return err
 }
 
 func upgradeOneHost(ctx context.Context, client pb.LiteVirtClient, h *pb.Host, binaryPath, targetVersion string, force bool) hostResult {

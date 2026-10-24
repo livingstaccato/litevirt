@@ -400,8 +400,14 @@ LogLevel VERBOSE
 
 // agent is n's fence ssh agent over the world's database, in mode.
 func (n *node) agent(mode string) *fencessh.Agent {
+	return n.gatedAgent(mode, nil)
+}
+
+// gatedAgent is agent with gate as its release gate: whether
+// release_2026_12_v1 has latched on n.
+func (n *node) gatedAgent(mode string, gate fencessh.Gate) *fencessh.Agent {
 	return fencessh.New(fencessh.Config{
-		Self: n.name, PKIDir: n.pkiDir, DB: n.w.db, Dir: n.dir, SSHUser: n.w.user,
+		Self: n.name, PKIDir: n.pkiDir, DB: n.w.db, Gate: gate, Dir: n.dir, SSHUser: n.w.user,
 		Mode: func() string { return mode },
 	})
 }

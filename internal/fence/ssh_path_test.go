@@ -105,7 +105,9 @@ func TestSSHArgs_LegacyIsUnchanged(t *testing.T) {
 }
 
 // TestFenceSSH_RefusalDialsNothing: a refused path fails the fence without
-// running ssh; a lenient fence keeps best-effort's contract.
+// running ssh, under every strategy. A lenient (best-effort) fence fails too:
+// its assumed success is for an attempt that may have landed, and a refused
+// one was never made. Both name the ways out.
 func TestFenceSSH_RefusalDialsNothing(t *testing.T) {
 	dir := t.TempDir()
 	log := filepath.Join(dir, "ran")
@@ -116,11 +118,35 @@ func TestFenceSSH_RefusalDialsNothing(t *testing.T) {
 	defer OverrideSSHBinaryForTest(fake)()
 	h := HostConfig{Name: "node-x", Address: "10.0.0.9", SSH: SSHFence{Refusal: "row does not verify"}}
 	r := fenceSSH(context.Background(), h, false)
-	if r.Success || !strings.Contains(r.Detail, "row does not verify") {
+	if r.Success || r.Method != "ssh" || !strings.Contains(r.Detail, "row does not verify") {
 		t.Fatalf("strict = %+v", r)
 	}
-	if lr := fenceSSH(context.Background(), h, true); !lr.Success || lr.Method != "best-effort-ssh" {
-		t.Fatalf("lenient = %+v", lr)
+	lr := fenceSSH(context.Background(), h, true)
+	if lr.Success || lr.Method != "best-effort-ssh" || !strings.Contains(lr.Detail, "row does not verify") {
+		t.Fatalf("lenient = %+v, want a failure", lr)
+	}
+	for _, res := range []Result{r, lr} {
+		if res.LogResult() != LogPartial || Assurance(res.Method, res.LogResult()) != AssuranceFailed {
+			t.Fatalf("%+v is recorded %s/%s, want partial/failed", res, res.LogResult(), Assurance(res.Method, res.LogResult()))
+		}
+		for _, want := range []string{"lv host fence-confirm node-x", "ipmi or redfish", "does not count as a fence"} {
+			if !strings.Contains(res.Detail, want) {
+				t.Fatalf("detail %q does not name %q", res.Detail, want)
+			}
+		}
+	}
+	for _, strategy := range []string{"", "best-effort", "ssh"} {
+		h := h
+		h.FenceStrategy = strategy
+		if er := Execute(context.Background(), h); er.Success {
+			t.Fatalf("Execute under %q of a refused path = %+v, want a failure", strategy, er)
+		}
+	}
+	// A path that cannot start (a pinned path with no pin) is not attempted
+	// either.
+	unstarted := HostConfig{Name: "node-x", Address: "10.0.0.9", SSH: SSHFence{Path: SSHPathPinned}}
+	if ur := fenceSSH(context.Background(), unstarted, true); ur.Success || !strings.Contains(ur.Detail, "could not start") {
+		t.Fatalf("lenient fence that could not start = %+v, want a failure", ur)
 	}
 	if _, err := os.Stat(log); !os.IsNotExist(err) {
 		t.Fatal("a refused fence ran ssh")

@@ -19,40 +19,6 @@ func fenceSSHUsedOn(t *testing.T, n *Node) bool {
 	return featureUsedOn(t, n, capabilities.Release202612V1, string(capabilities.FeatureFenceSSH))
 }
 
-// TestFleet_FenceSSH_LegacyEverywhereKeepsTheReleaseUnused: with
-// enforcement.fence_ssh: legacy on every host, release_2026_12_v1 latches but
-// no host publishes a row, so fence_ssh stays unused and a rollback below the
-// release stays possible; every fence takes the legacy path, unpinned, as
-// before. Once one host leaves legacy and publishes, a legacy host fences it
-// pinned.
-//
-// Mutation: let legacy mode publish (sync) — the feature is used, red.
-func TestFleet_FenceSSH_LegacyEverywhereKeepsTheReleaseUnused(t *testing.T) {
-	ctx := context.Background()
-	modes := map[string]string{"node-0": fencessh.ModeLegacy, "node-1": fencessh.ModeLegacy, "node-2": fencessh.ModeLegacy}
-	c, fs := fenceSSHFleetWith(t, 3, 2621, func(string) bool { return true }, func(n string) string { return modes[n] })
-	publishAndRender(t, c, fs)
-	for _, n := range c.Nodes {
-		if fenceSSHUsedOn(t, n) {
-			t.Fatalf("%s: fence_ssh is used although every host is on legacy", n.Name)
-		}
-		if rows, _ := corrosion.ListHostFenceSSH(ctx, n.DB); len(rows) != 0 {
-			t.Fatalf("%s holds %d fence ssh rows", n.Name, len(rows))
-		}
-		if q := daemon.BootRollbackCheck(ctx, t.TempDir(), n.DB); len(q) != 0 {
-			t.Fatalf("%s: a rollback check quarantines %v with nothing used", n.Name, q)
-		}
-	}
-	if sf := fs["node-0"].agent.FenceConfig(ctx, "node-2"); sf.Refusal != "" || sf.Path != fence.SSHPathLegacy {
-		t.Fatalf("legacy fence of node-2 = %+v, want the legacy path", sf)
-	}
-	modes["node-2"] = fencessh.ModeAuto
-	publishAndRender(t, c, fs)
-	if sf := fs["node-0"].agent.FenceConfig(ctx, "node-2"); sf.Refusal != "" || sf.Path != fence.SSHPathPinned {
-		t.Fatalf("legacy fence of a host that published = %+v, want pinned", sf)
-	}
-}
-
 // TestFleet_FenceSSH_AnOldNodeHoldsTheReleaseOff: one host still on the
 // previous build (modelled as one advertising nothing, as an older or
 // quarantined node does to this token): release_2026_12_v1 does not latch, no

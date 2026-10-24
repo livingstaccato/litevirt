@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/fencessh"
 )
 
 func (s *Server) handleUpgradeModal(w http.ResponseWriter, r *http.Request) {
@@ -40,7 +41,20 @@ func (s *Server) handleUpgradeHost(w http.ResponseWriter, r *http.Request) {
 	hash := sha256.Sum256(data)
 	checksum := hex.EncodeToString(hash[:])
 
-	stream, err := s.grpc.UpgradeHost(s.uiBearerCtx(r))
+	// The enforcement.fence_ssh preflight `lv host upgrade` runs, before
+	// anything is streamed: a member still on legacy refuses the upgrade.
+	ctx := s.uiBearerCtx(r)
+	warnings, err := fencessh.CheckUpgradeModes(ctx, s.grpc, []string{name})
+	if err != nil {
+		sendToast(w, "Upgrade refused: "+err.Error(), "error")
+		w.WriteHeader(http.StatusConflict)
+		return
+	}
+	for _, warning := range warnings {
+		slog.Warn("upgrade preflight", "host", name, "warning", warning)
+	}
+
+	stream, err := s.grpc.UpgradeHost(ctx)
 	if err != nil {
 		http.Error(w, "Upgrade failed: "+err.Error(), httpStatusFor(err))
 		return

@@ -6609,7 +6609,7 @@ message FenceSSHNode {
     // reachable=false: the host did not answer, and its view is unknown.
     bool   reachable           = 2;
     string error               = 3;
-    string mode                = 4;  // its enforcement.fence_ssh: managed | auto | legacy
+    string mode                = 4;  // its enforcement.fence_ssh: managed | auto
     string last_error          = 5;  // its agent's last sync failure
     repeated FenceSSHPeer peers = 6;
     // evaluated_for_request: with reevaluate, this host's agent ran a sync

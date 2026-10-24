@@ -313,8 +313,12 @@ of acting — it says nothing about whether the resulting rows have replicated.
   first; an unverified one is resumed only while it still stands, and never
   re-fenced — see
   [Resuming a recovery from a recorded fence](migration-failover.md#resuming-a-recovery-from-a-recorded-fence).
-- **Split-brain refusal.** If a fence fails (and the strategy is not
-  `best-effort`), the coordinator refuses to reschedule the host's VMs. It
+- **Split-brain refusal.** If a fence fails, the coordinator refuses to
+  reschedule the host's VMs. A `best-effort` fence fails only when it was never
+  attempted (its SSH path was refused, or ssh could not start); one it attempted
+  reports success whatever happened. The hold names the ways out: power the
+  host off and run `lv host fence-confirm <host>`, or give it an `ipmi` or
+  `redfish` fence strategy. It
   does not park the host: while a quorum still sees it down, the leader fences
   it again on a backoff — 30 s after the failed attempt, doubling per
   consecutive failure to a 5-minute cap, read from `fencing_log` so a restart
@@ -324,7 +328,9 @@ of acting — it says nothing about whether the resulting rows have replicated.
     `lv host config <host> --fence-strategy ipmi` (and the BMC credentials)
     takes effect on the next retry. Otherwise the method that failed is
     repeated: a host switched to `best-effort` is never "recovered" on a failed
-    best-effort fence.
+    best-effort fence. A `best-effort` fence that was never attempted is
+    retried as `best-effort`, so a refusal that has cleared (a host that has
+    published its fence ssh row since) fences the host then.
   - **What is never retried:** a `manual` fence (`lv host fence-confirm`
     resumes it) and a `watchdog` fence of a peer (it cannot succeed) — unless
     the host's strategy has since been set to `ipmi`, `redfish` or `ssh`, which the next

@@ -1045,7 +1045,7 @@ func addSetupEnforcement(sshUser string, joinPeers []string) (string, error) {
 	var why []string
 	block, ok, reason := localEnforcementForPeers(joinPeers)
 	if ok {
-		return block, nil
+		return refuseRemovedFenceSSH(block, "this machine's "+daemonConfigPath)
 	}
 	if reason != "" {
 		why = append(why, reason)
@@ -1059,12 +1059,33 @@ func addSetupEnforcement(sshUser string, joinPeers []string) (string, error) {
 		case !ok:
 			why = append(why, fmt.Sprintf("%s: no %s", target, daemonConfigPath))
 		default:
-			return enforcementBlockOf(cfg), nil
+			return refuseRemovedFenceSSH(enforcementBlockOf(cfg), target+":"+daemonConfigPath)
 		}
 	}
 	return "", fmt.Errorf("could not read the cluster's enforcement block, which the new host "+
 		"must boot with so its flags match its peers': %s. Run `lv host add` on a cluster node, "+
 		"or from a machine that can SSH to one as %q", strings.Join(why, "; "), sshUser)
+}
+
+// refuseRemovedFenceSSH passes on the cluster's enforcement block, read from
+// source, unless it sets enforcement.fence_ssh to a value this binary refuses
+// at start (fencessh.RemovedMode): copied verbatim, the new host's daemon would
+// not start. The add is refused before anything is minted or pushed, naming
+// where the value was read and the fix. A block that does not parse is passed
+// on as before; the new host's daemon checks its config at start.
+func refuseRemovedFenceSSH(block, source string) (string, error) {
+	var cfg struct {
+		Enforcement struct {
+			FenceSSH string `yaml:"fence_ssh"`
+		} `yaml:"enforcement"`
+	}
+	if err := yaml.Unmarshal([]byte(block), &cfg); err != nil || !fencessh.RemovedMode(cfg.Enforcement.FenceSSH) {
+		return block, nil
+	}
+	return "", fmt.Errorf("the cluster's enforcement block, read from %s, sets enforcement.fence_ssh: %s, "+
+		"which this binary refuses at start, so the new host's daemon would not start with it. On every host, "+
+		"%s in its config and restart its daemon, then add again; nothing was minted or pushed",
+		source, strings.TrimSpace(cfg.Enforcement.FenceSSH), fencessh.ModeFix)
 }
 
 // sshTargetForPeer is the SSH target for a join peer ("host:port"), reached as

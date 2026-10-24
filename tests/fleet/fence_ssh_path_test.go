@@ -109,7 +109,7 @@ func TestFleet_FenceSSH_OperatorFenceUsesTheDecidedPath(t *testing.T) {
 // one evaluation must not make node-2 unfenceable: every peer still fences it
 // over the managed key, which is never less safe than refusing (pin,
 // restricted key, from= and forced command all hold), in auto and in managed
-// mode, and legacy mode takes the pinned path. node-2 raises
+// mode. node-2 raises
 // fence_ssh_not_accepting (warning) for itself, which every node sees, and
 // resolves it once it accepts again.
 //
@@ -146,11 +146,6 @@ func TestFleet_FenceSSH_AHostThatStopsAcceptingIsStillFenced(t *testing.T) {
 		if sf := ag.FenceConfig(ctx, "node-2"); sf.Refusal != "" || sf.Path != fence.SSHPathManaged {
 			t.Fatalf("%s fence of node-2 = %+v, want the managed path", mode, sf)
 		}
-	}
-	legacy := fencessh.New(fencessh.Config{Self: "node-0", PKIDir: c.Nodes[0].PKIDir, DB: c.Nodes[0].DB,
-		Dir: fs["node-0"].dir, Mode: func() string { return fencessh.ModeLegacy }})
-	if sf := legacy.FenceConfig(ctx, "node-2"); sf.Refusal != "" || sf.Path != fence.SSHPathPinned {
-		t.Fatalf("legacy-mode fence of node-2 = %+v, want pinned", sf)
 	}
 	condOn := func(n *Node) (bool, string) {
 		cnd, ok, err := corrosion.GetHealthCondition(ctx, n.DB, "fence_ssh", "fence_ssh_not_accepting", "host", "node-2")

@@ -50,7 +50,7 @@ type Config struct {
 	HostKeyGlob string
 	// Accepting is SSHDAccepting in production.
 	Accepting AcceptingFunc
-	// Mode is enforcement.fence_ssh: managed, auto (default) or legacy.
+	// Mode is enforcement.fence_ssh: managed or auto (default).
 	Mode func() string
 	// SSHUser is the account a managed fence logs in as: root, except in a
 	// test's unprivileged sshd.
@@ -123,14 +123,13 @@ func New(cfg Config) *Agent {
 const (
 	ModeManaged = "managed"
 	ModeAuto    = "auto"
-	ModeLegacy  = "legacy"
 )
 
 // NormalizeMode is mode as the agent reads it: "" is auto; anything else
 // unknown is refused at config load (ValidMode).
 func NormalizeMode(mode string) string {
 	switch m := strings.ToLower(strings.TrimSpace(mode)); m {
-	case ModeManaged, ModeLegacy:
+	case ModeManaged:
 		return m
 	default:
 		return ModeAuto
@@ -140,10 +139,21 @@ func NormalizeMode(mode string) string {
 // ValidMode reports whether mode is a value enforcement.fence_ssh takes.
 func ValidMode(mode string) bool {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
-	case "", ModeManaged, ModeAuto, ModeLegacy:
+	case "", ModeManaged, ModeAuto:
 		return true
 	}
 	return false
+}
+
+// ModeFix is the operator's fix for a value ValidMode refuses.
+const ModeFix = "set enforcement.fence_ssh to auto or managed"
+
+// RemovedMode reports whether mode is a value an earlier build accepted and
+// this one refuses at start: legacy. A host whose daemon reports it (its
+// FenceSSHNode.mode) would not start on this binary, so `lv host upgrade`
+// refuses it before anything is streamed to it.
+func RemovedMode(mode string) bool {
+	return strings.EqualFold(strings.TrimSpace(mode), "legacy")
 }
 
 // Dir is where the agent's files live.
@@ -278,18 +288,6 @@ func (a *Agent) sync(ctx context.Context) error {
 		return err
 	}
 	if a.cfg.Gate == nil || !a.cfg.Gate.ReleaseFeatureAvailable(capabilities.FeatureFenceSSH) {
-		return nil
-	}
-	// enforcement.fence_ssh: legacy never makes the FIRST publication, so the
-	// release feature stays unused and a rollback below release_2026_12_v1
-	// stays possible. A row this host already published is still maintained
-	// (the feature is used anyway): left frozen, a renewal's revocation would
-	// stay owed, a revoked or expired certificate would leave the host
-	// unfenceable, and a new sshd host key would fail every fence of it. A
-	// row re-admission retired is replaced too: the feature was used for this
-	// name already, and every peer refuses to fence through a tombstone, so
-	// leaving it would make the re-admitted host unfenceable for good.
-	if a.Mode() == ModeLegacy && !a.hasOwnRow(ctx, self, tr) && !a.hasRetiredRow(ctx) {
 		return nil
 	}
 	return a.publish(ctx, self, selfSigner, peers, tr)
@@ -524,8 +522,9 @@ func (a *Agent) selfCheck(ctx context.Context, self *x509.Certificate) error {
 // publish writes this host's row when anything in it changed.
 //
 // A host whose certificate names no single fence address, or is not valid
-// now, publishes nothing: its peers keep fencing it the legacy way, unpinned
-// (`lv doctor fence` warns), rather than refuse a row that could never verify.
+// now, publishes nothing rather than a row that could never verify. Its peers
+// fence it unpinned until release_2026_12_v1 latches and refuse to once it has
+// (FenceConfig); `lv doctor fence` shows either.
 func (a *Agent) publish(ctx context.Context, self *x509.Certificate, signer crypto.Signer, peers []*Verified, tr Trust) error {
 	selfAddr, addrErr := FenceAddress(self)
 	if addrErr != nil {
@@ -619,20 +618,6 @@ func (a *Agent) publish(ctx context.Context, self *x509.Certificate, signer cryp
 	slog.Info("fence ssh: published this host's row", "generation", p.Generation, "accepting", accepting,
 		"detail", why, "serial", strings.ToLower(self.SerialNumber.Text(16)))
 	return evalReport
-}
-
-// hasOwnRow reports whether this host holds a live row it published itself
-// (ownLineage).
-func (a *Agent) hasOwnRow(ctx context.Context, self *x509.Certificate, tr Trust) bool {
-	prev, ok, err := corrosion.GetHostFenceSSH(ctx, a.cfg.DB, a.cfg.Self)
-	return err == nil && ok && !prev.Deleted && a.ownLineage(prev, self, tr)
-}
-
-// hasRetiredRow reports whether this host's name holds a tombstone (a row
-// re-admission retired).
-func (a *Agent) hasRetiredRow(ctx context.Context) bool {
-	prev, ok, err := corrosion.GetHostFenceSSH(ctx, a.cfg.DB, a.cfg.Self)
-	return err == nil && ok && prev.Deleted
 }
 
 // ownLineage reports whether prev was signed by this host under its current

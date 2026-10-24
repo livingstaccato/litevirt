@@ -5281,17 +5281,13 @@ type CloneVMRequest struct {
 	Mode     string                 `protobuf:"bytes,3,opt,name=mode,proto3" json:"mode,omitempty"`         // "" (auto) | "linked" | "full"
 	Snapshot string                 `protobuf:"bytes,4,opt,name=snapshot,proto3" json:"snapshot,omitempty"` // optional: clone from this snapshot of the source
 	Project  string                 `protobuf:"bytes,5,opt,name=project,proto3" json:"project,omitempty"`   // tenancy bucket for the clone ("" → source's)
-	// target_host is not used (an older design's placement pin); see
-	// destination_host.
-	TargetHost string `protobuf:"bytes,6,opt,name=target_host,json=targetHost,proto3" json:"target_host,omitempty"`
-	Ip         string `protobuf:"bytes,7,opt,name=ip,proto3" json:"ip,omitempty"`        // optional static IP for the clone's first NIC
-	Start      bool   `protobuf:"varint,8,opt,name=start,proto3" json:"start,omitempty"` // start the clone after creation
+	Ip       string                 `protobuf:"bytes,7,opt,name=ip,proto3" json:"ip,omitempty"`             // optional static IP for the clone's first NIC
+	Start    bool                   `protobuf:"varint,8,opt,name=start,proto3" json:"start,omitempty"`      // start the clone after creation
 	// target_pool: the storage pool, on the host the clone ends up on, that
 	// holds the clone's disks. Empty means that host's default disk directory.
 	TargetPool string `protobuf:"bytes,9,opt,name=target_pool,json=targetPool,proto3" json:"target_pool,omitempty"`
-	// destination_host is the host the clone ends up on, as target_host was
-	// meant to be: empty keeps it on the source's host. Field 6 stays
-	// ignored, as it always was, so a client that sets it is not newly refused.
+	// destination_host is the host the clone ends up on: empty keeps it on
+	// the source's host.
 	DestinationHost string `protobuf:"bytes,10,opt,name=destination_host,json=destinationHost,proto3" json:"destination_host,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
@@ -5358,13 +5354,6 @@ func (x *CloneVMRequest) GetSnapshot() string {
 func (x *CloneVMRequest) GetProject() string {
 	if x != nil {
 		return x.Project
-	}
-	return ""
-}
-
-func (x *CloneVMRequest) GetTargetHost() string {
-	if x != nil {
-		return x.TargetHost
 	}
 	return ""
 }
@@ -46334,21 +46323,19 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x13RekeyBindingRequest\x12\x18\n" +
 	"\anetwork\x18\x01 \x01(\tR\anetwork\"0\n" +
 	"\x14ResumeBindingRequest\x12\x18\n" +
-	"\anetwork\x18\x01 \x01(\tR\anetwork\"\x9d\x02\n" +
+	"\anetwork\x18\x01 \x01(\tR\anetwork\"\x8f\x02\n" +
 	"\x0eCloneVMRequest\x12\x16\n" +
 	"\x06source\x18\x01 \x01(\tR\x06source\x12\x16\n" +
 	"\x06target\x18\x02 \x01(\tR\x06target\x12\x12\n" +
 	"\x04mode\x18\x03 \x01(\tR\x04mode\x12\x1a\n" +
 	"\bsnapshot\x18\x04 \x01(\tR\bsnapshot\x12\x18\n" +
-	"\aproject\x18\x05 \x01(\tR\aproject\x12\x1f\n" +
-	"\vtarget_host\x18\x06 \x01(\tR\n" +
-	"targetHost\x12\x0e\n" +
+	"\aproject\x18\x05 \x01(\tR\aproject\x12\x0e\n" +
 	"\x02ip\x18\a \x01(\tR\x02ip\x12\x14\n" +
 	"\x05start\x18\b \x01(\bR\x05start\x12\x1f\n" +
 	"\vtarget_pool\x18\t \x01(\tR\n" +
 	"targetPool\x12)\n" +
 	"\x10destination_host\x18\n" +
-	" \x01(\tR\x0fdestinationHost\"F\n" +
+	" \x01(\tR\x0fdestinationHostJ\x04\b\x06\x10\aR\vtarget_host\"F\n" +
 	"\x18ConvertToTemplateRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
 	"\x06revert\x18\x02 \x01(\bR\x06revert\"=\n" +

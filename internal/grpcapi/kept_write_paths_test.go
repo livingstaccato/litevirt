@@ -13,6 +13,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
@@ -200,4 +201,86 @@ func TestCloneVM_AKeptOverlayMissingItsBaseInAnNFSPoolRefusesIt(t *testing.T) {
 	top := registryKeep(t, s, "old", base)
 	_, err := s.CloneVM(adminCtx(), &pb.CloneVMRequest{Source: "tpl", Target: "c1", TargetPool: "share"})
 	wantMissingBaseRefusal(t, "clone into an nfs pool", err, top, base)
+}
+
+// moveVolumeFixture is a stopped VM vm1 of this host whose disk root is a
+// qcow2 in a directory of its own, in pool "hot", and a dir pool "ssd" to
+// move it into. It returns the server, the disk file and the pool directory.
+func moveVolumeFixture(t *testing.T) (*Server, string, string) {
+	t.Helper()
+	s := testServer(t)
+	s.hostName = "test-host"
+	s.dataDir = t.TempDir()
+	srcFile := filepath.Join(t.TempDir(), "vm1-root.qcow2")
+	if err := qcow2.Create(srcFile, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(srcFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "ssd")
+	writePathsDirPool(t, s, "ssd", dir)
+	if err := corrosion.InsertVM(adminCtx(), s.db,
+		corrosion.VMRecord{Name: "vm1", HostName: s.hostName, State: "stopped"}, nil,
+		[]corrosion.DiskRecord{{VMName: "vm1", DiskName: "root", HostName: s.hostName, Path: srcFile,
+			SizeBytes: fi.Size(), StorageType: "local", StorageVolume: "hot"}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	return s, srcFile, dir
+}
+
+// A volume move writes <pool>/<vm>-<disk>.qcow2, a new file as a create's
+// disk is: a kept overlay naming it as its missing base refuses the move,
+// before anything is copied, and leaves the source as it was.
+//
+// Red on 083d7afca: the move goes ahead and writes the base, and goes ahead
+// while kept-disks.json cannot be read. Mutations: drop the keptPathRefusal
+// from moveOneVolume: both red; take every pool as shared storage elsewhere
+// (local false): the unreadable-registry case red.
+func TestMoveVolume_AKeptOverlayMissingItsBaseRefusesIt(t *testing.T) {
+	t.Run("the destination is the missing base", func(t *testing.T) {
+		s, srcFile, dir := moveVolumeFixture(t)
+		was, err := os.ReadFile(srcFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		base := filepath.Join(dir, "vm1-root.qcow2")
+		top := registryKeep(t, s, "vm1", base)
+		err = s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm1", DiskName: "root", TargetPool: "ssd", DeleteSource: true},
+			&streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()})
+		wantMissingBaseRefusal(t, "volume move", err, top, base)
+		if ents, _ := os.ReadDir(dir); len(ents) != 0 {
+			t.Fatalf("a refused move wrote into the pool: %v", ents)
+		}
+		sameBytes(t, "the source", srcFile, was)
+		disks, err := corrosion.GetVMDisks(adminCtx(), s.db, "vm1")
+		if err != nil || len(disks) != 1 || disks[0].Path != srcFile || disks[0].StorageVolume != "hot" {
+			t.Fatalf("a refused move changed the disk row: %+v (err=%v)", disks, err)
+		}
+	})
+	t.Run("an unreadable kept-disks.json holds a move into a local pool", func(t *testing.T) {
+		s, srcFile, dir := moveVolumeFixture(t)
+		named := keptUnknown(t, s, "registry")
+		err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm1", DiskName: "root", TargetPool: "ssd"},
+			&streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()})
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), named) {
+			t.Fatalf("move while %s cannot be read = %v; want FailedPrecondition naming it", named, err)
+		}
+		if ents, _ := os.ReadDir(dir); len(ents) != 0 || !exists(srcFile) {
+			t.Fatalf("a refused move wrote into the pool (%v) or lost its source", ents)
+		}
+	})
+	t.Run("a destination no kept overlay names goes ahead", func(t *testing.T) {
+		s, _, dir := moveVolumeFixture(t)
+		registryKeep(t, s, "old", filepath.Join(dir, "old-root.qcow2"))
+		if err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "vm1", DiskName: "root", TargetPool: "ssd"},
+			&streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()}); err != nil {
+			t.Fatalf("move into a pool no kept overlay's missing base is at: %v", err)
+		}
+		if !exists(filepath.Join(dir, "vm1-root.qcow2")) {
+			t.Fatal("the move did not write its copy in the pool: this proves nothing")
+		}
+	})
 }

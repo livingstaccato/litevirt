@@ -326,9 +326,12 @@ it reads, these are refused on that host, and `disk_leftover` names the file
 (`creates_refused`): every `lv import`; every create or `lv clone` that writes
 a disk file on the host's own storage (one with no disk file, or with every
 disk on shared nfs, ceph or iscsi storage outside the disk directory, goes
-ahead); every disk attach that creates a new disk; and every `lv backup
-restore-from` or `lv backup restore-live` with `--target-path`. With the record
-readable, a clone (into any pool, nfs included), a disk attach or a
+ahead); every disk attach that creates a new disk; every `lv move-volume` (and
+`lv stack migrate-volumes` move) into a pool on the host's own storage; and
+every `lv backup restore-from` or `lv backup restore-live` with
+`--target-path`. With the record readable, a clone (into any pool, nfs
+included), a disk attach, a volume move (its copy at `<pool
+dir>/<vm>-<disk>.qcow2`, checked before anything is copied) or a
 `--target-path` restore that would write a kept overlay's missing base is
 refused as a create is. A
 restore to the file the daemon names, or `--in-place` over the VM's own disk,

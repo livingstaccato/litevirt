@@ -164,7 +164,7 @@ func (s *Server) keptFileCreateRefusal(ctx context.Context, name string, files [
 // disk's backing chain cannot be read (keptRegistryChains). Unlike the other
 // kept-file refusals it does not depend on the name being created: until the
 // file it names reads, every import, every create or clone that writes a disk
-// file here, every disk attach, and every restore to a named target meets it. It wraps the error the caller maps to a code (KeptBackingFileError, or
+// file here, every disk attach, every volume move into a pool on this host's own storage, and every restore to a named target meets it. It wraps the error the caller maps to a code (KeptBackingFileError, or
 // a plain retryable one).
 type keptChainsUnknownError struct{ err error }
 
@@ -442,8 +442,8 @@ func (s *Server) sharedPoolElsewhere(driver, target string) bool {
 var isDataDirDisksErr = storage.IsDataDirDisksErr
 
 // keptPathRefusal is keptMissingBaseRefusal for a write of exactly the files
-// writes names (a clone's disks, an attach's new disk, a restore's named
-// target), as a gRPC status naming what is refused: a kept overlay whose
+// writes names (a clone's disks, an attach's new disk, a volume move's copy,
+// a restore's named target), as a gRPC status naming what is refused: a kept overlay whose
 // missing base is one of them refuses it, and so does a kept-disks.json or
 // kept chain that cannot be read when the write is local.
 func (s *Server) keptPathRefusal(ctx context.Context, what string, writes *keptWrites) error {

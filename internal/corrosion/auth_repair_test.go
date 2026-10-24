@@ -208,57 +208,6 @@ func TestDeleteUser2FA_LastFactorTombstonesPointer(t *testing.T) {
 	}
 }
 
-// TestV32Backfill_DeletedUserNotRevived (finding 2): a user deleted under a
-// pre-v32 binary (no auth cascade) keeps live orphan factors/codes and no
-// pointer. The migration must give them a TOMBSTONED pointer (and tombstone the
-// orphans), so reactivating the username doesn't revive old auth state.
-func TestV32Backfill_DeletedUserNotRevived(t *testing.T) {
-	c := mustTestClient(t)
-	ctx := context.Background()
-
-	// Simulate pre-v32 on-disk state via raw writes (no cascade, no pointers).
-	if err := c.execLocal(ctx,
-		`INSERT INTO users (username, role, password_hash, created_at, updated_at, deleted_at)
-		 VALUES ('ghost', 'viewer', 'x', '2021-01-01T00:00:00Z', '2021-06-01T00:00:00Z', '2021-06-01T00:00:00Z')`); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.execLocal(ctx,
-		`INSERT INTO user_2fa (username, method, secret, label, enrolled_at, updated_at)
-		 VALUES ('ghost', 'totp', 'oldsecret', '', '2021-01-01T00:00:00Z', '2021-01-01T00:00:00Z')`); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.execLocal(ctx,
-		`INSERT INTO recovery_codes (username, code_hash, created_at) VALUES ('ghost', '$2a$old', '2021-01-01T00:00:00Z')`); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := applyV32DataFixes(ctx, c, "2026-01-01T00:00:00Z"); err != nil {
-		t.Fatal(err)
-	}
-
-	// The pointer must be tombstoned (not a live '' pointer).
-	if _, live, _ := activeUser2FAEpoch(ctx, c, "ghost"); live {
-		t.Error("deleted user got a LIVE 2FA pointer during migration")
-	}
-	if fs, _ := ListUser2FA(ctx, c, "ghost"); len(fs) != 0 {
-		t.Errorf("deleted user's 2FA visible after migration: %+v", fs)
-	}
-	if got, _ := ListUnusedRecoveryCodes(ctx, c, "ghost"); len(got) != 0 {
-		t.Errorf("deleted user's recovery codes valid after migration: %v", got)
-	}
-
-	// Reactivate the username — old auth state must stay dead.
-	if err := InsertUser(ctx, c, "ghost", "viewer", "newpw"); err != nil {
-		t.Fatal(err)
-	}
-	if fs, _ := ListUser2FA(ctx, c, "ghost"); len(fs) != 0 {
-		t.Errorf("reactivation revived old 2FA: %+v", fs)
-	}
-	if got, _ := ListUnusedRecoveryCodes(ctx, c, "ghost"); len(got) != 0 {
-		t.Errorf("reactivation revived old recovery codes: %v", got)
-	}
-}
-
 // TestTouchUser2FA_RejectsDisabledOrStaleEpoch: the WebAuthn confirm-and-consume
 // gate. Touching a live factor succeeds; once it's disabled (and its set
 // deactivated) the touch changes zero rows, so a login can be rejected instead of
@@ -327,31 +276,6 @@ func TestUser2FA_WritePathsNeverNullLabel(t *testing.T) {
 	}
 	if n := rows[0].Int("n"); n != 0 {
 		t.Errorf("a write path produced %d NULL-label row(s); writes must normalize to ''", n)
-	}
-}
-
-// TestUser2FA_DataFixNormalizesNullLabel: a pre-existing NULL-label row (from an
-// old binary / manual edit) is normalized to ” by the InitSchema data fix, so it
-// can't sit as a distinct PK component that duplicates a factor or dodges a tombstone.
-func TestUser2FA_DataFixNormalizesNullLabel(t *testing.T) {
-	c := mustTestClient(t)
-	ctx := context.Background()
-
-	// Insert a raw NULL-label row (bypassing the normalized write paths).
-	if err := c.execLocal(ctx,
-		`INSERT INTO user_2fa (username, method, secret, label, enrolled_at, updated_at)
-		 VALUES ('carol', 'totp', 's', NULL, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')`); err != nil {
-		t.Fatal(err)
-	}
-	if err := applyV32DataFixes(ctx, c, "2026-01-01T00:00:00Z"); err != nil {
-		t.Fatal(err)
-	}
-	rows, err := c.Query(ctx, `SELECT COUNT(*) AS n FROM user_2fa WHERE label IS NULL`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n := rows[0].Int("n"); n != 0 {
-		t.Errorf("data fix left %d NULL-label row(s)", n)
 	}
 }
 
@@ -520,44 +444,5 @@ func TestDeleteUser_CascadesAndNoResurrect(t *testing.T) {
 	}
 	if got, _ := ListUnusedRecoveryCodes(ctx, c, "dave"); len(got) != 0 {
 		t.Errorf("recovery codes resurrected after delete→recreate: %v", got)
-	}
-}
-
-// TestRecoveryCodes_LegacyBackfillStillValidates: a pre-v32 DB has recovery_codes
-// with set_id=” and NO pointer row. The InitSchema backfill gives them an
-// active_set_id=” pointer so they keep validating; a later re-enroll supersedes
-// them; re-running the backfill is a no-op for the re-enrolled user.
-func TestRecoveryCodes_LegacyBackfillStillValidates(t *testing.T) {
-	c := mustTestClient(t)
-	ctx := context.Background()
-
-	// Simulate a pre-v32 row: legacy shape (set_id/updated_at default to '', no pointer).
-	if err := c.execLocal(ctx,
-		`INSERT INTO recovery_codes (username, code_hash, created_at) VALUES ('erin', '$2a$legacy', '2021-06-01T00:00:00Z')`); err != nil {
-		t.Fatal(err)
-	}
-	// Before the backfill there is no pointer, so the code can't validate yet.
-	if got, _ := ListUnusedRecoveryCodes(ctx, c, "erin"); len(got) != 0 {
-		t.Fatalf("precondition: expected no valid codes before backfill, got %v", got)
-	}
-
-	if err := applyV32DataFixes(ctx, c, "2026-01-01T00:00:00Z"); err != nil {
-		t.Fatal(err)
-	}
-	if got, _ := ListUnusedRecoveryCodes(ctx, c, "erin"); !slices.Equal(got, []string{"$2a$legacy"}) {
-		t.Errorf("legacy code did not validate after backfill: %v", got)
-	}
-
-	// Re-enroll supersedes the legacy set.
-	if err := InsertRecoveryCodes(ctx, c, "erin", []string{"$2a$fresh"}); err != nil {
-		t.Fatal(err)
-	}
-	// Re-running the backfill must NOT reset the re-enrolled user's pointer.
-	if err := applyV32DataFixes(ctx, c, "2026-01-01T00:00:00Z"); err != nil {
-		t.Fatal(err)
-	}
-	got, _ := ListUnusedRecoveryCodes(ctx, c, "erin")
-	if !slices.Equal(got, []string{"$2a$fresh"}) {
-		t.Errorf("re-enrolled set not active after backfill re-run: %v", got)
 	}
 }

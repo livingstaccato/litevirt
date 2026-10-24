@@ -184,9 +184,7 @@ import (
 //	         A code is valid only when its set_id == active_set_id.
 //	     Both pointers converge by ordinary updated_at LWW (no numeric/MAX
 //	     generation ordering, which per-node-monotonic NowTS would make unsafe).
-//	     Five ADD COLUMNs + two CREATE TABLEs; gap-1 from v31. InitSchema runs
-//	     idempotent post-migration data fixes (user_2fa NULL→'' label; legacy
-//	     2FA/recovery pointer backfill) via raw SQL, not replicated mutations.
+//	     Five ADD COLUMNs + two CREATE TABLEs; gap-1 from v31.
 //	v33: host_runtime_usage(host_name PK, disk_iops, net_mbps, updated_at,
 //	     deleted_at) — a per-host runtime-telemetry row the placement engine reads
 //	     to score the DiskIOPS/NetBW dimensions. Kept OUT of the full-state
@@ -825,13 +823,6 @@ func InitSchema(ctx context.Context, c *Client) error {
 		healed++
 	}
 
-	// v32 post-migration data fixes (idempotent, LOCAL-only — schema-init data
-	// repair must not emit replication mutations). Runs after the ledger loop so
-	// the v32 columns + recovery_code_sets are guaranteed present.
-	if err := applyV32DataFixes(ctx, c, now); err != nil {
-		return fmt.Errorf("schema init: v32 data fixes: %w", err)
-	}
-
 	for _, idx := range schemaIndexes {
 		if err := c.execLocal(ctx, idx); err != nil {
 			slog.Warn("index creation failed (non-fatal)", "error", err)
@@ -846,60 +837,6 @@ func InitSchema(ctx context.Context, c *Client) error {
 	eff := c.RefreshDBSchemaVersion(ctx)
 	slog.Info("schema initialized",
 		"schema_version", eff, "ledger", len(schemaMigrationLedger), "upgraded", upgraded, "healed", healed)
-	return nil
-}
-
-// applyV32DataFixes runs the idempotent, LOCAL-only data repairs the v32
-// migration needs but that schemaMigrations (ADD COLUMN only) can't express:
-//
-//   - Normalize user_2fa.label NULL → ” so the composite PK never carries a NULL
-//     component — a NULL-label row and an ”-label row are distinct, which would
-//     let the sensitive merge duplicate a factor or skip a tombstone.
-//   - Backfill recovery-code sets: give every pre-v32 user an active-set pointer
-//     (active_set_id=”) and stamp legacy codes' LWW key (updated_at=created_at),
-//     so existing unused codes (set_id=”) keep validating until the next
-//     re-enroll mints a real set and supersedes them.
-//
-// Every statement is a no-op on a fresh or already-fixed DB, and the pointer
-// insert is INSERT-ONLY so a re-run never resets a user who has since re-enrolled
-// (their pointer already holds a real active_set_id). The column stays physically
-// nullable (additive-only — no ALTER COLUMN); normalized write paths keep it ”
-// going forward.
-func applyV32DataFixes(ctx context.Context, c *Client, now string) error {
-	type stmt struct {
-		sql    string
-		params []interface{}
-	}
-	for _, s := range []stmt{
-		{`UPDATE user_2fa SET label = '' WHERE label IS NULL`, nil},
-		// Pointer backfill. The pointer is born TOMBSTONED for a user whose account
-		// is already deleted (deleted_at inherited from the users row): a pre-v32
-		// DeleteUser did NOT cascade auth rows, so a deleted user can still hold
-		// live orphan factors/codes that a LIVE pointer would revive on reactivation.
-		// A user with no users row (external realm) inherits NULL -> a live pointer.
-		{`INSERT INTO user_2fa_sets (username, active_epoch, updated_at, deleted_at)
-		  SELECT f.username, '', COALESCE(MAX(f.updated_at), ?),
-		         (SELECT u.deleted_at FROM users u WHERE u.username = f.username)
-		  FROM user_2fa f GROUP BY f.username
-		  ON CONFLICT(username) DO NOTHING`, []interface{}{now}},
-		{`INSERT INTO recovery_code_sets (username, active_set_id, updated_at, deleted_at)
-		  SELECT r.username, '', COALESCE(MAX(r.created_at), ?),
-		         (SELECT u.deleted_at FROM users u WHERE u.username = r.username)
-		  FROM recovery_codes r GROUP BY r.username
-		  ON CONFLICT(username) DO NOTHING`, []interface{}{now}},
-		{`UPDATE recovery_codes SET updated_at = created_at WHERE updated_at = ''`, nil},
-		// Tombstone the orphan factor/code rows of already-deleted users (pre-v32
-		// delete left them live) so no live secret rows linger behind the tombstoned
-		// pointer. Idempotent: only touches still-live rows.
-		{`UPDATE user_2fa SET deleted_at = ?, updated_at = ?
-		  WHERE deleted_at IS NULL AND username IN (SELECT username FROM users WHERE deleted_at IS NOT NULL)`, []interface{}{now, now}},
-		{`UPDATE recovery_codes SET deleted_at = ?, updated_at = ?
-		  WHERE deleted_at IS NULL AND username IN (SELECT username FROM users WHERE deleted_at IS NOT NULL)`, []interface{}{now, now}},
-	} {
-		if err := c.execLocal(ctx, s.sql, s.params...); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 

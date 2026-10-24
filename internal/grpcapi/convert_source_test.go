@@ -135,4 +135,3 @@ func TestBuildImage_ReadsTheHeldDirectory(t *testing.T) {
 		t.Fatalf("the image is not the VM's disk: %+v, %v", info, err)
 	}
 }
-

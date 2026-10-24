@@ -3496,8 +3496,8 @@ that host is judged by the disk files there (every file under
 usable or not, following any symlink below them, every file a note names,
 and every set-aside `.kept-` or `.superseded-` copy beside any local disk a
 disk row names; only regular files are opened, nothing on a pseudo-filesystem
-such as `/proc` or `/sys` is listed or read, and a scan past 250,000 files,
-4 GiB of headers read or 2 minutes stops): it is refused when one of them is,
+such as `/proc` or `/sys` is listed or read, a backing file there ends its chain, and a scan past 250,000 files,
+256 MiB of headers read or 1 minute stops): it is refused when one of them is,
 or backs on, a path it writes, and refused whatever its name when one of
 them, or a directory of them, cannot be read, or the scan stops, either,
 which `creates_refused` then names too. A create

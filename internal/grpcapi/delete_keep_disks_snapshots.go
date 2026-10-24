@@ -216,6 +216,11 @@ func walkKeptChainIn(b *keptScanBudget, stat func(string) (os.FileInfo, error), 
 			return out, "", dotdot, nil
 		}
 		isQ, info, err := keptLayerHeader(b, path)
+		if errors.Is(err, errKeptScanPseudoLayer) {
+			// On a pseudo-filesystem: no kept overlay backs on it, and it is
+			// never opened. The chain ends here, as at a non-regular layer.
+			return out, "", dotdot, nil
+		}
 		if err != nil {
 			return nil, "", -1, fmt.Errorf("%s: %w", path, err)
 		}
@@ -274,9 +279,10 @@ func keptLayerHeader(b *keptScanBudget, path string) (bool, *qcow2.ImageInfo, er
 	if err != nil {
 		return false, nil, err
 	}
-	// What InfoFile read, at most: the header and its extensions all lie in
-	// the first cluster, and the backing file's name.
-	if err := b.charge(int64(info.ClusterSize) + int64(len(info.BackingFile))); err != nil {
+	// What InfoFile read: the header, its extensions and the backing file's
+	// name, far under keptScanLayerBytes (not the cluster size, which a 2M
+	// cluster image would make 2 MiB a layer).
+	if err := b.charge(keptScanLayerBytes); err != nil {
 		return false, nil, err
 	}
 	return true, info, nil

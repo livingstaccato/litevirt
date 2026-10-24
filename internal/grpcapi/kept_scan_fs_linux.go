@@ -30,6 +30,9 @@ var keptScanPseudo = map[int64]string{
 	unix.BINFMTFS_MAGIC:       "binfmt_misc",
 	unix.NSFS_MAGIC:           "nsfs",
 	unix.RDTGROUP_SUPER_MAGIC: "resctrl",
+	0x67596969:                "rpc_pipefs", // its pipes read as regular files; opening one registers an upcall reader
+	0x0187:                    "autofs",     // listing or statting under it triggers mounts
+	unix.HUGETLBFS_MAGIC:      "hugetlbfs",
 }
 
 // keptScanPseudoFS reports whether path is on a pseudo-filesystem, and its

@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -175,5 +176,92 @@ func TestCreateVM_KeptScanRefusesPastItsBudget(t *testing.T) {
 				t.Fatalf("create web = %v; want FailedPrecondition naming the budget (%q)", err, c.want)
 			}
 		})
+	}
+}
+
+// A qcow2 header in a pool file that names a file on a pseudo-filesystem as
+// its backing file (a guest can write one into its own raw disk) ends that
+// chain, as a non-regular layer does: the create goes ahead, and the scan
+// never opens the backing file.
+//
+// Mutation: make keptScanBudget.open's pseudo-filesystem refusals a plain
+// error again (not errKeptScanPseudoLayer): red, the create is refused.
+func TestCreateVM_KeptScanEndsAChainAtAPseudoFilesystemBacking(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	dir := filepath.Join(t.TempDir(), "ssd")
+	writePathsDirPool(t, s, "ssd", dir)
+	ov := filepath.Join(dir, "guest-snap.qcow2")
+	overlayOn(t, ov, "/proc/kmsg")
+	unreadableKeptRegistry(t, s)
+	opened := keptScanOpened(t)
+	if err := createWithin(t, s, 30*time.Second); err != nil {
+		t.Fatalf("create web beside an overlay backed by /proc/kmsg, while kept-disks.json cannot be read: %v", err)
+	}
+	sawOverlay := false
+	for _, p := range opened() {
+		if strings.HasPrefix(p, "/proc") {
+			t.Fatalf("the scan opened %s, on a pseudo-filesystem", p)
+		}
+		sawOverlay = sawOverlay || p == ov
+	}
+	if !sawOverlay {
+		t.Fatalf("the scan did not open the overlay %s: this proves nothing", ov)
+	}
+}
+
+// The bytes budget is charged by what a layer read costs, not by its qcow2
+// cluster size: 4 overlays of a 2 MiB cluster size stay within 1 MiB.
+//
+// Mutation: charge info.ClusterSize again in keptLayerHeader: red.
+func TestCreateVM_KeptScanBytesBudgetIsNotChargedByClusterSize(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	dir := filepath.Join(t.TempDir(), "ssd")
+	writePathsDirPool(t, s, "ssd", dir)
+	for _, n := range []string{"a", "b", "c", "d"} {
+		ov := filepath.Join(dir, n+"-snap.qcow2")
+		overlayOn(t, ov, filepath.Join(t.TempDir(), n+".raw"))
+		f, err := os.OpenFile(ov, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// cluster_bits (header offset 20) = 21: 2 MiB clusters.
+		if _, err := f.WriteAt([]byte{0, 0, 0, 21}, 20); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+	}
+	unreadableKeptRegistry(t, s)
+	pb := keptScanMaxBytes
+	keptScanMaxBytes = 1 << 20
+	t.Cleanup(func() { keptScanMaxBytes = pb })
+	if err := createWithin(t, s, 30*time.Second); err != nil {
+		t.Fatalf("create web beside 4 overlays of 2 MiB clusters: %v", err)
+	}
+}
+
+// The defaults: 250k files, 256 MiB, 60 s, and a context deadline sooner
+// than that shortens the time.
+func TestKeptScanBudgetDefaults(t *testing.T) {
+	if keptScanMaxFiles != 250_000 || keptScanMaxBytes != 256<<20 || keptScanMaxTime != time.Minute {
+		t.Fatalf("budget = %d files, %d bytes, %s", keptScanMaxFiles, keptScanMaxBytes, keptScanMaxTime)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if d := time.Until(newKeptScanBudget(ctx).deadline); d > 6*time.Second {
+		t.Fatalf("deadline in %s with a context deadline in 5s", d)
+	}
+	if d := time.Until(newKeptScanBudget(context.Background()).deadline); d < 50*time.Second {
+		t.Fatalf("deadline in %s with no context deadline", d)
+	}
+}
+
+// rpc_pipefs, autofs and hugetlbfs are never listed or read.
+//
+// Mutation: drop one from keptScanPseudo: red.
+func TestKeptScanPseudoTable(t *testing.T) {
+	for magic, name := range map[int64]string{0x67596969: "rpc_pipefs", 0x0187: "autofs", 0x958458f6: "hugetlbfs"} {
+		if got := keptScanPseudo[magic]; got == "" {
+			t.Errorf("%s (%#x) is not skipped", name, magic)
+		}
 	}
 }

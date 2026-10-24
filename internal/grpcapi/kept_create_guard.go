@@ -559,7 +559,7 @@ func (s *Server) keptCollisionScan(ctx context.Context, writes *keptWrites) (str
 	if err != nil {
 		return "", err
 	}
-	b := newKeptScanBudget()
+	b := newKeptScanBudget(ctx)
 	listed := map[string]bool{}
 	for len(dirs) > 0 {
 		dir := filepath.Clean(dirs[len(dirs)-1])

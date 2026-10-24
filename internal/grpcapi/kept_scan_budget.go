@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -17,9 +18,17 @@ import (
 // one past any of these refuses instead, naming it. Variables for tests.
 var (
 	keptScanMaxFiles int64 = 250_000
-	keptScanMaxBytes int64 = 4 << 30
-	keptScanMaxTime        = 2 * time.Minute
+	keptScanMaxBytes int64 = 256 << 20
+	keptScanMaxTime        = time.Minute
 )
+
+// keptScanLayerBytes is what one chain layer's read is charged: its header,
+// extensions and backing-file name are well under it.
+const keptScanLayerBytes = 4 << 10
+
+// errKeptScanPseudoLayer marks a layer on a pseudo-filesystem: it holds no
+// disk, so it ends a chain (as a non-regular layer does) and is never opened.
+var errKeptScanPseudoLayer = errors.New("a pseudo-filesystem holds no disk")
 
 // errKeptScanBudget marks a keptCollisionScan that ran past its budget.
 var errKeptScanBudget = errors.New("the scan of this host's disk files ran past its budget")
@@ -35,8 +44,14 @@ type keptScanBudget struct {
 	deadline     time.Time
 }
 
-func newKeptScanBudget() *keptScanBudget {
-	return &keptScanBudget{deadline: time.Now().Add(keptScanMaxTime)}
+// newKeptScanBudget starts a budget: keptScanMaxTime, or the context's own
+// deadline when that is sooner.
+func newKeptScanBudget(ctx context.Context) *keptScanBudget {
+	dl := time.Now().Add(keptScanMaxTime)
+	if cd, ok := ctx.Deadline(); ok && cd.Before(dl) {
+		dl = cd
+	}
+	return &keptScanBudget{deadline: dl}
 }
 
 // look charges one file looked at, and checks the time.
@@ -81,7 +96,7 @@ func (b *keptScanBudget) open(path string) (*os.File, error) {
 	if fs, pseudo, err := keptScanPseudoFS(path); err != nil {
 		return nil, err
 	} else if pseudo {
-		return nil, fmt.Errorf("%s is on %s, a pseudo-filesystem, which holds no disk", path, fs)
+		return nil, fmt.Errorf("%s is on %s: %w", path, fs, errKeptScanPseudoLayer)
 	}
 	if keptScanOpenHook != nil {
 		keptScanOpenHook(path)
@@ -98,7 +113,7 @@ func (b *keptScanBudget) open(path string) (*os.File, error) {
 		var fs string
 		var pseudo bool
 		if fs, pseudo, err = keptScanPseudoFSOf(f); err == nil && pseudo {
-			err = fmt.Errorf("%s is on %s, a pseudo-filesystem, which holds no disk", path, fs)
+			err = fmt.Errorf("%s is on %s: %w", path, fs, errKeptScanPseudoLayer)
 		}
 	}
 	if err != nil {

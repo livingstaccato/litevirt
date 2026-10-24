@@ -265,3 +265,35 @@ func TestOVA_AMemberRepeatingAnEarlierFlattenedNameIsRefused(t *testing.T) {
 		})
 	}
 }
+
+// The preview's trailer budget is cumulative: after one 600 KiB member, a
+// second does not fit what is left of maxInspectTrailer, so the walk stops
+// at its header without reading its body, and a descriptor behind it is
+// out of sight (the import refuses that archive). A per-member budget would
+// read both and so let a preview skip thousands of near-1 MiB members.
+func TestInspectOVA_TrailerBudgetIsCumulative(t *testing.T) {
+	const member = 600 << 10
+	head := buildTar(t,
+		tarMember{name: "a.ovf", body: []byte(ovfWindowsSCSI)},
+		tarMember{name: "a.cert", body: make([]byte, member)},
+	)
+	ova := buildTar(t,
+		tarMember{name: "a.ovf", body: []byte(ovfWindowsSCSI)},
+		tarMember{name: "a.cert", body: make([]byte, member)},
+		tarMember{name: "a.mf", body: make([]byte, member)},
+		tarMember{name: "b.ovf", body: []byte(ovfOther)},
+	)
+	cr := &countingReader{r: bytes.NewReader(ova)}
+	data, err := InspectOVA(cr)
+	if err != nil || string(data) != ovfWindowsSCSI {
+		t.Fatalf("InspectOVA = %d bytes, %v; want the first descriptor", len(data), err)
+	}
+	// head ends in the two zero blocks that close an archive; the second
+	// member's header takes the place of the first of them.
+	if limit := len(head) - 512; cr.n > limit {
+		t.Fatalf("InspectOVA read %d bytes, past the second member's header (%d): it read that member", cr.n, limit)
+	}
+	if _, err := UnpackOVA(bytes.NewReader(ova), t.TempDir(), Budget(1<<30)); err == nil || !strings.Contains(err.Error(), "more than one .ovf") {
+		t.Fatalf("UnpackOVA err = %v, want the second-descriptor refusal", err)
+	}
+}

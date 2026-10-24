@@ -2040,7 +2040,6 @@ type ResourceTuning struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Hugepages     bool                   `protobuf:"varint,1,opt,name=hugepages,proto3" json:"hugepages,omitempty"`
 	CpuPinning    []int32                `protobuf:"varint,2,rep,packed,name=cpu_pinning,json=cpuPinning,proto3" json:"cpu_pinning,omitempty"`
-	NumaTopology  string                 `protobuf:"bytes,3,opt,name=numa_topology,json=numaTopology,proto3" json:"numa_topology,omitempty"` // deprecated: use numa_policy
 	IoThreads     int32                  `protobuf:"varint,4,opt,name=io_threads,json=ioThreads,proto3" json:"io_threads,omitempty"`
 	NumaPolicy    *NUMAPolicy            `protobuf:"bytes,5,opt,name=numa_policy,json=numaPolicy,proto3" json:"numa_policy,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -2089,13 +2088,6 @@ func (x *ResourceTuning) GetCpuPinning() []int32 {
 		return x.CpuPinning
 	}
 	return nil
-}
-
-func (x *ResourceTuning) GetNumaTopology() string {
-	if x != nil {
-		return x.NumaTopology
-	}
-	return ""
 }
 
 func (x *ResourceTuning) GetIoThreads() int32 {
@@ -8100,16 +8092,15 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\vhealth_wait\x18\x05 \x01(\tR\n" +
 	"healthWait\x12.\n" +
 	"\x13rollback_on_failure\x18\x06 \x01(\bR\x11rollbackOnFailure\x12#\n" +
-	"\rpause_between\x18\a \x01(\tR\fpauseBetween\"\xcd\x01\n" +
+	"\rpause_between\x18\a \x01(\tR\fpauseBetween\"\xbd\x01\n" +
 	"\x0eResourceTuning\x12\x1c\n" +
 	"\thugepages\x18\x01 \x01(\bR\thugepages\x12\x1f\n" +
 	"\vcpu_pinning\x18\x02 \x03(\x05R\n" +
-	"cpuPinning\x12#\n" +
-	"\rnuma_topology\x18\x03 \x01(\tR\fnumaTopology\x12\x1d\n" +
+	"cpuPinning\x12\x1d\n" +
 	"\n" +
 	"io_threads\x18\x04 \x01(\x05R\tioThreads\x128\n" +
 	"\vnuma_policy\x18\x05 \x01(\v2\x17.litevirt.v1.NUMAPolicyR\n" +
-	"numaPolicy\"l\n" +
+	"numaPolicyJ\x04\b\x03\x10\x04R\rnuma_topology\"l\n" +
 	"\n" +
 	"NUMAPolicy\x12%\n" +
 	"\x0epreferred_node\x18\x01 \x01(\x05R\rpreferredNode\x12\x16\n" +

@@ -229,10 +229,9 @@ func BuildVMSpec(instanceName, baseName string, vm *VMDef, f *File) (*pb.VMSpec,
 			cpuPins[i] = int32(p)
 		}
 		spec.Resources = &pb.ResourceTuning{
-			Hugepages:    vm.Resources.HugePages,
-			CpuPinning:   cpuPins,
-			NumaTopology: vm.Resources.NUMATopology,
-			IoThreads:    int32(vm.Resources.IOThreads),
+			Hugepages:  vm.Resources.HugePages,
+			CpuPinning: cpuPins,
+			IoThreads:  int32(vm.Resources.IOThreads),
 		}
 	}
 

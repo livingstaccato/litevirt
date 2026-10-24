@@ -386,10 +386,9 @@ func TestBuildVMSpec_WithResources(t *testing.T) {
 		CPU:    4,
 		Memory: 8192,
 		Resources: &ResourcesDef{
-			HugePages:    true,
-			CPUPinning:   []int{0, 1, 2, 3},
-			NUMATopology: "strict",
-			IOThreads:    2,
+			HugePages:  true,
+			CPUPinning: []int{0, 1, 2, 3},
+			IOThreads:  2,
 		},
 	}
 
@@ -409,9 +408,6 @@ func TestBuildVMSpec_WithResources(t *testing.T) {
 		if r.CpuPinning[i] != want {
 			t.Errorf("CpuPinning[%d] = %d, want %d", i, r.CpuPinning[i], want)
 		}
-	}
-	if r.NumaTopology != "strict" {
-		t.Errorf("NumaTopology = %q", r.NumaTopology)
 	}
 	if r.IoThreads != 2 {
 		t.Errorf("IoThreads = %d", r.IoThreads)
@@ -1262,5 +1258,17 @@ func TestBuildVMSpec_OnHostFailureString(t *testing.T) {
 	plain := &VMDef{Image: "ubuntu", CPU: 1, Memory: 512}
 	if spec := mustBuildVMSpec(t, "vm1", "vm1", plain, f); spec.OnHostFailure != "" {
 		t.Errorf("no migrate stanza: spec.OnHostFailure = %q, want empty", spec.OnHostFailure)
+	}
+}
+
+// `numa-topology` was a resources key that reached the spec and was never
+// read (the spec's NUMA control is numa_policy). A file that still names it is
+// told so rather than having it silently do nothing.
+//
+// Mutation: put the yaml field back — the problem is gone.
+func TestResources_NUMATopologyIsUnknown(t *testing.T) {
+	ps := problemsOf(t, "name: s\nvms:\n  a:\n    image: u\n    resources: {numa-topology: strict}\n")
+	if _, ok := findProblem(ps, "vms.a.resources", `unknown field "numa-topology"`); !ok {
+		t.Errorf("numa-topology not reported as unknown; got:\n%s", dumpProblems(ps))
 	}
 }

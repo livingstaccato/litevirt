@@ -1314,7 +1314,6 @@ device under that mapping. See [pci-passthrough.md](pci-passthrough.md#resource-
     resources:
       hugepages: true               # Use huge pages for VM memory
       cpu-pinning: [0, 1, 2, 3]    # Pin vCPUs to specific host CPUs
-      numa-topology: "strict"       # NUMA memory placement
       io-threads: 2                 # Number of I/O threads for disk operations
 ```
 

@@ -798,7 +798,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeCold, "")
 		case fwl != nil:
 			// QEMU's TLS stream only with both hosts ready and their
-			// migration CAs agreeing (memoryTLSReady).
+			// migration CAs agreeing (memoryTLSGap).
 			gap := s.memoryTLSGap(srcTLS, ens, req.TargetHost)
 			useTLS = gap == ""
 			route = s.chooseLiveFirmwareRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeMemory, gap)

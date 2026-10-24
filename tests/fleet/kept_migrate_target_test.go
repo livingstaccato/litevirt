@@ -25,7 +25,8 @@ import (
 //
 // Red before the check. Mutations: skip the check in ReceiveMigrationDisk
 // for a check_only header - "check_only" red; for a real receive - "the
-// write" red; drop it from EnsureDisks - "live" red.
+// write" red; drop it from EnsureDisks - "live" red; check only the first
+// stub - "live, the second of two disks" red.
 
 // keepOverlayMissing records on sc's node n a kept overlay of a deleted VM
 // whose missing backing file is base (a file name on n), and returns the
@@ -120,6 +121,21 @@ func TestFleet_MigrationTargetsGetTheKeptCreateCheck(t *testing.T) {
 		wantKeptRefusal(t, "EnsureDisks", err, top)
 		if _, err := os.Lstat(sc.disk); err == nil {
 			t.Fatal("a refused EnsureDisks made a stub at the kept overlay's missing base")
+		}
+	})
+	t.Run("live, the second of two disks", func(t *testing.T) {
+		sc := newColdStoppedScenario(t)
+		first := filepath.Join(filepath.Dir(sc.disk), "os1-a.qcow2")
+		second := filepath.Join(filepath.Dir(sc.disk), "os1-b.qcow2")
+		top := keepOverlayMissing(t, sc, sc.dst, second)
+		_, err := sc.c.PeerClient(sc.src, sc.dst).EnsureDisks(context.Background(), &pb.EnsureDisksRequest{
+			VmName: "os1", Disks: []*pb.DiskStub{{Path: first, SizeBytes: 1 << 20}, {Path: second, SizeBytes: 1 << 20}},
+		})
+		wantKeptRefusal(t, "EnsureDisks", err, top)
+		for _, p := range []string{first, second} {
+			if _, err := os.Lstat(p); err == nil {
+				t.Fatalf("a refused EnsureDisks made a stub at %s", p)
+			}
 		}
 	})
 }

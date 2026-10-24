@@ -154,13 +154,15 @@ func badFenceRow(t *testing.T, db *corrosion.Client, id, method, result string, 
 // Follow-up re-review N1: the confirm-first order on a best-effort host. The
 // operator powers the host off and confirms it (recorded fenced); this
 // coordinator fences it afresh on that confirmation, and the lenient SSH
-// fence, unable to reach the host that is off, records best-effort-ssh /
-// fenced after the confirmation. That row is this coordinator's own fence on
-// the confirmation, not a sign the host ran since: the shared-disk VM moves
-// in one step, as on main.
+// fence, unable to reach the host that is off, proves nothing; the
+// confirmation is what recovers it (the split-brain guard's best-effort
+// case). The fence's row is this coordinator's own fence on the
+// confirmation, not a sign the host ran since: the shared-disk VM moves in
+// one step, as on main.
 //
-// Mutation: drop the afresh exemption — the newer best-effort row refuses the
-// binding and sd stays on bad.
+// Mutations: drop the afresh exemption — the newer best-effort row refuses the
+// binding and sd stays on bad; drop best-effort from the guard's
+// confirmation case — nothing moves.
 func TestSharedDiskFence_ABestEffortHostConfirmedOffFirstMovesInOneStep(t *testing.T) {
 	db, ctx, c := sharedDiskFixture(t)
 	if err := corrosion.UpdateHostState(ctx, db, "bad", "fenced"); err != nil {
@@ -316,6 +318,11 @@ func TestSharedDiskFence_AReadErrorAfterAnAfreshFenceRetriesOnIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	badFenceRow(t, db, "op-bad", "manual", "manual-confirmed", 10*time.Second)
+	// The afresh best-effort fence counts as a self-pause (waited out at
+	// once here), so the recovery reaches the binding.
+	c.PartitionPauseEnforced = func(context.Context) bool { return true }
+	c.PeerPausesOnLoss = func(string) bool { return true }
+	c.PauseWaitFor = func(int) time.Duration { return 0 }
 	fences := 0
 	broken := false
 	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {

@@ -789,16 +789,16 @@ checked.
 | `verified` | `ipmi` or `redfish` + `fenced` | Powered off, then observed off (IPMI chassis power status, or Redfish `PowerState` `Off`). |
 | `operator-confirmed` | `lv host fence-confirm` | A person attested the host is down. |
 | `requested` | `ssh` or `watchdog` + `fenced` | The host accepted a forced power-off, or its watchdog heartbeat was stopped. Nothing checked it went down. |
-| `assumed` | `best-effort-ssh` + `fenced` | SSH itself failed and the best-effort strategy proceeded anyway. Not even the request is known to have arrived. |
-| `self_paused` | `best-effort-ssh` + `fenced`, detail prefixed `[relies on the host's partition pause]` | As `assumed`, but with `partition_pause_v1` latched: the coordinator waited out the host's own partition pause before it recovered anything, so the old copy had stopped executing. It says nothing about power. `litevirt_fences_total` counts it as `assumed`. |
+| `assumed` | `best-effort-ssh` + `fenced` | Written only by an earlier build: SSH failed and the best-effort strategy proceeded anyway. Not even the request is known to have arrived. This build does not recover from such a row. |
+| `self_paused` | `best-effort-ssh` + `fenced`, detail prefixed `[relies on the host's partition pause]` | A best-effort fence that did not confirm the power-off, relied on because `partition_pause_v1` has latched and the host said it pauses: the coordinator waited out the host's own partition pause before it recovered anything, so the old copy had stopped executing. It says nothing about power. `litevirt_fences_total` counts it as `assumed`. |
 | `awaiting-confirmation` | `manual` + `partial` | A manual fence waiting for a person. Not a failure. |
-| `failed` | any + `partial` | The fence ran and reported failure. |
+| `failed` | any + `partial` | The fence ran and reported failure, or was refused, or (best-effort) did not confirm the power-off with the host's pause not relied on. |
 
 Only `verified` and `operator-confirmed` are proof-grade: they satisfy the
 shared-storage fence, and only they record a host `fenced` once
 `fence_state_v1` has latched (`corrosion.FenceProofGrade` is defined in terms
 of this table, and the coordinator judges a live fence by the same one). A
-`requested` or `assumed` fence records the host `offline`, and still lets the
+`requested` or `self_paused` fence records the host `offline`, and still lets the
 coordinator that ran it reschedule **local-disk** VMs, which is why the command
 prints a note when it finds one. A later coordinator resumes a recovery from
 one while it still stands, and never fences the host again for it (see
@@ -2396,7 +2396,8 @@ holder writes.
   reported in `partition_pause_failed`.
 - `partition_pause_failed` (host, critical): this host lost the majority and
   could not pause a workload it had to. While it is open, the majority does
-  not rely on this host's pause and recovers on an `assumed` fence as before.
+  not rely on this host's pause, so a best-effort fence of it is no fence, and
+  its workloads are held until `lv host fence-confirm <host>`.
   With a verified hardware watchdog armed the host also self-fences. It
   resolves once every pause succeeds or the majority returns. A record that
   cannot be written (a full `data_dir`), or whose write does not return within

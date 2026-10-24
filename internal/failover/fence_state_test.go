@@ -60,13 +60,11 @@ func TestFenceClassification_OneRule(t *testing.T) {
 // Mutation: drop the latch check, so fenceRecordState keeps the legacy rule —
 // the host is recorded 'fenced' and the test goes red.
 func TestFailover_UnverifiedFenceRecordsOfflineOnceLatched(t *testing.T) {
-	for _, method := range []string{"ssh", "watchdog", "best-effort-ssh"} {
+	// Not best-effort: a best-effort fence counts only as a self-pause
+	// (TestPartitionPause_*), and an assumed success alone is held.
+	for _, method := range []string{"ssh", "watchdog"} {
 		t.Run(method, func(t *testing.T) {
-			strategy := method
-			if method == "best-effort-ssh" {
-				strategy = "best-effort"
-			}
-			db, ctx := seedDownHost(t, strategy, nil)
+			db, ctx := seedDownHost(t, method, nil)
 			c := newTestCoordinator("coordinator", db)
 			c.Gate = fenceStateLatched()
 			c.SetFencer(fencerReturning(method, true))

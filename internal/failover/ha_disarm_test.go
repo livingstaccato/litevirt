@@ -1046,7 +1046,7 @@ func TestHADisarm_StallAlertNamesHostHeldBeforeFence(t *testing.T) {
 	if len(alerts) != 1 {
 		t.Fatalf("stall alerts for a host held before its fence: %+v, want one", alerts)
 	}
-	if a := alerts[0]; a.host != "down" || a.reason != "recovery held: HA disarmed" || a.pending != 1 || !a.since.Equal(start) {
+	if a := alerts[0]; a.host != "down" || a.reason != "recovery held: HA disarmed; held: vm/vm" || a.pending != 1 || !a.since.Equal(start) {
 		t.Fatalf("alert = %+v, want host down, reason %q, pending 1, since %v", a, "recovery held: HA disarmed", start)
 	}
 	if fences != 0 || fenceRows(t, db) != 1 || hostState(t, db, ctx) != "active" || vmHost(t, db, ctx) != "down" {
@@ -1104,7 +1104,7 @@ func TestHADisarm_HeldClockRestartsAtTheFence(t *testing.T) {
 	}
 	tick(0)
 	tick(recoveryStallAfter + time.Second)
-	if len(reasons) != 1 || reasons[0] != "recovery held: HA disarmed" {
+	if len(reasons) != 1 || reasons[0] != "recovery held: HA disarmed; held: vm/vm" {
 		t.Fatalf("held alerts = %q, want one held by the disarm", reasons)
 	}
 
@@ -1118,7 +1118,7 @@ func TestHADisarm_HeldClockRestartsAtTheFence(t *testing.T) {
 		t.Fatalf("alerted on the cycle that fenced: %q", reasons)
 	}
 	tick(recoveryStallAfter + time.Second)
-	if len(reasons) != 2 || reasons[1] == "recovery held: HA disarmed" || sinces[1].Before(fencedAt) {
+	if len(reasons) != 2 || strings.HasPrefix(reasons[1], "recovery held: HA disarmed") || sinces[1].Before(fencedAt) {
 		t.Fatalf("alerts after the fence: %q since %v, want a second one, from the fence at %v, naming what holds it now",
 			reasons, sinces, fencedAt)
 	}
@@ -1161,7 +1161,7 @@ func TestHADisarm_UpgradingHostIsNotNamedHeldInsideItsGrace(t *testing.T) {
 	}
 	tick(upgradingTimeout - recoveryStallAfter - 30*time.Second) // past the grace: stuck
 	tick(recoveryStallAfter + time.Second)
-	if len(reasons) != 1 || reasons[0] != "recovery held: HA disarmed" {
+	if len(reasons) != 1 || reasons[0] != "recovery held: HA disarmed; held: vm/vm" {
 		t.Fatalf("a host stuck upgrading past %v: alerts %q, want one held by the disarm", upgradingTimeout, reasons)
 	}
 	if fences != 0 {

@@ -479,8 +479,9 @@ enforcement:
                               # watchdog is the backstop when a pause fails. A blip shorter
                               # than the pause time pauses nothing; a fleet-wide blip pauses
                               # everything and resumes everything on heal. An explicit false
-                              # is the kill switch: that host pauses nothing and recovers an
-                              # assumed fence at once, as before. See
+                              # is the kill switch: that host pauses nothing, and a
+                              # best-effort fence of a failed host is no longer relied on,
+                              # so its workloads are held until `lv host fence-confirm`. See
                               # design/partition-pause.md.
   partition_pause_record_failure: pause
                               # What a partition pause does when its record under

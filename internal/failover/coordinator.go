@@ -248,6 +248,9 @@ type Coordinator struct {
 	// holdReason is, per host, why its recovery last did not proceed; the
 	// stall alert names it (alertStalledRecoveries).
 	holdReason map[string]string
+	// lastFenceFailure is, per host, the method and detail of the newest
+	// fence this coordinator saw fail, for the retry hold (retryHold).
+	lastFenceFailure map[string]string
 	// stallSince and stallAlerted are the stall alert's clock and its last
 	// alert, per host (alertStalledRecoveries).
 	stallSince   map[string]time.Time
@@ -1238,7 +1241,7 @@ func (c *Coordinator) run(ctx context.Context) {
 				retryPlan = c.fenceRetryDue(ctx, h)
 				retry = retryPlan.Due
 				if !retry && !retryPlan.Next.IsZero() {
-					c.noteHold(target, "fence failed; retrying at "+retryPlan.Next.UTC().Format(time.RFC3339)+fenceFailedWayOut(h))
+					c.retryHold(h, retryPlan.Next)
 				}
 			}
 		}
@@ -1499,7 +1502,7 @@ func (c *Coordinator) stepDownGauges() {
 	c.mRegionsWithoutQuorum(0)
 	// The stall alert is the leader's too: a node that takes the lease back
 	// starts its clocks afresh rather than alerting on a stale one.
-	c.stallSince, c.stallAlerted, c.stallUnfenced, c.holdReason = nil, nil, nil, nil
+	c.stallSince, c.stallAlerted, c.stallUnfenced, c.holdReason, c.lastFenceFailure = nil, nil, nil, nil, nil
 	// So are the upgrading lives it saw: a later tenure has not seen what
 	// happened meanwhile.
 	c.upgradingLives = nil
@@ -1550,7 +1553,7 @@ func (c *Coordinator) forgetEpisodes() {
 	c.retrying = nil
 	c.retryNotified, c.retryRefusedLogged = nil, nil
 	c.resumeDeclined, c.confirmStale, c.notRelying = nil, nil, nil
-	c.stallSince, c.stallAlerted, c.stallUnfenced, c.holdReason = nil, nil, nil, nil
+	c.stallSince, c.stallAlerted, c.stallUnfenced, c.holdReason, c.lastFenceFailure = nil, nil, nil, nil, nil
 	c.upgradingLives = nil
 }
 
@@ -3630,7 +3633,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 	// self-pause when this coordinator relies on the host's partition pause
 	// (docs/design/partition-pause.md §4.2): same row shape, assurance
 	// self_paused, and recoverFenced then waits out the pause.
-	fr = asSelfPause(fr, pauseRelied)
+	fr = notAFenceUnlessPaused(asSelfPause(fr, pauseRelied))
 
 	logResult := fr.LogResult()
 	if !fr.Success {
@@ -3891,6 +3894,9 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	// leader knows neither — leaving it unset keeps recoverHosts' auto-recovery
 	// off a host somebody else's fence relocated VMs away from.
 	c.markHandled(ctx, h.Name)
+	// A best-effort fence counts only as a self-pause, live or resumed: a
+	// row an older build recorded as an assumed success is not one here.
+	fr = notAFenceUnlessPaused(fr)
 
 	// Step 2b: a fence that did not record the host "fenced" leaves it
 	// "offline" — a weaker claim, and the one the split-brain guards below
@@ -3927,10 +3933,9 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 			}
 			slog.Error("failover: best-effort fence unconfirmed under safe-fence policy, NOT rescheduling",
 				"host", h.Name, "detail", fr.Detail,
-				"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off, "+
-					"or set host label "+corrosion.LabelUnsafeAutoFailover+"=true to opt into legacy proceed-anyway")
+				"hint", strings.TrimPrefix(fenceFailedWayOut(h), "; or "))
 			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
-			c.noteHold(h.Name, "best-effort fence awaiting 'lv host fence-confirm "+h.Name+"' (safe-fence policy)")
+			c.noteHold(h.Name, "best-effort fence is not proof the host is off (safe-fence policy)"+fenceFailedWayOut(h))
 			return
 		}
 		slog.Info("failover: operator confirmed best-effort fence, proceeding", "host", h.Name)
@@ -3948,9 +3953,9 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 			}
 			slog.Error("failover: the fence ending a held fence did not reach the host, NOT rescheduling",
 				"host", h.Name, "detail", fr.Detail,
-				"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off; the recovery resumes from it")
+				"hint", strings.TrimPrefix(fenceFailedWayOut(h), "; or ")+"; the recovery resumes from it")
 			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
-			c.noteHold(h.Name, "best-effort fence after a held fence did not reach the host; awaiting 'lv host fence-confirm "+h.Name+"'")
+			c.noteHold(h.Name, "best-effort fence after a held fence did not reach the host"+fenceFailedWayOut(h))
 			return
 		}
 		slog.Info("failover: operator confirmed a host whose fence was held, proceeding", "host", h.Name)
@@ -3984,20 +3989,31 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 
 	// Split-brain guard. Reschedule only if:
 	//   - fence succeeded (real fence happened), OR
-	//   - strategy is "manual" AND an operator confirmation row exists.
+	//   - strategy is "manual" or "best-effort" AND an operator confirmation
+	//     row stands (confirmedOffNow).
 	// Manual fence used to claim Success=true unconditionally; it now reports
 	// Success=false and the coordinator must see an explicit confirmation row
 	// in fencing_log (written by `lv host fence-confirm`) before rescheduling.
-	// A best-effort fence that failed is no exception: a lenient SSH fence
-	// reports Success=true for any attempt it made (the safe-fence policy above
-	// gates that), so a failure is one it never made — its path was refused —
-	// and nothing reached the host.
+	// A best-effort fence is the same unless the host's partition pause is
+	// relied on (asSelfPause, waited out below): one that failed — refused,
+	// unstarted, or dialled with nothing confirmed — proves nothing, and the
+	// operator's confirmation is its only other way to recover, including
+	// the afresh fence run on that confirmation, which cannot reach a host
+	// that is off.
 	if !fr.Success {
-		switch h.FenceStrategy {
-		case "manual":
+		bestEffort := fr.Method == "best-effort-ssh" && fence.ResolveStrategy(h.FenceStrategy) == "best-effort"
+		switch {
+		case h.FenceStrategy == "manual" || bestEffort:
 			if why, ok := c.confirmedOffNow(ctx, h.Name, life, lifeKnown); !ok {
 				if why != "" {
 					return // refused with its remedy (noteConfirmationStale)
+				}
+				if bestEffort {
+					slog.Error("failover: the best-effort fence proves nothing and the host's partition pause is not relied on, NOT rescheduling",
+						"host", h.Name, "detail", fr.Detail, "hint", strings.TrimPrefix(fenceFailedWayOut(h), "; or "))
+					c.mAttempt(PhaseSplitBrain, ResultRefused, ErrFenceFailed)
+					c.noteFenceFailure(h, fr)
+					return
 				}
 				slog.Error("failover: manual fence not confirmed by operator, NOT rescheduling",
 					"host", h.Name, "detail", fr.Detail,
@@ -4006,14 +4022,14 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 				c.noteHold(h.Name, "manual fence awaiting 'lv host fence-confirm "+h.Name+"'")
 				return
 			}
-			slog.Info("failover: operator confirmed manual fence, proceeding",
-				"host", h.Name)
+			slog.Info("failover: operator confirmed the host off, proceeding",
+				"host", h.Name, "strategy", h.FenceStrategy)
 			c.mAttempt(PhaseSplitBrain, ResultOK, ErrManualConfirmed)
 		default:
 			slog.Error("failover: CRITICAL — fencing failed, NOT rescheduling VMs to prevent split-brain",
 				"host", h.Name, "strategy", h.FenceStrategy, "detail", fr.Detail)
 			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrFenceFailed)
-			c.noteHold(h.Name, "fence failed ("+fr.Method+": "+fr.Detail+"); retrying with backoff"+fenceFailedWayOut(h))
+			c.noteFenceFailure(h, fr)
 			return
 		}
 	}
@@ -5345,10 +5361,17 @@ func (c *Coordinator) strandedByHost(ctx context.Context) (map[string]int, error
 // strandedOn counts the recoverable workloads still recorded on host
 // (strandedByHost's per-host count).
 func (c *Coordinator) strandedOn(ctx context.Context, host string, enrolled map[string]bool) (int, error) {
-	n := 0
+	names, err := c.strandedNamesOn(ctx, host, enrolled)
+	return len(names), err
+}
+
+// strandedNamesOn names strandedOn's workloads: "vm/<name>" and
+// "container/<name>".
+func (c *Coordinator) strandedNamesOn(ctx context.Context, host string, enrolled map[string]bool) ([]string, error) {
+	var names []string
 	vms, err := corrosion.ListVMs(ctx, c.db, "", host)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	for _, vm := range vms {
 		if vmNeedsFailover(vm, enrolled[vm.Name]) {
@@ -5358,26 +5381,49 @@ func (c *Coordinator) strandedOn(ctx context.Context, host string, enrolled map[
 			if vm.State == "stopped" {
 				disks, derr := corrosion.GetVMDisks(ctx, c.db, vm.Name)
 				if derr != nil {
-					return 0, derr
+					return nil, derr
 				}
 				if corrosion.VMHasHostLocalDisk(disks) {
 					continue
 				}
 			}
-			n++
+			names = append(names, "vm/"+vm.Name)
 		}
 	}
 	cts, err := corrosion.ListContainers(ctx, c.db, host)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	for _, ct := range cts {
 		if containerNeedsFailover(ct) {
-			n++
+			names = append(names, "container/"+ct.Name)
 		}
 	}
-	return n, nil
+	return names, nil
 }
+
+// heldNamesNote is ", held: <names>" for the stall alert of host, at most
+// heldNamesMax of them; "" when they cannot be read.
+func (c *Coordinator) heldNamesNote(ctx context.Context, host string) string {
+	enrolled, err := c.autoPromoteEnrolled(ctx)
+	if err != nil {
+		return ""
+	}
+	names, err := c.strandedNamesOn(ctx, host, enrolled)
+	if err != nil || len(names) == 0 {
+		return ""
+	}
+	sort.Strings(names)
+	more := ""
+	if len(names) > heldNamesMax {
+		more = fmt.Sprintf(" and %d more", len(names)-heldNamesMax)
+		names = names[:heldNamesMax]
+	}
+	return "; held: " + strings.Join(names, ", ") + more
+}
+
+// heldNamesMax bounds the workloads one stall alert names.
+const heldNamesMax = 20
 
 // withHeldClaimRetries adds to byHost, for the stall alert only, each host
 // whose owed claim retry is held because it is neither fenced nor offline

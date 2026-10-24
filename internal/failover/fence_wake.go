@@ -254,7 +254,7 @@ func (c *Coordinator) fenceAuthorityChanged(ctx context.Context, h *corrosion.Ho
 	}
 	r := c.fenceRetryDue(ctx, h)
 	if !r.Due && !r.Next.IsZero() {
-		c.noteHold(h.Name, "fence failed; retrying at "+r.Next.UTC().Format(time.RFC3339)+fenceFailedWayOut(h))
+		c.retryHold(h, r.Next)
 	}
 	return r.Due
 }
@@ -302,6 +302,27 @@ func fenceFailedWayOut(h *corrosion.HostRecord) string {
 	return out + ", or give it an ipmi or redfish fence strategy"
 }
 
+// noteFenceFailure holds h's recovery on a fence that failed, naming what
+// failed and the way out, and keeps that failure for the retry holds that
+// replace this one while the next attempt waits (retryHold).
+func (c *Coordinator) noteFenceFailure(h *corrosion.HostRecord, fr fence.Result) {
+	if c.lastFenceFailure == nil {
+		c.lastFenceFailure = map[string]string{}
+	}
+	c.lastFenceFailure[h.Name] = fr.Method + ": " + fr.Detail
+	c.noteHold(h.Name, "fence failed ("+fr.Method+": "+fr.Detail+"); retrying with backoff"+fenceFailedWayOut(h))
+}
+
+// retryHold is the hold of h while its failed fence waits for its retry at
+// next: the failure it repeats, when this coordinator saw it, and the way out.
+func (c *Coordinator) retryHold(h *corrosion.HostRecord, next time.Time) {
+	what := "fence failed"
+	if f := c.lastFenceFailure[h.Name]; f != "" {
+		what += " (" + f + ")"
+	}
+	c.noteHold(h.Name, what+"; retrying at "+next.UTC().Format(time.RFC3339)+fenceFailedWayOut(h))
+}
+
 // noteHold records why the recovery of host is not proceeding, for the stall
 // alert. The newest reason wins.
 func (c *Coordinator) noteHold(host, reason string) {
@@ -322,6 +343,7 @@ func (c *Coordinator) forgetHost(host string) {
 	delete(c.afreshConfirm, host)
 	delete(c.notRelying, host)
 	delete(c.holdReason, host)
+	delete(c.lastFenceFailure, host)
 	delete(c.stallSince, host)
 	delete(c.stallAlerted, host)
 	delete(c.stallUnfenced, host)
@@ -397,6 +419,8 @@ func (c *Coordinator) alertStalledRecoveries(ctx context.Context, pending map[st
 		if held := c.unpausedHeldReason(host); held != "" {
 			reason = held + "; " + reason
 		}
+		// The one alert names what it holds.
+		reason += c.heldNamesNote(ctx, host)
 		msg := "failover: recovery of a fenced host has stalled"
 		if unfenced[host] {
 			msg = "failover: a quorum-down host is held unfenced, and its recovery with it"

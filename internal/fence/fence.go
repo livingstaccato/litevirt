@@ -21,6 +21,17 @@ type Result struct {
 	Method  string
 	Detail  string
 	Success bool
+	// Dialled marks a best-effort SSH fence that ran ssh and did not confirm
+	// the power-off: the request may or may not have reached the host. It is
+	// a failure (Success false) and proves nothing. The failover coordinator
+	// counts it only when it relies on the host's own partition pause and has
+	// waited that pause out (docs/design/partition-pause.md §4).
+	Dialled bool
+	// WrongHost marks an SSH fence whose pinned host key did not match: a
+	// different machine answered at the host's address. Nothing about the
+	// host itself is known, not even that it lost the majority, so not even
+	// its partition pause is relied on.
+	WrongHost bool
 }
 
 // HostConfig is the subset of corrosion.HostRecord fields needed for fencing.
@@ -106,8 +117,9 @@ func (s SSHFence) pathLabel() string {
 // Execute runs the fencing strategy specified by h.FenceStrategy.
 // Strategies:
 //
-//	"best-effort"  – try an SSH forced power-off; a dialled attempt succeeds regardless.
-//	                 A refused or unstarted one is a failure (sshNotAttempted)
+//	"best-effort"  – try an SSH forced power-off; one that does not confirm it is a
+//	                 failure (Dialled when ssh ran), as under "ssh", which the
+//	                 coordinator counts only on the host's partition pause
 //	"ssh"          – SSH forced (immediate) power-off; report failure if unreachable
 //	"ipmi"         – IPMI/BMC power off via ipmitool; must succeed
 //	"redfish"      – Redfish/BMC ComputerSystem.Reset ForceOff over HTTPS, then
@@ -178,6 +190,17 @@ func ResolveStrategy(raw string) string {
 	default:
 		return "best-effort"
 	}
+}
+
+// SSHOnly reports whether a host with fence strategy raw is fenced only over
+// SSH (ssh, or best-effort, which unset and unknown values resolve to): no
+// fence of it ever proves a power-off.
+func SSHOnly(raw string) bool {
+	switch ResolveStrategy(raw) {
+	case "ssh", "best-effort":
+		return true
+	}
+	return false
 }
 
 // sshFenceArmed is the line the remote fence command prints once it is running
@@ -530,19 +553,41 @@ func NotFencedWayOut(host string) string {
 		"(`lv host config %s --fence-strategy ipmi|redfish`)", host, host, host)
 }
 
-// sshFailure is an SSH fence that did not land: a failure, or for a lenient
-// (best-effort) fence the assumed success that strategy has always reported.
+// sshFailure is an SSH fence that ran ssh and did not land. It is a failure
+// under every strategy: nothing confirms the host went down. A lenient
+// (best-effort) one is marked Dialled, which the failover coordinator counts
+// only on the host's own partition pause (Result.Dialled). A host-key mismatch
+// is marked WrongHost: another machine answered at the address.
 func sshFailure(h HostConfig, lenient bool, runErr error, detail string, out []byte) Result {
+	wrong := hostKeyMismatch(out)
 	if lenient {
-		slog.Warn("SSH fence failed (best-effort, ignoring)", "host", h.Name, "error", runErr)
+		slog.Warn("best-effort SSH fence did not confirm the power-off; it is not a fence", "host", h.Name,
+			"error", runErr, "wrong_host", wrong)
 		return Result{
 			Method: "best-effort-ssh",
-			Detail: fmt.Sprintf("SSH failed (%v), proceeding anyway: %s [path=%s]", runErr, strings.TrimSpace(string(out)),
-				h.SSH.pathLabel()),
-			Success: true,
+			Detail: fmt.Sprintf("SSH failed (%v): %s [path=%s]", runErr, strings.TrimSpace(string(out)),
+				h.SSH.pathLabel()) + wrongHostNote(wrong),
+			Dialled:   true,
+			WrongHost: wrong,
 		}
 	}
-	return Result{Method: "ssh", Detail: fmt.Sprintf("%s (%v)", detail, runErr), Success: false}
+	return Result{Method: "ssh", Detail: fmt.Sprintf("%s (%v)", detail, runErr) + wrongHostNote(wrong), WrongHost: wrong}
+}
+
+func wrongHostNote(wrong bool) string {
+	if !wrong {
+		return ""
+	}
+	return " (the host key did not match: a different machine answered at this address)"
+}
+
+// hostKeyMismatch reports whether ssh's output says the target's host key did
+// not match the pin (or was not in it): what OpenSSH prints when
+// StrictHostKeyChecking refuses the key.
+func hostKeyMismatch(out []byte) bool {
+	s := string(out)
+	return strings.Contains(s, "Host key verification failed") ||
+		strings.Contains(s, "REMOTE HOST IDENTIFICATION HAS CHANGED")
 }
 
 // ProbeSSH checks h's managed path end to end without arming anything: the

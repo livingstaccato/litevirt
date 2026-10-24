@@ -19,6 +19,9 @@ type fakeRemote struct {
 	sysrqWritable bool
 	// unreachable: ssh never gets a session (no route, refused, auth failed).
 	unreachable bool
+	// wrongKey: a different machine answers at the address, and the pinned
+	// host key check refuses it.
+	wrongKey bool
 	// forcedCommand: the key is pinned to an authorized_keys command="..."
 	// that ignores what was asked for and exits 0.
 	forcedCommand bool
@@ -119,6 +122,11 @@ echo "poweroff: unexpected args: $*" >&2; exit 1
 	preamble := ""
 	if r.unreachable {
 		preamble = `echo "ssh: connect to host 10.0.0.4 port 22: No route to host" >&2; exit 255`
+	}
+	if r.wrongKey {
+		preamble = `echo "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@" >&2
+echo "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @" >&2
+echo "Host key verification failed." >&2; exit 255`
 	}
 	if r.forcedCommand {
 		preamble = `echo "backup-only key"; exit 0`
@@ -269,16 +277,46 @@ func TestFenceSSH_ExitZeroWithoutTheFenceRunningIsNotFenced(t *testing.T) {
 	}
 }
 
-// Best-effort is unchanged: it proceeds on a failure by design, which is why
-// the safe-fence policy demands an operator confirmation for it separately.
-func TestFenceSSH_BestEffortStillProceedsOnFailure(t *testing.T) {
+// Best-effort no longer proceeds on a failure: a fence that ran and did not
+// confirm the power-off is a failure marked Dialled, which the failover
+// coordinator counts only on the host's own partition pause.
+//
+// Mutation: report a lenient failure as Success (sshFailure) — red.
+func TestFenceSSH_BestEffortFailureIsDialledNotFenced(t *testing.T) {
 	fakeSSH(t, fakeRemote{forceWorks: false, sysrqWritable: false})
 	h := sshHost()
 	h.FenceStrategy = "best-effort"
 
 	r := Execute(fenceCtx(t), h)
 
-	if !r.Success {
-		t.Errorf("best-effort reported Success=false; it is fire-and-forget by design. detail=%q", r.Detail)
+	if r.Success || !r.Dialled || r.WrongHost || r.Method != "best-effort-ssh" {
+		t.Errorf("best-effort whose power-off failed = %+v, want a dialled best-effort-ssh failure", r)
+	}
+	if r.ProvedOff() || r.LogResult() != LogPartial {
+		t.Errorf("best-effort whose power-off failed is recorded %s, proved off %v", r.LogResult(), r.ProvedOff())
+	}
+}
+
+// A pinned fence whose host key check fails reached a different machine: not
+// a fence under either strategy, and marked WrongHost, so the coordinator does
+// not rely even on the host's partition pause. An unreachable host is not.
+//
+// Mutation: hostKeyMismatch returns false — WrongHost is never set, red.
+func TestFenceSSH_HostKeyMismatchIsTheWrongHost(t *testing.T) {
+	for _, strategy := range []string{"ssh", "best-effort"} {
+		fakeSSH(t, fakeRemote{wrongKey: true})
+		h := sshHost()
+		h.FenceStrategy = strategy
+		h.SSH = SSHFence{Path: SSHPathPinned, KnownHosts: []byte("a ssh-ed25519 AAAA\n"), HostKeyAlias: "a"}
+		r := Execute(fenceCtx(t), h)
+		if r.Success || !r.WrongHost || !strings.Contains(r.Detail, "a different machine answered") {
+			t.Fatalf("%s fence with a host-key mismatch = %+v, want a WrongHost failure", strategy, r)
+		}
+	}
+	fakeSSH(t, fakeRemote{unreachable: true})
+	h := sshHost()
+	h.FenceStrategy = "best-effort"
+	if r := Execute(fenceCtx(t), h); r.Success || r.WrongHost || !r.Dialled {
+		t.Fatalf("best-effort fence of an unreachable host = %+v, want dialled, not WrongHost", r)
 	}
 }

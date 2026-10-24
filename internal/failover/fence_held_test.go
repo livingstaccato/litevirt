@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -314,8 +315,9 @@ func TestFenceHeld_HostBackResolves(t *testing.T) {
 // becomes restart-any and the fence that follows is a best-effort one that
 // did not reach the host. mtl became recoverable during the hold, so a
 // partitioned host never paused it and may still run it: nothing is
-// rescheduled until an operator confirms the host off. The control, the same
-// fence of a host that was never held, recovers mtl as before.
+// rescheduled until an operator confirms the host off, even with the host's
+// partition pause relied on. The control, the same fence of a host that was
+// never held, recovers mtl once the pause is waited out (zero here).
 //
 // Mutation: drop the heldThisOutage refusal in recoverFenced — mtl is
 // rescheduled on the unreached fence.
@@ -328,6 +330,9 @@ func TestFenceHeld_AnUnreachedFenceAfterAHoldRecoversNothing(t *testing.T) {
 			db, c, _, fm := heldFixture(t, map[bool]string{true: "none", false: "restart-any"}[held])
 			ctx := context.Background()
 			c.SetFencer(unreached)
+			c.PartitionPauseEnforced = func(context.Context) bool { return true }
+			c.PeerPausesOnLoss = func(string) bool { return true }
+			c.PauseWaitFor = func(int) time.Duration { return 0 }
 			// The unsafe_auto_failover opt-out does not lift this refusal:
 			// it waives the safe-fence policy, not the pause gap.
 			if err := corrosion.SetHostLabel(ctx, db, "bad", corrosion.LabelUnsafeAutoFailover, "true"); err != nil {

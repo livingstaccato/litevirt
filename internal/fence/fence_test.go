@@ -28,8 +28,9 @@ func TestFenceManual_RequiresConfirmation(t *testing.T) {
 	}
 }
 
-func TestFenceBestEffort_NoSSH_Succeeds(t *testing.T) {
-	// best-effort with unreachable host (no SSH server) should still succeed.
+func TestFenceBestEffort_NoSSH_IsDialledNotFenced(t *testing.T) {
+	// best-effort with an unreachable host (no SSH server) is a failure that
+	// ran ssh: Dialled, which only the host's partition pause can make count.
 	h := HostConfig{
 		Name:          "unreachable",
 		Address:       "192.0.2.1", // TEST-NET, unreachable
@@ -40,8 +41,8 @@ func TestFenceBestEffort_NoSSH_Succeeds(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	r := Execute(ctx, h)
-	if !r.Success {
-		t.Errorf("best-effort should succeed even when SSH fails, got: %s", r.Detail)
+	if r.Success || !r.Dialled || r.WrongHost {
+		t.Errorf("best-effort with SSH failing = %+v, want a dialled failure", r)
 	}
 	if r.Method != "best-effort-ssh" {
 		t.Errorf("expected method=best-effort-ssh, got %q", r.Method)
@@ -72,12 +73,12 @@ func TestFenceUnknownStrategy_FallsBackToBestEffort(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	r := Execute(ctx, h)
-	// Should succeed (best-effort) and report best-effort-ssh method.
+	// Falls back to best-effort: best-effort-ssh, dialled, not a fence.
 	if r.Method != "best-effort-ssh" {
 		t.Errorf("expected fallback to best-effort-ssh, got %q", r.Method)
 	}
-	if !r.Success {
-		t.Errorf("fallback best-effort should succeed: %s", r.Detail)
+	if r.Success || !r.Dialled {
+		t.Errorf("fallback best-effort = %+v, want a dialled failure", r)
 	}
 }
 
@@ -90,7 +91,7 @@ func TestFenceEmpty_DefaultsBestEffort(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	r := Execute(ctx, h)
-	if !r.Success {
-		t.Errorf("empty strategy (best-effort) should succeed: %s", r.Detail)
+	if r.Success || !r.Dialled || r.Method != "best-effort-ssh" {
+		t.Errorf("empty strategy (best-effort) = %+v, want a dialled best-effort failure", r)
 	}
 }

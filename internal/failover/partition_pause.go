@@ -109,16 +109,41 @@ func (c *Coordinator) reliesOnPauseIfAssumed(ctx context.Context, h *corrosion.H
 	return fence.ResolveStrategy(h.FenceStrategy) == "best-effort" && c.relyOnPartitionPause(ctx, h)
 }
 
-// asSelfPause rewrites an assumed best-effort fence result as a self-pause
-// one when the pause may be relied on (relied, decided before the fence by
-// reliesOnPauseIfAssumed). Any other result is returned as is.
+// asSelfPause rewrites a best-effort fence that ran ssh and did not confirm
+// the power-off (Dialled; or an assumed success, as a fencer on an older
+// contract reports it) as a self-pause one when the pause may be relied on
+// (relied, decided before the fence by reliesOnPauseIfAssumed). The recovery
+// then waits out the pause (pauseDeadlinePassed). Anything else is returned
+// as is, and a best-effort fence it does not rewrite is not a fence
+// (notAFenceUnlessPaused):
+//
+//   - a refused or unstarted fence (not Dialled): nothing was attempted;
+//   - a host-key mismatch (WrongHost): a different machine answered at the
+//     address, so the host may well be elsewhere and still hold the majority,
+//     and its pause is no evidence of anything.
 func asSelfPause(fr fence.Result, relied bool) fence.Result {
-	if !fr.Success || fr.Method != "best-effort-ssh" || !relied {
+	if fr.Method != "best-effort-ssh" || !relied || fr.WrongHost || (!fr.Success && !fr.Dialled) {
 		return fr
 	}
 	// The method stays best-effort-ssh, so an older coordinator reads the row
 	// as the assumed fence it always was; the reliance rides in the detail.
 	fr.Detail = corrosion.FencePauseReliance + fr.Detail
+	fr.Success, fr.Dialled = true, false
+	return fr
+}
+
+// notAFenceUnlessPaused is the rule a best-effort fence is judged by: it
+// counts only as a self-pause (asSelfPause). One that reports success any
+// other way, with no proof the host went down, is a failure; nothing stands
+// between it and a second running copy. A successful SSH request (method
+// ssh: the remote shell confirmed it was powering the host off) and every
+// other strategy's result pass unchanged.
+func notAFenceUnlessPaused(fr fence.Result) fence.Result {
+	if fr.Method != "best-effort-ssh" || !fr.Success || corrosion.ReliesOnPartitionPause(fr.Method, fr.Detail) {
+		return fr
+	}
+	fr.Success = false
+	fr.Detail += "; not counted as a fence: nothing proves the host is off, and its partition pause is not relied on"
 	return fr
 }
 

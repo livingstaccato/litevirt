@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/failover"
@@ -138,6 +139,10 @@ type ppOpts struct {
 	pauserHook func(n *Node, p *health.PartitionPauser)
 	// tPause replaces a node's pauser T_pause (ppTPause), before it starts.
 	tPause map[string]time.Duration
+	// fenceResult, when set, replaces the drill's fence result (a
+	// best-effort SSH fence that could not reach the host) for a fence by
+	// the named node.
+	fenceResult func(by string) fence.Result
 	// vmBackend, when set, wraps a node's VM backend as its pauser sees it
 	// (a slow resume, a hook mid-pass).
 	vmBackend func(n *Node) health.PauseVMBackend
@@ -191,10 +196,14 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 			s.mu.Lock()
 			s.fence = append(s.fence, ppFence{target: h.Name, by: name, at: time.Now()})
 			s.mu.Unlock()
-			// The drill's fence: SSH cannot reach a partitioned host, and the
-			// best-effort strategy proceeds anyway — assurance assumed.
-			return fence.Result{Method: "best-effort-ssh", Success: true,
-				Detail: "SSH failed (fleet partition), proceeding anyway: by " + name}
+			if o.fenceResult != nil {
+				return o.fenceResult(name)
+			}
+			// The drill's fence: SSH cannot reach a partitioned host. It ran
+			// ssh and proved nothing (Dialled), which counts only as a
+			// self-pause.
+			return fence.Result{Method: "best-effort-ssh", Dialled: true,
+				Detail: "SSH failed (fleet partition): by " + name}
 		})
 		coord.Gate = ppGate{chk}
 		coord.Claimer = n.Server
@@ -546,8 +555,10 @@ func TestFleet_PartitionPause_MinorityPausesBeforeTheMajorityRecovers(t *testing
 
 // TestFleet_PartitionSettle_DualRunSettlesToTheCertifiedCopy is drill 1 on a
 // host WITHOUT the token: node-0 does not pause and the cluster has not
-// latched, so the majority recovers at once and pp-dual runs twice through the
-// partition (which this scenario asserts, so it cannot pass vacuously). After
+// latched. The majority's best-effort fence proves nothing, so it holds
+// pp-dual, until an operator confirms node-0 off by mistake; then pp-dual
+// runs twice through the partition (which this scenario asserts, so it cannot
+// pass vacuously). After
 // the heal, Layer 3 stops node-0's copy on the certified claim: exactly one
 // copy runs, and node-0's is destroyed, not undefined first, with
 // vm_settled and a partition.settle audit row.
@@ -580,6 +591,17 @@ func TestFleet_PartitionSettle_DualRunSettlesToTheCertifiedCopy(t *testing.T) {
 	})
 
 	c.SplitGossip(c.Nodes[:1], c.Nodes[1:])
+	decider := c.Nodes[2]
+	eventually(t, ppRecoverBound, "a fence of "+owner.Name+" in "+decider.Name+"'s fencing_log", func() bool {
+		rows, err := decider.DB.Query(ctx, `SELECT 1 FROM fencing_log WHERE host_name = ?`, owner.Name)
+		return err == nil && len(rows) > 0
+	})
+	if on := runningOn(c, "pp-dual"); len(on) != 1 {
+		t.Fatalf("pp-dual runs on %v after an unproven fence, want only the owner", on)
+	}
+	if _, err := c.SelfClient(decider).FenceHost(ctx, &pb.FenceHostRequest{Name: owner.Name, Confirmed: true, ConfirmManualOnly: true}); err != nil {
+		t.Fatalf("fence-confirm %s: %v", owner.Name, err)
+	}
 	eventually(t, ppRecoverBound, "the dual run: pp-dual running on the owner AND a recovery destination", func() bool {
 		return len(runningOn(c, "pp-dual")) == 2
 	})
@@ -940,14 +962,77 @@ func TestFleet_PartitionPause_FlagTurnedOffIsNotReliedOn(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, r := range rows {
-		if a := corrosion.FenceAssuranceDetail(r.String("method"), r.String("result"), r.String("detail")); a != corrosion.FenceAssumed {
+		if a := corrosion.FenceAssuranceDetail(r.String("method"), r.String("result"), r.String("detail")); a != corrosion.FenceFailed {
 			t.Errorf("%s recorded its fence of %s with assurance %s, want %s: it relied on a pause %s turned off before the partition",
-				decider.Name, owner.Name, a, corrosion.FenceAssumed, owner.Name)
+				decider.Name, owner.Name, a, corrosion.FenceFailed, owner.Name)
 		}
 	}
 	// The owner's flag is off, so it pauses nothing: the copy the coordinator
 	// would have waited on is still running.
 	if _, ok := firstEvent(owner, "suspend", "pp-off"); ok {
 		t.Errorf("%s suspended pp-off with enforcement.partition_pause off", owner.Name)
+	}
+	// And the coordinator, with nothing to rely on, holds it: no second copy.
+	time.Sleep(ppWait(4) + 2*time.Second)
+	if vm, _ := corrosion.GetVM(ctx, decider.DB, "pp-off"); vm == nil || vm.HostName != owner.Name {
+		t.Fatalf("pp-off on %s's replica = %+v, want it held on %s: nothing proves %s is off", decider.Name, vm, owner.Name, owner.Name)
+	}
+	if on := runningOn(c, "pp-off"); len(on) != 1 || on[0] != owner.Name {
+		t.Fatalf("pp-off runs on %v, want only %s", on, owner.Name)
+	}
+
+	// The way out: the operator powers the owner off and confirms it, and the
+	// recovery proceeds with no further fence.
+	owner.Virt.SetState("pp-off", libvirtfake.StateShutdown)
+	if _, err := c.SelfClient(decider).FenceHost(ctx, &pb.FenceHostRequest{Name: owner.Name, Confirmed: true, ConfirmManualOnly: true}); err != nil {
+		t.Fatalf("fence-confirm %s: %v", owner.Name, err)
+	}
+	eventually(t, ppRecoverBound, "pp-off recovered after the confirmation", func() bool {
+		vm, _ := corrosion.GetVM(ctx, decider.DB, "pp-off")
+		return vm != nil && vm.HostName != owner.Name
+	})
+}
+
+// TestFleet_PartitionPause_AWrongHostFenceIsNotReliedOn: the fence of the
+// partitioned owner reaches a different machine at its address (a host-key
+// mismatch). Even with the owner's pause latched and relied on, that fence is
+// no self-pause: the owner may hold the majority from elsewhere and never
+// pause. The VM is held well past the pause wait, and the fence is recorded
+// failed.
+//
+// Mutation: let asSelfPause rewrite a WrongHost result — the coordinator
+// records self_paused and recovers the VM after the wait.
+func TestFleet_PartitionPause_AWrongHostFenceIsNotReliedOn(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 5, IndependentReplicas: true, Relays: 5, RealGossip: true})
+	owner, decider := c.Nodes[0], c.Nodes[2]
+	insertVMPolicy(t, owner, "pp-wrong", owner.Name, "restart-any")
+	c.WaitConverged(t, convergeTimeout)
+	owner.Virt.SetState("pp-wrong", libvirtfake.StateRunning)
+	genesisByTick(t, c, decider)
+	enableRecoveryClaims(t, c)
+
+	newPPStack(t, c, ppOpts{latched: true, coordinators: map[string]bool{decider.Name: true},
+		fenceResult: func(by string) fence.Result {
+			return fence.Result{Method: "best-effort-ssh", Dialled: true, WrongHost: true,
+				Detail: "SSH failed (exit status 255): Host key verification failed. by " + by}
+		}})
+	c.SplitGossip(c.Nodes[:1], c.Nodes[1:])
+	eventually(t, ppRecoverBound, "a fence of "+owner.Name+" in "+decider.Name+"'s fencing_log", func() bool {
+		rows, err := decider.DB.Query(ctx, `SELECT 1 FROM fencing_log WHERE host_name = ?`, owner.Name)
+		return err == nil && len(rows) > 0
+	})
+	time.Sleep(ppWait(4) + 2*time.Second)
+	rows, err := decider.DB.Query(ctx, `SELECT method, result, detail FROM fencing_log WHERE host_name = ?`, owner.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		if a := corrosion.FenceAssuranceDetail(r.String("method"), r.String("result"), r.String("detail")); a != corrosion.FenceFailed {
+			t.Fatalf("%s recorded a fence that reached the wrong machine with assurance %s, want failed", decider.Name, a)
+		}
+	}
+	if vm, _ := corrosion.GetVM(ctx, decider.DB, "pp-wrong"); vm == nil || vm.HostName != owner.Name {
+		t.Fatalf("pp-wrong on %s's replica = %+v, want it held on %s", decider.Name, vm, owner.Name)
 	}
 }

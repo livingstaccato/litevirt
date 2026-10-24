@@ -176,8 +176,8 @@ func TestFenceBestEffort_WithPort(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	r := Execute(ctx, h)
-	if !r.Success {
-		t.Errorf("best-effort should succeed: %s", r.Detail)
+	if r.Success || !r.Dialled {
+		t.Errorf("best-effort = %+v, want a dialled failure", r)
 	}
 	if r.Method != "best-effort-ssh" {
 		t.Errorf("Method = %q", r.Method)
@@ -193,8 +193,8 @@ func TestFenceEmpty_Strategy(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	r := Execute(ctx, h)
-	if !r.Success {
-		t.Error("empty strategy (best-effort) should succeed")
+	if r.Success || !r.Dialled {
+		t.Errorf("empty strategy (best-effort) = %+v, want a dialled failure", r)
 	}
 }
 
@@ -207,8 +207,8 @@ func TestFenceUnknown_FallsToBestEffort(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	r := Execute(ctx, h)
-	if !r.Success {
-		t.Error("unknown strategy should fall back to best-effort and succeed")
+	if r.Success || !r.Dialled {
+		t.Errorf("unknown strategy = %+v, want best-effort's dialled failure", r)
 	}
 	if r.Method != "best-effort-ssh" {
 		t.Errorf("Method = %q, want best-effort-ssh", r.Method)

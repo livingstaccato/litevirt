@@ -610,9 +610,9 @@ func TestHADisarm_Fleet_HostDownWhileDisarmedIsNamedHeld(t *testing.T) {
 			named = append(named, al)
 		}
 	}
-	if len(named) != 1 || named[0].by != a.Name || named[0].reason != "recovery held: HA disarmed" {
+	if len(named) != 1 || named[0].by != a.Name || named[0].reason != "recovery held: HA disarmed; held: vm/vm-x" {
 		t.Fatalf("stall alerts naming %s: %+v, want one from the lease holder %s saying %q",
-			x.Name, named, a.Name, "recovery held: HA disarmed")
+			x.Name, named, a.Name, "recovery held: HA disarmed; held: vm/vm-x")
 	}
 	if fs := f.cs.Fences(); len(fs) != 0 {
 		t.Fatalf("fences while HA is disarmed: %+v", fs)

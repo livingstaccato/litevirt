@@ -47,6 +47,16 @@ func fenceRowAt(t *testing.T, db *corrosion.Client, id, method, result string, a
 	}
 }
 
+// fenceRowDetailAt is fenceRowAt with a detail.
+func fenceRowDetailAt(t *testing.T, db *corrosion.Client, id, method, result, detail string, at time.Time) {
+	t.Helper()
+	if err := db.Execute(context.Background(),
+		`INSERT OR IGNORE INTO fencing_log (id, host_name, method, result, timestamp, detail) VALUES (?, 'down', ?, ?, ?, ?)`,
+		id, method, result, at.UTC().Format(time.RFC3339), detail); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRecentFence_FromBeforeTheHostLastTurnedActiveDoesNotCount(t *testing.T) {
 	db, ctx := seedDownHost(t, "ssh", nil)
 	liveMembership(t, db)

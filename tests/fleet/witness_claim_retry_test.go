@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
@@ -33,7 +34,8 @@ import (
 // on two hosts at once, and must still be recovered.
 //
 //   - pause-off-then-on: node-0 runs without the pause in the first outage
-//     (so q3-b keeps running through it and after the heal), and with it in
+//     (so q3-b keeps running through it and after the heal, and the first
+//     recovery runs only on an operator's mistaken confirmation), and with it in
 //     the second (its flag flipped without the restart that would re-admit
 //     it, as the scenario's only way to reach this). A retry that runs at
 //     once starts q3-b while node-0 still runs it. A retry judged at the
@@ -116,6 +118,18 @@ func claimRetryAcrossOutages(t *testing.T, pauseOffFirst bool) {
 	// ── outage 1 ──
 	waitHealed("before the first split")
 	c.SplitGossip(minority, majority)
+	if pauseOffFirst {
+		// Without node-0's pause the majority's best-effort fence proves
+		// nothing and recovers nothing; an operator confirms node-0 off (by
+		// mistake: it still runs q3-b) to start the first recovery.
+		eventually(t, ppRecoverBound, "a fence of "+owner.Name+" in "+decider.Name+"'s fencing_log", func() bool {
+			rows, err := decider.DB.Query(ctx, `SELECT 1 FROM fencing_log WHERE host_name = ?`, owner.Name)
+			return err == nil && len(rows) > 0
+		})
+		if _, err := c.SelfClient(decider).FenceHost(ctx, &pb.FenceHostRequest{Name: owner.Name, Confirmed: true, ConfirmManualOnly: true}); err != nil {
+			t.Fatalf("fence-confirm %s: %v", owner.Name, err)
+		}
+	}
 	var destA *Node
 	eventually(t, ppRecoverBound, "the majority to recover q3-a in the first outage", func() bool {
 		destA = runsOnMajority("q3-a")

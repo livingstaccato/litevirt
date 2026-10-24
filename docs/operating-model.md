@@ -314,11 +314,13 @@ of acting — it says nothing about whether the resulting rows have replicated.
   re-fenced — see
   [Resuming a recovery from a recorded fence](migration-failover.md#resuming-a-recovery-from-a-recorded-fence).
 - **Split-brain refusal.** If a fence fails, the coordinator refuses to
-  reschedule the host's VMs. A `best-effort` fence fails only when it was never
-  attempted (its SSH path was refused, or ssh could not start); one it attempted
-  reports success whatever happened. The hold names the ways out: power the
-  host off and run `lv host fence-confirm <host>`, or give it an `ipmi` or
-  `redfish` fence strategy. It
+  reschedule the host's VMs. A `best-effort` fence fails whenever it does not
+  confirm the power-off, unless the host's partition pause is relied on and
+  waited out (see [When a best-effort host is
+  recovered](migration-failover.md#when-a-best-effort-host-is-recovered)). The
+  hold names the way out: power the host off and run
+  `lv host fence-confirm <host>`, or give it an `ipmi` or `redfish` fence
+  strategy. It
   does not park the host: while a quorum still sees it down, the leader fences
   it again on a backoff — 30 s after the failed attempt, doubling per
   consecutive failure to a 5-minute cap, read from `fencing_log` so a restart
@@ -328,9 +330,10 @@ of acting — it says nothing about whether the resulting rows have replicated.
     `lv host config <host> --fence-strategy ipmi` (and the BMC credentials)
     takes effect on the next retry. Otherwise the method that failed is
     repeated: a host switched to `best-effort` is never "recovered" on a failed
-    best-effort fence. A `best-effort` fence that was never attempted is
-    retried as `best-effort`, so a refusal that has cleared (a host that has
-    published its fence ssh row since) fences the host then.
+    best-effort fence. A failed `best-effort` fence is retried as
+    `best-effort`, so a refusal that has cleared (a host that has published its
+    fence ssh row since), or a host whose pause has become relied on, is
+    handled then.
   - **What is never retried:** a `manual` fence (`lv host fence-confirm`
     resumes it) and a `watchdog` fence of a peer (it cannot succeed) — unless
     the host's strategy has since been set to `ipmi`, `redfish` or `ssh`, which the next
@@ -818,9 +821,9 @@ Check `lv host inspect <host>` and the last `fencing_log` row before acting:
 
 | Why the host is down | What to do |
 | --- | --- |
-| Fence never confirmed — `manual` strategy awaiting confirmation, a `best-effort` fence with a writable shared disk, or a fence that failed | `lv host fence-confirm <host>`, **after** you have confirmed the power state yourself. This is a normal state for a `manual`-strategy host, and the likeliest non-zero you will see. |
+| Fence never confirmed — `manual` strategy awaiting confirmation, a `best-effort` fence that proved nothing (the host's partition pause not relied on) or with a writable shared disk, or a fence that failed | `lv host fence-confirm <host>`, **after** you have confirmed the power state yourself. This is a normal state for a `manual`-strategy host, and the likeliest non-zero you will see. |
 | Fenced successfully, but recovery was then refused — lost quorum, an ungated target, a superseded lease term, no placement candidate, a store error on the proof write | `lv host undrain <host>` once you have confirmed the host is dead. |
-| Marked down by hand — `lv host fence <host>` | If the fence succeeded, the failover leader treats it as it treats its own fence, and only while it still **stands**: some observer has watched the host fail without a break since **before** the fence, and nobody has seen it answer since. Then an `ssh` or `best-effort` fence is resumed from and the workloads are recovered; an `ipmi` fence is resumed from while under 5 minutes old, and otherwise renewed with a fresh power-off and then recovered. A fence that does not stand — the host was still answering when you fenced it, or every observer restarted since (a rolling upgrade restarts them all, so a host fenced before the upgrade) — is never resumed from on an `ssh` or `best-effort` fence: its workloads stay. Confirm the power state, then `lv host fence-confirm <host>`: within 5 minutes of the fence that resumes the recovery, and later the coordinator fences the host afresh for the outage. An `ipmi` fence that does not stand is renewed with a fresh power-off and recovered. If the fence failed, nothing moves on it: while a quorum sees the host down the leader fences it again on its retry backoff, and otherwise confirm the power state, then `lv host fence-confirm <host>`. A host whose fence **failed** returns to `active` on its own once quorum sees it healthy; one whose fence **succeeded** stays `offline` until `lv host undrain <host>` or its own reboot, because its workloads may have moved. For planned removal, `lv host drain <host>` first, which moves the workloads. |
+| Marked down by hand — `lv host fence <host>` | If the fence succeeded, the failover leader treats it as it treats its own fence, and only while it still **stands**: some observer has watched the host fail without a break since **before** the fence, and nobody has seen it answer since. Then an `ssh` fence, or a `best-effort` self-pause once its wait has passed, is resumed from and the workloads are recovered (a `best-effort` fence of an operator's `lv host fence` proves nothing and is not); an `ipmi` fence is resumed from while under 5 minutes old, and otherwise renewed with a fresh power-off and then recovered. A fence that does not stand — the host was still answering when you fenced it, or every observer restarted since (a rolling upgrade restarts them all, so a host fenced before the upgrade) — is never resumed from on an `ssh` or `best-effort` fence: its workloads stay. Confirm the power state, then `lv host fence-confirm <host>`: within 5 minutes of the fence that resumes the recovery, and later the coordinator fences the host afresh for the outage. An `ipmi` fence that does not stand is renewed with a fresh power-off and recovered. If the fence failed, nothing moves on it: while a quorum sees the host down the leader fences it again on its retry backoff, and otherwise confirm the power state, then `lv host fence-confirm <host>`. A host whose fence **failed** returns to `active` on its own once quorum sees it healthy; one whose fence **succeeded** stays `offline` until `lv host undrain <host>` or its own reboot, because its workloads may have moved. For planned removal, `lv host drain <host>` first, which moves the workloads. |
 | Fenced on a fence that did not verify the power-off (`ssh`, `watchdog`, `best-effort`), and its workloads were not recovered | Owner-assert keeps asking such a host whether it runs a workload, and repairs nothing while it does not answer. If it is off, `lv host fence-confirm <host>` makes that a proof. |
 
 Do **not** reach for `lv host undrain` on an unconfirmed fence. It returns the
@@ -1199,9 +1202,9 @@ leadership churn or a partition.
 - What protects you on the majority side is the fence strategy.
   `ipmi` over a management path that survives the partition powers the
   minority off first. `ssh` and `manual`, and `ipmi` with an unreachable BMC,
-  all fail closed and move nothing. `best-effort` does not: without
-  `enforcement.safe_fence_default`, it reschedules VMs that are still running
-  on the other side.
+  all fail closed and move nothing. So does `best-effort`, unless the minority
+  hosts' partition pause is relied on: then the majority waits until they have
+  paused their workloads before it reschedules them.
 - Under cluster scope, keep an odd number of voting sites, or put a witness in
   a third site, and pin workloads that must not cross with `placement.require`
   on a per-site host label.
@@ -1458,7 +1461,8 @@ leadership churn or a partition.
   are insufficient because a network-isolated but otherwise-healthy node can
   refuse SSH but continue writing to the shared volume.
 - **Production without shared storage**: `ssh` is acceptable; `best-effort`
-  for clusters that explicitly opt out of split-brain protection.
+  recovers automatically only with `enforcement.partition_pause` on (the
+  default), and otherwise waits for `lv host fence-confirm`.
 - **Homelab / single-tenant**: `manual` works if you're awake to confirm.
 - **All hosts**: configure `watchdog` as a backstop so a hung daemon
   self-fences within the watchdog timeout.

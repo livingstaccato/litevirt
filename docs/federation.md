@@ -110,7 +110,7 @@ site partition is where the strategies differ most:
 | `ipmi` | The power-off goes to the BMC. If the BMC sits behind the same failed link, the fence fails and nothing is rescheduled: the host is marked down and its workloads stay put until an operator acts. If the BMC is reachable some other way, the power-off lands and the reschedule is safe. |
 | `ssh` | The fence reports failure on an unreachable host, so nothing is rescheduled. |
 | `manual` | Nothing is rescheduled until `lv host fence-confirm`. |
-| `best-effort`, which is also what an unset or unrecognised `fence_strategy` becomes | The fence reports success whether or not the power-off landed. Unless `enforcement.safe_fence_default` is on and latched, the majority reschedules the minority site's VMs **while they are still running there**, so two copies of each VM run at once. Do not use best-effort across sites. |
+| `best-effort`, which is also what an unset or unrecognised `fence_strategy` becomes | The SSH fence cannot reach the host, so it proves nothing. The majority reschedules the minority site's VMs only once the minority hosts' partition pause has certainly stopped them (`partition_pause_v1` latched, each host advertising it), and otherwise holds them until `lv host fence-confirm`. |
 
 **The minority side stalls.** It cannot reach quorum, so it fences nothing
 and reschedules nothing. Its runtime-ownership actions refuse: a start

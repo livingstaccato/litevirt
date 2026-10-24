@@ -94,7 +94,9 @@ rebooted; `lv host mig ls` shows the pending mode in its PENDING column.
 Only GPUs on the NVIDIA driver are listed: a GPU passed through to a VM is on
 vfio-pci and `nvidia-smi` does not see it. litevirt does not yet attach a MIG
 instance to a VM or a container; the instances are for workloads on the host
-itself.
+itself. A device request that sets the API's `mig_profile` field (on a create,
+a re-create, a restore's spec or a PCI attach) is refused with
+`InvalidArgument` rather than given the whole GPU.
 
 A GPU MIG holds is never passed through. When a passthrough would bind an
 NVIDIA GPU to vfio-pci, the host first asks `nvidia-smi`, and refuses the

@@ -206,6 +206,11 @@ func (s *Server) AttachDevice(ctx context.Context, req *pb.AttachDeviceRequest) 
 	if req.VmName == "" {
 		return nil, status.Error(codes.InvalidArgument, "vm_name is required")
 	}
+	if req.PciDevice != nil {
+		if err := refuseMIGProfile(req.PciDevice); err != nil {
+			return nil, err
+		}
+	}
 
 	vmRec, err := corrosion.GetVM(ctx, s.db, req.VmName)
 	if err != nil || vmRec == nil {

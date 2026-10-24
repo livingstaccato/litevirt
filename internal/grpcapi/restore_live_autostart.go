@@ -32,6 +32,9 @@ import (
 // before metadata capture.
 func (s *Server) resolveRestoreSpec(ctx context.Context, req *pb.RestoreLiveRequest, manifest *pbsstore.Manifest) (*pb.VMSpec, error) {
 	if req.Spec != nil {
+		if err := refuseMIGProfile(req.Spec.Devices...); err != nil {
+			return nil, err
+		}
 		return req.Spec, nil
 	}
 	if manifest.VMSpecJSON != "" {

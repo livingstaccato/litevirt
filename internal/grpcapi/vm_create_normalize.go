@@ -58,7 +58,23 @@ func normalizeCreateVMSpec(in *pb.VMSpec, defaultCPUMode string) (*pb.VMSpec, er
 	if err := validateCreateLimits(spec); err != nil {
 		return nil, err
 	}
+	if err := refuseMIGProfile(spec.Devices...); err != nil {
+		return nil, err
+	}
 	return spec, nil
+}
+
+// refuseMIGProfile refuses a device that asks for a MIG profile. Nothing
+// attaches a MIG instance yet, so one would be ignored and the VM given the
+// whole GPU instead.
+func refuseMIGProfile(devs ...*pb.DeviceSpec) error {
+	for i, d := range devs {
+		if p := d.GetMigProfile(); p != "" {
+			return status.Errorf(codes.InvalidArgument,
+				"device %d: MIG attach is not supported yet; mig_profile must be empty (got %q)", i, p)
+		}
+	}
+	return nil
 }
 
 // validateCreateLimits checks the noisy-neighbour limits of a create spec

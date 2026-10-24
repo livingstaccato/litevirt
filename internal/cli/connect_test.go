@@ -279,6 +279,7 @@ func TestConnectRemote_TLSHandshake(t *testing.T) {
 
 func TestConnectLocal_TLSHandshake(t *testing.T) {
 	pkiDir := setupTestPKI(t)
+	asUID(t, 0) // the daemon's PKI directory is root's to use
 
 	serverTLS, err := pki.ServerTLSConfig(pkiDir)
 	if err != nil {

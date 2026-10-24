@@ -474,7 +474,9 @@ the local daemon automatically. It looks, in order, at:
    with `sudo`.
 
 In local mode the user's CLI client bundle (below), when there is one, takes
-the place of `pki_dir`. For a remote entry point, set the target host:
+the place of `pki_dir`. Only root uses the node's own identity in `pki_dir`:
+a user other than root without a bundle is refused before anything in it is
+read. For a remote entry point, set the target host:
 
 ```bash
 export LV_HOST=10.0.50.10
@@ -514,6 +516,12 @@ single-node install does not require copying daemon certificates out of
 /run/litevirt/file-restore/     # file restore: per-session export sockets and pidfiles
 /run/litevirt/endpoint          # grpc_port and pki_dir for a local lv (0644, nothing secret)
 ```
+
+`lv` run on a host as a user other than root uses that user's CLI client
+bundle in `~/.config/litevirt/pki/`, never the host's own identity in
+`/etc/litevirt/pki/`. A user without a bundle is told to run the command with
+sudo; `sudo lv host init --local` installs a bundle for `SUDO_USER` when it
+founds a cluster.
 
 ### What file restore changes on the host
 

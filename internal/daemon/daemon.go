@@ -80,7 +80,7 @@ type Daemon struct {
 	// ownRowReconciling single-flights the own-row reconcile; the two func
 	// fields replace the reconcile and the certificate source in tests.
 	ownRowReconciling atomic.Bool
-	ownRowReconciler  func(context.Context)
+	ownRowReconciler  func(ctx context.Context, from string)
 	ownRowCertSource  corrosion.InstalledCert
 	// auditWired is closed once wireAuditKeyring has installed the keyring
 	// audit rows are signed with; runAuditHold lands nothing before it.
@@ -408,13 +408,32 @@ const localMaxRecvMsgSize = 256 << 20
 // On a WAL-quarantined daemon both writes are refused by the replicated write
 // path, as every write is: the host stays as the cluster recorded it.
 func (d *Daemon) writeBootState(ctx context.Context, cpus, memMiB, diskGiB int, hasResources bool) {
-	d.writeBootStateWith(ctx, cpus, memMiB, diskGiB, hasResources, d.upgradePending)
+	d.writeBootStateWith(ctx, cpus, memMiB, diskGiB, hasResources, d.upgradePending, "")
 }
 
 // writeBootStateWith is writeBootState with the post-upgrade sentinel given:
-// a boot passes d.upgradePending, the own-row reconcile false.
-func (d *Daemon) writeBootStateWith(ctx context.Context, cpus, memMiB, diskGiB int, hasResources, upgradePending bool) {
+// a boot passes d.upgradePending, the own-row reconcile false. expectFrom is
+// the state the own-row reconcile acts over ("" for a boot): the decision is
+// made only when it is taken from that state (Boot.From, which the write is
+// guarded on in its own transaction), so a fence, drain or maintenance
+// recorded after the reconcile's evaluation read the row is never returned
+// to service. A refused decision leaves no trace on disk (hostboot.BootFiles).
+func (d *Daemon) writeBootStateWith(ctx context.Context, cpus, memMiB, diskGiB int, hasResources, upgradePending bool, expectFrom string) {
+	var files hostboot.BootFiles
+	if expectFrom != "" {
+		files = hostboot.SnapshotBootFiles(d.cfg.DataDir)
+	}
 	boot := hostboot.BootState(ctx, d.db, d.cfg.HostName, d.cfg.DataDir, upgradePending, time.Now())
+	if expectFrom != "" && boot.From != expectFrom && (!boot.Deferred || boot.State != expectFrom) {
+		slog.Info("boot report: this host's recorded state is not the one the own-row reconcile acts over; "+
+			"writing nothing", "expected", expectFrom, "state", boot.State, "from", boot.From, "reason", boot.Reason)
+		// No boot was written: the decision's marker, awaiting-serving note
+		// and unclean-boot entry are undone, so nothing reads it as one.
+		if err := files.Undo(); err != nil {
+			slog.Warn("boot report: could not undo the refused decision's boot files", "error", err)
+		}
+		return
+	}
 	slog.Info("boot state", "state", boot.State, "await_serving", boot.AwaitServing, "deferred", boot.Deferred, "from", boot.From, "reason", boot.Reason)
 	r := hostboot.Report{Version: d.cfg.Version, CPUs: cpus, MemMiB: memMiB, DiskGiB: diskGiB, HasResources: hasResources}
 	reportOnServing := func(from string) confirmFunc {
@@ -740,6 +759,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Error("a private key in the PKI directory is readable by other local users and "+
 			"could not be tightened", "error", err)
 	}
+	// And the config file, which can hold inline auth secrets: owner-only, as
+	// `lv host add` writes it, on a node upgraded in place too.
+	d.tightenOwnConfig()
 
 	// Set up libvirt TLS symlinks so qemu+tls:// migration works
 	// using our existing PKI certs. Best-effort — log warning if it fails.

@@ -2205,6 +2205,16 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			return status.Errorf(codes.Internal, "update disk record: %v", err)
 		}
 		_ = corrosion.UpdateDiskStorage(ctx, s.db, targetName, src.DiskName, poolRef.Driver, pool)
+		// The re-homed row records the backing this promotion built, as a
+		// renamed promotion's fresh row does (setDisks): the replica under a
+		// --no-localize overlay, or none. The source row's own backing — a
+		// linked clone's template disk on the host it left — is not the live
+		// disk's, and a replica no row names is held by nothing: its chain is
+		// refused at the next start, and pruning or a pool content delete
+		// removes the file the VM reads.
+		if err := corrosion.SetDiskBacking(ctx, s.db, targetName, src.DiskName, livePath, liveDiskBacking(livePath, replicaPath), ""); err != nil {
+			return status.Errorf(codes.Internal, "record the backing of disk %s: %v", src.DiskName, err)
+		}
 		for _, d := range others {
 			if !d.built() {
 				continue // a shared disk's row stays exactly as it was
@@ -2213,6 +2223,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				return status.Errorf(codes.Internal, "update disk record %s: %v", d.row.DiskName, err)
 			}
 			_ = corrosion.UpdateDiskStorage(ctx, s.db, targetName, d.row.DiskName, poolRef.Driver, pool)
+			if err := corrosion.SetDiskBacking(ctx, s.db, targetName, d.row.DiskName, d.livePath, liveDiskBacking(d.livePath, d.replicaPath), ""); err != nil {
+				return status.Errorf(codes.Internal, "record the backing of disk %s: %v", d.row.DiskName, err)
+			}
 		}
 		// The VM now runs on its replica target: replicate back to the host it left.
 		s.reverseReplicationAfterMove(ctx, "vm", targetName, "", vm.HostName, s.hostName)

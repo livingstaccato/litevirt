@@ -2031,6 +2031,16 @@ func ClearDiskBacking(ctx context.Context, c *Client, vmName, diskName, path str
 	return setDiskBacking(ctx, c, vmName, diskName, path, "", "")
 }
 
+// SetDiskBacking records that disk (vmName, diskName), now at path, is backed
+// by exactly backingDisk and backingImage ("" for none), as ClearDiskBacking
+// does: only while the live row still names path, in InsertDisk's whole-row
+// shape, and only while that row is still the one it read. A promotion that
+// takes a VM over re-homes the disk row it had, and records here the backing
+// it built: the replica under a --no-localize overlay, or none.
+func SetDiskBacking(ctx context.Context, c *Client, vmName, diskName, path, backingDisk, backingImage string) error {
+	return setDiskBacking(ctx, c, vmName, diskName, path, backingDisk, backingImage)
+}
+
 func setDiskBacking(ctx context.Context, c *Client, vmName, diskName, path, backingDisk, backingImage string) error {
 	var cur DiskRecord
 	found := false

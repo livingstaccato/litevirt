@@ -512,7 +512,12 @@ func (c *diskChain) snapshotBaseOf(layer, resolved, self, vm, project string) bo
 // legacyPromoted accepts the replica under a VM promoted with --no-localize
 // by a build that did not record backing_disk — raw (an incremental
 // replica) or qcow2 (a full one; promote.go:901-910 at 3e4ba50b declared the
-// backing's format by the replica's suffix): the layer is that VM's own
+// backing's format by the replica's suffix). Not only older layouts: until
+// a promotion that takes the VM over under its own name recorded the backing
+// on the row it re-homes (corrosion.SetDiskBacking in PromoteReplica), it
+// recorded none — only a renamed promotion's fresh row did — so the rows of
+// such promotions, over a replica in this build's replica owner directory,
+// start by this rule. The layer is that VM's own
 // promoted disk (d's file, or the file of a disk row with no backing_disk
 // recorded), in its pool's directory, and the replica is of it in a
 // directory a daemon created for exactly that VM:

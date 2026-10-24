@@ -136,36 +136,6 @@ func disksPoolServer(t *testing.T) (*Server, string) {
 	return s, disks
 }
 
-// CR1: a replica another host's replication runner uploads into a pool on
-// <data_dir>/disks lands where promote reads it, and is promoted — by the
-// failover's automatic promotion and by an operator's manual one.
-func TestPoolRound6_ReplicaUploadedIntoADisksPoolIsPromotable(t *testing.T) {
-	s, disks := disksPoolServer(t)
-	peer := bareEntryPeer(t, s)
-	for _, vm := range []string{"web", "api"} {
-		insertPromotableVM(t, s, vm, "", "dead-host", "root")
-		insertReplicationSchedule(t, s, vm, "default")
-		name := vm + "-root-" + stampAgo(10*time.Minute) + ".qcow2"
-		if err := uploadAs(replicaContentCtx(peer, vm, "", "root"), s, "default", name, string(qcow2Bytes(t))); err != nil {
-			t.Fatalf("the replication runner's upload of %s: %v", name, err)
-		}
-		if _, err := os.Stat(filepath.Join(disks, name)); err != nil {
-			t.Errorf("replica %s did not land in the pool directory: %v", name, err)
-		}
-	}
-	if err := s.AutoPromoteReplica(context.Background(), "web", "", 0); err != nil {
-		t.Errorf("automatic promotion of a replica in the disks pool: %v", err)
-	}
-	if err := promote(adminCtx(), s, &pb.PromoteReplicaRequest{VmName: "api", TargetPool: "default"}); err != nil {
-		t.Errorf("manual promotion of a replica in the disks pool: %v", err)
-	}
-	for _, vm := range []string{"web", "api"} {
-		if !s.virt.DomainExists(vm) {
-			t.Errorf("%s was not promoted", vm)
-		}
-	}
-}
-
 // Promotion takes the next-older replica when the newest is missing or
 // unreadable, unless the operator named the replica.
 func TestPoolRound6_PromoteFallsBackToAnOlderReplica(t *testing.T) {

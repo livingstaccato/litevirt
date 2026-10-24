@@ -166,11 +166,6 @@ func (p *legPeer) PushReplica(context.Context, ...grpc.CallOption) (grpc.ClientS
 		on: func(m *pb.PushReplicaRequest) { p.add(len(m.GetChunk())) }, resp: &pb.PushReplicaResponse{}}, nil
 }
 
-func (p *legPeer) UploadStoragePoolContent(context.Context, ...grpc.CallOption) (grpc.ClientStreamingClient[pb.UploadStoragePoolContentRequest, pb.UploadStoragePoolContentResponse], error) {
-	return &answerStream[pb.UploadStoragePoolContentRequest, pb.UploadStoragePoolContentResponse]{
-		on: func(m *pb.UploadStoragePoolContentRequest) { p.add(len(m.GetChunk())) }, resp: &pb.UploadStoragePoolContentResponse{}}, nil
-}
-
 func (p *legPeer) PushReplicaIncrement(context.Context, ...grpc.CallOption) (grpc.ClientStreamingClient[pb.PushReplicaIncrementRequest, pb.PushReplicaIncrementResponse], error) {
 	return &answerStream[pb.PushReplicaIncrementRequest, pb.PushReplicaIncrementResponse]{
 		on: func(m *pb.PushReplicaIncrementRequest) { p.add(len(m.GetData())) }, resp: &pb.PushReplicaIncrementResponse{ReplicaRecorded: true}}, nil
@@ -185,11 +180,9 @@ type answerStream[Req, Resp any] struct {
 func (c *answerStream[Req, Resp]) Send(m *Req) error            { c.on(m); return nil }
 func (c *answerStream[Req, Resp]) CloseAndRecv() (*Resp, error) { return c.resp, nil }
 
-// Each of the four legs that send a run's data to a peer — the recorded full
-// replica, main's upload (also the full copy's mirror), the incremental push
-// and the incremental mirror — charges the run's limiter exactly the data
-// bytes it sends: not the disk's size (the mirror skips zero chunks), and
-// nothing for a leg it does not send.
+// Each of the two legs that send a run's data to a peer — the recorded full
+// replica and the incremental push — charges the run's limiter exactly the
+// data bytes it sends.
 //
 // Mutations: remove the charge from any one leg (applyIncrementRemote's
 // forEachExtentChunk callback among them) — that leg charges 0.
@@ -201,13 +194,11 @@ func TestReplicationLegs_ChargeExactlyTheBytesSent(t *testing.T) {
 	const mib = 1 << 20
 	data := make([]byte, 3*mib+12345)
 	_, _ = rand.Read(data)
-	clear(data[mib : 2*mib]) // one all-zero chunk: the mirror does not send it
+	clear(data[mib : 2*mib]) // one all-zero chunk
 	file := filepath.Join(t.TempDir(), "scratch")
 	if err := os.WriteFile(file, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	vm, _ := corrosion.GetVM(context.Background(), f.s.db, "web")
-	k := replicaKeyOf(vm, "1")
 	rec := newReplicaRecord("a", "web", "1", "web/dr", "20260910-000000", "raw")
 	extents := [][2]int64{{0, int64(len(data))}}
 
@@ -219,14 +210,8 @@ func TestReplicationLegs_ChargeExactlyTheBytesSent(t *testing.T) {
 			_, err := streamReplicaToPool(ctx, peer, file, "dr", "peer", rec)
 			return err
 		}},
-		{"streamLegacyReplica", func(ctx context.Context) error {
-			return streamLegacyReplica(ctx, peer, file, "dr", "peer", k, "web-1-20260910-000000.qcow2")
-		}},
 		{"applyIncrementRemote", func(ctx context.Context) error {
 			return f.s.applyIncrementRemote(ctx, "peer", "dr", rec, "", int64(len(data)), bytes.NewReader(data), extents)
-		}},
-		{"mirrorIncrement", func(ctx context.Context) error {
-			return f.s.mirrorIncrement(ctx, "peer", "dr", k, rec, "", int64(len(data)), bytes.NewReader(data), extents)
 		}},
 	}
 	for _, leg := range legs {
@@ -237,9 +222,6 @@ func TestReplicationLegs_ChargeExactlyTheBytesSent(t *testing.T) {
 		}
 		if peer.sent == 0 || lim.charged() != peer.sent {
 			t.Errorf("%s charged %d for %d data bytes sent", leg.name, lim.charged(), peer.sent)
-		}
-		if leg.name == "mirrorIncrement" && peer.sent != int64(len(data))-mib {
-			t.Errorf("mirrorIncrement sent %d, want the disk less its zero chunk (%d)", peer.sent, len(data)-mib)
 		}
 	}
 }

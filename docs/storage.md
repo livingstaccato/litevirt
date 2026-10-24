@@ -561,9 +561,9 @@ record:
   every replica into the pool's replica area with a record beside it
   ([backups.md](backups.md#where-replicas-live-and-how-they-are-selected)),
   and a listing shows the caller the replicas of the VMs it may read. A
-  replica at the pool's top level — written before runs used the area, or an
-  older node's replica upload — is recorded on the pool's host with the VM,
-  disk and project it is a replica of. A file merely named like a replica
+  replica at the pool's top level, written before runs used the area, is
+  recorded on the pool's host with the VM, disk and project it is a replica
+  of. A file merely named like a replica
   (`<vm>-<disk>-<time>.qcow2`) is never owned through its name; listing and
   deleting it needs `storage.hostpath` at the root;
 - files uploaded into this pool while it belonged to its current project (a

@@ -245,8 +245,6 @@ func TestReplicateIncremental_ForksOnlyFromTheReplicaItsCheckpointContinues(t *t
 	sched := corrosion.BackupScheduleRecord{VMName: "web", Repo: "dr", Type: "replication", TargetPool: "dr", KeepReplicas: 5, Incremental: true}
 	data := make([]byte, 4<<20)
 	run := func(ts string) *fakeBackupSource {
-		replicaPeersMemos.Delete(f.s)
-		setEveryHostListsReplicas(t, f.s, true)
 		rd := &fakeBackupReader{data: data, extents: [][2]int64{{0, 1 << 20}}, incr: true}
 		src := &fakeBackupSource{full: &fakeBackupReader{data: data, extents: [][2]int64{{0, int64(len(data))}}}, incr: rd}
 		f.s.SetBackupSource(src)

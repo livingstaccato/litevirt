@@ -21,16 +21,15 @@ import (
 )
 
 // A replication schedule's bandwidth limit (lv replication schedule add
-// --bwlimit) paces every leg that sends a run's data to its target, the
-// mirror leg included. The schedule is created through the RPC, so the rate
+// --bwlimit) paces every leg that sends a run's data to its target. The schedule is created through the RPC, so the rate
 // passes the release gate as an operator's would. The owner's shared
 // throttle is wrapped to count what each run is charged; the target counts
 // the data bytes it receives on every replica stream. The two must be equal,
 // and not zero: charged bytes = bytes sent, not the disk's size.
 //
-// Mutation: drop the charge from one leg (streamLegacyReplica, the full
-// copy's mirror; or mirrorIncrement's send) — the mirror case charges less
-// than the target received.
+// Mutation: drop the charge from one leg (streamReplicaToPool's or
+// applyIncrementRemote's send) — that case charges less than the target
+// received.
 
 // byteCounter counts the data bytes a node receives on replica streams.
 type byteCounter struct {
@@ -132,30 +131,21 @@ func (s *rateSource) DeleteCheckpoint(string, string) error        { return nil 
 
 func TestReplicationRate_EveryLegChargesTheBytesItSends(t *testing.T) {
 	for _, tc := range []struct {
-		name                string
-		incremental, mirror bool
+		name        string
+		incremental bool
 	}{
-		{"full", false, false},
-		{"full+mirror", false, true},
-		{"incremental", true, false},
-		{"incremental+mirror", true, true},
+		{"full", false},
+		{"incremental", true},
 	} {
-		t.Run(tc.name, func(t *testing.T) { replicationRateScenario(t, tc.incremental, tc.mirror) })
+		t.Run(tc.name, func(t *testing.T) { replicationRateScenario(t, tc.incremental) })
 	}
 }
 
-func replicationRateScenario(t *testing.T, incremental, mirror bool) {
+func replicationRateScenario(t *testing.T, incremental bool) {
 	c := New(t, Options{Nodes: 3, SharedCRDT: true})
 	latchPITOverlay(t, c)
 	ctx := context.Background()
-	vmHost, replicaHost, other := c.Node("node-0"), c.Node("node-1"), c.Node("node-2")
-	if mirror {
-		// A host on main's build: no replica area, so every run also writes
-		// main's top-level replica (the mirror leg).
-		for _, m := range []string{"ListReplicas", "PushReplica", "PruneReplicas"} {
-			other.DoNotImplement(m)
-		}
-	}
+	vmHost, replicaHost := c.Node("node-0"), c.Node("node-1")
 
 	pool := filepath.Join(c.tmpRoot, replicaHost.Name, "data", "pools", "dr")
 	if err := os.MkdirAll(pool, 0o755); err != nil {
@@ -184,7 +174,7 @@ func replicationRateScenario(t *testing.T, incremental, mirror bool) {
 	if incremental {
 		data := make([]byte, 3*mib+4096)
 		_, _ = rand.Read(data)
-		clear(data[mib : 2*mib]) // a zero chunk the mirror does not send
+		clear(data[mib : 2*mib]) // a zero chunk
 		vmHost.Server.SetBackupSource(&rateSource{
 			full: &rateReader{data: data, extents: [][2]int64{{0, int64(len(data))}}},
 			incr: &rateReader{data: data, extents: [][2]int64{{0, mib}}, incr: true},
@@ -251,25 +241,15 @@ func replicationRateScenario(t *testing.T, incremental, mirror bool) {
 		if throttles != 1 || sum != got {
 			t.Errorf("run %d: charged %d bytes against %d throttle(s); the target received %d (by stream: %v)", i, sum, throttles, got, by)
 		}
-		switch {
-		case mirror && !incremental && by["UploadStoragePoolContent"] == 0:
-			t.Errorf("run %d: the full copy's mirror sent nothing: %v", i, by)
-		case !mirror && by["UploadStoragePoolContent"] != 0:
-			t.Errorf("run %d: a mirror was written with every host on this build: %v", i, by)
+		if by["UploadStoragePoolContent"] != 0 {
+			t.Errorf("run %d: a replica was uploaded to the pool's top level: %v", i, by)
 		}
 		if incremental {
-			// The first run is a full raw push of every extent; its mirror
-			// skips the zero chunk. The second sends the one dirty MiB, and its
-			// mirror, forked from the first run's, the same MiB again.
+			// The first run is a full raw push of every extent; the second
+			// sends the one dirty MiB.
 			want := int64(3*mib + 4096)
-			if mirror {
-				want = 2*want - mib
-			}
 			if i == 1 {
 				want = mib
-				if mirror {
-					want = 2 * mib
-				}
 			}
 			if got != want {
 				t.Errorf("incremental run %d: the target received %d, want %d (by stream: %v)", i, got, want, by)

@@ -344,8 +344,7 @@ replacement, so keep backups too.
 
 **Replica sets.** One run replicates every disk with one run time, so the
 replicas a run writes are a set: the root disk first, exactly as before (its
-`--incremental` chain, its fallback, its top-level copy for a host on an older
-build), then each other disk as a full point-in-time copy. Each disk keeps its
+`--incremental` chain and its fallback), then each other disk as a full point-in-time copy. Each disk keeps its
 own replica and record, so `keep_replicas` applies per disk and the storage
 cost is one replica per disk per kept run. A run whose copy of any disk fails
 reports the run failed (`disk.replicated` names the disk), and the disks it
@@ -674,24 +673,10 @@ A cross-host replica is sent with its record over the peer-only `PushReplica`
 (incremental ones over `PushReplicaIncrement`, which also carries the record),
 and pruned on the peer through the peer-only `PruneReplicas`. Before a byte is
 sent, the sender asks the receiver for the VM's records (`ListReplicas`). A
-receiver on an older build (it has no `ListReplicas`) is sent the replica the
-way that build receives one: a `<vm>-<disk>-<time>.<ext>` file at its pool's
-top level (an upload, or an incremental push forked from its newest top-level
-raw replica of the disk), which its failover promotes as before; it is pruned
-there by name, to `--keep`. A receiver that cannot answer at all is sent
-nothing. During a roll, a new host also takes an older sender's record-less
-incremental push, at the pool's top level, only under the exact
-`<vm>-<disk>-<time>.raw` name of one VM disk on the cluster and forked only
-from a top-level raw replica of that disk. While any host cannot answer
-`ListReplicas`, every run that writes a replica into the area also writes the
-same data as the `<vm>-<disk>-<time>.<ext>` file at the pool's top level, so a
-failover coordinated by an older host promotes the newest replica rather than
-the last one written before the upgrade; once every host answers, runs stop
-writing it and the top-level copies are pruned. A pruned replica is never one
-a VM disk on any host references. "Every host" is the cluster's admitted
-gossip membership — the hosts replication reaches — so a host that is down,
-fenced or removed for good does not keep the copies coming; a member on an
-older build does.
+receiver that cannot answer, including one on a build older than replica
+records (it has no `ListReplicas`), is sent nothing and the run fails. A push
+without its record, and a replica sent as a pool upload, are refused. A
+pruned replica is never one a VM disk on any host references.
 
 The owner directory is keyed by project and VM name: a VM deleted and
 re-created under the same name in the same project inherits the earlier VM's
@@ -706,10 +691,7 @@ promotable: promotion and failover choose the newest of a disk's replicas from
 both places, a top-level one by its pool record, or an unrecorded one by its
 exact name ([storage.md](storage.md#uploads)). A run's `--keep` counts them
 after the area's: once the area holds `keep` replicas of the disk, the
-top-level ones are pruned too (never one a VM disk uses) — but only once every
-host answers `ListReplicas`. While any host is on an older build, or cannot
-be asked, the top-level replicas are kept to `keep` as that build kept them,
-since its failover coordinator sees nothing else.
+top-level ones are pruned too (never one a VM disk uses).
 
 Manage it from the **Replication** section of the `/schedules` UI or the CLI:
 
@@ -764,9 +746,8 @@ lv replication schedule ls        # RATE column; "-" is unlimited
 - The limit is per schedule and per source host, shared: every run of the
   schedule on one host (a pool, project or cluster schedule's VMs, two runs at
   once) moves at the limit in total.
-- It paces every byte a run sends to its target: the full copy, the
-  incremental extents, and the top-level copy written for hosts on an older
-  build.
+- It paces every byte a run sends to its target: the full copy and the
+  incremental extents.
 - A container schedule's sends are also paced by the owner's `backup_bwlimits`
   entry for its repo; the lower limit wins.
 - Re-adding a schedule without `--bwlimit` keeps its stored limit; `--bwlimit 0`

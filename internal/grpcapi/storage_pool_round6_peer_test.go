@@ -143,10 +143,9 @@ func TestPoolRound6_AnOlderHostsListingIsMatchedByExactName(t *testing.T) {
 
 // fakePushStream (disk_isolation_replica_test.go) feeds PushReplicaIncrement its frames.
 
-// A replica the daemon uploads or pushes is named for the VM's disk it says
-// it is of, in that VM's project, forks only from that disk's replicas, and
-// is recorded as that VM's — which is what makes a name another project's VM
-// could share promotable at all.
+// A replica arrives only pushed with its record: an upload under a replica
+// content call is refused, and so is a push without a record. A replica call
+// naming a project the VM is not in is refused before either.
 func TestPoolRound6_ReplicasArriveNamedAndRecordedForTheirVM(t *testing.T) {
 	s, disks := disksPoolServer(t)
 	insertProjectVM(t, s, "app", "acme", "x-root", filepath.Join(t.TempDir(), "app-x-root.qcow2"), "")
@@ -155,15 +154,12 @@ func TestPoolRound6_ReplicasArriveNamedAndRecordedForTheirVM(t *testing.T) {
 	k := replicaKey{VM: "app", Disk: "x-root", Project: "acme"}
 	as := func(project string) context.Context { return replicaContentCtx(peer, k.VM, project, k.Disk) }
 
-	if err := uploadAs(as("acme"), s, "default", "other-root-20261006-120000.qcow2", "x"); status.Code(err) != codes.InvalidArgument {
-		t.Errorf("a replica upload named for another disk: got %v, want InvalidArgument", err)
-	}
 	if err := uploadAs(as("bravo"), s, "default", "app-x-root-20261006-120000.qcow2", "x"); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("a replica upload in a project the VM is not in: got %v, want FailedPrecondition", err)
 	}
 	full := "app-x-root-20261006-120000.qcow2"
-	if err := uploadAs(as("acme"), s, "default", full, "x"); err != nil {
-		t.Fatalf("app's replica upload: %v", err)
+	if err := uploadAs(as("acme"), s, "default", full, "x"); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("app's replica upload: got %v, want InvalidArgument", err)
 	}
 	// An incremental push is a replica of its own record now (replica_records.go):
 	// one without a record — an older node's, named for any disk — is refused,
@@ -186,8 +182,8 @@ func TestPoolRound6_ReplicasArriveNamedAndRecordedForTheirVM(t *testing.T) {
 	if err := push(incr, ""); status.Code(err) != codes.InvalidArgument {
 		t.Errorf("a push without its record: got %v, want InvalidArgument", err)
 	}
-	if got := s.replicaNames(context.Background(), "default", "", k, "", false); !slices.Equal(got, []string{full}) {
-		t.Errorf("app's replicas = %v, want [%s]", got, full)
+	if got := s.replicaNames(context.Background(), "default", "", k, "", false); len(got) != 0 {
+		t.Errorf("app's replicas = %v, want none", got)
 	}
 }
 

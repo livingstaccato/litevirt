@@ -283,16 +283,13 @@ func TestPromote_RenamedCarriesEveryRecoveredDisk(t *testing.T) {
 }
 
 // One run replicates every disk of the VM with one run time, and a disk
-// replication cannot copy is reported, not silently absent. Another disk's
-// replica is never mirrored to the pool's top level, which only a main-build
-// host reads, and for its root alone.
+// replication cannot copy is reported, not silently absent. Nothing is
+// written at the pool's top level: every replica is in the replica area.
 //
-// Mutations: "root only" (runVMReplication skips replicateOtherDisks) — red;
-// "mirror every disk" (the isOtherSetDisk guard removed) — red.
+// Mutation: "root only" (runVMReplication skips replicateOtherDisks) — red.
 func TestReplication_OneRunReplicatesTheWholeSet(t *testing.T) {
 	s := testServer(t)
-	s.dataDir = t.TempDir()                // where the pool records of the top-level mirror go
-	setEveryHostListsReplicas(t, s, false) // a main-build host may be listening: mirror the root
+	s.dataDir = t.TempDir()
 	ctx := context.Background()
 	dir := replicaPoolDir(t, s, "dr")
 	srcDir := t.TempDir()
@@ -343,17 +340,9 @@ func TestReplication_OneRunReplicatesTheWholeSet(t *testing.T) {
 		t.Error("data2 was skipped silently")
 	}
 	top, _ := os.ReadDir(dir)
-	var names []string
 	for _, e := range top {
-		names = append(names, e.Name())
-	}
-	if !slices.ContainsFunc(names, func(n string) bool { return strings.Contains(n, "root") }) {
-		for _, e := range evs {
-			t.Logf("event %s %s: %s", e.Type, e.Result, e.Detail)
+		if strings.HasPrefix(e.Name(), "set1-") {
+			t.Errorf("a replica was written at the pool's top level: %s", e.Name())
 		}
-		t.Fatalf("no top-level mirror of the root (the test's premise): %v", names)
-	}
-	if slices.ContainsFunc(names, func(n string) bool { return strings.Contains(n, "data1") }) {
-		t.Errorf("data1 was mirrored to the top level: %v", names)
 	}
 }

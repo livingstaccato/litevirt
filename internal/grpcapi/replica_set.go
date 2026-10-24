@@ -33,8 +33,7 @@ import (
 // of one run are a set: each disk keeps its own replica and record, in the
 // format it always had (replica_records.go), and a run's set is the records
 // that carry its time. The root disk goes first and exactly as before — its
-// incremental chain, its fallback, its top-level mirror for a main-build host —
-// then each other disk as a full point-in-time copy (copyVMDiskConsistent).
+// incremental chain and its fallback — then each other disk as a full point-in-time copy (copyVMDiskConsistent).
 //
 // A promotion, manual or automatic, recovers every disk that has a replica:
 // the replica of the root's run, or, for a disk that run did not copy, its
@@ -51,27 +50,11 @@ import (
 // copied and never rebuilt from a replica: it is reachable from another host
 // as it is, and a takeover promotion reattaches it as-is, its row untouched.
 // Not copied either: a host-local disk that is not file-based (zfs, lvm),
-// reported as skipped on every run, and a cdrom. To a receiver on an older
-// build, which promotes only the root, the other disks are not sent.
+// reported as skipped on every run, and a cdrom.
 //
 // The VM lock is held for the root's run as before, and for each other disk
 // only during its point-in-time step (otherDiskCopy). The partial marker is
 // a durable health condition (replica_set / vm.promoted_partial).
-
-// otherSetDiskKey marks a context replicating a disk other than the root.
-type otherSetDiskKey struct{}
-
-func withOtherSetDisk(ctx context.Context) context.Context {
-	return context.WithValue(ctx, otherSetDiskKey{}, true)
-}
-
-// isOtherSetDisk reports whether ctx replicates a disk other than the root,
-// which is never mirrored to a pool's top level: a main-build host promotes
-// the root disk alone.
-func isOtherSetDisk(ctx context.Context) bool {
-	v, _ := ctx.Value(otherSetDiskKey{}).(bool)
-	return v
-}
 
 // replicaSetOthers is every disk of the VM besides src that a replication run
 // replicates and a promotion recovers: not a cdrom. In a fixed order, so a
@@ -284,7 +267,6 @@ func (s *Server) replicateOtherDisks(ctx context.Context, sched corrosion.Backup
 	if len(disks) == 0 {
 		return nil
 	}
-	ctx = withOtherSetDisk(ctx)
 	ctx = withOtherDiskLock(ctx, relock)
 	var copyable []corrosion.DiskRecord
 	for _, d := range disks {
@@ -303,25 +285,6 @@ func (s *Server) replicateOtherDisks(ctx context.Context, sched corrosion.Backup
 	}
 	if len(copyable) == 0 {
 		return nil
-	}
-	if targetHost != s.hostName {
-		// A receiver on an older build keeps replicas at its pool's top level
-		// and promotes the root disk alone: another disk sent there is never
-		// read.
-		legacy, err := s.replicaReceiverLegacy(ctx, targetHost, sched.TargetPool, vm.Project, vm.Name)
-		if err != nil {
-			return fmt.Errorf("replicate the other disks of %s: %w", vm.Name, err)
-		}
-		if legacy {
-			names := make([]string, 0, len(copyable))
-			for _, d := range copyable {
-				names = append(names, d.DiskName)
-			}
-			s.recordVMEvent(ctx, vm.Name, "disk.replicated", "skipped", fmt.Sprintf(
-				"%s → %s@%s: not replicated; %s runs an older build that promotes the root disk only",
-				strings.Join(names, ", "), sched.TargetPool, targetHost, targetHost))
-			return nil
-		}
 	}
 	var errs []error
 	for i := range copyable {

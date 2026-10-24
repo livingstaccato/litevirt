@@ -110,18 +110,6 @@ func parseReplicaName(name string) (prefix string, ts time.Time, future, ok bool
 	return base[:n-1], ts, ts.After(time.Now().Add(replicaStampSkew)), true
 }
 
-// notAReplicaName is the refusal of a replica upload or push whose name is not
-// one of k's disk's, saying so when only its stamp is wrong: beyond this
-// host's clock, which is the replicating host's clock being ahead.
-func notAReplicaName(name string, k replicaKey) error {
-	if p, ts, future, ok := parseReplicaName(name); ok && future && p == k.VM+"-"+k.Disk {
-		return status.Errorf(codes.InvalidArgument,
-			"%q is stamped %s, in the future by more than %s of this host's clock: the replicating host's clock is ahead",
-			name, ts.Format(time.RFC3339), replicaStampSkew)
-	}
-	return status.Errorf(codes.InvalidArgument, "%q is not a replica name of vm %q disk %q", name, k.VM, k.Disk)
-}
-
 // replicaOlder orders replicas by the run time their names carry (a name
 // with none first, then by name): replicas of one disk by age.
 func replicaOlder(a, b string) bool {

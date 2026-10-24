@@ -579,21 +579,22 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 		return err
 	}
 	// Who the upload is for: the caller who made it, on whichever node. A
-	// user's upload is recorded as its pool's project's; the daemon's replica
-	// as its VM's; an older node's (no marker) is not recorded.
+	// user's upload is recorded as its pool's project's; a node's own (no
+	// user) as a peer's.
 	caller, err := s.poolContentCallerOf(ctx)
 	if err != nil {
 		return err
 	}
 	// Into a pool on <data_dir>/disks a user's upload lands in disks/uploads,
-	// out of the VM disks' namespace. The daemon's replica lands in the pool
-	// directory, where promotion reads it.
+	// out of the VM disks' namespace.
 	dir := poolDir
 	if caller.record {
 		dir = s.poolUploadDir(poolDir)
 	}
-	if caller.view == viewReplicas && !replicaNameIs(first.Filename, caller.replica) {
-		return notAReplicaName(first.Filename, caller.replica)
+	// A replica is sent with PushReplica and lands, with its record, in the
+	// replica area: never as an upload at the pool's top level.
+	if caller.view == viewReplicas {
+		return status.Error(codes.InvalidArgument, "a replica is sent with PushReplica, not uploaded")
 	}
 	dest, err := safename.SafeJoin(dir, first.Filename)
 	if err != nil {
@@ -661,45 +662,39 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if err := tmp.Close(); err != nil {
 		return status.Errorf(codes.Internal, "close: %v", err)
 	}
-	// Durable before visible. This receiver carries cross-host replicas into
-	// their promotable name, so it follows publishReplica: data synced before
-	// the rename, the directory after it, or a power loss can leave the final
+	// Durable before visible, as publishReplica: data synced before the
+	// rename, the directory after it, or a power loss can leave the final
 	// name on a file whose bytes never reached the disk.
 	if err := syncPath(tmpName); err != nil {
 		return status.Errorf(codes.Internal, "sync: %v", err)
 	}
 	// Never replace what is there — a file, or a symlink planted at the name —
 	// and never write through one.
-	// An upload (not the daemon's replica) is marked on the store before it
-	// is published, so no host takes it for a late replica even where its
-	// record does not arrive (lateReplicaOK).
-	marked := caller.view != viewReplicas
-	if marked {
-		if err := markUpload(dest); err != nil {
-			if storage.IsFSNoAnswer(err) {
-				// Nothing was written there, and a removal would wait on
-				// the same store that does not answer.
-				return status.Errorf(codes.Unavailable, "mark upload: %v", err)
-			}
-			unmarkUpload(dest)
-			return status.Errorf(codes.Internal, "mark upload: %v", err)
+	// An upload is marked on the store before it is published, so no host
+	// takes it for a late replica even where its record does not arrive
+	// (lateReplicaOK).
+	if err := markUpload(dest); err != nil {
+		if storage.IsFSNoAnswer(err) {
+			// Nothing was written there, and a removal would wait on the
+			// same store that does not answer.
+			return status.Errorf(codes.Unavailable, "mark upload: %v", err)
 		}
+		unmarkUpload(dest)
+		return status.Errorf(codes.Internal, "mark upload: %v", err)
 	}
 	withdraw := func() {
 		_ = os.Remove(dest)
-		if marked {
-			unmarkUpload(dest)
-		}
+		unmarkUpload(dest)
 	}
 	if library {
 		if err := publishLibraryFile(tmpName, dest, first.Filename, false); err != nil {
-			if marked && !lexists(dest) {
+			if !lexists(dest) {
 				unmarkUpload(dest)
 			}
 			return err
 		}
 	} else if err := publishNoClobber(tmpName, dest, first.Filename); err != nil {
-		if marked && !lexists(dest) {
+		if !lexists(dest) {
 			unmarkUpload(dest)
 		}
 		return err
@@ -711,24 +706,13 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 		return status.Errorf(codes.Internal, "sync directory: %v", err)
 	}
 	// A caller's upload is recorded as its pool's project's: in a directory
-	// that is not the pool's own, the record is what makes it theirs. A
-	// replica's record says whose VM's disk it is, which is what promotion
-	// and pruning match it by.
+	// that is not the pool's own, the record is what makes it theirs.
 	var recErr error
 	switch {
-	case caller.view == viewReplicas:
-		recErr = s.recordPoolReplica(ctx, rec.Name, caller.replica, dest)
 	case caller.record:
 		recErr = s.recordPoolUpload(ctx, rec.Name, rec.Project, callerUsername(caller.ctx)+"@"+callerRealm(caller.ctx), dest)
 	default:
 		recErr = s.recordPeerUpload(ctx, rec.Name, dest)
-	}
-	// A replica that cannot be recorded stays where it would be matched by
-	// its name anyway (not a shared store whose records epoch is known), as
-	// before records; a user's upload is theirs only by its record.
-	if recErr != nil && caller.view == viewReplicas && s.isLegacyUnrecorded(ctx, dest) {
-		slog.Warn("replica upload not recorded; it is matched by its name", "path", dest, "error", recErr)
-		recErr = nil
 	}
 	if recErr != nil {
 		withdraw()

@@ -645,17 +645,6 @@ func TestPoolRound8_SharedPruneKeepsAReplicaAnotherHostsDiskUses(t *testing.T) {
 	}
 }
 
-// m6: a replica whose stamp is in the future is refused saying so.
-func TestPoolRound8_AFutureStampIsRefusedSayingSo(t *testing.T) {
-	s, _ := disksPoolServer(t)
-	peer := bareEntryPeer(t, s)
-	name := "zvm-root-" + time.Now().Add(time.Hour).UTC().Format("20060102-150405") + ".qcow2"
-	err := uploadAs(replicaContentCtx(peer, "zvm", "acme", "root"), s, "default", name, "x")
-	if err == nil || !strings.Contains(err.Error(), "future") {
-		t.Errorf("a replica stamped an hour ahead: got %v, want a refusal naming the future stamp", err)
-	}
-}
-
 // I1, shared: other hosts on the store must be able to match a run's
 // replica. Its record sits beside it on the store (replica_records.go), so a
 // cluster whose replicated rows cannot be written still shares it.

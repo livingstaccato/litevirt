@@ -21,17 +21,14 @@ import (
 // Where two of the final-review fixes meet.
 
 // Pools C3 (an area replica is deleted through the content API) meets import
-// I-5 (the area's directories are 0711) and the top-level copy a run writes
-// while a main-build host is in the cluster (I-3, replica_mirror.go): the
-// operator deletes both copies of her VM's replica, each by its name, never
-// another project's area replica; the next run writes into the same owner
-// directory, which qemu can still search.
-func TestCrossFix_AnAreaReplicaAndItsMainCopyAreDeletedAndTheAreaStaysReachable(t *testing.T) {
+// I-5 (the area's directories are 0711): the operator deletes her VM's
+// replica by its name, never another project's area replica; the next run
+// writes into the same owner directory, which qemu can still search.
+func TestCrossFix_AnAreaReplicaIsDeletedAndTheAreaStaysReachable(t *testing.T) {
 	old := syscall.Umask(0o077)
 	t.Cleanup(func() { syscall.Umask(old) })
 	f := newPoolFixture(t)
 	f.grantPoolWrite(t)
-	setEveryHostListsReplicas(t, f.s, false)
 	ctx := context.Background()
 	vm, _ := corrosion.GetVM(ctx, f.s.db, "web")
 	disks, _ := corrosion.GetVMDisks(ctx, f.s.db, "web")
@@ -47,11 +44,10 @@ func TestCrossFix_AnAreaReplicaAndItsMainCopyAreDeletedAndTheAreaStaysReachable(
 	run("20261005-000000")
 
 	area := filepath.Join(replicaOwnerDir(f.dr, "a", "web"), "1-20261005-000000.qcow2")
-	top := filepath.Join(f.dr, "web-1-20261005-000000.qcow2")
 	if got := listedReplicas(t, f.s, f.alice, "dr"); !slices.Contains(got, "web/"+filepath.Base(area)) {
 		t.Fatalf("alice's listing = %v, want web/%s", got, filepath.Base(area))
 	}
-	for _, p := range []string{area, top} {
+	for _, p := range []string{area} {
 		if _, err := f.s.DeleteStoragePoolContent(f.alice, &pb.DeleteStoragePoolContentRequest{PoolName: "dr", Filename: filepath.Base(p)}); err != nil {
 			t.Fatalf("alice deleting %s: %v", filepath.Base(p), err)
 		}
@@ -69,7 +65,7 @@ func TestCrossFix_AnAreaReplicaAndItsMainCopyAreDeletedAndTheAreaStaysReachable(
 	// searchable by qemu.
 	run("20261005-010000")
 	next := filepath.Join(replicaOwnerDir(f.dr, "a", "web"), "1-20261005-010000.qcow2")
-	if !present(next) || !present(filepath.Join(f.dr, "web-1-20261005-010000.qcow2")) {
+	if !present(next) {
 		t.Fatalf("the next run wrote no replica after the delete")
 	}
 	for _, d := range []string{filepath.Join(f.dr, replicaAreaDir), filepath.Dir(next)} {

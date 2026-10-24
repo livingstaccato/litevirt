@@ -15,8 +15,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
-	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -609,22 +607,21 @@ func (s *Server) PushReplica(stream pb.LiteVirt_PushReplicaServer) error {
 
 // proveReplicaRecords asks the receiving host for (project, vm)'s replica
 // records before a single replica byte is sent to it. A receiver that answers
-// records them. One on an older build has no ListReplicas (Unimplemented):
-// legacy is true, and the caller sends the replica the way that build
-// receives one, as main did — a runner-named file at its pool's top level,
-// which that build's failover coordinator promotes (rolling upgrade). Any
-// other error refuses: nothing is sent to a host that cannot say which it is.
-func proveReplicaRecords(ctx context.Context, client pb.LiteVirtClient, pool, host, project, vm string) (legacy bool, err error) {
-	_, err = client.ListReplicas(ctx, &pb.ListReplicasRequest{
+// records them. Any error refuses — Unimplemented included, a build older
+// than replica records, which would keep the bytes as a bare name at its
+// pool's top level: nothing is sent to a host that cannot show it records
+// them.
+func proveReplicaRecords(ctx context.Context, client pb.LiteVirtClient, pool, host, project, vm string) error {
+	_, err := client.ListReplicas(ctx, &pb.ListReplicasRequest{
 		PoolName: pool, Host: host, Project: tenancy.NormalizeProject(project), Vm: vm,
 	})
 	switch {
 	case err == nil:
-		return false, nil
+		return nil
 	case status.Code(err) == codes.Unimplemented:
-		return true, nil
+		return fmt.Errorf("host %q runs a build that predates replica records; upgrade it before replicating to it (nothing was sent to it)", host)
 	}
-	return false, fmt.Errorf("host %q cannot show it records replicas (%v); nothing was sent to it", host, err)
+	return fmt.Errorf("host %q cannot show it records replicas (%v); nothing was sent to it", host, err)
 }
 
 // legacyReplicaName is the top-level name main's runner gave a replica of
@@ -651,103 +648,6 @@ func replicaRecordFor(path string) (replicaRecord, bool) {
 		return replicaRecord{}, false
 	}
 	return r, true
-}
-
-// everyHostListsReplicas reports whether every host of the cluster answers
-// ListReplicas — runs a build that knows the replica area. A host on an older
-// build (Unimplemented) cannot see the area, and if it coordinates a failover
-// it promotes only top-level replicas; a host that cannot be asked is taken
-// to be one. "Every host" is the admitted memberlist membership — the peers
-// replication reaches, which capabilities.ReplicationGated tokens confirm
-// against — so a host row that is dead, fenced or removed for good does not
-// hold this answer at "no" forever. The answer is kept for a while
-// (replicaPeersFresh when all do, replicaPeersStale otherwise), so a
-// replication run does not ask every host; no lock is held while the hosts
-// are asked (up to replicaPeersAskTimeout each), and runs asking at once may
-// each ask.
-func (s *Server) everyHostListsReplicas(ctx context.Context) bool {
-	m := replicaPeersMemoOf(s)
-	m.mu.Lock()
-	if !m.at.IsZero() && time.Since(m.at) < map[bool]time.Duration{true: replicaPeersFresh, false: replicaPeersStale}[m.all] {
-		all := m.all
-		m.mu.Unlock()
-		return all
-	}
-	m.mu.Unlock()
-	all := s.askEveryHostListsReplicas(ctx)
-	m.mu.Lock()
-	m.all, m.at = all, time.Now()
-	m.mu.Unlock()
-	return all
-}
-
-// How long everyHostListsReplicas keeps an answer.
-var (
-	replicaPeersFresh = 10 * time.Minute
-	replicaPeersStale = time.Minute
-)
-
-// replicaPeersAskTimeout bounds each host's answer.
-const replicaPeersAskTimeout = 10 * time.Second
-
-type replicaPeersMemo struct {
-	mu  sync.Mutex
-	at  time.Time
-	all bool
-}
-
-var replicaPeersMemos sync.Map // *Server → *replicaPeersMemo
-
-func replicaPeersMemoOf(s *Server) *replicaPeersMemo {
-	m, _ := replicaPeersMemos.LoadOrStore(s, &replicaPeersMemo{})
-	return m.(*replicaPeersMemo)
-}
-
-func (s *Server) askEveryHostListsReplicas(ctx context.Context) bool {
-	members := s.db.Members()
-	if len(members) == 0 {
-		// No member admitted yet (gossip still converging after a start):
-		// "all" only when no other host row is a live one.
-		hosts, err := corrosion.ListHosts(ctx, s.db)
-		if err != nil {
-			return false
-		}
-		for _, h := range hosts {
-			if h.Name != s.hostName && corrosion.VotingEligible(h.State) {
-				return false
-			}
-		}
-		return true
-	}
-	for _, p := range members {
-		if p.Name == "" || p.Name == s.hostName {
-			continue
-		}
-		if !s.hostListsReplicas(ctx, p.Name) {
-			slog.Info("replication: a host cannot show replica records; top-level replicas are kept for it", "host", p.Name)
-			return false
-		}
-	}
-	return true
-}
-
-// hostListsReplicas asks host whether it has ListReplicas. An answer from its
-// handler says it does (InvalidArgument or NotFound included: the handler
-// ran); Unimplemented, or no answer, says it may not.
-func (s *Server) hostListsReplicas(ctx context.Context, host string) bool {
-	ctx, cancel := context.WithTimeout(ctx, replicaPeersAskTimeout)
-	defer cancel()
-	client, closeConn, err := s.dialPeer(ctx, host)
-	if err != nil {
-		return false
-	}
-	defer closeConn()
-	_, err = client.ListReplicas(ctx, &pb.ListReplicasRequest{PoolName: "litevirt-probe", Host: host, Vm: "litevirt-probe"})
-	switch status.Code(err) {
-	case codes.OK, codes.InvalidArgument, codes.NotFound, codes.FailedPrecondition, codes.PermissionDenied:
-		return true
-	}
-	return false
 }
 
 // backingSet is a set of files something is layered on.

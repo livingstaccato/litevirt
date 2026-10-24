@@ -147,11 +147,9 @@ func TestPoolRound7_AReplicaCallIsNotRefusedByADeletedNamesake(t *testing.T) {
 	}
 	peer := bareEntryPeer(t, s)
 	name := "zvm-root-" + stampAgo(time.Minute) + ".qcow2"
-	if err := uploadAs(replicaContentCtx(peer, "zvm", "acme", "root"), s, "default", name, "x"); err != nil {
-		t.Errorf("acme's zvm replica upload refused over bravo's deleted zvm: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(disks, name)); err != nil {
-		t.Errorf("replica not written: %v", err)
+	writePoolFile(t, filepath.Join(disks, name), "x")
+	if _, err := s.ListStoragePoolContents(replicaContentCtx(peer, "zvm", "acme", "root"), &pb.ListStoragePoolContentsRequest{PoolName: "default"}); err != nil {
+		t.Errorf("acme's zvm replica listing refused over bravo's deleted zvm: %v", err)
 	}
 }
 

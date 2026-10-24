@@ -198,6 +198,12 @@ func writeKeptDisks(dataDir, name string, n keptDisksNote) error {
 	if err != nil {
 		return err
 	}
+	// Under is of Paths: a file a kept disk backs on, held for that disk. A
+	// note with no kept disk left holds nothing, however long Recorded keeps
+	// it on disk.
+	if len(n.Paths) == 0 {
+		n.Under = nil
+	}
 	if len(n.Paths) == 0 && len(n.Recorded) == 0 {
 		if err := os.Remove(f); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err

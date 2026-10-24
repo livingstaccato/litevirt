@@ -358,11 +358,7 @@ import (
 //	     so every premise in this subsystem is machine-verified again. The
 //	     recovery lifecycle is specified in
 //	     docs/reviews/2026-09-08-trust-lifecycle-followup-scope.md and will
-//	     arrive under its own schema version. A database that ran those
-//	     prerelease commits is an UNSUPPORTED UPGRADE: this build refuses to
-//	     start on one rather than guessing at a migration, preserving the
-//	     evidence for a deliberate offline recovery — see
-//	     refusePrereleaseTrustDatabase in netbox_prerelease_boundary.go.
+//	     arrive under its own schema version.
 //	v52: leader-lease term ledger — leader_lease_terms, append-only with term in
 //	     the primary key, giving each lease acquisition a durable incarnation
 //	     number. leader_election is unchanged. Registered like audit_chain_heads
@@ -800,16 +796,6 @@ func (c *Client) migrateAcknowledgedTiesPK(ctx context.Context) error {
 // gap from the old swallow-benign loop is healed rather than falsely claimed.
 func InitSchema(ctx context.Context, c *Client) error {
 	slog.Info("initializing schema")
-
-	// THE UNSUPPORTED-UPGRADE BOUNDARY, FIRST AND BEFORE ANY WRITE. A database
-	// that carries the prerelease permanent-loss trust schema cannot be migrated
-	// by this build — see netbox_prerelease_boundary.go for why an automatic
-	// answer is a guess. It refuses here, ahead of the DDL, the ledger and the
-	// data fixes, so the refusal is reached with the database untouched and its
-	// evidence intact for a deliberate offline recovery.
-	if err := refusePrereleaseTrustDatabase(ctx, c); err != nil {
-		return err
-	}
 
 	// Tables first (CREATE TABLE IF NOT EXISTS — genuinely idempotent, and it
 	// guarantees every table exists before the ledger's presence checks run).
@@ -2808,9 +2794,8 @@ var schemaDDL = []string{
 		--
 		-- LAST, where its heal ALTER appends it. That ALTER exists precisely to
 		-- run on a real database — one created by an earlier v51 build, whose
-		-- table already exists so CREATE TABLE IF NOT EXISTS is a no-op — and
-		-- refusePrereleaseTrustDatabase does not refuse such a database, so it
-		-- boots and gets the column appended after deleted_at. netbox_bindings is
+		-- table already exists so CREATE TABLE IF NOT EXISTS is a no-op — so it
+		-- gets the column appended after deleted_at. netbox_bindings is
 		-- in sync.go's tableNames, so it is digested every anti-entropy tick, and
 		-- the v1 digest hashes SELECT * positionally: declaring this column 6th
 		-- while the ALTER appends it 12th made a freshly-created node and a healed

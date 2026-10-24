@@ -61,18 +61,13 @@ var removedTrustSurface = []string{
 // allowedToNameTheRemovedSurface are the files that may mention it, and the
 // reason each may.
 //
-// Every one of them is talking about the REMOVAL. The boundary has to name the
-// tables and the removed evaluator's condition codes in order to detect them and
-// refuse; the schema history has to record that they were here and went; the
-// migration test asserts they are NOT created; this file lists them in order to
-// forbid them.
+// Every one of them is talking about the REMOVAL. The schema history has to
+// record that they were here and went; the migration test asserts they are NOT
+// created; this file lists them in order to forbid them.
 var allowedToNameTheRemovedSurface = map[string]string{
-	"internal/corrosion/netbox_prerelease_boundary.go":      "detects the prerelease trust schema and refuses to start on it",
-	"internal/corrosion/schema.go":                          "records in the v51 history that they were removed",
-	"internal/corrosion/schema_migration_test.go":           "asserts a migration does NOT create them",
-	"internal/corrosion/netbox_prerelease_boundary_test.go": "exercises the refusal",
-	"tests/fleet/netbox_prerelease_boundary_test.go":        "seeds a prerelease database to assert the refusal changes nothing cluster-wide",
-	"internal/grpcapi/netbox_no_trust_bypass_test.go":       "this guard",
+	"internal/corrosion/schema.go":                    "records in the v51 history that they were removed",
+	"internal/corrosion/schema_migration_test.go":     "asserts a migration does NOT create them",
+	"internal/grpcapi/netbox_no_trust_bypass_test.go": "this guard",
 }
 
 // TestTheRemovedTrustSurfaceIsGoneFromTheWholeTree is the flat scan.

@@ -175,11 +175,6 @@ pci:
   # How often to rescan PCI devices. "0" disables periodic rescan.
   rescan_interval: "5m"
 
-  # DEPRECATED: installs no udev rule. Real-time PCI events are covered by
-  # rescan_interval. Setting it true only logs a warning; remove any leftover
-  # /etc/udev/rules.d/99-litevirt-pci.rules (an upgrade cleans up the litevirt one).
-  udev_hook: false
-
   # Free pcie-root-port controllers a NEWLY-DEFINED q35 domain is left with —
   # ports none of its own disks/NICs/hostdevs sit on — so a later hot-plug
   # (disk, NIC, or PCI) has somewhere to land. They are added right after the

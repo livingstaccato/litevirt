@@ -334,10 +334,13 @@ the `lv mapping` CLI.
 
 ## VM Backup & Restore
 
-- **Backup**: the backup modal includes a **"Skip in-guest fs-freeze"** option;
+- **Backup**: VM detail page → "Backup" opens a modal that takes a snapshot backup
+  into a backup repo. It includes a **"Skip in-guest fs-freeze"** option;
   by default a VM with a guest agent is frozen briefly for an application-consistent
-  backup. Download a full VM backup as a file from the VM detail page via a "Backup" link.
-- **Restore**: Upload a backup file to create a new VM. Available from the VMs list page via a "Restore VM" button. The restore modal allows specifying VM name, CPU, memory, network, and includes upload progress tracking.
+  backup.
+- **Restore**: each backup listed on the VM detail page or the `/backups` page has
+  "Restore" (materialize the disk from the backup, `RestoreFromBackup`) and "Live
+  restore" (boot against it while it streams in, `RestoreLive`).
 - **Promote replica**: VM detail page → "Promote replica" opens a modal to bring the VM up from its newest replica (disaster recovery). Options: new name (take over vs. alongside), explicit pool/host, force (split-brain override), and a fast overlay mode. Drives the `PromoteReplica` stream and redirects to the recovered VM. Replication schedules (incremental + auto-promote toggles) are managed under `/schedules`.
 
 ## Boot Order

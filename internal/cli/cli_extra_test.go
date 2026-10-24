@@ -221,7 +221,6 @@ func TestGetSetupScript_ContainsKeyPhrases(t *testing.T) {
 		"grpc_port",
 		"pki_dir",
 		"vfio-pci",
-		"udev",
 	}
 	for _, phrase := range phrases {
 		if !strings.Contains(script, phrase) {

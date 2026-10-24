@@ -2176,8 +2176,6 @@ func TestUndrainHost_FromMaintenance(t *testing.T) {
 	}
 }
 
-// ─── BackupVM with real disk ────────────────────────────────────────────────
-
 // ─── DeployStack dry-run with image present ─────────────────────────────────
 
 func TestDeployStack_DryRunWithImage(t *testing.T) {

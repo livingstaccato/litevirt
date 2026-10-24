@@ -1032,7 +1032,6 @@ type WebAuthnConfig struct {
 // PCIConfig holds PCI device management settings.
 type PCIConfig struct {
 	RescanInterval string      `yaml:"rescan_interval"` // "0" = off, "5m" = every 5 min
-	UdevHook       bool        `yaml:"udev_hook"`       // install udev rule for real-time events
 	SRIOV          SRIOVConfig `yaml:"sriov"`
 	// SparePCIeRootPorts is the number of pcie-root-port controllers a NEW q35
 	// domain is left with that none of its own devices sit on. q35 hot-plug
@@ -1307,6 +1306,12 @@ var retiredConfigKeys = []struct {
 			"for a registry-credential writer that never shipped); the value is ignored and can be " +
 			"removed. The writer will ship under a new token, canonical_registry_v2 — see " +
 			"docs/design/canonical-registry-credentials.md",
+	},
+	{
+		path: []string{"pci", "udev_hook"},
+		why: "it installed no udev rule for several releases; real-time PCI events are covered by " +
+			"pci.rescan_interval. The value is ignored and can be removed, along with any " +
+			"/etc/udev/rules.d/99-litevirt-pci.rules left from an older install",
 	},
 }
 

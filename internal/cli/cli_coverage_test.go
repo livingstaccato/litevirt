@@ -233,7 +233,6 @@ func TestSetupScriptContent_HasPCISection(t *testing.T) {
 	required := []string{
 		"pci",
 		"rescan_interval",
-		"udev_hook",
 		"sriov",
 		"max_vfs_per_pf",
 		"vfio-pci",
@@ -244,9 +243,13 @@ func TestSetupScriptContent_HasPCISection(t *testing.T) {
 			t.Errorf("setupScriptContent missing %q", s)
 		}
 	}
-	// The deprecated udev rule is no longer installed by the setup script.
+	// The retired udev rule is no longer installed by the setup script, and
+	// a new config does not set the retired pci.udev_hook key.
 	if strings.Contains(setupScriptContent, "99-litevirt-pci.rules") {
-		t.Error("setup script still installs the deprecated litevirt PCI udev rule")
+		t.Error("setup script still installs the retired litevirt PCI udev rule")
+	}
+	if strings.Contains(setupScriptContent, "udev_hook") || strings.Contains(setupScriptContent, "PCI_UDEV_HOOK") {
+		t.Error("setup script still writes the retired pci.udev_hook key")
 	}
 }
 

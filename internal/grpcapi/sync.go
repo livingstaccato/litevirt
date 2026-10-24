@@ -182,7 +182,7 @@ func (s *Server) clusterStateDigest(ctx context.Context) *pb.ClusterStateDigestR
 // on this host. Callers can compare digests across hosts to detect drift.
 func (s *Server) GetStateDigest(ctx context.Context, _ *emptypb.Empty) (*pb.StateDigestResponse, error) {
 	// Dual-use: anti-entropy peers (host cert) OR an operator bearer (UI
-	// diagnostics / `lv cluster sync`).
+	// diagnostics / `lv cluster converge`).
 	if err := s.requirePeerOrRole(ctx, "operator"); err != nil {
 		return nil, err
 	}

@@ -452,9 +452,6 @@ func TestPCIConfig_ZeroValue(t *testing.T) {
 	if cfg.RescanInterval != "" {
 		t.Errorf("zero RescanInterval = %q", cfg.RescanInterval)
 	}
-	if cfg.UdevHook {
-		t.Error("zero UdevHook should be false")
-	}
 }
 
 func TestSRIOVConfig_ZeroValue(t *testing.T) {

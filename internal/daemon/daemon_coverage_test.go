@@ -256,7 +256,6 @@ join_peers:
   - "10.0.0.2:8946"
 pci:
   rescan_interval: "10m"
-  udev_hook: true
   sriov:
     managed: true
     max_vfs_per_pf: 32
@@ -309,9 +308,6 @@ pci:
 	}
 	if cfg.PCI.RescanInterval != "10m" {
 		t.Errorf("PCI.RescanInterval = %q", cfg.PCI.RescanInterval)
-	}
-	if !cfg.PCI.UdevHook {
-		t.Error("PCI.UdevHook should be true")
 	}
 	if !cfg.PCI.SRIOV.Managed {
 		t.Error("PCI.SRIOV.Managed should be true")
@@ -464,9 +460,6 @@ func TestLoadConfig_SRIOVDefaults(t *testing.T) {
 	if cfg.PCI.RescanInterval != "" {
 		t.Errorf("PCI.RescanInterval = %q, want empty", cfg.PCI.RescanInterval)
 	}
-	if cfg.PCI.UdevHook {
-		t.Error("PCI.UdevHook should default to false")
-	}
 	if cfg.PCI.SRIOV.Managed {
 		t.Error("PCI.SRIOV.Managed should default to false")
 	}
@@ -538,9 +531,6 @@ func TestConfigStruct_ZeroValue(t *testing.T) {
 	}
 	if len(cfg.JoinPeers) != 0 {
 		t.Errorf("zero JoinPeers = %v", cfg.JoinPeers)
-	}
-	if cfg.PCI.UdevHook {
-		t.Error("zero UdevHook should be false")
 	}
 	if cfg.PCI.SRIOV.Managed {
 		t.Error("zero SRIOV.Managed should be false")

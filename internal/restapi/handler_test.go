@@ -485,12 +485,6 @@ func (m *mockGRPC) PushImage(context.Context, *pb.PushImageRequest, ...grpc.Call
 func (m *mockGRPC) BuildImage(context.Context, *pb.BuildImageRequest, ...grpc.CallOption) (*pb.BuildImageResponse, error) {
 	return nil, nil
 }
-func (m *mockGRPC) BackupVM(context.Context, *pb.BackupVMRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[pb.BackupChunk], error) {
-	return nil, nil
-}
-func (m *mockGRPC) RestoreVM(context.Context, ...grpc.CallOption) (grpc.ClientStreamingClient[pb.RestoreVMRequest, pb.VM], error) {
-	return nil, nil
-}
 func (m *mockGRPC) ListImages(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.ListImagesResponse, error) {
 	return m.listImagesResp, nil
 }

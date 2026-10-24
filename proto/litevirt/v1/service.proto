@@ -987,14 +987,6 @@ message PushImageProgress  { string status = 1; float progress_pct = 2;
 message BuildImageRequest  { string vm_name = 1; string image_name = 2; }
 message BuildImageResponse { string name = 1; int64 size_bytes = 2; }
 
-// ── Backup ──
-message BackupVMRequest    { string vm_name = 1; }
-message BackupChunk        { bytes data = 1; int64 total_bytes = 2;
-    string checksum = 3; }
-message RestoreVMRequest   { string name = 1; bytes chunk = 2;
-    bool final = 3; int32 cpu = 4; int32 memory_mib = 5;
-    string network = 6; }
-
 // ── Import ──
 // Client-streams a source artifact (OVA / OVF-dir tar / .vma / Proxmox bundle)
 // in chunks (first frame carries the metadata fields); the server streams back
@@ -4850,10 +4842,6 @@ service LiteVirt {
     // on every host where nothing uses them, reporting each host's outcome:
     // lv image rm.
     rpc RemoveImage(RemoveImageRequest)        returns (RemoveImageResponse);
-
-    // ── Backup ──
-    rpc BackupVM(BackupVMRequest)              returns (stream BackupChunk);
-    rpc RestoreVM(stream RestoreVMRequest)     returns (VM);
 
     // ── Import (migrate VMs in from VMware OVA/OVF or Proxmox .conf/vzdump) ──
     rpc ImportVM(stream ImportVMRequest)        returns (stream ImportVMProgress);

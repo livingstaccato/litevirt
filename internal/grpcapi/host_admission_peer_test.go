@@ -120,7 +120,7 @@ func TestReserveHostCapacity_RefusesAMoveFromASourceThatCannotWrite(t *testing.T
 		{name: "release-probation", method: "DrainHost", ping: &pb.PingResponse{ReleaseProbation: true}, want: codes.FailedPrecondition, pinged: true},
 		{name: "container", method: "MigrateContainer", ping: &pb.PingResponse{WalQuarantined: true}, want: codes.FailedPrecondition, pinged: true},
 		{name: "unreachable", method: "MigrateVM", err: status.Error(codes.Unavailable, "down"), want: codes.Unavailable, pinged: true},
-		{name: "not-a-move", method: "RestoreVM", ping: &pb.PingResponse{WalQuarantined: true}, want: codes.OK},
+		{name: "not-a-move", method: "CreateVM", ping: &pb.PingResponse{WalQuarantined: true}, want: codes.OK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := testServer(t)

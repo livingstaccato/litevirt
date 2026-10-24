@@ -1301,11 +1301,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if d.cfg.PCI.SRIOV.Managed {
 		go svc.RunSRIOVValidation(ctx, d.parsePCIRescanInterval())
 	}
-	// The udev_hook is deprecated: real-time PCI events are covered by the rescan
-	// interval. Warn (don't fail) so operators migrate off the broken curl-to-REST rule.
-	if d.cfg.PCI.UdevHook {
-		slog.Warn("pci.udev_hook is deprecated and no longer installs a udev rule; rely on pci.rescan_interval instead. Remove any /etc/udev/rules.d/99-litevirt-pci.rules left from an older install.")
-	}
 	// Target the upgrade swap at the binary we're actually running (re-exec uses
 	// os.Executable()), so a non-/usr/local/bin install upgrades correctly.
 	if exe, err := os.Executable(); err == nil {

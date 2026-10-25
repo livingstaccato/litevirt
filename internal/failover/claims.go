@@ -939,7 +939,8 @@ func (c *Coordinator) retryClaims(ctx context.Context, target string) bool {
 				delete(c.restsOnTrust, target)
 				c.holdUnproven(ctx, h, "the owed recovery claims rest on a confirmed SSH power-off that no longer counts"+
 					fenceFailedWayOut(h)+" ("+note+")",
-					"the owed recovery claims rest on a confirmed SSH power-off that no longer counts", c.lastStale[target], note)
+					"the owed recovery claims rest on a confirmed SSH power-off that no longer counts", c.lastStale[target],
+					&trustJudged{fr: fr, id: rec.ID})
 				return true
 			}
 		}

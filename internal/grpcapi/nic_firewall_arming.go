@@ -219,22 +219,22 @@ func (s *Server) needsPausedStart(ctx context.Context, vm string, live bool) boo
 func (s *Server) NICStartGuard(ctx context.Context) lv.StartGuard {
 	return lv.StartGuard{
 		Before: func(name string) (bool, error) {
+			// A start this host left paused is not started again over it:
+			// libvirt refuses a second create of the active domain, and this
+			// start's end (PausedDone) would drop the record of the one that
+			// is not finished. Asked first, so a refused start changes
+			// nothing (a hand-over record stays too).
+			if marked, merr := s.startPausedMarked(name); merr != nil || marked {
+				if active, aerr := s.virt.DomainIsActive(name); aerr != nil || active {
+					return false, s.startLeftPausedGuardRefusal(ctx, name)
+				}
+			}
 			// A start here is not a hand-over: a record an earlier move left
 			// must not resume this run's guest (re-review m3).
 			s.endHeld(name, "it is started here")
 			vlans, err := s.tapVLANsOf(ctx, name)
 			if err != nil {
 				return false, fmt.Errorf("whether %s's NICs have VLANs could not be read, so it is not run here: %w", name, err)
-			}
-			// A start this host left paused is not started again over it:
-			// libvirt refuses a second create of the active domain, and this
-			// start's end (PausedDone) would drop the record of the one that
-			// is not finished. `lv start` finishes it (finishStartLeftPaused).
-			if marked, merr := s.startPausedMarked(name); merr != nil || marked {
-				if active, aerr := s.virt.DomainIsActive(name); aerr != nil || active {
-					return false, fmt.Errorf("a start of %s this host left paused is not finished (its start-paused record is there); "+
-						"`lv start %s` finishes it", name, name)
-				}
 			}
 			if len(vlans) > 0 || s.needsPausedStart(ctx, name, false) {
 				// Recorded before the paused create, so a daemon that dies

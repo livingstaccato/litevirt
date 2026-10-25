@@ -2778,11 +2778,11 @@ func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord
 	if err := s.operatorStopStartRefusal(ctx, vm); err != nil {
 		return nil, err
 	}
-	// A start this host left paused (an interrupted daemon's: its record is
-	// still there, its domain paused) is finished, not started again: libvirt
-	// would refuse a second create of the running domain (rc9 lab F1).
-	if out, done, err := s.finishStartLeftPaused(ctx, vm); done {
-		return out, err
+	// A start this host left paused (its record is still there, its domain
+	// paused) is neither finished here nor started again over: the start is
+	// refused, saying what to do, and the record kept (rc9 lab F1).
+	if err := s.startLeftPausedRefusal(ctx, vm.Name); err != nil {
+		return nil, err
 	}
 	// A volume move this host left unresolved points the disk row at the file
 	// the persistent config names before anything reads the rows, or refuses
@@ -3127,49 +3127,24 @@ func (s *Server) stopLocked(ctx context.Context, vm *corrosion.VMRecord, force b
 		return true
 	}
 	// A paused guest cannot answer an ACPI shutdown (libvirt: "domain is not
-	// running"). One a start of this host left paused (its start-paused
-	// record names this incarnation) never ran, and a stop ends it by a kill,
-	// as the timeout would, under the same write-quarantine rule (rc9 lab
-	// F1). Any other paused guest (an I/O error's, partition pause's, a
-	// hand-over's) has run, and a kill loses what it has not flushed: a plain
-	// stop is refused, saying so; `lv stop --force` kills it.
-	paused, startLeftPaused, pausedWhy := false, false, ""
+	// running"), and a plain stop never kills one: whatever paused it (an I/O
+	// error, partition pause, a hand-over, a start left paused), a kill loses
+	// what the guest has not flushed, if it ran. The plain stop is refused,
+	// saying why it is paused and that `lv stop --force` destroys it (rc9 lab
+	// F1, review C1).
 	if !force {
 		if st, serr := s.virt.DomainStateReason(vm.Name); serr == nil && st.Reason == "paused" {
-			paused, pausedWhy = true, st.PausedReason
-			if want, uerr := s.startPausedUUID(vm.Name); uerr == nil && want != "" && s.domainIsUUID(vm.Name, want) {
-				startLeftPaused = true
-			}
+			return nil, status.Error(codes.FailedPrecondition, s.pausedStopRefusal(ctx, vm.Name, st.PausedReason))
 		}
 	}
-	if paused && !startLeftPaused {
-		why := pausedWhy
-		if why == "" {
-			why = "reason unknown"
-		}
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"VM %q is paused (%s), so it cannot shut down gracefully, and it was not stopped: `lv stop --force %s` kills it "+
-				"(what the guest has not flushed is lost), or let it resume first (a partition pause resumes when the partition "+
-				"heals; a guest held for its NIC guards: `lv firewall nic-guard resume %s`) and stop it then",
-			vm.Name, why, vm.Name, vm.Name)
-	}
-	if paused {
-		if reason := s.stopQuarantineReason(); reason != "" {
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"VM %q is paused, so it cannot shut down, and it was not killed: this host is in write quarantine (%s), "+
-					"so a kill could not be recorded and its restart policy would undo it; %s",
-				vm.Name, reason, s.quarantineRemedy())
-		}
-		slog.Info("StopVM: the guest was left paused by a start and never ran; killing it", "vm", vm.Name)
+	if force {
 		if err := s.virt.DestroyDomain(vm.Name); err != nil && !alreadyStopped("destroy", err) {
 			return nil, status.Errorf(codes.Internal, "destroy: %v", err)
 		}
-		// The start it was left paused by has ended now.
+		// The domain is not running now: a start left paused has ended, and
+		// its record goes with it, so no stale record names a later run of
+		// this VM (review C1).
 		s.unmarkStartPaused(vm.Name)
-	} else if force {
-		if err := s.virt.DestroyDomain(vm.Name); err != nil && !alreadyStopped("destroy", err) {
-			return nil, status.Errorf(codes.Internal, "destroy: %v", err)
-		}
 	} else if err := s.virt.ShutdownDomain(vm.Name); err != nil {
 		if !alreadyStopped("shutdown", err) {
 			return nil, status.Errorf(codes.Internal, "shutdown: %v", err)

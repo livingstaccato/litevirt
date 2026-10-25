@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -39,57 +40,102 @@ func strandedCond(t *testing.T, s *Server) (corrosion.HealthCondition, bool) {
 	return c, ok && c.Lifecycle != corrosion.ConditionResolved
 }
 
-// F1 (a): an operator `lv start` writes running only once the domain is up,
-// so its row is still stopped; a restart-policy start leaves error. A daemon
-// killed in either's paused window leaves a recorded start of this
-// incarnation that the sweep finishes — VLANs on, then the resume — as it
-// does a reconciler start's.
+// failShutdownPaused makes the fake answer a shutdown of a paused guest as
+// libvirt does (rc9 lab F1).
+func failShutdownPaused(fake *libvirtfake.Fake) {
+	fake.FailShutdownDomain = func(name string) error {
+		if st, _ := fake.RawState(name); st == libvirtfake.StatePaused {
+			return errors.New("Requested operation is not valid: domain is not running")
+		}
+		return nil
+	}
+}
+
+// assertNeverRanGuidance fails unless text tells the operator what to do
+// with a start left paused whose guest never ran.
+func assertNeverRanGuidance(t *testing.T, text string) {
+	t.Helper()
+	for _, want := range []string{"never ran", "`lv stop --force vm1` loses nothing", "`lv start vm1`"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("guidance %q does not say %q", text, want)
+		}
+	}
+}
+
+// F1, scoped down for v1.10.0: the sweep finishes only a recorded start whose
+// row is running or starting (the reconciler's). An operator `lv start` (row
+// still stopped) and a restart-policy start (row error or crashed) left
+// paused are not finished — that needs the gates such a start passes, which
+// is v1.10.1's — but named, telling the operator what to do. The row is not
+// touched (review I1).
 //
-// Mutation: only running/starting rows finishable (the old rule) — red.
-func TestResumeStrandedStarts_FinishesAnOperatorOrRestartPolicyStart(t *testing.T) {
-	for _, state := range []string{"stopped", "error"} {
+// Mutations: stopped/error/crashed finishable again — red (resumed); no
+// condition on the refused branch — red; the never-ran guidance dropped from
+// strandedRemedy — red.
+func TestResumeStrandedStarts_NamesAnOperatorOrRestartPolicyStart(t *testing.T) {
+	for _, state := range []string{"stopped", "error", "crashed"} {
 		t.Run(state, func(t *testing.T) {
 			s, fake := leftPaused(t, state)
+			if state == "stopped" {
+				if err := corrosion.UpdateVMState(adminCtx(), s.db, "vm1", "stopped", "operator-stop"); err != nil {
+					t.Fatal(err)
+				}
+			}
 			before := len(vlanDomainOps(fake, "vm1"))
 			s.ResumeStrandedStarts(context.Background())
-			ops := vlanDomainOps(fake, "vm1")[before:]
-			tap, resume := opIndex(ops, "vlan-tap"), opIndex(ops, "resume")
-			if tap < 0 || resume < tap {
-				t.Fatalf("row %s: ops %q, want the VLAN on, then the resume", state, ops)
+			if st, _ := fake.RawState("vm1"); st != libvirtfake.StatePaused {
+				t.Fatalf("row %s: the domain is %v, want it left paused", state, st)
 			}
-			if marked, _ := s.startPausedMarked("vm1"); marked {
-				t.Fatal("the finished start's record outlived it")
+			if ops := vlanDomainOps(fake, "vm1")[before:]; opIndex(ops, "resume") >= 0 || opIndex(ops, "destroy") >= 0 {
+				t.Fatalf("row %s: ops %q, want nothing done to the domain", state, ops)
+			}
+			if marked, _ := s.startPausedMarked("vm1"); !marked {
+				t.Fatal("the record of a start kept unfinished was dropped")
+			}
+			c, named := strandedCond(t, s)
+			if !named {
+				t.Fatalf("row %s: the start left paused is not named", state)
+			}
+			assertNeverRanGuidance(t, c.Evidence)
+			if row, _ := corrosion.GetVM(adminCtx(), s.db, "vm1"); row == nil || row.State != state {
+				t.Fatalf("row %+v, want it left %s", row, state)
 			}
 		})
 	}
 }
 
-// F1 (b): every recorded start the sweep keeps without finishing is named by
+// Every recorded start the sweep keeps without finishing is named by
 // vm_start_stranded_paused — never silence — but for one something else
-// holds, which reports itself (M3).
+// holds (partition pause, a hand-over), which reports itself (M3).
 //
 // Mutations: no condition on the refused branch — red; a condition on the
-// held branch — red.
+// held branch — red; no hand-over check in classifyStrandedStart — red (the
+// held guest is resumed: review M6).
 func TestResumeStrandedStarts_NamesEveryStartItKeeps(t *testing.T) {
 	for name, tc := range map[string]struct {
 		state string
-		setup func(*Server, *libvirtfake.Fake)
+		setup func(*testing.T, *Server, *libvirtfake.Fake)
 		named bool
 	}{
 		"row in a state no unfinished start leaves": {state: "migrating", named: true},
-		"domain state unreadable": {state: "running", named: true, setup: func(s *Server, f *libvirtfake.Fake) {
+		"domain state unreadable": {state: "running", named: true, setup: func(t *testing.T, s *Server, f *libvirtfake.Fake) {
 			f.FailDomainStateReason = func(string) error { return errors.New("connection reset by peer") }
 		}},
-		"held by partition pause": {state: "running", named: false, setup: func(s *Server, f *libvirtfake.Fake) {
+		"held by partition pause": {state: "running", named: false, setup: func(t *testing.T, s *Server, f *libvirtfake.Fake) {
 			if err := f.MarkPartitionPaused("vm1", "tok-1"); err != nil {
-				panic(err)
+				t.Fatal(err)
+			}
+		}},
+		"held by a hand-over": {state: "running", named: false, setup: func(t *testing.T, s *Server, f *libvirtfake.Fake) {
+			if err := s.putHeld(heldGuest{VM: "vm1", Source: "other-host", Since: time.Now().UTC().Format(time.RFC3339)}); err != nil {
+				t.Fatal(err)
 			}
 		}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, fake := leftPaused(t, tc.state)
 			if tc.setup != nil {
-				tc.setup(s, fake)
+				tc.setup(t, s, fake)
 			}
 			s.ResumeStrandedStarts(context.Background())
 			if st, _ := fake.RawState("vm1"); st != libvirtfake.StatePaused {
@@ -105,32 +151,80 @@ func TestResumeStrandedStarts_NamesEveryStartItKeeps(t *testing.T) {
 	}
 }
 
-// F1 (c): `lv start` of a VM a start of this host left paused finishes that
-// start — VLANs on, then the resume, the row running — instead of failing
-// with "domain is already running"; and it never drops the record of a start
-// it does not finish: one held by something else is refused, record kept.
+// Review m2: a start left paused here whose VM's row now names another host
+// (failover moved it while this daemon was down) is a paused qemu here while
+// another host may run the VM. One copy at every moment: it is neither
+// resumed nor killed, its record is kept, and it is named, with both hosts.
 //
-// Mutations: no finishStartLeftPaused in startVMLocked — red; the guard
-// taking the record over (no refusal in Before) — red.
-func TestStartVM_FinishesAStartLeftPaused(t *testing.T) {
-	s, fake := leftPaused(t, "stopped")
+// Mutation: drop the record on another host's row (the old rule) — red.
+func TestResumeStrandedStarts_NamesAStartWhoseRowIsAnotherHosts(t *testing.T) {
+	s, fake := leftPaused(t, "running")
+	if err := corrosion.UpdateVMHost(adminCtx(), s.db, "vm1", "other-host", "running"); err != nil {
+		t.Fatal(err)
+	}
 	before := len(vlanDomainOps(fake, "vm1"))
-	if _, err := s.StartVM(adminCtx(), &pb.StartVMRequest{Name: "vm1"}); err != nil {
-		t.Fatalf("StartVM of a start left paused: %v", err)
+	s.ResumeStrandedStarts(context.Background())
+	if st, _ := fake.RawState("vm1"); st != libvirtfake.StatePaused {
+		t.Fatalf("the domain is %v, want it left paused", st)
 	}
-	ops := vlanDomainOps(fake, "vm1")[before:]
-	tap, resume, start := opIndex(ops, "vlan-tap"), opIndex(ops, "resume"), opIndex(ops, "start")
-	if tap < 0 || resume < tap || start >= 0 {
-		t.Fatalf("ops %q: want the VLAN on and the resume, and no second create", ops)
+	if ops := vlanDomainOps(fake, "vm1")[before:]; len(ops) != 0 {
+		t.Fatalf("ops %q, want nothing done to the domain", ops)
 	}
-	if st, _ := fake.RawState("vm1"); st != libvirtfake.StateRunning {
-		t.Fatalf("domain %v, want running", st)
+	if marked, _ := s.startPausedMarked("vm1"); !marked {
+		t.Fatal("the record was dropped")
 	}
-	if vm, _ := corrosion.GetVM(adminCtx(), s.db, "vm1"); vm == nil || vm.State != "running" {
-		t.Fatalf("row %+v, want running", vm)
+	c, named := strandedCond(t, s)
+	if !named {
+		t.Fatal("a paused qemu here, while the row names another host, is not named")
 	}
-	if marked, _ := s.startPausedMarked("vm1"); marked {
-		t.Fatal("the finished start's record outlived it")
+	for _, want := range []string{"other-host", s.hostName, "`virsh destroy vm1`", "never ran"} {
+		if !strings.Contains(c.Evidence, want) {
+			t.Fatalf("condition %q does not name %q", c.Evidence, want)
+		}
+	}
+	// The condition holds while the domain stays, and resolves once it goes.
+	s.JudgeStrandedStarts(adminCtx())
+	if _, named := strandedCond(t, s); !named {
+		t.Fatal("resolved while the paused domain is still here")
+	}
+	fake.SetState("vm1", libvirtfake.StateShutdown)
+	s.JudgeStrandedStarts(adminCtx())
+	if _, named := strandedCond(t, s); named {
+		t.Fatal("still named once the domain was stopped")
+	}
+}
+
+// `lv start` of a VM a start of this host left paused does not finish that
+// start, nor start the VM again over it: it is refused with the guidance the
+// condition gives, nothing is done to the domain, and the record is kept
+// (no start path deletes a record it did not finish; review I2, I3). The row
+// running (the sweep's own case) is refused the same way.
+//
+// Mutations: no startLeftPausedRefusal in startVMLocked — red (the guard's
+// refusal is not the guidance); finishing the start again — red.
+func TestStartVM_RefusesAStartLeftPaused(t *testing.T) {
+	for _, state := range []string{"stopped", "error", "running"} {
+		t.Run(state, func(t *testing.T) {
+			s, fake := leftPaused(t, state)
+			before := len(vlanDomainOps(fake, "vm1"))
+			_, err := s.StartVM(adminCtx(), &pb.StartVMRequest{Name: "vm1"})
+			if status.Code(err) != codes.FailedPrecondition {
+				t.Fatalf("StartVM of a start left paused: %v, want FailedPrecondition", err)
+			}
+			assertNeverRanGuidance(t, status.Convert(err).Message())
+			if ops := vlanDomainOps(fake, "vm1")[before:]; len(ops) != 0 {
+				t.Fatalf("ops %q, want nothing done to the domain", ops)
+			}
+			if st, _ := fake.RawState("vm1"); st != libvirtfake.StatePaused {
+				t.Fatalf("domain %v, want still paused", st)
+			}
+			if marked, _ := s.startPausedMarked("vm1"); !marked {
+				t.Fatal("the record of a start not finished was dropped")
+			}
+			if row, _ := corrosion.GetVM(adminCtx(), s.db, "vm1"); row == nil || row.State != state {
+				t.Fatalf("row %+v, want it left %s", row, state)
+			}
+		})
 	}
 }
 
@@ -156,54 +250,62 @@ func TestStartVM_NeverDropsTheRecordOfAStartItDoesNotFinish(t *testing.T) {
 	}
 }
 
-// F1 (d): `lv stop` (not --force) of a paused domain stops it: a paused
-// guest cannot answer an ACPI shutdown, so it is killed, as the timeout would.
+// The guard's refusal of a start over a start left paused changes nothing:
+// a hand-over record on the domain stays too (it is asked before endHeld).
 //
-// Mutation: no paused branch in stopLocked — red.
-func TestStopVM_StopsAPausedDomain(t *testing.T) {
+// Mutation: ask after endHeld (the old order) — red.
+func TestNICStartGuard_RefusalOverAStartLeftPausedKeepsAHandOver(t *testing.T) {
 	s, fake := leftPaused(t, "running")
-	// As libvirt answers a shutdown of a paused guest (rc9 lab F1).
-	fake.FailShutdownDomain = func(name string) error {
-		if st, _ := fake.RawState(name); st == libvirtfake.StatePaused {
-			return errors.New("Requested operation is not valid: domain is not running")
-		}
-		return nil
+	if err := s.putHeld(heldGuest{VM: "vm1", Source: "other-host", Since: time.Now().UTC().Format(time.RFC3339)}); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "vm1"}); err != nil {
-		t.Fatalf("StopVM of a paused domain: %v", err)
+	if err := fake.StartDomain("vm1"); err == nil {
+		t.Fatal("the guard started over a start left paused")
 	}
-	if st, _ := fake.RawState("vm1"); st == libvirtfake.StatePaused || st == libvirtfake.StateRunning {
-		t.Fatalf("domain %v after the stop, want shut off", st)
+	if _, held, _ := s.getHeld("vm1"); !held {
+		t.Fatal("a refused start dropped the hand-over record")
 	}
-	if marked, _ := s.startPausedMarked("vm1"); marked {
-		t.Fatal("the record of the start the stop ended outlived it")
+	if marked, _ := s.startPausedMarked("vm1"); !marked {
+		t.Fatal("a refused start dropped the start record")
 	}
 }
 
-// A plain `lv stop` kills only a guest a start left paused (its record names
-// this incarnation): that guest never ran. Any other paused guest — an I/O
-// error's, a partition pause's, one whose record names another incarnation —
-// has run, and a kill loses what it has not flushed: the plain stop is refused,
-// naming the pause and the choices, and the guest is left as it is. `lv stop
-// --force` stops it.
+// A plain `lv stop` never kills a paused guest (review C1): whatever paused
+// it — a start left paused, an I/O error, partition pause, with or without a
+// start record — the stop is refused, saying why it is paused and that
+// `lv stop --force` destroys it, and the guest is left as it is. `lv stop
+// --force` then destroys it and removes its start record, so none is left
+// behind to name a later run.
 //
-// Mutations: kill any paused guest on a plain stop (no record check) — red;
-// skip the uuid match — red (the other-incarnation case is killed).
-func TestStopVM_APlainStopRefusesAGuestThatHasRun(t *testing.T) {
-	for name, setup := range map[string]func(t *testing.T, s *Server, fake *libvirtfake.Fake){
-		"io-error pause": func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
-			fake.SetState("vm1", libvirtfake.StateRunning)
-			if err := fake.PauseOnIOError("vm1"); err != nil {
+// Mutations: a plain stop kills a paused guest with a uuid-matched record
+// (765201126's branch) — red; --force keeping the record — red.
+func TestStopVM_APlainStopNeverKillsAPausedGuest(t *testing.T) {
+	ioError := func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
+		fake.SetState("vm1", libvirtfake.StateRunning)
+		if err := fake.PauseOnIOError("vm1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, tc := range map[string]struct {
+		record bool // a uuid-matched start record (leftPaused)
+		setup  func(t *testing.T, s *Server, fake *libvirtfake.Fake)
+		want   string
+	}{
+		"a start left paused":       {record: true, want: "never ran"},
+		"record and io-error pause": {record: true, setup: ioError, want: "io-error"},
+		"record and partition pause": {record: true, want: "partition pause", setup: func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
+			if err := fake.MarkPartitionPaused("vm1", "tok-1"); err != nil {
 				t.Fatal(err)
 			}
-		},
-		"partition pause": func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
+		}},
+		"io-error pause, no record": {setup: ioError, want: "io-error"},
+		"partition pause, no record": {want: "paused", setup: func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
 			fake.SetState("vm1", libvirtfake.StatePaused)
 			if err := fake.MarkPartitionPaused("vm1", "tok-1"); err != nil {
 				t.Fatal(err)
 			}
-		},
-		"a record of another incarnation": func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
+		}},
+		"a record of another incarnation": {want: "another incarnation", setup: func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
 			if err := fake.DefineDomain(`<domain type='kvm'><name>vm1</name><uuid>11111111-1111-1111-1111-111111111111</uuid></domain>`); err != nil {
 				t.Fatal(err)
 			}
@@ -217,27 +319,36 @@ func TestStopVM_APlainStopRefusesAGuestThatHasRun(t *testing.T) {
 				t.Fatal(err)
 			}
 			fake.SetState("vm1", libvirtfake.StatePaused)
-		},
+		}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			s, fake := vlanStartServer(t)
-			if err := corrosion.UpdateVMState(adminCtx(), s.db, "vm1", "running", ""); err != nil {
-				t.Fatal(err)
-			}
-			setup(t, s, fake)
-			fake.FailShutdownDomain = func(name string) error {
-				if st, _ := fake.RawState(name); st == libvirtfake.StatePaused {
-					return errors.New("Requested operation is not valid: domain is not running")
+			var s *Server
+			var fake *libvirtfake.Fake
+			if tc.record {
+				s, fake = leftPaused(t, "running")
+			} else {
+				s, fake = vlanStartServer(t)
+				if err := corrosion.UpdateVMState(adminCtx(), s.db, "vm1", "running", ""); err != nil {
+					t.Fatal(err)
 				}
-				return nil
 			}
+			if tc.setup != nil {
+				tc.setup(t, s, fake)
+			}
+			failShutdownPaused(fake)
+			markedBefore, _ := s.startPausedMarked("vm1")
 			_, err := s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "vm1"})
-			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "paused") ||
-				!strings.Contains(err.Error(), "lv stop --force vm1") {
-				t.Fatalf("a plain stop of a paused guest that has run: %v, want FailedPrecondition naming the pause and --force", err)
+			msg := status.Convert(err).Message()
+			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(msg, "is paused") ||
+				!strings.Contains(msg, "graceful stop is impossible") || !strings.Contains(msg, "`lv stop --force vm1` destroys it") ||
+				!strings.Contains(msg, tc.want) {
+				t.Fatalf("a plain stop of a paused guest: %v, want FailedPrecondition naming the pause (%q) and --force", err, tc.want)
 			}
 			if st, _ := fake.RawState("vm1"); st != libvirtfake.StatePaused {
 				t.Fatalf("the refused stop changed the guest: %v", st)
+			}
+			if marked, _ := s.startPausedMarked("vm1"); marked != markedBefore {
+				t.Fatalf("the refused stop changed the start record: %v, was %v", marked, markedBefore)
 			}
 			if _, err := s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "vm1", Force: true}); err != nil {
 				t.Fatalf("lv stop --force of a paused guest: %v", err)
@@ -245,6 +356,36 @@ func TestStopVM_APlainStopRefusesAGuestThatHasRun(t *testing.T) {
 			if st, _ := fake.RawState("vm1"); st == libvirtfake.StatePaused || st == libvirtfake.StateRunning {
 				t.Fatalf("after --force the guest is %v, want shut off", st)
 			}
+			if marked, _ := s.startPausedMarked("vm1"); marked {
+				t.Fatal("lv stop --force left the start record behind")
+			}
 		})
+	}
+}
+
+// The review's probe (C1), ported: `lv stop --force` of a start left paused
+// leaves no record behind; the VM run again by a path that does not touch
+// the record, then paused on an I/O error, is not killed by a plain stop.
+//
+// Mutation: --force keeping the record — red.
+func TestStopVM_NoStaleRecordAfterForceStop(t *testing.T) {
+	s, fake := leftPaused(t, "running")
+	failShutdownPaused(fake)
+	if _, err := s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "vm1", Force: true}); err != nil {
+		t.Fatalf("force stop: %v", err)
+	}
+	if marked, _ := s.startPausedMarked("vm1"); marked {
+		t.Fatal("lv stop --force left the start record behind")
+	}
+	fake.SetState("vm1", libvirtfake.StateRunning)
+	if err := fake.PauseOnIOError("vm1"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "vm1"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("a plain stop of an io-error-paused guest: %v, want refused", err)
+	}
+	if st, _ := fake.RawState("vm1"); st != libvirtfake.StatePaused {
+		t.Fatalf("a plain stop changed an io-error-paused guest that ran: %v", st)
 	}
 }

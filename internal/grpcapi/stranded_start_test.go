@@ -68,9 +68,16 @@ func TestResumeStrandedStarts(t *testing.T) {
 		t.Fatalf("the condition after the finish: %s, want resolved", c.Lifecycle)
 	}
 	// Its row is stopped, as an interrupted operator `lv start` leaves it:
-	// its own recorded start, finished too (rc9 lab F1).
-	if st, _ := fake.RawState("stoppedrow"); st != libvirtfake.StateRunning {
-		t.Fatalf("the recorded start of a VM whose row is stopped was not finished: %v", st)
+	// not finished by the sweep (v1.10.0), but named, its record kept
+	// (rc9 lab F1).
+	if st, _ := fake.RawState("stoppedrow"); st != libvirtfake.StatePaused {
+		t.Fatalf("the recorded start of a VM whose row is stopped: %v, want it left paused", st)
+	}
+	if c, ok, _ := corrosion.GetHealthCondition(ctx, s.db, StrandedStartEvaluator, CondStrandedStartPaused, "vm", "stoppedrow@"+s.hostName); !ok || c.Lifecycle == corrosion.ConditionResolved {
+		t.Fatal("the recorded start of a VM whose row is stopped is not named")
+	}
+	if marked, _ := s.startPausedMarked("stoppedrow"); !marked {
+		t.Fatal("the record of a start kept unfinished was dropped")
 	}
 	if marked, _ := s.startPausedMarked("vm1"); marked {
 		t.Fatal("the finished start's record outlived it")

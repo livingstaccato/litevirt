@@ -19,9 +19,10 @@ import (
 )
 
 // NB-R13: a start record whose domain libvirt no longer knows (not found), or
-// whose VM row is gone or names another host, is dropped by the sweep: that
-// start can never be finished here, and the record would otherwise outlive it
-// for good.
+// whose VM row is gone, is dropped by the sweep: that start can never be
+// finished here, and the record would otherwise outlive it for good. (A row
+// naming another host keeps the record, and names the paused domain:
+// TestResumeStrandedStarts_NamesAStartWhoseRowIsAnotherHosts.)
 func TestResumeStrandedStarts_DropsARecordWithNothingToFinish(t *testing.T) {
 	for name, setup := range map[string]func(t *testing.T, s *Server, fake *libvirtfake.Fake){
 		"domain not found": func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
@@ -46,15 +47,6 @@ func TestResumeStrandedStarts_DropsARecordWithNothingToFinish(t *testing.T) {
 				t.Fatal(err)
 			}
 			if err := corrosion.DeleteVM(adminCtx(), s.db, "vm1"); err != nil {
-				t.Fatal(err)
-			}
-		},
-		"row names another host": func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
-			fake.SetState("vm1", libvirtfake.StatePaused)
-			if err := s.markStartPaused("vm1"); err != nil {
-				t.Fatal(err)
-			}
-			if err := corrosion.UpdateVMHost(adminCtx(), s.db, "vm1", "elsewhere", "running"); err != nil {
 				t.Fatal(err)
 			}
 		},

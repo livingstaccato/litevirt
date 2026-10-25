@@ -18,11 +18,10 @@ import (
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
-// NB-R13: a start record whose domain libvirt no longer knows (not found), or
-// whose VM row is gone, is dropped by the sweep: that start can never be
-// finished here, and the record would otherwise outlive it for good. (A row
-// naming another host keeps the record, and names the paused domain:
-// TestResumeStrandedStarts_NamesAStartWhoseRowIsAnotherHosts.)
+// NB-R13: a start record whose domain libvirt no longer knows (not found) is
+// dropped by the sweep: that start has ended, and the record would otherwise
+// outlive it for good. (A row naming another host, or a row that is gone,
+// keeps the record and names the paused domain: review m2, F7 m2.)
 func TestResumeStrandedStarts_DropsARecordWithNothingToFinish(t *testing.T) {
 	for name, setup := range map[string]func(t *testing.T, s *Server, fake *libvirtfake.Fake){
 		"domain not found": func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
@@ -39,15 +38,6 @@ func TestResumeStrandedStarts_DropsARecordWithNothingToFinish(t *testing.T) {
 				// As libvirt.Client wraps it (domain.go): VIR_ERR_NO_DOMAIN.
 				return fmt.Errorf("lookup domain %s: %w", name,
 					golibvirt.Error{Code: uint32(golibvirt.ErrNoDomain), Message: "Domain not found: no domain with matching name '" + name + "'"})
-			}
-		},
-		"row gone": func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
-			fake.SetState("vm1", libvirtfake.StatePaused)
-			if err := s.markStartPaused("vm1"); err != nil {
-				t.Fatal(err)
-			}
-			if err := corrosion.DeleteVM(adminCtx(), s.db, "vm1"); err != nil {
-				t.Fatal(err)
 			}
 		},
 	} {

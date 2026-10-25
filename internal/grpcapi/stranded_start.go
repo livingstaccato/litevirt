@@ -79,11 +79,16 @@ var strandedRowStates = map[string]bool{"running": true, "starting": true}
 // the operator is told to do about it (strandedRemedy).
 type strandedReport struct {
 	why string
-	// neverRan: the record names the domain's own incarnation (its uuid) and
-	// the domain is paused for a start's reason, so the guest never ran.
+	// neverRan: proven, not inferred: the record names the domain's own
+	// incarnation (its uuid), and QEMU reports the domain "prelaunch"
+	// (query-status), which only a guest whose vCPUs never ran is. libvirt's
+	// paused reason "user" is no proof: it reports the same for an operator's
+	// suspend (review F7 I1).
 	neverRan bool
 	// rowHost: the VM's row names this other host.
 	rowHost string
+	// rowGone: the VM's row is gone (the VM was deleted).
+	rowGone bool
 }
 
 func (r strandedReport) Error() string { return r.why }
@@ -121,8 +126,6 @@ func (s *Server) classifyStrandedStart(ctx context.Context, vm string) (stranded
 	switch {
 	case err != nil:
 		return refuse("its VM row cannot be read: %v", err)
-	case row == nil:
-		return strandedDrop, strandedReport{why: "its VM is gone"}
 	}
 	// Something else holding it paused comes first: it is left paused, and
 	// not reported as a stranded start (review M3).
@@ -150,13 +153,24 @@ func (s *Server) classifyStrandedStart(ctx context.Context, vm string) (stranded
 	if ferr := s.firmwareMoveHeld(vm); ferr != nil {
 		return strandedHeld, strandedReport{why: ferr.Error()}
 	}
-	// Whether this is the start's own guest, which never ran: the record
-	// names the domain's incarnation, and the domain is paused as a start
-	// leaves it.
+	// Whether this is the start's own guest, and whether it never ran: the
+	// record names the domain's incarnation, and QEMU reports it prelaunch.
+	// QEMU is asked only for a domain that may be this start's.
 	startPause := st.PausedReason == "user" || st.PausedReason == "starting-up"
 	want, rerr := s.startPausedUUID(vm)
 	own := rerr == nil && want != "" && s.domainIsUUID(vm, want)
-	rep := strandedReport{neverRan: startPause && own}
+	rep := strandedReport{}
+	notProven := ""
+	if startPause && own {
+		rep.neverRan, notProven = s.qemuNeverRan(vm)
+	}
+	if row == nil {
+		// A paused qemu of a deleted VM, holding its disks: kept as it is
+		// and named, not dropped unseen (review F7 m2).
+		rep.rowGone = true
+		rep.why = "its VM row is gone (the VM was deleted)"
+		return strandedRefuse, rep
+	}
 	if row.HostName != s.hostName {
 		// Another copy may run there (one copy at every moment): this one is
 		// kept as it is — never resumed, never killed — and named, so a
@@ -178,6 +192,11 @@ func (s *Server) classifyStrandedStart(ctx context.Context, vm string) (stranded
 	case !own:
 		rep.why = fmt.Sprintf("its start record names another incarnation (uuid %s) than the domain here, or the domain's uuid cannot be read", want)
 		return strandedRefuse, rep
+	case !rep.neverRan:
+		// libvirt's "user" is also an operator's suspend of a guest that ran,
+		// with a record left from an earlier start: never resumed on it.
+		rep.why = "it cannot be shown that its guest never ran: " + notProven
+		return strandedRefuse, rep
 	case !strandedRowStates[row.State]:
 		rep.why = fmt.Sprintf("its VM row is %s (an operator `lv start`, or a restart-policy start), and only a start whose row is running or starting is finished automatically", row.State)
 		return strandedRefuse, rep
@@ -189,20 +208,44 @@ func (s *Server) classifyStrandedStart(ctx context.Context, vm string) (stranded
 // paused on this host: the condition's text and `lv start`'s refusal say the
 // same.
 func (s *Server) strandedRemedy(vm string, rep strandedReport) string {
-	if rep.rowHost != "" && rep.rowHost != s.hostName {
-		lost := "if this copy ran, what it has not flushed is lost"
-		if rep.neverRan {
-			lost = "this copy never ran, so nothing is lost"
-		}
+	destroyLost := "QEMU reports this copy never ran (prelaunch), so nothing is lost"
+	if !rep.neverRan {
+		destroyLost = "it cannot be shown that this copy never ran, so it discards whatever guest state it has not flushed " +
+			"to disk; decide whether that matters before you run it"
+	}
+	switch {
+	case rep.rowGone:
+		return fmt.Sprintf("Its VM row is gone, but this paused domain is still on %[2]s, holding its disks; it is left as it is, "+
+			"neither resumed nor killed. Stop it on %[2]s with `virsh destroy %[1]s` (%[3]s)", vm, s.hostName, destroyLost)
+	case rep.rowHost != "" && rep.rowHost != s.hostName:
 		return fmt.Sprintf("Its row names %[3]s, so another copy may run there: this domain on %[2]s is left as it is, "+
 			"neither resumed nor killed. Check which host runs the VM (`lv inspect %[1]s`, and `virsh domstate %[1]s` on %[3]s); "+
-			"if %[3]s runs it, stop this copy on %[2]s with `virsh destroy %[1]s` (%[4]s)", vm, s.hostName, rep.rowHost, lost)
+			"if %[3]s runs it, stop this copy on %[2]s with `virsh destroy %[1]s` (%[4]s)", vm, s.hostName, rep.rowHost, destroyLost)
+	case rep.neverRan:
+		return fmt.Sprintf("QEMU reports the guest never ran (prelaunch), so `lv stop --force %[1]s` loses nothing; "+
+			"then start it with `lv start %[1]s`", vm)
 	}
-	if rep.neverRan {
-		return fmt.Sprintf("The guest never ran, so `lv stop --force %[1]s` loses nothing; then start it with `lv start %[1]s`", vm)
+	return fmt.Sprintf("It cannot be shown that the guest never ran: `lv stop --force %[1]s` discards any guest state not "+
+		"flushed to disk, so decide whether that matters before you run it; then start it with `lv start %[1]s`", vm)
+}
+
+// qemuNeverRan reports whether QEMU proves vm's guest never ran: its
+// query-status is "prelaunch". When not, why says what QEMU answered.
+func (s *Server) qemuNeverRan(vm string) (bool, string) {
+	q, ok := s.virt.(interface {
+		DomainQEMUStatus(name string) (string, error)
+	})
+	if !ok {
+		return false, "this host cannot ask QEMU for its run state"
 	}
-	return fmt.Sprintf("It cannot be shown that the guest never ran: `lv stop --force %[1]s` loses what it has not flushed, "+
-		"if it ran; then start it with `lv start %[1]s`", vm)
+	st, err := q.DomainQEMUStatus(vm)
+	switch {
+	case err != nil:
+		return false, fmt.Sprintf("QEMU's run state cannot be read (%v)", err)
+	case st != lv.QEMUStatusPrelaunch:
+		return false, fmt.Sprintf("QEMU reports it %q, not prelaunch, so its guest has run (an operator's suspend, a capture) and its start record is stale", st)
+	}
+	return true, ""
 }
 
 // finishStrandedStart finishes vm's recorded paused start: its NIC firewall
@@ -293,6 +336,7 @@ func (s *Server) JudgeStrandedStarts(ctx context.Context) {
 	if s.db == nil || s.virt == nil {
 		return
 	}
+	s.dropStaleStartRecords()
 	conds, deleted, err := corrosion.ListHealthConditionsByCode(ctx, s.db, StrandedStartEvaluator, CondStrandedStartPaused)
 	if err != nil {
 		return
@@ -310,6 +354,32 @@ func (s *Server) JudgeStrandedStarts(ctx context.Context) {
 		}
 		s.judgeStrandedStart(ctx, vm, nil)
 	}
+}
+
+// dropStaleStartRecords drops each start record whose domain runs (active,
+// not paused): its start ended, whatever did not remove the record (a
+// destroy outside `lv stop --force`, a migration back in, a failed unmark).
+// A start in flight is never running before it ends: its domain is shut off
+// until its paused create, and paused until its resume (review F7 I1).
+func (s *Server) dropStaleStartRecords() {
+	for _, vm := range s.startPausedRecords() {
+		s.dropStartRecordIfRunning(vm)
+	}
+}
+
+// dropStartRecordIfRunning drops vm's start record when its domain here
+// runs, unpaused: a stale record. Any other state, or one it cannot read,
+// keeps it.
+func (s *Server) dropStartRecordIfRunning(vm string) {
+	st, err := s.virt.DomainStateReason(vm)
+	if err != nil || st.Reason != "running" {
+		return
+	}
+	if marked, merr := s.startPausedMarked(vm); merr != nil || !marked {
+		return
+	}
+	slog.Info("start guard: dropped the start record of a domain that runs (stale)", "vm", vm)
+	s.unmarkStartPaused(vm)
 }
 
 // judgeStrandedStart raises vm_start_stranded_paused for vm on this host
@@ -368,7 +438,7 @@ func (s *Server) domainIsUUID(vm, uuid string) bool {
 // gone): the start goes on as any other.
 func (s *Server) startLeftPausedRefusal(ctx context.Context, vm string) error {
 	if st, err := s.virt.DomainStateReason(vm); (err == nil && st.Reason != "paused") || (err != nil && lv.IsNoDomain(err)) {
-		return nil
+		return nil // a stale record of a domain that runs: the start guard drops it
 	}
 	if marked, err := s.startPausedMarked(vm); err == nil && !marked {
 		return nil
@@ -380,12 +450,11 @@ func (s *Server) startLeftPausedRefusal(ctx context.Context, vm string) error {
 	case strandedHeld:
 		return status.Errorf(codes.FailedPrecondition,
 			"VM %q is paused here by an unfinished start, and %s; it stays paused, and it was not started", vm, rep.why)
-	case strandedRefuse:
-		// Named, as the sweep names it.
-		s.judgeStrandedStart(ctx, vm, rep)
 	}
-	// strandedFinish: a start in flight here (the reconciler's), or one the
-	// sweep could not finish (and named): either way not this start's to end.
+	// Refused, and not named here: a start the reconciler has in flight
+	// (a restart-policy start's row is error) looks exactly like this until
+	// it resumes. A start left paused is named by the sweep (a daemon that
+	// died) or by the start guard (a start that failed paused: PausedKept).
 	why := rep.why
 	if why == "" {
 		why = "a start of this host, in flight or interrupted, has not resumed it"
@@ -403,13 +472,13 @@ func (s *Server) pausedStopRefusal(ctx context.Context, vm, libvirtReason string
 	if why == "" {
 		why = "reason unknown"
 	}
-	lost := "what the guest has not flushed is lost"
+	lost := "it discards any guest state not flushed to disk, so decide whether that matters before you run it"
 	if marked, err := s.startPausedMarked(vm); err != nil || marked {
 		switch verdict, rep := s.classifyStrandedStart(ctx, vm); {
 		case verdict == strandedHeld:
 			why += "; " + rep.why
 		case rep.neverRan:
-			why += "; a start of this host created it paused and was not finished, so the guest never ran"
+			why += "; a start of this host created it paused and was not finished, and QEMU reports the guest never ran (prelaunch)"
 			lost = "the guest never ran, so nothing is lost"
 		case verdict == strandedRefuse:
 			why += "; a start of this host left it paused (" + rep.why + ")"
@@ -431,4 +500,43 @@ func (s *Server) startLeftPausedGuardRefusal(ctx context.Context, vm string) err
 	}
 	return fmt.Errorf("a start of %s this host left paused is not finished (its start-paused record is there), and it is not "+
 		"started again over it. %s", vm, s.strandedRemedy(vm, rep))
+}
+
+// strandedStartKept names vm at once when a start of it failed after its
+// paused create and its domain may still be paused, its record kept
+// (libvirt.StartGuard.PausedKept): not only at the next daemon start (review
+// F7 m5). A domain something else holds is that hold's to report.
+func (s *Server) strandedStartKept(ctx context.Context, vm string, startErr error) {
+	verdict, rep := s.classifyStrandedStart(ctx, vm)
+	switch verdict {
+	case strandedDrop, strandedHeld:
+		return
+	}
+	if verdict == strandedFinish || rep.why == "" {
+		rep.why = fmt.Sprintf("a start failed (%v) after creating it paused, and its domain could not be stopped", startErr)
+	} else {
+		rep.why = fmt.Sprintf("a start failed (%v) after creating it paused, and %s", startErr, rep.why)
+	}
+	slog.Error("start guard: a failed start left the domain paused; its record is kept and the guest named", "vm", vm, "error", startErr)
+	s.judgeStrandedStart(ctx, vm, rep)
+}
+
+// startRecordRefusal refuses an operation that would start vm's domain
+// again (a snapshot restore) while a start of this host has left a record
+// for it: the start guard would refuse that start only after the operation
+// had torn the domain down (review F7 m1). A record whose domain runs is
+// stale, and dropped.
+func (s *Server) startRecordRefusal(op, vm string) error {
+	s.dropStartRecordIfRunning(vm)
+	marked, err := s.startPausedMarked(vm)
+	switch {
+	case err != nil:
+		return status.Errorf(codes.FailedPrecondition, "%s of VM %q refused: whether a start of it was left paused here cannot be read: %v", op, vm, err)
+	case !marked:
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"%[1]s of VM %[2]q refused, and nothing was changed: a start of it on this host was left paused (its start-paused record "+
+			"is there), and the %[1]s would start the domain again over it. Run `lv stop --force %[2]s` first (it destroys the "+
+			"paused guest and removes the record; `lv stop %[2]s` says whether the guest ran), then the %[1]s", op, vm)
 }

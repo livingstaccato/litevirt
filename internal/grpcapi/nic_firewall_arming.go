@@ -224,6 +224,7 @@ func (s *Server) NICStartGuard(ctx context.Context) lv.StartGuard {
 			// start's end (PausedDone) would drop the record of the one that
 			// is not finished. Asked first, so a refused start changes
 			// nothing (a hand-over record stays too).
+			s.dropStartRecordIfRunning(name)
 			if marked, merr := s.startPausedMarked(name); merr != nil || marked {
 				if active, aerr := s.virt.DomainIsActive(name); aerr != nil || active {
 					return false, s.startLeftPausedGuardRefusal(ctx, name)
@@ -253,6 +254,7 @@ func (s *Server) NICStartGuard(ctx context.Context) lv.StartGuard {
 		},
 		AfterPaused: func(name string) error { return s.readyGuestHere(ctx, name, startingHere) },
 		PausedDone:  s.unmarkStartPaused,
+		PausedKept:  func(name string, err error) { s.strandedStartKept(ctx, name, err) },
 	}
 }
 

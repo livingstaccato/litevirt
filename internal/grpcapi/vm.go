@@ -3096,6 +3096,19 @@ func (s *Server) stopMoveLeftLocked(ctx context.Context, vm *corrosion.VMRecord,
 // stopLocked is the stop itself. settlesMove says the caller is entitled to
 // stop a row recorded migrating (stopMoveLeftLocked).
 func (s *Server) stopLocked(ctx context.Context, vm *corrosion.VMRecord, force bool, timeoutSec int32, note string, settlesMove bool) (*pb.VM, error) {
+	// A paused guest cannot answer an ACPI shutdown (libvirt: "domain is not
+	// running"), and a plain stop never kills one: whatever paused it (an I/O
+	// error, partition pause, a hand-over, a start left paused), a kill loses
+	// what the guest has not flushed, if it ran. The plain stop is refused
+	// before anything runs, its PreStop hook included, saying why it is
+	// paused and that `lv stop --force` destroys it (rc9 lab F1, review C1,
+	// F7 m4). A start record whose domain runs is stale, and dropped.
+	if !force {
+		if st, serr := s.virt.DomainStateReason(vm.Name); serr == nil && st.Reason == "paused" {
+			return nil, status.Error(codes.FailedPrecondition, s.pausedStopRefusal(ctx, vm.Name, st.PausedReason))
+		}
+	}
+	s.dropStartRecordIfRunning(vm.Name)
 	hspec := vmHooks(vm)
 	pbVM := &pb.VM{Name: vm.Name, HostName: vm.HostName, State: pb.VMState_VM_STOPPING}
 	hooks.Run(ctx, hooks.PreStop, pbVM, hspec)
@@ -3125,17 +3138,6 @@ func (s *Server) stopLocked(ctx context.Context, vm *corrosion.VMRecord, force b
 		slog.Info("StopVM: the domain is already not running; nothing to stop", "vm", vm.Name, "op", op, "error", err)
 		noop = true
 		return true
-	}
-	// A paused guest cannot answer an ACPI shutdown (libvirt: "domain is not
-	// running"), and a plain stop never kills one: whatever paused it (an I/O
-	// error, partition pause, a hand-over, a start left paused), a kill loses
-	// what the guest has not flushed, if it ran. The plain stop is refused,
-	// saying why it is paused and that `lv stop --force` destroys it (rc9 lab
-	// F1, review C1).
-	if !force {
-		if st, serr := s.virt.DomainStateReason(vm.Name); serr == nil && st.Reason == "paused" {
-			return nil, status.Error(codes.FailedPrecondition, s.pausedStopRefusal(ctx, vm.Name, st.PausedReason))
-		}
 	}
 	if force {
 		if err := s.virt.DestroyDomain(vm.Name); err != nil && !alreadyStopped("destroy", err) {

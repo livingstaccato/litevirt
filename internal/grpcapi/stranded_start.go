@@ -11,10 +11,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
 // A start through the guard creates a guest with tap VLANs (or a guarded NIC
@@ -92,12 +94,32 @@ func (s *Server) ResumeStrandedStarts(ctx context.Context) {
 	if s.virt == nil || s.db == nil {
 		return
 	}
+	s.removeHalfWrittenStartRecords()
 	for _, vm := range s.startPausedRecords() {
 		if ctx.Err() != nil {
 			return
 		}
-		if st, err := s.virt.DomainStateReason(vm); err == nil && st.Reason != "paused" {
+		st, err := s.virt.DomainStateReason(vm)
+		switch {
+		case err != nil && lv.IsNotFound(err):
+			s.unmarkStartPaused(vm) // no such domain here: nothing to finish
+			continue
+		case err == nil && st.Reason != "paused":
 			s.unmarkStartPaused(vm) // it runs, or was stopped: the start ended
+			continue
+		}
+		if row, rerr := corrosion.GetVM(ctx, s.db, vm); rerr == nil && (row == nil || row.HostName != s.hostName) {
+			s.unmarkStartPaused(vm) // its VM is gone, or another host's now
+			continue
+		}
+		// The record's incarnation must be the domain's: a same-name domain
+		// of another uuid (deleted and created again since) is not this
+		// start's, and is never resumed by it. One whose uuid cannot be told
+		// is not either.
+		if want, rerr := s.startPausedUUID(vm); rerr != nil || want == "" || !s.domainIsUUID(vm, want) {
+			err := fmt.Errorf("its start record names another incarnation than the domain here, or none (record uuid %q)", want)
+			slog.Error("start guard: not finishing a paused start: "+err.Error(), "vm", vm)
+			s.judgeStrandedStart(ctx, vm, err)
 			continue
 		}
 		if !s.strandedStart(ctx, vm) {
@@ -105,7 +127,7 @@ func (s *Server) ResumeStrandedStarts(ctx context.Context) {
 				"vm", vm)
 			continue
 		}
-		err := s.readyGuestHere(ctx, vm, startingHere)
+		err = s.readyGuestHere(ctx, vm, startingHere)
 		if err == nil {
 			r, ok := s.virt.(interface{ ResumeDomain(string) error })
 			if !ok {
@@ -200,4 +222,13 @@ func (s *Server) judgeStrandedStart(ctx context.Context, vm string, problem erro
 	if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
 		slog.Warn("start guard: raise the stranded-start condition", "vm", vm, "error", err)
 	}
+}
+
+// domainIsUUID reports whether vm's domain here is the incarnation uuid.
+func (s *Server) domainIsUUID(vm, uuid string) bool {
+	x, err := s.virt.DumpXML(vm)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(lv.UUIDFromXML(x), uuid)
 }

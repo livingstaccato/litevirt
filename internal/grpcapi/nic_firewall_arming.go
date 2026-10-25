@@ -232,7 +232,7 @@ func (s *Server) NICStartGuard(ctx context.Context) lv.StartGuard {
 				// (ResumeStrandedStarts). Without it such a guest is only
 				// left paused, never resumed by the sweep: the start goes on.
 				if err := s.markStartPaused(name); err != nil {
-					slog.Warn("start guard: could not record a paused start; if this daemon dies before the resume, the guest stays paused",
+					slog.Error("start guard: could not record a paused start; if this daemon dies before the resume, the guest stays paused",
 						"vm", name, "error", err)
 				}
 				return true, nil

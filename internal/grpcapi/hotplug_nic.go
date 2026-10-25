@@ -120,6 +120,16 @@ func (s *Server) attachNICEntry(ctx context.Context, req *pb.AttachDeviceRequest
 	if spec.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "nic network name is required")
 	}
+	// A NIC's VLANs live on its host tap and are put there from the VM's
+	// spec (tap_vlans.go); an attach records the NIC in its rows only, so a
+	// trunk given here would never reach the tap and an access NIC would sit
+	// on VLAN 1, the bridge's untagged segment.
+	if len(spec.GetTrunk()) > 0 {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"a hot-attached NIC cannot carry trunk: VLANs (%v): they would never be put on its tap, and an access NIC would join "+
+				"the bridge's untagged segment instead of its VLAN; give the VM the NIC in its spec (a compose deploy) instead",
+			spec.GetTrunk())
+	}
 	if !s.operationProtocolActive(ctx) {
 		return nil, status.Error(codes.FailedPrecondition,
 			"nic attach requires the operation_protocol_v1 capability to be active")

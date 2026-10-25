@@ -718,6 +718,15 @@ type Server struct {
 	// network.EnsureBridge validation path.
 	bridgeEnsure func(name string) error
 
+	// netPreflight checks a VM's NICs' host wiring before it is defined or
+	// started (SetNetPreflight); nil = network.RunPreFlight.
+	netPreflight func([]network.PreFlightCheck) error
+
+	// bridgeVLANFiltering reads a bridge's VLAN filtering on this host, for
+	// the start preflight and bridge_vlan_filtering_off
+	// (SetBridgeVLANFiltering); nil = network.BridgeVLANFiltering.
+	bridgeVLANFiltering func(bridge string) (isBridge, on bool, err error)
+
 	// bridgeExists is a test seam for "does this bridge already exist on this
 	// host". Production leaves it nil, preserving network.BridgeExists.
 	bridgeExists func(name string) bool
@@ -1434,6 +1443,9 @@ type Server struct {
 	// creatingIncarnations names the VMs a create on this host is bringing
 	// up, with the uuid of the incarnation it creates (noteCreatingIncarnation).
 	creatingIncarnations sync.Map // vm name -> uuid
+	// pendingTapVLANs holds the tap VLANs of a guest a start on this host
+	// is bringing up before its row is written (notePendingTapVLANs).
+	pendingTapVLANs sync.Map // vm name -> *[]tapVLANNIC
 
 	// readyRead is Ready's one local read; nil means the real hosts-table
 	// query. A seam so a test can stand in for a read blocked on the client
@@ -1841,6 +1853,15 @@ func (s *Server) SetNetBoxMirrorInventory(on bool) { s.enfNetBoxMirror.Store(on)
 // SetBridgeEnsure injects the host-bridge test seam (see bridgeEnsure): a
 // rootless harness cannot create a real bridge, so it substitutes a no-op.
 func (s *Server) SetBridgeEnsure(fn func(name string) error) { s.bridgeEnsure = fn }
+
+// SetNetPreflight replaces the NIC host-wiring preflight (see netPreflight).
+func (s *Server) SetNetPreflight(fn func([]network.PreFlightCheck) error) { s.netPreflight = fn }
+
+// SetBridgeVLANFiltering replaces the read of a bridge's VLAN filtering on
+// this host (see bridgeVLANFiltering).
+func (s *Server) SetBridgeVLANFiltering(fn func(bridge string) (isBridge, on bool, err error)) {
+	s.bridgeVLANFiltering = fn
+}
 
 // SetDHCPReservationBackend injects the host-local DHCP facts an exact
 // reservation depends on (nic_identity.go): whether this host's dnsmasq

@@ -140,6 +140,15 @@ type NetworkDef struct {
 	// operator removed, and stays removed; a re-deploy of the network, which
 	// writes its definition verbatim, keeps the others (re-review m6).
 	KeptVLANs []int `yaml:"-"`
+	// AllowUnfilteredAccessVLANMoves lets `lv migrate` and `lv host drain`
+	// move a VM with an access-VLAN NIC (trunk: with one VLAN) on this
+	// network onto a host whose bridge does not filter VLANs — onto that
+	// bridge's untagged segment. Off by default. Never set from a compose
+	// file: only `lv network set --allow-unfiltered-access-vlan-moves`
+	// (admin, audited) sets it, and a re-deploy of the network keeps it.
+	// Omitted from the stored JSON while off, and an older node, which does
+	// not know the key, ignores it (it does not refuse such moves anyway).
+	AllowUnfilteredAccessVLANMoves bool `yaml:"-" json:",omitempty"`
 
 	// NetBoxPrefixID binds this network to a NetBox prefix. Zero means unbound,
 	// which is every network today.

@@ -515,6 +515,9 @@ func (s *Server) autoDefineRestoredVM(
 		// renders its NICs from here (nic_firewall_arming.go).
 		defer s.pendingNICs(targetName, spec.Uuid, ifaceRecords, nil)()
 	}
+	// Its NICs' VLANs go on its taps before it runs (NICStartGuard), read from
+	// here until its row is written.
+	defer s.pendingTapVLANsFor(ctx, targetName, spec, ifaceRecords)()
 	if err := s.virt.StartDomain(targetName); err != nil {
 		releaseHW()
 		// Roll back the definition but KEEP the overlay + NBD so the operator can

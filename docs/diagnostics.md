@@ -3197,6 +3197,83 @@ carries the reason:
 The pool returns to `active` and the condition resolves on the first check
 that finds the export mounted. Deleting the pool resolves it too.
 
+### A bridge cannot carry an access-VLAN NIC (`bridge_vlan_filtering_off`)
+
+A NIC with a `trunk:` of one VLAN is an access port, and needs a Linux bridge
+with VLAN filtering on: every start of its VM on a host whose bridge has it
+off is refused, a failover's included
+([networking.md](networking.md#vlan-trunk-mode)). Each host checks every 30 s
+which of its bridges is a Linux bridge with VLAN filtering off (or
+unreadable) while some VM of the cluster has an access-port NIC on a network
+using it, and raises `bridge_vlan_filtering_off` (evaluator `access_vlan`,
+subject `host/<bridge>@<host>`, warning; observed on the first such check,
+confirmed on the next) for each. The evidence names the bridge and the host,
+counts the VMs that cannot start there and lists up to ten of them, and says
+the fix. A bridge that does not exist on the host is reported too: litevirt
+would create it for a start there, without VLAN filtering. A device that is
+not a Linux bridge is not judged.
+
+While it is open, failover recovers such a VM onto a host whose bridge is not
+reported, when one qualifies; only when none does is it placed on a reported
+host, where its start is refused and the VM waits for the fix: it stays
+`pending` (or `starting`, for an onboot start), its detail naming the bridge,
+is tried again on every reconcile pass, and starts by itself once the bridge
+filters VLANs. A refused `lv start` or health restart is not retried: start
+the VM again with `lv start <vm>` after the fix. `lv migrate` and `lv host
+drain` never move such a VM onto a reported host: the target refuses the move
+before anything is copied, and a drain does not choose it, unless the VM's
+network allows it (`--allow-unfiltered-access-vlan-moves`, below).
+
+Fix it on the host the subject names: `ip link set dev <bridge> type bridge
+vlan_filtering 1`, with the VLAN on the bridge's uplink, and keep it across a
+reboot in what creates the bridge
+([networking.md](networking.md#access-vlan-nics-need-a-vlan-filtering-bridge)).
+The condition resolves on the first check that finds the bridge filtering
+VLANs, or no VM with an access-port NIC on it.
+
+### A network lets access-VLAN VMs move onto unfiltered bridges (`access_vlan_unfiltered_moves_allowed`)
+
+`lv network set <net> --allow-unfiltered-access-vlan-moves=true` (admin only,
+audited as `network.access_vlan_unfiltered_moves`) lets `lv migrate` and `lv
+host drain` move a VM with an access-VLAN NIC on that network onto a host whose
+bridge does not filter VLANs, or does not have the bridge yet, where the NIC
+joins the bridge's untagged segment. While it is on, `access_vlan_unfiltered_moves_allowed`
+(evaluator `access_vlan`, subject `network/<name>`, warning) is open for the
+network, and `lv doctor access-vlan-moves` lists it. Starts on such a bridge are
+still refused. Turn it off with `--allow-unfiltered-access-vlan-moves=false`;
+the condition resolves on the next check (every 30 s), or when the network is
+removed.
+
+### A start left paused (`vm_start_stranded_paused`)
+
+A start of a VM whose NICs need their tap VLANs (or a NIC guard under a tap
+libvirt names) creates the guest paused, readies it and then resumes it. If
+the daemon stopped in between, or the libvirt connection dropped so that
+neither the resume nor the destroy landed, the guest stays paused. Each such
+paused start is recorded on the host (under `start-paused/` in the data
+directory) before the guest is created, and the record is removed when the
+start ends. When the daemon starts again, before anything else can start a
+guest, it finishes each start that still has a record: the domain is paused,
+its row names this host as running or starting, and nothing else holds it (no
+partition pause mark on the domain, no partition pause record in memory, the
+reserve or the record directory, no hand-over, no firmware move; any of them
+unreadable counts as held). It puts the firewall and VLANs in force and resumes
+it. A domain paused without a record (by partition pause, a snapshot, an
+operator) is never resumed by it. One it cannot finish
+stays paused and is named by `vm_start_stranded_paused` (evaluator
+`start_guard`, subject `vm/<name>@<host>`, warning), with why. Fix the cause
+and `lv restart <vm>`, or `lv stop <vm> --force`. The condition resolves on
+the next check (every 30 s) that finds the guest running, stopped or gone.
+
+## `lv doctor access-vlan-moves`
+
+Read-only. Lists the networks that have `--allow-unfiltered-access-vlan-moves`
+on (see above).
+
+```
+lv doctor access-vlan-moves
+```
+
 ### Orphaned runtimes (`vm_orphan_runtime`, `ct_orphan_runtime`)
 
 Each host reports the workloads **litevirt created** that are still present on

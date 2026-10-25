@@ -972,6 +972,10 @@ func (c *Cluster) buildServer(n *Node) {
 	// snapshot layer, as the daemon wires it from its libvirt client
 	// (grpcapi/pit_copy.go). The fleet has no backup sessions.
 	n.Server.SetPointInTimeSnapshotter(n.Virt)
+	// Every domain start goes through the server's start guard, as the
+	// daemon wires it (daemon.Run): the guest's NIC firewall in force and its
+	// NICs' VLANs on its taps before it runs.
+	n.Virt.SetStartGuard(n.Server.NICStartGuard(c.ctx))
 
 	// Firmware state: the daemon gives its server one store, with NVRAM under
 	// the data dir and swtpm under libvirt's root. Every node here gets a swtpm

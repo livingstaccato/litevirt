@@ -924,6 +924,8 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 			}
 		}
 		defer s.pendingNICs(req.Target, cloneUUID, ifaceRecords, trunks)()
+		// So are its NICs' VLANs, put on its taps before it runs (NICStartGuard).
+		defer s.pendingTapVLANsFor(ctx, req.Target, &srcSpec, ifaceRecords)()
 		if err := s.virt.StartDomain(req.Target); err != nil {
 			rollbackClone(false)
 			return nil, status.Errorf(codes.Internal, "start clone: %v", err)

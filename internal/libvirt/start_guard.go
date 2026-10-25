@@ -16,9 +16,22 @@ import (
 // at start (vnetN) — and then the domain is started paused, AfterPaused runs
 // while it is paused, and only then does the guest run. An error from either
 // leaves the domain stopped.
+//
+// PausedDone, when set, runs once a start that Before paused has ended: the
+// guest resumed, or the domain destroyed (or never created). It is not called
+// for a start that was not paused. A daemon that dies before it runs leaves
+// whatever Before recorded for the paused start in place, which is how such a
+// start is found again (grpcapi.ResumeStrandedStarts).
 type StartGuard struct {
 	Before      func(name string) (pause bool, err error)
 	AfterPaused func(name string) error
+	PausedDone  func(name string)
+}
+
+func (g StartGuard) pausedDone(name string) {
+	if g.PausedDone != nil {
+		g.PausedDone(name)
+	}
 }
 
 func (g StartGuard) before(name string) (bool, error) {
@@ -116,6 +129,9 @@ func guardedStart(g StartGuard, name string, create func(paused bool) error, res
 	pause, err := g.before(name)
 	if err != nil {
 		return fmt.Errorf("start domain %s: %w", name, err)
+	}
+	if pause {
+		defer g.pausedDone(name)
 	}
 	if err := create(pause); err != nil {
 		return err

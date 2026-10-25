@@ -390,3 +390,38 @@ func TestMigrateVM_Fallback_CarriesTheWeight(t *testing.T) {
 		t.Errorf("no migrate event carried shares_weight=977: %v", fake.EventLog())
 	}
 }
+
+// The direct migration fallback neither hands the guest over paused nor asks
+// the target to put its NICs' VLANs on: a VM with a trunk NIC is not moved by
+// it (its access NIC would run on the target's VLAN 1), and stays running here.
+//
+// Mutation: drop the trunk refusal from the fallback — red.
+func TestVMChecker_MigrateFallbackRefusesATrunkVM(t *testing.T) {
+	db := testCheckVMDB(t)
+	ctx := context.Background()
+	for _, h := range []string{"host-a", "host-b"} {
+		if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{Name: h, State: "active", MemTotal: 32768}); err != nil {
+			t.Fatalf("InsertHost: %v", err)
+		}
+	}
+	spec := `{"network":[{"name":"accnet","mac":"52:54:00:aa:08:01","trunk":[30]}]}`
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "w", HostName: "host-a", State: "running", Spec: spec}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	fake := libvirtfake.New()
+	if err := fake.DefineDomain(`<domain type='kvm'><name>w</name></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetState("w", libvirtfake.StateRunning)
+	v := NewVMChecker("host-a", t.TempDir(), db, nil)
+	v.virt = fake
+	v.migrateVM(ctx, corrosion.VMRecord{Name: "w", HostName: "host-a", State: "running", Spec: spec})
+	for _, e := range fake.EventLog() {
+		if e.Op == "migrate" {
+			t.Fatalf("the fallback migrated a VM with a trunk NIC: %+v", e)
+		}
+	}
+	if vm, _ := corrosion.GetVM(ctx, db, "w"); vm == nil || vm.State != "running" {
+		t.Fatalf("w after the refused fallback: %+v, want running", vm)
+	}
+}

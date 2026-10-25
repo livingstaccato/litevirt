@@ -46,6 +46,18 @@ type Request struct {
 	// it: it counts only while the host runs the build that set it.
 	RequireNICGuards bool
 
+	// AvoidHosts are hosts this workload is known not to start on (host →
+	// why): passed over while any other host qualifies, and placed on only
+	// when none does, where the host's own start refusal then holds it. Set
+	// by failover for a VM with an access-VLAN NIC (bridge_vlan_filtering_off).
+	AvoidHosts map[string]string
+
+	// ExcludeHosts are hosts this workload must not be placed on (host →
+	// why): a hard rejection, named in NoEligibleHostError. Set by drain for
+	// a VM with an access-VLAN NIC (bridge_vlan_filtering_off): a move onto
+	// such a host is refused there, so it is no target.
+	ExcludeHosts map[string]string
+
 	// Soft preferences — violation = lower score but not excluded
 	PreferLabels map[string]string
 	Affinity     []string // VM names that should be on the same host
@@ -564,6 +576,9 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 
 		// Hard: USB passthrough. A raw device exists on one host; a mapped
 		// one on the hosts its mapping lists.
+		if why, ok := req.ExcludeHosts[h.Name]; ok {
+			failed = append(failed, why)
+		}
 		if req.USBHost != "" && h.Name != req.USBHost {
 			failed = append(failed, "usb device (a raw USB device is plugged into "+req.USBHost+")")
 		}
@@ -652,6 +667,7 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 		return nil, &NoEligibleHostError{VMName: req.VMName, Rejections: rejections,
 			NoContainerRuntime: req.Container && !anyContainerRuntime}
 	}
+	candidates = withoutAvoided(candidates, req.AvoidHosts)
 
 	// Sort by score descending; ties by fewest VMs then name (stable).
 	sort.SliceStable(candidates, func(i, j int) bool {
@@ -664,6 +680,24 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 		return candidates[i].host.Name < candidates[j].host.Name
 	})
 	return candidates, nil
+}
+
+// withoutAvoided drops the candidates in avoid, unless that would drop them
+// all.
+func withoutAvoided(c []hostCandidate, avoid map[string]string) []hostCandidate {
+	if len(avoid) == 0 {
+		return c
+	}
+	kept := make([]hostCandidate, 0, len(c))
+	for _, h := range c {
+		if _, ok := avoid[h.host.Name]; !ok {
+			kept = append(kept, h)
+		}
+	}
+	if len(kept) == 0 {
+		return c
+	}
+	return kept
 }
 
 func pickBest(c []hostCandidate) string {

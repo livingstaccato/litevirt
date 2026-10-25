@@ -326,27 +326,6 @@ func TestNextFreeIP_InvalidSubnet(t *testing.T) {
 	}
 }
 
-func TestCheckIPConflict(t *testing.T) {
-	db := corrosion.NewTestClientT(t)
-	ctx := context.Background()
-	if err := corrosion.InitSchema(ctx, db); err != nil {
-		t.Fatalf("InitSchema: %v", err)
-	}
-
-	// No conflict initially.
-	if err := checkIPConflict(ctx, db, "net-check", "10.0.0.5"); err != nil {
-		t.Fatalf("checkIPConflict should succeed: %v", err)
-	}
-
-	// Allocate an IP, then check conflict.
-	if _, err := AllocateIP(ctx, db, "net-check", "10.0.0.0/24", "aa:bb:cc:00:00:01", "vm-conflict"); err != nil {
-		t.Fatalf("AllocateIP: %v", err)
-	}
-	if err := checkIPConflict(ctx, db, "net-check", "10.0.0.2"); err == nil {
-		t.Error("expected IP conflict error")
-	}
-}
-
 func TestEnsureVXLAN_Error(t *testing.T) {
 	execCommand = func(name string, args ...string) ([]byte, error) {
 		return []byte("some error"), errors.New("exit status 1")

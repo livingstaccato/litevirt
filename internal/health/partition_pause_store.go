@@ -239,3 +239,22 @@ func RemovePauseRecord(dataDir, kind, name string) error {
 func WritePauseRecordForTests(dataDir string, rec PauseRecord) error {
 	return newPauseStore(dataDir).put(rec)
 }
+
+// WritePauseRecordToReserveForTests writes rec into the reserve layer only, as
+// the pauser does when the record directory cannot take it (a full data_dir),
+// and forgets this process's view of it, as a restarted daemon would: only the
+// reserve file holds it. Production never calls it.
+func WritePauseRecordToReserveForTests(dataDir string, rec PauseRecord) error {
+	s := newPauseStore(dataDir)
+	if err := s.ensureReserve(); err != nil {
+		return err
+	}
+	s.st.mu.Lock()
+	g := s.st.gen[rec.Key()]
+	s.st.mu.Unlock()
+	if err := s.putReserve(rec, g); err != nil {
+		return err
+	}
+	forgetPauseProcessStateForTests(dataDir)
+	return nil
+}

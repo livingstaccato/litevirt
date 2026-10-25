@@ -1546,6 +1546,9 @@ func restoreWithRetry(v snapshotAPI, g StartGuard, fg FirmwareMoveGuard, domainN
 		_ = v.DomainDestroy(dom)
 		return fmt.Errorf("restore %s: %w", domainName, gerr)
 	}
+	if pause {
+		defer g.pausedDone(domainName)
+	}
 	// Before armed it already when it did not ask for the paused step (its
 	// NICs name their taps); one pass is enough (re-review m3).
 	if pause {

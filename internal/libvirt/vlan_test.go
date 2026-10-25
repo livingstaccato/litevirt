@@ -2,6 +2,8 @@ package libvirt
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -19,118 +21,224 @@ func fakeVirshDumpXML(mac, tapDev string) []byte {
 </domain>`, mac, tapDev))
 }
 
-func TestConfigureVLANTap_callsBridgeVlanAdd(t *testing.T) {
-	const (
-		domain = "testvm"
-		mac    = "52:54:00:aa:bb:cc"
-		tapDev = "vnet0"
-		vlanID = 42
-	)
-
-	// findTapDevice uses go-libvirt (requires live connection), so we test
-	// the bridge VLAN logic directly via configureAccessBridgeVLAN with a
-	// fake execVLAN. The XML parsing logic is tested in vlan_parse_test.go.
-
-	var recorded [][]string
-
-	// Override execVLAN to capture bridge vlan add calls.
+// fakeBridgeVLAN answers `bridge vlan show dev <tap>` with the VLANs given
+// (iproute2's layout: a header, the tap's name on its first VLAN's line) and
+// records every add and del.
+func fakeBridgeVLAN(t *testing.T, tapDev string, have ...string) *[]string {
+	t.Helper()
 	orig := execVLAN
-	defer func() { execVLAN = orig }()
-
+	t.Cleanup(func() { execVLAN = orig })
+	var calls []string
 	execVLAN = func(name string, args ...string) ([]byte, error) {
-		recorded = append(recorded, append([]string{name}, args...))
+		if len(args) >= 2 && args[0] == "vlan" && args[1] == "show" {
+			out := "port              vlan-id\n"
+			for i, v := range have {
+				if i == 0 {
+					out += tapDev + "             " + v + "\n"
+				} else {
+					out += "                  " + v + "\n"
+				}
+			}
+			return []byte(out), nil
+		}
+		calls = append(calls, name+" "+strings.Join(args, " "))
 		return nil, nil
 	}
-
-	// Call the internal bridge-add logic directly by bypassing findTapDevice.
-	// We test configureTrunkBridgeVLANs which is the core of ConfigureTrunkTap.
-	vlanIDs := []int{10, 20, 30}
-	if err := configureTrunkBridgeVLANs(tapDev, vlanIDs); err != nil {
-		t.Fatalf("configureTrunkBridgeVLANs: %v", err)
-	}
-
-	if len(recorded) != len(vlanIDs) {
-		t.Fatalf("expected %d bridge calls, got %d", len(vlanIDs), len(recorded))
-	}
-
-	for i, vid := range vlanIDs {
-		call := recorded[i]
-		if call[0] != "bridge" {
-			t.Errorf("call %d: expected binary 'bridge', got %q", i, call[0])
-		}
-		vidStr := fmt.Sprintf("%d", vid)
-		found := false
-		for _, arg := range call {
-			if arg == vidStr {
-				found = true
-			}
-		}
-		if !found {
-			t.Errorf("call %d: VID %d not found in args %v", i, vid, call)
-		}
-		// Trunk mode must NOT include pvid or untagged flags.
-		for _, arg := range call {
-			if strings.EqualFold(arg, "pvid") || strings.EqualFold(arg, "untagged") {
-				t.Errorf("call %d: trunk mode should not have %q flag, args: %v", i, arg, call)
-			}
-		}
-	}
-	_ = domain
-	_ = mac
-	_ = vlanID
+	return &calls
 }
 
-func TestConfigureVLANTap_pvid_untagged(t *testing.T) {
-	const tapDev = "vnet1"
+// On a fresh tap (VLAN 1 only, the bridge's default pvid) every trunk VLAN is
+// added tagged — no pvid, no untagged — and VLAN 1 stays.
+func TestNegotiateTrunkVLANs_FreshTapAddsEachVLANTagged(t *testing.T) {
+	calls := fakeBridgeVLAN(t, "vnet0", "1 PVID Egress Untagged")
+	if err := negotiateTrunkVLANs("vnet0", []int{10, 20, 30}); err != nil {
+		t.Fatalf("negotiateTrunkVLANs: %v", err)
+	}
+	want := []string{
+		"bridge vlan add dev vnet0 vid 10",
+		"bridge vlan add dev vnet0 vid 20",
+		"bridge vlan add dev vnet0 vid 30",
+	}
+	if strings.Join(*calls, "|") != strings.Join(want, "|") {
+		t.Fatalf("calls = %q, want %q", *calls, want)
+	}
+}
 
-	var recorded [][]string
-	orig := execVLAN
-	defer func() { execVLAN = orig }()
-	execVLAN = func(name string, args ...string) ([]byte, error) {
-		recorded = append(recorded, append([]string{name}, args...))
-		return nil, nil
+// A tap that carries VLANs the trunk no longer has is converged: those are
+// removed (VLAN 1 is kept), the missing ones added, the ones it has left as
+// they are. Re-applying to a converged tap does nothing.
+//
+// Mutations: skip the removal — red; add every desired VLAN whether present
+// or not — red.
+func TestNegotiateTrunkVLANs_ConvergesAStaleTap(t *testing.T) {
+	calls := fakeBridgeVLAN(t, "vnet0", "1 PVID Egress Untagged", "100", "200")
+	if err := negotiateTrunkVLANs("vnet0", []int{100, 300}); err != nil {
+		t.Fatalf("negotiateTrunkVLANs: %v", err)
+	}
+	want := []string{
+		"bridge vlan del dev vnet0 vid 200",
+		"bridge vlan add dev vnet0 vid 300",
+	}
+	if strings.Join(*calls, "|") != strings.Join(want, "|") {
+		t.Fatalf("calls = %q, want %q", *calls, want)
 	}
 
-	if err := configureAccessBridgeVLAN(tapDev, 100); err != nil {
+	calls = fakeBridgeVLAN(t, "vnet0", "1 PVID Egress Untagged", "100", "300")
+	if err := negotiateTrunkVLANs("vnet0", []int{100, 300}); err != nil {
+		t.Fatalf("negotiateTrunkVLANs on a converged tap: %v", err)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("a converged tap was changed: %q", *calls)
+	}
+}
+
+// A fresh access tap (VLAN 1 as pvid, untagged: the bridge's default_pvid)
+// becomes a port on its VLAN alone. Adding the VLAN as pvid moved only the
+// pvid flag, so the tap was left with "1 Egress Untagged" beside
+// "30 PVID Egress Untagged" (lab 2 drill 6): the bridge's VLAN-1 floods
+// reached the guest. The VLAN is added before VLAN 1 is removed, so the port
+// always has a pvid.
+//
+// Mutations: skip the removal — red; remove before adding — red.
+func TestConfigureAccessBridgeVLAN_TapCarriesOnlyItsVLAN(t *testing.T) {
+	calls := fakeBridgeVLAN(t, "vnet1", "1 PVID Egress Untagged")
+	if err := configureAccessBridgeVLAN("vnet1", 30); err != nil {
 		t.Fatalf("configureAccessBridgeVLAN: %v", err)
 	}
-
-	if len(recorded) != 1 {
-		t.Fatalf("expected 1 bridge call, got %d", len(recorded))
+	want := []string{
+		"bridge vlan add dev vnet1 vid 30 pvid untagged",
+		"bridge vlan del dev vnet1 vid 1",
 	}
-
-	call := recorded[0]
-	hasPVID := false
-	hasUntagged := false
-	for _, arg := range call {
-		if arg == "pvid" {
-			hasPVID = true
-		}
-		if arg == "untagged" {
-			hasUntagged = true
-		}
-	}
-	if !hasPVID {
-		t.Errorf("access mode should have pvid flag; args: %v", call)
-	}
-	if !hasUntagged {
-		t.Errorf("access mode should have untagged flag; args: %v", call)
+	if strings.Join(*calls, "|") != strings.Join(want, "|") {
+		t.Fatalf("calls = %q, want %q", *calls, want)
 	}
 }
 
-func TestConfigureTrunkTap_emptyVlanIDs(t *testing.T) {
-	var called int
-	orig := execVLAN
-	defer func() { execVLAN = orig }()
-	execVLAN = func(name string, args ...string) ([]byte, error) {
-		called++
-		return nil, nil
+// Re-applying (a start, a live migration's target, the periodic convergence)
+// converges a tap that still has VLAN 1 or another VLAN, and leaves a
+// converged one as it is, with no write at all: the convergence reads every
+// running access tap on a timer.
+//
+// Mutation: drop the converged check — red (a converged tap is written).
+func TestConfigureAccessBridgeVLAN_ReapplyConverges(t *testing.T) {
+	calls := fakeBridgeVLAN(t, "vnet1", "1 Egress Untagged", "30 PVID Egress Untagged", "40")
+	if err := configureAccessBridgeVLAN("vnet1", 30); err != nil {
+		t.Fatalf("configureAccessBridgeVLAN: %v", err)
+	}
+	want := []string{
+		"bridge vlan add dev vnet1 vid 30 pvid untagged",
+		"bridge vlan del dev vnet1 vid 1",
+		"bridge vlan del dev vnet1 vid 40",
+	}
+	if strings.Join(*calls, "|") != strings.Join(want, "|") {
+		t.Fatalf("calls = %q, want %q", *calls, want)
 	}
 
-	if err := configureTrunkBridgeVLANs("vnet2", nil); err != nil {
+	calls = fakeBridgeVLAN(t, "vnet1", "30 PVID Egress Untagged")
+	if err := configureAccessBridgeVLAN("vnet1", 30); err != nil {
+		t.Fatalf("configureAccessBridgeVLAN on a converged tap: %v", err)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("a converged tap: calls = %q, want none", *calls)
+	}
+}
+
+// A tap carrying its VLAN tagged only, or as pvid but egress tagged, is not
+// an access port yet: the VLAN is added again as pvid, untagged.
+//
+// Mutation: accessConverged ignoring the flags — red.
+func TestConfigureAccessBridgeVLAN_FlagsCount(t *testing.T) {
+	for _, have := range []string{"30", "30 PVID", "30 Egress Untagged"} {
+		calls := fakeBridgeVLAN(t, "vnet1", have)
+		if err := configureAccessBridgeVLAN("vnet1", 30); err != nil {
+			t.Fatalf("%q: %v", have, err)
+		}
+		if want := []string{"bridge vlan add dev vnet1 vid 30 pvid untagged"}; strings.Join(*calls, "|") != strings.Join(want, "|") {
+			t.Fatalf("tap with %q: calls = %q, want %q", have, *calls, want)
+		}
+	}
+}
+
+// An access port on VLAN 1 keeps VLAN 1, and a fresh tap already is one.
+func TestConfigureAccessBridgeVLAN_VLAN1KeepsIt(t *testing.T) {
+	calls := fakeBridgeVLAN(t, "vnet1", "1 PVID Egress Untagged")
+	if err := configureAccessBridgeVLAN("vnet1", 1); err != nil {
+		t.Fatalf("configureAccessBridgeVLAN: %v", err)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("calls = %q, want none", *calls)
+	}
+}
+
+// Both layouts iproute2 has printed: a tab-separated "vlan ids" header with a
+// leading space before each VLAN, and the aligned "vlan-id" one. A port name
+// is never read as a VLAN.
+func TestParseTapVLANEntries(t *testing.T) {
+	for name, out := range map[string]string{
+		"old": "port\tvlan ids\nvnet3\t 1 PVID Egress Untagged\n\t 30\n\t 4000 Egress Untagged\n\n",
+		"new": "port              vlan-id  \nvnet3             1 PVID Egress Untagged\n                  30\n                  4000 Egress Untagged\n",
+	} {
+		got := parseTapVLANEntries(out)
+		want := []tapVLAN{{1, true, true}, {30, false, false}, {4000, false, true}}
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("%s: got %+v, want %+v", name, got, want)
+		}
+	}
+	if got := parseTapVLANEntries("port vlan-id\n7abc 30 PVID\n"); len(got) != 1 || got[0].vid != 30 || !got[0].pvid {
+		t.Errorf("a port name that starts with a digit: got %+v, want VLAN 30 pvid", got)
+	}
+}
+
+// No trunk VLANs on a fresh tap: nothing to add or remove.
+func TestNegotiateTrunkVLANs_EmptyList(t *testing.T) {
+	calls := fakeBridgeVLAN(t, "vnet2", "1 PVID Egress Untagged")
+	if err := negotiateTrunkVLANs("vnet2", nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if called != 0 {
-		t.Errorf("expected no bridge calls for empty vlanIDs, got %d", called)
+	if len(*calls) != 0 {
+		t.Errorf("expected no bridge changes for an empty VLAN list, got %q", *calls)
+	}
+}
+
+// tapMasterVLANFiltering follows the tap's master link and reads that
+// bridge's vlan_filtering; a tap with no master, or a master that is not a
+// bridge, is an error, never a guess.
+func TestTapMasterVLANFiltering(t *testing.T) {
+	root := t.TempDir()
+	orig := tapSysClassNet
+	tapSysClassNet = root
+	t.Cleanup(func() { tapSysClassNet = orig })
+	mk := func(p, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(root, p)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if content != "" {
+			if err := os.WriteFile(filepath.Join(root, p), []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	mk("brf/bridge/vlan_filtering", "1\n")
+	mk("bru/bridge/vlan_filtering", "0\n")
+	mk("eth0/x", "")
+	for tap, master := range map[string]string{"vnet0": "brf", "vnet1": "bru", "vnet3": "eth0"} {
+		mk(tap+"/x", "")
+		if err := os.Symlink("../"+master, filepath.Join(root, tap, "master")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("vnet2/x", "")
+	if m, on, err := tapMasterVLANFiltering("vnet0"); err != nil || m != "brf" || !on {
+		t.Errorf("vnet0: %q %v %v", m, on, err)
+	}
+	if m, on, err := tapMasterVLANFiltering("vnet1"); err != nil || m != "bru" || on {
+		t.Errorf("vnet1: %q %v %v", m, on, err)
+	}
+	if _, _, err := tapMasterVLANFiltering("vnet2"); err == nil {
+		t.Error("vnet2 has no master: no error")
+	}
+	if _, _, err := tapMasterVLANFiltering("vnet3"); err == nil {
+		t.Error("vnet3's master is not a bridge: no error")
 	}
 }

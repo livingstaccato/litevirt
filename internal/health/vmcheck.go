@@ -1012,6 +1012,15 @@ func (v *VMChecker) migrateVM(ctx context.Context, vm corrosion.VMRecord) {
 			"vm", vm.Name, "target", target.Name)
 		return
 	}
+	// Nor a VM with a trunk NIC: its VLANs live on its taps, and this
+	// fallback neither hands the guest over paused nor asks the target to
+	// put them on, so an access NIC would run on the target's VLAN 1. A
+	// spec that cannot be read is refused the same way.
+	if spec := (&pb.VMSpec{}); json.Unmarshal([]byte(vm.Spec), spec) != nil || specHasTrunkNIC(spec) {
+		slog.Error("vmcheck: the health-check migrate fallback does not move a VM with a trunk: NIC (or an unreadable spec); it stays here",
+			"vm", vm.Name, "target", target.Name)
+		return
+	}
 
 	if err := corrosion.UpdateVMState(ctx, v.db, vm.Name, "migrating", fmt.Sprintf("health check → %s", target.Name)); err != nil {
 		v.noteStateWriteFail(corrosion.OpVMState, err)
@@ -1403,4 +1412,14 @@ func haHoldsHealthAction(ctx context.Context, db *corrosion.Client) string {
 		return "cluster HA is disarmed (lv cluster ha)"
 	}
 	return ""
+}
+
+// specHasTrunkNIC reports whether spec has a NIC on the `trunk:` feature.
+func specHasTrunkNIC(spec *pb.VMSpec) bool {
+	for _, n := range spec.GetNetwork() {
+		if len(n.GetTrunk()) > 0 {
+			return true
+		}
+	}
+	return false
 }

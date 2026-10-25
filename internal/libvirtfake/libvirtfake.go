@@ -293,6 +293,18 @@ type Fake struct {
 	// and its error is returned — a dead or restarting libvirt connection. It
 	// may also block, to model a hung libvirtd.
 	FailRunningDomainTaps func() error
+	// FailConfigureVLANTap, when set, runs at the start of ConfigureVLANTap
+	// and fails it with what it returns: a tap the host cannot put on its
+	// access VLAN.
+	FailConfigureVLANTap func(domain, mac string, vlan int) error
+	// FailPartitionPauseMark, when set, fails PartitionPauseMark with what
+	// it returns: a mark that cannot be read.
+	FailPartitionPauseMark func(name string) error
+	// TapMaster, when set, answers TapMasterVLANFiltering: the bridge the
+	// NIC's tap is enslaved to and whether it filters VLANs. Unset, a tap's
+	// master is the bridge its live definition names (else "fakebr0"), and
+	// it filters.
+	TapMaster func(domain, mac string) (master string, filtering bool, err error)
 	// FailCreateLiveSnapshot fires AFTER the disk overlay has cut over, modeling a
 	// RAM-save/capture failure that leaves the VM on an overlay.
 	FailCreateLiveSnapshot func(domain, snap string) error
@@ -942,6 +954,9 @@ func (f *Fake) StartDomain(name string) error {
 			return fmt.Errorf("start domain %s: %w", name, err)
 		}
 		pause = p
+	}
+	if pause && g.PausedDone != nil {
+		defer g.PausedDone(name)
 	}
 	if err := f.startDomain(name, pause); err != nil {
 		// As libvirt.Client.StartDomain (startWithConsoleBackstop): a start QEMU
@@ -3261,17 +3276,74 @@ func (f *Fake) PoolDestroyIfDefined(name string) error {
 	return nil
 }
 
+// ConfigureVLANTap mirrors libvirt.Client.ConfigureVLANTap: it needs the
+// domain active (only then has its NIC a tap), and FailConfigureVLANTap can
+// refuse it.
 func (f *Fake) ConfigureVLANTap(domainName, bridge, mac string, vlanID int) error {
 	defer f.daemon()()
+	if hook := f.FailConfigureVLANTap; hook != nil {
+		if err := hook(domainName, mac, vlanID); err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if st := f.domains[domainName]; st != StateRunning && st != StatePaused {
+		return fmt.Errorf("find tap for %s/%s: libvirtfake: domain is not active, so its NIC has no tap", domainName, mac)
+	}
 	f.record("vlan-tap", domainName, fmt.Sprintf("bridge=%s mac=%s vlan=%d", bridge, mac, vlanID))
 	return nil
 }
-func (f *Fake) ConfigureTrunkTap(domainName, bridge, mac string, vlanIDs []int) error {
+
+// TapMasterVLANFiltering mirrors libvirt.Client.TapMasterVLANFiltering: the
+// domain must be active (only then has its NIC a tap); TapMaster decides the
+// answer when set.
+func (f *Fake) TapMasterVLANFiltering(domainName, mac string) (string, bool, error) {
+	defer f.daemon()()
+	f.mu.Lock()
+	st := f.domains[domainName]
+	live := f.liveXMLLocked(domainName)
+	f.mu.Unlock()
+	if st != StateRunning && st != StatePaused {
+		return "", false, fmt.Errorf("find tap for %s/%s: libvirtfake: domain is not active, so its NIC has no tap", domainName, mac)
+	}
+	if hook := f.TapMaster; hook != nil {
+		return hook(domainName, mac)
+	}
+	if br := fakeNICBridge(live, mac); br != "" {
+		return br, true, nil
+	}
+	return "fakebr0", true, nil
+}
+
+// fakeNICBridge is the source bridge of the interface with mac in a domain
+// definition, or "".
+func fakeNICBridge(x, mac string) string {
+	for _, el := range fakeIfaceElem.FindAllString(x, -1) {
+		if !strings.Contains(strings.ToLower(el), strings.ToLower(mac)) {
+			continue
+		}
+		if m := fakeSourceBridge.FindStringSubmatch(el); m != nil {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+var (
+	fakeIfaceElem    = regexp.MustCompile(`(?s)<interface\b.*?</interface>`)
+	fakeSourceBridge = regexp.MustCompile(`<source\b[^>]*\bbridge=['"]([^'"]+)['"]`)
+)
+
+// NegotiateTrunkVLANs mirrors libvirt.Client.NegotiateTrunkVLANs, the domain
+// active as ConfigureVLANTap needs it.
+func (f *Fake) NegotiateTrunkVLANs(domainName, bridge, mac string, vlanIDs []int) error {
 	defer f.daemon()()
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if st := f.domains[domainName]; st != StateRunning && st != StatePaused {
+		return fmt.Errorf("find tap for %s/%s: libvirtfake: domain is not active, so its NIC has no tap", domainName, mac)
+	}
 	f.record("trunk-tap", domainName, fmt.Sprintf("bridge=%s mac=%s vlans=%v", bridge, mac, vlanIDs))
 	return nil
 }

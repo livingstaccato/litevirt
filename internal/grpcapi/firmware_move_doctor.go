@@ -1575,6 +1575,7 @@ func (s *Server) doctorAcceptSourceAfterCommit(ctx context.Context, m fwmig.Mark
 // convergeMovedGuest is the part of a migration's finish that does not need
 // the other host, for a VM whose copy now lives on `on` (this host) after
 // living on `from`: each VXLAN NIC's FDB entry pointed at on's VTEP, the
+// VLANs of a running guest's NICs put on its taps here (applyTapVLANs), the
 // gateways of a guest that runs here announced out of this host's bridges
 // (announceGatewaysOf, what AnnounceMigratedGuest does on a live move's
 // target), and the stack's LB backends refreshed.
@@ -1585,6 +1586,9 @@ func (s *Server) convergeMovedGuest(ctx context.Context, vm *corrosion.VMRecord,
 		s.updateFDBForMigration(ctx, iface, from, on)
 	}
 	if running {
+		if err := s.applyTapVLANs(ctx, vm.Name); err != nil {
+			slog.Error("move: a running guest's NIC VLANs are not on its taps here; ConvergeTapVLANs retries", "vm", vm.Name, "error", err)
+		}
 		go s.announceGatewaysOf(ctx, vm.Name)
 	}
 	go s.refreshLBForStack(context.Background(), vm.StackName)

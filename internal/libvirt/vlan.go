@@ -3,7 +3,10 @@ package libvirt
 import (
 	"encoding/xml"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -13,9 +16,9 @@ var execVLAN = func(name string, args ...string) ([]byte, error) {
 	return exec.Command(name, args...).CombinedOutput()
 }
 
-// ConfigureVLANTap finds the tap interface for a domain's network interface
-// and sets the VLAN tag using `bridge vlan add`.
-// bridge: Linux bridge name, mac: MAC of the VM interface, vlanID: VLAN tag (1–4094).
+// ConfigureVLANTap makes the tap of a domain's NIC (matched by MAC) an access
+// port on vlanID (1-4094): vlanID is its pvid, egress untagged, and the only
+// VLAN it carries (configureAccessBridgeVLAN).
 //
 // Method form so the call site can go through grpcapi.LibvirtBackend
 // (and the fleet's fake libvirt can stub it). The package-level alias
@@ -25,11 +28,38 @@ func (c *Client) ConfigureVLANTap(domainName, bridge, mac string, vlanID int) er
 	if err != nil {
 		return fmt.Errorf("find tap for %s/%s: %w", domainName, mac, err)
 	}
-
-	// bridge vlan add dev <tap> vid <vlan> pvid untagged
-	// pvid: ingress untagged frames get this VLAN
-	// untagged: egress frames are stripped of the tag (VM sees untagged traffic)
 	return configureAccessBridgeVLAN(tapDev, vlanID)
+}
+
+// TapMasterVLANFiltering reads, from the kernel, the bridge the tap of a
+// domain's NIC (matched by MAC) is actually enslaved to, and whether that
+// bridge filters VLANs. It is what an access port's VLAN depends on: a bridge
+// that does not filter ignores the tap's pvid. Any answer it cannot read is an
+// error, never a guess: the tap has no master, the master is not a Linux
+// bridge, or its vlan_filtering cannot be read.
+func (c *Client) TapMasterVLANFiltering(domainName, mac string) (master string, filtering bool, err error) {
+	tapDev, err := findTapDevice(c, domainName, mac)
+	if err != nil {
+		return "", false, fmt.Errorf("find tap for %s/%s: %w", domainName, mac, err)
+	}
+	return tapMasterVLANFiltering(tapDev)
+}
+
+// tapSysClassNet is /sys/class/net; a var so tests can point it elsewhere.
+var tapSysClassNet = "/sys/class/net"
+
+// tapMasterVLANFiltering is TapMasterVLANFiltering on a known tap.
+func tapMasterVLANFiltering(tapDev string) (string, bool, error) {
+	link, err := os.Readlink(filepath.Join(tapSysClassNet, tapDev, "master"))
+	if err != nil {
+		return "", false, fmt.Errorf("tap %s: cannot read the bridge it is enslaved to: %w", tapDev, err)
+	}
+	master := filepath.Base(link)
+	data, err := os.ReadFile(filepath.Join(tapSysClassNet, master, "bridge", "vlan_filtering"))
+	if err != nil {
+		return master, false, fmt.Errorf("tap %s: cannot read whether its master %s filters VLANs (is it a Linux bridge?): %w", tapDev, master, err)
+	}
+	return master, strings.TrimSpace(string(data)) == "1", nil
 }
 
 // TapDevice returns the host-side tap interface name for a domain's NIC
@@ -41,18 +71,6 @@ func (c *Client) TapDevice(domainName, mac string) (string, error) {
 	return findTapDevice(c, domainName, mac)
 }
 
-// ConfigureTrunkTap sets up a tap interface for VLAN trunk mode.
-// All listed VLAN IDs are added without pvid/untagged — the VM sends and
-// receives tagged frames and handles its own VLAN demux.
-func (c *Client) ConfigureTrunkTap(domainName, bridge, mac string, vlanIDs []int) error {
-	tapDev, err := findTapDevice(c, domainName, mac)
-	if err != nil {
-		return fmt.Errorf("find tap for %s/%s: %w", domainName, mac, err)
-	}
-
-	return configureTrunkBridgeVLANs(tapDev, vlanIDs)
-}
-
 // ConfigureVLANTap (package func) is retained for direct callers that
 // don't want to dereference a *Client method (e.g. test fixtures that
 // call configureAccessBridgeVLAN's wrapper). Prefer the method form.
@@ -60,49 +78,77 @@ func ConfigureVLANTap(c *Client, domainName, bridge, mac string, vlanID int) err
 	return c.ConfigureVLANTap(domainName, bridge, mac, vlanID)
 }
 
-func ConfigureTrunkTap(c *Client, domainName, bridge, mac string, vlanIDs []int) error {
-	return c.ConfigureTrunkTap(domainName, bridge, mac, vlanIDs)
-}
-
-// configureAccessBridgeVLAN applies a single access-mode VLAN (pvid+untagged) to a tap device.
-// This is the inner logic of ConfigureVLANTap, extracted so tests can call it without libvirt.
+// configureAccessBridgeVLAN converges tapDev to an access port on vlanID: the
+// only VLAN it carries, as pvid, egress untagged (ingress untagged frames join
+// it, egress frames leave untagged).
+//
+// The removal matters for VLAN 1. A new port of a VLAN-filtering bridge
+// carries VLAN 1 as pvid, untagged (the bridge's default_pvid); adding vlanID
+// as pvid moves only the pvid flag, so VLAN 1 stayed on the tap egress
+// untagged, and the bridge's VLAN-1 broadcasts and unknown unicast reached
+// the guest beside its own VLAN's.
+//
+// It reads the tap first, and a tap already converged is left as it is, with
+// no write: the reconciler converges every running access tap on a timer
+// (grpcapi.ConvergeTapVLANs), so a converged tap must cost one read. Otherwise
+// vlanID is added before anything is removed, so the port is never without a
+// pvid, and then every other VLAN the tap carried is removed.
+//
+// Extracted from ConfigureVLANTap so tests can call it without libvirt.
 func configureAccessBridgeVLAN(tapDev string, vlanID int) error {
+	current, err := readTapVLANEntries(tapDev)
+	if err != nil {
+		return err
+	}
+	if accessConverged(current, vlanID) {
+		return nil
+	}
 	out, err := execVLAN("bridge", "vlan", "add", "dev", tapDev,
 		"vid", fmt.Sprintf("%d", vlanID), "pvid", "untagged")
 	if err != nil {
 		return fmt.Errorf("bridge vlan add %s vid %d: %w: %s", tapDev, vlanID, err, out)
 	}
-	return nil
-}
-
-// configureTrunkBridgeVLANs applies trunk-mode VLANs (no pvid/untagged) to a tap device.
-// This is the inner logic of ConfigureTrunkTap, extracted so tests can call it without libvirt.
-func configureTrunkBridgeVLANs(tapDev string, vlanIDs []int) error {
-	for _, vid := range vlanIDs {
-		out, err := execVLAN("bridge", "vlan", "add", "dev", tapDev,
-			"vid", fmt.Sprintf("%d", vid))
+	for _, e := range current {
+		if e.vid == vlanID {
+			continue
+		}
+		out, err := execVLAN("bridge", "vlan", "del", "dev", tapDev, "vid", fmt.Sprintf("%d", e.vid))
 		if err != nil {
-			return fmt.Errorf("bridge vlan add %s vid %d (trunk): %w: %s", tapDev, vid, err, out)
+			return fmt.Errorf("bridge vlan del %s vid %d (access port on VLAN %d): %w: %s", tapDev, e.vid, vlanID, err, out)
 		}
 	}
 	return nil
 }
 
-// NegotiateTrunkVLANs reads the current VLANs on a tap, computes a diff against
-// desiredVLANs, and applies adds/removes to converge to the desired state.
-func NegotiateTrunkVLANs(c *Client, domainName, bridge, mac string, desiredVLANs []int) error {
+// accessConverged reports whether a tap carrying entries is already an access
+// port on vlanID: that VLAN alone, as pvid, egress untagged.
+func accessConverged(entries []tapVLAN, vlanID int) bool {
+	return len(entries) == 1 && entries[0].vid == vlanID && entries[0].pvid && entries[0].untagged
+}
+
+// NegotiateTrunkVLANs converges the tap of a domain's NIC (matched by MAC) to
+// trunk mode on exactly desiredVLANs: it reads the VLANs the tap carries,
+// removes those not desired, and adds the missing ones, tagged (no pvid or
+// untagged flag), so the guest sends and receives tagged frames and handles
+// its own VLAN demux. VLAN 1, the bridge's default pvid, is left as it is: it
+// carries the NIC's untagged (native) frames.
+//
+// Idempotent, so a caller re-applies it to a tap whatever it carries: a fresh
+// one at a start, or one a live migration's target created.
+//
+// Method form so the call site can go through grpcapi.LibvirtBackend (and the
+// fleet's fake libvirt can stub it).
+func (c *Client) NegotiateTrunkVLANs(domainName, bridge, mac string, desiredVLANs []int) error {
 	tapDev, err := findTapDevice(c, domainName, mac)
 	if err != nil {
 		return fmt.Errorf("find tap for %s/%s: %w", domainName, mac, err)
 	}
+	return negotiateTrunkVLANs(tapDev, desiredVLANs)
+}
 
-	// Ensure vlan_filtering is enabled on the bridge.
-	out, err := execVLAN("bridge", "vlan", "show", "dev", bridge)
-	if err != nil {
-		return fmt.Errorf("bridge vlan show %s: %w: %s", bridge, err, out)
-	}
-
-	// Read current VLANs on the tap device.
+// negotiateTrunkVLANs is NegotiateTrunkVLANs on a known tap, so tests can call
+// it without libvirt.
+func negotiateTrunkVLANs(tapDev string, desiredVLANs []int) error {
 	current, err := readTapVLANs(tapDev)
 	if err != nil {
 		return err
@@ -131,10 +177,11 @@ func NegotiateTrunkVLANs(c *Client, domainName, bridge, mac string, desiredVLANs
 	// Add VLANs not yet present.
 	for _, v := range desiredVLANs {
 		if !currentSet[v] {
+			currentSet[v] = true // a VLAN listed twice is added once
 			out, err := execVLAN("bridge", "vlan", "add", "dev", tapDev,
 				"vid", fmt.Sprintf("%d", v))
 			if err != nil {
-				return fmt.Errorf("bridge vlan add %s vid %d: %w: %s", tapDev, v, err, out)
+				return fmt.Errorf("bridge vlan add %s vid %d (trunk): %w: %s", tapDev, v, err, out)
 			}
 		}
 	}
@@ -142,32 +189,61 @@ func NegotiateTrunkVLANs(c *Client, domainName, bridge, mac string, desiredVLANs
 	return nil
 }
 
-// readTapVLANs parses `bridge vlan show dev <tap>` output to extract VLAN IDs.
+// tapVLAN is one VLAN of a bridge port, as `bridge vlan show` lists it.
+type tapVLAN struct {
+	vid      int
+	pvid     bool // ingress untagged frames join it
+	untagged bool // egress frames leave untagged
+}
+
+// readTapVLANs is the VLAN IDs readTapVLANEntries reads.
 func readTapVLANs(tapDev string) ([]int, error) {
+	entries, err := readTapVLANEntries(tapDev)
+	if err != nil {
+		return nil, err
+	}
+	vlans := make([]int, 0, len(entries))
+	for _, e := range entries {
+		vlans = append(vlans, e.vid)
+	}
+	return vlans, nil
+}
+
+// readTapVLANEntries parses `bridge vlan show dev <tap>`: one VLAN per line,
+// the port's name on the first ("v0    1 PVID Egress Untagged", then
+// "      30"), after a header line starting "port".
+func readTapVLANEntries(tapDev string) ([]tapVLAN, error) {
 	out, err := execVLAN("bridge", "vlan", "show", "dev", tapDev)
 	if err != nil {
 		return nil, fmt.Errorf("bridge vlan show %s: %w: %s", tapDev, err, out)
 	}
+	return parseTapVLANEntries(string(out)), nil
+}
 
-	var vlans []int
-	for _, line := range strings.Split(string(out), "\n") {
+func parseTapVLANEntries(out string) []tapVLAN {
+	var entries []tapVLAN
+	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "port") {
 			continue
 		}
-		// Lines look like: "100" or "100 PVID Egress Untagged" or "tapXXX  100..."
 		fields := strings.Fields(line)
-		for _, f := range fields {
-			// Try to parse each field as a VLAN ID.
-			vid := 0
-			n, err := fmt.Sscanf(f, "%d", &vid)
-			if err == nil && n == 1 && vid >= 1 && vid <= 4094 {
-				vlans = append(vlans, vid)
-				break // first number on the line is the VID
+		for i, f := range fields {
+			// The first field that is a VLAN ID; a port name before it is not
+			// one (a whole-field parse, so "1abc" is not VLAN 1).
+			vid, err := strconv.Atoi(f)
+			if err != nil || vid < 1 || vid > 4094 {
+				continue
 			}
+			e := tapVLAN{vid: vid}
+			flags := strings.ToLower(strings.Join(fields[i+1:], " "))
+			e.pvid = strings.Contains(flags, "pvid")
+			e.untagged = strings.Contains(flags, "untagged")
+			entries = append(entries, e)
+			break
 		}
 	}
-	return vlans, nil
+	return entries
 }
 
 // RunningDomainTaps returns the host device of every NIC of every running

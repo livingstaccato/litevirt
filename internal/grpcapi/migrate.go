@@ -1750,7 +1750,11 @@ func writeVMSeed(vm *corrosion.VMRecord, req *pb.EnsureCloudInitRequest, isoPath
 // Every path is checked before any is created, and a failure part-way removes
 // the stubs this call created, so a refused or failed call leaves nothing.
 func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*pb.EnsureDisksResponse, error) {
-	if _, err := s.authorizeMigrationTarget(ctx, req.VmName); err != nil {
+	// The authorization reads the VM's row, and refuses when it cannot (or
+	// it is gone): the access-VLAN check below judges that same row, so it
+	// can never be skipped for want of one (review NB-R3).
+	vmRec, err := s.authorizeMigrationTarget(ctx, req.VmName)
+	if err != nil {
 		return nil, err
 	}
 	// Whether this host's QEMU can take an encrypted copy, settled once.
@@ -1775,6 +1779,11 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 	// anything is created here, and the source refuses the move.
 	if p := s.nicMTUProblem(ctx, req.GetNicMtu()); p != "" {
 		return &pb.EnsureDisksResponse{NicMtuProblem: p}, nil
+	}
+	// An access-VLAN NIC whose bridge here does not filter VLANs: refused
+	// before anything is created here, for a live and a cold move alike.
+	if err := s.accessVLANMoveRefusal(ctx, vmRec); err != nil {
+		return nil, err
 	}
 	isoWarning := ""
 	var isoResolved map[string]string
@@ -2259,6 +2268,9 @@ func (s *Server) coldMovePreflight(ctx context.Context, vm *corrosion.VMRecord, 
 		return status.Errorf(codes.Internal, "libvirt not connected on host %s", s.hostName)
 	}
 	if err := s.nicMTUPreflight(ctx, vm, targetHost); err != nil {
+		return err
+	}
+	if err := s.coldMoveAccessVLANRefusal(ctx, vm, targetHost); err != nil {
 		return err
 	}
 	if err := s.refuseColdMoveOnSharedMAC(ctx, vm.Name); err != nil {
@@ -3155,9 +3167,13 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 	// A runtime move of a VM with a NIC on a managed network asks which device
 	// the target serves each such network on. Best effort, like the cgroup ask.
 	wantNetDevs := runtime && s.vmHasManagedNIC(ctx, vmName)
+	// An access-VLAN NIC always asks, and the answer is not best effort: the
+	// target refuses a VM whose bridge there does not filter VLANs
+	// (accessVLANMoveRefusal), live or cold.
+	hasAccessVLAN := s.vmHasAccessVLANNIC(ctx, vmName)
 	shareOnly := runtime && (s.vmSharesWeight(ctx, vmName) > 0 || hasVNCPassword || wantNetDevs) && len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 &&
-		s.migrationNetwork == "" && !hasRBD && len(mtus) == 0
-	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 && s.migrationNetwork == "" && !shareOnly && !hasRBD && len(mtus) == 0 {
+		s.migrationNetwork == "" && !hasRBD && len(mtus) == 0 && !hasAccessVLAN
+	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 && s.migrationNetwork == "" && !shareOnly && !hasRBD && len(mtus) == 0 && !hasAccessVLAN {
 		return ensureOutcome{}, nil
 	}
 	client, closer, err := s.dialPeer(ctx, targetHost)

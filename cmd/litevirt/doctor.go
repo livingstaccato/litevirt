@@ -27,7 +27,7 @@ and audited; check each subcommand's help before running it.`,
 	}
 	cmd.AddCommand(newDoctorDivergenceCmd(), newDoctorRepairOwnerCmd(), newDoctorMachineTypesCmd(),
 		newDoctorVMUUIDsCmd(), newDoctorFenceCmd(), newDoctorCPUModeCmd(), newDoctorPrivilegedContainersCmd(), newDoctorFirmwareMoveCmd(),
-		newDoctorMigrationTLSCmd(), newDoctorProjectSpellingsCmd())
+		newDoctorMigrationTLSCmd(), newDoctorProjectSpellingsCmd(), newDoctorAccessVLANMovesCmd())
 	return cmd
 }
 

@@ -393,6 +393,11 @@ func newDaemon(cfg *Config, bootWatchdog *watchdog.BootKeeper) (*Daemon, error) 
 			return svc.CreatingIncarnation(name)
 		}
 		return ""
+	}, func(ctx context.Context, name string) bool {
+		if svc := startWaitSvc.Load(); svc != nil {
+			return svc.HasTapVLANs(ctx, name)
+		}
+		return grpcapi.VMHasTapVLANs(ctx, db, name)
 	}))
 
 	// An earlier build left the backup session directories 0777; narrow them
@@ -1632,6 +1637,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// (grpcapi.ReconcileNFSMounts), off the start path: a server that does
 	// not answer must not hold the daemon's start.
 	go d.runNFSMountReconcile(ctx)
+	// This host's bridges that cannot carry an access-VLAN NIC
+	// (grpcapi.ReconcileAccessVLANBridges): bridge_vlan_filtering_off; and
+	// the VLANs of every running guest's NICs back on its taps
+	// (grpcapi.ConvergeTapVLANs).
+	go d.runAccessVLANBridgeReconcile(ctx)
 	// Before this daemon serves: no cold-migration copy can be in flight yet.
 	svc.SweepColdMigrationScratch()
 	svc.SetReplicator(repl)
@@ -1885,6 +1895,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Warn("firewall: the first pass failed; starts arm their own", "error", err)
 	}
 	d.fwReconciler.Start(ctx)
+	// A start an earlier run of this daemon left created-paused (it died
+	// between creating the domain paused and resuming it) is finished
+	// through the guard now, before any start source and the gRPC server
+	// run, or named by vm_start_stranded_paused (review NB-R1).
+	svc.ResumeStrandedStarts(ctx)
 	go svc.RecordExistingTrunkVLANsLoop(ctx, 0)
 	// A guest handed over paused for its NIC guards runs once they are in
 	// force here, even when the source's resume never arrives (re-review
@@ -3232,6 +3247,32 @@ func (d *Daemon) runNFSMountReconcile(ctx context.Context) {
 	}
 }
 
+// runAccessVLANBridgeReconcile judges this host's bridges for access-VLAN
+// NICs and converges its running guests' tap VLANs at once, then every
+// grpcapi.AccessVLANBridgeReconcileInterval (= TapVLANConvergeInterval),
+// until ctx is cancelled.
+func (d *Daemon) runAccessVLANBridgeReconcile(ctx context.Context) {
+	if d.svc == nil {
+		return
+	}
+	pass := func() {
+		d.svc.ReconcileAccessVLANBridges(ctx)
+		d.svc.ConvergeTapVLANs(ctx)
+		d.svc.JudgeStrandedStarts(ctx)
+	}
+	pass()
+	ticker := time.NewTicker(grpcapi.TapVLANConvergeInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pass()
+		}
+	}
+}
+
 // refreshDBPoolCapacity updates total/used bytes for every file-based storage
 // pool registered for THIS host in the DB — including pools created at runtime
 // via `lv pool create`. registerStoragePools only scans cfg.StoragePools, so
@@ -4493,16 +4534,17 @@ func (d *Daemon) wireLeaseTermLedgerGate() {
 
 // startWaitNeeded is the predicate RequireStartGuard waits on (re-review
 // m3): a start waits for the start guard only when its VM has a NIC guard
-// on, or whether it has one cannot be read. A VM with none starts as it did
-// before guards. creating names the incarnation a create on this host is
-// starting (grpcapi.Server.CreatingIncarnation): such a start waits only for
-// that incarnation's guards.
-func startWaitNeeded(db *corrosion.Client, creating func(name string) string) func(name string) bool {
+// on, or a NIC whose VLANs the guard puts on its tap (vlans: an access NIC
+// started unguarded would run on VLAN 1), or either cannot be read. A VM with
+// neither starts as it did before guards. creating names the incarnation a
+// create on this host is starting (grpcapi.Server.CreatingIncarnation): such
+// a start waits only for that incarnation's guards.
+func startWaitNeeded(db *corrosion.Client, creating func(name string) string, vlans func(ctx context.Context, name string) bool) func(name string) bool {
 	return func(name string) bool {
 		gctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		macs, err := corrosion.GuardedMACsOfIncarnation(gctx, db, name, creating(name))
-		return err != nil || len(macs) > 0
+		return err != nil || len(macs) > 0 || vlans(gctx, name)
 	}
 }
 

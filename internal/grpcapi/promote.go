@@ -2070,6 +2070,10 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			// The new row is written once the domain runs; until then the
 			// firewall renders its NICs from here (nic_firewall_arming.go).
 			defer s.pendingNICs(targetName, spec.Uuid, ifaceRecords, nil)()
+			// So are its NICs' VLANs, put on its taps before it runs
+			// (NICStartGuard); a takeover's row exists, and they are read
+			// from it.
+			defer s.pendingTapVLANsFor(ctx, targetName, &spec, ifaceRecords)()
 		}
 		stage, err := attempt(diskCfg)
 		// A NIC MTU this host cannot carry is not the other disks' doing.

@@ -27,7 +27,7 @@ func TestAutomationUpdate90RequiredIndexLedger(t *testing.T) {
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	if CurrentSchemaVersion != 90 || storedVersion(t, c) != 90 || derivedSchemaVersion(ctx, c) != 90 {
+	if CurrentSchemaVersion != 91 || storedVersion(t, c) != 91 || derivedSchemaVersion(ctx, c) != 91 {
 		t.Fatalf("real required-index migration did not establish90: code=%d stored=%d derived=%d", CurrentSchemaVersion, storedVersion(t, c), derivedSchemaVersion(ctx, c))
 	}
 	units := 0

@@ -385,7 +385,7 @@ var frozenReleaseFeatures = map[string][]Feature{
 	Release202701V1: {
 		"project_adoption",
 	},
-	Release202702V1: {"automation_identity_continuity"},
+	Release202702V1: {"automation_identity_continuity", "catalog_incarnation"},
 	// Not shipped yet: corrected only by one reviewed change here and in
 	// releaseFeatures together.
 	AutomationV1: {"automation_state"},

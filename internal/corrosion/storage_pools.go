@@ -2,9 +2,12 @@ package corrosion
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 // StoragePoolRecord represents a storage pool on a host.
@@ -27,23 +30,14 @@ type StoragePoolRecord struct {
 // UpsertStoragePool inserts or updates a storage pool record. Options are
 // serialised as JSON; nil/empty maps round-trip as a JSON "{}" (sqlite
 // treats NULL and "{}" the same after scanStoragePool decodes them).
+//
+// It is the write of a node where the release feature catalog_incarnation is
+// not available: the previous release's statement, except on a born row,
+// whose lifetime it keeps (catalog_incarnation.go). A write that would give
+// birth over a born lifetime is refused (ErrCatalogBirthNeedsLatch).
+// WriteStoragePool is every production caller's.
 func UpsertStoragePool(ctx context.Context, c *Client, p StoragePoolRecord) error {
-	now := c.NowTS()
-	optsJSON := "{}"
-	if len(p.Options) > 0 {
-		b, err := json.Marshal(p.Options)
-		if err != nil {
-			return fmt.Errorf("marshal options: %w", err)
-		}
-		optsJSON = string(b)
-	}
-	return c.Execute(ctx,
-		`INSERT OR REPLACE INTO storage_pools
-			(host_name, name, driver, source, target, options, project, total_bytes, used_bytes, state, updated_at, deleted_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
-		p.HostName, p.Name, p.Driver, p.Source, p.Target, optsJSON, p.Project,
-		p.TotalBytes, p.UsedBytes, p.State, now,
-	)
+	return writeStoragePool(ctx, c, p, catalogUnlatched, capabilities.FeatureGrant{})
 }
 
 // ListAllStoragePools returns all active storage pools across the cluster.
@@ -203,11 +197,27 @@ func countN(rows []Row, err error) (int, error) {
 // caller may want to keep the underlying mount around for a manual
 // recovery. Schedule a real driver cleanup in the gRPC handler instead.
 func MarkStoragePoolDeleted(ctx context.Context, c *Client, hostName, name string) error {
-	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE storage_pools SET deleted_at = ?, updated_at = ?
-		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
-		nowRFC3339(), now, hostName, name)
+	// A born pool's delete names its incarnation: it ends that lifetime and
+	// no later one (catalog_incarnation.go).
+	for attempt := 0; attempt < catalogWriteRetries; attempt++ {
+		row, err := readPoolRow(ctx, c.db, hostName, name)
+		if err != nil {
+			return err
+		}
+		now := c.NowTS()
+		del := Statement{SQL: storagePoolLegacyDeleteSQL, Params: []interface{}{nowRFC3339(), now, hostName, name}}
+		if row.incarnation != "" {
+			del = Statement{SQL: storagePoolLifetimeDeleteSQL, Params: []interface{}{nowRFC3339(), now, hostName, name, row.incarnation}}
+		}
+		ok, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+			again, err := readPoolRow(ctx, tx, hostName, name)
+			return err == nil && again.incarnation == row.incarnation, err
+		}, []Statement{del})
+		if err != nil || ok {
+			return err
+		}
+	}
+	return fmt.Errorf("storage pool %s on %s kept changing while it was deleted; nothing was written", name, hostName)
 }
 
 func scanStoragePool(r Row) StoragePoolRecord {

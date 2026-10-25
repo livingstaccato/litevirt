@@ -254,7 +254,7 @@ func (s *Server) recordNFSPoolOutcome(ctx context.Context, name, source, target 
 	}
 	if want != rec.State {
 		rec.State = want
-		if err := corrosion.UpsertStoragePool(ctx, s.db, rec); err != nil {
+		if err := corrosion.UpdateStoragePool(ctx, s.db, rec); err != nil {
 			slog.Warn("NFS mounts: record the pool's state", "pool", name, "error", err)
 		}
 	}

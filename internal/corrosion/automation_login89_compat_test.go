@@ -38,7 +38,7 @@ func TestAutomationLogin89Frozen88Layout(t *testing.T) {
 		t.Fatal("independent88 descriptor changed")
 	}
 	old, current := aggregateLocalTables88(), aggregateLocalTables()
-	if len(old) != 38 || len(current) != 38 || CurrentSchemaVersion != 90 || automationCutSourceSchema != 90 {
+	if len(old) != 38 || len(current) != 38 || CurrentSchemaVersion != 91 || automationCutSourceSchema != 91 {
 		t.Fatal("current90 boundary preserves archived88/89 layout")
 	}
 	for i := range old {
@@ -111,7 +111,7 @@ func TestAutomationLogin89Genuine88PublicCold(t *testing.T) {
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	if storedVersion(t, c) != 90 || !reflect.DeepEqual(schemaDDL, e.DDL) {
+	if storedVersion(t, c) != 91 || !reflect.DeepEqual(schemaDDL, e.DDL) {
 		t.Fatal("current90 changed predecessor88 DDL")
 	}
 	for _, old := range e.Ledger {

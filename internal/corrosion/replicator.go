@@ -3633,13 +3633,28 @@ func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement,
 			return err
 		}
 	}
-	skip, err := r.shouldSkipLWW(ctx, tx, tableName, pkCols, s, sh, incomingHLC)
-	if err != nil {
-		return err
+	// An image's or a pool's lifetime orders a write before its clock does
+	// (catalog_incarnation.go).
+	lifetimeApplies := false
+	if tableName == "images" || tableName == "storage_pools" {
+		verdict, cErr := catalogLifetimeDecision(ctx, tx, s, tableName)
+		if cErr != nil {
+			return cErr
+		}
+		if verdict == catalogSkip {
+			return nil
+		}
+		lifetimeApplies = verdict == catalogApply
 	}
-	if skip {
-		slog.Debug("replicator: LWW skip (local is newer)", "table", tableName, "hlc", incomingHLC)
-		return nil
+	if !lifetimeApplies {
+		skip, err := r.shouldSkipLWW(ctx, tx, tableName, pkCols, s, sh, incomingHLC)
+		if err != nil {
+			return err
+		}
+		if skip {
+			slog.Debug("replicator: LWW skip (local is newer)", "table", tableName, "hlc", incomingHLC)
+			return nil
+		}
 	}
 	applied := s.SQL
 	if sh.Kind == KindInsert {

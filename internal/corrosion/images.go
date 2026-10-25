@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/hlc"
 )
 
@@ -168,38 +170,93 @@ type ImageRecordResult struct {
 // "Before" is by two hosts' clocks, so a delete issued just after the
 // operation began on a host whose clock runs behind by more than that gap
 // loses too.
+//
+// The record takes the form its row calls for (catalog_incarnation.go): on a
+// node where the release feature is not available, the previous release's
+// forms; a record that would give birth over a born lifetime is refused
+// (ErrCatalogBirthNeedsLatch). RecordImageWithGrant is the latched node's.
 func RecordImage(ctx context.Context, c *Client, img ImageRecord, revive bool, startDeleted string, clk ImageClocks) (ImageRecordResult, error) {
-	stmts := []Statement{imageInsert(img, clk.Insert)}
-	if revive {
-		stmts = append(stmts, imageRevive(img.Name, clk.Revive))
+	return RecordImageLifetime(ctx, c, img, revive, startDeleted, clk, false, capabilities.FeatureGrant{})
+}
+
+// RecordImageLifetime is RecordImage and RecordImageWithGrant: latched says
+// the release feature catalog_incarnation is available on this node, and g,
+// when it is a grant of that feature, lets the record give birth.
+func RecordImageLifetime(ctx context.Context, c *Client, img ImageRecord, revive bool, startDeleted string, clk ImageClocks, latched bool, g capabilities.FeatureGrant) (ImageRecordResult, error) {
+	mode := catalogUnlatched
+	if latched {
+		mode = catalogLatched
+		if g.Check(capabilities.FeatureCatalogIncarnation) == nil {
+			mode = catalogBirth
+		}
 	}
-	res := ImageRecordResult{Outcome: ImageRecordWritten}
-	_, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
-		var deletedAt, updatedAt, checksum string
-		err := tx.QueryRowContext(ctx,
-			`SELECT COALESCE(deleted_at, ''), COALESCE(updated_at, ''), COALESCE(checksum, '') FROM images WHERE name = ?`, img.Name).
-			Scan(&deletedAt, &updatedAt, &checksum)
-		if errors.Is(err, sql.ErrNoRows) {
-			return true, nil
-		}
+	for attempt := 0; attempt < catalogWriteRetries; attempt++ {
+		row, err := readImageRow(ctx, c.db, img.Name)
 		if err != nil {
-			return false, err
+			return ImageRecordResult{}, err
 		}
-		switch {
-		case deletedAt != "" && deletedAt != startDeleted:
-			res.Outcome = ImageRecordDeleted
-		case lwwOrder(updatedAt, clk.Insert) >= 0:
-			res.Outcome = ImageRecordSuperseded
+		res := ImageRecordResult{Outcome: ImageRecordWritten}
+		if row.found {
+			switch {
+			case row.deletedAt != "" && row.deletedAt != startDeleted:
+				res.Outcome = ImageRecordDeleted
+			case lwwOrder(row.updatedAt, clk.Insert) >= 0:
+				res.Outcome = ImageRecordSuperseded
+			}
 		}
 		if res.Outcome != ImageRecordWritten {
-			res.UpdatedAt, res.Checksum = updatedAt, checksum
+			res.UpdatedAt, res.Checksum = row.updatedAt, row.checksum
+			return res, nil
 		}
-		return res.Outcome == ImageRecordWritten, nil
-	}, stmts)
-	if err != nil {
-		return ImageRecordResult{}, err
+		// The catalog statements of this record over row
+		// (catalog_incarnation.go).
+		var stmts []Statement
+		live := row.found && !row.deleted
+		switch {
+		case live && row.incarnation != "":
+			stmts = []Statement{{SQL: imageContinueSQL, Params: []interface{}{
+				img.Format, img.SourceURL, img.Checksum, img.SizeBytes, clk.Insert, img.Name, row.incarnation}}}
+		case row.deleted && !revive:
+			// A copy never brings a deleted image back, whatever lifetime
+			// its tombstone ends: it writes nothing.
+			return ImageRecordResult{Outcome: ImageRecordDeleted, UpdatedAt: row.updatedAt, Checksum: row.checksum}, nil
+		case live || !revive:
+			// A live row born before the latch keeps the previous forms, and
+			// so does a copy over no row: it gives no birth, and the birth
+			// that made the image replaces its row on every replica (rule 1).
+			stmts = []Statement{imageInsert(img, clk.Insert)}
+			if revive {
+				stmts = append(stmts, imageRevive(img.Name, clk.Revive))
+			}
+		case mode == catalogBirth:
+			// An operator's record over no row or a tombstone: a birth.
+			if err := g.Check(capabilities.FeatureCatalogIncarnation); err != nil {
+				return ImageRecordResult{}, err
+			}
+			stmts = []Statement{{SQL: imageBirthSQL, Params: []interface{}{
+				img.Name, img.Format, img.SourceURL, img.Checksum, img.SizeBytes, nowRFC3339(), clk.Insert,
+				newCatalogIncarnation(clk.Insert, !row.found)}}}
+		case mode == catalogLatched:
+			return ImageRecordResult{}, ErrCatalogBirthNeeded
+		case row.incarnation != "":
+			return ImageRecordResult{}, ErrCatalogBirthNeedsLatch
+		default:
+			stmts = []Statement{imageInsert(img, clk.Insert), imageRevive(img.Name, clk.Revive)}
+		}
+		// Written only if, in the same transaction, the row still reads as
+		// it did when its form was chosen; otherwise it is decided again.
+		ok, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+			again, err := readImageRow(ctx, tx, img.Name)
+			return err == nil && again == row, err
+		}, stmts)
+		if err != nil {
+			return ImageRecordResult{}, err
+		}
+		if ok {
+			return res, nil
+		}
 	}
-	return res, nil
+	return ImageRecordResult{}, fmt.Errorf("image %q: its catalog row kept changing while it was recorded; nothing was written", img.Name)
 }
 
 // ObserveStamp advances this host's clock to ts, a row's updated_at another
@@ -418,10 +475,30 @@ func GetImageHosts(ctx context.Context, c *Client, imageName string) ([]ImageHos
 // DeleteImage tombstones an image. Its deleted_at is to the nanosecond: a
 // prune keeps a file published after it (grpcapi publishedAfterDelete), and a
 // delete recorded to the second has to cover the whole second.
+//
+// A born image's delete names its incarnation (imageLifetimeDeleteSQL): it
+// ends that lifetime and no later one (catalog_incarnation.go).
 func DeleteImage(ctx context.Context, c *Client, name string) error {
-	now := c.NowTS()
-	return c.ExecuteBatch(ctx, []Statement{
-		{SQL: imageDeletedAtSQL, Params: []interface{}{nowRFC3339Nano(), now, name}},
-		{SQL: `UPDATE image_hosts SET deleted_at = ?, updated_at = ? WHERE image_name = ?`, Params: []interface{}{nowRFC3339(), now, name}},
-	})
+	for attempt := 0; attempt < catalogWriteRetries; attempt++ {
+		row, err := readImageRow(ctx, c.db, name)
+		if err != nil {
+			return err
+		}
+		now := c.NowTS()
+		del := Statement{SQL: imageDeletedAtSQL, Params: []interface{}{nowRFC3339Nano(), now, name}}
+		if row.incarnation != "" {
+			del = Statement{SQL: imageLifetimeDeleteSQL, Params: []interface{}{nowRFC3339Nano(), now, name, row.incarnation}}
+		}
+		ok, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+			again, err := readImageRow(ctx, tx, name)
+			return err == nil && again.incarnation == row.incarnation, err
+		}, []Statement{
+			del,
+			{SQL: `UPDATE image_hosts SET deleted_at = ?, updated_at = ? WHERE image_name = ?`, Params: []interface{}{nowRFC3339(), now, name}},
+		})
+		if err != nil || ok {
+			return err
+		}
+	}
+	return fmt.Errorf("image %q: its catalog row kept changing while it was deleted; nothing was written", name)
 }

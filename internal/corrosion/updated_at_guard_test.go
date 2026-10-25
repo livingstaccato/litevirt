@@ -156,6 +156,12 @@ func TestReplicatedUpdatedAtUsesNowTS(t *testing.T) {
 			if fn.Name.Name == "AdoptProjectIncarnation" {
 				continue
 			}
+			// catalogLifetimeDecision only classifies a RECEIVED images or
+			// storage_pools statement by the lifetime it names; it writes
+			// nothing (catalog_incarnation.go).
+			if fn.Name.Name == "catalogLifetimeDecision" {
+				continue
+			}
 			body := string(src[fset.Position(fn.Pos()).Offset:fset.Position(fn.End()).Offset])
 			if strings.Contains(body, "NowTS(") {
 				continue

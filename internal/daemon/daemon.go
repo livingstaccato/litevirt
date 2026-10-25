@@ -2963,7 +2963,7 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 				slog.Warn("storage pool statfs failed", "pool", p.Name, "target", p.Target, "error", err)
 			}
 		}
-		if err := corrosion.UpsertStoragePool(ctx, d.db, rec); err != nil {
+		if err := corrosion.WriteStoragePool(ctx, d.db, d.catalogGate(), rec); err != nil {
 			slog.Warn("failed to register storage pool", "pool", p.Name, "error", err)
 		}
 	}
@@ -2995,7 +2995,7 @@ func (d *Daemon) ensureGlobalISOLibrary(ctx context.Context) {
 		slog.Warn("global ISO library: create directory", "dir", dir, "error", err)
 		return
 	}
-	if err := corrosion.UpsertStoragePool(ctx, d.db, corrosion.StoragePoolRecord{
+	if err := corrosion.WriteStoragePool(ctx, d.db, d.catalogGate(), corrosion.StoragePoolRecord{
 		HostName: d.cfg.HostName,
 		Name:     grpcapi.GlobalISOLibraryName,
 		Driver:   "dir",
@@ -3080,7 +3080,7 @@ func (d *Daemon) refreshDirPoolExports(ctx context.Context, configured map[strin
 			opts[storage.NFSExportOption] = exp
 		}
 		r.Options = opts
-		if err := corrosion.UpsertStoragePool(ctx, d.db, r); err != nil {
+		if err := corrosion.UpdateStoragePool(ctx, d.db, r); err != nil {
 			slog.Warn("storage pools: cannot record a pool's NFS export", "pool", r.Name, "error", err)
 		}
 	}
@@ -3292,7 +3292,7 @@ func (d *Daemon) refreshDBPoolCapacity(ctx context.Context) {
 		if err := poolStatfs(p.Target, &st); err != nil {
 			slog.Warn("refresh pool capacity: statfs", "pool", p.Name, "target", p.Target, "error", err)
 			p.State = "error"
-			_ = corrosion.UpsertStoragePool(ctx, d.db, p)
+			_ = corrosion.UpdateStoragePool(ctx, d.db, p)
 			continue
 		}
 		p.TotalBytes = int64(st.Blocks * uint64(st.Bsize))
@@ -3302,7 +3302,7 @@ func (d *Daemon) refreshDBPoolCapacity(ctx context.Context) {
 		if !strings.EqualFold(p.Driver, "nfs") || p.State != grpcapi.PoolStateDegraded {
 			p.State = "active"
 		}
-		if err := corrosion.UpsertStoragePool(ctx, d.db, p); err != nil {
+		if err := corrosion.UpdateStoragePool(ctx, d.db, p); err != nil {
 			slog.Warn("refresh pool capacity: upsert", "pool", p.Name, "error", err)
 		}
 	}
@@ -4640,4 +4640,13 @@ func fileRestoreRunDir(dataDir string) string {
 		return "/run/litevirt/file-restore"
 	}
 	return filepath.Join(dataDir, "file-restore", "run")
+}
+
+// catalogGate is the release-feature gate the image and pool catalog writers
+// take (corrosion.WriteStoragePool); nil before the checker exists.
+func (d *Daemon) catalogGate() corrosion.CatalogFeatureGate {
+	if d.checker == nil {
+		return nil
+	}
+	return d.checker
 }

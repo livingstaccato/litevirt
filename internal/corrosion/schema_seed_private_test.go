@@ -100,7 +100,7 @@ func privateSeedShape(c *Client) (string, error) {
 }
 func privateSeedValidate(c *Client, identity, initialized bool, shape string) error {
 	ctx := context.Background()
-	if CurrentSchemaVersion != 90 || len(schemaMigrationLedger) != 216 {
+	if CurrentSchemaVersion != 91 || len(schemaMigrationLedger) != 219 {
 		return fmt.Errorf("compiled schema/catalog changed")
 	}
 	tables, err := privateSeedRows(c, `SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`)
@@ -124,7 +124,7 @@ func privateSeedValidate(c *Client, identity, initialized bool, shape string) er
 		case "schema_state":
 			want = 1
 		case "applied_migrations":
-			want = 216
+			want = 219
 		case "local_voter_incarnation":
 			if identity {
 				want = 1
@@ -142,7 +142,7 @@ func privateSeedValidate(c *Client, identity, initialized bool, shape string) er
 	for _, r := range rows {
 		got[r.String("id")] = r.String("checksum")
 	}
-	if len(rows) != 216 || len(got) != 216 {
+	if len(rows) != 219 || len(got) != 219 {
 		return fmt.Errorf("migration receipt inventory")
 	}
 	for _, m := range schemaMigrationLedger {
@@ -154,7 +154,7 @@ func privateSeedValidate(c *Client, identity, initialized bool, shape string) er
 	if err != nil {
 		return err
 	}
-	if len(rows) != 1 || rows[0].Int64("id") != 1 || rows[0].Int64("version") != 90 || derivedSchemaVersion(ctx, c) != 90 {
+	if len(rows) != 1 || rows[0].Int64("id") != 1 || rows[0].Int64("version") != 91 || derivedSchemaVersion(ctx, c) != 91 {
 		return fmt.Errorf("schema version differs")
 	}
 	if err = c.ExecuteLocal(ctx, func(tx *LocalTx) error { return automationVerifyUpdateIndexesTx(ctx, tx) }); err != nil {
@@ -175,7 +175,7 @@ func privateSeedValidate(c *Client, identity, initialized bool, shape string) er
 		return fmt.Errorf("physical schema differs")
 	}
 	if initialized {
-		if c.effectiveDBSchema.Load() != 90 || c.acknowledgedTies == nil || c.acknowledgedVersions == nil {
+		if c.effectiveDBSchema.Load() != 91 || c.acknowledgedTies == nil || c.acknowledgedVersions == nil {
 			return fmt.Errorf("actual InitSchema client state absent")
 		}
 	} else if c.effectiveDBSchema.Load() != 0 || c.acknowledgedTies != nil || c.acknowledgedVersions != nil {
@@ -774,7 +774,7 @@ func TestPrivateMemorySchemaSeedControls(t *testing.T) {
 		privateSeedCheck(t, p.c.execLocal(ctx, wrong))
 		ledgerBefore, e := privateSeedRows(p.c, `SELECT * FROM applied_migrations ORDER BY id`)
 		privateSeedCheck(t, e)
-		privateSeedMust(t, len(ledgerBefore) == 216, "negative index image lacks its complete valid ledger")
+		privateSeedMust(t, len(ledgerBefore) == 219, "negative index image lacks its complete valid ledger")
 		e = InitSchema(ctx, p.c)
 		privateSeedMust(t, e != nil && strings.Contains(e.Error(), "required schema index") && strings.Contains(e.Error(), "order differs"), "actual InitSchema accepted corrupted physical index: %v", e)
 		ledgerAfter, e := privateSeedRows(p.c, `SELECT * FROM applied_migrations ORDER BY id`)

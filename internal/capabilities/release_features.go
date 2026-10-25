@@ -86,7 +86,9 @@ type FeatureInfo struct {
 // after the latch marks it used. Its other data, the cluster failback policy,
 // is nothing failback can act on without those records, so it shares the bit.
 var releaseFeatures = map[Feature]FeatureInfo{
-	FeatureAutomationState:              {Token: AutomationV1, Description: "Automation authority, certified automation history and automation claim state"},
+	FeatureAutomationState: {Token: AutomationV1, Description: "Automation authority, certified automation history and automation claim state"},
+	FeatureCatalogIncarnation: {Token: Release202702V1, Description: "Image and storage pool birth incarnations: a deleted and re-created image or pool, or a pool of a re-admitted host, is a new lifetime that no write of the earlier one reaches (used by the first image or pool created after the latch)",
+		Writers: []string{"internal/corrosion.RecordImageLifetime", "internal/corrosion.writeStoragePool"}},
 	FeatureAutomationIdentityContinuity: {Token: Release202702V1, Description: "Certified continuity of an existing automation identity and its current parent lifetime", Writers: []string{"internal/corrosion.Client.claimAcceptContinuityWithGrant", "internal/corrosion.Client.materializeAutomationContinuity", "internal/corrosion.Client.importAutomationContinuity"}},
 	FeatureVMLimits: {Token: Release202611V1, Description: "Per-VM CPU limit and shares, and NIC bandwidth limits",
 		Writers: []string{"internal/grpcapi.admitLimitedSpec", "internal/grpcapi.admitLimitUpdate",
@@ -249,6 +251,7 @@ const (
 const (
 	FeatureFenceSSH                     Feature = "fence_ssh"
 	FeatureAutomationIdentityContinuity Feature = "automation_identity_continuity"
+	FeatureCatalogIncarnation           Feature = "catalog_incarnation"
 )
 
 // The feature of automation_v1. automation_v1 is not a release-train token,

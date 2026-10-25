@@ -554,7 +554,7 @@ func retainedCompatibilityCurrent37Fixture(t *testing.T, continuations ...func(*
 		}
 	}})
 	// Historical helper name retained; this factory always constructs CURRENT data.
-	if CurrentSchemaVersion != 90 || storedVersion(t, f.local.c) != 90 || len(aggregateLocalTables()) != 38 {
+	if CurrentSchemaVersion != 91 || storedVersion(t, f.local.c) != 91 || len(aggregateLocalTables()) != 38 {
 		t.Fatal("current factory requires actual90 schema/private38")
 	}
 	before := receiverActive(t, f.local.c)
@@ -745,7 +745,7 @@ func TestRetainedCurrent37NonemptyExecutionWarmCold(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	c.SetVoterConfigGate(func() bool { return true })
-	if storedVersion(t, c) != 90 || receiverActive(t, c) != active {
+	if storedVersion(t, c) != 91 || receiverActive(t, c) != active {
 		t.Fatal("cold current90 state changed")
 	}
 	view, err = pki.CaptureHostTrust(ctx, f.local.pki, f.local.name)

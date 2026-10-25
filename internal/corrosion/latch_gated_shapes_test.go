@@ -35,6 +35,16 @@ var frozenLatchGatedShapes = map[string][]string{
 	capabilities.Release202701V1: {
 		"stmtshape/v1:6f039aff36330ccd98dff94968e61f991c6c11c1a6ea34e3687e68763b509c1b", // projectsAdoptIncarnationSQL (project_adoption)
 	},
+	// Not shipped yet (F1): corrected only by one reviewed change here and in
+	// latchGatedShapes together.
+	capabilities.Release202702V1: {
+		"stmtshape/v1:34c2e0c1e7ebc2e4e34bbcc475ac4093bd33cf1b70c97c3f656cb0bf0bc1e1de", // storagePoolBirthSQL (catalog_incarnation)
+		"stmtshape/v1:512af81cfa9173a60e2eed52a53e24d6f776f5b4ecb9015d7ded49ce6f15853d", // imageBirthSQL (catalog_incarnation)
+		"stmtshape/v1:74d6132826649e2ef6f5bf5e523e6e3521c41bb7f811bc59b2e3f84da7d3066e", // storagePoolMutateSQL (catalog_incarnation)
+		"stmtshape/v1:b7f486e9a5bc30558b24a87df6ff6752eb43bdc28b8309ee7fdbb1ab0a7ead52", // imageContinueSQL (catalog_incarnation)
+		"stmtshape/v1:c02913c78cfed1908d03aad604cabdab49415bf1ba1b38da7c1073803d64edce", // imageLifetimeDeleteSQL (catalog_incarnation)
+		"stmtshape/v1:db66476377d56ccad4cc2b2211d2d3c01c69ed45dedad555f0e1d8758f587d20", // storagePoolLifetimeDeleteSQL (catalog_incarnation)
+	},
 }
 
 // TestLatchGatedShapesAreFrozen (review round 1, m-3): each token's latch-gated

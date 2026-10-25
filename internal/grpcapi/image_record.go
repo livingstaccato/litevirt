@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/hlc"
 )
@@ -166,7 +167,10 @@ func (s *Server) recordImage(ctx context.Context, op imageOp, t *imageTicket, im
 	var res corrosion.ImageRecordResult
 	for attempt := 0; ; attempt++ {
 		var err error
-		res, err = corrosion.RecordImage(ctx, s.db, img, op.revives(), t.deleted, clk)
+		res, err = s.recordImageRow(ctx, img, op.revives(), t.deleted, clk)
+		if _, coded := status.FromError(err); err != nil && coded {
+			return err
+		}
 		if err != nil {
 			s.noteStateWriteFail(corrosion.OpImage, err)
 			return status.Errorf(codes.Internal, "record image: %v", err)
@@ -293,4 +297,41 @@ func (s *Server) recordImageHost(ctx context.Context, ih corrosion.ImageHostReco
 			"image", ih.ImageName, "host", ih.HostName)
 	}
 	return corrosion.RecordImageHost(ctx, s.db, ih, false, at)
+}
+
+// catalogGate is this server's release-feature gate as the catalog writers
+// take it; nil when none is wired (an unlatched node).
+func (s *Server) catalogGate() corrosion.CatalogFeatureGate {
+	if s.releaseFeatures == nil {
+		return nil
+	}
+	return s.releaseFeatures
+}
+
+// recordImageRow writes an image's catalog row (corrosion.RecordImage) in the
+// form its row calls for. Once catalog_incarnation is available here, a
+// record that gives the image birth takes the feature's grant
+// (catalog_incarnation.go); any other is written without recording a use. A
+// birth that would replace a born lifetime on a node not latched yet is
+// refused (FailedPrecondition).
+func (s *Server) recordImageRow(ctx context.Context, img corrosion.ImageRecord, revive bool, startDeleted string, clk corrosion.ImageClocks) (corrosion.ImageRecordResult, error) {
+	gate := s.catalogGate()
+	var res corrosion.ImageRecordResult
+	var err error
+	if gate == nil || !gate.FeatureAvailable(capabilities.FeatureCatalogIncarnation) {
+		res, err = corrosion.RecordImage(ctx, s.db, img, revive, startDeleted, clk)
+	} else {
+		res, err = corrosion.RecordImageWithGrant(ctx, s.db, img, revive, startDeleted, clk, nil)
+		if errors.Is(err, corrosion.ErrCatalogBirthNeeded) {
+			err = gate.WithFeature(ctx, capabilities.FeatureCatalogIncarnation, func(ctx context.Context, g capabilities.FeatureGrant) error {
+				var werr error
+				res, werr = corrosion.RecordImageWithGrant(ctx, s.db, img, revive, startDeleted, clk, &g)
+				return werr
+			})
+		}
+	}
+	if errors.Is(err, corrosion.ErrCatalogBirthNeedsLatch) {
+		return res, status.Errorf(codes.FailedPrecondition, "image %q: %v", img.Name, err)
+	}
+	return res, err
 }

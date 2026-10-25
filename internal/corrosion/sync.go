@@ -591,9 +591,14 @@ func (c *Client) dumpTable(table string) (syncTable, bool) {
 
 // unsetIncarnationColumns are the incarnation columns withoutUnsetIncarnation
 // leaves out of a dump while they are unset.
-var unsetIncarnationColumns = map[string]string{
-	"projects": "incarnation",
-	"tokens":   "user_created_at",
+//
+// The first column is the one judged unset; the others, written only beside
+// it, go with it (storage_pools.host_incarnation is set only by a birth).
+var unsetIncarnationColumns = map[string][]string{
+	"projects":      {"incarnation"},
+	"tokens":        {"user_created_at"},
+	"images":        {"incarnation"},
+	"storage_pools": {"incarnation", "host_incarnation"},
 }
 
 // withoutUnsetIncarnation leaves an incarnation column out of a dump while
@@ -605,11 +610,11 @@ var unsetIncarnationColumns = map[string]string{
 // incarnation (projectsDumpDecision), and judges such a tokens row as
 // unstamped (tokenRowDecision).
 func withoutUnsetIncarnation(st syncTable) syncTable {
-	col, ok := unsetIncarnationColumns[st.Name]
+	cols, ok := unsetIncarnationColumns[st.Name]
 	if !ok {
 		return st
 	}
-	at := indexOf(st.Columns, col)
+	at := indexOf(st.Columns, cols[0])
 	if at < 0 {
 		return st
 	}
@@ -618,12 +623,32 @@ func withoutUnsetIncarnation(st syncTable) syncTable {
 			return st
 		}
 	}
-	cols := append(append([]string{}, st.Columns[:at]...), st.Columns[at+1:]...)
+	drop := map[int]bool{}
+	for _, col := range cols {
+		if i := indexOf(st.Columns, col); i >= 0 {
+			drop[i] = true
+		}
+	}
+	keep := func(r []interface{}) []interface{} {
+		out := make([]interface{}, 0, len(r)-len(drop))
+		for i, v := range r {
+			if !drop[i] {
+				out = append(out, v)
+			}
+		}
+		return out
+	}
+	names := make([]string, 0, len(st.Columns)-len(drop))
+	for i, c := range st.Columns {
+		if !drop[i] {
+			names = append(names, c)
+		}
+	}
 	rows := make([][]interface{}, len(st.Rows))
 	for i, r := range st.Rows {
-		rows[i] = append(append([]interface{}{}, r[:at]...), r[at+1:]...)
+		rows[i] = keep(r)
 	}
-	st.Columns, st.Rows = cols, rows
+	st.Columns, st.Rows = names, rows
 	return st
 }
 

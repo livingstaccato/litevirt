@@ -47,23 +47,23 @@ func update89ReadBounded(t *testing.T, name string, limit int64) []byte {
 }
 
 func TestAutomationUpdate90DescriptorAndObservation(t *testing.T) {
-	if CurrentSchemaVersion != 90 || automationCutSourceSchema != 90 || automationCutCodec != 1 || len(automationCutSections) != 9 || len(aggregateLocalTables()) != 38 || retainedLocalLayoutDigest() != update90Private38 {
+	if CurrentSchemaVersion != 91 || automationCutSourceSchema != 91 || automationCutCodec != 1 || len(automationCutSections) != 9 || len(aggregateLocalTables()) != 38 || retainedLocalLayoutDigest() != update90Private38 {
 		t.Fatal("current90 provenance must retain codec1/nine sections/private38")
 	}
-	for version := 69; version <= 90; version++ {
+	for version := 69; version <= 91; version++ {
 		if !supportedAutomationCutDescriptor(version, 1) || supportedAutomationCutDescriptor(version, 2) {
 			t.Fatal("archived/current descriptor changed", version)
 		}
 	}
-	if supportedAutomationCutDescriptor(91, 1) {
+	if supportedAutomationCutDescriptor(92, 1) {
 		t.Fatal("unknown future provenance admitted")
 	}
 	for _, retained := range []bool{false, true} {
-		for _, version := range []int64{88, 89, 90, 91} {
+		for _, version := range []int64{88, 89, 90, 91, 92} {
 			for _, digest := range []string{update90Private38, login88Layout, strings.Repeat("a", 64)} {
 				o := aggregateLocalObservation{retained: retained, layoutDigest: digest}
 				err := o.observe(&aggregateLocalAudit{}, 15, 1, Row{Columns: []string{"id", "version"}, Values: []any{int64(1), version}})
-				want := digest == update90Private38 && (version == 90 || retained && version == 89) || retained && digest == login88Layout && version == 88
+				want := digest == update90Private38 && (version == 91 || retained && (version == 89 || version == 90)) || retained && digest == login88Layout && version == 88
 				if (err == nil) != want {
 					t.Fatalf("schema/layout meaning retained=%v version=%d digest=%s: %v", retained, version, digest, err)
 				}
@@ -132,7 +132,7 @@ func TestAutomationUpdate90Genuine89UpgradeArchiveAndFrames(t *testing.T) {
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatal("real89 to90 migration", err)
 	}
-	if storedVersion(t, c) != 90 || derivedSchemaVersion(ctx, c) != 90 || !reflect.DeepEqual(schemaDDL, e.DDL) {
+	if storedVersion(t, c) != 91 || derivedSchemaVersion(ctx, c) != 91 || !reflect.DeepEqual(schemaDDL, e.DDL) {
 		t.Fatal("index-only90 changed DDL or failed actual migration")
 	}
 	ledger := update90Ledger(t, c)
@@ -165,7 +165,7 @@ func TestAutomationUpdate90Genuine89UpgradeArchiveAndFrames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := InitSchema(ctx, c); err != nil || storedVersion(t, c) != 90 || !reflect.DeepEqual(ledger, update90Ledger(t, c)) {
+	if err := InitSchema(ctx, c); err != nil || storedVersion(t, c) != 91 || !reflect.DeepEqual(ledger, update90Ledger(t, c)) {
 		t.Fatal("cold90 reopened receipt drift", err)
 	}
 	check()
@@ -175,7 +175,7 @@ func TestAutomationUpdate90NonemptyCutAndColdReplay(t *testing.T) {
 	ctx := context.Background()
 	f, _, _ := updateFirst(t)
 	before := updateSnapshot(t, f.c)
-	if storedVersion(t, f.c) != 90 {
+	if storedVersion(t, f.c) != 91 {
 		t.Fatal("current90 real initialization required")
 	}
 	if err := f.c.SealVoterGeneration(ctx, 1, "current90-update-cut"); err != nil {
@@ -186,7 +186,7 @@ func TestAutomationUpdate90NonemptyCutAndColdReplay(t *testing.T) {
 		t.Fatal("actual source90 update cut", err)
 	}
 	meta, records := cutFixtureRead(t, f.c, id)
-	if meta.SourceSchema != 90 || meta.Codec != 1 || len(meta.Inventory) != 9 || meta.Head.Sequence <= 14 || !reflect.DeepEqual(before, updateSnapshot(t, f.c)) {
+	if meta.SourceSchema != 91 || meta.Codec != 1 || len(meta.Inventory) != 9 || meta.Head.Sequence <= 14 || !reflect.DeepEqual(before, updateSnapshot(t, f.c)) {
 		t.Fatal("source90 cut omitted update or changed active state")
 	}
 	var observation aggregateLocalObservation

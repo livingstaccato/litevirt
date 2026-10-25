@@ -118,6 +118,9 @@ var appendOnlyLedger = []struct {
 	{"a099_local_automation_credential_issuance_parent_alias", 89},
 	{"a100_local_automation_credential_issuance_parent_realm", 89},
 	{"a101_local_automation_credential_issuance_parent_birth", 89},
+	{"a102_images_incarnation", schemaVersionCatalogIncarnation},
+	{"a103_storage_pools_incarnation", schemaVersionCatalogIncarnation},
+	{"a104_storage_pools_host_incarnation", schemaVersionCatalogIncarnation},
 }
 
 const appendOnlyRule = "schemaMigrations is append-only: add new ALTERs at the end; never reorder"

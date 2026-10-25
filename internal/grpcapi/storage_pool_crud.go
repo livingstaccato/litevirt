@@ -272,7 +272,13 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 			rec.UsedBytes = int64((st.Blocks - st.Bavail) * uint64(st.Bsize))
 		}
 	}
-	if err := corrosion.UpsertStoragePool(ctx, s.db, rec); err != nil {
+	if err := corrosion.WriteStoragePool(ctx, s.db, s.catalogGate(), rec); err != nil {
+		if _, coded := status.FromError(err); coded {
+			return nil, err
+		}
+		if errors.Is(err, corrosion.ErrCatalogBirthNeedsLatch) {
+			return nil, status.Errorf(codes.FailedPrecondition, "persist: %v", err)
+		}
 		return nil, status.Errorf(codes.Internal, "persist: %v", err)
 	}
 	// Make the pool resolvable for move/replicate/compose on this host right

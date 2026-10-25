@@ -28,6 +28,16 @@ var latchGatedShapes = map[string][]string{
 	capabilities.Release202701V1: {
 		projectsAdoptIncarnationSQL, // AdoptProjectIncarnation (project_adoption)
 	},
+	// catalog_incarnation (catalog_incarnation.go): written once the token has
+	// latched, or over a row a latched writer gave birth to.
+	capabilities.Release202702V1: {
+		imageBirthSQL,                // imageStatements (birth)
+		imageContinueSQL,             // imageStatements (a born image's content)
+		imageLifetimeDeleteSQL,       // DeleteImage (a born image)
+		storagePoolBirthSQL,          // writeStoragePool (birth)
+		storagePoolMutateSQL,         // writeStoragePool (a born pool)
+		storagePoolLifetimeDeleteSQL, // MarkStoragePoolDeleted (a born pool)
+	},
 }
 
 // LatchGatedShapes returns token's latch-gated statements (latchGatedShapes).

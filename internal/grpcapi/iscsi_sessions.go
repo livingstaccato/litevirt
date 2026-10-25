@@ -188,7 +188,7 @@ func (s *Server) reconcileISCSIPool(ctx context.Context, pool string, tried map[
 	}
 	if want != rec.State {
 		rec.State = want
-		if err := corrosion.UpsertStoragePool(ctx, s.db, rec); err != nil {
+		if err := corrosion.UpdateStoragePool(ctx, s.db, rec); err != nil {
 			slog.Warn("iSCSI sessions: record the pool's state", "pool", pool, "error", err)
 		}
 	}

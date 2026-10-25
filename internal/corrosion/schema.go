@@ -634,7 +634,22 @@ import (
 // v88: local certified-history-derived identity continuity; no native authority.
 // v89: local session issuance pins origin or continuity proof and exact attachment.
 // v90: required local desired-admission index for certified conditional updates.
-const CurrentSchemaVersion = 90
+// v91: images.incarnation, storage_pools.incarnation (TEXT NOT NULL, default
+// empty) and storage_pools.host_incarnation (INTEGER NOT NULL DEFAULT 0) — the
+// catalog birth incarnation (catalog_incarnation.go): a fresh
+// "<birth HLC>~<f|r><32 hex>" written by every birth of an image or a pool
+// (a first create, a re-create over a tombstone, a pool of a re-admitted
+// host) once the release feature catalog_incarnation is available, and never
+// changed otherwise; host_incarnation is hosts.incarnation of the pool's host
+// at its birth. An empty value is a row born before that: no lifetime, refused by the
+// consume API, and never adopted. The columns are left out of a node's
+// anti-entropy dump while every value is unset. Appended LAST for the v53
+// digest reason. Additive.
+const CurrentSchemaVersion = 91
+
+// schemaVersionCatalogIncarnation is the version the catalog birth
+// incarnation columns were added in.
+const schemaVersionCatalogIncarnation = 91
 
 // schemaVersionTokenUserIncarnation is the version tokens.user_created_at was
 // added in.
@@ -1742,7 +1757,8 @@ var schemaDDL = []string{
 		size_bytes   INTEGER,
 		created_at   TEXT NOT NULL,
 		updated_at   TEXT NOT NULL,
-		deleted_at   TEXT
+		deleted_at   TEXT,
+		incarnation  TEXT NOT NULL DEFAULT ''
 	)`,
 
 	`CREATE TABLE IF NOT EXISTS image_hosts (
@@ -2619,6 +2635,10 @@ var schemaDDL = []string{
 		state        TEXT NOT NULL DEFAULT 'active',
 		updated_at   TEXT NOT NULL,
 		deleted_at   TEXT,
+		options      TEXT,
+		project      TEXT NOT NULL DEFAULT '',
+		incarnation  TEXT NOT NULL DEFAULT '',
+		host_incarnation INTEGER NOT NULL DEFAULT 0,
 		PRIMARY KEY (host_name, name)
 	)`,
 
@@ -4060,6 +4080,11 @@ var schemaMigrations = []string{
 	`ALTER TABLE local_automation_credential_issuance ADD COLUMN parent_alias TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE local_automation_credential_issuance ADD COLUMN parent_realm TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE local_automation_credential_issuance ADD COLUMN parent_birth TEXT NOT NULL DEFAULT ''`,
+	// The catalog birth incarnation (see History,
+	// schemaVersionCatalogIncarnation).
+	`ALTER TABLE images ADD COLUMN incarnation TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE storage_pools ADD COLUMN incarnation TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE storage_pools ADD COLUMN host_incarnation INTEGER NOT NULL DEFAULT 0`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -4173,6 +4198,9 @@ var alterVersions = []int{
 	82,                                // local_automation_receiver_current.established_inventory
 	schemaVersionTokenUserIncarnation, // tokens.user_created_at
 	89, 89, 89, 89, 89, 89, 89,        // local issuance proof mode/attachment
+	schemaVersionCatalogIncarnation, // images.incarnation
+	schemaVersionCatalogIncarnation, // storage_pools.incarnation
+	schemaVersionCatalogIncarnation, // storage_pools.host_incarnation
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

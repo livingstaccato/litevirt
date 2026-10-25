@@ -327,6 +327,11 @@ func (c *Client) antiEntropyAuthorityDecision(tx *sql.Tx, table syncTable, row [
 		// node's account's (user_incarnation.go).
 		return c.userKeyedRowDecision(tx, table, row)
 	}
+	if table.Name == "images" || table.Name == "storage_pools" {
+		// An image's or a pool's lifetime orders its rows before their
+		// clocks do (catalog_incarnation.go).
+		return catalogDumpDecision(tx, table, row)
+	}
 	m := table.authority
 	if m == nil {
 		return mergeAuthorityNormal, nil

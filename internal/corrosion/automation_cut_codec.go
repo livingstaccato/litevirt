@@ -20,7 +20,7 @@ const automationCutCodec = 1
 
 // Deliberately independent of CurrentSchemaVersion: new provenance requires an
 // explicit inventory review. A future live schema cannot relabel an old cut.
-const automationCutSourceSchema = 90
+const automationCutSourceSchema = 91
 
 // Explicit source descriptors: 69/1 retains its original inventory and root.
 // 70/1 adds only outgoing job pins/publication wrappers/public trust evidence,
@@ -89,8 +89,12 @@ const automationCutSourceSchema = 90
 // 90/1 adds only a required physical desired-admission index and its schema
 // ledger unit. Neither is a certified section or private-layout row. Archived
 // 69..89 bytes/roots, nine public sections/codec1 and private38 remain fixed.
+// 91/1 adds only the replicated catalog birth incarnation columns of images
+// and storage_pools, which are in no certified section or private-layout row.
+// Archived 69..90 bytes/roots, nine public sections/codec1 and private38
+// remain fixed.
 func supportedAutomationCutDescriptor(schema, codec int) bool {
-	return codec == 1 && (schema == 69 || schema == 70 || schema == 71 || schema == 72 || schema == 73 || schema == 74 || schema == 75 || schema == 76 || schema == 77 || schema == 78 || schema == 79 || schema == 80 || schema == 81 || schema == 82 || schema == 83 || schema == 84 || schema == 85 || schema == 86 || schema == 87 || schema == 88 || schema == 89 || schema == 90)
+	return codec == 1 && (schema == 69 || schema == 70 || schema == 71 || schema == 72 || schema == 73 || schema == 74 || schema == 75 || schema == 76 || schema == 77 || schema == 78 || schema == 79 || schema == 80 || schema == 81 || schema == 82 || schema == 83 || schema == 84 || schema == 85 || schema == 86 || schema == 87 || schema == 88 || schema == 89 || schema == 90 || schema == 91)
 }
 
 type automationCutInventory struct {

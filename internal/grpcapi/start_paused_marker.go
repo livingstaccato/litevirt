@@ -8,7 +8,10 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
+
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
 // A start the guard pauses (NICStartGuard: tap VLANs, or a guarded NIC that
@@ -43,7 +46,15 @@ func (s *Server) markStartPaused(name string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(tmp, "%s\n%s\n", name, time.Now().UTC().Format(time.RFC3339)); err != nil {
+	// The incarnation it pauses: a same-name domain of another uuid is not
+	// this start's (startPausedUUID).
+	uuid := ""
+	if s.virt != nil {
+		if x, err := s.virt.DumpXMLInactive(name); err == nil {
+			uuid = lv.UUIDFromXML(x)
+		}
+	}
+	if _, err := fmt.Fprintf(tmp, "%s\n%s\nuuid=%s\n", name, time.Now().UTC().Format(time.RFC3339), uuid); err != nil {
 		tmp.Close()
 		os.Remove(tmp.Name())
 		return err
@@ -87,5 +98,37 @@ func (s *Server) unmarkStartPaused(name string) {
 	if err := os.Remove(s.startPausedPath(name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		// It stays: a later sweep finds the guest running, and drops it.
 		slog.Warn("start guard: could not remove the record of a paused start that ended", "vm", name, "error", err)
+	}
+}
+
+// startPausedUUID is the domain uuid name's record names, "" when it names
+// none (it could not be read when the start was recorded).
+func (s *Server) startPausedUUID(name string) (string, error) {
+	b, err := os.ReadFile(s.startPausedPath(name))
+	if err != nil {
+		return "", err
+	}
+	for _, l := range strings.Split(string(b), "\n") {
+		if u, ok := strings.CutPrefix(l, "uuid="); ok {
+			return strings.ToLower(strings.TrimSpace(u)), nil
+		}
+	}
+	return "", nil
+}
+
+// removeHalfWrittenStartRecords removes the temporary files of record writes
+// a daemon died in (.tmp-*): never a record, and never read.
+func (s *Server) removeHalfWrittenStartRecords() {
+	dir := filepath.Join(s.dataDir, startPausedDir)
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), ".tmp-") {
+			if err := os.Remove(filepath.Join(dir, e.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				slog.Warn("start guard: could not remove a half-written record of a paused start", "file", e.Name(), "error", err)
+			}
+		}
 	}
 }

@@ -2353,8 +2353,9 @@ holder writes.
   ```
   partition-pause: workload stays paused kind=vm name=<vm> reason="the domain is paused on a disk I/O error, not by this host's partition pause; …"
   ```
-  No `lv` command resumes a paused VM (`lv stop` and `lv start` drop the
-  record but reboot the guest). On the VM's host, once it should run:
+  No `lv` command resumes a paused VM. A plain `lv stop` refuses it, and
+  `lv stop --force` destroys it, which drops the record but reboots the guest
+  on its next start. On the VM's host, once it should run:
   ```
   virsh resume <vm>
   ```
@@ -3253,17 +3254,79 @@ neither the resume nor the destroy landed, the guest stays paused. Each such
 paused start is recorded on the host (under `start-paused/` in the data
 directory) before the guest is created, and the record is removed when the
 start ends. When the daemon starts again, before anything else can start a
-guest, it finishes each start that still has a record: the domain is paused,
-its row names this host as running or starting, and nothing else holds it (no
-partition pause mark on the domain, no partition pause record in memory, the
-reserve or the record directory, no hand-over, no firmware move; any of them
-unreadable counts as held). It puts the firewall and VLANs in force and resumes
-it. A domain paused without a record (by partition pause, a snapshot, an
-operator) is never resumed by it. One it cannot finish
-stays paused and is named by `vm_start_stranded_paused` (evaluator
-`start_guard`, subject `vm/<name>@<host>`, warning), with why. Fix the cause
-and `lv restart <vm>`, or `lv stop <vm> --force`. The condition resolves on
-the next check (every 30 s) that finds the guest running, stopped or gone.
+guest, it goes over each start that still has a record. It never kills a
+guest:
+
+- One that has ended (libvirt has no such domain, or the domain is no longer
+  paused) has its record removed.
+- One that something else holds paused (a partition pause mark on the domain, a
+  partition pause record in memory, the reserve or the record directory, a
+  hand-over, a firmware move) is left paused; that hold reports it.
+- One of this start's own incarnation (the record names the domain's uuid)
+  whose guest provably never ran, and whose row names this host as running or
+  starting (a failover, reschedule or onboot start), is finished: the firewall
+  and VLANs in force, then the resume. The proof is QEMU's own run state
+  (QMP `query-status`, asked through libvirt) reading `prelaunch`. libvirt's
+  paused reason is not proof: it reads `user` both for a start left paused
+  and for a guest that ran and was suspended. libvirt notes a domain asked
+  this way as tainted (`custom-monitor`) in its log.
+- Any other is left paused, its record kept, and named by
+  `vm_start_stranded_paused` (evaluator `start_guard`, subject
+  `vm/<name>@<host>`, warning), with why. That covers an operator `lv start`
+  (its row is still `stopped`: running is recorded only once the guest runs)
+  and a restart-policy start (row `error` or `crashed`), which are not
+  finished automatically; a guest QEMU does not report as `prelaunch`; a
+  record that names another incarnation or none; a VM whose row is gone (it
+  was deleted, and its paused domain still holds its disks); a row in any
+  other state; and anything it needs that cannot be read.
+
+The condition's text says what to do:
+
+- When the record names the domain's own incarnation and QEMU reports it
+  `prelaunch`, the guest never ran, so `lv stop --force <vm>` loses nothing.
+  Then start it with `lv start <vm>`.
+- When that cannot be shown, the text says so: `lv stop --force <vm>`
+  discards any guest state not flushed to disk, so decide whether that
+  matters before you run it.
+- When the VM's row is gone, the domain is left as it is, and the text says
+  to stop it on this host with `virsh destroy <vm>`.
+- When the VM's row names another host (failover moved it while this daemon
+  was down), another copy may run there. This domain is left as it is, neither
+  resumed nor killed, and the condition names both hosts. Check which host
+  runs the VM (`lv inspect <vm>`, and `virsh domstate <vm>` on the other
+  host). If that host runs it, stop this copy with `virsh destroy <vm>` on
+  this host.
+
+A domain paused without a record (by partition pause, a snapshot) is never
+resumed by it.
+
+`lv start <vm>` of a VM whose domain a start left paused does not finish that
+start, and does not start the VM again over it. It refuses with the same
+guidance, and keeps the record. It does not raise the condition itself: a
+restart-policy start the reconciler has in flight looks the same until it
+resumes. Any other start of the domain while it is still active (a failover,
+a restart policy) is refused by the start guard in the same way. No start
+removes the record of a start it did not finish. A snapshot restore of such a
+VM is refused before it changes anything; run `lv stop --force <vm>` first.
+
+A plain `lv stop <vm>` of any paused guest (a start left paused, an I/O
+error, a partition pause, a hand-over) is refused, before the VM's `pre_stop`
+hook runs. A paused guest cannot shut down gracefully, and a kill loses what
+it has not flushed. The refusal names the pause and its reason, as far as
+they are known, and says that `lv stop --force <vm>` destroys the guest
+(nothing is lost only when QEMU reports it never ran); or let it resume first
+and stop it then. `lv stop --force` destroys the domain and removes its start
+record, so no record outlives it.
+
+If a start fails after the paused create, and libvirt cannot confirm the
+domain is no longer paused (the destroy did not land, or the connection
+dropped), the record is kept too, and the guest is named at once.
+
+A record whose domain runs (unpaused) is stale, since its start has ended. The
+30 s check, a start and a stop each remove it.
+
+The condition resolves on the next check (every 30 s) that finds the guest
+running, stopped or gone.
 
 ## `lv doctor access-vlan-moves`
 

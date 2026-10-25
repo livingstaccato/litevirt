@@ -219,6 +219,17 @@ func (s *Server) needsPausedStart(ctx context.Context, vm string, live bool) boo
 func (s *Server) NICStartGuard(ctx context.Context) lv.StartGuard {
 	return lv.StartGuard{
 		Before: func(name string) (bool, error) {
+			// A start this host left paused is not started again over it:
+			// libvirt refuses a second create of the active domain, and this
+			// start's end (PausedDone) would drop the record of the one that
+			// is not finished. Asked first, so a refused start changes
+			// nothing (a hand-over record stays too).
+			s.dropStartRecordIfRunning(name)
+			if marked, merr := s.startPausedMarked(name); merr != nil || marked {
+				if active, aerr := s.virt.DomainIsActive(name); aerr != nil || active {
+					return false, s.startLeftPausedGuardRefusal(ctx, name)
+				}
+			}
 			// A start here is not a hand-over: a record an earlier move left
 			// must not resume this run's guest (re-review m3).
 			s.endHeld(name, "it is started here")
@@ -232,7 +243,7 @@ func (s *Server) NICStartGuard(ctx context.Context) lv.StartGuard {
 				// (ResumeStrandedStarts). Without it such a guest is only
 				// left paused, never resumed by the sweep: the start goes on.
 				if err := s.markStartPaused(name); err != nil {
-					slog.Warn("start guard: could not record a paused start; if this daemon dies before the resume, the guest stays paused",
+					slog.Error("start guard: could not record a paused start; if this daemon dies before the resume, the guest stays paused",
 						"vm", name, "error", err)
 				}
 				return true, nil
@@ -243,6 +254,7 @@ func (s *Server) NICStartGuard(ctx context.Context) lv.StartGuard {
 		},
 		AfterPaused: func(name string) error { return s.readyGuestHere(ctx, name, startingHere) },
 		PausedDone:  s.unmarkStartPaused,
+		PausedKept:  func(name string, err error) { s.strandedStartKept(ctx, name, err) },
 	}
 }
 

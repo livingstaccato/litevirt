@@ -2798,6 +2798,12 @@ func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord
 	if err := s.operatorStopStartRefusal(ctx, vm); err != nil {
 		return nil, err
 	}
+	// A start this host left paused (its record is still there, its domain
+	// paused) is neither finished here nor started again over: the start is
+	// refused, saying what to do, and the record kept (rc9 lab F1).
+	if err := s.startLeftPausedRefusal(ctx, vm.Name); err != nil {
+		return nil, err
+	}
 	// A volume move this host left unresolved points the disk row at the file
 	// the persistent config names before anything reads the rows, or refuses
 	// the start (move_unresolved.go).
@@ -3110,6 +3116,19 @@ func (s *Server) stopMoveLeftLocked(ctx context.Context, vm *corrosion.VMRecord,
 // stopLocked is the stop itself. settlesMove says the caller is entitled to
 // stop a row recorded migrating (stopMoveLeftLocked).
 func (s *Server) stopLocked(ctx context.Context, vm *corrosion.VMRecord, force bool, timeoutSec int32, note string, settlesMove bool) (*pb.VM, error) {
+	// A paused guest cannot answer an ACPI shutdown (libvirt: "domain is not
+	// running"), and a plain stop never kills one: whatever paused it (an I/O
+	// error, partition pause, a hand-over, a start left paused), a kill loses
+	// what the guest has not flushed, if it ran. The plain stop is refused
+	// before anything runs, its PreStop hook included, saying why it is
+	// paused and that `lv stop --force` destroys it (rc9 lab F1, review C1,
+	// F7 m4). A start record whose domain runs is stale, and dropped.
+	if !force {
+		if st, serr := s.virt.DomainStateReason(vm.Name); serr == nil && st.Reason == "paused" {
+			return nil, status.Error(codes.FailedPrecondition, s.pausedStopRefusal(ctx, vm.Name, st.PausedReason))
+		}
+	}
+	s.dropStartRecordIfRunning(vm.Name)
 	hspec := vmHooks(vm)
 	pbVM := &pb.VM{Name: vm.Name, HostName: vm.HostName, State: pb.VMState_VM_STOPPING}
 	hooks.Run(ctx, hooks.PreStop, pbVM, hspec)
@@ -3144,6 +3163,10 @@ func (s *Server) stopLocked(ctx context.Context, vm *corrosion.VMRecord, force b
 		if err := s.virt.DestroyDomain(vm.Name); err != nil && !alreadyStopped("destroy", err) {
 			return nil, status.Errorf(codes.Internal, "destroy: %v", err)
 		}
+		// The domain is not running now: a start left paused has ended, and
+		// its record goes with it, so no stale record names a later run of
+		// this VM (review C1).
+		s.unmarkStartPaused(vm.Name)
 	} else if err := s.virt.ShutdownDomain(vm.Name); err != nil {
 		if !alreadyStopped("shutdown", err) {
 			return nil, status.Errorf(codes.Internal, "shutdown: %v", err)

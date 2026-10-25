@@ -421,6 +421,10 @@ func (s *Server) restoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"VM %q is in state %q — cannot restore snapshot now", req.VmName, vm.State)
 	}
+	// A start left paused here: refused before anything is torn down.
+	if err := s.startRecordRefusal("snapshot restore", req.VmName); err != nil {
+		return nil, err
+	}
 
 	// Branch on snapshot type: a memory snapshot restores RAM too, and its
 	// vmstate file is host-local — refuse if the VM has since moved hosts.

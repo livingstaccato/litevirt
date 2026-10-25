@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	golibvirt "github.com/digitalocean/go-libvirt"
 )
 
 // StartGuard is what must hold before a domain's guest runs: its per-NIC
@@ -18,19 +20,39 @@ import (
 // leaves the domain stopped.
 //
 // PausedDone, when set, runs once a start that Before paused has ended: the
-// guest resumed, or the domain destroyed (or never created). It is not called
-// for a start that was not paused. A daemon that dies before it runs leaves
+// guest resumed, or libvirt confirms the domain is no longer paused
+// (destroyed, or never created). A failed start whose domain may still be
+// paused does not call it (review I4). It is not called for a start that was
+// not paused. A daemon that dies before it runs leaves
 // whatever Before recorded for the paused start in place, which is how such a
 // start is found again (grpcapi.ResumeStrandedStarts).
+//
+// PausedKept, when set, runs instead of PausedDone for a paused start that
+// failed while its domain may still be paused (its record is kept): err is
+// the start's failure. It lets the daemon name the guest at once, not only
+// at its next start (review F7 m5).
 type StartGuard struct {
 	Before      func(name string) (pause bool, err error)
 	AfterPaused func(name string) error
 	PausedDone  func(name string)
+	PausedKept  func(name string, err error)
 }
 
 func (g StartGuard) pausedDone(name string) {
 	if g.PausedDone != nil {
 		g.PausedDone(name)
+	}
+}
+
+// pausedEnded reports a failed paused start's end: PausedDone when the
+// domain is no longer paused, else PausedKept.
+func (g StartGuard) pausedEnded(name string, err error, stillPaused bool) {
+	if !stillPaused {
+		g.pausedDone(name)
+		return
+	}
+	if g.PausedKept != nil {
+		g.PausedKept(name, err)
 	}
 }
 
@@ -125,31 +147,59 @@ func (c *Client) guard(name string) (StartGuard, error) {
 // guardedStart starts a domain through the guard: create(paused) starts it,
 // resume lets a paused one run, destroy undoes a start the guard refused or
 // that could not be resumed.
-func guardedStart(g StartGuard, name string, create func(paused bool) error, resume func() error, destroy func()) error {
+//
+// A paused start's end (PausedDone) is reported only once it has really
+// ended: the guest resumed, or stillPaused finds the domain no longer paused
+// (destroyed, never created, or not this start's). A domain a failed create
+// or a destroy that did not land leaves paused keeps the start's record, so
+// the sweep names it (grpcapi.ResumeStrandedStarts; review I4).
+func guardedStart(g StartGuard, name string, create func(paused bool) error, resume func() error, destroy func(), stillPaused func() bool) error {
 	pause, err := g.before(name)
 	if err != nil {
 		return fmt.Errorf("start domain %s: %w", name, err)
 	}
-	if pause {
-		defer g.pausedDone(name)
+	ended := func(err error) error {
+		if pause {
+			g.pausedEnded(name, err, stillPaused())
+		}
+		return err
 	}
 	if err := create(pause); err != nil {
-		return err
+		return ended(err)
 	}
 	if !pause {
 		return nil
 	}
 	if err := g.afterPaused(name); err != nil {
 		destroy()
-		return fmt.Errorf("start domain %s: %w", name, err)
+		return ended(fmt.Errorf("start domain %s: %w", name, err))
 	}
 	if err := resume(); err != nil {
 		// Left paused, the domain would disagree with the start's error and
 		// with the row (re-review m5): stop it, as a refusal does.
 		destroy()
-		return fmt.Errorf("resume domain %s: %w", name, err)
+		return ended(fmt.Errorf("resume domain %s: %w", name, err))
 	}
+	g.pausedDone(name)
 	return nil
+}
+
+// domainStillPaused reports whether name's domain may still be paused: true
+// unless libvirt answers that it has no such domain, or that it is in a
+// state other than paused. A state it cannot read counts as paused.
+func domainStillPaused(v interface {
+	DomainLookupByName(name string) (golibvirt.Domain, error)
+	DomainGetState(dom golibvirt.Domain, flags uint32) (int32, int32, error)
+}, name string) bool {
+	dom, err := v.DomainLookupByName(name)
+	if err != nil {
+		return !IsNoDomain(err)
+	}
+	st, _, err := v.DomainGetState(dom, 0)
+	if err != nil {
+		return !IsNoDomain(err)
+	}
+	return golibvirt.DomainState(st) == golibvirt.DomainPaused
 }
 
 var (

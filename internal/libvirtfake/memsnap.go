@@ -187,6 +187,7 @@ func (f *Fake) stopCPUsLocked(name string) {
 
 func (f *Fake) runCPUsLocked(name string) {
 	f.domains[name] = StateRunning
+	f.markRanLocked(name)
 	m := f.memLocked(name)
 	if m.stoppedAt >= 0 {
 		m.pauses = append(m.pauses, PauseWindow{Start: m.stoppedAt, End: f.memClock})

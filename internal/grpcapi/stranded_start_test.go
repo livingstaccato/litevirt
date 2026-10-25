@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -37,6 +38,7 @@ func TestResumeStrandedStarts(t *testing.T) {
 	insertTestVMWithSpec(t, ctx, s.db, "stoppedrow", "test-host", "stopped", `{"name":"stoppedrow"}`)
 	fake.SetState("stoppedrow", libvirtfake.StatePaused)
 	for _, vm := range []string{"vm1", "stoppedrow"} {
+		giveUUID(t, fake, vm)
 		if err := s.markStartPaused(vm); err != nil {
 			t.Fatal(err)
 		}
@@ -65,8 +67,17 @@ func TestResumeStrandedStarts(t *testing.T) {
 	if c, _ := cond(); c.Lifecycle != corrosion.ConditionResolved {
 		t.Fatalf("the condition after the finish: %s, want resolved", c.Lifecycle)
 	}
+	// Its row is stopped, as an interrupted operator `lv start` leaves it:
+	// not finished by the sweep (v1.10.0), but named, its record kept
+	// (rc9 lab F1).
 	if st, _ := fake.RawState("stoppedrow"); st != libvirtfake.StatePaused {
-		t.Fatal("a paused domain whose row is not running here was resumed")
+		t.Fatalf("the recorded start of a VM whose row is stopped: %v, want it left paused", st)
+	}
+	if c, ok, _ := corrosion.GetHealthCondition(ctx, s.db, StrandedStartEvaluator, CondStrandedStartPaused, "vm", "stoppedrow@"+s.hostName); !ok || c.Lifecycle == corrosion.ConditionResolved {
+		t.Fatal("the recorded start of a VM whose row is stopped is not named")
+	}
+	if marked, _ := s.startPausedMarked("stoppedrow"); !marked {
+		t.Fatal("the record of a start kept unfinished was dropped")
 	}
 	if marked, _ := s.startPausedMarked("vm1"); marked {
 		t.Fatal("the finished start's record outlived it")
@@ -152,6 +163,7 @@ func TestResumeStrandedStarts_NeverResumesAGuestSomethingElseHolds(t *testing.T)
 			if err := corrosion.UpdateVMState(ctx, s.db, "vm1", "running", ""); err != nil {
 				t.Fatal(err)
 			}
+			giveUUID(t, fake, "vm1") // so the record's incarnation matches, and only the hold keeps it paused
 			fake.SetState("vm1", libvirtfake.StatePaused)
 			setup(t, s, fake)
 			s.ResumeStrandedStarts(context.Background())
@@ -181,5 +193,19 @@ func TestNICStartGuard_RecordsAPausedStartWhileItRuns(t *testing.T) {
 	}
 	if marked, _ := s.startPausedMarked("vm1"); marked {
 		t.Fatal("the record outlived the start")
+	}
+}
+
+// giveUUID defines name in the fake with a uuid of its own, as libvirt always
+// has one: a start record names it (NB-R14).
+func giveUUID(t *testing.T, fake *libvirtfake.Fake, name string) {
+	t.Helper()
+	st, _ := fake.RawState(name)
+	u := fmt.Sprintf("%08x-0000-4000-8000-000000000000", len(name)*7919)
+	if err := fake.DefineDomain(`<domain type='kvm'><name>` + name + `</name><uuid>` + u + `</uuid></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	if st != "" {
+		fake.SetState(name, st)
 	}
 }

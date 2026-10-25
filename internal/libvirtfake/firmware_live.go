@@ -169,6 +169,7 @@ func (f *Fake) LandFirmwareLive(src *Fake, name string, p libvirt.MigrateParams)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.domains[name] = StatePaused
+	f.markRanLocked(name) // a guest handed over: it ran on its source
 	f.xml[name] = persist
 	if live != persist {
 		f.activeXML[name] = live
@@ -252,6 +253,7 @@ func (f *Fake) leftStateLocked(name string) {
 	delete(f.offReason, name)
 	delete(f.ioPaused, name)
 	delete(f.ppMark, name)
+	delete(f.ran, name)
 }
 
 // ShutOffDomain takes a domain to shut off with reason, as a crash of its

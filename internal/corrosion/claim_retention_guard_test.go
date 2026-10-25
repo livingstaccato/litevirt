@@ -25,29 +25,68 @@ import (
 //   - no DELETE/REPLACE/DROP/ALTER whose table name is computed, outside the
 //     functions listed in claimRetentionDynamicOK.
 //
+// UPDATE counts too: clearing a value or acceptance column is a compaction.
+// A printf format string is SQL with a computed part, like a concatenation;
+// a computed part anywhere in the table name ("local_%s_claims") is computed.
+// Package-level declarations are allowlisted by constant name, never by file.
+//
+// Known limits (a reviewer must still catch these): an upsert
+// (INSERT ... ON CONFLICT DO UPDATE) that writes LOWER ballots or empty
+// values keeps the row and is not flagged; SQL assembled through
+// strings.Builder, bytes.Buffer, strings.Join, or a whole statement passed
+// through a variable, is not folded; and SQL outside Go source is not scanned.
+//
 // A change that needs one of these must first show the import stays safe
 // without the rows (docs: task5g design §2), then change this guard.
 
 var claimRetentionTables = `(local_recovery_claims|local_incarnation_claims|local_automation_history)`
 
-var claimRetentionVerb = `(delete\s+from|replace\s+into|insert\s+or\s+replace\s+into|drop\s+table(\s+if\s+exists)?|alter\s+table|truncate(\s+table)?|rename\s+to)`
+var claimRetentionVerb = `(update|delete\s+from|replace\s+into|insert\s+or\s+replace\s+into|drop\s+table(\s+if\s+exists)?|alter\s+table|truncate(\s+table)?|rename\s+to)`
 
 var claimRetentionStatic = regexp.MustCompile(claimRetentionVerb + `\s+["` + "`" + `]?` + claimRetentionTables + `\b`)
 
 // dynamicMark stands for a non-constant operand in a folded string.
 const dynamicMark = "\x00dyn\x00"
 
-var claimRetentionDynamic = regexp.MustCompile(`(delete\s+from|replace\s+into|insert\s+or\s+replace\s+into|drop\s+table(\s+if\s+exists)?|alter\s+table|truncate(\s+table)?|rename\s+to)\s+` + regexp.QuoteMeta(dynamicMark))
+var claimRetentionDynamic = regexp.MustCompile(`(` + claimRetentionVerb + `\s+["` + "`" + `]?[a-z0-9_]*` + regexp.QuoteMeta(dynamicMark) + `)`)
+
+// claimRetentionDynamicUpdate: a computed table in an UPDATE statement (SQL
+// shape "update <name> set"), not the word in prose.
+var claimRetentionDynamicUpdate = regexp.MustCompile(`update\s+["` + "`" + `]?[a-z0-9_]*` + regexp.QuoteMeta(dynamicMark) + `[a-z0-9_"` + "`" + `]*\s+set\b`)
+
+// printfVerb is one printf directive in a format string.
+var printfVerb = regexp.MustCompile(`%[-+# 0-9.*\[\]]*[a-zA-Z%]`)
+
+// isPrintf: fmt.Sprintf and its kin, whose first argument is a format.
+func isPrintf(call *ast.CallExpr) bool {
+	var name string
+	switch f := call.Fun.(type) {
+	case *ast.SelectorExpr:
+		name = f.Sel.Name
+	case *ast.Ident:
+		name = f.Name
+	}
+	return name == "Sprintf" || name == "Fprintf" || name == "Appendf" || name == "Printf"
+}
 
 // claimRetentionDynamicOK are the functions allowed to delete, drop or
 // rename a computed table, with why none of them can reach the three tables.
 var claimRetentionDynamicOK = map[string]string{
-	"internal/corrosion/identity.go:yieldThenApply":                   "replicated identity tables keyed by id; the guarded tables are node-local claim/history tables without an id column",
-	"internal/corrosion/testing.go:RefoundTableForTest":               "test-only table rebuild that copies every row",
-	"internal/corrosion/isolation.go:DiscardReplicatedStateForReseed": "walks the replicated tables only; the test asserts the guarded tables are not replicated",
-	"internal/corrosion/schema.go:rebuildClusterCRLStatements":        "rebuilds cluster_crl under a constant name",
-	"internal/corrosion/schema_automation_custody.go:":                "package constants naming the custody recipient tables",
-	"internal/health/superseded_bound.go:renameSetAside":              "an os.Rename log label, not SQL",
+	"internal/corrosion/identity.go:yieldThenApply":                                        "replicated identity tables keyed by id; the guarded tables are node-local claim/history tables without an id column",
+	"internal/corrosion/testing.go:RefoundTableForTest":                                    "test-only table rebuild that copies every row",
+	"internal/corrosion/isolation.go:DiscardReplicatedStateForReseed":                      "walks the replicated tables only; the test asserts the guarded tables are not replicated",
+	"internal/corrosion/schema.go:rebuildClusterCRLStatements":                             "rebuilds cluster_crl under a constant name",
+	"internal/corrosion/schema_automation_custody.go:automationCustodyDropOriginal":        "drops the custody recipient table after copying it to its replacement",
+	"internal/corrosion/schema_automation_custody.go:automationCustodyRenameReplacement":   "renames the custody replacement table into place",
+	"internal/corrosion/anti_entropy_authority.go:antiEntropySweepDeletedWorkloadChildren": "UPDATE over a constant list of replicated VM child tables",
+	"internal/corrosion/host_readmit.go:retireHostOwnedRows":                               "soft delete (deleted_at) of replicated host-owned tables",
+	"internal/corrosion/identity.go:identityCollapseUpdate":                                "replicated identity tables keyed by id",
+	"internal/corrosion/identity.go:tombstoneLocalInPlace":                                 "replicated identity tables keyed by id, soft delete",
+	"internal/corrosion/recovery_claims_proof.go:updateProofClaimCertificateLocal":         "sets claim_certificate on replicated proof rows during replication apply",
+	"internal/corrosion/replicator.go:applyBulkPerRow":                                     "replication apply; reaches replicated tables only (asserted above)",
+	"internal/corrosion/stmthistorical.go:HistoricalShapes":                                "statement-shape ledger entries over a constant list of replicated firewall tables",
+	"internal/corrosion/sync.go:updateProofStepState":                                      "sets step_state on replicated proof rows during replication apply",
+	"internal/health/superseded_bound.go:renameSetAside":                                   "an os.Rename log label, not SQL",
 }
 
 func TestClaimRetentionNeverPrunesAutomationState(t *testing.T) {
@@ -92,19 +131,28 @@ func claimRetentionFindings(t *testing.T, path, rel string) []string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(strings.ToLower(string(src)), "delete") && !strings.Contains(strings.ToLower(string(src)), "replace") &&
+	return claimRetentionScan(t, rel, src)
+}
+
+// claimRetentionScan reports every forbidden statement in one file's source.
+func claimRetentionScan(t *testing.T, rel string, src []byte) []string {
+	if !strings.Contains(strings.ToLower(string(src)), "delete") && !strings.Contains(strings.ToLower(string(src)), "update") && !strings.Contains(strings.ToLower(string(src)), "replace") &&
 		!strings.Contains(strings.ToLower(string(src)), "drop") && !strings.Contains(strings.ToLower(string(src)), "alter") &&
 		!strings.Contains(strings.ToLower(string(src)), "truncate") && !strings.Contains(strings.ToLower(string(src)), "rename") {
 		return nil
 	}
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, path, src, 0)
+	f, err := parser.ParseFile(fset, rel, src, 0)
 	if err != nil {
 		t.Fatalf("%s: %v", rel, err)
 	}
 	var out []string
 	check := func(fn string, e ast.Expr, call *ast.CallExpr) {
-		s := strings.ToLower(strings.Join(strings.Fields(foldString(e)), " "))
+		folded := foldString(e)
+		if call != nil && isPrintf(call) && len(call.Args) > 0 && call.Args[0] == e {
+			folded = printfVerb.ReplaceAllString(folded, dynamicMark)
+		}
+		s := strings.ToLower(strings.Join(strings.Fields(folded), " "))
 		if s == "" {
 			return
 		}
@@ -120,17 +168,39 @@ func claimRetentionFindings(t *testing.T, path, rel string) []string {
 			}
 			out = append(out, rel+":"+strconv.Itoa(at.Line)+": "+stmt+" prunes automation-carrying state (claim_retention_guard_test.go)")
 		}
-		if claimRetentionDynamic.MatchString(s) {
+		dynamic := false
+		for _, m := range claimRetentionDynamic.FindAllString(s, -1) {
+			if !strings.HasPrefix(m, "update") {
+				dynamic = true
+			}
+		}
+		if dynamic || claimRetentionDynamicUpdate.MatchString(s) {
 			if _, ok := claimRetentionDynamicOK[rel+":"+fn]; !ok {
 				out = append(out, rel+":"+strconv.Itoa(at.Line)+": "+fn+" deletes, drops or renames a computed table; prove it cannot reach the claim/history tables and list it in claimRetentionDynamicOK")
 			}
 		}
 	}
+	type unit struct {
+		fn   string
+		node ast.Node
+	}
+	var units []unit
 	for _, decl := range f.Decls {
-		fn := ""
-		if fd, ok := decl.(*ast.FuncDecl); ok {
-			fn = fd.Name.Name
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			units = append(units, unit{d.Name.Name, d})
+		case *ast.GenDecl:
+			for _, spec := range d.Specs {
+				name := ""
+				if vs, ok := spec.(*ast.ValueSpec); ok && len(vs.Names) > 0 {
+					name = vs.Names[0].Name
+				}
+				units = append(units, unit{name, spec})
+			}
 		}
+	}
+	for _, u := range units {
+		fn := u.fn
 		// Maximal string expressions, each checked once, with the call they
 		// are an argument of (for the lease-term scope).
 		var walk func(n ast.Node, call *ast.CallExpr) bool
@@ -155,7 +225,7 @@ func claimRetentionFindings(t *testing.T, path, rel string) []string {
 			}
 			return true
 		}
-		ast.Inspect(decl, func(n ast.Node) bool { return n == nil || walk(n, nil) })
+		ast.Inspect(u.node, func(n ast.Node) bool { return n == nil || walk(n, nil) })
 	}
 	return out
 }
@@ -215,4 +285,40 @@ func leaseTermScoped(sql string, call *ast.CallExpr) bool {
 		}
 	}
 	return false
+}
+
+// Each probe is a way a later change could prune or clear automation-carrying
+// state; each must be caught. The controls must not be.
+func TestClaimRetentionGuardCatchesProbes(t *testing.T) {
+	const head = "package corrosion\n\nimport \"fmt\"\n\nvar _ = fmt.Sprintf\n\n"
+	for _, p := range []struct {
+		name, rel, body string
+		caught          bool
+	}{
+		{"update clears claim values", "internal/corrosion/probe.go",
+			"func p(ctx context.Context, tx *LocalTx) { tx.Exec(ctx, `UPDATE local_recovery_claims SET value_json = NULL WHERE target_kind = ?`, ClaimKindAutomation) }", true},
+		{"update clears history", "internal/corrosion/probe.go",
+			"func p(ctx context.Context, tx *LocalTx) { tx.Exec(ctx, \"UPDATE local_automation_history SET value_json = ''\") }", true},
+		{"update of incarnation claims", "internal/corrosion/probe.go",
+			"const q = `update local_incarnation_claims set accept_json = ''`", true},
+		{"sprintf computed table", "internal/corrosion/probe.go",
+			"func p(table string) string { return fmt.Sprintf(\"DELETE FROM %s WHERE x = 1\", table) }", true},
+		{"sprintf partial table name", "internal/corrosion/probe.go",
+			"func p(kind string) string { return fmt.Sprintf(\"DELETE FROM local_%s_claims\", kind) }", true},
+		{"concatenated partial table name", "internal/corrosion/probe.go",
+			"func p(kind string) string { return \"DELETE FROM local_\" + kind + \"_claims\" }", true},
+		{"new computed drop in the custody file", "internal/corrosion/schema_automation_custody.go",
+			"const sneaky = \"DROP TABLE \" + otherTable", true},
+		{"control: the custody drop constant", "internal/corrosion/schema_automation_custody.go",
+			"const automationCustodyDropOriginal = \"DROP TABLE \" + automationCustodyRecipientTable", false},
+		{"control: lease-term prune", "internal/corrosion/probe.go",
+			"func p(ctx context.Context, tx *LocalTx) { tx.Exec(ctx, `DELETE FROM local_recovery_claims WHERE target_kind = ? AND owner_epoch < ?`, ClaimKindLeaseTerm, 1) }", false},
+		{"control: upsert keeps the row", "internal/corrosion/probe.go",
+			"const q = `INSERT INTO local_recovery_claims (a) VALUES (?) ON CONFLICT DO UPDATE SET a = excluded.a`", false},
+	} {
+		got := claimRetentionScan(t, p.rel, []byte(head+p.body+"\n"))
+		if (len(got) > 0) != p.caught {
+			t.Errorf("%s: findings %q, want caught=%v", p.name, got, p.caught)
+		}
+	}
 }

@@ -8,6 +8,37 @@
   {{template "health-matrix" .}}
 </div>
 
+{{if .TrustSSHPoweroff}}
+<!-- Hosts whose operator trusts a confirmed SSH power-off -->
+<div class="section" id="trust-ssh-poweroff" style="margin-top:20px">
+  <div class="section-header"><h2>Trusted SSH power-off</h2></div>
+  <div style="padding:8px 12px;font-size:13px">
+    <span class="badge badge-warning" style="font-size:10px">note</span>
+    {{len .TrustSSHPoweroff}} host(s) trust a confirmed SSH power-off (<code>litevirt.trust_ssh_poweroff</code>):
+    {{range $i, $h := .TrustSSHPoweroff}}{{if $i}}, {{end}}<a href="/hosts/{{$h}}">{{$h}}</a>{{end}}.
+    Their workloads are recovered when the remote shell confirms a power-off over the pinned host key, without
+    proof the host is off: one that ignores it, or whose power-off hangs, runs them twice.
+    <code>lv host config &lt;host&gt; --trust-ssh-poweroff=false</code> turns it off.
+  </div>
+</div>
+{{end}}
+{{if .SSHOnlyFencing}}
+<!-- Hosts fenced only over SSH: no fence of theirs proves a power-off -->
+<div class="section" id="ssh-only-fencing" style="margin-top:20px">
+  <div class="section-header"><h2>Fencing</h2></div>
+  <div style="padding:8px 12px;font-size:13px">
+    <span class="badge badge-warning" style="font-size:10px">warning</span>
+    {{len .SSHOnlyFencing}} host(s) fence only over SSH:
+    {{range $i, $h := .SSHOnlyFencing}}{{if $i}}, {{end}}<a href="/hosts/{{$h}}">{{$h}}</a>{{end}}.
+    An SSH fence never proves the host is off, so if one fails its workloads are held until its
+    partition pause has been waited out, or until you power it off and confirm it
+    (<code>lv host fence-confirm &lt;host&gt;</code>, or Confirm powered off on the host page).
+    Configure ipmi or redfish fencing on each to recover at once
+    (<code>lv host config &lt;host&gt; --fence-strategy ipmi|redfish</code>).
+  </div>
+</div>
+{{end}}
+
 <!-- Timeline -->
 <div class="section" style="margin-top:20px">
   <div class="section-header"><h2>Recent Events</h2></div>

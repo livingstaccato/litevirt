@@ -10,6 +10,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cli"
@@ -738,6 +739,7 @@ func newHostConfigCmd() *cobra.Command {
 	var clearIPMI bool
 	var rfEndpoint, rfUser, rfPass, rfPassFile, rfSystemID, rfAuth, rfCAFile string
 	var clearRedfish, clearRedfishCA bool
+	var trustSSHPoweroff bool
 
 	cmd := &cobra.Command{
 		Use:   "config <host>",
@@ -779,7 +781,25 @@ func newHostConfigCmd() *cobra.Command {
 			// --redfish-system-id="" given explicitly unsets the system id; an
 			// omitted flag leaves it alone.
 			clearSystemID := cmd.Flags().Changed("redfish-system-id") && rfSystemID == ""
+			// --trust-ssh-poweroff is the host's corrosion.LabelTrustSSHPoweroff
+			// label (SetHostLabels: admin, audited, replicated to every
+			// coordinator); every other flag is ConfigureHost's.
+			trustChanged := cmd.Flags().Changed("trust-ssh-poweroff")
+			others := 0
+			cmd.Flags().Visit(func(f *pflag.Flag) {
+				if f.Name != "trust-ssh-poweroff" {
+					others++
+				}
+			})
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if trustChanged {
+					if err := setTrustSSHPoweroff(ctx, c, args[0], trustSSHPoweroff); err != nil {
+						return err
+					}
+					if others == 0 {
+						return nil
+					}
+				}
 				out := &pb.ConfigureHostRequest{
 					Name:          args[0],
 					FenceStrategy: fenceStrategy,
@@ -885,8 +905,35 @@ func newHostConfigCmd() *cobra.Command {
 		"redfish-system-id", "redfish-auth", "redfish-ca-file", "clear-redfish-ca"} {
 		cmd.MarkFlagsMutuallyExclusive("clear-redfish", f)
 	}
+	cmd.Flags().BoolVar(&trustSSHPoweroff, "trust-ssh-poweroff", false,
+		"Recover this host's workloads on an SSH power-off its remote shell confirmed over the pinned host key (default off). "+
+			"A confirmed request is not an observed power-off: a host that ignores it, or whose power-off hangs, keeps "+
+			"running its workloads beside their replacements. Never applies to a dial failure, a host-key mismatch or an "+
+			"unconfirmed result. --trust-ssh-poweroff=false turns it off")
 
 	return cmd
+}
+
+// setTrustSSHPoweroff sets or clears host's trust in a confirmed SSH
+// power-off (corrosion.LabelTrustSSHPoweroff), through SetHostLabels, which
+// is admin-only and audited.
+func setTrustSSHPoweroff(ctx context.Context, c pb.LiteVirtClient, host string, on bool) error {
+	req := &pb.SetHostLabelsRequest{Name: host}
+	if on {
+		req.Labels = map[string]string{corrosion.LabelTrustSSHPoweroff: "true"}
+	} else {
+		req.Remove = []string{corrosion.LabelTrustSSHPoweroff}
+	}
+	if _, err := c.SetHostLabels(ctx, req); err != nil {
+		return fmt.Errorf("set --trust-ssh-poweroff: %w", err)
+	}
+	if on {
+		fmt.Printf("Host %s: a confirmed SSH power-off now recovers its workloads without proof the host is off. "+
+			"If it ignores or does not finish one, they run twice.\n", host)
+	} else {
+		fmt.Printf("Host %s: a confirmed SSH power-off no longer recovers its workloads by itself.\n", host)
+	}
+	return nil
 }
 
 // checkIPMICleared confirms a --clear-ipmi took effect. A server that predates

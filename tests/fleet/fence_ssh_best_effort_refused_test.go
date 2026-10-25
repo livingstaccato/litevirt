@@ -17,8 +17,9 @@ import (
 // the unpinned path, and the production fence.Execute turns that refusal into
 // a failed fence, not best-effort's assumed success: nothing reached node-2,
 // so its VM stays recorded there on every replica, the fence is recorded
-// partial with the ways out, and the stall alert names them: power node-2 off
-// and `lv host fence-confirm node-2`, or give it ipmi or redfish.
+// partial with the ways out, and the one stall alert names the held VM and the
+// ways out: power node-2 off and `lv host fence-confirm node-2`, or give it
+// ipmi or redfish.
 //
 // Mutation: count a refused lenient fence as best-effort's assumed success
 // (fence.sshNotAttempted) — vm-victim is rescheduled, red.
@@ -108,7 +109,7 @@ func TestFleet_FenceSSH_BestEffortRowlessTargetIsHeld(t *testing.T) {
 	if len(gotReasons) == 0 {
 		t.Fatalf("no stall alert named %s", victim.Name)
 	}
-	for _, want := range []string{"lv host fence-confirm " + victim.Name, "ipmi or redfish"} {
+	for _, want := range []string{"lv host fence-confirm " + victim.Name, "ipmi or redfish", "held: vm/vm-victim"} {
 		if !strings.Contains(gotReasons[len(gotReasons)-1], want) {
 			t.Fatalf("stall reason %q does not name %q", gotReasons[len(gotReasons)-1], want)
 		}

@@ -225,6 +225,7 @@ lv host config <host>                     # Configure host settings
   [--redfish-auth session|basic]          # default session
   [--redfish-ca-file <pem>]               # CA the BMC certificate must chain to (default: system roots)
   [--clear-redfish]                       # Remove the Redfish settings
+  [--trust-ssh-poweroff[=false]]          # Recover on a confirmed, pinned SSH power-off (default off; risks two copies)
   [--watchdog-dev <path>]
   [--role worker|witness]                 # witness = vote-only tiebreaker
   [--region <name>]                       # Region label (federation)

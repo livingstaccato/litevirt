@@ -47,8 +47,18 @@ func fenceRowAt(t *testing.T, db *corrosion.Client, id, method, result string, a
 	}
 }
 
+// fenceRowDetailAt is fenceRowAt with a detail.
+func fenceRowDetailAt(t *testing.T, db *corrosion.Client, id, method, result, detail string, at time.Time) {
+	t.Helper()
+	if err := db.Execute(context.Background(),
+		`INSERT OR IGNORE INTO fencing_log (id, host_name, method, result, timestamp, detail) VALUES (?, 'down', ?, ?, ?, ?)`,
+		id, method, result, at.UTC().Format(time.RFC3339), detail); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRecentFence_FromBeforeTheHostLastTurnedActiveDoesNotCount(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	liveMembership(t, db)
 	c := newTestCoordinator("coordinator", db)
 
@@ -81,7 +91,7 @@ func TestRecentFence_FromBeforeTheHostLastTurnedActiveDoesNotCount(t *testing.T)
 // The whole path: the host that came back and fails again is fenced at once,
 // not skipped as recently fenced.
 func TestRecentFence_ANewLifeIsFencedWithoutWaitingOutTheWindow(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	liveMembership(t, db)
 	fenceRowAt(t, db, "confirm-old", "manual", "manual-confirmed", time.Now().Add(-time.Minute))
 	time.Sleep(1100 * time.Millisecond)
@@ -103,7 +113,7 @@ func TestRecentFence_ANewLifeIsFencedWithoutWaitingOutTheWindow(t *testing.T) {
 	fences := 0
 	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
 		fences++
-		return fence.Result{Method: "ssh", Success: true}
+		return fence.Result{Method: "ssh", Success: true, Detail: "stub [path=managed]"}
 	})
 	c.run(ctx)
 	if fences != 1 {
@@ -123,7 +133,7 @@ func TestRecentFence_ANewLifeIsFencedWithoutWaitingOutTheWindow(t *testing.T) {
 // (the newer success is ignored); compare with Before instead of !After (the
 // same-second success counts).
 func TestRecentFence_ARetryCountsOnlyRowsNewerThanTheFailureItRepeats(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	liveMembership(t, db)
 	c := newTestCoordinator("coordinator", db)
 	now := time.Now().UTC().Truncate(time.Second)

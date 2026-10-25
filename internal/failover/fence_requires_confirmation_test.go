@@ -10,9 +10,16 @@ import (
 
 func fencerReturning(method string, success bool) Fencer {
 	return func(context.Context, fence.HostConfig) fence.Result {
-		return fence.Result{Method: method, Detail: "stub " + method, Success: success}
+		// An ssh stub reports the pinned managed path, as a real confirmed
+		// SSH power-off does (fence.ConfirmedOverPin).
+		return fence.Result{Method: method, Detail: "stub " + method + " [path=managed]", Success: success}
 	}
 }
+
+// trustSSH labels a host as trusting a confirmed SSH power-off
+// (corrosion.LabelTrustSSHPoweroff): the tests whose subject is not the
+// trust decision, with an ssh stub standing for a fence that recovers.
+var trustSSH = map[string]string{corrosion.LabelTrustSSHPoweroff: "true"}
 
 // seedDownHost is one host quorum agrees is down, carrying a restart-any VM, plus
 // a healthy peer to receive it. labels are applied to the down host.
@@ -99,7 +106,7 @@ func TestFenceRequiresConfirmation_AnUnverifiedFenceDoesNotReschedule(t *testing
 // the default, and the reason the setting is opt-in — distrusting SSH removes
 // automatic recovery from every SSH-fenced host.
 func TestFenceRequiresConfirmation_DefaultIsUnchanged(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	c := newTestCoordinator("coordinator", db)
 	c.SetFencer(fencerReturning("ssh", true))
 
@@ -159,7 +166,7 @@ func TestFenceRequiresConfirmation_TheGateAcceptsAnOperatorConfirmation(t *testi
 		t.Fatal("precondition: acquire the lease")
 	}
 
-	c.recoverFenced(ctx, h, fence.Result{Method: "ssh", Success: true}, h.FenceStrategy, false)
+	c.recoverFenced(ctx, h, fence.Result{Method: "ssh", Success: true, Detail: "stub [path=managed]"}, h.FenceStrategy, false)
 
 	if got := vmHost(t, db, ctx); got != "alive" {
 		t.Errorf("VM on %q; an operator confirmation satisfies the label", got)

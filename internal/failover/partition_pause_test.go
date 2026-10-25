@@ -3,11 +3,13 @@ package failover
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/health"
 )
 
@@ -24,14 +26,21 @@ func (m *monoClock) Advance(d time.Duration) {
 	m.mu.Unlock()
 }
 
+// dialledFencer is a best-effort fence that ran ssh and could not reach the
+// host: a failure marked Dialled, as fence.Execute reports it.
+func dialledFencer() Fencer {
+	return func(context.Context, fence.HostConfig) fence.Result {
+		return fence.Result{Method: "best-effort-ssh", Detail: "SSH failed (exit status 255): no route to host", Dialled: true}
+	}
+}
+
 // pauseCoordinator is seedDownHost with a best-effort fence that cannot reach
-// the host (method best-effort-ssh, assurance assumed), and the reliance
-// predicate as given.
+// the host (dialledFencer), and the reliance predicate as given.
 func pauseCoordinator(t *testing.T, latched bool) (*Coordinator, *corrosion.Client, context.Context, *monoClock) {
 	t.Helper()
 	db, ctx := seedDownHost(t, "best-effort", nil)
 	c := newTestCoordinator("coordinator", db)
-	c.SetFencer(fencerReturning("best-effort-ssh", true))
+	c.SetFencer(dialledFencer())
 	mono := &monoClock{now: time.Unix(1_900_000_000, 0)}
 	c.Mono = mono.Now
 	c.PartitionPauseEnforced = func(context.Context) bool { return latched }
@@ -51,19 +60,34 @@ func newestAssurance(t *testing.T, db *corrosion.Client, ctx context.Context, ho
 	return r.String("method"), corrosion.FenceAssuranceDetail(r.String("method"), r.String("result"), r.String("detail"))
 }
 
-// Unlatched, nothing changes: an assumed best-effort fence recovers at once
-// and is recorded as assumed. G2 of docs/design/partition-pause.md.
+// Unlatched, the host's partition pause is not relied on, so a best-effort
+// fence that could not reach the host proves nothing: it is recorded failed
+// and the VM is held, with the way out named. (Before, it was recorded
+// assumed and the VM recovered at once while the original might still run.)
 //
-// Mutation: rely on the pause regardless of the predicate — the VM does not
-// move on the first cycle and this goes red.
-func TestPartitionPause_UnlatchedRecoversAtOnceAsAssumed(t *testing.T) {
+// Mutations: rely on the pause regardless of the predicate — the fence is
+// recorded self_paused and this goes red; count a dialled best-effort fence
+// as success (asSelfPause/notAFenceUnlessPaused pass it) — the VM moves.
+func TestPartitionPause_UnlatchedHoldsTheUnprovenFence(t *testing.T) {
 	c, db, ctx, _ := pauseCoordinator(t, false)
 	c.run(ctx)
-	if got := vmHost(t, db, ctx); got != "alive" {
-		t.Fatalf("VM on %q after an assumed fence with partition_pause_v1 unlatched; want it recovered at once, as today", got)
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Fatalf("VM recovered to %q on a best-effort fence that proves nothing, with no pause relied on", got)
 	}
-	if m, a := newestAssurance(t, db, ctx, "down"); a != corrosion.FenceAssumed {
-		t.Fatalf("fence recorded as %s (assurance %s), want assumed", m, a)
+	if m, a := newestAssurance(t, db, ctx, "down"); a != corrosion.FenceFailed {
+		t.Fatalf("fence recorded as %s (assurance %s), want failed", m, a)
+	}
+	assertHeldWithTheWayOut(t, c, "down")
+}
+
+// assertHeldWithTheWayOut checks host's hold names the one way out.
+func assertHeldWithTheWayOut(t *testing.T, c *Coordinator, host string) {
+	t.Helper()
+	hold := c.holdReason[host]
+	for _, want := range []string{"lv host fence-confirm " + host, "ipmi or redfish"} {
+		if !strings.Contains(hold, want) {
+			t.Fatalf("hold reason %q does not name %q", hold, want)
+		}
 	}
 }
 
@@ -123,7 +147,7 @@ func TestPartitionPause_ASuccessorWaitsAfresh(t *testing.T) {
 		t.Fatal(err)
 	}
 	succ := newTestCoordinator("alive", db)
-	succ.SetFencer(fencerReturning("best-effort-ssh", true))
+	succ.SetFencer(dialledFencer())
 	succ.Mono = mono.Now
 	succ.PartitionPauseEnforced = func(context.Context) bool { return true }
 	succ.PeerPausesOnLoss = func(string) bool { return true }
@@ -166,7 +190,7 @@ func TestPartitionPause_AHostThatAnsweredIsNotRecovered(t *testing.T) {
 }
 
 // An open partition_pause_failed for the host means its pause cannot be relied
-// on: the coordinator records assumed and behaves as without partition pause.
+// on: the fence proves nothing, and the VM is held.
 //
 // Mutation: ignore the condition in relyOnPartitionPause — the fence is
 // recorded self_paused and this goes red.
@@ -180,12 +204,13 @@ func TestPartitionPause_AFailedPauseIsNotReliedOn(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.run(ctx)
-	if _, a := newestAssurance(t, db, ctx, "down"); a != corrosion.FenceAssumed {
-		t.Fatalf("fence recorded %s although the host reported its pause failed", a)
+	if _, a := newestAssurance(t, db, ctx, "down"); a != corrosion.FenceFailed {
+		t.Fatalf("fence recorded %s although the host reported its pause failed; want failed", a)
 	}
-	if got := vmHost(t, db, ctx); got != "alive" {
-		t.Fatalf("VM on %q; with no pause to rely on, recovery runs as today", got)
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Fatalf("VM recovered to %q with no pause to rely on and no proof the host is off", got)
 	}
+	assertHeldWithTheWayOut(t, c, "down")
 }
 
 // A verified fence never waits.
@@ -345,7 +370,7 @@ func TestPartitionPause_ARegainedCoordinatorDefersNewFences(t *testing.T) {
 
 // The cluster latch is not enough: the fenced host itself must have said, on
 // its latest probe answer, that it pauses. A host whose flag went off after
-// the latch says otherwise, and is recovered as before.
+// the latch says otherwise, and its VM is held.
 //
 // Mutation: drop the per-host check — the fence reads self_paused and this
 // goes red.
@@ -353,10 +378,10 @@ func TestPartitionPause_TheTargetMustHaveAdvertisedTheToken(t *testing.T) {
 	c, db, ctx, _ := pauseCoordinator(t, true)
 	c.PeerPausesOnLoss = func(peer string) bool { return peer != "down" }
 	c.run(ctx)
-	if _, a := newestAssurance(t, db, ctx, "down"); a != corrosion.FenceAssumed {
-		t.Fatalf("fence recorded %s for a host that did not advertise the token", a)
+	if _, a := newestAssurance(t, db, ctx, "down"); a != corrosion.FenceFailed {
+		t.Fatalf("fence recorded %s for a host that did not advertise the token; want failed", a)
 	}
-	if got := vmHost(t, db, ctx); got != "alive" {
-		t.Fatalf("VM on %q; without the host's pause to rely on, recovery runs as today", got)
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Fatalf("VM recovered to %q without the host's pause to rely on", got)
 	}
 }

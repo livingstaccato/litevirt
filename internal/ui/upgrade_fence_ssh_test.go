@@ -107,3 +107,35 @@ func TestUIUpgradeHost_RunsTheFenceSSHPreflight(t *testing.T) {
 		})
 	}
 }
+
+// A member that does not report its mode is no refusal, and the upgrade goes
+// on, but the operator sees the preflight's warning in the result's toast,
+// not only in the daemon's log (R5).
+//
+// Mutation: leave the warnings out of the toast — red.
+func TestUIUpgradeHost_ShowsThePreflightWarnings(t *testing.T) {
+	mock := &upgradeMock{mockGRPC: newDefaultMock(), stream: &fakeUpgradeStream{},
+		members: []string{"host1", "host2"}, modes: map[string]string{"host2": "-"}}
+	s, err := NewServer(&silentMemberMock{mock}, "test-cluster")
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	w := serveRequest(s, upgradeReq(t, "host1"))
+	if w.Code != http.StatusOK || mock.opened != 1 {
+		t.Fatalf("upgrade = %d (%d streams), want it upgraded", w.Code, mock.opened)
+	}
+	msg, typ := renderedToast(t, w)
+	if typ != "warning" || !strings.Contains(msg, "preflight warning: host2 did not report its enforcement.fence_ssh") {
+		t.Fatalf("toast = %q (%s), want the preflight warning naming host2", msg, typ)
+	}
+}
+
+// silentMemberMock reports host2 unreachable, with no mode.
+type silentMemberMock struct{ *upgradeMock }
+
+func (m *silentMemberMock) GetFenceSSHStatus(ctx context.Context, req *pb.FenceSSHStatusRequest, opts ...grpc.CallOption) (*pb.FenceSSHStatus, error) {
+	return &pb.FenceSSHStatus{Nodes: []*pb.FenceSSHNode{
+		{Host: "host1", Reachable: true, Mode: "auto"},
+		{Host: "host2", Reachable: false},
+	}}, nil
+}

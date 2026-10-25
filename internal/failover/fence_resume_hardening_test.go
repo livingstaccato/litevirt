@@ -45,7 +45,7 @@ func TestResume_SafeFenceKeysOnTheRecordedFence(t *testing.T) {
 	first.Now = func() time.Time { return now }
 	first.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
 		seedLease(t, db, "good", now.Add(leaseDuration))
-		return fence.Result{Method: "ssh", Detail: "poweroff sent", Success: true}
+		return fence.Result{Method: "ssh", Detail: "poweroff sent [path=managed]", Success: true}
 	})
 	first.RunOnce(ctx)
 	if h, _ := corrosion.GetHost(ctx, db, "bad"); h == nil || h.State != "fenced" {

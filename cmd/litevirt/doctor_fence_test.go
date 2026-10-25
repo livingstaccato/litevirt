@@ -13,12 +13,18 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 type fenceReadinessClient struct {
 	pb.LiteVirtClient
 	resp   *pb.FenceReadiness
 	health *pb.ClusterHealth // nil → an empty health report
+	hosts  []*pb.Host
+}
+
+func (c *fenceReadinessClient) ListHosts(context.Context, *pb.ListHostsRequest, ...grpc.CallOption) (*pb.ListHostsResponse, error) {
+	return &pb.ListHostsResponse{Hosts: c.hosts}, nil
 }
 
 func (c *fenceReadinessClient) GetClusterHealth(context.Context, *pb.GetClusterHealthRequest, ...grpc.CallOption) (*pb.ClusterHealth, error) {
@@ -46,9 +52,14 @@ func runDoctorFence(t *testing.T, resp *pb.FenceReadiness) (string, int) {
 
 func runDoctorFenceWithHealth(t *testing.T, resp *pb.FenceReadiness, health *pb.ClusterHealth) (string, int) {
 	t.Helper()
+	return runDoctorFenceWith(t, &fenceReadinessClient{resp: resp, health: health})
+}
+
+func runDoctorFenceWith(t *testing.T, client *fenceReadinessClient) (string, int) {
+	t.Helper()
 	orig := withClient
 	withClient = func(ctx context.Context, fn func(context.Context, pb.LiteVirtClient) error) error {
-		return fn(ctx, &fenceReadinessClient{resp: resp, health: health})
+		return fn(ctx, client)
 	}
 	t.Cleanup(func() { withClient = orig })
 
@@ -354,6 +365,56 @@ func TestDoctorFence_FenceSSHMatrixWarnsOfAnUnpinnedFence(t *testing.T) {
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+// `lv doctor fence` names every host that fences only over SSH (ssh,
+// best-effort, or unset) and recommends ipmi or redfish, without changing the
+// exit code. A BMC host and a host in maintenance are not named.
+//
+// Mutation: drop printSSHOnlyFencing from the command — no warning, red.
+func TestDoctorFence_FlagsSSHOnlyFencing(t *testing.T) {
+	out, code := runDoctorFenceWith(t, &fenceReadinessClient{resp: &pb.FenceReadiness{}, hosts: []*pb.Host{
+		{Name: "a", FenceStrategy: ""},
+		{Name: "b", FenceStrategy: "ssh"},
+		{Name: "c", FenceStrategy: "ipmi"},
+		{Name: "d", FenceStrategy: "redfish"},
+		{Name: "m", FenceStrategy: "best-effort", State: pb.HostState_HOST_MAINTENANCE},
+	}})
+	if code != 0 {
+		t.Fatalf("exit code %d, want 0: the SSH-only warning is diagnostic", code)
+	}
+	for _, want := range []string{"2 host(s) fence only over SSH: a (best-effort), b (ssh)",
+		"lv host fence-confirm <host>", "--fence-strategy ipmi|redfish"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output does not contain %q:\n%s", want, out)
+		}
+	}
+	out, _ = runDoctorFenceWith(t, &fenceReadinessClient{resp: &pb.FenceReadiness{}, hosts: []*pb.Host{
+		{Name: "c", FenceStrategy: "ipmi"}}})
+	if strings.Contains(out, "fence only over SSH") {
+		t.Fatalf("an all-BMC cluster is warned about SSH fencing:\n%s", out)
+	}
+}
+
+// `lv doctor fence` names the hosts that trust a confirmed SSH power-off, apart
+// from the SSH-only warning, and says what it risks. A host without the label
+// is not named.
+//
+// Mutation: drop printTrustSSHPoweroff — no note, red.
+func TestDoctorFence_FlagsTrustedSSHPoweroff(t *testing.T) {
+	out, code := runDoctorFenceWith(t, &fenceReadinessClient{resp: &pb.FenceReadiness{}, hosts: []*pb.Host{
+		{Name: "a", FenceStrategy: "ssh", Labels: map[string]string{corrosion.LabelTrustSSHPoweroff: "true"}},
+		{Name: "b", FenceStrategy: "ssh"},
+	}})
+	if code != 0 {
+		t.Fatalf("exit code %d, want 0", code)
+	}
+	for _, want := range []string{"1 host(s) trust a confirmed SSH power-off (litevirt.trust_ssh_poweroff): a\n",
+		"runs them twice", "2 host(s) fence only over SSH"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output does not contain %q:\n%s", want, out)
 		}
 	}
 }

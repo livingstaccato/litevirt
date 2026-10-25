@@ -17,6 +17,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fence"
 )
 
 func newDoctorFenceCmd() *cobra.Command {
@@ -79,6 +80,10 @@ shared-disk count comes from the queried node's replicated rows.`,
 				// the verdict, so a failed read does not fail the command.
 				if h, herr := c.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{}); herr == nil {
 					printStalledObservers(os.Stdout, h.GetConditions())
+				}
+				// Best-effort too: which hosts fence only over SSH.
+				if hl, lerr := c.ListHosts(ctx, &pb.ListHostsRequest{}); lerr == nil {
+					printSSHOnlyFencing(os.Stdout, hl.GetHosts())
 				}
 				if fenceHazard(r) {
 					return silentExitError{code: 1}
@@ -305,6 +310,55 @@ func hostPostureWord(h *pb.FenceHostPosture) string {
 	default:
 		return "NOT enforcing"
 	}
+}
+
+// printSSHOnlyFencing names every host (but one in maintenance) whose fence
+// strategy goes only over SSH (ssh, best-effort, or unset, which is
+// best-effort), and recommends a
+// BMC. An SSH fence never proves a power-off, so failover recovers such a
+// host's workloads only after its partition pause, or an operator's
+// `lv host fence-confirm`; a hardware fence recovers them at once.
+// DIAGNOSTIC ONLY: it does not change the exit code.
+func printSSHOnlyFencing(w io.Writer, hosts []*pb.Host) {
+	var ssh []string
+	for _, h := range hosts {
+		if h.GetState() == pb.HostState_HOST_MAINTENANCE {
+			continue
+		}
+		if fence.SSHOnly(h.GetFenceStrategy()) {
+			ssh = append(ssh, h.GetName()+" ("+fence.ResolveStrategy(h.GetFenceStrategy())+")")
+		}
+	}
+	printTrustSSHPoweroff(w, hosts)
+	if len(ssh) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "\nWARNING: %d host(s) fence only over SSH: %s\n", len(ssh), strings.Join(ssh, ", "))
+	fmt.Fprintln(w, "An SSH fence never proves the host is off. If one of these hosts fails, its")
+	fmt.Fprintln(w, "workloads are held until its partition pause has been waited out, or until you")
+	fmt.Fprintln(w, "power it off and run `lv host fence-confirm <host>`. Give each an ipmi or redfish")
+	fmt.Fprintln(w, "fence strategy (`lv host config <host> --fence-strategy ipmi|redfish`) to recover at once.")
+}
+
+// printTrustSSHPoweroff names every host whose operator chose to trust a
+// confirmed SSH power-off (corrosion.LabelTrustSSHPoweroff), separately from
+// the SSH-only warning: their workloads are recovered on a request the host
+// confirmed, not on proof it is off.
+func printTrustSSHPoweroff(w io.Writer, hosts []*pb.Host) {
+	var trusted []string
+	for _, h := range hosts {
+		if h.GetLabels()[corrosion.LabelTrustSSHPoweroff] == "true" {
+			trusted = append(trusted, h.GetName())
+		}
+	}
+	if len(trusted) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "\nNOTE: %d host(s) trust a confirmed SSH power-off (%s): %s\n", len(trusted),
+		corrosion.LabelTrustSSHPoweroff, strings.Join(trusted, ", "))
+	fmt.Fprintln(w, "Their workloads are recovered when the remote shell confirms a power-off over the pinned host")
+	fmt.Fprintln(w, "key, without proof the host is off: one that ignores it, or whose power-off hangs, runs them twice.")
+	fmt.Fprintln(w, "`lv host config <host> --trust-ssh-poweroff=false` turns it off.")
 }
 
 // printStalledObservers lists hosts with an open observer_stalled condition:

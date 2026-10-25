@@ -41,7 +41,7 @@ func TestHADisarmPreRecord_WritesNoPolicy(t *testing.T) {
 // retries a failed attempt with backoff, stops once paid, and never blocks a
 // coordinator cycle: its call runs on its own goroutine.
 func TestHAPreRecorder_RetriesAndNeverBlocksACycle(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	c := newTestCoordinator("coordinator", db)
 	blocked := make(chan struct{})
 	var attempts atomic.Int32

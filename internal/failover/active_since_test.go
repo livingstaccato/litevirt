@@ -19,7 +19,7 @@ import (
 // Mutation: drop the activeSince check in run — the host is fenced on the
 // observations from before its boot write.
 func TestHostJustActiveIsCountedAfresh(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	db.SetHostMembershipGate(func() bool { return true })
 	if _, err := db.SplitHostMembership(ctx); err != nil || !db.HostMembershipLive() {
 		t.Fatalf("split host membership: live=%v err=%v", db.HostMembershipLive(), err)
@@ -34,7 +34,7 @@ func TestHostJustActiveIsCountedAfresh(t *testing.T) {
 	fences := 0
 	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
 		fences++
-		return fence.Result{Method: "ssh", Success: true}
+		return fence.Result{Method: "ssh", Success: true, Detail: "stub [path=managed]"}
 	})
 	c.run(ctx)
 	if fences != 0 {
@@ -67,7 +67,7 @@ func TestHostJustActiveIsCountedAfresh(t *testing.T) {
 // Mutation: return false from turnedActiveThisCycle — the first case passes
 // the host through.
 func TestTurnedActiveThisCycle(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	liveMembership(t, db)
 	c := newTestCoordinator("coordinator", db)
 
@@ -150,7 +150,7 @@ func TestCountedSinceActive(t *testing.T) {
 // Mutation: treat a NULL last_seen as a run from before the activation — the
 // host, failing since it turned active 9 s ago, is not fenced.
 func TestHostJustActive_OlderObserverRowCounts(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	liveMembership(t, db)
 	// The host turned active 9 s ago: FailuresToFence probes (8 s) fit since.
 	if _, err := db.DB().Exec(`UPDATE host_membership SET state = 'active', updated_at = ? WHERE host_name = 'down'`,
@@ -168,7 +168,7 @@ func TestHostJustActive_OlderObserverRowCounts(t *testing.T) {
 	fences := 0
 	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
 		fences++
-		return fence.Result{Method: "ssh", Success: true}
+		return fence.Result{Method: "ssh", Success: true, Detail: "stub [path=managed]"}
 	})
 	c.run(ctx)
 	if fences != 1 {

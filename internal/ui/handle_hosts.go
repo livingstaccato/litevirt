@@ -173,6 +173,21 @@ func (s *Server) handleFenceHost(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// handleFenceConfirmHost is `lv host fence-confirm` from the host page: the
+// operator has powered the host off, and its held workloads may be
+// recovered. The same RPC, under the session's own authority (admin) and
+// audit; it refuses a host that still answers.
+func (s *Server) handleFenceConfirmHost(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	result, err := s.grpc.FenceHost(s.uiBearerCtx(r), &pb.FenceHostRequest{Name: name, Confirmed: true, ConfirmManualOnly: true})
+	if err != nil {
+		rpcWriteFailed(w, "Confirm powered off", err)
+		return
+	}
+	sendToast(w, name+" confirmed powered off: "+result.Detail, "warning")
+	w.WriteHeader(http.StatusOK)
+}
+
 func (s *Server) handleRemoveHost(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	_, err := s.grpc.RemoveHost(s.uiBearerCtx(r), &pb.RemoveHostRequest{Name: name, Force: false})

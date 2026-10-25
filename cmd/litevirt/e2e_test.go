@@ -35,6 +35,9 @@ func (f *fakeStream[T]) Context() context.Context     { return context.Backgroun
 // ── Mock gRPC client ────────────────────────────────────────────────────────
 
 type mockClient struct {
+	// setHostLabels and configuredHosts record those RPCs, in order.
+	setHostLabels   []*pb.SetHostLabelsRequest
+	configuredHosts []*pb.ConfigureHostRequest
 	// Embed the client interface so RPCs the mock doesn't exercise (e.g. the
 	// firewall management calls) are satisfied without a hand-written stub.
 	pb.LiteVirtClient
@@ -184,6 +187,7 @@ func (m *mockClient) UndrainHost(_ context.Context, in *pb.UndrainHostRequest, _
 	return &pb.Host{Name: in.Name, State: pb.HostState_HOST_ACTIVE}, nil
 }
 func (m *mockClient) SetHostLabels(_ context.Context, in *pb.SetHostLabelsRequest, _ ...grpc.CallOption) (*pb.Host, error) {
+	m.setHostLabels = append(m.setHostLabels, in)
 	return &pb.Host{Name: in.Name, Labels: in.Labels}, nil
 }
 func (m *mockClient) FenceHost(_ context.Context, in *pb.FenceHostRequest, _ ...grpc.CallOption) (*pb.FenceResult, error) {
@@ -219,6 +223,7 @@ func (m *mockClient) ListHostDevices(_ context.Context, _ *pb.ListHostDevicesReq
 	return &pb.ListHostDevicesResponse{Devices: m.devices}, nil
 }
 func (m *mockClient) ConfigureHost(_ context.Context, in *pb.ConfigureHostRequest, _ ...grpc.CallOption) (*pb.Host, error) {
+	m.configuredHosts = append(m.configuredHosts, in)
 	return &pb.Host{Name: in.Name, State: pb.HostState_HOST_ACTIVE}, nil
 }
 

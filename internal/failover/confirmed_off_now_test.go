@@ -126,6 +126,8 @@ func TestConfirmedOffNow_AResumedGateRequiresTheConfirmationToStand(t *testing.T
 		safe     bool
 	}{
 		{"fence_requires_confirmation", "ssh", requireConfirmation, "ssh", false},
+		// A best-effort fence counts only as a self-pause, so the resumed
+		// row is one; its pause wait is zero here, to isolate the gate.
 		{"best-effort under safe-fence", "best-effort", nil, "best-effort-ssh", true},
 	}
 	for _, g := range gates {
@@ -141,7 +143,12 @@ func TestConfirmedOffNow_AResumedGateRequiresTheConfirmationToStand(t *testing.T
 				db, ctx := seedDownHost(t, g.strategy, g.labels)
 				confirmedAt := time.Now().Add(-time.Minute)
 				fenceRowAt(t, db, "confirm-1", "manual", "manual-confirmed", confirmedAt)
-				fenceRowAt(t, db, "fence-2", g.method, "fenced", time.Now().Add(-20*time.Second))
+				if g.method == "best-effort-ssh" {
+					fenceRowDetailAt(t, db, "fence-2", g.method, "fenced", corrosion.FencePauseReliance+"stub",
+						time.Now().Add(-20*time.Second))
+				} else {
+					fenceRowAt(t, db, "fence-2", g.method, "fenced", time.Now().Add(-20*time.Second))
+				}
 				if err := corrosion.UpdateHostState(ctx, db, "down", "offline"); err != nil {
 					t.Fatal(err)
 				}
@@ -159,6 +166,11 @@ func TestConfirmedOffNow_AResumedGateRequiresTheConfirmationToStand(t *testing.T
 				if g.safe {
 					c.Gate = gateEnforcing(capabilities.SafeFenceDefaultV1)
 					c.SafeFenceEnforce = true
+					c.PauseWaitFor = func(int) time.Duration { return 0 }
+					// The self-pause row is authority only while the pause
+					// is relied on.
+					c.PartitionPauseEnforced = func(context.Context) bool { return true }
+					c.PeerPausesOnLoss = func(string) bool { return true }
 				}
 
 				c.run(ctx)

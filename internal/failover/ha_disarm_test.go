@@ -43,7 +43,7 @@ func fenceRows(t *testing.T, db *corrosion.Client) int {
 // Mutation: skip the candidate and fence re-reads — the host is fenced while
 // disarmed and this goes red.
 func TestHADisarm_NoFenceWhileDisarmed(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	setHA(t, db, corrosion.HADisarmed)
 	c := newTestCoordinator("coordinator", db)
 	fences := 0
@@ -79,7 +79,7 @@ func TestHADisarm_NoFenceWhileDisarmed(t *testing.T) {
 // L1, the resume: a fence an operator recorded after this coordinator's own
 // failed one is not recovered from while disarmed.
 func TestHADisarm_RecordedFenceIsNotResumed(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	lengthenStreak(t, db, ctx, 2*time.Minute)
 	c := newTestCoordinator("coordinator", db)
 	fences := 0
@@ -107,7 +107,7 @@ func TestHADisarm_RecordedFenceIsNotResumed(t *testing.T) {
 // Mutation: drop the resume of a held recovery from the fence loop — the VM
 // stays on the fenced host after the arm and this goes red.
 func TestHADisarm_HeldWorkIsKeptAndRunsAfterArm(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	c := newTestCoordinator("coordinator", db)
 	fences := 0
 	c.SetFencer(countingFencer(&fences, sshFence))
@@ -174,7 +174,7 @@ func TestHADisarm_RecoverHostsRuns(t *testing.T) {
 // An unreadable policy holds every fence; a read error decides nothing,
 // recoverHosts included.
 func TestHADisarm_UnreadableOrUnreadDecidesNothing(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	if err := db.Execute(ctx, `INSERT INTO cluster_policies (key, value, set_by, updated_at, deleted_at)
 	 VALUES (?, ?, ?, ?, NULL)
 	 ON CONFLICT(key) DO UPDATE SET value = excluded.value, set_by = excluded.set_by,
@@ -189,7 +189,7 @@ func TestHADisarm_UnreadableOrUnreadDecidesNothing(t *testing.T) {
 		t.Fatal("an unreadable HA policy was read as armed")
 	}
 
-	db2, _ := seedDownHost(t, "ssh", nil)
+	db2, _ := seedDownHost(t, "ssh", trustSSH)
 	if err := corrosion.InsertHost(ctx, db2, corrosion.HostRecord{Name: "back", Address: "10.0.0.7", SSHUser: "root",
 		SSHPort: 22, GRPCPort: 7443, State: "offline", FenceStrategy: "manual"}); err != nil {
 		t.Fatal(err)
@@ -221,7 +221,7 @@ func TestHADisarm_UnreadableOrUnreadDecidesNothing(t *testing.T) {
 // Mutation: drop the re-read in failover() — the host is fenced and this goes
 // red.
 func TestHADisarm_FlipBeforeTheFence(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	c := newTestCoordinator("coordinator", db)
 	fences := 0
 	c.SetFencer(countingFencer(&fences, sshFence))
@@ -255,7 +255,7 @@ func TestHADisarm_FlipBeforeEachMintSite(t *testing.T) {
 	// The VM reschedule, at both of its re-reads.
 	for _, site := range []string{haSiteReschedule, haSiteReschedule + "-mint"} {
 		t.Run(site, func(t *testing.T) {
-			db, ctx := seedDownHost(t, "ssh", nil)
+			db, ctx := seedDownHost(t, "ssh", trustSSH)
 			c := newTestCoordinator("coordinator", db)
 			c.SetFencer(countingFencer(new(int), sshFence))
 			c.Gate = gate
@@ -354,7 +354,7 @@ func TestHADisarm_FlipBeforeEachMintSite(t *testing.T) {
 
 // The stall alert names the hold.
 func TestHADisarm_StallAlertSaysHeld(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	clock := time.Now()
 	c := newTestCoordinator("coordinator", db)
 	c.Now = func() time.Time { return clock }
@@ -822,7 +822,7 @@ func TestHADisarm_HeldRecoveryOneOffReadErrorNeverSkipsTheRefence(t *testing.T) 
 // the stall alert.
 func TestHADisarm_HeldRecoveryReadErrorsNameThemselves(t *testing.T) {
 	for _, what := range []string{"host", "fence log", "health"} {
-		db, ctx := seedDownHost(t, "ssh", nil)
+		db, ctx := seedDownHost(t, "ssh", trustSSH)
 		c := newTestCoordinator("coordinator", db)
 		c.SetFencer(countingFencer(new(int), sshFence))
 		c.ha.beforeHold = func(site string) {
@@ -849,7 +849,7 @@ func TestHADisarm_HeldRecoveryReadErrorsNameThemselves(t *testing.T) {
 // Re-review 1 I-1: a read error while judging a held recovery keeps the mark;
 // the next cycle, with the rows readable, recovers.
 func TestHADisarm_HeldRecoveryReadErrorIsRetried(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	c := newTestCoordinator("coordinator", db)
 	c.SetFencer(countingFencer(new(int), sshFence))
 	c.ha.beforeHold = func(site string) {
@@ -884,7 +884,7 @@ func TestHADisarm_HeldRecoveryReadErrorIsRetried(t *testing.T) {
 // Mutation: resume the held recovery directly — the VM moves and this goes
 // red.
 func TestHADisarm_HeldRecoveryOnAFenceThatNoLongerStandsMovesNothing(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	c := newTestCoordinator("coordinator", db)
 	fences := 0
 	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
@@ -971,7 +971,7 @@ func TestPeerVeto_VisibleAndResolves(t *testing.T) {
 // R3-m2: an armed cluster in which this node counts the scope's quorum live,
 // every live voter answering armed and fresh, still fences.
 func TestPeerVeto_ArmedClusterWithQuorumStillFences(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	c := newTestCoordinator("coordinator", db)
 	fences := 0
 	c.SetFencer(countingFencer(&fences, sshFence))
@@ -1000,11 +1000,11 @@ func TestPeerVeto_ArmedClusterWithQuorumStillFences(t *testing.T) {
 // heldBeforeFence) — no alert, and this goes red. Start the unfenced clock
 // from the newest fence row — the alert comes on the first cycle, red.
 func TestHADisarm_StallAlertNamesHostHeldBeforeFence(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	old := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
 	if err := db.Execute(ctx,
 		`INSERT INTO fencing_log (id, host_name, method, result, timestamp, detail) VALUES (?, ?, ?, ?, ?, ?)`,
-		"old", "down", "ssh", "fenced", old, "an earlier outage"); err != nil {
+		"old", "down", "ssh", "fenced", old, "an earlier outage [path=managed]"); err != nil {
 		t.Fatal(err)
 	}
 	setHA(t, db, corrosion.HADisarmed)
@@ -1046,7 +1046,7 @@ func TestHADisarm_StallAlertNamesHostHeldBeforeFence(t *testing.T) {
 	if len(alerts) != 1 {
 		t.Fatalf("stall alerts for a host held before its fence: %+v, want one", alerts)
 	}
-	if a := alerts[0]; a.host != "down" || a.reason != "recovery held: HA disarmed" || a.pending != 1 || !a.since.Equal(start) {
+	if a := alerts[0]; a.host != "down" || a.reason != "recovery held: HA disarmed; held: vm/vm" || a.pending != 1 || !a.since.Equal(start) {
 		t.Fatalf("alert = %+v, want host down, reason %q, pending 1, since %v", a, "recovery held: HA disarmed", start)
 	}
 	if fences != 0 || fenceRows(t, db) != 1 || hostState(t, db, ctx) != "active" || vmHost(t, db, ctx) != "down" {
@@ -1077,7 +1077,7 @@ func TestHADisarm_StallAlertNamesHostHeldBeforeFence(t *testing.T) {
 // reset) — the post-fence alert waits out recoveryStallRepeat, and this goes
 // red.
 func TestHADisarm_HeldClockRestartsAtTheFence(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	setHA(t, db, corrosion.HADisarmed)
 	// fencing_log rows carry the wall clock: start early enough that the
 	// fence, after the held alert, lands at the virtual clock's now.
@@ -1104,7 +1104,7 @@ func TestHADisarm_HeldClockRestartsAtTheFence(t *testing.T) {
 	}
 	tick(0)
 	tick(recoveryStallAfter + time.Second)
-	if len(reasons) != 1 || reasons[0] != "recovery held: HA disarmed" {
+	if len(reasons) != 1 || reasons[0] != "recovery held: HA disarmed; held: vm/vm" {
 		t.Fatalf("held alerts = %q, want one held by the disarm", reasons)
 	}
 
@@ -1118,7 +1118,7 @@ func TestHADisarm_HeldClockRestartsAtTheFence(t *testing.T) {
 		t.Fatalf("alerted on the cycle that fenced: %q", reasons)
 	}
 	tick(recoveryStallAfter + time.Second)
-	if len(reasons) != 2 || reasons[1] == "recovery held: HA disarmed" || sinces[1].Before(fencedAt) {
+	if len(reasons) != 2 || strings.HasPrefix(reasons[1], "recovery held: HA disarmed") || sinces[1].Before(fencedAt) {
 		t.Fatalf("alerts after the fence: %q since %v, want a second one, from the fence at %v, naming what holds it now",
 			reasons, sinces, fencedAt)
 	}
@@ -1131,7 +1131,7 @@ func TestHADisarm_HeldClockRestartsAtTheFence(t *testing.T) {
 // Mutation: admit an 'upgrading' host into heldBeforeFence whatever its age —
 // it alerts inside the upgrade grace, and this goes red.
 func TestHADisarm_UpgradingHostIsNotNamedHeldInsideItsGrace(t *testing.T) {
-	db, ctx := seedDownHost(t, "ssh", nil)
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	if err := corrosion.UpdateHostState(ctx, db, "down", "upgrading"); err != nil {
 		t.Fatal(err)
 	}
@@ -1161,7 +1161,7 @@ func TestHADisarm_UpgradingHostIsNotNamedHeldInsideItsGrace(t *testing.T) {
 	}
 	tick(upgradingTimeout - recoveryStallAfter - 30*time.Second) // past the grace: stuck
 	tick(recoveryStallAfter + time.Second)
-	if len(reasons) != 1 || reasons[0] != "recovery held: HA disarmed" {
+	if len(reasons) != 1 || reasons[0] != "recovery held: HA disarmed; held: vm/vm" {
 		t.Fatalf("a host stuck upgrading past %v: alerts %q, want one held by the disarm", upgradingTimeout, reasons)
 	}
 	if fences != 0 {

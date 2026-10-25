@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/fencessh"
@@ -53,6 +54,13 @@ func (s *Server) handleUpgradeHost(w http.ResponseWriter, r *http.Request) {
 	for _, warning := range warnings {
 		slog.Warn("upgrade preflight", "host", name, "warning", warning)
 	}
+	// Shown with the result, so the operator sees what the preflight could
+	// not check (R5): a member that did not report its mode, an unreadable
+	// status.
+	note := ""
+	if len(warnings) > 0 {
+		note = " (preflight warning: " + strings.Join(warnings, "; ") + ")"
+	}
 
 	stream, err := s.grpc.UpgradeHost(ctx)
 	if err != nil {
@@ -88,7 +96,11 @@ func (s *Server) handleUpgradeHost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sendToast(w, "Host '"+resp.HostName+"' upgraded: "+resp.OldVersion+" → "+resp.NewVersion, "success")
+	toastType := "success"
+	if note != "" {
+		toastType = "warning"
+	}
+	sendToast(w, "Host '"+resp.HostName+"' upgraded: "+resp.OldVersion+" → "+resp.NewVersion+note, toastType)
 	w.Header().Set("HX-Redirect", "/hosts/"+name)
 	w.WriteHeader(http.StatusOK)
 }

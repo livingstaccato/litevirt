@@ -76,7 +76,7 @@ func (c *Coordinator) relyOnPartitionPause(ctx context.Context, h *corrosion.Hos
 	}
 	if failed {
 		c.noteNotRelying(h.Name, "pause_failed", func() {
-			slog.Warn("failover: the host reported its partition pause FAILED; recovering on the best-effort fence alone, as without partition pause",
+			slog.Warn("failover: the host reported its partition pause FAILED; not relying on it, so a best-effort fence of it recovers nothing until it is confirmed off",
 				"host", h.Name)
 		})
 		return false
@@ -109,16 +109,79 @@ func (c *Coordinator) reliesOnPauseIfAssumed(ctx context.Context, h *corrosion.H
 	return fence.ResolveStrategy(h.FenceStrategy) == "best-effort" && c.relyOnPartitionPause(ctx, h)
 }
 
-// asSelfPause rewrites an assumed best-effort fence result as a self-pause
-// one when the pause may be relied on (relied, decided before the fence by
-// reliesOnPauseIfAssumed). Any other result is returned as is.
-func asSelfPause(fr fence.Result, relied bool) fence.Result {
-	if !fr.Success || fr.Method != "best-effort-ssh" || !relied {
+// asSelfPause rewrites a best-effort fence that ran ssh and did not confirm
+// the power-off (Dialled; or an assumed success, as a fencer on an older
+// contract reports it) as a self-pause one when the pause may be relied on
+// (relied, decided before the fence by reliesOnPauseIfAssumed). The recovery
+// then waits out the pause (pauseDeadlinePassed). Anything else is returned
+// as is, and a best-effort fence it does not rewrite is not a fence
+// (notAFenceUnlessPaused):
+//
+//   - a refused or unstarted fence (not Dialled): nothing was attempted;
+//   - a host-key mismatch (WrongHost): a different machine answered at the
+//     address, so the host may well be elsewhere and still hold the majority,
+//     and its pause is no evidence of anything;
+//   - an answered one (Answered): the host's sshd answered past the host-key
+//     check and the command still failed, so the host is reachable and has
+//     not paused for want of a majority (a hung daemon, which pauses
+//     nothing, is the likelier cause).
+//
+// A best-effort fence the remote shell confirmed (method ssh) is one more
+// fence that proves nothing, and is rewritten the same way, unless the host
+// trusts a confirmed SSH power-off (trustedSSH), when it stands as it is.
+func asSelfPause(fr fence.Result, relied, trusted bool) fence.Result {
+	if relied && fr.Method == "ssh" && fr.Success && !trustedSSH(fr, trusted) {
+		fr.Method = "best-effort-ssh"
+	} else if fr.Method != "best-effort-ssh" || !relied || fr.WrongHost || fr.Answered || (!fr.Success && !fr.Dialled) {
 		return fr
 	}
 	// The method stays best-effort-ssh, so an older coordinator reads the row
 	// as the assumed fence it always was; the reliance rides in the detail.
 	fr.Detail = corrosion.FencePauseReliance + fr.Detail
+	fr.Success, fr.Dialled = true, false
+	return fr
+}
+
+// notAFenceUnlessPaused is the rule a best-effort fence is judged by: it
+// counts only as a self-pause (asSelfPause). One that reports success any
+// other way, with no proof the host went down, is a failure; nothing stands
+// between it and a second running copy. A successful SSH request (method
+// ssh: the remote shell confirmed it was powering the host off) and every
+// other strategy's result pass unchanged.
+func notAFenceUnlessPaused(fr fence.Result) fence.Result {
+	if fr.Method != "best-effort-ssh" || !fr.Success || corrosion.ReliesOnPartitionPause(fr.Method, fr.Detail) {
+		return fr
+	}
+	fr.Success = false
+	fr.Detail += "; not counted as a fence: nothing proves the host is off, and its partition pause is not relied on"
+	return fr
+}
+
+// trustedSSH reports whether fr is an SSH power-off the host's operator has
+// chosen to trust (corrosion.LabelTrustSSHPoweroff, trusted): confirmed by
+// the remote shell, over the host's pinned key. Nothing else is, whatever the
+// setting.
+func trustedSSH(fr fence.Result, trusted bool) bool {
+	return trusted && fence.ConfirmedOverPin(fr)
+}
+
+// trustsSSHPoweroff reports whether h's operator chose to trust a confirmed
+// SSH power-off of it.
+func trustsSSHPoweroff(h *corrosion.HostRecord) bool {
+	return h != nil && h.Labels[corrosion.LabelTrustSSHPoweroff] == "true"
+}
+
+// holdUntrustedSSH stops counting an SSH power-off the remote shell confirmed
+// (method ssh) as a fence unless the host trusts one (trustedSSH): a
+// confirmed request is not an observed power-off. It is recorded as it ran;
+// recoverFenced holds the workloads on it (fr.Unproven) until a hardware
+// fence or an operator's fence-confirm.
+func holdUntrustedSSH(fr fence.Result, trusted bool) fence.Result {
+	if fr.Method != "ssh" || !fr.Success || trustedSSH(fr, trusted) {
+		return fr
+	}
+	fr.Success, fr.Unproven = false, true
+	fr.Detail += "; the remote shell confirmed the power-off, but a confirmed SSH power-off is not proof the host is off"
 	return fr
 }
 
@@ -283,6 +346,12 @@ type pauseVerdict struct {
 	observers []string
 }
 
+// whyPauseNotRelied refuses a self-pause whose pause can no longer be relied
+// on, at its deadline and on resume.
+const whyPauseNotRelied = "the host's partition pause is no longer relied on (it reported the pause failed, " +
+	"or this coordinator does not rely on it), and nothing else proves the host is off; power it off and run " +
+	"'lv host fence-confirm', or give it an ipmi or redfish fence strategy"
+
 // refused is a refusal whose reason names no observer.
 func refused(why string) pauseVerdict { return pauseVerdict{why: why, key: why} }
 
@@ -371,12 +440,15 @@ const whyContacted = "this node probed the host healthy since the wait began"
 // same evidence. Answers that are still the latest verdict (a bridge that
 // still stands) are not affected.
 func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.HostRecord, at, mono time.Time) pauseVerdict {
-	hr := c.readHostHealth(ctx, h.Name)
 	if !c.relyOnPartitionPause(ctx, h) {
-		v := c.quietFallback(ctx, hr, h.Name, at, false)
-		v.bridged, v.observers = false, nil
-		return v
+		// The wait proves nothing without the pause: the host reported its
+		// pause failed, or this coordinator cannot rely on it (its own flag
+		// off, no probe answer from the host). Nothing else proves the host
+		// off, so the deadline refuses, re-checked every cycle, and the
+		// stall alert names the way out.
+		return refused(whyPauseNotRelied)
 	}
+	hr := c.readHostHealth(ctx, h.Name)
 	sets, explicit, err := c.pauseVoterSets(ctx, h.Name)
 	if errors.Is(err, errVoterSetMoved) {
 		return refused(keyVoterSetMoved)

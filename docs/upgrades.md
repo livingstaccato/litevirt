@@ -716,8 +716,10 @@ setting holds the feature unused. Once the token latches, a host in `auto` or
 `managed` refuses to fence a host that has published no row.
 An earlier build also took `enforcement.fence_ssh: legacy`; this one refuses it
 at start, with the fix in the error. `lv host upgrade`, and the web UI's
-upgrade, read every member's running mode first and refuse while any member is
-still on `legacy`, before they pre-stage or swap anything (`--force` included): a
+upgrade on a node already running this build, read every member's running mode
+first and refuse while any member is still on `legacy`, before they pre-stage or
+swap anything (`--force` included). For an upgrade from an earlier build, whose
+web UI runs no such check, use this build's `lv host upgrade`: a
 target would not start on this build, and a member left on its binary publishes
 no fence SSH row, so once the token latches an upgraded host refuses to fence it
 and its workloads are not recovered if it fails. Set `enforcement.fence_ssh` to
@@ -1613,6 +1615,46 @@ retire latch, frozen after it — and places workloads and gates upgrades on
 them. Its own reports, written to `hosts` alone, are still absorbed by the
 upgraded hosts. Upgrade such a host to this build before you power it on
 again.
+
+### What changes for failover: a best-effort fence is no longer a fence
+
+Release note. On this build failover never starts a second copy on a guess. A
+failed host's workloads are recovered automatically only on an `ipmi` or
+`redfish` power-off observed off, on the host's own partition pause, waited
+out, or on an operator's `lv host fence-confirm` ([When a best-effort host is
+recovered](migration-failover.md#when-a-best-effort-host-is-recovered)).
+
+**SSH-confirmed fences now hold by default.** An `ssh` (or `best-effort`)
+fence whose remote shell confirmed it was powering the host off used to
+recover the host's workloads at once. It no longer does: a confirmed request
+is not an observed power-off. An operator who accepts that risk for a host can
+turn it back on with `lv host config <host> --trust-ssh-poweroff` (the
+`litevirt.trust_ssh_poweroff` label), which trusts only a confirmation reached
+over the host's pinned sshd key. `lv doctor fence` and the health page list
+the hosts with it on. Host labels are one last-writer-wins value, so an
+unrelated label written on a node that has not yet seen a
+`--trust-ssh-poweroff=false` can bring the trust back: after turning it off,
+check that `lv doctor fence` no longer lists the host.
+
+What changes on an upgraded cluster: a `best-effort` fence (the default
+strategy) that does not confirm the power-off used to be recorded `assumed`
+and recovered at once, even with nothing to show the old copy had stopped.
+Now, unless the host's partition pause is relied on, it is recorded `failed`
+and the workloads are held, as are a refused fence, an SSH host-key mismatch,
+and an assumed row an earlier build left behind. The coordinator raises one
+`host.recovery.stalled` alert per host naming the held workloads and the way
+out: power the host off and run `lv host fence-confirm <host>` (or Confirm
+powered off in the web UI), or give it an `ipmi` or `redfish` fence strategy.
+`lv doctor fence` and the web UI's health page list the hosts fenced only over
+SSH. With `enforcement.partition_pause` on (the default) and
+`partition_pause_v1` latched, a host that loses the majority is still
+recovered on its own after the pause wait, as before. Nothing gates this on
+a token: it is decided where the recovery is created. Until every host runs
+this build, a failover leader on an earlier build still recovers on an assumed
+fence it ran itself, and on any SSH power-off its remote shell confirmed,
+whatever `litevirt.trust_ssh_poweroff` says: that build does not know the
+label. Upgrade the lease holder early in the roll, or keep HA disarmed on a
+cluster whose hosts fence only over SSH until the roll is done.
 
 ### An unverified fence records `offline` after the roll
 

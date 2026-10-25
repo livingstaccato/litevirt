@@ -1016,10 +1016,90 @@ When a host goes offline, the failover coordinator:
 |--------|-------------|
 | `ipmi` | Power cycle via IPMI/BMC (requires `ipmi_address`, `ipmi_user`, `ipmi_pass` on host). Verified post-fence by polling `chassis power status`. |
 | `redfish` | Power-off through the BMC's Redfish service over HTTPS: a `ComputerSystem.Reset` with `ForceOff`, then `PowerState` polled until it reads `Off`. Same weight as `ipmi`: the fence succeeds, and is verified, only once `Off` is observed. Requires `redfish_endpoint`, `redfish_user` and `redfish_pass` on the host. See [Redfish](#redfish) below. |
-| `ssh` | Forced, immediate power-off over SSH: `systemctl poweroff --force --force`, falling back to `echo o > /proc/sysrq-trigger`. Not a graceful shutdown — no units are stopped, so `libvirt-guests` does not get to shut guests down cleanly first; the host stops now, as if its power were pulled. The session dies with the host, and that is reported as success only when the remote shell had already confirmed it was issuing the power-off. Reports failure if the host is unreachable or both power-off commands fail. How the session reaches the host — the managed fence key, root's own ssh setup, and whether the host's sshd key is pinned — is [Managed fence SSH](#managed-fence-ssh). |
+| `ssh` | Forced, immediate power-off over SSH: `systemctl poweroff --force --force`, falling back to `echo o > /proc/sysrq-trigger`. Not a graceful shutdown — no units are stopped, so `libvirt-guests` does not get to shut guests down cleanly first; the host stops now, as if its power were pulled. The session dies with the host, and that is reported as success only when the remote shell had already confirmed it was issuing the power-off. Reports failure if the host is unreachable or both power-off commands fail. Even a confirmed power-off is not proof the host is off, so failover holds the host's workloads on it unless the host trusts one (see [When a best-effort host is recovered](#when-a-best-effort-host-is-recovered)). How the session reaches the host — the managed fence key, root's own ssh setup, and whether the host's sshd key is pinned — is [Managed fence SSH](#managed-fence-ssh). |
 | `watchdog` | Local watchdog self-fence (the host writes its own watchdog timer dead). Requires `watchdog_dev` in config. When `watchdog_dev` is set the daemon validates the device at startup and refuses to start if it's absent, so a broken watchdog is caught before it's needed rather than at fence time (override: `LITEVIRT_UNSAFE_SKIP_WATCHDOG_CHECK=1`). On a graceful daemon shutdown the watchdog is disarmed only when this host owns no running VMs or containers; while it owns any, the device stays armed — a restarting daemon resumes petting well inside the timeout, and a daemon stopped for good with workloads left behind lets the watchdog reboot the host into a safely fenced state. A timer left running this way, or by a crash, is petted by the next daemon before it opens its state and through the rest of its startup, so a slow or failing startup that systemd keeps restarting does not reboot the host; one the previous daemon disarmed is not opened until the usual point of startup. That petting is bounded: each startup pets for at most `watchdog.boot_keeper_max_sec` (default 120 s), and startups that never reach the heartbeat stop being petted after `watchdog.boot_keeper_max_boots` (default 5) or once the first of them is `watchdog.boot_keeper_streak_window_sec` (default 300 s) old, so a host whose daemon cannot come back reboots within about 6 minutes. With `watchdog_dev` set and the device verified as a counting hardware watchdog, a running daemon stops petting, and self-fences, when either no state-store round trip has completed or the partition pauser has made no progress for `watchdog.liveness_stale_sec` (default 120 s; 0 turns it off): a wedged daemon must not keep its workloads behind a petted watchdog. A round trip that fails (a timeout, an interrupted query, SQLITE_BUSY or SQLITE_LOCKED) is not progress. Progress is timed on the monotonic clock, so a wall-clock step is not a wedge, and a long pass that keeps moving (settling many containers after a heal) is not one either. In auto mode (`watchdog_dev` empty), or on a device that is not verified, the daemon never stops petting for this. A self-fence writes `/run/litevirt/self-fenced`; while it exists no later daemon pets the watchdog, and each one starts fenced (it refuses ownership work), so restarting the daemon cannot cancel the reboot. Only the reboot clears it (there is no operator command to do so). On a host whose watchdog did not reboot it (a watchdog that never fires), the marker keeps the host fenced in software until it is rebooted: its workloads keep running, but it takes on no ownership work. Reboot the host; do not remove the file. Drain (or `lv host shutdown-workloads`) before planned maintenance. |
 | `manual` | Coordinator does NOT auto-reschedule; operator must run `lv host fence-confirm <host>` after physically powering it off. Required when shared storage would corrupt under split-brain. |
-| `best-effort` | Tries the same forced SSH power-off as `ssh`; an attempt it made succeeds regardless. One it never made fails, as under `ssh`: its path was refused (see [Managed fence SSH](#managed-fence-ssh)) or ssh could not start. Nothing reached the host, so the coordinator holds the recovery and retries the fence on the failed-fence backoff, and the hold names the ways out: power the host off and run `lv host fence-confirm <host>`, or give it an `ipmi` or `redfish` fence strategy. Used in homelabs / single-tenant clusters that explicitly opt out of split-brain protection. |
+| `best-effort` | Tries the same forced SSH power-off as `ssh`. It never proves the host is off, so failover recovers a best-effort host's workloads only on the host's own partition pause, waited out, or on an operator's `lv host fence-confirm` (see [When a best-effort host is recovered](#when-a-best-effort-host-is-recovered)). The default strategy. |
+
+### When a best-effort host is recovered
+
+Failover never starts a second copy of a workload on a guess. It recovers a
+failed host's workloads automatically only on proof that the old copy cannot
+run:
+
+- a proof-grade hardware fence: an `ipmi` or `redfish` power-off, observed off;
+  or
+- the host's own partition pause, waited out. The host pauses its recoverable
+  workloads once it loses the voter majority, and the coordinator relies on that
+  only as [docs/design/partition-pause.md](design/partition-pause.md) §4.3
+  allows: `partition_pause_v1` latched with the coordinator's own
+  `enforcement.partition_pause` on, the host's latest health-probe answer saying
+  it pauses, and no open `partition_pause_failed` for it. The coordinator then
+  records the fence `self_paused` and starts nothing until the pause wait (26 s
+  on up to 17 hosts) has passed. The reliance is asked again at the deadline
+  and whenever a record is resumed (by a new lease holder, or after HA is
+  re-armed): a pause no longer relied on by then (the host's
+  `partition_pause_failed` arrived, or the coordinator's own flag is off, or
+  it holds no probe answer from the host) holds the workloads. This applies to
+  the `best-effort` strategy; or
+- an operator's `lv host fence-confirm <host>` after powering the host off.
+
+Everything else holds the host's workloads:
+
+- an SSH fence (`ssh` or `best-effort`) whose remote shell confirmed it was
+  powering the host off. A confirmed request is not an observed power-off: a
+  host that ignores it, or whose power-off hangs, keeps running. The fence is
+  recorded as it ran (`requested`); a `best-effort` one is waited out as a
+  self-pause when the host's pause is relied on;
+- a best-effort SSH fence that connected and then failed, or could not connect,
+  when the host's pause is not relied on;
+- an SSH fence whose pinned host key did not match: a different machine
+  answered at the address, so not even the host's pause is relied on;
+- an SSH fence the host's sshd answered past the host-key check whose command
+  still failed (permission denied, the power-off commands failed, or it exited
+  without confirming): the host is reachable, so it has not paused for want of
+  a majority, and not even its pause is relied on;
+- a refused fence (see [Managed fence SSH](#managed-fence-ssh)), or one whose
+  ssh could not start;
+- no fence at all.
+
+A fence that failed is recorded `failed` and retried on the failed-fence
+backoff. The coordinator raises one `host.recovery.stalled` alert per host, a
+minute in, naming the held workloads, the reason, and the way out: power the
+host off and run `lv host fence-confirm <host>` (or **Confirm powered off** on
+the host's page in the web UI), or give the host an `ipmi` or `redfish` fence
+strategy. After the confirmation the recovery proceeds on its own. `lv doctor
+fence` and the web UI's health page list every host fenced only over SSH.
+
+**Trusting a confirmed SSH power-off** is a per-host operator choice, off by
+default:
+
+```bash
+lv host config <host> --trust-ssh-poweroff          # on
+lv host config <host> --trust-ssh-poweroff=false    # off
+```
+
+It sets the host's `litevirt.trust_ssh_poweroff` label (admin only, audited,
+and replicated, so every coordinator reads the same value). With it on, an SSH
+power-off of that host that the remote shell confirmed, reached over the
+host's pinned sshd key (the `managed` or `legacy-pinned` path), recovers its
+workloads at once, as an `ssh` fence did before. Nothing else is trusted,
+whatever the setting: not a dial failure, not a host-key mismatch, not an
+unconfirmed result, and not an unpinned success. The path is the one the fence
+was given, never text the answering machine printed. The risk is the one above:
+a host that confirms and then does not power off runs its workloads twice.
+`lv doctor fence` and the health page list every host with it on.
+
+Turning it off is a label write, and `hosts.labels` is one value replicated
+last-writer-wins: an unrelated label set on another node that has not yet seen
+the change writes the whole map back, and can bring the trust back. After
+`--trust-ssh-poweroff=false`, check `lv doctor fence` (or the health page) a
+little later, and turn it off again if the host is still listed. A leader on an
+earlier build ignores the label altogether and trusts every confirmed SSH
+power-off (see [upgrades.md](upgrades.md)).
+
+A fence row an earlier build recorded as an assumed best-effort success is not
+authority here either: a coordinator resuming from one holds the workloads.
 
 Configure per-host:
 
@@ -1309,9 +1389,9 @@ Any other value of `enforcement.fence_ssh` fails the daemon's start.
   fence` says it expired): renew the certificate with `lv host renew-cert`.
 - A host that has published is never fenced without its pin, in any mode, and a
   managed fence that fails is never retried down another path. A refused fence
-  fails under every strategy: a `best-effort` fence reports an attempt that failed
-  as an assumed success, but a refused one was never attempted, and it fails as
-  under `ssh`. `fencing_log`'s detail records the path: `[path=managed]`,
+  fails under every strategy, as does every best-effort fence that did not
+  confirm the power-off (see [When a best-effort host is
+  recovered](#when-a-best-effort-host-is-recovered)). `fencing_log`'s detail records the path: `[path=managed]`,
   `[path=legacy-pinned]`, `[path=legacy-unpinned]` or `[path=refused]`.
 - A new cluster's `lv host init` writes `fence_ssh: managed`, and `lv host add`
   copies it with the enforcement block. An upgraded cluster stays `auto`.
@@ -1533,7 +1613,7 @@ one replicated entry. The state says what the fence **proved**:
 | Fence | Host state |
 |---|---|
 | `ipmi` or `redfish`, powered off and observed off | `fenced` |
-| `ssh`, `watchdog`, or `best-effort` that succeeded | `offline` once `fence_state_v1` has latched; `fenced` before |
+| `ssh` or `watchdog` that succeeded, or a `best-effort` one relied on as a self-pause | `offline` once `fence_state_v1` has latched; `fenced` before |
 | any fence that failed | `offline` |
 | `lv host fence-confirm` | `fenced` |
 
@@ -1583,7 +1663,8 @@ the lease next takes the recovery over from that record. It needs:
    write, or a last-writer-wins loss under clock skew), so nothing below
    relies on it.
 2. **The newest fence attempt succeeded.** That covers a verified `ipmi` or
-   `redfish` power-off and an `ssh` or `best-effort` success. A host left `offline` by a
+   `redfish` power-off, an `ssh` success, and a `best-effort` self-pause (an
+   assumed best-effort row of an earlier build is not one). A host left `offline` by a
    failed fence has a failed newest attempt and is not resumed from; while a
    quorum sees it down, the leader fences it again on a backoff (30 s,
    doubling to 5 minutes), and a later successful fence by anyone — an
@@ -1609,7 +1690,7 @@ What happens next depends on the fence:
   raised as the `refence_failed` health condition. Confirm it is off and run
   `lv host fence-confirm <host>`, and the recovery resumes from the
   confirmation.
-- **An unverified (`ssh`, `best-effort`) fence** is resumed from directly while
+- **An unverified (`ssh`, `best-effort` self-pause) fence** is resumed from directly while
   it still stands, and never re-fenced: an SSH power-off of a host that is
   already off cannot connect and reports a failed fence. A fence that no longer
   stands is logged once, as "the recorded fence of this host no longer stands",
@@ -1943,8 +2024,9 @@ failover once this is enforced. `lv host inspect <host>` prints a note when a ho
 fence strategy can't prove a power-off. Give shared-disk hosts an IPMI or Redfish fence strategy,
 or expect to run `lv host fence-confirm` for their failover.
 
-Local-disk VMs are unaffected: their transfers keep the existing quorum/proof gate
-(a `best-effort` fence is sufficient — no shared-write hazard).
+Local-disk VMs are unaffected by this gate: their transfers keep the existing
+quorum/proof gate (a `best-effort` self-pause is sufficient — no shared-write
+hazard).
 
 ### Recovery claims (single-winner recovery)
 

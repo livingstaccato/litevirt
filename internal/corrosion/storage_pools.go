@@ -55,6 +55,35 @@ const storagePoolColumns = `host_name, name, driver, source, target, options, CO
 // places on, refreshes or resolves it; lv pool create gives it a new birth.
 const storagePoolUsable = `deleted_at IS NULL AND (incarnation = '' OR host_incarnation = COALESCE((SELECT h.incarnation FROM hosts h WHERE h.name = storage_pools.host_name), 0))`
 
+// GetStoragePoolAnyLifetime is GetStoragePool that also finds a pool born
+// under an earlier lifetime of its host (stale), which every listing leaves
+// out: what an ownership check (lv pool create) and lv pool rm must see.
+func GetStoragePoolAnyLifetime(ctx context.Context, c *Client, hostName, name string) (rec StoragePoolRecord, ok, stale bool, err error) {
+	rows, err := c.Query(ctx,
+		`SELECT `+storagePoolColumns+`, CASE WHEN `+storagePoolUsable+` THEN 0 ELSE 1 END AS stale
+		 FROM storage_pools WHERE host_name = ? AND name = ? AND deleted_at IS NULL`, hostName, name)
+	if err != nil || len(rows) == 0 {
+		return StoragePoolRecord{}, false, false, err
+	}
+	return scanStoragePool(rows[0]), true, rows[0].Int("stale") == 1, nil
+}
+
+// ListStaleHostStoragePools returns every live pool born under an earlier
+// lifetime of its host: left out of every other listing, shown by lv pool ls
+// so an operator can create it again or remove it.
+func ListStaleHostStoragePools(ctx context.Context, c *Client) ([]StoragePoolRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT `+storagePoolColumns+` FROM storage_pools WHERE deleted_at IS NULL AND NOT (`+storagePoolUsable+`)`)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]StoragePoolRecord, len(rows))
+	for i, r := range rows {
+		out[i] = scanStoragePool(r)
+	}
+	return out, nil
+}
+
 // ListAllStoragePools returns all active storage pools across the cluster.
 func ListAllStoragePools(ctx context.Context, c *Client) ([]StoragePoolRecord, error) {
 	rows, err := c.Query(ctx,

@@ -449,7 +449,8 @@ func logStaleHostPool(r StoragePoolRecord, hostN int64) {
 		return
 	}
 	slog.Warn("storage pool: born under an earlier lifetime of its host, which has been re-admitted since; "+
-		"it is not used, refreshed or reborn on its own (the host may have other storage): create it again (lv pool create) if it still exists",
+		"it is not used, refreshed or reborn on its own (the host may have other storage); lv pool ls shows it as stale-host: "+
+		"create it again (lv pool create) if it still exists, or remove it (lv pool rm)",
 		"host", r.HostName, "pool", r.Name, "pool_host_incarnation", r.HostIncarnation, "host_incarnation", hostN)
 }
 

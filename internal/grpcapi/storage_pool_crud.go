@@ -93,7 +93,12 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 	//
 	// When the stored project equals the claim this is the same path that was
 	// just checked, so an ordinary re-apply costs nothing.
-	existing, found, err := corrosion.GetStoragePool(ctx, s.db, host, req.Name)
+	//
+	// A pool born under an earlier lifetime of its host (stale-host) is left
+	// out of every listing, but its row still names its project: the check
+	// reads it too, or another project could re-create the name into its own
+	// and take over the disks that name the pool.
+	existing, found, _, err := corrosion.GetStoragePoolAnyLifetime(ctx, s.db, host, req.Name)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "lookup: %v", err)
 	}
@@ -330,7 +335,9 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 	// request's claim), scoped to the pool's host. storage_pools is replicated, so
 	// the entry node can read the record to RBAC-check before forwarding to the
 	// owning host. Fail closed on a read error.
-	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, host, req.Name)
+	// A stale-host pool (born under an earlier lifetime of its host) is found
+	// too, so it can be removed.
+	rec, ok, stale, err := corrosion.GetStoragePoolAnyLifetime(ctx, s.db, host, req.Name)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "lookup: %v", err)
 	}
@@ -367,6 +374,16 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 	// Target path: re-run the guard against this host's authoritative view.
 	if err := s.poolReferenceGuard(ctx, host, req.Name, req.Force); err != nil {
 		return nil, err
+	}
+	if stale {
+		// The row is of an earlier lifetime of this host, which may have had
+		// other storage: nothing here is torn down or cleaned, the row goes.
+		if err := corrosion.MarkStoragePoolDeleted(ctx, s.db, host, req.Name); err != nil {
+			return nil, status.Errorf(codes.Internal, "delete: %v", err)
+		}
+		s.audit(ctx, "storage.pool.delete", req.Name, fmt.Sprintf("force=%t stale-host", req.Force), "ok")
+		slog.Info("storage pool of an earlier host lifetime deleted", "host", host, "name", req.Name)
+		return &pb.DeleteStoragePoolResponse{}, nil
 	}
 
 	// A pool's own <data_dir>/pools/<name> goes with it — but never with files
@@ -506,7 +523,7 @@ func (s *Server) GetStoragePool(ctx context.Context, req *pb.GetStoragePoolReque
 	if host == "" {
 		host = s.hostName
 	}
-	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, host, req.Name)
+	rec, ok, stale, err := corrosion.GetStoragePoolAnyLifetime(ctx, s.db, host, req.Name)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "lookup: %v", err)
 	}
@@ -515,6 +532,9 @@ func (s *Server) GetStoragePool(ctx context.Context, req *pb.GetStoragePoolReque
 	}
 	if err := s.authorizeResourceRead(ctx, rec.Project, poolRBACPathFor(rec.Project, rec.Name), "storage.pool.read"); err != nil {
 		return nil, err
+	}
+	if stale {
+		rec.State = poolStateStaleHost
 	}
 	return &pb.GetStoragePoolResponse{Pool: storagePoolRecordToPB(rec)}, nil
 }

@@ -55,10 +55,12 @@ their own state.
 Once the cluster upgrade that records pool lifetimes has finished (`lv cluster
 upgrade-status`), a host added back is a new lifetime of that host, and it may
 have different storage. A pool created with `lv pool create` before the
-removal is then not used: it is left out of `lv pool ls`, placement and every
-refresh, and the daemon logs once that it belongs to an earlier lifetime of the
-host. Create it again with `lv pool create` if it still exists. A pool from the
-host's configuration file is registered again on its own.
+removal is then not used: placement and every refresh leave it out, `lv pool
+ls` and `lv pool inspect` show its state as `stale-host`, and the daemon logs
+once that it belongs to an earlier lifetime of the host. Create it again with
+`lv pool create` if it still exists, in the project it belongs to, or remove it
+with `lv pool rm`, which removes only the row. A pool from the host's
+configuration file is registered again on its own.
 
 `--option k=v` is repeatable for driver-specific flags (Ceph keyring
 paths, ZFS volblocksize, iSCSI portal addresses, …). The full

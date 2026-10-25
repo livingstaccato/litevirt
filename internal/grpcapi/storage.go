@@ -11,6 +11,11 @@ import (
 // host is no longer a member: `lv host rm` removed it.
 const poolStateDeparted = "departed"
 
+// poolStateStaleHost is the listed state of a pool born under an earlier
+// lifetime of its host (corrosion.ListStaleHostStoragePools): not used until
+// lv pool create makes it again, or lv pool rm removes it.
+const poolStateStaleHost = "stale-host"
+
 // ListStoragePools returns the pools the caller may view: global pools (any
 // viewer) + those owned by a project the caller can read. A legacy cluster viewer
 // (no project binding) still sees all via the role fallback.
@@ -26,6 +31,14 @@ func (s *Server) ListStoragePools(ctx context.Context, _ *pb.ListStoragePoolsReq
 	if err != nil {
 		return nil, err
 	}
+	stale, err := corrosion.ListStaleHostStoragePools(ctx, s.db)
+	if err != nil {
+		return nil, err
+	}
+	for i := range stale {
+		stale[i].State = poolStateStaleHost
+	}
+	pools = append(pools, stale...)
 	hosts, err := corrosion.ListHosts(ctx, s.db)
 	if err != nil {
 		return nil, err

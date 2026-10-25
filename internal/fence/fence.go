@@ -102,16 +102,18 @@ func WithTrust(detail string, trusted bool) string {
 }
 
 // RecordedTrust reports whether detail records that its fence was judged
-// trusted: its last "[trust=" token is "[trust=on]" and follows the last
-// "[path=" token, which the remote machine's output cannot carry either
-// (remoteOutput). A detail with no token (an earlier build's row) records no
-// trust: the fence is held.
+// trusted: it ends in "[trust=on]", the token its writer appends LAST, and no
+// "[path=" token follows the one before it. A "[trust=" anywhere earlier (the
+// remote machine's output, which remoteOutput rewrites anyway, or an
+// admin-set field such as a BMC address) is not read. A detail with no token
+// (an earlier build's row) records no trust: the fence is held.
 func RecordedTrust(detail string) bool {
-	i := strings.LastIndex(detail, "[trust=")
-	if i < 0 || !strings.HasPrefix(detail[i:], trustOn) {
+	d := strings.TrimSpace(detail)
+	if !strings.HasSuffix(d, trustOn) {
 		return false
 	}
-	return strings.LastIndex(detail, "[path=") < i
+	i := len(d) - len(trustOn)
+	return strings.LastIndex(d, "[path=") < i
 }
 
 // remoteOutput is what the machine that answered an SSH fence printed, as a

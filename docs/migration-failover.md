@@ -1129,7 +1129,11 @@ address stored with a bracket, which those builds wrote raw into their rows,
 is flagged as `ha.fence.bmc_address_unsafe` until it is fixed.
 A recovery resting on a trusted fence needs the host to trust one still, so
 revoking the setting holds a recovery not yet made, an owed retry included,
-until the same confirmation.
+until the same confirmation, or until the setting is turned on again: the rule
+is the trust recorded at judgement AND the host trusting one when the recovery
+is decided, on every leader at every moment, so a fence judged trusted counts
+again once the setting is back, and the leader holding it resumes the
+recovery from it on its next cycle while it still stands.
 
 Turning it off is a label write, and `hosts.labels` is one value replicated
 last-writer-wins: an unrelated label set on another node that has not yet seen

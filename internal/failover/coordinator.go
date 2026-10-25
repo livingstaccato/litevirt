@@ -1136,6 +1136,11 @@ func (c *Coordinator) run(ctx context.Context) {
 			switch {
 			case c.confirmationFencesAfresh(ctx, h):
 				afresh = true
+			case c.trustRestored(h):
+				// Held on a confirmed SSH power-off whose trust was revoked
+				// and is set again: it counts again (trust recorded at
+				// judgement AND trusted now), so it is decided afresh from
+				// the record, as a restarted coordinator decides it.
 			case c.fenceAuthorityChanged(ctx, h):
 				// A fence recorded since this coordinator handled the host
 				// (an operator's, another coordinator's), or its own failed

@@ -54,7 +54,7 @@ type unprovenFenceEvidence struct {
 // fence as it was judged, whose trust note (sshTrustNote) is its remedy's.
 func (c *Coordinator) holdUnproven(ctx context.Context, h *corrosion.HostRecord, hold, why, stale string, trust *trustJudged) {
 	c.noteGateHold(h.Name, hold, stale)
-	c.raiseUnproven(ctx, h, why, stale, trust)
+	c.raiseUnprovenAs(ctx, h, unprovenRaise{why: why, trust: trust, hold: hold, holdNote: trust.note(h)}, stale)
 }
 
 // unprovenRaise is what ha.recovery.unproven_fence was last raised with.
@@ -65,6 +65,10 @@ type unprovenRaise struct {
 	// (noteResumeDeclined), so nothing was recovered on it, and the remedy
 	// names `lv host undrain` too.
 	declined bool
+	// hold is the hold holdUnproven noted (the host.recovery.stalled text),
+	// and holdNote the trust note it embeds: the settle sweep rewrites that
+	// note in it while it is still the host's hold (review m3).
+	hold, holdNote string
 }
 
 // trustJudged is a confirmed SSH power-off held because the trust setting did
@@ -160,6 +164,43 @@ func unprovenRemedy(h *corrosion.HostRecord, trustNote string) string {
 	return out
 }
 
+// refreshTrustHold rewrites the trust note in the hold r noted, while that is
+// still host's hold, to what it says against h now: the stall alert follows
+// a trust setting changed during the hold as the condition does. Only the
+// text changes, never the hold.
+func (c *Coordinator) refreshTrustHold(host string, h *corrosion.HostRecord, r *unprovenRaise) {
+	if r.trust == nil || r.hold == "" || r.holdNote == "" || c.holdBase[host] != r.hold {
+		return
+	}
+	note := r.trust.note(h)
+	if note == r.holdNote || !strings.Contains(r.hold, r.holdNote) {
+		return
+	}
+	r.hold, r.holdNote = strings.Replace(r.hold, r.holdNote, note, 1), note
+	c.noteGateHold(host, r.hold, c.lastStale[host])
+}
+
+// trustRestored reports whether host's recovery is held here on a confirmed
+// SSH power-off that counts again: its trust was recorded when the fence was
+// judged and the host, read afresh as h, trusts one again (a revocation, then
+// the setting set again). The rule is the same on every coordinator and at
+// every moment, so the coordinator holding it re-decides it, as a restarted
+// one would from the record. It reports a host once per restoration: a
+// re-decision that holds again records its own reason.
+func (c *Coordinator) trustRestored(h *corrosion.HostRecord) bool {
+	r, ok := c.unprovenRaised[h.Name]
+	if !ok || r.trust == nil {
+		return false
+	}
+	fr := r.trust.fr
+	if !trustedSSH(fr, fence.RecordedTrust(fr.Detail, r.trust.id) && trustsSSHPoweroff(h)) {
+		return false
+	}
+	r.trust = nil
+	c.unprovenRaised[h.Name] = r
+	return true
+}
+
 // unprovenRemedyOf is unprovenRemedy for what r raised: for a recorded fence
 // declined, the undrain that lets the coordinator judge the outage afresh is
 // a way out too. Nothing was recovered on that fence, so returning the host
@@ -231,6 +272,7 @@ func (c *Coordinator) resolveUnprovenSettled(ctx context.Context, pending map[st
 			// the raise, and the host's trust setting as it is now (h is read
 			// afresh); raiseUnproven rewrites only on a change.
 			if r, ok := c.unprovenRaised[host]; ok {
+				c.refreshTrustHold(host, h, &r)
 				c.raiseUnprovenAs(ctx, h, r, c.lastStale[host])
 			}
 		}

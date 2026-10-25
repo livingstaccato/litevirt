@@ -323,11 +323,12 @@ func sshTrustNote(h *corrosion.HostRecord, fr fence.Result, id string) string {
 		return h.Name + "'s trust of a confirmed SSH power-off was revoked after this fence was judged, " +
 			"so it no longer counts; it needs `lv host fence-confirm " + h.Name + "`"
 	case recorded && now:
-		// Only on a hold re-read after the trust was set again: the
-		// revocation held this recovery, and setting it again does not
-		// release it.
+		// Only on a hold re-read after the trust was set again. The fence
+		// counts again (trust recorded at judgement AND trusted now), and
+		// the coordinator holding it decides it afresh (trustRestored).
 		return h.Name + "'s trust of a confirmed SSH power-off was revoked after this fence was judged and is set again now, " +
-			"but the revocation held this recovery; it needs `lv host fence-confirm " + h.Name + "`"
+			"so the fence counts again: the recovery resumes from it while it still stands; if it does not, it needs " +
+			"`lv host fence-confirm " + h.Name + "`"
 	case now:
 		return h.Name + " trusts a confirmed SSH power-off now, but this fence was judged before it did (or by an " +
 			"earlier build): the setting counts later fences confirmed over its pinned host key, never this one"

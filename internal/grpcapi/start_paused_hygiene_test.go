@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -27,6 +28,11 @@ func TestResumeStrandedStarts_DropsARecordWithNothingToFinish(t *testing.T) {
 			}
 			if err := fake.UndefineDomain("vm1", false); err != nil {
 				t.Fatal(err)
+			}
+			// libvirt's answer for a domain it does not know (the fake's own
+			// answer for one is "unknown", which other tests rely on).
+			fake.FailDomainStateReason = func(name string) error {
+				return fmt.Errorf("lookup domain %s: Domain not found: no domain with matching name '%s'", name, name)
 			}
 		},
 		"row gone": func(t *testing.T, s *Server, fake *libvirtfake.Fake) {

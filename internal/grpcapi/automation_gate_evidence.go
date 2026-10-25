@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -17,16 +18,33 @@ import (
 const (
 	// generationBarrierFirstRetry doubles to generationBarrierMaxRetry while
 	// a generation's evidence stays incomplete.
-	generationBarrierFirstRetry = 5 * time.Second
-	generationBarrierMaxRetry   = 10 * time.Minute
-	// generationBarrierMaxAttempts caps barriers per (generation, members,
-	// live missing voters): a voter that answers but never signs costs at
-	// most this many records until something it depends on changes.
-	generationBarrierMaxAttempts = 3
+	// generationBarrierMaxCertified caps CERTIFIED barriers per (generation,
+	// members, live missing voters): a voter that answers but never signs
+	// costs at most this many records until one of those changes, or
+	// generationBarrierCapRearm passes without a certified barrier. A failed
+	// barrier certifies nothing and does not count.
+	generationBarrierMaxCertified = 3
 	// generationBarrierProbeTimeout bounds the liveness probe of one voter,
 	// made outside the engine lock.
 	generationBarrierProbeTimeout = 2 * time.Second
 )
+
+// generationBarrierFirstRetry doubles to generationBarrierMaxRetry between
+// barrier attempts at one generation. generationBarrierCapRearm re-arms an
+// exhausted attempt cap after that long without a certified barrier.
+var (
+	generationBarrierFirstRetry = 5 * time.Second
+	generationBarrierMaxRetry   = 10 * time.Minute
+	generationBarrierCapRearm   = 10 * time.Minute
+)
+
+// SetGenerationBarrierTimingForTest replaces the backoff and cap re-arm
+// intervals and returns a function restoring them.
+func SetGenerationBarrierTimingForTest(first, max, rearm time.Duration) (restore func()) {
+	f, m, r := generationBarrierFirstRetry, generationBarrierMaxRetry, generationBarrierCapRearm
+	generationBarrierFirstRetry, generationBarrierMaxRetry, generationBarrierCapRearm = first, max, rearm
+	return func() { generationBarrierFirstRetry, generationBarrierMaxRetry, generationBarrierCapRearm = f, m, r }
+}
 
 // generationBarrierDeadline bounds one whole pass, so the daemon's adoption
 // loop (whose context has no deadline) can never stall on it.
@@ -42,12 +60,26 @@ func SetGenerationBarrierDeadlineForTest(d time.Duration) (restore func()) {
 
 // generationBarrierState is AutomationGenerationBarrier's retry state.
 type generationBarrierState struct {
-	mu       sync.Mutex
-	boot     string // random per process: request ids never replay a pre-restart one
-	key      string // generation, members and live missing voters the attempts count against
-	attempts int
-	next     time.Time
+	mu   sync.Mutex
+	boot string // random per process: request ids never replay a pre-restart one
+	// Backoff belongs to the generation: every attempt there, certified or
+	// failed, under any key, doubles it, so a flapping liveness set cannot
+	// reset it.
+	gen   int64
+	tries int
+	next  time.Time
+	// The cap belongs to the key: generation, members and live missing
+	// voters.
+	key           string
+	certified     int
+	lastCertified time.Time
+	// started counts barriers handed to the engine (tests).
+	started atomic.Int64
 }
+
+// GenerationBarrierAttemptsForTest is how many barriers this server has
+// handed to its engine.
+func (s *Server) GenerationBarrierAttemptsForTest() int64 { return s.generationBarrier.started.Load() }
 
 // AutomationGenerationBarrier gives the adopted voter generation certified
 // evidence of its automation voters (F1 Task 5G follow-up B). When this voter
@@ -57,9 +89,11 @@ type generationBarrierState struct {
 // answers, holding authority at the generation under its member incarnation,
 // does it certify an internal read barrier through its own engine, sending
 // phase 2 only to members that answered: a dead or blackholed member costs no
-// record and holds no engine lock for its timeout. Attempts are
-// capped per (generation, members, live missing set) and spaced by backoff;
-// a change in any of those re-arms them. The pass has its own deadline.
+// record and holds no engine lock for its timeout. Attempts are spaced by a
+// per-generation backoff that a change of liveness does not reset; certified
+// barriers are capped per (generation, members, live missing set), re-armed
+// by a change in any of those or by generationBarrierCapRearm without one.
+// The pass has its own deadline.
 func (s *Server) AutomationGenerationBarrier(ctx context.Context) error {
 	if !s.enfAutomation.Load() || s.db == nil {
 		return nil
@@ -89,16 +123,22 @@ func (s *Server) AutomationGenerationBarrier(ctx context.Context) error {
 		_, _ = rand.Read(r[:])
 		b.boot = hex.EncodeToString(r[:])
 	}
-	if b.key != key {
-		b.key, b.attempts, b.next = key, 0, time.Time{}
-	}
 	now := time.Now()
-	if b.attempts >= generationBarrierMaxAttempts || now.Before(b.next) {
+	if b.gen != cfg.Generation {
+		b.gen, b.tries, b.next = cfg.Generation, 0, time.Time{}
+	}
+	if b.key != key {
+		b.key, b.certified = key, 0
+	}
+	if b.certified >= generationBarrierMaxCertified && now.Sub(b.lastCertified) >= generationBarrierCapRearm {
+		b.certified = 0
+	}
+	if b.certified >= generationBarrierMaxCertified || now.Before(b.next) {
 		b.mu.Unlock()
 		return nil
 	}
-	attempt := b.attempts
-	b.attempts++
+	attempt := b.tries
+	b.tries++
 	delay := generationBarrierFirstRetry << min(attempt, 7)
 	if delay > generationBarrierMaxRetry {
 		delay = generationBarrierMaxRetry
@@ -110,9 +150,16 @@ func (s *Server) AutomationGenerationBarrier(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	b.started.Add(1)
 	if err := e.GenerationBarrier(ctx, cfg.Generation, tag, unreachable); err != nil {
 		return err
 	}
+	b.mu.Lock()
+	if b.key == key {
+		b.certified++
+		b.lastCertified = time.Now()
+	}
+	b.mu.Unlock()
 	// The barrier's own anchor is above the evidence cursor; an older anchor
 	// upgraded in place meanwhile is picked up by rescanning.
 	s.db.ResetAutomationEvidenceScan()

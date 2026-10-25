@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -236,13 +237,19 @@ func TestAutomationGateEvidenceDeadMemberNoStormNoStall(t *testing.T) {
 func TestAutomationGateEvidenceBarrierAttemptsCapped(t *testing.T) {
 	m := importedElectorate(t)
 	refuseAccepts(m.d, 64)
+	// Evidence for a, b and c first, so d is the only member missing and the
+	// cap's key stays put (evidence progress re-arms it, at most once per
+	// member).
+	if _, err := m.Engine(0).Submit(m.ctx, m.Barrier(0, "evidence-without-d")); err != nil {
+		t.Fatal(err)
+	}
 	head := m.Head(t, 0)
 	for range 8 {
 		m.a.Server.ResetGenerationBarrierBackoffForTest()
 		_ = m.a.Server.AutomationGenerationBarrier(m.ctx)
 	}
-	if added := m.Head(t, 0).Sequence - head.Sequence; added == 0 || added > 3 {
-		t.Fatalf("%d barrier records for one unchanged missing voter, want 1..3", added)
+	if added := m.Head(t, 0).Sequence - head.Sequence; added != 3 {
+		t.Fatalf("%d barrier records for one unchanged missing voter, want the cap of 3", added)
 	}
 }
 
@@ -322,5 +329,111 @@ func TestAutomationGateEvidencePassHasADeadline(t *testing.T) {
 	_ = m.a.Server.AutomationGenerationBarrier(context.Background())
 	if took := time.Since(start); took > 1500*time.Millisecond {
 		t.Fatalf("a pass with no caller deadline took %v, past its own 500ms deadline", took)
+	}
+}
+
+// switchableRefusal arms n to refuse its next count AcceptRecoveryClaim calls
+// while on is set and pass them through otherwise.
+func switchableRefusal(n *Node, on *atomic.Bool, count int) {
+	for range count {
+		n.HookUnary("AcceptRecoveryClaim", func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
+			if on.Load() {
+				return nil, status.Error(codes.Unavailable, "injected refusal")
+			}
+			return h(ctx, req)
+		})
+	}
+}
+
+// Three barriers that fail (no quorum: b, c and d refuse every accept for a
+// while) do not use up the attempt cap: once the voters sign again, the next
+// pass certifies and all four are counted, without a restart.
+func TestAutomationGateEvidenceFailedBarriersDoNotExhaustTheCap(t *testing.T) {
+	m := importedElectorate(t)
+	var refusing atomic.Bool
+	refusing.Store(true)
+	for _, n := range []*Node{m.b, m.c, m.d} {
+		switchableRefusal(n, &refusing, 256)
+	}
+	for i := range 3 {
+		m.a.Server.ResetGenerationBarrierBackoffForTest()
+		if err := m.a.Server.AutomationGenerationBarrier(m.ctx); err == nil {
+			t.Fatalf("barrier %d certified with every other voter refusing", i)
+		}
+	}
+	refusing.Store(false)
+	m.a.Server.ResetGenerationBarrierBackoffForTest()
+	if err := m.a.Server.AutomationGenerationBarrier(m.ctx); err != nil {
+		t.Fatalf("barrier after the voters recovered: %v", err)
+	}
+	if got := m.imported(t, m.a); got != 4 {
+		t.Fatalf("a counts %d after the voters recovered, want 4: failed barriers used up the cap", got)
+	}
+}
+
+// d answers but never signs: three certified barriers exhaust the cap. Once
+// d signs again, nothing changes in the cap's key, so only the quiet
+// interval re-arms it.
+func TestAutomationGateEvidenceCapRearmsAfterQuiet(t *testing.T) {
+	m := importedElectorate(t)
+	var refusing atomic.Bool
+	refusing.Store(true)
+	switchableRefusal(m.d, &refusing, 256)
+	if _, err := m.Engine(0).Submit(m.ctx, m.Barrier(0, "evidence-without-d")); err != nil {
+		t.Fatal(err)
+	}
+	head := m.Head(t, 0)
+	for range 4 {
+		m.a.Server.ResetGenerationBarrierBackoffForTest()
+		_ = m.a.Server.AutomationGenerationBarrier(m.ctx)
+	}
+	if added := m.Head(t, 0).Sequence - head.Sequence; added != 3 {
+		t.Fatalf("%d barriers certified, want the cap of 3", added)
+	}
+	refusing.Store(false)
+	m.a.Server.ResetGenerationBarrierBackoffForTest()
+	_ = m.a.Server.AutomationGenerationBarrier(m.ctx)
+	if got := m.imported(t, m.a); got != 3 {
+		t.Fatalf("fixture: capped, a counts %d, want 3", got)
+	}
+	defer grpcapi.SetGenerationBarrierTimingForTest(5*time.Second, 10*time.Minute, 0)()
+	m.a.Server.ResetGenerationBarrierBackoffForTest()
+	if err := m.a.Server.AutomationGenerationBarrier(m.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.imported(t, m.a); got != 4 {
+		t.Fatalf("a counts %d after the quiet interval, want 4: the cap never re-armed", got)
+	}
+}
+
+// b's liveness flaps on every probe while c and d answer and refuse: the set
+// of live missing voters, and so the cap's key, changes on every pass. The
+// backoff belongs to the generation, so the passes do not turn into one
+// barrier per flap.
+func TestAutomationGateEvidenceFlappingMemberNoStorm(t *testing.T) {
+	m := importedElectorate(t)
+	var refusing atomic.Bool
+	refusing.Store(true)
+	for _, n := range []*Node{m.b, m.c, m.d} {
+		switchableRefusal(n, &refusing, 1024)
+	}
+	var probes atomic.Int64
+	for range 256 {
+		m.b.HookUnary("GetAutomationImportSource", func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
+			if probes.Add(1)%2 == 0 {
+				return nil, status.Error(codes.Unavailable, "flap")
+			}
+			return h(ctx, req)
+		})
+	}
+	defer grpcapi.SetGenerationBarrierTimingForTest(300*time.Millisecond, 10*time.Minute, 10*time.Minute)()
+	start := time.Now()
+	for time.Since(start) < 4*time.Second {
+		_ = m.a.Server.AutomationGenerationBarrier(m.ctx)
+		time.Sleep(50 * time.Millisecond)
+	}
+	// Backoff 0.3, 0.6, 1.2, 2.4s from the first: at most 5 barriers in 4s.
+	if got := m.a.Server.GenerationBarrierAttemptsForTest(); got > 5 {
+		t.Fatalf("%d barriers in 4s with a flapping member, want at most 5", got)
 	}
 }

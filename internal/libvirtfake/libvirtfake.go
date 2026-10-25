@@ -1542,7 +1542,10 @@ func (f *Fake) domainStateReason(name string) (libvirt.DomainStatus, error) {
 	defer f.mu.Unlock()
 	s, ok := f.domains[name]
 	if !ok {
-		return libvirt.DomainStatus{State: "unknown", Reason: "unknown"}, nil
+		// As libvirt.Client: the lookup fails, Domain not found
+		// (libvirt.IsNotFound).
+		return libvirt.DomainStatus{State: "unknown", Reason: "unknown"},
+			fmt.Errorf("lookup domain %s: libvirtfake: Domain not found: no domain with matching name '%s'", name, name)
 	}
 	coarse := "unknown"
 	switch s {

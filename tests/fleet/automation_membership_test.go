@@ -236,6 +236,11 @@ func TestAutomationMembershipOldGenerationCannotCertify(t *testing.T) {
 // are ready.
 func TestAutomationVoterImportGuardRefusesAbsentData(t *testing.T) {
 	m := newAutomationMembershipFixture(t)
+	// Generation 1: the initialize certificate carries a, b and c's accepts,
+	// durable evidence that all three hold authority at generation 1.
+	if st := m.a.Server.AutomationMembershipStatus(m.ctx); st.ImportedVoters != 3 {
+		t.Fatalf("a reports %+v at generation 1, want three evidenced imported voters", st)
+	}
 	m.replaceC(t)
 	st := m.d.Server.AutomationMembershipStatus(m.ctx)
 	if st.Imported || st.Code != "automation_import_absent" {
@@ -251,6 +256,41 @@ func TestAutomationVoterImportGuardRefusesAbsentData(t *testing.T) {
 	}
 	if _, err := m.Engine(3).Submit(m.ctx, m.Barrier(3, "fresh-voter")); automation.Code(err) != automation.CodeUnavailable {
 		t.Fatalf("d submitted without imported data: %v", err)
+	}
+	// Generation 3 has three members but only a and b hold authority: a
+	// decision there is certified by those two alone, and the voters with
+	// evidence of an import are two, not three.
+	if _, err := m.Engine(1).Submit(m.ctx, m.Barrier(1, "two-of-three")); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []*Node{m.a, m.b} {
+		if st := n.Server.AutomationMembershipStatus(m.ctx); st.ImportedVoters != 2 {
+			t.Fatalf("%s reports %+v, want two evidenced imported voters at generation 3", n.Name, st)
+		}
+	}
+}
+
+// A reset is refused by every voter that holds automation state, at accept
+// time, whichever node coordinates it: d holds none, but a, b and c do, so no
+// majority accepts the reset and a keeps its authority.
+func TestAutomationVoterResetGuardRefusedThroughStatelessCoordinator(t *testing.T) {
+	m := newAutomationMembershipFixture(t)
+	if used, _, err := m.d.DB.AutomationUsed(m.ctx); err != nil || used {
+		t.Fatalf("d must hold no automation state for this scenario: %v %v", used, err)
+	}
+	if _, err := m.cluster.SelfClient(m.d).ChangeVoterConfig(context.Background(), &pb.ChangeVoterConfigRequest{Op: corrosion.VoterChangeReset}); err == nil {
+		t.Fatal("a reset coordinated by a node without automation state was decided")
+	} else if !strings.Contains(err.Error(), "automation") {
+		t.Fatalf("reset refused for another reason: %v", err)
+	}
+	for _, n := range m.cluster.Nodes {
+		_, _ = n.Server.AdoptVoterConfigs(context.Background())
+		if g := adoptedGen(t, n); g != 1 {
+			t.Fatalf("%s adopted generation %d after a refused reset", n.Name, g)
+		}
+	}
+	if st := m.a.Server.AutomationMembershipStatus(m.ctx); !st.Imported {
+		t.Fatalf("a lost its automation authority: %+v", st)
 	}
 }
 

@@ -1505,9 +1505,9 @@ var supported = []string{
 	// adoption pass, never the token. See Release202701V1.
 	Release202701V1,
 	Release202702V1,
-	// AutomationV1 is advertised CONDITIONALLY on enforcement.automation
-	// (default off): every voter relies on every peer refusing automation
-	// votes until its adoption carried the complete prefix. See AutomationV1.
+	// AutomationV1 is advertised UNCONDITIONALLY: every voter enforces the
+	// import-before-vote rule on its own authority row, whatever its flag
+	// says, so no node relies on a peer's flag. See AutomationV1.
 	AutomationV1,
 }
 

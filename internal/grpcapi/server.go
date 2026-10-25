@@ -559,9 +559,9 @@ type Server struct {
 	// that lets recovery_claim_v1 be advertised (with RecoveryClaimReadiness) and the
 	// reversible kill switch afterwards (recovery_claim_enforce.go).
 	enfRecoveryClaim atomic.Bool
-	// enfAutomation is enforcement.automation (default off): the flag that
-	// lets automation_v1 be advertised (automation_membership.go). It is not
-	// activation: the daemon's automation gate decides that.
+	// enfAutomation is enforcement.automation (default off): this node's
+	// enforcement of automation_v1 (tokenEnabled, not_enforcing). The token is
+	// advertised on the build; activation is the daemon's automation gate.
 	enfAutomation atomic.Bool
 	// enfPartitionPause is enforcement.partition_pause (default on): this node
 	// pauses its recoverable workloads on losing the voter majority, so it may
@@ -1737,13 +1737,14 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.enfVRRPUnicast.Load() && !s.vrrpRowLatched.Load() {
 		caps = withoutCapability(caps, capabilities.VRRPUnicastV1)
 	}
-	// automation_v1 is withheld while enforcement.automation is off: every
-	// voter relies on every peer refusing automation votes until its adoption
-	// carried the complete prefix, so the latch has to mean config uniformity.
-	// See capabilities.AutomationV1 and TestAdvertise_AutomationWithheldWhileOff.
-	if !s.enfAutomation.Load() {
-		caps = withoutCapability(caps, capabilities.AutomationV1)
-	}
+	// automation_v1 is deliberately NOT withheld here. Ask where the guarantee
+	// is enforced: every voter refuses an automation vote on its own
+	// authority row (corrosion admitAutomationTx), and only an ordinary
+	// adoption that imported the old majority's state carries that row,
+	// whatever enforcement.automation says. No node relies on a peer's flag,
+	// so withholding prevents nothing, while a witness that never sets the
+	// flag would hold the latch off fleet-wide. See
+	// TestAdvertise_AutomationIsUnconditional.
 	return caps
 }
 

@@ -112,6 +112,12 @@ func (g *AutomationGate) Readiness(ctx context.Context) AutomationReadiness {
 	case dev && m.Voters != 1:
 		fail(capabilities.AutomationComponentDurability, "development_needs_single_host",
 			fmt.Sprintf("single-host development needs exactly one voter, the adopted generation has %d", m.Voters))
+	case dev:
+		// Automation authority needs an electorate of three in storage, so a
+		// one-voter cluster never holds it; single-host storage authority is
+		// not built.
+		fail(capabilities.AutomationComponentDurability, "development_mode_unsupported",
+			"this build cannot serve single-host development: automation authority needs at least three voters")
 	default:
 		ready[capabilities.AutomationComponentDurability] = true
 	}
@@ -124,6 +130,14 @@ func (g *AutomationGate) Readiness(ctx context.Context) AutomationReadiness {
 		fail(capabilities.AutomationComponentMembership, m.Code, m.Detail)
 	case !m.Imported:
 		fail(capabilities.AutomationComponentMembership, "automation_import_absent", m.Detail)
+	case !dev && m.ImportedVoters < 3:
+		// Members are not durable voters: a member that holds no import
+		// refuses every automation vote. Peers' authority rows are not
+		// readable here, so only signatures this replica anchored at the
+		// adopted generation count; until three exist it fails closed.
+		fail(capabilities.AutomationComponentMembership, "ha_needs_three_imported_voters",
+			fmt.Sprintf("ha-quorum needs three voters of generation %d with a complete import; %d are evidenced by "+
+				"their signatures there", m.Generation, m.ImportedVoters))
 	default:
 		ready[capabilities.AutomationComponentMembership] = true
 	}

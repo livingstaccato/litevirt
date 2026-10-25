@@ -563,17 +563,18 @@ enforcement:
                               # still pinned. No mode fences a host that has published a
                               # fence ssh row without its pinned host key. `lv host init`
                               # writes managed for a new cluster. No capability token.
-  automation: false           # Advertise automation_v1, so the cluster can latch it once
-                              # every host runs a build with automation and has this flag
-                              # on (a host parked in maintenance on an older build holds it
-                              # off). Withheld while off: every voter relies on every peer
-                              # refusing automation votes until a membership change has
-                              # carried its complete automation state. Latching it does NOT
+  automation: false           # Enforce automation_v1 on this host. Every build with
+                              # automation advertises the token whatever this says (each
+                              # voter refuses automation votes until a membership change
+                              # has carried its complete automation state, flag or not);
+                              # a host parked in maintenance on an older build holds the
+                              # latch off. Enforcing it does NOT
                               # enable the automation service: that also needs the
                               # cluster's automation origin (recorded when `lv host init`
                               # founds a cluster on a build with automation; a cluster
-                              # founded earlier never has one), a complete import at an
-                              # eligible voter generation and every later readiness
+                              # founded earlier never has one), three voters of the
+                              # adopted generation evidenced (by their signatures there)
+                              # to hold a complete import, and every later readiness
                               # component, none of which exists in this build. Once
                               # latched, a rollback below it quarantines. While automation
                               # state exists, `lv cluster voter force-reconfigure` and
@@ -585,6 +586,8 @@ automation:
                               # with a complete automation import. single-host-development:
                               # an explicit opt-in for a one-host cluster, matched by the
                               # SDK's own opt-in; never valid with more than one voter.
+                              # This build cannot serve it (automation authority needs
+                              # three voters): the gate reports development_mode_unsupported.
 
 # External NetBox IPAM integration. Disabled by default; when disabled no
 # NetBox client is constructed and no behaviour changes (no HTTP, no goroutine).

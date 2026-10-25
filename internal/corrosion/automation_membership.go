@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -91,26 +92,48 @@ func carryAutomationAuthorityTx(ctx context.Context, tx *LocalTx, self string, n
 // never "unused".
 func (c *Client) AutomationUsed(ctx context.Context) (used bool, detail string, err error) {
 	err = c.ExecuteLocal(ctx, func(tx *LocalTx) error {
-		for _, q := range []struct {
-			what, sql string
-			args      []any
-		}{
-			{"automation authority", `SELECT 1 AS one FROM local_automation_authority LIMIT 1`, nil},
-			{"certified automation history", `SELECT 1 AS one FROM local_automation_history LIMIT 1`, nil},
-			{"automation claim state", `SELECT 1 AS one FROM local_recovery_claims WHERE target_kind = ? LIMIT 1`, []any{ClaimKindAutomation}},
-		} {
-			rows, err := tx.Query(ctx, q.sql, q.args...)
-			if err != nil {
-				return err
-			}
-			if len(rows) > 0 {
-				used, detail = true, q.what
-				return nil
-			}
-		}
-		return nil
+		var err error
+		used, detail, err = automationUsedTx(ctx, tx)
+		return err
 	})
 	return used, detail, err
+}
+
+func automationUsedTx(ctx context.Context, tx *LocalTx) (used bool, detail string, err error) {
+	for _, q := range []struct {
+		what, sql string
+		args      []any
+	}{
+		{"automation authority", `SELECT 1 AS one FROM local_automation_authority LIMIT 1`, nil},
+		{"certified automation history", `SELECT 1 AS one FROM local_automation_history LIMIT 1`, nil},
+		{"automation claim state", `SELECT 1 AS one FROM local_recovery_claims WHERE target_kind = ? LIMIT 1`, []any{ClaimKindAutomation}},
+	} {
+		rows, err := tx.Query(ctx, q.sql, q.args...)
+		if err != nil {
+			return false, "", err
+		}
+		if len(rows) > 0 {
+			return true, q.what, nil
+		}
+	}
+	return false, "", nil
+}
+
+// refuseResetTx is the voter's half of the reset guard: a voter holding
+// automation state never accepts a reset, whichever node coordinates it. A
+// reset re-derives the voter set without importing from the old majority, so
+// adopting it would strand every voter's automation authority. Returns the
+// refusal detail, "" to accept.
+func refuseResetTx(ctx context.Context, tx *LocalTx, self string, key ClaimKey, v *ClaimValue) (string, error) {
+	if !key.IsVoterConfig() || v == nil || v.Config == nil || v.Config.Change != VoterChangeReset {
+		return "", nil
+	}
+	used, what, err := automationUsedTx(ctx, tx)
+	if err != nil || !used {
+		return "", err
+	}
+	return fmt.Sprintf("%s holds %s, and a voter reset imports nothing from the old voter majority, so it would "+
+		"strand automation; this build has no automation recovery proof for it", self, what), nil
 }
 
 // AutomationMembershipStanding is this voter's automation membership as one
@@ -124,6 +147,14 @@ type AutomationMembershipStanding struct {
 	// adoption of Generation carried its complete state (or Generation is the
 	// one its authority was established at).
 	Imported bool
+	// ImportedVoters are the members of Generation, under their member
+	// incarnation, with durable local evidence that they hold automation
+	// authority there: this voter when Imported, and every signer of a
+	// verified automation certificate this replica anchored at Generation (a
+	// voter signs an automation accept only under its own authority at that
+	// generation). A member that has not signed anything at Generation yet is
+	// not counted: absence of evidence is not readiness.
+	ImportedVoters []string
 	// Detail says why Imported is false.
 	Detail string
 }
@@ -142,9 +173,20 @@ func (c *Client) AutomationMembershipStanding(ctx context.Context) (AutomationMe
 			return nil
 		}
 		out.Voters = len(st.cfg.Members)
+		evidenced, err := automationEvidencedVotersTx(ctx, tx, st.cfg)
+		if err != nil {
+			return err
+		}
 		_, err = automationEstablishedAuthorityTx(ctx, tx, c.hostName, st.adopted)
 		if err == nil {
 			out.Imported = true
+			evidenced[c.hostName] = true
+		}
+		for name := range evidenced {
+			out.ImportedVoters = append(out.ImportedVoters, name)
+		}
+		sort.Strings(out.ImportedVoters)
+		if out.Imported {
 			return nil
 		}
 		if !errors.Is(err, errAutomationAuthority) {
@@ -169,6 +211,37 @@ func (c *Client) AutomationMembershipStanding(ctx context.Context) (AutomationMe
 		return nil
 	})
 	return out, err
+}
+
+// automationEvidenceAnchors bounds how many of the newest anchors at the
+// adopted generation are read for signer evidence.
+const automationEvidenceAnchors = 64
+
+// automationEvidencedVotersTx returns the members of cfg (by name, under
+// their member incarnation) that signed an accept in an automation
+// certificate anchored at cfg's generation, newest first, bounded.
+func automationEvidencedVotersTx(ctx context.Context, tx *LocalTx, cfg *VoterConfig) (map[string]bool, error) {
+	out := map[string]bool{}
+	rows, err := tx.Query(ctx, `SELECT certificate FROM local_automation_anchors WHERE generation = ?
+		ORDER BY sequence DESC LIMIT ?`, cfg.Generation, automationEvidenceAnchors)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		cert, err := DecodeClaimCertificate(r.String("certificate"))
+		if err != nil || cert.ConfigGeneration != cfg.Generation {
+			continue
+		}
+		for _, a := range cert.Accepts {
+			if m, ok := cfg.Member(a.Voter); ok && m.Incarnation == a.VoterIncarnation && a.ConfigGeneration == cfg.Generation {
+				out[a.Voter] = true
+			}
+		}
+		if len(out) == len(cfg.Members) {
+			break
+		}
+	}
+	return out, nil
 }
 
 // clusterPolicyAutomationOrigin is the cluster_policies key of the automation

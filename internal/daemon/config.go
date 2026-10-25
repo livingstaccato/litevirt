@@ -947,13 +947,11 @@ type EnforcementConfig struct {
 	// fleet-wide before it forms, and after it those hosts report the token
 	// in PingResponse.not_enforcing and their peers raise ha_degraded.
 	RecoveryClaim bool `yaml:"recovery_claim,omitempty"`
-	// Automation: advertise automation_v1 (capabilities.AutomationV1), so the
-	// cluster can latch it once every host runs a build with automation and
-	// has this flag on. Default off; it is withheld while off because every
-	// voter relies on every peer refusing automation votes until its
-	// membership import is complete. Latching it does not enable the
-	// automation service: the readiness gate does, and stays closed until
-	// every readiness component exists.
+	// Automation: this node enforces automation_v1
+	// (capabilities.AutomationV1), which every build with automation
+	// advertises. Default off. Enforcing it does not enable the automation
+	// service: the readiness gate does, and stays closed until every
+	// readiness component exists.
 	Automation bool `yaml:"automation,omitempty"`
 	// PartitionPause: on losing the voter majority for T_pause (10 s), suspend
 	// every VM and freeze every container the failover coordinator would

@@ -621,6 +621,12 @@ func (c *Client) claimAcceptValue(ctx context.Context, key ClaimKey, b Ballot, v
 				res.Refusal, res.Detail = r, d
 				return nil
 			}
+			if d, err := refuseResetTx(ctx, tx, c.hostName, key, &v); err != nil {
+				return err
+			} else if d != "" {
+				res.Refusal, res.Detail = RefusalInvalidValue, d
+				return nil
+			}
 			if sealed, err := legacyKeySealedTx(ctx, tx, key); err != nil {
 				return err
 			} else if sealed {

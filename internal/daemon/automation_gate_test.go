@@ -23,7 +23,7 @@ func readyTask5Gate(mode string, voters int) *AutomationGate {
 			return true, "", nil
 		},
 		Membership: func(context.Context) grpcapi.AutomationMembershipStatus {
-			return grpcapi.AutomationMembershipStatus{Generation: 4, Voters: voters, Imported: true}
+			return grpcapi.AutomationMembershipStatus{Generation: 4, Voters: voters, ImportedVoters: voters, Imported: true}
 		},
 	}
 }
@@ -86,6 +86,15 @@ func TestAutomationGateHANeedsThreeDurableVoters(t *testing.T) {
 			t.Fatalf("%d voters: membership %+v (present %v), want ha_needs_three_voters", tc.voters, n, found)
 		}
 	}
+	// Three members, but only two hold a carried import: the real quorum has
+	// no fault tolerance.
+	g2 := readyTask5Gate("", 3)
+	g2.Membership = func(context.Context) grpcapi.AutomationMembershipStatus {
+		return grpcapi.AutomationMembershipStatus{Generation: 4, Voters: 3, ImportedVoters: 2, Imported: true}
+	}
+	if n, ok := reasonFor(g2.Readiness(context.Background()), capabilities.AutomationComponentMembership); !ok || n.Code != "ha_needs_three_imported_voters" {
+		t.Fatalf("two imported voters of three: %+v (present %v)", n, ok)
+	}
 	// A three-voter generation whose import is incomplete is not durable.
 	g := readyTask5Gate("", 3)
 	g.Membership = func(context.Context) grpcapi.AutomationMembershipStatus {
@@ -97,26 +106,34 @@ func TestAutomationGateHANeedsThreeDurableVoters(t *testing.T) {
 }
 
 func TestAutomationGateDevelopmentNeedsExplicitOptIn(t *testing.T) {
-	// One voter and no opt-in: the HA default refuses it.
-	r := readyTask5Gate("", 1).Readiness(context.Background())
+	// The state a one-host cluster actually reaches: one voter, and no
+	// automation authority (storage requires three members).
+	single := func(mode string) *AutomationGate {
+		g := readyTask5Gate(mode, 1)
+		g.Membership = func(context.Context) grpcapi.AutomationMembershipStatus {
+			return grpcapi.AutomationMembershipStatus{Generation: 1, Voters: 1, Code: "automation_import_absent", Detail: "no authority"}
+		}
+		return g
+	}
+	// No opt-in: the HA default refuses it.
+	r := single("").Readiness(context.Background())
 	if r.Mode != capabilities.AutomationModeHAQuorum {
 		t.Fatalf("default mode %q, want %q", r.Mode, capabilities.AutomationModeHAQuorum)
 	}
 	if n, ok := reasonFor(r, capabilities.AutomationComponentMembership); !ok || n.Code != "ha_needs_three_voters" {
 		t.Fatalf("single voter without opt-in: %+v", n)
 	}
-	// Explicitly opted in: the single-host mode is reported and the HA rule
-	// does not apply; a multi-voter cluster cannot claim it.
-	r = readyTask5Gate(capabilities.AutomationModeSingleHostDevelopment, 1).Readiness(context.Background())
-	if r.Mode != capabilities.AutomationModeSingleHostDevelopment {
-		t.Fatalf("opted-in mode %q", r.Mode)
+	// Explicitly opted in: the mode is reported, and the gate says plainly
+	// that this build cannot serve it, rather than an HA reason.
+	r = single(capabilities.AutomationModeSingleHostDevelopment).Readiness(context.Background())
+	if r.Mode != capabilities.AutomationModeSingleHostDevelopment || r.Ready {
+		t.Fatalf("opted-in: %+v", r)
+	}
+	if n, ok := reasonFor(r, capabilities.AutomationComponentDurability); !ok || n.Code != "development_mode_unsupported" {
+		t.Fatalf("single-host development: %+v (present %v), want development_mode_unsupported", n, ok)
 	}
 	if n, ok := reasonFor(r, capabilities.AutomationComponentMembership); ok && n.Code == "ha_needs_three_voters" {
 		t.Fatal("explicit single-host development still held to the HA voter rule")
-	}
-	r = readyTask5Gate(capabilities.AutomationModeSingleHostDevelopment, 3).Readiness(context.Background())
-	if n, ok := reasonFor(r, capabilities.AutomationComponentDurability); !ok || n.Code != "development_needs_single_host" {
-		t.Fatalf("single-host development on three voters: %+v", n)
 	}
 	// An unknown mode is a config error, never a silent default.
 	if err := validateAutomationConfig(AutomationConfig{DurabilityMode: "fast"}); err == nil {
@@ -159,33 +176,48 @@ func TestAutomationGateRefusesClusterWithoutOrigin(t *testing.T) {
 	}
 }
 
-// Once automation_v1 has latched here, every rollback to a build that does not
-// know it quarantines, whether or not anything was used yet: its marker
-// carries no safe_if_unused rule. Managed resources only exist after the
-// latch, so a rollback that would orphan them is always caught.
-func TestAutomationVoterRollbackGuardAfterManagedResources(t *testing.T) {
+// What this pins: once automation_v1 has latched here, a rollback to any build
+// that does not know the token quarantines, unconditionally — its marker
+// carries no safe_if_unused rule, so no reading of the recorded release-feature
+// uses (empty, failing, or naming an automation feature) turns it into a mere
+// probation. It does not model managed resources: they can only exist after
+// the latch, so "quarantine on every rollback below the latch" covers "after
+// managed resources exist" by being stronger.
+func TestAutomationVoterRollbackGuardQuarantinesBelowTheLatch(t *testing.T) {
 	if !capabilities.Has(capabilities.All(), capabilities.AutomationV1) {
 		t.Fatal("automation_v1 is not a declared token: a latched marker would quarantine this very build")
 	}
-	dir := t.TempDir()
 	content := capabilities.MarkerContent(capabilities.AutomationV1)
 	// What an older build sees: a marker it has no token for, with
 	// automation_v1's exact content.
 	const older = "automation_v1_as_seen_by_an_older_build"
-	if err := os.WriteFile(health.ActivationMarkerPath(dir, older), content, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	unused := func() ([]corrosion.ReleaseFeatureUse, error) { return nil, nil }
-	q, probation := preflightRollback(dir, unused)
-	if len(q) != 1 || q[0] != older || len(probation) != 0 {
-		t.Fatalf("rollback below automation_v1: quarantine %v probation %v, want quarantine of the token", q, probation)
-	}
-	// And this build, which knows the token, is not a rollback.
-	if err := os.WriteFile(health.ActivationMarkerPath(dir, capabilities.AutomationV1), content, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if q, _ := preflightRollback(dir, unused); len(q) != 1 {
-		t.Fatalf("this build quarantined on its own automation_v1 marker: %v", q)
+	for _, uses := range []struct {
+		name string
+		fn   func() ([]corrosion.ReleaseFeatureUse, error)
+	}{
+		{"nothing used", func() ([]corrosion.ReleaseFeatureUse, error) { return nil, nil }},
+		{"uses unreadable", func() ([]corrosion.ReleaseFeatureUse, error) { return nil, os.ErrPermission }},
+		{"automation used", func() ([]corrosion.ReleaseFeatureUse, error) {
+			return []corrosion.ReleaseFeatureUse{{Token: older, Feature: string(capabilities.FeatureAutomationStream)}}, nil
+		}},
+	} {
+		t.Run(uses.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(health.ActivationMarkerPath(dir, older), content, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			q, probation := preflightRollback(dir, uses.fn)
+			if len(q) != 1 || q[0] != older || len(probation) != 0 {
+				t.Fatalf("rollback below automation_v1: quarantine %v probation %v, want quarantine of the token", q, probation)
+			}
+			// This build, which knows the token, is not a rollback.
+			if err := os.WriteFile(health.ActivationMarkerPath(dir, capabilities.AutomationV1), content, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if q, _ := preflightRollback(dir, uses.fn); len(q) != 1 || q[0] != older {
+				t.Fatalf("this build quarantined on its own automation_v1 marker: %v", q)
+			}
+		})
 	}
 }
 

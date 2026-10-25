@@ -26,13 +26,16 @@ import (
 //   - a forced generation adopts through the non-carrying import, and both
 //     forcing it and signing it are refused while automation history exists
 //     (refuseWithoutAutomationRecoveryProof);
-//   - a reset is refused while automation history exists;
+//   - a reset is refused while automation history exists, by the
+//     coordinator and, at accept time, by every voter that holds automation
+//     state (corrosion refuseResetTx), whichever node coordinates it;
 //   - a voter new to the electorate adopts the generation but holds no
 //     authority, so it refuses every automation vote and reports
 //     automation_import_absent until a complete prefix import exists for it.
 
 // SetAutomationEnforce sets enforcement.automation: whether this node
-// advertises automation_v1. It is not activation (the daemon's gate).
+// enforces automation_v1 (tokenEnabled, not_enforcing). automation_v1 itself
+// is advertised on the build. It is not activation (the daemon's gate).
 func (s *Server) SetAutomationEnforce(on bool) { s.enfAutomation.Store(on) }
 
 // AutomationMembershipStatus is this voter's membership readiness for
@@ -42,6 +45,10 @@ type AutomationMembershipStatus struct {
 	Voters     int
 	// Imported: this voter holds automation authority at Generation.
 	Imported bool
+	// ImportedVoters counts the members of Generation with durable local
+	// evidence that they hold authority there
+	// (corrosion.AutomationMembershipStanding.ImportedVoters).
+	ImportedVoters int
 	// Durable: this voter commits promises durably and can sign
 	// (VoterConfigReadiness).
 	Durable bool
@@ -63,6 +70,7 @@ func (s *Server) AutomationMembershipStatus(ctx context.Context) AutomationMembe
 		return out
 	}
 	out.Generation, out.Voters, out.Imported = st.Generation, st.Voters, st.Imported
+	out.ImportedVoters = len(st.ImportedVoters)
 	out.Durable, out.Detail = s.VoterConfigReadiness(ctx)
 	switch {
 	case !st.Imported:

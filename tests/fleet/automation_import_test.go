@@ -207,9 +207,10 @@ func TestAutomationVoterImportRefusesForgedOrStaleCut(t *testing.T) {
 	head := m.Head(t, 0)
 	other := m.record(t, m.a, head.Sequence-1)
 
-	// Forged tip. Sources are tried in name order and the first record with
-	// the attested digest is taken, so a serves it.
-	forgeDecision(t, m.a, other.Certificate)
+	// Forged tip from every source: each is tried once.
+	for _, n := range []*Node{m.a, m.b, m.c} {
+		forgeDecision(t, n, other.Certificate)
+	}
 	if err := m.d.Server.ImportAutomationPrefix(m.ctx); err == nil {
 		t.Fatal("import accepted a tip whose certificate certifies another record")
 	}
@@ -328,5 +329,87 @@ func TestAutomationVoterImportKeepsResetAndForceRefused(t *testing.T) {
 	}
 	if _, err := m.d.DB.AutomationImportPlan(m.ctx); !errors.Is(err, corrosion.ErrAutomationAlreadyImported) {
 		t.Fatalf("plan after import: %v", err)
+	}
+}
+
+// One source serving a tip whose certificate does not verify (forged, or
+// signed by a since-revoked key) does not block the import: the next source
+// with the attested digest is tried, and d imports from b.
+func TestAutomationVoterImportSkipsABadSource(t *testing.T) {
+	m := grownElectorate(t)
+	other := m.record(t, m.a, m.Head(t, 0).Sequence-1)
+	forgeDecision(t, m.a, other.Certificate)
+	if err := m.d.Server.ImportAutomationPrefix(m.ctx); err != nil {
+		t.Fatalf("one bad source of three blocked the import: %v", err)
+	}
+	if st := m.d.Server.AutomationMembershipStatus(m.ctx); !st.Imported {
+		t.Fatalf("d reports %+v", st)
+	}
+	if h, want := m.Head(t, 3), m.Head(t, 0); h != want {
+		t.Fatalf("d's head %+v, want %+v", h, want)
+	}
+}
+
+// Each of the grant's own guards refuses with its own reason, so none of them
+// is carried by a later check.
+func TestAutomationVoterImportGrantGuards(t *testing.T) {
+	m := grownElectorate(t)
+	grant := capabilities.GrantForTest(t, capabilities.FeatureAutomationState)
+	refuse := func(why, want string, att []corrosion.AutomationImportSource) {
+		t.Helper()
+		err := m.d.DB.AutomationGrantImportedAuthority(m.ctx, grant, 2, att)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("%s: grant = %v, want a refusal naming %q", why, err, want)
+		}
+		m.requireNoImport(t, why)
+	}
+
+	// An interrupted import: the tip is staged, no predecessor is.
+	fail := func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
+		return nil, status.Error(codes.Unavailable, "injected")
+	}
+	m.a.HookUnary("GetAutomationDecision", func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) { return h(ctx, req) })
+	m.a.HookUnary("GetAutomationDecision", fail)
+	m.b.HookUnary("GetAutomationDecision", fail)
+	m.c.HookUnary("GetAutomationDecision", fail)
+	if err := m.d.Server.ImportAutomationPrefix(m.ctx); err == nil {
+		t.Fatal("fixture: import completed")
+	}
+	att := m.attestations(t, 2)
+	refuse("staged import pending", "not finished", att)
+
+	if err := m.d.Server.ImportAutomationPrefix(m.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := localExec(m.ctx, m.d.DB, `DELETE FROM local_automation_authority WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	head := m.Head(t, 3)
+
+	// A target beyond the local certified head.
+	ahead := append([]corrosion.AutomationImportSource(nil), att...)
+	for i := range ahead {
+		ahead[i].Head.Sequence = head.Sequence + 1
+	}
+	refuse("target ahead of the local head", "below the old majority", ahead)
+
+	// The sources name another automation cluster than the local history.
+	foreign := append([]corrosion.AutomationImportSource(nil), att...)
+	for i := range foreign {
+		foreign[i].Head.ClusterUID = "another-cluster"
+	}
+	refuse("other automation cluster", "automation cluster", foreign)
+
+	// The semantic projection lags the certified head.
+	if err := localExec(m.ctx, m.d.DB, `UPDATE local_automation_semantic_heads SET sequence = sequence - 1 WHERE stage = ''`); err != nil {
+		t.Fatal(err)
+	}
+	refuse("semantic projection behind", "semantic projection", att)
+	if err := localExec(m.ctx, m.d.DB, `UPDATE local_automation_semantic_heads SET sequence = sequence + 1 WHERE stage = ''`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.d.DB.AutomationGrantImportedAuthority(m.ctx, grant, 2, att); err != nil {
+		t.Fatalf("genuine grant after the refusals: %v", err)
 	}
 }

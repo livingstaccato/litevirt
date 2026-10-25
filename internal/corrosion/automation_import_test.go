@@ -10,7 +10,7 @@ import (
 
 // importVoters: a, b and c are generation 1; d's replica adopts generation 2
 // as built by next, through the sealed-majority import unless plain.
-func importVoterAt(t *testing.T, next func(a, b, c, d *claimTestVoter) VoterConfigValue, plain bool) (d *claimTestVoter, cfg VoterConfigValue) {
+func importVoterAt(t *testing.T, next func(a, b, c, d *claimTestVoter) VoterConfigValue, plain bool, from ...string) (d *claimTestVoter, cfg VoterConfigValue) {
 	t.Helper()
 	ctx := context.Background()
 	ca := newClaimTestCA(t)
@@ -26,7 +26,10 @@ func importVoterAt(t *testing.T, next func(a, b, c, d *claimTestVoter) VoterConf
 	if plain {
 		err = RecordVoterAdoption(ctx, d.c, 2)
 	} else {
-		_, err = d.c.ImportClaimsAndAdoptAutomation(ctx, 2, []string{"a", "b"}, nil)
+		if len(from) == 0 {
+			from = []string{"a", "b"}
+		}
+		_, err = d.c.ImportClaimsAndAdoptAutomation(ctx, 2, from, nil)
 	}
 	if err != nil {
 		t.Fatal(err)
@@ -49,18 +52,23 @@ func TestAutomationImportEligibilityRules(t *testing.T) {
 		next  func(a, b, c, d *claimTestVoter) VoterConfigValue
 		plain bool
 		ok    bool
+		from  []string
 	}{
-		{"ordinary add", add, false, true},
-		{"adopted without the sealed-majority import", add, true, false},
+		{"ordinary add", add, false, true, nil},
+		{"adopted without the sealed-majority import", add, true, false, nil},
+		{"imported from a minority of the old generation", add, false, false, []string{"a"}},
+		{"imported from voters outside the old generation", add, false, false, []string{"d", "x"}},
+		{"imported from one voter named twice", add, false, false, []string{"a", "a"}},
+		{"imported from the whole old generation", add, false, true, []string{"a", "b", "c"}},
 		{"forced", func(a, b, c, d *claimTestVoter) VoterConfigValue {
 			return VoterConfigValue{Members: membersOf(a, b, d), Change: "force:x"}
-		}, false, false},
+		}, false, false, nil},
 		{"reset", func(a, b, c, d *claimTestVoter) VoterConfigValue {
 			return VoterConfigValue{Members: membersOf(a, b, c, d), Change: VoterChangeReset}
-		}, false, false},
+		}, false, false, nil},
 		{"two voters", func(a, b, c, d *claimTestVoter) VoterConfigValue {
 			return VoterConfigValue{Members: membersOf(a, d), Change: VoterChangeAdd("d")}
-		}, false, false},
+		}, false, false, nil},
 		{"other incarnation", func(a, b, c, d *claimTestVoter) VoterConfigValue {
 			ms := membersOf(a, b, c, d)
 			for i := range ms {
@@ -69,10 +77,10 @@ func TestAutomationImportEligibilityRules(t *testing.T) {
 				}
 			}
 			return VoterConfigValue{Members: ms, Change: VoterChangeAdd("d")}
-		}, false, false},
+		}, false, false, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			d, _ := importVoterAt(t, tc.next, tc.plain)
+			d, _ := importVoterAt(t, tc.next, tc.plain, tc.from...)
 			var plan AutomationImportPlan
 			err := d.c.ExecuteLocal(ctx, func(tx *LocalTx) error {
 				var err error
@@ -153,5 +161,47 @@ func TestAutomationImportTargetNeedsOldMajority(t *testing.T) {
 	split[1].Head.ClusterUID = "v"
 	if _, _, err := plan.Target(split); err == nil {
 		t.Fatal("sources disagreeing on the automation cluster accepted")
+	}
+}
+
+// A tip is verified only against an ordinary automation electorate no later
+// than the import generation: not a forced one, not a reset, not one of two.
+func TestAutomationImportCertConfigRules(t *testing.T) {
+	ctx := context.Background()
+	ca := newClaimTestCA(t)
+	a, b, c := newClaimTestVoter(t, ca, "a"), newClaimTestVoter(t, ca, "b"), newClaimTestVoter(t, ca, "c")
+	d := newClaimTestVoter(t, ca, "d")
+	for _, v := range []VoterConfigValue{
+		{Generation: 1, Members: membersOf(a, b, c), Change: VoterChangeGenesis},
+		{Generation: 2, Members: membersOf(a, b, c), Change: "force:x"},
+		{Generation: 3, Members: membersOf(a, b, c), Change: VoterChangeReset},
+		{Generation: 4, Members: membersOf(a, b), Change: "rm:c"},
+		{Generation: 5, Members: membersOf(a, b, c), Change: VoterChangeAdd("c")},
+	} {
+		v.CreatedBy, v.CreatedAt = "t", "t"
+		if err := WriteVoterConfig(ctx, d.c, v, ClaimCertificate{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		certGen, gen int64
+		ok           bool
+		why          string
+	}{
+		{1, 5, true, "ordinary genesis"},
+		{5, 5, true, "the import generation itself"},
+		{2, 5, false, "forced"},
+		{3, 5, false, "reset"},
+		{4, 5, false, "two voters"},
+		{5, 4, false, "later than the import generation"},
+		{0, 5, false, "no generation"},
+	} {
+		err := d.c.ExecuteLocal(ctx, func(tx *LocalTx) error {
+			_, err := automationImportCertConfigTx(ctx, tx, tc.certGen, tc.gen)
+			return err
+		})
+		if (err == nil) != tc.ok {
+			t.Fatalf("%s (certified at %d, import at %d): %v, want ok=%v", tc.why, tc.certGen, tc.gen, err, tc.ok)
+		}
 	}
 }

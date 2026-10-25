@@ -2,6 +2,8 @@ package automation
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
@@ -25,7 +27,11 @@ func (e *Engine) ImportPrefix(ctx context.Context, grant capabilities.FeatureGra
 		return err
 	}
 	if head.Sequence < target.Sequence {
-		var tip *corrosion.AutomationRecord
+		// Try every source serving the attested tip: one whose certificate
+		// does not verify (forged, or signed by a since-revoked key) must not
+		// block an import that another source can serve.
+		var refused error = fail(CodeUnavailable)
+		begun := false
 		for _, v := range sources {
 			call, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
 			r, ok, err := e.transport.Fetch(call, v, target.Sequence)
@@ -33,16 +39,21 @@ func (e *Engine) ImportPrefix(ctx context.Context, grant capabilities.FeatureGra
 			if err != nil || !ok {
 				continue
 			}
-			if digest, err := r.Value.Digest(); err == nil && digest == target.Digest {
-				tip = &r
-				break
+			if digest, err := r.Value.Digest(); err != nil || digest != target.Digest {
+				continue
 			}
+			if err := e.db.AutomationBeginImport(ctx, grant, r, e.verifier, gen); err != nil {
+				if errors.Is(err, corrosion.ErrAutomationImportIneligible) || ctx.Err() != nil {
+					return err
+				}
+				refused = fmt.Errorf("tip from %s: %w", v, err)
+				continue
+			}
+			begun = true
+			break
 		}
-		if tip == nil {
-			return fail(CodeUnavailable)
-		}
-		if err := e.db.AutomationBeginImport(ctx, grant, *tip, e.verifier, gen); err != nil {
-			return err
+		if !begun {
+			return refused
 		}
 	}
 	pending, err := e.db.AutomationRecoveryPending(ctx)

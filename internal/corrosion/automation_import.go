@@ -116,6 +116,7 @@ func automationImportEligibleTx(ctx context.Context, tx *LocalTx, self string, g
 	if len(rows) != 1 || strings.TrimSpace(rows[0].String("imported_from")) == "" {
 		return plan, importIneligible("%s adopted voter generation %d without importing the sealed old majority's claim state", self, gen)
 	}
+	adoptedFrom := strings.TrimSpace(rows[0].String("imported_from"))
 	rows, err = tx.Query(ctx, `SELECT `+voterConfigCols+` FROM voter_configs WHERE generation = ? AND deleted_at IS NULL`, gen-1)
 	if err != nil {
 		return plan, err
@@ -129,6 +130,18 @@ func automationImportEligibleTx(ctx context.Context, tx *LocalTx, self string, g
 	}
 	if !prev.Explicit() || len(prev.Members) < 3 {
 		return plan, importIneligible("voter generation %d (%d members) is not an automation electorate to import from", gen-1, len(prev.Members))
+	}
+	// The claim import must have come from a sealed majority of gen-1 itself:
+	// distinct members of it, at least MajorityOf of them.
+	from := map[string]bool{}
+	for _, name := range strings.Split(adoptedFrom, ",") {
+		if _, ok := prev.Member(name); ok {
+			from[name] = true
+		}
+	}
+	if need := MajorityOf(len(prev.Members)); len(from) < need {
+		return plan, importIneligible("%s adopted voter generation %d importing from %q, not a majority (%d) of generation %d's members",
+			self, gen, adoptedFrom, need, gen-1)
 	}
 	plan.Previous, plan.Current = prev, cur
 	return plan, nil
@@ -331,8 +344,8 @@ func (c *Client) AutomationBeginImport(ctx context.Context, grant capabilities.F
 }
 
 // automationImportCertConfigTx is the electorate a tip certified at certGen
-// is verified against: an explicit, ordinary automation electorate no later
-// than the import generation.
+// is verified against: an explicit, ordinary (neither forced nor reset)
+// automation electorate no later than the import generation.
 func automationImportCertConfigTx(ctx context.Context, tx *LocalTx, certGen, gen int64) (*VoterConfig, error) {
 	if certGen <= 0 || certGen > gen {
 		return nil, fmt.Errorf("automation import: tip certified at voter generation %d, outside 1..%d", certGen, gen)
@@ -348,7 +361,7 @@ func automationImportCertConfigTx(ctx context.Context, tx *LocalTx, certGen, gen
 	if err != nil {
 		return nil, err
 	}
-	if !cfg.Explicit() || IsForcedChange(cfg.Change) || len(cfg.Members) < 3 || automationElectorateBudget(cfg.Members) != nil {
+	if !cfg.Explicit() || IsForcedChange(cfg.Change) || cfg.Change == VoterChangeReset || len(cfg.Members) < 3 || automationElectorateBudget(cfg.Members) != nil {
 		return nil, fmt.Errorf("automation import: voter generation %d is not an automation electorate", certGen)
 	}
 	return cfg, nil

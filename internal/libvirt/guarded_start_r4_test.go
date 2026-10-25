@@ -50,13 +50,14 @@ func TestGuardedStart_PausedDoneOnlyOnceTheStartEnded(t *testing.T) {
 		"resume failed, destroy did not land":   {resume: boom, want: false},
 	} {
 		t.Run(name, func(t *testing.T) {
-			created, paused, done := false, false, false
+			created, paused, done, kept := false, false, false, false
 			// "create failed, no domain left" creates nothing.
 			leaveDomain := tc.create == nil || name == "create failed, the domain left paused"
 			g := StartGuard{
 				Before:      func(string) (bool, error) { return true, nil },
 				AfterPaused: func(string) error { return tc.after },
 				PausedDone:  func(string) { done = true },
+				PausedKept:  func(string, error) { kept = true },
 			}
 			_ = guardedStart(g, "web",
 				func(p bool) error {
@@ -77,6 +78,9 @@ func TestGuardedStart_PausedDoneOnlyOnceTheStartEnded(t *testing.T) {
 				func() bool { return created && paused })
 			if done != tc.want {
 				t.Fatalf("PausedDone reported = %v, want %v", done, tc.want)
+			}
+			if wantKept := !tc.want; kept != wantKept {
+				t.Fatalf("PausedKept reported = %v, want %v", kept, wantKept)
 			}
 		})
 	}
@@ -116,5 +120,77 @@ func TestDomainStillPaused(t *testing.T) {
 		if got := domainStillPaused(tc.api, "web"); got != tc.want {
 			t.Errorf("%s: domainStillPaused = %v, want %v", name, got, tc.want)
 		}
+	}
+}
+
+// restoreAPI is the slice of snapshotAPI restoreWithRetry uses, over one
+// domain whose state it tracks.
+type restoreAPI struct {
+	snapshotAPI
+	state                 golibvirt.DomainState
+	resumeErr, destroyErr error
+}
+
+func (a *restoreAPI) DomainRestoreFlags(string, golibvirt.OptString, uint32) error {
+	a.state = golibvirt.DomainPaused
+	return nil
+}
+
+func (a *restoreAPI) DomainLookupByName(name string) (golibvirt.Domain, error) {
+	return golibvirt.Domain{Name: name}, nil
+}
+
+func (a *restoreAPI) DomainGetState(golibvirt.Domain, uint32) (int32, int32, error) {
+	return int32(a.state), 0, nil
+}
+
+func (a *restoreAPI) DomainResume(golibvirt.Domain) error {
+	if a.resumeErr != nil {
+		return a.resumeErr
+	}
+	a.state = golibvirt.DomainRunning
+	return nil
+}
+
+func (a *restoreAPI) DomainDestroy(golibvirt.Domain) error {
+	if a.destroyErr != nil {
+		return a.destroyErr
+	}
+	a.state = golibvirt.DomainShutoff
+	return nil
+}
+
+// Review I4 and F7 m3 (X1): a restore the guard paused reports its end
+// (PausedDone, which drops the start record) only once the domain resumed
+// or is no longer paused; one left paused is reported kept (PausedKept),
+// its record kept.
+//
+// Mutation: restoreWithRetry's PausedDone unconditional — red.
+func TestRestoreWithRetry_PausedDoneOnlyOnceTheStartEnded(t *testing.T) {
+	boom := errors.New("boom")
+	for name, tc := range map[string]struct {
+		api        restoreAPI
+		after      error
+		done, kept bool
+	}{
+		"resumed":                             {done: true},
+		"resume failed, left paused":          {api: restoreAPI{resumeErr: boom}, kept: true},
+		"guard refused, destroy landed":       {after: boom, done: true},
+		"guard refused, destroy did not land": {api: restoreAPI{destroyErr: boom}, after: boom, kept: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			done, kept := false, false
+			g := StartGuard{
+				Before:      func(string) (bool, error) { return true, nil },
+				AfterPaused: func(string) error { return tc.after },
+				PausedDone:  func(string) { done = true },
+				PausedKept:  func(string, error) { kept = true },
+			}
+			api := tc.api
+			_ = restoreWithRetry(&api, g, FirmwareMoveGuard{}, "web", "/saved", "")
+			if done != tc.done || kept != tc.kept {
+				t.Fatalf("PausedDone %v, PausedKept %v; want %v, %v", done, kept, tc.done, tc.kept)
+			}
+		})
 	}
 }

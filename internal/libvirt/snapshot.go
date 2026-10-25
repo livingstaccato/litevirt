@@ -1550,9 +1550,11 @@ func restoreWithRetry(v snapshotAPI, g StartGuard, fg FirmwareMoveGuard, domainN
 	// ended: resumed, or the domain no longer paused (review I4).
 	if pause {
 		defer func() {
-			if err == nil || !domainStillPaused(v, domainName) {
+			if err == nil {
 				g.pausedDone(domainName)
+				return
 			}
+			g.pausedEnded(domainName, err, domainStillPaused(v, domainName))
 		}()
 	}
 	// Before armed it already when it did not ask for the paused step (its

@@ -184,6 +184,11 @@ type Fake struct {
 	// pause on a failed disk write, reported with PausedReason io-error.
 	// Any other state change of the domain forgets it.
 	ioPaused map[string]bool
+	// ran names the active domains whose QEMU has run its vCPUs: a domain
+	// created paused that never resumed is not in it, and query-status
+	// (DomainQEMUStatus) reports it "prelaunch". A new QEMU process, or
+	// none, forgets it.
+	ran map[string]bool
 	// ppMark is the partition-pause mark (MarkPartitionPaused), live only:
 	// it holds for the run it was set in (starts) while the domain is active.
 	ppMark map[string]ppMark
@@ -297,6 +302,9 @@ type Fake struct {
 	// and fails it with what it returns: a tap the host cannot put on its
 	// access VLAN.
 	FailConfigureVLANTap func(domain, mac string, vlan int) error
+	// FailQEMUStatus, when set, fails DomainQEMUStatus with what it
+	// returns: a QMP query that libvirt cannot answer.
+	FailQEMUStatus func(name string) error
 	// FailPartitionPauseMark, when set, fails PartitionPauseMark with what
 	// it returns: a mark that cannot be read.
 	FailPartitionPauseMark func(name string) error
@@ -515,6 +523,12 @@ func (f *Fake) SetState(name string, s State) {
 		delete(f.ppMark, name) // a new QEMU process, or none: the live mark is gone
 	}
 	started := s == StateRunning && f.domains[name] != StateRunning
+	if prev := f.domains[name]; (s != StateRunning && s != StatePaused) || (prev != StateRunning && prev != StatePaused) {
+		delete(f.ran, name) // a new QEMU process, or none
+	}
+	if s == StateRunning {
+		f.markRanLocked(name)
+	}
 	f.domains[name] = s
 	f.mu.Unlock()
 	if started {
@@ -955,23 +969,42 @@ func (f *Fake) StartDomain(name string) error {
 		}
 		pause = p
 	}
-	if pause && g.PausedDone != nil {
+	var startErr error
+	if pause {
 		// As libvirt.Client: the paused start's end is reported only once
-		// the domain is no longer paused (resumed, stopped, never created).
+		// the domain is no longer paused (resumed, stopped, never created);
+		// a failed one left paused is reported kept.
 		defer func() {
 			if st, ok := f.RawState(name); !ok || st != StatePaused {
-				g.PausedDone(name)
+				if g.PausedDone != nil {
+					g.PausedDone(name)
+				}
+			} else if startErr != nil && g.PausedKept != nil {
+				g.PausedKept(name, startErr)
 			}
 		}()
+	}
+	// stopFailed stops a paused start that failed, as libvirt.Client's
+	// destroy does; a FailDestroyDomain refusal leaves it paused, as a
+	// destroy that did not land does.
+	stopFailed := func() {
+		if f.FailDestroyDomain != nil && f.FailDestroyDomain(name) != nil {
+			return
+		}
+		f.mu.Lock()
+		f.domains[name] = StateShutdown
+		f.mu.Unlock()
 	}
 	if err := f.startDomain(name, pause); err != nil {
 		// As libvirt.Client.StartDomain (startWithConsoleBackstop): a start QEMU
 		// refuses for a console password it cannot do is retried once without
 		// the passwords, and the host stops setting VNC passwords.
 		if !libvirt.IsConsolePasswordRefusal(err) || !f.stripConsoleForBackstop(name, err) {
+			startErr = err
 			return err
 		}
 		if err := f.startDomain(name, pause); err != nil {
+			startErr = err
 			return err
 		}
 	}
@@ -981,18 +1014,16 @@ func (f *Fake) StartDomain(name string) error {
 	}
 	if g.AfterPaused != nil {
 		if err := g.AfterPaused(name); err != nil {
-			f.mu.Lock()
-			f.domains[name] = StateShutdown
-			f.mu.Unlock()
-			return fmt.Errorf("start domain %s: %w", name, err)
+			stopFailed()
+			startErr = fmt.Errorf("start domain %s: %w", name, err)
+			return startErr
 		}
 	}
 	if err := f.resumeDomain(name); err != nil {
 		// As libvirt.Client does (re-review m5): a domain that cannot be
 		// resumed is stopped, not left paused.
-		f.mu.Lock()
-		f.domains[name] = StateShutdown
-		f.mu.Unlock()
+		stopFailed()
+		startErr = err
 		return err
 	}
 	return nil
@@ -1035,6 +1066,8 @@ func (f *Fake) startDomainUnlocked(name string, paused bool) error {
 	f.domains[name] = StateRunning
 	if paused {
 		f.domains[name] = StatePaused
+	} else {
+		f.markRanLocked(name)
 	}
 	// The guest starts with the console passwords its definition carries,
 	// and keeps them until it stops, whatever a later define says.
@@ -1138,6 +1171,7 @@ func (f *Fake) resumeDomain(name string) error {
 		return fmt.Errorf("libvirtfake: domain %q is not paused (%s)", name, st)
 	}
 	f.domains[name] = StateRunning
+	f.markRanLocked(name)
 	delete(f.ioPaused, name)
 	f.record("resume", name, "")
 	f.flushPendingNvramLocked(name)
@@ -1900,6 +1934,7 @@ func (f *Fake) LandMigratedState(domXML string, paused bool) {
 	f.leftStateLocked(name)
 	f.xml[name] = domXML
 	f.domains[name] = StateRunning
+	f.markRanLocked(name) // a migrated guest ran on its source
 	note := ""
 	if paused {
 		f.domains[name] = StatePaused
@@ -3743,4 +3778,39 @@ func insertUUID(xmlConfig, name, u string) string {
 		}
 	}
 	return xmlConfig
+}
+
+// markRanLocked records that name's QEMU has run its vCPUs. Caller holds f.mu.
+func (f *Fake) markRanLocked(name string) {
+	if f.ran == nil {
+		f.ran = map[string]bool{}
+	}
+	f.ran[name] = true
+}
+
+// DomainQEMUStatus mirrors libvirt.Client.DomainQEMUStatus (QMP
+// query-status): "prelaunch" for a domain created paused whose vCPUs never
+// ran, "paused" for one paused after it ran, "running"; an inactive domain is
+// libvirt's "domain is not running".
+func (f *Fake) DomainQEMUStatus(name string) (string, error) {
+	defer f.daemon()()
+	if f.FailQEMUStatus != nil {
+		if err := f.FailQEMUStatus(name); err != nil {
+			return "", err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.domains[name]
+	switch {
+	case !ok:
+		return "", noDomain(name)
+	case st == StateRunning:
+		return "running", nil
+	case st == StatePaused && !f.ran[name]:
+		return libvirt.QEMUStatusPrelaunch, nil
+	case st == StatePaused:
+		return "paused", nil
+	}
+	return "", notRunning("query-status", name)
 }

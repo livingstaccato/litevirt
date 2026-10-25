@@ -26,15 +26,33 @@ import (
 // not paused. A daemon that dies before it runs leaves
 // whatever Before recorded for the paused start in place, which is how such a
 // start is found again (grpcapi.ResumeStrandedStarts).
+//
+// PausedKept, when set, runs instead of PausedDone for a paused start that
+// failed while its domain may still be paused (its record is kept): err is
+// the start's failure. It lets the daemon name the guest at once, not only
+// at its next start (review F7 m5).
 type StartGuard struct {
 	Before      func(name string) (pause bool, err error)
 	AfterPaused func(name string) error
 	PausedDone  func(name string)
+	PausedKept  func(name string, err error)
 }
 
 func (g StartGuard) pausedDone(name string) {
 	if g.PausedDone != nil {
 		g.PausedDone(name)
+	}
+}
+
+// pausedEnded reports a failed paused start's end: PausedDone when the
+// domain is no longer paused, else PausedKept.
+func (g StartGuard) pausedEnded(name string, err error, stillPaused bool) {
+	if !stillPaused {
+		g.pausedDone(name)
+		return
+	}
+	if g.PausedKept != nil {
+		g.PausedKept(name, err)
 	}
 }
 
@@ -140,29 +158,27 @@ func guardedStart(g StartGuard, name string, create func(paused bool) error, res
 	if err != nil {
 		return fmt.Errorf("start domain %s: %w", name, err)
 	}
-	ended := func() {
-		if pause && !stillPaused() {
-			g.pausedDone(name)
+	ended := func(err error) error {
+		if pause {
+			g.pausedEnded(name, err, stillPaused())
 		}
+		return err
 	}
 	if err := create(pause); err != nil {
-		ended()
-		return err
+		return ended(err)
 	}
 	if !pause {
 		return nil
 	}
 	if err := g.afterPaused(name); err != nil {
 		destroy()
-		ended()
-		return fmt.Errorf("start domain %s: %w", name, err)
+		return ended(fmt.Errorf("start domain %s: %w", name, err))
 	}
 	if err := resume(); err != nil {
 		// Left paused, the domain would disagree with the start's error and
 		// with the row (re-review m5): stop it, as a refusal does.
 		destroy()
-		ended()
-		return fmt.Errorf("resume domain %s: %w", name, err)
+		return ended(fmt.Errorf("resume domain %s: %w", name, err))
 	}
 	g.pausedDone(name)
 	return nil

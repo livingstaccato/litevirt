@@ -1093,7 +1093,11 @@ minute in, naming the held workloads, the reason, and the way out: power the
 host off and run `lv host fence-confirm <host>` (or **Confirm powered off** on
 the host's page in the web UI), or give the host an `ipmi` or `redfish` fence
 strategy. After the confirmation the recovery proceeds on its own. `lv doctor
-fence` and the web UI's health page list every host fenced only over SSH.
+fence` and the web UI's health page list every host fenced only over SSH. A
+hold on a fence that ran but is not proof (a confirmed SSH power-off the host
+does not trust, or a best-effort fence that proves nothing) is also a
+`lv health` condition, `ha.recovery.unproven_fence`, until it ends (see
+[Diagnostics](diagnostics.md)).
 
 **Trusting a confirmed SSH power-off** is a per-host operator choice, off by
 default:

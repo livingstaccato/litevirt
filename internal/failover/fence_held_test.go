@@ -320,7 +320,8 @@ func TestFenceHeld_HostBackResolves(t *testing.T) {
 // never held, recovers mtl once the pause is waited out (zero here).
 //
 // Mutation: drop the heldThisOutage refusal in recoverFenced — mtl is
-// rescheduled on the unreached fence.
+// rescheduled on the unreached fence. Hold that refusal with noteGateHold
+// alone — no ha.recovery.unproven_fence, red.
 func TestFenceHeld_AnUnreachedFenceAfterAHoldRecoversNothing(t *testing.T) {
 	unreached := func(context.Context, fence.HostConfig) fence.Result {
 		return fence.Result{Method: "best-effort-ssh", Detail: "ssh: connect: no route to host", Success: true}
@@ -361,6 +362,11 @@ func TestFenceHeld_AnUnreachedFenceAfterAHoldRecoversNothing(t *testing.T) {
 				}
 				if !c.heldThisOutage(ctx, "bad") {
 					t.Error("heldThisOutage forgot the hold once the fence was recorded")
+				}
+				// `lv health` shows the hold (the rc9 lab's F3).
+				if row, ok, err := corrosion.GetHealthCondition(ctx, db, RefenceEvaluator, CondRecoveryUnprovenFence, "host", "bad"); err != nil ||
+					!ok || row.Lifecycle == corrosion.ConditionResolved || !strings.Contains(row.Evidence, "held fence (ha.fence_held)") {
+					t.Errorf("no open %s naming the held fence: %+v (%v)", CondRecoveryUnprovenFence, row, err)
 				}
 				return
 			}

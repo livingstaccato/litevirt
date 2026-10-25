@@ -1529,6 +1529,37 @@ The condition resolves once the host is removed; a fenced or offline host
 once no recoverable workload is left on it; any other host once it is no
 longer held (a quorum of voters sees it answer, or its pause is over).
 
+### A recovery held on a fence that is not proof (`ha.recovery.unproven_fence`)
+
+Evaluator `failover`, subject the host, severity critical, written by the
+failover lease holder. The host was fenced, but the fence is not proof that it
+is off, so its recoverable workloads are not started elsewhere: nothing runs
+twice, and they stay recorded on the host until it is proven off. It is raised
+for a hold the host's own fence makes:
+
+- an SSH power-off the remote shell confirmed, on a host that does not trust
+  one (`litevirt.trust_ssh_poweroff` off, the default);
+- a best-effort fence under the safe-fence policy;
+- a best-effort fence that did not reach the host after its fence was held
+  (`ha.fence_held`);
+- a best-effort fence that proves nothing, when the host's partition pause is
+  not relied on.
+
+The evidence names the held `workloads`, the reason in `detail` (with an
+operator confirmation that does not stand for this outage, when there is one),
+and the `remedy`: once the host is powered off, `lv host fence-confirm <host>`,
+and the recovery resumes from it. For a host without an `ipmi` or `redfish`
+fence strategy it adds `lv host config <host> --fence-strategy ipmi|redfish`,
+so the next fence proves a power-off. For a confirmed SSH power-off it names
+`lv host config <host> --trust-ssh-poweroff` as the operator's choice, not a
+recommendation: it counts later fences, not the one already holding this
+recovery. The same hold is named by the `host.recovery.stalled` notification.
+
+The condition resolves when the recovery goes ahead (the operator's
+confirmation, or a fence judged again that passes), and, read back by a later
+lease holder, once the host is removed, back in service, or has no
+recoverable workload left on it.
+
 ### A fence held because nothing needs it (`ha.fence_held`)
 
 Evaluator `failover`, subject the host, severity warning, written by the

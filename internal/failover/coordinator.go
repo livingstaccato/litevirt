@@ -1485,6 +1485,7 @@ func (c *Coordinator) run(ctx context.Context) {
 		}
 		c.alertStalledRecoveries(ctx, pending, unfenced)
 		c.resolveBridgedSettled(ctx, byHost, c.noteBridgedBeforeFence(ctx))
+		c.resolveUnprovenSettled(ctx, byHost)
 	}
 }
 
@@ -3391,6 +3392,7 @@ func (c *Coordinator) resumeFromConfirmation(ctx context.Context, target string)
 	// The operator's word is that the host is off now: a claim retry this
 	// recovery leaves owed acts on this moment (claimRetryOutageOver).
 	c.noteRecoveryAt(target, c.now(), c.mono())
+	c.resolveUnproven(ctx, target, "an operator confirmed the host off")
 	c.recoverWorkloads(ctx, h)
 	return true
 }
@@ -3972,7 +3974,8 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 			if stale == "" { // a stale confirmation is counted once (noteConfirmationStale)
 				c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
 			}
-			c.noteGateHold(h.Name, "best-effort fence is not proof the host is off (safe-fence policy)"+fenceFailedWayOut(h), stale)
+			c.holdUnproven(ctx, h, "best-effort fence is not proof the host is off (safe-fence policy)"+fenceFailedWayOut(h),
+				"the best-effort fence is not proof "+h.Name+" is off, and the safe-fence policy asks for proof", stale, false)
 			return
 		}
 		slog.Info("failover: operator confirmed best-effort fence, proceeding", "host", h.Name)
@@ -3991,7 +3994,9 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 			if stale == "" {
 				c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
 			}
-			c.noteGateHold(h.Name, "best-effort fence after a held fence did not reach the host"+fenceFailedWayOut(h), stale)
+			c.holdUnproven(ctx, h, "best-effort fence after a held fence did not reach the host"+fenceFailedWayOut(h),
+				"the best-effort fence that ended a held fence (ha.fence_held) did not reach "+h.Name+
+					", and what it would recover was never paused by its partition pause", stale, false)
 			return
 		}
 		slog.Info("failover: operator confirmed a host whose fence was held, proceeding", "host", h.Name)
@@ -4050,8 +4055,10 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 					if stale == "" {
 						c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
 					}
-					c.noteGateHold(h.Name, "the SSH fence's remote shell confirmed the power-off, which is not proof the host is off"+
-						fenceFailedWayOut(h)+trustSSHChoice(h), stale)
+					c.holdUnproven(ctx, h, "the SSH fence's remote shell confirmed the power-off, which is not proof the host is off"+
+						fenceFailedWayOut(h)+trustSSHChoice(h),
+						"the SSH fence's remote shell confirmed the power-off, which is not proof "+h.Name+
+							" is off, and "+h.Name+" does not trust a confirmed SSH power-off", stale, true)
 					return
 				}
 				if bestEffort {
@@ -4061,7 +4068,8 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 						c.mAttempt(PhaseSplitBrain, ResultRefused, ErrFenceFailed)
 					}
 					c.noteFenceFailure(h, fr)
-					c.noteGateHold(h.Name, c.holdBase[h.Name], stale)
+					c.holdUnproven(ctx, h, c.holdBase[h.Name],
+						"the best-effort fence proves nothing ("+fr.Detail+"), and "+h.Name+"'s partition pause is not relied on", stale, false)
 					return
 				}
 				slog.Error("failover: manual fence not confirmed by operator, NOT rescheduling",
@@ -4084,6 +4092,10 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 			return
 		}
 	}
+
+	// Past every gate: whatever fence held the recovery for want of proof
+	// no longer does (ha.recovery.unproven_fence).
+	c.resolveUnproven(ctx, h.Name, "the recovery went ahead")
 
 	// A fence that relied on the host's partition pause starts nothing until
 	// the pause has certainly happened (docs/design/partition-pause.md §4.2);

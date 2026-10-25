@@ -930,8 +930,8 @@ func (c *Coordinator) retryClaims(ctx context.Context, target string) bool {
 		}
 		if rec.Method == "ssh" && rec.Result == fence.LogFenced {
 			fr := fence.Result{Success: true, Method: rec.Method, Detail: rec.Detail}
-			if !trustedSSH(fr, fence.RecordedTrust(rec.Detail) && trustsSSHPoweroff(h)) {
-				note := sshTrustNote(h, fr)
+			if !trustedSSH(fr, fence.RecordedTrust(rec.Detail, rec.ID) && trustsSSHPoweroff(h)) {
+				note := sshTrustNote(h, fr, rec.ID)
 				slog.Error("failover: an owed claim retry rests on an SSH power-off that no longer counts, NOT retrying",
 					"host", target, "fence_id", rec.ID, "reason", note)
 				c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)

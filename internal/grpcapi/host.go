@@ -1955,8 +1955,10 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 	// by the label as it reads later (fence.RecordedTrust). LAST, after the
 	// target note's admin-set BMC address, which must not be able to carry a
 	// token that counts.
+	// The row's id is minted before the detail: the token names it.
+	rowID := randid.New()
 	if fr.Method == "ssh" && fr.Success {
-		detail = fence.WithTrust(detail, h.Labels[corrosion.LabelTrustSSHPoweroff] == "true", path)
+		detail = fence.WithTrust(detail, h.Labels[corrosion.LabelTrustSSHPoweroff] == "true", path, rowID)
 	}
 
 	// Mark it offline regardless of fence success, and record the fence, in
@@ -1968,7 +1970,7 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 	// host as handled, and never looked again. Together, every peer holds
 	// both or neither (colonelpanik/litevirt#253).
 	if err := s.recordFence(ctx, corrosion.FenceLogRecord{
-		ID:       randid.New(),
+		ID:       rowID,
 		HostName: req.Name,
 		Method:   method,
 		Result:   result,

@@ -37,11 +37,11 @@ func TestFenceHost_RecordsTheTrustDecision(t *testing.T) {
 		if _, err := s.FenceHost(adminCtx(), &pb.FenceHostRequest{Name: "peer", Confirmed: true}); err != nil {
 			t.Fatalf("FenceHost: %v", err)
 		}
-		rows, err := s.db.Query(ctx, `SELECT detail FROM fencing_log WHERE host_name = 'peer'`)
+		rows, err := s.db.Query(ctx, `SELECT id, detail FROM fencing_log WHERE host_name = 'peer'`)
 		if err != nil || len(rows) != 1 {
 			t.Fatalf("fencing_log rows %d (%v)", len(rows), err)
 		}
-		if got := fence.RecordedTrust(rows[0].String("detail")); got != trusted {
+		if got := fence.RecordedTrust(rows[0].String("detail"), rows[0].String("id")); got != trusted {
 			t.Errorf("trusted=%v: the row %q records trust %v", trusted, rows[0].String("detail"), got)
 		}
 	}
@@ -70,15 +70,15 @@ func TestFenceHost_TheTrustTokenIsLast(t *testing.T) {
 	if _, err := s.FenceHost(adminCtx(), &pb.FenceHostRequest{Name: "peer", Confirmed: true}); err != nil {
 		t.Fatalf("FenceHost: %v", err)
 	}
-	rows, err := s.db.Query(ctx, `SELECT detail FROM fencing_log WHERE host_name = 'peer'`)
+	rows, err := s.db.Query(ctx, `SELECT id, detail FROM fencing_log WHERE host_name = 'peer'`)
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("fencing_log rows %d (%v)", len(rows), err)
 	}
 	d := rows[0].String("detail")
-	if fence.RecordedTrust(d) {
+	if fence.RecordedTrust(d, rows[0].String("id")) {
 		t.Fatalf("an admin-set BMC address recorded trust for an untrusting host: %q", d)
 	}
-	if !strings.HasSuffix(d, "[trust=off;path=managed;v=2]") {
+	if !strings.HasSuffix(d, "[trust=off;path=managed;id="+rows[0].String("id")+";v=3]") {
 		t.Errorf("the trust token is not last: %q", d)
 	}
 	if strings.Contains(d, "[trust=on") {
@@ -115,7 +115,7 @@ func TestFenceHost_AdminTextCannotNameAPin(t *testing.T) {
 	if _, err := s.FenceHost(adminCtx(), &pb.FenceHostRequest{Name: "peer", Confirmed: true}); err != nil {
 		t.Fatalf("FenceHost: %v", err)
 	}
-	rows, err := s.db.Query(ctx, `SELECT detail FROM fencing_log WHERE host_name = 'peer'`)
+	rows, err := s.db.Query(ctx, `SELECT id, detail FROM fencing_log WHERE host_name = 'peer'`)
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("fencing_log rows %d (%v)", len(rows), err)
 	}
@@ -123,7 +123,7 @@ func TestFenceHost_AdminTextCannotNameAPin(t *testing.T) {
 	if strings.Contains(d, "10.0.0.9 [path=managed]") {
 		t.Errorf("the BMC address was written with its brackets: %q", d)
 	}
-	if tok, ok := fence.RecordedTrustToken(d); !ok || tok.Path != "legacy-unpinned" || fence.RecordedTrust(d) {
+	if tok, ok := fence.RecordedTrustToken(d); !ok || tok.Path != "legacy-unpinned" || fence.RecordedTrust(d, rows[0].String("id")) {
 		t.Errorf("the token records %+v (ok %v) for an unpinned fence: %q", tok, ok, d)
 	}
 }

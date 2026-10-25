@@ -39,7 +39,7 @@ func operatorFences(t *testing.T, db *corrosion.Client, ctx context.Context) {
 		// As FenceHost records it for a host that trusts a confirmed SSH
 		// power-off (the fixtures' trustSSH): the decision rides in the row.
 		ID: "operator-ssh-down", HostName: "down", Method: "ssh", Result: fence.LogFenced,
-		Detail: fence.WithTrust("operator fence [path=managed]", true, "managed"),
+		Detail: fence.WithTrust("operator fence [path=managed]", true, "managed", "operator-ssh-down"),
 	}, "offline"); err != nil {
 		t.Fatalf("RecordFenceWithState: %v", err)
 	}

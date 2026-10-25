@@ -1119,7 +1119,8 @@ a host that confirms and then does not power off runs its workloads twice.
 `lv doctor fence` and the health page list every host with it on. The setting
 is never retroactive: the decision is recorded with the fence when it is
 judged, with the path the fence took (a marked token such as
-`[trust=on;path=managed;v=2]`, last in its fencing log detail), and every
+`[trust=on;path=managed;id=<row id>;v=3]`, last in its fencing log detail,
+counted only for the row it names), and every
 later judgement of that fence, a new failover leader's included, uses it, so
 a fence judged untrusted stays held until `lv host fence-confirm <host>`.
 A fence row written before this release carries no marked token, so a

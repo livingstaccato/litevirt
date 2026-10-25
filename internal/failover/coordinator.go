@@ -3687,8 +3687,10 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 	// (docs/design/partition-pause.md §4.2): same row shape, assurance
 	// self_paused, and recoverFenced then waits out the pause.
 	fr = notAFenceUnlessPaused(asSelfPause(fr, pauseRelied, trusted))
+	// The row's id is minted now: the trust token names it (fence.WithTrust).
+	rowID := randid.New()
 	if fr.Method == "ssh" && fr.Success {
-		fr.Detail = fence.WithTrust(fr.Detail, trusted, ranPath(fr))
+		fr.Detail = fence.WithTrust(fr.Detail, trusted, ranPath(fr), rowID)
 	}
 
 	logResult := fr.LogResult()
@@ -3717,7 +3719,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 	// on a fence that has no audit trail — but intentionally non-blocking: the
 	// fence physically happened, and a lost audit row must not strand the VMs.
 	rec := corrosion.FenceLogRecord{
-		ID:       randid.New(),
+		ID:       rowID,
 		HostName: h.Name,
 		Method:   fr.Method,
 		Result:   logResult,
@@ -3957,8 +3959,11 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	// fence.RecordedTrust, live or resumed) AND still trusts one now: trust is
 	// never retroactive, and its revocation holds a recovery not yet made.
 	// Why it did not count is read first, from the fence as it ran.
-	trustNote := sshTrustNote(h, fr)
-	fr = holdUntrustedSSH(notAFenceUnlessPaused(fr), fence.RecordedTrust(fr.Detail) && trustsSSHPoweroff(h))
+	// The fence judged is the row every caller records first (noteFencedOn):
+	// its token counts only when it names that row.
+	fenceID := c.fencedOn[h.Name]
+	trustNote := sshTrustNote(h, fr, fenceID)
+	fr = holdUntrustedSSH(notAFenceUnlessPaused(fr), fence.RecordedTrust(fr.Detail, fenceID) && trustsSSHPoweroff(h))
 	// And a self-pause counts only while the pause is still relied on.
 	if fr.Success && corrosion.ReliesOnPartitionPause(fr.Method, fr.Detail) && !c.relyOnPartitionPause(ctx, h) {
 		fr.Success = false

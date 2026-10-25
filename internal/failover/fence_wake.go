@@ -303,17 +303,17 @@ func fenceFailedWayOut(h *corrosion.HostRecord) string {
 }
 
 // sshTrustNote says, for a hold on an SSH power-off the remote shell
-// confirmed (fr as it ran, before holdUntrustedSSH), why the trust setting
+// confirmed (fr as it ran, before holdUntrustedSSH, recorded as row id), why the trust setting
 // did not count it, and what the setting would do, only where that is true:
 // a later fence confirmed over the host's pinned key. Trusting one is the
 // operator's choice, never advice: trusting a confirmed request is trusting
 // that the host did power off.
-func sshTrustNote(h *corrosion.HostRecord, fr fence.Result) string {
-	recorded, now := fence.RecordedTrust(fr.Detail), trustsSSHPoweroff(h)
+func sshTrustNote(h *corrosion.HostRecord, fr fence.Result, id string) string {
+	recorded, now := fence.RecordedTrust(fr.Detail, id), trustsSSHPoweroff(h)
 	// The path the trust decision reads is the one its marked token records;
 	// a row without one says only what its last path token says.
 	pinned := fence.ConfirmedOverPin(fr)
-	if tok, ok := fence.RecordedTrustToken(fr.Detail); ok {
+	if tok, ok := fence.RecordedTrustToken(fr.Detail); ok && tok.ID == id {
 		pinned = fence.PinnedPath(tok.Path)
 	}
 	switch {

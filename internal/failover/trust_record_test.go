@@ -54,7 +54,7 @@ func TestTrustSSH_ARowWithoutATokenIsHeld(t *testing.T) {
 //
 // Mutation: judge by the recorded decision alone — the VM moves, red.
 func TestTrustSSH_RevokingTrustHoldsAPendingRecovery(t *testing.T) {
-	c, db, ctx := operatorSSHRow(t, nil, fence.WithTrust("operator fence [path=managed]", true, "managed"))
+	c, db, ctx := operatorSSHRow(t, nil, fence.WithTrust("operator fence [path=managed]", true, "managed", "operator-ssh-down"))
 	if got := vmHost(t, db, ctx); got != "down" {
 		t.Fatalf("VM recovered to %q on a trusted fence whose host's trust was revoked since", got)
 	}
@@ -79,11 +79,11 @@ func TestTrustSSH_TheHoldSaysWhyTheTrustDidNotCount(t *testing.T) {
 		want    []string
 		notWant []string
 	}{
-		{"unpinned, trusted host", trustSSH, fence.WithTrust("operator fence [path=legacy-unpinned]", true, "legacy-unpinned"),
+		{"unpinned, trusted host", trustSSH, fence.WithTrust("operator fence [path=legacy-unpinned]", true, "legacy-unpinned", "operator-ssh-down"),
 			[]string{"not confirmed over", "pinned"}, []string{"counts later fences", "--trust-ssh-poweroff"}},
-		{"judged before the trust", trustSSH, fence.WithTrust("operator fence [path=managed]", false, "managed"),
+		{"judged before the trust", trustSSH, fence.WithTrust("operator fence [path=managed]", false, "managed", "operator-ssh-down"),
 			[]string{"trusts a confirmed SSH power-off now", "never this one"}, []string{"may instead set"}},
-		{"untrusted host", nil, fence.WithTrust("operator fence [path=managed]", false, "managed"),
+		{"untrusted host", nil, fence.WithTrust("operator fence [path=managed]", false, "managed", "operator-ssh-down"),
 			[]string{"--trust-ssh-poweroff", "pinned", "never this one", "not a recommendation"}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

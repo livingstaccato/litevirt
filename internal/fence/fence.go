@@ -89,34 +89,45 @@ func RecordedPath(detail string) string {
 // that fence, a successor's resume included, reads it back (RecordedTrust)
 // rather than the label as it reads now: trust is never retroactive.
 //
-// The token is marked ("[trust=on;path=managed;v=2]"): an earlier build wrote
-// no token, or an unmarked "[trust=on]", and an admin-set field of its rows
-// (a BMC address) could end in either. Only the marked form, as this build
-// writes it, counts; a row without one is held, like a row with no token. The
-// path inside it is the one the trust decision reads, never a "[path=" token
-// elsewhere in the detail, which admin-set text after the real one could
-// carry (RecordedPath reads the last).
-const trustMark = "v=2"
+// The token is marked and bound to its row: "[trust=on;path=managed;id=<the
+// fencing_log row id>;v=3]". An earlier build wrote no token, and an
+// admin-set field at the end of its rows (a BMC address in the target note)
+// could end in any text, a well-formed token included, which no text rule can
+// tell from a genuine one. The row id is minted at random when the row is
+// written, so no address set before cannot contain it: only a token naming
+// its own row's id counts. The path inside it is the one the trust decision
+// reads, never a "[path=" token elsewhere in the detail.
+const trustMark = "v=3"
 
-// WithTrust is detail with the trust decision, and path, the path the fence
-// took (Result.Path; a fence label such as "managed"), appended.
-func WithTrust(detail string, trusted bool, path string) string {
+// WithTrust is detail with the trust decision appended: trusted, path, the
+// path the fence took (Result.Path; a fence label such as "managed"), and id,
+// the id of the fencing_log row the detail is written to, minted before it.
+func WithTrust(detail string, trusted bool, path, id string) string {
 	on := "off"
 	if trusted {
 		on = "on"
 	}
-	return detail + " [trust=" + on + ";path=" + DetailField(path) + ";" + trustMark + "]"
+	return detail + " [trust=" + on + ";path=" + tokenField(path) + ";id=" + tokenField(id) + ";" + trustMark + "]"
+}
+
+// tokenField is s as a trust token field: brackets and the field separator
+// rewritten.
+func tokenField(s string) string {
+	return strings.ReplaceAll(DetailField(s), ";", ",")
 }
 
 // TrustRecord is what a marked trust token records.
 type TrustRecord struct {
 	Trusted bool
 	Path    string
+	// ID is the fencing_log row id the token was written for.
+	ID string
 }
 
 // RecordedTrustToken reads the marked trust token that ends detail. ok is
-// false when it does not end in one: no token, an earlier build's unmarked
-// one, or one followed by anything (a token in an earlier field).
+// false when it does not end in one: no token, an earlier build's or an
+// earlier form, or one followed by anything (a token in an earlier field), or
+// one after unbalanced text.
 func RecordedTrustToken(detail string) (TrustRecord, bool) {
 	d := strings.TrimSpace(detail)
 	if !strings.HasSuffix(d, ";"+trustMark+"]") {
@@ -131,7 +142,7 @@ func RecordedTrustToken(detail string) (TrustRecord, bool) {
 		return TrustRecord{}, false
 	}
 	parts := strings.Split(body, ";")
-	if len(parts) != 3 || parts[2] != trustMark || !strings.HasPrefix(parts[1], "path=") {
+	if len(parts) != 4 || parts[3] != trustMark || !strings.HasPrefix(parts[1], "path=") || !strings.HasPrefix(parts[2], "id=") {
 		return TrustRecord{}, false
 	}
 	var r TrustRecord
@@ -143,6 +154,7 @@ func RecordedTrustToken(detail string) (TrustRecord, bool) {
 		return TrustRecord{}, false
 	}
 	r.Path = strings.TrimPrefix(parts[1], "path=")
+	r.ID = strings.TrimPrefix(parts[2], "id=")
 	return r, true
 }
 
@@ -172,14 +184,15 @@ func PinnedPath(path string) bool {
 	return path == "managed" || path == "legacy-pinned"
 }
 
-// RecordedTrust reports whether detail records that its fence was judged
-// trusted, over a pinned path: it ends in a marked trust token
-// (RecordedTrustToken) saying "on", whose path is pinned (PinnedPath). Any
-// other detail — no token, an unmarked one, a token not last, an unpinned
-// path — records no trust, and the fence is held.
-func RecordedTrust(detail string) bool {
+// RecordedTrust reports whether detail, the detail of the fencing_log row id,
+// records that its fence was judged trusted, over a pinned path: it ends in a
+// marked trust token (RecordedTrustToken) saying "on", naming id, whose path
+// is pinned (PinnedPath). Any other detail — no token, an earlier form, a
+// token not last or after unbalanced text, another row's id, an unpinned path
+// — records no trust, and the fence is held.
+func RecordedTrust(detail, id string) bool {
 	r, ok := RecordedTrustToken(detail)
-	return ok && r.Trusted && PinnedPath(r.Path)
+	return ok && id != "" && r.ID == id && r.Trusted && PinnedPath(r.Path)
 }
 
 // DetailField is s, admin-set or remote text, as a fence detail records it:

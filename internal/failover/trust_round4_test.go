@@ -105,7 +105,7 @@ func heldOnRow(t *testing.T, detail string) string {
 func TestTrustSSH_AdminTextInARowCannotMakeItCount(t *testing.T) {
 	for name, detail := range map[string]string{
 		"unpinned, BMC address names a pin": fence.WithTrust("SSH forced poweroff to root@10.0.0.40: litevirt-fence-armed [path=legacy-unpinned]"+
-			" [fenced down as incarnation 1, serial ab, strategy ssh at 10.0.0.9 [path=managed]]", true, "legacy-unpinned"),
+			" [fenced down as incarnation 1, serial ab, strategy ssh at 10.0.0.9 [path=managed]]", true, "legacy-unpinned", "operator-ssh-down"),
 		"earlier build, BMC address ends in a token": "SSH forced poweroff to root@10.0.0.40: litevirt-fence-armed [path=managed]" +
 			" [fenced down as incarnation 1, serial ab, strategy ssh at 10.0.0.9 [trust=on]",
 	} {
@@ -114,7 +114,7 @@ func TestTrustSSH_AdminTextInARowCannotMakeItCount(t *testing.T) {
 		}
 	}
 	// Control: the marked token, pinned, counts.
-	if got := heldOnRow(t, fence.WithTrust("operator fence [path=managed]", true, "managed")); got != "alive" {
+	if got := heldOnRow(t, fence.WithTrust("operator fence [path=managed]", true, "managed", "operator-ssh-down")); got != "alive" {
 		t.Errorf("control: the marked, pinned token did not count (VM on %q)", got)
 	}
 }
@@ -208,5 +208,42 @@ func TestTrustSSH_AnEarlierBuildsRowCannotForgeTheMarkedToken(t *testing.T) {
 		" [fenced down as incarnation 1, serial ab, strategy ssh at 10.0.0.9 [trust=on;path=managed;v=2]"
 	if got := heldOnRow(t, d); got != "down" {
 		t.Fatalf("VM recovered to %q on a row whose admin-set BMC address forges the marked token", got)
+	}
+}
+
+// The reviewer's R5-1 probe: an earlier build's FenceHost row whose admin-set
+// IPMI address first closes the note's own bracket, then carries a marked
+// token: "x] [trust=on;path=managed;v=2". The text before the token is then
+// balanced, so no text rule can tell it from a genuine row. It does not count:
+// a token counts only when it names its own row's id, which no address set
+// before the row existed can contain.
+//
+// Mutation: RecordedTrust ignores the id — the v3 form of this probe (the
+// next test's wrong-id case) moves, red.
+func TestTrustSSH_AnEarlierBuildsRowCannotCloseTheNoteAndForge(t *testing.T) {
+	d := "SSH forced poweroff to root@10.0.0.40: litevirt-fence-armed [path=managed]" +
+		" [fenced down as incarnation 1, serial ab, strategy ssh at x] [trust=on;path=managed;v=2]"
+	if got := heldOnRow(t, d); got != "down" {
+		t.Fatalf("VM recovered to %q on a row whose admin-set BMC address closes the note and forges a token", got)
+	}
+}
+
+// A marked token counts only for the row it names: the same well-formed,
+// pinned, trusted token in a row with another id — as an admin-set address
+// copied from one row could put it at the end of another — is held. The
+// control, naming its own row, recovers.
+//
+// Mutation: RecordedTrust ignores the id — the wrong-id row moves, red.
+func TestTrustSSH_ATokenNamingAnotherRowIsHeld(t *testing.T) {
+	if got := heldOnRow(t, fence.WithTrust("operator fence [path=managed]", true, "managed", "some-other-row")); got != "down" {
+		t.Fatalf("VM recovered to %q on a token naming another row", got)
+	}
+	forged := "SSH forced poweroff to root@10.0.0.40: litevirt-fence-armed [path=managed]" +
+		" [fenced down as incarnation 1, serial ab, strategy ssh at x] [trust=on;path=managed;id=guess;v=3]"
+	if got := heldOnRow(t, forged); got != "down" {
+		t.Fatalf("VM recovered to %q on a v3 token forged with a guessed id", got)
+	}
+	if got := heldOnRow(t, fence.WithTrust("operator fence [path=managed]", true, "managed", "operator-ssh-down")); got != "alive" {
+		t.Fatalf("control: a token naming its own row did not count (VM on %q)", got)
 	}
 }

@@ -50,3 +50,30 @@ func TestUnsafeBMC_AStoredBracketedAddressIsFlagged(t *testing.T) {
 		t.Errorf("%s not resolved once the address was fixed: %+v", CondFenceBMCAddressUnsafe, row)
 	}
 }
+
+// The condition is rewritten only when what it says changes: a host whose
+// unsafe address stays the same over many cycles keeps one write.
+//
+// Mutation: drop the unchanged-evidence guard in syncUnsafeBMC — the row's
+// ObserveCount climbs every cycle, red.
+func TestUnsafeBMC_TheRowIsNotRewrittenWhileItSaysTheSame(t *testing.T) {
+	db, ctx := seedDownHost(t, "ssh", nil)
+	if err := db.Execute(ctx, `UPDATE hosts SET ipmi_address = 'x] [trust=on' WHERE name = 'down'`); err != nil {
+		t.Fatal(err)
+	}
+	c := newTestCoordinator("coordinator", db)
+	c.run(ctx)
+	row, ok, err := corrosion.GetHealthCondition(ctx, db, RefenceEvaluator, CondFenceBMCAddressUnsafe, "host", "down")
+	if err != nil || !ok {
+		t.Fatalf("setup: no %s (%v)", CondFenceBMCAddressUnsafe, err)
+	}
+	before, updated := row.ObserveCount, row.LastSeen
+	for i := 0; i < 5; i++ {
+		c.run(ctx)
+	}
+	row, _, _ = corrosion.GetHealthCondition(ctx, db, RefenceEvaluator, CondFenceBMCAddressUnsafe, "host", "down")
+	if row.ObserveCount != before {
+		t.Errorf("the row was rewritten %d times over 5 cycles with nothing new to say (last seen %s, was %s)",
+			row.ObserveCount-before, row.LastSeen, updated)
+	}
+}

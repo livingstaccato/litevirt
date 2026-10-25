@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/sys/unix"
 )
 
 // execSSHD is an SSH server that runs each exec request under sh as sshd
@@ -157,7 +158,34 @@ func TestRunOutputContext_AnswersLikeRunOutput(t *testing.T) {
 // and the closed session leave the shell, its pipeline and the background
 // sleep running, red.
 func TestRunOutputContext_DeadlineKillsTheRemoteGroup(t *testing.T) {
-	assertDeadlineKillsTheRemoteGroup(t, execSSHD(t))
+	assertDeadlineKillsTheRemoteGroup(t, execSSHD(t), treeCmd)
+}
+
+// treeCmd is a command with a background child and a pipeline, all in its
+// own process group; it records its shell's pid in the file it is given.
+func treeCmd(marker string) string {
+	return `sleep 30 & echo $$ > '` + marker + `'; sleep 30 | cat`
+}
+
+// escapingCmd runs, under coreutils timeout, a child that ignores SIGTERM.
+// timeout without --foreground calls setpgid(0, 0), so the child and timeout
+// leave the command's process group (staying in its session), and a kill of
+// that group misses them (the rc8 lab drill 3 leftover). It records the
+// child's pid.
+func escapingCmd(marker string) string {
+	return `sleep 30 & timeout 30 sh -c 'trap "" TERM; echo $$ > '"'` + marker + `'"'; exec sleep 30'`
+}
+
+// A child that moved to a process group of its own is still in the
+// command's session, and the whole session is killed.
+//
+// Mutation: kill only the command's process group in the watcher — timeout
+// and its TERM-ignoring child run on, red.
+func TestRunOutputContext_DeadlineKillsTheSession(t *testing.T) {
+	if _, err := exec.LookPath("timeout"); err != nil {
+		t.Skip("no timeout(1)")
+	}
+	assertDeadlineKillsTheRemoteGroup(t, execSSHD(t), escapingCmd)
 }
 
 // On a machine with no setsid, the command stays in the group sshd gave the
@@ -180,10 +208,33 @@ func TestRunOutputContext_NoSetsidKillsTheWholeTree(t *testing.T) {
 	if out, err := c.RunOutputContext(context.Background(), `command -v setsid || echo none`); err != nil || string(out) != "none\n" {
 		t.Fatalf("the fake machine must have no setsid: %q, %v", out, err)
 	}
-	assertDeadlineKillsTheRemoteGroup(t, c)
+	assertDeadlineKillsTheRemoteGroup(t, c, treeCmd)
 }
 
-func assertDeadlineKillsTheRemoteGroup(t *testing.T, c *Client) {
+// With no setsid, a child that left the command's process group is still in
+// the session sshd gave the wrapper, and that session is killed.
+//
+// Mutation: kill only the wrapper's process group on that branch — timeout
+// and its child run on, red.
+func TestRunOutputContext_NoSetsidKillsTheSession(t *testing.T) {
+	bin := t.TempDir()
+	for _, tool := range []string{"sh", "sleep", "cat", "timeout"} {
+		p, err := exec.LookPath(tool)
+		if err != nil {
+			t.Skip(err)
+		}
+		if err := os.Symlink(p, filepath.Join(bin, tool)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := execSSHDPath(t, bin)
+	if out, err := c.RunOutputContext(context.Background(), `command -v setsid || echo none`); err != nil || string(out) != "none\n" {
+		t.Fatalf("the fake machine must have no setsid: %q, %v", out, err)
+	}
+	assertDeadlineKillsTheRemoteGroup(t, c, escapingCmd)
+}
+
+func assertDeadlineKillsTheRemoteGroup(t *testing.T, c *Client, cmd func(marker string) string) {
 	t.Helper()
 	marker := filepath.Join(t.TempDir(), "pid")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -191,16 +242,19 @@ func assertDeadlineKillsTheRemoteGroup(t *testing.T, c *Client) {
 	start := time.Now()
 	done := make(chan error, 1)
 	go func() {
-		_, err := c.RunOutputContext(ctx, `sleep 30 & echo $$ > '`+marker+`'; sleep 30 | cat`)
+		_, err := c.RunOutputContext(ctx, cmd(marker))
 		done <- err
 	}()
-	pid, pgid := 0, 0
+	pid, pgid, sid := 0, 0, 0
 	for time.Since(start) < 10*time.Second {
 		if b, err := os.ReadFile(marker); err == nil && strings.HasSuffix(string(b), "\n") {
 			if pid, err = strconv.Atoi(strings.TrimSpace(string(b))); err != nil {
 				t.Fatal(err)
 			}
 			if pgid, err = syscall.Getpgid(pid); err != nil {
+				t.Fatalf("the command (pid %d) is already gone: %v", pid, err)
+			}
+			if sid, err = unix.Getsid(pid); err != nil {
 				t.Fatalf("the command (pid %d) is already gone: %v", pid, err)
 			}
 			break
@@ -222,17 +276,18 @@ func assertDeadlineKillsTheRemoteGroup(t *testing.T, c *Client) {
 	if pid == 0 {
 		t.Fatal("the command never ran")
 	}
-	if pgid == syscall.Getpgrp() {
-		t.Fatalf("the command ran in the test's own process group (%d)", pgid)
+	if own, _ := unix.Getsid(0); pgid == syscall.Getpgrp() || sid == own {
+		t.Fatalf("the command ran in the test's own process group (%d) or session (%d)", pgid, sid)
 	}
-	if live := liveInGroup(t, pgid, pid); len(live) > 0 {
+	if live := liveIn(t, pgid, sid, pid); len(live) > 0 {
 		t.Fatalf("after RunOutputContext returned, still running: %v", live)
 	}
 }
 
-// liveInGroup lists the processes, other than zombies, in process group pgid
-// or with pid, polling briefly so a killed process has time to exit.
-func liveInGroup(t *testing.T, pgid, pid int) []string {
+// liveIn lists the processes, other than zombies, in process group pgid or
+// session sid or with pid, polling briefly so a killed process has time to
+// exit.
+func liveIn(t *testing.T, pgid, sid, pid int) []string {
 	t.Helper()
 	if _, err := os.Stat("/proc/self/stat"); err != nil {
 		t.Skip("no /proc to read process groups from")
@@ -251,13 +306,14 @@ func liveInGroup(t *testing.T, pgid, pid int) []string {
 			if k < 0 {
 				continue
 			}
-			fs := strings.Fields(s[k+1:]) // state, ppid, pgrp, ...
-			if len(fs) < 3 || fs[0] == "Z" {
+			fs := strings.Fields(s[k+1:]) // state, ppid, pgrp, session, ...
+			if len(fs) < 4 || fs[0] == "Z" {
 				continue
 			}
 			p, _ := strconv.Atoi(strings.Fields(s)[0])
 			g, _ := strconv.Atoi(fs[2])
-			if g == pgid || p == pid {
+			sess, _ := strconv.Atoi(fs[3])
+			if g == pgid || sess == sid || p == pid {
 				live = append(live, s[:k+1])
 			}
 		}

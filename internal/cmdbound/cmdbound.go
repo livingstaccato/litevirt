@@ -39,6 +39,8 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -154,4 +156,63 @@ func Apply(cmd *exec.Cmd) *exec.Cmd {
 	}
 	cmd.WaitDelay = WaitDelay
 	return cmd
+}
+
+// CommandSession is Command with the command leading a session of its own
+// (Setsid), and the whole session killed when the context ends, not only
+// its process group. A child can leave the group (coreutils timeout without
+// --foreground calls setpgid(0, 0)), and a group kill then misses it, but it
+// cannot leave the session without setsid. The session is read from /proc;
+// where there is none, only the group is killed.
+func CommandSession(ctx context.Context, name string, args ...string) *exec.Cmd {
+	cmd := Command(ctx, name, args...)
+	cmd.SysProcAttr.Setpgid = false
+	cmd.SysProcAttr.Setsid = true
+	cmd.Cancel = func() error { return killSession(cmd.Process.Pid) }
+	return cmd
+}
+
+// killSession SIGKILLs session sid: its leader's group, then every process
+// /proc lists in the session, twice, so a child forked during the first pass
+// is caught by the second.
+func killSession(sid int) error {
+	gerr := syscall.Kill(-sid, syscall.SIGKILL)
+	found := false
+	for pass := 0; pass < 2; pass++ {
+		for _, pid := range sessionMembers(sid) {
+			found = true
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
+	if errors.Is(gerr, syscall.ESRCH) && !found {
+		return os.ErrProcessDone
+	}
+	return nil
+}
+
+// sessionMembers lists the processes /proc shows in session sid, zombies
+// included (a kill is harmless to them).
+func sessionMembers(sid int) []int {
+	dirs, _ := os.ReadDir("/proc")
+	var out []int
+	for _, d := range dirs {
+		pid, err := strconv.Atoi(d.Name())
+		if err != nil {
+			continue
+		}
+		b, err := os.ReadFile("/proc/" + d.Name() + "/stat")
+		if err != nil {
+			continue
+		}
+		// After "pid (comm)": state, ppid, pgrp, session.
+		k := bytes.LastIndexByte(b, ')')
+		if k < 0 {
+			continue
+		}
+		f := strings.Fields(string(b[k+1:]))
+		if len(f) >= 4 && f[3] == strconv.Itoa(sid) {
+			out = append(out, pid)
+		}
+	}
+	return out
 }

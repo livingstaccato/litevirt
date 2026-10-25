@@ -1462,8 +1462,8 @@ func (d *LocalAddTarget) Shell(kind, cmd string) ([]byte, error) {
 	return d.ShellContext(context.Background(), kind, cmd)
 }
 
-// ShellContext is Shell, with the command run in a process group of its own
-// that is killed, whole, when ctx ends. A type embedding *LocalAddTarget
+// ShellContext is Shell, with the command run in a session of its own that
+// is killed, whole, when ctx ends. A type embedding *LocalAddTarget
 // inherits it, so shellWithin calls it and not the embedder's Shell override.
 func (d *LocalAddTarget) ShellContext(ctx context.Context, kind, cmd string) ([]byte, error) {
 	d.Events = append(d.Events, "sh "+kind)
@@ -1474,7 +1474,7 @@ func (d *LocalAddTarget) ShellContext(ctx context.Context, kind, cmd string) ([]
 		}
 		return []byte(d.DaemonState + "\n"), nil
 	}
-	out, err := cmdbound.Output(ctx, cmdbound.Command(ctx, "sh", "-c", cmd))
+	out, err := cmdbound.Output(ctx, cmdbound.CommandSession(ctx, "sh", "-c", cmd))
 	if err != nil {
 		return out, fmt.Errorf("%s: %w", kind, err)
 	}

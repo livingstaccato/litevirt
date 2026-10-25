@@ -62,8 +62,8 @@ type unprovenRaise struct {
 	why   string
 	trust *trustJudged
 	// declined: the hold is a recorded fence that no longer stands
-	// (noteResumeDeclined), so nothing was recovered on it, and the remedy
-	// names `lv host undrain` too.
+	// (noteResumeDeclined), and the remedy names `lv host undrain` too, on
+	// its precondition.
 	declined bool
 	// hold is the hold holdUnproven noted (the host.recovery.stalled text),
 	// and holdNote the trust note it embeds: the settle sweep rewrites that
@@ -202,14 +202,19 @@ func (c *Coordinator) trustRestored(h *corrosion.HostRecord) bool {
 }
 
 // unprovenRemedyOf is unprovenRemedy for what r raised: for a recorded fence
-// declined, the undrain that lets the coordinator judge the outage afresh is
-// a way out too. Nothing was recovered on that fence, so returning the host
-// to active starts nothing twice.
+// declined, an undrain is a way out too, on its precondition. UndrainHost
+// starts nothing: it returns the host to active, and any recovery after it
+// needs a fresh fence under the ordinary rules. It is safe only while the
+// host answers and none of its workloads runs elsewhere, which is the
+// operator's to check: an earlier resume of the same fence may have recovered
+// part of them, so nothing here claims that none moved.
 func unprovenRemedyOf(h *corrosion.HostRecord, r unprovenRaise) string {
 	out := unprovenRemedy(h, r.trust.note(h))
 	if r.declined {
-		out += fmt.Sprintf(". Nothing was recovered on this fence, so `lv host undrain %[1]s` is a way out too: it returns "+
-			"%[1]s to service if it is up, and if it is down the coordinator fences it afresh for this outage", h.Name)
+		out += fmt.Sprintf(". If %[1]s is up and answering (`lv host inspect %[1]s`) and none of its workloads runs anywhere "+
+			"else (`lv ls --host %[1]s` lists each one still recorded on it), `lv host undrain %[1]s` returns it to service: "+
+			"the coordinator moves nothing on a declined fence. Undraining a host that does not answer only has the "+
+			"coordinator judge the outage afresh: nothing moves until a new fence proves it off", h.Name)
 	}
 	return out
 }

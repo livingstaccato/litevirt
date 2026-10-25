@@ -1582,13 +1582,21 @@ since revoked. Where the setting is off, it names
 `lv host config <host> --trust-ssh-poweroff` as the operator's choice, not a
 recommendation: it counts later fences confirmed over the pinned key, never
 the one already holding this recovery, whichever leader judges it. For a
-declined recorded fence it adds `lv host undrain <host>`: nothing was recovered
-on that fence, so the undrain returns the host to service if it is up, and if
-it is down the leader fences it afresh for the outage. The same
-hold is named by the `host.recovery.stalled` notification. The detail is kept
-current while the hold lasts: a confirmation noted later as not standing, a
-later fence's failure, or a change to the host's trust setting (re-read each
-cycle; it never releases the hold) replaces what it said.
+declined recorded fence it adds `lv host undrain <host>`, on its precondition:
+the host is up and answering (`lv host inspect <host>`) and none of its
+workloads runs anywhere else (`lv ls --host <host>` lists each one still
+recorded on it). The leader moves nothing on a declined fence, and the
+undrain starts nothing: it returns the host to service, and a host that does
+not answer is only judged afresh, with nothing moved until a new fence proves
+it off. An earlier resume of the same fence may have recovered part of the
+workloads, which is why the precondition is checked rather than assumed. The
+same hold is named by the `host.recovery.stalled` notification, whose text
+follows the trust setting too. The detail is kept current while the hold
+lasts: a confirmation noted later as not standing, a later fence's failure, or
+a change to the host's trust setting (re-read each cycle) replaces what it
+said. A setting turned on never releases a fence judged untrusted; a trust
+revoked and then set again makes its fence count again, and the leader
+resumes the recovery from it on its next cycle while it still stands.
 
 The condition resolves when the recovery goes ahead (the operator's
 confirmation, or a fence judged again that passes), and, read back by a later

@@ -503,10 +503,17 @@ func TestUnprovenFence_ADeclinedRecordedFenceIsAHealthCondition(t *testing.T) {
 	if !strings.Contains(ev.Detail, "recorded ssh fence operator-ssh-down no longer stands") {
 		t.Errorf("detail does not name the declined fence: %q", ev.Detail)
 	}
-	for _, want := range []string{"`lv host fence-confirm down`", "`lv host undrain down`"} {
+	for _, want := range []string{"`lv host fence-confirm down`", "`lv host undrain down`",
+		"If down is up and answering", "none of its workloads runs anywhere else", "nothing moves until a new fence proves it off"} {
 		if !strings.Contains(ev.Remedy, want) {
 			t.Errorf("remedy does not name %q: %q", want, ev.Remedy)
 		}
+	}
+	// The undrain is offered on its precondition, never on a claim that
+	// nothing moved (review I1): an earlier resume of the same fence may
+	// have recovered part of the workloads.
+	if strings.Contains(ev.Remedy, "Nothing was recovered") {
+		t.Errorf("remedy claims nothing was recovered on the fence: %q", ev.Remedy)
 	}
 
 	operatorConfirms(t, db, ctx, "down")

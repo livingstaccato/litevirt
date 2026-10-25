@@ -830,6 +830,16 @@ Do **not** reach for `lv host undrain` on an unconfirmed fence. It returns the
 host to `active` while the machine may still be running, which is exactly the
 split-brain the gate refused to create.
 
+The one exception is a recorded fence the leader **declined** (it no longer
+stands, named by `ha.recovery.unproven_fence` with an undrain in its remedy):
+the leader moves nothing on a declined fence. If the host is up and answering
+(`lv host inspect <host>`) and none of its workloads runs anywhere else
+(`lv ls --host <host>` lists each one still recorded on it), `lv host undrain
+<host>` returns it to service. Check both: an earlier resume of the same fence
+may have recovered part of its workloads. Undraining a host that does not
+answer only has the leader judge the outage afresh: nothing moves until a new
+fence proves it off.
+
 Two things the gauge will not tell you. Dropping to zero is not proof of
 recovery: any command that moves the host out of `fenced`/`offline` — `undrain`
 included — takes it out of the count whether or not the workloads went anywhere,

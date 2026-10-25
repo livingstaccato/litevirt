@@ -956,7 +956,13 @@ func (f *Fake) StartDomain(name string) error {
 		pause = p
 	}
 	if pause && g.PausedDone != nil {
-		defer g.PausedDone(name)
+		// As libvirt.Client: the paused start's end is reported only once
+		// the domain is no longer paused (resumed, stopped, never created).
+		defer func() {
+			if st, ok := f.RawState(name); !ok || st != StatePaused {
+				g.PausedDone(name)
+			}
+		}()
 	}
 	if err := f.startDomain(name, pause); err != nil {
 		// As libvirt.Client.StartDomain (startWithConsoleBackstop): a start QEMU

@@ -66,7 +66,8 @@ func startDomainGuarded(v snapshotAPI, g StartGuard, name string) error {
 			return nil
 		},
 		func() error { return v.DomainResume(dom) },
-		func() { _ = v.DomainDestroy(dom) })
+		func() { _ = v.DomainDestroy(dom) },
+		func() bool { return domainStillPaused(v, name) })
 }
 
 // ShutdownDomain sends an ACPI poweroff to a running domain. The firmware

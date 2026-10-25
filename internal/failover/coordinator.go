@@ -248,6 +248,11 @@ type Coordinator struct {
 	// holdReason is, per host, why its recovery last did not proceed; the
 	// stall alert names it (alertStalledRecoveries).
 	holdReason map[string]string
+	// holdBase is, per host, the hold reason last noted (noteHold) before any
+	// stale operator confirmation was appended to it (noteConfirmationStale),
+	// so that note, repeated every cycle, is appended to the hold rather than
+	// replacing it.
+	holdBase map[string]string
 	// lastFenceFailure is, per host, the method and detail of the newest
 	// fence this coordinator saw fail, for the retry hold (retryHold).
 	lastFenceFailure map[string]string
@@ -1503,6 +1508,7 @@ func (c *Coordinator) stepDownGauges() {
 	// The stall alert is the leader's too: a node that takes the lease back
 	// starts its clocks afresh rather than alerting on a stale one.
 	c.stallSince, c.stallAlerted, c.stallUnfenced, c.holdReason, c.lastFenceFailure = nil, nil, nil, nil, nil
+	c.holdBase = nil
 	// So are the upgrading lives it saw: a later tenure has not seen what
 	// happened meanwhile.
 	c.upgradingLives = nil
@@ -1554,6 +1560,7 @@ func (c *Coordinator) forgetEpisodes() {
 	c.retryNotified, c.retryRefusedLogged = nil, nil
 	c.resumeDeclined, c.confirmStale, c.notRelying = nil, nil, nil
 	c.stallSince, c.stallAlerted, c.stallUnfenced, c.holdReason, c.lastFenceFailure = nil, nil, nil, nil, nil
+	c.holdBase = nil
 	c.upgradingLives = nil
 }
 
@@ -2400,10 +2407,12 @@ func (c *Coordinator) manualFenceConfirmed(ctx context.Context, host string) boo
 // manualFenceConfirmed alone accepts any confirmation under five minutes old,
 // so one from before the host last came back (a reboot boots it 'active')
 // would be spent on a fence of its next outage while it runs its workloads.
-// A refusal is noted with its remedy (noteConfirmationStale), and why is
-// non-empty then; it is empty when there is no recent confirmation at all, or
-// on a read error.
-func (c *Coordinator) confirmedOffNow(ctx context.Context, host string, life time.Time, lifeKnown bool) (string, bool) {
+// A refusal is noted with its remedy (noteConfirmationStale), and stale is
+// that note then; it is empty when there is no recent confirmation at all, or
+// on a read error. A gate that refuses on it still holds on its own reason,
+// with stale appended (withStaleConfirmation): the confirmation is only why
+// the gate did not pass.
+func (c *Coordinator) confirmedOffNow(ctx context.Context, host string, life time.Time, lifeKnown bool) (stale string, confirmed bool) {
 	if !c.manualFenceConfirmed(ctx, host) {
 		return "", false
 	}
@@ -2412,16 +2421,29 @@ func (c *Coordinator) confirmedOffNow(ctx context.Context, host string, life tim
 		return "", false
 	}
 	if lifeKnown && confirmedAt.Before(life) {
-		why := "it was written before the host last turned active"
-		c.noteConfirmationStale(host, confirm, why)
-		return why, false
+		return c.noteConfirmationStale(host, confirm, "it was written before the host last turned active"), false
 	}
 	why, stands := c.confirmationStands(ctx, host, confirmedAt)
 	if !stands {
-		c.noteConfirmationStale(host, confirm, why)
-		return why, false
+		return c.noteConfirmationStale(host, confirm, why), false
 	}
 	return "", true
+}
+
+// withStaleConfirmation appends to a gate's hold reason the operator
+// confirmation that does not stand for this outage (confirmedOffNow's note),
+// when there is one. The gate's own reason leads: it is why a confirmation is
+// needed at all, and a stale confirmation alone reads as the only problem
+// (the rc9 lab's A2: an untrusted SSH power-off held as "the confirmation
+// does not stand", never naming the fence or the trust opt-in).
+func withStaleConfirmation(reason, stale string) string {
+	if stale == "" {
+		return reason
+	}
+	if reason == "" {
+		return stale
+	}
+	return reason + "; " + stale
 }
 
 // safeFenceRequiresProof reports whether a FAILED best-effort fence of h must be
@@ -3082,24 +3104,30 @@ func (c *Coordinator) confirmationStands(ctx context.Context, host string, confi
 
 // noteConfirmationStale records that the operator confirmation confirm of
 // host no longer stands (confirmationStands): the host's hold names it and
-// the remedy every cycle, and it is logged and counted once per confirmation.
-func (c *Coordinator) noteConfirmationStale(host string, confirm fenceRecord, why string) {
+// the remedy every cycle, after whatever else holds it (holdBase), and it is
+// logged and counted once per confirmation. It returns the note.
+func (c *Coordinator) noteConfirmationStale(host string, confirm fenceRecord, why string) string {
 	if why == "" {
-		return
+		return ""
 	}
 	hint := "confirm " + host + " is powered off, then run 'lv host fence-confirm " + host + "' again"
-	c.noteHold(host, "the operator confirmation "+confirm.ID+" does not stand for this outage: "+
-		strings.Replace(why, "the fence", "the confirmation", 1)+"; "+hint)
+	note := "the operator confirmation " + confirm.ID + " does not stand for this outage: " +
+		strings.Replace(why, "the fence", "the confirmation", 1) + "; " + hint
+	if c.holdReason == nil {
+		c.holdReason = map[string]string{}
+	}
+	c.holdReason[host] = withStaleConfirmation(c.holdBase[host], note)
 	if c.confirmStale == nil {
 		c.confirmStale = map[string]string{}
 	}
 	if c.confirmStale[host] == confirm.ID {
-		return
+		return note
 	}
 	c.confirmStale[host] = confirm.ID
 	slog.Warn("failover: the operator confirmation does not stand for this outage, NOT acting on it",
 		"host", host, "confirmation", confirm.ID, "confirmed_at", confirm.TS, "reason", why, "hint", hint)
 	c.mAttempt(PhaseRecovery, ResultRefused, ErrManualUnconfirmed)
+	return note
 }
 
 // confirmationAndAttempt reads host's fencing_log for the newest operator
@@ -3689,7 +3717,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 	if fr.Success {
 		// A fence that succeeded answers whatever held the recovery back;
 		// recoverFenced records anything that holds it now.
-		delete(c.holdReason, h.Name)
+		c.clearHold(h.Name)
 	}
 
 	// Say so, at the moment it matters, when the fence proves nothing. The row
@@ -3937,15 +3965,14 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	// unless the host explicitly opts into legacy proceed-anyway. Pre-flip (token
 	// not enforced) this is a no-op, so a mixed-version roll keeps today's behavior.
 	if fenceWasBestEffort(fr.Method, ranUnder) && c.safeFenceRequiresProof(ctx, h) {
-		if why, ok := c.confirmedOffNow(ctx, h.Name, life, lifeKnown); !ok {
-			if why != "" {
-				return // refused with its remedy (noteConfirmationStale)
-			}
+		if stale, ok := c.confirmedOffNow(ctx, h.Name, life, lifeKnown); !ok {
 			slog.Error("failover: best-effort fence unconfirmed under safe-fence policy, NOT rescheduling",
 				"host", h.Name, "detail", fr.Detail,
 				"hint", strings.TrimPrefix(fenceFailedWayOut(h), "; or "))
-			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
-			c.noteHold(h.Name, "best-effort fence is not proof the host is off (safe-fence policy)"+fenceFailedWayOut(h))
+			if stale == "" { // a stale confirmation is counted once (noteConfirmationStale)
+				c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
+			}
+			c.noteGateHold(h.Name, "best-effort fence is not proof the host is off (safe-fence policy)"+fenceFailedWayOut(h), stale)
 			return
 		}
 		slog.Info("failover: operator confirmed best-effort fence, proceeding", "host", h.Name)
@@ -3957,15 +3984,14 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	// recover became recoverable during the hold, so the host's partition pause
 	// never paused it, and it may still run there (heldThisOutage).
 	if fr.Method == "best-effort-ssh" && c.heldThisOutage(ctx, h.Name) {
-		if why, ok := c.confirmedOffNow(ctx, h.Name, life, lifeKnown); !ok {
-			if why != "" {
-				return // refused with its remedy (noteConfirmationStale)
-			}
+		if stale, ok := c.confirmedOffNow(ctx, h.Name, life, lifeKnown); !ok {
 			slog.Error("failover: the fence ending a held fence did not reach the host, NOT rescheduling",
 				"host", h.Name, "detail", fr.Detail,
 				"hint", strings.TrimPrefix(fenceFailedWayOut(h), "; or ")+"; the recovery resumes from it")
-			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
-			c.noteHold(h.Name, "best-effort fence after a held fence did not reach the host"+fenceFailedWayOut(h))
+			if stale == "" {
+				c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
+			}
+			c.noteGateHold(h.Name, "best-effort fence after a held fence did not reach the host"+fenceFailedWayOut(h), stale)
 			return
 		}
 		slog.Info("failover: operator confirmed a host whose fence was held, proceeding", "host", h.Name)
@@ -3981,16 +4007,15 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	// A confirmation written AFTER this refusal is picked up by the fence loop
 	// (resumeFromConfirmation), which resumes the recovery from it.
 	if requiresFenceConfirmation(h) && fr.Success && !fr.ProvedOff() {
-		if why, ok := c.confirmedOffNow(ctx, h.Name, life, lifeKnown); !ok {
-			if why != "" {
-				return // refused with its remedy (noteConfirmationStale)
-			}
+		if stale, ok := c.confirmedOffNow(ctx, h.Name, life, lifeKnown); !ok {
 			slog.Error("failover: host requires a verified fence and this one was not verified, NOT rescheduling",
 				"host", h.Name, "method", fr.Method, "detail", fr.Detail,
 				"label", corrosion.LabelFenceRequiresConfirmation,
 				"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off; the recovery resumes from it")
-			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
-			c.noteHold(h.Name, "unverified "+fr.Method+" fence awaiting 'lv host fence-confirm "+h.Name+"' ("+corrosion.LabelFenceRequiresConfirmation+")")
+			if stale == "" {
+				c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
+			}
+			c.noteGateHold(h.Name, "unverified "+fr.Method+" fence awaiting 'lv host fence-confirm "+h.Name+"' ("+corrosion.LabelFenceRequiresConfirmation+")", stale)
 			return
 		}
 		slog.Info("failover: operator confirmed an unverified fence, proceeding", "host", h.Name, "method", fr.Method)
@@ -4014,30 +4039,38 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 		bestEffort := fr.Method == "best-effort-ssh" && fence.ResolveStrategy(h.FenceStrategy) == "best-effort"
 		switch {
 		case h.FenceStrategy == "manual" || bestEffort || fr.Unproven:
-			if why, ok := c.confirmedOffNow(ctx, h.Name, life, lifeKnown); !ok {
-				if why != "" {
-					return // refused with its remedy (noteConfirmationStale)
-				}
+			// A stale confirmation (stale) is not why the recovery is held:
+			// the fence is. Each refusal holds on its own reason, the stale
+			// confirmation appended (noteGateHold), and a stale one is
+			// counted once, by noteConfirmationStale.
+			if stale, ok := c.confirmedOffNow(ctx, h.Name, life, lifeKnown); !ok {
 				if fr.Unproven {
 					slog.Error("failover: an SSH power-off the remote shell confirmed is not proof the host is off, NOT rescheduling",
 						"host", h.Name, "detail", fr.Detail, "hint", strings.TrimPrefix(fenceFailedWayOut(h), "; or "))
-					c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
-					c.noteHold(h.Name, "the SSH fence's remote shell confirmed the power-off, which is not proof the host is off"+
-						fenceFailedWayOut(h)+trustSSHChoice(h))
+					if stale == "" {
+						c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
+					}
+					c.noteGateHold(h.Name, "the SSH fence's remote shell confirmed the power-off, which is not proof the host is off"+
+						fenceFailedWayOut(h)+trustSSHChoice(h), stale)
 					return
 				}
 				if bestEffort {
 					slog.Error("failover: the best-effort fence proves nothing and the host's partition pause is not relied on, NOT rescheduling",
 						"host", h.Name, "detail", fr.Detail, "hint", strings.TrimPrefix(fenceFailedWayOut(h), "; or "))
-					c.mAttempt(PhaseSplitBrain, ResultRefused, ErrFenceFailed)
+					if stale == "" {
+						c.mAttempt(PhaseSplitBrain, ResultRefused, ErrFenceFailed)
+					}
 					c.noteFenceFailure(h, fr)
+					c.noteGateHold(h.Name, c.holdBase[h.Name], stale)
 					return
 				}
 				slog.Error("failover: manual fence not confirmed by operator, NOT rescheduling",
 					"host", h.Name, "detail", fr.Detail,
 					"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off")
-				c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
-				c.noteHold(h.Name, "manual fence awaiting 'lv host fence-confirm "+h.Name+"'")
+				if stale == "" {
+					c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
+				}
+				c.noteGateHold(h.Name, "manual fence awaiting 'lv host fence-confirm "+h.Name+"'", stale)
 				return
 			}
 			slog.Info("failover: operator confirmed the host off, proceeding",
@@ -4113,7 +4146,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 	fenceEpoch, fenceEpochWhy, fenceEpochRetry := c.proofGradeFenceRefWhy(ctx, h.Name)
 	// Recovery is running: whatever held it back before no longer does, and
 	// a refusal below records what holds it now (the stall alert's reason).
-	delete(c.holdReason, h.Name)
+	c.clearHold(h.Name)
 
 	// Step 3: Find VMs that should be restarted.
 	vms, err := corrosion.ListVMs(ctx, c.db, "", h.Name)

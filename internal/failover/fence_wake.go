@@ -336,12 +336,30 @@ func (c *Coordinator) retryHold(h *corrosion.HostRecord, next time.Time) {
 }
 
 // noteHold records why the recovery of host is not proceeding, for the stall
-// alert. The newest reason wins.
+// alert. The newest reason wins; a stale operator confirmation noted after it
+// is appended to it (noteConfirmationStale).
 func (c *Coordinator) noteHold(host, reason string) {
 	if c.holdReason == nil {
 		c.holdReason = map[string]string{}
 	}
-	c.holdReason[host] = reason
+	if c.holdBase == nil {
+		c.holdBase = map[string]string{}
+	}
+	c.holdReason[host], c.holdBase[host] = reason, reason
+}
+
+// noteGateHold holds host's recovery on reason, a gate an operator
+// confirmation passes, with stale appended: confirmedOffNow's note of a
+// confirmation that does not stand for this outage (withStaleConfirmation).
+func (c *Coordinator) noteGateHold(host, reason, stale string) {
+	c.noteHold(host, reason)
+	c.holdReason[host] = withStaleConfirmation(reason, stale)
+}
+
+// clearHold forgets why host's recovery was held: it is proceeding.
+func (c *Coordinator) clearHold(host string) {
+	delete(c.holdReason, host)
+	delete(c.holdBase, host)
 }
 
 // forgetHost drops the per-episode memory kept for host here, once it is back
@@ -354,7 +372,7 @@ func (c *Coordinator) forgetHost(host string) {
 	delete(c.confirmStale, host)
 	delete(c.afreshConfirm, host)
 	delete(c.notRelying, host)
-	delete(c.holdReason, host)
+	c.clearHold(host)
 	delete(c.lastFenceFailure, host)
 	delete(c.stallSince, host)
 	delete(c.stallAlerted, host)

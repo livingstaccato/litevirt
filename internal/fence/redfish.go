@@ -124,6 +124,10 @@ func redfishBaseURL(endpoint string) (*url.URL, error) {
 		return nil, fmt.Errorf("invalid redfish endpoint %q: credentials belong in the redfish user and password, not the URL", endpoint)
 	case u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/"):
 		return nil, fmt.Errorf("invalid redfish endpoint %q: give the base URL only, https://host[:port]", endpoint)
+	case strings.ContainsAny(endpoint, "[]") && (net.ParseIP(u.Hostname()) == nil || !strings.Contains(u.Hostname(), ":")):
+		// Brackets would open or close a token in a fence row; a URL has
+		// them only around an IPv6 literal host.
+		return nil, fmt.Errorf("invalid redfish endpoint %q: '[' and ']' only around an IPv6 address", endpoint)
 	}
 	return &url.URL{Scheme: "https", Host: u.Host}, nil
 }

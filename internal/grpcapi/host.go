@@ -1937,6 +1937,11 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 
 	method := fr.Method
 	detail := fr.Detail
+	// The path the fence took, read before anything admin-set is appended.
+	path := fr.Path
+	if path == "" {
+		path = fence.RecordedPath(fr.Detail)
+	}
 	result := fr.LogResult()
 	if !fr.Success {
 		detail = fmt.Sprintf("fence failed (%s); host marked offline in state", fr.Detail)
@@ -1951,7 +1956,7 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 	// target note's admin-set BMC address, which must not be able to carry a
 	// token that counts.
 	if fr.Method == "ssh" && fr.Success {
-		detail = fence.WithTrust(detail, h.Labels[corrosion.LabelTrustSSHPoweroff] == "true")
+		detail = fence.WithTrust(detail, h.Labels[corrosion.LabelTrustSSHPoweroff] == "true", path)
 	}
 
 	// Mark it offline regardless of fence success, and record the fence, in
@@ -2063,6 +2068,13 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 			return nil, status.Errorf(codes.InvalidArgument,
 				"invalid fence strategy %q (valid: ssh, ipmi, redfish, watchdog, manual, best-effort)", req.FenceStrategy)
 		}
+	}
+
+	// A BMC address is written into fence rows (fenceTargetNote), whose
+	// tokens are bracketed: it may not carry a bracket.
+	if strings.ContainsAny(req.IpmiAddress, "[]") {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"invalid ipmi address %q: a host name or address, without '[' or ']'", req.IpmiAddress)
 	}
 
 	// The Redfish settings: what this request does to them, decided and
@@ -2998,5 +3010,8 @@ func fenceTargetNote(ctx context.Context, db *corrosion.Client, h *corrosion.Hos
 	if bmc == "" {
 		bmc = "-"
 	}
-	return fmt.Sprintf(" [fenced %s as incarnation %d, serial %s, strategy %s at %s]", h.Name, n, h.CertSerial, h.FenceStrategy, bmc)
+	// Every field is written with its brackets rewritten (fence.DetailField):
+	// the BMC address is admin-set, and must not open or close a token.
+	return fmt.Sprintf(" [fenced %s as incarnation %d, serial %s, strategy %s at %s]", fence.DetailField(h.Name), n,
+		fence.DetailField(h.CertSerial), fence.DetailField(h.FenceStrategy), fence.DetailField(bmc))
 }

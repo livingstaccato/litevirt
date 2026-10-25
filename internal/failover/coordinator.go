@@ -259,6 +259,9 @@ type Coordinator struct {
 	// sweep re-raises with both, so the condition's detail stays current.
 	lastStale      map[string]string
 	unprovenRaised map[string]unprovenRaise
+	// restsOnTrust names the hosts whose recovery went ahead on a trusted SSH
+	// power-off, for an owed claim retry to re-judge (retryClaims).
+	restsOnTrust map[string]bool
 	// lastFenceFailure is, per host, the method and detail of the newest
 	// fence this coordinator saw fail, for the retry hold (retryHold).
 	lastFenceFailure map[string]string
@@ -1515,7 +1518,7 @@ func (c *Coordinator) stepDownGauges() {
 	// The stall alert is the leader's too: a node that takes the lease back
 	// starts its clocks afresh rather than alerting on a stale one.
 	c.stallSince, c.stallAlerted, c.stallUnfenced, c.holdReason, c.lastFenceFailure = nil, nil, nil, nil, nil
-	c.holdBase, c.lastStale, c.unprovenRaised = nil, nil, nil
+	c.holdBase, c.lastStale, c.unprovenRaised, c.restsOnTrust = nil, nil, nil, nil
 	// So are the upgrading lives it saw: a later tenure has not seen what
 	// happened meanwhile.
 	c.upgradingLives = nil
@@ -1567,7 +1570,7 @@ func (c *Coordinator) forgetEpisodes() {
 	c.retryNotified, c.retryRefusedLogged = nil, nil
 	c.resumeDeclined, c.confirmStale, c.notRelying = nil, nil, nil
 	c.stallSince, c.stallAlerted, c.stallUnfenced, c.holdReason, c.lastFenceFailure = nil, nil, nil, nil, nil
-	c.holdBase, c.lastStale, c.unprovenRaised = nil, nil, nil
+	c.holdBase, c.lastStale, c.unprovenRaised, c.restsOnTrust = nil, nil, nil, nil
 	c.upgradingLives = nil
 }
 
@@ -3402,6 +3405,7 @@ func (c *Coordinator) resumeFromConfirmation(ctx context.Context, target string)
 	// The operator's word is that the host is off now: a claim retry this
 	// recovery leaves owed acts on this moment (claimRetryOutageOver).
 	c.noteRecoveryAt(target, c.now(), c.mono())
+	delete(c.restsOnTrust, target) // it rests on the operator's word now
 	c.resolveUnproven(ctx, target, "an operator confirmed the host off")
 	c.recoverWorkloads(ctx, h)
 	return true
@@ -3683,7 +3687,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 	// self_paused, and recoverFenced then waits out the pause.
 	fr = notAFenceUnlessPaused(asSelfPause(fr, pauseRelied, trusted))
 	if fr.Method == "ssh" && fr.Success {
-		fr.Detail = fence.WithTrust(fr.Detail, trusted)
+		fr.Detail = fence.WithTrust(fr.Detail, trusted, ranPath(fr))
 	}
 
 	logResult := fr.LogResult()
@@ -4116,16 +4120,25 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 			// the operator can say it is off (the rc9 lab's F1a).
 			// One raised before, on a host since given a BMC strategy whose
 			// fence failed too, is kept current: the reason is this failure.
+			// With the newest stale confirmation, as the settle sweep raises
+			// it, so the row is not rewritten twice per retry.
 			if fence.SSHOnly(h.FenceStrategy) {
 				c.raiseUnproven(ctx, h, "the SSH fence of "+h.Name+" failed ("+fr.Detail+"), so nothing proves "+h.Name+
-					" is off; the fence is retried with backoff, and an SSH fence cannot reach a host that has lost power", "", "")
+					" is off; the fence is retried with backoff, and an SSH fence cannot reach a host that has lost power", c.lastStale[h.Name], "")
 			} else if c.unprovenOpen(ctx, h.Name) {
 				c.raiseUnproven(ctx, h, "the "+fr.Method+" fence of "+h.Name+" failed ("+fr.Detail+"), so nothing proves "+h.Name+
-					" is off; the fence is retried with backoff", "", "")
+					" is off; the fence is retried with backoff", c.lastStale[h.Name], "")
 			}
 			return
 		}
 	}
+
+	// Whether this recovery rests on a trusted SSH power-off: a claim retry it
+	// leaves owed re-judges that trust before it runs (retryClaims).
+	if c.restsOnTrust == nil {
+		c.restsOnTrust = map[string]bool{}
+	}
+	c.restsOnTrust[h.Name] = fr.Method == "ssh" && fr.Success
 
 	// Past every gate: whatever fence held the recovery for want of proof
 	// no longer does (ha.recovery.unproven_fence).

@@ -12,6 +12,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/claims"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/placement"
 )
@@ -914,6 +915,34 @@ func (c *Coordinator) retryClaims(ctx context.Context, target string) bool {
 	if !c.holdLease(ctx) {
 		c.claimRetry[target] = true
 		return true
+	}
+	// A retry is a recovery not yet made. One that rests on a trusted SSH
+	// power-off needs it to count still: the decision recorded with the fence
+	// AND the host trusting one now, as recoverFenced judges it. A revoked
+	// trust drops the retry and holds the recovery, until a fence-confirm.
+	// The fence judged is the one this coordinator acted on (fencedOn); one
+	// it cannot read yet waits for the next tick.
+	if c.restsOnTrust[target] {
+		rec, found, err := corrosion.GetFenceLog(ctx, c.db, c.fencedOn[target])
+		if err != nil || !found {
+			c.claimRetry[target] = true
+			return true
+		}
+		if rec.Method == "ssh" && rec.Result == fence.LogFenced {
+			fr := fence.Result{Success: true, Method: rec.Method, Detail: rec.Detail}
+			if !trustedSSH(fr, fence.RecordedTrust(rec.Detail) && trustsSSHPoweroff(h)) {
+				note := sshTrustNote(h, fr)
+				slog.Error("failover: an owed claim retry rests on an SSH power-off that no longer counts, NOT retrying",
+					"host", target, "fence_id", rec.ID, "reason", note)
+				c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
+				c.forgetClaimRetries(target)
+				delete(c.restsOnTrust, target)
+				c.holdUnproven(ctx, h, "the owed recovery claims rest on a confirmed SSH power-off that no longer counts"+
+					fenceFailedWayOut(h)+" ("+note+")",
+					"the owed recovery claims rest on a confirmed SSH power-off that no longer counts", c.lastStale[target], note)
+				return true
+			}
+		}
 	}
 	slog.Info("failover: retrying the recovery claims refused on an earlier tick", "host", target)
 	c.recoverWorkloads(ctx, h)

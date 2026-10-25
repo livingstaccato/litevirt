@@ -310,8 +310,14 @@ func fenceFailedWayOut(h *corrosion.HostRecord) string {
 // that the host did power off.
 func sshTrustNote(h *corrosion.HostRecord, fr fence.Result) string {
 	recorded, now := fence.RecordedTrust(fr.Detail), trustsSSHPoweroff(h)
+	// The path the trust decision reads is the one its marked token records;
+	// a row without one says only what its last path token says.
+	pinned := fence.ConfirmedOverPin(fr)
+	if tok, ok := fence.RecordedTrustToken(fr.Detail); ok {
+		pinned = fence.PinnedPath(tok.Path)
+	}
 	switch {
-	case !fence.ConfirmedOverPin(fr):
+	case !pinned:
 		return "this power-off was not confirmed over " + h.Name + "'s pinned host key, so no trust setting counts it"
 	case recorded && !now:
 		return h.Name + "'s trust of a confirmed SSH power-off was revoked after this fence was judged, " +
@@ -386,6 +392,7 @@ func (c *Coordinator) forgetHost(host string) {
 	delete(c.notRelying, host)
 	c.clearHold(host)
 	delete(c.unprovenRaised, host)
+	delete(c.restsOnTrust, host)
 	delete(c.lastFenceFailure, host)
 	delete(c.stallSince, host)
 	delete(c.stallAlerted, host)

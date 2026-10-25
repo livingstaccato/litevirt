@@ -62,7 +62,7 @@ func ConfirmedOverPin(r Result) bool {
 	if path == "" {
 		path = RecordedPath(r.Detail)
 	}
-	return path == "managed" || path == "legacy-pinned"
+	return PinnedPath(path)
 }
 
 // RecordedPath is the path label an SSH fence's detail records: its last
@@ -83,37 +83,90 @@ func RecordedPath(detail string) string {
 }
 
 // Trust tokens: the decision, made when a confirmed SSH power-off is judged,
-// whether its host trusted one (the host's litevirt.trust_ssh_poweroff then).
-// The coordinator appends one to the fence's detail before it records the row
-// (WithTrust), and every later judgement of that fence, a successor's resume
-// included, reads it back (RecordedTrust) rather than the label as it reads
-// now: trust is never retroactive.
-const (
-	trustOn  = "[trust=on]"
-	trustOff = "[trust=off]"
-)
+// whether its host trusted one (the host's litevirt.trust_ssh_poweroff then),
+// and the path the fence took. The writer appends one LAST to the fence's
+// detail before it records the row (WithTrust), and every later judgement of
+// that fence, a successor's resume included, reads it back (RecordedTrust)
+// rather than the label as it reads now: trust is never retroactive.
+//
+// The token is marked ("[trust=on;path=managed;v=2]"): an earlier build wrote
+// no token, or an unmarked "[trust=on]", and an admin-set field of its rows
+// (a BMC address) could end in either. Only the marked form, as this build
+// writes it, counts; a row without one is held, like a row with no token. The
+// path inside it is the one the trust decision reads, never a "[path=" token
+// elsewhere in the detail, which admin-set text after the real one could
+// carry (RecordedPath reads the last).
+const trustMark = "v=2"
 
-// WithTrust is detail with the trust decision appended.
-func WithTrust(detail string, trusted bool) string {
+// WithTrust is detail with the trust decision, and path, the path the fence
+// took (Result.Path; a fence label such as "managed"), appended.
+func WithTrust(detail string, trusted bool, path string) string {
+	on := "off"
 	if trusted {
-		return detail + " " + trustOn
+		on = "on"
 	}
-	return detail + " " + trustOff
+	return detail + " [trust=" + on + ";path=" + DetailField(path) + ";" + trustMark + "]"
+}
+
+// TrustRecord is what a marked trust token records.
+type TrustRecord struct {
+	Trusted bool
+	Path    string
+}
+
+// RecordedTrustToken reads the marked trust token that ends detail. ok is
+// false when it does not end in one: no token, an earlier build's unmarked
+// one, or one followed by anything (a token in an earlier field).
+func RecordedTrustToken(detail string) (TrustRecord, bool) {
+	d := strings.TrimSpace(detail)
+	if !strings.HasSuffix(d, ";"+trustMark+"]") {
+		return TrustRecord{}, false
+	}
+	i := strings.LastIndex(d, " [trust=")
+	if i < 0 {
+		return TrustRecord{}, false
+	}
+	body := d[i+len(" [") : len(d)-1]
+	if strings.ContainsAny(body, "[]") {
+		return TrustRecord{}, false
+	}
+	parts := strings.Split(body, ";")
+	if len(parts) != 3 || parts[2] != trustMark || !strings.HasPrefix(parts[1], "path=") {
+		return TrustRecord{}, false
+	}
+	var r TrustRecord
+	switch parts[0] {
+	case "trust=on":
+		r.Trusted = true
+	case "trust=off":
+	default:
+		return TrustRecord{}, false
+	}
+	r.Path = strings.TrimPrefix(parts[1], "path=")
+	return r, true
+}
+
+// PinnedPath reports whether path is one that reaches the host over its
+// pinned sshd key: the managed or the legacy-pinned path.
+func PinnedPath(path string) bool {
+	return path == "managed" || path == "legacy-pinned"
 }
 
 // RecordedTrust reports whether detail records that its fence was judged
-// trusted: it ends in "[trust=on]", the token its writer appends LAST, and no
-// "[path=" token follows the one before it. A "[trust=" anywhere earlier (the
-// remote machine's output, which remoteOutput rewrites anyway, or an
-// admin-set field such as a BMC address) is not read. A detail with no token
-// (an earlier build's row) records no trust: the fence is held.
+// trusted, over a pinned path: it ends in a marked trust token
+// (RecordedTrustToken) saying "on", whose path is pinned (PinnedPath). Any
+// other detail — no token, an unmarked one, a token not last, an unpinned
+// path — records no trust, and the fence is held.
 func RecordedTrust(detail string) bool {
-	d := strings.TrimSpace(detail)
-	if !strings.HasSuffix(d, trustOn) {
-		return false
-	}
-	i := len(d) - len(trustOn)
-	return strings.LastIndex(d, "[path=") < i
+	r, ok := RecordedTrustToken(detail)
+	return ok && r.Trusted && PinnedPath(r.Path)
+}
+
+// DetailField is s, admin-set or remote text, as a fence detail records it:
+// with "[" and "]" rewritten, so that it cannot open or close a token
+// (RecordedPath, RecordedTrustToken).
+func DetailField(s string) string {
+	return strings.NewReplacer("[", "(", "]", ")").Replace(s)
 }
 
 // remoteOutput is what the machine that answered an SSH fence printed, as a

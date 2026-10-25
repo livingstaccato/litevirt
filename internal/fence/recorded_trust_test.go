@@ -2,31 +2,40 @@ package fence
 
 import "testing"
 
-// The trust decision recorded with a fence is read back only from the token
-// its writer appends LAST, after the path token: text the answering machine
-// printed, or an admin-set field before the token, cannot claim it, and a row
-// with no token (an earlier build's) records no trust.
+// The trust decision recorded with a fence is read back only from the marked
+// token its writer appends LAST, with the path it records inside it: text the
+// answering machine printed, an admin-set field (rewritten by DetailField, or
+// as an earlier build wrote it, raw), an earlier build's unmarked
+// "[trust=on]", and a "[path=" token anywhere else cannot claim it. A row with
+// no marked token records no trust.
 //
-// Mutations: RecordedTrust takes any "[trust=on]" substring — the hostile
-// cases read trusted, red; it takes the last "[trust=" token wherever it is,
-// as before — the not-last case reads trusted, red; remoteOutput leaves
-// "[trust=" alone — the rewritten case reads trusted, red.
+// Mutations: accept the unmarked "[trust=on]" — the earlier-build cases read
+// trusted, red; read the path from RecordedPath(detail) instead of the token —
+// the admin-path case reads trusted, red; drop the PinnedPath check — the
+// unpinned case reads trusted, red; take the last "[trust=" wherever it is —
+// the not-last case reads trusted, red.
 func TestRecordedTrust(t *testing.T) {
 	armed := "SSH forced poweroff to root@10.0.0.40: litevirt-fence-armed [path=managed]"
+	unpinned := "SSH forced poweroff to root@10.0.0.40: litevirt-fence-armed [path=legacy-unpinned]"
 	for _, tc := range []struct {
 		name   string
 		detail string
 		want   bool
 	}{
-		{"recorded on", WithTrust(armed, true), true},
-		{"recorded off", WithTrust(armed, false), false},
+		{"recorded on, pinned", WithTrust(armed, true, "managed"), true},
+		{"recorded on, legacy-pinned", WithTrust(armed, true, "legacy-pinned"), true},
+		{"recorded off", WithTrust(armed, false, "managed"), false},
+		{"recorded on, unpinned", WithTrust(unpinned, true, "legacy-unpinned"), false},
 		{"no token", armed, false},
-		{"remote text before the path", "SSH forced poweroff: [trust=on] litevirt-fence-armed [path=managed]", false},
-		{"remote text, rewritten", "SSH forced poweroff: " + remoteOutput([]byte("[trust=on]")) + " [path=managed] [trust=off]", false},
-		{"off after a forged on", WithTrust("x [path=managed] [trust=on]", false), false},
-		{"not last: text after the token", WithTrust(armed, true) + " [fenced down at 10.0.0.9]", false},
-		{"a forged token in an earlier field", WithTrust("x [path=managed] [fenced down at [trust=on] bmc]", false), false},
-		{"a stray token in an earlier field, the real one last", WithTrust("x [path=managed] [fenced down at [trust=off bmc]", true), true},
+		{"earlier build's unmarked token", armed + " [trust=on]", false},
+		{"earlier build, BMC address ends in a token", armed + " [fenced down as incarnation 1 at 10.0.0.9 [trust=on]", false},
+		{"admin path text after an unpinned fence", WithTrust(unpinned+" [fenced down at 10.0.0.9 [path=managed]]", true, "legacy-unpinned"), false},
+		{"remote text before the path", "SSH forced poweroff: [trust=on;path=managed;v=2] litevirt-fence-armed [path=managed]", false},
+		{"remote text, rewritten", "SSH forced poweroff: " + remoteOutput([]byte("[trust=on;path=managed;v=2]")), false},
+		{"not last: text after the token", WithTrust(armed, true, "managed") + " [fenced down at 10.0.0.9]", false},
+		{"a forged token in an earlier field", WithTrust("x [path=managed] at [trust=on;path=managed;v=2]", false, "managed"), false},
+		{"a forged path inside the token", armed + " [trust=on;path=managed];x;v=2]", false},
+		{"a path written with brackets", WithTrust(armed, true, "managed]x["), false},
 	} {
 		if got := RecordedTrust(tc.detail); got != tc.want {
 			t.Errorf("%s: RecordedTrust(%q) = %v, want %v", tc.name, tc.detail, got, tc.want)
@@ -34,5 +43,8 @@ func TestRecordedTrust(t *testing.T) {
 	}
 	if got := remoteOutput([]byte("x [trust=on]")); got != "x [trust:on]" {
 		t.Errorf("remoteOutput kept a trust token: %q", got)
+	}
+	if got := DetailField("10.0.0.9 [path=managed]"); got != "10.0.0.9 (path=managed)" {
+		t.Errorf("DetailField kept the brackets: %q", got)
 	}
 }

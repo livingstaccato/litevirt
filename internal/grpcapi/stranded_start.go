@@ -543,8 +543,10 @@ func (s *Server) strandedStartKept(ctx context.Context, vm string, startErr erro
 // had torn the domain down (review F7 m1). A record whose domain runs is
 // stale, and dropped; so is one whose domain is shut off (a destroy outside
 // `lv stop --force`), which holds no paused guest and which the start guard
-// does not refuse a start over either (review r8-m1). The restore holds the
-// VM's lock, and its start lease before it starts anything.
+// does not refuse a start over either (review r8-m1). The caller must hold
+// the VM's start lease: a start that holds it may be in the window between
+// recording its paused start and its paused create, its domain shut off, and
+// its record is not stale.
 func (s *Server) startRecordRefusal(op, vm string) error {
 	s.dropStartRecordIfRunning(vm)
 	s.dropStartRecordIfInactive(vm)

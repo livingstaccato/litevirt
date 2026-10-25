@@ -15,6 +15,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fwmig"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -266,6 +267,32 @@ func TestRestoreSnapshot_DropsTheStartRecordOfAShutOffDomain(t *testing.T) {
 	}
 	if marked, _ := s.startPausedMarked("rs"); marked {
 		t.Fatal("the restore kept the stale start record of a shut-off domain")
+	}
+}
+
+// Review of the rc10 polish, m1: a reconciler or restart-policy start holds
+// the VM's start lease, not its lock, and between recording its paused start
+// and the paused create its domain is shut off. A restore in that window is
+// refused at the lease, and must not drop that start's record first: the
+// record is judged only once the restore holds the lease.
+//
+// Mutation: startRecordRefusal before holdStartLease, as before — red.
+func TestRestoreSnapshot_KeepsTheRecordOfAStartThatHoldsTheLease(t *testing.T) {
+	s := lockTestServer(t)
+	fake := seedRestorableVM(t, s, "disk")
+	if heldBy, err := health.TryVMStartLease(adminCtx(), s.db, s.hostName+"/vmcheck", "rs", time.Now()); err != nil || heldBy != s.hostName+"/vmcheck" {
+		t.Fatalf("setup: lease %q %v", heldBy, err)
+	}
+	if err := s.markStartPaused("rs"); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetState("rs", libvirtfake.StateShutdown)
+	_, err := s.RestoreSnapshot(adminCtx(), &pb.RestoreSnapshotRequest{VmName: "rs", SnapshotName: "s1"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("RestoreSnapshot = %v, want refused while a start holds the lease", err)
+	}
+	if marked, _ := s.startPausedMarked("rs"); !marked {
+		t.Fatal("the refused restore dropped the record of the start that holds the lease")
 	}
 }
 

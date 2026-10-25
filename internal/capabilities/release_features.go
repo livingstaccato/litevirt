@@ -86,6 +86,7 @@ type FeatureInfo struct {
 // after the latch marks it used. Its other data, the cluster failback policy,
 // is nothing failback can act on without those records, so it shares the bit.
 var releaseFeatures = map[Feature]FeatureInfo{
+	FeatureAutomationState:              {Token: AutomationV1, Description: "Automation authority, certified automation history and automation claim state"},
 	FeatureAutomationIdentityContinuity: {Token: Release202702V1, Description: "Certified continuity of an existing automation identity and its current parent lifetime", Writers: []string{"internal/corrosion.Client.claimAcceptContinuityWithGrant", "internal/corrosion.Client.materializeAutomationContinuity", "internal/corrosion.Client.importAutomationContinuity"}},
 	FeatureVMLimits: {Token: Release202611V1, Description: "Per-VM CPU limit and shares, and NIC bandwidth limits",
 		Writers: []string{"internal/grpcapi.admitLimitedSpec", "internal/grpcapi.admitLimitUpdate",
@@ -250,6 +251,16 @@ const (
 	FeatureAutomationIdentityContinuity Feature = "automation_identity_continuity"
 )
 
+// The feature of automation_v1. automation_v1 is not a release-train token,
+// but its marker carries the same safe_if_unused rule, and this is the used
+// bit that rule reads: the first write of any automation state (an authority
+// row, certified history, an automation claim) must record it through
+// WithFeature first. No writer in this build creates automation state, so it
+// is never recorded and a rollback below automation_v1 never quarantines on it.
+const (
+	FeatureAutomationState Feature = "automation_state"
+)
+
 // The features of release_2027_01_v1. Each name is written into a replicated
 // key once used, so it never changes.
 const (
@@ -293,8 +304,12 @@ const MarkerRollbackKey = "rollback"
 // rollbackRules is every token whose activation marker carries a rollback rule.
 // Only release tokens belong here: the rule is sound only for a token whose
 // every effect is behind WithFeature, so that "no feature used" means
-// "nothing written that a previous build cannot keep".
+// "nothing written that a previous build cannot keep". AutomationV1 is one in
+// that sense: it is advertised on the build and so latches on every cluster,
+// and its one feature (automation_state) is the used bit every first write of
+// automation state must record first; this build has no such writer.
 var rollbackRules = map[string]string{
+	AutomationV1:    RollbackSafeIfUnused,
 	Release202611V1: RollbackSafeIfUnused,
 	Release202612V1: RollbackSafeIfUnused,
 	Release202701V1: RollbackSafeIfUnused,
@@ -329,6 +344,8 @@ func Honoured(token string, feature Feature) bool {
 // it quarantines on any marker it does not know, rule or not. A later release
 // token's entry is true, because the build below it is a release-token build.
 var ruleAwareBelow = map[string]bool{
+	// The build below automation_v1 is a release-token build.
+	AutomationV1:    true,
 	Release202611V1: false,
 	Release202612V1: true,
 	Release202701V1: true,

@@ -13,8 +13,12 @@ package capabilities
 // ReplicationGated: a host parked in maintenance on an older build may still
 // run a managed VM, so it holds the latch off.
 //
-// It carries no rollback rule, so a rollback below it always quarantines,
-// whether or not a managed resource exists yet.
+// Because it latches on every cluster, its marker carries safe_if_unused
+// (release_features.go): a rollback below it proceeds, on release probation,
+// while no use of its feature automation_state is recorded, and quarantines
+// once one is. Every first write of automation state must record that use
+// through WithFeature before it writes; no writer in this build creates
+// automation state.
 //
 // Holding the token is not activation. The service is enabled only when the
 // latch holds AND every readiness component reports ready (AutomationActive);

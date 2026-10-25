@@ -16,8 +16,13 @@ func TestAutomationCapabilityLabelAloneDoesNotEnable(t *testing.T) {
 	if !ReplicationGated(AutomationV1) {
 		t.Fatal("automation_v1 is not replication-gated: a parked host on an older build would not hold it off")
 	}
-	if RollbackRule(AutomationV1) != "" {
-		t.Fatal("automation_v1 carries a rollback rule: a rollback below it could start without quarantine")
+	// It latches on every cluster, so a rollback below it must cost
+	// something only where automation was used.
+	if RollbackRule(AutomationV1) != RollbackSafeIfUnused || !RuleHonouredBelow(AutomationV1) {
+		t.Fatal("automation_v1 has no safe_if_unused rule honoured below it: a rollback would quarantine clusters that never used automation")
+	}
+	if info, ok := LookupFeature(FeatureAutomationState); !ok || info.Token != AutomationV1 {
+		t.Fatalf("automation state is not a feature of automation_v1: %+v", info)
 	}
 	if AutomationActive(true, nil) {
 		t.Fatal("the latched label alone enabled automation")

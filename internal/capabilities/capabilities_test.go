@@ -386,6 +386,9 @@ var frozenReleaseFeatures = map[string][]Feature{
 		"project_adoption",
 	},
 	Release202702V1: {"automation_identity_continuity"},
+	// Not shipped yet: corrected only by one reviewed change here and in
+	// releaseFeatures together.
+	AutomationV1: {"automation_state"},
 }
 
 // TestReleaseFeatureSetIsFrozen (m6): every release token's declared features

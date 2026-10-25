@@ -575,8 +575,10 @@ enforcement:
                               # founded earlier never has one), three voters of the
                               # adopted generation evidenced (by their signatures there)
                               # to hold a complete import, and every later readiness
-                              # component, none of which exists in this build. Once
-                              # latched, a rollback below it quarantines. While automation
+                              # component, none of which exists in this build. Its marker
+                              # carries `rollback: safe_if_unused`: a rollback below it
+                              # proceeds on release probation unless automation use
+                              # (automation_state) is recorded, then quarantines. While automation
                               # state exists, `lv cluster voter force-reconfigure` and
                               # `lv cluster voter reset` are refused.
 

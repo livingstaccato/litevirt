@@ -176,46 +176,48 @@ func TestAutomationGateRefusesClusterWithoutOrigin(t *testing.T) {
 	}
 }
 
-// What this pins: once automation_v1 has latched here, a rollback to any build
-// that does not know the token quarantines, unconditionally — its marker
-// carries no safe_if_unused rule, so no reading of the recorded release-feature
-// uses (empty, failing, or naming an automation feature) turns it into a mere
-// probation. It does not model managed resources: they can only exist after
-// the latch, so "quarantine on every rollback below the latch" covers "after
-// managed resources exist" by being stronger.
-func TestAutomationVoterRollbackGuardQuarantinesBelowTheLatch(t *testing.T) {
+// automation_v1 latches on every cluster (advertised on the build), so its
+// marker carries safe_if_unused: a rollback to a build that does not know the
+// token proceeds (on probation) while no automation use is recorded, and
+// quarantines once one is, or when the recorded uses cannot be read.
+func TestAutomationVoterRollbackGuardQuarantinesOnlyAfterUse(t *testing.T) {
 	if !capabilities.Has(capabilities.All(), capabilities.AutomationV1) {
 		t.Fatal("automation_v1 is not a declared token: a latched marker would quarantine this very build")
 	}
 	content := capabilities.MarkerContent(capabilities.AutomationV1)
 	// What an older build sees: a marker it has no token for, with
-	// automation_v1's exact content.
+	// automation_v1's exact content, and uses recorded under that name.
 	const older = "automation_v1_as_seen_by_an_older_build"
-	for _, uses := range []struct {
-		name string
-		fn   func() ([]corrosion.ReleaseFeatureUse, error)
+	for _, tc := range []struct {
+		name       string
+		uses       func() ([]corrosion.ReleaseFeatureUse, error)
+		quarantine bool
 	}{
-		{"nothing used", func() ([]corrosion.ReleaseFeatureUse, error) { return nil, nil }},
-		{"uses unreadable", func() ([]corrosion.ReleaseFeatureUse, error) { return nil, os.ErrPermission }},
-		{"automation used", func() ([]corrosion.ReleaseFeatureUse, error) {
-			return []corrosion.ReleaseFeatureUse{{Token: older, Feature: string(capabilities.FeatureAutomationStream)}}, nil
-		}},
+		{"unused proceeds", func() ([]corrosion.ReleaseFeatureUse, error) { return nil, nil }, false},
+		{"used quarantines", func() ([]corrosion.ReleaseFeatureUse, error) {
+			return []corrosion.ReleaseFeatureUse{{Token: older, Feature: string(capabilities.FeatureAutomationState)}}, nil
+		}, true},
+		{"unreadable uses fail closed", func() ([]corrosion.ReleaseFeatureUse, error) { return nil, os.ErrPermission }, true},
 	} {
-		t.Run(uses.name, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			if err := os.WriteFile(health.ActivationMarkerPath(dir, older), content, 0o600); err != nil {
 				t.Fatal(err)
 			}
-			q, probation := preflightRollback(dir, uses.fn)
-			if len(q) != 1 || q[0] != older || len(probation) != 0 {
-				t.Fatalf("rollback below automation_v1: quarantine %v probation %v, want quarantine of the token", q, probation)
+			q, probation := preflightRollback(dir, tc.uses)
+			if tc.quarantine {
+				if len(q) != 1 || q[0] != older {
+					t.Fatalf("quarantine %v probation %v, want quarantine of the token", q, probation)
+				}
+			} else if len(q) != 0 || len(probation) != 1 || probation[0] != older {
+				t.Fatalf("quarantine %v probation %v, want the rollback to proceed on probation", q, probation)
 			}
 			// This build, which knows the token, is not a rollback.
 			if err := os.WriteFile(health.ActivationMarkerPath(dir, capabilities.AutomationV1), content, 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if q, _ := preflightRollback(dir, uses.fn); len(q) != 1 || q[0] != older {
-				t.Fatalf("this build quarantined on its own automation_v1 marker: %v", q)
+			if q2, _ := preflightRollback(dir, tc.uses); len(q2) != len(q) {
+				t.Fatalf("this build's own automation_v1 marker changed the outcome: %v", q2)
 			}
 		})
 	}

@@ -433,7 +433,9 @@ segment. So a create, and every start of the VM, by whatever path (`lv start`,
 `lv restart`, a failover, reschedule, onboot or health restart, promote, clone
 `--start`, replace, import, restore), is refused when the NIC's bridge on that
 host has VLAN filtering off, naming the bridge: the check runs where every
-start passes, before the guest runs. A
+start passes, before the guest runs, on the bridge the NIC's tap is actually
+enslaved to (read from the kernel), which may not be the one its network's name
+resolves to; a tap whose bridge cannot be read refuses the start. A
 failover, reschedule or onboot start refused that way is not parked in
 `error`: the VM waits on that host (`pending` or `starting`, the detail naming
 the bridge), is tried again on every reconcile pass, and starts by itself once
@@ -456,7 +458,11 @@ bridge cannot hold it, and a re-deploy of the network keeps it (a compose file
 cannot set it). With it on, a migration or drain of a VM whose access-VLAN NIC
 is on that network may land it on a host whose bridge does not filter VLANs, on
 that bridge's untagged segment, and the target logs a warning. Starts there are
-still refused. While it is on, `lv health` shows
+still refused, so a drain's cold move of a running VM, which ends in a start on
+the target, is refused before the guest is shut down when the target is named
+by `bridge_vlan_filtering_off` for the NIC's bridge, opt-in or not. A node on an
+older build that rewrites the network's definition (its own `lv network set`,
+or a re-deploy through it) drops the setting, which turns it off. While it is on, `lv health` shows
 `access_vlan_unfiltered_moves_allowed` for the network, `lv network inspect`
 says so, and `lv doctor access-vlan-moves` lists it
 ([diagnostics.md](diagnostics.md#a-network-lets-access-vlan-vms-move-onto-unfiltered-bridges-access_vlan_unfiltered_moves_allowed)).

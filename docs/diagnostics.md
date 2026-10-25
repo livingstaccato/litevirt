@@ -3211,11 +3211,17 @@ removed.
 A start of a VM whose NICs need their tap VLANs (or a NIC guard under a tap
 libvirt names) creates the guest paused, readies it and then resumes it. If
 the daemon stopped in between, or the libvirt connection dropped so that
-neither the resume nor the destroy landed, the guest stays paused. When the
-daemon starts again, before anything else can start a guest, it finishes each
-such start: a domain paused for a user reason, whose row names this host as
-running or starting, held by no partition pause, hand-over or firmware move.
-It puts the firewall and VLANs in force and resumes it. One it cannot finish
+neither the resume nor the destroy landed, the guest stays paused. Each such
+paused start is recorded on the host (under `start-paused/` in the data
+directory) before the guest is created, and the record is removed when the
+start ends. When the daemon starts again, before anything else can start a
+guest, it finishes each start that still has a record: the domain is paused,
+its row names this host as running or starting, and nothing else holds it (no
+partition pause mark on the domain, no partition pause record in memory, the
+reserve or the record directory, no hand-over, no firmware move; any of them
+unreadable counts as held). It puts the firewall and VLANs in force and resumes
+it. A domain paused without a record (by partition pause, a snapshot, an
+operator) is never resumed by it. One it cannot finish
 stays paused and is named by `vm_start_stranded_paused` (evaluator
 `start_guard`, subject `vm/<name>@<host>`, warning), with why. Fix the cause
 and `lv restart <vm>`, or `lv stop <vm> --force`. The condition resolves on

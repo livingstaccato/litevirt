@@ -344,6 +344,20 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"%q is held as a disk a delete kept on this host: %s; it is not pool content to delete", req.Filename, why)
 	}
+	// A replica an earlier layout kept at the top level, read through a
+	// disk's header whatever its row records (replicaChainUser): of the VM
+	// its records name, or of any disk in the pool.
+	vms := []string{req.ReplicaVm}
+	if recs, err := s.recordsOf(ctx, target); err != nil {
+		return nil, status.Errorf(codes.Internal, "read the records of %q: %v", req.Filename, err)
+	} else {
+		for _, u := range recs {
+			vms = append(vms, u.VM)
+		}
+	}
+	if err := s.refuseReplicaAChainReads(ctx, req.Filename, target, dir, vms...); err != nil {
+		return nil, err
+	}
 	// Only the caller's own upload or replica; library content no record
 	// refers to is shared by everyone who reads the pool, and only an admin
 	// deletes it.
@@ -425,6 +439,14 @@ func (s *Server) deleteAreaReplica(ctx context.Context, dir string, caller poolC
 	if held, why := s.keptHolds(ctx, path); held {
 		return true, status.Errorf(codes.FailedPrecondition,
 			"%q is held as a disk a delete kept on this host: %s; it is not pool content to delete", file, why)
+	}
+	// What a disk's header reads, whatever its row records (replicaChainUser).
+	var replicaVM string
+	if r, ok := replicaRecordFor(path); ok {
+		replicaVM = r.VM
+	}
+	if err := s.refuseReplicaAChainReads(ctx, file, path, dir, replicaVM); err != nil {
+		return true, err
 	}
 	if err := os.Remove(path + ".json"); err != nil && !os.IsNotExist(err) {
 		return true, status.Errorf(codes.Internal, "delete the replica's record: %v", err)

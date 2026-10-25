@@ -3555,6 +3555,39 @@ by hand (`rbd -m <that cluster's monitors> rm <pool>/<image>`). A journaled
 cutover cleanup that kept one retries by itself, and succeeds once the pool
 is on this host.
 
+### Replicas in a pool are not removed (`replica_removal_held`)
+
+Before a replica file is removed, whether by a schedule's prune, the orphan
+sweep or a pool content delete (`DeleteStoragePoolContent`, as
+`lv iso rm` and docs/storage.md use it), its host checks that no disk reads
+it. It checks the disk records, and also the qcow2 header chain of every disk
+of the replica's VM and of every live disk in the pool. A `--no-localize`
+promotion's disk is an overlay on its replica, and a record can lack its
+backing, so the header is what counts.
+
+While a header in that chain, or the disk records, cannot be read, whether
+the replica is in use cannot be told. The replica is kept, and so is every
+other replica in the pool, because each removal checks every disk in the
+pool. The replicas pile up until that file reads again.
+
+The host raises `replica_removal_held` (evaluator `replica_prune`, subject
+`host/<host>/<pool>`, warning), one per pool. Its evidence holds one entry
+for each file that cannot be read:
+
+- the file's path, or `""` when the disk records cannot be read;
+- its VM and disk;
+- the error;
+- since when;
+- how many replicas it has kept, and up to ten of them by path.
+
+The VM a held replica belongs to gets a `vm.replica_removal_held` event
+naming the file, at most once an hour while the hold lasts. A pool content
+delete that is held is refused with the same reason.
+
+To recover, fix that file's header or its storage, or move the file out of
+the pool. The next prune or sweep that reads every disk it checks removes
+what was held and resolves the condition.
+
 ### A VM delete kept a disk file (`disk_leftover`)
 
 A VM delete never removes a disk it cannot prove unused, and never leaves one

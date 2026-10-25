@@ -285,6 +285,13 @@ func (s *Server) sweepPoolReplicas(ctx context.Context, pool, poolDir string, no
 			if owners, oerr := s.diskReferencesAnyHost(ctx, path); oerr != nil || len(owners) > 0 {
 				continue
 			}
+			// What a disk's header reads, whatever its row records.
+			if user, err := s.replicaChainUser(ctx, path, poolDir, r.VM); err != nil || user != "" {
+				if err != nil {
+					slog.Warn("replica sweep: cannot tell whether a disk reads a replica; it is kept", "file", path, "error", err)
+				}
+				continue
+			}
 			if err := os.Remove(path + ".json"); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				continue
 			}

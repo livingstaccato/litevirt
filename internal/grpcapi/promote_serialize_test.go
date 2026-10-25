@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -342,13 +343,21 @@ func TestAbandon_IsRefusedWhileTheWorkloadsDomainMayRun(t *testing.T) {
 // A promote test must keep its markers in its own data dir. The markers used
 // to land in ./promote-markers and ./promote-started under the package
 // directory, where concurrent test processes deleted each other's.
+//
+// The test runs in a fresh working directory of its own, so the check sees only
+// a relative write by this test's server, never a directory some other process
+// left in the shared package directory.
 func TestPromoteMarkers_StayInTheServersDataDir(t *testing.T) {
+	t.Chdir(t.TempDir())
 	s := testServer(t)
 	if s.dataDir == "" {
 		t.Fatal("testServer has no dataDir; its markers would be written relative to the working directory")
 	}
 	if err := s.writePromoteMarker("guarddb", "proof-1"); err != nil {
 		t.Fatalf("writePromoteMarker: %v", err)
+	}
+	if p := s.promoteMarkerPath("guarddb"); !filepath.IsAbs(p) {
+		t.Fatalf("marker path %q is relative", p)
 	}
 	if !strings.HasPrefix(s.promoteMarkerPath("guarddb"), s.dataDir) {
 		t.Fatalf("marker path %q is outside dataDir %q", s.promoteMarkerPath("guarddb"), s.dataDir)
@@ -358,7 +367,7 @@ func TestPromoteMarkers_StayInTheServersDataDir(t *testing.T) {
 	}
 	for _, d := range []string{"promote-markers", "promote-started"} {
 		if _, err := os.Stat(d); err == nil {
-			t.Errorf("./%s exists under the package directory", d)
+			t.Errorf("./%s exists under the working directory", d)
 		}
 	}
 }

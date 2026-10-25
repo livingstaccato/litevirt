@@ -427,3 +427,104 @@ func TestUnprovenFence_TheDetailStaysCurrent(t *testing.T) {
 		}
 	})
 }
+
+// The rc10 lab's N3: the remedy upper-cased the trust note's first letter,
+// which begins with the host's name when the trust was revoked ("Node-5's").
+// A host name is never capitalised; a note that begins with a word is.
+//
+// Mutation: upper-case the note's first letter unconditionally, as before —
+// red.
+func TestUnprovenRemedy_DoesNotCapitaliseAHostName(t *testing.T) {
+	h := &corrosion.HostRecord{Name: "node-5", FenceStrategy: "ssh"}
+	revoked := sshTrustNote(h, fence.Result{Method: "ssh", Success: true,
+		Detail: fence.WithTrust("operator fence [path=managed]", true, "managed", "f1")}, "f1")
+	if !strings.HasPrefix(revoked, "node-5's trust") {
+		t.Fatalf("setup: the revoked note does not begin with the host name: %q", revoked)
+	}
+	if got := unprovenRemedy(h, revoked); !strings.Contains(got, ". node-5's trust") || strings.Contains(got, "Node-5") {
+		t.Errorf("remedy capitalises the host name: %q", got)
+	}
+	unpinned := sshTrustNote(h, fence.Result{Method: "ssh", Success: true,
+		Detail: fence.WithTrust("operator fence [path=legacy-unpinned]", false, "legacy-unpinned", "f1")}, "f1")
+	if got := unprovenRemedy(h, unpinned); !strings.Contains(got, ". This power-off was not confirmed") {
+		t.Errorf("remedy does not begin a sentence that starts with a word: %q", got)
+	}
+
+	// The same, end to end: a hold on a revoked trust.
+	_, db, _ := operatorSSHRow(t, nil, fence.WithTrust("operator fence [path=managed]", true, "managed", "operator-ssh-down"))
+	if _, ev, open := unprovenCond(t, db); !open || !strings.Contains(ev.Remedy, "down's trust") || strings.Contains(ev.Remedy, "Down's") {
+		t.Errorf("the condition's remedy capitalises the host name (open %v): %q", open, ev.Remedy)
+	}
+}
+
+// The rc10 lab's A5: an operator's `lv host fence --confirmed` of a host the
+// observers had not yet watched stay down is declined ("the recorded fence
+// … no longer stands") and never resumed from. The VM is held, which is safe,
+// but nothing showed in `lv health`. The decline raises
+// ha.recovery.unproven_fence, naming fence-confirm and undrain; the decline
+// stays a decline (the VM does not move on it), and the condition resolves
+// once the operator's confirmation lets the recovery go ahead.
+//
+// Mutation: no raise in noteResumeDeclined — red.
+func TestUnprovenFence_ADeclinedRecordedFenceIsAHealthCondition(t *testing.T) {
+	db, ctx := seedDownHost(t, "ssh", trustSSH)
+	operatorFences(t, db, ctx)
+	ageFenceRows(t, db, ctx, 2*time.Minute)
+	// Every observer's failing run began after the fence: none watched the
+	// host stay down across it.
+	now := time.Now()
+	for _, o := range []string{"coordinator", "alive"} {
+		failingSince(t, db, o, now.Add(-90*time.Second), now)
+	}
+	c := newTestCoordinator("coordinator", db)
+	fences := 0
+	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		fences++
+		return fence.Result{Method: "ssh", Detail: "ssh: connect: No route to host [path=managed]"}
+	})
+	c.run(ctx)
+	c.run(ctx)
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Fatalf("a declined recorded fence moved the VM to %q", got)
+	}
+	if fences != 0 {
+		t.Fatalf("a declined recorded fence ran %d fences", fences)
+	}
+	if !strings.Contains(c.holdReason["down"], "no longer stands") {
+		t.Fatalf("setup: the recorded fence was not declined (hold %q)", c.holdReason["down"])
+	}
+	row, ev, open := unprovenCond(t, db)
+	if !open {
+		t.Fatalf("no open %s for a recovery held on a declined recorded fence", CondRecoveryUnprovenFence)
+	}
+	if row.Severity != corrosion.SeverityCritical || len(ev.Workloads) != 1 || ev.Workloads[0] != "vm/vm" {
+		t.Errorf("severity %q workloads %v, want critical, [vm/vm]", row.Severity, ev.Workloads)
+	}
+	if !strings.Contains(ev.Detail, "recorded ssh fence operator-ssh-down no longer stands") {
+		t.Errorf("detail does not name the declined fence: %q", ev.Detail)
+	}
+	for _, want := range []string{"`lv host fence-confirm down`", "`lv host undrain down`",
+		"If down is up and answering", "none of its workloads runs anywhere else", "nothing moves until a new fence proves it off", "If any moved, use `lv host fence-confirm down` instead"} {
+		if !strings.Contains(ev.Remedy, want) {
+			t.Errorf("remedy does not name %q: %q", want, ev.Remedy)
+		}
+	}
+	// The undrain is offered on its precondition, never on a claim that
+	// nothing moved (review I1): an earlier resume of the same fence may
+	// have recovered part of the workloads.
+	if strings.Contains(ev.Remedy, "Nothing was recovered") {
+		t.Errorf("remedy claims nothing was recovered on the fence: %q", ev.Remedy)
+	}
+
+	operatorConfirms(t, db, ctx, "down")
+	c.SetFencer(confirmedSSH("managed"))
+	for i := 0; i < 3 && vmHost(t, db, ctx) == "down"; i++ {
+		c.run(ctx)
+	}
+	if got := vmHost(t, db, ctx); got != "alive" {
+		t.Fatalf("VM still on %q after fence-confirm (hold %q)", got, c.holdReason["down"])
+	}
+	if _, _, open := unprovenCond(t, db); open {
+		t.Fatalf("%s still open after the recovery went ahead", CondRecoveryUnprovenFence)
+	}
+}

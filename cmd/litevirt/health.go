@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"text/tabwriter"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc/metadata"
@@ -232,7 +233,9 @@ func printClusterHealth(h *pb.ClusterHealth) {
 			if c.GetCode() == moveUnresolvedCode {
 				fmt.Printf("\n%s on %s/%s:\n", c.GetCode(), c.GetSubjectKind(), c.GetSubjectId())
 				printMoveEvidence(c.GetEvidence())
+				continue
 			}
+			printConditionGuidance(c)
 		}
 	}
 
@@ -270,6 +273,76 @@ func printClusterHealth(h *pb.ClusterHealth) {
 		}
 		w.Flush()
 	}
+}
+
+// evidenceWrapWidth is the width `lv health` wraps a condition's detail and
+// remedy to.
+const evidenceWrapWidth = 100
+
+// printConditionGuidance prints, under an open condition, the detail and the
+// remedy its evidence carries (the "detail" and "remedy" strings), so the
+// operator sees what is wrong and what to do without reading the JSON: each
+// labelled, indented and wrapped. A resolved condition, or evidence with
+// neither, prints nothing; nothing else in the evidence is printed.
+func printConditionGuidance(c *pb.HealthCondition) {
+	if c.GetLifecycle() == "resolved" {
+		return
+	}
+	var ev struct {
+		Detail string `json:"detail"`
+		Remedy string `json:"remedy"`
+	}
+	if json.Unmarshal([]byte(c.GetEvidence()), &ev) != nil {
+		return
+	}
+	// Detail and remedy can carry a peer's text (a remote shell's answer, a
+	// BMC's error): whitespace is folded, and every other control or format
+	// character escaped (termSafe), so none reaches the terminal.
+	ev.Detail, ev.Remedy = termSafe(strings.Join(strings.Fields(ev.Detail), " ")), termSafe(strings.Join(strings.Fields(ev.Remedy), " "))
+	if ev.Detail == "" && ev.Remedy == "" {
+		return
+	}
+	fmt.Printf("\n%s on %s/%s:\n", termSafe(c.GetCode()), termSafe(c.GetSubjectKind()), termSafe(c.GetSubjectId()))
+	if ev.Detail != "" {
+		fmt.Print(wrapIndented(ev.Detail, "    detail: ", "            ", evidenceWrapWidth))
+	}
+	if ev.Remedy != "" {
+		fmt.Print(wrapIndented(ev.Remedy, "    remedy: ", "            ", evidenceWrapWidth))
+	}
+}
+
+// wrapIndented is text's words wrapped to width columns, the first line
+// begun with first and every other with rest; a word wider than the line is
+// never split, and neither is a `code span` (a command stays on one line, to
+// be copied whole). It ends with a newline.
+func wrapIndented(text, first, rest string, width int) string {
+	var words []string
+	open := false
+	for _, w := range strings.Fields(text) {
+		if open {
+			words[len(words)-1] += " " + w
+		} else {
+			words = append(words, w)
+		}
+		if strings.Count(w, "`")%2 == 1 {
+			open = !open
+		}
+	}
+	var b strings.Builder
+	line, n := first, 0
+	for _, w := range words {
+		if n > 0 && utf8.RuneCountInString(line)+1+utf8.RuneCountInString(w) > width {
+			b.WriteString(line + "\n")
+			line, n = rest, 0
+		}
+		if n > 0 {
+			line += " "
+		}
+		line += w
+		n++
+	}
+	b.WriteString(line + "\n")
+	return b.String()
 }
 
 // capacityDBCell renders the capacity table's DB column: what running VMs

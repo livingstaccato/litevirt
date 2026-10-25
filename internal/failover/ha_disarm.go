@@ -352,7 +352,7 @@ func (c *Coordinator) resumeHAHeldRecovery(ctx context.Context, host string, obs
 			}
 		default:
 			delete(c.ha.heldRecovery, host)
-			c.noteResumeDeclined(host, rec, why)
+			c.noteResumeDeclined(ctx, h, rec, why)
 			c.noteHold(host, "recovery held by an HA disarm, and its fence no longer stands: "+why)
 		}
 		return true

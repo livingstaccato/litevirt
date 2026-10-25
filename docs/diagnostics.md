@@ -1346,6 +1346,24 @@ old (stale: its scan has stopped, or no node holds its lease), an evaluator
 with incomplete coverage, an incomplete capacity sample, and a link not
 proven good.
 
+Under the conditions table it prints, for each open condition whose evidence
+carries one, its `detail` and its `remedy`, indented and wrapped (a command
+in backticks is never split), so what is wrong and what to do are on screen
+without reading the evidence JSON:
+
+```
+ha.recovery.unproven_fence on host/node-5:
+    detail: the recovery of node-5 is held: the SSH fence of node-5 failed (ssh: connect: No route
+            to host), so nothing proves node-5 is off; the fence is retried with backoff, and an SSH
+            fence cannot reach a host that has lost power. Its workloads are not started elsewhere
+            until node-5 is proven off, so nothing runs twice
+    remedy: once node-5 is powered off, `lv host fence-confirm node-5`, and the recovery resumes
+            from it. To recover at once next time, give it a fence that proves a power-off:
+            `lv host config node-5 --fence-strategy ipmi|redfish`
+```
+
+A `vm.move_unresolved` condition prints its moves instead (see below).
+
 Peer connectivity counts toward that state: a link the checker cannot prove
 good is a coverage gap, so a `suspect` or `failing` edge reads DEGRADED
 rather than being reported and ignored. Links whose **target is in
@@ -1547,6 +1565,10 @@ for a hold the host's own fence makes:
 - a failed fence of a host with the `ssh` strategy (its dial or power-off
   failed), retried with backoff: a host that lost power leaves an SSH fence
   nothing to reach, so only the operator can say it is off.
+- a recorded fence that no longer stands, an unverified one (`ssh`,
+  `best-effort`) that a leader declines to resume from: typically an
+  operator's `lv host fence` run before any observer had watched the host stay
+  down. It is declined for good, never turned into a recovery.
 
 The evidence names the held `workloads`, the reason in `detail` (with an
 operator confirmation that does not stand for this outage, when there is one),
@@ -1559,10 +1581,23 @@ why the trust setting did not count it: confirmed off the host's pinned key
 since revoked. Where the setting is off, it names
 `lv host config <host> --trust-ssh-poweroff` as the operator's choice, not a
 recommendation: it counts later fences confirmed over the pinned key, never
-the one already holding this recovery, whichever leader judges it. The same
-hold is named by the `host.recovery.stalled` notification. The detail is kept
-current while the hold lasts: a confirmation noted later as not standing, or a
-later fence's failure, replaces what it said.
+the one already holding this recovery, whichever leader judges it. For a
+declined recorded fence it adds `lv host undrain <host>`, on its precondition:
+the host is up and answering (`lv host inspect <host>`) and none of its
+workloads runs anywhere else (`lv ls --host <host>` lists each one still
+recorded on it). The leader moves nothing on a declined fence, and the
+undrain starts nothing: it returns the host to service, and a host that does
+not answer is only judged afresh, with nothing moved until a new fence proves
+it off. An earlier resume of the same fence may have recovered part of the
+workloads, which is why the precondition is checked rather than assumed; if
+any moved, the remedy says to use `lv host fence-confirm <host>` instead. The
+same hold is named by the `host.recovery.stalled` notification, whose text
+follows the trust setting too. The detail is kept current while the hold
+lasts: a confirmation noted later as not standing, a later fence's failure, or
+a change to the host's trust setting (re-read each cycle) replaces what it
+said. A setting turned on never releases a fence judged untrusted; a trust
+revoked and then set again makes its fence count again, and the leader
+resumes the recovery from it on its next cycle while it still stands.
 
 The condition resolves when the recovery goes ahead (the operator's
 confirmation, or a fence judged again that passes), and, read back by a later

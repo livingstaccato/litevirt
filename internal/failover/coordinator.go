@@ -1136,6 +1136,11 @@ func (c *Coordinator) run(ctx context.Context) {
 			switch {
 			case c.confirmationFencesAfresh(ctx, h):
 				afresh = true
+			case c.trustRestored(h):
+				// Held on a confirmed SSH power-off whose trust was revoked
+				// and is set again: it counts again (trust recorded at
+				// judgement AND trusted now), so it is decided afresh from
+				// the record, as a restarted coordinator decides it.
 			case c.fenceAuthorityChanged(ctx, h):
 				// A fence recorded since this coordinator handled the host
 				// (an operator's, another coordinator's), or its own failed
@@ -1237,7 +1242,7 @@ func (c *Coordinator) run(ctx context.Context) {
 						continue
 					}
 				default:
-					c.noteResumeDeclined(target, rec, why)
+					c.noteResumeDeclined(ctx, h, rec, why)
 				}
 			}
 			// The other way a stranded recovery can be resumed: a refusal for
@@ -2955,8 +2960,20 @@ func (c *Coordinator) refence(ctx context.Context, h *corrosion.HostRecord, rec 
 
 // noteResumeDeclined logs, once per host and fence, that a recorded fence was
 // found and is no longer authority: the one line that explains why a 'fenced'
-// host's workloads are staying where they are.
-func (c *Coordinator) noteResumeDeclined(host string, rec fenceRecord, why string) {
+// host's workloads are staying where they are. It raises
+// ha.recovery.unproven_fence for that hold too (the rc10 lab's A5): an
+// operator's fence judged before any observer watched the host stay down is
+// declined for good, and only an operator's confirmation, or an undrain that
+// lets the outage be judged afresh, ends it. The decline itself is unchanged:
+// it never becomes a recovery.
+func (c *Coordinator) noteResumeDeclined(ctx context.Context, h *corrosion.HostRecord, rec fenceRecord, why string) {
+	host := h.Name
+	// Raised on every decline, not once: a later outage may decline the same
+	// fence again after this one's condition resolved. It is not rewritten
+	// while it says the same.
+	c.raiseUnprovenAs(ctx, h, unprovenRaise{declined: true,
+		why: "the recorded " + rec.Method + " fence " + rec.ID + " no longer stands (" + why + "), so nothing is recovered on it"},
+		c.lastStale[host])
 	if c.resumeDeclined == nil {
 		c.resumeDeclined = map[string]string{}
 	}
@@ -3962,7 +3979,8 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	// The fence judged is the row every caller records first (noteFencedOn):
 	// its token counts only when it names that row.
 	fenceID := c.fencedOn[h.Name]
-	trustNote := sshTrustNote(h, fr, fenceID)
+	judged := &trustJudged{fr: fr, id: fenceID}
+	trustNote := judged.note(h)
 	fr = holdUntrustedSSH(notAFenceUnlessPaused(fr), fence.RecordedTrust(fr.Detail, fenceID) && trustsSSHPoweroff(h))
 	// And a self-pause counts only while the pause is still relied on.
 	if fr.Success && corrosion.ReliesOnPartitionPause(fr.Method, fr.Detail) && !c.relyOnPartitionPause(ctx, h) {
@@ -4007,7 +4025,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 				c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
 			}
 			c.holdUnproven(ctx, h, "best-effort fence is not proof the host is off (safe-fence policy)"+fenceFailedWayOut(h),
-				"the best-effort fence is not proof "+h.Name+" is off, and the safe-fence policy asks for proof", stale, "")
+				"the best-effort fence is not proof "+h.Name+" is off, and the safe-fence policy asks for proof", stale, nil)
 			return
 		}
 		slog.Info("failover: operator confirmed best-effort fence, proceeding", "host", h.Name)
@@ -4028,7 +4046,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 			}
 			c.holdUnproven(ctx, h, "best-effort fence after a held fence did not reach the host"+fenceFailedWayOut(h),
 				"the best-effort fence that ended a held fence (ha.fence_held) did not reach "+h.Name+
-					", and what it would recover was never paused by its partition pause", stale, "")
+					", and what it would recover was never paused by its partition pause", stale, nil)
 			return
 		}
 		slog.Info("failover: operator confirmed a host whose fence was held, proceeding", "host", h.Name)
@@ -4090,7 +4108,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 					c.holdUnproven(ctx, h, "the SSH fence's remote shell confirmed the power-off, which is not proof the host is off"+
 						fenceFailedWayOut(h)+" ("+trustNote+")",
 						"the SSH fence's remote shell confirmed the power-off, which is not proof "+h.Name+
-							" is off, and the trust setting does not count it", stale, trustNote)
+							" is off, and the trust setting does not count it", stale, judged)
 					return
 				}
 				if bestEffort {
@@ -4101,7 +4119,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 					}
 					c.noteFenceFailure(h, fr)
 					c.holdUnproven(ctx, h, c.holdBase[h.Name],
-						"the best-effort fence proves nothing ("+fr.Detail+"), and "+h.Name+"'s partition pause is not relied on", stale, "")
+						"the best-effort fence proves nothing ("+fr.Detail+"), and "+h.Name+"'s partition pause is not relied on", stale, nil)
 					return
 				}
 				slog.Error("failover: manual fence not confirmed by operator, NOT rescheduling",
@@ -4130,10 +4148,10 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 			// it, so the row is not rewritten twice per retry.
 			if fence.SSHOnly(h.FenceStrategy) {
 				c.raiseUnproven(ctx, h, "the SSH fence of "+h.Name+" failed ("+fr.Detail+"), so nothing proves "+h.Name+
-					" is off; the fence is retried with backoff, and an SSH fence cannot reach a host that has lost power", c.lastStale[h.Name], "")
+					" is off; the fence is retried with backoff, and an SSH fence cannot reach a host that has lost power", c.lastStale[h.Name], nil)
 			} else if c.unprovenOpen(ctx, h.Name) {
 				c.raiseUnproven(ctx, h, "the "+fr.Method+" fence of "+h.Name+" failed ("+fr.Detail+"), so nothing proves "+h.Name+
-					" is off; the fence is retried with backoff", c.lastStale[h.Name], "")
+					" is off; the fence is retried with backoff", c.lastStale[h.Name], nil)
 			}
 			return
 		}

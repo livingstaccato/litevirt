@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -248,5 +249,104 @@ func TestFleet_AFailedSSHFenceHoldIsInLvHealth(t *testing.T) {
 	}
 	if open, _, _, _ := unprovenFenceCond(t, c, b, victim.Name); open {
 		t.Fatalf("`lv health` on %s still lists %s after the recovery", b.Name, failover.CondRecoveryUnprovenFence)
+	}
+}
+
+// TestFleet_ADeclinedOperatorFenceIsInLvHealth: the rc10 lab's A5. An
+// operator fences the victim (`lv host fence --confirmed`, over SSH, on a host
+// that trusts a confirmed SSH power-off) before any observer has watched it
+// stay down. a's coordinator finds the recorded fence, which does not stand
+// (every observer's failing run began after it), and declines it: the VM is
+// held and never recovered on it. `lv health` on ANOTHER node (b) lists
+// ha.recovery.unproven_fence for the victim, naming the declined fence and
+// both ways out, fence-confirm and undrain. The operator undrains the victim
+// through b; the coordinator fences it afresh for the outage, recovers the
+// VM, and the condition resolves on b's replica.
+//
+// Multi-node by construction: the decline rests on two observers' failure
+// reports, the hold is a's coordinator's, and it is read back through b.
+//
+// Mutation: no raise in noteResumeDeclined — b lists nothing, red.
+func TestFleet_ADeclinedOperatorFenceIsInLvHealth(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2815})
+	a, b, victim := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	if _, err := c.SelfClient(a).ConfigureHost(ctx, &pb.ConfigureHostRequest{Name: victim.Name, FenceStrategy: "ssh"}); err != nil {
+		t.Fatal(err)
+	}
+	trustSSHPoweroffOn(t, c, a, victim)
+	insertVM(t, a, "vm-declined", victim.Name)
+	c.WaitConverged(t, convergeTimeout)
+	clock := NewVirtualClock(time.Now().UTC())
+
+	// The operator's fence lands while the victim still answers everyone.
+	a.Server.SetFenceExecutor(func(context.Context, fence.HostConfig) fence.Result { return sshOff })
+	if _, err := c.SelfClient(a).FenceHost(ctx, &pb.FenceHostRequest{Name: victim.Name, Confirmed: true}); err != nil {
+		t.Fatalf("lv host fence %s: %v", victim.Name, err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	c.Isolate(victim)
+
+	// The observers' failing runs begin only after the fence.
+	clock.Advance(30 * time.Second)
+	runStart := clock.Now()
+	cs := c.NewCoordinators(clock)
+	var fences atomic.Int32
+	for _, n := range c.Nodes {
+		cs.ByNode[n.Name].SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+			fences.Add(1)
+			return fence.Result{Method: "ssh", Success: true, Detail: "litevirt-fence-armed [path=managed]"}
+		})
+	}
+	seq := 5
+	tick := func() {
+		clock.Advance(20 * time.Second)
+		seq++
+		PublishHealthRun(t, a, victim.Name, seq, runStart, clock.Now())
+		PublishHealthRun(t, b, victim.Name, seq, runStart, clock.Now())
+		c.WaitConverged(t, convergeTimeout, a, b)
+		cs.Tick(ctx, a)
+		c.WaitConverged(t, convergeTimeout, a, b)
+	}
+	for i := 0; i < 3; i++ {
+		tick()
+	}
+	if vm := vmOn(t, b, "vm-declined"); vm == nil || vm.HostName != victim.Name {
+		t.Fatalf("vm-declined on b's replica = %+v: a recorded fence that does not stand recovered it", vm)
+	}
+	if n := fences.Load(); n != 0 {
+		t.Fatalf("the coordinator fenced %s %d time(s) over a declined recorded fence", victim.Name, n)
+	}
+	open, detail, remedy, workloads := unprovenFenceCond(t, c, b, victim.Name)
+	if !open {
+		t.Fatalf("`lv health` on %s does not list %s for %s, whose recorded fence was declined", b.Name, failover.CondRecoveryUnprovenFence, victim.Name)
+	}
+	if !strings.Contains(detail, "no longer stands") || len(workloads) != 1 || workloads[0] != "vm/vm-declined" {
+		t.Errorf("evidence does not name the declined fence and the held VM: detail %q, workloads %v", detail, workloads)
+	}
+	for _, want := range []string{"`lv host fence-confirm " + victim.Name + "`", "`lv host undrain " + victim.Name + "`"} {
+		if !strings.Contains(remedy, want) {
+			t.Errorf("remedy does not name %q: %q", want, remedy)
+		}
+	}
+
+	if _, err := c.SelfClient(b).UndrainHost(ctx, &pb.UndrainHostRequest{Name: victim.Name}); err != nil {
+		t.Fatalf("lv host undrain %s: %v", victim.Name, err)
+	}
+	c.WaitConverged(t, convergeTimeout, a, b)
+	for i := 0; i < 20 && fences.Load() == 0; i++ {
+		tick()
+	}
+	for i := 0; i < 3; i++ {
+		tick()
+	}
+	if fences.Load() == 0 {
+		t.Fatalf("the coordinator did not fence %s afresh after the undrain", victim.Name)
+	}
+	if vm := vmOn(t, b, "vm-declined"); vm == nil || vm.HostName == victim.Name {
+		t.Fatalf("vm-declined = %+v, want it recovered on the fresh fence after the undrain", vm)
+	}
+	if open, _, _, _ := unprovenFenceCond(t, c, b, victim.Name); open {
+		t.Fatalf("`lv health` on %s still lists %s after the hold ended", b.Name, failover.CondRecoveryUnprovenFence)
 	}
 }

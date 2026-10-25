@@ -382,6 +382,22 @@ func (s *Server) dropStartRecordIfRunning(vm string) {
 	s.unmarkStartPaused(vm)
 }
 
+// dropStartRecordIfInactive drops vm's start record when its domain here is
+// defined and shut off: nothing is paused, and the start guard lets a start
+// go on over it (its Before). Any other state, a missing domain, or a state
+// it cannot read keeps it.
+func (s *Server) dropStartRecordIfInactive(vm string) {
+	active, err := s.virt.DomainIsActive(vm)
+	if err != nil || active {
+		return
+	}
+	if marked, merr := s.startPausedMarked(vm); merr != nil || !marked {
+		return
+	}
+	slog.Info("start guard: dropped the start record of a domain that is shut off (stale)", "vm", vm)
+	s.unmarkStartPaused(vm)
+}
+
 // judgeStrandedStart raises vm_start_stranded_paused for vm on this host
 // while problem, and resolves it once problem is nil.
 func (s *Server) judgeStrandedStart(ctx context.Context, vm string, problem error) {
@@ -525,9 +541,15 @@ func (s *Server) strandedStartKept(ctx context.Context, vm string, startErr erro
 // again (a snapshot restore) while a start of this host has left a record
 // for it: the start guard would refuse that start only after the operation
 // had torn the domain down (review F7 m1). A record whose domain runs is
-// stale, and dropped.
+// stale, and dropped; so is one whose domain is shut off (a destroy outside
+// `lv stop --force`), which holds no paused guest and which the start guard
+// does not refuse a start over either (review r8-m1). The caller must hold
+// the VM's start lease: a start that holds it may be in the window between
+// recording its paused start and its paused create, its domain shut off, and
+// its record is not stale.
 func (s *Server) startRecordRefusal(op, vm string) error {
 	s.dropStartRecordIfRunning(vm)
+	s.dropStartRecordIfInactive(vm)
 	marked, err := s.startPausedMarked(vm)
 	switch {
 	case err != nil:

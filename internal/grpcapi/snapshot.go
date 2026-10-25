@@ -421,11 +421,6 @@ func (s *Server) restoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"VM %q is in state %q — cannot restore snapshot now", req.VmName, vm.State)
 	}
-	// A start left paused here: refused before anything is torn down.
-	if err := s.startRecordRefusal("snapshot restore", req.VmName); err != nil {
-		return nil, err
-	}
-
 	// Branch on snapshot type: a memory snapshot restores RAM too, and its
 	// vmstate file is host-local — refuse if the VM has since moved hosts.
 	snap, _ := corrosion.GetSnapshot(ctx, s.db, req.VmName, req.SnapshotName)
@@ -490,6 +485,13 @@ func (s *Server) restoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 		return nil, err
 	}
 	defer releaseLease()
+	// A start left paused here: refused before anything is torn down. Judged
+	// only under the start lease, so a start that holds it (between recording
+	// its paused start and the paused create, its domain shut off) never has
+	// its record dropped as stale.
+	if err := s.startRecordRefusal("snapshot restore", req.VmName); err != nil {
+		return nil, err
+	}
 
 	// Restore firmware state (NVRAM + swtpm) from the snapshot sidecar before the
 	// domain is redefined, so reverted disks/RAM + firmware are a consistent set

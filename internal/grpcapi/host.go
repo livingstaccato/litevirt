@@ -67,10 +67,13 @@ func (s *Server) ListHosts(ctx context.Context, req *pb.ListHostsRequest) (*pb.L
 			Labels:           h.Labels,
 			Version:          h.Version,
 			StoragePools:     pools,
-			Region:           h.Region,
-			CertSerial:       h.CertSerial,
-			CreatedAt:        parseTimestamp(h.CreatedAt),
-			UpdatedAt:        parseTimestamp(h.UpdatedAt),
+			// `lv doctor fence` and the UI health page name the SSH-only
+			// hosts from this list; empty, every host read as best-effort.
+			FenceStrategy: h.FenceStrategy,
+			Region:        h.Region,
+			CertSerial:    h.CertSerial,
+			CreatedAt:     parseTimestamp(h.CreatedAt),
+			UpdatedAt:     parseTimestamp(h.UpdatedAt),
 		}
 		resp.Hosts = append(resp.Hosts, host)
 	}

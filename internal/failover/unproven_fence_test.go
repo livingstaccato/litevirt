@@ -427,3 +427,32 @@ func TestUnprovenFence_TheDetailStaysCurrent(t *testing.T) {
 		}
 	})
 }
+
+// The rc10 lab's N3: the remedy upper-cased the trust note's first letter,
+// which begins with the host's name when the trust was revoked ("Node-5's").
+// A host name is never capitalised; a note that begins with a word is.
+//
+// Mutation: upper-case the note's first letter unconditionally, as before —
+// red.
+func TestUnprovenRemedy_DoesNotCapitaliseAHostName(t *testing.T) {
+	h := &corrosion.HostRecord{Name: "node-5", FenceStrategy: "ssh"}
+	revoked := sshTrustNote(h, fence.Result{Method: "ssh", Success: true,
+		Detail: fence.WithTrust("operator fence [path=managed]", true, "managed", "f1")}, "f1")
+	if !strings.HasPrefix(revoked, "node-5's trust") {
+		t.Fatalf("setup: the revoked note does not begin with the host name: %q", revoked)
+	}
+	if got := unprovenRemedy(h, revoked); !strings.Contains(got, ". node-5's trust") || strings.Contains(got, "Node-5") {
+		t.Errorf("remedy capitalises the host name: %q", got)
+	}
+	unpinned := sshTrustNote(h, fence.Result{Method: "ssh", Success: true,
+		Detail: fence.WithTrust("operator fence [path=legacy-unpinned]", false, "legacy-unpinned", "f1")}, "f1")
+	if got := unprovenRemedy(h, unpinned); !strings.Contains(got, ". This power-off was not confirmed") {
+		t.Errorf("remedy does not begin a sentence that starts with a word: %q", got)
+	}
+
+	// The same, end to end: a hold on a revoked trust.
+	_, db, _ := operatorSSHRow(t, nil, fence.WithTrust("operator fence [path=managed]", true, "managed", "operator-ssh-down"))
+	if _, ev, open := unprovenCond(t, db); !open || !strings.Contains(ev.Remedy, "down's trust") || strings.Contains(ev.Remedy, "Down's") {
+		t.Errorf("the condition's remedy capitalises the host name (open %v): %q", open, ev.Remedy)
+	}
+}

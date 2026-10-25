@@ -121,9 +121,19 @@ func unprovenRemedy(h *corrosion.HostRecord, trustNote string) string {
 			"`lv host config %s --fence-strategy ipmi|redfish`", h.Name)
 	}
 	if trustNote != "" {
-		out += ". " + strings.ToUpper(trustNote[:1]) + trustNote[1:]
+		out += ". " + sentenceStart(trustNote, h.Name)
 	}
 	return out
+}
+
+// sentenceStart is note begun as a sentence: its first letter upper-cased,
+// unless it begins with the host name host, which keeps its case ("node-5's",
+// never "Node-5's").
+func sentenceStart(note, host string) string {
+	if note == "" || strings.HasPrefix(note, host) {
+		return note
+	}
+	return strings.ToUpper(note[:1]) + note[1:]
 }
 
 // resolveUnproven resolves host's ha.recovery.unproven_fence, when raised.

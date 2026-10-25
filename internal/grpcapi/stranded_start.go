@@ -2,9 +2,14 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -21,7 +26,8 @@ import (
 // its VLANs on — but the guest never runs, and nothing said so.
 //
 // ResumeStrandedStarts runs once at daemon start, before any start source
-// and before the gRPC server: each such domain is readied (readyGuestHere,
+// and before the gRPC server: each domain whose paused start is recorded here
+// (markStartPaused) and that nothing else holds is readied (readyGuestHere,
 // as the interrupted start would have) and resumed, or, when it cannot be,
 // named by vm_start_stranded_paused. JudgeStrandedStarts resolves the
 // condition on every later pass once the domain is no longer held that way.
@@ -32,11 +38,20 @@ const (
 	CondStrandedStartPaused = "vm_start_stranded_paused"
 )
 
-// strandedStart reports whether vm's domain here is a start left paused: the
-// domain is paused for a user reason (libvirt's for a domain created paused),
-// its row names this host and says it runs or is starting, and no record
-// here holds it paused on purpose.
+// strandedStart reports whether vm's domain here is a start this daemon left
+// paused, safe to finish: a paused start of it is recorded here
+// (markStartPaused), the domain is paused, its row names this host and says
+// it runs or is starting, and nothing else holds it paused — no partition
+// pause mark on the live domain, no partition pause record in any layer
+// (memory, the reserve, the record directory), no hand-over, no firmware
+// hold. Any of those that cannot be read holds it too (fail closed): the sweep
+// never resumes a guest another part of litevirt may be holding, whatever its
+// own record says (review R2-B1).
 func (s *Server) strandedStart(ctx context.Context, vm string) bool {
+	marked, err := s.startPausedMarked(vm)
+	if err != nil || !marked {
+		return false
+	}
 	st, err := s.virt.DomainStateReason(vm)
 	if err != nil || st.Reason != "paused" || (st.PausedReason != "user" && st.PausedReason != "starting-up") {
 		return false
@@ -44,6 +59,15 @@ func (s *Server) strandedStart(ctx context.Context, vm string) bool {
 	rec, err := corrosion.GetVM(ctx, s.db, vm)
 	if err != nil || rec == nil || rec.HostName != s.hostName || (rec.State != "running" && rec.State != "starting") {
 		return false
+	}
+	marks, ok := s.virt.(interface {
+		PartitionPauseMark(name string) (string, bool, error)
+	})
+	if !ok {
+		return false
+	}
+	if _, marked, merr := marks.PartitionPauseMark(vm); marked || merr != nil {
+		return false // partition pause's, or cannot be told apart from it
 	}
 	if _, paused, perr := health.ReadPauseRecord(s.dataDir, health.PauseKindVM, vm); paused || perr != nil {
 		return false // partition pause's
@@ -57,16 +81,28 @@ func (s *Server) strandedStart(ctx context.Context, vm string) bool {
 	return true
 }
 
-// ResumeStrandedStarts readies and resumes every start this host left
-// paused, and names the ones it cannot. Call it once, at daemon start, after
-// the start guard and the first firewall pass, before any start source and
-// the gRPC server: nothing else can be starting a domain then.
+// ResumeStrandedStarts readies and resumes every start this daemon recorded
+// as paused (markStartPaused) and did not finish, and names the ones it
+// cannot. Call it once, at daemon start, after the start guard and the first
+// firewall pass, before any start source and the gRPC server: nothing else
+// can be starting a domain then. A record whose domain is no longer paused (it
+// was resumed or stopped by other means, or is gone) is dropped. A domain
+// paused without a record is never resumed here.
 func (s *Server) ResumeStrandedStarts(ctx context.Context) {
-	for _, vm := range s.activeDomains() {
+	if s.virt == nil || s.db == nil {
+		return
+	}
+	for _, vm := range s.startPausedRecords() {
 		if ctx.Err() != nil {
 			return
 		}
+		if st, err := s.virt.DomainStateReason(vm); err == nil && st.Reason != "paused" {
+			s.unmarkStartPaused(vm) // it runs, or was stopped: the start ended
+			continue
+		}
 		if !s.strandedStart(ctx, vm) {
+			slog.Warn("start guard: a start this daemon left paused is held by something else, or cannot be judged; it stays paused",
+				"vm", vm)
 			continue
 		}
 		err := s.readyGuestHere(ctx, vm, startingHere)
@@ -83,9 +119,31 @@ func (s *Server) ResumeStrandedStarts(ctx context.Context) {
 			s.judgeStrandedStart(ctx, vm, err)
 			continue
 		}
+		s.unmarkStartPaused(vm)
 		slog.Warn("start guard: finished a start an interrupted daemon left paused: readied and resumed", "vm", vm)
 		s.judgeStrandedStart(ctx, vm, nil)
 	}
+}
+
+// startPausedRecords is the VM names with a paused start recorded here.
+func (s *Server) startPausedRecords() []string {
+	ents, err := os.ReadDir(filepath.Join(s.dataDir, startPausedDir))
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			slog.Warn("start guard: cannot read the records of paused starts", "error", err)
+		}
+		return nil
+	}
+	var names []string
+	for _, e := range ents {
+		b, err := hex.DecodeString(e.Name())
+		if err != nil || e.IsDir() {
+			continue // a temporary file, or not ours
+		}
+		names = append(names, string(b))
+	}
+	sort.Strings(names)
+	return names
 }
 
 // JudgeStrandedStarts resolves vm_start_stranded_paused for each guest of
@@ -109,30 +167,6 @@ func (s *Server) JudgeStrandedStarts(ctx context.Context) {
 		}
 		s.judgeStrandedStart(ctx, vm, nil)
 	}
-}
-
-// activeDomains is the domains active here (running or paused), sorted.
-func (s *Server) activeDomains() []string {
-	if s.virt == nil || s.db == nil {
-		return nil
-	}
-	lister, ok := s.virt.(interface {
-		RunningDomainTaps() (map[string]map[string]string, error)
-	})
-	if !ok {
-		return nil
-	}
-	running, err := lister.RunningDomainTaps()
-	if err != nil {
-		slog.Warn("start guard: cannot list the domains active here", "error", err)
-		return nil
-	}
-	names := make([]string, 0, len(running))
-	for n := range running {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	return names
 }
 
 // judgeStrandedStart raises vm_start_stranded_paused for vm on this host

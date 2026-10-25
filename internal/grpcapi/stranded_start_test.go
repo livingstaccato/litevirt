@@ -5,7 +5,9 @@ import (
 	"errors"
 	"testing"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -34,6 +36,11 @@ func TestResumeStrandedStarts(t *testing.T) {
 	}
 	insertTestVMWithSpec(t, ctx, s.db, "stoppedrow", "test-host", "stopped", `{"name":"stoppedrow"}`)
 	fake.SetState("stoppedrow", libvirtfake.StatePaused)
+	for _, vm := range []string{"vm1", "stoppedrow"} {
+		if err := s.markStartPaused(vm); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	// The tap cannot be configured: it stays paused, named.
 	fake.SetState("vm1", libvirtfake.StatePaused)
@@ -61,6 +68,9 @@ func TestResumeStrandedStarts(t *testing.T) {
 	if st, _ := fake.RawState("stoppedrow"); st != libvirtfake.StatePaused {
 		t.Fatal("a paused domain whose row is not running here was resumed")
 	}
+	if marked, _ := s.startPausedMarked("vm1"); marked {
+		t.Fatal("the finished start's record outlived it")
+	}
 }
 
 // JudgeStrandedStarts resolves the condition for a guest that was stopped or
@@ -72,6 +82,9 @@ func TestJudgeStrandedStarts_ResolvesWithoutResuming(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake.SetState("vm1", libvirtfake.StatePaused)
+	if err := s.markStartPaused("vm1"); err != nil {
+		t.Fatal(err)
+	}
 	s.judgeStrandedStart(ctx, "vm1", errors.New("x"))
 	s.JudgeStrandedStarts(ctx)
 	if st, _ := fake.RawState("vm1"); st != libvirtfake.StatePaused {
@@ -84,5 +97,89 @@ func TestJudgeStrandedStarts_ResolvesWithoutResuming(t *testing.T) {
 	s.JudgeStrandedStarts(ctx)
 	if c, _, _ := corrosion.GetHealthCondition(ctx, s.db, StrandedStartEvaluator, CondStrandedStartPaused, "vm", "vm1@"+s.hostName); c.Lifecycle != corrosion.ConditionResolved {
 		t.Fatalf("after the guest stopped: %s, want resolved", c.Lifecycle)
+	}
+}
+
+// R2-B1 (the review's probe, kept, and widened): the sweep resumes only a
+// domain whose paused start this daemon recorded, and never one that anything
+// else holds. A guest partition pause suspended reports the same paused
+// reason ("user"); with its record only in memory when the daemon died, there
+// is no record left on disk — but its mark is on the live domain. Each case
+// below must stay paused:
+//
+//   - no start record, whatever else (an operator's or a snapshot's pause), and
+//     the probe: partition-paused, its record lost;
+//   - a start record AND the partition pause mark;
+//   - a start record AND a partition pause record in the reserve layer;
+//   - a start record AND a mark that cannot be read.
+//
+// Mutations: act on any user-paused domain (ignore the start record) — red;
+// ignore the partition pause mark — red; ignore the pause record layers — red.
+func TestResumeStrandedStarts_NeverResumesAGuestSomethingElseHolds(t *testing.T) {
+	for name, setup := range map[string]func(t *testing.T, s *Server, fake *libvirtfake.Fake){
+		"no start record, nothing else holds it": func(t *testing.T, s *Server, fake *libvirtfake.Fake) {},
+		"no start record, partition-paused": func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
+			if err := fake.MarkPartitionPaused("vm1", "tok-1"); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"start record and the partition pause mark": func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
+			if err := s.markStartPaused("vm1"); err != nil {
+				t.Fatal(err)
+			}
+			if err := fake.MarkPartitionPaused("vm1", "tok-1"); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"start record and a reserve pause record": func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
+			if err := s.markStartPaused("vm1"); err != nil {
+				t.Fatal(err)
+			}
+			if err := health.WritePauseRecordToReserveForTests(s.dataDir, health.PauseRecord{Kind: health.PauseKindVM, Name: "vm1"}); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"start record and an unreadable mark": func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
+			if err := s.markStartPaused("vm1"); err != nil {
+				t.Fatal(err)
+			}
+			fake.FailPartitionPauseMark = func(string) error { return errors.New("metadata unreadable") }
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, fake := vlanStartServer(t)
+			ctx := adminCtx()
+			if err := corrosion.UpdateVMState(ctx, s.db, "vm1", "running", ""); err != nil {
+				t.Fatal(err)
+			}
+			fake.SetState("vm1", libvirtfake.StatePaused)
+			setup(t, s, fake)
+			s.ResumeStrandedStarts(context.Background())
+			if st, _ := fake.RawState("vm1"); st != libvirtfake.StatePaused {
+				t.Fatalf("the sweep resumed a guest something else holds: state %v", st)
+			}
+		})
+	}
+}
+
+// The guard records a paused start before the paused create, and drops the
+// record once the start has ended — here refused while paused.
+//
+// Mutation: no markStartPaused in Before — red; no PausedDone — red.
+func TestNICStartGuard_RecordsAPausedStartWhileItRuns(t *testing.T) {
+	s, fake := vlanStartServer(t)
+	var during bool
+	fake.FailConfigureVLANTap = func(string, string, int) error {
+		during, _ = s.startPausedMarked("vm1")
+		return errors.New("no")
+	}
+	if _, err := s.StartVM(adminCtx(), &pb.StartVMRequest{Name: "vm1"}); err == nil {
+		t.Fatal("the start ran")
+	}
+	if !during {
+		t.Fatal("no record of the paused start while it was paused")
+	}
+	if marked, _ := s.startPausedMarked("vm1"); marked {
+		t.Fatal("the record outlived the start")
 	}
 }

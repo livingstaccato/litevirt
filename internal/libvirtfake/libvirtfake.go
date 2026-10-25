@@ -297,6 +297,9 @@ type Fake struct {
 	// and fails it with what it returns: a tap the host cannot put on its
 	// access VLAN.
 	FailConfigureVLANTap func(domain, mac string, vlan int) error
+	// FailPartitionPauseMark, when set, fails PartitionPauseMark with what
+	// it returns: a mark that cannot be read.
+	FailPartitionPauseMark func(name string) error
 	// TapMaster, when set, answers TapMasterVLANFiltering: the bridge the
 	// NIC's tap is enslaved to and whether it filters VLANs. Unset, a tap's
 	// master is the bridge its live definition names (else "fakebr0"), and
@@ -951,6 +954,9 @@ func (f *Fake) StartDomain(name string) error {
 			return fmt.Errorf("start domain %s: %w", name, err)
 		}
 		pause = p
+	}
+	if pause && g.PausedDone != nil {
+		defer g.PausedDone(name)
 	}
 	if err := f.startDomain(name, pause); err != nil {
 		// As libvirt.Client.StartDomain (startWithConsoleBackstop): a start QEMU

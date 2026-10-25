@@ -227,6 +227,14 @@ func (s *Server) NICStartGuard(ctx context.Context) lv.StartGuard {
 				return false, fmt.Errorf("whether %s's NICs have VLANs could not be read, so it is not run here: %w", name, err)
 			}
 			if len(vlans) > 0 || s.needsPausedStart(ctx, name, false) {
+				// Recorded before the paused create, so a daemon that dies
+				// before the resume leaves evidence the sweep can trust
+				// (ResumeStrandedStarts). Without it such a guest is only
+				// left paused, never resumed by the sweep: the start goes on.
+				if err := s.markStartPaused(name); err != nil {
+					slog.Warn("start guard: could not record a paused start; if this daemon dies before the resume, the guest stays paused",
+						"vm", name, "error", err)
+				}
 				return true, nil
 			}
 			actx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -234,6 +242,7 @@ func (s *Server) NICStartGuard(ctx context.Context) lv.StartGuard {
 			return false, s.ArmNICsFor(actx, name)
 		},
 		AfterPaused: func(name string) error { return s.readyGuestHere(ctx, name, startingHere) },
+		PausedDone:  s.unmarkStartPaused,
 	}
 }
 

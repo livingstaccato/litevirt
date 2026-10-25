@@ -37,6 +37,11 @@ func (f *Fake) MarkPartitionPaused(name, token string) error {
 // PartitionPauseMark mirrors libvirt.Client.PartitionPauseMark.
 func (f *Fake) PartitionPauseMark(name string) (string, bool, error) {
 	defer f.daemon()()
+	if hook := f.FailPartitionPauseMark; hook != nil {
+		if err := hook(name); err != nil {
+			return "", false, err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	st, ok := f.domains[name]

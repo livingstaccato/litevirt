@@ -328,3 +328,41 @@ func (s *Server) vmHasAccessVLANNIC(ctx context.Context, vm string) bool {
 	}
 	return false
 }
+
+// coldMoveAccessVLANRefusal refuses, before the guest is shut down, a cold
+// move of a running VM that ends in a start on target (a drain's cold move)
+// when target is named by bridge_vlan_filtering_off for one of its access
+// NICs' bridges. The network's opt-in to unfiltered moves does not help it:
+// the start that ends the move is refused there whatever the opt-in says, and
+// the VM would be left moved and stopped (review NB-R10). A target that has
+// not reported (an older build, a bridge it never judged) is not refused
+// here; its start still is.
+func (s *Server) coldMoveAccessVLANRefusal(ctx context.Context, vm *corrosion.VMRecord, target string) error {
+	if vm == nil || vm.Spec == "" {
+		return nil
+	}
+	spec := &pb.VMSpec{}
+	if json.Unmarshal([]byte(vm.Spec), spec) != nil {
+		return nil
+	}
+	if len(health.AccessVLANBridges(spec, nil)) == 0 {
+		return nil
+	}
+	unfit, err := health.AccessVLANUnfitHosts(ctx, s.db)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "read which hosts' bridges cannot carry VM %q's access-VLAN NICs: %v", vm.Name, err)
+	}
+	if len(unfit[target]) == 0 {
+		return nil
+	}
+	rows, err := corrosion.ListNetworks(ctx, s.db)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "read the networks of VM %q: %v", vm.Name, err)
+	}
+	if why, ok := health.AccessVLANHostsUnfitFor(spec, health.AccessVLANNetworks(rows), unfit)[target]; ok {
+		return status.Errorf(codes.FailedPrecondition,
+			"not moving %q cold to %s: the move ends in a start there, and %s; a start on such a bridge is refused whatever "+
+				"the network allows for moves, so the VM would be left moved and stopped", vm.Name, target, why)
+	}
+	return nil
+}

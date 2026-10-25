@@ -19,6 +19,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/placement"
 )
@@ -330,5 +331,41 @@ func TestEnsureDisks_JudgesTheAccessVLANOfTheRowItAuthorized(t *testing.T) {
 	defer s.db.DB().ExecContext(context.Background(), `ALTER TABLE vms_nbr3 RENAME TO vms`) //nolint:errcheck
 	if _, err := s.EnsureDisks(ctx, &pb.EnsureDisksRequest{VmName: "acc"}); err == nil {
 		t.Fatal("EnsureDisks with the VM's row unreadable let the move through")
+	}
+}
+
+// NB-R10: a drain's cold move of a running VM ends in a start on the target,
+// which is refused on a bridge that does not filter VLANs whatever the
+// network's opt-in says. So the move is refused before the guest is shut
+// down when the target is named for the VM's access NIC's bridge — opt-in or
+// not — and let through for a target that is not named.
+//
+// Mutations: coldMoveAccessVLANRefusal a no-op — red; drop it from
+// coldMovePreflight — red.
+func TestColdMoveAccessVLANRefusal_TheOptInDoesNotCoverAMoveThatEndsInAStart(t *testing.T) {
+	s, _ := unfilteredNets(t)
+	ctx := context.Background()
+	if _, err := s.SetNetworkGuardConfig(adminCtx(), &pb.SetNetworkGuardConfigRequest{Name: "lan",
+		SetAllowUnfilteredAccessVlanMoves: true, AllowUnfilteredAccessVlanMoves: true}); err != nil {
+		t.Fatal(err)
+	}
+	bridge := network.BridgeName("lan", networkDef(t, s, "lan"))
+	if err := corrosion.UpsertHealthCondition(ctx, s.db, corrosion.HealthCondition{Evaluator: health.AccessVLANEvaluator,
+		Code: health.CondBridgeVLANFilteringOff, SubjectKind: "host", SubjectID: health.AccessVLANSubject(bridge, "h2"),
+		Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityWarning, Hosts: []string{"h2"}}); err != nil {
+		t.Fatal(err)
+	}
+	spec, _ := json.Marshal(&pb.VMSpec{Name: "acc", Network: []*pb.NetworkAttachment{{Name: "lan", Trunk: []int32{30}}}})
+	vm := &corrosion.VMRecord{Name: "acc", Spec: string(spec)}
+	if err := s.coldMoveAccessVLANRefusal(ctx, vm, "h2"); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("a cold move onto a named host under the opt-in: %v, want FailedPrecondition", err)
+	}
+	if err := s.coldMoveAccessVLANRefusal(ctx, vm, "h3"); err != nil {
+		t.Fatalf("a cold move onto a host not named: %v", err)
+	}
+	// The drain's cold move asks it before the shutdown (coldMovePreflight).
+	s.virt = libvirtfake.New()
+	if err := s.coldMovePreflight(ctx, vm, "h2"); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "ends in a start") {
+		t.Fatalf("coldMovePreflight onto a named host: %v, want the access-VLAN refusal", err)
 	}
 }

@@ -112,6 +112,12 @@ func TestKeptDisks_AnUnknownKeptChainIsNamedInHealth(t *testing.T) {
 			if !strings.Contains(refused, named) {
 				t.Fatalf("creates_refused = %q; want it to name %s", refused, named)
 			}
+			// It lists every write the check judges, volume moves among them.
+			for _, op := range []string{"import", "create", "clone", "disk attach", "volume move", "restore", "migration", "rebuild"} {
+				if !strings.Contains(refused, op) {
+					t.Fatalf("creates_refused = %q; want it to name %s", refused, op)
+				}
+			}
 			// With "chain" the disk files on this host cannot all be read
 			// either, and every local create is held; with "registry" they
 			// can, and only one that collides is.

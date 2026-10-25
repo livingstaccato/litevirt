@@ -1134,7 +1134,16 @@ func (s *Server) releaseKept(ctx context.Context, req *pb.KeptDisksRequest, acto
 		if len(forget) > 0 {
 			nerr = health.ForgetKeptNoted(s.dataDir, u.vm, forget)
 		}
-		if rerr := s.forgetKeptRecords(u.regs, gone); nerr == nil {
+		rerr := s.forgetKeptRecords(u.regs, gone)
+		var left *keptRecordedNoteLeftError
+		switch {
+		case nerr == nil && errors.As(rerr, &left) && failed == nil:
+			// The release itself is done: only the note's list of what
+			// kept-disks.json recorded is left naming a file that is gone,
+			// and nothing drops it later (judgeKeptDisks never sees the
+			// entry again). Reported as what it is.
+			failed = fmt.Errorf("the files are removed and their kept-disks.json entries dropped; %w", left)
+		case nerr == nil:
 			nerr = rerr
 		}
 		if nerr != nil && failed == nil {
@@ -1259,8 +1268,10 @@ func (s *Server) keptSnapshotStill(ctx context.Context, r corrosion.SnapshotReco
 }
 
 // forgetKeptRecords drops from kept-disks.json each of regs whose file is in
-// gone. An entry rewritten meanwhile (a VM of the name kept the path again)
-// is left.
+// gone, and its file from the note's recorded list (health.ForgetKeptRecorded),
+// as judgeKeptDisks does for a file that is gone: a note left naming it would
+// outlive the entry. An entry rewritten meanwhile (a VM of the name kept the
+// path again) is left.
 func (s *Server) forgetKeptRecords(regs []diskKeptRecord, gone []string) error {
 	if len(regs) == 0 {
 		return nil
@@ -1271,7 +1282,7 @@ func (s *Server) forgetKeptRecords(regs []diskKeptRecord, gone []string) error {
 	if s.diskKept.unreadable != nil {
 		return fmt.Errorf("%s cannot be read: %w", filepath.Join(s.dataDir, diskKeptFile), s.diskKept.unreadable)
 	}
-	changed := false
+	var dropped []diskKeptRecord
 	for _, r := range regs {
 		if !slices.Contains(gone, filepath.Clean(s.hostDiskFile(r.Path))) {
 			continue
@@ -1280,15 +1291,35 @@ func (s *Server) forgetKeptRecords(regs []diskKeptRecord, gone []string) error {
 		if cur, ok := m[key]; ok && cur == r {
 			delete(m, key)
 			delete(s.diskKept.unsavedKey, key)
-			changed = true
+			dropped = append(dropped, r)
 		}
 	}
-	if !changed {
+	if len(dropped) == 0 {
 		return nil
 	}
 	s.saveDiskKeptLocked()
 	if s.diskKept.unsaved {
 		return fmt.Errorf("%s was not saved", filepath.Join(s.dataDir, diskKeptFile))
 	}
+	for _, r := range dropped {
+		if err := health.ForgetKeptRecorded(s.dataDir, r.VM, s.keptRecordedFiles([]KeptDisk{r.KeptDisk})); err != nil {
+			return &keptRecordedNoteLeftError{note: filepath.Join(s.dataDir, "kept-disks", r.VM+".json"), path: r.Path, err: err}
+		}
+	}
 	return nil
 }
+
+// keptRecordedNoteLeftError is a forgetKeptRecords whose entries are
+// dropped and saved, and whose drop of an entry's file from its note's
+// recorded list failed: the note is left naming it.
+type keptRecordedNoteLeftError struct {
+	note, path string
+	err        error
+}
+
+func (e *keptRecordedNoteLeftError) Error() string {
+	return fmt.Sprintf("the note %s still lists %s as recorded (%v): it holds nothing, and nothing drops it later; "+
+		"remove that path from the note's \"recorded\" list, or the note if that is all it lists", e.note, e.path, e.err)
+}
+
+func (e *keptRecordedNoteLeftError) Unwrap() error { return e.err }

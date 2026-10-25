@@ -3626,7 +3626,10 @@ While an entry is there, a create on that host never clears the file it names,
 nor a file that disk's backing chain reaches: the create is refused, naming
 the file (docs/cli-reference.md, `lv rm`). A disk the delete of a VM with no
 domain kept is also in `<data_dir>/kept-disks/<vm>.json`, with the files its
-chain backs on. While `kept-disks.json`, a note `<data_dir>/kept-disks/<vm>.json`,
+chain backs on. Every entry's file is also noted there (`recorded`), for the
+scan below alone: that holds no file, so a retry of a delete whose removal
+failed still frees it, and the note goes with the entry once the file is
+gone or released. While `kept-disks.json`, a note `<data_dir>/kept-disks/<vm>.json`,
 the listing of the set-aside `.kept-` and `.superseded-` copies, or the
 backing chain of a disk one of them names, cannot be read, the evidence names
 the file under `creates_refused`
@@ -3638,10 +3641,14 @@ copies a host-local disk, and failover rebuild of a missing overlay disk on
 that host is judged by the disk files there (every file under
 `<data_dir>/disks`, the disk store's directory, `<data_dir>/pools`,
 `<data_dir>/mounts` and the directory of every file-based pool of the host,
-usable or not, every file a note names, and every set-aside `.kept-` or
-`.superseded-` copy beside any local disk a disk row names): it is refused when one of them is, or backs on, a path it
-writes, and refused whatever its name when one of them, or a directory of
-them, cannot be read either, which `creates_refused` then names too. A create
+usable or not, following any symlink below them, every file a note names,
+and every set-aside `.kept-` or `.superseded-` copy beside any local disk a
+disk row names; only regular files are opened, nothing on a pseudo-filesystem
+such as `/proc` or `/sys` is listed or read, a backing file there ends its chain, and a scan past 250,000 files,
+256 MiB of headers read or 1 minute stops): it is refused when one of them is,
+or backs on, a path it writes, and refused whatever its name when one of
+them, or a directory of them, cannot be read, or the scan stops, either,
+which `creates_refused` then names too. A create
 that clears a file an earlier VM of its name left is refused. Any other goes
 ahead, as does a create or clone with no disk file, or with every disk on
 shared nfs, ceph or iscsi storage outside the disk directory. A migration's

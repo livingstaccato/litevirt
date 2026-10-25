@@ -478,12 +478,14 @@ func (s *Server) createKeptWrites(spec *pb.VMSpec, cfgs map[int]storage.Config) 
 	return w
 }
 
-// keptCollisionOnDisk judges a create, clone, disk attach or restore to a
-// named target that clears nothing while kept-disks.json, a kept-disk note,
-// a set-aside listing or a kept chain cannot be read (rerr), from the disk files on this host
-// (keptCollisionScan): one that writes a path a file there backs on, or one
-// already there, is refused, as what a delete kept cannot be told apart. Any
-// other goes ahead, with a warning naming what failed. A scan that cannot
+// keptCollisionOnDisk judges a write of new disk files on this host's own
+// storage that clears nothing (an import, a create, a clone, a disk attach, a
+// volume move, a restore to a named target, a migration onto this host or a
+// failover rebuild) while kept-disks.json, a kept-disk note, a set-aside
+// listing or a kept chain cannot be read (rerr), from the disk files on this
+// host (keptCollisionScan): one that writes a path a file there backs on, or
+// one already there, is refused, as what a delete kept cannot be told apart.
+// Any other goes ahead, with a warning naming what failed. A scan that cannot
 // complete refuses whatever it writes (keptChainsUnknownError): what is safe
 // is then unknown. Retryable only when storage or the database did not
 // answer. source names what could not be read (kept-disks.json, a note, the
@@ -493,14 +495,15 @@ func (s *Server) keptCollisionOnDisk(ctx context.Context, rerr error, writes *ke
 	hit, err := s.keptCollisionScan(ctx, writes)
 	if err != nil {
 		transient := keptRegistryTransient(rerr) || storage.IsFSNoAnswer(err) || errors.Is(err, errKeptScanPoolsUnread)
-		return &keptChainsUnknownError{keptChainsRefusal(fmt.Sprintf("whether a disk a delete kept backs on a path the create writes "+
-			"cannot be told: %v, and %v; nothing was created", rerr, err), transient)}
+		return &keptChainsUnknownError{keptChainsRefusal(fmt.Sprintf("whether a disk a delete kept backs on a path it writes "+
+			"cannot be told: %v, and %v; nothing was written", rerr, err), transient)}
 	}
 	if hit != "" {
 		return health.NewKeptBackingFileError(fmt.Sprintf("%s, and %v; whether that is a disk a delete kept cannot be told, "+
-			"so nothing was created (or place the VM on another host)", hit, rerr))
+			"so nothing was written (or place the disk on another host)", hit, rerr))
 	}
-	slog.Warn("create: what deletes kept on this host cannot all be read; the create goes ahead, as no disk file on this host backs on a path it writes. "+
+	slog.Warn("kept-disk check: what deletes kept on this host cannot all be read; a write of a new disk file (a create, clone, disk attach, "+
+		"volume move, restore, migration or rebuild) goes ahead, as no disk file on this host backs on a path it writes. "+
 		"Fix what cannot be read so that what deletes kept is judged by it again", "source", source, "error", rerr)
 	return nil
 }
@@ -515,10 +518,17 @@ var errKeptScanPoolsUnread = errors.New("this host's storage pools cannot be rea
 // host keeps VM disks in (keptScanDirs), each file a kept-disk note names,
 // each set-aside .kept- and .superseded- copy (health.ListKeptDisks,
 // health.ListSupersededDisks: also beside a disk at a path of its own), and
-// each kept-disks.json entry of this host still held in memory. The walk
-// follows no symlink below a directory it lists. It returns how the first
-// file that is, or backs on, a path the create writes (writes, compared as
-// the missing-base check compares: each side with its directory resolved
+// each kept-disks.json entry of this host still held in memory. A symlink
+// below a directory it lists is followed (keptScanFollow): a directory it
+// names is listed once, by its resolved path, and a file it names is read;
+// one that cannot be followed is an error. Nothing on a pseudo-filesystem
+// (/proc, /sys, ...: keptScanPseudoFS) is listed or read, only a regular
+// file is ever opened, and that without blocking (keptScanBudget.open), and
+// a scan past its budget of files, bytes read or time (keptScanMaxFiles,
+// keptScanMaxBytes, keptScanMaxTime) is an error naming it: a link below a
+// root can name the whole host. It returns how the first file
+// that is, or backs on, a path in writes (compared as the missing-base
+// check compares: each side with its directory resolved
 // through symlinks) collides, or "" when none does; a directory, a pool row
 // or a chain that cannot be read, or a path whose comparison cannot be told,
 // is an error, naming it. A nil writes writes nothing, and the scan only
@@ -531,10 +541,11 @@ var errKeptScanPoolsUnread = errors.New("this host's storage pools cannot be rea
 // <data_dir>/pools and <data_dir>/mounts), or at a path the note or the
 // registry entry of its keep names; a set-aside copy is made beside the disk
 // it was, wherever that is, and is read from the same listings
-// keptNoteChains reads. What is not covered is a kept overlay
-// outside every one of those directories that only the unreadable registry
-// names (a restore to an admin's --target-path elsewhere, kept by a later
-// delete, with its note gone).
+// keptNoteChains reads; every registry entry of this host is noted too
+// (keptDisksNote.Recorded), so a restart while the registry cannot be read
+// loses none of them. What is not covered is a kept overlay outside every
+// one of those directories whose note is gone, or that an older build
+// recorded in the registry alone.
 func (s *Server) keptCollisionScan(ctx context.Context, writes *keptWrites) (string, error) {
 	var files []string
 	seen := map[string]bool{}
@@ -548,6 +559,7 @@ func (s *Server) keptCollisionScan(ctx context.Context, writes *keptWrites) (str
 	if err != nil {
 		return "", err
 	}
+	b := newKeptScanBudget(ctx)
 	listed := map[string]bool{}
 	for len(dirs) > 0 {
 		dir := filepath.Clean(dirs[len(dirs)-1])
@@ -556,6 +568,22 @@ func (s *Server) keptCollisionScan(ctx context.Context, writes *keptWrites) (str
 			continue
 		}
 		listed[dir] = true
+		if err := b.look(); err != nil {
+			return "", err
+		}
+		// A pseudo-filesystem (/proc, /sys, ...) holds no disk, and reading
+		// one can block or consume (/proc/kmsg): not listed, by its type,
+		// whatever path reached it.
+		pseudo, err := storage.Bounded("statfs", dir, func() (bool, error) {
+			_, p, err := keptScanPseudoFS(dir)
+			return p, err
+		})
+		if errors.Is(err, fs.ErrNotExist) || pseudo {
+			continue
+		}
+		if err != nil {
+			return "", fmt.Errorf("the disk directory %s on this host cannot be listed (%w)", dir, err)
+		}
 		ents, err := storage.Bounded("list", dir, func() ([]os.DirEntry, error) { return os.ReadDir(dir) })
 		if errors.Is(err, fs.ErrNotExist) {
 			continue
@@ -564,15 +592,34 @@ func (s *Server) keptCollisionScan(ctx context.Context, writes *keptWrites) (str
 			return "", fmt.Errorf("the disk directory %s on this host cannot be listed (%w)", dir, err)
 		}
 		for _, e := range ents {
+			if err := b.look(); err != nil {
+				return "", err
+			}
 			switch p := filepath.Join(dir, e.Name()); {
 			case e.IsDir():
 				dirs = append(dirs, p)
 			case e.Type().IsRegular():
 				add(p)
+			case e.Type()&fs.ModeSymlink != 0:
+				// Followed to what it names, listed by that: a kept overlay
+				// below a symlinked directory is still on this host, and a
+				// link back to a directory listed already ends there. One
+				// naming nothing holds nothing; one that cannot be followed
+				// is an error, as a directory that cannot be listed is.
+				r, isDir, err := keptScanFollow(p)
+				switch {
+				case errors.Is(err, fs.ErrNotExist):
+				case err != nil:
+					return "", fmt.Errorf("the symlink %s on this host cannot be followed (%w)", p, err)
+				case isDir:
+					dirs = append(dirs, r)
+				case r != "":
+					add(r)
+				}
 			}
 		}
 	}
-	noted, err := health.KeptNotedFiles(s.dataDir)
+	noted, err := health.KeptScanFiles(s.dataDir)
 	if err != nil {
 		return "", fmt.Errorf("this host's notes of the disks deletes kept cannot be read (%w)", err)
 	}
@@ -631,9 +678,12 @@ func (s *Server) keptCollisionScan(ctx context.Context, writes *keptWrites) (str
 			missing string
 		}
 		w, err := storage.Bounded("read the backing chain of", p, func() (walked, error) {
-			l, m, _, err := walkKeptChain(stat, p, true)
+			l, m, _, err := walkKeptChainIn(b, stat, p, true)
 			return walked{l, m}, err
 		})
+		if errors.Is(err, errKeptScanBudget) {
+			return "", err
+		}
 		if err != nil {
 			return "", fmt.Errorf("the backing chain of %s on this host cannot be read (%w)", p, err)
 		}
@@ -641,26 +691,58 @@ func (s *Server) keptCollisionScan(ctx context.Context, writes *keptWrites) (str
 			hit, err := hits(l)
 			switch {
 			case err != nil:
-				return "", fmt.Errorf("whether the create writes %s, which %s on this host is or backs on, cannot be told (%w)", l, p, err)
+				return "", fmt.Errorf("whether it writes %s, which %s on this host is or backs on, cannot be told (%w)", l, p, err)
 			case !hit:
 			case i == 0:
-				return fmt.Sprintf("the create writes %s, which is on this host already", l), nil
+				return fmt.Sprintf("it writes %s, which is on this host already", l), nil
 			default:
-				return fmt.Sprintf("the create writes %s, which %s on this host backs on", l, p), nil
+				return fmt.Sprintf("it writes %s, which %s on this host backs on", l, p), nil
 			}
 		}
 		if w.missing != "" {
 			hit, err := hits(w.missing)
 			if err != nil {
-				return "", fmt.Errorf("whether the create writes %s, which %s on this host backs on although it is missing, cannot be told (%w)",
+				return "", fmt.Errorf("whether it writes %s, which %s on this host backs on although it is missing, cannot be told (%w)",
 					w.missing, p, err)
 			}
 			if hit {
-				return fmt.Sprintf("the create writes %s, which %s on this host backs on although it is missing", w.missing, p), nil
+				return fmt.Sprintf("it writes %s, which %s on this host backs on although it is missing", w.missing, p), nil
 			}
 		}
 	}
 	return "", nil
+}
+
+// keptScanFollow resolves the symlink p for keptCollisionScan, bounded: the
+// path it names with every symlink resolved, and whether that is a
+// directory; "" for something that is neither a directory nor a regular
+// file, or that is on a pseudo-filesystem (keptScanPseudoFS). A link
+// naming nothing is fs.ErrNotExist.
+func keptScanFollow(p string) (string, bool, error) {
+	type followed struct {
+		path  string
+		isDir bool
+	}
+	f, err := storage.Bounded("follow the symlink", p, func() (followed, error) {
+		r, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			return followed{}, err
+		}
+		fi, err := os.Stat(r)
+		if err != nil {
+			return followed{}, err
+		}
+		if !fi.IsDir() && !fi.Mode().IsRegular() {
+			return followed{}, nil
+		}
+		// What a link names on a pseudo-filesystem (/proc, /sys, ...) is
+		// neither listed nor read: it holds no disk.
+		if _, pseudo, err := keptScanPseudoFS(r); err != nil || pseudo {
+			return followed{}, err
+		}
+		return followed{r, fi.IsDir()}, nil
+	})
+	return f.path, f.isDir, err
 }
 
 // keptScanDirs is every directory this host keeps VM disks in, for

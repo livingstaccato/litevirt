@@ -48,3 +48,35 @@ func TestKeptNotes_ListsAndFailsClosed(t *testing.T) {
 		t.Errorf("old's note is still there once it names nothing (%v)", err)
 	}
 }
+
+// A note whose last kept disk goes holds nothing more, though the note stays
+// for its Recorded paths: a file noted Under that disk is no longer held,
+// and a later release of another chain does not name it as kept for this
+// VM. The recorded path is still scanned.
+//
+// Red before: KeptNotedFiles still mapped base to a. Mutation: drop the
+// "len(n.Paths) == 0 -> n.Under = nil" in writeKeptDisks: red.
+func TestKeptNote_UnderGoesWithTheLastKeptDisk(t *testing.T) {
+	dir := t.TempDir()
+	top, base, data := "/pool/a-root.qcow2", "/pool/base.qcow2", "/pool/a-data.qcow2"
+	if err := writeKeptDisks(dir, "a", keptDisksNote{Paths: []string{top}, Under: []string{base}, Recorded: []string{data}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := forgetKeptDisks(dir, "a", []string{top}); err != nil {
+		t.Fatal(err)
+	}
+	held, err := KeptNotedFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(held) != 0 {
+		t.Fatalf("KeptNotedFiles = %v after a's last kept disk went; want nothing held", held)
+	}
+	scanned, err := KeptScanFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scanned[data] != "a" {
+		t.Fatalf("KeptScanFiles = %v; want the recorded %s still scanned for a", scanned, data)
+	}
+}

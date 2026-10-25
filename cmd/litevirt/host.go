@@ -1086,36 +1086,10 @@ func newHostPreflightUpgradeCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				resp, err := c.PreflightUpgrade(ctx,
-					&pb.PreflightUpgradeRequest{TargetHost: args[0]})
-				if err != nil {
-					return fmt.Errorf("preflight: %w", err)
-				}
-				if len(resp.Findings) == 0 {
-					fmt.Printf("Host %s: no findings, upgrade is safe.\n", resp.Host)
-					return nil
-				}
-				fmt.Printf("Host %s preflight findings:\n", resp.Host)
-				for _, f := range resp.Findings {
-					fmt.Printf("  [%s] %s: %s\n", f.Severity, f.Code, f.Message)
-				}
-				if !resp.Ok {
-					return fmt.Errorf("upgrade blocked by %d finding(s)", countBlockingCLI(resp.Findings))
-				}
-				return nil
+				return cli.HostPreflightUpgrade(ctx, c, args[0], os.Stdout)
 			})
 		},
 	}
-}
-
-func countBlockingCLI(findings []*pb.PreflightFinding) int {
-	n := 0
-	for _, f := range findings {
-		if f.Severity == "block" {
-			n++
-		}
-	}
-	return n
 }
 
 // newHostRotateAuditKeyCmd replaces the key a host signs audit rows with. It

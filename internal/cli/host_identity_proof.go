@@ -200,14 +200,18 @@ const keyProofDomain = "litevirt-host-add-proof-v1:"
 
 // keyProofTimeout bounds the openssl run on the machine, in seconds (where
 // it has `timeout`); a run it ends is NOSIGN, and the key is compared in
-// memory. A var so a test can shorten it.
+// memory. Where timeout takes them, --foreground keeps it in the command's
+// process group (without it, coreutils timeout moves itself and openssl to
+// a group of their own), and -k 5 SIGKILLs an openssl that ignores the
+// TERM 5s later. A var so a test can shorten it.
 var keyProofTimeout = 30
 
 // keyProofDeadline bounds the whole challenge on the client, whatever the
 // machine has: with no `timeout` binary the remote bound is dropped, and a
 // hung openssl (or a hostile machine) would block the add forever. It
-// outlasts keyProofTimeout, so a machine that does have `timeout` still
-// answers NOSIGN first. A var so a test can shorten it.
+// outlasts keyProofTimeout and timeout's 5s KILL follow-up, so a machine
+// that does have `timeout` still answers NOSIGN first. A var so a test can
+// shorten it.
 var keyProofDeadline = 45 * time.Second
 
 // keyProofCmd signs challenge with keyPath (as the shell names it) and
@@ -221,9 +225,10 @@ func keyProofCmd(keyPath, challenge string) string {
 	return fmt.Sprintf(`if [ ! -e %s ]; then echo NOKEY; `+
 		`elif [ ! -f %s ]; then echo NOTFILE; `+
 		`elif ! command -v %s >/dev/null 2>&1; then echo NOSIGN; `+
-		`else t=; if command -v timeout >/dev/null 2>&1; then t="timeout %d"; fi; `+
+		`else t=; if command -v timeout >/dev/null 2>&1; then `+
+		`if timeout --foreground -k 5 5 sh -c : >/dev/null 2>&1; then t="timeout --foreground -k 5 %d"; else t="timeout %d"; fi; fi; `+
 		`if s=$(printf '%%s' %s | $t %s dgst -sha256 -sign %s 2>/dev/null | base64 | tr -d '\n') && [ -n "$s" ]; then echo "SIG $s"; `+
-		`else echo NOSIGN; fi; fi`, k, k, o, keyProofTimeout, ssh.ShellQuote(challenge), o, k)
+		`else echo NOSIGN; fi; fi`, k, k, o, keyProofTimeout, keyProofTimeout, ssh.ShellQuote(challenge), o, k)
 }
 
 // keyMatchesCert reports whether the PEM private key keyPEM is cert's: the

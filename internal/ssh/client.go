@@ -521,7 +521,7 @@ func (c *Client) RunOutputContext(ctx context.Context, cmd string) ([]byte, erro
 		return out.Bytes(), err
 	case <-ctx.Done():
 	}
-	// EOF on stdin: the remote kills the command's group. Wait a little for
+	// EOF on stdin: the remote kills the command's session. Wait a little for
 	// it to report, so a machine that answers has stopped it before this
 	// returns; one that does not answer is not waited for.
 	_ = stdin.Close()
@@ -539,26 +539,60 @@ func (c *Client) RunOutputContext(ctx context.Context, cmd string) ([]byte, erro
 var remoteKillGrace = 2 * time.Second
 
 // killOnStdinEOF wraps cmd for RunOutputContext. A watcher reading the
-// session's stdin kills cmd's process group when stdin reaches EOF:
+// session's stdin kills cmd's whole session when stdin reaches EOF:
 //
-//   - with setsid, cmd runs in a session of its own, so its group's id is its
-//     pid, and that group is killed;
-//   - without it, cmd stays in the wrapper's group, and that whole group is
-//     killed (wrapper, watcher and cmd's tree): sshd makes the command it
-//     runs a session leader, so $$ names it. Where $$ leads no group (an
-//     unusual launcher), the kill finds none, and only cmd's shell is killed.
+//   - with setsid, cmd runs in a session of its own, so the session's id is
+//     its pid;
+//   - without it, cmd stays in the session sshd gave the wrapper (sshd makes
+//     the command it runs a session leader, so $$ names it), and that whole
+//     session is killed: wrapper, watcher and cmd's tree. Where $$ leads no
+//     session (an unusual launcher), the kill finds none, and only cmd's
+//     shell is killed.
 //
-// The wrapper exits with cmd's status and stops the watcher first, so a
-// command that ended by itself is never followed by a kill. A background job
+// The session, not the process group: a child may move to a group of its
+// own (coreutils timeout without --foreground calls setpgid(0, 0)), but it
+// cannot leave the session without setsid.
+//
+// The wrapper exits with cmd's status and stops the watcher first (a
+// watcher still reading stdin; one that is killing finishes, and is waited
+// for), so a command that ended by itself is never followed by a kill. A background job
 // reads /dev/null unless told otherwise, so stdin reaches the watcher as fd 3.
 func killOnStdinEOF(cmd string) string {
 	q := ShellQuote(cmd)
 	return `exec 3<&0; ` +
-		`if command -v setsid >/dev/null 2>&1; then setsid sh -c ` + q + ` 3<&- </dev/null & p=$!; g=-$p; f=; ` +
-		`else sh -c ` + q + ` 3<&- </dev/null & p=$!; g=-$$; f=$p; fi; ` +
-		`{ cat <&3 >/dev/null; kill -s KILL -- $g 2>/dev/null || { [ -n "$f" ] && kill -s KILL $f; }; } >/dev/null 2>&1 & w=$!; ` +
-		`exec 3<&-; wait $p; rc=$?; kill $w 2>/dev/null; exit $rc`
+		`if command -v setsid >/dev/null 2>&1; then setsid sh -c ` + q + ` 3<&- </dev/null & p=$!; s=$p; f=; ` +
+		`else sh -c ` + q + ` 3<&- </dev/null & p=$!; s=$$; f=$p; fi; ` +
+		`sh -c ` + ShellQuote(sessionKillWatcher) + ` sh "$s" "$f" <&3 >/dev/null 2>&1 & w=$!; ` +
+		`exec 3<&-; wait $p; rc=$?; kill $w 2>/dev/null; wait $w; exit $rc`
 }
+
+// sessionKillWatcher is the watcher killOnStdinEOF starts with the session's
+// id ($1) and, without setsid, cmd's pid ($2). Once stdin reaches EOF it
+// SIGKILLs every process in session $1: with setsid, cmd's group first (the
+// watcher is outside it), then the session by pkill -s, twice, so a child
+// forked during the first pass is caught by the second. Where there is no
+// pkill it reads /proc once instead, skipping itself. Without setsid the
+// watcher is in the session too, and is killed with the rest, wrapper
+// included. From EOF on it ignores SIGTERM: the wrapper, once cmd has died,
+// stops the watcher with one and waits for it, which must not cut the kill
+// short.
+const sessionKillWatcher = `cat >/dev/null
+trap '' TERM
+s=$1; f=$2
+[ -z "$f" ] && kill -s KILL -- -$s
+if command -v pkill >/dev/null 2>&1; then
+  pkill -KILL -s "$s"; pkill -KILL -s "$s"
+else
+  for x in /proc/[0-9]*/stat; do
+    read -r l < "$x" || continue
+    i=${l%% *}
+    [ "$i" = "$$" ] && continue
+    set -- ${l##*") "}
+    [ "$4" = "$s" ] && kill -s KILL "$i"
+  done
+fi
+[ -n "$f" ] && kill -s KILL "$f"
+exit 0`
 
 // CopyFileMode copies a local file to the remote host with an explicit mode.
 //

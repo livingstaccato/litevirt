@@ -1,16 +1,20 @@
 package cli
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // stubOpenSSL installs a script as the machine's openssl.
@@ -207,10 +211,40 @@ func TestKeyProof_SignsADomainSeparatedChallenge(t *testing.T) {
 // deadline without stopping the command (7f288a4bf) — the command runs in
 // the test's own process group and the hung openssl outlives the proof, red.
 func TestKeyProof_NoTimeoutBinaryStillBoundedByClientDeadline(t *testing.T) {
+	assertHungProofLeavesNothing(t, []string{"sh", "base64", "tr", "printf", "sleep"},
+		func(marker string) string { return `echo $$ > '` + marker + `'; exec sleep 30` })
+}
+
+// A target WITH coreutils timeout, and an openssl that ignores SIGTERM (the
+// rc8 lab drill 3 leftover). Without --foreground, timeout moves itself and
+// openssl to a process group of their own, so a kill of the command's group
+// missed both, and they ran on after the proof refused. Now timeout stays in
+// the group, and the command's whole session is killed in any case.
+//
+// Mutations: plain `timeout 30` together with a group-only kill (d2fa715ff)
+// — timeout and openssl outlive the proof, red. Either change alone is
+// enough to pass; each is pinned by its own test (the session kill by
+// TestLocalShellContext_KillsTheSession and the internal/ssh session tests,
+// --foreground by TestKeyProofCmd_TimeoutStaysInTheGroup).
+func TestKeyProof_RealTimeoutAndATermIgnoringOpenSSLLeaveNothing(t *testing.T) {
+	if _, err := exec.LookPath("timeout"); err != nil {
+		t.Skip("no timeout(1)")
+	}
+	assertHungProofLeavesNothing(t, []string{"sh", "base64", "tr", "printf", "sleep", "timeout"},
+		func(marker string) string { return `trap '' TERM; echo $$ > '` + marker + `'; exec sleep 30` })
+}
+
+// assertHungProofLeavesNothing runs the challenge on a machine whose PATH
+// holds only tools, with an openssl stub that records its pid in the file it
+// is given and hangs, and asserts that the proof refuses at the client's
+// deadline and that nothing in the stub's process group or session, nor the
+// stub, is left running.
+func assertHungProofLeavesNothing(t *testing.T, tools []string, stub func(marker string) string) {
+	t.Helper()
 	f := newAddFixture(t)
 	crt := parseCerts(f.before["host.crt"])[0]
 	bin := t.TempDir()
-	for _, tool := range []string{"sh", "base64", "tr", "printf", "sleep"} {
+	for _, tool := range tools {
 		p, err := exec.LookPath(tool)
 		if err != nil {
 			t.Fatal(err)
@@ -220,11 +254,11 @@ func TestKeyProof_NoTimeoutBinaryStillBoundedByClientDeadline(t *testing.T) {
 		}
 	}
 	t.Setenv("PATH", bin)
-	if _, err := exec.LookPath("timeout"); err == nil {
-		t.Fatal("the fake target must have no timeout")
+	if _, err := exec.LookPath("timeout"); err == nil != slices.Contains(tools, "timeout") {
+		t.Fatalf("timeout on the fake target: %v, want %v", err == nil, slices.Contains(tools, "timeout"))
 	}
 	marker := filepath.Join(t.TempDir(), "openssl.pid")
-	stubOpenSSL(t, `echo $$ > '`+marker+`'; exec sleep 30`)
+	stubOpenSSL(t, stub(marker))
 	old := keyProofDeadline
 	// Headroom for a saturated host to start the stub before the deadline.
 	keyProofDeadline = 3 * time.Second
@@ -238,14 +272,17 @@ func TestKeyProof_NoTimeoutBinaryStillBoundedByClientDeadline(t *testing.T) {
 		defer close(done)
 		proved, err = signedChallenge(f.target, "/etc/litevirt/pki/host.key", crt)
 	}()
-	// The hung openssl's pid and process group, read while it runs.
-	pid, pgid := 0, 0
+	// The hung openssl's pid, process group and session, read while it runs.
+	pid, pgid, sid := 0, 0, 0
 	for pid == 0 && time.Since(start) < 10*time.Second {
 		if b, rerr := os.ReadFile(marker); rerr == nil && strings.HasSuffix(string(b), "\n") {
 			if pid, rerr = strconv.Atoi(strings.TrimSpace(string(b))); rerr != nil {
 				t.Fatal(rerr)
 			}
 			if pgid, rerr = syscall.Getpgid(pid); rerr != nil {
+				t.Fatalf("the stub (pid %d) is already gone: %v", pid, rerr)
+			}
+			if sid, rerr = unix.Getsid(pid); rerr != nil {
 				t.Fatalf("the stub (pid %d) is already gone: %v", pid, rerr)
 			}
 			break
@@ -255,7 +292,7 @@ func TestKeyProof_NoTimeoutBinaryStillBoundedByClientDeadline(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(20 * time.Second):
-		t.Fatal("the proof was not bounded without a remote timeout")
+		t.Fatal("the proof was not bounded by the client's deadline")
 	}
 	if proved || err == nil || !strings.Contains(err.Error(), "deadline") {
 		t.Fatalf("proved %v, %v; want a refusal naming the deadline", proved, err)
@@ -266,18 +303,93 @@ func TestKeyProof_NoTimeoutBinaryStillBoundedByClientDeadline(t *testing.T) {
 	if pid == 0 {
 		t.Fatal("the stub openssl never ran")
 	}
-	if pgid == syscall.Getpgrp() {
-		t.Fatalf("the challenge ran in the test's own process group (%d): it cannot be killed whole", pgid)
+	if own, _ := unix.Getsid(0); pgid == syscall.Getpgrp() || sid == own {
+		t.Fatalf("the challenge ran in the test's own process group (%d) or session (%d): it cannot be killed whole", pgid, sid)
 	}
-	if live := liveProcesses(t, pgid, pid); len(live) > 0 {
+	if live := liveProcesses(t, pgid, sid, pid); len(live) > 0 {
 		t.Fatalf("after the proof returned, still running: %v", live)
 	}
 }
 
+// The local target kills the command's whole session at its deadline, so a
+// child that moved to a process group of its own is killed too.
+//
+// Mutation: kill only the command's process group (cmdbound.Command) —
+// timeout and its TERM-ignoring child run on, red.
+func TestLocalShellContext_KillsTheSession(t *testing.T) {
+	if _, err := exec.LookPath("timeout"); err != nil {
+		t.Skip("no timeout(1)")
+	}
+	marker := filepath.Join(t.TempDir(), "pid")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		_, err := (&LocalAddTarget{}).ShellContext(ctx, keyProofKind,
+			`timeout 30 sh -c 'trap "" TERM; echo $$ > '"'`+marker+`'"'; exec sleep 30'`)
+		done <- err
+	}()
+	pid, pgid, sid := 0, 0, 0
+	for pid == 0 && time.Since(start) < 10*time.Second {
+		if b, rerr := os.ReadFile(marker); rerr == nil && strings.HasSuffix(string(b), "\n") {
+			pid, _ = strconv.Atoi(strings.TrimSpace(string(b)))
+			pgid, _ = syscall.Getpgid(pid)
+			sid, _ = unix.Getsid(pid)
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a killed command reported success")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("ShellContext was not bounded by its context")
+	}
+	if pid == 0 || sid <= 0 {
+		t.Fatal("the command never ran")
+	}
+	if own, _ := unix.Getsid(0); sid == own {
+		t.Fatalf("the command ran in the test's own session (%d)", sid)
+	}
+	if live := liveProcesses(t, pgid, sid, pid); len(live) > 0 {
+		t.Fatalf("after ShellContext returned, still running: %v", live)
+	}
+}
+
+// keyProofCmd runs openssl under `timeout --foreground` where timeout takes
+// it, so timeout does not move itself and openssl out of the command's
+// process group.
+//
+// Mutation: plain `timeout 30` — timeout's group is not the shell's, red.
+func TestKeyProofCmd_TimeoutStaysInTheGroup(t *testing.T) {
+	if _, err := exec.LookPath("timeout"); err != nil {
+		t.Skip("no timeout(1)")
+	}
+	dir := t.TempDir()
+	key := filepath.Join(dir, "host.key")
+	if err := os.WriteFile(key, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "groups")
+	// The stub records its own process group.
+	stubOpenSSL(t, `read -r l < /proc/$$/stat; set -- ${l##*") "}; echo "$3" > '`+out+`'`)
+	cmd := exec.Command("sh", "-c", keyProofCmd(key, "c"))
+	if b, err := cmd.Output(); err != nil || strings.TrimSpace(string(b)) != "NOSIGN" {
+		t.Fatalf("%q, %v", b, err)
+	}
+	fs := strings.Fields(string(mustRead(t, out)))
+	if len(fs) != 1 || fs[0] != strconv.Itoa(syscall.Getpgrp()) {
+		t.Fatalf("openssl ran in group %v; want the command's group %d", fs, syscall.Getpgrp())
+	}
+}
+
 // liveProcesses lists the processes, other than zombies, that are in process
-// group pgid or are pid, a moment after a kill (a killed process may need a
-// few milliseconds to exit). It reads /proc.
-func liveProcesses(t *testing.T, pgid, pid int) []string {
+// group pgid or session sid or are pid, a moment after a kill (a killed
+// process may need a few milliseconds to exit). It reads /proc.
+func liveProcesses(t *testing.T, pgid, sid, pid int) []string {
 	t.Helper()
 	if _, err := os.Stat("/proc/self/stat"); err != nil {
 		t.Skip("no /proc to read process groups from")
@@ -296,14 +408,15 @@ func liveProcesses(t *testing.T, pgid, pid int) []string {
 			if k < 0 {
 				continue
 			}
-			// After "pid (comm)": state, ppid, pgrp.
+			// After "pid (comm)": state, ppid, pgrp, session.
 			fs := strings.Fields(s[k+1:])
-			if len(fs) < 3 || fs[0] == "Z" {
+			if len(fs) < 4 || fs[0] == "Z" {
 				continue
 			}
 			p, _ := strconv.Atoi(strings.Fields(s)[0])
 			g, _ := strconv.Atoi(fs[2])
-			if g == pgid || p == pid {
+			sess, _ := strconv.Atoi(fs[3])
+			if g == pgid || sess == sid || p == pid {
 				live = append(live, s[:k+1])
 			}
 		}

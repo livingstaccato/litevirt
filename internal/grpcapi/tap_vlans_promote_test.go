@@ -8,6 +8,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -20,6 +21,12 @@ import (
 // promotion, a new row written after the start) through the start guard.
 func promoteAccessVLAN(t *testing.T, s *Server, setup ...func(*libvirtfake.Fake)) (*libvirtfake.Fake, error) {
 	t.Helper()
+	return promoteAccessVLANOn(t, s, "lo", setup...)
+}
+
+// promoteAccessVLANOn is promoteAccessVLAN with vm1's NIC on network net.
+func promoteAccessVLANOn(t *testing.T, s *Server, net string, setup ...func(*libvirtfake.Fake)) (*libvirtfake.Fake, error) {
+	t.Helper()
 	fake := libvirtfake.New()
 	for _, f := range setup {
 		f(fake)
@@ -31,10 +38,10 @@ func promoteAccessVLAN(t *testing.T, s *Server, setup ...func(*libvirtfake.Fake)
 	poolDir := t.TempDir()
 	s.SetStoragePoolsByName(map[string]StoragePoolRef{"replica-pool": {Driver: "local", Target: poolDir}})
 	specJSON, _ := json.Marshal(&pb.VMSpec{Name: "vm1", Cpu: 1, MemoryMib: 512,
-		Network: []*pb.NetworkAttachment{{Name: "lo", Mac: srcMAC, Trunk: []int32{30}}}})
+		Network: []*pb.NetworkAttachment{{Name: net, Mac: srcMAC, Trunk: []int32{30}}}})
 	if err := corrosion.InsertVM(ctx, s.db,
 		corrosion.VMRecord{Name: "vm1", HostName: "test-host", State: "running", Spec: string(specJSON)},
-		[]corrosion.InterfaceRecord{{VMName: "vm1", NetworkName: "lo", MAC: srcMAC}},
+		[]corrosion.InterfaceRecord{{VMName: "vm1", NetworkName: net, MAC: srcMAC}},
 		[]corrosion.DiskRecord{{VMName: "vm1", DiskName: "root", HostName: "test-host",
 			Path: "/nonexistent-source", SizeBytes: 1 << 20, StorageType: "local"}},
 	); err != nil {
@@ -148,5 +155,45 @@ func TestPromoteReplica_AnAccessVLANOnANonFilteringBridgeIsRefused(t *testing.T)
 				t.Fatal("the promoted guest runs on a bridge that does not carry its VLAN")
 			}
 		})
+	}
+}
+
+// Concern 1: on a managed network whose bridge (its Interface, "brlan") is not
+// the flat bridge of its name ("lan"), a promotion attaches the NIC to the
+// flat bridge. The named bridge filters VLANs; the bridge the tap really sits
+// on does not. The start is refused: the guard judges the tap's real master,
+// read here from where the promoted domain's definition puts the NIC (as the
+// kernel's master link would be), not the bridge the network's name resolves
+// to.
+//
+// Mutation: judge the network's named bridge instead of the tap's master — red.
+func TestPromoteReplica_JudgesTheTapsRealMasterOnAManagedNetwork(t *testing.T) {
+	s := testServer(t)
+	if err := corrosion.UpsertNetwork(context.Background(), s.db, corrosion.NetworkRecord{Name: "lan", Type: "bridge",
+		Config: `{"Type":"bridge","Interface":"brlan"}`}); err != nil {
+		t.Fatal(err)
+	}
+	s.SetBridgeEnsure(func(string) error { return nil })
+	filters := map[string]bool{"brlan": true, "lan": false}
+	s.SetBridgeVLANFiltering(func(br string) (bool, bool, error) { return true, filters[br], nil })
+	fake, err := promoteAccessVLANOn(t, s, "lan", func(f *libvirtfake.Fake) {
+		f.TapMaster = func(dom, mac string) (string, bool, error) {
+			x, err := f.DumpXML(dom)
+			if err != nil {
+				return "", false, err
+			}
+			m := regexp.MustCompile(`<source bridge=['"]([^'"]+)['"]`).FindStringSubmatch(x)
+			if m == nil {
+				return "", false, errors.New("no master")
+			}
+			master := m[1]
+			return master, filters[master], nil
+		}
+	})
+	if err == nil || !strings.Contains(err.Error(), `"lan" does not filter VLANs`) {
+		t.Fatalf("promote onto the flat bridge lan (unfiltered) while brlan filters: %v, want a refusal naming lan", err)
+	}
+	if st, _ := fake.DomainState("vm1-p"); st == "running" {
+		t.Fatal("the promoted guest runs on a bridge that does not carry its VLAN")
 	}
 }

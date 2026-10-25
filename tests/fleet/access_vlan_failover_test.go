@@ -250,3 +250,31 @@ func TestFleet_AccessVLANFailoverPassesOverAHostWithoutTheBridge(t *testing.T) {
 	accVLANStart(t, ctx, b)
 	assertVLANBeforeRun(t, b, accVLANVM, "vlan=30")
 }
+
+// Concern 1, through the reconciler: b's bridge for the network (the one its
+// name resolves to) filters VLANs, so failover places the VM there and the
+// start preflight passes; but the bridge b's tap is actually enslaved to does
+// not (a managed network whose own bridge is not the flat one of its name,
+// say). The start guard judges the tap's real master and refuses: the guest
+// never runs on the untagged segment.
+//
+// Mutation: judge the network's named bridge instead of the tap's master — red.
+func TestFleet_AccessVLANFailoverStartJudgesTheTapsRealMaster(t *testing.T) {
+	ctx := context.Background()
+	clock := NewVirtualClock(time.Now().UTC())
+	c, a, b, _ := accVLANFleet(t, clock, false, true)
+	b.Virt.TapMaster = func(string, string) (string, bool, error) { return "br-real", false, nil }
+	pciFoFailOver(t, ctx, c, clock, a, b)
+	accVLANStart(t, ctx, b)
+	if st, _ := b.Virt.DomainState(accVLANVM); st == "running" {
+		t.Fatalf("%s runs on %s on a tap whose master does not filter VLANs", accVLANVM, b.Name)
+	}
+	for _, e := range b.Virt.EventLog() {
+		if e.Domain == accVLANVM && (e.Op == "vlan-tap" || e.Op == "resume") {
+			t.Fatalf("%s on %s: %s %s; want the start refused before the tap is configured or the guest runs", accVLANVM, b.Name, e.Op, e.Note)
+		}
+	}
+	if vm := vmOn(t, b, accVLANVM); vm == nil || vm.State == "running" {
+		t.Fatalf("%s on %s: %+v; want not running", accVLANVM, b.Name, vm)
+	}
+}

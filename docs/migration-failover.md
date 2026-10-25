@@ -1122,6 +1122,9 @@ judged (a `[trust=on]` or `[trust=off]` token in its fencing log detail), and
 every later judgement of that fence, a new failover leader's included, uses
 it, so a fence judged untrusted stays held until `lv host fence-confirm
 <host>`, and so does a fence row an earlier build wrote without the token.
+A recovery resting on a trusted fence needs the host to trust one still, so
+revoking the setting holds a recovery not yet made, until the same
+confirmation.
 
 Turning it off is a label write, and `hosts.labels` is one value replicated
 last-writer-wins: an unrelated label set on another node that has not yet seen

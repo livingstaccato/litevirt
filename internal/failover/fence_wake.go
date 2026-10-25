@@ -302,18 +302,27 @@ func fenceFailedWayOut(h *corrosion.HostRecord) string {
 	return out + ", or give it an ipmi or redfish fence strategy"
 }
 
-// trustSSHChoice names, for a hold on a confirmed SSH power-off, the
-// per-host setting that would have recovered it, as the operator's choice it
-// is and never as advice: trusting a confirmed request is trusting that the
-// host did power off. For a host that trusts one now, which this fence was
-// judged before, it says the setting counts later fences only.
-func trustSSHChoice(h *corrosion.HostRecord) string {
-	if trustsSSHPoweroff(h) {
-		// Set since this fence was judged: it counts later fences only.
-		return " (" + h.Name + " now trusts a confirmed SSH power-off; that counts later fences, never this one)"
+// sshTrustNote says, for a hold on an SSH power-off the remote shell
+// confirmed (fr as it ran, before holdUntrustedSSH), why the trust setting
+// did not count it, and what the setting would do, only where that is true:
+// a later fence confirmed over the host's pinned key. Trusting one is the
+// operator's choice, never advice: trusting a confirmed request is trusting
+// that the host did power off.
+func sshTrustNote(h *corrosion.HostRecord, fr fence.Result) string {
+	recorded, now := fence.RecordedTrust(fr.Detail), trustsSSHPoweroff(h)
+	switch {
+	case !fence.ConfirmedOverPin(fr):
+		return "this power-off was not confirmed over " + h.Name + "'s pinned host key, so no trust setting counts it"
+	case recorded && !now:
+		return h.Name + "'s trust of a confirmed SSH power-off was revoked after this fence was judged, " +
+			"so it no longer counts; it needs `lv host fence-confirm " + h.Name + "`"
+	case now:
+		return h.Name + " trusts a confirmed SSH power-off now, but this fence was judged before it did (or by an " +
+			"earlier build): the setting counts later fences confirmed over its pinned host key, never this one"
 	}
-	return " (an operator who accepts the risk that a host ignores or does not finish a confirmed SSH power-off " +
-		"may instead set `lv host config " + h.Name + " --trust-ssh-poweroff`; it is not a recommendation)"
+	return "an operator who accepts the risk that a host ignores or does not finish a confirmed SSH power-off may " +
+		"instead set `lv host config " + h.Name + " --trust-ssh-poweroff` (not a recommendation): it counts later " +
+		"fences confirmed over its pinned host key, never this one"
 }
 
 // noteFenceFailure holds h's recovery on a fence that failed, naming what
@@ -362,6 +371,7 @@ func (c *Coordinator) noteGateHold(host, reason, stale string) {
 func (c *Coordinator) clearHold(host string) {
 	delete(c.holdReason, host)
 	delete(c.holdBase, host)
+	delete(c.lastStale, host)
 }
 
 // forgetHost drops the per-episode memory kept for host here, once it is back
@@ -375,6 +385,7 @@ func (c *Coordinator) forgetHost(host string) {
 	delete(c.afreshConfirm, host)
 	delete(c.notRelying, host)
 	c.clearHold(host)
+	delete(c.unprovenRaised, host)
 	delete(c.lastFenceFailure, host)
 	delete(c.stallSince, host)
 	delete(c.stallAlerted, host)

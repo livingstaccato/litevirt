@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -46,17 +47,31 @@ type unprovenFenceEvidence struct {
 // holdUnproven holds h's recovery on hold, a fence that is not proof h is
 // off, with stale appended (noteGateHold), and raises
 // ha.recovery.unproven_fence for it. why is the reason without its way out,
-// for the condition's detail; sshConfirmed says the fence was an SSH power-off
-// the remote shell confirmed, which the trust opt-in would have counted.
-func (c *Coordinator) holdUnproven(ctx context.Context, h *corrosion.HostRecord, hold, why, stale string, sshConfirmed bool) {
+// for the condition's detail; trustNote, for a confirmed SSH power-off, is why
+// the trust setting did not count it (sshTrustNote), for its remedy.
+func (c *Coordinator) holdUnproven(ctx context.Context, h *corrosion.HostRecord, hold, why, stale, trustNote string) {
 	c.noteGateHold(h.Name, hold, stale)
-	c.raiseUnproven(ctx, h, why, stale, sshConfirmed)
+	c.raiseUnproven(ctx, h, why, stale, trustNote)
+}
+
+// unprovenRaise is what ha.recovery.unproven_fence was last raised with.
+type unprovenRaise struct{ why, trustNote string }
+
+// unprovenOpen reports whether host's ha.recovery.unproven_fence is open. A
+// read error reports false.
+func (c *Coordinator) unprovenOpen(ctx context.Context, host string) bool {
+	row, ok, err := corrosion.GetHealthCondition(ctx, c.db, RefenceEvaluator, CondRecoveryUnprovenFence, "host", host)
+	return err == nil && ok && row.Lifecycle != corrosion.ConditionResolved
 }
 
 // raiseUnproven writes ha.recovery.unproven_fence for h. A host with no
 // recoverable workload on it holds nothing back, and raises nothing. The row
 // is not rewritten while it says the same: a hold can last days.
-func (c *Coordinator) raiseUnproven(ctx context.Context, h *corrosion.HostRecord, why, stale string, sshConfirmed bool) {
+func (c *Coordinator) raiseUnproven(ctx context.Context, h *corrosion.HostRecord, why, stale, trustNote string) {
+	if c.unprovenRaised == nil {
+		c.unprovenRaised = map[string]unprovenRaise{}
+	}
+	c.unprovenRaised[h.Name] = unprovenRaise{why, trustNote}
 	workloads, err := c.recoverableOn(ctx, h.Name)
 	if err != nil || len(workloads) == 0 {
 		return
@@ -78,7 +93,7 @@ func (c *Coordinator) raiseUnproven(ctx context.Context, h *corrosion.HostRecord
 		detail += "; " + stale
 	}
 	b, _ := json.Marshal(unprovenFenceEvidence{Detail: detail, Workloads: capList(workloads),
-		Remedy: unprovenRemedy(h, sshConfirmed)})
+		Remedy: unprovenRemedy(h, trustNote)})
 	if !fresh && row.Evidence == string(b) && row.Severity == corrosion.SeverityCritical {
 		return
 	}
@@ -94,10 +109,10 @@ func (c *Coordinator) raiseUnproven(ctx context.Context, h *corrosion.HostRecord
 // unprovenRemedy is the way out of h's hold: the operator's confirmation,
 // which the recovery resumes from; for a host whose fence does not go through
 // a BMC, a fence strategy that proves a power-off next time; and, for a
-// confirmed SSH power-off on a host that does not trust one, the trust
-// opt-in, as the operator's choice it is. The opt-in never reaches back: a
-// fence judged untrusted stays held until the confirmation (fence.RecordedTrust).
-func unprovenRemedy(h *corrosion.HostRecord, sshConfirmed bool) string {
+// confirmed SSH power-off, trustNote (sshTrustNote): why the trust setting did
+// not count it, and what it would do where that is true. Trust is never
+// retroactive: a fence judged untrusted stays held until the confirmation.
+func unprovenRemedy(h *corrosion.HostRecord, trustNote string) string {
 	out := fmt.Sprintf("once %s is powered off, `lv host fence-confirm %s`, and the recovery resumes from it", h.Name, h.Name)
 	switch fence.ResolveStrategy(h.FenceStrategy) {
 	case "ipmi", "redfish":
@@ -105,14 +120,8 @@ func unprovenRemedy(h *corrosion.HostRecord, sshConfirmed bool) string {
 		out += fmt.Sprintf(". To recover at once next time, give it a fence that proves a power-off: "+
 			"`lv host config %s --fence-strategy ipmi|redfish`", h.Name)
 	}
-	switch {
-	case sshConfirmed && trustsSSHPoweroff(h):
-		out += fmt.Sprintf(". %s now trusts a confirmed SSH power-off: that counts later fences, never this one, "+
-			"which was judged before it and still needs `lv host fence-confirm %s`", h.Name, h.Name)
-	case sshConfirmed:
-		out += fmt.Sprintf(". An operator who accepts the risk that a host ignores or does not finish a confirmed SSH "+
-			"power-off may instead set `lv host config %s --trust-ssh-poweroff` (not a recommendation): it counts later "+
-			"fences, never this one, which still needs `lv host fence-confirm %s`", h.Name, h.Name)
+	if trustNote != "" {
+		out += ". " + strings.ToUpper(trustNote[:1]) + trustNote[1:]
 	}
 	return out
 }
@@ -126,6 +135,7 @@ func (c *Coordinator) resolveUnproven(ctx context.Context, host, why string) {
 	ts := c.now().UTC().Format(time.RFC3339)
 	row.Lifecycle, row.ResolvedAt, row.LastSeen, row.Reporter = corrosion.ConditionResolved, ts, ts, c.hostName
 	row.ObserveCount, row.CleanCount = 0, row.CleanCount+1
+	delete(c.unprovenRaised, host)
 	if err := corrosion.UpsertHealthCondition(ctx, c.db, row); err != nil {
 		slog.Warn("failover: could not resolve "+CondRecoveryUnprovenFence, "host", host, "error", err)
 		return
@@ -158,6 +168,13 @@ func (c *Coordinator) resolveUnprovenSettled(ctx context.Context, pending map[st
 			c.resolveUnproven(ctx, host, "removed")
 		case pending[host] == 0:
 			c.resolveUnproven(ctx, host, "no recoverable workload left on it, or it is "+h.State)
+		default:
+			// Still held: keep the detail current with what this coordinator
+			// last raised it for and the newest stale confirmation, noted
+			// after the raise (raiseUnproven rewrites only on a change).
+			if r, ok := c.unprovenRaised[host]; ok {
+				c.raiseUnproven(ctx, h, r.why, c.lastStale[host], r.trustNote)
+			}
 		}
 	}
 }

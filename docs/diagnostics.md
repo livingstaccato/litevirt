@@ -1553,10 +1553,16 @@ operator confirmation that does not stand for this outage, when there is one),
 and the `remedy`: once the host is powered off, `lv host fence-confirm <host>`,
 and the recovery resumes from it. For a host without an `ipmi` or `redfish`
 fence strategy it adds `lv host config <host> --fence-strategy ipmi|redfish`,
-so the next fence proves a power-off. For a confirmed SSH power-off it names
+so the next fence proves a power-off. For a confirmed SSH power-off it says
+why the trust setting did not count it: confirmed off the host's pinned key
+(no setting counts that), judged before the host trusted one, or trusted and
+since revoked. Where the setting is off, it names
 `lv host config <host> --trust-ssh-poweroff` as the operator's choice, not a
-recommendation: it counts later fences, never the one already holding this
-recovery, whichever leader judges it. The same hold is named by the `host.recovery.stalled` notification.
+recommendation: it counts later fences confirmed over the pinned key, never
+the one already holding this recovery, whichever leader judges it. The same
+hold is named by the `host.recovery.stalled` notification. The detail is kept
+current while the hold lasts: a confirmation noted later as not standing, or a
+later fence's failure, replaces what it said.
 
 The condition resolves when the recovery goes ahead (the operator's
 confirmation, or a fence judged again that passes), and, read back by a later

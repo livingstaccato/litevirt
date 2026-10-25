@@ -59,7 +59,7 @@ func TestUnprovenFence_AnUntrustedSSHPowerOffIsAHealthCondition(t *testing.T) {
 		t.Errorf("workloads %v, want [vm/vm]", ev.Workloads)
 	}
 	if !strings.Contains(ev.Detail, "confirmed the power-off, which is not proof down is off") ||
-		!strings.Contains(ev.Detail, "does not trust a confirmed SSH power-off") {
+		!strings.Contains(ev.Detail, "the trust setting does not count it") {
 		t.Errorf("detail does not give the reason: %q", ev.Detail)
 	}
 	for _, want := range []string{"`lv host fence-confirm down`", "`lv host config down --trust-ssh-poweroff`",
@@ -343,4 +343,87 @@ func TestUnprovenFence_AFailedBMCFenceIsNot(t *testing.T) {
 	if _, _, open := unprovenCond(t, db); open {
 		t.Fatalf("%s raised for a failed ipmi fence", CondRecoveryUnprovenFence)
 	}
+}
+
+// The condition's detail stays current. (a) An operator confirmation written
+// after the raise that does not stand is named in it, as in the stall alert.
+// (b) A host given an ipmi strategy after its SSH fence failed, whose ipmi
+// fence then fails too, is held on that failure: the detail names it, not the
+// SSH fence, and the remedy no longer suggests a BMC strategy.
+//
+// Mutations: drop the settle sweep's re-raise — (a) red; drop the re-raise of
+// an open condition on a failed BMC fence — (b) red.
+func TestUnprovenFence_TheDetailStaysCurrent(t *testing.T) {
+	t.Run("a stale confirmation noted later", func(t *testing.T) {
+		db, ctx := seedDownHost(t, "ssh", nil)
+		liveMembership(t, db)
+		runStart := time.Now()
+		for _, o := range []string{"coordinator", "alive"} {
+			failingSince(t, db, o, runStart, runStart)
+		}
+		c := newTestCoordinator("coordinator", db)
+		c.SetFencer(confirmedSSH("managed"))
+		now := time.Now()
+		c.Now = func() time.Time { return now }
+		c.run(ctx)
+		if _, _, open := unprovenCond(t, db); !open {
+			t.Fatal("setup: no condition raised")
+		}
+		time.Sleep(1100 * time.Millisecond)
+		fenceRowAt(t, db, "confirm-new", "manual", "manual-confirmed", time.Now())
+		now = now.Add(recoveryStallAfter + time.Second)
+		holdLeaseThrough(t, db, ctx, now)
+		for _, o := range []string{"coordinator", "alive"} {
+			failingSince(t, db, o, runStart, now)
+		}
+		c.run(ctx)
+		if !strings.Contains(c.holdReason["down"], "confirm-new") {
+			t.Fatalf("setup: the confirmation was not judged stale (hold %q)", c.holdReason["down"])
+		}
+		if _, ev, _ := unprovenCond(t, db); !strings.Contains(ev.Detail, "confirm-new") {
+			t.Errorf("the condition's detail does not name the stale confirmation: %q", ev.Detail)
+		}
+	})
+	t.Run("a strategy switch whose fence fails", func(t *testing.T) {
+		db, ctx := seedDownHost(t, "ssh", nil)
+		c := newTestCoordinator("coordinator", db)
+		ipmi := false
+		c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+			if ipmi {
+				return fence.Result{Method: "ipmi", Detail: "BMC unreachable"}
+			}
+			return fence.Result{Method: "ssh", Detail: "ssh: connect: No route to host [path=managed]"}
+		})
+		now := time.Now()
+		c.Now = func() time.Time { return now }
+		c.run(ctx)
+		if _, _, open := unprovenCond(t, db); !open {
+			t.Fatal("setup: no condition raised")
+		}
+		if err := db.Execute(ctx, `UPDATE hosts SET fence_strategy = 'ipmi' WHERE name = 'down'`); err != nil {
+			t.Fatal(err)
+		}
+		ipmi = true
+		for i := 0; i < 6; i++ {
+			now = now.Add(5 * time.Minute)
+			holdLeaseThrough(t, db, ctx, now)
+			for _, o := range []string{"coordinator", "alive"} {
+				failingSince(t, db, o, now.Add(-time.Hour), now)
+			}
+			c.run(ctx)
+		}
+		if !strings.Contains(c.holdReason["down"], "BMC unreachable") {
+			t.Fatalf("setup: the ipmi fence did not run and fail (hold %q)", c.holdReason["down"])
+		}
+		_, ev, open := unprovenCond(t, db)
+		if !open {
+			t.Fatal("the condition resolved while the host is still unproven")
+		}
+		if !strings.Contains(ev.Detail, "ipmi fence of down failed (BMC unreachable)") || strings.Contains(ev.Detail, "lost power") {
+			t.Errorf("detail is not the current reason: %q", ev.Detail)
+		}
+		if strings.Contains(ev.Remedy, "--fence-strategy") {
+			t.Errorf("remedy still suggests a BMC strategy: %q", ev.Remedy)
+		}
+	})
 }

@@ -223,6 +223,7 @@ var dataDirOwned = []string{
 	"firewall-would-drop.json",   // daemon.go: firewall.NewWouldDropTally (its .tmp, dataDirOwnedPrefixes)
 	"firewall-initial-mode",      // daemon.go firewallInitialModeName: the founder's enforcement decision
 	"nic-guard-held",             // grpcapi/nic_guard_held.go heldGuestDir: guests held paused for their guards
+	"start-paused",               // grpcapi/start_paused_marker.go startPausedDir: starts the guard paused and has not finished (temps are .tmp-*, dot-names)
 	"promote-started",            // grpcapi/promote_serialize.go: an operator promotion's recorded start, per proof
 	"shared-disk-released",       // health/shared_disk_release.go sharedReleaseDir: shared disks released for a start
 	"move-unresolved",            // health/move_unresolved.go UnresolvedMoveDirName: volume moves whose config and row may disagree

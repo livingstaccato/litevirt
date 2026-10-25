@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Automation across voter-membership changes (F1 Task 5).
@@ -231,6 +232,22 @@ type automationEvidence struct {
 	members string
 	cursor  int64
 	voters  map[string]bool
+	// rescanAt is when the cursor last went back to 0.
+	rescanAt time.Time
+}
+
+// automationEvidenceRescanInterval: while evidence is incomplete, the scan
+// restarts from the generation's first anchor this often, so a certificate
+// upgraded in place below the cursor is counted. Each read stays bounded.
+var automationEvidenceRescanInterval = 5 * time.Minute
+
+// ResetAutomationEvidenceScan makes the next evidence read rescan from the
+// first anchor (evidence already counted stays: within a generation it only
+// grows). Called after a certified generation barrier.
+func (c *Client) ResetAutomationEvidenceScan() {
+	c.automationEvidence.mu.Lock()
+	c.automationEvidence.cursor = 0
+	c.automationEvidence.mu.Unlock()
 }
 
 // automationEvidencedVotersTx returns the members of cfg (by name, under
@@ -238,20 +255,25 @@ type automationEvidence struct {
 // certificate anchored at cfg's generation. It continues from the last anchor
 // it read, reading at most automationEvidencePages pages per call, so a
 // first read after a restart may undercount until it has caught up (fail
-// closed). A certificate upgraded in place below the cursor is not reread.
+// closed). Only the generation's own anchors are read. A certificate
+// upgraded in place below the cursor is counted after the next rescan
+// (ResetAutomationEvidenceScan, or automationEvidenceRescanInterval).
 func (c *Client) automationEvidencedVotersTx(ctx context.Context, tx *LocalTx, cfg *VoterConfig) (map[string]bool, error) {
 	ev := &c.automationEvidence
 	ev.mu.Lock()
 	defer ev.mu.Unlock()
 	if members := MembersHash(cfg.Members); ev.gen != cfg.Generation || ev.members != members || ev.voters == nil {
-		ev.gen, ev.members, ev.cursor, ev.voters = cfg.Generation, members, 0, map[string]bool{}
+		ev.gen, ev.members, ev.cursor, ev.voters, ev.rescanAt = cfg.Generation, members, 0, map[string]bool{}, time.Now()
+	}
+	if len(ev.voters) < len(cfg.Members) && time.Since(ev.rescanAt) >= automationEvidenceRescanInterval {
+		ev.cursor, ev.rescanAt = 0, time.Now()
 	}
 	for range automationEvidencePages {
 		if len(ev.voters) == len(cfg.Members) {
 			break
 		}
 		rows, err := tx.Query(ctx, `SELECT sequence, generation, certificate FROM local_automation_anchors
-			WHERE sequence > ? ORDER BY sequence LIMIT ?`, ev.cursor, automationEvidencePage)
+			WHERE sequence > ? AND generation = ? ORDER BY sequence LIMIT ?`, ev.cursor, cfg.Generation, automationEvidencePage)
 		if err != nil {
 			return nil, err
 		}

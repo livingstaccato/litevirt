@@ -150,6 +150,9 @@ type Proposer struct {
 	Transport Transport
 	// CallTimeout bounds each voter RPC. 0 → DefaultCallTimeout.
 	CallTimeout time.Duration
+	// AcceptTimeout, when set, bounds each phase-2 (Accept) RPC instead of
+	// CallTimeout; phase 1 keeps CallTimeout.
+	AcceptTimeout time.Duration
 	// Backoff is how long to wait before retrying after a ballot was refused
 	// as stale. Nil → a random 0–50ms, which is what breaks a duel.
 	Backoff func(attempt int) time.Duration
@@ -237,6 +240,13 @@ var errBallotBound = errors.New("claims: ballot already bound to another value i
 // DefaultCallTimeout bounds each voter RPC when CallTimeout is 0. The owner
 // probe's timing is budgeted against it (grpcapi claimProbeRefreshAge).
 const DefaultCallTimeout = 3 * time.Second
+
+func (p *Proposer) acceptTimeout() time.Duration {
+	if p.AcceptTimeout > 0 {
+		return p.AcceptTimeout
+	}
+	return p.callTimeout()
+}
 
 func (p *Proposer) callTimeout() time.Duration {
 	if p.CallTimeout > 0 {
@@ -518,7 +528,7 @@ func (p *Proposer) acceptAll(ctx context.Context, spec Spec, b corrosion.Ballot,
 	answers := make(chan answer, len(voters))
 	for _, t := range voters {
 		go func(voter string) {
-			cctx, cancel := context.WithTimeout(actx, p.callTimeout())
+			cctx, cancel := context.WithTimeout(actx, p.acceptTimeout())
 			defer cancel()
 			res, err := p.Transport.Accept(cctx, voter, spec.Key, b, v, spec.Generation)
 			answers <- answer{voter: voter, res: res, err: err}

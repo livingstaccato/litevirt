@@ -3,10 +3,14 @@ package fleet
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/grpcapi"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Gate evidence (F1 Task 5G follow-up B): the gate's imported-voter count
@@ -169,8 +173,154 @@ func TestAutomationGateEvidenceBarrierNeedsAuthority(t *testing.T) {
 func TestAutomationGateEvidenceBarriersFromEveryVoter(t *testing.T) {
 	m := importedElectorate(t)
 	for i := range 4 {
-		if err := m.Engine(i).GenerationBarrier(m.ctx, 2, 0); err != nil {
+		if err := m.Engine(i).GenerationBarrier(m.ctx, 2, "same-tag", nil); err != nil {
 			t.Fatalf("%s's barrier at generation 2: %v", m.cluster.Nodes[i].Name, err)
 		}
+	}
+}
+
+// refuseAccepts makes n refuse its next count AcceptRecoveryClaim calls at
+// once: alive (it still answers the import-source probe) but never signing.
+func refuseAccepts(n *Node, count int) {
+	for range count {
+		n.HookUnary("AcceptRecoveryClaim", func(ctx context.Context, req any, h grpc.UnaryHandler) (any, error) {
+			return nil, status.Error(codes.Unavailable, "injected refusal")
+		})
+	}
+}
+
+// d is blackholed: every claim RPC to it is held 30s and then refused. A
+// pass finds no missing member alive, certifies nothing, returns quickly, and
+// holds up no ordinary submit; repeated passes add no record.
+func TestAutomationGateEvidenceDeadMemberNoStormNoStall(t *testing.T) {
+	m := importedElectorate(t)
+	for _, n := range []*Node{m.a, m.b, m.c} {
+		m.cluster.SetLinkFaultBoth(m.d, n, LinkFault{ClaimDelay: 30 * time.Second})
+	}
+	// Evidence for a, b and c; d, the only member missing, is dead.
+	if _, err := m.Engine(0).Submit(m.ctx, m.Barrier(0, "evidence-without-d")); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.imported(t, m.a); got != 3 {
+		t.Fatalf("fixture: a counts %d, want 3", got)
+	}
+	head := m.Head(t, 0)
+	barrierDone := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		_ = m.a.Server.AutomationGenerationBarrier(m.ctx)
+		barrierDone <- time.Since(start)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	start := time.Now()
+	if _, err := m.Engine(0).Submit(m.ctx, m.Barrier(0, "ordinary-beside-a-dead-member")); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > 6*time.Second {
+		t.Fatalf("an ordinary submit beside the generation barrier took %v", took)
+	}
+	if took := <-barrierDone; took > 6*time.Second {
+		t.Fatalf("a generation barrier pass with a dead member took %v", took)
+	}
+	for range 5 {
+		m.a.Server.ResetGenerationBarrierBackoffForTest()
+		_ = m.a.Server.AutomationGenerationBarrier(m.ctx)
+	}
+	if h := m.Head(t, 0); h.Sequence != head.Sequence+1 {
+		t.Fatalf("head moved %d -> %d: barriers were certified for a dead member", head.Sequence, h.Sequence)
+	}
+}
+
+// d is alive but never signs: each pass would certify a record without it.
+// Attempts are capped per generation, membership and live missing set.
+func TestAutomationGateEvidenceBarrierAttemptsCapped(t *testing.T) {
+	m := importedElectorate(t)
+	refuseAccepts(m.d, 64)
+	head := m.Head(t, 0)
+	for range 8 {
+		m.a.Server.ResetGenerationBarrierBackoffForTest()
+		_ = m.a.Server.AutomationGenerationBarrier(m.ctx)
+	}
+	if added := m.Head(t, 0).Sequence - head.Sequence; added == 0 || added > 3 {
+		t.Fatalf("%d barrier records for one unchanged missing voter, want 1..3", added)
+	}
+}
+
+// A restarted voter's next barrier is a fresh request, not a replay of a
+// pre-restart one that returns a stored receipt and certifies nothing.
+func TestAutomationGateEvidenceBarrierAfterRestart(t *testing.T) {
+	m := importedElectorate(t)
+	refuseAccepts(m.d, 64)
+	head := m.Head(t, 0)
+	if err := m.a.Server.AutomationGenerationBarrier(m.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if h := m.Head(t, 0); h.Sequence != head.Sequence+1 {
+		t.Fatalf("fixture: first barrier did not certify: %d -> %d", head.Sequence, h.Sequence)
+	}
+	restarted := grpcapi.NewServerForTests(grpcapi.TestServerOpts{
+		HostName: m.a.Name, DataDir: filepath.Join(t.TempDir(), "restarted"), PKIDir: m.a.PKIDir, DB: m.a.DB, Virt: m.a.Virt,
+	})
+	restarted.SetPeerUnaryInterceptor(m.cluster.networkRPCClient())
+	restarted.SetAutomationEnforce(true)
+	if err := restarted.AutomationGenerationBarrier(m.ctx); err != nil {
+		t.Fatalf("barrier after restart: %v", err)
+	}
+	if h := m.Head(t, 0); h.Sequence != head.Sequence+2 {
+		t.Fatalf("barrier after restart certified nothing: head %d, want %d", h.Sequence, head.Sequence+2)
+	}
+}
+
+// b and c are missing and alive, d is missing and dead. The barrier certifies
+// with b and c without waiting on d, so neither it nor an ordinary submit
+// queued behind it is held for d's timeout.
+func TestAutomationGateEvidenceBarrierSkipsDeadVoters(t *testing.T) {
+	m := importedElectorate(t)
+	for _, n := range []*Node{m.a, m.b, m.c} {
+		m.cluster.SetLinkFaultBoth(m.d, n, LinkFault{ClaimDelay: 30 * time.Second})
+	}
+	barrierDone := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		if err := m.a.Server.AutomationGenerationBarrier(m.ctx); err != nil {
+			t.Error(err)
+		}
+		barrierDone <- time.Since(start)
+	}()
+	time.Sleep(2500 * time.Millisecond) // past the probes: the barrier holds the engine
+	start := time.Now()
+	if _, err := m.Engine(0).Submit(m.ctx, m.Barrier(0, "ordinary-behind-the-barrier")); err != nil {
+		t.Fatal(err)
+	}
+	// A dead member already costs an ordinary submit a few 750ms timeouts
+	// (recover, prepare, distribute); waiting out the barrier's 10s accept
+	// timeout on it as well would push this past 12s.
+	took := time.Since(start)
+	barrierTook := <-barrierDone
+	t.Logf("ordinary submit behind the barrier: %v; barrier: %v", took, barrierTook)
+	if took > 9*time.Second {
+		t.Fatalf("an ordinary submit behind the generation barrier took %v", took)
+	}
+	if barrierTook > 8*time.Second {
+		t.Fatalf("the generation barrier took %v with one dead member", barrierTook)
+	}
+	if got := m.imported(t, m.a); got != 3 {
+		t.Fatalf("a counts %d after the barrier, want 3 (a, b, c)", got)
+	}
+}
+
+// A pass has its own deadline: started with a context that has none (as the
+// daemon's adoption loop does), it returns by that deadline even when every
+// peer is blackholed.
+func TestAutomationGateEvidencePassHasADeadline(t *testing.T) {
+	m := importedElectorate(t)
+	for _, n := range []*Node{m.b, m.c, m.d} {
+		m.cluster.SetLinkFaultBoth(m.a, n, LinkFault{ClaimDelay: 30 * time.Second})
+	}
+	defer grpcapi.SetGenerationBarrierDeadlineForTest(500 * time.Millisecond)()
+	start := time.Now()
+	_ = m.a.Server.AutomationGenerationBarrier(context.Background())
+	if took := time.Since(start); took > 1500*time.Millisecond {
+		t.Fatalf("a pass with no caller deadline took %v, past its own 500ms deadline", took)
 	}
 }

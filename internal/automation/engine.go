@@ -116,8 +116,19 @@ func (e *Engine) decideAutomationUsing(ctx context.Context, cfg *corrosion.Voter
 	if p == nil {
 		p = claims.NewProposer(e.self, e.transport)
 	}
-	p.CallTimeout = callTimeout(ctx)
+	p.CallTimeout = defaultCallTimeout
+	p.AcceptTimeout = acceptTimeout(ctx)
 	spec := claims.Spec{Key: key, Generation: cfg.Generation, Voters: cfg.Names(), PrepareQuorum: corrosion.MajorityOf(len(cfg.Members)), MaxRounds: 8, Propose: propose, BeforeAccept: beforeAccept}
+	if skip := acceptSkip(ctx); skip != nil {
+		quorum := corrosion.MajorityOf(len(cfg.Members))
+		var targets []string
+		for _, v := range cfg.Names() {
+			if !skip[v] {
+				targets = append(targets, v)
+			}
+		}
+		spec.Electorate = func(corrosion.ClaimValue) ([]string, int) { return targets, quorum }
+	}
 	return p.Decide(ctx, spec)
 }
 

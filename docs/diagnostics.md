@@ -1575,6 +1575,21 @@ A leader on an earlier build neither raises nor resolves it, so one raised
 before the lease passes to such a leader stays open until a leader on this
 build takes over.
 
+### A BMC address with a bracket in it (`ha.fence.bmc_address_unsafe`)
+
+Evaluator `failover`, subject the host, severity warning, written by the
+failover lease holder. The host's stored IPMI address, or its Redfish endpoint,
+carries `[` or `]` other than around a plain IPv6 address (no zone).
+`lv host config` refuses such an address now, but one stored before is not
+inert: an earlier build wrote it raw into the fencing log rows of its
+`lv host fence`, where it could form the token a recovery reads its SSH trust
+decision from. This build counts that token only in balanced text, and writes
+the address with its brackets rewritten, but fix the stored address. The
+evidence names the `field`, the `value` (brackets rewritten) and the `remedy`:
+`lv host config <host> --ipmi-address <addr>`, or
+`--redfish-endpoint https://<host>[:port]`. `lv doctor fence` lists each such
+host. The condition resolves once the address is fixed, or the host removed.
+
 ### A fence held because nothing needs it (`ha.fence_held`)
 
 Evaluator `failover`, subject the host, severity warning, written by the

@@ -1123,7 +1123,9 @@ judged, with the path the fence took (a marked token such as
 later judgement of that fence, a new failover leader's included, uses it, so
 a fence judged untrusted stays held until `lv host fence-confirm <host>`.
 A fence row written before this release carries no marked token, so a
-recovery resumed from one needs `lv host fence-confirm <host>` too.
+recovery resumed from one needs `lv host fence-confirm <host>` too; a BMC
+address stored with a bracket, which those builds wrote raw into their rows,
+is flagged as `ha.fence.bmc_address_unsafe` until it is fixed.
 A recovery resting on a trusted fence needs the host to trust one still, so
 revoking the setting holds a recovery not yet made, an owed retry included,
 until the same confirmation.

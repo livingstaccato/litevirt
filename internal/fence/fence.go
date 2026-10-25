@@ -127,7 +127,7 @@ func RecordedTrustToken(detail string) (TrustRecord, bool) {
 		return TrustRecord{}, false
 	}
 	body := d[i+len(" [") : len(d)-1]
-	if strings.ContainsAny(body, "[]") {
+	if strings.ContainsAny(body, "[]") || !balancedBrackets(d[:i]) {
 		return TrustRecord{}, false
 	}
 	parts := strings.Split(body, ";")
@@ -144,6 +144,26 @@ func RecordedTrustToken(detail string) (TrustRecord, bool) {
 	}
 	r.Path = strings.TrimPrefix(parts[1], "path=")
 	return r, true
+}
+
+// balancedBrackets reports whether every "[" in s is closed, in order, by a
+// "]". Every row this build writes is (remote and admin-set text is written
+// through DetailField); a token inside an unclosed bracket is text an earlier
+// build wrote raw, such as an admin-set BMC address ending a row's target
+// note, and is not one.
+func balancedBrackets(s string) bool {
+	depth := 0
+	for _, r := range s {
+		switch r {
+		case '[':
+			depth++
+		case ']':
+			if depth--; depth < 0 {
+				return false
+			}
+		}
+	}
+	return depth == 0
 }
 
 // PinnedPath reports whether path is one that reaches the host over its
@@ -170,12 +190,13 @@ func DetailField(s string) string {
 }
 
 // remoteOutput is what the machine that answered an SSH fence printed, as a
-// fence detail records it: trimmed, with any "[path=" or "[trust=" rewritten
-// so that it cannot pass for the path token fenceSSH appends (RecordedPath)
-// or the trust token the coordinator appends (RecordedTrust).
+// fence detail records it: trimmed, with every bracket rewritten
+// (DetailField), so that it can neither pass for the path token fenceSSH
+// appends (RecordedPath) or the trust token the coordinator appends
+// (RecordedTrust), nor leave a bracket unbalanced, which would get a genuine
+// row's token refused.
 func remoteOutput(out []byte) string {
-	s := strings.ReplaceAll(strings.TrimSpace(string(out)), "[path=", "[path:")
-	return strings.ReplaceAll(s, "[trust=", "[trust:")
+	return DetailField(strings.TrimSpace(string(out)))
 }
 
 // HostConfig is the subset of corrosion.HostRecord fields needed for fencing.
@@ -629,7 +650,7 @@ func fenceSSH(ctx context.Context, h HostConfig, lenient bool) Result {
 	cmd := exec.CommandContext(ctx, sshBinary, args...)
 	out, runErr := cmd.CombinedOutput()
 	armed := sawFenceArmed(out)
-	detail := fmt.Sprintf("SSH forced poweroff to %s: %s%s", target, remoteOutput(out), path)
+	detail := fmt.Sprintf("SSH forced poweroff to %s: %s%s", DetailField(target), remoteOutput(out), path)
 
 	// Classification. A success requires the marker, always: it is the only
 	// evidence that OUR command ran on the target. An exit 0 without it means

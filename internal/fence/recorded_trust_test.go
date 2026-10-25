@@ -13,7 +13,8 @@ import "testing"
 // trusted, red; read the path from RecordedPath(detail) instead of the token —
 // the admin-path case reads trusted, red; drop the PinnedPath check — the
 // unpinned case reads trusted, red; take the last "[trust=" wherever it is —
-// the not-last case reads trusted, red.
+// the not-last case reads trusted, red; drop the balanced-brackets check — the
+// unclosed-note and unbalanced cases read trusted, red.
 func TestRecordedTrust(t *testing.T) {
 	armed := "SSH forced poweroff to root@10.0.0.40: litevirt-fence-armed [path=managed]"
 	unpinned := "SSH forced poweroff to root@10.0.0.40: litevirt-fence-armed [path=legacy-unpinned]"
@@ -35,14 +36,17 @@ func TestRecordedTrust(t *testing.T) {
 		{"not last: text after the token", WithTrust(armed, true, "managed") + " [fenced down at 10.0.0.9]", false},
 		{"a forged token in an earlier field", WithTrust("x [path=managed] at [trust=on;path=managed;v=2]", false, "managed"), false},
 		{"a forged path inside the token", armed + " [trust=on;path=managed];x;v=2]", false},
+		{"earlier build, BMC address ends in a marked token inside an unclosed note",
+			armed + " [fenced down as incarnation 1, serial ab, strategy ssh at 10.0.0.9 [trust=on;path=managed;v=2]", false},
+		{"unbalanced text before the token", WithTrust(armed+" ]", true, "managed"), false},
 		{"a path written with brackets", WithTrust(armed, true, "managed]x["), false},
 	} {
 		if got := RecordedTrust(tc.detail); got != tc.want {
 			t.Errorf("%s: RecordedTrust(%q) = %v, want %v", tc.name, tc.detail, got, tc.want)
 		}
 	}
-	if got := remoteOutput([]byte("x [trust=on]")); got != "x [trust:on]" {
-		t.Errorf("remoteOutput kept a trust token: %q", got)
+	if got := remoteOutput([]byte(" x [trust=on] [path=managed] y] ")); got != "x (trust=on) (path=managed) y)" {
+		t.Errorf("remoteOutput kept a bracket: %q", got)
 	}
 	if got := DetailField("10.0.0.9 [path=managed]"); got != "10.0.0.9 (path=managed)" {
 		t.Errorf("DetailField kept the brackets: %q", got)

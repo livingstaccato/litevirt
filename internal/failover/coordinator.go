@@ -1495,6 +1495,7 @@ func (c *Coordinator) run(ctx context.Context) {
 		c.alertStalledRecoveries(ctx, pending, unfenced)
 		c.resolveBridgedSettled(ctx, byHost, c.noteBridgedBeforeFence(ctx))
 		c.resolveUnprovenSettled(ctx, byHost)
+		c.syncUnsafeBMC(ctx)
 	}
 }
 

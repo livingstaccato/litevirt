@@ -194,3 +194,19 @@ func fenceRowsOf(t *testing.T, db *corrosion.Client) []string {
 	}
 	return out
 }
+
+// The reviewer's R4-1 probe: an earlier build's FenceHost row, written before
+// BMC addresses were validated, whose admin-set IPMI address ends in the
+// marked token body. The row then ends in a well-formed marked token, inside
+// the note's unclosed bracket. It does not count: the text before the token
+// must be balanced, as every row this build writes is.
+//
+// Mutation: drop the balanced-brackets check from RecordedTrustToken — the VM
+// moves, red.
+func TestTrustSSH_AnEarlierBuildsRowCannotForgeTheMarkedToken(t *testing.T) {
+	d := "SSH forced poweroff to root@10.0.0.40: litevirt-fence-armed [path=managed]" +
+		" [fenced down as incarnation 1, serial ab, strategy ssh at 10.0.0.9 [trust=on;path=managed;v=2]"
+	if got := heldOnRow(t, d); got != "down" {
+		t.Fatalf("VM recovered to %q on a row whose admin-set BMC address forges the marked token", got)
+	}
+}

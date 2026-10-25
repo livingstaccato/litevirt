@@ -101,7 +101,10 @@ func (s *Server) ResumeStrandedStarts(ctx context.Context) {
 		}
 		st, err := s.virt.DomainStateReason(vm)
 		switch {
-		case err != nil && lv.IsNotFound(err):
+		case err != nil && lv.IsNoDomain(err):
+			// libvirt's own VIR_ERR_NO_DOMAIN, and nothing else: any other
+			// error (a dropped connection, a driver's "not found") keeps the
+			// record, since the domain may still be paused.
 			s.unmarkStartPaused(vm) // no such domain here: nothing to finish
 			continue
 		case err == nil && st.Reason != "paused":
@@ -112,19 +115,31 @@ func (s *Server) ResumeStrandedStarts(ctx context.Context) {
 			s.unmarkStartPaused(vm) // its VM is gone, or another host's now
 			continue
 		}
-		// The record's incarnation must be the domain's: a same-name domain
-		// of another uuid (deleted and created again since) is not this
-		// start's, and is never resumed by it. One whose uuid cannot be told
-		// is not either.
-		if want, rerr := s.startPausedUUID(vm); rerr != nil || want == "" || !s.domainIsUUID(vm, want) {
-			err := fmt.Errorf("its start record names another incarnation than the domain here, or none (record uuid %q)", want)
-			slog.Error("start guard: not finishing a paused start: "+err.Error(), "vm", vm)
-			s.judgeStrandedStart(ctx, vm, err)
-			continue
-		}
+		// Something else holding it comes first: such a domain is left
+		// paused, and is not reported as a stranded start (review M3).
 		if !s.strandedStart(ctx, vm) {
 			slog.Warn("start guard: a start this daemon left paused is held by something else, or cannot be judged; it stays paused",
 				"vm", vm)
+			continue
+		}
+		// The record's incarnation must be the domain's: a same-name domain
+		// of another uuid (deleted and created again since) is not this
+		// start's, and is never resumed by it. A record that holds no uuid
+		// (the definition could not be read when the start was recorded)
+		// cannot show the domain is that start's, and is not resumed either.
+		want, rerr := s.startPausedUUID(vm)
+		var refuse error
+		switch {
+		case rerr != nil:
+			refuse = fmt.Errorf("its start record cannot be read: %w", rerr)
+		case want == "":
+			refuse = errors.New("its start record holds no readable domain uuid (the definition could not be read when the start was recorded), so the domain here cannot be shown to be that start's")
+		case !s.domainIsUUID(vm, want):
+			refuse = fmt.Errorf("its start record names another incarnation (uuid %s) than the domain here, or the domain's uuid cannot be read", want)
+		}
+		if refuse != nil {
+			slog.Error("start guard: not finishing a paused start: "+refuse.Error(), "vm", vm)
+			s.judgeStrandedStart(ctx, vm, refuse)
 			continue
 		}
 		err = s.readyGuestHere(ctx, vm, startingHere)

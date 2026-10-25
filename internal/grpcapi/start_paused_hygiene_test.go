@@ -3,12 +3,15 @@ package grpcapi
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	golibvirt "github.com/digitalocean/go-libvirt"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -32,7 +35,9 @@ func TestResumeStrandedStarts_DropsARecordWithNothingToFinish(t *testing.T) {
 			// libvirt's answer for a domain it does not know (the fake's own
 			// answer for one is "unknown", which other tests rely on).
 			fake.FailDomainStateReason = func(name string) error {
-				return fmt.Errorf("lookup domain %s: Domain not found: no domain with matching name '%s'", name, name)
+				// As libvirt.Client wraps it (domain.go): VIR_ERR_NO_DOMAIN.
+				return fmt.Errorf("lookup domain %s: %w", name,
+					golibvirt.Error{Code: uint32(golibvirt.ErrNoDomain), Message: "Domain not found: no domain with matching name '" + name + "'"})
 			}
 		},
 		"row gone": func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
@@ -127,7 +132,10 @@ func TestNICStartGuard_ARecordThatCannotBeWrittenLogsAnError(t *testing.T) {
 }
 
 // NB-R17: a half-written record (.tmp-*, a write the daemon died in) is
-// removed by the sweep, not kept for ever beside the records.
+// removed by the sweep, not kept for ever beside the records; a real record
+// beside it is left alone (review M4).
+//
+// Mutations: no removal — red; removing every file — red.
 func TestResumeStrandedStarts_RemovesHalfWrittenRecords(t *testing.T) {
 	s, _ := vlanStartServer(t)
 	dir := filepath.Join(s.dataDir, startPausedDir)
@@ -138,8 +146,109 @@ func TestResumeStrandedStarts_RemovesHalfWrittenRecords(t *testing.T) {
 	if err := os.WriteFile(tmp, []byte("vm1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	s.ResumeStrandedStarts(context.Background())
+	if err := s.markStartPaused("vm1"); err != nil {
+		t.Fatal(err)
+	}
+	s.removeHalfWrittenStartRecords()
 	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
 		t.Fatalf("the half-written record is still there: %v", err)
+	}
+	if marked, err := s.startPausedMarked("vm1"); !marked || err != nil {
+		t.Fatalf("a real record went with the temp files: %v, %v", marked, err)
+	}
+	if err := os.WriteFile(tmp, []byte("vm1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.ResumeStrandedStarts(context.Background())
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Fatalf("the sweep left the half-written record: %v", err)
+	}
+}
+
+// Only libvirt's own VIR_ERR_NO_DOMAIN drops a record (review I1): any other
+// failure to read the domain's state — a dropped connection, a driver error
+// that happens to say "not found" — keeps it, since the domain may still be
+// paused and need its start finished.
+//
+// Mutation: drop records on lv.IsNotFound (its text fallback) — red.
+func TestResumeStrandedStarts_KeepsTheRecordOnAnyOtherStateError(t *testing.T) {
+	s, fake := vlanStartServer(t)
+	fake.SetState("vm1", libvirtfake.StatePaused)
+	if err := s.markStartPaused("vm1"); err != nil {
+		t.Fatal(err)
+	}
+	fake.FailDomainStateReason = func(string) error {
+		return errors.New("internal error: storage driver not found for the connection")
+	}
+	s.ResumeStrandedStarts(context.Background())
+	if marked, _ := s.startPausedMarked("vm1"); !marked {
+		t.Fatal("a state error that only says \"not found\" dropped the record of a domain that may still be paused")
+	}
+}
+
+// A record that holds no uuid (its domain's definition could not be read when
+// the start was recorded) is never resumed by, whatever the domain here
+// reports — even a domain whose own uuid cannot be read either — and the
+// condition says the record holds no readable uuid (review M1, M2).
+//
+// Mutations: drop the want == "" guard — red; the old "another incarnation"
+// text for it — red.
+func TestResumeStrandedStarts_ARecordWithNoUUIDIsNeverResumed(t *testing.T) {
+	s, fake := vlanStartServer(t)
+	ctx := adminCtx()
+	if err := corrosion.UpdateVMState(ctx, s.db, "vm1", "running", ""); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetState("vm1", libvirtfake.StatePaused) // no definition: no uuid either side
+	if err := s.markStartPaused("vm1"); err != nil {
+		t.Fatal(err)
+	}
+	if u, _ := s.startPausedUUID("vm1"); u != "" {
+		t.Fatalf("the record holds uuid %q, want none for this test", u)
+	}
+	s.ResumeStrandedStarts(context.Background())
+	if st, _ := fake.RawState("vm1"); st != libvirtfake.StatePaused {
+		t.Fatalf("a record with no uuid was resumed: %v", st)
+	}
+	c, ok, err := corrosion.GetHealthCondition(ctx, s.db, StrandedStartEvaluator, CondStrandedStartPaused, "vm", "vm1@"+s.hostName)
+	if err != nil || !ok || !strings.Contains(c.Evidence, "no readable") {
+		t.Fatalf("condition %+v (found %v, %v): want it raised, saying the record holds no readable uuid", c, ok, err)
+	}
+}
+
+// A domain something else holds (partition pause) is not reported as a
+// stranded start even when its record names another incarnation: the hold
+// checks come first (review M3). It is never resumed either way.
+//
+// Mutation: the uuid refusal before the hold checks — red (a condition).
+func TestResumeStrandedStarts_AHeldDomainIsNotReportedForAUUIDMismatch(t *testing.T) {
+	s, fake := vlanStartServer(t)
+	ctx := adminCtx()
+	if err := corrosion.UpdateVMState(ctx, s.db, "vm1", "running", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.DefineDomain(`<domain type='kvm'><name>vm1</name><uuid>11111111-1111-1111-1111-111111111111</uuid></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.markStartPaused("vm1"); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetState("vm1", libvirtfake.StateShutdown)
+	if err := fake.UndefineDomain("vm1", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.DefineDomain(`<domain type='kvm'><name>vm1</name><uuid>22222222-2222-2222-2222-222222222222</uuid></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetState("vm1", libvirtfake.StatePaused)
+	if err := fake.MarkPartitionPaused("vm1", "tok-1"); err != nil {
+		t.Fatal(err)
+	}
+	s.ResumeStrandedStarts(context.Background())
+	if st, _ := fake.RawState("vm1"); st != libvirtfake.StatePaused {
+		t.Fatalf("resumed: %v", st)
+	}
+	if c, ok, _ := corrosion.GetHealthCondition(ctx, s.db, StrandedStartEvaluator, CondStrandedStartPaused, "vm", "vm1@"+s.hostName); ok {
+		t.Fatalf("a partition-paused domain was reported as a stranded start: %+v", c)
 	}
 }

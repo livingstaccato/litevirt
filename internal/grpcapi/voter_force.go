@@ -140,6 +140,11 @@ func (s *Server) planForcedReconfiguration(ctx context.Context, lostIn []string)
 	if !prev.Explicit() {
 		return nil, none, nil, nil, status.Error(codes.FailedPrecondition, "no voter generation with members is adopted; there is nothing to force")
 	}
+	// Before any signature is asked for: a forced generation imports from the
+	// survivors only (automation_membership.go).
+	if err := s.refuseWithoutAutomationRecoveryProof(ctx, "forced reconfiguration"); err != nil {
+		return nil, none, nil, nil, err
+	}
 	lost := dedupSorted(lostIn)
 	if len(lost) == 0 {
 		return nil, none, nil, nil, status.Error(codes.InvalidArgument, "--lost names at least one member of the adopted generation")
@@ -377,6 +382,11 @@ func (s *Server) remoteSignForced(ctx context.Context, host string, from int64, 
 // generation it replaces and signs. Peer-only.
 func (s *Server) SignForcedVoterConfig(ctx context.Context, req *pb.SignForcedVoterConfigRequest) (*pb.SignForcedVoterConfigResponse, error) {
 	if err := s.requirePeerCert(ctx); err != nil {
+		return nil, err
+	}
+	// Every survivor refuses on its own state, before it seals anything: a
+	// coordinator on another build cannot skip the planner's refusal.
+	if err := s.refuseWithoutAutomationRecoveryProof(ctx, "forced reconfiguration"); err != nil {
 		return nil, err
 	}
 	v := valueFromPB(&pb.RecoveryClaimValue{VoterConfig: req.GetValue()})

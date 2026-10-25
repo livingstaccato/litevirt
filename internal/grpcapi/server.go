@@ -559,6 +559,10 @@ type Server struct {
 	// that lets recovery_claim_v1 be advertised (with RecoveryClaimReadiness) and the
 	// reversible kill switch afterwards (recovery_claim_enforce.go).
 	enfRecoveryClaim atomic.Bool
+	// enfAutomation is enforcement.automation (default off): the flag that
+	// lets automation_v1 be advertised (automation_membership.go). It is not
+	// activation: the daemon's automation gate decides that.
+	enfAutomation atomic.Bool
 	// enfPartitionPause is enforcement.partition_pause (default on): this node
 	// pauses its recoverable workloads on losing the voter majority, so it may
 	// advertise partition_pause_v1 (docs/design/partition-pause.md §5).
@@ -1733,6 +1737,13 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.enfVRRPUnicast.Load() && !s.vrrpRowLatched.Load() {
 		caps = withoutCapability(caps, capabilities.VRRPUnicastV1)
 	}
+	// automation_v1 is withheld while enforcement.automation is off: every
+	// voter relies on every peer refusing automation votes until its adoption
+	// carried the complete prefix, so the latch has to mean config uniformity.
+	// See capabilities.AutomationV1 and TestAdvertise_AutomationWithheldWhileOff.
+	if !s.enfAutomation.Load() {
+		caps = withoutCapability(caps, capabilities.AutomationV1)
+	}
 	return caps
 }
 
@@ -2400,6 +2411,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfNetBoxMirror.Load()
 	case capabilities.VMReplaceV1:
 		return s.enfVMReplace.Load()
+	case capabilities.AutomationV1:
+		return s.enfAutomation.Load()
 	default:
 		return false
 	}

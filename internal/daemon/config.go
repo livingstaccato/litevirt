@@ -117,6 +117,12 @@ type Config struct {
 	// forwarded-identity switches live under Auth for historical reasons.)
 	Enforcement EnforcementConfig `yaml:"enforcement"`
 
+	// Automation is the `automation:` block (docs/configuration.md): the
+	// durability mode the automation service reports. It enables nothing; the
+	// service stays off until every readiness component holds
+	// (automation_gate.go).
+	Automation AutomationConfig `yaml:"automation"`
+
 	// Firewall is the `firewall:` block: this host's firewall log listener
 	// and store (docs/firewall.md, "Logging").
 	Firewall FirewallConfig `yaml:"firewall"`
@@ -941,6 +947,14 @@ type EnforcementConfig struct {
 	// fleet-wide before it forms, and after it those hosts report the token
 	// in PingResponse.not_enforcing and their peers raise ha_degraded.
 	RecoveryClaim bool `yaml:"recovery_claim,omitempty"`
+	// Automation: advertise automation_v1 (capabilities.AutomationV1), so the
+	// cluster can latch it once every host runs a build with automation and
+	// has this flag on. Default off; it is withheld while off because every
+	// voter relies on every peer refusing automation votes until its
+	// membership import is complete. Latching it does not enable the
+	// automation service: the readiness gate does, and stays closed until
+	// every readiness component exists.
+	Automation bool `yaml:"automation,omitempty"`
 	// PartitionPause: on losing the voter majority for T_pause (10 s), suspend
 	// every VM and freeze every container the failover coordinator would
 	// recover elsewhere, and resume them only once a majority of voters
@@ -1172,6 +1186,9 @@ func LoadConfig() (*Config, error) {
 		return nil, err
 	}
 	if err := cfg.Containers.validate(); err != nil {
+		return nil, err
+	}
+	if err := validateAutomationConfig(cfg.Automation); err != nil {
 		return nil, err
 	}
 	if err := cfg.Containers.validateHostAccess(cfg.DataDir, cfg.PKIDir); err != nil {

@@ -456,7 +456,7 @@ func (s *Server) importFromSealedMajority(ctx context.Context, prev *corrosion.V
 		return 0, from, fmt.Errorf("only %d of the %d sealed members of generation %d needed to import from "+
 			"answered (%s); retrying", len(from), need, prev.Generation, strings.Join(from, ","))
 	}
-	n, err := s.db.ImportClaimsAndAdopt(ictx, newGen, from, states)
+	n, err := s.importAutomationFromSealedMajority(ictx, newGen, from, states)
 	return n, from, err
 }
 
@@ -909,6 +909,11 @@ func (s *Server) ChangeVoterConfig(ctx context.Context, req *pb.ChangeVoterConfi
 			}
 		}
 	case corrosion.VoterChangeReset:
+		// A reset re-derives the voter set without importing from the old
+		// majority (automation_membership.go).
+		if err := s.refuseWithoutAutomationRecoveryProof(ctx, "voter reset"); err != nil {
+			return nil, err
+		}
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unknown voter change %q (init, add, rm or reset)", op)
 	}

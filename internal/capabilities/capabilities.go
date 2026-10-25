@@ -1505,12 +1505,16 @@ var supported = []string{
 	// adoption pass, never the token. See Release202701V1.
 	Release202701V1,
 	Release202702V1,
+	// AutomationV1 is advertised CONDITIONALLY on enforcement.automation
+	// (default off): every voter relies on every peer refusing automation
+	// votes until its adoption carried the complete prefix. See AutomationV1.
+	AutomationV1,
 }
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{VMSnapshotClaimV1, SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, LeaseTermClaimV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, VRRPUnicastV1, Release202611V1, SpecConflictV1, NetBoxIPRepointV1, UserIncarnationV1, ProjectIncarnationV1, Release202612V1, Release202701V1, Release202702V1}
+var all = []string{VMSnapshotClaimV1, SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, LeaseTermClaimV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, VRRPUnicastV1, Release202611V1, SpecConflictV1, NetBoxIPRepointV1, UserIncarnationV1, ProjectIncarnationV1, Release202612V1, Release202701V1, Release202702V1, AutomationV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -1618,6 +1622,11 @@ var replicationGated = map[string]bool{
 	// column's statement shapes on runtime_action_proofs must be decodable by
 	// every host we stream to. Not mandatory: the flag is the opt-in.
 	RecoveryClaimV1: true,
+	// Confirmed against every replication recipient: not a decode claim but a
+	// runtime one — a host parked in maintenance on a build without
+	// automation may still hold a managed VM, and must not be bypassed. Not
+	// mandatory: the flag is the opt-in. See AutomationV1.
+	AutomationV1: true,
 	// Confirmed against every replication recipient: not a decode claim but a
 	// READ one — every host that may hold a passworded guest, a maintenance
 	// host on an older build included, must read the password from the domain

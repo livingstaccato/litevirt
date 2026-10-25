@@ -897,7 +897,15 @@ func (c *Client) ClaimStatesForImport(ctx context.Context, gen int64) (ClaimImpo
 //
 // It refuses unless this node's adopted generation is newGen-1: the import is
 // relative to the generation it replaces.
+//
+// It never carries automation authority to newGen: a node adopting through
+// it (a forced generation, a test) is not automation-ready afterwards. The
+// ordinary certified transition uses ImportClaimsAndAdoptAutomation.
 func (c *Client) ImportClaimsAndAdopt(ctx context.Context, newGen int64, from []string, states []ClaimVoterState) (int, error) {
+	return c.importClaimsAndAdopt(ctx, newGen, from, states, false)
+}
+
+func (c *Client) importClaimsAndAdopt(ctx context.Context, newGen int64, from []string, states []ClaimVoterState, carryAutomation bool) (int, error) {
 	imported := 0
 	// Copy before any release gate or network owner can run. Import remains
 	// inert accepted state: it never creates this voter's signed lineage.
@@ -986,6 +994,11 @@ func (c *Client) ImportClaimsAndAdopt(ctx context.Context, newGen int64, from []
 					return err
 				}
 				imported++
+			}
+		}
+		if carryAutomation {
+			if err := carryAutomationAuthorityTx(ctx, tx, c.hostName, newGen); err != nil {
+				return err
 			}
 		}
 		return recordAdoptionTx(ctx, tx, newGen, from)

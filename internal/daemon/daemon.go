@@ -70,6 +70,10 @@ const grpcMaxMsgSize = 64 << 20 // 64 MiB
 
 // Daemon is the main litevirtd process.
 type Daemon struct {
+	// automationGate decides whether this node may enable the automation
+	// service (automation_gate.go). The public automation service (F1 Task 8)
+	// reads it; nothing in this build enables the service.
+	automationGate *AutomationGate
 	// captureReg is the host's memory snapshot capture registry, shared by
 	// the gRPC server, the partition pauser and the settle.
 	captureReg *libvirt.CaptureRegistry
@@ -1555,6 +1559,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// partition_pause_v1: advertised only with enforcement.partition_pause on
 		// (default on), because the majority relies on this node pausing.
 		svc.SetPartitionPause(d.cfg.Enforcement.PartitionPause)
+		// automation_v1: advertised only with enforcement.automation on, and
+		// even latched it enables nothing: the gate needs every readiness
+		// component, and the later tasks' components do not exist yet.
+		svc.SetAutomationEnforce(d.cfg.Enforcement.Automation)
+		d.automationGate = &AutomationGate{
+			Mode: d.cfg.Automation.DurabilityMode,
+			Enforced: func() bool {
+				return d.cfg.Enforcement.Automation && d.checker.DurablyLatched(capabilities.AutomationV1)
+			},
+			Origin: func(ctx context.Context) (bool, string, error) {
+				_, ok, err := corrosion.GetAutomationOrigin(ctx, d.db)
+				return ok, "", err
+			},
+			Membership: svc.AutomationMembershipStatus,
+		}
 		// Resource pressure (docs/configuration.md, "Resource pressure"): this
 		// host grades its own resources and Ready reports the grade. It reports
 		// only; with pressure.enabled false nothing is sampled and peers read this
@@ -2069,6 +2088,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// networks.
 		go svc.SeedFirewallEnforcementLoop(ctx, 0, filepath.Join(d.cfg.DataDir, firewallInitialModeName))
 		go svc.SeedFirewallSynfloodLoop(ctx, 0, filepath.Join(d.cfg.DataDir, firewallSynfloodDecisionName))
+		// And that it was founded on a build with automation: the origin the
+		// automation gate requires (no older cluster is ever adopted).
+		go svc.SeedAutomationOriginLoop(ctx, 0, filepath.Join(d.cfg.DataDir, automationOriginName))
 		svc.StartDHCPReservations(ctx, 0)
 
 		// Converge this host's network devices on the replicated networks table
@@ -3593,6 +3615,12 @@ const genesisMarkerName = "genesis-pending"
 // (grpcapi.SeedFirewallEnforcementLoop).
 const firewallInitialModeName = "firewall-initial-mode"
 
+// automationOriginName is the founder's genesis record that the cluster was
+// founded on a build with automation (seedAdminUser). Its loop
+// (grpcapi.SeedAutomationOriginLoop) replicates it as the automation_origin
+// cluster policy and removes the file.
+const automationOriginName = "automation-origin"
+
 // firewallSynfloodDecisionName is the founder's genesis decision to protect
 // guest NICs from SYN floods, in data_dir, consumed once recorded
 // (grpcapi.SeedFirewallSynfloodLoop).
@@ -3740,6 +3768,16 @@ func (d *Daemon) seedAdminUser(ctx context.Context) error {
 	if err := os.WriteFile(filepath.Join(d.cfg.DataDir, firewallSynfloodDecisionName),
 		[]byte(corrosion.SynfloodOn+"\n"), 0o600); err != nil {
 		slog.Warn("could not record the new cluster's SYN-flood protection; it stays off until `lv firewall synflood on`",
+			"error", err)
+	}
+
+	// And that it is founded on a build with automation: the origin record the
+	// automation gate requires, recorded by its own loop once cluster_policies
+	// can be written. A cluster founded before this build has none and is
+	// never automation-ready (there is no cutover for it).
+	if err := os.WriteFile(filepath.Join(d.cfg.DataDir, automationOriginName),
+		[]byte(d.cfg.HostName+"\n"), 0o600); err != nil {
+		slog.Warn("could not record the new cluster's automation origin; it is not automation-ready",
 			"error", err)
 	}
 

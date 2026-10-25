@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -326,6 +328,44 @@ func HostUpgrade(ctx context.Context, client pb.LiteVirtClient, opts UpgradeOpts
 	}
 	if failures > 0 {
 		return fmt.Errorf("%d host(s) failed to upgrade", failures)
+	}
+	return nil
+}
+
+// HostPreflightUpgrade reports, on w, what would block or warn an upgrade of
+// host to this build, without performing it: the daemon's preflight
+// findings, and the same enforcement.fence_ssh check `lv host upgrade` runs
+// (checkFenceSSHModes), which a daemon on the old build cannot make for the
+// new one. It returns an error when either blocks.
+func HostPreflightUpgrade(ctx context.Context, client pb.LiteVirtClient, host string, w io.Writer) error {
+	resp, err := client.PreflightUpgrade(ctx, &pb.PreflightUpgradeRequest{TargetHost: host})
+	if err != nil {
+		return fmt.Errorf("preflight: %w", err)
+	}
+	if resp.Host != "" {
+		host = resp.Host
+	}
+	blocking := 0
+	for _, f := range resp.Findings {
+		if f.Severity == "block" {
+			blocking++
+		}
+	}
+	findings := slices.Clone(resp.Findings)
+	if ferr := checkFenceSSHModes(ctx, client, []*pb.Host{{Name: host}}); ferr != nil {
+		findings = append(findings, &pb.PreflightFinding{Severity: "block", Code: "fence_ssh_legacy", Message: ferr.Error()})
+		blocking++
+	}
+	if len(findings) == 0 {
+		fmt.Fprintf(w, "Host %s: no findings, upgrade is safe.\n", host)
+		return nil
+	}
+	fmt.Fprintf(w, "Host %s preflight findings:\n", host)
+	for _, f := range findings {
+		fmt.Fprintf(w, "  [%s] %s: %s\n", f.Severity, f.Code, f.Message)
+	}
+	if !resp.Ok || blocking > 0 {
+		return fmt.Errorf("upgrade blocked by %d finding(s)", blocking)
 	}
 	return nil
 }

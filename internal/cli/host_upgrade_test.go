@@ -600,3 +600,31 @@ func TestUpgradeOneHost_FallbackVersion(t *testing.T) {
 
 // Ensure unused imports don't break (emptypb used by full LiteVirtClient interface).
 var _ = (*emptypb.Empty)(nil)
+
+// `lv host preflight-upgrade` runs the enforcement.fence_ssh check `lv host
+// upgrade` runs: it said "no findings, upgrade is safe" for a node on
+// legacy, which the upgrade then refused (rc8 lab F3). A target on legacy,
+// and another member on legacy, are each a blocking finding; a clean cluster
+// is still safe.
+//
+// Mutation: drop checkFenceSSHModes from HostPreflightUpgrade — both legacy
+// cases report "upgrade is safe", red.
+func TestHostPreflightUpgrade_RefusesLegacyFenceSSH(t *testing.T) {
+	hosts := []*pb.Host{{Name: "node1"}, {Name: "node2"}}
+	for _, legacy := range []string{"node1", "node2"} {
+		client := &mockUpgradeClient{hosts: hosts, fenceModes: map[string]string{legacy: "legacy"}}
+		var out strings.Builder
+		err := HostPreflightUpgrade(context.Background(), client, "node1", &out)
+		if err == nil || strings.Contains(out.String(), "upgrade is safe") {
+			t.Fatalf("%s on legacy: %v, %q; want a blocking finding", legacy, err, out.String())
+		}
+		if !strings.Contains(out.String(), "[block] fence_ssh_legacy: ") || !strings.Contains(out.String(), legacy) {
+			t.Errorf("%s on legacy: %q, want the fence_ssh_legacy finding naming it", legacy, out.String())
+		}
+	}
+	var out strings.Builder
+	if err := HostPreflightUpgrade(context.Background(), &mockUpgradeClient{hosts: hosts}, "node1", &out); err != nil ||
+		!strings.Contains(out.String(), "Host node1: no findings, upgrade is safe.") {
+		t.Fatalf("clean cluster: %v, %q", err, out.String())
+	}
+}

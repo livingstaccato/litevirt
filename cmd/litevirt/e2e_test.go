@@ -739,6 +739,16 @@ func (m *mockClient) PreflightUpgrade(_ context.Context, _ *pb.PreflightUpgradeR
 	return &pb.PreflightUpgradeResponse{Ok: true}, nil
 }
 
+// GetFenceSSHStatus reports every host on enforcement.fence_ssh auto, for the
+// fence_ssh check `lv host preflight-upgrade` makes.
+func (m *mockClient) GetFenceSSHStatus(_ context.Context, _ *pb.FenceSSHStatusRequest, _ ...grpc.CallOption) (*pb.FenceSSHStatus, error) {
+	st := &pb.FenceSSHStatus{}
+	for _, h := range m.hosts {
+		st.Nodes = append(st.Nodes, &pb.FenceSSHNode{Host: h.Name, Reachable: true, Mode: "auto"})
+	}
+	return st, nil
+}
+
 // federation mocks.
 func (m *mockClient) ListRegions(_ context.Context, _ *pb.ListRegionsRequest, _ ...grpc.CallOption) (*pb.ListRegionsResponse, error) {
 	return &pb.ListRegionsResponse{}, nil

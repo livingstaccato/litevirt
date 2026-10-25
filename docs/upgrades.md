@@ -722,6 +722,8 @@ target would not start on this build, and a member left on its binary publishes
 no fence SSH row, so once the token latches an upgraded host refuses to fence it
 and its workloads are not recovered if it fails. Set `enforcement.fence_ssh` to
 `auto` or `managed` in that host's config and restart its daemon, then upgrade.
+`lv host preflight-upgrade` makes the same check and lists a member on `legacy`
+as a blocking `fence_ssh_legacy` finding.
 A member that does not report its mode is upgraded past with a warning. The mode
 read is the one the daemon started with, so a config changed to `legacy` since
 then is caught only when the new daemon starts. `lv host add` refuses to copy an

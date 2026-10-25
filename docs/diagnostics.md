@@ -1346,6 +1346,24 @@ old (stale: its scan has stopped, or no node holds its lease), an evaluator
 with incomplete coverage, an incomplete capacity sample, and a link not
 proven good.
 
+Under the conditions table it prints, for each open condition whose evidence
+carries one, its `detail` and its `remedy`, indented and wrapped (a command
+in backticks is never split), so what is wrong and what to do are on screen
+without reading the evidence JSON:
+
+```
+ha.recovery.unproven_fence on host/node-5:
+    detail: the recovery of node-5 is held: the SSH fence of node-5 failed (ssh: connect: No route
+            to host), so nothing proves node-5 is off; the fence is retried with backoff, and an SSH
+            fence cannot reach a host that has lost power. Its workloads are not started elsewhere
+            until node-5 is proven off, so nothing runs twice
+    remedy: once node-5 is powered off, `lv host fence-confirm node-5`, and the recovery resumes
+            from it. To recover at once next time, give it a fence that proves a power-off:
+            `lv host config node-5 --fence-strategy ipmi|redfish`
+```
+
+A `vm.move_unresolved` condition prints its moves instead (see below).
+
 Peer connectivity counts toward that state: a link the checker cannot prove
 good is a coverage gap, so a `suspect` or `failing` edge reads DEGRADED
 rather than being reported and ignored. Links whose **target is in

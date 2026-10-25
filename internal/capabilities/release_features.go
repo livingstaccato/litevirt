@@ -86,7 +86,7 @@ type FeatureInfo struct {
 // after the latch marks it used. Its other data, the cluster failback policy,
 // is nothing failback can act on without those records, so it shares the bit.
 var releaseFeatures = map[Feature]FeatureInfo{
-	FeatureAutomationState:              {Token: AutomationV1, Description: "Automation authority, certified automation history and automation claim state"},
+	FeatureAutomationState:              {Token: AutomationV1, Description: "Automation authority, certified automation history and automation claim state", Writers: []string{"internal/corrosion.Client.AutomationBeginImport", "internal/corrosion.Client.AutomationGrantImportedAuthority"}},
 	FeatureAutomationIdentityContinuity: {Token: Release202702V1, Description: "Certified continuity of an existing automation identity and its current parent lifetime", Writers: []string{"internal/corrosion.Client.claimAcceptContinuityWithGrant", "internal/corrosion.Client.materializeAutomationContinuity", "internal/corrosion.Client.importAutomationContinuity"}},
 	FeatureVMLimits: {Token: Release202611V1, Description: "Per-VM CPU limit and shares, and NIC bandwidth limits",
 		Writers: []string{"internal/grpcapi.admitLimitedSpec", "internal/grpcapi.admitLimitUpdate",
@@ -307,7 +307,8 @@ const MarkerRollbackKey = "rollback"
 // "nothing written that a previous build cannot keep". AutomationV1 is one in
 // that sense: it is advertised on the build and so latches on every cluster,
 // and its one feature (automation_state) is the used bit every first write of
-// automation state must record first; this build has no such writer.
+// automation state must record first. Its writers are the new-voter
+// certified-prefix import (corrosion AutomationBeginImport, AutomationGrantImportedAuthority).
 var rollbackRules = map[string]string{
 	AutomationV1:    RollbackSafeIfUnused,
 	Release202611V1: RollbackSafeIfUnused,

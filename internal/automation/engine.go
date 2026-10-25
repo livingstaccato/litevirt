@@ -476,6 +476,13 @@ func (e *Engine) recoverIntermediate(ctx context.Context, cfg *corrosion.VoterCo
 }
 
 func (e *Engine) resumeRecovery(ctx context.Context, cfg *corrosion.VoterConfig) error {
+	return e.stagePredecessors(ctx, cfg.Names())
+}
+
+// stagePredecessors fetches each predecessor the pending staged job needs
+// from any of voters, stages it, and applies the job once it connects to the
+// local prefix.
+func (e *Engine) stagePredecessors(ctx context.Context, voters []string) error {
 	for range 256 {
 		next, err := e.db.AutomationRecoveryNext(ctx)
 		if err != nil {
@@ -485,7 +492,7 @@ func (e *Engine) resumeRecovery(ctx context.Context, cfg *corrosion.VoterConfig)
 			return e.db.AutomationFinishRecovery(ctx, reduce, 256)
 		}
 		found := false
-		for _, v := range cfg.Names() {
+		for _, v := range voters {
 			call, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
 			r, ok, err := e.transport.Fetch(call, v, next)
 			cancel()

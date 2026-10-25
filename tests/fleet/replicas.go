@@ -224,6 +224,7 @@ func (c *Cluster) LinkStats(from, to *Node) LinkStats {
 var claimMethods = map[string]bool{
 	"GetAutomationDecision":     true,
 	"InstallAutomationDecision": true,
+	"GetAutomationImportSource": true,
 	"PrepareRecoveryClaim":      true,
 	"AcceptRecoveryClaim":       true,
 	"GetRecoveryClaim":          true,

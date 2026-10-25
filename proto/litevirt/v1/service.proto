@@ -3090,6 +3090,21 @@ message GetAutomationDecisionResponse { bytes record_json = 1; bool found = 2; }
 message InstallAutomationDecisionRequest { bytes record_json = 1; }
 message InstallAutomationDecisionResponse { uint64 applied_sequence = 1; }
 
+// A voter new to the automation electorate asks each member of the previous
+// generation whether it holds automation authority at the requested (its own
+// adopted) generation and what certified head it holds (F1 Task 5G). Direct
+// peer mTLS only; the caller must be a member of that generation. Read-only.
+message GetAutomationImportSourceRequest { int64 generation = 1; }
+message GetAutomationImportSourceResponse {
+    string voter = 1;
+    string incarnation = 2;        // the source's voter incarnation
+    int64 adopted_generation = 3;  // the source's adopted voter generation
+    bool authority = 4;            // automation authority at adopted_generation == requested generation
+    uint64 head_sequence = 5;      // certified automation head (0 when authority is false)
+    string head_digest = 6;
+    string cluster_uid = 7;        // automation cluster of the certified head
+}
+
 message RecoveryClaimKey {
     string target_kind = 1;  // vm | container | voter_config | lun | lease_term
     string target_name = 2;  // workload, LUN or lease name; "" for voter_config
@@ -5259,6 +5274,7 @@ service LiteVirt {
     rpc ImportAutomationCustodyEquality(ImportAutomationCustodyEqualityRequest) returns (ImportAutomationCustodyEqualityResponse);
     rpc GetAutomationDecision(GetAutomationDecisionRequest) returns (GetAutomationDecisionResponse);
     rpc InstallAutomationDecision(InstallAutomationDecisionRequest) returns (InstallAutomationDecisionResponse);
+    rpc GetAutomationImportSource(GetAutomationImportSourceRequest) returns (GetAutomationImportSourceResponse);
     rpc PrepareRecoveryClaim(PrepareRecoveryClaimRequest) returns (PrepareRecoveryClaimResponse);
     rpc AcceptRecoveryClaim(AcceptRecoveryClaimRequest) returns (AcceptRecoveryClaimResponse);
     // Read-only: a voter's recorded state for one key, its incarnation and

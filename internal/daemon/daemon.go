@@ -4524,7 +4524,7 @@ const voterAdoptionInterval = 5 * time.Second
 func (d *Daemon) runVoterAdoption(ctx context.Context, svc *grpcapi.Server) {
 	t := time.NewTicker(voterAdoptionInterval)
 	defer t.Stop()
-	var lastErr string
+	var lastErr, lastImportErr string
 	for {
 		if _, err := svc.AdoptVoterConfigs(ctx); err != nil {
 			if err.Error() != lastErr {
@@ -4534,12 +4534,33 @@ func (d *Daemon) runVoterAdoption(ctx context.Context, svc *grpcapi.Server) {
 		} else {
 			lastErr = ""
 		}
+		lastImportErr = d.importAutomationPrefix(ctx, svc, lastImportErr)
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		}
 	}
+}
+
+// importAutomationPrefix runs one pass of the new-voter certified-prefix
+// import (F1 Task 5G) after an adoption pass. A voter that already holds
+// automation authority, or may not import, returns at once after a local
+// read. It returns the error text to compare the next pass against.
+func (d *Daemon) importAutomationPrefix(ctx context.Context, svc *grpcapi.Server, last string) string {
+	err := svc.ImportAutomationPrefix(ctx)
+	switch {
+	case err == nil:
+		if last != "" {
+			slog.Info("automation: imported the certified automation prefix; this voter holds automation authority")
+		}
+		return ""
+	case errors.Is(err, corrosion.ErrAutomationImportIneligible):
+		return ""
+	case err.Error() != last:
+		slog.Warn("automation: certified prefix import did not complete; retrying", "error", err)
+	}
+	return err.Error()
 }
 
 func (d *Daemon) wireLeaseTermLedgerGate() {

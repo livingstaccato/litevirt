@@ -314,6 +314,7 @@ const (
 	LiteVirt_ImportAutomationCustodyEquality_FullMethodName   = "/litevirt.v1.LiteVirt/ImportAutomationCustodyEquality"
 	LiteVirt_GetAutomationDecision_FullMethodName             = "/litevirt.v1.LiteVirt/GetAutomationDecision"
 	LiteVirt_InstallAutomationDecision_FullMethodName         = "/litevirt.v1.LiteVirt/InstallAutomationDecision"
+	LiteVirt_GetAutomationImportSource_FullMethodName         = "/litevirt.v1.LiteVirt/GetAutomationImportSource"
 	LiteVirt_PrepareRecoveryClaim_FullMethodName              = "/litevirt.v1.LiteVirt/PrepareRecoveryClaim"
 	LiteVirt_AcceptRecoveryClaim_FullMethodName               = "/litevirt.v1.LiteVirt/AcceptRecoveryClaim"
 	LiteVirt_GetRecoveryClaim_FullMethodName                  = "/litevirt.v1.LiteVirt/GetRecoveryClaim"
@@ -926,6 +927,7 @@ type LiteVirtClient interface {
 	ImportAutomationCustodyEquality(ctx context.Context, in *ImportAutomationCustodyEqualityRequest, opts ...grpc.CallOption) (*ImportAutomationCustodyEqualityResponse, error)
 	GetAutomationDecision(ctx context.Context, in *GetAutomationDecisionRequest, opts ...grpc.CallOption) (*GetAutomationDecisionResponse, error)
 	InstallAutomationDecision(ctx context.Context, in *InstallAutomationDecisionRequest, opts ...grpc.CallOption) (*InstallAutomationDecisionResponse, error)
+	GetAutomationImportSource(ctx context.Context, in *GetAutomationImportSourceRequest, opts ...grpc.CallOption) (*GetAutomationImportSourceResponse, error)
 	PrepareRecoveryClaim(ctx context.Context, in *PrepareRecoveryClaimRequest, opts ...grpc.CallOption) (*PrepareRecoveryClaimResponse, error)
 	AcceptRecoveryClaim(ctx context.Context, in *AcceptRecoveryClaimRequest, opts ...grpc.CallOption) (*AcceptRecoveryClaimResponse, error)
 	// Read-only: a voter's recorded state for one key, its incarnation and
@@ -4439,6 +4441,16 @@ func (c *liteVirtClient) InstallAutomationDecision(ctx context.Context, in *Inst
 	return out, nil
 }
 
+func (c *liteVirtClient) GetAutomationImportSource(ctx context.Context, in *GetAutomationImportSourceRequest, opts ...grpc.CallOption) (*GetAutomationImportSourceResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetAutomationImportSourceResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_GetAutomationImportSource_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) PrepareRecoveryClaim(ctx context.Context, in *PrepareRecoveryClaimRequest, opts ...grpc.CallOption) (*PrepareRecoveryClaimResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PrepareRecoveryClaimResponse)
@@ -5727,6 +5739,7 @@ type LiteVirtServer interface {
 	ImportAutomationCustodyEquality(context.Context, *ImportAutomationCustodyEqualityRequest) (*ImportAutomationCustodyEqualityResponse, error)
 	GetAutomationDecision(context.Context, *GetAutomationDecisionRequest) (*GetAutomationDecisionResponse, error)
 	InstallAutomationDecision(context.Context, *InstallAutomationDecisionRequest) (*InstallAutomationDecisionResponse, error)
+	GetAutomationImportSource(context.Context, *GetAutomationImportSourceRequest) (*GetAutomationImportSourceResponse, error)
 	PrepareRecoveryClaim(context.Context, *PrepareRecoveryClaimRequest) (*PrepareRecoveryClaimResponse, error)
 	AcceptRecoveryClaim(context.Context, *AcceptRecoveryClaimRequest) (*AcceptRecoveryClaimResponse, error)
 	// Read-only: a voter's recorded state for one key, its incarnation and
@@ -6884,6 +6897,9 @@ func (UnimplementedLiteVirtServer) GetAutomationDecision(context.Context, *GetAu
 }
 func (UnimplementedLiteVirtServer) InstallAutomationDecision(context.Context, *InstallAutomationDecisionRequest) (*InstallAutomationDecisionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method InstallAutomationDecision not implemented")
+}
+func (UnimplementedLiteVirtServer) GetAutomationImportSource(context.Context, *GetAutomationImportSourceRequest) (*GetAutomationImportSourceResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetAutomationImportSource not implemented")
 }
 func (UnimplementedLiteVirtServer) PrepareRecoveryClaim(context.Context, *PrepareRecoveryClaimRequest) (*PrepareRecoveryClaimResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PrepareRecoveryClaim not implemented")
@@ -12079,6 +12095,24 @@ func _LiteVirt_InstallAutomationDecision_Handler(srv interface{}, ctx context.Co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_GetAutomationImportSource_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetAutomationImportSourceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetAutomationImportSource(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetAutomationImportSource_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetAutomationImportSource(ctx, req.(*GetAutomationImportSourceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_PrepareRecoveryClaim_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(PrepareRecoveryClaimRequest)
 	if err := dec(in); err != nil {
@@ -14361,6 +14395,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "InstallAutomationDecision",
 			Handler:    _LiteVirt_InstallAutomationDecision_Handler,
+		},
+		{
+			MethodName: "GetAutomationImportSource",
+			Handler:    _LiteVirt_GetAutomationImportSource_Handler,
 		},
 		{
 			MethodName: "PrepareRecoveryClaim",

@@ -26,7 +26,7 @@ import (
 // verified. A lagging carried voter refuses to accept beyond its own certified
 // parent until it catches up through the existing authenticated prefix fetch.
 // A voter NEW to the electorate holds no prefix and gets no authority here; it
-// needs the receiver transfer finalizer, which this build does not have.
+// gains both through the certified-prefix import (automation_import.go).
 
 // ImportClaimsAndAdoptAutomation is ImportClaimsAndAdopt for an ordinary
 // certified transition: the same merge and adoption, and in the same

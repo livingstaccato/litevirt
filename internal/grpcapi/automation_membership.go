@@ -31,7 +31,8 @@ import (
 //     state (corrosion refuseResetTx), whichever node coordinates it;
 //   - a voter new to the electorate adopts the generation but holds no
 //     authority, so it refuses every automation vote and reports
-//     automation_import_absent until a complete prefix import exists for it.
+//     automation_import_absent until its certified-prefix import from the
+//     old majority grants it (ImportAutomationPrefix, automation_import.go).
 
 // SetAutomationEnforce sets enforcement.automation: whether this node
 // enforces automation_v1 (tokenEnabled, not_enforcing). automation_v1 itself

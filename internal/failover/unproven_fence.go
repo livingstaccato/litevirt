@@ -92,8 +92,8 @@ func (c *Coordinator) raiseUnproven(ctx context.Context, h *corrosion.HostRecord
 // which the recovery resumes from; for a host whose fence does not go through
 // a BMC, a fence strategy that proves a power-off next time; and, for a
 // confirmed SSH power-off on a host that does not trust one, the trust
-// opt-in, as the operator's choice it is. The opt-in does not reach back: a
-// fence already judged not proof stays held until the confirmation.
+// opt-in, as the operator's choice it is. The opt-in never reaches back: a
+// fence judged untrusted stays held until the confirmation (fence.RecordedTrust).
 func unprovenRemedy(h *corrosion.HostRecord, sshConfirmed bool) string {
 	out := fmt.Sprintf("once %s is powered off, `lv host fence-confirm %s`, and the recovery resumes from it", h.Name, h.Name)
 	switch fence.ResolveStrategy(h.FenceStrategy) {
@@ -102,10 +102,14 @@ func unprovenRemedy(h *corrosion.HostRecord, sshConfirmed bool) string {
 		out += fmt.Sprintf(". To recover at once next time, give it a fence that proves a power-off: "+
 			"`lv host config %s --fence-strategy ipmi|redfish`", h.Name)
 	}
-	if sshConfirmed && !trustsSSHPoweroff(h) {
+	switch {
+	case sshConfirmed && trustsSSHPoweroff(h):
+		out += fmt.Sprintf(". %s now trusts a confirmed SSH power-off: that counts later fences, never this one, "+
+			"which was judged before it and still needs `lv host fence-confirm %s`", h.Name, h.Name)
+	case sshConfirmed:
 		out += fmt.Sprintf(". An operator who accepts the risk that a host ignores or does not finish a confirmed SSH "+
-			"power-off may instead set `lv host config %s --trust-ssh-poweroff` (not a recommendation): it counts a later "+
-			"fence's confirmed power-off, not this one, which still needs `lv host fence-confirm %s`", h.Name, h.Name)
+			"power-off may instead set `lv host config %s --trust-ssh-poweroff` (not a recommendation): it counts later "+
+			"fences, never this one, which still needs `lv host fence-confirm %s`", h.Name, h.Name)
 	}
 	return out
 }

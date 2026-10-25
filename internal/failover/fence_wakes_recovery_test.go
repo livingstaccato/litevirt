@@ -36,7 +36,10 @@ func ageFenceRows(t *testing.T, db *corrosion.Client, ctx context.Context, d tim
 func operatorFences(t *testing.T, db *corrosion.Client, ctx context.Context) {
 	t.Helper()
 	if err := corrosion.RecordFenceWithState(ctx, db, corrosion.FenceLogRecord{
-		ID: "operator-ssh-down", HostName: "down", Method: "ssh", Result: fence.LogFenced, Detail: "operator fence [path=managed]",
+		// As FenceHost records it for a host that trusts a confirmed SSH
+		// power-off (the fixtures' trustSSH): the decision rides in the row.
+		ID: "operator-ssh-down", HostName: "down", Method: "ssh", Result: fence.LogFenced,
+		Detail: fence.WithTrust("operator fence [path=managed]", true),
 	}, "offline"); err != nil {
 		t.Fatalf("RecordFenceWithState: %v", err)
 	}

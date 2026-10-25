@@ -3620,6 +3620,11 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 	// Whether an assumed best-effort fence relies on the host's partition
 	// pause is decided here too, for the same reason (reliesOnPauseIfAssumed).
 	pauseRelied := c.reliesOnPauseIfAssumed(ctx, h)
+	// Whether the host trusts a confirmed SSH power-off is decided here, once,
+	// and recorded with the fence (fence.WithTrust): every later judgement of
+	// this fence, a successor's resume included, reads that decision, never
+	// the label as it reads then. Trust is never retroactive.
+	trusted := trustsSSHPoweroff(h)
 
 	leaseLeft, ok := c.holdLeaseAtLeast(ctx, minFenceLease)
 	if !ok {
@@ -3666,7 +3671,10 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 	// self-pause when this coordinator relies on the host's partition pause
 	// (docs/design/partition-pause.md §4.2): same row shape, assurance
 	// self_paused, and recoverFenced then waits out the pause.
-	fr = notAFenceUnlessPaused(asSelfPause(fr, pauseRelied, trustsSSHPoweroff(h)))
+	fr = notAFenceUnlessPaused(asSelfPause(fr, pauseRelied, trusted))
+	if fr.Method == "ssh" && fr.Success {
+		fr.Detail = fence.WithTrust(fr.Detail, trusted)
+	}
 
 	logResult := fr.LogResult()
 	if !fr.Success {
@@ -3930,8 +3938,9 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	// A best-effort fence counts only as a self-pause, live or resumed: a
 	// row an older build recorded as an assumed success is not one here.
 	// Nor does an SSH power-off the remote shell confirmed, unless the host
-	// trusts one.
-	fr = holdUntrustedSSH(notAFenceUnlessPaused(fr), trustsSSHPoweroff(h))
+	// trusted one when the fence was judged: the decision recorded with it
+	// (fence.RecordedTrust), live or resumed, never the label as it reads now.
+	fr = holdUntrustedSSH(notAFenceUnlessPaused(fr), fence.RecordedTrust(fr.Detail))
 	// And a self-pause counts only while the pause is still relied on.
 	if fr.Success && corrosion.ReliesOnPartitionPause(fr.Method, fr.Detail) && !c.relyOnPartitionPause(ctx, h) {
 		fr.Success = false

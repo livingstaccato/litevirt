@@ -82,11 +82,45 @@ func RecordedPath(detail string) string {
 	return rest[:j]
 }
 
+// Trust tokens: the decision, made when a confirmed SSH power-off is judged,
+// whether its host trusted one (the host's litevirt.trust_ssh_poweroff then).
+// The coordinator appends one to the fence's detail before it records the row
+// (WithTrust), and every later judgement of that fence, a successor's resume
+// included, reads it back (RecordedTrust) rather than the label as it reads
+// now: trust is never retroactive.
+const (
+	trustOn  = "[trust=on]"
+	trustOff = "[trust=off]"
+)
+
+// WithTrust is detail with the trust decision appended.
+func WithTrust(detail string, trusted bool) string {
+	if trusted {
+		return detail + " " + trustOn
+	}
+	return detail + " " + trustOff
+}
+
+// RecordedTrust reports whether detail records that its fence was judged
+// trusted: its last "[trust=" token is "[trust=on]" and follows the last
+// "[path=" token, which the remote machine's output cannot carry either
+// (remoteOutput). A detail with no token (an earlier build's row) records no
+// trust: the fence is held.
+func RecordedTrust(detail string) bool {
+	i := strings.LastIndex(detail, "[trust=")
+	if i < 0 || !strings.HasPrefix(detail[i:], trustOn) {
+		return false
+	}
+	return strings.LastIndex(detail, "[path=") < i
+}
+
 // remoteOutput is what the machine that answered an SSH fence printed, as a
-// fence detail records it: trimmed, with any "[path=" rewritten so that it
-// cannot pass for the path token fenceSSH appends (RecordedPath).
+// fence detail records it: trimmed, with any "[path=" or "[trust=" rewritten
+// so that it cannot pass for the path token fenceSSH appends (RecordedPath)
+// or the trust token the coordinator appends (RecordedTrust).
 func remoteOutput(out []byte) string {
-	return strings.ReplaceAll(strings.TrimSpace(string(out)), "[path=", "[path:")
+	s := strings.ReplaceAll(strings.TrimSpace(string(out)), "[path=", "[path:")
+	return strings.ReplaceAll(s, "[trust=", "[trust:")
 }
 
 // HostConfig is the subset of corrosion.HostRecord fields needed for fencing.

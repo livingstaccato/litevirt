@@ -117,3 +117,72 @@ func TestFleet_AnUnprovenFenceHoldIsInLvHealth(t *testing.T) {
 		t.Fatalf("`lv health` on %s still lists %s for %s after the recovery", b.Name, failover.CondRecoveryUnprovenFence, victim.Name)
 	}
 }
+
+// TestFleet_TrustIsNeverRetroactiveAcrossALeaderChange: the rc9 lab's A3,
+// across a leader change. a's coordinator judges the victim's confirmed SSH
+// power-off untrusted and holds its VM. The operator then sets the victim to
+// trust a confirmed SSH power-off, through b, and the lease passes to b, whose
+// coordinator never judged the fence and resumes it from the record. It must
+// use the decision recorded with the fence, not the label as it reads now:
+// the VM stays held until fence-confirm, and the condition stays open.
+//
+// Mutation: judge a resumed fence by the host's label again — b recovers the
+// VM on the old fence, red.
+func TestFleet_TrustIsNeverRetroactiveAcrossALeaderChange(t *testing.T) {
+	ctx := context.Background()
+	clock := NewVirtualClock(time.Now().UTC())
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2813})
+	a, b, victim := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	if _, err := c.SelfClient(a).ConfigureHost(ctx, &pb.ConfigureHostRequest{Name: victim.Name, FenceStrategy: "ssh"}); err != nil {
+		t.Fatal(err)
+	}
+	insertVM(t, a, "vm-held", victim.Name)
+	c.WaitConverged(t, convergeTimeout)
+	c.Isolate(victim)
+	runStart := clock.Now().Add(-time.Minute)
+	publish := func(i int) {
+		now := clock.Now()
+		PublishHealthRun(t, a, victim.Name, 5+i, runStart, now)
+		PublishHealthRun(t, b, victim.Name, 5+i, runStart, now)
+		c.WaitConverged(t, convergeTimeout, a, b)
+	}
+	publish(0)
+	cs := c.NewCoordinators(clock)
+	for _, n := range c.Nodes {
+		cs.ByNode[n.Name].SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+			return fence.Result{Method: "ssh", Success: true, Detail: "litevirt-fence-armed [path=managed]"}
+		})
+	}
+	cs.Tick(ctx, a)
+	c.WaitConverged(t, convergeTimeout, a, b)
+	if vm := vmOn(t, b, "vm-held"); vm == nil || vm.HostName != victim.Name {
+		t.Fatalf("setup: vm-held = %+v, want held on %s", vm, victim.Name)
+	}
+
+	trustSSHPoweroffOn(t, c, b, victim, a, b)
+	// a stops; its lease runs out, and b's coordinator takes over.
+	for i := 1; i <= 4; i++ {
+		clock.Advance(30 * time.Second)
+		publish(i)
+		cs.Tick(ctx, b)
+		c.WaitConverged(t, convergeTimeout, a, b)
+	}
+	if vm := vmOn(t, b, "vm-held"); vm == nil || vm.HostName != victim.Name {
+		t.Fatalf("vm-held = %+v: b recovered it on a fence a judged untrusted, after the trust was set", vm)
+	}
+	if open, _, _, _ := unprovenFenceCond(t, c, b, victim.Name); !open {
+		t.Fatalf("`lv health` on %s does not list %s while the recovery is still held", b.Name, failover.CondRecoveryUnprovenFence)
+	}
+
+	mustFenceConfirm(t, b, victim.Name)
+	c.WaitConverged(t, convergeTimeout, a, b)
+	for i := 5; i <= 6; i++ {
+		clock.Advance(20 * time.Second)
+		publish(i)
+		cs.Tick(ctx, b)
+		c.WaitConverged(t, convergeTimeout, a, b)
+	}
+	if vm := vmOn(t, b, "vm-held"); vm == nil || vm.HostName == victim.Name {
+		t.Fatalf("vm-held = %+v, want it recovered after fence-confirm", vm)
+	}
+}

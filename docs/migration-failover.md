@@ -1117,10 +1117,11 @@ unconfirmed result, and not an unpinned success. The path is the one the fence
 was given, never text the answering machine printed. The risk is the one above:
 a host that confirms and then does not power off runs its workloads twice.
 `lv doctor fence` and the health page list every host with it on. The setting
-is read when a fence is judged, so turning it on does not release a recovery
-already held on an untrusted power-off: that one stays held until
-`lv host fence-confirm <host>`, unless a new failover leader resumes the
-recorded fence and judges it again with the setting then in force.
+is never retroactive: the decision is recorded with the fence when it is
+judged (a `[trust=on]` or `[trust=off]` token in its fencing log detail), and
+every later judgement of that fence, a new failover leader's included, uses
+it, so a fence judged untrusted stays held until `lv host fence-confirm
+<host>`, and so does a fence row an earlier build wrote without the token.
 
 Turning it off is a label write, and `hosts.labels` is one value replicated
 last-writer-wins: an unrelated label set on another node that has not yet seen

@@ -1941,6 +1941,12 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 	if !fr.Success {
 		detail = fmt.Sprintf("fence failed (%s); host marked offline in state", fr.Detail)
 	}
+	// A confirmed SSH power-off records whether the host trusted one now: a
+	// coordinator resuming a recovery from this row judges it by that, never
+	// by the label as it reads later (fence.RecordedTrust).
+	if fr.Method == "ssh" && fr.Success {
+		detail = fence.WithTrust(detail, h.Labels[corrosion.LabelTrustSSHPoweroff] == "true")
+	}
 	// The physical fence went through THIS node's row, which may lag a
 	// re-admission: say which incarnation it aimed at, so an operator can
 	// re-run it on a caught-up node (host_incarnation.go).

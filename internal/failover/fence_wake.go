@@ -305,10 +305,12 @@ func fenceFailedWayOut(h *corrosion.HostRecord) string {
 // trustSSHChoice names, for a hold on a confirmed SSH power-off, the
 // per-host setting that would have recovered it, as the operator's choice it
 // is and never as advice: trusting a confirmed request is trusting that the
-// host did power off. "" for a host that already trusts one.
+// host did power off. For a host that trusts one now, which this fence was
+// judged before, it says the setting counts later fences only.
 func trustSSHChoice(h *corrosion.HostRecord) string {
 	if trustsSSHPoweroff(h) {
-		return ""
+		// Set since this fence was judged: it counts later fences only.
+		return " (" + h.Name + " now trusts a confirmed SSH power-off; that counts later fences, never this one)"
 	}
 	return " (an operator who accepts the risk that a host ignores or does not finish a confirmed SSH power-off " +
 		"may instead set `lv host config " + h.Name + " --trust-ssh-poweroff`; it is not a recommendation)"

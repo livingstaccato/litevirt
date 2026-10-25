@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -62,7 +63,7 @@ func TestUnprovenFence_AnUntrustedSSHPowerOffIsAHealthCondition(t *testing.T) {
 		t.Errorf("detail does not give the reason: %q", ev.Detail)
 	}
 	for _, want := range []string{"`lv host fence-confirm down`", "`lv host config down --trust-ssh-poweroff`",
-		"not this one", "--fence-strategy ipmi|redfish"} {
+		"never this one", "--fence-strategy ipmi|redfish"} {
 		if !strings.Contains(ev.Remedy, want) {
 			t.Errorf("remedy does not name %q: %q", want, ev.Remedy)
 		}
@@ -179,12 +180,14 @@ func TestUnprovenFence_ABestEffortFenceThatProvesNothingIsAHealthCondition(t *te
 	}
 }
 
-// A fence judged again past its gates resolves the condition, whether or not
-// a workload is placed: here a successor resumes the recorded SSH power-off
-// after the operator set the host to trust one, with no host to take the VM.
+// Trust is never retroactive, whichever leader judges the fence: a
+// successor resuming a recorded SSH power-off that was judged untrusted uses
+// the recorded decision, not the label as it reads now. The VM stays held and
+// the condition open after the operator sets the trust, until fence-confirm.
 //
-// Mutation: drop the resolve after recoverFenced's gates — it stays open, red.
-func TestUnprovenFence_AFenceJudgedAgainPastTheGatesResolvesIt(t *testing.T) {
+// Mutation: judge a resumed fence by trustsSSHPoweroff(h) again — the
+// successor recovers the VM, red.
+func TestUnprovenFence_TrustSetAfterTheFenceDoesNotReleaseItUnderASuccessor(t *testing.T) {
 	db, ctx := seedDownHost(t, "ssh", nil)
 	c := newTestCoordinator("coordinator", db)
 	c.SetFencer(confirmedSSH("managed"))
@@ -197,20 +200,68 @@ func TestUnprovenFence_AFenceJudgedAgainPastTheGatesResolvesIt(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := corrosion.UpdateHostState(ctx, db, "alive", "maintenance"); err != nil {
-		t.Fatal(err)
-	}
 	if err := db.Execute(ctx, `DELETE FROM leader_election`); err != nil {
 		t.Fatal(err)
 	}
 	succ := newTestCoordinator("alive", db)
 	succ.SetFencer(confirmedSSH("managed"))
 	succ.run(ctx)
+	succ.run(ctx)
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Fatalf("a successor recovered the VM to %q on a fence judged untrusted, once the trust was set", got)
+	}
+	if _, _, open := unprovenCond(t, db); !open {
+		t.Fatalf("%s resolved while the recovery is still held (hold %q)", CondRecoveryUnprovenFence, succ.holdReason["down"])
+	}
+	operatorConfirms(t, db, ctx, "down")
+	succ.run(ctx)
+	if got := vmHost(t, db, ctx); got != "alive" {
+		t.Fatalf("VM still on %q after fence-confirm (hold %q)", got, succ.holdReason["down"])
+	}
+}
+
+// A later fence that passes the gates resolves the condition, whether or not
+// a workload is placed: a failed best-effort fence holds the VM, the host is
+// given an ipmi strategy, and its retry proves the power-off, with no host to
+// take the VM.
+//
+// Mutation: drop the resolve after recoverFenced's gates — it stays open, red.
+func TestUnprovenFence_ALaterFenceThatPassesTheGatesResolvesIt(t *testing.T) {
+	db, ctx := seedDownHost(t, "best-effort", nil)
+	c := newTestCoordinator("coordinator", db)
+	proves := false
+	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		if proves {
+			return fence.Result{Method: "ipmi", Success: true, Detail: "chassis power off, verified"}
+		}
+		return fence.Result{Method: "best-effort-ssh", Dialled: true, Detail: "SSH failed (exit status 255) [path=managed]"}
+	})
+	now := time.Now()
+	c.Now = func() time.Time { return now }
+	c.run(ctx)
+	if _, _, open := unprovenCond(t, db); !open {
+		t.Fatalf("setup: no condition raised (hold %q)", c.holdReason["down"])
+	}
+	if err := db.Execute(ctx, `UPDATE hosts SET fence_strategy = 'ipmi' WHERE name = 'down'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpdateHostState(ctx, db, "alive", "maintenance"); err != nil {
+		t.Fatal(err)
+	}
+	proves = true
+	for i := 0; i < 6; i++ {
+		now = now.Add(5 * time.Minute)
+		holdLeaseThrough(t, db, ctx, now)
+		for _, o := range []string{"coordinator", "alive"} {
+			failingSince(t, db, o, now.Add(-time.Hour), now)
+		}
+		c.run(ctx)
+	}
 	if got := vmHost(t, db, ctx); got != "down" {
 		t.Fatalf("setup: VM placed on %q with no host to take it", got)
 	}
 	if _, _, open := unprovenCond(t, db); open {
-		t.Fatalf("%s still open after the successor's recovery went past its gates (hold %q)", CondRecoveryUnprovenFence, succ.holdReason["down"])
+		t.Fatalf("%s still open after a proof-grade fence passed the gates (hold %q)", CondRecoveryUnprovenFence, c.holdReason["down"])
 	}
 }
 

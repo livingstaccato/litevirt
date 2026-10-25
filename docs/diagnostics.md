@@ -3236,8 +3236,11 @@ guest, it goes over each start that still has a record:
 A domain paused without a record (by partition pause, a snapshot) is never
 resumed by it. `lv start <vm>` of a VM left paused this way finishes its start
 the same way, or refuses, saying why, keeping the record; it never starts the
-VM again over it. `lv stop <vm>` stops a paused guest (it cannot shut down, so
-it is killed, as at the end of a stop's timeout). The condition resolves on the
+VM again over it. `lv stop <vm>` stops a guest a start left paused (it never
+ran and cannot shut down, so it is killed, as at the end of a stop's timeout).
+Any other paused guest (an I/O error's, a partition pause's) has run, so a
+plain `lv stop` refuses it, naming the pause: `lv stop --force <vm>` kills it,
+losing what it has not flushed, or let it resume first. The condition resolves on the
 next check (every 30 s) that finds the guest running, stopped or gone.
 
 ## `lv doctor access-vlan-moves`

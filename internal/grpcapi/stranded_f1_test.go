@@ -179,3 +179,72 @@ func TestStopVM_StopsAPausedDomain(t *testing.T) {
 		t.Fatal("the record of the start the stop ended outlived it")
 	}
 }
+
+// A plain `lv stop` kills only a guest a start left paused (its record names
+// this incarnation): that guest never ran. Any other paused guest — an I/O
+// error's, a partition pause's, one whose record names another incarnation —
+// has run, and a kill loses what it has not flushed: the plain stop is refused,
+// naming the pause and the choices, and the guest is left as it is. `lv stop
+// --force` stops it.
+//
+// Mutations: kill any paused guest on a plain stop (no record check) — red;
+// skip the uuid match — red (the other-incarnation case is killed).
+func TestStopVM_APlainStopRefusesAGuestThatHasRun(t *testing.T) {
+	for name, setup := range map[string]func(t *testing.T, s *Server, fake *libvirtfake.Fake){
+		"io-error pause": func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
+			fake.SetState("vm1", libvirtfake.StateRunning)
+			if err := fake.PauseOnIOError("vm1"); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"partition pause": func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
+			fake.SetState("vm1", libvirtfake.StatePaused)
+			if err := fake.MarkPartitionPaused("vm1", "tok-1"); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"a record of another incarnation": func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
+			if err := fake.DefineDomain(`<domain type='kvm'><name>vm1</name><uuid>11111111-1111-1111-1111-111111111111</uuid></domain>`); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.markStartPaused("vm1"); err != nil {
+				t.Fatal(err)
+			}
+			if err := fake.UndefineDomain("vm1", false); err != nil {
+				t.Fatal(err)
+			}
+			if err := fake.DefineDomain(`<domain type='kvm'><name>vm1</name><uuid>22222222-2222-2222-2222-222222222222</uuid></domain>`); err != nil {
+				t.Fatal(err)
+			}
+			fake.SetState("vm1", libvirtfake.StatePaused)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, fake := vlanStartServer(t)
+			if err := corrosion.UpdateVMState(adminCtx(), s.db, "vm1", "running", ""); err != nil {
+				t.Fatal(err)
+			}
+			setup(t, s, fake)
+			fake.FailShutdownDomain = func(name string) error {
+				if st, _ := fake.RawState(name); st == libvirtfake.StatePaused {
+					return errors.New("Requested operation is not valid: domain is not running")
+				}
+				return nil
+			}
+			_, err := s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "vm1"})
+			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "paused") ||
+				!strings.Contains(err.Error(), "lv stop --force vm1") {
+				t.Fatalf("a plain stop of a paused guest that has run: %v, want FailedPrecondition naming the pause and --force", err)
+			}
+			if st, _ := fake.RawState("vm1"); st != libvirtfake.StatePaused {
+				t.Fatalf("the refused stop changed the guest: %v", st)
+			}
+			if _, err := s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "vm1", Force: true}); err != nil {
+				t.Fatalf("lv stop --force of a paused guest: %v", err)
+			}
+			if st, _ := fake.RawState("vm1"); st == libvirtfake.StatePaused || st == libvirtfake.StateRunning {
+				t.Fatalf("after --force the guest is %v, want shut off", st)
+			}
+		})
+	}
+}

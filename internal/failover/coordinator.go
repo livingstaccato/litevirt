@@ -4098,6 +4098,13 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 				"host", h.Name, "strategy", h.FenceStrategy, "detail", fr.Detail)
 			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrFenceFailed)
 			c.noteFenceFailure(h, fr)
+			// A host fenced only over SSH has no other way to be proven off:
+			// one that lost power leaves the fence nothing to reach, and only
+			// the operator can say it is off (the rc9 lab's F1a).
+			if fence.SSHOnly(h.FenceStrategy) {
+				c.raiseUnproven(ctx, h, "the SSH fence of "+h.Name+" failed ("+fr.Detail+"), so nothing proves "+h.Name+
+					" is off; the fence is retried with backoff, and an SSH fence cannot reach a host that has lost power", "", false)
+			}
 			return
 		}
 	}

@@ -186,3 +186,67 @@ func TestFleet_TrustIsNeverRetroactiveAcrossALeaderChange(t *testing.T) {
 		t.Fatalf("vm-held = %+v, want it recovered after fence-confirm", vm)
 	}
 }
+
+// TestFleet_AFailedSSHFenceHoldIsInLvHealth: the rc9 lab's F1a. The victim,
+// fenced only over SSH, is powered off from outside, so a's coordinator's SSH
+// fence cannot reach it and its VM is held, retried with backoff. `lv health`
+// on b lists ha.recovery.unproven_fence for it with the failure and the way
+// out; after fence-confirm through b the VM is recovered and the condition
+// resolves on b's replica.
+//
+// Mutation: drop the raise from the failed-fence branch — b lists nothing,
+// red.
+func TestFleet_AFailedSSHFenceHoldIsInLvHealth(t *testing.T) {
+	ctx := context.Background()
+	clock := NewVirtualClock(time.Now().UTC())
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2814})
+	a, b, victim := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	if _, err := c.SelfClient(a).ConfigureHost(ctx, &pb.ConfigureHostRequest{Name: victim.Name, FenceStrategy: "ssh"}); err != nil {
+		t.Fatal(err)
+	}
+	insertVM(t, a, "vm-off", victim.Name)
+	c.WaitConverged(t, convergeTimeout)
+	c.Isolate(victim)
+	runStart := clock.Now().Add(-time.Minute)
+	cs := c.NewCoordinators(clock)
+	for _, n := range c.Nodes {
+		cs.ByNode[n.Name].SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+			return fence.Result{Method: "ssh", Detail: "ssh: connect to host port 22: No route to host [path=managed]"}
+		})
+	}
+	tick := func(i int) {
+		clock.Advance(20 * time.Second)
+		now := clock.Now()
+		PublishHealthRun(t, a, victim.Name, 5+i, runStart, now)
+		PublishHealthRun(t, b, victim.Name, 5+i, runStart, now)
+		c.WaitConverged(t, convergeTimeout, a, b)
+		cs.Tick(ctx, a)
+		c.WaitConverged(t, convergeTimeout, a, b)
+	}
+	for i := 0; i < 2; i++ {
+		tick(i)
+	}
+	if vm := vmOn(t, b, "vm-off"); vm == nil || vm.HostName != victim.Name {
+		t.Fatalf("setup: vm-off = %+v, want held on %s", vm, victim.Name)
+	}
+	open, detail, remedy, workloads := unprovenFenceCond(t, c, b, victim.Name)
+	if !open {
+		t.Fatalf("`lv health` on %s does not list %s for %s", b.Name, failover.CondRecoveryUnprovenFence, victim.Name)
+	}
+	if !strings.Contains(detail, "No route to host") || len(workloads) != 1 || workloads[0] != "vm/vm-off" ||
+		!strings.Contains(remedy, "`lv host fence-confirm "+victim.Name+"`") {
+		t.Errorf("evidence: detail %q, workloads %v, remedy %q", detail, workloads, remedy)
+	}
+
+	mustFenceConfirm(t, b, victim.Name)
+	c.WaitConverged(t, convergeTimeout, a, b)
+	for i := 2; i < 4; i++ {
+		tick(i)
+	}
+	if vm := vmOn(t, b, "vm-off"); vm == nil || vm.HostName == victim.Name {
+		t.Fatalf("vm-off = %+v, want it recovered after fence-confirm", vm)
+	}
+	if open, _, _, _ := unprovenFenceCond(t, c, b, victim.Name); open {
+		t.Fatalf("`lv health` on %s still lists %s after the recovery", b.Name, failover.CondRecoveryUnprovenFence)
+	}
+}

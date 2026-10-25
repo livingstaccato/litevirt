@@ -21,7 +21,10 @@ import (
 //     trust one (holdUntrustedSSH);
 //   - a best-effort fence that proves nothing: under the safe-fence policy,
 //     after a held fence (ha.fence_held), or when the host's partition pause
-//     is not relied on.
+//     is not relied on;
+//   - a failed fence of a host fenced only over SSH (its dial or power-off
+//     failed), retried with backoff: a host that lost power leaves it nothing
+//     to reach.
 //
 // Before it, such a hold showed only in the coordinator's log, the
 // host.recovery.stalled notification and `lv doctor fence`, never in

@@ -1543,7 +1543,10 @@ for a hold the host's own fence makes:
 - a best-effort fence that did not reach the host after its fence was held
   (`ha.fence_held`);
 - a best-effort fence that proves nothing, when the host's partition pause is
-  not relied on.
+  not relied on;
+- a failed fence of a host with the `ssh` strategy (its dial or power-off
+  failed), retried with backoff: a host that lost power leaves an SSH fence
+  nothing to reach, so only the operator can say it is off.
 
 The evidence names the held `workloads`, the reason in `detail` (with an
 operator confirmation that does not stand for this outage, when there is one),
@@ -1559,6 +1562,12 @@ The condition resolves when the recovery goes ahead (the operator's
 confirmation, or a fence judged again that passes), and, read back by a later
 lease holder, once the host is removed, back in service, or has no
 recoverable workload left on it.
+
+A hold for `litevirt.fence_requires_confirmation` or the `manual` strategy
+raises no condition: the operator chose it, and the notification names it.
+A leader on an earlier build neither raises nor resolves it, so one raised
+before the lease passes to such a leader stays open until a leader on this
+build takes over.
 
 ### A fence held because nothing needs it (`ha.fence_held`)
 

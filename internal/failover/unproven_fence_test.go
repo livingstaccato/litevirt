@@ -288,3 +288,59 @@ func TestUnprovenFence_TheSafeFencePolicyHoldIsAHealthCondition(t *testing.T) {
 		t.Errorf("evidence does not give the reason and the way out: %+v", ev)
 	}
 }
+
+// The rc9 lab's F1a: an ssh-strategy fence whose dial (or power-off) failed
+// holds the host's workloads too, retried with backoff, and nothing proves
+// the host is off. It is the hold an operator most needs to see — a host that
+// lost power leaves an SSH fence nothing to reach — so it raises the
+// condition, with the failure in its detail and no trust opt-in in its
+// remedy, which a failed fence would not answer. It resolves once the
+// operator's confirmation lets the recovery go ahead.
+//
+// Mutation: drop the raise from the failed-fence branch — no condition, red.
+func TestUnprovenFence_AFailedSSHFenceIsAHealthCondition(t *testing.T) {
+	db, ctx := seedDownHost(t, "ssh", nil)
+	lengthenStreak(t, db, ctx, 2*time.Minute)
+	c := newTestCoordinator("coordinator", db)
+	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		return fence.Result{Method: "ssh", Detail: "ssh: connect to host 10.0.0.40 port 22: No route to host [path=managed]"}
+	})
+	c.run(ctx)
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Fatalf("setup: VM recovered to %q on a failed SSH fence", got)
+	}
+	_, ev, open := unprovenCond(t, db)
+	if !open {
+		t.Fatalf("no open %s for a failed SSH fence (hold %q)", CondRecoveryUnprovenFence, c.holdReason["down"])
+	}
+	if !strings.Contains(ev.Detail, "SSH fence of down failed") || !strings.Contains(ev.Detail, "No route to host") {
+		t.Errorf("detail does not name the failed fence: %q", ev.Detail)
+	}
+	if !strings.Contains(ev.Remedy, "`lv host fence-confirm down`") || !strings.Contains(ev.Remedy, "--fence-strategy ipmi|redfish") ||
+		strings.Contains(ev.Remedy, "trust-ssh-poweroff") {
+		t.Errorf("remedy: %q", ev.Remedy)
+	}
+
+	operatorConfirms(t, db, ctx, "down")
+	c.run(ctx)
+	if got := vmHost(t, db, ctx); got != "alive" {
+		t.Fatalf("VM still on %q after fence-confirm (hold %q)", got, c.holdReason["down"])
+	}
+	if _, _, open := unprovenCond(t, db); open {
+		t.Fatalf("%s still open after the recovery went ahead", CondRecoveryUnprovenFence)
+	}
+}
+
+// A failed IPMI fence is not this condition: its BMC is the proof, and the
+// retry is what fixes it. Only a fence that goes over SSH alone raises it.
+func TestUnprovenFence_AFailedBMCFenceIsNot(t *testing.T) {
+	db, ctx := seedDownHost(t, "ipmi", nil)
+	c := newTestCoordinator("coordinator", db)
+	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		return fence.Result{Method: "ipmi", Detail: "BMC unreachable"}
+	})
+	c.run(ctx)
+	if _, _, open := unprovenCond(t, db); open {
+		t.Fatalf("%s raised for a failed ipmi fence", CondRecoveryUnprovenFence)
+	}
+}

@@ -2343,8 +2343,9 @@ holder writes.
   ```
   partition-pause: workload stays paused kind=vm name=<vm> reason="the domain is paused on a disk I/O error, not by this host's partition pause; …"
   ```
-  No `lv` command resumes a paused VM (`lv stop` and `lv start` drop the
-  record but reboot the guest). On the VM's host, once it should run:
+  No `lv` command resumes a paused VM. A plain `lv stop` refuses it, and
+  `lv stop --force` destroys it, which drops the record but reboots the guest
+  on its next start. On the VM's host, once it should run:
   ```
   virsh resume <vm>
   ```
@@ -3215,33 +3216,63 @@ neither the resume nor the destroy landed, the guest stays paused. Each such
 paused start is recorded on the host (under `start-paused/` in the data
 directory) before the guest is created, and the record is removed when the
 start ends. When the daemon starts again, before anything else can start a
-guest, it goes over each start that still has a record:
+guest, it goes over each start that still has a record. It never kills a
+guest:
 
-- One that has ended, or can never be finished here (libvirt has no such
-  domain, the domain is no longer paused, the VM is gone or another host's), has
-  its record removed.
+- One that has ended (libvirt has no such domain, or the domain is no longer
+  paused), or whose VM is gone, has its record removed.
 - One that something else holds paused (a partition pause mark on the domain, a
   partition pause record in memory, the reserve or the record directory, a
   hand-over, a firmware move) is left paused; that hold reports it.
 - One of this start's own incarnation (the record names the domain's uuid),
-  paused by the start, whose row is running or starting (a failover,
-  reschedule or onboot start), stopped (an operator `lv start`, which records
-  running only once the guest runs) or error (a restart-policy start), is
-  finished: the firewall and VLANs in force, then the resume.
-- Any other is left paused and named by `vm_start_stranded_paused` (evaluator
-  `start_guard`, subject `vm/<name>@<host>`, warning), with why: its record
-  names another incarnation or none, its row is in a state no unfinished start
-  leaves, or something it needs cannot be read.
+  paused by the start, whose row names this host as running or starting (a
+  failover, reschedule or onboot start), is finished: the firewall and VLANs in
+  force, then the resume.
+- Any other is left paused, its record kept, and named by
+  `vm_start_stranded_paused` (evaluator `start_guard`, subject
+  `vm/<name>@<host>`, warning), with why. That covers an operator `lv start`
+  (its row is still `stopped`: running is recorded only once the guest runs)
+  and a restart-policy start (row `error` or `crashed`), which are not
+  finished automatically; a record that names another incarnation or none; a
+  row in any other state; and anything it needs that cannot be read.
+
+The condition's text says what to do:
+
+- When the record names the domain's own incarnation and the domain is paused
+  as a start leaves it, the guest never ran, so `lv stop --force <vm>` loses
+  nothing. Then start it with `lv start <vm>`.
+- When that cannot be shown, the text says so: `lv stop --force <vm>` then
+  loses what the guest has not flushed, if it ran.
+- When the VM's row names another host (failover moved it while this daemon
+  was down), another copy may run there. This domain is left as it is, neither
+  resumed nor killed, and the condition names both hosts. Check which host
+  runs the VM (`lv inspect <vm>`, and `virsh domstate <vm>` on the other
+  host). If that host runs it, stop this copy with `virsh destroy <vm>` on
+  this host.
 
 A domain paused without a record (by partition pause, a snapshot) is never
-resumed by it. `lv start <vm>` of a VM left paused this way finishes its start
-the same way, or refuses, saying why, keeping the record; it never starts the
-VM again over it. `lv stop <vm>` stops a guest a start left paused (it never
-ran and cannot shut down, so it is killed, as at the end of a stop's timeout).
-Any other paused guest (an I/O error's, a partition pause's) has run, so a
-plain `lv stop` refuses it, naming the pause: `lv stop --force <vm>` kills it,
-losing what it has not flushed, or let it resume first. The condition resolves on the
-next check (every 30 s) that finds the guest running, stopped or gone.
+resumed by it.
+
+`lv start <vm>` of a VM whose domain a start left paused does not finish that
+start, and does not start the VM again over it. It refuses with the same
+guidance, and keeps the record. Any other start of the domain while it is
+still active (a failover, a restart policy) is refused by the start guard in
+the same way. No start removes the record of a start it did not finish.
+
+A plain `lv stop <vm>` of any paused guest (a start left paused, an I/O
+error, a partition pause, a hand-over) is refused. A paused guest cannot shut
+down gracefully, and a kill loses what it has not flushed. The refusal names
+the pause and its reason, as far as they are known, and says that
+`lv stop --force <vm>` destroys the guest; or let it resume first and stop it
+then. `lv stop --force` destroys the domain and removes its start record, so
+no record outlives it.
+
+If a start fails after the paused create, and libvirt cannot confirm the
+domain is no longer paused (the destroy did not land, or the connection
+dropped), the record is kept too, and the next daemon start names the guest.
+
+The condition resolves on the next check (every 30 s) that finds the guest
+running, stopped or gone.
 
 ## `lv doctor access-vlan-moves`
 

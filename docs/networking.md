@@ -481,11 +481,12 @@ replace, restore, import, a snapshot revert). An access VLAN that cannot be put
 on its tap refuses the start, since the guest would run on VLAN 1, and so does
 an access NIC whose MAC or bridge cannot be resolved. A start the daemon
 did not finish (it stopped between creating the guest paused and resuming it)
-is finished when the daemon starts again, its VLANs put on first, or named by
-`vm_start_stranded_paused` when it cannot be (unless something else, such as a
-partition pause, holds it and reports it); `lv start` finishes such a start the
-same way, and `lv stop` stops such a never-run paused guest (any other paused
-guest needs `lv stop --force`)
+is finished when the daemon starts again, its VLANs put on first, if its row
+is running or starting (a failover, reschedule or onboot start). Any other is
+left paused and named by `vm_start_stranded_paused` (unless something else, such
+as a partition pause, holds it and reports it). `lv start` does not finish such
+a start, and refuses; a plain `lv stop` refuses any paused guest. When the
+guest never ran, `lv stop --force <vm>` loses nothing; then run `lv start <vm>`
 ([diagnostics.md](diagnostics.md#a-start-left-paused-vm_start_stranded_paused)). A live
 migration hands such a guest over paused, and the target puts the VLANs on
 the taps it made before it lets the guest run; a live firmware move does the

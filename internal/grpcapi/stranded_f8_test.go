@@ -247,6 +247,28 @@ func TestRestoreSnapshot_RefusesUpFrontOverAStartLeftPaused(t *testing.T) {
 	}
 }
 
+// Review r8-m1: a start record whose domain is shut off (a destroy outside
+// `lv stop --force`) holds no paused guest. The restore drops it, as the start
+// guard treats it, and goes on: it is not refused with a text about a guest
+// "left paused".
+//
+// Mutation: startRecordRefusal not dropping the record of an inactive domain
+// — red.
+func TestRestoreSnapshot_DropsTheStartRecordOfAShutOffDomain(t *testing.T) {
+	s := lockTestServer(t)
+	fake := seedRestorableVM(t, s, "disk")
+	if err := s.markStartPaused("rs"); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetState("rs", libvirtfake.StateShutdown)
+	if _, err := s.RestoreSnapshot(adminCtx(), &pb.RestoreSnapshotRequest{VmName: "rs", SnapshotName: "s1"}); err != nil {
+		t.Fatalf("restore of a shut-off domain with a stale start record: %v", err)
+	}
+	if marked, _ := s.startPausedMarked("rs"); marked {
+		t.Fatal("the restore kept the stale start record of a shut-off domain")
+	}
+}
+
 // Review F7 m4: a plain stop of a paused guest is refused before anything
 // runs: the VM's PreStop hook does not fire for a stop that is refused.
 //

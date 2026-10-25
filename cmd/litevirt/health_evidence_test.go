@@ -87,3 +87,28 @@ func TestWrapIndented(t *testing.T) {
 		t.Fatalf("got %q\nwant %q", got, want)
 	}
 }
+
+// Review of the rc10 polish, m2: a condition's detail and remedy can carry a
+// peer's text. No control or format character in them reaches the terminal:
+// an escape sequence or a bidi override is printed escaped, and a newline or
+// tab is folded into the wrapping.
+//
+// Mutation: print detail and remedy without termSafe — red.
+func TestPrintClusterHealth_EscapesControlCharactersInGuidance(t *testing.T) {
+	out := captureStdout(t, func() {
+		printClusterHealth(&pb.ClusterHealth{Overall: "CRITICAL", Conditions: []*pb.HealthCondition{{
+			Code: "ha.recovery.unproven_fence", SubjectKind: "host", SubjectId: "node-5", Lifecycle: "confirmed",
+			Evidence: `{"detail":"ssh said \u001b[2J\u001b]0;pwned\u0007 here\nand\tthere","remedy":"run \u202e` + "`lv host fence-confirm node-5`" + `"}`,
+		}}})
+	})
+	for _, bad := range []string{"\x1b", "\x07", "\u202e"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("output carries %q:\n%q", bad, out)
+		}
+	}
+	for _, want := range []string{`\x1b[2J`, `\x07`, `\u202e`, "here and there"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%q", want, out)
+		}
+	}
+}

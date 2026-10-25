@@ -295,11 +295,14 @@ func printConditionGuidance(c *pb.HealthCondition) {
 	if json.Unmarshal([]byte(c.GetEvidence()), &ev) != nil {
 		return
 	}
-	ev.Detail, ev.Remedy = strings.TrimSpace(ev.Detail), strings.TrimSpace(ev.Remedy)
+	// Detail and remedy can carry a peer's text (a remote shell's answer, a
+	// BMC's error): whitespace is folded, and every other control or format
+	// character escaped (termSafe), so none reaches the terminal.
+	ev.Detail, ev.Remedy = termSafe(strings.Join(strings.Fields(ev.Detail), " ")), termSafe(strings.Join(strings.Fields(ev.Remedy), " "))
 	if ev.Detail == "" && ev.Remedy == "" {
 		return
 	}
-	fmt.Printf("\n%s on %s/%s:\n", c.GetCode(), c.GetSubjectKind(), c.GetSubjectId())
+	fmt.Printf("\n%s on %s/%s:\n", termSafe(c.GetCode()), termSafe(c.GetSubjectKind()), termSafe(c.GetSubjectId()))
 	if ev.Detail != "" {
 		fmt.Print(wrapIndented(ev.Detail, "    detail: ", "            ", evidenceWrapWidth))
 	}

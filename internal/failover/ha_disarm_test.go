@@ -881,8 +881,8 @@ func TestHADisarm_HeldRecoveryReadErrorIsRetried(t *testing.T) {
 // nothing and fences nothing; the decline is final. (A verified fence that no
 // longer stands is fenced again instead: TestHADisarm_HeldRecoveryIsRefenced.)
 //
-// Mutation: resume the held recovery directly — the VM moves and this goes
-// red.
+// Mutations: resume the held recovery directly — the VM moves and this goes
+// red; no raise in noteResumeDeclined — no condition, red.
 func TestHADisarm_HeldRecoveryOnAFenceThatNoLongerStandsMovesNothing(t *testing.T) {
 	db, ctx := seedDownHost(t, "ssh", trustSSH)
 	c := newTestCoordinator("coordinator", db)
@@ -916,6 +916,10 @@ func TestHADisarm_HeldRecoveryOnAFenceThatNoLongerStandsMovesNothing(t *testing.
 	}
 	if !strings.Contains(c.holdReason["down"], "no longer stands") {
 		t.Fatalf("hold reason %q", c.holdReason["down"])
+	}
+	// The decline is named in `lv health` (the rc10 lab's A5).
+	if _, ev, open := unprovenCond(t, db); !open || !strings.Contains(ev.Detail, "no longer stands") {
+		t.Fatalf("no open %s naming the declined fence (open %v, detail %q)", CondRecoveryUnprovenFence, open, ev.Detail)
 	}
 }
 

@@ -1237,7 +1237,7 @@ func (c *Coordinator) run(ctx context.Context) {
 						continue
 					}
 				default:
-					c.noteResumeDeclined(target, rec, why)
+					c.noteResumeDeclined(ctx, h, rec, why)
 				}
 			}
 			// The other way a stranded recovery can be resumed: a refusal for
@@ -2955,8 +2955,20 @@ func (c *Coordinator) refence(ctx context.Context, h *corrosion.HostRecord, rec 
 
 // noteResumeDeclined logs, once per host and fence, that a recorded fence was
 // found and is no longer authority: the one line that explains why a 'fenced'
-// host's workloads are staying where they are.
-func (c *Coordinator) noteResumeDeclined(host string, rec fenceRecord, why string) {
+// host's workloads are staying where they are. It raises
+// ha.recovery.unproven_fence for that hold too (the rc10 lab's A5): an
+// operator's fence judged before any observer watched the host stay down is
+// declined for good, and only an operator's confirmation, or an undrain that
+// lets the outage be judged afresh, ends it. The decline itself is unchanged:
+// it never becomes a recovery.
+func (c *Coordinator) noteResumeDeclined(ctx context.Context, h *corrosion.HostRecord, rec fenceRecord, why string) {
+	host := h.Name
+	// Raised on every decline, not once: a later outage may decline the same
+	// fence again after this one's condition resolved. It is not rewritten
+	// while it says the same.
+	c.raiseUnprovenAs(ctx, h, unprovenRaise{declined: true,
+		why: "the recorded " + rec.Method + " fence " + rec.ID + " no longer stands (" + why + "), so nothing is recovered on it"},
+		c.lastStale[host])
 	if c.resumeDeclined == nil {
 		c.resumeDeclined = map[string]string{}
 	}

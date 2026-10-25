@@ -26,6 +26,9 @@ import (
 //   - a failed fence of a host fenced only over SSH (its dial or power-off
 //     failed), retried with backoff: a host that lost power leaves it nothing
 //     to reach.
+//   - a recorded unverified fence that no longer stands, declined for good
+//     (noteResumeDeclined): an operator's fence judged before any observer
+//     watched the host stay down (the rc10 lab's A5).
 //
 // Before it, such a hold showed only in the coordinator's log, the
 // host.recovery.stalled notification and `lv doctor fence`, never in
@@ -58,6 +61,10 @@ func (c *Coordinator) holdUnproven(ctx context.Context, h *corrosion.HostRecord,
 type unprovenRaise struct {
 	why   string
 	trust *trustJudged
+	// declined: the hold is a recorded fence that no longer stands
+	// (noteResumeDeclined), so nothing was recovered on it, and the remedy
+	// names `lv host undrain` too.
+	declined bool
 }
 
 // trustJudged is a confirmed SSH power-off held because the trust setting did
@@ -89,10 +96,16 @@ func (c *Coordinator) unprovenOpen(ctx context.Context, host string) bool {
 // recoverable workload on it holds nothing back, and raises nothing. The row
 // is not rewritten while it says the same: a hold can last days.
 func (c *Coordinator) raiseUnproven(ctx context.Context, h *corrosion.HostRecord, why, stale string, trust *trustJudged) {
+	c.raiseUnprovenAs(ctx, h, unprovenRaise{why: why, trust: trust}, stale)
+}
+
+// raiseUnprovenAs is raiseUnproven for r.
+func (c *Coordinator) raiseUnprovenAs(ctx context.Context, h *corrosion.HostRecord, r unprovenRaise, stale string) {
 	if c.unprovenRaised == nil {
 		c.unprovenRaised = map[string]unprovenRaise{}
 	}
-	c.unprovenRaised[h.Name] = unprovenRaise{why, trust}
+	c.unprovenRaised[h.Name] = r
+	why := r.why
 	workloads, err := c.recoverableOn(ctx, h.Name)
 	if err != nil || len(workloads) == 0 {
 		return
@@ -114,7 +127,7 @@ func (c *Coordinator) raiseUnproven(ctx context.Context, h *corrosion.HostRecord
 		detail += "; " + stale
 	}
 	b, _ := json.Marshal(unprovenFenceEvidence{Detail: detail, Workloads: capList(workloads),
-		Remedy: unprovenRemedy(h, trust.note(h))})
+		Remedy: unprovenRemedyOf(h, r)})
 	if !fresh && row.Evidence == string(b) && row.Severity == corrosion.SeverityCritical {
 		return
 	}
@@ -143,6 +156,19 @@ func unprovenRemedy(h *corrosion.HostRecord, trustNote string) string {
 	}
 	if trustNote != "" {
 		out += ". " + sentenceStart(trustNote, h.Name)
+	}
+	return out
+}
+
+// unprovenRemedyOf is unprovenRemedy for what r raised: for a recorded fence
+// declined, the undrain that lets the coordinator judge the outage afresh is
+// a way out too. Nothing was recovered on that fence, so returning the host
+// to active starts nothing twice.
+func unprovenRemedyOf(h *corrosion.HostRecord, r unprovenRaise) string {
+	out := unprovenRemedy(h, r.trust.note(h))
+	if r.declined {
+		out += fmt.Sprintf(". Nothing was recovered on this fence, so `lv host undrain %[1]s` is a way out too: it returns "+
+			"%[1]s to service if it is up, and if it is down the coordinator fences it afresh for this outage", h.Name)
 	}
 	return out
 }
@@ -205,7 +231,7 @@ func (c *Coordinator) resolveUnprovenSettled(ctx context.Context, pending map[st
 			// the raise, and the host's trust setting as it is now (h is read
 			// afresh); raiseUnproven rewrites only on a change.
 			if r, ok := c.unprovenRaised[host]; ok {
-				c.raiseUnproven(ctx, h, r.why, c.lastStale[host], r.trust)
+				c.raiseUnprovenAs(ctx, h, r, c.lastStale[host])
 			}
 		}
 	}

@@ -1547,6 +1547,10 @@ for a hold the host's own fence makes:
 - a failed fence of a host with the `ssh` strategy (its dial or power-off
   failed), retried with backoff: a host that lost power leaves an SSH fence
   nothing to reach, so only the operator can say it is off.
+- a recorded fence that no longer stands, an unverified one (`ssh`,
+  `best-effort`) that a leader declines to resume from: typically an
+  operator's `lv host fence` run before any observer had watched the host stay
+  down. It is declined for good, never turned into a recovery.
 
 The evidence names the held `workloads`, the reason in `detail` (with an
 operator confirmation that does not stand for this outage, when there is one),
@@ -1559,10 +1563,14 @@ why the trust setting did not count it: confirmed off the host's pinned key
 since revoked. Where the setting is off, it names
 `lv host config <host> --trust-ssh-poweroff` as the operator's choice, not a
 recommendation: it counts later fences confirmed over the pinned key, never
-the one already holding this recovery, whichever leader judges it. The same
+the one already holding this recovery, whichever leader judges it. For a
+declined recorded fence it adds `lv host undrain <host>`: nothing was recovered
+on that fence, so the undrain returns the host to service if it is up, and if
+it is down the leader fences it afresh for the outage. The same
 hold is named by the `host.recovery.stalled` notification. The detail is kept
-current while the hold lasts: a confirmation noted later as not standing, or a
-later fence's failure, replaces what it said.
+current while the hold lasts: a confirmation noted later as not standing, a
+later fence's failure, or a change to the host's trust setting (re-read each
+cycle; it never releases the hold) replaces what it said.
 
 The condition resolves when the recovery goes ahead (the operator's
 confirmation, or a fence judged again that passes), and, read back by a later

@@ -62,7 +62,7 @@ func ConfirmedOverPin(r Result) bool {
 	if path == "" {
 		path = RecordedPath(r.Detail)
 	}
-	return path == "managed" || path == "legacy-pinned"
+	return PinnedPath(path)
 }
 
 // RecordedPath is the path label an SSH fence's detail records: its last
@@ -82,11 +82,134 @@ func RecordedPath(detail string) string {
 	return rest[:j]
 }
 
+// Trust tokens: the decision, made when a confirmed SSH power-off is judged,
+// whether its host trusted one (the host's litevirt.trust_ssh_poweroff then),
+// and the path the fence took. The writer appends one LAST to the fence's
+// detail before it records the row (WithTrust), and every later judgement of
+// that fence, a successor's resume included, reads it back (RecordedTrust)
+// rather than the label as it reads now: trust is never retroactive.
+//
+// The token is marked and bound to its row: "[trust=on;path=managed;id=<the
+// fencing_log row id>;v=3]". An earlier build wrote no token, and an
+// admin-set field at the end of its rows (a BMC address in the target note)
+// could end in any text, a well-formed token included, which no text rule can
+// tell from a genuine one. The row id is minted at random when the row is
+// written, so no address set before cannot contain it: only a token naming
+// its own row's id counts. The path inside it is the one the trust decision
+// reads, never a "[path=" token elsewhere in the detail.
+const trustMark = "v=3"
+
+// WithTrust is detail with the trust decision appended: trusted, path, the
+// path the fence took (Result.Path; a fence label such as "managed"), and id,
+// the id of the fencing_log row the detail is written to, minted before it.
+func WithTrust(detail string, trusted bool, path, id string) string {
+	on := "off"
+	if trusted {
+		on = "on"
+	}
+	return detail + " [trust=" + on + ";path=" + tokenField(path) + ";id=" + tokenField(id) + ";" + trustMark + "]"
+}
+
+// tokenField is s as a trust token field: brackets and the field separator
+// rewritten.
+func tokenField(s string) string {
+	return strings.ReplaceAll(DetailField(s), ";", ",")
+}
+
+// TrustRecord is what a marked trust token records.
+type TrustRecord struct {
+	Trusted bool
+	Path    string
+	// ID is the fencing_log row id the token was written for.
+	ID string
+}
+
+// RecordedTrustToken reads the marked trust token that ends detail. ok is
+// false when it does not end in one: no token, an earlier build's or an
+// earlier form, or one followed by anything (a token in an earlier field), or
+// one after unbalanced text.
+func RecordedTrustToken(detail string) (TrustRecord, bool) {
+	d := strings.TrimSpace(detail)
+	if !strings.HasSuffix(d, ";"+trustMark+"]") {
+		return TrustRecord{}, false
+	}
+	i := strings.LastIndex(d, " [trust=")
+	if i < 0 {
+		return TrustRecord{}, false
+	}
+	body := d[i+len(" [") : len(d)-1]
+	if strings.ContainsAny(body, "[]") || !balancedBrackets(d[:i]) {
+		return TrustRecord{}, false
+	}
+	parts := strings.Split(body, ";")
+	if len(parts) != 4 || parts[3] != trustMark || !strings.HasPrefix(parts[1], "path=") || !strings.HasPrefix(parts[2], "id=") {
+		return TrustRecord{}, false
+	}
+	var r TrustRecord
+	switch parts[0] {
+	case "trust=on":
+		r.Trusted = true
+	case "trust=off":
+	default:
+		return TrustRecord{}, false
+	}
+	r.Path = strings.TrimPrefix(parts[1], "path=")
+	r.ID = strings.TrimPrefix(parts[2], "id=")
+	return r, true
+}
+
+// balancedBrackets reports whether every "[" in s is closed, in order, by a
+// "]". Every row this build writes is (remote and admin-set text is written
+// through DetailField); a token inside an unclosed bracket is text an earlier
+// build wrote raw, such as an admin-set BMC address ending a row's target
+// note, and is not one.
+func balancedBrackets(s string) bool {
+	depth := 0
+	for _, r := range s {
+		switch r {
+		case '[':
+			depth++
+		case ']':
+			if depth--; depth < 0 {
+				return false
+			}
+		}
+	}
+	return depth == 0
+}
+
+// PinnedPath reports whether path is one that reaches the host over its
+// pinned sshd key: the managed or the legacy-pinned path.
+func PinnedPath(path string) bool {
+	return path == "managed" || path == "legacy-pinned"
+}
+
+// RecordedTrust reports whether detail, the detail of the fencing_log row id,
+// records that its fence was judged trusted, over a pinned path: it ends in a
+// marked trust token (RecordedTrustToken) saying "on", naming id, whose path
+// is pinned (PinnedPath). Any other detail — no token, an earlier form, a
+// token not last or after unbalanced text, another row's id, an unpinned path
+// — records no trust, and the fence is held.
+func RecordedTrust(detail, id string) bool {
+	r, ok := RecordedTrustToken(detail)
+	return ok && id != "" && r.ID == id && r.Trusted && PinnedPath(r.Path)
+}
+
+// DetailField is s, admin-set or remote text, as a fence detail records it:
+// with "[" and "]" rewritten, so that it cannot open or close a token
+// (RecordedPath, RecordedTrustToken).
+func DetailField(s string) string {
+	return strings.NewReplacer("[", "(", "]", ")").Replace(s)
+}
+
 // remoteOutput is what the machine that answered an SSH fence printed, as a
-// fence detail records it: trimmed, with any "[path=" rewritten so that it
-// cannot pass for the path token fenceSSH appends (RecordedPath).
+// fence detail records it: trimmed, with every bracket rewritten
+// (DetailField), so that it can neither pass for the path token fenceSSH
+// appends (RecordedPath) or the trust token the coordinator appends
+// (RecordedTrust), nor leave a bracket unbalanced, which would get a genuine
+// row's token refused.
 func remoteOutput(out []byte) string {
-	return strings.ReplaceAll(strings.TrimSpace(string(out)), "[path=", "[path:")
+	return DetailField(strings.TrimSpace(string(out)))
 }
 
 // HostConfig is the subset of corrosion.HostRecord fields needed for fencing.
@@ -540,7 +663,7 @@ func fenceSSH(ctx context.Context, h HostConfig, lenient bool) Result {
 	cmd := exec.CommandContext(ctx, sshBinary, args...)
 	out, runErr := cmd.CombinedOutput()
 	armed := sawFenceArmed(out)
-	detail := fmt.Sprintf("SSH forced poweroff to %s: %s%s", target, remoteOutput(out), path)
+	detail := fmt.Sprintf("SSH forced poweroff to %s: %s%s", DetailField(target), remoteOutput(out), path)
 
 	// Classification. A success requires the marker, always: it is the only
 	// evidence that OUR command ran on the target. An exit 0 without it means

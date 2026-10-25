@@ -108,6 +108,31 @@ func ValidateRedfishConfig(c RedfishConfig) error {
 	return nil
 }
 
+// UnsafeBMCAddress reports whether addr, an IPMI address or a Redfish
+// endpoint as stored, carries a bracket other than around a plain IPv6
+// literal host (an https URL's "[addr]" or "[addr]:port", no zone). Such text
+// written raw into a fence row by an earlier build could open or close a
+// token there; ConfigureHost refuses it now, and the failover coordinator
+// flags any stored before (ha.fence.bmc_address_unsafe).
+func UnsafeBMCAddress(addr string) bool {
+	if !strings.ContainsAny(addr, "[]") {
+		return false
+	}
+	u, err := url.Parse(strings.TrimSpace(addr))
+	if err != nil || u.Scheme != "https" {
+		return true
+	}
+	h := u.Hostname()
+	if net.ParseIP(h) == nil || !strings.Contains(h, ":") {
+		return true
+	}
+	host := u.Host
+	if p := u.Port(); p != "" {
+		host = strings.TrimSuffix(host, ":"+p)
+	}
+	return host != "["+h+"]" || strings.Count(addr, "[") != 1 || strings.Count(addr, "]") != 1
+}
+
 // redfishBaseURL parses an endpoint into its scheme and host. Only https, a
 // host, and an empty or "/" path; no credentials, query or fragment.
 func redfishBaseURL(endpoint string) (*url.URL, error) {
@@ -124,6 +149,12 @@ func redfishBaseURL(endpoint string) (*url.URL, error) {
 		return nil, fmt.Errorf("invalid redfish endpoint %q: credentials belong in the redfish user and password, not the URL", endpoint)
 	case u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/"):
 		return nil, fmt.Errorf("invalid redfish endpoint %q: give the base URL only, https://host[:port]", endpoint)
+	case UnsafeBMCAddress(endpoint):
+		// Brackets would open or close a token in a fence row; a URL has
+		// them only around an IPv6 literal host, and a zoned one (which the
+		// URL parser accepts) names an interface on one node only, and its
+		// zone is free text.
+		return nil, fmt.Errorf("invalid redfish endpoint %q: '[' and ']' only around an IPv6 address, with no zone", endpoint)
 	}
 	return &url.URL{Scheme: "https", Host: u.Host}, nil
 }

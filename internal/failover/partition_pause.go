@@ -171,6 +171,16 @@ func trustsSSHPoweroff(h *corrosion.HostRecord) bool {
 	return h != nil && h.Labels[corrosion.LabelTrustSSHPoweroff] == "true"
 }
 
+// ranPath is the path an SSH fence took: the one fenceSSH reported, or, for a
+// fencer that reports it only in its detail, that detail's path token, read
+// before anything else is appended to it.
+func ranPath(fr fence.Result) string {
+	if fr.Path != "" {
+		return fr.Path
+	}
+	return fence.RecordedPath(fr.Detail)
+}
+
 // holdUntrustedSSH stops counting an SSH power-off the remote shell confirmed
 // (method ssh) as a fence unless the host trusts one (trustedSSH): a
 // confirmed request is not an observed power-off. It is recorded as it ran;

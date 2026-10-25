@@ -302,16 +302,33 @@ func fenceFailedWayOut(h *corrosion.HostRecord) string {
 	return out + ", or give it an ipmi or redfish fence strategy"
 }
 
-// trustSSHChoice names, for a hold on a confirmed SSH power-off, the
-// per-host setting that would have recovered it, as the operator's choice it
-// is and never as advice: trusting a confirmed request is trusting that the
-// host did power off. "" for a host that already trusts one.
-func trustSSHChoice(h *corrosion.HostRecord) string {
-	if trustsSSHPoweroff(h) {
-		return ""
+// sshTrustNote says, for a hold on an SSH power-off the remote shell
+// confirmed (fr as it ran, before holdUntrustedSSH, recorded as row id), why the trust setting
+// did not count it, and what the setting would do, only where that is true:
+// a later fence confirmed over the host's pinned key. Trusting one is the
+// operator's choice, never advice: trusting a confirmed request is trusting
+// that the host did power off.
+func sshTrustNote(h *corrosion.HostRecord, fr fence.Result, id string) string {
+	recorded, now := fence.RecordedTrust(fr.Detail, id), trustsSSHPoweroff(h)
+	// The path the trust decision reads is the one its marked token records;
+	// a row without one says only what its last path token says.
+	pinned := fence.ConfirmedOverPin(fr)
+	if tok, ok := fence.RecordedTrustToken(fr.Detail); ok && tok.ID == id {
+		pinned = fence.PinnedPath(tok.Path)
 	}
-	return " (an operator who accepts the risk that a host ignores or does not finish a confirmed SSH power-off " +
-		"may instead set `lv host config " + h.Name + " --trust-ssh-poweroff`; it is not a recommendation)"
+	switch {
+	case !pinned:
+		return "this power-off was not confirmed over " + h.Name + "'s pinned host key, so no trust setting counts it"
+	case recorded && !now:
+		return h.Name + "'s trust of a confirmed SSH power-off was revoked after this fence was judged, " +
+			"so it no longer counts; it needs `lv host fence-confirm " + h.Name + "`"
+	case now:
+		return h.Name + " trusts a confirmed SSH power-off now, but this fence was judged before it did (or by an " +
+			"earlier build): the setting counts later fences confirmed over its pinned host key, never this one"
+	}
+	return "an operator who accepts the risk that a host ignores or does not finish a confirmed SSH power-off may " +
+		"instead set `lv host config " + h.Name + " --trust-ssh-poweroff` (not a recommendation): it counts later " +
+		"fences confirmed over its pinned host key, never this one"
 }
 
 // noteFenceFailure holds h's recovery on a fence that failed, naming what
@@ -336,12 +353,31 @@ func (c *Coordinator) retryHold(h *corrosion.HostRecord, next time.Time) {
 }
 
 // noteHold records why the recovery of host is not proceeding, for the stall
-// alert. The newest reason wins.
+// alert. The newest reason wins; a stale operator confirmation noted after it
+// is appended to it (noteConfirmationStale).
 func (c *Coordinator) noteHold(host, reason string) {
 	if c.holdReason == nil {
 		c.holdReason = map[string]string{}
 	}
-	c.holdReason[host] = reason
+	if c.holdBase == nil {
+		c.holdBase = map[string]string{}
+	}
+	c.holdReason[host], c.holdBase[host] = reason, reason
+}
+
+// noteGateHold holds host's recovery on reason, a gate an operator
+// confirmation passes, with stale appended: confirmedOffNow's note of a
+// confirmation that does not stand for this outage (withStaleConfirmation).
+func (c *Coordinator) noteGateHold(host, reason, stale string) {
+	c.noteHold(host, reason)
+	c.holdReason[host] = withStaleConfirmation(reason, stale)
+}
+
+// clearHold forgets why host's recovery was held: it is proceeding.
+func (c *Coordinator) clearHold(host string) {
+	delete(c.holdReason, host)
+	delete(c.holdBase, host)
+	delete(c.lastStale, host)
 }
 
 // forgetHost drops the per-episode memory kept for host here, once it is back
@@ -354,7 +390,9 @@ func (c *Coordinator) forgetHost(host string) {
 	delete(c.confirmStale, host)
 	delete(c.afreshConfirm, host)
 	delete(c.notRelying, host)
-	delete(c.holdReason, host)
+	c.clearHold(host)
+	delete(c.unprovenRaised, host)
+	delete(c.restsOnTrust, host)
 	delete(c.lastFenceFailure, host)
 	delete(c.stallSince, host)
 	delete(c.stallAlerted, host)

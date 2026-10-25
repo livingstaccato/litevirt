@@ -67,10 +67,13 @@ func (s *Server) ListHosts(ctx context.Context, req *pb.ListHostsRequest) (*pb.L
 			Labels:           h.Labels,
 			Version:          h.Version,
 			StoragePools:     pools,
-			Region:           h.Region,
-			CertSerial:       h.CertSerial,
-			CreatedAt:        parseTimestamp(h.CreatedAt),
-			UpdatedAt:        parseTimestamp(h.UpdatedAt),
+			// `lv doctor fence` and the UI health page name the SSH-only
+			// hosts from this list; empty, every host read as best-effort.
+			FenceStrategy: h.FenceStrategy,
+			Region:        h.Region,
+			CertSerial:    h.CertSerial,
+			CreatedAt:     parseTimestamp(h.CreatedAt),
+			UpdatedAt:     parseTimestamp(h.UpdatedAt),
 		}
 		resp.Hosts = append(resp.Hosts, host)
 	}
@@ -1934,6 +1937,11 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 
 	method := fr.Method
 	detail := fr.Detail
+	// The path the fence took, read before anything admin-set is appended.
+	path := fr.Path
+	if path == "" {
+		path = fence.RecordedPath(fr.Detail)
+	}
 	result := fr.LogResult()
 	if !fr.Success {
 		detail = fmt.Sprintf("fence failed (%s); host marked offline in state", fr.Detail)
@@ -1942,6 +1950,16 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 	// re-admission: say which incarnation it aimed at, so an operator can
 	// re-run it on a caught-up node (host_incarnation.go).
 	detail += fenceTargetNote(ctx, s.db, h)
+	// A confirmed SSH power-off records whether the host trusted one now: a
+	// coordinator resuming a recovery from this row judges it by that, never
+	// by the label as it reads later (fence.RecordedTrust). LAST, after the
+	// target note's admin-set BMC address, which must not be able to carry a
+	// token that counts.
+	// The row's id is minted before the detail: the token names it.
+	rowID := randid.New()
+	if fr.Method == "ssh" && fr.Success {
+		detail = fence.WithTrust(detail, h.Labels[corrosion.LabelTrustSSHPoweroff] == "true", path, rowID)
+	}
 
 	// Mark it offline regardless of fence success, and record the fence, in
 	// ONE replicated entry (RecordFenceWithState). A successful operator fence
@@ -1952,7 +1970,7 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 	// host as handled, and never looked again. Together, every peer holds
 	// both or neither (colonelpanik/litevirt#253).
 	if err := s.recordFence(ctx, corrosion.FenceLogRecord{
-		ID:       randid.New(),
+		ID:       rowID,
 		HostName: req.Name,
 		Method:   method,
 		Result:   result,
@@ -2052,6 +2070,13 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 			return nil, status.Errorf(codes.InvalidArgument,
 				"invalid fence strategy %q (valid: ssh, ipmi, redfish, watchdog, manual, best-effort)", req.FenceStrategy)
 		}
+	}
+
+	// A BMC address is written into fence rows (fenceTargetNote), whose
+	// tokens are bracketed: it may not carry a bracket.
+	if strings.ContainsAny(req.IpmiAddress, "[]") {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"invalid ipmi address %q: a host name or address, without '[' or ']'", req.IpmiAddress)
 	}
 
 	// The Redfish settings: what this request does to them, decided and
@@ -2987,5 +3012,8 @@ func fenceTargetNote(ctx context.Context, db *corrosion.Client, h *corrosion.Hos
 	if bmc == "" {
 		bmc = "-"
 	}
-	return fmt.Sprintf(" [fenced %s as incarnation %d, serial %s, strategy %s at %s]", h.Name, n, h.CertSerial, h.FenceStrategy, bmc)
+	// Every field is written with its brackets rewritten (fence.DetailField):
+	// the BMC address is admin-set, and must not open or close a token.
+	return fmt.Sprintf(" [fenced %s as incarnation %d, serial %s, strategy %s at %s]", fence.DetailField(h.Name), n,
+		fence.DetailField(h.CertSerial), fence.DetailField(h.FenceStrategy), fence.DetailField(bmc))
 }

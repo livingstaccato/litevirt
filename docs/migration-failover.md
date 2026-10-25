@@ -1093,7 +1093,11 @@ minute in, naming the held workloads, the reason, and the way out: power the
 host off and run `lv host fence-confirm <host>` (or **Confirm powered off** on
 the host's page in the web UI), or give the host an `ipmi` or `redfish` fence
 strategy. After the confirmation the recovery proceeds on its own. `lv doctor
-fence` and the web UI's health page list every host fenced only over SSH.
+fence` and the web UI's health page list every host fenced only over SSH. A
+hold on a fence that ran but is not proof (a confirmed SSH power-off the host
+does not trust, or a best-effort fence that proves nothing) is also a
+`lv health` condition, `ha.recovery.unproven_fence`, until it ends (see
+[Diagnostics](diagnostics.md)).
 
 **Trusting a confirmed SSH power-off** is a per-host operator choice, off by
 default:
@@ -1112,7 +1116,20 @@ whatever the setting: not a dial failure, not a host-key mismatch, not an
 unconfirmed result, and not an unpinned success. The path is the one the fence
 was given, never text the answering machine printed. The risk is the one above:
 a host that confirms and then does not power off runs its workloads twice.
-`lv doctor fence` and the health page list every host with it on.
+`lv doctor fence` and the health page list every host with it on. The setting
+is never retroactive: the decision is recorded with the fence when it is
+judged, with the path the fence took (a marked token such as
+`[trust=on;path=managed;id=<row id>;v=3]`, last in its fencing log detail,
+counted only for the row it names), and every
+later judgement of that fence, a new failover leader's included, uses it, so
+a fence judged untrusted stays held until `lv host fence-confirm <host>`.
+A fence row written before this release carries no marked token, so a
+recovery resumed from one needs `lv host fence-confirm <host>` too; a BMC
+address stored with a bracket, which those builds wrote raw into their rows,
+is flagged as `ha.fence.bmc_address_unsafe` until it is fixed.
+A recovery resting on a trusted fence needs the host to trust one still, so
+revoking the setting holds a recovery not yet made, an owed retry included,
+until the same confirmation.
 
 Turning it off is a label write, and `hosts.labels` is one value replicated
 last-writer-wins: an unrelated label set on another node that has not yet seen

@@ -1529,6 +1529,68 @@ The condition resolves once the host is removed; a fenced or offline host
 once no recoverable workload is left on it; any other host once it is no
 longer held (a quorum of voters sees it answer, or its pause is over).
 
+### A recovery held on a fence that is not proof (`ha.recovery.unproven_fence`)
+
+Evaluator `failover`, subject the host, severity critical, written by the
+failover lease holder. The host was fenced, but the fence is not proof that it
+is off, so its recoverable workloads are not started elsewhere: nothing runs
+twice, and they stay recorded on the host until it is proven off. It is raised
+for a hold the host's own fence makes:
+
+- an SSH power-off the remote shell confirmed, on a host that does not trust
+  one (`litevirt.trust_ssh_poweroff` off, the default);
+- a best-effort fence under the safe-fence policy;
+- a best-effort fence that did not reach the host after its fence was held
+  (`ha.fence_held`);
+- a best-effort fence that proves nothing, when the host's partition pause is
+  not relied on;
+- a failed fence of a host with the `ssh` strategy (its dial or power-off
+  failed), retried with backoff: a host that lost power leaves an SSH fence
+  nothing to reach, so only the operator can say it is off.
+
+The evidence names the held `workloads`, the reason in `detail` (with an
+operator confirmation that does not stand for this outage, when there is one),
+and the `remedy`: once the host is powered off, `lv host fence-confirm <host>`,
+and the recovery resumes from it. For a host without an `ipmi` or `redfish`
+fence strategy it adds `lv host config <host> --fence-strategy ipmi|redfish`,
+so the next fence proves a power-off. For a confirmed SSH power-off it says
+why the trust setting did not count it: confirmed off the host's pinned key
+(no setting counts that), judged before the host trusted one, or trusted and
+since revoked. Where the setting is off, it names
+`lv host config <host> --trust-ssh-poweroff` as the operator's choice, not a
+recommendation: it counts later fences confirmed over the pinned key, never
+the one already holding this recovery, whichever leader judges it. The same
+hold is named by the `host.recovery.stalled` notification. The detail is kept
+current while the hold lasts: a confirmation noted later as not standing, or a
+later fence's failure, replaces what it said.
+
+The condition resolves when the recovery goes ahead (the operator's
+confirmation, or a fence judged again that passes), and, read back by a later
+lease holder, once the host is removed, back in service, or has no
+recoverable workload left on it.
+
+A hold for `litevirt.fence_requires_confirmation` or the `manual` strategy
+raises no condition: the operator chose it, and the notification names it.
+A leader on an earlier build neither raises nor resolves it, so one raised
+before the lease passes to such a leader stays open until a leader on this
+build takes over.
+
+### A BMC address with a bracket in it (`ha.fence.bmc_address_unsafe`)
+
+Evaluator `failover`, subject the host, severity warning, written by the
+failover lease holder. The host's stored IPMI address, or its Redfish endpoint,
+carries `[` or `]` other than around a plain IPv6 address (no zone).
+`lv host config` refuses such an address now, but one stored before is not
+inert: an earlier build wrote it raw into the fencing log rows of its
+`lv host fence`, where it could form the token a recovery reads its SSH trust
+decision from. This build counts that token only when it names its own
+fencing log row, which no address set before the row could, and writes the
+address with its brackets rewritten, but fix the stored address. The
+evidence names the `field`, the `value` (brackets rewritten) and the `remedy`:
+`lv host config <host> --ipmi-address <addr>`, or
+`--redfish-endpoint https://<host>[:port]`. `lv doctor fence` lists each such
+host. The condition resolves once the address is fixed, or the host removed.
+
 ### A fence held because nothing needs it (`ha.fence_held`)
 
 Evaluator `failover`, subject the host, severity warning, written by the

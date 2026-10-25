@@ -80,6 +80,7 @@ shared-disk count comes from the queried node's replicated rows.`,
 				// the verdict, so a failed read does not fail the command.
 				if h, herr := c.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{}); herr == nil {
 					printStalledObservers(os.Stdout, h.GetConditions())
+					printUnsafeBMC(os.Stdout, h.GetConditions())
 				}
 				// Best-effort too: which hosts fence only over SSH.
 				if hl, lerr := c.ListHosts(ctx, &pb.ListHostsRequest{}); lerr == nil {
@@ -359,6 +360,31 @@ func printTrustSSHPoweroff(w io.Writer, hosts []*pb.Host) {
 	fmt.Fprintln(w, "Their workloads are recovered when the remote shell confirms a power-off over the pinned host")
 	fmt.Fprintln(w, "key, without proof the host is off: one that ignores it, or whose power-off hangs, runs them twice.")
 	fmt.Fprintln(w, "`lv host config <host> --trust-ssh-poweroff=false` turns it off.")
+}
+
+// printUnsafeBMC names every host with an open ha.fence.bmc_address_unsafe:
+// its stored IPMI address or Redfish endpoint carries a bracket other than
+// around a plain IPv6 address, which earlier builds wrote raw into their
+// fence rows. Prints nothing when there is none.
+func printUnsafeBMC(w io.Writer, conds []*pb.HealthCondition) {
+	var lines []string
+	for _, c := range conds {
+		if c.GetCode() != "ha.fence.bmc_address_unsafe" || c.GetLifecycle() == "resolved" {
+			continue
+		}
+		var ev struct {
+			Field  string `json:"field"`
+			Value  string `json:"value"`
+			Remedy string `json:"remedy"`
+		}
+		_ = json.Unmarshal([]byte(c.GetEvidence()), &ev) // unreadable evidence still names the host
+		lines = append(lines, fmt.Sprintf("  %s: %s %q; %s", c.GetSubjectId(), ev.Field, ev.Value, ev.Remedy))
+	}
+	if len(lines) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "\nWARNING: %d host(s) have a BMC address with a bracket in it; fix each:\n%s\n",
+		len(lines), strings.Join(lines, "\n"))
 }
 
 // printStalledObservers lists hosts with an open observer_stalled condition:

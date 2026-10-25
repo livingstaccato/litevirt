@@ -38,8 +38,10 @@ var frozenLatchGatedShapes = map[string][]string{
 	// Not shipped yet (F1): corrected only by one reviewed change here and in
 	// latchGatedShapes together.
 	capabilities.Release202702V1: {
+		"stmtshape/v1:2e9bc204a7022add022a4ba17c9bffc0cd53413d83e882b5dba9b6496ac2daf3", // storagePoolCapacitySQL (catalog_incarnation)
 		"stmtshape/v1:34c2e0c1e7ebc2e4e34bbcc475ac4093bd33cf1b70c97c3f656cb0bf0bc1e1de", // storagePoolBirthSQL (catalog_incarnation)
 		"stmtshape/v1:512af81cfa9173a60e2eed52a53e24d6f776f5b4ecb9015d7ded49ce6f15853d", // imageBirthSQL (catalog_incarnation)
+		"stmtshape/v1:5261b7d38fd0b0ea652c412417cf90ebf4338d9215c818c91c5b55a8d030dcfb", // storagePoolOptionsSQL (catalog_incarnation)
 		"stmtshape/v1:74d6132826649e2ef6f5bf5e523e6e3521c41bb7f811bc59b2e3f84da7d3066e", // storagePoolMutateSQL (catalog_incarnation)
 		"stmtshape/v1:b7f486e9a5bc30558b24a87df6ff6752eb43bdc28b8309ee7fdbb1ab0a7ead52", // imageContinueSQL (catalog_incarnation)
 		"stmtshape/v1:c02913c78cfed1908d03aad604cabdab49415bf1ba1b38da7c1073803d64edce", // imageLifetimeDeleteSQL (catalog_incarnation)

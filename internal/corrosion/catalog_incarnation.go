@@ -8,13 +8,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
+	"sync"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/hlc"
 )
 
-// CATALOG BIRTH INCARNATIONS (release feature catalog_incarnation, schema v92).
+// CATALOG BIRTH INCARNATIONS (release feature catalog_incarnation, schema v91).
 //
 // An image name or a (host, pool) name can be deleted and created again, and
 // before this nothing in either row told the two lifetimes apart: created_at
@@ -126,6 +128,27 @@ func CompareCatalogIncarnations(a, b string) int {
 	return strings.Compare(a, b)
 }
 
+// catalogBirthClock is the birth clock an incarnation carries ("" for none).
+func catalogBirthClock(inc string) string {
+	if i := strings.LastIndex(inc, catalogIncarnationSep); i > 0 {
+		return inc[:i]
+	}
+	return ""
+}
+
+// catalogRowFloor is the latest stamp a row holds: its updated_at, or its
+// lifetime's birth clock when that is later (a row that came by
+// anti-entropy from a peer whose clock ran ahead). A birth or a delete over
+// the row is stamped strictly after it, so a rebirth always sorts after the
+// lifetime it ends.
+func catalogRowFloor(r catalogRow) string {
+	floor := r.updatedAt
+	if b := catalogBirthClock(r.incarnation); b != "" && (floor == "" || lwwOrder(b, floor) > 0) {
+		floor = b
+	}
+	return floor
+}
+
 // ─────────────────────────────── images ───────────────────────────────
 
 // imageBirthSQL is an image's birth: the whole row, its incarnation, live.
@@ -189,10 +212,6 @@ const (
 	catalogLatched
 	// catalogBirth: the writer holds the grant.
 	catalogBirth
-	// catalogMutate: a write to an existing pool (a capacity refresh, a
-	// state, an export, a key fingerprint): never a birth. Over no row or a
-	// tombstone it writes nothing, so it never brings a deleted pool back.
-	catalogMutate
 )
 
 // RecordImageWithGrant is RecordImage on a node where the release feature is
@@ -337,8 +356,6 @@ func writeStoragePool(ctx context.Context, c *Client, p StoragePoolRecord, mode 
 			// No row, a tombstone, or a row born under an earlier lifetime of
 			// its host: a birth.
 			switch mode {
-			case catalogMutate:
-				return nil
 			case catalogLatched:
 				return ErrCatalogBirthNeeded
 			case catalogUnlatched:
@@ -351,11 +368,13 @@ func writeStoragePool(ctx context.Context, c *Client, p StoragePoolRecord, mode 
 				if err := g.Check(capabilities.FeatureCatalogIncarnation); err != nil {
 					return err
 				}
-				if row.found && lwwOrder(row.updatedAt, now) >= 0 {
-					// The row is stamped at or ahead of this clock (it came by
-					// anti-entropy): take its stamp, and stamp after it.
-					ObserveStamp(c, row.updatedAt)
-					continue
+				// Stamped after the row and its lifetime's birth
+				// (catalogRowFloor), which may have come by anti-entropy from a
+				// peer whose clock runs ahead.
+				if row.found {
+					if now, err = c.nowTSAfter(row.updatedAt, catalogBirthClock(row.incarnation)); err != nil {
+						return err
+					}
 				}
 				stmt = Statement{SQL: storagePoolBirthSQL, Params: []interface{}{p.HostName, p.Name, p.Driver, p.Source, p.Target,
 					optsJSON, p.Project, p.TotalBytes, p.UsedBytes, p.State, now, newCatalogIncarnation(now, !row.found), hostN}}
@@ -404,14 +423,116 @@ type CatalogFeatureGate interface {
 	WithFeature(ctx context.Context, feature capabilities.Feature, write func(context.Context, capabilities.FeatureGrant) error) error
 }
 
-// UpdateStoragePool writes p over its existing live row only: a capacity
-// refresh, a state, an NFS export, a ceph key fingerprint. It never gives
-// birth: over no row or a tombstone it writes nothing, so a refresh that
-// raced lv pool rm never brings the pool back. A born row keeps its lifetime
-// (storagePoolMutateSQL); one born before the latch takes the previous
-// release's statement. It needs no grant.
+// storagePoolCapacitySQL is a capacity refresh or a state change of one
+// lifetime of a pool: its mutable columns only, never its configuration.
+const storagePoolCapacitySQL = `UPDATE storage_pools SET total_bytes = ?, used_bytes = ?, state = ?, updated_at = ?
+		 WHERE host_name = ? AND name = ? AND incarnation = ? AND deleted_at IS NULL`
+
+// storagePoolOptionsSQL is a recorded fact about one lifetime of a pool kept
+// in its options (an NFS export, a ceph key fingerprint).
+const storagePoolOptionsSQL = `UPDATE storage_pools SET options = ?, updated_at = ?
+		 WHERE host_name = ? AND name = ? AND incarnation = ? AND deleted_at IS NULL`
+
+// staleHostPools notes, once per pool lifetime, a born pool whose host was
+// re-admitted since its birth (logStaleHostPool).
+var staleHostPools sync.Map
+
+// logStaleHostPool logs, once per (host, pool, incarnation), that a pool row
+// was born under an earlier lifetime of its host. Nothing is written to it,
+// nothing places on it (it is left out of every pool listing), and it is not
+// reborn on its own: the re-admitted host may have other storage. A pool
+// from the host's configuration is reborn by registration; any other the
+// operator creates again (lv pool create).
+func logStaleHostPool(r StoragePoolRecord, hostN int64) {
+	key := r.HostName + "\x00" + r.Name + "\x00" + r.Incarnation
+	if _, seen := staleHostPools.LoadOrStore(key, true); seen {
+		return
+	}
+	slog.Warn("storage pool: born under an earlier lifetime of its host, which has been re-admitted since; "+
+		"it is not used, refreshed or reborn on its own (the host may have other storage): create it again (lv pool create) if it still exists",
+		"host", r.HostName, "pool", r.Name, "pool_host_incarnation", r.HostIncarnation, "host_incarnation", hostN)
+}
+
+// NoteStaleHostPools logs, once per pool lifetime, each live pool of host
+// born under an earlier lifetime of the host (logStaleHostPool). The pool
+// listings leave such a pool out, so nothing else would mention it.
+func NoteStaleHostPools(ctx context.Context, c *Client, host string) error {
+	hostN, live, err := hostIncarnationNow(ctx, c.db, host)
+	if err != nil || !live {
+		return err
+	}
+	rows, err := c.Query(ctx, `SELECT name, incarnation, host_incarnation FROM storage_pools
+		WHERE host_name = ? AND deleted_at IS NULL AND incarnation != '' AND host_incarnation != ?`, host, hostN)
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		logStaleHostPool(StoragePoolRecord{HostName: host, Name: r.String("name"), Incarnation: r.String("incarnation"),
+			HostIncarnation: r.Int64("host_incarnation")}, hostN)
+	}
+	return nil
+}
+
+// UpdateStoragePool writes p's capacity and state (total_bytes, used_bytes,
+// state) over the lifetime p was read from (p.Incarnation, as every pool
+// listing returns it). It never gives birth and never writes configuration:
+//   - a row deleted or re-created since p was read (another incarnation) is
+//     left alone, so a refresh that raced lv pool rm and create writes
+//     nothing into the new pool;
+//   - a pool born under an earlier lifetime of its host is left alone, and
+//     logged once (logStaleHostPool);
+//   - a row born before the latch (”) takes the previous release's statement.
+//
+// It needs no grant.
 func UpdateStoragePool(ctx context.Context, c *Client, p StoragePoolRecord) error {
-	return writeStoragePool(ctx, c, p, catalogMutate, capabilities.FeatureGrant{})
+	return mutateStoragePool(ctx, c, p, false)
+}
+
+// UpdateStoragePoolOptions is UpdateStoragePool for p's options (an NFS
+// export, a ceph key fingerprint), on the same terms.
+func UpdateStoragePoolOptions(ctx context.Context, c *Client, p StoragePoolRecord) error {
+	return mutateStoragePool(ctx, c, p, true)
+}
+
+func mutateStoragePool(ctx context.Context, c *Client, p StoragePoolRecord, options bool) error {
+	optsJSON, err := poolOptionsJSON(p.Options)
+	if err != nil {
+		return err
+	}
+	row, err := readPoolRow(ctx, c.db, p.HostName, p.Name)
+	if err != nil {
+		return err
+	}
+	if !row.found || row.deleted || row.incarnation != p.Incarnation {
+		return nil // not the lifetime p was read from
+	}
+	hostN, _, err := hostIncarnationNow(ctx, c.db, p.HostName)
+	if err != nil {
+		return err
+	}
+	now := c.NowTS()
+	var stmt Statement
+	switch {
+	case row.incarnation == "":
+		stmt = Statement{SQL: storagePoolLegacySQL, Params: []interface{}{p.HostName, p.Name, p.Driver, p.Source, p.Target,
+			optsJSON, p.Project, p.TotalBytes, p.UsedBytes, p.State, now}}
+	case row.hostIncarnation != hostN:
+		logStaleHostPool(StoragePoolRecord{HostName: p.HostName, Name: p.Name, Incarnation: row.incarnation, HostIncarnation: row.hostIncarnation}, hostN)
+		return nil
+	case options:
+		stmt = Statement{SQL: storagePoolOptionsSQL, Params: []interface{}{optsJSON, now, p.HostName, p.Name, row.incarnation}}
+	default:
+		stmt = Statement{SQL: storagePoolCapacitySQL, Params: []interface{}{p.TotalBytes, p.UsedBytes, p.State, now, p.HostName, p.Name, row.incarnation}}
+	}
+	_, err = c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		again, err := readPoolRow(ctx, tx, p.HostName, p.Name)
+		if err != nil {
+			return false, err
+		}
+		n, _, err := hostIncarnationNow(ctx, tx, p.HostName)
+		return err == nil && again == row && n == hostN, err
+	}, []Statement{stmt})
+	return err
 }
 
 // WriteStoragePool creates or writes p (lv pool create, a configured pool, the
@@ -527,7 +648,7 @@ func catalogLifetimeDecision(ctx context.Context, tx *sql.Tx, s Statement, table
 		case strings.TrimSpace(storagePoolLifetimeDeleteSQL):
 			scoped, incoming = true, param(4)
 			row, err = readPoolRow(ctx, tx, param(2), param(3))
-		case strings.TrimSpace(storagePoolMutateSQL):
+		case strings.TrimSpace(storagePoolMutateSQL), strings.TrimSpace(storagePoolCapacitySQL), strings.TrimSpace(storagePoolOptionsSQL):
 			return catalogNormal, nil
 		default:
 			row, err = legacyPoolRow(ctx, tx, s)

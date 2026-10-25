@@ -163,7 +163,8 @@ func TestReplicatedUpdatedAtUsesNowTS(t *testing.T) {
 				continue
 			}
 			body := string(src[fset.Position(fn.Pos()).Offset:fset.Position(fn.End()).Offset])
-			if strings.Contains(body, "NowTS(") {
+			// nowTSAfter is NowTS stamped after given floors.
+			if strings.Contains(body, "NowTS(") || strings.Contains(body, "nowTSAfter(") {
 				continue
 			}
 			// A pure statement-builder that takes the timestamp as a `now`

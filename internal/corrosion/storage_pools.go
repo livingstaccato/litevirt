@@ -25,6 +25,12 @@ type StoragePoolRecord struct {
 	TotalBytes int64
 	UsedBytes  int64
 	State      string
+	// Incarnation and HostIncarnation are the row's birth incarnation and
+	// the host incarnation it was born under (catalog_incarnation.go), as a
+	// pool listing read them: UpdateStoragePool writes only into that
+	// lifetime. Both are ignored by WriteStoragePool, which reads its own.
+	Incarnation     string
+	HostIncarnation int64
 }
 
 // UpsertStoragePool inserts or updates a storage pool record. Options are
@@ -40,11 +46,20 @@ func UpsertStoragePool(ctx context.Context, c *Client, p StoragePoolRecord) erro
 	return writeStoragePool(ctx, c, p, catalogUnlatched, capabilities.FeatureGrant{})
 }
 
+// storagePoolColumns is what scanStoragePool reads.
+const storagePoolColumns = `host_name, name, driver, source, target, options, COALESCE(project, '') AS project, total_bytes, used_bytes, state, incarnation, host_incarnation`
+
+// storagePoolUsable is the predicate of a live pool that may be used: not a
+// pool born under an earlier lifetime of its host (catalog_incarnation.go,
+// logStaleHostPool). Such a row is left out of every listing, so nothing
+// places on, refreshes or resolves it; lv pool create gives it a new birth.
+const storagePoolUsable = `deleted_at IS NULL AND (incarnation = '' OR host_incarnation = COALESCE((SELECT h.incarnation FROM hosts h WHERE h.name = storage_pools.host_name), 0))`
+
 // ListAllStoragePools returns all active storage pools across the cluster.
 func ListAllStoragePools(ctx context.Context, c *Client) ([]StoragePoolRecord, error) {
 	rows, err := c.Query(ctx,
-		`SELECT host_name, name, driver, source, target, options, COALESCE(project, '') AS project, total_bytes, used_bytes, state
-		 FROM storage_pools WHERE deleted_at IS NULL`)
+		`SELECT `+storagePoolColumns+`
+		 FROM storage_pools WHERE `+storagePoolUsable)
 	if err != nil {
 		return nil, err
 	}
@@ -58,8 +73,8 @@ func ListAllStoragePools(ctx context.Context, c *Client) ([]StoragePoolRecord, e
 // ListStoragePoolsForHost returns all active storage pools for a specific host.
 func ListStoragePoolsForHost(ctx context.Context, c *Client, hostName string) ([]StoragePoolRecord, error) {
 	rows, err := c.Query(ctx,
-		`SELECT host_name, name, driver, source, target, options, COALESCE(project, '') AS project, total_bytes, used_bytes, state
-		 FROM storage_pools WHERE host_name = ? AND deleted_at IS NULL`, hostName)
+		`SELECT `+storagePoolColumns+`
+		 FROM storage_pools WHERE `+storagePoolUsable+` AND host_name = ? AND deleted_at IS NULL`, hostName)
 	if err != nil {
 		return nil, err
 	}
@@ -75,8 +90,8 @@ func ListStoragePoolsForHost(ctx context.Context, c *Client, hostName string) ([
 // distinguish "missing" from "error" — a NotFound RPC code is enough.
 func GetStoragePool(ctx context.Context, c *Client, hostName, name string) (StoragePoolRecord, bool, error) {
 	rows, err := c.Query(ctx,
-		`SELECT host_name, name, driver, source, target, options, COALESCE(project, '') AS project, total_bytes, used_bytes, state
-		 FROM storage_pools WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+		`SELECT `+storagePoolColumns+`
+		 FROM storage_pools WHERE `+storagePoolUsable+` AND host_name = ? AND name = ? AND deleted_at IS NULL`,
 		hostName, name)
 	if err != nil {
 		return StoragePoolRecord{}, false, err
@@ -103,6 +118,7 @@ func HostsWithPool(ctx context.Context, c *Client, poolName, excludeHost string)
 		 FROM storage_pools sp
 		 JOIN hosts h ON h.name = sp.host_name
 		 WHERE sp.name = ? AND sp.deleted_at IS NULL
+		   AND (sp.incarnation = '' OR sp.host_incarnation = h.incarnation)
 		   AND h.deleted_at IS NULL AND h.name != ?
 		 ORDER BY sp.host_name`, poolName, excludeHost)
 	if err != nil {
@@ -204,7 +220,11 @@ func MarkStoragePoolDeleted(ctx context.Context, c *Client, hostName, name strin
 		if err != nil {
 			return err
 		}
-		now := c.NowTS()
+		// Stamped after the row and its lifetime's birth (catalogRowFloor).
+		now, err := c.nowTSAfter(row.updatedAt, catalogBirthClock(row.incarnation))
+		if err != nil {
+			return err
+		}
 		del := Statement{SQL: storagePoolLegacyDeleteSQL, Params: []interface{}{nowRFC3339(), now, hostName, name}}
 		if row.incarnation != "" {
 			del = Statement{SQL: storagePoolLifetimeDeleteSQL, Params: []interface{}{nowRFC3339(), now, hostName, name, row.incarnation}}
@@ -231,6 +251,9 @@ func scanStoragePool(r Row) StoragePoolRecord {
 		TotalBytes: r.Int64("total_bytes"),
 		UsedBytes:  r.Int64("used_bytes"),
 		State:      r.String("state"),
+
+		Incarnation:     r.String("incarnation"),
+		HostIncarnation: r.Int64("host_incarnation"),
 	}
 	if blob := r.String("options"); blob != "" && blob != "{}" {
 		_ = json.Unmarshal([]byte(blob), &rec.Options)
@@ -258,8 +281,8 @@ func ListRBDDiskPathsForHost(ctx context.Context, c *Client, host string) ([]str
 // the ceph key fingerprints of one pool are compared across.
 func ListStoragePoolsNamed(ctx context.Context, c *Client, name string) ([]StoragePoolRecord, error) {
 	rows, err := c.Query(ctx,
-		`SELECT host_name, name, driver, source, target, options, COALESCE(project, '') AS project, total_bytes, used_bytes, state
-		 FROM storage_pools WHERE name = ? AND deleted_at IS NULL`, name)
+		`SELECT `+storagePoolColumns+`
+		 FROM storage_pools WHERE `+storagePoolUsable+` AND name = ? AND deleted_at IS NULL`, name)
 	if err != nil {
 		return nil, err
 	}

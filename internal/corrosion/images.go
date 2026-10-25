@@ -54,50 +54,48 @@ func imageRevive(name, updatedAt string) Statement {
 	return Statement{SQL: imageDeletedAtSQL, Params: []interface{}{nil, updatedAt, name}}
 }
 
-// InsertImage creates or replaces an image record WITHOUT reviving a deleted
-// one: a peer that holds the name's tombstone keeps it, and anti-entropy then
-// takes it back to this host's row, so a delete wins. A copy from a peer — a
-// push, an auto-pull or heal — writes this one, so a copy that finishes after
-// lv image rm never brings the image back (review round 1, I-1). The caller
-// refuses outright when the row already reads deleted here (grpcapi
-// Server.recordImage).
+// InsertImage records img as a copy from a peer does (RecordImage, revive
+// false), at clocks taken now: it never revives a deleted image, never gives
+// birth, and over a born image writes only into the lifetime it reads now.
 func InsertImage(ctx context.Context, c *Client, img ImageRecord) error {
-	return c.ExecuteBatch(ctx, []Statement{imageInsert(img, c.NowTS())})
+	clk := ReserveImageClocks(c)
+	_, inc, err := ImageLifetimeAt(ctx, c, img.Name)
+	if err != nil {
+		return err
+	}
+	clk.Lifetime = inc
+	_, err = RecordImage(ctx, c, img, false, "", clk)
+	return err
 }
 
-// ReviveImage is InsertImage that also makes the image live on every host, a
-// deleted image's name included (lab 2 F-1): an operator's import, pull,
-// build or compose download under that name. The insert alone leaves each peer's tombstone in place (see
-// imageInsertSQL); anti-entropy then took the tombstone back to this host's
-// row, the image left `lv image ls` everywhere, and a prune removed its
-// current file as a deleted image's.
-//
-// So the insert is followed, in the same entry and at a strictly later clock,
-// by DeleteImage's own statement with a NULL deleted_at. Every supported build
-// applies that shape as a full-PK LWW update (v1.3.0 emits it itself), so a
-// peer on an older build revives the row exactly as one on this build: no
-// capability gates it. A peer whose row is newer than both keeps its own, as
-// for any LWW write. A peer with no row yet gets it from the insert, and the
-// update then changes nothing.
-//
-// One window converges to a mixed row (review round 1, m-1): a delete stamped
-// strictly between the insert's clock T1 and the revive's T2 — about one
-// clock tick apart. A peer then skips the insert (its delete is newer than
-// T1) and applies the revive (T2 is newer), so it ends live with the OLD
-// content's checksum, format and size at T2 while this host holds the new
-// content at T2; anti-entropy settles the tie by content and may pick the old
-// checksum everywhere. A revive carrying the full row would close it, but that
-// is a new statement shape and would need the release latch, as
-// imageHostReviveSQL does.
+// ReviveImage records img as an operator's import does (RecordImage, revive
+// true), from the row as it reads now: a deleted image's name included (lab 2
+// F-1). On a node where catalog_incarnation is not available it refuses to
+// give birth over a born lifetime (ErrCatalogBirthNeedsLatch).
 func ReviveImage(ctx context.Context, c *Client, img ImageRecord) error {
 	clk := ReserveImageClocks(c)
-	return c.ExecuteBatch(ctx, []Statement{imageInsert(img, clk.Insert), imageRevive(img.Name, clk.Revive)})
+	d, inc, err := ImageLifetimeAt(ctx, c, img.Name)
+	if err != nil {
+		return err
+	}
+	clk.Lifetime = inc
+	_, err = RecordImage(ctx, c, img, true, d, clk)
+	return err
+}
+
+// ImageLifetimeAt is image name's deleted_at and incarnation here ("" and ""
+// when the row is absent): what an image operation reads as it begins.
+func ImageLifetimeAt(ctx context.Context, c *Client, name string) (deletedAt, incarnation string, err error) {
+	row, err := readImageRow(ctx, c.db, name)
+	return row.deletedAt, row.incarnation, err
 }
 
 // ImageClocks are the clocks of one record of an image: its catalog insert's
 // and revive's, Insert strictly before Revive, and this host's image_hosts
-// row's (Host).
-type ImageClocks struct{ Insert, Revive, Host string }
+// row's (Host). Lifetime is the image's incarnation as the operation began
+// (ImageLifetimeAt; "" for no born row): a copy writes only into that lifetime
+// (catalog_incarnation.go).
+type ImageClocks struct{ Insert, Revive, Host, Lifetime string }
 
 // ReserveImageClocks takes, now, the clocks a later RecordImage and
 // RecordImageHost write at (review re-review 1, R-m1). An operation reserves
@@ -196,16 +194,22 @@ func RecordImageLifetime(ctx context.Context, c *Client, img ImageRecord, revive
 			return ImageRecordResult{}, err
 		}
 		res := ImageRecordResult{Outcome: ImageRecordWritten}
+		// The record must be stamped after the row and after the birth of the
+		// lifetime it holds: a row that came by anti-entropy from a peer whose
+		// clock runs ahead can carry a birth stamped after this host's clocks,
+		// and a rebirth stamped before it would sort below the lifetime it ends.
+		floor := catalogRowFloor(row)
 		if row.found {
 			switch {
 			case row.deletedAt != "" && row.deletedAt != startDeleted:
 				res.Outcome = ImageRecordDeleted
-			case lwwOrder(row.updatedAt, clk.Insert) >= 0:
+			case lwwOrder(floor, clk.Insert) >= 0:
 				res.Outcome = ImageRecordSuperseded
+				ObserveStamp(c, floor)
 			}
 		}
 		if res.Outcome != ImageRecordWritten {
-			res.UpdatedAt, res.Checksum = row.updatedAt, row.checksum
+			res.UpdatedAt, res.Checksum = floor, row.checksum
 			return res, nil
 		}
 		// The catalog statements of this record over row
@@ -213,6 +217,12 @@ func RecordImageLifetime(ctx context.Context, c *Client, img ImageRecord, revive
 		var stmts []Statement
 		live := row.found && !row.deleted
 		switch {
+		case live && row.incarnation != "" && !revive && row.incarnation != clk.Lifetime:
+			// A copy begun under another lifetime (or before this one reached
+			// this host) never writes into this one: the newer record
+			// describes the image (grpcapi: a copy of its content is recorded
+			// as this host's copy, any other is retried).
+			return ImageRecordResult{Outcome: ImageRecordSuperseded, UpdatedAt: floor, Checksum: row.checksum}, nil
 		case live && row.incarnation != "":
 			stmts = []Statement{{SQL: imageContinueSQL, Params: []interface{}{
 				img.Format, img.SourceURL, img.Checksum, img.SizeBytes, clk.Insert, img.Name, row.incarnation}}}
@@ -259,7 +269,7 @@ func RecordImageLifetime(ctx context.Context, c *Client, img ImageRecord, revive
 	return ImageRecordResult{}, fmt.Errorf("image %q: its catalog row kept changing while it was recorded; nothing was written", img.Name)
 }
 
-// ObserveStamp advances this host's clock to ts, a row's updated_at another
+// ObserveStamp advances this host's clocks to ts, a row's updated_at another
 // host wrote, as the replicator does for each entry it applies
 // (hlc.Clock.Update): a clock reserved here afterwards (NowTS,
 // ReserveImageClocks) orders after ts. A row that arrived by anti-entropy
@@ -268,6 +278,15 @@ func RecordImageLifetime(ctx context.Context, c *Client, img ImageRecord, revive
 // a stamp more than hlc.MaxSkewMS ahead of this host's wall clock, and one
 // that does not parse changes nothing: the caller compares again (LWWNewer).
 func ObserveStamp(c *Client, ts string) {
+	at, ok := tsInstant(ts)
+	if ok && !tsFutureSkewed(ts, c.now()) {
+		// The RFC3339 path (NowWallTS) orders after it too.
+		c.tsMu.Lock()
+		if at.After(c.lastTS) {
+			c.lastTS = at
+		}
+		c.tsMu.Unlock()
+	}
 	if c.clock == nil {
 		return
 	}
@@ -275,7 +294,6 @@ func ObserveStamp(c *Client, ts string) {
 		c.clock.Update(p)
 		return
 	}
-	at, ok := tsInstant(ts)
 	if !ok {
 		return
 	}
@@ -484,7 +502,12 @@ func DeleteImage(ctx context.Context, c *Client, name string) error {
 		if err != nil {
 			return err
 		}
-		now := c.NowTS()
+		// Stamped after the row and after its lifetime's birth
+		// (catalogRowFloor), so the tombstone orders after both.
+		now, err := c.nowTSAfter(row.updatedAt, catalogBirthClock(row.incarnation))
+		if err != nil {
+			return err
+		}
 		del := Statement{SQL: imageDeletedAtSQL, Params: []interface{}{nowRFC3339Nano(), now, name}}
 		if row.incarnation != "" {
 			del = Statement{SQL: imageLifetimeDeleteSQL, Params: []interface{}{nowRFC3339Nano(), now, name, row.incarnation}}

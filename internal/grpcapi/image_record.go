@@ -92,7 +92,9 @@ const imageTicketRecords = 2
 // A copy from a peer refuses a name that already reads deleted here, so
 // nothing is streamed for it.
 func (s *Server) imageOpStart(ctx context.Context, name string, op imageOp) (*imageTicket, error) {
-	d, err := corrosion.ImageDeletedAt(ctx, s.db, name)
+	// The lifetime op begins under: a copy records only into it
+	// (corrosion.ImageClocks.Lifetime).
+	d, lifetime, err := corrosion.ImageLifetimeAt(ctx, s.db, name)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read image %q's catalog record: %v", name, err)
 	}
@@ -103,7 +105,9 @@ func (s *Server) imageOpStart(ctx context.Context, name string, op imageOp) (*im
 	}
 	t := &imageTicket{deleted: d}
 	for range imageTicketRecords {
-		t.clocks = append(t.clocks, corrosion.ReserveImageClocks(s.db))
+		clk := corrosion.ReserveImageClocks(s.db)
+		clk.Lifetime = lifetime
+		t.clocks = append(t.clocks, clk)
 	}
 	return t, nil
 }
@@ -185,7 +189,9 @@ func (s *Server) recordImage(ctx context.Context, op imageOp, t *imageTicket, im
 		// (re-review 3, m-1). One the clock refuses (hlc.MaxSkewMS) would
 		// supersede every attempt: that is clock skew, not a race.
 		corrosion.ObserveStamp(s.db, res.UpdatedAt)
+		lifetime := clk.Lifetime
 		clk = corrosion.ReserveImageClocks(s.db)
+		clk.Lifetime = lifetime
 		if !corrosion.LWWNewer(clk.Insert, res.UpdatedAt) {
 			return status.Errorf(codes.FailedPrecondition,
 				"image %q's catalog record here is stamped %s, ahead of this host's clock (%s) by more than the %s of clock skew the cluster accepts from a peer: "+

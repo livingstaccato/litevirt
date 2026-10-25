@@ -3080,7 +3080,7 @@ func (d *Daemon) refreshDirPoolExports(ctx context.Context, configured map[strin
 			opts[storage.NFSExportOption] = exp
 		}
 		r.Options = opts
-		if err := corrosion.UpdateStoragePool(ctx, d.db, r); err != nil {
+		if err := corrosion.UpdateStoragePoolOptions(ctx, d.db, r); err != nil {
 			slog.Warn("storage pools: cannot record a pool's NFS export", "pool", r.Name, "error", err)
 		}
 	}
@@ -3279,6 +3279,11 @@ func (d *Daemon) runNFSMountReconcile(ctx context.Context) {
 // via `lv pool create`. registerStoragePools only scans cfg.StoragePools, so
 // runtime-created pools (not in config) were never statfs'd and showed 0B/0B.
 func (d *Daemon) refreshDBPoolCapacity(ctx context.Context) {
+	// A pool born under an earlier lifetime of this host is left out of the
+	// listing below; say so once (corrosion.NoteStaleHostPools).
+	if err := corrosion.NoteStaleHostPools(ctx, d.db, d.cfg.HostName); err != nil {
+		slog.Warn("refresh pool capacity: check pools of earlier host lifetimes", "error", err)
+	}
 	pools, err := corrosion.ListStoragePoolsForHost(ctx, d.db, d.cfg.HostName)
 	if err != nil {
 		slog.Warn("refresh pool capacity: list pools", "error", err)

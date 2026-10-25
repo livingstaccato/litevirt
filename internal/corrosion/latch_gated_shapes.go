@@ -36,6 +36,8 @@ var latchGatedShapes = map[string][]string{
 		imageLifetimeDeleteSQL,       // DeleteImage (a born image)
 		storagePoolBirthSQL,          // writeStoragePool (birth)
 		storagePoolMutateSQL,         // writeStoragePool (a born pool)
+		storagePoolCapacitySQL,       // UpdateStoragePool (a born pool's capacity and state)
+		storagePoolOptionsSQL,        // UpdateStoragePoolOptions (a born pool's export, key fingerprint)
 		storagePoolLifetimeDeleteSQL, // MarkStoragePoolDeleted (a born pool)
 	},
 }

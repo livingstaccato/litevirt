@@ -25,12 +25,14 @@ func catalogGrant(t *testing.T) *capabilities.FeatureGrant {
 func recordImg(t *testing.T, c *Client, name, sum string, revive bool, g *capabilities.FeatureGrant) error {
 	t.Helper()
 	ctx := context.Background()
-	start, err := ImageDeletedAt(ctx, c, name)
+	start, inc, err := ImageLifetimeAt(ctx, c, name)
 	if err != nil {
 		return err
 	}
+	clk := ReserveImageClocks(c)
+	clk.Lifetime = inc
 	res, err := RecordImageWithGrant(ctx, c, ImageRecord{Name: name, Format: "qcow2", Checksum: sum, SizeBytes: 1},
-		revive, start, ReserveImageClocks(c), g)
+		revive, start, clk, g)
 	if err == nil && res.Outcome != ImageRecordWritten {
 		return fmt.Errorf("record %s: %s", name, res.Outcome)
 	}

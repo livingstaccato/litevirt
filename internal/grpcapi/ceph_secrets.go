@@ -448,7 +448,7 @@ func (s *Server) recordCephKeyFingerprint(ctx context.Context, pool, fp string) 
 	}
 	opts[storage.CephKeyFPOption] = fp
 	rec.Options = opts
-	if err := corrosion.UpdateStoragePool(ctx, s.db, rec); err != nil {
+	if err := corrosion.UpdateStoragePoolOptions(ctx, s.db, rec); err != nil {
 		slog.Warn("ceph pool: record the key fingerprint", "pool", pool, "error", err)
 	}
 }
